@@ -16,7 +16,8 @@ cards:
   - { name: joint_state,           type: sensor }
   - { name: loco_state,            type: sensor }
   - { name: battery,               type: sensor }
-  - { name: lidar,                 type: sensor }
+  - { name: lidar_cloud,           type: sensor }
+  - { name: lidar_map,             type: sensor }
   - { name: camera_rear,           type: sensor }
   - { name: camera_left,           type: sensor }
   - { name: camera_front,          type: sensor }

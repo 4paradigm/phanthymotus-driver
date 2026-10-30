@@ -21,6 +21,7 @@ from domain_bridge import CoreBridge
 from media_workers import MediaWorkers, encode_pointcloud
 
 CAMERA_LANES = ("camera_rear", "camera_left", "camera_front", "camera_right")
+LIDAR_LANES = ("lidar_cloud", "lidar_map")
 MEDIA_MAX_AGE_S = 0.75
 
 
@@ -105,7 +106,8 @@ class S10Nodes:
             "joint_state": {"topic": base + "joint_state", "format": "data/json"},
             "loco_state": {"topic": base + "loco_state", "format": "data/json"},
             "battery": {"topic": base + "battery", "format": "data/json"},
-            "lidar": {"topic": base + "lidar", "format": "sensor/pointcloud"},
+            "lidar_cloud": {"topic": base + "lidar_cloud", "format": "sensor/pointcloud"},
+            "lidar_map": {"topic": base + "lidar_map", "format": "sensor/pointcloud"},
         }
         # The Pro camera service numbers its physical inputs tail, left, head,
         # right. Subscribe to USB names and semantic aliases alike.
@@ -136,12 +138,15 @@ class S10Nodes:
                             for key in camera_topics})
         self.publishers = {
             key: self.bridge.create_publisher(key, spec["topic"], String)
-            for key, spec in self.topics.items() if key != "lidar"
+            for key, spec in self.topics.items() if key not in LIDAR_LANES
             and not key.startswith("camera_")
         }
         from std_msgs.msg import UInt8MultiArray
-        self.lidar_publisher = self.bridge.create_publisher(
-            "lidar", self.topics["lidar"]["topic"], UInt8MultiArray)
+        self.lidar_publishers = {
+            lane: self.bridge.create_publisher(lane, self.topics[lane]["topic"], UInt8MultiArray)
+            for lane in LIDAR_LANES
+        }
+        self.lidar_publisher = self.lidar_publishers["lidar_cloud"]
         from sensor_msgs.msg import CompressedImage
         self.camera_publishers = {
             key: self.bridge.create_publisher(key, self.topics[key]["topic"], CompressedImage)
@@ -156,7 +161,8 @@ class S10Nodes:
                     self.media_workers.add_compressed_camera(key)
                 else:
                     self.media_workers.add_camera(key)
-            self.media_workers.add_lidar("lidar")
+            for lane in LIDAR_LANES:
+                self.media_workers.add_lidar(lane)
         topics = config.get("topics", {})
         # Sensor streams may publish best-effort; the sensor-data profile is
         # compatible with both best-effort and reliable writers.
@@ -168,7 +174,7 @@ class S10Nodes:
         # media lane its own group so slow point-cloud ingress cannot block
         # camera callbacks, while aliases within one camera remain serialized.
         self._media_callback_groups = {
-            lane: MutuallyExclusiveCallbackGroup() for lane in (*CAMERA_LANES, "lidar")
+            lane: MutuallyExclusiveCallbackGroup() for lane in (*CAMERA_LANES, *LIDAR_LANES)
         }
         self._stream_lock = threading.Lock()
         self._camera_source_lock = threading.Lock()
@@ -189,15 +195,19 @@ class S10Nodes:
             "joint_state": topics.get("joints", "/JOINTS_DATA_10HZ"),
             "battery": topics.get("battery", "/BATTERY_DATA"),
             "loco_state": topics.get("motion_info", "/MOTION_INFO"),
-            "lidar": topics.get("lidar", ["/LIDAR/POINTS", "/DEPTH_POINTS", "/local_scans"]),
+            "lidar_cloud": topics.get("lidar_cloud", topics.get(
+                "lidar", ["/LIDAR/POINTS", "/DEPTH_POINTS", "/local_scans"])),
+            "lidar_map": topics.get("lidar_map", "/ACCUMULATED_POINTS_MAP"),
         }
         self._source_topics.update({key: value for key, value in camera_topics.items()})
         self.robot.create_subscription(Imu, topics.get("imu", "/IMU"), self._forward_imu, stream_qos)
         self.robot.create_subscription(JointsData, topics.get("joints", "/JOINTS_DATA_10HZ"), self._forward_joints, stream_qos)
         self.robot.create_subscription(BatteryData, topics.get("battery", "/BATTERY_DATA"), self._forward_battery, stream_qos)
         self.robot.create_subscription(MotionInfo, topics.get("motion_info", "/MOTION_INFO"), self._forward_loco_state, stream_qos)
-        lidar_topics = topics.get("lidar", "/LIDAR/POINTS")
+        lidar_topics = topics.get("lidar_cloud", topics.get("lidar", "/LIDAR/POINTS"))
         self._lidar_topics = [lidar_topics] if isinstance(lidar_topics, str) else list(lidar_topics)
+        lidar_map_topic = topics.get("lidar_map", "/ACCUMULATED_POINTS_MAP")
+        self._lidar_map_topic = str(lidar_map_topic)
         self._active_lidar_source = None
         self._lidar_source_last_seen = {}
         self._configured_camera_lanes = {
@@ -239,11 +249,19 @@ class S10Nodes:
             handle = self.robot.create_subscription(
                 PointCloud2, topic,
                 lambda msg, source=topic: self._forward_lidar(source, msg), self._sensor_qos,
-                callback_group=self._media_callback_groups["lidar"])
+                callback_group=self._media_callback_groups["lidar_cloud"])
             self._media_subscriptions.append(handle)
             self._media_topic_subscriptions.add(topic)
             self._media_topic_types[topic] = PointCloud2
             self._media_subscription_handles[topic] = handle
+        if self._lidar_map_topic not in self._media_topic_subscriptions:
+            handle = self.robot.create_subscription(
+                PointCloud2, self._lidar_map_topic, self._forward_lidar_map, self._sensor_qos,
+                callback_group=self._media_callback_groups["lidar_map"])
+            self._media_subscriptions.append(handle)
+            self._media_topic_subscriptions.add(self._lidar_map_topic)
+            self._media_topic_types[self._lidar_map_topic] = PointCloud2
+            self._media_subscription_handles[self._lidar_map_topic] = handle
         camera_subscriptions = sum(
             1 for topic in self._media_topic_subscriptions
             if topic in self._configured_camera_lanes or
@@ -255,7 +273,7 @@ class S10Nodes:
             topic not in self._camera_topic_lanes
         )
         print(f"[ros2] media subscriptions ready: camera_topics={camera_subscriptions} "
-              f"lidar_topics={lidar_subscriptions} lanes=4", flush=True)
+              f"lidar_topics={lidar_subscriptions} lanes=6", flush=True)
         if hasattr(self.robot, "create_timer"):
             self._media_discovery_timer = self.robot.create_timer(2.0, self._scan_media_topics)
 
@@ -269,21 +287,9 @@ class S10Nodes:
         for topic, type_names in discovered:
             types = set(type_names)
             if "sensor_msgs/msg/PointCloud2" in types:
-                identity = (topic, "lidar")
-                if identity in self._discovered_media:
-                    continue
-                if topic in self._media_topic_subscriptions:
-                    continue
-                self._discovered_media.add(identity)
-                if topic not in self._lidar_topics:
-                    self._lidar_topics.append(topic)
-                self._source_topics["lidar"] = list(self._lidar_topics)
-                self._media_subscriptions.append(self.robot.create_subscription(
-                    PointCloud2, topic,
-                    lambda msg, source=topic: self._forward_lidar(source, msg), self._sensor_qos,
-                    callback_group=self._media_callback_groups["lidar"]))
-                self._media_topic_subscriptions.add(topic)
-                print(f"[ros2] discovered point cloud subscription: {topic}", flush=True)
+                # Configured raw feeds are subscribed during initialization.
+                # Never discover extra PointCloud2 endpoints: the graph also
+                # contains maps, paths and diagnostics with incompatible size.
                 continue
             msg_type = (CompressedImage if "sensor_msgs/msg/CompressedImage" in types else
                         Image if "sensor_msgs/msg/Image" in types else None)
@@ -424,7 +430,7 @@ class S10Nodes:
                     stats[f"_{stage}_rate_count"] = stats[stage]
                     stats[f"_{stage}_rate_time"] = monotonic_now
             first = stats[stage] == 1
-            report_rate = (key in {"camera_left", "camera_rear", "lidar"} and
+            report_rate = (key in {"camera_left", "camera_rear", *LIDAR_LANES} and
                            monotonic_now - stats.get("last_rate_log", monotonic_now) >= 10.0)
             if report_rate:
                 stats["last_rate_log"] = monotonic_now
@@ -446,7 +452,7 @@ class S10Nodes:
         for key, spec in self.topics.items():
             try:
                 source = self._source_topics[key]
-                if key == "lidar":
+                if key == "lidar_cloud":
                     source = self._lidar_topics
                 sources = [source] if isinstance(source, str) else list(source)
                 result[key]["robot_publishers"] = sum(
@@ -459,13 +465,16 @@ class S10Nodes:
             result[key]["bridge_alive"] = lane["alive"]
             result[key]["bridge_errors"] = lane.get("errors", 0)
             result[key]["bridge_last_error"] = lane.get("last_error")
-            if self.media_workers is not None and (key.startswith("camera_") or key == "lidar"):
+            if self.media_workers is not None and (key.startswith("camera_") or key in LIDAR_LANES):
                 result[key]["worker_alive"] = self.media_workers.is_alive(key)
-            if key == "lidar":
+            if key == "lidar_cloud":
                 result[key]["active_source"] = self._active_lidar_source
                 result[key]["source_publishers"] = {
                     topic: self._count_publishers(topic) for topic in self._lidar_topics
                 }
+            elif key == "lidar_map":
+                result[key]["source"] = self._lidar_map_topic
+                result[key]["source_publishers"] = self._count_publishers(self._lidar_map_topic)
             elif key.startswith("camera_"):
                 result[key]["active_source"] = self._camera_lane_sources.get(key)
                 source = result[key]["active_source"]
@@ -705,7 +714,7 @@ class S10Nodes:
             msg, source = source, None
         now = time.monotonic()
         if not self._fresh_header(getattr(msg, "header", None)):
-            self._record_stream("lidar", "dropped")
+            self._record_stream("lidar_cloud", "dropped")
             return
         if source is not None:
             self._lidar_source_last_seen[source] = now
@@ -731,7 +740,17 @@ class S10Nodes:
                 self._active_lidar_source = source
             elif source != self._active_lidar_source:
                 return
-        self._record_stream("lidar", "received")
+        self._forward_lidar_packet("lidar_cloud", msg)
+
+    def _forward_lidar_map(self, msg):
+        """Forward only the configured accumulated map; never mix it with raw lidar."""
+        self._forward_lidar_packet("lidar_map", msg)
+
+    def _forward_lidar_packet(self, lane, msg):
+        if not self._fresh_header(getattr(msg, "header", None)):
+            self._record_stream(lane, "dropped")
+            return
+        self._record_stream(lane, "received")
         if self.media_workers is not None:
             fields = [(field.name, field.offset, field.datatype, field.count)
                       for field in msg.fields]
@@ -741,31 +760,31 @@ class S10Nodes:
                             getattr(stamp, "sec", 0) if stamp else 0,
                             getattr(stamp, "nanosec", 0) if stamp else 0)
             submitted = self.media_workers.submit(
-                "lidar", (media_header,
+                lane, (media_header,
                            fields, msg.is_bigendian, msg.width, msg.height,
                            msg.row_step, msg.point_step, bytes(msg.data)))
             if not submitted:
-                self._record_stream("lidar", "dropped")
+                self._record_stream(lane, "dropped")
             return
         packet = self._pointcloud_packet(msg)
         if packet is None:
-            self._record_stream("lidar", "dropped")
+            self._record_stream(lane, "dropped")
             return
         from std_msgs.msg import UInt8MultiArray
         output = UInt8MultiArray()
         output.data = array.array("B", packet)
-        self.lidar_publisher.publish(output)
-        self._record_stream("lidar", "published")
+        self.lidar_publishers[lane].publish(output)
+        self._record_stream(lane, "published")
 
     def _handle_media_result(self, lane, header, packet):
         if packet is None:
             self._record_stream(lane, "dropped")
             return
-        if lane == "lidar":
+        if lane in LIDAR_LANES:
             from std_msgs.msg import UInt8MultiArray
             output = UInt8MultiArray()
             output.data = array.array("B", packet)
-            self.lidar_publisher.publish(output)
+            self.lidar_publishers[lane].publish(output)
         else:
             from sensor_msgs.msg import CompressedImage
             output = CompressedImage()
@@ -1001,7 +1020,8 @@ class S10StatePlugin:
             "joint_state": "山猫 S10 轮足关节位置、速度、力矩和温度（原生协议 10Hz）",
             "loco_state": "山猫 S10 运动状态、步态、模式和速度（原生协议 10Hz）",
             "battery": "山猫 S10 电池电量、电压、温度和充电状态",
-            "lidar": "山猫 S10 激光雷达点云（实时 ROS 2 转发）",
+            "lidar_cloud": "山猫 S10 原始实时激光雷达点云",
+            "lidar_map": "山猫 S10 累积/定位点云地图",
         }
         topics = self.nodes.topics if self.nodes else {}
         for camera in (key for key in topics if key.startswith("camera_")):
@@ -1037,7 +1057,8 @@ class S10StatePlugin:
                 "joint_state": "1048577:15728640", "loco_state": "1048577:15728640",
                 "battery": "1048578:15728640",
                 }
-        if name == "lidar" and self.nodes: return {"state": "streaming", **self.nodes.topics[name]}
+        if name in LIDAR_LANES and self.nodes:
+            return {"state": "streaming", **self.nodes.topics[name]}
         if name.startswith("camera_") and self.nodes:
             return {"state": "streaming", **self.nodes.topics[name]}
         if name not in keys: return {"state": "unsupported_card", "card": name}

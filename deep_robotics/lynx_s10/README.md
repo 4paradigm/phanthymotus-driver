@@ -10,7 +10,7 @@
 
 ## 卡片
 
-- `model` 返回官方 `S10.urdf`；`joints` 按 URDF 的固定 16 关节顺序返回 `sensor/skeleton` 结构（q/dq/tau/temperature），并在运控姿态可用时附带 `imu_quat`。`imu` 从运控报告提取加速度、角速度和姿态；`joint_state` 保留原生电机状态；`loco_state` 合并运控和基础状态报告；`battery` 提供电池列表。
+- `model` 返回官方 `S10.urdf`；`joints` 按 URDF 的固定 16 关节顺序返回 `sensor/skeleton` 结构（q/dq/tau/temperature），并在运控姿态可用时附带 `imu_quat`。`imu` 从运控报告提取加速度、角速度和姿态；`joint_state` 保留原生电机状态；`loco_state` 合并运控和基础状态报告；`battery` 提供电池列表。`lidar_cloud` 只转发原始实时雷达云，`lidar_map` 只转发累积定位地图云，两者不会互相切换。
 - 急停、充电及设备状态保留在 `loco_state`、`battery` 等对应数据卡中，不额外提供不稳定的汇总状态卡。
 - `loco` 提供 `move`、`stop_move`、`stand_up`、`stand_down`、`damp`、`gait`、`mode` 和 `manual_control`。`move` 的前后/侧向速度单位为 m/s，偏航角速度参数 `yaw_rate_deg_s` 使用度/秒；发给固件前会转换为 rad/s。`manual_control` 是常规/辅助模式的六轴归一化控制强度（-1 到 1），不是角度；普通步态只响应前后、侧移和偏航分量。通过 ASDU 执行 `stand_up` 后会自动进入 RL 运控状态，无需单独切换。持续运动指令 10Hz 刷新，到时自动发零指令；各状态切换会等待状态上报并通过 ACP 发送 action completion。
 - `head_light` 与 `tail_light` 分别设置头灯和尾灯。颜色使用固件支持的黑、白、绿、蓝具名选项；协议不支持任意 RGB 值。每张卡只显示自己的效果、颜色和周期参数；周期仅在呼吸或闪烁 action 中出现。渐变流水由固件自动选择彩色序列，不需要颜色参数。

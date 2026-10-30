@@ -128,7 +128,8 @@ def test_state_cards_expose_core_topics_when_ros_nodes_are_present(monkeypatch):
         "joint_state": {"topic": "/robot/lynx_s10/joint_state", "format": "data/json"},
         "loco_state": {"topic": "/robot/lynx_s10/loco_state", "format": "data/json"},
         "battery": {"topic": "/robot/lynx_s10/battery", "format": "data/json"},
-        "lidar": {"topic": "/robot/lynx_s10/lidar", "format": "sensor/pointcloud"},
+        "lidar_cloud": {"topic": "/robot/lynx_s10/lidar_cloud", "format": "sensor/pointcloud"},
+        "lidar_map": {"topic": "/robot/lynx_s10/lidar_map", "format": "sensor/pointcloud"},
     }, "stream_status": lambda _self: {"imu": {"received": 0, "published": 0}}})()
     plugin = device.S10StatePlugin(native, nodes)
     tools = {item["name"]: item for item in plugin.get_tools()}
@@ -137,7 +138,8 @@ def test_state_cards_expose_core_topics_when_ros_nodes_are_present(monkeypatch):
     assert plugin.dispatch("info", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/lynx_s10/imu"
     assert plugin.dispatch("start", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/lynx_s10/imu"
     assert plugin.dispatch("start", {"_tool_name": "joints"})["topic_out"][0]["format"] == "sensor/skeleton"
-    assert plugin.dispatch("info", {"_tool_name": "lidar"})["topic_out"][0]["format"] == "sensor/pointcloud"
+    assert plugin.dispatch("info", {"_tool_name": "lidar_cloud"})["topic_out"][0]["format"] == "sensor/pointcloud"
+    assert plugin.dispatch("info", {"_tool_name": "lidar_map"})["topic_out"][0]["format"] == "sensor/pointcloud"
 
 
 def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
@@ -317,22 +319,27 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert (point_step, point_count) == (12, 1)
     assert nodes.lidar_publisher.messages[-1].data.typecode == "B"
     assert struct.unpack_from("<fff", encoded, 8) == (1.0, 2.0, -3.0)
+    callbacks["/ACCUMULATED_POINTS_MAP"](lidar)
+    map_encoded = bytes(nodes.lidar_publishers["lidar_map"].messages[-1].data)
+    assert map_encoded == encoded
+    assert not nodes.lidar_publishers["lidar_cloud"].messages[-1] is \
+        nodes.lidar_publishers["lidar_map"].messages[-1]
     stream_status = nodes.stream_status()
     assert stream_status["imu"]["received"] == stream_status["imu"]["published"] == 1
     assert stream_status["joints"]["received"] == stream_status["joint_state"]["received"] == 1
-    assert stream_status["lidar"]["received"] == stream_status["lidar"]["published"] == 1
+    assert stream_status["lidar_cloud"]["received"] == stream_status["lidar_cloud"]["published"] == 1
+    assert stream_status["lidar_map"]["received"] == stream_status["lidar_map"]["published"] == 1
     assert stream_status["camera_rear"]["received"] == stream_status["camera_rear"]["published"] == 1
     assert "/s10/front/image" in nodes.robot.subscriptions
     assert nodes._source_topics["camera_rear"] == "/CAMERA/RAW"
     assert nodes._source_topics["camera_left"] == "/s10/left/image"
     assert nodes._source_topics["camera_front"] == "/s10/front/image"
     assert nodes._source_topics["camera_right"] == "/s10/right/image"
-    assert "/s10/depth" in nodes.robot.subscriptions
+    assert "/s10/depth" not in nodes.robot.subscriptions
     groups = nodes.robot.subscription_groups
     assert groups["/s10/rear/image/compressed"] is groups["/CAMERA/RAW"]
     assert groups["/s10/left/image"] is not groups["/s10/rear/image/compressed"]
-    assert groups["/s10/depth"] is groups["/LIDAR/POINTS"]
-    assert groups["/s10/depth"] is not groups["/s10/rear/image/compressed"]
+    assert groups["/LIDAR/POINTS"] is not groups["/s10/rear/image/compressed"]
     assert nodes._sensor_qos.kwargs == {
         "depth": 1, "history": 1, "reliability": 2, "durability": 2}
     nodes.close()
@@ -1316,15 +1323,15 @@ def test_lidar_source_switches_to_higher_priority_configured_stream(monkeypatch)
     nodes._active_lidar_source = "/local_scans"
     nodes._lidar_source_last_seen = {"/local_scans": time.monotonic()}
     nodes._stream_lock = threading.Lock()
-    nodes._stream_stats = {"lidar": {"received": 0, "published": 0, "dropped": 0,
+    nodes._stream_stats = {"lidar_cloud": {"received": 0, "published": 0, "dropped": 0,
                                       "last_received": None, "last_published": None}}
-    nodes._source_topics = {"lidar": list(nodes._lidar_topics)}
+    nodes._source_topics = {"lidar_cloud": list(nodes._lidar_topics)}
     nodes.media_workers = SimpleNamespace(submit=lambda *_args: True)
     msg = SimpleNamespace(fields=[], is_bigendian=False, width=0, height=0,
                           row_step=0, point_step=0, data=b"")
     nodes._forward_lidar("/DEPTH_POINTS", msg)
     assert nodes._active_lidar_source == "/DEPTH_POINTS"
-    assert nodes._stream_stats["lidar"]["received"] == 1
+    assert nodes._stream_stats["lidar_cloud"]["received"] == 1
 
 
 def test_loco_completion_is_delivered_asynchronously(monkeypatch):

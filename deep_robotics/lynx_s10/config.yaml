@@ -14,12 +14,13 @@ topics:
   joints: "/JOINTS_DATA_10HZ"
   battery: "/BATTERY_DATA"
   motion_info: "/MOTION_INFO"
-  # S10 Pro firmware exposes the depth point cloud on DEPTH_POINTS. Keep
-  # legacy/local scan topics as fallbacks for older robot images.
-  lidar:
+  # Prefer the vendor raw lidar topic. Depth/local scans are only fallbacks
+  # for firmware variants where the raw endpoint is unavailable.
+  lidar_cloud:
+    - "/LIDAR/POINTS"
     - "/DEPTH_POINTS"
     - "/local_scans"
-    - "/LIDAR/POINTS"
+  lidar_map: "/ACCUMULATED_POINTS_MAP"
 camera_topics:
   camera_rear:
     - "/camera/rear/image_raw"
