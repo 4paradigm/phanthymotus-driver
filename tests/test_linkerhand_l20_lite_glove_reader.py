@@ -75,6 +75,26 @@ def test_bad_frames_never_publish_and_valid_successor_recovers(fault):
     assert parser.feed(packet(0x20, 2))[0]["sequence"] == 2
 
 
+@pytest.mark.parametrize("wire", [0x20, 0x10, 0x2A, 0x1A])
+@pytest.mark.parametrize("flags", [0, 0xC0])
+def test_invalid_length_is_rejected_from_header_before_waiting_for_payload(wire, flags):
+    for length in range(256):
+        if length == 24:
+            continue
+        parser = Decoder()
+        bad_header = bytes([0xA0, wire | flags, 7, 1 | flags, length])
+        assert parser.feed(bad_header[:4]) == []
+        assert parser.rejected == 0  # Length byte has not arrived yet.
+        assert parser.feed(bad_header[4:]) == []
+        assert parser.rejected == 1  # No advertised payload was required.
+        assert len(parser.buffer) <= 1  # Only a possible next A0 sync byte remains.
+        recovered = []
+        for byte in packet(wire, seq=2):
+            recovered.extend(parser.feed(bytes([byte])))
+        assert len(recovered) == 1 and recovered[0]["sequence"] == 2
+        assert parser.accepted == 1 and not parser.buffer
+
+
 def update(assembler, wire, now, seq=1, values=None):
     for sample in Decoder().feed(packet(wire, seq, values)):
         assembler.update(sample, now)
