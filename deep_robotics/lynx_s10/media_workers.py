@@ -112,7 +112,8 @@ def _worker(jobs, results, kind, lane):
                 packet = _reencode_jpeg(data)
             else:
                 header, fields, bigendian, width, height, row_step, point_step, data = job
-                packet = _pointcloud(fields, bigendian, width, height, row_step, point_step, data)
+                packet = encode_pointcloud(fields, bigendian, width, height, row_step,
+                                           point_step, data)
             results.put((lane, header, packet), timeout=0.2)
         except Exception as exc:
             failures += 1
@@ -145,25 +146,54 @@ def _reencode_jpeg(data):
     return stream.getvalue()
 
 
-def _pointcloud(fields, bigendian, width, height, row_step, point_step, data):
+def encode_pointcloud(fields, bigendian, width, height, row_step, point_step, data,
+                      max_points=40000):
+    """Pack XYZ only as little-endian float32 records for the cloud renderer."""
     import math
     import struct
-    offsets = dict(fields)
-    if not all(name in offsets for name in ("x", "y", "z")):
+    point_formats = {7: "f", 8: "d"}  # sensor_msgs/PointField FLOAT32/FLOAT64
+    field_specs = {}
+    for field in fields:
+        if len(field) == 2:
+            name, offset = field
+            datatype, count = 7, 1
+        else:
+            name, offset, datatype, count = field[:4]
+        if name in ("x", "y", "z"):
+            if datatype not in point_formats or int(count) != 1:
+                return None
+            field_specs[name] = (int(offset), point_formats[datatype])
+    if set(field_specs) != {"x", "y", "z"}:
         return None
-    total = int(width) * int(height)
+    width, height = int(width), int(height)
+    row_step, point_step = int(row_step), int(point_step)
+    data = memoryview(data)
+    if width < 0 or height < 0 or point_step <= 0 or row_step < width * point_step:
+        return None
+    total = width * height
     if total <= 0:
         return struct.pack("<II", 12, 0)
-    stride = max(1, math.ceil(total / 2000))
+    if len(data) < row_step * height:
+        return None
+    for offset, fmt in field_specs.values():
+        if offset < 0 or offset + struct.calcsize(fmt) > point_step:
+            return None
+    limit = max(1, int(max_points))
+    sample_count = min(total, limit)
+    if sample_count == 1:
+        indices = [0]
+    else:
+        indices = [round(i * (total - 1) / (sample_count - 1))
+                   for i in range(sample_count)]
     endian = ">" if bigendian else "<"
     packed = bytearray(struct.pack("<II", 12, 0))
     count = 0
-    for index in range(0, total, stride):
-        row, col = divmod(index, int(width))
-        offset = row * int(row_step) + col * int(point_step)
+    for index in indices:
+        row, col = divmod(index, width)
+        offset = row * row_step + col * point_step
         try:
-            point = tuple(struct.unpack_from(endian + "f", data, offset + offsets[name])[0]
-                          for name in ("x", "y", "z"))
+            point = tuple(struct.unpack_from(endian + fmt, data, offset + field_offset)[0]
+                          for field_offset, fmt in (field_specs[name] for name in ("x", "y", "z")))
         except struct.error:
             continue
         if all(math.isfinite(value) for value in point):

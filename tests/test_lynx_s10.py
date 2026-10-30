@@ -105,7 +105,9 @@ def test_standard_state_cards_read_native_reports(monkeypatch):
     assert skeleton["joint_count"] == 16
     assert len(skeleton["joints"]) == 16
     assert skeleton["joints"][0] == {
-        "idx": 0, "name": "fl_hipx_joint", "q": 0.25,
+        "idx": 0, "name": "fl_hipx_joint",
+        "q": pytest.approx(0.25 + math.radians(device.JOINT_OFFSETS_DEG[0])
+                            - device.MODEL_REFERENCE_ANGLES[0]),
         "dq": None, "tau": None, "temperature": None,
     }
     assert plugin.dispatch("joint_state", {"_tool_name": "joint_state"})["Motor"][0]["dq"] == 0.1
@@ -194,9 +196,12 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     qos_module.qos_profile_sensor_data = object()
     class ReliabilityPolicy:
         RELIABLE = 1
+    class DurabilityPolicy:
+        VOLATILE = 2
     class QoSProfile:
         def __init__(self, **kwargs): self.kwargs = kwargs
     qos_module.ReliabilityPolicy = ReliabilityPolicy
+    qos_module.DurabilityPolicy = DurabilityPolicy
     qos_module.QoSProfile = QoSProfile
     sensor_msg = ModuleType("sensor_msgs.msg")
     sensor_msg.Imu, sensor_msg.PointCloud2 = Imu, PointCloud2
@@ -244,17 +249,22 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert skeleton["format"] == "sensor/skeleton"
     assert skeleton["joint_count"] == 16
     assert skeleton["joints"][0]["name"] == "fl_hipx_joint"
-    assert skeleton["joints"][15]["q"] == 15
+    assert skeleton["joints"][15]["q"] == -15
+    assert nodes.robot.subscriptions["/IMU"]
+    assert next(iter(nodes.robot.subscriptions.values()))
     assert full_joint_state["fr_hipx_joint_q"] == 4
 
     callbacks["/BATTERY_DATA"](SimpleNamespace(data=[
         SimpleNamespace(voltage=0, current=0, cells=[0, 0]),
-        SimpleNamespace(voltage=52000, current=0, cells=[3700, 3800], battery_level=87),
+        SimpleNamespace(voltage=52000, current=0, cells=[3700, 3800],
+                        serial=[0, 0, 0], battery_level=87),
     ]))
     battery = json.loads(nodes.publishers["battery"].messages[-1].data)
     assert battery["batteries"] == {
-        "battery_0": {"voltage": 0, "current": 0, "cells": [0, 0]},
-        "battery_1": {"voltage": 52000, "current": 0, "cells": [3700, 3800], "battery_level": 87},
+        "battery_0": {"all_zero_placeholder": True},
+        "battery_1": {"voltage": 52000, "current": 0, "cells": [3700, 3800],
+                       "battery_level": 87,
+                       "zero_placeholder_fields": {"serial": {"all_zero": True, "length": 3}}},
     }
 
     callbacks["/MOTION_INFO"](SimpleNamespace(data=SimpleNamespace(vel_x=0.3, vel_y=0.0)))
@@ -271,7 +281,8 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
 
     point_data = struct.pack("<ffffff", 1.0, 2.0, 3.0, math.nan, 5.0, 6.0)
     lidar = SimpleNamespace(
-        fields=[SimpleNamespace(name=name, offset=offset) for name, offset in (("x", 0), ("y", 4), ("z", 8))],
+        fields=[SimpleNamespace(name=name, offset=offset, datatype=7, count=1)
+                for name, offset in (("x", 0), ("y", 4), ("z", 8))],
         is_bigendian=False, height=1, width=2, row_step=24, point_step=12, data=point_data,
     )
     callbacks["/LIDAR/POINTS"](lidar)
@@ -293,7 +304,8 @@ def test_lidar_packet_uniformly_caps_large_point_cloud(monkeypatch):
     width = 10000
     data = b"".join(struct.pack("<fff", float(index), 0.0, 0.0) for index in range(width))
     lidar = SimpleNamespace(
-        fields=[SimpleNamespace(name=name, offset=offset) for name, offset in (("x", 0), ("y", 4), ("z", 8))],
+        fields=[SimpleNamespace(name=name, offset=offset, datatype=7, count=1)
+                for name, offset in (("x", 0), ("y", 4), ("z", 8))],
         is_bigendian=False, height=1, width=width, row_step=width * 12, point_step=12, data=data,
     )
 
@@ -302,7 +314,25 @@ def test_lidar_packet_uniformly_caps_large_point_cloud(monkeypatch):
 
     assert (point_step, point_count) == (12, 2000)
     assert struct.unpack_from("<f", encoded, 8)[0] == 0.0
-    assert struct.unpack_from("<f", encoded, 8 + (point_count - 1) * point_step)[0] == 9995.0
+    assert struct.unpack_from("<f", encoded, 8 + (point_count - 1) * point_step)[0] == 9999.0
+
+
+def test_lidar_packet_supports_float64_big_endian_and_validates_layout(monkeypatch):
+    device = _load_device(monkeypatch)
+    point = struct.pack(">ddd", 1.25, -2.5, 3.75)
+    fields = [SimpleNamespace(name=name, offset=offset, datatype=8, count=1)
+              for name, offset in (("x", 0), ("y", 8), ("z", 16))]
+    lidar = SimpleNamespace(fields=fields, is_bigendian=True, height=1, width=1,
+                            row_step=24, point_step=24, data=point)
+    encoded = device.S10Nodes._pointcloud_packet(lidar)
+    assert struct.unpack_from("<II", encoded) == (12, 1)
+    assert struct.unpack_from("<fff", encoded, 8) == (1.25, -2.5, 3.75)
+
+    lidar.data = point[:-1]
+    assert device.S10Nodes._pointcloud_packet(lidar) is None
+    fields[0].datatype = 2
+    lidar.data = point
+    assert device.S10Nodes._pointcloud_packet(lidar) is None
 
 
 def test_camera_ros_image_encodes_to_frontend_jpeg(monkeypatch):
@@ -474,7 +504,8 @@ def test_skeleton_maps_all_s10_motor_fields_and_urdf_order(monkeypatch):
     assert result["format"] == "sensor/skeleton"
     assert result["joint_count"] == 16
     assert [joint["name"] for joint in result["joints"]] == list(device.JOINT_NAMES)
-    assert result["joints"][-1]["q"] == 1.5
+    assert result["joints"][-1]["q"] == pytest.approx(
+        -1.5 + math.radians(device.JOINT_OFFSETS_DEG[-1]) - device.MODEL_REFERENCE_ANGLES[-1])
     assert result["joints"][0]["temperature"] == [30]
     assert result["imu_quat"] == [1, 0, 0, 0]
 
@@ -497,6 +528,17 @@ def test_joints_ascii_motor_indices_follow_urdf_order(monkeypatch):
             "position": float(index)} for index in reversed(range(16))]
     ordered = device._order_joints(raw)
     assert [joint["position"] for joint in ordered] == list(map(float, range(16)))
+
+
+def test_skeleton_applies_vendor_direction_offset_and_reference_pose(monkeypatch):
+    device = _load_device(monkeypatch)
+    raw = [{"name": list(str(index).encode("ascii")), "position": 0.0}
+           for index in range(16)]
+    skeleton = device._skeleton_payload({}, raw_joints=raw)
+    for index, joint in enumerate(skeleton["joints"]):
+        expected = (math.radians(device.JOINT_OFFSETS_DEG[index])
+                    - device.MODEL_REFERENCE_ANGLES[index])
+        assert joint["q"] == pytest.approx(expected)
 
 
 def test_navigation_actions_use_s10_pro_native_commands(monkeypatch):
@@ -874,15 +916,21 @@ def test_control_schema_exposes_supported_navigation_and_light_options(monkeypat
     nav_params = device.S10NavigationPlugin(native).get_tool()["inputSchema"]["x-action-params"]["goal"]["params"]
     localize_params = device.S10NavigationPlugin(native).get_tool()["inputSchema"]["x-action-params"]["localize"]["params"]
     light_tool = device.S10LightPlugin(native).get_tool()
-    light_params = light_tool["inputSchema"]["x-action-params"]["set"]["params"]
+    actions = light_tool["inputSchema"]["x-action-params"]
+    light_params = actions["set"]["params"]
 
     assert set(nav_params) == {"x", "y", "z", "yaw_degrees", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous", "confirm"}
     assert set(localize_params) == {"x", "y", "z", "yaw_degrees", "confirm"}
     assert {"head_color", "tail_color", "head_effect", "tail_effect"} <= set(light_params)
+    assert "head_cycle_seconds" not in light_params
+    assert "head_cycle_seconds" in actions["set_head_periodic"]["params"]
+    assert "tail_cycle_seconds" in actions["set_tail_periodic"]["params"]
+    assert "head_cycle_seconds" in actions["set_both_periodic"]["params"]
+    assert "tail_cycle_seconds" in actions["set_both_periodic"]["params"]
     assert light_tool["name"] == "light"
     properties = light_tool["inputSchema"]["properties"]
-    assert properties["head_cycle_seconds"]["x-visible-when"] == {"head_effect": ["呼吸", "闪烁"]}
-    assert properties["tail_cycle_seconds"]["x-visible-when"] == {"tail_effect": ["呼吸", "闪烁"]}
+    assert properties["head_periodic_effect"]["enum"] == ["呼吸", "闪烁"]
+    assert properties["head_effect"]["enum"] == ["常亮", "填充流水", "移动流水", "渐变流水"]
 
     charge_schema = device.S10ChargePlugin(native).get_tool()["inputSchema"]
     assert charge_schema["x-is-dangerous"] is True
@@ -894,9 +942,10 @@ def test_light_uses_named_colors_and_effects_in_native_protocol(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
     plugin = device.S10LightPlugin(native)
-    plugin.dispatch("set", {"head_color": "绿色", "tail_color": "蓝色",
-                             "head_effect": "呼吸", "tail_effect": "闪烁",
-                             "head_cycle_seconds": 3, "tail_cycle_seconds": 2})
+    plugin.dispatch("set_both_periodic", {"head_color": "绿色", "tail_color": "蓝色",
+                                           "head_periodic_effect": "呼吸",
+                                           "tail_periodic_effect": "闪烁",
+                                           "head_cycle_seconds": 3, "tail_cycle_seconds": 2})
 
     assert native.calls[-1][0] == (0x00100005, 0x00200002, {
         "CustomMode": True,
@@ -925,6 +974,20 @@ def test_light_constant_effect_omits_cycle_from_native_payload(monkeypatch):
     })
     leds = native.calls[-1][0][2]["Led"]
     assert "Cycle" not in leds[0]
+    assert "Cycle" not in leds[1]
+
+
+def test_light_periodic_action_can_mix_static_and_cyclic_side(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    device.S10LightPlugin(native).dispatch("set_head_periodic", {
+        "head_periodic_effect": "闪烁", "head_cycle_seconds": 4,
+        "tail_effect": "常亮",
+    })
+    leds = native.calls[-1][0][2]["Led"]
+    assert leds[0]["Type"] == device.LIGHT_EFFECTS["闪烁"]
+    assert leds[0]["Cycle"] == 4
+    assert leds[1]["Type"] == device.LIGHT_EFFECTS["常亮"]
     assert "Cycle" not in leds[1]
 
 

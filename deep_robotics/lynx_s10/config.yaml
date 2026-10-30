@@ -22,21 +22,21 @@ topics:
     - "/LIDAR/POINTS"
 camera_topics:
   camera_0:
-    - "/usb_camera_1/image_raw"
-    - "/camera_front/image_raw"
     - "/camera/front/image_raw"
+    - "/camera_front/image_raw"
+    - "/usb_camera_1/image_raw"
   camera_1:
-    - "/usb_camera_1/image_raw_0"
-    - "/camera_back/image_raw"
     - "/camera/rear/image_raw"
+    - "/camera_back/image_raw"
+    - "/usb_camera_1/image_raw_0"
   camera_2:
-    - "/usb_camera_1/image_raw_1"
-    - "/camera_left/image_raw"
     - "/camera/left/image_raw"
+    - "/camera_left/image_raw"
+    - "/usb_camera_1/image_raw_1"
   camera_3:
-    - "/usb_camera_1/image_raw_2"
-    - "/camera_right/image_raw"
     - "/camera/right/image_raw"
+    - "/camera_right/image_raw"
+    - "/usb_camera_1/image_raw_2"
 # JPEG encoding and point-cloud packing run in one bounded worker process per
 # stream; this keeps the robot ROS executor available for control/state topics.
 media_workers: true

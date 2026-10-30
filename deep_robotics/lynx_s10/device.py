@@ -18,7 +18,7 @@ from pathlib import Path
 from basic_server import BasicServerClient, _protocol_int
 from common.vendor_runtime import action_schema, tool
 from domain_bridge import CoreBridge
-from media_workers import MediaWorkers
+from media_workers import MediaWorkers, encode_pointcloud
 
 
 def _mark_dangerous(result, actions):
@@ -83,7 +83,7 @@ class S10Nodes:
         import json
         import time
         from rclpy.node import Node
-        from rclpy.qos import qos_profile_sensor_data
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
         from drdds.msg import BatteryData, JointsData, MotionInfo
         from sensor_msgs.msg import CompressedImage, Image, Imu, PointCloud2
         from std_msgs.msg import String
@@ -107,10 +107,10 @@ class S10Nodes:
         # semantic front/rear/left/right names. Subscribe to all known
         # aliases; the first active source wins without blocking the others.
         camera_topics = config.get("camera_topics", {
-            "camera_0": ["/usb_camera_1/image_raw", "/camera_front/image_raw", "/camera/front/image_raw"],
-            "camera_1": ["/usb_camera_1/image_raw_0", "/camera_back/image_raw", "/camera/rear/image_raw"],
-            "camera_2": ["/usb_camera_1/image_raw_1", "/camera_left/image_raw", "/camera/left/image_raw"],
-            "camera_3": ["/usb_camera_1/image_raw_2", "/camera_right/image_raw", "/camera/right/image_raw"],
+            "camera_0": ["/camera/front/image_raw", "/camera_front/image_raw", "/usb_camera_1/image_raw"],
+            "camera_1": ["/camera/rear/image_raw", "/camera_back/image_raw", "/usb_camera_1/image_raw_0"],
+            "camera_2": ["/camera/left/image_raw", "/camera_left/image_raw", "/usb_camera_1/image_raw_1"],
+            "camera_3": ["/camera/right/image_raw", "/camera_right/image_raw", "/usb_camera_1/image_raw_2"],
         })
         self.topics.update({key: {"topic": base + key, "format": "image/jpeg"}
                             for key in camera_topics})
@@ -138,11 +138,11 @@ class S10Nodes:
                     self.media_workers.add_camera(key)
             self.media_workers.add_lidar("lidar")
         topics = config.get("topics", {})
-        # Camera and lidar publishers on the S10 use sensor-data QoS.  A
-        # RELIABLE subscription cannot match a BEST_EFFORT publisher, so use
-        # the standard volatile/BEST_EFFORT profile for both sides of these
-        # high-rate streams.
-        stream_qos = qos_profile_sensor_data
+        # The S10's native ROS publishers (including image and point-cloud
+        # topics) advertise RELIABLE/volatile. BEST_EFFORT subscriptions do
+        # not match those endpoints, so use a compatible profile throughout.
+        stream_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE,
+                                durability=DurabilityPolicy.VOLATILE)
         self._stream_lock = threading.Lock()
         self._stream_stats = {
             name: {"received": 0, "published": 0, "dropped": 0,
@@ -162,10 +162,10 @@ class S10Nodes:
             "lidar": topics.get("lidar", ["/LIDAR/POINTS", "/DEPTH_POINTS", "/local_scans"]),
         }
         self._source_topics.update({key: value for key, value in camera_topics.items()})
-        self.robot.create_subscription(Imu, topics.get("imu", "/IMU"), self._forward_imu, qos_profile_sensor_data)
-        self.robot.create_subscription(JointsData, topics.get("joints", "/JOINTS_DATA_10HZ"), self._forward_joints, qos_profile_sensor_data)
-        self.robot.create_subscription(BatteryData, topics.get("battery", "/BATTERY_DATA"), self._forward_battery, qos_profile_sensor_data)
-        self.robot.create_subscription(MotionInfo, topics.get("motion_info", "/MOTION_INFO"), self._forward_loco_state, qos_profile_sensor_data)
+        self.robot.create_subscription(Imu, topics.get("imu", "/IMU"), self._forward_imu, stream_qos)
+        self.robot.create_subscription(JointsData, topics.get("joints", "/JOINTS_DATA_10HZ"), self._forward_joints, stream_qos)
+        self.robot.create_subscription(BatteryData, topics.get("battery", "/BATTERY_DATA"), self._forward_battery, stream_qos)
+        self.robot.create_subscription(MotionInfo, topics.get("motion_info", "/MOTION_INFO"), self._forward_loco_state, stream_qos)
         lidar_topics = topics.get("lidar", "/LIDAR/POINTS")
         self._lidar_topics = [lidar_topics] if isinstance(lidar_topics, str) else list(lidar_topics)
         self._active_lidar_source = None
@@ -282,9 +282,37 @@ class S10Nodes:
         values = jsonable(msg)
         batteries = values.get("data", []) if isinstance(values, dict) else []
         slots = batteries if isinstance(batteries, list) else []
-        payload = {"batteries": {
-            f"battery_{index}": battery for index, battery in enumerate(slots)
-        }}
+        # Keep actual packs and their fields addressable by slot. Fixed-size
+        # arrays such as battery_serialnum contain reserved zero entries;
+        # retain those as one compact field instead of expanding them into
+        # dozens of dashboard values.
+        payload = {"batteries": {}}
+        for index, battery in enumerate(slots):
+            if not isinstance(battery, dict):
+                payload["batteries"][f"battery_{index}"] = (
+                    {"all_zero_placeholder": True} if _all_zero_placeholder(battery) else battery)
+                continue
+            if _all_zero_placeholder(battery):
+                payload["batteries"][f"battery_{index}"] = {"all_zero_placeholder": True}
+                continue
+            compact = {}
+            placeholders = {}
+            for field, value in battery.items():
+                if isinstance(value, (list, tuple)) and value and all(
+                        _all_zero_placeholder(item) for item in value):
+                    placeholders[field] = {"all_zero": True, "length": len(value)}
+                else:
+                    compact[field] = value
+            if placeholders:
+                compact["zero_placeholder_fields"] = placeholders
+            if compact and any(not _all_zero_placeholder(value)
+                               for key, value in compact.items()
+                               if key != "zero_placeholder_fields"):
+                payload["batteries"][f"battery_{index}"] = compact
+            elif compact:
+                payload["batteries"][f"battery_{index}"] = compact
+            else:
+                payload.setdefault("zero_placeholder_slots", []).append(index)
         self._publish_json("battery", payload)
 
     def _forward_loco_state(self, msg):
@@ -381,7 +409,8 @@ class S10Nodes:
             return
         self._record_stream("lidar", "received")
         if self.media_workers is not None:
-            fields = [(field.name, field.offset) for field in msg.fields]
+            fields = [(field.name, field.offset, field.datatype, field.count)
+                      for field in msg.fields]
             submitted = self.media_workers.submit(
                 "lidar", (None, fields, msg.is_bigendian, msg.width, msg.height,
                            msg.row_step, msg.point_step, bytes(msg.data)))
@@ -421,31 +450,11 @@ class S10Nodes:
     @staticmethod
     def _pointcloud_packet(msg):
         """Encode a bounded, spatially distributed sample for the cloud renderer."""
-        fields = {field.name: field.offset for field in msg.fields}
-        if not all(name in fields for name in ("x", "y", "z")):
-            return None
-        endian = ">" if msg.is_bigendian else "<"
-        width = int(msg.width)
-        total_points = width * int(msg.height)
-        if width <= 0 or total_points <= 0:
-            return struct.pack("<II", 12, 0)
-
-        stride = max(1, math.ceil(total_points / MAX_LIDAR_RENDER_POINTS))
-        packed = bytearray(struct.pack("<II", 12, 0))
-        count = 0
-        for index in range(0, total_points, stride):
-            row, col = divmod(index, width)
-            offset = row * int(msg.row_step) + col * int(msg.point_step)
-            try:
-                point = tuple(struct.unpack_from(endian + "f", msg.data, offset + fields[name])[0]
-                              for name in ("x", "y", "z"))
-            except struct.error:
-                continue
-            if all(math.isfinite(value) for value in point):
-                packed.extend(struct.pack("<fff", *point))
-                count += 1
-        struct.pack_into("<I", packed, 4, count)
-        return packed
+        fields = [(field.name, field.offset, field.datatype, field.count)
+                  for field in msg.fields]
+        return encode_pointcloud(fields, msg.is_bigendian, msg.width, msg.height,
+                                 msg.row_step, msg.point_step, bytes(msg.data),
+                                 MAX_LIDAR_RENDER_POINTS)
 
     def close(self):
         if self.media_workers is not None:
@@ -465,6 +474,25 @@ JOINT_NAMES = (
 )
 URDF_PATH = Path(__file__).with_name("resource") / "S10.urdf"
 MAX_LIDAR_RENDER_POINTS = 2000
+JOINT_DIRECTIONS = (1, 1, -1, 1, 1, -1, 1, -1,
+                    -1, 1, -1, 1, -1, -1, 1, -1)
+JOINT_OFFSETS_DEG = (-35, -145, 156, 0, 35, -145, 156, 0,
+                     -35, 145, -156, 0, 35, 145, -156, 0)
+MODEL_REFERENCE_ANGLES = (0.0, -0.35, 0.65, 0.0,
+                          0.0, -0.35, 0.65, 0.0,
+                          0.0, 0.35, -0.65, 0.0,
+                          0.0, 0.35, -0.65, 0.0)
+
+
+def _model_joint_position(value, index):
+    if value is None:
+        return None
+    try:
+        return (float(value) * JOINT_DIRECTIONS[index]
+                + math.radians(JOINT_OFFSETS_DEG[index])
+                - MODEL_REFERENCE_ANGLES[index])
+    except (TypeError, ValueError):
+        return value
 
 
 def _joint_value(joint, *keys):
@@ -596,7 +624,8 @@ def _skeleton_payload(items, raw_joints=None):
         raw = raw_joints[idx] if idx < len(raw_joints) else None
         joints.append({
             "idx": idx, "name": name,
-            "q": _joint_value(raw, "q", "Q", "position", "Position", "Pos", "Angle"),
+            "q": _model_joint_position(
+                _joint_value(raw, "q", "Q", "position", "Position", "Pos", "Angle"), idx),
             "dq": _joint_value(raw, "dq", "DQ", "velocity", "Velocity", "Speed"),
             "tau": _joint_value(raw, "tau", "Tau", "torque", "Torque", "TorqueEst"),
             "temperature": _joint_value(raw, "temperature", "Temperature", "Temp", "motion_temp", "driver_temp"),
@@ -1094,41 +1123,61 @@ class S10NavigationPlugin:
 
 LIGHT_COLORS = {"黑色": 0, "白色": 1, "绿色": 2, "蓝色": 3}
 LIGHT_EFFECTS = {"常亮": 0, "填充流水": 1, "移动流水": 2, "渐变流水": 3, "呼吸": 4, "闪烁": 5}
+LIGHT_STATIC_EFFECTS = {name: code for name, code in LIGHT_EFFECTS.items()
+                        if name not in ("呼吸", "闪烁")}
+LIGHT_CYCLIC_EFFECTS = {name: LIGHT_EFFECTS[name] for name in ("呼吸", "闪烁")}
 
 
 class S10LightPlugin:
-    ACTIONS = {"set": (["head_color", "tail_color", "head_effect", "tail_effect",
-                        "head_cycle_seconds", "tail_cycle_seconds"],
-                        "设置头灯和尾灯的具名颜色与灯效")}
+    ACTIONS = {
+        "set": (["head_color", "tail_color", "head_effect", "tail_effect"],
+                "设置头灯和尾灯颜色与非周期灯效"),
+        "set_head_periodic": (["head_color", "tail_color", "head_periodic_effect",
+                               "tail_effect", "head_cycle_seconds"],
+                              "设置头灯呼吸/闪烁，并设置尾灯非周期灯效"),
+        "set_tail_periodic": (["head_color", "tail_color", "head_effect",
+                               "tail_periodic_effect", "tail_cycle_seconds"],
+                              "设置尾灯呼吸/闪烁，并设置头灯非周期灯效"),
+        "set_both_periodic": (["head_color", "tail_color", "head_periodic_effect",
+                               "tail_periodic_effect", "head_cycle_seconds",
+                               "tail_cycle_seconds"], "设置头灯和尾灯呼吸/闪烁及各自周期"),
+    }
 
     def __init__(self, native): self.native = native
     def get_tool(self):
-        return tool("light", "actuator", "山猫 S10 头尾灯控制。固件仅支持黑、白、绿、蓝四种颜色，不支持自定义 RGB；灯效和呼吸/闪烁周期均使用具名选项。", action_schema(self.ACTIONS, {
+        result = tool("light", "actuator", "山猫 S10 头尾灯控制。固件仅支持黑、白、绿、蓝四种颜色，不支持自定义 RGB。常规灯效使用 set；需要呼吸或闪烁时选择对应 periodic 动作，周期字段只会在该动作下显示。", action_schema(self.ACTIONS, {
             "head_color": {"type": "string", "enum": list(LIGHT_COLORS), "default": "白色", "description": "头灯颜色"},
             "tail_color": {"type": "string", "enum": list(LIGHT_COLORS), "default": "白色", "description": "尾灯颜色"},
-            "head_effect": {"type": "string", "enum": list(LIGHT_EFFECTS), "default": "常亮", "description": "头灯效果"},
-            "tail_effect": {"type": "string", "enum": list(LIGHT_EFFECTS), "default": "常亮", "description": "尾灯效果"},
+            "head_effect": {"type": "string", "enum": list(LIGHT_STATIC_EFFECTS), "default": "常亮", "description": "头灯非周期效果"},
+            "tail_effect": {"type": "string", "enum": list(LIGHT_STATIC_EFFECTS), "default": "常亮", "description": "尾灯非周期效果"},
+            "head_periodic_effect": {"type": "string", "enum": list(LIGHT_CYCLIC_EFFECTS), "default": "呼吸", "description": "头灯周期效果"},
+            "tail_periodic_effect": {"type": "string", "enum": list(LIGHT_CYCLIC_EFFECTS), "default": "呼吸", "description": "尾灯周期效果"},
             "head_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
-                                    "description": "头灯呼吸或闪烁周期（秒）",
-                                    "x-visible-when": {"head_effect": ["呼吸", "闪烁"]}},
+                                    "description": "头灯呼吸/闪烁周期（秒）"},
             "tail_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
-                                    "description": "尾灯呼吸或闪烁周期（秒）",
-                                    "x-visible-when": {"tail_effect": ["呼吸", "闪烁"]}},
+                                    "description": "尾灯呼吸/闪烁周期（秒）"},
         }))
+        return result
     def start(self): pass
     def stop(self): pass
     def dispatch(self, action, args):
         if action == "start": return {"state": "ready"}
         if action == "stop": return {"state": "idle"}
         if action == "info": return {"state": "ready"}
-        if action == "set":
+        if action in self.ACTIONS and action.startswith("set"):
             leds = []
             for side in ("head", "tail"):
+                effect_name = (args.get(f"{side}_periodic_effect", "呼吸")
+                               if action in (f"set_{side}_periodic", "set_both_periodic")
+                               else args.get(f"{side}_effect", "常亮"))
+                if action == "set" and effect_name not in LIGHT_STATIC_EFFECTS:
+                    return {"ok": False, "code": "INVALID_ARGUMENT",
+                            "error": "Use a periodic light action for 呼吸/闪烁"}
                 led = {
-                    "Type": LIGHT_EFFECTS[args.get(f"{side}_effect", "常亮")],
+                    "Type": LIGHT_EFFECTS[effect_name],
                     "Color": [LIGHT_COLORS[args.get(f"{side}_color", "白色")]],
                 }
-                if args.get(f"{side}_effect", "常亮") in ("呼吸", "闪烁"):
+                if effect_name in LIGHT_CYCLIC_EFFECTS:
                     led["Cycle"] = int(args.get(f"{side}_cycle_seconds", 1))
                 leds.append(led)
             # The Pro firmware applies this command but does not send an ASDU
