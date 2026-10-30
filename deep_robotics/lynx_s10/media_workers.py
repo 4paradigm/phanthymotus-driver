@@ -162,8 +162,6 @@ def _jpeg(width, height, step, encoding, data):
     encoding = str(encoding).lower()
     if encoding in ("jpeg", "jpg", "mjpeg"):
         payload = bytes(data)
-        if payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9"):
-            return payload
         try:
             image = Image.open(BytesIO(payload)).convert("RGB")
         except (OSError, ValueError):

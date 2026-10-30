@@ -21,6 +21,7 @@ from domain_bridge import CoreBridge
 from media_workers import MediaWorkers, encode_pointcloud
 
 CAMERA_LANES = ("camera_rear", "camera_left", "camera_front", "camera_right")
+MEDIA_MAX_AGE_S = 0.75
 
 
 def _mark_dangerous(result, actions):
@@ -551,7 +552,22 @@ class S10Nodes:
         except (ValueError, OSError):
             return None
 
+    @staticmethod
+    def _fresh_header(header):
+        """Reject DDS samples that were already stale before this callback."""
+        if header is None or not hasattr(header, "stamp"):
+            return True
+        stamp = header.stamp
+        seconds = float(getattr(stamp, "sec", 0)) + float(getattr(stamp, "nanosec", 0)) / 1e9
+        if seconds <= 0:
+            return True
+        age = time.time() - seconds
+        return -0.25 <= age <= MEDIA_MAX_AGE_S
+
     def _forward_camera(self, key, msg, already_received=False):
+        if not self._fresh_header(msg.header):
+            self._record_stream(key, "dropped")
+            return
         if not already_received:
             self._record_stream(key, "received")
         if self.media_workers is not None:
@@ -574,6 +590,9 @@ class S10Nodes:
         self._record_stream(key, "published")
 
     def _forward_compressed_camera(self, key, msg, already_received=False):
+        if not self._fresh_header(msg.header):
+            self._record_stream(key, "dropped")
+            return
         if not already_received:
             self._record_stream(key, "received")
         if self.media_workers is not None:
@@ -605,6 +624,9 @@ class S10Nodes:
         if msg is None:
             msg, source = source, None
         now = time.monotonic()
+        if not self._fresh_header(getattr(msg, "header", None)):
+            self._record_stream("lidar", "dropped")
+            return
         if source is not None:
             self._lidar_source_last_seen[source] = now
             active_seen = self._lidar_source_last_seen.get(self._active_lidar_source, 0)
@@ -633,8 +655,14 @@ class S10Nodes:
         if self.media_workers is not None:
             fields = [(field.name, field.offset, field.datatype, field.count)
                       for field in msg.fields]
+            header = getattr(msg, "header", None)
+            stamp = getattr(header, "stamp", None)
+            media_header = ((getattr(header, "frame_id", "") if header else ""),
+                            getattr(stamp, "sec", 0) if stamp else 0,
+                            getattr(stamp, "nanosec", 0) if stamp else 0)
             submitted = self.media_workers.submit(
-                "lidar", (None, fields, msg.is_bigendian, msg.width, msg.height,
+                "lidar", (media_header,
+                           fields, msg.is_bigendian, msg.width, msg.height,
                            msg.row_step, msg.point_step, bytes(msg.data)))
             if not submitted:
                 self._record_stream("lidar", "dropped")
