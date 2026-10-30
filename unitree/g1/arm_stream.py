@@ -80,6 +80,8 @@ class ArmStreamExecutor:
         self._feedback = {'q': [], 'dq': [], 'arm_ns': 0, 'fault': True}
         self._source_tick = None
         self._source_time_ns = None
+        # Bumped on feedback gaps and mode changes; teaching previews bind it.
+        self._feedback_epoch = 0
         self._subscriber = None
         self._fsm_subscriber = self._arm_observer = None
         self._fsm = {'arm_ns': 0}
@@ -203,18 +205,36 @@ class ArmStreamExecutor:
                 if delta is not None and not 0 < delta < 0x80000000: return
                 # G1 tick advances in milliseconds; late delivery cannot renew source age.
                 sampled_ns = received_ns if delta is None else min(received_ns, self._source_time_ns+delta*1_000_000)
+                if self._feedback['arm_ns'] and received_ns-self._feedback['arm_ns'] > 100_000_000:
+                    self._feedback_epoch += 1
                 self._source_tick = tick
                 self._source_time_ns = sampled_ns
                 self._feedback = {**feedback, 'arm_ns':sampled_ns,'received_ns':received_ns,
                     'source_tick':tick}
         except Exception as exc:
             with self._feedback_lock:
+                if not self._feedback.get('error'): self._feedback_epoch += 1
                 self._feedback = {**self._feedback,'error':type(exc).__name__}
 
     def _on_fsm(self, msg):
         received_ns = self.clock()
+        current = (int(msg.fsm_id), int(msg.fsm_mode))
         with self._feedback_lock:
-            self._fsm = {'arm_ns':received_ns,'fsm_id':int(msg.fsm_id),'fsm_mode':int(msg.fsm_mode)}
+            previous = (self._fsm.get('fsm_id'), self._fsm.get('fsm_mode'))
+            # Unitree supports arm actions in both 801 substates 0 and 3.
+            # Normal arm takeover crosses between them without changing the
+            # operator's motion mode. Other transitions still revoke grants.
+            arm_substates = {(801, 0), (801, 3)}
+            mode_changed = previous != current and not (
+                previous in arm_substates and current in arm_substates)
+            if self._fsm['arm_ns'] and (received_ns-self._fsm['arm_ns'] > 100_000_000 or mode_changed):
+                self._feedback_epoch += 1
+            self._fsm = {'arm_ns':received_ns,'fsm_id':current[0],'fsm_mode':current[1]}
+
+    @property
+    def feedback_epoch(self):
+        gaps = self._low_state.gaps if self._low_state is not None else 0
+        with self._feedback_lock: return self._feedback_epoch+gaps
 
     def _snapshot(self):
         if self._snapshot_provider: return copy.deepcopy(self._snapshot_provider())
@@ -431,11 +451,17 @@ class ArmStreamExecutor:
                     # Continue the safe SDK handback, but do not start a vendor
                     # gesture after an explicit stop cancelled its pending work.
                     op['action_id']=None
-                else:
-                    # ExecuteAction has no cancel/status API. Once 99 was sent,
-                    # a local stop cannot honestly report the vendor action as
-                    # cancelled or acquire its control back silently.
+                elif op.get('operator_reset'):
+                    # Reset has only a no-reply transport acknowledgement.
+                    # An explicit stop must still wait for the operator's
+                    # baseline confirmation, not treat a DDS write as release.
                     op.update(state='unknown',reason='release_action_stop_unconfirmed')
+                else:
+                    # 99 already owns the handback. Stop cannot cancel that
+                    # RPC, but must not discard its eventual receipt either.
+                    # Keep waiting on this same operation and fresh rest;
+                    # neither another RPC nor an early success is warranted.
+                    op['stop_pending_vendor_action'] = True
                 return copy.deepcopy(op)
             if ident in self._operations: return copy.deepcopy(self._operations[ident])
             if self._operation and self._operation['state'] not in ('completed','failed','unknown'):
@@ -450,6 +476,9 @@ class ArmStreamExecutor:
             if self._legacy_busy(): raise ValueError('external_control_owned')
             _,q,_ = self._fresh()
             self.hold('release_requested',release=True)
+            # Handback now owns the actuator. The finished replay must not
+            # overwrite a release failure with its expired 100 ms watchdog.
+            self.replay_deadline_ns = None
             self._prepared=False
             ident = ident or secrets.token_hex(16)
             self._operation = {'operation_id':ident,'state':'holding','started_ns':self.clock(),
@@ -616,12 +645,22 @@ class ArmStreamExecutor:
                 op['sdk_return'],op['sdk_returned_ns']=ret,self.clock()
                 success=type(ret) is int and ret==0
                 if op.get('operator_reset'): op['request_sent'] = success
-                if op['state']=='unknown':return  # Stop cannot retract an in-flight request.
+                # A late receipt belongs only to this operation. A local
+                # deadline while the RPC was pending is recoverable on an
+                # actual success; a feedback fault/operator reset is not.
+                late = (op['state']=='unknown' and op.get('reason')=='release_timeout'
+                        and op.get('timed_out_state')=='sdk_pending')
+                if op is not self._operation or (op['state']!='sdk_pending' and not late):return
                 if success and op.get('operator_reset'):
                     self._complete_release(op, physical_confirmed=False)
                     return
-                op['state']='awaiting_feedback' if success else 'failed'
-                if not success:op['reason']='release_sdk_error'
+                if success:
+                    op['state']='awaiting_feedback'
+                    op.pop('reason',None)
+                else:
+                    # 3104 is an unknown RPC outcome, never a stopped robot.
+                    op.update(state='unknown' if ret==3104 else 'failed',
+                              reason='release_sdk_timeout' if ret==3104 else 'release_sdk_error')
                 self._settle=None
         except Exception as exc:
             with self.lock:op.update(state='failed' if op.get('operator_reset') else 'unknown',
@@ -632,8 +671,14 @@ class ArmStreamExecutor:
         if op is None or op['state'] in ('completed','failed','unknown'):return
         now=self.clock()
         if op.get('operator_reset') and op['state']=='sdk_pending':return
-        if now-op['started_ns']>10_000_000_000:
-            op.update(state='unknown',reason='release_timeout');return
+        # The receipt and physical settling are separate phases. A late
+        # successful RPC must still get fresh feedback, not inherit an already
+        # expired RPC deadline and immediately become unknown again.
+        phase_start = op['sdk_returned_ns'] if op['state']=='awaiting_feedback' else op['started_ns']
+        if now-phase_start>10_000_000_000:
+            op.update(timed_out_state=op['state'],state='unknown',reason='release_timeout')
+            self._settle=None
+            return
         if op['state']=='holding':
             if self._channel_open:
                 self._write(q,None,self._weight)
@@ -668,7 +713,10 @@ class ArmStreamExecutor:
                 op['state']='sdk_pending'
                 self._rpc_thread=threading.Thread(target=self._invoke99,args=(op,),name='g1-arm-release',daemon=True)
                 self._rpc_thread.start()
-            else:op['state']='awaiting_feedback';op['sdk_returned_ns']=now;self._settle=None
+            else:
+                # No vendor action follows a plain stop. The fresh stationary
+                # sample above already confirms the zero-weight handback.
+                self._complete_release(op, physical_confirmed=not op.get('operator_reset'))
             return
         if op['state']=='awaiting_feedback':
             if op.get('operator_reset'):
@@ -690,11 +738,43 @@ class ArmStreamExecutor:
         self._hold_confirmed=physical_confirmed
         if self._channel_open:self._channel.close();self._channel_open=False
 
+    def _late_rest_candidate(self, op):
+        # A zero-weight stop that timed out with no vendor action in flight
+        # may still receive late physical confirmation. Lock held by caller.
+        return bool(op and op['state']=='unknown' and op.get('reason')=='release_timeout'
+                    and op.get('action_id') is None and not op.get('request_sent')
+                    and op.get('zero_writes',0)>=5 and self._weight==0
+                    and not (self._rpc_thread and self._rpc_thread.is_alive()))
+
+    def awaiting_late_rest(self, operation_id):
+        """True while this same stop can still settle; raises on stale feedback.
+
+        Lets a caller keep waiting past the release deadline without
+        reissuing stop or 99, and without reading executor internals.
+        """
+        with self.lock:
+            op=self._operation
+            if not (self._late_rest_candidate(op) and op.get('operation_id')==operation_id
+                    and op.get('timed_out_state')=='confirming_handback'
+                    and not op.get('operator_reset') and self.state not in ('fault','active')):
+                return False
+        self._fresh()
+        return True
+
     def tick(self):
         with self.lock:
             if not self.session_id and not (self._operation and self._operation['state'] not in ('completed','failed','unknown')):return
             try:
                 s,q,dq=self._fresh()
+                op=self._operation
+                if (self._late_rest_candidate(op)
+                        and (op.get('handback_confirmed') or op.get('timed_out_state')=='confirming_handback')):
+                    # A completed zero-weight stop can receive late physical
+                    # confirmation. Never retry an SDK call or replay targets.
+                    if self._stationary(s,q,dq,op['zero_confirmed_ns']):
+                        op['handback_confirmed']=True
+                        self._complete_release(op,physical_confirmed=True)
+                    return
                 if self._operation and self._operation['state'] not in ('completed','failed','unknown'):
                     self._release_tick(s,q,dq);return
                 if self.state=='fault':return
@@ -784,7 +864,10 @@ class ArmStreamExecutor:
 
     def status(self):
         with self.lock:
-            return {'state':self.state,'reason':self.reason,'boot_id':self.boot_id,'session_id':self.session_id,
+            release_reason = (self._operation.get('reason') if self._operation
+                              and self._operation['state'] in ('unknown','failed') else None)
+            return {'state':self.state,'reason':release_reason or self.reason,
+                'boot_id':self.boot_id,'session_id':self.session_id,
                 'sequence':self.seq,'applied_sequence':self.applied_seq,'feedback':self._snapshot(),
                 'commanded_q':copy.deepcopy(self.last_q),'ownership_held':bool(self.session_id or self._opening or self._legacy_pending
                     or self._operation and self._operation['state']!='completed'),

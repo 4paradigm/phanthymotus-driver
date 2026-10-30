@@ -67,6 +67,8 @@ COPY av_recording.py /work/av_recording.py
 COPY servo.py /work/servo.py
 COPY arm_sdk.py /work/arm_sdk.py
 COPY trajectory.py trajectory_control.py /work/
+COPY teaching.py /work/teaching.py
+COPY skill_workbench/ /work/skill_workbench/
 COPY arm_stream.py low_state.py sdk_adapter.py motion_control.py teleop_control.py teleop_bus.py ros_spin.py /work/
 COPY motion/ /work/motion/
 RUN python3 -c 'import sys, numpy, casadi, pinocchio; from pinocchio import casadi as cpin; assert sys.executable == "/usr/bin/python3"; assert numpy.__version__ == "2.2.6"; assert casadi.__version__ == "3.8.1"; assert pinocchio.__version__ == "4.1.0"; cpin.Model(pinocchio.buildSampleModelManipulator())'

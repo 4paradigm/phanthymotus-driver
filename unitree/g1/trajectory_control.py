@@ -113,6 +113,10 @@ class TrajectoryControl:
         with self.lock:
             self._idle()
             generation = self.control._generation
+            # Teaching previews bind the exact file and stop generation. Keep
+            # the ordinary filename-only teleop API unchanged.
+            if args.get('expected_generation', generation) != generation:
+                raise ValueError('replay_cancelled')
             self.motion.stop()
             if self.arm.profile is None:
                 self.arm.configure_profile(self.motion.cfg['calibration_path'],
@@ -120,6 +124,8 @@ class TrajectoryControl:
             self.arm.start()
             recording = read_recording(self.directory, args.get('filename'), self.arm.limits)
             self._check_binding(recording)
+            if args.get('expected_sha256', recording['sha256']) != recording['sha256']:
+                raise ValueError('recording_changed_after_preview')
             if recording['frames'][0]['kind'] != 'target': raise ValueError('recording_initial_target_missing')
             ident = secrets.token_hex(16)
             with self.control._lock:
@@ -172,6 +178,7 @@ class TrajectoryControl:
 
     def _run(self, ident, recording):
         status, result = 'error', {}
+        trajectory_completed = False
         try:
             if self.cancel.is_set(): raise ValueError('replay_cancelled')
             prepared = self.arm.dispatch('prepare_operator_session', {})
@@ -201,16 +208,27 @@ class TrajectoryControl:
                 self._send_frame(frame, seq)
             self._wait_until(start+recording['duration_ns'])
             status = 'completed'
+            trajectory_completed = True
             result = {'filename': recording['filename'], 'sha256': recording['sha256'], 'frames': len(recording['frames'])}
         except Exception as exc:
             status = 'cancelled' if self.cancel.is_set() else 'error'
             result = {'reason': str(exc)}
         finally:
+            result['trajectory_completed'] = trajectory_completed
+            self.last_action.update(phase='releasing', result=copy.deepcopy(result))
             try:
-                stopped = self.control._stop_motion()
+                stopped = self.control._stop_motion(replay_completion=True)
                 result['stop'] = stopped
             except Exception as exc:
                 status = 'error'; result['stop_error'] = str(exc)
+                release = self.arm.status().get('release') or {}
+                result['stop'] = {k: release.get(k) for k in (
+                    'operation_id', 'state', 'physical_confirmed', 'authority_released')}
+                result['failure_stage'] = 'release'
+                result['message'] = ('录制轨迹已结束，停止交权尚未确认。请查询同一次交权状态，不要重复执行动作。'
+                    if trajectory_completed else '轨迹未完整结束，停止交权也未确认。请检查设备状态，不要重复执行动作。')
+            if status == 'completed' and self.cancel.is_set():
+                status = 'cancelled'
             with self.arm.lock: self.arm.replay_deadline_ns = None
             self.last_action = {'action_id': ident, 'status': status, 'result': result}
             self.notify(ident, status, result)

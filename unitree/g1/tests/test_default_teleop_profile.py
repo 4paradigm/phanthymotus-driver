@@ -101,6 +101,7 @@ def test_bundle_can_register_teleop_with_servo_cards(monkeypatch, legacy, teleop
         'motion_control': {'MotionControl': Stub},
         'teleop_control': {'TeleopControl': Stub},
         'teleop_bus': {'TeleopBus': Stub},
+        'teaching': {'teaching_plugin': lambda control: Stub()},
         'servo': {'G1ServoPlugin': Stub},
         'servo_eef': {'G1ServoEefPlugin': Stub},
     }.items():
@@ -113,7 +114,7 @@ def test_bundle_can_register_teleop_with_servo_cards(monkeypatch, legacy, teleop
             namespace['G1DeviceBundle'](config, 'offline', None, None, None, None, None)
         return
     bundle = namespace['G1DeviceBundle'](config, 'offline', None, None, None, None, None)
-    assert len(bundle._plugins) == 4
+    assert len(bundle._plugins) == 5
     assert bundle._plugins[0]._teleop_control is bundle._plugins[1]
 
 
@@ -174,6 +175,7 @@ def test_bundle_owns_one_source_independent_of_display_and_arm(monkeypatch, stat
         'motion_control': {'MotionControl':Plugin},
         'teleop_control': {'TeleopControl':Plugin},
         'teleop_bus': {'TeleopBus':Plugin},
+        'teaching': {'teaching_plugin':lambda control: Plugin()},
     }.items(): monkeypatch.setitem(sys.modules, name, SimpleNamespace(**attrs))
     cfg = {'plugins':{'state':{'enabled':state}, 'loco':{'enabled':loco}, 'arm':{'enabled':teleop},
                       'smart_motion':{'enabled':False}}, 'teleop_control':{'enabled':teleop}}

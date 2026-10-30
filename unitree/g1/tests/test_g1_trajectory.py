@@ -292,7 +292,7 @@ def test_replay_stop_is_not_blocked_by_file_verification(tmp_path, monkeypatch):
         release.set(); done.set(); ticker.join(1)
 
 
-@pytest.mark.parametrize('failure', ['cancel', 'stop_unconfirmed'])
+@pytest.mark.parametrize('failure', ['cancel', 'stop_unconfirmed', 'cancel_during_release'])
 def test_replay_failure_never_reports_completed(tmp_path, failure):
     card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
     try:
@@ -309,12 +309,25 @@ def test_replay_failure_never_reports_completed(tmp_path, failure):
             return original_wait(deadline)
         card.trajectory._wait_until = wait
         if failure == 'stop_unconfirmed':
-            card._stop_motion = lambda: (_ for _ in ()).throw(ValueError('stop_unconfirmed'))
+            card._stop_motion = lambda **kwargs: (_ for _ in ()).throw(ValueError('stop_unconfirmed'))
+        if failure == 'cancel_during_release':
+            original_stop = card._stop_motion
+            def stopped(**kwargs):
+                result = original_stop(**kwargs)
+                card.trajectory.cancel.set()
+                return result
+            card._stop_motion = stopped
         result = card.dispatch('play', {'filename': name})
         card.trajectory.thread.join(6)
         outcome = card.dispatch('action_status', {'action_id': result['action_id']})
-        assert outcome['status'] == ('cancelled' if failure == 'cancel' else 'error'), outcome
+        assert outcome['status'] == ('error' if failure == 'stop_unconfirmed' else 'cancelled'), outcome
         assert receipts[-1][0] == result['action_id'] and receipts[-1][1] != 'completed'
+        if failure == 'stop_unconfirmed':
+            assert outcome['result']['trajectory_completed'] is True
+            assert outcome['result']['failure_stage'] == 'release'
+            assert outcome['result']['stop_error'] == 'stop_unconfirmed'
+        if failure == 'cancel_during_release':
+            assert outcome['result']['trajectory_completed'] is True
     finally:
         card.trajectory.stop(); done.set(); ticker.join(1)
 

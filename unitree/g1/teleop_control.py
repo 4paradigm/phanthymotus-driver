@@ -573,7 +573,7 @@ class TeleopControl:
                 with self._lock: self._state, self._reason = 'fault', str(exc)
             self._closed.wait(.005)
 
-    def _stop_motion(self, *, operator_confirmation=False):
+    def _stop_motion(self, *, operator_confirmation=False, replay_completion=False):
         self.motion.cancel_pending()
         with self.motion._lock:
             self.motion._preview = None
@@ -588,13 +588,35 @@ class TeleopControl:
             confirmed = operator_confirmation and self.executor.confirm_operator_reset()
             result = {} if confirmed else self.executor.dispatch('stop', {})
             if result.get('error'): raise ValueError(result.get('code', result['error']))
-            deadline = time.monotonic()+12.
-            while self.executor.status()['ownership_held'] and time.monotonic() < deadline:
+            operation_id = result.get('operation_id')
+            started = time.monotonic()
+            while True:
+                state = self.executor.status()
+                release = state.get('release') or {}
+                if replay_completion and operation_id and release.get('operation_id') != operation_id:
+                    raise ValueError('release_operation_changed')
+                if not state['ownership_held']:
+                    break
+                elapsed = time.monotonic()-started
+                if elapsed >= 12.:
+                    # Keep this replay pending while the SAME zero-weight stop
+                    # settles late; never reissue stop or 99.
+                    if (elapsed >= 30. or not (replay_completion and operation_id)
+                            or not self.executor.awaiting_late_rest(operation_id)):
+                        break
                 if confirmed:self.executor.confirm_operator_reset()
                 time.sleep(.02)
-            state = self.executor.status()
-            if state['ownership_held']: raise ValueError(state['reason'] or 'stop_unconfirmed')
+            if state['ownership_held']:
+                raise ValueError((state.get('release') or {}).get('reason') or state['reason'] or 'stop_unconfirmed')
+            if replay_completion and operation_id:
+                if (release.get('state') != 'completed' or not release.get('physical_confirmed')
+                        or not release.get('authority_released') or release.get('operator_reset')
+                        or state.get('output_active')):
+                    raise ValueError('release_not_physically_confirmed')
             result = {'state': 'idle', 'authority_released': True, 'return_required': False}
+            if replay_completion and operation_id:
+                result.update(operation_id=operation_id, physical_confirmed=True,
+                              settled_after_timeout=bool(release.get('timed_out_state')))
         with self._lock:
             self._reset_operation = None
             self._state, self._reason = 'idle', None
