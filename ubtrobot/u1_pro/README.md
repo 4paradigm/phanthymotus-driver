@@ -162,7 +162,7 @@ native 后端现在先判断声音活动，再接受厂商方位事件；保持�
 
 启动、设备切换、音频断流恢复或定位服务重新发现后，先用约 1 秒音频学习背景（建议此时保持安静）。阈值为 `max(minimum_dbfs, background_dbfs + margin_db)`。连续约 150ms 超过阈值后进入活动状态，再等待至少 0.5 秒才接受新定位结果；最近约 150ms 没有超过门限就抑制并清空方向，但保留最多 0.8 秒的活动上下文以容纳字词停顿。超过 0.8 秒安静后重新要求起声和等待。公开心跳最多再等 500ms，输出 `no_event`、`angle_deg: null`。低于阈值期间背景缓慢更新，活动期间冻结背景，避免持续说话/音乐把自身吸收为噪声。回放通道、直流、启动学习期、无效 PCM 都不能单独触发方向。
 
-`config.yaml` 的 `sound_direction.activity` 可调整 `minimum_dbfs`（默认 -65，范围 -90 至 -10）和 `margin_db`（默认 2.5，范围 1 至 30）。默认值只是初始调试值，尚未经真机门控验收：漏掉较轻声音时可降低门限，背景误触发时可提高门限；过高会漏检短句或远处声音。暂不提供网页调参或持久化设置卡。
+`config.yaml` 的 `sound_direction.activity` 可调整 `minimum_dbfs`（默认 -65，范围 -90 至 -10）和 `margin_db`（默认 2.5，范围 1 至 30）。当前默认值已经操作者在本机环境对比后选定，仍需其他环境验收：漏掉较轻声音时可降低门限，背景误触发时可提高门限；过高会漏检短句或远处声音。暂不提供网页调参或持久化设置卡。
 
 卡片 `info` → `source_status.activity` 提供 `active`、`reason`、`level_dbfs`、`background_dbfs`、`threshold_dbfs` 及当前配置。`calibrating` 为学习期，`below_threshold` 为被声音门限抑制，`settling` 为等待定位窗口更新，`sound_detected` 为允许接收事件，`unsupported_or_invalid_audio` 为输入布局/格式不受支持。仅支持已核验的 Bothlent UAC Dongle / Mic Arry 8、16kHz S16LE 8 通道布局，未知输入保守抑制。
 
@@ -182,6 +182,12 @@ native 后端现在先判断声音活动，再接受厂商方位事件；保持�
 
 ## 独立开发与可用版本回退
 
-本分支 feat/u1pro-sound-direction-only 仅包含听声辨位、既有麦克风修复及必要接口，不包含同事未合并的 idle_actions 卡片或其原生控制模块/注册/依赖。当前真机认可部署是 release.261029.49fb570 + perception release.261029.f959e96-jetson-jp6.1；该历史整合镜像含 idle_actions，作为原样回退保存，不代表本分支包含该卡片。本分支未部署，不替换同事真机开发。
+本验收分支 feat/u1pro-sound-direction-acceptance 仅包含听声辨位、既有麦克风修复及必要接口，不包含同事未合并的 idle_actions 卡片或其原生控制模块/注册/依赖。当前真机认可部署是 release.261029.49fb570 + perception release.261029.f959e96-jetson-jp6.1；该历史整合镜像含 idle_actions，作为原样回退保存，不代表本分支包含该卡片。本 PR 镜像用于独立验收；部署后不提供上述未合并卡片。
 
 认可门限：minimum_dbfs=-65、margin_db=2.5，settle=.5s、pause hold=.8s。当前输入输出和单人估计 ASR 关联保留；真实采集窗口及头→胸补偿仍在可行性核查，未开启或宣称可用。
+
+## 本次验收冻结
+
+操作者确认 49fb570 历史整合镜像的声音效果最好，冻结 minimum_dbfs=-65、margin_db=2.5，settle=0.5s、pause hold=0.8s。本 PR 保留相同的 direction_card.py、native_direction.py、sound_activity.py 逻辑，不包含头部补偿或 idle_actions。音频和方向分别接入 ASR 的对应输入；平台实验关联见 phanthymotus PR #353，单人近似关联不能宣称真实采集窗口匹配。
+
+方向的物理参考系尚未验证：操作者观察原始方向可用，两种头部转角加减均未改善，不能据此断言厂商已经做过补偿。本版本不添加颈部角度。现场约15度误差是本次观察，不能当作跨环境精度保证。
