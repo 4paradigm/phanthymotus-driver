@@ -69,9 +69,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(tools['move_head']['inputSchema']['properties']),{'pitch_deg','yaw_deg','time'})
         self.assertNotIn('topic_in',tools['move_head'])
         schema=tools['head_visual_follow']['inputSchema']
-        self.assertEqual(schema['properties'],{})
+        self.assertEqual(set(schema['properties']),{'action'})
+        actions=schema['properties']['action']['enum']
+        self.assertEqual([a for a in actions if a not in {'start','stop','info','config'}],['follow'])
+        self.assertEqual(schema['properties']['action']['default'],'follow')
         self.assertEqual(schema['required'],[])
-        self.assertNotIn('x-action-params',schema)
+        self.assertEqual(schema['x-action-params'],{'follow':{'params':[],'description':'寻找画面人物并跟随'}})
         self.assertEqual(schema['x-completion'],{'background':True,'timeout':0,'silent_completion':True})
         self.assertNotIn('actions',schema['x-completion'])
         self.assertEqual(tools['head_visual_follow']['topic_in'],[])
