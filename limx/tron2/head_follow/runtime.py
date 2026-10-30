@@ -25,11 +25,57 @@ class Runtime:
         self.data_lock = threading.RLock()
         self.packet = None
         self.send_guard = None
+        self.follow_lock = asyncio.Lock()
+        self.session = None
+        self.session_task = None
         self.engine = Engine(Client(self.robot, self.detections, self.move), clock, wall)
         self.adapter.head.follow_guard = self.before_send
 
     def launch(self):
         self.engine.launch()
+
+    def session_update(self, session, **fields):
+        with self.data_lock:
+            session.update(fields)
+
+    def follow_result(self, session):
+        return dict(self.info(), action_id=session['action_id'],
+                    completion_protocol='acp', completion_pending=True)
+
+    async def complete_session(self, session, status, reason, snapshot):
+        if session['state'] != 'running':
+            return
+        # Commit the one terminal result before awaiting HTTP. A stop/shutdown
+        # concurrent with reporting must not send a different terminal payload.
+        result = {'action':'follow','reason':reason,'completion_protocol':'acp',
+            'head_commands_sent':snapshot['head_commands_sent']-session['initial_head_commands'],
+            'motion_sent':snapshot['head_commands_sent']>session['initial_head_commands'] or snapshot['send_result_unknown'],
+            'motion_may_continue':bool(snapshot['head_motion'] or snapshot['send_result_unknown'] or snapshot['error'] or self.adapter.head.active),
+            'send_result_unknown':snapshot['send_result_unknown'],
+            'last_head_motion':copy.deepcopy(snapshot['head_motion']),
+            'error':snapshot['error'], 'automatic_home_sent_by_completion':False}
+        self.session_update(session, state='reporting', status=status, result=result)
+        try:
+            delivered = await self.adapter._report_completion(
+                'head_visual_follow', session['action_id'], status, result)
+        except Exception:
+            delivered = False
+        self.session_update(session, state='settled' if delivered else 'blocked_reporting',
+                            callback_delivered=delivered, finished_at=self.wall())
+
+    async def watch_session(self, session):
+        # Let the MCP response return so Core can register the session before
+        # an immediate stop/fault. The existing callback retries cover races.
+        await asyncio.sleep(.1)
+        while not self.closed and session['state']=='running':
+            snapshot = await asyncio.to_thread(self.engine.info)
+            if snapshot['error'] or snapshot['send_result_unknown'] and not snapshot['active']:
+                await self.complete_session(session,'error','control_fault',snapshot)
+                return
+            if not snapshot['active'] and snapshot['head_motion'] is None:
+                await self.complete_session(session,'cancelled','operator_stop',snapshot)
+                return
+            await asyncio.sleep(.1)
 
     def receive(self, raw, generation):
         if not isinstance(raw, str) or len(raw) > 256 * 1024:
@@ -121,8 +167,11 @@ class Runtime:
 
     async def call(self, args):
         require(not self.closed, '头部跟随正在关闭')
-        action = args.get('action','info')
+        # Empty arguments are the one public Execute operation. Lifecycle
+        # actions remain internal and never produce a top-level action_id.
+        action = args.get('action','follow')
         clean = {k:v for k,v in args.items() if k not in ('input_topic','input_topics')}
+        clean.setdefault('action',action)
         require(not set(clean)-{'action','instance_id','_trace_id'}, '不支持的跟随参数')
         if action in ('start','follow'):
             # No canvas wire is needed. Legacy matching metadata is harmless;
@@ -143,25 +192,62 @@ class Runtime:
             if sub is not None:
                 self.publisher.unsubscribe(sub)
         if action == 'follow':
-            generation = self.generation
-            deadline = self.loop.time()+PREPARE_SECONDS
-            while True:
-                require(not self.closed and self.bound and generation == self.generation, '跟随准备已取消')
+            async with self.follow_lock:
+                snapshot = await asyncio.to_thread(self.engine.info)
+                if self.session is not None:
+                    if self.session['state']=='running' and snapshot['active'] and not self.engine.stop_requested.is_set():
+                        return self.follow_result(self.session)
+                    require(self.session['state']=='settled', '上次跟随会话尚未完成或回调未确认；请核对状态')
+                generation = self.generation
+                deadline = self.loop.time()+PREPARE_SECONDS
+                while True:
+                    require(not self.closed and self.bound and generation == self.generation, '跟随准备已取消')
+                    try:
+                        parse_frame(self.detections(), self.wall())
+                        break
+                    except ValueError:
+                        require(self.loop.time()<deadline, '等待头部VOP的新鲜人物检测；请先开启camera→VOP')
+                        await asyncio.sleep(.05)
+                admission = asyncio.create_task(asyncio.to_thread(self.engine.call, clean))
                 try:
-                    parse_frame(self.detections(), self.wall())
-                    break
-                except ValueError:
-                    require(self.loop.time()<deadline, '等待头部VOP的新鲜人物检测；请先开启camera→VOP')
-                    await asyncio.sleep(.05)
-        return await asyncio.to_thread(self.engine.call, clean)
+                    await asyncio.shield(admission)
+                except asyncio.CancelledError:
+                    # Losing the MCP caller must not leave an untracked enable
+                    # running in a worker after the coroutine has disappeared.
+                    self.engine.stop_requested.set()
+                    try:
+                        await admission
+                    finally:
+                        await asyncio.to_thread(self.engine.call, {'action':'stop'})
+                    raise
+                session = {'action_id':'tron2_follow_'+uuid.uuid4().hex, 'state':'running',
+                    'status':None, 'callback_delivered':False, 'result':None, 'finished_at':None,
+                    'started_at':self.wall(), 'initial_head_commands':snapshot['head_commands_sent']}
+                with self.data_lock:
+                    self.session = session
+                self.session_task = asyncio.create_task(self.watch_session(session))
+                return self.follow_result(session)
+        await asyncio.to_thread(self.engine.call, clean)
+        return self.info()
 
     def info(self):
-        return dict(self.engine.info(), vop_subscribed=self.bound)
+        snapshot = self.engine.info()
+        with self.data_lock:
+            session = copy.deepcopy(self.session)
+        return dict(snapshot, vop_subscribed=self.bound, session=session)
 
     async def close(self):
         if self.closed:
             return
         self.engine.stop_requested.set()
         await self.call({'action':'stop'})
+        if self.session is not None:
+            await self.complete_session(self.session,'cancelled','driver_shutdown',
+                                        await asyncio.to_thread(self.engine.info))
+        if self.session_task is not None:
+            # A reporting callback has a finite timeout and must not be
+            # cancelled midway and then retried as a different terminal state.
+            if self.session_task.done() or self.session['state']!='running':
+                await self.session_task
         self.closed = True
         await asyncio.to_thread(self.engine.close)

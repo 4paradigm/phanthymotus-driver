@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 import sys
 import time
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -33,6 +34,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.reader.head_control_status=AsyncMock(return_value={'vr_head_follow':False})
         self.reader.send_movej=AsyncMock();self.reader.send_gripper=AsyncMock()
         self.adapter.head.report=AsyncMock(return_value=True)
+        self.adapter._report_completion=AsyncMock(return_value=True)
         self.q=[0.]*16;self.feedback()
         self.runtime=Runtime(self.adapter,self.pub);self.adapter.follow_runtime=self.runtime
         self.runner=None
@@ -66,7 +68,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('head_visual_follow',tools);self.assertNotIn('yolo_detect',tools)
         self.assertEqual(set(tools['move_head']['inputSchema']['properties']),{'pitch_deg','yaw_deg','time'})
         self.assertNotIn('topic_in',tools['move_head'])
-        self.assertEqual(list(tools['head_visual_follow']['inputSchema']['x-action-params']),['follow'])
+        schema=tools['head_visual_follow']['inputSchema']
+        self.assertEqual(schema['properties'],{})
+        self.assertEqual(schema['required'],[])
+        self.assertNotIn('x-action-params',schema)
+        self.assertEqual(schema['x-completion'],{'background':True,'timeout':0,'silent_completion':True})
+        self.assertNotIn('actions',schema['x-completion'])
         self.assertEqual(tools['head_visual_follow']['topic_in'],[])
         self.assertEqual(tools['head_visual_follow']['topic_out'],[])
         self.no_sends()
@@ -189,6 +196,93 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             async with session.get(url+'/health') as r:h=await r.json()
             self.assertFalse(h['head_visual_follow']['active'])
         self.no_sends()
+
+    async def test_execute_without_action_and_repeated_execute_share_one_session(self):
+        await self.start();self.pub.callback(self.packet())
+        first,second=await asyncio.gather(self.runtime.call({}),self.runtime.call({}))
+        self.assertTrue(first['action_id'].startswith('tron2_follow_'))
+        self.assertEqual(first['action_id'],second['action_id'])
+        self.assertTrue(first['completion_pending']);self.assertEqual(first['completion_protocol'],'acp')
+        self.adapter._report_completion.assert_not_awaited();self.no_sends()
+
+    async def test_lifecycle_diagnostics_do_not_return_top_level_session_action_id(self):
+        await self.enable()
+        for action in ('info','start','stop'):
+            result=await self.runtime.call({'action':action})
+            self.assertNotIn('action_id',result)
+            self.assertIn('action_id',result['session'])
+        await self.runtime.session_task
+        self.assertEqual(self.adapter._report_completion.await_count,1)
+        tool,aid,status,result=self.adapter._report_completion.call_args.args
+        self.assertEqual((tool,status),('head_visual_follow','cancelled'))
+        self.assertFalse(result['motion_sent']);self.assertFalse(result['motion_may_continue'])
+        self.assertEqual(self.runtime.info()['session']['action_id'],aid)
+        self.no_sends()
+
+    async def test_stop_waits_for_already_accepted_segment_then_reports_once(self):
+        await self.enable()
+        self.runtime.engine.pending={'action_id':'accepted-head'}
+        await self.runtime.call({'action':'stop'})
+        await asyncio.sleep(.2);self.adapter._report_completion.assert_not_awaited()
+        self.runtime.engine.pending=None
+        await self.runtime.session_task
+        self.assertEqual(self.adapter._report_completion.call_args.args[2],'cancelled')
+        await self.runtime.close()
+        self.assertEqual(self.adapter._report_completion.await_count,1)
+        self.no_sends()
+
+    async def test_fault_reports_error_and_does_not_claim_physical_stop_or_home(self):
+        await self.enable();self.runtime.engine.fail(Error('feedback lost'))
+        await self.runtime.session_task
+        _,_,status,result=self.adapter._report_completion.call_args.args
+        self.assertEqual(status,'error');self.assertTrue(result['motion_may_continue'])
+        self.assertFalse(result['automatic_home_sent_by_completion']);self.no_sends()
+
+    async def test_callback_failure_blocks_new_session_without_resending(self):
+        await self.enable();self.adapter._report_completion.return_value=False
+        await self.runtime.call({'action':'stop'});await self.runtime.session_task
+        self.assertEqual(self.runtime.info()['session']['state'],'blocked_reporting')
+        self.pub.callback=None
+        with self.assertRaisesRegex(Error,'回调未确认'):await self.runtime.call({})
+        self.assertEqual(self.adapter._report_completion.await_count,1);self.no_sends()
+
+    async def test_settled_session_restarts_with_new_unique_id(self):
+        await self.enable();first=self.runtime.session['action_id']
+        await self.runtime.call({'action':'stop'});await self.runtime.session_task
+        await self.start();self.pub.callback(self.packet());result=await self.runtime.call({})
+        self.assertNotEqual(result['action_id'],first)
+        self.assertTrue(result['active']);self.no_sends()
+
+    async def test_home_and_missing_person_do_not_settle_live_session(self):
+        await self.enable()
+        self.runtime.engine.state='waiting_person';self.runtime.engine.event('home_verified')
+        await asyncio.sleep(.2)
+        self.assertEqual(self.runtime.info()['session']['state'],'running')
+        self.adapter._report_completion.assert_not_awaited();self.no_sends()
+
+    async def test_shutdown_preserves_truth_about_inflight_motion(self):
+        await self.enable();self.runtime.engine.pending={'action_id':'accepted-head'}
+        await self.runtime.close()
+        _,_,status,result=self.adapter._report_completion.call_args.args
+        self.assertEqual((status,result['reason']),('cancelled','driver_shutdown'))
+        self.assertTrue(result['motion_may_continue'])
+        self.assertEqual(self.adapter._report_completion.await_count,1);self.no_sends()
+
+    async def test_cancelled_enable_cannot_leave_untracked_follow_active(self):
+        await self.start();self.pub.callback(self.packet())
+        entered,release=threading.Event(),threading.Event()
+        original=self.runtime.engine.call
+        def delayed(args):
+            if args.get('action')=='follow':
+                entered.set();release.wait(2)
+            return original(args)
+        with patch.object(self.runtime.engine,'call',side_effect=delayed):
+            task=asyncio.create_task(self.runtime.call({}))
+            await asyncio.to_thread(entered.wait,1)
+            self.assertTrue(entered.is_set());task.cancel();release.set()
+            with self.assertRaises(asyncio.CancelledError):await task
+        self.assertFalse(self.runtime.engine.active)
+        self.assertIsNone(self.runtime.session);self.no_sends()
 
 class PackagingTests(unittest.TestCase):
     def test_no_custom_detector_generic_control_or_extra_service(self):

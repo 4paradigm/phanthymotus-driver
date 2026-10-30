@@ -5,7 +5,7 @@ import threading
 import time
 from .client import Error, require, finite, pose, terminal
 
-VERSION = '0.2.1'
+VERSION = '0.3.0'
 CAMERA = '/limx_tron2/camera'
 VOP_TOPIC = CAMERA + '/objects'
 MAX_FRAME_AGE = 1.5
@@ -15,10 +15,12 @@ LOSS_SECONDS = 1.5
 def tool():
     return {'name':'head_visual_follow', 'type':'actuator', 'multiInstance':False,
         'description':'TRON2人物头部跟随：无需连线，内部读取头部VOP；执行后跟随人物，确认无人后回正。',
-        'inputSchema':{'type':'object','additionalProperties':False,'properties':{
-            'action':{'type':'string','enum':['follow','stop','info'],'default':'follow','title':'操作'}},
-            'required':['action'],'x-resource':['head','arm_l','arm_r'],
-            'x-action-params':{'follow':{'params':[],'description':'寻找画面人物并跟随'}}},
+        'inputSchema':{'type':'object','additionalProperties':False,'properties':{},
+            'required':[],'x-resource':['head','arm_l','arm_r'],
+            # A continuous session occupies its channels without blocking the
+            # agent's finish barrier. Only the session's terminal ACP callback
+            # releases it; returning home does not silently end the session.
+            'x-completion':{'background':True,'timeout':0,'silent_completion':True}},
         'topic_in':[],'topic_out':[]}
 
 
