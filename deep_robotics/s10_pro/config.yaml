@@ -8,6 +8,7 @@ reader:
   domain_id: 0
   vendor_profile: "/opt/phanthy-motus/s10-reader-udp.xml"
 motion:
+  auto_navigation: true
   enabled: false
   refresh_hz: 2.0
   max_duration_s: 2.0
