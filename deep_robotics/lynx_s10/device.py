@@ -359,6 +359,11 @@ class S10Nodes:
             suffix = usb.group(1)
             return {None: "camera_rear", "0": "camera_front",
                     "1": "camera_left", "2": "camera_right"}.get(suffix)
+        # Do not let the generic camera_N matcher reinterpret aliases such as
+        # /usb_camera_2/image_raw as a physical front camera. Only the vendor
+        # image_raw suffix mapping above is trusted.
+        if name.startswith("/usb_camera_"):
+            return None
         tokens = set(filter(None, re.split(r"[^a-z0-9]+", name)))
         numbered = re.search(r"(?:^|[/_])camera[_-]?(\d+)(?:$|[/_])", name)
         if numbered:

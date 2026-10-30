@@ -378,7 +378,7 @@ def test_compressed_jpeg_is_downscaled_for_low_latency_preview(monkeypatch):
     payload = media_workers._reencode_jpeg(source.getvalue())
     assert payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9")
     with Image.open(BytesIO(payload)) as image:
-        assert max(image.size) <= 640
+        assert image.size == (1280, 720)
 
 
 def test_model_resource_returns_official_urdf(monkeypatch):

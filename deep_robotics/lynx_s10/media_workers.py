@@ -219,9 +219,12 @@ def _save_preview(image, stream):
 
 
 def _reencode_jpeg(data):
-    # Bound compressed MJPEG payloads too; forwarding full-resolution frames
-    # makes DDS transport and frontend decode queue behind old frames.
+    # The vendor sometimes declares an already encoded JPEG as sensor_msgs/Image
+    # with encoding=jpeg. Preserve valid payloads byte-for-byte; decoding these
+    # non-standard Image samples can produce black frames or corrupt the image.
     payload = bytes(data)
+    if payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9"):
+        return payload
     from io import BytesIO
     from PIL import Image
     image = Image.open(BytesIO(payload)).convert("RGB")
