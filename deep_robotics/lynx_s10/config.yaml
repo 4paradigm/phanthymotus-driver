@@ -44,8 +44,8 @@ camera_topics:
     - "/camera_left/image_raw/compressed"
     - "/camera_1/image_raw"
     - "/camera_1/image_raw/compressed"
-    - "/usb_camera_1/image_raw_1"
-    - "/usb_camera_1/image_raw_1/compressed"
+    - "/usb_camera_2/image_raw"
+    - "/usb_camera_2/image_raw/compressed"
   camera_front:
     - "/camera/front/image_raw"
     - "/camera/front/image_raw/compressed"
@@ -55,8 +55,6 @@ camera_topics:
     - "/camera_front/image_raw/compressed"
     - "/camera_2/image_raw"
     - "/camera_2/image_raw/compressed"
-    - "/usb_camera_1/image_raw_0"
-    - "/usb_camera_1/image_raw_0/compressed"
   camera_right:
     - "/camera/right/image_raw"
     - "/camera/right/image_raw/compressed"
@@ -66,8 +64,6 @@ camera_topics:
     - "/camera_right/image_raw/compressed"
     - "/camera_3/image_raw"
     - "/camera_3/image_raw/compressed"
-    - "/usb_camera_1/image_raw_2"
-    - "/usb_camera_1/image_raw_2/compressed"
 # JPEG encoding and point-cloud packing run in one bounded worker process per
 # stream; this keeps the robot ROS executor available for control/state topics.
 media_workers: true

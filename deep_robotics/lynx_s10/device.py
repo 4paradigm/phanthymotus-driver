@@ -117,12 +117,11 @@ class S10Nodes:
             "camera_left": ["/camera/left/image_raw", "/camera/left/image_raw/compressed",
                          "/camera/left/color/image_raw", "/camera/left/color/image_raw/compressed",
                          "/camera_left/image_raw", "/camera_1/image_raw",
-                         "/usb_camera_1/image_raw_1", "/usb_camera_1/image_raw_1/compressed",
+                         "/usb_camera_2/image_raw", "/usb_camera_2/image_raw/compressed",
                          ],
             "camera_front": ["/camera/front/image_raw", "/camera/front/image_raw/compressed",
                          "/camera/front/color/image_raw", "/camera/front/color/image_raw/compressed",
                          "/camera_front/image_raw", "/camera_2/image_raw",
-                         "/usb_camera_1/image_raw_0", "/usb_camera_1/image_raw_0/compressed",
                          ],
             "camera_right": ["/camera/right/image_raw", "/camera/right/image_raw/compressed",
                          "/camera/right/color/image_raw", "/camera/right/color/image_raw/compressed",
@@ -354,11 +353,13 @@ class S10Nodes:
         # usb_cam_multi_node uses one base topic and numbered suffixes.  Do
         # this before the generic camera_N rule, which otherwise interprets
         # the service's ``camera_1`` prefix as the lane for every image.
-        usb = re.search(r"/usb_camera_1/image_raw(?:_(\d+))?(?:/|$)", name)
+        usb = re.search(r"/usb_camera_(\d+)/image_raw(?:_(\d+))?(?:/|$)", name)
         if usb:
-            suffix = usb.group(1)
-            return {None: "camera_rear", "0": "camera_front",
-                    "1": "camera_left", "2": "camera_right"}.get(suffix)
+            camera_number, suffix = usb.groups()
+            if suffix is not None:
+                return None
+            return {"1": "camera_rear", "2": "camera_left",
+                    "3": "camera_front", "4": "camera_right"}.get(camera_number)
         # Do not let the generic camera_N matcher reinterpret aliases such as
         # /usb_camera_2/image_raw as a physical front camera. Only the vendor
         # image_raw suffix mapping above is trusted.
