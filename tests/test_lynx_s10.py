@@ -493,7 +493,7 @@ def test_light_cycle_controls_are_scoped_to_breathe_and_blink_actions(monkeypatc
     for action in ("constant", "fill_flow", "moving_flow", "gradient_flow"):
         assert "head_cycle_seconds" not in actions[action]["params"]
         assert "tail_cycle_seconds" not in actions[action]["params"]
-    assert set(actions["gradient_flow"]["params"]) == set()
+    assert set(actions["gradient_flow"]["params"]) == {"head_color", "tail_color"}
     for action in ("breathe", "blink"):
         assert "head_cycle_seconds" in actions[action]["params"]
         assert "tail_cycle_seconds" in actions[action]["params"]
@@ -1288,9 +1288,24 @@ def test_light_uses_fire_and_forget_when_firmware_has_no_response(monkeypatch):
 def test_gradient_flow_lets_firmware_choose_rainbow_colors(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
-    device.S10LightPlugin(native).dispatch("gradient_flow", {})
+    device.S10LightPlugin(native).dispatch("gradient_flow", {
+        "head_color": "绿色", "tail_color": "蓝色",
+    })
     leds = native.calls[-1][0][2]["Led"]
-    assert leds == [{"Type": device.LIGHT_EFFECTS["渐变流水"]}] * 2
+    assert leds == [
+        {"Type": device.LIGHT_EFFECTS["渐变流水"], "Color": [device.LIGHT_COLORS["绿色"]]},
+        {"Type": device.LIGHT_EFFECTS["渐变流水"], "Color": [device.LIGHT_COLORS["蓝色"]]},
+    ]
+
+
+def test_single_light_gradient_sends_selected_color(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    device.S10SingleLightPlugin(native, "head").dispatch("gradient_flow", {"color": "绿色"})
+    leds = native.calls[-1][0][2]["Led"]
+    assert leds[0] == {"Type": device.LIGHT_EFFECTS["渐变流水"],
+                       "Color": [device.LIGHT_COLORS["绿色"]]}
+    assert len(leds) == 2
 
 
 def test_light_constant_effect_omits_cycle_from_native_payload(monkeypatch):

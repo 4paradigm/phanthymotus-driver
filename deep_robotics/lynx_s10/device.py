@@ -1494,7 +1494,7 @@ class S10LightPlugin:
         "constant": (["head_color", "tail_color"], "头尾灯常亮"),
         "fill_flow": (["head_color", "tail_color"], "头尾灯填充流水"),
         "moving_flow": (["head_color", "tail_color"], "头尾灯移动流水"),
-        "gradient_flow": ([], "彩色渐变流水；由灯控固件自动选择渐变颜色"),
+        "gradient_flow": (["head_color", "tail_color"], "头尾灯按所选颜色执行渐变流水"),
         "breathe": (["head_color", "tail_color", "head_cycle_seconds", "tail_cycle_seconds"], "头尾灯呼吸；头尾周期分别设置，单位为秒"),
         "blink": (["head_color", "tail_color", "head_cycle_seconds", "tail_cycle_seconds"], "头尾灯闪烁；头尾周期分别设置，单位为秒"),
         "head_constant_tail_blink": (["head_color", "tail_color", "tail_cycle_seconds"], "头灯常亮、尾灯闪烁"),
@@ -1544,9 +1544,6 @@ class S10LightPlugin:
             for side in ("head", "tail"):
                 effect = effects[side]
                 effect_code = LIGHT_ACTION_EFFECTS[effect][1]
-                if effect == "gradient_flow":
-                    leds.append({"Type": effect_code})
-                    continue
                 color = args.get(f"{side}_color", "白色")
                 if color not in LIGHT_COLORS:
                     return {"ok": False, "code": "INVALID_ARGUMENT",
@@ -1569,7 +1566,7 @@ class S10SingleLightPlugin:
         "constant": (['color'], "常亮"),
         "fill_flow": (['color'], "填充流水"),
         "moving_flow": (['color'], "移动流水"),
-        "gradient_flow": ([], "彩色渐变流水"),
+        "gradient_flow": (['color'], "按所选颜色执行渐变流水"),
         "breathe": (['color', 'cycle_seconds'], "呼吸"),
         "blink": (['color', 'cycle_seconds'], "闪烁"),
     }
@@ -1610,11 +1607,10 @@ class S10SingleLightPlugin:
             raise ValueError(f"unsupported S10 {self.side} light action: {action}")
         effect_code = LIGHT_ACTION_EFFECTS[action][1]
         led = {"Type": effect_code}
-        if action != "gradient_flow":
-            color = args.get("color", "白色")
-            if color not in LIGHT_COLORS:
-                return {"ok": False, "code": "INVALID_ARGUMENT", "error": "unsupported color"}
-            led["Color"] = [LIGHT_COLORS[color]]
+        color = args.get("color", "白色")
+        if color not in LIGHT_COLORS:
+            return {"ok": False, "code": "INVALID_ARGUMENT", "error": "unsupported color"}
+        led["Color"] = [LIGHT_COLORS[color]]
         if action in {"breathe", "blink"}:
             cycle = args.get("cycle_seconds", 1)
             if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 1:
