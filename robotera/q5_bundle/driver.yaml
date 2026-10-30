@@ -14,6 +14,7 @@ build_context_extras:
 # plugins (robot_ready, system_health, estop, diagnostics, simple_action) are
 # intentionally excluded, and joints.py's extra `model` resource tool is included.
 cards:
+  - { name: wooden_man,        type: processor }
   - { name: base_drive,        type: actuator }
   - { name: joints,            type: sensor }
   - { name: joints_state,      type: sensor }
