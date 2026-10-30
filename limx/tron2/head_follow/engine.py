@@ -14,10 +14,10 @@ def tool():
         'description':'连接VOP人物检测后进行平滑头部跟随；不跟随模式可暂停或复位头部。',
         'inputSchema':{'type':'object','additionalProperties':False,'properties':{
             'action':{'type':'string','enum':['follow','not_follow','start','stop','info'],
-                'default':'follow','title':'模式','oneOf':[
-                    {'const':'follow','title':'人物跟随'}, {'const':'not_follow','title':'不跟随模式'}]},
+                'default':'follow','title':'Mode','oneOf':[
+                    {'const':'follow','title':'Follow'}, {'const':'not_follow','title':'Non-follow mode'}]},
             'non_follow_action':{'type':'string','enum':['pause','reset'],'default':'pause',
-                'title':'不跟随操作','oneOf':[{'const':'pause','title':'暂停跟随'},{'const':'reset','title':'头部复位'}]},
+                'title':'Non-follow action','oneOf':[{'const':'pause','title':'Pause following'},{'const':'reset','title':'Reset head'}]},
             'input_topic':{'type':'string','description':'由画布VOP输出连线注入；仅接受TRON2头部相机的对象话题'}},
             'required':[],'x-resource':['head','arm_l','arm_r'],
             'x-action-params':{'follow':{'params':[]},'not_follow':{'params':['non_follow_action']}},
