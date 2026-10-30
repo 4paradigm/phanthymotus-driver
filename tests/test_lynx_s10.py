@@ -573,7 +573,8 @@ def test_media_worker_uses_independent_result_queue_per_lane():
     add_method = next(node for node in method.body if isinstance(node, ast.FunctionDef)
                       and node.name == "_add")
     source_text = ast.get_source_segment(source, add_method)
-    assert "results = self._ctx.Queue(maxsize=4)" in source_text
+    assert "jobs = self._ctx.Queue(maxsize=1)" in source_text
+    assert "results = self._ctx.Queue(maxsize=1)" in source_text
     assert "self._results[lane] = results" in source_text
 
 
@@ -674,7 +675,7 @@ def test_service_configures_verified_s10_robot_network_without_shell_exports():
 def test_core_domain_bridge_is_spawned_and_uses_bounded_latest_value_lanes():
     source = (DRIVER / "domain_bridge.py").read_text(encoding="utf-8")
     assert 'mp.get_context("spawn")' in source
-    assert "Queue(maxsize=8)" in source
+    assert "Queue(maxsize=1)" in source
     assert 'os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile' in source
     assert 'os.environ["ROS_DOMAIN_ID"] = str(domain)' in source
     assert "interfaceWhiteList" not in source

@@ -31,10 +31,11 @@ class MediaWorkers:
         self._add(lane, "lidar")
 
     def _add(self, lane, kind):
-        jobs = self._ctx.Queue(maxsize=2)
-        # Allow conversion and publication to overlap by a few frames while
-        # retaining a bounded queue; old frames are still replaced by latest.
-        results = self._ctx.Queue(maxsize=4)
+        # Media is a live view: never queue historical frames.  A single slot
+        # plus _put_latest keeps conversion and publication non-blocking while
+        # bounding end-to-end latency to roughly one frame.
+        jobs = self._ctx.Queue(maxsize=1)
+        results = self._ctx.Queue(maxsize=1)
         process = self._ctx.Process(target=_worker, args=(jobs, results, kind, lane),
                                     name=f"lynx-s10-media-{lane}", daemon=True)
         process.start()

@@ -39,10 +39,9 @@ class CoreBridge:
         from rclpy.serialization import serialize_message
 
         if lane not in self._queues:
-            # Keep a small burst buffer. A one-slot multiprocessing queue can
-            # report Full while its feeder thread is still handing the prior
-            # item to the child, which starves high-rate media lanes.
-            messages = self._ctx.Queue(maxsize=8)
+            # Keep only the newest sample. Historical camera/lidar frames add
+            # visible latency; _put_latest replaces them without blocking ROS.
+            messages = self._ctx.Queue(maxsize=1)
             process = self._ctx.Process(
                 target=_run_publisher,
                 args=(messages, self._profile, self._domain, lane),
@@ -88,7 +87,7 @@ class CoreBridge:
                     old_queue.close()
                 except Exception:
                     pass
-            messages = self._ctx.Queue(maxsize=8)
+            messages = self._ctx.Queue(maxsize=1)
             process = self._ctx.Process(
                 target=_run_publisher,
                 args=(messages, self._profile, self._domain, lane),

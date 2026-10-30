@@ -116,15 +116,20 @@ class S10Nodes:
             "camera_left": ["/camera/left/image_raw", "/camera/left/image_raw/compressed",
                          "/camera/left/color/image_raw", "/camera/left/color/image_raw/compressed",
                          "/camera_left/image_raw", "/camera_1/image_raw",
-                         "/usb_camera_1/image_raw_0", "/usb_camera_1/image_raw_0/compressed"],
+                         "/usb_camera_1/image_raw_1", "/usb_camera_1/image_raw_1/compressed",
+                         "/usb_camera_2/image_raw", "/usb_camera_2/image_raw/compressed",
+                         "/usb_camera_2/image_raw_0", "/usb_camera_2/image_raw_0/compressed"],
             "camera_front": ["/camera/front/image_raw", "/camera/front/image_raw/compressed",
                          "/camera/front/color/image_raw", "/camera/front/color/image_raw/compressed",
                          "/camera_front/image_raw", "/camera_2/image_raw",
-                         "/usb_camera_1/image_raw_1", "/usb_camera_1/image_raw_1/compressed"],
+                         "/usb_camera_1/image_raw_0", "/usb_camera_1/image_raw_0/compressed",
+                         "/usb_camera_3/image_raw", "/usb_camera_3/image_raw/compressed",
+                         "/usb_camera_3/image_raw_0", "/usb_camera_3/image_raw_0/compressed"],
             "camera_right": ["/camera/right/image_raw", "/camera/right/image_raw/compressed",
                          "/camera/right/color/image_raw", "/camera/right/color/image_raw/compressed",
                          "/camera_right/image_raw", "/camera_3/image_raw",
-                         "/usb_camera_1/image_raw_2", "/usb_camera_1/image_raw_2/compressed"],
+                         "/usb_camera_4/image_raw", "/usb_camera_4/image_raw/compressed",
+                         "/usb_camera_4/image_raw_0", "/usb_camera_4/image_raw_0/compressed"],
         }))
         for lane in CAMERA_LANES:
             camera_topics.setdefault(lane, [])
@@ -595,11 +600,18 @@ class S10Nodes:
             # A discovered topic may produce one stale/diagnostic frame before
             # the configured live stream starts. Let an inactive source take
             # over after the current source has gone quiet.
+            direct_sources = {"/DEPTH_POINTS", "/local_scans", "/LIDAR/POINTS"}
+            # Prefer a live raw sensor feed over accumulated maps/debug clouds.
+            # Derived clouds are fallback-only and must never steal the lane
+            # while a direct source is producing frames.
+            active_direct = self._active_lidar_source in direct_sources
+            candidate_direct = source in direct_sources
             active_priority = (self._lidar_topics.index(self._active_lidar_source)
                                if self._active_lidar_source in self._lidar_topics else None)
             candidate_priority = (self._lidar_topics.index(source)
                                   if source in self._lidar_topics else None)
             if (self._active_lidar_source is None or
+                    (candidate_direct and not active_direct) or
                     (candidate_priority is not None and
                      (active_priority is None or candidate_priority < active_priority)) or
                     (source != self._active_lidar_source and now - active_seen > 2.0)):
