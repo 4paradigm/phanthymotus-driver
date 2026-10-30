@@ -3,7 +3,7 @@ import copy
 import math
 import unittest
 from head_follow.client import Error, pose
-from head_follow.engine import Policy, parse_frame, VOP_TOPIC
+from head_follow.engine import Policy, parse_frame, VOP_TOPIC, speed_multiplier
 from head_follow.servo import Limiter
 
 
@@ -79,6 +79,55 @@ class FollowPolicyTests(unittest.TestCase):
         limiter=Limiter([0.,0.])
         for dt in (0.,1.,float('nan')):
             with self.assertRaises(Error):limiter.step([1.,1.],dt)
+
+    def test_all_four_gears_scale_the_trajectory_without_changing_direction(self):
+        traces=[]
+        for speed in (.5,1.,2.,4.):
+            limiter=Limiter([0.,0.],speed)
+            for _ in range(50):
+                limiter.step([8.*speed,-12.*speed],.02)
+                self.assertLessEqual(abs(limiter.velocity[0]),8.*speed)
+                self.assertLessEqual(abs(limiter.velocity[1]),12.*speed)
+                self.assertLessEqual(max(map(abs,limiter.acceleration)),32.*speed)
+            self.assertGreater(limiter.position[0],0)
+            self.assertLess(limiter.position[1],0)
+            traces.append([v/speed for v in limiter.position])
+        for trace in traces:
+            for actual,normal in zip(trace,traces[1]):self.assertAlmostEqual(actual,normal,places=10)
+
+    def test_downshift_keeps_state_and_decelerates_without_a_velocity_jump(self):
+        limiter=Limiter([-50.,-40.],4.)
+        for _ in range(50):limiter.step([32.,48.],.02)
+        state=(limiter.position[:],limiter.velocity[:],limiter.acceleration[:])
+        limiter.set_speed(.5)
+        self.assertEqual((limiter.position,limiter.velocity,limiter.acceleration),state)
+        previous=limiter.velocity[:];previous_acceleration=limiter.acceleration[:]
+        for _ in range(150):
+            limiter.step([4.,6.],.005)
+            self.assertLessEqual(max(abs(a-b) for a,b in zip(previous,limiter.velocity)),128.*.005+1e-9)
+            self.assertLessEqual(max(abs(a-b) for a,b in zip(previous_acceleration,limiter.acceleration)),60.*.005+1e-9)
+            previous=limiter.velocity[:];previous_acceleration=limiter.acceleration[:]
+        self.assertLess(limiter.velocity[1],state[1][1])
+
+    def test_invalid_gears_are_rejected_without_changing_limiter_state(self):
+        limiter=Limiter([0.,0.]);limiter.step([8.,12.],.02)
+        state=(limiter.speed,limiter.position[:],limiter.velocity[:],limiter.acceleration[:])
+        for bad in (True,False,0.,-1.,3.,.51,'2x','2.0',None,[],{},float('inf'),float('nan')):
+            with self.subTest(speed=bad):
+                with self.assertRaises(Error):speed_multiplier(bad)
+                with self.assertRaises(Error):limiter.set_speed(bad)
+                self.assertEqual((limiter.speed,limiter.position,limiter.velocity,limiter.acceleration),state)
+
+    def test_canvas_string_gears_and_numeric_clients_resolve_identically(self):
+        for text,number in (('0.5',.5),('1',1.),('2',2.),('4',4.)):
+            self.assertEqual(speed_multiplier(text),speed_multiplier(number))
+
+    def test_all_gears_preserve_head_angle_limits(self):
+        for speed in (.5,1.,2.,4.):
+            limiter=Limiter([29.99,-44.99],speed)
+            for _ in range(200):
+                target=limiter.step([32.,-48.],.02)
+                self.assertTrue(-55.<=target[0]<=30. and -45.<=target[1]<=45.)
 
 
 if __name__=='__main__':unittest.main()

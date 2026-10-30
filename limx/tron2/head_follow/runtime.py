@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from .client import require
-from .engine import Policy, VOP_TOPIC, parse_frame
+from .engine import Policy, VOP_TOPIC, parse_frame, speed_multiplier
 from .servo import Stream, CONTROL_SECONDS, SEND_SECONDS, MOVE_SECONDS, Limiter
 from vendor import motion_readiness, MoveError
 from head import card_degrees
@@ -92,10 +92,11 @@ class Runtime:
         active=f is not None and f['state']=='running' and not f['_stop'].is_set()
         stream=f.get('_stream') if f else None
         pending=stream is not None and stream.job is not None and self.adapter.head.active is stream.job
-        return {'service':'tron2-head-visual-follow','version':'0.4.0',
+        return {'service':'tron2-head-visual-follow','version':'0.5.0',
             'topic_in':[{'topic':VOP_TOPIC,'format':'data/json'}],'topic_out':[],
             'detection_topic':VOP_TOPIC,'input_connected':self.bound,'vop_subscribed':self.bound,
             'mode':self.mode,'non_follow_action':self.non_follow_action,'active':active,
+            'speed':stream.speed if stream is not None else 1.,
             'state':c['state'] if live_control else self.policy.state if active else f['state'] if f and f['state'] in ('blocked_reporting','fault') else 'paused',
             'session':self.job_view(f),'control_action':self.job_view(c),
             'head_motion':({'action_id':stream.job['action_id'],'state':stream.job['state']} if pending else None),
@@ -104,7 +105,8 @@ class Runtime:
             'error':f.get('error') if f else None,'input_error':self.policy.input_error,
             'target_center_normalized':self.policy.point,'events':list(self.policy.events),
             'control_hz':1/CONTROL_SECONDS,'maximum_head_command_hz':1/SEND_SECONDS,
-            'transport':'two_axis_ack_serialized_moveh','move_horizon_seconds':MOVE_SECONDS,
+            'transport':'two_axis_ack_serialized_moveh','move_horizon_seconds':stream.move_seconds if stream else MOVE_SECONDS,
+            'speed_limited_by_feedback':bool(stream and stream.target_limited),
             'continuous_motor_servo_claimed':False,'measurement_time_verified':False,
             'arm_and_gripper_commands_sent':0,
             'stop_note':'暂停阻止新目标；已受理的短时转头仍会完成，不构成硬件急停。'}
@@ -141,9 +143,9 @@ class Runtime:
                 if wanted is None:
                     # Invalid/stale input cannot produce either tracking or home.
                     # Drop future targets. The last accepted short MoveH may finish.
-                    stream.limiter=Limiter([p['pitch'],p['yaw']])
+                    stream.limiter=Limiter([p['pitch'],p['yaw']],stream.speed)
                     await asyncio.sleep(CONTROL_SECONDS);continue
-                target=stream.limiter.step(wanted,min(.1,dt))
+                target=stream.limiter.step([v*stream.speed for v in wanted],min(.1,dt))
                 if stream.last_send is None or now-stream.last_send>=SEND_SECONDS:
                     baseline=stream.last_target or [p['pitch'],p['yaw']]
                     if max(abs(a-b) for a,b in zip(target,baseline))>=.025:
@@ -248,9 +250,11 @@ class Runtime:
 
     async def call(self, args):
         require(isinstance(args,dict),'跟随参数必须是对象')
-        require(not set(args)-{'action','non_follow_action','input_topic','input_topics','instance_id','_trace_id'},'不支持的跟随参数')
+        require(not set(args)-{'action','non_follow_action','speed','input_topic','input_topics','instance_id','_trace_id'},'不支持的跟随参数')
         action=args.get('action','follow')
         require(action in ('follow','not_follow','start','stop','info'),'不支持的跟随操作')
+        # Stale hidden form values must not block lifecycle stop/pause/reset.
+        speed=speed_multiplier(args.get('speed',1.)) if action=='follow' else None
         topic=self.topics(args) if action in ('follow','start') else None
         if action=='info':return self.info()
         if action=='stop':
@@ -284,6 +288,9 @@ class Runtime:
                 task=self.follow['_task']
                 if task is not None and not task.done():
                     require(not self.follow['_stop'].is_set(),'跟随仍在停止确认，请稍候')
+                    if 'speed' in args:
+                        self.follow['_stream'].set_speed(speed)
+                        self.follow['speed']=speed
                     return self.accepted(self.follow)
                 require(self.follow['callback_delivered'],'上次跟随ACP回调未确认')
             topic=topic or self.input_topic
@@ -297,8 +304,8 @@ class Runtime:
                     require(self.clock()<deadline,'等待VOP的新鲜人物检测；请检查camera→VOP连线')
                     await asyncio.sleep(.05)
             self.mode='follow';self.policy=Policy()
-            job=self.new_job('follow');self.follow=job
-            stream=Stream(self.adapter,lambda fresh:self.guard(job,fresh),self.clock);job['_stream']=stream
+            job=self.new_job('follow');job['speed']=speed;self.follow=job
+            stream=Stream(self.adapter,lambda fresh:self.guard(job,fresh),self.clock,speed=speed);job['_stream']=stream
             try:await stream.start(job['action_id'])
             except BaseException:
                 job['_stop'].set();self.follow=None;self.mode='not_follow'

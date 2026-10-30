@@ -73,6 +73,11 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([v for v in s['properties']['action']['enum'] if v not in {'start','stop','info','config'}],['follow','not_follow'])
         self.assertEqual(s['properties']['non_follow_action']['enum'],['pause','reset'])
         self.assertEqual(s['x-action-params']['not_follow']['params'],['non_follow_action'])
+        self.assertEqual(s['x-action-params']['follow']['params'],['speed'])
+        self.assertEqual(s['properties']['speed']['type'],'string')
+        self.assertEqual(s['properties']['speed']['enum'],['1','0.5','2','4'])
+        self.assertEqual(s['properties']['speed']['default'],'1')
+        self.assertEqual([v['title'] for v in s['properties']['speed']['oneOf']],['1\u00d7','0.5\u00d7','2\u00d7','4\u00d7'])
         self.assertEqual(s['x-completion'],{'background':True,'timeout':0,'silent_completion':True})
     async def test_info_is_authoritative_without_subscribing_or_arming(self):
         r=await self.runtime.call({'action':'info'})
@@ -95,6 +100,85 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         a=await self.enable();b=await self.enable()
         self.assertEqual(a['action_id'],b['action_id']);self.assertTrue(a['completion_pending'])
         self.assertIs(self.adapter.head.active,self.runtime.follow['_stream'].job)
+        self.assertEqual(b['speed'],1.)
+    async def test_selected_speed_reaches_motion_stream_and_survives_invalid_input_wait(self):
+        self.people=[[.8,0.]]
+        result=await self.runtime.call({'action':'follow','input_topic':VOP_TOPIC,'speed':4})
+        await self.wait_sends(3)
+        self.assertEqual(result['speed'],4.)
+        stream=self.runtime.follow['_stream']
+        self.assertEqual(stream.speed,4.);self.assertEqual(stream.limiter.speed,4.)
+        self.publish=False;self.pub.callback('invalid-json');await asyncio.sleep(.07)
+        self.assertEqual(stream.limiter.speed,4.)
+        self.assertEqual(self.runtime.policy.state,'input_wait')
+    async def test_change_gear_reuses_acp_session_without_resetting_motion_state(self):
+        self.people=[[.8,0.]];original=await self.enable();await self.wait_sends(3)
+        stream=self.runtime.follow['_stream'];limiter=stream.limiter
+        state=(limiter.position[:],limiter.velocity[:],limiter.acceleration[:])
+        count=len(self.sent)
+        changed=await self.runtime.call({'action':'follow','speed':.5})
+        self.assertEqual(changed['action_id'],original['action_id'])
+        self.assertIs(self.runtime.follow['_stream'],stream);self.assertIs(stream.limiter,limiter)
+        self.assertEqual((limiter.position,limiter.velocity,limiter.acceleration),state)
+        self.assertEqual(changed['speed'],.5);self.assertEqual(changed['session']['speed'],.5)
+        self.assertEqual(len(self.sent),count)
+        unchanged=await self.runtime.call({'action':'follow'})
+        self.assertEqual(unchanged['speed'],.5)
+    async def test_bad_follow_speed_does_not_bind_or_change_an_active_gear(self):
+        for bad in (True,'2x',3,0,-1,None,float('nan')):
+            with self.assertRaises(Error):await self.runtime.call({'action':'follow','input_topic':VOP_TOPIC,'speed':bad})
+        self.assertFalse(self.runtime.bound);self.assertEqual(self.sent,[])
+        await self.enable()
+        with self.assertRaises(Error):await self.runtime.call({'action':'follow','speed':3})
+        self.assertEqual(self.runtime.info()['speed'],1.)
+    async def test_hidden_speed_does_not_block_lifecycle_pause_or_reset(self):
+        result=await self.runtime.call({'action':'start','input_topic':VOP_TOPIC,'speed':'stale'})
+        self.assertFalse(result['active']);self.assertEqual(self.sent,[])
+        await self.runtime.call({'action':'follow','speed':2})
+        await self.runtime.call({'action':'not_follow','non_follow_action':'pause','speed':'stale'})
+        await self.await_job(self.runtime.control)
+        await self.runtime.call({'action':'not_follow','non_follow_action':'reset','speed':4})
+        await self.await_job(self.runtime.control)
+        self.assertEqual(self.sent[-1]['data']['joint'],[0.,0.])
+        self.assertGreaterEqual(self.sent[-1]['data']['time'],3.)
+        restarted=await self.enable();self.assertEqual(restarted['speed'],1.)
+    async def test_high_gear_does_not_relax_feedback_error_protection(self):
+        await self.runtime.call({'action':'follow','input_topic':VOP_TOPIC,'speed':4})
+        stream=self.runtime.follow['_stream'];stream.last_target=[0.,0.]
+        self.q[15]=math.radians(4.1);self.feedback()
+        with self.assertRaisesRegex(Error,'头部反馈'):stream.read()
+        self.q[15]=0.;self.feedback()
+    async def test_fast_gears_bound_new_targets_instead_of_widening_feedback_guard(self):
+        result=await self.runtime.call({'action':'follow','input_topic':VOP_TOPIC,'speed':'4'})
+        stream=self.runtime.follow['_stream']
+        await stream.send([20.,-20.])
+        self.assertEqual(stream.last_target,[3.5,-3.5])
+        self.assertEqual(stream.limiter.position,stream.last_target)
+        self.assertEqual(self.sent[-1]['data']['time'],.1)
+        self.assertTrue(self.runtime.info()['speed_limited_by_feedback'])
+        self.assertEqual(result['move_horizon_seconds'],.1)
+        await self.runtime.call({'action':'follow','speed':'2'})
+        self.assertEqual(stream.move_seconds,.125)
+        await self.runtime.call({'action':'follow','speed':'0.5'})
+        self.assertEqual(stream.move_seconds,.25)
+    async def test_canvas_string_speed_through_mcp_dispatch_reuses_session(self):
+        async def rpc(args):
+            request=SimpleNamespace(json=AsyncMock(return_value={'jsonrpc':'2.0','id':1,
+                'method':'tools/call','params':{'name':'head_visual_follow','arguments':args}}))
+            response=await self.adapter.rpc(request)
+            result=json.loads(response.body)['result']
+            self.assertFalse(result['isError'],result)
+            return json.loads(result['content'][0]['text'])
+        follow=await rpc({'action':'follow','input_topic':VOP_TOPIC,'speed':'0.5'})
+        self.assertEqual(follow['speed'],.5)
+        for gear in ('1','2','4'):
+            result=await rpc({'action':'follow','speed':gear})
+            self.assertEqual(result['action_id'],follow['action_id'])
+            self.assertEqual(result['speed'],float(gear))
+        paused=await rpc({'action':'not_follow','non_follow_action':'pause','speed':'4'})
+        await self.await_job(self.runtime.control)
+        self.assertTrue(self.runtime.control['callback_delivered'])
+        self.assertNotEqual(paused['action_id'],follow['action_id'])
     async def test_follow_stream_uses_short_two_axis_updates_without_arrival_dwells(self):
         self.people=[[.8,0.]];await self.enable();await self.wait_sends(4)
         self.assertTrue(all(s['data']['time']==.25 for s in self.sent))

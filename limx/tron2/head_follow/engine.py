@@ -2,11 +2,21 @@
 import math
 from .client import require, finite
 
-VERSION = '0.4.0'
+VERSION = '0.5.0'
 CAMERA = '/limx_tron2/camera'
 VOP_TOPIC = CAMERA + '/objects'
 MAX_FRAME_AGE = 1.5
 LOSS_SECONDS = 1.5
+SPEED_MULTIPLIERS = (.5, 1., 2., 4.)
+
+
+def speed_multiplier(value):
+    # Existing Motus enum selects submit strings, including numeric choices.
+    if type(value) is str and value in ('0.5','1','2','4'):
+        value=float(value)
+    require(type(value) in (int, float) and value in SPEED_MULTIPLIERS,
+            'Speed must be one of 0.5, 1, 2 or 4')
+    return float(value)
 
 
 def tool():
@@ -18,9 +28,13 @@ def tool():
                     {'const':'follow','title':'Follow'}, {'const':'not_follow','title':'Non-follow mode'}]},
             'non_follow_action':{'type':'string','enum':['pause','reset'],'default':'pause',
                 'title':'Non-follow action','oneOf':[{'const':'pause','title':'Pause following'},{'const':'reset','title':'Reset head'}]},
+            # Put 1x first as older canvases do not apply select defaults.
+            'speed':{'type':'string','enum':['1','0.5','2','4'],'default':'1','title':'Speed',
+                'description':'Follow speed multiplier; actual motion remains limited by feedback and the robot controller.',
+                'oneOf':[{'const':v,'title':v+'\u00d7'} for v in ('1','0.5','2','4')]},
             'input_topic':{'type':'string','description':'由画布VOP输出连线注入；仅接受TRON2头部相机的对象话题'}},
             'required':[],'x-resource':['head','arm_l','arm_r'],
-            'x-action-params':{'follow':{'params':[]},'not_follow':{'params':['non_follow_action']}},
+            'x-action-params':{'follow':{'params':['speed']},'not_follow':{'params':['non_follow_action']}},
             'x-completion':{'background':True,'timeout':0,'silent_completion':True}},
         'topic_in':[{'topic':VOP_TOPIC,'format':'data/json','desc':'VOP人物检测输入'}], 'topic_out':[]}
 
