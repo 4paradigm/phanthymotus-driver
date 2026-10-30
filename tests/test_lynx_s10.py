@@ -386,6 +386,8 @@ def test_model_resource_returns_official_urdf(monkeypatch):
     marker_origins = [tuple(map(float, root.find(f"joint[@name='front_marker_{name}_joint']/origin").get("xyz").split()))
                       for name in ("tip", "left", "right", "close")]
     assert all(sum(value * value for value in origin) >= 0.005 ** 2 for origin in marker_origins)
+    tip = marker_origins[0]
+    assert tip[0] > 0.2 and tip[2] > 0.1
     checker = shutil.which("check_urdf")
     if checker:
         urdf_path = DRIVER / "resource" / "S10.urdf"
@@ -449,9 +451,11 @@ def test_light_cycle_controls_are_scoped_to_breathe_and_blink_actions(monkeypatc
     actions = schema["x-action-params"]
     assert set(actions) == {"constant", "fill_flow", "moving_flow", "gradient_flow", "breathe", "blink"}
     for action in ("constant", "fill_flow", "moving_flow", "gradient_flow"):
-        assert "cycle_seconds" not in actions[action]["params"]
+        assert "head_cycle_seconds" not in actions[action]["params"]
+        assert "tail_cycle_seconds" not in actions[action]["params"]
     for action in ("breathe", "blink"):
-        assert "cycle_seconds" in actions[action]["params"]
+        assert "head_cycle_seconds" in actions[action]["params"]
+        assert "tail_cycle_seconds" in actions[action]["params"]
 
 
 def test_media_worker_replaces_stale_queued_frame_without_reporting_failure(monkeypatch):
@@ -567,7 +571,7 @@ def test_media_worker_uses_independent_result_queue_per_lane():
     add_method = next(node for node in method.body if isinstance(node, ast.FunctionDef)
                       and node.name == "_add")
     source_text = ast.get_source_segment(source, add_method)
-    assert "results = self._ctx.Queue(maxsize=1)" in source_text
+    assert "results = self._ctx.Queue(maxsize=4)" in source_text
     assert "self._results[lane] = results" in source_text
 
 
@@ -668,7 +672,7 @@ def test_service_configures_verified_s10_robot_network_without_shell_exports():
 def test_core_domain_bridge_is_spawned_and_uses_bounded_latest_value_lanes():
     source = (DRIVER / "domain_bridge.py").read_text(encoding="utf-8")
     assert 'mp.get_context("spawn")' in source
-    assert "Queue(maxsize=1)" in source
+    assert "Queue(maxsize=8)" in source
     assert 'os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile' in source
     assert 'os.environ["ROS_DOMAIN_ID"] = str(domain)' in source
     assert "interfaceWhiteList" not in source
@@ -1138,8 +1142,10 @@ def test_control_schema_exposes_supported_navigation_and_light_options(monkeypat
     assert set(localize_params) == {"x", "y", "z", "yaw_degrees", "confirm"}
     assert set(light_params) == {"head_color", "tail_color"}
     assert set(actions) == {"constant", "fill_flow", "moving_flow", "gradient_flow", "breathe", "blink"}
-    assert "cycle_seconds" in actions["breathe"]["params"]
-    assert "cycle_seconds" in actions["blink"]["params"]
+    assert "head_cycle_seconds" in actions["breathe"]["params"]
+    assert "tail_cycle_seconds" in actions["breathe"]["params"]
+    assert "head_cycle_seconds" in actions["blink"]["params"]
+    assert "tail_cycle_seconds" in actions["blink"]["params"]
     assert light_tool["name"] == "light"
     charge_schema = device.S10ChargePlugin(native).get_tool()["inputSchema"]
     assert charge_schema["x-is-dangerous"] is True
@@ -1151,13 +1157,14 @@ def test_light_uses_named_colors_and_effects_in_native_protocol(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
     plugin = device.S10LightPlugin(native)
-    plugin.dispatch("breathe", {"head_color": "绿色", "tail_color": "蓝色", "cycle_seconds": 3})
+    plugin.dispatch("breathe", {"head_color": "绿色", "tail_color": "蓝色",
+                                 "head_cycle_seconds": 3, "tail_cycle_seconds": 5})
 
     assert native.calls[-1][0] == (0x00100005, 0x00200002, {
         "CustomMode": True,
         "Led": [
             {"Type": 4, "Color": [2], "Cycle": 3},
-            {"Type": 4, "Color": [3], "Cycle": 3},
+            {"Type": 4, "Color": [3], "Cycle": 5},
         ],
     })
     assert native.calls[-1][1] == {}
@@ -1182,15 +1189,34 @@ def test_light_constant_effect_omits_cycle_from_native_payload(monkeypatch):
     assert "Cycle" not in leds[1]
 
 
-def test_light_blink_action_sets_cycle_for_both_lamps(monkeypatch):
+def test_light_blink_action_sets_independent_cycles_for_lamps(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
-    device.S10LightPlugin(native).dispatch("blink", {"cycle_seconds": 4})
+    device.S10LightPlugin(native).dispatch("blink", {
+        "head_cycle_seconds": 4, "tail_cycle_seconds": 7})
     leds = native.calls[-1][0][2]["Led"]
     assert leds[0]["Type"] == device.LIGHT_EFFECTS["闪烁"]
     assert leds[0]["Cycle"] == 4
     assert leds[1]["Type"] == device.LIGHT_EFFECTS["闪烁"]
-    assert leds[1]["Cycle"] == 4
+    assert leds[1]["Cycle"] == 7
+
+
+def test_lidar_source_switches_to_higher_priority_configured_stream(monkeypatch):
+    device = _load_device(monkeypatch)
+    nodes = object.__new__(device.S10Nodes)
+    nodes._lidar_topics = ["/DEPTH_POINTS", "/local_scans", "/LIDAR/POINTS"]
+    nodes._active_lidar_source = "/local_scans"
+    nodes._lidar_source_last_seen = {"/local_scans": time.monotonic()}
+    nodes._stream_lock = threading.Lock()
+    nodes._stream_stats = {"lidar": {"received": 0, "published": 0, "dropped": 0,
+                                      "last_received": None, "last_published": None}}
+    nodes._source_topics = {"lidar": list(nodes._lidar_topics)}
+    nodes.media_workers = SimpleNamespace(submit=lambda *_args: True)
+    msg = SimpleNamespace(fields=[], is_bigendian=False, width=0, height=0,
+                          row_step=0, point_step=0, data=b"")
+    nodes._forward_lidar("/DEPTH_POINTS", msg)
+    assert nodes._active_lidar_source == "/DEPTH_POINTS"
+    assert nodes._stream_stats["lidar"]["received"] == 1
 
 
 def test_loco_completion_is_delivered_asynchronously(monkeypatch):

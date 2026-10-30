@@ -110,7 +110,8 @@ class S10Nodes:
             "camera_0": ["/camera/front/image_raw", "/camera/front/image_raw/compressed",
                          "/camera/front/color/image_raw", "/camera/front/color/image_raw/compressed",
                          "/camera_front/image_raw", "/camera_0/image_raw",
-                         "/usb_camera_1/image_raw", "/usb_camera_1/image_raw/compressed"],
+                         "/usb_camera_1/image_raw", "/usb_camera_1/image_raw/compressed",
+                         "/DEPTH_IMAGE"],
             "camera_1": ["/camera/rear/image_raw", "/camera/rear/image_raw/compressed",
                          "/camera/rear/color/image_raw", "/camera/rear/color/image_raw/compressed",
                          "/camera_back/image_raw", "/camera_1/image_raw",
@@ -185,6 +186,7 @@ class S10Nodes:
         lidar_topics = topics.get("lidar", "/LIDAR/POINTS")
         self._lidar_topics = [lidar_topics] if isinstance(lidar_topics, str) else list(lidar_topics)
         self._active_lidar_source = None
+        self._lidar_source_last_seen = {}
         self._configured_camera_lanes = {
             topic: key for key, values in camera_topics.items()
             for topic in ([values] if isinstance(values, str) else values)
@@ -388,7 +390,23 @@ class S10Nodes:
             result[key]["bridge_last_error"] = lane.get("last_error")
             if self.media_workers is not None and (key.startswith("camera_") or key == "lidar"):
                 result[key]["worker_alive"] = self.media_workers.is_alive(key)
+            if key == "lidar":
+                result[key]["active_source"] = self._active_lidar_source
+                result[key]["source_publishers"] = {
+                    topic: self._count_publishers(topic) for topic in self._lidar_topics
+                }
+            elif key.startswith("camera_"):
+                result[key]["active_source"] = self._camera_lane_sources.get(key)
+                source = result[key]["active_source"]
+                result[key]["source_publishers"] = (
+                    self._count_publishers(source) if source else None)
         return result
+
+    def _count_publishers(self, topic):
+        try:
+            return self.robot.count_publishers(topic)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
 
     def _publish_json(self, key, value):
         from std_msgs.msg import String
@@ -570,10 +588,24 @@ class S10Nodes:
     def _forward_lidar(self, source, msg=None):
         if msg is None:
             msg, source = source, None
-        if self._active_lidar_source is None:
-            self._active_lidar_source = source
-        elif source is not None and source != self._active_lidar_source:
-            return
+        now = time.monotonic()
+        if source is not None:
+            self._lidar_source_last_seen[source] = now
+            active_seen = self._lidar_source_last_seen.get(self._active_lidar_source, 0)
+            # A discovered topic may produce one stale/diagnostic frame before
+            # the configured live stream starts. Let an inactive source take
+            # over after the current source has gone quiet.
+            active_priority = (self._lidar_topics.index(self._active_lidar_source)
+                               if self._active_lidar_source in self._lidar_topics else None)
+            candidate_priority = (self._lidar_topics.index(source)
+                                  if source in self._lidar_topics else None)
+            if (self._active_lidar_source is None or
+                    (candidate_priority is not None and
+                     (active_priority is None or candidate_priority < active_priority)) or
+                    (source != self._active_lidar_source and now - active_seen > 2.0)):
+                self._active_lidar_source = source
+            elif source != self._active_lidar_source:
+                return
         self._record_stream("lidar", "received")
         if self.media_workers is not None:
             fields = [(field.name, field.offset, field.datatype, field.count)
@@ -1303,8 +1335,8 @@ class S10LightPlugin:
         "fill_flow": (["head_color", "tail_color"], "头尾灯填充流水"),
         "moving_flow": (["head_color", "tail_color"], "头尾灯移动流水"),
         "gradient_flow": (["head_color", "tail_color"], "头尾灯渐变流水"),
-        "breathe": (["head_color", "tail_color", "cycle_seconds"], "头尾灯呼吸；周期单位为秒"),
-        "blink": (["head_color", "tail_color", "cycle_seconds"], "头尾灯闪烁；周期单位为秒"),
+        "breathe": (["head_color", "tail_color", "head_cycle_seconds", "tail_cycle_seconds"], "头尾灯呼吸；头尾周期分别设置，单位为秒"),
+        "blink": (["head_color", "tail_color", "head_cycle_seconds", "tail_cycle_seconds"], "头尾灯闪烁；头尾周期分别设置，单位为秒"),
     }
 
     def __init__(self, native): self.native = native
@@ -1312,8 +1344,10 @@ class S10LightPlugin:
         result = tool("light", "actuator", "山猫 S10 头尾灯控制。按 action 选择常亮、流水、渐变、呼吸或闪烁；固件仅支持黑、白、绿、蓝四种颜色。周期参数只属于呼吸和闪烁 action。", action_schema(self.ACTIONS, {
             "head_color": {"type": "string", "enum": list(LIGHT_COLORS), "default": "白色", "description": "头灯颜色"},
             "tail_color": {"type": "string", "enum": list(LIGHT_COLORS), "default": "白色", "description": "尾灯颜色"},
-            "cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
-                               "description": "呼吸或闪烁周期（秒）"},
+            "head_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
+                                    "description": "头灯呼吸或闪烁周期（秒）"},
+            "tail_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
+                                    "description": "尾灯呼吸或闪烁周期（秒）"},
         }))
         return result
     def start(self): pass
@@ -1324,11 +1358,12 @@ class S10LightPlugin:
         if action == "info": return {"state": "ready"}
         if action in self.ACTIONS:
             effect_name, effect_code = LIGHT_ACTION_EFFECTS[action]
-            cycle = args.get("cycle_seconds", 1)
             if action in {"breathe", "blink"}:
-                if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 1:
-                    return {"ok": False, "code": "INVALID_ARGUMENT",
-                            "error": "cycle_seconds must be a positive integer"}
+                for side in ("head", "tail"):
+                    cycle = args.get(f"{side}_cycle_seconds", 1)
+                    if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 1:
+                        return {"ok": False, "code": "INVALID_ARGUMENT",
+                                "error": f"{side}_cycle_seconds must be a positive integer"}
             leds = []
             for side in ("head", "tail"):
                 color = args.get(f"{side}_color", "白色")
@@ -1337,7 +1372,7 @@ class S10LightPlugin:
                             "error": f"unsupported {side}_color"}
                 led = {"Type": effect_code, "Color": [LIGHT_COLORS[color]]}
                 if action in {"breathe", "blink"}:
-                    led["Cycle"] = cycle
+                    led["Cycle"] = args.get(f"{side}_cycle_seconds", 1)
                 leds.append(led)
             # The Pro firmware applies this command but does not send an ASDU
             # response. Use the native fire-and-forget path so a successful

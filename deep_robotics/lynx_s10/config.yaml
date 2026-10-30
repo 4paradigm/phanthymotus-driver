@@ -32,6 +32,9 @@ camera_topics:
     - "/camera_0/image_raw/compressed"
     - "/usb_camera_1/image_raw"
     - "/usb_camera_1/image_raw/compressed"
+    # S10 Pro firmware currently exposes the active depth imager here even
+    # when the four RGB camera nodes are not started.
+    - "/DEPTH_IMAGE"
   camera_1:
     - "/camera/rear/image_raw"
     - "/camera/rear/image_raw/compressed"

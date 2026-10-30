@@ -32,7 +32,9 @@ class MediaWorkers:
 
     def _add(self, lane, kind):
         jobs = self._ctx.Queue(maxsize=2)
-        results = self._ctx.Queue(maxsize=1)
+        # Allow conversion and publication to overlap by a few frames while
+        # retaining a bounded queue; old frames are still replaced by latest.
+        results = self._ctx.Queue(maxsize=4)
         process = self._ctx.Process(target=_worker, args=(jobs, results, kind, lane),
                                     name=f"lynx-s10-media-{lane}", daemon=True)
         process.start()
