@@ -85,6 +85,7 @@ class S10Nodes:
     def __init__(self, config, namespace, ros2):
         import json
         import time
+        from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
         from drdds.msg import BatteryData, JointsData, MotionInfo
@@ -163,6 +164,12 @@ class S10Nodes:
                                 reliability=ReliabilityPolicy.BEST_EFFORT,
                                 durability=DurabilityPolicy.VOLATILE)
         self._sensor_qos = stream_qos
+        # The node's default callback group is mutually exclusive. Give each
+        # media lane its own group so slow point-cloud ingress cannot block
+        # camera callbacks, while aliases within one camera remain serialized.
+        self._media_callback_groups = {
+            lane: MutuallyExclusiveCallbackGroup() for lane in (*CAMERA_LANES, "lidar")
+        }
         self._stream_lock = threading.Lock()
         self._camera_source_lock = threading.Lock()
         self._stream_stats = {
@@ -217,7 +224,9 @@ class S10Nodes:
             msg_type = CompressedImage if topic.endswith("/compressed") else Image
             callback = lambda msg, camera=key, source=topic: self._forward_camera_alias(
                 camera, source, msg)
-            handle = self.robot.create_subscription(msg_type, topic, callback, self._sensor_qos)
+            handle = self.robot.create_subscription(
+                msg_type, topic, callback, self._sensor_qos,
+                callback_group=self._media_callback_groups[key])
             self._media_subscriptions.append(handle)
             self._media_topic_subscriptions.add(topic)
             self._media_topic_types[topic] = msg_type
@@ -229,7 +238,8 @@ class S10Nodes:
                 continue
             handle = self.robot.create_subscription(
                 PointCloud2, topic,
-                lambda msg, source=topic: self._forward_lidar(source, msg), self._sensor_qos)
+                lambda msg, source=topic: self._forward_lidar(source, msg), self._sensor_qos,
+                callback_group=self._media_callback_groups["lidar"])
             self._media_subscriptions.append(handle)
             self._media_topic_subscriptions.add(topic)
             self._media_topic_types[topic] = PointCloud2
@@ -270,7 +280,8 @@ class S10Nodes:
                 self._source_topics["lidar"] = list(self._lidar_topics)
                 self._media_subscriptions.append(self.robot.create_subscription(
                     PointCloud2, topic,
-                    lambda msg, source=topic: self._forward_lidar(source, msg), self._sensor_qos))
+                    lambda msg, source=topic: self._forward_lidar(source, msg), self._sensor_qos,
+                    callback_group=self._media_callback_groups["lidar"]))
                 self._media_topic_subscriptions.add(topic)
                 print(f"[ros2] discovered point cloud subscription: {topic}", flush=True)
                 continue
@@ -305,7 +316,9 @@ class S10Nodes:
             self._discovered_media.add(identity)
             callback = lambda msg, camera=key, source=topic: self._forward_camera_alias(
                 camera, source, msg)
-            handle = self.robot.create_subscription(msg_type, topic, callback, self._sensor_qos)
+            handle = self.robot.create_subscription(
+                msg_type, topic, callback, self._sensor_qos,
+                callback_group=self._media_callback_groups[key])
             self._media_subscriptions.append(handle)
             self._media_topic_subscriptions.add(topic)
             self._media_topic_types[topic] = msg_type
@@ -983,7 +996,6 @@ class S10StatePlugin:
     def __init__(self, native, nodes=None): self.native, self.nodes = native, nodes
     def get_tools(self):
         cards = {
-            "state": "山猫 S10 原生 TCP 协议连接及全部设备主动上报状态",
             "imu": "山猫 S10 IMU 加速度和角速度（由原生运控状态报告提供，10Hz）",
             "joints": "山猫 S10 16 个轮足关节角度（原生协议 10Hz）",
             "joint_state": "山猫 S10 轮足关节位置、速度、力矩和温度（原生协议 10Hz）",
@@ -1011,7 +1023,7 @@ class S10StatePlugin:
         if self.nodes: self.nodes.close()
         self.native.close()
     def dispatch(self, action, args):
-        name = args.get("_tool_name", "state")
+        name = args.get("_tool_name", "")
         if action == "start":
             self.native.start()
             return self._topic_result(name, "running")
@@ -1025,11 +1037,6 @@ class S10StatePlugin:
                 "joint_state": "1048577:15728640", "loco_state": "1048577:15728640",
                 "battery": "1048578:15728640",
                 }
-        if name == "state":
-            result = self.native.snapshot()
-            if self.nodes:
-                result["ros_streams"] = self.nodes.stream_status()
-            return result
         if name == "lidar" and self.nodes: return {"state": "streaming", **self.nodes.topics[name]}
         if name.startswith("camera_") and self.nodes:
             return {"state": "streaming", **self.nodes.topics[name]}
@@ -1489,77 +1496,6 @@ LIGHT_ACTION_EFFECTS = {
 LIGHT_EFFECTS = {name: code for name, code in LIGHT_ACTION_EFFECTS.values()}
 
 
-class S10LightPlugin:
-    ACTIONS = {
-        "constant": (["head_color", "tail_color"], "头尾灯常亮"),
-        "fill_flow": (["head_color", "tail_color"], "头尾灯填充流水"),
-        "moving_flow": (["head_color", "tail_color"], "头尾灯移动流水"),
-        "gradient_flow": (["head_color", "tail_color"], "头尾灯按所选颜色执行渐变流水"),
-        "breathe": (["head_color", "tail_color", "head_cycle_seconds", "tail_cycle_seconds"], "头尾灯呼吸；头尾周期分别设置，单位为秒"),
-        "blink": (["head_color", "tail_color", "head_cycle_seconds", "tail_cycle_seconds"], "头尾灯闪烁；头尾周期分别设置，单位为秒"),
-        "head_constant_tail_blink": (["head_color", "tail_color", "tail_cycle_seconds"], "头灯常亮、尾灯闪烁"),
-        "head_blink_tail_constant": (["head_color", "tail_color", "head_cycle_seconds"], "头灯闪烁、尾灯常亮"),
-        "head_constant_tail_breathe": (["head_color", "tail_color", "tail_cycle_seconds"], "头灯常亮、尾灯呼吸"),
-        "head_breathe_tail_constant": (["head_color", "tail_color", "head_cycle_seconds"], "头灯呼吸、尾灯常亮"),
-    }
-
-    def __init__(self, native): self.native = native
-    def get_tool(self):
-        result = tool("light", "actuator", "山猫 S10 头尾灯控制。按 action 选择常亮、流水、渐变、呼吸或闪烁；固件仅支持黑、白、绿、蓝四种颜色。周期参数只属于呼吸和闪烁 action。", action_schema(self.ACTIONS, {
-            "head_color": {"type": "string", "enum": list(LIGHT_COLORS), "default": "白色", "description": "头灯颜色"},
-            "tail_color": {"type": "string", "enum": list(LIGHT_COLORS), "default": "白色", "description": "尾灯颜色"},
-            "head_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
-                                    "description": "头灯呼吸或闪烁周期（秒）"},
-            "tail_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
-                                    "description": "尾灯呼吸或闪烁周期（秒）"},
-        }))
-        return result
-    def start(self): pass
-    def stop(self): pass
-    def dispatch(self, action, args):
-        if action == "start": return {"state": "ready"}
-        if action == "stop": return {"state": "idle"}
-        if action == "info": return {"state": "ready"}
-        if action in self.ACTIONS:
-            mixed_effects = {
-                "head_constant_tail_blink": {"head": "constant", "tail": "blink"},
-                "head_blink_tail_constant": {"head": "blink", "tail": "constant"},
-                "head_constant_tail_breathe": {"head": "constant", "tail": "breathe"},
-                "head_breathe_tail_constant": {"head": "breathe", "tail": "constant"},
-            }
-            effects = mixed_effects.get(action, {"head": action, "tail": action})
-            for side, effect in effects.items():
-                if effect not in LIGHT_ACTION_EFFECTS:
-                    return {"ok": False, "code": "INVALID_ARGUMENT",
-                            "error": f"unsupported {side}_effect"}
-            if any(effect in {"breathe", "blink"} for effect in effects.values()):
-                for side in ("head", "tail"):
-                    if effects[side] not in {"breathe", "blink"}:
-                        continue
-                    cycle = args.get(f"{side}_cycle_seconds", 1)
-                    if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 1:
-                        return {"ok": False, "code": "INVALID_ARGUMENT",
-                                "error": f"{side}_cycle_seconds must be a positive integer"}
-            leds = []
-            for side in ("head", "tail"):
-                effect = effects[side]
-                effect_code = LIGHT_ACTION_EFFECTS[effect][1]
-                color = args.get(f"{side}_color", "白色")
-                if color not in LIGHT_COLORS:
-                    return {"ok": False, "code": "INVALID_ARGUMENT",
-                            "error": f"unsupported {side}_color"}
-                led = {"Type": effect_code, "Color": [LIGHT_COLORS[color]]}
-                if effect in {"breathe", "blink"}:
-                    led["Cycle"] = args.get(f"{side}_cycle_seconds", 1)
-                leds.append(led)
-            # The Pro firmware applies this command but does not send an ASDU
-            # response. Use the native fire-and-forget path so a successful
-            # physical change is never reported as a TCP timeout.
-            return self.native.send(0x00100005, 0x00200002,
-                                    {"CustomMode": True, "Led": leds})
-        raise ValueError(f"unsupported S10 light action: {action}")
-
-
 class S10SingleLightPlugin:
     """Independent head/tail light card with effect-scoped parameters."""
     ACTIONS = {
@@ -1654,7 +1590,7 @@ def build_plugins(config, namespace=None, ros2=None):
     nodes = S10Nodes(config, namespace or "", ros2) if ros2 is not None else None
     plugins = [S10ModelPlugin(), S10StatePlugin(native, nodes), S10MotionPlugin(native, nodes),
                S10SingleLightPlugin(native, "head"),
-               S10SingleLightPlugin(native, "tail"), S10LightPlugin(native),
+               S10SingleLightPlugin(native, "tail"),
                S10ChargePlugin(native)]
     if str(config.get("model_variant", "standard")).lower() == "pro":
         plugins.append(S10NavigationPlugin(native))

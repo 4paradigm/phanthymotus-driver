@@ -11,7 +11,6 @@ build_context_extras:
   - ../../common
 cards:
   - { name: model,                 type: resource }
-  - { name: state,                 type: sensor }
   - { name: imu,                   type: sensor }
   - { name: joints,                type: sensor }
   - { name: joint_state,           type: sensor }
@@ -25,6 +24,5 @@ cards:
   - { name: loco,                  type: actuator }
   - { name: head_light,            type: actuator }
   - { name: tail_light,            type: actuator }
-  - { name: light,                 type: actuator }
   - { name: charging,              type: actuator }
   - { name: navigation,            type: actuator }

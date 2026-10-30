@@ -74,8 +74,10 @@ def test_pro_config_registers_navigation_and_matches_marketplace_cards(monkeypat
     assert config["model_variant"] == "pro"
     assert "navigation" in card_names
     assert {"head_light", "tail_light"} <= card_names
+    assert "light" not in card_names
     assert "loco" in card_names and "motion" not in card_names
     assert {"imu", "loco_state", "joints", "joint_state", "battery"} <= card_names
+    assert "state" not in card_names
     assert "errors" not in card_names
     assert {"camera_rear", "camera_left", "camera_front", "camera_right"} <= card_names
     assert "device" not in card_names
@@ -130,6 +132,7 @@ def test_state_cards_expose_core_topics_when_ros_nodes_are_present(monkeypatch):
     }, "stream_status": lambda _self: {"imu": {"received": 0, "published": 0}}})()
     plugin = device.S10StatePlugin(native, nodes)
     tools = {item["name"]: item for item in plugin.get_tools()}
+    assert "state" not in tools
     assert tools["joints"]["topic_out"] == [{"topic": "/robot/lynx_s10/joints", "format": "sensor/skeleton"}]
     assert plugin.dispatch("info", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/lynx_s10/imu"
     assert plugin.dispatch("start", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/lynx_s10/imu"
@@ -153,14 +156,16 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
             self.context = context
             self.publishers = {}
             self.subscriptions = {}
+            self.subscription_groups = {}
 
         def create_publisher(self, _msg_type, topic, _depth):
             publisher = FakePublisher()
             self.publishers[topic] = publisher
             return publisher
 
-        def create_subscription(self, _msg_type, topic, callback, _depth):
+        def create_subscription(self, _msg_type, topic, callback, _depth, callback_group=None):
             self.subscriptions[topic] = callback
+            self.subscription_groups[topic] = callback_group
 
         def create_timer(self, *_args):
             return object()
@@ -203,6 +208,9 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
 
     ros_node = ModuleType("rclpy.node")
     ros_node.Node = FakeNode
+    callback_groups = ModuleType("rclpy.callback_groups")
+    callback_groups.MutuallyExclusiveCallbackGroup = type(
+        "MutuallyExclusiveCallbackGroup", (), {})
     qos_module = ModuleType("rclpy.qos")
     qos_module.qos_profile_sensor_data = object()
     class ReliabilityPolicy:
@@ -226,7 +234,8 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     drdds_msg = ModuleType("drdds.msg")
     drdds_msg.JointsData, drdds_msg.BatteryData, drdds_msg.MotionInfo = JointsData, BatteryData, MotionInfo
     for module_name, module in {
-        "rclpy.node": ros_node, "rclpy.qos": qos_module, "sensor_msgs.msg": sensor_msg,
+        "rclpy.node": ros_node, "rclpy.callback_groups": callback_groups,
+        "rclpy.qos": qos_module, "sensor_msgs.msg": sensor_msg,
         "std_msgs.msg": standard_msg, "drdds.msg": drdds_msg,
     }.items():
         monkeypatch.setitem(__import__("sys").modules, module_name, module)
@@ -319,6 +328,11 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert nodes._source_topics["camera_front"] == "/s10/front/image"
     assert nodes._source_topics["camera_right"] == "/s10/right/image"
     assert "/s10/depth" in nodes.robot.subscriptions
+    groups = nodes.robot.subscription_groups
+    assert groups["/s10/rear/image/compressed"] is groups["/CAMERA/RAW"]
+    assert groups["/s10/left/image"] is not groups["/s10/rear/image/compressed"]
+    assert groups["/s10/depth"] is groups["/LIDAR/POINTS"]
+    assert groups["/s10/depth"] is not groups["/s10/rear/image/compressed"]
     assert nodes._sensor_qos.kwargs == {
         "depth": 1, "history": 1, "reliability": 2, "durability": 2}
     nodes.close()
@@ -484,19 +498,16 @@ def test_light_cycle_controls_are_scoped_to_breathe_and_blink_actions(monkeypatc
             return {"state": "sent"}
 
     native = Native()
-    plugin = device.S10LightPlugin(native)
+    plugin = device.S10SingleLightPlugin(native, "head")
     schema = plugin.get_tool()["inputSchema"]
     actions = schema["x-action-params"]
-    assert set(actions) == {"constant", "fill_flow", "moving_flow", "gradient_flow", "breathe", "blink",
-                            "head_constant_tail_blink", "head_blink_tail_constant",
-                            "head_constant_tail_breathe", "head_breathe_tail_constant"}
+    assert set(actions) == {"constant", "fill_flow", "moving_flow", "gradient_flow", "breathe", "blink"}
     for action in ("constant", "fill_flow", "moving_flow", "gradient_flow"):
-        assert "head_cycle_seconds" not in actions[action]["params"]
-        assert "tail_cycle_seconds" not in actions[action]["params"]
-    assert set(actions["gradient_flow"]["params"]) == {"head_color", "tail_color"}
+        assert "cycle_seconds" not in actions[action]["params"]
+    assert set(actions["gradient_flow"]["params"]) == {"color"}
     for action in ("breathe", "blink"):
-        assert "head_cycle_seconds" in actions[action]["params"]
-        assert "tail_cycle_seconds" in actions[action]["params"]
+        assert "cycle_seconds" in actions[action]["params"]
+    assert plugin.get_tool()["name"] == "head_light"
 
 
 def test_media_worker_replaces_stale_queued_frame_without_reporting_failure(monkeypatch):
@@ -1162,7 +1173,7 @@ def test_actuator_lifecycle_never_starts_charging_or_sends_idle_commands(monkeyp
     assert native.calls[-1][0] == (0x00100004, 0x00100002, {"Charge": 0})
 
 
-def test_state_card_stop_start_keeps_shared_tcp_client_alive(monkeypatch):
+def test_sensor_card_stop_start_keeps_shared_tcp_client_alive(monkeypatch):
     device = _load_device(monkeypatch)
 
     class LifecycleNative(FakeNative):
@@ -1181,9 +1192,9 @@ def test_state_card_stop_start_keeps_shared_tcp_client_alive(monkeypatch):
 
     native = LifecycleNative()
     plugin = device.S10StatePlugin(native)
-    assert plugin.dispatch("stop", {"_tool_name": "state"}) == {"state": "idle"}
+    assert plugin.dispatch("stop", {"_tool_name": "imu"}) == {"state": "idle"}
     assert not native.closed
-    assert plugin.dispatch("start", {"_tool_name": "state"}) == {"state": "running"}
+    assert plugin.dispatch("start", {"_tool_name": "imu"}) == {"state": "running"}
     assert native.start_count == 1
     assert native.close_count == 0
 
@@ -1210,23 +1221,18 @@ def test_control_schema_exposes_supported_navigation_and_light_options(monkeypat
     native = FakeNative({})
     nav_params = device.S10NavigationPlugin(native).get_tool()["inputSchema"]["x-action-params"]["goal"]["params"]
     localize_params = device.S10NavigationPlugin(native).get_tool()["inputSchema"]["x-action-params"]["localize"]["params"]
-    light_tool = device.S10LightPlugin(native).get_tool()
+    light_tool = device.S10SingleLightPlugin(native, "head").get_tool()
     actions = light_tool["inputSchema"]["x-action-params"]
     light_params = actions["constant"]["params"]
 
     assert set(nav_params) == {"x", "y", "z", "yaw_degrees", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous", "confirm"}
     assert set(localize_params) == {"x", "y", "z", "yaw_degrees", "confirm"}
-    assert set(light_params) == {"head_color", "tail_color"}
-    assert set(actions) == {"constant", "fill_flow", "moving_flow", "gradient_flow", "breathe", "blink",
-                            "head_constant_tail_blink", "head_blink_tail_constant",
-                            "head_constant_tail_breathe", "head_breathe_tail_constant"}
-    assert "head_cycle_seconds" not in actions["head_constant_tail_blink"]["params"]
-    assert "tail_cycle_seconds" in actions["head_constant_tail_blink"]["params"]
-    assert "head_cycle_seconds" in actions["breathe"]["params"]
-    assert "tail_cycle_seconds" in actions["breathe"]["params"]
-    assert "head_cycle_seconds" in actions["blink"]["params"]
-    assert "tail_cycle_seconds" in actions["blink"]["params"]
-    assert light_tool["name"] == "light"
+    assert set(light_params) == {"color"}
+    assert set(actions) == {"constant", "fill_flow", "moving_flow", "gradient_flow", "breathe", "blink"}
+    assert "cycle_seconds" not in actions["constant"]["params"]
+    assert "cycle_seconds" in actions["breathe"]["params"]
+    assert "cycle_seconds" in actions["blink"]["params"]
+    assert light_tool["name"] == "head_light"
     charge_schema = device.S10ChargePlugin(native).get_tool()["inputSchema"]
     assert charge_schema["x-is-dangerous"] is True
     assert "confirm" in charge_schema["x-action-params"]["start_charging"]["params"]
@@ -1236,15 +1242,14 @@ def test_control_schema_exposes_supported_navigation_and_light_options(monkeypat
 def test_light_uses_named_colors_and_effects_in_native_protocol(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
-    plugin = device.S10LightPlugin(native)
-    plugin.dispatch("breathe", {"head_color": "绿色", "tail_color": "蓝色",
-                                 "head_cycle_seconds": 3, "tail_cycle_seconds": 5})
+    plugin = device.S10SingleLightPlugin(native, "head")
+    plugin.dispatch("breathe", {"color": "绿色", "cycle_seconds": 3})
 
     assert native.calls[-1][0] == (0x00100005, 0x00200002, {
         "CustomMode": True,
         "Led": [
             {"Type": 4, "Color": [2], "Cycle": 3},
-            {"Type": 4, "Color": [3], "Cycle": 5},
+            {"Type": 0, "Color": [1]},
         ],
     })
     assert native.calls[-1][1] == {}
@@ -1265,37 +1270,12 @@ def test_head_and_tail_light_cards_are_independent(monkeypatch):
     assert len(native.calls[-1][0][2]["Led"]) == 2
 
 
-def test_light_mixed_action_allows_different_head_and_tail_effects(monkeypatch):
-    device = _load_device(monkeypatch)
-    native = FakeNative({})
-    device.S10LightPlugin(native).dispatch("head_constant_tail_blink", {
-        "head_color": "白色", "tail_color": "蓝色", "tail_cycle_seconds": 3,
-    })
-    assert native.calls[-1][0][2]["Led"] == [
-        {"Type": device.LIGHT_EFFECTS["常亮"], "Color": [1]},
-        {"Type": device.LIGHT_EFFECTS["闪烁"], "Color": [3], "Cycle": 3},
-    ]
-
-
 def test_light_uses_fire_and_forget_when_firmware_has_no_response(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
-    result = device.S10LightPlugin(native).dispatch("constant", {})
+    result = device.S10SingleLightPlugin(native, "head").dispatch("constant", {})
     assert result["state"] == "sent"
     assert native.calls[-1][0][:2] == (0x00100005, 0x00200002)
-
-
-def test_gradient_flow_lets_firmware_choose_rainbow_colors(monkeypatch):
-    device = _load_device(monkeypatch)
-    native = FakeNative({})
-    device.S10LightPlugin(native).dispatch("gradient_flow", {
-        "head_color": "绿色", "tail_color": "蓝色",
-    })
-    leds = native.calls[-1][0][2]["Led"]
-    assert leds == [
-        {"Type": device.LIGHT_EFFECTS["渐变流水"], "Color": [device.LIGHT_COLORS["绿色"]]},
-        {"Type": device.LIGHT_EFFECTS["渐变流水"], "Color": [device.LIGHT_COLORS["蓝色"]]},
-    ]
 
 
 def test_single_light_gradient_sends_selected_color(monkeypatch):
@@ -1311,9 +1291,7 @@ def test_single_light_gradient_sends_selected_color(monkeypatch):
 def test_light_constant_effect_omits_cycle_from_native_payload(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
-    device.S10LightPlugin(native).dispatch("constant", {
-        "head_color": "白色", "tail_color": "蓝色",
-    })
+    device.S10SingleLightPlugin(native, "head").dispatch("constant", {"color": "白色"})
     leds = native.calls[-1][0][2]["Led"]
     assert "Cycle" not in leds[0]
     assert "Cycle" not in leds[1]
@@ -1322,13 +1300,13 @@ def test_light_constant_effect_omits_cycle_from_native_payload(monkeypatch):
 def test_light_blink_action_sets_independent_cycles_for_lamps(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
-    device.S10LightPlugin(native).dispatch("blink", {
-        "head_cycle_seconds": 4, "tail_cycle_seconds": 7})
+    device.S10SingleLightPlugin(native, "head").dispatch("blink", {
+        "color": "绿色", "cycle_seconds": 4})
     leds = native.calls[-1][0][2]["Led"]
     assert leds[0]["Type"] == device.LIGHT_EFFECTS["闪烁"]
     assert leds[0]["Cycle"] == 4
-    assert leds[1]["Type"] == device.LIGHT_EFFECTS["闪烁"]
-    assert leds[1]["Cycle"] == 7
+    assert leds[0]["Color"] == [device.LIGHT_COLORS["绿色"]]
+    assert leds[1]["Type"] == device.LIGHT_EFFECTS["常亮"]
 
 
 def test_lidar_source_switches_to_higher_priority_configured_stream(monkeypatch):
