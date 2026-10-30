@@ -169,7 +169,7 @@ def _jpeg(width, height, step, encoding, data):
         except (OSError, ValueError):
             return None
         stream = BytesIO()
-        image.save(stream, format="JPEG", quality=85, optimize=False)
+        _save_preview(image, stream)
         return stream.getvalue()
     if encoding in ("nv12", "nv21"):
         try:
@@ -195,7 +195,7 @@ def _jpeg(width, height, step, encoding, data):
         except (ImportError, ValueError, TypeError):
             return None
         stream = BytesIO()
-        image.save(stream, format="JPEG", quality=85, optimize=False)
+        _save_preview(image, stream)
         return stream.getvalue()
     mode, raw_mode = {"rgb8": ("RGB", "RGB"), "bgr8": ("RGB", "BGR"),
                       "rgba8": ("RGBA", "RGBA"), "bgra8": ("RGBA", "BGRA"),
@@ -206,8 +206,18 @@ def _jpeg(width, height, step, encoding, data):
     if image.mode == "RGBA":
         image = image.convert("RGB")
     stream = BytesIO()
-    image.save(stream, format="JPEG", quality=85, optimize=False)
+    _save_preview(image, stream)
     return stream.getvalue()
+
+
+def _save_preview(image, stream):
+    """Encode a bounded dashboard preview instead of queuing full frames."""
+    max_dimension = 640
+    if max(image.size) > max_dimension:
+        scale = max_dimension / float(max(image.size))
+        image = image.resize((max(1, int(image.width * scale)),
+                              max(1, int(image.height * scale))))
+    image.save(stream, format="JPEG", quality=65, optimize=False)
 
 
 def _reencode_jpeg(data):

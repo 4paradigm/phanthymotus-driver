@@ -432,8 +432,8 @@ def test_camera_lane_recognizes_numbered_camera_topic_independent_of_discovery_o
     assert nodes._assign_camera_lane("/camera_3/image_raw") == "camera_right"
     assert nodes._assign_camera_lane("/camera_1/image_raw") == "camera_left"
     assert nodes._assign_camera_lane("/usb_camera_1/image_raw_0") == "camera_left"
-    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_1") == "camera_front"
-    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_2") == "camera_right"
+    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_1") is None
+    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_2") is None
     assert nodes._assign_camera_lane("/camera_0/image_raw") == "camera_rear"
 
 
@@ -463,6 +463,7 @@ def test_light_cycle_controls_are_scoped_to_breathe_and_blink_actions(monkeypatc
     for action in ("constant", "fill_flow", "moving_flow", "gradient_flow"):
         assert "head_cycle_seconds" not in actions[action]["params"]
         assert "tail_cycle_seconds" not in actions[action]["params"]
+    assert set(actions["gradient_flow"]["params"]) == set()
     for action in ("breathe", "blink"):
         assert "head_cycle_seconds" in actions[action]["params"]
         assert "tail_cycle_seconds" in actions[action]["params"]
@@ -1221,6 +1222,14 @@ def test_light_uses_fire_and_forget_when_firmware_has_no_response(monkeypatch):
     result = device.S10LightPlugin(native).dispatch("constant", {})
     assert result["state"] == "sent"
     assert native.calls[-1][0][:2] == (0x00100005, 0x00200002)
+
+
+def test_gradient_flow_lets_firmware_choose_rainbow_colors(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    device.S10LightPlugin(native).dispatch("gradient_flow", {})
+    leds = native.calls[-1][0][2]["Led"]
+    assert leds == [{"Type": device.LIGHT_EFFECTS["渐变流水"]}] * 2
 
 
 def test_light_constant_effect_omits_cycle_from_native_payload(monkeypatch):

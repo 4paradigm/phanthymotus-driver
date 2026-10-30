@@ -27,7 +27,7 @@
 
 S10 URDF 含有指向 `meshes/*.STL` 的视觉网格引用；本次仅随镜像提供 URDF 文本，骨架关节名与运动学链可用，但不承诺展示厂家 STL 外观。`joints` 实时流使用真机 `JOINTS_DATA_10HZ` 的 16 个电机字段，并按 URDF 关节顺序映射到仓库通用 `sensor/skeleton`；`joint_state` 同时保留完整供应商消息字段。
 
-相机卡片按实际方位命名为 `camera_rear`、`camera_left`、`camera_front`、`camera_right`；厂商 USB 输入顺序对应 tail、left、head、right。
+相机卡片按实际方位命名为 `camera_rear`、`camera_left`、`camera_front`、`camera_right`。当前真机确认的 USB 输入只有 tail (`/usb_camera_1/image_raw`) 和 left (`/usb_camera_1/image_raw_0`)；前、右卡只接受明确的语义 ROS topic，不会把未知 USB 后缀按发现顺序猜测成前/右。
 
 Go1/Go2/As2W 中的语音、遥控器、SLAM、深度相机、特技、专用避障以及 `loco` 命令集都没有 S10 指南依据，因此不移植。M20 Pro 的导航卡片名称与动作边界可复用，但导航实现按 S10 自己的 ASDU 和 Pro 型号边界实现。
 

@@ -117,19 +117,15 @@ class S10Nodes:
                          "/camera/left/color/image_raw", "/camera/left/color/image_raw/compressed",
                          "/camera_left/image_raw", "/camera_1/image_raw",
                          "/usb_camera_1/image_raw_0", "/usb_camera_1/image_raw_0/compressed",
-                         "/usb_camera_2/image_raw", "/usb_camera_2/image_raw/compressed",
-                         "/usb_camera_2/image_raw_0", "/usb_camera_2/image_raw_0/compressed"],
+                         ],
             "camera_front": ["/camera/front/image_raw", "/camera/front/image_raw/compressed",
                          "/camera/front/color/image_raw", "/camera/front/color/image_raw/compressed",
                          "/camera_front/image_raw", "/camera_2/image_raw",
-                         "/usb_camera_1/image_raw_1", "/usb_camera_1/image_raw_1/compressed",
-                         "/usb_camera_3/image_raw", "/usb_camera_3/image_raw/compressed",
-                         "/usb_camera_3/image_raw_0", "/usb_camera_3/image_raw_0/compressed"],
+                         ],
             "camera_right": ["/camera/right/image_raw", "/camera/right/image_raw/compressed",
                          "/camera/right/color/image_raw", "/camera/right/color/image_raw/compressed",
                          "/camera_right/image_raw", "/camera_3/image_raw",
-                         "/usb_camera_4/image_raw", "/usb_camera_4/image_raw/compressed",
-                         "/usb_camera_4/image_raw_0", "/usb_camera_4/image_raw_0/compressed"],
+                         ],
         }))
         for lane in CAMERA_LANES:
             camera_topics.setdefault(lane, [])
@@ -336,6 +332,11 @@ class S10Nodes:
         key = self._configured_camera_lanes.get(topic) or self._camera_topic_lanes.get(topic)
         if key is None:
             key = self._camera_key_for_topic(topic)
+        # Unknown USB inputs are not safe to assign by discovery order: doing
+        # so can expose the left camera as front/right. Only use explicitly
+        # mapped USB topics; semantic camera names may still use the fallback.
+        if key is None and topic.lower().startswith("/usb_camera_"):
+            return None
         if key is None:
             reserved = set(self._camera_topic_lanes.values())
             key = next((lane for lane in CAMERA_LANES if lane not in reserved), None)
@@ -354,11 +355,7 @@ class S10Nodes:
         if usb:
             suffix = usb.group(1)
             return {None: "camera_rear", "0": "camera_left",
-                    "1": "camera_front", "2": "camera_right"}.get(suffix)
-        usb_service = re.search(r"/usb_camera_(\d+)(?:/|$)", name)
-        if usb_service:
-            return {"1": "camera_rear", "2": "camera_left",
-                    "3": "camera_front", "4": "camera_right"}.get(usb_service.group(1))
+                    }.get(suffix)
         tokens = set(filter(None, re.split(r"[^a-z0-9]+", name)))
         numbered = re.search(r"(?:^|[/_])camera[_-]?(\d+)(?:$|[/_])", name)
         if numbered:
@@ -1400,7 +1397,7 @@ class S10LightPlugin:
         "constant": (["head_color", "tail_color"], "头尾灯常亮"),
         "fill_flow": (["head_color", "tail_color"], "头尾灯填充流水"),
         "moving_flow": (["head_color", "tail_color"], "头尾灯移动流水"),
-        "gradient_flow": (["head_color", "tail_color"], "头尾灯渐变流水"),
+        "gradient_flow": ([], "彩色渐变流水；由灯控固件自动选择渐变颜色"),
         "breathe": (["head_color", "tail_color", "head_cycle_seconds", "tail_cycle_seconds"], "头尾灯呼吸；头尾周期分别设置，单位为秒"),
         "blink": (["head_color", "tail_color", "head_cycle_seconds", "tail_cycle_seconds"], "头尾灯闪烁；头尾周期分别设置，单位为秒"),
     }
@@ -1432,6 +1429,9 @@ class S10LightPlugin:
                                 "error": f"{side}_cycle_seconds must be a positive integer"}
             leds = []
             for side in ("head", "tail"):
+                if action == "gradient_flow":
+                    leds.append({"Type": effect_code})
+                    continue
                 color = args.get(f"{side}_color", "白色")
                 if color not in LIGHT_COLORS:
                     return {"ok": False, "code": "INVALID_ARGUMENT",
