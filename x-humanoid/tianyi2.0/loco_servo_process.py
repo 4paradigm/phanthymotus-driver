@@ -484,6 +484,7 @@ class LocoServoPlugin:
                         worker_alive=bool(self._process and self._process.poll() is None and not self._fault),
                         worker_failed=bool(self._fault) or dispatch["worker_failed"])
         result["transport"] = self._outbox.info()
+        result["chassis_reserved"] = self.reserves_chassis()
         if self._fault:
             result.update(state="error", error=self._fault, output=[0.0] * 6)
             result["last"] = {"verdict": "ERROR", "reason": self._fault}
@@ -559,6 +560,17 @@ class LocoServoPlugin:
             except Exception as exc:
                 self._mark_fault(f"velocity controller RPC failed: {exc}")
                 return self._decorate(self._last_info)
+
+    def reserves_chassis(self):
+        """Reserve for an admitted stream, including dry-run and silent holds.
+
+        This is a local lifecycle decision, not a cached SDK action-ID claim.
+        Checking it never sends an IPC/SDK request or renews motion deadlines.
+        Faulted/paused sessions still require the normal confirmed-stop handover.
+        """
+        with self._rpc_lock, self._state_lock:
+            return (not self._fault and not self._stopping
+                    and self._outbox.info()["active"])
 
     def pause_for_explicit_command(self, reason=""):
         with self._rpc_lock:

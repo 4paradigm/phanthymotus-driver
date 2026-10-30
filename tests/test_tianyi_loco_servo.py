@@ -1226,7 +1226,7 @@ def load_bundle():
     return scope["TianyiDeviceBundle"]
 
 
-def test_bundle_hands_control_to_explicit_card_and_requires_cancel_before_resume(setup, monkeypatch):
+def test_bundle_requires_manual_pause_before_explicit_motion_and_cancel_before_resume(setup, monkeypatch):
     monkeypatch.setitem(sys.modules, "loco_servo_process", setup.module)
     bundle = load_bundle()({"plugins": {"loco_servo": {"enabled": True, "dry_run": False}}}, "ubuntu", setup.ros, None)
     class Nav:
@@ -1247,7 +1247,11 @@ def test_bundle_hands_control_to_explicit_card_and_requires_cancel_before_resume
         assert bundle.dispatch("loco_servo", {"action": "start"})["state"] == "running"
         setup.clock.advance()
         send(servo, command(setup))
-        bundle.dispatch("nav", {"action": "move_to"})
+        assert bundle.dispatch("nav", {"action": "move_to"})["state"] == "error"
+        assert not servo._paused and servo._backend.messages[-1] != [0] * 6
+        assert bundle._base_owner == ""
+        assert bundle.dispatch("loco_servo", {"action": "pause"})["state"] == "paused"
+        assert bundle.dispatch("nav", {"action": "move_to"})["state"] == "navigating"
         assert bundle.dispatch("loco_servo", {"action": "resume"})["state"] == "error"
         bundle.dispatch("nav", {"action": "cancel"})
         assert bundle.dispatch("loco_servo", {"action": "resume"})["state"] == "running"
@@ -1503,6 +1507,10 @@ def test_bundle_does_not_start_other_motion_when_sdk_stop_fails(setup, monkeypat
     setup.clock.advance()
     send(servo, command(setup))
     servo._backend.fail = True
+    # Release the navigation reservation by pausing, while deliberately failing
+    # its zero write. The following refusal must exercise the SDK stop guard.
+    assert bundle.dispatch("loco_servo", {"action": "pause"})["state"] == "error"
+    assert not servo.reserves_chassis()
     assert bundle.dispatch("home", {"action": "go_home"})["state"] == "error"
     assert calls == []
     assert bundle._base_owner == ""

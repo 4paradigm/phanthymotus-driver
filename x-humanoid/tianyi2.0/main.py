@@ -600,7 +600,8 @@ class TianyiDeviceBundle:
             self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))
             print("[bundle] LightPlugin loaded")
 
-        # The stream and call-shaped base cards must not write simultaneously.
+        # An active stream reserves the base against ordinary call-shaped
+        # motion. Explicit cancel/brake still goes through the stop handshake.
         # Keep this arbitration in the bundle; existing card implementations
         # and the shared navigation client remain unchanged.
         import threading as _threading
@@ -674,6 +675,10 @@ class TianyiDeviceBundle:
         if servo is not None and (tool_name == "loco_servo" or base_action):
             with self._base_command_lock:
                 if base_action:
+                    if action in motions.get(tool_name, set()) and servo.reserves_chassis():
+                        return {"state": "error", "owner": "loco_servo", "error":
+                                "loco_servo reserves the chassis for velocity navigation; "
+                                f"pause/stop loco_servo before {tool_name}.{action}"}
                     released = servo.pause_for_explicit_command(f"{tool_name}.{action}")
                     if released is False:
                         return {"state": "error", "error":

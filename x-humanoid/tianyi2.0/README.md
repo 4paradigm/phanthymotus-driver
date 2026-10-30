@@ -437,15 +437,31 @@ returns idle and releases nodes/worker only once the stop is confirmed (or the
 failed worker's firmware lease wait has elapsed); otherwise it reports an error
 and remains paused. Starting after stop creates a new worker with no replay.
 
-At the bundle dispatch boundary, explicit `nav`, `home` and `chassis_raw`
-motion/cancel actions pause this stream before executing. An unconfirmed SDK
-stop blocks the handover. Successful handover cancels the owned velocity action
-and disables its heartbeat before the new owner runs; the yielded stream emits
-no more motion, zero or heartbeat writes. Starting/resuming after call-shaped
-motion still requires explicit `nav.cancel`, `home.cancel` or
-`chassis_raw.brake`. Existing card implementations, `nav_client.py` and
-`loco_state` are unchanged. Controllers bypassing the bundle need separate
-coordination; the SDK firmware heartbeat is global, with only one active token.
+At the bundle dispatch boundary, a running `loco_servo` session reserves the
+chassis for its incoming velocity stream (normally ActuCore `navi`). Waiting
+for commands, dry-run and temporary watchdog holds retain this reservation.
+`info.chassis_reserved` reports this local reservation; it does not confirm SDK
+ownership. Ordinary `nav.move_to/move_by/rotate/rotate_to`, `home.go_home` and
+`chassis_raw.move/rotate` requests return an occupancy error without pausing the
+stream or writing zero velocity. Pause or stop `loco_servo` explicitly before
+switching to those cards. Driver `nav` is a separate REST navigation card from
+ActuCore `navi`, which publishes velocity for `loco_servo`.
+
+`nav.cancel`, `home.cancel` and `chassis_raw.brake` bypass the priority rejection
+and retain the existing stop handshake. An unconfirmed SDK stop still blocks
+handover. Successful handover cancels the owned velocity action and disables its
+heartbeat before the other card runs; the yielded stream emits no more motion,
+zero or heartbeat writes. Starting/resuming after call-shaped motion still
+requires explicit `nav.cancel`, `home.cancel` or `chassis_raw.brake`. Existing
+card implementations, `nav_client.py` and `loco_state` are unchanged. Controllers
+bypassing the bundle need separate coordination; the SDK firmware heartbeat is
+global, with only one active token.
+
+SDK ownership failures distinguish an empty held handle, an empty current action,
+and different action IDs. Error-path diagnostics include available handle IDs,
+statuses and reasons. These diagnostics do not relax ownership checks or add
+SDK reads to successful velocity updates. An empty current action alone does
+not establish that another controller took over; inspect the recorded details.
 
 ### First deployment checks
 

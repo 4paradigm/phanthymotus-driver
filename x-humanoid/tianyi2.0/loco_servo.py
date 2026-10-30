@@ -976,6 +976,12 @@ class LocoServoPlugin:
                                  self._running and not self._paused and not self._yielded)
         return {"ok": True, **self._info()}
 
+    def reserves_chassis(self):
+        """Local stream reservation; this does not assert SDK ownership."""
+        with self._lock:
+            return (self._running and not self._paused and not self._yielded
+                    and not self._closing)
+
     def pause_for_explicit_command(self, reason=""):
         with self._lock:
             if self._running:
@@ -999,6 +1005,7 @@ class LocoServoPlugin:
             "linear_acceleration": self._accel[0], "angular_acceleration": self._accel[1],
             "wz_limit": self._wz_limit, "yaw_latency_gain": self._yaw_gain,
             "yielded_to_explicit_command": self._yielded,
+            "chassis_reserved": self.reserves_chassis(),
             "control_interface": interface,
             "counts": dict(self._counts), "last": copy.deepcopy(self._last),
             "input_queue": self._inbox.info(),
