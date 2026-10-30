@@ -1,32 +1,76 @@
 mcp_port: 15745
-bind_host: 127.0.0.1
-ros_namespace: s10_pro
-name: S10 Pro
-register: true
-core_domain_id: 42
-reader:
-  domain_id: 0
-  vendor_profile: /opt/phanthy-motus/s10-reader-udp.xml
+ros_namespace: "s10_pro"
+name: "云深处山猫 S10"
+model_variant: "pro"
+navigation_task_timeout: 180
+ros:
+  robot_domain_id: 0
+  core_domain_id: null
+# service.yml targets the S10 onboard host: robot_server runs there and listens
+# on TCP 30003. NETWORK_INTERFACE/CIDR constrain robot-domain DDS; domain 42 is
+# published only by isolated loopback-profiled subprocesses.
 topics:
-  battery: /BATTERY_DATA
-  joints: /JOINTS_DATA_10HZ
-  imu: /IMU
-  lidar: /LIDAR/POINTS
-plugins:
-  battery:
-    enabled: true
-    refresh_hz: 1.0
-    stale_after_s: 5.0
-  joints:
-    enabled: true
-    refresh_hz: 10.0
-    stale_after_s: 5.0
+  imu: "/IMU"
+  joints: "/JOINTS_DATA_10HZ"
+  battery: "/BATTERY_DATA"
+  motion_info: "/MOTION_INFO"
+  # Raw sensor candidates. Probe in parallel, lock to the first live source,
+  # and fail over only after the active source has gone stale.
   lidar_cloud:
-    enabled: true
-    refresh_hz: 10.0
-    stale_after_s: 5.0
-    max_points: 40000
-  imu:
-    enabled: true
-    refresh_hz: 20.0
-    stale_after_s: 5.0
+    - "/local_scans"
+    - "/DEPTH_POINTS"
+  lidar_map: "/ACCUMULATED_POINTS_MAP"
+camera_topics:
+  camera_rear:
+    - "/camera/rear/image_raw"
+    - "/camera/rear/image_raw/compressed"
+    - "/camera/rear/color/image_raw"
+    - "/camera/rear/color/image_raw/compressed"
+    - "/camera_back/image_raw"
+    - "/camera_back/image_raw/compressed"
+    - "/camera_0/image_raw"
+    - "/camera_0/image_raw/compressed"
+    - "/usb_camera_1/image_raw"
+    - "/usb_camera_1/image_raw/compressed"
+    # S10 Pro firmware currently exposes the active depth imager here even
+    # when the four RGB camera nodes are not started.
+    - "/DEPTH_IMAGE"
+  camera_left:
+    - "/camera/left/image_raw"
+    - "/camera/left/image_raw/compressed"
+    - "/camera/left/color/image_raw"
+    - "/camera/left/color/image_raw/compressed"
+    - "/camera_left/image_raw"
+    - "/camera_left/image_raw/compressed"
+    - "/camera_1/image_raw"
+    - "/camera_1/image_raw/compressed"
+    - "/usb_camera_2/image_raw"
+    - "/usb_camera_2/image_raw/compressed"
+  camera_front:
+    - "/camera/front/image_raw"
+    - "/camera/front/image_raw/compressed"
+    - "/camera/front/color/image_raw"
+    - "/camera/front/color/image_raw/compressed"
+    - "/camera_front/image_raw"
+    - "/camera_front/image_raw/compressed"
+    - "/camera_2/image_raw"
+    - "/camera_2/image_raw/compressed"
+  camera_right:
+    - "/camera/right/image_raw"
+    - "/camera/right/image_raw/compressed"
+    - "/camera/right/color/image_raw"
+    - "/camera/right/color/image_raw/compressed"
+    - "/camera_right/image_raw"
+    - "/camera_right/image_raw/compressed"
+    - "/camera_3/image_raw"
+    - "/camera_3/image_raw/compressed"
+# JPEG encoding and point-cloud packing run in one bounded worker process per
+# stream; this keeps the robot ROS executor available for control/state topics.
+media_workers: true
+basic_server:
+  enabled: true
+  # On the onboard host, robot_server is reachable at this host address. For a
+  # separate driver host, override with the S10 host's reachable address.
+  host: "10.21.33.103"
+  tcp_port: 30003
+  timeout: 2.0

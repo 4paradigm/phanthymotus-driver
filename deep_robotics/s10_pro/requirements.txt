@@ -1,2 +1,2 @@
-# rclpy, drdds and PyYAML are supplied by the Jazzy image / apt packages.
-# No additional pip dependencies are required by this image.
+PyYAML==6.0.2
+Pillow==11.1.0

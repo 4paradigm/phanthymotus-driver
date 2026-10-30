@@ -6,12 +6,24 @@ hardware_model: s10-pro
 image_name: deep-robotics-s10-pro
 port: 15745
 mcp_url: http://localhost:15745/mcp
-description: Read-only S10 Pro Battery, Joints, LiDAR point-cloud and IMU monitoring
+description: S10 Pro TCP locomotion, lighting, charging, navigation, IMU, battery, joints, cameras and LiDAR streams
 build_context_extras:
   - ../../common
 cards:
-  - { name: battery,     type: sensor }
-  - { name: joints,      type: sensor }
   - { name: model,       type: resource }
-  - { name: lidar_cloud, type: sensor }
   - { name: imu,         type: sensor }
+  - { name: joints,      type: sensor }
+  - { name: joint_state, type: sensor }
+  - { name: loco_state,  type: sensor }
+  - { name: battery,     type: sensor }
+  - { name: lidar_cloud, type: sensor }
+  - { name: lidar_map,   type: sensor }
+  - { name: camera_rear,  type: sensor }
+  - { name: camera_left,  type: sensor }
+  - { name: camera_front, type: sensor }
+  - { name: camera_right, type: sensor }
+  - { name: loco,        type: actuator }
+  - { name: head_light,  type: actuator }
+  - { name: tail_light,  type: actuator }
+  - { name: charging,    type: actuator }
+  - { name: navigation,  type: actuator }

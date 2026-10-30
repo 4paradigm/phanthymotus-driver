@@ -342,10 +342,11 @@ class S10Nodes:
             source = self._camera_lane_sources.get(key)
             if source is not None and source != topic:
                 # The S10 node exposes raw and compressed aliases for the same
-                # USB camera. Prefer compressed once it produces a frame and
-                # remove the redundant raw subscription so it cannot consume
-                # executor time or feed a stale competing stream.
-                if not (topic.endswith("/compressed") and not source.endswith("/compressed")):
+                # USB camera. Prefer the raw Image topic: it avoids the
+                # vendor's compressed-topic cache, which can contain old
+                # frames. A compressed alias may only be used as fallback
+                # when no raw source has produced a frame.
+                if not (not topic.endswith("/compressed") and source.endswith("/compressed")):
                     return
                 old_handle = self._media_subscription_handles.get(source)
                 if old_handle is not None:

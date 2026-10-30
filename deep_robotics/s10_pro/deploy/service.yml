@@ -2,18 +2,18 @@ deep-robotics-s10-pro:
   image: __IMAGE__
   container_name: embodied-deep-robotics-s10-pro
   network_mode: host
-  volumes:
-    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
-    - /opt/phanthy-motus/s10-reader-udp.xml:/opt/phanthy-motus/s10-reader-udp.xml:ro
-    - /opt/phanthy-motus/s10-pro/config.yaml:/work/deep_robotics/s10_pro/config.yaml:ro
-    - /opt/phanthy-motus/s10-pro/core-cert.pem:/run/s10/core-cert.pem:ro
   environment:
-    - S10_REQUIRE_VENDOR_PROFILE=1
-    - S10_REGISTRATION_PINNED_LEAF_FILE=/run/s10/core-cert.pem
-    - ROS_DOMAIN_ID=42
-    - ROS_NAMESPACE=s10_pro
-    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
-    - AGENT_CORE_URL=https://localhost:15678
     - PYTHONUNBUFFERED=1
+    - RCUTILS_COLORIZED_OUTPUT=0
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - ROS_LOCALHOST_ONLY=0
+    - NETWORK_INTERFACE=eth0
+    - ROBOT_NETWORK_CIDR=10.21.33.0/24
+    - AGENT_CORE_URL=https://localhost:15678
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
   restart: always
+  stop_grace_period: 30s

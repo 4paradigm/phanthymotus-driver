@@ -17,9 +17,8 @@ topics:
   # Raw sensor candidates. Probe in parallel, lock to the first live source,
   # and fail over only after the active source has gone stale.
   lidar_cloud:
-    - "/DEPTH_POINTS"
     - "/local_scans"
-    - "/LIDAR/POINTS"
+    - "/DEPTH_POINTS"
   lidar_map: "/ACCUMULATED_POINTS_MAP"
 camera_topics:
   camera_rear:
