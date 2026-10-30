@@ -276,11 +276,10 @@ class S10Nodes:
                         Image if "sensor_msgs/msg/Image" in types else None)
             if msg_type is None:
                 continue
-            try:
-                if self.robot.count_publishers(topic) == 0:
-                    continue
-            except (AttributeError, RuntimeError, TypeError):
-                pass
+            # Do not require a publisher at discovery time. The S10 camera
+            # process can register its topic before DDS endpoints become
+            # visible; creating the subscription now lets late publishers
+            # connect instead of leaving the card permanently without a lane.
             # Do not let unrelated depth imagery (for example /DEPTH_IMAGE)
             # claim a directional camera card before the four RGB sources.
             if topic not in self._configured_camera_lanes and self._camera_key_for_topic(topic) is None:
@@ -1613,7 +1612,8 @@ def build_plugins(config, namespace=None, ros2=None):
     nodes = S10Nodes(config, namespace or "", ros2) if ros2 is not None else None
     plugins = [S10ModelPlugin(), S10StatePlugin(native, nodes), S10MotionPlugin(native, nodes),
                S10SingleLightPlugin(native, "head"),
-               S10SingleLightPlugin(native, "tail"), S10ChargePlugin(native)]
+               S10SingleLightPlugin(native, "tail"), S10LightPlugin(native),
+               S10ChargePlugin(native)]
     if str(config.get("model_variant", "standard")).lower() == "pro":
         plugins.append(S10NavigationPlugin(native))
     return plugins
