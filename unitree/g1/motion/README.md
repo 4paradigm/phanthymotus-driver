@@ -1,0 +1,203 @@
+# G1 遥操与数值进程
+
+本说明包含 G1 双臂遥操的使用、运行依赖与实现。驱动全部能力和启动入口见 [G1 Driver 说明](../README.md)。
+
+网页生成可调用 Skill 使用 `g1_teaching` 卡，复用本文的原录制、回放与停止接口；不新建运动控制器。见[录制技能说明](../skill_workbench/README.md)。
+
+## 使用
+
+`teleop_control` 接收设备 Driver 的输入，在 G1 Driver 内完成相对映射、独立进程 IK 和双臂位置下发。默认注册该卡，市场清单包含 `teleop_control`。随镜像提供原厂 G1_23（每臂 5 关节、固定假手）的完整固定几何 profile；不依赖现场临时标定脚本或用户填写路径。Core 和 ActuCore 无需遥操专用修改。
+
+1. 安装 PICO Driver，在 Canvas 添加 `teleop_device` 和 `teleop_control`，连接命令输出与控制卡输入。
+2. 在设备卡齿轮页查看安装和配对说明，连接 PICO。
+3. 启动项目。确认机器人和操作者的双臂自然下垂，松开双握把，长按左 X + 右 A 一秒。保持按钮直到基准建立；模型首次准备可能需要数秒。Driver 只在这次明确确认后采集实际姿态建立映射，不在首帧自动标定。
+4. 松开按钮，再按下双握把接通。握把按下时的新目标必须通过 IK、输入时效和执行门禁。末端对齐误差仅供显示，不再作为接通条件。
+5. 松开任一握把暂停输出并继续预览。暂停期间保留具体 hold 原因，正常预览不会将其覆盖成 regrip_required；成功重新接通后清除该原因。再次接通需新一次双握；沿用原映射基准。输入中断或 IK 失败后不自动恢复；设备连接或跟踪空间改变后需再次确认双方下垂姿态并长按 X+A。
+6. 需要清除遥操状态时，松开双握把，长按左 Y + 右 B 一秒。每次按住只触发一次。Driver 停止接收旧目标，清除映射并停止录制，复用 Canvas 停止流程：两秒内降低 SDK 控制权重，完成五次零权重写入，并通过新鲜反馈确认交权。Reset 不主动移动到指定姿态，不读取 reset_pose.json，也不发送动作99。
+7. 交权确认后显示 `waiting_baseline_confirmation`。设备输入和 Driver 保持运行。确认机器人与操作者双臂自然下垂后，长按 X+A 建立新映射，松键并重新双握。不会自动重新接通。未持有控制权时直接清除遥操状态；反馈过期、写入失败或交权超时保留失败，不显示完成。
+8. 从 Canvas 停止项目会关闭遥操输入。独立调用 `arm.release` 也会取消遥操并关闭输入，之后需从 Canvas 重新启动项目。Driver 重启后需停止再启动项目恢复绑定，无需删线重连。
+
+Reset 使用与 Canvas 相同的 `holding → handback → confirming_handback → awaiting_feedback → completed` 交权流程。回执 `action_id=null`、`request_sent=false`；持有控制权时，只有确认交权才返回 `authority_released=true` 和执行器 `idle/release_confirmed`。没有控制权的空操作返回 `no_op=true`，不制造新的运动租约。独立 `arm.release` 的厂商动作行为保持原样。
+
+数值求解完成后，若发布前的实测位置或已下发位置已离开本次执行包围区间，协调器将该候选标为 `rejected/motion_envelope_stale_start` 并丢弃。它不安装新证明、不发布目标、不暂停执行器，也不延长上一条目标的有效期。持续握持时继续处理下一帧；连续拒绝仍由既有目标超时保护停止。实际执行越界、反馈失效和松握暂停的保护保持不变；不扩大区间或增加重试。
+
+求解期间执行器进入 hold，且尚未满足续接条件或候选早于续接时间时，仅丢弃该候选并记录 `rejected/waiting_fresh_input_after_hold`。保留执行器原停止原因和续接时间，不关闭遥操接通状态，不延长旧目标期限。持续双握下，后续新帧仍须通过既有续接、反馈及区间检查才能输出；人工暂停、停止和交权不因此自动恢复。
+
+G1 SDK的订阅使用独立读取线程和DDS WaitSet等待数据；消息读取、Python反序列化及业务回调不再占用共享DDS接收线程。现有queueLen和队列丢弃语义保持。关闭订阅时先唤醒并结束读取线程，再释放DataReader。LowState 与运动状态订阅使用 DDS `KeepLast(1)`，不进入SDK回调队列。反馈回调使用独立锁，不等待执行器锁。LowState 年龄同时依据设备 tick 的推进计算；延迟收到旧状态不会把它标记为新状态。首次样本仍以接收时间建立时钟基准，不能据此证明首次样本的绝对源时间。
+
+Bundle 通过 `LowStateSource` 为遥操和状态卡持有唯一的 `rt/lowstate` 订阅。SDK 只解码一次，缓存完整消息、设备 tick、源时间和接收时间；手臂读取这份快照，接管通道初始化也复用200 ms内的新鲜样本并保留关节使能和型号字段校验，状态卡通过现有 ROS 定时器按20 Hz发布IMU、每两份新样本按10 Hz发布关节和姿态。消费者不修改原消息，也不刷新源时间。关闭状态卡不影响手臂；停止手臂不关闭共享源。Bundle 完成各控制入口的停止后才关闭共享源，重启源时先清空旧快照。电池和主板订阅保持独立。真实手臂仍检查FSM新鲜度和允许模式，并保留外部控制观测；测试用 `snapshot=` 不能与共享源混用。
+
+预览仅因时间过期时保留同一映射内的旧骨架。`visualization.available` 表示有可绘制数据，`visualization.stale=true` 表示历史快照；此时 `feedback_fresh=false`、对齐状态为 `unavailable`，序号及原时间戳不变，反馈年龄继续增长。旧骨架不参与目标执行，也不延长命令有效期。输入断开或跟踪丢失、会话或映射变化、重新标定及明确停止仍清空预览；不可达结果不借用旧IK骨架。PICO 消费端必须区分“可绘制”和“实时可用”。
+
+`tests/validate_shared_lowstate.py` 使用独立进程发布合成1000 Hz DDS数据，检查单订阅、ROS输出频率、源年龄和关闭重建。仅在 `--network none --read-only` 且无设备映射的测试容器中运行，并设置 `G1_TELEOP_ISOLATED_TEST=1`；该检查不连接机器人，也不替代现场闪烁验收。
+
+独立 `arm.release` 的原厂99请求发出后没有可靠取消接口；不得声称停止遥操能撤销该请求。Y+B/Reset 不发送此请求。
+
+收到首条有效输入并取得设备卡片 `instance_id` 后，才开始发布 ROS 骨架反馈；此前可通过 MCP `info` 查询等待状态。骨架反馈发布目标频率为30 Hz。ROS 接收等待以最早发布时间为上限，发布延迟后只发送最新快照，不补发积压帧；机器人控制频率保持不变。 输入订阅保留可靠KeepLast(16)及单线程ROS实体归属；反馈前有界处理已排队输入，每轮最多32次spin检查，后续检查不阻塞，避免每次反馈只推进一帧。慢反馈仍会占用该线程，本机制不保证任意负载下的实时性。接收端完整校验并持有输入副本，后续读取只重查时效和跟踪状态。批收期间已观察到的松握、跟踪丢失或超过300ms的输入中断会锁存暂停；按键释放会重置长按计时。暂停后仍需新的松握和双握，单纯序号跳号不触发暂停。
+
+PICO 继续使用既有 `left/right.controls.buttons` 的 `available`、`pressed`，不新增 topic。确认键是 `left.x + right.a`，Reset 键是 `left.y + right.b`；已有遥操、暂停、Reset 处理中或错误状态均接收这两组按键；X+A 重建基准，新的 Y+B 按键可重试交权。X+A 会先完成旧通道交权；已经进行的 DDS 写入需结束，不声称撤销已发送请求。同时按两组键不执行。输入超过 300 ms、按键松开或握把按下会中断一秒计时。
+
+| 顶层 state | 顶层 reason | PICO 提示含义 |
+|---|---|---|
+| `ready` | `waiting_baseline_confirmation` | 双方双臂下垂，松握，长按 X+A 确认 |
+| `ready` | `release_buttons_then_regrip` | 松开按钮，再次双握接通 |
+| `ready` | `regrip_required` | 松握后再次双握；对齐数值仅供参考 |
+| `hold` | `resetting` | 正在停止发布目标并交还控制权；不执行原厂复位，不接通遥操 |
+| `active` | `null` | 遥操已接通 |
+| `hold` / `fault` | 具体错误码 | 显示失败原因；不报告交权完成 |
+
+`alignment.state/ready` 继续表达真实的几何诊断；PICO 不得用它替代顶层执行状态或修改成恒为 true。
+用户不需要填写实例 ID、模型路径、位移比例或 Shadow/Live。这些由框架和 Driver 预设管理；启动项目本身不发送运动目标。支持 FSM 500、801，不自动切换本体模式。
+
+适用范围仅为原厂 G1_23 固定假手，不自动适配 G1_29、灵巧手或改装 TCP。不提供附加碰撞与工作区扫描；Driver 不自动停止其他控制程序。`servo`、`servo_eef` 可同时注册，但本实现不提供统一控制器仲裁。
+
+## 实现
+
+`MotionControl` 在 Driver 主进程只处理校验、最新目标和生命周期。`NumericalWorker` 在独立 CPU Python 进程加载 G1_23 模型、FK/IK 和显示；ROS、控制权、持续执行、保持和停止留在 arm。两个进程之间只有一个在途请求，协调器只保留最新待处理输入。没有GPU依赖或额外遥操构建开关。
+
+### 模块与依赖
+
+| 模块 | 职责 |
+|---|---|
+| `../teleop_control.py`、`../teleop_bus.py` | 设备输入、相对映射、会话与 ROS 订阅 |
+| `../motion_control.py` | 内部数值协调与最新目标；不再注册独立运动卡 |
+| `worker.py`、`../../../common/motion/worker.py` | G1 求解器入口与独立进程 IPC |
+| `kinematics.py`、`ik.py` | 固定关节、FK 与 CasADi IK |
+| `profile.py`、`body23_fixed_hand.json` | 机型几何及每轮实测基准 |
+| `visualization.py` | 实测、IK 骨架和对齐诊断数据 |
+| `../arm_stream.py` | 控制权、位置下发、保持与停止 |
+
+主进程和数值子进程共用系统 `/usr/bin/python3` 及依赖，各自创建模型和 Data。数值依赖由 [镜像配方](../Dockerfile) 固定：NumPy 2.2.6、Pinocchio 4.1.0、CasADi 3.8.1、SciPy 1.15.3。构建步骤见 [G1 构建说明](../README.md#构建)。
+
+镜像仅保留 IK/FK 所需的 URDF，不下载或打包附加碰撞网格。测试专用的未标定数据位于 `../tests/fixtures/calibration.json`，不随业务镜像安装。
+
+### 输入与状态
+
+| 方向 | Topic | 格式 |
+|---|---|---|
+| 设备 → 控制卡 | `/teleop/command` | `data/teleop-cmd`，JSON schema `motus.teleop.command/1` |
+| 控制卡 → Canvas 监控与 PICO Driver | `/teleop/state` | `data/teleop-state` |
+
+输入来源由 Canvas 连线决定。控制卡直接订阅传入的 `input_topic`，不限定 topic 路径、不按首帧绑定来源实例，也不额外认证消息中的实例或设备 ID。格式、时效、序号和代次检查仍保留；设备或跟踪空间变化后，需要松握并长按 X+A 明确确认后重建坐标基准。
+
+设备输入为左右控制器位姿、握把、跟踪状态、身份、代次、序号与时效。PICO Driver 订阅同机 `/teleop/state`，把 `motus.teleop.feedback/1` 转发到头显。G1 提供 `visualization`（实测、IK、躯干线框）和 `alignment`（左右末端位置/朝向误差、阈值、状态、`ready`）。两端使用新版协议，不新增 topic 或协商。URDF、关节顺序、数值求解、对齐判定与执行均在 G1 Driver 内。
+
+对齐比较实测末端和可执行 IK 末端，`error_reference=ik`。求解失败时状态为 `unreachable`，误差参考请求目标（`error_reference=requested_target`），不能使能；求解残差另列 `target_residual`。实测反馈超过 200 ms、输入/目标超过 300 ms 或代次改变时，撤销就绪与旧目标。3 cm / 15° 仅为诊断显示阈值，不用于使能。
+
+### 机型 profile 与每轮基准
+
+`motion/body23_fixed_hand.json` 固定关节映射、URDF SHA、双掌 TCP（腕轴前方 0.2 m）和手柄局部变换。该文件不包含某次现场腰腿角度，也不填写 acceptance 通过标记。每次初始化映射时，从同一份新鲜 LowState 采集双臂和 13 个腰腿关节，为数值工作进程生成本轮临时 profile；工作进程重启沿用同一份基准，新的遥操会话重新采样。缺失、过期或非有限实测值会明确报告，不用零值猜测机器人姿态。松握重握不重新标定。
+
+适用范围是原厂 G1_23 固定假手；不宣称自动适配 G1_29、灵巧手或改装 TCP。本实现不检查几何碰撞，不能将关节限位或预览线框当作碰撞验收结果。
+
+卡片注册、info、默认启用及空闲 stop 不申请运动权、不创建 SDK 命令通道。`servo`、`servo_eef` 可以同时注册；本实现不新增统一控制器仲裁，也不在装载时因其他卡片 enabled 而拒绝遥操。旧会话/过期指令隔离与本遥操的停止取消仍保留。
+
+### 执行与平滑
+
+每个有效目标仅下发一次。以后端最后成功下发的位置为起点，做 120 ms 一阶指数平滑，再将各关节增量裁剪到 ±1 rad/s × dt；dt 最大 50 ms，断帧或重握不积累追赶额度。仅处理最新目标，不排队补发历史动作。这限制的是位置参考的变化率，不是实测电机速度的硬保证。
+
+遥操肩肘增益为 kp=80/kd=3，腕部为 40/1.5；普通 servo 增益不变，不增加重力补偿。IK 失败丢弃失败结果及其滤波历史，并要求松握和重新双握后续接。松握后的执行器恢复不新增静止阈值；`continuation_ready` 表示可以继续接收目标，与物理保持确认 `hold_confirmed` 区分。
+
+输入有效性、反馈时效与 URDF 关节限位仍校验；不提供附加软件碰撞/工作区扫描，不能据此认为任意姿态均无碰撞。原始电机遥测保留，厂商保护不修改。Driver 不自动停止其他控制程序。
+
+### 状态与恢复
+
+Canvas 监控的 `input_status` 区分 `waiting_binding`、`stopped`、`waiting_input`、`input_stale`、`transport_error` 和 `fresh`。`transport` 提供接收/接受序号、拒绝原因、订阅代次和执行器心跳；MCP 在线不等于 DDS 接收正常。
+
+尚未建立基准时，启动无帧、输入过期或跟踪丢失会暂时进入 hold；新鲜且跟踪有效的输入恢复后，显示 `waiting_baseline_confirmation`，仍需 X+A 明确确认。SDK/交权失败及 `reset_interrupted` 保持原错误；后续输入中断和恢复不能清除这些错误。
+
+订阅创建、读取和销毁由同一专用 ROS 线程执行；设备身份补全不重建同 topic 订阅。IK 子进程故障分别报告 `ik_worker_timeout`、`ik_worker_exited` 或 `ik_worker_unavailable`，原始异常保留在日志中。
+
+空闲且从未接管 SDK 时，重复停止返回 no-op；不创建释放任务，也不声称已验证物理停止。未知的厂商动作结果仍报告未知，不通过重复 stop 清除。Driver 不持久化或自动恢复运动租约。
+
+“以后端最后成功下发的位置续接”的设计参考 **@jsmy-CTH** 的 [PR #322](https://github.com/4paradigm/phanthymotus-driver/pull/322)。120 ms 平滑、1 rad/s 限幅及 50 ms 时间上限为本次 G1 适配参数。其他来源见 [来源与迁移边界](#来源与迁移边界)。
+
+遥操执行循环（周期约 4 ms）在同一有效关节目标的有效期内，从最后一次成功的 SDK 输出继续向目标推进。每个 tick 使用原有 120 ms 指数平滑、1 rad/s 限幅及 50 ms 时间差上限，并重新检查反馈、关节限位和运动包围区间。新目标替换旧目标后，从最后一次输出续接。目标过期、暂停、故障或交权时停止推进，不延长原有效期（最多 300 ms）。指数平滑渐近接近目标，单包到期前不保证到达任意距离；执行循环不提供 250 Hz 硬实时保证。`applied_sequence` 表示最近一次成功输出所对应的命令序号，同一序号可对应多次插值输出。
+
+## 轨迹接口（供示教适配器调用）
+
+录制、文件校验和回放属于 `teleop_control`；页面、试运行流程和 Skill 由 `g1_teaching` 卡负责（见[录制技能说明](../skill_workbench/README.md)）。接口由现有 loopback MCP 提供，参数均放在 `arguments` 中。
+
+| action | 参数 | 结果 |
+|---|---|---|
+| `info` | 无 | `input_fresh`、`mapped`、`can_record`、`recording`、`replay_active`、`last_action` |
+| `record_start` | 无 | 新鲜、已映射的 live 遥操中开始录制；返回文件和服务端开始时间 |
+| `record_stop` | 无 | 停止录制并等待最多 2 秒落盘；`complete`、`stopping`、`error` 分别说明结果 |
+| `recordings` | 无 | 文件名、大小、完整文件/临时文件；列表不代替 `inspect` 校验 |
+| `inspect` | `filename` | 校验后的 `filename/sha256/binding/joint_names/duration_seconds/frames/preview` |
+| `start_difference` | `filename` | `ready/target_q/current_q/joint_delta_rad` |
+| `play` | `filename` | 自动检查后开始回放，返回异步 `action_id` |
+| `action_status` | `action_id` | 最近一次回放的 `running/completed/cancelled/error` 和结果 |
+| `stop` | 无 | 立即请求取消遥操/回放，再等待原执行器交权；失败不报告停止成功 |
+
+`record_stop` **不停止遥操**。适配器须先确认 `complete=true`，再调用 `stop`，分别检查文件结果与交权结果。仍在落盘时用 `info.recording` 轮询。指令超时、输入断流、IK 或 SDK 执行故障仅暂停轨迹采样，不终止录制。暂停帧保留最后一次成功下发的目标及当时的反馈时间；重复故障不重复写暂停帧。同一映射下恢复成功下发后，继续写入同一文件，保留暂停时长。运动控制的停止和恢复判据保持不变。显式停止遥操、Reset 或交还控制权会正常结束并保存已有录制；之后调用 record_stop 返回同一文件结果。Reset 先结束采样，再交还控制权；不执行原厂复位。映射改变仍结束当前录制。队列溢出、写盘失败、格式或限位校验失败仍使文件无效，不把临时文件列为可回放资产。
+
+录制仅保存 SDK 成功接受的最终关节参考，已包含遥操平滑与限速。录制与载入不按文件帧间隔重复判定速度，避免时间戳抖动或暂停帧使有效输出被误拒绝。同时保存实测位置/速度、反馈单调时间、源输入序号、SDK 序号、映射代次及执行会话 ID。格式为 `motus.g1.trajectory/1` JSONL，10 维关节顺序在头部列出，角度 rad、速度 rad/s、时间 ns，无夹爪字段。后台队列最多 256 帧；单文件最多 64 MiB、120000 帧、10 分钟。溢出或写盘失败不会阻塞运动线程，但该录制无效。
+
+每次成功写入 SDK 的插值目标都会录制，因此同一 `sdk_sequence` 可有多条记录，读取校验允许重复序号。录制不降采样，也不放宽原资源上限。按 250 Hz 计算，120000 帧约对应 480 秒，字节上限可能更早触发。资源限制或写盘失败会使录制无效，并保留 partial 文件，不能承诺持续录满 10 分钟。回放仍按原时间轴发送已录制目标，不重复滤波或插值。
+
+文件位于 `teleop_control.data_dir/recordings`，默认 `/opt/phanthy-motus/data/g1/recordings`。部署模板挂载持久化数据目录，不再需要机器身份文件或 `trajectory_device_id` 配置。
+
+同型号且模型哈希、固定几何和关节顺序一致的机器可以共用录制文件。新文件不保存机器身份；旧文件中的 `binding.device_id` 被忽略，无需改写原文件或摘要。载入时仍核对模型、固定几何和关节顺序；腰腿基准仅保留为录制元数据，不作为回放门槛。模型或几何配置不同的设备不能直接复用文件。未完成文件、符号链接、越界文件名、摘要错误、非法时间或超限关节均拒绝。`sha256` 是完整文件摘要。
+
+### 适配调用示例
+
+在 Canvas 已启动遥操且 `info.can_record=true` 时：
+
+```json
+{"name":"teleop_control","arguments":{"action":"record_start"}}
+{"name":"teleop_control","arguments":{"action":"record_stop"}}
+{"name":"teleop_control","arguments":{"action":"stop"}}
+{"name":"teleop_control","arguments":{"action":"inspect","filename":"g1-<id>.jsonl"}}
+{"name":"teleop_control","arguments":{"action":"start_difference","filename":"g1-<id>.jsonl"}}
+```
+
+用户先恢复现场物体并确认运动空间无障碍。起点位置差值仅供显示，不设置位置容差门禁；`start_difference.ready` 只表示当前实测速度不超过0.02 rad/s，该显示值不作为位置模式接管门槛。确认执行后，Driver 先以每关节不超过0.1 rad/s的参考变化速度移动到录制首帧，再开始原录制时间轴；任意非零差值均通过限速过渡发送首帧，不直接跳到目标。过渡使用原执行器的位置发送与停止逻辑，不重新运行数值计算。首帧目标下发完成后直接进入原时间轴，不另等实测位置进入容差或自动确认物理到位。`inspect.preview` 最多 181 点，包含 `t/kind/target_q/feedback_q`，单位保持 rad。下游负责转换显示单位，不套用 PiPER 的 12 关节或夹爪字段。
+
+```json
+{"name":"teleop_control","arguments":{"action":"play","filename":"g1-<id>.jsonl"}}
+{"name":"teleop_control","arguments":{"action":"action_status","action_id":"<执行返回值>"}}
+```
+
+`play` 只需文件名，调用即表示执行回放，不再填写布尔确认项或复制限时预检 ID。Driver 每次执行均重新读取并校验文件、设备、模型、关节顺序和控制权；不重复检查录制时的腿部和腰部基准。未开始遥操或仅等待基准确认时，Driver 自动关闭输入等待后回放；已有操作员会话或控制租约时仍拒绝抢占。查看文件用 `inspect`，查看起点差异用 `start_difference`，两者不触发运动。旧调用若明确传入 `execute=false`，返回 `use_inspect_before_replay`，不会意外执行动作。成功启动返回 `status=running` 和 `action_id`；`action_status` 的 `phase` 先为 `moving_to_start`，首帧目标下发完成后为 `replaying`。仅最后一项结果保留在 `info.last_action`，Driver 重启后不恢复动作。失败返回 `state=error/code/error`。
+
+回放与遥操互斥。回放按原时间发送已经录制的关节参考，不重新运行 IK、数值包围区间或几何碰撞计算，也不再施加 120 ms 低通滤波。回放前停止数值协调进程，直接使用执行器的关节位置入口；控制权、反馈、关节限位、写入失败处置、保持和停止逻辑继续共用。已录制目标不再重复滤波或限速。发生调度抖动时，只取最新到期目标，不补发积压目标；暂停事件仍保留。发送值直接使用文件中的关节参考，时间轴不延长。暂停事件停止输出，恢复事件沿原时间继续。回放看门狗和每条回放指令的有效期均为 200 ms；关节反馈、运控状态与基准/对齐反馈的最大年龄也为 200 ms。看门狗或指令到期、反馈超过有效期时停止。该设置容忍短时调度波动，但不会补发积压目标，也不能保证超过 200 ms 的停顿仍可继续回放。回放不需要 PICO 持续跟踪，也不会消费手柄指令。
+
+原时间轴结束后，完成原执行器停止交权才报告 `completed`；不增加末帧位置误差或速度阈值，不延长时间轴补发收敛目标。此状态表示指令发送与交权完成，不表示现场动作形态已获人工验收。取消为 `cancelled`；停止未确认仍为 `error`。ACP 事件 `tool=teleop_control` 与查询接口使用相同 `action_id`，只发一次终态通知。原有 action 99 未确认等控制故障不会由回放清除。
+
+## 验证
+
+### 离线验证
+
+在仓库根目录、具备 G1 运行依赖和 pytest 的环境中执行：
+
+```sh
+python3 -m pytest -q -rs tests/test_teleop_contract.py tests/test_g1_servo_eef.py unitree/g1/tests
+```
+
+`test_motion_control_numeric.py` 使用真实 URDF、IK/FK 和数值子进程；缺少数值依赖时会跳过，不能把跳过记作通过。协议、执行器与线程用例使用硬件替身；线程用例还使用合成求解器测试超时、重启和旧代次隔离。这些测试不验证机器人动作或物理停止。
+
+### ROS 生命周期验证
+
+[手动验证脚本](../tests/validate_ros_lifecycle.py) 使用真实 ROS 节点和接收线程，检查订阅切换、线程归属、InvalidHandle 恢复及错误状态。控制对象使用替身，不导入硬件 SDK，不验证机器人动作。脚本不由默认 pytest 收集。
+
+在 Linux ARM64 测试机的仓库根目录执行。将 `G1_TEST_IMAGE` 设置为已有的 G1 Driver 镜像；容器使用隔离网络、只读文件系统和只读源码，不挂载设备：
+
+```sh
+docker run --rm --network none --read-only --tmpfs /tmp \
+  -v "$PWD:/src:ro" -w /src \
+  -e G1_TELEOP_ISOLATED_TEST=1 -e PYTHONDONTWRITEBYTECODE=1 \
+  -e PYTHONPATH=/src -e ROS_LOG_DIR=/tmp/ros-log \
+  --entrypoint /bin/bash "$G1_TEST_IMAGE" -lc \
+  'source /opt/ros/humble/setup.bash && python3 unitree/g1/tests/validate_ros_lifecycle.py'
+```
+
+成功时输出 `ROS ISOLATED PASS`。环境变量仅确认操作者已选择隔离环境，不会自动检查容器网络或设备挂载。真实模型验证仍使用 `test_motion_control_numeric.py`。
+
+## 来源与迁移边界
+
+数值实现从主仓 `30280160` 后的四卡契约工作树所含既有 G1 实现按模块选择性迁移，来源文件及 SHA256 见 `source-manifest.json`。原始算法和 G1 模型来自 Driver PR #152（`0adb64cb63e358244f4e02c0a7823523824f17a8`），Unitree `xr_teleoperate` revision `845b25a32f7febedf220e830952a7134897adb9d`，Copyright 2025 HangZhou YuShu TECHNOLOGY CO.,LTD，Apache-2.0。完整许可证沿用仓库 LICENSE。
+
+保留 G1_23 模型、锁定关节、手掌变换、PR152 五自由度加权目标及关节限位；已删除未启用的附加碰撞检查、专用资产和下载步骤。数值进程输出完整位置参考，执行与保持由 arm 处理。未迁移 PICO SDK、采集、相对映射、硬件发布或控制权逻辑。源码迁移不等于冻结基线复现或北京真机通过。
+
+依赖要求带 CasADi 支持的 Pinocchio 4.1.0、CasADi 3.8.1、NumPy 2.2.6 和 SciPy 1.15.3。Dockerfile 使用系统 Python 安装带 CasADi 绑定的预编译 Pinocchio wheel；普通 PyPI pin wheel 不提供该绑定，不能据其安装成功声称数值通过。目标 Linux ARM64 构建与真实求解需分别验证。

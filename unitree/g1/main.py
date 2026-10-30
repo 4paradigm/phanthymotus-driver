@@ -87,6 +87,10 @@ class G1DeviceBundle:
         self._plugins: list = []
         self._smart_motion = smart_motion
         plugins_cfg = cfg.get("plugins", {})
+        self._low_state = None
+        if plugins_cfg.get('state', {}).get('enabled', False) or cfg.get('teleop_control', {}).get('enabled', False):
+            from low_state import LowStateSource
+            self._low_state = LowStateSource()
         camera_plugin = None
 
         if plugins_cfg.get("mic", {}).get("enabled", False):
@@ -119,13 +123,10 @@ class G1DeviceBundle:
             from device import LocoStatePlugin, LocoPlugin, StatePlugin
             loco_state = LocoStatePlugin(plugins_cfg["loco"], namespace, executor)
             self._plugins.append(loco_state)
-            # StatePlugin owns the rt/lowstate subscription that posture is derived
-            # from. LocoPlugin needs it to tell lying from squatting once the robot
-            # is limp (FSM 0/1), so build it first when it is enabled and reuse the
-            # same instance rather than opening a second high-rate subscription.
+            # LocoPlugin reuses StatePlugin's posture computed from the shared source.
             posture_source = None
             if plugins_cfg.get("state", {}).get("enabled", False):
-                state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor)
+                state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor, low_state=self._low_state)
                 self._plugins.append(state_plugin)
                 posture_source = state_plugin.node
                 print("[bundle] StatePlugin loaded (posture source for LocoPlugin)")
@@ -181,6 +182,34 @@ class G1DeviceBundle:
             self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client))
             print("[bundle] ArmActionPlugin loaded")
 
+        self._motion_bus = None
+        if cfg.get('motion_control', {}).get('enabled', False):
+            raise ValueError('motion_control is removed; use teleop_control')
+        control_cfg = cfg.get('teleop_control', {})
+        if control_cfg.get('enabled', False):
+            from arm_stream import ArmStreamExecutor
+            from motion_control import MotionControl
+            from teleop_control import TeleopControl
+            from teleop_bus import TeleopBus
+            from device import _loco_acp_notify
+            arm = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'arm'), None)
+            if arm is None:
+                raise ValueError('teleop_control requires arm plugin')
+            effective = dict(control_cfg)
+            effective['servo_position'] = True
+            stream = ArmStreamExecutor(effective, namespace, arm_client, low_state=self._low_state)
+            motion = MotionControl(dict(effective), stream)
+            stream.motion_control = motion
+            arm._stream = stream
+            control = TeleopControl(dict(control_cfg), motion,
+                notify=lambda ident, status, result: _loco_acp_notify(ident, status, result, tool='teleop_control'))
+            arm._teleop_control = control
+            stream.public_motion_topics = False
+            self._motion_bus = TeleopBus(executor, control)
+            self._plugins.append(control)
+            from teaching import teaching_plugin
+            self._plugins.append(teaching_plugin(control))
+
         # servo 默认**关闭**，和 arm 不同。arm 放的是厂商预设手势，经过内置控制器；
         # servo 直接往 rt/arm_sdk 写关节指令，是这个驱动第一次驱动电机本身。
         # 一个默认开启的执行器卡片，等于容器一重启就可以被 start —— 开关留给人。
@@ -207,7 +236,7 @@ class G1DeviceBundle:
             # posture source — a second instance would duplicate the rt/lowstate
             # subscription and clash on the ROS node name.
             if not any(isinstance(p, StatePlugin) for p in self._plugins):
-                self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor))
+                self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor, low_state=self._low_state))
                 print("[bundle] StatePlugin loaded")
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
@@ -279,6 +308,8 @@ class G1DeviceBundle:
             print(f"[bundle] SmartMotionPlugin loaded (speaker={'yes' if speaker_plugin else 'no'}, loco={'yes' if loco_plugin else 'no'})")
 
     def start_all(self) -> None:
+        if self._low_state is not None:
+            self._low_state.start()
         for i, p in enumerate(self._plugins):
             try:
                 p.start()
@@ -299,6 +330,9 @@ class G1DeviceBundle:
         remaining_plugins = [p for p in other_plugins if p not in point_plugins]
         for p in capture_plugins + point_plugins + remaining_plugins:
             p.stop()
+        # Keep feedback alive until every control owner has completed its stop.
+        if self._low_state is not None:
+            self._low_state.stop()
         print("[bundle] All plugins stopped")
 
     def get_all_tools(self) -> list:
@@ -433,6 +467,11 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
+                    if name in ('motion_control', 'teleop_control', 'g1_teaching'):
+                        import ipaddress
+                        if self.headers.get('Origin') or not ipaddress.ip_address(self.client_address[0]).is_loopback:
+                            err(-32600, 'teleop control requires loopback')
+                            return
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
@@ -542,9 +581,15 @@ def main():
     _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, smart_motion=smart_motion, network_iface=network_iface)
     _bundle.start_all()
 
+    from ros_spin import SpinHealth, supervised_spin
+    from rclpy.impl.implementation_singleton import rclpy_implementation
+    InvalidHandle = rclpy_implementation.InvalidHandle
+    from rclpy.executors import ExternalShutdownException, ShutdownException
+    executor._driver_spin_health = SpinHealth()
+
     def _spin():
-        while rclpy.ok():
-            executor.spin_once(timeout_sec=0.1)
+        supervised_spin(executor, rclpy.ok, executor._driver_spin_health,
+                        InvalidHandle, (ExternalShutdownException, ShutdownException))
 
     spin_thread = threading.Thread(target=_spin, daemon=True, name="bundle_spin")
     spin_thread.start()
@@ -565,21 +610,26 @@ def main():
         server.serve_forever()
     finally:
         # Keep the safety peer alive while cards cancel and release sequences.
-        # Perform cleanup once, including after a signal-triggered server exit.
         try:
             _bundle.stop_all()
         finally:
             try:
-                if smart_motion:
-                    smart_motion.shutdown()
+                # Join the teleop owner before shutting down its ROS context.
+                bus = _bundle._motion_bus
+                if bus is not None and getattr(bus, 'shared_executor', None) is executor:
+                    bus.close()
             finally:
                 try:
-                    loco_client.stop()
+                    if smart_motion:
+                        smart_motion.shutdown()
                 finally:
                     try:
-                        executor.shutdown()
+                        loco_client.stop()
                     finally:
-                        rclpy.shutdown()
+                        try:
+                            executor.shutdown()
+                        finally:
+                            rclpy.shutdown()
 
 
 if __name__ == "__main__":

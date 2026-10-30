@@ -330,7 +330,7 @@ class RobotReader:
             raise MoveError('厂家当前不是有效的上层开发模式，未发送头部转动指令',False,'vendor_not_ready')
         return {'vr_head_follow':False,'source':'fresh_vendor_get_robot_info'}
 
-    async def send_moveh(self, q, move_time):
+    async def send_moveh(self, q, move_time, *, guard=None):
         """Only a two-axis MoveH; one send and exact identity/GUID/title ACK."""
         q, move_time = validate_moveh(q, move_time)
         if not self.connected or self.ws is None or self.ws.closed or not self.serial:
@@ -347,6 +347,8 @@ class RobotReader:
         status = self.sample('robot_status')
         if not status['available'] or not motion_readiness(status['data'])['ready'] or self.head_pending or self.move_pending:
             raise MoveError('核对头部模式期间运动状态改变，未发送转动指令',False)
+        if guard is not None:
+            guard()  # Recheck follow ownership, deadline and feedback AFTER the awaited mode probe.
         guid = str(uuid.uuid4()); future = asyncio.get_running_loop().create_future()
         self.head_pending = (guid, future)
         sent = False
