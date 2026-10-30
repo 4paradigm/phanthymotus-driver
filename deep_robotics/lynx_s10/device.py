@@ -1402,9 +1402,10 @@ class S10LightPlugin:
         "gradient_flow": ([], "彩色渐变流水；由灯控固件自动选择渐变颜色"),
         "breathe": (["head_color", "tail_color", "head_cycle_seconds", "tail_cycle_seconds"], "头尾灯呼吸；头尾周期分别设置，单位为秒"),
         "blink": (["head_color", "tail_color", "head_cycle_seconds", "tail_cycle_seconds"], "头尾灯闪烁；头尾周期分别设置，单位为秒"),
-        "custom": (["head_effect", "tail_effect", "head_color", "tail_color",
-                     "head_cycle_seconds", "tail_cycle_seconds"],
-                    "头灯和尾灯分别选择效果；仅呼吸/闪烁使用对应周期"),
+        "head_constant_tail_blink": (["head_color", "tail_color", "tail_cycle_seconds"], "头灯常亮、尾灯闪烁"),
+        "head_blink_tail_constant": (["head_color", "tail_color", "head_cycle_seconds"], "头灯闪烁、尾灯常亮"),
+        "head_constant_tail_breathe": (["head_color", "tail_color", "tail_cycle_seconds"], "头灯常亮、尾灯呼吸"),
+        "head_breathe_tail_constant": (["head_color", "tail_color", "head_cycle_seconds"], "头灯呼吸、尾灯常亮"),
     }
 
     def __init__(self, native): self.native = native
@@ -1416,10 +1417,6 @@ class S10LightPlugin:
                                     "description": "头灯呼吸或闪烁周期（秒）"},
             "tail_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
                                     "description": "尾灯呼吸或闪烁周期（秒）"},
-            "head_effect": {"type": "string", "enum": list(LIGHT_ACTION_EFFECTS),
-                            "default": "constant", "description": "头灯效果"},
-            "tail_effect": {"type": "string", "enum": list(LIGHT_ACTION_EFFECTS),
-                            "default": "constant", "description": "尾灯效果"},
         }))
         return result
     def start(self): pass
@@ -1429,9 +1426,13 @@ class S10LightPlugin:
         if action == "stop": return {"state": "idle"}
         if action == "info": return {"state": "ready"}
         if action in self.ACTIONS:
-            effects = ({"head": args.get("head_effect", "constant"),
-                        "tail": args.get("tail_effect", "constant")}
-                       if action == "custom" else {"head": action, "tail": action})
+            mixed_effects = {
+                "head_constant_tail_blink": {"head": "constant", "tail": "blink"},
+                "head_blink_tail_constant": {"head": "blink", "tail": "constant"},
+                "head_constant_tail_breathe": {"head": "constant", "tail": "breathe"},
+                "head_breathe_tail_constant": {"head": "breathe", "tail": "constant"},
+            }
+            effects = mixed_effects.get(action, {"head": action, "tail": action})
             for side, effect in effects.items():
                 if effect not in LIGHT_ACTION_EFFECTS:
                     return {"ok": False, "code": "INVALID_ARGUMENT",
