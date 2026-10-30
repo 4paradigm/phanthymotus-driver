@@ -36,13 +36,13 @@ class MediaWorkers:
         jobs = self._ctx.Queue(maxsize=1)
         results = self._ctx.Queue(maxsize=1)
         process = self._ctx.Process(target=_worker, args=(jobs, results, kind, lane),
-                                    name=f"lynx-s10-media-{lane}", daemon=True)
+                                    name=f"s10-pro-media-{lane}", daemon=True)
         process.start()
         self._jobs[lane] = jobs
         self._results[lane] = results
         self._processes[lane] = process
         collector = threading.Thread(target=self._collect_lane, args=(lane, results),
-                                     name=f"lynx-s10-media-results-{lane}", daemon=True)
+                                     name=f"s10-pro-media-results-{lane}", daemon=True)
         self._collector_threads[lane] = collector
         collector.start()
 

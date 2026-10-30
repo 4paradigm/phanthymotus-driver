@@ -45,7 +45,7 @@ class CoreBridge:
             process = self._ctx.Process(
                 target=_run_publisher,
                 args=(messages, self._profile, self._domain, lane),
-                name=f"lynx-s10-domain42-{lane}", daemon=True,
+                name=f"s10-pro-domain42-{lane}", daemon=True,
             )
             process.start()
             self._queues[lane] = messages
@@ -91,7 +91,7 @@ class CoreBridge:
             process = self._ctx.Process(
                 target=_run_publisher,
                 args=(messages, self._profile, self._domain, lane),
-                name=f"lynx-s10-domain42-{lane}", daemon=True,
+                name=f"s10-pro-domain42-{lane}", daemon=True,
             )
             process.start()
             self._queues[lane] = messages
@@ -159,7 +159,7 @@ def _run_publisher(messages, profile, domain, lane):
              "std_msgs/msg/UInt8MultiArray": UInt8MultiArray,
              "sensor_msgs/msg/CompressedImage": CompressedImage}
     rclpy.init(domain_id=domain)
-    node = Node(f"lynx_s10_core_{lane}")
+    node = Node(f"s10_pro_core_{lane}")
     qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
     publishers = {}
     counts = {}

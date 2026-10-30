@@ -1,2 +1,0 @@
-MetaType header
-JointsDataCmdValue data

@@ -95,12 +95,12 @@ class S10Nodes:
         from std_msgs.msg import String
 
         self.json = json
-        self.robot = Node("lynx_s10_driver_robot", context=ros2.ctx_robot)
+        self.robot = Node("s10_pro_driver_robot", context=ros2.ctx_robot)
         ros2.executor_robot.add_node(self.robot)
-        self.bridge = CoreBridge(os.environ.get("S10_CORE_FASTDDS_PROFILE", "/tmp/lynx-s10-core-fastdds.xml"),
+        self.bridge = CoreBridge(os.environ.get("S10_CORE_FASTDDS_PROFILE", "/tmp/s10-pro-core-fastdds.xml"),
                                  int(config.get("ros", {}).get("core_domain_id") or 42))
         prefix = f"/{namespace}/" if namespace else "/"
-        base = prefix + "lynx_s10/"
+        base = prefix + "s10_pro/"
         self.topics = {
             "imu": {"topic": base + "imu", "format": "data/json"},
             "joints": {"topic": base + "joints", "format": "sensor/skeleton"},

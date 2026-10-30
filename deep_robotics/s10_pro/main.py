@@ -58,7 +58,7 @@ def configure_fastdds_profile(config):
     if robot_address not in robot_network or robot_address not in interface_address.network:
         raise ValueError(f"S10 basic_server {robot_address} is outside selected robot subnet {robot_network}")
 
-    profile_path = Path(os.environ.get("S10_FASTDDS_PROFILE", "/tmp/lynx-s10-fastdds.xml"))
+    profile_path = Path(os.environ.get("S10_FASTDDS_PROFILE", "/tmp/s10-pro-fastdds.xml"))
     profile_path.write_text(f'''<?xml version="1.0" encoding="UTF-8"?>
 <dds xmlns="http://www.eprosima.com"><profiles>
   <transport_descriptors><transport_descriptor>
@@ -71,7 +71,7 @@ def configure_fastdds_profile(config):
   </rtps></participant>
 </profiles></dds>''', encoding="utf-8")
     os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = str(profile_path)
-    core_profile = profile_path.with_name("lynx-s10-core-fastdds.xml")
+    core_profile = profile_path.with_name("s10-pro-core-fastdds.xml")
     core_profile.write_text('''<?xml version="1.0" encoding="UTF-8"?>
 <dds xmlns="http://www.eprosima.com"><profiles>
   <transport_descriptors><transport_descriptor>

@@ -1,2 +1,0 @@
-MetaType header
-LedStatusLightValue[] data

@@ -1,2 +1,0 @@
-MetaType header
-NavCmdValue data

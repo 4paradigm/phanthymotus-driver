@@ -1,2 +1,0 @@
-int32 state
-uint32 error_code

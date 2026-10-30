@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from deep_robotics.lynx_s10.basic_server import (
+from deep_robotics.s10_pro.basic_server import (
     HEADER,
     MAX_ASDU,
     SYNC,
@@ -28,12 +28,12 @@ from deep_robotics.lynx_s10.basic_server import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DRIVER = ROOT / "deep_robotics" / "lynx_s10"
+DRIVER = ROOT / "deep_robotics" / "s10_pro"
 
 
 def _load_device(monkeypatch):
     monkeypatch.syspath_prepend(str(DRIVER))
-    spec = importlib.util.spec_from_file_location("lynx_s10_device_for_test", DRIVER / "device.py")
+    spec = importlib.util.spec_from_file_location("s10_pro_device_for_test", DRIVER / "device.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -83,11 +83,11 @@ def test_pro_config_registers_navigation_and_matches_marketplace_cards(monkeypat
     assert "device" not in card_names
     assert not card_names.intersection({"motion_info", "native_basic_status", "native_device_status", "hard_estop", "charge_status"})
     assert any(plugin.__class__.__name__ == "S10NavigationPlugin" for plugin in plugins)
-    assert config["mcp_port"] == driver["port"] == 15724
+    assert config["mcp_port"] == driver["port"] == 15745
     assert config["mcp_port"] != yaml.safe_load((ROOT / "agibot/AimDK_X2/driver.yaml").read_text())["port"]
     dockerfile = (DRIVER / "Dockerfile").read_text()
-    assert "15724" in dockerfile
-    assert "COPY --from=drdds-builder /lynx_s10_ws/install/" in dockerfile
+    assert "15745" in dockerfile
+    assert "COPY --from=drdds-builder /s10_pro_ws/install/" in dockerfile
     assert "rm -rf build log src" in dockerfile
 
 
@@ -123,20 +123,20 @@ def test_state_cards_expose_core_topics_when_ros_nodes_are_present(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
     nodes = type("Nodes", (), {"topics": {
-        "imu": {"topic": "/robot/lynx_s10/imu", "format": "data/json"},
-        "joints": {"topic": "/robot/lynx_s10/joints", "format": "sensor/skeleton"},
-        "joint_state": {"topic": "/robot/lynx_s10/joint_state", "format": "data/json"},
-        "loco_state": {"topic": "/robot/lynx_s10/loco_state", "format": "data/json"},
-        "battery": {"topic": "/robot/lynx_s10/battery", "format": "data/json"},
-        "lidar_cloud": {"topic": "/robot/lynx_s10/lidar_cloud", "format": "sensor/pointcloud"},
-        "lidar_map": {"topic": "/robot/lynx_s10/lidar_map", "format": "sensor/pointcloud"},
+        "imu": {"topic": "/robot/s10_pro/imu", "format": "data/json"},
+        "joints": {"topic": "/robot/s10_pro/joints", "format": "sensor/skeleton"},
+        "joint_state": {"topic": "/robot/s10_pro/joint_state", "format": "data/json"},
+        "loco_state": {"topic": "/robot/s10_pro/loco_state", "format": "data/json"},
+        "battery": {"topic": "/robot/s10_pro/battery", "format": "data/json"},
+        "lidar_cloud": {"topic": "/robot/s10_pro/lidar_cloud", "format": "sensor/pointcloud"},
+        "lidar_map": {"topic": "/robot/s10_pro/lidar_map", "format": "sensor/pointcloud"},
     }, "stream_status": lambda _self: {"imu": {"received": 0, "published": 0}}})()
     plugin = device.S10StatePlugin(native, nodes)
     tools = {item["name"]: item for item in plugin.get_tools()}
     assert "state" not in tools
-    assert tools["joints"]["topic_out"] == [{"topic": "/robot/lynx_s10/joints", "format": "sensor/skeleton"}]
-    assert plugin.dispatch("info", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/lynx_s10/imu"
-    assert plugin.dispatch("start", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/lynx_s10/imu"
+    assert tools["joints"]["topic_out"] == [{"topic": "/robot/s10_pro/joints", "format": "sensor/skeleton"}]
+    assert plugin.dispatch("info", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/s10_pro/imu"
+    assert plugin.dispatch("start", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/s10_pro/imu"
     assert plugin.dispatch("start", {"_tool_name": "joints"})["topic_out"][0]["format"] == "sensor/skeleton"
     assert plugin.dispatch("info", {"_tool_name": "lidar_cloud"})["topic_out"][0]["format"] == "sensor/pointcloud"
     assert plugin.dispatch("info", {"_tool_name": "lidar_map"})["topic_out"][0]["format"] == "sensor/pointcloud"
@@ -413,7 +413,7 @@ def test_vendor_mjpeg_image_is_published_without_worker_hop(monkeypatch):
         AssertionError("valid MJPEG must bypass worker")))
     nodes._stream_lock = threading.Lock()
     nodes._source_topics = {"camera_rear": "/usb_camera_1/image_raw"}
-    nodes.topics = {"camera_rear": {"topic": "/host/lynx_s10/camera_rear"}}
+    nodes.topics = {"camera_rear": {"topic": "/host/s10_pro/camera_rear"}}
     nodes._stream_stats = {"camera_rear": {"received": 0, "published": 0, "dropped": 0,
                                             "last_received": None, "last_published": None}}
     msg = SimpleNamespace(encoding="jpeg", data=b"\xff\xd8jpeg\xff\xd9",
@@ -572,7 +572,7 @@ def test_media_worker_result_queue_replaces_stale_frame(monkeypatch):
 
 
 def test_domain_bridge_replaces_full_lane_with_latest_sample():
-    from deep_robotics.lynx_s10.domain_bridge import _put_latest
+    from deep_robotics.s10_pro.domain_bridge import _put_latest
 
     class FullQueue:
         def __init__(self):
@@ -591,7 +591,7 @@ def test_domain_bridge_replaces_full_lane_with_latest_sample():
 
 
 def test_domain_bridge_counts_unreplaceable_full_lane_as_drop_not_error():
-    from deep_robotics.lynx_s10.domain_bridge import _put_latest
+    from deep_robotics.s10_pro.domain_bridge import _put_latest
 
     class RacedQueue:
         def put_nowait(self, _item):
@@ -605,7 +605,7 @@ def test_domain_bridge_counts_unreplaceable_full_lane_as_drop_not_error():
 
 
 def test_media_worker_result_errors_are_throttled_and_reset_after_success(capsys):
-    from deep_robotics.lynx_s10.media_workers import MediaWorkers
+    from deep_robotics.s10_pro.media_workers import MediaWorkers
 
     workers = MediaWorkers.__new__(MediaWorkers)
     workers._result_failures = 0
@@ -627,7 +627,7 @@ def test_media_worker_result_errors_are_throttled_and_reset_after_success(capsys
 
 
 def test_domain_bridge_publish_error_throttle_boundaries():
-    from deep_robotics.lynx_s10.domain_bridge import _should_log_failure
+    from deep_robotics.s10_pro.domain_bridge import _should_log_failure
 
     assert [count for count in range(1, 201) if _should_log_failure(count)] == [1, 100, 200]
 
@@ -650,7 +650,7 @@ def test_media_worker_uses_independent_result_queue_per_lane():
 
 def test_main_builds_constrained_fastdds_profile_before_runtime(monkeypatch, tmp_path):
     monkeypatch.syspath_prepend(str(DRIVER))
-    spec = importlib.util.spec_from_file_location("lynx_s10_main_for_test", DRIVER / "main.py")
+    spec = importlib.util.spec_from_file_location("s10_pro_main_for_test", DRIVER / "main.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
@@ -685,7 +685,7 @@ def test_main_builds_constrained_fastdds_profile_before_runtime(monkeypatch, tmp
 
 def test_main_fails_closed_for_missing_or_mismatched_robot_network(monkeypatch, tmp_path):
     monkeypatch.syspath_prepend(str(DRIVER))
-    spec = importlib.util.spec_from_file_location("lynx_s10_main_fail_closed_test", DRIVER / "main.py")
+    spec = importlib.util.spec_from_file_location("s10_pro_main_fail_closed_test", DRIVER / "main.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
@@ -734,7 +734,7 @@ def test_main_fails_closed_for_missing_or_mismatched_robot_network(monkeypatch, 
 
 def test_service_configures_verified_s10_robot_network_without_shell_exports():
     service_path = DRIVER / "deploy" / "service.yml"
-    service = yaml.safe_load(service_path.read_text(encoding="utf-8"))["deep-robotics-lynx-s10"]
+    service = yaml.safe_load(service_path.read_text(encoding="utf-8"))["deep-robotics-s10-pro"]
     environment = dict(item.split("=", 1) for item in service["environment"])
     assert environment["NETWORK_INTERFACE"] == "eth0"
     assert environment["ROBOT_NETWORK_CIDR"] == "10.21.33.0/24"
@@ -1431,7 +1431,7 @@ def test_basic_server_uses_tcp_for_request_response(monkeypatch):
 
     fake_socket = FakeSocket()
     monkeypatch.setattr(
-        "deep_robotics.lynx_s10.basic_server.socket.create_connection",
+        "deep_robotics.s10_pro.basic_server.socket.create_connection",
         lambda address, timeout: fake_socket,
     )
     client = BasicServerClient({"basic_server": {
@@ -1478,7 +1478,7 @@ def test_basic_server_matches_string_encoded_response_type_and_command(monkeypat
 
     fake_socket = FakeSocket()
     monkeypatch.setattr(
-        "deep_robotics.lynx_s10.basic_server.socket.create_connection",
+        "deep_robotics.s10_pro.basic_server.socket.create_connection",
         lambda address, timeout: fake_socket,
     )
     client = BasicServerClient({"basic_server": {
