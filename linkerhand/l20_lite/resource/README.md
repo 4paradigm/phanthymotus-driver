@@ -15,3 +15,8 @@ open/fist endpoints in `config.yaml`. Uncalibrated sway, roll, and distal thumb
 joints remain neutral. These approximate angles are never used to control the
 physical hands. The two URDFs are combined into one model because the current
 dashboard fetches one `model` resource per driver.
+
+With three-channel thumb mapping enabled, the preview additionally maps motor
+1 to thumb CMC yaw and motor 9 to thumb CMC roll, using the configured thumb
+open/closed endpoints. The distal thumb joints follow the URDF's approximate
+mimics. These are target visualizations, not measured physical joint angles.

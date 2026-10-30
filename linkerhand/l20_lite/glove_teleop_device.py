@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from common.vendor_runtime import action_schema, tool
 from glove_skeleton import GloveSkeleton
+from glove_thumb import ThumbMapping
 from modbus_client import JOINT_COUNT, _bytes
 from modbus_device import HandPlugin, L20LiteConnection
 
@@ -131,11 +132,19 @@ class GloveTeleopPlugin:
         if not 1 <= self.speed <= 255 or not 1 <= self.torque <= 255:
             raise ValueError("glove speed and torque must be 1..255")
         hand_cfg = hand.hand_config
+        thumb_config = config.get("thumb_mapping", {})
+        self._thumb = (ThumbMapping(
+            thumb_config, self._quaternion_delta_vector, self._quaternion_multiply,
+            self._quaternion_fraction, self.max_fraction_step, self.open_deadband,
+        ) if thumb_config.get("enabled", False) else None)
+        if self._thumb is not None and self.source_mode == "udp":
+            raise ValueError("three-channel thumb needs direct root/top quaternion input")
         self.skeleton = GloveSkeleton(
             {
                 "left": (hand_cfg["left_open_pose"], hand_cfg["left_fist_pose"]),
                 "right": (hand_cfg["open_pose"], hand_cfg["fist_pose"]),
-            }
+            },
+            thumb_endpoints=self._thumb.endpoints if self._thumb else None,
         )
         self._publisher_factory = publisher_factory or (
             lambda topic: SkeletonPublisher(ros2, topic)
@@ -196,9 +205,11 @@ class GloveTeleopPlugin:
                 "calibrate_open": (["side"], "自然张开指定手套并保持稳定约半秒，记录张开姿态"),
                 "calibrate_fist": (
                     ["side"],
-                    "先记录张开姿态，再保持指定手套握拳并记录角度",
+                    "先记录张开姿态，再保持指定手套握拳，拇指末节也需明显弯曲",
                 ),
                 "arm": (["confirm_motion"], "确认安全后启用已校准且已连接的灵巧手遥操"),
+                "calibrate_thumb_sway": (["side"], "拇指根部尽量不屈曲，向掌心侧摆到期望终点，保持稳定"),
+                "calibrate_thumb_roll": (["side"], "拇指侧摆尽量保持张开，仅做根部屈曲到期望终点，保持稳定"),
                 "disarm": ([], "立即停止遥操并释放输出力矩"),
                 "info": ([], "查看连接、接收帧数、最近数据和错误"),
                 "stop": ([], "停止接收和预览，并退出遥操"),
@@ -472,6 +483,8 @@ class GloveTeleopPlugin:
             )
             closed = quaternion_calibration.get("fist")
             for finger, joint in enumerate((0, 2, 3, 4, 5)):
+                if finger == 0 and self._thumb is not None and self._thumb.ready(side):
+                    continue
                 if closed is None:
                     motion = self._quaternion_delta_vector(
                         opened[finger], relative[finger]
@@ -498,6 +511,12 @@ class GloveTeleopPlugin:
                         ),
                     ),
                 )
+            if self._thumb is not None:
+                thumb_target = self._thumb.targets(side)
+                if thumb_target is not None:
+                    for joint, value in zip((0, 1, 9), thumb_target):
+                        target[joint] = value
+                    self._mapped_fractions[side][0] = self._thumb.fractions[side][0]
             return target
         calibration = self._calibration.get(side, {})
         if "open" not in calibration or "fist" not in calibration:
@@ -536,6 +555,7 @@ class GloveTeleopPlugin:
         yaw = sample.get("yaw")
         quaternions = None
         quaternion_sources = None
+        thumb_pose = None
         if any(
             key in sample
             for key in (
@@ -548,6 +568,9 @@ class GloveTeleopPlugin:
             quaternions, quaternion_sources = self._root_top_quaternions(
                 sample, return_sources=True
             )
+        if self._thumb is not None:
+            # Reject a missing/bad tip before it can refresh the source watchdog.
+            thumb_pose = self._thumb.decode(sample)
         if side not in ("left", "right") or not all(
             isinstance(row, list)
             and len(row) == 5
@@ -598,6 +621,8 @@ class GloveTeleopPlugin:
                 "yaw": list(yaw),
                 "sequence": sample.get("sequence"),
             }
+            if self._thumb is not None:
+                self._thumb.observe(side, thumb_pose, now, self.calibration_window_s)
             self._reader_status = {
                 "state": "streaming",
                 "side": side,
@@ -902,13 +927,27 @@ class GloveTeleopPlugin:
                         if time.monotonic() >= deadline:
                             raise RuntimeError("hold the glove pose still for stable calibration")
                     else:
-                        return self._store_calibration(side, pose, *captured)
+                        thumb_pose = (self._thumb.stable_pose(
+                            side, time.monotonic(), self.calibration_window_s,
+                            self.calibration_stability_deg,
+                        ) if self._thumb is not None else None)
+                        if self._thumb is None or thumb_pose is not None:
+                            return self._store_calibration(side, pose, *captured, thumb_pose=thumb_pose)
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("hold thumb root and tip still for stable calibration")
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"no fresh {side} glove frame within 2 seconds")
             time.sleep(0.02)
 
-    def _store_calibration(self, side, pose, angles, relative, sample_count):
+    def _store_calibration(self, side, pose, angles, relative, sample_count, thumb_pose=None):
         # Called with the state lock held; failed sampling never changes endpoints.
+        thumb_candidate = self._thumb.candidate(side, pose, thumb_pose) if self._thumb else None
+        if pose in ("thumb_sway", "thumb_roll"):
+            if self._thumb is None:
+                raise RuntimeError("enable thumb_mapping before calibrating thumb axes")
+            self._thumb.commit(side, thumb_candidate)
+            return {"side": side, "captured": pose, "sample_count": sample_count,
+                    "thumb_ready": self._thumb.ready(side)}
         calibration = self._calibration.setdefault(side, {})
         quaternion_calibration = self._quaternion_calibration.setdefault(
             side, {}
@@ -937,7 +976,7 @@ class GloveTeleopPlugin:
             if {"open", "fist"} <= quaternion_calibration.keys():
                 small = [
                     index
-                    for index in range(5)
+                    for index in range(1 if self._thumb is not None else 0, 5)
                     if self._quaternion_fraction(
                         quaternion_calibration["open"][index],
                         quaternion_calibration["fist"][index],
@@ -948,7 +987,7 @@ class GloveTeleopPlugin:
             else:
                 small = [
                     index
-                    for index in range(5)
+                    for index in range(1 if self._thumb is not None else 0, 5)
                     if abs(
                         self._angle_delta(
                             calibration["fist"][index],
@@ -966,10 +1005,13 @@ class GloveTeleopPlugin:
             self._filtered_pitch[side] = list(angles)
             self._pitch_candidates.pop(side, None)
             self._mapped_fractions[side] = [1.0] * 5
+        if self._thumb is not None:
+            self._thumb.commit(side, thumb_candidate)
         return {
             "side": side,
             "captured": pose,
             "sample_count": sample_count,
+            "thumb_ready": self._thumb.ready(side) if self._thumb else None,
             "ready": "open" in calibration and "fist" in calibration,
             "pitch": angles,
             "orientation_source": (
@@ -1142,6 +1184,12 @@ class GloveTeleopPlugin:
                         if not sides:
                             raise RuntimeError(
                                 "no calibrated glove and matching L20 Lite hand with fresh data"
+                            )
+                    if self._thumb is not None:
+                        missing = [side for side in sides if not self._thumb.ready(side)]
+                        if missing:
+                            raise RuntimeError(
+                                f"complete open/fist, calibrate_thumb_sway and calibrate_thumb_roll for {missing}"
                             )
                 for controller in controllers:
                     controller.connection.close()
@@ -1395,6 +1443,8 @@ class GloveTeleopPlugin:
             self._last_timestamp = None
             self._raw.clear()
             self._calibration_history.clear()
+            if self._thumb is not None:
+                self._thumb.clear()
             self._filtered_pitch.clear()
             self._pitch_candidates.clear()
             self._relative_quaternions.clear()
@@ -1421,7 +1471,7 @@ class GloveTeleopPlugin:
             }
         if action == "start":
             return self._start()
-        if action in ("calibrate_open", "calibrate_fist"):
+        if action in ("calibrate_open", "calibrate_fist", "calibrate_thumb_sway", "calibrate_thumb_roll"):
             return self._calibrate(args.get("side"), action.removeprefix("calibrate_"))
         if action == "arm":
             if args.get("confirm_motion") is not True:
@@ -1487,6 +1537,14 @@ class GloveTeleopPlugin:
                         for side, calibration in self._calibration.items()
                         if {"open", "fist"} <= calibration.keys()
                     ],
+                    "thumb_mapping": {
+                        "enabled": self._thumb is not None,
+                        "ready_sides": [side for side in ("left", "right")
+                                        if self._thumb is not None and self._thumb.ready(side)],
+                        "fractions": dict(self._thumb.fractions) if self._thumb else {},
+                        "captured": {side: list(poses) for side, poses in
+                                     self._thumb.calibration.items()} if self._thumb else {},
+                    },
                     "last_raw": (
                         {side: self._last_frame[side] for side in ("left", "right")}
                         if self._last_frame

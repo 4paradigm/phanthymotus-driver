@@ -20,6 +20,7 @@ FILES = (
     "glove_direct_reader.py",
     "glove_protocol.py",
     "glove_skeleton.py",
+    "glove_thumb.py",
     "check_runtime.py",
     "config.yaml",
     "driver.yaml",

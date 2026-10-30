@@ -17,6 +17,7 @@ COPY glove_teleop_device.py /work/glove_teleop_device.py
 COPY glove_direct_reader.py /work/glove_direct_reader.py
 COPY glove_protocol.py /work/glove_protocol.py
 COPY glove_skeleton.py /work/glove_skeleton.py
+COPY glove_thumb.py /work/glove_thumb.py
 COPY check_runtime.py /work/check_runtime.py
 COPY resource/ /work/resource/
 COPY config.yaml   /work/config.yaml

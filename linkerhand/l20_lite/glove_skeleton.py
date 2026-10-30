@@ -25,13 +25,18 @@ UNCALIBRATED_THUMB_MIMICS = {"thumb_mcp", "thumb_ip"}
 
 
 class GloveSkeleton:
-    def __init__(self, poses_by_side):
+    def __init__(self, poses_by_side, thumb_endpoints=None):
+        self.thumb_endpoints = thumb_endpoints
         self.poses = {}
         self.joints = {}
         sources = {}
         for side in ("left", "right"):
             open_pose, fist_pose = poses_by_side[side]
             self.poses[side] = (_bytes(open_pose), _bytes(fist_pose))
+            if thumb_endpoints:
+                for motor, opened, closed in zip((0, 1, 9), *thumb_endpoints[side]):
+                    self.poses[side][0][motor] = opened
+                    self.poses[side][1][motor] = closed
             source = ET.parse(MODEL_DIR / f"l20lite_{side}_skeleton.urdf").getroot()
             sources[side] = source
             joints = []
@@ -97,13 +102,15 @@ class GloveSkeleton:
         for index, (name, lower, upper, parent, multiplier, offset) in enumerate(
             self.joints[side]
         ):
-            if name in FLEX_MOTORS:
-                motor = FLEX_MOTORS[name]
+            motor = FLEX_MOTORS.get(name)
+            if self.thumb_endpoints and name in ("thumb_cmc_yaw", "thumb_cmc_roll"):
+                motor = 1 if name == "thumb_cmc_yaw" else 9
+            if motor is not None:
                 fraction = (raw[motor] - open_pose[motor]) / (
                     fist_pose[motor] - open_pose[motor]
                 )
                 angle = lower + max(0.0, min(1.0, fraction)) * (upper - lower)
-            elif name in UNCALIBRATED_THUMB_MIMICS:
+            elif name in UNCALIBRATED_THUMB_MIMICS and not self.thumb_endpoints:
                 angle = lower
             elif parent:
                 angle = angles[parent] * multiplier + offset

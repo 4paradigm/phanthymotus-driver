@@ -33,6 +33,16 @@ plugins:
     calibration_window_ms: 300
     calibration_stability_deg: 8
     open_deadband: 0.10
+    # Independent tip flexion / root sway / root flexion (motors 0,1,9).
+    # Requires open, fist, thumb_sway and thumb_roll calibration before arm.
+    thumb_mapping:
+      enabled: true
+      left:
+        open: [254, 254, 254]
+        closed: [0, 0, 0]
+      right:
+        open: [254, 254, 254]
+        closed: [0, 0, 0]
     speed: 50
     torque: 50
   hand_gesture:

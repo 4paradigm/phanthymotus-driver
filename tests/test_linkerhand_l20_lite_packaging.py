@@ -23,6 +23,7 @@ def test_build_context_contains_native_runtime_without_private_configuration(tmp
     builder = module("native_builder", "build_context.py")
     target = builder.stage_context(tmp_path / "build")
     assert (target / "glove_protocol.py").is_file()
+    assert (target / "glove_thumb.py").is_file()
     assert (target / "common/vendor_runtime.py").is_file()
     assert (target / "resource/l20lite_left_skeleton.urdf").is_file()
     assert not list(target.rglob("*.dll"))

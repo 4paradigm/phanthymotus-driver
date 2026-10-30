@@ -808,6 +808,156 @@ def test_natural_open_deadband_converges_without_bypassing_step_limit():
     assert device._stabilize_fraction("left", 1, 0.12) == pytest.approx(0.12)
 
 
+def thumb_device(monkeypatch, side="left", complete=True, fist_roll=50):
+    clock = [1000.0]
+    monkeypatch.setattr(glove.time, "monotonic", lambda: clock[0])
+    hand = FakeHand()
+    hand._discover = lambda: {side: f"/dev/{side}"}
+    device = glove.GloveTeleopPlugin(hand, {
+        "source_mode": "direct", "thumb_mapping": {"enabled": True},
+    }, "test", None)
+    device._thread = object()
+    sign = 1 if side == "left" else -1
+
+    def rotation(degrees, axis):
+        q = [0.0, 0.0, 0.0, math.cos(math.radians(degrees)/2)]
+        q[axis] = math.sin(math.radians(degrees)/2)
+        return q
+
+    def send(flex=0, sway=0, roll=0, fingers=0, wrist=0, target_side=side):
+        clock[0] += 0.02
+        palm = rotation(wrist, 0)
+        root = device._quaternion_multiply(rotation(sign*sway, 1), rotation(sign*roll, 2))
+        tip = device._quaternion_multiply(root, rotation(flex, 0))
+        sample = root_top_sample(target_side,
+            [palm, device._quaternion_multiply(palm, root)] +
+            [device._quaternion_multiply(palm, rotation(fingers, 0))]*4,
+            [device._quaternion_multiply(palm, tip), None] + [None]*4)
+        device.accept_direct_sample(sample, now=clock[0])
+        return sample
+
+    send()
+    device.dispatch("calibrate_open", {"side": side})
+    send(flex=80, roll=fist_roll, fingers=80)
+    device.dispatch("calibrate_fist", {"side": side})
+    if complete:
+        send(sway=40)
+        device.dispatch("calibrate_thumb_sway", {"side": side})
+        send(roll=50)
+        assert device.dispatch("calibrate_thumb_roll", {"side": side})["thumb_ready"]
+    return device, send, clock
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("movement,motor", [("flex", 0), ("sway", 1), ("roll", 9)])
+def test_thumb_channels_independently_reach_full_range_and_preserve_four_fingers(monkeypatch, side, movement, motor):
+    device, send, _ = thumb_device(monkeypatch, side)
+    # Let the existing ring/pinky jump guard settle after fist calibration.
+    for _ in range(60):
+        send()
+    baseline = device._last_frame[side][2:9]
+    for _ in range(25):
+        send(**{movement: {"flex": 80, "sway": 40, "roll": 50}[movement]})
+    target = device._last_frame[side]
+    assert target[motor] == 0  # Previously thumb flex stopped at 93.
+    assert all(target[i] == 254 for i in (0, 1, 9) if i != motor)
+    assert target[2:9] == baseline
+    assert device._thumb.ready(side)
+    assert not device._thumb.ready("right" if side == "left" else "left")
+    for _ in range(25):
+        send()
+    assert [device._last_frame[side][i] for i in (0, 1, 9)] == [254]*3
+
+
+def test_thumb_mapping_is_wrist_invariant_and_other_hand_frames_do_not_advance_it(monkeypatch):
+    device, send, _ = thumb_device(monkeypatch)
+    for _ in range(60):
+        send(flex=40, sway=20, wrist=55)
+    before = list(device._last_frame["left"])
+    for _ in range(25):
+        send(flex=40, sway=20, wrist=-35)
+    assert device._last_frame["left"] == before
+    send(flex=80)
+    fractions = list(device._thumb.fractions["left"])
+    for _ in range(8):
+        send(target_side="right")
+    assert device._thumb.fractions["left"] == fractions
+
+
+def test_thumb_missing_tip_does_not_refresh_watchdog_and_incomplete_calibration_cannot_arm(monkeypatch):
+    device, send, clock = thumb_device(monkeypatch, complete=False)
+    before = device._side_received["left"]
+    invalid = root_top_sample("left", [axis_quaternion(0)]*6, [None]*6)
+    with pytest.raises(ValueError, match="thumb"):
+        device.accept_direct_sample(invalid, now=clock[0]+0.1)
+    assert device._side_received["left"] == before
+    monkeypatch.setattr(glove, "L20LiteConnection", lambda _: pytest.fail("must not enable torque"))
+    with pytest.raises(RuntimeError, match="calibrate_thumb_sway"):
+        device._arm()
+    assert not device._armed
+
+
+def test_overlapping_thumb_calibration_is_rejected_without_replacing_previous_pose(monkeypatch):
+    device, send, _ = thumb_device(monkeypatch)
+    previous = device._thumb.calibration["left"]
+    send(sway=40)
+    with pytest.raises(RuntimeError, match="overlap"):
+        device.dispatch("calibrate_thumb_roll", {"side": "left"})
+    assert device._thumb.calibration["left"] is previous
+    send()
+    device.dispatch("calibrate_open", {"side": "left"})
+    assert not device._thumb.ready("left")
+
+
+def test_three_channel_thumb_preview_includes_sway_roll_and_tip_joints(monkeypatch):
+    device, _, _ = thumb_device(monkeypatch)
+    opened = {j["name"]: j["q"] for j in device.skeleton.sample("left", [254]*10)}
+    closed = {j["name"]: j["q"] for j in device.skeleton.sample("left", [0]*10)}
+    for name in ("thumb_cmc_pitch", "thumb_cmc_yaw", "thumb_cmc_roll", "thumb_mcp", "thumb_ip"):
+        assert closed[f"left_{name}"] > opened[f"left_{name}"]
+
+
+def test_thumb_tip_movement_prevents_stable_capture_even_when_root_is_still(monkeypatch):
+    device, send, clock = thumb_device(monkeypatch)
+    device.calibration_window_s = 0.3
+    for i in range(18):
+        send(flex=i*5)
+    assert device._thumb.stable_pose("left", clock[0], 0.3, 8) is None
+    for _ in range(18):
+        send(flex=30)
+    assert device._thumb.stable_pose("left", clock[0], 0.3, 8) is not None
+
+
+def test_thumb_tip_can_calibrate_with_stationary_thumb_root(monkeypatch):
+    device, send, _ = thumb_device(monkeypatch, fist_roll=0)
+    assert device._thumb.ready("left")
+    for _ in range(25):
+        send(flex=80)
+    assert device._last_frame["left"][0] == 0
+    assert device._last_frame["left"][1] == device._last_frame["left"][9] == 254
+
+
+def test_three_channel_thumb_uses_existing_motor_step_limit(monkeypatch):
+    device, send, _ = thumb_device(monkeypatch)
+    client = FakeClient()
+    monkeypatch.setattr(glove, "L20LiteConnection", lambda _: type(
+        "Connection", (), {"get": lambda self: client})())
+    # Keep this test synchronous so every target write is inspected explicitly.
+    monkeypatch.setattr(device, "_ensure_control_threads_locked", lambda: None)
+    try:
+        send()
+        assert device._arm()["sides"] == ["left"]
+        for _ in range(25):
+            send(flex=80, sway=40, roll=50)
+        device._apply_latest()
+        command = [v for kind, v in client.commands if kind == "position"][-1]
+        assert all(abs(v-254) <= 16 for v in command)
+        assert all(command[i] < 254 for i in (0, 1, 9))
+    finally:
+        stop_simulated_device(device)
+    assert device._thumb.calibration == {} and device._thumb.current == {}
+
+
 def test_vendor_root_top_mapping_ignores_thumb_tip_and_unused_slot():
     roots = [axis_quaternion(v) for v in (10, 20, 30, 40, 50, 60)]
     tips = [axis_quaternion(150), [float("nan")] * 4] + [axis_quaternion(160)] * 4
