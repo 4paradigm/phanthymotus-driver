@@ -856,6 +856,7 @@ class PackagingTests(unittest.TestCase):
             for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','completion.py','trajectory.py','pose.py','head.py','gripper.py','camera.py','ros2.py','config.yaml'):
                 shutil.copyfile(DRIVER/name, root/name)
             shutil.copytree(DRIVER/'resource', root/'resource')
+            shutil.copytree(DRIVER/'head_follow', root/'head_follow')
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
                 'assert "<robot" in skeleton.model()["urdf"]; '
@@ -899,7 +900,7 @@ class PackagingTests(unittest.TestCase):
                 with patch.dict(os.environ,CONFIG_PATH=str(path)), self.assertRaisesRegex(ValueError, 'read-only sensor'): load()
                 path.write_text(yaml.safe_dump(config))
                 with patch.dict(os.environ,CONFIG_PATH=str(path)):
-                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'move_head', 'pose', 'gripper', 'camera', 'camera_left', 'camera_right'})
+                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'move_head', 'pose', 'gripper', 'camera', 'camera_left', 'camera_right', 'head_visual_follow'})
 
     def test_camera_only_and_fixed_source_configuration(self):
         load = self.function('load_settings')
