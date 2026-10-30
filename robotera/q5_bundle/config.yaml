@@ -146,3 +146,5 @@ plugins:
     enabled: true
   robot_status:
     enabled: true
+  trend_processor:
+    enabled: true
