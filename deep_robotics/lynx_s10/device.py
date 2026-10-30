@@ -316,10 +316,25 @@ class S10Nodes:
         """Use the first active configured alias for each physical camera lane."""
         from sensor_msgs.msg import CompressedImage
 
+        stale_handles = []
         with self._camera_source_lock:
             source = self._camera_lane_sources.get(key)
             if source is not None and source != topic:
-                return
+                # The S10 node exposes raw and compressed aliases for the same
+                # USB camera. Prefer compressed once it produces a frame and
+                # remove the redundant raw subscription so it cannot consume
+                # executor time or feed a stale competing stream.
+                if not (topic.endswith("/compressed") and not source.endswith("/compressed")):
+                    return
+                old_handle = self._media_subscription_handles.get(source)
+                if old_handle is not None:
+                    stale_handles.append(old_handle)
+                    if hasattr(self.robot, "destroy_subscription"):
+                        self.robot.destroy_subscription(old_handle)
+                    self._media_subscriptions = [handle for handle in self._media_subscriptions
+                                                 if handle is not old_handle]
+                    self._media_topic_subscriptions.discard(source)
+                    self._media_subscription_handles.pop(source, None)
             self._camera_lane_sources[key] = topic
             self._camera_topic_lanes[topic] = key
             self._source_topics[key] = topic
