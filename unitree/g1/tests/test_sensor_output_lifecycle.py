@@ -1,7 +1,6 @@
 """Run real publication/lifecycle paths with local publishers, never hardware."""
 
 import ast
-from array import array
 import json
 import multiprocessing
 from pathlib import Path
@@ -15,9 +14,6 @@ import unittest
 from unittest import mock
 
 from sensor_output import OutputGate
-from camera_frame import (
-    RGB_SCHEMA, encode_envelope, decode_envelope,
-)
 
 G1 = Path(__file__).resolve().parents[1]
 
@@ -125,8 +121,8 @@ class CameraLifecycleTests(unittest.TestCase):
         plugin._status = {"state": "running"}
         return plugin
 
-    def test_tools_preserve_legacy_first_and_frame_overrides(self):
-        plugin = self.plugin({"rgb_frame_topic": "/custom/rgb"})
+    def test_tools_expose_only_legacy_rgb(self):
+        plugin = self.plugin()
         tools = {t["name"]: t for t in plugin.get_tools()}
         self.assertEqual(set(tools), {"camera_rgb", "camera_depth", "camera_distance"})
         rgb = tools["camera_rgb"]["topic_out"][0]
@@ -136,19 +132,27 @@ class CameraLifecycleTests(unittest.TestCase):
         for name, tool in tools.items():
             live = plugin.dispatch("info", {"_tool_name": name})
             self.assertEqual(live["topic_out"], tool["topic_out"])
-        self.assertEqual(len({o["port"] for o in tools["camera_rgb"]["topic_out"]}), 2)
+        self.assertEqual(len(tools["camera_rgb"]["topic_out"]), 1)
         self.assertEqual(tools["camera_depth"]["topic_out"], [{
             "topic": "/ubuntu/camera/depth", "format": "image/depth-zlib"}])
         self.assertEqual(tools["camera_distance"]["topic_out"], [{
             "topic": "/ubuntu/camera/distance", "format": "data/json"}])
-        frame = tools["camera_rgb"]["topic_out"][1]
-        self.assertEqual((frame["port"], frame["topic"], frame["schema"]),
-                         ("rgb_frame", "/custom/rgb", RGB_SCHEMA))
-        no_frame = self.plugin({"frame_enabled": False})
-        for tool in no_frame.get_tools():
-            self.assertEqual(len(tool["topic_out"]), 1)
-            self.assertEqual(no_frame.dispatch("info", {"_tool_name": tool["name"]})["topic_out"], tool["topic_out"])
-        self.assertEqual(no_frame.get_tools()[0]["topic_out"][0]["port"], "rgb")
+
+    def test_camera_worker_initialization_and_error_reporting(self):
+        source = (G1 / "device.py").read_text(encoding="utf-8")
+        worker = source[source.index("def run_realsense_process("):]
+        self.assertLess(worker.index("logsafe.install(check_fd=False)"), worker.index("import cv2"))
+        self.assertIn("_zlib.compress(", worker)
+        self.assertIn("if count == 1 or count % 100 == 0:", worker)
+        self.assertIn('"frameset_errors": 0', worker)
+
+    def test_marketplace_keeps_camera_and_lidar_cards(self):
+        import yaml
+        manifest = yaml.safe_load((G1 / "driver.yaml").read_text(encoding="utf-8"))
+        card_names = {card["name"] for card in manifest["cards"]}
+        self.assertTrue({"camera_rgb", "camera_depth", "lidar_cloud"} <= card_names)
+        self.assertFalse({"camera_rgb_frame", "camera_depth_frame", "navigation_lidar",
+                          "navigation_imu", "lidar_imu"} & card_names)
 
     def test_cross_stop_and_capture_demand(self):
         plugin = self.plugin()
@@ -220,16 +224,14 @@ class CameraLifecycleTests(unittest.TestCase):
         gates = {n: OutputGate() for n in ("camera_rgb", "camera_depth", "camera_distance", "capture")}
         cls = device_class(
             "_RealSenseNode", gates=gates, np=np, Image=Message, CompressedImage=Message,
-            UInt8MultiArray=Message, RS_JPEG_QUALITY=80,
+            RS_JPEG_QUALITY=80,
             cv2=SimpleNamespace(IMWRITE_JPEG_QUALITY=1,
                                 imencode=lambda *a: (True, np.frombuffer(b"\xff\xd8test\xff\xd9", dtype=np.uint8))),
-            build_frame_metadata=lambda **kw: {"schema": kw["schema"], "image": kw["image"]},
         )
         node = cls.__new__(cls)
         node._worker_stop = threading.Event()
-        node._diagnostics = {"rgb_frame_published": 0}
         node._record_error = mock.Mock(side_effect=lambda *args: self.fail(str(args)))
-        for name in ("_color_pub", "_depth_pub", "_capture_pub", "_rgb_frame_pub"):
+        for name in ("_color_pub", "_depth_pub", "_capture_pub"):
             setattr(node, name, Publisher())
         return node, gates, np
 
@@ -250,23 +252,34 @@ class CameraLifecycleTests(unittest.TestCase):
         old = gates["camera_rgb"].token()
         gates["camera_rgb"].set_enabled(False)
         node._color_q = self.one_frame_queue(node, (
-            np.zeros((1, 1, 3)), None, None, 0, {}, 1, old, gates["capture"].token()))
+            np.zeros((1, 1, 3)), None, old, gates["capture"].token()))
         node._color_loop()
         self.assertEqual(len(node._capture_pub.messages), 1)
         self.assertFalse(node._color_pub.messages)
-        self.assertFalse(node._rgb_frame_pub.messages)
+        self.assertFalse(gates["camera_rgb"].status()["ready"])
 
     def test_real_color_loop_keeps_legacy_jpeg_and_passive_cache(self):
         node, gates, np = self.worker()
         gates["capture"].set_enabled(False)
         node._color_q = self.one_frame_queue(node, (
-            np.zeros((1, 1, 3)), None, None, 0, {}, 1, gates["camera_rgb"].token(), None))
+            np.zeros((1, 1, 3)), None, gates["camera_rgb"].token(), None))
         node._color_loop()
         self.assertEqual(node._color_pub.messages[0].format, "jpeg")
         self.assertEqual(len(node._capture_pub.messages), 1)
-        metadata, payload = decode_envelope(bytes(node._rgb_frame_pub.messages[0].data))
-        self.assertEqual(payload, node._color_pub.messages[0].data)
-        self.assertEqual(metadata["schema"], RGB_SCHEMA)
+        self.assertTrue(gates["camera_rgb"].status()["ready"])
+        self.assertEqual(gates["camera_rgb"].status()["published"], 1)
+
+    def test_failed_rgb_publish_does_not_report_ready(self):
+        node, gates, np = self.worker()
+        gates["capture"].set_enabled(False)
+        node._color_pub.publish = mock.Mock(side_effect=RuntimeError("DDS failure"))
+        node._record_error = mock.Mock()
+        node._color_q = self.one_frame_queue(node, (
+            np.zeros((1, 1, 3)), None, gates["camera_rgb"].token(), None))
+        node._color_loop()
+        self.assertFalse(gates["camera_rgb"].status()["ready"])
+        self.assertEqual(gates["camera_rgb"].status()["published"], 0)
+        node._record_error.assert_called_once()
 
     def test_real_depth_loop_publishes_legacy_and_reports_ready(self):
         node, gates, np = self.worker()

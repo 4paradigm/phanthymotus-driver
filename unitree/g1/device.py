@@ -3909,9 +3909,6 @@ class RealSensePlugin:
         self._color_topic = f"/{namespace}/camera/rgb"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._dist_topic  = f"/{namespace}/camera/distance"
-        self._rgb_frame_topic = self._config.get(
-            "rgb_frame_topic", f"/{namespace}/camera/rgb_frame"
-        )
         self._proc = None
         self._status_q = None
         self._status = {"state": "idle"}
@@ -3944,8 +3941,7 @@ class RealSensePlugin:
             "multiInstance": False,
             "description": f"RealSense color camera — {RS_COLOR_W}x{RS_COLOR_H} JPEG @ {RS_COLOR_FPS}fps. Publishes CompressedImage to {self._color_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"port": "rgb", "topic": self._color_topic, "format": "image/jpeg"}]
-                         + self._frame_outputs("rgb"),
+            "topic_out": [{"port": "rgb", "topic": self._color_topic, "format": "image/jpeg"}],
         }
 
     def _depth_tool(self) -> dict:
@@ -3967,18 +3963,6 @@ class RealSensePlugin:
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._dist_topic, "format": "data/json"}],
         }
-
-    def _frame_outputs(self, stream) -> list:
-        from camera_frame import ENVELOPE_FORMAT, RGB_SCHEMA
-        if not self._config.get("frame_enabled", True):
-            return []
-        return [{
-            "port": f"{stream}_frame",
-            "topic": self._rgb_frame_topic,
-            "format": ENVELOPE_FORMAT,
-            "ros_type": "std_msgs/msg/UInt8MultiArray",
-            "schema": RGB_SCHEMA,
-        }]
 
     def _drain_status(self) -> dict:
         if self._status_q is not None:
@@ -4125,7 +4109,6 @@ def run_realsense_process(
             "camera_rgb", "camera_depth", "camera_distance")}
         gates["capture"] = OutputGate(False)
 
-    from array import array
     import os
     import cv2
     import numpy as np
@@ -4134,24 +4117,9 @@ def run_realsense_process(
     from rclpy.node import Node as _Node
     from rclpy.executors import SingleThreadedExecutor
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-    from std_msgs.msg import String as _String, UInt8MultiArray
+    from std_msgs.msg import String as _String
     from sensor_msgs.msg import Image, CompressedImage
-    from camera_frame import (
-        RGB_SCHEMA,
-        RealSenseClockNormalizer,
-        build_calibrations,
-        build_frame_metadata,
-        build_intrinsics,
-        encode_envelope,
-        load_lidar_camera_calibration,
-        realsense_extrinsics_transform,
-    )
-
     config_values = dict(plugin_config or {})
-    frame_enabled = bool(config_values.get("frame_enabled", True))
-    rgb_frame_topic = config_values.get(
-        "rgb_frame_topic", f"/{namespace}/camera/rgb_frame"
-    )
 
     _QOS = QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -4167,11 +4135,6 @@ def run_realsense_process(
             self._capture_pub = self.create_publisher(CompressedImage, color_topic + "_internal", _QOS)
             self._depth_pub = self.create_publisher(CompressedImage, depth_topic, _QOS)
             self._dist_pub  = self.create_publisher(_String, dist_topic, _QOS)
-            self._rgb_frame_pub = (
-                self.create_publisher(UInt8MultiArray, rgb_frame_topic, _QOS)
-                if frame_enabled else None
-            )
-
             self._pipeline = None
             self._shutting_down = False
             self._last_frame_monotonic = 0.0
@@ -4179,25 +4142,15 @@ def run_realsense_process(
             self._last_dist_time = 0.0
             self._last_status_time = 0.0
             self._serial = None
-            self._rgb_calibration = None
-            self._sequence = {"rgb": 0}
             self._diagnostics = {
                 "reconnect_count": 0,
                 "framesets": 0,
-                "rgb_frame_published": 0,
-                "invalid_source_stamps": 0,
-                "out_of_order_source_stamps": 0,
                 "color_coalesced": 0,
                 "depth_coalesced": 0,
                 "legacy_publish_errors": 0,
-                "frame_publish_errors": 0,
                 "jpeg_encode_errors": 0,
                 "frameset_errors": 0,
             }
-            # Do not shadow rclpy.node.Node._clock: get_clock() relies on the
-            # ROS Clock object's handle when stamping the legacy messages.
-            self._camera_clock_normalizer = self._new_clock_normalizer()
-
             self._depth_q = queue.Queue(maxsize=1)
             self._depth_worker = None
 
@@ -4218,21 +4171,9 @@ def run_realsense_process(
 
             self.get_logger().info(
                 f"RealSenseNode ready — color:{color_topic} depth:{depth_topic} "
-                f"dist:{dist_topic} rgb_frame:{rgb_frame_topic if frame_enabled else 'disabled'}"
+                f"dist:{dist_topic}"
             )
             self._publish_status("starting")
-
-        def _new_clock_normalizer(self):
-            return RealSenseClockNormalizer(
-                warmup_samples=int(config_values.get("clock_warmup_samples", 8)),
-                window_samples=int(config_values.get("clock_window_samples", 300)),
-                reset_threshold_ns=int(
-                    float(config_values.get("clock_reset_threshold_ms", 1000)) * 1_000_000
-                ),
-                reset_confirm_samples=int(
-                    config_values.get("clock_reset_confirm_samples", 5)
-                ),
-            )
 
         def _record_error(self, counter, message):
             count = self._diagnostics[counter] + 1
@@ -4248,17 +4189,8 @@ def run_realsense_process(
             value = {
                 "state": state,
                 "device_serial": self._serial,
-                "frame_enabled": frame_enabled,
                 "diagnostics": dict(self._diagnostics),
             }
-            if self._rgb_calibration:
-                value["calibration_id"] = self._rgb_calibration["calibration_id"]
-                value["lidar_camera_status"] = self._rgb_calibration[
-                    "lidar_to_camera"
-                ].get("status")
-                value["base_camera_status"] = self._rgb_calibration[
-                    "base_to_camera"
-                ].get("status")
             if error:
                 value["error"] = str(error)
             if status_q is None:
@@ -4272,79 +4204,6 @@ def run_realsense_process(
                 status_q.put_nowait(value)
             except queue.Full:
                 pass
-
-        def _frame_domain(self, frame):
-            try:
-                return str(frame.get_frame_timestamp_domain())
-            except Exception:
-                return "unknown"
-
-        def _timing(self, frame, stream, receive_unix_ns):
-            try:
-                source_ms = frame.get_timestamp()
-            except Exception:
-                source_ms = None
-            timing = self._camera_clock_normalizer.normalize(
-                source_timestamp_ms=source_ms,
-                source_domain=self._frame_domain(frame),
-                driver_receive_stamp_ns=receive_unix_ns,
-                stream=stream,
-            )
-            if not timing.available:
-                self._diagnostics["invalid_source_stamps"] += 1
-            if timing.out_of_order:
-                self._diagnostics["out_of_order_source_stamps"] += 1
-            return timing
-
-        @staticmethod
-        def _intrinsics(profile):
-            intrinsics = profile.get_intrinsics()
-            return build_intrinsics(
-                width=intrinsics.width,
-                height=intrinsics.height,
-                fx=intrinsics.fx,
-                fy=intrinsics.fy,
-                cx=intrinsics.ppx,
-                cy=intrinsics.ppy,
-                coefficients=list(intrinsics.coeffs),
-                realsense_model=str(intrinsics.model),
-            )
-
-        def _configure_profile(self, profile):
-            color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
-            depth_profile = profile.get_stream(rs.stream.depth).as_video_stream_profile()
-            depth_sensor = profile.get_device().first_depth_sensor()
-            depth_scale_m = float(depth_sensor.get_depth_scale())
-            depth_to_color_rs = depth_profile.get_extrinsics_to(color_profile)
-            depth_to_rgb = realsense_extrinsics_transform(
-                source_frame="camera_depth_optical_frame",
-                target_frame="camera_color_optical_frame",
-                rotation_column_major=list(depth_to_color_rs.rotation),
-                translation_m=list(depth_to_color_rs.translation),
-            )
-            (
-                lidar_to_rgb,
-                base_to_camera,
-                calibration_error,
-            ) = load_lidar_camera_calibration(
-                config_values.get(
-                    "lidar_camera_calibration",
-                    "/work/calibration/g1_factory_nominal_lidar_camera.yaml",
-                )
-            )
-            self._rgb_calibration, _ = build_calibrations(
-                serial=self._serial,
-                rgb_intrinsics=self._intrinsics(color_profile),
-                depth_intrinsics=self._intrinsics(depth_profile),
-                depth_to_rgb=depth_to_rgb,
-                lidar_to_rgb=lidar_to_rgb,
-                base_to_camera=base_to_camera,
-                depth_scale_m=depth_scale_m,
-            )
-            if calibration_error:
-                self.get_logger().warn(
-                    f"Camera extrinsic calibration incomplete: {calibration_error}"
-                )
 
         def start_capture(self):
             if self._pipeline is not None:
@@ -4363,10 +4222,7 @@ def run_realsense_process(
                 config.enable_device(self._serial)
                 config.enable_stream(rs.stream.depth, RS_DEPTH_W, RS_DEPTH_H, rs.format.z16, RS_DEPTH_FPS)
                 config.enable_stream(rs.stream.color, RS_COLOR_W, RS_COLOR_H, rs.format.bgr8, RS_COLOR_FPS)
-                profile = pipeline.start(config, self._on_frame)
-                self._configure_profile(profile)
-                self._camera_clock_normalizer = self._new_clock_normalizer()
-                self._sequence = {"rgb": 0}
+                pipeline.start(config, self._on_frame)
                 self._last_frame_monotonic = time.monotonic()
                 self._worker_stop.clear()
                 self._depth_worker = threading.Thread(target=self._depth_loop, name="rs_depth", daemon=True)
@@ -4465,7 +4321,7 @@ def run_realsense_process(
         def _color_loop(self):
             while not self._worker_stop.is_set():
                 try:
-                    color_np, stamp, timing, receive_mono_ns, calibration, sequence, token, capture_token = self._color_q.get(timeout=0.5)
+                    color_np, stamp, token, capture_token = self._color_q.get(timeout=0.5)
                 except queue.Empty:
                     continue
                 if (token != gates["camera_rgb"].token()
@@ -4490,7 +4346,7 @@ def run_realsense_process(
                         # an explicit capture request also works with RGB off.
                         gates["camera_rgb"].publish(token, self._capture_pub, cmsg, record=False)
                     if not gates["camera_rgb"].publish(
-                            token, self._color_pub, cmsg, record=self._rgb_frame_pub is None):
+                            token, self._color_pub, cmsg):
                         continue
                 except Exception as e:
                     self._record_error(
@@ -4498,33 +4354,6 @@ def run_realsense_process(
                         f"[realsense] color legacy publish error: {e}",
                     )
                     continue
-                if self._rgb_frame_pub is None or calibration is None:
-                    continue
-                try:
-                    metadata = build_frame_metadata(
-                        schema=RGB_SCHEMA,
-                        frame_id="camera_color_optical_frame",
-                        timing=timing,
-                        driver_receive_monotonic_ns=receive_mono_ns,
-                        sequence=sequence,
-                        image={
-                            "encoding": "jpeg",
-                            "width": int(color_np.shape[1]),
-                            "height": int(color_np.shape[0]),
-                            "payload_size": len(payload),
-                        },
-                        calibration=calibration,
-                    )
-                    envelope = encode_envelope(metadata, payload)
-                    frame_msg = UInt8MultiArray()
-                    frame_msg.data = array("B", envelope)
-                    if gates["camera_rgb"].publish(token, self._rgb_frame_pub, frame_msg):
-                        self._diagnostics["rgb_frame_published"] += 1
-                except Exception as e:
-                    self._record_error(
-                        "frame_publish_errors",
-                        f"[realsense] color frame publish error: {e}",
-                    )
 
         def _on_frame(self, frame):
             try:
@@ -4534,25 +4363,19 @@ def run_realsense_process(
                 fs = frame.as_frameset()
                 color_frame = fs.get_color_frame()
                 depth_frame = fs.get_depth_frame()
-                receive_unix_ns = time.time_ns()
-                receive_mono_ns = time.monotonic_ns()
                 stamp = self.get_clock().now().to_msg()
                 self._last_frame_monotonic = time.monotonic()
                 self._diagnostics["framesets"] += 1
 
                 if color_frame and (tokens["camera_rgb"] is not None or tokens["capture"] is not None):
                     color_np = np.asanyarray(color_frame.get_data())
-                    color_timing = self._timing(color_frame, "rgb", receive_unix_ns)
-                    self._sequence["rgb"] += 1
                     try:
                         self._color_q.get_nowait()
                         self._diagnostics["color_coalesced"] += 1
                     except queue.Empty:
                         pass
                     self._color_q.put_nowait((
-                        color_np, stamp, color_timing, receive_mono_ns,
-                        self._rgb_calibration, self._sequence["rgb"],
-                        tokens["camera_rgb"], tokens["capture"],
+                        color_np, stamp, tokens["camera_rgb"], tokens["capture"],
                     ))
 
                 dist = 0.0

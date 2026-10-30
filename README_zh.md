@@ -101,14 +101,10 @@ IMU 就绪状态，顶层就绪状态保持原有点云语义。安全检查使�
 四元数，角速度单位为 rad/s，线加速度单位为 m/s²，并保留三组标准 3×3 协方差。
 点云和 IMU 各自保留归一化后的采样时间，并非同步采样对，时间戳也不是原始 DDS 值的逐位复制。
 
-### G1 相机自描述帧
+### G1 相机输出
 
-RealSense 插件保留现有 `/ubuntu/camera/rgb` 压缩图作为 `camera_rgb` 的第一项输出，
-其稳定端口名为 `rgb`；`/ubuntu/camera/depth` 深度图和距离 topic 的消息语义不变。
-同时新增一条
-BEST_EFFORT + KEEP_LAST(1) 自描述 RGB 帧，不与导航算法绑定：
-`camera_rgb` 的 `rgb_frame` 端口 → `/ubuntu/camera/rgb_frame`
-（`phanthy.sensor.camera_rgb_frame.v1`）。
+RealSense 插件通过 `camera_rgb` 的 `rgb` 端口发布 `/ubuntu/camera/rgb` 压缩图；
+深度图和距离 topic 的消息语义不变。
 
 停止相机卡只停止该卡的输出，不影响另一相机卡、距离输出或
 拍照/录像。拍照使用按需启用的内部 JPEG 通道。全部输出及拍照需求停止后，共享
@@ -120,28 +116,10 @@ BEST_EFFORT + KEEP_LAST(1) 自描述 RGB 帧，不与导航算法绑定：
 |---|---|
 | navigation_lidar | lidar_cloud / navigation_lidar |
 | navigation_imu、lidar_imu | 支持端口的消费端使用 lidar_cloud / navigation_imu；当前 controlled semantic spatial 卡改用其 `imu_topic` 配置 |
-| camera_rgb_frame | camera_rgb / rgb_frame |
 
 移除的名字不保留隐藏别名。原点云输出维持列表首位及原有数据格式；IMU topic
 及其 ROS 类型保持可用。Canvas 和消费端需要支持传递描述符。此轮整合尚未部署或
 真机验收，本地测试不能代替 ROS/设备验收。
-
-RGB 自描述帧以 `std_msgs/msg/UInt8MultiArray` 承载 `PSE1` 二进制 envelope：固定
-小端头（magic、JSON 元数据长度、二进制载荷长度）之后依次是规范 JSON
-元数据和 JPEG 载荷。每帧完整携带当前 RealSense profile 内参、
-稳定 `calibration_id`、Depth→RGB 外参、源时间/Driver 接收时间，以及配置的
-LiDAR→RGB 外参。`base_to_camera` 字段使用 `target_from_source` 约定和 row-major 4×4
-齐次矩阵，语义固定为 `T_base_camera`，将
-`camera_color_optical_frame` 中的点变换到 `base_link`。它也参与生成
-`calibration_id`，因此消费端无需知道机器人型号。源时间无效、尚在预热、发生时钟重置或倒序时仍发布该帧，
-但明确标记为 `unavailable`，不会用发布时刻伪造采集时间。
-
-仓库内置的 LiDAR→Camera 和 Camera→Base 变换来自固定版本的宇树官方 G1 URDF，状态只能是
-`factory_nominal`：它不是北京 G1 的实测外参。在该机器人上完成点云投影叠加
-与像素残差验收并保存证据前，不得改成 `validated_on_device`。配置缺失或非法
-时输出 `unavailable`，不会用单位矩阵冒充有效标定。相机重连后会重新读取
-活动 profile；序列号、分辨率、内参、depth scale 或外参变化都会生成新的
-`calibration_id`。
 
 ## 开发新驱动
 

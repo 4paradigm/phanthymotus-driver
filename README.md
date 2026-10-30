@@ -145,14 +145,10 @@ valid substitute for the MID360 built-in IMU. Before accepting a navigation
 run, verify the isolated worker delivers approximately 10 Hz LiDAR and 200 Hz
 IMU; materially lower rates or repeated source-stamp gaps invalidate the run.
 
-### G1 Self-Describing Camera Frames
+### G1 Camera Outputs
 
-The RealSense plugin keeps the legacy `/ubuntu/camera/rgb` compressed image
-as the first `camera_rgb` output, with stable port `rgb`; the
-`/ubuntu/camera/depth` image and distance topics are unchanged. It additionally
-exposes one latest-only, BEST_EFFORT self-describing RGB frame stream, independent
-of navigation: `camera_rgb`, port `rgb_frame` → `/ubuntu/camera/rgb_frame`
-(`phanthy.sensor.camera_rgb_frame.v1`).
+The RealSense plugin publishes `/ubuntu/camera/rgb` as a `CompressedImage`
+on the `camera_rgb` port `rgb`; depth and distance topics are unchanged.
 
 Stopping a camera card gates its own outputs, not its sibling, distance, or
 photo/video capture. Capture uses an on-demand internal
@@ -160,36 +156,13 @@ JPEG channel. With no active outputs or capture requests, the shared process
 pauses hardware capture. A stop timeout is an error, never an idle success.
 
 Migration: replace saved Canvas `navigation_lidar` with `lidar_cloud`'s
-`navigation_lidar` port and `camera_rgb_frame` with `camera_rgb`'s `rgb_frame`.
+`navigation_lidar` port.
 Where supported, replace saved `lidar_imu` or `navigation_imu` card connections
 with the `lidar_cloud` card's `navigation_imu` port; the cloud descriptor's
 `associated_imu` metadata also remains available. The current controlled semantic
 spatial card instead uses its configured `imu_topic` as described above. Consumer
 and Canvas support for ports or metadata is required; hardware/ROS acceptance is
 pending, and local tests are not a deployment claim.
-
-The RGB stream uses `std_msgs/msg/UInt8MultiArray` to transport a `PSE1` binary
-envelope: a fixed little-endian header (`magic`, JSON metadata length, binary
-payload length), canonical JSON metadata, then the JPEG payload.
-Every frame repeats its active-profile intrinsics, stable `calibration_id`,
-RealSense Depth-to-RGB transform, source/Driver-receive timing, and the
-configured LiDAR-to-RGB calibration. The `base_to_camera` entry is a
-`target_from_source`, row-major 4x4 `T_base_camera` which transforms points
-from `camera_color_optical_frame` into `base_link`. It is included in the
-`calibration_id`, so consumers do not need to
-know the robot model. Invalid, warming-up, reset, or
-out-of-order source timestamps are published as explicitly unavailable; the
-Driver does not replace them with publish time.
-
-The bundled LiDAR-to-camera and base-to-camera transforms are derived from the
-pinned official G1 URDF and are intentionally marked `factory_nominal`. They are
-not measured
-per-robot calibration and must not be relabeled `validated_on_device` until a
-projection overlay and pixel-residual acceptance run has been recorded on that
-G1. Missing or invalid calibration is represented as `unavailable`, never as
-an identity transform. Camera reconnects rebuild the profile calibration and
-therefore update `calibration_id` when serial, resolution, intrinsics, depth
-scale, or extrinsics change.
 
 ## Writing a New Driver
 

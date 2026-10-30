@@ -97,15 +97,7 @@ plugins:
     enabled: true
   camera:
     enabled: true
-    # RGB self-describing frames accompany the legacy camera outputs.
     # Camera failures remain isolated from loco.
-    frame_enabled: true
-    rgb_frame_topic: /ubuntu/camera/rgb_frame
-    lidar_camera_calibration: /work/calibration/g1_factory_nominal_lidar_camera.yaml
-    clock_warmup_samples: 8
-    clock_window_samples: 300
-    clock_reset_threshold_ms: 1000
-    clock_reset_confirm_samples: 5
     reconnect_interval_sec: 1.0
     stale_frame_timeout_sec: 2.5
   vision_capture:

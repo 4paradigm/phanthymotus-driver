@@ -12,7 +12,7 @@ initial projection overlay, but it is not a measured calibration for a
 particular robot. Before changing the status to `validated_on_device`, record:
 
 - the G1 and RealSense serial/profile;
-- the exact transform and resulting `calibration_id`;
+- the exact transform and its provenance;
 - RGB frames with projected LiDAR points at several distances and directions;
 - quantitative pixel residuals and the acceptance threshold used.
 
@@ -30,9 +30,3 @@ and is not composed into the static transform again. The transform uses reliable
 transient-local `/tf_static` delivery through ROS 2 `StaticTransformBroadcaster`.
 Replace the configured translation and rotation after per-device calibration;
 do not describe the factory value as a measured extrinsic.
-
-The RealSense RGB PSE1 envelope includes the `base_to_camera` entry in its
-`calibration_id`. Consumers can therefore
-transform camera-optical points into `base_link` without knowing the robot
-model. Missing or invalid device calibration is reported as `unavailable`; it
-is never replaced with an identity matrix.
