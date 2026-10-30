@@ -1,6 +1,6 @@
 # LimX TRON2 传感器、双臂、头部与夹爪控制驱动
 
-为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂/头部控制卡片、预设pose动作卡片和一张可选择左右的夹爪控制卡片，新增一张基于 Perception Stack VOP 的人物头部视觉跟随卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.14.3`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂/头部控制卡片、预设pose动作卡片和一张可选择左右的夹爪控制卡片，新增一张基于 Perception Stack VOP 的人物头部视觉跟随卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.15.0`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
@@ -12,7 +12,7 @@
 | `camera_right` | sensor | 右腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_right`（image/jpeg） |
 | `arm_control` | actuator | move自定义目标、reset复位并自动校验；ACP完成通知 | 无 |
 | `move_head` | actuator | 俯仰-60～45°（上正）、偏航-88～88°（自身左正）绝对目标；ACP确认到位 | 无 |
-| `head_visual_follow` | actuator | VOP人物跟随；确认无人后回正；仅显式执行后启用 | 内部订阅 `/limx_tron2/camera/objects`；无画布端口 |
+| `head_visual_follow` | actuator | 平滑人物跟随；不跟随模式含暂停与头部复位；ACP会话跟踪 | 左侧输入 `/limx_tron2/camera/objects`（data/json） |
 | `model` | resource | 厂家DACH_TRON2A骨架URDF，供平台自动加载 | 无 |
 
 夹爪卡片说明见 [夹爪卡片使用说明](GRIPPER.md)。只填写side（left/right）、opening_mm（0至85mm）、speed、force；没有action/close/recover选项。驱动按底层值=毫米数×94/85名义换算，0mm闭合。非法输入在占用任务和发送前拒绝，两侧独立管理；合法指令仍保留未到位或断连保护。
@@ -25,87 +25,62 @@ battery_state卡片、配置、topic和电池计算/显示代码已从本版本�
 
 ## 人物头部视觉跟随
 
-本模块随原 TRON2 驱动在 `127.0.0.1:15791/mcp` 提供 `head_visual_follow` 卡片。
-继续使用 Perception Stack 的 VOP 检测，不包含自建 YOLO、单独容器、额外端口或通用控制插件。
-原手动 `move_head` 卡片的角度参数和使用方式保留。
+同一个 TRON2 驱动和 `127.0.0.1:15791/mcp` 提供 `head_visual_follow`。
+使用现有 Perception Stack VOP，不增加自建 YOLO、独立容器或额外端口；不修改 Core、VOP 或公共前端。
 
-### 使用
+### 画布与操作
 
-1. 在画布只连接 TRON2 头部 `camera` → Perception Stack 的 `vop`。
-   `head_visual_follow` 单独放置，不需要输入或输出连线。它在驱动内部订阅固定的
-   `/limx_tron2/camera/objects` 人物检测；无需为它配置话题或连接器。
-2. 开启智能控制，等相机与 VOP 连续输出，再按跟随卡片的“执行”。当前 Motus 前端要求至少一个可见参数才显示“执行”，因此保留只有 `follow` 的 ACTION 单选，点“执行”启动跟随；不改 Motus/Core 或公共前端。空参数调用仍兼容。
-3. 卡片优先选择靠近中心的人，至少两个不同的新鲜结果确认后跟随。人物可从整幅画面获取；
-   空间关联不等于身份识别，多人靠近、交叉或短暂遮挡时保持，避免立即切换人物。
-4. 人物消失，或执行时未发现人，连续至少3个有效检测结果且持续1.5秒确认无人后，
-   回正至 pitch=0°、yaw=0°。输入断流、错误、过期或重复结果不算“无人”。
+1. 连线为 TRON2 头部 `camera` → `vop` → `head_visual_follow` 左侧输入端。
+   静态声明和 info 都返回解析后的 `/limx_tron2/camera/objects`、`data/json` 输入。
+   开启项目只建立只读订阅，不启用头部运动；跟随执行前要求连线注入该头部对象话题并有新鲜检测。
+   不接受左右腕相机或其它对象话题。
+2. ACTION 选择“人物跟随”（`follow`），点击“执行”启用。优先选择靠近图像中心的人，
+   至少两个不同的新鲜结果确认后跟随；空间关联不等于身份识别。
+3. ACTION 选择“不跟随模式”（`not_follow`）时显示“不跟随操作”：
+   - “暂停跟随”（`pause`）停止发送新目标，等待最后受理目标取得持续新反馈的静止验证。
+   - “头部复位”（`reset`）先暂停并确认前一会话停稳、完成回调，再经原 `move_head` 路径转至 pitch=0°、yaw=0°，验证到位后报告复位结果。
+   暂停不依赖仍然有效的 VOP 连线；断流时也能请求暂停。暂停不是硬件急停。
+4. 跟随过程中，至少3个有效新检测结果且持续1.5秒确认无人后平滑回正，随后继续等待人物。
+   检测错误、过期、重复结果和短暂遮挡不会被当作“无人”。
 
-启动容器不订阅检测；开启智能控制会建立内部订阅，不自动跟随。每次重新启动项目后需再次执行。直接执行时也会自动建立订阅，最多等1.5秒收取新鲜VOP结果；没有有效结果则不启用跟随、不发送动作。
-内部 `start` / `stop` / `info` 用于平台生命周期与诊断，不在界面展示为动作。静态声明和info响应的 `topic_in` / `topic_out` 均为空，平台不会推断跟随卡片的画布端口；诊断字段 `detection_topic` 只说明内部订阅来源。
-关闭智能控制或停用卡片会阻止新目标；已受理的本次转头仍会完成，停用不是中途制动。
+### 平滑闭环与边界
 
-### 控制与观测边界
+仓库宇树实现中未找到可直接复用的独立头部跟随；G1 手臂伺服、R1 底盘伺服不属于这个执行器。
+头部调度借鉴官方 [TRON2 head_scheduler.py](https://github.com/limxdynamics/tron2_env/blob/ec84cead9c4dab658b7253f94a2eab73d5e9b62d/src/tron2_env/motion/head_scheduler.py)：
+只使用两轴 `request_moveh`，按最新视觉结果更新目标，每次命令等待其匹配ACK，连续跟随时不再等待每个小目标完全静止。
+这是视觉闭环、短时 MoveH 目标流；不宣称厂商提供了原生连续电机 ServoH，也不使用全身16轴 ServoJ或向双臂发送保持目标。
 
-采用 VOP 原生 `objects[].name/position/confidence`：`position` 为图像中心归一化的
-[x,y]，范围−1至1，向右/向下为正。不从该点编造检测框、躯干位置或相机标定。
-仅使用置信度至少0.55的人物。VOP 的发布时间、可选处理耗时、本地接收时间用于
-1.5秒新鲜度和重复结果检查；这些字段不能证明硬件测量时钟同步，也不能识别被重新推理的
-冻结图像。驱动状态保留 `measurement_time_verified=false`。
+控制计算周期20ms，头部命令不高于10Hz，单个目标时间窗250ms；实际频率受ACK和模式核对耗时限制。
+人物中心观测滤波与角速度/加速度/加加速度限制分开处理，俯仰最高8°/s、偏航最高12°/s，
+角度范围 pitch=-55°至30°、yaw=-45°至45°。循环延迟后不追发积压目标；反馈落后已发送目标超过4°即停止累积新目标，
+这4°是反馈误差保护，不是单次转头幅度上限。
 
-跟随直接计算完整目标，约6°/s，单次0.6–15秒，pitch限制−55°至30°，yaw限制−45°至45°。
-原“最多4°”步进限制不恢复。目标通过同一进程的原 `move_head` 参数验证、任务互斥、
-模式/连接检查、厂商 MoveH、持续新反馈到位验证及原头部 ACP 回调代码执行。
-一次转头完成且回调成功后，等待之后的新鲜 VOP 结果，再计算下一目标；这是串行 MoveH，
-不在转头途中叠加目标，不宣称连续伺服。
+VOP 使用原生 `objects[].name/position/confidence`，只接受置信度至少0.55的人物。
+`position` 是−1至1的二维中心位置，向右/下为正，不据此编造人脸框、躯干或标定。
+VOP发布时间、可选处理耗时、本地接收时间只用于新鲜度/重复检查，不证明硬件时钟同步；`measurement_time_verified=false`。
 
-### 跟随会话完成协议
+跟随全程占用原头部动作所有权，与双臂、预设动作和夹爪互斥。每次发送前仍检查运行模式、连接、
+控制代际、头部所有权、机械臂参考姿态和观测有效性。机械臂改变、其它动作、反馈或ACK不明时不重试、不自动复位。
+暂停/复位的受理响应不等于物理停止或复位成功。最后跟随目标要求至少3个推进的新反馈、持续0.5秒静止并到位，
+复位使用原有到位验证器；失败或未知发送保留保护。
 
-外层持续跟随声明 `x-completion: {background: true, timeout: 0, silent_completion: true}`，
-使用 Core 已支持的持续后台 ACP 语义：会话占用声明的 head/arm_l/arm_r 通道，不阻塞
-Agent 的 finish 等待，也不会在默认120秒后被错误释放。无 action filter，空参数执行同样登记。
-启动成功返回唯一 `tron2_follow_*` 会话 `action_id` 和 `completion_pending=true`，不表示跟随完成。
-重复执行返回正在运行的同一会话，不重复启用或创建并行会话。
+### 完成协议与验证
 
-人物消失后回正、再次等待人物都属于同一持续会话，不发送虚假的整次完成回调。
-内部 start/info/stop 响应不含顶层 action_id，诊断只在 session 字段内展示会话，避免生命周期调用重复登记。
-停用后不再发送新目标；已受理转头由原到位验证器结束后，会话以 cancelled 回调。
-控制故障或未知发送以 error 回调，不自动回正，不把反馈失联声称为物理停止。
-驱动关闭以 cancelled 回调并明确标记仍可能继续的已受理运动；关闭并不等于急停。
+持续跟随使用既有后台 ACP：`background=true, timeout=0, silent_completion=true`，
+返回唯一会话 `action_id`；“不跟随”控制操作也有独立ID及预计时长，实际终态通过原验证TLS的ACP回调报告。
+回正/等待人物不是整次会话完成。`head_motion` 只显示当前所有者，`last_head_motion` 保留历史结果，二者不混同。
+回调失败保留 `blocked_reporting`；不能把请求受理、ACK或缓存结果当作到位。
 
-会话终态通过原 Adapter 的已验证 TLS 通道 POST `/api/acp/complete`，tool 固定为
-head_visual_follow；重试只发送同一终态payload，沿用原3次有限回调策略。
-回调未确认时保留 blocked_reporting 诊断，拒绝开启下一会话，不重复转动或自动重报为成功。
-运行时/端到端测试覆盖无参数入口、会话唯一性、终态回调、故障和回调失败；内部每次 MoveH
-仍使用不同的头部动作ID及原生到位验证，与整次跟随会话分开跟踪。
+主对话已完成组件296项离线回归，另有真实本地MCP/ACP HTTP端到端场景覆盖连线跟随、连续目标、暂停和复位。
+这些都是模拟机器人数据的离线验证；没有发送实机运动，不能替代现场平滑性、连线和模式操作验收。
+配置仍需启用 `joint_state`、`camera`、`move_head`、`head_visual_follow`。
 
-### 构建范围
-
-Dockerfile 的新增复制项使四个 head_follow Python 模块进入原镜像，导入检查用于发现
-打包遗漏；增加的只是源码体积，没有新模型、apt/pip依赖或独立容器。driver.yaml
-只登记新增卡片元数据，不增加镜像内容。不修改 Core、Perception/VOP 或 common。
-
-跟随工作线程只经原 Adapter 的 asyncio 循环调用头部控制。厂商只读模式核对结束、真正发送
-之前，再核对启用状态、动作所有权、观测和参考姿态。机械臂动作或位置改变、其它头部命令、
-模式不符、动作失败或发送结果未知时，停止发送新目标；不自动纠正、不重试、不自动回正。
-跟随不发送机械臂/夹爪命令，不切换模式、不修改保护、不控制底盘。
-
-配置中需同时启用 `joint_state`、`camera`、`move_head`、`head_visual_follow`。
-构建与部署见下方“构建与部署”。升级源码不能代替 ARM64 镜像构建、
-现场 VOP 消息/DDS 连通性及实机跟随回正验收；旧的独立跟随/YOLO原型不会被自动删除。
-
-从 `limx/tron2` 目录运行离线测试：
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-`test_head_follow.py` 覆盖 VOP 消息及跟随状态机，`test_follow_runtime.py` 覆盖同驱动发现、
-原头部参数路径、发送前竞态保护、生命周期、线程桥接与真实 loopback MCP；`test_follow_e2e.py` 覆盖跟随与回正的原生到位验证。
-所有测试均不连接实体机器人。
+构建仅在原 TRON2 镜像中复制五个 head_follow Python 模块及导入检查，不增加模型、apt/pip依赖或其它容器。
+运行离线回归：`python3 -m unittest discover -s tests -v`。
 
 ## 读取边界与字段说明
 
-传感器后台仅发送request_get_joint_state。arm_control仅在显式move/reset调用时发送一次request_movej；move_head在显式move时发送一次request_moveh；显式启用人物跟随后，跟随模块也通过同一move_head路径串行转头；夹爪卡片仅在显式读取状态或跟踪开合动作时查询夹爪，显式开合只发送一次所选侧的指令。pose仅在显式选择英文动作后自检、必要时先回原home并确认，再回正头部，以ServoJ执行预设轨迹；挥手在右肩旋转三轮后保持手臂、右夹爪开合一次，再回原home。没有模式切换、拖动示教或自动演示循环。
+传感器后台仅发送request_get_joint_state。arm_control仅在显式move/reset调用时发送一次request_movej；move_head在显式move时发送一次request_moveh；显式启用人物跟随后，跟随模块占用同一头部通道发送带ACK关联的两轴MoveH最新目标流；夹爪卡片仅在显式读取状态或跟踪开合动作时查询夹爪，显式开合只发送一次所选侧的指令。pose仅在显式选择英文动作后自检、必要时先回原home并确认，再回正头部，以ServoJ执行预设轨迹；挥手在右肩旋转三轮后保持手臂、右夹爪开合一次，再回原home。没有模式切换、拖动示教或自动演示循环。
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。

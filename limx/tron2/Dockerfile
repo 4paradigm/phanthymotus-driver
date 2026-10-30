@@ -18,6 +18,7 @@ RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/tron2-requir
 COPY common/ /work/common/
 COPY main.py device.py vendor.py state.py reset.py skeleton.py completion.py trajectory.py pose.py head.py gripper.py camera.py ros2.py check.py config.yaml driver.yaml /work/
 COPY head_follow/__init__.py head_follow/client.py head_follow/engine.py head_follow/runtime.py /work/head_follow/
+COPY head_follow/servo.py /work/head_follow/
 COPY resource/ /work/resource/
 COPY deploy/ /deploy/
 ENV PYTHONUNBUFFERED=1

@@ -1,149 +1,114 @@
-"""Synthetic VOP -> native MoveH arrival -> real session ACP HTTP callback."""
+"""Real local MCP/ACP HTTP, synthetic VOP and guarded native head transport."""
 import asyncio
 import json
+import math
 import os
 import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
-
 import aiohttp
 from aiohttp import web
-from test_sensors import settings, info, joints
 from device import Adapter
 from state import joint_state
+from test_sensors import settings, info, joints
 from head_follow.runtime import Runtime
+from head_follow.engine import VOP_TOPIC
 
 
 class Bus:
-    def publish(self, *args):
-        pass
-
-    def subscribe_json(self, topic, callback):
-        self.callback = callback
-        return topic
-
-    def unsubscribe(self, sub):
-        self.callback = None
-
-
-async def exercise():
-    bus = Bus()
-    pending, callbacks, sent, completed = set(), [], [], []
-    settled = asyncio.Event()
-
-    async def callback(request):
-        data = await request.json()
-        assert data['action_id'] in pending, data
-        assert 'Authorization' not in request.headers
-        callbacks.append(data)
-        if data['tool'] == 'head_visual_follow':
-            settled.set()
-        return web.json_response({'ok': True, 'action_id': data['action_id']})
-
-    app = web.Application()
-    app.router.add_post('/api/acp/complete', callback)
-    acp = web.AppRunner(app)
-    await acp.setup()
-    site = web.TCPSite(acp, '127.0.0.1', 0)
-    await site.start()
-    core_url = 'http://127.0.0.1:%s' % site._server.sockets[0].getsockname()[1]
-    try:
-        async with aiohttp.ClientSession(trust_env=False) as session:
-            adapter = Adapter(bus.publish, settings(enabled_cards=[
-                'joint_state', 'camera', 'move_head', 'head_visual_follow']), session=session)
-            reader, q = adapter.reader, [0.] * 16
-
-            def feedback():
-                reader.accept_info(info())
-                reader.joints = joint_state(joints(q=q[:], dq=[0.] * 16, timestamp=time.monotonic()))
-                reader.joints_at, reader.joints_received = time.monotonic(), time.time()
-
-            async def wire(data):
-                assert data['title'] == 'request_moveh'
-                pending.add(adapter.head.active['action_id'])
-                sent.append(data)
-                q[14:] = data['data']['joint']
-                feedback()
-                reader.head_pending[1].set_result({'result': 'success'})
-
-            reader.ws = SimpleNamespace(closed=False, send_json=wire)
-            reader.head_control_status = AsyncMock(return_value={'vr_head_follow': False})
-            reader.send_movej, reader.send_gripper = AsyncMock(), AsyncMock()
-            feedback()
-            runtime = Runtime(adapter, bus)
-            adapter.follow_runtime = runtime
-            mcp_app = web.Application()
-            mcp_app.router.add_post('/mcp', adapter.rpc)
-            mcp = web.AppRunner(mcp_app)
-            await mcp.setup()
-            rpc_site = web.TCPSite(mcp, '127.0.0.1', 0)
-            await rpc_site.start()
-            rpc_url = 'http://127.0.0.1:%s/mcp' % rpc_site._server.sockets[0].getsockname()[1]
-
-            def detection(people):
-                bus.callback(json.dumps({'timestamp': time.time(), 'latency_ms': 0, 'count': len(people),
-                    'objects': [{'name': 'person', 'confidence': .95, 'position': xy} for xy in people]}))
-
-            try:
-                with patch.dict(os.environ, AGENT_CORE_URL=core_url):
-                    await runtime.call({'action': 'start'})
-                    detection([[.8, 0.]])
-                    # A real MCP Execute with no action selector returns one session id.
-                    async with session.post(rpc_url, json={'jsonrpc': '2.0', 'id': 1,
-                            'method': 'tools/call', 'params': {'name': 'head_visual_follow', 'arguments': {}}}) as reply:
-                        body = await reply.json()
-                    assert not body['result']['isError'], body
-                    accepted = json.loads(body['result']['content'][0]['text'])
-                    pending.add(accepted['action_id'])
-                    assert accepted['completion_pending'] and not callbacks
-                    runtime.launch()
-                    started, stage = time.monotonic(), 'follow'
-                    while time.monotonic() - started < 18:
-                        feedback()
-                        state = await asyncio.to_thread(runtime.info)
-                        assert state['state'] != 'fault', state
-                        if stage == 'follow' and len(sent) == 1 and state['head_motion'] is None:
-                            completed.append(adapter.head.summary())
-                            stage = 'home'
-                        elif stage == 'home' and len(sent) == 2 and any(e['event'] == 'home_verified' for e in state['events']):
-                            completed.append(adapter.head.summary())
-                            break
-                        detection([[.8, 0.]] if stage == 'follow' else [])
-                        await asyncio.sleep(.075)
-                    assert len(sent) == 2 and len(completed) == 2, (sent, state)
-                    assert all(r['status'] == 'completed' and r['arrival_verified'] and r['callback_delivered']
-                        and r['verification'] == 'post_duration_advancing_head_feedback'
-                        and r['verified_samples'] >= 3 for r in completed), completed
-                    assert sent[0]['data']['joint'][1] < 0 and sent[1]['data']['joint'] == [0., 0.]
-                    assert not settled.is_set(), 'Home must not settle the continuous session'
-                    assert runtime.info()['session']['action_id'] == accepted['action_id']
-                    assert runtime.info()['session']['state'] == 'running'
-                    await runtime.call({'action': 'stop'})
-                    await asyncio.wait_for(settled.wait(), 2)
-                    await runtime.session_task
-                    terminal = [r for r in callbacks if r['tool'] == 'head_visual_follow']
-                    assert len(terminal) == 1 and terminal[0]['action_id'] == accepted['action_id'], terminal
-                    assert terminal[0]['status'] == 'cancelled'
-                    assert not terminal[0]['result']['motion_may_continue']
-                    assert runtime.info()['session']['callback_delivered']
-                    assert reader.send_movej.await_count == reader.send_gripper.await_count == 0
-                    return {'head_sends': len(sent), 'verified_arrivals': len(completed),
-                            'arm_or_gripper_sends': 0, 'session_callbacks': len(terminal)}
-            finally:
-                await runtime.close()
-                await adapter.head.close()
-                await adapter.motion.close()
-                await mcp.cleanup()
-    finally:
-        await acp.cleanup()
+    def publish(self,*args):pass
+    def subscribe_json(self,topic,callback):self.callback=callback;return topic
+    def unsubscribe(self,sub):self.callback=None
 
 
 class NativeFollowEndToEndTests(unittest.IsolatedAsyncioTestCase):
-    async def test_vop_follow_home_and_session_acp_over_real_http(self):
-        self.assertEqual(await exercise(), {'head_sends': 2, 'verified_arrivals': 2,
-                                          'arm_or_gripper_sends': 0, 'session_callbacks': 1})
+    async def test_wired_stream_pause_reset_and_parent_acp_over_real_http(self):
+        bus=Bus();q=[0.]*16;sent=[];callbacks=[];pending=set();people=[[.8,0.]]
+        async def complete(request):
+            data=await request.json();self.assertIn(data['action_id'],pending)
+            callbacks.append(data)
+            return web.json_response({'ok':True,'action_id':data['action_id']})
+        acp_app=web.Application();acp_app.router.add_post('/api/acp/complete',complete)
+        acp=web.AppRunner(acp_app);await acp.setup();site=web.TCPSite(acp,'127.0.0.1',0);await site.start()
+        core_url='http://127.0.0.1:%s'%site._server.sockets[0].getsockname()[1]
+        pump=None;runtime=None;adapter=None;mcp=None
+        try:
+            async with aiohttp.ClientSession(trust_env=False) as session:
+                adapter=Adapter(bus.publish,settings(enabled_cards=['joint_state','camera','move_head','head_visual_follow']),session=session)
+                reader=adapter.reader
+                def feedback():
+                    reader.accept_info(info());reader.joints=joint_state(joints(q=q[:],dq=[0.]*16,timestamp=time.monotonic()))
+                    reader.joints_at=time.monotonic();reader.joints_received=time.time()
+                async def wire(data):
+                    self.assertEqual(data['title'],'request_moveh');self.assertEqual(len(data['data']['joint']),2)
+                    pending.add(adapter.head.active['action_id']);sent.append((time.monotonic(),data))
+                    q[14:]=data['data']['joint'];feedback();reader.head_pending[1].set_result({'result':'success'})
+                reader.ws=SimpleNamespace(closed=False,send_json=wire)
+                reader.head_control_status=AsyncMock(return_value={'vr_head_follow':False})
+                reader.send_movej=AsyncMock();reader.send_gripper=AsyncMock()
+                feedback();runtime=Runtime(adapter,bus);adapter.follow_runtime=runtime
+                async def publish():
+                    while True:
+                        feedback()
+                        if getattr(bus,'callback',None):
+                            bus.callback(json.dumps({'timestamp':time.time(),'latency_ms':0,'count':len(people),
+                                'objects':[{'name':'person','confidence':.9,'position':v} for v in people]}))
+                        await asyncio.sleep(.025)
+                pump=asyncio.create_task(publish())
+                app=web.Application();app.router.add_post('/mcp',adapter.rpc)
+                mcp=web.AppRunner(app);await mcp.setup();rpcsite=web.TCPSite(mcp,'127.0.0.1',0);await rpcsite.start()
+                url='http://127.0.0.1:%s/mcp'%rpcsite._server.sockets[0].getsockname()[1]
+                async def rpc(args):
+                    async with session.post(url,json={'jsonrpc':'2.0','id':1,'method':'tools/call',
+                            'params':{'name':'head_visual_follow','arguments':args}}) as response:body=await response.json()
+                    self.assertFalse(body['result']['isError'],body)
+                    result=json.loads(body['result']['content'][0]['text'])
+                    if result.get('action_id'):pending.add(result['action_id'])
+                    return result
+                with patch.dict(os.environ,AGENT_CORE_URL=core_url):
+                    follow=await rpc({'action':'follow','input_topic':VOP_TOPIC})
+                    self.assertTrue(follow['completion_pending']);self.assertEqual(callbacks,[])
+                    started=time.monotonic()
+                    while len(sent)<5 and time.monotonic()-started<3:await asyncio.sleep(.03)
+                    self.assertGreaterEqual(len(sent),5,runtime.info())
+                    # Move the same measured person smoothly through the image.
+                    for x in (.6,.4,.2,0.,-.2,-.4,-.6,-.8):
+                        people[:]=[[x,0.]];await asyncio.sleep(.15)
+                    await asyncio.sleep(.9)
+                    yaw=[math.degrees(s['data']['joint'][1]) for _,s in sent]
+                    self.assertTrue(any(b<a for a,b in zip(yaw,yaw[1:])),yaw)
+                    self.assertTrue(any(b>a for a,b in zip(yaw,yaw[1:])),yaw)
+                    self.assertEqual(callbacks,[])  # ACKs are not whole-session completion.
+                    for (ta,a),(tb,b) in zip(sent,sent[1:]):
+                        self.assertGreaterEqual(tb-ta,.095)
+                        step=abs(math.degrees(b['data']['joint'][1]-a['data']['joint'][1]))
+                        self.assertLessEqual(step,12*(tb-ta)+.03)
+                    # Only distinct valid missing-person observations may home.
+                    people[:]=[];end=time.monotonic()+5
+                    while time.monotonic()<end and not any(e['event']=='home_center_observed' for e in runtime.policy.events):await asyncio.sleep(.05)
+                    self.assertTrue(any(e['event']=='home_center_observed' for e in runtime.policy.events),runtime.info())
+                    self.assertEqual(runtime.follow['action_id'],follow['action_id']);self.assertEqual(callbacks,[])
+                    pause=await rpc({'action':'not_follow','non_follow_action':'pause'})
+                    count=len(sent);await asyncio.wait_for(asyncio.shield(runtime.control['_task']),3)
+                    self.assertEqual(len(sent),count);self.assertIsNone(adapter.head.active)
+                    self.assertEqual([(c['action_id'],c['status']) for c in callbacks],
+                        [(follow['action_id'],'cancelled'),(pause['action_id'],'completed')])
+                    self.assertTrue(callbacks[0]['result']['physical_stop_verified'])
+                    reset=await rpc({'action':'not_follow','non_follow_action':'reset'})
+                    await asyncio.wait_for(asyncio.shield(runtime.control['_task']),6)
+                    outer=callbacks[-1]
+                    self.assertEqual((outer['action_id'],outer['status']),(reset['action_id'],'completed'))
+                    self.assertTrue(outer['result']['reset_verified'])
+                    self.assertTrue(outer['result']['head_motion']['arrival_verified'])
+                    self.assertGreaterEqual(outer['result']['head_motion']['verified_samples'],3)
+                    self.assertEqual(sent[-1][1]['data']['joint'],[0.,0.])
+                    self.assertFalse(runtime.info()['active'])
+                    reader.send_movej.assert_not_awaited();reader.send_gripper.assert_not_awaited()
+                    await runtime.close();await adapter.head.close();await adapter.motion.close()
+        finally:
+            if pump:pump.cancel();await asyncio.gather(pump,return_exceptions=True)
+            if mcp:await mcp.cleanup()
+            await acp.cleanup()
 
-
-if __name__ == '__main__':
-    unittest.main()
+if __name__=='__main__':unittest.main()

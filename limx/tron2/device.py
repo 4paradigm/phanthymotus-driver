@@ -17,7 +17,7 @@ from camera import CameraStream, CAMERA_SOURCES
 from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments, normalize_arguments, GRIPPER_SIDES, combined_tool, combined_arguments
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.14.3'
+VERSION = '0.15.0'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -194,7 +194,7 @@ class Adapter:
     def call(self, name, args):
         allowed = {'action', 'instance_id', '_trace_id'}
         if name == 'head_visual_follow':
-            allowed |= {'input_topic','input_topics'}
+            allowed |= {'input_topic','input_topics','non_follow_action'}
         if name == 'arm_control':
             allowed |= {'joint', 'time'}
         if name == 'pose':
