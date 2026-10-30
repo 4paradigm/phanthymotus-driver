@@ -17,7 +17,7 @@ from camera import CameraStream, CAMERA_SOURCES
 from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments, normalize_arguments, GRIPPER_SIDES, combined_tool, combined_arguments
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.9.5'
+VERSION = '0.15.1'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -46,8 +46,11 @@ class Adapter:
         self.publish = publish
         self.settings = settings
         self.enabled = settings['enabled_cards']
-        if set(self.enabled) - (set(TOPICS) | set(CAMERA_SOURCES) | ({'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES))):
+        if set(self.enabled) - (set(TOPICS) | set(CAMERA_SOURCES) | ({'arm_control', 'move_head', 'gripper', 'pose', 'head_visual_follow'} | set(GRIPPER_SIDES))):
             raise ValueError('Unknown TRON2 card in configuration')
+        if 'head_visual_follow' in self.enabled and not {'joint_state','camera','move_head'} <= set(self.enabled):
+            raise ValueError('头部跟随需要joint_state、camera和move_head')
+        self.follow_runtime = None
         self.reader = reader or RobotReader(settings)
         self.registered_id = None
         self.core_ssl = True
@@ -166,7 +169,7 @@ class Adapter:
                                    **metadata_properties()}},
                 'topic_out': [{'topic': CAMERA_SOURCES[name][0], 'format': 'image/jpeg'}]})
         for name in self.enabled:
-            if name in ({'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES)) or name in CAMERA_SOURCES:
+            if name in ({'arm_control', 'move_head', 'gripper', 'pose', 'head_visual_follow'} | set(GRIPPER_SIDES)) or name in CAMERA_SOURCES:
                 continue
             tools.append({'name': name, 'type': 'sensor', 'multiInstance': False,
                 'description': DESCRIPTIONS[name],
@@ -180,6 +183,9 @@ class Adapter:
                 'description': 'TRON2 DACH dual-arm/head URDF with fixed gripper outlines for the skeleton renderer',
                 'inputSchema': {'type': 'object', 'additionalProperties': False,
                     'properties': metadata_properties()}})
+        if 'head_visual_follow' in self.enabled:
+            from head_follow.engine import tool as follow_tool
+            tools.append(follow_tool())
         return tools
 
     def snapshot(self):
@@ -187,6 +193,8 @@ class Adapter:
 
     def call(self, name, args):
         allowed = {'action', 'instance_id', '_trace_id'}
+        if name == 'head_visual_follow':
+            allowed |= {'input_topic','input_topics','non_follow_action','speed'}
         if name == 'arm_control':
             allowed |= {'joint', 'time'}
         if name == 'pose':
@@ -206,6 +214,10 @@ class Adapter:
             if not isinstance(value, str) or len(value) > 128 or any(
                     ord(c) < 32 or ord(c) == 127 for c in value):
                 raise ValueError('Invalid Core metadata: ' + key)
+        if name == 'head_visual_follow':
+            if name not in self.enabled:
+                raise ValueError('Unknown tool')
+            return {'status':'validated','motion_sent':False}
         if name == 'model' and 'joint_state' in self.enabled:
             if 'action' in args:
                 raise ValueError('Model has no action')
@@ -334,6 +346,45 @@ class Adapter:
                 self.publish(TOPICS[name], data)
             await asyncio.sleep(self.settings['poll_interval_seconds'])
 
+    async def execute_tool(self, name, args, *, follow_guard=None):
+        data = self.call(name, args)
+        if name == 'head_visual_follow':
+            if self.follow_runtime is None:
+                raise ValueError('头部跟随尚未初始化')
+            return await self.follow_runtime.call(args)
+        if name in CAMERA_SOURCES:
+            data = await self.cameras[name].call(args.get('action', 'info'))
+        if name == 'arm_control' and data.get('action') in ('move', 'reset'):
+            action = data['action']
+            target = data['joint'] if action == 'move' else data['target_q']
+            duration = data['time'] if action == 'move' else data['duration_seconds']
+            details = {key: data[key] for key in ('pose_sha256',) if key in data}
+            data = await self.motion.dispatch(action, target, duration, details)
+        if name == 'pose' and data.get('status')=='validated':
+            data=await self.pose.execute(args)
+        if name == 'move_head' and data.get('action') == 'move':
+            details = {key:data[key] for key in ('target_pitch_deg','target_yaw_deg')}
+            if follow_guard is not None:
+                details['head_follow_guard'] = follow_guard
+            data = await self.head.dispatch('move',data['joint'],data['time'],details)
+        if name == 'gripper':
+            if data.get('status')=='validated':
+                owner=self.grippers['gripper_'+data['side']]
+                data=await owner.dispatch(data['action'],data['arguments'])
+            elif args.get('action')=='info':
+                side=args.get('side')
+                if side: data=await self.grippers['gripper_'+side].read_state()
+        if name in GRIPPER_SIDES:
+            owner = self.grippers[name]
+            action = args.get('action')
+            if action == 'info':
+                data = await owner.read_state()
+            elif action == 'recover':
+                data = await owner.recover(args)
+            elif action in MOTION_ACTIONS:
+                data = await owner.dispatch(action, args)
+        return data
+
     async def rpc(self, request):
         try:
             body = await request.json()
@@ -361,40 +412,11 @@ class Adapter:
                 result = {}
             elif method == 'tools/call':
                 try:
-                    data = self.call(params.get('name'), params.get('arguments', {}))
-                    if params.get('name') in CAMERA_SOURCES:
-                        data = await self.cameras[params['name']].call(params.get('arguments', {}).get('action', 'info'))
-                    if params.get('name') == 'arm_control' and data.get('action') in ('move', 'reset'):
-                        action = data['action']
-                        target = data['joint'] if action == 'move' else data['target_q']
-                        duration = data['time'] if action == 'move' else data['duration_seconds']
-                        details = {key: data[key] for key in ('pose_sha256',) if key in data}
-                        data = await self.motion.dispatch(action, target, duration, details)
-                    if params.get('name') == 'pose' and data.get('status')=='validated':
-                        data=await self.pose.execute(params.get('arguments',{}))
-                    if params.get('name') == 'move_head' and data.get('action') == 'move':
-                        details = {key:data[key] for key in ('target_pitch_deg','target_yaw_deg')}
-                        data = await self.head.dispatch('move',data['joint'],data['time'],details)
-                    if params.get('name') == 'gripper':
-                        if data.get('status')=='validated':
-                            owner=self.grippers['gripper_'+data['side']]
-                            data=await owner.dispatch(data['action'],data['arguments'])
-                        elif params.get('arguments',{}).get('action')=='info':
-                            side=params['arguments'].get('side')
-                            if side: data=await self.grippers['gripper_'+side].read_state()
-                    if params.get('name') in GRIPPER_SIDES:
-                        owner = self.grippers[params['name']]
-                        action = params.get('arguments', {}).get('action')
-                        if action == 'info':
-                            data = await owner.read_state()
-                        elif action == 'recover':
-                            data = await owner.recover(params['arguments'])
-                        elif action in MOTION_ACTIONS:
-                            data = await owner.dispatch(action, params['arguments'])
+                    data = await self.execute_tool(params.get('name'), params.get('arguments', {}))
                     error = False
                 except (ValueError, TypeError) as exc:
                     data, error = {'error': str(exc)[:240],
-                        'read_only': params.get('name') not in self.enabled or params.get('name') not in ({'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES)) or
+                        'read_only': params.get('name') not in self.enabled or params.get('name') not in ({'arm_control', 'move_head', 'gripper', 'pose', 'head_visual_follow'} | set(GRIPPER_SIDES)) or
                             params.get('name') in GRIPPER_SIDES and params.get('arguments', {}).get('action') not in MOTION_ACTIONS,
                         'motion_sent': getattr(exc, 'motion_sent', False)}, True
                     if params.get('name') == 'gripper' and 'gripper' in self.enabled:
@@ -419,13 +441,13 @@ class Adapter:
             return web.json_response({'jsonrpc': '2.0', 'id': rid,
                 'error': {'code': -32602, 'message': str(exc)[:240]}})
 
-    async def health(self, request):
+    def health_data(self):
         samples = self.snapshot()
         ready = self.reader.connected and bool(samples) and all(s['available'] for s in samples.values())
         cameras = {name: stream.info() for name, stream in self.cameras.items() if name in self.enabled}
         if not samples and cameras:
             ready = all(info['available'] for info in cameras.values())
-        return web.json_response({'version': VERSION, 'read_only': not set(self.enabled) & ({'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES)), 'ready': ready,
+        return {'version': VERSION, 'read_only': not set(self.enabled) & ({'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES)), 'ready': ready,
             'arm_motion': self.motion.summary(),
             'head_motion': self.head.summary(),
             'pose_motion': self.pose.motion_summary(),
@@ -434,8 +456,13 @@ class Adapter:
             'cameras': cameras,
             'robot_connected': self.reader.connected, 'registered_mcp_id': self.registered_id,
             'last_connection_error': self.reader.last_error,
-            'round_trip_seconds': self.reader.last_round_trip, 'samples': samples},
-            status=200 if ready else 503)
+            'round_trip_seconds': self.reader.last_round_trip, 'samples': samples}
+
+    async def health(self, request):
+        data = self.health_data()
+        if self.follow_runtime is not None:
+            data['head_visual_follow'] = await asyncio.to_thread(self.follow_runtime.info)
+        return web.json_response(data,status=200 if data['ready'] else 503)
 
     async def register_loop(self, session):
         last = None
