@@ -149,9 +149,36 @@ def _worker(jobs, results, kind, lane):
 def _jpeg(width, height, step, encoding, data):
     from io import BytesIO
     from PIL import Image
+    encoding = str(encoding).lower()
+    if encoding in ("nv12", "nv21"):
+        try:
+            import numpy as np
+            width, height, step = int(width), int(height), int(step)
+            raw = np.frombuffer(bytes(data), dtype=np.uint8)
+            y_size = step * height
+            uv_rows = (height + 1) // 2
+            if raw.size < y_size + step * uv_rows:
+                return None
+            y = raw[:y_size].reshape(height, step)[:, :width]
+            uv = raw[y_size:y_size + step * uv_rows].reshape(uv_rows, step)[:, :width]
+            u, v = uv[:, 0::2], uv[:, 1::2]
+            if encoding == "nv21":
+                u, v = v, u
+            u = np.repeat(np.repeat(u, 2, axis=0), 2, axis=1)[:height, :width].astype(np.float32)
+            v = np.repeat(np.repeat(v, 2, axis=0), 2, axis=1)[:height, :width].astype(np.float32)
+            yf = y.astype(np.float32)
+            rgb = np.clip(np.stack((yf + 1.402 * (v - 128.0),
+                                    yf - 0.344136 * (u - 128.0) - 0.714136 * (v - 128.0),
+                                    yf + 1.772 * (u - 128.0)), axis=-1), 0, 255).astype(np.uint8)
+            image = Image.fromarray(rgb, "RGB")
+        except (ImportError, ValueError, TypeError):
+            return None
+        stream = BytesIO()
+        image.save(stream, format="JPEG", quality=85, optimize=False)
+        return stream.getvalue()
     mode, raw_mode = {"rgb8": ("RGB", "RGB"), "bgr8": ("RGB", "BGR"),
                       "rgba8": ("RGBA", "RGBA"), "bgra8": ("RGBA", "BGRA"),
-                      "mono8": ("L", "L"), "8uc1": ("L", "L")}.get(str(encoding).lower(), (None, None))
+                      "mono8": ("L", "L"), "8uc1": ("L", "L")}.get(encoding, (None, None))
     if mode is None:
         return None
     image = Image.frombytes(mode, (int(width), int(height)), bytes(data), "raw", raw_mode, int(step), 1)
@@ -227,7 +254,8 @@ def encode_pointcloud(fields, bigendian, width, height, row_step, point_step, da
         except struct.error:
             continue
         if all(math.isfinite(value) for value in point):
-            packed.extend(struct.pack("<fff", *point))
+            # S10 reports +Z down relative to the dashboard convention.
+            packed.extend(struct.pack("<fff", point[0], point[1], -point[2]))
             count += 1
     struct.pack_into("<I", packed, 4, count)
     return bytes(packed)

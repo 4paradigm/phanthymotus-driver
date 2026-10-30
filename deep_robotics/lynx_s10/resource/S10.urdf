@@ -1004,8 +1004,8 @@
   <link name="front_marker_tip" />
   <joint name="front_marker_tip_joint" type="fixed">
     <!-- The marker is a small front-head indicator, above the body centreline. -->
-    <origin xyz="0.24 0 0.34" rpy="0 0 0" />
-    <parent link="base_link" />
+    <origin xyz="0 0 0.20" rpy="0 0 0" />
+    <parent link="front_lidar_link" />
     <child link="front_marker_tip" />
   </joint>
   <link name="front_marker_left" />

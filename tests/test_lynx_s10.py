@@ -169,7 +169,7 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
                 ("/s10/rear/image/compressed", ["sensor_msgs/msg/CompressedImage"]),
                 ("/s10/left/image", ["sensor_msgs/msg/Image"]),
                 ("/s10/right/image", ["sensor_msgs/msg/Image"]),
-                ("/s10/depth", ["sensor_msgs/msg/PointCloud2"]),
+                    ("/s10/depth", ["sensor_msgs/msg/PointCloud2"]),
             ]
 
         def destroy_node(self):
@@ -305,7 +305,7 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     point_step, point_count = struct.unpack_from("<II", encoded)
     assert (point_step, point_count) == (12, 1)
     assert nodes.lidar_publisher.messages[-1].data.typecode == "B"
-    assert struct.unpack_from("<fff", encoded, 8) == (1.0, 2.0, 3.0)
+    assert struct.unpack_from("<fff", encoded, 8) == (1.0, 2.0, -3.0)
     stream_status = nodes.stream_status()
     assert stream_status["imu"]["received"] == stream_status["imu"]["published"] == 1
     assert stream_status["joints"]["received"] == stream_status["joint_state"]["received"] == 1
@@ -349,7 +349,7 @@ def test_lidar_packet_supports_float64_big_endian_and_validates_layout(monkeypat
                             row_step=24, point_step=24, data=point)
     encoded = device.S10Nodes._pointcloud_packet(lidar)
     assert struct.unpack_from("<II", encoded) == (12, 1)
-    assert struct.unpack_from("<fff", encoded, 8) == (1.25, -2.5, 3.75)
+    assert struct.unpack_from("<fff", encoded, 8) == (1.25, -2.5, -3.75)
 
     lidar.data = point[:-1]
     assert device.S10Nodes._pointcloud_packet(lidar) is None
@@ -386,8 +386,9 @@ def test_model_resource_returns_official_urdf(monkeypatch):
     marker_origins = [tuple(map(float, root.find(f"joint[@name='front_marker_{name}_joint']/origin").get("xyz").split()))
                       for name in ("tip", "left", "right", "close")]
     assert all(sum(value * value for value in origin) >= 0.005 ** 2 for origin in marker_origins)
-    tip = marker_origins[0]
-    assert tip[0] > 0.2 and tip[2] > 0.1
+    tip_joint = root.find("joint[@name='front_marker_tip_joint']")
+    assert tip_joint.find("parent").get("link") == "front_lidar_link"
+    assert marker_origins[0][2] > 0.1
     checker = shutil.which("check_urdf")
     if checker:
         urdf_path = DRIVER / "resource" / "S10.urdf"
