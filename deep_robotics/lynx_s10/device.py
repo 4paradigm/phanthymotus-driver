@@ -22,6 +22,7 @@ from media_workers import MediaWorkers, encode_pointcloud
 
 CAMERA_LANES = ("camera_rear", "camera_left", "camera_front", "camera_right")
 LIDAR_LANES = ("lidar_cloud", "lidar_map")
+LIDAR_SOURCE_STALE_SECONDS = 3.0
 MEDIA_MAX_AGE_S = 0.75
 
 
@@ -195,8 +196,7 @@ class S10Nodes:
             "joint_state": topics.get("joints", "/JOINTS_DATA_10HZ"),
             "battery": topics.get("battery", "/BATTERY_DATA"),
             "loco_state": topics.get("motion_info", "/MOTION_INFO"),
-            "lidar_cloud": topics.get("lidar_cloud", topics.get(
-                "lidar", ["/LIDAR/POINTS", "/DEPTH_POINTS", "/local_scans"])),
+            "lidar_cloud": topics.get("lidar_cloud", topics.get("lidar", "/DEPTH_POINTS")),
             "lidar_map": topics.get("lidar_map", "/ACCUMULATED_POINTS_MAP"),
         }
         self._source_topics.update({key: value for key, value in camera_topics.items()})
@@ -204,7 +204,7 @@ class S10Nodes:
         self.robot.create_subscription(JointsData, topics.get("joints", "/JOINTS_DATA_10HZ"), self._forward_joints, stream_qos)
         self.robot.create_subscription(BatteryData, topics.get("battery", "/BATTERY_DATA"), self._forward_battery, stream_qos)
         self.robot.create_subscription(MotionInfo, topics.get("motion_info", "/MOTION_INFO"), self._forward_loco_state, stream_qos)
-        lidar_topics = topics.get("lidar_cloud", topics.get("lidar", "/LIDAR/POINTS"))
+        lidar_topics = topics.get("lidar_cloud", topics.get("lidar", "/DEPTH_POINTS"))
         self._lidar_topics = [lidar_topics] if isinstance(lidar_topics, str) else list(lidar_topics)
         lidar_map_topic = topics.get("lidar_map", "/ACCUMULATED_POINTS_MAP")
         self._lidar_map_topic = str(lidar_map_topic)
@@ -712,34 +712,21 @@ class S10Nodes:
     def _forward_lidar(self, source, msg=None):
         if msg is None:
             msg, source = source, None
-        now = time.monotonic()
         if not self._fresh_header(getattr(msg, "header", None)):
             self._record_stream("lidar_cloud", "dropped")
             return
         if source is not None:
-            self._lidar_source_last_seen[source] = now
-            active_seen = self._lidar_source_last_seen.get(self._active_lidar_source, 0)
-            # A discovered topic may produce one stale/diagnostic frame before
-            # the configured live stream starts. Let an inactive source take
-            # over after the current source has gone quiet.
-            direct_sources = {"/DEPTH_POINTS", "/local_scans", "/LIDAR/POINTS"}
-            # Prefer a live raw sensor feed over accumulated maps/debug clouds.
-            # Derived clouds are fallback-only and must never steal the lane
-            # while a direct source is producing frames.
-            active_direct = self._active_lidar_source in direct_sources
-            candidate_direct = source in direct_sources
-            active_priority = (self._lidar_topics.index(self._active_lidar_source)
-                               if self._active_lidar_source in self._lidar_topics else None)
-            candidate_priority = (self._lidar_topics.index(source)
-                                  if source in self._lidar_topics else None)
-            if (self._active_lidar_source is None or
-                    (candidate_direct and not active_direct) or
-                    (candidate_priority is not None and
-                     (active_priority is None or candidate_priority < active_priority)) or
-                    (source != self._active_lidar_source and now - active_seen > 2.0)):
+            if source not in self._lidar_topics:
+                return
+            now = time.monotonic()
+            if self._active_lidar_source is None:
                 self._active_lidar_source = source
             elif source != self._active_lidar_source:
-                return
+                active_seen = self._lidar_source_last_seen.get(self._active_lidar_source, 0.0)
+                if now - active_seen < LIDAR_SOURCE_STALE_SECONDS:
+                    return
+                self._active_lidar_source = source
+            self._lidar_source_last_seen[source] = now
         self._forward_lidar_packet("lidar_cloud", msg)
 
     def _forward_lidar_map(self, msg):

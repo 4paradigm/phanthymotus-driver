@@ -313,7 +313,7 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
                 for name, offset in (("x", 0), ("y", 4), ("z", 8))],
         is_bigendian=False, height=1, width=2, row_step=24, point_step=12, data=point_data,
     )
-    callbacks["/LIDAR/POINTS"](lidar)
+    callbacks["/DEPTH_POINTS"](lidar)
     encoded = bytes(nodes.lidar_publisher.messages[-1].data)
     point_step, point_count = struct.unpack_from("<II", encoded)
     assert (point_step, point_count) == (12, 1)
@@ -339,7 +339,7 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     groups = nodes.robot.subscription_groups
     assert groups["/s10/rear/image/compressed"] is groups["/CAMERA/RAW"]
     assert groups["/s10/left/image"] is not groups["/s10/rear/image/compressed"]
-    assert groups["/LIDAR/POINTS"] is not groups["/s10/rear/image/compressed"]
+    assert groups["/DEPTH_POINTS"] is not groups["/s10/rear/image/compressed"]
     assert nodes._sensor_qos.kwargs == {
         "depth": 1, "history": 1, "reliability": 2, "durability": 2}
     nodes.close()
@@ -1316,12 +1316,12 @@ def test_light_blink_action_sets_independent_cycles_for_lamps(monkeypatch):
     assert leds[1]["Type"] == device.LIGHT_EFFECTS["常亮"]
 
 
-def test_lidar_source_switches_to_higher_priority_configured_stream(monkeypatch):
+def test_lidar_source_locks_to_first_valid_configured_stream(monkeypatch):
     device = _load_device(monkeypatch)
     nodes = object.__new__(device.S10Nodes)
     nodes._lidar_topics = ["/DEPTH_POINTS", "/local_scans", "/LIDAR/POINTS"]
-    nodes._active_lidar_source = "/local_scans"
-    nodes._lidar_source_last_seen = {"/local_scans": time.monotonic()}
+    nodes._active_lidar_source = None
+    nodes._lidar_source_last_seen = {}
     nodes._stream_lock = threading.Lock()
     nodes._stream_stats = {"lidar_cloud": {"received": 0, "published": 0, "dropped": 0,
                                       "last_received": None, "last_published": None}}
@@ -1331,6 +1331,27 @@ def test_lidar_source_switches_to_higher_priority_configured_stream(monkeypatch)
                           row_step=0, point_step=0, data=b"")
     nodes._forward_lidar("/DEPTH_POINTS", msg)
     assert nodes._active_lidar_source == "/DEPTH_POINTS"
+    assert nodes._stream_stats["lidar_cloud"]["received"] == 1
+    nodes._forward_lidar("/local_scans", msg)
+    assert nodes._active_lidar_source == "/DEPTH_POINTS"
+    assert nodes._stream_stats["lidar_cloud"]["received"] == 1
+
+
+def test_lidar_source_fails_over_after_active_source_stales(monkeypatch):
+    device = _load_device(monkeypatch)
+    nodes = object.__new__(device.S10Nodes)
+    nodes._lidar_topics = ["/DEPTH_POINTS", "/local_scans", "/LIDAR/POINTS"]
+    nodes._active_lidar_source = "/DEPTH_POINTS"
+    nodes._lidar_source_last_seen = {"/DEPTH_POINTS": time.monotonic() - 4.0}
+    nodes._stream_lock = threading.Lock()
+    nodes._stream_stats = {"lidar_cloud": {"received": 0, "published": 0, "dropped": 0,
+                                            "last_received": None, "last_published": None}}
+    nodes._source_topics = {"lidar_cloud": list(nodes._lidar_topics)}
+    nodes.media_workers = SimpleNamespace(submit=lambda *_args: True)
+    msg = SimpleNamespace(fields=[], is_bigendian=False, width=0, height=0,
+                          row_step=0, point_step=0, data=b"")
+    nodes._forward_lidar("/local_scans", msg)
+    assert nodes._active_lidar_source == "/local_scans"
     assert nodes._stream_stats["lidar_cloud"]["received"] == 1
 
 
