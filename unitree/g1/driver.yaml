@@ -15,6 +15,8 @@ build_context_extras:
 # its tools (pos_tag, slam_mapping, slam_cloud, spatial) are excluded.
 # `smart_motion` and `safety_harness` are on by default even though absent
 # from config.yaml's plugins block (main.py defaults them to enabled=True).
+# Exception: telemetry_recorder is listed as an experimental opt-in card;
+# config.yaml disables it and tools/list omits it until explicitly enabled.
 cards:
   - { name: mic,                    type: sensor }
   - { name: tts,                    type: actuator }
@@ -45,3 +47,4 @@ cards:
   - { name: ext_mic,                type: sensor }
   - { name: ext_camera,             type: sensor }
   - { name: smart_motion,           type: actuator }
+  - { name: telemetry_recorder,     type: actuator }
