@@ -856,6 +856,87 @@ class SpeakerPlugin:
 
 # ── Speaker Isolated Process Mode ─────────────────────────────────────────────
 
+class _SpeakerCommands:
+    """Speaker subprocess command handling, separate from ROS/SDK for tests.
+
+    `start` plays an 8 s beep before subscribing. It used to run inline on the
+    single command loop, so a `stop` sent meanwhile queued behind it for up to
+    8 s -- past Core's 5 s per-card stop deadline, which then dropped the
+    connection (BrokenPipe in the driver) and reported the stop unconfirmed.
+    Now `start` runs on its own thread and replies when it finishes; `stop`
+    cancels it within one beep block and replies at once. A `start` for the
+    topic already subscribed is a no-op: no beep, no re-subscription.
+    """
+
+    def __init__(self, node, play_beep, reply):
+        self._node, self._play_beep, self._reply = node, play_beep, reply
+        self._lock = threading.Lock()      # serialises node subscribe/stop
+        self._starter = None               # (thread, cancel event, topic)
+
+    def cancel_start(self):
+        starter, self._starter = self._starter, None
+        if starter:
+            starter[1].set()
+            starter[0].join(timeout=2)
+
+    def _start(self, request_id, topic):
+        cancel = threading.Event()
+
+        def run():
+            with self._lock:
+                if cancel.is_set():
+                    return self._reply(request_id, {"state": "idle", "cancelled": True})
+                self._node.stop_play()
+            self._play_beep(cancel)
+            with self._lock:
+                if cancel.is_set():
+                    return self._reply(request_id, {"state": "idle", "cancelled": True})
+                topic_now = self._node.start_play(topic)
+            self._reply(request_id, {"state": "ready", "topic": topic_now})
+
+        thread = threading.Thread(target=run, daemon=True, name="speaker_start")
+        self._starter = (thread, cancel, topic)
+        thread.start()
+
+    def handle(self, request_id, action, args):
+        try:
+            if action in ("start", "play"):
+                topic = args.get("input_topic", "")
+                if not topic:
+                    return self._reply(request_id, {"error": "Missing input_topic"})
+                starter = self._starter
+                if starter and starter[0].is_alive() and starter[2] == topic:
+                    # Same start already in flight: answer when it lands.
+                    def follow():
+                        starter[0].join()
+                        with self._lock:
+                            state = self._node.state
+                        self._reply(request_id, {"state": "ready" if state != "idle" else "idle",
+                                                 "topic": topic})
+                    return threading.Thread(target=follow, daemon=True).start()
+                with self._lock:
+                    already = self._node._sub is not None and self._node._topic == topic
+                if already:
+                    return self._reply(request_id, {"state": "ready", "topic": topic})
+                self.cancel_start()
+                return self._start(request_id, topic)
+            if action == "stop":
+                self.cancel_start()
+                with self._lock:
+                    self._node.stop_play()
+                return self._reply(request_id, {"state": "idle"})
+            if action == "info":
+                with self._lock:
+                    return self._reply(request_id, {
+                        "state": self._node.state, "topic": self._node._topic,
+                        "buffer_chunks": self._node._buf.qsize()})
+            if action in ("interrupt", "pause", "resume"):
+                return self._reply(request_id, getattr(self._node, action)())
+            self._reply(request_id, None)
+        except Exception as e:
+            self._reply(request_id, {"error": str(e)})
+
+
 def _speaker_process(network_iface: str, namespace: str, plugin_config: dict,
                      command_queue, result_queue):
     """Subprocess: runs SpeakerNode with its own DDS context + ROS2.
@@ -907,8 +988,8 @@ def _speaker_process(network_iface: str, namespace: str, plugin_config: dict,
         result_queue.put({"ready": False, "error": str(e)})
         return
 
-    def _play_beep():
-        """Play startup beep synchronously."""
+    def _play_beep(cancel):
+        """Play the startup beep; stop at the next block once `cancel` is set."""
         import pathlib
         pcm_path = pathlib.Path(__file__).parent / 'resource' / 'startup_beep.pcm'
         try:
@@ -916,6 +997,9 @@ def _speaker_process(network_iface: str, namespace: str, plugin_config: dict,
             block_size = 9600
             deadline = None
             for off in range(0, len(pcm), block_size):
+                if cancel.is_set():
+                    print(f"[Speaker:subprocess] startup sound cancelled at offset {off}", flush=True)
+                    return
                 block = pcm[off:off + block_size]
                 t0 = time.monotonic()
                 code, _ = audio_client.PlayStream(APP_NAME, "0", block)
@@ -929,10 +1013,13 @@ def _speaker_process(network_iface: str, namespace: str, plugin_config: dict,
                     deadline = now
                 wake = deadline - _SpeakerNode.MAX_LEAD_S
                 if wake > now:
-                    time.sleep(wake - now)
+                    cancel.wait(wake - now)
             print(f"[Speaker:subprocess] startup sound OK ({len(pcm)} bytes)", flush=True)
         except Exception as e:
             print(f"[Speaker:subprocess] startup sound error: {e}", flush=True)
+
+    commands = _SpeakerCommands(node, _play_beep,
+                                lambda request_id, result: result_queue.put({"id": request_id, "result": result}))
 
     # Command loop
     while True:
@@ -942,43 +1029,9 @@ def _speaker_process(network_iface: str, namespace: str, plugin_config: dict,
             break
         if cmd is None:
             break
-        request_id = cmd.get("id")
-        action = cmd.get("action", "")
-        args = cmd.get("args", {})
-        try:
-            if action in ("start", "play"):
-                topic = args.get("input_topic", "")
-                if not topic:
-                    result_queue.put({"id": request_id, "result": {"error": "Missing input_topic"}})
-                    continue
-                node.stop_play()
-                # Play startup sound before starting subscription (same as non-isolated path)
-                _play_beep()
-                topic = node.start_play(topic)
-                result_queue.put({"id": request_id, "result": {"state": "ready", "topic": topic}})
-            elif action == "stop":
-                node.stop_play()
-                result_queue.put({"id": request_id, "result": {"state": "idle"}})
-            elif action == "interrupt":
-                r = node.interrupt()
-                result_queue.put({"id": request_id, "result": r})
-            elif action == "pause":
-                r = node.pause()
-                result_queue.put({"id": request_id, "result": r})
-            elif action == "resume":
-                r = node.resume()
-                result_queue.put({"id": request_id, "result": r})
-            elif action == "info":
-                result_queue.put({"id": request_id, "result": {
-                    "state": node.state,
-                    "topic": node._topic,
-                    "buffer_chunks": node._buf.qsize(),
-                }})
-            else:
-                result_queue.put({"id": request_id, "result": None})
-        except Exception as e:
-            result_queue.put({"id": request_id, "result": {"error": str(e)}})
+        commands.handle(cmd.get("id"), cmd.get("action", ""), cmd.get("args", {}))
 
+    commands.cancel_start()
     node.stop_play()
     executor.shutdown()
 
@@ -1001,6 +1054,7 @@ class SpeakerIsolatedProxy:
 
         self._ipc_lock = threading.Lock()
         self._request_id = 0
+        self._waiters = {}  # request id -> (event, [result])
         self._startup_error = None
 
         ctx = _mp.get_context("spawn")
@@ -1027,6 +1081,21 @@ class SpeakerIsolatedProxy:
             print(f"[Speaker:proxy] {self._startup_error}", flush=True)
             return
         print(f"[Speaker:proxy] subprocess ready, pid={self._proc.pid}", flush=True)
+        threading.Thread(target=self._route_results, daemon=True, name="speaker_results").start()
+
+    def _route_results(self):
+        # Replies come back in completion order, not request order: a `stop`
+        # answers while an earlier `start` is still playing its beep.
+        while self._proc.is_alive() or not self._result_queue.empty():
+            try:
+                result = self._result_queue.get(timeout=1.0)
+            except Exception:
+                continue
+            with self._ipc_lock:
+                waiter = self._waiters.pop(result.get("id"), None)
+            if waiter:
+                waiter[1].append(result.get("result"))
+                waiter[0].set()
 
     def get_tool(self) -> dict:
         return {
@@ -1065,18 +1134,19 @@ class SpeakerIsolatedProxy:
     def dispatch(self, action: str, args: dict) -> dict | None:
         if not self._proc or not self._proc.is_alive():
             return {"error": self._startup_error or "speaker subprocess is not running"}
-        import queue as _q
+        # The lock covers only registration and the send, never the wait, so
+        # `stop` is not queued behind a `start` that is still playing its beep.
+        done, box = threading.Event(), []
         with self._ipc_lock:
             self._request_id += 1
             request_id = self._request_id
+            self._waiters[request_id] = (done, box)
             self._command_queue.put({"id": request_id, "action": action, "args": dict(args)})
-            try:
-                while True:
-                    result = self._result_queue.get(timeout=15.0)
-                    if result.get("id") == request_id:
-                        return result.get("result")
-            except _q.Empty:
-                return {"error": f"speaker action '{action}' timed out (15s)"}
+        if done.wait(15.0):
+            return box[0]
+        with self._ipc_lock:
+            self._waiters.pop(request_id, None)
+        return {"error": f"speaker action '{action}' timed out (15s)"}
 
 class SmartMotionPlugin:
     """统一打断/暂停控制卡片。协调 speaker + loco 的中止和暂停。"""
