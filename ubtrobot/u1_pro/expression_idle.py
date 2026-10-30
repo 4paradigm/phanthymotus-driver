@@ -25,6 +25,7 @@ class ExpressionIdleLoop:
         self.notify = notify
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._shutdown = threading.Event()
         self._thread = None
         self._end_thread = None
         self._ending = False
@@ -57,6 +58,7 @@ class ExpressionIdleLoop:
             if self._ending or self._enabled or (self._thread is not None and self._thread.is_alive()):
                 raise ValueError("expression idle is already starting/running or still stopping; query info first")
             self._stop = threading.Event()
+            self._shutdown.clear()
             self._enabled = True
             self._managed = True
             self._state = "starting"
@@ -85,12 +87,16 @@ class ExpressionIdleLoop:
                     "message": "已停止安排新的待机表情，已接收的单次动作允许执行完成。",
                     "idle_loop": self._snapshot()}
 
-    def end(self, action_id, *, interrupt=False):
+    def end(self, action_id, *, interrupt=False, shutdown=False):
         """End smart control and restore native idle, reporting completion via ACP."""
         with self._lock:
             if self.control is None:
                 raise RuntimeError("expression idle requires the vendor idle preference controller")
+            if shutdown:
+                self._shutdown.set()
             if self._ending:
+                if shutdown:
+                    return {"state": "restoring", "idle_loop": self._snapshot()}
                 raise ValueError("Smart control is already restoring vendor idle; query info first")
             with self.audio._lock:
                 self.audio._native_restoring = True
@@ -135,7 +141,10 @@ class ExpressionIdleLoop:
                 if loop_thread.is_alive():
                     raise RuntimeError("Smart control startup is still unconfirmed; vendor enable was not sent")
             deadline = time.monotonic() + self.ACTION_TIMEOUT
-            while True:
+            # Shutdown cannot leave a persistent preference disabled merely
+            # because an SDK interrupt/result is unconfirmed. Startup still
+            # must settle first, so its disable cannot race the final enable.
+            while not self._shutdown.is_set():
                 with self.audio._lock:
                     busy = self.audio._active is not None or self.audio._handoff is not None or self.audio._interrupting
                 if not busy:

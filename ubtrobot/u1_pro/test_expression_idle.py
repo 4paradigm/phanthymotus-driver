@@ -644,6 +644,47 @@ class ExpressionIdleTests(unittest.TestCase):
         self.loop._end_thread.join(2)
         self.assertEqual(self.notify.call_args.args[:2], ("end-loop", "completed"))
 
+    def test_shutdown_restores_when_an_existing_exit_is_waiting_for_motion(self):
+        self.start_loop()
+        self.wait_for(lambda: self.audio._active is not None)
+        self.end_loop()
+        self.nodes.trigger_call = mock.Mock(return_value={"success": False})
+        result = self.plugin.stop()
+        self.assertEqual(result["state"], "error")
+        self.assertFalse(self.loop.info()["smart_control_active"])
+        self.assertEqual(self.control.set_enabled.call_args.args, (True,))
+        self.finish_active()
+
+    def test_shutdown_reports_both_interrupt_and_restoration_failure(self):
+        self.start_loop()
+        self.wait_for(lambda: self.audio._active is not None)
+        self.nodes.trigger_call = mock.Mock(return_value={"success": False})
+        self.control.set_enabled.side_effect = RuntimeError("restore failed")
+        result = self.plugin.stop()
+        self.assertEqual(result["state"], "error")
+        self.assertIn("interrupt_error", result["interrupt_result"])
+        self.assertIn("restore failed", result["idle_loop"]["last_error"])
+        self.assertTrue(result["idle_loop"]["smart_control_active"])
+        self.control.set_enabled.assert_called_with(True)
+        self.finish_active()
+
+    def test_shutdown_restores_native_idle_even_when_sdk_interrupt_fails(self):
+        for failure in ({"success": False}, TimeoutError("SDK interrupt timed out")):
+            with self.subTest(failure=failure):
+                self.start_loop()
+                self.wait_for(lambda: self.audio._active is not None)
+                if isinstance(failure, Exception):
+                    self.nodes.trigger_call = mock.Mock(side_effect=failure)
+                else:
+                    self.nodes.trigger_call = mock.Mock(return_value=failure)
+                result = self.plugin.stop()
+                self.assertEqual(result["state"], "error")
+                self.assertIn("interrupt_error", result)
+                self.assertFalse(self.loop.info()["smart_control_active"])
+                self.assertEqual(self.control.set_enabled.call_args.args, (True,))
+                self.assertIsNotNone(self.audio._active)
+                self.finish_active()
+
     def test_failed_stop_interrupt_does_not_restore_over_active_motion(self):
         self.start_loop()
         self.wait_for(lambda: len(self.nodes.string_calls) == 1)

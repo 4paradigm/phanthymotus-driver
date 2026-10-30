@@ -2047,14 +2047,13 @@ class ExpressionPlugin:
         self.running = False
         result = self.audio.stop()
         # Bundle shutdown must restore a session it owns before ROS nodes close.
-        if result.get("state") != "error" and self.idle_loop.info()["smart_control_active"]:
-            if not self.idle_loop.info()["restoring_vendor_idle"]:
-                self.idle_loop.end(str(uuid.uuid4()))
+        if self.idle_loop.info()["smart_control_active"]:
+            self.idle_loop.end(str(uuid.uuid4()), shutdown=True)
             self.idle_loop._end_thread.join(
                 self.idle_loop.TRANSITION_TIMEOUT + self.idle_loop.ACTION_TIMEOUT + 35)
             if self.idle_loop.info()["smart_control_active"]:
-                return {"state": "error", "message": "Vendor idle restoration is unconfirmed",
-                        "idle_loop": self.idle_loop.info()}
+                return {**result, "state": "error", "message": "Vendor idle restoration is unconfirmed",
+                        "interrupt_result": result, "idle_loop": self.idle_loop.info()}
         return result
 
     def dispatch(self, action, args):
