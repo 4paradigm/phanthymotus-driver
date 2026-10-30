@@ -31,3 +31,10 @@
 PYTHONPATH=ubtrobot/u1_pro python3 -m unittest discover -s ubtrobot/u1_pro -p 'test_*.py' -v
 python3 scripts/check_service_yml.py ubtrobot/u1_pro
 ```
+
+# 头部朝向诊断（2026-10-29）
+
+手动 `head_orientation` 尚未实现为可用卡片。10 月 27 日 SoundSource 验收存在
+“软件反馈变化但物理不转”的失败记录，不能依据 actual 字段或 success 回执认定到位。
+参见 [最小只读／单次诊断工具及失败链路记录](diagnostics/README.md)。
+该独立工具不注册卡片、不自动启动、不切换行为；发送需明确选择且确认具体角度语义。

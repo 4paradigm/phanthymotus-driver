@@ -1,0 +1,50 @@
+{
+  "source": "Original 2026-10-27 chat command output, turn 01a17b7d-516a-7340-92a8-62355ec7a327; vendor log re-read 2026-10-29",
+  "scope": "Selected head log lines only; not a complete request capture",
+  "vendor_log": [
+    "[INFO] [1793073057.307422264] [uworld_sound_follower_node_g4Io7OLpFhWI]: Received sound source request",
+    "[INFO] [1793073057.307504472] [uworld_sound_follower_node_g4Io7OLpFhWI]: Sound source degree: 10.000000",
+    "[INFO] [1793073057.307538232] [uworld_sound_follower_node_g4Io7OLpFhWI]: Motion 1",
+    "[INFO] [1793073057.308926680] [uworld_sound_follower_node_g4Io7OLpFhWI]: Waiting for uworld motion service response, total timeout: 2700 ms",
+    "[ERROR] [1793073058.596661176] [uworld_sound_follower_node_g4Io7OLpFhWI]: Uworld motion service failed: Motion was interrupted",
+    "[INFO] [1793073066.476577688] [uworld_sound_follower_node_cgCKp61uO1Nh]: Received sound source request",
+    "[INFO] [1793073066.476666776] [uworld_sound_follower_node_cgCKp61uO1Nh]: Sound source degree: 10.000000",
+    "[INFO] [1793073066.476705784] [uworld_sound_follower_node_cgCKp61uO1Nh]: Motion 1",
+    "[INFO] [1793073066.477494584] [uworld_sound_follower_node_cgCKp61uO1Nh]: Waiting for uworld motion service response, total timeout: 2700 ms",
+    "[INFO] [1793073068.005391992] [uworld_sound_follower_node_cgCKp61uO1Nh]: success",
+    "[INFO] [1793073120.544697304] [uworld_sound_follower_node_we3dCT8t9LcA]: Received sound source request",
+    "[INFO] [1793073120.544760216] [uworld_sound_follower_node_we3dCT8t9LcA]: Sound source degree: 10.000000",
+    "[INFO] [1793073120.544794168] [uworld_sound_follower_node_we3dCT8t9LcA]: Motion 1",
+    "[INFO] [1793073120.546225944] [uworld_sound_follower_node_we3dCT8t9LcA]: Waiting for uworld motion service response, total timeout: 2700 ms",
+    "[INFO] [1793073122.202841304] [uworld_sound_follower_node_we3dCT8t9LcA]: success",
+    "[INFO] [1793073136.126335448] [uworld_sound_follower_node_Znb9kSuRv38u]: Received sound source request",
+    "[INFO] [1793073136.126418936] [uworld_sound_follower_node_Znb9kSuRv38u]: Sound source degree: -10.000000",
+    "[INFO] [1793073136.126450232] [uworld_sound_follower_node_Znb9kSuRv38u]: Motion 1",
+    "[INFO] [1793073136.127116952] [uworld_sound_follower_node_Znb9kSuRv38u]: Waiting for uworld motion service response, total timeout: 2700 ms",
+    "[INFO] [1793073137.769026072] [uworld_sound_follower_node_Znb9kSuRv38u]: success",
+    "[INFO] [1793073142.271943608] [uworld_sound_follower_node_Wa6wnuVOHDUr]: Received sound source request",
+    "[INFO] [1793073142.272005560] [uworld_sound_follower_node_Wa6wnuVOHDUr]: Sound source degree: -10.000000",
+    "[INFO] [1793073142.272047608] [uworld_sound_follower_node_Wa6wnuVOHDUr]: Motion 1",
+    "[INFO] [1793073142.272647288] [uworld_sound_follower_node_Wa6wnuVOHDUr]: Waiting for uworld motion service response, total timeout: 2700 ms",
+    "[INFO] [1793073143.875695640] [uworld_sound_follower_node_Wa6wnuVOHDUr]: success"
+  ],
+  "request_reconstruction": {
+    "degree_observed": [
+      10,
+      -10
+    ],
+    "with_waist": "false in deployed d2f1b804 code",
+    "revolute_max_vel": "not recovered from raw capture; do not infer",
+    "revolute_max_acc": "not recovered from raw capture; do not infer",
+    "other_fields": "deployed worker leaves prismatic_setup and zones at ROS numeric defaults (zero)"
+  },
+  "last_task": {
+    "degree": -10,
+    "initial_desired_radians": -0.24519447853396453,
+    "actual_radians": 0.3084354248664316,
+    "desired_radians": 0.3073447678195601,
+    "vendor_status": 0,
+    "arrival_confirmed": false
+  },
+  "physical_observation": "Operator reported completely no head turn; preset nod worked."
+}
