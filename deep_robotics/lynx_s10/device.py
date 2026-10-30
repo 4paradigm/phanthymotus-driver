@@ -577,6 +577,21 @@ class S10Nodes:
         # latency bound without blacking out the camera.
         if not already_received:
             self._record_stream(key, "received")
+        # The S10 camera node declares MJPEG as sensor_msgs/Image. For a valid
+        # JPEG payload, publish directly from the callback: sending it through
+        # a worker only adds an IPC hop and a frame of latency. Raw/NV12 frames
+        # still use the isolated encoder worker below.
+        payload = bytes(msg.data)
+        if str(msg.encoding).lower() in {"jpeg", "jpg", "mjpeg"} and \
+                payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9"):
+            from sensor_msgs.msg import CompressedImage
+            output = CompressedImage()
+            output.header = msg.header
+            output.format = "jpeg"
+            output.data = payload
+            self.camera_publishers[key].publish(output)
+            self._record_stream(key, "published")
+            return
         if self.media_workers is not None:
             header = (msg.header.frame_id, msg.header.stamp.sec, msg.header.stamp.nanosec)
             submitted = self.media_workers.submit(
@@ -601,6 +616,16 @@ class S10Nodes:
         # from a different clock domain, so freshness is diagnostic-only here.
         if not already_received:
             self._record_stream(key, "received")
+        payload = bytes(msg.data)
+        if payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9"):
+            from sensor_msgs.msg import CompressedImage
+            output = CompressedImage()
+            output.header = msg.header
+            output.format = "jpeg"
+            output.data = payload
+            self.camera_publishers[key].publish(output)
+            self._record_stream(key, "published")
+            return
         if self.media_workers is not None:
             header = (msg.header.frame_id, msg.header.stamp.sec, msg.header.stamp.nanosec)
             submitted = self.media_workers.submit(key, (header, bytes(msg.data)))

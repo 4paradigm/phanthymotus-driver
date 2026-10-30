@@ -368,6 +368,28 @@ def test_camera_ros_image_encodes_to_frontend_jpeg(monkeypatch):
     assert encoded.startswith(b"\xff\xd8") and encoded.endswith(b"\xff\xd9")
 
 
+def test_vendor_mjpeg_image_is_published_without_worker_hop(monkeypatch):
+    device = _load_device(monkeypatch)
+    sensor_msg = ModuleType("sensor_msgs.msg")
+    sensor_msg.CompressedImage = type("CompressedImage", (), {"__init__": lambda self: None})
+    monkeypatch.setitem(__import__("sys").modules, "sensor_msgs.msg", sensor_msg)
+    nodes = device.S10Nodes.__new__(device.S10Nodes)
+    published = []
+    nodes.camera_publishers = {"camera_rear": SimpleNamespace(publish=published.append)}
+    nodes.media_workers = SimpleNamespace(submit=lambda *_args: (_ for _ in ()).throw(
+        AssertionError("valid MJPEG must bypass worker")))
+    nodes._stream_lock = threading.Lock()
+    nodes._source_topics = {"camera_rear": "/usb_camera_1/image_raw"}
+    nodes.topics = {"camera_rear": {"topic": "/host/lynx_s10/camera_rear"}}
+    nodes._stream_stats = {"camera_rear": {"received": 0, "published": 0, "dropped": 0,
+                                            "last_received": None, "last_published": None}}
+    msg = SimpleNamespace(encoding="jpeg", data=b"\xff\xd8jpeg\xff\xd9",
+                          header=SimpleNamespace(stamp=SimpleNamespace(sec=0, nanosec=0)))
+    nodes._forward_camera("camera_rear", msg)
+    assert len(published) == 1
+    assert published[0].data == msg.data
+
+
 def test_compressed_jpeg_is_downscaled_for_low_latency_preview(monkeypatch):
     _load_device(monkeypatch)
     import media_workers
