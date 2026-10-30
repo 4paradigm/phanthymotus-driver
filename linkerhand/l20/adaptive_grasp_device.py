@@ -186,8 +186,7 @@ class AdaptiveGraspPlugin:
             {
                 "bound_side": {
                     "type": "string",
-                    "enum": ["", "left", "right"],
-                    "default": "",
+                    "enum": ["left", "right"],
                     "description": "本次操作的灵巧手，必须选择左手或右手",
                 },
                 "instance_id": {"type": "string"},

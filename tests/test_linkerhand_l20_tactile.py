@@ -95,11 +95,16 @@ def test_tactile_tool_metadata(fake_hand):
     ]
 
     schema = tool_def["inputSchema"]
-    assert set(schema['properties']) == {'action', 'bound_side'}
-    assert set(tool_def['configSchema']['properties']) == {'can_channel', 'poll_hz'}
+    assert set(schema['properties']) == {'action'}
+    assert set(tool_def['configSchema']['properties']) == {'bound_side', 'can_channel', 'poll_hz'}
+    side = tool_def['configSchema']['properties']['bound_side']
+    assert side['scope'] == 'instance'
+    assert side['enum'] == ['left', 'right']
+    assert side['default'] == 'left'
     assert tool_def['configSchema']['properties']['can_channel']['scope'] == 'instance'
     assert "action" in schema["properties"]
-    assert set(schema["properties"]["action"]["enum"]) == {"info", "get_state", "start", "stop", "config"}
+    # Core hides sensor ACTION and execute controls when only lifecycle actions remain.
+    assert set(schema["properties"]["action"]["enum"]) == {"info", "start", "stop", "config"}
 
 
 def test_tactile_info_and_config(fake_hand):
@@ -364,6 +369,38 @@ def wait_for_stream(predicate):
     while not predicate() and time.monotonic() < end:
         time.sleep(.005)
     assert predicate()
+
+
+def test_gear_selection_starts_and_switches_stream_without_public_action(fake_hand, ros_runtime):
+    hand, _ = fake_hand
+    ros, published = ros_runtime
+    plugin = TactilePlugin(hand, {'poll_hz': 50, 'auto_start': False}, ros2=ros)
+    bundle = DriverBundle([plugin])
+    try:
+        # Core applies shared settings, then instance settings, then start with only its ID.
+        bundle.dispatch('hand_tactile', {'action': 'config', 'poll_hz': 50})
+        configured = bundle.dispatch('hand_tactile', {
+            'action': 'config', 'instance_id': 'sensor', 'bound_side': 'right', 'can_channel': 'can0',
+        })
+        assert configured['topic_out'] == [{'topic': '/hand/right/tactile', 'format': 'sensor/tactile'}]
+        assert not plugin._streams  # Saving settings does not start acquisition.
+        started = bundle.dispatch('hand_tactile', {'action': 'start', 'instance_id': 'sensor'})
+        assert started['stream_side'] == 'right'
+        wait_for_stream(lambda: any(frame['side'] == 'right' for frame in published))
+
+        # Changing the instance gear while running moves acquisition and its returned topic.
+        switched = bundle.dispatch('hand_tactile', {
+            'action': 'config', 'instance_id': 'sensor', 'bound_side': 'left',
+        })
+        assert switched['topic_out'] == [{'topic': '/hand/left/tactile', 'format': 'sensor/tactile'}]
+        assert set(plugin._streams) == {('left', 'can0')}
+        count = len(published)
+        wait_for_stream(lambda: len(published) > count)
+        assert all(frame['side'] == 'left' for frame in published[count:])
+        assert bundle.dispatch('hand_tactile', {'action': 'stop', 'instance_id': 'sensor'})['state'] == 'idle'
+        assert not plugin._streams
+    finally:
+        plugin.stop()
 
 
 def test_card_selection_moves_tactile_stream_to_right(fake_hand, ros_runtime):

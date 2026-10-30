@@ -113,18 +113,11 @@ class TactilePlugin:
         schema = action_schema(
             {
                 "info": ([], "获取触觉传感器卡片信息、当前绑定状态及 topic_out"),
-                "get_state": (["bound_side"], "应用所选左右手到当前采集流，并读取五指新鲜压力与完整阵列快照"),
                 "start": ([], "启动触觉数据后台连续采集与流式推送"),
                 "stop": ([], "停止触觉数据流推送"),
-                "config": (["bound_side"], "按提供的字段更新实例左右手／CAN 接口或共享采集频率"),
+                "config": ([], "按提供的字段更新实例左右手／CAN 接口或共享采集频率"),
             },
-            {
-                "bound_side": {
-                    "type": "string",
-                    "enum": ["left", "right"],
-                    "description": "选择本卡片实际采集的左手或右手，触觉数据流同步切换",
-                },
-            },
+            {},
         )
 
         definition = tool(
@@ -139,6 +132,14 @@ class TactilePlugin:
         definition["configSchema"] = {
             "type": "object",
             "properties": {
+                "bound_side": {
+                    "type": "string",
+                    "enum": ["left", "right"],
+                    "default": self.default_side,
+                    "scope": "instance",
+                    "title": "采集左右手",
+                    "description": "选择本卡片采集的左手或右手；启动智能控制后自动采集，切换后请重新打开数据流。",
+                },
                 "can_channel": {
                     "type": "string",
                     "default": self.default_channel,

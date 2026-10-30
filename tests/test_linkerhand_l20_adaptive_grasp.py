@@ -808,6 +808,8 @@ def test_user_card_settings_and_actions_keep_threshold_separate_from_speed():
     definition = plugin.get_tool()
     settings = definition['configSchema']['properties']
     schema = definition['inputSchema']
+    assert schema['properties']['bound_side']['enum'] == ['left', 'right']
+    assert 'default' not in schema['properties']['bound_side']
     assert set(settings) == {'motion_current', 'tactile_threshold'}
     assert settings['motion_current']['default'] == 230
     assert settings['tactile_threshold']['default'] == 15
