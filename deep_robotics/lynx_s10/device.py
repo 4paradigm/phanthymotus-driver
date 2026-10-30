@@ -83,7 +83,7 @@ class S10Nodes:
         import json
         import time
         from rclpy.node import Node
-        from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
         from drdds.msg import BatteryData, JointsData, MotionInfo
         from sensor_msgs.msg import CompressedImage, Image, Imu, PointCloud2
         from std_msgs.msg import String
@@ -106,12 +106,14 @@ class S10Nodes:
         # Firmware images have used both the USB-camera names and the
         # semantic front/rear/left/right names. Subscribe to all known
         # aliases; the first active source wins without blocking the others.
-        camera_topics = config.get("camera_topics", {
+        camera_topics = dict(config.get("camera_topics", {
             "camera_0": ["/camera/front/image_raw", "/camera_front/image_raw", "/usb_camera_1/image_raw"],
             "camera_1": ["/camera/rear/image_raw", "/camera_back/image_raw", "/usb_camera_1/image_raw_0"],
             "camera_2": ["/camera/left/image_raw", "/camera_left/image_raw", "/usb_camera_1/image_raw_1"],
             "camera_3": ["/camera/right/image_raw", "/camera_right/image_raw", "/usb_camera_1/image_raw_2"],
-        })
+        }))
+        for index in range(4):
+            camera_topics.setdefault(f"camera_{index}", [])
         self.topics.update({key: {"topic": base + key, "format": "image/jpeg"}
                             for key in camera_topics})
         self.publishers = {
@@ -138,11 +140,12 @@ class S10Nodes:
                     self.media_workers.add_camera(key)
             self.media_workers.add_lidar("lidar")
         topics = config.get("topics", {})
-        # The S10's native ROS publishers (including image and point-cloud
-        # topics) advertise RELIABLE/volatile. BEST_EFFORT subscriptions do
-        # not match those endpoints, so use a compatible profile throughout.
-        stream_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE,
+        # Sensor streams may publish best-effort; the sensor-data profile is
+        # compatible with both best-effort and reliable writers.
+        stream_qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
+                                reliability=ReliabilityPolicy.BEST_EFFORT,
                                 durability=DurabilityPolicy.VOLATILE)
+        self._sensor_qos = stream_qos
         self._stream_lock = threading.Lock()
         self._stream_stats = {
             name: {"received": 0, "published": 0, "dropped": 0,
@@ -169,22 +172,106 @@ class S10Nodes:
         lidar_topics = topics.get("lidar", "/LIDAR/POINTS")
         self._lidar_topics = [lidar_topics] if isinstance(lidar_topics, str) else list(lidar_topics)
         self._active_lidar_source = None
-        for source_topic in self._lidar_topics:
-            self.robot.create_subscription(
-                PointCloud2, source_topic,
-                lambda msg, source=source_topic: self._forward_lidar(source, msg), stream_qos)
-        for key, configured_topics in camera_topics.items():
-            source_topics = [configured_topics] if isinstance(configured_topics, str) else configured_topics
-            for source_topic in source_topics:
-                if source_topic.endswith("/compressed"):
-                    self.robot.create_subscription(CompressedImage, source_topic,
-                        lambda msg, camera=key: self._forward_compressed_camera(camera, msg),
-                        stream_qos)
-                else:
-                    self.robot.create_subscription(Image, source_topic,
-                        lambda msg, camera=key: self._forward_camera(camera, msg), stream_qos)
-            print(f"[ros2] {key} subscriptions created: {', '.join(source_topics)}", flush=True)
-        print(f"[ros2] lidar subscriptions created: {', '.join(self._lidar_topics)}", flush=True)
+        self._configured_camera_lanes = {
+            topic: key for key, values in camera_topics.items()
+            for topic in ([values] if isinstance(values, str) else values)
+        }
+        self._configured_lidar_topics = set(self._lidar_topics)
+        self._media_topic_subscriptions = set()
+        self._discovered_media = set()
+        self._media_subscriptions = []
+        self._camera_lane_sources = {}
+        self._scan_media_topics()
+        # Keep configured aliases as a compatibility fallback when a ROS graph
+        # implementation does not report publishers until after discovery.
+        for topic, key in self._configured_camera_lanes.items():
+            if topic in self._media_topic_subscriptions:
+                continue
+            msg_type = CompressedImage if topic.endswith("/compressed") else Image
+            if msg_type is CompressedImage:
+                callback = lambda msg, camera=key: self._forward_compressed_camera(camera, msg)
+            else:
+                callback = lambda msg, camera=key: self._forward_camera(camera, msg)
+            self._media_subscriptions.append(self.robot.create_subscription(
+                msg_type, topic, callback, self._sensor_qos))
+            self._media_topic_subscriptions.add(topic)
+            self._source_topics.setdefault(key, topic)
+        for topic in self._configured_lidar_topics:
+            if topic in self._media_topic_subscriptions:
+                continue
+            self._media_subscriptions.append(self.robot.create_subscription(
+                PointCloud2, topic,
+                lambda msg, source=topic: self._forward_lidar(source, msg), self._sensor_qos))
+            self._media_topic_subscriptions.add(topic)
+        print(f"[ros2] media subscriptions ready: cameras={sum(k.startswith('camera_') for k in self._camera_lane_sources)} "
+              f"lidar_topics={len(self._media_topic_subscriptions) - len(self._camera_lane_sources)}", flush=True)
+        if hasattr(self.robot, "create_timer"):
+            self._media_discovery_timer = self.robot.create_timer(2.0, self._scan_media_topics)
+
+    def _scan_media_topics(self):
+        """Discover actual image and point-cloud endpoints as robot nodes start."""
+        try:
+            discovered = self.robot.get_topic_names_and_types()
+        except (AttributeError, RuntimeError):
+            return
+        from sensor_msgs.msg import CompressedImage, Image, PointCloud2
+        for topic, type_names in discovered:
+            types = set(type_names)
+            if "sensor_msgs/msg/PointCloud2" in types and topic not in self._media_topic_subscriptions:
+                identity = (topic, "lidar")
+                if identity in self._discovered_media:
+                    continue
+                self._discovered_media.add(identity)
+                if topic not in self._lidar_topics:
+                    self._lidar_topics.append(topic)
+                self._source_topics["lidar"] = list(self._lidar_topics)
+                self._media_subscriptions.append(self.robot.create_subscription(
+                    PointCloud2, topic,
+                    lambda msg, source=topic: self._forward_lidar(source, msg), self._sensor_qos))
+                self._media_topic_subscriptions.add(topic)
+                print(f"[ros2] discovered point cloud subscription: {topic}", flush=True)
+                continue
+            msg_type = (CompressedImage if "sensor_msgs/msg/CompressedImage" in types else
+                        Image if "sensor_msgs/msg/Image" in types else None)
+            if msg_type is None:
+                continue
+            key = self._configured_camera_lanes.get(topic) or self._camera_key_for_topic(topic)
+            if key is None:
+                key = next((f"camera_{index}" for index in range(4)
+                            if f"camera_{index}" not in self._camera_lane_sources), None)
+            elif key in self._camera_lane_sources and self._camera_lane_sources[key] != topic:
+                print(f"[ros2] ignoring duplicate camera lane {key}: {topic}", flush=True)
+                continue
+            if key is None:
+                print(f"[ros2] ignoring extra camera topic (four lanes are occupied): {topic}", flush=True)
+                continue
+            identity = (topic, key)
+            if identity in self._discovered_media:
+                continue
+            self._discovered_media.add(identity)
+            if msg_type is CompressedImage:
+                callback = lambda msg, camera=key: self._forward_compressed_camera(camera, msg)
+            else:
+                callback = lambda msg, camera=key: self._forward_camera(camera, msg)
+            self._media_subscriptions.append(self.robot.create_subscription(
+                msg_type, topic, callback, self._sensor_qos))
+            self._media_topic_subscriptions.add(topic)
+            self._source_topics[key] = topic
+            self._camera_lane_sources[key] = topic
+            print(f"[ros2] discovered {key} subscription: {topic} ({msg_type.__name__})", flush=True)
+
+    @staticmethod
+    def _camera_key_for_topic(topic):
+        name = topic.lower()
+        import re
+        tokens = set(filter(None, re.split(r"[^a-z0-9]+", name)))
+        for directions, key in ((("front", "forward"), "camera_0"),
+                                (("rear", "back", "backward"), "camera_1"),
+                                (("left",), "camera_2"),
+                                (("right",), "camera_3")):
+            if tokens.intersection(directions):
+                return key
+        return None
 
     def _record_stream(self, key, stage):
         now = time.time()
@@ -286,33 +373,30 @@ class S10Nodes:
         # arrays such as battery_serialnum contain reserved zero entries;
         # retain those as one compact field instead of expanding them into
         # dozens of dashboard values.
-        payload = {"batteries": {}}
+        payload = {}
+        zero_placeholders = {}
         for index, battery in enumerate(slots):
             if not isinstance(battery, dict):
-                payload["batteries"][f"battery_{index}"] = (
-                    {"all_zero_placeholder": True} if _all_zero_placeholder(battery) else battery)
+                if _all_zero_placeholder(battery):
+                    zero_placeholders[f"battery_{index}"] = {"all_zero": True}
+                else:
+                    payload[f"battery_{index}"] = {"value": battery}
                 continue
             if _all_zero_placeholder(battery):
-                payload["batteries"][f"battery_{index}"] = {"all_zero_placeholder": True}
+                zero_placeholders[f"battery_{index}"] = {"all_zero": True}
                 continue
-            compact = {}
-            placeholders = {}
+            pack = {}
             for field, value in battery.items():
                 if isinstance(value, (list, tuple)) and value and all(
                         _all_zero_placeholder(item) for item in value):
-                    placeholders[field] = {"all_zero": True, "length": len(value)}
+                    zero_placeholders[f"battery_{index}_{field}"] = {
+                        "all_zero": True, "length": len(value)}
                 else:
-                    compact[field] = value
-            if placeholders:
-                compact["zero_placeholder_fields"] = placeholders
-            if compact and any(not _all_zero_placeholder(value)
-                               for key, value in compact.items()
-                               if key != "zero_placeholder_fields"):
-                payload["batteries"][f"battery_{index}"] = compact
-            elif compact:
-                payload["batteries"][f"battery_{index}"] = compact
-            else:
-                payload.setdefault("zero_placeholder_slots", []).append(index)
+                    pack[field] = value
+            if pack:
+                payload[f"battery_{index}"] = pack
+        if zero_placeholders:
+            payload["zero_placeholders"] = zero_placeholders
         self._publish_json("battery", payload)
 
     def _forward_loco_state(self, msg):
@@ -1130,32 +1214,24 @@ LIGHT_CYCLIC_EFFECTS = {name: LIGHT_EFFECTS[name] for name in ("呼吸", "闪烁
 
 class S10LightPlugin:
     ACTIONS = {
-        "set": (["head_color", "tail_color", "head_effect", "tail_effect"],
-                "设置头灯和尾灯颜色与非周期灯效"),
-        "set_head_periodic": (["head_color", "tail_color", "head_periodic_effect",
-                               "tail_effect", "head_cycle_seconds"],
-                              "设置头灯呼吸/闪烁，并设置尾灯非周期灯效"),
-        "set_tail_periodic": (["head_color", "tail_color", "head_effect",
-                               "tail_periodic_effect", "tail_cycle_seconds"],
-                              "设置尾灯呼吸/闪烁，并设置头灯非周期灯效"),
-        "set_both_periodic": (["head_color", "tail_color", "head_periodic_effect",
-                               "tail_periodic_effect", "head_cycle_seconds",
-                               "tail_cycle_seconds"], "设置头灯和尾灯呼吸/闪烁及各自周期"),
+        "set": (["head_color", "tail_color", "head_effect", "tail_effect",
+                 "head_cycle_seconds", "tail_cycle_seconds"],
+                "设置头尾灯颜色和效果；呼吸或闪烁时才设置周期"),
     }
 
     def __init__(self, native): self.native = native
     def get_tool(self):
-        result = tool("light", "actuator", "山猫 S10 头尾灯控制。固件仅支持黑、白、绿、蓝四种颜色，不支持自定义 RGB。常规灯效使用 set；需要呼吸或闪烁时选择对应 periodic 动作，周期字段只会在该动作下显示。", action_schema(self.ACTIONS, {
+        result = tool("light", "actuator", "山猫 S10 头尾灯控制。固件仅支持黑、白、绿、蓝四种颜色，不支持自定义 RGB。选择呼吸或闪烁时才会显示并使用对应周期。", action_schema(self.ACTIONS, {
             "head_color": {"type": "string", "enum": list(LIGHT_COLORS), "default": "白色", "description": "头灯颜色"},
             "tail_color": {"type": "string", "enum": list(LIGHT_COLORS), "default": "白色", "description": "尾灯颜色"},
-            "head_effect": {"type": "string", "enum": list(LIGHT_STATIC_EFFECTS), "default": "常亮", "description": "头灯非周期效果"},
-            "tail_effect": {"type": "string", "enum": list(LIGHT_STATIC_EFFECTS), "default": "常亮", "description": "尾灯非周期效果"},
-            "head_periodic_effect": {"type": "string", "enum": list(LIGHT_CYCLIC_EFFECTS), "default": "呼吸", "description": "头灯周期效果"},
-            "tail_periodic_effect": {"type": "string", "enum": list(LIGHT_CYCLIC_EFFECTS), "default": "呼吸", "description": "尾灯周期效果"},
+            "head_effect": {"type": "string", "enum": list(LIGHT_EFFECTS), "default": "常亮", "description": "头灯效果"},
+            "tail_effect": {"type": "string", "enum": list(LIGHT_EFFECTS), "default": "常亮", "description": "尾灯效果"},
             "head_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
-                                    "description": "头灯呼吸/闪烁周期（秒）"},
+                                    "description": "头灯呼吸/闪烁周期（秒）",
+                                    "x-show-when": {"head_effect": ["呼吸", "闪烁"]}},
             "tail_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
-                                    "description": "尾灯呼吸/闪烁周期（秒）"},
+                                    "description": "尾灯呼吸/闪烁周期（秒）",
+                                    "x-show-when": {"tail_effect": ["呼吸", "闪烁"]}},
         }))
         return result
     def start(self): pass
@@ -1164,15 +1240,13 @@ class S10LightPlugin:
         if action == "start": return {"state": "ready"}
         if action == "stop": return {"state": "idle"}
         if action == "info": return {"state": "ready"}
-        if action in self.ACTIONS and action.startswith("set"):
+        if action == "set":
             leds = []
             for side in ("head", "tail"):
-                effect_name = (args.get(f"{side}_periodic_effect", "呼吸")
-                               if action in (f"set_{side}_periodic", "set_both_periodic")
-                               else args.get(f"{side}_effect", "常亮"))
-                if action == "set" and effect_name not in LIGHT_STATIC_EFFECTS:
+                effect_name = args.get(f"{side}_effect", "常亮")
+                if effect_name not in LIGHT_EFFECTS:
                     return {"ok": False, "code": "INVALID_ARGUMENT",
-                            "error": "Use a periodic light action for 呼吸/闪烁"}
+                            "error": f"unsupported {side}_effect"}
                 led = {
                     "Type": LIGHT_EFFECTS[effect_name],
                     "Color": [LIGHT_COLORS[args.get(f"{side}_color", "白色")]],

@@ -104,12 +104,13 @@ def _worker(jobs, results, kind, lane):
         if job is None:
             return
         try:
-            if kind == "camera":
-                header, width, height, step, encoding, data = job
-                packet = _jpeg(width, height, step, encoding, data)
-            elif kind == "compressed_camera":
-                header, data = job
-                packet = _reencode_jpeg(data)
+            if kind in ("camera", "compressed_camera"):
+                if len(job) == 2:
+                    header, data = job
+                    packet = _reencode_jpeg(data)
+                else:
+                    header, width, height, step, encoding, data = job
+                    packet = _jpeg(width, height, step, encoding, data)
             else:
                 header, fields, bigendian, width, height, row_step, point_step, data = job
                 packet = encode_pointcloud(fields, bigendian, width, height, row_step,

@@ -161,7 +161,16 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
             self.subscriptions[topic] = callback
 
         def create_timer(self, *_args):
-            raise AssertionError("S10 stream forwarding must be source-driven, not polled")
+            return object()
+
+        def get_topic_names_and_types(self):
+            return [
+                ("/s10/front/image", ["sensor_msgs/msg/Image"]),
+                ("/s10/rear/image/compressed", ["sensor_msgs/msg/CompressedImage"]),
+                ("/s10/left/image", ["sensor_msgs/msg/Image"]),
+                ("/s10/right/image", ["sensor_msgs/msg/Image"]),
+                ("/s10/depth", ["sensor_msgs/msg/PointCloud2"]),
+            ]
 
         def destroy_node(self):
             pass
@@ -196,12 +205,16 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     qos_module.qos_profile_sensor_data = object()
     class ReliabilityPolicy:
         RELIABLE = 1
+        BEST_EFFORT = 2
     class DurabilityPolicy:
         VOLATILE = 2
+    class HistoryPolicy:
+        KEEP_LAST = 1
     class QoSProfile:
         def __init__(self, **kwargs): self.kwargs = kwargs
     qos_module.ReliabilityPolicy = ReliabilityPolicy
     qos_module.DurabilityPolicy = DurabilityPolicy
+    qos_module.HistoryPolicy = HistoryPolicy
     qos_module.QoSProfile = QoSProfile
     sensor_msg = ModuleType("sensor_msgs.msg")
     sensor_msg.Imu, sensor_msg.PointCloud2 = Imu, PointCloud2
@@ -260,11 +273,13 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
                         serial=[0, 0, 0], battery_level=87),
     ]))
     battery = json.loads(nodes.publishers["battery"].messages[-1].data)
-    assert battery["batteries"] == {
-        "battery_0": {"all_zero_placeholder": True},
-        "battery_1": {"voltage": 52000, "current": 0, "cells": [3700, 3800],
-                       "battery_level": 87,
-                       "zero_placeholder_fields": {"serial": {"all_zero": True, "length": 3}}},
+    assert battery == {
+        "battery_1": {"voltage": 52000, "current": 0,
+                      "cells": [3700, 3800], "battery_level": 87},
+        "zero_placeholders": {
+            "battery_0": {"all_zero": True},
+            "battery_1_serial": {"all_zero": True, "length": 3},
+        },
     }
 
     callbacks["/MOTION_INFO"](SimpleNamespace(data=SimpleNamespace(vel_x=0.3, vel_y=0.0)))
@@ -296,6 +311,14 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert stream_status["joints"]["received"] == stream_status["joint_state"]["received"] == 1
     assert stream_status["lidar"]["received"] == stream_status["lidar"]["published"] == 1
     assert stream_status["camera_0"]["received"] == stream_status["camera_0"]["published"] == 1
+    assert "/s10/front/image" in nodes.robot.subscriptions
+    assert nodes._source_topics["camera_0"] == "/s10/front/image"
+    assert nodes._source_topics["camera_1"] == "/s10/rear/image/compressed"
+    assert nodes._source_topics["camera_2"] == "/s10/left/image"
+    assert nodes._source_topics["camera_3"] == "/s10/right/image"
+    assert "/s10/depth" in nodes.robot.subscriptions
+    assert nodes._sensor_qos.kwargs == {
+        "depth": 1, "history": 1, "reliability": 2, "durability": 2}
     nodes.close()
 
 
@@ -922,15 +945,13 @@ def test_control_schema_exposes_supported_navigation_and_light_options(monkeypat
     assert set(nav_params) == {"x", "y", "z", "yaw_degrees", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous", "confirm"}
     assert set(localize_params) == {"x", "y", "z", "yaw_degrees", "confirm"}
     assert {"head_color", "tail_color", "head_effect", "tail_effect"} <= set(light_params)
-    assert "head_cycle_seconds" not in light_params
-    assert "head_cycle_seconds" in actions["set_head_periodic"]["params"]
-    assert "tail_cycle_seconds" in actions["set_tail_periodic"]["params"]
-    assert "head_cycle_seconds" in actions["set_both_periodic"]["params"]
-    assert "tail_cycle_seconds" in actions["set_both_periodic"]["params"]
+    assert set(actions) == {"set"}
+    assert {"head_cycle_seconds", "tail_cycle_seconds"} <= set(light_params)
     assert light_tool["name"] == "light"
     properties = light_tool["inputSchema"]["properties"]
-    assert properties["head_periodic_effect"]["enum"] == ["呼吸", "闪烁"]
-    assert properties["head_effect"]["enum"] == ["常亮", "填充流水", "移动流水", "渐变流水"]
+    assert properties["head_effect"]["enum"] == list(device.LIGHT_EFFECTS)
+    assert properties["head_cycle_seconds"]["x-show-when"] == {
+        "head_effect": ["呼吸", "闪烁"]}
 
     charge_schema = device.S10ChargePlugin(native).get_tool()["inputSchema"]
     assert charge_schema["x-is-dangerous"] is True
@@ -942,9 +963,9 @@ def test_light_uses_named_colors_and_effects_in_native_protocol(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
     plugin = device.S10LightPlugin(native)
-    plugin.dispatch("set_both_periodic", {"head_color": "绿色", "tail_color": "蓝色",
-                                           "head_periodic_effect": "呼吸",
-                                           "tail_periodic_effect": "闪烁",
+    plugin.dispatch("set", {"head_color": "绿色", "tail_color": "蓝色",
+                                           "head_effect": "呼吸",
+                                           "tail_effect": "闪烁",
                                            "head_cycle_seconds": 3, "tail_cycle_seconds": 2})
 
     assert native.calls[-1][0] == (0x00100005, 0x00200002, {
@@ -977,11 +998,11 @@ def test_light_constant_effect_omits_cycle_from_native_payload(monkeypatch):
     assert "Cycle" not in leds[1]
 
 
-def test_light_periodic_action_can_mix_static_and_cyclic_side(monkeypatch):
+def test_light_single_action_can_mix_static_and_cyclic_side(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
-    device.S10LightPlugin(native).dispatch("set_head_periodic", {
-        "head_periodic_effect": "闪烁", "head_cycle_seconds": 4,
+    device.S10LightPlugin(native).dispatch("set", {
+        "head_effect": "闪烁", "head_cycle_seconds": 4,
         "tail_effect": "常亮",
     })
     leds = native.calls[-1][0][2]["Led"]
