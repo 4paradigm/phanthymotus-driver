@@ -1088,8 +1088,65 @@ def test_bad_glove_frames_are_rejected(change):
         glove.GloveTeleopPlugin.parse_frame(json.dumps(data).encode())
 
 
+def test_udp_reader_status_is_sanitized_before_watchdog_logging(capsys):
+    device, _, _ = plugin()
+    device.source_mode = "direct_udp"
+    poison = "\nFORGED\x00\x1b[31m"*80
+    payload = json.dumps({
+        "state": "waiting_for_glove", "idle_seconds": 2.5, "unknown": "X"*500,
+        "diagnostics": {"left": {"status": poison, "sequence": 7,
+                                  "unknown": "SECRET_FIELD"},
+                        "unexpected": {"status": "SECRET_FIELD"}},
+    }).encode()
+    assert len(payload) <= 4096
+
+    class Receiver:
+        used = False
+        def recvfrom(self, _size):
+            if not self.used:
+                self.used = True
+                return payload, (device.source_ip, 1234)
+            device._shutdown.set()
+            raise OSError("done")
+
+    device._armed = True
+    device._active_sides = ["left"]
+    device._side_received = {"left": time.monotonic()-1}
+    device._receive_loop(Receiver())
+    status = device._last_watchdog_event["reader_status"]
+    assert status["idle_seconds"] == 2.5
+    assert status["diagnostics"]["left"]["sequence"] == 7
+    assert set(status["diagnostics"]) == {"left"}
+    assert "unknown" not in device._reader_status
+    line = capsys.readouterr().out.strip()
+    assert line.startswith("[glove-watchdog] ") and len(line.encode()) < 2048
+    assert "SECRET_FIELD" not in line and "X"*100 not in line
+    assert all(32 <= ord(c) < 127 for c in line)
+    json.loads(line.removeprefix("[glove-watchdog] "))
+
+
+def test_watchdog_also_sanitizes_preexisting_status_and_drops_nonfinite_values(capsys):
+    device, _, _ = plugin()
+    device._reader_status = {
+        "state": "connected", "idle_seconds": float("inf"), "observed_at_ms": 10**200,
+        "extra": "NOT_LOGGED"*10000,
+        "diagnostics": {"right": {"status": "\n\x1b界"*10000, "sequence": 10**200}},
+    }
+    device._armed = True
+    device._active_sides = ["right"]
+    device._side_received = {"right": 0}
+    device._tick_watchdog(now=1)
+    event = device._last_watchdog_event
+    assert "idle_seconds" not in event["reader_status"]
+    assert "observed_at_ms" not in event["reader_status"]
+    assert "sequence" not in event["reader_status"]["diagnostics"]["right"]
+    line = capsys.readouterr().out.strip()
+    assert len(line.encode()) < 2048 and "NOT_LOGGED" not in line
+    assert all(32 <= ord(c) < 127 for c in line)
+
+
 @pytest.mark.parametrize("outcome", ["completed", "error", "cancelled", "callback_failure"])
-def test_arm_dispatch_is_async_and_reports_one_terminal_completion(monkeypatch, outcome):
+def test_arm_dispatch_is_async_and_reports_one_terminal_completion(monkeypatch, capsys, outcome):
     device, hand, _ = plugin()
     schema = device.get_tools()[0]["inputSchema"]
     assert schema["x-completion"] == {"actions": ["arm"], "timeout": 60}
@@ -1110,7 +1167,7 @@ def test_arm_dispatch_is_async_and_reports_one_terminal_completion(monkeypatch, 
         reports.append((action_id, status, result))
         completed.set()
         if outcome == "callback_failure":
-            raise OSError("Core unavailable")
+            raise OSError("Core unavailable\nFORGED\r\x00\x1b[31m" + "界"*10000)
 
     hand._discover = discover
     monkeypatch.setattr(device, "_acp_callback", callback)
@@ -1135,6 +1192,11 @@ def test_arm_dispatch_is_async_and_reports_one_terminal_completion(monkeypatch, 
             assert all(("torque", [0]*10) in c.commands for c in clients.values())
             with pytest.raises(RuntimeError, match="ACP"):
                 device.dispatch("arm", {"confirm_motion": True})
+            acp = [line for line in capsys.readouterr().out.splitlines() if line.startswith("[ACP]")]
+            assert len(acp) == 1 and len(acp[0]) < 300
+            assert all(32 <= ord(c) < 127 for c in acp[0])
+            assert "\\nFORGED" in acp[0]
+            assert len(device._last_arm_result["callback_error"]) <= 200
         else:
             wait_for(lambda: device._arm_action is None)
             assert reports[0][1] == outcome

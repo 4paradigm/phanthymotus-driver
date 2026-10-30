@@ -37,6 +37,41 @@ FORMAT = "sensor/skeleton"
 SCHEMA = "linker.stroke10.flat.v1"
 
 
+def _log_text(value, limit=200):
+    # Same escaping policy as vendor_runtime's remote HTTP request logging.
+    # Limit before encoding too, so a huge value cannot amplify this operation.
+    return str(value)[:limit].encode("unicode_escape").decode("ascii")[:limit]
+
+
+def _reader_log_status(status):
+    """Fixed-size diagnostic summary; never serialize arbitrary reader fields."""
+    if not isinstance(status, dict):
+        return None
+    result = {}
+    if status.get("state") in ("connected", "waiting_for_glove", "streaming"):
+        result["state"] = status["state"]
+    for key in ("idle_seconds", "observed_at_ms", "sample_timestamp_ms"):
+        value = status.get(key)
+        if type(value) in (int, float) and 0 <= value <= 1e15 and math.isfinite(value):
+            result[key] = value
+    diagnostics = status.get("diagnostics")
+    if isinstance(diagnostics, dict):
+        result["diagnostics"] = {}
+        for side in ("left", "right"):
+            raw = diagnostics.get(side)
+            if not isinstance(raw, dict):
+                continue
+            entry = {}
+            for key in ("status", "frame_marker", "layout", "backend"):
+                if isinstance(raw.get(key), str):
+                    entry[key] = _log_text(raw[key], 64)
+            sequence = raw.get("sequence")
+            if type(sequence) is int and 0 <= sequence <= 255:
+                entry["sequence"] = sequence
+            result["diagnostics"][side] = entry
+    return result
+
+
 class SkeletonPublisher:
     def __init__(self, ros2, topic):
         from rclpy.node import Node
@@ -1093,13 +1128,13 @@ class GloveTeleopPlugin:
         except Exception as exc:
             with self._lock:
                 self._arm_completion_failed = True
-                terminal["callback_error"] = str(exc)
+                terminal["callback_error"] = _log_text(exc)
             # Core cannot confirm ownership: do not leave streaming torque enabled.
             try:
                 self._disarm()
             except Exception as cleanup_error:
-                terminal["cleanup_error"] = str(cleanup_error)
-            print(f"[ACP] {active['action_id']}: {exc}", flush=True)
+                terminal["cleanup_error"] = _log_text(cleanup_error)
+            print(f"[ACP] {active['action_id']}: {_log_text(exc)}", flush=True)
         finally:
             with self._lock:
                 if self._arm_action is active:
@@ -1119,7 +1154,7 @@ class GloveTeleopPlugin:
                 self._acp_callback(terminal["action_id"], terminal["status"], terminal["result"])
             except Exception as exc:
                 with self._lock:
-                    terminal["callback_error"] = str(exc)
+                    terminal["callback_error"] = _log_text(exc)
             else:
                 with self._lock:
                     self._arm_completion_failed = False
@@ -1257,7 +1292,7 @@ class GloveTeleopPlugin:
                         elif sample.get("state") in ("connected", "waiting_for_glove"):
                             with self._lock:
                                 self._reader_status = {
-                                    **sample,
+                                    **_reader_log_status(sample),
                                     "observed_at_ms": int(time.time() * 1000),
                                 }
                 else:
@@ -1295,7 +1330,7 @@ class GloveTeleopPlugin:
                         else None
                     ),
                     "timing": dict(self._timing),
-                    "reader_status": self._reader_status,
+                    "reader_status": _reader_log_status(self._reader_status),
                 }
                 self._error = "glove stream timed out"
                 self._request_disarm_locked()
@@ -1332,7 +1367,7 @@ class GloveTeleopPlugin:
                         elif sample.get("state") in ("connected", "waiting_for_glove"):
                             with self._lock:
                                 self._reader_status = {
-                                    **sample,
+                                    **_reader_log_status(sample),
                                     "observed_at_ms": int(time.time() * 1000),
                                 }
                     except Exception as exc:
