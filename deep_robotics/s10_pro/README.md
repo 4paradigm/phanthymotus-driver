@@ -13,11 +13,10 @@ a second action is rejected as busy while the first is running.
 
 - `start` activates read-only feedback and returns `{"state":"ready"}`.
   This is a lifecycle marker, not proof that a specific movement is available.
-  With automatic navigation enabled, standing feedback can subsequently trigger mode 17.
 - `stop` cancels the current action, returns `{"state":"idle"}` immediately and
   releases observation once the action worker finishes stopping.
 - `info`/`status` read current blockers. Inspect `readiness.actions.move` for
-  movement, separately from posture readiness. Starting the card never sends velocity.
+  movement, separately from posture readiness. Starting a card sends no command.
 - `stand_up` requests state 1 only when idle, confirms standing, then requests
   move mode 17. An already-ready state 17 needs no posture publication.
 - `sit_down` requests state 4 and waits for final idle state 0.
@@ -41,28 +40,6 @@ feedback. Small residual velocity can use independently stationary odometry;
 see [stationary confirmation](deploy/STOP_DIAGNOSTICS.md).
 Application cancellation is not a hardware emergency stop. Failed tasks are not
 automatically replayed; later requests use current conditions.
-
-## Automatic navigation after card start
-
-`motion.auto_navigation` defaults to true. Starting the motion card begins a
-read-only standing check. When fresh telemetry confirms stationary standing
-state 1 and the current joint/fault/e-stop checks pass, the controller requests
-only mode 17. In idle/lying state 0 it waits for the operator to stand the robot;
-it never sends a stand command on its own. No velocity or gait command is sent.
-Already being in mode 17 is a no-op. Disable this feature with
-`auto_navigation: false`; stopping the card stops the background check.
-
-Automatic navigation shares the same active-action slot and transport lock as
-manual locomotion, so it cannot write across a manual action. A failed transition
-is not repeatedly sent while the same standing episode persists. Inspect
-`readiness.automatic_navigation` for waiting, transitioning, ready or error state.
-
-If standing is already confirmed when `start` is dispatched, its immediate
-`ready` response also returns the transition's unique `action_id`; `start` is
-listed in `x-completion` and the worker posts its terminal ACP result. If the
-robot stands later, the background transition has no dispatched Core call and
-is reported in status rather than fabricating an ACP pending action. Driver-side
-arbitration still excludes conflicting commands; `x-resource` alone is not a lock.
 
 ## ACP
 
@@ -104,8 +81,7 @@ The image contains generated `drdds` interfaces from licensed text sources;
 message generators stay in the build stage. No Core code is patched.
 
 The Driver starts with cards idle. Follow the canvas lifecycle to start
-observation. After motion-card start the optional automatic navigation behavior
-described above can send mode 17 from standing, but never a stand or velocity command. During upgrades preserve
+observation; no startup posture or velocity is sent. During upgrades preserve
 old containers/images and current site configuration for rollback. Removal of
 source-side policies/outboxes does not authorize deleting their site backups.
 

@@ -25,7 +25,9 @@ def build_runtime_plugins(config, namespace, bridge, publish, *, motion_bridge=N
     if os.environ.get('S10_EXECUTION_AUTHORIZATION_FILE'):
         logging.warning('Legacy execution mode ignored; motion disabled, monitors available')
         host_enabled = False
-    motion_plugin = LocoMovePlugin(config.get('motion', {}), namespace,
+    motion_config = dict(config.get('motion', {}))
+    motion_config.pop('auto_navigation', None)  # Ignore the removed option in existing site files.
+    motion_plugin = LocoMovePlugin(motion_config, namespace,
         motion_bridge or bridge, lambda: DDSProcessTransport(config, execution_enabled=host_enabled),
         host_enabled=host_enabled)
     plugins = build_plugins(config, namespace, bridge, publish, motion=motion_plugin,

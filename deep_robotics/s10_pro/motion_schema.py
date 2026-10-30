@@ -43,7 +43,7 @@ def tools(config_schema, relative_topic):
                 'move': {'params': ['direction', 'speed', 'duration'], 'description': 'Move for a bounded duration, then confirm stopping.'},
                 'stop_move': {'params': [], 'description': 'Cancel the current action and stop active velocity output.'}},
             'x-resource': 'base', 'x-completion': {
-                'actions': ['stand_up', 'sit_down', 'move', 'stand_down', 'sitdown', 'start'], 'timeout': 20}},
+                'actions': ['stand_up', 'sit_down', 'move', 'stand_down', 'sitdown'], 'timeout': 20}},
         'configSchema': copy.deepcopy(config_schema), 'topic_in': [], 'topic_out': []}
     relative = {'name': 'relative_move', 'title': 'S10 Relative Movement', 'type': 'actuator', 'multiInstance': False,
         'description': 'Reach a relative distance or angle using odometry, then confirm stopping.',

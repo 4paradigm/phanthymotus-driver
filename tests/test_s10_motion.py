@@ -105,7 +105,7 @@ def rig():
     bridge = Bridge()
     transport = Transport(bridge)
     callbacks = []
-    p = LocoMovePlugin({'enabled': True, 'action_timeout_s': 8., 'auto_navigation': False}, 'test', bridge,
+    p = LocoMovePlugin({'enabled': True, 'action_timeout_s': 8.}, 'test', bridge,
                       lambda: transport, callback=lambda *args: callbacks.append(args))
     assert p.start() == {'state': 'ready'}
     yield p, bridge, transport, callbacks
@@ -279,7 +279,8 @@ def test_fault_during_move_stops_output(rig):
     assert 'fault' in result['reason'] and t.velocities[-1] == (0., 0., 0.)
 
 
-def test_legacy_execution_environment_only_disables_motion(monkeypatch):
+@pytest.mark.parametrize('removed_option', [{}, {'auto_navigation': False}])
+def test_legacy_execution_environment_only_disables_motion(monkeypatch, removed_option):
     import importlib.util
     import sys
     path = Path(__file__).resolve().parents[1] / 'deep_robotics/s10_pro/main.py'
@@ -288,7 +289,7 @@ def test_legacy_execution_environment_only_disables_motion(monkeypatch):
     spec = importlib.util.spec_from_file_location('s10_main_degraded', path)
     module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
     bridge = Bridge()
-    plugins = module.build_runtime_plugins({'motion': {'enabled': True}}, 'test', bridge, lambda *a: None)
+    plugins = module.build_runtime_plugins({'motion': {'enabled': True, **removed_option}}, 'test', bridge, lambda *a: None)
     try:
         assert len(plugins) == 6 and not plugins[-1]._host_enabled
         assert not bridge.owners
@@ -367,61 +368,3 @@ def test_acp_failure_does_not_retry_or_change_motion_result(rig):
     p.execute('move', {'direction': 'forward', 'speed': .1, 'duration': .5})
     assert wait(p)['completed'] and len(attempts) == 1
     assert p._active is None
-
-
-def until(predicate, seconds=4):
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        if predicate(): return
-        time.sleep(.02)
-    raise AssertionError('condition was not reached')
-
-
-def test_auto_navigation_waits_for_manual_stand_and_sends_only_17(rig):
-    p, b, t, callbacks = rig
-    p.stop(); b.state = 0
-    p._settings['auto_navigation'] = True
-    assert p.start()['state'] == 'ready'
-    time.sleep(.4)
-    assert not t.states and not t.velocities
-    assert p._automatic_navigation['state'] == 'waiting_for_manual_stand'
-    b.state = 1
-    until(lambda: b.state == 17 and p._active is None)
-    assert t.states == [17] and not t.velocities
-    assert p._automatic_navigation['state'] == 'navigation_ready'
-    assert not callbacks  # No original Core call is pending for a later background transition.
-
-
-def test_auto_navigation_respects_faults_and_card_stop(rig):
-    p, b, t, callbacks = rig
-    p.stop(); b.state = 1; b.faults = [{'code': 1}]
-    p._settings['auto_navigation'] = True
-    p.start(); time.sleep(.4)
-    assert not t.states
-    p.stop(); b.faults = []
-    time.sleep(.4)
-    assert not t.states and not t.velocities
-    assert p._automatic_navigation['state'] == 'idle'
-
-
-def test_auto_navigation_does_not_compete_with_manual_action(rig):
-    p, b, t, callbacks = rig
-    p._settings['auto_navigation'] = True
-    p.execute('sit_down', {})
-    until(lambda: p._active is None)
-    time.sleep(.3)
-    assert b.state == 0 and t.states == [4] and len(callbacks) == 1
-
-
-def test_start_transition_returns_acp_id_if_standing_is_already_confirmed(rig):
-    p, b, t, callbacks = rig
-    p.stop(); b.state = 1
-    p._settings['auto_navigation'] = True
-    # Pre-existing shared feedback can already establish a stable window.
-    for _ in range(5):
-        p._stationary_status((1,)); time.sleep(.1)
-    reply = p.start()
-    assert reply['state'] == 'ready' and reply.get('action_id')
-    until(lambda: p._active is None)
-    assert t.states == [17] and not t.velocities
-    assert len(callbacks) == 1 and callbacks[0][0] == reply['action_id']

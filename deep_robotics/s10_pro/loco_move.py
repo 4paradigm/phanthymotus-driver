@@ -56,10 +56,6 @@ class LocoMovePlugin:
         self._history = OrderedDict()
         self._stationary = StationaryWindow(clock=clock)
         self._channel = {}
-        self._navigation_stop = threading.Event()
-        self._navigation_thread = None
-        self._navigation_attempted = False
-        self._automatic_navigation = {'state': 'idle', 'physical_command_sent': False}
         self._relative_topic = '/' + '/'.join(p for p in (namespace.strip('/'), 's10_pro', 'relative_move_status') if p)
 
     def get_tools(self):
@@ -162,58 +158,12 @@ class LocoMovePlugin:
                 return {'state': 'idle'}
             self._bridge.acquire('s10_motion', {'motion_info', 'hard_estop', 'joints', 'fault_aggregator', 'odometry'},
                                  {'refresh_hz': 10., 'stale_after_s': 2.})
-            if self._started:
-                return {'state': 'ready'}
             self._started = True
-            self._navigation_stop = threading.Event()
-            self._navigation_attempted = False
-            # If standing is already known, return the accepted transition ID
-            # so Core can track this start-triggered action through normal ACP.
-            transition = self._maybe_enter_navigation(notify=True)
-            self._navigation_thread = threading.Thread(target=self._navigation_loop,
-                args=(self._navigation_stop,), name='s10-auto-navigation', daemon=True)
-            self._navigation_thread.start()
-            return {'state': 'ready', **transition}
-
-    def _maybe_enter_navigation(self, *, notify=False):
-        if not self._settings['auto_navigation'] or not self._started or self._closed:
-            self._automatic_navigation = {'state': 'disabled'}
-            return {}
-        if self._active:
-            return {}
-        state = self._observe()['motion_state']
-        if state == 0:
-            self._navigation_attempted = False
-            self._automatic_navigation = {'state': 'waiting_for_manual_stand'}
-        elif state == 17:
-            self._navigation_attempted = False
-            self._automatic_navigation = {'state': 'navigation_ready'}
-        elif state == 1 and not self._navigation_attempted:
-            blocked = self._blockers(states=(1,))
-            self._automatic_navigation = {'state': 'waiting_for_standing_feedback', 'blocked_by': blocked}
-            if not blocked:
-                reply = self.execute('enter_navigation', {}, notify=notify)
-                if reply.get('accepted'):
-                    self._navigation_attempted = True
-                    self._automatic_navigation = {'state': 'entering_navigation'}
-                    return {'action_id': reply['action_id']} if notify else {}
-        return {}
-
-    def _navigation_loop(self, stopped):
-        while not stopped.wait(.1):
-            with self._lock:
-                if stopped.is_set() or not self._started or self._closed:
-                    return
-                try:
-                    self._maybe_enter_navigation()
-                except Exception as error:
-                    self._automatic_navigation = {'state': 'unavailable', 'reason': type(error).__name__}
+        return {'state': 'ready'}
 
     def stop(self):
         with self._lock:
             self._started = False
-            self._navigation_stop.set()
-            self._automatic_navigation = {'state': 'idle'}
             self._cancel.set()
             idle = self._active is None
         if idle:
@@ -223,8 +173,6 @@ class LocoMovePlugin:
     def close(self):
         self._closed = True
         self.stop()
-        if self._navigation_thread is not None:
-            self._navigation_thread.join(1.)
         if self._worker is not None:
             self._worker.join(3.)
         if self._transport is not None:
@@ -253,8 +201,7 @@ class LocoMovePlugin:
                 'last_result': copy.deepcopy(self._last),
                 'readiness': {'ready': not blocked and not self._active, 'blocked_by': blocked,
                     'actions': actions, 'motion_state': self._observe()['motion_state'],
-                    'stationary_check': self._stationary_status(), 'command_channel': dict(self._channel),
-                    'automatic_navigation': copy.deepcopy(self._automatic_navigation)}}
+                    'stationary_check': self._stationary_status(), 'command_channel': dict(self._channel)}}
 
     def _request(self, action, arguments):
         values = {k: v for k, v in arguments.items() if k not in ('_tool_name', 'instance_id', 'action')}
@@ -262,7 +209,7 @@ class LocoMovePlugin:
             # Core can retain hidden move fields while changing the selection.
             for key in ('direction', 'speed', 'duration'):
                 values.pop(key, None)
-        internal = {'sit_down': 'lie', 'move': 'move_2s', 'enter_navigation': 'stand_up'}.get(action, action)
+        internal = {'sit_down': 'lie', 'move': 'move_2s'}.get(action, action)
         if action == 'relative_move':
             turning = values.get('direction', '').startswith('turn_')
             value = values.get('angle' if turning else 'distance')
@@ -278,7 +225,7 @@ class LocoMovePlugin:
         request['action'] = action
         return request
 
-    def execute(self, action, arguments, *, notify=True):
+    def execute(self, action, arguments):
         request = self._request(action, arguments)
         signature = {k: v for k, v in request.items() if k not in ('request_id', 'issued_at_ms', 'ttl_ms')}
         with self._lock:
@@ -304,7 +251,7 @@ class LocoMovePlugin:
             self._cancel = threading.Event()
             self._active = {'request_id': request['request_id'], 'action_id': action_id, 'action': action}
             deadline = self._clock() + self._settings['action_timeout_s']
-            self._worker = threading.Thread(target=self._run, args=(request, record, deadline, notify),
+            self._worker = threading.Thread(target=self._run, args=(request, record, deadline),
                                             name='s10-motion', daemon=True)
             try:
                 self._worker.start()
@@ -444,7 +391,7 @@ class LocoMovePlugin:
         if not response:
             raise MotionUnavailable('motion_response_not_observed')
 
-    def _run(self, request, record, deadline, notify):
+    def _run(self, request, record, deadline):
         action_id = record['receipt']['action_id']
         action = request['action']
         navigation = action in ('move', 'relative_move')
@@ -463,12 +410,10 @@ class LocoMovePlugin:
                 self._cancel.wait(.02)
             else:
                 raise MotionUnavailable('command_receiver_unmatched')
-            if action in ('stand_up', 'enter_navigation'):
+            if action == 'stand_up':
                 state = self._observe()['motion_state']
                 if state not in (0, 1, 17):
                     raise MotionUnavailable('posture_transition_not_ready')
-                if action == 'enter_navigation' and state != 1:
-                    raise MotionUnavailable('standing_state_required')
                 if state == 0:
                     result['physical_command_sent'] = True
                     self._posture(1, 1, deadline)
@@ -506,16 +451,10 @@ class LocoMovePlugin:
                 record['result'] = copy.deepcopy(result)
                 self._last = result
                 self._active = None
-                if action == 'enter_navigation':
-                    self._automatic_navigation = {'state': 'navigation_ready' if status == 'completed' else 'error',
-                                                  'result': copy.deepcopy(result)}
                 if not self._started:
                     self._bridge.release('s10_motion')
             # One worker, one terminal callback. No outbox polling or receipt protocol.
             try:
-                # Background standing detection has no dispatched Core call;
-                # report it in status rather than inventing an ACP pending ID.
-                if notify:
-                    self._callback(action_id, status, result, 'relative_move' if action == 'relative_move' else self.name)
+                self._callback(action_id, status, result, 'relative_move' if action == 'relative_move' else self.name)
             except Exception as error:
                 logging.warning('ACP callback failed (%s)', type(error).__name__)
