@@ -9,7 +9,7 @@ charging and navigation.
 | --- | --- | --- |
 | Battery | `/BATTERY_DATA` (`drdds/msg/BatteryData`) | `soc`, `soh`, `current`, `voltage`, `cell_vol`, `temperature`, `cycle` as JSON |
 | Joints | `/JOINTS_DATA_10HZ` (`drdds/msg/JointsData`) and `/IMU` | `joints_info` JSON with joint names/angles/speeds/torques/temperatures; `joints` skeleton with 16 joints and IMU orientation |
-| LiDAR | `/local_scans` or `/DEPTH_POINTS` plus `/ACCUMULATED_POINTS_MAP` | Split `lidar_cloud` and `lidar_map` `sensor/pointcloud` streams with bounded latest-frame workers |
+| LiDAR | 22 historical/live PointCloud2 candidates; `/ACCUMULATED_POINTS_MAP` remains the map source | Split `lidar_cloud` and `lidar_map` `sensor/pointcloud` streams with bounded latest-frame workers; only one fresh cloud source is active at a time |
 | IMU | `/IMU` (`sensor_msgs/msg/Imu`) | source `header.stamp`, quaternion (w,x,y,z), angular velocity, linear acceleration, Euler angles (radians), temperature |
 
 `model` returns the S10 skeleton URDF used by the joint renderer. It is a
@@ -31,7 +31,8 @@ second and a bounded duration. Head and tail lights are independent cards.
 ## Runtime
 
 The MCP server listens on loopback port 15745. `ROS_NAMESPACE` defaults to
-`s10_pro`; output topics follow `/<namespace>/s10_pro/<stream>`.
+`s10_pro`; output topics follow `/<namespace>/<stream>` (for example
+`/s10_pro/imu`).
 Four sensor calls use empty arguments. Start/stop/status/config lifecycle calls
 remain supported by the shared MCP bundle; stopping a card releases only its
 own subscription lease. Data is published only while the relevant input is

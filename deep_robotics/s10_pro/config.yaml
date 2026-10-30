@@ -14,11 +14,31 @@ topics:
   joints: "/JOINTS_DATA_10HZ"
   battery: "/BATTERY_DATA"
   motion_info: "/MOTION_INFO"
-  # Raw sensor candidates. Probe in parallel, lock to the first live source,
-  # and fail over only after the active source has gone stale.
+  # Probe candidates in parallel. Direct sensor sources outrank derived clouds;
+  # otherwise keep the selected source until it has gone stale.
   lidar_cloud:
     - "/local_scans"
     - "/DEPTH_POINTS"
+    - "/LIDAR/POINTS"
+    - "/ALIGNED_POINTS"
+    - "/CLOUD_REGISTERED_BODY"
+    - "/FULL_CLOUD_MAP"
+    - "/HANDLER_POINTS_DEBUG"
+    - "/LIO_ALIGNED_POINTS"
+    - "/LOC_BODY_POINTS"
+    - "/NAV_POINTS"
+    - "/REGIS_ALIGNED_POINTS"
+    - "/SEG_CLOUD"
+    - "/cloud_depth"
+    - "/cloud_local"
+    - "/cloud_local_g"
+    - "/cloud_nav"
+    - "/cloud_now_g"
+    - "/cloud_obs"
+    - "/free_paths"
+    - "/grid_map_3d"
+    - "/height_map"
+    - "/path"
   lidar_map: "/ACCUMULATED_POINTS_MAP"
 camera_topics:
   camera_rear:

@@ -123,20 +123,20 @@ def test_state_cards_expose_core_topics_when_ros_nodes_are_present(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
     nodes = type("Nodes", (), {"topics": {
-        "imu": {"topic": "/robot/s10_pro/imu", "format": "data/json"},
-        "joints": {"topic": "/robot/s10_pro/joints", "format": "sensor/skeleton"},
-        "joint_state": {"topic": "/robot/s10_pro/joint_state", "format": "data/json"},
-        "loco_state": {"topic": "/robot/s10_pro/loco_state", "format": "data/json"},
-        "battery": {"topic": "/robot/s10_pro/battery", "format": "data/json"},
-        "lidar_cloud": {"topic": "/robot/s10_pro/lidar_cloud", "format": "sensor/pointcloud"},
-        "lidar_map": {"topic": "/robot/s10_pro/lidar_map", "format": "sensor/pointcloud"},
+        "imu": {"topic": "/robot/imu", "format": "data/json"},
+        "joints": {"topic": "/robot/joints", "format": "sensor/skeleton"},
+        "joint_state": {"topic": "/robot/joint_state", "format": "data/json"},
+        "loco_state": {"topic": "/robot/loco_state", "format": "data/json"},
+        "battery": {"topic": "/robot/battery", "format": "data/json"},
+        "lidar_cloud": {"topic": "/robot/lidar_cloud", "format": "sensor/pointcloud"},
+        "lidar_map": {"topic": "/robot/lidar_map", "format": "sensor/pointcloud"},
     }, "stream_status": lambda _self: {"imu": {"received": 0, "published": 0}}})()
     plugin = device.S10StatePlugin(native, nodes)
     tools = {item["name"]: item for item in plugin.get_tools()}
     assert "state" not in tools
-    assert tools["joints"]["topic_out"] == [{"topic": "/robot/s10_pro/joints", "format": "sensor/skeleton"}]
-    assert plugin.dispatch("info", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/s10_pro/imu"
-    assert plugin.dispatch("start", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/s10_pro/imu"
+    assert tools["joints"]["topic_out"] == [{"topic": "/robot/joints", "format": "sensor/skeleton"}]
+    assert plugin.dispatch("info", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/imu"
+    assert plugin.dispatch("start", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/imu"
     assert plugin.dispatch("start", {"_tool_name": "joints"})["topic_out"][0]["format"] == "sensor/skeleton"
     assert plugin.dispatch("info", {"_tool_name": "lidar_cloud"})["topic_out"][0]["format"] == "sensor/pointcloud"
     assert plugin.dispatch("info", {"_tool_name": "lidar_map"})["topic_out"][0]["format"] == "sensor/pointcloud"
@@ -261,6 +261,9 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     )
     nodes = device.S10Nodes({"camera_topics": {"camera_rear": "/CAMERA/RAW"}}, "robot", ros2)
     callbacks = nodes.robot.subscriptions
+    assert nodes.topics["imu"]["topic"] == "/robot/imu"
+    assert "/s10/depth" in callbacks
+    assert "/s10/depth" in nodes._lidar_topics
 
     imu = SimpleNamespace(linear_acceleration=SimpleNamespace(x=1.0, y=2.0, z=3.0))
     callbacks["/IMU"](imu)
@@ -335,11 +338,12 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert nodes._source_topics["camera_left"] == "/s10/left/image"
     assert nodes._source_topics["camera_front"] == "/s10/front/image"
     assert nodes._source_topics["camera_right"] == "/s10/right/image"
-    assert "/s10/depth" not in nodes.robot.subscriptions
+    assert "/s10/depth" in nodes.robot.subscriptions
     groups = nodes.robot.subscription_groups
     assert groups["/s10/rear/image/compressed"] is groups["/CAMERA/RAW"]
     assert groups["/s10/left/image"] is not groups["/s10/rear/image/compressed"]
     assert groups["/DEPTH_POINTS"] is not groups["/s10/rear/image/compressed"]
+    assert groups["/s10/depth"] is not groups["/DEPTH_POINTS"]
     assert nodes._sensor_qos.kwargs == {
         "depth": 1, "history": 1, "reliability": 2, "durability": 2}
     nodes.close()
@@ -470,6 +474,15 @@ def test_camera_config_has_four_directional_lanes_and_common_aliases():
     for lane, direction, index in zip(lanes, ("rear", "left", "front", "right"), range(4)):
         assert f"/camera/{direction}/color/image_raw" in cameras[lane]
         assert f"/camera_{index}/image_raw" in cameras[lane]
+
+
+def test_lidar_cloud_probes_previous_pointcloud_topics_but_keeps_map_separate():
+    config = yaml.safe_load((DRIVER / "config.yaml").read_text())
+    candidates = config["topics"]["lidar_cloud"]
+    assert len(candidates) == 22
+    assert "/ACCUMULATED_POINTS_MAP" not in candidates
+    assert {"/DEPTH_POINTS", "/local_scans", "/ALIGNED_POINTS",
+            "/CLOUD_REGISTERED_BODY", "/FULL_CLOUD_MAP", "/LIDAR/POINTS"} <= set(candidates)
 
 
 def test_discovered_unclassified_camera_topics_reserve_distinct_lanes(monkeypatch):
@@ -1334,6 +1347,8 @@ def test_lidar_source_locks_to_first_valid_configured_stream(monkeypatch):
     nodes._lidar_topics = ["/DEPTH_POINTS", "/local_scans", "/LIDAR/POINTS"]
     nodes._active_lidar_source = None
     nodes._lidar_source_last_seen = {}
+    nodes._lidar_topic_stats = {}
+    nodes._lidar_source_lock = threading.Lock()
     nodes._stream_lock = threading.Lock()
     nodes._stream_stats = {"lidar_cloud": {"received": 0, "published": 0, "dropped": 0,
                                       "last_received": None, "last_published": None}}
@@ -1355,6 +1370,8 @@ def test_lidar_source_fails_over_after_active_source_stales(monkeypatch):
     nodes._lidar_topics = ["/DEPTH_POINTS", "/local_scans", "/LIDAR/POINTS"]
     nodes._active_lidar_source = "/DEPTH_POINTS"
     nodes._lidar_source_last_seen = {"/DEPTH_POINTS": time.monotonic() - 4.0}
+    nodes._lidar_topic_stats = {}
+    nodes._lidar_source_lock = threading.Lock()
     nodes._stream_lock = threading.Lock()
     nodes._stream_stats = {"lidar_cloud": {"received": 0, "published": 0, "dropped": 0,
                                             "last_received": None, "last_published": None}}
@@ -1365,6 +1382,31 @@ def test_lidar_source_fails_over_after_active_source_stales(monkeypatch):
     nodes._forward_lidar("/local_scans", msg)
     assert nodes._active_lidar_source == "/local_scans"
     assert nodes._stream_stats["lidar_cloud"]["received"] == 1
+
+
+def test_lidar_direct_sensor_source_preempts_derived_candidate(monkeypatch):
+    device = _load_device(monkeypatch)
+    nodes = object.__new__(device.S10Nodes)
+    nodes._lidar_topics = ["/FULL_CLOUD_MAP", "/DEPTH_POINTS"]
+    nodes._active_lidar_source = "/FULL_CLOUD_MAP"
+    nodes._lidar_source_last_seen = {"/FULL_CLOUD_MAP": time.monotonic()}
+    nodes._lidar_topic_stats = {}
+    nodes._lidar_source_lock = threading.Lock()
+    nodes._stream_lock = threading.Lock()
+    nodes._stream_stats = {"lidar_cloud": {"received": 0, "published": 0, "dropped": 0,
+                                             "last_received": None, "last_published": None}}
+    nodes._source_topics = {"lidar_cloud": list(nodes._lidar_topics)}
+    accepted = []
+    nodes.media_workers = SimpleNamespace(
+        submit=lambda lane, job: accepted.append((lane, job)) or True)
+    msg = SimpleNamespace(fields=[], is_bigendian=False, width=0, height=0,
+                          row_step=0, point_step=0, data=b"")
+
+    nodes._forward_lidar("/DEPTH_POINTS", msg)
+
+    assert nodes._active_lidar_source == "/DEPTH_POINTS"
+    assert nodes._stream_stats["lidar_cloud"]["received"] == 1
+    assert len(accepted) == 1
 
 
 def test_loco_completion_is_delivered_asynchronously(monkeypatch):

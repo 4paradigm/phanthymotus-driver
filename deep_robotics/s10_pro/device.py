@@ -23,6 +23,7 @@ from media_workers import MediaWorkers, encode_pointcloud
 CAMERA_LANES = ("camera_rear", "camera_left", "camera_front", "camera_right")
 LIDAR_LANES = ("lidar_cloud", "lidar_map")
 LIDAR_SOURCE_STALE_SECONDS = 3.0
+DIRECT_LIDAR_SOURCES = frozenset({"/DEPTH_POINTS", "/local_scans", "/LIDAR/POINTS"})
 MEDIA_MAX_AGE_S = 0.75
 
 
@@ -100,7 +101,7 @@ class S10Nodes:
         self.bridge = CoreBridge(os.environ.get("S10_CORE_FASTDDS_PROFILE", "/tmp/s10-pro-core-fastdds.xml"),
                                  int(config.get("ros", {}).get("core_domain_id") or 42))
         prefix = f"/{namespace}/" if namespace else "/"
-        base = prefix + "s10_pro/"
+        base = prefix
         self.topics = {
             "imu": {"topic": base + "imu", "format": "data/json"},
             "joints": {"topic": base + "joints", "format": "sensor/skeleton"},
@@ -205,11 +206,15 @@ class S10Nodes:
         self.robot.create_subscription(BatteryData, topics.get("battery", "/BATTERY_DATA"), self._forward_battery, stream_qos)
         self.robot.create_subscription(MotionInfo, topics.get("motion_info", "/MOTION_INFO"), self._forward_loco_state, stream_qos)
         lidar_topics = topics.get("lidar_cloud", topics.get("lidar", "/DEPTH_POINTS"))
-        self._lidar_topics = [lidar_topics] if isinstance(lidar_topics, str) else list(lidar_topics)
         lidar_map_topic = topics.get("lidar_map", "/ACCUMULATED_POINTS_MAP")
         self._lidar_map_topic = str(lidar_map_topic)
+        lidar_topics = [lidar_topics] if isinstance(lidar_topics, str) else list(lidar_topics)
+        self._lidar_topics = list(dict.fromkeys(
+            topic for topic in lidar_topics if topic != self._lidar_map_topic))
         self._active_lidar_source = None
         self._lidar_source_last_seen = {}
+        self._lidar_topic_stats = {}
+        self._lidar_source_lock = threading.Lock()
         self._configured_camera_lanes = {
             topic: key for key, values in camera_topics.items()
             for topic in ([values] if isinstance(values, str) else values)
@@ -218,7 +223,7 @@ class S10Nodes:
         # a lane's first callback claim its active source. This avoids assigning
         # several newly discovered image topics to one lane before any frame arrives.
         self._camera_topic_lanes = {}
-        self._configured_lidar_topics = set(self._lidar_topics)
+        self._lidar_callback_groups = {}
         self._media_topic_subscriptions = set()
         self._media_topic_types = {}
         self._media_subscription_handles = {}
@@ -243,17 +248,8 @@ class S10Nodes:
             self._media_subscription_handles[topic] = handle
             if not self._source_topics.get(key):
                 self._source_topics[key] = topic
-        for topic in self._configured_lidar_topics:
-            if topic in self._media_topic_subscriptions:
-                continue
-            handle = self.robot.create_subscription(
-                PointCloud2, topic,
-                lambda msg, source=topic: self._forward_lidar(source, msg), self._sensor_qos,
-                callback_group=self._media_callback_groups["lidar_cloud"])
-            self._media_subscriptions.append(handle)
-            self._media_topic_subscriptions.add(topic)
-            self._media_topic_types[topic] = PointCloud2
-            self._media_subscription_handles[topic] = handle
+        for topic in self._lidar_topics:
+            self._subscribe_lidar_candidate(topic, PointCloud2)
         if self._lidar_map_topic not in self._media_topic_subscriptions:
             handle = self.robot.create_subscription(
                 PointCloud2, self._lidar_map_topic, self._forward_lidar_map, self._sensor_qos,
@@ -287,9 +283,9 @@ class S10Nodes:
         for topic, type_names in discovered:
             types = set(type_names)
             if "sensor_msgs/msg/PointCloud2" in types:
-                # Configured raw feeds are subscribed during initialization.
-                # Never discover extra PointCloud2 endpoints: the graph also
-                # contains maps, paths and diagnostics with incompatible size.
+                # Probe every PointCloud2 source, but keep the configured map
+                # lane separate and publish only the selected cloud candidate.
+                self._subscribe_lidar_candidate(topic, PointCloud2, discovered=True)
                 continue
             msg_type = (CompressedImage if "sensor_msgs/msg/CompressedImage" in types else
                         Image if "sensor_msgs/msg/Image" in types else None)
@@ -332,6 +328,27 @@ class S10Nodes:
             if not self._source_topics.get(key):
                 self._source_topics[key] = topic
             print(f"[ros2] discovered {key} subscription: {topic} ({msg_type.__name__})", flush=True)
+
+    def _subscribe_lidar_candidate(self, topic, message_type, discovered=False):
+        from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+
+        if topic == self._lidar_map_topic or topic in self._media_topic_subscriptions:
+            return
+        if topic not in self._lidar_topics:
+            self._lidar_topics.append(topic)
+            self._source_topics["lidar_cloud"] = list(self._lidar_topics)
+        callback_group = MutuallyExclusiveCallbackGroup()
+        handle = self.robot.create_subscription(
+            message_type, topic,
+            lambda msg, source=topic: self._forward_lidar(source, msg), self._sensor_qos,
+            callback_group=callback_group)
+        self._lidar_callback_groups[topic] = callback_group
+        self._media_subscriptions.append(handle)
+        self._media_topic_subscriptions.add(topic)
+        self._media_topic_types[topic] = message_type
+        self._media_subscription_handles[topic] = handle
+        if discovered:
+            print(f"[ros2] discovered lidar_cloud candidate: {topic}", flush=True)
 
     def _forward_camera_alias(self, key, topic, msg):
         """Use the first active configured alias for each physical camera lane."""
@@ -439,7 +456,9 @@ class S10Nodes:
                 published_hz = stats.get("published_hz", 0.0)
                 counts = (stats["received"], stats["published"], stats["dropped"])
         if first and stage == "received":
-            print(f"[ros2] first {key} sample received from {self._source_topics[key]}", flush=True)
+            source = (self._active_lidar_source if key == "lidar_cloud"
+                      else self._source_topics[key])
+            print(f"[ros2] first {key} sample received from {source}", flush=True)
         if first and stage == "published":
             print(f"[ros2] first {key} sample published to {self.topics[key]['topic']}", flush=True)
         if report_rate:
@@ -469,9 +488,18 @@ class S10Nodes:
             if self.media_workers is not None and (key.startswith("camera_") or key in LIDAR_LANES):
                 result[key]["worker_alive"] = self.media_workers.is_alive(key)
             if key == "lidar_cloud":
-                result[key]["active_source"] = self._active_lidar_source
+                with self._lidar_source_lock:
+                    result[key]["active_source"] = self._active_lidar_source
+                    result[key]["source_probe"] = {
+                        topic: {"received": stats["received"],
+                                "stale_dropped": stats["stale_dropped"],
+                                "age_s": max(0.0, time.monotonic() - stats["last_seen"])
+                                if stats["last_seen"] is not None else None}
+                        for topic, stats in self._lidar_topic_stats.items()
+                    }
+                    candidates = list(self._lidar_topics)
                 result[key]["source_publishers"] = {
-                    topic: self._count_publishers(topic) for topic in self._lidar_topics
+                    topic: self._count_publishers(topic) for topic in candidates
                 }
             elif key == "lidar_map":
                 result[key]["source"] = self._lidar_map_topic
@@ -714,20 +742,39 @@ class S10Nodes:
         if msg is None:
             msg, source = source, None
         if not self._fresh_header(getattr(msg, "header", None)):
+            if source is not None:
+                with self._lidar_source_lock:
+                    stats = self._lidar_topic_stats.setdefault(
+                        source, {"received": 0, "stale_dropped": 0, "last_seen": None})
+                    stats["stale_dropped"] += 1
             self._record_stream("lidar_cloud", "dropped")
             return
         if source is not None:
             if source not in self._lidar_topics:
                 return
             now = time.monotonic()
-            if self._active_lidar_source is None:
-                self._active_lidar_source = source
-            elif source != self._active_lidar_source:
-                active_seen = self._lidar_source_last_seen.get(self._active_lidar_source, 0.0)
-                if now - active_seen < LIDAR_SOURCE_STALE_SECONDS:
-                    return
-                self._active_lidar_source = source
-            self._lidar_source_last_seen[source] = now
+            with self._lidar_source_lock:
+                stats = self._lidar_topic_stats.setdefault(
+                    source, {"received": 0, "stale_dropped": 0, "last_seen": None})
+                stats["received"] += 1
+                stats["last_seen"] = now
+                first_source_sample = stats["received"] == 1
+                if self._active_lidar_source is None:
+                    self._active_lidar_source = source
+                elif source != self._active_lidar_source:
+                    active_seen = self._lidar_source_last_seen.get(self._active_lidar_source, 0.0)
+                    active_is_direct = self._active_lidar_source in DIRECT_LIDAR_SOURCES
+                    candidate_is_direct = source in DIRECT_LIDAR_SOURCES
+                    if ((candidate_is_direct and not active_is_direct) or
+                            now - active_seen >= LIDAR_SOURCE_STALE_SECONDS):
+                        self._active_lidar_source = source
+                selected = source == self._active_lidar_source
+                if selected:
+                    self._lidar_source_last_seen[source] = now
+            if first_source_sample:
+                print(f"[ros2] first lidar_cloud candidate sample received from {source}", flush=True)
+            if not selected:
+                return
         self._forward_lidar_packet("lidar_cloud", msg)
 
     def _forward_lidar_map(self, msg):
