@@ -17,7 +17,7 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_FILES = {
     'scripts/update_s10_pr.py', 'scripts/check_s10_release.py',
-    'scripts/s10_pr_target.json', 'scripts/s10_pr_tests.txt',
+    'scripts/s10_pr_target.json',
     'scripts/s10-review-requirements.txt',
 }
 
@@ -49,8 +49,7 @@ def allowed_path(name):
                             'deep_robotics/s10_pro/deploy/control-authorization.disabled.json',
                             'deep_robotics/s10_pro/vendor/s10-nos-drdds-1.0.23/SOURCE.json'}
         return path.suffix in {'.py', '.md', '.yaml', '.yml', '.txt', '.xml', '.urdf', '.msg', '.srv', '.cmake', '.service'} or path.name in {'Dockerfile', 'LICENSE', 'CMakeLists.txt'}
-    return (len(path.parts) == 2 and path.parts[0] == 'tests'
-            and path.name.startswith('test_s10_') and path.suffix == '.py') or name in SCRIPT_FILES
+    return name in SCRIPT_FILES
 
 
 def changed_files():
@@ -116,9 +115,6 @@ def run_checks():
     for command in ([sys.executable, 'scripts/check_s10_release.py'],
                     [sys.executable, 'scripts/check_service_yml.py', 'deep_robotics/s10_pro']):
         subprocess.run(command, cwd=ROOT, check=True)
-    nodes = [line.strip() for line in (ROOT / 'scripts/s10_pr_tests.txt').read_text().splitlines()
-             if line.strip() and not line.lstrip().startswith('#')]
-    subprocess.run([sys.executable, '-m', 'pytest', '-q', *nodes, '--tb=short'], cwd=ROOT, check=True)
     git('diff', '--check')
 
 

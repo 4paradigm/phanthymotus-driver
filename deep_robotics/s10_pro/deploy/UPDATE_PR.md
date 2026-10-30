@@ -1,57 +1,47 @@
 # Updating the existing S10 PR
 
-This helper remains specific to the original PR #451. For the current version,
-see [release notes](RELEASE_20261030.md).
-Do not run the original-PR publisher from the new version branch; its branch
-guard intentionally rejects that operation.
+The target is existing PR #451 in `4paradigm/phanthymotus-driver`, from
+`wowwwwwwwwwwwwwwwwwww/phanthymotus-driver` branch
+`feat/s10-base-posture-timed-move`. Continue updating that branch; do not create
+a replacement PR. See the [release notes](RELEASE_20261030.md).
 
-The target is PR #451 in `4paradigm/phanthymotus-driver`, from the original
-`wowwwwwwwwwwwwwwwwwww/phanthymotus-driver` fork and
-`feat/s10-base-posture-timed-move` branch. The updater does not create a new PR,
-change branches, merge, rebase, amend, reset or force-push.
+## Development setup and checks
 
-## Development setup
-
-Use Python 3.12 or later in a development environment, outside the runtime image:
+Use Python 3.12 or later outside the runtime image:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r scripts/s10-review-requirements.txt
+.venv/bin/python scripts/update_s10_pr.py --offline
 ```
 
-Review the intended changes and use the check-only command first:
+Run the helper on the original PR branch. It validates the public catalogue,
+JSON schemas, Docker COPY inputs and service isolation. The S10 test suite,
+captured fixture and selected-test manifest have been removed at the
+maintainer's request; the helper does not run regression tests. These checks
+never connect to the robot, restart containers or send motion.
 
-```bash
-.venv/bin/python scripts/update_s10_pr.py
-```
-
-It checks the original fork and branch against the live PR ref, validates the
-public catalogue, JSON schemas and Docker COPY inputs, checks service isolation,
-and runs the release gate listed in `scripts/s10_pr_tests.txt`.
-`--offline` runs the local checks without querying GitHub and cannot publish.
-The script never opens a robot connection, restarts a container or sends motion.
-
-## One-command update
+## Publishing an S10-only update
 
 ```bash
 .venv/bin/python scripts/update_s10_pr.py --publish
 ```
 
-This explicitly commits and pushes the S10 changes after the checks pass. Before
-committing, the updater also verifies that GitHub reports the PR open and on the
-expected original branch/repository. Existing `gh` or Git credential-helper
+The helper verifies the original fork, branch and live open PR before committing
+and making a normal push. It never changes branches, merges, rebases, amends,
+resets, force-pushes or creates PRs. Existing GitHub/Git credential-helper
 authentication is reused without logging credentials. `GH_TOKEN` or
-`GITHUB_TOKEN` can also supply API authentication; never put tokens in this repo.
-Normal Git credentials must permit pushing the fork. API rate limits or missing
-authentication stop publication rather than guessing the target.
+`GITHUB_TOKEN` may supply API authentication; do not store tokens in this repo.
 
-Only Driver sources/docs, `tests/test_s10_*.py`, and the named S10 release helper
-files are eligible. Local databases, credentials, image archives and unrelated
-changes are excluded. Pre-staged changes or unrelated unpushed commits stop the
-updater. There is no automatic stash or cleanup. A failed push leaves the local
-commit available to inspect and retry; concurrent remote updates are never
-replaced. Updating the branch updates the same PR. This helper does not post bot
-commands, trigger a separate build request, or deploy an image.
+Only Driver sources/docs and the named S10 release helpers are eligible. Local
+databases, credentials, image archives and unrelated changes are excluded.
+Pre-staged changes or unrelated unpushed commits stop publication. Integrating
+upstream changes or removing files outside that allowlist requires a separate
+reviewed Git update of the same branch. The helper never automatically stashes
+or cleans the workspace. Concurrent remote updates are never replaced.
+
+Updating the existing branch updates PR #451. The helper does not post bot
+commands, request a separate build or deploy an image.
 
 ## Building the reviewed source
 
@@ -63,20 +53,7 @@ Stage exactly the Docker COPY inputs outside the checkout:
 docker build --platform linux/arm64 -t s10-pro:review /tmp/s10-release-context
 ```
 
-The context destination must not exist. The manifest records hashes of the
-staged inputs. The Dockerfile retains its pinned ROS base, message-generation
-build stage, runtime dependencies and existing deployment hardening. Passing a
-COPY/schema check is not proof of a complete image build or hardware acceptance.
-
-## Validation limits
-
-The release gate covers the current public API, merged actions, bounded and
-relative movement, authorization/Prepare, stopping, DDS, durable tasks,
-packaging and updater failure boundaries using synthetic feedback.
-Historical tests that expect the retired 13-monitor catalogue or manual Prepare
-UI are not part of this gate. The earlier full S10 run had 41 failures also
-present at PR head; they must be migrated separately, not reported as passing.
-The gate is explicitly a selected regression set, not the whole repository suite.
-The `loco_move` interface exposes forward/backward and in-place turns; no lateral
-entry was added. Stop diagnostics record missing evidence without relaxing
-confirmation thresholds or clearing protection.
+The context destination must not exist. The manifest records hashes of staged
+inputs. Passing these checks does not prove an image build or hardware
+acceptance. See the [test asset audit](TEST_ASSET_AUDIT.md) for removed coverage
+and historical results.

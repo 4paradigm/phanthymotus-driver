@@ -158,10 +158,14 @@ completion is not acknowledged or physically successful.
 ## Local checks and remaining work
 
 ```bash
-python3 -m pytest -q tests/test_s10_*.py
+python3 scripts/check_s10_release.py
 python3 scripts/check_service_yml.py deep_robotics/s10_pro
 python3 deep_robotics/s10_pro/deploy/check_container_contract.py
 ```
+
+The S10 test suite and captured sample data were removed at the maintainer's
+request. These commands validate release structure and configuration; they
+do not run regression tests or prove hardware behavior.
 
 The container checker validates the install fragment by default. When local,
 fully resolved standard-baseline and candidate Compose documents are available, run:
