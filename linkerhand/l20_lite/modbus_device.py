@@ -537,8 +537,6 @@ def build_plugins(config: dict, _namespace: str, _ros2) -> list:
         glove = GloveTeleopPlugin(hand, glove_config, _namespace, _ros2)
         hand._glove_plugin = glove
         plugins.append(glove)
-    if os.environ.get("GLOVE_PREVIEW_ONLY") == "1":
-        return [plugin for plugin in plugins if getattr(plugin, "PREFIX", None) == "glove_teleop"]
     return plugins
 
 

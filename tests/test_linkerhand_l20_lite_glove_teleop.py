@@ -494,16 +494,31 @@ def test_frame_contract_and_dual_hand_urdf():
     assert device.dispatch("info", {})["sent_commands"] == 0
 
 
-def test_driver_registers_visual_card_and_model_resource():
+@pytest.mark.parametrize("preview_override", [None, "0", "1"])
+def test_driver_registers_all_cards_and_model_in_preview_mode(monkeypatch, preview_override):
+    if preview_override is None:
+        monkeypatch.delenv("GLOVE_PREVIEW_ONLY", raising=False)
+    else:
+        monkeypatch.setenv("GLOVE_PREVIEW_ONLY", preview_override)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("registration and preview-only arm must not open hardware")
+
+    monkeypatch.setattr(modbus_device.MultiHandPlugin, "_discover", forbidden)
+    monkeypatch.setattr(modbus_device.L20LiteConnection, "get", forbidden)
     config = load_config(str(DRIVER / "main.py"))
-    tools = DriverBundle(
-        modbus_device.build_plugins(config, "test", None)
-    ).get_all_tools()
+    bundle = DriverBundle(modbus_device.build_plugins(config, "test", None))
+    tools = bundle.get_all_tools()
     by_name = {item["name"]: item for item in tools}
+    assert {"hand", "hand_gesture", "glove_teleop", "model"} <= by_name.keys()
     assert by_name["glove_teleop"]["topic_out"] == [
         {"topic": "/test/glove_teleop/skeleton", "format": "sensor/skeleton"}
     ]
     assert by_name["model"]["type"] == "resource"
+    assert "<robot" in bundle.dispatch("model", {})["urdf"]
+    if preview_override != "0":
+        with pytest.raises(RuntimeError, match="GLOVE_PREVIEW_ONLY=0"):
+            bundle.dispatch("glove_teleop", {"action": "arm", "confirm_motion": True})
 
 
 def test_udp_preview_receives_without_moving_hardware():
