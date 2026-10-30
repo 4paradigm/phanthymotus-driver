@@ -1,6 +1,6 @@
 # LimX TRON2 传感器、双臂、头部与夹爪控制驱动
 
-为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂/头部控制卡片、预设pose动作卡片和一张可选择左右的夹爪控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.9.5`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂/头部控制卡片、预设pose动作卡片和一张可选择左右的夹爪控制卡片，新增 YOLO 检测和头部人物跟随两张卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.12.0`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
@@ -13,6 +13,8 @@
 | `arm_control` | actuator | move自定义目标、reset复位并自动校验；ACP完成通知 | 无 |
 | `move_head` | actuator | 俯仰-60～45°（上正）、偏航-88～88°（自身左正）绝对目标；ACP确认到位 | 无 |
 | `model` | resource | 厂家DACH_TRON2A骨架URDF，供平台自动加载 | 无 |
+| yolo_detect | processor | 现有GPU模型检测并标注 | JPEG图像及检测JSON |
+| head_visual_follow | actuator | 显式执行后跟随人物，确认无人后回正 | 无 |
 
 夹爪卡片说明见 [夹爪卡片使用说明](GRIPPER.md)。只填写side（left/right）、opening_mm（0至85mm）、speed、force；没有action/close/recover选项。驱动按底层值=毫米数×94/85名义换算，0mm闭合。非法输入在占用任务和发送前拒绝，两侧独立管理；合法指令仍保留未到位或断连保护。
 
@@ -24,7 +26,7 @@ battery_state卡片、配置、topic和电池计算/显示代码已从本版本�
 
 ## 读取边界与字段说明
 
-传感器后台仅发送request_get_joint_state。arm_control仅在显式move/reset调用时发送一次request_movej；move_head仅在显式move调用时发送一次request_moveh；夹爪卡片仅在显式读取状态或跟踪开合动作时查询夹爪，显式开合只发送一次所选侧的指令。pose仅在显式选择英文动作后自检、必要时先回原home并确认，再回正头部，以ServoJ执行预设轨迹；挥手在右肩旋转三轮后保持手臂、右夹爪开合一次，再回原home。没有模式切换、拖动示教或自动演示循环。
+传感器后台仅发送request_get_joint_state。arm_control仅在显式move/reset调用时发送一次request_movej；move_head仅在显式move调用时发送一次request_moveh；用户显式执行 head_visual_follow 后，跟随控制也通过同一校验/任务管理路径串行发送头部目标，确认无人后回正；夹爪卡片仅在显式读取状态或跟踪开合动作时查询夹爪，显式开合只发送一次所选侧的指令。pose仅在显式选择英文动作后自检、必要时先回原home并确认，再回正头部，以ServoJ执行预设轨迹；挥手在右肩旋转三轮后保持手臂、右夹爪开合一次，再回原home。没有模式切换、拖动示教或自动演示循环。
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。
@@ -34,7 +36,7 @@ battery_state卡片、配置、topic和电池计算/显示代码已从本版本�
 - 厂家关节时间戳的时钟及单位尚未验证，因此 `robot_timestamp` 仅作为原始值保留，`measurement_time_verified` 为 `false`。接收年龄不能证明测量数据的真实年龄。
 - 默认超过5秒没有对应数据则`available: false`、`sample_status: stale`、缓存`data: null`。骨架发布空joints与不可用状态。断连时立即清空。
 
-关节传感器start/stop兼容单实例生命周期，不启动/停止机器人，也不停止后台采样。info读取缓存，不额外请求机器人。camera的start/stop实际开启/释放只读视频连接。公开四张sensor、一张arm_control actuator及model resource；不提供独立robot_status/reset_pose卡片或助手卡片。
+关节传感器start/stop兼容单实例生命周期，不启动/停止机器人，也不停止后台采样。info读取缓存，不额外请求机器人。camera的start/stop实际开启/释放只读视频连接。各业务卡片与 model resource 统一由本驱动提供；不提供独立robot_status/reset_pose卡片或助手卡片。
 
 兼容Agent Core自动注入的instance_id和_trace_id：最长128字符、无控制字符，不参与机器人请求或回显。关节传感器通过内部info查看当前原始缓存。
 
@@ -85,7 +87,7 @@ sudo docker exec embodied-limx-tron2 python3 /work/check.py
 
 脚本等待就绪，检查Core注册、joint_state骨架sensor、可选camera/arm_control及model类型、骨架格式和URDF名称，验证生命周期及关节接收时间更新。它不调用move/reset，也不验证真实运动。
 
-升级后刷新Motus，移除画布上的旧robot_status、reset_pose、joint_angles、battery_state实例，重新添加joint_state以更新缓存的渲染格式。使用joint_state、camera、camera_left、camera_right、arm_control五张业务卡片；model由骨架组件自动读取，不需要手动执行或连接。开启后从监控查看joint_state的厂家双臂/头部骨架。监控和查看数据流均加载同一model资源；升级后应重新加载组件以更新缓存。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
+升级后刷新Motus，移除画布上的旧robot_status、reset_pose、joint_angles、battery_state实例，重新添加joint_state以更新缓存的渲染格式。各卡片按需添加；model由骨架组件自动读取，不需要手动执行或连接。开启后从监控查看joint_state的厂家双臂/头部骨架。监控和查看数据流均加载同一model资源；升级后应重新加载组件以更新缓存。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
 
 `GET http://127.0.0.1:15791/health` 返回卡片状态：启用关节时，机器人连接且这些已启用传感器全部有最近接收数据为HTTP 200。可选camera的idle/断流不会阻塞它们或机械臂任务。只启用相机时，所有已启用相机都有最近成功发布的JPEG才就绪，否则为503。配置必须启用至少一张传感器，禁止仅开启arm_control却将空样本集合当成就绪。`registered_mcp_id` 单独表明 Core 注册是否完成；机器人可读与 Core 已注册是两项独立条件。
 
@@ -139,7 +141,7 @@ reset自动复位检查与动作完成跟踪为同一个过程，无需另调ver
 - 只有验证成功且回调送达才释放本地所有权。反馈验证失败或回调无法送达会保留blocked_requires_operator_check，阻止新的运动。失败通知和Core超时不会物理停止机械臂；现场确认停止、处理原因后再重启驱动。内部start/stop不会清除该状态，stop仍不是急停。
 - 进程正常关闭时终止验证任务并报告error，说明运动可能继续；不发送停机、复位或第二条运动命令。进程强制退出无法保证回调，Core保留120秒超时兜底。
 
-Dockerfile按dpkg实际安装状态检查python3-pip和ca-certificates，仅缺少时执行apt更新/安装；基础镜像已提供的包不重复安装。aiohttp/PyYAML仍由requirements.txt管理，是既有HTTP/WebSocket和配置解析依赖；完成机制只增加Python标准库源码，没有新增pip包、设备权限或资源资产。
+Dockerfile按dpkg实际安装状态检查python3-pip和ca-certificates，仅缺少时执行apt更新/安装；基础镜像已提供的包不重复安装。aiohttp/PyYAML 是既有 HTTP/WebSocket 和配置解析依赖；本次视觉卡片增加 Pillow（仅用于 JPEG 解码和标注）。不安装 PyTorch、Ultralytics、CUDA 或模型权重，不新增设备权限。
 
 ## 头部与左右腕RGB摄像头
 
@@ -168,3 +170,37 @@ sudo docker exec embodied-limx-tron2 /bin/bash -c 'source /opt/ros/humble/setup.
 测试使用合成MJPEG，覆盖启停/并发/中断等待、断流清空/重连、无效响应/畸形/截断/超限/停滞帧、RPC元数据与禁止运动；左右腕分开输出/独立停止、失败不影响其他源/JSON就绪，以及三路CompressedImage原始二进制、独立frame_id/单帧队列。只读隧道现场诊断确认三路同时连续视频，左停止后头部/右继续发布；实际图像/现场标识不进入仓库或公开PR。源/中继测试不能代替新镜像部署后的DDS/Core/平台验收。
 
 预设动作卡片的使用、起始姿态、停止与验证范围见 [POSE.md](POSE.md)。pose与arm_control复用同一双臂执行器；不扩展arm_control的公开动作，不更改原始home。
+
+
+## YOLO 检测和头部人物跟随（同一驱动）
+
+`0.12.0` 将 `yolo_detect`（processor）和 `head_visual_follow`（actuator）集成到现有
+`limx-tron2-driver`。仍只有一个 `limx/tron2/Dockerfile`、一个 `driver.yaml`、一个
+`embodied-limx-tron2` 容器、一个 MCP 入口 `127.0.0.1:15791/mcp` 和一个原有 ROS2
+publisher/context。两个子目录只是 Python 模块，没有独立镜像、监听端口或 Core 服务注册。
+标准 `bash build.sh --mirror none limx/tron2` 会包含两张新卡片。
+
+1. 使用默认配置，或在应用自己的 `config.yaml` 的 `plugins` 中启用 `yolo_detect` 和
+   `head_visual_follow`。跟随还需要 `joint_state`、`camera`、`move_head`；缺少时拒绝配置。
+   保留旧应用配置时不会自动改写文件，需要在升级配置中明确添加这两个字段。
+2. 在画布将头部 `camera` 连至 `yolo_detect`，开启智能控制，等待实时检测图像。
+3. 添加本驱动提供的 `head_visual_follow`，直接执行默认的 `follow`。画面任意位置有人
+   即可候选锁定，优先靠中心的人；连续有效帧确认无人后，头部回到 pitch=0°、yaw=0°。
+4. 关闭智能控制或停用卡片，会阻止后续跟随目标；已受理的转头会完成，不构成硬件制动。
+   启动驱动、启动项目和查询状态均不会自动启用跟随。
+
+YOLO 复用原相机已经发布的 JPEG 和同一个接收时间戳，不再创建第二个视频连接或 ROS
+订阅。输出 `/limx_tron2/yolo/annotated`（JPEG）和 `/limx_tron2/yolo/detections`（JSON），
+由原 publisher 发布。图像解码和 GPU HTTP 请求在工作线程运行，不阻塞 asyncio 的关节
+反馈、MCP 或 ACP。模型仍使用已有 GPU 端点 `http://172.28.4.23:18080` 的
+`yolov8l-worldv2.pt`；Jetson 只增加 Pillow，不安装/下载模型和 GPU 运行库。
+
+头部控制复用原 `move_head` 参数验证、HeadCompletion、运动互斥、模式/连接检查及 ACP
+完成确认。没有绕过原保护的厂商命令路径。跟随保留完整目标、约6°/s、角度范围及未知
+结果不重发；检测断流不作为“无人”证据。具体契约见
+[人物跟随](head_follow/README.md) 和 [YOLO 检测](yolo_detect/README.md)。
+
+旧的独立服务不由本 PR 自动停止或删除。迁移时应先通过镜像构建和离线测试，再暂停旧
+跟随、确认头部停止、保留旧容器/注册/画布备份，替换并验证原 TRON2 驱动，最后在画布
+改用同一驱动的新卡片。只有新服务验收后才清理旧实例。不要同时启用新旧跟随控制器。
+共享 Core、系统配置、DDS/证书、其它机器人和示教代码均不在本次修改范围。

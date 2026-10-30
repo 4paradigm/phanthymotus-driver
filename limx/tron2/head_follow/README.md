@@ -1,171 +1,36 @@
-# TRON2 head visual follow
+# TRON2 头部人物跟随
 
-An independent MCP actuator card that turns the head to follow a person selected
-anywhere in the head-camera image, then returns to pitch/yaw 0° after the
-person leaves (or no person is found after startup). It reuses the installed TRON2 `move_head` driver and existing YOLO
-results; it does not control the arms/grippers or alter the original driver.
+这是原 TRON2 驱动中的 Python 模块，不是独立服务。卡片由父目录 `main.py` / `device.py`
+在原 `127.0.0.1:15791/mcp` 提供；没有单独 Dockerfile、容器或服务注册。
 
-## Card operations
+在画布启用同一驱动的头部 `camera` → `yolo_detect` 后，执行 `head_visual_follow` 的默认
+`follow`。界面没有 `pause` / `status`；内部 `start` / `stop` / `info` 供项目生命周期使用。
+启动容器和启动项目只使卡片就绪，不会自动转头。停用卡片或关闭智能控制阻止后续目标，
+不能中途制动已经受理的动作。
 
-| Operation | Behavior |
-| --- | --- |
-| `follow` | Select a person across two distinct frames, preferring the center and follow their upper torso. |
+人物可从整幅图像获得候选，优先靠近中心的人；至少两个不同的新鲜帧确认后跟踪。
+目标靠图像检测框的空间连续性关联，不识别人脸身份。交叉、短暂遮挡或存在多个相近候选
+时保持，不立即换人。已锁定的人消失，或者启用时连续未发现人，至少3个有效空帧且持续
+1.5秒才回正到 pitch=0°、yaw=0°。已在回正范围内则保持。相机/模型失败、过期或重放帧
+不算“无人”，不会据此回正。
 
-Lifecycle `start` and diagnostic `info` are supported internally but hidden by
-the existing Canvas renderer. Only `follow` is visible and selected by default: press Execute. Neither `pause` nor `status` is exposed. Startup,
-container restart and project lifecycle start never enable following.
+跟随计算完整目标，不再分割成最多4°的步进；约6°/s，单次0.6–15秒，pitch在−55°至30°、
+yaw在−45°至45°。目标用原 `move_head` 的参数验证和 `HeadCompletion.dispatch` 路径执行，
+原限位、模式/连接检查、动作互斥、ACP和真实到位确认均保留。一次动作完成、解除占用并
+收到之后的新鲜图像，才发送下一次目标。这仍是串行 MoveH，不是连续伺服或转动途中改目标。
 
-The service is `TRON2 Head Visual Follow`; its single tool is
-`head_visual_follow`, with no user tuning fields other than `action`.
+工作线程通过 `vision.Runtime` 读取原 Adapter 的反馈并将头部请求交回其 asyncio 循环。
+没有额外 loopback HTTP 调用、厂商写接口、机械臂或夹爪指令。机械臂移动、其它头部命令、
+动作失败或结果未知时停止跟随；未知发送不重试、不自动回正。
 
-## Tracking and motion behavior
+配置需同时启用 `joint_state`、`camera`、`move_head`、`yolo_detect`、`head_visual_follow`。
+检测必须来自头部 `/limx_tron2/camera`，两腕相机不能作为本控制器的输入。
 
-- Acquire across the image, preferring the center; associate subsequent person boxes by overlap,
-  displacement and size. Hold when matching is ambiguous. This is spatial
-  tracking, not face identity recognition, and does not guarantee identity
-  through crossings or long occlusions.
-- Short occlusions hold the current direction. At least three fresh negative
-  observations over 1.5 seconds trigger a return to neutral. Camera/inference
-  failure or stale images never count as evidence that the person has left.
-- Each request sends the entire currently computed target. There is **no 4°
-  per-request cap**. Duration scales with angular distance at approximately
-  6°/s; target limits remain pitch −55°…30° and yaw ±45°.
-- Commands are serialized through `move_head`. Matching action IDs, acknowledged
-  completion, fresh feedback and driver release are required before another
-  target. Only that action's explicit stationary proof can replace a duplicate
-  settling window; initial admission still requires stable observations.
-- Only frames received after the completed turn can produce the next target.
-  This remains a sequence of MoveH turns with arrival checks, **not continuous
-  servo control or in-flight replanning**. Fast crossings can outpace the input
-  detector or leave the association gate.
-- External head control, arm motion/displacement, unknown request results or
-  driver faults disable following. No automatic retries, mode changes or error
-  resets are sent. Lifecycle `stop` is not an emergency stop and cannot cancel a turn
-  already accepted by the existing driver.
-
-## Dependencies and integration
-
-Use the existing, field-verified TRON2 0.11.x motion driver on loopback `15791`.
-Older/different versions fail the compatibility gate and require a separate
-compatibility review; this PR does not upgrade the main driver or teaching.
-The native VR head follower must be disabled for the existing manual head
-interface; this service never changes that setting.
-
-The sibling `../yolo_detect` service must already be running on loopback `15792`
-with the **head camera** `/limx_tron2/camera` as input and `person` in its model
-vocabulary. No new model is bundled or downloaded. Wrist-camera input is refused.
-The service reads `/health` from these two local dependencies and only posts
-`move_head` requests to `/mcp` on `15791`. It neither starts nor reconfigures the
-detector, camera streams, Core or robot driver. Disable this card while
-using other motion/teaching cards.
-
-The detector health contract used by `parse_frame()` is:
-
-```json
-{
-  "active": true,
-  "available": true,
-  "input_topic": "/limx_tron2/camera",
-  "last_error": null,
-  "latest_result": {
-    "available": true,
-    "input_topic": "/limx_tron2/camera",
-    "box_coordinate_system": "original_image_pixels",
-    "frame_sequence": 123,
-    "source_received_at": 1793275200.0,
-    "published_at": 1793275200.2,
-    "source_header_stamp": {"sec": 1793275200, "nanosec": 0},
-    "image_width": 640,
-    "image_height": 480,
-    "detections": [{"label": "person", "confidence": 0.9,
-                    "box_xyxy": [200, 50, 380, 450]}]
-  }
-}
-```
-
-Timestamps above are illustrative. Receipt-to-use age must be ≤1.5 seconds and
-frame identifiers must advance. This validates local freshness, not hardware
-clock synchronization. See `client.pose()` for the required driver feedback
-contract and `terminal()` for completion checks.
-
-## Run
-
-No Python packages beyond the standard library are required (Python 3.9+).
-From this directory on the Jetson:
+构建、部署和迁移见父目录 [README](../README.md)。测试在父目录运行：
 
 ```bash
-python3 server.py
+python3 -m unittest discover -s tests -v
 ```
 
-Or build/run this directory as a **separate service**:
-
-```bash
-docker build --pull=false --network=none --build-arg BASE_IMAGE='existing-local-runtime-image' \
-  -t tron2-head-visual-follow:0.1.3 limx/tron2/head_follow
-docker run -d --name tron2-head-visual-follow --network host --read-only \
-  --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges \
-  --pids-limit 64 --memory 128m --cpus 0.5 \
-  tron2-head-visual-follow:0.1.3
-```
-
-The Docker build context above is relative to the repository root. The server
-binds only `127.0.0.1:15793`. Register `http://127.0.0.1:15793/mcp` as an HTTP MCP
-service in Motus to expose the card. It has no DDS input wiring of its own;
-keep the existing head-camera→YOLO connection. `driver.yaml` describes this
-standalone service; the parent TRON2 image/catalog is unchanged. Do not start a
-second instance if the field-installed follow service already owns this port.
-
-To check without movement, use `GET /health` or tool action `info`. To begin,
-select `follow` and execute; to stop sending new targets, disable intelligent control (project lifecycle `stop`).
-After stopping the service, any command already accepted by the robot driver
-can still complete. No automatic recenter is sent during shutdown.
-
-## Validation
-
-```bash
-cd limx/tron2/head_follow
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
-# Enable actual loopback HTTP tests where socket binding is permitted:
-FOLLOW_HTTP_TEST=1 PYTHONDONTWRITEBYTECODE=1 \
-  python3 -m unittest discover -s tests -v
-```
-
-The tests use fake joint feedback/detections and never contact hardware. Docker
-builds run the real loopback HTTP checks as well. Tests cover full targets larger
-than 4°, duration scaling, initial stationarity, exact-action proof reuse,
-external-control conflicts, unknown send outcomes, fresh-frame gating,
-ambiguous matches, person loss/reacquisition and lifecycle startup remaining idle.
-
-The operator has confirmed that head following works on the physical TRON2 and
-requested the final full-target variant for field testing. This is operator
-acceptance, not a measured latency, servo smoothness or tracking-accuracy claim.
-Site-specific update archives, container replacement journals, personal paths
-and deployment backups are intentionally excluded from this contribution.
-
-With no initial person, at least three fresh empty observations over 1.5 seconds trigger recentering. Already-neutral heads hold without repeat commands; ambiguous matches hold rather than choosing arbitrarily. Camera failures never trigger recentering.
-
-
-## Build scope and infrastructure review
-
-`BASE_IMAGE` is required and must be an existing local, known-good runtime image.
-Use the installed TRON2/follow runtime for head following, and the installed YOLO
-runtime containing ROS2/Pillow for detection. No base image is selected or pulled
-implicitly. There is no apt/pip installation, OS upgrade, new system dependency,
-or model download. An unsuitable base fails its import/tests instead of changing
-the environment. No host filesystem or production container is modified by this
-Dockerfile.
-
-The verify stage runs fake-backend unit tests and loopback HTTP. The final stage
-copies only this card's Python files; newly added tests and build tooling are not
-copied into the runtime image. Existing contents/layers of the chosen base are
-inherited unchanged. Image size is not claimed to be zero-growth: the necessary
-application-code layer must be measured against the selected base on a Docker
-host. Local Docker is unavailable; actual build/size checks remain pending until
-the separate read-only-production verification recipe is run.
-
-The new `driver.yaml` is application metadata for this independent service, not
-an edit to the parent driver or system configuration. This nested service is
-built with the explicit context above; the shared root build script and CI
-workflows are unchanged. No Core code, `/etc` files, systemd units, certificates,
-DDS profiles, original driver config, teaching code or existing images are
-rewritten. Registration/runtime deployment is separate from building the image.
+`tests/test_head_follow.py` 覆盖控制状态机；`tests/test_vision.py` 覆盖单入口发现、生命周期、
+同进程反馈/发送、线程死锁防护、原头部校验复用及真实 loopback HTTP。均不控制实体机器人。

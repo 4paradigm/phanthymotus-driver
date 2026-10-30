@@ -1,10 +1,8 @@
-"""Only loopback reads and the existing, protected two-axis move_head tool."""
-import json
+"""Feedback validation and a callback to the existing guarded move_head path."""
 import math
-import urllib.request
 
 
-class Error(RuntimeError):
+class Error(ValueError):
     pass
 
 
@@ -17,46 +15,20 @@ def finite(value):
     return type(value) in (int, float) and math.isfinite(value)
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        raise Error('服务重定向被拒绝')
-
-
 class Client:
-    def request(self, port, path, body=None):
-        require(port in (15791, 15792) and path in ('/health', '/mcp'), '不支持的接口')
-        request = urllib.request.Request(
-            'http://127.0.0.1:%d%s' % (port, path),
-            data=None if body is None else json.dumps(body, allow_nan=False).encode(),
-            headers={'Content-Type': 'application/json'})
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        with opener.open(request, timeout=6 if body is not None else 2) as response:
-            raw = response.read(1024 * 1024 + 1)
-        require(len(raw) <= 1024 * 1024, '服务响应超限')
-        return json.loads(raw)
-
-    def robot(self):
-        return self.request(15791, '/health')
-
-    def detections(self):
-        return self.request(15792, '/health')
+    """Validated callbacks into the owning TRON2 adapter, with no HTTP listener."""
+    def __init__(self, robot, detections, move):
+        self.robot = robot
+        self.detections = detections
+        self._move = move
 
     def move(self, pitch, yaw, duration):
         require(all(finite(v) for v in (pitch, yaw, duration)), '无效头部目标')
         require(-55 <= pitch <= 30 and -45 <= yaw <= 45 and .6 <= duration <= 15,
                 '头部目标超出跟随范围')
-        reply = self.request(15791, '/mcp', {
-            'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
-            'params': {'name': 'move_head', 'arguments': {
-                'action': 'move', 'pitch_deg': pitch, 'yaw_deg': yaw, 'time': duration}}})
-        require('error' not in reply and isinstance(reply.get('result'), dict), '头部请求结果不明；不重发')
-        result = reply['result']
-        data = result.get('structuredContent')
-        if not isinstance(data, dict):
-            data = json.loads(next(c['text'] for c in result.get('content', []) if c['type'] == 'text'))
-        require(result.get('isError') is not True, '头部驱动拒绝：' + str(data.get('error', data))[:240])
-        require(data.get('motion_sent') is True and isinstance(data.get('action_id'), str),
-                '头部请求结果不明；不重发')
+        data = self._move(pitch, yaw, duration)
+        require(isinstance(data, dict) and data.get('motion_sent') is True and
+                isinstance(data.get('action_id'), str), '头部请求结果不明；不重发')
         return data
 
 
@@ -70,7 +42,7 @@ def terminal(motion):
 def pose(health, stationary=True):
     require(isinstance(health, dict) and health.get('robot_connected') is True and health.get('ready') is True,
             '机器人未就绪；不发送新指令')
-    require(str(health.get('version', '')).startswith('0.11.'), '需核对新的驱动版本兼容性')
+    require(str(health.get('version', '')).startswith('0.12.'), '需核对新的驱动版本兼容性')
     sample = health.get('samples', {}).get('joint_state') or {}
     data = sample.get('data') or {}
     q, dq = data.get('q'), data.get('dq')

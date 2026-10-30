@@ -250,8 +250,9 @@ class ROSImageTests(unittest.TestCase):
         rclpy=types.ModuleType('rclpy')
         rclpy.init=MagicMock(); rclpy.ok=MagicMock(return_value=True); rclpy.shutdown=MagicMock()
         node=MagicMock(); sinks={source[0]:MagicMock() for source in CAMERA_SOURCES.values()}
+        sinks['/limx_tron2/yolo/annotated']=MagicMock()
         node.create_publisher.side_effect=lambda kind,topic,qos:sinks[topic]
-        node.get_clock().now().to_msg.return_value='receipt-time'
+        node.get_clock().now().to_msg.side_effect=lambda:types.SimpleNamespace(sec=10,nanosec=20)
         rclpy.create_node=MagicMock(return_value=node)
         qos=types.ModuleType('rclpy.qos'); qos.QoSProfile=MagicMock()
         qos.ReliabilityPolicy=types.SimpleNamespace(BEST_EFFORT='best_effort')
@@ -270,11 +271,17 @@ class ROSImageTests(unittest.TestCase):
                     'FASTRTPS_DEFAULT_PROFILES_FILE':str(profile),'ROS_DOMAIN_ID':'42','RMW_IMPLEMENTATION':'rmw_fastrtps_cpp'}):
                 publisher=ros2.JsonPublisher([],image_topics=list(sinks))
                 for topic in sinks:
-                    publisher.publish(topic,JPEG)
+                    stamp=publisher.publish(topic,JPEG)
+                    self.assertEqual(stamp,{'sec':10,'nanosec':20,'frame_id':ros2.IMAGE_FRAMES[topic]})
                     message=sinks[topic].publish.call_args[0][0]
                     self.assertEqual(message.data,JPEG); self.assertEqual(message.format,'jpeg')
-                    self.assertEqual(message.header.stamp,'receipt-time')
+                    self.assertEqual((message.header.stamp.sec,message.header.stamp.nanosec),(10,20))
                     self.assertEqual(message.header.frame_id,ros2.IMAGE_FRAMES[topic])
                     sinks[topic].publish.assert_called_once()
+                source_stamp={'sec':101,'nanosec':202,'frame_id':'tron2_head_camera'}
+                publisher.publish('/limx_tron2/yolo/annotated',JPEG,stamp=source_stamp)
+                annotated=sinks['/limx_tron2/yolo/annotated'].publish.call_args.args[0]
+                self.assertEqual((annotated.header.stamp.sec,annotated.header.stamp.nanosec),(101,202))
+                self.assertEqual(annotated.header.frame_id,'tron2_head_camera')
                 self.assertEqual(qos.QoSProfile.call_args.kwargs['depth'],1)
                 publisher.close(); node.destroy_node.assert_called_once(); rclpy.shutdown.assert_called_once()

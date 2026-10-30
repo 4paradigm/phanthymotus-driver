@@ -1,107 +1,40 @@
-# TRON2 YOLO detection card
+# TRON2 YOLO 检测
 
-Standalone, read-only `yolo_detect` processor. Connect one existing `camera`,
-`camera_left` or `camera_right` JPEG stream in Canvas. Latest frames are sent to
-an existing YOLO-World GPU service; annotated JPEGs and structured detections
-are published on `/limx_tron2/yolo/annotated` (`image/jpeg`) and
-`/limx_tron2/yolo/detections` (`data/json`). No robot motion is sent.
+这是原 TRON2 驱动内的 processor 卡片，使用父目录唯一的 MCP 入口、容器、ROS2 context
+和 publisher。没有单独 Dockerfile、driver.yaml、监听端口或视频/DDS订阅。
 
-The UI exposes View Data Stream without confidence/FPS/label tuning fields.
-Internal lifecycle actions `start`, `stop`, `info` remain available. The source
-is derived from Canvas wiring; callers can pass `input_topic` or exactly one
-`input_topics` entry. Legacy tuning values are ignored. All valid model
-results are retained; inference load is limited to 2 Hz with a latest-frame queue.
+在画布将原 `camera`、`camera_left` 或 `camera_right` 中的一路连接到 `yolo_detect`，启动
+项目。原相机卡片转发 JPEG 时，把相同的图像和接收/发布时间戳交给最新帧队列。工作线程
+每秒最多处理2帧，过载只保留最新图像，不积压。标注图和检测 JSON 返回原 publisher：
 
-## Dependencies and integration
+- `/limx_tron2/yolo/annotated`：`image/jpeg`
+- `/limx_tron2/yolo/detections`：`data/json`
 
-- ROS2 Humble (`rclpy`, `sensor_msgs`, `std_msgs`) and Pillow.
-- The existing Core/camera FastDDS domain/profile. Set `ROS_DOMAIN_ID`,
-  `YOLO_EXPECTED_DOMAIN` (default 42), `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`,
-  and `FASTRTPS_DEFAULT_PROFILES_FILE` pointing to an existing readable profile.
-- The existing deployment-approved YOLO service at `http://172.28.4.23:18080`.
-  The adapter deliberately accepts only this endpoint; another site needs an
-  explicit endpoint/configuration review, not an arbitrary tool-call URL.
-  GPU service deployment and model weights are not included.
+卡片没有置信度、类别或帧率调节框。Core 用 `start` / `stop` / `info` 管理生命周期和相机
+连接，`input_topic` / `input_topics` 由连接选择。未启用的相机输入会被拒绝。原输入头部
+时间戳和源 JPEG/标注 JPEG 的 SHA256 随结果保留，时间戳是转发端接收时间，不能当成
+已经验证的硬件测量时间。
 
-Backend contract: `GET /health` reports `status: ok`, `model_loaded: true`,
-`model: yolov8l-worldv2.pt`. `POST /detect` accepts original JPEG bytes as
-`application/octet-stream`, returning `image_width`, `image_height`,
-`box_coordinate_system: original_image_pixels`, and `detections` entries with
-`label`, `confidence`, `box_xyxy`. Dimensions, coordinates and freshness are
-validated. See `ModelClient` and `validate_detections` for bounds.
+GPU推理仍请求现有 `http://172.28.4.23:18080`，模型为 `yolov8l-worldv2.pt`，只接受该
+部署端点，不允许卡片参数指定任意 URL。GPU `/health` 需返回 `status=ok`、
+`model_loaded=true` 和对应 `model`；`POST /detect` 接受 JPEG 二进制，结果需包含原图
+`image_width` / `image_height`、`box_coordinate_system=original_image_pixels`、
+`detections` 数组（`label`、`confidence`、`box_xyxy`）。尺寸、检测框、返回大小及3秒
+时效检查失败时不输出可用检测；故障状态清除旧检测框。
 
-The service binds loopback `15792`. Register
-`http://127.0.0.1:15792/mcp` as an HTTP MCP service in Motus, connect a camera,
-and enable intelligent control. Stopping intelligent control stops detection.
-`/health` reports state/counters and `/latest.jpg` returns the image or status
-slate. The sibling `../head_follow` uses this health/result contract and requires
-the head camera as source; wrist input can still be used for detection alone.
+Jetson只使用 Pillow 解码和绘制标注，依赖加入父目录已有 `requirements.txt`。不安装
+PyTorch、Ultralytics、CUDA或模型权重，不增加系统包和GPU设备权限。原Dockerfile的
+基础镜像和安装流程保留。Pillow和业务代码会增加镜像内容，体积需实际构建后测量。
 
-## Worker deadline fix (0.1.2)
+保留调度修复：只读一次时钟计算剩余等待，避免负数 sleep 杀死工作线程。health 的
+`vision.yolo_detect.worker_alive` 报告线程存活；HTTP可达不等于检测正常。
 
-The old limiter read the clock twice around a deadline, occasionally producing
-`time.sleep(negative)` outside the processing error handler. This killed
-`yolo_latest_frame` while HTTP and DDS input could stay alive, leaving STARTING
-on screen. The limiter now computes remaining time from one clock sample and
-only waits for positive intervals. A deterministic regression exercises this
-boundary. Health adds `worker_alive`; an active dead worker reports an error.
-No model, vocabulary, inference rate or camera behavior changes.
-
-## Build and validate
-
-From the repository root:
+构建、部署和旧独立服务迁移见父目录 [README](../README.md)。测试在父目录运行：
 
 ```bash
-docker build --pull=false --network=none --build-arg BASE_IMAGE='existing-local-yolo-image' \
-  -t tron2-yolo-detect:0.1.2 limx/tron2/yolo_detect
+python3 -m unittest discover -s tests -v
 ```
 
-Run as a separate host-network service with read-only root, non-root user, the
-existing DDS profile mounted read-only, environment above, and a private writable
-`/tmp` (such as a 128 MiB tmpfs). Do not start another instance if port 15792 is
-already owned by the field service. The parent TRON2 image stays unchanged.
-
-```bash
-cd limx/tron2/yolo_detect
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
-YOLO_HTTP_TEST=1 PYTHONDONTWRITEBYTECODE=1 \
-  python3 -m unittest discover -s tests -v
-```
-
-Unit tests use fake model/bus and do not contact hardware. Real loopback HTTP
-can be enabled separately. `smoke_dds.py` exercises DDS and must run **only in a
-network-none test container with a separate DDS domain/profile**. `probe.py`
-is a read-only live receiver proving two matching image/result pairs by hash
-and distinct frame sequence; neither sends robot commands.
-
-Field repair passed 59 tests (including deployment-only tests outside this
-contribution), isolated DDS checks, actual detection validation and continued
-inference/output growth. Its receipt reported about 2 fps, 298–364 ms latency,
-worker alive, and no robot motion. Personal deployment paths, update installers,
-replacement journals and backups are excluded from this PR.
-
-
-## Build scope and infrastructure review
-
-`BASE_IMAGE` is required and must be an existing local, known-good runtime image.
-Use the installed TRON2/follow runtime for head following, and the installed YOLO
-runtime containing ROS2/Pillow for detection. No base image is selected or pulled
-implicitly. There is no apt/pip installation, OS upgrade, new system dependency,
-or model download. An unsuitable base fails its import/tests instead of changing
-the environment. No host filesystem or production container is modified by this
-Dockerfile.
-
-The verify stage runs fake-backend unit tests and loopback HTTP. The final stage
-copies only this card's Python files; newly added tests and build tooling are not
-copied into the runtime image. Existing contents/layers of the chosen base are
-inherited unchanged. Image size is not claimed to be zero-growth: the necessary
-application-code layer must be measured against the selected base on a Docker
-host. Local Docker is unavailable; actual build/size checks remain pending until
-the separate read-only-production verification recipe is run.
-
-The new `driver.yaml` is application metadata for this independent service, not
-an edit to the parent driver or system configuration. This nested service is
-built with the explicit context above; the shared root build script and CI
-workflows are unchanged. No Core code, `/etc` files, systemd units, certificates,
-DDS profiles, original driver config, teaching code or existing images are
-rewritten. Registration/runtime deployment is separate from building the image.
+`test_yolo_detect.py` 覆盖最新帧、图像/结果关联、失败和输入切换；`test_yolo_worker.py`
+覆盖跨调度截止时间的确定性回归；`test_vision.py` 覆盖与原驱动的集成。测试不连接真实
+GPU或机器人；上线仍需实际镜像构建、DDS输出和现场验收。

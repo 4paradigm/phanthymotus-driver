@@ -28,11 +28,11 @@ class Fake:
 class RegressionTests(unittest.TestCase):
     def test_deadline_crossing_does_not_kill_worker(self):
         f=Fake([0.,0.,.49,.51,.51,.51])
-        scheduler(Path(__file__).resolve().parents[1]/'engine.py')(f)
+        scheduler(Path(__file__).resolve().parents[1]/'yolo_detect/engine.py')(f)
         self.assertEqual(f.steps,2)
     def test_already_due_does_not_sleep_negative(self):
         f=Fake([0.,0.,.5,.51])
-        scheduler(Path(__file__).resolve().parents[1]/'engine.py')(f)
+        scheduler(Path(__file__).resolve().parents[1]/'yolo_detect/engine.py')(f)
         self.assertEqual(f.steps,2)
 
 if __name__=='__main__':unittest.main(verbosity=2)

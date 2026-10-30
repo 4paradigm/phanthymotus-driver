@@ -1,8 +1,8 @@
 import copy
 import math
 import unittest
-from client import Error, pose, Client
-from engine import Engine, parse_frame, associate
+from head_follow.client import Error, pose, Client
+from head_follow.engine import Engine, parse_frame, associate
 
 
 class Fake:
@@ -18,7 +18,7 @@ class Fake:
         self.arm_busy = False
 
     def robot(self):
-        return {'version':'0.11.0-grasp-close-local1', 'ready':True, 'robot_connected':True,
+        return {'version':'0.12.0', 'ready':True, 'robot_connected':True,
                 'samples':{'joint_state':{'available':True,'reception_age_seconds':.1,
                     'data':{'q':self.q[:], 'dq':[0.]*16,'robot_timestamp':self.t}}},
                 'head_motion':copy.deepcopy(self.motion),'arm_motion':{'state':'moving'} if self.arm_busy else None}
@@ -96,7 +96,7 @@ class FollowTests(unittest.TestCase):
 
     def test_large_error_not_split_into_four_degree_steps(self):
         self.start()
-        from client import pose
+        from head_follow.client import pose
         p=pose(self.f.robot())
         self.e.dispatch(p,12.,-15.,'follow')
         pitch,yaw,duration=self.f.calls[-1]
@@ -107,7 +107,7 @@ class FollowTests(unittest.TestCase):
     def test_large_home_move_keeps_original_speed_and_limits(self):
         self.f.q[14]=-math.radians(-50.)
         self.start()
-        from client import pose
+        from head_follow.client import pose
         self.e.dispatch(pose(self.f.robot()),0.,0.,'return_home')
         self.assertEqual(self.f.calls[-1][:2],(0.,0.))
         self.assertAlmostEqual(self.f.calls[-1][2],50./6.)
@@ -143,7 +143,7 @@ class FollowTests(unittest.TestCase):
         self.assertEqual(self.f.calls,[])
 
     def test_pause_removed_but_lifecycle_stop_still_works(self):
-        from client import Error
+        from head_follow.client import Error
         self.start()
         with self.assertRaises(Error):self.e.call({'action':'pause'})
         self.e.call({'action':'stop'});self.assertFalse(self.e.active)
@@ -226,16 +226,19 @@ class FollowTests(unittest.TestCase):
         with self.assertRaises(Error):self.start()
         self.assertEqual(self.f.calls,[])
 
-    def test_only_public_move_head_transport(self):
-        calls=[];c=Client()
-        def request(port,path,body):
-            calls.append(body);return {'result':{'structuredContent':{'motion_sent':True,'action_id':'one'}}}
-        c.request=request;c.move(2,-2,.7)
-        self.assertEqual(calls[0]['params']['name'],'move_head')
+    def test_only_validated_in_process_head_callback(self):
+        calls=[]
+        def move(pitch,yaw,duration):
+            calls.append((pitch,yaw,duration))
+            return {'motion_sent':True,'action_id':'one'}
+        c=Client(self.f.robot,self.f.detections,move)
+        c.move(2,-2,.7)
+        self.assertEqual(calls,[(2,-2,.7)])
         c.move(0,0,9.)
-        self.assertEqual(calls[-1]['params']['arguments']['time'],9.)
+        self.assertEqual(calls[-1],(0,0,9.))
         with self.assertRaises(Error):c.move(0,0,15.1)
         with self.assertRaises(Error):c.move(60,0,1)
+        self.assertEqual(len(calls),2)
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 IMAGE_FRAMES = {'/limx_tron2/camera': 'tron2_head_camera',
+                '/limx_tron2/yolo/annotated': 'tron2_yolo',
                 '/limx_tron2/camera_left': 'tron2_left_wrist_camera',
                 '/limx_tron2/camera_right': 'tron2_right_wrist_camera'}
 
@@ -50,18 +51,25 @@ class JsonPublisher:
             self.close()
             raise
 
-    def publish(self, topic, data):
+    def publish(self, topic, data, stamp=None):
         if topic in self.image_topics:
             message = self.image_type()
             # This stamp is the relay's receipt/publish clock, not the camera's
             # unverified measurement timestamp. JPEG bytes remain unchanged.
             message.header.stamp = self.node.get_clock().now().to_msg()
             message.header.frame_id = IMAGE_FRAMES[topic]
+            if stamp is not None:
+                message.header.stamp.sec = stamp['sec']
+                message.header.stamp.nanosec = stamp['nanosec']
+                message.header.frame_id = stamp['frame_id']
             message.format, message.data = 'jpeg', data
         else:
             message = self.message_type()
             message.data = json.dumps(data, ensure_ascii=False, allow_nan=False)
         self.publishers[topic].publish(message)
+        if topic in self.image_topics:
+            return {'sec': message.header.stamp.sec, 'nanosec': message.header.stamp.nanosec,
+                    'frame_id': message.header.frame_id}
 
     def close(self):
         if self.node:

@@ -1,7 +1,7 @@
 """Fake model/ROS only; no network, GPU or robot commands."""
 import io,json,unittest
 from PIL import Image
-from engine import *
+from yolo_detect.engine import *
 
 class Clock:
     def __init__(self):self.t=100.

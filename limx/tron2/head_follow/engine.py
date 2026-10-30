@@ -3,7 +3,7 @@ import copy
 import math
 import threading
 import time
-from client import Client, Error, require, finite, pose, terminal
+from .client import Client, Error, require, finite, pose, terminal
 
 VERSION = '0.1.3'
 CAMERA = '/limx_tron2/camera'
@@ -89,7 +89,8 @@ def parse_frame(health, now):
 
 class Engine:
     def __init__(self, client=None, clock=time.monotonic, wall=time.time):
-        self.client = client or Client()
+        require(client is not None, '跟随必须绑定原 TRON2 驱动')
+        self.client = client
         self.clock, self.wall = clock, wall
         self.lock = threading.RLock()
         # A single lock serializes control start/stop and the one physical send.

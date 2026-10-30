@@ -6,7 +6,7 @@ hardware_model: tron2
 image_name: limx-tron2
 port: 15791
 mcp_url: "http://localhost:15791/mcp"
-description: "TRON2 三路RGB相机、实时骨架、双臂移动与自然垂下复位、预设动作、头部俯仰偏航及左右夹爪开合"
+description: "TRON2 三路RGB相机、实时骨架、双臂移动与自然垂下复位、预设动作、头部俯仰偏航、左右夹爪开合、GPU YOLO 检测和头部人物跟随"
 build_context_extras:
   - ../../common
 cards:
@@ -19,3 +19,5 @@ cards:
   - {name: move_head, type: actuator}
   - {name: gripper, type: actuator}
   - {name: model, type: resource}
+  - {name: yolo_detect, type: processor}
+  - {name: head_visual_follow, type: actuator}

@@ -41,6 +41,23 @@ def read_samples():
     return samples
 
 
+def validate_visual_tools(tools):
+    """Validate discovery only; never enable detection or autonomous motion."""
+    by_name = {tool['name']: tool for tool in tools}
+    if 'yolo_detect' in by_name:
+        expected = [{'topic': '/limx_tron2/yolo/annotated', 'format': 'image/jpeg'},
+                    {'topic': '/limx_tron2/yolo/detections', 'format': 'data/json'}]
+        if by_name['yolo_detect'].get('topic_out') != expected:
+            raise ValueError('YOLO output contract differs')
+    if 'head_visual_follow' in by_name:
+        schema = by_name['head_visual_follow']['inputSchema']
+        if not {'joint_state', 'camera', 'move_head', 'yolo_detect'} <= set(by_name) or \
+                schema['properties'].get('action', {}).get('enum') != ['follow', 'stop', 'info'] or \
+                schema['properties']['action'].get('default') != 'follow' or \
+                schema.get('x-resource') != ['head', 'arm_l', 'arm_r']:
+            raise ValueError('Follow dependencies, action schema or physical resources differ')
+
+
 def check_camera_bus(topics):
     """Optional actual DDS subscriber proof, no frame files or motion calls."""
     try:
@@ -106,9 +123,10 @@ def run_check(timeout=20, camera=False):
                 schema.get('x-resource')!=['arm_l','arm_r','head']:
             raise ValueError('Pose schema or shared physical resources differ')
     names = {tool['name'] for tool in tools}
-    expected = {**dict.fromkeys(CARDS | set(CAMERA_SOURCES), 'sensor'), 'arm_control': 'actuator', 'pose': 'actuator', 'move_head': 'actuator', 'gripper': 'actuator', 'model': 'resource'}
+    expected = {**dict.fromkeys(CARDS | set(CAMERA_SOURCES), 'sensor'), 'arm_control': 'actuator', 'pose': 'actuator', 'move_head': 'actuator', 'gripper': 'actuator', 'model': 'resource', 'yolo_detect': 'processor', 'head_visual_follow': 'actuator'}
     if not CARDS <= names or names - set(expected) or any(tool['type'] != expected[tool['name']] for tool in tools):
         raise ValueError('Expected skeleton sensor, optional camera/arm_control and model resource')
+    validate_visual_tools(tools)
     camera_tools = {tool['name']: tool for tool in tools if tool['name'] in CAMERA_SOURCES}
     for name, camera_tool in camera_tools.items():
         if camera_tool['topic_out'] != [{'topic': CAMERA_SOURCES[name][0], 'format': 'image/jpeg'}] \
