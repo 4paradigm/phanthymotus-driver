@@ -32,6 +32,7 @@ class CoreBridge:
         self._dropped = {}
         self._errors = {}
         self._last_error = {}
+        self._queue_locks = {}
         self._lock = threading.Lock()
 
     def create_publisher(self, lane: str, topic: str, msg_type):
@@ -51,6 +52,7 @@ class CoreBridge:
             self._dropped[lane] = 0
             self._errors[lane] = 0
             self._last_error[lane] = None
+            self._queue_locks[lane] = threading.Lock()
         return _BridgePublisher(self, lane, topic, msg_type, serialize_message)
 
     def publish(self, lane, topic, msg_type, serialize_message, message):
@@ -60,15 +62,9 @@ class CoreBridge:
             if process is None or not process.is_alive():
                 self._restart_lane(lane)
             messages = self._queues[lane]
-            try:
-                messages.put_nowait(item)
-            except queue.Full:
-                try:
-                    messages.get_nowait()
-                except queue.Empty:
-                    pass
-                messages.put_nowait(item)
-                self._dropped[lane] += 1
+            with self._queue_locks[lane]:
+                if not _put_latest(messages, item):
+                    self._dropped[lane] += 1
             self._counts[lane] += 1
         except Exception as exc:
             self._errors[lane] = self._errors.get(lane, 0) + 1
@@ -204,3 +200,23 @@ def _run_publisher(messages, profile, domain, lane):
         finally:
             if rclpy.ok():
                 rclpy.shutdown()
+
+
+def _put_latest(messages, item):
+    """Keep the newest sample in a bounded lane without blocking callbacks."""
+    try:
+        messages.put_nowait(item)
+        return True
+    except queue.Full:
+        pass
+    try:
+        messages.get_nowait()
+    except queue.Empty:
+        # The consumer may have taken the previous item while the queue's
+        # capacity semaphore is still being released by its feeder thread.
+        pass
+    try:
+        messages.put_nowait(item)
+        return True
+    except queue.Full:
+        return False

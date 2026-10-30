@@ -270,10 +270,16 @@ class S10Nodes:
                         Image if "sensor_msgs/msg/Image" in types else None)
             if msg_type is None:
                 continue
-            key = self._assign_camera_lane(topic)
-            if key in self._camera_lane_sources and self._camera_lane_sources[key] != topic:
-                print(f"[ros2] ignoring duplicate camera lane {key}: {topic}", flush=True)
+            try:
+                if self.robot.count_publishers(topic) == 0:
+                    continue
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+            # Do not let unrelated depth imagery (for example /DEPTH_IMAGE)
+            # claim a directional camera card before the four RGB sources.
+            if topic not in self._configured_camera_lanes and self._camera_key_for_topic(topic) is None:
                 continue
+            key = self._assign_camera_lane(topic)
             if key is None:
                 print(f"[ros2] ignoring extra camera topic (four lanes are occupied): {topic}", flush=True)
                 continue
@@ -1283,39 +1289,31 @@ class S10NavigationPlugin:
 
 
 LIGHT_COLORS = {"黑色": 0, "白色": 1, "绿色": 2, "蓝色": 3}
-LIGHT_EFFECTS = {"常亮": 0, "填充流水": 1, "移动流水": 2, "渐变流水": 3, "呼吸": 4, "闪烁": 5}
-LIGHT_STATIC_EFFECTS = {name: code for name, code in LIGHT_EFFECTS.items()
-                        if name not in ("呼吸", "闪烁")}
-LIGHT_CYCLIC_EFFECTS = {name: LIGHT_EFFECTS[name] for name in ("呼吸", "闪烁")}
+LIGHT_ACTION_EFFECTS = {
+    "constant": ("常亮", 0), "fill_flow": ("填充流水", 1),
+    "moving_flow": ("移动流水", 2), "gradient_flow": ("渐变流水", 3),
+    "breathe": ("呼吸", 4), "blink": ("闪烁", 5),
+}
+LIGHT_EFFECTS = {name: code for name, code in LIGHT_ACTION_EFFECTS.values()}
 
 
 class S10LightPlugin:
     ACTIONS = {
-        "set": (["head_color", "tail_color", "head_effect", "tail_effect",
-                 "head_breathe_cycle_seconds", "head_blink_cycle_seconds",
-                 "tail_breathe_cycle_seconds", "tail_blink_cycle_seconds"],
-                "设置头尾灯颜色和效果；呼吸或闪烁时才设置周期"),
+        "constant": (["head_color", "tail_color"], "头尾灯常亮"),
+        "fill_flow": (["head_color", "tail_color"], "头尾灯填充流水"),
+        "moving_flow": (["head_color", "tail_color"], "头尾灯移动流水"),
+        "gradient_flow": (["head_color", "tail_color"], "头尾灯渐变流水"),
+        "breathe": (["head_color", "tail_color", "cycle_seconds"], "头尾灯呼吸；周期单位为秒"),
+        "blink": (["head_color", "tail_color", "cycle_seconds"], "头尾灯闪烁；周期单位为秒"),
     }
 
     def __init__(self, native): self.native = native
     def get_tool(self):
-        result = tool("light", "actuator", "山猫 S10 头尾灯控制。固件仅支持黑、白、绿、蓝四种颜色，不支持自定义 RGB。选择呼吸或闪烁时才会显示并使用对应周期。", action_schema(self.ACTIONS, {
+        result = tool("light", "actuator", "山猫 S10 头尾灯控制。按 action 选择常亮、流水、渐变、呼吸或闪烁；固件仅支持黑、白、绿、蓝四种颜色。周期参数只属于呼吸和闪烁 action。", action_schema(self.ACTIONS, {
             "head_color": {"type": "string", "enum": list(LIGHT_COLORS), "default": "白色", "description": "头灯颜色"},
             "tail_color": {"type": "string", "enum": list(LIGHT_COLORS), "default": "白色", "description": "尾灯颜色"},
-            "head_effect": {"type": "string", "enum": list(LIGHT_EFFECTS), "default": "常亮", "description": "头灯效果"},
-            "tail_effect": {"type": "string", "enum": list(LIGHT_EFFECTS), "default": "常亮", "description": "尾灯效果"},
-            "head_breathe_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
-                                    "description": "头灯呼吸周期（秒）",
-                                    "x-show-when": {"head_effect": "呼吸"}},
-            "head_blink_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
-                                    "description": "头灯闪烁周期（秒）",
-                                    "x-show-when": {"head_effect": "闪烁"}},
-            "tail_breathe_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
-                                    "description": "尾灯呼吸周期（秒）",
-                                    "x-show-when": {"tail_effect": "呼吸"}},
-            "tail_blink_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
-                                    "description": "尾灯闪烁周期（秒）",
-                                    "x-show-when": {"tail_effect": "闪烁"}},
+            "cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
+                               "description": "呼吸或闪烁周期（秒）"},
         }))
         return result
     def start(self): pass
@@ -1324,25 +1322,22 @@ class S10LightPlugin:
         if action == "start": return {"state": "ready"}
         if action == "stop": return {"state": "idle"}
         if action == "info": return {"state": "ready"}
-        if action == "set":
+        if action in self.ACTIONS:
+            effect_name, effect_code = LIGHT_ACTION_EFFECTS[action]
+            cycle = args.get("cycle_seconds", 1)
+            if action in {"breathe", "blink"}:
+                if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 1:
+                    return {"ok": False, "code": "INVALID_ARGUMENT",
+                            "error": "cycle_seconds must be a positive integer"}
             leds = []
             for side in ("head", "tail"):
-                effect_name = args.get(f"{side}_effect", "常亮")
-                if effect_name not in LIGHT_EFFECTS:
+                color = args.get(f"{side}_color", "白色")
+                if color not in LIGHT_COLORS:
                     return {"ok": False, "code": "INVALID_ARGUMENT",
-                            "error": f"unsupported {side}_effect"}
-                led = {
-                    "Type": LIGHT_EFFECTS[effect_name],
-                    "Color": [LIGHT_COLORS[args.get(f"{side}_color", "白色")]],
-                }
-                if effect_name in LIGHT_CYCLIC_EFFECTS:
-                    cycle_kind = "breathe" if effect_name == "呼吸" else "blink"
-                    cycle = args.get(f"{side}_{cycle_kind}_cycle_seconds")
-                    # Accept the pre-conditional field for old callers, but do
-                    # not expose it in the card schema.
-                    if cycle is None:
-                        cycle = args.get(f"{side}_cycle_seconds", 1)
-                    led["Cycle"] = int(cycle)
+                            "error": f"unsupported {side}_color"}
+                led = {"Type": effect_code, "Color": [LIGHT_COLORS[color]]}
+                if action in {"breathe", "blink"}:
+                    led["Cycle"] = cycle
                 leds.append(led)
             # The Pro firmware applies this command but does not send an ASDU
             # response. Use the native fire-and-forget path so a successful

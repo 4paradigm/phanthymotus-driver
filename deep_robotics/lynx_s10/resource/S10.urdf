@@ -1003,25 +1003,25 @@
   <!-- Fixed-joint chain forms a front-facing triangle in skeleton renderers. -->
   <link name="front_marker_tip" />
   <joint name="front_marker_tip_joint" type="fixed">
-    <origin xyz="0.42 0 0.18" rpy="0 0 0" />
+    <origin xyz="0.105 0 0.045" rpy="0 0 0" />
     <parent link="base_link" />
     <child link="front_marker_tip" />
   </joint>
   <link name="front_marker_left" />
   <joint name="front_marker_left_joint" type="fixed">
-    <origin xyz="-0.15 0 -0.25" rpy="0 0 0" />
+    <origin xyz="-0.0375 0 -0.0625" rpy="0 0 0" />
     <parent link="front_marker_tip" />
     <child link="front_marker_left" />
   </joint>
   <link name="front_marker_right" />
   <joint name="front_marker_right_joint" type="fixed">
-    <origin xyz="-0.15 0 0.25" rpy="0 0 0" />
+    <origin xyz="-0.0375 0 0.0625" rpy="0 0 0" />
     <parent link="front_marker_left" />
     <child link="front_marker_right" />
   </joint>
   <link name="front_marker_close" />
   <joint name="front_marker_close_joint" type="fixed">
-    <origin xyz="0.30 0 0" rpy="0 0 0" />
+    <origin xyz="0.075 0 0" rpy="0 0 0" />
     <parent link="front_marker_right" />
     <child link="front_marker_close" />
   </joint>

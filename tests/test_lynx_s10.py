@@ -425,7 +425,16 @@ def test_camera_lane_recognizes_numbered_camera_topic_independent_of_discovery_o
     assert nodes._assign_camera_lane("/camera_0/image_raw") == "camera_0"
 
 
-def test_light_cycle_controls_use_scalar_visibility_conditions(monkeypatch):
+def test_unclassified_depth_image_does_not_claim_directional_camera_lane(monkeypatch):
+    device = _load_device(monkeypatch)
+    assert device.S10Nodes._camera_key_for_topic("/DEPTH_IMAGE") is None
+    nodes = device.S10Nodes.__new__(device.S10Nodes)
+    nodes._configured_camera_lanes = {"/usb_camera_1/image_raw_2": "camera_3"}
+    nodes._camera_topic_lanes = {}
+    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_2") == "camera_3"
+
+
+def test_light_cycle_controls_are_scoped_to_breathe_and_blink_actions(monkeypatch):
     device = _load_device(monkeypatch)
 
     class Native:
@@ -437,19 +446,12 @@ def test_light_cycle_controls_use_scalar_visibility_conditions(monkeypatch):
     native = Native()
     plugin = device.S10LightPlugin(native)
     schema = plugin.get_tool()["inputSchema"]
-    properties = schema["properties"]
-    assert properties["head_breathe_cycle_seconds"]["x-show-when"] == {"head_effect": "呼吸"}
-    assert properties["head_blink_cycle_seconds"]["x-show-when"] == {"head_effect": "闪烁"}
-    assert properties["tail_breathe_cycle_seconds"]["x-show-when"] == {"tail_effect": "呼吸"}
-    assert properties["tail_blink_cycle_seconds"]["x-show-when"] == {"tail_effect": "闪烁"}
-    assert all(not isinstance(condition, list)
-               for key in properties if key.endswith("cycle_seconds")
-               for condition in properties[key]["x-show-when"].values())
-
-    plugin.dispatch("set", {"head_effect": "常亮", "tail_effect": "闪烁",
-                             "tail_blink_cycle_seconds": 3})
-    assert "Cycle" not in native.sent[2]["Led"][0]
-    assert native.sent[2]["Led"][1]["Cycle"] == 3
+    actions = schema["x-action-params"]
+    assert set(actions) == {"constant", "fill_flow", "moving_flow", "gradient_flow", "breathe", "blink"}
+    for action in ("constant", "fill_flow", "moving_flow", "gradient_flow"):
+        assert "cycle_seconds" not in actions[action]["params"]
+    for action in ("breathe", "blink"):
+        assert "cycle_seconds" in actions[action]["params"]
 
 
 def test_media_worker_replaces_stale_queued_frame_without_reporting_failure(monkeypatch):
@@ -492,6 +494,39 @@ def test_media_worker_result_queue_replaces_stale_frame(monkeypatch):
     from media_workers import _put_latest
     assert _put_latest(results, ("camera_0", "new", b"new")) is True
     assert results.items == [("camera_0", "new", b"new")]
+
+
+def test_domain_bridge_replaces_full_lane_with_latest_sample():
+    from deep_robotics.lynx_s10.domain_bridge import _put_latest
+
+    class FullQueue:
+        def __init__(self):
+            self.items = ["stale"]
+        def put_nowait(self, item):
+            if self.items:
+                import queue
+                raise queue.Full
+            self.items.append(item)
+        def get_nowait(self):
+            return self.items.pop(0)
+
+    messages = FullQueue()
+    assert _put_latest(messages, "fresh") is True
+    assert messages.items == ["fresh"]
+
+
+def test_domain_bridge_counts_unreplaceable_full_lane_as_drop_not_error():
+    from deep_robotics.lynx_s10.domain_bridge import _put_latest
+
+    class RacedQueue:
+        def put_nowait(self, _item):
+            import queue
+            raise queue.Full
+        def get_nowait(self):
+            import queue
+            raise queue.Empty
+
+    assert _put_latest(RacedQueue(), "fresh") is False
 
 
 def test_media_worker_result_errors_are_throttled_and_reset_after_success(capsys):
@@ -1097,20 +1132,15 @@ def test_control_schema_exposes_supported_navigation_and_light_options(monkeypat
     localize_params = device.S10NavigationPlugin(native).get_tool()["inputSchema"]["x-action-params"]["localize"]["params"]
     light_tool = device.S10LightPlugin(native).get_tool()
     actions = light_tool["inputSchema"]["x-action-params"]
-    light_params = actions["set"]["params"]
+    light_params = actions["constant"]["params"]
 
     assert set(nav_params) == {"x", "y", "z", "yaw_degrees", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous", "confirm"}
     assert set(localize_params) == {"x", "y", "z", "yaw_degrees", "confirm"}
-    assert {"head_color", "tail_color", "head_effect", "tail_effect"} <= set(light_params)
-    assert set(actions) == {"set"}
-    assert {"head_breathe_cycle_seconds", "head_blink_cycle_seconds",
-            "tail_breathe_cycle_seconds", "tail_blink_cycle_seconds"} <= set(light_params)
+    assert set(light_params) == {"head_color", "tail_color"}
+    assert set(actions) == {"constant", "fill_flow", "moving_flow", "gradient_flow", "breathe", "blink"}
+    assert "cycle_seconds" in actions["breathe"]["params"]
+    assert "cycle_seconds" in actions["blink"]["params"]
     assert light_tool["name"] == "light"
-    properties = light_tool["inputSchema"]["properties"]
-    assert properties["head_effect"]["enum"] == list(device.LIGHT_EFFECTS)
-    assert properties["head_breathe_cycle_seconds"]["x-show-when"] == {"head_effect": "呼吸"}
-    assert properties["head_blink_cycle_seconds"]["x-show-when"] == {"head_effect": "闪烁"}
-
     charge_schema = device.S10ChargePlugin(native).get_tool()["inputSchema"]
     assert charge_schema["x-is-dangerous"] is True
     assert "confirm" in charge_schema["x-action-params"]["start_charging"]["params"]
@@ -1121,17 +1151,13 @@ def test_light_uses_named_colors_and_effects_in_native_protocol(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
     plugin = device.S10LightPlugin(native)
-    plugin.dispatch("set", {"head_color": "绿色", "tail_color": "蓝色",
-                                           "head_effect": "呼吸",
-                                           "tail_effect": "闪烁",
-                                           "head_breathe_cycle_seconds": 3,
-                                           "tail_blink_cycle_seconds": 2})
+    plugin.dispatch("breathe", {"head_color": "绿色", "tail_color": "蓝色", "cycle_seconds": 3})
 
     assert native.calls[-1][0] == (0x00100005, 0x00200002, {
         "CustomMode": True,
         "Led": [
             {"Type": 4, "Color": [2], "Cycle": 3},
-            {"Type": 5, "Color": [3], "Cycle": 2},
+            {"Type": 4, "Color": [3], "Cycle": 3},
         ],
     })
     assert native.calls[-1][1] == {}
@@ -1140,7 +1166,7 @@ def test_light_uses_named_colors_and_effects_in_native_protocol(monkeypatch):
 def test_light_uses_fire_and_forget_when_firmware_has_no_response(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
-    result = device.S10LightPlugin(native).dispatch("set", {})
+    result = device.S10LightPlugin(native).dispatch("constant", {})
     assert result["state"] == "sent"
     assert native.calls[-1][0][:2] == (0x00100005, 0x00200002)
 
@@ -1148,27 +1174,23 @@ def test_light_uses_fire_and_forget_when_firmware_has_no_response(monkeypatch):
 def test_light_constant_effect_omits_cycle_from_native_payload(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
-    device.S10LightPlugin(native).dispatch("set", {
+    device.S10LightPlugin(native).dispatch("constant", {
         "head_color": "白色", "tail_color": "蓝色",
-        "head_effect": "常亮", "tail_effect": "填充流水",
     })
     leds = native.calls[-1][0][2]["Led"]
     assert "Cycle" not in leds[0]
     assert "Cycle" not in leds[1]
 
 
-def test_light_single_action_can_mix_static_and_cyclic_side(monkeypatch):
+def test_light_blink_action_sets_cycle_for_both_lamps(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
-    device.S10LightPlugin(native).dispatch("set", {
-        "head_effect": "闪烁", "head_blink_cycle_seconds": 4,
-        "tail_effect": "常亮",
-    })
+    device.S10LightPlugin(native).dispatch("blink", {"cycle_seconds": 4})
     leds = native.calls[-1][0][2]["Led"]
     assert leds[0]["Type"] == device.LIGHT_EFFECTS["闪烁"]
     assert leds[0]["Cycle"] == 4
-    assert leds[1]["Type"] == device.LIGHT_EFFECTS["常亮"]
-    assert "Cycle" not in leds[1]
+    assert leds[1]["Type"] == device.LIGHT_EFFECTS["闪烁"]
+    assert leds[1]["Cycle"] == 4
 
 
 def test_loco_completion_is_delivered_asynchronously(monkeypatch):
