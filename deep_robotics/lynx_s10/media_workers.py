@@ -169,26 +169,34 @@ def _jpeg(width, height, step, encoding, data):
         return stream.getvalue()
     if encoding in ("nv12", "nv21"):
         try:
-            import numpy as np
             width, height, step = int(width), int(height), int(step)
-            raw = np.frombuffer(bytes(data), dtype=np.uint8)
+            raw = bytes(data)
             y_size = step * height
             uv_rows = (height + 1) // 2
-            if raw.size < y_size + step * uv_rows:
+            if width <= 0 or height <= 0 or step < width or len(raw) < y_size + step * uv_rows:
                 return None
-            y = raw[:y_size].reshape(height, step)[:, :width]
-            uv = raw[y_size:y_size + step * uv_rows].reshape(uv_rows, step)[:, :width]
-            u, v = uv[:, 0::2], uv[:, 1::2]
-            if encoding == "nv21":
-                u, v = v, u
-            u = np.repeat(np.repeat(u, 2, axis=0), 2, axis=1)[:height, :width].astype(np.float32)
-            v = np.repeat(np.repeat(v, 2, axis=0), 2, axis=1)[:height, :width].astype(np.float32)
-            yf = y.astype(np.float32)
-            rgb = np.clip(np.stack((yf + 1.402 * (v - 128.0),
-                                    yf - 0.344136 * (u - 128.0) - 0.714136 * (v - 128.0),
-                                    yf + 1.772 * (u - 128.0)), axis=-1), 0, 255).astype(np.uint8)
-            image = Image.fromarray(rgb, "RGB")
-        except (ImportError, ValueError, TypeError):
+            # Keep this conversion dependency-free. The camera driver commonly
+            # publishes NV12/NV21, and adding NumPy just for this path adds a
+            # large wheel to the runtime image.
+            rgb = bytearray(width * height * 3)
+            out = 0
+            for y in range(height):
+                y_row = y * step
+                uv_row = y_size + (y // 2) * step
+                for x in range(width):
+                    chroma = uv_row + (x // 2) * 2
+                    u, v = raw[chroma], raw[chroma + 1]
+                    if encoding == "nv21":
+                        u, v = v, u
+                    luminance = raw[y_row + x]
+                    c = luminance - 16
+                    d, e = u - 128, v - 128
+                    rgb[out] = max(0, min(255, (298 * c + 409 * e + 128) >> 8))
+                    rgb[out + 1] = max(0, min(255, (298 * c - 100 * d - 208 * e + 128) >> 8))
+                    rgb[out + 2] = max(0, min(255, (298 * c + 516 * d + 128) >> 8))
+                    out += 3
+            image = Image.frombytes("RGB", (width, height), bytes(rgb))
+        except (IndexError, ValueError, TypeError):
             return None
         stream = BytesIO()
         _save_preview(image, stream)

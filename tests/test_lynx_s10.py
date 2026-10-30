@@ -389,6 +389,18 @@ def test_camera_ros_image_encodes_to_frontend_jpeg(monkeypatch):
     assert encoded.startswith(b"\xff\xd8") and encoded.endswith(b"\xff\xd9")
 
 
+@pytest.mark.parametrize("encoding", ["nv12", "nv21"])
+def test_nv12_camera_image_encodes_without_numpy(monkeypatch, encoding):
+    _load_device(monkeypatch)
+    import media_workers
+
+    # 2x2 neutral gray frame: Y=128, U=V=128. NV12 and NV21 differ only in
+    # chroma byte order, so both must produce a valid JPEG without NumPy.
+    payload = bytes([128, 128, 128, 128, 128, 128])
+    encoded = media_workers._jpeg(2, 2, 2, encoding, payload)
+    assert encoded.startswith(b"\xff\xd8") and encoded.endswith(b"\xff\xd9")
+
+
 def test_vendor_mjpeg_image_is_published_without_worker_hop(monkeypatch):
     device = _load_device(monkeypatch)
     sensor_msg = ModuleType("sensor_msgs.msg")
