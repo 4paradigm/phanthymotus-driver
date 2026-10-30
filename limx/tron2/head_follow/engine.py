@@ -3,7 +3,7 @@ import copy
 import math
 import threading
 import time
-from .client import Client, Error, require, finite, pose, terminal
+from .client import Error, require, finite, pose, terminal
 
 VERSION = '0.2.1'
 CAMERA = '/limx_tron2/camera'
@@ -72,7 +72,6 @@ class Engine:
         require(client is not None, '跟随必须绑定原 TRON2 驱动')
         self.client = client
         self.clock, self.wall = clock, wall
-        self.lock = threading.RLock()
         # A single lock serializes control start/stop and the one physical send.
         self.control = threading.RLock()
         self.active = False
@@ -84,7 +83,6 @@ class Engine:
         self.target = None
         self.candidate = None
         self.candidate_since = None
-        self.last_seen = None
         self.missing_since = None
         self.misses = 0
         self.returning = False
@@ -145,7 +143,7 @@ class Engine:
             parse_frame(self.client.detections(), self.wall())
             self.owner_id = p['head_id']
             self.arm_reference = p['q'][:14]
-            self.target = self.candidate = self.last_seen = self.missing_since = None
+            self.target = self.candidate = self.missing_since = None
             self.candidate_since = None
             self.misses = 0
             self.returning = False
@@ -321,7 +319,6 @@ class Engine:
                             self.dispatch(p, 0., 0., 'return_home')
                         return
                     self.target = box
-                self.last_seen = self.clock()
                 self.missing_since = None
                 self.misses = 0
                 self.state = 'tracking'
