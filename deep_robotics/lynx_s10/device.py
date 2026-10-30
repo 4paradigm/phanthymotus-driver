@@ -116,12 +116,12 @@ class S10Nodes:
             "camera_left": ["/camera/left/image_raw", "/camera/left/image_raw/compressed",
                          "/camera/left/color/image_raw", "/camera/left/color/image_raw/compressed",
                          "/camera_left/image_raw", "/camera_1/image_raw",
-                         "/usb_camera_1/image_raw_0", "/usb_camera_1/image_raw_0/compressed",
+                         "/usb_camera_1/image_raw_1", "/usb_camera_1/image_raw_1/compressed",
                          ],
             "camera_front": ["/camera/front/image_raw", "/camera/front/image_raw/compressed",
                          "/camera/front/color/image_raw", "/camera/front/color/image_raw/compressed",
                          "/camera_front/image_raw", "/camera_2/image_raw",
-                         "/usb_camera_1/image_raw_1", "/usb_camera_1/image_raw_1/compressed",
+                         "/usb_camera_1/image_raw_0", "/usb_camera_1/image_raw_0/compressed",
                          ],
             "camera_right": ["/camera/right/image_raw", "/camera/right/image_raw/compressed",
                          "/camera/right/color/image_raw", "/camera/right/color/image_raw/compressed",
@@ -356,8 +356,8 @@ class S10Nodes:
         usb = re.search(r"/usb_camera_1/image_raw(?:_(\d+))?(?:/|$)", name)
         if usb:
             suffix = usb.group(1)
-            return {None: "camera_rear", "0": "camera_left",
-                    "1": "camera_front", "2": "camera_right"}.get(suffix)
+            return {None: "camera_rear", "0": "camera_front",
+                    "1": "camera_left", "2": "camera_right"}.get(suffix)
         tokens = set(filter(None, re.split(r"[^a-z0-9]+", name)))
         numbered = re.search(r"(?:^|[/_])camera[_-]?(\d+)(?:$|[/_])", name)
         if numbered:
@@ -1468,6 +1468,63 @@ class S10LightPlugin:
         raise ValueError(f"unsupported S10 light action: {action}")
 
 
+class S10SingleLightPlugin:
+    """Independent head/tail light card with effect-scoped parameters."""
+    ACTIONS = {
+        "constant": (['color'], "常亮"),
+        "fill_flow": (['color'], "填充流水"),
+        "moving_flow": (['color'], "移动流水"),
+        "gradient_flow": ([], "彩色渐变流水"),
+        "breathe": (['color', 'cycle_seconds'], "呼吸"),
+        "blink": (['color', 'cycle_seconds'], "闪烁"),
+    }
+
+    def __init__(self, native, side):
+        self.native = native
+        self.side = side
+
+    def get_tool(self):
+        result = tool(f"{self.side}_light", "actuator",
+                      f"山猫 S10 {self.side}灯控制；周期参数只用于呼吸和闪烁",
+                      action_schema(self.ACTIONS, {
+                          "color": {"type": "string", "enum": list(LIGHT_COLORS), "default": "白色"},
+                          "cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
+                                             "description": "该灯呼吸或闪烁周期（秒）"},
+                      }))
+        return result
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action not in self.ACTIONS:
+            raise ValueError(f"unsupported S10 {self.side} light action: {action}")
+        effect_code = LIGHT_ACTION_EFFECTS[action][1]
+        led = {"Type": effect_code}
+        if action != "gradient_flow":
+            color = args.get("color", "白色")
+            if color not in LIGHT_COLORS:
+                return {"ok": False, "code": "INVALID_ARGUMENT", "error": "unsupported color"}
+            led["Color"] = [LIGHT_COLORS[color]]
+        if action in {"breathe", "blink"}:
+            cycle = args.get("cycle_seconds", 1)
+            if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 1:
+                return {"ok": False, "code": "INVALID_ARGUMENT",
+                        "error": "cycle_seconds must be a positive integer"}
+            led["Cycle"] = cycle
+        return self.native.send(0x00100005, 0x00200002,
+                                {"CustomMode": True, "Led": [led]})
+
+
 class S10ChargePlugin:
     CONFIRM_ACTIONS = {"start_charging", "stop_charging"}
     def __init__(self, native): self.native = native
@@ -1496,7 +1553,8 @@ def build_plugins(config, namespace=None, ros2=None):
     native = BasicServerClient(config)
     nodes = S10Nodes(config, namespace or "", ros2) if ros2 is not None else None
     plugins = [S10ModelPlugin(), S10StatePlugin(native, nodes), S10MotionPlugin(native, nodes),
-               S10LightPlugin(native), S10ChargePlugin(native)]
+               S10SingleLightPlugin(native, "head"),
+               S10SingleLightPlugin(native, "tail"), S10ChargePlugin(native)]
     if str(config.get("model_variant", "standard")).lower() == "pro":
         plugins.append(S10NavigationPlugin(native))
     return plugins

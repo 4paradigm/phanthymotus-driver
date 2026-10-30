@@ -14,7 +14,7 @@
 - `model` 返回官方 `S10.urdf`；`joints` 按 URDF 的固定 16 关节顺序返回 `sensor/skeleton` 结构（q/dq/tau/temperature），并在运控姿态可用时附带 `imu_quat`。`imu` 从运控报告提取加速度、角速度和姿态；`joint_state` 保留原生电机状态；`loco_state` 合并运控和基础状态报告；`battery` 提供电池列表。
 - 急停、充电及设备健康状态分别保留在 `loco_state`、`battery` 或汇总 `state`，不再拆成多张厂商专用状态卡。
 - `loco` 提供 `move`、`stop_move`、`stand_up`、`stand_down`、`damp`、`gait`、`mode` 和 `manual_control`。`move` 的前后/侧向速度单位为 m/s，偏航角速度参数 `yaw_rate_deg_s` 使用度/秒；发给固件前会转换为 rad/s。`manual_control` 是常规/辅助模式的六轴归一化控制强度（-1 到 1），不是角度；普通步态只响应前后、侧移和偏航分量。通过 ASDU 执行 `stand_up` 后会自动进入 RL 运控状态，无需单独切换。持续运动指令 10Hz 刷新，到时自动发零指令；各状态切换会等待状态上报并通过 ACP 发送 action completion。
-- `light` 独立设置头尾灯颜色和效果。颜色使用固件支持的黑、白、绿、蓝具名选项；协议不支持任意 RGB 值。快捷 action 使用同一种效果；另提供头尾不同效果的组合 action。效果使用常亮、流水、渐变、呼吸、闪烁等具名选项；只有对应灯为呼吸或闪烁时才显示该灯的周期参数，单位为秒；渐变流水由固件自动选择彩色序列，不需要颜色参数。
+- `head_light` 与 `tail_light` 分别设置头灯和尾灯。颜色使用固件支持的黑、白、绿、蓝具名选项；协议不支持任意 RGB 值。每张卡只显示自己的效果、颜色和周期参数；周期仅在呼吸或闪烁 action 中出现。渐变流水由固件自动选择彩色序列，不需要颜色参数。
 - 不注册 `device` 控制卡：休眠/唤醒属于电源与安全管理，不交由 Agent 自主控制；SDK 关节流通过机载配置与标准状态话题提供。
 - `charging` 提供 `start_charging`、`stop_charging` 两个自主充电动作，两者都必须显式传入 `confirm=true`；卡片生命周期的 `start`/`stop` 只报告 `ready`/`idle`，不会触发充电。风险较高的 `Charge=2` 强制清除状态不开放为普通动作。
 - 本设备为 S10 Pro，默认 `model_variant` 设为 `pro` 并注册 `navigation` 动作卡，包含单点任务、取消、状态、定位初始化、地图位姿和感知状态。它只是在机器人当前已加载地图中执行目标点导航，不负责创建地图；使用前必须已有可用地图且定位正常。单点导航和定位初始化必须显式传入 `confirm=true`；导航任务异步返回 action ID 并通过 ACP 报告完成、取消或错误。文档指出非 Pro 版本会以通用错误 `0xE00A` 拒绝导航功能；若将驱动用于标准版，需将配置改为 `standard` 并从 `driver.yaml` 卡片清单移除导航卡。
@@ -27,7 +27,7 @@
 
 S10 URDF 含有指向 `meshes/*.STL` 的视觉网格引用；本次仅随镜像提供 URDF 文本，骨架关节名与运动学链可用，但不承诺展示厂家 STL 外观。`joints` 实时流使用真机 `JOINTS_DATA_10HZ` 的 16 个电机字段，并按 URDF 关节顺序映射到仓库通用 `sensor/skeleton`；`joint_state` 同时保留完整供应商消息字段。
 
-相机卡片按实际方位命名为 `camera_rear`、`camera_left`、`camera_front`、`camera_right`；厂商 USB 输入按 tail、left、head、right 顺序映射到 `/usb_camera_1/image_raw`、`image_raw_0`、`image_raw_1`、`image_raw_2`。未知 USB 后缀不会按发现顺序猜测分配。
+相机卡片按实际方位命名为 `camera_rear`、`camera_left`、`camera_front`、`camera_right`；当前部署按现场确认将 `/usb_camera_1/image_raw` 映射为后视、`image_raw_1` 映射为左视、`image_raw_0` 映射为前视、`image_raw_2` 映射为右视。未知 USB 后缀不会按发现顺序猜测分配。
 
 Go1/Go2/As2W 中的语音、遥控器、SLAM、深度相机、特技、专用避障以及 `loco` 命令集都没有 S10 指南依据，因此不移植。M20 Pro 的导航卡片名称与动作边界可复用，但导航实现按 S10 自己的 ASDU 和 Pro 型号边界实现。
 

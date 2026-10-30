@@ -221,16 +221,14 @@ def _save_preview(image, stream):
 
 
 def _reencode_jpeg(data):
-    # ROS compressed-image transport already carries a JPEG payload. Avoid
-    # decoding and re-encoding every frame; preserve it byte-for-byte.
+    # Bound compressed MJPEG payloads too; forwarding full-resolution frames
+    # makes DDS transport and frontend decode queue behind old frames.
     payload = bytes(data)
-    if payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9"):
-        return payload
     from io import BytesIO
     from PIL import Image
     image = Image.open(BytesIO(payload)).convert("RGB")
     stream = BytesIO()
-    image.save(stream, format="JPEG", quality=85, optimize=False)
+    _save_preview(image, stream)
     return stream.getvalue()
 
 

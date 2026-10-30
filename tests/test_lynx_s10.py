@@ -73,7 +73,7 @@ def test_pro_config_registers_navigation_and_matches_marketplace_cards(monkeypat
 
     assert config["model_variant"] == "pro"
     assert "navigation" in card_names
-    assert "light" in card_names
+    assert {"head_light", "tail_light"} <= card_names
     assert "loco" in card_names and "motion" not in card_names
     assert {"imu", "loco_state", "joints", "joint_state", "battery"} <= card_names
     assert "errors" not in card_names
@@ -368,11 +368,17 @@ def test_camera_ros_image_encodes_to_frontend_jpeg(monkeypatch):
     assert encoded.startswith(b"\xff\xd8") and encoded.endswith(b"\xff\xd9")
 
 
-def test_compressed_jpeg_is_forwarded_without_reencoding(monkeypatch):
+def test_compressed_jpeg_is_downscaled_for_low_latency_preview(monkeypatch):
     _load_device(monkeypatch)
     import media_workers
-    payload = b"\xff\xd8already-encoded\xff\xd9"
-    assert media_workers._reencode_jpeg(payload) == payload
+    from io import BytesIO
+    from PIL import Image
+    source = BytesIO()
+    Image.new("RGB", (1280, 720), (255, 0, 0)).save(source, format="JPEG")
+    payload = media_workers._reencode_jpeg(source.getvalue())
+    assert payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9")
+    with Image.open(BytesIO(payload)) as image:
+        assert max(image.size) <= 640
 
 
 def test_model_resource_returns_official_urdf(monkeypatch):
@@ -431,8 +437,8 @@ def test_camera_lane_recognizes_numbered_camera_topic_independent_of_discovery_o
 
     assert nodes._assign_camera_lane("/camera_3/image_raw") == "camera_right"
     assert nodes._assign_camera_lane("/camera_1/image_raw") == "camera_left"
-    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_0") == "camera_left"
-    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_1") == "camera_front"
+    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_0") == "camera_front"
+    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_1") == "camera_left"
     assert nodes._assign_camera_lane("/usb_camera_1/image_raw_2") == "camera_right"
     assert nodes._assign_camera_lane("/camera_0/image_raw") == "camera_rear"
 
@@ -1220,6 +1226,20 @@ def test_light_uses_named_colors_and_effects_in_native_protocol(monkeypatch):
         ],
     })
     assert native.calls[-1][1] == {}
+
+
+def test_head_and_tail_light_cards_are_independent(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    head = device.S10SingleLightPlugin(native, "head")
+    tail = device.S10SingleLightPlugin(native, "tail")
+    assert head.get_tool()["name"] == "head_light"
+    assert tail.get_tool()["name"] == "tail_light"
+    assert "cycle_seconds" not in head.get_tool()["inputSchema"]["x-action-params"]["constant"]["params"]
+    head.dispatch("constant", {"color": "白色"})
+    tail.dispatch("blink", {"color": "蓝色", "cycle_seconds": 2})
+    assert native.calls[-2][0][2]["Led"] == [{"Type": 0, "Color": [1]}]
+    assert native.calls[-1][0][2]["Led"] == [{"Type": 5, "Color": [3], "Cycle": 2}]
 
 
 def test_light_mixed_action_allows_different_head_and_tail_effects(monkeypatch):
