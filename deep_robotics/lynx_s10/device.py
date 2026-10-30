@@ -250,18 +250,10 @@ class S10Nodes:
             discovered = self.robot.get_topic_names_and_types()
         except (AttributeError, RuntimeError):
             return
-        import re
         from sensor_msgs.msg import CompressedImage, Image, PointCloud2
         for topic, type_names in discovered:
             types = set(type_names)
             if "sensor_msgs/msg/PointCloud2" in types:
-                # The robot publishes many derived map/path clouds. They are
-                # not the physical lidar frame and must not replace the live
-                # scan source (which also avoids display-frame inversions).
-                direct_name = topic.lower()
-                if (topic not in self._configured_lidar_topics and
-                        not re.search(r"(?:depth_points|local_scans|lidar/points|/depth$|/scan(?:s)?$)", direct_name)):
-                    continue
                 identity = (topic, "lidar")
                 if identity in self._discovered_media:
                     continue
