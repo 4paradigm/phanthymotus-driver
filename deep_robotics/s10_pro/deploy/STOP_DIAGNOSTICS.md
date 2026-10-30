@@ -69,12 +69,19 @@ S10 retains its own authorization, total deadline, state and feedback checks;
 these robots' SDK acknowledgements, speed limits and recovery APIs are not
 interchangeable. Core and the single-Driver architecture are unchanged.
 
-After an unconfirmed stop, inspect the recorded evidence before deciding whether
-feedback delivery or the bounded confirmation budget needs adjustment. Any
-subsequent explicit posture recovery must still pass stationary, fault,
-authorization and fresh-feedback checks. Do not replay the old request or erase
-its terminal result. The existing `stand_down` path can recover a failed channel
-when these conditions pass; faults or stale data still block publication.
+After an unconfirmed stop, the failed task stays failed and its worker is
+closed. There is no persistent manual-intervention lock. The supervisor checks
+current stationary feedback, faults, authorization and e-stop again on its
+bounded ticks; a valid existing session can rebuild the channel without being
+renewed. A new explicit posture request, including `stand_up`, can also rebuild
+the channel after the same current checks. Current faults still prevent it;
+their later clearance does not require a separate unlock button. No old request
+is replayed or changed to success. `sit_down` remains a lie-down action.
+
+Monitor/event publication failures are diagnostic-only and do not lock motion.
+Durable task-storage errors remain blocking because losing request identity can
+cause an already executed action to run again. Completion enqueue errors retry
+and clear when submission succeeds.
 
 `loco_move` supports forward/backward and in-place turns, not lateral movement.
 `max_vy` is a shared/internal lateral cap (default 0.1 m/s, schema maximum

@@ -51,22 +51,24 @@ def test_renew_only_after_expiry(p):
     s=m.AutomaticPreparation(p);s.tick();s.tick();assert p.calls==['prepare_automatic']
     p.auth.active=False;s.tick();assert p.calls==['prepare_automatic','prepare_automatic']
 
-@pytest.mark.parametrize('case',['stopped','disabled','busy','failed','revoked'])
+@pytest.mark.parametrize('case',['stopped','disabled','busy','revoked'])
 def test_never_overrides_explicit_stop_busy_failure_or_revocation(p,case):
     if case=='stopped':p._started=False
     if case=='disabled':p._settings['enabled']=False
     if case=='busy':p._active={'request_id':'active'}
-    if case=='failed':p._backend.safety_status=lambda:{'failed_closed':True}
     if case=='revoked':p.auth.valid=False
     supervisor=m.AutomaticPreparation(p)
     supervisor._startup_observation_started=True
     supervisor.tick();assert not p.calls and not p.auth.active
 
-def test_prepare_exception_latches_instead_of_looping(p):
+def test_prepare_exception_retries_on_later_tick_without_permanent_latch(p):
     count=[]
     def fail(*args):count.append(1);raise RuntimeError()
     p.dispatch=fail;s=m.AutomaticPreparation(p);s.tick();s.tick()
-    assert len(count)==1 and s.status()['state']=='needs_review'
+    assert len(count)==2 and s.status()['state']=='waiting'
+    p.dispatch = Plugin.dispatch.__get__(p, Plugin)
+    s.tick()
+    assert p.auth.active and s.status()['state']=='session_active'
 
 def test_close_prevents_later_prepare(p):
     s=m.AutomaticPreparation(p);s.close();s.tick();assert not p.calls
@@ -187,3 +189,23 @@ def test_identical_prepare_blocker_is_not_logged_on_every_retry(p, caplog):
     assert len(lines) == 2
     assert 'fresh_clear_fault_snapshot_required' in lines[0]
     assert 'session_active' in lines[1]
+
+
+def test_failed_worker_rechecks_current_conditions_without_renewing_session(p):
+    p.auth.active = True
+    failed = [True]
+    attempts = []
+    p._backend.safety_status = lambda: {'failed_closed': failed[0]}
+    def recover():
+        attempts.append(1)
+        if len(attempts) == 1:
+            return {'ready': False, 'blocked_by': ['fresh_clear_fault_snapshot_required']}
+        failed[0] = False
+        return {'ready': True, 'recovered': True}
+    p._backend.recover_worker = recover
+    supervisor = m.AutomaticPreparation(p)
+    supervisor.tick()
+    assert supervisor.status()['state'] == 'waiting'
+    supervisor.tick()
+    assert supervisor.status()['state'] == 'session_active'
+    assert not failed[0] and not p.calls and p.auth.count == 0

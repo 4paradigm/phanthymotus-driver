@@ -269,8 +269,7 @@ class SupervisedMotionPlugin(MotionPlugin):
             blocked.append('controller_closed')
         if not self._execution_authorized_now():
             blocked.append('operator_session_unavailable')
-        if self._backend.safety_status()['failed_closed']:
-            blocked.append('operator_intervention_required')
+        # A closed worker is rebuilt after current checks, not a manual latch.
         if action is not None and action not in POSTURE_STATES:
             blocked.append('supervised_posture_only')
         if self._feedback is None:

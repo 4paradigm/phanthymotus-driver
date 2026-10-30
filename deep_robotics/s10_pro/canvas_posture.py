@@ -34,7 +34,6 @@ INSTRUCTIONS = {
     'exit_move_with_lie_required': 'The vendor state machine ignores stand in state 17. Use lie and wait for state 0 before requesting stand.',
     'wait_for_idle_required': 'The robot is changing posture. Wait for lie to finish in state 0 before another action.',
     'unsupported_transition_state': 'The current vendor state does not support this posture transition. No command was sent.',
-    'operator_intervention_required': 'The previous action failed. A new request may recover the channel only after stationary and fault checks; old actions are never replayed.',
     'move_mode_required': 'Timed movement requires move mode, state 17.',
     'stationary_move_mode_required': 'Movement requires state 17 and confirmed rest: normal motion feedback or a bounded bias corroborated by stationary odometry.',
     'timed_command_channel_not_prepared': 'The timed velocity channel is not prepared. No movement command was sent.',
@@ -452,7 +451,7 @@ class CanvasPostureBackend(SupervisedPostureBackend):
             self._distance_permit = None
 
     def recover_worker(self):
-        """Only called by an explicit human-selected recover_test operation."""
+        """Rebuild a closed worker from current feedback, never replaying a task."""
         with self._lock:
             if self._closed or self._request is not None or self._transport_factory is None:
                 raise RuntimeError('recovery unavailable for closed or active backend')
@@ -530,7 +529,7 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
                     self._publish(topic,
                                   'data/json', copy.deepcopy(event))
                 except Exception:
-                    self._error = 'status_publish_failed'
+                    self._status_error = 'status_publish_failed'
 
     def _card_status(self, source, *, card):
         result = copy.deepcopy(source)
@@ -739,7 +738,7 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
             'x-resource': 'base'}
         return {'name': RELATIVE_MOVE_TOOL, 'title': 'S10 Relative Movement',
             'type': 'actuator', 'multiInstance': False,
-            'description': 'Use live odometry to reach a relative distance or angle, decelerate and stop. Feedback errors or excessive drift stop the task and latch failure.',
+            'description': 'Use live odometry to reach a relative distance or angle, decelerate and stop. Feedback errors or excessive drift stop the current task. Later requests use current readiness checks.',
             'inputSchema': schema, 'configSchema': super().get_tool()['configSchema'],
             'topic_in': [], 'topic_out': self._relative_ports()}
 
@@ -924,7 +923,7 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
                 try:
                     checked = self._backend.recover_worker()
                 except Exception:
-                    return self._unavailable(['recovery_failed_requires_review'], action)
+                    return self._unavailable(['command_channel_unavailable'], action)
                 if not checked['ready']:
                     return self._check_unavailable(checked, action)
                 auto_recovered = True

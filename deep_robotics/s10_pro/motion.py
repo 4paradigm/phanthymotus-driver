@@ -223,6 +223,7 @@ class MotionPlugin:
         self._last = None
         self._events = deque(maxlen=64)
         self._error = None
+        self._status_error = None
         self._last_tick = clock()
         self._settings = self._validate(config or {})
         base = '/' + '/'.join(p for p in (str(namespace).strip('/'), 's10_pro') if p)
@@ -436,7 +437,7 @@ class MotionPlugin:
                 try:
                     self._publish(self.events_topic, 'data/json', copy.deepcopy(event))
                 except Exception:
-                    self._error = 'status_publish_failed'
+                    self._status_error = 'status_publish_failed'
 
     def _publish_status(self, payload):
         self._publish(self.status_topic, 'data/json', payload)
@@ -464,6 +465,7 @@ class MotionPlugin:
                     **diagnostics},
                 'settings': dict(self._settings), 'active_request': copy.deepcopy(self._active),
                 'last_result': copy.deepcopy(self._last), 'last_error': self._error,
+                'status_publish_error': self._status_error,
                 'completion_delivery': self._delivery_status(),
                 'topic_in': [], 'topic_out': self._ports(), 'supported_actions': list(ACTIONS),
                 'stop_semantics': 'application_stop_not_emergency_stop', 'events': list(self._events)}
@@ -549,6 +551,8 @@ class MotionPlugin:
                 try:
                     self._notifier.submit(payload)
                     self._tasks.mark_enqueued(record['request_id'])
+                    if self._error == 'completion_enqueue_failed_retained_for_retry':
+                        self._error = None
                 except Exception:
                     self._error = 'completion_enqueue_failed_retained_for_retry'
         finally:
@@ -876,6 +880,7 @@ class MotionPlugin:
                             payload = self.status()
                             payload['timestamp_ms'] = int(self._wall() * 1000)
                             self._publish_status(payload)
+                            self._status_error = None
                         except Exception:
-                            self._error = 'status_publish_failed'
+                            self._status_error = 'status_publish_failed'
                         self._next_status = now + 1. / self._settings['refresh_hz']

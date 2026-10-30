@@ -27,9 +27,12 @@ When a version-2 policy is valid, the supervisor may start read-only observation
 and check readiness. It creates a session only while idle/enabled and permitted.
 Every activation still checks stationary telemetry, advancing enabled joints,
 fresh clear HES and fault feedback. Active tasks are never interrupted for
-renewal. An explicit card stop is respected. Command failures and preparation
-exceptions latch for review; automatic preparation never clears the stop alarm,
-replays a task, selects a posture, or publishes velocity. Policy changes,
+renewal. An explicit card stop is respected. Command failures close the old
+worker; current readiness is checked again on the next bounded supervisor tick.
+Healthy authorized conditions allow channel reconstruction without a manual
+unlock or session renewal. Preparation exceptions are retried on later ticks,
+not permanently latched. This never replays a task, selects a posture, or
+publishes velocity. Policy changes,
 revocation or machine/boot mismatch remain fail-closed. A process restart loses
 its in-memory session and must pass the separately approved startup permission.
 

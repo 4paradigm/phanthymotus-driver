@@ -170,7 +170,6 @@ class LocoMovePlugin(CanvasPosturePlugin):
             'operator_session_unavailable': 'Waiting for an authorized Prepare session.',
             'fresh_clear_fault_snapshot_required': 'Robot fault feedback is missing, stale or reports a fault; check robot diagnostics.',
             'driver_error_requires_review': 'The previous failure requires review before another motion.',
-            'operator_intervention_required': 'Review the previous failed motion and confirm the robot is stationary.',
             'fresh_stationary_feedback_required': 'Waiting for fresh stationary feedback.',
             'stationary_move_mode_required': 'Movement requires stationary move mode.',
             'move_mode_required': 'Run stand_up and wait for its ACP completion first.',
@@ -227,10 +226,16 @@ class LocoMovePlugin(CanvasPosturePlugin):
             if self._active is not None: return {'accepted': False, 'state': 'busy', 'reason': 'active_motion_task_in_progress'}
             if self._closed.is_set() or not self._started or not self._settings['enabled']:
                 return self._unavailable(['card_not_enabled'], action)
-            if self._error or self._backend.safety_status()['failed_closed']:
+            if self._error:
                 return self._unavailable(['driver_error_requires_review'], action)
             self._backend.start_observation()
-            check = self._backend.preflight(stationary_states=(0, 1, 17))
+            if self._backend.safety_status()['failed_closed']:
+                try:
+                    check = self._backend.recover_worker()
+                except Exception:
+                    return self._unavailable(['command_channel_unavailable'], action)
+            else:
+                check = self._backend.preflight(stationary_states=(0, 1, 17))
             if self._backend.feedback.observation().get('motion_state') not in (0, 1, 17):
                 check['blocked_by'].append('wait_for_idle_required')
             if check['blocked_by']: return self._check_unavailable(check, action)

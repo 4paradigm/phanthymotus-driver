@@ -1,26 +1,6 @@
 {
   "_provenance": "Offline fixture captured through read-only NOS subscriptions on 2026-10-22. Not a live source.",
   "samples": {
-    "/IMU_DATA": {
-      "header": {
-        "frame_id": 0,
-        "stamp": {
-          "sec": 1792647441,
-          "nanosec": 298000000
-        }
-      },
-      "data": {
-        "roll": -0.0036850334145128727,
-        "pitch": -0.0027896296232938766,
-        "yaw": 0.005008375737816095,
-        "omega_x": -0.005564269609749317,
-        "omega_y": -0.0035911037120968103,
-        "omega_z": 0.010128894820809364,
-        "acc_x": 0.01709669828414917,
-        "acc_y": -0.04324321448802948,
-        "acc_z": 9.810924530029297
-      }
-    },
     "/JOINTS_DATA_10HZ": {
       "header": {
         "frame_id": 1468700,

@@ -20,7 +20,6 @@ class AutomaticPreparation:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread = None
-        self._failure_latched = False
         self._startup_observation_started = False
         self._last_logged_status = None
         self._status = {'enabled': True, 'state': 'waiting', 'blocked_by': [],
@@ -82,17 +81,20 @@ class AutomaticPreparation:
                     self.plugin._worker is not None and self.plugin._worker.is_alive()):
                 self._record('busy', ['active_motion_task_in_progress'])
                 return
-            # A latched command failure needs review or an explicit new action;
-            # the supervisor must not repeatedly restart a failed worker.
-            if self.plugin._error or self.plugin._backend.safety_status().get('failed_closed'):
-                self._record('needs_review', ['driver_error_requires_review'])
+            if self.plugin._error:
+                self._record('waiting', [self.plugin._error])
                 return
             if self.authorization.authorized_now():
-                self._failure_latched = False
+                if self.plugin._backend.safety_status().get('failed_closed'):
+                    try:
+                        checked = self.plugin._backend.recover_worker()
+                    except Exception:
+                        self._record('waiting', ['command_channel_unavailable'])
+                        return
+                    if not checked.get('ready'):
+                        self._record('waiting', checked.get('blocked_by', ['command_channel_unavailable']))
+                        return
                 self._record('session_active')
-                return
-            if self._failure_latched:
-                self._record('needs_review', ['automatic_prepare_failed'])
                 return
             if not self.authorization.automatic_prepare_allowed():
                 self._record('explicit_prepare_required', ['automatic_prepare_not_authorized'])
@@ -103,9 +105,8 @@ class AutomaticPreparation:
             try:
                 result = self.plugin.dispatch('prepare_automatic', {})
             except Exception:
-                # Do not reset errors, change limits, or replay a previous task.
-                self._failure_latched = True
-                self._record('needs_review', ['automatic_prepare_failed'])
+                # Retry readiness on the next bounded tick; never replay motion.
+                self._record('waiting', ['automatic_prepare_unavailable'])
                 return
             if result.get('prepared') and self.authorization.authorized_now():
                 session = self.authorization.public_status()
@@ -113,17 +114,14 @@ class AutomaticPreparation:
                              last_session_id=session.get('session_id'))
             else:
                 blocked = result.get('blocked_by', ['prepare_not_ready'])
-                if any('requires_review' in reason for reason in blocked):
-                    self._failure_latched = True
-                self._record('needs_review' if self._failure_latched else 'waiting', blocked)
+                self._record('waiting', blocked)
 
     def _run(self):
         while not self._stop.is_set():
             try:
                 self.tick()
             except Exception:
-                self._failure_latched = True
-                self._record('needs_review', ['automatic_prepare_failed'])
+                self._record('waiting', ['automatic_prepare_unavailable'])
             self._stop.wait(self.interval_s)
 
     def close(self):

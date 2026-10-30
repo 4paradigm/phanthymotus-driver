@@ -447,7 +447,11 @@ def test_async_acceptance_returns_before_feedback_and_one_acknowledged_acp(loco,
         release.set()
         assert terminal(p, 'async-public')['completed']
         p._worker.join(1)
-        p._flush_notifications()
+        deadline = time.monotonic() + 1.
+        while not notifier.status(receipt['action_id']) and time.monotonic() < deadline:
+            # The background monitor may briefly own the nonblocking enqueue lock.
+            p._flush_notifications()
+            time.sleep(.01)
         assert notifier.process_pending() == 1
         assert len(posts) == 1
         callback = posts[0]
@@ -481,3 +485,39 @@ def test_compact_status_and_rejections_keep_diagnostics_in_info(loco):
     assert 'fresh_clear_fault_snapshot_required' in rejected['blocked_by']
     assert 'message' in rejected and 'readiness' not in rejected
     assert len(json.dumps(rejected)) < 1200
+
+
+@pytest.mark.parametrize('state,expected', [(0, [1, 17]), (1, [17]), (17, [])])
+def test_new_stand_up_rebuilds_failed_worker_without_manual_unlock(loco, state, expected):
+    p, backend, bridge, _, transports = loco
+    bridge.state = state
+    backend.abort()
+    assert call(p, 'stand_up', request_id='new-after-failure')['accepted']
+    assert terminal(p, 'new-after-failure')['completed']
+    assert [s for t in transports for s, _ in t.states] == expected
+    assert not any(t.velocity_commands for t in transports)
+    assert 'operator_intervention_required' not in call(p, 'info')['readiness']['blocked_by']
+
+
+def test_current_fault_blocks_then_recovers_on_fresh_request(loco):
+    p, backend, bridge, _, transports = loco
+    bridge.state = 0
+    backend.abort()
+    bridge.faults = [{'code': 33025}]
+    blocked = call(p, 'stand_up', request_id='fault-present')
+    assert not blocked['accepted']
+    assert 'fresh_clear_fault_snapshot_required' in blocked['blocked_by']
+    assert not any(t.states or t.velocity_commands for t in transports)
+    bridge.faults = []
+    assert call(p, 'stand_up', request_id='fault-cleared')['accepted']
+    assert terminal(p, 'fault-cleared')['completed']
+
+
+def test_monitor_output_error_does_not_lock_motion(loco):
+    p, _, _, _, _ = loco
+    def fail(*args): raise RuntimeError('monitor output unavailable')
+    p._publish = fail
+    p._event('test_monitor_failure')
+    assert p._status_error == 'status_publish_failed' and p._error is None
+    assert call(p, 'sit_down', request_id='monitor-error')['accepted']
+    assert terminal(p, 'monitor-error')['completed']
