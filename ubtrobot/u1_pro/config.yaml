@@ -2,7 +2,8 @@ mcp_port: 15740
 ros_namespace: ""
 idle_actions:
   # ROSA config client runs in the existing vendor container; no SDK idle endpoint.
-  # Only used by idle_actions. Driver/card lifecycle preserves this preference.
+  # Shared by idle_actions and expression smart control (disable on takeover,
+  # enable on exit). Preparing cards alone does not change the preference.
   native_container: walker-behavior.behavior-1
 ros:
   # Vendor control, authorization, TTS, and motion services run on domain 20.

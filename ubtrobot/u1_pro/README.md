@@ -28,27 +28,39 @@
 
 | 用途 | expression 输入 |
 | --- | --- |
-| 启动周期待机 | `{"action":"idle_start"}` |
-| 停止安排后续待机表情 | `{"action":"idle_stop"}` |
+| 画布开启智能控制时自动接管并启动周期 | `{"action":"start"}`（平台自动发送） |
+| 关闭原厂待机并启动智能控制周期 | `{"action":"idle_start"}` |
+| 结束智能控制并恢复原厂待机 | `{"action":"idle_stop"}` |
 | 查询循环和当前任务 | `{"action":"info"}` |
 
-原来的 `start` 仍只准备卡片，不自动启用循环。`play` 的名称、参数及完成通知保持原用法；`interrupt/stop` 先关闭循环，再执行原来的共享任务中断逻辑。`head` 的接口不变。
+将expression卡片保留在画布中，点击“开启智能控制”即可自动启动：平台会向该卡片发送MCP `start`，驱动内部按 `idle_start` 执行，无需再手动发送一次。`start` 快速返回 `state:"loading"` 和 `action_id`，平台通过 `info` 观察原厂关闭确认结果；成功后变为 `ready`，失败为 `error` 并附带原因。重复 `start` 在周期正在启动或运行时复用原周期和关联ID，不创建第二个线程；手动 `idle_start` 仍拒绝重复启动。驱动进程启动时的Python生命周期 `start()` 只准备卡片，不自动接管；没有在画布中开启智能控制时不会因此关闭原厂待机或播放周期。
 
-先通过独立的 `idle_actions.disable` 关闭原厂自动待机，并等待已提交的厂商动作结束。两种待机模式分开控制：`expression.idle_start` 会在后台读回原厂待机偏好，只有确认为关闭才启动，不自动修改该持久配置；开关为关闭也不等于已经确认电机静止。运行中不要另行开启原厂自动待机，否则两路可能竞争控制器。
+`play` 的名称、参数及完成通知保持原用法；调用时先关闭周期调度，当前任务确属该循环时，自动调用SDK中断，再播放指定表情。`interrupt` 关闭周期并执行原有共享任务中断，保留智能控制期间原厂待机关闭的状态；`stop` 则在后台中断当前任务、恢复原厂待机并结束智能控制。`head` 的接口不变。
 
-`idle_start` 快速返回 `state:"starting"` 和唯一 `action_id`；读取与启动结果通过 ACP 完成通知返回（`x-completion` 包含 `play` 和 `idle_start`，兜底120秒）。**启动完成表示循环已启用，不表示整个循环结束。** 原厂待机仍开启、查询失败等通过该启动通知报错。重复启动在旧线程仍运行时直接拒绝，避免创建多个循环。
+无需再单独操作 `idle_actions`：`expression.idle_start` 在后台调用同一个原生控制器发送 `disable`，服务成功且读回持久配置为关闭后，才启用周期。关闭失败或结果不确定时不发送周期表情。原厂已提交的动作仍允许完成；读回开关关闭不代表物理动作已经停止，当前接管流程没有原厂待机任务的完成屏障，首次周期动作与残余原厂动作仍可能重叠。运行中不要用独立开关另行开启原厂待机。独立 `idle_actions` 卡片继续保留，其自身接口不变。
 
-后台从当前固件实际开放的 `blink`、`gaze`、`distracted` 中选择，权重为70/20/10；注视、发呆尽量不连续重复。每轮随机等待3–7秒，已有TTS、head或expression任务时让出。预设通过同一个SDK任务槽串行提交，等待厂商对应UUID的真实结果事件后再安排下一轮，不按估算时长重复下发。
+`idle_start` 快速返回 `state:"starting"` 和唯一 `action_id`；关闭、读回及启动结果通过 ACP 完成通知返回。**启动完成表示原厂开关已关闭且循环已启用，不表示整个循环结束，也不表示原厂残余动作已停止。** 恢复原厂待机期间的启动会被拒绝，避免创建多个循环。`x-completion` 包含 `start`、`play`、`idle_start`、`idle_stop` 和 `stop`，兜底240秒，以覆盖启动请求收尾、当前任务等待和原生开关的有界调用；内部单次表情等待仍为120秒。
 
-循环内的每次预设仅走内部完成回调，不重复向ACP上报，避免每次眨眼都触发Agent对话。请求失败、取消或120秒没有结果时，循环进入 `error` 并停止安排新动作，详情通过 `expression.info.idle_loop.last_error` 和驱动日志查看；不会自动重发或全局中断。缺少完成事件时，活动任务槽会保留，不能把超时当成物理停止。
+后台从当前固件实际开放的 `confused`、`gaze`、`distracted`、`frown`、`pout`、`thinking` 中等概率选择，避免连续重复；如果固件只提供其中一个，则允许重复该动作。启动后以及每次动作成功完成后随机等待0.5–1.5秒，已有TTS、head或expression任务时让出。预设通过同一个SDK任务槽串行提交，等待厂商对应UUID的结果事件后再安排下一轮，不按估算时长重复下发。周期中不再主动选择 `blink`。
 
-`expression.info` 保留原 `state/active`，新增 `idle_loop`：`enabled`、`state`、`current_action_id`、`last_expression`、`completed_count`、`last_error`、`available_expressions`。后台活动任务在 `active` 中标记 `background:true`。
+循环内的每次预设仅走内部完成回调，不重复向ACP上报，避免每次表情都触发Agent对话。请求失败、取消或120秒没有结果时，循环进入 `error` 并停止安排新动作，详情通过 `expression.info.idle_loop.last_error` 和驱动日志查看；不会自动重发或全局中断。缺少完成事件时，活动任务槽会保留，不能把超时当成物理停止。
 
-`idle_stop` 只停止后续调度，不取消已接收的单次预设，也不影响其他前台任务；如需尝试打断当前动作，仍使用原 `interrupt`。中断后的本地 `cancelled` 不是物理停止证明。主动动作在后台预设播放期间仍沿用原来“任务槽忙”的返回，不自动抢占；需要切换时，先 `idle_stop`，等当前任务完成，再 `play`。驱动停止或卡片 `stop` 后不会继续启动周期动作。
+`expression.info` 保留 `active`，顶层 `state` 在启动确认期间为 `loading`，恢复期间为 `restoring`，失败为 `error`，其余为 `ready/idle`，并提供对应 `message`。新增 `idle_loop`：`enabled`、`state`、`current_action_id`、`last_expression`、`completed_count`、`last_error`、`available_expressions`，以及 `smart_control_active`（本次接管尚未完成原厂恢复）、`restoring_vendor_idle`（正在恢复）。后台活动任务在 `active` 中标记 `background:true`。`x-stop.pending_states` 声明 `restoring`，避免平台把恢复中当成已结束；平台自身每卡停止确认死线若先到，可能显示“停止未确认”，后台恢复结果仍通过ACP及info读取。
+
+`idle_stop` 快速返回 `state:"restoring"` 和 `action_id`：立即冻结后续调度，在后台等待尚未返回的启动请求收尾及当前驱动任务完成，再发送 `enable`，成功读回开启后才通过ACP报告智能控制结束。恢复期间拒绝新expression、head和TTS任务；不会为了退出而中断其他前台任务。当前任务120秒无完成结果、启动未收尾、enable失败或读回不确定时报告错误，不虚报恢复成功，允许再次调用 `idle_stop` 重试。若原厂偏好原本就是关闭，显式结束仍按用户要求发送enable，而不是恢复旧值。普通 `expression.play` 已支持自动接管周期动作，不必先手动 `interrupt`：
+
+1. 校验表情名称后关闭周期调度，检查当前任务ID、`background`标记及来源，只抢占本卡片循环自己的动作。
+2. 如果旧待机请求仍在提交，等待其返回；随后调用SDK `interrupt`。SDK调用期间保留任务占用和交接预约，其他expression、head、TTS不能插入。
+3. SDK明确确认中断请求后，再提交指定表情；如果旧动作已经自然结束，则跳过不必要的中断。
+4. 中断失败或超时，不发送新表情；通过新表情的ACP关联ID报告错误，旧活动任务不会被假装取消。尚未确认的旧请求也不会被盲目重发。
+
+接管路径在后台运行，MCP快速返回 `state:"queued"`、新表情的 `action_id` 和 `preempting_action_id`；最终播放结果仍走原 `play` 的ACP完成通知。新表情失败也只报告一次。调用 `play` 会关闭周期，播放结束后不会自动恢复，继续待机需再调用 `idle_start`；这仍属于智能控制，原厂待机保持关闭，明确调用 `idle_stop/stop` 才恢复。如果当前占用者是手动表情、TTS或head，则不会自动中断它，保留忙碌返回。周期恰好处于等待间隔时，直接关闭调度并正常播放，无需发送中断。
+
+共享中断也会等待已经接收的SDK提交结束，并阻止新任务在中断过程中进入。只有SDK确认中断请求后才清除对应任务、报告本地 `cancelled`；失败时保留任务槽并返回错误。SDK确认和本地 `cancelled` 都不是物理静止的证明；此改动没有增加传感器停止确认或复位动作。正常驱动关闭时，若本卡曾接管，会中断驱动任务并等待原厂恢复；未接管的卡片不因正常关闭而改写原厂偏好。进程被强杀或机器断电时无法保证发送enable，可用保留的独立idle_actions卡片恢复。
 
 ### 自动待机动作卡片 `idle_actions`
 
-此开关使用厂商原生 ROSA 配置服务，而 `system_controls` 的三个开关走公开 SDK，且在驱动启动时自动关闭。因此单独新增 `idle_actions`，避免把持久的待机偏好混入 SDK 开关和原有 `all` 操作。驱动、卡片的启动和停止均不改写待机偏好，只有显式调用 `enable`/`disable` 才会修改。
+此开关使用厂商原生 ROSA 配置服务，而 `system_controls` 的三个开关走公开 SDK，且在驱动启动时自动关闭。因此保留独立 `idle_actions`，避免把持久的待机偏好混入 SDK 开关和原有 `all` 操作。这张独立卡片的启动和停止不改写待机偏好，显式 `enable`/`disable` 才会修改；`expression` 智能控制现在复用同一控制器，在接管和退出时自动操作该偏好。
 
 在 `idle_actions` 卡片上调用：
 
