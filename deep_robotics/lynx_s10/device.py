@@ -167,7 +167,9 @@ class S10Nodes:
         self._camera_source_lock = threading.Lock()
         self._stream_stats = {
             name: {"received": 0, "published": 0, "dropped": 0,
-                   "last_received": None, "last_published": None}
+                   "last_received": None, "last_published": None,
+                   "last_rate_log": time.monotonic(), "last_rate_count": 0,
+                   "received_hz": 0.0, "published_hz": 0.0}
             for name in self.topics
         }
         self._motion_lock = threading.Lock()
@@ -395,16 +397,35 @@ class S10Nodes:
 
     def _record_stream(self, key, stage):
         now = time.time()
+        monotonic_now = time.monotonic()
         with self._stream_lock:
             stats = self._stream_stats[key]
             stats[stage] += 1
             if stage in ("received", "published"):
                 stats[f"last_{stage}"] = now
+                previous_count = stats.setdefault(f"_{stage}_rate_count", stats[stage])
+                previous_time = stats.setdefault(f"_{stage}_rate_time", monotonic_now)
+                interval = monotonic_now - previous_time
+                if interval >= 2.0:
+                    stats[f"{stage}_hz"] = round((stats[stage] - previous_count) / interval, 1)
+                    stats[f"_{stage}_rate_count"] = stats[stage]
+                    stats[f"_{stage}_rate_time"] = monotonic_now
             first = stats[stage] == 1
+            report_rate = (key in {"camera_left", "camera_rear", "lidar"} and
+                           monotonic_now - stats.get("last_rate_log", monotonic_now) >= 10.0)
+            if report_rate:
+                stats["last_rate_log"] = monotonic_now
+                received_hz = stats.get("received_hz", 0.0)
+                published_hz = stats.get("published_hz", 0.0)
+                counts = (stats["received"], stats["published"], stats["dropped"])
         if first and stage == "received":
             print(f"[ros2] first {key} sample received from {self._source_topics[key]}", flush=True)
         if first and stage == "published":
             print(f"[ros2] first {key} sample published to {self.topics[key]['topic']}", flush=True)
+        if report_rate:
+            print(f"[ros2] media rate lane={key} received_hz={received_hz:.1f} "
+                  f"published_hz={published_hz:.1f} received={counts[0]} "
+                  f"published={counts[1]} dropped={counts[2]}", flush=True)
 
     def stream_status(self):
         with self._stream_lock:
@@ -595,9 +616,10 @@ class S10Nodes:
         # JPEG payload, publish directly from the callback: sending it through
         # a worker only adds an IPC hop and a frame of latency. Raw/NV12 frames
         # still use the isolated encoder worker below.
-        payload = bytes(msg.data)
+        payload = msg.data
         if str(msg.encoding).lower() in {"jpeg", "jpg", "mjpeg"} and \
-                payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9"):
+                len(payload) >= 4 and payload[0] == 0xff and payload[1] == 0xd8 and \
+                payload[-2] == 0xff and payload[-1] == 0xd9:
             from sensor_msgs.msg import CompressedImage
             output = CompressedImage()
             output.header = msg.header
