@@ -17,6 +17,7 @@
 | [`limx/tron2`](limx/tron2/README.md) | 逐际动力 TRON2 双臂机器人 | 15791 | 头部/左右腕RGB摄像头、关节骨架与夹爪示意、双臂 MoveJ及自动验证复位 |
  | `brainco/revo2` | BrainCo Revo 2 灵巧手 | 15706 | 手指位置/预设手势/LED 控制、状态遥测，触觉版附带指尖触觉遥测 |
 | `linkerhand/l20_lite` | 灵心巧手 L20 Lite | 15733 | USB-RS485/Modbus 115200、10 关节控制与状态读取 |
+| [`linkerhand/l20`](linkerhand/l20/README.md) | 灵心巧手 L20-10 | 15734 | USB-CAN、16 主动关节控制、数字手势、自适应接触停止抓握与独立触觉感知，共四张卡片 |
 | `phanthy/remote_control` | 远程控制桥接 | 15710 | 远程控制中继 |
 
 ## 快速开始
