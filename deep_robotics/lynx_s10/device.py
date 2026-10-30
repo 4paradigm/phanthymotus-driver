@@ -570,9 +570,10 @@ class S10Nodes:
         return -0.25 <= age <= MEDIA_MAX_AGE_S
 
     def _forward_camera(self, key, msg, already_received=False):
-        if not self._fresh_header(msg.header):
-            self._record_stream(key, "dropped")
-            return
+        # S10 camera timestamps come from the AOS clock and are not guaranteed
+        # to share the container wall clock. Do not discard valid frames based
+        # on that clock skew; the worker/bridge latest-only queues provide the
+        # latency bound without blacking out the camera.
         if not already_received:
             self._record_stream(key, "received")
         if self.media_workers is not None:
@@ -595,9 +596,8 @@ class S10Nodes:
         self._record_stream(key, "published")
 
     def _forward_compressed_camera(self, key, msg, already_received=False):
-        if not self._fresh_header(msg.header):
-            self._record_stream(key, "dropped")
-            return
+        # The vendor declares MJPEG as sensor_msgs/Image. Its timestamp may be
+        # from a different clock domain, so freshness is diagnostic-only here.
         if not already_received:
             self._record_stream(key, "received")
         if self.media_workers is not None:
