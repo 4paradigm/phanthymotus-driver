@@ -769,13 +769,28 @@ class GloveTeleopPlugin:
 
     def _finish_disarm(self):
         with self._io_lock, self.hand._bus_lock:
-            for client in self._clients.values():
+            for side, client in self._clients.items():
+                started = time.monotonic()
+                acknowledged = False
                 try:
                     client.set_torques([0] * JOINT_COUNT)
+                    acknowledged = True
                 except Exception as exc:
                     with self._lock:
                         self._error = f"torque release failed: {exc}"
                 finally:
+                    finished = time.monotonic()
+                    with self._lock:
+                        age = self._side_received.get(side)
+                    print("[glove-release] " + json.dumps({
+                        "side": side,
+                        "timestamp_ms": int(time.time() * 1000),
+                        "zero_torque_acknowledged": acknowledged,
+                        "release_io_ms": round((finished - started) * 1000, 1),
+                        "last_sample_to_release_ms": (
+                            round((finished - age) * 1000, 1) if age is not None else None
+                        ),
+                    }), flush=True)
                     try:
                         client.close()
                     except Exception as exc:
@@ -900,8 +915,19 @@ class GloveTeleopPlugin:
             time.sleep(0.05)
 
     def _arm(self):
-        if os.environ.get("GLOVE_PREVIEW_ONLY") == "1":
-            raise RuntimeError("本次为骨架预览测试，已禁止灵巧手运动")
+        preview = os.environ.get("GLOVE_PREVIEW_ONLY")
+        if preview not in (None, "0", "1"):
+            raise ValueError("GLOVE_PREVIEW_ONLY must be 0 or 1")
+        preview_only = (
+            preview == "1"
+            if preview is not None
+            else self.config.get("preview_only", True)
+        )
+        if preview_only:
+            raise RuntimeError(
+                "默认仅骨架预览；完成时序验收后设置 GLOVE_PREVIEW_ONLY=0，"
+                "重新创建容器，再显式 arm(confirm_motion=true)"
+            )
         arm_started = time.monotonic()
         with self._lock:
             if self._armed:
@@ -1258,6 +1284,9 @@ class GloveTeleopPlugin:
                     "state": "running" if self._socket or self._thread else "idle",
                     "armed": self._armed,
                     "source_mode": self.source_mode,
+                    "watchdog_ms": self.watchdog_s * 1000,
+                    "preview_only_config": self.config.get("preview_only", True),
+                    "preview_only_override": os.environ.get("GLOVE_PREVIEW_ONLY"),
                     "arming": self._arming,
                     "cleanup_pending": self._pending_disarm,
                     "glove_port": (

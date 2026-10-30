@@ -7,3 +7,4 @@ services:
       GLOVE_SERIAL_PORT: ${GLOVE_SERIAL_PORT:?Set the receiver stable device path}
       L20_SERIAL_PORT: ${L20_SERIAL_PORT:?Set the hand RS485 device path}
       GLOVE_SOURCE_MODE: direct
+      GLOVE_PREVIEW_ONLY: ${GLOVE_PREVIEW_ONLY:-1}

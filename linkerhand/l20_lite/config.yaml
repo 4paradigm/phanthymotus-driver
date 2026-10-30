@@ -23,7 +23,10 @@ plugins:
     listen_host: "127.0.0.1"
     listen_port: 19012
     max_hz: 15
-    watchdog_ms: 800
+    # Preview until reader + Modbus release timing is accepted on this hardware.
+    preview_only: true
+    # Candidate stale-input cutoff, NOT a measured physical release bound.
+    watchdog_ms: 300
     max_delta_per_step: 16
     max_fraction_step: 0.05
     speed: 50

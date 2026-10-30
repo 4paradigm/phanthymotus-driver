@@ -24,6 +24,54 @@ from common.vendor_runtime import DriverBundle, load_config
 import modbus_device
 
 
+@pytest.fixture(autouse=True)
+def explicit_motion_opt_in_for_offline_tests(monkeypatch):
+    # Fake-UART motion tests deliberately opt in; production remains preview-only.
+    monkeypatch.setenv("GLOVE_PREVIEW_ONLY", "0")
+
+
+def test_default_preview_blocks_arm_before_discovery(monkeypatch):
+    monkeypatch.delenv("GLOVE_PREVIEW_ONLY", raising=False)
+    hand = FakeHand()
+    monkeypatch.setattr(hand, "_discover", lambda: pytest.fail("must not open hardware"))
+    config = load_config(str(DRIVER / "config.yaml"))["plugins"]["glove_teleop"]
+    assert config["preview_only"] is True
+    assert config["watchdog_ms"] == 300
+    device = glove.GloveTeleopPlugin(hand, config, "test", None)
+    with pytest.raises(RuntimeError, match="GLOVE_PREVIEW_ONLY=0"):
+        device._arm()
+    assert not hand._teleop_active
+
+
+def test_invalid_preview_override_cannot_enable_motion(monkeypatch):
+    monkeypatch.setenv("GLOVE_PREVIEW_ONLY", "false")
+    device = glove.GloveTeleopPlugin(FakeHand(), {}, "test", None)
+    with pytest.raises(ValueError, match="GLOVE_PREVIEW_ONLY"):
+        device._arm()
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_release_log_distinguishes_ack_from_failed_release(failed, capsys):
+    class ReleaseClient(FakeClient):
+        def set_torques(self, values):
+            if failed:
+                raise TimeoutError("no zero-torque reply")
+            super().set_torques(values)
+
+    device = glove.GloveTeleopPlugin(FakeHand(), {}, "test", None)
+    client = ReleaseClient()
+    device._clients["left"] = client
+    device._side_received["left"] = time.monotonic() - 0.3
+    device._finish_disarm()
+    log = capsys.readouterr().out.strip()
+    event = json.loads(log.removeprefix("[glove-release] "))
+    assert event["zero_torque_acknowledged"] is (not failed)
+    assert event["last_sample_to_release_ms"] >= 300
+    assert event["release_io_ms"] >= 0
+    assert ("close", None) in client.commands
+    assert not device._clients
+
+
 def packet(left=None, right=None, timestamp=1):
     return json.dumps(
         {
