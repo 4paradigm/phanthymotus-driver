@@ -34,7 +34,7 @@ RUN pip3 install --no-cache-dir -i "${PYPI_MIRROR}" -r /tmp/u1-requirements.txt 
 WORKDIR /work
 COPY --from=interface-builder /u1_ws/install /u1_ws/install
 COPY common/ /work/common/
-COPY main.py device.py config.yaml driver.yaml /work/
+COPY main.py device.py qr_scan.py config.yaml driver.yaml /work/
 COPY deploy/ /deploy/
 
 ENV ROS_DOMAIN_ID=42
