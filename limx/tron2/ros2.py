@@ -2,10 +2,10 @@
 import json
 import os
 import re
+import threading
 from pathlib import Path
 
 IMAGE_FRAMES = {'/limx_tron2/camera': 'tron2_head_camera',
-                '/limx_tron2/yolo/annotated': 'tron2_yolo',
                 '/limx_tron2/camera_left': 'tron2_left_wrist_camera',
                 '/limx_tron2/camera_right': 'tron2_right_wrist_camera'}
 
@@ -30,6 +30,7 @@ class JsonPublisher:
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
         from std_msgs.msg import String
         self.rclpy, self.message_type = rclpy, String
+        self.executor = self.spin_thread = None
         self.image_topics = set(image_topics)
         self.image_type = None
         if self.image_topics:
@@ -51,27 +52,42 @@ class JsonPublisher:
             self.close()
             raise
 
-    def publish(self, topic, data, stamp=None):
+    def publish(self, topic, data):
         if topic in self.image_topics:
             message = self.image_type()
             # This stamp is the relay's receipt/publish clock, not the camera's
             # unverified measurement timestamp. JPEG bytes remain unchanged.
             message.header.stamp = self.node.get_clock().now().to_msg()
             message.header.frame_id = IMAGE_FRAMES[topic]
-            if stamp is not None:
-                message.header.stamp.sec = stamp['sec']
-                message.header.stamp.nanosec = stamp['nanosec']
-                message.header.frame_id = stamp['frame_id']
             message.format, message.data = 'jpeg', data
         else:
             message = self.message_type()
             message.data = json.dumps(data, ensure_ascii=False, allow_nan=False)
         self.publishers[topic].publish(message)
-        if topic in self.image_topics:
-            return {'sec': message.header.stamp.sec, 'nanosec': message.header.stamp.nanosec,
-                    'frame_id': message.header.frame_id}
+
+    def subscribe_json(self, topic, callback):
+        """One original ROS context, lazily spun only when a control wire starts."""
+        if self.executor is None:
+            from rclpy.executors import SingleThreadedExecutor
+            self.executor = SingleThreadedExecutor()
+            self.executor.add_node(self.node)
+            self.spin_thread = threading.Thread(target=self.executor.spin,
+                name='tron2_control_input', daemon=True)
+            self.spin_thread.start()
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST, durability=DurabilityPolicy.VOLATILE)
+        return self.node.create_subscription(self.message_type, topic,
+            lambda message: callback(message.data), qos)
+
+    def unsubscribe(self, subscription):
+        self.node.destroy_subscription(subscription)
 
     def close(self):
+        if self.executor is not None:
+            self.executor.shutdown()
+            self.spin_thread.join(timeout=5)
+            self.executor = self.spin_thread = None
         if self.node:
             self.node.destroy_node()
             self.node = None

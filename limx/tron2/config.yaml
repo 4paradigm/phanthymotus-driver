@@ -15,5 +15,3 @@ plugins:
   camera: {enabled: true}
   camera_left: {enabled: true}
   camera_right: {enabled: true}
-  yolo_detect: {enabled: true}
-  head_visual_follow: {enabled: true}

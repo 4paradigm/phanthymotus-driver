@@ -63,7 +63,7 @@ def load_settings():
     if settings['stale_after_seconds'] < settings['poll_interval_seconds']:
         raise ValueError('Stale threshold must cover the poll interval')
     plugins = config.get('plugins', {})
-    allowed = {'joint_state', 'arm_control', 'move_head', 'pose', 'gripper', 'gripper_left', 'gripper_right', 'yolo_detect', 'head_visual_follow'} | set(CAMERA_SOURCES)
+    allowed = {'joint_state', 'arm_control', 'move_head', 'pose', 'gripper', 'gripper_left', 'gripper_right'} | set(CAMERA_SOURCES)
     if not isinstance(plugins, dict) or set(plugins) - allowed:
         raise ValueError('Only TRON2 sensor, arm_control and gripper plugins may be configured')
     enabled = []
@@ -74,9 +74,6 @@ def load_settings():
             enabled.append(name)
     if not set(enabled) & ({'joint_state'} | set(CAMERA_SOURCES)):
         raise ValueError('Enable at least one read-only sensor')
-    if 'head_visual_follow' in enabled:
-        from vision import validate_enabled
-        validate_enabled(enabled)
     settings['enabled_cards'] = enabled
     settings['home_file'] = os.environ.get('TRON2_HOME_FILE', '/config/tron2/home.json')
     # Fixed read-only video source on the same configured robot host. Callers
@@ -93,13 +90,12 @@ async def run():
     from ros2 import JsonPublisher
     from camera import CAMERA_SOURCES
     settings = load_settings()
+    from head_stream import STATE_TOPIC
     json_topics = [TOPICS[name] for name in settings['enabled_cards'] if name in TOPICS]
-    image_topics = [source[0] for name, source in CAMERA_SOURCES.items() if name in settings['enabled_cards']]
-    if 'yolo_detect' in settings['enabled_cards']:
-        from yolo_detect.engine import IMAGE_TOPIC, RESULT_TOPIC
-        json_topics.append(RESULT_TOPIC)
-        image_topics.append(IMAGE_TOPIC)
-    publisher = JsonPublisher(json_topics, image_topics=image_topics)
+    if 'move_head' in settings['enabled_cards']:
+        json_topics.append(STATE_TOPIC)
+    publisher = JsonPublisher(json_topics,
+        image_topics=[source[0] for name, source in CAMERA_SOURCES.items() if name in settings['enabled_cards']])
     tasks = []
     runner = None
     adapter = None
@@ -110,11 +106,10 @@ async def run():
             loop.add_signal_handler(signum, stopping.set)
         async with aiohttp.ClientSession(trust_env=False,
                 timeout=aiohttp.ClientTimeout(total=8)) as session:
-            def publish(topic, data):
-                stamp = publisher.publish(topic, data)
-                if adapter is not None and adapter.vision is not None:
-                    adapter.vision.on_image(topic, data, stamp)
-            adapter = Adapter(publish, settings, session=session)
+            adapter = Adapter(publisher.publish, settings, session=session)
+            if 'move_head' in adapter.enabled:
+                from head_stream import HeadStream
+                adapter.head_stream = HeadStream(adapter, publisher)
             ca = os.environ.get('AGENT_CORE_CA_CERT')
             if ca:
                 adapter.core_ssl = ssl.create_default_context(cafile=ca)
@@ -126,10 +121,6 @@ async def run():
             await web.TCPSite(runner, '127.0.0.1', PORT).start()
             LOG.info('TRON2 MCP on loopback:%s; sensor poll interval %ss',
                      PORT, settings['poll_interval_seconds'])
-            if set(adapter.enabled) & {'yolo_detect', 'head_visual_follow'}:
-                from vision import Runtime
-                adapter.vision = Runtime(adapter, publisher)
-                adapter.vision.launch()
             tasks = [asyncio.create_task(adapter.reader.run(session)),
                      asyncio.create_task(adapter.publish_loop()),
                      asyncio.create_task(adapter.register_loop(session)),
@@ -139,8 +130,8 @@ async def run():
                 for task in done:
                     task.result()
             finally:
-                if adapter.vision is not None:
-                    await adapter.vision.close()
+                if adapter.head_stream is not None:
+                    await adapter.head_stream.close()
                 await asyncio.gather(*(stream.close() for stream in adapter.cameras.values()))
                 await adapter.motion.close()
                 await adapter.head.close()
@@ -150,8 +141,8 @@ async def run():
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
     finally:
-        if adapter is not None and adapter.vision is not None:
-            await adapter.vision.close()
+        if adapter is not None and adapter.head_stream is not None:
+            await adapter.head_stream.close()
         if runner:
             await runner.cleanup()
         publisher.close()
