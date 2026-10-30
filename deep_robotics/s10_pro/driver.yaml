@@ -8,15 +8,10 @@ port: 15745
 mcp_url: http://localhost:15745/mcp
 description: Read-only S10 Pro Battery, Joints, LiDAR point-cloud and IMU monitoring
 build_context_extras:
-- ../../common
+  - ../../common
 cards:
-- name: battery
-  type: sensor
-- name: joints
-  type: sensor
-- name: model
-  type: resource
-- name: lidar_cloud
-  type: sensor
-- name: imu
-  type: sensor
+  - { name: battery,     type: sensor }
+  - { name: joints,      type: sensor }
+  - { name: model,       type: resource }
+  - { name: lidar_cloud, type: sensor }
+  - { name: imu,         type: sensor }
