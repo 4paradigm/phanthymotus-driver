@@ -64,8 +64,8 @@ TIMED_SPEED_MPS = .08
 TIMED_YAW_RATE_RAD_S = .15
 TIMED_DURATION_S = 2.
 TIMED_DURATION_RANGE_S = (.5, 5.)
-TIMED_LINEAR_RANGE_MPS = (.06, .12)
-TIMED_YAW_RANGE_RAD_S = (.08, .20)
+TIMED_LINEAR_RANGE_MPS = (.06, 1.)
+TIMED_YAW_RANGE_RAD_S = (.08, 1.)
 TIMED_RESPONSE_MPS = .05
 TIMED_RESPONSE_YAW_RAD_S = .04
 RELATIVE_SCOPES = {direction: 'relative_' + direction for direction in RELATIVE_DIRECTIONS}
@@ -484,6 +484,7 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
         self.timed_events_topic = base + '/timed_move_events'
         self.relative_status_topic = base + '/relative_move_status'
         self.relative_events_topic = base + '/relative_move_events'
+        self._stop_diagnostics = None
         if autostart:
             self._thread.start()
 
@@ -680,8 +681,8 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
             'title': 'Movement Direction', 'description': 'Select a bounded movement that stops automatically.'}
         schema = {'type': 'object', 'properties': {
             'direction': direction,
-            'speed': {'type': 'number', 'minimum': .06, 'maximum': .20, 'default': .08,
-                      'title': 'Speed', 'description': 'Translation: 0.06-0.12 m/s. Turning: 0.08-0.20 rad/s.'},
+            'speed': {'type': 'number', 'minimum': .06, 'maximum': 1., 'default': .08,
+                      'title': 'Speed', 'description': 'Translation: 0.06-1.00 m/s. Turning: 0.08-1.00 rad/s. Lower configured speed caps apply; expanded limits are pending hardware validation.'},
             'duration': {'type': 'number', 'minimum': .5, 'maximum': 5., 'default': 2.,
                          'title': 'Duration (s)'}},
                   'required': ['direction', 'speed', 'duration'], 'additionalProperties': False}
@@ -934,27 +935,58 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
         with self._lock:
             if self._active and self._active.get('request_id') == request_id:
                 self._phase = 'stopping'
-        stop_deadline = min(self._clock() + 1.2, request_deadline)
+        stop_started = self._clock()
+        stop_deadline = min(stop_started + 1.2, request_deadline)
         next_send, stable, last_sequence, send_count = self._clock(), 0, None, 0
-        sent = False
+        sent, last_check, trace = False, None, []
+
+        def finish(confirmed, cause, error_type=None):
+            self._stop_diagnostics = {
+                'confirmed': confirmed, 'failure_kind': cause,
+                'elapsed_s': max(0., self._clock() - stop_started),
+                'available_budget_s': max(0., stop_deadline - stop_started),
+                'zero_commands_sent': send_count, 'required_zero_commands': 2,
+                'consecutive_ready_samples': stable, 'required_ready_samples': 2,
+                'last_stationary_check': copy.deepcopy(last_check),
+                'recent_distinct_feedback': copy.deepcopy(trace), 'error_type': error_type}
+            return confirmed, sent
+
         while self._clock() < stop_deadline:
             if self._clock() >= next_send:
                 try:
                     receipt = self._backend.stop_distance(action, request_id)
                     sent = sent or receipt.get('sent') is True
                     send_count += receipt.get('sent') is True
-                except Exception:
-                    return False, sent
+                except Exception as exc:
+                    return finish(False, 'zero_command_send_failed', type(exc).__name__)
                 next_send = self._clock() + .1
-            observation = self._backend.distance_stopped()
+            try:
+                observation = self._backend.distance_stopped()
+            except Exception as exc:
+                return finish(False, 'stop_feedback_read_failed', type(exc).__name__)
+            last_check = observation.get('stationary_check')
             sequence = observation.get('sequence')
             if type(sequence) is int and sequence != last_sequence:
                 last_sequence = sequence
+                trace.append(copy.deepcopy(last_check))
+                trace = trace[-16:]
                 stable = stable + 1 if observation.get('stopped') else 0
                 if stable >= 2 and send_count >= 2:
-                    return True, sent
+                    return finish(True, None)
             time.sleep(.02)
-        return False, sent
+        check = last_check or {}
+        velocity = check.get('reported_velocity') or {}
+        moving = (all(type(velocity.get(k)) in (int, float) and math.isfinite(velocity[k])
+                      for k in ('vx', 'vy', 'yaw_rate')) and
+                  (math.hypot(velocity['vx'], velocity['vy']) >= check.get('linear_tolerance_mps', .05)
+                   or abs(velocity['yaw_rate']) >= check.get('yaw_tolerance_radps', .06)))
+        cause = ('stop_budget_exhausted' if stop_deadline <= stop_started else
+                 'stop_feedback_stale_or_missing' if check.get('feedback_fresh') is not True else
+                 'stop_motion_state_mismatch' if check.get('motion_state') != 17 else
+                 'reported_velocity_above_stop_tolerance' if moving else
+                 'insufficient_zero_commands' if send_count < 2 else
+                 'insufficient_stable_feedback')
+        return finish(False, cause)
 
     def _run_action(self, record, request, started):
         if request['action'] in RELATIVE_ACTIONS:
@@ -971,6 +1003,7 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
         confirmed = stop_confirmed = completed = False
         sent = pulse_completed = False
         command_frames = 0
+        self._stop_diagnostics = None
         min_vx = max_vx = None
         peak_signed_vx = peak_signed_yaw = None
         reason = 'timed_motion_incomplete'
@@ -1055,6 +1088,7 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
                 'reported_peak_signed_yaw_rad_s': peak_signed_yaw,
                 'completion_level': 'reported_velocity_response_and_reported_stop',
                 'physical_command_sent': sent, 'finished_at': self._wall()}
+            result['stop_diagnostics'] = copy.deepcopy(self._stop_diagnostics)
             try:
                 if self._tasks.finish(rid, result):
                     with self._lock:
@@ -1079,6 +1113,7 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
         receipt = {'accepted': None}
         sent = completed = stop_confirmed = confirmed = False
         command_frames, last_status = 0, None
+        self._stop_diagnostics = None
         reason = 'relative_motion_incomplete'
         try:
             initial = self._backend.begin_relative(action, request, self._cancel)
@@ -1166,6 +1201,7 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
                 'closed_loop_status': copy.deepcopy(last_status),
                 'completion_level': 'odometry_relative_target_and_reported_stop',
                 'physical_command_sent': sent, 'finished_at': self._wall()}
+            result['stop_diagnostics'] = copy.deepcopy(self._stop_diagnostics)
             try:
                 if self._tasks.finish(rid, result):
                     with self._lock:

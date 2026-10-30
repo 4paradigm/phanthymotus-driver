@@ -534,14 +534,18 @@ class MotionPlugin:
         except Exception:
             return {'delivery_state': 'status_unavailable', 'acknowledged': False}
 
+    def _notification_payload(self, record):
+        result = record['result']
+        return {'action_id': record['action_id'], 'request_id': record['request_id'],
+                'status': result['status'], 'result': result, 'tool': 'motion',
+                'ts': result['finished_at']}
+
     def _flush_notifications(self):
         if self._notifier is None or not self._notification_lock.acquire(blocking=False):
             return
         try:
             for record in self._tasks.pending_notifications():
-                result = record['result']
-                payload = {'action_id': record['action_id'], 'request_id': record['request_id'],
-                    'status': result['status'], 'result': result, 'tool': 'motion', 'ts': result['finished_at']}
+                payload = self._notification_payload(record)
                 try:
                     self._notifier.submit(payload)
                     self._tasks.mark_enqueued(record['request_id'])

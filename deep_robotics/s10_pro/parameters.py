@@ -46,11 +46,11 @@ _MOTION_FIELDS = {
                        'title': 'Maximum movement duration (s)', 'description': 'Application limit for a finite velocity request, in seconds.'},
     'action_timeout_s': {'type': 'number', 'minimum': .2, 'maximum': 15., 'default': 8.,
                          'title': 'Posture confirmation timeout (s)', 'description': 'Maximum wait for fresh posture confirmation, in seconds.'},
-    'max_vx': {'type': 'number', 'minimum': .01, 'maximum': .3, 'default': .2,
+    'max_vx': {'type': 'number', 'minimum': .01, 'maximum': 1., 'default': .2,
                'title': 'Forward speed limit (m/s)', 'description': 'Symmetric application limit on forward/backward velocity in m/s.'},
     'max_vy': {'type': 'number', 'minimum': .01, 'maximum': .15, 'default': .1,
                'title': 'Lateral speed limit (m/s)', 'description': 'Symmetric application limit on lateral velocity in m/s.'},
-    'max_yaw_rate': {'type': 'number', 'minimum': .01, 'maximum': .3, 'default': .2,
+    'max_yaw_rate': {'type': 'number', 'minimum': .01, 'maximum': 1., 'default': .2,
                      'title': 'Yaw rate limit (rad/s)', 'description': 'Symmetric application limit on turning rate in rad/s.'},
 }
 _CONFIG_DESCRIPTION = ('Omitted values preserve the current configuration. Explicit null, empty strings, '
@@ -265,7 +265,8 @@ def validate_motion_request(action, arguments, settings, wall_time=time.time, *,
         speed = values.get('speed', .15 if direction.startswith('turn_') else .08)
         duration = values.get('duration', 2.)
         if (type(speed) not in (int, float) or not math.isfinite(speed)
-                or not ((.08 <= speed <= .20) if direction.startswith('turn_') else (.06 <= speed <= .12))):
+                or not ((.08 <= speed <= min(1., current['max_yaw_rate'])) if direction.startswith('turn_')
+                        else (.06 <= speed <= min(1., current['max_vx'])))):
             raise ValueError('speed outside finite-motion direction range')
         if type(duration) not in (int, float) or not math.isfinite(duration) or not .5 <= duration <= 5.:
             raise ValueError('duration outside finite-motion range')

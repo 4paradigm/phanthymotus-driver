@@ -31,12 +31,21 @@ def card(name='lidar'):
     return value, bridge, published
 
 
-@pytest.mark.parametrize('name,hz,title', [('state', 1, 'Robot State'), ('joints', 5, 'Joint Feedback'),
-    ('imu', 5, 'IMU'), ('odometry', 5, 'Odometry'), ('lidar', 2, 'LiDAR Point Cloud')])
+@pytest.mark.parametrize('name,hz,title', [('state', 1, 'Robot State'), ('joints', 10, 'Joint Feedback'),
+    ('imu', 20, 'IMU'), ('odometry', 5, 'Odometry'), ('lidar', 2, 'LiDAR Point Cloud')])
 def test_sensor_schema_defaults_and_visible_names_match_runtime(name, hz, title):
     value, bridge, _ = card(name)
     tool = value.get_tool()
     assert tool['name'] == name and tool['title'] == f'S10 Pro · {title}'
+    if name in ('joints', 'imu'):
+        # These public monitors intentionally use the standard G1 renderer and
+        # empty action schema; their backend lifecycle remains independently tested.
+        assert tool['inputSchema'] == {'type': 'object', 'properties': {}}
+        assert tool['topic_in'] == []
+        assert tool['topic_out'] == value._ports()
+        assert value.status()['settings']['refresh_hz'] == hz
+        assert bridge.commands == []
+        return
     assert tool['topic_out'][0]['topic'] == f'/same_namespace/s10_pro/{name}'
     assert value.status()['settings']['refresh_hz'] == hz
     for key, schema in tool['configSchema']['properties'].items():
@@ -146,7 +155,7 @@ def test_motion_configuration_changes_update_velocity_defaults_and_limits_immedi
 
 @pytest.mark.parametrize('settings', [{'enabled': None}, {'enabled': 1}, {'unknown': 2},
     {'refresh_hz': False}, {'max_duration_s': ''}, {'max_duration_s': None},
-    {'max_vx': float('nan')}, {'max_vy': float('inf')}, {'max_yaw_rate': .31}, {'max_duration_s': 5.1}])
+    {'max_vx': float('nan')}, {'max_vy': float('inf')}, {'max_yaw_rate': 1.0001}, {'max_duration_s': 5.1}])
 def test_invalid_motion_settings_are_rejected(settings):
     with pytest.raises(ValueError):
         p.validate_motion_settings(settings)

@@ -62,6 +62,7 @@ class StationaryWindow:
             ready = valid and len(tail) >= STABLE_SAMPLES and duration + 1e-9 >= STABLE_DURATION_S
             speed = observed.get('velocity') or {}
             return {'ready': bool(ready), 'matching_samples': len(tail),
+                'feedback_fresh': bool(valid),
                 'required_samples': STABLE_SAMPLES, 'stable_duration_s': max(0., duration),
                 'required_duration_s': STABLE_DURATION_S,
                 'linear_tolerance_mps': LINEAR_TOLERANCE_MPS,

@@ -15,12 +15,9 @@ import xml.etree.ElementTree as ET
 from common.vendor_runtime import DriverBundle, load_config, make_handler, resolve_namespace, start_registration
 from bridge import ReaderBridge
 from device import build_plugins
-from motion import MotionPlugin, validate_contract
-from motion_backend import DDSMotionBackend
 from motion_process import DDSProcessTransport
 from motion_tasks import MotionTasks
 from acp import ACPNotifier
-from control_runtime import load_runtime_binding
 from operator_authorization import load_operator_authorization
 from automatic_prepare import start_automatic_preparation
 
@@ -35,48 +32,26 @@ def build_runtime_plugins(config, namespace, bridge, publish, *, notifier=None, 
     """
     operator = operator_authorization or load_operator_authorization(config)
     observer_bridge = bridge if motion_bridge is None else motion_bridge
-    if operator.configured:
-        from canvas_posture import CanvasPostureBackend, CanvasPosturePlugin
-        if os.environ.get('S10_EXECUTION_AUTHORIZATION_FILE') or (runtime_binding is not None and runtime_binding.authorized):
+    legacy_mode = bool(os.environ.get('S10_EXECUTION_AUTHORIZATION_FILE')
+                       or (runtime_binding is not None and runtime_binding.authorized))
+    if legacy_mode:
+        if operator.configured:
             operator.revoke('conflicting_execution_modes')
-        def make_posture_transport():
-            return DDSProcessTransport(config, execution_enabled=operator.authorized_now(),
-                                       supervised_posture=True)
-        transport = make_posture_transport()
-        backend = CanvasPostureBackend(observer_bridge, transport, operator,
-                                       transport_factory=make_posture_transport)
-        # This bounds reported-state observation, not an operator response,
-        # physical pose completion, or a robot-side stopping guarantee.
-        settings = {**config.get('motion', {}), 'action_timeout_s': 15.}
-        motion_plugin = CanvasPosturePlugin(settings, namespace, backend=backend,
-            feedback=backend.feedback, publish=publish,
-            execution_authorized=operator.authorized_now() or getattr(operator, 'supports_prepare', False),
-            authorization_provider=operator.authorized_now, notifier=notifier, tasks=tasks)
-        plugins = build_plugins(config, namespace, bridge, publish, motion=motion_plugin,
-                                motion_bridge=observer_bridge)
-        plugins.append(motion_plugin)
-        return plugins
-    binding = runtime_binding or load_runtime_binding(config)
-    policies = binding.contract.get('actions', {})
-    timeouts = [item['send_timeout_s'] for action, item in policies.items()
-                if isinstance(item, dict) and validate_contract(binding.contract, action)
-                and type(item.get('send_timeout_s')) in (int, float)] if isinstance(policies, dict) else []
-    transport = DDSProcessTransport(config, execution_enabled=binding.authorized,
-                                    rpc_budget_s=min(timeouts, default=.2))
+        raise ValueError('loco_move requires the protected operator Prepare policy; '
+                         'legacy execution-contract mode is not supported by this catalogue')
+    from loco_move import LocoMoveBackend, LocoMovePlugin
 
-    # The production runtime supplies a separate read-only child for motion.
-    # Point-cloud conversion and sensor IPC must not queue its feedback samples.
-    observer_bridge = bridge if motion_bridge is None else motion_bridge
-    motion_backend = DDSMotionBackend(observer_bridge, transport, contract=binding.contract,
-        authority_provider=binding.authority_provider if binding.authorized else None,
-        posture_stop=binding.posture_stop, execution_authorized=binding.authorized,
-        authorization_provider=binding.authorized_now, runtime_status=binding.public_status)
-    motion_plugin = MotionPlugin(config.get("motion", {}), namespace, backend=motion_backend,
-                                feedback=motion_backend.feedback, publish=publish, execution_authorized=binding.authorized,
-                                authorization_provider=binding.authorized_now,
-                                notifier=notifier, tasks=tasks)
-    # Strict motion/estop monitors share the existing isolated observer;
-    # lidar conversion on the sensor reader must not delay their display.
+    def make_posture_transport():
+        return DDSProcessTransport(config, execution_enabled=operator.authorized_now(),
+                                   supervised_posture=True)
+
+    backend = LocoMoveBackend(observer_bridge, make_posture_transport(), operator,
+                              transport_factory=make_posture_transport)
+    settings = {**config.get('motion', {}), 'action_timeout_s': 15.}
+    motion_plugin = LocoMovePlugin(settings, namespace, backend=backend,
+        feedback=backend.feedback, publish=publish,
+        execution_authorized=operator.authorized_now() or getattr(operator, 'supports_prepare', False),
+        authorization_provider=operator.authorized_now, notifier=notifier, tasks=tasks)
     plugins = build_plugins(config, namespace, bridge, publish, motion=motion_plugin,
                             motion_bridge=observer_bridge)
     plugins.append(motion_plugin)
@@ -177,12 +152,9 @@ def main():
         cleanup.callback(notifier.close)
         notifier.start()
         operator = load_operator_authorization(config)
-        binding = None if operator.configured else load_runtime_binding(config)
-        if binding is not None:
-            cleanup.callback(binding.close)
         bundle = DriverBundle(build_runtime_plugins(config, namespace, bridge, bus.publish,
                                                    notifier=notifier, tasks=tasks,
-                                                   motion_bridge=motion_bridge, runtime_binding=binding,
+                                                   motion_bridge=motion_bridge,
                                                    operator_authorization=operator))
         for plugin in bundle.plugins:
             if hasattr(plugin, "close"):
@@ -209,7 +181,7 @@ def main():
         # the posture observer and readiness supervisor; it never sends motion.
         if config.get("register", True):
             start_registration(port, config, "deep-robotics-s10-pro-driver")
-        authorized = operator.authorized_now() if operator.configured else binding.authorized_now()
+        authorized = operator.authorized_now()
         logging.info("S10 Pro monitoring cards and gated motion; namespace=%s port=%d domain=%d motion_authorized=%s", namespace, port, domain, authorized)
         server.serve_forever()
 

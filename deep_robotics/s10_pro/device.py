@@ -184,10 +184,11 @@ class ReadOnlyCard:
 
     def get_tool(self):
         if self.name in G1_CARDS:
-            output = {"name": self.name, "type": "sensor", "multiInstance": False,
+            output = {"name": self.name, "title": f"S10 Pro · {self.title}",
+                      "type": "sensor", "multiInstance": False,
                       "description": f"S10 Pro {self.title}, using the G1 card output format.",
                       "inputSchema": {"type": "object", "properties": {}},
-                      "topic_out": self._ports()}
+                      "topic_in": [], "topic_out": self._ports()}
             if self.name == "lidar_cloud":
                 output["configSchema"] = {"type": "object", "properties": {}}
             return output
@@ -227,7 +228,8 @@ class ReadOnlyCard:
     def get_tools(self):
         tools = [self.get_tool()]
         if self.name == "joints":
-            tools.append({"name": "model", "type": "resource", "description": "Read-only S10 Pro 16-joint skeleton model.",
+            tools.append({"name": "model", "title": "S10 Pro · Model", "type": "resource",
+                          "description": "Read-only S10 Pro 16-joint skeleton model.",
                           "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}})
         return tools
 

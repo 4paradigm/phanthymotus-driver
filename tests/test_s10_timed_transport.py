@@ -131,7 +131,7 @@ def test_distance_permit_may_repeat_same_bounded_request_and_zero_stop(adapter):
 
 
 @pytest.mark.parametrize('action,vx', [
-    ('forward_30cm', -.1), ('backward_30cm', .1), ('forward_30cm', .121),
+    ('forward_30cm', -.1), ('backward_30cm', .1), ('forward_30cm', 1.0001),
     ('stand', .1), ('move_mode', 0.)])
 def test_distance_scope_rejects_wrong_direction_speed_or_posture_action(adapter, action, vx):
     with pytest.raises(AuthorityUnavailable):

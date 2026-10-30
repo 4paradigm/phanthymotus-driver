@@ -4,11 +4,11 @@ from pathlib import Path
 import yaml
 
 from deep_robotics.s10_pro.device import build_plugins
-from test_s10_timed_move import runtime
+from test_s10_loco_move import loco
 
 
-def test_marketplace_catalogue_matches_supervised_runtime_without_motion(runtime):
-    motion, _, bridge, _, transports = runtime
+def test_marketplace_catalogue_matches_supervised_runtime_without_motion(loco):
+    motion, _, bridge, _, transports = loco
     manifest = yaml.safe_load((Path(__file__).resolve().parents[1] /
         'deep_robotics/s10_pro/driver.yaml').read_text())
     sensors = build_plugins({}, 'test', bridge, lambda *args: None, motion=motion)

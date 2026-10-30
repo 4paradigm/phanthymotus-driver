@@ -52,5 +52,6 @@ No same-method before/after size measurement exists yet for this local edit.
 After rebuilding, record both image IDs and docker image inspect Size values
 for the current and candidate ARM64 images, then report the exact byte delta.
 Do not claim a no-growth result from shared disk usage or compressed-vs-unpacked
-comparisons. These edits add no runtime package or new COPY payload, but that
-alone is not evidence that a rebuilt image has the same size.
+comparisons. The merged-card revision adds loco_move.py and diagnostic documentation to the
+COPY payload, with no new runtime package. This does not establish an unchanged
+image size; record the actual before/after sizes after a complete rebuild.

@@ -1,25 +1,24 @@
-# Current running-driver source
-
-Infrastructure rationale, the pinned ROS base and image-size measurement
-requirements are documented in [build reproducibility](deploy/BUILD_REPRODUCIBILITY.md).
-
-This revision imports the running Docker driver on 2026-10-30, including automatic
-preparation, the hidden manual Prepare entry, bounded/relative movement, and the
-read-only joint skeleton. Public monitor cards are battery, joints, lidar_cloud
-and imu, plus device availability. The historical sections below describe earlier
-versions. See [automatic preparation](README_AUTOMATIC_PREPARE.md) for current
-startup behavior. Existing PR deployment hardening is retained.
-
 # DEEP Robotics S10 Pro Driver
 
-S10 Pro is one driver bundle with one MCP endpoint at `127.0.0.1:15745/mcp`.
-The `phanthy-motus-agent-core-1` uses the standard platform container name. Its target
-implementation is the shared platform Core, without S10-specific image layers
-or source patches; use the approved standard baseline for comparison. The target application
-has exactly that Core and one `embodied-deep-robotics-s10-pro` driver container.
-This local candidate has not been built or deployed to the robot. Existing
-site storage, configuration, certificates and canvas data require a separate
-local inventory before any future migration; do not replace them with defaults.
+One Driver exposes an MCP endpoint at `127.0.0.1:15745/mcp`. Public tools are
+`battery`, `joints`, `model` (resource), `lidar_cloud`, `imu`, `device`, `loco_move`
+and `relative_move`. The standard Core is unchanged; deployment uses one Core
+and one Driver container, with existing site storage and credentials preserved.
+
+`loco_move` combines the former posture and timed-movement cards. Its actions are
+`stand_up` (stand then enter move mode), `stand_down`, finite `move`, and
+`stop_move` (application cancellation, not a hardware emergency stop). It has no
+canvas output ports. Status is queried through `info`/`status`; completion uses
+ACP. The default canvas action remains read-only `status`.
+
+See [locomotion and migration](deploy/LOCO_MOVE.md),
+[automatic preparation](README_AUTOMATIC_PREPARE.md), and
+[build reproducibility](deploy/BUILD_REPRODUCIBILITY.md).
+For checked updates to the original PR branch, see [update PR](deploy/UPDATE_PR.md).
+The supported production mode uses the protected operator Prepare policy.
+Legacy `S10_EXECUTION_AUTHORIZATION_FILE` execution-contract mode is rejected
+explicitly, so a second public tool catalogue cannot silently appear. Without
+an operator grant the same tools remain visible and motion stays unavailable.
 
 ## Pinned G1 development reference
 
@@ -98,31 +97,30 @@ keep their upstream license files and verify field compatibility separately.
 
 ## Cards and motion boundaries
 
-The manifest lists state, joints, IMU, odometry, LiDAR, motion feedback, device
-health, hardware e-stop, errors, motion events, capabilities, ROS graph and
-restricted device-management cards. The configured supervised mode adds
-`motion`, `timed_move` and `relative_move` through the same driver bundle.
-Cards are idle at process start; start only enables their defined observations.
+The public catalogue is listed above. Reader sources such as hardware e-stop,
+faults and odometry remain internal control checks rather than separate cards.
+Sensors begin idle. Under an enabled protected policy, automatic Prepare starts
+motion observation and prepares a session/channel; it sends no posture or speed
+command. Missing/stale feedback, faults and revoked authority remain blockers.
 
-Default output paths are `/{namespace}/s10_pro/{card}`, with separate
-`posture_status|posture_events`, `timed_move_status|timed_move_events` and
-`relative_move_status|relative_move_events` outputs. LiDAR keeps its point-cloud
-port and a separate JSON metadata port. Preserve raw timestamps and unknown
-units. Freshness uses monotonic receive time; missing and stale data must not
-appear live. Stopping a sensor releases only its own leases.
+From reported state 0, `stand_up` requests state 1, confirms fresh stationary
+feedback, then requests state 17. From state 1 it performs the second stage only;
+stationary state 17 completes without commands. `stand_down` waits for final idle
+state 0. Each stage retains its original policy scope and the task has one shared
+deadline, mutex and terminal completion. Vendor remote navigation mode remains a
+site prerequisite; reported state does not prove vendor control ownership.
 
-Motion is disabled by default. Explicit deployment policy and a successful
-prepare operation are required for a supervised session of up to 60 minutes.
-A card or DDS subscriber does not establish vendor control ownership.
-`stand` requests state 1, `lie` requests state 4 and waits for final state 0,
-and `move_mode` requests state 17 from stationary state 1. To leave state 17,
-use lie before stand. Navigation mode on the vendor remote remains a site
-prerequisite; it is not inferred from feedback.
+Finite `move` supports forward/backward or in-place turns for 0.5-5 seconds.
+Translation accepts 0.06-1.00 m/s and turning 0.08-1.00 rad/s; the selected speed
+default is 0.08 and explicitly configured lower caps still apply. Completion
+requires direction-consistent feedback and confirmed stopping. Speed multiplied
+by duration is not measured displacement. These expanded limits need separate
+hardware acceptance.
 
-Timed movement supports forward/backward and in-place left/right turns for
-0.5-5 seconds. Translation limits are 0.06-0.12 m/s; turns use 0.08-0.20 rad/s.
-Completion requires direction-consistent feedback and confirmed stopping.
-Speed multiplied by duration is not measured displacement.
+The merged card ignores known hidden direction/speed/duration values on other
+actions, because the canvas can still submit them after switching action.
+Unrelated unknown parameters remain rejected. Stage failures include
+`failed_stage`, `failure_phase`, `reason` and `blocked_by` for diagnosis.
 
 Relative movement uses /ODOM for one axis per task: translation 0.3-0.6 m or
 30/60-degree turns. Translation limits are 0.06-0.12 m/s; turns use

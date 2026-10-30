@@ -1,41 +1,11 @@
-# Current runtime update
+# S10 motion cards
 
-Automatic preparation runs in the driver when enabled and the protected policy
-is valid. The canvas no longer exposes a manual Prepare action. See
-[automatic preparation](../README_AUTOMATIC_PREPARE.md). The older manual-start
-notes below are historical; all motion requests still require healthy feedback
-and a valid session.
-
-# S10 Posture, Timed and Relative Movement Cards
-
-The three tools belong to one S10 driver and share its controller, authorization,
-task history and chassis lock. Starting a card observes state; it does not
-open a motion session or switch the robot mode. A protected prepare policy
-allows an explicit session of up to 60 minutes after readiness checks.
-
-| Tool | Operations | Completion evidence |
-| --- | --- | --- |
-| motion | prepare, stand, lie, move_mode | Preparation sends no motion. Posture requests require fresh reported state; lie waits for final state 0. |
-| timed_move | forward, backward, turn_left, turn_right | Direction-consistent velocity response and fresh stationary feedback after repeated zero commands. |
-| relative_move | forward, backward, left, right, turn_left, turn_right | Valid /ODOM reaches the target, settles and confirms stopping. |
-
-Use state 1 before requesting move_mode (17). The vendor state machine ignores
-stand directly from 17: lie to final state 0 before stand. Navigation mode on
-the handheld remains a site prerequisite. Do not infer vendor control ownership
-from a DDS match, card state or reported motion state.
-
-Timed movement uses speed and duration, never odometry distance. Relative
-movement accepts distance for translation or angle for turns. Its speed default
-is valid for both direction classes; backend limits remain authoritative.
-Relative movement decelerates and stops on drift; full trajectory correction
-has not been implemented. Physical relative movement is not accepted yet.
-
-Each card owns separate status and event topics under /{namespace}/s10_pro:
-posture_status/posture_events, timed_move_status/timed_move_events and
-relative_move_status/relative_move_events. Do not connect them to a shared
-legacy motion output. Lifecycle stop requests cancellation through the existing
-shared controller. It is not a hardware e-stop or a guarantee that the robot
-has stopped; completion must retain actual stop-confirmation evidence.
+The current interface is `loco_move` plus the independent `relative_move` tool.
+See [the current contract and migration](LOCO_MOVE.md) for actions, speed ranges,
+completion and saved-canvas migration. Former `motion` and `timed_move` tools
+are retired from the public catalogue. `loco_move` has no output ports; relative
+movement retains its own ports. Read status through info/status and await ACP.
+Automatic Prepare is unchanged and never selects a posture or sends velocity.
 
 ## Packaging and future provisioning
 

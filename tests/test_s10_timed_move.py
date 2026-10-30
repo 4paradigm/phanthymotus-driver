@@ -341,7 +341,7 @@ def test_timed_turn_uses_yaw_axis_and_confirms_stop(runtime, direction, sign):
 
 
 @pytest.mark.parametrize('arguments', [
-    {'direction': 'forward', 'speed': .13, 'duration': 2.},
+    {'direction': 'forward', 'speed': 1.01, 'duration': 2.},
     {'direction': 'turn_left', 'speed': .07, 'duration': 2.},
     {'direction': 'turn_right', 'speed': .15, 'duration': 5.1},
 ])

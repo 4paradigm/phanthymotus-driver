@@ -16,9 +16,9 @@ spec.loader.exec_module(setup)
 def test_new_modules_are_in_image_and_timed_card_is_in_manifest():
     dockerfile = (DRIVER / 'Dockerfile').read_text()
     assert all(name in dockerfile for name in ('canvas_posture.py', 'stationary_feedback.py',
-                                                'relative_motion.py'))
+                                                'relative_motion.py', 'loco_move.py'))
     cards = yaml.safe_load((DRIVER / 'driver.yaml').read_text())['cards']
-    assert {'motion', 'timed_move', 'relative_move'} <= {c['name'] for c in cards}
+    assert {'loco_move', 'relative_move'} <= {c['name'] for c in cards}
 
 
 def test_supervised_overlay_mounts_identity_and_policy_read_only():

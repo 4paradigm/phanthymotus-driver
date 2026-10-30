@@ -6,7 +6,7 @@ hardware_model: "s10-pro"
 image_name: deep-robotics-s10-pro
 port: 15745
 mcp_url: "http://localhost:15745/mcp"
-description: "S10 Pro battery, joint skeleton, IMU and point-cloud monitoring, device availability, and gated posture, timed and relative movement"
+description: "S10 Pro battery, joint skeleton, IMU and point-cloud monitoring, device availability, unified loco_move and separate gated relative movement"
 build_context_extras:
   - ../../common
 # Public tools advertised by the configured supervised driver bundle.
@@ -18,8 +18,7 @@ cards:
   - {name: lidar_cloud, type: sensor}
   - {name: imu, type: sensor}
   - {name: device, type: actuator}
-  - {name: motion, type: actuator}
-  - {name: timed_move, type: actuator}
+  - {name: loco_move, type: actuator}
   - {name: relative_move, type: actuator}
 # Hardware e-stop, fault and odometry feedback remain internal motion checks.
 # No charging action is exposed.

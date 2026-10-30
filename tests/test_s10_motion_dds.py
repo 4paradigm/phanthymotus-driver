@@ -412,3 +412,39 @@ def test_optional_installed_ros_generated_messages_without_participant():
     assert state.data.state == 1
     assert state.header.stamp.sec == 1_792_000_000
     assert nav.data.x_vel == .125 and nav.data.y_vel == -.0625 and nav.data.yaw_vel == .25
+
+@pytest.mark.parametrize('scope,velocity', [('forward_30cm', 1.), ('backward_30cm', -1.)])
+def test_finite_linear_transport_cap_expands_without_expanding_relative(setup, scope, velocity):
+    clock, node, _, codec, original = setup
+    original.close()
+    adapter = DDSCommandAdapter(node, execution_enabled=True, supervised_posture=True,
+                                codec=codec, clock=clock)
+    try:
+        adapter.prepare_state_channel()
+        adapter.publish_velocity(velocity, authority=operator_permit(clock, scope, 'expanded'))
+        with pytest.raises(AuthorityUnavailable):
+            adapter.publish_velocity(velocity * 1.01, authority=operator_permit(clock, scope, 'too-fast'))
+        relative = 'relative_forward' if velocity > 0 else 'relative_backward'
+        with pytest.raises(AuthorityUnavailable):
+            adapter.publish_velocity(velocity, authority=operator_permit(clock, relative, 'relative-unchanged'))
+        adapter.publish_zero_velocity(authority=operator_permit(clock, scope, 'zero'))
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize('scope,yaw', [('turn_left', 1.), ('turn_right', -1.)])
+def test_finite_turn_cap_does_not_expand_relative_turn_cap(setup, scope, yaw):
+    clock, node, _, codec, original = setup
+    original.close()
+    adapter = DDSCommandAdapter(node, execution_enabled=True, supervised_posture=True,
+                                codec=codec, clock=clock)
+    try:
+        adapter.prepare_state_channel()
+        adapter.publish_velocity(yaw_rate=yaw, authority=operator_permit(clock, scope, 'turn'))
+        with pytest.raises(AuthorityUnavailable):
+            adapter.publish_velocity(yaw_rate=yaw*1.01, authority=operator_permit(clock, scope, 'too-fast'))
+        with pytest.raises(AuthorityUnavailable):
+            adapter.publish_velocity(yaw_rate=yaw, authority=operator_permit(clock, 'relative_'+scope, 'relative'))
+        adapter.publish_zero_velocity(authority=operator_permit(clock, scope, 'zero'))
+    finally:
+        adapter.close()

@@ -406,11 +406,13 @@ class DDSCommandAdapter:
             expected = 1 if base_scope in ('forward_30cm', 'turn_left', 'forward', 'left') else -1
             turning = base_scope.startswith('turn_')
             lateral = base_scope in ('left', 'right')
-            invalid = ((vx != 0 or vy != 0 or abs(yaw_rate) > .20
+            linear_limit = .12 if relative else 1.
+            yaw_limit = .20 if relative else 1.
+            invalid = ((vx != 0 or vy != 0 or abs(yaw_rate) > yaw_limit
                         or (yaw_rate != 0 and yaw_rate * expected <= 0)) if turning else
                        (vx != 0 or yaw_rate != 0 or abs(vy) > .12
                         or (vy != 0 and vy * expected <= 0)) if lateral else
-                       (vy != 0 or yaw_rate != 0 or abs(vx) > .12
+                       (vy != 0 or yaw_rate != 0 or abs(vx) > linear_limit
                         or (vx != 0 and vx * expected <= 0)))
             if invalid:
                 raise AuthorityUnavailable('navigation command exceeds its direction or speed scope')
