@@ -25,7 +25,7 @@ async def exercise():
  reader.head_control_status=AsyncMock(return_value={'vr_head_follow':False})
  reader.send_movej=AsyncMock();reader.send_gripper=AsyncMock();adapter.head.report=AsyncMock(return_value=True)
  feedback();runtime=Runtime(adapter,bus);adapter.follow_runtime=runtime
- await runtime.call({'action':'start','input_topic':VOP_TOPIC})
+ await runtime.call({'action':'start'})
  def detection(people):
   bus.callback(json.dumps({'timestamp':time.time(),'latency_ms':0,'count':len(people),
    'objects':[{'name':'person','confidence':.95,'position':xy} for xy in people]}))

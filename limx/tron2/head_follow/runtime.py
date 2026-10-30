@@ -10,6 +10,8 @@ from .client import Client, require, pose
 from .engine import Engine, VOP_TOPIC, parse_frame
 from vendor import motion_readiness
 
+PREPARE_SECONDS = 1.5
+
 
 class Runtime:
     def __init__(self, adapter, publisher, clock=time.monotonic, wall=time.time):
@@ -106,26 +108,33 @@ class Runtime:
                 (self.adapter.head.last or {}).get('action_id') == g['head_id'],
                 '模式核对期间参考姿态或头部控制权变化，未发送')
 
+    def bind(self):
+        if self.bound:
+            return
+        self.generation += 1
+        generation = self.generation
+        sub = self.publisher.subscribe_json(VOP_TOPIC, lambda raw:self.receive(raw,generation))
+        with self.data_lock:
+            self.subscription = sub
+            self.bound = True
+            self.packet = None
+
     async def call(self, args):
         require(not self.closed, '头部跟随正在关闭')
         action = args.get('action','info')
-        if action == 'start':
+        clean = {k:v for k,v in args.items() if k not in ('input_topic','input_topics')}
+        require(not set(clean)-{'action','instance_id','_trace_id'}, '不支持的跟随参数')
+        if action in ('start','follow'):
+            # No canvas wire is needed. Legacy matching metadata is harmless;
+            # callers cannot select a different camera, topic or endpoint.
             topics = args.get('input_topics') or []
             require(isinstance(topics,list) and all(isinstance(t,str) for t in topics), 'VOP输入话题无效')
             if args.get('input_topic'):
                 topics = [args['input_topic'], *topics]
-            topics = list(dict.fromkeys(topics))
-            require(topics == [VOP_TOPIC], '请将TRON2头部相机的VOP输出接到跟随卡片：'+VOP_TOPIC)
-            if not self.bound:
-                self.generation += 1
-                generation = self.generation
-                sub = self.publisher.subscribe_json(VOP_TOPIC, lambda raw:self.receive(raw,generation))
-                with self.data_lock:
-                    self.subscription = sub
-                    self.bound = True
-                    self.packet = None
+            require(all(topic == VOP_TOPIC for topic in topics), '本卡片独立读取TRON2头部VOP，不接受其它输入话题')
+            self.bind()
         if action == 'stop':
-            self.engine.stop_requested.set()  # Gate a send waiting for its mode query.
+            self.engine.stop_requested.set()
             with self.data_lock:
                 self.generation += 1
                 self.bound = False
@@ -134,8 +143,16 @@ class Runtime:
             if sub is not None:
                 self.publisher.unsubscribe(sub)
         if action == 'follow':
-            require(self.bound, '先开启头部相机→VOP→head_visual_follow后再执行跟随')
-        clean = {k:v for k,v in args.items() if k not in ('input_topic','input_topics')}
+            generation = self.generation
+            deadline = self.loop.time()+PREPARE_SECONDS
+            while True:
+                require(not self.closed and self.bound and generation == self.generation, '跟随准备已取消')
+                try:
+                    parse_frame(self.detections(), self.wall())
+                    break
+                except ValueError:
+                    require(self.loop.time()<deadline, '等待头部VOP的新鲜人物检测；请先开启camera→VOP')
+                    await asyncio.sleep(.05)
         return await asyncio.to_thread(self.engine.call, clean)
 
     def info(self):

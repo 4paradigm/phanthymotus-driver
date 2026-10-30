@@ -5,7 +5,7 @@ import threading
 import time
 from .client import Client, Error, require, finite, pose, terminal
 
-VERSION = '0.2.0'
+VERSION = '0.2.1'
 CAMERA = '/limx_tron2/camera'
 VOP_TOPIC = CAMERA + '/objects'
 MAX_FRAME_AGE = 1.5
@@ -14,12 +14,12 @@ LOSS_SECONDS = 1.5
 
 def tool():
     return {'name':'head_visual_follow', 'type':'actuator', 'multiInstance':False,
-        'description':'TRON2人物头部跟随：接VOP后执行，跟随画面人物；确认无人后回正。',
+        'description':'TRON2人物头部跟随：无需连线，内部读取头部VOP；执行后跟随人物，确认无人后回正。',
         'inputSchema':{'type':'object','additionalProperties':False,'properties':{
             'action':{'type':'string','enum':['follow','stop','info'],'default':'follow','title':'操作'}},
             'required':['action'],'x-resource':['head','arm_l','arm_r'],
             'x-action-params':{'follow':{'params':[],'description':'寻找画面人物并跟随'}}},
-        'topic_in':[{'format':'data/json','desc':'TRON2头部相机的VOP检测'}]}
+        'topic_in':[],'topic_out':[]}
 
 
 def center(point):
@@ -110,7 +110,9 @@ class Engine:
     def info(self):
         with self.control:
             return copy.deepcopy({'service': 'tron2-head-visual-follow', 'version': VERSION,
-                'input_topic': VOP_TOPIC, 'observation_time_basis':self.time_basis, 'measurement_time_verified':False,
+                'detection_topic': VOP_TOPIC,
+                'topic_in':[],'topic_out':[],
+                'observation_time_basis':self.time_basis, 'measurement_time_verified':False,
                 'state': self.state, 'active': self.active, 'target_center_normalized': self.target,
                 'input_error': self.input_error, 'error': self.error, 'head_motion': self.pending,
                 'send_result_unknown': self.unknown_send, 'head_commands_sent': self.commands,

@@ -47,7 +47,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         if self.runner:await self.runner.cleanup()
 
     async def start(self):
-        return await self.adapter.execute_tool('head_visual_follow',{'action':'start','input_topic':VOP_TOPIC})
+        return await self.adapter.execute_tool('head_visual_follow',{'action':'start'})
 
     def packet(self,people=((.6,0.),)):
         return json.dumps({'timestamp':time.time(),'latency_ms':0,'objects':[
@@ -67,7 +67,8 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(tools['move_head']['inputSchema']['properties']),{'pitch_deg','yaw_deg','time'})
         self.assertNotIn('topic_in',tools['move_head'])
         self.assertEqual(list(tools['head_visual_follow']['inputSchema']['x-action-params']),['follow'])
-        self.assertEqual(tools['head_visual_follow']['topic_in'][0]['format'],'data/json')
+        self.assertEqual(tools['head_visual_follow']['topic_in'],[])
+        self.assertEqual(tools['head_visual_follow']['topic_out'],[])
         self.no_sends()
 
     async def test_lifecycle_launch_info_and_health_never_arm_or_deadlock(self):
@@ -79,11 +80,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.no_sends()
 
     async def test_source_must_be_head_vop_and_exactly_one(self):
-        for args in ({},{'input_topic':'/limx_tron2/camera_left/objects'},
+        for args in ({'input_topic':'/limx_tron2/camera_left/objects'},
                      {'input_topics':[VOP_TOPIC,'/other']},{'input_topics':'bad'}):
             with self.assertRaises(Error):await self.runtime.call({'action':'start',**args})
         self.assertIsNone(self.pub.callback);self.no_sends()
-        with self.assertRaises(Error):await self.runtime.call({'action':'follow'})
+        with patch('head_follow.runtime.PREPARE_SECONDS',.05),self.assertRaises(Error):
+            await self.runtime.call({'action':'follow'})
 
     async def test_delayed_old_callback_and_invalid_payload_cannot_rearm(self):
         await self.start();old=self.pub.callback
@@ -138,6 +140,31 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(Error,'阻塞'):self.runtime.robot()
         self.no_sends()
 
+    async def test_info_authoritatively_has_no_canvas_ports_or_binding(self):
+        result=await self.adapter.execute_tool('head_visual_follow',{'action':'info','instance_id':'canvas','_trace_id':'inference'})
+        self.assertEqual(result['topic_in'],[])
+        self.assertEqual(result['topic_out'],[])
+        self.assertEqual(result['detection_topic'],VOP_TOPIC)
+        self.assertEqual(self.runtime.info()['topic_in'],result['topic_in'])
+        self.assertFalse(self.runtime.bound);self.assertFalse(result['active'])
+        self.assertIsNone(self.pub.callback);self.no_sends()
+
+    async def test_manual_follow_subscribes_fixed_vop_without_start_or_wire(self):
+        task=asyncio.create_task(self.adapter.execute_tool('head_visual_follow',{'action':'follow'}))
+        await asyncio.sleep(.05)
+        self.assertTrue(self.runtime.bound);self.assertIsNotNone(self.pub.callback)
+        self.pub.callback(self.packet())
+        result=await asyncio.wait_for(task,2)
+        self.assertTrue(result['active']);self.assertEqual(result['topic_in'],[])
+        self.assertEqual(result['detection_topic'],VOP_TOPIC);self.no_sends()
+
+    async def test_stop_while_waiting_for_vop_cancels_enable(self):
+        task=asyncio.create_task(self.adapter.execute_tool('head_visual_follow',{'action':'follow'}))
+        await asyncio.sleep(.05);old=self.pub.callback
+        await self.runtime.call({'action':'stop'});old(self.packet())
+        with self.assertRaises(Error):await task
+        self.assertFalse(self.runtime.engine.active);self.no_sends()
+
     async def test_real_loopback_mcp_exposes_follow_and_uses_lifecycle(self):
         app=web.Application();app.router.add_post('/mcp',self.adapter.rpc);app.router.add_get('/health',self.adapter.health)
         self.runner=web.AppRunner(app);await self.runner.setup()
@@ -148,7 +175,16 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 async with session.post(url+'/mcp',json={'jsonrpc':'2.0','id':1,'method':method,'params':params}) as r:return await r.json()
             r=await rpc('tools/list',{})
             self.assertIn('head_visual_follow',{t['name'] for t in r['result']['tools']})
-            r=await rpc('tools/call',{'name':'head_visual_follow','arguments':{'action':'start','input_topic':VOP_TOPIC}})
+            follow=next(t for t in r['result']['tools'] if t['name']=='head_visual_follow')
+            self.assertEqual(follow['topic_in'],[])
+            self.assertEqual(follow['topic_out'],[])
+            r=await rpc('tools/call',{'name':'head_visual_follow','arguments':{'action':'info','instance_id':'canvas-inference'}})
+            self.assertFalse(r['result']['isError'])
+            resolved=json.loads(r['result']['content'][0]['text'])
+            self.assertEqual(resolved['topic_in'],[])
+            self.assertEqual(resolved['detection_topic'],VOP_TOPIC)
+            self.assertFalse(self.runtime.bound);self.assertIsNone(self.pub.callback)
+            r=await rpc('tools/call',{'name':'head_visual_follow','arguments':{'action':'start'}})
             self.assertFalse(r['result']['isError']);self.assertTrue(self.runtime.bound)
             async with session.get(url+'/health') as r:h=await r.json()
             self.assertFalse(h['head_visual_follow']['active'])
