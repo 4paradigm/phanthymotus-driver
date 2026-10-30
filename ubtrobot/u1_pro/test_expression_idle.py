@@ -57,7 +57,7 @@ class ExpressionIdleTests(unittest.TestCase):
     def test_schema_and_start_preserve_normal_expression_behavior(self):
         schema = self.plugin.get_tool()["inputSchema"]
         self.assertEqual(schema["x-completion"], {"actions": ["start", "play", "idle_start", "idle_stop", "stop"], "timeout": 240})
-        self.assertEqual(schema["x-stop"], {"pending_states": ["restoring"]})
+        self.assertNotIn("x-stop", schema)
         self.assertEqual(schema["x-resource"], device.VENDOR_ACTION_RESOURCE)
         self.assertIn("idle_stop", schema["properties"]["action"]["enum"])
         self.bundle.start_all()
@@ -691,7 +691,8 @@ class ExpressionIdleTests(unittest.TestCase):
         self.nodes.trigger_call = mock.Mock(return_value={"success": False})
         self.plugin.dispatch("stop", {"action_id": "failed-stop"})
         self.loop._end_thread.join(2)
-        self.assertEqual(self.notify.call_args.args[:2], ("failed-stop", "error"))
+        self.assertEqual(self.notify.call_args.args[:2], ("failed-stop", "completed"))
+        self.assertEqual(self.loop.info()["state"], "error")
         self.control.set_enabled.assert_called_once_with(False)
         self.assertIsNotNone(self.audio._active)
         self.assertTrue(self.loop.info()["smart_control_active"])
@@ -798,7 +799,7 @@ class ExpressionIdleTests(unittest.TestCase):
         self.assertIs(worker, self.loop._thread)
         self.control.set_enabled.assert_called_once_with(False)
 
-    def test_canvas_stop_exposes_pending_restore_then_idle(self):
+    def test_canvas_stop_acknowledges_before_background_restore_finishes(self):
         self.loop.GAP_MIN = self.loop.GAP_MAX = 10
         self.call_expression_mcp("start")
         self.wait_for(lambda: self.loop.info()["state"] == "running")
@@ -812,9 +813,14 @@ class ExpressionIdleTests(unittest.TestCase):
         self.control.set_enabled.side_effect = enable
         try:
             result = self.call_expression_mcp("stop", action_id="canvas-stop")
-            self.assertEqual(result["state"], "restoring")
+            self.assertEqual(result["state"], "idle")
+            self.assertTrue(result["accepted"])
+            self.assertEqual(result["completion_scope"], "request_accepted")
             self.assertTrue(entered.wait(1))
-            self.assertEqual(self.call_expression_mcp("info")["state"], "restoring")
+            info = self.call_expression_mcp("info")
+            self.assertEqual(info["state"], "idle")
+            self.assertTrue(info["idle_loop"]["restoring_vendor_idle"])
+            self.assertEqual(self.notify.call_args.args[:2], ("canvas-stop", "completed"))
         finally:
             release.set()
         self.loop._end_thread.join(2)

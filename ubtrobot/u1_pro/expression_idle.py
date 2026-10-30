@@ -12,8 +12,8 @@ from native_idle_actions import safe_native_detail
 
 class ExpressionIdleLoop:
     WEIGHTS = {name: 1 for name in ("confused", "gaze", "distracted", "frown", "pout", "thinking")}
-    GAP_MIN = 0.5
-    GAP_MAX = 1.5
+    GAP_MIN = 3.0
+    GAP_MAX = 5.0
     ACTION_TIMEOUT = 120.0
     TRANSITION_TIMEOUT = 35.0
     POLL_INTERVAL = 0.25
@@ -87,7 +87,7 @@ class ExpressionIdleLoop:
                     "message": "已停止安排新的待机表情，已接收的单次动作允许执行完成。",
                     "idle_loop": self._snapshot()}
 
-    def end(self, action_id, *, interrupt=False, shutdown=False):
+    def end(self, action_id, *, interrupt=False, shutdown=False, accept_only=False):
         """End smart control and restore native idle, reporting completion via ACP."""
         with self._lock:
             if self.control is None:
@@ -105,7 +105,7 @@ class ExpressionIdleLoop:
             self._enabled = False
             self._state = "restoring"
             self._managed = True  # A failed/uncertain restoration must remain retryable.
-            worker = threading.Thread(target=self._end, args=(action_id, self._thread, interrupt),
+            worker = threading.Thread(target=self._end, args=(action_id, self._thread, interrupt, accept_only),
                                       name="u1-expression-restore", daemon=True)
             self._end_thread = worker
             try:
@@ -117,6 +117,12 @@ class ExpressionIdleLoop:
                 with self.audio._lock:
                     self.audio._native_restoring = False
                 raise
+        if accept_only:
+            result = {"state": "idle", "action": "stop", "action_id": action_id,
+                      "accepted": True, "completion_scope": "request_accepted",
+                      "message": "停止请求已接收，后台继续中断动作并恢复原厂待机。"}
+            self.notify(action_id, "completed", result)
+            return result
         return {"state": "restoring", "action": "stop" if interrupt else "idle_stop",
                 "action_id": action_id,
                 "message": "已暂停周期调度，正在等待当前任务结束并恢复原厂待机开关。"}
@@ -127,7 +133,7 @@ class ExpressionIdleLoop:
             raise RuntimeError("Vendor idle preference change was not confirmed")
         return result
 
-    def _end(self, action_id, loop_thread, interrupt):
+    def _end(self, action_id, loop_thread, interrupt, accept_only=False):
         status, result = "error", {}
         try:
             if interrupt:
@@ -172,7 +178,10 @@ class ExpressionIdleLoop:
                 with self.audio._lock:
                     self.audio._native_restoring = False
                 result["idle_loop"] = self._snapshot()
-        self.notify(action_id, status, result)
+        if not accept_only:
+            self.notify(action_id, status, result)
+        elif status == "error":
+            print(f"[U1 expression idle] background cleanup failed: {result['message']}")
 
     def _pick(self, previous):
         names = [name for name in self.expressions if name != previous]

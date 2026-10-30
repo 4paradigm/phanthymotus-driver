@@ -41,11 +41,11 @@
 
 `idle_start` 快速返回 `state:"starting"` 和唯一 `action_id`；关闭、读回及启动结果通过 ACP 完成通知返回。**启动完成表示原厂开关已关闭且循环已启用，不表示整个循环结束，也不表示原厂残余动作已停止。** 恢复原厂待机期间的启动会被拒绝，避免创建多个循环。`x-completion` 包含 `start`、`play`、`idle_start`、`idle_stop` 和 `stop`，兜底240秒，以覆盖启动请求收尾、当前任务等待和原生开关的有界调用；内部单次表情等待仍为120秒。
 
-后台从当前固件实际开放的 `confused`、`gaze`、`distracted`、`frown`、`pout`、`thinking` 中等概率选择，避免连续重复；如果固件只提供其中一个，则允许重复该动作。启动后以及每次动作成功完成后随机等待0.5–1.5秒，已有TTS、head或expression任务时让出。预设通过同一个SDK任务槽串行提交，等待厂商对应UUID的结果事件后再安排下一轮，不按估算时长重复下发。周期中不再主动选择 `blink`。
+后台从当前固件实际开放的 `confused`、`gaze`、`distracted`、`frown`、`pout`、`thinking` 中等概率选择，避免连续重复；如果固件只提供其中一个，则允许重复该动作。启动后以及每次动作成功完成后随机等待3–5秒，已有TTS、head或expression任务时让出。预设通过同一个SDK任务槽串行提交，等待厂商对应UUID的结果事件后再安排下一轮，不按估算时长重复下发。周期中不再主动选择 `blink`。
 
 循环内的每次预设仅走内部完成回调，不重复向ACP上报，避免每次表情都触发Agent对话。请求失败、取消或120秒没有结果时，循环进入 `error` 并停止安排新动作，详情通过 `expression.info.idle_loop.last_error` 和驱动日志查看；不会自动重发或全局中断。缺少完成事件时，活动任务槽会保留，不能把超时当成物理停止。
 
-`expression.info` 保留 `active`，顶层 `state` 在启动确认期间为 `loading`，恢复期间为 `restoring`，失败为 `error`，其余为 `ready/idle`，并提供对应 `message`。新增 `idle_loop`：`enabled`、`state`、`current_action_id`、`last_expression`、`completed_count`、`last_error`、`available_expressions`，以及 `smart_control_active`（本次接管尚未完成原厂恢复）、`restoring_vendor_idle`（正在恢复）。后台活动任务在 `active` 中标记 `background:true`。`x-stop.pending_states` 声明 `restoring`，避免平台把恢复中当成已结束；平台自身每卡停止确认死线若先到，可能显示“停止未确认”，后台恢复结果仍通过ACP及info读取。
+`expression.info` 保留 `active`，顶层 `state` 在启动确认期间为 `loading`，等待确认的 `idle_stop` 恢复期间为 `restoring`，失败为 `error`，其余为 `ready/idle`。卡片 `stop` 改为请求接收即完成：后台线程启动后立即返回 `state:idle`、`accepted:true`、`completion_scope:request_accepted`，ACP也立即报告completed，仅代表停止请求已接收。停止后info顶层保持idle，实际收尾进度与错误通过 `idle_loop.state/restoring_vendor_idle/last_error` 查看；后台收尾不再次发送相互矛盾的完成通知，失败写入日志。移除 `x-stop.pending_states`，平台不再等待后台恢复。内部任务占用、恢复互斥和进程关闭时等待恢复的逻辑仍保留。`idle_stop` 仍提供等待恢复确认的语义。
 
 `idle_stop` 快速返回 `state:"restoring"` 和 `action_id`：立即冻结后续调度，在后台等待尚未返回的启动请求收尾及当前驱动任务完成，再发送 `enable`，成功读回开启后才通过ACP报告智能控制结束。恢复期间拒绝新expression、head和TTS任务；不会为了退出而中断其他前台任务。当前任务120秒无完成结果、启动未收尾、enable失败或读回不确定时报告错误，不虚报恢复成功，允许再次调用 `idle_stop` 重试。若原厂偏好原本就是关闭，显式结束仍按用户要求发送enable，而不是恢复旧值。普通 `expression.play` 已支持自动接管周期动作，不必先手动 `interrupt`：
 
@@ -59,6 +59,8 @@
 共享中断也会等待已经接收的SDK提交结束，并阻止新任务在中断过程中进入。只有SDK确认中断请求后才清除对应任务、报告本地 `cancelled`；失败时保留任务槽并返回错误。SDK确认和本地 `cancelled` 都不是物理静止的证明；此改动没有增加传感器停止确认或复位动作。正常驱动关闭时，若本卡曾接管，会中断驱动任务并等待原厂恢复；未接管的卡片不因正常关闭而改写原厂偏好。进程被强杀或机器断电时无法保证发送enable，可用保留的独立idle_actions卡片恢复。
 
 ### 自动待机动作卡片 `idle_actions`
+
+收尾时延：停止周期的事件会立即唤醒3–5秒随机间隔，不必等间隔结束。`idle_stop` 仍允许当前任务完成，等待上限120秒；`stop` 会先请求SDK中断，但提交收尾等待上限12秒，SDK服务发现/响应也各有10秒等待。原生配置写入外层上限25秒，另加最多5秒读回。因此当前协议不保证五秒内实际恢复完成，`restoring` 期间不能视为完成。要缩短实际时延，需要优化原生配置调用与SDK等待链路；仅缩短平台超时会丢失完成确认。
 
 驱动正常关闭时，只要智能控制仍持有原厂待机偏好，就会尝试开启并读回确认；SDK中断失败或超时也不跳过该恢复步骤，原中断错误仍返回。关闭恢复会等待尚在进行的启动禁用操作收尾，但不依赖未确认的动作完成事件。若恢复失败会明确报告，不承诺断电、强杀或配置服务不可用时一定恢复成功。
 

@@ -2010,6 +2010,7 @@ class ExpressionPlugin:
         self.audio = audio
         self.running = False
         self._smart_start_id = None
+        self._stop_accepted = False
         if catalog_available:
             self.EXPRESSIONS = {name: value for name, value in self.EXPRESSIONS.items()
                                 if motion_catalog and value[0] in motion_catalog}
@@ -2024,7 +2025,7 @@ class ExpressionPlugin:
             "idle_start": ([], "Disable and verify vendor idle, then start periodic confused/gaze/distracted/frown/pout/thinking presets; completion acknowledges startup only."),
             "idle_stop": ([], "End smart control: freeze scheduling, wait for accepted tasks, enable and verify vendor idle, then complete."),
             "interrupt": ([], "Interrupt the current expression motion."),
-            "stop": ([], "Interrupt the current U1 Pro motion, restore vendor idle, then end smart control."),
+            "stop": ([], "Acknowledge stop immediately; interrupt motion and restore vendor idle in the background. Check info for cleanup errors."),
             "info": ([], "Read the expression card and active playback state."),
         }
         schema = action_schema(actions, {
@@ -2032,7 +2033,6 @@ class ExpressionPlugin:
             "action_id": {"type": "string", "description": "Optional ACP action correlation ID."},
         })
         schema["x-completion"] = {"actions": ["start", "play", "idle_start", "idle_stop", "stop"], "timeout": 240}
-        schema["x-stop"] = {"pending_states": ["restoring"]}
         schema["x-resource"] = VENDOR_ACTION_RESOURCE
         return tool(self.PREFIX, "actuator", "控制 U1 Pro 预设表情和轻量手势，例如微笑和眨眼；头部动作由 head 卡片提供。", schema)
 
@@ -2068,6 +2068,7 @@ class ExpressionPlugin:
                             "action": "start", "action_id": self._smart_start_id, "idle_loop": state,
                             "message": "智能控制正在启动。" if state["state"] == "starting" else "智能控制周期已启用。"}
                 result = self.idle_loop.start(action_id)
+                self._stop_accepted = False
                 self._smart_start_id = action_id
                 self.running = True
                 if action == "start":
@@ -2076,7 +2077,14 @@ class ExpressionPlugin:
                     result.update(state="loading", action="start")
                 return result
             self.running = False
-            return self.idle_loop.end(action_id, interrupt=action == "stop")
+            previous = self._stop_accepted
+            self._stop_accepted = action == "stop"
+            try:
+                return self.idle_loop.end(action_id, interrupt=action == "stop",
+                                          accept_only=action == "stop")
+            except Exception:
+                self._stop_accepted = previous
+                raise
         if action == "play":
             name = str(args.get("name", "")).strip().lower()
             if name not in self.EXPRESSIONS:
@@ -2094,6 +2102,8 @@ class ExpressionPlugin:
             idle = self.idle_loop.info()
             state = {"starting": "loading", "restoring": "restoring", "error": "error"}.get(
                 idle["state"], "ready" if self.running else "idle")
+            if self._stop_accepted:
+                state = "idle"
             return {"state": state, "active": active, "idle_loop": idle,
                     "message": idle["last_error"] or (
                         "正在关闭并确认原厂待机开关。" if state == "loading" else
