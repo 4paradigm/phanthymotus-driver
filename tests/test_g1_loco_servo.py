@@ -53,6 +53,22 @@ def card(t=None, reader=None, **cfg):
 def send(obj, cmd=None):
     obj._on_message(SimpleNamespace(data=json.dumps(cmd or command())))
 
+def test_published_twist_descriptor_units_match_axis_groups():
+    obj, _ = card()
+    descriptor = obj.dispatch("info", {})["control_interface"]
+    assert descriptor["joint_names"] == ["vx", "vy", "vz", "wx", "wy", "wz"]
+    assert descriptor["units"] == {"linear": "m/s", "angular": "rad/s", "time": "s"}
+    assert descriptor["groups"] == [
+        {"name": "base_linear", "offset": 0, "count": 3, "unit": "m/s", "resource": "base"},
+        {"name": "base_angular", "offset": 3, "count": 3, "unit": "rad/s", "resource": "base"},
+    ]
+    parsed = m.parse_descriptor(descriptor)
+    assert [(g.offset, g.count, g.unit, g.resource) for g in parsed.groups] == [
+        (0, 3, "m/s", "base"), (3, 3, "rad/s", "base")
+    ]
+    assert parsed.resources == ("base",)
+
+
 def test_submit_deadline_and_mapping():
     obj, t = card(); cmd = command(); before = time.monotonic(); send(obj, cmd)
     args, deadline = t.moves[0]
