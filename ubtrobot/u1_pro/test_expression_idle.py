@@ -220,7 +220,7 @@ class ExpressionIdleTests(unittest.TestCase):
             for _ in range(15):
                 self.assertIn(self.loop._pick(previous), expected - {previous})
 
-    def test_manual_expression_interrupts_idle_then_plays_and_does_not_resume_loop(self):
+    def test_manual_expression_interrupts_idle_then_resumes_after_completion(self):
         self.start_loop()
         self.wait_for(lambda: len(self.nodes.string_calls) == 1)
         with self.audio._lock:
@@ -243,15 +243,17 @@ class ExpressionIdleTests(unittest.TestCase):
         self.assertEqual(result["state"], "queued")
         self.assertIn("preempting_action_id", result)
         self.wait_for(lambda: sequence == ["interrupt", "A007"] and self.audio._handoff is None)
-        self.assertFalse(self.loop.info()["enabled"])
-        self.loop._thread.join(2)
-        self.assertEqual(self.loop.info()["state"], "stopped")
+        self.assertTrue(self.loop.info()["enabled"])
+        time.sleep(0.04)
+        self.assertEqual(len(self.nodes.string_calls), 2)
         self.audio._on_playback_state({"uuid": old_uuid, "phase": "result", "success": True})
         self.assertEqual(self.audio._active["action_id"], "manual")
         self.finish_active()
         self.assertEqual([c.args[:2] for c in self.notify.call_args_list],
                          [("start-loop", "completed"), ("manual", "completed")])
-        self.assertEqual(len(self.nodes.string_calls), 2)
+        self.wait_for(lambda: len(self.nodes.string_calls) == 3)
+        self.assertTrue(self.audio._active["background"])
+        self.control.set_enabled.assert_called_once_with(False)
 
     def test_handoff_blocks_other_tasks_even_if_old_completion_arrives_during_interrupt(self):
         entered, release = threading.Event(), threading.Event()
@@ -365,13 +367,13 @@ class ExpressionIdleTests(unittest.TestCase):
         self.assertEqual(self.nodes.interrupts, 0)
         self.finish_active()
 
-    def test_idle_in_gap_stops_then_regular_expression_plays_without_interrupt(self):
+    def test_idle_in_gap_stays_enabled_and_manual_expression_needs_no_interrupt(self):
         self.loop.GAP_MIN = self.loop.GAP_MAX = 10
         self.start_loop()
         self.wait_for(lambda: self.loop.info()["state"] == "running")
         result = self.plugin.dispatch("play", {"name": "smile", "action_id": "manual"})
         self.assertEqual(result["state"], "queued")
-        self.assertFalse(self.loop.info()["enabled"])
+        self.assertTrue(self.loop.info()["enabled"])
         self.assertEqual(self.nodes.interrupts, 0)
         self.assertEqual(self.nodes.string_calls[0][1]["action"], "A007")
         self.finish_active()
@@ -423,6 +425,21 @@ class ExpressionIdleTests(unittest.TestCase):
         self.assertEqual(self.nodes.string_calls[0][1]["action"], "A007")
         self.assertEqual(self.nodes.interrupts, 0)
         self.finish_active()
+        self.wait_for(lambda: len(self.nodes.string_calls) == 2)
+        self.assertTrue(self.loop.info()["enabled"])
+        self.assertTrue(self.audio._active["background"])
+
+    def test_explicit_stop_during_manual_expression_prevents_cycle_resumption(self):
+        self.start_loop()
+        self.wait_for(lambda: len(self.nodes.string_calls) == 1)
+        self.plugin.dispatch("play", {"name": "smile", "action_id": "manual"})
+        self.wait_for(lambda: len(self.nodes.string_calls) == 2 and self.audio._handoff is None)
+        self.loop.stop()
+        self.finish_active()
+        self.loop._thread.join(2)
+        time.sleep(0.04)
+        self.assertFalse(self.loop.info()["enabled"])
+        self.assertEqual(len(self.nodes.string_calls), 2)
 
     def test_failed_explicit_interrupt_keeps_active_and_does_not_report_cancelled(self):
         self.audio.dispatch("speak", {"text": "hello", "action_id": "foreground"})
@@ -590,7 +607,7 @@ class ExpressionIdleTests(unittest.TestCase):
         self.finish_active()
         self.control.set_enabled.assert_called_once_with(False)
         self.assertTrue(self.loop.info()["smart_control_active"])
-        self.assertFalse(self.loop.info()["enabled"])
+        self.assertTrue(self.loop.info()["enabled"])
         self.end_loop()
         self.loop._end_thread.join(2)
         self.assertEqual(self.control.set_enabled.call_args_list, [mock.call(False), mock.call(True)])

@@ -192,7 +192,8 @@ class ExpressionIdleLoop:
             previous = None
             while not stop.wait(self._rng.uniform(self.GAP_MIN, self.GAP_MAX)):
                 with self.audio._lock:
-                    busy = self.audio._active is not None
+                    busy = (self.audio._active is not None or self.audio._handoff is not None
+                            or self.audio._interrupting)
                 if busy:
                     continue
                 name = self._pick(previous)
@@ -257,7 +258,7 @@ class ExpressionIdleLoop:
                 if self._current == action_id:
                     self._current = None
             if response.get("state") == "cancelled":
-                return "stopped"
+                return "busy" if response.get("preempted") and not stop.is_set() else "stopped"
             if response.get("state") == "error" and response.get("message") == "another U1 Pro audio action is active":
                 return "busy"
             raise RuntimeError("Unexpected idle expression response")
@@ -269,6 +270,8 @@ class ExpressionIdleLoop:
                 if stop.is_set():
                     return "stopped"
                 if outcome["status"] != "completed":
+                    if outcome["status"] == "cancelled" and outcome["result"].get("preempted"):
+                        return "busy"
                     raise RuntimeError("Idle expression ended with status " + str(outcome["status"]))
                 return "completed"
             if time.monotonic() >= deadline:

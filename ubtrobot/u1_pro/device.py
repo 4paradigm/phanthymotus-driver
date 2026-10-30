@@ -1490,7 +1490,8 @@ class AudioPlugin:
             self._active = None
             self._completion_callback = None
             self._submission = None
-        self._complete(active, "cancelled", {"state": "cancelled", "action_id": active["action_id"]}, callback)
+        self._complete(active, "cancelled", {"state": "cancelled", "action_id": active["action_id"],
+                                            "preempted": active.get("preempted", False)}, callback)
 
     def queue_expression(self, payload, action_id, idle_action_id):
         """Reserve a foreground handoff only if the current task belongs to this idle loop."""
@@ -1502,6 +1503,7 @@ class AudioPlugin:
             if owned_idle and self._handoff is None and not self._interrupting and not self._native_restoring:
                 handoff = {"action_id": action_id, "cancelled": False}
                 self._handoff = handoff
+                active["preempted"] = True
                 submission = self._submission
                 worker = threading.Thread(target=self._preempt_expression,
                                           args=(payload, handoff, active, submission),
@@ -1531,6 +1533,7 @@ class AudioPlugin:
                     return
                 if active is target:
                     self._interrupt_vendor()
+                    target["preempted"] = True
                     self._cancel_active(target)
                 elif active is not None:
                     raise RuntimeError("Another U1 Pro task took over; no interrupt or expression was sent")
@@ -1588,15 +1591,20 @@ class AudioPlugin:
             self._submission = submission
         try:
             with self._command_lock:
-                if cancel_event is not None and cancel_event.is_set():
+                with self._lock:
+                    preempted = (self._active is not None and
+                                 self._active["action_id"] == action_id and
+                                 self._active.get("preempted", False))
+                if (cancel_event is not None and cancel_event.is_set()) or preempted:
                     with self._lock:
                         if self._active and self._active["action_id"] == action_id:
                             self._active = None
                             self._completion_callback = None
                             self._submission = None
                     self._complete({"action_id": action_id, "tool_name": tool_name}, "cancelled",
-                                   {"state": "cancelled", "action_id": action_id}, on_complete)
-                    return {"state": "cancelled", "action_id": action_id}
+                                   {"state": "cancelled", "action_id": action_id,
+                                    "preempted": preempted}, on_complete)
+                    return {"state": "cancelled", "action_id": action_id, "preempted": preempted}
                 result = self.nodes.string_call(kind, vendor_payload)
                 submission["error"] = _vendor_request_failed(result)
                 returned_uuid = _vendor_action_uuid(result)
@@ -2012,7 +2020,7 @@ class ExpressionPlugin:
     def get_tool(self):
         actions = {
             "start": ([], "Begin smart control: automatically disable vendor idle and start the idle expression cycle, as idle_start does."),
-            "play": (["name"], "Play a declared expression; stop periodic idle and interrupt its active preset first, without preempting other foreground tasks."),
+            "play": (["name"], "Play a declared expression; interrupt its active idle preset, then automatically resume an enabled idle cycle after playback completes."),
             "idle_start": ([], "Disable and verify vendor idle, then start periodic confused/gaze/distracted/frown/pout/thinking presets; completion acknowledges startup only."),
             "idle_stop": ([], "End smart control: freeze scheduling, wait for accepted tasks, enable and verify vendor idle, then complete."),
             "interrupt": ([], "Interrupt the current expression motion."),
@@ -2076,7 +2084,7 @@ class ExpressionPlugin:
                 raise ValueError("expression.play requires one of the declared expression names")
             legacy_action, _motion_name = self.EXPRESSIONS[name]
             action_id = str(args.get("action_id") or uuid.uuid4())[:128]
-            idle_action_id = self.idle_loop.stop()["idle_loop"]["current_action_id"]
+            idle_action_id = self.idle_loop.info()["current_action_id"]
             return self.audio.queue_expression({"action": legacy_action}, action_id, idle_action_id)
         if action == "interrupt":
             self.idle_loop.stop()
