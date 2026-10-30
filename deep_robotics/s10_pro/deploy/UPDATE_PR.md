@@ -1,7 +1,7 @@
 # Updating the existing S10 PR
 
-This helper remains specific to the original PR #451. For the new version on
-`feat/s10-offline-acp-20261030`, see [release notes](RELEASE_20261030.md).
+This helper remains specific to the original PR #451. For the current version,
+see [release notes](RELEASE_20261030.md).
 Do not run the original-PR publisher from the new version branch; its branch
 guard intentionally rejects that operation.
 

@@ -19,7 +19,7 @@ One `loco_move` actuator exposes these actions:
 | Action | Behavior |
 | --- | --- |
 | stand_up | State 0: request 1, observe its fresh post-send feedback, wait until stationary, then request 17 and observe its fresh post-send feedback. State 1: only perform the second stage. Stationary state 17: succeed without sending a posture or velocity command. |
-| sitdown | Request lie and wait for final state 0, not intermediate state 4. |
+| sit_down | Request lie and wait for final state 0, not intermediate state 4. |
 | move | Existing forward/backward/in-place-turn finite motion with direction, speed and duration. It still requires stationary move mode; it never stands automatically. |
 | stop_move | Cancel the active application request. An active finite move sends zero commands and checks stopped feedback through its existing worker. With no active request, it reports no application motion; it does not claim to stop external or vendor motion. |
 | info, status, config, start, stop | Existing controller configuration and observation lifecycle. |
@@ -44,7 +44,7 @@ The standard bundle has eight public tools in total.
 | --- | --- |
 | motion / stand | loco_move / stand_up (now includes entering move mode) |
 | motion / move_mode | loco_move / stand_up |
-| motion / lie | loco_move / sitdown |
+| motion / lie | loco_move / sit_down |
 | timed_move / implicit tool action | loco_move / action=move, retaining direction/speed/duration |
 | motion or timed_move status port | Removed; use loco_move info/status |
 | motion or timed_move event port | Removed; action completion uses ACP |
@@ -108,12 +108,12 @@ raw exception messages and authorization credentials are not included.
 
 ## Concise action replies and ACP compatibility
 
-The public downward action is `sitdown`, retaining the original lie-down
+The public downward action is `sit_down`, retaining the original lie-down
 command and final state 0; the name does not add a separate seated posture.
-The retired `stand_down` call remains a compatibility alias for saved workflows,
+The retired `sitdown` and `stand_down` calls remain compatibility aliases for saved workflows,
 including ACP tracking, but is not advertised in the action dropdown.
 
-`stand_up`, `sitdown` and `move` return an accepted running `action_id` after
+`stand_up`, `sit_down` and `move` return an accepted running `action_id` after
 preflight, then finish in the worker and report the terminal outcome through ACP.
 Do not poll or resubmit an accepted command. The acceptance reply is not physical
 completion. Replayed terminal requests retain original identity and do not

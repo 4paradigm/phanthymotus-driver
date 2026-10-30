@@ -121,6 +121,59 @@ def test_real_policy_controls_supervisor_without_motion(policy, case):
 from test_s10_prepare_authorization import policy
 
 
+@pytest.mark.parametrize('case', ['approved', 'startup_denied', 'legacy', 'opt_out'])
+def test_shipped_service_prevents_inherited_disable_without_granting_authority(policy, monkeypatch, case):
+    import time
+    import yaml
+    from deep_robotics.s10_pro.loco_move import LocoMoveBackend, LocoMovePlugin
+    from test_s10_timed_move import Bridge, Transport, Notifier
+    from test_s10_prepare_authorization import automatic_manifest
+
+    # Reproduce the site failure: replacing a container inherited an explicit 0.
+    # Apply the shipped service environment before constructing the supervisor.
+    monkeypatch.setenv('S10_AUTO_PREPARE', '0')
+    driver = Path(__file__).resolve().parents[1] / 'deep_robotics/s10_pro'
+    service = yaml.safe_load((driver / 'deploy/service.yml').read_text())['deep-robotics-s10-pro']
+    for item in service['environment']:
+        key, value = item.split('=', 1)
+        monkeypatch.setenv(key, value)
+    if case == 'opt_out':
+        monkeypatch.setenv('S10_AUTO_PREPARE', '0')
+    manifest, state, load = policy
+    if case != 'legacy':
+        automatic_manifest(manifest, state, startup=case != 'startup_denied', renewal=True)
+    grant, bridge, transports = load(real_clock=True), Bridge(), []
+    def factory():
+        transport = Transport(bridge)
+        transports.append(transport)
+        return transport
+    backend = LocoMoveBackend(bridge, factory(), grant, transport_factory=factory)
+    plugin = LocoMovePlugin({'enabled': True}, 'test', backend, notifier=Notifier())
+    supervisor = None
+    try:
+        supervisor = m.start_automatic_preparation([plugin])
+        if case == 'approved':
+            deadline = time.monotonic() + 3.
+            while time.monotonic() < deadline:
+                if grant.authorized_now() and supervisor.status()['state'] == 'session_active':
+                    break
+                time.sleep(.01)
+            assert grant.authorized_now()
+            assert supervisor.status()['state'] == 'session_active'
+        else:
+            if supervisor is not None and supervisor._thread is not None:
+                deadline = time.monotonic() + 1.
+                while supervisor.status()['state'] == 'waiting' and time.monotonic() < deadline:
+                    time.sleep(.01)
+            assert not grant.authorized_now()
+        assert (supervisor is None) == (case == 'opt_out')
+        assert all(not t.states and not t.velocity_commands for t in transports)
+    finally:
+        if supervisor is not None:
+            supervisor.close()
+        plugin.close()
+
+
 def test_identical_prepare_blocker_is_not_logged_on_every_retry(p, caplog):
     import logging
     p.blocked = ['fresh_clear_fault_snapshot_required']

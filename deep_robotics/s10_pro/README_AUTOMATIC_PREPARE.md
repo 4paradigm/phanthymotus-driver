@@ -61,3 +61,35 @@ mounts after approval; adjust the supervised overlay's host directory to match.
 Do not copy active site policy files into Git or an image, change Core, or erase
 task/outbox state. Merely deploying this source does not migrate an existing
 robot policy or authorize automatic activation.
+
+## Deployment switch and readiness checks
+
+The service fragment explicitly sets `S10_AUTO_PREPARE=1`. Keep this setting in
+the rendered site Compose service when using an owner-approved automatic policy.
+It enables the supervisor, not the policy permissions; legacy explicit policies,
+revocation, missing grants and feedback blockers still prevent activation.
+Set `0` only as a deliberate site opt-out, with a separate trusted explicit
+preparation path. The public locomotion card does not expose Prepare.
+
+When replacing a container, apply the intended Compose environment rather than
+copying the old container's effective environment unchanged. An inherited
+`S10_AUTO_PREPARE=0` overrides the application's default and survives an ordinary
+restart. Changing this environment variable requires recreating the Driver.
+Preserve the old container/image, site files, policy scopes and task/outbox state.
+
+Check both configuration and readiness before calling deployment successful:
+
+1. Confirm the running Driver's `S10_AUTO_PREPARE` is `1` and the persisted Compose
+   service has the same setting. Inspect only this value, never dump credentials.
+2. Query `loco_move` with `action: info`. The detailed readiness must contain
+   `automatic_preparation`; with healthy feedback and an approved automatic
+   policy it reaches `session_active` and `operator_session.authorized: true`.
+3. Check command-channel readiness and the actual `blocked_by` list. Missing
+   telemetry, faults or denied policy permissions remain deployment blockers;
+   do not clear them by relaxing thresholds or expanding permissions.
+4. Verify Core was not changed/restarted and no motion task was created. Do not
+   issue stand-up, sit-down or velocity commands as a deployment health check.
+
+If the card is running with fresh feedback but reports `prepare_required`, no
+command channel and `automatic_preparation: null`, check this switch first.
+Clicking Start enables observation; it does not replace the disabled supervisor.

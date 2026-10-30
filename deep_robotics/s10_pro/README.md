@@ -6,7 +6,7 @@ and `relative_move`. The standard Core is unchanged; deployment uses one Core
 and one Driver container, with existing site storage and credentials preserved.
 
 `loco_move` combines the former posture and timed-movement cards. Its actions are
-`stand_up` (stand then enter move mode), `sitdown`, finite `move`, and
+`stand_up` (stand then enter move mode), `sit_down`, finite `move`, and
 `stop_move` (application cancellation, not a hardware emergency stop). It has no
 canvas output ports. Status is queried through `info`/`status`; completion uses
 ACP. The default canvas action remains read-only `status`.
@@ -108,7 +108,7 @@ command. Missing/stale feedback, faults and revoked authority remain blockers.
 
 From reported state 0, `stand_up` requests state 1, confirms fresh stationary
 feedback, then requests state 17. From state 1 it performs the second stage only;
-stationary state 17 completes without commands. `sitdown` waits for final idle
+stationary state 17 completes without commands. `sit_down` waits for final idle
 state 0. Each stage retains its original policy scope and the task has one shared
 deadline, mutex and terminal completion. Vendor remote navigation mode remains a
 site prerequisite; reported state does not prove vendor control ownership.
@@ -189,12 +189,12 @@ robot observations and older test totals do not validate the present candidate.
 
 ## Concise action replies and ACP compatibility
 
-The public downward action is `sitdown`, retaining the original lie-down
+The public downward action is `sit_down`, retaining the original lie-down
 command and final state 0; the name does not add a separate seated posture.
-The retired `stand_down` call remains a compatibility alias for saved workflows,
+The retired `sitdown` and `stand_down` calls remain compatibility aliases for saved workflows,
 including ACP tracking, but is not advertised in the action dropdown.
 
-`stand_up`, `sitdown` and `move` return an accepted running `action_id` after
+`stand_up`, `sit_down` and `move` return an accepted running `action_id` after
 preflight, then finish in the worker and report the terminal outcome through ACP.
 Do not poll or resubmit an accepted command. The acceptance reply is not physical
 completion. Replayed terminal requests retain original identity and do not

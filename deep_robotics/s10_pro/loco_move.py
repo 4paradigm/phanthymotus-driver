@@ -11,9 +11,9 @@ except ImportError:
     from motion import MotionPlugin
     from parameters import validate_empty_arguments, validate_motion_request
 
-LOCO_TOOL, STAND_UP, SIT_DOWN = 'loco_move', 'stand_up', 'sitdown'
+LOCO_TOOL, STAND_UP, SIT_DOWN = 'loco_move', 'stand_up', 'sit_down'
 PUBLIC_ACTIONS = ('info', 'start', 'stop', 'status', 'config', STAND_UP, SIT_DOWN, 'move', 'stop_move')
-ACTION_NAMES = {'lie': SIT_DOWN, 'stand_down': SIT_DOWN, DISTANCE_ACTION: 'move'}
+ACTION_NAMES = {'lie': SIT_DOWN, 'stand_down': SIT_DOWN, 'sitdown': SIT_DOWN, DISTANCE_ACTION: 'move'}
 MOVE_FIELDS = frozenset(('direction', 'speed', 'duration'))
 
 class StandUpFailure(RuntimeError):
@@ -52,7 +52,7 @@ class LocoMovePlugin(CanvasPosturePlugin):
         # Canvas renders fields in schema insertion order; action stays first
         # while x-action-params reveals movement fields underneath it.
         props = {'action': {'type': 'string', 'enum': list(PUBLIC_ACTIONS),
-                            'description': 'Locomotion action; sitdown keeps the original lie-down behavior. Wait for ACP after an accepted motion instead of polling.'}}
+                            'description': 'Locomotion action; sit_down keeps the original lie-down behavior. Wait for ACP after an accepted motion instead of polling.'}}
         props.update({k: copy.deepcopy(v) for k, v in posture['inputSchema']['properties'].items()
                       if k in ('request_id', 'issued_at_ms', 'ttl_ms', 'instance_id', '_tool_name')})
         props.update(copy.deepcopy(timed['properties']))
@@ -80,10 +80,10 @@ class LocoMovePlugin(CanvasPosturePlugin):
                       'move': {'params': ['direction', 'speed', 'duration'], 'description': 'Finite forward/backward movement or turn; requires stationary move mode and confirms stopping.'},
                       'stop_move': {'params': [], 'description': 'Cancel the active application task. Finite movement sends zero velocity and checks stopping; cancelling posture is not a physical stop guarantee.'}},
                   'x-resource': 'base', 'x-completion': {
-                      'actions': [STAND_UP, SIT_DOWN, 'move', 'stand_down'], 'timeout': 20, 'silent_completion': False,
+                      'actions': [STAND_UP, SIT_DOWN, 'move', 'stand_down', 'sitdown'], 'timeout': 20, 'silent_completion': False,
                       'description': 'Returns action_id after acceptance; completion arrives once through ACP. Do not poll or repeat an accepted command. stand_up completes only at reported move mode.'}}
         return {'name': LOCO_TOOL, 'title': 'S10 Locomotion', 'type': 'actuator', 'multiInstance': False,
-                'description': 'Stand up, sitdown (original lie-down), finite move, or cancel. Motion returns action_id and completes through ACP; do not poll after acceptance. status is concise; info is detailed diagnostics. Direction/speed/duration apply only to move.',
+                'description': 'Stand up, sit_down (original lie-down), finite move, or cancel. Motion returns action_id and completes through ACP; do not poll after acceptance. status is concise; info is detailed diagnostics. Direction/speed/duration apply only to move.',
                 'inputSchema': schema, 'configSchema': posture['configSchema'], 'topic_in': [], 'topic_out': self._ports()}
 
     @staticmethod
@@ -138,7 +138,7 @@ class LocoMovePlugin(CanvasPosturePlugin):
         return super()._control_ok(action)
 
     def dispatch(self, action, args):
-        if action == 'stand_down':
+        if action in ('stand_down', 'sitdown'):
             action = SIT_DOWN  # Saved canvases retain the old alias.
         if args.get('_tool_name') == RELATIVE_MOVE_TOOL: return super().dispatch(action, args)
         if args.get('_tool_name') not in (None, LOCO_TOOL): raise ValueError('Retired tool; migrate to loco_move')

@@ -35,7 +35,7 @@ def test_public_schema_merges_cards_and_tracks_real_actions(loco):
     p, _, _, _, _ = loco
     assert [t['name'] for t in p.get_tools()] == ['loco_move', 'relative_move']
     schema = p.get_tool()['inputSchema']
-    assert schema['x-completion']['actions'] == ['stand_up', 'sitdown', 'move', 'stand_down']
+    assert schema['x-completion']['actions'] == ['stand_up', 'sit_down', 'move', 'stand_down', 'sitdown']
     assert not {'stand', 'move_mode', 'prepare'} & set(schema['properties']['action']['enum'])
     jsonschema.validate({'action': 'stand_up'}, schema)
     jsonschema.validate({'action': 'move', 'direction': 'forward', 'speed': .08, 'duration': 1}, schema)
@@ -166,7 +166,7 @@ def test_shared_status_keeps_relative_events_separate(loco):
     p._event('synthetic', action='relative_move')
     status = call(p, 'info')
     assert [e['action'] for e in status['events']] == ['stand_up', 'move']
-    assert set(status['readiness']['actions']) == {'stand_up', 'sitdown', 'move'}
+    assert set(status['readiness']['actions']) == {'stand_up', 'sit_down', 'move'}
     assert all(e['card'] == 'loco_move' for e in status['events'])
 
 def test_deadline_and_missing_post_send_feedback_never_advance(loco, monkeypatch):
@@ -263,7 +263,7 @@ def test_lower_turning_cap_still_overrides_expanded_range(loco):
     assert not any(t.velocity_commands for t in transports)
 
 @pytest.mark.parametrize('hidden', [{'direction': 'forward'}, {'direction': 'forward', 'speed': .08, 'duration': 2.}])
-@pytest.mark.parametrize('action,state,states', [('stand_up', 0, [1, 17]), ('sitdown', 17, [4])])
+@pytest.mark.parametrize('action,state,states', [('stand_up', 0, [1, 17]), ('sit_down', 17, [4])])
 def test_canvas_hidden_move_fields_do_not_block_posture(loco, action, state, states, hidden):
     p, _, bridge, _, transports = loco
     bridge.state = state
@@ -398,21 +398,23 @@ def test_legacy_execution_mode_is_explicitly_rejected(monkeypatch):
                                      runtime_binding=SimpleNamespace(authorized=False))
 
 
-def test_sitdown_is_visible_and_old_alias_remains_callable(loco):
+def test_sit_down_is_visible_and_old_alias_remains_callable(loco):
     p, _, bridge, _, transports = loco
     schema = p.get_tool()['inputSchema']
     actions = schema['properties']['action']['enum']
-    assert 'sitdown' in actions and 'stand_down' not in actions
-    assert {'sitdown', 'stand_down'} <= set(schema['x-completion']['actions'])
+    assert 'sit_down' in actions and not {'stand_down', 'sitdown'} & set(actions)
+    assert {'sit_down', 'stand_down', 'sitdown'} <= set(schema['x-completion']['actions'])
     bridge.state = 17
-    result = call(p, 'sitdown', request_id='new-sitdown')
-    assert result['action'] == 'sitdown' and result['action_id']
-    assert terminal(p, 'new-sitdown')['completed']
-    bridge.state = 17
-    alias = call(p, 'stand_down', request_id='legacy-sitdown')
-    assert alias['action'] == 'sitdown'
-    assert terminal(p, 'legacy-sitdown')['completed']
-    assert [state for t in transports for state, _ in t.states] == [4, 4]
+    result = call(p, 'sit_down', request_id='new-sit_down')
+    assert result['action'] == 'sit_down' and result['action_id']
+    assert terminal(p, 'new-sit_down')['completed']
+    for old_name in ('stand_down', 'sitdown'):
+        bridge.state = 17
+        request_id = 'legacy-' + old_name
+        alias = call(p, old_name, request_id=request_id)
+        assert alias['action'] == 'sit_down'
+        assert terminal(p, request_id)['completed']
+    assert [state for t in transports for state, _ in t.states] == [4, 4, 4]
     assert not any(t.velocity_commands for t in transports)
 
 

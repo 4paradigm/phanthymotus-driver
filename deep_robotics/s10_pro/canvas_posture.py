@@ -27,7 +27,7 @@ INSTRUCTIONS = {
     'joint_data_not_advancing': 'Joint samples are not advancing. Fresh DDS messages do not prove that the motors are awake.',
     'fresh_joint_feedback_required': 'Fresh, complete feedback from all 16 joints is required.',
     'fresh_clear_fault_snapshot_required': 'The fault snapshot is stale or reports an active fault. No command was sent.',
-    'stationary_idle_or_standing_required': 'State 0, 1 or 17 must remain stationary for 0.3 seconds: planar speed below 0.05 m/s and yaw rate below 0.06 rad/s.',
+    'stationary_idle_or_standing_required': 'Wait for confirmed rest in state 0, 1 or 17. Normal motion feedback needs 0.3 seconds; a bounded velocity bias needs 0.5 seconds of independently stationary odometry.',
     'stand_first_required': 'Move mode requires stationary standing with reported state 1.',
     'fresh_stationary_feedback_required': 'Move mode requires fresh stationary motion feedback.',
     'already_in_move_mode': 'The robot is already in move mode, state 17. Use lie to leave this mode.',
@@ -36,7 +36,7 @@ INSTRUCTIONS = {
     'unsupported_transition_state': 'The current vendor state does not support this posture transition. No command was sent.',
     'operator_intervention_required': 'The previous action failed. A new request may recover the channel only after stationary and fault checks; old actions are never replayed.',
     'move_mode_required': 'Timed movement requires move mode, state 17.',
-    'stationary_move_mode_required': 'Timed movement requires state 17 and 0.3 seconds of stationary feedback: planar speed below 0.05 m/s and yaw rate below 0.06 rad/s.',
+    'stationary_move_mode_required': 'Movement requires state 17 and confirmed rest: normal motion feedback or a bounded bias corroborated by stationary odometry.',
     'timed_command_channel_not_prepared': 'The timed velocity channel is not prepared. No movement command was sent.',
 }
 
@@ -74,10 +74,12 @@ RELATIVE_ANGLE_DEGREES = (30, 60)
 RELATIVE_LINEAR_RANGE_MPS = (.06, .12)
 RELATIVE_YAW_RANGE_RAD_S = (.12, .20)
 NAVIGATION_ACTIONS = (*DISTANCE_ACTIONS, *RELATIVE_ACTIONS)
+STOP_CONFIRMATION_BUDGET_S = 2.
+STOP_RESERVE_S = STOP_CONFIRMATION_BUDGET_S + .05
 
 
 def odometry_observation(record, now):
-    """Parse ODOM for monitoring compatibility; timed moves do not depend on it."""
+    """Parse ODOM for relative movement and optional stationary corroboration."""
     result = {'fresh': False, 'sequence': 0, 'x': None, 'y': None, 'yaw': None,
               'received_monotonic': None, 'age_s': None, 'reason': 'fresh_odometry_required'}
     if not isinstance(record, dict) or not fresh(record, now, .35):
@@ -113,11 +115,16 @@ def odometry_observation(record, now):
     yaw_rate = angular.get('z') if isinstance(angular, dict) else None
     if type(yaw_rate) not in (int, float) or not math.isfinite(yaw_rate):
         return result
+    header = raw.get('header', {})
+    stamp = header.get('stamp', {}) if isinstance(header, dict) else {}
+    sec, nanosec = (stamp.get(k) for k in ('sec', 'nanosec')) if isinstance(stamp, dict) else (None, None)
+    source_stamp = (sec + nanosec / 1e9 if type(sec) is int and sec >= 0
+                    and type(nanosec) is int and 0 <= nanosec < 1_000_000_000 else None)
     return {'fresh': True, 'sequence': sequence, 'x': float(values[0]),
             'y': float(values[1]), 'yaw': yaw, 'vx': float(speeds[0]),
             'vy': float(speeds[1]), 'yaw_rate': float(yaw_rate),
             'received_monotonic': float(record['received_monotonic']),
-            'age_s': float(record['age_s'])}
+            'age_s': float(record['age_s']), 'source_stamp_s': source_stamp}
 
 
 def fresh(record, now, limit):
@@ -184,7 +191,7 @@ class CanvasPostureBackend(SupervisedPostureBackend):
         return blocked, ids
 
     def stationary_status(self, states=(0, 1, 17)):
-        return self._stationary.observe(self.feedback.observation(), states)
+        return self._stationary.observe(self.feedback.observation(), states, self.odometry_status())
 
     def wait_stationary(self, states, timeout_s=.65):
         deadline = self._clock() + timeout_s
@@ -950,7 +957,7 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
             if self._active and self._active.get('request_id') == request_id:
                 self._phase = 'stopping'
         stop_started = self._clock()
-        stop_deadline = min(stop_started + 1.2, request_deadline)
+        stop_deadline = min(stop_started + STOP_CONFIRMATION_BUDGET_S, request_deadline)
         next_send, stable, last_sequence, send_count = self._clock(), 0, None, 0
         sent, last_check, trace = False, None, []
 
@@ -1012,7 +1019,7 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
         direction = DISTANCE_DIRECTIONS[direction_name]
         turning = direction_name.startswith('turn_')
         speed, duration = float(request['speed']), float(request['duration'])
-        deadline = request['expires_monotonic'] - 1.25
+        deadline = request['expires_monotonic'] - STOP_RESERVE_S
         receipt = {'accepted': None}
         confirmed = stop_confirmed = completed = False
         sent = pulse_completed = False
@@ -1123,7 +1130,7 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
     def _run_relative_action(self, record, request, started):
         action, rid = request['action'], request['request_id']
         direction, target = request['direction'], float(request['target'])
-        speed, deadline = float(request['speed']), request['expires_monotonic'] - 1.25
+        speed, deadline = float(request['speed']), request['expires_monotonic'] - STOP_RESERVE_S
         receipt = {'accepted': None}
         sent = completed = stop_confirmed = confirmed = False
         command_frames, last_status = 0, None

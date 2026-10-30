@@ -37,7 +37,7 @@ def test_stop_failure_retains_specific_evidence(monkeypatch, sample, expected):
     d = p._stop_diagnostics
     assert d['failure_kind'] == expected
     assert d['last_stationary_check'] == sample
-    assert d['available_budget_s'] == pytest.approx(1.2)
+    assert d['available_budget_s'] == pytest.approx(module.STOP_CONFIRMATION_BUDGET_S)
     assert d['zero_commands_sent'] >= 2
     assert len(d['recent_distinct_feedback']) <= 16
 
@@ -75,3 +75,21 @@ def test_fault_still_blocks_stand_down_recovery(loco):
     assert not result['accepted']
     assert 'fresh_clear_fault_snapshot_required' in result['blocked_by']
     assert not any(t.states or t.velocity_commands for t in transports)
+
+
+@pytest.mark.parametrize('request_deadline,expected', [(15., True), (11.1, False)])
+def test_deceleration_confirmation_has_more_time_but_never_outlives_request(monkeypatch, request_deadline, expected):
+    now = [10.]
+    p = object.__new__(module.CanvasPosturePlugin)
+    p._clock = lambda: now[0]
+    p._lock = threading.RLock()
+    p._active = None
+    def feedback():
+        ready = now[0] >= 11.4
+        return {'stopped': ready, 'sequence': int((now[0] - 10.) * 10),
+                'stationary_check': check(ready=ready, matching_samples=4 if ready else 0)}
+    p._backend = SimpleNamespace(stop_distance=lambda *a: {'sent': True}, distance_stopped=feedback)
+    monkeypatch.setattr(module.time, 'sleep', lambda seconds: now.__setitem__(0, now[0] + seconds))
+    assert p._stop_fixed_distance('move_2s', 'test', request_deadline) == (expected, True)
+    assert now[0] <= min(12., request_deadline) + .021
+    assert p._stop_diagnostics['zero_commands_sent'] >= 2
