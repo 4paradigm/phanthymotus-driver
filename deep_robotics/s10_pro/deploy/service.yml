@@ -1,0 +1,28 @@
+deep-robotics-s10-pro:
+  image: __IMAGE__
+  container_name: embodied-deep-robotics-s10-pro
+  network_mode: host
+  # HTTP parent creates no DDS participant; domain-0 children use vendor UDP.
+  # Fleet loopback defaults remain inherited and are stripped by each child.
+  # The shipped config selects the mounted profile. An empty host override
+  # fails closed through S10_REQUIRE_VENDOR_PROFILE.
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /opt/phanthy-motus/s10-reader-udp.xml:/opt/phanthy-motus/s10-reader-udp.xml:ro
+    - /opt/phanthy-motus/s10-pro/config.yaml:/work/deep_robotics/s10_pro/config.yaml:ro
+  environment:
+    # Host opt-out; canvas config cannot override this switch.
+    - S10_MOTION_ENABLED=1
+    - S10_REQUIRE_VENDOR_PROFILE=1
+    - ROS_DOMAIN_ID=42
+    - ROS_NAMESPACE=s10_pro
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - AGENT_CORE_URL=https://localhost:15678
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always

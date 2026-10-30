@@ -1,0 +1,22 @@
+mcp_port: 15745
+bind_host: "127.0.0.1"
+ros_namespace: "s10_pro"
+name: "S10 Pro"
+register: true
+reader:
+  domain_id: 0
+  vendor_profile: "/opt/phanthy-motus/s10-reader-udp.xml"
+motion:
+  enabled: false
+  refresh_hz: 2.0
+  max_duration_s: 2.0
+  action_timeout_s: 15.0
+  max_vx: 1.0
+  max_vy: 0.1
+  max_yaw_rate: 1.0
+topics:
+  motion_info: "/MOTION_INFO"
+  joints: "/JOINTS_DATA_10HZ"
+  odometry: "/ODOM"
+  hard_estop: "/HES_STATUS"
+  fault_aggregator: "/fault_aggregator"
