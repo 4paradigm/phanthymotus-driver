@@ -459,7 +459,7 @@ def test_light_cycle_controls_are_scoped_to_breathe_and_blink_actions(monkeypatc
     plugin = device.S10LightPlugin(native)
     schema = plugin.get_tool()["inputSchema"]
     actions = schema["x-action-params"]
-    assert set(actions) == {"constant", "fill_flow", "moving_flow", "gradient_flow", "breathe", "blink"}
+    assert set(actions) == {"constant", "fill_flow", "moving_flow", "gradient_flow", "breathe", "blink", "custom"}
     for action in ("constant", "fill_flow", "moving_flow", "gradient_flow"):
         assert "head_cycle_seconds" not in actions[action]["params"]
         assert "tail_cycle_seconds" not in actions[action]["params"]
@@ -1187,7 +1187,11 @@ def test_control_schema_exposes_supported_navigation_and_light_options(monkeypat
     assert set(nav_params) == {"x", "y", "z", "yaw_degrees", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous", "confirm"}
     assert set(localize_params) == {"x", "y", "z", "yaw_degrees", "confirm"}
     assert set(light_params) == {"head_color", "tail_color"}
-    assert set(actions) == {"constant", "fill_flow", "moving_flow", "gradient_flow", "breathe", "blink"}
+    assert set(actions) == {"constant", "fill_flow", "moving_flow", "gradient_flow", "breathe", "blink", "custom"}
+    assert set(actions["custom"]["params"]) == {
+        "head_effect", "tail_effect", "head_color", "tail_color",
+        "head_cycle_seconds", "tail_cycle_seconds",
+    }
     assert "head_cycle_seconds" in actions["breathe"]["params"]
     assert "tail_cycle_seconds" in actions["breathe"]["params"]
     assert "head_cycle_seconds" in actions["blink"]["params"]
@@ -1214,6 +1218,19 @@ def test_light_uses_named_colors_and_effects_in_native_protocol(monkeypatch):
         ],
     })
     assert native.calls[-1][1] == {}
+
+
+def test_light_custom_action_allows_different_head_and_tail_effects(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    device.S10LightPlugin(native).dispatch("custom", {
+        "head_effect": "constant", "tail_effect": "blink",
+        "head_color": "白色", "tail_color": "蓝色", "tail_cycle_seconds": 3,
+    })
+    assert native.calls[-1][0][2]["Led"] == [
+        {"Type": device.LIGHT_EFFECTS["常亮"], "Color": [1]},
+        {"Type": device.LIGHT_EFFECTS["闪烁"], "Color": [3], "Cycle": 3},
+    ]
 
 
 def test_light_uses_fire_and_forget_when_firmware_has_no_response(monkeypatch):

@@ -1402,6 +1402,9 @@ class S10LightPlugin:
         "gradient_flow": ([], "彩色渐变流水；由灯控固件自动选择渐变颜色"),
         "breathe": (["head_color", "tail_color", "head_cycle_seconds", "tail_cycle_seconds"], "头尾灯呼吸；头尾周期分别设置，单位为秒"),
         "blink": (["head_color", "tail_color", "head_cycle_seconds", "tail_cycle_seconds"], "头尾灯闪烁；头尾周期分别设置，单位为秒"),
+        "custom": (["head_effect", "tail_effect", "head_color", "tail_color",
+                     "head_cycle_seconds", "tail_cycle_seconds"],
+                    "头灯和尾灯分别选择效果；仅呼吸/闪烁使用对应周期"),
     }
 
     def __init__(self, native): self.native = native
@@ -1413,6 +1416,10 @@ class S10LightPlugin:
                                     "description": "头灯呼吸或闪烁周期（秒）"},
             "tail_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
                                     "description": "尾灯呼吸或闪烁周期（秒）"},
+            "head_effect": {"type": "string", "enum": list(LIGHT_ACTION_EFFECTS),
+                            "default": "constant", "description": "头灯效果"},
+            "tail_effect": {"type": "string", "enum": list(LIGHT_ACTION_EFFECTS),
+                            "default": "constant", "description": "尾灯效果"},
         }))
         return result
     def start(self): pass
@@ -1422,16 +1429,26 @@ class S10LightPlugin:
         if action == "stop": return {"state": "idle"}
         if action == "info": return {"state": "ready"}
         if action in self.ACTIONS:
-            effect_name, effect_code = LIGHT_ACTION_EFFECTS[action]
-            if action in {"breathe", "blink"}:
+            effects = ({"head": args.get("head_effect", "constant"),
+                        "tail": args.get("tail_effect", "constant")}
+                       if action == "custom" else {"head": action, "tail": action})
+            for side, effect in effects.items():
+                if effect not in LIGHT_ACTION_EFFECTS:
+                    return {"ok": False, "code": "INVALID_ARGUMENT",
+                            "error": f"unsupported {side}_effect"}
+            if any(effect in {"breathe", "blink"} for effect in effects.values()):
                 for side in ("head", "tail"):
+                    if effects[side] not in {"breathe", "blink"}:
+                        continue
                     cycle = args.get(f"{side}_cycle_seconds", 1)
                     if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle < 1:
                         return {"ok": False, "code": "INVALID_ARGUMENT",
                                 "error": f"{side}_cycle_seconds must be a positive integer"}
             leds = []
             for side in ("head", "tail"):
-                if action == "gradient_flow":
+                effect = effects[side]
+                effect_code = LIGHT_ACTION_EFFECTS[effect][1]
+                if effect == "gradient_flow":
                     leds.append({"Type": effect_code})
                     continue
                 color = args.get(f"{side}_color", "白色")
@@ -1439,7 +1456,7 @@ class S10LightPlugin:
                     return {"ok": False, "code": "INVALID_ARGUMENT",
                             "error": f"unsupported {side}_color"}
                 led = {"Type": effect_code, "Color": [LIGHT_COLORS[color]]}
-                if action in {"breathe", "blink"}:
+                if effect in {"breathe", "blink"}:
                     led["Cycle"] = args.get(f"{side}_cycle_seconds", 1)
                 leds.append(led)
             # The Pro firmware applies this command but does not send an ASDU
