@@ -20,6 +20,8 @@ from common.vendor_runtime import action_schema, tool
 from domain_bridge import CoreBridge
 from media_workers import MediaWorkers, encode_pointcloud
 
+CAMERA_LANES = ("camera_rear", "camera_left", "camera_front", "camera_right")
+
 
 def _mark_dangerous(result, actions):
     schema = result["inputSchema"]
@@ -106,26 +108,26 @@ class S10Nodes:
         # The Pro camera service numbers its physical inputs tail, left, head,
         # right. Subscribe to USB names and semantic aliases alike.
         camera_topics = dict(config.get("camera_topics", {
-            "camera_0": ["/camera/rear/image_raw", "/camera/rear/image_raw/compressed",
+            "camera_rear": ["/camera/rear/image_raw", "/camera/rear/image_raw/compressed",
                          "/camera/rear/color/image_raw", "/camera/rear/color/image_raw/compressed",
                          "/camera_back/image_raw", "/camera_0/image_raw",
                          "/usb_camera_1/image_raw", "/usb_camera_1/image_raw/compressed",
                          "/DEPTH_IMAGE"],
-            "camera_1": ["/camera/left/image_raw", "/camera/left/image_raw/compressed",
+            "camera_left": ["/camera/left/image_raw", "/camera/left/image_raw/compressed",
                          "/camera/left/color/image_raw", "/camera/left/color/image_raw/compressed",
                          "/camera_left/image_raw", "/camera_1/image_raw",
                          "/usb_camera_1/image_raw_0", "/usb_camera_1/image_raw_0/compressed"],
-            "camera_2": ["/camera/front/image_raw", "/camera/front/image_raw/compressed",
+            "camera_front": ["/camera/front/image_raw", "/camera/front/image_raw/compressed",
                          "/camera/front/color/image_raw", "/camera/front/color/image_raw/compressed",
                          "/camera_front/image_raw", "/camera_2/image_raw",
                          "/usb_camera_1/image_raw_1", "/usb_camera_1/image_raw_1/compressed"],
-            "camera_3": ["/camera/right/image_raw", "/camera/right/image_raw/compressed",
+            "camera_right": ["/camera/right/image_raw", "/camera/right/image_raw/compressed",
                          "/camera/right/color/image_raw", "/camera/right/color/image_raw/compressed",
                          "/camera_right/image_raw", "/camera_3/image_raw",
                          "/usb_camera_1/image_raw_2", "/usb_camera_1/image_raw_2/compressed"],
         }))
-        for index in range(4):
-            camera_topics.setdefault(f"camera_{index}", [])
+        for lane in CAMERA_LANES:
+            camera_topics.setdefault(lane, [])
         self.topics.update({key: {"topic": base + key, "format": "image/jpeg"}
                             for key in camera_topics})
         self.publishers = {
@@ -192,7 +194,7 @@ class S10Nodes:
         }
         # Reserve lane assignments while scanning the ROS graph, but only let
         # a lane's first callback claim its active source. This avoids assigning
-        # several newly discovered image topics to camera_0 before any frame arrives.
+        # several newly discovered image topics to one lane before any frame arrives.
         self._camera_topic_lanes = {}
         self._configured_lidar_topics = set(self._lidar_topics)
         self._media_topic_subscriptions = set()
@@ -339,8 +341,7 @@ class S10Nodes:
             key = self._camera_key_for_topic(topic)
         if key is None:
             reserved = set(self._camera_topic_lanes.values())
-            key = next((f"camera_{index}" for index in range(4)
-                        if f"camera_{index}" not in reserved), None)
+            key = next((lane for lane in CAMERA_LANES if lane not in reserved), None)
         if key is not None:
             self._camera_topic_lanes[topic] = key
         return key
@@ -354,11 +355,11 @@ class S10Nodes:
         if numbered:
             index = int(numbered.group(1))
             if 0 <= index < 4:
-                return f"camera_{index}"
-        for directions, key in ((("rear", "back", "backward"), "camera_0"),
-                                (("left",), "camera_1"),
-                                (("front", "forward"), "camera_2"),
-                                (("right",), "camera_3")):
+                return CAMERA_LANES[index]
+        for directions, key in ((("rear", "back", "backward"), "camera_rear"),
+                                (("left",), "camera_left"),
+                                (("front", "forward"), "camera_front"),
+                                (("right",), "camera_right")):
             if tokens.intersection(directions):
                 return key
         return None

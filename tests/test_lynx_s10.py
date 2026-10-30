@@ -75,7 +75,7 @@ def test_pro_config_registers_navigation_and_matches_marketplace_cards(monkeypat
     assert "loco" in card_names and "motion" not in card_names
     assert {"imu", "loco_state", "joints", "joint_state", "battery"} <= card_names
     assert "errors" not in card_names
-    assert {"camera_0", "camera_1", "camera_2", "camera_3"} <= card_names
+    assert {"camera_rear", "camera_left", "camera_front", "camera_right"} <= card_names
     assert "device" not in card_names
     assert not card_names.intersection({"motion_info", "native_basic_status", "native_device_status", "hard_estop", "charge_status"})
     assert any(plugin.__class__.__name__ == "S10NavigationPlugin" for plugin in plugins)
@@ -246,7 +246,7 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
         ctx_robot=object(), ctx_core=object(),
         executor_robot=Executor(), executor_core=Executor(),
     )
-    nodes = device.S10Nodes({"camera_topics": {"camera_0": "/CAMERA/RAW"}}, "robot", ros2)
+    nodes = device.S10Nodes({"camera_topics": {"camera_rear": "/CAMERA/RAW"}}, "robot", ros2)
     callbacks = nodes.robot.subscriptions
 
     imu = SimpleNamespace(linear_acceleration=SimpleNamespace(x=1.0, y=2.0, z=3.0))
@@ -289,7 +289,7 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     camera_msg = SimpleNamespace(width=2, height=1, step=6, encoding="rgb8",
                                  data=bytes((255, 0, 0, 0, 255, 0)), header={"stamp": 1})
     callbacks["/CAMERA/RAW"](camera_msg)
-    camera_output = nodes.camera_publishers["camera_0"].messages[-1]
+    camera_output = nodes.camera_publishers["camera_rear"].messages[-1]
     assert camera_output.format == "jpeg"
     assert bytes(camera_output.data).startswith(b"\xff\xd8")
     assert camera_output.header == camera_msg.header
@@ -310,12 +310,12 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert stream_status["imu"]["received"] == stream_status["imu"]["published"] == 1
     assert stream_status["joints"]["received"] == stream_status["joint_state"]["received"] == 1
     assert stream_status["lidar"]["received"] == stream_status["lidar"]["published"] == 1
-    assert stream_status["camera_0"]["received"] == stream_status["camera_0"]["published"] == 1
+    assert stream_status["camera_rear"]["received"] == stream_status["camera_rear"]["published"] == 1
     assert "/s10/front/image" in nodes.robot.subscriptions
-    assert nodes._source_topics["camera_0"] == "/CAMERA/RAW"
-    assert nodes._source_topics["camera_1"] == "/s10/left/image"
-    assert nodes._source_topics["camera_2"] == "/s10/front/image"
-    assert nodes._source_topics["camera_3"] == "/s10/right/image"
+    assert nodes._source_topics["camera_rear"] == "/CAMERA/RAW"
+    assert nodes._source_topics["camera_left"] == "/s10/left/image"
+    assert nodes._source_topics["camera_front"] == "/s10/front/image"
+    assert nodes._source_topics["camera_right"] == "/s10/right/image"
     assert "/s10/depth" in nodes.robot.subscriptions
     assert nodes._sensor_qos.kwargs == {
         "depth": 1, "history": 1, "reliability": 2, "durability": 2}
@@ -398,10 +398,11 @@ def test_model_resource_returns_official_urdf(monkeypatch):
 def test_camera_config_has_four_directional_lanes_and_common_aliases():
     config = yaml.safe_load((DRIVER / "config.yaml").read_text())
     cameras = config["camera_topics"]
-    assert set(cameras) == {f"camera_{index}" for index in range(4)}
-    for index, direction in enumerate(("rear", "left", "front", "right")):
-        assert f"/camera/{direction}/color/image_raw" in cameras[f"camera_{index}"]
-        assert f"/camera_{index}/image_raw" in cameras[f"camera_{index}"]
+    lanes = ("camera_rear", "camera_left", "camera_front", "camera_right")
+    assert set(cameras) == set(lanes)
+    for lane, direction, index in zip(lanes, ("rear", "left", "front", "right"), range(4)):
+        assert f"/camera/{direction}/color/image_raw" in cameras[lane]
+        assert f"/camera_{index}/image_raw" in cameras[lane]
 
 
 def test_discovered_unclassified_camera_topics_reserve_distinct_lanes(monkeypatch):
@@ -413,7 +414,7 @@ def test_discovered_unclassified_camera_topics_reserve_distinct_lanes(monkeypatc
     lanes = [nodes._assign_camera_lane(f"/stream/camera_{index}/image")
              for index in range(4)]
 
-    assert lanes == ["camera_0", "camera_1", "camera_2", "camera_3"]
+    assert lanes == ["camera_rear", "camera_left", "camera_front", "camera_right"]
 
 
 def test_camera_lane_recognizes_numbered_camera_topic_independent_of_discovery_order(monkeypatch):
@@ -422,19 +423,19 @@ def test_camera_lane_recognizes_numbered_camera_topic_independent_of_discovery_o
     nodes._configured_camera_lanes = {}
     nodes._camera_topic_lanes = {}
 
-    assert nodes._assign_camera_lane("/camera_3/image_raw") == "camera_3"
-    assert nodes._assign_camera_lane("/camera_1/image_raw") == "camera_1"
-    assert nodes._assign_camera_lane("/usb/camera_2/image") == "camera_2"
-    assert nodes._assign_camera_lane("/camera_0/image_raw") == "camera_0"
+    assert nodes._assign_camera_lane("/camera_3/image_raw") == "camera_right"
+    assert nodes._assign_camera_lane("/camera_1/image_raw") == "camera_left"
+    assert nodes._assign_camera_lane("/usb/camera_2/image") == "camera_front"
+    assert nodes._assign_camera_lane("/camera_0/image_raw") == "camera_rear"
 
 
 def test_unclassified_depth_image_does_not_claim_directional_camera_lane(monkeypatch):
     device = _load_device(monkeypatch)
     assert device.S10Nodes._camera_key_for_topic("/DEPTH_IMAGE") is None
     nodes = device.S10Nodes.__new__(device.S10Nodes)
-    nodes._configured_camera_lanes = {"/usb_camera_1/image_raw_2": "camera_3"}
+    nodes._configured_camera_lanes = {"/usb_camera_1/image_raw_2": "camera_right"}
     nodes._camera_topic_lanes = {}
-    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_2") == "camera_3"
+    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_2") == "camera_right"
 
 
 def test_light_cycle_controls_are_scoped_to_breathe_and_blink_actions(monkeypatch):

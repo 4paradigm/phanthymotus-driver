@@ -24,9 +24,11 @@
 
 传感器与执行卡片沿用仓库常用命名和职责。已提供的容器日志确认 `/IMU`、`/JOINTS_DATA_10HZ`、`/BATTERY_DATA`、`/MOTION_INFO` 都收到并发布到 `/host/lynx_s10/...`；旧日志没有记录 Agent Core 的活动订阅，且旧版同进程双 context 共用 FastDDS profile。因而此前可确认源到 driver、driver 到本地发布成功，故障范围落在 domain-42 发现/订阅边界；新实现把 Agent Core 发布者放进 loopback-only 独立进程，并用有界 latest-value IPC 队列跨进程转发。需部署后再查看 `state.ros_streams` 的 bridge 队列与 Agent Core 实际订阅，才能最终确认前端恢复。
 
-旧版雷达点云最高约 10Hz、单帧约 8.5 万点；点云被均匀限采样至 2,000 点并以紧凑字节缓冲传递，避免队列积压。S10 Pro 提供前、后、左、右四路相机，对应 `camera_0..3` 四张 sensor 卡，默认 ROS topic 为 `/usb_camera_1/image_raw`、`image_raw_0`、`image_raw_1`、`image_raw_2`；现场部署仍应以 `ros2 topic list/info` 核对实际方向和 topic。相机和雷达订阅使用 ROS sensor-data（BEST_EFFORT）QoS。每路相机和雷达都有独立的 `spawn` 媒体 worker，worker 只负责 JPEG 编码或点云限采样；任务队列最多保留 2 帧，满载时丢弃旧帧。转换结果再进入每路独立的 maxsize=1 domain-42 bridge 进程，单路高负载不会阻塞其他流或控制/状态回调。容器日志应分别出现 `first ... sample received`、`first ... sample published` 和 `[dds-bridge] first sample published`；若没有，`state.ros_streams` 可用于区分源 topic、worker/队列和跨进程发布阶段。
+旧版雷达点云最高约 10Hz、单帧约 8.5 万点；点云被均匀限采样至 2,000 点并以紧凑字节缓冲传递，避免队列积压。S10 Pro 提供前、后、左、右四路相机，对应 `camera_rear`、`camera_left`、`camera_front`、`camera_right` 四张 sensor 卡，默认 ROS topic 为 `/usb_camera_1/image_raw`、`image_raw_0`、`image_raw_1`、`image_raw_2`；现场部署仍应以 `ros2 topic list/info` 核对实际方向和 topic。相机和雷达订阅使用 ROS sensor-data（BEST_EFFORT）QoS。每路相机和雷达都有独立的 `spawn` 媒体 worker，worker 只负责 JPEG 编码或点云限采样；任务队列最多保留 2 帧，满载时丢弃旧帧。转换结果再进入每路独立的 maxsize=1 domain-42 bridge 进程，单路高负载不会阻塞其他流或控制/状态回调。容器日志应分别出现 `first ... sample received`、`first ... sample published` 和 `[dds-bridge] first sample published`；若没有，`state.ros_streams` 可用于区分源 topic、worker/队列和跨进程发布阶段。
 
 S10 URDF 含有指向 `meshes/*.STL` 的视觉网格引用；本次仅随镜像提供 URDF 文本，骨架关节名与运动学链可用，但不承诺展示厂家 STL 外观。`joints` 实时流使用真机 `JOINTS_DATA_10HZ` 的 16 个电机字段，并按 URDF 关节顺序映射到仓库通用 `sensor/skeleton`；`joint_state` 同时保留完整供应商消息字段。
+
+相机卡片按实际方位命名为 `camera_rear`、`camera_left`、`camera_front`、`camera_right`；厂商 USB 输入顺序对应 tail、left、head、right。
 
 Go1/Go2/As2W 中的语音、遥控器、SLAM、深度相机、特技、专用避障以及 `loco` 命令集都没有 S10 指南依据，因此不移植。M20 Pro 的导航卡片名称与动作边界可复用，但导航实现按 S10 自己的 ASDU 和 Pro 型号边界实现。
 
