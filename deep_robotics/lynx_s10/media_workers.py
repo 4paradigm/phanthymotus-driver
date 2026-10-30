@@ -16,6 +16,7 @@ class MediaWorkers:
         self._results = {}
         self._jobs = {}
         self._processes = {}
+        self._result_failures = 0
         self._closed = False
         self._thread = threading.Thread(target=self._collect, name="lynx-s10-media-results", daemon=True)
         self._thread.start()
@@ -58,12 +59,19 @@ class MediaWorkers:
                 except queue.Empty:
                     continue
                 found = True
-                try:
-                    self._on_result(*result)
-                except Exception as exc:
-                    print(f"[media-worker] result handling failed: {exc}", flush=True)
+                self._handle_result(result)
             if not found:
                 threading.Event().wait(0.01)
+
+    def _handle_result(self, result):
+        try:
+            self._on_result(*result)
+            self._result_failures = 0
+        except Exception as exc:
+            self._result_failures += 1
+            count = self._result_failures
+            if count == 1 or count % 100 == 0:
+                print(f"[media-worker] result handling failed count={count}: {exc}", flush=True)
 
     def close(self):
         self._closed = True

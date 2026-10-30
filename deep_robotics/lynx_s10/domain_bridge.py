@@ -15,6 +15,10 @@ _TYPE_NAMES = {
 }
 
 
+def _should_log_failure(count: int) -> bool:
+    return count == 1 or count % 100 == 0
+
+
 class CoreBridge:
     """Publish serialized robot-domain samples from loopback-only processes."""
 
@@ -161,6 +165,7 @@ def _run_publisher(messages, profile, domain, lane):
     qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
     publishers = {}
     counts = {}
+    failures = {}
     try:
         # The child must remain alive even when the parent executor has no
         # work temporarily.  Its lifetime is controlled by the queue sentinel,
@@ -184,11 +189,15 @@ def _run_publisher(messages, profile, domain, lane):
                 print(f"[dds-bridge] publisher created domain={domain} topic={topic} type={type_name}", flush=True)
             try:
                 publisher.publish(deserialize_message(payload, msg_type))
+                failures[topic] = 0
                 counts[topic] = counts.get(topic, 0) + 1
                 if counts[topic] == 1:
                     print(f"[dds-bridge] first sample published domain={domain} topic={topic}", flush=True)
             except Exception as exc:
-                print(f"[dds-bridge] publish failed topic={topic}: {exc}", flush=True)
+                failures[topic] = failures.get(topic, 0) + 1
+                count = failures[topic]
+                if _should_log_failure(count):
+                    print(f"[dds-bridge] publish failed topic={topic} count={count}: {exc}", flush=True)
     finally:
         try:
             node.destroy_node()

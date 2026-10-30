@@ -494,6 +494,34 @@ def test_media_worker_result_queue_replaces_stale_frame(monkeypatch):
     assert results.items == [("camera_0", "new", b"new")]
 
 
+def test_media_worker_result_errors_are_throttled_and_reset_after_success(capsys):
+    from deep_robotics.lynx_s10.media_workers import MediaWorkers
+
+    workers = MediaWorkers.__new__(MediaWorkers)
+    workers._result_failures = 0
+    workers._on_result = lambda *_args: (_ for _ in ()).throw(RuntimeError("broken"))
+    result = ("camera_0", {}, b"frame")
+
+    for _ in range(100):
+        workers._handle_result(result)
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 2
+    assert "count=1" in lines[0]
+    assert "count=100" in lines[1]
+
+    workers._on_result = lambda *_args: None
+    workers._handle_result(result)
+    workers._on_result = lambda *_args: (_ for _ in ()).throw(RuntimeError("broken"))
+    workers._handle_result(result)
+    assert "count=1" in capsys.readouterr().out
+
+
+def test_domain_bridge_publish_error_throttle_boundaries():
+    from deep_robotics.lynx_s10.domain_bridge import _should_log_failure
+
+    assert [count for count in range(1, 201) if _should_log_failure(count)] == [1, 100, 200]
+
+
 def test_media_worker_uses_independent_result_queue_per_lane():
     import ast
 
