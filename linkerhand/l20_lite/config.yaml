@@ -29,6 +29,10 @@ plugins:
     watchdog_ms: 300
     max_delta_per_step: 16
     max_fraction_step: 0.05
+    # Capture a stable pose over multiple source frames, rather than one click.
+    calibration_window_ms: 300
+    calibration_stability_deg: 8
+    open_deadband: 0.10
     speed: 50
     torque: 50
   hand_gesture:

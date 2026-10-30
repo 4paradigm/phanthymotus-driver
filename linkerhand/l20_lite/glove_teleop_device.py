@@ -11,6 +11,8 @@ import subprocess
 import sys
 import threading
 import time
+import statistics
+from collections import deque
 
 from common.vendor_runtime import action_schema, tool
 from glove_skeleton import GloveSkeleton
@@ -105,6 +107,16 @@ class GloveTeleopPlugin:
         self.watchdog_s = float(config.get("watchdog_ms", 300)) / 1000
         self.max_delta = int(config.get("max_delta_per_step", 16))
         self.max_fraction_step = float(config.get("max_fraction_step", 0.05))
+        self.open_deadband = float(config.get("open_deadband", 0.05))
+        # Zero preserves single-frame capture for configurations predating this option.
+        self.calibration_window_s = float(config.get("calibration_window_ms", 0)) / 1000
+        self.calibration_stability_deg = float(config.get("calibration_stability_deg", 8))
+        if not 0 <= self.open_deadband <= 0.2:
+            raise ValueError("open_deadband must be in 0..0.2")
+        if not ((self.calibration_window_s == 0 or 0.2 <= self.calibration_window_s <= 1)
+                and 1 <= self.calibration_stability_deg <= 20):
+            raise ValueError("invalid glove calibration window or stability limit")
+        self._calibration_history = {}
         self.speed = int(config.get("speed", 50))
         self.torque = int(config.get("torque", 50))
         if not 1 <= self.listen_port <= 65535 or not 1 <= self.max_hz <= 30:
@@ -177,7 +189,7 @@ class GloveTeleopPlugin:
         schema = action_schema(
             {
                 "start": ([], "启动手套直读和双手 3D 预览；不会驱动灵巧手"),
-                "calibrate_open": (["side"], "保持指定手套张开，记录张开角度"),
+                "calibrate_open": (["side"], "自然张开指定手套并保持稳定约半秒，记录张开姿态"),
                 "calibrate_fist": (
                     ["side"],
                     "先记录张开姿态，再保持指定手套握拳并记录角度",
@@ -433,7 +445,7 @@ class GloveTeleopPlugin:
         # sample cannot make the preview or hand jump through its full stroke.
         if fraction >= 0.9:
             fraction = 1.0
-        elif fraction <= 0.05:
+        elif fraction <= self.open_deadband:
             fraction = 0.0
         state = self._mapped_fractions.setdefault(side, [fraction] * 5)
         previous = state[finger]
@@ -611,6 +623,13 @@ class GloveTeleopPlugin:
                 self._quaternion_preview_origin.pop(side, None)
             self._preview_origin.setdefault(side, list(pitch))
             self._side_received[side] = now
+            history = self._calibration_history.setdefault(side, deque(maxlen=128))
+            history.append((now, list(pitch), (
+                [list(q) for q in self._relative_quaternions[side]]
+                if side in self._relative_quaternions else None
+            )))
+            while history and now - history[0][0] > max(self.calibration_window_s, 0.02):
+                history.popleft()
             frame = {
                 "timestampMs": max(
                     int(time.time() * 1000), (self._last_timestamp or 0) + 1
@@ -824,6 +843,36 @@ class GloveTeleopPlugin:
                         "teleop is disabled but serial cleanup is still pending"
                     )
 
+    def _stable_calibration_pose(self, side, now):
+        """Return robust endpoints only after a fresh, stable multi-frame window."""
+        if self.calibration_window_s == 0:
+            return (list(self._raw[side]["pitch"]),
+                    self._relative_quaternions.get(side), 1)
+        samples = [s for s in self._calibration_history.get(side, ())
+                   if now - s[0] <= self.calibration_window_s]
+        if len(samples) < 8 or samples[-1][0] - samples[0][0] < self.calibration_window_s * 0.8:
+            return None
+        angles = [samples[0][1][i] + statistics.median(
+            self._angle_delta(s[1][i], samples[0][1][i]) for s in samples
+        ) for i in range(5)]
+        has_quaternions = samples[-1][2] is not None
+        if any((s[2] is not None) != has_quaternions for s in samples):
+            return None
+        relative = [] if has_quaternions else None
+        for finger in range(5):
+            if has_quaternions:
+                values = [s[2][finger] for s in samples]
+                def distance(a, b):
+                    return math.degrees(math.sqrt(sum(v*v for v in self._quaternion_delta_vector(a, b))))
+                # A medoid handles q/-q equivalence and avoids averaging Euler angles.
+                center = min(values, key=lambda q: sum(distance(q, v) for v in values))
+                if max(distance(center, v) for v in values) > self.calibration_stability_deg:
+                    return None
+                relative.append(list(center))
+            elif max(abs(self._angle_delta(s[1][finger], angles[finger])) for s in samples) > self.calibration_stability_deg:
+                return None
+        return angles, relative, len(samples)
+
     def _calibrate(self, side, pose):
         if self.source_mode == "udp":
             raise RuntimeError("pose calibration is only used with direct glove input")
@@ -843,76 +892,85 @@ class GloveTeleopPlugin:
                     side in self._raw
                     and time.monotonic() - self._side_received[side] <= self.watchdog_s
                 ):
-                    angles = list(self._raw[side]["pitch"])
-                    relative = self._relative_quaternions.get(side)
-                    quaternion_calibration = self._quaternion_calibration.setdefault(
-                        side, {}
-                    )
-                    if pose == "open":
-                        calibration.clear()
-                        quaternion_calibration.clear()
-                        self._mapped_fractions[side] = [0.0] * 5
-                        self._preview_origin[side] = angles
-                        self._filtered_pitch[side] = list(angles)
-                        self._pitch_candidates.pop(side, None)
-                    calibration[pose] = angles
-                    if relative is not None:
-                        quaternion_calibration[pose] = [
-                            list(value) for value in relative
-                        ]
-                        self._filtered_quaternions[side] = [
-                            list(value) for value in relative
-                        ]
-                        self._quaternion_candidates.pop(side, None)
-                        if pose == "open":
-                            self._quaternion_preview_origin[side] = [
-                                list(value) for value in relative
-                            ]
-                    if "open" in calibration and "fist" in calibration:
-                        if {"open", "fist"} <= quaternion_calibration.keys():
-                            small = [
-                                index
-                                for index in range(5)
-                                if self._quaternion_fraction(
-                                    quaternion_calibration["open"][index],
-                                    quaternion_calibration["fist"][index],
-                                    quaternion_calibration["fist"][index],
-                                )
-                                is None
-                            ]
-                        else:
-                            small = [
-                                index
-                                for index in range(5)
-                                if abs(
-                                    self._angle_delta(
-                                        calibration["fist"][index],
-                                        calibration["open"][index],
-                                    )
-                                )
-                                < 5
-                            ]
-                        if small:
-                            calibration.pop("fist", None)
-                            quaternion_calibration.pop("fist", None)
-                            raise RuntimeError(
-                                f"glove flexion changed less than 5 degrees on fingers {small}; repeat poses"
-                            )
-                        self._filtered_pitch[side] = list(angles)
-                        self._pitch_candidates.pop(side, None)
-                        self._mapped_fractions[side] = [1.0] * 5
-                    return {
-                        "side": side,
-                        "captured": pose,
-                        "ready": "open" in calibration and "fist" in calibration,
-                        "pitch": angles,
-                        "orientation_source": (
-                            "quaternion" if relative is not None else "euler"
-                        ),
-                    }
+                    captured = self._stable_calibration_pose(side, time.monotonic())
+                    if captured is None:
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("hold the glove pose still for stable calibration")
+                    else:
+                        return self._store_calibration(side, pose, *captured)
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"no fresh {side} glove frame within 2 seconds")
-            time.sleep(0.05)
+            time.sleep(0.02)
+
+    def _store_calibration(self, side, pose, angles, relative, sample_count):
+        # Called with the state lock held; failed sampling never changes endpoints.
+        calibration = self._calibration.setdefault(side, {})
+        quaternion_calibration = self._quaternion_calibration.setdefault(
+            side, {}
+        )
+        if pose == "open":
+            calibration.clear()
+            quaternion_calibration.clear()
+            self._mapped_fractions[side] = [0.0] * 5
+            self._preview_origin[side] = angles
+            self._filtered_pitch[side] = list(angles)
+            self._pitch_candidates.pop(side, None)
+        calibration[pose] = angles
+        if relative is not None:
+            quaternion_calibration[pose] = [
+                list(value) for value in relative
+            ]
+            self._filtered_quaternions[side] = [
+                list(value) for value in relative
+            ]
+            self._quaternion_candidates.pop(side, None)
+            if pose == "open":
+                self._quaternion_preview_origin[side] = [
+                    list(value) for value in relative
+                ]
+        if "open" in calibration and "fist" in calibration:
+            if {"open", "fist"} <= quaternion_calibration.keys():
+                small = [
+                    index
+                    for index in range(5)
+                    if self._quaternion_fraction(
+                        quaternion_calibration["open"][index],
+                        quaternion_calibration["fist"][index],
+                        quaternion_calibration["fist"][index],
+                    )
+                    is None
+                ]
+            else:
+                small = [
+                    index
+                    for index in range(5)
+                    if abs(
+                        self._angle_delta(
+                            calibration["fist"][index],
+                            calibration["open"][index],
+                        )
+                    )
+                    < 5
+                ]
+            if small:
+                calibration.pop("fist", None)
+                quaternion_calibration.pop("fist", None)
+                raise RuntimeError(
+                    f"glove flexion changed less than 5 degrees on fingers {small}; repeat poses"
+                )
+            self._filtered_pitch[side] = list(angles)
+            self._pitch_candidates.pop(side, None)
+            self._mapped_fractions[side] = [1.0] * 5
+        return {
+            "side": side,
+            "captured": pose,
+            "sample_count": sample_count,
+            "ready": "open" in calibration and "fist" in calibration,
+            "pitch": angles,
+            "orientation_source": (
+                "quaternion" if relative is not None else "euler"
+            ),
+        }
 
     def _arm(self):
         preview = os.environ.get("GLOVE_PREVIEW_ONLY")
@@ -1238,6 +1296,7 @@ class GloveTeleopPlugin:
             self._last_frame = None
             self._last_timestamp = None
             self._raw.clear()
+            self._calibration_history.clear()
             self._filtered_pitch.clear()
             self._pitch_candidates.clear()
             self._relative_quaternions.clear()

@@ -762,6 +762,52 @@ def root_top_sample(side, roots, tips):
     }
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_multi_frame_calibration_is_stable_sign_invariant_and_side_specific(monkeypatch, side):
+    clock = [1000.0]
+    monkeypatch.setattr(glove.time, "monotonic", lambda: clock[0])
+    device = glove.GloveTeleopPlugin(FakeHand(), {
+        "source_mode": "direct", "calibration_window_ms": 300,
+        "calibration_stability_deg": 8, "open_deadband": 0.10,
+    }, "test", None)
+
+    def send(degrees, sign=1):
+        clock[0] += 0.02
+        q = [sign*v for v in axis_quaternion(degrees)]
+        sample = root_top_sample(side, [axis_quaternion(0)] + [q]*5, [None]*6)
+        device.accept_direct_sample(sample, now=clock[0])
+
+    send(0)
+    assert device._stable_calibration_pose(side, clock[0]) is None
+    for i in range(16):
+        send(1 if i % 2 else -1, -1 if i % 2 else 1)
+    opened = device.dispatch("calibrate_open", {"side": side})
+    assert opened["sample_count"] >= 8
+    assert not opened["ready"]
+    assert set(device._calibration) == {side}
+    original = [list(q) for q in device._quaternion_calibration[side]["open"]]
+    for i in range(16):
+        send(i * 5)
+    assert device._stable_calibration_pose(side, clock[0]) is None
+    assert device._quaternion_calibration[side]["open"] == original
+    for i in range(16):
+        send(80, -1 if i % 2 else 1)
+    closed = device.dispatch("calibrate_fist", {"side": side})
+    assert closed["sample_count"] >= 8 and closed["ready"]
+    assert device._stable_calibration_pose(side, clock[0] + 1) is None
+
+
+def test_natural_open_deadband_converges_without_bypassing_step_limit():
+    device = glove.GloveTeleopPlugin(FakeHand(), {"open_deadband": 0.1}, "test", None)
+    device._mapped_fractions["left"] = [1.0]*5
+    values = [device._stabilize_fraction("left", 1, 0.08) for _ in range(22)]
+    assert values[-1] == 0
+    assert all(abs(b-a) <= device.max_fraction_step + 1e-10
+               for a, b in zip([1.0] + values, values))
+    device._mapped_fractions["left"][1] = 0.12
+    assert device._stabilize_fraction("left", 1, 0.12) == pytest.approx(0.12)
+
+
 def test_vendor_root_top_mapping_ignores_thumb_tip_and_unused_slot():
     roots = [axis_quaternion(v) for v in (10, 20, 30, 40, 50, 60)]
     tips = [axis_quaternion(150), [float("nan")] * 4] + [axis_quaternion(160)] * 4
