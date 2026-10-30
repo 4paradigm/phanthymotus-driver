@@ -150,6 +150,17 @@ def _jpeg(width, height, step, encoding, data):
     from io import BytesIO
     from PIL import Image
     encoding = str(encoding).lower()
+    if encoding in ("jpeg", "jpg", "mjpeg"):
+        payload = bytes(data)
+        if payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9"):
+            return payload
+        try:
+            image = Image.open(BytesIO(payload)).convert("RGB")
+        except (OSError, ValueError):
+            return None
+        stream = BytesIO()
+        image.save(stream, format="JPEG", quality=85, optimize=False)
+        return stream.getvalue()
     if encoding in ("nv12", "nv21"):
         try:
             import numpy as np
