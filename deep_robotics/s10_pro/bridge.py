@@ -1,11 +1,10 @@
 """Supervise an independent, subscription-only vendor ROS process.
 
-Fast DDS profile selection is process global. The platform process never joins
+Fast DDS profile selection is process global. The HTTP driver process never joins
 the robot domain, and the child never receives the platform loopback profile.
 """
 from __future__ import annotations
 
-import base64
 import copy
 import json
 import logging
@@ -97,17 +96,13 @@ class ReaderBridge:
     def _control_locked(self):
         active = self._active_locked()
         rates = {}
-        max_points = 6000
         for sources, options in self._owners.values():
             rate = float(options.get("refresh_hz", 5))
             if not math.isfinite(rate) or not 0.1 <= rate <= 30:
                 raise ValueError("refresh_hz must be within 0.1..30")
             for source in sources:
                 rates[source] = max(rates.get(source, 0), rate)
-            if "lidar" in sources:
-                max_points = int(options.get("max_points", 6000))
-        return {"active": sorted(active), "rates_hz": rates,
-                "max_points": max(100, min(40000, max_points))}
+        return {"active": sorted(active), "rates_hz": rates}
 
     def snapshot(self, source):
         with self._lock:
@@ -115,7 +110,7 @@ class ReaderBridge:
             error = self._last_error
             if record is None:
                 return {"data": None, "received_at_ms": None, "age_s": None,
-                        "fresh": False, "error": error, "sequence": 0, "binary": None}
+                        "fresh": False, "error": error, "sequence": 0}
             result = copy.deepcopy(record)
             age = max(0, self._clock() - result["received_monotonic"])
             threshold = max((float(opts.get("stale_after_s", 5)) for sources, opts in self._owners.values()
@@ -141,14 +136,6 @@ class ReaderBridge:
         # Reject old pipe backlog even if the child remains alive.
         if now - stamp > 10 or not isinstance(event.get("data"), dict):
             return False
-        binary = None
-        if key == "lidar":
-            try:
-                binary = base64.b64decode(event.get("binary_base64", ""), validate=True)
-            except (ValueError, TypeError):
-                return False
-            if len(binary) > 640008 or len(binary) < 8:
-                return False
         with self._lock:
             if key not in self._active_locked():
                 return False
@@ -158,7 +145,7 @@ class ReaderBridge:
             if previous and stamp < previous["received_monotonic"]:
                 return False
             self._sequence += 1
-            self._cache[key] = {"data": event["data"], "binary": binary,
+            self._cache[key] = {"data": event["data"],
                                 "received_monotonic": stamp,
                                 "received_at_ms": event.get("received_at_ms"),
                                 "sequence": self._sequence}

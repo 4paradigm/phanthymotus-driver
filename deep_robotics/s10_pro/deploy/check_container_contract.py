@@ -48,7 +48,7 @@ def validate_fragment(fragment):
     if driver.get("image") != "__IMAGE__":
         raise ValueError("The install fragment requires the platform __IMAGE__ placeholder")
     if driver.get("network_mode") != "host":
-        raise ValueError("Platform DDS requires host networking")
+        raise ValueError("Local Core HTTP and robot DDS require host networking")
 
 
 def validate_compose(candidate, baseline):

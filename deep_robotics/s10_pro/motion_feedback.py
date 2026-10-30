@@ -2,7 +2,7 @@
 import math
 
 def odometry_observation(record, now):
-    """Parse ODOM for relative movement and optional stationary corroboration."""
+    """Parse ODOM for optional stationary corroboration."""
     result = {'fresh': False, 'sequence': 0, 'x': None, 'y': None, 'yaw': None,
               'received_monotonic': None, 'age_s': None, 'reason': 'fresh_odometry_required'}
     if not isinstance(record, dict) or not fresh(record, now, .35):

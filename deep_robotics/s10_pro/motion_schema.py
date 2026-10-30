@@ -18,7 +18,7 @@ METADATA = {
 }
 
 
-def tools(config_schema, relative_topic):
+def tools(config_schema):
     properties = {'action': {'type': 'string', 'enum': ACTIONS},
                   **copy.deepcopy(METADATA), **copy.deepcopy(MOVE),
                   **copy.deepcopy(config_schema['properties']), 'config': copy.deepcopy(config_schema)}
@@ -45,18 +45,4 @@ def tools(config_schema, relative_topic):
             'x-resource': 'base', 'x-completion': {
                 'actions': ['stand_up', 'sit_down', 'move', 'stand_down', 'sitdown'], 'timeout': 20}},
         'configSchema': copy.deepcopy(config_schema), 'topic_in': [], 'topic_out': []}
-    relative = {'name': 'relative_move', 'title': 'S10 Relative Movement', 'type': 'actuator', 'multiInstance': False,
-        'description': 'Reach a relative distance or angle using odometry, then confirm stopping.',
-        'inputSchema': {'type': 'object', 'properties': {
-            'direction': {'type': 'string', 'enum': ['forward', 'backward', 'left', 'right', 'turn_left', 'turn_right']},
-            'distance': {'type': 'number', 'minimum': .3, 'maximum': .6, 'default': .5},
-            'angle': {'type': 'integer', 'enum': [30, 60], 'default': 60},
-            'speed': {'type': 'number', 'minimum': .06, 'maximum': .20, 'default': .12}},
-            'required': ['direction', 'speed'], 'additionalProperties': False,
-            'allOf': [{'if': {'properties': {'direction': {'enum': ['turn_left', 'turn_right']}}, 'required': ['direction']},
-                'then': {'required': ['angle'], 'not': {'required': ['distance']}},
-                'else': {'required': ['distance'], 'not': {'required': ['angle']}}}],
-            'x-resource': 'base', 'x-completion': {'actions': ['move', 'relative_move'], 'timeout': 20}},
-        'configSchema': copy.deepcopy(config_schema), 'topic_in': [],
-        'topic_out': [{'topic': relative_topic, 'format': 'data/json'}]}
-    return [loco, relative]
+    return [loco]

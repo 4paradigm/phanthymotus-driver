@@ -4,7 +4,7 @@ The current control, configuration, lifecycle and ACP contract is documented in
 [the Driver README](../README.md). Keep that document as the single operational
 reference rather than copying earlier posture/Prepare interfaces here.
 
-Both `loco_move` and `relative_move` use one controller and physical resource
+The sole public card `loco_move` uses one controller and physical resource
 `base`. Pose transitions and movement have separate readiness checks. A canvas
 `start` result of `ready` is a lifecycle marker; inspect the requested action's
 current blockers before interpreting hardware readiness.

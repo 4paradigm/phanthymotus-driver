@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only S10 Pro ROS 2 adapter, isolated from the platform DDS process.
+"""Read-only S10 Pro motion feedback adapter, isolated from the HTTP parent.
 
 The parent supplies JSON control records on stdin.  Only subscriptions are
 created; this module never imports a vendor controller or calls a ROS service.
@@ -10,7 +10,6 @@ pending record for each source, so a slow parent cannot grow a stale queue.
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import math
 import os
@@ -23,57 +22,15 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from pathlib import Path
 
-try:
-    from .pointcloud import convert_pointcloud
-except ImportError:  # Direct execution inside the independent reader process.
-    from pointcloud import convert_pointcloud
-
-
 DEFAULT_SOURCES = {
-    "battery": {"topic": "/BATTERY_DATA", "type": "drdds/msg/BatteryData"},
     "motion_info": {"topic": "/MOTION_INFO", "type": "drdds/msg/MotionInfo"},
     "joints": {"topic": "/JOINTS_DATA_10HZ", "type": "drdds/msg/JointsData"},
-    "imu": {"topic": "/IMU", "type": "sensor_msgs/msg/Imu"},
     "odometry": {"topic": "/ODOM", "type": "nav_msgs/msg/Odometry"},
-    "lidar": {"topic": "/LIDAR/POINTS", "type": "sensor_msgs/msg/PointCloud2"},
     "hard_estop": {"topic": "/HES_STATUS", "type": "drdds/msg/StdMsgInt32"},
-    # These exact names were discovered on the S10, but older vendor message
-    # bundles may not contain their classes. Missing types never imply health.
-    "exception": {"topic": "/EXCEPTION_NOTIFICATION", "type": "drdds/msg/Exception", "optional": True},
-    "fault_event": {"topic": "/fault_event", "type": "drdds/msg/FaultEvent", "optional": True},
     "fault_aggregator": {"topic": "/fault_aggregator", "type": "drdds/msg/FaultEventArray", "optional": True},
-    "cpu_status": {"topic": "/cpu_status", "type": "drdds/msg/CPUStatus", "optional": True},
-    "memory_status": {"topic": "/memory_status", "type": "drdds/msg/MemoryStatus", "optional": True},
-    "filesystem_status": {"topic": "/filesystem_status", "type": "drdds/msg/FileSystemStatus", "optional": True},
-    "network_status": {"topic": "/network_status", "type": "drdds/msg/NetworkStatus", "optional": True},
-    "ros_graph": {"topic": "ros2://graph", "type": "internal/ros_graph", "internal": True},
 }
-DEFAULT_RATES_HZ = {
-    "battery": 2.0, "motion_info": 5.0, "joints": 5.0,
-    "imu": 5.0, "odometry": 5.0, "lidar": 3.0,
-    "hard_estop": 5.0, "exception": 5.0, "fault_event": 5.0,
-    "fault_aggregator": 2.0, "ros_graph": 1.0,
-    "cpu_status": 2.0, "memory_status": 2.0,
-    "filesystem_status": 2.0, "network_status": 2.0,
-}
+DEFAULT_RATES_HZ = {key: 5.0 for key in DEFAULT_SOURCES}
 MAX_CONTROL_BYTES = 16 * 1024
-MAX_POINTS = 40000  # The existing canvas renderer's maximum display size.
-# Keep the graph below the bridge's 2 MB line cap even if every advertised
-# endpoint has maximum-length names. The observed S10 graph has ~150 topics.
-MAX_GRAPH_TOPICS = 256
-MAX_GRAPH_NODES = 256
-MAX_GRAPH_ENDPOINTS = 8
-MAX_GRAPH_TYPES = 4
-MAX_STATUS_ITEMS = 32
-STATUS_IDENTITIES = {
-    "cpu_status": ("soc_id",), "memory_status": ("soc_id",),
-    "filesystem_status": ("soc_id", "mount_point", "device_path"),
-    "network_status": ("soc_id", "iface"),
-}
-
-
-def _graph_text(value, limit=128):
-    return str(value)[:limit]
 
 
 def log(message: str) -> None:
@@ -129,13 +86,6 @@ def source_specs(config: dict) -> dict:
         raise ValueError("topics and message_types must be mappings")
     result = {}
     for key, defaults in DEFAULT_SOURCES.items():
-        if defaults.get("internal"):
-            # Internal graph inspection is not a ROS topic and cannot be
-            # redirected by a card or by declarative topic configuration.
-            if key in topics or key in message_types:
-                raise ValueError(f"{key} is an internal read-only source")
-            result[key] = dict(defaults)
-            continue
         entry = topics.get(key, defaults["topic"])
         if isinstance(entry, str):
             item = {"topic": entry, "type": message_types.get(key, defaults["type"])}
@@ -160,7 +110,7 @@ def normalize_control(command: dict, *, previous: dict | None = None) -> dict:
     """Validate a data-only control record before it can change subscriptions."""
     if not isinstance(command, dict):
         raise ValueError("control record must be a JSON object")
-    if set(command) - {"active", "rates_hz", "max_points"}:
+    if set(command) - {"active", "rates_hz"}:
         raise ValueError("unsupported control fields")
     active = command.get("active")
     if not isinstance(active, list) or any(not isinstance(k, str) for k in active):
@@ -178,10 +128,7 @@ def normalize_control(command: dict, *, previous: dict | None = None) -> dict:
         if not math.isfinite(rate) or not 0 < rate <= 200:
             raise ValueError(f"publish rate for {key} must be between 0 and 200 Hz")
         rates[key] = float(rate)
-    max_points = command.get("max_points", previous.get("max_points", 6000))
-    if isinstance(max_points, bool) or not isinstance(max_points, int) or not 1 <= max_points <= MAX_POINTS:
-        raise ValueError(f"max_points must be an integer between 1 and {MAX_POINTS}")
-    return {"active": list(active), "rates_hz": rates, "max_points": max_points}
+    return {"active": list(active), "rates_hz": rates}
 
 
 class LatestEventWriter:
@@ -218,7 +165,7 @@ class LatestEventWriter:
             if self._closed or self.failed.is_set():
                 return False
             # Replacing does not move the key: a high-rate source cannot starve
-            # pending battery or health data by repeatedly jumping the queue.
+            # pending motion or fault data by repeatedly jumping the queue.
             self._pending[key] = event
             self._condition.notify()
         return True
@@ -274,10 +221,6 @@ class SubscriptionReader:
         self._last_emitted = {}
         self._last_attempt = {}
         self._last_error = {}
-        self._type_available = {}
-        self._last_received_at_ms = {}
-        self._status_items = {}
-        self._status_truncated = set()
         self.closed = False
 
     def apply_control(self, command: dict):
@@ -292,9 +235,6 @@ class SubscriptionReader:
                 self.node.destroy_subscription(subscription)
             self._last_emitted.pop(key, None)
             self._last_attempt.pop(key, None)
-            self._last_received_at_ms.pop(key, None)
-            self._status_items.pop(key, None)
-            self._status_truncated.discard(key)
         self._purge(old - new)
         self.reconcile()
 
@@ -303,8 +243,6 @@ class SubscriptionReader:
             return
         now = self._monotonic()
         for key in self.control["active"]:
-            if self.specs[key].get("internal"):
-                continue
             if key in self.subscriptions:
                 continue
             if now - self._last_attempt.get(key, -math.inf) < 2.0:
@@ -314,9 +252,7 @@ class SubscriptionReader:
             generation = self._generations[key]
             try:
                 spec = self.specs[key]
-                self._type_available[key] = False
                 message_type = self._message_getter(spec["type"])
-                self._type_available[key] = True
                 subscription = self.node.create_subscription(
                     message_type, spec["topic"],
                     lambda message, k=key, g=generation: self._on_message(k, g, message),
@@ -324,94 +260,8 @@ class SubscriptionReader:
                 )
                 self.subscriptions[key] = subscription
             except Exception as exc:
-                # Retry missing types without taking unrelated cards offline.
+                # Retry missing types without blocking other feedback sources.
                 self._report_error(key, "subscription", exc)
-        if "ros_graph" in self.control["active"]:
-            self._sample_graph(now)
-
-    def _sample_graph(self, now):
-        """Inspect the vendor domain without publishing or invoking services.
-
-        Discovery is evidence of an advertised endpoint, never evidence of a
-        valid sensor sample or control ownership. Keep each result bounded and
-        poll at most once per second to protect the sensor callback loop.
-        """
-        period = max(1.0, 1.0 / self.control["rates_hz"]["ros_graph"])
-        if now - self._last_attempt.get("ros_graph", -math.inf) < period:
-            return
-        self._last_attempt["ros_graph"] = now
-        try:
-            discovered = list(self.node.get_topic_names_and_types())
-            node_names = list(self.node.get_node_names_and_namespaces())
-            truncated = len(discovered) > MAX_GRAPH_TOPICS or len(node_names) > MAX_GRAPH_NODES
-
-            def field(value):
-                nonlocal truncated
-                value = str(value)
-                truncated = truncated or len(value) > 128
-                return value[:128]
-
-            topics = []
-            by_topic = {}
-            for name, kinds in sorted(discovered)[:MAX_GRAPH_TOPICS]:
-                kinds = list(kinds)
-                entry = {"topic": field(name),
-                         "types": [field(kind) for kind in sorted(kinds)[:MAX_GRAPH_TYPES]]}
-                truncated = truncated or len(kinds) > MAX_GRAPH_TYPES
-                try:
-                    endpoints = list(self.node.get_publishers_info_by_topic(name))
-                    entry["publisher_count"] = len(endpoints)
-                    entry["publishers"] = [
-                        {"node": field(endpoint.node_name),
-                         "namespace": field(endpoint.node_namespace),
-                         "type": field(endpoint.topic_type)}
-                        for endpoint in endpoints[:MAX_GRAPH_ENDPOINTS]
-                    ]
-                    truncated = truncated or len(endpoints) > MAX_GRAPH_ENDPOINTS
-                except Exception as exc:
-                    entry.update(publisher_count=None, publishers=[], discovery_error=type(exc).__name__)
-                by_topic[name] = entry
-                topics.append(entry)
-            sources = {}
-            for key, spec in self.specs.items():
-                if spec.get("internal"):
-                    continue
-                entry = by_topic.get(spec["topic"])
-                available = self._type_available.get(key)
-                if available is None:
-                    try:
-                        self._message_getter(spec["type"])
-                        available = True
-                    except Exception:
-                        available = False
-                    self._type_available[key] = available
-                publishers = entry["publishers"] if entry else []
-                # A truncated endpoint list cannot prove a complete count of
-                # type-compatible publishers; the raw list remains visible.
-                matching = (sum(item["type"] == spec["type"] for item in publishers)
-                            if entry and entry["publisher_count"] is not None
-                            and entry["publisher_count"] <= MAX_GRAPH_ENDPOINTS else None)
-                sources[key] = {"topic": spec["topic"], "type": spec["type"],
-                                "type_available": available,
-                                "topic_discovered": True if entry else
-                                    None if len(discovered) > MAX_GRAPH_TOPICS else False,
-                                "publisher_count": entry["publisher_count"] if entry else
-                                    None if len(discovered) > MAX_GRAPH_TOPICS else 0,
-                                "matching_publishers": matching,
-                                "last_received_at_ms": self._last_received_at_ms.get(key)}
-            event = {"key": "ros_graph", "received_monotonic": now,
-                     "received_at_ms": int(self._wall_time() * 1000),
-                     "data": {"topics": topics,
-                              "nodes": [{"name": field(name), "namespace": field(namespace)}
-                                        for name, namespace in sorted(node_names)[:MAX_GRAPH_NODES]],
-                              "sources": sources, "read_only": True,
-                              "command_publishers_created": 0, "services_called": 0,
-                              "truncated": truncated}}
-            if self._emit(event) is not False:
-                self._last_emitted["ros_graph"] = now
-        except Exception as exc:
-            # No synthetic empty graph: an older successful result expires.
-            self._report_error("ros_graph", "discovery", exc)
 
     def _report_error(self, key, operation, exc):
         now = self._monotonic()
@@ -427,40 +277,12 @@ class SubscriptionReader:
         received = self._monotonic()
         rate = self.control["rates_hz"][key]
         due = received - self._last_emitted.get(key, -math.inf) >= 1.0 / rate
-        if not due and key not in STATUS_IDENTITIES:
+        if not due:
             return
         received_at_ms = int(self._wall_time() * 1000)
         try:
             event = {"key": key, "received_monotonic": received, "received_at_ms": received_at_ms}
-            if key == "lidar":
-                binary, metadata = convert_pointcloud(message, max_points=self.control["max_points"])
-                event["data"] = to_json_safe(metadata)
-                event["binary_base64"] = base64.b64encode(binary).decode("ascii")
-            else:
-                data = to_json_safe(message)
-                if key in STATUS_IDENTITIES:
-                    if not isinstance(data, dict):
-                        raise ValueError("monitoring status must be an object")
-                    identity = tuple(_graph_text(data.get(field, "<unknown>"), 128)
-                                     for field in STATUS_IDENTITIES[key])
-                    items = self._status_items.setdefault(key, OrderedDict())
-                    items[identity] = (data, received, received_at_ms)
-                    items.move_to_end(identity)
-                    if len(items) > MAX_STATUS_ITEMS:
-                        items.popitem(last=False)
-                        self._status_truncated.add(key)
-                    event["data"] = {
-                        "latest": data,
-                        "items": [{"data": item, "received_at_ms": stamp,
-                                   "age_s": max(0.0, received - monotonic_stamp)}
-                                  for item, monotonic_stamp, stamp in items.values()],
-                        "truncated": key in self._status_truncated,
-                    }
-                else:
-                    event["data"] = data
-            self._last_received_at_ms[key] = received_at_ms
-            if not due:
-                return  # Retain every SoC/interface before output throttling.
+            event["data"] = to_json_safe(message)
             if self._emit(event) is not False:
                 self._last_emitted[key] = received
         except Exception as exc:
@@ -518,8 +340,6 @@ def import_ros(specs, *, validate_messages=False):
 
     if validate_messages:
         for spec in specs.values():
-            if spec.get("internal"):
-                continue
             try:
                 get_message(spec["type"])
             except (ImportError, AttributeError, ModuleNotFoundError):

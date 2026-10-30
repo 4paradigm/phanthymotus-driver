@@ -11,32 +11,9 @@ import math
 import time
 import uuid
 
-SENSOR_TITLES = {'state': 'Robot State', 'battery': 'Battery', 'joints': 'Joint Feedback', 'imu': 'IMU',
-                 'odometry': 'Odometry', 'lidar': 'LiDAR Point Cloud',
-                 'lidar_cloud': 'LiDAR Point Cloud',
-                 'motion_info': 'Motion Status', 'device_status': 'Device Status',
-                 'hard_estop': 'Hardware E-Stop', 'errors': 'Errors',
-                 'motion_events': 'Motion Events', 'capabilities': 'Capabilities',
-                 'ros_graph': 'ROS Graph', 'device': 'Device Controls'}
-SENSOR_REFRESH_HZ = {'state': 1., 'battery': 1., 'joints': 10., 'imu': 20., 'odometry': 5., 'lidar': 2.,
-                     'lidar_cloud': 10.,
-                     'motion_info': 5., 'device_status': 1., 'hard_estop': 5.,
-                     'errors': 1., 'motion_events': 2., 'capabilities': 1.,
-                     'ros_graph': .5, 'device': 1.}
 META_FIELDS = {'instance_id', '_tool_name'}
-MOTION_ACTIONS = ('stand_up', 'lie', 'move_2s', 'relative_move')
-LIFECYCLE_ACTIONS = ('info', 'start', 'stop', 'status', 'config')
+MOTION_ACTIONS = ('stand_up', 'lie', 'move_2s')
 
-_SENSOR_FIELDS = {
-    'enabled': {'type': 'boolean', 'default': True, 'title': 'Enabled',
-                'description': 'Enable this read-only card. Stopping the card releases only its data stream.'},
-    'refresh_hz': {'type': 'number', 'minimum': .1, 'maximum': 30., 'title': 'Publish limit (Hz)',
-                   'description': 'Canvas publication frequency limit in Hz; not a raw sensor sampling-rate guarantee.'},
-    'stale_after_s': {'type': 'number', 'minimum': .1, 'maximum': 300., 'default': 5.,
-                      'title': 'Stale after (s)', 'description': 'Maximum sensor data age in seconds. Motion feedback retains its separate 0.5 s limit.'},
-    'max_points': {'type': 'integer', 'minimum': 100, 'maximum': 40000, 'default': 6000,
-                   'title': 'Maximum displayed points', 'description': 'Maximum number of points in each published point cloud.'},
-}
 _MOTION_FIELDS = {
     'enabled': {'type': 'boolean', 'default': False, 'title': 'Enable card status',
                 'description': 'Enable card status only. This setting cannot authorize physical execution.'},
@@ -106,28 +83,6 @@ def _schema(definitions, settings):
             'additionalProperties': False}
 
 
-def sensor_defaults(name):
-    if name not in SENSOR_REFRESH_HZ:
-        raise ValueError('Unknown sensor card')
-    result = {'enabled': True, 'refresh_hz': SENSOR_REFRESH_HZ[name], 'stale_after_s': 5.}
-    if name in ('lidar', 'lidar_cloud'):
-        result['max_points'] = 6000
-    return result
-
-
-def _sensor_definitions(name):
-    defaults = sensor_defaults(name)
-    return {key: copy.deepcopy(_SENSOR_FIELDS[key]) for key in defaults}
-
-
-def validate_sensor_settings(name, settings):
-    return _validated(settings, _sensor_definitions(name), sensor_defaults(name))
-
-
-def sensor_config_schema(name, settings):
-    return _schema(_sensor_definitions(name), validate_sensor_settings(name, settings))
-
-
 def _strip_metadata(values):
     for name in META_FIELDS:
         if name in values:
@@ -135,13 +90,6 @@ def _strip_metadata(values):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f'{name} must be a nonblank string')
     return values
-
-
-def config_overlap_constraints(fields):
-    """Reject direct/nested duplicates in both UI/LLM schema and runtime."""
-    return [{'if': {'properties': {'config': {'type': 'object', 'required': [name]}},
-                    'required': ['config']}, 'then': {'not': {'required': [name]}}}
-            for name in fields]
 
 
 def normalize_config_updates(options, allowed):
@@ -188,8 +136,6 @@ def validate_motion_request(action, arguments, settings, wall_time=time.time, *,
     allowed = {'request_id', 'issued_at_ms', 'ttl_ms'}
     if action == 'move_2s':
         allowed |= {'direction', 'speed', 'duration'}
-    if action == 'relative_move':
-        allowed |= {'direction', 'speed', 'distance', 'angle', 'target'}
     _unknown(values, allowed, 'motion parameters')
     properties = {'request_id': {'type': 'string', 'minLength': 1, 'maxLength': 128, 'pattern': r'\S'},
                   'issued_at_ms': {'type': 'integer', 'minimum': 0, 'maximum': 1e15},
@@ -219,26 +165,4 @@ def validate_motion_request(action, arguments, settings, wall_time=time.time, *,
         if type(duration) not in (int, float) or not math.isfinite(duration) or not .5 <= duration <= 5.:
             raise ValueError('duration outside finite-motion range')
         request.update(direction=direction, speed=float(speed), duration=float(duration))
-    if action == 'relative_move':
-        direction = values.get('direction')
-        if direction not in ('forward', 'backward', 'left', 'right', 'turn_left', 'turn_right'):
-            raise ValueError('invalid relative-motion direction')
-        turning = direction.startswith('turn_')
-        speed = values.get('speed', .15 if turning else .08)
-        if (type(speed) not in (int, float) or not math.isfinite(speed)
-                or not ((.12 <= speed <= .20) if turning else (.06 <= speed <= .12))):
-            raise ValueError('speed outside relative-motion direction range')
-        target = values.get('target')
-        if type(target) not in (int, float) or not math.isfinite(target):
-            raise ValueError('relative-motion target must be finite')
-        if turning:
-            if not math.radians(30) <= target <= math.radians(60):
-                raise ValueError('relative-motion turn outside validated range')
-        elif not .3 <= target <= .6:
-            raise ValueError('relative-motion distance outside validated range')
-        request.update(direction=direction, speed=float(speed), target=float(target))
-        if 'distance' in values:
-            request['distance'] = float(values['distance'])
-        if 'angle' in values:
-            request['angle'] = int(values['angle'])
     return request

@@ -105,7 +105,7 @@ def rig():
     bridge = Bridge()
     transport = Transport(bridge)
     callbacks = []
-    p = LocoMovePlugin({'enabled': True, 'action_timeout_s': 8.}, 'test', bridge,
+    p = LocoMovePlugin({'enabled': True, 'action_timeout_s': 8.}, bridge,
                       lambda: transport, callback=lambda *args: callbacks.append(args))
     assert p.start() == {'state': 'ready'}
     yield p, bridge, transport, callbacks
@@ -121,11 +121,10 @@ def wait(p):
 def test_schema_and_lifecycle(rig):
     p, _, transport, _ = rig
     tools = p.get_tools()
-    assert [t['name'] for t in tools] == ['loco_move', 'relative_move']
+    assert [t['name'] for t in tools] == ['loco_move']
     for t in tools:
         jsonschema.Draft202012Validator.check_schema(t['inputSchema'])
         assert t['inputSchema']['x-resource'] == 'base'
-    assert tools[1]['inputSchema']['x-completion']['actions'] == ['move', 'relative_move']
     assert p.dispatch('stop', {}) == {'state': 'idle'}
     assert p.dispatch('start', {}) == {'state': 'ready'}
     assert not transport.states and not transport.velocities
@@ -209,13 +208,48 @@ def test_posture_timeout(rig):
     assert callbacks[0][1] == 'error'
 
 
-def test_relative_move_uses_same_controller_and_callback(rig):
-    p, b, t, callbacks = rig
-    p.dispatch('move', {'_tool_name': 'relative_move', 'direction': 'forward', 'distance': .3, 'speed': .12})
-    result = wait(p)
-    assert result['completed'] and result['stop_confirmed']
-    assert callbacks[0][3] == 'relative_move'
-    assert .2 < b.x < .4
+def test_removed_relative_motion_cannot_reach_transport(rig):
+    p, _, transport, callbacks = rig
+    args = {'direction': 'forward', 'distance': .3, 'speed': .12}
+    with pytest.raises(ValueError):
+        p.dispatch('move', {**args, '_tool_name': 'relative_move'})
+    with pytest.raises(ValueError):
+        p.dispatch('relative_move', args)
+    with pytest.raises(ValueError):
+        p.execute('relative_move', args)
+    assert not transport.states and not transport.velocities and not callbacks
+
+
+def test_internal_feedback_survives_monitor_removal(rig):
+    from deep_robotics.s10_pro.reader import SubscriptionReader, source_specs, normalize_control
+    _, bridge, _, _ = rig
+    sources = bridge.owners['s10_motion']
+    assert sources == set(source_specs({})) == {
+        'motion_info', 'joints', 'odometry', 'hard_estop', 'fault_aggregator'}
+    callbacks, events = {}, []
+    class Node:
+        def create_subscription(self, cls, topic, callback, qos):
+            callbacks[topic] = callback
+            return topic
+        def destroy_subscription(self, subscription):
+            callbacks.pop(subscription)
+    reader = SubscriptionReader(Node(), source_specs({}), lambda kind: dict,
+                                events.append, None)
+    try:
+        reader.apply_control({'active': sorted(sources), 'rates_hz': {s: 10. for s in sources}})
+        for source, spec in source_specs({}).items():
+            callbacks[spec['topic']](bridge.snapshot(source)['data'])
+        assert {event['key'] for event in events} == sources
+        assert all(isinstance(event['data'], dict) for event in events)
+        old_callback = callbacks['/MOTION_INFO']
+        reader.apply_control({'active': []})
+        old_callback({'data': {}})
+        assert not callbacks and len(events) == len(sources)
+        for removed in ('battery', 'imu', 'lidar', 'ros_graph'):
+            with pytest.raises(ValueError):
+                normalize_control({'active': [removed]})
+    finally:
+        reader.close()
 
 
 def test_worker_rejects_expired_command():
@@ -289,9 +323,9 @@ def test_legacy_execution_environment_only_disables_motion(monkeypatch, removed_
     spec = importlib.util.spec_from_file_location('s10_main_degraded', path)
     module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
     bridge = Bridge()
-    plugins = module.build_runtime_plugins({'motion': {'enabled': True, **removed_option}}, 'test', bridge, lambda *a: None)
+    plugins = module.build_runtime_plugins({'motion': {'enabled': True, **removed_option}}, bridge)
     try:
-        assert len(plugins) == 6 and not plugins[-1]._host_enabled
+        assert len(plugins) == 1 and not plugins[-1]._host_enabled
         assert not bridge.owners
     finally:
         for plugin in plugins:

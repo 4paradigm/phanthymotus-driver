@@ -3,7 +3,6 @@ bind_host: "127.0.0.1"
 ros_namespace: "s10_pro"
 name: "S10 Pro"
 register: true
-core_domain_id: 42
 reader:
   domain_id: 0
   vendor_profile: "/opt/phanthy-motus/s10-reader-udp.xml"
@@ -16,27 +15,8 @@ motion:
   max_vy: 0.1
   max_yaw_rate: 1.0
 topics:
-  battery: "/BATTERY_DATA"
   motion_info: "/MOTION_INFO"
   joints: "/JOINTS_DATA_10HZ"
-  imu: "/IMU"
   odometry: "/ODOM"
-  lidar: "/LIDAR/POINTS"
   hard_estop: "/HES_STATUS"
-  exception: "/EXCEPTION_NOTIFICATION"
-  fault_event: "/fault_event"
   fault_aggregator: "/fault_aggregator"
-plugins:
-  state: {enabled: true, refresh_hz: 1.0, stale_after_s: 5.0}
-  joints: {enabled: true, refresh_hz: 5.0, stale_after_s: 5.0}
-  imu: {enabled: true, refresh_hz: 5.0, stale_after_s: 5.0}
-  odometry: {enabled: true, refresh_hz: 5.0, stale_after_s: 5.0}
-  lidar: {enabled: true, refresh_hz: 2.0, stale_after_s: 5.0, max_points: 6000}
-  motion_info: {enabled: true, refresh_hz: 5.0, stale_after_s: 0.5}
-  device_status: {enabled: true, refresh_hz: 1.0, stale_after_s: 5.0}
-  hard_estop: {enabled: true, refresh_hz: 5.0, stale_after_s: 0.5}
-  errors: {enabled: true, refresh_hz: 1.0, stale_after_s: 5.0}
-  motion_events: {enabled: true, refresh_hz: 2.0, stale_after_s: 5.0}
-  capabilities: {enabled: true, refresh_hz: 1.0, stale_after_s: 5.0}
-  ros_graph: {enabled: true, refresh_hz: 0.5, stale_after_s: 10.0}
-  device: {enabled: true, refresh_hz: 1.0, stale_after_s: 5.0}

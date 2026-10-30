@@ -1,4 +1,4 @@
-"""One bounded S10 controller for posture, timed and relative motion.
+"""One bounded S10 controller for posture and timed motion.
 
 The platform owns ACP scheduling; this plugin serializes all base writes and
 checks current hardware feedback. It has no policy sessions or persistent lock.
@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import copy
 import logging
-import math
 import threading
 import time
 from collections import OrderedDict
@@ -19,7 +18,6 @@ try:
     from .motion_schema import tools
     from .parameters import (motion_defaults, motion_config_schema, validate_motion_settings,
         normalize_config_updates, validate_empty_arguments, validate_motion_request)
-    from .relative_motion import RelativeController
     from .stationary_feedback import StationaryWindow
 except ImportError:
     from acp import complete
@@ -27,7 +25,6 @@ except ImportError:
     from motion_schema import tools
     from parameters import (motion_defaults, motion_config_schema, validate_motion_settings,
         normalize_config_updates, validate_empty_arguments, validate_motion_request)
-    from relative_motion import RelativeController
     from stationary_feedback import StationaryWindow
 
 DIRECTIONS = {'forward': (1., 0., 0.), 'backward': (-1., 0., 0.),
@@ -42,7 +39,7 @@ class MotionUnavailable(RuntimeError):
 class LocoMovePlugin:
     name = 'loco_move'
 
-    def __init__(self, config, namespace, bridge, transport_factory, *, callback=complete,
+    def __init__(self, config, bridge, transport_factory, *, callback=complete,
                  clock=time.monotonic, wall_time=time.time, host_enabled=True):
         self._settings = validate_motion_settings({'max_vx': 1., 'max_yaw_rate': 1., 'action_timeout_s': 15., **config})
         self._host_enabled = host_enabled
@@ -56,10 +53,9 @@ class LocoMovePlugin:
         self._history = OrderedDict()
         self._stationary = StationaryWindow(clock=clock)
         self._channel = {}
-        self._relative_topic = '/' + '/'.join(p for p in (namespace.strip('/'), 's10_pro', 'relative_move_status') if p)
 
     def get_tools(self):
-        return tools(motion_config_schema(self._settings), self._relative_topic)
+        return tools(motion_config_schema(self._settings))
 
     def _snapshot(self, source):
         try:
@@ -179,22 +175,16 @@ class LocoMovePlugin:
             self._transport.close()
         self._bridge.release('s10_motion')
 
-    def _info(self, relative=False):
+    def _info(self):
         with self._lock:
             blocked = self._blockers()
             move = list(dict.fromkeys([*blocked, *self._blockers(states=(17,))]))
             if self._active:
                 move.append('active_motion_task_in_progress')
-            relative_blocked = list(move)
-            if not self._odometry()['fresh']:
-                relative_blocked.append('fresh_odometry_required')
             actions = {'stand_up': {'ready': not blocked and not self._active, 'blocked_by': blocked},
                        'sit_down': {'ready': not blocked and not self._active, 'blocked_by': blocked},
                        'move': {'ready': not move, 'blocked_by': move}}
-            if relative:
-                actions = {'relative_move': {'ready': not relative_blocked, 'blocked_by': relative_blocked}}
-                blocked = relative_blocked
-            return {'card': 'relative_move' if relative else self.name,
+            return {'card': self.name,
                 'state': 'ready' if self._started else 'idle',
                 'ready': not blocked and not self._active, 'blocked_by': blocked,
                 'settings': dict(self._settings), 'active_request': copy.deepcopy(self._active),
@@ -210,18 +200,8 @@ class LocoMovePlugin:
             for key in ('direction', 'speed', 'duration'):
                 values.pop(key, None)
         internal = {'sit_down': 'lie', 'move': 'move_2s'}.get(action, action)
-        if action == 'relative_move':
-            turning = values.get('direction', '').startswith('turn_')
-            value = values.get('angle' if turning else 'distance')
-            if type(value) not in (int, float) or not math.isfinite(value):
-                raise ValueError('relative target must be finite')
-            if turning and (type(value) is not int or value not in (30, 60) or 'distance' in values):
-                raise ValueError('relative turn requires angle 30 or 60')
-            if not turning and ('angle' in values or not .3 <= value <= .6):
-                raise ValueError('relative distance must be .3 through .6 metres')
-            values['target'] = math.radians(value) if turning else value
         request = validate_motion_request(internal, values, self._settings, self._wall,
-            allowed_actions=('stand_up', 'lie', 'move_2s', 'relative_move'))
+            allowed_actions=('stand_up', 'lie', 'move_2s'))
         request['action'] = action
         return request
 
@@ -238,7 +218,7 @@ class LocoMovePlugin:
             if self._active is not None:
                 return {'state': 'busy', 'accepted': False, 'reason': 'active_motion_task_in_progress'}
             blocked = self._blockers()
-            if action in ('move', 'relative_move') and self._observe()['motion_state'] != 17:
+            if action == 'move' and self._observe()['motion_state'] != 17:
                 blocked.append('move_mode_required')
             if blocked:
                 return {'state': 'unavailable', 'accepted': False, 'blocked_by': blocked}
@@ -268,10 +248,9 @@ class LocoMovePlugin:
         return {'state': 'cancellation_requested' if active else 'idle', 'accepted': active}
 
     def dispatch(self, action, args):
-        if args.get('_tool_name') not in (None, 'loco_move', 'relative_move'):
+        if args.get('_tool_name') not in (None, 'loco_move'):
             raise ValueError('unsupported motion tool')
-        relative = args.get('_tool_name') == 'relative_move'
-        if not relative and action in ('start', 'config', 'info', 'status', 'stop', 'stop_move'):
+        if action in ('start', 'config', 'info', 'status', 'stop', 'stop_move'):
             args = {k: v for k, v in args.items() if k not in ('direction', 'speed', 'duration')}
         action = ALIASES.get(action, action)
         if action == 'start':
@@ -284,14 +263,12 @@ class LocoMovePlugin:
             return self.stop()
         if action == 'config':
             self._configure(normalize_config_updates(args, motion_defaults()))
-            return self._info(relative)
+            return self._info()
         if action in ('info', 'status'):
             validate_empty_arguments(args)
-            return self._info(relative)
+            return self._info()
         if action == 'stop_move':
             return self.cancel()
-        if relative and action in ('move', 'relative_move'):
-            return self.execute('relative_move', args)
         if action not in ('stand_up', 'sit_down', 'move'):
             raise ValueError('unsupported locomotion action')
         return self.execute(action, args)
@@ -345,15 +322,8 @@ class LocoMovePlugin:
 
     def _move(self, request, deadline, result):
         self._wait_stationary((17,), min(deadline, self._clock() + .9))
-        controller = None
-        if request['action'] == 'relative_move':
-            initial = self._odometry()
-            if not initial['fresh']:
-                raise MotionUnavailable('fresh_odometry_required')
-            controller = RelativeController(initial, direction=request['direction'], target=request['target'],
-                                            max_speed=request['speed'], now=self._clock())
-        end = min(self._clock() + request['duration'], deadline - 2.05) if controller is None else deadline - 2.05
-        if controller is None and end < self._clock() + request['duration'] - .01:
+        end = min(self._clock() + request['duration'], deadline - 2.05)
+        if end < self._clock() + request['duration'] - .01:
             raise MotionUnavailable('insufficient_stop_budget')
         response = False
         next_frame = self._clock()
@@ -363,19 +333,7 @@ class LocoMovePlugin:
                 raise MotionUnavailable('command_stream_late')
             if self._observe()['motion_state'] != 17:
                 raise MotionUnavailable('move_mode_lost')
-            if controller is not None:
-                pose = self._odometry()
-                if not pose['fresh']:
-                    raise MotionUnavailable('fresh_odometry_required')
-                if pose['sequence'] == controller.last_sequence:
-                    self._cancel.wait(.02)
-                    continue
-                velocity, progress = controller.command(pose, self._clock())
-                result['progress'] = progress
-                if progress['phase'] == 'completed':
-                    return
-            else:
-                velocity = tuple(v * request['speed'] for v in DIRECTIONS[request['direction']])
+            velocity = tuple(v * request['speed'] for v in DIRECTIONS[request['direction']])
             result['physical_command_sent'] = True
             self._send(velocity=velocity)
             result['command_frames'] = result.get('command_frames', 0) + 1
@@ -386,15 +344,13 @@ class LocoMovePlugin:
                 response |= projected >= min(.03, request['speed'] * .3)
             next_frame += .1
             self._cancel.wait(max(0., next_frame - self._clock()))
-        if controller is not None:
-            raise MotionUnavailable('relative_motion_timeout')
         if not response:
             raise MotionUnavailable('motion_response_not_observed')
 
     def _run(self, request, record, deadline):
         action_id = record['receipt']['action_id']
         action = request['action']
-        navigation = action in ('move', 'relative_move')
+        navigation = action == 'move'
         result = {'action': action, 'request_id': request['request_id'], 'completed': False,
                   'physical_command_sent': False, 'stop_confirmed': False}
         status = 'error'
@@ -455,6 +411,6 @@ class LocoMovePlugin:
                     self._bridge.release('s10_motion')
             # One worker, one terminal callback. No outbox polling or receipt protocol.
             try:
-                self._callback(action_id, status, result, 'relative_move' if action == 'relative_move' else self.name)
+                self._callback(action_id, status, result, self.name)
             except Exception as error:
                 logging.warning('ACP callback failed (%s)', type(error).__name__)

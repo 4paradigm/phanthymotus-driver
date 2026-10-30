@@ -45,12 +45,12 @@ def check_release(context: Path | None = None) -> dict:
         def status(self):
             return {}
 
-    plugins = main.build_runtime_plugins({}, 'release_check', NoRobot(), lambda *a: None)
+    plugins = main.build_runtime_plugins({}, NoRobot())
     try:
         tools = DriverBundle(plugins).get_all_tools()
         assert {c['name']: c['type'] for c in manifest['cards']} == {
             t['name']: t['type'] for t in tools}
-        assert len(tools) == len(manifest['cards']) == 8
+        assert [t['name'] for t in tools] == ['loco_move']
         for tool in tools:
             for key in ('name', 'type', 'title', 'description', 'inputSchema'):
                 assert key in tool, (tool['name'], key)

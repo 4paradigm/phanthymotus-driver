@@ -1,15 +1,15 @@
 # DEEP Robotics S10 Pro
 
-One Driver beside the standard Agent Core. Public tools are `battery`, `joints`,
-`model`, `lidar_cloud`, `imu`, `device`, `loco_move` and `relative_move`.
-The device-management placeholder sends no hardware commands.
+One Driver beside the standard Agent Core. The sole public card is `loco_move`.
+Battery, joint, IMU and point-cloud cards, the skeleton model resource, the
+unavailable device-management placeholder and `relative_move` have been removed.
+Their implementations, publication paths and image inputs are also removed.
 
 ## Motion and canvas lifecycle
 
 `loco_move` supports `stand_up`, `sit_down`, finite `move` and `stop_move`.
-Saved `sitdown` / `stand_down` calls remain aliases. `relative_move` uses odometry
-to reach a distance or angle. Both tools share one controller and `x-resource: base`;
-a second action is rejected as busy while the first is running.
+Saved `sitdown` / `stand_down` calls remain aliases. One controller owns
+`x-resource: base`; a second action is rejected as busy while the first runs.
 
 - `start` activates read-only feedback and returns `{"state":"ready"}`.
   This is a lifecycle marker, not proof that a specific movement is available.
@@ -22,13 +22,10 @@ a second action is rejected as busy while the first is running.
 - `sit_down` requests state 4 and waits for final idle state 0.
 - `move` sends `/NAV_CMD` at 10 Hz for 0.5–5 seconds, with configured speed caps.
   It must observe velocity in the requested direction and confirm stopping.
-- Relative movement accepts 0.3–0.6 m or 30/60 degrees. Odometry controls progress,
-  settling and drift/stall detection. Translation is capped at 0.12 m/s and
-  turning at 0.20 rad/s.
 
 Motion requires `motion.enabled: true` in config plus `S10_MOTION_ENABLED=1`
 (default). Setting the host variable to `0` disables motion even if canvas
-settings enable it. Sensors remain available. An old
+settings enable it. An old
 `S10_EXECUTION_AUTHORIZATION_FILE` disables motion with a warning instead of
 crashing/restarting the entire Driver. Legacy Prepare policies, identity grants,
 manual unlocks and automatic permission renewal are no longer used.
@@ -68,10 +65,16 @@ motions are never replayed. Existing site databases are not deleted or migrated.
 
 ## Deployment and DDS
 
-Fast DDS uses process-global profiles. The platform process stays on domain 42
-with `/opt/phanthy-motus/dds-local.xml` restricted to loopback. The read-only
-reader and command worker use separate domain-0 processes with the vendor UDP
-profile; they never inherit the platform profile. Preserve this separation.
+The parent serves HTTP MCP and ACP only; there is no platform DDS publisher or
+sensor publication process. The read-only reader and command worker remain
+separate domain-0 processes using the vendor UDP profile. Their environment
+removes inherited platform DDS settings before selecting the robot profile.
+The shared service fragment retains the fleet loopback defaults; the parent
+creates no DDS participant from them.
+
+Only five internal feedback sources remain: motion status, enabled joints,
+odometry for stationary confirmation, hardware e-stop and aggregated faults.
+They are activated by the motion card lifecycle and are not public sensor cards.
 
 Before creating the Driver, install the shipped `/deploy/s10-reader-udp.xml`
 as the read-only host mount `/opt/phanthy-motus/s10-reader-udp.xml` and provide
@@ -99,5 +102,5 @@ python3 deep_robotics/s10_pro/deploy/check_container_contract.py
 
 The compact motion tests use fake telemetry/transport and a local self-signed
 HTTPS server. They cover gates, posture, motion, cancellation, stopping,
-relative progress, message encoding and ACP; they never connect to a robot.
+message encoding and ACP; they never connect to a robot.
 Passing these checks does not establish a full ARM64 build or hardware acceptance.

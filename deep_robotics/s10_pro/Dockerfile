@@ -1,4 +1,4 @@
-# Vendor DDS and platform DDS run in separate processes, both on Jazzy/Python3.12.
+# Robot DDS runs in isolated child processes; the parent uses HTTP only.
 # Immutable multi-platform ROS Jazzy base; provenance and size notes are in
 # deploy/BUILD_REPRODUCIBILITY.md. Refresh only with a reviewed image rebuild.
 ARG ROS_BASE_IMAGE=ros:jazzy-ros-base@sha256:8eed0a4669bbf43ee331878a4c39bd8ebddea8e3312a58b4fae8edb14526b617
@@ -23,7 +23,7 @@ COPY --from=interfaces /s10_ws/install/ /s10_ws/install/
 WORKDIR /work
 COPY common/ /work/common/
 COPY deploy/ /deploy/
-COPY acp.py bridge.py device.py loco_move.py main.py monitoring.py motion_dds.py motion_feedback.py motion_process.py motion_schema.py motion_worker.py parameters.py pointcloud.py reader.py relative_motion.py s10_skeleton.py stationary_feedback.py s10_skeleton.urdf config.yaml driver.yaml requirements.txt /work/deep_robotics/s10_pro/
+COPY acp.py bridge.py loco_move.py main.py motion_dds.py motion_feedback.py motion_process.py motion_schema.py motion_worker.py parameters.py reader.py stationary_feedback.py config.yaml driver.yaml requirements.txt /work/deep_robotics/s10_pro/
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 RCUTILS_COLORIZED_OUTPUT=0
 EXPOSE 15745
 CMD ["/bin/bash", "-c", "source /opt/ros/jazzy/setup.bash && source /s10_ws/install/setup.bash && exec python3 /work/deep_robotics/s10_pro/main.py"]

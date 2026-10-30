@@ -2,7 +2,8 @@ deep-robotics-s10-pro:
   image: __IMAGE__
   container_name: embodied-deep-robotics-s10-pro
   network_mode: host
-  # Domain-0 child uses UDP; platform domain 42 is loopback-only.
+  # HTTP parent creates no DDS participant; domain-0 children use vendor UDP.
+  # Fleet loopback defaults remain inherited and are stripped by each child.
   # The shipped config selects the mounted profile. An empty host override
   # fails closed through S10_REQUIRE_VENDOR_PROFILE.
   volumes:
