@@ -2022,7 +2022,7 @@ class ExpressionPlugin:
         actions = {
             "start": ([], "Begin smart control: automatically disable vendor idle and start the idle expression cycle, as idle_start does."),
             "play": (["name"], "Play a declared expression; interrupt its active idle preset, then automatically resume an enabled idle cycle after playback completes."),
-            "idle_start": ([], "Disable and verify vendor idle, then start periodic confused/gaze/distracted/frown/pout/thinking presets; completion acknowledges startup only."),
+            "idle_start": ([], "Disable and verify vendor idle, then start periodic confused/gaze/distracted/frown/pout/smile presets; completion acknowledges startup only."),
             "idle_stop": ([], "End smart control: freeze scheduling, wait for accepted tasks, enable and verify vendor idle, then complete."),
             "interrupt": ([], "Interrupt the current expression motion."),
             "stop": ([], "Acknowledge stop immediately; interrupt motion and restore vendor idle in the background. Check info for cleanup errors."),

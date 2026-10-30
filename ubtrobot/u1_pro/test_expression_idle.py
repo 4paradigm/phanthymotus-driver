@@ -85,7 +85,7 @@ class ExpressionIdleTests(unittest.TestCase):
         self.finish_active()
         self.loop._thread.join(2)
         self.assertEqual(len(self.nodes.string_calls), 2)
-        self.assertTrue(all(kind == "play_action" and args["action"] in {"A025", "A003", "A024", "A005", "A008", "A029"}
+        self.assertTrue(all(kind == "play_action" and args["action"] in {"A025", "A003", "A024", "A005", "A008", "A007"}
                             for kind, args in self.nodes.string_calls))
         self.notify.assert_called_once()
         self.assertEqual(self.notify.call_args.args[:2], ("start-loop", "completed"))
@@ -205,7 +205,7 @@ class ExpressionIdleTests(unittest.TestCase):
         self.notify.assert_called_once()
 
     def test_no_supported_idle_presets_and_invalid_ids_are_rejected(self):
-        expression = device.ExpressionPlugin(self.audio, {"A007": {}}, True, idle_control=self.control)
+        expression = device.ExpressionPlugin(self.audio, {"A029": {}}, True, idle_control=self.control)
         with self.assertRaises(ValueError):
             expression.dispatch("idle_start", {})
         with self.assertRaises(ValueError):
@@ -213,7 +213,7 @@ class ExpressionIdleTests(unittest.TestCase):
         self.assertEqual(self.nodes.string_calls, [])
 
     def test_requested_palette_is_uniform_and_avoids_immediate_repeats(self):
-        expected = {"confused", "gaze", "distracted", "frown", "pout", "thinking"}
+        expected = {"confused", "gaze", "distracted", "frown", "pout", "smile"}
         self.assertEqual(set(self.loop.expressions), expected)
         self.assertEqual(set(self.loop.WEIGHTS.values()), {1})
         for previous in expected:
@@ -454,14 +454,14 @@ class ExpressionIdleTests(unittest.TestCase):
         original = self.nodes.string_call
 
         def play(name, args):
-            if args.get("action") == "A007":
+            if args.get("action") == "A033":
                 raise RuntimeError("foreground rejected")
             return original(name, args)
 
         self.nodes.string_call = play
         self.start_loop()
         self.wait_for(lambda: len(self.nodes.string_calls) == 1)
-        self.plugin.dispatch("play", {"name": "smile", "action_id": "manual"})
+        self.plugin.dispatch("play", {"name": "laugh", "action_id": "manual"})
         self.wait_for(lambda: self.audio._handoff is None)
         self.assertIsNone(self.audio._active)
         reports = [c.args[1] for c in self.notify.call_args_list if c.args[0] == "manual"]

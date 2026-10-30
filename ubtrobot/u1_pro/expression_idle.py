@@ -11,7 +11,7 @@ from native_idle_actions import safe_native_detail
 
 
 class ExpressionIdleLoop:
-    WEIGHTS = {name: 1 for name in ("confused", "gaze", "distracted", "frown", "pout", "thinking")}
+    WEIGHTS = {name: 1 for name in ("confused", "gaze", "distracted", "frown", "pout", "smile")}
     GAP_MIN = 3.0
     GAP_MAX = 5.0
     ACTION_TIMEOUT = 120.0
