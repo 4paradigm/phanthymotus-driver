@@ -234,6 +234,42 @@ def test_hand_failed_worker_unloads_motor_current(connected_hand, monkeypatch):
     assert not hand._held
 
 
+@pytest.mark.parametrize('instance_id', ['canvas-card', ''])
+def test_hand_acp_failure_reports_result_and_blocks_next_motion_by_target(
+        connected_hand, monkeypatch, instance_id):
+    hand, _, bus, ctrl = connected_hand
+    workers = []
+    monkeypatch.setattr(threading.Thread, 'start', lambda worker: workers.append(worker))
+    monkeypatch.setattr(ctrl, 'move', lambda *args, **kwargs: {
+        'state': 'completed', 'torque_released': True,
+    })
+    monkeypatch.setattr(hand, '_discover', lambda: {'left': 'can0'})
+
+    def delivery_failed(*args):
+        raise RuntimeError('simulated ACP delivery failure')
+
+    hand._acp_callback = delivery_failed
+    reply = hand.dispatch('open', {
+        'instance_id': instance_id, 'bound_side': 'left', 'confirm_motion': True,
+    })
+    # Exercise the actual worker invocation, including its physical-target argument.
+    workers[0].run()
+    info = hand.dispatch('info', {'instance_id': instance_id, 'bound_side': 'left'})
+    assert info['last_result']['action_id'] == reply['action_id']
+    assert info['last_result']['status'] == 'completed'
+    assert info['last_result']['callback_error'] == 'simulated ACP delivery failure'
+    assert hand._delivery_failed == {('left', 'can0'): True}
+
+    before = len(bus.sent_messages)
+    for next_instance in (instance_id, 'another-card', ''):
+        with pytest.raises(RuntimeError, match='ACP completion delivery failed'):
+            hand.dispatch('close', {
+                'instance_id': next_instance, 'bound_side': 'left', 'confirm_motion': True,
+            })
+    assert len(workers) == 1
+    assert len(bus.sent_messages) == before
+
+
 def test_shared_can_change_blocked_until_motion_finishes(connected_hand, monkeypatch):
     hand, _, _, _ = connected_hand
     workers = []

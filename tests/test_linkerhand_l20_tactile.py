@@ -416,7 +416,7 @@ def test_card_selection_moves_tactile_stream_to_right(fake_hand, ros_runtime):
         assert info['state'] == 'running' and info['stream_side'] == 'right'
         assert info['topic_out'] == [
             {'topic': '/robot/hand/right/tactile', 'format': 'sensor/tactile'}]
-        assert '/robot/hand/right/tactile' in ros.topics
+        wait_for_stream(lambda: '/robot/hand/right/tactile' in ros.topics)
         assert plugin._worker_thread is None  # Unclaimed default-left worker was stopped.
         count = len(published)
         wait_for_stream(lambda: len(published) > count)
@@ -661,7 +661,9 @@ def test_real_can_queries_require_new_scalar_and_all_matrix_rows_without_motor_c
     hand = mock.Mock(spec=HandPlugin)
     hand.config = {'side': 'left', 'can_channel': 'can0'}
     hand.get_controller_for_side.return_value = FakeController(client)
-    plugin = TactilePlugin(hand, {'matrix_request_interval_s': .01, 'matrix_timeout_s': .05})
+    # This checks reply completeness, not 50ms scheduling under ARM64 emulation.
+    plugin = TactilePlugin(hand, {'matrix_request_interval_s': .01, 'tactile_timeout_s': 1.0,
+                                  'matrix_timeout_s': 1.0, 'stale_after_s': 5.0})
     try:
         result = plugin.dispatch('get_state', {})
         assert result['scalar_valid'] and result['matrix_valid']

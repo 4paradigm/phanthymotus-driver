@@ -584,6 +584,8 @@ class HandPlugin:
     # ── async motion thread ──────────────────────────────────────────
 
     def _run_motion(self, instance_id: tuple[str, str], active: dict) -> None:
+        # The caller passes the physical (side, channel) key here, not the canvas ID.
+        # The canvas instance ID is kept separately in active["instance_id"].
         action = active["action"]
         ctrl = active["controller"]
         try:

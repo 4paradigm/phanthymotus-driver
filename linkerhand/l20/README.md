@@ -169,6 +169,10 @@ PYTHONPATH=. python3 linkerhand/l20/hardware_smoke.py --tactile-matrix
 
 驱动端口 `15734`，L20 Lite 为 `15733`。部署服务见 `deploy/service.yml`：使用 host 网络、host IPC、`privileged: true`、`/dev` 和 DDS 配置挂载，ROS 域为 42。依赖为 `python-can`、`pyyaml`，ROS 2 及 `std_msgs` 由基础镜像提供。
 
+默认基础镜像固定为已实测 ARM64 镜像 `ros-base@sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f`，不跟随 `latest` 更新。`requirements.txt` 固定容器中已实测的 `python-can==4.6.1` 和 `PyYAML==5.4.1`；后者由该基础镜像提供，构建时无需另行编译旧版 PyYAML。升级基础镜像或依赖版本后，需要重新运行通信、可选 QEMU 兼容与卡片回归。
+
+2026-10-30 验证：以上固定组合完成 `linux/arm64` 镜像构建，镜像内核对依赖版本后，离线回归为 1001 项通过、1 项跳过（旧协议不适用的五指位置回复用例）。新增 ACP 回归使用实际工作线程入口，覆盖有／无卡片 ID 时完成通知失败、终态查询及同一物理目标后续运动被拒绝；不连接真实 CAN。
+
 `Dockerfile` 包含四张卡片的 Python 模块。完整构建时需把仓库 `common/` 加入构建上下文；`driver.yaml` 已通过 `build_context_extras` 声明该目录，并列出三张 actuator 和一张 sensor。以下命令在仓库根目录构建本地 ARM64 镜像，不推送镜像仓库：
 
 ```bash
