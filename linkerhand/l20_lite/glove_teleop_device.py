@@ -995,7 +995,7 @@ class GloveTeleopPlugin:
             if self._armed:
                 raise RuntimeError("already armed; disarm before arming again")
             if self._arm_completion_failed:
-                raise RuntimeError("ACP completion delivery failed; restart driver after checking Core")
+                raise RuntimeError("ACP completion delivery failed; restore Core and disarm to retry notification")
             if self._arming or self._pending_disarm or not self._cleanup_done.is_set():
                 raise RuntimeError("teleop setup or cleanup is still pending")
             if self._shutdown.is_set():
@@ -1058,10 +1058,43 @@ class GloveTeleopPlugin:
             except Exception as cleanup_error:
                 terminal["cleanup_error"] = str(cleanup_error)
             print(f"[ACP] {active['action_id']}: {exc}", flush=True)
-        else:
+        finally:
             with self._lock:
                 if self._arm_action is active:
                     self._arm_action = None
+
+    def _retry_arm_completion(self):
+        """Retry only a terminal notification, never hardware setup or movement."""
+        with self._lock:
+            if not self._arm_completion_failed or self._arm_action is not None:
+                return False
+            terminal = self._last_arm_result
+            active = {"action_id": terminal["action_id"]}
+            self._arm_action = active
+
+        def retry():
+            try:
+                self._acp_callback(terminal["action_id"], terminal["status"], terminal["result"])
+            except Exception as exc:
+                with self._lock:
+                    terminal["callback_error"] = str(exc)
+            else:
+                with self._lock:
+                    self._arm_completion_failed = False
+                    terminal.pop("callback_error", None)
+            finally:
+                with self._lock:
+                    if self._arm_action is active:
+                        self._arm_action = None
+
+        try:
+            threading.Thread(target=retry, name="glove-arm-completion-retry", daemon=True).start()
+        except Exception:
+            with self._lock:
+                if self._arm_action is active:
+                    self._arm_action = None
+            raise
+        return True
 
     def _arm(self, session=None):
         # Private synchronous setup is owned exclusively by the ACP worker.
@@ -1396,7 +1429,8 @@ class GloveTeleopPlugin:
             return self._start_arm()
         if action == "disarm":
             self._disarm()
-            return {"state": "running", "armed": False}
+            retrying = self._retry_arm_completion()
+            return {"state": "running", "armed": False, "completion_retry": retrying}
         if action == "stop":
             return self._stop()
         if action == "info":
@@ -1414,6 +1448,7 @@ class GloveTeleopPlugin:
                     "arming": self._arming,
                     "arm_action_id": self._arm_action["action_id"] if self._arm_action else None,
                     "last_arm_result": self._last_arm_result,
+                    "arm_completion_delivery_failed": self._arm_completion_failed,
                     "cleanup_pending": self._pending_disarm,
                     "glove_port": (
                         self.glove_port if self.source_mode != "udp" else None

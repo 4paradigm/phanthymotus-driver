@@ -980,9 +980,10 @@ def test_arm_dispatch_is_async_and_reports_one_terminal_completion(monkeypatch, 
         release.set()
         assert completed.wait(1)
         if outcome == "callback_failure":
-            wait_for(lambda: device._arm_completion_failed and not device._armed and device._cleanup_done.is_set())
+            wait_for(lambda: device._arm_completion_failed and not device._armed
+                     and device._cleanup_done.is_set() and device._arm_action is None)
             assert all(("torque", [0]*10) in c.commands for c in clients.values())
-            with pytest.raises(RuntimeError, match="pending|ACP"):
+            with pytest.raises(RuntimeError, match="ACP"):
                 device.dispatch("arm", {"confirm_motion": True})
         else:
             wait_for(lambda: device._arm_action is None)
@@ -994,6 +995,53 @@ def test_arm_dispatch_is_async_and_reports_one_terminal_completion(monkeypatch, 
             assert not any(c.commands for c in clients.values())
     finally:
         release.set()
+        stop_simulated_device(device)
+
+
+@pytest.mark.parametrize("first_failure", ["setup", "callback"])
+def test_failed_arm_can_recover_and_retry_without_restarting_driver(monkeypatch, first_failure):
+    device, hand, _ = plugin()
+    device.accept_packet(packet(), "192.0.2.1")
+    found = {"right": "/dev/right"} if first_failure == "setup" else {
+        "left": "/dev/left", "right": "/dev/right"}
+    hand._discover = lambda: dict(found)
+    clients = {side: FakeClient() for side in ("left", "right")}
+    monkeypatch.setattr(glove, "L20LiteConnection", lambda cfg: type(
+        "Connection", (), {"get": lambda self: clients[cfg["side"]]})())
+    reports = []
+    core_online = [first_failure != "callback"]
+
+    def callback(action_id, status, result):
+        reports.append((action_id, status))
+        if not core_online[0]:
+            raise OSError("Core unavailable")
+
+    monkeypatch.setattr(device, "_acp_callback", callback)
+    try:
+        first = device.dispatch("arm", {"confirm_motion": True})
+        wait_for(lambda: device._arm_action is None)
+        assert not device._arming and not device._armed and not hand._teleop_active
+        if first_failure == "callback":
+            assert device._arm_completion_failed
+            with pytest.raises(RuntimeError, match="ACP"):
+                device.dispatch("arm", {"confirm_motion": True})
+            command_counts = {side: len(c.commands) for side, c in clients.items()}
+            core_online[0] = True
+            assert device.dispatch("disarm", {})["completion_retry"] is True
+            wait_for(lambda: device._arm_action is None)
+            assert not device._arm_completion_failed
+            assert reports[-1] == reports[0]  # Same terminal action, not a new motion.
+            assert {side: len(c.commands) for side, c in clients.items()} == command_counts
+        else:
+            assert reports == [(first["action_id"], "error")]
+        found.update(left="/dev/left", right="/dev/right")
+        device.accept_packet(packet(timestamp=2), "192.0.2.1")
+        second = device.dispatch("arm", {"confirm_motion": True})
+        wait_for(lambda: device._arm_action is None)
+        assert second["action_id"] != first["action_id"]
+        assert reports[-1] == (second["action_id"], "completed")
+        assert device._armed and hand._teleop_active
+    finally:
         stop_simulated_device(device)
 
 
