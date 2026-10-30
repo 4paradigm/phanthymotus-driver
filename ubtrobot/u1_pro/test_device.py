@@ -486,14 +486,16 @@ class U1CardContractTests(unittest.TestCase):
             initialize_robot=mock.Mock(),
         )
         with mock.patch.object(device, "U1Nodes", return_value=nodes):
-            plugins = device.build_plugins({}, "test", object())
+            plugins = device.build_plugins({"idle_actions": {"native_container": "test-behavior"}}, "test", object())
         nodes.initialize_robot.assert_called_once_with()
 
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
             "lifecycle", "mic", "speaker", "tts", "expression", "head", "system_controls",
-            "camera_left", "camera_right",
+            "idle_actions", "camera_left", "camera_right",
         ])
+        idle_card = next(plugin for plugin in plugins if plugin.PREFIX == "idle_actions")
+        self.assertEqual(idle_card.control.container, "test-behavior")
         self.assertEqual(len(prefixes), len(set(prefixes)))
         for plugin in plugins:
             self.assertTrue(plugin.PREFIX)
@@ -1339,6 +1341,269 @@ class U1CardContractTests(unittest.TestCase):
             "success": False, "code": "OK", "data": {"enabled": False},
         }
         self.assertEqual(device.U1Nodes.set_system_enabled(nodes, "vision_enabled", False)["enabled"], False)
+
+    def test_idle_card_lifecycle_preserves_preference_and_declares_async_actions(self):
+        import device
+
+        control = mock.Mock(spec=device.IdleActionControl)
+        plugin = device.IdleActionsPlugin(control)
+        schema = plugin.get_tool()["inputSchema"]
+        self.assertEqual(set(schema["properties"]["action"]["enum"]),
+                         {"start", "stop", "enable", "disable", "status"})
+        self.assertEqual(schema["x-completion"], {"actions": ["enable", "disable"], "timeout": 45})
+        self.assertEqual(schema["x-resource"], "u1_idle_config")
+        self.assertIn("action_id", schema["properties"])
+        self.assertEqual(plugin.start(), {"state": "ready"})
+        self.assertEqual(plugin.stop(), {"state": "idle"})
+        plugin.dispatch("start", {})
+        plugin.dispatch("stop", {})
+        self.assertIsNone(plugin.dispatch("unknown", {}))
+        self.assertEqual(control.mock_calls, [])
+
+    def test_system_controls_all_keeps_original_three_sdk_switches(self):
+        import device
+
+        nodes = mock.Mock()
+        plugin = device.SystemControlsPlugin(nodes)
+        plugin.dispatch("disable", {"control": "all"})
+        self.assertEqual(nodes.set_system_enabled.call_args_list, [
+            mock.call("wakeup_enabled", False), mock.call("wakeup_followup", False),
+            mock.call("vision_enabled", False),
+        ])
+        self.assertEqual(plugin.get_tool()["inputSchema"]["properties"]["control"]["enum"],
+                         ["wakeup", "wakeup_followup", "visual_behavior", "all"])
+
+    def _call_idle_mcp(self, plugin, action, **arguments):
+        from common.vendor_runtime import DriverBundle, make_handler
+
+        request = json.dumps({
+            "jsonrpc": "2.0", "id": "idle-request", "method": "tools/call",
+            "params": {"name": "idle_actions", "arguments": {"action": action, **arguments}},
+        }).encode()
+        bundle = DriverBundle([plugin])
+        handler_type = make_handler(lambda: bundle, "u1-test", "u1-test")
+        handler = object.__new__(handler_type)
+        handler.path = "/mcp"
+        handler.headers = {"Content-Length": str(len(request))}
+        handler.rfile = io.BytesIO(request)
+        handler.send_json = mock.Mock()
+        handler.do_POST()
+        handler.send_json.assert_called_once()
+        http_status, response = handler.send_json.call_args.args
+        self.assertEqual(http_status, 200)
+        self.assertEqual(response["id"], "idle-request")
+        self.assertNotIn("error", response)
+        return json.loads(response["result"]["content"][0]["text"])
+
+    def test_idle_mcp_returns_before_work_finishes_then_posts_correlated_success(self):
+        import device
+
+        ids = set()
+        for action in ("enable", "disable"):
+            with self.subTest(action=action):
+                entered, release = threading.Event(), threading.Event()
+                threads = []
+                enabled = action != "disable"
+                business_result = {"ok": True, "data": {"enabled": enabled}}
+
+                def perform(*args):
+                    threads.append(threading.get_ident())
+                    entered.set()
+                    if not release.wait(2):
+                        raise RuntimeError("test operation was not released")
+                    return business_result
+
+                control = mock.Mock(spec=device.IdleActionControl)
+                control.status.side_effect = perform
+                control.set_enabled.side_effect = perform
+                plugin = device.IdleActionsPlugin(control)
+                with mock.patch.object(device.urllib.request, "urlopen") as post:
+                    try:
+                        supplied = {"action_id": "caller-enable-1"} if action == "enable" else {}
+                        queued = self._call_idle_mcp(plugin, action, **supplied)
+                        self.assertEqual(queued["state"], "running")
+                        self.assertEqual(queued["action"], action)
+                        self.assertEqual(queued["request"], {
+                            "config_key": "idle_action_enabled",
+                            "enabled": enabled,
+                        })
+                        self.assertIn({"enable": "开启", "disable": "关闭"}[action],
+                                      queued["message"])
+                        self.assertTrue(entered.wait(1))
+                        self.assertEqual(len(threads), 1)
+                        self.assertNotEqual(threads[0], threading.get_ident())
+                        post.assert_not_called()
+                    finally:
+                        release.set()
+                        plugin._worker.join(2)
+                    self.assertFalse(plugin._worker.is_alive())
+                    post.assert_called_once()
+                    request = post.call_args.args[0]
+                    self.assertTrue(request.full_url.endswith("/api/acp/complete"))
+                    self.assertEqual(request.get_method(), "POST")
+                    completion = json.loads(request.data)
+                    self.assertEqual(completion["action_id"], queued["action_id"])
+                    self.assertEqual(completion["status"], "completed")
+                    self.assertEqual(completion["tool"], "idle_actions")
+                    self.assertEqual(completion["result"], {
+                        "state": "completed", "action_id": queued["action_id"], "action": action,
+                        "result": business_result,
+                    })
+                if supplied:
+                    self.assertEqual(queued["action_id"], supplied["action_id"])
+                else:
+                    self.assertEqual(str(device.uuid.UUID(queued["action_id"])), queued["action_id"])
+                self.assertNotIn(queued["action_id"], ids)
+                ids.add(queued["action_id"])
+                control.set_enabled.assert_called_once_with(enabled)
+                control.status.assert_not_called()
+
+    def test_idle_status_mcp_returns_observed_boolean_without_background_task(self):
+        import device
+        import subprocess
+
+        plugin = device.IdleActionsPlugin(device.IdleActionControl())
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled), mock.patch("native_idle_actions.subprocess.run", return_value=
+                    subprocess.CompletedProcess([], 0, stdout=json.dumps({"enabled": enabled}), stderr="")) as run, \
+                    mock.patch.object(device, "_acp_notify") as notify:
+                result = self._call_idle_mcp(plugin, "status")
+                self.assertEqual(result, {
+                    "ok": True, "code": "OK", "data": {"enabled": enabled}, "source": "vendor_user_config",
+                })
+                self.assertIs(result["data"]["enabled"], enabled)
+                self.assertNotIn("action_id", result)
+                self.assertIsNone(plugin._worker)
+                run.assert_called_once()
+                self.assertEqual(run.call_args.args[0][13:15], ["python3", "-c"])
+                notify.assert_not_called()
+
+    def test_idle_timeout_readback_reaches_mcp_caller_through_acp_error(self):
+        import device
+        import subprocess
+
+        for observed, expected in ((False, "match"), (True, "mismatch"), (None, "unknown")):
+            with self.subTest(observed=observed):
+                plugin = device.IdleActionsPlugin(device.IdleActionControl())
+                entered, release = threading.Event(), threading.Event()
+
+                def native(command, **kwargs):
+                    if command[13] == "bash":
+                        entered.set()
+                        if not release.wait(2):
+                            raise RuntimeError("test write was not released")
+                        raise subprocess.TimeoutExpired("write", 25)
+                    if observed is None:
+                        raise subprocess.TimeoutExpired("readback", 5)
+                    return subprocess.CompletedProcess([], 0, stdout=json.dumps({"enabled": observed}), stderr="")
+
+                with mock.patch("native_idle_actions.subprocess.run", side_effect=native) as run, \
+                        mock.patch.object(device.urllib.request, "urlopen") as post:
+                    try:
+                        queued = self._call_idle_mcp(plugin, "disable")
+                        self.assertEqual(queued["state"], "running")
+                        self.assertTrue(entered.wait(1))
+                        post.assert_not_called()
+                    finally:
+                        release.set()
+                        plugin._worker.join(2)
+                    self.assertFalse(plugin._worker.is_alive())
+                    post.assert_called_once()
+                    completion = json.loads(post.call_args.args[0].data)
+                self.assertEqual(completion["status"], "error")
+                self.assertEqual(completion["tool"], "idle_actions")
+                self.assertEqual(completion["action_id"], queued["action_id"])
+                self.assertEqual(completion["result"]["action_id"], queued["action_id"])
+                message = completion["result"]["message"]
+                self.assertIn(f"readback={expected};", message)
+                self.assertIn("requested=false;", message)
+                self.assertIn("timed out", message)
+                self.assertIn("request completion unconfirmed; no automatic retry", message)
+                self.assertEqual(run.call_count, 2)
+
+    def test_idle_busy_and_stop_reject_new_work_but_active_operation_completes(self):
+        import device
+
+        entered, release = threading.Event(), threading.Event()
+        control = mock.Mock(spec=device.IdleActionControl)
+        control.status.return_value = {"ok": True, "data": {"enabled": True}}
+
+        def perform(enabled):
+            entered.set()
+            if not release.wait(2):
+                raise RuntimeError("test operation was not released")
+            return {"ok": True, "enabled": enabled}
+
+        control.set_enabled.side_effect = perform
+        plugin = device.IdleActionsPlugin(control)
+        with mock.patch.object(device, "_acp_notify") as notify:
+            try:
+                first = plugin.dispatch("enable", {})
+                self.assertTrue(entered.wait(1))
+                with self.assertRaisesRegex(RuntimeError, "busy"):
+                    plugin.dispatch("disable", {})
+                self.assertEqual(plugin.stop(), {"state": "idle"})
+                with self.assertRaisesRegex(RuntimeError, "stopped"):
+                    plugin.dispatch("disable", {})
+            finally:
+                release.set()
+                plugin._worker.join(2)
+            self.assertFalse(plugin._worker.is_alive())
+            self.assertEqual(notify.call_count, 1)
+            self.assertEqual(notify.call_args.args[:2], (first["action_id"], "completed"))
+            plugin.start()
+            second = plugin.dispatch("disable", {})
+            plugin._worker.join(2)
+            self.assertFalse(plugin._worker.is_alive())
+            self.assertEqual(notify.call_count, 2)
+            self.assertEqual(notify.call_args.args[:2], (second["action_id"], "completed"))
+        self.assertEqual(control.set_enabled.call_args_list, [mock.call(True), mock.call(False)])
+        control.status.assert_not_called()
+
+    def test_idle_invalid_ids_and_worker_start_failure_leave_card_available(self):
+        import device
+
+        control = mock.Mock(spec=device.IdleActionControl)
+        control.set_enabled.return_value = {"ok": True, "enabled": True}
+        plugin = device.IdleActionsPlugin(control)
+        with mock.patch.object(device, "_acp_notify") as notify:
+            for value in ("", None, 1, "bad\nID", "a" * 129):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    plugin.dispatch("enable", {"action_id": value})
+            for target in ("device.threading.Thread", "device.threading.Thread.start"):
+                with self.subTest(target=target), mock.patch(target, side_effect=RuntimeError("thread unavailable")):
+                    with self.assertRaisesRegex(RuntimeError, "thread unavailable"):
+                        plugin.dispatch("enable", {})
+            self.assertIsNone(plugin._active)
+            self.assertIsNone(plugin._worker)
+            self.assertEqual(control.mock_calls, [])
+            notify.assert_not_called()
+            queued = plugin.dispatch("enable", {})
+            plugin._worker.join(2)
+            self.assertFalse(plugin._worker.is_alive())
+            notify.assert_called_once()
+            self.assertEqual(notify.call_args.args[:2], (queued["action_id"], "completed"))
+
+    def test_idle_worker_error_post_escapes_and_caps_unexpected_error_text(self):
+        import device
+
+        control = mock.Mock(spec=device.IdleActionControl)
+        control.set_enabled.side_effect = RuntimeError("bad\nforged\x1b[31m\x00\r" * 300)
+        plugin = device.IdleActionsPlugin(control)
+        with mock.patch.object(device.urllib.request, "urlopen") as post:
+            queued = plugin.dispatch("enable", {})
+            plugin._worker.join(2)
+            self.assertFalse(plugin._worker.is_alive())
+            post.assert_called_once()
+            completion = json.loads(post.call_args.args[0].data)
+        self.assertEqual(completion["action_id"], queued["action_id"])
+        self.assertEqual(completion["status"], "error")
+        message = completion["result"]["message"]
+        self.assertLessEqual(len(message), 1024)
+        self.assertTrue(message.isascii())
+        self.assertTrue(all(32 <= ord(char) < 127 for char in message))
+        for escaped in (r"\n", r"\x1b", r"\x00", r"\r"):
+            self.assertIn(escaped, message)
 
     def test_speaker_enables_stereo_output_before_subscribing(self):
         import device
