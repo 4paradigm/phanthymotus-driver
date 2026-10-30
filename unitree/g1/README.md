@@ -17,10 +17,12 @@
 | 双臂遥操 | `teleop_control` | 启用；接收设备输入，控制原厂 G1_23 固定假手双臂，提供对齐反馈及轨迹录制/回放；见[遥操使用说明](motion/README.md#使用) |
 | 连续控制 | `servo`、`servo_eef` | 关闭；分别接收关节目标和末端位姿目标，按需启用 |
 | 音频与灯光 | `mic`、`tts`、`speaker`、`led` | 启用；麦克风输入、文本播报、音频播放和 LED 控制 |
-| 视觉 | `camera_rgb`、`camera_depth`、`camera_distance`、`vision_capture` | 启用；RealSense 图像、距离、拍照和录像 |
+| 视觉 | `camera_rgb`、`camera_depth`、`camera_distance`、`vision_capture`、`image_diff` | 启用；RealSense 图像、距离、拍照录像和前后对比 |
 | 雷达与空间服务 | `lidar_cloud`、`controlled_spatial`、`controlled_spatial_map` | 启用；点云、厂商 SLAM 空间操作及地图数据 |
 | 本体状态 | `loco_state`、`loco_motion_state`、`motion_events`、`posture`、`imu`、`battery`、`joints`、`mainboard`、`model` | 启用；运动状态、姿态、电池、关节和模型数据 |
 | 外接设备 | `ext_mic`、`ext_camera` | 启用；外接麦克风和相机 |
+
+`image_diff` 复用 `camera_rgb` 的帧缓存，提供 `capture_baseline` / `compare` / `compare_files`，输出 before/after/diff 三联图、差异 mask 和 JSON 指标，存放在 `/opt/phanthy-motus/data/image_diff`。它只做确定性像素/几何对比，不做语义识别；`compare_files` 只接受 `source_root` 下的绝对路径。
 
 旧 `slam` 插件默认关闭。独立 `motion_control` 卡片入口已移除；双臂遥操使用 `teleop_control`。旧配置显式启用 `motion_control` 时，驱动会报迁移错误。
 

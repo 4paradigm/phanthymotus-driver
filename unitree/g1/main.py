@@ -249,6 +249,12 @@ class G1DeviceBundle:
                 plugins_cfg["vision_capture"], namespace, executor, camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        if plugins_cfg.get("image_diff", {}).get("enabled", False):
+            from image_diff import ImageDiffPlugin
+            self._plugins.append(ImageDiffPlugin(
+                plugins_cfg["image_diff"], namespace, executor, camera_plugin))
+            print("[bundle] ImageDiffPlugin loaded")
+
         if plugins_cfg.get("lidar", {}).get("enabled", False):
             from device import LidarPlugin
             self._plugins.append(LidarPlugin(plugins_cfg["lidar"], namespace, executor))
