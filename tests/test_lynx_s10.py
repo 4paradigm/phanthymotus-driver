@@ -313,8 +313,8 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert stream_status["camera_0"]["received"] == stream_status["camera_0"]["published"] == 1
     assert "/s10/front/image" in nodes.robot.subscriptions
     assert nodes._source_topics["camera_0"] == "/CAMERA/RAW"
-    assert nodes._source_topics["camera_1"] == "/s10/rear/image/compressed"
-    assert nodes._source_topics["camera_2"] == "/s10/left/image"
+    assert nodes._source_topics["camera_1"] == "/s10/left/image"
+    assert nodes._source_topics["camera_2"] == "/s10/front/image"
     assert nodes._source_topics["camera_3"] == "/s10/right/image"
     assert "/s10/depth" in nodes.robot.subscriptions
     assert nodes._sensor_qos.kwargs == {
@@ -398,7 +398,7 @@ def test_camera_config_has_four_directional_lanes_and_common_aliases():
     config = yaml.safe_load((DRIVER / "config.yaml").read_text())
     cameras = config["camera_topics"]
     assert set(cameras) == {f"camera_{index}" for index in range(4)}
-    for index, direction in enumerate(("front", "rear", "left", "right")):
+    for index, direction in enumerate(("rear", "left", "front", "right")):
         assert f"/camera/{direction}/color/image_raw" in cameras[f"camera_{index}"]
         assert f"/camera_{index}/image_raw" in cameras[f"camera_{index}"]
 

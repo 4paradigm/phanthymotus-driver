@@ -103,22 +103,21 @@ class S10Nodes:
             "battery": {"topic": base + "battery", "format": "data/json"},
             "lidar": {"topic": base + "lidar", "format": "sensor/pointcloud"},
         }
-        # Firmware images have used both the USB-camera names and the
-        # semantic front/rear/left/right names. Subscribe to all known
-        # aliases; the first active source wins without blocking the others.
+        # The Pro camera service numbers its physical inputs tail, left, head,
+        # right. Subscribe to USB names and semantic aliases alike.
         camera_topics = dict(config.get("camera_topics", {
-            "camera_0": ["/camera/front/image_raw", "/camera/front/image_raw/compressed",
-                         "/camera/front/color/image_raw", "/camera/front/color/image_raw/compressed",
-                         "/camera_front/image_raw", "/camera_0/image_raw",
+            "camera_0": ["/camera/rear/image_raw", "/camera/rear/image_raw/compressed",
+                         "/camera/rear/color/image_raw", "/camera/rear/color/image_raw/compressed",
+                         "/camera_back/image_raw", "/camera_0/image_raw",
                          "/usb_camera_1/image_raw", "/usb_camera_1/image_raw/compressed",
                          "/DEPTH_IMAGE"],
-            "camera_1": ["/camera/rear/image_raw", "/camera/rear/image_raw/compressed",
-                         "/camera/rear/color/image_raw", "/camera/rear/color/image_raw/compressed",
-                         "/camera_back/image_raw", "/camera_1/image_raw",
-                         "/usb_camera_1/image_raw_0", "/usb_camera_1/image_raw_0/compressed"],
-            "camera_2": ["/camera/left/image_raw", "/camera/left/image_raw/compressed",
+            "camera_1": ["/camera/left/image_raw", "/camera/left/image_raw/compressed",
                          "/camera/left/color/image_raw", "/camera/left/color/image_raw/compressed",
-                         "/camera_left/image_raw", "/camera_2/image_raw",
+                         "/camera_left/image_raw", "/camera_1/image_raw",
+                         "/usb_camera_1/image_raw_0", "/usb_camera_1/image_raw_0/compressed"],
+            "camera_2": ["/camera/front/image_raw", "/camera/front/image_raw/compressed",
+                         "/camera/front/color/image_raw", "/camera/front/color/image_raw/compressed",
+                         "/camera_front/image_raw", "/camera_2/image_raw",
                          "/usb_camera_1/image_raw_1", "/usb_camera_1/image_raw_1/compressed"],
             "camera_3": ["/camera/right/image_raw", "/camera/right/image_raw/compressed",
                          "/camera/right/color/image_raw", "/camera/right/color/image_raw/compressed",
@@ -348,9 +347,9 @@ class S10Nodes:
             index = int(numbered.group(1))
             if 0 <= index < 4:
                 return f"camera_{index}"
-        for directions, key in ((("front", "forward"), "camera_0"),
-                                (("rear", "back", "backward"), "camera_1"),
-                                (("left",), "camera_2"),
+        for directions, key in ((("rear", "back", "backward"), "camera_0"),
+                                (("left",), "camera_1"),
+                                (("front", "forward"), "camera_2"),
                                 (("right",), "camera_3")):
             if tokens.intersection(directions):
                 return key
