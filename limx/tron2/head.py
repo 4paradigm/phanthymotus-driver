@@ -47,9 +47,7 @@ def tool():
             'x-resource':['head','arm_l','arm_r'],
             # No action filter: calls without an action still register ACP.
             # Lifecycle/info responses never carry action_id and create no pending task.
-            'x-completion':{'timeout':completion.ACP_TIMEOUT}},
-        'topic_in':[{'format':'control/joint','desc':'通用人物跟随的协商头部目标'}],
-        'topic_out':[{'topic':'/limx_tron2/head_state','format':'data/json','desc':'头部实际反馈与动作完成状态'}]}
+            'x-completion':{'timeout':completion.ACP_TIMEOUT}}}
 
 
 class HeadCompletion(ArmCompletion):
@@ -61,7 +59,7 @@ class HeadCompletion(ArmCompletion):
         super().__init__(reader, report)
         self.admission_lock = asyncio.Lock()
         self.recovering = False
-        self.stream_guard = None
+        self.follow_guard = None
 
     async def dispatch(self, action, target, duration, details):
         # Invalid new input must never clear a previous task.
@@ -207,11 +205,11 @@ class HeadCompletion(ArmCompletion):
 
     async def send(self, target, duration):
         self.validate_admission_feedback()
-        token = (self.active or {}).get('details',{}).get('head_stream')
+        token = (self.active or {}).get('details',{}).get('head_follow_guard')
         if token is not None:
-            if self.stream_guard is None:
-                raise MoveError('头部数据流保护未配置',False)
-            return await self.reader.send_moveh(target, duration, guard=lambda:self.stream_guard(token))
+            if self.follow_guard is None:
+                raise MoveError('头部跟随保护未配置',False)
+            return await self.reader.send_moveh(target, duration, guard=lambda:self.follow_guard(token))
         return await self.reader.send_moveh(target, duration)
 
     async def wait_for_arrival(self, job):

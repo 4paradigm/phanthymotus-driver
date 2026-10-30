@@ -1,0 +1,194 @@
+"""VOP integration on the original TRON2 MCP/MoveH path; no hardware."""
+import asyncio
+import copy
+import json
+import math
+from pathlib import Path
+import sys
+import time
+from types import SimpleNamespace
+import unittest
+from unittest.mock import AsyncMock, Mock, patch
+import aiohttp
+from aiohttp import web
+from device import Adapter
+from state import joint_state
+from test_sensors import settings, info, joints
+from head_follow.runtime import Runtime
+from head_follow.engine import VOP_TOPIC
+from head_follow.client import Error
+
+class Publisher:
+    def __init__(self):self.callback=None;self.unbound=[]
+    def publish(self,*args):pass
+    def subscribe_json(self,topic,callback):self.callback=callback;return topic
+    def unsubscribe(self,sub):self.unbound.append(sub);self.callback=None
+
+class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.pub=Publisher()
+        self.adapter=Adapter(self.pub.publish,settings(enabled_cards=['joint_state','camera','move_head','head_visual_follow']))
+        self.reader=self.adapter.reader;self.reader.accept_info(info())
+        self.reader.ws=SimpleNamespace(closed=False,send_json=AsyncMock())
+        self.reader.head_control_status=AsyncMock(return_value={'vr_head_follow':False})
+        self.reader.send_movej=AsyncMock();self.reader.send_gripper=AsyncMock()
+        self.adapter.head.report=AsyncMock(return_value=True)
+        self.q=[0.]*16;self.feedback()
+        self.runtime=Runtime(self.adapter,self.pub);self.adapter.follow_runtime=self.runtime
+        self.runner=None
+
+    def feedback(self):
+        self.reader.accept_info(info())
+        self.reader.joints=joint_state(joints(q=self.q[:],dq=[0.]*16,timestamp=time.monotonic()))
+        self.reader.joints_at=time.monotonic();self.reader.joints_received=time.time()
+
+    async def asyncTearDown(self):
+        await self.runtime.close();await self.adapter.head.close();await self.adapter.motion.close()
+        if self.runner:await self.runner.cleanup()
+
+    async def start(self):
+        return await self.adapter.execute_tool('head_visual_follow',{'action':'start','input_topic':VOP_TOPIC})
+
+    def packet(self,people=((.6,0.),)):
+        return json.dumps({'timestamp':time.time(),'latency_ms':0,'objects':[
+            {'name':'person','confidence':.9,'position':list(xy)} for xy in people]})
+
+    async def enable(self):
+        await self.start();self.pub.callback(self.packet())
+        await self.adapter.execute_tool('head_visual_follow',{'action':'follow'})
+
+    def no_sends(self):
+        self.reader.ws.send_json.assert_not_awaited()
+        self.reader.send_movej.assert_not_awaited();self.reader.send_gripper.assert_not_awaited()
+
+    async def test_one_visible_follow_and_original_manual_schema_same_driver(self):
+        tools={t['name']:t for t in self.adapter.tools()}
+        self.assertIn('head_visual_follow',tools);self.assertNotIn('yolo_detect',tools)
+        self.assertEqual(set(tools['move_head']['inputSchema']['properties']),{'pitch_deg','yaw_deg','time'})
+        self.assertNotIn('topic_in',tools['move_head'])
+        self.assertEqual(list(tools['head_visual_follow']['inputSchema']['x-action-params']),['follow'])
+        self.assertEqual(tools['head_visual_follow']['topic_in'][0]['format'],'data/json')
+        self.no_sends()
+
+    async def test_lifecycle_launch_info_and_health_never_arm_or_deadlock(self):
+        self.runtime.launch();await self.start()
+        for action in ('info','stop'):
+            result=await asyncio.wait_for(self.adapter.execute_tool('head_visual_follow',{'action':action}),2)
+            self.assertFalse(result['active'])
+        await asyncio.wait_for(self.adapter.health(None),2)
+        self.no_sends()
+
+    async def test_source_must_be_head_vop_and_exactly_one(self):
+        for args in ({},{'input_topic':'/limx_tron2/camera_left/objects'},
+                     {'input_topics':[VOP_TOPIC,'/other']},{'input_topics':'bad'}):
+            with self.assertRaises(Error):await self.runtime.call({'action':'start',**args})
+        self.assertIsNone(self.pub.callback);self.no_sends()
+        with self.assertRaises(Error):await self.runtime.call({'action':'follow'})
+
+    async def test_delayed_old_callback_and_invalid_payload_cannot_rearm(self):
+        await self.start();old=self.pub.callback
+        old(self.packet());self.assertTrue(self.runtime.detections()['active'])
+        await self.runtime.call({'action':'stop'});await self.start()
+        old(self.packet());self.assertFalse(self.runtime.detections()['active'])
+        self.pub.callback('bad-json')
+        with self.assertRaises(Error):await self.runtime.call({'action':'follow'})
+        self.assertFalse(self.runtime.engine.active);self.no_sends()
+
+    async def test_internal_move_uses_original_validation_and_axis_conversion(self):
+        await self.enable()
+        self.adapter.head.dispatch=AsyncMock(return_value={'motion_sent':True,'action_id':'one'})
+        r=await asyncio.to_thread(self.runtime.move,2.,-6.,1.)
+        self.assertEqual(r['action_id'],'one')
+        action,target,duration,details=self.adapter.head.dispatch.call_args.args
+        self.assertEqual((action,duration),('move',1.))
+        self.assertEqual(target,[-math.radians(2),-math.radians(6)])
+        self.assertIn('head_follow_guard',details)
+        self.no_sends()
+
+    async def guarded_send(self,mode):
+        await self.enable();self.reader.head_control_status=AsyncMock(side_effect=mode)
+        with self.assertRaises(ValueError):await asyncio.to_thread(self.runtime.move,0.,-2.,.6)
+        self.no_sends()
+
+    async def test_stop_during_mode_query_blocks_native_send(self):
+        async def mode():
+            await self.runtime.call({'action':'stop'})
+            return {'vr_head_follow':False}
+        await self.guarded_send(mode)
+
+    async def test_expiry_during_mode_query_blocks_native_send(self):
+        async def mode():
+            self.runtime.send_guard['expires']-=2
+            return {'vr_head_follow':False}
+        await self.guarded_send(mode)
+
+    async def test_reference_change_during_mode_query_blocks_native_send(self):
+        async def mode():
+            self.q[0]=.1;self.feedback()
+            return {'vr_head_follow':False}
+        await self.guarded_send(mode)
+
+    async def test_arm_reference_changed_before_dispatch_blocks_send(self):
+        await self.enable();self.q[0]=.1;self.feedback()
+        with self.assertRaisesRegex(Error,'参考姿态'):
+            await asyncio.to_thread(self.runtime.move,0.,-2.,.6)
+        self.no_sends()
+
+    async def test_eventloop_cannot_block_itself(self):
+        with self.assertRaisesRegex(Error,'阻塞'):self.runtime.robot()
+        self.no_sends()
+
+    async def test_real_loopback_mcp_exposes_follow_and_uses_lifecycle(self):
+        app=web.Application();app.router.add_post('/mcp',self.adapter.rpc);app.router.add_get('/health',self.adapter.health)
+        self.runner=web.AppRunner(app);await self.runner.setup()
+        site=web.TCPSite(self.runner,'127.0.0.1',0);await site.start()
+        url='http://127.0.0.1:%d'%site._server.sockets[0].getsockname()[1]
+        async with aiohttp.ClientSession() as session:
+            async def rpc(method,params):
+                async with session.post(url+'/mcp',json={'jsonrpc':'2.0','id':1,'method':method,'params':params}) as r:return await r.json()
+            r=await rpc('tools/list',{})
+            self.assertIn('head_visual_follow',{t['name'] for t in r['result']['tools']})
+            r=await rpc('tools/call',{'name':'head_visual_follow','arguments':{'action':'start','input_topic':VOP_TOPIC}})
+            self.assertFalse(r['result']['isError']);self.assertTrue(self.runtime.bound)
+            async with session.get(url+'/health') as r:h=await r.json()
+            self.assertFalse(h['head_visual_follow']['active'])
+        self.no_sends()
+
+class PackagingTests(unittest.TestCase):
+    def test_no_custom_detector_generic_control_or_extra_service(self):
+        root=Path(__file__).resolve().parents[1]
+        for name in ('yolo_detect','head_stream.py','vision.py'):
+            self.assertFalse((root/name).exists())
+        self.assertEqual((root/'requirements.txt').read_bytes(),b'aiohttp>=3.10.11,<4\nPyYAML>=6.0.2,<7\n')
+        for name in ('device.py','main.py','Dockerfile','driver.yaml','config.yaml','head_follow/runtime.py'):
+            s=(root/name).read_text()
+            for forbidden in ('172.28.4.23','15792','15793','actucore','control/joint'):
+                self.assertNotIn(forbidden,s)
+        self.assertFalse((root/'head_follow/Dockerfile').exists())
+
+    def test_ros_input_uses_original_context_best_effort_and_shutdown_order(self):
+        import types
+        from unittest.mock import MagicMock
+        from ros2 import JsonPublisher
+        log=[];node=MagicMock();executor=MagicMock()
+        executor.spin.side_effect=lambda:log.append('spin')
+        executor.shutdown.side_effect=lambda:log.append('executor_shutdown')
+        node.destroy_node.side_effect=lambda:log.append('destroy_node')
+        qos=types.ModuleType('rclpy.qos');qos.QoSProfile=lambda **kw:SimpleNamespace(**kw)
+        qos.ReliabilityPolicy=SimpleNamespace(BEST_EFFORT='best_effort')
+        qos.HistoryPolicy=SimpleNamespace(KEEP_LAST='keep_last');qos.DurabilityPolicy=SimpleNamespace(VOLATILE='volatile')
+        executors=types.ModuleType('rclpy.executors');executors.SingleThreadedExecutor=Mock(return_value=executor)
+        p=JsonPublisher.__new__(JsonPublisher);p.node=node;p.executor=p.spin_thread=None;p.message_type=object
+        p.rclpy=SimpleNamespace(ok=lambda:True,shutdown=lambda:log.append('rclpy_shutdown'))
+        received=[]
+        with patch.dict(sys.modules,{'rclpy.qos':qos,'rclpy.executors':executors}):
+            sub=p.subscribe_json(VOP_TOPIC,received.append)
+            callback=node.create_subscription.call_args.args[2];profile=node.create_subscription.call_args.args[3]
+            callback(SimpleNamespace(data='{}'));self.assertEqual(received,['{}'])
+            self.assertEqual(profile.reliability,'best_effort');self.assertEqual(profile.depth,1)
+            p.unsubscribe(sub);p.close()
+        executor.add_node.assert_called_once_with(node)
+        self.assertLess(log.index('executor_shutdown'),log.index('destroy_node'))
+        self.assertLess(log.index('destroy_node'),log.index('rclpy_shutdown'))
+
+if __name__=='__main__':unittest.main()

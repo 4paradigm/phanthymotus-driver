@@ -348,7 +348,7 @@ class RobotReader:
         if not status['available'] or not motion_readiness(status['data'])['ready'] or self.head_pending or self.move_pending:
             raise MoveError('核对头部模式期间运动状态改变，未发送转动指令',False)
         if guard is not None:
-            guard()  # Recheck stream epoch, TTL and feedback AFTER the awaited mode probe.
+            guard()  # Recheck follow ownership, deadline and feedback AFTER the awaited mode probe.
         guid = str(uuid.uuid4()); future = asyncio.get_running_loop().create_future()
         self.head_pending = (guid, future)
         sent = False

@@ -1,6 +1,6 @@
 # LimX TRON2 传感器、双臂、头部与夹爪控制驱动
 
-为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂/头部控制卡片、预设pose动作卡片和一张可选择左右的夹爪控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.13.0`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂/头部控制卡片、预设pose动作卡片和一张可选择左右的夹爪控制卡片，新增一张基于 Perception Stack VOP 的人物头部视觉跟随卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.14.0`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
@@ -12,6 +12,7 @@
 | `camera_right` | sensor | 右腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_right`（image/jpeg） |
 | `arm_control` | actuator | move自定义目标、reset复位并自动校验；ACP完成通知 | 无 |
 | `move_head` | actuator | 俯仰-60～45°（上正）、偏航-88～88°（自身左正）绝对目标；ACP确认到位 | 无 |
+| `head_visual_follow` | actuator | VOP人物跟随；确认无人后回正；仅显式执行后启用 | 输入 `/limx_tron2/camera/objects`（data/json） |
 | `model` | resource | 厂家DACH_TRON2A骨架URDF，供平台自动加载 | 无 |
 
 夹爪卡片说明见 [夹爪卡片使用说明](GRIPPER.md)。只填写side（left/right）、opening_mm（0至85mm）、speed、force；没有action/close/recover选项。驱动按底层值=毫米数×94/85名义换算，0mm闭合。非法输入在占用任务和发送前拒绝，两侧独立管理；合法指令仍保留未到位或断连保护。
@@ -22,9 +23,13 @@
 
 battery_state卡片、配置、topic和电池计算/显示代码已从本版本移除；当前双臂版本不收录电池功能，后续有明确双腿需求再设计。
 
+## 人物头部视觉跟随
+
+在画布连接头部 `camera` → Perception Stack `vop` → `head_visual_follow`，开启智能控制并等检测数据更新，再执行跟随。界面只显示 `follow`；人物消失或连续确认无人时回正，相机/检测失败时保持。容器/项目启动不自动转头。具体观测格式、运动完成及停止行为见 [跟随说明](head_follow/README.md)。跟随与手动转头均由原 TRON2 容器、原15791入口提供；没有独立YOLO或额外平台插件依赖。
+
 ## 读取边界与字段说明
 
-传感器后台仅发送request_get_joint_state。arm_control仅在显式move/reset调用时发送一次request_movej；move_head仅在显式move调用时发送一次request_moveh；夹爪卡片仅在显式读取状态或跟踪开合动作时查询夹爪，显式开合只发送一次所选侧的指令。pose仅在显式选择英文动作后自检、必要时先回原home并确认，再回正头部，以ServoJ执行预设轨迹；挥手在右肩旋转三轮后保持手臂、右夹爪开合一次，再回原home。没有模式切换、拖动示教或自动演示循环。
+传感器后台仅发送request_get_joint_state。arm_control仅在显式move/reset调用时发送一次request_movej；move_head在显式move时发送一次request_moveh；显式启用人物跟随后，跟随模块也通过同一move_head路径串行转头；夹爪卡片仅在显式读取状态或跟踪开合动作时查询夹爪，显式开合只发送一次所选侧的指令。pose仅在显式选择英文动作后自检、必要时先回原home并确认，再回正头部，以ServoJ执行预设轨迹；挥手在右肩旋转三轮后保持手臂、右夹爪开合一次，再回原home。没有模式切换、拖动示教或自动演示循环。
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。
@@ -34,7 +39,7 @@ battery_state卡片、配置、topic和电池计算/显示代码已从本版本�
 - 厂家关节时间戳的时钟及单位尚未验证，因此 `robot_timestamp` 仅作为原始值保留，`measurement_time_verified` 为 `false`。接收年龄不能证明测量数据的真实年龄。
 - 默认超过5秒没有对应数据则`available: false`、`sample_status: stale`、缓存`data: null`。骨架发布空joints与不可用状态。断连时立即清空。
 
-关节传感器start/stop兼容单实例生命周期，不启动/停止机器人，也不停止后台采样。info读取缓存，不额外请求机器人。camera的start/stop实际开启/释放只读视频连接。公开四张sensor、一张arm_control actuator及model resource；不提供独立robot_status/reset_pose卡片或助手卡片。
+关节传感器start/stop兼容单实例生命周期，不启动/停止机器人，也不停止后台采样。info读取缓存，不额外请求机器人。camera的start/stop实际开启/释放只读视频连接。公开四张sensor、arm_control/pose/move_head/gripper/head_visual_follow五张actuator及model resource；不提供独立robot_status/reset_pose卡片或助手卡片。
 
 兼容Agent Core自动注入的instance_id和_trace_id：最长128字符、无控制字符，不参与机器人请求或回显。关节传感器通过内部info查看当前原始缓存。
 
@@ -85,7 +90,7 @@ sudo docker exec embodied-limx-tron2 python3 /work/check.py
 
 脚本等待就绪，检查Core注册、joint_state骨架sensor、可选camera/arm_control及model类型、骨架格式和URDF名称，验证生命周期及关节接收时间更新。它不调用move/reset，也不验证真实运动。
 
-升级后刷新Motus，移除画布上的旧robot_status、reset_pose、joint_angles、battery_state实例，重新添加joint_state以更新缓存的渲染格式。使用joint_state、camera、camera_left、camera_right、arm_control五张业务卡片；model由骨架组件自动读取，不需要手动执行或连接。开启后从监控查看joint_state的厂家双臂/头部骨架。监控和查看数据流均加载同一model资源；升级后应重新加载组件以更新缓存。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
+升级后刷新Motus，移除画布上的旧robot_status、reset_pose、joint_angles、battery_state实例，重新添加joint_state以更新缓存的渲染格式。相机、骨架与运动卡片按需添加；视觉跟随另需连接现有VOP输出；model由骨架组件自动读取，不需要手动执行或连接。开启后从监控查看joint_state的厂家双臂/头部骨架。监控和查看数据流均加载同一model资源；升级后应重新加载组件以更新缓存。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
 
 `GET http://127.0.0.1:15791/health` 返回卡片状态：启用关节时，机器人连接且这些已启用传感器全部有最近接收数据为HTTP 200。可选camera的idle/断流不会阻塞它们或机械臂任务。只启用相机时，所有已启用相机都有最近成功发布的JPEG才就绪，否则为503。配置必须启用至少一张传感器，禁止仅开启arm_control却将空样本集合当成就绪。`registered_mcp_id` 单独表明 Core 注册是否完成；机器人可读与 Core 已注册是两项独立条件。
 
@@ -168,43 +173,3 @@ sudo docker exec embodied-limx-tron2 /bin/bash -c 'source /opt/ros/humble/setup.
 测试使用合成MJPEG，覆盖启停/并发/中断等待、断流清空/重连、无效响应/畸形/截断/超限/停滞帧、RPC元数据与禁止运动；左右腕分开输出/独立停止、失败不影响其他源/JSON就绪，以及三路CompressedImage原始二进制、独立frame_id/单帧队列。只读隧道现场诊断确认三路同时连续视频，左停止后头部/右继续发布；实际图像/现场标识不进入仓库或公开PR。源/中继测试不能代替新镜像部署后的DDS/Core/平台验收。
 
 预设动作卡片的使用、起始姿态、停止与验证范围见 [POSE.md](POSE.md)。pose与arm_control复用同一双臂执行器；不扩展arm_control的公开动作，不更改原始home。
-
-## 通用人物视觉跟随的 TRON2 执行适配（0.13.0）
-
-不再提供自建 `yolo_detect` 或 TRON2 专用 `head_visual_follow` 卡片，不需要外部私有 GPU
-端点、Pillow 或独立视觉容器。识别复用 Perception Stack 的 VOP；人物跟随策略在平台
-ActuCore 的 `headfollow` 插件中，机器人驱动只负责本机头部动作和反馈。
-
-画布接线：`camera → VOP → headfollow → move_head`。最后一条为 `control/joint`；
-头部执行卡片的 `info.control_interface` 声明 `motus.control/1` 和
-`head_tracking` 扩展。Core 将这份接口交给策略，策略通过所声明的反馈话题读取真实头部
-状态。没有修改 Agent Core、Perception、其它机器人或原 DDS/证书配置。
-
-手动 `move_head` 的俯仰/偏航/时间、坐标约定和 ACP 行为保留；新增输入口不增加人工表单
-参数。只启动项目会订阅命令流，不转头；用户必须在通用 `headfollow` 卡片显式执行
-`follow`。停用数据流仅阻止尚未发送的新目标，不能中途制动已经受理的 MoveH。
-
-执行端约束：
-
-- 原生顺序 `[head_pitch_Joint, head_yaw_Joint]`，单位 rad。头部俯仰原生下正、偏航自身左正。
-- 跟随工作范围为原生 pitch −30°～55°、yaw −45°～45°，按≤6°/s的目标变化率计算运动时间，单次0.6～15秒；
-  手动卡片原有更大限位不改动。回正为 `[0,0]`，不改变双臂自然垂下home。
-- `head_stream.py` 复用 `common.control.ControlSink` 检查标准控制协议、过期/重复、来源及
-  限位；再检查驱动会话、参考姿态和动作所有权。无排队、无同目标纠正、无自动解除故障。
-- 数据流仍由原 HeadCompletion / MoveH 执行，保留模式、碰撞保护标志、互斥、新反馈、
-  实际到位验证和 ACP 回调。新增可选发送前 guard，在只读模式查询之后再次核对 TTL、
-  接线代次和参考姿态；不会用过期目标补发。原手动/pose发送不传 guard，行为不变。
-- `/limx_tron2/head_state`（data/json）发布实际两轴反馈及 `motus.head-state/1` 请求确认。
-  `accepted`、静止和 `completed+arrival_verified+callback_delivered` 分开报告。无力矩传感
-  保护声明时 `force_torque=null`，不虚构测力能力。
-- 一个驱动进程、一个15791入口、原ROS context/publisher。连接控制流后才启动原节点的
-  executor，不再创建视觉订阅进程或第二个设备驱动。关闭时先结束executor线程再销毁节点。
-
-通用插件依赖配套的 ActuCore 更新；仅部署本驱动不会出现 `headfollow` 卡片。旧独立
-YOLO/跟随的容器、注册和画布实例应在明确停用后定向移除，不能删除 Perception Stack
-来清理自建 YOLO。保留已知旧镜像/容器参数和应用配置以便回退。禁止同时启用新旧跟随。
-
-VOP 的库接口是 `{timestamp, count, objects:[{name, position:[x,y], confidence}]}`；position
-是图像中心归一化到−1～1，不是像素坐标或三维点。当前 VOP 只提供发布/处理计时，未承诺
-相机硬件采样时间；插件不把它标为硬件同步验证。现场旧版 Perception 的兼容性须用一条
-实际输出核对，不能仅凭容器名或镜像标签判定。实际DDS和实体头部运动仍需新镜像验收。

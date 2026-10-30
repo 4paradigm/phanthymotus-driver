@@ -63,7 +63,7 @@ def load_settings():
     if settings['stale_after_seconds'] < settings['poll_interval_seconds']:
         raise ValueError('Stale threshold must cover the poll interval')
     plugins = config.get('plugins', {})
-    allowed = {'joint_state', 'arm_control', 'move_head', 'pose', 'gripper', 'gripper_left', 'gripper_right'} | set(CAMERA_SOURCES)
+    allowed = {'joint_state', 'arm_control', 'move_head', 'pose', 'gripper', 'gripper_left', 'gripper_right','head_visual_follow'} | set(CAMERA_SOURCES)
     if not isinstance(plugins, dict) or set(plugins) - allowed:
         raise ValueError('Only TRON2 sensor, arm_control and gripper plugins may be configured')
     enabled = []
@@ -74,6 +74,8 @@ def load_settings():
             enabled.append(name)
     if not set(enabled) & ({'joint_state'} | set(CAMERA_SOURCES)):
         raise ValueError('Enable at least one read-only sensor')
+    if 'head_visual_follow' in enabled and not {'joint_state','camera','move_head'} <= set(enabled):
+        raise ValueError('头部跟随需要joint_state、camera和move_head')
     settings['enabled_cards'] = enabled
     settings['home_file'] = os.environ.get('TRON2_HOME_FILE', '/config/tron2/home.json')
     # Fixed read-only video source on the same configured robot host. Callers
@@ -90,11 +92,7 @@ async def run():
     from ros2 import JsonPublisher
     from camera import CAMERA_SOURCES
     settings = load_settings()
-    from head_stream import STATE_TOPIC
-    json_topics = [TOPICS[name] for name in settings['enabled_cards'] if name in TOPICS]
-    if 'move_head' in settings['enabled_cards']:
-        json_topics.append(STATE_TOPIC)
-    publisher = JsonPublisher(json_topics,
+    publisher = JsonPublisher([TOPICS[name] for name in settings['enabled_cards'] if name in TOPICS],
         image_topics=[source[0] for name, source in CAMERA_SOURCES.items() if name in settings['enabled_cards']])
     tasks = []
     runner = None
@@ -107,9 +105,10 @@ async def run():
         async with aiohttp.ClientSession(trust_env=False,
                 timeout=aiohttp.ClientTimeout(total=8)) as session:
             adapter = Adapter(publisher.publish, settings, session=session)
-            if 'move_head' in adapter.enabled:
-                from head_stream import HeadStream
-                adapter.head_stream = HeadStream(adapter, publisher)
+            if 'head_visual_follow' in adapter.enabled:
+                from head_follow.runtime import Runtime
+                adapter.follow_runtime = Runtime(adapter, publisher)
+                adapter.follow_runtime.launch()
             ca = os.environ.get('AGENT_CORE_CA_CERT')
             if ca:
                 adapter.core_ssl = ssl.create_default_context(cafile=ca)
@@ -130,8 +129,8 @@ async def run():
                 for task in done:
                     task.result()
             finally:
-                if adapter.head_stream is not None:
-                    await adapter.head_stream.close()
+                if adapter.follow_runtime is not None:
+                    await adapter.follow_runtime.close()
                 await asyncio.gather(*(stream.close() for stream in adapter.cameras.values()))
                 await adapter.motion.close()
                 await adapter.head.close()
@@ -141,8 +140,8 @@ async def run():
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
     finally:
-        if adapter is not None and adapter.head_stream is not None:
-            await adapter.head_stream.close()
+        if adapter is not None and adapter.follow_runtime is not None:
+            await adapter.follow_runtime.close()
         if runner:
             await runner.cleanup()
         publisher.close()

@@ -106,7 +106,7 @@ def run_check(timeout=20, camera=False):
                 schema.get('x-resource')!=['arm_l','arm_r','head']:
             raise ValueError('Pose schema or shared physical resources differ')
     names = {tool['name'] for tool in tools}
-    expected = {**dict.fromkeys(CARDS | set(CAMERA_SOURCES), 'sensor'), 'arm_control': 'actuator', 'pose': 'actuator', 'move_head': 'actuator', 'gripper': 'actuator', 'model': 'resource'}
+    expected = {**dict.fromkeys(CARDS | set(CAMERA_SOURCES), 'sensor'), 'arm_control': 'actuator', 'pose': 'actuator', 'move_head': 'actuator', 'gripper': 'actuator', 'model': 'resource', 'head_visual_follow':'actuator'}
     if not CARDS <= names or names - set(expected) or any(tool['type'] != expected[tool['name']] for tool in tools):
         raise ValueError('Expected skeleton sensor, optional camera/arm_control and model resource')
     camera_tools = {tool['name']: tool for tool in tools if tool['name'] in CAMERA_SOURCES}
