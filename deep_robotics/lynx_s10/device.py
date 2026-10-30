@@ -116,13 +116,13 @@ class S10Nodes:
             "camera_left": ["/camera/left/image_raw", "/camera/left/image_raw/compressed",
                          "/camera/left/color/image_raw", "/camera/left/color/image_raw/compressed",
                          "/camera_left/image_raw", "/camera_1/image_raw",
-                         "/usb_camera_1/image_raw_1", "/usb_camera_1/image_raw_1/compressed",
+                         "/usb_camera_1/image_raw_0", "/usb_camera_1/image_raw_0/compressed",
                          "/usb_camera_2/image_raw", "/usb_camera_2/image_raw/compressed",
                          "/usb_camera_2/image_raw_0", "/usb_camera_2/image_raw_0/compressed"],
             "camera_front": ["/camera/front/image_raw", "/camera/front/image_raw/compressed",
                          "/camera/front/color/image_raw", "/camera/front/color/image_raw/compressed",
                          "/camera_front/image_raw", "/camera_2/image_raw",
-                         "/usb_camera_1/image_raw_0", "/usb_camera_1/image_raw_0/compressed",
+                         "/usb_camera_1/image_raw_1", "/usb_camera_1/image_raw_1/compressed",
                          "/usb_camera_3/image_raw", "/usb_camera_3/image_raw/compressed",
                          "/usb_camera_3/image_raw_0", "/usb_camera_3/image_raw_0/compressed"],
             "camera_right": ["/camera/right/image_raw", "/camera/right/image_raw/compressed",
@@ -347,6 +347,18 @@ class S10Nodes:
     def _camera_key_for_topic(topic):
         name = topic.lower()
         import re
+        # usb_cam_multi_node uses one base topic and numbered suffixes.  Do
+        # this before the generic camera_N rule, which otherwise interprets
+        # the service's ``camera_1`` prefix as the lane for every image.
+        usb = re.search(r"/usb_camera_1/image_raw(?:_(\d+))?(?:/|$)", name)
+        if usb:
+            suffix = usb.group(1)
+            return {None: "camera_rear", "0": "camera_left",
+                    "1": "camera_front", "2": "camera_right"}.get(suffix)
+        usb_service = re.search(r"/usb_camera_(\d+)(?:/|$)", name)
+        if usb_service:
+            return {"1": "camera_rear", "2": "camera_left",
+                    "3": "camera_front", "4": "camera_right"}.get(usb_service.group(1))
         tokens = set(filter(None, re.split(r"[^a-z0-9]+", name)))
         numbered = re.search(r"(?:^|[/_])camera[_-]?(\d+)(?:$|[/_])", name)
         if numbered:
@@ -877,7 +889,6 @@ class S10StatePlugin:
             "joint_state": "山猫 S10 轮足关节位置、速度、力矩和温度（原生协议 10Hz）",
             "loco_state": "山猫 S10 运动状态、步态、模式和速度（原生协议 10Hz）",
             "battery": "山猫 S10 电池电量、电压、温度和充电状态",
-            "navigation_status": "山猫 S10 导航任务和定位状态（Pro 支持）",
             "lidar": "山猫 S10 激光雷达点云（实时 ROS 2 转发）",
         }
         topics = self.nodes.topics if self.nodes else {}
@@ -913,7 +924,7 @@ class S10StatePlugin:
         keys = {"imu": "1048577:15728640", "joints": "1048577:15728640",
                 "joint_state": "1048577:15728640", "loco_state": "1048577:15728640",
                 "battery": "1048578:15728640",
-                "navigation_status": "1048579:15728640"}
+                }
         if name == "state":
             result = self.native.snapshot()
             if self.nodes:

@@ -61,10 +61,19 @@ class MediaWorkers:
                     result = results.get_nowait()
                 except queue.Empty:
                     continue
+                # A worker may finish another frame while the callback is
+                # publishing. Drain any superseded result and handle only the
+                # newest one, preventing conversion time from becoming visible
+                # stream latency.
+                while True:
+                    try:
+                        result = results.get_nowait()
+                    except queue.Empty:
+                        break
                 found = True
                 self._handle_result(result)
             if not found:
-                threading.Event().wait(0.01)
+                threading.Event().wait(0.001)
 
     def _handle_result(self, result):
         try:

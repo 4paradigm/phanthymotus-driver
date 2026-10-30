@@ -44,8 +44,8 @@ camera_topics:
     - "/camera_left/image_raw/compressed"
     - "/camera_1/image_raw"
     - "/camera_1/image_raw/compressed"
-    - "/usb_camera_1/image_raw_1"
-    - "/usb_camera_1/image_raw_1/compressed"
+    - "/usb_camera_1/image_raw_0"
+    - "/usb_camera_1/image_raw_0/compressed"
   camera_front:
     - "/camera/front/image_raw"
     - "/camera/front/image_raw/compressed"
@@ -55,8 +55,8 @@ camera_topics:
     - "/camera_front/image_raw/compressed"
     - "/camera_2/image_raw"
     - "/camera_2/image_raw/compressed"
-    - "/usb_camera_1/image_raw_0"
-    - "/usb_camera_1/image_raw_0/compressed"
+    - "/usb_camera_1/image_raw_1"
+    - "/usb_camera_1/image_raw_1/compressed"
   camera_right:
     - "/camera/right/image_raw"
     - "/camera/right/image_raw/compressed"

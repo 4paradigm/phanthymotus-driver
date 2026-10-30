@@ -425,7 +425,9 @@ def test_camera_lane_recognizes_numbered_camera_topic_independent_of_discovery_o
 
     assert nodes._assign_camera_lane("/camera_3/image_raw") == "camera_right"
     assert nodes._assign_camera_lane("/camera_1/image_raw") == "camera_left"
-    assert nodes._assign_camera_lane("/usb/camera_2/image") == "camera_front"
+    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_0") == "camera_left"
+    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_1") == "camera_front"
+    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_2") == "camera_right"
     assert nodes._assign_camera_lane("/camera_0/image_raw") == "camera_rear"
 
 
@@ -575,6 +577,7 @@ def test_media_worker_uses_independent_result_queue_per_lane():
     source_text = ast.get_source_segment(source, add_method)
     assert "jobs = self._ctx.Queue(maxsize=1)" in source_text
     assert "results = self._ctx.Queue(maxsize=1)" in source_text
+    assert "results.get_nowait()" in (DRIVER / "media_workers.py").read_text()
     assert "self._results[lane] = results" in source_text
 
 

@@ -13,7 +13,6 @@
 - `state` 汇总连接、最近错误与所有已收到的设备主动报告，适合诊断传输是否收到数据。
 - `model` 返回官方 `S10.urdf`；`joints` 按 URDF 的固定 16 关节顺序返回 `sensor/skeleton` 结构（q/dq/tau/temperature），并在运控姿态可用时附带 `imu_quat`。`imu` 从运控报告提取加速度、角速度和姿态；`joint_state` 保留原生电机状态；`loco_state` 合并运控和基础状态报告；`battery` 提供电池列表。
 - 急停、充电及设备健康状态分别保留在 `loco_state`、`battery` 或汇总 `state`，不再拆成多张厂商专用状态卡。
-- `navigation_status` 提供导航任务、定位与置信度报告。
 - `loco` 提供 `move`、`stop_move`、`stand_up`、`stand_down`、`damp`、`gait`、`mode` 和 `manual_control`。`move` 的前后/侧向速度单位为 m/s，偏航角速度参数 `yaw_rate_deg_s` 使用度/秒；发给固件前会转换为 rad/s。`manual_control` 是常规/辅助模式的六轴归一化控制强度（-1 到 1），不是角度；普通步态只响应前后、侧移和偏航分量。通过 ASDU 执行 `stand_up` 后会自动进入 RL 运控状态，无需单独切换。持续运动指令 10Hz 刷新，到时自动发零指令；各状态切换会等待状态上报并通过 ACP 发送 action completion。
 - `light` 独立设置头尾灯颜色和效果。颜色使用固件支持的黑、白、绿、蓝具名选项；协议不支持任意 RGB 值。效果使用常亮、流水、渐变、呼吸、闪烁等具名选项；仅呼吸和闪烁要求 `head_cycle_seconds` 与 `tail_cycle_seconds`，分别控制头灯和尾灯周期，单位为秒。
 - 不注册 `device` 控制卡：休眠/唤醒属于电源与安全管理，不交由 Agent 自主控制；SDK 关节流通过机载配置与标准状态话题提供。
@@ -24,7 +23,7 @@
 
 传感器与执行卡片沿用仓库常用命名和职责。已提供的容器日志确认 `/IMU`、`/JOINTS_DATA_10HZ`、`/BATTERY_DATA`、`/MOTION_INFO` 都收到并发布到 `/host/lynx_s10/...`；旧日志没有记录 Agent Core 的活动订阅，且旧版同进程双 context 共用 FastDDS profile。因而此前可确认源到 driver、driver 到本地发布成功，故障范围落在 domain-42 发现/订阅边界；新实现把 Agent Core 发布者放进 loopback-only 独立进程，并用有界 latest-value IPC 队列跨进程转发。需部署后再查看 `state.ros_streams` 的 bridge 队列与 Agent Core 实际订阅，才能最终确认前端恢复。
 
-旧版雷达点云最高约 10Hz、单帧约 8.5 万点；点云被均匀限采样至 2,000 点并以紧凑字节缓冲传递，避免队列积压。S10 Pro 提供前、后、左、右四路相机，对应 `camera_rear`、`camera_left`、`camera_front`、`camera_right` 四张 sensor 卡，默认 ROS topic 为 `/usb_camera_1/image_raw`、`image_raw_0`、`image_raw_1`、`image_raw_2`；现场部署仍应以 `ros2 topic list/info` 核对实际方向和 topic。相机和雷达订阅使用 ROS sensor-data（BEST_EFFORT）QoS。每路相机和雷达都有独立的 `spawn` 媒体 worker，worker 只负责 JPEG 编码或点云限采样；任务队列最多保留 2 帧，满载时丢弃旧帧。转换结果再进入每路独立的 maxsize=1 domain-42 bridge 进程，单路高负载不会阻塞其他流或控制/状态回调。容器日志应分别出现 `first ... sample received`、`first ... sample published` 和 `[dds-bridge] first sample published`；若没有，`state.ros_streams` 可用于区分源 topic、worker/队列和跨进程发布阶段。
+旧版雷达点云最高约 10Hz、单帧约 8.5 万点；点云被均匀限采样至 2,000 点并以紧凑字节缓冲传递，避免队列积压。S10 Pro 提供前、后、左、右四路相机，对应 `camera_rear`、`camera_left`、`camera_front`、`camera_right` 四张 sensor 卡；现场部署仍应以 `ros2 topic list/info` 核对实际方向和 topic，未启动或未发现的物理输入不会伪造数据。相机和雷达订阅使用 ROS sensor-data（BEST_EFFORT）QoS。每路媒体都有独立的 `spawn` worker 和 domain-42 bridge 进程；任务、结果和跨进程发布队列均只保留最新帧，收集器会丢弃转换完成但已过时的结果，以避免历史帧造成延迟。
 
 S10 URDF 含有指向 `meshes/*.STL` 的视觉网格引用；本次仅随镜像提供 URDF 文本，骨架关节名与运动学链可用，但不承诺展示厂家 STL 外观。`joints` 实时流使用真机 `JOINTS_DATA_10HZ` 的 16 个电机字段，并按 URDF 关节顺序映射到仓库通用 `sensor/skeleton`；`joint_state` 同时保留完整供应商消息字段。
 
