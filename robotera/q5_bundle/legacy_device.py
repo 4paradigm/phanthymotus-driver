@@ -22,6 +22,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from audio_timing import PcmWriteTimeline
+from playback_telemetry import PlaybackTracker, encode_packet, parse_audio_format
+
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -349,7 +352,10 @@ finally:
 """ % (device, device, channels, sample_rate, channels * 2, channels * 2)
 
 
-def _q5_alsa_speaker_command(device: str, output_rate: int, output_channels: int) -> str:
+def _q5_alsa_speaker_command(device: str, output_rate: int, output_channels: int,
+                             max_records: int = 2048, max_write_stalls: int = 250,
+                             max_progress_failures: int = 50,
+                             progress_timeout_seconds: float = 10.0) -> str:
     """Return the remote PCM16 stdin -> Q5 ALSA playback process.
 
     The Q5's playback card is visible as ``hw:2,0`` but its incomplete ALSA
@@ -357,51 +363,288 @@ def _q5_alsa_speaker_command(device: str, output_rate: int, output_channels: int
     It accepts S16_LE stereo at 44.1/48 kHz.  Keep the public contract at
     16 kHz mono and convert only at this hardware boundary.
     """
-    return """import audioop, ctypes, sys
+    template = r"""import audioop, ctypes, json, queue, struct, sys, threading, time
 alsa = ctypes.CDLL('libasound.so.2')
 alsa.snd_pcm_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
 alsa.snd_pcm_set_params.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
 alsa.snd_pcm_writei.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
 alsa.snd_pcm_prepare.argtypes = [ctypes.c_void_p]
+alsa.snd_pcm_recover.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+alsa.snd_pcm_delay.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_long)]
+alsa.snd_pcm_state.argtypes = [ctypes.c_void_p]
+alsa.snd_pcm_state.restype = ctypes.c_int
 alsa.snd_pcm_drain.argtypes = [ctypes.c_void_p]
 alsa.snd_pcm_close.argtypes = [ctypes.c_void_p]
+event_lock = threading.Lock()
+def emit(event, **values):
+  values.update(event=event, timestamp_ns=time.monotonic_ns(), clock_id='q5_audio_host_monotonic')
+  with event_lock:
+    sys.stdout.write(json.dumps(values, separators=(',', ':')) + '\n')
+    sys.stdout.flush()
+def read_exact(size, allow_eof=False):
+  value = bytearray()
+  while len(value) < size:
+    chunk = sys.stdin.buffer.read(size - len(value))
+    if not chunk:
+      if allow_eof and not value: return None
+      raise EOFError('truncated playback packet')
+    value.extend(chunk)
+  return bytes(value)
+packets = queue.Queue(maxsize=64)
+def read_packets():
+  try:
+    while True:
+      prefix = read_exact(12, True)
+      if prefix is None: break
+      magic, header_size, pcm_size = struct.unpack('!4sII', prefix)
+      if magic != b'Q5PT' or header_size > 65536 or pcm_size > 16777216:
+        raise ValueError('invalid playback packet')
+      header = json.loads(read_exact(header_size).decode('ascii'))
+      packets.put((header, read_exact(pcm_size)))
+  except Exception as exc:
+    emit('transport_failed', code='INVALID_TRANSPORT', message=str(exc))
+  finally:
+    packets.put(None)
+reader = threading.Thread(target=read_packets, daemon=True)
+reader.start()
 pcm = ctypes.c_void_p()
-rc = alsa.snd_pcm_open(ctypes.byref(pcm), b'%s', 0, 0)
-if rc < 0: raise RuntimeError('snd_pcm_open(%s) failed: %%d' %% rc)
-rc = alsa.snd_pcm_set_params(pcm, 2, 3, %d, %d, 1, 200000)
-if rc < 0: raise RuntimeError('snd_pcm_set_params failed: %%d' %% rc)
-state = None
-pending = bytearray()
-# Read the raw pipe so a short DDS frame is forwarded immediately. The
-# previous BufferedReader.read(3200) waited for a full 100 ms block and made
-# speech appear to play only after the utterance ended on bursty sources.
-read_bytes = 3200
-write_bytes = 640  # 20 ms of 16 kHz mono PCM; enough for sample alignment.
+rc = alsa.snd_pcm_open(ctypes.byref(pcm), __DEVICE__, 0, 0)
+if rc < 0: raise RuntimeError('snd_pcm_open failed: %d' % rc)
+rc = alsa.snd_pcm_set_params(pcm, 2, 3, __CHANNELS__, __RATE__, 1, 200000)
+if rc < 0: raise RuntimeError('snd_pcm_set_params failed: %d' % rc)
+generation = time.monotonic_ns()
+emit('backend_ready', generation=generation, device_sample_rate_hz=__RATE__)
+MAX_RECORDS = __MAX_RECORDS__
+MAX_WRITE_STALLS = __MAX_WRITE_STALLS__
+MAX_PROGRESS_FAILURES = __MAX_PROGRESS_FAILURES__
+PROGRESS_TIMEOUT_NS = __PROGRESS_TIMEOUT_NS__
+rate_state = None
+submitted_global = 0
+consumed_global = 0
+records = {}
+record_order = []
+rejected_ids = set()
+rejected_order = []
+delay_failures = 0
+progress_observed = False
+def remember_rejected(speech_id):
+  if speech_id in rejected_ids: return
+  rejected_ids.add(speech_id)
+  rejected_order.append(speech_id)
+  while len(rejected_order) > MAX_RECORDS:
+    rejected_ids.discard(rejected_order.pop(0))
+def fail_record(record, code, message, event='failed'):
+  if record is None or record['terminal']: return False
+  record['failed'] = True
+  record['terminal'] = True
+  remember_rejected(record['speech_id'])
+  emit(event, speech_id=record['speech_id'], code=code, message=message, generation=generation)
+  return True
+def prune_terminal_records():
+  global record_order
+  terminal_ids = {record['speech_id'] for record in record_order if record['terminal']}
+  if not terminal_ids: return
+  record_order = [record for record in record_order if record['speech_id'] not in terminal_ids]
+  for speech_id in terminal_ids:
+    records.pop(speech_id, None)
+def fail_buffered(code, message, current_record=None, event='failed'):
+  for item in list(record_order):
+    pending = any(end > consumed_global for start, end in item['segments'])
+    if item is current_record or pending or not progress_observed:
+      fail_record(item, code, message, event)
+def fail_active(code, message):
+  for item in list(record_order):
+    fail_record(item, code, message)
+def check_progress_timeouts():
+  now = time.monotonic_ns()
+  for item in list(record_order):
+    if (not item['terminal'] and item['total'] is not None
+        and item['reported_consumed'] < item['total']
+        and now - item['last_progress_ns'] >= PROGRESS_TIMEOUT_NS):
+      fail_record(item, 'ALSA_PROGRESS_TIMEOUT', 'device consumption made no bounded progress')
+def handle_xrun_state():
+  global consumed_global, progress_observed
+  consumed_global = submitted_global
+  progress_observed = True
+  for record in list(record_order):
+    if record['terminal']: continue
+    if record['total'] is not None and record['submitted'] >= record['total']:
+      consumed = record['submitted']
+      record['reported_consumed'] = consumed
+      record['last_progress_ns'] = time.monotonic_ns()
+      emit('device_progress', speech_id=record['speech_id'], consumed_frames=consumed,
+           generation=generation, device_delay_frames=0,
+           evidence='snd_pcm_xrun_tail')
+      record['terminal'] = True
+    else:
+      fail_record(record, 'ALSA_UNDERRUN', 'ALSA entered XRUN before speech EOF', 'underrun')
+  prepared = int(alsa.snd_pcm_prepare(pcm))
+  if prepared < 0:
+    fail_active('ALSA_PREPARE_FAILED', 'snd_pcm_prepare failed: %d' % prepared)
+def update_progress():
+  global consumed_global, delay_failures, progress_observed
+  pcm_state = int(alsa.snd_pcm_state(pcm))
+  if pcm_state == 4:
+    handle_xrun_state()
+    return
+  if pcm_state not in (3, 5):
+    check_progress_timeouts()
+    return
+  delay = ctypes.c_long()
+  rc = alsa.snd_pcm_delay(pcm, ctypes.byref(delay))
+  if rc < 0:
+    delay_failures += 1
+    if delay_failures >= MAX_PROGRESS_FAILURES:
+      fail_active('ALSA_DELAY_FAILED', 'snd_pcm_delay repeatedly failed: %d' % rc)
+      delay_failures = 0
+    check_progress_timeouts()
+    return
+  delay_failures = 0
+  progress_observed = True
+  consumed_global = max(consumed_global, submitted_global - max(0, int(delay.value)))
+  for record in list(record_order):
+    if record['terminal']: continue
+    consumed = sum(min(end - start, max(0, consumed_global - start)) for start, end in record['segments'])
+    consumed = min(record['submitted'], consumed)
+    if consumed != record['reported_consumed']:
+      record['reported_consumed'] = consumed
+      record['last_progress_ns'] = time.monotonic_ns()
+      emit('device_progress', speech_id=record['speech_id'], consumed_frames=consumed,
+           generation=generation, device_delay_frames=max(0, int(delay.value)),
+           evidence='snd_pcm_delay')
+      if record['total'] is not None and consumed >= record['total']:
+        record['terminal'] = True
+  check_progress_timeouts()
 try:
   while True:
-    chunk = sys.stdin.buffer.raw.read(read_bytes)
-    if not chunk: break
-    pending.extend(chunk)
-    while len(pending) >= write_bytes:
-      raw = bytes(pending[:write_bytes])
-      del pending[:write_bytes]
-      mono, state = audioop.ratecv(raw, 2, 1, 16000, %d, state)
-      stereo = audioop.tostereo(mono, 2, 1, 1)
-      frames = len(stereo) // %d
-      offset = 0
-      while offset < frames:
-        portion = stereo[offset * %d:]
-        buf = ctypes.create_string_buffer(portion)
-        written = alsa.snd_pcm_writei(pcm, buf, frames - offset)
-        if written < 0:
-          alsa.snd_pcm_prepare(pcm)
+    try:
+      item = packets.get(timeout=0.01)
+    except queue.Empty:
+      update_progress()
+      continue
+    if item is None: break
+    header, raw = item
+    speech_id = header.get('speech_id') if header.get('tracked') else None
+    record = None
+    if speech_id is not None:
+      sequence = header.get('sequence')
+      if speech_id in rejected_ids:
+        continue
+      record = records.get(speech_id)
+      if record is None:
+        if sequence != 0:
+          emit('failed', speech_id=speech_id, code='CHUNK_SEQUENCE_ERROR', message='first sequence is not zero', generation=generation)
+          remember_rejected(speech_id)
           continue
-        offset += written
+        prune_terminal_records()
+        if len(records) >= MAX_RECORDS:
+          emit('failed', speech_id=speech_id, code='PLAYBACK_CAPACITY', message='playback capacity is exhausted by active tasks', generation=generation)
+          remember_rejected(speech_id)
+          continue
+        record = {'speech_id': speech_id, 'next_sequence': 0, 'submitted': 0,
+                  'total': None, 'segments': [], 'reported_consumed': 0,
+                  'failed': False, 'terminal': False,
+                  'last_progress_ns': time.monotonic_ns()}
+        records[speech_id] = record
+        record_order.append(record)
+      if record['terminal']:
+        continue
+      if sequence < record['next_sequence']:
+        # An already accepted sequence is an idempotent duplicate.
+        continue
+      if sequence > record['next_sequence']:
+        fail_record(record, 'CHUNK_SEQUENCE_ERROR', 'missing or out-of-order chunk')
+        continue
+      if record['total'] is not None:
+        fail_record(record, 'CHUNK_SEQUENCE_ERROR', 'new chunk after EOF')
+        continue
+      record['next_sequence'] += 1
+    if len(raw) % 2:
+      if record is not None:
+        fail_record(record, 'INVALID_PCM', 'unaligned PCM16 payload')
+      continue
+    mono, rate_state = audioop.ratecv(raw, 2, 1, 16000, __RATE__, rate_state)
+    output = audioop.tostereo(mono, 2, 1, 1)
+    frames = len(output) // (__CHANNELS__ * 2)
+    offset = 0
+    write_stalls = 0
+    while offset < frames:
+      portion = output[offset * __CHANNELS__ * 2:]
+      buffer = ctypes.create_string_buffer(portion)
+      written = int(alsa.snd_pcm_writei(pcm, buffer, frames - offset))
+      if written == -11:
+        write_stalls += 1
+        if write_stalls >= MAX_WRITE_STALLS:
+          fail_buffered('ALSA_WRITE_STALLED', 'ALSA writes made no bounded progress', record)
+          break
+        time.sleep(0.002)
+        continue
+      if written == -32:
+        fail_buffered('ALSA_UNDERRUN', 'ALSA underrun discarded buffered playback frames', record, 'underrun')
+        alsa.snd_pcm_prepare(pcm)
+        consumed_global = submitted_global
+        break
+      if written < 0:
+        recovered = int(alsa.snd_pcm_recover(pcm, written, 1))
+        if recovered >= 0:
+          write_stalls += 1
+          if write_stalls < MAX_WRITE_STALLS: continue
+          fail_buffered('ALSA_WRITE_STALLED', 'ALSA recovery made no bounded progress', record)
+          break
+        fail_buffered('ALSA_WRITE_FAILED', 'snd_pcm_writei failed: %d' % written, record)
+        break
+      if written == 0:
+        write_stalls += 1
+        if write_stalls >= MAX_WRITE_STALLS:
+          fail_buffered('ALSA_WRITE_STALLED', 'ALSA writes made no bounded progress', record)
+          break
+        continue
+      write_stalls = 0
+      start = submitted_global
+      submitted_global += written
+      offset += written
+      if record is not None:
+        record['submitted'] += written
+        record['last_progress_ns'] = time.monotonic_ns()
+        if record['segments'] and record['segments'][-1][1] == start:
+          record['segments'][-1][1] = submitted_global
+        else:
+          record['segments'].append([start, submitted_global])
+    if record is not None and not record['terminal'] and header.get('eof') is True:
+      record['total'] = record['submitted']
+    if record is not None and not record['terminal']:
+      emit('pcm_submitted', speech_id=speech_id, submitted_frames=record['submitted'],
+           total_output_frames=record['total'], generation=generation,
+           device_sample_rate_hz=__RATE__)
+    update_progress()
+except Exception as exc:
+  fail_active('REMOTE_PLAYER_FAILED', str(exc))
 finally:
-  alsa.snd_pcm_drain(pcm)
+  drained = int(alsa.snd_pcm_drain(pcm))
+  if drained >= 0:
+    consumed_global = submitted_global
+    for record in list(record_order):
+      if not record['terminal']:
+        consumed = record['submitted']
+        if consumed != record['reported_consumed']:
+          record['reported_consumed'] = consumed
+          emit('device_progress', speech_id=record['speech_id'], consumed_frames=consumed,
+               generation=generation, device_delay_frames=0, evidence='snd_pcm_drain')
+        if record['total'] is not None and consumed >= record['total']:
+          record['terminal'] = True
+  else:
+    fail_active('ALSA_DRAIN_FAILED', 'snd_pcm_drain failed: %d' % drained)
   alsa.snd_pcm_close(pcm)
-""" % (device, device, output_channels, output_rate, output_rate, output_channels * 2,
-       output_channels * 2)
+"""
+    return (template.replace("__DEVICE__", repr(device.encode("utf-8")))
+            .replace("__RATE__", str(int(output_rate)))
+            .replace("__CHANNELS__", str(int(output_channels)))
+            .replace("__MAX_RECORDS__", str(max(1, int(max_records))))
+            .replace("__MAX_WRITE_STALLS__", str(max(1, int(max_write_stalls))))
+            .replace("__MAX_PROGRESS_FAILURES__", str(
+                max(1, int(max_progress_failures))))
+            .replace("__PROGRESS_TIMEOUT_NS__", str(max(
+                1, int(float(progress_timeout_seconds) * 1_000_000_000)))))
 
 
 class MicPlugin:
@@ -545,8 +788,8 @@ class SpeakerPlugin:
 
     def __init__(self, plugin_config, namespace, executor, client):
         global _Q5_SPEAKER_PLUGIN
-        del namespace
         self._client = client
+        self._event_topic = f"/{namespace}/speaker/playback_events"
         self._topic = ""
         self._device = str(plugin_config.get("device", "hw:2,0"))
         self._rate = int(plugin_config.get("sample_rate_hz", 16000))
@@ -571,6 +814,14 @@ class SpeakerPlugin:
         self._running = False
         self._frames_received = 0
         self._frames_written = 0
+        self._timing = PcmWriteTimeline(self._rate, self._channels)
+        self._telemetry_enabled = plugin_config.get("telemetry_enabled", True) is True
+        self._telemetry = PlaybackTracker(
+            max_events=max(100, int(plugin_config.get("telemetry_recent_events", 2048))),
+            max_speeches=max(100, int(plugin_config.get("telemetry_max_speeches", 10000))))
+        self._event_thread = None
+        self._remote_generation = None
+        self._backend_ready = threading.Event()
         _Q5_SPEAKER_PLUGIN = self
         if self._rate != 16000 or self._channels != 1:
             raise ValueError("Q5 speaker only supports the shared 16 kHz mono PCM contract")
@@ -582,10 +833,16 @@ class SpeakerPlugin:
             "name": "speaker", "type": "actuator", "multiInstance": False,
             "description": "Q5 speaker. Connect any audio/pcm-16k output (TTS, microphone, or other PCM source) to play it live. set_volume controls live PCM gain and requests the Q5 system volume.",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["start", "set_volume", "get_volume", "stop", "info"]},
+                "action": {"type": "string", "enum": [
+                    "start", "set_volume", "get_volume", "stop", "info",
+                    "get_playback_status", "get_recent_events",
+                    "wait_for_completion", "get_capabilities"]},
                 "input_topic": {"type": "string", "description": "PCM 16 kHz AudioChunk topic from the canvas connection"},
                 "volume": {"type": "integer", "title": "Speaker 音量", "minimum": 0, "maximum": 100,
                            "default": self._volume},
+                "speech_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "timeout_seconds": {"type": "number", "minimum": 0, "maximum": 300},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
             }, "required": ["action"], "additionalProperties": False,
             "x-action-params": {
                 "start": {"params": ["input_topic"], "description": "连接并开始实时播放 PCM。"},
@@ -593,9 +850,14 @@ class SpeakerPlugin:
                 "get_volume": {"params": [], "description": "读取当前 speaker 音量和最近一次 XOS 系统音量设置结果。"},
                 "stop": {"params": [], "description": "停止实时播放。"},
                 "info": {"params": [], "description": "查看 speaker 状态。"},
+                "get_playback_status": {"params": ["speech_id"], "description": "查询单条语音的设备播放状态。"},
+                "get_recent_events": {"params": ["speech_id", "limit"], "description": "读取最近播放事件。"},
+                "wait_for_completion": {"params": ["speech_id", "timeout_seconds"], "description": "等待 ALSA 设备层完成。"},
+                "get_capabilities": {"params": [], "description": "读取播放遥测能力和精度限制。"},
             }},
             # Leave the topic unresolved until canvas supplies input_topic.
             "topic_in": [{"format": "audio/pcm-16k"}],
+            "topic_out": [{"topic": self._event_topic, "format": "data/json"}],
         }
 
     def start(self, input_topic=None):
@@ -636,7 +898,8 @@ class SpeakerPlugin:
             for offset in range(0, len(pcm), block_size):
                 block = pcm[offset:offset + block_size]
                 if proc.stdin:
-                    proc.stdin.write(block)
+                    proc.stdin.write(encode_packet(
+                        parse_audio_format("audio/pcm-16k"), block))
                     proc.stdin.flush()
                 time.sleep(len(block) / 32000.0)
             if proc.stdin:
@@ -699,11 +962,12 @@ class SpeakerPlugin:
         _stop_remote_speaker_playback()
         command = _q5_alsa_speaker_command(
             self._device, self._output_rate, self._output_channels)
+        self._backend_ready.clear()
         last_error = None
         for attempt in range(3):
             self._process = subprocess.Popen(
                 _q5_ssh_args(_q5_speaker_playback_shell(command)), stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             try:
                 _raise_if_remote_process_exited(self._process, "speaker")
                 break
@@ -725,17 +989,180 @@ class SpeakerPlugin:
         self._running = True
         self._frames_received = 0
         self._frames_written = 0
+        self._timing.reset()
+        if self._process.stdout:
+            self._event_thread = threading.Thread(
+                target=self._read_remote_events, args=(self._process,), daemon=True,
+                name="q5_speaker_telemetry")
+            self._event_thread.start()
+            if not self._backend_ready.wait(timeout=2.0):
+                raise RuntimeError("remote ALSA backend readiness timed out")
         self._thread = threading.Thread(target=self._pump, daemon=True, name="q5_speaker_stream")
         self._thread.start()
 
+    def _write_speaker_chunk(self, item) -> bool:
+        if isinstance(item, (bytes, bytearray)):
+            pcm = bytes(item)
+            metadata = parse_audio_format("audio/pcm-16k")
+        else:
+            pcm = bytes(item.get("pcm", b""))
+            metadata = item.get("metadata")
+        if metadata is None or not metadata.valid:
+            return False
+        while (hasattr(self, "_backend_ready") and self._running
+               and not self._backend_ready.wait(timeout=0.1)):
+            pass
+        if not self._running:
+            return False
+        if metadata.tracked and self._telemetry_enabled:
+            previous = self._telemetry.get_recent_events(metadata.speech_id, 1)
+            if not self._telemetry.receive_chunk(metadata, len(pcm) // (self._channels * 2)):
+                recent = self._telemetry.get_recent_events(metadata.speech_id, 1)
+                if (recent != previous and recent
+                        and recent[-1].get("event") == "failed"):
+                    self._publish_terminal_events(recent)
+                return False
+        self._process.stdin.write(encode_packet(metadata, pcm))
+        self._process.stdin.flush()
+        return True
+
+    def _read_remote_events(self, process=None) -> None:
+        process = self._process if process is None else process
+        stream = process.stdout if process else None
+        if stream is None:
+            return
+        for line in iter(stream.readline, b""):
+            if process is not self._process:
+                return
+            try:
+                event = json.loads(line.decode("utf-8"))
+                if isinstance(event, dict):
+                    self._handle_remote_event(event)
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError,
+                    ValueError, OverflowError) as exc:
+                print(f"[SpeakerPlugin] invalid remote telemetry: {exc}", flush=True)
+                self._fail_active_and_publish(
+                    "REMOTE_TELEMETRY_INVALID", "invalid remote telemetry")
+        if process is self._process and self._running:
+            self._fail_active_and_publish(
+                "REMOTE_TELEMETRY_ENDED", "remote telemetry stream ended")
+
+    def _publish_terminal_events(self, events):
+        publish = getattr(self._client, "publish_speaker_event", None)
+        if not callable(publish):
+            return
+        for event in events:
+            try:
+                publish(event)
+            except Exception as exc:
+                print(f"[SpeakerPlugin] publish event failed: {exc}", flush=True)
+
+    def _fail_active_and_publish(self, code, message, state="FAILED"):
+        events = self._telemetry.fail_active_events(code, message, state)
+        self._publish_terminal_events(events)
+        return len(events)
+
+    def _backend_reset_and_publish(self, generation, reason):
+        events = self._telemetry.backend_reset_events(generation, reason)
+        self._publish_terminal_events(events)
+
+    def _handle_remote_event(self, event: dict) -> None:
+        kind = event.get("event")
+        speech_id = event.get("speech_id")
+        generation = int(event.get("generation", 0))
+        timestamp_ns = int(event.get("timestamp_ns", 0))
+        handled = False
+        if kind == "backend_ready":
+            if (self._telemetry_enabled
+                    and generation != getattr(self, "_remote_generation", None)):
+                self._backend_reset_and_publish(
+                    generation, "remote ALSA backend generation changed")
+            self._remote_generation = generation
+            if hasattr(self, "_backend_ready"):
+                self._backend_ready.set()
+            return
+        if not self._telemetry_enabled:
+            return
+        if (kind != "transport_failed"
+              and getattr(self, "_remote_generation", None) is not None
+              and generation != self._remote_generation):
+            return
+        elif kind == "pcm_submitted" and speech_id:
+            handled = self._telemetry.record_submitted(
+                str(speech_id), int(event.get("submitted_frames", 0)),
+                event.get("total_output_frames"), generation, timestamp_ns,
+                event.get("device_sample_rate_hz", self._output_rate))
+        elif kind == "device_progress" and speech_id:
+            handled = self._telemetry.record_device_progress(
+                str(speech_id), int(event.get("consumed_frames", 0)),
+                generation, timestamp_ns, event.get("evidence"))
+        elif kind == "underrun" and speech_id:
+            handled = self._telemetry.record_underrun(
+                str(speech_id), generation, timestamp_ns)
+        elif kind == "failed" and speech_id:
+            handled = self._telemetry.fail(
+                str(speech_id), str(event.get("code", "REMOTE_PLAYBACK_FAILED")),
+                str(event.get("message", "remote playback failed")))
+        elif kind == "transport_failed":
+            self._fail_active_and_publish(
+                str(event.get("code", "REMOTE_TRANSPORT_FAILED")),
+                str(event.get("message", "remote playback transport failed")))
+            return
+        if handled:
+            recent = self._telemetry.get_recent_events(
+                str(speech_id) if speech_id else None, 1)
+            publish = getattr(self._client, "publish_speaker_event", None)
+            if recent and callable(publish):
+                publish(recent[-1])
+
     def _pump(self):
+        failed_speaker_epoch = -1
         while self._running and self._process and self._process.stdin:
             getter = getattr(self._client, "pop_speaker_chunk", None)
-            chunk = getter() if callable(getter) else None
-            if chunk is None:
+            failure_getter = getattr(self._client, "pop_speaker_failure", None)
+            if callable(failure_getter) and self._telemetry_enabled:
+                # Bound each drain pass so PCM processing is not starved.
+                for _ in range(64):
+                    failure = failure_getter()
+                    if failure is None:
+                        break
+                    if not isinstance(failure, dict):
+                        continue
+                    code = str(failure.get("code") or "SPEAKER_QUEUE_OVERFLOW")
+                    message = str(failure.get("message") or
+                                  "tracked speaker chunk dropped because the queue is full")
+                    if failure.get("fail_all") is True:
+                        self._telemetry.mark_unknown_failed(code, message)
+                        self._fail_active_and_publish(code, message)
+                        failed_speaker_epoch = max(
+                            failed_speaker_epoch,
+                            int(failure.get("through_epoch", 0)))
+                    speech_ids = list(failure.get("speech_ids") or [])
+                    if failure.get("speech_id"):
+                        speech_ids.append(failure["speech_id"])
+                    for speech_id in dict.fromkeys(
+                            str(item) for item in speech_ids if item):
+                        events = self._telemetry.fail_or_reject_events(
+                            speech_id, code, message)
+                        self._publish_terminal_events(events)
+            item = getter() if callable(getter) else None
+            if item is None:
                 time.sleep(0.005)
                 continue
+            if (isinstance(item, dict)
+                    and int(item.get("speaker_epoch", failed_speaker_epoch + 1))
+                    <= failed_speaker_epoch):
+                metadata = item.get("metadata")
+                speech_id = getattr(metadata, "speech_id", None)
+                if getattr(metadata, "tracked", False) and speech_id:
+                    events = self._telemetry.fail_or_reject_events(
+                        str(speech_id), "SPEAKER_FAILURE_QUEUE_OVERFLOW",
+                        "speaker chunk belongs to a failed queue epoch")
+                    self._publish_terminal_events(events)
+                continue
+            chunk = bytes(item.get("pcm", b"")) if isinstance(item, dict) else bytes(item)
             self._frames_received += 1
+            self._timing.mark_received(len(chunk))
             if self._frames_received == 1:
                 print(f"[SpeakerPlugin] first PCM frame received from {self._topic}", flush=True)
             elif self._frames_received % 100 == 0:
@@ -747,9 +1174,14 @@ class SpeakerPlugin:
                 gain = (self._volume / 100.0) * self._input_gain
                 if gain != 1.0:
                     chunk = audioop.mul(chunk, 2, gain)
-                self._process.stdin.write(chunk)
-                self._process.stdin.flush()
+                if isinstance(item, dict):
+                    item = dict(item, pcm=chunk)
+                else:
+                    item = chunk
+                if not self._write_speaker_chunk(item):
+                    continue
                 self._frames_written += 1
+                self._timing.mark_write_completed(len(chunk))
                 if self._frames_written == 1:
                     print("[SpeakerPlugin] first PCM frame written to ALSA", flush=True)
             except (BrokenPipeError, OSError):
@@ -760,6 +1192,8 @@ class SpeakerPlugin:
                     except Exception:
                         pass
                 print(f"[SpeakerPlugin] remote playback stream ended: {detail}", flush=True)
+                self._fail_active_and_publish(
+                    "REMOTE_STREAM_ENDED", detail or "remote playback stream ended")
                 self._running = False
                 break
 
@@ -797,17 +1231,40 @@ class SpeakerPlugin:
 
     def stop(self):
         self._running = False
-        if self._process is not None:
+        if hasattr(self, "_backend_ready"):
+            self._backend_ready.clear()
+        if hasattr(self, "_telemetry"):
+            self._fail_active_and_publish(
+                "PLAYBACK_STOPPED", "speaker playback was stopped", "INTERRUPTED")
+        process = self._process
+        if process is not None:
             try:
-                if self._process.stdin:
-                    self._process.stdin.close()
-                self._process.wait(timeout=3)
+                if process.stdin:
+                    process.stdin.close()
+                process.wait(timeout=3)
             except (subprocess.TimeoutExpired, OSError):
-                self._process.terminate()
+                process.terminate()
+        if self._event_thread is not None and self._event_thread is not threading.current_thread():
+            self._event_thread.join(timeout=0.5)
+        self._event_thread = None
         self._process = None
         _stop_remote_speaker_playback()
 
     def dispatch(self, action, args):
+        if action == "get_capabilities":
+            return {**self._telemetry.capabilities(),
+                    "enabled": self._telemetry_enabled,
+                    "event_topic": self._event_topic}
+        if action == "get_playback_status":
+            return self._telemetry.get_status(str(args.get("speech_id") or ""))
+        if action == "get_recent_events":
+            speech_id = args.get("speech_id")
+            return {"events": self._telemetry.get_recent_events(
+                str(speech_id) if speech_id else None, int(args.get("limit", 100)))}
+        if action == "wait_for_completion":
+            return self._telemetry.wait_for_completion(
+                str(args.get("speech_id") or ""),
+                min(300.0, max(0.0, float(args.get("timeout_seconds", 15.0)))))
         if action == "start":
             requested = str(args.get("input_topic") or "")
             if not requested:
@@ -835,7 +1292,9 @@ class SpeakerPlugin:
                                  "input_gain": self._input_gain,
                                  "system_volume": self._system_volume},
                     "frames_received": self._frames_received,
-                    "frames_written": self._frames_written}
+                    "frames_written": self._frames_written,
+                    "timing": self._timing.snapshot(),
+                    "telemetry": self._telemetry.capabilities()}
         return None
 
 
