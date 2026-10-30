@@ -1,9 +1,8 @@
 """Private bounded command worker for one independent vendor DDS process.
 
 Construction/import does not initialize ROS. The CLI creates a domain-0 node;
-without an execution flag it can only inspect the graph. Explicit supervised
-startup prepares a state publisher for discovery, without constructing or
-sending a command. Normal execution creates publishers only after validation.
+without an execution flag it can only inspect the graph. Enabled startup
+prepares publishers for discovery without sending commands.
 EOF/close only destroys this worker's publishers, and is not a robot stop.
 """
 from __future__ import annotations
@@ -48,7 +47,7 @@ def strict_json(raw):
 
 def dispatch_request(adapter, request, *, clock=time.monotonic):
     """Pure dispatcher, injectable for offline tests; never initializes ROS."""
-    if not isinstance(request, dict) or set(request) != {'id', 'op', 'payload', 'authority', 'deadline_monotonic'}:
+    if not isinstance(request, dict) or set(request) != {'id', 'op', 'payload', 'deadline_monotonic'}:
         raise ValueError('invalid private motion request shape')
     request_id = request['id']
     if type(request_id) is not int or not 1 <= request_id <= 2**53 - 1:
@@ -60,21 +59,18 @@ def dispatch_request(adapter, request, *, clock=time.monotonic):
     if not isinstance(payload, dict):
         raise ValueError('private motion payload must be an object')
     if operation == 'graph':
-        if payload or request['authority'] is not None:
+        if payload:
             raise ValueError('graph query does not accept motion arguments')
         return adapter.graph_snapshot()
     if operation == 'state':
         if set(payload) != {'state'}:
             raise ValueError('state command requires only state')
-        # The adapter rechecks its own process gate and fresh attestation after
-        # message import/construction, and immediately before publishing.
-        return adapter.publish_state(payload['state'], authority=request['authority'],
-            cancel_event=_DeadlineCancellation(deadline, clock))
+        # The private adapter checks execution and deadline before publishing.
+        return adapter.publish_state(payload['state'], cancel_event=_DeadlineCancellation(deadline, clock))
     if operation == 'velocity':
         if set(payload) != {'vx', 'vy', 'yaw_rate'}:
             raise ValueError('velocity command requires three physical axes')
-        return adapter.publish_velocity(**payload, authority=request['authority'],
-            cancel_event=_DeadlineCancellation(deadline, clock))
+        return adapter.publish_velocity(**payload, cancel_event=_DeadlineCancellation(deadline, clock))
     raise ValueError('unknown private motion operation')
 
 
@@ -123,7 +119,6 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--allow-execution', action='store_true')
-    mode.add_argument('--allow-supervised-posture', action='store_true')
     args = parser.parse_args(argv)
     # The parent uses reader_environment before spawning. A second check keeps
     # accidental direct invocation from joining the platform's DDS domain.
@@ -134,12 +129,12 @@ def main(argv=None):
     rclpy.init(args=[], signal_handler_options=SignalHandlerOptions.NO)
     node = rclpy.create_node('s10_pro_motion_commands', enable_rosout=False, start_parameter_services=False)
     codec = MessageCodec()
-    if args.allow_execution or args.allow_supervised_posture:
-        codec.prepare(supervised_posture=args.allow_supervised_posture)
-    adapter = DDSCommandAdapter(node, execution_enabled=args.allow_execution or args.allow_supervised_posture,
-        supervised_posture=args.allow_supervised_posture, codec=codec)
+    if args.allow_execution:
+        codec.prepare()
+    adapter = DDSCommandAdapter(node, execution_enabled=args.allow_execution,
+        codec=codec)
     try:
-        if args.allow_supervised_posture:
+        if args.allow_execution:
             adapter.prepare_state_channel()
         serve(adapter, lambda: rclpy.spin_once(node, timeout_sec=0), stdin=sys.stdin.buffer.fileno(), stdout=sys.stdout.buffer)
     finally:

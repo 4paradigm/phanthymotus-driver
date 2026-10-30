@@ -9,11 +9,9 @@ deep-robotics-s10-pro:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - /opt/phanthy-motus/s10-reader-udp.xml:/opt/phanthy-motus/s10-reader-udp.xml:ro
     - /opt/phanthy-motus/s10-pro/config.yaml:/work/deep_robotics/s10_pro/config.yaml:ro
-    # Driver task identities and completion outbox only; no Core database mount.
-    - /opt/phanthy-motus/s10-pro/state:/work/state
   environment:
-    # Run the supervisor; only a protected policy can authorize activation.
-    - S10_AUTO_PREPARE=1
+    # Host opt-out; canvas config cannot override this switch.
+    - S10_MOTION_ENABLED=1
     - S10_REQUIRE_VENDOR_PROFILE=1
     - ROS_DOMAIN_ID=42
     - ROS_NAMESPACE=s10_pro

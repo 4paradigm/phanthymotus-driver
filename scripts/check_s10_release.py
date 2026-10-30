@@ -30,7 +30,6 @@ def check_release(context: Path | None = None) -> dict:
     assert config['motion']['max_vx'] == config['motion']['max_yaw_rate'] == 1.
     assert config['motion']['max_vy'] == .1
     sys.path[:0] = [str(ROOT), str(DRIVER)]
-    from operator_authorization import OperatorAuthorization
     from common.vendor_runtime import DriverBundle
     spec = importlib.util.spec_from_file_location('s10_release_main', DRIVER / 'main.py')
     main = importlib.util.module_from_spec(spec)
@@ -46,8 +45,7 @@ def check_release(context: Path | None = None) -> dict:
         def status(self):
             return {}
 
-    plugins = main.build_runtime_plugins({}, 'release_check', NoRobot(), lambda *a: None,
-                                         operator_authorization=OperatorAuthorization())
+    plugins = main.build_runtime_plugins({}, 'release_check', NoRobot(), lambda *a: None)
     try:
         tools = DriverBundle(plugins).get_all_tools()
         assert {c['name']: c['type'] for c in manifest['cards']} == {
@@ -68,8 +66,7 @@ def check_release(context: Path | None = None) -> dict:
             'forward', 'backward', 'turn_left', 'turn_right']
         jsonschema.validate({'action': 'stand_up', 'direction': 'forward'}, schema)
         assert schema['x-completion']['actions'] == ['stand_up', 'sit_down', 'move', 'stand_down', 'sitdown']
-        assert not any(p._backend.transport.status().get('worker_running')
-                       for p in plugins if hasattr(p, '_backend'))
+        assert not any(p._transport is not None for p in plugins if hasattr(p, '_transport'))
     finally:
         for plugin in plugins:
             plugin.close() if hasattr(plugin, 'close') else plugin.stop()

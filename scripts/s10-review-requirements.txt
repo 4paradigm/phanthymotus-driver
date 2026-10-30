@@ -1,3 +1,4 @@
 # Development checks only; never installed in the runtime image.
 PyYAML==6.0.3
 jsonschema==4.26.0
+pytest==9.2.0

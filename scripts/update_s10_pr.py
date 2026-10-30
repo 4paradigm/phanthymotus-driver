@@ -45,11 +45,9 @@ def allowed_path(name):
         if path.suffix in {'.db', '.sqlite3', '.pem', '.key', '.tar', '.gz', '.zip', '.log', '.pyc'}:
             return False
         if path.suffix == '.json':
-            return name in {'deep_robotics/s10_pro/deploy/G1_REFERENCE.json',
-                            'deep_robotics/s10_pro/deploy/control-authorization.disabled.json',
-                            'deep_robotics/s10_pro/vendor/s10-nos-drdds-1.0.23/SOURCE.json'}
+            return name == 'deep_robotics/s10_pro/vendor/s10-nos-drdds-1.0.23/SOURCE.json'
         return path.suffix in {'.py', '.md', '.yaml', '.yml', '.txt', '.xml', '.urdf', '.msg', '.srv', '.cmake', '.service'} or path.name in {'Dockerfile', 'LICENSE', 'CMakeLists.txt'}
-    return name in SCRIPT_FILES
+    return name in SCRIPT_FILES or name == 'tests/test_s10_motion.py'
 
 
 def changed_files():
@@ -115,6 +113,7 @@ def run_checks():
     for command in ([sys.executable, 'scripts/check_s10_release.py'],
                     [sys.executable, 'scripts/check_service_yml.py', 'deep_robotics/s10_pro']):
         subprocess.run(command, cwd=ROOT, check=True)
+    subprocess.run([sys.executable, '-m', 'pytest', '-q', 'tests/test_s10_motion.py'], cwd=ROOT, check=True)
     git('diff', '--check')
 
 

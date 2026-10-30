@@ -3,7 +3,7 @@
 The target is existing PR #451 in `4paradigm/phanthymotus-driver`, from
 `wowwwwwwwwwwwwwwwwwww/phanthymotus-driver` branch
 `feat/s10-base-posture-timed-move`. Continue updating that branch; do not create
-a replacement PR. See the [release notes](RELEASE_20261030.md).
+a replacement PR. The current interface is in the [Driver README](../README.md).
 
 ## Development setup and checks
 
@@ -16,9 +16,8 @@ python3 -m venv .venv
 ```
 
 Run the helper on the original PR branch. It validates the public catalogue,
-JSON schemas, Docker COPY inputs and service isolation. The S10 test suite,
-captured fixture and selected-test manifest have been removed at the
-maintainer's request; the helper does not run regression tests. These checks
+JSON schemas, Docker COPY inputs and service isolation. It also runs the compact `tests/test_s10_motion.py` regressions required for
+the simplified motion/ACP contract. These checks
 never connect to the robot, restart containers or send motion.
 
 ## Publishing an S10-only update
@@ -33,7 +32,7 @@ resets, force-pushes or creates PRs. Existing GitHub/Git credential-helper
 authentication is reused without logging credentials. `GH_TOKEN` or
 `GITHUB_TOKEN` may supply API authentication; do not store tokens in this repo.
 
-Only Driver sources/docs and the named S10 release helpers are eligible. Local
+Only Driver sources/docs, the compact S10 motion test and the named release helpers are eligible. Local
 databases, credentials, image archives and unrelated changes are excluded.
 Pre-staged changes or unrelated unpushed commits stop publication. Integrating
 upstream changes or removing files outside that allowlist requires a separate
@@ -55,5 +54,5 @@ docker build --platform linux/arm64 -t s10-pro:review /tmp/s10-release-context
 
 The context destination must not exist. The manifest records hashes of staged
 inputs. Passing these checks does not prove an image build or hardware
-acceptance. See the [test asset audit](TEST_ASSET_AUDIT.md) for removed coverage
-and historical results.
+acceptance. Use the [deployment acceptance guide](ACCEPTANCE.md) for the
+separate hardware checks.

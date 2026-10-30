@@ -15,51 +15,26 @@ try:
     from .reader import source_specs
     from .parameters import (sensor_defaults, sensor_config_schema, validate_sensor_settings,
                              normalize_config_updates, validate_empty_arguments, SENSOR_TITLES, config_overlap_constraints)
-    from .monitoring import (MOTION_CAPABILITY, DEVICE_ACTIONS, DEVICE_REASON, ErrorObservations,
-                             capabilities_snapshot, device_summary, estop_summary, motion_summary)
+    from .monitoring import DEVICE_ACTIONS, DEVICE_REASON, capabilities_snapshot
     from .s10_skeleton import model_description, model_joint_name, model_angle
 except ImportError:  # Direct driver execution; reader itself imports no ROS here.
     from reader import source_specs
     from parameters import (sensor_defaults, sensor_config_schema, validate_sensor_settings,
                             normalize_config_updates, validate_empty_arguments, SENSOR_TITLES, config_overlap_constraints)
-    from monitoring import (MOTION_CAPABILITY, DEVICE_ACTIONS, DEVICE_REASON, ErrorObservations,
-                            capabilities_snapshot, device_summary, estop_summary, motion_summary)
+    from monitoring import DEVICE_ACTIONS, DEVICE_REASON, capabilities_snapshot
     from s10_skeleton import model_description, model_joint_name, model_angle
 
 
 CARDS = {
-    "state": (SENSOR_TITLES["state"], ("battery", "motion_info", "hard_estop", "exception", "fault_event", "fault_aggregator"), 1.0),
     "battery": (SENSOR_TITLES["battery"], ("battery",), 1.0),
     "joints": (SENSOR_TITLES["joints"], ("joints", "imu"), 10.0),
     "imu": ("IMU", ("imu",), 5.0),
-    "odometry": (SENSOR_TITLES["odometry"], ("odometry",), 5.0),
-    "lidar": (SENSOR_TITLES["lidar"], ("lidar",), 2.0),
     "lidar_cloud": (SENSOR_TITLES["lidar_cloud"], ("lidar",), 10.0),
-    "motion_info": (SENSOR_TITLES["motion_info"], ("motion_info",), 5.0),
-    "device_status": (SENSOR_TITLES["device_status"], ("battery", "joints", "cpu_status", "memory_status", "filesystem_status", "network_status"), 1.0),
-    "hard_estop": (SENSOR_TITLES["hard_estop"], ("hard_estop",), 5.0),
-    "errors": (SENSOR_TITLES["errors"], ("exception", "fault_event", "fault_aggregator"), 1.0),
-    "motion_events": (SENSOR_TITLES["motion_events"], (), 2.0),
-    "capabilities": (SENSOR_TITLES["capabilities"], (), 1.0),
-    "ros_graph": (SENSOR_TITLES["ros_graph"], ("ros_graph",), 0.5),
     "device": (SENSOR_TITLES["device"], (), 1.0),
 }
-SOURCE_TOPICS = {
-    "battery": "/BATTERY_DATA", "motion_info": "/MOTION_INFO",
-    "joints": "/JOINTS_DATA_10HZ", "imu": "/IMU",
-    "odometry": "/ODOM", "lidar": "/LIDAR/POINTS",
-    "hard_estop": "/HES_STATUS", "exception": "/EXCEPTION_NOTIFICATION",
-    "fault_event": "/fault_event", "fault_aggregator": "/fault_aggregator", "ros_graph": "ros2://graph",
-    "cpu_status": "/cpu_status", "memory_status": "/memory_status",
-    "filesystem_status": "/filesystem_status", "network_status": "/network_status",
-}
-ERROR_SOURCES = ("exception", "fault_event", "fault_aggregator")
-RESOURCE_SOURCES = ("cpu_status", "memory_status", "filesystem_status", "network_status")
-LOCAL_CARDS = ("motion_events", "capabilities", "device")
+SOURCE_TOPICS = {"battery": "/BATTERY_DATA", "joints": "/JOINTS_DATA_10HZ",
+                 "imu": "/IMU", "lidar": "/LIDAR/POINTS"}
 G1_CARDS = ("battery", "joints", "lidar_cloud", "imu")
-# Only these cards are advertised to Core.  The reader source catalogue remains
-# complete because motion readiness and relative movement still consume
-# motion_info, hard_estop, odometry, joints and fault snapshots internally.
 PUBLIC_CARDS = (*G1_CARDS, "device")
 
 
@@ -140,16 +115,12 @@ class ReadOnlyCard:
         self.title, self.sources, default_hz = CARDS[name]
         self._bridge, self._publish = bridge, publish
         self._motion = motion
-        self._errors = ErrorObservations()
         self._source_topics = {**SOURCE_TOPICS, **(source_topics or {})}
         self._source_types = {key: value["type"] for key, value in source_specs({}).items()}
         self._source_types.update(source_types or {})
         base = "/" + "/".join(part for part in (str(namespace).strip("/"), "s10_pro") if part)
-        # The action card owns /motion_events. This independent view must not
-        # add a second producer to that existing event/ACP-related stream.
-        self.topic = f"{base}/motion_events_view" if name == "motion_events" else f"{base}/{name}"
+        self.topic = f"{base}/{name}"
         self.joint_detail_topic = f"{base}/joints_info" if name == "joints" else None
-        self.info_topic = f"{base}/lidar_info" if name == "lidar" else None
         self._defaults = self._validate({**sensor_defaults(name), **dict(config or {})})
         self._settings = dict(self._defaults)
         self._lock = threading.RLock()
@@ -175,11 +146,9 @@ class ReadOnlyCard:
             # skeleton topic for the monitor dashboard.
             return [{"topic": self.joint_detail_topic, "format": "data/json"},
                     {"topic": self.topic, "format": "sensor/skeleton"}]
-        fmt = ("sensor/pointcloud" if self.name in ("lidar", "lidar_cloud") else
+        fmt = ("sensor/pointcloud" if self.name == "lidar_cloud" else
                "data/json")
         ports = [{"topic": self.topic, "format": fmt}]
-        if self.info_topic:
-            ports.append({"topic": self.info_topic, "format": "data/json"})
         return ports
 
     def get_tool(self):
@@ -200,8 +169,6 @@ class ReadOnlyCard:
         description = f"Read-only S10 Pro {self.title} data. Stopping releases only this card's data stream."
         if self.name == "device":
             description = f"S10 device-management availability. Lights, mode, sleep, wake and automatic sleep are unavailable. {DEVICE_REASON}"
-        elif self.name == "motion_events":
-            description = "Independent read-only view of existing application motion events. Starting or stopping this view never starts, stops or notifies a motion task."
         return {
             "name": self.name, "title": f"S10 Pro · {self.title}", "type": "actuator" if self.name == "device" else "sensor", "multiInstance": False,
             "description": description,
@@ -264,123 +231,21 @@ class ReadOnlyCard:
         return data, source_info, binary
 
     def _payload(self):
-        if self.name in LOCAL_CARDS:
-            return self._local_payload(), {}
+        if self.name == "device":
+            return {"source": {}, "fresh": False, "stale": False, "connected": False,
+                "live_robot_data": False, "status": "locked", "execution_available": False,
+                "data": capabilities_snapshot()["device"]}, {}
         values = {source: self._snapshot(source) for source in self.sources}
         source_info = {source: value[1] for source, value in values.items()}
-        # Candidate fault streams are event driven with unverified heartbeat
-        # semantics. They cannot determine the state card's online indicator.
-        required = (("battery", "motion_info", "hard_estop") if self.name == "state" else
-                    ("battery", "joints") if self.name == "device_status" else self.sources)
-        fresh = all(source_info[source]["fresh"] for source in required)
-        connected = any(source_info[source]["fresh"] for source in required)
-        received = any(source_info[source]["received"] for source in required)
-        payload = {
-            "card": self.name, "read_only": True, "timestamp_ms": int(time.time() * 1000),
+        fresh = all(info["fresh"] for info in source_info.values())
+        connected = any(info["fresh"] for info in source_info.values())
+        received = any(info["received"] for info in source_info.values())
+        return {"card": self.name, "read_only": True, "timestamp_ms": int(time.time() * 1000),
             "connected": connected, "fresh": fresh, "stale": received and not fresh,
             "status": "live" if fresh else "partial" if connected else "stale" if received else "no_data",
             "source": source_info,
             "data": ({source: value[0] for source, value in values.items()}
-                     if len(self.sources) != 1 else values[self.sources[0]][0]),
-        }
-        if self.name == "state":
-            payload["capabilities"] = {"motion": dict(MOTION_CAPABILITY)}
-            payload["units"] = {"battery": {"voltage": None, "current": None, "capacity": None,
-                                                "battery_level": None, "temperature": None},
-                                "motion_info": None}
-            payload["state_code_meaning"] = "unknown"
-            payload["summary"] = {
-                "online": connected, "all_required_sources_fresh": fresh,
-                "required_sources": list(required),
-                "motion": motion_summary(values["motion_info"][0], source_info["motion_info"]),
-                "hardware_emergency_stop": estop_summary(values["hard_estop"][0], source_info["hard_estop"]),
-                "device": device_summary(values["battery"][0], None),
-                "errors": self._error_summary({key: values[key] for key in ERROR_SOURCES}),
-            }
-        elif self.name == "motion_info":
-            payload["summary"] = motion_summary(payload["data"], source_info["motion_info"])
-        elif self.name == "hard_estop":
-            payload["summary"] = estop_summary(payload["data"], source_info["hard_estop"])
-        elif self.name == "device_status":
-            payload["summary"] = device_summary(values["battery"][0], values["joints"][0],
-                                                {key: values[key] for key in RESOURCE_SOURCES},
-                                                self._settings["stale_after_s"])
-        elif self.name == "errors":
-            payload["summary"] = self._error_summary(values)
-            payload["health"] = payload["summary"]["current_fault_state"]
-        elif self.name == "ros_graph":
-            payload["summary"] = {
-                "discovery_only": True, "control_ownership": "unknown",
-                "note": "Discovered topics and publishers do not prove valid data, hardware availability or command authority.",
-            }
-        elif self.name == "joints":
-            data = payload["data"] or {}
-            raw = data.get("joints") if isinstance(data.get("joints"), dict) else data
-            inner = raw.get("data")
-            records = inner.get("joints_data", []) if isinstance(inner, dict) else []
-            if not isinstance(records, list):
-                records = []
-            payload["joint_count"] = len(records)
-            payload["joint_labels"] = [self._joint_label(item.get("name")) if isinstance(item, dict) else None
-                                       for item in records]
-            payload["units"] = {"position": None, "velocity": None, "torque": None, "temperature": None}
-            payload["status_word_meaning"] = "unknown"
-        elif self.name in ("imu", "odometry"):
-            payload["message_type"] = self._source_types[self.sources[0]]
-            payload["frame_contract"] = "raw_ros_message"
-        return payload, values
-
-    def _error_summary(self, values):
-        with self._lock:
-            return self._errors.update(values)
-
-    def _local_payload(self):
-        payload = {
-            "card": self.name, "read_only": True, "timestamp_ms": int(time.time() * 1000),
-            "connected": False, "fresh": False, "stale": False,
-            "source": {}, "live_robot_data": False, "status": "informational",
-        }
-        if self.name == "capabilities":
-            payload["data"] = capabilities_snapshot()
-        elif self.name == "device":
-            payload.update(status="locked", execution_available=False,
-                           data=capabilities_snapshot()["device"])
-        else:
-            payload.update(status="unavailable", data=None)
-            if self._motion is None:
-                payload["reason"] = "The application motion-event provider is not connected."
-                return payload
-            try:
-                # status() is the existing passive observation API. Do not call
-                # start/stop/cancel/dispatch, access task stores, or emit ACP.
-                state = self._motion.status()
-                if not isinstance(state, dict) or not isinstance(state.get("events"), list):
-                    raise TypeError("motion-event provider returned an invalid snapshot")
-                events = _json_value(state["events"][-64:])
-                last = events[-1] if events else None
-                stamp = last.get("timestamp_ms") if isinstance(last, dict) else None
-                age = ((payload["timestamp_ms"] - stamp) / 1000
-                       if type(stamp) is int and stamp <= payload["timestamp_ms"] else None)
-                payload.update(status="observing", data={
-                    "events": events, "event_count": len(events), "history_limit": 64,
-                    "last_event_age_s": age, "motion_card_state": state.get("state"),
-                    "motion_phase": state.get("phase"),
-                    "event_source_topic": getattr(self._motion, "events_topic", None),
-                    "completion_notifications_emitted_by_view": 0,
-                    "note": "Existing application event history; no events does not establish robot state. Event timestamps are preserved.",
-                })
-            except Exception:
-                payload["reason"] = "The application motion-event snapshot is unavailable."
-        return payload
-
-    @staticmethod
-    def _joint_label(name):
-        if isinstance(name, (list, tuple)):
-            try:
-                return bytes(name).split(b"\0", 1)[0].decode("ascii")
-            except (ValueError, TypeError, UnicodeDecodeError):
-                return None
-        return name if isinstance(name, str) else None
+                     if len(self.sources) != 1 else values[self.sources[0]][0])}, values
 
     def _reader_status(self):
         try:
@@ -405,8 +270,6 @@ class ReadOnlyCard:
             for key in ("data", "summary", "health", "live_robot_data", "reason", "execution_available"):
                 if key in payload:
                     result[key] = payload[key]
-            if self.name == "state":
-                result["capabilities"] = {"motion": dict(MOTION_CAPABILITY)}
             return result
 
     def _overrides(self, options):
@@ -564,7 +427,7 @@ class ReadOnlyCard:
                 with self._lock:
                     if generation != self._generation or self._state != "running" or cancel.is_set():
                         return
-                    if self.name in ("lidar", "lidar_cloud"):
+                    if self.name == "lidar_cloud":
                         _, source, binary = values["lidar"]
                         sequence = source["sequence"]
                         should_send = (source["fresh"] and isinstance(binary, bytes) and bool(binary)
@@ -574,9 +437,6 @@ class ReadOnlyCard:
                         if should_send:
                             self._publish(self.topic, "sensor/pointcloud", binary)
                             self._last_binary_sequence = sequence
-                        if self.info_topic:
-                            payload["binary_published"] = should_send
-                            self._publish(self.info_topic, "data/json", payload)
                     else:
                         if self.name not in G1_CARDS or payload["fresh"]:
                             content = _g1_output(self.name, payload["data"]) if self.name in G1_CARDS else payload

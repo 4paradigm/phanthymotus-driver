@@ -1,67 +1,22 @@
-# Build inputs and image-size evidence
+# Image build inputs
 
-## ROS base pin
-
-Both build stages default to the same immutable multi-platform image:
+Both stages use the immutable ROS base:
 
 `ros:jazzy-ros-base@sha256:8eed0a4669bbf43ee331878a4c39bd8ebddea8e3312a58b4fae8edb14526b617`
 
-Source: Docker Hub's official `library/ros` tag metadata, checked 2026-10-30:
-https://hub.docker.com/v2/repositories/library/ros/tags/jazzy-ros-base
+Production builds target `linux/arm64`. The build stage generates `drdds`
+interfaces from licensed text message definitions. Colcon/code generators are
+excluded from runtime; runtime packages supply YAML, Fast DDS and ROSIDL support.
+The public catalogue and Docker COPY inventory are validated by
+`scripts/check_s10_release.py`; it can stage an exact context and hash manifest.
 
-The tag metadata reports last update 2026-10-27 and ARM64/v8 manifest
-`sha256:1db94fb5490d0a9c5485e27624c9cf26206c6ff4b26136291628ce8de14f7a6c`.
-The index pin retains support for the architectures provided by upstream;
-production S10 builds must target linux/arm64. A deliberate ROS_BASE_IMAGE
-override is a new build input and must be recorded and tested separately.
-The pin prevents tag drift, but apt package resolution is not snapshot-pinned,
-so it does not promise bit-for-bit identical rebuilds.
+The source excludes historical TLS/adapter bindings, independent diagnostic
+CLIs, policy provisioning, SQLite task/outbox implementations and process notes.
+Deploy files carry operational configuration only. No credentials or site
+state are included. Apt resolution is not snapshot-pinned, so identical source
+and base pins do not promise byte-identical builds.
 
-This local edit has not been rebuilt or deployed. Registry manifest access was
-unavailable, so equality between the newly pinned base and the previously
-built image's base layers has not been established. Rebuild and validate the
-ARM64 image before replacing the current deployment.
-
-## Why the infrastructure files are needed
-
-- Dockerfile: generate the S10-specific drdds messages in a separate stage.
-  Colcon and ROS interface generators stay in that stage. The runtime installs
-  YAML parsing, Fast DDS RMW and generated-interface support; no pytest or
-  duplicate pip packages are installed.
-- deploy/service.yml: preserve host networking, domain 42, separate vendor
-  DDS profile selection, read-only configuration, persistent driver task data
-  and bounded local logs. This fragment does not define or modify Core.
-- driver.yaml: supply driver identity, fixed MCP port, the shared common/
-  build context and the current public tool catalogue. Internal reader sources
-  are not advertised as extra cards. The model tool is a resource.
-- requirements.txt: document the image-provided dependencies; it contains no
-  additional pip requirements.
-
-## Size evidence and acceptance boundary
-
-The existing deployed build `release.261030.0d84ce6`, associated by the build bot
-with PR commit 67603552, has image/config ID
-`sha256:ae62dff403ff8120801b1956343b741fdf9375d4a281e579c442321a03017dd3`.
-Its registry manifest is
-`sha256:ee364f1a353634b5424830c633f5a916c4f9c58d94fc965791ac80f99264ac61`.
-The downloaded registry layers total 287,716,875 compressed bytes. This is
-neither an incremental pull size nor Docker's unpacked image size.
-The offline transfer archive size is not used for image-size comparisons.
-
-No same-method before/after size measurement exists yet for this local edit.
-After rebuilding, record both image IDs and docker image inspect Size values
-for the current and candidate ARM64 images, then report the exact byte delta.
-Do not claim a no-growth result from shared disk usage or compressed-vs-unpacked
-comparisons. The merged-card revision adds loco_move.py and diagnostic documentation to the
-COPY payload, with no new runtime package. This does not establish an unchanged
-image size; record the actual before/after sizes after a complete rebuild.
-
-## Latest reviewed build and pending measurement
-
-PR #451's build agent reported commit d4e217a24d9e27aa0753a260e5b57059f17365b1
-successfully built as `release.261030.d470850` on 2026-10-30. A build success is
-not image-size or hardware acceptance evidence. A registry metadata request for
-this and `release.261030.dc2f9c7` failed with a TLS connection EOF during the
-automatic-policy revision; no size/delta is inferred from that failed request.
-The policy revision adds no runtime apt/pip package. The exact rebuilt candidate
-and baseline `docker image inspect Size` measurements remain a release item.
+Before release, build the reviewed ARM64 source and compare candidate and deployed
+baseline using the same `docker image inspect Size` measurement. Archive size
+and downloaded compressed layers are different measures. Source cleanup alone
+is not evidence of a completed build or hardware acceptance.

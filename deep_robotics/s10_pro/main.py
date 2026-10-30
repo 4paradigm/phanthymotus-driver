@@ -16,46 +16,21 @@ from common.vendor_runtime import DriverBundle, load_config, make_handler, resol
 from bridge import ReaderBridge
 from device import build_plugins
 from motion_process import DDSProcessTransport
-from motion_tasks import MotionTasks
-from acp import ACPNotifier
-from operator_authorization import load_operator_authorization
-from automatic_prepare import start_automatic_preparation
 
 
-def build_runtime_plugins(config, namespace, bridge, publish, *, notifier=None, tasks=None,
-                          motion_bridge=None, runtime_binding=None, operator_authorization=None):
-    """Build sensors and the motion UI without opening a control connection.
-
-    The motion backend stays unsupported until a machine-specific action contract
-    and protected, explicit deployment authorization have been bound.
-    Canvas configuration cannot grant that authorization.
-    """
-    operator = operator_authorization or load_operator_authorization(config)
-    observer_bridge = bridge if motion_bridge is None else motion_bridge
-    legacy_mode = bool(os.environ.get('S10_EXECUTION_AUTHORIZATION_FILE')
-                       or (runtime_binding is not None and runtime_binding.authorized))
-    if legacy_mode:
-        if operator.configured:
-            operator.revoke('conflicting_execution_modes')
-        raise ValueError('loco_move requires the protected operator Prepare policy; '
-                         'legacy execution-contract mode is not supported by this catalogue')
-    from loco_move import LocoMoveBackend, LocoMovePlugin
-
-    def make_posture_transport():
-        return DDSProcessTransport(config, execution_enabled=operator.authorized_now(),
-                                   supervised_posture=True)
-
-    backend = LocoMoveBackend(observer_bridge, make_posture_transport(), operator,
-                              transport_factory=make_posture_transport)
-    settings = {**config.get('motion', {}), 'action_timeout_s': 15.}
-    motion_plugin = LocoMovePlugin(settings, namespace, backend=backend,
-        feedback=backend.feedback, publish=publish,
-        execution_authorized=operator.authorized_now() or getattr(operator, 'supports_prepare', False),
-        authorization_provider=operator.authorized_now, notifier=notifier, tasks=tasks)
+def build_runtime_plugins(config, namespace, bridge, publish, *, motion_bridge=None):
+    """Bind the one motion controller; construction performs no robot I/O."""
+    from loco_move import LocoMovePlugin
+    host_enabled = os.environ.get('S10_MOTION_ENABLED', '1') == '1'
+    if os.environ.get('S10_EXECUTION_AUTHORIZATION_FILE'):
+        logging.warning('Legacy execution mode ignored; motion disabled, monitors available')
+        host_enabled = False
+    motion_plugin = LocoMovePlugin(config.get('motion', {}), namespace,
+        motion_bridge or bridge, lambda: DDSProcessTransport(config, execution_enabled=host_enabled),
+        host_enabled=host_enabled)
     plugins = build_plugins(config, namespace, bridge, publish, motion=motion_plugin,
-                            motion_bridge=observer_bridge)
-    plugins.append(motion_plugin)
-    return plugins
+                            motion_bridge=motion_bridge)
+    return [*plugins, motion_plugin]
 
 
 def validate_platform_profile(path):
@@ -144,25 +119,12 @@ def main():
         cleanup.callback(bridge.close)
         motion_bridge = ReaderBridge(config, config_path)
         cleanup.callback(motion_bridge.close)
-        # Driver-only persistent state; never shares the Core database or credentials.
-        state = Path(os.environ.get("S10_STATE_DIR", "/work/state"))
-        tasks = MotionTasks(state / "motion-tasks.sqlite3")
-        cleanup.callback(tasks.close)
-        notifier = ACPNotifier(state / "acp-outbox.sqlite3")
-        cleanup.callback(notifier.close)
-        notifier.start()
-        operator = load_operator_authorization(config)
         bundle = DriverBundle(build_runtime_plugins(config, namespace, bridge, bus.publish,
-                                                   notifier=notifier, tasks=tasks,
-                                                   motion_bridge=motion_bridge,
-                                                   operator_authorization=operator))
+                                                   motion_bridge=motion_bridge))
         for plugin in bundle.plugins:
             if hasattr(plugin, "close"):
                 cleanup.callback(plugin.close)
         cleanup.callback(bundle.stop_all)
-        automatic_prepare = start_automatic_preparation(bundle.plugins)
-        if automatic_prepare is not None:
-            cleanup.callback(automatic_prepare.close)
         port = int(os.environ.get("MCP_PORT", config["mcp_port"]))
         server = ThreadingHTTPServer((str(config.get("bind_host", "127.0.0.1")), port),
                                      make_handler(lambda: bundle, "s10-pro-bundle", "deep-robotics-s10-pro-driver"))
@@ -177,12 +139,10 @@ def main():
 
         signal.signal(signal.SIGTERM, shutdown)
         signal.signal(signal.SIGINT, shutdown)
-        # Sensors stay idle. The automatic-prepare driver supervisor starts only
-        # the posture observer and readiness supervisor; it never sends motion.
+        # Canvas start/stop owns card lifecycle; startup sends no robot commands.
         if config.get("register", True):
             start_registration(port, config, "deep-robotics-s10-pro-driver")
-        authorized = operator.authorized_now()
-        logging.info("S10 Pro monitoring cards and gated motion; namespace=%s port=%d domain=%d motion_authorized=%s", namespace, port, domain, authorized)
+        logging.info("S10 Pro monitoring cards and gated motion; namespace=%s port=%d domain=%d motion_enabled=%s", namespace, port, domain, config.get("motion", {}).get("enabled", False))
         server.serve_forever()
 
 

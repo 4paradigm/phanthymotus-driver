@@ -24,7 +24,7 @@ SENSOR_REFRESH_HZ = {'state': 1., 'battery': 1., 'joints': 10., 'imu': 20., 'odo
                      'errors': 1., 'motion_events': 2., 'capabilities': 1.,
                      'ros_graph': .5, 'device': 1.}
 META_FIELDS = {'instance_id', '_tool_name'}
-MOTION_ACTIONS = ('stand', 'lie', 'velocity', 'stopmotion')
+MOTION_ACTIONS = ('stand_up', 'lie', 'move_2s', 'relative_move')
 LIFECYCLE_ACTIONS = ('info', 'start', 'stop', 'status', 'config')
 
 _SENSOR_FIELDS = {
@@ -177,55 +177,6 @@ def motion_config_schema(settings):
     return _schema(_MOTION_FIELDS, validate_motion_settings(settings))
 
 
-def motion_action_schema(settings):
-    current = validate_motion_settings(settings)
-    config = motion_config_schema(current)
-    properties = {
-        'action': {'type': 'string', 'enum': [*LIFECYCLE_ACTIONS, *MOTION_ACTIONS],
-                   'description': 'Required operation. No physical motion is selected by default.'},
-        'vx': {'type': 'number', 'minimum': -current['max_vx'], 'maximum': current['max_vx'],
-               'default': 0., 'title': 'Forward velocity (m/s)', 'description': 'Forward/backward velocity in m/s, within the current application limit.'},
-        'vy': {'type': 'number', 'minimum': -current['max_vy'], 'maximum': current['max_vy'],
-               'default': 0., 'title': 'Lateral velocity (m/s)', 'description': 'Lateral velocity in m/s, within the current application limit.'},
-        'yaw_rate': {'type': 'number', 'minimum': -current['max_yaw_rate'], 'maximum': current['max_yaw_rate'],
-                     'default': 0., 'title': 'Yaw rate (rad/s)', 'description': 'Turning rate in rad/s, within the current application limit.'},
-        'duration': {'type': 'number', 'minimum': .1, 'maximum': current['max_duration_s'],
-                     'default': min(1., current['max_duration_s']), 'title': 'Movement duration (s)',
-                     'description': 'Finite movement duration in seconds, followed by a stop request and fresh stop confirmation.'},
-        'request_id': {'type': 'string', 'minLength': 1, 'maxLength': 128, 'pattern': r'\S',
-                       'description': 'Optional nonblank idempotency key, at most 128 characters. A UUID is generated when omitted. Reuse the same ID to retry the same request.'},
-        'issued_at_ms': {'type': 'integer', 'minimum': 0, 'maximum': 1000000000000000,
-                         'description': 'Request creation time in Unix milliseconds. Generated as an integer at receipt when omitted; future skew over 100 ms or age beyond TTL is rejected.'},
-        'ttl_ms': {'type': 'integer', 'minimum': 100, 'maximum': 2000, 'default': 1000,
-                   'title': 'Request validity (ms)', 'description': 'Request acceptance lifetime in integer milliseconds; not the motion duration.'},
-        **copy.deepcopy(config['properties']), 'config': config,
-        '_tool_name': {'type': 'string', 'minLength': 1, 'pattern': r'\S', 'description': 'Internal tool routing metadata.'},
-        'instance_id': {'type': 'string', 'minLength': 1, 'pattern': r'\S', 'description': 'Internal card instance metadata.'},
-    }
-    # Conditional field restrictions mirror dispatch validation while preserving
-    # the flat properties and action metadata expected by the canvas editor.
-    metadata = set(META_FIELDS) | {'action'}
-    motion_meta = {'request_id', 'issued_at_ms', 'ttl_ms'}
-    velocity = {'vx', 'vy', 'yaw_rate', 'duration'}
-    configs = set(config['properties']) | {'config'}
-    groups = [(['velocity'], metadata | motion_meta | velocity),
-              (['stand', 'lie', 'stopmotion'], metadata | motion_meta),
-              (['config', 'start'], metadata | configs),
-              (['info', 'status', 'stop'], metadata)]
-    conditions = []
-    for actions, allowed in groups:
-        forbidden = sorted(set(properties) - allowed)
-        conditions.append({'if': {'properties': {'action': {'enum': actions}}, 'required': ['action']},
-                           'then': {'not': {'anyOf': [{'required': [name]} for name in forbidden]}}})
-    return {'type': 'object', 'properties': properties, 'required': ['action'], 'additionalProperties': False,
-            'allOf': conditions + config_overlap_constraints(config['properties']), 'x-action-params': {
-                'stand': {'params': [], 'description': 'Stand and wait for fresh posture confirmation.'},
-                'lie': {'params': [], 'description': 'Lie down and wait for fresh posture confirmation.'},
-                'velocity': {'params': ['vx', 'vy', 'yaw_rate', 'duration'],
-                             'description': 'Move for a finite duration, then request zero velocity and confirm the stop.'},
-                'stopmotion': {'params': [], 'description': 'Cancel the active application task and request a stop. This is not a hardware emergency stop.'}}}
-
-
 def validate_motion_request(action, arguments, settings, wall_time=time.time, *, check_freshness=True,
                             allowed_actions=MOTION_ACTIONS):
     """Validate an action without emitting output or authorizing its execution."""
@@ -235,14 +186,14 @@ def validate_motion_request(action, arguments, settings, wall_time=time.time, *,
     values = _object(arguments, 'Motion arguments')
     _strip_metadata(values)
     allowed = {'request_id', 'issued_at_ms', 'ttl_ms'}
-    if action == 'velocity':
-        allowed |= {'vx', 'vy', 'yaw_rate', 'duration'}
     if action == 'move_2s':
         allowed |= {'direction', 'speed', 'duration'}
     if action == 'relative_move':
         allowed |= {'direction', 'speed', 'distance', 'angle', 'target'}
     _unknown(values, allowed, 'motion parameters')
-    properties = motion_action_schema(current)['properties']
+    properties = {'request_id': {'type': 'string', 'minLength': 1, 'maxLength': 128, 'pattern': r'\S'},
+                  'issued_at_ms': {'type': 'integer', 'minimum': 0, 'maximum': 1e15},
+                  'ttl_ms': {'type': 'integer', 'minimum': 100, 'maximum': 10000}}
     now_seconds = wall_time() if callable(wall_time) else wall_time
     if isinstance(now_seconds, bool) or not isinstance(now_seconds, (int, float)) or not math.isfinite(now_seconds):
         raise ValueError('Current time must be a finite number of seconds')
@@ -255,9 +206,6 @@ def validate_motion_request(action, arguments, settings, wall_time=time.time, *,
     if not isinstance(rid, str) or not rid.strip() or len(rid) > 128:
         raise ValueError('request_id must be a nonblank string of at most 128 characters')
     request = {'action': action, 'request_id': rid, 'issued_at_ms': issued, 'ttl_ms': ttl, 'duration': 0.}
-    if action == 'velocity':
-        for name in ('vx', 'vy', 'yaw_rate', 'duration'):
-            request[name] = _validate_value(name, values.get(name, properties[name]['default']), properties[name])
     if action == 'move_2s':
         direction = values.get('direction')
         if direction not in ('forward', 'backward', 'turn_left', 'turn_right'):

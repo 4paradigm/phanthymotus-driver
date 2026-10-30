@@ -1,321 +1,460 @@
-"""Unified locomotion UI and one durable, feedback-gated stand-up sequence."""
+"""One bounded S10 controller for posture, timed and relative motion.
+
+The platform owns ACP scheduling; this plugin serializes all base writes and
+checks current hardware feedback. It has no policy sessions or persistent lock.
+"""
 from __future__ import annotations
+
 import copy
-import hashlib
+import logging
+import math
+import threading
+import time
+from collections import OrderedDict
+from uuid import uuid4
+
 try:
-    from .canvas_posture import CanvasPostureBackend, CanvasPosturePlugin, DISTANCE_ACTION, RELATIVE_ACTION, RELATIVE_MOVE_TOOL
-    from .motion import MotionPlugin
-    from .parameters import validate_empty_arguments, validate_motion_request
+    from .acp import complete
+    from .motion_feedback import fresh, motion_observation, odometry_observation
+    from .motion_schema import tools
+    from .parameters import (motion_defaults, motion_config_schema, validate_motion_settings,
+        normalize_config_updates, validate_empty_arguments, validate_motion_request)
+    from .relative_motion import RelativeController
+    from .stationary_feedback import StationaryWindow
 except ImportError:
-    from canvas_posture import CanvasPostureBackend, CanvasPosturePlugin, DISTANCE_ACTION, RELATIVE_ACTION, RELATIVE_MOVE_TOOL
-    from motion import MotionPlugin
-    from parameters import validate_empty_arguments, validate_motion_request
+    from acp import complete
+    from motion_feedback import fresh, motion_observation, odometry_observation
+    from motion_schema import tools
+    from parameters import (motion_defaults, motion_config_schema, validate_motion_settings,
+        normalize_config_updates, validate_empty_arguments, validate_motion_request)
+    from relative_motion import RelativeController
+    from stationary_feedback import StationaryWindow
 
-LOCO_TOOL, STAND_UP, SIT_DOWN = 'loco_move', 'stand_up', 'sit_down'
-PUBLIC_ACTIONS = ('info', 'start', 'stop', 'status', 'config', STAND_UP, SIT_DOWN, 'move', 'stop_move')
-ACTION_NAMES = {'lie': SIT_DOWN, 'stand_down': SIT_DOWN, 'sitdown': SIT_DOWN, DISTANCE_ACTION: 'move'}
-MOVE_FIELDS = frozenset(('direction', 'speed', 'duration'))
+DIRECTIONS = {'forward': (1., 0., 0.), 'backward': (-1., 0., 0.),
+              'turn_left': (0., 0., 1.), 'turn_right': (0., 0., -1.)}
+ALIASES = {'sitdown': 'sit_down', 'stand_down': 'sit_down'}
 
-class StandUpFailure(RuntimeError):
-    def __init__(self, reason, blocked_by=()):
-        super().__init__(reason)
-        self.reason, self.blocked_by = reason, list(blocked_by)
 
-class LocoMoveBackend(CanvasPostureBackend):
-    def prepare_execution(self, action):
-        if action == STAND_UP:
-            self._require_ready('stand')
-            self._require_ready('move_mode')
-            return super().prepare_execution('stand')
-        return super().prepare_execution(action)
+class MotionUnavailable(RuntimeError):
+    pass
 
-class LocoMovePlugin(CanvasPosturePlugin):
-    name = LOCO_TOOL
-    execution_actions = (*CanvasPosturePlugin.execution_actions, STAND_UP)
 
-    def __init__(self, config, *args, **kwargs):
-        # An existing site/card override remains binding. Defaults do not
-        # change the selected command speed or grant physical authority.
-        config = {'max_vx': 1., 'max_yaw_rate': 1., **(config or {})}
-        super().__init__(config, *args, **kwargs)
-        base = self.status_topic.rsplit('/', 1)[0]
-        self.status_topic = self.timed_status_topic = base + '/loco_move_status'
-        self.events_topic = self.timed_events_topic = base + '/loco_move_events'
+class LocoMovePlugin:
+    name = 'loco_move'
 
-    def _ports(self):
-        # Status remains available through info/status; completion uses ACP.
-        return []
-
-    def get_tool(self):
-        posture = super().get_tool()
-        timed = self._timed_move_tool()['inputSchema']
-        # Canvas renders fields in schema insertion order; action stays first
-        # while x-action-params reveals movement fields underneath it.
-        props = {'action': {'type': 'string', 'enum': list(PUBLIC_ACTIONS),
-                            'description': 'Locomotion action; sit_down keeps the original lie-down behavior. Wait for ACP after an accepted motion instead of polling.'}}
-        props.update({k: copy.deepcopy(v) for k, v in posture['inputSchema']['properties'].items()
-                      if k in ('request_id', 'issued_at_ms', 'ttl_ms', 'instance_id', '_tool_name')})
-        props.update(copy.deepcopy(timed['properties']))
-        props.update(copy.deepcopy(posture['configSchema']['properties']))
-        props['config'] = copy.deepcopy(posture['configSchema'])
-        metadata = {'request_id', 'issued_at_ms', 'ttl_ms', 'instance_id', '_tool_name', 'action'}
-        groups = [(['move'], metadata | {'direction', 'speed', 'duration'}),
-                  ([STAND_UP, SIT_DOWN, 'stop_move'], metadata),
-                  (['start', 'config'], metadata | set(posture['configSchema']['properties']) | {'config'}),
-                  (['info', 'status', 'stop'], {'action', 'instance_id', '_tool_name'})]
-        conditions = []
-        for actions, allowed in groups:
-            # Core's canvas submits nonempty fields even when x-action-params
-            # hides them. These three fields have meaning only for move.
-            allowed = allowed | MOVE_FIELDS
-            disallowed = [{'required': [k]} for k in props if k not in allowed]
-            rule = {'not': {'anyOf': disallowed}} if disallowed else {}
-            if actions == ['move']: rule['required'] = ['direction', 'speed', 'duration']
-            conditions.append({'if': {'properties': {'action': {'enum': actions}}, 'required': ['action']}, 'then': rule})
-        schema = {'type': 'object', 'properties': props, 'required': ['action'],
-                  'additionalProperties': False, 'allOf': conditions,
-                  'x-action-params': {
-                      STAND_UP: {'params': [], 'description': 'Stand up, confirm fresh stable state 1, then enter move mode 17. Already-ready state 17 sends no command. No velocity is sent.'},
-                      SIT_DOWN: {'params': [], 'description': 'Lie down and wait for final idle state 0.'},
-                      'move': {'params': ['direction', 'speed', 'duration'], 'description': 'Finite forward/backward movement or turn; requires stationary move mode and confirms stopping.'},
-                      'stop_move': {'params': [], 'description': 'Cancel the active application task. Finite movement sends zero velocity and checks stopping; cancelling posture is not a physical stop guarantee.'}},
-                  'x-resource': 'base', 'x-completion': {
-                      'actions': [STAND_UP, SIT_DOWN, 'move', 'stand_down', 'sitdown'], 'timeout': 20, 'silent_completion': False,
-                      'description': 'Returns action_id after acceptance; completion arrives once through ACP. Do not poll or repeat an accepted command. stand_up completes only at reported move mode.'}}
-        return {'name': LOCO_TOOL, 'title': 'S10 Locomotion', 'type': 'actuator', 'multiInstance': False,
-                'description': 'Stand up, sit_down (original lie-down), finite move, or cancel. Motion returns action_id and completes through ACP; do not poll after acceptance. status is concise; info is detailed diagnostics. Direction/speed/duration apply only to move.',
-                'inputSchema': schema, 'configSchema': posture['configSchema'], 'topic_in': [], 'topic_out': self._ports()}
-
-    @staticmethod
-    def _action_card(action):
-        return RELATIVE_MOVE_TOOL if action == RELATIVE_ACTION else LOCO_TOOL
-
-    def _notification_payload(self, record):
-        payload = super()._notification_payload(record)
-        payload['tool'] = RELATIVE_MOVE_TOOL if record['request']['action'] == RELATIVE_ACTION else LOCO_TOOL
-        payload['result'] = (self._public_record(payload['result']) if payload['tool'] == RELATIVE_MOVE_TOOL
-                             else self._display_result(payload['result'], record['request']['action']))
-        return payload
+    def __init__(self, config, namespace, bridge, transport_factory, *, callback=complete,
+                 clock=time.monotonic, wall_time=time.time, host_enabled=True):
+        self._settings = validate_motion_settings({'max_vx': 1., 'max_yaw_rate': 1., 'action_timeout_s': 15., **config})
+        self._host_enabled = host_enabled
+        self._bridge, self._factory = bridge, transport_factory
+        self._transport = None
+        self._callback, self._clock, self._wall = callback, clock, wall_time
+        self._lock, self._io_lock = threading.RLock(), threading.Lock()
+        self._active = self._worker = self._last = None
+        self._cancel = threading.Event()
+        self._started = self._closed = False
+        self._history = OrderedDict()
+        self._stationary = StationaryWindow(clock=clock)
+        self._channel = {}
+        self._relative_topic = '/' + '/'.join(p for p in (namespace.strip('/'), 's10_pro', 'relative_move_status') if p)
 
     def get_tools(self):
-        return [self.get_tool(), self._relative_move_tool()]
+        return tools(motion_config_schema(self._settings), self._relative_topic)
 
-    @staticmethod
-    def _public_record(record):
-        result = copy.deepcopy(record)
-        if isinstance(result, dict) and result.get('action') in ACTION_NAMES:
-            result['action'] = ACTION_NAMES[result['action']]
-        return result
+    def _snapshot(self, source):
+        try:
+            record = self._bridge.snapshot(source)
+            return record if isinstance(record, dict) else {}
+        except Exception:
+            return {}
 
-    def _loco_status(self, source=None):
-        result = copy.deepcopy(source if source is not None else self.status())
-        result.update(card=LOCO_TOOL, title='S10 Locomotion', topic_out=self._ports(),
-                      supported_actions=[STAND_UP, SIT_DOWN, 'move', 'stop_move'])
-        result['events'] = [self._public_record(e) for e in result['events'] if e.get('card') != RELATIVE_MOVE_TOOL]
-        active = result.get('active_request')
-        result['shared_controller_busy'] = active is not None
-        result['active_request'] = None if active and active['action'] == RELATIVE_ACTION else self._public_record(active)
-        last = result.get('last_result')
-        result['last_result'] = (self._public_record(last) if not last or last['action'] != RELATIVE_ACTION
-                               else next((e for e in reversed(result['events']) if e.get('event') == 'finished'), None))
-        readiness = result['readiness']; old = readiness['actions']
-        blockers = list(readiness['blocked_by'])
-        if not {'stand', 'move_mode'} <= set(self._backend.authorization.public_status().get('allowed_actions', [])):
-            blockers.append('stand_and_move_mode_authorization_required')
-        if self._backend.feedback.observation().get('motion_state') not in (0, 1, 17):
-            blockers.append('wait_for_idle_required')
-        readiness['actions'] = {STAND_UP: {**old['stand'], 'ready': not blockers, 'blocked_by': list(dict.fromkeys(blockers))},
-                                SIT_DOWN: old['lie'], 'move': old[DISTANCE_ACTION]}
-        return result
+    def _observe(self):
+        return motion_observation(self._snapshot('motion_info'), self._clock())
 
-    def _publish_status(self, payload):
-        self._publish(self.status_topic, 'data/json', self._loco_status(payload))
-        self._publish(self.relative_status_topic, 'data/json', self._card_status(payload, card=RELATIVE_MOVE_TOOL))
+    def _odometry(self):
+        return odometry_observation(self._snapshot('odometry'), self._clock())
 
-    def _control_ok(self, action=None):
-        if action == STAND_UP:
-            return all(super(LocoMovePlugin, self)._control_ok(stage) for stage in ('stand', 'move_mode'))
-        return super()._control_ok(action)
+    def _stationary_status(self, states=(0, 1, 17)):
+        return self._stationary.observe(self._observe(), states, self._odometry())
 
-    def dispatch(self, action, args):
-        if action in ('stand_down', 'sitdown'):
-            action = SIT_DOWN  # Saved canvases retain the old alias.
-        if args.get('_tool_name') == RELATIVE_MOVE_TOOL: return super().dispatch(action, args)
-        if args.get('_tool_name') not in (None, LOCO_TOOL): raise ValueError('Retired tool; migrate to loco_move')
-        if action not in PUBLIC_ACTIONS and action not in ('prepare', 'prepare_automatic'):
-            raise ValueError('Unsupported loco_move action')
-        if action in PUBLIC_ACTIONS and action != 'move':
-            # Do not let hidden values left by a previous move selection block
-            # posture, cancellation, status or lifecycle calls. All remaining
-            # parameters still pass through the original strict validators.
-            args = {key: value for key, value in args.items() if key not in MOVE_FIELDS}
-        if action in ('info', 'status'):
-            validate_empty_arguments(args)
-            status = self._loco_status()
-            return status if action == 'info' else self._summary(status)
-        if action in ('config', 'start', 'stop'):
-            super().dispatch(action, args); return self._summary(self._loco_status(), include_settings=True)
-        if action == 'stop_move':
-            validate_motion_request('stopmotion', args, self._settings, self._wall); return self._display_result(self.cancel(), action)
-        if action == STAND_UP: return self._display_result(self.execute(STAND_UP, args), action)
-        if action == SIT_DOWN: return self._display_result(self.execute('lie', args), action)
-        if action == 'move': return self._display_result(self.execute(DISTANCE_ACTION, args), action)
-        if args.get('_tool_name') is not None: raise ValueError('Prepare is private to the supervisor')
-        return super().dispatch(action, args)
+    def _blockers(self, *, states=None):
+        blocked = []
+        if not self._host_enabled or not self._settings['enabled']:
+            blocked.append('motion_disabled')
+        if not self._started or self._closed:
+            blocked.append('card_not_started')
+        observed = self._observe()
+        if not observed['fresh']:
+            blocked.append('fresh_motion_feedback_required')
+        hes = self._snapshot('hard_estop')
+        hes_data = hes.get('data')
+        if not fresh(hes, self._clock(), .5) or not isinstance(hes_data, dict) or type(hes_data.get('value')) is not int or hes_data['value'] != 0:
+            blocked.append('fresh_clear_hard_estop_required')
+        faults = self._snapshot('fault_aggregator')
+        fault_data = faults.get('data')
+        if not fresh(faults, self._clock(), 2.) or not isinstance(fault_data, dict) or fault_data.get('active_faults') != []:
+            blocked.append('fresh_clear_fault_snapshot_required')
+        joints = self._snapshot('joints')
+        joint_data = joints.get('data')
+        joint_data = joint_data.get('data') if isinstance(joint_data, dict) else None
+        rows = joint_data.get('joints_data') if isinstance(joint_data, dict) else None
+        if (not fresh(joints, self._clock(), .5) or not isinstance(rows, list) or len(rows) != 16
+                or any(not isinstance(r, dict) or type(r.get('status_word')) is not int or r['status_word'] != 1 for r in rows)):
+            blocked.append('fresh_enabled_joint_feedback_required')
+        if states is not None:
+            if observed['motion_state'] not in states:
+                blocked.append('move_mode_required' if states == (17,) else 'posture_transition_not_ready')
+            if not self._stationary_status(states)['ready']:
+                blocked.append('stationary_feedback_required')
+        return blocked
 
-    @staticmethod
-    def _blocker_text(blockers):
-        messages = {
-            'card_not_enabled': 'Enable and start the card first.',
-            'operator_session_unavailable': 'Waiting for an authorized Prepare session.',
-            'fresh_clear_fault_snapshot_required': 'Robot fault feedback is missing, stale or reports a fault; check robot diagnostics.',
-            'driver_error_requires_review': 'The previous failure requires review before another motion.',
-            'fresh_stationary_feedback_required': 'Waiting for fresh stationary feedback.',
-            'stationary_move_mode_required': 'Movement requires stationary move mode.',
-            'move_mode_required': 'Run stand_up and wait for its ACP completion first.',
-            'active_motion_task_in_progress': 'A motion is still running; wait for ACP or cancel it.',
-        }
-        return ' '.join(dict.fromkeys(messages.get(b, b.replace('_', ' ') + '.') for b in blockers))
+    def _check(self, *, states=None, cancelled=True):
+        if cancelled and self._cancel.is_set():
+            raise MotionUnavailable('cancelled')
+        blocked = self._blockers(states=states)
+        if blocked:
+            raise MotionUnavailable(','.join(blocked))
 
-    def _display_result(self, record, action):
-        """Keep protocol identity and outcome; leave full evidence in durable info."""
-        record = self._public_record(record)
-        keys = ('action_id', 'original_action_id', 'request_id', 'action', 'accepted',
-                'state', 'status', 'completed', 'confirmed', 'stop_confirmed',
-                'reason', 'blocked_by', 'failed_stage', 'failure_phase', 'replayed', 'terminal', 'physical_command_sent')
-        result = {k: record[k] for k in keys if k in record}
-        result.setdefault('action', ACTION_NAMES.get(action, action))
-        if result.get('action_id') and result.get('status') == 'running':
-            result['message'] = 'Command accepted. Wait for its ACP completion; do not poll or resend.'
-        elif result.get('completed'):
-            result['message'] = 'Command completed; required robot feedback was confirmed.'
-        elif result.get('state') == 'busy':
-            result['message'] = 'Another motion is running. Wait for ACP or use stop_move.'
-        elif result.get('blocked_by'):
-            result['message'] = self._blocker_text(result['blocked_by'])
-        elif result.get('reason') == 'reported_stop_not_confirmed':
-            result['message'] = 'Stop was not confirmed. Check the robot and use info for diagnostics.'
-        else:
-            result['message'] = str(result.get('reason', result.get('state', 'Command result'))).replace('_', ' ')
-        return result
+    def _wait_stationary(self, states, deadline):
+        while True:
+            self._check()
+            observed = self._observe()
+            if observed['motion_state'] not in states:
+                raise MotionUnavailable('move_mode_required' if states == (17,) else 'posture_transition_not_ready')
+            if self._stationary_status(states)['ready']:
+                return
+            if self._clock() >= deadline:
+                raise MotionUnavailable('stationary_feedback_required')
+            self._cancel.wait(.04)
 
-    def _summary(self, status, *, include_settings=False):
-        readiness = status['readiness']
-        blocked = readiness['blocked_by']
-        result = {'card': LOCO_TOOL, 'state': status['state'],
-                'enabled': status['settings']['enabled'], 'ready': readiness['ready'],
-                'topic_out': [],
-                'active_request': ({k: self._public_record(status['active_request']).get(k)
-                                    for k in ('action_id', 'request_id', 'action')}
-                                   if status.get('active_request') else None),
-                'last_result': (self._display_result(status['last_result'], status['last_result']['action'])
-                                if status.get('last_result') else None),
-                'blocked_by': blocked,
-                'message': self._blocker_text(blocked) if blocked else 'Ready. Motion completion is reported through ACP.'}
-        if include_settings:
-            result['settings'] = status['settings']
-        return result
+    def _ensure_transport(self):
+        with self._io_lock:
+            if self._transport is None or self._transport.status().get('closed'):
+                if self._transport is not None:
+                    self._transport.close()
+                self._transport = self._factory()
+            if not self._transport.status().get('worker_running'):
+                self._transport.start(timeout_s=5.)
+
+    def _send(self, *, state=None, velocity=None, stopping=False):
+        with self._io_lock:
+            if not stopping:
+                self._check()
+            cancel = threading.Event() if stopping else self._cancel
+            if state is not None:
+                receipt = self._transport.publish_state(state, cancel_event=cancel)
+            else:
+                # A zero frame is also a navigation command, only valid in move mode.
+                if self._observe()['motion_state'] != 17:
+                    raise MotionUnavailable('move_mode_required')
+                receipt = self._transport.publish_velocity(*velocity, cancel_event=cancel)
+            if receipt.get('sent') is not True:
+                raise MotionUnavailable('command_not_sent')
+            return receipt
+
+    def start(self):
+        with self._lock:
+            if self._closed:
+                return {'state': 'idle'}
+            self._bridge.acquire('s10_motion', {'motion_info', 'hard_estop', 'joints', 'fault_aggregator', 'odometry'},
+                                 {'refresh_hz': 10., 'stale_after_s': 2.})
+            self._started = True
+        return {'state': 'ready'}
+
+    def stop(self):
+        with self._lock:
+            self._started = False
+            self._cancel.set()
+            idle = self._active is None
+        if idle:
+            self._bridge.release('s10_motion')
+        return {'state': 'idle'}
+
+    def close(self):
+        self._closed = True
+        self.stop()
+        if self._worker is not None:
+            self._worker.join(3.)
+        if self._transport is not None:
+            self._transport.close()
+        self._bridge.release('s10_motion')
+
+    def _info(self, relative=False):
+        with self._lock:
+            blocked = self._blockers()
+            move = list(dict.fromkeys([*blocked, *self._blockers(states=(17,))]))
+            if self._active:
+                move.append('active_motion_task_in_progress')
+            relative_blocked = list(move)
+            if not self._odometry()['fresh']:
+                relative_blocked.append('fresh_odometry_required')
+            actions = {'stand_up': {'ready': not blocked and not self._active, 'blocked_by': blocked},
+                       'sit_down': {'ready': not blocked and not self._active, 'blocked_by': blocked},
+                       'move': {'ready': not move, 'blocked_by': move}}
+            if relative:
+                actions = {'relative_move': {'ready': not relative_blocked, 'blocked_by': relative_blocked}}
+                blocked = relative_blocked
+            return {'card': 'relative_move' if relative else self.name,
+                'state': 'ready' if self._started else 'idle',
+                'ready': not blocked and not self._active, 'blocked_by': blocked,
+                'settings': dict(self._settings), 'active_request': copy.deepcopy(self._active),
+                'last_result': copy.deepcopy(self._last),
+                'readiness': {'ready': not blocked and not self._active, 'blocked_by': blocked,
+                    'actions': actions, 'motion_state': self._observe()['motion_state'],
+                    'stationary_check': self._stationary_status(), 'command_channel': dict(self._channel)}}
+
+    def _request(self, action, arguments):
+        values = {k: v for k, v in arguments.items() if k not in ('_tool_name', 'instance_id', 'action')}
+        if action in ('stand_up', 'sit_down'):
+            # Core can retain hidden move fields while changing the selection.
+            for key in ('direction', 'speed', 'duration'):
+                values.pop(key, None)
+        internal = {'sit_down': 'lie', 'move': 'move_2s'}.get(action, action)
+        if action == 'relative_move':
+            turning = values.get('direction', '').startswith('turn_')
+            value = values.get('angle' if turning else 'distance')
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError('relative target must be finite')
+            if turning and (type(value) is not int or value not in (30, 60) or 'distance' in values):
+                raise ValueError('relative turn requires angle 30 or 60')
+            if not turning and ('angle' in values or not .3 <= value <= .6):
+                raise ValueError('relative distance must be .3 through .6 metres')
+            values['target'] = math.radians(value) if turning else value
+        request = validate_motion_request(internal, values, self._settings, self._wall,
+            allowed_actions=('stand_up', 'lie', 'move_2s', 'relative_move'))
+        request['action'] = action
+        return request
 
     def execute(self, action, arguments):
-        if action != STAND_UP: return super().execute(action, arguments)
-        args = dict(arguments or {})
+        request = self._request(action, arguments)
+        signature = {k: v for k, v in request.items() if k not in ('request_id', 'issued_at_ms', 'ttl_ms')}
         with self._lock:
-            request = validate_motion_request(action, args, self._settings, self._wall,
-                check_freshness=False, allowed_actions=self.execution_actions)
-            if self._tasks.get(request['request_id']): return MotionPlugin.execute(self, action, args)
-            if self._active is not None: return {'accepted': False, 'state': 'busy', 'reason': 'active_motion_task_in_progress'}
-            if self._closed.is_set() or not self._started or not self._settings['enabled']:
-                return self._unavailable(['card_not_enabled'], action)
-            if self._error:
-                return self._unavailable(['driver_error_requires_review'], action)
-            self._backend.start_observation()
-            if self._backend.safety_status()['failed_closed']:
-                try:
-                    check = self._backend.recover_worker()
-                except Exception:
-                    return self._unavailable(['command_channel_unavailable'], action)
-            else:
-                check = self._backend.preflight(stationary_states=(0, 1, 17))
-            if self._backend.feedback.observation().get('motion_state') not in (0, 1, 17):
-                check['blocked_by'].append('wait_for_idle_required')
-            if check['blocked_by']: return self._check_unavailable(check, action)
-            return MotionPlugin.execute(self, action, {**args, 'request_id': request['request_id']})
-
-    def _run_action(self, record, request, started):
-        if request['action'] != STAND_UP: return super()._run_action(record, request, started)
-        rid, deadline = request['request_id'], request['expires_monotonic']
-        stages, stage_ids = [], []
-        completed, reason, sent = False, 'stand_up_incomplete', False
-        stage, phase, blocked_by, error_type = None, 'plan', [], None
-        try:
-            state = self._backend.feedback.observation().get('motion_state')
-            if state not in (0, 1, 17): raise StandUpFailure('unexpected_posture_state')
-            plan = ('stand', 'move_mode') if state == 0 else ('move_mode',) if state == 1 else ()
-            if not plan:
-                check = self._backend.preflight(stationary_states=(17,))
-                if check['blocked_by'] or self._observation_failure(STAND_UP):
-                    raise StandUpFailure('move_mode_not_stationary', check['blocked_by'])
-            for stage in plan:
-                phase = 'preflight'
-                if self._clock() >= deadline or self._cancel.is_set() or self._observation_failure(STAND_UP):
-                    raise StandUpFailure('sequence_conditions_lost')
-                check = self._backend.preflight(stationary_states=(0,) if stage == 'stand' else (1,))
-                if check['blocked_by']: raise StandUpFailure('stage_preflight_unavailable', check['blocked_by'])
-                sid = 'loco_' + hashlib.sha256((rid + ':' + stage).encode()).hexdigest()
-                stage_ids.append(sid)
-                child = {**request, 'request_id': sid, 'action': stage}
-                with self._io_lock:
-                    if self._cancel.is_set() or self._clock() >= deadline or self._observation_failure(STAND_UP):
-                        raise StandUpFailure('sequence_conditions_lost')
-                    phase = 'prepare_channel'
-                    self._backend.prepare_execution(stage)
-                    if self._clock() >= deadline or self._cancel.is_set(): raise TimeoutError('Stage expired')
-                    phase = 'send'
-                    receipt = self._backend.send(stage, child, self._cancel)
-                    sent = sent or receipt.get('sent') is True
-                    self._last_command = self._clock()
-                self._event('stage_sent', action=STAND_UP, stage=stage, request_id=rid, action_id=record['action_id'])
-                confirmed = False
-                phase = 'wait_feedback'
-                while self._clock() < deadline:
-                    failure = self._observation_failure(STAND_UP)
-                    if failure: reason = failure; break
-                    observed = self._backend.target_feedback(stage, sid)
-                    if observed.get('confirmed') is True and observed.get('fresh') is True:
-                        confirmed = True; break
-                    self._cancel.wait(.02)
-                if not confirmed: raise StandUpFailure('stage_feedback_unconfirmed')
-                stages.append({'action': stage, 'reported_target_state': 1 if stage == 'stand' else 17, 'confirmed': True})
-                self._backend.finish(sid)
-            completed = not self._observation_failure(STAND_UP) and self._clock() < deadline
-            reason = 'move_mode_ready' if completed else 'sequence_conditions_lost'
-        except Exception as exc:
-            error_type = type(exc).__name__
-            blocked_by = exc.blocked_by if isinstance(exc, StandUpFailure) else []
-            reason = self._observation_failure(STAND_UP) or (
-                exc.reason if isinstance(exc, StandUpFailure) else 'stage_' + phase + '_failed')
-        finally:
-            if self._cancel.is_set() or self._clock() >= deadline or self._observation_failure(STAND_UP):
-                completed = False; reason = self._observation_failure(STAND_UP) or 'stand_up_deadline_exceeded'
-            if not completed: self._backend.abort()
-            for sid in stage_ids: self._backend.finish(sid)
-            result = {'request_id': rid, 'action_id': record['action_id'], 'action': STAND_UP,
-                      'accepted': True, 'completed': bool(completed), 'confirmed': bool(completed),
-                      'state': 'completed' if completed else 'error', 'status': 'completed' if completed else 'error',
-                      'reason': reason, 'stages': stages, 'physical_command_sent': sent, 'stop_confirmed': False,
-                      'reported_target_state': 17 if completed else None, 'completion_level': 'reported_motion_state',
-                      'physical_pose_completion_verified': False, 'finished_at': self._wall()}
-            if not completed:
-                result.update(failed_stage=stage, failure_phase=phase,
-                              blocked_by=blocked_by, error_type=error_type)
+            previous = self._history.get(request['request_id'])
+            if previous:
+                if previous['signature'] != signature:
+                    raise ValueError('request_id already belongs to another action')
+                # A finished replay has no action_id, so Core creates no new pending.
+                return copy.deepcopy(previous.get('result') or previous['receipt'])
+            if self._active is not None:
+                return {'state': 'busy', 'accepted': False, 'reason': 'active_motion_task_in_progress'}
+            blocked = self._blockers()
+            if action in ('move', 'relative_move') and self._observe()['motion_state'] != 17:
+                blocked.append('move_mode_required')
+            if blocked:
+                return {'state': 'unavailable', 'accepted': False, 'blocked_by': blocked}
+            action_id = 's10_motion_' + uuid4().hex
+            receipt = {'state': 'moving', 'accepted': True, 'action_id': action_id}
+            record = {'signature': signature, 'receipt': receipt}
+            self._history[request['request_id']] = record
+            while len(self._history) > 256:
+                self._history.popitem(last=False)
+            self._cancel = threading.Event()
+            self._active = {'request_id': request['request_id'], 'action_id': action_id, 'action': action}
+            deadline = self._clock() + self._settings['action_timeout_s']
+            self._worker = threading.Thread(target=self._run, args=(request, record, deadline),
+                                            name='s10-motion', daemon=True)
             try:
-                if self._tasks.finish(rid, result):
-                    with self._lock:
-                        self._last, self._phase = result, result['state'] if self._started else 'idle'
-                        self._event('finished', **result)
-            except Exception: self._error = 'terminal_record_failed_restart_recovery_required'
-            finally:
-                with self._lock: self._active = None
-                if not self._started: self._backend.stop_observation()
-                self._busy.release()
-            self._flush_notifications()
+                self._worker.start()
+            except Exception:
+                self._active = None
+                self._history.pop(request['request_id'])
+                raise
+            return receipt
+
+    def cancel(self):
+        with self._lock:
+            active = self._active is not None
+            self._cancel.set()
+        return {'state': 'cancellation_requested' if active else 'idle', 'accepted': active}
+
+    def dispatch(self, action, args):
+        if args.get('_tool_name') not in (None, 'loco_move', 'relative_move'):
+            raise ValueError('unsupported motion tool')
+        relative = args.get('_tool_name') == 'relative_move'
+        if not relative and action in ('start', 'config', 'info', 'status', 'stop', 'stop_move'):
+            args = {k: v for k, v in args.items() if k not in ('direction', 'speed', 'duration')}
+        action = ALIASES.get(action, action)
+        if action == 'start':
+            updates = normalize_config_updates(args, motion_defaults())
+            if updates:
+                self._configure(updates)
+            return self.start()
+        if action == 'stop':
+            validate_empty_arguments(args)
+            return self.stop()
+        if action == 'config':
+            self._configure(normalize_config_updates(args, motion_defaults()))
+            return self._info(relative)
+        if action in ('info', 'status'):
+            validate_empty_arguments(args)
+            return self._info(relative)
+        if action == 'stop_move':
+            return self.cancel()
+        if relative and action in ('move', 'relative_move'):
+            return self.execute('relative_move', args)
+        if action not in ('stand_up', 'sit_down', 'move'):
+            raise ValueError('unsupported locomotion action')
+        return self.execute(action, args)
+
+    def _configure(self, updates):
+        with self._lock:
+            changed = validate_motion_settings({**self._settings, **updates})
+            if self._active and changed != self._settings:
+                self._cancel.set()
+            self._settings = changed
+
+    def _posture(self, state, target, deadline):
+        self._check()
+        self._wait_stationary((0,) if state == 1 else (1,) if state == 17 else (0, 1, 17),
+                              min(deadline, self._clock() + .9))
+        marker = self._observe()['sequence']
+        self._send(state=state)
+        stable = 0
+        previous = marker
+        while self._clock() < deadline:
+            self._check()
+            observed = self._observe()
+            if observed['sequence'] != previous:
+                stable = stable + 1 if observed['motion_state'] == target else 0
+                previous = observed['sequence']
+                if stable >= 2:
+                    return
+            self._cancel.wait(.02)
+        raise MotionUnavailable('posture_feedback_timeout')
+
+    def _stop_velocity(self, deadline):
+        self._stationary.reset()
+        deadline = min(deadline, self._clock() + 2.)
+        zeros = stable = 0
+        previous = None
+        while self._clock() < deadline:
+            try:
+                self._send(velocity=(0., 0., 0.), stopping=True)
+                zeros += 1
+            except Exception:
+                return False
+            observed = self._observe()
+            if observed['sequence'] != previous:
+                check = self._stationary_status((17,))
+                stable = stable + 1 if check['ready'] else 0
+                previous = observed['sequence']
+            if zeros >= 2 and stable >= 2:
+                return True
+            time.sleep(.1)
+        return False
+
+    def _move(self, request, deadline, result):
+        self._wait_stationary((17,), min(deadline, self._clock() + .9))
+        controller = None
+        if request['action'] == 'relative_move':
+            initial = self._odometry()
+            if not initial['fresh']:
+                raise MotionUnavailable('fresh_odometry_required')
+            controller = RelativeController(initial, direction=request['direction'], target=request['target'],
+                                            max_speed=request['speed'], now=self._clock())
+        end = min(self._clock() + request['duration'], deadline - 2.05) if controller is None else deadline - 2.05
+        if controller is None and end < self._clock() + request['duration'] - .01:
+            raise MotionUnavailable('insufficient_stop_budget')
+        response = False
+        next_frame = self._clock()
+        while self._clock() < end:
+            self._check()
+            if self._clock() - next_frame > .3:
+                raise MotionUnavailable('command_stream_late')
+            if self._observe()['motion_state'] != 17:
+                raise MotionUnavailable('move_mode_lost')
+            if controller is not None:
+                pose = self._odometry()
+                if not pose['fresh']:
+                    raise MotionUnavailable('fresh_odometry_required')
+                if pose['sequence'] == controller.last_sequence:
+                    self._cancel.wait(.02)
+                    continue
+                velocity, progress = controller.command(pose, self._clock())
+                result['progress'] = progress
+                if progress['phase'] == 'completed':
+                    return
+            else:
+                velocity = tuple(v * request['speed'] for v in DIRECTIONS[request['direction']])
+            result['physical_command_sent'] = True
+            self._send(velocity=velocity)
+            result['command_frames'] = result.get('command_frames', 0) + 1
+            observed = self._observe()['velocity']
+            axes = DIRECTIONS.get(request['direction'])
+            if axes is not None:
+                projected = sum(observed.get(k, 0.) * axis for k, axis in zip(('vx', 'vy', 'yaw_rate'), axes))
+                response |= projected >= min(.03, request['speed'] * .3)
+            next_frame += .1
+            self._cancel.wait(max(0., next_frame - self._clock()))
+        if controller is not None:
+            raise MotionUnavailable('relative_motion_timeout')
+        if not response:
+            raise MotionUnavailable('motion_response_not_observed')
+
+    def _run(self, request, record, deadline):
+        action_id = record['receipt']['action_id']
+        action = request['action']
+        navigation = action in ('move', 'relative_move')
+        result = {'action': action, 'request_id': request['request_id'], 'completed': False,
+                  'physical_command_sent': False, 'stop_confirmed': False}
+        status = 'error'
+        try:
+            self._check()
+            self._ensure_transport()
+            kind = 'velocity' if navigation else 'state'
+            while self._clock() < deadline:
+                self._check()
+                self._channel = self._transport.graph_snapshot()
+                if self._channel.get(kind, {}).get('matched_subscribers', 0) > 0:
+                    break
+                self._cancel.wait(.02)
+            else:
+                raise MotionUnavailable('command_receiver_unmatched')
+            if action == 'stand_up':
+                state = self._observe()['motion_state']
+                if state not in (0, 1, 17):
+                    raise MotionUnavailable('posture_transition_not_ready')
+                if state == 0:
+                    result['physical_command_sent'] = True
+                    self._posture(1, 1, deadline)
+                    state = 1
+                if state == 1:
+                    result['physical_command_sent'] = True
+                    self._posture(17, 17, deadline)
+                self._wait_stationary((17,), min(deadline, self._clock() + .9))
+            elif action == 'sit_down':
+                if self._observe()['motion_state'] != 0:
+                    result['physical_command_sent'] = True
+                    self._posture(4, 0, deadline)
+            else:
+                self._move(request, deadline, result)
+            self._check()
+            if self._clock() >= deadline:
+                raise MotionUnavailable('action_timeout')
+            result['completed'] = True
+            status = 'completed'
+        except Exception as error:
+            status = 'cancelled' if self._cancel.is_set() else 'error'
+            result['reason'] = str(error) if isinstance(error, MotionUnavailable) else getattr(error, 'reason', type(error).__name__)
+        finally:
+            if navigation and result['physical_command_sent']:
+                result['stop_confirmed'] = self._stop_velocity(deadline)
+                if not result['stop_confirmed']:
+                    result['completed'] = False
+                    result['reason'] = 'reported_stop_not_confirmed'
+                    status = 'error'
+            if self._cancel.is_set() and status == 'completed':
+                result['completed'] = False
+                status = 'cancelled'
+            result.update(status=status, state=status, finished_at=self._wall())
+            with self._lock:
+                record['result'] = copy.deepcopy(result)
+                self._last = result
+                self._active = None
+                if not self._started:
+                    self._bridge.release('s10_motion')
+            # One worker, one terminal callback. No outbox polling or receipt protocol.
+            try:
+                self._callback(action_id, status, result, 'relative_move' if action == 'relative_move' else self.name)
+            except Exception as error:
+                logging.warning('ACP callback failed (%s)', type(error).__name__)
