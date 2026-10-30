@@ -247,9 +247,15 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert skeleton["joints"][15]["q"] == 15
     assert full_joint_state["fr_hipx_joint_q"] == 4
 
-    callbacks["/BATTERY_DATA"](SimpleNamespace(data=[SimpleNamespace(battery_level=87)]))
+    callbacks["/BATTERY_DATA"](SimpleNamespace(data=[
+        SimpleNamespace(voltage=0, current=0, cells=[0, 0]),
+        SimpleNamespace(voltage=52000, current=0, cells=[3700, 3800], battery_level=87),
+    ]))
     battery = json.loads(nodes.publishers["battery"].messages[-1].data)
-    assert battery["battery_0_battery_level"] == 87
+    assert battery["batteries"] == {
+        "battery_0": {"voltage": 0, "current": 0, "cells": [0, 0]},
+        "battery_1": {"voltage": 52000, "current": 0, "cells": [3700, 3800], "battery_level": 87},
+    }
 
     callbacks["/MOTION_INFO"](SimpleNamespace(data=SimpleNamespace(vel_x=0.3, vel_y=0.0)))
     loco_state = json.loads(nodes.publishers["loco_state"].messages[-1].data)
@@ -491,35 +497,6 @@ def test_joints_ascii_motor_indices_follow_urdf_order(monkeypatch):
             "position": float(index)} for index in reversed(range(16))]
     ordered = device._order_joints(raw)
     assert [joint["position"] for joint in ordered] == list(map(float, range(16)))
-
-
-def test_battery_fields_are_flattened_recursively(monkeypatch):
-    device = _load_device(monkeypatch)
-    result = {}
-    device._flatten_fields({"level": 87, "cells": [{"voltage": 3.7}, {"voltage": 3.8}]}, "battery_0", result)
-    assert result == {
-        "battery_0_level": 87,
-        "battery_0_cells_0_voltage": 3.7,
-        "battery_0_cells_1_voltage": 3.8,
-    }
-
-
-def test_battery_only_omits_whole_zero_slots(monkeypatch):
-    device = _load_device(monkeypatch)
-    result = {}
-    zero_slot = {"voltage": 0, "current": 0, "cycles": 0,
-                 "battery_temperature": [0.0], "battery_serialnum": [0]}
-    real_slot = {"voltage": 52000, "current": 0, "cycles": 0,
-                 "battery_temperature": [0.0], "battery_level": 0}
-    if not device._all_zero_placeholder(zero_slot):
-        device._flatten_fields(zero_slot, "battery_0", result)
-    if device._all_zero_placeholder(real_slot):
-        raise AssertionError("a powered battery with zero current must not be a placeholder")
-    device._flatten_fields(real_slot, "battery_1", result)
-    assert "battery_0_voltage" not in result
-    assert result["battery_1_current"] == 0
-    assert result["battery_1_cycles"] == 0
-    assert result["battery_1_battery_temperature_0"] == 0.0
 
 
 def test_navigation_actions_use_s10_pro_native_commands(monkeypatch):

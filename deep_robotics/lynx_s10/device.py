@@ -183,6 +183,8 @@ class S10Nodes:
                 else:
                     self.robot.create_subscription(Image, source_topic,
                         lambda msg, camera=key: self._forward_camera(camera, msg), stream_qos)
+            print(f"[ros2] {key} subscriptions created: {', '.join(source_topics)}", flush=True)
+        print(f"[ros2] lidar subscriptions created: {', '.join(self._lidar_topics)}", flush=True)
 
     def _record_stream(self, key, stage):
         now = time.time()
@@ -279,11 +281,10 @@ class S10Nodes:
         from common.vendor_runtime import jsonable
         values = jsonable(msg)
         batteries = values.get("data", []) if isinstance(values, dict) else []
-        payload = {}
-        for index, battery in enumerate(batteries if isinstance(batteries, list) else []):
-            if _all_zero_placeholder(battery):
-                continue
-            _flatten_fields(battery, f"battery_{index}", payload, omit_zero_placeholders=True)
+        slots = batteries if isinstance(batteries, list) else []
+        payload = {"batteries": {
+            f"battery_{index}": battery for index, battery in enumerate(slots)
+        }}
         self._publish_json("battery", payload)
 
     def _forward_loco_state(self, msg):
