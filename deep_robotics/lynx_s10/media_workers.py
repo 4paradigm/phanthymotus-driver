@@ -16,10 +16,9 @@ class MediaWorkers:
         self._results = {}
         self._jobs = {}
         self._processes = {}
+        self._collector_threads = {}
         self._result_failures = 0
         self._closed = False
-        self._thread = threading.Thread(target=self._collect, name="lynx-s10-media-results", daemon=True)
-        self._thread.start()
 
     def add_camera(self, lane):
         self._add(lane, "camera")
@@ -42,6 +41,10 @@ class MediaWorkers:
         self._jobs[lane] = jobs
         self._results[lane] = results
         self._processes[lane] = process
+        collector = threading.Thread(target=self._collect_lane, args=(lane, results),
+                                     name=f"lynx-s10-media-results-{lane}", daemon=True)
+        self._collector_threads[lane] = collector
+        collector.start()
 
     def submit(self, lane, job):
         jobs = self._jobs.get(lane)
@@ -53,27 +56,20 @@ class MediaWorkers:
         process = self._processes.get(lane)
         return bool(process and process.is_alive())
 
-    def _collect(self):
+    def _collect_lane(self, lane, results):
         while not self._closed:
-            found = False
-            for results in tuple(self._results.values()):
+            try:
+                result = results.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            # Drain superseded results for this lane before publishing. A slow
+            # lane can no longer block the result collector for other cameras.
+            while True:
                 try:
                     result = results.get_nowait()
                 except queue.Empty:
-                    continue
-                # A worker may finish another frame while the callback is
-                # publishing. Drain any superseded result and handle only the
-                # newest one, preventing conversion time from becoming visible
-                # stream latency.
-                while True:
-                    try:
-                        result = results.get_nowait()
-                    except queue.Empty:
-                        break
-                found = True
-                self._handle_result(result)
-            if not found:
-                threading.Event().wait(0.001)
+                    break
+            self._handle_result(result)
 
     def _handle_result(self, result):
         try:
@@ -101,10 +97,12 @@ class MediaWorkers:
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=1)
-        self._thread.join(timeout=1)
+        for collector in self._collector_threads.values():
+            collector.join(timeout=1)
         self._jobs.clear()
         self._results.clear()
         self._processes.clear()
+        self._collector_threads.clear()
 
 
 def _put_latest(target, item):
