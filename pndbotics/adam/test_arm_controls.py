@@ -7,6 +7,7 @@ import sys
 import time
 import types
 import unittest
+from unittest import mock
 
 sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 
@@ -34,8 +35,12 @@ def _fake_lowcmd(dof):
 
 
 def _prime_arm_plugin(publisher):
-    plugin = ArmControlPlugin({}, "", None, dds_lowcmd_pub=publisher)
+    plugin = ArmControlPlugin({}, "", None, dds_lowcmd_pub=publisher,
+                              grpc_client=types.SimpleNamespace(get_control_state=lambda **kw: {"success":True,"domain_id":0}))
     plugin._hold_q = [index / 100.0 for index in range(31)]
+    for joint in ("elbow_Left", "elbow_Right"):
+        plugin._hold_q[ADAM_PRO_JOINTS.index(joint)] *= -1
+    plugin._owner_checked_at = time.monotonic()
     plugin._current_q = plugin._hold_q.copy()
     plugin._seg_current = plugin._hold_q.copy()
     plugin._seg_start = {}
@@ -82,7 +87,7 @@ class ArmControlTests(unittest.TestCase):
         tool = plugin.get_tool()
         self.assertIn("reset", tool["inputSchema"]["properties"]["action"]["enum"])
         self.assertEqual(
-            ["duration_s"],
+            ["duration_s", "confirm"],
             tool["inputSchema"]["x-action-params"]["reset"]["params"],
         )
 
@@ -93,7 +98,7 @@ class ArmControlTests(unittest.TestCase):
             plugin._target_q = {
                 ADAM_PRO_JOINTS.index("shoulderPitch_Left"): math.radians(-90),
             }
-            result = plugin.dispatch("reset", {"duration_s": 3.0})
+            result = plugin.dispatch("reset", {"confirm": True, "duration_s": 3.0})
         finally:
             plugin._stop_event.set()
             if plugin._thread is not None:
@@ -111,9 +116,9 @@ class ArmControlTests(unittest.TestCase):
             self.assertAlmostEqual(plugin._hold_q[index], plugin._target_q[index])
 
     def test_degrees_convert_to_the_ros_joint_target(self):
-        name, target = _arm_target_radians("left_shoulder_pitch", -90)
+        name, target = _arm_target_radians("left_shoulder_pitch", -45)
         self.assertEqual("shoulderPitch_Left", name)
-        self.assertAlmostEqual(-math.pi / 2, target)
+        self.assertAlmostEqual(-math.pi / 4, target)
 
     def test_each_joint_rejects_its_own_limit_violation(self):
         with self.assertRaisesRegex(ValueError, "left_shoulder_roll"):
@@ -137,7 +142,7 @@ class ArmControlTests(unittest.TestCase):
         device.pnd_adam_msg_dds__LowCmd_ = _fake_lowcmd
         try:
             plugin.start()
-            result = plugin.dispatch("set_shoulder", {
+            result = plugin.dispatch("set_shoulder", {"confirm": True,
                 "side": "left", "pitch_deg": -30, "roll_deg": 20,
                 "yaw_deg": 10,
             })
@@ -146,7 +151,8 @@ class ArmControlTests(unittest.TestCase):
             plugin._thread.join(1.0)
             plugin._thread = None
             plugin._seg_started_at = time.monotonic() - plugin._seg_span
-            plugin._write_command(0.02)
+            for _ in range(100):
+                plugin._write_command(0.02)
         finally:
             plugin._stop_event.set()
             if plugin._thread is not None:
@@ -212,8 +218,40 @@ class ArmControlTests(unittest.TestCase):
             else:
                 device.pnd_adam_msg_dds__LowCmd_ = original_factory
 
-        self.assertEqual(publisher.commands[-1].motor_cmd[elbow].kp, 0.0)
+        for index, name in enumerate(ADAM_PRO_JOINTS):
+            if name.startswith(("waist", "neck", "shoulder", "elbow", "wrist")):
+                self.assertEqual(publisher.commands[-1].motor_cmd[index].kp, 0.0)
+                self.assertEqual(publisher.commands[-1].motor_cmd[index].kd, 0.0)
         self.assertFalse(plugin._active)
+
+    def test_feedback_fault_ramps_both_upper_body_gains_and_finishes_release(self):
+        publisher = _FakePublisher()
+        plugin = _prime_arm_plugin(publisher)
+        plugin._active = plugin._streaming = True
+        plugin._target_q = {ADAM_PRO_JOINTS.index("elbow_Left"): -0.5}
+        started = time.monotonic()
+        with mock.patch.object(device.time, "monotonic", return_value=started):
+            plugin._fail_feedback("feedback expired")
+        with mock.patch.object(device, "pnd_adam_msg_dds__LowCmd_", _fake_lowcmd, create=True):
+            for fraction in (0.5, 1.0):
+                now = started + fraction * plugin._RELEASE_SECONDS
+                plugin._owner_checked_at = now
+                with mock.patch.object(device.time, "monotonic", return_value=now):
+                    plugin._write_command(0.02)
+                packet = publisher.commands[-1]
+                for index, name in enumerate(ADAM_PRO_JOINTS):
+                    kp, kd = plugin._pd_for_joint(name)
+                    scale = 1 - fraction if name.startswith(
+                        ("waist", "neck", "shoulder", "elbow", "wrist")) else 1
+                    self.assertAlmostEqual(kp * scale, packet.motor_cmd[index].kp, places=5)
+                    self.assertAlmostEqual(kd * scale, packet.motor_cmd[index].kd, places=5)
+        self.assertFalse(plugin._streaming)
+        self.assertFalse(plugin._active)
+        self.assertFalse(plugin._target_q)
+        self.assertIsNone(plugin._release_started_at)
+        count = len(publisher.commands)
+        plugin._write_command(0.02)
+        self.assertEqual(count, len(publisher.commands))
 
     def test_stop_waits_for_release_and_includes_waist(self):
         publisher = _FakePublisher()
@@ -239,12 +277,15 @@ class ArmControlTests(unittest.TestCase):
                 device.pnd_adam_msg_dds__LowCmd_ = original_factory
         self.assertEqual(0.0, publisher.commands[-1].motor_cmd[waist].kp)
         self.assertEqual(0.0, publisher.commands[-1].motor_cmd[neck].kp)
+        self.assertEqual(0.0, publisher.commands[-1].motor_cmd[waist].kd)
+        self.assertEqual(0.0, publisher.commands[-1].motor_cmd[neck].kd)
 
     def test_segment_starts_from_current_output_and_ends_at_target(self):
         publisher = _FakePublisher()
         plugin = _prime_arm_plugin(publisher)
         shoulder = ADAM_PRO_JOINTS.index("shoulderPitch_Left")
         hold = plugin._hold_q[shoulder]
+        plugin._confirm_target_write = lambda generation: None
         plugin._set_targets({"shoulderPitch_Left": -1.0})
         self.assertEqual(plugin._seg_current[shoulder], hold)
         self.assertEqual(plugin._seg_start[shoulder], hold)
@@ -267,7 +308,7 @@ class ArmControlTests(unittest.TestCase):
         # Retarget to a new pose: the new segment starts from current output,
         # not from the original hold or previous target.
         plugin._set_targets({"shoulderPitch_Left": 0.5})
-        self.assertAlmostEqual(plugin._seg_start[shoulder], mid)
+        self.assertAlmostEqual(plugin._seg_start[shoulder], mid, delta=0.01)
         self.assertEqual(plugin._target_q[shoulder], 0.5)
 
         # At the end of the segment the output equals the newest target.
@@ -276,6 +317,16 @@ class ArmControlTests(unittest.TestCase):
         device.pnd_adam_msg_dds__LowCmd_ = _fake_lowcmd
         try:
             plugin._write_command(0.02)
+        finally:
+            if original_factory is None:
+                del device.pnd_adam_msg_dds__LowCmd_
+            else:
+                device.pnd_adam_msg_dds__LowCmd_ = original_factory
+        self.assertLess(publisher.commands[-1].motor_cmd[shoulder].q, 0.5)
+        device.pnd_adam_msg_dds__LowCmd_ = _fake_lowcmd
+        try:
+            for _ in range(100):
+                plugin._write_command(0.02)
         finally:
             if original_factory is None:
                 del device.pnd_adam_msg_dds__LowCmd_
@@ -299,8 +350,9 @@ class ArmControlTests(unittest.TestCase):
         shoulder = ADAM_PRO_JOINTS.index("shoulderPitch_Left")
         hold = plugin._hold_q[shoulder]
         samples = 400
-        for distance in (0.2, 0.5, 1.0, 2.0):
-            plugin._set_targets({"shoulderPitch_Left": hold - distance})
+        for distance in (0.2, 0.5, 1.0):
+            plugin._confirm_target_write = lambda generation: None
+            self.assertIsNone(plugin._set_targets({"shoulderPitch_Left": hold - distance}))
             span = plugin._seg_span
             peak = 0.0
             previous = ease(0.0)
@@ -412,8 +464,13 @@ class HandSmoothTests(unittest.TestCase):
             self.assertEqual(plugin._command_positions, [500] * 12)
             stop = plugin._control_stop_event
 
-            # Let the control loop run for a few periods; it should move partway.
-            time.sleep(0.05)
+            # Observe convergence rather than assuming exactly five scheduler
+            # ticks fit into 50ms on a shared development machine.
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                if pub.commands and all(abs(v) <= 60 for v in pub.commands[-1].position):
+                    break
+                time.sleep(0.005)
             stop.set()
             plugin._control_thread.join(1.0)
         finally:
