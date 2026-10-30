@@ -377,7 +377,11 @@ def test_compressed_jpeg_is_forwarded_without_reencoding(monkeypatch):
 
 def test_model_resource_returns_official_urdf(monkeypatch):
     device = _load_device(monkeypatch)
-    result = device.S10ModelPlugin().dispatch("model", {})
+    plugin = device.S10ModelPlugin()
+    assert plugin.dispatch("start", {}) == {"state": "ready"}
+    assert plugin.dispatch("info", {}) == {"state": "ready"}
+    assert plugin.dispatch("stop", {}) == {"state": "idle"}
+    result = plugin.dispatch("model", {})
     root = ET.fromstring(result["urdf"])
     assert root.tag == "robot" and root.get("name") == "S10"
     assert all(child.tag in {"link", "joint", "material"} for child in root)

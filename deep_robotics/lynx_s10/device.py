@@ -874,6 +874,12 @@ class S10ModelPlugin:
     def start(self): pass
     def stop(self): pass
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
         if action == "model":
             return {"urdf": URDF_PATH.read_text(encoding="utf-8")}
         return {"state": "ready"}
