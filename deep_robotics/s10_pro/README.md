@@ -6,7 +6,7 @@ and `relative_move`. The standard Core is unchanged; deployment uses one Core
 and one Driver container, with existing site storage and credentials preserved.
 
 `loco_move` combines the former posture and timed-movement cards. Its actions are
-`stand_up` (stand then enter move mode), `stand_down`, finite `move`, and
+`stand_up` (stand then enter move mode), `sitdown`, finite `move`, and
 `stop_move` (application cancellation, not a hardware emergency stop). It has no
 canvas output ports. Status is queried through `info`/`status`; completion uses
 ACP. The default canvas action remains read-only `status`.
@@ -26,11 +26,12 @@ an operator grant the same tools remain visible and motion stays unavailable.
 
 The reference is repository commit
 `4ccfdebf938e69f98c40a84554c538224a4a6859`, with `unitree/g1` tree
-`af218e219107d4b951950f54ff30658a9afd75ec`. The active S10 checkout starts at
-`7385f170922853988e5ccfce14a1ef582a12bdfa` and contains uncommitted work.
+`af218e219107d4b951950f54ff30658a9afd75ec`. The initial S10 development baseline was
+`7385f170922853988e5ccfce14a1ef582a12bdfa`.
 [The reference lock](deploy/G1_REFERENCE.json) records hashes of the reviewed
 G1 files. This pins the available local reference; it is not a claim about the
-latest remote branch. The G1 reference itself remains unchanged.
+latest remote branch. Current upstream G1 files may evolve independently;
+the lock is verified against the recorded Git objects, not today's checkout.
 
 Follow `README_dev.md` and the pinned G1 implementations of `main.py`,
 `Dockerfile`, `deploy/service.yml`, `loco_relative_move.py` and
@@ -107,7 +108,7 @@ command. Missing/stale feedback, faults and revoked authority remain blockers.
 
 From reported state 0, `stand_up` requests state 1, confirms fresh stationary
 feedback, then requests state 17. From state 1 it performs the second stage only;
-stationary state 17 completes without commands. `stand_down` waits for final idle
+stationary state 17 completes without commands. `sitdown` waits for final idle
 state 0. Each stage retains its original policy scope and the task has one shared
 deadline, mutex and terminal completion. Vendor remote navigation mode remains a
 site prerequisite; reported state does not prove vendor control ownership.
@@ -185,3 +186,29 @@ this driver does not patch it. This work does not edit the robot or its canvas.
 
 See [acceptance](deploy/ACCEPTANCE.md) for evidence requirements. Historical
 robot observations and older test totals do not validate the present candidate.
+
+## Concise action replies and ACP compatibility
+
+The public downward action is `sitdown`, retaining the original lie-down
+command and final state 0; the name does not add a separate seated posture.
+The retired `stand_down` call remains a compatibility alias for saved workflows,
+including ACP tracking, but is not advertised in the action dropdown.
+
+`stand_up`, `sitdown` and `move` return an accepted running `action_id` after
+preflight, then finish in the worker and report the terminal outcome through ACP.
+Do not poll or resubmit an accepted command. The acceptance reply is not physical
+completion. Replayed terminal requests retain original identity and do not
+register a new pending action. Failed or cancelled tasks report that outcome.
+
+`status`, lifecycle replies and ordinary action/ACP results are concise, with a
+human-readable `message` and protocol identity/status/reason. `info` retains
+full readiness, events and stop evidence; task storage is unchanged. Automatic
+Prepare logs a repeated blocker only when the meaningful outcome changes.
+
+The official legacy Core returns precisely `{ok: true, action_id: ...}` after
+accepting an ACP POST. This endpoint receipt is accepted without pretending it
+means matched/cached/duplicate. Newer explicit receipt states remain supported.
+A matching successful legacy receipt is not retried: retrying it can repeatedly
+wake the agent. Network failures still have bounded retries with unchanged IDs;
+the legacy endpoint does not guarantee duplicate suppression if an ACK is lost.
+No Core source change or blanket silencing of failures is introduced.

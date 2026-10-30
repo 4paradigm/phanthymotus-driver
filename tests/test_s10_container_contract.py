@@ -84,10 +84,14 @@ def test_duplicate_yaml_service_is_rejected(tmp_path):
 def test_g1_pinned_files_match_exact_local_git_objects():
     lock = json.loads((DRIVER / "deploy/G1_REFERENCE.json").read_text())
     commit = lock["reference_commit"]
+    tree = subprocess.check_output(
+        ["git", "rev-parse", f"{commit}:unitree/g1"], cwd=ROOT, text=True).strip()
+    assert tree == lock["g1_tree"]
     for name, digest in lock["files"].items():
         data = subprocess.check_output(["git", "show", f"{commit}:unitree/g1/{name}"], cwd=ROOT)
         assert hashlib.sha256(data).hexdigest() == digest
-        assert (ROOT / "unitree/g1" / name).read_bytes() == data
+    # The lock is a historical development reference. Updating main may change
+    # G1 independently; never require reverting those upstream files to the pin.
 
 
 def test_staged_docker_context_has_all_copy_inputs_and_install_fragment(tmp_path):

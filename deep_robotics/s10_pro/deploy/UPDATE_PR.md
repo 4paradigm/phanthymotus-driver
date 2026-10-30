@@ -1,5 +1,10 @@
 # Updating the existing S10 PR
 
+This helper remains specific to the original PR #451. For the new version on
+`feat/s10-offline-acp-20261030`, see [release notes](RELEASE_20261030.md).
+Do not run the original-PR publisher from the new version branch; its branch
+guard intentionally rejects that operation.
+
 The target is PR #451 in `4paradigm/phanthymotus-driver`, from the original
 `wowwwwwwwwwwwwwwwwwww/phanthymotus-driver` fork and
 `feat/s10-base-posture-timed-move` branch. The updater does not create a new PR,

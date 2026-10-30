@@ -35,7 +35,7 @@ def test_public_schema_merges_cards_and_tracks_real_actions(loco):
     p, _, _, _, _ = loco
     assert [t['name'] for t in p.get_tools()] == ['loco_move', 'relative_move']
     schema = p.get_tool()['inputSchema']
-    assert schema['x-completion']['actions'] == ['stand_up', 'stand_down', 'move']
+    assert schema['x-completion']['actions'] == ['stand_up', 'sitdown', 'move', 'stand_down']
     assert not {'stand', 'move_mode', 'prepare'} & set(schema['properties']['action']['enum'])
     jsonschema.validate({'action': 'stand_up'}, schema)
     jsonschema.validate({'action': 'move', 'direction': 'forward', 'speed': .08, 'duration': 1}, schema)
@@ -166,7 +166,7 @@ def test_shared_status_keeps_relative_events_separate(loco):
     p._event('synthetic', action='relative_move')
     status = call(p, 'info')
     assert [e['action'] for e in status['events']] == ['stand_up', 'move']
-    assert set(status['readiness']['actions']) == {'stand_up', 'stand_down', 'move'}
+    assert set(status['readiness']['actions']) == {'stand_up', 'sitdown', 'move'}
     assert all(e['card'] == 'loco_move' for e in status['events'])
 
 def test_deadline_and_missing_post_send_feedback_never_advance(loco, monkeypatch):
@@ -263,7 +263,7 @@ def test_lower_turning_cap_still_overrides_expanded_range(loco):
     assert not any(t.velocity_commands for t in transports)
 
 @pytest.mark.parametrize('hidden', [{'direction': 'forward'}, {'direction': 'forward', 'speed': .08, 'duration': 2.}])
-@pytest.mark.parametrize('action,state,states', [('stand_up', 0, [1, 17]), ('stand_down', 17, [4])])
+@pytest.mark.parametrize('action,state,states', [('stand_up', 0, [1, 17]), ('sitdown', 17, [4])])
 def test_canvas_hidden_move_fields_do_not_block_posture(loco, action, state, states, hidden):
     p, _, bridge, _, transports = loco
     bridge.state = state
@@ -396,3 +396,86 @@ def test_legacy_execution_mode_is_explicitly_rejected(monkeypatch):
     with pytest.raises(ValueError, match='legacy execution-contract mode'):
         module.build_runtime_plugins({}, 'test', Bridge(), lambda *a: None,
                                      runtime_binding=SimpleNamespace(authorized=False))
+
+
+def test_sitdown_is_visible_and_old_alias_remains_callable(loco):
+    p, _, bridge, _, transports = loco
+    schema = p.get_tool()['inputSchema']
+    actions = schema['properties']['action']['enum']
+    assert 'sitdown' in actions and 'stand_down' not in actions
+    assert {'sitdown', 'stand_down'} <= set(schema['x-completion']['actions'])
+    bridge.state = 17
+    result = call(p, 'sitdown', request_id='new-sitdown')
+    assert result['action'] == 'sitdown' and result['action_id']
+    assert terminal(p, 'new-sitdown')['completed']
+    bridge.state = 17
+    alias = call(p, 'stand_down', request_id='legacy-sitdown')
+    assert alias['action'] == 'sitdown'
+    assert terminal(p, 'legacy-sitdown')['completed']
+    assert [state for t in transports for state, _ in t.states] == [4, 4]
+    assert not any(t.velocity_commands for t in transports)
+
+
+def test_async_acceptance_returns_before_feedback_and_one_acknowledged_acp(loco, tmp_path, monkeypatch):
+    from deep_robotics.s10_pro.acp import ACPNotifier, ACPResponse
+    p, backend, bridge, _, _ = loco
+    bridge.state = 0
+    entered, release = threading.Event(), threading.Event()
+    original = backend.target_feedback
+    posts = []
+    def core(payload):
+        posts.append(payload)
+        return ACPResponse(200, {'ok': True, 'action_id': payload['action_id']})
+    notifier = ACPNotifier(tmp_path / 'outbox', transport=core)
+    p._notifier = notifier
+    def feedback(stage, rid):
+        if stage == 'stand':
+            entered.set()
+            assert release.wait(3)
+        return original(stage, rid)
+    monkeypatch.setattr(backend, 'target_feedback', feedback)
+    try:
+        receipt = call(p, 'stand_up', request_id='async-public')
+        assert entered.wait(1)
+        assert receipt['action_id'] and receipt['status'] == 'running'
+        assert not receipt['completed']
+        assert 'ACP' in receipt['message'] and len(str(receipt)) < 700
+        assert p._tasks.get('async-public')['result'] is None
+        assert not posts
+        release.set()
+        assert terminal(p, 'async-public')['completed']
+        p._worker.join(1)
+        p._flush_notifications()
+        assert notifier.process_pending() == 1
+        assert len(posts) == 1
+        callback = posts[0]
+        assert callback['action_id'] == receipt['action_id']
+        assert callback['tool'] == 'loco_move'
+        assert callback['result']['completed']
+        assert 'stages' not in callback['result']
+        assert notifier.status(receipt['action_id'])['acknowledged']
+        assert notifier.process_pending() == 0
+        assert len(posts) == 1
+        # Full evidence remains in the durable task/info result.
+        assert len(p._tasks.get('async-public')['result']['stages']) == 2
+    finally:
+        release.set()
+        p._worker.join(4)
+        p._notifier = Notifier()
+        notifier.close()
+
+
+def test_compact_status_and_rejections_keep_diagnostics_in_info(loco):
+    import json
+    p, _, bridge, _, _ = loco
+    status = call(p, 'status')
+    detailed = call(p, 'info')
+    assert 'message' in status and 'readiness' not in status
+    assert 'events' not in status and 'operator_session' not in status
+    assert 'readiness' in detailed and 'events' in detailed
+    bridge.faults = [{'code': 33025}]
+    rejected = call(p, 'stand_up')
+    assert not rejected['accepted']
+    assert 'fresh_clear_fault_snapshot_required' in rejected['blocked_by']
+    assert 'message' in rejected and 'readiness' not in rejected
+    assert len(json.dumps(rejected)) < 1200

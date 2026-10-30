@@ -22,6 +22,7 @@ class AutomaticPreparation:
         self._thread = None
         self._failure_latched = False
         self._startup_observation_started = False
+        self._last_logged_status = None
         self._status = {'enabled': True, 'state': 'waiting', 'blocked_by': [],
                         'attempts': 0, 'sessions_prepared': 0,
                         'last_session_id': None, 'physical_command_sent': False}
@@ -37,10 +38,16 @@ class AutomaticPreparation:
 
     def _record(self, state, blocked=(), **fields):
         with self._lock:
-            changed = (self._status['state'], self._status['blocked_by']) != (state, list(blocked))
             self._status.update(state=state, blocked_by=list(blocked), **fields)
+            # A periodic retry transitions through preparing every five seconds.
+            # Log the meaningful outcome only when it changes, not every poll.
+            outcome = (state, tuple(blocked))
+            changed = state != 'preparing' and outcome != self._last_logged_status
+            if changed:
+                self._last_logged_status = outcome
         if changed:
-            logging.info('Automatic prepare: state=%s blocked_by=%s', state, list(blocked))
+            logging.info('Automatic prepare: %s%s', state,
+                         ' — ' + ', '.join(blocked) if blocked else '')
 
     def start(self):
         if self._thread is not None or not self.policy_enabled():

@@ -119,3 +119,18 @@ def test_real_policy_controls_supervisor_without_motion(policy, case):
 
 
 from test_s10_prepare_authorization import policy
+
+
+def test_identical_prepare_blocker_is_not_logged_on_every_retry(p, caplog):
+    import logging
+    p.blocked = ['fresh_clear_fault_snapshot_required']
+    supervisor = m.AutomaticPreparation(p)
+    with caplog.at_level(logging.INFO):
+        for _ in range(4):
+            supervisor.tick()
+        p.blocked = []
+        supervisor.tick()
+    lines = [record.getMessage() for record in caplog.records if 'Automatic prepare:' in record.getMessage()]
+    assert len(lines) == 2
+    assert 'fresh_clear_fault_snapshot_required' in lines[0]
+    assert 'session_active' in lines[1]

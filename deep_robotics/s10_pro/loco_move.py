@@ -11,9 +11,9 @@ except ImportError:
     from motion import MotionPlugin
     from parameters import validate_empty_arguments, validate_motion_request
 
-LOCO_TOOL, STAND_UP = 'loco_move', 'stand_up'
-PUBLIC_ACTIONS = ('info', 'start', 'stop', 'status', 'config', STAND_UP, 'stand_down', 'move', 'stop_move')
-ACTION_NAMES = {'lie': 'stand_down', DISTANCE_ACTION: 'move'}
+LOCO_TOOL, STAND_UP, SIT_DOWN = 'loco_move', 'stand_up', 'sitdown'
+PUBLIC_ACTIONS = ('info', 'start', 'stop', 'status', 'config', STAND_UP, SIT_DOWN, 'move', 'stop_move')
+ACTION_NAMES = {'lie': SIT_DOWN, 'stand_down': SIT_DOWN, DISTANCE_ACTION: 'move'}
 MOVE_FIELDS = frozenset(('direction', 'speed', 'duration'))
 
 class StandUpFailure(RuntimeError):
@@ -52,7 +52,7 @@ class LocoMovePlugin(CanvasPosturePlugin):
         # Canvas renders fields in schema insertion order; action stays first
         # while x-action-params reveals movement fields underneath it.
         props = {'action': {'type': 'string', 'enum': list(PUBLIC_ACTIONS),
-                            'description': 'Locomotion action'}}
+                            'description': 'Locomotion action; sitdown keeps the original lie-down behavior. Wait for ACP after an accepted motion instead of polling.'}}
         props.update({k: copy.deepcopy(v) for k, v in posture['inputSchema']['properties'].items()
                       if k in ('request_id', 'issued_at_ms', 'ttl_ms', 'instance_id', '_tool_name')})
         props.update(copy.deepcopy(timed['properties']))
@@ -60,7 +60,7 @@ class LocoMovePlugin(CanvasPosturePlugin):
         props['config'] = copy.deepcopy(posture['configSchema'])
         metadata = {'request_id', 'issued_at_ms', 'ttl_ms', 'instance_id', '_tool_name', 'action'}
         groups = [(['move'], metadata | {'direction', 'speed', 'duration'}),
-                  ([STAND_UP, 'stand_down', 'stop_move'], metadata),
+                  ([STAND_UP, SIT_DOWN, 'stop_move'], metadata),
                   (['start', 'config'], metadata | set(posture['configSchema']['properties']) | {'config'}),
                   (['info', 'status', 'stop'], {'action', 'instance_id', '_tool_name'})]
         conditions = []
@@ -76,14 +76,14 @@ class LocoMovePlugin(CanvasPosturePlugin):
                   'additionalProperties': False, 'allOf': conditions,
                   'x-action-params': {
                       STAND_UP: {'params': [], 'description': 'Stand up, confirm fresh stable state 1, then enter move mode 17. Already-ready state 17 sends no command. No velocity is sent.'},
-                      'stand_down': {'params': [], 'description': 'Lie down and wait for final idle state 0.'},
+                      SIT_DOWN: {'params': [], 'description': 'Lie down and wait for final idle state 0.'},
                       'move': {'params': ['direction', 'speed', 'duration'], 'description': 'Finite forward/backward movement or turn; requires stationary move mode and confirms stopping.'},
                       'stop_move': {'params': [], 'description': 'Cancel the active application task. Finite movement sends zero velocity and checks stopping; cancelling posture is not a physical stop guarantee.'}},
                   'x-resource': 'base', 'x-completion': {
-                      'actions': [STAND_UP, 'stand_down', 'move'], 'timeout': 20, 'silent_completion': False,
-                      'description': 'One task and ACP result for the complete action; stand_up completes only at reported move mode.'}}
+                      'actions': [STAND_UP, SIT_DOWN, 'move', 'stand_down'], 'timeout': 20, 'silent_completion': False,
+                      'description': 'Returns action_id after acceptance; completion arrives once through ACP. Do not poll or repeat an accepted command. stand_up completes only at reported move mode.'}}
         return {'name': LOCO_TOOL, 'title': 'S10 Locomotion', 'type': 'actuator', 'multiInstance': False,
-                'description': 'Stand up into move mode, lie down, perform finite movement, or cancel movement. Direction, speed and duration apply only to move and are ignored for other actions.',
+                'description': 'Stand up, sitdown (original lie-down), finite move, or cancel. Motion returns action_id and completes through ACP; do not poll after acceptance. status is concise; info is detailed diagnostics. Direction/speed/duration apply only to move.',
                 'inputSchema': schema, 'configSchema': posture['configSchema'], 'topic_in': [], 'topic_out': self._ports()}
 
     @staticmethod
@@ -93,7 +93,8 @@ class LocoMovePlugin(CanvasPosturePlugin):
     def _notification_payload(self, record):
         payload = super()._notification_payload(record)
         payload['tool'] = RELATIVE_MOVE_TOOL if record['request']['action'] == RELATIVE_ACTION else LOCO_TOOL
-        payload['result'] = self._public_record(payload['result'])
+        payload['result'] = (self._public_record(payload['result']) if payload['tool'] == RELATIVE_MOVE_TOOL
+                             else self._display_result(payload['result'], record['request']['action']))
         return payload
 
     def get_tools(self):
@@ -109,7 +110,7 @@ class LocoMovePlugin(CanvasPosturePlugin):
     def _loco_status(self, source=None):
         result = copy.deepcopy(source if source is not None else self.status())
         result.update(card=LOCO_TOOL, title='S10 Locomotion', topic_out=self._ports(),
-                      supported_actions=[STAND_UP, 'stand_down', 'move', 'stop_move'])
+                      supported_actions=[STAND_UP, SIT_DOWN, 'move', 'stop_move'])
         result['events'] = [self._public_record(e) for e in result['events'] if e.get('card') != RELATIVE_MOVE_TOOL]
         active = result.get('active_request')
         result['shared_controller_busy'] = active is not None
@@ -124,7 +125,7 @@ class LocoMovePlugin(CanvasPosturePlugin):
         if self._backend.feedback.observation().get('motion_state') not in (0, 1, 17):
             blockers.append('wait_for_idle_required')
         readiness['actions'] = {STAND_UP: {**old['stand'], 'ready': not blockers, 'blocked_by': list(dict.fromkeys(blockers))},
-                                'stand_down': old['lie'], 'move': old[DISTANCE_ACTION]}
+                                SIT_DOWN: old['lie'], 'move': old[DISTANCE_ACTION]}
         return result
 
     def _publish_status(self, payload):
@@ -137,6 +138,8 @@ class LocoMovePlugin(CanvasPosturePlugin):
         return super()._control_ok(action)
 
     def dispatch(self, action, args):
+        if action == 'stand_down':
+            action = SIT_DOWN  # Saved canvases retain the old alias.
         if args.get('_tool_name') == RELATIVE_MOVE_TOOL: return super().dispatch(action, args)
         if args.get('_tool_name') not in (None, LOCO_TOOL): raise ValueError('Retired tool; migrate to loco_move')
         if action not in PUBLIC_ACTIONS and action not in ('prepare', 'prepare_automatic'):
@@ -147,16 +150,72 @@ class LocoMovePlugin(CanvasPosturePlugin):
             # parameters still pass through the original strict validators.
             args = {key: value for key, value in args.items() if key not in MOVE_FIELDS}
         if action in ('info', 'status'):
-            validate_empty_arguments(args); return self._loco_status()
+            validate_empty_arguments(args)
+            status = self._loco_status()
+            return status if action == 'info' else self._summary(status)
         if action in ('config', 'start', 'stop'):
-            super().dispatch(action, args); return self._loco_status()
+            super().dispatch(action, args); return self._summary(self._loco_status(), include_settings=True)
         if action == 'stop_move':
-            validate_motion_request('stopmotion', args, self._settings, self._wall); return self.cancel()
-        if action == STAND_UP: return self.execute(STAND_UP, args)
-        if action == 'stand_down': return self._public_record(self.execute('lie', args))
-        if action == 'move': return self._public_record(self.execute(DISTANCE_ACTION, args))
+            validate_motion_request('stopmotion', args, self._settings, self._wall); return self._display_result(self.cancel(), action)
+        if action == STAND_UP: return self._display_result(self.execute(STAND_UP, args), action)
+        if action == SIT_DOWN: return self._display_result(self.execute('lie', args), action)
+        if action == 'move': return self._display_result(self.execute(DISTANCE_ACTION, args), action)
         if args.get('_tool_name') is not None: raise ValueError('Prepare is private to the supervisor')
         return super().dispatch(action, args)
+
+    @staticmethod
+    def _blocker_text(blockers):
+        messages = {
+            'card_not_enabled': 'Enable and start the card first.',
+            'operator_session_unavailable': 'Waiting for an authorized Prepare session.',
+            'fresh_clear_fault_snapshot_required': 'Robot fault feedback is missing, stale or reports a fault; check robot diagnostics.',
+            'driver_error_requires_review': 'The previous failure requires review before another motion.',
+            'operator_intervention_required': 'Review the previous failed motion and confirm the robot is stationary.',
+            'fresh_stationary_feedback_required': 'Waiting for fresh stationary feedback.',
+            'stationary_move_mode_required': 'Movement requires stationary move mode.',
+            'move_mode_required': 'Run stand_up and wait for its ACP completion first.',
+            'active_motion_task_in_progress': 'A motion is still running; wait for ACP or cancel it.',
+        }
+        return ' '.join(dict.fromkeys(messages.get(b, b.replace('_', ' ') + '.') for b in blockers))
+
+    def _display_result(self, record, action):
+        """Keep protocol identity and outcome; leave full evidence in durable info."""
+        record = self._public_record(record)
+        keys = ('action_id', 'original_action_id', 'request_id', 'action', 'accepted',
+                'state', 'status', 'completed', 'confirmed', 'stop_confirmed',
+                'reason', 'blocked_by', 'failed_stage', 'failure_phase', 'replayed', 'terminal', 'physical_command_sent')
+        result = {k: record[k] for k in keys if k in record}
+        result.setdefault('action', ACTION_NAMES.get(action, action))
+        if result.get('action_id') and result.get('status') == 'running':
+            result['message'] = 'Command accepted. Wait for its ACP completion; do not poll or resend.'
+        elif result.get('completed'):
+            result['message'] = 'Command completed; required robot feedback was confirmed.'
+        elif result.get('state') == 'busy':
+            result['message'] = 'Another motion is running. Wait for ACP or use stop_move.'
+        elif result.get('blocked_by'):
+            result['message'] = self._blocker_text(result['blocked_by'])
+        elif result.get('reason') == 'reported_stop_not_confirmed':
+            result['message'] = 'Stop was not confirmed. Check the robot and use info for diagnostics.'
+        else:
+            result['message'] = str(result.get('reason', result.get('state', 'Command result'))).replace('_', ' ')
+        return result
+
+    def _summary(self, status, *, include_settings=False):
+        readiness = status['readiness']
+        blocked = readiness['blocked_by']
+        result = {'card': LOCO_TOOL, 'state': status['state'],
+                'enabled': status['settings']['enabled'], 'ready': readiness['ready'],
+                'topic_out': [],
+                'active_request': ({k: self._public_record(status['active_request']).get(k)
+                                    for k in ('action_id', 'request_id', 'action')}
+                                   if status.get('active_request') else None),
+                'last_result': (self._display_result(status['last_result'], status['last_result']['action'])
+                                if status.get('last_result') else None),
+                'blocked_by': blocked,
+                'message': self._blocker_text(blocked) if blocked else 'Ready. Motion completion is reported through ACP.'}
+        if include_settings:
+            result['settings'] = status['settings']
+        return result
 
     def execute(self, action, arguments):
         if action != STAND_UP: return super().execute(action, arguments)

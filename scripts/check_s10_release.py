@@ -67,7 +67,7 @@ def check_release(context: Path | None = None) -> dict:
         assert schema['properties']['direction']['enum'] == [
             'forward', 'backward', 'turn_left', 'turn_right']
         jsonschema.validate({'action': 'stand_up', 'direction': 'forward'}, schema)
-        assert schema['x-completion']['actions'] == ['stand_up', 'stand_down', 'move']
+        assert schema['x-completion']['actions'] == ['stand_up', 'sitdown', 'move', 'stand_down']
         assert not any(p._backend.transport.status().get('worker_running')
                        for p in plugins if hasattr(p, '_backend'))
     finally:

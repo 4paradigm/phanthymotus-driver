@@ -19,7 +19,7 @@ One `loco_move` actuator exposes these actions:
 | Action | Behavior |
 | --- | --- |
 | stand_up | State 0: request 1, observe its fresh post-send feedback, wait until stationary, then request 17 and observe its fresh post-send feedback. State 1: only perform the second stage. Stationary state 17: succeed without sending a posture or velocity command. |
-| stand_down | Request lie and wait for final state 0, not intermediate state 4. |
+| sitdown | Request lie and wait for final state 0, not intermediate state 4. |
 | move | Existing forward/backward/in-place-turn finite motion with direction, speed and duration. It still requires stationary move mode; it never stands automatically. |
 | stop_move | Cancel the active application request. An active finite move sends zero commands and checks stopped feedback through its existing worker. With no active request, it reports no application motion; it does not claim to stop external or vendor motion. |
 | info, status, config, start, stop | Existing controller configuration and observation lifecycle. |
@@ -44,7 +44,7 @@ The standard bundle has eight public tools in total.
 | --- | --- |
 | motion / stand | loco_move / stand_up (now includes entering move mode) |
 | motion / move_mode | loco_move / stand_up |
-| motion / lie | loco_move / stand_down |
+| motion / lie | loco_move / sitdown |
 | timed_move / implicit tool action | loco_move / action=move, retaining direction/speed/duration |
 | motion or timed_move status port | Removed; use loco_move info/status |
 | motion or timed_move event port | Removed; action completion uses ACP |
@@ -105,3 +105,29 @@ legacy explicit policies are not auto-activated. Per-stage action permits and
 all live telemetry checks remain unchanged. See ../README_AUTOMATIC_PREPARE.md.
 A failed stand_up reports failed_stage, failure_phase, reason and blocked_by;
 raw exception messages and authorization credentials are not included.
+
+## Concise action replies and ACP compatibility
+
+The public downward action is `sitdown`, retaining the original lie-down
+command and final state 0; the name does not add a separate seated posture.
+The retired `stand_down` call remains a compatibility alias for saved workflows,
+including ACP tracking, but is not advertised in the action dropdown.
+
+`stand_up`, `sitdown` and `move` return an accepted running `action_id` after
+preflight, then finish in the worker and report the terminal outcome through ACP.
+Do not poll or resubmit an accepted command. The acceptance reply is not physical
+completion. Replayed terminal requests retain original identity and do not
+register a new pending action. Failed or cancelled tasks report that outcome.
+
+`status`, lifecycle replies and ordinary action/ACP results are concise, with a
+human-readable `message` and protocol identity/status/reason. `info` retains
+full readiness, events and stop evidence; task storage is unchanged. Automatic
+Prepare logs a repeated blocker only when the meaningful outcome changes.
+
+The official legacy Core returns precisely `{ok: true, action_id: ...}` after
+accepting an ACP POST. This endpoint receipt is accepted without pretending it
+means matched/cached/duplicate. Newer explicit receipt states remain supported.
+A matching successful legacy receipt is not retried: retrying it can repeatedly
+wake the agent. Network failures still have bounded retries with unchanged IDs;
+the legacy endpoint does not guarantee duplicate suppression if an ACK is lost.
+No Core source change or blanket silencing of failures is introduced.

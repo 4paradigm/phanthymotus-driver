@@ -19,3 +19,5 @@ tests/test_s10_motion_card_deploy.py
 tests/test_s10_review_deployment.py
 tests/test_s10_container_contract.py
 tests/test_s10_pr_update.py
+tests/test_s10_acp_delivery.py
+tests/test_s10_motion_acp.py

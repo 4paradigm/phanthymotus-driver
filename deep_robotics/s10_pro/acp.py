@@ -3,7 +3,8 @@
 This module never creates actions or publishes robot commands. One owner process
 uses one outbox file. A terminal payload is immutable once submitted; network
 retries use the same action ID and bytes. Core's matched/cached/duplicate receipt
-provides deduplication, including an early callback or a lost acknowledgement.
+provides deduplication when supported. The older exact {ok, action_id} receipt
+confirms endpoint acceptance only; successful delivery must not cause retries.
 
 Construction performs no network I/O. Call ``start()`` explicitly in the driver,
 or ``process_pending()`` in an isolated test. Pending records survive restart.
@@ -330,6 +331,13 @@ class ACPNotifier:
         if not isinstance(response, ACPResponse) or isinstance(response.http_status, bool) or not isinstance(response.http_status, int) or not 200 <= response.http_status < 300:
             raise ACPDeliveryError("http_rejected", "ACP endpoint did not return a successful HTTP response.")
         body = response.body
+        # The official Core release.261023.3a3567a endpoint returns precisely
+        # these two fields. It already enqueues completion before returning.
+        # Requiring a newer `state` field retries an accepted callback and can
+        # repeatedly wake that Core's agent. Do not infer matched/cached here.
+        if (isinstance(body, dict) and set(body) == {'ok', 'action_id'}
+                and body['ok'] is True and body['action_id'] == action_id):
+            return 'endpoint_accepted'
         if (not isinstance(body, dict) or body.get("ok") is not True
                 or body.get("action_id") != action_id or not isinstance(body.get("state"), str)
                 or body["state"] not in ACK_STATES):

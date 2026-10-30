@@ -467,3 +467,44 @@ def test_no_console_output_or_secrets_in_delivery_record(tmp_path, capsys):
         assert capsys.readouterr().err == ""
     finally:
         notifier.close()
+
+
+def test_official_legacy_core_receipt_stops_repeated_agent_wakeups(tmp_path):
+    clock, posts = Clock(), []
+    def legacy_core(payload):
+        posts.append(copy.deepcopy(payload))
+        return ACPResponse(200, {'ok': True, 'action_id': payload['action_id']})
+    notifier = ACPNotifier(tmp_path / 'legacy-core-outbox', transport=legacy_core, clock=clock)
+    try:
+        notifier.submit(terminal())
+        assert notifier.process_pending() == 1
+        record = notifier.status('s10-action-1')
+        assert record['acknowledged']
+        assert record['receipt_state'] == 'endpoint_accepted'
+        # Do not claim the old Core retained an early callback or deduplicated it.
+        assert record['receipt_state'] not in ('matched', 'cached', 'duplicate')
+        for _ in range(15):
+            clock.advance()
+            notifier.submit(terminal())
+            assert notifier.process_pending() == 0
+        assert len(posts) == 1
+    finally:
+        notifier.close()
+
+
+@pytest.mark.parametrize('body', [
+    {'ok': True, 'action_id': 's10-action-1', 'state': None},
+    {'ok': True, 'action_id': 's10-action-1', 'error': 'rejected'},
+    {'ok': True, 'action_id': 'wrong'},
+    {'ok': 1, 'action_id': 's10-action-1'},
+])
+def test_legacy_receipt_compatibility_never_accepts_ambiguous_response(tmp_path, body):
+    notifier = ACPNotifier(tmp_path / 'invalid-core-outbox',
+                           transport=lambda payload: ACPResponse(200, body))
+    try:
+        notifier.submit(terminal())
+        notifier.process_pending()
+        assert not notifier.status('s10-action-1')['acknowledged']
+        assert notifier.status('s10-action-1')['last_error_code'] == 'invalid_ack'
+    finally:
+        notifier.close()
