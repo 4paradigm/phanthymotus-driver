@@ -312,7 +312,7 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert stream_status["lidar"]["received"] == stream_status["lidar"]["published"] == 1
     assert stream_status["camera_0"]["received"] == stream_status["camera_0"]["published"] == 1
     assert "/s10/front/image" in nodes.robot.subscriptions
-    assert nodes._source_topics["camera_0"] == "/s10/front/image"
+    assert nodes._source_topics["camera_0"] == "/CAMERA/RAW"
     assert nodes._source_topics["camera_1"] == "/s10/rear/image/compressed"
     assert nodes._source_topics["camera_2"] == "/s10/left/image"
     assert nodes._source_topics["camera_3"] == "/s10/right/image"
@@ -366,6 +366,13 @@ def test_camera_ros_image_encodes_to_frontend_jpeg(monkeypatch):
     assert encoded.startswith(b"\xff\xd8") and encoded.endswith(b"\xff\xd9")
 
 
+def test_compressed_jpeg_is_forwarded_without_reencoding(monkeypatch):
+    _load_device(monkeypatch)
+    import media_workers
+    payload = b"\xff\xd8already-encoded\xff\xd9"
+    assert media_workers._reencode_jpeg(payload) == payload
+
+
 def test_model_resource_returns_official_urdf(monkeypatch):
     device = _load_device(monkeypatch)
     result = device.S10ModelPlugin().dispatch("model", {})
@@ -373,10 +380,132 @@ def test_model_resource_returns_official_urdf(monkeypatch):
     assert root.tag == "robot" and root.get("name") == "S10"
     assert all(child.tag in {"link", "joint", "material"} for child in root)
     assert root.find("joint[@name='fl_hipx_joint']") is not None
+    for name in ("front_marker_tip", "front_marker_left", "front_marker_right", "front_marker_close"):
+        assert root.find(f"link[@name='{name}']") is not None
+    assert root.find("joint[@name='front_marker_tip_joint']") is not None
+    marker_origins = [tuple(map(float, root.find(f"joint[@name='front_marker_{name}_joint']/origin").get("xyz").split()))
+                      for name in ("tip", "left", "right", "close")]
+    assert all(sum(value * value for value in origin) >= 0.005 ** 2 for origin in marker_origins)
     checker = shutil.which("check_urdf")
     if checker:
         urdf_path = DRIVER / "resource" / "S10.urdf"
         subprocess.run([checker, str(urdf_path)], check=True, capture_output=True, text=True)
+
+
+def test_camera_config_has_four_directional_lanes_and_common_aliases():
+    config = yaml.safe_load((DRIVER / "config.yaml").read_text())
+    cameras = config["camera_topics"]
+    assert set(cameras) == {f"camera_{index}" for index in range(4)}
+    for index, direction in enumerate(("front", "rear", "left", "right")):
+        assert f"/camera/{direction}/color/image_raw" in cameras[f"camera_{index}"]
+        assert f"/camera_{index}/image_raw" in cameras[f"camera_{index}"]
+
+
+def test_discovered_unclassified_camera_topics_reserve_distinct_lanes(monkeypatch):
+    device = _load_device(monkeypatch)
+    nodes = device.S10Nodes.__new__(device.S10Nodes)
+    nodes._configured_camera_lanes = {}
+    nodes._camera_topic_lanes = {}
+
+    lanes = [nodes._assign_camera_lane(f"/stream/camera_{index}/image")
+             for index in range(4)]
+
+    assert lanes == ["camera_0", "camera_1", "camera_2", "camera_3"]
+
+
+def test_camera_lane_recognizes_numbered_camera_topic_independent_of_discovery_order(monkeypatch):
+    device = _load_device(monkeypatch)
+    nodes = device.S10Nodes.__new__(device.S10Nodes)
+    nodes._configured_camera_lanes = {}
+    nodes._camera_topic_lanes = {}
+
+    assert nodes._assign_camera_lane("/camera_3/image_raw") == "camera_3"
+    assert nodes._assign_camera_lane("/camera_1/image_raw") == "camera_1"
+    assert nodes._assign_camera_lane("/usb/camera_2/image") == "camera_2"
+    assert nodes._assign_camera_lane("/camera_0/image_raw") == "camera_0"
+
+
+def test_light_cycle_controls_use_scalar_visibility_conditions(monkeypatch):
+    device = _load_device(monkeypatch)
+
+    class Native:
+        def __init__(self): self.sent = None
+        def send(self, *args):
+            self.sent = args
+            return {"state": "sent"}
+
+    native = Native()
+    plugin = device.S10LightPlugin(native)
+    schema = plugin.get_tool()["inputSchema"]
+    properties = schema["properties"]
+    assert properties["head_breathe_cycle_seconds"]["x-show-when"] == {"head_effect": "呼吸"}
+    assert properties["head_blink_cycle_seconds"]["x-show-when"] == {"head_effect": "闪烁"}
+    assert properties["tail_breathe_cycle_seconds"]["x-show-when"] == {"tail_effect": "呼吸"}
+    assert properties["tail_blink_cycle_seconds"]["x-show-when"] == {"tail_effect": "闪烁"}
+    assert all(not isinstance(condition, list)
+               for key in properties if key.endswith("cycle_seconds")
+               for condition in properties[key]["x-show-when"].values())
+
+    plugin.dispatch("set", {"head_effect": "常亮", "tail_effect": "闪烁",
+                             "tail_blink_cycle_seconds": 3})
+    assert "Cycle" not in native.sent[2]["Led"][0]
+    assert native.sent[2]["Led"][1]["Cycle"] == 3
+
+
+def test_media_worker_replaces_stale_queued_frame_without_reporting_failure(monkeypatch):
+    device = _load_device(monkeypatch)
+
+    class FullQueue:
+        def __init__(self):
+            self.items = ["stale"]
+        def put_nowait(self, item):
+            if self.items:
+                import queue
+                raise queue.Full
+            self.items.append(item)
+        def get_nowait(self):
+            return self.items.pop(0)
+
+    workers = device.MediaWorkers.__new__(device.MediaWorkers)
+    workers._jobs = {"camera_0": FullQueue()}
+    workers._closed = False
+
+    assert workers.submit("camera_0", "fresh") is True
+    assert workers._jobs["camera_0"].items == ["fresh"]
+
+
+def test_media_worker_result_queue_replaces_stale_frame(monkeypatch):
+    device = _load_device(monkeypatch)
+
+    class FullQueue:
+        def __init__(self):
+            self.items = [("camera_0", "old", b"old")]
+        def put_nowait(self, item):
+            if self.items:
+                import queue
+                raise queue.Full
+            self.items.append(item)
+        def get_nowait(self):
+            return self.items.pop(0)
+
+    results = FullQueue()
+    from media_workers import _put_latest
+    assert _put_latest(results, ("camera_0", "new", b"new")) is True
+    assert results.items == [("camera_0", "new", b"new")]
+
+
+def test_media_worker_uses_independent_result_queue_per_lane():
+    import ast
+
+    source = (DRIVER / "media_workers.py").read_text()
+    module = ast.parse(source)
+    method = next(node for node in module.body if isinstance(node, ast.ClassDef)
+                  and node.name == "MediaWorkers")
+    add_method = next(node for node in method.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "_add")
+    source_text = ast.get_source_segment(source, add_method)
+    assert "results = self._ctx.Queue(maxsize=1)" in source_text
+    assert "self._results[lane] = results" in source_text
 
 
 def test_main_builds_constrained_fastdds_profile_before_runtime(monkeypatch, tmp_path):
@@ -946,12 +1075,13 @@ def test_control_schema_exposes_supported_navigation_and_light_options(monkeypat
     assert set(localize_params) == {"x", "y", "z", "yaw_degrees", "confirm"}
     assert {"head_color", "tail_color", "head_effect", "tail_effect"} <= set(light_params)
     assert set(actions) == {"set"}
-    assert {"head_cycle_seconds", "tail_cycle_seconds"} <= set(light_params)
+    assert {"head_breathe_cycle_seconds", "head_blink_cycle_seconds",
+            "tail_breathe_cycle_seconds", "tail_blink_cycle_seconds"} <= set(light_params)
     assert light_tool["name"] == "light"
     properties = light_tool["inputSchema"]["properties"]
     assert properties["head_effect"]["enum"] == list(device.LIGHT_EFFECTS)
-    assert properties["head_cycle_seconds"]["x-show-when"] == {
-        "head_effect": ["呼吸", "闪烁"]}
+    assert properties["head_breathe_cycle_seconds"]["x-show-when"] == {"head_effect": "呼吸"}
+    assert properties["head_blink_cycle_seconds"]["x-show-when"] == {"head_effect": "闪烁"}
 
     charge_schema = device.S10ChargePlugin(native).get_tool()["inputSchema"]
     assert charge_schema["x-is-dangerous"] is True
@@ -966,7 +1096,8 @@ def test_light_uses_named_colors_and_effects_in_native_protocol(monkeypatch):
     plugin.dispatch("set", {"head_color": "绿色", "tail_color": "蓝色",
                                            "head_effect": "呼吸",
                                            "tail_effect": "闪烁",
-                                           "head_cycle_seconds": 3, "tail_cycle_seconds": 2})
+                                           "head_breathe_cycle_seconds": 3,
+                                           "tail_blink_cycle_seconds": 2})
 
     assert native.calls[-1][0] == (0x00100005, 0x00200002, {
         "CustomMode": True,
@@ -1002,7 +1133,7 @@ def test_light_single_action_can_mix_static_and_cyclic_side(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
     device.S10LightPlugin(native).dispatch("set", {
-        "head_effect": "闪烁", "head_cycle_seconds": 4,
+        "head_effect": "闪烁", "head_blink_cycle_seconds": 4,
         "tail_effect": "常亮",
     })
     leds = native.calls[-1][0][2]["Led"]

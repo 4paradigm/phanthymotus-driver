@@ -107,10 +107,22 @@ class S10Nodes:
         # semantic front/rear/left/right names. Subscribe to all known
         # aliases; the first active source wins without blocking the others.
         camera_topics = dict(config.get("camera_topics", {
-            "camera_0": ["/camera/front/image_raw", "/camera_front/image_raw", "/usb_camera_1/image_raw"],
-            "camera_1": ["/camera/rear/image_raw", "/camera_back/image_raw", "/usb_camera_1/image_raw_0"],
-            "camera_2": ["/camera/left/image_raw", "/camera_left/image_raw", "/usb_camera_1/image_raw_1"],
-            "camera_3": ["/camera/right/image_raw", "/camera_right/image_raw", "/usb_camera_1/image_raw_2"],
+            "camera_0": ["/camera/front/image_raw", "/camera/front/image_raw/compressed",
+                         "/camera/front/color/image_raw", "/camera/front/color/image_raw/compressed",
+                         "/camera_front/image_raw", "/camera_0/image_raw",
+                         "/usb_camera_1/image_raw", "/usb_camera_1/image_raw/compressed"],
+            "camera_1": ["/camera/rear/image_raw", "/camera/rear/image_raw/compressed",
+                         "/camera/rear/color/image_raw", "/camera/rear/color/image_raw/compressed",
+                         "/camera_back/image_raw", "/camera_1/image_raw",
+                         "/usb_camera_1/image_raw_0", "/usb_camera_1/image_raw_0/compressed"],
+            "camera_2": ["/camera/left/image_raw", "/camera/left/image_raw/compressed",
+                         "/camera/left/color/image_raw", "/camera/left/color/image_raw/compressed",
+                         "/camera_left/image_raw", "/camera_2/image_raw",
+                         "/usb_camera_1/image_raw_1", "/usb_camera_1/image_raw_1/compressed"],
+            "camera_3": ["/camera/right/image_raw", "/camera/right/image_raw/compressed",
+                         "/camera/right/color/image_raw", "/camera/right/color/image_raw/compressed",
+                         "/camera_right/image_raw", "/camera_3/image_raw",
+                         "/usb_camera_1/image_raw_2", "/usb_camera_1/image_raw_2/compressed"],
         }))
         for index in range(4):
             camera_topics.setdefault(f"camera_{index}", [])
@@ -147,6 +159,7 @@ class S10Nodes:
                                 durability=DurabilityPolicy.VOLATILE)
         self._sensor_qos = stream_qos
         self._stream_lock = threading.Lock()
+        self._camera_source_lock = threading.Lock()
         self._stream_stats = {
             name: {"received": 0, "published": 0, "dropped": 0,
                    "last_received": None, "last_published": None}
@@ -176,8 +189,14 @@ class S10Nodes:
             topic: key for key, values in camera_topics.items()
             for topic in ([values] if isinstance(values, str) else values)
         }
+        # Reserve lane assignments while scanning the ROS graph, but only let
+        # a lane's first callback claim its active source. This avoids assigning
+        # several newly discovered image topics to camera_0 before any frame arrives.
+        self._camera_topic_lanes = {}
         self._configured_lidar_topics = set(self._lidar_topics)
         self._media_topic_subscriptions = set()
+        self._media_topic_types = {}
+        self._media_subscription_handles = {}
         self._discovered_media = set()
         self._media_subscriptions = []
         self._camera_lane_sources = {}
@@ -188,23 +207,37 @@ class S10Nodes:
             if topic in self._media_topic_subscriptions:
                 continue
             msg_type = CompressedImage if topic.endswith("/compressed") else Image
-            if msg_type is CompressedImage:
-                callback = lambda msg, camera=key: self._forward_compressed_camera(camera, msg)
-            else:
-                callback = lambda msg, camera=key: self._forward_camera(camera, msg)
-            self._media_subscriptions.append(self.robot.create_subscription(
-                msg_type, topic, callback, self._sensor_qos))
+            callback = lambda msg, camera=key, source=topic: self._forward_camera_alias(
+                camera, source, msg)
+            handle = self.robot.create_subscription(msg_type, topic, callback, self._sensor_qos)
+            self._media_subscriptions.append(handle)
             self._media_topic_subscriptions.add(topic)
-            self._source_topics.setdefault(key, topic)
+            self._media_topic_types[topic] = msg_type
+            self._media_subscription_handles[topic] = handle
+            if not self._source_topics.get(key):
+                self._source_topics[key] = topic
         for topic in self._configured_lidar_topics:
             if topic in self._media_topic_subscriptions:
                 continue
-            self._media_subscriptions.append(self.robot.create_subscription(
+            handle = self.robot.create_subscription(
                 PointCloud2, topic,
-                lambda msg, source=topic: self._forward_lidar(source, msg), self._sensor_qos))
+                lambda msg, source=topic: self._forward_lidar(source, msg), self._sensor_qos)
+            self._media_subscriptions.append(handle)
             self._media_topic_subscriptions.add(topic)
-        print(f"[ros2] media subscriptions ready: cameras={sum(k.startswith('camera_') for k in self._camera_lane_sources)} "
-              f"lidar_topics={len(self._media_topic_subscriptions) - len(self._camera_lane_sources)}", flush=True)
+            self._media_topic_types[topic] = PointCloud2
+            self._media_subscription_handles[topic] = handle
+        camera_subscriptions = sum(
+            1 for topic in self._media_topic_subscriptions
+            if topic in self._configured_camera_lanes or
+            topic in self._camera_topic_lanes
+        )
+        lidar_subscriptions = sum(
+            1 for topic in self._media_topic_subscriptions
+            if topic not in self._configured_camera_lanes and
+            topic not in self._camera_topic_lanes
+        )
+        print(f"[ros2] media subscriptions ready: camera_topics={camera_subscriptions} "
+              f"lidar_topics={lidar_subscriptions} lanes=4", flush=True)
         if hasattr(self.robot, "create_timer"):
             self._media_discovery_timer = self.robot.create_timer(2.0, self._scan_media_topics)
 
@@ -217,9 +250,11 @@ class S10Nodes:
         from sensor_msgs.msg import CompressedImage, Image, PointCloud2
         for topic, type_names in discovered:
             types = set(type_names)
-            if "sensor_msgs/msg/PointCloud2" in types and topic not in self._media_topic_subscriptions:
+            if "sensor_msgs/msg/PointCloud2" in types:
                 identity = (topic, "lidar")
                 if identity in self._discovered_media:
+                    continue
+                if topic in self._media_topic_subscriptions:
                     continue
                 self._discovered_media.add(identity)
                 if topic not in self._lidar_topics:
@@ -235,36 +270,76 @@ class S10Nodes:
                         Image if "sensor_msgs/msg/Image" in types else None)
             if msg_type is None:
                 continue
-            key = self._configured_camera_lanes.get(topic) or self._camera_key_for_topic(topic)
-            if key is None:
-                key = next((f"camera_{index}" for index in range(4)
-                            if f"camera_{index}" not in self._camera_lane_sources), None)
-            elif key in self._camera_lane_sources and self._camera_lane_sources[key] != topic:
+            key = self._assign_camera_lane(topic)
+            if key in self._camera_lane_sources and self._camera_lane_sources[key] != topic:
                 print(f"[ros2] ignoring duplicate camera lane {key}: {topic}", flush=True)
                 continue
             if key is None:
                 print(f"[ros2] ignoring extra camera topic (four lanes are occupied): {topic}", flush=True)
                 continue
+            if topic in self._media_topic_subscriptions:
+                if self._media_topic_types.get(topic) is msg_type:
+                    continue
+                old_handle = self._media_subscription_handles.get(topic)
+                if old_handle is not None and hasattr(self.robot, "destroy_subscription"):
+                    self.robot.destroy_subscription(old_handle)
+                self._media_subscriptions = [handle for handle in self._media_subscriptions
+                                             if handle is not old_handle]
+                self._media_topic_subscriptions.discard(topic)
             identity = (topic, key)
             if identity in self._discovered_media:
                 continue
             self._discovered_media.add(identity)
-            if msg_type is CompressedImage:
-                callback = lambda msg, camera=key: self._forward_compressed_camera(camera, msg)
-            else:
-                callback = lambda msg, camera=key: self._forward_camera(camera, msg)
-            self._media_subscriptions.append(self.robot.create_subscription(
-                msg_type, topic, callback, self._sensor_qos))
+            callback = lambda msg, camera=key, source=topic: self._forward_camera_alias(
+                camera, source, msg)
+            handle = self.robot.create_subscription(msg_type, topic, callback, self._sensor_qos)
+            self._media_subscriptions.append(handle)
             self._media_topic_subscriptions.add(topic)
-            self._source_topics[key] = topic
-            self._camera_lane_sources[key] = topic
+            self._media_topic_types[topic] = msg_type
+            self._media_subscription_handles[topic] = handle
+            if not self._source_topics.get(key):
+                self._source_topics[key] = topic
             print(f"[ros2] discovered {key} subscription: {topic} ({msg_type.__name__})", flush=True)
+
+    def _forward_camera_alias(self, key, topic, msg):
+        """Use the first active configured alias for each physical camera lane."""
+        from sensor_msgs.msg import CompressedImage
+
+        with self._camera_source_lock:
+            source = self._camera_lane_sources.get(key)
+            if source is not None and source != topic:
+                return
+            self._camera_lane_sources[key] = topic
+            self._camera_topic_lanes[topic] = key
+            self._source_topics[key] = topic
+        self._record_stream(key, "received")
+        if isinstance(msg, CompressedImage):
+            self._forward_compressed_camera(key, msg, already_received=True)
+        else:
+            self._forward_camera(key, msg, already_received=True)
+
+    def _assign_camera_lane(self, topic):
+        key = self._configured_camera_lanes.get(topic) or self._camera_topic_lanes.get(topic)
+        if key is None:
+            key = self._camera_key_for_topic(topic)
+        if key is None:
+            reserved = set(self._camera_topic_lanes.values())
+            key = next((f"camera_{index}" for index in range(4)
+                        if f"camera_{index}" not in reserved), None)
+        if key is not None:
+            self._camera_topic_lanes[topic] = key
+        return key
 
     @staticmethod
     def _camera_key_for_topic(topic):
         name = topic.lower()
         import re
         tokens = set(filter(None, re.split(r"[^a-z0-9]+", name)))
+        numbered = re.search(r"(?:^|[/_])camera[_-]?(\d+)(?:$|[/_])", name)
+        if numbered:
+            index = int(numbered.group(1))
+            if 0 <= index < 4:
+                return f"camera_{index}"
         for directions, key in ((("front", "forward"), "camera_0"),
                                 (("rear", "back", "backward"), "camera_1"),
                                 (("left",), "camera_2"),
@@ -436,8 +511,9 @@ class S10Nodes:
         except (ValueError, OSError):
             return None
 
-    def _forward_camera(self, key, msg):
-        self._record_stream(key, "received")
+    def _forward_camera(self, key, msg, already_received=False):
+        if not already_received:
+            self._record_stream(key, "received")
         if self.media_workers is not None:
             header = (msg.header.frame_id, msg.header.stamp.sec, msg.header.stamp.nanosec)
             submitted = self.media_workers.submit(
@@ -457,8 +533,9 @@ class S10Nodes:
         self.camera_publishers[key].publish(output)
         self._record_stream(key, "published")
 
-    def _forward_compressed_camera(self, key, msg):
-        self._record_stream(key, "received")
+    def _forward_compressed_camera(self, key, msg, already_received=False):
+        if not already_received:
+            self._record_stream(key, "received")
         if self.media_workers is not None:
             header = (msg.header.frame_id, msg.header.stamp.sec, msg.header.stamp.nanosec)
             submitted = self.media_workers.submit(key, (header, bytes(msg.data)))
@@ -1215,7 +1292,8 @@ LIGHT_CYCLIC_EFFECTS = {name: LIGHT_EFFECTS[name] for name in ("呼吸", "闪烁
 class S10LightPlugin:
     ACTIONS = {
         "set": (["head_color", "tail_color", "head_effect", "tail_effect",
-                 "head_cycle_seconds", "tail_cycle_seconds"],
+                 "head_breathe_cycle_seconds", "head_blink_cycle_seconds",
+                 "tail_breathe_cycle_seconds", "tail_blink_cycle_seconds"],
                 "设置头尾灯颜色和效果；呼吸或闪烁时才设置周期"),
     }
 
@@ -1226,12 +1304,18 @@ class S10LightPlugin:
             "tail_color": {"type": "string", "enum": list(LIGHT_COLORS), "default": "白色", "description": "尾灯颜色"},
             "head_effect": {"type": "string", "enum": list(LIGHT_EFFECTS), "default": "常亮", "description": "头灯效果"},
             "tail_effect": {"type": "string", "enum": list(LIGHT_EFFECTS), "default": "常亮", "description": "尾灯效果"},
-            "head_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
-                                    "description": "头灯呼吸/闪烁周期（秒）",
-                                    "x-show-when": {"head_effect": ["呼吸", "闪烁"]}},
-            "tail_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
-                                    "description": "尾灯呼吸/闪烁周期（秒）",
-                                    "x-show-when": {"tail_effect": ["呼吸", "闪烁"]}},
+            "head_breathe_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
+                                    "description": "头灯呼吸周期（秒）",
+                                    "x-show-when": {"head_effect": "呼吸"}},
+            "head_blink_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
+                                    "description": "头灯闪烁周期（秒）",
+                                    "x-show-when": {"head_effect": "闪烁"}},
+            "tail_breathe_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
+                                    "description": "尾灯呼吸周期（秒）",
+                                    "x-show-when": {"tail_effect": "呼吸"}},
+            "tail_blink_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
+                                    "description": "尾灯闪烁周期（秒）",
+                                    "x-show-when": {"tail_effect": "闪烁"}},
         }))
         return result
     def start(self): pass
@@ -1252,7 +1336,13 @@ class S10LightPlugin:
                     "Color": [LIGHT_COLORS[args.get(f"{side}_color", "白色")]],
                 }
                 if effect_name in LIGHT_CYCLIC_EFFECTS:
-                    led["Cycle"] = int(args.get(f"{side}_cycle_seconds", 1))
+                    cycle_kind = "breathe" if effect_name == "呼吸" else "blink"
+                    cycle = args.get(f"{side}_{cycle_kind}_cycle_seconds")
+                    # Accept the pre-conditional field for old callers, but do
+                    # not expose it in the card schema.
+                    if cycle is None:
+                        cycle = args.get(f"{side}_cycle_seconds", 1)
+                    led["Cycle"] = int(cycle)
                 leds.append(led)
             # The Pro firmware applies this command but does not send an ASDU
             # response. Use the native fire-and-forget path so a successful

@@ -31,22 +31,6 @@
           rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
       </material>
     </visual>
-    <!-- Small front-facing triangular marker for the skeleton view. -->
-    <visual>
-      <origin xyz="0.31 0 0.12" rpy="0 0 0" />
-      <geometry><box size="0.14 0.012 0.012" /></geometry>
-      <material name="head_marker_red"><color rgba="0.9 0.1 0.1 1" /></material>
-    </visual>
-    <visual>
-      <origin xyz="0.245 0 0.17" rpy="0 0.785398 0" />
-      <geometry><box size="0.10 0.012 0.012" /></geometry>
-      <material name="head_marker_red_left"><color rgba="0.9 0.1 0.1 1" /></material>
-    </visual>
-    <visual>
-      <origin xyz="0.245 0 0.07" rpy="0 -0.785398 0" />
-      <geometry><box size="0.10 0.012 0.012" /></geometry>
-      <material name="head_marker_red_right"><color rgba="0.9 0.1 0.1 1" /></material>
-    </visual>
     <collision>
         <origin xyz="0 0.024 0" rpy="0 1.5707963268 0"/>
         <geometry>
@@ -1015,5 +999,30 @@
       link="base_link" />
     <child
       link="back_lidar_link" />
+  </joint>
+  <!-- Fixed-joint chain forms a front-facing triangle in skeleton renderers. -->
+  <link name="front_marker_tip" />
+  <joint name="front_marker_tip_joint" type="fixed">
+    <origin xyz="0.42 0 0.18" rpy="0 0 0" />
+    <parent link="base_link" />
+    <child link="front_marker_tip" />
+  </joint>
+  <link name="front_marker_left" />
+  <joint name="front_marker_left_joint" type="fixed">
+    <origin xyz="-0.15 0 -0.25" rpy="0 0 0" />
+    <parent link="front_marker_tip" />
+    <child link="front_marker_left" />
+  </joint>
+  <link name="front_marker_right" />
+  <joint name="front_marker_right_joint" type="fixed">
+    <origin xyz="-0.15 0 0.25" rpy="0 0 0" />
+    <parent link="front_marker_left" />
+    <child link="front_marker_right" />
+  </joint>
+  <link name="front_marker_close" />
+  <joint name="front_marker_close_joint" type="fixed">
+    <origin xyz="0.30 0 0" rpy="0 0 0" />
+    <parent link="front_marker_right" />
+    <child link="front_marker_close" />
   </joint>
 </robot>

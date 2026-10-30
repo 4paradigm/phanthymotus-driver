@@ -13,7 +13,7 @@ class MediaWorkers:
     def __init__(self, on_result):
         self._ctx = mp.get_context("spawn")
         self._on_result = on_result
-        self._results = self._ctx.Queue(maxsize=8)
+        self._results = {}
         self._jobs = {}
         self._processes = {}
         self._closed = False
@@ -31,30 +31,19 @@ class MediaWorkers:
 
     def _add(self, lane, kind):
         jobs = self._ctx.Queue(maxsize=2)
-        process = self._ctx.Process(target=_worker, args=(jobs, self._result_queue, kind, lane),
+        results = self._ctx.Queue(maxsize=1)
+        process = self._ctx.Process(target=_worker, args=(jobs, results, kind, lane),
                                     name=f"lynx-s10-media-{lane}", daemon=True)
         process.start()
         self._jobs[lane] = jobs
+        self._results[lane] = results
         self._processes[lane] = process
-
-    @property
-    def _result_queue(self):
-        return self._results
 
     def submit(self, lane, job):
         jobs = self._jobs.get(lane)
         if jobs is None or self._closed:
             return False
-        try:
-            jobs.put_nowait(job)
-            return True
-        except queue.Full:
-            try:
-                jobs.get_nowait()
-                jobs.put_nowait(job)
-                return False
-            except queue.Empty:
-                return False
+        return _put_latest(jobs, job)
 
     def is_alive(self, lane):
         process = self._processes.get(lane)
@@ -62,14 +51,19 @@ class MediaWorkers:
 
     def _collect(self):
         while not self._closed:
-            try:
-                result = self._result_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            try:
-                self._on_result(*result)
-            except Exception as exc:
-                print(f"[media-worker] result handling failed: {exc}", flush=True)
+            found = False
+            for results in tuple(self._results.values()):
+                try:
+                    result = results.get_nowait()
+                except queue.Empty:
+                    continue
+                found = True
+                try:
+                    self._on_result(*result)
+                except Exception as exc:
+                    print(f"[media-worker] result handling failed: {exc}", flush=True)
+            if not found:
+                threading.Event().wait(0.01)
 
     def close(self):
         self._closed = True
@@ -89,7 +83,25 @@ class MediaWorkers:
                 process.join(timeout=1)
         self._thread.join(timeout=1)
         self._jobs.clear()
+        self._results.clear()
         self._processes.clear()
+
+
+def _put_latest(target, item):
+    """Enqueue a live frame, replacing an older queued frame when full."""
+    try:
+        target.put_nowait(item)
+        return True
+    except queue.Full:
+        try:
+            target.get_nowait()
+        except queue.Empty:
+            return False
+        try:
+            target.put_nowait(item)
+            return True
+        except queue.Full:
+            return False
 
 
 def _worker(jobs, results, kind, lane):
@@ -115,7 +127,9 @@ def _worker(jobs, results, kind, lane):
                 header, fields, bigendian, width, height, row_step, point_step, data = job
                 packet = encode_pointcloud(fields, bigendian, width, height, row_step,
                                            point_step, data)
-            results.put((lane, header, packet), timeout=0.2)
+            # Each lane has its own one-frame result queue, so camera traffic
+            # cannot evict a newer lidar frame (or vice versa).
+            _put_latest(results, (lane, header, packet))
         except Exception as exc:
             failures += 1
             if failures == 1 or failures % 100 == 0:
@@ -139,16 +153,21 @@ def _jpeg(width, height, step, encoding, data):
 
 
 def _reencode_jpeg(data):
+    # ROS compressed-image transport already carries a JPEG payload. Avoid
+    # decoding and re-encoding every frame; preserve it byte-for-byte.
+    payload = bytes(data)
+    if payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9"):
+        return payload
     from io import BytesIO
     from PIL import Image
-    image = Image.open(BytesIO(bytes(data))).convert("RGB")
+    image = Image.open(BytesIO(payload)).convert("RGB")
     stream = BytesIO()
     image.save(stream, format="JPEG", quality=85, optimize=False)
     return stream.getvalue()
 
 
 def encode_pointcloud(fields, bigendian, width, height, row_step, point_step, data,
-                      max_points=40000):
+                      max_points=2000):
     """Pack XYZ only as little-endian float32 records for the cloud renderer."""
     import math
     import struct
