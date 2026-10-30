@@ -432,8 +432,8 @@ def test_camera_lane_recognizes_numbered_camera_topic_independent_of_discovery_o
     assert nodes._assign_camera_lane("/camera_3/image_raw") == "camera_right"
     assert nodes._assign_camera_lane("/camera_1/image_raw") == "camera_left"
     assert nodes._assign_camera_lane("/usb_camera_1/image_raw_0") == "camera_left"
-    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_1") is None
-    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_2") is None
+    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_1") == "camera_front"
+    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_2") == "camera_right"
     assert nodes._assign_camera_lane("/camera_0/image_raw") == "camera_rear"
 
 

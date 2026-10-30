@@ -121,10 +121,12 @@ class S10Nodes:
             "camera_front": ["/camera/front/image_raw", "/camera/front/image_raw/compressed",
                          "/camera/front/color/image_raw", "/camera/front/color/image_raw/compressed",
                          "/camera_front/image_raw", "/camera_2/image_raw",
+                         "/usb_camera_1/image_raw_1", "/usb_camera_1/image_raw_1/compressed",
                          ],
             "camera_right": ["/camera/right/image_raw", "/camera/right/image_raw/compressed",
                          "/camera/right/color/image_raw", "/camera/right/color/image_raw/compressed",
                          "/camera_right/image_raw", "/camera_3/image_raw",
+                         "/usb_camera_1/image_raw_2", "/usb_camera_1/image_raw_2/compressed",
                          ],
         }))
         for lane in CAMERA_LANES:
@@ -355,7 +357,7 @@ class S10Nodes:
         if usb:
             suffix = usb.group(1)
             return {None: "camera_rear", "0": "camera_left",
-                    }.get(suffix)
+                    "1": "camera_front", "2": "camera_right"}.get(suffix)
         tokens = set(filter(None, re.split(r"[^a-z0-9]+", name)))
         numbered = re.search(r"(?:^|[/_])camera[_-]?(\d+)(?:$|[/_])", name)
         if numbered:
