@@ -31,6 +31,7 @@ Available tools are:
   the requested base-frame B using
   joint-space planning by default, with an explicit TCP-linear mode available.
   Relative `move_offset`, absolute `movel`, and waypoint `movep` are not exposed.
+- `gripper`: RealMan two-finger gripper position control (1~1000 opening stroke, 0~120 mm) with force configuration (10~100%), stall detection, and keep/rollback protection policies.
 - `ext_camera`: multi-instance upper-computer USB camera card. A RealSense
   instance can publish RGB, depth, or left infrared without going through the
   RealMan controller.
@@ -152,6 +153,45 @@ The controller's collision level, electronic fences, virtual walls, and
 physical safety system remain responsible for collision protection; the driver
 has no environment model and does not plan a detour around obstacles.
 
+## Two-finger gripper (`gripper`)
+
+The `gripper` card exposes position control for RealMan two-finger end-effectors, supporting ZX (知行) 1-DOF ecosystem grippers via the `RM_ARM+` protocol as well as standard grippers via SDK position commands.
+
+### Position convention
+
+- `position`: integer from `1` (fully closed) to `1000` (fully open), corresponding to a physical opening travel stroke of 0~120 mm.
+- Every motion request requires explicit safety confirmation: `confirm_motion=true`.
+- Motion is guarded by the client's `motion_gate` and an internal `_gripper_lock`, preventing concurrent overlapping motions.
+
+### Force and stall parameters
+
+- `force`: integer from `10` to `100` (default `20`). Configures the ZX gripper torque threshold written to ecosystem register `1220` (and verified via readback). Values below `10` are rejected because they fall inside the mechanical static friction deadband and cannot reliably drive motion. Force configuration failures on RM+ grippers immediately fail the action. Standard grippers omit register 1220 force configuration.
+- `on_stall`: protection policy when the gripper is blocked during movement:
+  - `keep` (default): keeps the gripper at the blocked position. Crucially, it updates the controller setpoint to the blocked position so that removing the obstacle does not cause the gripper to jump forward toward the original target. If updating the setpoint command fails, the action reports `status: "failed"` with `stall_keep_failed` to prevent claiming an insecure setpoint.
+  - `rollback`: automatically and safely backs off to the start position recorded before the motion began. If issuing the rollback command fails (`rollback_command_failed`) or the gripper fails to reach the start position (`rollback_failed`), the action reports `status: "failed"` with `rollback_succeeded: false`.
+- `stall_timeout_seconds`: floating-point number between `0.5` and `30.0` seconds (default `3.0`). Defines the idle timeout without position progress (>10 units deadband) before motion is declared stalled.
+
+### Completion semantics and ACP contract
+
+Following the standard asynchronous ACP contract (`x-completion`):
+1. `set_position` returns immediately with `{"state": "running", "action_id": "rm75_gripper_..."}`.
+2. The background monitor polls position progress and stall status.
+3. Upon reaching the target, detecting stall, being interrupted, or failing, it POSTs the terminal outcome to `/api/acp/complete`:
+   - `status: "completed"` with reason:
+     - `target_reached`: reached target within tolerance (<= 10 units).
+     - `motion_stalled_kept`: stalled and locked at blocked position.
+     - `motion_stalled_rolled_back`: stalled and returned to start position successfully (`rollback_succeeded: true`).
+     - `interrupted`: stopped during execution.
+   - `status: "failed"` with reason (e.g., feedback unavailable or lost during motion, hardware fault, timeout, `stall_keep_failed`, `rollback_command_failed`, `rollback_failed`, or `rollback_feedback_lost`).
+4. Full completion details (including `position` / `final_position`, `target` / `requested_position`, `start_position`, `blocked_position`, `stalled`, `on_stall`, `rollback_succeeded`, `force`, `mode`, `error`, `stall_timeout_seconds`, `elapsed_seconds`) are preserved in the completion payload and queryable via `gripper.info` under `last_completion`.
+
+### Hardware fault detection and recovery limitations
+
+- Motion neutralization and terminal lock retention: before releasing the motion lock upon timeout or interruption, the driver overwrites the outstanding target with a hold command at the current measured position. If position feedback is lost post-command or holding fails, the outstanding non-blocking motion remains active on the controller; to prevent concurrent arm movements, the driver retains the motion lock and `motion_gate` in a protected state until an explicit `stop` is dispatched.
+- RM+ feedback validation: the driver inspects `sys_state` and `dof_err` from `rm_get_rm_plus_state_info`. If `sys_state != 0` or any `dof_err != 0` is reported by the controller, the driver raises an error and terminates with `status: "failed"` rather than mistaking hardware failure for a mechanical stall.
+- Continuous feedback loss: if feedback samples drop continuously for 1.0 second during motion, the action aborts immediately with `status: "failed"` and reports the last known observed position rather than inventing the target position.
+- The standard SDK provides no dedicated pre-emptive gripper cancel API; calling `stop` marks the action interrupted and waits for the ongoing command to conclude in a safe terminal state before releasing locks.
+
 The HTTP service listens on port `15718` and provides `/health` and `/mcp`.
 The normal Agent Core runtime still initializes its ROS/DDS transport, but robot
 communication itself goes directly through API2 TCP port `8080`.
@@ -226,3 +266,29 @@ RealSense enumeration and capture, as described above.
 Skeleton publication skips disconnected/busy SDK clients, retries failed samples
 at most every two seconds, and logs once per outage until a successful sample.
 An already-running SDK TCP query still holds the SDK lock until it returns.
+
+## ArUco 标记中心点识别卡片 (`aruco_detector` / `aruco_zones`)
+
+Driver 已注册 `aruco_detector` 处理卡片（`type: processor`，同时提供 `aruco_zones` 兼容别名），专门用于识别 RealSense 相机画面中的 ArUco 码 ID 及中心点位置坐标，为下游物体分拣任务提供定位依据：
+
+1. **输入与输出**：
+   - 输入：连接 `ext_camera` 的 RGB 图像流（`format: image/jpeg`）。
+   - 输出：带标记边框与中心点十字线标注的 JPEG 预览图（`/{namespace}/aruco_detector/overlay`）与检测结果 JSON（`/{namespace}/aruco_detector/markers`）。
+2. **纯视觉识别与中心点提取接口（可直接调用）**：
+   - 动作支持：`detect`、`get_marker_center`、`info`、`start`、`stop`。
+   - **调用 `dispatch("detect", {"marker_id": 3})` 或 `dispatch("get_marker_center", {"marker_id": 3})`**：
+     - 直接获取指定标记码的中心点坐标：
+       - `found`: `true` / `false` 是否在画面中找到该码。
+       - `center`: `[x, y]` 归一化中心坐标（范围 0.0~1.0，画面左上角为 0,0）。
+       - `center_normalized`: `[x, y]` 归一化中心坐标。
+       - `center_px`: `[px_x, px_y]` 像素中心坐标。
+       - `marker`: 包含四个角点详细坐标的对象。
+   - **调用 `dispatch("detect", {})` 或 `dispatch("info", {})`**：
+     - 获取当前画面中所有检测到的标记码列表：
+       - `detected_markers`: 画面中所有可见码列表，包含各自的 `id`、`center_normalized`、`center_px`、`corners_px` 与 `corners_normalized`。
+       - `detected_marker_ids`: 画面中可见的所有 ArUco ID 列表，如 `[1, 3, 7]`。
+       - `marker_count`: 检测到的标记总数。
+   - **纯几何中心提取**：
+     - 本卡片仅负责 ArUco 码 ID 识别与中心点位置提取，不设置待分拣区/分拣区等额外规则；下游分拣任务可直接根据获取到的中心点坐标规划机械臂抓取动作。
+
+
