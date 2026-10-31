@@ -72,6 +72,57 @@ python main.py
    进到本容器（`common/file_intake.py`），回包给出的是**容器内部**的绝对路径 ——
    不需要任何共享挂载。详见 [README_dev.md 的 File Arguments 一节](README_dev.md#file-arguments-format-file-and-post-fileupload)。
 
+### G1 导航传感器
+
+只读 `navigation_sensors` 插件使用一个隔离 worker 直接订阅 MID360 原始 DDS，
+并发布算法无关的 `/ubuntu/navigation/lidar`（`PointCloud2`）和
+`/ubuntu/navigation/imu`（`Imu`）。两路数据保留 MID360 共享源时钟并统一
+归一化到 ROS system time；时钟未就绪、重置或样本无效时直接丢弃，不伪造
+源时间戳。
+各导航流归一化后的时间戳重复或倒序时丢弃，不用上一帧加一伪造新样本。
+诊断分别记录 `cloud_non_increasing_timestamps` 和
+`imu_non_increasing_timestamps`；后续严格递增的样本可正常恢复。
+点云转换只接受小端且满足 `row_step == width * point_step` 的紧凑行布局；
+大端、带行 padding 或行长不足的有组织点云会被丢弃，避免错误解码。
+
+`lidar_cloud` 保留旧点云输出作为第一项，第二项为 `navigation_lidar` 端口的标准
+PointCloud2；该输出描述符中的 `associated_imu` 声明实际配置的 IMU topic、格式、
+ROS 类型、QoS、坐标系和时间语义。第三项为 `navigation_imu` 端口，直接公开同一
+IMU 的 ROS topic 描述符；消费端能否直接使用该端口或元数据取决于其实现。
+当前 controlled semantic spatial 卡只连接 `navigation_lidar`，通过其 `imu_topic`
+配置订阅 IMU（默认为 `/ubuntu/navigation/imu`），不会自动绑定 IMU 端口或读取
+`associated_imu`；使用自定义 topic 时必须配置并核对对应 IMU。两路点云的 format
+都是 `sensor/pointcloud`，FAST-LIVO2 必须选择 `navigation_lidar`，不能误连旧二进制点云。
+不提供独立 `lidar_imu` 卡；
+原机身 `imu` 不变。`lidar_cloud` 同时管理两路导航数据，停止时释放两路请求及 worker；
+重新启动不会发送上一启停周期的排队帧。`info` 的 `outputs.navigation_imu` 单独报告
+IMU 就绪状态，顶层就绪状态保持原有点云语义。安全检查使用内部
+`/ubuntu/lidar/cloud_internal`，复用同一份点云转换，不依赖公开点云卡是否启用。
+
+关联 IMU 的格式为 `sensor/imu`，原生 ROS 消息为 `sensor_msgs/msg/Imu`：姿态使用
+四元数，角速度单位为 rad/s，线加速度单位为 m/s²，并保留三组标准 3×3 协方差。
+点云和 IMU 各自保留归一化后的采样时间，并非同步采样对，时间戳也不是原始 DDS 值的逐位复制。
+
+### G1 相机输出
+
+RealSense 插件通过 `camera_rgb` 的 `rgb` 端口发布 `/ubuntu/camera/rgb` 压缩图；
+深度图和距离 topic 的消息语义不变。
+
+停止相机卡只停止该卡的输出，不影响另一相机卡、距离输出或
+拍照/录像。拍照使用按需启用的内部 JPEG 通道。全部输出及拍照需求停止后，共享
+进程暂停相机采集。停止门控超时返回错误，不伪报 idle。
+
+旧 Canvas 迁移（消费端同事负责）：
+
+| 原卡片 | 新卡片 / 端口 |
+|---|---|
+| navigation_lidar | lidar_cloud / navigation_lidar |
+| navigation_imu、lidar_imu | 支持端口的消费端使用 lidar_cloud / navigation_imu；当前 controlled semantic spatial 卡改用其 `imu_topic` 配置 |
+
+移除的名字不保留隐藏别名。原点云输出维持列表首位及原有数据格式；IMU topic
+及其 ROS 类型保持可用。Canvas 和消费端需要支持传递描述符。此轮整合尚未部署或
+真机验收，本地测试不能代替 ROS/设备验收。
+
 ## 开发新驱动
 
 想要为新硬件添加驱动？请参阅 **[驱动开发指南](README_dev.md)** 获取完整规范，包括：

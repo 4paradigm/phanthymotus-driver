@@ -615,11 +615,38 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `sensor/pose2d` | 2D human skeleton | `hint === 'sensor/pose2d'` |
 | `sensor/lidar*` | Lidar scan | `hint.startsWith('sensor/lidar')` |
 | `sensor/pointcloud` | 3D Point cloud | `hint === 'sensor/pointcloud'` |
+| `sensor/imu` | IMU orientation/velocity/acceleration | `hint === 'sensor/imu'` |
 | `sensor/mapping` | 2D Occupancy map | `hint === 'sensor/mapping'` |
 | `state/odom` | Text / KV panel | `motus.odom/1` — see "Robot Odometry" |
 | `control/velocity` | Text / KV panel | `motus.control/1` `twist` — see "Continuous Control" |
 | `control/joint` | Text / KV panel | `motus.control/1` joint modes |
 | (no hint) | Activity stream | Fallback when no format specified |
+
+### IMU Rendering — `sensor/imu`
+
+`sensor/imu` is the platform format for a native `sensor_msgs/msg/Imu` topic.
+The topic descriptor must also declare `ros_type: sensor_msgs/msg/Imu`, its QoS,
+timestamp source, and `frame_id`. Agent Core subscribes using the native ROS
+type and exposes the following JSON representation to dashboard renderers:
+
+```json
+{
+  "schema": "phanthy.sensor.imu.v1",
+  "frame_id": "livox_frame",
+  "stamp_ns": 1780000000000000000,
+  "orientation": {"x": 0, "y": 0, "z": 0, "w": 1},
+  "orientation_covariance": [0, 0, 0, 0, 0, 0, 0, 0, 0],
+  "angular_velocity_rad_s": {"x": 0, "y": 0, "z": 0},
+  "angular_velocity_covariance": [0, 0, 0, 0, 0, 0, 0, 0, 0],
+  "linear_acceleration_m_s2": {"x": 0, "y": 0, "z": 9.80665},
+  "linear_acceleration_covariance": [0, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+```
+
+Quaternion components are unitless, angular velocity is rad/s, linear
+acceleration is m/s², and the covariance arrays retain ROS row-major order and
+units. Do not publish JSON in place of the native ROS topic; this JSON is only
+the Agent Core WebSocket representation.
 
 The last three carry a declared schema rather than free-form JSON, and the port
 format is what a *consumer* matches on when wiring a canvas — the renderer is
@@ -628,7 +655,7 @@ incidental. `control/*` is an **input** port on a driver command card;
 
 ### Depth Rendering — `image/depth-zlib`
 
-Two depth formats are supported:
+The depth transport changed as follows:
 
 - **`image/depth-z16` is gone.** It was the raw uint16 buffer (640×480 = 614 KB/frame) on `sensor_msgs/Image`, and it saturated ARM64 CPU on DDS serialization. Every driver that published it — G1, T800, Tianyi 2.0, AgiBot X2 — was already producing exactly 640×480 little-endian 16UC1, i.e. the zlib form's fixed contract, so the per-message `width`/`height`/`step`/`is_bigendian` it carried were used by nobody. They now compress in the driver, as go2, realman, A3 and Bumi already did. A future camera whose native depth is not 640×480 resizes in its own driver (and must rescale its `camera_info` K to match) rather than widening this contract.
 

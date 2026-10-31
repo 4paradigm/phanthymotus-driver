@@ -83,6 +83,88 @@ python main.py
    reply names the path *inside* the container — no shared mount. See
    [README_dev.md § File Arguments](README_dev.md#file-arguments-format-file-and-post-fileupload).
 
+### G1 Navigation Sensors
+
+The read-only `navigation_sensors` Driver plugin launches an isolated worker
+process which subscribes directly to the MID360 raw DDS streams instead of
+converting the body `/ubuntu/state/imu` JSON. Keeping raw LiDAR conversion and
+IMU forwarding out of the full Driver process prevents the legacy LiDAR,
+camera, and MCP threads from starving navigation input callbacks. The worker
+publishes two algorithm-independent navigation sensor topics:
+
+- `/ubuntu/navigation/lidar` — `sensor_msgs/msg/PointCloud2`,
+  RELIABLE + KEEP_LAST(2), with `x/y/z/intensity/tag/line/timestamp` fields;
+- `/ubuntu/navigation/imu` — `sensor_msgs/msg/Imu`, RELIABLE + KEEP_LAST(200);
+
+The MID360 converter accepts only little-endian, tightly packed PointCloud2 rows
+(`row_step == width * point_step`). Big-endian clouds, organized clouds with row
+padding, and undersized rows are dropped instead of being decoded incorrectly.
+
+For each navigation stream, duplicate or decreasing normalized timestamps are
+dropped, never clamped to manufacture a newer measurement. Diagnostics count
+these as `cloud_non_increasing_timestamps` / `imu_non_increasing_timestamps`;
+subsequent strictly increasing samples can resume normally.
+
+The native MID360 IMU message uses quaternion orientation, angular velocity in
+rad/s, linear acceleration in m/s², and the three standard 3×3 covariance
+arrays. The existing body `imu` card remains unchanged.
+
+With `navigation_sensors` enabled, `lidar_cloud` exposes the unchanged legacy
+cloud first, native PointCloud2 on port `navigation_lidar` second, and the IMU
+ROS topic descriptor on port `navigation_imu` third. The cloud descriptor retains
+its `associated_imu` metadata with the configured IMU topic, `sensor/imu` format,
+ROS type, QoS, frame and timestamp semantics. Consumers can use the IMU port or
+this metadata rather than deriving a topic name from the cloud topic. The IMU
+normally uses `/ubuntu/navigation/imu`; there is no independent `lidar_imu` card.
+The current controlled semantic spatial card connects `navigation_lidar` and
+subscribes to the IMU via its `imu_topic` configuration (default
+`/ubuntu/navigation/imu`); it does not automatically bind the IMU port or read
+`associated_imu`. For custom topics, configure and verify the matching IMU topic.
+Both cloud outputs advertise `sensor/pointcloud`, so select `navigation_lidar`,
+not the legacy binary cloud, for FAST-LIVO2.
+
+The `lidar_cloud` card owns both navigation streams. Stopping it releases both
+requests and the worker once neither stream remains active. Its `info` reports
+IMU readiness separately under `outputs.navigation_imu`; the top-level readiness
+retains the historical cloud-only contract. Restart discards queued frames from
+the old epoch.
+
+LiDAR and IMU each retain their own MID360 sample time, corrected from the
+shared source clock into the ROS system-time domain. These are independently
+sampled streams, not synchronized pairs; corrected stamps are not bit-for-bit
+raw DDS stamps. Samples are dropped while clock offset estimation is not ready
+or after an invalid/reset observation; the Driver never invents a source
+timestamp. The fixed upside-down mounting rotation is applied equally to cloud
+and IMU. The existing `/ubuntu/lidar/cloud` legacy card remains
+available for Canvas. Safety uses `/ubuntu/lidar/cloud_internal`, produced from
+the same conversion independently of the public card's publishing gate.
+
+Navigation consumers such as LiDAR-inertial mapping and path planning can bind
+to these topics without the Driver naming or selecting a specific algorithm.
+The body IMU JSON is approximately 20 Hz, has no source timestamp, and is not a
+valid substitute for the MID360 built-in IMU. Before accepting a navigation
+run, verify the isolated worker delivers approximately 10 Hz LiDAR and 200 Hz
+IMU; materially lower rates or repeated source-stamp gaps invalidate the run.
+
+### G1 Camera Outputs
+
+The RealSense plugin publishes `/ubuntu/camera/rgb` as a `CompressedImage`
+on the `camera_rgb` port `rgb`; depth and distance topics are unchanged.
+
+Stopping a camera card gates its own outputs, not its sibling, distance, or
+photo/video capture. Capture uses an on-demand internal
+JPEG channel. With no active outputs or capture requests, the shared process
+pauses hardware capture. A stop timeout is an error, never an idle success.
+
+Migration: replace saved Canvas `navigation_lidar` with `lidar_cloud`'s
+`navigation_lidar` port.
+Where supported, replace saved `lidar_imu` or `navigation_imu` card connections
+with the `lidar_cloud` card's `navigation_imu` port; the cloud descriptor's
+`associated_imu` metadata also remains available. The current controlled semantic
+spatial card instead uses its configured `imu_topic` as described above. Consumer
+and Canvas support for ports or metadata is required; hardware/ROS acceptance is
+pending, and local tests are not a deployment claim.
+
 ## Writing a New Driver
 
 Want to add support for new hardware? See the **[Driver Development Guide](README_dev.md)** for the full specification, including:

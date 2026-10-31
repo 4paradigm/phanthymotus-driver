@@ -55,6 +55,8 @@ COPY led_control.py /work/led_control.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py
 COPY safety_harness.py /work/safety_harness.py
+COPY loco_servo.py /work/loco_servo.py
+COPY loco_servo_transport.py /work/loco_servo_transport.py
 COPY loco_relative_move.py /work/loco_relative_move.py
 COPY relative_feedback.py /work/relative_feedback.py
 COPY timed_motion.py /work/timed_motion.py
@@ -63,6 +65,12 @@ COPY scan_context.py /work/scan_context.py
 COPY controlled_spatial.py /work/controlled_spatial.py
 COPY controlled_spatial_map.py /work/controlled_spatial_map.py
 COPY pointcloud_utils.py /work/pointcloud_utils.py
+COPY navigation_sensor_bridge.py /work/navigation_sensor_bridge.py
+COPY navigation_sensor_bridge_main.py /work/navigation_sensor_bridge_main.py
+COPY navigation_pointcloud.py /work/navigation_pointcloud.py
+COPY navigation_time.py /work/navigation_time.py
+COPY sensor_output.py /work/sensor_output.py
+COPY calibration/ /work/calibration/
 COPY av_recording.py /work/av_recording.py
 COPY servo.py /work/servo.py
 COPY arm_sdk.py /work/arm_sdk.py

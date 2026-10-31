@@ -12,7 +12,7 @@
 
 | 能力 | 卡片 | 默认状态与用途 |
 |---|---|---|
-| 运动与模式 | `loco`、`switch_mode`、`switch_mode_expert`、`motion_switcher`、`smart_motion` | 启用；运动指令、模式切换和打断控制 |
+| 运动与模式 | `loco`、`loco_servo`、`switch_mode`、`switch_mode_expert`、`motion_switcher`、`smart_motion` | 启用；指令式运动、连续速度流、模式切换和打断控制 |
 | 手臂动作 | `arm` | 启用；厂商预设手势和收臂 |
 | 双臂遥操 | `teleop_control` | 启用；接收设备输入，控制原厂 G1_23 固定假手双臂，提供对齐反馈及轨迹录制/回放；见[遥操使用说明](motion/README.md#使用) |
 | 网页录制技能 | `g1_teaching` | 复用双臂遥操的录制和回放；在原执行卡完成检查、录制、试运行并保存普通 Skill；见[录制技能说明](skill_workbench/README.md) |
@@ -86,6 +86,8 @@ python3 unitree/g1/main.py eth0
 - [Driver SDK 适配层](sdk_adapter.py)组合 SDK 既有 `ChannelFactory.CreateChannel` / `Channel.SetReader` 接口，不修改 SDK、不创建额外 DDS participant。LowState、执行器 FSM 与 `rt/arm_sdk` 观察订阅均保留最新一帧；需要回调的反馈由 Driver 自有线程执行有界读取，停止后 join 并只关闭底层 reader 一次。其他 SDK 订阅和 RPC 回复仍沿用 SDK 回调与可选队列机制；适配层仅过滤自身读取作用域内由 `StopIteration` 产生的空读告警，其他线程及真实异常日志保留。SDK 读异常可能只返回空值，安全判断仍依赖反馈时效，不能以订阅存在证明反馈有效。
 - 动作 99 的 no-reply 发送封装位于 Driver 适配层，发送成功不代表姿态完成；不改变现有 Reset/停止/交权状态机，也不让原本不发 99 的操作新增动作。
 - [部署模板](deploy/service.yml)使用宿主网络并挂载设备和持久数据目录。相机、麦克风、雷达和空间操作分别依赖对应设备或厂商服务；卡片注册成功不代表已收到传感器数据。
+- `loco_servo` 接收 `control/velocity` 的 `motus.control/1` twist 速度流，默认启用但 `dry_run: true`，仅空跑；关闭空跑后接线并启动即可发出底座指令。它不经过 SmartMotion 安全检查、没有避障，也不与 `loco` 等入口自动互斥；需由使用者避免多个控制源同时发指令。为防未来时间戳延长命令寿命，实发时拒绝超过本机时间 100 ms 的命令或观测时间戳，需保证发布端和驱动端时钟同步。独立 SDK 客户端随驱动进程创建，SDK 没有暴露完整的客户端释放接口；不要在进程内反复重建该卡片。G1 固件对亚秒速度持续时间的行为未验证；驱动进程崩溃、网络中断或 SDK 写入卡住时，软件看门狗不能保证停机。SDK 停止应答或发送零速都不等于确认机器人已物理停稳；关闭空跑前须另行验证机器人侧看门狗和急停。
+- 导航速度流需在 Canvas 中显式连接到 `loco_servo` 的 `control/velocity` 输入，例如 `/actucore/navi/cmd`（ROS `std_msgs/msg/String`，`motus.control/1`）；未提供输入 topic 时卡片不会自动订阅。
 - `servo` 和 `servo_eef` 默认关闭。启用前核对关节布局、夹爪和腰部配置，并阅读对应模块说明。驱动没有统一的多控制器仲裁，不要让多个控制源同时控制同一组关节。
 - SDK 请求成功与实测动作完成是不同状态。检查返回结果和本体反馈；软件检查不能替代物理动作验收。
 
