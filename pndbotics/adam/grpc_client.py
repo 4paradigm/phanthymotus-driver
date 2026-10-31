@@ -73,7 +73,14 @@ class AdamGrpcClient:
             "message": getattr(response, "message", ""),
         }
         for field in fields:
-            result[field] = getattr(response, field)
+            value = getattr(response, field)
+            # protobuf repeated scalar fields are iterable containers, not
+            # JSON-native lists.  Materialize them at the adapter boundary so
+            # every MCP result can be serialized without leaking protobuf
+            # implementation types to the HTTP layer.
+            if field in ("switchable_states", "available_actions"):
+                value = list(value)
+            result[field] = value
         return result
 
     def set_mode(self, mode) -> dict:
