@@ -34,8 +34,9 @@ RUN pip3 install --no-cache-dir -i "${PYPI_MIRROR}" -r /tmp/u1-requirements.txt 
 WORKDIR /work
 COPY --from=interface-builder /u1_ws/install /u1_ws/install
 COPY common/ /work/common/
-COPY main.py device.py config.yaml driver.yaml /work/
+COPY main.py device.py direction_card.py native_direction.py sound_activity.py config.yaml driver.yaml /work/
 COPY deploy/ /deploy/
+COPY native_doa/ /deploy/native_doa/
 
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp

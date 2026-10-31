@@ -8,6 +8,7 @@ management call. The robot's public ROS graph provides useful contracts:
 from __future__ import annotations
 
 import json
+import math
 import mmap
 import os
 import queue
@@ -22,6 +23,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
+
+from direction_card import SoundDirectionPlugin
 
 from common.vendor_runtime import action_schema, jsonable, tool
 
@@ -39,6 +42,15 @@ CAMERA_FRAME_TIMEOUT = 3.0
 CAMERA_RIGHT_RETRY_TIMEOUT = 5.0
 MIC_TOPIC = "/sys/device/audio_in/raw"
 MIC_SDK_FIRST_FRAME_TIMEOUT = 1.0
+MIC_GAIN_DB_DEFAULT = 18.0
+MIC_GAIN_DB_MIN = 0.0
+MIC_GAIN_DB_MAX = 24.0
+MIC_SPEECH_TARGET_DBFS = -18.0
+MIC_NOISE_ATTENUATION_DB = -24.0
+MIC_SPEECH_MARGIN_DB = 9.0
+MIC_SPEECH_HANGOVER_MS = 280
+MIC_NOISE_CALIBRATION_MS = 1200
+MIC_HIGH_PASS_HZ = 100.0
 SPEAKER_TOPIC = "/sys/device/audio_out/raw"
 AUDIO_FORMAT = "audio/pcm-16k"
 PLAYBACK_TOPIC = "/robo/media/subscribe/playback_state"
@@ -55,6 +67,165 @@ JPEG_MAX_PIXELS = 1280 * 720
 VENDOR_ACTION_RESOURCE = "u1_action"
 
 EVENT_TOPICS = {"playback_state": PLAYBACK_TOPIC}
+
+
+def _resolve_mic_gain_db(config: dict) -> float:
+    """Read a bounded input gain from env/config without accepting NaN/inf."""
+    audio_config = config.get("audio", {}) if isinstance(config, dict) else {}
+    if not isinstance(audio_config, dict):
+        audio_config = {}
+    configured = os.environ.get(
+        "U1_PRO_MIC_GAIN_DB", audio_config.get("mic_gain_db", MIC_GAIN_DB_DEFAULT))
+    try:
+        gain_db = float(configured)
+    except (TypeError, ValueError):
+        gain_db = MIC_GAIN_DB_DEFAULT
+    if not math.isfinite(gain_db):
+        gain_db = MIC_GAIN_DB_DEFAULT
+    return min(MIC_GAIN_DB_MAX, max(MIC_GAIN_DB_MIN, gain_db))
+
+
+class _AdaptiveSpeechLeveler:
+    """Make speech prominent while suppressing a learned steady noise floor.
+
+    This deliberately stays in the driver: it is a streaming dynamics stage,
+    not a second speech recognizer. A short startup calibration estimates the
+    room floor, a high-pass filter removes DC/motor rumble, and a smooth gate
+    applies make-up gain only while the signal clears that floor. Processing
+    failures fail open so enhancement can never mute the microphone.
+    """
+
+    SAMPLE_RATE = 16_000
+    HISTORY_SECONDS = 3.0
+
+    def __init__(self, max_gain_db: float):
+        self.max_gain_db = float(max_gain_db)
+        self._lock = threading.Lock()
+        self._history: list[tuple[float, float]] = []
+        self._history_seconds = 0.0
+        self._elapsed_seconds = 0.0
+        self._noise_floor_dbfs = -60.0
+        self._gain_db = MIC_NOISE_ATTENUATION_DB
+        self._hangover_samples = 0
+        self._previous_x = 0.0
+        self._previous_y = 0.0
+        self._speech_active = False
+        self._speech_gain_db = 0.0
+        self._level_dbfs = -120.0
+        self._applied_gain_db = MIC_NOISE_ATTENUATION_DB
+
+    @staticmethod
+    def _coefficient(duration_s: float, time_constant_s: float) -> float:
+        return 1.0 - math.exp(-duration_s / max(time_constant_s, 1e-3))
+
+    def _high_pass(self, samples):
+        import numpy as np
+
+        alpha = math.exp(-2.0 * math.pi * MIC_HIGH_PASS_HZ / self.SAMPLE_RATE)
+        output = np.empty_like(samples)
+        previous_x = self._previous_x
+        previous_y = self._previous_y
+        for index, current_x in enumerate(samples):
+            current_y = alpha * (previous_y + float(current_x) - previous_x)
+            output[index] = current_y
+            previous_x = float(current_x)
+            previous_y = current_y
+        self._previous_x = previous_x
+        self._previous_y = previous_y
+        return output
+
+    def _remember_level(self, duration_s: float, level_dbfs: float) -> float:
+        import numpy as np
+
+        self._history.append((duration_s, level_dbfs))
+        self._history_seconds += duration_s
+        while self._history and self._history_seconds > self.HISTORY_SECONDS:
+            removed_duration, _ = self._history.pop(0)
+            self._history_seconds -= removed_duration
+        return float(np.percentile([level for _, level in self._history], 20))
+
+    def process(self, payload: bytes) -> bytes:
+        raw = bytes(payload)
+        if not raw or len(raw) % 2:
+            return b""
+        try:
+            import numpy as np
+
+            with self._lock:
+                samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+                filtered = self._high_pass(samples)
+                duration_s = len(filtered) / self.SAMPLE_RATE
+                self._elapsed_seconds += duration_s
+                rms = float(np.sqrt(np.mean(filtered * filtered) + 1e-12))
+                level_dbfs = 20.0 * math.log10(max(rms, 1e-6))
+                candidate_floor = self._remember_level(duration_s, level_dbfs)
+
+                calibrating = self._elapsed_seconds < MIC_NOISE_CALIBRATION_MS / 1000.0
+                if calibrating:
+                    coefficient = self._coefficient(duration_s, 0.20)
+                    self._noise_floor_dbfs += coefficient * (
+                        candidate_floor - self._noise_floor_dbfs)
+
+                threshold_dbfs = max(-55.0, self._noise_floor_dbfs + MIC_SPEECH_MARGIN_DB)
+                raw_detected = level_dbfs > threshold_dbfs
+                if not calibrating and not raw_detected:
+                    coefficient = self._coefficient(duration_s, 1.5)
+                    self._noise_floor_dbfs += coefficient * (
+                        candidate_floor - self._noise_floor_dbfs)
+                elif candidate_floor < self._noise_floor_dbfs:
+                    coefficient = self._coefficient(duration_s, 0.5)
+                    self._noise_floor_dbfs += coefficient * (
+                        candidate_floor - self._noise_floor_dbfs)
+                self._noise_floor_dbfs = min(-20.0, max(-90.0, self._noise_floor_dbfs))
+
+                detected = raw_detected
+                if raw_detected:
+                    self._hangover_samples = int(
+                        self.SAMPLE_RATE * MIC_SPEECH_HANGOVER_MS / 1000)
+                elif self._hangover_samples > 0:
+                    self._hangover_samples = max(0, self._hangover_samples - len(filtered))
+                    detected = True
+
+                if raw_detected:
+                    self._speech_gain_db = min(
+                        self.max_gain_db,
+                        max(0.0, MIC_SPEECH_TARGET_DBFS - level_dbfs),
+                    )
+                    desired_gain_db = self._speech_gain_db
+                elif detected:
+                    # Hangover protects the end of a word, but must not turn a
+                    # newly quiet frame into a request for maximum make-up gain.
+                    desired_gain_db = self._speech_gain_db
+                else:
+                    desired_gain_db = MIC_NOISE_ATTENUATION_DB
+                time_constant = 0.035 if desired_gain_db > self._gain_db else 0.10
+                coefficient = self._coefficient(duration_s, time_constant)
+                next_gain_db = self._gain_db + coefficient * (
+                    desired_gain_db - self._gain_db)
+                gain_ramp_db = np.linspace(
+                    self._gain_db, next_gain_db, len(filtered), dtype=np.float32)
+                gain_ramp = np.power(10.0, gain_ramp_db / 20.0)
+                enhanced = np.clip(filtered * gain_ramp, -0.95, 0.95)
+
+                self._gain_db = float(next_gain_db)
+                self._speech_active = bool(detected)
+                self._level_dbfs = level_dbfs
+                self._applied_gain_db = self._gain_db
+                return (enhanced * 32767.0).astype("<i2").tobytes()
+        except Exception:
+            return raw
+
+    def status(self) -> dict:
+        with self._lock:
+            return {
+                "mode": "adaptive_speech",
+                "calibrating": self._elapsed_seconds < MIC_NOISE_CALIBRATION_MS / 1000.0,
+                "speech_active": self._speech_active,
+                "input_level_dbfs": round(self._level_dbfs, 1),
+                "noise_floor_dbfs": round(self._noise_floor_dbfs, 1),
+                "applied_gain_db": round(self._applied_gain_db, 1),
+                "max_gain_db": self.max_gain_db,
+            }
 
 
 def _normalize_pcm16k(message: Any, data: Any) -> bytes:
@@ -479,6 +650,8 @@ class U1Nodes:
         self._closed = False
         self.config = config
         self.namespace = namespace
+        self.mic_gain_db = _resolve_mic_gain_db(config)
+        self._mic_leveler = _AdaptiveSpeechLeveler(self.mic_gain_db)
         self.mic_topic = f"/{namespace}/mic/audio"
         self.AudioChunk = AudioChunk
         self.AudioInData = AudioInData
@@ -719,7 +892,22 @@ class U1Nodes:
             self.set_mic_enabled(False)
         self._mic_forwarding = False
         self.stop_mic_reader()
-        opened = self.trigger_call("audio_open")
+        self._mic_sdk_error = ""
+        try:
+            opened = self.trigger_call("audio_open")
+        except TimeoutError as exc:
+            # On this firmware domain-2 raw audio can be live while the SDK
+            # open RPC never replies. Use the existing topic conversion path;
+            # MicPlugin.start still requires a NEW PCM frame before readiness.
+            self._mic_frames = 0
+            self._mic_frame_event.clear()
+            self._mic_sdk_error = str(exc)[:256]
+            with self._mic_source_lock:
+                self._mic_source = "topic"
+                self._mic_pending_topic = None
+            self._mic_forwarding = True
+            return {"state": "waiting_for_audio", "source": "device raw-topic fallback",
+                    "sdk_warning": self._mic_sdk_error}
         if _vendor_request_failed(opened):
             raise RuntimeError("U1 Pro audio stream open was rejected")
         self._mic_stream_open = True
@@ -783,6 +971,10 @@ class U1Nodes:
                 U1Nodes._cancel_mic_source_timer_locked(self)
             if self._mic_source != "sdk":
                 return
+        leveler = getattr(self, "_mic_leveler", None)
+        payload = leveler.process(payload) if leveler is not None else payload
+        if not payload:
+            return
         chunk = self.AudioChunk()
         chunk.format = AUDIO_FORMAT
         chunk.data = list(payload)
@@ -821,6 +1013,10 @@ class U1Nodes:
 
     def _publish_topic_mic_frame(self, payload: bytes, header: Any = None) -> None:
         if not self._mic_forwarding:
+            return
+        leveler = getattr(self, "_mic_leveler", None)
+        payload = leveler.process(payload) if leveler is not None else payload
+        if not payload:
             return
         chunk = self.AudioChunk()
         chunk.format = AUDIO_FORMAT
@@ -1278,11 +1474,25 @@ class MicPlugin:
         self._enable_requested = False
 
     def get_tool(self):
-        return tool(self.PREFIX, "sensor", "U1 Pro 麦克风阵列：输出 16 kHz 单声道 PCM 音频流，可供语音识别使用。", _sensor_schema(), topic_out=[{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}])
+        return tool(self.PREFIX, "sensor", "U1 Pro 麦克风阵列：输出自适应突出人声、抑制稳定背景声的 16 kHz 单声道 PCM 音频流，可供语音识别使用。", _sensor_schema(), topic_out=[{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}])
+
+    def _status(self, state: str) -> dict:
+        result = {
+            "state": state,
+            "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}],
+        }
+        leveler = getattr(self.nodes, "_mic_leveler", None)
+        if leveler is not None:
+            result["audio_processing"] = leveler.status()
+        warning = getattr(self.nodes, "_mic_sdk_error", "")
+        if isinstance(warning, str) and warning:
+            result["sdk_warning"] = warning
+            result["audio_source"] = getattr(self.nodes, "_mic_source", None)
+        return result
 
     def start(self):
         if self.running:
-            return {"state": "running", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+            return self._status("running")
         self._enable_requested = True
         microphone_enabled = False
         try:
@@ -1302,10 +1512,12 @@ class MicPlugin:
             else:
                 self._enable_requested = False
             self.running = False
-            return {"state": "error", "message": message, "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+            result = self._status("error")
+            result["message"] = message
+            return result
         else:
             self.running = True
-            return {"state": "running", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+            return self._status("running")
 
     def stop(self):
         if not self._enable_requested:
@@ -1328,8 +1540,11 @@ class MicPlugin:
         elif action == "stop":
             result = self.stop()
             result["topic_out"] = [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]
+            leveler = getattr(self.nodes, "_mic_leveler", None)
+            if leveler is not None:
+                result["audio_processing"] = leveler.status()
             return result
-        return {"state": "running" if self.running else "idle", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+        return self._status("running" if self.running else "idle")
 
 
 class SpeakerPlugin:
@@ -2121,6 +2336,6 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
                ExpressionPlugin(audio, motion_catalog, catalog_available),
                HeadPlugin(audio, motion_catalog, catalog_available),
-               SystemControlsPlugin(nodes),
+               SystemControlsPlugin(nodes), SoundDirectionPlugin(nodes),
                camera_left, camera_right]
     return plugins
