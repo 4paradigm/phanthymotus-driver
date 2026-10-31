@@ -3528,7 +3528,8 @@ class ArmPlugin:
 
             msg.cmds = cmds
             self._pos_publisher.publish(msg)
-            return {"state": "moving", "side": "both", "joints": len(cmds)}
+            return {"state": "moving", "side": next(iter(poses)) if len(poses) == 1 else "both",
+                    "joints": len(cmds)}
         except Exception as e:
             return {"error": str(e)}
 
