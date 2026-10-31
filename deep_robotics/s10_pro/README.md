@@ -94,11 +94,12 @@ startup instead of selecting an arbitrary interface.
 `controlled_spatial` auto-selects local `drmap` only when the basic-server IP
 is assigned to this host and both `drmap` and its map directory are present.
 Otherwise the fixed allowlisted operations run over SSH to that server IP as
-`user` (overridable with `S10_DRMAP_SSH_USER`). Supply the password through the
-runtime secret `S10_DRMAP_PASSWORD`, or provision an SSH key; no password is
-stored in the image, source, or service fragment. SSH uses `accept-new` host
-key handling, so the first connection pins the presented host key and later
-changes fail closed. The tutorial demonstrates `/var/opt/robot/data/maps`,
+`user` (overridable with `S10_DRMAP_SSH_USER`). The service fragment defaults
+`S10_DRMAP_PASSWORD` to the robot's reported default password; override it via
+the deployment environment after changing the robot credential. This default
+is weak and is stored in the deployment configuration, not the image. SSH uses
+`accept-new` host-key handling, so the first connection pins the presented host
+key and later changes fail closed. The tutorial demonstrates `/var/opt/robot/data/maps`,
 `drmap mapping start`, `drmap mapping stop`, and `drmap map list`; responses
 from `drmap --format json map list` are parsed when valid. The SSH management
 host can differ from the TCP controller address and is set with

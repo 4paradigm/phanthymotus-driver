@@ -808,9 +808,9 @@ def test_service_configures_verified_s10_robot_network_without_shell_exports():
     assert environment["NETWORK_INTERFACE"] == "${S10_NETWORK_INTERFACE:-auto}"
     assert environment["S10_BASIC_SERVER_HOST"] == "${S10_BASIC_SERVER_HOST:-10.21.33.103}"
     assert environment["S10_DRMAP_MODE"] == "${S10_DRMAP_MODE:-auto}"
-    assert environment["S10_DRMAP_SSH_HOST"] == "${S10_DRMAP_SSH_HOST:-}"
+    assert environment["S10_DRMAP_SSH_HOST"] == "${S10_DRMAP_SSH_HOST:-10.21.33.106}"
     assert environment["S10_DRMAP_SSH_USER"] == "${S10_DRMAP_SSH_USER:-user}"
-    assert environment["S10_DRMAP_PASSWORD"] == "${S10_DRMAP_PASSWORD:-}"
+    assert environment["S10_DRMAP_PASSWORD"] == "${S10_DRMAP_PASSWORD:-'}"
     assert environment["ROBOT_NETWORK_CIDR"] == "10.21.33.0/24"
     config = yaml.safe_load((DRIVER / "config.yaml").read_text(encoding="utf-8"))
     assert config["basic_server"]["host"] == "10.21.33.103"
