@@ -153,6 +153,11 @@ class CoreSubscriber:
 
 
 def _run_subscriber(messages, profile, topic, domain):
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except ImportError:
+        pass
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
     os.environ["ROS_DOMAIN_ID"] = str(domain)
     os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile

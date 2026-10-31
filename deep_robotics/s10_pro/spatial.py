@@ -120,6 +120,10 @@ class S10ControlledSpatialPlugin:
         return payload
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             return {"state": "ready", "mode": self.mode,
                     "deployment": "aos" if self.control_local else "external",

@@ -31,6 +31,9 @@ def build_descriptor(expected_hz=10.0):
 class S10LocoServoPlugin:
     def __init__(self, native, ros2=None, motion=None):
         self.native, self.ros2, self.motion = native, ros2, motion
+        # Match the repository-wide motion-permission contract: images are
+        # read-only unless the deployment explicitly arms physical motion.
+        self._motion_enabled = os.environ.get("S10_MOTION_ENABLED", "0") == "1"
         self._descriptor_raw = build_descriptor()
         self._descriptor = parse_descriptor(self._descriptor_raw)
         self._lock = threading.RLock()
@@ -75,6 +78,7 @@ class S10LocoServoPlugin:
         if action == "resume": return self._halt(False)
         if action == "info": return {"state": "paused" if self._paused else "running" if self._running else "idle",
                                       "input": self._topic, "dry_run": self._dry_run,
+                                      "motion_enabled": self._motion_enabled,
                                       "applied": self._applied, "refused": self._refused,
                                       "control_interface": self._descriptor_raw}
         if action == "config":
@@ -91,6 +95,8 @@ class S10LocoServoPlugin:
     def _start(self, args):
         topic = str(args.get("input_topic") or "").strip()
         if not topic: return {"state": "error", "message": "缺少 input_topic，请连接 control/velocity 输出"}
+        if not self._motion_enabled:
+            return {"state": "error", "message": "S10_MOTION_ENABLED is not set; this driver is read-only"}
         if self.ros2 is None:
             return {"state": "error", "message": "没有 ROS runtime，无法接入 control/velocity"}
         if self.motion is not None and self.motion.is_moving():
@@ -150,12 +156,18 @@ class S10LocoServoPlugin:
             if subscriber is None:
                 return
             if not subscriber._process.is_alive():
-                with self._lock:
-                    self._running = False
-                    self._paused = True
-                    self._sink = None
-                    self._refused += 1
+                # The reader drives the watchdog. Once its subprocess is gone,
+                # no later tick can revoke the last non-zero native velocity.
+                # Hold before changing _running so a concurrent start cannot
+                # open a fresh stream between failure detection and the stop.
                 self._reader_stop.set()
+                self._hold()
+                with self._lock:
+                    if self._subscriber is subscriber:
+                        self._running = False
+                        self._paused = True
+                        self._sink = None
+                        self._refused += 1
                 return
             payload = subscriber.latest()
             if payload is not None:

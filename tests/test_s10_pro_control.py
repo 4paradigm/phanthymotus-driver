@@ -823,6 +823,7 @@ def test_service_configures_verified_s10_robot_network_without_shell_exports():
     environment = dict(item.split("=", 1) for item in service["environment"])
     assert environment["NETWORK_INTERFACE"] == "${S10_NETWORK_INTERFACE:-auto}"
     assert environment["S10_BASIC_SERVER_HOST"] == "${S10_BASIC_SERVER_HOST:-10.21.33.103}"
+    assert environment["S10_MOTION_ENABLED"] == "${S10_MOTION_ENABLED:-1}"
     assert environment["S10_DRMAP_MODE"] == "${S10_DRMAP_MODE:-auto}"
     assert environment["S10_DRMAP_SSH_HOST"] == "${S10_DRMAP_SSH_HOST:-10.21.33.106}"
     assert environment["S10_DRMAP_SSH_USER"] == "${S10_DRMAP_SSH_USER:-user}"
@@ -839,6 +840,7 @@ def test_core_domain_bridge_is_spawned_and_uses_bounded_latest_value_lanes():
     source = (DRIVER / "domain_bridge.py").read_text(encoding="utf-8")
     assert 'mp.get_context("spawn")' in source
     assert "Queue(maxsize=1)" in source
+    assert "logsafe.install(check_fd=False)" in source
     assert 'os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile' in source
     assert 'os.environ["ROS_DOMAIN_ID"] = str(domain)' in source
     assert "interfaceWhiteList" not in source
@@ -1322,6 +1324,8 @@ def test_controlled_spatial_uses_fixed_drmap_commands_and_confirmation(monkeypat
     monkeypatch.setattr(subprocess, "run", run)
     plugin = S10ControlledSpatialPlugin({"basic_server": {"host": "10.21.33.103"},
                                          "controlled_spatial": {"mode": "ssh", "ssh_host": "10.21.33.106"}})
+    assert plugin.dispatch("start", {}) == {"state": "ready"}
+    assert plugin.dispatch("stop", {}) == {"state": "idle"}
     assert plugin.dispatch("mapping_start", {})["code"] == "INVALID_ARGUMENT"
     assert calls == []
     listed = plugin.dispatch("map_list", {})
@@ -1433,7 +1437,53 @@ def test_loco_servo_is_a_dry_run_velocity_sink_by_default(monkeypatch):
     assert plugin.dispatch("info", {})["dry_run"] is True
     assert plugin.dispatch("config", {"dry_run": False})["code"] == "CONFIRM_REQUIRED"
     assert plugin.dispatch("config", {"dry_run": False, "confirm": True})["dry_run"] is False
-    assert plugin.dispatch("start", {"input_topic": "/policy/velocity"})["state"] == "error"
+    result = plugin.dispatch("start", {"input_topic": "/policy/velocity"})
+    assert result["state"] == "error"
+    assert "S10_MOTION_ENABLED" in result["message"]
+
+
+def test_loco_servo_holds_if_core_subscriber_dies(monkeypatch):
+    monkeypatch.syspath_prepend(str(DRIVER))
+    monkeypatch.setenv("S10_MOTION_ENABLED", "1")
+    from loco_servo import S10LocoServoPlugin
+
+    class Process:
+        alive = True
+
+        def is_alive(self):
+            return self.alive
+
+    class Subscriber:
+        def __init__(self, *_args):
+            self._process = Process()
+
+        def latest(self):
+            return None
+
+        def stop(self):
+            pass
+
+    subscriber = Subscriber()
+    monkeypatch.setattr("loco_servo.CoreSubscriber", lambda *_args: subscriber)
+    native = FakeNative({})
+    plugin = S10LocoServoPlugin(native, ros2=object())
+    try:
+        assert plugin.dispatch("config", {"dry_run": False, "confirm": True}) == {"ok": True, "dry_run": False}
+        assert plugin.dispatch("start", {"input_topic": "/policy/velocity"})["state"] == "running"
+        plugin._apply([0.2, 0.0, 0.0, 0.0, 0.0, 0.1])
+        assert native.calls[-1][0][2]["X"] == 0.2
+
+        subscriber._process.alive = False
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and plugin.dispatch("info", {})["state"] != "paused":
+            time.sleep(0.01)
+
+        assert plugin.dispatch("info", {})["state"] == "paused"
+        assert native.calls[-1][0][2] == {
+            "X": 0.0, "Y": 0.0, "Z": 0.0, "Roll": 0.0, "Pitch": 0.0, "Yaw": 0.0,
+        }
+    finally:
+        plugin.stop()
 
 
 def test_control_schema_exposes_supported_navigation_and_light_options(monkeypatch):

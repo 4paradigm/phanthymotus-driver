@@ -32,7 +32,10 @@ Motion uses native S10 TCP commands and reports long-running completion through
 second and a bounded duration. Head and tail lights are independent cards.
 `loco_servo` is the streaming counterpart for visual navigation policies. It
 subscribes on Core domain 42 through a loopback-only bridge process, requires
-`confirm=true` before switching out of dry-run, and stops on its watchdog.
+`S10_MOTION_ENABLED=1` at deployment plus `confirm=true` before switching out
+of dry-run, and stops on its watchdog. The supplied service fragment enables
+motion for supervised operation; set `S10_MOTION_ENABLED=0` to force read-only
+mode without rebuilding the image.
 The `navigation.route` action sends a sequence of up to 64 vendor `Item` targets
 in one native task request; each point has map coordinates, yaw, and point type,
 while the route shares gait, speed, direction, obstacle, and navigation mode.
