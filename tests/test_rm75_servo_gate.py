@@ -21,6 +21,16 @@ class FakeClient:
     def command(self, method, *args):
         return 0
 
+    def call(self, method, *args):
+        # `_start` 探测硬件：夹爪在线且使能，六维力有一个非零的系统外受力读数。
+        # 这个文件只关心运动门的交接，所以探测给的是「一切正常」。
+        if method == "rm_get_gripper_state":
+            return {"status": 1, "enable_state": 1, "actpos": 1000, "mode": 1}
+        if method == "rm_get_force_data":
+            return {"force_data": [0.0] * 6,
+                    "zero_force_data": [0.1, 0.0, 0.2, 0.0, 0.0, 0.0]}
+        raise AssertionError(f"unexpected SDK call: {method}")
+
 
 def test_servo_holds_motion_gate_for_active_stream():
     client = FakeClient()
