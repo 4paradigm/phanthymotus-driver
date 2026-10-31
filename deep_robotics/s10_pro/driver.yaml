@@ -23,7 +23,9 @@ cards:
   - { name: camera_front, type: sensor }
   - { name: camera_right, type: sensor }
   - { name: loco,        type: actuator }
+  - { name: loco_servo,  type: actuator }
   - { name: head_light,  type: actuator }
   - { name: tail_light,  type: actuator }
   - { name: charging,    type: actuator }
   - { name: navigation,  type: actuator }
+  - { name: controlled_spatial, type: actuator }
