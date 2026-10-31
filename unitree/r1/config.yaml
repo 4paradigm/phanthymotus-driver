@@ -2,6 +2,8 @@ mcp_port: 15702
 ros_namespace: ""   # 留空则自动使用 hostname
 
 plugins:
+  demo_echo:
+    enabled: true
   mic:
     enabled: true
   tts:
