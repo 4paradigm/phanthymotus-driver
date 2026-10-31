@@ -19,6 +19,9 @@ from basic_server import BasicServerClient, _protocol_int
 from common.vendor_runtime import action_schema, tool
 from domain_bridge import CoreBridge
 from media_workers import MediaWorkers, encode_pointcloud
+from loco_servo import S10LocoServoPlugin
+from spatial import S10ControlledSpatialPlugin
+from common.odom import build_interface, build_sample
 
 CAMERA_LANES = ("camera_rear", "camera_left", "camera_front", "camera_right")
 LIDAR_LANES = ("lidar_cloud", "lidar_map")
@@ -107,6 +110,7 @@ class S10Nodes:
             "joints": {"topic": base + "joints", "format": "sensor/skeleton"},
             "joint_state": {"topic": base + "joint_state", "format": "data/json"},
             "loco_state": {"topic": base + "loco_state", "format": "data/json"},
+            "odom": {"topic": base + "state/odom", "format": "state/odom"},
             "battery": {"topic": base + "battery", "format": "data/json"},
             "lidar_cloud": {"topic": base + "lidar_cloud", "format": "sensor/pointcloud"},
             "lidar_map": {"topic": base + "lidar_map", "format": "sensor/pointcloud"},
@@ -197,6 +201,7 @@ class S10Nodes:
             "joint_state": topics.get("joints", "/JOINTS_DATA_10HZ"),
             "battery": topics.get("battery", "/BATTERY_DATA"),
             "loco_state": topics.get("motion_info", "/MOTION_INFO"),
+            "odom": topics.get("motion_info", "/MOTION_INFO"),
             "lidar_cloud": topics.get("lidar_cloud", topics.get("lidar", "/DEPTH_POINTS")),
             "lidar_map": topics.get("lidar_map", "/ACCUMULATED_POINTS_MAP"),
         }
@@ -619,6 +624,22 @@ class S10Nodes:
             self.motion_state = motion.get("state") if isinstance(motion, dict) else None
             self.gait_state = gait.get("gait") if isinstance(gait, dict) else None
         self._publish_json("loco_state", data)
+        motion_info = data.get("motion_info", data) if isinstance(data, dict) else {}
+        def number(*names):
+            for name in names:
+                value = motion_info.get(name) if isinstance(motion_info, dict) else None
+                if value is not None:
+                    try:
+                            number = float(value)
+                            return number if math.isfinite(number) else None
+                    except (TypeError, ValueError):
+                        return None
+            return None
+        twist = [number("vel_x", "VelX"), number("vel_y", "VelY"), None,
+                 None, None, number("vel_yaw", "VelYaw")]
+        self._publish_json("odom", build_sample(
+            stamp_ms=int(time.time() * 1000), twist=twist,
+            vendor={"motion_state": motion, "gait_state": gait}))
 
     @staticmethod
     def _jpeg_from_ros_image(msg):
@@ -856,7 +877,7 @@ JOINT_NAMES = (
     "hl_hipx_joint", "hl_hipy_joint", "hl_knee_joint", "hl_wheel_joint",
     "hr_hipx_joint", "hr_hipy_joint", "hr_knee_joint", "hr_wheel_joint",
 )
-URDF_PATH = Path(__file__).with_name("resource") / "S10.urdf"
+URDF_PATH = Path(__file__).with_name("resource") / "S10_kinematic.urdf"
 MAX_LIDAR_RENDER_POINTS = 2000
 JOINT_DIRECTIONS = (1, 1, -1, 1, 1, -1, 1, -1,
                     -1, 1, -1, 1, -1, -1, 1, -1)
@@ -1054,6 +1075,7 @@ class S10StatePlugin:
             "joints": "山猫 S10 16 个轮足关节角度（原生协议 10Hz）",
             "joint_state": "山猫 S10 轮足关节位置、速度、力矩和温度（原生协议 10Hz）",
             "loco_state": "山猫 S10 运动状态、步态、模式和速度（原生协议 10Hz）",
+            "odom": "山猫 S10 本体速度里程计（未提供位姿，机体坐标系）",
             "battery": "山猫 S10 电池电量、电压、温度和充电状态",
             "lidar_cloud": "山猫 S10 原始实时激光雷达点云",
             "lidar_map": "山猫 S10 累积/定位点云地图",
@@ -1064,6 +1086,8 @@ class S10StatePlugin:
         definitions = []
         for name, description in cards.items():
             outputs = [topics[name]] if name in topics else None
+            if name == "loco_state" and "odom" in topics:
+                outputs.append(topics["odom"])
             definitions.append(tool(name, "sensor", description, topic_out=outputs))
         return definitions
 
@@ -1071,6 +1095,8 @@ class S10StatePlugin:
         result = {"state": state}
         if self.nodes and name in self.nodes.topics:
             result["topic_out"] = [self.nodes.topics[name]]
+            if name == "loco_state" and "odom" in self.nodes.topics:
+                result["topic_out"].append(self.nodes.topics["odom"])
         return result
 
     def start(self): self.native.start()
@@ -1086,7 +1112,13 @@ class S10StatePlugin:
             # The TCP client is shared by every S10 card and is closed only
             # when the driver bundle itself shuts down.
             return self._topic_result(name, "idle")
-        if action == "info": return self._topic_result(name, "ready")
+        if action == "info":
+            result = self._topic_result(name, "ready")
+            if name == "loco_state":
+                result["odom_interface"] = build_interface(
+                    provides=["vx", "vy", "wz"], frame="body", rate_hz=10,
+                    pose_drift="none")
+            return result
         reports = self.native.snapshot()["reports"]
         keys = {"imu": "1048577:15728640", "joints": "1048577:15728640",
                 "joint_state": "1048577:15728640", "loco_state": "1048577:15728640",
@@ -1138,6 +1170,7 @@ class S10MotionPlugin:
     def __init__(self, native, nodes=None):
         self.native = native
         self.nodes = nodes
+        self._servo = None
         self._condition = threading.Condition()
         self._active = None
         self._transition_lock = threading.Lock()
@@ -1147,6 +1180,13 @@ class S10MotionPlugin:
 
     def _acp_callback(self, action_id, status, result):
         _notify_acp_async(action_id, status, result, "loco")
+
+    def attach_servo(self, plugin):
+        self._servo = plugin
+
+    def is_moving(self):
+        with self._condition:
+            return self._active is not None
 
     def _finish(self, active, status, result):
         if active and active.get("action_id"):
@@ -1235,6 +1275,7 @@ class S10MotionPlugin:
         schema = result["inputSchema"]
         schema["x-completion"] = {"actions": ["move", "manual_control", "stand_up", "stand_down",
                                                "damp", "gait"], "timeout": 65}
+        _mark_dangerous(result, ("damp", "gait", "mode"))
         return result
     def start(self):
         with self._condition:
@@ -1304,6 +1345,12 @@ class S10MotionPlugin:
                         exc = RuntimeError(f"{exc}; zero command failed: {stop_exc}")
                     self._finish(command, "error", {"state": "error", "message": str(exc)})
     def dispatch(self, action, args):
+        if action in {"damp", "gait", "mode"}:
+            error = _confirmation_error(action, args)
+            if error:
+                return error
+        if self._servo is not None and action not in {"start", "info"}:
+            self._servo.pause_for_explicit_command(action)
         if action == "start":
             self.start()
             return {"state": "ready"}
@@ -1373,9 +1420,10 @@ class S10MotionPlugin:
 
 
 class S10NavigationPlugin:
-    CONFIRM_ACTIONS = {"goal", "localize"}
+    CONFIRM_ACTIONS = {"goal", "route", "localize"}
     ACTIONS = {
         "goal": (["x", "y", "z", "yaw_degrees", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous"], "前往设备当前已加载地图中的目标点；不负责建图；航向角使用角度制"),
+        "route": (["waypoints", "gait", "speed", "reverse", "avoid_obstacles", "autonomous"], "按顺序执行多个地图目标点；各点使用米和度；不负责建图"),
         "cancel": ([], "取消当前导航任务"), "status": ([], "查询导航任务状态"),
         "localize": (["x", "y", "z", "yaw_degrees"], "按地图坐标初始化/重置定位；航向角使用角度制"),
         "pose": ([], "查询机器人地图坐标和姿态"),
@@ -1393,11 +1441,17 @@ class S10NavigationPlugin:
             "gait": {"type": "string", "enum": ["navigation_flat", "navigation_stairs"], "default": "navigation_flat"},
             "speed": {"type": "integer", "enum": [0, 1, 2], "default": 0}, "reverse": {"type": "boolean", "default": False},
             "avoid_obstacles": {"type": "boolean", "default": True}, "autonomous": {"type": "boolean", "default": False},
+            "waypoints": {"type": "array", "minItems": 1, "maxItems": 64,
+                          "items": {"type": "object", "required": ["x", "y", "yaw_degrees"],
+                                    "properties": {"x": {"type": "number"}, "y": {"type": "number"},
+                                                   "z": {"type": "number", "default": 0},
+                                                   "yaw_degrees": {"type": "number"},
+                                                   "point_type": {"type": "integer", "enum": [0, 1, 2, 3, 4], "default": 1}}}},
             "confirm": {"type": "boolean", "description": "Required true for goal navigation and localization changes."},
         }))
         _mark_dangerous(result, self.CONFIRM_ACTIONS)
         timeout = max(10, math.ceil(float(self.native.config.get("navigation_task_timeout", 180))) + 10)
-        result["inputSchema"]["x-completion"] = {"actions": ["goal"], "timeout": timeout}
+        result["inputSchema"]["x-completion"] = {"actions": ["goal", "route"], "timeout": timeout}
         return result
 
     def _acp_callback(self, action_id, status, result):
@@ -1423,14 +1477,19 @@ class S10NavigationPlugin:
             value = int(raw_code, 16 if raw_code.startswith("0x") else 10)
         except (TypeError, ValueError):
             return str(code)
-        return None if value == 0 else value
+        return None if value in {0, 0x2300, 0x2302} else value
 
-    def _run_goal(self, action_id, item, timeout):
+    def _run_goal(self, action_id, items, timeout):
         try:
-            response = self.native.request(0x00100003, 0x00100002, {"Item": [item]}, response_timeout=timeout)
+            response = self.native.request(0x00100003, 0x00100002, {"Item": items}, response_timeout=timeout)
             error = self._response_error(response)
             if error is not None:
                 self._finish_goal(action_id, "error", {"state": "error", "error_code": error, "response": response})
+                return
+            terminal = self._navigation_terminal(response)
+            if terminal is not None:
+                state, detail = terminal
+                self._finish_goal(action_id, state, {"state": state, "response": response, **detail})
                 return
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
@@ -1454,17 +1513,33 @@ class S10NavigationPlugin:
         items = body.get("Items", body) if isinstance(body, dict) else {}
         if not isinstance(items, dict):
             return None
-        raw = next((items.get(key) for key in
-                    ("NavigationState", "NavState", "TaskState", "Status", "State")
-                    if items.get(key) is not None), None)
+        nav_status = items.get("NavStatus", {})
+        nav_status = nav_status if isinstance(nav_status, dict) else {}
+        error_code = nav_status.get("ErrorCode", items.get("ErrorCode"))
+        if error_code is not None:
+            try:
+                raw_error = str(error_code).strip().lower()
+                code = int(raw_error, 16 if raw_error.startswith("0x") else 10)
+            except (TypeError, ValueError):
+                code = None
+            if code == 0x2300:
+                return "completed", {}
+            if code == 0x2302:
+                return "cancelled", {"reason": "navigation_cancelled"}
+            if code not in (None, 0):
+                return "error", {"message": "navigation task failed", "error_code": code}
+        raw = next((value for value in (
+                    nav_status.get("Status"), items.get("NavigationState"),
+                    items.get("NavState"), items.get("TaskState"),
+                    items.get("Status"), items.get("State")) if value is not None), None)
         if raw is None:
             return None
         value = str(raw).strip().lower()
-        if value in {"completed", "complete", "success", "succeeded", "3", "4"}:
+        if value in {"completed", "complete", "success", "succeeded", "4"}:
             return "completed", {}
-        if value in {"cancelled", "canceled", "cancel", "5"}:
+        if value in {"cancelled", "canceled", "cancel"}:
             return "cancelled", {"reason": "navigation_cancelled"}
-        if value in {"failed", "failure", "error", "aborted", "6", "7"}:
+        if value in {"failed", "failure", "error", "aborted"}:
             return "error", {"message": "navigation task failed", "status": raw}
         return None
 
@@ -1516,12 +1591,25 @@ class S10NavigationPlugin:
         if action == "perception_status": return self.native.request(0x00100003, 0x00110001)
         if action == "localize":
             return self.native.request(0x00100003, 0x00200002, {"PosX": args["x"], "PosY": args["y"], "PosZ": args.get("z", 0), "Yaw": math.radians(float(args["yaw_degrees"]))})
-        if action == "goal":
-            item = {"Value": 0, "MapID": 0, "PosX": args["x"], "PosY": args["y"], "PosZ": args.get("z", 0),
-                    "AngleYaw": math.radians(float(args["yaw_degrees"])), "PointInfo": int(args.get("point_type", 1)),
+        if action in {"goal", "route"}:
+            points = [args] if action == "goal" else args.get("waypoints")
+            if not isinstance(points, list) or not points or len(points) > 64:
+                return {"ok": False, "code": "INVALID_ARGUMENT", "error": "route requires 1 to 64 waypoints"}
+            items = []
+            for point in points:
+                if not isinstance(point, dict) or not all(key in point for key in ("x", "y", "yaw_degrees")):
+                    return {"ok": False, "code": "INVALID_ARGUMENT", "error": "each waypoint requires x, y, and yaw_degrees"}
+                xyz_yaw = [point["x"], point["y"], point.get("z", 0), point["yaw_degrees"]]
+                if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                       for v in xyz_yaw):
+                    return {"ok": False, "code": "INVALID_ARGUMENT", "error": "waypoint coordinates and yaw must be finite numbers"}
+                items.append({"Value": len(items), "MapID": 0,
+                    "PosX": float(point["x"]), "PosY": float(point["y"]), "PosZ": float(point.get("z", 0)),
+                    "AngleYaw": math.radians(float(point["yaw_degrees"])),
+                    "PointInfo": int(point.get("point_type", args.get("point_type", 1))),
                     "Gait": GAITS[args.get("gait", "navigation_flat")], "Speed": int(args.get("speed", 0)),
                     "Manner": int(bool(args.get("reverse", False))), "ObsMode": 0 if args.get("avoid_obstacles", True) else 1,
-                    "NavMode": int(bool(args.get("autonomous", False))), "Terrain": 0, "Posture": 0, "Waypoints": {}}
+                    "NavMode": int(bool(args.get("autonomous", False))), "Terrain": 0, "Posture": 0, "Waypoints": {}})
             timeout = float(self.native.config.get("navigation_task_timeout", 180))
             action_id = f"s10_navigation_{uuid4().hex}"
             with self._goal_lock:
@@ -1529,7 +1617,7 @@ class S10NavigationPlugin:
                     return {"ok": False, "code": "ACTION_IN_PROGRESS", "action_id": self._active_goal,
                             "error": "navigation goal already active; cancel it before sending another goal"}
                 self._active_goal = action_id
-            worker = threading.Thread(target=self._run_goal, args=(action_id, item, timeout),
+            worker = threading.Thread(target=self._run_goal, args=(action_id, items, timeout),
                                       daemon=True, name="s10-navigation-goal")
             try:
                 worker.start()
@@ -1538,8 +1626,8 @@ class S10NavigationPlugin:
                     if self._active_goal == action_id:
                         self._active_goal = None
                 return {"ok": False, "code": "WORKER_START_FAILED", "error": str(exc)}
-            return {"state": "accepted", "action": "goal", "action_id": action_id,
-                    "task_timeout": timeout}
+            return {"state": "accepted", "action": action, "waypoint_count": len(items),
+                    "action_id": action_id, "task_timeout": timeout}
         raise ValueError(f"unsupported S10 navigation action: {action}")
 
 
@@ -1644,10 +1732,14 @@ class S10ChargePlugin:
 def build_plugins(config, namespace=None, ros2=None):
     native = BasicServerClient(config)
     nodes = S10Nodes(config, namespace or "", ros2) if ros2 is not None else None
-    plugins = [S10ModelPlugin(), S10StatePlugin(native, nodes), S10MotionPlugin(native, nodes),
+    motion = S10MotionPlugin(native, nodes)
+    servo = S10LocoServoPlugin(native, ros2, motion)
+    motion.attach_servo(servo)
+    plugins = [S10ModelPlugin(), S10StatePlugin(native, nodes), motion,
+               servo,
                S10SingleLightPlugin(native, "head"),
                S10SingleLightPlugin(native, "tail"),
                S10ChargePlugin(native)]
     if str(config.get("model_variant", "standard")).lower() == "pro":
-        plugins.append(S10NavigationPlugin(native))
+        plugins.extend([S10NavigationPlugin(native), S10ControlledSpatialPlugin(config)])
     return plugins

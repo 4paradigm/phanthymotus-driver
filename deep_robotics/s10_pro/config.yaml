@@ -6,9 +6,11 @@ navigation_task_timeout: 180
 ros:
   robot_domain_id: 0
   core_domain_id: null
+  robot_interface: auto
+  robot_network_cidr: 10.21.33.0/24
 # service.yml targets the S10 onboard host: robot_server runs there and listens
-# on TCP 30003. NETWORK_INTERFACE/CIDR constrain robot-domain DDS; domain 42 is
-# published only by isolated loopback-profiled subprocesses.
+# on TCP 30003. NETWORK_INTERFACE/CIDR constrain robot-domain DDS; domain 42
+# publishers and the control subscriber run in loopback-profiled subprocesses.
 topics:
   imu: "/IMU"
   joints: "/JOINTS_DATA_10HZ"
@@ -94,3 +96,11 @@ basic_server:
   host: "10.21.33.103"
   tcp_port: 30003
   timeout: 2.0
+controlled_spatial:
+  # drmap lives on NOS, separate from AOS/basic_server. Auto uses local only
+  # when this host is the NOS management host; otherwise it connects by SSH.
+  mode: auto
+  ssh_user: user
+  ssh_host: "10.21.33.106"
+  directory: /var/opt/robot/data/maps
+  timeout: 30

@@ -7,8 +7,17 @@ deep-robotics-s10-pro:
     - RCUTILS_COLORIZED_OUTPUT=0
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - ROS_LOCALHOST_ONLY=0
-    - NETWORK_INTERFACE=eth0
+    - NETWORK_INTERFACE=${S10_NETWORK_INTERFACE:-auto}
     - ROBOT_NETWORK_CIDR=10.21.33.0/24
+    - S10_BASIC_SERVER_HOST=${S10_BASIC_SERVER_HOST:-10.21.33.103}
+    # This deployment is intended for supervised physical operation. Setting
+    # the value to 0 preserves read-only mode without rebuilding the image.
+    - S10_MOTION_ENABLED=${S10_MOTION_ENABLED:-1}
+    - S10_DRMAP_MODE=${S10_DRMAP_MODE:-auto}
+    - S10_DRMAP_SSH_HOST=${S10_DRMAP_SSH_HOST:-10.21.33.106}
+    - S10_DRMAP_SSH_USER=${S10_DRMAP_SSH_USER:-user}
+    - S10_DRMAP_PASSWORD=${S10_DRMAP_PASSWORD:-'}
+    - S10_DRMAP_DIRECTORY=${S10_DRMAP_DIRECTORY:-/var/opt/robot/data/maps}
     - AGENT_CORE_URL=https://localhost:15678
   logging:
     driver: local

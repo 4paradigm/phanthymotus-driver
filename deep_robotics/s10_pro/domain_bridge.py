@@ -125,6 +125,59 @@ class CoreBridge:
         self._ctx = None
 
 
+class CoreSubscriber:
+    """Receive one Core-domain String stream in a loopback-only process."""
+
+    def __init__(self, profile: str, topic: str, domain: int = 42):
+        self._ctx = mp.get_context("spawn")
+        self._messages = self._ctx.Queue(maxsize=1)
+        self._process = self._ctx.Process(
+            target=_run_subscriber, args=(self._messages, profile, topic, int(domain)),
+            name="s10-pro-domain42-control", daemon=True)
+        self._process.start()
+        self._dropped = 0
+
+    def latest(self):
+        item = None
+        while True:
+            try:
+                item = self._messages.get_nowait()
+            except queue.Empty:
+                return item
+
+    def stop(self):
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=1)
+        self._messages.close()
+
+
+def _run_subscriber(messages, profile, topic, domain):
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except ImportError:
+        pass
+    os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
+    os.environ["ROS_DOMAIN_ID"] = str(domain)
+    os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile
+    import rclpy
+    from rclpy.node import Node
+    from std_msgs.msg import String
+
+    rclpy.init(domain_id=domain)
+    node = Node("s10_pro_core_control")
+    def receive(message):
+        _put_latest(messages, message.data)
+    node.create_subscription(String, topic, receive, 1)
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
 class _BridgePublisher:
     def __init__(self, bridge, lane, topic, msg_type, serialize_message):
         self._bridge = bridge

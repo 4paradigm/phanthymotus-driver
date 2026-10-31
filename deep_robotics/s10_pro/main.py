@@ -26,13 +26,56 @@ def _interface_ipv4(interface):
     return ipaddress.ip_interface(f"{address}/{netmask}")
 
 
+def _route_source_ipv4(host, port):
+    """Ask the kernel which source address it routes to the S10 server."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.connect((str(host), int(port)))
+        return ipaddress.ip_address(sock.getsockname()[0])
+
+
+def _interface_names_for_address(address):
+    matches = []
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        for _, name in socket.if_nameindex():
+            request = struct.pack("256s", name.encode()[:15])
+            try:
+                current = socket.inet_ntoa(fcntl.ioctl(sock.fileno(), 0x8915, request)[20:24])
+            except OSError:
+                continue
+            if current == str(address):
+                matches.append(name)
+    return matches
+
+
+def resolve_robot_interface(config):
+    """Resolve the robot-facing interface by the kernel route to basic_server."""
+    ros_config = config.get("ros", {})
+    configured = os.environ.get("NETWORK_INTERFACE") or ros_config.get("robot_interface", "auto")
+    if configured and str(configured).lower() != "auto":
+        return str(configured)
+    server = config.get("basic_server", {})
+    host = os.environ.get("S10_BASIC_SERVER_HOST") or server.get("host")
+    port = server.get("tcp_port", server.get("tls_tcp_port", 30003))
+    if not host:
+        raise ValueError("basic_server.host is required to auto-detect the S10 network interface")
+    try:
+        source = _route_source_ipv4(host, port)
+    except OSError as exc:
+        raise ValueError(f"cannot resolve a route to S10 basic_server {host}: {exc}") from exc
+    matches = _interface_names_for_address(source)
+    if len(matches) != 1:
+        raise ValueError(f"route to S10 server {host} selected source {source}, which maps to {len(matches)} interfaces")
+    print(f"[network] auto-detected S10 interface {matches[0]} ({source}) via route to {host}", flush=True)
+    return matches[0]
+
+
 def configure_fastdds_profile(config):
     """Configure the robot process and a separate loopback-only core bridge."""
     ros_config = config.get("ros", {})
-    interface = os.environ.get("NETWORK_INTERFACE") or ros_config.get("robot_interface")
+    interface = resolve_robot_interface(config)
     if not interface or len(interface.encode()) > 15:
         raise ValueError("NETWORK_INTERFACE must name the isolated S10-facing network interface")
-    cidr = os.environ.get("ROBOT_NETWORK_CIDR") or ros_config.get("robot_network_cidr")
+    cidr = os.environ.get("ROBOT_NETWORK_CIDR") or ros_config.get("robot_network_cidr") or "10.21.33.0/24"
     if not cidr:
         raise ValueError("ROBOT_NETWORK_CIDR must explicitly identify the isolated robot subnet")
     try:
