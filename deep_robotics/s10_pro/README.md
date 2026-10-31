@@ -66,8 +66,11 @@ Build with the repository's normal driver build workflow. `driver.yaml` declares
 required vendor message definitions in a build stage, and copies only their
 runtime interfaces into the final image. See `vendor/SOURCE.md` for provenance.
 The final image is larger than the base image because this driver needs the
-Fast DDS RMW package plus PyYAML and Pillow; apt recommends and pip caches are
-disabled/removed to keep that growth limited to this component.
+Fast DDS RMW package plus PyYAML, Pillow, `openssh-client`, and `sshpass`.
+The SSH packages support the current one-click NOS `drmap` password path; they
+can be removed when deployment supports a managed SSH key/secret. Apt
+recommends and pip caches are disabled/removed to keep this growth limited to
+the component.
 
 `deploy/service.yml` is a service fragment for the normal platform deployment.
 It does not mount host files; it preconfigures the interface auto-detection,
@@ -131,10 +134,12 @@ multi-point native route remains the supported navigation route contract.
 Run from repository root:
 
 ```sh
-python -m pytest -q tests/test_s10_four_monitors.py tests/test_s10_registration.py tests/test_s10_monitor_runtime.py
+python3 -m pytest -q tests/test_s10_pro_control.py
 ```
 
-Tests use synthetic messages, fake subscriptions and local HTTP. They do not
-send robot commands. Earlier combined-image robot checks are historical and do
-not validate this independent monitoring image; a new Bot build and robot-level
-monitor validation are required before claiming this version accepted.
+The latest local run passed 75 tests. Tests use synthetic messages, fake native
+TCP clients, and fake Core-domain subscribers; they do not send robot commands.
+They cover interface auto-detection, AOS/NOS separation, control confirmation,
+valid/invalid continuous-control messages, watchdog stopping, and subscriber
+failure stopping. A new Bot build and robot-level validation are still required
+before claiming this version accepted.

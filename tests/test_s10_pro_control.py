@@ -1486,6 +1486,87 @@ def test_loco_servo_holds_if_core_subscriber_dies(monkeypatch):
         plugin.stop()
 
 
+def test_loco_servo_core_stream_validates_messages_and_watchdog_holds(monkeypatch):
+    monkeypatch.syspath_prepend(str(DRIVER))
+    monkeypatch.setenv("S10_MOTION_ENABLED", "1")
+    from loco_servo import S10LocoServoPlugin
+
+    class Process:
+        def is_alive(self):
+            return True
+
+    class Subscriber:
+        def __init__(self, *_args):
+            self._process = Process()
+            self.payloads = []
+
+        def latest(self):
+            return self.payloads.pop(0) if self.payloads else None
+
+        def stop(self):
+            pass
+
+    def command(values, *, stamp_ms=None, ttl_ms=500, seq=1):
+        stamp_ms = int(time.time() * 1000) if stamp_ms is None else stamp_ms
+        return json.dumps({
+            "schema": "motus.control/1", "seq": seq, "stamp_ms": stamp_ms,
+            "obs_stamp_ms": stamp_ms, "ttl_ms": ttl_ms, "source": "test",
+            "priority": 50, "mode": "twist", "dof": 6, "values": values,
+        })
+
+    def wait_for(predicate):
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        pytest.fail("timed out waiting for loco_servo reader")
+
+    subscriber = Subscriber()
+    monkeypatch.setattr("loco_servo.CoreSubscriber", lambda *_args: subscriber)
+    native = FakeNative({})
+    plugin = S10LocoServoPlugin(native, ros2=object())
+    try:
+        plugin.dispatch("config", {"dry_run": False, "confirm": True})
+        assert plugin.dispatch("start", {"input_topic": "/policy/velocity"})["state"] == "running"
+
+        subscriber.payloads.append(command([0.2, 0.1, 0.0, 0.0, 0.0, -0.2]))
+        wait_for(lambda: len(native.calls) == 1)
+        assert native.calls[-1][0][2] == {
+            "X": 0.2, "Y": 0.1, "Z": 0.0, "Roll": 0.0, "Pitch": 0.0, "Yaw": -0.2,
+        }
+
+        time.sleep(0.06)
+        subscriber.payloads.append(command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0],
+                                           stamp_ms=int(time.time() * 1000) - 1000,
+                                           ttl_ms=100, seq=2))
+        wait_for(lambda: getattr(plugin._last, "verdict", None).value == "dropped")
+        assert len(native.calls) == 1
+
+        time.sleep(0.06)
+        subscriber.payloads.append(command([2.0, 0.0, 0.0, 0.0, 0.0, 0.0], seq=3))
+        wait_for(lambda: getattr(plugin._last, "verdict", None).value == "clamped")
+        assert len(native.calls) == 2
+        assert native.calls[-1][0][2]["X"] == pytest.approx(0.45)
+
+        time.sleep(0.06)
+        subscriber.payloads.append(command([0.1, 0.0, 0.2, 0.0, 0.0, 0.0], seq=4))
+        wait_for(lambda: getattr(plugin._last, "verdict", None).value == "rejected")
+        assert len(native.calls) == 2
+
+        refused = plugin.dispatch("info", {})["refused"]
+        subscriber.payloads.append("not-json")
+        wait_for(lambda: plugin.dispatch("info", {})["refused"] == refused + 1)
+        assert len(native.calls) == 2
+
+        wait_for(lambda: len(native.calls) == 3)
+        assert native.calls[-1][0][2] == {
+            "X": 0.0, "Y": 0.0, "Z": 0.0, "Roll": 0.0, "Pitch": 0.0, "Yaw": 0.0,
+        }
+    finally:
+        plugin.stop()
+
+
 def test_control_schema_exposes_supported_navigation_and_light_options(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
