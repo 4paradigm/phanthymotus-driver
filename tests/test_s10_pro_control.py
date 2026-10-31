@@ -775,29 +775,45 @@ def test_controlled_spatial_auto_detects_aos_and_external_execution(monkeypatch,
     monkeypatch.delenv("S10_DRMAP_MODE", raising=False)
     monkeypatch.delenv("S10_DRMAP_PASSWORD", raising=False)
 
-    monkeypatch.setattr(S10ControlledSpatialPlugin, "_is_local_address", staticmethod(lambda _address: True))
+    # AOS (103) can host the driver while NOS (106) continues to own drmap.
+    monkeypatch.setattr(
+        S10ControlledSpatialPlugin,
+        "_is_local_address",
+        staticmethod(lambda address: str(address) == "10.21.33.103"),
+    )
     monkeypatch.setattr("spatial.shutil.which", lambda command: "/usr/bin/drmap" if command == "drmap" else "/usr/bin/ssh")
     plugin = S10ControlledSpatialPlugin({
         "basic_server": {"host": "10.21.33.103"},
-        "controlled_spatial": {"mode": "auto", "directory": str(tmp_path)},
+        "controlled_spatial": {"mode": "auto", "ssh_host": "10.21.33.106", "directory": str(tmp_path)},
     })
-    assert plugin.mode == "local"
-    # Recreate to exercise auto-selection against an external S10 address.
+    assert plugin.mode == "ssh"
+    assert plugin.dispatch("info", {})["deployment"] == "aos"
+    assert plugin.host == "10.21.33.106"
+
+    # A Jetson sees neither robot address locally and uses the same NOS SSH path.
     monkeypatch.setattr(S10ControlledSpatialPlugin, "_is_local_address", staticmethod(lambda _address: False))
     plugin = S10ControlledSpatialPlugin({
         "basic_server": {"host": "10.21.33.103"},
-        "controlled_spatial": {"mode": "auto", "directory": str(tmp_path)},
+        "controlled_spatial": {"mode": "auto", "ssh_host": "10.21.33.106", "directory": str(tmp_path)},
     })
     assert plugin.mode == "ssh"
-    assert plugin.host == "10.21.33.103"
+    assert plugin.dispatch("info", {})["deployment"] == "external"
+    assert plugin.host == "10.21.33.106"
     assert plugin.user == "user"
 
+    # Only a NOS-local deployment may execute drmap without SSH.
     monkeypatch.setattr(S10ControlledSpatialPlugin, "_is_local_address", staticmethod(lambda _address: True))
+    plugin = S10ControlledSpatialPlugin({
+        "basic_server": {"host": "10.21.33.103"},
+        "controlled_spatial": {"mode": "auto", "ssh_host": "10.21.33.106", "directory": str(tmp_path)},
+    })
+    assert plugin.mode == "local"
+
     monkeypatch.setattr("spatial.shutil.which", lambda _command: None)
-    with pytest.raises(ValueError, match="S10 address is local but drmap"):
+    with pytest.raises(ValueError, match="S10 NOS address is local but drmap"):
         S10ControlledSpatialPlugin({
             "basic_server": {"host": "10.21.33.103"},
-            "controlled_spatial": {"mode": "auto", "directory": str(tmp_path)},
+            "controlled_spatial": {"mode": "auto", "ssh_host": "10.21.33.106", "directory": str(tmp_path)},
         })
 
 
@@ -815,6 +831,7 @@ def test_service_configures_verified_s10_robot_network_without_shell_exports():
     config = yaml.safe_load((DRIVER / "config.yaml").read_text(encoding="utf-8"))
     assert config["basic_server"]["host"] == "10.21.33.103"
     assert config["basic_server"]["timeout"] == 2.0
+    assert config["controlled_spatial"]["ssh_host"] == "10.21.33.106"
     assert config["controlled_spatial"]["timeout"] == 30
 
 
@@ -1303,8 +1320,8 @@ def test_controlled_spatial_uses_fixed_drmap_commands_and_confirmation(monkeypat
         return SimpleNamespace(returncode=0, stdout='{"maps": []}', stderr='')
 
     monkeypatch.setattr(subprocess, "run", run)
-    plugin = S10ControlledSpatialPlugin({"basic_server": {"host": "10.21.33.106"},
-                                         "controlled_spatial": {"mode": "ssh"}})
+    plugin = S10ControlledSpatialPlugin({"basic_server": {"host": "10.21.33.103"},
+                                         "controlled_spatial": {"mode": "ssh", "ssh_host": "10.21.33.106"}})
     assert plugin.dispatch("mapping_start", {})["code"] == "INVALID_ARGUMENT"
     assert calls == []
     listed = plugin.dispatch("map_list", {})

@@ -67,8 +67,10 @@ Fast DDS RMW package plus PyYAML and Pillow; apt recommends and pip caches are
 disabled/removed to keep that growth limited to this component.
 
 `deploy/service.yml` is a service fragment for the normal platform deployment.
-It does not mount host files; the interface, robot subnet, and native server
-address must be set in its environment/configuration for the target host.
+It does not mount host files; it preconfigures the interface auto-detection,
+robot subnet, AOS control endpoint, and NOS map-management endpoint for a
+standard S10 deployment. Override these values only for a different robot
+network or changed robot credentials.
 `main.py` generates the robot and Core Fast DDS profiles at startup.
 
 This bundle uses the repository's shared registration helper. That helper does
@@ -91,9 +93,11 @@ the server remains `10.21.33.103`; do not use the NOS `10.21.31.0/24`
 service/PPS network for the robot-facing port. Ambiguous or missing routes fail
 startup instead of selecting an arbitrary interface.
 
-`controlled_spatial` auto-selects local `drmap` only when the basic-server IP
-is assigned to this host and both `drmap` and its map directory are present.
-Otherwise the fixed allowlisted operations run over SSH to that server IP as
+`10.21.33.103` is the AOS TCP control/sensing endpoint, while `10.21.33.106`
+is the NOS map-management endpoint. `controlled_spatial` auto-selects local
+`drmap` only when the NOS management IP is assigned to this host and both
+`drmap` and its map directory are present. Otherwise the fixed allowlisted
+operations run over SSH to the NOS host as
 `user` (overridable with `S10_DRMAP_SSH_USER`). The service fragment defaults
 `S10_DRMAP_PASSWORD` to the robot's reported default password; override it via
 the deployment environment after changing the robot credential. This default
@@ -102,8 +106,7 @@ is weak and is stored in the deployment configuration, not the image. SSH uses
 key and later changes fail closed. The tutorial demonstrates `/var/opt/robot/data/maps`,
 `drmap mapping start`, `drmap mapping stop`, and `drmap map list`; responses
 from `drmap --format json map list` are parsed when valid. The SSH management
-host can differ from the TCP controller address and is set with
-`S10_DRMAP_SSH_HOST` (the tutorial session shows `10.21.33.106`). Map
+host is set with `S10_DRMAP_SSH_HOST` and defaults to `10.21.33.106`. Map
 activation, deletion, and mapping status remain unavailable until their exact
 CLI schema and error semantics are verified on target firmware.
 

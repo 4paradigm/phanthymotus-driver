@@ -97,10 +97,10 @@ basic_server:
   tcp_port: 30003
   timeout: 2.0
 controlled_spatial:
-  # auto selects local drmap only when the S10 server address belongs to this
-  # host and the CLI is available; otherwise it uses SSH to basic_server.host.
+  # drmap lives on NOS, separate from AOS/basic_server. Auto uses local only
+  # when this host is the NOS management host; otherwise it connects by SSH.
   mode: auto
   ssh_user: user
-  ssh_host: ""
+  ssh_host: "10.21.33.106"
   directory: /var/opt/robot/data/maps
   timeout: 30

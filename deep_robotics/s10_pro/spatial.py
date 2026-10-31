@@ -27,9 +27,9 @@ class S10ControlledSpatialPlugin:
     def __init__(self, config):
         spatial = config.get("controlled_spatial", {})
         self.requested_mode = os.environ.get("S10_DRMAP_MODE", spatial.get("mode", "auto"))
-        self.host = str(os.environ.get("S10_DRMAP_SSH_HOST") or spatial.get("ssh_host") or
-                        os.environ.get("S10_BASIC_SERVER_HOST") or
-                        config.get("basic_server", {}).get("host", "10.21.33.103"))
+        self.control_host = str(os.environ.get("S10_BASIC_SERVER_HOST") or
+                                config.get("basic_server", {}).get("host", "10.21.33.103"))
+        self.host = str(os.environ.get("S10_DRMAP_SSH_HOST") or spatial.get("ssh_host") or "10.21.33.106")
         self.user = os.environ.get("S10_DRMAP_SSH_USER", spatial.get("ssh_user", "user"))
         self.password = os.environ.get("S10_DRMAP_PASSWORD", "")
         self.directory = os.environ.get("S10_DRMAP_DIRECTORY", spatial.get("directory", "/var/opt/robot/data/maps"))
@@ -39,17 +39,21 @@ class S10ControlledSpatialPlugin:
         try:
             self.host_address = ipaddress.ip_address(self.host)
         except ValueError as exc:
-            raise ValueError("S10 basic_server host must be an IP address for deployment detection") from exc
+            raise ValueError("S10 drmap SSH host must be an IP address for deployment detection") from exc
         if not self.directory.startswith("/") or "\n" in self.directory:
             raise ValueError("S10_DRMAP_DIRECTORY must be an absolute path")
         self.local_target = self._is_local_address(self.host_address)
+        try:
+            self.control_local = self._is_local_address(ipaddress.ip_address(self.control_host))
+        except ValueError as exc:
+            raise ValueError("S10 basic_server host must be an IP address for deployment detection") from exc
         local_drmap = shutil.which("drmap") is not None and os.path.isdir(self.directory)
         if self.requested_mode == "local" and not local_drmap:
             raise ValueError("local drmap mode requested but drmap or map directory is missing")
         if self.requested_mode == "local" and not self.local_target:
-            raise ValueError("refusing local drmap execution: S10 basic_server is not a local address")
+            raise ValueError("refusing local drmap execution: S10 NOS management host is not local")
         if self.requested_mode == "auto" and self.local_target and not local_drmap:
-            raise ValueError("S10 address is local but drmap or its map directory is missing")
+            raise ValueError("S10 NOS address is local but drmap or its map directory is missing")
         self.mode = ("local" if self.local_target else "ssh") if self.requested_mode == "auto" else self.requested_mode
         if self.mode == "ssh" and shutil.which("ssh") is None:
             raise ValueError("ssh client is required for robot-side drmap execution")
@@ -118,7 +122,8 @@ class S10ControlledSpatialPlugin:
     def dispatch(self, action, args):
         if action == "info":
             return {"state": "ready", "mode": self.mode,
-                    "deployment": "aos" if self.local_target else "external",
+                    "deployment": "aos" if self.control_local else "external",
+                    "management_host": self.host,
                     "ssh_host": self.host if self.mode == "ssh" else None,
                     "directory": self.directory}
         if action == "map_list":
