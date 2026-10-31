@@ -1,0 +1,14 @@
+.git
+**/.git
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.env
+.env.*
+**/.env
+**/.env.*
+**/*.env
+**/*.env.*
+!**/.env.example
+vendor/
+rootfs/

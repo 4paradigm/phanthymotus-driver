@@ -35,6 +35,46 @@ def both_sides_config(**overrides):
     })
 
 
+@pytest.mark.parametrize("source_mode", ["direct", "direct_udp"])
+def test_connection_refuses_glove_port_before_modbus_client_creation(monkeypatch, tmp_path, source_mode):
+    receiver = tmp_path / "ttyUSB0"
+    receiver.touch()
+    stable = tmp_path / "receiver"
+    stable.symlink_to(receiver)
+    monkeypatch.setenv("GLOVE_SERIAL_PORT", str(stable))
+    calls = []
+    monkeypatch.setattr(modbus_device, "L20LiteModbusClient", lambda *a, **k: calls.append(a))
+    connection = modbus_device.L20LiteConnection({
+        "serial_port": str(receiver),
+        "plugins": {"glove_teleop": {"enabled": True, "source_mode": source_mode}},
+    })
+    with pytest.raises(RuntimeError, match="reserved glove receiver"):
+        connection.detect_sides()
+    assert calls == []
+
+
+def test_connection_uses_configured_glove_port_without_environment(monkeypatch):
+    monkeypatch.delenv("GLOVE_SERIAL_PORT", raising=False)
+    connection = modbus_device.L20LiteConnection({
+        "serial_port": "/dev/glove-receiver",
+        "plugins": {"glove_teleop": {"enabled": True, "source_mode": "direct_udp",
+                                    "glove_port": "/dev/glove-receiver"}},
+    })
+    with pytest.raises(RuntimeError, match="reserved glove receiver"):
+        connection.get()
+
+
+def test_source_mode_override_keeps_receiver_protected(monkeypatch):
+    monkeypatch.setenv("GLOVE_SOURCE_MODE", "direct")
+    monkeypatch.setenv("GLOVE_SERIAL_PORT", "/dev/glove-receiver")
+    connection = modbus_device.L20LiteConnection({
+        "serial_port": "/dev/glove-receiver",
+        "plugins": {"glove_teleop": {"enabled": True, "source_mode": "udp"}},
+    })
+    with pytest.raises(RuntimeError, match="reserved glove receiver"):
+        connection.get()
+
+
 class FakeSerial:
     def __init__(self, **kwargs):
         self.options = kwargs
@@ -801,6 +841,7 @@ def test_unbound_legacy_card_still_works_but_second_unbound_card_is_rejected(mon
 def test_build_plugins_exposes_one_multi_instance_hand_tool():
     config = load_config(str(DRIVER / "main.py"))
     config["plugins"]["hand_gesture"]["enabled"] = False
+    config["plugins"]["glove_teleop"]["enabled"] = False
     plugins = modbus_device.build_plugins(config, "", None)
     assert len(plugins) == 1
     tools = DriverBundle(plugins).get_all_tools()

@@ -13,6 +13,13 @@ COPY main.py       /work/main.py
 COPY modbus_client.py /work/modbus_client.py
 COPY modbus_device.py /work/modbus_device.py
 COPY gesture_device.py /work/gesture_device.py
+COPY glove_teleop_device.py /work/glove_teleop_device.py
+COPY glove_direct_reader.py /work/glove_direct_reader.py
+COPY glove_protocol.py /work/glove_protocol.py
+COPY glove_skeleton.py /work/glove_skeleton.py
+COPY glove_thumb.py /work/glove_thumb.py
+COPY check_runtime.py /work/check_runtime.py
+COPY resource/ /work/resource/
 COPY config.yaml   /work/config.yaml
 COPY deploy/       /deploy/
 

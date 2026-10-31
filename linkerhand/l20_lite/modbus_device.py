@@ -55,6 +55,12 @@ class L20LiteConnection:
             raise ValueError("side must be right or left")
         self.baudrate = int(config.get("baudrate", 115200))
         self.timeout_s = float(config.get("response_timeout_s", 0.5))
+        glove_config = config.get("plugins", {}).get("glove_teleop", {})
+        self._glove_port = None
+        glove_mode = os.environ.get("GLOVE_SOURCE_MODE") or glove_config.get("source_mode", "direct")
+        if glove_config.get("enabled") and glove_mode in ("direct", "direct_udp"):
+            self._glove_port = (os.environ.get("GLOVE_SERIAL_PORT") or
+                                glove_config.get("glove_port", "/dev/ttyUSB0"))
         self._client: L20LiteModbusClient | None = None
         self._lock = threading.Lock()
 
@@ -63,6 +69,10 @@ class L20LiteConnection:
         if target_side not in ("left", "right"):
             raise ValueError("side must be left or right")
         with self._lock:
+            # Even a read-only Modbus probe opens and reconfigures the UART.
+            # Legacy info/get_state paths bypass MultiHandPlugin._ports().
+            if self._glove_port and os.path.realpath(self.port) == os.path.realpath(self._glove_port):
+                raise RuntimeError("refusing Modbus access to reserved glove receiver port")
             if self._client is not None and self._client.side != target_side:
                 self._client.close()
                 self._client = None
@@ -205,6 +215,7 @@ class HandPlugin:
             "then": {"required": ["confirm_motion"]},
         }]
         schema["x-is-dangerous"] = True
+        schema["x-resource"] = ["l20_lite_left_hand", "l20_lite_right_hand"]
         schema["x-completion"] = {
             # Allow the motion deadline plus callback retries and Core registration.
             "actions": list(MOTION_ACTIONS), "timeout": int(self.motion_timeout_s) + 25,
@@ -507,13 +518,25 @@ class HandPlugin:
 
 
 def build_plugins(config: dict, _namespace: str, _ros2) -> list:
+    # Resolve the host-specific fallback once. Discovered per-hand ports must
+    # still override it when constructing individual connections.
+    if os.environ.get("L20_SERIAL_PORT"):
+        config = {**config, "serial_port": os.environ["L20_SERIAL_PORT"]}
     hand_config = config.get("plugins", {}).get("hand", {})
     hand = MultiHandPlugin(config, hand_config)
     plugins = [hand] if hand_config.get("enabled", True) else []
     gesture_config = config.get("plugins", {}).get("hand_gesture", {})
     if gesture_config.get("enabled", False):
         from gesture_device import GesturePlugin
-        plugins.append(GesturePlugin(hand, gesture_config))
+        gesture = GesturePlugin(hand, gesture_config)
+        hand._gesture_plugin = gesture
+        plugins.append(gesture)
+    glove_config = config.get("plugins", {}).get("glove_teleop", {})
+    if glove_config.get("enabled", False):
+        from glove_teleop_device import GloveTeleopPlugin
+        glove = GloveTeleopPlugin(hand, glove_config, _namespace, _ros2)
+        hand._glove_plugin = glove
+        plugins.append(glove)
     return plugins
 
 
@@ -529,6 +552,7 @@ class MultiHandPlugin:
         # Serial discovery and motion never overlap. Two cards may be queued,
         # but no second controller may open/probe a moving RS-485 port.
         self._bus_lock = threading.RLock()
+        self._teleop_active = False
         self._bindings: dict[str, str] = {}
         self._controllers: dict[str, HandPlugin] = {}
         self._stopped_instances: set[str] = set()
@@ -573,12 +597,21 @@ class MultiHandPlugin:
         candidates = [self.config.get("serial_port", "/dev/ttyUSB0")]
         candidates += glob.glob("/dev/serial/by-path/*")
         candidates += glob.glob("/dev/ttyUSB*")
+        glove_config = self.config.get("plugins", {}).get("glove_teleop", {})
+        glove_port = (os.environ.get("GLOVE_SERIAL_PORT") or
+                      glove_config.get("glove_port", "/dev/ttyUSB0"))
+        glove_mode = os.environ.get("GLOVE_SOURCE_MODE") or glove_config.get("source_mode", "direct")
+        excluded = (os.path.realpath(glove_port)
+                    if glove_config.get("enabled") and glove_mode in ("direct", "direct_udp")
+                    else None)
         seen = set()
         ports = []
         for candidate in candidates:
             if not os.path.exists(candidate):
                 continue
             path = os.path.realpath(candidate)
+            if path == excluded:
+                continue
             if path not in seen:
                 seen.add(path)
                 ports.append(path)
@@ -627,6 +660,13 @@ class MultiHandPlugin:
             return controller
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action in (*MOTION_ACTIONS, "get_state", "stop") and self._teleop_active:
+            glove = getattr(self, "_glove_plugin", None)
+            if action == "get_state" or glove is None:
+                raise RuntimeError("glove teleoperation owns the hands; disarm it first")
+            # Explicit operator commands take priority over the streaming owner.
+            # Wait until its in-flight write and torque-release cleanup finish.
+            glove._disarm()
         instance_id = args.get("instance_id") or ""
         if action == "config":
             side = args.get("bound_side")
