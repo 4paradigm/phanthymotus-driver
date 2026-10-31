@@ -471,6 +471,14 @@ class TianyiDeviceBundle:
             self._plugins.append(NavStatePlugin(plugins_cfg["nav_state"], namespace, ros2, slamtec_client))
             print("[bundle] NavStatePlugin loaded")
 
+        if plugins_cfg.get("loco_state", {}).get("enabled", False):
+            from loco_state import LocoStatePlugin
+            loco_state_url = os.environ.get("SLAMTEC_URL", cfg.get("slamtec", {}).get(
+                "base_url", "http://192.168.11.1:1448"))
+            self._plugins.append(LocoStatePlugin(
+                plugins_cfg["loco_state"], namespace, ros2, loco_state_url))
+            print("[bundle] LocoStatePlugin loaded")
+
         if plugins_cfg.get("power_board", {}).get("enabled", False):
             from device import PowerBoardStatePlugin
             self._plugins.append(PowerBoardStatePlugin(plugins_cfg["power_board"], namespace, ros2))
@@ -592,10 +600,26 @@ class TianyiDeviceBundle:
             self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))
             print("[bundle] LightPlugin loaded")
 
+        # The stream and call-shaped base cards must not write simultaneously.
+        # Keep this arbitration in the bundle; existing card implementations
+        # and the shared navigation client remain unchanged.
+        import threading as _threading
+        self._base_command_lock = _threading.RLock()
+        self._base_owner = ""
+        self._loco_servo = None
+        if plugins_cfg.get("loco_servo", {}).get("enabled", False):
+            from loco_servo import LocoServoPlugin
+            self._loco_servo = LocoServoPlugin(
+                plugins_cfg["loco_servo"], namespace, ros2,
+                conflict=self._base_motion_problem)
+            self._plugins.append(self._loco_servo)
+            print("[bundle] LocoServoPlugin loaded")
+
     # 核心插件始终自动启动，其余等 MCP action:start 触发（懒启动）
     _ALWAYS_START = {
         'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin',
         'ExtMicPlugin', 'CameraSnapshotPlugin', 'ControlledSpatialPlugin',
+        'LocoStatePlugin',
     }
 
     def start_all(self) -> None:
@@ -635,6 +659,47 @@ class TianyiDeviceBundle:
         return tools
 
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
+        servo = self._loco_servo
+        motions = {"nav": {"move_to", "move_by", "rotate", "rotate_to"},
+                   "home": {"go_home"}, "chassis_raw": {"move", "rotate"}}
+        stops = {"nav": "cancel", "home": "cancel", "chassis_raw": "brake"}
+        action = args.get("action", "start")
+        base_action = action in motions.get(tool_name, set()) or action == stops.get(tool_name)
+        if base_action:
+            base_action = any(
+                tool["name"] == tool_name
+                for plugin in self._plugins
+                for tool in (plugin.get_tools() if hasattr(plugin, "get_tools")
+                             else [plugin.get_tool()]))
+        if servo is not None and (tool_name == "loco_servo" or base_action):
+            with self._base_command_lock:
+                if base_action:
+                    released = servo.pause_for_explicit_command(f"{tool_name}.{action}")
+                    if released is False:
+                        return {"state": "error", "error":
+                                "loco_servo SDK stop unconfirmed; retry after firmware heartbeat expiry"}
+                    if action in motions.get(tool_name, set()):
+                        # Retain ownership even after an ambiguous timeout.
+                        # Cancel/brake explicitly releases it, never an inferred
+                        # completion or an old plugin's private poll flag.
+                        self._base_owner = tool_name
+                result = self._dispatch(tool_name, args)
+                if base_action and action == stops.get(tool_name):
+                    api = result.get("api_result", {}) if isinstance(result, dict) else {}
+                    if (isinstance(result, dict) and not result.get("error")
+                            and result.get("state") != "error"
+                            and isinstance(api, dict) and not api.get("error")):
+                        self._base_owner = ""
+                return result
+        return self._dispatch(tool_name, args)
+
+    def _base_motion_problem(self) -> str:
+        if self._base_owner:
+            return (f"{self._base_owner} owns the chassis; use nav.cancel, "
+                    "home.cancel or chassis_raw.brake before starting/resuming loco_servo")
+        return ""
+
+    def _dispatch(self, tool_name: str, args: dict) -> dict | None:
         for p in self._plugins:
             plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
             for tool_def in plugin_tools:
