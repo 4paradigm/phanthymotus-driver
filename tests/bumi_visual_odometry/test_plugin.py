@@ -388,7 +388,7 @@ def test_body_imu_requires_a_fresh_sample_timestamp(plugin, monkeypatch):
 
     monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(Imu=Imu))
     node = plugin._node
-    node.imu_assisted, node.imu_source = True, 'body'
+    node.imu_assisted, node.imu_source = True, 'state'
     node.health = module.Health('seg', None, 0, imu_required=True)
     node.health.details['imu_assistance'] = {}
     published = []
@@ -412,3 +412,43 @@ def test_body_imu_requires_a_fresh_sample_timestamp(plugin, monkeypatch):
 def test_camera_imu_mode_is_rejected_instead_of_breaking_the_camera(executor):
     with pytest.raises(ValueError, match='camera IMU is not packaged'):
         module.VisualOdometryPlugin({'imu_source': 'camera'}, 'robot', executor)
+
+
+def test_controller_imu_reader_publishes_changed_samples_only(plugin, monkeypatch):
+    import time
+
+    class Imu:
+        def __init__(self):
+            self.header = NS(stamp=NS(sec=0, nanosec=0), frame_id='')
+            self.orientation = NS(x=0., y=0., z=0., w=1.)
+            self.orientation_covariance = [0.]*9
+            self.angular_velocity = NS(x=0., y=0., z=0.)
+            self.linear_acceleration = NS(x=0., y=0., z=0.)
+
+    monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(Imu=Imu))
+    node = plugin._node
+    node.active = True
+    node.imu_assisted, node.imu_source = True, 'controller'
+    node.health = module.Health('seg', None, 0, imu_required=True)
+    node.health.details['imu_assistance'] = {}
+    published = []
+    node.body_imu_pub = NS(publish=published.append)
+    reading = [0.0]
+
+    class Controller:
+        def get_imu_data(self):
+            return NS(ori=[0.0, 0.0, 0.0, 1.0],
+                      angular_vel=[reading[0], 0.0, 0.0],
+                      linear_acc=[0.0, 0.0, 9.8])
+
+    node.high_ctrl = Controller()
+    node._start_controller_imu()
+    time.sleep(.08)
+    first = len(published)
+    assert first >= 1
+    time.sleep(.08)
+    assert len(published) == first  # unchanged samples must not refresh freshness
+    reading[0] = .1
+    time.sleep(.08)
+    assert len(published) > first
+    node._stop_controller_imu()

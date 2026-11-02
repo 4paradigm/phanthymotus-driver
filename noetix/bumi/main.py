@@ -191,7 +191,8 @@ class BumiDeviceBundle:
             else:
                 from visual_odometry import VisualOdometryPlugin
                 self._plugins.append(VisualOdometryPlugin(
-                    plugins_cfg["visual_odometry"], namespace, executor))
+                    plugins_cfg["visual_odometry"], namespace, executor,
+                    high_ctrl=high_ctrl))
                 print("[bundle] VisualOdometryPlugin loaded")
 
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:

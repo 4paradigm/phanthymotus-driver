@@ -226,7 +226,7 @@ def estimate(msg, segment, frame_id):
 class VisualOdometryNode:
     """Quality state machine and process supervisor for one visual estimator."""
 
-    def __init__(self, namespace, config=None):
+    def __init__(self, namespace, config=None, high_ctrl=None):
         from rclpy.node import Node
         from rclpy.qos import qos_profile_sensor_data
         from std_msgs.msg import String
@@ -236,11 +236,18 @@ class VisualOdometryNode:
         self.String = String
         self.lock = threading.RLock()
         self.config = dict(config or {})
+        self.high_ctrl = high_ctrl
         self.imu_assisted = self.config.get('imu_assisted', False) is True
-        requested_source = str(self.config.get('imu_source', 'body'))
-        if requested_source != 'body':
-            raise ValueError('imu_source must be body; camera IMU is not packaged')
-        self.imu_source = 'body'
+        requested_source = str(self.config.get('imu_source', 'controller'))
+        if requested_source not in ('controller', 'state'):
+            raise ValueError('imu_source must be controller or state; camera IMU is not packaged')
+        if self.imu_assisted and requested_source == 'controller' and high_ctrl is None:
+            requested_source = 'state'
+        self.imu_source = requested_source
+        self.imu_reader = None
+        self.imu_reader_stop = None
+        self.imu_reader_signature = None
+        self.last_controller_imu = None
         self.active = False
         self.closed = False
         self.output = OUTPUT_TOPIC
@@ -310,8 +317,8 @@ class VisualOdometryNode:
         self.imu_mount = None
         if self.imu_assisted:
             self.health.details['imu_assistance'] = dict(
-                enabled=True, mode='rotation_prior', source=getattr(self, 'imu_source', 'camera'),
-                filter='madgwick' if getattr(self, 'imu_source', 'camera') == 'camera' else 'body-imu')
+                enabled=True, mode='rotation_prior', source=self.imu_source,
+                filter='high-controller' if self.imu_source == 'controller' else 'state-topic')
         self.estimate = None
         self.epochs = {}
         self.cache = OrderedDict()
@@ -413,6 +420,7 @@ class VisualOdometryNode:
 
     def stop(self, reason='visual odometry stopped'):
         self._set_raw_enabled(False)
+        self._stop_controller_imu()
         if self.active:
             self.health.fault(reason)
             self.publish()
@@ -466,14 +474,17 @@ class VisualOdometryNode:
         self.input_subs.extend(f.sub for f in self.filters)
         self.sync = message_filters.ApproximateTimeSynchronizer(self.filters, 5, .02)
         self.sync.registerCallback(self._guard(self.rgbd))
-        if self.imu_assisted and getattr(self, 'imu_source', 'camera') == 'body':
+        if self.imu_assisted:
             from sensor_msgs.msg import Imu
             root = '/'+self.segment
             self.body_imu_pub = self.node.create_publisher(
                 Imu, root+'/imu', self.qos)
             self.segment_pubs.append(self.body_imu_pub)
-            self._subscribe(String, f'/{namespace}/state/imu',
-                            self.body_imu, self.input_subs)
+            if self.imu_source == 'state':
+                self._subscribe(String, f'/{namespace}/state/imu',
+                                self.body_imu, self.input_subs)
+            else:
+                self._start_controller_imu()
 
     def _epoch(self, name, value):
         if not isinstance(value, str) or not value:
@@ -536,18 +547,9 @@ class VisualOdometryNode:
             epoch=meta.get('epoch'), clock_mapping=meta.get('clock_mapping'),
             depth_scale=meta.get('depth_scale'))
         if getattr(self, 'imu_assisted', False):
-            if getattr(self, 'imu_source', 'camera') == 'body':
-                imu_stamp = self.health.samples.get('imu')
-                if imu_stamp is None or self.now()-imu_stamp > MAX_INPUT_AGE_NS:
-                    return  # wait for the body IMU prior
-            else:
-                self.imu_mount = meta.get('imu')
-                if not self.imu_mount or self.imu_mount.get('stamp_ns') is None:
-                    return  # wait for measured gyro/accel brackets, never fall back silently
-                self._epoch('camera_imu', self.imu_mount['epoch'])
-                if not -50_000_000 <= self.now()-self.imu_mount['stamp_ns'] <= 500_000_000:
-                    raise ValueError('camera IMU input stale')
-                self.health.details['imu_assistance']['input'] = deepcopy(self.imu_mount)
+            imu_stamp = self.health.samples.get('imu')
+            if imu_stamp is None or self.now()-imu_stamp > MAX_INPUT_AGE_NS:
+                return  # wait for the body/controller IMU prior
         frame_id = rgb.header.frame_id
         if not frame_id:
             raise ValueError('image frame_id is empty')
@@ -640,46 +642,80 @@ class VisualOdometryNode:
         transform.transform.rotation.w = quaternion[3]
         self.broadcaster = StaticTransformBroadcaster(self.node)
         transforms = [transform]
-        if self.imu_assisted and getattr(self, 'imu_source', 'camera') == 'body':
-            # Publisher/subscription are created in bind_inputs so the body IMU
-            # prior is already arriving before the first RGB-D frame is prepared.
-            pass
-        elif self.imu_assisted:
-            from sensor_msgs.msg import Imu
-            try:
-                from .camera_imu import matrix_quaternion
-            except ImportError:
-                from camera_imu import matrix_quaternion
-            mount = self.imu_mount
-            if mount['frame_id'] != self.namespace+'_camera_imu':
-                raise ValueError('wrong camera IMU frame')
-            imu_tf = TransformStamped()
-            imu_tf.header = deepcopy(transform.header)
-            imu_tf.header.frame_id = self.frame_id
-            imu_tf.child_frame_id = mount['frame_id']
-            t = finite(mount['translation_m'], 3)
-            q = matrix_quaternion(mount['rotation_row_major'])
-            (imu_tf.transform.translation.x, imu_tf.transform.translation.y,
-             imu_tf.transform.translation.z) = t
-            (imu_tf.transform.rotation.x, imu_tf.transform.rotation.y,
-             imu_tf.transform.rotation.z, imu_tf.transform.rotation.w) = q
-            transforms.append(imu_tf)
-            self._subscribe(Imu, root+'/imu', self.imu_orientation, self.result_subs)
         self.broadcaster.sendTransform(transforms)
         self._subscribe(Odometry, root+'/visual',
                         lambda msg: self.odometry(msg), self.result_subs)
         self._subscribe(OdomInfo, root+'/diagnostic', self.diagnostic, self.result_subs)
-        if self.imu_assisted and getattr(self, 'imu_source', 'camera') == 'body':
+        if self.imu_assisted:
             self.children.start(self.segment, self.base_frame(),
                                 imu_topic=root+'/imu', imu_filter=False)
-        elif self.imu_assisted:
-            self.children.start(self.segment, self.base_frame(),
-                                imu_topic=f'/{self.namespace}/odometry_input/imu_raw')
         else:
             self.children.start(self.segment, self.base_frame())
 
-    def body_imu(self, msg):
+    def _start_controller_imu(self):
+        if self.high_ctrl is None:
+            raise ValueError('controller IMU source requested without HighController')
+        self._stop_controller_imu()
+        stop = threading.Event()
+        self.imu_reader_stop = stop
+
+        def read_loop():
+            while not stop.wait(.02):
+                try:
+                    with self.lock:
+                        if not self.active or self.closed:
+                            continue
+                        raw = self.high_ctrl.get_imu_data()
+                        q = finite([raw.ori[i] for i in range(4)], 4)
+                        norm = math.sqrt(sum(v*v for v in q))
+                        if norm < 1e-6:
+                            raise ValueError('controller IMU quaternion is zero')
+                        q = [v/norm for v in q]
+                        angular = finite([raw.angular_vel[i] for i in range(3)], 3)
+                        linear = finite([raw.linear_acc[i] for i in range(3)], 3)
+                        signature = tuple(round(v, 6) for v in q+angular+linear)
+                        if signature == self.imu_reader_signature:
+                            continue  # do not refresh freshness with a cached value
+                        self.imu_reader_signature = signature
+                        self._publish_body_imu(q, angular, linear, self.now(),
+                                              'read_completion')
+                except Exception as exc:
+                    with self.lock:
+                        self.health.fault(str(exc))
+                        self.publish()
+
+        self.imu_reader = threading.Thread(target=read_loop, daemon=True,
+                                           name='bumi_visual_imu')
+        self.imu_reader.start()
+
+    def _stop_controller_imu(self):
+        stop, self.imu_reader_stop = self.imu_reader_stop, None
+        if stop is not None:
+            stop.set()
+        reader, self.imu_reader = self.imu_reader, None
+        if reader is not None and reader.is_alive():
+            reader.join(timeout=.5)
+        self.imu_reader_signature = None
+
+    def _publish_body_imu(self, q, angular, linear, stamp, timestamp_source):
         from sensor_msgs.msg import Imu
+        self.health.observe('imu', stamp, stamp, True)
+        self.health.details['imu_assistance']['input'] = dict(
+            source=self.imu_source, stamp_ns=stamp,
+            timestamp_source=timestamp_source, quaternion=q)
+        out = Imu()
+        out.header.stamp.sec, out.header.stamp.nanosec = divmod(stamp, 10**9)
+        out.header.frame_id = self.base_frame()
+        (out.orientation.x, out.orientation.y,
+         out.orientation.z, out.orientation.w) = q
+        out.orientation_covariance[0] = 0.01
+        (out.angular_velocity.x, out.angular_velocity.y,
+         out.angular_velocity.z) = angular
+        (out.linear_acceleration.x, out.linear_acceleration.y,
+         out.linear_acceleration.z) = linear
+        self.body_imu_pub.publish(out)
+
+    def body_imu(self, msg):
         data = json.loads(msg.data)
         quaternion = data.get('quaternion')
         if not isinstance(quaternion, list) or len(quaternion) != 4:
@@ -695,34 +731,12 @@ class VisualOdometryNode:
         now = self.now()
         if not -50_000_000 <= now-stamp <= 500_000_000:
             raise ValueError('body IMU input stale')
-        self.health.observe('imu', stamp, now, True)
-        self.health.details['imu_assistance']['input'] = dict(
-            source='body', stamp_ns=stamp,
-            timestamp_source=data.get('timestamp_source', 'unknown'), quaternion=q)
-        out = Imu()
-        out.header.stamp.sec, out.header.stamp.nanosec = divmod(stamp, 10**9)
-        out.header.frame_id = self.base_frame()
-        (out.orientation.x, out.orientation.y,
-         out.orientation.z, out.orientation.w) = q
-        out.orientation_covariance[0] = 0.01
         angular = data.get('angular_vel')
-        if isinstance(angular, list) and len(angular) == 3:
-            (out.angular_velocity.x, out.angular_velocity.y,
-             out.angular_velocity.z) = finite(angular, 3)
         linear = data.get('linear_acc')
-        if isinstance(linear, list) and len(linear) == 3:
-            (out.linear_acceleration.x, out.linear_acceleration.y,
-             out.linear_acceleration.z) = finite(linear, 3)
-        self.body_imu_pub.publish(out)
-
-    def imu_orientation(self, msg):
-        if msg.header.frame_id != self.namespace+'_camera_imu' or msg.orientation_covariance[0] < 0:
-            raise ValueError('invalid filtered camera IMU frame or orientation')
-        q = msg.orientation
-        quat_matrix([q.x, q.y, q.z, q.w])
-        t = msg.header.stamp.sec*10**9+msg.header.stamp.nanosec
-        self.health.observe('imu', t, self.now(), True)
-        self.health.details['imu_assistance']['orientation_stamp_ns'] = t
+        angular = finite(angular, 3) if isinstance(angular, list) and len(angular) == 3 else [0.]*3
+        linear = finite(linear, 3) if isinstance(linear, list) and len(linear) == 3 else [0.]*3
+        self._publish_body_imu(q, angular, linear, stamp,
+                              data.get('timestamp_source', 'unknown'))
 
     def odometry(self, msg):
         try:
@@ -913,9 +927,9 @@ class VisualOdometryPlugin:
 
     PREFIX = 'visual_odometry'
 
-    def __init__(self, plugin_config, namespace, executor):
+    def __init__(self, plugin_config, namespace, executor, high_ctrl=None):
         self._namespace = namespace
-        self._node = VisualOdometryNode(namespace, plugin_config)
+        self._node = VisualOdometryNode(namespace, plugin_config, high_ctrl=high_ctrl)
         executor.add_node(self._node.node)
 
     def get_tools(self) -> list:

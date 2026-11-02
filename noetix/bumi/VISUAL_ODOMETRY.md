@@ -3,8 +3,8 @@
 Read-only visual odometry runs **inside the Bumi bundle**: `main.py` starts
 `VisualOdometryPlugin`, which supervises one `rtabmap_odom/rgbd_odometry` child
 and publishes `motus.odom/1` on `/bumi_visual_odometry/state/odom`. It is not a
-second driver, image or container. The robot body IMU (`/state/imu`) optionally
-supplies a rotation prior; translation still comes from RGB-D. There is no
+second driver, image or container. The robot body IMU optionally supplies a
+rotation prior; translation still comes from RGB-D. There is no
 `robot_localization`/EKF or full visual-inertial state estimator.
 
 The card is controlled by `plugins.visual_odometry.enabled` in `config.yaml`.
@@ -127,17 +127,19 @@ RTAB-Map's odometry message is a trajectory delta, not a measured body twist.
 
 ## Body IMU rotation assistance
 
-`plugins.visual_odometry.imu_assisted: true` (shipped default) republishes the
-StatePlugin's 20 Hz body quaternion as
+`plugins.visual_odometry.imu_assisted: true` (shipped default) polls the
+HighController body IMU directly at 20–50 Hz and republishes changed samples as
 `sensor_msgs/Imu` on the segment-private `/<segment>/imu` topic. RTAB-Map waits
 for this orientation prior and uses it for rotation only; acceleration is not
-integrated into position. The camera stays on its normal video-only
-`pyrealsense2` path, so no custom RSUSB SDK, camera-mount TF or Madgwick child is
-started.
+integrated into position. `imu_source: state` is the fallback that consumes
+StatePlugin's `/state/imu` JSON; `controller` is the shipped default. The camera
+stays on its normal video-only `pyrealsense2` path, so no custom RSUSB SDK,
+camera-mount TF or Madgwick child is started.
 
 The SDK exposes no hardware capture timestamp; the payload marks `stamp_ns` as
 `timestamp_source: read_completion`, and the card applies a conservative 500 ms
-freshness window. Missing orientation prevents tracking; orientation older than
+freshness window. Unchanged controller samples are not republished, so a cached
+sample cannot keep the freshness clock alive. Missing orientation prevents tracking; orientation older than
 500 ms invalidates the segment. Camera-IMU mode is not packaged and is rejected
 at construction rather than starting a camera that cannot open its SDK. These checks reject bad input; they do not establish metric
 accuracy. Static IMU bias, walking blur and long-term drift still require
