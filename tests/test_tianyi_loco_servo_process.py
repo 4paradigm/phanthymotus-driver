@@ -555,13 +555,16 @@ def test_outbox_backpressure_keeps_latest_motion_and_priority_zero(process_setup
 
 
 
-def test_follow_shaping_settings_reach_the_control_process(process_setup):
+def test_turn_limit_reaches_process_and_legacy_compensation_cannot_be_enabled(process_setup):
     card = process_setup.create()
     send(card, command())
     wait_info(card, lambda item: item["counts"]["accepted"] == 1)
     result = card.dispatch("config", {"wz_limit": 0.6, "yaw_latency_gain": 1.0})
     assert result.get("ok"), result
     info = card.dispatch("info", {})
-    assert info["wz_limit"] == 0.6 and info["yaw_latency_gain"] == 1.0
-    assert card.dispatch("config", {"yaw_latency_gain": 9})["state"] == "error"
-    assert card.dispatch("info", {})["yaw_latency_gain"] == 1.0
+    assert info["wz_limit"] == 0.6 and "yaw_latency_gain" not in info
+    assert card.dispatch("config", {"yaw_latency_gain": 9})["ok"]
+    assert "yaw_latency_gain" not in card.dispatch("info", {})
+    tool = card.get_tool()
+    assert "yaw_latency_gain" not in tool["configSchema"]["properties"]
+    assert "yaw_latency_gain" not in tool["inputSchema"]["properties"]

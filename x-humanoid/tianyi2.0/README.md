@@ -188,8 +188,15 @@ the vendor ROS server. Third-party license notices are installed in
 `/usr/share/doc/tianyi-loco-sdk/`.
 
 Bundle startup is inert. MCP/canvas `start` subscribes to the default input,
-or an explicitly provided `input_topic` / first `input_topics` entry. **New
-cards default to dry-run.** Dry-run does not launch/connect the SDK worker or
+or an explicitly provided `input_topic` / first `input_topics` entry. `start`
+also accepts the settings advertised by `config`, including `dry_run: false`;
+they are checked and applied before the SDK connection opens. Omitted settings
+retain deployment or previously configured values. Form defaults reflect those
+current settings, and a successful start preserves them for a later stop/start.
+An SDK connection failure is returned as an error, without silently succeeding
+in dry-run. Starting an already paused/yielded session does not resume it.
+
+**New cards default to dry-run.** Dry-run does not launch/connect the SDK worker or
 create a chassis action. Turning dry-run off while running first requires a
 successful read-only SDK connection. Connection alone creates no motion action.
 An incompatible SDK/firmware, a disconnected SDK endpoint, or low localization
@@ -206,21 +213,14 @@ acknowledged idle), not network RPCs or measured physical motion.
 The backend state/action ID describe the last acknowledgement, not a substitute
 for odometry feedback; verify physical motion with `loco_state`.
 
-Follow shaping (`wz_limit`, `yaw_latency_gain`) is applied to admitted
-non-zero commands before the shared step clamp; explicit all-zero commands are
-never shaped. `wz_limit` (rad/s, default = `max_wz`) clamps the turn instead of
-rejecting it; the descriptor navi reads is unchanged. `yaw_latency_gain`
-(1/s, default 0 = off) compensates detection latency: navi turns from a
-bearing measured at `obs_stamp_ms`, but the base kept turning while that frame
-was processed, so the closed loop overshoots and `wz` oscillates. The card
-integrates its own executed `wz` from `obs_stamp_ms` to now and executes
-`wz - gain * rotation`. A gain near navi's proportional yaw gain removes the
-overshoot; larger gains only slow the turn, smaller ones leave some overshoot.
-In a simulated loop (navi gain 1.5, 300–500ms latency) gain 1.0 settled fastest
-without reversing `wz`. Both are runtime `config` settings and take effect
-without stopping. `last_command_timing.turn` shows `requested_wz`,
-`rotated_since_observation_rad` and `shaped_wz`. If compensation cancels a
-turn exactly, velocity is zeroed but the action is kept (not a stop).
+`wz_limit` (rad/s, default = `max_wz`) clamps admitted non-zero turn commands
+before the shared step clamp; explicit all-zero commands are never shaped.
+The descriptor navi reads is unchanged. This runtime setting takes effect
+without stopping. `last_command_timing.turn` shows `requested_wz`, `wz_limit`
+and `shaped_wz`. Angular velocity follows navi's requested turn subject to these
+normal limits. Delay compensation and executed-turn integration have been
+removed; legacy `yaw_latency_gain` values in saved configuration are ignored
+and cannot reactivate them. The coefficient is absent from public card options.
 
 Input TTL and observation age (500ms) are admission checks: an already-stale
 command is dropped and cannot resume motion or renew the watchdog. Once

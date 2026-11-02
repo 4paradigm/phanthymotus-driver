@@ -11,10 +11,11 @@ def test_every_public_action_has_its_own_parameter_contract(setup):
     assert set(actions) == {"start", "stop", "pause", "resume", "info", "config"}
     contracts = schema["x-action-params"]
     assert set(contracts) == set(actions)
-    assert contracts["start"]["params"] == ["input_topic"]
+    assert contracts["start"]["params"][0] == "input_topic"
     for action in ("stop", "pause", "resume", "info"):
         assert contracts[action]["params"] == []
     settings = set(tool["configSchema"]["properties"])
+    assert set(contracts["start"]["params"]) == settings | {"input_topic"}
     assert set(contracts["config"]["params"]) == settings
     assert settings <= set(schema["properties"])
     assert schema["required"] == ["action"]
@@ -36,7 +37,7 @@ def test_settings_advertised_by_config_action_reach_runtime_configuration(setup)
     plugin = start(setup)
     payload = {"dry_run": True, "rotate_only": True, "require_standing": False,
                "min_vx": .02, "linear_acceleration": .4, "angular_acceleration": 1.5,
-               "wz_limit": .6, "yaw_latency_gain": 1.0}
+               "wz_limit": .6}
     schema = plugin.get_tool()["inputSchema"]
     assert set(payload) == set(schema["x-action-params"]["config"]["params"])
     result = plugin.dispatch("config", payload)

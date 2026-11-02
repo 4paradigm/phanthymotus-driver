@@ -1873,22 +1873,15 @@ def _follow_loop(setup, plugin, *, nav_gain=1.5, latency_s=0.4, target=0.6, seco
     return bearings, executed
 
 
-def _sign_changes(values, floor=0.02):
-    signs = [1 if v > floor else -1 for v in values if abs(v) > floor]
-    return sum(a != b for a, b in zip(signs, signs[1:]))
-
-
-def test_latency_compensation_damps_the_closed_follow_loop(setup):
+def test_obsolete_latency_gain_cannot_change_the_follow_loop(setup):
     plain, plain_wz = _follow_loop(setup, start(setup, dry_run=True))
     compensated, comp_wz = _follow_loop(setup, start(setup, dry_run=True, yaw_latency_gain=1.5))
-    # Without compensation a 400ms-old bearing makes the base swing past the
-    # target and back; with gain equal to navi's it settles without reversing.
-    assert min(plain) < -0.05 and _sign_changes(plain_wz) >= 2
-    assert min(compensated) > -0.05 and _sign_changes(comp_wz) == 0
-    assert abs(compensated[-1]) < 0.03
+    # A previously saved coefficient must not reactivate the removed shaping.
+    assert compensated == pytest.approx(plain)
+    assert comp_wz == pytest.approx(plain_wz)
 
 
-def test_latency_compensation_subtracts_rotation_since_observation(setup):
+def test_obsolete_latency_gain_does_not_change_turn_for_an_older_valid_frame(setup):
     plugin = start(setup, yaw_latency_gain=1.0)
     for seq in range(1, 11):  # Turn at a steady 0.5 rad/s for one second.
         send(plugin, command(setup, [0, 0, 0, 0, 0, 0.5], seq=seq))
@@ -1896,20 +1889,20 @@ def test_latency_compensation_subtracts_rotation_since_observation(setup):
     now = int(setup.clock.time() * 1000)
     send(plugin, command(setup, [0, 0, 0, 0, 0, 0.5], seq=11, obs_stamp_ms=now - 400))
     turn = plugin._info()["last_command_timing"]["turn"]
-    # Since the frame was captured the base turned about 0.5 x 0.4 = 0.2 rad.
-    assert turn["rotated_since_observation_rad"] == pytest.approx(0.2, abs=0.02)
-    assert turn["shaped_wz"] == pytest.approx(0.3, abs=0.02)
-    assert plugin._last_output[5] == pytest.approx(0.3, abs=0.02)
+    assert "rotated_since_observation_rad" not in turn
+    assert "yaw_latency_gain" not in turn
+    assert turn["shaped_wz"] == pytest.approx(0.5)
+    assert plugin._last_output[5] == pytest.approx(0.5)
 
 
-def test_compensation_is_off_by_default_and_leaves_navi_output_unchanged(setup):
+def test_navi_yaw_is_not_latency_compensated(setup):
     plugin = start(setup)
     for seq in range(1, 11):
         send(plugin, command(setup, [0, 0, 0, 0, 0, 0.5], seq=seq))
         setup.clock.advance(0.1)
     now = int(setup.clock.time() * 1000)
     send(plugin, command(setup, [0, 0, 0, 0, 0, 0.5], seq=11, obs_stamp_ms=now - 400))
-    assert plugin._info()["yaw_latency_gain"] == 0.0
+    assert "yaw_latency_gain" not in plugin._info()
     assert plugin._last_output[5] == pytest.approx(0.5)
 
 
@@ -1936,9 +1929,7 @@ def test_explicit_zero_is_never_shaped_into_motion(setup):
     assert plugin._backend.messages[-1] == [0] * 6
 
 
-def test_compensated_turn_to_zero_keeps_the_action(setup):
-    # navi still asks to turn, compensation cancels it exactly: velocity goes
-    # to zero but this is not an explicit stop, so the action is retained.
+def test_obsolete_compensation_cannot_zero_a_nonzero_navi_turn(setup):
     plugin = start(setup, yaw_latency_gain=1.0)
     for seq in range(1, 11):
         send(plugin, command(setup, [0, 0, 0, 0, 0, 0.5], seq=seq))
@@ -1946,18 +1937,21 @@ def test_compensated_turn_to_zero_keeps_the_action(setup):
     now = int(setup.clock.time() * 1000)
     stops = plugin._backend.stop_calls
     send(plugin, command(setup, [0, 0, 0, 0, 0, 0.2], seq=11, obs_stamp_ms=now - 400))
-    assert plugin._last_output[5] == pytest.approx(0.0, abs=1e-9)
+    assert plugin._last_timing["turn"]["shaped_wz"] == pytest.approx(0.2)
+    # The ordinary shared step clamp still limits 0.5 -> 0.2 to 0.3 first.
+    assert plugin._last_output[5] == pytest.approx(0.3)
+    setup.clock.advance(0.1)
+    send(plugin, command(setup, [0, 0, 0, 0, 0, 0.2], seq=12))
+    assert plugin._last_output[5] == pytest.approx(0.2)
     assert plugin._backend.stop_calls == stops
-    assert plugin._last_preserved_action is True
+    assert plugin._last_preserved_action is False
 
 
-@pytest.mark.parametrize("args", [{"wz_limit": 0}, {"wz_limit": 1.5}, {"wz_limit": True},
-                                  {"yaw_latency_gain": -0.1}, {"yaw_latency_gain": 6},
-                                  {"yaw_latency_gain": float("nan")}])
+@pytest.mark.parametrize("args", [{"wz_limit": 0}, {"wz_limit": 1.5}, {"wz_limit": True}])
 def test_follow_shaping_config_is_validated(setup, args):
     plugin = start(setup)
     assert plugin.dispatch("config", args)["state"] == "error"
-    assert plugin._wz_limit == 1.0 and plugin._yaw_gain == 0.0
+    assert plugin._wz_limit == 1.0
 
 
 def test_follow_shaping_config_applies_without_stopping(setup):
@@ -1965,8 +1959,11 @@ def test_follow_shaping_config_applies_without_stopping(setup):
     send(plugin, command(setup))
     stops = plugin._backend.stop_calls
     result = plugin.dispatch("config", {"wz_limit": 0.6, "yaw_latency_gain": 1.2})
-    assert result["ok"] and result["wz_limit"] == 0.6 and result["yaw_latency_gain"] == 1.2
+    assert result["ok"] and result["wz_limit"] == 0.6
+    assert "yaw_latency_gain" not in result
     assert plugin._backend.stop_calls == stops
     schema = plugin.get_tool()["inputSchema"]
-    assert {"wz_limit", "yaw_latency_gain"} <= set(schema["properties"])
-    assert {"wz_limit", "yaw_latency_gain"} <= set(schema["x-action-params"]["config"]["params"])
+    assert "wz_limit" in schema["properties"]
+    assert "wz_limit" in schema["x-action-params"]["config"]["params"]
+    assert "yaw_latency_gain" not in schema["properties"]
+    assert "yaw_latency_gain" not in schema["x-action-params"]["config"]["params"]
