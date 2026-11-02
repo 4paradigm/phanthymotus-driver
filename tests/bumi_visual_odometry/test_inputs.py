@@ -61,7 +61,8 @@ def raw_ros(monkeypatch):
             self.data = data
     messages = {}
     node = NS(create_publisher=lambda cls, topic, qos: NS(
-        publish=messages.setdefault(topic, []).append))
+        publish=messages.setdefault(topic, []).append,
+        get_subscription_count=lambda: 1))
     monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(Image=Image, CameraInfo=Image))
     monkeypatch.setitem(sys.modules, 'std_msgs.msg', NS(String=String))
     return messages, node
@@ -205,6 +206,18 @@ def test_metric_depth_is_rate_limited_to_two_hz(raw_ros, monkeypatch):
     metric.publish(second, second)
     metric.publish(third, third)
     assert len(messages['/robot/camera/depth_metric']) == 2
+
+
+def test_metric_depth_does_not_convert_or_publish_without_subscribers(raw_ros):
+    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
+    raw_publisher, messages = publisher(raw_ros)
+    mapper = CaptureTimeMapper(.002)
+    metric = ComputationalDepthPublisher(raw_publisher.node, 'robot', mapper, object())
+    metric.publisher.get_subscription_count = lambda: 0
+    data = frames()
+    metric.publish(data, data)
+    assert not messages['/robot/camera/depth_metric']
+    assert mapper.cached_key is None
 
 
 @pytest.mark.parametrize('model,coeffs', [

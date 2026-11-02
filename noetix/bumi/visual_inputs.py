@@ -86,6 +86,8 @@ class ComputationalDepthPublisher:
 
     def publish(self, source_frames, aligned_frames):
         import numpy as np
+        if self.publisher.get_subscription_count() == 0:
+            return
         if self.last_publish is not None and time.monotonic() - self.last_publish < .5:
             return
         source_color, source_depth = source_frames.get_color_frame(), source_frames.get_depth_frame()

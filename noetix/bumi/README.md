@@ -213,7 +213,7 @@ sudo systemctl start noetix-video-capture.service
 
 Depth 卡片保留原来的 `/<namespace>/camera/depth` 压缩展示输出，另提供
 `/<namespace>/camera/depth_metric`（`sensor/depth-f32`，ROS Image 的
-`32FC1` 米制深度，最多 2 Hz），供需要几何计算的消费者使用。它来自同一
+`32FC1` 米制深度，有订阅时最多 2 Hz），供需要几何计算的消费者使用。它来自同一
 相机采集进程和对齐后的 RGB 光学坐标系，header 携带源深度帧采集时间映射
 及 `frame_id`；卡片 `camera_info` 为两路分别声明相同像素网格的运行时内参。
 运行时内参缺失或畸变尚不能按针孔模型处理时，不应把兜底 FOV 当作已标定
