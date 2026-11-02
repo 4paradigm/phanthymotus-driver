@@ -2362,32 +2362,11 @@ def _camera_subprocess(namespace: str):
     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
     config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
 
-    imu_inputs = None
-    motion_queue = None
-    imu_assisted = os.environ.get("BUMI_VISUAL_ODOMETRY_IMU") == "1"
     try:
-        if imu_assisted:
-            config.enable_stream(rs.stream.gyro, rs.format.motion_xyz32f, 200)
-            config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f, 200)
-            motion_queue = rs.frame_queue(256, keep_frames=True)
-            profile = pipeline.start(config, motion_queue)
-            # Configure the actual active device, not an independently queried
-            # SDK instance. Its shared clock fit compensates oscillator drift;
-            # a fixed arrival offset eventually made IMU stamps run ahead.
-            for sensor in profile.get_device().query_sensors():
-                if sensor.supports(rs.option.global_time_enabled):
-                    sensor.set_option(rs.option.global_time_enabled, 1.)
-            deadline = _time.monotonic()+3.
-            while _time.monotonic() < deadline:
-                motion_queue.try_wait_for_frame(100)
-            from camera_imu import CameraImuPublisher
-            imu_inputs = CameraImuPublisher(node, namespace, pipeline, _QOS)
-        else:
-            pipeline.start(config)
+        pipeline.start(config)
     except Exception as e:
         print(f"[camera_subprocess] Realsense pipeline start failed: {e}", flush=True)
-        if motion_queue is not None:
-            pipeline.stop()
+        pipeline.stop()
         return
 
     # VOP detects objects in the RGB image, while navi samples the depth map at
@@ -2465,8 +2444,7 @@ def _camera_subprocess(namespace: str):
             from visual_inputs import RawCameraPublisher
             raw_inputs = RawCameraPublisher(
                 node, namespace, pipeline, _QOS,
-                min_interval_s=(1.0/raw_rate_hz if raw_rate_hz > 0 else 0.0),
-                **({'imu': imu_inputs} if imu_inputs is not None else {}))
+                min_interval_s=(1.0/raw_rate_hz if raw_rate_hz > 0 else 0.0))
         except Exception as _e:
             print(f"[camera_subprocess] raw RGB-D branch unavailable: {_e}", flush=True)
         if raw_inputs is not None:
@@ -2477,8 +2455,6 @@ def _camera_subprocess(namespace: str):
                 from std_msgs.msg import Bool
                 def raw_enabled(msg):
                     raw_inputs.enabled = bool(msg.data)
-                    if imu_inputs is not None:
-                        imu_inputs.enabled = bool(msg.data)
                 node.create_subscription(
                     Bool, f"/{namespace}/odometry_input/raw_enabled",
                     raw_enabled,
@@ -2495,20 +2471,7 @@ def _camera_subprocess(namespace: str):
             # own callbacks; otherwise card stop/start never reaches it.
             _rclpy.spin_once(node, timeout_sec=0)
             t0 = _time.monotonic()
-            if motion_queue is not None:
-                source = motion_queue.wait_for_frame(1000)
-                if source.is_motion_frame():
-                    try:
-                        imu_inputs.observe(source, _time.time_ns())
-                    except Exception as exc:
-                        # A bad motion packet invalidates the IMU epoch, not
-                        # the media stream. The odometry supervisor restarts.
-                        imu_inputs.restart(str(exc))
-                        print(f"[camera_subprocess] IMU input reset: {exc}", flush=True)
-                    continue
-                source_frames = source.as_frameset()
-            else:
-                source_frames = pipeline.wait_for_frames(timeout_ms=1000)
+            source_frames = pipeline.wait_for_frames(timeout_ms=1000)
             t_wait = _time.monotonic() - t0
 
             frames = align_to_color.process(source_frames)
@@ -2678,11 +2641,6 @@ class CameraPlugin:
     def start(self) -> None:
         import sys
         env = dict(os.environ)
-        if env.get("BUMI_VISUAL_ODOMETRY_IMU") == "1":
-            sdk_python = '/opt/bumi-rsusb/python'
-            if not os.path.isfile(sdk_python+'/pyrealsense2/__init__.py'):
-                raise RuntimeError('IMU assistance requires the bundle RSUSB SDK')
-            env['PYTHONPATH'] = sdk_python+os.pathsep+env.get('PYTHONPATH', '')
         self._proc = subprocess.Popen(
             [sys.executable, "-c",
              # Protect import-time output as well as the child entry point.

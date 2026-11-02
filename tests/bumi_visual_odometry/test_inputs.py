@@ -231,18 +231,3 @@ def test_raw_publisher_starts_disabled_until_the_card_latches_enable(raw_ros):
     raw_publisher.enabled = True
     raw_publisher.publish(frames(), frames())
     assert len(messages['/robot/odometry_input/rgb']) == 1
-
-
-def test_rgb_and_depth_use_the_motion_clock_in_assisted_mode(raw_ros, monkeypatch):
-    from noetix.bumi.camera_imu import SharedClock
-    raw_publisher, messages = publisher(raw_ros)
-    clock = SharedClock()
-    clock.convert('gyro', 1005., 'hardware_clock', 10_000_000_000)
-    raw_publisher.imu = NS(clock=clock, metadata=lambda: {'stamp_ns':10_000_000_000})
-    monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 10_020_000_000)
-    aligned = frames(ms=1000)
-    raw_publisher.publish(aligned, aligned)
-    assert _stamp(messages['/robot/odometry_input/rgb'][0]) == 9_995_000_000
-    assert _stamp(messages['/robot/odometry_input/depth'][0]) == 10_005_000_000
-    meta = json.loads(messages['/robot/odometry_input/camera_meta'][0].data)
-    assert meta['imu']['stamp_ns'] == 10_000_000_000

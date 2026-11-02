@@ -147,12 +147,11 @@ on-robot validation. Set `imu_assisted: false` to return to visual-only mode.
 
 ## Validation status
 
-ROS-free regression for this branch: **493 passed**, run with
+ROS-free regression for this branch: **465 passed**, run with
 `python3 -m pytest -q tests/bumi_visual_odometry tests/test_bumi*.py noetix/bumi/tests`.
 The visual-odometry tests cover the pose/quality contract, launch parameters,
 plugin lifecycle/actions, static TF/mount and the gated camera raw branch.
 
-On-robot verification: the body-IMU path republishes the StatePlugin quaternion
-in the segment base frame and RTAB-Map reaches `tracking`; the earlier camera-IMU
-RSUSB pipeline is not used. Stop/start testing of the visual card and the body
-IMU freshness/restart case still need hardware validation with the final image.
+On-robot verification: the body-IMU path reaches `tracking`; controller-source
+direct polling and stop/start behavior still need hardware stress validation.
+The camera-IMU RSUSB build path and its modules have been removed.

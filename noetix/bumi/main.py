@@ -135,10 +135,6 @@ class BumiDeviceBundle:
             # publishing in the camera child.
             os.environ.pop("BUMI_VISUAL_ODOMETRY", None)
             os.environ.pop("BUMI_VISUAL_ODOMETRY_MAX_FPS", None)
-        # Body IMU assistance uses /state/imu; the camera stays on its normal
-        # video-only SDK path. Camera-IMU mode is not packaged in this image.
-        os.environ.pop("BUMI_VISUAL_ODOMETRY_IMU", None)
-
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
             state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl)

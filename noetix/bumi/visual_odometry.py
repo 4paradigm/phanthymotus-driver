@@ -129,7 +129,7 @@ class ChildProcesses:
         self.prefix = prefix
         self.children = []
 
-    def start(self, segment, frame_id, imu_topic=None, *, imu_filter=True):
+    def start(self, segment, frame_id, imu_topic=None):
         if self.children:
             raise RuntimeError('old visual odometry process still present')
         if self.prefix is None:
@@ -139,15 +139,6 @@ class ChildProcesses:
         root = '/'+segment
         path = self.directory/'odometry.yaml'
         try:
-            if imu_topic and imu_filter:
-                imu_path = self.directory/'madgwick.yaml'
-                imu_path.write_text(parameter_file(dict(use_mag=False, publish_tf=False,
-                                                        world_frame='enu', gain=.01)))
-                args = [str(Path(self.prefix('imu_filter_madgwick'))/'lib'/
-                            'imu_filter_madgwick'/'imu_filter_madgwick_node'), '--ros-args',
-                        '-r', '__ns:='+root, '--params-file', str(imu_path),
-                        '-r', 'imu/data_raw:='+imu_topic, '-r', 'imu/data:='+root+'/imu']
-                self.children.append(self.popen(args, start_new_session=True))
             path.write_text(parameter_file(config))
             args = [str(Path(self.prefix(PACKAGE))/'lib'/PACKAGE/EXECUTABLE), '--ros-args',
                     '-r', '__node:=rgbd_odometry', '-r', '__ns:='+root,
@@ -314,7 +305,6 @@ class VisualOdometryNode:
         self.health = Health(self.segment,
                              self.calibration.id if self.calibration else None, self.now(),
                              imu_required=self.imu_assisted)
-        self.imu_mount = None
         if self.imu_assisted:
             self.health.details['imu_assistance'] = dict(
                 enabled=True, mode='rotation_prior', source=self.imu_source,
@@ -648,7 +638,7 @@ class VisualOdometryNode:
         self._subscribe(OdomInfo, root+'/diagnostic', self.diagnostic, self.result_subs)
         if self.imu_assisted:
             self.children.start(self.segment, self.base_frame(),
-                                imu_topic=root+'/imu', imu_filter=False)
+                                imu_topic=root+'/imu')
         else:
             self.children.start(self.segment, self.base_frame())
 

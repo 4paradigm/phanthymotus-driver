@@ -470,7 +470,6 @@ that process also publishes an optional, read-only raw branch
 | `depth` | `sensor_msgs/Image`, 32FC1 metres | depth in the colour grid, scaled by the SDK `depth_scale` |
 | `info` | `sensor_msgs/CameraInfo` | live K/D/R/P; zero coefficients are published as `plumb_bob` |
 | `camera_meta` | `std_msgs/String` | JSON provenance: epoch, per-stream source stamp/frame/clock domain, depth scale, receive time |
-| `imu_raw` | `sensor_msgs/Imu` | optional camera gyro/accel pairs at about 200 Hz, before orientation filtering |
 
 The raw branch never opens a second pipeline, never touches the USB device and
 never publishes a chassis command. Construction and every publish are wrapped,
@@ -479,12 +478,12 @@ capture continue as before. `main.py` sets `BUMI_VISUAL_ODOMETRY=1` only when th
 card is enabled — a disabled card costs no extra DDS traffic and starts no
 estimator.
 
-`plugins.visual_odometry.imu_assisted` defaults to true. The camera process uses
-an isolated RSUSB SDK to capture RGB/depth/gyro/accel in one pipeline. Factory
-extrinsics and the SDK shared clock fit align the inputs; Madgwick orientation
-supplies RTAB-Map's rotation prior. Translation is still estimated from RGB-D,
-with no inertial position integration or robot_localization/EKF. Set the option
-false and restart the bundle to restore the original visual-only SDK path.
+`plugins.visual_odometry.imu_assisted` defaults to true with
+`imu_source: controller`: the visual card polls the HighController body IMU
+directly and republishes changed samples as `sensor_msgs/Imu`. RTAB-Map uses the
+orientation as a rotation prior; translation is still estimated from RGB-D, with
+no inertial position integration or robot_localization/EKF. `imu_source: state`
+falls back to the StatePlugin topic. Set `imu_assisted: false` to run visual-only.
 The output is not wired
 into `loco_target`/`loco_servo`. The full `motus.odom/1` sample is also declared
 as a second `state/odom` canvas output for future consumers, but no loco card is
@@ -492,10 +491,9 @@ wired to it. The shipped config applies the standard level-forward mount so `pos
 reported as `pose_reference: body_axes`, a convention rather than a measured
 extrinsic). The card defaults to `initializing` and
 publishes no pose until the estimator is tracking; a fault ends that segment and recovery
-starts a fresh one automatically. Stopping the card reaps its estimator/filter children and
-private topics and disables the shared raw RGB-D/IMU branches through
-`/NS/odometry_input/raw_enabled`; the camera, media cards and motion cards keep
-running.
+starts a fresh one automatically. Stopping the card reaps its estimator and private topics and disables the
+shared raw RGB-D branch through `/NS/odometry_input/raw_enabled`; the camera,
+media cards and motion cards keep running.
 
-The output contract, quality states, optional measured camera mount, validation
+The output contract, quality states, assumed body-axis calibration, validation
 status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
