@@ -115,6 +115,19 @@ def test_shared_raw_publisher_uses_sdk_scale_and_separate_source_times(raw_ros):
     assert meta['clock_mapping'] == 'device_to_host'
 
 
+def test_global_capture_depth_stamp_does_not_change_with_processing_delay(raw_ros, monkeypatch):
+    pub, messages = publisher(raw_ros)
+    aligned = frames()
+    aligned.get_color_frame().get_frame_timestamp_domain = lambda: 'timestamp_domain.global_time'
+    aligned.get_depth_frame().get_frame_timestamp_domain = lambda: 'timestamp_domain.global_time'
+    monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 1_100_000_000)
+    pub.publish(aligned, aligned)
+    depth = messages['/robot/odometry_input/depth'][0]
+    assert _stamp(depth) == 1_010_000_000
+    assert depth.header.frame_id == 'robot_rgb_optical'
+    assert json.loads(messages['/robot/odometry_input/camera_meta'][0].data)['depth_stamp_ns'] == _stamp(depth)
+
+
 def test_estimator_gets_one_validated_pair_with_original_stamps(raw_ros, monkeypatch):
     from noetix.bumi.visual_odometry import VisualOdometryNode
     from noetix.bumi.visual_odometry_contract import Health

@@ -109,7 +109,8 @@ def test_card_is_a_read_only_sensor_on_its_own_topic(plugin):
     assert tool['type'] == 'sensor' and tool['multiInstance'] is False
     assert tool['topic_out'] == [
         {'topic': '/robot/bumi_visual_odometry/status', 'format': 'data/json'},
-        {'topic': '/robot/bumi_visual_odometry/state/odom', 'format': 'state/odom'}]
+        {'topic': '/robot/bumi_visual_odometry/state/odom', 'format': 'state/odom'},
+        {'topic': '/robot/odometry_input/depth', 'format': 'sensor/depth-f32'}]
     assert set(tool['inputSchema']['properties']['action']['enum']) == {
         'start', 'stop', 'info'}
     assert 'x-action-params' not in tool['inputSchema']
@@ -259,6 +260,12 @@ def test_info_keeps_full_sample_and_exposes_it_in_canvas_details(plugin):
     assert result['quality']['visual_diagnostic']['inliers'] == 20
     assert '"covariance"' in result['description']
     assert '"visual_diagnostic"' in result['description']
+
+
+def test_info_exposes_capture_timed_metric_depth_from_shared_camera(plugin):
+    result = plugin.dispatch('info', {})
+    assert {'topic': '/robot/odometry_input/depth', 'format': 'sensor/depth-f32',
+            'message_type': 'sensor_msgs/msg/Image'} in result['topic_out']
 
 
 # ── recoverable faults: one bad sample must not kill the segment ─────────────
@@ -461,4 +468,5 @@ def test_output_topics_follow_the_bundle_namespace(executor):
     assert plugin._node.status_topic == '/alpha'+module.STATUS_TOPIC
     assert tool['topic_out'] == [
         {'topic': '/alpha'+module.STATUS_TOPIC, 'format': 'data/json'},
-        {'topic': '/alpha'+module.OUTPUT_TOPIC, 'format': 'state/odom'}]
+        {'topic': '/alpha'+module.OUTPUT_TOPIC, 'format': 'state/odom'},
+        {'topic': '/alpha/odometry_input/depth', 'format': 'sensor/depth-f32'}]

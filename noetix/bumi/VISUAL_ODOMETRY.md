@@ -112,6 +112,16 @@ Payload reuses `common/odom.py` (`motus.odom/1`). `twist` is always six `null`s:
 RTAB-Map's odometry message is a trajectory delta, not a measured body twist.
 `pose` is `null` unless the segment is tracking; no last pose is repeated.
 
+Runtime `info` also declares `/<namespace>/odometry_input/depth` as
+`sensor/depth-f32` (`sensor_msgs/Image`, `32FC1`, metres). This is the existing
+aligned depth output of the same camera process used by VO. Its header carries
+the depth source timestamp mapped by the same clock mapping as the VO inputs,
+and its frame is the RGB optical frame. It is published only while the VO raw
+input branch is enabled. The hardware-clock mapping uses an arrival-derived
+offset and is approximate; the header does not establish exposure
+synchronization. The public compressed depth stream still has publication
+timestamps and must not be substituted for capture-timed processing.
+
 - `pose`: `{position, quaternion xyzw, frame_id, child_frame_id, covariance[36]}`;
   `child_frame_id` is `<segment>_base`, which carries robot body axes by default
   (x forward, y left, z up) at the camera origin.
