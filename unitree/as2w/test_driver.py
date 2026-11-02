@@ -1641,6 +1641,7 @@ class TestDriverContracts(unittest.TestCase):
                          info["odom_interface"]["provides"])
         self.assertEqual(10, info["odom_interface"]["rate_hz"])
         self.assertEqual("unbounded", info["odom_interface"]["pose_drift"])
+        self.assertEqual({"available": False}, info["odom_interface"]["slam_pose"])
 
     @staticmethod
     def _odom_node(published):
