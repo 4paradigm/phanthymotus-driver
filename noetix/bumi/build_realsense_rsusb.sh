@@ -15,9 +15,10 @@ if [ -d "$root/source" ]; then
 else
     # CI cancels builds after 600 seconds without output. Keep transfer progress
     # visible and bound network stalls instead of silently waiting indefinitely.
+    # At CI's observed ~90 KB/s, the 33 MB archive needs over six minutes.
     printf '[rsusb] Downloading librealsense %s\n' "$revision"
     curl -fL --proto '=https' --proto-redir '=https' --retry 2 \
-        --connect-timeout 15 --max-time 180 --retry-max-time 480 \
+        --connect-timeout 15 --max-time 900 --retry-max-time 1800 \
         --speed-limit 1024 --speed-time 30 \
         "https://codeload.github.com/realsenseai/librealsense/tar.gz/$revision" \
         -o "$root/source.tar.gz"
