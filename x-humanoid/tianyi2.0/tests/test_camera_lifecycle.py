@@ -181,6 +181,7 @@ def _raw_frame(width=4, height=2, encoding="bgr8"):
     frame = types.SimpleNamespace()
     frame.width, frame.height, frame.encoding = width, height, encoding
     frame.data = b"\x01" * (width * height * 3)
+    frame.header = types.SimpleNamespace(stamp="source-stamp", frame_id="color_optical")
     return frame
 
 
@@ -195,6 +196,9 @@ class _Camera:
         device.CameraPlugin._ensure_orbbec_service = staticmethod(
             lambda: self.service_checks.append(True))
         self.plugin = device.CameraPlugin({}, "host", _Ros2())
+        # These tests exercise endpoint/thread lifecycle. First-frame readiness
+        # is tested separately with the real wait and concurrent frame delivery.
+        self.plugin._wait_for_first_frame = lambda generation: True
 
     def close(self):
         device.CameraPlugin._ensure_orbbec_service = self._real_ensure
@@ -258,7 +262,7 @@ def camera():
 
 
 def test_first_start_publishes_encoded_frames(camera):
-    assert camera.plugin.dispatch("start", {}) == {"state": "running"}
+    assert camera.plugin.dispatch("start", {})["state"] == "loading"
     camera.feed()
     assert camera.wait_published(1), "first start did not publish an encoded frame"
     assert camera._pub.published[0].format == "jpeg"
@@ -271,15 +275,15 @@ def test_restart_after_stop_publishes_again(camera):
     assert camera.wait_published(1)
 
     camera.plugin.dispatch("stop", {})
-    assert camera.plugin.dispatch("info", {}) == {
-        "state": "idle",
-        "topic_out": [{"topic": "/host/camera/head", "format": "image/jpeg"}],
-    }
+    info = camera.plugin.dispatch("info", {})
+    assert info["state"] == "idle"
+    assert info["topic_out"] == [{"topic": "/host/camera/head", "format": "image/jpeg"}]
+    assert not info["ready"]
 
     # dispatch("start") alone must re-arm: main.py's lazy start is a
     # once-per-process path and will not run a second time.
-    assert camera.plugin.dispatch("start", {}) == {"state": "running"}
-    assert camera.plugin.dispatch("info", {})["state"] == "running"
+    assert camera.plugin.dispatch("start", {})["state"] == "loading"
+    assert camera.plugin.dispatch("info", {})["state"] == "loading"
     before = len(camera._pub.published)
     camera.feed()
     assert camera.wait_published(before + 1), \

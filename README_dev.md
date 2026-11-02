@@ -1680,6 +1680,29 @@ correct until a robot accelerates like it was kicked.
 `max_velocity` is optional in `parse_descriptor`, so omitting it is the correct
 action, not a workaround.
 
+`max_delta_per_step` is a bound on the change in **one accepted command**;
+`ControlSink` does not multiply it by elapsed time. To configure a nominal
+acceleration in SI units, declare `acceleration / expected_hz` per active axis
+(e.g. 0.3 m/s² at 10 Hz becomes a 0.03 m/s step). This matches the nominal
+cadence, not a strict wall-clock acceleration guarantee under a different frame
+rate. Keep this limit in the descriptor and let the shared sink clamp it; do
+not implement another ramp inside the driver's SDK callback.
+
+A velocity base may explicitly declare `limits.zero_immediate: true` to treat
+an exact zero on any twist axis as an immediate stop on that axis, bypassing
+only the step clamp. This opt-in is valid only for `twist`; other modes and
+omitted/false declarations keep the ordinary clamp. Freshness, ordering,
+arbitration and all other checks still apply to zero commands.
+
+When an external stop has changed the actual velocity, call
+`ControlSink.rebase(actual_values)` to synchronize its step baseline. This does
+not count as a command or renew the watchdog, and does not clear source,
+sequence or priority state. Seed a zero baseline before the first frame if
+startup must also be step-limited. For compatible live limit changes, use
+`reconfigure(descriptor)` to preserve admission and arbitration state rather
+than calling `reset()`.
+
+
 **Give an unactuatable axis `lower == upper == 0`, do not omit it.** A ground
 base has no `vz`, `wx` or `wy`, and the vector is six wide regardless. Pinning
 them to zero makes the sink **reject** a policy that puts anything there;
@@ -2359,3 +2382,4 @@ Checklist before you call it done:
 - [ ] the spec module is listed in the bundle's Dockerfile `COPY` lines
       (`tests/test_dockerfile_copies.py` checks this)
 - [ ] a unit test calls `parse()` on every declaration the driver can emit
+

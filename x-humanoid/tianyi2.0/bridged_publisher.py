@@ -373,6 +373,7 @@ def should_use_bridge(topic: str) -> bool:
         "/camera/",
         "/asr/",
         "/nav/",
+        "/loco/",
         "/controlled_spatial/",
         "/ext_mic/",
     ]
