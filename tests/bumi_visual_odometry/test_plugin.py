@@ -200,9 +200,9 @@ def summary(node):
 def test_summary_is_small_and_measures_segment_displacement_without_changing_odom(plugin):
     node = tracking(plugin)
     node.publish()
-    assert summary(node) == dict(status='tracking', displacement_m=0.,
-                                position_m=[1., 2., 3.], pose_reference='rgb_optical',
-                                age_ms=0., reason=None)
+    assert summary(node) == dict(status='tracking', turn_angle_deg=None,
+                                displacement_m=0., position_m=[1., 2., 3.],
+                                pose_reference='rgb_optical', age_ms=0., reason=None)
     node.estimate['pose']['position'] = [1., 2., 5.123456]
     node.last_summary_ns = None
     node.publish()
@@ -211,6 +211,35 @@ def test_summary_is_small_and_measures_segment_displacement_without_changing_odo
     assert last(plugin)['pose']['position'] == [1., 2., 5.123456]
     assert last(plugin)['pose']['covariance'] == [0.]*36
     assert last(plugin)['vendor']['visual_diagnostic']['inliers'] == 20
+
+
+def test_turn_angle_is_relative_to_the_first_imu_sample(plugin, monkeypatch):
+    import math
+    class Imu:
+        def __init__(self):
+            self.header = NS(stamp=NS(sec=0, nanosec=0), frame_id='')
+            self.orientation = NS(x=0., y=0., z=0., w=1.)
+            self.orientation_covariance = [0.]*9
+            self.angular_velocity = NS(x=0., y=0., z=0.)
+            self.linear_acceleration = NS(x=0., y=0., z=0.)
+    monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(Imu=Imu))
+    node = tracking(plugin)
+    node.health.imu_required = True
+    node.health.kinds = node.health.kinds + ('imu',)
+    node.health.details['imu_assistance'] = {}
+    node.body_imu_pub = NS(publish=lambda msg: None)
+    node._publish_body_imu([0., 0., 0., 1.], [0., 0., 0.], [0., 0., 0.],
+                           node.now(), 'read_completion')
+    node.last_summary_ns = None
+    node.publish()
+    assert summary(node)['turn_angle_deg'] == 0.
+    node.node.time += 100_000_000
+    node._publish_body_imu([0., 0., math.sin(math.pi/4), math.cos(math.pi/4)],
+                           [0., 0., 0.], [0., 0., 0.],
+                           node.now(), 'read_completion')
+    node.last_summary_ns = None
+    node.publish()
+    assert summary(node)['turn_angle_deg'] == 90.
 
 
 def test_summary_throttle_keeps_the_twenty_hz_odom_and_immediate_lost_transition(

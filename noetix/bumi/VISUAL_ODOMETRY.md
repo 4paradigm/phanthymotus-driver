@@ -33,9 +33,13 @@ to disabled. `start` sends `Bool(true)` and resumes it. The shared camera pipeli
 `camera`/`depth` cards, photo/video capture, audio and every motion card keep
 running; only the visual-odometry branch and estimator are affected.
 
-The canvas displays only `status`, `displacement_m`, `position_m`,
+The canvas displays `status`, `turn_angle_deg`, `displacement_m`, `position_m`,
 `pose_reference`, `age_ms` and `reason`. Positions and displacement are rounded
-to millimetres for display; the full odometry retains its original precision.
+to millimetres and the turn angle to 0.1 degree for display; the full odometry
+retains its original precision. `turn_angle_deg` is the body yaw relative to the
+first IMU orientation in the current segment, wrapped to -180..180 degrees. It
+is derived from the IMU quaternion, not integrated angular velocity, and resets
+with each segment.
 Displacement is the 3-D straight-line distance from the **first tracking pose of
 the current segment**, not accumulated walking distance or validated accuracy.
 The shipping `config.yaml` sets a permanent **body-axis convention** for the
@@ -147,7 +151,7 @@ on-robot validation. Set `imu_assisted: false` to return to visual-only mode.
 
 ## Validation status
 
-ROS-free regression for this branch: **466 passed**, run with
+ROS-free regression for this branch: **467 passed**, run with
 `python3 -m pytest -q tests/bumi_visual_odometry tests/test_bumi*.py noetix/bumi/tests`.
 The visual-odometry tests cover the pose/quality contract, launch parameters,
 plugin lifecycle/actions, static TF/mount and the gated camera raw branch.

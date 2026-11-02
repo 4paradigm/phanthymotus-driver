@@ -478,6 +478,9 @@ capture continue as before. `main.py` sets `BUMI_VISUAL_ODOMETRY=1` only when th
 card is enabled — a disabled card costs no extra DDS traffic and starts no
 estimator.
 
+The compact status includes `turn_angle_deg`: body yaw relative to the first IMU
+sample of the current segment, wrapped to -180..180 degrees.
+
 `plugins.visual_odometry.imu_assisted` defaults to true with
 `imu_source: controller`: the visual card polls the HighController body IMU
 directly and republishes changed samples as `sensor_msgs/Imu`. RTAB-Map uses the
