@@ -2,7 +2,7 @@
 
 Read-only visual odometry runs **inside the Bumi bundle**: `main.py` starts
 `VisualOdometryPlugin`, which supervises one `rtabmap_odom/rgbd_odometry` child
-and publishes `motus.odom/1` on `/bumi_visual_odometry/state/odom`. It is not a
+and publishes `motus.odom/1` on `/<namespace>/bumi_visual_odometry/state/odom`. It is not a
 second driver, image or container. The robot body IMU optionally supplies a
 rotation prior; translation still comes from RGB-D. There is no
 `robot_localization`/EKF or full visual-inertial state estimator.
@@ -20,8 +20,8 @@ uses. Disabled means no raw branch, no estimator child, no extra DDS traffic.
 | --- | --- |
 | Tool / card | `rgbd_visual_odometry` (sensor, read-only) |
 | MCP actions | `start`, `stop`, `info` (system actions only; no execution form/button) |
-| Canvas output | `/bumi_visual_odometry/status`, `std_msgs/msg/String`, port format `data/json`, about 5 Hz |
-| Full ROS output | `/bumi_visual_odometry/state/odom`, `std_msgs/msg/String`, `motus.odom/1`, 20 Hz |
+| Canvas output | `/<namespace>/bumi_visual_odometry/status`, `std_msgs/msg/String`, port format `data/json`, about 5 Hz |
+| Full ROS output | `/<namespace>/bumi_visual_odometry/state/odom`, `std_msgs/msg/String`, `motus.odom/1`, 20 Hz |
 | Consumer | none; it is not wired into `loco_target`/`loco_servo` |
 
 `stop` reaps the estimator/filter children and the card's private topics, and sends a
@@ -47,7 +47,7 @@ starts a new segment and distance origin.
 The canvas declares two outputs: the 5 Hz `status` summary (`data/json`) and the
 full `state/odom` sample (`motus.odom/1`) so other cards can consume the pose
 without a second converter. Existing ROS subscribers can also use
-`/bumi_visual_odometry/state/odom` directly. The card's details button fetches `info`, whose
+`/<namespace>/bumi_visual_odometry/state/odom` directly. The card's details button fetches `info`, whose
 description contains the complete current sample, including covariance, timing,
 segment/calibration IDs and visual diagnostics; the same sample is returned as
 `sample`, with `odom_topic` pointing to the original ROS output. Details are a
@@ -147,7 +147,7 @@ on-robot validation. Set `imu_assisted: false` to return to visual-only mode.
 
 ## Validation status
 
-ROS-free regression for this branch: **465 passed**, run with
+ROS-free regression for this branch: **466 passed**, run with
 `python3 -m pytest -q tests/bumi_visual_odometry tests/test_bumi*.py noetix/bumi/tests`.
 The visual-odometry tests cover the pose/quality contract, launch parameters,
 plugin lifecycle/actions, static TF/mount and the gated camera raw branch.

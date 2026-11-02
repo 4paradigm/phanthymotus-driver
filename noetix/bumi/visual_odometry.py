@@ -4,7 +4,8 @@ RTAB-Map ``rgbd_odometry`` runs as one supervised child of the bundle process.
 The bundle's camera subprocess remains the only RealSense owner and publishes an
 optional raw RGB-D branch on ``/{namespace}/odometry_input/*``; this module
 consumes it, validates/undistorts frame pairs, launches the estimator and
-publishes a read-only ``motus.odom/1`` sample on ``/bumi_visual_odometry/state/odom``.
+publishes a read-only ``motus.odom/1`` sample on
+``/<namespace>/bumi_visual_odometry/state/odom``.
 
 Optional camera IMU orientation supplies RTAB-Map's rotation prior. There is no
 inertial translation integration or robot_localization EKF. Stopping this card
@@ -40,6 +41,8 @@ except ImportError:  # imported as a top-level /work module inside the bundle im
 
 PACKAGE = 'rtabmap_odom'
 EXECUTABLE = 'rgbd_odometry'
+# Namespaced so two bundles in the same DDS domain cannot collide. These are
+# suffixes; the runtime prefixes them with ``/<namespace>``.
 OUTPUT_TOPIC = '/bumi_visual_odometry/state/odom'
 STATUS_TOPIC = '/bumi_visual_odometry/status'
 
@@ -241,9 +244,10 @@ class VisualOdometryNode:
         self.last_controller_imu = None
         self.active = False
         self.closed = False
-        self.output = OUTPUT_TOPIC
+        self.output = f'/{namespace}'+OUTPUT_TOPIC
+        self.status_topic = f'/{namespace}'+STATUS_TOPIC
         self.publisher = self.node.create_publisher(String, self.output, self.qos)
-        self.status_publisher = self.node.create_publisher(String, STATUS_TOPIC, self.qos)
+        self.status_publisher = self.node.create_publisher(String, self.status_topic, self.qos)
         # The raw RGB-D producer lives in the camera subprocess. This private
         # control topic is the lifecycle signal: stop disables the shared
         # branch, start re-enables it, matching what sensor-card stop means.
@@ -381,9 +385,9 @@ class VisualOdometryNode:
         from common.odom import build_interface
         sample = self.publish()
         return dict(state='running' if self.active else 'idle',
-                    topic_out=[{'topic': STATUS_TOPIC, 'format': 'data/json',
+                    topic_out=[{'topic': self.status_topic, 'format': 'data/json',
                                 'message_type': 'std_msgs/msg/String'},
-                               {'topic': OUTPUT_TOPIC, 'format': 'state/odom',
+                               {'topic': self.output, 'format': 'state/odom',
                                 'message_type': 'std_msgs/msg/String'}],
                     odom_topic=self.output,
                     sample=sample,
@@ -931,7 +935,7 @@ class VisualOdometryPlugin:
                             + ('body IMU rotation assistance; no inertial translation/EKF, '
                                if self._node.imu_assisted else 'no IMU/EKF/fusion, ')+
                             'not in the motion path. '
-                            f'Canvas status: {STATUS_TOPIC}; full odometry: {OUTPUT_TOPIC}'),
+                            f'Canvas status: {self._node.status_topic}; full odometry: {self._node.output}'),
             'inputSchema': {
                 'type': 'object',
                 'properties': {
@@ -944,8 +948,8 @@ class VisualOdometryPlugin:
                                # reset is no longer exposed; recovery creates a
                                # new segment automatically.
                                'enum': ['start', 'stop', 'info']}}},
-            'topic_out': [{'topic': STATUS_TOPIC, 'format': 'data/json'},
-                          {'topic': OUTPUT_TOPIC, 'format': 'state/odom'}],
+            'topic_out': [{'topic': self._node.status_topic, 'format': 'data/json'},
+                          {'topic': self._node.output, 'format': 'state/odom'}],
         }]
 
     def start(self) -> None:

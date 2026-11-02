@@ -455,7 +455,7 @@ Single container: the estimator runs inside this bundle, not in a sidecar.
 is true (**enabled by default**); the plugin
 supervises one `rtabmap_odom/rgbd_odometry` child and an optional IMU attitude filter, and
 publishes a read-only `motus.odom/1` stream on
-`/bumi_visual_odometry/state/odom`. No second image, no second container, no USB
+`/<namespace>/bumi_visual_odometry/state/odom`. No second image, no second container, no USB
 or privileged change.
 
 Camera/depth output formats are unchanged. A single pyrealsense2 capture process

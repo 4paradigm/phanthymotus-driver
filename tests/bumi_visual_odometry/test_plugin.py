@@ -50,7 +50,7 @@ def executor(monkeypatch):
             return NS(now=lambda: NS(nanoseconds=self.time))
 
         def create_publisher(self, cls, topic, qos):
-            messages = self.messages if topic == module.OUTPUT_TOPIC else []
+            messages = self.messages if topic.endswith(module.OUTPUT_TOPIC) else []
             self.topics[topic] = messages
             return NS(publish=messages.append)
 
@@ -108,8 +108,8 @@ def test_card_is_a_read_only_sensor_on_its_own_topic(plugin):
     assert tool['name'] == 'rgbd_visual_odometry'
     assert tool['type'] == 'sensor' and tool['multiInstance'] is False
     assert tool['topic_out'] == [
-        {'topic': '/bumi_visual_odometry/status', 'format': 'data/json'},
-        {'topic': '/bumi_visual_odometry/state/odom', 'format': 'state/odom'}]
+        {'topic': '/robot/bumi_visual_odometry/status', 'format': 'data/json'},
+        {'topic': '/robot/bumi_visual_odometry/state/odom', 'format': 'state/odom'}]
     assert set(tool['inputSchema']['properties']['action']['enum']) == {
         'start', 'stop', 'info'}
     assert 'x-action-params' not in tool['inputSchema']
@@ -194,7 +194,7 @@ def tracking(plugin):
 
 
 def summary(node):
-    return json.loads(node.node.topics['/bumi_visual_odometry/status'][-1].data)
+    return json.loads(node.node.topics['/robot/bumi_visual_odometry/status'][-1].data)
 
 
 def test_summary_is_small_and_measures_segment_displacement_without_changing_odom(plugin):
@@ -222,13 +222,13 @@ def test_summary_throttle_keeps_the_twenty_hz_odom_and_immediate_lost_transition
         clock[0] = i*50_000_000
         node.publish()
     assert len(node.node.messages) == 20
-    assert len(node.node.topics['/bumi_visual_odometry/status']) == 5
+    assert len(node.node.topics['/robot/bumi_visual_odometry/status']) == 5
     assert node.node.timers[0][0] == .05
     # Lose freshness after the one-second camera watchdog: do not wait for 5 Hz.
     clock[0] = 1_450_000_000
     node.node.time += 1_000_000_001
     node.tick()
-    assert len(node.node.topics['/bumi_visual_odometry/status']) == 6
+    assert len(node.node.topics['/robot/bumi_visual_odometry/status']) == 6
     assert summary(node)['status'] == 'lost'
     assert summary(node)['position_m'] is None
     assert summary(node)['displacement_m'] is None
@@ -254,7 +254,7 @@ def test_info_keeps_full_sample_and_exposes_it_in_canvas_details(plugin):
     node = tracking(plugin)
     result = plugin.dispatch('info', {})
     assert result['topic_out'][0]['format'] == 'data/json'
-    assert result['odom_topic'] == module.OUTPUT_TOPIC
+    assert result['odom_topic'] == '/robot'+module.OUTPUT_TOPIC
     assert result['sample'] == last(plugin)
     assert result['quality']['visual_diagnostic']['inliers'] == 20
     assert '"covariance"' in result['description']
@@ -452,3 +452,13 @@ def test_controller_imu_reader_publishes_changed_samples_only(plugin, monkeypatc
     time.sleep(.08)
     assert len(published) > first
     node._stop_controller_imu()
+
+
+def test_output_topics_follow_the_bundle_namespace(executor):
+    plugin = module.VisualOdometryPlugin({}, 'alpha', executor)
+    tool = plugin.get_tools()[0]
+    assert plugin._node.output == '/alpha'+module.OUTPUT_TOPIC
+    assert plugin._node.status_topic == '/alpha'+module.STATUS_TOPIC
+    assert tool['topic_out'] == [
+        {'topic': '/alpha'+module.STATUS_TOPIC, 'format': 'data/json'},
+        {'topic': '/alpha'+module.OUTPUT_TOPIC, 'format': 'state/odom'}]
