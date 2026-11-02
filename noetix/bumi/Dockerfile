@@ -4,16 +4,6 @@ FROM ${ROS_BASE_IMAGE} AS audio_msgs_builder
 COPY audio_msgs/ /bumi_ros_ws/src/audio_msgs/
 RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && cd /bumi_ros_ws && colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release && source install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk, SoundDirection"'
 
-# The camera needs userspace HID on the shipped Jetson kernel. Keep compilation
-# and headers outside the runtime image; retain the existing SDK for fallback.
-FROM ${ROS_BASE_IMAGE} AS rsusb_builder
-RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
-      -exec sed -i 's|http://mirrors.tencentyun.com/ubuntu-ports|https://ports.ubuntu.com/ubuntu-ports|g' {} + && \
-    apt-get update && apt-get install -y --no-install-recommends \
-      cmake build-essential git curl python3-dev libusb-1.0-0-dev && \
-    rm -rf /var/lib/apt/lists/*
-COPY build_realsense_rsusb.sh /tmp/build_realsense_rsusb.sh
-RUN bash /tmp/build_realsense_rsusb.sh /tmp/rsusb
 
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
@@ -25,9 +15,6 @@ ARG UBUNTU_MIRROR=https://ports.ubuntu.com/ubuntu-ports
 ARG ROS_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu
 # Keep only the generated interface; source and build artifacts stay in the builder.
 COPY --from=audio_msgs_builder /bumi_ros_ws/install/ /bumi_ros_ws/install/
-COPY --from=rsusb_builder /tmp/rsusb/install/lib/librealsense2.so* /opt/bumi-rsusb/lib/
-COPY --from=rsusb_builder /tmp/rsusb/install/python/pyrealsense2/ /opt/bumi-rsusb/python/pyrealsense2/
-COPY --from=rsusb_builder /tmp/rsusb/source/LICENSE /opt/bumi-rsusb/LICENSE
 RUN /bin/bash -c 'source /ros_ws/install/setup.bash && source /bumi_ros_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk, SoundDirection"'
 
 WORKDIR /work
@@ -57,7 +44,9 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
     rm -rf /var/lib/apt/lists/*
 
 # RTAB-Map RGB-D odometry, bundle-local (single container). The estimator runs as
-# one supervised child of main.py; no second image/container is deployed.
+# one supervised child of main.py; no second image/container is deployed. Body
+# IMU orientation comes from the existing /state/imu topic, so the camera stays
+# on the normal pip pyrealsense2 path and no custom RealSense SDK is built here.
 #
 # The base image carries /opt/ros/humble but no ROS 2 apt source (only the Ubuntu
 # archive is configured), so `ros-humble-*` is invisible to apt until the ROS
@@ -94,7 +83,7 @@ RUN set -eu; \
       echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] $src $UBUNTU_CODENAME main" \
         > /etc/apt/sources.list.d/ros2.list; \
       if apt-get update && apt-get install -y --no-install-recommends \
-           ros-humble-rtabmap-odom ros-humble-imu-filter-madgwick; then \
+           ros-humble-rtabmap-odom; then \
         installed=1; break; \
       fi; \
       rm -rf /var/lib/apt/lists/*; \

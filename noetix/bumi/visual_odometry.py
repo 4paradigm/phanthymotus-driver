@@ -129,7 +129,7 @@ class ChildProcesses:
         self.prefix = prefix
         self.children = []
 
-    def start(self, segment, frame_id, imu_topic=None):
+    def start(self, segment, frame_id, imu_topic=None, *, imu_filter=True):
         if self.children:
             raise RuntimeError('old visual odometry process still present')
         if self.prefix is None:
@@ -139,7 +139,7 @@ class ChildProcesses:
         root = '/'+segment
         path = self.directory/'odometry.yaml'
         try:
-            if imu_topic:
+            if imu_topic and imu_filter:
                 imu_path = self.directory/'madgwick.yaml'
                 imu_path.write_text(parameter_file(dict(use_mag=False, publish_tf=False,
                                                         world_frame='enu', gain=.01)))
@@ -237,6 +237,7 @@ class VisualOdometryNode:
         self.lock = threading.RLock()
         self.config = dict(config or {})
         self.imu_assisted = self.config.get('imu_assisted', False) is True
+        self.imu_source = str(self.config.get('imu_source', 'camera'))
         self.active = False
         self.closed = False
         self.output = OUTPUT_TOPIC
@@ -305,8 +306,9 @@ class VisualOdometryNode:
                              imu_required=self.imu_assisted)
         self.imu_mount = None
         if self.imu_assisted:
-            self.health.details['imu_assistance'] = dict(enabled=True, mode='rotation_prior',
-                                                         filter='madgwick')
+            self.health.details['imu_assistance'] = dict(
+                enabled=True, mode='rotation_prior', source=getattr(self, 'imu_source', 'camera'),
+                filter='madgwick' if getattr(self, 'imu_source', 'camera') == 'camera' else 'body-imu')
         self.estimate = None
         self.epochs = {}
         self.cache = OrderedDict()
@@ -461,6 +463,14 @@ class VisualOdometryNode:
         self.input_subs.extend(f.sub for f in self.filters)
         self.sync = message_filters.ApproximateTimeSynchronizer(self.filters, 5, .02)
         self.sync.registerCallback(self._guard(self.rgbd))
+        if self.imu_assisted and getattr(self, 'imu_source', 'camera') == 'body':
+            from sensor_msgs.msg import Imu
+            root = '/'+self.segment
+            self.body_imu_pub = self.node.create_publisher(
+                Imu, root+'/imu', self.qos)
+            self.segment_pubs.append(self.body_imu_pub)
+            self._subscribe(String, f'/{namespace}/state/imu',
+                            self.body_imu, self.input_subs)
 
     def _epoch(self, name, value):
         if not isinstance(value, str) or not value:
@@ -523,13 +533,18 @@ class VisualOdometryNode:
             epoch=meta.get('epoch'), clock_mapping=meta.get('clock_mapping'),
             depth_scale=meta.get('depth_scale'))
         if getattr(self, 'imu_assisted', False):
-            self.imu_mount = meta.get('imu')
-            if not self.imu_mount or self.imu_mount.get('stamp_ns') is None:
-                return  # wait for measured gyro/accel brackets, never fall back silently
-            self._epoch('camera_imu', self.imu_mount['epoch'])
-            if not -50_000_000 <= self.now()-self.imu_mount['stamp_ns'] <= 500_000_000:
-                raise ValueError('camera IMU input stale')
-            self.health.details['imu_assistance']['input'] = deepcopy(self.imu_mount)
+            if getattr(self, 'imu_source', 'camera') == 'body':
+                imu_stamp = self.health.samples.get('imu')
+                if imu_stamp is None or self.now()-imu_stamp > MAX_INPUT_AGE_NS:
+                    return  # wait for the body IMU prior
+            else:
+                self.imu_mount = meta.get('imu')
+                if not self.imu_mount or self.imu_mount.get('stamp_ns') is None:
+                    return  # wait for measured gyro/accel brackets, never fall back silently
+                self._epoch('camera_imu', self.imu_mount['epoch'])
+                if not -50_000_000 <= self.now()-self.imu_mount['stamp_ns'] <= 500_000_000:
+                    raise ValueError('camera IMU input stale')
+                self.health.details['imu_assistance']['input'] = deepcopy(self.imu_mount)
         frame_id = rgb.header.frame_id
         if not frame_id:
             raise ValueError('image frame_id is empty')
@@ -622,7 +637,11 @@ class VisualOdometryNode:
         transform.transform.rotation.w = quaternion[3]
         self.broadcaster = StaticTransformBroadcaster(self.node)
         transforms = [transform]
-        if self.imu_assisted:
+        if self.imu_assisted and getattr(self, 'imu_source', 'camera') == 'body':
+            # Publisher/subscription are created in bind_inputs so the body IMU
+            # prior is already arriving before the first RGB-D frame is prepared.
+            pass
+        elif self.imu_assisted:
             from sensor_msgs.msg import Imu
             try:
                 from .camera_imu import matrix_quaternion
@@ -647,11 +666,45 @@ class VisualOdometryNode:
         self._subscribe(Odometry, root+'/visual',
                         lambda msg: self.odometry(msg), self.result_subs)
         self._subscribe(OdomInfo, root+'/diagnostic', self.diagnostic, self.result_subs)
-        if self.imu_assisted:
+        if self.imu_assisted and getattr(self, 'imu_source', 'camera') == 'body':
+            self.children.start(self.segment, self.base_frame(),
+                                imu_topic=root+'/imu', imu_filter=False)
+        elif self.imu_assisted:
             self.children.start(self.segment, self.base_frame(),
                                 imu_topic=f'/{self.namespace}/odometry_input/imu_raw')
         else:
             self.children.start(self.segment, self.base_frame())
+
+    def body_imu(self, msg):
+        from sensor_msgs.msg import Imu
+        data = json.loads(msg.data)
+        quaternion = data.get('quaternion')
+        if not isinstance(quaternion, list) or len(quaternion) != 4:
+            raise ValueError('body IMU quaternion missing')
+        q = finite(quaternion, 4)
+        norm = math.sqrt(sum(v*v for v in q))
+        if norm < 1e-6:
+            raise ValueError('body IMU quaternion is zero')
+        q = [v/norm for v in q]
+        stamp = self.now()
+        self.health.observe('imu', stamp, stamp, True)
+        self.health.details['imu_assistance']['input'] = dict(
+            source='body', stamp_ns=stamp, quaternion=q)
+        out = Imu()
+        out.header.stamp = self.node.get_clock().now().to_msg()
+        out.header.frame_id = self.base_frame()
+        (out.orientation.x, out.orientation.y,
+         out.orientation.z, out.orientation.w) = q
+        out.orientation_covariance[0] = 0.01
+        angular = data.get('angular_vel')
+        if isinstance(angular, list) and len(angular) == 3:
+            (out.angular_velocity.x, out.angular_velocity.y,
+             out.angular_velocity.z) = finite(angular, 3)
+        linear = data.get('linear_acc')
+        if isinstance(linear, list) and len(linear) == 3:
+            (out.linear_acceleration.x, out.linear_acceleration.y,
+             out.linear_acceleration.z) = finite(linear, 3)
+        self.body_imu_pub.publish(out)
 
     def imu_orientation(self, msg):
         if msg.header.frame_id != self.namespace+'_camera_imu' or msg.orientation_covariance[0] < 0:

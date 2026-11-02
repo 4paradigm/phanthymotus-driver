@@ -135,10 +135,14 @@ class BumiDeviceBundle:
             # publishing in the camera child.
             os.environ.pop("BUMI_VISUAL_ODOMETRY", None)
             os.environ.pop("BUMI_VISUAL_ODOMETRY_MAX_FPS", None)
-        if (plugins_cfg.get("visual_odometry", {}).get("enabled", False)
-                and plugins_cfg["visual_odometry"].get("imu_assisted", False) is True):
+        visual_cfg = plugins_cfg.get("visual_odometry", {})
+        if (visual_cfg.get("enabled", False)
+                and visual_cfg.get("imu_assisted", False) is True
+                and visual_cfg.get("imu_source", "camera") == "camera"):
             os.environ["BUMI_VISUAL_ODOMETRY_IMU"] = "1"
         else:
+            # Body IMU assistance uses /state/imu; the camera stays on its
+            # normal video-only SDK path.
             os.environ.pop("BUMI_VISUAL_ODOMETRY_IMU", None)
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:

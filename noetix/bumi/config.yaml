@@ -58,9 +58,11 @@ plugins:
   visual_odometry:
     # 默认开启只读视觉里程计；原始 RGB-D 分支限频见下方。
     enabled: true
-    # One shared RGB/depth/IMU pipeline; translation still comes from RGB-D.
-    # Set false to return to the original visual-only/native-SDK path.
+    # Rotation prior from the robot body IMU (state/imu). The camera keeps its
+    # normal video-only path; no camera IMU or custom RSUSB SDK is required.
+    # Set imu_assisted: false to return to the original visual-only path.
     imu_assisted: true
+    imu_source: body
     # Raw branch sample rate when enabled. The measured raw cadence is ~8.3 Hz
     # at this cap and RTAB-Map currently processes ~7.5-9 Hz, so 10 Hz bounds
     # the extra DDS/CPU load instead of duplicating every 30 Hz camera frame.
