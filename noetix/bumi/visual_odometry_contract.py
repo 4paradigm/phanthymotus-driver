@@ -1,8 +1,8 @@
 """ROS-free contracts for the Bumi bundle-local RGB-D visual odometry.
 
-This is the visual-only half that PR #425 shipped, kept without the body-IMU
-fusion: there is no IMU input, no robot_localization EKF, no gyro calibration and
-no gravity window. RTAB-Map ``rgbd_odometry`` is the only estimator, so the
+RTAB-Map ``rgbd_odometry`` remains the position estimator. Optional camera-IMU
+orientation assists its rotation prior; there is no body-IMU/EKF translation
+fusion. The
 quality contract is "the camera tracker produced a pose and its own diagnostics
 agree with it" and nothing more.
 
@@ -27,7 +27,7 @@ MAX_TRANSPORT_NS = 250_000_000      # publisher -> subscriber age
 MAX_INPUT_AGE_NS = 1_000_000_000      # camera stream older than this is stale
 MAX_VISUAL_AGE_NS = 1_500_000_000   # RTAB result/diagnostic older than this is stale
 AGE_LIMITS = {'camera': MAX_INPUT_AGE_NS, 'visual': MAX_VISUAL_AGE_NS,
-              'diagnostic': MAX_VISUAL_AGE_NS}
+              'diagnostic': MAX_VISUAL_AGE_NS, 'imu': 500_000_000}
 MIN_INLIERS = 10                    # rtabmap OdomInfo inlier floor
 MAX_POSITION_SIGMA_M = 0.2          # refuse obviously broken visual covariance
 
@@ -147,7 +147,10 @@ class Health:
 
     kinds = ('camera', 'visual', 'diagnostic')
 
-    def __init__(self, segment, calibration_id, started_ns):
+    def __init__(self, segment, calibration_id, started_ns, imu_required=False):
+        self.imu_required = imu_required
+        if imu_required:
+            self.kinds = self.kinds+('imu',)
         self.segment, self.calibration_id, self.started_ns = segment, calibration_id, started_ns
         self.samples, self.counts = {}, {}
         self.pairs = {'visual': deque(maxlen=20), 'diagnostic': deque(maxlen=20)}
@@ -185,12 +188,16 @@ class Health:
                for kind, stamp in self.samples.items()):
             self.fault('input stale')
         ready = (self.counts.get('camera', 0) >= 3 and self.counts.get('visual', 0) >= 3)
+        if self.imu_required:
+            ready = ready and self.counts.get('imu', 0) >= 3
         paired = set(self.pairs['visual']) & set(self.pairs['diagnostic'])
         coherent = bool(paired) and now_ns-max(paired) <= MAX_VISUAL_AGE_NS
         state = 'lost' if self.reason else ('tracking' if ready and coherent else 'initializing')
         return dict(status=state,
                     reason=self.reason or (None if state == 'tracking'
-                                           else 'waiting for paired RGB-D visual odometry'),
+                                           else ('waiting for camera IMU orientation'
+                                                 if self.imu_required and not self.counts.get('imu')
+                                                 else 'waiting for paired RGB-D visual odometry')),
                     segment_id=self.segment, calibration_id=self.calibration_id,
                     input_age_ms={k: (now_ns-v)/1e6 for k, v in self.samples.items()},
                     visual_stamp_ns=max(paired) if paired else None)

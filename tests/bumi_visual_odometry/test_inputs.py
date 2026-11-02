@@ -231,3 +231,53 @@ def test_raw_publisher_starts_disabled_until_the_card_latches_enable(raw_ros):
     raw_publisher.enabled = True
     raw_publisher.publish(frames(), frames())
     assert len(messages['/robot/odometry_input/rgb']) == 1
+
+
+def test_rgb_and_depth_use_the_motion_clock_in_assisted_mode(raw_ros, monkeypatch):
+    from noetix.bumi.camera_imu import SharedClock
+    raw_publisher, messages = publisher(raw_ros)
+    clock = SharedClock()
+    clock.convert('gyro', 1005., 'hardware_clock', 10_000_000_000)
+    raw_publisher.imu = NS(clock=clock, metadata=lambda: {'stamp_ns':10_000_000_000})
+    monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 10_020_000_000)
+    aligned = frames(ms=1000)
+    raw_publisher.publish(aligned, aligned)
+    assert _stamp(messages['/robot/odometry_input/rgb'][0]) == 9_995_000_000
+    assert _stamp(messages['/robot/odometry_input/depth'][0]) == 10_005_000_000
+    meta = json.loads(messages['/robot/odometry_input/camera_meta'][0].data)
+    assert meta['imu']['stamp_ns'] == 10_000_000_000
+
+
+def test_assisted_input_uses_existing_small_future_stamp_tolerance(raw_ros, monkeypatch):
+    from noetix.bumi.visual_odometry import VisualOdometryNode
+    from noetix.bumi.visual_odometry_contract import Health
+    raw_publisher, messages = publisher(raw_ros)
+    aligned = frames()
+    raw_publisher.publish(aligned, aligned)
+    rgb=messages['/robot/odometry_input/rgb'][0]
+    depth=messages['/robot/odometry_input/depth'][0]
+    info=messages['/robot/odometry_input/info'][0]
+    t=_stamp(rgb)
+    meta=json.loads(messages['/robot/odometry_input/camera_meta'][0].data)
+    # ClockMap/Health already allow 50ms future skew from arrival mapping.
+    meta['imu']={'epoch':'imu_epoch','stamp_ns':t+40_000_000}
+    node=VisualOdometryNode.__new__(VisualOdometryNode)
+    node.imu_assisted=True
+    node.cache={t:meta}
+    node.images={t:(rgb,depth,info)}
+    node.health=Health('seg',None,0,imu_required=True)
+    node.health.details['imu_assistance']={}
+    node.epochs={}
+    node.now=lambda:t+20_000_000
+    node.frame_id=node.optics=node.maps=None
+    node.children=NS(children=[object()])
+    monkeypatch.setitem(sys.modules,'rtabmap_msgs.msg',NS(RGBDImage=NS))
+    forwarded=[]
+    node.rgbd_pub=NS(publish=forwarded.append)
+    node._prepare(t)
+    assert len(forwarded)==1 and node.health.reason is None
+    meta['imu']['stamp_ns']=t-600_000_000
+    node.cache={t:meta}
+    node.images={t:(rgb,depth,info)}
+    with pytest.raises(ValueError,match='camera IMU input stale'):
+        node._prepare(t)

@@ -35,7 +35,7 @@ def camera_metadata(color, depth, *, epoch, depth_scale, received_ns):
 class RawCameraPublisher:
     """Publish device-timed raw RGB/depth plus CameraInfo and provenance JSON."""
 
-    def __init__(self, node, namespace, pipeline, qos, min_interval_s=0.0):
+    def __init__(self, node, namespace, pipeline, qos, min_interval_s=0.0, imu=None):
         from sensor_msgs.msg import Image, CameraInfo
         from std_msgs.msg import String
         self.Image, self.Info, self.String = Image, CameraInfo, String
@@ -46,6 +46,7 @@ class RawCameraPublisher:
         self.depth_scale = pipeline.get_active_profile().get_device().first_depth_sensor().get_depth_scale()
         self.epoch = uuid.uuid4().hex
         self.clocks = [ClockMap(), ClockMap()]
+        self.imu = imu
         # Sample the enabled raw branch at a bounded rate instead of duplicating
         # every 30 Hz capture frame over DDS.
         self.min_interval_s = max(0.0, float(min_interval_s))
@@ -79,6 +80,9 @@ class RawCameraPublisher:
             stamps = []
             for index, key in enumerate(('rgb', 'depth')):
                 src = meta[key]
+                if self.imu is not None:
+                    stamps.append(self.imu.clock.convert(key, src['source_ms'], src['domain'], wall))
+                    continue
                 if index == 1 and self.clocks[1].offset is None:
                     self.clocks[1].offset = self.clocks[0].offset
                 stamps.append(self.clocks[index].convert(src['source_ms'], src['domain'], wall))
@@ -121,6 +125,8 @@ class RawCameraPublisher:
             self.pubs['info'].publish(info)
             meta.update(rgb_stamp_ns=stamps[0], depth_stamp_ns=stamps[1],
                         clock_mapping='device_to_host' if meta['rgb']['domain'] == 'hardware_clock' else 'device_wall')
+            if self.imu is not None:
+                meta['imu'] = self.imu.metadata()
             self.pubs['camera_meta'].publish(self.String(data=json.dumps(meta, allow_nan=False)))
         except Exception as exc:
             if 'camera clock reset' in str(exc) or 'domain changed' in str(exc):

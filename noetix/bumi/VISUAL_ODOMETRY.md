@@ -3,8 +3,9 @@
 Read-only visual odometry runs **inside the Bumi bundle**: `main.py` starts
 `VisualOdometryPlugin`, which supervises one `rtabmap_odom/rgbd_odometry` child
 and publishes `motus.odom/1` on `/bumi_visual_odometry/state/odom`. It is not a
-second driver, image or container, and it is not a fusion estimator: no IMU, no
-`robot_localization`/EKF, no visual-inertial fusion, no distance feedback.
+second driver, image or container. Camera IMU orientation optionally supplies a
+rotation prior; translation still comes from RGB-D. There is no
+`robot_localization`/EKF or full visual-inertial state estimator.
 
 The card is controlled by `plugins.visual_odometry.enabled` in `config.yaml`.
 It is **enabled by default**. Set the key to `false` in `config.yaml` or a mounted
@@ -23,10 +24,10 @@ uses. Disabled means no raw branch, no estimator child, no extra DDS traffic.
 | Full ROS output | `/bumi_visual_odometry/state/odom`, `std_msgs/msg/String`, `motus.odom/1`, 20 Hz |
 | Consumer | none; it is not wired into `loco_target`/`loco_servo` |
 
-`stop` reaps the estimator child and the card's private topics, and sends a
+`stop` reaps the estimator/filter children and the card's private topics, and sends a
 transient-local `Bool(false)` on the private `/<NS>/odometry_input/raw_enabled`
 control topic so the camera subprocess stops converting/serializing the raw
-RGB-D branch too. The latched sample is delivered even if the camera process
+RGB-D and raw IMU branches too. The latched sample is delivered even if the camera process
 starts late or is restarted while the card is stopped; the camera branch defaults
 to disabled. `start` sends `Bool(true)` and resumes it. The shared camera pipeline, the
 `camera`/`depth` cards, photo/video capture, audio and every motion card keep
@@ -99,8 +100,9 @@ reset is required.
   (`[-0.5, 0.5, -0.5, 0.5]`, xyzw) with zero translation, so `base` carries robot
   body axes (x forward, y left, z up) at the camera origin; `publish_tf` of the
   estimator stays false. Removing calibration falls back to `rgb_optical`.
-- No IMU topic is fused; the unused `imu` remap prevents an accidental live
-  subscription.
+- With `imu_assisted: false`, the unused `imu` remap prevents an accidental live
+  subscription. With assistance enabled, only the segment's private filtered
+  camera IMU topic is remapped to RTAB-Map.
 - The pose is accepted only when the RTAB-Map `OdomInfo` for the same stamp says
   tracking is valid (`inliers >= 10`, `matches >= inliers`, not `lost`).
 
@@ -123,13 +125,53 @@ RTAB-Map's odometry message is a trajectory delta, not a measured body twist.
 - `info()` declares an empty `odom_interface.provides` (no velocity axes),
   `pose_drift: unbounded`, `rate_hz: 20`, plus the current quality.
 
-## Camera IMU access (prerequisite for VIO)
+## Camera IMU rotation assistance
+
+`plugins.visual_odometry.imu_assisted: true` (shipped default) selects the
+isolated RSUSB SDK **only for the camera subprocess**. Set it to `false` and
+restart the bundle to restore the original native-SDK visual-only path.
+`state/odom`, the compact canvas status, RTAB-Map pose/diagnostic checks and
+existing camera/visual freshness limits are preserved. This does not integrate
+acceleration into position or continue estimating distance after visual loss.
+
+One asynchronous pipeline captures RGB, depth, gyro and accel. The active device
+uses the SDK's shared global-time fit to compensate clock drift; three seconds
+of startup reports are drained before publishing. No extra arrival-time offset
+is applied to global timestamps. Domain, ordering and age checks remain active;
+a late clock-fit startup fails closed rather than claiming a valid pose. Accel is
+linearly interpolated between measured brackets at each actual gyro timestamp;
+no extrapolation or repeated latest samples are used. SDK extrinsics rotate
+accel into gyro axes, and a static `optical -> camera_imu` TF preserves the
+factory rotation and translation to RGB. The assumed body-axis mount above is
+still an assumption, separate from these factory sensor extrinsics.
+
+A supervised `imu_filter_madgwick_node` estimates orientation (`use_mag=false`,
+`publish_tf=false`, ENU, gain 0.01). RTAB-Map waits for this orientation and uses
+its private `/<segment>/imu` topic. `Odom/GuessSmoothingDelay=0` explicitly keeps
+acceleration out of motion prediction. The filter is reaped with the estimator on
+stop/reset. Missing orientation prevents tracking; orientation older than
+500 ms invalidates the segment. Raw motion gaps over 25 ms reset the motion
+epoch and require a fresh estimator segment. These thresholds reject bad input;
+they do not establish metric accuracy. Static gyro bias, walking blur and
+long-term drift still require on-robot validation.
+
+Full diagnostics are in `vendor.imu_assistance`: factory mount, raw sample
+count/gap, latest raw stamp, reset reason and filtered orientation stamp. Raw measurements are
+on `/<NS>/odometry_input/imu_raw`; these preserve physical gyro-frame axes and
+contain no orientation until filtered. No IMU fields are added to the compact
+canvas status. The SDK is built in a separate Docker stage; only runtime shared
+libraries and Python bindings are copied into `/opt/bumi-rsusb`, alongside the
+existing native SDK. The only extra ROS runtime package is
+`ros-humble-imu-filter-madgwick`.
+
+## Standalone camera IMU access probe
 
 The D435i has an internal gyro and accelerometer. Some Jetson kernels omit
 `CONFIG_HID_SENSOR_HUB` and the HID accelerometer/gyro modules: the native
 RealSense backend then exposes RGB/depth but no Motion Module, even in a
 privileged container with `/dev` mounted. The bundle currently enables only the
-RGB/depth streams; its visual estimator does not fuse camera IMU measurements.
+RGB/depth streams in visual-only mode; assistance uses the shared RSUSB pipeline
+described above.
 
 For that kernel configuration, build an isolated RSUSB SDK, which implements
 UVC/HID in userspace. The helper pins official librealsense v2.59.1 and verifies
@@ -179,9 +221,11 @@ extrinsics. Ten-second recordings after warmup measured about 193–196 Hz with
 54–55 ms gaps, failing the probe's five-period continuity limit (25 ms at
 200 Hz). Native camera capture also timed out during separate RSUSB access.
 This proves IMU/extrinsics access, **not VIO-ready timing or coexistence**.
-Use a single capture owner and validate image/IMU timing and delivery before
-integrating an estimator; do not switch the bundle's default SDK based on this
-probe alone.
+A later 60-second single-pipeline RGB/depth/gyro/accel experiment had zero
+missing frame numbers: gyro 199.49 Hz (maximum gap 5.014 ms), accel 202.82 Hz
+(4.934 ms), RGB/depth 29.98 Hz, all on hardware timestamps. The assistance path
+uses that single pipeline; it does not run this standalone motion-only probe
+alongside video. These capture measurements do not prove walking accuracy.
 
 See the [official Jetson backend guide](https://github.com/realsenseai/librealsense/blob/v2.59.1/doc/installation_jetson.md)
 and [D435i IMU documentation](https://github.com/realsenseai/librealsense/blob/v2.59.1/doc/d435i.md).
@@ -231,15 +275,19 @@ on hardware; do not use the rendered URDF as a measured extrinsic.
 
 ## Build and probe
 
-The bundle image installs `ros-humble-rtabmap-odom` and verifies the estimator
+The bundle image installs `ros-humble-rtabmap-odom` and
+`ros-humble-imu-filter-madgwick` and verifies the estimator
 executable at build time; `tf2_ros` and the message packages come transitively
 from that package, so they are not installed twice. The shared ROS base image only
 contains `/opt/ros/humble`; it does **not** configure a ROS 2 apt source, so the
 Dockerfile adds the repository and its signing key first. It defaults to the
 Tsinghua `ros2/ubuntu` mirror (the build machine is in Tencent Cloud) and falls
 back to `packages.ros.org`; override with
-`--build-arg ROS_APT_MIRROR=<url>` when building directly. Nothing else is
-added: the bundle already ships numpy/OpenCV/PyYAML for its camera and config.
+`--build-arg ROS_APT_MIRROR=<url>` when building directly. The bundle already
+ships numpy/OpenCV/PyYAML. The separate SDK build stage adds about 18 MiB of
+runtime shared libraries/bindings on the tested ARM64 target; compiler, source
+and headers stay out of the final image. The extra Madgwick package has about
+1.2 MiB installed size. This feature therefore has a small runtime image cost.
 
 A synthetic integration probe is copied into the image. It never opens the
 RealSense device and never commands the chassis; run it in an isolated domain:
@@ -254,14 +302,36 @@ accuracy validation.
 
 ## Validation status
 
-ROS-free regression for this branch: `491 passed` in the Bumi suite; the
+ROS-free regression for this branch: **397 passed**, run with
+`python3 -m pytest -q tests/bumi_visual_odometry tests/test_bumi*.py noetix/bumi/tests`; the
 visual-odometry tests cover the pose/quality contract, launch parameters (single
-estimator, no EKF/IMU), plugin lifecycle/actions, static TF/mount and the gated
+estimator, optional IMU attitude filter and no translation EKF), plugin lifecycle/actions, static TF/mount and the gated
 camera-subprocess raw branch.
 
-**Not executed:** ARM64 image build, real ROS probe, deployment, DDS timing /
-media-load measurement, real-robot accuracy. The card is read-only and defaults
-to `initializing`, so it cannot inject invented odometry before those checks.
+SSH deployment verified actual camera IMU input, Madgwick orientation and
+RTAB-Map's private IMU subscription. Stop/start testing disabled raw IMU output
+while JPEG continued at 30 Hz, without replacing the camera process. Pausing
+Madgwick caused `lost` with no pose in 0.528 s, followed by recovery into a new
+segment. A 75-second stationary test had 1438 tracking samples, no lost status
+and one segment; raw/filtered IMU were approximately 199 Hz and JPEG 30 Hz.
+That early fixed-offset build later reset its IMU epoch in a 0.66 m walking
+trial due to clock mapping, so it is not the final timing validation. The final
+implementation uses the SDK shared clock fit described above.
+
+With the final SDK-clock path, a 300-second stationary run had 5976 tracking
+samples, one segment and no loss. Raw/filtered IMU averaged about 199 Hz and
+JPEG 30 Hz; image metadata reported `global_time`. A subsequent 180-second
+walking run had 3461 tracking samples, one segment and no loss/reset. Against
+the operator's approximate 0.87 m tape distance, the displacement between the
+first/last five-second mean positions was 0.9216 m: +0.0516 m (about +5.9%).
+This single approximate measurement does not establish accuracy; the output
+continues to report `accuracy_validated=false`.
+
+The final timing/accuracy measurements are recorded with the robot acceptance
+artifacts. An ARM64 Docker image rebuild and statistically meaningful
+walking accuracy validation are not established by source tests or a single
+walking trial. The card is read-only and suppresses pose unless all required
+inputs and RTAB-Map diagnostics pass.
 
 ## Limitations
 
@@ -269,6 +339,10 @@ to `initializing`, so it cannot inject invented odometry before those checks.
   figure of ~1.8 Hz predates this branch); fast rotation, low texture and
   occlusion make loss expected, and loss is latched rather than degraded.
 - No loop closure/global relocalization; drift is unbounded by design.
+- Pose position is expressed in the segment's odometry frame, while the child
+  base frame carries the configured body axes. IMU initialization can change
+  the odometry frame's initial heading; without a magnetometer it is not an
+  absolute heading. Do not assume a straight walk must change only odom x.
 - The camera source has no confirmed exposure timestamp; the device-to-host
   mapping is an arrival-time approximation.
 - 20 ms pairing, 10 inliers, 0.2 m position sigma and the 250 ms/1 s ages are

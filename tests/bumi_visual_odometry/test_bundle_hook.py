@@ -386,3 +386,51 @@ def test_invalid_raw_rate_falls_back_to_the_documented_default(capture, monkeypa
                         NS(RawCameraPublisher=RawCameraPublisher))
     device._camera_subprocess('robot')
     assert len(seen) == 1 and abs(seen[0]-0.1) < 1e-9
+
+
+def test_assisted_capture_preserves_each_motion_frame_in_the_shared_pipeline(capture, monkeypatch):
+    device, state = capture
+    monkeypatch.setenv('BUMI_VISUAL_ODOMETRY', '1')
+    monkeypatch.setenv('BUMI_VISUAL_ODOMETRY_IMU', '1')
+    rs = sys.modules['pyrealsense2']
+    rs.stream.gyro, rs.stream.accel, rs.format.motion_xyz32f = 'gyro', 'accel', 'xyz32f'
+    rs.option = NS(global_time_enabled='global_time')
+    original_profile = rs.pipeline.get_active_profile
+    original_wait = rs.pipeline.wait_for_frames
+    sensor = NS(supports=lambda _: True, set_option=lambda *args: state.streams.append(args))
+    def profile(pipe):
+        result = original_profile(pipe)
+        result.get_device = lambda: NS(query_sensors=lambda: [sensor])
+        return result
+    monkeypatch.setattr(rs.pipeline, 'get_active_profile', profile)
+    started = []
+    monkeypatch.setattr(rs.pipeline, 'start', lambda pipe, cfg, queue: (started.append(queue), profile(pipe))[1])
+    frames = [NS(is_motion_frame=lambda: True), NS(is_motion_frame=lambda: True)]
+    def wait(timeout):
+        if frames:
+            return frames.pop(0)
+        value = original_wait(NS(), timeout)
+        return NS(is_motion_frame=lambda: False, as_frameset=lambda: value)
+    queue = NS(try_wait_for_frame=lambda _: (False, None), wait_for_frame=wait)
+    rs.frame_queue = lambda *args, **kwargs: queue
+    clock = iter(range(1000))
+    monkeypatch.setattr('time.monotonic', lambda: next(clock))
+    motion = []
+    imu = NS(observe=lambda frame, now: motion.append(frame), enabled=False)
+    monkeypatch.setitem(sys.modules, 'camera_imu', NS(CameraImuPublisher=lambda *args: imu))
+    shared = []
+    class Raw:
+        def __init__(self, *args, **kwargs):
+            shared.append(kwargs['imu'])
+            self.enabled = True
+        def publish(self, *args):
+            shared.append('video')
+    monkeypatch.setitem(sys.modules, 'visual_inputs', NS(RawCameraPublisher=Raw))
+    device._camera_subprocess('robot')
+    assert started == [queue] and len(motion) == 2
+    assert shared == [imu, 'video']
+    assert ('gyro', 'xyz32f', 200) in state.streams
+    assert ('accel', 'xyz32f', 200) in state.streams
+    assert ('global_time', 1.) in state.streams
+    assert state.published['/robot/camera/color'] and state.published['/robot/camera/depth']
+    assert state.stopped

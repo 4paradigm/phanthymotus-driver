@@ -6,9 +6,10 @@ optional raw RGB-D branch on ``/{namespace}/odometry_input/*``; this module
 consumes it, validates/undistorts frame pairs, launches the estimator and
 publishes a read-only ``motus.odom/1`` sample on ``/bumi_visual_odometry/state/odom``.
 
-There is no IMU input, no robot_localization EKF, no visual-inertial fusion and
-no consumer in the motion path: stopping this card only reaps its own child and
-private topics, never the camera or a motion card.
+Optional camera IMU orientation supplies RTAB-Map's rotation prior. There is no
+inertial translation integration or robot_localization EKF. Stopping this card
+only reaps its estimator/filter children and private topics, never the camera
+or a motion card.
 """
 from __future__ import annotations
 from array import array
@@ -84,17 +85,20 @@ def parameter_file(config):
     return '\n'.join(lines)+'\n'
 
 
-def parameters(segment, frame_id):
+def parameters(segment, frame_id, imu_assisted=False):
     """Parameters for the bundle-local visual estimator.
 
     ``frame_id`` is the segment's base frame, which coincides with the optical
     frame when no camera mount is measured. A static base->optical transform is
     published before the estimator starts; RTAB-Map looks that up per frame.
     """
-    return dict(frame_id=frame_id, odom_frame_id=segment+'_odom', publish_tf=False,
-                wait_imu_to_init=False, subscribe_rgbd=True,
+    config = dict(frame_id=frame_id, odom_frame_id=segment+'_odom', publish_tf=False,
+                wait_imu_to_init=imu_assisted, subscribe_rgbd=True,
                 qos=2, qos_camera_info=2, topic_queue_size=5, sync_queue_size=5,
                 **{'Odom/ResetCountdown': '0'})
+    if imu_assisted:
+        config['Odom/GuessSmoothingDelay'] = '0'  # orientation only, no acceleration prediction
+    return config
 
 
 def stop_group(proc):
@@ -117,7 +121,7 @@ def stop_group(proc):
 
 
 class ChildProcesses:
-    """The one RTAB-Map child; stopping it never touches the camera process."""
+    """RTAB-Map and optional attitude filter; neither owns the camera."""
 
     def __init__(self, directory, *, popen=None, stop=None, prefix=None):
         self.directory = Path(directory)
@@ -125,16 +129,25 @@ class ChildProcesses:
         self.prefix = prefix
         self.children = []
 
-    def start(self, segment, frame_id):
+    def start(self, segment, frame_id, imu_topic=None):
         if self.children:
             raise RuntimeError('old visual odometry process still present')
         if self.prefix is None:
             from ament_index_python.packages import get_package_prefix
             self.prefix = get_package_prefix
-        config = parameters(segment, frame_id)
+        config = parameters(segment, frame_id, imu_assisted=bool(imu_topic))
         root = '/'+segment
         path = self.directory/'odometry.yaml'
         try:
+            if imu_topic:
+                imu_path = self.directory/'madgwick.yaml'
+                imu_path.write_text(parameter_file(dict(use_mag=False, publish_tf=False,
+                                                        world_frame='enu', gain=.01)))
+                args = [str(Path(self.prefix('imu_filter_madgwick'))/'lib'/
+                            'imu_filter_madgwick'/'imu_filter_madgwick_node'), '--ros-args',
+                        '-r', '__ns:='+root, '--params-file', str(imu_path),
+                        '-r', 'imu/data_raw:='+imu_topic, '-r', 'imu/data:='+root+'/imu']
+                self.children.append(self.popen(args, start_new_session=True))
             path.write_text(parameter_file(config))
             args = [str(Path(self.prefix(PACKAGE))/'lib'/PACKAGE/EXECUTABLE), '--ros-args',
                     '-r', '__node:=rgbd_odometry', '-r', '__ns:='+root,
@@ -142,9 +155,7 @@ class ChildProcesses:
             for source, target in (('rgbd_image', root+'/rgbd_image'),
                                    ('odom', root+'/visual'),
                                    ('odom_info', root+'/diagnostic'),
-                                   # No IMU is fused; keep an unused remap so an
-                                   # implicit subscription cannot pick a live topic.
-                                   ('imu', root+'/unused_imu')):
+                                   ('imu', root+('/imu' if imu_topic else '/unused_imu'))):
                 args.extend(['-r', source+':='+target])
             env = dict(os.environ, OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1')
             self.children.append(self.popen(args, env=env, start_new_session=True))
@@ -225,6 +236,7 @@ class VisualOdometryNode:
         self.String = String
         self.lock = threading.RLock()
         self.config = dict(config or {})
+        self.imu_assisted = self.config.get('imu_assisted', False) is True
         self.active = False
         self.closed = False
         self.output = OUTPUT_TOPIC
@@ -289,7 +301,12 @@ class VisualOdometryNode:
     def _new_segment(self):
         self.segment = 'bumi_visual_'+uuid.uuid4().hex
         self.health = Health(self.segment,
-                             self.calibration.id if self.calibration else None, self.now())
+                             self.calibration.id if self.calibration else None, self.now(),
+                             imu_required=self.imu_assisted)
+        self.imu_mount = None
+        if self.imu_assisted:
+            self.health.details['imu_assistance'] = dict(enabled=True, mode='rotation_prior',
+                                                         filter='madgwick')
         self.estimate = None
         self.epochs = {}
         self.cache = OrderedDict()
@@ -505,6 +522,14 @@ class VisualOdometryNode:
         self.health.details['camera_time_provenance'] = dict(
             epoch=meta.get('epoch'), clock_mapping=meta.get('clock_mapping'),
             depth_scale=meta.get('depth_scale'))
+        if getattr(self, 'imu_assisted', False):
+            self.imu_mount = meta.get('imu')
+            if not self.imu_mount or self.imu_mount.get('stamp_ns') is None:
+                return  # wait for measured gyro/accel brackets, never fall back silently
+            self._epoch('camera_imu', self.imu_mount['epoch'])
+            if not -50_000_000 <= self.now()-self.imu_mount['stamp_ns'] <= 500_000_000:
+                raise ValueError('camera IMU input stale')
+            self.health.details['imu_assistance']['input'] = deepcopy(self.imu_mount)
         frame_id = rgb.header.frame_id
         if not frame_id:
             raise ValueError('image frame_id is empty')
@@ -596,11 +621,46 @@ class VisualOdometryNode:
         transform.transform.rotation.z = quaternion[2]
         transform.transform.rotation.w = quaternion[3]
         self.broadcaster = StaticTransformBroadcaster(self.node)
-        self.broadcaster.sendTransform([transform])
+        transforms = [transform]
+        if self.imu_assisted:
+            from sensor_msgs.msg import Imu
+            try:
+                from .camera_imu import matrix_quaternion
+            except ImportError:
+                from camera_imu import matrix_quaternion
+            mount = self.imu_mount
+            if mount['frame_id'] != self.namespace+'_camera_imu':
+                raise ValueError('wrong camera IMU frame')
+            imu_tf = TransformStamped()
+            imu_tf.header = deepcopy(transform.header)
+            imu_tf.header.frame_id = self.frame_id
+            imu_tf.child_frame_id = mount['frame_id']
+            t = finite(mount['translation_m'], 3)
+            q = matrix_quaternion(mount['rotation_row_major'])
+            (imu_tf.transform.translation.x, imu_tf.transform.translation.y,
+             imu_tf.transform.translation.z) = t
+            (imu_tf.transform.rotation.x, imu_tf.transform.rotation.y,
+             imu_tf.transform.rotation.z, imu_tf.transform.rotation.w) = q
+            transforms.append(imu_tf)
+            self._subscribe(Imu, root+'/imu', self.imu_orientation, self.result_subs)
+        self.broadcaster.sendTransform(transforms)
         self._subscribe(Odometry, root+'/visual',
                         lambda msg: self.odometry(msg), self.result_subs)
         self._subscribe(OdomInfo, root+'/diagnostic', self.diagnostic, self.result_subs)
-        self.children.start(self.segment, self.base_frame())
+        if self.imu_assisted:
+            self.children.start(self.segment, self.base_frame(),
+                                imu_topic=f'/{self.namespace}/odometry_input/imu_raw')
+        else:
+            self.children.start(self.segment, self.base_frame())
+
+    def imu_orientation(self, msg):
+        if msg.header.frame_id != self.namespace+'_camera_imu' or msg.orientation_covariance[0] < 0:
+            raise ValueError('invalid filtered camera IMU frame or orientation')
+        q = msg.orientation
+        quat_matrix([q.x, q.y, q.z, q.w])
+        t = msg.header.stamp.sec*10**9+msg.header.stamp.nanosec
+        self.health.observe('imu', t, self.now(), True)
+        self.health.details['imu_assistance']['orientation_stamp_ns'] = t
 
     def odometry(self, msg):
         try:
@@ -802,7 +862,9 @@ class VisualOdometryPlugin:
             'type': 'sensor',
             'multiInstance': False,
             'description': ('Bumi RGB-D visual odometry (RTAB-Map rgbd_odometry), read-only — '
-                            'no IMU/EKF/fusion, not in the motion path. '
+                            + ('camera IMU rotation assistance; no inertial translation/EKF, '
+                               if self._node.imu_assisted else 'no IMU/EKF/fusion, ')+
+                            'not in the motion path. '
                             f'Canvas status: {STATUS_TOPIC}; full odometry: {OUTPUT_TOPIC}'),
             'inputSchema': {
                 'type': 'object',

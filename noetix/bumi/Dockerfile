@@ -4,6 +4,17 @@ FROM ${ROS_BASE_IMAGE} AS audio_msgs_builder
 COPY audio_msgs/ /bumi_ros_ws/src/audio_msgs/
 RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && cd /bumi_ros_ws && colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release && source install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk, SoundDirection"'
 
+# The camera needs userspace HID on the shipped Jetson kernel. Keep compilation
+# and headers outside the runtime image; retain the existing SDK for fallback.
+FROM ${ROS_BASE_IMAGE} AS rsusb_builder
+RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
+      -exec sed -i 's|http://mirrors.tencentyun.com/ubuntu-ports|https://ports.ubuntu.com/ubuntu-ports|g' {} + && \
+    apt-get update && apt-get install -y --no-install-recommends \
+      cmake build-essential git curl python3-dev libusb-1.0-0-dev && \
+    rm -rf /var/lib/apt/lists/*
+COPY build_realsense_rsusb.sh /tmp/build_realsense_rsusb.sh
+RUN bash /tmp/build_realsense_rsusb.sh /tmp/rsusb
+
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 ARG UBUNTU_MIRROR=https://ports.ubuntu.com/ubuntu-ports
@@ -14,6 +25,9 @@ ARG UBUNTU_MIRROR=https://ports.ubuntu.com/ubuntu-ports
 ARG ROS_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu
 # Keep only the generated interface; source and build artifacts stay in the builder.
 COPY --from=audio_msgs_builder /bumi_ros_ws/install/ /bumi_ros_ws/install/
+COPY --from=rsusb_builder /tmp/rsusb/install/lib/librealsense2.so* /opt/bumi-rsusb/lib/
+COPY --from=rsusb_builder /tmp/rsusb/install/python/pyrealsense2/ /opt/bumi-rsusb/python/pyrealsense2/
+COPY --from=rsusb_builder /tmp/rsusb/source/LICENSE /opt/bumi-rsusb/LICENSE
 RUN /bin/bash -c 'source /ros_ws/install/setup.bash && source /bumi_ros_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk, SoundDirection"'
 
 WORKDIR /work
@@ -80,7 +94,7 @@ RUN set -eu; \
       echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] $src $UBUNTU_CODENAME main" \
         > /etc/apt/sources.list.d/ros2.list; \
       if apt-get update && apt-get install -y --no-install-recommends \
-           ros-humble-rtabmap-odom; then \
+           ros-humble-rtabmap-odom ros-humble-imu-filter-madgwick; then \
         installed=1; break; \
       fi; \
       rm -rf /var/lib/apt/lists/*; \
@@ -149,6 +163,7 @@ COPY visual_odometry.py /work/visual_odometry.py
 COPY visual_odometry_contract.py /work/visual_odometry_contract.py
 COPY visual_odometry_probe.py /work/visual_odometry_probe.py
 COPY realsense_imu_probe.py /work/realsense_imu_probe.py
+COPY camera_imu.py /work/camera_imu.py
 COPY build_realsense_rsusb.sh /work/build_realsense_rsusb.sh
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py

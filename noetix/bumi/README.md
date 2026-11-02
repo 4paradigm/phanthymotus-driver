@@ -453,13 +453,13 @@ docker logs -f embodied-noetix-bumi
 Single container: the estimator runs inside this bundle, not in a sidecar.
 `main.py` starts a `VisualOdometryPlugin` when `plugins.visual_odometry.enabled`
 is true (**enabled by default**); the plugin
-supervises exactly one `rtabmap_odom/rgbd_odometry` child and
+supervises one `rtabmap_odom/rgbd_odometry` child and an optional IMU attitude filter, and
 publishes a read-only `motus.odom/1` stream on
 `/bumi_visual_odometry/state/odom`. No second image, no second container, no USB
 or privileged change.
 
-The camera card is unchanged, and so is the single pyrealsense2 capture process
-that owns the device (`device.py::_camera_subprocess`). When the card is enabled,
+Camera/depth output formats are unchanged. A single pyrealsense2 capture process
+owns the device (`device.py::_camera_subprocess`). When the card is enabled,
 that process also publishes an optional, read-only raw branch
 (`visual_inputs.py`) on `/<namespace>/odometry_input/`, sampled at
 `plugins.visual_odometry.max_rate_hz` (default 10 Hz):
@@ -470,6 +470,7 @@ that process also publishes an optional, read-only raw branch
 | `depth` | `sensor_msgs/Image`, 32FC1 metres | depth in the colour grid, scaled by the SDK `depth_scale` |
 | `info` | `sensor_msgs/CameraInfo` | live K/D/R/P; zero coefficients are published as `plumb_bob` |
 | `camera_meta` | `std_msgs/String` | JSON provenance: epoch, per-stream source stamp/frame/clock domain, depth scale, receive time |
+| `imu_raw` | `sensor_msgs/Imu` | optional camera gyro/accel pairs at about 200 Hz, before orientation filtering |
 
 The raw branch never opens a second pipeline, never touches the USB device and
 never publishes a chassis command. Construction and every publish are wrapped,
@@ -478,16 +479,21 @@ capture continue as before. `main.py` sets `BUMI_VISUAL_ODOMETRY=1` only when th
 card is enabled — a disabled card costs no extra DDS traffic and starts no
 estimator.
 
-It is **not** a fusion or feedback source: there is no IMU input, no
-robot_localization/EKF, no visual-inertial fusion, and the output is not wired
+`plugins.visual_odometry.imu_assisted` defaults to true. The camera process uses
+an isolated RSUSB SDK to capture RGB/depth/gyro/accel in one pipeline. Factory
+extrinsics and the SDK shared clock fit align the inputs; Madgwick orientation
+supplies RTAB-Map's rotation prior. Translation is still estimated from RGB-D,
+with no inertial position integration or robot_localization/EKF. Set the option
+false and restart the bundle to restore the original visual-only SDK path.
+The output is not wired
 into `loco_target`/`loco_servo`. The full `motus.odom/1` sample is also declared
 as a second `state/odom` canvas output for future consumers, but no loco card is
 wired to it. The shipped config applies the standard level-forward mount so `position` uses robot body axes (x forward, y left, z up;
 reported as `pose_reference: body_axes`, a convention rather than a measured
 extrinsic). The card defaults to `initializing` and
 publishes no pose until the estimator is tracking; a fault ends that segment and recovery
-starts a fresh one automatically. Stopping the card reaps its own child and
-private topics and disables the shared raw RGB-D branch through
+starts a fresh one automatically. Stopping the card reaps its estimator/filter children and
+private topics and disables the shared raw RGB-D/IMU branches through
 `/NS/odometry_input/raw_enabled`; the camera, media cards and motion cards keep
 running.
 
