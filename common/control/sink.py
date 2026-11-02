@@ -353,6 +353,34 @@ class ControlSink:
                 ))
         return None
 
+    def rebase(self, actual_values) -> None:
+        """Synchronise the slew baseline after a driver's confirmed output.
+
+        This is not a command or a reset: no source, sequence, watchdog time or
+        abort state changes. In particular, confirming a watchdog zero cannot
+        renew the command that expired. Call outside an in-progress submit,
+        whose successful tail records the values it applied.
+        """
+        if not isinstance(actual_values, (list, tuple)) or len(actual_values) != self.descriptor.dof:
+            raise ValueError("baseline values must match descriptor.dof")
+        if not all(_finite_number(value) for value in actual_values):
+            raise ValueError("baseline values must be finite numbers")
+        self._last_values = tuple(float(value) for value in actual_values)
+
+    def reconfigure(self, descriptor) -> None:
+        """Update limits/rate without clearing admission or execution state.
+
+        The action layout and anything used by cached index tables must stay
+        identical. A driver changing the physical action space needs a new
+        session, rather than reinterpreting an old source's sequence in place.
+        The caller serialises this with submit/tick, as with the other APIs.
+        """
+        candidate = descriptor if isinstance(descriptor, Descriptor) else parse_descriptor(descriptor)
+        for name in ("mode", "dof", "joint_names", "units", "groups", "frame", "end_effector", "force_torque"):
+            if getattr(candidate, name) != getattr(self.descriptor, name):
+                raise ValueError(f"reconfigure cannot change descriptor.{name}")
+        self.descriptor = candidate
+
     def reset(self) -> None:
         """Clear state for a new session. The only way out of `aborted`.
 
@@ -558,6 +586,10 @@ class ControlSink:
             if i in self._advisory_indices or i in self._quat_component_indices:
                 # 不执行的维不必钳 —— 钳了只会让状态回报里那个数看起来被平滑过，
                 # 而它根本没有去过任何地方。姿态在下面按角度整体钳。
+                continue
+            if self.descriptor.zero_immediate and want == 0.0:
+                # Explicit velocity zero is also used per axis (stop forward
+                # travel while retaining a turn). Position modes never opt in.
                 continue
             delta = want - previous
             if delta > limit:
