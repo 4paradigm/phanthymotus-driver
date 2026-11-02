@@ -246,7 +246,10 @@ class _BumiStateNode(Node):
                 if now - last_imu_time >= self._IMU_INTERVAL:
                     last_imu_time = now
                     imu = self._high_ctrl.get_imu_data()
+                    # Timestamp the reading, not the consumer callback: the
+                    # visual card uses this to reject delayed/replayed samples.
                     imu_data = {
+                        "stamp_ns":     int(self.get_clock().now().nanoseconds),
                         "quaternion":    [imu.ori[i] for i in range(4)],
                         "angular_vel":   [imu.angular_vel[i] for i in range(3)],
                         "linear_acc":    [imu.linear_acc[i] for i in range(3)],

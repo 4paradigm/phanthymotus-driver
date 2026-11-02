@@ -113,8 +113,7 @@ def test_card_is_a_read_only_sensor_on_its_own_topic(plugin):
     assert set(tool['inputSchema']['properties']['action']['enum']) == {
         'start', 'stop', 'info'}
     assert 'x-action-params' not in tool['inputSchema']
-    assert set(tool['configSchema']['properties']) == {'calibration'}
-    assert set(tool['configSchema']['properties']) == {'calibration'}
+    assert 'configSchema' not in tool
     assert 'no IMU/EKF/fusion' in tool['description']
 
 
@@ -376,3 +375,35 @@ def test_camera_epoch_change_requests_a_restart(plugin):
     node.epochs['camera'] = 'old-epoch'
     node.metadata(NS(data=json.dumps({'epoch': 'new-epoch'})))
     assert node.restart_requested == 'camera input restarted'
+
+
+def test_body_imu_requires_a_fresh_sample_timestamp(plugin, monkeypatch):
+    class Imu:
+        def __init__(self):
+            self.header = NS(stamp=NS(sec=0, nanosec=0), frame_id='')
+            self.orientation = NS(x=0., y=0., z=0., w=1.)
+            self.orientation_covariance = [0.]*9
+            self.angular_velocity = NS(x=0., y=0., z=0.)
+            self.linear_acceleration = NS(x=0., y=0., z=0.)
+
+    monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(Imu=Imu))
+    node = plugin._node
+    node.imu_assisted, node.imu_source = True, 'body'
+    node.health = module.Health('seg', None, 0, imu_required=True)
+    node.health.details['imu_assistance'] = {}
+    published = []
+    node.body_imu_pub = NS(publish=published.append)
+    now = node.now()
+
+    def message(stamp):
+        return NS(data=json.dumps({'stamp_ns': stamp, 'quaternion': [0., 0., 0., 1.],
+                                   'angular_vel': [0., 0., 0.],
+                                   'linear_acc': [0., 0., 9.8]}))
+
+    node.body_imu(message(now))
+    assert len(published) == 1
+    assert published[0].header.frame_id == node.base_frame()
+    assert node.health.samples['imu'] == now
+
+    with pytest.raises(ValueError, match='body IMU input stale'):
+        node.body_imu(message(now-600_000_000))

@@ -686,12 +686,17 @@ class VisualOdometryNode:
         if norm < 1e-6:
             raise ValueError('body IMU quaternion is zero')
         q = [v/norm for v in q]
-        stamp = self.now()
-        self.health.observe('imu', stamp, stamp, True)
+        stamp = data.get('stamp_ns')
+        if isinstance(stamp, bool) or not isinstance(stamp, int) or stamp <= 0:
+            raise ValueError('body IMU timestamp missing')
+        now = self.now()
+        if not -50_000_000 <= now-stamp <= 500_000_000:
+            raise ValueError('body IMU input stale')
+        self.health.observe('imu', stamp, now, True)
         self.health.details['imu_assistance']['input'] = dict(
             source='body', stamp_ns=stamp, quaternion=q)
         out = Imu()
-        out.header.stamp = self.node.get_clock().now().to_msg()
+        out.header.stamp.sec, out.header.stamp.nanosec = divmod(stamp, 10**9)
         out.header.frame_id = self.base_frame()
         (out.orientation.x, out.orientation.y,
          out.orientation.z, out.orientation.w) = q
@@ -915,7 +920,7 @@ class VisualOdometryPlugin:
             'type': 'sensor',
             'multiInstance': False,
             'description': ('Bumi RGB-D visual odometry (RTAB-Map rgbd_odometry), read-only — '
-                            + ('camera IMU rotation assistance; no inertial translation/EKF, '
+                            + ('body IMU rotation assistance; no inertial translation/EKF, '
                                if self._node.imu_assisted else 'no IMU/EKF/fusion, ')+
                             'not in the motion path. '
                             f'Canvas status: {STATUS_TOPIC}; full odometry: {OUTPUT_TOPIC}'),
@@ -931,10 +936,6 @@ class VisualOdometryPlugin:
                                # reset is no longer exposed; recovery creates a
                                # new segment automatically.
                                'enum': ['start', 'stop', 'info']}}},
-            'configSchema': {'type': 'object', 'properties': {
-                'calibration': {'type': 'object',
-                                'description': 'Optional measured camera_to_body mount; '
-                                               'without it the pose stays in the optical frame'}}},
             'topic_out': [{'topic': STATUS_TOPIC, 'format': 'data/json'},
                           {'topic': OUTPUT_TOPIC, 'format': 'state/odom'}],
         }]

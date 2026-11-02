@@ -142,7 +142,7 @@ on-robot validation. Set `imu_assisted: false` to return to visual-only mode.
 
 ## Validation status
 
-ROS-free regression for this branch: **491 passed**, run with
+ROS-free regression for this branch: **492 passed**, run with
 `python3 -m pytest -q tests/bumi_visual_odometry tests/test_bumi*.py noetix/bumi/tests`.
 The visual-odometry tests cover the pose/quality contract, launch parameters,
 plugin lifecycle/actions, static TF/mount and the gated camera raw branch.
