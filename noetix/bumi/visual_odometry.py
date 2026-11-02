@@ -237,7 +237,10 @@ class VisualOdometryNode:
         self.lock = threading.RLock()
         self.config = dict(config or {})
         self.imu_assisted = self.config.get('imu_assisted', False) is True
-        self.imu_source = str(self.config.get('imu_source', 'camera'))
+        requested_source = str(self.config.get('imu_source', 'body'))
+        if requested_source != 'body':
+            raise ValueError('imu_source must be body; camera IMU is not packaged')
+        self.imu_source = 'body'
         self.active = False
         self.closed = False
         self.output = OUTPUT_TOPIC
@@ -694,7 +697,8 @@ class VisualOdometryNode:
             raise ValueError('body IMU input stale')
         self.health.observe('imu', stamp, now, True)
         self.health.details['imu_assistance']['input'] = dict(
-            source='body', stamp_ns=stamp, quaternion=q)
+            source='body', stamp_ns=stamp,
+            timestamp_source=data.get('timestamp_source', 'unknown'), quaternion=q)
         out = Imu()
         out.header.stamp.sec, out.header.stamp.nanosec = divmod(stamp, 10**9)
         out.header.frame_id = self.base_frame()

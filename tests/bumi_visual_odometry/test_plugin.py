@@ -407,3 +407,8 @@ def test_body_imu_requires_a_fresh_sample_timestamp(plugin, monkeypatch):
 
     with pytest.raises(ValueError, match='body IMU input stale'):
         node.body_imu(message(now-600_000_000))
+
+
+def test_camera_imu_mode_is_rejected_instead_of_breaking_the_camera(executor):
+    with pytest.raises(ValueError, match='camera IMU is not packaged'):
+        module.VisualOdometryPlugin({'imu_source': 'camera'}, 'robot', executor)

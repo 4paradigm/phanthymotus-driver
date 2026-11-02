@@ -127,22 +127,25 @@ RTAB-Map's odometry message is a trajectory delta, not a measured body twist.
 
 ## Body IMU rotation assistance
 
-`plugins.visual_odometry.imu_assisted: true` with `imu_source: body` (shipped
-default) republishes the StatePlugin's 20 Hz body quaternion as
+`plugins.visual_odometry.imu_assisted: true` (shipped default) republishes the
+StatePlugin's 20 Hz body quaternion as
 `sensor_msgs/Imu` on the segment-private `/<segment>/imu` topic. RTAB-Map waits
 for this orientation prior and uses it for rotation only; acceleration is not
 integrated into position. The camera stays on its normal video-only
 `pyrealsense2` path, so no custom RSUSB SDK, camera-mount TF or Madgwick child is
 started.
 
-Missing orientation prevents tracking; orientation older than 500 ms invalidates
-the segment. These checks reject bad input; they do not establish metric
+The SDK exposes no hardware capture timestamp; the payload marks `stamp_ns` as
+`timestamp_source: read_completion`, and the card applies a conservative 500 ms
+freshness window. Missing orientation prevents tracking; orientation older than
+500 ms invalidates the segment. Camera-IMU mode is not packaged and is rejected
+at construction rather than starting a camera that cannot open its SDK. These checks reject bad input; they do not establish metric
 accuracy. Static IMU bias, walking blur and long-term drift still require
 on-robot validation. Set `imu_assisted: false` to return to visual-only mode.
 
 ## Validation status
 
-ROS-free regression for this branch: **492 passed**, run with
+ROS-free regression for this branch: **493 passed**, run with
 `python3 -m pytest -q tests/bumi_visual_odometry tests/test_bumi*.py noetix/bumi/tests`.
 The visual-odometry tests cover the pose/quality contract, launch parameters,
 plugin lifecycle/actions, static TF/mount and the gated camera raw branch.
