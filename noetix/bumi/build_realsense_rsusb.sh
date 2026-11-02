@@ -28,11 +28,12 @@ else
     tar -xzf "$root/source.tar.gz" -C "$root/source" --strip-components=1
     printf '%s\n' "$digest" > "$root/source/.verified-archive-sha256"
 fi
-# librealsense's CMake unconditionally git-clones pybind11 and pybind11_json
-# during configure. The CI builder can reach codeload.github.com (used above for
-# the main source archive) but not the github.com git endpoint, so replace those
-# clone steps with pinned tarball downloads. Hashes are for the exact tags the
-# upstream templates request (pybind11 v2.13.6, pybind11_json 0.2.15).
+# librealsense's CMake unconditionally git-clones pybind11, pybind11_json and
+# nlohmann/json during configure. The CI builder can reach codeload.github.com
+# (used above for the main source archive) but not the github.com git endpoint,
+# so replace those clone steps with pinned tarball downloads. Hashes are for the
+# exact tags the upstream templates request (pybind11 v2.13.6, pybind11_json
+# 0.2.15, nlohmann/json v3.12.0).
 python3 - "$root" <<'PY'
 import pathlib
 import re
@@ -56,6 +57,28 @@ for relative, (url, digest) in downloads.items():
     text = re.sub(r'^\s*GIT_CONFIG .*$', '', text, flags=re.M)
     text = re.sub(r'^\s*GIT_SHALLOW .*$', '', text, flags=re.M)
     path.write_text(text)
+
+# nlohmann/json uses a custom DOWNLOAD_COMMAND with a shallow git clone instead
+# of GIT_REPOSITORY, so rewrite that template outright.
+json_template = '''cmake_minimum_required(VERSION 3.6)
+project(nlohmann-json-download NONE)
+
+include(ExternalProject)
+ExternalProject_Add(
+    nlohmann_json
+    PREFIX .
+    URL "https://codeload.github.com/nlohmann/json/tar.gz/refs/tags/v3.12.0"
+    URL_HASH SHA256=4b92eb0c06d10683f7447ce9406cb97cd4b453be18d7279320f7b2f025c10187
+    TIMEOUT 1800
+    SOURCE_DIR "${CMAKE_BINARY_DIR}/third-party/json"
+    DOWNLOAD_DIR "${CMAKE_BINARY_DIR}/third-party/"
+    UPDATE_COMMAND ""
+    CONFIGURE_COMMAND ""
+    BUILD_COMMAND ""
+    INSTALL_COMMAND ""
+)
+'''
+(root/'source/CMake/json-download.cmake.in').write_text(json_template)
 PY
 echo '[rsusb] Configuring SDK'
 cmake -S "$root/source" -B "$root/build" \
