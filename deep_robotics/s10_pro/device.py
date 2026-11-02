@@ -1741,5 +1741,7 @@ def build_plugins(config, namespace=None, ros2=None):
                S10SingleLightPlugin(native, "tail"),
                S10ChargePlugin(native)]
     if str(config.get("model_variant", "standard")).lower() == "pro":
-        plugins.extend([S10NavigationPlugin(native), S10ControlledSpatialPlugin(config)])
+        from audio import S10MicPlugin, S10SpeakerPlugin
+        plugins.extend([S10NavigationPlugin(native), S10ControlledSpatialPlugin(config),
+                        S10MicPlugin(config, namespace or "", nodes), S10SpeakerPlugin(config)])
     return plugins

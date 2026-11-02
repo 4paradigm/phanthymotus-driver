@@ -2,6 +2,8 @@ deep-robotics-s10-pro:
   image: __IMAGE__
   container_name: embodied-deep-robotics-s10-pro
   network_mode: host
+  devices:
+    - /dev/snd:/dev/snd
   environment:
     - PYTHONUNBUFFERED=1
     - RCUTILS_COLORIZED_OUTPUT=0
@@ -17,6 +19,8 @@ deep-robotics-s10-pro:
     - S10_DRMAP_SSH_USER=${S10_DRMAP_SSH_USER:-user}
     - S10_DRMAP_PASSWORD=${S10_DRMAP_PASSWORD:-'}
     - S10_DRMAP_DIRECTORY=${S10_DRMAP_DIRECTORY:-/var/opt/robot/data/maps}
+    - S10_AUDIO_CAPTURE_DEVICE=${S10_AUDIO_CAPTURE_DEVICE:-default}
+    - S10_AUDIO_PLAYBACK_DEVICE=${S10_AUDIO_PLAYBACK_DEVICE:-default}
     - AGENT_CORE_URL=https://localhost:15678
   logging:
     driver: local

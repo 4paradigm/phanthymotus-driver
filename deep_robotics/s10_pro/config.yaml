@@ -96,6 +96,9 @@ basic_server:
   host: "10.21.33.103"
   tcp_port: 30003
   timeout: 2.0
+audio:
+  capture_device: default
+  playback_device: default
 controlled_spatial:
   # drmap lives on NOS, separate from AOS/basic_server. Auto uses local only
   # when this host is the NOS management host; otherwise it connects by SSH.

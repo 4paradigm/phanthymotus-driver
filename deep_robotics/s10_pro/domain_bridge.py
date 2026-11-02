@@ -12,6 +12,7 @@ _TYPE_NAMES = {
     "String": "std_msgs/msg/String",
     "UInt8MultiArray": "std_msgs/msg/UInt8MultiArray",
     "CompressedImage": "sensor_msgs/msg/CompressedImage",
+    "AudioChunk": "audio_msgs/msg/AudioChunk",
 }
 
 
@@ -33,18 +34,20 @@ class CoreBridge:
         self._errors = {}
         self._last_error = {}
         self._queue_locks = {}
+        self._queue_depths = {}
+        self._latest_only = {}
         self._lock = threading.Lock()
 
-    def create_publisher(self, lane: str, topic: str, msg_type):
+    def create_publisher(self, lane: str, topic: str, msg_type, *, queue_depth=1, latest_only=True):
         from rclpy.serialization import serialize_message
 
         if lane not in self._queues:
             # Keep only the newest sample. Historical camera/lidar frames add
             # visible latency; _put_latest replaces them without blocking ROS.
-            messages = self._ctx.Queue(maxsize=1)
+            messages = self._ctx.Queue(maxsize=int(queue_depth))
             process = self._ctx.Process(
                 target=_run_publisher,
-                args=(messages, self._profile, self._domain, lane),
+                args=(messages, self._profile, self._domain, lane, int(queue_depth)),
                 name=f"s10-pro-domain42-{lane}", daemon=True,
             )
             process.start()
@@ -55,6 +58,10 @@ class CoreBridge:
             self._errors[lane] = 0
             self._last_error[lane] = None
             self._queue_locks[lane] = threading.Lock()
+            self._queue_depths[lane] = int(queue_depth)
+            self._latest_only[lane] = bool(latest_only)
+        elif (self._queue_depths[lane], self._latest_only[lane]) != (int(queue_depth), bool(latest_only)):
+            raise ValueError(f"bridge lane {lane!r} was created with different queue settings")
         return _BridgePublisher(self, lane, topic, msg_type, serialize_message)
 
     def publish(self, lane, topic, msg_type, serialize_message, message):
@@ -65,7 +72,15 @@ class CoreBridge:
                 self._restart_lane(lane)
             messages = self._queues[lane]
             with self._queue_locks[lane]:
-                if not _put_latest(messages, item):
+                try:
+                    if self._latest_only[lane]:
+                        accepted = _put_latest(messages, item)
+                    else:
+                        messages.put_nowait(item)
+                        accepted = True
+                except queue.Full:
+                    accepted = False
+                if not accepted:
                     self._dropped[lane] += 1
             self._counts[lane] += 1
         except Exception as exc:
@@ -87,10 +102,11 @@ class CoreBridge:
                     old_queue.close()
                 except Exception:
                     pass
-            messages = self._ctx.Queue(maxsize=1)
+            depth = self._queue_depths[lane]
+            messages = self._ctx.Queue(maxsize=depth)
             process = self._ctx.Process(
                 target=_run_publisher,
-                args=(messages, self._profile, self._domain, lane),
+                args=(messages, self._profile, self._domain, lane, depth),
                 name=f"s10-pro-domain42-{lane}", daemon=True,
             )
             process.start()
@@ -152,6 +168,72 @@ class CoreSubscriber:
         self._messages.close()
 
 
+class CoreAudioSubscriber:
+    """Receive ordered PCM frames from Core domain in an isolated process."""
+
+    def __init__(self, profile: str, topic: str, domain: int = 42, queue_depth: int = 32):
+        self._ctx = mp.get_context("spawn")
+        self._messages = self._ctx.Queue(maxsize=int(queue_depth))
+        self._process = self._ctx.Process(
+            target=_run_audio_subscriber, args=(self._messages, profile, topic, int(domain)),
+            name="s10-pro-domain42-audio", daemon=True)
+        self._process.start()
+
+    def get(self, timeout=0.1):
+        try:
+            return self._messages.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def is_alive(self):
+        return self._process.is_alive()
+
+    def stop(self):
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=1)
+        self._messages.close()
+
+
+def _run_audio_subscriber(messages, profile, topic, domain):
+    from common import logsafe
+    logsafe.install(check_fd=False)
+    os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
+    os.environ["ROS_DOMAIN_ID"] = str(domain)
+    os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile
+
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from audio_msgs.msg import AudioChunk
+
+    rclpy.init(domain_id=domain)
+    node = Node("s10_pro_core_speaker")
+    qos = QoSProfile(depth=32, reliability=ReliabilityPolicy.BEST_EFFORT)
+
+    def receive(message):
+        item = (str(message.format), bytes(message.data))
+        try:
+            messages.put_nowait(item)
+        except queue.Full:
+            try:
+                messages.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                messages.put_nowait(item)
+            except queue.Full:
+                pass
+
+    node.create_subscription(AudioChunk, topic, receive, qos)
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
 def _run_subscriber(messages, profile, topic, domain):
     from common import logsafe
     logsafe.install(check_fd=False)
@@ -188,7 +270,7 @@ class _BridgePublisher:
                              self._serialize, message)
 
 
-def _run_publisher(messages, profile, domain, lane):
+def _run_publisher(messages, profile, domain, lane, queue_depth=1):
     try:
         from common import logsafe
         logsafe.install()
@@ -204,13 +286,15 @@ def _run_publisher(messages, profile, domain, lane):
     from rclpy.serialization import deserialize_message
     from sensor_msgs.msg import CompressedImage
     from std_msgs.msg import String, UInt8MultiArray
+    from audio_msgs.msg import AudioChunk
 
     types = {"std_msgs/msg/String": String,
              "std_msgs/msg/UInt8MultiArray": UInt8MultiArray,
-             "sensor_msgs/msg/CompressedImage": CompressedImage}
+             "sensor_msgs/msg/CompressedImage": CompressedImage,
+             "audio_msgs/msg/AudioChunk": AudioChunk}
     rclpy.init(domain_id=domain)
     node = Node(f"s10_pro_core_{lane}")
-    qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+    qos = QoSProfile(depth=max(1, int(queue_depth)), reliability=ReliabilityPolicy.BEST_EFFORT)
     publishers = {}
     counts = {}
     failures = {}

@@ -13,6 +13,21 @@ charging and navigation.
 | IMU | `/IMU` (`sensor_msgs/msg/Imu`) | source `header.stamp`, quaternion (w,x,y,z), angular velocity, linear acceleration, Euler angles (radians), temperature |
 | `loco_servo` | `control/velocity` (`motus.control/1`, twist) | bounded continuous velocity commands to the native S10 TCP controller; dry-run by default |
 | Odom | `/MOTION_INFO` (`drdds/msg/MotionInfo`) | `state/odom` with measured body `vx`, `vy`, and `wz`; no fabricated pose |
+| `mic` | local ALSA capture device | `/{namespace}/mic/audio`, `audio/pcm-16k` (`audio_msgs/msg/AudioChunk`), for the Perception ASR card |
+| `speaker` | connected `audio/pcm-16k` input topic | plays TTS PCM on the local ALSA playback device |
+
+The microphone captures mono S16LE at 16 kHz in 32 ms frames. It starts with
+the driver bundle and can also be started/stopped from its card. Connect its
+`/{namespace}/mic/audio` output to the Perception ASR audio input. The speaker
+does not guess a TTS topic: connect a TTS `audio/pcm-16k` output to it, and the
+canvas supplies that topic on `start`. The speaker ignores the TTS end-of-stream
+marker. Both cards use the host's ALSA `default` device unless
+`S10_AUDIO_CAPTURE_DEVICE` or `S10_AUDIO_PLAYBACK_DEVICE` overrides it; raw ALSA
+names such as `hw:1,0` and `plughw:1,0` are accepted.
+Deployment maps the host `/dev/snd` into the container. This directly supports
+onboard deployment when the S10 audio devices are present on AOS. In external
+Jetson deployment, the cards use Jetson-local `/dev/snd`; this does not tunnel
+the AOS-integrated microphone/speaker over the robot Ethernet link.
 
 `model` returns a mesh-free kinematic URDF used by the joint renderer. It has
 the 16 actuated joints and limits, but deliberately no STL dependency. A fixed
@@ -66,17 +81,20 @@ control/state callbacks.
 Build with the repository's normal driver build workflow. `driver.yaml` declares
 `../../common` as a build-context extra; the Dockerfile expects the staged
 `common/` directory. It pins the ROS Humble base image by digest, builds the six
-required vendor message definitions in a build stage, and copies only their
+required vendor message definitions plus shared `audio_msgs/AudioChunk` in a
+build stage, and copies only their
 runtime interfaces into the final image. See `vendor/SOURCE.md` for provenance.
 The final image is larger than the base image because this driver needs the
-Fast DDS RMW package plus PyYAML, Pillow, `openssh-client`, and `sshpass`.
+Fast DDS RMW package, ALSA command-line tools (`alsa-utils`), PyYAML, Pillow,
+`openssh-client`, and `sshpass`.
 The SSH packages support the current one-click NOS `drmap` password path; they
 can be removed when deployment supports a managed SSH key/secret. Apt
 recommends and pip caches are disabled/removed to keep this growth limited to
 the component.
 
 `deploy/service.yml` is a service fragment for the normal platform deployment.
-It does not mount host files; it preconfigures the interface auto-detection,
+It maps `/dev/snd` so the cards can access ALSA devices on the deployment host
+and preconfigures the interface auto-detection,
 robot subnet, AOS control endpoint, and NOS map-management endpoint for a
 standard S10 deployment. Override these values only for a different robot
 network or changed robot credentials.
@@ -137,13 +155,14 @@ multi-point native route remains the supported navigation route contract.
 Run from repository root:
 
 ```sh
-python3 -m pytest -q tests/test_s10_pro_control.py
+python3 -m pytest -q tests/test_s10_pro_control.py tests/test_s10_pro_audio.py
 ```
 
-The latest local run passed 77 tests. Tests use synthetic messages, fake native
+The latest local run passed 81 tests. Tests use synthetic messages, fake native
 TCP clients, and fake Core-domain subscribers; they do not send robot commands.
 They cover interface auto-detection, AOS/NOS separation, control confirmation,
 valid/invalid continuous-control messages, tested `loco` speed-limit parity,
 start-time confirmation, sanitized remote output, watchdog stopping, and
 subscriber failure stopping. A new Bot build and robot-level validation are still required
-before claiming this version accepted.
+before claiming this version accepted. Audio tests validate contracts and frame
+filtering only; ALSA capture/playback still needs validation on the target host.
