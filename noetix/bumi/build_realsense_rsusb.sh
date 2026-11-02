@@ -28,6 +28,35 @@ else
     tar -xzf "$root/source.tar.gz" -C "$root/source" --strip-components=1
     printf '%s\n' "$digest" > "$root/source/.verified-archive-sha256"
 fi
+# librealsense's CMake unconditionally git-clones pybind11 and pybind11_json
+# during configure. The CI builder can reach codeload.github.com (used above for
+# the main source archive) but not the github.com git endpoint, so replace those
+# clone steps with pinned tarball downloads. Hashes are for the exact tags the
+# upstream templates request (pybind11 v2.13.6, pybind11_json 0.2.15).
+python3 - "$root" <<'PY'
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1])
+downloads = {
+    'CMake/pybind11-download.cmake.in': (
+        'https://codeload.github.com/pybind/pybind11/tar.gz/refs/tags/v2.13.6',
+        'e08cb87f4773da97fa7b5f035de8763abc656d87d5773e62f6da0587d1f0ec20'),
+    'CMake/pybind11-json-download.cmake.in': (
+        'https://codeload.github.com/pybind/pybind11_json/tar.gz/refs/tags/0.2.15',
+        '9a4a1494549a2db27bc4c5a16743a5c88ebc18e13c73019c56f399ae0310baf2'),
+}
+for relative, (url, digest) in downloads.items():
+    path = root/'source'/relative
+    text = path.read_text()
+    text = re.sub(r'^\s*GIT_REPOSITORY .*$', f'    URL "{url}"', text, flags=re.M)
+    text = re.sub(r'^\s*GIT_TAG .*$', f'    URL_HASH SHA256={digest}\n    TIMEOUT 1800',
+                  text, flags=re.M)
+    text = re.sub(r'^\s*GIT_CONFIG .*$', '', text, flags=re.M)
+    text = re.sub(r'^\s*GIT_SHALLOW .*$', '', text, flags=re.M)
+    path.write_text(text)
+PY
 echo '[rsusb] Configuring SDK'
 cmake -S "$root/source" -B "$root/build" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$root/install" \
