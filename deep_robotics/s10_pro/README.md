@@ -13,21 +13,23 @@ charging and navigation.
 | IMU | `/IMU` (`sensor_msgs/msg/Imu`) | source `header.stamp`, quaternion (w,x,y,z), angular velocity, linear acceleration, Euler angles (radians), temperature |
 | `loco_servo` | `control/velocity` (`motus.control/1`, twist) | bounded continuous velocity commands to the native S10 TCP controller; dry-run by default |
 | Odom | `/MOTION_INFO` (`drdds/msg/MotionInfo`) | `state/odom` with measured body `vx`, `vy`, and `wz`; no fabricated pose |
-| `mic` | local ALSA capture device | `/{namespace}/mic/audio`, `audio/pcm-16k` (`audio_msgs/msg/AudioChunk`), for the Perception ASR card |
-| `speaker` | connected `audio/pcm-16k` input topic | plays TTS PCM on the local ALSA playback device |
+| `mic` | AOS ALSA capture device, local or SSH-forwarded | `/{namespace}/mic/audio`, `audio/pcm-16k` (`audio_msgs/msg/AudioChunk`), for the Perception ASR card |
+| `speaker` | connected `audio/pcm-16k` input topic | plays TTS PCM on the AOS ALSA playback device, locally or over SSH |
 
 The microphone captures mono S16LE at 16 kHz in 32 ms frames. It starts with
 the driver bundle and can also be started/stopped from its card. Connect its
 `/{namespace}/mic/audio` output to the Perception ASR audio input. The speaker
 does not guess a TTS topic: connect a TTS `audio/pcm-16k` output to it, and the
 canvas supplies that topic on `start`. The speaker ignores the TTS end-of-stream
-marker. Both cards use the host's ALSA `default` device unless
-`S10_AUDIO_CAPTURE_DEVICE` or `S10_AUDIO_PLAYBACK_DEVICE` overrides it; raw ALSA
-names such as `hw:1,0` and `plughw:1,0` are accepted.
-Deployment maps the host `/dev/snd` into the container. This directly supports
-onboard deployment when the S10 audio devices are present on AOS. In external
-Jetson deployment, the cards use Jetson-local `/dev/snd`; this does not tunnel
-the AOS-integrated microphone/speaker over the robot Ethernet link.
+marker. `S10_AUDIO_MODE=auto` uses local ALSA when the configured AOS address is
+bound on this host (onboard deployment), otherwise it runs `arecord`/`aplay` on
+AOS over SSH (external Jetson deployment). The default AOS endpoint is
+`10.21.33.103`, with `user` and the configured S10 SSH password; override with
+`S10_AUDIO_SSH_HOST`, `S10_AUDIO_SSH_USER`, and `S10_AUDIO_SSH_PASSWORD`.
+`S10_AUDIO_CAPTURE_DEVICE` and `S10_AUDIO_PLAYBACK_DEVICE` select the respective
+ALSA devices on AOS. Set `S10_AUDIO_MODE=local` or `ssh` to force a mode.
+Deployment maps `/dev/snd` for local operation; external operation transports
+PCM over SSH and does not use the Jetson's unrelated local sound card.
 
 `model` returns a mesh-free kinematic URDF used by the joint renderer. It has
 the 16 actuated joints and limits, but deliberately no STL dependency. A fixed

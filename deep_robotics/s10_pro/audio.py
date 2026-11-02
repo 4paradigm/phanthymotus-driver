@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import queue
+import shlex
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -35,6 +37,49 @@ def _playback_command(device):
             "-f", "S16_LE", "-r", "16000", "-c", "1"]
 
 
+def _is_local_address(address):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind((address, 0))
+        return True
+    except OSError:
+        return address in {"127.0.0.1", "0.0.0.0"}
+
+
+def _audio_launch(program, device, mode, host, user, password):
+    command = _capture_command(device) if program == "arecord" else _playback_command(device)
+    if mode == "local":
+        return command, None
+    target = f"{user}@{host}" if user else host
+    remote_command = "exec " + shlex.join(command)
+    ssh = ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new",
+           "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", "--",
+           target, remote_command]
+    if password:
+        if not shutil.which("sshpass"):
+            raise RuntimeError("sshpass is unavailable for configured AOS audio password")
+        env = os.environ.copy()
+        env["SSHPASS"] = password
+        return ["sshpass", "-e", *ssh], env
+    return ["ssh", "-o", "BatchMode=yes", *ssh[1:]], None
+
+
+def _audio_transport(config):
+    audio = config.get("audio", {})
+    mode = os.environ.get("S10_AUDIO_MODE", audio.get("mode", "auto"))
+    host = os.environ.get("S10_AUDIO_SSH_HOST") or audio.get("ssh_host", "10.21.33.103")
+    user = os.environ.get("S10_AUDIO_SSH_USER", audio.get("ssh_user", "user"))
+    password = os.environ.get("S10_AUDIO_SSH_PASSWORD",
+                              os.environ.get("S10_DRMAP_PASSWORD", ""))
+    if mode not in {"auto", "local", "ssh"}:
+        raise ValueError("S10_AUDIO_MODE must be auto, local, or ssh")
+    local = _is_local_address(str(host))
+    if mode == "local" and not local:
+        raise ValueError("local audio mode requested but the configured AOS address is not local")
+    selected = "local" if mode == "local" or (mode == "auto" and local) else "ssh"
+    return selected, str(host), str(user), str(password)
+
+
 def _audio_tool(name, description, actions, *, topic_out=None, topic_in=None):
     result = tool(name, "sensor" if name == "mic" else "actuator", description,
                   action_schema(actions, {}))
@@ -53,6 +98,7 @@ class S10MicPlugin:
         self.topic = f"/{namespace}/mic/audio" if namespace else "/mic/audio"
         self.device = os.environ.get("S10_AUDIO_CAPTURE_DEVICE") or str(
             config.get("audio", {}).get("capture_device", "default"))
+        self.mode, self.host, self.user, self.password = _audio_transport(config)
         self._publisher = None
         self._process = None
         self._reader = None
@@ -85,17 +131,18 @@ class S10MicPlugin:
                 return {"state": "running", "topic_out": self.get_tool()["topic_out"]}
             if self.nodes is None:
                 return {"state": "error", "error": "ROS 2 bridge is unavailable"}
-            if not shutil.which("arecord"):
+            if self.mode == "local" and not shutil.which("arecord"):
                 return {"state": "error", "error": "arecord is unavailable in the driver image"}
             if self._publisher is None:
                 from audio_msgs.msg import AudioChunk
                 self._publisher = self.nodes.bridge.create_publisher(
                     "mic_audio", self.topic, AudioChunk, queue_depth=32, latest_only=False)
             try:
-                self._process = subprocess.Popen(
-                    _capture_command(self.device), stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE, bufsize=0)
-            except OSError as exc:
+                command, env = _audio_launch("arecord", self.device, self.mode,
+                                             self.host, self.user, self.password)
+                self._process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                                 stderr=subprocess.PIPE, bufsize=0, env=env)
+            except (OSError, RuntimeError) as exc:
                 self._last_error = str(exc)
                 return {"state": "error", "error": self._last_error}
             if self._process.poll() is not None:
@@ -174,7 +221,8 @@ class S10MicPlugin:
         if action == "info":
             running = self._process is not None and self._process.poll() is None
             result = {"state": "running" if running else "idle", "frames": self._frames,
-                      "topic_out": self.get_tool()["topic_out"]}
+                      "topic_out": self.get_tool()["topic_out"], "mode": self.mode,
+                      "audio_host": self.host if self.mode == "ssh" else None}
             if self._last_error:
                 result["error"] = self._last_error
             return result
@@ -187,6 +235,7 @@ class S10SpeakerPlugin:
     def __init__(self, config):
         self.device = os.environ.get("S10_AUDIO_PLAYBACK_DEVICE") or str(
             config.get("audio", {}).get("playback_device", "default"))
+        self.mode, self.host, self.user, self.password = _audio_transport(config)
         self.domain = int(config.get("ros", {}).get("core_domain_id") or 42)
         self._subscriber = None
         self._process = None
@@ -221,13 +270,15 @@ class S10SpeakerPlugin:
             if self._worker and self._worker.is_alive() and topic == self._topic:
                 return {"state": "playing", "input_topic": topic}
             self._stop_playback()
-            if not shutil.which("aplay"):
+            if self.mode == "local" and not shutil.which("aplay"):
                 return {"state": "error", "error": "aplay is unavailable in the driver image"}
             try:
-                process = subprocess.Popen(_playback_command(self.device), stdin=subprocess.PIPE,
+                command, env = _audio_launch("aplay", self.device, self.mode,
+                                             self.host, self.user, self.password)
+                process = subprocess.Popen(command, stdin=subprocess.PIPE,
                                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                           bufsize=0)
-            except OSError as exc:
+                                           bufsize=0, env=env)
+            except (OSError, RuntimeError) as exc:
                 self._last_error = str(exc)
                 return {"state": "error", "error": self._last_error}
             if process.poll() is not None:
@@ -315,5 +366,6 @@ class S10SpeakerPlugin:
         if action == "info":
             return {"state": "playing" if self._worker and self._worker.is_alive() else "idle",
                     "input_topic": self._topic or None, "frames_played": self._frames,
-                    "frames_dropped": self._dropped, "last_error": self._last_error}
+                    "frames_dropped": self._dropped, "last_error": self._last_error,
+                    "mode": self.mode, "audio_host": self.host if self.mode == "ssh" else None}
         raise ValueError(f"unsupported S10 speaker action: {action}")

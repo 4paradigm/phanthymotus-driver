@@ -97,6 +97,9 @@ basic_server:
   tcp_port: 30003
   timeout: 2.0
 audio:
+  mode: auto
+  ssh_host: "10.21.33.103"
+  ssh_user: user
   capture_device: default
   playback_device: default
 controlled_spatial:

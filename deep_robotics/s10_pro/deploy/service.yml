@@ -21,6 +21,10 @@ deep-robotics-s10-pro:
     - S10_DRMAP_DIRECTORY=${S10_DRMAP_DIRECTORY:-/var/opt/robot/data/maps}
     - S10_AUDIO_CAPTURE_DEVICE=${S10_AUDIO_CAPTURE_DEVICE:-default}
     - S10_AUDIO_PLAYBACK_DEVICE=${S10_AUDIO_PLAYBACK_DEVICE:-default}
+    - S10_AUDIO_MODE=${S10_AUDIO_MODE:-auto}
+    - S10_AUDIO_SSH_HOST=${S10_AUDIO_SSH_HOST:-10.21.33.103}
+    - S10_AUDIO_SSH_USER=${S10_AUDIO_SSH_USER:-user}
+    - S10_AUDIO_SSH_PASSWORD=${S10_AUDIO_SSH_PASSWORD:-'}
     - AGENT_CORE_URL=https://localhost:15678
   logging:
     driver: local

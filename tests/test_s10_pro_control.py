@@ -314,7 +314,9 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert nodes.topics["odom"] == {"topic": "/robot/state/odom", "format": "state/odom"}
     state_card = device.S10StatePlugin(FakeNative({}), nodes)
     loco_definition = next(card for card in state_card.get_tools() if card["name"] == "loco_state")
-    assert {item["format"] for item in loco_definition["topic_out"]} == {"data/json", "state/odom"}
+    assert loco_definition["topic_out"] == [{"topic": "/robot/loco_state", "format": "data/json"}]
+    odom_definition = next(card for card in state_card.get_tools() if card["name"] == "odom")
+    assert odom_definition["topic_out"] == [nodes.topics["odom"]]
 
     camera_msg = SimpleNamespace(width=2, height=1, step=6, encoding="rgb8",
                                  data=bytes((255, 0, 0, 0, 255, 0)), header={"stamp": 1})
@@ -835,12 +837,35 @@ def test_service_configures_verified_s10_robot_network_without_shell_exports():
     assert environment["S10_DRMAP_SSH_HOST"] == "${S10_DRMAP_SSH_HOST:-10.21.33.106}"
     assert environment["S10_DRMAP_SSH_USER"] == "${S10_DRMAP_SSH_USER:-user}"
     assert environment["S10_DRMAP_PASSWORD"] == "${S10_DRMAP_PASSWORD:-'}"
+    assert environment["S10_AUDIO_MODE"] == "${S10_AUDIO_MODE:-auto}"
+    assert environment["S10_AUDIO_SSH_HOST"] == "${S10_AUDIO_SSH_HOST:-10.21.33.103}"
+    assert environment["S10_AUDIO_SSH_PASSWORD"] == "${S10_AUDIO_SSH_PASSWORD:-'}"
     assert environment["ROBOT_NETWORK_CIDR"] == "10.21.33.0/24"
     config = yaml.safe_load((DRIVER / "config.yaml").read_text(encoding="utf-8"))
     assert config["basic_server"]["host"] == "10.21.33.103"
     assert config["basic_server"]["timeout"] == 2.0
     assert config["controlled_spatial"]["ssh_host"] == "10.21.33.106"
     assert config["controlled_spatial"]["timeout"] == 30
+
+
+def test_audio_auto_selects_local_aos_or_ssh_transport(monkeypatch):
+    monkeypatch.syspath_prepend(str(DRIVER))
+    import audio
+
+    monkeypatch.delenv("S10_AUDIO_MODE", raising=False)
+    monkeypatch.setattr(audio, "_is_local_address", lambda _address: True)
+    assert audio._audio_transport({"audio": {"ssh_host": "10.21.33.103"}})[0] == "local"
+
+    monkeypatch.setattr(audio, "_is_local_address", lambda _address: False)
+    monkeypatch.setenv("S10_AUDIO_SSH_PASSWORD", "'")
+    monkeypatch.setattr(audio.shutil, "which", lambda _program: "/usr/bin/sshpass")
+    mode, host, user, password = audio._audio_transport({"audio": {}})
+    assert (mode, host, user, password) == ("ssh", "10.21.33.103", "user", "'")
+    command, env = audio._audio_launch("arecord", "hw:0,0", mode, host, user, password)
+    assert command[:3] == ["sshpass", "-e", "ssh"]
+    assert command[-2] == "user@10.21.33.103"
+    assert "arecord" in command[-1]
+    assert env["SSHPASS"] == "'"
 
 
 def test_core_domain_bridge_is_spawned_and_uses_bounded_latest_value_lanes():
@@ -1451,7 +1476,23 @@ def test_loco_servo_is_a_dry_run_velocity_sink_by_default(monkeypatch):
     from loco_servo import S10LocoServoPlugin, build_descriptor
     from common.control import parse_descriptor
 
-    plugin = S10LocoServoPlugin(FakeNative({}))
+    class Process:
+        def is_alive(self):
+            return True
+
+    class Subscriber:
+        def __init__(self, *_args):
+            self._process = Process()
+
+        def latest(self):
+            return None
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr("loco_servo.CoreSubscriber", lambda *_args: Subscriber())
+
+    plugin = S10LocoServoPlugin(FakeNative({}), ros2=object())
     assert parse_descriptor(build_descriptor()).mode == "twist"
     assert "groups" not in build_descriptor()
     definition = plugin.get_tool()
@@ -1463,8 +1504,12 @@ def test_loco_servo_is_a_dry_run_velocity_sink_by_default(monkeypatch):
     assert "groups" not in descriptor
     assert plugin.dispatch("info", {})["dry_run"] is True
     assert plugin.dispatch("config", {"dry_run": False})["code"] == "CONFIRM_REQUIRED"
+    result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": True})
+    assert result["state"] == "running"
+    assert plugin.dispatch("info", {})["dry_run"] is True
+    plugin.stop()
     assert plugin.dispatch("config", {"dry_run": False, "confirm": True})["dry_run"] is False
-    result = plugin.dispatch("start", {"input_topic": "/policy/velocity"})
+    result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": False})
     assert result["state"] == "error"
     assert "S10_MOTION_ENABLED" in result["message"]
 
@@ -1742,10 +1787,13 @@ def test_lidar_source_locks_to_first_valid_configured_stream(monkeypatch):
     nodes._source_topics = {"lidar_cloud": list(nodes._lidar_topics)}
     nodes.media_workers = SimpleNamespace(submit=lambda *_args: True)
     msg = SimpleNamespace(fields=[], is_bigendian=False, width=0, height=0,
-                          row_step=0, point_step=0, data=b"")
+                          row_step=0, point_step=0, data=b"",
+                          header=SimpleNamespace(
+                              stamp=SimpleNamespace(sec=1, nanosec=0), frame_id="aos_lidar"))
     nodes._forward_lidar("/DEPTH_POINTS", msg)
     assert nodes._active_lidar_source == "/DEPTH_POINTS"
     assert nodes._stream_stats["lidar_cloud"]["received"] == 1
+    assert nodes._stream_stats["lidar_cloud"]["dropped"] == 0
     nodes._forward_lidar("/local_scans", msg)
     assert nodes._active_lidar_source == "/DEPTH_POINTS"
     assert nodes._stream_stats["lidar_cloud"]["received"] == 1

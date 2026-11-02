@@ -27,7 +27,6 @@ CAMERA_LANES = ("camera_rear", "camera_left", "camera_front", "camera_right")
 LIDAR_LANES = ("lidar_cloud", "lidar_map")
 LIDAR_SOURCE_STALE_SECONDS = 3.0
 DIRECT_LIDAR_SOURCES = frozenset({"/DEPTH_POINTS", "/local_scans", "/LIDAR/POINTS"})
-MEDIA_MAX_AGE_S = 0.75
 
 
 def _mark_dangerous(result, actions):
@@ -675,18 +674,6 @@ class S10Nodes:
         except (ValueError, OSError):
             return None
 
-    @staticmethod
-    def _fresh_header(header):
-        """Reject DDS samples that were already stale before this callback."""
-        if header is None or not hasattr(header, "stamp"):
-            return True
-        stamp = header.stamp
-        seconds = float(getattr(stamp, "sec", 0)) + float(getattr(stamp, "nanosec", 0)) / 1e9
-        if seconds <= 0:
-            return True
-        age = time.time() - seconds
-        return -0.25 <= age <= MEDIA_MAX_AGE_S
-
     def _forward_camera(self, key, msg, already_received=False):
         # S10 camera timestamps come from the AOS clock and are not guaranteed
         # to share the container wall clock. Do not discard valid frames based
@@ -772,14 +759,6 @@ class S10Nodes:
     def _forward_lidar(self, source, msg=None):
         if msg is None:
             msg, source = source, None
-        if not self._fresh_header(getattr(msg, "header", None)):
-            if source is not None:
-                with self._lidar_source_lock:
-                    stats = self._lidar_topic_stats.setdefault(
-                        source, {"received": 0, "stale_dropped": 0, "last_seen": None})
-                    stats["stale_dropped"] += 1
-            self._record_stream("lidar_cloud", "dropped")
-            return
         if source is not None:
             if source not in self._lidar_topics:
                 return
@@ -813,9 +792,6 @@ class S10Nodes:
         self._forward_lidar_packet("lidar_map", msg)
 
     def _forward_lidar_packet(self, lane, msg):
-        if not self._fresh_header(getattr(msg, "header", None)):
-            self._record_stream(lane, "dropped")
-            return
         self._record_stream(lane, "received")
         if self.media_workers is not None:
             fields = [(field.name, field.offset, field.datatype, field.count)
@@ -1096,8 +1072,6 @@ class S10StatePlugin:
         definitions = []
         for name, description in cards.items():
             outputs = [topics[name]] if name in topics else None
-            if name == "loco_state" and "odom" in topics:
-                outputs.append(topics["odom"])
             definitions.append(tool(name, "sensor", description, topic_out=outputs))
         return definitions
 
@@ -1105,8 +1079,6 @@ class S10StatePlugin:
         result = {"state": state}
         if self.nodes and name in self.nodes.topics:
             result["topic_out"] = [self.nodes.topics[name]]
-            if name == "loco_state" and "odom" in self.nodes.topics:
-                result["topic_out"].append(self.nodes.topics["odom"])
         return result
 
     def start(self): self.native.start()
