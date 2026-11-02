@@ -231,3 +231,19 @@ def test_one_point_eight_hz_capture_does_not_trip_the_camera_watchdog():
     quality = health.status(4*556_000_000)
     assert quality['status'] == 'tracking'
     assert quality['input_age_ms']['camera'] < 1000
+
+
+def test_slam_metadata_distinguishes_pose_time_from_publication_time():
+    health = healthy()
+    pose = dict(position=[1, 2, 3], quaternion=[0, 0, 0, 1],
+                frame_id='s_odom', child_frame_id='opt', covariance=[0.]*36)
+    sample = make_sample(health, 1_100_000_000, dict(stamp_ns=1_090_000_000, pose=pose))
+    assert sample['vendor']['motus_slam'] == {
+        'status': 'tracking', 'segment_id': 's',
+        'stamp_source': 'measurement', 'clock_id': 'ros',
+    }
+    assert sample['stamp_ms'] == 1090
+    lost = make_sample(health, 900_000_000_000, None)
+    assert lost['vendor']['motus_slam']['status'] == 'lost'
+    assert lost['vendor']['motus_slam']['stamp_source'] == 'unknown'
+    assert lost['pose'] is None

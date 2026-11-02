@@ -400,8 +400,10 @@ class VisualOdometryNode:
                                  '\nDisplacement is from the first tracking pose after reset, '
                                  'not accumulated path length.\nDiagnostics:\n'+
                                  json.dumps(sample, indent=2, allow_nan=False)),
-                    odom_interface=build_interface(provides=[], rate_hz=20,
-                                                   pose_drift='unbounded'),
+                    odom_interface={**build_interface(provides=[], rate_hz=20,
+                                                      pose_drift='unbounded'),
+                                    'slam_pose': {'available': True,
+                                                  'profile': 'motus_slam/1'}},
                     quality=sample['vendor'],
                     namespace=self.namespace,
                     pose_reference=self.pose_reference(),

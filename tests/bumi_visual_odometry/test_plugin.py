@@ -169,6 +169,7 @@ def test_info_is_the_default_action(plugin):
     assert result['state'] == 'idle'
     assert result['namespace'] == 'robot'
     assert result['odom_interface']['provides'] == []
+    assert result['odom_interface']['slam_pose'] == {'available': True, 'profile': 'motus_slam/1'}
     assert plugin.dispatch('info', {})['state'] == 'idle'
 
 
