@@ -299,11 +299,18 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
         },
     }
 
-    callbacks["/MOTION_INFO"](SimpleNamespace(data=SimpleNamespace(vel_x=0.3, vel_y=0.0)))
+    delayed_stamp_ms = int(time.time() * 1000) - 900
+    delayed_sec, delayed_ms = divmod(delayed_stamp_ms, 1000)
+    callbacks["/MOTION_INFO"](SimpleNamespace(
+        header=SimpleNamespace(stamp=SimpleNamespace(
+            sec=delayed_sec, nanosec=delayed_ms * 1_000_000)),
+        data=SimpleNamespace(vel_x=0.3, vel_y=0.0)))
     loco_state = json.loads(nodes.publishers["loco_state"].messages[-1].data)
     assert loco_state["vel_x"] == 0.3
     odom = json.loads(nodes.publishers["odom"].messages[-1].data)
     assert odom["twist"] == [0.3, 0.0, None, None, None, None]
+    assert odom["stamp_ms"] == delayed_stamp_ms
+    assert odom["vendor"]["stamp_source"] == "robot"
     assert nodes.topics["odom"] == {"topic": "/robot/state/odom", "format": "state/odom"}
     state_card = device.S10StatePlugin(FakeNative({}), nodes)
     loco_definition = next(card for card in state_card.get_tools() if card["name"] == "loco_state")

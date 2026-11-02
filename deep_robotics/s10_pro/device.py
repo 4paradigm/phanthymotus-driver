@@ -637,9 +637,19 @@ class S10Nodes:
             return None
         twist = [number("vel_x", "VelX"), number("vel_y", "VelY"), None,
                  None, None, number("vel_yaw", "VelYaw")]
+        stamp = values.get("header", {}).get("stamp") if isinstance(values, dict) else None
+        vendor_ms = None
+        if isinstance(stamp, dict):
+            sec, nanosec = stamp.get("sec"), stamp.get("nanosec")
+            if (type(sec) is int and type(nanosec) is int
+                    and 0 <= nanosec < 1_000_000_000):
+                vendor_ms = sec * 1000 + nanosec // 1_000_000
+        from common.odom import resolve_stamp_ms
+        stamp_ms, stamp_provenance = resolve_stamp_ms(
+            vendor_ms=vendor_ms, received_ms=int(time.time() * 1000))
         self._publish_json("odom", build_sample(
-            stamp_ms=int(time.time() * 1000), twist=twist,
-            vendor={"motion_state": motion, "gait_state": gait}))
+            stamp_ms=stamp_ms, twist=twist,
+            vendor={"motion_state": motion, "gait_state": gait, **stamp_provenance}))
 
     @staticmethod
     def _jpeg_from_ros_image(msg):

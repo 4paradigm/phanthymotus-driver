@@ -64,6 +64,17 @@ def test_build_plugins_registers_audio_cards_for_pro_only(monkeypatch):
     pro = device.build_plugins({"model_variant": "pro"})
     standard = device.build_plugins({"model_variant": "standard"})
     assert {type(plugin).__name__ for plugin in pro} >= {"S10MicPlugin", "S10SpeakerPlugin"}
+    expected_prefixes = {
+        "S10LocoServoPlugin": "loco_servo",
+        "S10ControlledSpatialPlugin": "controlled_spatial",
+        "S10MicPlugin": "mic",
+        "S10SpeakerPlugin": "speaker",
+    }
+    for plugin in pro:
+        expected = expected_prefixes.get(type(plugin).__name__)
+        if expected:
+            assert plugin.PREFIX == expected
+            assert plugin.get_tool()["name"] == expected
     assert not {type(plugin).__name__ for plugin in standard} & {"S10MicPlugin", "S10SpeakerPlugin"}
 
 

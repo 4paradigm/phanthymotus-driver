@@ -28,6 +28,8 @@ def build_descriptor(expected_hz=10.0):
 
 
 class S10LocoServoPlugin:
+    PREFIX = "loco_servo"
+
     def __init__(self, native, ros2=None, motion=None):
         self.native, self.ros2, self.motion = native, ros2, motion
         # Match the repository-wide motion-permission contract: images are
@@ -51,7 +53,7 @@ class S10LocoServoPlugin:
         self._refused = 0
 
     def get_tool(self):
-        return {"name": "loco_servo", "type": "actuator", "multiInstance": False,
+        return {"name": self.PREFIX, "type": "actuator", "multiInstance": False,
                 "description": "S10 Pro continuous body velocity input for visual navigation.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": ["start", "stop", "pause", "resume", "info", "config"]},

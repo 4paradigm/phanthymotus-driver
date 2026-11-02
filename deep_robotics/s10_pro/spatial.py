@@ -34,6 +34,8 @@ def _safe_remote_value(value, depth=0):
 
 
 class S10ControlledSpatialPlugin:
+    PREFIX = "controlled_spatial"
+
     ACTIONS = {
         "info": ([], "Report auto-detected local or external execution path."),
         "map_list": ([], "List robot maps using drmap JSON output."),
@@ -90,7 +92,7 @@ class S10ControlledSpatialPlugin:
         return address.is_loopback
 
     def get_tool(self):
-        result = tool("controlled_spatial", "actuator",
+        result = tool(self.PREFIX, "actuator",
                       "山猫 S10 地图管理。地图列表为只读；启动/停止建图会影响定位和地图数据，需要 confirm=true。",
                       action_schema(self.ACTIONS, {
                           "confirm": {"type": "boolean", "description": "Required true for mapping start/stop."},

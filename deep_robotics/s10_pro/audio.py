@@ -46,6 +46,8 @@ def _audio_tool(name, description, actions, *, topic_out=None, topic_in=None):
 
 
 class S10MicPlugin:
+    PREFIX = "mic"
+
     def __init__(self, config, namespace, nodes):
         self.nodes = nodes
         self.topic = f"/{namespace}/mic/audio" if namespace else "/mic/audio"
@@ -61,7 +63,7 @@ class S10MicPlugin:
 
     def get_tool(self):
         return _audio_tool(
-            "mic", "S10 内置麦克风；输出单声道 PCM S16LE/16 kHz，连接到 ASR 音频输入。",
+            self.PREFIX, "S10 内置麦克风；输出单声道 PCM S16LE/16 kHz，连接到 ASR 音频输入。",
             {"start": ([], "Start microphone capture and publish PCM-16k frames."),
              "stop": ([], "Stop microphone capture."),
              "info": ([], "Read microphone capture state and frame count.")},
@@ -180,6 +182,8 @@ class S10MicPlugin:
 
 
 class S10SpeakerPlugin:
+    PREFIX = "speaker"
+
     def __init__(self, config):
         self.device = os.environ.get("S10_AUDIO_PLAYBACK_DEVICE") or str(
             config.get("audio", {}).get("playback_device", "default"))
@@ -196,7 +200,7 @@ class S10SpeakerPlugin:
 
     def get_tool(self):
         return _audio_tool(
-            "speaker", "S10 内置扬声器；播放连接输入的单声道 PCM S16LE/16 kHz TTS 音频。",
+            self.PREFIX, "S10 内置扬声器；播放连接输入的单声道 PCM S16LE/16 kHz TTS 音频。",
             {"start": (["input_topic"], "Subscribe to the connected TTS PCM-16k stream and play it."),
              "stop": ([], "Stop speaker playback."),
              "info": ([], "Read speaker subscription and playback state.")},
