@@ -1,5 +1,6 @@
 from types import SimpleNamespace as NS
 from pathlib import Path
+import os
 import subprocess
 
 import pytest
@@ -63,6 +64,24 @@ def test_builder_refuses_unverified_existing_sources(tmp_path, marker):
     assert result.returncode == 1
     assert 'Existing source is unverified' in result.stderr
     assert not (tmp_path / 'build').exists()
+
+
+def test_builder_reports_download_stage_before_a_transfer_failure(tmp_path, monkeypatch):
+    tools = tmp_path / 'tools'
+    tools.mkdir()
+    curl = tools / 'curl'
+    curl.write_text('#!/bin/sh\necho "Transfer timed out" >&2\nexit 28\n')
+    curl.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{tools}:{os.environ["PATH"]}')
+    script = Path(__file__).resolve().parents[2] / 'noetix/bumi/build_realsense_rsusb.sh'
+    root = tmp_path / 'sdk'
+    result = subprocess.run(['bash', str(script), str(root)],
+                            capture_output=True, text=True, timeout=5)
+    assert 'Downloading' in result.stdout
+    assert result.returncode == 28
+    assert 'Transfer timed out' in result.stderr
+    assert not (root / 'source').exists()
+    assert not (root / 'build').exists()
 
 
 @pytest.mark.parametrize('gap_s', [0., .03])

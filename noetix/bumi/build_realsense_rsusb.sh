@@ -13,14 +13,21 @@ if [ -d "$root/source" ]; then
         exit 1
     fi
 else
-    curl -fsSL --proto '=https' --proto-redir '=https' --retry 2 \
+    # CI cancels builds after 600 seconds without output. Keep transfer progress
+    # visible and bound network stalls instead of silently waiting indefinitely.
+    printf '[rsusb] Downloading librealsense %s\n' "$revision"
+    curl -fL --proto '=https' --proto-redir '=https' --retry 2 \
+        --connect-timeout 15 --max-time 180 --retry-max-time 480 \
+        --speed-limit 1024 --speed-time 30 \
         "https://codeload.github.com/realsenseai/librealsense/tar.gz/$revision" \
         -o "$root/source.tar.gz"
+    echo '[rsusb] Verifying source archive'
     echo "$digest  $root/source.tar.gz" | sha256sum -c -
     mkdir -p "$root/source"
     tar -xzf "$root/source.tar.gz" -C "$root/source" --strip-components=1
     printf '%s\n' "$digest" > "$root/source/.verified-archive-sha256"
 fi
+echo '[rsusb] Configuring SDK'
 cmake -S "$root/source" -B "$root/build" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$root/install" \
     -DCMAKE_INSTALL_LIBDIR=lib '-DCMAKE_INSTALL_RPATH=$ORIGIN/../../lib' \
@@ -31,6 +38,8 @@ cmake -S "$root/source" -B "$root/build" \
     -DBUILD_GLSL_EXTENSIONS=OFF -DBUILD_TOOLS=OFF \
     -DBUILD_ROSBAG2=OFF -DBUILD_WITH_DDS=OFF \
     -DENABLE_STATS=OFF -DENABLE_AI_ASSISTANT=OFF -DCHECK_FOR_UPDATES=OFF
+echo '[rsusb] Building SDK Python bindings'
 cmake --build "$root/build" --target pyrealsense2 pyrsutils --parallel 3
+echo '[rsusb] Installing SDK'
 cmake --install "$root/build"
 printf 'SDK ready: PYTHONPATH=%s/install/python\n' "$root"
