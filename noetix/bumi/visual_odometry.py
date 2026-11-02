@@ -334,6 +334,8 @@ class VisualOdometryNode:
         self.last_reject = None
         self.restart_requested = None
         self.summary_origin = None
+        self.yaw_origin_rad = None
+        self.turn_angle_deg = None
         self.last_summary_ns = None
         self.last_summary_state = None
 
@@ -372,6 +374,8 @@ class VisualOdometryNode:
             distance = math.sqrt(sum((a-b)**2 for a, b in zip(position, self.summary_origin)))
         stamp = quality['visual_stamp_ns']
         summary = dict(status=quality['status'],
+                       turn_angle_deg=(round(self.turn_angle_deg, 1)
+                                       if self.turn_angle_deg is not None else None),
                        displacement_m=round(distance, 3) if distance is not None else None,
                        position_m=[round(v, 3) for v in position] if position is not None else None,
                        pose_reference=quality['pose_reference'],
@@ -693,6 +697,15 @@ class VisualOdometryNode:
 
     def _publish_body_imu(self, q, angular, linear, stamp, timestamp_source):
         from sensor_msgs.msg import Imu
+        # Body yaw in the IMU/world frame; report only the turn since the first
+        # sample of this segment. This is an orientation observation, not
+        # integrated angular velocity, so it does not drift by integration.
+        yaw = math.atan2(2.0*(q[3]*q[2]+q[0]*q[1]),
+                         1.0-2.0*(q[1]*q[1]+q[2]*q[2]))
+        if self.yaw_origin_rad is None:
+            self.yaw_origin_rad = yaw
+        self.turn_angle_deg = math.degrees(
+            (yaw-self.yaw_origin_rad+math.pi) % (2.0*math.pi) - math.pi)
         self.health.observe('imu', stamp, stamp, True)
         self.health.details['imu_assistance']['input'] = dict(
             source=self.imu_source, stamp_ns=stamp,
