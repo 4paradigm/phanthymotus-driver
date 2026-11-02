@@ -1,0 +1,10 @@
+{
+  "battery_min_soc": 20,
+  "temperature_limits": {},
+  "intervals": {
+    "battery": 1,
+    "imu": 0.05,
+    "joints": 0.1,
+    "motion_state": 0.5
+  }
+}
