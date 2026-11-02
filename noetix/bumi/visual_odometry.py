@@ -388,10 +388,7 @@ class VisualOdometryNode:
                     topic_out=[{'topic': self.status_topic, 'format': 'data/json',
                                 'message_type': 'std_msgs/msg/String'},
                                {'topic': self.output, 'format': 'state/odom',
-                                'message_type': 'std_msgs/msg/String'},
-                               {'topic': f'/{self.namespace}/odometry_input/depth',
-                                'format': 'sensor/depth-f32',
-                                'message_type': 'sensor_msgs/msg/Image'}],
+                                'message_type': 'std_msgs/msg/String'}],
                     odom_topic=self.output,
                     sample=sample,
                     # The existing canvas details dialog renders info.description.
@@ -952,9 +949,7 @@ class VisualOdometryPlugin:
                                # new segment automatically.
                                'enum': ['start', 'stop', 'info']}}},
             'topic_out': [{'topic': self._node.status_topic, 'format': 'data/json'},
-                          {'topic': self._node.output, 'format': 'state/odom'},
-                          {'topic': f'/{self._node.namespace}/odometry_input/depth',
-                           'format': 'sensor/depth-f32'}],
+                          {'topic': self._node.output, 'format': 'state/odom'}],
         }]
 
     def start(self) -> None:
