@@ -29,6 +29,12 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  aruco_zones:
+    enabled: true
+  aruco_point:
+    enabled: true
+    # Exposes the card for setup, but no motion until calibrated and explicitly
+    # armed with action=start; each point also needs confirm_motion=true.
   camera_snapshot:
     enabled: true
     output_dir: "/opt/phanthy-motus/data/images"
