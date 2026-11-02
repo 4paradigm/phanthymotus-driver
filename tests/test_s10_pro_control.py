@@ -823,7 +823,7 @@ def test_service_configures_verified_s10_robot_network_without_shell_exports():
     environment = dict(item.split("=", 1) for item in service["environment"])
     assert environment["NETWORK_INTERFACE"] == "${S10_NETWORK_INTERFACE:-auto}"
     assert environment["S10_BASIC_SERVER_HOST"] == "${S10_BASIC_SERVER_HOST:-10.21.33.103}"
-    assert environment["S10_MOTION_ENABLED"] == "${S10_MOTION_ENABLED:-1}"
+    assert environment["S10_MOTION_ENABLED"] == "${S10_MOTION_ENABLED:-0}"
     assert environment["S10_DRMAP_MODE"] == "${S10_DRMAP_MODE:-auto}"
     assert environment["S10_DRMAP_SSH_HOST"] == "${S10_DRMAP_SSH_HOST:-10.21.33.106}"
     assert environment["S10_DRMAP_SSH_USER"] == "${S10_DRMAP_SSH_USER:-user}"
@@ -1353,6 +1353,21 @@ def test_controlled_spatial_reports_invalid_json_and_remote_failures(monkeypatch
     assert plugin.dispatch("mapping_start", {"confirm": True})["code"] == "DRMAP_FAILED"
 
 
+def test_controlled_spatial_sanitizes_and_bounds_remote_output(monkeypatch):
+    monkeypatch.syspath_prepend(str(DRIVER))
+    from spatial import S10ControlledSpatialPlugin
+
+    result = SimpleNamespace(returncode=2, stdout="map\x1b[31mname", stderr="x\x00y" * 2000)
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: result)
+    plugin = S10ControlledSpatialPlugin({"basic_server": {"host": "10.21.33.103"},
+                                         "controlled_spatial": {"mode": "ssh", "ssh_host": "10.21.33.106"}})
+    response = plugin.dispatch("mapping_start", {"confirm": True})
+    assert "\x1b" not in response["stdout"]
+    assert "\\x1b" in response["stdout"]
+    assert "\\x00" in response["stderr"]
+    assert len(response["stderr"]) <= 512
+
+
 def test_sensor_card_stop_start_keeps_shared_tcp_client_alive(monkeypatch):
     device = _load_device(monkeypatch)
 
@@ -1431,15 +1446,61 @@ def test_loco_servo_is_a_dry_run_velocity_sink_by_default(monkeypatch):
 
     plugin = S10LocoServoPlugin(FakeNative({}))
     assert parse_descriptor(build_descriptor()).mode == "twist"
+    assert "groups" not in build_descriptor()
     definition = plugin.get_tool()
     assert definition["name"] == "loco_servo"
     assert definition["topic_in"][0]["format"] == "control/velocity"
+    descriptor = build_descriptor()
+    assert descriptor["limits"]["lower"] == [-1.67, -0.4, 0, 0, 0, -1.0]
+    assert descriptor["limits"]["upper"] == [1.67, 0.4, 0, 0, 0, 1.0]
+    assert "groups" not in descriptor
     assert plugin.dispatch("info", {})["dry_run"] is True
     assert plugin.dispatch("config", {"dry_run": False})["code"] == "CONFIRM_REQUIRED"
     assert plugin.dispatch("config", {"dry_run": False, "confirm": True})["dry_run"] is False
     result = plugin.dispatch("start", {"input_topic": "/policy/velocity"})
     assert result["state"] == "error"
     assert "S10_MOTION_ENABLED" in result["message"]
+
+
+def test_loco_servo_start_can_atomically_arm_with_confirmation(monkeypatch):
+    monkeypatch.syspath_prepend(str(DRIVER))
+    monkeypatch.setenv("S10_MOTION_ENABLED", "1")
+    from loco_servo import S10LocoServoPlugin
+
+    class Process:
+        def is_alive(self):
+            return True
+
+    class Subscriber:
+        def __init__(self, *_args):
+            self._process = Process()
+
+        def latest(self):
+            return None
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr("loco_servo.CoreSubscriber", lambda *_args: Subscriber())
+    plugin = S10LocoServoPlugin(FakeNative({}), ros2=object())
+    try:
+        tool_schema = plugin.get_tool()["inputSchema"]
+        assert set(tool_schema["x-action-params"]["start"]["params"]) == {
+            "input_topic", "dry_run", "confirm",
+        }
+        refused = plugin.dispatch("start", {
+            "input_topic": "/policy/velocity", "dry_run": False,
+        })
+        assert refused["code"] == "CONFIRM_REQUIRED"
+        assert plugin.dispatch("info", {})["state"] == "idle"
+
+        started = plugin.dispatch("start", {
+            "input_topic": "/policy/velocity", "dry_run": False, "confirm": True,
+        })
+        assert started["state"] == "running"
+        assert plugin.dispatch("info", {})["dry_run"] is False
+    finally:
+        plugin.stop()
 
 
 def test_loco_servo_holds_if_core_subscriber_dies(monkeypatch):

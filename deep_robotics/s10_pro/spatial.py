@@ -15,6 +15,24 @@ import subprocess
 from common.vendor_runtime import action_schema, tool
 
 
+def _safe_remote_value(value, depth=0):
+    """Bound and escape data returned by a remote CLI before exposing it via MCP."""
+    if depth >= 5:
+        return "[truncated]"
+    if isinstance(value, str):
+        escaped = "".join(char if char >= " " and char != "\x7f" else f"\\x{ord(char):02x}"
+                          for char in value)
+        return escaped[:512]
+    if isinstance(value, list):
+        return [_safe_remote_value(item, depth + 1) for item in value[:100]]
+    if isinstance(value, dict):
+        return {str(_safe_remote_value(key, depth + 1))[:128]: _safe_remote_value(item, depth + 1)
+                for key, item in list(value.items())[:100]}
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(type(value).__name__)
+
+
 class S10ControlledSpatialPlugin:
     ACTIONS = {
         "info": ([], "Report auto-detected local or external execution path."),
@@ -108,13 +126,14 @@ class S10ControlledSpatialPlugin:
         except (OSError, subprocess.TimeoutExpired) as exc:
             return {"ok": False, "code": "EXECUTION_FAILED", "error": str(exc), "mode": self.mode}
         payload = {"ok": result.returncode == 0, "mode": self.mode,
-                   "exit_code": result.returncode, "stdout": result.stdout[-12000:],
-                   "stderr": result.stderr[-4000:]}
+                   "exit_code": result.returncode,
+                   "stdout": _safe_remote_value(result.stdout[-12000:]),
+                   "stderr": _safe_remote_value(result.stderr[-4000:])}
         if result.returncode:
             payload["code"] = "DRMAP_FAILED"
         if args[:2] == ["--format", "json"] and result.returncode == 0:
             try:
-                payload["data"] = json.loads(result.stdout)
+                payload["data"] = _safe_remote_value(json.loads(result.stdout))
             except json.JSONDecodeError:
                 payload["code"] = "INVALID_JSON_OUTPUT"
         return payload

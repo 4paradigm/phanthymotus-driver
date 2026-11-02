@@ -33,9 +33,12 @@ second and a bounded duration. Head and tail lights are independent cards.
 `loco_servo` is the streaming counterpart for visual navigation policies. It
 subscribes on Core domain 42 through a loopback-only bridge process, requires
 `S10_MOTION_ENABLED=1` at deployment plus `confirm=true` before switching out
-of dry-run, and stops on its watchdog. The supplied service fragment enables
-motion for supervised operation; set `S10_MOTION_ENABLED=0` to force read-only
-mode without rebuilding the image.
+of dry-run (also accepted atomically on `start`), and stops on its watchdog.
+The supplied service fragment defaults to read-only; explicitly set
+`S10_MOTION_ENABLED=1` for supervised physical operation. The speed limits
+match the real-robot-tested `loco` card (`vx=1.67 m/s`, `vy=0.4 m/s`,
+`wz=1.0 rad/s`). Per-step delta limits are additional software shaping, not
+claimed as measured hardware limits.
 The `navigation.route` action sends a sequence of up to 64 vendor `Item` targets
 in one native task request; each point has map coordinates, yaw, and point type,
 while the route shares gait, speed, direction, obstacle, and navigation mode.
@@ -137,9 +140,10 @@ Run from repository root:
 python3 -m pytest -q tests/test_s10_pro_control.py
 ```
 
-The latest local run passed 75 tests. Tests use synthetic messages, fake native
+The latest local run passed 77 tests. Tests use synthetic messages, fake native
 TCP clients, and fake Core-domain subscribers; they do not send robot commands.
 They cover interface auto-detection, AOS/NOS separation, control confirmation,
-valid/invalid continuous-control messages, watchdog stopping, and subscriber
-failure stopping. A new Bot build and robot-level validation are still required
+valid/invalid continuous-control messages, tested `loco` speed-limit parity,
+start-time confirmation, sanitized remote output, watchdog stopping, and
+subscriber failure stopping. A new Bot build and robot-level validation are still required
 before claiming this version accepted.
