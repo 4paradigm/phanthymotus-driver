@@ -115,6 +115,113 @@ def test_shared_raw_publisher_uses_sdk_scale_and_separate_source_times(raw_ros):
     assert meta['clock_mapping'] == 'device_to_host'
 
 
+def test_computational_depth_shares_capture_time_and_survives_vo_stop(raw_ros, monkeypatch):
+    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
+
+    raw_publisher, messages = publisher(raw_ros)
+    mapper = CaptureTimeMapper(raw_publisher.depth_scale)
+    raw_publisher.time_mapper = mapper
+    depth_publisher = ComputationalDepthPublisher(raw_publisher.node, 'robot', mapper, object())
+    aligned = frames()
+    monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 10_000_000_000)
+
+    depth_publisher.publish(aligned, aligned)
+    raw_publisher.publish(aligned, aligned)
+    compute = messages['/robot/camera/depth_metric'][0]
+    vo_depth = messages['/robot/odometry_input/depth'][0]
+    assert _stamp(compute) == _stamp(vo_depth) == 10_010_000_000
+    assert compute.header.frame_id == vo_depth.header.frame_id == 'robot_rgb_optical'
+    assert compute.encoding == '32FC1'
+    assert np.frombuffer(compute.data, dtype='<f4').tolist() == pytest.approx([1.] * 6)
+
+    raw_publisher.enabled = False
+    depth_publisher.last_publish = None
+    next_frames = frames(ms=1033)
+    monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 10_033_000_000)
+    depth_publisher.publish(next_frames, next_frames)
+    raw_publisher.publish(next_frames, next_frames)
+    assert len(messages['/robot/camera/depth_metric']) == 2
+    assert len(messages['/robot/odometry_input/depth']) == 1
+
+
+def test_computational_depth_does_not_replace_missing_source_time(raw_ros):
+    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
+
+    raw_publisher, messages = publisher(raw_ros)
+    depth_publisher = ComputationalDepthPublisher(raw_publisher.node, 'robot',
+                                                  CaptureTimeMapper(.002), object())
+    bad = frames()
+    bad.get_depth_frame().get_frame_timestamp_domain = lambda: 'unknown'
+    with pytest.raises(ValueError):
+        depth_publisher.publish(bad, bad)
+    assert not messages['/robot/camera/depth_metric']
+
+
+def test_metric_depth_keeps_global_capture_stamp_after_processing_delay(raw_ros, monkeypatch):
+    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
+    raw_publisher, messages = publisher(raw_ros)
+    metric = ComputationalDepthPublisher(raw_publisher.node, 'robot', CaptureTimeMapper(.002), object())
+    aligned = frames()
+    aligned.get_color_frame().get_frame_timestamp_domain = lambda: 'timestamp_domain.global_time'
+    aligned.get_depth_frame().get_frame_timestamp_domain = lambda: 'timestamp_domain.global_time'
+    monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 1_100_000_000)
+    metric.publish(aligned, aligned)
+    assert _stamp(messages['/robot/camera/depth_metric'][0]) == 1_010_000_000
+
+
+def test_shared_time_mapper_rejects_reset_and_changes_epoch(monkeypatch):
+    from noetix.bumi.visual_inputs import CaptureTimeMapper
+    mapper = CaptureTimeMapper(.002)
+    monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 10_000_000_000)
+    first = frames()
+    meta, _ = mapper.sample(first.get_color_frame(), first.get_depth_frame())
+    reset = frames(ms=1)
+    with pytest.raises(ValueError, match='reset'):
+        mapper.sample(reset.get_color_frame(), reset.get_depth_frame())
+    new_meta, _ = mapper.sample(reset.get_color_frame(), reset.get_depth_frame())
+    assert new_meta['epoch'] != meta['epoch']
+
+
+def test_shared_time_mapper_does_not_reuse_a_stale_cached_frame(monkeypatch):
+    from noetix.bumi.visual_inputs import CaptureTimeMapper
+    mapper = CaptureTimeMapper(.002)
+    wall = iter([10_000_000_000, 10_400_000_000])
+    monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: next(wall))
+    source = frames()
+    mapper.sample(source.get_color_frame(), source.get_depth_frame())
+    with pytest.raises(ValueError, match='transport delay'):
+        mapper.sample(source.get_color_frame(), source.get_depth_frame())
+
+
+def test_metric_depth_is_rate_limited_to_two_hz(raw_ros, monkeypatch):
+    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
+    raw_publisher, messages = publisher(raw_ros)
+    metric = ComputationalDepthPublisher(raw_publisher.node, 'robot', CaptureTimeMapper(.002), object())
+    ticks = iter([10., 10.1, 10.6, 10.6])
+    monkeypatch.setattr(visual_inputs.time, 'monotonic', lambda: next(ticks))
+    monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 10_000_000_000)
+    first, second, third = frames(), frames(ms=1010), frames(ms=1030)
+    metric.publish(first, first)
+    metric.publish(second, second)
+    metric.publish(third, third)
+    assert len(messages['/robot/camera/depth_metric']) == 2
+
+
+@pytest.mark.parametrize('model,coeffs', [
+    ('distortion.unknown', [0.] * 5),
+    ('distortion.none', [.1, 0., 0., 0., 0.]),
+    ('distortion.brown_conrady', [.1, 0., 0., 0., 0.]),
+])
+def test_computational_depth_rejects_unproven_pinhole_geometry(raw_ros, model, coeffs):
+    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
+    raw_publisher, messages = publisher(raw_ros)
+    metric = ComputationalDepthPublisher(raw_publisher.node, 'robot', CaptureTimeMapper(.002), object())
+    bad = frames(model=model, coeffs=coeffs)
+    with pytest.raises(ValueError, match='pinhole'):
+        metric.publish(bad, bad)
+    assert not messages['/robot/camera/depth_metric']
+
+
 def test_estimator_gets_one_validated_pair_with_original_stamps(raw_ros, monkeypatch):
     from noetix.bumi.visual_odometry import VisualOdometryNode
     from noetix.bumi.visual_odometry_contract import Health

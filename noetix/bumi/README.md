@@ -211,6 +211,16 @@ sudo systemctl start noetix-video-capture.service
 相机没起来时走兜底 —— 声明必须在不串流时也答得出来，这是消费者能在 `start` 时就
 降级（而不是一帧一帧地发现问题）的前提。
 
+Depth 卡片保留原来的 `/<namespace>/camera/depth` 压缩展示输出，另提供
+`/<namespace>/camera/depth_metric`（`sensor/depth-f32`，ROS Image 的
+`32FC1` 米制深度，最多 2 Hz），供需要几何计算的消费者使用。它来自同一
+相机采集进程和对齐后的 RGB 光学坐标系，header 携带源深度帧采集时间映射
+及 `frame_id`；卡片 `camera_info` 为两路分别声明相同像素网格的运行时内参。
+运行时内参缺失或畸变尚不能按针孔模型处理时，不应把兜底 FOV 当作已标定
+几何。新输出不依赖 VO 卡片的启停；同一帧的 VO 原始输入和计算深度共享
+时间映射。设备硬件时钟使用到达时刻估计一次偏移，该映射是近似值，不代表
+精确曝光同步；源时间无效时不以回调时间代替。旧压缩流的时间语义不变。
+
 镜头换了必须重来一遍：`phanthymotus/actucore/tools/measure_fov.py`。
 
 ## `vision_capture` card
