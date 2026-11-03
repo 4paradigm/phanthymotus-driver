@@ -19,6 +19,14 @@ struct StaleVelocityCommand : CommandLeaseExpired {
     using CommandLeaseExpired::CommandLeaseExpired;
 };
 
+// Another controller currently owns the chassis.  This is a temporary
+// admission failure, not a fault in our transport or an action we own: the
+// caller may retry a later fresh command, but must never cancel or preempt the
+// foreign action on our behalf.
+struct ChassisBusy : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // Independent of ROS and the SDK, so the actual lease/ownership implementation
 // can be tested with a fake chassis. The firmware heartbeat is the backup if a
 // vendor call blocks or this worker/Python dies; its resolution is seconds.
@@ -94,7 +102,7 @@ private:
         if (!motion_possible_) {
             bool busy = false;
             measured(last_set_.busy_ms, [&] { busy = sdk_.busy(); });
-            if (busy) throw std::runtime_error("another chassis action is active");
+            if (busy) throw ChassisBusy("another chassis action is active");
             // No motion until firmware dead-client protection acknowledges.
             measured(last_set_.start_heartbeat_ms, [&] { sdk_.start_heartbeat(); });
             heartbeat_ = true;

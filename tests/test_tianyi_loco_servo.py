@@ -45,10 +45,15 @@ class StaleVelocityCommand(CommandLeaseExpired):
         self.zero_velocity_confirmed = zero_velocity_confirmed is True
 
 
+class ChassisBusy(RuntimeError):
+    pass
+
+
 class FakeBackend:
     def __init__(self, config=None):
         self.messages = []
         self.fail = False
+        self.busy_writes = 0
         self.connect_fail = False
         self.connected = False
         self.deadlines = []
@@ -69,6 +74,9 @@ class FakeBackend:
 
     def write(self, values, deadline, *, replace_expired=False, preserve_action=False,
               cancel_deadline_ms=None):
+        if self.busy_writes:
+            self.busy_writes -= 1
+            raise ChassisBusy("another chassis action is active")
         if self.fail:
             raise RuntimeError("transport failed")
         self.deadlines.append(deadline)
@@ -165,6 +173,7 @@ def setup(monkeypatch):
         monkeypatch.setitem(sys.modules, name, mod)
     backend_mod = types.ModuleType("slamtec_velocity")
     backend_mod.SlamtecVelocityBackend = FakeBackend
+    backend_mod.ChassisBusy = ChassisBusy
     backend_mod.CommandLeaseExpired = CommandLeaseExpired
     backend_mod.StaleVelocityCommand = StaleVelocityCommand
     monkeypatch.setitem(sys.modules, "slamtec_velocity", backend_mod)
@@ -917,6 +926,30 @@ def test_publish_error_is_visible_and_pauses_instead_of_counting_success(setup):
     plugin._backend.fail = False
     plugin._tick()
     assert plugin._backend.messages[-1] == [0] * 6
+
+
+def test_foreign_chassis_action_holds_without_fault_and_fresh_frame_recovers(setup):
+    plugin = start(setup)
+    plugin._backend.busy_writes = 1
+    first = command(setup)
+    send(plugin, first)
+    info = plugin._info()
+    assert info["state"] == "running"
+    assert info["counts"]["chassis_busy"] == info["counts"]["holds"] == 1
+    assert info["counts"]["accepted"] == info["counts"]["publish_errors"] == 0
+    assert info["last"]["verdict"] == "HOLD"
+    assert "waiting for chassis" in info["last"]["reason"]
+    assert info["output"] == [0.0] * 6
+    assert not plugin._paused and not plugin._backend.messages
+    # The rejected frame is consumed, never replayed on a timer tick.
+    plugin._tick()
+    assert not plugin._backend.messages
+    setup.clock.advance()
+    send(plugin, command(setup, seq=2))
+    info = plugin._info()
+    assert info["state"] == "running" and info["counts"]["accepted"] == 1
+    assert info["last"]["verdict"] in ("APPLIED", "CLAMPED")
+    assert plugin._backend.messages[-1] == pytest.approx([0.03, 0, 0, 0, 0, 0.2])
 
 
 @pytest.mark.parametrize("atomic", [False, True])

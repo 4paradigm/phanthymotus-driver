@@ -13,7 +13,8 @@ import threading
 import time
 
 from common.control import ControlSink, parse_descriptor
-from slamtec_velocity import CommandLeaseExpired, SlamtecVelocityBackend, StaleVelocityCommand
+from slamtec_velocity import (ChassisBusy, CommandLeaseExpired,
+                              SlamtecVelocityBackend, StaleVelocityCommand)
 
 INPUT_TOPIC = "/actucore/navi/cmd"
 WATCHDOG_MS = 300
@@ -259,7 +260,8 @@ class LocoServoPlugin:
         self._last_timing = None
         self._counts = {key: 0 for key in
                         ("received", "accepted", "published", "dry_run_commands", "soft_holds",
-                         "rejected", "dropped", "holds", "publish_errors", "refreshed_after_stop")}
+                         "chassis_busy", "rejected", "dropped", "holds", "publish_errors",
+                         "refreshed_after_stop")}
         self._inbox = _LatestControlInbox()
 
     @staticmethod
@@ -682,6 +684,21 @@ class LocoServoPlugin:
                 # The ordinary tick retains the accepted cancellation deadline,
                 # independently of this rejected packet.
                 self._record("DROPPED", str(exc))
+            except ChassisBusy as exc:
+                # Native BUSY is acknowledged before this worker creates an
+                # action, starts a heartbeat or writes velocity. Do not fault,
+                # stop or preempt the foreign owner; consume only this frame.
+                # A later fresh navi frame retries through the same worker.
+                self._counts["chassis_busy"] += 1
+                self._counts["holds"] += 1
+                self._last_output = [0.0] * 6
+                self._last_output_at = None
+                self._last_valid_at = None
+                self._lease_expiry_ms = self._cancel_deadline_ms = 0
+                self._soft_held = False
+                self._last_preserved_action = False
+                self._sink.rebase(self._last_output)
+                self._record("HOLD", f"{exc}; waiting for chassis to become idle")
             except (ValueError, TypeError, KeyError, OverflowError) as exc:
                 self._counts["rejected"] += 1
                 self._record("REJECTED", str(exc))
@@ -820,7 +837,7 @@ class LocoServoPlugin:
                 self._backend.write(values, self._command_deadline_ms, **options)
             else:
                 self._backend.stop()
-        except CommandLeaseExpired:
+        except (ChassisBusy, CommandLeaseExpired):
             raise
         except Exception as exc:
             raise RuntimeError(f"Slamware SDK write failed: {exc}") from exc

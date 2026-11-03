@@ -39,6 +39,13 @@ for line in sys.stdin:
     if mode == "error" and verb in ("SET", "UPDATE", "ZERO", "FOLLOW"):
         emit("MOTUS_SDK "+seq+" ERROR "+b"localization quality too low".hex())
         sys.exit(1)
+    if mode in ("busy_once", "busy_missing", "busy_mismatch") and seq == "1" and verb in ("SET", "UPDATE", "FOLLOW"):
+        snapshot = (None if mode == "busy_missing" else
+                    '{{"session_active":true,"action_id":17}}' if mode == "busy_mismatch" else
+                    '{{"session_active":false,"action_id":0}}')
+        suffix = " "+snapshot if snapshot is not None else ""
+        print("MOTUS_SDK "+seq+" BUSY "+b"another chassis action is active".hex()+suffix,flush=True)
+        continue
     if mode == "expired" and verb in ("SET", "UPDATE", "ZERO") and seq == "1":
         emit("MOTUS_SDK "+seq+" EXPIRED "+b"command lease expired at worker: remaining_ms=-12".hex())
         continue
@@ -119,6 +126,33 @@ def test_expired_intermediate_zero_does_not_fault_or_renew_session(backend):
         worker.write([0.0] * 6, int(time.time() * 1000) + 200, preserve_action=True)
     assert worker.info()["state"] == "ready" and not worker._armed
     assert worker.info()["connected"] and worker.info()["expired_commands"] == 1
+
+
+def test_busy_ack_keeps_backend_connected_and_next_fresh_write_recovers(backend):
+    worker = backend("busy_once")
+    worker.connect()
+    pid = worker.info()["process_id"]
+    with pytest.raises(backend_module.ChassisBusy, match="another chassis action"):
+        write(worker)
+    info = worker.info()
+    assert info["connected"] and info["process_id"] == pid
+    assert info["state"] == "waiting_for_chassis"
+    assert info["action_id"] == 0 and not worker._armed
+    assert info["busy_responses"] == 1
+    assert info["last_busy_error"] == "another chassis action is active"
+    write(worker)
+    assert worker.info()["state"] == "active"
+    assert worker.info()["process_id"] == pid
+
+
+@pytest.mark.parametrize("mode", ["busy_missing", "busy_mismatch"])
+def test_busy_ack_without_consistent_idle_proof_faults_backend(backend, mode):
+    worker = backend(mode)
+    worker.connect()
+    with pytest.raises(RuntimeError, match="did not prove an idle velocity session"):
+        write(worker)
+    info = worker.info()
+    assert not info["connected"] and info["state"] == "error"
 
 
 def test_advertised_staged_stop_sends_follow_and_soft_stop_has_no_deadline(backend):

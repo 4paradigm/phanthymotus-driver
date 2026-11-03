@@ -480,6 +480,17 @@ card implementations, `nav_client.py` and `loco_state` are unchanged. Controller
 bypassing the bundle need separate coordination; the SDK firmware heartbeat is
 global, with only one active token.
 
+If the first velocity command finds a foreign SDK chassis action, the native
+worker reports a recoverable `BUSY` hold. It does not start a heartbeat, create
+an action, write velocity, cancel or preempt the foreign owner, and the card
+remains running. Each later **fresh** navi frame may retry; once the chassis is
+idle, that frame creates the velocity action without requiring a card restart.
+No old command is replayed after the owner releases the chassis. A foreign
+action held for several seconds may still make navi's independent blocked-motion
+detector end its task; explicit `nav.cancel`, `home.cancel` or
+`chassis_raw.brake` remains the immediate handover path. Ownership loss after
+loco_servo has created its own action remains a fatal fault requiring restart.
+
 SDK ownership failures distinguish an empty held handle, an empty current action,
 and different action IDs. Error-path diagnostics include available handle IDs,
 statuses and reasons. These diagnostics do not relax ownership checks or add

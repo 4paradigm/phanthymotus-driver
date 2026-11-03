@@ -20,13 +20,17 @@ FAKE_ADAPTER = r'''
 class SlamwareAdapter {
     std::string mode_;
     unsigned long id_ = 0, next_ = 0;
+    unsigned long busy_checks_ = 0;
     void delay(const char* phase) {
         if (mode_ == phase)
             std::this_thread::sleep_for(std::chrono::milliseconds(120));
     }
 public:
     SlamwareAdapter(const std::string& mode, int, int) : mode_(mode) {}
-    bool busy() { delay("slow_busy"); return false; }
+    bool busy() {
+        delay("slow_busy");
+        return mode_ == "busy_once" && busy_checks_++ == 0;
+    }
     void start_heartbeat() { delay("slow_heartbeat"); }
     void refresh_heartbeat() { delay("slow_refresh"); }
     void stop_heartbeat() {}
@@ -173,6 +177,27 @@ def test_expired_idle_request_does_not_create_an_action(worker):
     assert request(process, 1, velocity(-10))[2] == "EXPIRED"
     assert request(process, 2, "STOP")[2:] == ["OK", "0", "ready"]
     assert request(process, 3, velocity(250))[2:] == ["OK", "1", "active"]
+
+
+def test_foreign_action_busy_keeps_worker_alive_and_next_fresh_command_recovers(worker):
+    process = worker("busy_once")
+    pid = process.pid
+    busy = request(process, 1, velocity(250))
+    assert busy[2] == "BUSY"
+    assert bytes.fromhex(busy[3]).decode() == "another chassis action is active"
+    assert busy.stats["session_active"] is False
+    assert busy.stats["action_id"] == 0
+    assert busy.stats["action_starts"] == 0
+    assert busy.stats["stop_attempts"] == busy.stats["heartbeat_refreshes"] == 0
+    assert busy.stats["last_set"]["busy_ms"] >= 0
+    assert busy.stats["last_set"]["start_heartbeat_ms"] is None
+    assert busy.stats["last_set"]["begin_ms"] is None
+    assert busy.stats["last_set"]["set_velocity_ms"] is None
+    assert process.poll() is None and process.pid == pid
+    recovered = request(process, 2, velocity(250))
+    assert recovered[2:] == ["OK", "1", "active"]
+    assert recovered.stats["action_starts"] == 1
+    assert request(process, 3, "STOP")[2:] == ["OK", "0", "ready"]
 
 
 def test_fresh_update_after_expiry_restarts_without_a_separate_stop_request(worker):

@@ -31,6 +31,10 @@ class StaleVelocityCommand(CommandLeaseExpired):
         self.zero_velocity_confirmed = zero_velocity_confirmed is True
 
 
+class ChassisBusy(RuntimeError):
+    """A foreign SDK action is active; this worker owns nothing to stop."""
+
+
 class SlamtecVelocityBackend:
     def __init__(self, config):
         self._config = dict(config)
@@ -44,6 +48,8 @@ class SlamtecVelocityBackend:
         self._error = ""
         self._expired_commands = 0
         self._last_expired_error = ""
+        self._busy_responses = 0
+        self._last_busy_error = ""
         self._last_write = None
         self._action_id = 0
         self._state = "disconnected"
@@ -105,6 +111,19 @@ class SlamtecVelocityBackend:
                     fields = reply.split(maxsplit=4)
                     self._record_native_ack(sequence, fields[2], fields[4] if len(fields) > 4 else None)
                     message = bytes.fromhex(fields[3]).decode("utf-8", "replace")
+                    if fields[2] == "BUSY":
+                        stats = self._native_stats or {}
+                        active, action_id = stats.get("session_active"), stats.get("action_id")
+                        if (active is not False or not isinstance(action_id, int) or
+                                isinstance(action_id, bool) or action_id != 0):
+                            raise RuntimeError(
+                                "unsafe BUSY acknowledgement did not prove an idle velocity session")
+                        self._armed = False
+                        self._action_id = 0
+                        self._state = "waiting_for_chassis"
+                        self._busy_responses += 1
+                        self._last_busy_error = message
+                        raise ChassisBusy(message)
                     if fields[2] == "STALE":
                         stats = self._native_stats or {}
                         active, action_id = stats.get("session_active"), stats.get("action_id")
@@ -208,6 +227,13 @@ class SlamtecVelocityBackend:
             # (or use its explicit snapshot when SDK work consumed the lease).
             self._expired_commands += 1
             self._last_expired_error = str(exc)
+            raise
+        except ChassisBusy:
+            # Native BUSY explicitly confirms that no velocity action or
+            # heartbeat was created. Keep this worker connected; only a later
+            # fresh command may retry.
+            if not command.startswith(("FOLLOW ", "SET ", "UPDATE ")):
+                self._fail("unexpected BUSY reply to non-motion request")
             raise
         except CommandLeaseExpired as exc:
             if not command.startswith(("SET ", "UPDATE ", "ZERO ")):
@@ -329,6 +355,8 @@ class SlamtecVelocityBackend:
                     "action_id": self._action_id, "error": self._error,
                     "expired_commands": self._expired_commands,
                     "last_expired_error": self._last_expired_error,
+                    "busy_responses": self._busy_responses,
+                    "last_busy_error": self._last_busy_error,
                     "last_write": dict(self._last_write) if self._last_write is not None else None,
                     "capabilities": {"atomic_expiry_update": self._atomic_expiry_update,
                                      "zero_velocity_update": self._zero_velocity_update,

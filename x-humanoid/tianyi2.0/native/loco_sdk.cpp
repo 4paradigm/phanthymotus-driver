@@ -84,6 +84,16 @@ int main(int argc, char** argv) {
                                      ",\"action_id\":" + std::to_string(sdk.action_id()) + "}";
                             reply(sequence, false, 0, e.what(), "STALE", stats);
                             continue;
+                        } catch (const ChassisBusy& e) {
+                            // We own no action or heartbeat yet.  Keep the
+                            // worker connected and let a later fresh command
+                            // retry after the foreign chassis action ends.
+                            auto stats = session.stats_json();
+                            stats.pop_back();
+                            stats += ",\"session_active\":" + std::string(session.active() ? "true" : "false") +
+                                     ",\"action_id\":" + std::to_string(sdk.action_id()) + "}";
+                            reply(sequence, false, 0, e.what(), "BUSY", stats);
+                            continue;
                         }
                     } else if (verb == "SOFT_STOP") {
                         if (in >> extra) throw std::runtime_error("malformed SOFT_STOP");
@@ -120,6 +130,13 @@ int main(int argc, char** argv) {
                             // a failed stop escapes to the fatal path below.
                             session.stop(Session::StopReason::LeaseExpired);
                             reply(sequence, false, 0, e.what(), "EXPIRED", session.stats_json());
+                            continue;
+                        } catch (const ChassisBusy& e) {
+                            auto stats = session.stats_json();
+                            stats.pop_back();
+                            stats += ",\"session_active\":" + std::string(session.active() ? "true" : "false") +
+                                     ",\"action_id\":" + std::to_string(sdk.action_id()) + "}";
+                            reply(sequence, false, 0, e.what(), "BUSY", stats);
                             continue;
                         }
                     } else if (verb == "STOP") {
