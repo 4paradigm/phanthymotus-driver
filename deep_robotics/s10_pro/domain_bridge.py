@@ -228,6 +228,10 @@ def _run_audio_subscriber(messages, profile, topic, domain):
     node.create_subscription(AudioChunk, topic, receive, qos)
     try:
         rclpy.spin(node)
+    except Exception as exc:
+        from rclpy.executors import ExternalShutdownException
+        if not isinstance(exc, ExternalShutdownException):
+            raise
     finally:
         node.destroy_node()
         if rclpy.ok():

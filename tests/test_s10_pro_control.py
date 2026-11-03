@@ -854,18 +854,27 @@ def test_audio_auto_selects_local_aos_or_ssh_transport(monkeypatch):
 
     monkeypatch.delenv("S10_AUDIO_MODE", raising=False)
     monkeypatch.setattr(audio, "_is_local_address", lambda _address: True)
-    assert audio._audio_transport({"audio": {"ssh_host": "10.21.33.103"}})[0] == "local"
+    local = audio._audio_transport({"audio": {"ssh_host": "10.21.33.103"}})
+    assert local[0] == "local"
+    assert local[4:] == ("default", "default")
 
     monkeypatch.setattr(audio, "_is_local_address", lambda _address: False)
     monkeypatch.setenv("S10_AUDIO_SSH_PASSWORD", "'")
+    monkeypatch.setenv("S10_AUDIO_CAPTURE_DEVICE", "default")
+    monkeypatch.setenv("S10_AUDIO_PLAYBACK_DEVICE", "default")
     monkeypatch.setattr(audio.shutil, "which", lambda _program: "/usr/bin/sshpass")
-    mode, host, user, password = audio._audio_transport({"audio": {}})
+    mode, host, user, password, capture_device, playback_device = audio._audio_transport({"audio": {}})
     assert (mode, host, user, password) == ("ssh", "10.21.33.103", "user", "'")
+    assert (capture_device, playback_device) == (
+        "plughw:CARD=rockchipes8388,DEV=0", "plughw:CARD=rockchipes8388,DEV=0")
     command, env = audio._audio_launch("arecord", "hw:0,0", mode, host, user, password)
     assert command[:3] == ["sshpass", "-e", "ssh"]
     assert command[-2] == "user@10.21.33.103"
     assert "arecord" in command[-1]
     assert env["SSHPASS"] == "'"
+    playback, _ = audio._audio_launch("aplay", "plughw:CARD=rockchipes8388,DEV=0",
+                                      mode, host, user, password)
+    assert "plughw:CARD=rockchipes8388,DEV=0" in playback[-1]
 
 
 def test_core_domain_bridge_is_spawned_and_uses_bounded_latest_value_lanes():

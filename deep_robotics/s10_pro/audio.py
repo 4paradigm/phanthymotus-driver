@@ -77,7 +77,16 @@ def _audio_transport(config):
     if mode == "local" and not local:
         raise ValueError("local audio mode requested but the configured AOS address is not local")
     selected = "local" if mode == "local" or (mode == "auto" and local) else "ssh"
-    return selected, str(host), str(user), str(password)
+    capture_device = os.environ.get("S10_AUDIO_CAPTURE_DEVICE") or audio.get("capture_device")
+    playback_device = os.environ.get("S10_AUDIO_PLAYBACK_DEVICE") or audio.get("playback_device")
+    if selected == "ssh":
+        remote_default = "plughw:CARD=rockchipes8388,DEV=0"
+        capture_device = remote_default if capture_device in (None, "", "default") else capture_device
+        playback_device = remote_default if playback_device in (None, "", "default") else playback_device
+    else:
+        capture_device = capture_device or "default"
+        playback_device = playback_device or "default"
+    return selected, str(host), str(user), str(password), str(capture_device), str(playback_device)
 
 
 def _audio_tool(name, description, actions, *, topic_out=None, topic_in=None):
@@ -96,9 +105,8 @@ class S10MicPlugin:
     def __init__(self, config, namespace, nodes):
         self.nodes = nodes
         self.topic = f"/{namespace}/mic/audio" if namespace else "/mic/audio"
-        self.device = os.environ.get("S10_AUDIO_CAPTURE_DEVICE") or str(
-            config.get("audio", {}).get("capture_device", "default"))
-        self.mode, self.host, self.user, self.password = _audio_transport(config)
+        (self.mode, self.host, self.user, self.password,
+         self.device, _) = _audio_transport(config)
         self._publisher = None
         self._process = None
         self._reader = None
@@ -121,6 +129,9 @@ class S10MicPlugin:
         result = self._start_capture()
         if result.get("state") == "error":
             print(f"[s10-mic] capture not started: {result.get('error')}", flush=True)
+        else:
+            print(f"[s10-mic] capture running mode={self.mode} host={self.host} "
+                  f"device={self.device} topic={self.topic}", flush=True)
 
     def stop(self):
         self._stop_capture()
@@ -233,9 +244,8 @@ class S10SpeakerPlugin:
     PREFIX = "speaker"
 
     def __init__(self, config):
-        self.device = os.environ.get("S10_AUDIO_PLAYBACK_DEVICE") or str(
-            config.get("audio", {}).get("playback_device", "default"))
-        self.mode, self.host, self.user, self.password = _audio_transport(config)
+        (self.mode, self.host, self.user, self.password,
+         _, self.device) = _audio_transport(config)
         self.domain = int(config.get("ros", {}).get("core_domain_id") or 42)
         self._subscriber = None
         self._process = None

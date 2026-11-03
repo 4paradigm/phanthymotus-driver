@@ -26,8 +26,10 @@ bound on this host (onboard deployment), otherwise it runs `arecord`/`aplay` on
 AOS over SSH (external Jetson deployment). The default AOS endpoint is
 `10.21.33.103`, with `user` and the configured S10 SSH password; override with
 `S10_AUDIO_SSH_HOST`, `S10_AUDIO_SSH_USER`, and `S10_AUDIO_SSH_PASSWORD`.
-`S10_AUDIO_CAPTURE_DEVICE` and `S10_AUDIO_PLAYBACK_DEVICE` select the respective
-ALSA devices on AOS. Set `S10_AUDIO_MODE=local` or `ssh` to force a mode.
+In SSH mode both devices default to `plughw:CARD=rockchipes8388,DEV=0`, the
+verified AOS ES8388 card; in local mode they default to `default`.
+`S10_AUDIO_CAPTURE_DEVICE` and `S10_AUDIO_PLAYBACK_DEVICE` override the
+respective ALSA devices. Set `S10_AUDIO_MODE=local` or `ssh` to force a mode.
 Deployment maps `/dev/snd` for local operation; external operation transports
 PCM over SSH and does not use the Jetson's unrelated local sound card.
 
