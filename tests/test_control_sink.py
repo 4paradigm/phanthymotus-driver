@@ -290,7 +290,7 @@ def test_reconfigure_applies_new_limits_and_freshness_without_resetting_admissio
     sink = make_sink(clock, apply, _twist_descriptor(), on_watchdog=lambda: holds.append(True))
     sink.submit(message(clock, [.1, .1], mode="twist", seq=7, priority=100))
     clock.advance(60)
-    updated = _twist_descriptor(zero_immediate=True)
+    updated = _twist_descriptor()
     updated["limits"]["max_delta_per_step"] = [.02, .02]
     updated["rate"].update(watchdog_ms=100, max_obs_age_ms=50)
     sink.reconfigure(parse_descriptor(updated))
@@ -320,6 +320,18 @@ def test_reconfigure_rejects_structure_changes_atomically(field, value):
     original = sink.descriptor
     with pytest.raises(ValueError, match=field):
         sink.reconfigure(replace(original, **{field: value}))
+    assert sink.descriptor is original
+
+
+@pytest.mark.parametrize("before,after", [(False, True), (True, False)])
+def test_reconfigure_rejects_zero_immediate_semantic_changes_atomically(before, after):
+    """A live session cannot change how an exact zero bypasses slew limits."""
+    from dataclasses import replace
+    clock, apply = FakeClock(), Recorder()
+    sink = make_sink(clock, apply, _twist_descriptor(zero_immediate=before))
+    original = sink.descriptor
+    with pytest.raises(ValueError, match="zero_immediate"):
+        sink.reconfigure(replace(original, zero_immediate=after))
     assert sink.descriptor is original
 
 

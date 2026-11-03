@@ -376,7 +376,10 @@ class ControlSink:
         The caller serialises this with submit/tick, as with the other APIs.
         """
         candidate = descriptor if isinstance(descriptor, Descriptor) else parse_descriptor(descriptor)
-        for name in ("mode", "dof", "joint_names", "units", "groups", "frame", "end_effector", "force_torque"):
+        for name in (
+            "mode", "dof", "joint_names", "units", "groups", "frame",
+            "end_effector", "force_torque", "zero_immediate",
+        ):
             if getattr(candidate, name) != getattr(self.descriptor, name):
                 raise ValueError(f"reconfigure cannot change descriptor.{name}")
         self.descriptor = candidate

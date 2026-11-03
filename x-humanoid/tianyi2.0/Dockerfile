@@ -39,6 +39,11 @@ ENV PYTHONPATH=/tianyi_ws/install/lyre_msgs/local/lib/python3.10/dist-packages:/
 ENV AMENT_PREFIX_PATH=/tianyi_ws/install/bodyctrl_msgs:/tianyi_ws/install/lyre_msgs:${AMENT_PREFIX_PATH}
 ENV LD_LIBRARY_PATH=/tianyi_ws/install/bodyctrl_msgs/lib:/tianyi_ws/install/lyre_msgs/lib:${LD_LIBRARY_PATH}
 
+# loco_servo needs the official Slamware C++ headers/static libraries because
+# Tianyi has no ROS /cmd_vel subscriber. build_sdk.sh pins both SDK packages by
+# SHA-256, installs only the stripped private worker plus required notices, and
+# deletes the downloaded SDK/source/build tree. This deliberately grows only
+# the Tianyi image; other driver targets do not inherit the vendor SDK payload.
 COPY native/ /tmp/tianyi-loco-sdk-src/
 RUN sh /tmp/tianyi-loco-sdk-src/build_sdk.sh "${TARGETARCH:-$(uname -m)}" && \
     rm -rf /tmp/tianyi-loco-sdk-src

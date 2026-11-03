@@ -194,6 +194,13 @@ and SHA256 for ARM64 and AMD64; it compiles only this private C++ worker, not
 the vendor ROS server. Third-party license notices are installed in
 `/usr/share/doc/tianyi-loco-sdk/`.
 
+This SDK-backed path intentionally increases only the Tianyi image by the
+installed native worker, its linked vendor dependencies and required notices.
+The SDK archive, headers, sources and build tree are removed after compilation;
+the size tradeoff is required because Tianyi exposes no usable ROS velocity
+subscriber, while discrete REST actions cannot provide continuous combined
+linear/angular servo control.
+
 Bundle startup is inert. MCP/canvas `start` subscribes to the default input,
 or an explicitly provided `input_topic` / first `input_topics` entry. `start`
 also accepts the settings advertised by `config`, including `dry_run: false`;
