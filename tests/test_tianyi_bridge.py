@@ -125,6 +125,27 @@ def test_subscriptions_are_bridged_unconditionally():
         assert bp.should_bridge_subscription(topic)
 
 
+def test_outbound_publish_reports_when_bridge_is_unavailable(sock_dir, monkeypatch):
+    monkeypatch.setattr(bp.BridgedPublisher, "SOCKET_DIR", str(sock_dir))
+    publisher = bp.BridgedPublisher(
+        node=types.SimpleNamespace(), msg_type=FakeMsg, topic="/depth",
+        qos=QOS.QoSProfile())
+    assert publisher.publish(b"frame") is False
+
+
+def test_outbound_publish_reports_an_accepted_frame():
+    writes = []
+    publisher = object.__new__(bp.BridgedPublisher)
+    publisher._connected = True
+    publisher._socket = types.SimpleNamespace(sendall=writes.append)
+    publisher._send_lock = threading.Lock()
+    publisher._connect_lock = threading.Lock()
+    publisher._msg_count = 0
+    publisher.topic = "/depth"
+    assert publisher.publish(b"frame") is True
+    assert b"frame" in writes
+
+
 # ── the protocol ─────────────────────────────────────────────────────────────
 
 @pytest.fixture

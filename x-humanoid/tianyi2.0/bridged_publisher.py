@@ -114,8 +114,14 @@ class BridgedPublisher:
                 self._connected = False
                 return False
 
-    def publish(self, msg: Any) -> None:
-        """Publish message (same interface as rclpy.Publisher)."""
+    def publish(self, msg: Any) -> bool:
+        """Publish one message and report whether the bridge accepted it.
+
+        Existing callers may ignore the return value exactly as they do for a
+        normal rclpy publisher. High-rate sensor workers use ``False`` to keep
+        their health counters honest when this compatibility layer drops a
+        frame because the bridge is unavailable.
+        """
         # Try to connect if not connected
         if not self._connected:
             if not self._try_connect():
@@ -124,7 +130,7 @@ class BridgedPublisher:
                     print(f"[bridged_pub] WARNING: bridge not available for {self.topic}, "
                           f"messages will be dropped", flush=True)
                 self._msg_count += 1
-                return
+                return False
 
         try:
             # Serialize message
@@ -141,6 +147,7 @@ class BridgedPublisher:
             # Debug: log first few IMU publishes
             if "imu" in self.topic.lower() and self._msg_count <= 5:
                 print(f"[bridged_pub] {self.topic}: published msg #{self._msg_count}, size={len(serialized)} bytes", flush=True)
+            return True
 
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             # Connection lost, mark as disconnected for retry
@@ -149,6 +156,7 @@ class BridgedPublisher:
                 self._socket.close()
                 self._socket = None
             print(f"[bridged_pub] connection lost for {self.topic}, will retry", flush=True)
+            return False
 
     def destroy(self) -> None:
         """Cleanup (same interface as rclpy.Publisher)."""

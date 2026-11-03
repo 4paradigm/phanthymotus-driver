@@ -22,9 +22,12 @@ The default rate is 15Hz (previously 8Hz), configurable with
 `plugins.camera_depth.hz` up to 30Hz. The source camera and available CPU/network
 still determine the actual rate. Both source and output retain only the newest
 frame; a frame waiting locally for 500ms is discarded. A single ROS timer
-sets the rate, avoiding the former second rate gate that included compression
-time and skipped scheduled frames. `info` reports target/average Hz, frame
-counts and the time since the last source/output frame.
+has been replaced by one latest-only worker: the ROS callback only swaps the
+pending frame, while crop, zlib compression, and the synchronous bridge write
+run outside both executors. The worker never replays old frames or catches up
+in a burst. `info` reports target/average Hz, coalesced/stale/error counts,
+worker health, payload size, and encode/bridge/total processing and interval
+timings so a remaining device or socket bottleneck is visible on the robot.
 
 On the canvas, connect head RGB to `vop`, `vop` to `navi`, `camera_depth` to
 `navi`'s depth input, `loco_state` to its odometry input, and `navi` to
