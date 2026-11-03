@@ -1572,6 +1572,37 @@ def test_loco_servo_start_can_atomically_arm_with_confirmation(monkeypatch):
         plugin.stop()
 
 
+def test_loco_servo_rechecks_motion_permission_after_environment_revocation(monkeypatch):
+    monkeypatch.syspath_prepend(str(DRIVER))
+    monkeypatch.setenv("S10_MOTION_ENABLED", "1")
+    from loco_servo import S10LocoServoPlugin
+
+    plugin = S10LocoServoPlugin(FakeNative({}), ros2=object())
+    assert plugin.dispatch("config", {"dry_run": False, "confirm": True}) == {
+        "ok": True, "dry_run": False,
+    }
+
+    monkeypatch.setenv("S10_MOTION_ENABLED", "0")
+    denied_config = plugin.dispatch("config", {"dry_run": False, "confirm": True})
+    assert denied_config["code"] == "MOTION_DISABLED"
+    denied_start = plugin.dispatch("start", {
+        "input_topic": "/policy/velocity", "dry_run": False, "confirm": True,
+    })
+    assert denied_start["state"] == "error"
+    assert "S10_MOTION_ENABLED" in denied_start["message"]
+    assert plugin.dispatch("info", {})["motion_enabled"] is False
+
+
+def test_loco_servo_rejects_invalid_motion_permission(monkeypatch):
+    monkeypatch.syspath_prepend(str(DRIVER))
+    monkeypatch.setenv("S10_MOTION_ENABLED", "true")
+    from loco_servo import S10LocoServoPlugin
+
+    plugin = S10LocoServoPlugin(FakeNative({}), ros2=object())
+    result = plugin.dispatch("config", {"dry_run": False, "confirm": True})
+    assert result["code"] == "INVALID_MOTION_PERMISSION"
+
+
 def test_loco_servo_holds_if_core_subscriber_dies(monkeypatch):
     monkeypatch.syspath_prepend(str(DRIVER))
     monkeypatch.setenv("S10_MOTION_ENABLED", "1")

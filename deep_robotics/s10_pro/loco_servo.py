@@ -32,9 +32,7 @@ class S10LocoServoPlugin:
 
     def __init__(self, native, ros2=None, motion=None):
         self.native, self.ros2, self.motion = native, ros2, motion
-        # Match the repository-wide motion-permission contract: images are
-        # read-only unless the deployment explicitly arms physical motion.
-        self._motion_enabled = os.environ.get("S10_MOTION_ENABLED", "0") == "1"
+        self._motion_enabled = False
         self._descriptor_raw = build_descriptor()
         self._descriptor = parse_descriptor(self._descriptor_raw)
         self._lock = threading.RLock()
@@ -72,14 +70,19 @@ class S10LocoServoPlugin:
     def stop(self):
         self.dispatch("stop", {})
 
+    def _refresh_motion_permission(self):
+        value = os.environ.get("S10_MOTION_ENABLED", "0")
+        self._motion_enabled = value == "1"
+        return self._motion_enabled, value in {"0", "1"}
+
     def dispatch(self, action, args):
         if action == "start": return self._start(args)
         if action == "stop": return self._stop()
         if action == "pause": return self._halt(True)
         if action == "resume": return self._halt(False)
         if action == "info": return {"state": "paused" if self._paused else "running" if self._running else "idle",
+                                      "motion_enabled": self._refresh_motion_permission()[0],
                                       "input": self._topic, "dry_run": self._dry_run,
-                                      "motion_enabled": self._motion_enabled,
                                       "applied": self._applied, "refused": self._refused,
                                       "control_interface": self._descriptor_raw}
         if action == "config":
@@ -87,7 +90,14 @@ class S10LocoServoPlugin:
                 return {"ok": False, "code": "INVALID_ARGUMENT", "message": "dry_run must be a boolean"}
             if args.get("dry_run") is False and self._dry_run and args.get("confirm") is not True:
                 return {"ok": False, "code": "CONFIRM_REQUIRED", "message": "启用实时底盘控制需要 confirm=true"}
-            if args.get("dry_run") is False and not self._motion_enabled:
+            if args.get("dry_run") is False:
+                motion_enabled, valid_permission = self._refresh_motion_permission()
+                if not valid_permission:
+                    return {"ok": False, "code": "INVALID_MOTION_PERMISSION",
+                            "message": "S10_MOTION_ENABLED must be 0 or 1"}
+            else:
+                motion_enabled = True
+            if args.get("dry_run") is False and not motion_enabled:
                 return {"ok": False, "code": "MOTION_DISABLED",
                         "message": "S10_MOTION_ENABLED is not set; this driver is read-only"}
             if args.get("dry_run") is True and not self._dry_run and self._running:
@@ -104,7 +114,11 @@ class S10LocoServoPlugin:
         if args.get("dry_run") is False and self._dry_run and args.get("confirm") is not True:
             return {"state": "error", "code": "CONFIRM_REQUIRED", "message": "启用实时底盘控制需要 confirm=true"}
         requested_dry_run = args.get("dry_run", self._dry_run)
-        if not requested_dry_run and not self._motion_enabled:
+        motion_enabled, valid_permission = self._refresh_motion_permission()
+        if not requested_dry_run and not valid_permission:
+            return {"state": "error", "code": "INVALID_MOTION_PERMISSION",
+                    "message": "S10_MOTION_ENABLED must be 0 or 1"}
+        if not requested_dry_run and not motion_enabled:
             return {"state": "error", "message": "S10_MOTION_ENABLED is not set; this driver is read-only"}
         if self.ros2 is None:
             return {"state": "error", "message": "没有 ROS runtime，无法接入 control/velocity"}

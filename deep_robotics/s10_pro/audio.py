@@ -324,10 +324,10 @@ class S10SpeakerPlugin:
             if subscriber is None or process is None:
                 return
             if process.poll() is not None:
-                self._last_error = f"aplay exited with {process.returncode}"
+                self._fail_playback(f"aplay exited with {process.returncode}")
                 return
             if not subscriber.is_alive():
-                self._last_error = "Core-domain audio subscriber exited"
+                self._fail_playback("Core-domain audio subscriber exited")
                 return
             item = subscriber.get(timeout=0.1)
             if item is None:
@@ -342,8 +342,12 @@ class S10SpeakerPlugin:
                 self._frames += 1
             except (BrokenPipeError, OSError) as exc:
                 if not self._stop.is_set():
-                    self._last_error = str(exc)
+                    self._fail_playback(str(exc))
                 return
+
+    def _fail_playback(self, error):
+        self._last_error = error
+        self._stop_playback()
 
     def _stop_playback(self):
         with self._lock:

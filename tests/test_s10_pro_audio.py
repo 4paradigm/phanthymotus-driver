@@ -110,3 +110,56 @@ def test_speaker_discards_invalid_and_tts_eof_frames(monkeypatch):
     assert plugin._process.stdin.writes == [b"\x00\x01" * 32, b"\x02\x03" * 32]
     assert plugin._frames == 2
     assert plugin._dropped == 3
+
+
+def test_speaker_cleans_up_player_when_audio_subscriber_dies(monkeypatch):
+    audio = _load_audio(monkeypatch)
+    plugin = audio.S10SpeakerPlugin({"audio": {}})
+    plugin._stop = threading.Event()
+
+    class Stream:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    class Process:
+        returncode = None
+
+        def __init__(self):
+            self.stdin = Stream()
+            self.stderr = Stream()
+            self.terminated = False
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -15
+
+        def wait(self, timeout):
+            return self.returncode
+
+    class Subscriber:
+        stopped = False
+
+        def is_alive(self):
+            return False
+
+        def stop(self):
+            self.stopped = True
+
+    process, subscriber = Process(), Subscriber()
+    plugin._process, plugin._subscriber = process, subscriber
+    plugin._topic = "/remote_control/mic"
+
+    plugin._playback_loop()
+
+    status = plugin.dispatch("info", {})
+    assert status["state"] == "idle"
+    assert status["input_topic"] is None
+    assert status["last_error"] == "Core-domain audio subscriber exited"
+    assert process.terminated
+    assert process.stdin.closed and process.stderr.closed
+    assert subscriber.stopped
