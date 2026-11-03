@@ -531,6 +531,9 @@ def test_camera_lane_recognizes_numbered_camera_topic_independent_of_discovery_o
 
 def test_unclassified_depth_image_does_not_claim_directional_camera_lane(monkeypatch):
     device = _load_device(monkeypatch)
+    config = yaml.safe_load((DRIVER / "config.yaml").read_text())
+    assert all("/DEPTH_IMAGE" not in topics
+               for topics in config["camera_topics"].values())
     assert device.S10Nodes._camera_key_for_topic("/DEPTH_IMAGE") is None
     nodes = device.S10Nodes.__new__(device.S10Nodes)
     nodes._configured_camera_lanes = {"/usb_camera_1/image_raw_2": "camera_right"}
