@@ -59,6 +59,8 @@ class FakeBackend:
         self.stop_calls = 0
         self.cancel_deadlines = []
         self.soft_stop_calls = []
+        self.action_id = 0
+        self._next_action_id = 1
 
     def connect(self):
         if self.connect_fail:
@@ -74,6 +76,9 @@ class FakeBackend:
         self.preserved_actions.append(preserve_action)
         self.cancel_deadlines.append(cancel_deadline_ms)
         self.messages.append(list(values))
+        if any(values) and not self.action_id:
+            self.action_id = self._next_action_id
+            self._next_action_id += 1
 
     def soft_stop(self, cancel_deadline_ms=None):
         if self.fail:
@@ -89,12 +94,14 @@ class FakeBackend:
             raise RuntimeError("stop failed")
         if self.connected:
             self.messages.append([0] * 6)
+        self.action_id = 0
 
     def close(self):
         self.connected = False
 
     def info(self):
-        return {"type": "slamware_sdk", "connected": self.connected}
+        return {"type": "slamware_sdk", "connected": self.connected,
+                "action_id": self.action_id}
 
 
 class Node:
@@ -432,12 +439,16 @@ def test_worker_zero_command_bypasses_motion_pacing(setup, monkeypatch):
     plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
     assert applied.wait(1)
     plugin.dispatch("info", {})
+    action_id = backend.action_id
+    applied.clear()
     setup.clock.advance(0.01)
     plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup, [0] * 6, seq=2))))
-    assert stopped.wait(1)
+    assert applied.wait(1)
+    assert not stopped.is_set()
     info = plugin.dispatch("info", {})
     assert info["counts"]["accepted"] == 2
     assert info["output"] == [0] * 6
+    assert backend.action_id == action_id
 
 
 def test_stop_joins_outside_state_lock_and_blocks_restart_until_old_worker_exits(setup, monkeypatch):
@@ -696,7 +707,7 @@ def test_zero_is_prioritized_and_cannot_be_overwritten_by_a_later_motion(setup):
     assert plugin._info()["input_queue"]["pending"] == 2
     assert plugin._info()["input_queue"]["coalesced"] == 1
     plugin._tick()
-    assert plugin._backend.messages == [[0] * 6]
+    assert plugin._backend.messages == []  # idle zero neither creates nor cancels
     assert plugin._last["requested"] == [0] * 6
     setup.clock.advance()
     plugin._tick()
@@ -1553,22 +1564,43 @@ def test_nonzero_target_crossing_zero_does_not_cancel_sdk_action(setup, translat
     forward = [0.25 if translating else 0, 0, 0, 0, 0, 0.25]
     reverse = [-value for value in forward]
     send(plugin, command(setup, forward, seq=1))
+    action_id = plugin._backend.action_id
+    assert action_id
     assert plugin._last_output == pytest.approx(forward)
     setup.clock.advance(0.125)
     send(plugin, command(setup, reverse, seq=2))
     assert plugin._last_output == [0] * 6
     assert plugin._backend.preserved_actions == [False, True]
     assert plugin._backend.stop_calls == 0
+    assert plugin._backend.action_id == action_id
     assert plugin._backend.deadlines[-1] > setup.clock.time() * 1000
     setup.clock.advance(0.125)
     send(plugin, command(setup, reverse, seq=3))
     assert plugin._last_output == pytest.approx(reverse)
     assert plugin._backend.stop_calls == 0
+    assert plugin._backend.action_id == action_id
     setup.clock.advance(0.125)
     send(plugin, command(setup, [0] * 6, seq=4))
-    assert plugin._backend.stop_calls == 1
+    assert plugin._backend.stop_calls == 0
     assert plugin._last_output == [0] * 6
-    assert plugin._backend.preserved_actions == [False, True, False]
+    assert plugin._backend.preserved_actions == [False, True, False, True]
+    assert plugin._cancel_deadline_ms > setup.clock.time() * 1000
+    assert plugin._backend.action_id == action_id
+    setup.clock.advance(0.125)
+    send(plugin, command(setup, reverse, seq=5))
+    assert plugin._backend.stop_calls == 0
+    assert plugin._last_output == pytest.approx(reverse)
+    assert plugin._backend.action_id == action_id
+
+
+def test_idle_zero_neither_creates_nor_cancels_sdk_action(setup):
+    plugin = start(setup)
+    send(plugin, command(setup, [0] * 6))
+    assert plugin._last["verdict"] == "APPLIED"
+    assert plugin._backend.messages == []
+    assert plugin._backend.stop_calls == 0
+    assert plugin._cancel_deadline_ms == 0
+    assert plugin._backend.action_id == 0
 
 
 def test_acceleration_configuration_is_declared_and_idle_update_does_no_io(setup):
@@ -1694,6 +1726,8 @@ def test_single_axis_zero_immediately_stops_translation_while_turning(setup):
     for sequence in range(1, 12):
         send(plugin, command(setup, [0.3, 0, 0, 0, 0, 0.6], seq=sequence))
         setup.clock.advance()
+    action_id = plugin._backend.action_id
+    assert action_id
     send(plugin, command(setup, [0, 0, 0, 0, 0, -0.6], seq=12))
     assert plugin._last_output[0] == 0
     assert plugin._last_output[5] == pytest.approx(0.4)
@@ -1702,8 +1736,65 @@ def test_single_axis_zero_immediately_stops_translation_while_turning(setup):
     setup.clock.advance()
     send(plugin, command(setup, [0] * 6, seq=13))
     assert plugin._last_output == [0] * 6
-    assert plugin._backend.stop_calls == 1
+    assert plugin._backend.stop_calls == 0
+    assert plugin._backend.action_id == action_id
     assert plugin._sink._last_values == (0,) * 6
+
+
+def test_zero_retains_action_until_silence_timeout_and_lifecycle_stop_cancels(setup):
+    plugin = start(setup)
+    send(plugin, command(setup, seq=1))
+    action_id = plugin._backend.action_id
+    setup.clock.advance(0.1)
+    send(plugin, command(setup, [0] * 6, seq=2))
+    assert plugin._backend.action_id == action_id
+    assert plugin._backend.stop_calls == 0
+
+    setup.clock.advance(1.01)
+    plugin._tick()
+    assert plugin._backend.stop_calls == 1
+    assert plugin._backend.action_id == 0
+
+    setup.clock.advance(0.1)
+    send(plugin, command(setup, seq=3))
+    assert plugin._backend.action_id and plugin._backend.action_id != action_id
+    plugin.dispatch("pause", {})
+    assert plugin._backend.stop_calls == 2
+    assert plugin._backend.action_id == 0
+
+
+def test_zero_arriving_after_action_lease_cancels_instead_of_forgetting_action(setup):
+    plugin = start(setup)
+    send(plugin, command(setup, seq=1))
+    assert plugin._backend.action_id
+    setup.clock.advance(1.01)
+    send(plugin, command(setup, [0] * 6, seq=2))
+    assert plugin._backend.stop_calls == 1
+    assert plugin._backend.action_id == 0
+    assert plugin._cancel_deadline_ms == 0
+
+
+def test_late_zero_keeps_stop_retry_latched_when_sdk_cancel_fails(setup):
+    plugin = start(setup)
+    send(plugin, command(setup, seq=1))
+    action_id = plugin._backend.action_id
+    assert action_id
+
+    setup.clock.advance(1.01)
+    plugin._backend.fail = True
+    send(plugin, command(setup, [0] * 6, seq=2))
+
+    assert plugin._paused
+    assert plugin._zero_pending
+    assert plugin._backend.action_id == action_id
+    assert plugin._last["verdict"] == "ERROR"
+
+    # The ordinary controller tick retries the confirmed lifecycle stop before
+    # it does anything else, even though the card is paused after the fault.
+    plugin._backend.fail = False
+    plugin._tick()
+    assert not plugin._zero_pending
+    assert plugin._backend.action_id == 0
 
 
 def test_soft_hold_rebases_actual_zero_without_forgetting_source_or_sequence(setup):

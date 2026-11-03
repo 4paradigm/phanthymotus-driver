@@ -60,16 +60,18 @@ verify the wire payload, not distance accuracy or navigation safety on hardware.
 object. The namespace comes from `ros_namespace` or the hostname.
 `nav_state` remains available with its existing map-localized pose output.
 
-The new card uses its own read-only HTTP client in `loco_state.py`, leaving
-`nav_client.py` and existing cards unchanged. It reads the chassis address from
-`SLAMTEC_URL` or `slamtec.base_url` and polls these endpoints concurrently:
+The new card uses its own read-only, persistent HTTP transport in
+`loco_state.py`, leaving `nav_client.py` and existing cards unchanged. It reads
+the chassis address from `SLAMTEC_URL` or `slamtec.base_url`. Each polling lane
+owns its keep-alive connection; a failed or server-closed connection is
+discarded and recreated on the next request.
 
-| Reading | Endpoint | Meaning |
-| --- | --- | --- |
-| Pose | `/api/core/slam/v1/localization/odopose` | Odometry frame position and roll/pitch/yaw, distinct from map localization |
-| Velocity | `/api/core/motion/v1/speed` | Measured body-frame `vx`, `vy`, `omega`; unmeasured vertical velocity is null |
-| IMU | `/api/core/slam/v1/imu` | Chassis IMU; only fields enabled in `availibilityBitMap` are forwarded |
-| Total mileage | `/api/core/statistics/v1/odometry` | Vendor-reported total travelled distance in metres; not displacement from a task origin |
+| Lane | Default cadence | Reading | Endpoint | Meaning |
+| --- | --- | --- | --- | --- |
+| Fast | 20Hz target | Pose | `/api/core/slam/v1/localization/odopose` | Odometry-frame position and roll/pitch/yaw, distinct from map localization |
+| Fast | 20Hz target | Velocity | `/api/core/motion/v1/speed` | Measured body-frame `vx`, `vy`, `omega`; unmeasured vertical velocity is null |
+| Slow | 5Hz | IMU | `/api/core/slam/v1/imu` | Chassis IMU; only fields enabled in `availibilityBitMap` are forwarded |
+| Slow | 1Hz | Total mileage | `/api/core/statistics/v1/odometry` | Vendor-reported total travelled distance in metres; not displacement from a task origin |
 
 `position` and `velocity` are XYZ arrays; `rpy` is roll/pitch/yaw and
 `yaw_speed` comes from `omega`. `v` is the signed measured forward speed `vx`,
@@ -90,11 +92,12 @@ speed; IMU validity is reported separately in `imu.available`.
 Mileage validity is independent too: a missing mileage endpoint sets `length`
 to null and reports `errors.length`, while valid pose and twist remain usable.
 
-`plugins.loco_state.hz` defaults to a target of 10Hz (maximum 10); HTTP latency
-can lower the actual rate. `request_timeout` defaults to 0.5 seconds per request.
-There is at most one four-request group in flight. MCP `stop` returns the
-canvas lifecycle marker `{"state": "idle"}` while leaving this always-active
-observer running, matching R1; driver shutdown stops the worker.
+`plugins.loco_state.hz` defaults to a 20Hz fast-lane target (maximum 50Hz),
+`imu_hz` to 5Hz, `length_hz` to 1Hz, and `request_timeout` to 0.2 seconds per
+request. HTTP latency can lower a lane's actual rate, but slow IMU or mileage
+requests cannot block pose/speed publication. MCP `stop` returns the canvas
+lifecycle marker `{"state": "idle"}` while leaving this always-active observer
+running, matching R1; driver shutdown stops both workers and their connections.
 
 The standard output uses `common.odom` from the official driver repository:
 `twist = [vx, vy, null, null, null, omega]`, `frame = "body"`, SI units,
@@ -104,9 +107,13 @@ null. There is one speed observation per publish, with no faster stream being
 discarded. The IMU boot-relative timestamp is never used as `stamp_ms`.
 
 `info()` includes a validated `odom_interface` with `provides = ["vx", "vy", "wz"]`,
-the target rate, and `pose_drift = "unbounded"`: the source is uncorrected wheel
-odometry, not map localization. Standard `pose` now contains measured position
-and an orientation quaternion derived from the same endpoint's roll/pitch/yaw:
+the fast target rate, and `pose_drift = "unbounded"`: the source is uncorrected
+wheel odometry, not map localization. Its optional timing declaration is
+`{"stamp_source": "received"}` because the REST replies do not carry a usable
+measurement clock. It deliberately omits `max_measurement_delay_ms`: the HTTP
+timeout is a failure bound, not a measured sensor delay. Standard `pose` now
+contains measured position and an orientation quaternion derived from the same
+endpoint's roll/pitch/yaw:
 
 ```json
 {
@@ -215,12 +222,18 @@ for odometry feedback; verify physical motion with `loco_state`.
 
 `wz_limit` (rad/s, default = `max_wz`) clamps admitted non-zero turn commands
 before the shared step clamp; explicit all-zero commands are never shaped.
-The descriptor navi reads is unchanged. This runtime setting takes effect
+This runtime setting takes effect
 without stopping. `last_command_timing.turn` shows `requested_wz`, `wz_limit`
 and `shaped_wz`. Angular velocity follows navi's requested turn subject to these
 normal limits. Delay compensation and executed-turn integration have been
 removed; legacy `yaw_latency_gain` values in saved configuration are ignored
 and cannot reactivate them. The coefficient is absent from public card options.
+
+The control descriptor may also carry per-axis response metadata such as
+`response.wz = {gain, delay_s, settling_s, source}`. Those values are robot
+properties for a planner to consume, not operator tuning knobs. Tianyi leaves
+the block absent until the response has been measured or obtained from a
+traceable vendor specification; it does not publish guessed timing values.
 
 Input TTL and observation age (500ms) are admission checks: an already-stale
 command is dropped and cannot resume motion or renew the watchdog. Once
@@ -396,10 +409,13 @@ without cancelling and recreating that action. The staged `FOLLOW` operation
 carries the intermediate zero while retaining the original bounded deadlines.
 Legacy workers with the `ZERO` capability can also retain an existing action
 across a ramp crossing; older workers safely fall back to stopping. Neither
-zero path creates an action while idle. Explicit all-zero input still
-stops/cancels immediately, and
-the 300ms receive watchdog, 500ms observation admission limit and one-second cancellation
-deadline still apply.
+zero path creates an action while idle. An explicit all-zero input during a
+live lease updates the held SDK action to zero without cancelling it, so a
+following fresh command can update the same action. A zero received while idle
+is a no-op. Lifecycle stop/pause/handover still cancels immediately; the 300ms
+receive watchdog first commands zero and the one-second cancellation deadline
+then cancels a silent stream. The 500ms observation admission limit still
+rejects stale commands.
 
 Configure loco_servo exposes live settings via `action: config`:
 

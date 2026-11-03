@@ -174,9 +174,10 @@ def _step_limits(hz, linear_acceleration, angular_acceleration):
 
 
 def build_descriptor(hz=10.0, max_vx=0.3, max_wz=1.0, min_vx=0.0,
-                     linear_acceleration=0.3, angular_acceleration=2.0):
+                     linear_acceleration=0.3, angular_acceleration=2.0,
+                     response=None):
     min_vx = _validated_min_vx(min_vx, max_vx)
-    return {
+    descriptor = {
         "control_interface": "motus.control/1", "mode": "twist", "dof": 6,
         "joint_names": ["vx", "vy", "vz", "wx", "wy", "wz"],
         "frame": "base_link",
@@ -193,6 +194,9 @@ def build_descriptor(hz=10.0, max_vx=0.3, max_wz=1.0, min_vx=0.0,
                  "cancel_after_ms": CANCEL_AFTER_MS},
         "force_torque": None,
     }
+    if response is not None:
+        descriptor["response"] = copy.deepcopy(response)
+    return descriptor
 
 
 class LocoServoPlugin:
@@ -209,7 +213,8 @@ class LocoServoPlugin:
                        self._positive(config, "angular_acceleration", 2.0))
         self._descriptor = build_descriptor(
             self._hz, self._positive(config, "max_vx", 0.3),
-            self._positive(config, "max_wz", 1.0), config.get("min_vx", 0.0), *self._accel)
+            self._positive(config, "max_wz", 1.0), config.get("min_vx", 0.0),
+            *self._accel, response=config.get("response"))
         self._min_vx = self._descriptor["limits"]["min_magnitude"][0]
         self._parsed_descriptor = parse_descriptor(self._descriptor)
         # Apply the configured yaw cap before the shared clamp; the descriptor
@@ -642,8 +647,9 @@ class LocoServoPlugin:
                         self._cancel_deadline_ms = self._command_cancel_deadline_ms
                         self._soft_held = False
                     else:
-                        # Explicit zero (including rotate_only suppression)
-                        # has already cancelled; no silence timer remains armed.
+                        # No action existed to preserve (for example an idle
+                        # zero).  Do not arm a cancellation timer for a vendor
+                        # action that was never created.
                         self._last_valid_at = None
                         self._lease_expiry_ms = self._cancel_deadline_ms = 0
                         self._soft_held = False
@@ -739,7 +745,27 @@ class LocoServoPlugin:
         if self._settings["rotate_only"]:
             requested[0] = requested[1] = 0.0
         motion_requested = any(requested)
-        if motion_requested and self._command_deadline_ms <= time.time() * 1000:
+        now_ms = time.time() * 1000
+        # A zero in the velocity stream is a velocity update, not a lifecycle
+        # command.  Tianyi's vendor STOP releases the Slamware action, so keep
+        # an action we already own until the independent cancel_after deadline.
+        # An idle zero must
+        # remain pure no-op: it must neither create nor cancel an action.
+        if (not motion_requested and self._cancel_deadline_ms
+                and now_ms >= self._cancel_deadline_ms):
+            # The action lease has already ended.  A late zero must not make us
+            # forget a still-owned SDK action without cancelling it.
+            self._hold()
+            if self._zero_pending:
+                # STOP is a lifecycle boundary, not a best-effort velocity
+                # write.  Keep the retry latched and fault the card if the SDK
+                # did not confirm it; otherwise the code below would clear the
+                # latch while the previous action could still be moving.
+                raise RuntimeError("SDK stop unconfirmed")
+        preserve_zero = bool(
+            not motion_requested and self._cancel_deadline_ms
+            and now_ms < self._cancel_deadline_ms)
+        if motion_requested and self._command_deadline_ms <= now_ms:
             raise CommandLeaseExpired("receive watchdog expired before apply")
         if motion_requested:
             problem = self._standing_problem()
@@ -750,7 +776,7 @@ class LocoServoPlugin:
         if self._settings["rotate_only"]:
             output[0] = output[1] = 0.0
         motion_expired = bool(motion_requested and self._lease_expiry_ms and
-                              time.time() * 1000 >= self._lease_expiry_ms)
+                              now_ms >= self._lease_expiry_ms)
         if motion_expired and not self._native_staged_stop() and not self._native_expiry_update():
             # Compatibility with old workers that cancel on motion expiry.
             # This is deliberately after the sink's admission checks: stale or
@@ -765,16 +791,18 @@ class LocoServoPlugin:
         replace_expired = bool(motion_expired and not self._native_staged_stop() and
                                self._native_expiry_update() and
                                self._lease_expiry_ms and
-                               time.time() * 1000 >= self._lease_expiry_ms)
+                               now_ms >= self._lease_expiry_ms)
         now = time.monotonic()
         # ControlSink is the sole step limiter. Its values are already clamped
         # by the advertised fixed per-frame contract, including immediate zero.
+        preserve_action = bool(
+            preserve_zero or motion_requested and not any(output))
         if self._settings["dry_run"]:
             self._counts["dry_run_commands"] += 1
-        else:
+        elif any(output) or preserve_action:
             self._publish(output, replace_expired=replace_expired,
-                          preserve_action=bool(motion_requested and not any(output)))
-        self._last_preserved_action = bool(motion_requested and not any(output))
+                          preserve_action=preserve_action)
+        self._last_preserved_action = preserve_action
         self._last_output = output
         self._last_output_at = now
         self._zero_pending = False

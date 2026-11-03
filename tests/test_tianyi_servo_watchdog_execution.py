@@ -214,19 +214,35 @@ def test_repeated_new_packets_cannot_extend_one_old_observation(setup):
     assert plugin._backend.stop_calls == 1
 
 
-@pytest.mark.parametrize("stop_kind", ["zero", "pause", "stop", "handover"])
-def test_explicit_stops_cancel_without_waiting_for_either_watchdog(setup, stop_kind):
+@pytest.mark.parametrize("stop_kind", ["pause", "stop", "handover"])
+def test_lifecycle_stops_cancel_without_waiting_for_either_watchdog(setup, stop_kind):
     plugin = start(setup)
     send(plugin, command(setup))
     setup.clock.advance(0.01)
-    if stop_kind == "zero":
-        send(plugin, command(setup, [0] * 6, seq=2))
-    elif stop_kind == "handover":
+    if stop_kind == "handover":
         assert plugin.pause_for_explicit_command("nav.move_to")
     else:
         plugin.dispatch(stop_kind, {})
     assert plugin._backend is None or plugin._backend.stop_calls >= 1
     assert not any(plugin._last_output) and plugin._cancel_deadline_ms == 0
+
+
+def test_explicit_zero_updates_velocity_but_retains_action_until_timeout(setup):
+    plugin = start(setup)
+    send(plugin, command(setup))
+    action_id = plugin._backend.action_id
+    setup.clock.advance(0.01)
+    send(plugin, command(setup, [0] * 6, seq=2))
+    assert plugin._last_output == [0] * 6
+    assert plugin._backend.stop_calls == 0
+    assert plugin._backend.action_id == action_id
+    assert plugin._cancel_deadline_ms > setup.clock.time() * 1000
+
+    setup.clock.advance(1.01)
+    plugin._tick()
+    assert plugin._backend.stop_calls == 1
+    assert plugin._backend.action_id == 0
+    assert plugin._cancel_deadline_ms == 0
 
 
 def test_real_process_soft_zeros_resumes_same_action_then_cancels_on_silence(process_setup):

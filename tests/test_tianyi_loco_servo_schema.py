@@ -1,6 +1,7 @@
 """Public MCP schemas must expose the runtime actions used by canvas clients."""
 
 from test_tianyi_loco_servo import setup, start
+from common.control import parse_descriptor
 
 
 def test_every_public_action_has_its_own_parameter_contract(setup):
@@ -44,3 +45,13 @@ def test_settings_advertised_by_config_action_reach_runtime_configuration(setup)
     assert result["ok"]
     for key, value in payload.items():
         assert result[key] == value
+
+
+def test_driver_response_is_descriptor_metadata_not_an_operator_setting(setup):
+    response = {"wz": {"gain": .76, "delay_s": .12, "settling_s": .35,
+                       "source": "measured"}}
+    descriptor = setup.module.build_descriptor(response=response)
+    assert parse_descriptor(descriptor).response == response
+    plugin = setup.create(response=response)
+    assert plugin.dispatch("info", {})["control_interface"]["response"] == response
+    assert "response" not in plugin.get_tool()["configSchema"]["properties"]
