@@ -321,10 +321,17 @@ class LocoServoPlugin:
                 "require_standing": {"type": "boolean", "default": self._settings["require_standing"],
                                      "description": "要求有效的站立反馈才执行指令。天轶需配置 standing_topic（域0 Bool）；开启后缺失、过期或 false 均拒绝运动。"}}},
         }
-        # Both public MCP calls and the configuration form use one declaration.
         # Agent Core constructs action-specific functions from x-action-params;
         # configSchema alone does not advertise a dispatchable config action.
-        tool["inputSchema"]["properties"].update(copy.deepcopy(tool["configSchema"]["properties"]))
+        # Copy the constraints/descriptions, but never copy form defaults into
+        # the action schema. The canvas saves the gear form first and sends it
+        # as ``action: config`` before ``start``. A stale action-schema default
+        # (notably dry_run=true from deployment YAML) would otherwise be filled
+        # into start and overwrite the value the user just saved in the gear.
+        action_settings = copy.deepcopy(tool["configSchema"]["properties"])
+        for field in action_settings.values():
+            field.pop("default", None)
+        tool["inputSchema"]["properties"].update(action_settings)
         return tool
 
     def start(self):

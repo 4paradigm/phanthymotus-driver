@@ -117,12 +117,26 @@ def test_real_process_first_start_false_reaches_sdk_and_survives_stop_start(proc
     assert info["backend"]["connected"]
 
 
-def test_real_process_saved_false_is_not_overwritten_by_start_defaults(process_setup):
+def test_real_process_saved_false_is_not_overwritten_by_canvas_start_schema(process_setup):
     card = process_setup.create(start=False, dry_run=True)
+    # Canvas caches the action schema before the user edits the gear form.
+    tool = card.get_tool()
+    schema = tool["inputSchema"]
+    start_params = schema["x-action-params"]["start"]["params"]
+    # Match the canvas action builder: include only defaults advertised by the
+    # start action schema. Gear-form defaults live in configSchema and must not
+    # leak back into this payload after action:config saved a different value.
+    generated_start = {
+        name: schema["properties"][name]["default"]
+        for name in start_params
+        if "default" in schema["properties"][name]
+    }
+    assert generated_start == {"input_topic": "/actucore/navi/cmd"}
     assert card.dispatch("config", {"dry_run": False})["ok"]
-    info = card.dispatch("start", {})
+    info = card.dispatch("start", generated_start)
     assert info["state"] == "running" and info["dry_run"] is False
-    assert card.get_tool()["inputSchema"]["properties"]["dry_run"]["default"] is False
+    assert card.get_tool()["configSchema"]["properties"]["dry_run"]["default"] is False
+    assert "default" not in card.get_tool()["inputSchema"]["properties"]["dry_run"]
 
 
 def test_real_process_dry_run_still_never_launches_sdk_when_explicitly_requested(process_setup, tmp_path):

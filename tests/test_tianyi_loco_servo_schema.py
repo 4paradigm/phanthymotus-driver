@@ -28,8 +28,12 @@ def test_public_config_fields_match_form_constraints_without_aliasing(setup):
     public = tool["inputSchema"]["properties"]
     form = tool["configSchema"]["properties"]
     for name, field in form.items():
-        assert public[name] == field
+        expected = dict(field)
+        expected.pop("default", None)
+        assert public[name] == expected
         assert public[name] is not field
+        assert "default" not in public[name]
+        assert "default" in field
     public["dry_run"]["description"] = "changed by an action-schema consumer"
     assert public["dry_run"] != form["dry_run"]
 
