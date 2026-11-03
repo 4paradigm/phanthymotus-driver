@@ -145,6 +145,70 @@ def test_zero_immediate_cannot_change_position_or_mixed_group_semantics():
     assert not parse_descriptor(descriptor_dict()).zero_immediate
 
 
+def test_optional_axis_response_is_validated_and_preserved():
+    raw = _twist_descriptor()
+    raw["response"] = {"wz": {"gain": .76, "delay_s": .12,
+                              "settling_s": .35, "source": "measured"}}
+    parsed = parse_descriptor(raw)
+    assert parsed.response == {
+        "wz": {"gain": .76, "delay_s": .12, "settling_s": .35,
+               "source": "measured"}}
+    assert parse_descriptor(_twist_descriptor()).response == {}
+
+
+@pytest.mark.parametrize("response,problem", [
+    ({"yaw": {"gain": 1, "delay_s": 0, "settling_s": 0,
+              "source": "measured"}}, "not in joint_names"),
+    ({"wz": {"gain": 0, "delay_s": 0, "settling_s": 0,
+             "source": "measured"}}, "gain must be positive"),
+    ({"wz": {"gain": 1, "delay_s": -1, "settling_s": 0,
+             "source": "measured"}}, "non-negative"),
+    ({"wz": {"gain": 1, "delay_s": 0, "settling_s": 0}}, "missing source"),
+    ({"wz": {"gain": 1, "delay_s": 0, "settling_s": 0,
+             "source": "guess"}}, "source must be one of"),
+    ({"wz": {"gain": 10 ** 400, "delay_s": 0, "settling_s": 0,
+             "source": "measured"}}, "finite number"),
+])
+def test_axis_response_rejects_incomplete_or_unphysical_measurements(response, problem):
+    raw = _twist_descriptor()
+    raw["response"] = response
+    with pytest.raises(DescriptorError, match=problem):
+        parse_descriptor(raw)
+
+
+def test_axis_response_is_currently_a_twist_only_contract():
+    raw = descriptor_dict()
+    raw["response"] = {
+        raw["joint_names"][0]: {
+            "gain": 1, "delay_s": 0, "settling_s": 0,
+            "source": "vendor-spec",
+        }
+    }
+    with pytest.raises(DescriptorError, match="non-twist group"):
+        parse_descriptor(raw)
+
+
+def test_axis_response_uses_the_axis_group_mode_in_a_mixed_descriptor():
+    raw = descriptor_dict(mode="joint_position", joint_names=["joint", "wz"])
+    raw["groups"] = [
+        {"name": "joint", "offset": 0, "count": 1,
+         "mode": "joint_position"},
+        {"name": "base", "offset": 1, "count": 1, "mode": "twist"},
+    ]
+    raw["response"] = {
+        "wz": {"gain": 0.8, "delay_s": 0.1, "settling_s": 0.2,
+               "source": "measured"},
+    }
+    assert parse_descriptor(raw).response["wz"]["gain"] == 0.8
+
+    raw["response"] = {
+        "joint": {"gain": 1, "delay_s": 0, "settling_s": 0,
+                  "source": "vendor-spec"},
+    }
+    with pytest.raises(DescriptorError, match="non-twist group 'joint'"):
+        parse_descriptor(raw)
+
+
 @pytest.mark.parametrize("mode,opt_in", [("joint_position", False), ("twist", False), ("twist", True)])
 def test_explicit_zero_only_bypasses_the_slew_clamp_when_opted_in(mode, opt_in):
     clock, apply = FakeClock(), Recorder()
