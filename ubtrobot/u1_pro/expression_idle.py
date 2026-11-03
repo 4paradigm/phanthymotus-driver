@@ -128,6 +128,8 @@ class ExpressionIdleLoop:
                 "message": "已暂停周期调度，正在等待当前任务结束并恢复原厂待机开关。"}
 
     def _set_native(self, enabled):
+        if self.audio.visual_enabled():
+            raise RuntimeError("Visual behavior is enabled; vendor idle preference was not changed")
         result = self.control.set_enabled(enabled)
         if not isinstance(result, dict) or result.get("ok") is not True or result.get("enabled") is not enabled:
             raise RuntimeError("Vendor idle preference change was not confirmed")
@@ -137,7 +139,7 @@ class ExpressionIdleLoop:
         status, result = "error", {}
         try:
             if interrupt:
-                response = self.audio.stop()
+                response = self.audio.stop_for_owner("expression")
                 if response.get("state") == "error":
                     raise RuntimeError("Cannot restore vendor idle after failed interrupt: " +
                                        safe_native_detail(response, 240))
@@ -152,7 +154,8 @@ class ExpressionIdleLoop:
             # must settle first, so its disable cannot race the final enable.
             while not self._shutdown.is_set():
                 with self.audio._lock:
-                    busy = self.audio._active is not None or self.audio._handoff is not None or self.audio._interrupting
+                    busy = (self.audio._active is not None or self.audio._tts_active is not None or
+                            self.audio._handoff is not None or self.audio._interrupting)
                 if not busy:
                     break
                 if time.monotonic() >= deadline:
@@ -209,6 +212,11 @@ class ExpressionIdleLoop:
             startup_reported = True
             previous = None
             while not stop.wait(self._rng.uniform(self.GAP_MIN, self.GAP_MAX)):
+                if self.audio.visual_enabled():
+                    self.stop()
+                    with self._lock:
+                        self._state = "vendor_controlled"
+                    return
                 with self.audio._lock:
                     busy = (self.audio._active is not None or self.audio._handoff is not None
                             or self.audio._interrupting)
@@ -239,7 +247,7 @@ class ExpressionIdleLoop:
         finally:
             with self._lock:
                 self._enabled = False
-                if self._state != "error" and not self._ending:
+                if self._state not in ("error", "vendor_controlled") and not self._ending:
                     self._state = "stopped"
 
     def _play_once(self, name, stop):

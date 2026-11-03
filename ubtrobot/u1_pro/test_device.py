@@ -205,6 +205,9 @@ class FakeNodes:
         self.interrupts += name == "interrupt"
         return {"success": True}
 
+    def get_system_enabled(self, name):
+        return {"enabled": False}
+
     def add_playback_listener(self, listener):
         self.playback_listener = listener
 
@@ -1291,7 +1294,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(tool["name"], "tts")
         self.assertEqual(schema["properties"]["action"]["enum"], ["start", "speak", "interrupt", "stop", "info"])
         self.assertEqual(schema["x-completion"]["actions"], ["speak"])
-        self.assertEqual(schema["x-resource"], device.VENDOR_ACTION_RESOURCE)
+        self.assertEqual(schema["x-resource"], "u1_speech")
 
     def test_head_card_uses_readable_preset_names(self):
         import device
@@ -1672,7 +1675,7 @@ class U1CardContractTests(unittest.TestCase):
         vendor_uuid = nodes.string_calls[0][1]["uuid"]
         self.assertTrue(vendor_uuid)
         self.assertNotEqual(vendor_uuid, "request-1")
-        self.assertEqual(plugin._active["vendor_uuid"], "adapter-1")
+        self.assertEqual(plugin._tts_active["vendor_uuid"], "adapter-1")
 
     def test_playback_result_completes_only_matching_active_action(self):
         import device
@@ -1681,7 +1684,7 @@ class U1CardContractTests(unittest.TestCase):
         plugin = device.AudioPlugin(nodes)
         plugin.start()
         plugin.dispatch("speak", {"text": "hello", "action_id": "request-2"})
-        vendor_uuid = plugin._active["vendor_uuid"]
+        vendor_uuid = plugin._tts_active["vendor_uuid"]
         with mock.patch.object(device, "_acp_notify") as notify:
             plugin._on_playback_state({"uuid": "old", "phase": "result", "success": True, "state_name": "COMPLETED"})
             notify.assert_not_called()

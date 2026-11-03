@@ -50,7 +50,7 @@ class ExpressionIdleTests(unittest.TestCase):
 
     def finish_active(self, success=True):
         with self.audio._lock:
-            vendor_uuid = self.audio._active["vendor_uuid"]
+            vendor_uuid = (self.audio._active or self.audio._tts_active)["vendor_uuid"]
         self.audio._on_playback_state({"uuid": vendor_uuid, "phase": "result",
                                        "success": success, "state_name": "COMPLETED" if success else "FAILED"})
 
@@ -140,12 +140,11 @@ class ExpressionIdleTests(unittest.TestCase):
     def test_waits_for_foreground_and_idle_stop_does_not_interrupt_it(self):
         self.audio.dispatch("speak", {"text": "hello", "action_id": "foreground"})
         self.start_loop()
-        self.wait_for(lambda: self.loop.info()["state"] == "running")
-        time.sleep(0.04)
-        self.assertEqual(len(self.nodes.string_calls), 1)
+        self.wait_for(lambda: self.audio._active is not None)
         self.loop.stop()
+        self.assertIsNotNone(self.audio._tts_active)
         self.assertEqual(self.nodes.interrupts, 0)
-        self.assertEqual(self.audio._active["action_id"], "foreground")
+        self.finish_active()
         self.finish_active()
         self.assertIn(("foreground", "completed"), [c.args[:2] for c in self.notify.call_args_list])
 
@@ -280,6 +279,172 @@ class ExpressionIdleTests(unittest.TestCase):
         self.assertEqual(self.audio._active["action_id"], "manual")
         self.finish_active()
 
+    def test_stopping_unowned_cards_does_not_cancel_background_idle(self):
+        self.start_loop()
+        self.wait_for(lambda: self.audio._active is not None)
+        active = self.audio._active
+        head = device.HeadPlugin(self.audio, idle_loop=self.loop)
+        self.assertEqual(head.stop()["state"], "idle")
+        self.assertEqual(self.audio.dispatch("stop", {})["state"], "idle")
+        self.assertIs(self.audio._active, active)
+        self.assertEqual(self.nodes.interrupts, 0)
+        self.assertTrue(self.loop.info()["enabled"])
+
+    def test_local_stop_only_cancels_its_own_speech(self):
+        self.audio.dispatch("speak", {"text": "hello", "action_id": "speech"})
+        self.assertEqual(self.audio.dispatch("stop", {})["state"], "idle")
+        self.assertIsNone(self.audio._tts_active)
+        self.assertEqual(self.nodes.interrupts, 1)
+        self.assertEqual(self.notify.call_args.args[:2], ("speech", "cancelled"))
+
+    def test_head_cannot_preempt_idle_when_speech_would_be_interrupted(self):
+        self.start_loop()
+        self.wait_for(lambda: self.audio._active is not None)
+        self.audio.dispatch("speak", {"text": "hello"})
+        head = device.HeadPlugin(self.audio, idle_loop=self.loop)
+        response = head.dispatch("play", {"name": "nod"})
+        self.assertEqual(response["code"], "SHARED_INTERRUPT_CONFLICT")
+        self.assertEqual(self.nodes.interrupts, 0)
+        self.assertIsNone(self.audio._handoff)
+        self.assertTrue(self.audio._active["background"])
+        self.assertIsNotNone(self.audio._tts_active)
+
+    def test_rejected_speech_does_not_release_motion_slot(self):
+        self.plugin.dispatch("play", {"name": "smile"})
+        active = self.audio._active
+        self.nodes.string_call = mock.Mock(return_value={"success": False, "message": "denied"})
+        with self.assertRaisesRegex(RuntimeError, "denied"):
+            self.audio.dispatch("speak", {"text": "hello"})
+        self.assertIs(self.audio._active, active)
+        self.assertIsNone(self.audio._tts_active)
+
+    def test_shutdown_cancels_both_slots_but_local_stop_cannot(self):
+        self.plugin.dispatch("play", {"name": "smile", "action_id": "motion"})
+        self.audio.dispatch("speak", {"text": "hello", "action_id": "speech"})
+        self.assertEqual(self.audio.stop()["state"], "idle")
+        self.assertIsNone(self.audio._active)
+        self.assertIsNone(self.audio._tts_active)
+        self.assertEqual(self.nodes.interrupts, 1)
+        self.assertEqual({c.args[:2] for c in self.notify.call_args_list},
+                         {("motion", "cancelled"), ("speech", "cancelled")})
+
+    def test_head_preempts_background_idle_and_cycle_resumes_with_head_acp(self):
+        head = device.HeadPlugin(self.audio, idle_loop=self.loop)
+        self.start_loop()
+        self.wait_for(lambda: self.audio._active is not None)
+        result = head.dispatch("play", {"name": "nod", "action_id": "manual-head"})
+        self.assertEqual(result["state"], "queued")
+        self.assertIn("preempting_action_id", result)
+        self.wait_for(lambda: self.audio._handoff is None and len(self.nodes.string_calls) == 2)
+        self.assertEqual(self.audio._active["tool_name"], "head")
+        self.assertEqual(self.nodes.string_calls[-1][1]["action"], "A014")
+        self.finish_active()
+        reports = [c for c in self.notify.call_args_list if c.args[0] == "manual-head"]
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0].args[1], "completed")
+        self.assertEqual(reports[0].args[3], "head")
+        self.wait_for(lambda: len(self.nodes.string_calls) == 3)
+        self.assertTrue(self.audio._active["background"])
+
+    def test_head_does_not_preempt_foreground_tts(self):
+        head = device.HeadPlugin(self.audio, idle_loop=self.loop)
+        self.audio.dispatch("speak", {"text": "hello", "action_id": "tts"})
+        self.assertEqual(head.dispatch("play", {"name": "nod"})["state"], "queued")
+        self.assertEqual(self.nodes.interrupts, 0)
+        self.assertEqual(self.audio._tts_active["action_id"], "tts")
+        self.assertEqual(head.stop()["code"], "SHARED_INTERRUPT_CONFLICT")
+        self.assertEqual(self.audio.dispatch("stop", {})["code"], "SHARED_INTERRUPT_CONFLICT")
+        self.assertEqual(self.nodes.interrupts, 0)
+        self.finish_active()
+        self.finish_active()
+
+    def test_tts_and_cycle_complete_independently_without_interrupt(self):
+        self.start_loop()
+        self.wait_for(lambda: self.audio._active is not None)
+        response = self.audio.dispatch("speak", {"text": "hello", "action_id": "manual-tts"})
+        self.assertEqual(response["state"], "queued")
+        self.assertNotIn("preempting_action_id", response)
+        self.assertEqual(self.nodes.interrupts, 0)
+        speech_uuid = self.audio._tts_active["vendor_uuid"]
+        self.finish_active()
+        self.wait_for(lambda: len(self.nodes.string_calls) == 3)
+        self.assertEqual(self.audio._tts_active["vendor_uuid"], speech_uuid)
+        self.audio._on_playback_state({"uuid": speech_uuid, "phase": "result", "success": True})
+        self.assertIsNotNone(self.audio._active)
+        reports = [c for c in self.notify.call_args_list if c.args[0] == "manual-tts"]
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0].args[3], "tts")
+
+    def test_tts_does_not_preempt_foreground_expression(self):
+        self.plugin.dispatch("play", {"name": "smile", "action_id": "manual"})
+        self.assertEqual(self.audio.dispatch("speak", {"text": "hello"})["state"], "queued")
+        self.assertEqual(self.audio._active["action_id"], "manual")
+        self.assertEqual(self.nodes.interrupts, 0)
+        self.finish_active()
+        self.finish_active()
+
+    def test_visual_enabled_skips_expression_takeover_and_exit(self):
+        self.nodes.get_system_enabled = mock.Mock(return_value={"enabled": True})
+        for action in ("start", "idle_start", "idle_stop", "stop"):
+            result = self.plugin.dispatch(action, {"action_id": "visual-" + action})
+            self.assertTrue(result["skipped"])
+            self.assertEqual(result["reason"], "visual_behavior_enabled")
+        self.assertTrue(self.plugin.stop()["skipped"])
+        self.control.set_enabled.assert_not_called()
+        self.assertEqual(self.nodes.string_calls, [])
+        self.assertEqual(self.nodes.interrupts, 0)
+        self.assertFalse(self.loop.info()["enabled"])
+
+    def test_visual_enabled_blocks_head_expression_and_interrupt_but_allows_tts(self):
+        self.nodes.get_system_enabled = mock.Mock(return_value={"enabled": True})
+        head = device.HeadPlugin(self.audio, idle_loop=self.loop)
+        for card, name in ((head, "nod"), (self.plugin, "smile")):
+            result = card.dispatch("play", {"name": name})
+            self.assertEqual(result["code"], "VISUAL_BEHAVIOR_ENABLED")
+        self.assertEqual(self.audio.dispatch("speak", {"text": "hello"})["state"], "queued")
+        self.assertTrue(head.stop()["skipped"])
+        self.assertTrue(self.audio.stop()["skipped"])
+        self.assertEqual(self.nodes.interrupts, 0)
+        self.assertEqual(self.nodes.string_calls[0][0], "play_text")
+        self.finish_active()
+
+    def test_unknown_visual_state_blocks_motion_and_preference_writes(self):
+        self.nodes.get_system_enabled = mock.Mock(return_value={"success": True})
+        with self.assertRaisesRegex(RuntimeError, "unconfirmed"):
+            self.plugin.dispatch("start", {})
+        with self.assertRaisesRegex(RuntimeError, "unconfirmed"):
+            self.plugin.dispatch("play", {"name": "smile"})
+        self.assertEqual(self.audio.stop()["state"], "error")
+        self.control.set_enabled.assert_not_called()
+        self.assertEqual(self.nodes.string_calls, [])
+        self.assertEqual(self.nodes.interrupts, 0)
+
+    def test_enabling_visual_during_cycle_stops_scheduling_without_vendor_exit(self):
+        self.start_loop()
+        self.wait_for(lambda: self.audio._active is not None)
+        self.nodes.get_system_enabled = mock.Mock(return_value={"enabled": True})
+        self.finish_active()
+        self.wait_for(lambda: not self.loop.info()["enabled"])
+        self.assertEqual(self.loop.info()["state"], "vendor_controlled")
+        self.plugin.dispatch("stop", {})
+        self.control.set_enabled.assert_called_once_with(False)
+        self.assertEqual(self.nodes.interrupts, 0)
+
+    def test_visual_enable_before_native_restore_prevents_configuration_write(self):
+        self.nodes.get_system_enabled = mock.Mock(return_value={"enabled": True})
+        with self.assertRaisesRegex(RuntimeError, "was not changed"):
+            self.loop._set_native(True)
+        self.control.set_enabled.assert_not_called()
+
+    def test_tts_submission_does_not_require_any_interrupt(self):
+        self.start_loop()
+        self.wait_for(lambda: self.audio._active is not None)
+        self.nodes.trigger_call = mock.Mock(return_value={"success": False})
+        self.assertEqual(self.audio.dispatch("speak", {"text": "hello"})["state"], "queued")
+        self.nodes.trigger_call.assert_not_called()
+        self.assertIsNotNone(self.audio._active)
+        self.assertIsNotNone(self.audio._tts_active)
+
     def test_interrupt_failure_preserves_old_slot_and_reports_foreground_error_once(self):
         self.start_loop()
         self.wait_for(lambda: len(self.nodes.string_calls) == 1)
@@ -380,13 +545,10 @@ class ExpressionIdleTests(unittest.TestCase):
 
     def test_normal_play_does_not_interrupt_existing_foreground_task(self):
         self.audio.dispatch("speak", {"text": "hello", "action_id": "foreground"})
-        self.start_loop()
-        self.wait_for(lambda: self.loop.info()["state"] == "running")
-        result = self.plugin.dispatch("play", {"name": "smile", "action_id": "manual"})
-        self.assertEqual(result["state"], "error")
+        self.assertEqual(self.plugin.dispatch("play", {"name": "smile"})["state"], "queued")
         self.assertEqual(self.nodes.interrupts, 0)
-        self.assertEqual(self.audio._active["action_id"], "foreground")
-        self.assertEqual(len(self.nodes.string_calls), 1)
+        self.assertEqual(self.audio._tts_active["action_id"], "foreground")
+        self.finish_active()
         self.finish_active()
 
     def test_explicit_stop_cancels_pending_handoff_without_duplicate_acp(self):
@@ -446,7 +608,7 @@ class ExpressionIdleTests(unittest.TestCase):
         self.nodes.trigger_call = mock.Mock(return_value={"success": False})
         result = self.audio.stop()
         self.assertEqual(result["state"], "error")
-        self.assertEqual(self.audio._active["action_id"], "foreground")
+        self.assertEqual(self.audio._tts_active["action_id"], "foreground")
         self.notify.assert_not_called()
         self.finish_active()
 
@@ -472,7 +634,7 @@ class ExpressionIdleTests(unittest.TestCase):
         self.nodes.trigger_call = mock.Mock(return_value={})
         result = self.audio.stop()
         self.assertEqual(result["state"], "error")
-        self.assertEqual(self.audio._active["action_id"], "foreground")
+        self.assertEqual(self.audio._tts_active["action_id"], "foreground")
         self.notify.assert_not_called()
         self.finish_active()
 

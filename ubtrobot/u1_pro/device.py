@@ -1415,10 +1415,13 @@ class AudioPlugin:
         self._active: dict | None = None
         self._completion_callback = None
         self._submission = None
+        self._tts_active = None
+        self._tts_submission = None
         self._command_lock = threading.RLock()
         self._handoff = None
         self._interrupting = False
         self._native_restoring = False
+        self._idle_loop = None
         self.nodes.add_playback_listener(self._on_playback_state)
 
     def get_tool(self):
@@ -1435,30 +1438,55 @@ class AudioPlugin:
         }
         schema = action_schema(actions, properties)
         schema["x-completion"] = {"actions": ["speak"], "timeout": 120}
-        schema["x-resource"] = VENDOR_ACTION_RESOURCE
+        schema["x-resource"] = "u1_speech"
         return tool(self.PREFIX, "actuator", "U1 Pro 文本转语音输出。提交文本即可播报；本卡不提供预设动作或原始音频播放。", schema)
 
     def start(self):
         self.running = True
         return {"state": "ready"}
 
-    def stop(self):
+    def stop_for_owner(self, owner):
+        return self.stop(owner=owner)
+
+    def stop(self, *, owner=None):
+        try:
+            if self.visual_enabled():
+                return {"state": "idle", "skipped": True, "reason": "visual_behavior_enabled"}
+        except Exception as exc:
+            return {"state": "error", "message": str(exc), "skipped": True}
         with self._lock:
             if self._interrupting:
                 return {"state": "error", "message": "U1 Pro interruption is already in progress"}
+            motion_owned = self._active is not None and self._active["tool_name"] == owner
+            speech_owned = self._tts_active is not None and owner == "tts"
+            handoff_owned = self._handoff is not None and self._handoff.get("tool_name") == owner
+            if owner is not None:
+                if not (motion_owned or speech_owned or handoff_owned):
+                    return {"state": "idle"}
+                if ((self._active is not None and not motion_owned) or
+                        (self._tts_active is not None and not speech_owned) or
+                        (self._handoff is not None and not handoff_owned)):
+                    return {"state": "error", "code": "SHARED_INTERRUPT_CONFLICT",
+                            "message": "SDK only exposes a shared interrupt; another card is active, so no interrupt was sent"}
             self._interrupting = True
+            speech_submission = self._tts_submission
             if self._handoff is not None:
                 self._handoff["cancelled"] = True
             submission = self._submission
         result = {"state": "idle"}
         try:
             self._wait_for_submission(submission)
+            self._wait_for_submission(speech_submission)
             with self._command_lock:
                 with self._lock:
                     active = self._active
-                if active:
+                    speech = self._tts_active
+                if active or speech:
                     result["interrupt"] = self._interrupt_vendor()
-                    self._cancel_active(active)
+                    if active:
+                        self._cancel_active(active)
+                    if speech:
+                        self._cancel_speech(speech)
         except Exception as exc:
             result.update(state="error", interrupt_error=safe_native_detail(exc, 512))
         finally:
@@ -1472,7 +1500,22 @@ class AudioPlugin:
         if submission is not None and not submission["done"].wait(SERVICE_TIMEOUT + 2):
             raise RuntimeError("Previous U1 Pro submission is unconfirmed; no subsequent motion was sent")
 
+    def visual_enabled(self):
+        state = self.nodes.get_system_enabled("vision_enabled_state")
+        enabled = U1Nodes._system_enabled_value(state)
+        if enabled is None:
+            raise RuntimeError("U1 Pro visual behavior state is unconfirmed")
+        return enabled
+
+    def motion_guard(self):
+        if self.visual_enabled():
+            return {"state": "error", "code": "VISUAL_BEHAVIOR_ENABLED",
+                    "message": "自主视觉已开启，拒绝手动运动或共享中断；请先关闭自主视觉。"}
+        return None
+
     def _interrupt_vendor(self):
+        if self.visual_enabled():
+            raise RuntimeError("Visual behavior is enabled; SDK interrupt was not sent")
         result = self.nodes.trigger_call("interrupt")
         positive = isinstance(result, dict) and (
             result.get("success") is True or result.get("ok") is True or
@@ -1493,20 +1536,29 @@ class AudioPlugin:
         self._complete(active, "cancelled", {"state": "cancelled", "action_id": active["action_id"],
                                             "preempted": active.get("preempted", False)}, callback)
 
-    def queue_expression(self, payload, action_id, idle_action_id):
+    def queue_expression(self, payload, action_id, idle_action_id, tool_name="expression", kind="play_action"):
         """Reserve a foreground handoff only if the current task belongs to this idle loop."""
+        if kind == "play_action":
+            guard = self.motion_guard()
+            if guard:
+                return {**guard, "action_id": action_id}
+        elif self.visual_enabled():
+            return self._queue(kind, payload, action_id, tool_name)
         with self._lock:
             active = self._active
             owned_idle = (active is not None and idle_action_id is not None and
                           active["action_id"] == idle_action_id and active.get("background") is True and
                           active["tool_name"] == "expression")
+            if owned_idle and self._tts_active is not None:
+                return {"state": "error", "code": "SHARED_INTERRUPT_CONFLICT",
+                        "message": "Cannot preempt idle motion while speech is active", "action_id": action_id}
             if owned_idle and self._handoff is None and not self._interrupting and not self._native_restoring:
-                handoff = {"action_id": action_id, "cancelled": False}
+                handoff = {"action_id": action_id, "cancelled": False, "tool_name": tool_name}
                 self._handoff = handoff
                 active["preempted"] = True
                 submission = self._submission
                 worker = threading.Thread(target=self._preempt_expression,
-                                          args=(payload, handoff, active, submission),
+                                          args=(payload, handoff, active, submission, tool_name, kind),
                                           name="u1-expression-handoff", daemon=True)
                 try:
                     worker.start()
@@ -1515,10 +1567,10 @@ class AudioPlugin:
                     raise
                 return {"state": "queued", "action_id": action_id,
                         "preempting_action_id": idle_action_id,
-                        "message": "正在中断周期待机动作，确认请求成功后播放指定表情。"}
-        return self._queue("play_action", payload, action_id, "expression")
+                        "message": "正在中断周期待机动作，确认请求成功后播放指定动作。"}
+        return self._queue(kind, payload, action_id, tool_name)
 
-    def _preempt_expression(self, payload, handoff, target, submission):
+    def _preempt_expression(self, payload, handoff, target, submission, tool_name="expression", kind="play_action"):
         submitted = False
         reported = False
         try:
@@ -1532,6 +1584,9 @@ class AudioPlugin:
                 if cancelled:
                     return
                 if active is target:
+                    with self._lock:
+                        if self._tts_active is not None:
+                            raise RuntimeError("Speech is active; shared interrupt would stop another card")
                     self._interrupt_vendor()
                     target["preempted"] = True
                     self._cancel_active(target)
@@ -1541,7 +1596,7 @@ class AudioPlugin:
                     if handoff["cancelled"]:
                         return
                 submitted = True  # _queue owns its ACP error report after this point.
-                response = self._queue("play_action", payload, handoff["action_id"], "expression",
+                response = self._queue(kind, payload, handoff["action_id"], tool_name,
                                        _handoff=handoff)
                 if response.get("state") != "queued":
                     submitted = False
@@ -1554,7 +1609,7 @@ class AudioPlugin:
                         self._handoff = None
                 status = "cancelled" if cancelled else "error"
                 _acp_notify(handoff["action_id"], status,
-                            {"state": status, "message": safe_native_detail(exc, 512)}, "expression")
+                            {"state": status, "message": safe_native_detail(exc, 512)}, tool_name)
                 reported = True
         finally:
             with self._lock:
@@ -1562,7 +1617,7 @@ class AudioPlugin:
                 if self._handoff is handoff:
                     self._handoff = None
             if cancelled and not reported:
-                _acp_notify(handoff["action_id"], "cancelled", {"state": "cancelled"}, "expression")
+                _acp_notify(handoff["action_id"], "cancelled", {"state": "cancelled"}, tool_name)
 
     def _complete(self, active: dict, status: str, result: dict, callback=None) -> None:
         if callback is not None:
@@ -1572,6 +1627,10 @@ class AudioPlugin:
 
     def _queue(self, kind: str, payload: dict, action_id: str, tool_name: str = "audio",
                *, on_complete=None, cancel_event=None, _handoff=None) -> dict:
+        if kind == "play_action":
+            guard = self.motion_guard()
+            if guard:
+                return {**guard, "action_id": action_id}
         with self._lock:
             if cancel_event is not None and cancel_event.is_set():
                 return {"state": "cancelled", "action_id": action_id}
@@ -1605,6 +1664,8 @@ class AudioPlugin:
                                    {"state": "cancelled", "action_id": action_id,
                                     "preempted": preempted}, on_complete)
                     return {"state": "cancelled", "action_id": action_id, "preempted": preempted}
+                if kind == "play_action" and self.visual_enabled():
+                    raise RuntimeError("Visual behavior enabled before submission; motion was not sent")
                 result = self.nodes.string_call(kind, vendor_payload)
                 submission["error"] = _vendor_request_failed(result)
                 returned_uuid = _vendor_action_uuid(result)
@@ -1639,19 +1700,64 @@ class AudioPlugin:
             raise RuntimeError(message)
         return {"state": "queued", "action_id": action_id, "request": result}
 
+    def _cancel_speech(self, expected):
+        with self._lock:
+            if self._tts_active is not expected:
+                return
+            self._tts_active = None
+            self._tts_submission = None
+        self._complete(expected, "cancelled", {"state": "cancelled", "action_id": expected["action_id"]})
+
+    def _queue_speech(self, text, action_id):
+        submission = {"done": threading.Event(), "error": False}
+        with self._lock:
+            if self._tts_active or self._interrupting or self._handoff or self._native_restoring:
+                return {"state": "error", "message": "another speech or shared interrupt is active",
+                        "action_id": action_id}
+            active = {"action_id": action_id, "vendor_uuid": str(uuid.uuid4()),
+                      "kind": "play_text", "tool_name": "tts"}
+            self._tts_active = active
+            self._tts_submission = submission
+        with self._command_lock:
+            try:
+                result = self.nodes.string_call("play_text", {"text": text, "uuid": active["vendor_uuid"]})
+                if _vendor_request_failed(result):
+                    raise RuntimeError(str(result.get("message") or "vendor rejected speech"))
+                returned_uuid = _vendor_action_uuid(result)
+                with self._lock:
+                    if self._tts_active is active and returned_uuid:
+                        active["vendor_uuid"] = returned_uuid
+            except Exception as exc:
+                submission["error"] = True
+                with self._lock:
+                    if self._tts_active is active:
+                        self._tts_active = None
+                        self._tts_submission = None
+                self._complete(active, "error", {"state": "error", "message": str(exc), "action_id": action_id})
+                raise
+            finally:
+                submission["done"].set()
+        return {"state": "queued", "action_id": action_id, "request": result}
+
     def _on_playback_state(self, event: dict) -> None:
         data = _event_data(event)
         if data.get("phase") != "result":
             return
         event_uuid = data.get("uuid")
         with self._lock:
-            active = self._active
-            if not active or not event_uuid or event_uuid != active["vendor_uuid"]:
-                return
-            self._active = None
-            callback = self._completion_callback
-            self._completion_callback = None
-            self._submission = None
+            speech = self._tts_active
+            if speech is not None and event_uuid and event_uuid == speech["vendor_uuid"]:
+                active, callback = speech, None
+                self._tts_active = None
+                self._tts_submission = None
+            else:
+                active = self._active
+                if not active or not event_uuid or event_uuid != active["vendor_uuid"]:
+                    return
+                self._active = None
+                callback = self._completion_callback
+                self._completion_callback = None
+                self._submission = None
         state_name = str(data.get("state_name") or data.get("state") or "").upper()
         failed = state_name == "FAILED" or data.get("success") is False
         success = not failed and (data.get("success") is True or state_name == "COMPLETED")
@@ -1663,16 +1769,16 @@ class AudioPlugin:
             return self.start()
         if action == "info":
             with self._lock:
-                active = dict(self._active) if self._active else None
+                active = dict(self._tts_active) if self._tts_active else None
             return {"state": "ready" if self.running else "idle", "active": active}
         if action == "speak":
             text = str(args.get("text", "")).strip()
             if not text:
                 raise ValueError("tts.speak requires text")
             action_id = str(args.get("action_id") or uuid.uuid4())[:128]
-            return self._queue("play_text", {"text": text[:4096]}, action_id, "tts")
+            return self._queue_speech(text[:4096], action_id)
         if action in ("interrupt", "stop"):
-            return self.stop()
+            return self.stop_for_owner("tts")
         return None
 
 
@@ -2017,6 +2123,7 @@ class ExpressionPlugin:
         self.idle_loop = ExpressionIdleLoop(
             audio, self.EXPRESSIONS, idle_control,
             lambda action_id, status, result: _acp_notify(action_id, status, result, "expression"))
+        self.audio._idle_loop = self.idle_loop
 
     def get_tool(self):
         actions = {
@@ -2045,6 +2152,8 @@ class ExpressionPlugin:
     def stop(self):
         self.idle_loop.stop()
         self.running = False
+        if self.audio.visual_enabled():
+            return {"state": "idle", "skipped": True, "reason": "visual_behavior_enabled"}
         result = self.audio.stop()
         # Bundle shutdown must restore a session it owns before ROS nodes close.
         if self.idle_loop.info()["smart_control_active"]:
@@ -2061,6 +2170,16 @@ class ExpressionPlugin:
             action_id = str(args.get("action_id") or uuid.uuid4())
             if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", action_id):
                 raise ValueError("expression smart control requires a valid action_id")
+            if self.audio.visual_enabled():
+                self.idle_loop.stop()
+                self.running = action in ("start", "idle_start")
+                self._stop_accepted = not self.running
+                result = {"state": "ready" if self.running else "idle", "action": action,
+                          "action_id": action_id, "skipped": True,
+                          "reason": "visual_behavior_enabled",
+                          "message": "自主视觉已开启，不接管原厂待机、不启动周期、不执行退出恢复。"}
+                _acp_notify(action_id, "completed", result, "expression")
+                return result
             if action in ("start", "idle_start"):
                 state = self.idle_loop.info()
                 if action == "start" and state["enabled"] and state["state"] in ("starting", "running"):
@@ -2095,7 +2214,7 @@ class ExpressionPlugin:
             return self.audio.queue_expression({"action": legacy_action}, action_id, idle_action_id)
         if action == "interrupt":
             self.idle_loop.stop()
-            return self.audio.stop()
+            return self.audio.stop_for_owner("expression")
         if action == "info":
             with self.audio._lock:
                 active = dict(self.audio._active) if self.audio._active else None
@@ -2330,8 +2449,9 @@ class HeadPlugin:
     }
 
     def __init__(self, audio: AudioPlugin, motion_catalog: dict[str, dict[str, Any]] | None = None,
-                 catalog_available: bool = False):
+                 catalog_available: bool = False, *, idle_loop=None):
         self.audio = audio
+        self.idle_loop = idle_loop
         self.running = False
         if catalog_available:
             self.HEAD_ACTIONS = {name: value for name, value in self.HEAD_ACTIONS.items()
@@ -2362,7 +2482,7 @@ class HeadPlugin:
 
     def stop(self):
         self.running = False
-        return self.audio.stop()
+        return self.audio.stop_for_owner("head")
 
     def dispatch(self, action, args):
         if action == "start":
@@ -2373,7 +2493,8 @@ class HeadPlugin:
                 raise ValueError("head.play requires one of the declared head motion names")
             legacy_action, _motion_name = self.HEAD_ACTIONS[name]
             action_id = str(args.get("action_id") or uuid.uuid4())[:128]
-            return self.audio._queue("play_action", {"action": legacy_action}, action_id, "head")
+            idle_action_id = self.idle_loop.info()["current_action_id"] if self.idle_loop else None
+            return self.audio.queue_expression({"action": legacy_action}, action_id, idle_action_id, "head")
         if action in ("interrupt", "stop"):
             return self.stop()
         if action == "info":
@@ -2436,9 +2557,10 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     catalog_available = hasattr(nodes, "motion_catalog")
     camera_left = EyeCameraPlugin(nodes, "left")
     camera_right = EyeCameraPlugin(nodes, "right")
+    expression = ExpressionPlugin(audio, motion_catalog, catalog_available, idle_control=idle_control)
     plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
-               ExpressionPlugin(audio, motion_catalog, catalog_available, idle_control=idle_control),
-               HeadPlugin(audio, motion_catalog, catalog_available),
+               expression,
+               HeadPlugin(audio, motion_catalog, catalog_available, idle_loop=expression.idle_loop),
                SystemControlsPlugin(nodes),
                IdleActionsPlugin(idle_control),
                camera_left, camera_right]
