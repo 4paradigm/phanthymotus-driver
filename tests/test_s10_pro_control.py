@@ -1516,12 +1516,17 @@ def test_loco_servo_is_a_dry_run_velocity_sink_by_default(monkeypatch):
     assert "groups" not in descriptor
     assert plugin.dispatch("info", {})["dry_run"] is True
     assert plugin.dispatch("config", {"dry_run": False})["code"] == "CONFIRM_REQUIRED"
+    denied = plugin.dispatch("config", {"dry_run": False, "confirm": True})
+    assert denied["code"] == "MOTION_DISABLED"
+    assert plugin.dispatch("info", {})["dry_run"] is True
     result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": True})
     assert result["state"] == "running"
     assert plugin.dispatch("info", {})["dry_run"] is True
     plugin.stop()
-    assert plugin.dispatch("config", {"dry_run": False, "confirm": True})["dry_run"] is False
-    result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": False})
+    assert plugin.dispatch("config", {"dry_run": False, "confirm": True})["code"] == "MOTION_DISABLED"
+    assert plugin.dispatch("info", {})["dry_run"] is True
+    result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": False,
+                                       "confirm": True})
     assert result["state"] == "error"
     assert "S10_MOTION_ENABLED" in result["message"]
 

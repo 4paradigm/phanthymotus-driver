@@ -89,6 +89,7 @@ def test_speaker_discards_invalid_and_tts_eof_frames(monkeypatch):
         def __init__(self):
             self.items = [
                 (audio.AUDIO_FORMAT, b"\x00\x01" * 32),
+                ("pcm_16k_16bit_mono", b"\x02\x03" * 32),
                 ("audio/pcm-48k", b"\x00\x01" * 32),
                 (audio.AUDIO_FORMAT, audio.AUDIO_EOF_MAGIC),
                 (audio.AUDIO_FORMAT, b"\x00"),
@@ -106,6 +107,6 @@ def test_speaker_discards_invalid_and_tts_eof_frames(monkeypatch):
 
     plugin._subscriber = Subscriber()
     plugin._playback_loop()
-    assert plugin._process.stdin.writes == [b"\x00\x01" * 32]
-    assert plugin._frames == 1
+    assert plugin._process.stdin.writes == [b"\x00\x01" * 32, b"\x02\x03" * 32]
+    assert plugin._frames == 2
     assert plugin._dropped == 3

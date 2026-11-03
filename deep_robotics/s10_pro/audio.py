@@ -15,6 +15,7 @@ from common.vendor_runtime import action_schema, tool
 from domain_bridge import CoreAudioSubscriber
 
 AUDIO_FORMAT = "audio/pcm-16k"
+SUPPORTED_AUDIO_FORMATS = {AUDIO_FORMAT, "pcm_16k_16bit_mono"}
 AUDIO_MESSAGE_TYPE = "audio_msgs/msg/AudioChunk"
 FRAME_BYTES = 1024  # 32 ms of mono PCM S16_LE at 16 kHz.
 FRAME_DURATION_NS = FRAME_BYTES * 1_000_000_000 // (16_000 * 2)
@@ -332,7 +333,7 @@ class S10SpeakerPlugin:
             if item is None:
                 continue
             audio_format, payload = item
-            if (audio_format != AUDIO_FORMAT or not payload or payload == AUDIO_EOF_MAGIC
+            if (audio_format not in SUPPORTED_AUDIO_FORMATS or not payload or payload == AUDIO_EOF_MAGIC
                     or len(payload) % 2 or len(payload) > MAX_AUDIO_FRAME_BYTES):
                 self._dropped += 1
                 continue

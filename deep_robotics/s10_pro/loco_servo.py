@@ -87,6 +87,9 @@ class S10LocoServoPlugin:
                 return {"ok": False, "code": "INVALID_ARGUMENT", "message": "dry_run must be a boolean"}
             if args.get("dry_run") is False and self._dry_run and args.get("confirm") is not True:
                 return {"ok": False, "code": "CONFIRM_REQUIRED", "message": "启用实时底盘控制需要 confirm=true"}
+            if args.get("dry_run") is False and not self._motion_enabled:
+                return {"ok": False, "code": "MOTION_DISABLED",
+                        "message": "S10_MOTION_ENABLED is not set; this driver is read-only"}
             if args.get("dry_run") is True and not self._dry_run and self._running:
                 self._hold()
             if "dry_run" in args: self._dry_run = args["dry_run"]

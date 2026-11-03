@@ -16,12 +16,14 @@ charging and navigation.
 | `mic` | AOS ALSA capture device, local or SSH-forwarded | `/{namespace}/mic/audio`, `audio/pcm-16k` (`audio_msgs/msg/AudioChunk`), for the Perception ASR card |
 | `speaker` | connected `audio/pcm-16k` input topic | plays TTS PCM on the AOS ALSA playback device, locally or over SSH |
 
-The microphone captures mono S16LE at 16 kHz in 32 ms frames. It starts with
-the driver bundle and can also be started/stopped from its card. Connect its
-`/{namespace}/mic/audio` output to the Perception ASR audio input. The speaker
-does not guess a TTS topic: connect a TTS `audio/pcm-16k` output to it, and the
-canvas supplies that topic on `start`. The speaker ignores the TTS end-of-stream
-marker. `S10_AUDIO_MODE=auto` uses local ALSA when the configured AOS address is
+The microphone captures mono S16LE at 16 kHz in 32 ms frames and publishes
+independently of ASR. It starts with the driver bundle and can also be
+started/stopped from its card. Connect its `/{namespace}/mic/audio` output to
+any compatible audio consumer. The speaker subscribes to the topic supplied by
+the canvas and does not require TTS; it accepts both `audio/pcm-16k` and
+`pcm_16k_16bit_mono` AudioChunk markers, including the Agent Core
+`/remote_control/mic` stream. It ignores the audio end-of-stream marker.
+`S10_AUDIO_MODE=auto` uses local ALSA when the configured AOS address is
 bound on this host (onboard deployment), otherwise it runs `arecord`/`aplay` on
 AOS over SSH (external Jetson deployment). The default AOS endpoint is
 `10.21.33.103`, with `user` and the configured S10 SSH password; override with
