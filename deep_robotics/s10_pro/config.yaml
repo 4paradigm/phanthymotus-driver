@@ -54,6 +54,7 @@ camera_topics:
     - "/camera_0/image_raw/compressed"
     - "/usb_camera_1/image_raw"
     - "/usb_camera_1/image_raw/compressed"
+    - "/usb_camera_1/image_raw_0"
   camera_left:
     - "/camera/left/image_raw"
     - "/camera/left/image_raw/compressed"

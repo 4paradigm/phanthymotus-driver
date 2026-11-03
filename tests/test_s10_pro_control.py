@@ -492,6 +492,7 @@ def test_camera_config_has_four_directional_lanes_and_common_aliases():
     for lane, direction, index in zip(lanes, ("rear", "left", "front", "right"), range(4)):
         assert f"/camera/{direction}/color/image_raw" in cameras[lane]
         assert f"/camera_{index}/image_raw" in cameras[lane]
+    assert "/usb_camera_1/image_raw_0" in cameras["camera_rear"]
 
 
 def test_lidar_cloud_probes_previous_pointcloud_topics_but_keeps_map_separate():
@@ -859,7 +860,8 @@ def test_audio_auto_selects_local_aos_or_ssh_transport(monkeypatch):
     monkeypatch.setattr(audio, "_is_local_address", lambda _address: True)
     local = audio._audio_transport({"audio": {"ssh_host": "10.21.33.103"}})
     assert local[0] == "local"
-    assert local[4:] == ("default", "default")
+    assert local[4:] == (
+        "plughw:CARD=Speaker,DEV=0", "plughw:CARD=rockchipes8388,DEV=0")
 
     monkeypatch.setattr(audio, "_is_local_address", lambda _address: False)
     monkeypatch.setenv("S10_AUDIO_SSH_PASSWORD", "'")
@@ -869,13 +871,13 @@ def test_audio_auto_selects_local_aos_or_ssh_transport(monkeypatch):
     mode, host, user, password, capture_device, playback_device = audio._audio_transport({"audio": {}})
     assert (mode, host, user, password) == ("ssh", "10.21.33.103", "user", "'")
     assert (capture_device, playback_device) == (
-        "plughw:CARD=rockchipes8388,DEV=0", "plughw:CARD=rockchipes8388,DEV=0")
-    command, env = audio._audio_launch("arecord", "hw:0,0", mode, host, user, password)
+        "plughw:CARD=Speaker,DEV=0", "plughw:CARD=rockchipes8388,DEV=0")
+    command, env = audio._audio_launch("arecord", capture_device, mode, host, user, password)
     assert command[:3] == ["sshpass", "-e", "ssh"]
     assert command[-2] == "user@10.21.33.103"
     assert "arecord" in command[-1]
     assert env["SSHPASS"] == "'"
-    playback, _ = audio._audio_launch("aplay", "plughw:CARD=rockchipes8388,DEV=0",
+    playback, _ = audio._audio_launch("aplay", playback_device,
                                       mode, host, user, password)
     assert "plughw:CARD=rockchipes8388,DEV=0" in playback[-1]
 

@@ -17,6 +17,8 @@ from domain_bridge import CoreAudioSubscriber
 AUDIO_FORMAT = "audio/pcm-16k"
 SUPPORTED_AUDIO_FORMATS = {AUDIO_FORMAT, "pcm_16k_16bit_mono"}
 AUDIO_MESSAGE_TYPE = "audio_msgs/msg/AudioChunk"
+DEFAULT_CAPTURE_DEVICE = "plughw:CARD=Speaker,DEV=0"
+DEFAULT_PLAYBACK_DEVICE = "plughw:CARD=rockchipes8388,DEV=0"
 FRAME_BYTES = 1024  # 32 ms of mono PCM S16_LE at 16 kHz.
 FRAME_DURATION_NS = FRAME_BYTES * 1_000_000_000 // (16_000 * 2)
 MAX_AUDIO_FRAME_BYTES = 256 * 1024
@@ -80,13 +82,10 @@ def _audio_transport(config):
     selected = "local" if mode == "local" or (mode == "auto" and local) else "ssh"
     capture_device = os.environ.get("S10_AUDIO_CAPTURE_DEVICE") or audio.get("capture_device")
     playback_device = os.environ.get("S10_AUDIO_PLAYBACK_DEVICE") or audio.get("playback_device")
-    if selected == "ssh":
-        remote_default = "plughw:CARD=rockchipes8388,DEV=0"
-        capture_device = remote_default if capture_device in (None, "", "default") else capture_device
-        playback_device = remote_default if playback_device in (None, "", "default") else playback_device
-    else:
-        capture_device = capture_device or "default"
-        playback_device = playback_device or "default"
+    capture_device = (DEFAULT_CAPTURE_DEVICE
+                     if capture_device in (None, "", "default") else capture_device)
+    playback_device = (DEFAULT_PLAYBACK_DEVICE
+                      if playback_device in (None, "", "default") else playback_device)
     return selected, str(host), str(user), str(password), str(capture_device), str(playback_device)
 
 
