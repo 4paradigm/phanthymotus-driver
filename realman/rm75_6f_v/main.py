@@ -12,3 +12,5 @@ if __name__ == "__main__":
         server_name="realman-rm75-6f-v",
         build_plugins=build_plugins,
     )
+
+# TEST ONLY: Fresh RM75 Deploy Approval lifecycle against Controller v130; no runtime change. Do not merge.
