@@ -55,8 +55,12 @@ plugins:
     enabled: true
   loco_state:
     enabled: true
-    hz: 10  # Target rate; actual refresh depends on chassis HTTP latency.
-    request_timeout: 0.5
+    # Fast control feedback reuses one HTTP connection. Human-facing telemetry
+    # is sampled independently so IMU/mileage latency cannot stall odometry.
+    hz: 20
+    imu_hz: 5
+    length_hz: 1
+    request_timeout: 0.2
   loco_servo:
     enabled: true  # Present but inert until canvas/MCP start.
     expected_hz: 10
@@ -65,6 +69,8 @@ plugins:
     linear_acceleration: 0.3  # m/s^2; explicit zero stops immediately.
     angular_acceleration: 2.0  # rad/s^2; bounded steering response, configurable via MCP.
     wz_limit: 1.0  # rad/s; turn commands above this are clamped (not rejected). <= max_wz.
+    # Optional driver-owned response metadata for a planner is supported; keep
+    # it absent until gain/delay/settling have a traceable measurement or spec.
     dry_run: true  # First deployment must inspect commands before enabling real motion.
     # Official Slamware SDK TCP endpoint, distinct from HTTP :1448.
     sdk_host: "192.168.11.1"

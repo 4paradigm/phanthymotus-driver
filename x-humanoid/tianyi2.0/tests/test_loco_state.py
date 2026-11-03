@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-from concurrent.futures import ThreadPoolExecutor
 import copy
 import importlib.util
 import json
@@ -15,7 +14,7 @@ import threading
 import time
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parents[1]))
@@ -281,16 +280,20 @@ class PluginTests(unittest.TestCase):
         interface = parse_interface(info["odom_interface"])
         self.assertEqual(("vx", "vy", "wz"), interface.provides)
         self.assertEqual("unbounded", interface.pose_drift)
+        self.assertEqual(20, interface.rate_hz)
+        self.assertEqual({"stamp_source": "received"}, interface.timing)
+        self.assertNotIn("max_measurement_delay_ms", interface.timing)
         self.assertTrue(interface.usable_for_control)
         self.assertFalse(info["available"])
         self.assertEqual({"state": "idle"}, state.dispatch("stop", {}))
         self.assertIsNone(state.dispatch("unsupported", {}))
 
-    def test_concurrent_read_only_requests(self):
-        client = Client(threading.Barrier(4))
+    def test_fast_feedback_does_not_wait_for_slow_telemetry(self):
+        client = Client()
         state = plugin(client)
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            result = state._poll_once(pool)
+        state._sample_slow("imu", client.get_imu)
+        state._sample_slow("length", client.get_total_odometry)
+        result = state._poll_once()
         self.assertTrue(result["available"])
         self.assertEqual({("odopose", 0.05), ("speed", 0.05), ("imu", 0.05),
                           ("length", 0.05)}, set(client.calls))
@@ -322,6 +325,7 @@ class PluginTests(unittest.TestCase):
         finally:
             state.stop()
         self.assertFalse(state._thread.is_alive())
+        self.assertFalse(state._slow_thread.is_alive())
         self.assertEqual("idle", state.dispatch("info", {})["state"])
         self.assertEqual(2, len(state._node.publishers))
 
@@ -331,6 +335,8 @@ class PluginTests(unittest.TestCase):
             state.start()
             wait_for(lambda: len(state._odom_pub.messages) >= 1)
             state.stop()
+            self.assertFalse(state._thread.is_alive())
+            self.assertFalse(state._slow_thread.is_alive())
             count = len(state._odom_pub.messages)
             state.dispatch("start", {})
             wait_for(lambda: len(state._odom_pub.messages) > count)
@@ -416,39 +422,106 @@ class PluginTests(unittest.TestCase):
 class ClientTests(unittest.TestCase):
     def test_api_paths_methods_and_request_deadlines(self):
         client = STATE._LocoStateClient("http://chassis/")
-        with patch.object(STATE.urllib.request, "urlopen") as urlopen:
-            urlopen.return_value.__enter__.return_value.read.return_value = b'{"vx":0}'
+        with patch.object(STATE.http.client, "HTTPConnection") as factory:
+            connection = factory.return_value
+            connection.sock = None
+            response = connection.getresponse.return_value
+            response.status, response.will_close = 200, False
+            response.read.return_value = b'{"vx":0}'
             for method, path in (
                 (client.get_odometry_pose, "/api/core/slam/v1/localization/odopose"),
                 (client.get_speed, "/api/core/motion/v1/speed"),
                 (client.get_imu, "/api/core/slam/v1/imu"),
             ):
                 self.assertEqual({"vx": 0}, method(timeout=0.2))
-                request = urlopen.call_args.args[0]
-                self.assertEqual("http://chassis" + path, request.full_url)
-                self.assertEqual("GET", request.get_method())
-                self.assertIsNone(request.data)
-                self.assertEqual(0.2, urlopen.call_args.kwargs["timeout"])
+                self.assertEqual(("GET", path), connection.request.call_args.args)
+            factory.assert_called_once_with("chassis", 80, timeout=0.2)
+            client.close()
+            connection.close.assert_called_once()
+
+    def test_fast_and_slow_workers_use_separate_persistent_connections(self):
+        client = STATE._LocoStateClient("http://chassis")
+        connections = []
+
+        def make_connection(*_args, **_kwargs):
+            connection = Mock()
+            connection.sock = None
+            response = connection.getresponse.return_value
+            response.status, response.will_close = 200, False
+            response.read.return_value = b'{"vx":0}'
+            connections.append(connection)
+            return connection
+
+        barrier = threading.Barrier(2)
+        results = []
+
+        def read(method):
+            barrier.wait()
+            results.append(method(timeout=0.2))
+            results.append(method(timeout=0.2))
+
+        with patch.object(STATE.http.client, "HTTPConnection",
+                          side_effect=make_connection) as factory:
+            fast = threading.Thread(target=read, args=(client.get_speed,))
+            slow = threading.Thread(target=read, args=(client.get_imu,))
+            fast.start()
+            slow.start()
+            fast.join(1)
+            slow.join(1)
+            self.assertFalse(fast.is_alive() or slow.is_alive())
+            self.assertEqual(2, factory.call_count)
+            self.assertEqual(4, len(results))
+            self.assertEqual([2, 2], sorted(c.request.call_count for c in connections))
+            client.close()
+            for connection in connections:
+                connection.close.assert_called_once()
+
+    def test_broken_reused_socket_is_discarded_and_reconnected(self):
+        client = STATE._LocoStateClient("http://chassis")
+        first, second = Mock(), Mock()
+        first.sock = None
+        second.sock = None
+        for connection in (first, second):
+            response = connection.getresponse.return_value
+            response.status, response.will_close = 200, False
+            response.read.return_value = b'{"vx":0}'
+
+        with patch.object(STATE.http.client, "HTTPConnection",
+                          side_effect=[first, second]) as factory:
+            self.assertEqual({"vx": 0}, client.get_speed(timeout=0.2))
+            first.sock = types.SimpleNamespace(
+                settimeout=Mock(side_effect=OSError("socket is closed")))
+            self.assertEqual({"vx": 0}, client.get_speed(timeout=0.2))
+
+        self.assertEqual(2, factory.call_count)
+        first.close.assert_called_once()
+        second.request.assert_called_once()
 
     def test_bad_http_responses_become_current_errors(self):
         client = STATE._LocoStateClient("http://chassis")
-        with patch.object(STATE.urllib.request, "urlopen") as urlopen:
+        with patch.object(STATE.http.client, "HTTPConnection") as factory:
+            connection = factory.return_value
+            connection.sock = None
+            response = connection.getresponse.return_value
+            response.status, response.will_close = 200, False
             for body in (b"", b"broken-json", b"[]", b"false"):
                 with self.subTest(body=body):
-                    urlopen.return_value.__enter__.return_value.read.return_value = body
+                    response.read.return_value = body
                     self.assertIn("error", client.get_speed(timeout=0.2))
-            urlopen.side_effect = TimeoutError("timed out")
+            connection.getresponse.side_effect = TimeoutError("timed out")
             self.assertEqual({"error": "timed out"}, client.get_speed(timeout=0.2))
 
     def test_total_odometry_uses_the_documented_scalar_endpoint(self):
         client = STATE._LocoStateClient("http://chassis")
-        with patch.object(STATE.urllib.request, "urlopen") as urlopen:
-            response = urlopen.return_value.__enter__.return_value
+        with patch.object(STATE.http.client, "HTTPConnection") as factory:
+            connection = factory.return_value
+            connection.sock = None
+            response = connection.getresponse.return_value
+            response.status, response.will_close = 200, False
             response.read.return_value = b"123.4"
             self.assertEqual({"length": 123.4}, client.get_total_odometry(timeout=0.2))
-            self.assertEqual("http://chassis/api/core/statistics/v1/odometry",
-                             urlopen.call_args.args[0].full_url)
-            self.assertEqual("GET", urlopen.call_args.args[0].get_method())
+            self.assertEqual(("GET", "/api/core/statistics/v1/odometry"),
+                             connection.request.call_args.args)
             for body in (b"null", b"false", b"-1", b"NaN", b"[]", b"{}"):
                 response.read.return_value = body
                 self.assertIn("error", client.get_total_odometry(timeout=0.2))
