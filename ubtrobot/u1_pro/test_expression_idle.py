@@ -419,16 +419,57 @@ class ExpressionIdleTests(unittest.TestCase):
         self.assertEqual(self.nodes.string_calls, [])
         self.assertEqual(self.nodes.interrupts, 0)
 
-    def test_enabling_visual_during_cycle_stops_scheduling_without_vendor_exit(self):
+    def test_enabling_visual_during_cycle_restores_vendor_idle_before_releasing_ownership(self):
         self.start_loop()
         self.wait_for(lambda: self.audio._active is not None)
         self.nodes.get_system_enabled = mock.Mock(return_value={"enabled": True})
         self.finish_active()
-        self.wait_for(lambda: not self.loop.info()["enabled"])
+        self.wait_for(lambda: not self.loop.info()["smart_control_active"])
         self.assertEqual(self.loop.info()["state"], "vendor_controlled")
         self.plugin.dispatch("stop", {})
+        self.assertEqual(self.control.set_enabled.call_args_list, [mock.call(False), mock.call(True)])
+        self.assertEqual(self.nodes.interrupts, 0)
+
+    def test_visual_handoff_failure_keeps_ownership_and_idle_stop_can_retry(self):
+        self.start_loop()
+        self.wait_for(lambda: self.audio._active is not None)
+        self.control.set_enabled.side_effect = RuntimeError("restore failed")
+        self.nodes.get_system_enabled = mock.Mock(return_value={"enabled": True})
+        self.finish_active()
+        self.wait_for(lambda: self.loop.info()["state"] == "error")
+        self.loop._end_thread.join(2)
+        self.assertTrue(self.loop.info()["smart_control_active"])
+        self.assertIn("restore failed", self.loop.info()["last_error"])
+        self.control.set_enabled.side_effect = lambda enabled: {"ok": True, "enabled": enabled}
+        result = self.plugin.dispatch("idle_stop", {"action_id": "retry-restore"})
+        self.assertEqual(result["state"], "restoring")
+        self.loop._end_thread.join(2)
+        self.assertFalse(self.loop.info()["smart_control_active"])
+        self.assertEqual(self.control.set_enabled.call_args.args, (True,))
+        self.assertEqual(self.nodes.interrupts, 0)
+
+    def test_visual_handoff_waits_for_accepted_motion_without_global_interrupt(self):
+        self.start_loop()
+        self.wait_for(lambda: self.audio._active is not None)
+        self.nodes.get_system_enabled = mock.Mock(return_value={"enabled": True})
+        self.wait_for(lambda: self.loop.info()["restoring_vendor_idle"])
+        self.assertTrue(self.loop.info()["smart_control_active"])
         self.control.set_enabled.assert_called_once_with(False)
         self.assertEqual(self.nodes.interrupts, 0)
+        self.finish_active()
+        self.wait_for(lambda: not self.loop.info()["smart_control_active"])
+        self.assertEqual(self.loop.info()["state"], "vendor_controlled")
+        self.control.set_enabled.assert_called_with(True)
+
+    def test_visual_handoff_does_not_release_ownership_on_unconfirmed_restore(self):
+        self.start_loop()
+        self.wait_for(lambda: self.audio._active is not None)
+        self.control.set_enabled.side_effect = None
+        self.control.set_enabled.return_value = {"ok": True, "enabled": False}
+        self.nodes.get_system_enabled = mock.Mock(return_value={"enabled": True})
+        self.finish_active()
+        self.wait_for(lambda: self.loop.info()["state"] == "error")
+        self.assertTrue(self.loop.info()["smart_control_active"])
 
     def test_visual_enable_before_native_restore_prevents_configuration_write(self):
         self.nodes.get_system_enabled = mock.Mock(return_value={"enabled": True})

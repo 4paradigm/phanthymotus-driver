@@ -2152,7 +2152,7 @@ class ExpressionPlugin:
     def stop(self):
         self.idle_loop.stop()
         self.running = False
-        if self.audio.visual_enabled():
+        if self.audio.visual_enabled() and not self.idle_loop.info()["smart_control_active"]:
             return {"state": "idle", "skipped": True, "reason": "visual_behavior_enabled"}
         result = self.audio.stop()
         # Bundle shutdown must restore a session it owns before ROS nodes close.
@@ -2171,6 +2171,10 @@ class ExpressionPlugin:
             if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", action_id):
                 raise ValueError("expression smart control requires a valid action_id")
             if self.audio.visual_enabled():
+                if self.idle_loop.info()["smart_control_active"]:
+                    self.running = False
+                    self._stop_accepted = action == "stop"
+                    return self.idle_loop.end(action_id, accept_only=action == "stop")
                 self.idle_loop.stop()
                 self.running = action in ("start", "idle_start")
                 self._stop_accepted = not self.running

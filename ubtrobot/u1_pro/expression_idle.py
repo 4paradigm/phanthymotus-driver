@@ -87,7 +87,7 @@ class ExpressionIdleLoop:
                     "message": "已停止安排新的待机表情，已接收的单次动作允许执行完成。",
                     "idle_loop": self._snapshot()}
 
-    def end(self, action_id, *, interrupt=False, shutdown=False, accept_only=False):
+    def end(self, action_id, *, interrupt=False, shutdown=False, accept_only=False, visual_handoff=False):
         """End smart control and restore native idle, reporting completion via ACP."""
         with self._lock:
             if self.control is None:
@@ -105,7 +105,7 @@ class ExpressionIdleLoop:
             self._enabled = False
             self._state = "restoring"
             self._managed = True  # A failed/uncertain restoration must remain retryable.
-            worker = threading.Thread(target=self._end, args=(action_id, self._thread, interrupt, accept_only),
+            worker = threading.Thread(target=self._end, args=(action_id, self._thread, interrupt, accept_only, visual_handoff),
                                       name="u1-expression-restore", daemon=True)
             self._end_thread = worker
             try:
@@ -128,14 +128,16 @@ class ExpressionIdleLoop:
                 "message": "已暂停周期调度，正在等待当前任务结束并恢复原厂待机开关。"}
 
     def _set_native(self, enabled):
-        if self.audio.visual_enabled():
+        with self._lock:
+            owned = self._managed
+        if self.audio.visual_enabled() and not (enabled and owned):
             raise RuntimeError("Visual behavior is enabled; vendor idle preference was not changed")
         result = self.control.set_enabled(enabled)
         if not isinstance(result, dict) or result.get("ok") is not True or result.get("enabled") is not enabled:
             raise RuntimeError("Vendor idle preference change was not confirmed")
         return result
 
-    def _end(self, action_id, loop_thread, interrupt, accept_only=False):
+    def _end(self, action_id, loop_thread, interrupt, accept_only=False, visual_handoff=False):
         status, result = "error", {}
         try:
             if interrupt:
@@ -164,7 +166,7 @@ class ExpressionIdleLoop:
             self._set_native(True)
             with self._lock:
                 self._managed = False
-                self._state = "stopped"
+                self._state = "vendor_controlled" if visual_handoff else "stopped"
                 self._last_error = None
             status = "completed"
             result = {"state": "stopped", "vendor_idle_enabled": True,
@@ -181,7 +183,7 @@ class ExpressionIdleLoop:
                 with self.audio._lock:
                     self.audio._native_restoring = False
                 result["idle_loop"] = self._snapshot()
-        if not accept_only:
+        if not accept_only and not visual_handoff:
             self.notify(action_id, status, result)
         elif status == "error":
             print(f"[U1 expression idle] background cleanup failed: {result['message']}")
@@ -213,9 +215,7 @@ class ExpressionIdleLoop:
             previous = None
             while not stop.wait(self._rng.uniform(self.GAP_MIN, self.GAP_MAX)):
                 if self.audio.visual_enabled():
-                    self.stop()
-                    with self._lock:
-                        self._state = "vendor_controlled"
+                    self.end("expression-visual-" + str(uuid.uuid4()), visual_handoff=True)
                     return
                 with self.audio._lock:
                     busy = (self.audio._active is not None or self.audio._handoff is not None
@@ -292,6 +292,9 @@ class ExpressionIdleLoop:
             self._last_expression = name
         deadline = time.monotonic() + self.ACTION_TIMEOUT
         while not stop.is_set():
+            if self.audio.visual_enabled():
+                self.end("expression-visual-" + str(uuid.uuid4()), visual_handoff=True)
+                return "stopped"
             if done.wait(self.POLL_INTERVAL):
                 if stop.is_set():
                     return "stopped"
