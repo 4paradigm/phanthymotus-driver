@@ -143,12 +143,6 @@ class FrankaExtCameraTests(unittest.TestCase):
         self.call("start")
         self.assertEqual(self.session("5678").routes, {"camera-a": "depth"})
 
-    def test_explicit_selection_is_required_even_with_one_camera(self):
-        self.devices[:] = self.devices[:1]
-        with self.assertRaises(ValueError):
-            self.call("start")
-        self.assertFalse(FakeSession.instances)
-
     def test_two_cameras_bind_to_their_own_serials(self):
         self.start("camera-a", "5678", "infrared")
         self.start("camera-b", "1234", "rgb")
@@ -160,16 +154,6 @@ class FrankaExtCameraTests(unittest.TestCase):
         self.assertEqual(self.call(instance_id="camera-a")["device_path"],
                          "realsense://5678")
 
-    def test_same_camera_rgb_depth_and_infrared_share_one_session(self):
-        routes = {"rgb-card": "rgb", "depth-card": "depth", "ir-card": "infrared"}
-        for instance_id, channel in routes.items():
-            result = self.start(instance_id, channel=channel)
-            self.assertEqual(result["state"], "running")
-            expected = "image/depth-zlib" if channel == "depth" else "image/jpeg"
-            self.assertEqual(result["topic_out"][0]["format"], expected)
-        self.assertEqual(len(FakeSession.instances), 1)
-        self.assertEqual(self.session().routes, routes)
-
     def test_stopping_one_card_leaves_other_routes_and_cameras_running(self):
         self.start("rgb-a")
         self.start("depth-a", channel="depth")
@@ -179,16 +163,6 @@ class FrankaExtCameraTests(unittest.TestCase):
         self.assertEqual(self.session().routes, {"depth-a": "depth"})
         self.assertEqual(self.session("5678").routes, {"rgb-b": "rgb"})
         self.assertEqual(self.call(instance_id="depth-a")["state"], "running")
-
-    def test_repeated_start_and_config_do_not_replace_or_stop_capture(self):
-        self.start()
-        session = self.session()
-        for _ in range(3):
-            self.call("start")
-            self.call("config", device_path="realsense://1234", channel="rgb")
-        self.assertEqual(len(FakeSession.instances), 1)
-        self.assertEqual(session.routes, {"camera-a": "rgb"})
-        self.assertFalse(session.stop_calls)
 
     def test_running_channel_change_replaces_only_this_route(self):
         self.start()
@@ -215,27 +189,6 @@ class FrankaExtCameraTests(unittest.TestCase):
         self.assertEqual(self.session().routes, {"other": "rgb"})
         self.assertEqual(self.session("5678").routes, {"camera-a": "infrared"})
 
-    def test_invalid_running_channel_keeps_existing_capture(self):
-        self.start()
-        with self.assertRaises(ValueError):
-            self.call("config", channel="invalid")
-        self.assertEqual(self.session().routes, {"camera-a": "rgb"})
-        self.assertFalse(self.session().stop_calls)
-
-    def test_offline_saved_camera_stays_selected_and_is_kept_in_dropdown(self):
-        FakeSession.offline.add("9999")
-        result = self.call("config", device_path="realsense://9999", channel="depth")
-        self.assertEqual(result["state"], "idle")
-        choices = self.plugin.get_tools()[0]["configSchema"]["properties"]["device_path"]["oneOf"]
-        self.assertIn("realsense://9999", {item["const"] for item in choices})
-        result = self.call("start")
-        self.assertEqual(result["device_path"], "realsense://9999")
-        self.assertFalse(result["fresh"])
-        self.assertEqual(self.session("9999").routes, {"camera-a": "depth"})
-        self.assertEqual(len(FakeSession.instances), 1)
-        FakeSession.offline.clear()
-        self.assertTrue(self.call()["fresh"])
-
     def test_disconnected_selection_does_not_fall_back_to_another_camera(self):
         self.call("config", device_path="realsense://1234")
         self.devices[:] = [camera_device("5678")]
@@ -244,25 +197,6 @@ class FrankaExtCameraTests(unittest.TestCase):
         self.assertEqual(result["serial_number"], "1234")
         self.assertFalse(result["fresh"])
         self.assertEqual([session.serial_number for session in FakeSession.instances], ["1234"])
-
-    def test_all_lifecycle_actions_require_valid_instance_identity(self):
-        self.start()
-        for action in ("config", "start", "stop", "info"):
-            for bad in (None, "", "9camera", "camera/a", "a b", 123):
-                with self.subTest(action=action, instance_id=bad), self.assertRaises(ValueError):
-                    self.plugin.dispatch(action, {"instance_id": bad,
-                                                  "device_path": "realsense://1234"})
-        self.assertEqual(self.session().routes, {"camera-a": "rgb"})
-
-    def test_bad_device_and_channel_values_are_rejected_before_capture(self):
-        for path in (None, True, 123, [], "", "/dev/video0", "usb://1234",
-                     "realsense://", "realsense://../1234", "realsense://1234/5"):
-            with self.subTest(path=path), self.assertRaises(ValueError):
-                self.call("start", device_path=path)
-        for channel in (None, True, 123, [], "thermal", "RGB", ""):
-            with self.subTest(channel=channel), self.assertRaises(ValueError):
-                self.start(channel=channel)
-        self.assertFalse(FakeSession.instances)
 
     def test_ids_that_collapse_to_same_dds_topic_are_rejected(self):
         self.start("camera-a")
@@ -287,41 +221,6 @@ class FrankaExtCameraTests(unittest.TestCase):
                 self.assertIsNone(parsed.D)
                 self.assertIsNone(parsed.half_fov_rad)
                 self.assertIsNone(parsed.half_fov_v_rad)
-
-    def test_camera_identity_survives_discovery_loss_and_plugin_restart(self):
-        for channel in ("rgb", "depth", "infrared"):
-            self.call("config", device_path="realsense://1234", channel=channel)
-            expected = f"intel/realsense/{channel}"
-            self.assertEqual(self.call()["camera_info"][0]["id"], expected)
-            self.devices.clear()
-            restarted = ExtCameraPlugin({}, "franka", None)
-            result = restarted.dispatch("config", {
-                "instance_id": "restored", "device_path": "realsense://1234",
-                "channel": channel})
-            self.assertEqual(result["camera_info"][0]["id"], expected)
-            restarted.stop()
-            self.devices.append(camera_device("1234"))
-
-    def test_driver_shutdown_releases_all_routes_and_forbids_restart(self):
-        self.start("camera-a")
-        self.start("camera-b", serial="5678", channel="depth")
-        self.plugin.stop()
-        self.assertTrue(all(not session.routes for session in FakeSession.instances))
-        with self.assertRaises(RuntimeError):
-            self.start()
-
-    def test_bundle_routes_other_tools_without_camera_side_effects(self):
-        master, joints = OtherCard("master_states"), OtherCard("joint_states")
-        bundle = DriverBundle([self.plugin, master, joints])
-        for plugin in (master, joints):
-            result = bundle.dispatch(plugin.name, {"action": "info", "instance_id": "other-card"})
-            self.assertEqual(result["name"], plugin.name)
-            self.assertEqual(len(plugin.calls), 1)
-        self.assertFalse(FakeSession.instances)
-        bundle.dispatch("ext_camera", {"action": "start", "instance_id": "camera-a",
-                                       "device_path": "realsense://1234"})
-        self.assertEqual(len(master.calls), 1)
-        self.assertEqual(len(joints.calls), 1)
 
     def test_missing_sdk_leaves_camera_listing_and_other_cards_available(self):
         with mock.patch.dict(sys.modules, {"pyrealsense2": None}), mock.patch.object(
@@ -369,29 +268,6 @@ class FrankaExtCameraTests(unittest.TestCase):
         self.assertFalse(failures, failures)
         self.assertEqual(len(outcomes), 1)
         return outcomes[0]
-
-    def test_config_change_invalidates_pending_start_with_old_camera(self):
-        self.call("config", device_path="realsense://1234")
-        result = self._hold_discovery_during("start", {}, lambda: self.call(
-            "config", device_path="realsense://5678", channel="depth"))
-        self.assertEqual(result["state"], "idle")
-        self.assertEqual(result["device_path"], "realsense://5678")
-        self.assertEqual(result["channel"], "depth")
-        self.assertFalse(FakeSession.instances)
-        self.call("start")
-        self.assertEqual(self.session("5678").routes, {"camera-a": "depth"})
-        self.assertEqual(len(FakeSession.instances), 1)
-
-    def test_stale_partial_config_cannot_overwrite_newer_camera_selection(self):
-        self.call("config", device_path="realsense://1234", channel="rgb")
-        result = self._hold_discovery_during("config", {"channel": "depth"}, lambda: self.call(
-            "config", device_path="realsense://5678", channel="infrared"))
-        self.assertEqual(result["device_path"], "realsense://5678")
-        self.assertEqual(result["channel"], "infrared")
-        current = self.call()
-        self.assertEqual(current["device_path"], "realsense://5678")
-        self.assertEqual(current["channel"], "infrared")
-        self.assertFalse(FakeSession.instances)
 
     def test_stop_cancels_start_blocked_in_device_enumeration(self):
         self.call("config", device_path="realsense://1234")

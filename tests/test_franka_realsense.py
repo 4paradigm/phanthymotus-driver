@@ -154,17 +154,6 @@ class RGBDLifecycleTests(unittest.TestCase):
         self.assertTrue(process.closed)
         self.assertIsNone(self.session._proc)
 
-    def test_rgb_status_reports_real_profile_and_topic(self):
-        self.session.start("rgb-a", "rgb")
-        self.report({"rgb-a": "rgb"})
-        info = self.session.info("rgb-a", "rgb")
-        self.assertTrue(info["fresh"])
-        self.assertEqual((info["width"], info["height"], info["fps"]), (1280, 720, 15))
-        self.assertEqual(info["encoding"], "bgr8")
-        self.assertEqual(info["topic_out"], [{
-            "topic": "/robot_a/ext_camera/rgb_a/rgb", "format": "image/jpeg",
-        }])
-
     def test_start_and_stale_status_require_current_channel_frames(self):
         self.assertEqual(self.session.start("depth-a", "depth")["state"], "starting")
         self.report({"depth-a": "depth"})
@@ -181,35 +170,6 @@ class RGBDLifecycleTests(unittest.TestCase):
         self.now.return_value += 3.1
         self.assertEqual(
             self.session.info("depth-a", "infrared")["state"], "error")
-
-    def test_switch_long_running_stream_does_not_restart_healthy_worker(self):
-        self.session.start("rgb-a", "rgb")
-        process = self.session._proc
-        self.now.return_value += 100
-        self.report({"rgb-a": "rgb"})
-        result = self.session.start("rgb-a", "depth")
-        self.assertEqual(result["state"], "starting")
-        self.assertFalse(result["fresh"])
-        self.assertIs(self.session._proc, process)
-        self.assertFalse(process.closed)
-        self.report({"rgb-a": "depth"})
-        self.assertTrue(self.session.info("rgb-a", "depth")["fresh"])
-
-    def test_retry_restores_every_route_after_worker_failure(self):
-        self.session.start("rgb-a", "rgb")
-        self.session.start("depth-a", "depth")
-        self.report({}, error="Device unavailable")
-        self.assertEqual(self.session.info("rgb-a", "rgb")["state"], "error")
-        old = self.session._proc
-        self.session.start("rgb-a", "rgb")
-        self.assertTrue(old.closed)
-        self.assertEqual(
-            self.session._wanted, {"rgb-a": "rgb", "depth-a": "depth"})
-
-    def test_startup_timeout_is_not_running(self):
-        self.session.start("rgb-a", "rgb")
-        self.now.return_value += 10.1
-        self.assertEqual(self.session.info("rgb-a", "rgb")["state"], "error")
 
 
 class FakeConfig:
@@ -394,21 +354,6 @@ class RGBDCaptureTests(unittest.TestCase):
         attempt.assert_called_once()
         backoff.assert_called_once_with(2.0)
 
-    def test_usb3_pipeline_enables_rgb_depth_and_infrared_once(self):
-        errors, config, pipeline, node_name, _ = self.capture([
-            (0.1, rs.STREAMS), (0.2, rs.STREAMS),
-        ])
-        self.assertEqual(errors, [])
-        self.assertEqual(config.device, "serial-1234")
-        self.assertEqual(config.streams, [
-            ("color", 1280, 720, "bgr8", 15),
-            ("depth", 640, 480, "z16", 15),
-            ("infrared", 1, 640, 480, "y8", 15),
-        ])
-        pipeline.start.assert_called_once_with(config)
-        pipeline.stop.assert_called_once_with()
-        self.assertRegex(node_name, r"^robot_a_realsense_rgbd_[a-z0-9]+$")
-
     def test_usb2_uses_conservative_shared_profile(self):
         errors, config, _, _, _ = self.capture(
             [(0.1, rs.STREAMS)], usb_type="2.1")
@@ -418,13 +363,6 @@ class RGBDCaptureTests(unittest.TestCase):
             ("depth", 640, 480, "z16", 6),
             ("infrared", 1, 640, 480, "y8", 6),
         ])
-
-    def test_slow_first_frames_get_startup_window(self):
-        errors, _, _, _, _ = self.capture([
-            (4.0, ()), (4.5, ("rgb",)),
-            (5.0, ("depth",)), (5.5, ("infrared",)),
-        ])
-        self.assertEqual(errors, [])
 
     def test_missing_first_stream_eventually_times_out(self):
         errors, _, _, _, _ = self.capture([

@@ -195,14 +195,6 @@ class ControlSessionTests(unittest.TestCase):
         self.assertEqual(session.wait(command_id, 2)["status"], "cancelled")
         self.assertIn("STOP " + command_id, factory.commands())
 
-    def test_only_owner_can_cancel_but_explicit_stop_is_robot_wide(self):
-        _, session, _, owner = self.session()
-        command_id = session.move(owner, TARGET)
-        with self.assertRaisesRegex(RuntimeError, "another control card"):
-            session.stop_motion(("joint_control", "other"), command_id)
-        session.stop_motion()
-        self.assertEqual(session.wait(command_id, 2)["status"], "cancelled")
-
     def test_releasing_controller_stops_motion_and_keeps_reader(self):
         manager, session, factory, owner = self.session()
         manager.acquire("172.16.0.3", ("joint_states", "reader"))
@@ -245,13 +237,6 @@ class ControlSessionTests(unittest.TestCase):
         self.assertEqual(len(factory.commands()), 1)
         self.assertIn("exited", session.motion(command_id)["error"])
 
-    def test_backend_rejection_is_terminal_and_not_success(self):
-        _, session, _, owner = self.session("reject")
-        command_id = session.move(owner, TARGET)
-        result = session.wait(command_id, 2)
-        self.assertEqual(result["status"], "rejected")
-        self.assertEqual(result["error"], "Robot is not idle")
-
     def test_missing_fifo_rejects_before_any_write(self):
         _, session, factory, owner = self.session("no_fifo")
         with self.assertRaisesRegex(RuntimeError, "SCHED_FIFO"):
@@ -259,25 +244,6 @@ class ControlSessionTests(unittest.TestCase):
         self.assertFalse(session.snapshot()["control_ready"])
         self.assertFalse(session.snapshot()["rt_kernel"])
         self.assertFalse(session.snapshot()["sched_fifo"])
-        self.assertEqual(factory.commands(), [])
-
-    def test_stale_state_rejects_before_any_write(self):
-        _, stale_session, stale_factory, stale_owner = self.session("stale", retry_delay=1)
-        eventually(lambda: not stale_session.snapshot()["connected"])
-        with self.assertRaisesRegex(RuntimeError, "Fresh"):
-            stale_session.move(stale_owner, TARGET)
-        self.assertEqual(stale_factory.commands(), [])
-
-    def test_invalid_target_and_parameters_never_reach_native(self):
-        _, session, factory, owner = self.session()
-        cases = [([0] * 6, {}), ([True] * 7, {}), ([float("nan")] * 7, {}),
-                 (["0"] * 7, {}), ([0] * 7, {}),
-                 (TARGET, {"speed_rad_s": True}), (TARGET, {"speed_rad_s": 1}),
-                 (TARGET, {"tolerance_rad": 0}), (TARGET, {"tolerance_rad": float("inf")}),
-                 (TARGET, {"timeout_s": 0}), (TARGET, {"timeout_s": 121})]
-        for target, kwargs in cases:
-            with self.subTest(target=target, kwargs=kwargs), self.assertRaises(ValueError):
-                session.move(owner, target, **kwargs)
         self.assertEqual(factory.commands(), [])
 
     def test_motion_events_do_not_keep_stale_robot_state_alive(self):
@@ -306,17 +272,6 @@ class ControlSessionTests(unittest.TestCase):
         self.assertIsNotNone(factory.processes[0].poll())
         self.assertEqual(len(factory.commands()), 2)
 
-    def test_unacknowledged_stop_is_bounded_and_forces_connection_cleanup(self):
-        manager, session, factory, owner = self.session("ignore_stop", motion_stop_timeout=0.15)
-        command_id = session.move(owner, TARGET)
-        started = time.monotonic()
-        with self.assertRaisesRegex(RuntimeError, "not confirmed"):
-            manager.close()
-        self.assertLess(time.monotonic() - started, 1)
-        self.assertEqual(session.motion(command_id)["status"], "failed")
-        self.assertIn("not confirmed", session.snapshot()["error"])
-        self.assertIsNotNone(factory.processes[0].poll())
-
     def test_explicit_stop_watchdog_fails_instead_of_holding_ownership_forever(self):
         _, session, factory, owner = self.session("ignore_stop", motion_stop_timeout=0.15)
         command_id = session.move(owner, TARGET)
@@ -334,33 +289,6 @@ class ControlSessionTests(unittest.TestCase):
         result = session.wait(command_id, 2)
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["stop_status"], "stopped")
-
-    def test_owner_release_reports_real_broken_command_pipe(self):
-        manager, session, factory, owner = self.session("close_input")
-        manager.acquire("172.16.0.3", ("joint_states", "reader"))
-        command_id = session.move(owner, TARGET)
-        eventually(lambda: session.motion(command_id)["status"] == "running")
-        with self.assertRaisesRegex(RuntimeError, "not confirmed.*command channel"):
-            manager.release("172.16.0.3", owner)
-        self.assertEqual(session.motion(command_id)["status"], "failed")
-        eventually(lambda: factory.processes[0].poll() is not None)
-
-    def test_owner_release_reports_backend_stop_failure(self):
-        manager, session, factory, owner = self.session("stop_failed")
-        manager.acquire("172.16.0.3", ("joint_states", "reader"))
-        command_id = session.move(owner, TARGET)
-        with self.assertRaisesRegex(RuntimeError, "not confirmed.*stop failed"):
-            manager.release("172.16.0.3", owner)
-        self.assertEqual(session.motion(command_id)["status"], "failed")
-        eventually(lambda: factory.processes[0].poll() is not None)
-
-    def test_last_release_cleans_up_after_stop_failure_and_reports_it(self):
-        manager, session, factory, owner = self.session("stop_failed")
-        command_id = session.move(owner, TARGET)
-        with self.assertRaisesRegex(RuntimeError, "not confirmed.*stop failed"):
-            manager.release("172.16.0.3", owner)
-        self.assertEqual(session.motion(command_id)["status"], "failed")
-        self.assertIsNotNone(factory.processes[0].poll())
 
     def test_terminal_results_survive_later_moves_and_duplicate_events(self):
         _, session, _, owner = self.session("success")

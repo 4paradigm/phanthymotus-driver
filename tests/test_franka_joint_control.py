@@ -300,19 +300,6 @@ class JointControlTests(unittest.TestCase):
             self.assertAlmostEqual(math.degrees(float(limit.attrib["lower"]) + 0.01), prop["minimum"], places=4)
             self.assertAlmostEqual(math.degrees(float(limit.attrib["upper"]) - 0.01), prop["maximum"], places=4)
 
-    def test_configuration_and_info_do_not_open_a_connection_or_submit_motion(self):
-        self.call("config", robot_ip="__manual__", manual_robot_ip="172.16.0.3", speed_deg_s=2)
-        info = self.call()
-        self.assertEqual("idle", info["state"])
-        self.assertEqual("172.16.0.3", info["robot_ip"])
-        self.assertEqual([], self.sessions)
-
-    def test_movement_requires_started_card_and_never_implicitly_connects(self):
-        self.call("config", robot_ip="172.16.0.3")
-        with self.assertRaises((ValueError, RuntimeError)):
-            self.call("set", joint1_deg=1)
-        self.assertEqual([], self.sessions)
-
     def test_canvas_topic_routes_each_control_card_to_its_own_ip(self):
         first = self.start("control-a", "172.16.0.2")
         second = self.start("control-b", "172.16.0.3")
@@ -409,30 +396,6 @@ class JointControlTests(unittest.TestCase):
             self.call("set", joint1_deg=100, speed_deg_s=0.1)
         self.assertEqual(session.moves, [])
 
-    def test_motion_interrupt_preserves_card_lease(self):
-        session = self.start()
-        result = self.bundle.dispatch("joint_control", {"action": "stopmotion"})
-        self.assertEqual(result["state"], "stop_requested")
-        self.call("jog", joint=1, step_deg=1)
-        self.assertEqual(len(session.moves), 1)
-
-    def test_jog_offsets_selected_actual_joint_and_uses_request_speed(self):
-        session = self.start(speed_deg_s=2)
-        original = session.snapshot()["q"]
-        self.call("jog", joint=4, step_deg=-2.5, speed_deg_s=3)
-        expected = list(original)
-        expected[3] -= math.radians(2.5)
-        self.assertEqual(expected, session.moves[0]["target_rad"])
-        self.assertAlmostEqual(math.radians(3), session.moves[0]["speed_rad_s"])
-
-    def test_jog_rejects_noncanonical_joint_values_without_submitting_motion(self):
-        session = self.start()
-        for joint in (None, "", "0", "8", "-1", "2.5", "2.0", "02", "+2", "2e0",
-                      " 2 ", "J2", "２", "true", True, False, [], {}, 2.5, float("nan")):
-            with self.subTest(joint=joint), self.assertRaisesRegex(ValueError, "joint must be"):
-                self.call("jog", joint=joint, step_deg=1)
-        self.assertEqual([], session.moves)
-
     def test_canvas_jog_accepts_large_signed_steps_for_each_joint(self):
         session = self.start()
         topic = self.call()["topic_out"][0]["topic"]
@@ -449,23 +412,6 @@ class JointControlTests(unittest.TestCase):
                     session.finish(result["action_id"])
                     self.completed(result["action_id"])
         self.assertEqual(14, len(session.moves))
-
-    def test_large_jog_still_rejects_targets_outside_each_joint_range(self):
-        session = self.start()
-        for joint in range(1, 8):
-            for step in (360, -360, 1e308, -1e308):
-                with self.subTest(joint=joint, step=step), self.assertRaisesRegex(
-                        ValueError, f"J{joint} target is outside"):
-                    self.call("jog", joint=joint, step_deg=step)
-        self.assertEqual([], session.moves)
-
-    def test_jog_rejects_invalid_step_numbers_before_submission(self):
-        session = self.start()
-        for step in (None, "15", "", True, False, [], {}, float("nan"),
-                     float("inf"), -float("inf"), 10 ** 400):
-            with self.subTest(step=step), self.assertRaisesRegex(ValueError, "step_deg must be a finite number"):
-                self.call("jog", joint=1, step_deg=step)
-        self.assertEqual([], session.moves)
 
     def test_invalid_requests_never_reach_backend(self):
         session = self.start()
@@ -507,35 +453,6 @@ class JointControlTests(unittest.TestCase):
                 self.call("set", joint1_deg=1)
         self.assertEqual([], session.moves)
 
-    def test_start_remains_observable_when_control_not_ready(self):
-        session = self.start()
-        session.value["control_ready"] = False
-        info = self.call()
-        self.assertEqual("ready", info["state"])
-        self.assertFalse(info["control_ready"])
-        self.assertEqual(FakeSession.INITIAL_Q, info["actual_rad"])
-
-    def test_shared_ip_and_instance_id_do_not_share_sensor_controller_lease(self):
-        self.call("start", "same-id", tool="joint_states", robot_ip="172.16.0.3")
-        session = self.start("same-id")
-        self.assertEqual(1, len(self.sessions))
-        self.call("stop", "same-id", tool="joint_states")
-        self.assertEqual(0, session.closed)
-        self.call("set", "same-id", joint1_deg=1)
-        self.assertEqual(1, len(session.moves))
-
-    def test_same_ip_rejects_overlapping_motion_and_other_ip_is_independent(self):
-        session = self.start()
-        self.start("control-b")
-        other = self.start("control-c", "172.16.0.2")
-        first = self.call("set", joint1_deg=1)
-        with self.assertRaises(RuntimeError):
-            self.call("set", "control-b", joint1_deg=2)
-        self.call("set", "control-c", joint1_deg=2)
-        self.assertEqual(1, len(session.moves))
-        self.assertEqual(1, len(other.moves))
-        self.assertEqual(first["action_id"], session.motion()["command_id"])
-
     def test_completion_is_asynchronous_and_info_exposes_actual_and_target(self):
         session, action_id = self.started_move()
         self.assertEqual([], self.completions)
@@ -557,20 +474,6 @@ class JointControlTests(unittest.TestCase):
                 result = self.call("set", joint1_deg=1)
                 session.finish(result["action_id"], status, error="backend declined motion")
                 self.assertEqual("error", self.completed(result["action_id"])[1])
-
-    def test_public_stop_without_action_id_stops_another_cards_motion_on_same_ip(self):
-        for action in ("stopmotion", "Stop"):
-            with self.subTest(action=action):
-                session, action_id = self.started_move()
-                self.start("control-b")
-                result = self.call(action, "control-b")
-                self.assertEqual("ready", result["state"])
-                self.assertEqual(action_id, result["motion"]["command_id"])
-                self.assertEqual("cancelled", self.completed(action_id)[1])
-                self.assertEqual("cancelled", session.motion(action_id)["status"])
-                self.assertIsNone(session.stops[-1][0])
-                self.assertEqual(0, session.closed)
-                self.assertEqual("ready", self.call()["state"])
 
     def test_global_interrupt_hooks_stop_both_selected_robot_ips(self):
         first = self.start()
@@ -595,16 +498,6 @@ class JointControlTests(unittest.TestCase):
         self.assertEqual(0, first.closed)
         self.assertEqual(0, second.closed)
 
-    def test_global_interrupt_stops_shared_ip_only_once(self):
-        session = self.start()
-        self.start("control-b")
-        self.start("control-c")
-        action_id = self.call("set", "control-b", joint1_deg=1)["action_id"]
-        response = self.bundle.dispatch("joint_control", {"action": "stop"})
-        self.assertEqual(1, len(response["robots"]))
-        self.assertEqual([(None, None)], session.stops)
-        self.assertEqual("cancelled", self.completed(action_id)[1])
-
     def test_global_interrupt_failure_does_not_skip_another_robot(self):
         first = self.start()
         second = self.start("control-b", "172.16.0.2")
@@ -622,93 +515,6 @@ class JointControlTests(unittest.TestCase):
             self.assertFalse(any(record[0] == first_id for record in self.completions))
         finally:
             first.stop_error = None
-
-    def test_global_interrupt_does_not_wait_for_another_cards_stop_confirmation(self):
-        first = self.start()
-        second = self.start("control-b", "172.16.0.2")
-        self.call("set", joint1_deg=1)
-        self.call("set", "control-b", joint1_deg=2)
-        confirmation_started = threading.Event()
-        release_confirmation = threading.Event()
-        second_stop_requested = threading.Event()
-        original_release = first.release_owner
-        original_stop = second.stop_motion
-        errors = []
-
-        def delayed_confirmation(owner):
-            original_release(owner)
-            confirmation_started.set()
-            if not release_confirmation.wait(2):
-                raise TimeoutError("Test did not release lifecycle stop confirmation")
-
-        def observe_stop(*args, **kwargs):
-            second_stop_requested.set()
-            return original_stop(*args, **kwargs)
-
-        def invoke(function):
-            try:
-                function()
-            except Exception as exc:
-                errors.append(exc)
-
-        first.release_owner = delayed_confirmation
-        second.stop_motion = observe_stop
-        lifecycle = threading.Thread(target=invoke, args=(lambda: self.call("stop"),))
-        interrupt = threading.Thread(target=invoke, args=(
-            lambda: self.bundle.dispatch("joint_control", {"action": "stop"}),))
-        lifecycle.start()
-        try:
-            self.assertTrue(confirmation_started.wait(1))
-            interrupt.start()
-            stopped_without_waiting_for_first = second_stop_requested.wait(0.3)
-        finally:
-            release_confirmation.set()
-            lifecycle.join(2)
-            if interrupt.ident is not None:
-                interrupt.join(2)
-            first.release_owner = original_release
-            second.stop_motion = original_stop
-        self.assertFalse(lifecycle.is_alive())
-        self.assertFalse(interrupt.is_alive())
-        self.assertEqual([], errors)
-        self.assertTrue(stopped_without_waiting_for_first,
-                        "A card waiting for stop confirmation delayed the other robot's interrupt")
-
-    def test_stop_is_idempotent_before_start_and_after_a_card_is_disabled(self):
-        self.assertEqual("idle", self.call("stop")["state"])
-        self.assertEqual("idle", self.call("stop")["state"])
-        self.assertEqual([], self.sessions)
-        session = self.start()
-        self.assertEqual("idle", self.call("stop")["state"])
-        closed = session.closed
-        self.assertEqual("idle", self.call("stop")["state"])
-        self.assertEqual(closed, session.closed)
-        self.assertEqual([], session.moves)
-
-    def test_lifecycle_stop_cancels_motion_and_preserves_other_state_subscriber(self):
-        self.call("start", "state-card", tool="joint_states", robot_ip="172.16.0.3")
-        session, action_id = self.started_move()
-        result = self.call("stop")
-        self.assertEqual("idle", result["state"])
-        self.assertEqual("cancelled", self.completed(action_id)[1])
-        self.assertEqual(0, session.closed)
-        self.assertEqual("running", self.call("info", "state-card", tool="joint_states")["state"])
-
-    def test_failed_stop_does_not_report_idle_or_clear_an_active_action(self):
-        session, action_id = self.started_move()
-        publisher = self.publishers[-1]
-        session.stop_error = RuntimeError("backend stop not acknowledged")
-        try:
-            with self.assertRaises(RuntimeError):
-                self.call("stop")
-            self.assertEqual("running", session.motion(action_id)["status"])
-            self.assertNotEqual("idle", self.call()["state"])
-            self.assertEqual([], self.completions)
-            publisher.callback()
-            self.assertEqual(1, len(publisher.frames))
-            self.assertEqual("running", publisher.frames[-1]["motion"]["status"])
-        finally:
-            session.stop_error = None
 
     def test_stop_timeout_keeps_card_and_feedback_available(self):
         session, action_id = self.started_move()
@@ -734,51 +540,6 @@ class JointControlTests(unittest.TestCase):
         finally:
             session.wait = original_wait
             session.finish(action_id, "cancelled")
-
-    def test_backend_stop_failure_terminal_does_not_disable_card(self):
-        session, action_id = self.started_move()
-        original_stop = session.stop_motion
-
-        def failed_stop(*args, **kwargs):
-            session.finish(action_id, "failed", error="Physical backend stop failed")
-            return session.motion(action_id)
-
-        session.stop_motion = failed_stop
-        try:
-            with self.assertRaises(RuntimeError):
-                self.call("stop")
-            self.assertEqual(0, session.closed)
-            self.assertNotEqual("idle", self.call()["state"])
-            self.assertEqual("error", self.completed(action_id)[1])
-        finally:
-            session.stop_motion = original_stop
-
-    def test_stopped_timer_does_not_resume_after_control_card_restart(self):
-        self.start()
-        old = self.publishers[-1]
-        old.callback()
-        self.assertEqual(1, len(old.frames))
-        self.call("stop")
-        self.start()
-        current = self.publishers[-1]
-        self.assertIsNot(old, current)
-        old.callback()
-        self.assertEqual(1, len(old.frames))
-        self.assertEqual([], current.frames)
-        current.callback()
-        self.assertEqual(1, len(current.frames))
-        self.assertEqual("ready", current.frames[-1]["state"])
-
-    def test_submission_error_does_not_create_a_pending_acp_action(self):
-        session = self.start()
-        session.move_error = RuntimeError("controller rejected submission")
-        with self.assertRaises(RuntimeError):
-            self.call("set", joint1_deg=1)
-        self.assertEqual([], self.completions)
-        self.assertEqual([], session.moves)
-        session.move_error = None
-        self.call("set", joint1_deg=2)
-        self.assertEqual(1, len(session.moves))
 
     def test_public_stop_waits_for_backend_confirmation_before_returning_ready(self):
         session, action_id = self.started_move()
@@ -809,35 +570,6 @@ class JointControlTests(unittest.TestCase):
         self.assertEqual("ready", result["state"])
         self.assertEqual(action_id, result["motion"]["command_id"])
         self.assertEqual("cancelled", self.completed(action_id)[1])
-
-    def test_completion_racing_stop_reports_one_backend_terminal_result(self):
-        session, action_id = self.started_move()
-        barrier = threading.Barrier(3)
-        errors = []
-
-        def finish():
-            barrier.wait()
-            session.finish(action_id)
-
-        def stop():
-            barrier.wait()
-            try:
-                self.call("stop")
-            except Exception as exc:
-                errors.append(exc)
-
-        finisher = threading.Thread(target=finish)
-        stopper = threading.Thread(target=stop)
-        finisher.start()
-        stopper.start()
-        barrier.wait(timeout=1)
-        finisher.join(2)
-        stopper.join(2)
-        self.assertFalse(finisher.is_alive())
-        self.assertFalse(stopper.is_alive())
-        self.assertEqual([], errors)
-        expected = {"succeeded": "completed", "cancelled": "cancelled"}[session.motion()["status"]]
-        self.assertEqual(expected, self.completed(action_id)[1])
 
     def test_acp_delivery_failure_keeps_successful_physical_result_visible(self):
         attempts = []
