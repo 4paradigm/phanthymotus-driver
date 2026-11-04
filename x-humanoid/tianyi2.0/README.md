@@ -206,3 +206,26 @@ light indicates Ready before running arm actions.
 | `high_five` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
 | `reset` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
 | `stop` | no parameters | no parameters |
+
+## External mic on PC1 (`ext_mic` network source)
+
+A USB mic (e.g. a DJI Wireless Mic receiver) plugged into **PC1** is captured
+there by `audio_sender.py` and streamed to the driver on PC2 as raw PCM-16k
+over TCP (`tcp://192.168.41.1:9800/pcm16k`). PC1 is configured under
+`plugins.ext_mic.network_sources` in `config.yaml`.
+
+At startup, and again whenever the card's SSH settings are saved, the driver
+prepares PC1 over SSH (`ext_devices.probe_remote_host`):
+
+| Step | What it does | When it cannot |
+|---|---|---|
+| Devices | `arecord -l` as the SSH user; prefers a USB card | logs which of: SSH failed / no card in the kernel / no capture device |
+| Permission | if the kernel has cards but the user is not in `audio`, runs `sudo usermod -aG audio <user>` with the SSH password | logs the exact command to run by hand |
+| Sender | copies `audio_sender.py` when **its content** differs (md5), and restarts it | logs `deploy failed` |
+| Streaming | ready only once bytes arrive on the port — silence counts, an open port does not | names the option `[not streaming]` and logs the tail of `/tmp/audio_sender.log` |
+
+`audio_sender.py` needs `python3` and `numpy` on PC1 (Ubuntu 22.04 ships both).
+It uses pyalsaaudio when a working one is installed and otherwise captures
+through `arecord`, so PC1 needs no pip install and no internet. If its capture
+fails, the process exits rather than keep an empty port open, and the next
+health check restarts it.

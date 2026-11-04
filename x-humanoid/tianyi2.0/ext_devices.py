@@ -8,12 +8,16 @@ tool instance on the canvas.
 """
 
 import glob
+import hashlib
 import logging
 import os
 import re
+import shlex
+import socket
 import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 import cv2
@@ -177,6 +181,195 @@ def _parse_hw_params(output: str) -> dict:
             if rates:
                 info["rate"] = min(rates)
     return info
+
+
+# ── Remote mic: one probe for startup and for the card's SSH config ──────────
+#
+# A mic plugged into another computer (Tianyi's PC1) is captured there by
+# audio_sender.py and streamed over TCP. Everything that remote host needs is
+# prepared from here, over SSH, because a new robot arrives with none of it.
+# Each stage reports its own failure: "no devices" from an account that cannot
+# open /dev/snd looks identical to "nothing plugged in" unless it is told apart.
+
+SENDER_SRC = Path(__file__).with_name("audio_sender.py")
+SENDER_LOG = "/tmp/audio_sender.log"
+DEFAULT_SENDER_PORT = 9800
+DEFAULT_SENDER_PATH = "/home/ubuntu/audio_sender.py"
+
+
+def remote_mic_url(ssh_host: str, port: int) -> str:
+    return f"tcp://{ssh_host}:{port}/pcm16k"
+
+
+def _tcp_has_data(host: str, port: int, timeout: float = 3.0) -> bool:
+    """True once the sender actually streams. A listening port is not enough:
+    a sender whose capture failed used to keep its port open with nothing behind
+    it. Silence is still bytes (zeros), so a quiet room is not a failure here."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            return len(sock.recv(1024)) > 0
+    except OSError:
+        return False
+
+
+def probe_remote_host(ssh_host: str, ssh_user: str, ssh_pass: str,
+                      port: int = DEFAULT_SENDER_PORT,
+                      script: str = DEFAULT_SENDER_PATH) -> list[dict]:
+    """Find the capture device on `ssh_host`, prepare the host, and start streaming.
+
+    Returns the device entry for the ext_mic card, or [] when there is no device
+    to offer — in which case the reason has been printed, and the caller should
+    keep whatever it already knew rather than forget it.
+    """
+    tag = f"[ext_mic/probe] {ssh_host}:"
+
+    def _redact(text) -> str:
+        text = str(text)
+        return text.replace(ssh_pass, "***") if ssh_pass else text
+
+    def _ssh(cmd: str, timeout: int = 10):
+        return subprocess.run(
+            ["sshpass", "-p", ssh_pass, "ssh",
+             "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=3",
+             f"{ssh_user}@{ssh_host}", cmd],
+            capture_output=True, text=True, timeout=timeout)
+
+    def _list_devices():
+        result = _ssh("arecord -l 2>&1")
+        if result.returncode == 255:      # ssh's own failure, not arecord's
+            raise RuntimeError(result.stderr.strip() or "ssh exited 255")
+        return _parse_arecord_output(result.stdout)
+
+    # 1. Devices, as the account that will capture sees them.
+    try:
+        devices = _list_devices()
+    except Exception as e:
+        print(f"{tag} SSH failed: {_redact(e)}", flush=True)
+        return []
+
+    if not devices:
+        devices = _repair_audio_group(_ssh, _list_devices, ssh_host, ssh_user, ssh_pass, _redact)
+        if not devices:
+            return []
+
+    # The sender captures one card, so offer exactly that one. Several entries
+    # sharing one tcp:// value were indistinguishable in the card, and whichever
+    # came first won. Prefer a USB device: that is what gets plugged in.
+    try:
+        usb = _ssh("ls -d /proc/asound/card*/usbid 2>/dev/null").stdout
+        usb_cards = {int(n) for n in re.findall(r"card(\d+)/usbid", usb)}
+    except Exception:
+        usb_cards = set()
+    dev = next((d for d in devices if d["card"] in usb_cards), devices[0])
+
+    try:
+        hw = _ssh(f"arecord -D hw:{dev['card']},{dev['device']} --dump-hw-params -d 1 /dev/null 2>&1")
+        dev.update(_parse_hw_params(hw.stdout + hw.stderr))
+    except Exception:
+        pass
+
+    # 2. The sender script, by content. Checking only that the file exists left
+    # whatever version first landed there in place forever, fixes included.
+    updated = False
+    if not SENDER_SRC.is_file():
+        print(f"{tag} ERROR: {SENDER_SRC} is missing from this image — cannot deploy the sender", flush=True)
+    else:
+        local_md5 = hashlib.md5(SENDER_SRC.read_bytes()).hexdigest()
+        try:
+            remote = _ssh(f"md5sum {shlex.quote(script)} 2>/dev/null").stdout.split()
+            if not remote or remote[0] != local_md5:
+                scp = subprocess.run(
+                    ["sshpass", "-p", ssh_pass, "scp", "-o", "StrictHostKeyChecking=no",
+                     str(SENDER_SRC), f"{ssh_user}@{ssh_host}:{script}"],
+                    capture_output=True, text=True, timeout=15)
+                if scp.returncode != 0:
+                    raise RuntimeError(f"scp exited {scp.returncode}: {scp.stderr.strip()}")
+                updated = bool(remote)
+                print(f"{tag} {'updated' if updated else 'deployed'} {script}", flush=True)
+        except Exception as e:
+            print(f"{tag} deploy failed: {_redact(e)}", flush=True)
+
+    # 3. Streaming — judged by data arriving, the same test the capture node uses.
+    ready = not updated and _tcp_has_data(ssh_host, port)
+    if not ready:
+        try:
+            # -f matches the full command line, so the path alone is enough.
+            _ssh(f"pkill -9 -f {shlex.quote(script)}")
+            time.sleep(3)                               # let ALSA release the card
+            _ssh(f"nohup python3 {shlex.quote(script)} --port {port} --card {dev['card']} "
+                 f"< /dev/null > {SENDER_LOG} 2>&1 &")
+            for _ in range(5):
+                time.sleep(2)
+                if _tcp_has_data(ssh_host, port):
+                    ready = True
+                    break
+        except Exception as e:
+            print(f"{tag} sender start failed: {_redact(e)}", flush=True)
+        if ready:
+            print(f"{tag} audio_sender streaming (card={dev['card']}, port={port})", flush=True)
+        else:
+            try:
+                tail = _ssh(f"tail -n 8 {SENDER_LOG}").stdout.strip()
+            except Exception:
+                tail = ""
+            print(f"{tag} WARNING: audio_sender is not streaming (card={dev['card']}, port={port}). "
+                  f"{SENDER_LOG}:\n{_redact(tail) or '(empty)'}", flush=True)
+    else:
+        print(f"{tag} audio_sender healthy", flush=True)
+
+    fmt_desc = f"{dev.get('format', '?')}/{dev.get('rate', '?')}Hz/{dev.get('channels', '?')}ch"
+    url = remote_mic_url(ssh_host, port)
+    return [{
+        "index": url,
+        "alsa_id": url,
+        "name": f"{dev['name']} ({fmt_desc}) @ {ssh_host}" + ("" if ready else " [not streaming]"),
+        "network": True,
+        "_ssh_host": ssh_host,
+        "_ssh_user": ssh_user,
+        "_ssh_pass": ssh_pass,
+        "_ssh_card": str(dev["card"]),
+        "_ssh_script": script,
+        "_port": port,
+    }]
+
+
+def _repair_audio_group(_ssh, _list_devices, ssh_host, ssh_user, ssh_pass, _redact) -> list[dict]:
+    """`arecord -l` found nothing. Tell "no device" apart from "not allowed to see it".
+
+    /dev/snd/* is root:audio. A fresh Tianyi PC1's `ubuntu` is not in `audio`,
+    so it gets "no soundcards found" while the kernel lists the card and
+    `sudo arecord -l` shows it. Join the group if sudo accepts the SSH password;
+    each SSH command is a new login, so the next one already has it.
+    """
+    tag = f"[ext_mic/probe] {ssh_host}:"
+    try:
+        out = _ssh("cat /proc/asound/cards; echo '---'; id -nG").stdout
+    except Exception:
+        return []
+    cards, _, groups = out.partition("---")
+    kernel_has_cards = bool(re.search(r"^\s*\d+\s*\[", cards, re.M))
+    if not kernel_has_cards:
+        print(f"{tag} no capture devices (none registered with the kernel)", flush=True)
+        return []
+    if "audio" in groups.split():
+        print(f"{tag} no capture devices (cards exist but none is a usable capture device)", flush=True)
+        return []
+
+    print(f"{tag} '{ssh_user}' is not in the 'audio' group, so it cannot see the sound cards; adding it", flush=True)
+    try:
+        # printf is a shell builtin: the password never appears in a process list.
+        r = _ssh(f"printf '%s\\n' {shlex.quote(ssh_pass)} | sudo -S -p '' usermod -aG audio {shlex.quote(ssh_user)}")
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip() or f"exited {r.returncode}")
+        devices = _list_devices()
+    except Exception as e:
+        print(f"{tag} ERROR: could not add '{ssh_user}' to 'audio' ({_redact(e)}). "
+              f"On {ssh_host} run: sudo usermod -aG audio {ssh_user}", flush=True)
+        return []
+    if not devices:
+        print(f"{tag} joined 'audio' but still no capture devices", flush=True)
+    return devices
 
 
 def _enumerate_ext_cameras() -> list[dict]:
@@ -1047,20 +1240,20 @@ class ExtMicPlugin:
         self._executor = executor
         self._nodes: dict[str, _ExtMicNode] = {}
         self._instance_configs: dict[str, dict] = {}  # instance_id → saved config params
+        self._network_sources = plugin_cfg.get("network_sources", []) or []
         self._available_devices = _enumerate_ext_mics()
         # Add dynamically probed remote devices (from main.py _probe_remote_mics)
-        if remote_devices:
-            self._available_devices.extend(remote_devices)
-        elif plugin_cfg.get("network_sources"):
-            # Fallback: static config (backward compat if probe not called)
-            for ns in plugin_cfg.get("network_sources", []):
-                url = ns.get("url", f"tcp://{ns.get('ssh_host', '')}:{ns.get('port', 9800)}/pcm16k")
-                self._available_devices.append({
-                    "index": url,
-                    "alsa_id": url,
-                    "name": ns.get("name", ns.get("ssh_host", "Remote Mic")),
-                    "network": True,
-                })
+        self._available_devices.extend(remote_devices or [])
+        # A source whose startup probe failed still gets an entry, so a saved card
+        # keeps a target — and a full one. This entry used to carry only the URL:
+        # with no `_ssh_host` a later successful probe could not find it to replace
+        # it, the two then shared one value (the card showed the IP, not the mic),
+        # and a start that picked it had no SSH config to restart the sender with.
+        probed_urls = {d.get("alsa_id") for d in self._available_devices}
+        for ns in self._network_sources:
+            entry = self._static_entry(ns)
+            if entry and entry["alsa_id"] not in probed_urls:
+                self._available_devices.append(entry)
         log.info(f"[ext_mic] found {len(self._available_devices)} external mic device(s)")
         for d in self._available_devices:
             log.info(f"  [{d['index']}] {d['name']}")
@@ -1110,91 +1303,44 @@ class ExtMicPlugin:
             self._executor.remove_node(self._nodes[key])
             del self._nodes[key]
 
+    @staticmethod
+    def _static_entry(ns: dict) -> dict | None:
+        ssh_host = ns.get("ssh_host", "")
+        url = ns.get("url") or (remote_mic_url(ssh_host, ns.get("port", DEFAULT_SENDER_PORT)) if ssh_host else "")
+        if not url:
+            return None
+        return {
+            "index": url,
+            "alsa_id": url,
+            "name": ns.get("name", ssh_host or "Remote Mic"),
+            "network": True,
+            "_ssh_host": ssh_host,
+            "_ssh_user": ns.get("ssh_user", "ubuntu"),
+            "_ssh_pass": ns.get("ssh_password", ""),
+            "_ssh_card": str(ns.get("card", "1")),
+            "_ssh_script": ns.get("sender_path", DEFAULT_SENDER_PATH),
+            "_port": ns.get("port", DEFAULT_SENDER_PORT),
+        }
+
     def _probe_remote(self, ssh_host: str, ssh_user: str, ssh_pass: str,
                       port: int, script: str) -> list[dict]:
-        """SSH probe remote host: detect devices, deploy & start audio_sender, cache results."""
-        import subprocess as _sp
-        from pathlib import Path
+        """Re-probe one host and replace what was known about it — only on success.
 
-        def _ssh(cmd, timeout=10):
-            return _sp.run(
-                ["sshpass", "-p", ssh_pass, "ssh",
-                 "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=3",
-                 f"{ssh_user}@{ssh_host}", cmd],
-                capture_output=True, text=True, timeout=timeout)
-
-        # Remove old remote devices for this host
-        self._available_devices = [d for d in self._available_devices
-                                   if not (d.get("network") and d.get("_ssh_host") == ssh_host)]
-
-        # Probe devices
-        try:
-            result = _ssh("arecord -l")
-            devices = _parse_arecord_output(result.stdout + result.stderr)
-        except Exception as e:
-            log.warning(f"[ext_mic/probe] {ssh_host}: SSH failed: {e}")
+        A failed probe returns [] and leaves the list alone: forgetting a device
+        because one SSH attempt timed out would empty a working card's choices.
+        """
+        entries = probe_remote_host(ssh_host, ssh_user, ssh_pass, port=port, script=script)
+        if not entries:
             return []
-
-        if not devices:
-            log.info(f"[ext_mic/probe] {ssh_host}: no capture devices")
-            return []
-
-        # Probe hw params for each device
-        for dev in devices:
-            try:
-                hw = _ssh(f"arecord -D hw:{dev['card']},{dev['device']} --dump-hw-params -d 1 /dev/null 2>&1")
-                dev.update(_parse_hw_params(hw.stdout + hw.stderr))
-            except Exception:
-                dev.setdefault("format", "S16_LE")
-                dev.setdefault("rate", 16000)
-                dev.setdefault("channels", 1)
-
-        # Deploy audio_sender.py if missing
-        try:
-            check = _ssh(f"test -f {script} && echo EXISTS")
-            if "EXISTS" not in (check.stdout or ""):
-                local_src = str(Path(__file__).parent / "audio_sender.py")
-                _sp.run(["sshpass", "-p", ssh_pass, "scp",
-                         "-o", "StrictHostKeyChecking=no",
-                         local_src, f"{ssh_user}@{ssh_host}:{script}"],
-                        check=True, timeout=15)
-                log.info(f"[ext_mic/probe] {ssh_host}: deployed audio_sender.py")
-        except Exception as e:
-            log.warning(f"[ext_mic/probe] {ssh_host}: deploy failed: {e}")
-
-        # Start audio_sender if not running
-        primary_card = devices[0]["card"]
-        try:
-            check = _ssh("pgrep -f audio_sender.py")
-            if check.returncode != 0 or not check.stdout.strip():
-                _ssh(f"nohup python3 {script} --port {port} --card {primary_card} "
-                     f"> /tmp/audio_sender.log 2>&1 &")
-                time.sleep(1)
-                log.info(f"[ext_mic/probe] {ssh_host}: started audio_sender (card={primary_card}, port={port})")
-        except Exception:
-            pass
-
-        # Cache results and return summary
-        probed = []
-        for dev in devices:
-            fmt_desc = f"{dev.get('format', '?')}/{dev.get('rate', '?')}Hz/{dev.get('channels', '?')}ch"
-            entry = {
-                "index": f"tcp://{ssh_host}:{port}/pcm16k",
-                "alsa_id": f"tcp://{ssh_host}:{port}/pcm16k",
-                "name": f"{dev['name']} ({fmt_desc}) @ {ssh_host}",
-                "network": True,
-                "_ssh_host": ssh_host,
-                "_ssh_user": ssh_user,
-                "_ssh_pass": ssh_pass,
-                "_ssh_card": str(dev["card"]),
-                "_ssh_script": script,
-                "_port": port,
-            }
-            self._available_devices.append(entry)
-            probed.append({"name": entry["name"], "url": entry["alsa_id"]})
-
-        log.info(f"[ext_mic/probe] {ssh_host}: found {len(devices)} device(s)")
-        return probed
+        # Old entries for this host are matched by host *or* by URL prefix, so an
+        # entry written before entries carried `_ssh_host` is replaced too.
+        prefix = f"tcp://{ssh_host}:"
+        self._available_devices = [
+            d for d in self._available_devices
+            if not (d.get("network") and (d.get("_ssh_host") == ssh_host
+                                          or str(d.get("alsa_id", "")).startswith(prefix)))
+        ] + entries
+        return [{"name": e["name"], "url": e["alsa_id"]} for e in entries]
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         instance_id = args.get("instance_id", "")
@@ -1287,12 +1433,13 @@ class ExtMicPlugin:
                 # Shared config (sidebar SSH settings) — trigger remote probe
                 ssh_host = args.get("ssh_host", "").strip()
                 if ssh_host:
+                    ns = next((n for n in self._network_sources if n.get("ssh_host") == ssh_host), {})
                     probed = self._probe_remote(
                         ssh_host=ssh_host,
                         ssh_user=args.get("ssh_user", "ubuntu"),
                         ssh_pass=args.get("ssh_pass", "123"),
-                        port=9800,
-                        script="/home/ubuntu/audio_sender.py",
+                        port=ns.get("port", DEFAULT_SENDER_PORT),
+                        script=ns.get("sender_path", DEFAULT_SENDER_PATH),
                     )
                     return {"configured": True, "remote_devices": probed}
                 return {"configured": True}
