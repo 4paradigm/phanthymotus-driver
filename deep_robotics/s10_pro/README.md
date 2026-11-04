@@ -55,11 +55,15 @@ is `header.stamp: null`. Point coordinates remain in the input LiDAR frame;
 there is no mounting transform, temporal accumulation or object recognition.
 Joint latency and LiDAR coordinate refinements remain separate local work.
 
-Motion and lighting use the vendor `basic_server` JSON framing over TLS/TCP on
-port `30003`. The client verifies the `server.local` endpoint using the
+Motion and lighting use the vendor `basic_server` JSON framing on port `30003`.
+The deployed S10 service currently uses plain TCP (`S10_BASIC_SERVER_TRANSPORT=tcp`)
+because TLS is disabled on this robot. Set the transport to `tls` only when the
+vendor TLS service and its client identity are provisioned. In TLS mode the client verifies the `server.local` endpoint using the
 S10 certificate SHA-256 pin in `config.yaml`; deployments can override the
-name/pin or provide a CA with `S10_BASIC_SERVER_TLS_CA`. There is no plaintext
-fallback. Motion uses native S10 commands and reports long-running completion through
+name/pin or provide a CA with `S10_BASIC_SERVER_TLS_CA`. The robot server
+requests a client certificate, so set `S10_BASIC_SERVER_TLS_CLIENT_CERT` and
+`S10_BASIC_SERVER_TLS_CLIENT_KEY` to the vendor-issued identity files. There
+is no implicit plaintext fallback from TLS mode. Motion uses native S10 commands and reports long-running completion through
 `/api/acp/complete`; locomotion movement accepts `yaw_rate_deg_s` in degrees per
 second and a bounded duration. Head and tail lights are independent cards.
 `loco_servo` is the streaming counterpart for visual navigation policies. It

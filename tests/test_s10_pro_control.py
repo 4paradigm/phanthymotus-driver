@@ -670,6 +670,15 @@ def test_domain_bridge_publish_error_throttle_boundaries():
     assert [count for count in range(1, 201) if _should_log_failure(count)] == [1, 100, 200]
 
 
+def test_domain_bridge_log_topic_is_escaped_and_bounded():
+    from deep_robotics.s10_pro.domain_bridge import _safe_topic
+
+    assert _safe_topic("/topic\nforged") == "/topic\\nforged"
+    escaped = _safe_topic("/" + "x" * 500)
+    assert len(escaped) == 120
+    assert escaped.endswith("...")
+
+
 def test_media_worker_uses_independent_result_queue_per_lane():
     import ast
 
@@ -841,6 +850,7 @@ def test_service_configures_verified_s10_robot_network_without_shell_exports():
     environment = dict(item.split("=", 1) for item in service["environment"])
     assert environment["NETWORK_INTERFACE"] == "${S10_NETWORK_INTERFACE:-auto}"
     assert environment["S10_BASIC_SERVER_HOST"] == "${S10_BASIC_SERVER_HOST:-10.21.33.103}"
+    assert environment["S10_BASIC_SERVER_TRANSPORT"] == "${S10_BASIC_SERVER_TRANSPORT:-tcp}"
     assert environment["S10_MOTION_ENABLED"] == "${S10_MOTION_ENABLED:-0}"
     assert environment["S10_DRMAP_MODE"] == "${S10_DRMAP_MODE:-auto}"
     assert environment["S10_DRMAP_SSH_HOST"] == "${S10_DRMAP_SSH_HOST:-10.21.33.106}"
@@ -1966,7 +1976,9 @@ def test_basic_server_uses_tcp_for_request_response(monkeypatch):
             self.ready.set()
 
     fake_socket = FakeSocket()
-    tls_context = SimpleNamespace(wrap_socket=lambda sock, server_hostname: (
+    tls_context = SimpleNamespace(load_cert_chain=lambda cert, key: (
+        cert == "/vendor/client.crt" and key == "/vendor/client.key"),
+        wrap_socket=lambda sock, server_hostname: (
         sock if server_hostname == "server.local" else pytest.fail("wrong TLS server name")))
     monkeypatch.setattr("deep_robotics.s10_pro.basic_server.ssl.SSLContext",
                         lambda _protocol: tls_context)
@@ -1975,13 +1987,14 @@ def test_basic_server_uses_tcp_for_request_response(monkeypatch):
         lambda address, timeout: fake_socket,
     )
     client = BasicServerClient({"basic_server": {
-        "host": "127.0.0.1", "tls_tcp_port": 30003, "timeout": 1,
+        "host": "127.0.0.1", "transport": "tls", "tls_tcp_port": 30003, "timeout": 1,
+        "tls_client_cert": "/vendor/client.crt", "tls_client_key": "/vendor/client.key",
         "tls_sha256_fingerprint": hashlib.sha256(b"approved S10 certificate").hexdigest(),
     }})
     try:
         response = client.request(0x00100064, 0x00000005)
         assert response["PatrolDevice"]["Items"] == {"ErrorCode": 0}
-        assert client.snapshot()["transport"] == "TLS/TCP"
+        assert client.snapshot()["transport"] == "TLS"
         assert client.snapshot()["reports"]["1048676:5"] == response
     finally:
         client.close()
@@ -2022,7 +2035,8 @@ def test_basic_server_matches_string_encoded_response_type_and_command(monkeypat
             self.ready.set()
 
     fake_socket = FakeSocket()
-    tls_context = SimpleNamespace(wrap_socket=lambda sock, server_hostname: sock)
+    tls_context = SimpleNamespace(load_cert_chain=lambda cert, key: None,
+                                  wrap_socket=lambda sock, server_hostname: sock)
     monkeypatch.setattr("deep_robotics.s10_pro.basic_server.ssl.SSLContext",
                         lambda _protocol: tls_context)
     monkeypatch.setattr(
@@ -2031,6 +2045,7 @@ def test_basic_server_matches_string_encoded_response_type_and_command(monkeypat
     )
     client = BasicServerClient({"basic_server": {
         "host": "127.0.0.1", "tls_tcp_port": 30003, "timeout": 1,
+        "tls_client_cert": "/vendor/client.crt", "tls_client_key": "/vendor/client.key",
         "tls_sha256_fingerprint": hashlib.sha256(b"approved S10 certificate").hexdigest(),
     }})
     try:
@@ -2052,17 +2067,53 @@ def test_basic_server_rejects_unpinned_tls_certificate(monkeypatch):
 
     raw_socket = FakeSocket()
     wrapped_socket = FakeSocket()
-    context = SimpleNamespace(wrap_socket=lambda _sock, server_hostname: wrapped_socket)
+    context = SimpleNamespace(load_cert_chain=lambda cert, key: None,
+                              wrap_socket=lambda _sock, server_hostname: wrapped_socket)
     monkeypatch.setattr("deep_robotics.s10_pro.basic_server.ssl.SSLContext",
                         lambda _protocol: context)
     monkeypatch.setattr("deep_robotics.s10_pro.basic_server.socket.create_connection",
                         lambda *_args, **_kwargs: raw_socket)
     client = BasicServerClient({"basic_server": {
         "host": "127.0.0.1", "tls_sha256_fingerprint": "0" * 64,
+        "tls_client_cert": "/vendor/client.crt", "tls_client_key": "/vendor/client.key",
     }})
     with pytest.raises(ssl.SSLCertVerificationError, match="pin mismatch"):
         client._connect()
     assert wrapped_socket.closed is True
+
+
+def test_basic_server_requires_vendor_mtls_identity_before_connect(monkeypatch):
+    connect_called = False
+
+    def connect(*_args, **_kwargs):
+        nonlocal connect_called
+        connect_called = True
+        raise AssertionError("must fail before opening a socket")
+
+    monkeypatch.setattr("deep_robotics.s10_pro.basic_server.socket.create_connection", connect)
+    client = BasicServerClient({"basic_server": {"host": "127.0.0.1", "transport": "tls"}})
+    with pytest.raises(RuntimeError, match="vendor-issued TLS client certificate"):
+        client._connect()
+    assert connect_called is False
+
+
+def test_basic_server_can_use_explicit_plain_tcp(monkeypatch):
+    class FakeSocket:
+        def settimeout(self, _timeout):
+            pass
+
+    monkeypatch.setattr("deep_robotics.s10_pro.basic_server.socket.create_connection",
+                        lambda address, timeout: (address == ("127.0.0.1", 30003) and FakeSocket()))
+    client = BasicServerClient({"basic_server": {
+        "host": "127.0.0.1", "transport": "tcp", "tcp_port": 30003,
+    }})
+    client._connect()
+    assert client._socket is not None
+
+
+def test_basic_server_requires_client_certificate_and_key_as_a_pair():
+    with pytest.raises(ValueError, match="requires both client certificate and private key"):
+        BasicServerClient({"basic_server": {"tls_client_cert": "/tmp/client.crt"}})
 
 
 def test_basic_server_rejects_malformed_tls_fingerprint():

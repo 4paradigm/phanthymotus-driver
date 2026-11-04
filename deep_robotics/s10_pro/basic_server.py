@@ -119,16 +119,30 @@ class StreamDecoder:
 
 
 class BasicServerClient:
-    """TLS-authenticated client for the S10 basic_server protocol."""
+    """TCP/TLS client for the S10 basic_server protocol."""
 
     def __init__(self, config: dict):
         native = config.get("basic_server", {})
         self.host = str(os.environ.get("S10_BASIC_SERVER_HOST", native.get("host", "10.21.33.103")))
-        self.port = int(native.get("tls_tcp_port", native.get("tcp_port", 30003)))
+        configured_transport = os.environ.get("S10_BASIC_SERVER_TRANSPORT") or native.get("transport")
+        if not configured_transport:
+            configured_transport = "tls" if (native.get("tls_client_cert") or
+                                               native.get("tls_ca_file")) else "tcp"
+        self.transport = str(configured_transport).lower()
+        if self.transport not in {"tcp", "tls"}:
+            raise ValueError("S10_BASIC_SERVER_TRANSPORT must be tcp or tls")
+        self.port = int(native.get("tls_tcp_port" if self.transport == "tls" else "tcp_port",
+                                   native.get("tcp_port", 30003)))
         self.timeout = float(native.get("timeout", 2.0))
         self.tls_server_name = str(os.environ.get(
             "S10_BASIC_SERVER_TLS_NAME", native.get("tls_server_name", "server.local")))
         self.tls_ca_file = os.environ.get("S10_BASIC_SERVER_TLS_CA") or native.get("tls_ca_file")
+        self.tls_client_cert = (os.environ.get("S10_BASIC_SERVER_TLS_CLIENT_CERT") or
+                                native.get("tls_client_cert"))
+        self.tls_client_key = (os.environ.get("S10_BASIC_SERVER_TLS_CLIENT_KEY") or
+                               native.get("tls_client_key"))
+        if bool(self.tls_client_cert) != bool(self.tls_client_key):
+            raise ValueError("S10 basic_server mTLS requires both client certificate and private key")
         configured_pin = os.environ.get("S10_BASIC_SERVER_TLS_SHA256") or native.get(
             "tls_sha256_fingerprint", DEFAULT_TLS_SHA256_FINGERPRINT)
         normalized_pin = str(configured_pin).lower().replace(":", "").replace(" ", "")
@@ -160,6 +174,13 @@ class BasicServerClient:
 
     def _connect(self):
         if self._socket is None:
+            if self.transport == "tcp":
+                self._socket = socket.create_connection((self.host, self.port), timeout=self.timeout)
+                self._socket.settimeout(None)
+                return
+            if not self.tls_client_cert:
+                raise RuntimeError(
+                    "S10 basic_server requires a vendor-issued TLS client certificate and private key")
             raw_socket = socket.create_connection((self.host, self.port), timeout=self.timeout)
             connection = None
             try:
@@ -169,6 +190,7 @@ class BasicServerClient:
                     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                     context.check_hostname = False
                     context.verify_mode = ssl.CERT_NONE
+                context.load_cert_chain(self.tls_client_cert, self.tls_client_key)
                 connection = context.wrap_socket(raw_socket, server_hostname=self.tls_server_name)
                 certificate_digest = hashlib.sha256(connection.getpeercert(binary_form=True)).hexdigest()
                 if not hmac.compare_digest(
@@ -274,7 +296,7 @@ class BasicServerClient:
     def snapshot(self):
         with self._state_lock:
             reports = dict(self.reports)
-        return {"enabled": self.enabled, "transport": "TLS/TCP", "host": self.host,
+        return {"enabled": self.enabled, "transport": self.transport.upper(), "host": self.host,
                 "port": self.port, "connected": self._socket is not None,
                 "last_error": self.last_error, "reports": reports}
 

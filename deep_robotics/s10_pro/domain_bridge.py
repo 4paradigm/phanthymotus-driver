@@ -20,6 +20,13 @@ def _should_log_failure(count: int) -> bool:
     return count == 1 or count % 100 == 0
 
 
+def _safe_topic(topic, limit: int = 120) -> str:
+    value = str(topic).encode("unicode_escape").decode("ascii")
+    if len(value) > limit:
+        return value[:limit - 3] + "..."
+    return value
+
+
 class CoreBridge:
     """Publish serialized robot-domain samples from loopback-only processes."""
 
@@ -88,7 +95,7 @@ class CoreBridge:
             count = self._errors[lane]
             self._last_error[lane] = repr(exc)
             if count == 1 or count % 100 == 0:
-                print(f"[dds-bridge] enqueue failed lane={lane} topic={topic} "
+                print(f"[dds-bridge] enqueue failed lane={lane} topic={_safe_topic(topic)} "
                       f"count={count}: {exc!r}", flush=True)
 
     def _restart_lane(self, lane):
@@ -316,24 +323,24 @@ def _run_publisher(messages, profile, domain, lane, queue_depth=1):
             topic, type_name, payload = item
             msg_type = types.get(type_name)
             if msg_type is None:
-                print(f"[dds-bridge] unsupported type={type_name} topic={topic}", flush=True)
+                print(f"[dds-bridge] unsupported type={type_name} topic={_safe_topic(topic)}", flush=True)
                 continue
             publisher = publishers.get(topic)
             if publisher is None:
                 publisher = node.create_publisher(msg_type, topic, qos)
                 publishers[topic] = publisher
-                print(f"[dds-bridge] publisher created domain={domain} topic={topic} type={type_name}", flush=True)
+                print(f"[dds-bridge] publisher created domain={domain} topic={_safe_topic(topic)} type={type_name}", flush=True)
             try:
                 publisher.publish(deserialize_message(payload, msg_type))
                 failures[topic] = 0
                 counts[topic] = counts.get(topic, 0) + 1
                 if counts[topic] == 1:
-                    print(f"[dds-bridge] first sample published domain={domain} topic={topic}", flush=True)
+                    print(f"[dds-bridge] first sample published domain={domain} topic={_safe_topic(topic)}", flush=True)
             except Exception as exc:
                 failures[topic] = failures.get(topic, 0) + 1
                 count = failures[topic]
                 if _should_log_failure(count):
-                    print(f"[dds-bridge] publish failed topic={topic} count={count}: {exc}", flush=True)
+                    print(f"[dds-bridge] publish failed topic={_safe_topic(topic)} count={count}: {exc}", flush=True)
     finally:
         try:
             node.destroy_node()
