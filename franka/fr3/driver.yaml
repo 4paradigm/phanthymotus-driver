@@ -6,7 +6,7 @@ hardware_model: fr3
 image_name: franka-fr3
 port: 15723
 mcp_url: "http://localhost:15723/mcp"
-description: "Franka FR3 joint states, bounded joint control, RealSense camera streams and URDF skeleton model; multiple robot IPs share one driver using the official libfranka SDK"
+description: "Franka FR3 joint states, bounded joint control, Franka Hand gripper, RealSense camera streams and URDF skeleton model; multiple robot IPs share one driver using the official libfranka SDK"
 build_context_extras:
   - ../../common
 cards:

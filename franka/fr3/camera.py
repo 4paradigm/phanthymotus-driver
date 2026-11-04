@@ -82,7 +82,7 @@ class ExtCameraPlugin:
         return {"device_path": path, "channel": channel}, device
 
     def _make_node(self, instance_id, cfg, device):
-        # Lazy import keeps tools/list and arm/master cards usable without a camera SDK.
+        # Lazy import keeps tools/list and arm cards usable without a camera SDK.
         from franka.fr3.realsense import RealSenseSession
 
         serial = device["serial_number"]
