@@ -1496,9 +1496,9 @@ def test_sdk_lease_uses_receipt_watchdog_only(setup):
     send(plugin, cmd)
     assert plugin._backend.deadlines[-1] == pytest.approx(cmd["stamp_ms"] + 500, abs=1)
     setup.clock.advance()
-    # Observation age only gates admission: a 450ms-old detection still gets
+    # Observation age only gates admission: a 550ms-old detection still gets
     # the full receipt lease instead of 50ms.
-    cmd = command(setup, seq=2, obs_stamp_ms=int(setup.clock.time() * 1000) - 450)
+    cmd = command(setup, seq=2, obs_stamp_ms=int(setup.clock.time() * 1000) - 550)
     send(plugin, cmd)
     assert plugin._backend.deadlines[-1] == pytest.approx(cmd["stamp_ms"] + 500, abs=1)
 
