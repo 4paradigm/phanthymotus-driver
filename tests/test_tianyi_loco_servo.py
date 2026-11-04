@@ -251,6 +251,22 @@ def test_startup_is_inert_and_domain_routing_is_correct(setup):
     assert "LocoServoPlugin" not in (DRIVER / "main.py").read_text().split("_ALWAYS_START =", 1)[1].split("}", 1)[0]
 
 
+def test_measured_footprint_is_reported_and_survives_live_reconfiguration(setup):
+    descriptor = setup.module.build_descriptor()
+    assert descriptor["footprint"] == {"half_width": 0.275,
+                                       "source": "measured"}
+
+    plugin = start(setup)
+    assert plugin._info()["control_interface"]["footprint"] == descriptor["footprint"]
+
+    # A speed preset rebuilds and reparses the live descriptor. The physical
+    # envelope is independent of that setting and must not disappear from the
+    # copy returned to Navi afterward.
+    result = plugin.dispatch("config", {"speed_preset": "fast"})
+    assert result["ok"]
+    assert result["control_interface"]["footprint"] == descriptor["footprint"]
+
+
 @pytest.mark.parametrize("yaw", [-1.0, 1.0])
 def test_default_search_yaw_limit_reaches_sdk_with_ramp_and_rejects_excess(setup, yaw):
     plugin = start(setup)
