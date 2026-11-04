@@ -25,9 +25,14 @@ frame; a frame waiting locally for 500ms is discarded. A single ROS timer
 has been replaced by one latest-only worker: the ROS callback only swaps the
 pending frame, while crop, zlib compression, and the synchronous bridge write
 run outside both executors. The worker never replays old frames or catches up
-in a burst. `info` reports target/average Hz, coalesced/stale/error counts,
-worker health, payload size, and encode/bridge/total processing and interval
-timings so a remaining device or socket bottleneck is visible on the robot.
+in a burst. Nearest-neighbour resize uses direct integer sampling instead of an
+OpenCV worker pool, and the lossless zlib stream uses the bounded `Z_RLE`
+strategy so noisy hardware depth cannot spend hundreds of milliseconds in the
+general match search. The wire format and every uint16 millimetre sample remain
+unchanged. `info` reports target/average Hz, coalesced/stale/error counts,
+worker health, payload size, separate transform/compress timings, and
+encode/bridge/total processing and interval timings so a remaining device or
+socket bottleneck is visible on the robot.
 
 On the canvas, connect head RGB to `vop`, `vop` to `navi`, `camera_depth` to
 `navi`'s depth input, `loco_state` to its odometry input, and `navi` to

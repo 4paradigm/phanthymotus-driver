@@ -28,21 +28,18 @@ def test_native_depth_geometry_is_unknown_until_successful_publication(depth_plu
 
 def test_crop_diagnostic_matches_the_actual_native_crop(depth_plugin):
     plugin, _, _ = depth_plugin
-    calls = []
-    plugin._cv2.INTER_NEAREST = 0
-
-    def resize(data, size, interpolation):
-        calls.append((data.shape, size))
-        return np.full((size[1], size[0]), 1234, np.uint16)
-
-    plugin._cv2.resize = resize
     message = types.SimpleNamespace(
         width=1280, height=720, step=2560, encoding="16UC1", is_bigendian=0,
         data=np.full((720, 1280), 1234, dtype="<u2").tobytes(),
         header=types.SimpleNamespace(stamp="source", frame_id="native_depth_optical"))
     plugin._on_image(message)
     plugin._publish_latest()
-    assert calls == [((720, 960), (640, 480))]
+    # The fast path performs the documented crop and nearest-neighbour sample
+    # directly with NumPy; the constant source must stay bit-exact.
+    import zlib
+    decoded = np.frombuffer(
+        zlib.decompress(plugin._pub.messages[0].data), dtype="<u2").reshape(480, 640)
+    np.testing.assert_array_equal(decoded, np.full((480, 640), 1234, np.uint16))
     geometry = plugin.dispatch("info", {})["source_geometry"]
     assert (geometry["width"], geometry["height"]) == (1280, 720)
     assert geometry["crop_xywh"] == [160, 0, 960, 720]
