@@ -23,6 +23,7 @@ from dobot_sdk.version import __version__ as SDK_VERSION
 
 
 PACKET_SIZE = 1440
+FEEDBACK_PERIOD_S = {30004: 0.008, 30005: 0.2, 30006: 1.0}
 SDK_COMMIT = "55ec1ec82201aaf2e6d54aa47b6272bbaa14c815"
 ROBOT_MODES = {
     0: "unknown", 1: "initializing", 2: "brake_open", 3: "power_off",
@@ -140,9 +141,9 @@ class FeedbackClient:
             os.environ.get("DOBOT_FEEDBACK_PORT", config.get("feedback_port", 30004)),
         )
         self.model_name = os.environ.get("DOBOT_MODEL_NAME", config.get("model_name", ""))
-        self.stale_timeout = positive_number(config.get("stale_timeout_s", 2), "stale_timeout_s")
+        self._configured_stale_timeout = positive_number(config.get("stale_timeout_s", 2), "stale_timeout_s")
         self.connect_timeout = positive_number(config.get("connect_timeout_s", 2), "connect_timeout_s")
-        self.receive_timeout = positive_number(config.get("receive_timeout_s", 1), "receive_timeout_s")
+        self._configured_receive_timeout = positive_number(config.get("receive_timeout_s", 1), "receive_timeout_s")
         self.reconnect_delay = positive_number(config.get("reconnect_delay_s", 1), "reconnect_delay_s")
         self._factory = connection_factory
         self._clock = clock
@@ -156,9 +157,29 @@ class FeedbackClient:
         self._received_wall_ms = None
         self._transport_connected = False
         self._error = None
+        self._cleanup_error = None
         self._packets = 0
         self._invalid_packets = 0
         self._discarded_bytes = 0
+
+    @property
+    def receive_timeout(self):
+        # Config values are lower bounds. Allow three expected periods so a
+        # 1 Hz stream is not disconnected at its next nominal packet deadline.
+        return max(self._configured_receive_timeout, 3 * FEEDBACK_PERIOD_S[self.port])
+
+    @property
+    def stale_timeout(self):
+        return max(self._configured_stale_timeout, 3 * FEEDBACK_PERIOD_S[self.port])
+
+    def _disconnect(self, connection):
+        try:
+            disconnect(connection)
+        except Exception as exc:
+            # Cleanup must not kill the receive worker or skip stop/join. Keep
+            # the primary transport error and expose cleanup failure separately.
+            with self._lock:
+                self._cleanup_error = str(exc)
 
     def configure(self, address, port):
         address, port = endpoint(address, port)
@@ -170,6 +191,7 @@ class FeedbackClient:
                 self.address, self.port = address, port
                 self._latest = self._received_at = self._received_wall_ms = None
                 self._error = None
+                self._cleanup_error = None
                 self._packets = self._invalid_packets = self._discarded_bytes = 0
             self.start()
 
@@ -189,7 +211,7 @@ class FeedbackClient:
             with self._lock:
                 connection = self._connection
             if connection is not None:
-                disconnect(connection)
+                self._disconnect(connection)
             thread = self._thread
             if thread is not None:
                 thread.join(self.connect_timeout + self.receive_timeout + 2)
@@ -201,15 +223,16 @@ class FeedbackClient:
 
     def _run(self):
         while not self._stop.is_set():
-            connection = self._factory(self.address, self.port)
-            stream = PacketStream()
-            connection.set_timeout(self.connect_timeout, self.receive_timeout)
-            with self._lock:
-                self._connection = connection
-                # A new transport must deliver its own valid record before it
-                # becomes healthy; do not revive the previous session's cache.
-                self._received_at = None
+            connection = None
             try:
+                connection = self._factory(self.address, self.port)
+                stream = PacketStream()
+                connection.set_timeout(self.connect_timeout, self.receive_timeout)
+                with self._lock:
+                    self._connection = connection
+                    # A new transport must deliver its own valid record before it
+                    # becomes healthy; do not revive the previous session's cache.
+                    self._received_at = None
                 connection.connect()
                 with self._lock:
                     self._transport_connected = True
@@ -234,6 +257,7 @@ class FeedbackClient:
                             self._received_wall_ms = int(time.time() * 1000)
                             self._packets += 1
                             self._error = None
+                            self._cleanup_error = None
                     with self._lock:
                         self._discarded_bytes += stream.discarded_bytes
                     stream.discarded_bytes = 0
@@ -244,10 +268,13 @@ class FeedbackClient:
                     if not self._stop.is_set():
                         self._error = str(exc)
             finally:
-                disconnect(connection)
-                with self._lock:
-                    self._connection = None
-                    self._transport_connected = False
+                try:
+                    if connection is not None:
+                        self._disconnect(connection)
+                finally:
+                    with self._lock:
+                        self._connection = None
+                        self._transport_connected = False
             self._stop.wait(self.reconnect_delay)
 
     def snapshot(self):
@@ -263,6 +290,8 @@ class FeedbackClient:
                 "received_at_ms": self._received_wall_ms,
                 "controller_ip": self.address,
                 "feedback_port": self.port,
+                "receive_timeout_s": self.receive_timeout,
+                "stale_timeout_s": self.stale_timeout,
                 # Geometry identification may survive a feedback outage; joint
                 # positions below remain withheld whenever the stream is stale.
                 "robot_type_code": None if self._latest is None else self._latest["robot_type"],
@@ -270,6 +299,7 @@ class FeedbackClient:
                 "invalid_packets": self._invalid_packets,
                 "discarded_bytes": self._discarded_bytes,
                 "error": self._error,
+                "cleanup_error": self._cleanup_error,
                 # Never display cached positions as current data after an outage.
                 "data": copy.deepcopy(self._latest) if fresh else None,
             }

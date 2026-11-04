@@ -45,6 +45,11 @@ Upstream is unmodified. The adapter handles:
   dataclass serialization; both safety bytes retain their unsigned high bits.
 - Guaranteed socket close after upstream disconnect, including failed-connect
   sockets for which shutdown can fail before the SDK reaches its close call.
+  Cleanup exceptions are contained by the client so reconnect and stop/join
+  still complete; diagnostics retain them separately as `cleanup_error`.
+- Receive and freshness timeouts allow at least three nominal feedback periods,
+  including after port changes from the connection card. Port 30006 therefore
+  gets at least 3 seconds instead of timing out at its 1-second packet interval.
 
 The SDK's command APIs are installed for future extensions, but are not
 reachable through this sensor-only driver. There is no automatic

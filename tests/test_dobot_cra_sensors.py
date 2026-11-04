@@ -338,6 +338,144 @@ def test_failed_connect_socket_is_closed_even_if_sdk_shutdown_fails():
         right.close()
 
 
+@pytest.mark.parametrize("failure_stage", ["connect", "receive"])
+def test_worker_reconnects_after_sdk_disconnect_raises(failure_stage):
+    left, right = socket.socketpair()
+    second_connecting = threading.Event()
+    allow_second = threading.Event()
+
+    class BrokenCleanup(FakeConnection):
+        _socket = left
+
+        def connect(self):
+            if failure_stage == "connect":
+                raise ConnectionError("connect failed")
+
+        def disconnect(self):
+            super().disconnect()
+            raise OSError("SDK cleanup failed")
+
+    class NextConnection(FakeConnection):
+        def connect(self):
+            second_connecting.set()
+            if not allow_second.wait(2):
+                raise TimeoutError("test did not release reconnect")
+
+    first = BrokenCleanup([packet(), ConnectionError("stream lost")])
+    second = NextConnection([packet(angle=33)])
+    calls = []
+
+    def factory(address, port):
+        calls.append(port)
+        return first if len(calls) == 1 else second
+
+    client = FeedbackClient(
+        {"controller_ip": "127.0.0.1", "reconnect_delay_s": 0.01},
+        connection_factory=factory,
+    )
+    client.start()
+    try:
+        assert second_connecting.wait(2)
+        snapshot = client.snapshot()
+        assert snapshot["transport_connected"] is False
+        assert snapshot["data"] is None
+        assert snapshot["cleanup_error"] == "SDK cleanup failed"
+        assert snapshot["error"] == ("connect failed" if failure_stage == "connect" else "stream lost")
+        assert left.fileno() == -1
+        assert client._thread.is_alive()
+        allow_second.set()
+        wait_until(lambda: client.snapshot()["connected"])
+        snapshot = client.snapshot()
+        assert snapshot["data"]["joint_state"]["q_actual"][0] == 33
+        assert snapshot["cleanup_error"] is None
+        assert snapshot["error"] is None
+        assert calls == [30004, 30004]
+    finally:
+        allow_second.set()
+        client.stop()
+        left.close()
+        right.close()
+    assert client._thread is None
+    assert client._connection is None
+
+
+def test_stop_joins_worker_even_when_sdk_cleanup_raises():
+    class BrokenCleanup(FakeConnection):
+        def disconnect(self):
+            super().disconnect()
+            raise OSError("SDK cleanup failed")
+
+    connection = BrokenCleanup([packet()])
+    client = FeedbackClient(
+        {"controller_ip": "127.0.0.1"},
+        connection_factory=lambda address, port: connection,
+    )
+    client.start()
+    try:
+        wait_until(lambda: client.snapshot()["connected"])
+    finally:
+        client.stop()
+    assert client._thread is None
+    assert client._connection is None
+    assert client.snapshot()["transport_connected"] is False
+    assert client.snapshot()["cleanup_error"] == "SDK cleanup failed"
+
+
+def test_port_change_recalculates_timeout_margin_without_overwriting_config():
+    client = FeedbackClient({})
+    assert (client.receive_timeout, client.stale_timeout) == (1, 2)
+    client.configure("", 30006)
+    assert (client.receive_timeout, client.stale_timeout) == (3, 3)
+    assert client.snapshot()["receive_timeout_s"] == 3
+    assert client.snapshot()["stale_timeout_s"] == 3
+    client.configure("", 30005)
+    assert (client.receive_timeout, client.stale_timeout) == (1, 2)
+    client.configure("", 30004)
+    assert (client.receive_timeout, client.stale_timeout) == (1, 2)
+    custom = FeedbackClient({"receive_timeout_s": 4, "stale_timeout_s": 5, "feedback_port": 30006})
+    assert (custom.receive_timeout, custom.stale_timeout) == (4, 5)
+
+
+def test_connection_card_accepts_delayed_one_hz_packets_without_reconnecting():
+    from dobot_sdk.core.connection import DobotConnection
+
+    reader, writer = socket.socketpair()
+    calls = []
+
+    def factory(address, port):
+        calls.append(port)
+        connection = DobotConnection(address, port)
+
+        def connect():
+            connection._socket = reader
+            reader.settimeout(connection._receive_timeout)
+            connection._connected = True
+
+        connection.connect = connect
+        return connection
+
+    client = FeedbackClient({}, connection_factory=factory)
+    plugin = DobotSensors({}, client=client)
+    # Exercise the same port-selection path as the UI, not just initial config.
+    plugin.dispatch("start", {
+        "_tool_name": "connection", "controller_ip": "127.0.0.1", "feedback_port": 30006,
+    })
+    try:
+        writer.sendall(packet(angle=10))
+        wait_until(lambda: client.snapshot()["packets_received"] == 1)
+        time.sleep(1.15)  # One nominal period plus realistic scheduling jitter.
+        assert client.snapshot()["connected"]
+        writer.sendall(packet(angle=20))
+        wait_until(lambda: client.snapshot()["packets_received"] == 2)
+        snapshot = client.snapshot()
+        assert snapshot["data"]["joint_state"]["q_actual"][0] == 20
+        assert snapshot["error"] is None
+        assert calls == [30006]
+    finally:
+        client.stop()
+        writer.close()
+
+
 def test_real_sdk_receive_path_is_receive_only():
     from dobot_sdk.core.connection import DobotConnection
 
