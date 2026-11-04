@@ -1,8 +1,9 @@
-# Franka FR3 state driver
+# Franka FR3 joint control, state and external camera driver
 
-One ARM64 container exposes one read-only `joint_states` sensor card, plus the
-`model` resource automatically fetched for visualization. Each sensor instance
-has its own persistent `robot_ip` setting in the canvas gear menu. Multiple cards
+One ARM64 container exposes `joint_control` plus read-only `joint_states` and `ext_camera` sensor
+cards, plus the `model` resource automatically fetched for visualization. Each arm-state/control
+instance has its own persistent `robot_ip` setting in the canvas gear menu; camera
+instances select a USB serial independently. Multiple arm cards
 using the same IP share one state reader; different IPs have independent readers
 and retry timers. No IP, credentials or installation-specific configuration is
 embedded in the image.
@@ -191,3 +192,108 @@ Only `joint_states` needs to be placed on the canvas. If the monitoring dashboar
 was opened before project startup, reopen it after startup so Core refreshes
 the topic formats. Tests cover multiple sessions with fixtures; multiple physical
 arms and their network capacity still require hardware validation.
+
+## External RealSense camera
+
+This development version retains the read-only joint monitor and
+model, and adds only `ext_camera`. It contains no joint-control, gripper or master
+plugin. Camera capture is independent of robot-controller power and FCI.
+
+Select the device by USB serial in each card. The serial is deployment configuration,
+not embedded in the image. RGB and infrared publish JPEG; depth publishes
+`image/depth-zlib`: zlib-compressed 640x480 little-endian uint16 millimetres,
+with zero indicating invalid or unrepresentable depth. Depth is not RGB-aligned.
+The card's `info.topic_out` reports the exact selected channel and topic.
+Multiple cards on one serial share a capture session. Saving a running card automatically switches its camera/channel. Same-camera
+channel changes update the publishing route without reopening USB capture.
+Idle cards save configuration without starting capture. In the canvas, close
+the preview, select a channel with the card gear, save, and reopen the preview.
+An already-open preview remains subscribed to its original topic. Missing cameras retain their selection and
+retry without substituting another serial. Inspect `fresh`, `frames_published`,
+`state` and `error`; a frozen renderer image alone is not proof of a live camera.
+
+The backend is local to `franka/fr3/camera_backend.py` and `realsense.py`;
+no RealMan robot SDK is required. The service fragment exposes host USB/video
+nodes using device cgroup rules, without privileged mode. Its `/dev` mount is
+read-only, while device I/O remains permitted and `/dev/shm` is a writable tmpfs.
+Do not open another camera capture program on the same serial during validation.
+
+Offline tests: `python -m pytest tests/test_franka_ext_camera.py tests/test_franka_realsense.py`.
+Physical RGB/depth/infrared, USB reconnect and ARM64 image acceptance remain required.
+
+For the 2026-11-02 development build, the verified network overrides are:
+
+```bash
+docker build --network host \
+  --build-arg ROS_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu \
+  --build-arg PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple \
+  -t franka-fr3:camera-standalone-20261102 <prepared-context>
+```
+
+These overrides select dependency mirrors only; Core source and runtime are not modified.
+
+## Camera frame and timing semantics
+
+Each physical camera/channel uses a stable optical frame ID containing its serial
+identity. Multiple cards selecting that same camera/channel share the frame ID;
+different cameras do not. This is an identity label, not a camera-to-arm transform.
+`info.frame_id` matches the image header.
+
+`timestamp_source=publication_clock` identifies ROS publication time; hardware
+capture time is not currently exposed. `fps` remains the SDK profile rate, not a
+measured capture or publish rate. Depth reports `depth_unit=mm`,
+`invalid_depth_value=0`, and `depth_aligned_to_rgb=false`. It is native depth,
+not registered to the RGB image. Infrared is the left reflected-near-infrared
+intensity image; it measures neither temperature nor distance.
+
+## Camera interface declaration
+
+Each ext_camera instance has one dynamic output port. tools/list declares one
+placeholder; instance info returns its exact topic and image/jpeg or
+image/depth-zlib format. Consumers must resolve info before subscribing.
+camera_info.id is the stable family-level intel/realsense/<channel> identifier,
+independent of USB discovery and display names. It does not assert a D435i lens
+calibration: optics remain unknown. Physical identity remains in serial/frame_id.
+
+## Joint control
+
+`joint_control` is an actuator with per-instance robot_ip and speed_deg_s.
+Start binds the selected robot; it never initiates motion. `set` supplies absolute
+J1–J7 degrees (at least one), `jog` applies a signed increment once, and
+`stopmotion` requests a confirmed controlled stop while retaining the card.
+Project/card stop releases its lease. Motion interrupts use stopmotion, including
+all active arms when the platform sends no instance_id. Omitted joints use fresh
+actual state. Targets retain a 0.01 rad joint-limit margin, speed is 0.1–10 deg/s,
+and the seventh-order trajectory bounds acceleration and jerk. Motions exceeding
+the fixed 120 s budget are rejected before backend submission without changing speed.
+
+Python manages cards and shared sessions; the C++ libfranka 0.18 backend owns one
+connection per robot IP. The standard Jetson deployment uses
+`FRANKA_REALTIME_POLICY=standard` and leaves `FRANKA_REMOTE_HOST` unset.
+It permits the stock Jetson kernel with libfranka's `kIgnore` option and
+still requires FIFO scheduling. Set `FRANKA_REALTIME_POLICY=enforce`
+to require PREEMPT_RT as well. The native binary defaults to enforce when
+run outside the deployment. Check scheduling and network performance on
+the target before motion acceptance.
+
+Configure `robot_ip` on each card before starting it. The driver validates it
+at runtime. The schema omits the required marker to support Core versions
+whose manual actuator call omits the instance ID. The driver binds such calls
+to a unique started card using the supplied output topic.
+
+Both `set` and `jog` can run for several seconds depending on travel and
+speed. They use one asynchronous contract, returning an action ID and
+reporting completed, cancelled or error through ACP. The state stream
+uses J1–J7 order. `actual_deg` and `target_deg` use degrees, and fields
+ending in `_rad`, `motion.target` and `motion.max_error` use radians.
+`desired_rad` is the controller's instantaneous desired position.
+
+Keep the previous driver container and configuration when deploying a new
+image. To roll back to an AOOSTAR deployment, stop the replacement driver
+and restore the previous container with its remote backend settings.
+
+Core interruption and card lifecycle
+remain separate; stopping without backend confirmation is an error. These are
+software interlocks, not collision-free path planning or a substitute for the
+physical emergency stop. Neither Cartesian control nor automatic obstacle
+avoidance is provided. Build/installation alone does not pass physical acceptance.

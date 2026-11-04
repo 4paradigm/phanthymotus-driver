@@ -1,4 +1,4 @@
-"""Read-only Franka FR3 joint states with per-card IP configuration."""
+"""Franka FR3 cards sharing one physical session per robot IP."""
 
 from __future__ import annotations
 
@@ -7,11 +7,12 @@ import logging
 import math
 import re
 import threading
+import time
 from pathlib import Path
 
-from common.vendor_runtime import tool
+from common.vendor_runtime import action_schema, tool
 from discovery import Discovery
-from hardware import SessionManager, canonical_ip
+from hardware import JOINT_LOWER, JOINT_UPPER, JOINT_MARGIN, SessionManager, canonical_ip
 
 
 JOINT_NAMES = tuple(f"fr3_joint{i}" for i in range(1, 8))
@@ -72,6 +73,7 @@ class FrankaPlugin:
     """Canvas instances are consumers; sessions own physical connections."""
 
     PREFIX = "joint_states"
+    CONFIG_FIELDS = ("robot_ip", "manual_robot_ip", "publish_hz")
 
     def __init__(self, config, namespace="franka", ros2=None, *, manager=None,
                  publisher_factory=None, discovery=None):
@@ -183,6 +185,7 @@ class FrankaPlugin:
                 if other_id != instance_id and other_id.replace("-", "_") == instance_id.replace("-", "_"):
                     raise ValueError("instance_id collides with another card's DDS topic")
             instance = self._instances[instance_id] = _Instance()
+            instance.instance_id = instance_id
             return instance
 
     def _topic(self, instance_id):
@@ -190,6 +193,9 @@ class FrankaPlugin:
         # per canvas instance so several FR3s can coexist without topic clashes.
         return [{"topic": f"/{self._namespace}/{instance_id.replace('-', '_')}/state/joints",
                  "format": JOINT_FORMAT}]
+
+    def _owner_key(self, instance_id):
+        return (self.PREFIX, instance_id)
 
     @staticmethod
     def _validate(cfg):
@@ -293,7 +299,7 @@ class FrankaPlugin:
                 publisher.close()
         finally:
             if session is not None:
-                self._manager.release(instance.config["robot_ip"], key)
+                self._manager.release(instance.config["robot_ip"], self._owner_key(key))
 
     def _start_cancelled(self, instance, epoch):
         with self._lock:
@@ -307,7 +313,7 @@ class FrankaPlugin:
             return None
         if action not in ("config", "start", "stop", "info"):
             return None
-        allowed = ("robot_ip", "manual_robot_ip", "publish_hz")
+        allowed = self.CONFIG_FIELDS
         supplied = {key: args[key] for key in allowed if key in args}
         if action == "config" and args.get("instance_id", "") == "":
             # Core's sidebar may send instance fields as shared defaults.
@@ -338,15 +344,22 @@ class FrankaPlugin:
                 # Preserve manual mode for partial config updates, separately
                 # from the resolved IP/frequency used by sessions and publishers.
                 selection = {**defaults, **instance.selection, **supplied}
-                cfg = self._validate(selection)
-                if instance.session is not None and cfg != instance.config:
-                    raise ValueError("Stop this card before changing its IP or publish frequency")
-                instance.selection = {**selection, "publish_hz": cfg["publish_hz"]}
+                try:
+                    cfg = self._validate(selection)
+                    if instance.session is not None and cfg != instance.config:
+                        raise ValueError("Stop this card before changing its IP or publish frequency")
+                except Exception as exc:
+                    # A caller may persist a rejected config before applying it.
+                    # Controllers must not silently move using the previous IP.
+                    instance.configuration_error = str(exc)
+                    raise
+                instance.configuration_error = None
+                instance.selection = {**selection, **{k: v for k, v in cfg.items() if k != "robot_ip"}}
                 instance.config = cfg
                 if action == "start" and instance.session is None:
                     if not cfg.get("robot_ip"):
                         raise ValueError("robot_ip is required; configure this card before starting")
-                    instance.session = self._manager.acquire(cfg["robot_ip"], instance_id)
+                    instance.session = self._manager.acquire(cfg["robot_ip"], self._owner_key(instance_id))
                     try:
                         if self._start_cancelled(instance, epoch):
                             self._stop_instance(instance_id, instance)
@@ -370,5 +383,345 @@ class FrankaPlugin:
         return None
 
 
+class JointControlPlugin(FrankaPlugin):
+    """Discrete joint targets; the shared session owns hardware arbitration."""
+
+    PREFIX = "joint_control"
+    CONFIG_FIELDS = FrankaPlugin.CONFIG_FIELDS + ("speed_deg_s",)
+
+    def __init__(self, *args, acp_callback=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._acp_callback = acp_callback or self._post_completion
+
+    @staticmethod
+    def _number(value, name, low=None, high=None):
+        error = f"{name} must be a finite number"
+        if low is not None and high is not None:
+            error += f" from {low:g} to {high:g}"
+        if isinstance(value, bool) or not isinstance(value, (float, int)):
+            raise ValueError(error)
+        try:
+            value = float(value)
+        except OverflowError:
+            raise ValueError(error) from None
+        if (not math.isfinite(value) or (low is not None and value < low)
+                or (high is not None and value > high)):
+            raise ValueError(error)
+        return value
+
+    @staticmethod
+    def _validate(cfg):
+        cfg = FrankaPlugin._validate(cfg)
+        cfg["speed_deg_s"] = JointControlPlugin._number(
+            cfg.get("speed_deg_s", 5), "speed_deg_s", 0.1, 10)
+        return cfg
+
+    def get_tools(self):
+        definition = super().get_tools()[0]
+        config = definition["configSchema"]
+        # Official Core actuator click handler may omit instance_id. Its
+        # preflight cannot resolve an instance-scoped required robot_ip then.
+        # Backend still requires configured IP at start and exact card binding
+        # plus fresh, control-ready state before any motion; never guess an IP.
+        config.pop("required", None)
+        config["properties"]["speed_deg_s"] = {
+            "type": "number", "title": "默认速度 (度/秒)", "scope": "instance",
+            "minimum": 0.1, "maximum": 10, "default": 5,
+        }
+        properties = {
+            f"joint{i + 1}_deg": {
+                "type": "number", "title": f"J{i + 1} 目标角度 (度)",
+                "minimum": math.degrees(low + JOINT_MARGIN),
+                "maximum": math.degrees(high - JOINT_MARGIN),
+                "description": "绝对角度；留空则保持本次开始时的实际角度。",
+            } for i, (low, high) in enumerate(zip(JOINT_LOWER, JOINT_UPPER))
+        }
+        properties.update({
+            "output_topic": {"type": "string",
+                             "description": "由画布输出端口自动传入，用于匹配控制卡；无需填写。"},
+            "speed_deg_s": {"type": "number", "title": "速度 (度/秒)",
+                            "minimum": 0.1, "maximum": 10,
+                            "description": "各轴速度上限；留空使用卡片默认速度。"},
+            "joint": {"type": "integer", "title": "关节", "enum": list(range(1, 8))},
+            "step_deg": {"type": "number", "title": "点动增量 (度)",
+                         "default": 1,
+                         "description": "有符号单次增量，不能为零；每次点击执行一次。"},
+        })
+        schema = action_schema({
+            "set": ([*(f"joint{i}_deg" for i in range(1, 8)), "speed_deg_s"],
+                    "设置一个或多个关节的绝对角度（度）；至少填写一个关节。"),
+            "jog": (["joint", "step_deg", "speed_deg_s"], "单关节点动，按有符号增量移动一次。"),
+            # Match RealMan's public name; lifecycle "stop" remains internal.
+            "stopmotion": ([], "停止所选机械臂当前运动并保留本控制卡，不需要动作 ID；独立状态卡继续读取。"),
+            "info": ([], "查看实际角度、目标角度、执行状态及控制就绪条件。"),
+        }, properties)
+        schema["x-completion"] = {"actions": ["set", "jog"], "timeout": 130}
+        schema["x-resource"] = "arm"
+        schema["x-is-dangerous"] = True
+        schema["x-hooks"] = {key: {"action": "stopmotion"}
+                             for key in ("on_interrupt_motion", "on_interrupt_all")}
+        return [{**tool(self.PREFIX, "actuator",
+                        "Franka FR3 关节控制：J1–J7 角度设置、单次点动及运动停止。", schema,
+                        topic_out=[{"format": "data/json"}]),
+                 "multiInstance": True, "configSchema": config}]
+
+    def _topic(self, instance_id):
+        return [{"topic": f"/{self._namespace}/{instance_id.replace('-', '_')}/state/joint_control",
+                 "format": "data/json"}]
+
+    def _resolve_card(self, args):
+        """Use the existing output-port binding when the canvas omits the ID."""
+        instance_id = args.get("instance_id")
+        topic = args.get("output_topic")
+        if "output_topic" in args and (not isinstance(topic, str) or not topic):
+            raise ValueError("output_topic must identify this control card")
+        if instance_id:
+            instance_id = self._instance_id(args)
+            if topic is not None and topic != self._topic(instance_id)[0]["topic"]:
+                raise ValueError("Control card instance_id and output_topic do not match")
+            return args
+        with self._lock:
+            matches = [key for key in self._instances
+                       if topic is not None and self._topic(key)[0]["topic"] == topic]
+        if len(matches) != 1:
+            raise ValueError("Control card identity is missing or unknown; start this card and refresh the canvas")
+        return {**args, "instance_id": matches[0]}
+
+    def _info(self, instance_id, instance):
+        snapshot = instance.session.snapshot() if instance.session is not None else {}
+        motion = instance.session.motion() if instance.session is not None else {}
+        active = instance.publisher is not None
+        connected = snapshot.get("connected", False)
+        configuration_error = getattr(instance, "configuration_error", None)
+        state = ("ready" if connected else "loading") if active else "idle"
+        if motion.get("status") in ("submitted", "accepted", "queued", "running", "stopping") and active:
+            state = "running"
+        if instance.publish_error or configuration_error:
+            state = "error"
+        actual = snapshot.get("q")
+        target = motion.get("target")
+        return {
+            "state": state, "robot_ip": instance.config.get("robot_ip", ""),
+            "connected": connected, "readiness": snapshot.get("state", "idle"),
+            "control_ready": active and connected and not configuration_error and snapshot.get("control_ready", False),
+            "control_error": snapshot.get("control_error"),
+            "rt_kernel": snapshot.get("rt_kernel"), "sched_fifo": snapshot.get("sched_fifo"),
+            "data_age_ms": snapshot.get("data_age_ms"), "read_only": False,
+            "actual_rad": actual,
+            "actual_deg": None if actual is None else [math.degrees(q) for q in actual],
+            "target_rad": target,
+            "target_deg": None if target is None else [math.degrees(q) for q in target],
+            "desired_rad": snapshot.get("q_d"), "robot_mode": snapshot.get("robot_mode"),
+            "motion": motion, "last_result": getattr(instance, "last_result", None),
+            "acp": getattr(instance, "acp", None),
+            "error": configuration_error or instance.publish_error or snapshot.get("error"),
+            "publication_error": instance.publish_error,
+            "position_unit": "deg", "speed_unit": "deg/s",
+            "topic_in": [], "topic_out": self._topic(instance_id),
+        }
+
+    def _publish(self, instance, epoch):
+        if not instance.lock.acquire(blocking=False):
+            return
+        try:
+            if (self._start_cancelled(instance, epoch) or instance.publisher is None
+                    or instance.session is None):
+                return
+            # Status frames carry freshness explicitly; stale actual angles are null.
+            instance.publisher.publish(self._info(instance.instance_id, instance))
+            instance.publish_error = None
+        except Exception as exc:
+            instance.publish_error = f"Control status publication failed: {str(exc)[:200]}"
+        finally:
+            instance.lock.release()
+
+    def _stop_instance(self, key, instance):
+        # Do not detach the publisher/session before confirmed backend termination.
+        if instance.session is not None:
+            instance.session.release_owner(self._owner_key(key))
+        super()._stop_instance(key, instance)
+
+    def _prepare_target(self, action, args, instance):
+        if getattr(instance, "configuration_error", None):
+            raise RuntimeError("Resolve this card's rejected configuration before motion: "
+                               + instance.configuration_error)
+        if instance.publisher is None or instance.session is None:
+            raise RuntimeError("Start this joint_control card before requesting motion")
+        snapshot = instance.session.snapshot()
+        current = snapshot.get("q")
+        if (not snapshot.get("connected") or current is None or len(current) != 7
+                or any(not math.isfinite(q) for q in current)):
+            raise RuntimeError("Fresh robot state is required before motion")
+        target = list(current)
+        if action == "set":
+            supplied = [i for i in range(7) if f"joint{i + 1}_deg" in args]
+            if not supplied:
+                raise ValueError("Set at least one joint1_deg through joint7_deg")
+            for i in supplied:
+                name = f"joint{i + 1}_deg"
+                target[i] = math.radians(self._number(
+                    args[name], name, math.degrees(JOINT_LOWER[i] + JOINT_MARGIN),
+                    math.degrees(JOINT_UPPER[i] - JOINT_MARGIN)))
+        else:
+            joint = args.get("joint")
+            # Canvas enum selects serialize their values as strings.
+            if isinstance(joint, str) and joint in ("1", "2", "3", "4", "5", "6", "7"):
+                joint = int(joint)
+            if isinstance(joint, bool) or not isinstance(joint, int) or not 1 <= joint <= 7:
+                raise ValueError("joint must be an integer from 1 to 7")
+            step = self._number(args.get("step_deg", 1), "step_deg")
+            if step == 0:
+                raise ValueError("step_deg must not be zero")
+            target[joint - 1] += math.radians(step)
+        for i, value in enumerate(target):
+            if not JOINT_LOWER[i] + JOINT_MARGIN <= value <= JOINT_UPPER[i] - JOINT_MARGIN:
+                raise ValueError(f"J{i + 1} target is outside the allowed joint range")
+        speed = self._number(args.get("speed_deg_s", instance.config["speed_deg_s"]),
+                             "speed_deg_s", 0.1, 10)
+        if not snapshot.get("control_ready"):
+            raise RuntimeError(snapshot.get("control_error") or "Robot backend is not ready for motion")
+        distance = max(abs(goal - start) for goal, start in zip(target, current))
+        duration = max(1.0, 2.1875 * distance / math.radians(speed),
+                       math.sqrt(7.514 * distance / 0.3), (52.5 * distance) ** (1 / 3))
+        if duration + 2.0 > 120:
+            raise ValueError(f"预计轨迹耗时 {duration:.1f} 秒，超过120秒动作限制；请减小角度或自行选择更高速度")
+        return target, math.radians(speed)
+
+    def _complete(self, instance, session, action_id):
+        try:
+            result = session.wait(action_id, timeout=125)
+        except Exception as exc:
+            # A lost acknowledgement must stop the actual backend, not just the waiter.
+            try:
+                session.stop_motion(command_id=action_id)
+            except Exception as stop_error:
+                result = {"status": "failed", "error": f"{exc}; stop failed: {stop_error}"}
+            else:
+                result = {"status": "failed", "error": str(exc)}
+        status = {"succeeded": "completed", "cancelled": "cancelled"}.get(result.get("status"), "error")
+        with instance.lock:
+            if getattr(instance, "last_action_id", None) == action_id:
+                instance.last_result = {"action_id": action_id, "status": status, "result": result}
+                instance.acp = {"action_id": action_id, "state": "pending"}
+        error = None
+        # Completion IDs are idempotent at Core; bounded retry handles transient failures.
+        for attempt in range(3):
+            try:
+                self._acp_callback(action_id, status, result)
+                error = None
+                break
+            except Exception as exc:
+                error = str(exc)[:240]
+                if attempt < 2:
+                    time.sleep(0.25 * (attempt + 1))
+        with instance.lock:
+            if getattr(instance, "last_action_id", None) == action_id:
+                instance.acp = {"action_id": action_id, "state": "failed" if error else "accepted",
+                                "error": error}
+
+    def _post_completion(self, action_id, status, result):
+        import os
+        import ssl
+        import urllib.request
+
+        ca = os.environ.get("AGENT_CORE_CA_CERT")
+        if not ca:
+            raise RuntimeError("AGENT_CORE_CA_CERT is required for ACP completion")
+        context = ssl.create_default_context(cafile=ca)
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
+        body = {"action_id": action_id, "status": status, "result": result,
+                "tool": self.PREFIX, "ts": time.time()}
+        url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+        request = urllib.request.Request(url + "/api/acp/complete",
+                                         data=json.dumps(body, allow_nan=False).encode(),
+                                         headers={"Content-Type": "application/json"}, method="POST")
+        with opener.open(request, timeout=3) as response:
+            acknowledgement = json.load(response)
+        if (not isinstance(acknowledgement, dict) or acknowledgement.get("ok") is not True
+                or acknowledgement.get("action_id") != action_id):
+            raise RuntimeError("Agent Core did not acknowledge this action_id")
+
+    def dispatch(self, action, args):
+        if args.get("_tool_name", action) != self.PREFIX:
+            return None
+        if action in ("set", "jog", "Stop") or (action == "stopmotion" and
+                (args.get("instance_id") or "output_topic" in args)) or (
+                action in ("info", "stop") and "output_topic" in args):
+            args = self._resolve_card(args)
+        # Keep old saved canvas actions working without advertising a second stop.
+        if action == "Stop":
+            action = "stopmotion"
+        if action in ("config", "start", "info"):
+            result = super().dispatch(action, args)
+            if result is not None:
+                result["read_only"] = False
+            return result
+        if action not in ("set", "jog", "stopmotion", "stop"):
+            return None
+        if action in ("stop", "stopmotion") and not args.get("instance_id"):
+            # Core fires driver-wide interrupt hooks without a canvas instance.
+            # Attempt every selected IP even when one backend rejects its stop.
+            with self._lock:
+                sessions = [instance.session for instance in self._instances.values()]
+            outcomes, errors, seen = [], [], set()
+            for session in sessions:
+                if session is None or id(session) in seen:
+                    continue
+                seen.add(id(session))
+                # Session submission/stop is atomic. A card lifecycle lock can
+                # be waiting for confirmation and must not delay another arm.
+                try:
+                    outcomes.append({"robot_ip": session.address,
+                                     "motion": session.stop_motion()})
+                except Exception as exc:
+                    errors.append(str(exc))
+            return {"state": "error" if errors else "stop_requested", "robots": outcomes,
+                    **({"error": "; ".join(errors)} if errors else {})}
+        instance_id = self._instance_id(args)
+        instance = self._get_instance(instance_id)
+        if action == "stop":
+            # This name is also the framework's lifecycle stop. Cancel pending
+            # startup before waiting on its lock, then stop the selected robot
+            # and detach this card only after backend confirmation.
+            with self._lock:
+                if instance.publisher is None:
+                    instance.start_epoch += 1
+        with instance.lock:
+            if action in ("set", "jog"):
+                target, speed = self._prepare_target(action, args, instance)
+                session = instance.session
+                action_id = session.move(self._owner_key(instance_id), target,
+                                         speed_rad_s=speed, tolerance_rad=math.radians(0.5), timeout_s=120)
+                instance.last_action_id = action_id
+                instance.acp = {"action_id": action_id, "state": "waiting_for_motion"}
+                threading.Thread(target=self._complete, args=(instance, session, action_id),
+                                 name=f"franka-acp-{instance_id}", daemon=True).start()
+                return {"state": "running", "action_id": action_id,
+                        "target_deg": [math.degrees(q) for q in target],
+                        "speed_deg_s": math.degrees(speed)}
+            motion = {"status": "idle"}
+            if instance.session is not None:
+                motion = instance.session.stop_motion()
+                if motion.get("command_id") is not None:
+                    try:
+                        motion = instance.session.wait(motion["command_id"], timeout=3.5)
+                    except TimeoutError as exc:
+                        raise RuntimeError("Physical motion stop was not confirmed") from exc
+                    if motion.get("status") not in ("succeeded", "cancelled", "rejected"):
+                        raise RuntimeError("Physical motion stop was not confirmed: "
+                                           + str(motion.get("error")))
+            if action == "stop":
+                with self._lock:
+                    instance.start_epoch += 1
+                self._stop_instance(instance_id, instance)
+            return {**self._info(instance_id, instance), "motion": motion}
+
+
 def build_plugins(config, namespace, ros2):
-    return [FrankaPlugin(config, namespace, ros2)]
+    from franka.fr3.camera import ExtCameraPlugin
+    sensor = FrankaPlugin(config, namespace, ros2)
+    controller = JointControlPlugin(config, namespace, ros2,
+        manager=sensor._manager, discovery=sensor._discovery)
+    return [sensor, controller,
+            ExtCameraPlugin(config.get("ext_camera", {}), namespace, ros2)]

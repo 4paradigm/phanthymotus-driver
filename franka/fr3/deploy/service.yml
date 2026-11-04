@@ -5,7 +5,22 @@ franka-fr3:
   network_mode: host
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /dev:/dev:ro
+  device_cgroup_rules:
+    - "c 81:* rw"
+    - "c 189:* rw"
+  # FIFO permission is required in both enforce and explicit standard-kernel modes.
+  cap_add:
+    - SYS_NICE
+  ulimits:
+    rtprio: 99
+    memlock: -1
+  cap_drop:
+    - MKNOD
+  tmpfs:
+    - /dev/shm:rw,nosuid,nodev,size=128m
   environment:
+    - FRANKA_REALTIME_POLICY=${FRANKA_REALTIME_POLICY:-standard}
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
