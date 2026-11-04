@@ -373,6 +373,10 @@ class GesturePlugin:
                 time.sleep(0.5)
 
     def dispatch(self, action, args):
+        with self.hand._ownership_lock:
+            return self._dispatch_owned(action, args)
+
+    def _dispatch_owned(self, action, args):
         if action in (*ACTIONS, "stop") and getattr(self.hand, "_teleop_active", False):
             glove = getattr(self.hand, "_glove_plugin", None)
             if glove is None:

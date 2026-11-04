@@ -552,6 +552,9 @@ class MultiHandPlugin:
         # Serial discovery and motion never overlap. Two cards may be queued,
         # but no second controller may open/probe a moving RS-485 port.
         self._bus_lock = threading.RLock()
+        # Admission is separate from serial I/O: a manual request may wait for
+        # glove cleanup while the cleanup worker still needs the bus lock.
+        self._ownership_lock = threading.RLock()
         self._teleop_active = False
         self._bindings: dict[str, str] = {}
         self._controllers: dict[str, HandPlugin] = {}
@@ -660,6 +663,10 @@ class MultiHandPlugin:
             return controller
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        with self._ownership_lock:
+            return self._dispatch_owned(action, args)
+
+    def _dispatch_owned(self, action: str, args: dict) -> dict | None:
         if action in (*MOTION_ACTIONS, "get_state", "stop") and self._teleop_active:
             glove = getattr(self, "_glove_plugin", None)
             if action == "get_state" or glove is None:

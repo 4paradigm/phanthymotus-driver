@@ -125,6 +125,12 @@ thumb_ready 和 info.thumb_mapping.ready_sides 表示拇指四项齐全；缺任
 先完成下节的受控时序验收，再允许日常遥操。受控实机验收也需显式选择运动：将部署命令中的 `GLOVE_PREVIEW_ONLY=1` 改为 `0` 并重建容器。
 此设置只解除手套遥操的预览限制，仍需重新标定、操作员显式 arm(confirm_motion=true)；只启用已标定且找到匹配灵巧手的侧。
 arm 立即返回 running/action_id；串口发现和配置在后台运行，通过 ACP 回报 completed/error/cancelled。
+
+手动 hand/hand_gesture 动作接管时先等待遥操卸力；动作准入与 arm 预约使用同一控制权锁。
+若零扭矩写入未获应答或连接关闭失败，`info.cleanup_pending=true`、`info.release_failures` 会保留失败侧，
+手动接管和重新 arm 均被阻止。失败侧不会被当作已卸力，也不会被后台轮询自动解锁。
+检查供电、串口连接后，显式再次执行 `disarm` 重试原连接；仅全部清理成功后恢复准入。
+若串口描述符已无法恢复，应先确认实体断电，再重启驱动；不能以重启程序代替确认实体已经卸力。
 应等待该 action_id 的完成通知，再确认 info.armed=true；收到 running 不代表实体已经可以跟随。
 串口配置期间可以继续接收手套数据，disarm/stop 会取消本次配置，清理已打开的连接并尝试卸力。
 配置会在事务检查点检查 20 秒截止时间，x-completion 声明等待 60 秒以容纳清理及通知重试；这不是物理卸力时限。

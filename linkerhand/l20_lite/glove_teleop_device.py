@@ -194,6 +194,9 @@ class GloveTeleopPlugin:
         self._control_wake = threading.Event()
         self._cleanup_done = threading.Event()
         self._cleanup_done.set()
+        self._release_attempt_done = threading.Event()
+        self._release_attempt_done.set()
+        self._release_failures = {}
         self._control_thread = None
         self._watchdog_thread = None
         self._arming = False
@@ -849,19 +852,28 @@ class GloveTeleopPlugin:
         self._session += 1
         self._pending_disarm = True
         self._cleanup_done.clear()
+        if not self._release_failures:
+            self._release_attempt_done.clear()
         self._control_wake.set()
 
     def _finish_disarm(self):
         with self._io_lock, self.hand._bus_lock:
-            for side, client in self._clients.items():
+            with self._lock:
+                if not self._pending_disarm and not self._clients:
+                    return
+                # A failed release is latched. Only an explicit disarm attempt
+                # clears it; polling/finalizers cannot silently hand over.
+                if self._release_failures:
+                    return
+            failures = {}
+            for side, client in list(self._clients.items()):
                 started = time.monotonic()
                 acknowledged = False
                 try:
                     client.set_torques([0] * JOINT_COUNT)
                     acknowledged = True
                 except Exception as exc:
-                    with self._lock:
-                        self._error = f"torque release failed: {exc}"
+                    failures[side] = _log_text(exc)
                 finally:
                     finished = time.monotonic()
                     with self._lock:
@@ -875,29 +887,42 @@ class GloveTeleopPlugin:
                             round((finished - age) * 1000, 1) if age is not None else None
                         ),
                     }), flush=True)
+                if acknowledged:
                     try:
                         client.close()
                     except Exception as exc:
-                        with self._lock:
-                            self._error = f"serial close failed: {exc}"
-            self._clients.clear()
-            self._last_command.clear()
+                        failures[side] = _log_text(exc)
+                    else:
+                        del self._clients[side]
+                        self._last_command.pop(side, None)
             with self._lock:
                 self._armed = False
-                self._active_sides.clear()
-                self._pending_disarm = False
-                self.hand._teleop_active = False
-                self._cleanup_done.set()
+                self._active_sides = list(self._clients)
+                self._release_failures = failures
+                self._pending_disarm = bool(failures)
+                self.hand._teleop_active = bool(failures)
+                if failures:
+                    self._error = "torque release cleanup failed; restore connection and retry disarm"
+                    self._cleanup_done.clear()
+                else:
+                    if self._error == "torque release cleanup failed; restore connection and retry disarm":
+                        self._error = None
+                    self._cleanup_done.set()
+                self._release_attempt_done.set()
 
-    def _disarm(self):
+    def _disarm(self, *, retry_failed=False):
         with self._lock:
+            if self._release_failures and not retry_failed:
+                raise RuntimeError("torque release failed; handover is locked; explicitly retry glove disarm")
+            # Retry only when requested, keeping the previous client/port.
+            self._release_failures.clear()
             self._request_disarm_locked()
             worker = self._control_thread
         if worker is None or not worker.is_alive():
             self._finish_disarm()
         elif worker is not threading.current_thread():
             deadline = time.monotonic() + 5
-            while not self._cleanup_done.wait(0.02):
+            while not self._release_attempt_done.wait(0.02):
                 # Stop may race a worker that has just finished its final
                 # cleanup and is exiting, after this request cleared the event.
                 if not worker.is_alive():
@@ -907,6 +932,9 @@ class GloveTeleopPlugin:
                     raise RuntimeError(
                         "teleop is disabled but serial cleanup is still pending"
                     )
+        with self._lock:
+            if self._release_failures:
+                raise RuntimeError("torque release failed; handover is locked; restore connection and retry disarm")
 
     def _stable_calibration_pose(self, side, now):
         """Return robust endpoints only after a fresh, stable multi-frame window."""
@@ -1068,7 +1096,7 @@ class GloveTeleopPlugin:
                 "默认仅骨架预览；完成时序验收后设置 GLOVE_PREVIEW_ONLY=0，"
                 "重新创建容器，再显式 arm(confirm_motion=true)"
             )
-        with self._lock:
+        with self.hand._ownership_lock, self._lock:
             if self._armed:
                 raise RuntimeError("already armed; disarm before arming again")
             if self._arm_completion_failed:
@@ -1085,6 +1113,12 @@ class GloveTeleopPlugin:
                 )
             if time.monotonic() - self._last_received > self.watchdog_s:
                 raise RuntimeError("glove stream is stale")
+            controllers = [self.hand._legacy, *self.hand._controllers.values()]
+            if any(controller._active is not None for controller in controllers):
+                raise RuntimeError("an L20 Lite hand action is still running")
+            gesture = getattr(self.hand, "_gesture_plugin", None)
+            if gesture is not None and gesture._active is not None:
+                raise RuntimeError("an L20 Lite gesture is still running")
             self._arming = True
             self._session += 1
             session = self._session
@@ -1095,7 +1129,7 @@ class GloveTeleopPlugin:
     _acp_callback = HandPlugin._acp_callback
 
     def _start_arm(self):
-        with self._lock:
+        with self.hand._ownership_lock, self._lock:
             if self._arm_action is not None:
                 raise RuntimeError("another arm action is pending")
             session = self._reserve_arm()
@@ -1462,7 +1496,7 @@ class GloveTeleopPlugin:
             process.terminate()
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2)
-        self._disarm()
+        self._disarm(retry_failed=True)
         for worker in (self._control_thread, self._watchdog_thread):
             if worker is not None and worker is not threading.current_thread():
                 worker.join(timeout=5)
@@ -1513,7 +1547,7 @@ class GloveTeleopPlugin:
                 raise ValueError("arm requires boolean confirm_motion=true")
             return self._start_arm()
         if action == "disarm":
-            self._disarm()
+            self._disarm(retry_failed=True)
             retrying = self._retry_arm_completion()
             return {"state": "running", "armed": False, "completion_retry": retrying}
         if action == "stop":
@@ -1535,6 +1569,7 @@ class GloveTeleopPlugin:
                     "last_arm_result": self._last_arm_result,
                     "arm_completion_delivery_failed": self._arm_completion_failed,
                     "cleanup_pending": self._pending_disarm,
+                    "release_failures": dict(self._release_failures),
                     "glove_port": (
                         self.glove_port if self.source_mode != "udp" else None
                     ),

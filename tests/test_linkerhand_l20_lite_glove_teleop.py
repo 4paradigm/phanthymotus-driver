@@ -68,8 +68,15 @@ def test_release_log_distinguishes_ack_from_failed_release(failed, capsys):
     assert event["zero_torque_acknowledged"] is (not failed)
     assert event["last_sample_to_release_ms"] >= 300
     assert event["release_io_ms"] >= 0
-    assert ("close", None) in client.commands
-    assert not device._clients
+    if failed:
+        assert ("close", None) not in client.commands
+        assert device._clients == {"left": client}
+        assert device._pending_disarm and device.hand._teleop_active
+        assert not device._cleanup_done.is_set()
+        assert device._release_failures
+    else:
+        assert ("close", None) in client.commands
+        assert not device._clients
 
 
 def packet(left=None, right=None, timestamp=1):
@@ -129,6 +136,7 @@ class FakeHand:
             "left_fist_pose": list(RIGHT_FIST_POSE),
         }
         self._bus_lock = threading.RLock()
+        self._ownership_lock = threading.RLock()
         connection = type("Connection", (), {"close": lambda self: None})()
         self._legacy = type(
             "Controller", (), {"_active": None, "connection": connection}
