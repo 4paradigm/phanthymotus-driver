@@ -1,7 +1,7 @@
 mcp_port: 15746
-name: "Dobot CRA 状态传感器"
+name: "Dobot CRA 关节与安全皮肤"
 ros_namespace: dobot_cra
-# Configure through DOBOT_CONTROLLER_IP or the connection card. No robot is
+# Configure through DOBOT_CONTROLLER_IP or the joints card. No robot is
 # contacted until an address is supplied.
 controller_ip: ""
 feedback_port: 30004
@@ -13,6 +13,9 @@ stale_timeout_s: 2
 connect_timeout_s: 2
 receive_timeout_s: 1
 reconnect_delay_s: 1
+safe_skin_control:
+  connect_timeout_s: 2
+  receive_timeout_s: 2
 ros:
   robot_domain_id: 42
   core_domain_id: 42

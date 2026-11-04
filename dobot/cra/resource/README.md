@@ -8,9 +8,12 @@
 - SHA-256: `e79a0f39c0c06f2a645031f3a3d92bc111e2968844bb30a59846ddc838376bc7`
 - License: MIT, retained as `LICENSE.dobot`.
 
-The V4 CRA ROS model uses joint1..joint6. The platform skeleton renderer uses
-the URDF origins/axes to draw bones and does not load its referenced STL meshes;
-no meshes, RViz, MoveIt or additional ROS driver are needed in this image.
+The V4 CRA ROS model uses joint1..joint6. The model resource derives a display-only URDF from the original file: the
+joint4 offset is split into perpendicular rigid segments using fixed +90/-90
+frames. Compound RPY origins are factored into single-axis fixed rotations so
+the existing platform renderer and standard URDF FK agree. All six original
+actuated joints and all physical link transforms are preserved. No STL meshes,
+RViz, MoveIt or platform modifications are required.
 
 The supplied TCP/IP V4.6.6 manual maps feedback `CRRobotType=113` to CR3A.
 That type was also observed directly from the target controller. This driver

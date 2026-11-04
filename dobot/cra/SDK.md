@@ -22,8 +22,12 @@ The upstream SDK source and artifact checksum remain unchanged.
 
 The adapter imports upstream `DobotConnection`, `FeedbackParser`, `MyType` and
 the SDK version. It deliberately does not instantiate `DobotRobot`, whose
-connection lifecycle also opens Dashboard. A single feedback connection is
-enough for all sensors, even outside TCP control mode. It never transmits data.
+connection lifecycle also opens Dashboard. A single receive-only feedback connection supplies both sensors, even outside
+TCP control mode. The explicit safe_skin_control actuator lazily creates a
+separate serialized DashboardConnection and calls the official RobotControl
+RequestControl, EnableSafeSkin and SetSafeSkin methods. Startup never transmits
+control commands. SDK formatting is retained; the adapter uses sendall and
+complete semicolon framing to handle partial TCP writes/reads.
 
 Compatibility baseline: CRA six-axis V4 feedback layout, 1440 bytes, little
 endian, test magic `0x0123456789abcdef`, as documented by the supplied TCP/IP
@@ -48,15 +52,15 @@ Upstream is unmodified. The adapter handles:
   Cleanup exceptions are contained by the client so reconnect and stop/join
   still complete; diagnostics retain them separately as `cleanup_error`.
 - Receive and freshness timeouts allow at least three nominal feedback periods,
-  including after port changes from the connection card. Port 30006 therefore
+  including after port changes from the joints configuration. Port 30006 therefore
   gets at least 3 seconds instead of timing out at its 1-second packet interval.
 
-The SDK's command APIs are installed for future extensions, but are not
-reachable through this sensor-only driver. There is no automatic
-`RequestControl`, enable, alarm clearing, IO write, arbitrary command endpoint
-or motion API. Alarm codes and controller firmware version are not in the
-feedback record; cards explicitly mark them unavailable instead of fabricating
-values or opening another connection.
+Only the three explicit safe-skin/control-mode methods are exposed as writes.
+There is no automatic takeover, enable, alarm clearing, motion, IO write,
+arbitrary command endpoint, or invented safe-skin reset. Queued acknowledgements
+are reported as submissions, not verified configuration. Neither skin switch
+nor sensitivity readback is present in feedback; sensor values remain unknown
+rather than echoing requested settings. Writes are never automatically replayed.
 
 For an SDK update, download the new immutable commit artifact, compute its
 SHA-256, update requirements and this file plus `SDK_COMMIT`, and run the

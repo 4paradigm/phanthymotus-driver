@@ -1,4 +1,4 @@
-"""RM75-style sensor cards backed by one receive-only Dobot SDK client."""
+"""Joint skeleton and safe-skin cards sharing one feedback stream."""
 
 from __future__ import annotations
 
@@ -7,30 +7,28 @@ import math
 import threading
 import time
 
-from common.vendor_runtime import tool
+from common.vendor_runtime import action_schema, tool
 
 if __package__:
-    from .feedback import FeedbackClient, SDK_COMMIT, SDK_VERSION, positive_number
+    from .feedback import FeedbackClient, positive_number
     from .model import JOINT_NAMES, model_resource, resolve_model
+    from .control import PARTS, SafeSkinController
 else:
-    from feedback import FeedbackClient, SDK_COMMIT, SDK_VERSION, positive_number
+    from feedback import FeedbackClient, positive_number
     from model import JOINT_NAMES, model_resource, resolve_model
+    from control import PARTS, SafeSkinController
 
 
 CARD_DESCRIPTIONS = {
-    "connection": "控制器反馈连接、数据新鲜度和重连状态（只读）",
-    "joint_states": "六关节实际/目标角度、速度、电流和温度（只读）",
-    "joints": "CR3A 六关节实时三维骨架，按控制器型号码识别官方模型（只读）",
-    "robot_info": "反馈报告的机器人类型码、六轴信息和人工配置的型号（只读）",
-    "software_info": "驱动所用官方 SDK 版本及来源；反馈协议不提供控制器固件版本",
-    "arm_all_state": "机械臂完整反馈：关节、TCP 位姿、负载、力和 IO（只读）",
-    "controller_state": "使能、抱闸、运行、报警标志、电压和 IO 状态（只读）",
+    "joints": "CR3A 六轴实时骨架，固定直角连接保持真实关节坐标和六个可动轴",
+    "safe_skin": "小臂及 J4/J5/J6 安全皮肤接近暂停标志、数据有效性和最近控制请求",
 }
 
 
 class DobotSensors:
-    def __init__(self, config, namespace="dobot_cra", ros2=None, client=None):
+    def __init__(self, config, namespace="dobot_cra", ros2=None, client=None, controller=None):
         self.client = client if client is not None else FeedbackClient(config)
+        self.control = controller if controller is not None else SafeSkinController(self.client, config)
         self._hz = positive_number(config.get("publish_hz", 10), "publish_hz")
         if self._hz > 125:
             raise ValueError("publish_hz must not exceed the 125 Hz feedback rate")
@@ -47,25 +45,32 @@ class DobotSensors:
         }
 
     def get_tools(self):
-        definitions = [
-            tool(name, "sensor", description, topic_out=self._topics[name])
-            for name, description in CARD_DESCRIPTIONS.items()
-        ]
+        definitions = [tool(name, "sensor", description, topic_out=self._topics[name])
+                       for name, description in CARD_DESCRIPTIONS.items()]
+        # The removed connection card's shared configuration now lives on joints.
         definitions[0]["configSchema"] = {
-            "type": "object",
-            "properties": {
-                "controller_ip": {
-                    "type": "string", "description": "控制柜 IPv4 地址（LAN2 默认 192.168.200.1）",
-                    "scope": "shared", "x-sensitive": True,
-                },
-                "feedback_port": {
-                    "type": "integer", "enum": [30004, 30005, 30006], "default": 30004,
-                    "description": "反馈端口：30004 为 8ms，30005 为 200ms，30006 为 1000ms",
-                    "scope": "shared",
-                },
+            "type": "object", "properties": {
+                "controller_ip": {"type": "string", "description": "控制柜 IPv4 地址（LAN2 默认 192.168.200.1）",
+                                  "scope": "shared", "x-sensitive": True},
+                "feedback_port": {"type": "integer", "enum": [30004, 30005, 30006], "default": 30004,
+                                  "description": "反馈端口；30006 自动使用至少 3 秒超时", "scope": "shared"},
             },
         }
-        definitions.append(tool("model", "resource", "控制器识别型号对应的官方 URDF 关节模型"))
+        schema = action_schema({
+            "info": ([], "查看连接、控制请求记录及反馈；不发送控制命令"),
+            "request_control": (["confirm_change"], "显式请求 TCP 控制模式；仅下使能/下电时允许，不使能机器人"),
+            "set_enabled": (["enabled", "confirm_change"], "提交安全皮肤总开关；关闭会移除皮肤接近保护，不能用于碰撞复位"),
+            "set_sensitivity": (["part", "level", "confirm_change"], "提交指定部位灵敏度；0 关闭，1 低，2 中，3 高"),
+        }, {
+            "enabled": {"type": "boolean", "description": "安全皮肤总开关"},
+            "part": {"type": "integer", "enum": [3, 4, 5, 6], "description": "3 小臂；4/5/6 为 J4/J5/J6"},
+            "level": {"type": "integer", "enum": [0, 1, 2, 3], "description": "0 关闭；1 低；2 中；3 高"},
+            "confirm_change": {"type": "boolean", "description": "确认本次安全设置变更；每次写请求必须为 true"},
+        })
+        schema["x-is-dangerous"] = True
+        schema["x-resource"] = "arm"
+        definitions.append(tool("safe_skin_control", "actuator", "安全皮肤 TCP 控制：总开关和分区灵敏度；队列提交不等于配置读回", schema))
+        definitions.append(tool("model", "resource", "六轴 CR3A 直角连杆骨架 URDF，附加连接全部为固定关节"))
         return definitions
 
     def start(self):
@@ -77,17 +82,13 @@ class DobotSensors:
                 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
                 from std_msgs.msg import String
 
-                qos = QoSProfile(
-                    reliability=ReliabilityPolicy.BEST_EFFORT,
-                    history=HistoryPolicy.KEEP_LAST, depth=1,
-                    durability=DurabilityPolicy.VOLATILE,
-                )
+                qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                                 history=HistoryPolicy.KEEP_LAST, depth=1,
+                                 durability=DurabilityPolicy.VOLATILE)
                 node = Node("dobot_cra_sensors", context=self._ros2.ctx_core)
                 try:
-                    self._publishers = {
-                        name: node.create_publisher(String, topics[0]["topic"], qos)
-                        for name, topics in self._topics.items()
-                    }
+                    self._publishers = {name: node.create_publisher(String, topics[0]["topic"], qos)
+                                        for name, topics in self._topics.items()}
                     self._message_type = String
                     self._node = node
                     node.create_timer(1.0 / self._hz, self._publish)
@@ -108,33 +109,19 @@ class DobotSensors:
                 finally:
                     node.destroy_node()
             self._publishers = {}
-            self.client.stop()
+            try:
+                self.control.close()
+            finally:
+                self.client.stop()
 
     def payload(self, name, snapshot=None):
         snapshot = self.client.snapshot() if snapshot is None else snapshot
-        health = {key: value for key, value in snapshot.items() if key != "data"}
-        result = {
-            **health, "timestamp_ms": int(time.time() * 1000),
-            "source": "dobot_feedback", "read_only": True,
-        }
-        if name == "connection":
-            return result
-        if name == "software_info":
-            return {
-                **result, "source": "driver_metadata",
-                "sdk_version": SDK_VERSION, "sdk_commit": SDK_COMMIT,
-                "sdk_repository": "https://github.com/Dobot-Arm/TCP-IP-Python-V4",
-                "feedback_protocol_bytes": 1440,
-                "controller_firmware_version": None,
-                "controller_firmware_version_available": False,
-                "note": "Feedback does not report firmware version; check DobotStudio Pro.",
-            }
+        result = {key: value for key, value in snapshot.items() if key != "data"}
+        result.update(timestamp_ms=int(time.time() * 1000), source="dobot_feedback", read_only=True)
         state = snapshot["data"]
         if name == "joints":
-            skeleton = {
-                **result, "format": "sensor/skeleton", "position_unit": "rad",
-                "joint_count": 6, "joints": [], "available": False,
-            }
+            skeleton = {**result, "format": "sensor/skeleton", "position_unit": "rad",
+                        "joint_count": 6, "joints": [], "available": False}
             try:
                 skeleton.update(resolve_model(snapshot, self.client.model_name))
             except ValueError as exc:
@@ -144,68 +131,31 @@ class DobotSensors:
                 joints = state["joint_state"]
                 skeleton["available"] = True
                 skeleton["joints"] = [
-                    {"idx": i, "name": joint_name,
-                     "q": math.radians(joints["q_actual"][i]),
-                     "dq": math.radians(joints["qd_actual"][i]),
-                     "degree": joints["q_actual"][i]}
-                    for i, joint_name in enumerate(JOINT_NAMES)
+                    {"idx": i, "name": name, "q": math.radians(joints["q_actual"][i]),
+                     "dq": math.radians(joints["qd_actual"][i]), "degree": joints["q_actual"][i]}
+                    for i, name in enumerate(JOINT_NAMES)
                 ]
             return skeleton
-        if state is None:
-            return {**result, "available": False, "data": None}
-        result["available"] = True
-        if name == "robot_info":
-            try:
-                identity = resolve_model(snapshot, self.client.model_name)
-            except ValueError:
-                identity = {"model_name": None, "model_source": None}
-            return {
-                **result, **identity, "robot_type_code": state["robot_type"], "arm_dof": 6,
-                "configured_model_name": self.client.model_name or None,
-                "model_name_source": "operator_config" if self.client.model_name else None,
+        if name == "safe_skin":
+            # Feedback has proximity stops, not distance/configuration readback.
+            regions = {
+                name: {"part": part, "raw_flag": None if state is None else state[f"{name}_approach_state"],
+                       "approach_paused": None if state is None else bool(state[f"{name}_approach_state"])}
+                for part, name in PARTS.items()
             }
-        if name == "joint_states":
-            joints = state["joint_state"]
+            keys = ("robot_mode", "robot_mode_name", "enable_status", "running_status", "error_status",
+                    "collision_state", "safety_state", "safe_state", "current_command_id")
             return {
-                **result,
-                "joint_names": [f"joint{i}" for i in range(1, 7)],
-                "position": [math.radians(v) for v in joints["q_actual"]],
-                "velocity": [math.radians(v) for v in joints["qd_actual"]],
-                "position_unit": "rad", "velocity_unit": "rad/s",
-                "raw_degree": joints["q_actual"],
-                "target_degree": joints["q_target"],
-                "raw_velocity_deg_s": joints["qd_actual"],
-                "current_a": joints["i_actual"],
-                "motor_temperature_c": joints["temperatures"],
-                "brake_released": state["brake_released"],
-            }
-        if name == "arm_all_state":
-            return {
-                **result, "data": state,
-                "units": {
-                    "joint_position": "deg", "joint_velocity": "deg/s",
-                    "tcp_position": "mm", "tcp_orientation": "deg",
-                    "voltage": "V", "current": "A", "load": "kg",
-                },
-            }
-        if name == "controller_state":
-            keys = (
-                "robot_mode", "robot_mode_name", "enable_status", "brake_status",
-                "brake_released", "error_status", "running_status", "drag_status",
-                "jog_status", "pause_cmd_flag", "run_queued_cmd", "collision_state",
-                "auto_manual_mode", "safety_state", "safe_state", "safety_io_in",
-                "safety_io_out", "digital_inputs", "digital_outputs", "voltage",
-                "current", "speed_scaling", "current_command_id", "timestamp", "run_time",
-            )
-            return {
-                **result, "data": {key: state[key] for key in keys},
-                "alarm_codes_available": False,
-                "note": "error_status is an alarm flag, not a GetErrorID alarm-code list.",
+                **result, "available": state is not None, "regions": regions,
+                "any_approach_paused": None if state is None else any(v["approach_paused"] for v in regions.values()),
+                "robot_status": None if state is None else {key: state[key] for key in keys},
+                "configuration_readback_available": False, "hardware_presence": "unknown",
+                "enabled": None, "sensitivity": {name: None for name in PARTS.values()},
+                "control": self.control.snapshot(), "reset_supported": False,
             }
         raise ValueError(f"unknown sensor: {name}")
 
     def _publish(self):
-        # A single coherent snapshot for all cards; no network calls in ROS timers.
         with self._lifecycle:
             snapshot = self.client.snapshot()
             for name, publisher in self._publishers.items():
@@ -217,20 +167,24 @@ class DobotSensors:
         name = args.get("_tool_name", action)
         if name == "model":
             return model_resource(self.client.snapshot(), self.client.model_name)
+        if name == "safe_skin_control":
+            if action in ("info", name):
+                return {"state": "ready", **self.control.snapshot(), "feedback": self.payload("safe_skin")}
+            if action in ("start", "stop"):
+                # Lifecycle does not claim control or cancel queued settings.
+                if action == "stop":
+                    self.control.close()
+                return {"state": "ready" if action == "start" else "idle"}
+            return self.control.execute(action, args)
         if name not in CARD_DESCRIPTIONS:
             return None
         if action == "start":
-            # Shared configuration belongs to connection. Starting another card
-            # cannot take ownership of or close the shared feedback socket.
-            if name == "connection" and any(key in args for key in ("controller_ip", "feedback_port")):
-                self.client.configure(
-                    args.get("controller_ip", self.client.address),
-                    args.get("feedback_port", self.client.port),
-                )
+            if any(key in args for key in ("controller_ip", "feedback_port")):
+                self.control.reconfigure(args.get("controller_ip", self.client.address),
+                                         args.get("feedback_port", self.client.port))
             self.client.start()
             return {"state": "running", "topic_out": self._topics[name], **self.payload(name)}
         if action == "stop":
-            # Always-on singleton sensors follow the platform lifecycle contract.
             return {"state": "idle"}
         if action in ("info", name):
             return {"topic_out": self._topics[name], **self.payload(name)}

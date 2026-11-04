@@ -173,13 +173,12 @@ def test_single_read_only_connection_shared_by_all_cards_and_units():
                 assert plugin.dispatch("stop", {"_tool_name": name}) == {"state": "idle"}
         assert calls == [("127.0.0.1", 30004)]
         assert not connection.closed.is_set()
-        joint = plugin.payload("joint_states")
-        assert joint["position"][0] == pytest.approx(math.pi / 2)
-        assert joint["velocity"][0] == pytest.approx(math.pi)
-        assert joint["raw_degree"][1] == -30
-        assert plugin.payload("software_info")["controller_firmware_version"] is None
-        assert plugin.payload("controller_state")["data"]["robot_mode_name"] == "disabled"
-        assert plugin.payload("robot_info")["configured_model_name"] is None
+        joint = plugin.payload("joints")["joints"]
+        assert joint[0]["q"] == pytest.approx(math.pi / 2)
+        assert joint[0]["dq"] == pytest.approx(math.pi)
+        assert joint[1]["degree"] == -30
+        assert plugin.payload("safe_skin")["robot_status"]["robot_mode_name"] == "disabled"
+        assert plugin.payload("safe_skin")["configuration_readback_available"] is False
         snapshot = client.snapshot()
         snapshot["data"]["joint_state"]["q_actual"][0] = -999
         assert client.snapshot()["data"]["joint_state"]["q_actual"][0] == 90
@@ -195,11 +194,11 @@ def test_stale_data_is_withheld_even_if_socket_stays_open():
         wait_until(lambda: client.snapshot()["connected"])
         received = client._received_at
         client._clock = lambda: received + 3
-        result = DobotSensors({}, client=client).payload("joint_states")
+        result = DobotSensors({}, client=client).payload("safe_skin")
         assert result["transport_connected"]
         assert result["stale"] and not result["available"]
-        assert result["data"] is None
-        assert "position" not in result
+        assert result["robot_status"] is None
+        assert all(region["approach_paused"] is None for region in result["regions"].values())
         skeleton = DobotSensors({}, client=client).payload("joints")
         assert skeleton["joints"] == []
         assert not skeleton["available"]
@@ -208,7 +207,7 @@ def test_stale_data_is_withheld_even_if_socket_stays_open():
         client.stop()
 
 
-def test_joints_skeleton_matches_official_model_and_numeric_card():
+def test_joints_skeleton_matches_physical_model_names_and_radians():
     import xml.etree.ElementTree as ET
 
     client, _, calls = running_client([packet(angle=42)])
@@ -222,10 +221,10 @@ def test_joints_skeleton_matches_official_model_and_numeric_card():
         skeleton = plugin.payload("joints")
         assert model_names == [joint["name"] for joint in skeleton["joints"]]
         assert model_names == [f"joint{i}" for i in range(1, 7)]
-        assert [joint["q"] for joint in skeleton["joints"]] == plugin.payload("joint_states")["position"]
+        assert [joint["q"] for joint in skeleton["joints"]] == pytest.approx([math.radians(v) for v in (42, -30, 0, 0, 0, 0)])
         assert [joint["idx"] for joint in skeleton["joints"]] == list(range(6))
         assert "imu_quat" not in skeleton
-        assert plugin.payload("robot_info")["model_name"] == "CR3A"
+        assert skeleton["model_name"] == "CR3A"
         assert calls == [("127.0.0.1", 30004)]
     finally:
         client.stop()
@@ -314,7 +313,7 @@ def test_publish_all_health_states_without_network_calls():
     plugin._message_type = Message
     plugin._publishers = {name: Publisher() for name in CARD_DESCRIPTIONS}
     plugin._publish()
-    assert len(plugin._publishers) == 7
+    assert len(plugin._publishers) == 2
     for pub in plugin._publishers.values():
         assert pub.messages[0]["stale"]
         assert pub.messages[0]["read_only"]
@@ -436,7 +435,7 @@ def test_port_change_recalculates_timeout_margin_without_overwriting_config():
     assert (custom.receive_timeout, custom.stale_timeout) == (4, 5)
 
 
-def test_connection_card_accepts_delayed_one_hz_packets_without_reconnecting():
+def test_joints_configuration_accepts_delayed_one_hz_packets_without_reconnecting():
     from dobot_sdk.core.connection import DobotConnection
 
     reader, writer = socket.socketpair()
@@ -458,7 +457,7 @@ def test_connection_card_accepts_delayed_one_hz_packets_without_reconnecting():
     plugin = DobotSensors({}, client=client)
     # Exercise the same port-selection path as the UI, not just initial config.
     plugin.dispatch("start", {
-        "_tool_name": "connection", "controller_ip": "127.0.0.1", "feedback_port": 30006,
+        "_tool_name": "joints", "controller_ip": "127.0.0.1", "feedback_port": 30006,
     })
     try:
         writer.sendall(packet(angle=10))
@@ -520,7 +519,9 @@ def test_metadata_and_mcp_http_contract():
     tools = plugin.get_tools()
     assert {t["name"] for t in tools} == {t["name"] for t in metadata["cards"]}
     sensors = [t for t in tools if t["type"] == "sensor"]
-    assert len(sensors) == 7
+    assert len(sensors) == 2
+    assert {t["name"] for t in tools} == {"joints", "safe_skin", "safe_skin_control", "model"}
+    assert next(t for t in tools if t["name"] == "safe_skin_control")["type"] == "actuator"
     assert next(t for t in tools if t["name"] == "model")["type"] == "resource"
     assert all(t["topic_out"][0]["format"] == ("sensor/skeleton" if t["name"] == "joints" else "data/json") for t in sensors)
     assert tools[0]["configSchema"]["properties"]["controller_ip"]["x-sensitive"]
@@ -540,11 +541,15 @@ def test_metadata_and_mcp_http_contract():
 
     try:
         assert rpc("initialize", {})["result"]["serverInfo"]["name"] == "dobot-cra"
-        assert len(rpc("tools/list", {})["result"]["tools"]) == 8
-        result = rpc("tools/call", {"name": "joint_states", "arguments": {"action": "start"}})
+        assert len(rpc("tools/list", {})["result"]["tools"]) == 4
+        result = rpc("tools/call", {"name": "joints", "arguments": {"action": "start"}})
         payload = json.loads(result["result"]["content"][0]["text"])
-        assert payload["state"] == "running" and payload["data"] is None
-        assert payload["topic_out"][0]["format"] == "data/json"
+        assert payload["state"] == "running" and payload["joints"] == []
+        assert payload["topic_out"][0]["format"] == "sensor/skeleton"
+        removed = rpc("tools/call", {"name": "arm_all_state", "arguments": {"action": "info"}})
+        assert removed["error"]["code"] == -32601
+        control = rpc("tools/call", {"name": "safe_skin_control", "arguments": {"action": "start"}})
+        assert json.loads(control["result"]["content"][0]["text"])["state"] == "ready"
     finally:
         server.shutdown()
         server.server_close()

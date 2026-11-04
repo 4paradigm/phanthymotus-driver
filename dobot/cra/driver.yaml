@@ -1,20 +1,16 @@
 id: dobot-cra-driver
-name: Dobot CRA Sensors
+name: Dobot CRA Joints and Safe Skin
 category: driver
 hardware_provider: dobot
 hardware_model: cra
 image_name: dobot-cra
 port: 15746
 mcp_url: "http://localhost:15746/mcp"
-description: "Read-only Dobot CRA V4 feedback sensors using the official Python SDK; no motion or automatic TCP control takeover"
+description: "CR3A rigid-elbow skeleton, safe-skin feedback and explicit SDK skin settings; no motion or automatic control takeover"
 build_context_extras:
   - ../../common
 cards:
-  - { name: connection, type: sensor }
-  - { name: joint_states, type: sensor }
   - { name: joints, type: sensor }
+  - { name: safe_skin, type: sensor }
+  - { name: safe_skin_control, type: actuator }
   - { name: model, type: resource }
-  - { name: robot_info, type: sensor }
-  - { name: software_info, type: sensor }
-  - { name: arm_all_state, type: sensor }
-  - { name: controller_state, type: sensor }
