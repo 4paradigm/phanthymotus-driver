@@ -20,6 +20,7 @@ import pytest
 import yaml
 
 from deep_robotics.s10_pro.basic_server import (
+    DEFAULT_TLS_SHA256_FINGERPRINT,
     HEADER,
     MAX_ASDU,
     SYNC,
@@ -716,6 +717,8 @@ def test_main_builds_constrained_fastdds_profile_before_runtime(monkeypatch, tmp
     addresses = [node.text for node in root.findall(".//{*}interfaceWhiteList/{*}address")]
     assert addresses == ["127.0.0.1", "10.21.33.103"]
     assert root.find(".//{*}useBuiltinTransports").text == "false"
+    assert root.find(".//{*}sendBufferSize").text == "8388608"
+    assert root.find(".//{*}receiveBufferSize").text == "8388608"
     assert module.os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] == str(profile)
     core_profile = ET.parse(module.os.environ["S10_CORE_FASTDDS_PROFILE"]).getroot()
     core_addresses = [node.text for node in core_profile.findall(".//{*}interfaceWhiteList/{*}address")]
@@ -2065,3 +2068,13 @@ def test_basic_server_rejects_unpinned_tls_certificate(monkeypatch):
 def test_basic_server_rejects_malformed_tls_fingerprint():
     with pytest.raises(ValueError, match="64 hex digits"):
         BasicServerClient({"basic_server": {"tls_sha256_fingerprint": "z" * 64}})
+
+
+def test_basic_server_default_pin_matches_verified_robot_certificate():
+    expected = "6C:D4:11:BF:AF:FE:D2:C5:D9:3F:80:D3:0E:DB:51:4E:6B:19:4E:F2:E3:3A:19:9A:85:1B:BF:F9:CE:50:B4:15"
+    assert DEFAULT_TLS_SHA256_FINGERPRINT == expected.replace(":", "").lower()
+    config = yaml.safe_load((DRIVER / "config.yaml").read_text())
+    assert config["basic_server"]["tls_sha256_fingerprint"] == DEFAULT_TLS_SHA256_FINGERPRINT
+    service = yaml.safe_load((DRIVER / "deploy" / "service.yml").read_text())
+    environment = service["deep-robotics-s10-pro"]["environment"]
+    assert f"S10_BASIC_SERVER_TLS_SHA256=${{S10_BASIC_SERVER_TLS_SHA256:-{DEFAULT_TLS_SHA256_FINGERPRINT}}}" in environment

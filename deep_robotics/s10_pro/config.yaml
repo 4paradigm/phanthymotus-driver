@@ -94,7 +94,7 @@ basic_server:
   host: "10.21.33.103"
   tls_tcp_port: 30003
   tls_server_name: server.local
-  tls_sha256_fingerprint: 6cd411bfaafed2c5d93f80d30edb514e6b194ef2e33a199a851bbff9ce50b415
+  tls_sha256_fingerprint: 6cd411bfaffed2c5d93f80d30edb514e6b194ef2e33a199a851bbff9ce50b415
   timeout: 2.0
 audio:
   mode: auto

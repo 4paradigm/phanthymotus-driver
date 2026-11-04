@@ -19,7 +19,7 @@ SYNC = b"\xeb\x91\xeb\x90"
 HEADER = struct.Struct("<4sHHBBB5x")
 MAX_ASDU = 1000
 DEFAULT_TLS_SHA256_FINGERPRINT = (
-    "6cd411bfaafed2c5d93f80d30edb514e6b194ef2e33a199a851bbff9ce50b415"
+    "6cd411bfaffed2c5d93f80d30edb514e6b194ef2e33a199a851bbff9ce50b415"
 )
 
 

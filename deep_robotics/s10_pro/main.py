@@ -106,6 +106,7 @@ def configure_fastdds_profile(config):
 <dds xmlns="http://www.eprosima.com"><profiles>
   <transport_descriptors><transport_descriptor>
     <transport_id>s10_robot_and_loopback</transport_id><type>UDPv4</type>
+    <sendBufferSize>8388608</sendBufferSize><receiveBufferSize>8388608</receiveBufferSize>
     <interfaceWhiteList><address>127.0.0.1</address><address>{interface_address.ip}</address></interfaceWhiteList>
   </transport_descriptor></transport_descriptors>
   <participant profile_name="s10_constrained" is_default_profile="true"><rtps>
