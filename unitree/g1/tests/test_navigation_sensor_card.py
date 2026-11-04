@@ -128,8 +128,8 @@ class NavigationSensorCardContractTest(unittest.TestCase):
             '"sensor/pointcloud"',
             '"sensor_msgs/msg/PointCloud2"',
             '"sensor_msgs/msg/Imu"',
-            '"RELIABLE + KEEP_LAST(depth=2) + VOLATILE"',
-            '"RELIABLE + KEEP_LAST(depth=200) + VOLATILE"',
+            '"RELIABLE + KEEP_LAST(depth=100) + VOLATILE"',
+            '"RELIABLE + KEEP_LAST(depth=2000) + VOLATILE"',
             'blockers.append("clock_not_ready")',
             'blockers.append("cloud_stale")',
             'blockers.append("imu_stale")',
@@ -165,11 +165,11 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         imu = lidar["associated_imu"]
         self.assertEqual(lidar["format"], "sensor/pointcloud")
         self.assertEqual(lidar["ros_type"], "sensor_msgs/msg/PointCloud2")
-        self.assertEqual(lidar["qos"], "RELIABLE + KEEP_LAST(depth=2) + VOLATILE")
+        self.assertEqual(lidar["qos"], "RELIABLE + KEEP_LAST(depth=100) + VOLATILE")
         self.assertEqual(lidar["frame_id"], "custom_lidar_frame")
         self.assertEqual(imu["format"], "sensor/imu")
         self.assertEqual(imu["ros_type"], "sensor_msgs/msg/Imu")
-        self.assertEqual(imu["qos"], "RELIABLE + KEEP_LAST(depth=200) + VOLATILE")
+        self.assertEqual(imu["qos"], "RELIABLE + KEEP_LAST(depth=2000) + VOLATILE")
         self.assertEqual(imu["frame_id"], "custom_imu_frame")
 
         info = plugin.output_status("imu", owner="lidar")
@@ -192,7 +192,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
                 self.assertEqual(desc["topic"], cloud_topic)
                 self.assertEqual(desc["associated_imu"]["topic"], imu_topic)
                 self.assertEqual(desc["associated_imu"]["ros_type"], "sensor_msgs/msg/Imu")
-                self.assertEqual(desc["associated_imu"]["qos"], "RELIABLE + KEEP_LAST(depth=200) + VOLATILE")
+                self.assertEqual(desc["associated_imu"]["qos"], "RELIABLE + KEEP_LAST(depth=2000) + VOLATILE")
                 self.assertNotIn("port", desc["associated_imu"])
 
     def test_worker_publishers_match_associated_imu_descriptor(self):
@@ -223,12 +223,12 @@ class NavigationSensorCardContractTest(unittest.TestCase):
                 publisher.assert_any_call(module.PointCloud2, descriptor["topic"], module._NAVIGATION_CLOUD_QOS)
                 publisher.assert_any_call(module.Imu, imu["topic"], module._IMU_QOS)
                 self.assertEqual(module._IMU_QOS.kwargs, {
-                    "reliability": "reliable", "history": "keep_last", "depth": 200,
+                    "reliability": "reliable", "history": "keep_last", "depth": 2000,
                     "durability": "volatile",
                 })
                 self.assertEqual(imu["format"], "sensor/imu")
                 self.assertEqual(imu["ros_type"], "sensor_msgs/msg/Imu")
-                self.assertEqual(imu["qos"], "RELIABLE + KEEP_LAST(depth=200) + VOLATILE")
+                self.assertEqual(imu["qos"], "RELIABLE + KEEP_LAST(depth=2000) + VOLATILE")
 
     def test_monitor_preserves_configured_sensor_frames(self):
         module = self.load_bridge_module()
