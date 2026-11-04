@@ -1,4 +1,4 @@
-"""Admission and 300ms zero / 1000ms cancel deadlines stay independent."""
+"""Admission and 500ms zero / 1000ms cancel deadlines stay independent."""
 import json
 import types
 import pytest
@@ -17,12 +17,12 @@ def test_accepted_command_outlives_entry_ttl_then_soft_zeros_before_cancel(setup
     backend = plugin._backend
     writes = list(backend.messages)
     cancel = plugin._cancel_deadline_ms
-    assert backend.deadlines[-1] == pytest.approx(original["stamp_ms"] + 300, abs=1)
+    assert backend.deadlines[-1] == pytest.approx(original["stamp_ms"] + 500, abs=1)
     assert cancel == pytest.approx(original["stamp_ms"] + 1000, abs=1)
-    setup.clock.advance(0.21)
+    setup.clock.advance(0.31)
     plugin._tick()
     assert backend.messages == writes
-    setup.clock.advance(0.10)
+    setup.clock.advance(0.20)
     plugin._tick()
     assert plugin._last_output == [0] * 6
     assert backend.soft_stop_calls == [cancel]
@@ -30,11 +30,11 @@ def test_accepted_command_outlives_entry_ttl_then_soft_zeros_before_cancel(setup
     assert plugin._last_valid_at == received
     assert plugin._cancel_deadline_ms == cancel
     assert plugin._soft_held
-    setup.clock.advance(0.30)
+    setup.clock.advance(0.20)
     plugin._tick()
     assert backend.soft_stop_calls == [cancel]
     assert backend.stop_calls == 0
-    setup.clock.advance(0.40)
+    setup.clock.advance(0.30)
     plugin._tick()
     assert backend.stop_calls == 1
     assert plugin._last_valid_at is None and plugin._cancel_deadline_ms == 0
@@ -46,7 +46,7 @@ def test_fresh_10hz_commands_update_without_intermediate_zero_or_cancel(setup):
     for sequence in range(1, 12):
         payload = command(setup, seq=sequence)
         send(plugin, payload)
-        assert plugin._backend.deadlines[-1] == pytest.approx(payload["stamp_ms"] + 300, abs=1)
+        assert plugin._backend.deadlines[-1] == pytest.approx(payload["stamp_ms"] + 500, abs=1)
         assert plugin._backend.cancel_deadlines[-1] == pytest.approx(payload["stamp_ms"] + 1000, abs=1)
         setup.clock.advance(0.1)
         plugin._tick()
@@ -59,7 +59,7 @@ def test_fresh_10hz_commands_update_without_intermediate_zero_or_cancel(setup):
 def test_valid_input_during_soft_hold_resumes_without_cancelling_action(setup):
     plugin = start(setup)
     send(plugin, command(setup))
-    setup.clock.advance(0.31)
+    setup.clock.advance(0.51)
     plugin._tick()
     assert plugin._soft_held
     send(plugin, command(setup, seq=2))
@@ -79,14 +79,14 @@ def test_ipc_wait_spends_both_original_receive_budgets(setup):
     plugin._tick()
     timing = plugin._info()["last_command_timing"]
     assert timing["local_wait_ms"] == pytest.approx(120)
-    assert timing["receive_watchdog_ms"] == 300 and timing["cancel_after_ms"] == 1000
-    assert timing["remaining_before_apply_ms"] == pytest.approx(180, abs=1)
+    assert timing["receive_watchdog_ms"] == 500 and timing["cancel_after_ms"] == 1000
+    assert timing["remaining_before_apply_ms"] == pytest.approx(380, abs=1)
     assert timing["cancel_remaining_before_apply_ms"] == pytest.approx(880, abs=1)
     assert plugin._last_valid_at == original_receipt
-    setup.clock.advance(0.19)
+    setup.clock.advance(0.39)
     plugin._tick()
     assert plugin._soft_held and not plugin._backend.stop_calls
-    setup.clock.advance(0.70)
+    setup.clock.advance(0.50)
     plugin._tick()
     assert plugin._backend.stop_calls == 1
 
@@ -98,7 +98,7 @@ def test_frame_waiting_beyond_receive_budget_cannot_renew_live_session(setup):
     setup.clock.advance(0.10)
     payload = command(setup, seq=2, ttl_ms=1000)
     plugin._on_message(types.SimpleNamespace(data=json.dumps(payload)))
-    setup.clock.advance(0.31)
+    setup.clock.advance(0.51)
     plugin._tick()
     assert plugin._counts["accepted"] == 1 and plugin._counts["dropped"] == 1
     assert plugin._soft_held and plugin._cancel_deadline_ms == original_cancel
@@ -116,12 +116,12 @@ def test_sdk_acknowledgement_does_not_restart_either_watchdog(setup, monkeypatch
     monkeypatch.setattr(plugin._backend, "write", slow_write)
     send(plugin, command(setup))
     assert plugin._counts["accepted"] == 1 and plugin._last_valid_at == original_receipt
-    assert plugin._info()["last_command_timing"]["remaining_after_apply_ms"] == pytest.approx(70, abs=1)
+    assert plugin._info()["last_command_timing"]["remaining_after_apply_ms"] == pytest.approx(270, abs=1)
     assert plugin._cancel_deadline_ms - setup.clock.time() * 1000 == pytest.approx(770, abs=1)
-    setup.clock.advance(0.08)
+    setup.clock.advance(0.28)
     plugin._tick()
     assert plugin._soft_held and not plugin._backend.stop_calls
-    setup.clock.advance(0.70)
+    setup.clock.advance(0.50)
     plugin._tick()
     assert plugin._backend.stop_calls == 1
 
@@ -148,10 +148,10 @@ def test_unaccepted_frames_neither_stop_immediately_nor_renew_deadlines(setup, i
     assert (plugin._last_valid_at, plugin._lease_expiry_ms, plugin._cancel_deadline_ms) == previous
     assert not plugin._backend.stop_calls and not plugin._backend.soft_stop_calls
     assert any(plugin._last_output)
-    setup.clock.advance(0.16)
+    setup.clock.advance(0.36)
     plugin._tick()
     assert plugin._soft_held and not plugin._backend.stop_calls
-    setup.clock.advance(0.70)
+    setup.clock.advance(0.50)
     plugin._tick()
     assert plugin._backend.stop_calls == 1
 
@@ -177,7 +177,7 @@ def test_observation_limit_is_500ms_admission_only(setup):
     now = int(setup.clock.time() * 1000)
     send(plugin, command(setup, obs_stamp_ms=now - 450))
     assert plugin._counts["accepted"] == 1
-    assert plugin._backend.deadlines[-1] == now + 300  # Receipt lease, not obs + 500.
+    assert plugin._backend.deadlines[-1] == now + 500  # Receipt lease, not obs + 500.
     cancel = plugin._cancel_deadline_ms
     setup.clock.advance(0.06)
     plugin._tick()
@@ -186,7 +186,7 @@ def test_observation_limit_is_500ms_admission_only(setup):
     send(plugin, command(setup, seq=2, obs_stamp_ms=int(setup.clock.time() * 1000) - 501))
     assert plugin._counts["accepted"] == 1 and plugin._counts["dropped"] == 1
     assert any(plugin._last_output) and not plugin._backend.soft_stop_calls
-    setup.clock.advance(0.25)  # 310ms since the accepted receipt.
+    setup.clock.advance(0.45)  # 510ms since the accepted receipt.
     plugin._tick()
     assert plugin._soft_held and plugin._cancel_deadline_ms == cancel
     assert len(plugin._backend.soft_stop_calls) == 1 and not plugin._backend.stop_calls
@@ -200,16 +200,16 @@ def test_repeated_new_packets_cannot_extend_one_old_observation(setup):
         setup.clock.advance(began + elapsed - setup.clock.monotonic())
         send(plugin, command(setup, seq=seq, obs_stamp_ms=observation))
     cancel = plugin._cancel_deadline_ms
-    assert plugin._lease_expiry_ms == observation + 400 + 300  # Last receipt + 300.
+    assert plugin._lease_expiry_ms == observation + 400 + 500  # Last receipt + 500.
     setup.clock.advance(0.101)  # Observation now 501ms old: no longer admissible.
     send(plugin, command(setup, seq=4, obs_stamp_ms=observation))
     assert plugin._counts["accepted"] == 3 and plugin._counts["dropped"] == 1
-    assert plugin._lease_expiry_ms == observation + 700  # The dropped packet renewed nothing.
-    setup.clock.advance(0.20)
+    assert plugin._lease_expiry_ms == observation + 900  # The dropped packet renewed nothing.
+    setup.clock.advance(0.40)
     plugin._tick()
     assert plugin._soft_held and plugin._cancel_deadline_ms == cancel
     assert not plugin._backend.stop_calls
-    setup.clock.advance(0.71)
+    setup.clock.advance(0.51)
     plugin._tick()
     assert plugin._backend.stop_calls == 1
 
@@ -249,10 +249,10 @@ def test_real_process_soft_zeros_resumes_same_action_then_cancels_on_silence(pro
     card = process_setup.create()
     process_send(card, process_command(ttl_ms=100))
     first = wait_info(card, lambda item: item["counts"]["accepted"] == 1)
-    assert first["control_interface"]["rate"]["watchdog_ms"] == 300
+    assert first["control_interface"]["rate"]["watchdog_ms"] == 500
     assert first["control_interface"]["rate"]["max_obs_age_ms"] == 500
     assert first["backend"]["capabilities"]["staged_stop"]
-    assert first["backend"]["last_write"]["lease_remaining_ms"] <= 300
+    assert first["backend"]["last_write"]["lease_remaining_ms"] <= 500
     assert first["backend"]["last_write"]["cancel_remaining_ms"] > 700
     soft = wait_info(card, lambda item: item["counts"]["soft_holds"] == 1)
     assert soft["output"] == [0] * 6

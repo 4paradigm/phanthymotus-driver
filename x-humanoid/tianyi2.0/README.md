@@ -248,7 +248,7 @@ traceable vendor specification; it does not publish guessed timing values.
 Input TTL and observation age (500ms) are admission checks: an already-stale
 command is dropped and cannot resume motion or renew the watchdog. Once
 admitted, a command no longer stops motion at its producer's per-frame TTL
-(commonly 200ms). Its execution deadline ends 300ms after the original
+(commonly 200ms). Its execution deadline ends 500ms after the original
 ROS/bridge callback receipt; observation age does not shorten it. (With
 `obs_stamp_ms + 500ms` as an execution deadline, a 10Hz stream of ~400ms-old
 detections expired every frame and the per-frame clamp restarted from zero,
@@ -260,7 +260,7 @@ accepted frame can then update the same action directly. If no new valid frame
 arrives for 1000ms, the action is cancelled and its heartbeat stops.
 IPC, local queue and SDK reply time consume the original receive budgets,
 never renew them. A detection older than 500ms is never admitted, however
-many new packets reuse it. `control_interface.rate.watchdog_ms` reports 300 and
+many new packets reuse it. `control_interface.rate.watchdog_ms` reports 500 and
 `max_obs_age_ms` reports 500 (admission). Deploy Python and the native
 worker together; staged stopping requires the worker's advertised capability.
 Python uses the original monotonic receipt time for its silence watchdog; the
@@ -312,7 +312,7 @@ every other command just because a vendor call took 70ms of its 100ms period.
 When transport bunches arrivals closer than 50ms, the newest motion stays in
 the bounded inbox until the next permitted apply slot instead of being thrown
 away. Explicit zero always bypasses that pacing. Input TTL freshness,
-observation-age limits and the 300ms receive watchdog remain enforced.
+observation-age limits and the 500ms receive watchdog remain enforced.
 
 The ROS/MCP facade now runs the existing velocity controller in a separate
 Python process (`loco_servo_process.py`), rather than in the camera bundle's
@@ -384,7 +384,7 @@ measures generation-to-driver-callback age; `local_wait_ms` measures callback-to
 submission delay, including any synchronous stop before submission. These
 measurements are tied to that selected frame, even if a newer one has arrived.
 `dispatch.execution_deadline_basis` and the same field in `last_command_timing`
-are `receive_watchdog`; `receive_watchdog_ms` is 300. `ttl_ms`
+are `receive_watchdog`; `receive_watchdog_ms` is 500. `ttl_ms`
 remains the producer's input freshness limit and is not the execution lease.
 Continuous
 publication alone cannot guarantee continuous motion: expired observations,
@@ -422,7 +422,7 @@ across a ramp crossing; older workers safely fall back to stopping. Neither
 zero path creates an action while idle. An explicit all-zero input during a
 live lease updates the held SDK action to zero without cancelling it, so a
 following fresh command can update the same action. A zero received while idle
-is a no-op. Lifecycle stop/pause/handover still cancels immediately; the 300ms
+is a no-op. Lifecycle stop/pause/handover still cancels immediately; the 500ms
 receive watchdog first commands zero and the one-second cancellation deadline
 then cancels a silent stream. The 500ms observation admission limit still
 rejects stale commands.
