@@ -216,6 +216,21 @@ def test_repeated_start_is_idempotent_and_restart_reuses_endpoints(depth_plugin)
     assert plugin.dispatch("info", {})["state"] == "running"
 
 
+def test_mcp_stop_acknowledges_idle_and_dispatch_start_rearms(depth_plugin):
+    """Exercise the lifecycle path used after main.py's one lazy start."""
+    plugin, _, _ = depth_plugin
+    publisher, subscription = plugin._pub, plugin._subscription
+
+    stopped = plugin.dispatch("stop", {})
+    assert stopped["state"] == "idle"
+    assert plugin._running is False
+
+    restarted = plugin.dispatch("start", {})
+    assert restarted["state"] == "running"
+    assert plugin._running is True
+    assert (plugin._pub, plugin._subscription) == (publisher, subscription)
+
+
 def test_frame_that_ages_during_conversion_is_not_published(depth_plugin, monkeypatch):
     plugin, clock, _ = depth_plugin
     original = plugin._to_dashboard_depth

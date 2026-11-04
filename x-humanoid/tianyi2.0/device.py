@@ -2240,6 +2240,17 @@ class DepthCameraPlugin:
             depth = depth[top:top + crop_height, :]
         return self._cv2.resize(depth, (640, 480), interpolation=self._cv2.INTER_NEAREST)
     def dispatch(self, action, args):
+        # main.py only invokes start() for the first lazy start in a process.
+        # Every later lifecycle transition is delivered here, so handle both
+        # verbs explicitly.  Without this, stop merely returned the current
+        # ``running`` state and Agent Core timed out waiting for an idle ack.
+        if action == "start":
+            try:
+                self.start()
+            except Exception as exc:
+                return {"state": "error", "error": str(exc)}
+        elif action == "stop":
+            self.stop()
         now = time.monotonic()
         duration = now - self._first_published_at if self._first_published_at is not None else 0
         geometry = self._source_geometry
