@@ -720,8 +720,10 @@ class JointControlPlugin(FrankaPlugin):
 
 def build_plugins(config, namespace, ros2):
     from franka.fr3.camera import ExtCameraPlugin
+    from franka.fr3.gripper import GripperPlugin
     sensor = FrankaPlugin(config, namespace, ros2)
     controller = JointControlPlugin(config, namespace, ros2,
         manager=sensor._manager, discovery=sensor._discovery)
-    return [sensor, controller,
+    gripper = GripperPlugin(config, namespace, ros2, discovery=sensor._discovery)
+    return [sensor, controller, gripper,
             ExtCameraPlugin(config.get("ext_camera", {}), namespace, ros2)]

@@ -90,7 +90,7 @@ COPY --from=builder /opt/ros/humble/lib/*/libpinocchio_default.so.* \
     /opt/ros/humble/lib/*/libcoal.so.* \
     /opt/ros/humble/lib/*/liburdfdom_model.so.* \
     /opt/ros/humble/lib/*/liburdfdom_world.so.* /usr/local/lib/
-COPY --from=builder /usr/local/bin/franka-state-reader /usr/local/bin/
+COPY --from=builder /usr/local/bin/franka-state-reader /usr/local/bin/franka-gripper /usr/local/bin/
 COPY --from=builder /tmp/libfranka/LICENSE /tmp/libfranka/NOTICE /usr/share/licenses/libfranka/
 COPY --from=builder /tmp/libfranka/common/LICENSE /tmp/libfranka/common/NOTICE /usr/share/licenses/libfranka-common/
 COPY --from=builder /usr/share/doc/ros-humble-pinocchio/copyright /usr/share/licenses/pinocchio/copyright
@@ -104,7 +104,7 @@ RUN ln -s libfranka.so.0.18.1 /usr/local/lib/libfranka.so.0.18 \
 
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py hardware.py discovery.py camera.py camera_backend.py realsense.py camera_contract.py config.yaml driver.yaml requirements.txt /work/franka/fr3/
+COPY main.py device.py hardware.py gripper.py gripper_hardware.py discovery.py camera.py camera_backend.py realsense.py camera_contract.py config.yaml driver.yaml requirements.txt /work/franka/fr3/
 ARG PYPI_MIRROR=https://pypi.org/simple/
 RUN python3 -m pip install --no-cache-dir --only-binary=:all: -i ${PYPI_MIRROR} \
     numpy==1.23.5 opencv-python-headless==4.11.0.86 pyrealsense2==2.56.5.9235

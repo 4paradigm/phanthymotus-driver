@@ -5,6 +5,7 @@ franka-fr3:
   network_mode: host
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /opt/phanthy-motus/data/certs/cert.pem:/opt/phanthy-motus/data/certs/cert.pem:ro
     - /dev:/dev:ro
   device_cgroup_rules:
     - "c 81:* rw"
@@ -28,6 +29,7 @@ franka-fr3:
     - PYTHONUNBUFFERED=1
     - RCUTILS_COLORIZED_OUTPUT=0
     - AGENT_CORE_URL=${FRANKA_AGENT_CORE_URL:-https://localhost:15678}
+    - AGENT_CORE_CA_CERT=/opt/phanthy-motus/data/certs/cert.pem
   logging:
     driver: local
     options:

@@ -14,3 +14,4 @@ cards:
   - { name: model, type: resource }
   - { name: joint_control, type: actuator }
   - { name: ext_camera, type: sensor }
+  - { name: gripper, type: actuator }
