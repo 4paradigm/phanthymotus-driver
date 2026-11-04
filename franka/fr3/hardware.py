@@ -9,8 +9,6 @@ import math
 import os
 import selectors
 import subprocess
-import sys
-from pathlib import Path
 import threading
 import time
 import uuid
@@ -468,12 +466,8 @@ class RobotSession:
             attempt_started = time.monotonic()
             self._status("connecting", self._error)
             try:
-                command = [self._reader_path, self.address]
-                if os.environ.get("FRANKA_REMOTE_HOST"):
-                    command = [sys.executable, str(Path(__file__).with_name("remote_backend.py")),
-                               "client", self.address]
                 process = self._process_factory(
-                    command, stdin=subprocess.PIPE,
+                    [self._reader_path, self.address], stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
                 os.set_blocking(process.stdin.fileno(), False)
                 with self._lock:

@@ -78,7 +78,7 @@ FROM ros-base
 # iproute2 and aiohttp support bounded, read-only Desk device discovery.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates python3-yaml python3-aiohttp openssh-client iproute2 ros-humble-rmw-fastrtps-cpp \
+        ca-certificates python3-yaml python3-aiohttp iproute2 ros-humble-rmw-fastrtps-cpp \
         libpocofoundation80 libpoconet80 libfmt8 libtinyxml2-9 libconsole-bridge1.0 \
         libboost-filesystem1.74.0 libboost-serialization1.74.0 \
         libassimp5 liboctomap1.9 libtinyxml2.6.2v5 libusb-1.0-0 python3-pip \
@@ -104,7 +104,7 @@ RUN ln -s libfranka.so.0.18.1 /usr/local/lib/libfranka.so.0.18 \
 
 WORKDIR /work
 COPY common/ /work/common/
-COPY remote_backend.py main.py device.py hardware.py discovery.py camera.py camera_backend.py realsense.py camera_contract.py config.yaml driver.yaml requirements.txt /work/franka/fr3/
+COPY main.py device.py hardware.py discovery.py camera.py camera_backend.py realsense.py camera_contract.py config.yaml driver.yaml requirements.txt /work/franka/fr3/
 ARG PYPI_MIRROR=https://pypi.org/simple/
 RUN python3 -m pip install --no-cache-dir --only-binary=:all: -i ${PYPI_MIRROR} \
     numpy==1.23.5 opencv-python-headless==4.11.0.86 pyrealsense2==2.56.5.9235

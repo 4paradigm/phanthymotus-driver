@@ -195,9 +195,8 @@ arms and their network capacity still require hardware validation.
 
 ## External RealSense camera
 
-This development version retains the read-only joint monitor and
-model, and adds only `ext_camera`. It contains no joint-control, gripper or master
-plugin. Camera capture is independent of robot-controller power and FCI.
+The `ext_camera` sensor captures locally and can run independently of
+robot-controller power and FCI.
 
 Select the device by USB serial in each card. The serial is deployment configuration,
 not embedded in the image. RGB and infrared publish JPEG; depth publishes
@@ -220,17 +219,6 @@ Do not open another camera capture program on the same serial during validation.
 
 Offline tests: `python -m pytest tests/test_franka_ext_camera.py tests/test_franka_realsense.py`.
 Physical RGB/depth/infrared, USB reconnect and ARM64 image acceptance remain required.
-
-For the 2026-11-02 development build, the verified network overrides are:
-
-```bash
-docker build --network host \
-  --build-arg ROS_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu \
-  --build-arg PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple \
-  -t franka-fr3:camera-standalone-20261102 <prepared-context>
-```
-
-These overrides select dependency mirrors only; Core source and runtime are not modified.
 
 ## Camera frame and timing semantics
 
@@ -269,7 +257,7 @@ the fixed 120 s budget are rejected before backend submission without changing s
 
 Python manages cards and shared sessions; the C++ libfranka 0.18 backend owns one
 connection per robot IP. The standard Jetson deployment uses
-`FRANKA_REALTIME_POLICY=standard` and leaves `FRANKA_REMOTE_HOST` unset.
+`FRANKA_REALTIME_POLICY=standard`.
 It permits the stock Jetson kernel with libfranka's `kIgnore` option and
 still requires FIFO scheduling. Set `FRANKA_REALTIME_POLICY=enforce`
 to require PREEMPT_RT as well. The native binary defaults to enforce when
@@ -287,10 +275,6 @@ reporting completed, cancelled or error through ACP. The state stream
 uses J1–J7 order. `actual_deg` and `target_deg` use degrees, and fields
 ending in `_rad`, `motion.target` and `motion.max_error` use radians.
 `desired_rad` is the controller's instantaneous desired position.
-
-Keep the previous driver container and configuration when deploying a new
-image. To roll back to an AOOSTAR deployment, stop the replacement driver
-and restore the previous container with its remote backend settings.
 
 Core interruption and card lifecycle
 remain separate; stopping without backend confirmation is an error. These are
