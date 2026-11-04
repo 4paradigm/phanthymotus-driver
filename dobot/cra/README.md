@@ -10,12 +10,14 @@ TCP 控制模式，也不使能或移动机械臂。SDK 版本和协议适配说
 |---|---|
 | `connection` | 配置控制器 IP / 反馈端口；连接、新鲜度、重连错误和有效数据包计数 |
 | `joint_states` | 六关节实际/目标角度、实际速度、电流、电机温度、各关节抱闸状态 |
-| `robot_info` | 反馈中的机器人类型码、六轴信息；型号名称仅展示人工配置值 |
+| `joints` | 按 CR3A 官方关节链渲染的六轴实时三维骨架 |
+| `robot_info` | 反馈中的机器人类型码、六轴信息；113 自动识别为 CR3A |
 | `software_info` | 官方 SDK 版本、固定提交及来源；控制器固件版本标记为不可用 |
 | `arm_all_state` | SDK 完整状态：关节、TCP 实际/目标位姿、坐标系、负载、力及 IO |
 | `controller_state` | 模式、使能、运行、报警标志、抱闸、碰撞、安全字节、电压电流和数字 IO |
 
-六张卡片通过 `std_msgs/String` 发布 JSON，`topic_out.format=data/json`，
+七张 sensor 卡片通过 `std_msgs/String` 发布 JSON，`joints` 使用
+`topic_out.format=sensor/skeleton`，其余六张使用 `data/json`；
 主题为 `/dobot_cra/state/<card>`，默认 10Hz。SDK 原始关节位置/速度为 deg、deg/s；
 `joint_states.position/velocity` 转为 rad、rad/s，并同时保留原始角度。
 TCP 位置为 mm，姿态为 deg。力传感器字段存在不等于传感器在线，使用前应检查
@@ -25,8 +27,15 @@ TCP 位置为 mm，姿态为 deg。力传感器字段存在不等于传感器在
 `stale=true`，状态卡不再输出旧关节位置，返回 `available=false, data=null`。
 `transport_connected` 只表示 socket 已连接，不能代替数据有效性。
 
-未确认具体机械臂型号，因此不提供 URDF/model resource 或假定的关节限位。
-关节状态先以数值显示，后续确认型号后再添加三维骨架。
+`joints` 与数值卡 `joint_states` 使用同一个反馈快照，不增加网络连接。
+骨架以 `joint1..joint6` 匹配 URDF，`q` 和 `dq` 为 rad 和 rad/s。
+另提供平台骨架渲染器调用的 `model` resource（不发布 ROS topic）。
+控制器反馈 `CRRobotType=113` 时自动加载官方 V4 `cr3` 模型；来源和 MIT 许可证
+见 [resource/README.md](resource/README.md)。人工配置的型号不能覆盖不匹配的反馈型号。
+本版骨架只适配已验证识别的 CR3A；其他型号继续提供数值状态，不套用错误模型。
+未知型号或尚未识别时 `model.available=false` 并返回空场景，避免平台默认显示 G1 人形骨架。
+先确认连接卡收到反馈，再添加/打开 `joints` 卡片，以便渲染器首次加载时取得正确模型。
+数据过期时骨架返回 `joints=[], available=false`，静态模型身份可以保留。
 
 ## 网络及配置
 
@@ -65,7 +74,7 @@ SDK 使用已安装的构建工具构建，不再临时拉取不受约束的构�
 ```dotenv
 DOBOT_CONTROLLER_IP=192.168.200.1
 DOBOT_FEEDBACK_PORT=30004
-# 确认型号后再填，不从 CC262 控制柜型号推断
+# 默认留空，型号码 113 自动识别 CR3A；离线预览可显式设置 CR3A
 DOBOT_MODEL_NAME=
 ```
 
@@ -90,10 +99,12 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra
 
 ## PR 真机验收
 
-1. 通过平台安装本分支构建的驱动，确认 `15746/health` 和六张 sensor 卡片可用。
+1. 通过平台安装本分支构建的驱动，确认 `15746/health` 和七张 sensor 卡片可用。
 2. 查看 `connection`：`connected=true`、`stale=false`、计数持续增加。
 3. 对照 DobotStudio Pro 检查六关节角度、使能/抱闸状态及 TCP 位姿。
    如软件占用 `30004`，先断开软件后复测；本驱动不会连接 `29999`。
+   `robot_info` 应识别为 CR3A；添加 `joints` 后应显示六轴机械臂骨架，
+   各轴角度与 `joint_states` 一致。
 4. 断开控制柜网线：过期后应显示不可用，不能继续显示旧位置为实时数据；
    接回网线后应自动恢复。此测试需在机器人已停止时进行。
 5. 停止/启动单张卡片不应干扰其他卡片；重启容器后配置恢复。

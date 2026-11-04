@@ -8,7 +8,8 @@ RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} -r /work/dobot/cra/b
     && python3 -m pip install --no-cache-dir --no-build-isolation -i ${PYPI_MIRROR} -r /work/dobot/cra/requirements.txt \
     && python3 -c 'from dobot_sdk.protocol.data_types import MyType; assert MyType.itemsize == 1440'
 COPY common/ /work/common/
-COPY main.py device.py feedback.py config.yaml driver.yaml SDK.md /work/dobot/cra/
+COPY main.py device.py feedback.py model.py config.yaml driver.yaml SDK.md /work/dobot/cra/
+COPY resource/ /work/dobot/cra/resource/
 COPY deploy/ /deploy/
 
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0 \

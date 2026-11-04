@@ -121,9 +121,11 @@ def decode_packet(packet):
     # SDK 2.0.0 collapses BrakeStatus to bool and labels mode 11 as JOG.
     # Keep its code unmodified; correct semantics here against V4.6.6 docs.
     state["robot_mode"] = int(raw["RobotMode"])
+    state["robot_type"] = int(raw["CRRobotType"]) & 0xFF
     state["robot_mode_name"] = ROBOT_MODES.get(state["robot_mode"], "unknown")
     state["brake_status"] = int(raw["BrakeStatus"]) & 0xFF
-    state["brake_released"] = [bool(state["brake_status"] & (1 << i)) for i in range(6)]
+    # V4.6.6: bit 5 is J1, bit 0 is J6; expose the array in J1..J6 order.
+    state["brake_released"] = [bool(state["brake_status"] & (1 << (5 - i))) for i in range(6)]
     # SafeState is assigned dynamically by the SDK parser and is absent from
     # its dataclass fields. Preserve both bytes, including their high bits.
     state["safety_state"] = int(raw["SafetyState"]) & 0xFF
@@ -261,6 +263,9 @@ class FeedbackClient:
                 "received_at_ms": self._received_wall_ms,
                 "controller_ip": self.address,
                 "feedback_port": self.port,
+                # Geometry identification may survive a feedback outage; joint
+                # positions below remain withheld whenever the stream is stale.
+                "robot_type_code": None if self._latest is None else self._latest["robot_type"],
                 "packets_received": self._packets,
                 "invalid_packets": self._invalid_packets,
                 "discarded_bytes": self._discarded_bytes,

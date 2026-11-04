@@ -36,6 +36,9 @@ Upstream is unmodified. The adapter handles:
 - TCP packet splitting/coalescing, malformed-byte resynchronization and bounded
   buffering, reconnects, freshness, and NaN/Inf rejection.
 - `BrakeStatus` as a per-joint bitmask, not the SDK parser's collapsed boolean.
+  The published array is ordered J1..J6 (wire bits 5..0, respectively).
+- `CRRobotType` as an unsigned byte, preserving values above 127; type 113 is
+  identified as CR3A for the bundled official skeleton model.
 - Mode 11 as collision per the interface manual, rather than upstream's JOG
   label. Unknown mode values remain unknown rather than becoming INIT.
 - `SafeState`, dynamically assigned by the SDK parser but omitted by its

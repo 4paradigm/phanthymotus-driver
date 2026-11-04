@@ -11,13 +11,16 @@ from common.vendor_runtime import tool
 
 if __package__:
     from .feedback import FeedbackClient, SDK_COMMIT, SDK_VERSION, positive_number
+    from .model import JOINT_NAMES, model_resource, resolve_model
 else:
     from feedback import FeedbackClient, SDK_COMMIT, SDK_VERSION, positive_number
+    from model import JOINT_NAMES, model_resource, resolve_model
 
 
 CARD_DESCRIPTIONS = {
     "connection": "控制器反馈连接、数据新鲜度和重连状态（只读）",
     "joint_states": "六关节实际/目标角度、速度、电流和温度（只读）",
+    "joints": "CR3A 六关节实时三维骨架，按控制器型号码识别官方模型（只读）",
     "robot_info": "反馈报告的机器人类型码、六轴信息和人工配置的型号（只读）",
     "software_info": "驱动所用官方 SDK 版本及来源；反馈协议不提供控制器固件版本",
     "arm_all_state": "机械臂完整反馈：关节、TCP 位姿、负载、力和 IO（只读）",
@@ -38,7 +41,8 @@ class DobotSensors:
         self._lifecycle = threading.RLock()
         prefix = namespace.strip("/") or "dobot_cra"
         self._topics = {
-            name: [{"topic": f"/{prefix}/state/{name}", "format": "data/json"}]
+            name: [{"topic": f"/{prefix}/state/{name}",
+                    "format": "sensor/skeleton" if name == "joints" else "data/json"}]
             for name in CARD_DESCRIPTIONS
         }
 
@@ -61,6 +65,7 @@ class DobotSensors:
                 },
             },
         }
+        definitions.append(tool("model", "resource", "控制器识别型号对应的官方 URDF 关节模型"))
         return definitions
 
     def start(self):
@@ -125,12 +130,37 @@ class DobotSensors:
                 "note": "Feedback does not report firmware version; check DobotStudio Pro.",
             }
         state = snapshot["data"]
+        if name == "joints":
+            skeleton = {
+                **result, "format": "sensor/skeleton", "position_unit": "rad",
+                "joint_count": 6, "joints": [], "available": False,
+            }
+            try:
+                skeleton.update(resolve_model(snapshot, self.client.model_name))
+            except ValueError as exc:
+                return {**skeleton, "model_available": False, "model_error": str(exc)}
+            skeleton["model_available"] = True
+            if state is not None:
+                joints = state["joint_state"]
+                skeleton["available"] = True
+                skeleton["joints"] = [
+                    {"idx": i, "name": joint_name,
+                     "q": math.radians(joints["q_actual"][i]),
+                     "dq": math.radians(joints["qd_actual"][i]),
+                     "degree": joints["q_actual"][i]}
+                    for i, joint_name in enumerate(JOINT_NAMES)
+                ]
+            return skeleton
         if state is None:
             return {**result, "available": False, "data": None}
         result["available"] = True
         if name == "robot_info":
+            try:
+                identity = resolve_model(snapshot, self.client.model_name)
+            except ValueError:
+                identity = {"model_name": None, "model_source": None}
             return {
-                **result, "robot_type_code": state["robot_type"], "arm_dof": 6,
+                **result, **identity, "robot_type_code": state["robot_type"], "arm_dof": 6,
                 "configured_model_name": self.client.model_name or None,
                 "model_name_source": "operator_config" if self.client.model_name else None,
             }
@@ -185,6 +215,8 @@ class DobotSensors:
 
     def dispatch(self, action, args):
         name = args.get("_tool_name", action)
+        if name == "model":
+            return model_resource(self.client.snapshot(), self.client.model_name)
         if name not in CARD_DESCRIPTIONS:
             return None
         if action == "start":
