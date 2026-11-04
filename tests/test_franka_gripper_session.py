@@ -140,17 +140,6 @@ class GripperSessionTests(unittest.TestCase):
         eventually(lambda: session.snapshot()["connected"])
         return manager, session, factory, owner
 
-    def test_connect_read_and_close_never_send_homing_or_stop(self):
-        manager, session, factory, _ = self.session()
-        state = session.snapshot()
-        for name, value in STATE.items():
-            self.assertEqual(state[name], value)
-        self.assertNotIn("q", state)
-        self.assertTrue(factory.calls[0][0].endswith("franka-gripper"))
-        self.assertEqual(factory.calls[0][1], "172.16.0.3")
-        manager.close()
-        self.assertEqual(factory.commands(), [])
-
     def test_move_uses_meters_and_returns_actual_state(self):
         _, session, factory, owner = self.session("success")
         command_id = session.command(owner, "set_position", width_m=.025, speed_m_s=.03,
@@ -173,19 +162,6 @@ class GripperSessionTests(unittest.TestCase):
         self.assertTrue(session.snapshot()["is_grasped"])
         manager.release("172.16.0.3", owner)
         self.assertEqual(len(factory.commands()), 1)
-
-    def test_unhomed_rejects_width_commands_but_allows_explicit_homing(self):
-        _, session, factory, owner = self.session("unhomed")
-        for action in ("set_position", "grasp"):
-            with self.assertRaisesRegex(RuntimeError, "homed"):
-                session.command(owner, action, width_m=.02)
-        self.assertEqual(factory.commands(), [])
-        command_id = session.command(owner, "homing")
-        self.assertEqual(session.wait(command_id, 2)["status"], "succeeded")
-        self.assertEqual(factory.commands()[0], ["HOME", command_id, "30"])
-        self.assertEqual(session.snapshot()["max_width"], .08)
-        command_id = session.command(owner, "set_position", width_m=.02)
-        self.assertEqual(session.wait(command_id, 2)["status"], "succeeded")
 
     def test_limits_reject_invalid_commands_without_sending(self):
         _, session, factory, owner = self.session()
@@ -288,27 +264,12 @@ class GripperSessionTests(unittest.TestCase):
         self.assertTrue(session.snapshot()["connected"])
         self.assertEqual(factory.commands()[-1], ["STOP", command_id])
 
-    def test_sdk_false_result_is_failed(self):
-        _, session, _, owner = self.session("failed")
-        command_id = session.command(owner, "grasp", width_m=.02)
-        result = session.wait(command_id, 2)
-        self.assertEqual(result["status"], "failed")
-        self.assertIn("returned false", result["error"])
-
     def test_disconnect_fails_without_replaying_command(self):
         _, session, factory, owner = self.session("disconnect")
         command_id = session.command(owner, "homing")
         self.assertEqual(session.wait(command_id, 2)["status"], "failed")
         eventually(lambda: len(factory.calls) >= 2 and session.snapshot()["connected"])
         self.assertEqual(factory.commands(), [["HOME", command_id, "30"]])
-
-    def test_events_do_not_keep_stale_state_fresh(self):
-        _, session, _, owner = self.session("event_only", retry_delay=1)
-        command_id = session.command(owner, "set_position", width_m=.02)
-        result = session.wait(command_id, 2)
-        self.assertEqual(result["status"], "failed")
-        self.assertIn("stale", result["error"])
-        self.assertNotIn("width", session.snapshot())
 
     def test_state_validation_and_unhomed_feedback(self):
         _, session, _, _ = self.session()

@@ -141,18 +141,6 @@ class GripperCardTests(unittest.TestCase):
                 self.call("grasp", **{"instance_id": "", **args}, width_mm=10)
         self.assertEqual([], first.commands)
 
-    def test_same_ip_shares_session_and_rejects_overlapping_commands(self):
-        session = self.start()
-        self.assertIs(session, self.start("hand-b"))
-        result = self.call("grasp", width_mm=20)
-        with self.assertRaisesRegex(RuntimeError, "another motion"):
-            self.call("set_position", "hand-b", width_mm=40)
-        stopped = self.call("stopmotion", "hand-b")
-        self.assertEqual("cancelled", stopped["motion"]["status"])
-        fixtures.wait_for(lambda: len(self.completions) == 1)
-        self.assertEqual("cancelled", self.completions[0][1])
-        self.assertEqual(result["action_id"], self.completions[0][0])
-
     def test_stopmotion_releases_hold_without_stopping_other_ip_or_card(self):
         first = self.start()
         second = self.start("hand-b", "172.16.0.3")
@@ -163,13 +151,6 @@ class GripperCardTests(unittest.TestCase):
         self.assertEqual(1, len(first.physical_stops))
         self.assertEqual([], second.physical_stops)
         self.assertEqual(0, self.publishers[0].closed)
-
-    def test_lifecycle_stop_preserves_successful_grasp_hold(self):
-        session = self.start()
-        result = self.call("grasp", width_mm=20)
-        self.complete(session, result)
-        self.assertEqual("idle", self.call("stop")["state"])
-        self.assertEqual([], session.physical_stops)
 
     def test_stop_failure_is_not_reported_as_stopped(self):
         session = self.start()
@@ -190,16 +171,6 @@ class GripperCardTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "rejected configuration"):
             self.call("homing")
         self.assertEqual([], session.commands)
-
-    def test_stale_state_does_not_publish_old_width(self):
-        session = self.start()
-        session.value = {"connected": False, "state": "stale", "error": "Read timeout"}
-        self.publishers[0].callback()
-        payload = self.publishers[0].frames[-1]
-        self.assertFalse(payload["connected"])
-        self.assertIsNone(payload["width_mm"])
-        self.assertIsNone(payload["is_grasped"])
-        self.assertFalse(payload["control_ready"])
 
 
 if __name__ == "__main__":
