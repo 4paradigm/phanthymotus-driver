@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import ipaddress
 import json
 import math
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import threading
@@ -861,7 +863,7 @@ def test_audio_auto_selects_local_aos_or_ssh_transport(monkeypatch):
     local = audio._audio_transport({"audio": {"ssh_host": "10.21.33.103"}})
     assert local[0] == "local"
     assert local[4:] == (
-        "plughw:CARD=Speaker,DEV=0", "plughw:CARD=rockchipes8388,DEV=0")
+        "plughw:CARD=rockchipes8388,DEV=0", "plughw:CARD=rockchipes8388,DEV=0")
 
     monkeypatch.setattr(audio, "_is_local_address", lambda _address: False)
     monkeypatch.setenv("S10_AUDIO_SSH_PASSWORD", "'")
@@ -871,7 +873,7 @@ def test_audio_auto_selects_local_aos_or_ssh_transport(monkeypatch):
     mode, host, user, password, capture_device, playback_device = audio._audio_transport({"audio": {}})
     assert (mode, host, user, password) == ("ssh", "10.21.33.103", "user", "'")
     assert (capture_device, playback_device) == (
-        "plughw:CARD=Speaker,DEV=0", "plughw:CARD=rockchipes8388,DEV=0")
+        "plughw:CARD=rockchipes8388,DEV=0", "plughw:CARD=rockchipes8388,DEV=0")
     command, env = audio._audio_launch("arecord", capture_device, mode, host, user, password)
     assert command[:3] == ["sshpass", "-e", "ssh"]
     assert command[-2] == "user@10.21.33.103"
@@ -1934,6 +1936,10 @@ def test_basic_server_uses_tcp_for_request_response(monkeypatch):
         def settimeout(self, _timeout):
             pass
 
+        def getpeercert(self, binary_form=False):
+            assert binary_form is True
+            return b"approved S10 certificate"
+
         def sendall(self, frame):
             message_id, request = decode_frame(frame)
             body = request["PatrolDevice"]
@@ -1957,17 +1963,22 @@ def test_basic_server_uses_tcp_for_request_response(monkeypatch):
             self.ready.set()
 
     fake_socket = FakeSocket()
+    tls_context = SimpleNamespace(wrap_socket=lambda sock, server_hostname: (
+        sock if server_hostname == "server.local" else pytest.fail("wrong TLS server name")))
+    monkeypatch.setattr("deep_robotics.s10_pro.basic_server.ssl.SSLContext",
+                        lambda _protocol: tls_context)
     monkeypatch.setattr(
         "deep_robotics.s10_pro.basic_server.socket.create_connection",
         lambda address, timeout: fake_socket,
     )
     client = BasicServerClient({"basic_server": {
-        "host": "127.0.0.1", "tcp_port": 30003, "timeout": 1,
+        "host": "127.0.0.1", "tls_tcp_port": 30003, "timeout": 1,
+        "tls_sha256_fingerprint": hashlib.sha256(b"approved S10 certificate").hexdigest(),
     }})
     try:
         response = client.request(0x00100064, 0x00000005)
         assert response["PatrolDevice"]["Items"] == {"ErrorCode": 0}
-        assert client.snapshot()["transport"] == "TCP"
+        assert client.snapshot()["transport"] == "TLS/TCP"
         assert client.snapshot()["reports"]["1048676:5"] == response
     finally:
         client.close()
@@ -1982,6 +1993,10 @@ def test_basic_server_matches_string_encoded_response_type_and_command(monkeypat
 
         def settimeout(self, _timeout):
             pass
+
+        def getpeercert(self, binary_form=False):
+            assert binary_form is True
+            return b"approved S10 certificate"
 
         def sendall(self, frame):
             _message_id, _request = decode_frame(frame)
@@ -2004,12 +2019,16 @@ def test_basic_server_matches_string_encoded_response_type_and_command(monkeypat
             self.ready.set()
 
     fake_socket = FakeSocket()
+    tls_context = SimpleNamespace(wrap_socket=lambda sock, server_hostname: sock)
+    monkeypatch.setattr("deep_robotics.s10_pro.basic_server.ssl.SSLContext",
+                        lambda _protocol: tls_context)
     monkeypatch.setattr(
         "deep_robotics.s10_pro.basic_server.socket.create_connection",
         lambda address, timeout: fake_socket,
     )
     client = BasicServerClient({"basic_server": {
-        "host": "127.0.0.1", "tcp_port": 30003, "timeout": 1,
+        "host": "127.0.0.1", "tls_tcp_port": 30003, "timeout": 1,
+        "tls_sha256_fingerprint": hashlib.sha256(b"approved S10 certificate").hexdigest(),
     }})
     try:
         response = client.request(1048676, 5)
@@ -2018,3 +2037,31 @@ def test_basic_server_matches_string_encoded_response_type_and_command(monkeypat
         assert "1048676:5" in client.snapshot()["reports"]
     finally:
         client.close()
+
+
+def test_basic_server_rejects_unpinned_tls_certificate(monkeypatch):
+    class FakeSocket:
+        def close(self):
+            self.closed = True
+
+        def getpeercert(self, binary_form=False):
+            return b"unexpected certificate"
+
+    raw_socket = FakeSocket()
+    wrapped_socket = FakeSocket()
+    context = SimpleNamespace(wrap_socket=lambda _sock, server_hostname: wrapped_socket)
+    monkeypatch.setattr("deep_robotics.s10_pro.basic_server.ssl.SSLContext",
+                        lambda _protocol: context)
+    monkeypatch.setattr("deep_robotics.s10_pro.basic_server.socket.create_connection",
+                        lambda *_args, **_kwargs: raw_socket)
+    client = BasicServerClient({"basic_server": {
+        "host": "127.0.0.1", "tls_sha256_fingerprint": "0" * 64,
+    }})
+    with pytest.raises(ssl.SSLCertVerificationError, match="pin mismatch"):
+        client._connect()
+    assert wrapped_socket.closed is True
+
+
+def test_basic_server_rejects_malformed_tls_fingerprint():
+    with pytest.raises(ValueError, match="64 hex digits"):
+        BasicServerClient({"basic_server": {"tls_sha256_fingerprint": "z" * 64}})

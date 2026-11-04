@@ -28,11 +28,15 @@ bound on this host (onboard deployment), otherwise it runs `arecord`/`aplay` on
 AOS over SSH (external Jetson deployment). The default AOS endpoint is
 `10.21.33.103`, with `user` and the configured S10 SSH password; override with
 `S10_AUDIO_SSH_HOST`, `S10_AUDIO_SSH_USER`, and `S10_AUDIO_SSH_PASSWORD`.
-Capture defaults to the AOS USB audio capture device
-`plughw:CARD=Speaker,DEV=0` (ALSA card 1); playback defaults to the onboard
-codec `plughw:CARD=rockchipes8388,DEV=0` (ALSA card 0). These distinct devices
-are used in both local and SSH modes; override them independently when the AOS
-card names differ.
+Capture and playback both default to the verified AOS onboard codec
+`plughw:CARD=rockchipes8388,DEV=0` (ALSA card 0); the USB `Speaker` device is
+playback-only on this robot. These device settings are used in both local and
+SSH modes; override them independently when the AOS card names differ.
+The mic bridge keeps at most four 32 ms frames (128 ms) and replaces the oldest
+queued frame if its publisher falls behind. Raw `arecord`/SSH output has no
+hardware capture timestamp, so mic messages use a zero header stamp and
+consumers must treat capture time as untrusted. `mic info` reports bridge
+frames dropped during the current capture session.
 `S10_AUDIO_CAPTURE_DEVICE` and `S10_AUDIO_PLAYBACK_DEVICE` override the
 respective ALSA devices. Set `S10_AUDIO_MODE=local` or `ssh` to force a mode.
 Deployment maps `/dev/snd` for local operation; external operation transports
@@ -51,7 +55,11 @@ is `header.stamp: null`. Point coordinates remain in the input LiDAR frame;
 there is no mounting transform, temporal accumulation or object recognition.
 Joint latency and LiDAR coordinate refinements remain separate local work.
 
-Motion uses native S10 TCP commands and reports long-running completion through
+Motion and lighting use the vendor `basic_server` JSON framing over TLS/TCP on
+port `30003`. The client verifies the `server.local` endpoint using the
+S10 certificate SHA-256 pin in `config.yaml`; deployments can override the
+name/pin or provide a CA with `S10_BASIC_SERVER_TLS_CA`. There is no plaintext
+fallback. Motion uses native S10 commands and reports long-running completion through
 `/api/acp/complete`; locomotion movement accepts `yaw_rate_deg_s` in degrees per
 second and a bounded duration. Head and tail lights are independent cards.
 `loco_servo` is the streaming counterpart for visual navigation policies. It

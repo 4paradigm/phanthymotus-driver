@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import os
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -15,6 +18,9 @@ from datetime import datetime
 SYNC = b"\xeb\x91\xeb\x90"
 HEADER = struct.Struct("<4sHHBBB5x")
 MAX_ASDU = 1000
+DEFAULT_TLS_SHA256_FINGERPRINT = (
+    "6cd411bfaafed2c5d93f80d30edb514e6b194ef2e33a199a851bbff9ce50b415"
+)
 
 
 def _protocol_int(value: object) -> int:
@@ -113,13 +119,23 @@ class StreamDecoder:
 
 
 class BasicServerClient:
-    """Native TCP client for the S10 basic_server protocol."""
+    """TLS-authenticated client for the S10 basic_server protocol."""
 
     def __init__(self, config: dict):
         native = config.get("basic_server", {})
         self.host = str(os.environ.get("S10_BASIC_SERVER_HOST", native.get("host", "10.21.33.103")))
-        self.port = int(native.get("tcp_port", native.get("tls_tcp_port", 30003)))
+        self.port = int(native.get("tls_tcp_port", native.get("tcp_port", 30003)))
         self.timeout = float(native.get("timeout", 2.0))
+        self.tls_server_name = str(os.environ.get(
+            "S10_BASIC_SERVER_TLS_NAME", native.get("tls_server_name", "server.local")))
+        self.tls_ca_file = os.environ.get("S10_BASIC_SERVER_TLS_CA") or native.get("tls_ca_file")
+        configured_pin = os.environ.get("S10_BASIC_SERVER_TLS_SHA256") or native.get(
+            "tls_sha256_fingerprint", DEFAULT_TLS_SHA256_FINGERPRINT)
+        normalized_pin = str(configured_pin).lower().replace(":", "").replace(" ", "")
+        if len(normalized_pin) != 64 or any(
+                char not in "0123456789abcdef" for char in normalized_pin):
+            raise ValueError("S10 basic_server TLS SHA-256 fingerprint must contain 64 hex digits")
+        self.tls_sha256_fingerprint = normalized_pin
         self.config = config
         self.enabled = bool(native.get("enabled", True))
         self._socket = None
@@ -144,8 +160,25 @@ class BasicServerClient:
 
     def _connect(self):
         if self._socket is None:
-            self._socket = socket.create_connection((self.host, self.port), timeout=self.timeout)
-            self._socket.settimeout(None)
+            raw_socket = socket.create_connection((self.host, self.port), timeout=self.timeout)
+            connection = None
+            try:
+                if self.tls_ca_file:
+                    context = ssl.create_default_context(cafile=self.tls_ca_file)
+                else:
+                    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                connection = context.wrap_socket(raw_socket, server_hostname=self.tls_server_name)
+                certificate_digest = hashlib.sha256(connection.getpeercert(binary_form=True)).hexdigest()
+                if not hmac.compare_digest(
+                        certificate_digest, self.tls_sha256_fingerprint):
+                    raise ssl.SSLCertVerificationError("S10 basic_server TLS certificate pin mismatch")
+                connection.settimeout(None)
+                self._socket = connection
+            except Exception:
+                (connection or raw_socket).close()
+                raise
 
     def _remember(self, payload):
         body = payload.get("PatrolDevice", {})
@@ -241,7 +274,7 @@ class BasicServerClient:
     def snapshot(self):
         with self._state_lock:
             reports = dict(self.reports)
-        return {"enabled": self.enabled, "transport": "TCP", "host": self.host,
+        return {"enabled": self.enabled, "transport": "TLS/TCP", "host": self.host,
                 "port": self.port, "connected": self._socket is not None,
                 "last_error": self.last_error, "reports": reports}
 

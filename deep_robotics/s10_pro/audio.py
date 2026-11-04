@@ -17,12 +17,13 @@ from domain_bridge import CoreAudioSubscriber
 AUDIO_FORMAT = "audio/pcm-16k"
 SUPPORTED_AUDIO_FORMATS = {AUDIO_FORMAT, "pcm_16k_16bit_mono"}
 AUDIO_MESSAGE_TYPE = "audio_msgs/msg/AudioChunk"
-DEFAULT_CAPTURE_DEVICE = "plughw:CARD=Speaker,DEV=0"
+DEFAULT_CAPTURE_DEVICE = "plughw:CARD=rockchipes8388,DEV=0"
 DEFAULT_PLAYBACK_DEVICE = "plughw:CARD=rockchipes8388,DEV=0"
 FRAME_BYTES = 1024  # 32 ms of mono PCM S16_LE at 16 kHz.
 FRAME_DURATION_NS = FRAME_BYTES * 1_000_000_000 // (16_000 * 2)
 MAX_AUDIO_FRAME_BYTES = 256 * 1024
 AUDIO_EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"
+MIC_BRIDGE_QUEUE_DEPTH = 4  # 128 ms at 32 ms per PCM frame.
 
 
 def _pcm_card(device):
@@ -113,6 +114,7 @@ class S10MicPlugin:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._frames = 0
+        self._bridge_dropped_at_start = 0
         self._last_error = None
 
     def get_tool(self):
@@ -147,7 +149,9 @@ class S10MicPlugin:
             if self._publisher is None:
                 from audio_msgs.msg import AudioChunk
                 self._publisher = self.nodes.bridge.create_publisher(
-                    "mic_audio", self.topic, AudioChunk, queue_depth=32, latest_only=False)
+                    "mic_audio", self.topic, AudioChunk,
+                    queue_depth=MIC_BRIDGE_QUEUE_DEPTH, latest_only=True)
+            self._bridge_dropped_at_start = self._bridge_drop_count()
             try:
                 command, env = _audio_launch("arecord", self.device, self.mode,
                                              self.host, self.user, self.password)
@@ -169,12 +173,17 @@ class S10MicPlugin:
             self._reader.start()
         return {"state": "running", "topic_out": self.get_tool()["topic_out"]}
 
+    def _bridge_drop_count(self):
+        try:
+            return int(self.nodes.bridge.stats("mic_audio").get("dropped", 0))
+        except (AttributeError, TypeError, ValueError):
+            return 0
+
     def _capture_loop(self):
         from audio_msgs.msg import AudioChunk
 
         process = self._process
         buffer = bytearray()
-        next_frame_stamp_ns = None
         try:
             while not self._stop.is_set() and process is not None:
                 chunk = process.stdout.read(FRAME_BYTES)
@@ -185,20 +194,18 @@ class S10MicPlugin:
                         break
                     time.sleep(0.005)
                     continue
-                if next_frame_stamp_ns is None:
-                    next_frame_stamp_ns = time.time_ns() - FRAME_DURATION_NS
                 buffer.extend(chunk)
                 while len(buffer) >= FRAME_BYTES:
                     payload = bytes(buffer[:FRAME_BYTES])
                     del buffer[:FRAME_BYTES]
                     message = AudioChunk()
-                    message.header.stamp.sec = next_frame_stamp_ns // 1_000_000_000
-                    message.header.stamp.nanosec = next_frame_stamp_ns % 1_000_000_000
+                    # Raw arecord/SSH PCM does not include ALSA capture time.
+                    # Leave stamp zero instead of labeling pipe-read time as
+                    # a trusted capture timestamp.
                     message.format = AUDIO_FORMAT
                     message.data = payload
                     self._publisher.publish(message)
                     self._frames += 1
-                    next_frame_stamp_ns += FRAME_DURATION_NS
         except (OSError, ValueError) as exc:
             if not self._stop.is_set():
                 self._last_error = str(exc)
@@ -232,6 +239,8 @@ class S10MicPlugin:
         if action == "info":
             running = self._process is not None and self._process.poll() is None
             result = {"state": "running" if running else "idle", "frames": self._frames,
+                      "frames_dropped": max(0, self._bridge_drop_count() - self._bridge_dropped_at_start),
+                      "capture_timestamp_trusted": False,
                       "topic_out": self.get_tool()["topic_out"], "mode": self.mode,
                       "audio_host": self.host if self.mode == "ssh" else None}
             if self._last_error:

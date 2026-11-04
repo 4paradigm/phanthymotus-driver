@@ -9,7 +9,7 @@ ros:
   robot_interface: auto
   robot_network_cidr: 10.21.33.0/24
 # service.yml targets the S10 onboard host: robot_server runs there and listens
-# on TCP 30003. NETWORK_INTERFACE/CIDR constrain robot-domain DDS; domain 42
+# on TLS/TCP 30003. NETWORK_INTERFACE/CIDR constrain robot-domain DDS; domain 42
 # publishers and the control subscriber run in loopback-profiled subprocesses.
 topics:
   imu: "/IMU"
@@ -92,7 +92,9 @@ basic_server:
   # On the onboard host, robot_server is reachable at this host address. For a
   # separate driver host, override with the S10 host's reachable address.
   host: "10.21.33.103"
-  tcp_port: 30003
+  tls_tcp_port: 30003
+  tls_server_name: server.local
+  tls_sha256_fingerprint: 6cd411bfaafed2c5d93f80d30edb514e6b194ef2e33a199a851bbff9ce50b415
   timeout: 2.0
 audio:
   mode: auto

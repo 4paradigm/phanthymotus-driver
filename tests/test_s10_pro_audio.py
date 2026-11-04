@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,6 +49,95 @@ def test_audio_device_names_and_pcm_commands(monkeypatch):
         "-r", "16000", "-c", "1",
     ]
     assert audio._playback_command("default")[0:4] == ["aplay", "-q", "-D", "default"]
+
+
+def test_mic_capture_uses_bounded_latest_only_queue_and_reports_drops(monkeypatch):
+    audio = _load_audio(monkeypatch)
+    queue_args = {}
+    dropped = {"value": 7}
+
+    class Bridge:
+        def create_publisher(self, lane, topic, message_type, **kwargs):
+            queue_args.update(lane=lane, topic=topic, message_type=message_type, **kwargs)
+            return SimpleNamespace(publish=lambda _message: None)
+
+        def stats(self, lane):
+            assert lane == "mic_audio"
+            return {"dropped": dropped["value"]}
+
+    class Process:
+        def poll(self):
+            return None
+
+    class WorkerThread:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    message_module = SimpleNamespace(AudioChunk=object)
+    monkeypatch.setitem(sys.modules, "audio_msgs", SimpleNamespace(msg=message_module))
+    monkeypatch.setitem(sys.modules, "audio_msgs.msg", message_module)
+    monkeypatch.setattr(audio.shutil, "which", lambda _name: "/usr/bin/arecord")
+    monkeypatch.setattr(audio.subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    monkeypatch.setattr(audio.threading, "Thread", WorkerThread)
+    monkeypatch.setattr(audio, "_audio_launch", lambda *_args: (["arecord"], None))
+
+    plugin = audio.S10MicPlugin({"audio": {}}, "s10_pro", nodes=SimpleNamespace(bridge=Bridge()))
+    plugin.mode = "local"
+    assert plugin._start_capture()["state"] == "running"
+    assert queue_args["queue_depth"] == 4
+    assert queue_args["latest_only"] is True
+
+    dropped["value"] = 10
+    status = plugin.dispatch("info", {})
+    assert status["frames_dropped"] == 3
+    assert status["capture_timestamp_trusted"] is False
+
+
+def test_mic_capture_leaves_raw_pipe_timestamp_untrusted(monkeypatch):
+    audio = _load_audio(monkeypatch)
+
+    class AudioChunk:
+        def __init__(self):
+            self.header = SimpleNamespace(stamp=SimpleNamespace(sec=0, nanosec=0))
+
+    message_module = SimpleNamespace(AudioChunk=AudioChunk)
+    monkeypatch.setitem(sys.modules, "audio_msgs", SimpleNamespace(msg=message_module))
+    monkeypatch.setitem(sys.modules, "audio_msgs.msg", message_module)
+
+    class Stdout:
+        def __init__(self):
+            self.chunks = [b"\x01\x00" * 512, b""]
+
+        def read(self, _size):
+            return self.chunks.pop(0)
+
+    class Stderr:
+        def read(self, _size):
+            return b""
+
+    class Process:
+        def __init__(self):
+            self.stdout = Stdout()
+            self.stderr = Stderr()
+            self.returncode = 0
+
+        def poll(self):
+            return 0
+
+    published = []
+    plugin = audio.S10MicPlugin({"audio": {}}, "s10_pro", nodes=None)
+    plugin._process = Process()
+    plugin._publisher = SimpleNamespace(publish=published.append)
+    plugin._capture_loop()
+
+    assert len(published) == 1
+    assert published[0].format == audio.AUDIO_FORMAT
+    assert len(published[0].data) == 1024
+    stamp = published[0].header.stamp
+    assert (stamp.sec, stamp.nanosec) == (0, 0)
 
 
 def test_build_plugins_registers_audio_cards_for_pro_only(monkeypatch):
