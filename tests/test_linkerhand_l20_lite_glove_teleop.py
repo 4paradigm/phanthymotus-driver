@@ -421,6 +421,46 @@ def test_queued_stale_samples_do_not_refresh_the_watchdog():
     assert "left" not in device._side_received
 
 
+@pytest.mark.parametrize('live_channel', ['root', 'top'])
+@pytest.mark.parametrize('queue_delay', [0, 0.05])
+def test_partial_channel_loss_watchdog_uses_capture_age(monkeypatch, live_channel, queue_delay):
+    from glove_direct_reader import GloveAssembler
+    wall = [100.0]
+    monkeypatch.setattr(glove.time, 'time', lambda: wall[0])
+    device = glove.GloveTeleopPlugin(FakeHand(), {
+        'source_mode': 'direct', 'thumb_mapping': {'enabled': True},
+    }, 'test', None)
+    assembler = GloveAssembler()
+
+    def update(channel, now, sequence=1):
+        assembler.update({'side': 'left', 'channel': channel, 'sequence': sequence,
+                          'quaternions': [[0., 0., 0., 1.]] * 6}, now)
+
+    update('root', 10)
+    update('top', 10)
+    assert device.accept_direct_sample(assembler.sample('left', 10, wall_ms=100000), now=10)
+    client = FakeClient()
+    device._clients['left'] = client
+    device._active_sides = ['left']
+    device._armed = device.hand._teleop_active = True
+    for i in range(1, 10):
+        now = 10 + i * 0.02
+        update(live_channel, now, i + 1)
+        sample = assembler.sample('left', now, wall_ms=100000 + i * 20)
+        if sample is not None:
+            wall[0] = 100 + i * 0.02 + queue_delay
+            assert device.accept_direct_sample(sample, now=now + queue_delay)
+            assert 9.998 <= device._side_received['left'] <= 10.000001
+    device._tick_watchdog(now=10.298)
+    assert device._armed
+    device._tick_watchdog(now=10.301)
+    assert not device._armed and device._pending_disarm
+    assert device._last_watchdog_event['side_age_ms']['left'] >= 300
+    device._finish_disarm()
+    assert device._cleanup_done.is_set() and not device.hand._teleop_active
+    assert client.commands == [('torque', [0] * 10), ('close', None)]
+
+
 def test_arm_setup_can_receive_and_can_be_cancelled_before_torque_enable(monkeypatch):
     class GatedReadClient(FakeClient):
         def __init__(self):

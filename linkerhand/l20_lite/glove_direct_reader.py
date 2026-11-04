@@ -77,11 +77,15 @@ class GloveAssembler:
         self.emitted[side] = marker
         self.last_emit[side] = now
         self.diagnostics[side] = {"status": "valid_sample", "backend": "native_serial"}
+        # An assembled frame is only as fresh as its older constituent. Do not
+        # give a frozen channel a new capture time when the other channel moves.
+        oldest_age_ms = math.ceil(max(0.0, now - min(root['received'], top['received'])) * 1000)
+        wall_now_ms = int(time.time() * 1000) if wall_ms is None else wall_ms
         return {
             "side": side,
             "sequence": top["sequence"],
             "frame_marker": f"{marker[0]}:{marker[1]}",
-            "timestamp_ms": int(time.time() * 1000) if wall_ms is None else wall_ms,
+            "timestamp_ms": wall_now_ms - oldest_age_ms,
             "layout": "new",
             "quaternion_layout": "hex-root-top-v1",
             "root_quaternions": roots,

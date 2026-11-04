@@ -223,6 +223,7 @@ class GloveTeleopPlugin:
         self._mapped_fractions = {}
         self._preview_origin = {}
         self._side_received = {}
+        self._side_arrived = {}
         self._calibration = {}
         self._active_sides = []
         self._error = None
@@ -629,12 +630,12 @@ class GloveTeleopPlugin:
                     "missing root/top quaternions after quaternion calibration"
                 )
             source_stamp = sample.get("timestamp_ms")
-            if (
-                type(source_stamp) is int
-                and time.time() * 1000 - source_stamp > self.watchdog_s * 1000
-            ):
+            source_age_s = (max(0.0, (time.time() * 1000 - source_stamp) / 1000)
+                            if type(source_stamp) is int else 0.0)
+            if source_age_s > self.watchdog_s:
                 return False  # A queued old frame must not revive the motion watchdog.
-            previous_received = self._side_received.get(side)
+            source_received = now - source_age_s
+            previous_received = self._side_arrived.get(side)
             if previous_received is not None:
                 gap = max(0.0, (now - previous_received) * 1000)
                 self._timing["callback_gap_ms"] = round(gap, 1)
@@ -690,7 +691,8 @@ class GloveTeleopPlugin:
                 self._quaternion_candidates.pop(side, None)
                 self._quaternion_preview_origin.pop(side, None)
             self._preview_origin.setdefault(side, list(pitch))
-            self._side_received[side] = now
+            self._side_arrived[side] = now
+            self._side_received[side] = source_received
             history = self._calibration_history.setdefault(side, deque(maxlen=128))
             history.append((now, list(pitch), (
                 [list(q) for q in self._relative_quaternions[side]]
@@ -709,7 +711,7 @@ class GloveTeleopPlugin:
                     if name in self._raw
                     else list(self.skeleton.poses[name][0])
                 )
-        return self._accept_frame(frame, now)
+        return self._accept_frame(frame, source_received)
 
     def accept_packet(self, packet, source_ip, now=None):
         """Parse one datagram, publish it, and command only when explicitly armed."""
@@ -1433,6 +1435,8 @@ class GloveTeleopPlugin:
         with self._lock:
             if self._stopping:
                 raise RuntimeError("previous teleop session is still shutting down")
+            if self._pending_disarm or not self._cleanup_done.is_set():
+                raise RuntimeError("teleop cleanup is still pending; restore connection and explicitly retry disarm")
             if self.source_mode == "direct":
                 if self._thread is None:
                     if not os.path.exists(self.glove_port):
@@ -1496,7 +1500,14 @@ class GloveTeleopPlugin:
             process.terminate()
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2)
-        self._disarm(retry_failed=True)
+        release_error = None
+        try:
+            self._disarm(retry_failed=True)
+        except Exception as exc:
+            # Finish shutting down receive/control resources even if unloading
+            # torque failed. Keep the release interlock and clients intact;
+            # start remains blocked until an explicit disarm succeeds.
+            release_error = exc
         for worker in (self._control_thread, self._watchdog_thread):
             if worker is not None and worker is not threading.current_thread():
                 worker.join(timeout=5)
@@ -1524,11 +1535,14 @@ class GloveTeleopPlugin:
             self._mapped_fractions.clear()
             self._preview_origin.clear()
             self._side_received.clear()
+            self._side_arrived.clear()
             self._calibration.clear()
             self._source_stamps.clear()
             self._timing.clear()
             self._reader_status = None
             self._stopping = False
+        if release_error is not None:
+            raise release_error
         return {"state": "idle", "armed": False}
 
     def dispatch(self, action, args):

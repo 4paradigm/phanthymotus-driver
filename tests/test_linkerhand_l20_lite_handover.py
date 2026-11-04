@@ -234,3 +234,49 @@ def test_old_cleanup_finalizer_does_not_clear_new_arm_reservation():
     glove._arming = True
     glove._finish_disarm()
     assert hand._teleop_active and glove._arming
+
+
+@pytest.mark.parametrize('control_workers', [False, True])
+def test_failed_stop_can_retry_disarm_and_restart_without_driver_restart(monkeypatch, control_workers):
+    hand, _, glove = plugins()
+    client = ReleaseClient()
+    publishers = []
+
+    class Publisher:
+        def __init__(self):
+            self.closed = False
+            publishers.append(self)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr('glove_teleop_device.os.path.exists', lambda _: True)
+    monkeypatch.setattr(glove, '_publisher_factory', lambda _: Publisher())
+    monkeypatch.setattr(glove, '_direct_loop', lambda: glove._shutdown.wait())
+    glove.dispatch('start', {})
+    old_receiver = glove._thread
+    glove._clients['left'] = client
+    glove._armed = hand._teleop_active = True
+    if control_workers:
+        with glove._lock:
+            glove._ensure_control_threads_locked()
+    try:
+        with pytest.raises(RuntimeError, match='handover is locked'):
+            glove.dispatch('stop', {})
+        assert not old_receiver.is_alive() and publishers[0].closed
+        assert glove._control_thread is None and glove._watchdog_thread is None
+        assert not glove._stopping
+        assert hand._teleop_active and glove._pending_disarm
+        assert not glove._cleanup_done.is_set() and not client.closed
+        with pytest.raises(RuntimeError, match='cleanup'):
+            glove.dispatch('start', {})
+        client.fail = False
+        glove.dispatch('disarm', {})
+        assert not hand._teleop_active and glove._cleanup_done.is_set()
+        assert glove.dispatch('start', {})['state'] == 'running'
+        assert glove._thread is not old_receiver and glove._thread.is_alive()
+        assert len(publishers) == 2 and not publishers[1].closed
+        assert not glove._armed
+    finally:
+        client.fail = False
+        glove.dispatch('stop', {})

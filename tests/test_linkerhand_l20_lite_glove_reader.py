@@ -112,6 +112,26 @@ def test_single_live_channel_cannot_keep_stale_pair_alive():
     assert a.sample("right", 1.26) is None
 
 
+@pytest.mark.parametrize('live_wire', [0x20, 0x2A])
+def test_partial_channel_loss_preserves_oldest_capture_timestamp(live_wire):
+    a = GloveAssembler()
+    update(a, 0x20, 10)
+    update(a, 0x2A, 10)
+    assert a.sample('left', 10, wall_ms=100000)['timestamp_ms'] == 100000
+    for i in range(1, 10):
+        now = 10 + i * 0.02
+        update(a, live_wire, now, seq=i + 1)
+        sample = a.sample('left', now, wall_ms=100000 + i * 20)
+        if sample is not None:  # 50 Hz scheduling may skip a floating-point boundary.
+            assert 99999 <= sample['timestamp_ms'] <= 100000
+    update(a, live_wire, 10.201, seq=20)
+    assert a.sample('left', 10.201, wall_ms=100201) is None
+    lost_wire = 0x2A if live_wire == 0x20 else 0x20
+    update(a, lost_wire, 10.22, seq=21)
+    recovered = a.sample('left', 10.22, wall_ms=100220)
+    assert recovered['timestamp_ms'] > 100190
+
+
 def test_invalid_roots_use_correct_tip_slots_but_missing_palm_is_rejected():
     a = GloveAssembler()
     roots = [[0, 0, 0, 100], [60, 0, 0, 80], *[[0, 0, 0, 0]] * 4]
