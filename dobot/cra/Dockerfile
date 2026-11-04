@@ -3,8 +3,9 @@ FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR=https://pypi.org/simple/
 
 WORKDIR /work
-COPY requirements.txt /work/dobot/cra/requirements.txt
-RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} -r /work/dobot/cra/requirements.txt \
+COPY build-requirements.txt requirements.txt /work/dobot/cra/
+RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} -r /work/dobot/cra/build-requirements.txt \
+    && python3 -m pip install --no-cache-dir --no-build-isolation -i ${PYPI_MIRROR} -r /work/dobot/cra/requirements.txt \
     && python3 -c 'from dobot_sdk.protocol.data_types import MyType; assert MyType.itemsize == 1440'
 COPY common/ /work/common/
 COPY main.py device.py feedback.py config.yaml driver.yaml SDK.md /work/dobot/cra/

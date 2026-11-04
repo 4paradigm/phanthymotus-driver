@@ -12,6 +12,14 @@ the official package into the driver image. No SDK installation on the Jetson
 host, shared-object mount, or controller-side installation is required. The SDK
 is Python/numpy/requests, with no x86-only native robot library.
 
+The SDK source declares an unbounded `setuptools_scm>=6.2` build requirement.
+`build-requirements.txt` pins the build toolchain before pip installs the SDK
+with `--no-build-isolation`. This prevents an isolated build from resolving a
+new scm/vcs-versioning stack against Ubuntu's older system `packaging`.
+All required build dependencies are installed explicitly, as required by
+[pip's build isolation contract](https://pip.pypa.io/en/stable/reference/build-system/#disabling-build-isolation).
+The upstream SDK source and artifact checksum remain unchanged.
+
 The adapter imports upstream `DobotConnection`, `FeedbackParser`, `MyType` and
 the SDK version. It deliberately does not instantiate `DobotRobot`, whose
 connection lifecycle also opens Dashboard. A single feedback connection is

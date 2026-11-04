@@ -55,6 +55,8 @@ bash build.sh --mirror none dobot/cra
 ```
 
 构建会下载固定版本 SDK 并校验 SHA-256，构建机需要可访问 GitHub codeload。
+`build-requirements.txt` 固定 pip、setuptools、wheel、packaging 和 setuptools-scm；
+SDK 使用已安装的构建工具构建，不再临时拉取不受约束的构建依赖。
 采用 ARM64 ROS base，SDK 和依赖仅安装到镜像。`/deploy/service.yml` 供平台安装器
 提取并合并服务，容器名为 `embodied-dobot-cra`，MCP 端口 `15746`。
 
@@ -77,7 +79,8 @@ Agent Core 的 ROS domain 为 42；无需 privileged、设备挂载或主机 SDK
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -r dobot/cra/requirements.txt pytest
+.venv/bin/pip install -r dobot/cra/build-requirements.txt
+.venv/bin/pip install --no-build-isolation -r dobot/cra/requirements.txt pytest
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra_sensors.py -q
 .venv/bin/python scripts/check_service_yml.py
 ```
