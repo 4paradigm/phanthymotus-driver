@@ -92,8 +92,11 @@ camera, and MCP threads from starving navigation input callbacks. The worker
 publishes two algorithm-independent navigation sensor topics:
 
 - `/ubuntu/navigation/lidar` — `sensor_msgs/msg/PointCloud2`,
-  RELIABLE + KEEP_LAST(2), with `x/y/z/intensity/tag/line/timestamp` fields;
-- `/ubuntu/navigation/imu` — `sensor_msgs/msg/Imu`, RELIABLE + KEEP_LAST(200);
+  RELIABLE + KEEP_LAST(100), with `x/y/z/intensity/tag/line/timestamp` fields;
+- `/ubuntu/navigation/imu` — `sensor_msgs/msg/Imu`, RELIABLE + KEEP_LAST(2000);
+
+These are ROS publisher history depths, not end-to-end retention guarantees;
+the bridge's bounded pre-publication queues may still drop samples under load.
 
 The MID360 converter accepts only little-endian, tightly packed PointCloud2 rows
 (`row_step == width * point_step`). Big-endian clouds, organized clouds with row

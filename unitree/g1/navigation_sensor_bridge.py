@@ -39,10 +39,8 @@ from unitree_sdk2py.core.channel import ChannelSubscriber
 from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import Imu_, PointCloud2_
 
 
-# History must span a stalled subscriber: RELIABLE still drops the oldest
-# samples once KEEP_LAST history is full.  10 s at 10 Hz LiDAR and 200 Hz IMU
-# (ratio 1:20) matches the FAST-LIVO2 side; a dropped IMU sample becomes a time
-# gap that the estimator integrates as one step and produced metre-scale jumps.
+# These publisher histories match the mapper's defaults; they do not guarantee
+# retention before publication or when the middleware's resources are exhausted.
 _NAVIGATION_CLOUD_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST,
