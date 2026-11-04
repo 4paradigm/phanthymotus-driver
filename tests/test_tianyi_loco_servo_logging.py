@@ -18,7 +18,9 @@ import os, runpy, sys, threading, types
 sys.path.insert(0, sys.argv[2])
 core = types.ModuleType("loco_servo")
 core.TOGGLES = ()
+core.CONFIG_KEYS = ()
 core._validated_min_vx = lambda value, limit: value
+core._validated_speed_preset = lambda value, limit: (value, limit)
 core.LocoServoPlugin = type("Core", (), {})
 backend = types.ModuleType("slamtec_velocity")
 backend.SlamtecVelocityBackend = type("Backend", (), {})

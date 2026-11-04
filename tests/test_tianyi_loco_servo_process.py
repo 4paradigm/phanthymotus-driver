@@ -403,6 +403,7 @@ def test_idempotent_mutation_confirms_stop_before_clearing_pending_zero(
     {"min_vx": -0.01}, {"min_vx": 0.31},
     {"linear_acceleration": 0}, {"angular_acceleration": -1},
     {"linear_acceleration": "0.3"}, {"angular_acceleration": True},
+    {"speed_preset": "turbo"}, {"speed_preset": False},
     {"dry_run": 1}, {"rotate_only": "false"}, {"require_standing": None},
 ])
 def test_invalid_config_does_not_revoke_active_process_or_advance_epoch(process_setup, config):
@@ -437,6 +438,24 @@ def test_acceleration_configuration_survives_control_process_recreation(process_
     assert card.dispatch("start", {})["state"] == "running"
     restarted = card.dispatch("info", {})
     assert restarted["linear_acceleration"] == .2 and restarted["angular_acceleration"] == 2.0
+
+
+def test_fast_speed_preset_reaches_native_worker_and_survives_restart(process_setup):
+    card = process_setup.create(start=False)
+    configured = card.dispatch("config", {"speed_preset": "fast"})
+    assert configured["ok"] and configured["vx_limit"] == 0.5
+    started = card.dispatch("start", {})
+    assert started["state"] == "running" and started["speed_preset"] == "fast"
+    time.sleep(0.005)
+    send(card, command(values=[0.4, 0, 0, 0, 0, 0.2]))
+    active = wait_info(card, lambda item: item["counts"]["accepted"] == 1)
+    assert active["last"]["requested"][0] == 0.4
+    assert active["backend"]["state"] == "active"
+    assert card.stop()["state"] == "idle"
+    restarted = card.dispatch("start", {})
+    assert restarted["state"] == "running"
+    assert restarted["speed_preset"] == "fast" and restarted["vx_limit"] == 0.5
+    assert restarted["control_interface"]["limits"]["upper"][0] == 0.5
 
 
 def test_killing_only_control_child_does_not_confirm_sdk_group_handover(process_setup, monkeypatch):

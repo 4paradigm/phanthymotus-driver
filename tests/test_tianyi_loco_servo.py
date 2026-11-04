@@ -1358,7 +1358,8 @@ def test_unknown_tool_cannot_steal_base_ownership(setup, monkeypatch):
 
 
 @pytest.mark.parametrize("config", [{"expected_hz": 21}, {"max_vx": float("nan")},
-                                     {"max_wz": -1}, {"dry_run": "false"}])
+                                     {"max_wz": -1}, {"dry_run": "false"},
+                                     {"speed_preset": "turbo"}, {"speed_preset": True}])
 def test_invalid_config_is_rejected(setup, config):
     with pytest.raises(ValueError):
         setup.create(**config)
@@ -1384,6 +1385,58 @@ def test_min_vx_defaults_to_no_declared_floor_and_schema_uses_actual_max_vx(setu
     assert schema["maximum"] == 0.2
     assert "实测" in schema["description"] and "仅向规划器声明" in schema["description"]
     assert "不在执行端强行抬高速度" in schema["description"]
+
+
+@pytest.mark.parametrize(("preset", "limit"),
+                         [("slow", 0.15), ("normal", 0.30), ("fast", 0.50)])
+def test_speed_preset_sets_truthful_forward_limits_without_changing_yaw(setup, preset, limit):
+    plugin = setup.create(speed_preset=preset)
+    info = plugin.dispatch("info", {})
+    assert info["speed_preset"] == preset
+    assert info["vx_limit"] == limit
+    limits = info["control_interface"]["limits"]
+    assert limits["lower"] == [-limit, 0, 0, 0, 0, -1.0]
+    assert limits["upper"] == [limit, 0, 0, 0, 0, 1.0]
+
+
+def test_speed_preset_never_widens_a_lower_native_ceiling(setup):
+    plugin = setup.create(max_vx=0.2, speed_preset="fast")
+    info = plugin.dispatch("info", {})
+    assert info["speed_preset"] == "fast" and info["vx_limit"] == 0.2
+    assert info["control_interface"]["limits"]["upper"][0] == 0.2
+
+
+def test_live_speed_preset_change_stops_then_accepts_new_forward_range(setup):
+    plugin = start(setup)
+    send(plugin, command(setup, [0.2, 0, 0, 0, 0, 0.4]))
+    sink = plugin._sink
+    stop_calls = plugin._backend.stop_calls
+
+    result = plugin.dispatch("config", {"speed_preset": "fast"})
+
+    assert result["ok"] and result["speed_preset"] == "fast"
+    assert result["vx_limit"] == 0.5
+    assert result["output"] == [0.0] * 6
+    assert result["control_interface"]["limits"]["upper"] == [0.5, 0, 0, 0, 0, 1.0]
+    assert plugin._backend.stop_calls == stop_calls + 1
+    assert plugin._sink is sink
+    setup.clock.advance()
+    send(plugin, command(setup, [0.4, 0, 0, 0, 0, 0.4], seq=2))
+    assert plugin._last["verdict"] == "CLAMPED"
+    assert plugin._last["requested"][0] == 0.4
+    assert plugin._last_output[0] == pytest.approx(0.03)
+
+
+def test_speed_preset_change_rejects_incompatible_min_vx_before_stopping(setup):
+    plugin = start(setup, speed_preset="fast", min_vx=0.2)
+    send(plugin, command(setup, [0.3, 0, 0, 0, 0, 0.2]))
+    before = plugin._info()
+    stop_calls = plugin._backend.stop_calls
+    result = plugin.dispatch("config", {"speed_preset": "slow"})
+    assert result["state"] == "error" and "min_vx" in result["error"]
+    assert plugin._backend.stop_calls == stop_calls
+    assert plugin._info()["speed_preset"] == before["speed_preset"] == "fast"
+    assert plugin._info()["vx_limit"] == before["vx_limit"] == 0.5
 
 
 @pytest.mark.parametrize("min_vx", [True, False, None, "0.02", float("nan"), float("inf"),

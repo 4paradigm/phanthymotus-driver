@@ -41,6 +41,7 @@ def test_public_config_fields_match_form_constraints_without_aliasing(setup):
 def test_settings_advertised_by_config_action_reach_runtime_configuration(setup):
     plugin = start(setup)
     payload = {"dry_run": True, "rotate_only": True, "require_standing": False,
+               "speed_preset": "fast",
                "min_vx": .02, "linear_acceleration": .4, "angular_acceleration": 1.5,
                "wz_limit": .6}
     schema = plugin.get_tool()["inputSchema"]
@@ -49,6 +50,15 @@ def test_settings_advertised_by_config_action_reach_runtime_configuration(setup)
     assert result["ok"]
     for key, value in payload.items():
         assert result[key] == value
+
+
+def test_speed_preset_form_is_explicit_and_action_schema_has_no_stale_default(setup):
+    tool = setup.create().get_tool()
+    form = tool["configSchema"]["properties"]["speed_preset"]
+    action = tool["inputSchema"]["properties"]["speed_preset"]
+    assert form["enum"] == ["slow", "normal", "fast"]
+    assert form["default"] == "normal"
+    assert "default" not in action
 
 
 def test_driver_response_is_descriptor_metadata_not_an_operator_setting(setup):

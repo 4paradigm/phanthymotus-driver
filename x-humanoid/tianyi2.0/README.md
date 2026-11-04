@@ -437,15 +437,25 @@ Configure loco_servo exposes live settings via `action: config`:
 | `dry_run` | true | Validate, shape and count commands without SDK motion; enabling it during real execution first stops/cancels the old SDK action |
 | `rotate_only` | false | Suppress translation and preserve yaw rate; unsupported axes remain rejected |
 | `require_standing` | false | Require fresh true feedback from a configured domain-0 Bool source; missing/stale/false feedback stops/refuses motion |
+| `speed_preset` | normal | Forward-speed limit: `slow` = 0.15, `normal` = 0.30, `fast` = 0.50 m/s; yaw is unchanged |
 | `min_vx` | 0 | Measured minimum stable forward speed (m/s), advertised only as `control_interface.limits.min_magnitude[0]`; 0 declares no floor |
 | `linear_acceleration` | 0.3 | Nominal m/s² at expected_hz, converted to a shared per-command velocity step |
 | `angular_acceleration` | 2.0 | Nominal rad/s² at expected_hz, converted to a shared per-command angular-velocity step |
 
-Changing an acceleration setting stops the old motion before applying the new
-setting. The next fresh command starts under the new setting. `info` reports
-both settings and the existing `acceleration_limits` block; a control-process
-restart preserves settings within the running Driver. Persist custom settings
-in the card configuration or deployment YAML for container recreation.
+Changing a speed preset or acceleration setting stops the old motion before
+applying the new setting. The next fresh command starts under the new setting.
+The preset changes the advertised and enforced `vx` limit; it never silently
+multiplies Navi's command and never changes `wz`. Restart Navi after changing
+the preset so it snapshots the new downstream limit. `info` reports
+`speed_preset`, `vx_limit`, both acceleration settings and the existing
+`acceleration_limits` block; a control-process restart preserves settings
+within the running Driver. Persist custom settings in the card configuration
+or deployment YAML for container recreation.
+
+The 0.50 m/s fast preset is an operational ceiling, not a claim about the
+vendor's maximum speed. First verify it with dry-run, then in an open area with
+an operator ready to stop the chassis. Use `normal` again if tracking or braking
+distance is not acceptable.
 
 `min_vx` must be measured on the chassis before setting it, and cannot exceed
 `max_vx`. The servo never raises small input velocities to this value. Existing

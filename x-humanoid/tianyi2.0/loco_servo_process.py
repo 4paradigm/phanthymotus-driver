@@ -43,7 +43,8 @@ import time
 from types import SimpleNamespace
 import uuid
 
-from loco_servo import CONFIG_KEYS, LocoServoPlugin as _Core, TOGGLES, _validated_min_vx
+from loco_servo import (CONFIG_KEYS, LocoServoPlugin as _Core, TOGGLES,
+                        _validated_min_vx, _validated_speed_preset)
 
 from slamtec_velocity import SlamtecVelocityBackend
 
@@ -503,8 +504,11 @@ class LocoServoPlugin:
                 if action in ("start", "config"):
                     if any(key in args and type(args[key]) is not bool for key in TOGGLES):
                         raise ValueError("configuration toggles must be boolean")
+                    _, vx_limit = _validated_speed_preset(
+                        args.get("speed_preset", self._model._speed_preset),
+                        self._model._max_vx)
                     _validated_min_vx(args.get("min_vx", self._model._min_vx),
-                                      self._model._descriptor["limits"]["upper"][0])
+                                      vx_limit)
                     for key, current in zip(("linear_acceleration", "angular_acceleration"),
                                             self._model._accel):
                         self._model._positive(args, key, current)

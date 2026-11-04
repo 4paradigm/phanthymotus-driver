@@ -21,8 +21,10 @@ WATCHDOG_MS = 500
 MAX_OBS_AGE_MS = 600
 CANCEL_AFTER_MS = 1000
 FOLLOW_KEYS = ("wz_limit",)
+SPEED_PRESETS = {"slow": 0.15, "normal": 0.30, "fast": 0.50}
 TOGGLES = {"dry_run": True, "rotate_only": False, "require_standing": False}
-CONFIG_KEYS = (*TOGGLES, "min_vx", "linear_acceleration", "angular_acceleration", *FOLLOW_KEYS)
+CONFIG_KEYS = (*TOGGLES, "speed_preset", "min_vx",
+               "linear_acceleration", "angular_acceleration", *FOLLOW_KEYS)
 
 
 class _PostureRefused(ValueError):
@@ -156,6 +158,15 @@ def _validated_wz_limit(value, max_wz):
     return float(value)
 
 
+def _validated_speed_preset(value, max_vx):
+    choices = ", ".join(SPEED_PRESETS)
+    if not isinstance(value, str) or value not in SPEED_PRESETS:
+        raise ValueError(f"loco_servo.speed_preset must be one of: {choices}")
+    # A deployment may set a lower native ceiling. Presets can never widen it;
+    # this keeps older/custom max_vx configurations safe and truthful.
+    return value, min(SPEED_PRESETS[value], max_vx)
+
+
 def _step_limits(hz, linear_acceleration, angular_acceleration):
     for name, value in (("expected_hz", hz), ("linear_acceleration", linear_acceleration),
                         ("angular_acceleration", angular_acceleration)):
@@ -212,8 +223,15 @@ class LocoServoPlugin:
             raise ValueError("loco_servo.expected_hz must be <= 20")
         self._accel = (self._positive(config, "linear_acceleration", 0.3),
                        self._positive(config, "angular_acceleration", 2.0))
+        self._max_vx = self._positive(config, "max_vx", 0.5)
+        # The native worker enforces this independently. Pass the normalized
+        # ceiling even when the deployment omitted max_vx, so fast mode cannot
+        # be accepted by Python and then rejected by the SDK boundary.
+        self._backend_config["max_vx"] = self._max_vx
+        self._speed_preset, self._vx_limit = _validated_speed_preset(
+            config.get("speed_preset", "normal"), self._max_vx)
         self._descriptor = build_descriptor(
-            self._hz, self._positive(config, "max_vx", 0.3),
+            self._hz, self._vx_limit,
             self._positive(config, "max_wz", 1.0), config.get("min_vx", 0.0),
             *self._accel, response=config.get("response"))
         self._min_vx = self._descriptor["limits"]["min_magnitude"][0]
@@ -302,6 +320,9 @@ class LocoServoPlugin:
             "topic_in": [{"topic": INPUT_TOPIC, "format": "control/velocity",
                           "desc": "motus.control/1 twist [vx,vy,vz,wx,wy,wz]"}],
             "configSchema": {"type": "object", "properties": {
+                "speed_preset": {"type": "string", "default": self._speed_preset,
+                                  "enum": list(SPEED_PRESETS),
+                                  "description": "直行速度档位：slow=0.15、normal=0.30、fast=0.50 m/s。只改变 vx 上限，不放大转向；切档会先停车，随后需重启 navi 读取新上限。"},
                 "linear_acceleration": {"type": "number", "default": self._accel[0],
                                         "exclusiveMinimum": 0,
                                         "description": "直行标称加速度（m/s²），默认 0.3；按 expected_hz 换算为每帧速度步长，由共享 ControlSink 钳制。显式零速度立即停车。"},
@@ -941,10 +962,14 @@ class LocoServoPlugin:
         try:
             acceleration = (self._positive(args, "linear_acceleration", self._accel[0]),
                             self._positive(args, "angular_acceleration", self._accel[1]))
+            speed_preset, vx_limit = _validated_speed_preset(
+                args.get("speed_preset", self._speed_preset), self._max_vx)
             min_vx = _validated_min_vx(args.get("min_vx", self._min_vx),
-                                       self._descriptor["limits"]["upper"][0])
+                                       vx_limit)
             wz_limit = _validated_wz_limit(args.get("wz_limit", self._wz_limit), self._max_wz)
             descriptor = copy.deepcopy(self._descriptor)
+            descriptor["limits"]["lower"][0] = -vx_limit
+            descriptor["limits"]["upper"][0] = vx_limit
             descriptor["limits"]["min_magnitude"][0] = min_vx
             descriptor["limits"]["max_delta_per_step"] = _step_limits(self._hz, *acceleration)
             parsed_descriptor = parse_descriptor(descriptor)
@@ -954,7 +979,8 @@ class LocoServoPlugin:
         # Legacy yaw_latency_gain settings are intentionally ignored; no
         # constructor, start or config path can re-enable compensation.
         self._wz_limit = wz_limit
-        if (min_vx != self._min_vx or acceleration != self._accel or
+        if (speed_preset != self._speed_preset or min_vx != self._min_vx or
+                acceleration != self._accel or
                 any(self._settings[key] != value for key, value in updates.items())):
             self._inbox.activate(self._generation, False)
             # Stop under the OLD mode, especially before enabling dry_run.
@@ -972,6 +998,8 @@ class LocoServoPlugin:
             if self._sink is not None:
                 self._sink.reconfigure(parsed_descriptor)
             self._settings.update(updates)
+            self._speed_preset = speed_preset
+            self._vx_limit = vx_limit
             self._accel = acceleration
             # Keep the existing sink and its source/sequence arbitration;
             # reconfigure only the declared limits and their shared clamp.
@@ -1008,7 +1036,8 @@ class LocoServoPlugin:
         interface.update({key: self._settings[key] for key in ("dry_run", "rotate_only")})
         return {
             "state": "stopping" if self._closing else "paused" if self._running and self._paused else "running" if self._running else "idle",
-            "input": self._input_topic, "min_vx": self._min_vx, **self._settings,
+            "input": self._input_topic, "speed_preset": self._speed_preset,
+            "vx_limit": self._vx_limit, "min_vx": self._min_vx, **self._settings,
             "linear_acceleration": self._accel[0], "angular_acceleration": self._accel[1],
             "wz_limit": self._wz_limit,
             "yielded_to_explicit_command": self._yielded,

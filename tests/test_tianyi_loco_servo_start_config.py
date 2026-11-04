@@ -13,6 +13,7 @@ from test_tianyi_sdk_worker import native_worker
 
 SETTINGS = {
     "dry_run": False, "rotate_only": True, "require_standing": False,
+    "speed_preset": "fast",
     "min_vx": 0.02, "linear_acceleration": 0.4,
     "angular_acceleration": 1.0, "wz_limit": 0.5,
 }
@@ -77,7 +78,8 @@ def test_running_start_honours_false_without_a_separate_config_call(setup):
 
 @pytest.mark.parametrize("bad", [
     {"dry_run": "false"}, {"rotate_only": 0}, {"require_standing": None},
-    {"linear_acceleration": -1}, {"min_vx": 0.4}, {"wz_limit": 2},
+    {"speed_preset": "turbo"}, {"linear_acceleration": -1},
+    {"min_vx": 0.6}, {"wz_limit": 2},
 ])
 def test_invalid_start_settings_do_not_open_resources_or_partially_configure(setup, bad):
     card = setup.create(dry_run=True)
@@ -148,6 +150,7 @@ def test_real_process_dry_run_still_never_launches_sdk_when_explicitly_requested
 
 
 @pytest.mark.parametrize("bad", [{"dry_run": 0}, {"rotate_only": "false"},
+                                 {"speed_preset": "turbo"},
                                  {"linear_acceleration": -1}, {"wz_limit": 2}])
 def test_facade_rejects_bad_start_settings_before_spawning_or_changing_epoch(process_setup, bad):
     card = process_setup.create(start=False, dry_run=True)
