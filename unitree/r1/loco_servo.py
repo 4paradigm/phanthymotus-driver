@@ -35,12 +35,13 @@ disagreement is visible.
 
 ── one chassis, two cards ────────────────────────────────────────────────────
 
-`loco` and this card hold the same `RpcProxy` and both call `Move`. Matching
-`x-resource` does **not** keep them apart — ACP arbitrates its own scheduling,
-not two different routes to one motor. So the two are explicitly wired together:
-this card refuses to start while `loco` has a motion in flight, and `loco`'s own
-`move`/`stop_move` pause this one first. An explicit instruction from a person
-outranks a running policy, never the other way round. See README_dev.md
+`loco` and this card hold the same `RpcProxy` and both drive the chassis
+through it. Matching `x-resource` does **not** keep them apart — ACP arbitrates
+its own scheduling, not two different routes to one motor. So the two are
+explicitly wired together: this card refuses to start while `loco` has a motion
+in flight, and `loco`'s own `move`/`stop_move` pause this one first. An explicit
+instruction from a person outranks a running policy, never the other way round.
+See README_dev.md
 § "x-resource is a label, not a lock".
 """
 
@@ -149,6 +150,22 @@ MAX_HZ = 20.0
 WATCHDOG_MS = 300
 MAX_OBS_AGE_MS = 500
 
+# How long each velocity stays in force on the robot's own controller, s.
+#
+# Not `Move(..., True)`: in the H2 `LocoClient` R1 loads, that sends
+# `duration=864000` — ten days. The watchdog's StopMove is then the *only* thing
+# that ever stops the chassis, and a StopMove lost to an RPC timeout, a wedged
+# proxy or a dead driver process leaves the robot walking at the last velocity
+# with nothing on either side left to end it. A bounded duration makes the
+# controller itself the backstop: the stream renews it every command, and
+# silence stops the robot within this window even if no stop ever arrives.
+#
+# 1 s is the SDK's own non-continuous `Move` duration, and the path `loco`'s
+# timed `move` already uses on R1. It sits well past the watchdog (so the
+# watchdog stays the normal way a stream stops) and well past an RPC round trip
+# (so a slow call does not stutter a live stream).
+COMMAND_LEASE_S = 1.0
+
 # FSM 811 — loco_mode. Anything else and the robot is on the ground, lying down,
 # or mid-transition.
 STANDING_FSM = 811
@@ -217,7 +234,7 @@ def build_descriptor(expected_hz: float = DEFAULT_EXPECTED_HZ) -> dict:
 
 
 class LocoServoPlugin:
-    """One card, one input topic, one sink, one `Move` call per command."""
+    """One card, one input topic, one sink, one `SetVelocity` call per command."""
 
     PREFIX = "locoservo"      # no underscore — dispatch routes on partition("_")
 
@@ -285,6 +302,11 @@ class LocoServoPlugin:
         self._refused = 0
         self._sdk_errors = 0
         self._last_ret = 0
+        # StopMove the robot did not confirm. Counted apart from `sdk_errors`,
+        # which resets on the next accepted command: a lost stop is the one SDK
+        # failure an operator has to be able to see after the stream recovers.
+        self._stop_failures = 0
+        self._last_stop_ret = 0
         self._fsm_problem = ""
         # -inf rather than 0: the first command must actually read the FSM.
         self._fsm_checked_at = float("-inf")
@@ -478,6 +500,8 @@ class LocoServoPlugin:
             self._paused = False
             self._applied = 0
             self._holds = 0
+            self._stop_failures = 0
+            self._last_stop_ret = 0
 
         try:
             self._open(topic)
@@ -564,6 +588,9 @@ class LocoServoPlugin:
                 # robot would not take it".
                 "sdk_errors": self._sdk_errors,
                 "last_ret": self._last_ret,
+                "stop_failures": self._stop_failures,
+                "last_stop_ret": self._last_stop_ret,
+                "command_lease_s": COMMAND_LEASE_S,
                 # Empty when the posture is fine. A card that is subscribed and
                 # running but refusing every command looks identical from the
                 # canvas to one that is working, and this is the difference.
@@ -593,7 +620,7 @@ class LocoServoPlugin:
     def _chassis_conflict(self) -> str:
         """Refuse to start while `loco` is driving the same chassis.
 
-        Starting anyway produces two sources writing `Move` at different rates,
+        Starting anyway produces two sources writing velocities at different rates,
         which reads on the robot as a stutter and in the logs as nothing at all.
         """
         if self._loco is None or not getattr(self._loco, "is_moving", None):
@@ -722,7 +749,7 @@ class LocoServoPlugin:
         self._refused = 0
         self._applied += 1
         if self._dry_run:
-            print(f"[loco_servo] DRY RUN Move(vx={vx:+.3f}, vy={vy:+.3f}, "
+            print(f"[loco_servo] DRY RUN SetVelocity(vx={vx:+.3f}, vy={vy:+.3f}, "
                   f"vyaw={wz:+.3f})", flush=True)
             return
 
@@ -732,7 +759,8 @@ class LocoServoPlugin:
         # what it took a while to think of looking at on the robot — `loco`'s
         # own `move` has always reported `ret`, and this card missed it when it
         # copied the pattern.
-        ret = self._client.Move(vx, vy, wz, True)
+        # A bounded duration, never `Move(..., True)` — see COMMAND_LEASE_S.
+        ret = self._client.SetVelocity(vx, vy, wz, COMMAND_LEASE_S)
         if ret != 0:
             self._sdk_errors += 1
             self._last_ret = ret
@@ -741,7 +769,8 @@ class LocoServoPlugin:
             # the first one already says everything the rest would.
             if self._sdk_errors == 1 or self._sdk_errors % 100 == 0:
                 print(f"[loco_servo] SDK 拒绝了指令（第 {self._sdk_errors} 条）："
-                      f"Move(vx={vx:+.3f}, vy={vy:+.3f}, vyaw={wz:+.3f}) "
+                      f"SetVelocity(vx={vx:+.3f}, vy={vy:+.3f}, vyaw={wz:+.3f}, "
+                      f"duration={COMMAND_LEASE_S:g}) "
                       f"-> ret={ret}", flush=True)
         else:
             if self._sdk_errors:
@@ -755,12 +784,33 @@ class LocoServoPlugin:
 
         A chassis holds by being told to stop, not by being left alone — which is
         the one way this differs from every arm card in the repo.
+
+        **The return code is checked.** Discarding it made a stop the robot
+        never took indistinguishable from one it did. A failed stop is reported,
+        not raised and not retried: every caller (watchdog, abort, pause,
+        teardown) has already decided the chassis must stop, a lost RPC here is
+        usually `RpcProxy`'s 15 s timeout — a retry would hold this thread for
+        another 15 — and the backstop is COMMAND_LEASE_S: the last velocity
+        expires on the controller by itself.
+
+        Commands that arrive after a failed stop are still applied. Each one
+        carries its own short lease, so obeying it is no less safe than the
+        motion already in progress, and refusing it would not stop the robot.
         """
         self._holds += 1
         if self._dry_run:
             print("[loco_servo] DRY RUN StopMove()", flush=True)
             return
         try:
-            self._client.StopMove()
+            ret = self._client.StopMove()
         except Exception as exc:                              # noqa: BLE001
-            print(f"[loco_servo] StopMove failed: {exc}", flush=True)
+            print(f"[loco_servo] StopMove raised: {exc}", flush=True)
+            ret = None
+        if ret == 0:
+            self._last_stop_ret = 0
+            return
+        self._stop_failures += 1
+        self._last_stop_ret = ret
+        print(f"[loco_servo] StopMove 未被确认（第 {self._stop_failures} 次）："
+              f"ret={ret}；底盘将在最后一条指令的 {COMMAND_LEASE_S:g}s 有效期"
+              f"后自行停下", flush=True)
