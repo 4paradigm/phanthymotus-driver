@@ -513,7 +513,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
                           for c in ("received", "dropped", "invalid_timestamps", "non_increasing_timestamps")}
         node._last_receive_monotonic = {"cloud": 0, "imu": 0}
         node._clock_offset = mock.Mock()
-        node._clock_offset.correct_observation.side_effect = lambda source, host: source + 7
+        node._clock_offset.correct_observation.side_effect = lambda source, host, mono: source + 7
         node.get_clock = lambda: types.SimpleNamespace(now=lambda: types.SimpleNamespace(nanoseconds=9000000000))
         node._maybe_publish_status = lambda: None
         def header(ns):
@@ -530,6 +530,65 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         self.assertIs(imu_item[2], imu)
         self.assertEqual(cloud.header.stamp.nanosec, 100)
         self.assertEqual(imu.header.stamp.nanosec, 250)
+
+    def test_bridge_passes_monotonic_sample_to_shared_estimator(self):
+        module = self.load_bridge_module()
+        node = module._NavigationSensorNode.__new__(module._NavigationSensorNode)
+        node._clock_offset = mock.Mock()
+        node._clock_offset.correct_observation.return_value = 123
+        node._last_stamp_ns = {"cloud": 0, "imu": 0}
+        node._stamp_lock = threading.Lock()
+        node._counters = {"imu_non_increasing_timestamps": 0}
+        node.get_clock = lambda: types.SimpleNamespace(
+            now=lambda: types.SimpleNamespace(nanoseconds=987654321))
+        with mock.patch.object(module.time, "monotonic_ns", return_value=456):
+            self.assertEqual(node._correct_stamp(types.SimpleNamespace(sec=1, nanosec=2), "imu"), 123)
+        node._clock_offset.correct_observation.assert_called_once_with(1000000002, 987654321, 456)
+
+    def test_pending_jump_makes_worker_status_not_ready_until_normal_sample(self):
+        module = self.load_bridge_module()
+        node = module._NavigationSensorNode.__new__(module._NavigationSensorNode)
+        node._clock_offset = module.NavigationClockOffsetEstimator(warmup_samples=1)
+        node._clock_offset.correct_observation(10_000_000_000, 20_000_000_000, 1)
+        node._last_receive_monotonic = {"cloud": 10.0, "imu": 10.0}
+        node._counters = {"cloud_published": 1, "imu_published": 1}
+        with mock.patch.object(module.time, "monotonic", return_value=10.0):
+            self.assertTrue(node.status()["ready"])
+            self.assertIsNone(node._clock_offset.correct_observation(
+                10_000_000_001, 22_000_000_001, 2))
+            pending = node.status()
+            self.assertFalse(pending["ready"])
+            self.assertFalse(pending["clock"]["ready"])
+            self.assertEqual(pending["clock"]["pending_reset_samples"], 1)
+            self.assertIn("clock_not_ready", pending["blockers"])
+            self.assertIsNotNone(node._clock_offset.correct_observation(
+                10_000_000_002, 20_000_000_002, 3))
+            self.assertTrue(node.status()["ready"])
+
+    def test_wall_clock_backward_reset_keeps_per_stream_drop_guard(self):
+        module = self.load_bridge_module()
+        node = module._NavigationSensorNode.__new__(module._NavigationSensorNode)
+        node._clock_offset = module.NavigationClockOffsetEstimator(
+            warmup_samples=2, reset_confirm_samples=3)
+        node._last_stamp_ns = {"cloud": 0, "imu": 0}
+        node._stamp_lock = threading.Lock()
+        node._counters = {"cloud_non_increasing_timestamps": 0,
+                          "imu_non_increasing_timestamps": 0}
+        wall = [20_000_000_000]
+        node.get_clock = lambda: types.SimpleNamespace(
+            now=lambda: types.SimpleNamespace(nanoseconds=wall[0]))
+        def stamp(ns):
+            return types.SimpleNamespace(sec=ns // 1_000_000_000, nanosec=ns % 1_000_000_000)
+        with mock.patch.object(module.time, "monotonic_ns", side_effect=range(1, 20)):
+            self.assertIsNone(node._correct_stamp(stamp(10_000_000_000), "imu"))
+            self.assertIsNotNone(node._correct_stamp(stamp(10_010_000_000), "imu"))
+            wall[0] -= 2_000_000_000
+            for i in range(3):
+                self.assertIsNone(node._correct_stamp(stamp(10_020_000_000 + i * 10_000_000), "imu"))
+            self.assertEqual(node._clock_offset.snapshot().resets, 1)
+            wall[0] += 10_000_000
+            self.assertIsNone(node._correct_stamp(stamp(10_050_000_000), "imu"))
+            self.assertEqual(node._counters["imu_non_increasing_timestamps"], 1)
 
     def test_duplicate_and_decreasing_corrected_stamps_are_dropped(self):
         module = self.load_bridge_module()

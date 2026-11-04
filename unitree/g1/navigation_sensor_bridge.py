@@ -33,7 +33,7 @@ from navigation_pointcloud import (
     unitree_mid360_to_navigation_cloud,
     validated_rotation_matrix,
 )
-from navigation_time import ClockOffsetEstimator, split_ns, stamp_to_ns
+from navigation_time import NavigationClockOffsetEstimator, split_ns, stamp_to_ns
 from sensor_output import OutputGate, run_navigation_worker
 from unitree_sdk2py.core.channel import ChannelSubscriber
 from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import Imu_, PointCloud2_
@@ -122,7 +122,7 @@ class _NavigationSensorNode(Node):
 
         # Do not use ``self._clock``: rclpy.node.Node owns that attribute and
         # get_clock() returns it internally.
-        self._clock_offset = ClockOffsetEstimator(
+        self._clock_offset = NavigationClockOffsetEstimator(
             warmup_samples=int(config.get("clock_warmup_samples", 32)),
             window_samples=int(config.get("clock_window_samples", 400)),
             reset_threshold_ns=int(
@@ -205,8 +205,9 @@ class _NavigationSensorNode(Node):
     def _correct_stamp(self, source_stamp, stream: str) -> int | None:
         try:
             source_ns = stamp_to_ns(source_stamp.sec, source_stamp.nanosec)
+            mono_ns = time.monotonic_ns()
             host_ns = self.get_clock().now().nanoseconds
-            corrected_ns = self._clock_offset.correct_observation(source_ns, host_ns)
+            corrected_ns = self._clock_offset.correct_observation(source_ns, host_ns, mono_ns)
         except (AttributeError, TypeError, ValueError) as exc:
             counter = f"{stream}_invalid_timestamps"
             self._counters[counter] += 1
