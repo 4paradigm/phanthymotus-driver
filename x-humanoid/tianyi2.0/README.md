@@ -14,7 +14,7 @@ it does not mean a monocular model is involved. Following upstream driver
 PR #419, its output is `image/depth-zlib` on `sensor_msgs/CompressedImage`,
 with `format = "16UC1; compressedDepth zlib"`. The payload is a plain zlib
 stream containing exactly 640x480 little-endian uint16 millimetres; zero
-remains invalid depth. Compression preserves the original depth values and
+remains invalid depth. Compression preserves every original depth value and the
 source header. This replaces the previous raw `image/depth-z16` output and
 requires a consumer/bridge that supports `image/depth-zlib`.
 
@@ -25,9 +25,12 @@ frame; a frame waiting locally for 500ms is discarded. A single ROS timer
 has been replaced by one latest-only worker: the ROS callback only swaps the
 pending frame, while crop, zlib compression, and the synchronous bridge write
 run outside both executors. The worker never replays old frames or catches up
-in a burst. `info` reports target/average Hz, coalesced/stale/error counts,
-worker health, payload size, and encode/bridge/total processing and interval
-timings so a remaining device or socket bottleneck is visible on the robot.
+in a burst. Compression uses libdeflate level 1 (still a standard zlib stream)
+instead of CPython's much slower stock encoder on ARM. `info` reports the
+active compression backend, target/average Hz,
+coalesced/stale/error counts, worker health, payload size, and
+transform/compress/bridge/total processing and interval timings so a remaining
+device or socket bottleneck is visible on the robot.
 
 On the canvas, connect head RGB to `vop`, `vop` to `navi`, `camera_depth` to
 `navi`'s depth input, `loco_state` to its odometry input, and `navi` to

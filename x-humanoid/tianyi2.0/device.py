@@ -1968,6 +1968,10 @@ class DepthCameraPlugin:
         self._worker = None
         self._worker_shutdown = False
         self._next_publish_due = 0.0
+        self._compress_depth = None
+        self._compression_backend = "uninitialized"
+        self._last_transform_ms = self._max_transform_ms = 0.0
+        self._last_compress_ms = self._max_compress_ms = 0.0
         self._last_encode_ms = self._max_encode_ms = 0.0
         self._last_bridge_publish_ms = self._max_bridge_publish_ms = 0.0
         self._last_processing_ms = self._max_processing_ms = 0.0
@@ -1997,6 +2001,20 @@ class DepthCameraPlugin:
         import cv2
         import numpy as np
         self._cv2, self._np = cv2, np
+        try:
+            # libdeflate produces an ordinary RFC1950 zlib stream, so existing
+            # Navi and browser decoders need no change. Its ARM implementation
+            # avoids the 200-480 ms/frame seen with CPython's stock zlib on the
+            # noisy Orbbec Z16 image.
+            from deflate import zlib_compress
+            self._compression_backend = "libdeflate"
+        except ImportError:
+            # Source checkouts and recovery images may not yet contain the
+            # optional accelerator. Keep the card functional and report the
+            # slower backend explicitly in info rather than failing startup.
+            from zlib import compress as zlib_compress
+            self._compression_backend = "stdlib-zlib-fallback"
+        self._compress_depth = zlib_compress
         latest_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                                 history=HistoryPolicy.KEEP_LAST, depth=1,
                                 durability=DurabilityPolicy.VOLATILE)
@@ -2019,6 +2037,8 @@ class DepthCameraPlugin:
             self._publish_errors = 0
             self._source_geometry = self._latest_image = None
             self._next_publish_due = 0.0
+            self._last_transform_ms = self._max_transform_ms = 0.0
+            self._last_compress_ms = self._max_compress_ms = 0.0
             self._last_encode_ms = self._max_encode_ms = 0.0
             self._last_bridge_publish_ms = self._max_bridge_publish_ms = 0.0
             self._last_processing_ms = self._max_processing_ms = 0.0
@@ -2027,7 +2047,9 @@ class DepthCameraPlugin:
             self._last_error = ""
             self._frame_ready.notify_all()
         self._start_worker()
-        print(f"[DepthCameraPlugin] forwarding newest Z16 frame on worker at <= {self._max_hz:g} Hz")
+        print(
+            f"[DepthCameraPlugin] forwarding newest Z16 frame on worker at "
+            f"<= {self._max_hz:g} Hz ({self._compression_backend})", flush=True)
 
     def _start_worker(self):
         worker = self._worker
@@ -2116,15 +2138,18 @@ class DepthCameraPlugin:
                     if generation == self._generation:
                         self._invalid_frames += 1
                 return
-            # 640x480 raw z16 is ~614 KB. Level-1 zlib keeps the existing
-            # dashboard wire contract while reducing bridge traffic sharply.
-            import zlib as _zlib
+            transformed_at = time.monotonic()
+            transform_ms = (transformed_at - started) * 1000
+            # Keep the exact 640x480 little-endian uint16 zlib wire contract.
+            # libdeflate reduces encoder CPU without changing a depth sample.
             from sensor_msgs.msg import CompressedImage
             out = CompressedImage()
             out.header = msg.header
             out.format = "16UC1; compressedDepth zlib"
-            out.data = _zlib.compress(dashboard.astype("<u2", copy=False).tobytes(), 1)
+            out.data = self._compress_depth(
+                dashboard.astype("<u2", copy=False).tobytes(), 1)
             encoded_at = time.monotonic()
+            compress_ms = (encoded_at - transformed_at) * 1000
             encode_ms = (encoded_at - started) * 1000
             if encoded_at - received_at >= 0.5:
                 self._record_stale(generation)
@@ -2162,6 +2187,10 @@ class DepthCameraPlugin:
                 if self._first_published_at is None:
                     self._first_published_at = finished
                 self._forwarded_frames += 1
+                self._last_transform_ms = transform_ms
+                self._max_transform_ms = max(self._max_transform_ms, transform_ms)
+                self._last_compress_ms = compress_ms
+                self._max_compress_ms = max(self._max_compress_ms, compress_ms)
                 self._last_encode_ms = encode_ms
                 self._max_encode_ms = max(self._max_encode_ms, encode_ms)
                 self._last_bridge_publish_ms = bridge_ms
@@ -2220,6 +2249,8 @@ class DepthCameraPlugin:
                 "source_geometry": dict(geometry) if geometry else None,
                 "registration_to_color": "unknown",
                 "registration_note": "输入为厂商原生 depth/image_raw；仅作居中裁剪及缩放，未验证已投影到 RGB 视角。",
+                "compression_backend": self._compression_backend,
+                "compression_level": 1,
                 "received_frames": self._received_frames, "published_frames": self._forwarded_frames,
                 "invalid_frames": self._invalid_frames, "stale_frames": self._stale_frames,
                 "coalesced_frames": self._coalesced_frames,
@@ -2230,6 +2261,10 @@ class DepthCameraPlugin:
                     if self._forwarded_frames else None,
                 "worker_alive": bool(self._worker and self._worker.is_alive()),
                 "pending_frame": self._latest_image is not None,
+                "last_transform_ms": round(self._last_transform_ms, 1),
+                "max_transform_ms": round(self._max_transform_ms, 1),
+                "last_compress_ms": round(self._last_compress_ms, 1),
+                "max_compress_ms": round(self._max_compress_ms, 1),
                 "last_encode_ms": round(self._last_encode_ms, 1),
                 "max_encode_ms": round(self._max_encode_ms, 1),
                 "last_bridge_publish_ms": round(self._last_bridge_publish_ms, 1),

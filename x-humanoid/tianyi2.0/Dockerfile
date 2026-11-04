@@ -21,7 +21,8 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml numpy opencv-python-headless phonemizer pyalsaaudio sounddevice
+    pyyaml numpy opencv-python-headless phonemizer pyalsaaudio sounddevice \
+    deflate==0.9.0
 
 # Build tianyi ROS2 message packages (bodyctrl_msgs + lyre_msgs)
 COPY msgs/ /tianyi_ws/src/

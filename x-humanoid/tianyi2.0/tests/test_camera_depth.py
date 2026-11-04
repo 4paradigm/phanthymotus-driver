@@ -61,8 +61,11 @@ def depth_plugin(monkeypatch):
     messages.CompressedImage = type("CompressedImage", (), {})
     package = types.ModuleType("sensor_msgs")
     package.msg = messages
+    accelerated_zlib = types.ModuleType("deflate")
+    accelerated_zlib.zlib_compress = lambda data, level: zlib.compress(data, level)
     monkeypatch.setitem(sys.modules, "sensor_msgs", package)
     monkeypatch.setitem(sys.modules, "sensor_msgs.msg", messages)
+    monkeypatch.setitem(sys.modules, "deflate", accelerated_zlib)
     # These tests use native 640x480 frames; resizing is not part of this change.
     monkeypatch.setitem(sys.modules, "cv2", types.ModuleType("cv2"))
     monkeypatch.setitem(sys.modules, "numpy", np)
@@ -110,6 +113,30 @@ def test_lossless_depth_and_header_reach_consumer(depth_plugin, padding):
     expected_port = [{"topic": "/nvidia_desktop/camera/head/depth/visual_depth", "format": "image/depth-zlib"}]
     assert plugin.get_tool()["topic_out"] == expected_port
     assert plugin.dispatch("info", {})["topic_out"] == expected_port
+
+
+def test_standard_zlib_stream_uses_accelerator_without_changing_depth_values(
+        depth_plugin, monkeypatch):
+    plugin, _, _ = depth_plugin
+    calls = []
+    original = plugin._compress_depth
+
+    def record(data, level):
+        calls.append((len(data), level))
+        return original(data, level)
+
+    monkeypatch.setattr(plugin, "_compress_depth", record)
+    message, _ = frame(1707)
+    plugin._on_image(message)
+    plugin._publish_latest()
+    output, = plugin._pub.messages
+    decoded = np.frombuffer(zlib.decompress(output.data), dtype="<u2").reshape(480, 640)
+    assert decoded[1, 1] == 1707
+    assert calls == [(640 * 480 * 2, 1)]
+    info = plugin.dispatch("info", {})
+    assert info["compression_backend"] == "libdeflate"
+    assert info["compression_level"] == 1
+    assert "last_transform_ms" in info and "last_compress_ms" in info
 
 
 @pytest.mark.parametrize("changes", [
