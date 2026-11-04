@@ -144,8 +144,13 @@ class _NavigationSensorNode(Node):
         self._status_pub = self.create_publisher(String, self._status_topic, 10)
         self._publish_static_transform()
 
-        self._cloud_queue: queue.Queue = queue.Queue(maxsize=2)
-        self._imu_queue: queue.Queue = queue.Queue(maxsize=4)
+        # Deep enough to survive a stalled publish thread instead of dropping:
+        # the DDS history below is useless if samples are discarded here first.
+        # IMU is tiny, so keep a full 10 s; clouds keep 3 s to bound memory.
+        # Interior of the MID360 SDK receive path is still single-slot and is
+        # not covered by these sizes.
+        self._cloud_queue: queue.Queue = queue.Queue(maxsize=32)
+        self._imu_queue: queue.Queue = queue.Queue(maxsize=2000)
         self._stop = threading.Event()
         self._cloud_worker = threading.Thread(
             target=self._cloud_loop, name="navigation_cloud", daemon=True
