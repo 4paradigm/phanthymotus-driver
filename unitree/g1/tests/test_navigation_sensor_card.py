@@ -220,8 +220,14 @@ class NavigationSensorCardContractTest(unittest.TestCase):
                 self.assertEqual(imu["topic"], imu_topic)
                 self.assertEqual(worker.cloud_topic, descriptor["topic"])
                 self.assertEqual(worker.imu_topic, imu["topic"])
+                self.assertEqual(worker._cloud_queue.maxsize, 32)
+                self.assertEqual(worker._imu_queue.maxsize, 2000)
                 publisher.assert_any_call(module.PointCloud2, descriptor["topic"], module._NAVIGATION_CLOUD_QOS)
                 publisher.assert_any_call(module.Imu, imu["topic"], module._IMU_QOS)
+                self.assertEqual(module._NAVIGATION_CLOUD_QOS.kwargs, {
+                    "reliability": "reliable", "history": "keep_last", "depth": 100,
+                    "durability": "volatile",
+                })
                 self.assertEqual(module._IMU_QOS.kwargs, {
                     "reliability": "reliable", "history": "keep_last", "depth": 2000,
                     "durability": "volatile",
