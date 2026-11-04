@@ -29,6 +29,21 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.serialization import deserialize_message, serialize_message
 
 
+def _qos_metadata(qos) -> dict:
+    """Normalize rclpy's QoSProfile-or-depth shorthand for the bridge."""
+    if isinstance(qos, int):
+        return {"reliability": "best_effort", "depth": max(1, qos)}
+    reliability = getattr(qos, "reliability", ReliabilityPolicy.BEST_EFFORT)
+    return {
+        "reliability": (
+            "reliable"
+            if reliability == ReliabilityPolicy.RELIABLE
+            else "best_effort"
+        ),
+        "depth": max(1, int(getattr(qos, "depth", 1) or 1)),
+    }
+
+
 class BridgedPublisher:
     """Publisher that forwards messages to bridge process via Unix socket.
 
@@ -95,6 +110,13 @@ class BridgedPublisher:
                 metadata = {
                     "topic": self.topic,
                     "msg_type": msg_type_str,
+                    # The bridge still forces BEST_EFFORT for outbound data so
+                    # it matches Agent Core, but queue depth is part of the
+                    # publisher contract too.  In particular camera_depth is a
+                    # newest-frame stream (KEEP_LAST depth=1); silently turning
+                    # it into depth=200 lets stale images queue behind a slow
+                    # DDS write and eventually makes Navi go blind.
+                    "qos": _qos_metadata(self.qos),
                 }
                 import json
                 metadata_bytes = json.dumps(metadata).encode("utf-8")

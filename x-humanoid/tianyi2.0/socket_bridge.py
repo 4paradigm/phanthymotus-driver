@@ -33,7 +33,7 @@ import rclpy
 from rclpy.context import Context
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from rclpy.serialization import deserialize_message, serialize_message
+from rclpy.serialization import serialize_message
 from rosidl_runtime_py.utilities import get_message
 
 
@@ -41,6 +41,8 @@ from rosidl_runtime_py.utilities import get_message
 # rather than count-based so a 16 kHz audio topic costs the same number of log
 # lines as a 10 Hz one; see the comment in TopicHandler.publish.
 PROGRESS_INTERVAL_S = 300.0
+MAX_METADATA_BYTES = 64 * 1024
+MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
 # Default QoS profiles
 RELIABLE_QOS = QoSProfile(
@@ -58,15 +60,77 @@ BEST_EFFORT_QOS = QoSProfile(
 )
 
 
+def _is_hardware_depth(topic: str) -> bool:
+    return topic.endswith("/camera/head/depth/visual_depth")
+
+
+def _outbound_qos(topic: str, requested=None) -> QoSProfile:
+    """Keep only the newest hardware-depth frame on the domain-42 side.
+
+    Existing bridged topics retain the historical depth=200 behaviour.  The
+    hardware depth stream is different: every frame replaces the previous one,
+    and replaying an old FIFO after a short DDS stall is actively harmful to
+    navigation.  New clients carry their requested queue depth in metadata;
+    old clients for this one topic still get the safe depth=1 default.
+    """
+    if _is_hardware_depth(topic):
+        requested = requested or {}
+        depth = max(1, min(int(requested.get("depth", 1) or 1), 1))
+        return QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=depth,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+    return BEST_EFFORT_QOS
+
+
+def _recv_exact(conn: socket.socket, size: int):
+    """Read one framed field without assuming a Unix-socket recv is complete."""
+    if size < 0:
+        raise ValueError("negative frame size")
+    data = bytearray(size)
+    view = memoryview(data)
+    offset = 0
+    while offset < size:
+        received = conn.recv_into(view[offset:], min(size - offset, 65536))
+        if received == 0:
+            return None
+        offset += received
+    return bytes(data)
+
+
+def _configure_fastdds_publication() -> None:
+    """Keep large depth writes off the bridge's Python/client threads.
+
+    This process also forwards inbound navigation commands.  FastDDS defaults
+    to synchronous publication, so a large image write can otherwise hold the
+    process GIL and delay those commands.  The setting must be applied before
+    rclpy.init creates the participant.
+    """
+    os.environ["RMW_FASTRTPS_PUBLICATION_MODE"] = "ASYNCHRONOUS"
+    # When this is 1, rmw_fastrtps ignores the publication-mode environment
+    # variable and takes publishMode from XML.  The loopback transport profile
+    # remains loaded through FASTRTPS_DEFAULT_PROFILES_FILE either way.
+    os.environ.pop("RMW_FASTRTPS_USE_QOS_FROM_XML", None)
+
+
 class TopicHandler:
     """Handles a single topic: receives from socket, publishes to domain 42."""
 
-    def __init__(self, topic: str, msg_type_name: str, ctx: Context, executor):
+    def __init__(self, topic: str, msg_type_name: str, ctx: Context, executor,
+                 qos_spec=None):
         self.topic = topic
         self.msg_type_name = msg_type_name
         self.msg_class = get_message(msg_type_name)
         self.msg_count = 0
         self.context_invalid = False
+        self.is_hardware_depth = _is_hardware_depth(topic)
+        self.last_receive_gap_ms = None
+        self.max_receive_gap_ms = 0.0
+        self.last_publish_ms = 0.0
+        self.max_publish_ms = 0.0
+        self._last_receive_ts = None
         # Starts at 0 so the very first message always prints; after that the
         # interval governs.
         self._last_progress_ts = 0.0
@@ -77,9 +141,10 @@ class TopicHandler:
             context=ctx,
         )
 
-        # Use BEST_EFFORT for all topics to match Agent Core's expectations
-        # Agent Core's phanthy_bus_bridge subscribes with BEST_EFFORT
-        qos = BEST_EFFORT_QOS
+        # Keep BEST_EFFORT to match Agent Core.  Hardware depth additionally
+        # preserves its newest-only queue depth instead of inheriting the
+        # generic bridge's depth=200 FIFO.
+        qos = _outbound_qos(topic, qos_spec)
 
         self.pub = self.node.create_publisher(self.msg_class, topic, qos)
         executor.add_node(self.node)
@@ -87,15 +152,39 @@ class TopicHandler:
         print(f"[socket-bridge] topic handler created: {topic} ({msg_type_name})", flush=True)
 
     def publish(self, serialized_msg: bytes):
-        """Deserialize and publish message."""
+        """Publish the original CDR bytes without a Python decode/re-encode."""
         try:
-            msg = deserialize_message(serialized_msg, self.msg_class)
-            self.pub.publish(msg)
+            now = time.monotonic()
+            if self._last_receive_ts is not None:
+                gap_ms = (now - self._last_receive_ts) * 1000
+                self.last_receive_gap_ms = gap_ms
+                self.max_receive_gap_ms = max(self.max_receive_gap_ms, gap_ms)
+            self._last_receive_ts = now
+
+            publish_started = time.monotonic()
+            # ROS 2 Humble Publisher.publish(bytes) uses publish_raw /
+            # rcl_publish_serialized_message.  The CDR produced in the driver
+            # process is therefore forwarded byte-for-byte to domain 42.
+            self.pub.publish(serialized_msg)
+            publish_ms = (time.monotonic() - publish_started) * 1000
+            self.last_publish_ms = publish_ms
+            self.max_publish_ms = max(self.max_publish_ms, publish_ms)
             self.msg_count += 1
 
             # Debug first few messages for camera and imu
             if ("camera" in self.topic or "imu" in self.topic) and self.msg_count <= 5:
-                print(f"[socket-bridge] {self.topic}: msg #{self.msg_count}, serialized={len(serialized_msg)} bytes, type={type(msg)}", flush=True)
+                print(f"[socket-bridge] {self.topic}: msg #{self.msg_count}, serialized={len(serialized_msg)} bytes, raw_cdr=true", flush=True)
+
+            if publish_ms >= 100.0 or (
+                    self.is_hardware_depth and
+                    self.last_receive_gap_ms is not None
+                    and self.last_receive_gap_ms >= 400.0):
+                print(
+                    f"[socket-bridge] SLOW {self.topic}: "
+                    f"rx_gap_ms={self.last_receive_gap_ms!r} "
+                    f"dds_publish_ms={publish_ms:.1f} bytes={len(serialized_msg)}",
+                    flush=True,
+                )
 
             # Progress on a clock, not on a message count.
             #
@@ -278,6 +367,8 @@ class SocketBridgeServer:
                 flush=True,
             )
 
+        _configure_fastdds_publication()
+
         self.ctx = Context()
         rclpy.init(context=self.ctx, domain_id=42)
         self.executor = rclpy.executors.MultiThreadedExecutor(context=self.ctx)
@@ -298,19 +389,19 @@ class SocketBridgeServer:
         """Handle a client connection (one per topic)."""
         try:
             # First message: topic metadata (JSON)
-            length_bytes = conn.recv(4)
-            if len(length_bytes) < 4:
+            length_bytes = _recv_exact(conn, 4)
+            if length_bytes is None:
                 return
 
             metadata_len = struct.unpack("<I", length_bytes)[0]
+            if metadata_len > MAX_METADATA_BYTES:
+                raise ValueError(
+                    f"bridge metadata too large: {metadata_len} bytes")
 
             # Read metadata in chunks (like message data)
-            metadata_bytes = b""
-            while len(metadata_bytes) < metadata_len:
-                chunk = conn.recv(min(metadata_len - len(metadata_bytes), 65536))
-                if not chunk:
-                    return
-                metadata_bytes += chunk
+            metadata_bytes = _recv_exact(conn, metadata_len)
+            if metadata_bytes is None:
+                return
 
             metadata = json.loads(metadata_bytes.decode("utf-8"))
 
@@ -339,28 +430,27 @@ class SocketBridgeServer:
                     except Exception as e:
                         print(f"[socket-bridge] cleanup error for {topic}: {e}", flush=True)
 
-                self.handlers[topic] = TopicHandler(topic, msg_type, self.ctx, self.executor)
+                self.handlers[topic] = TopicHandler(
+                    topic, msg_type, self.ctx, self.executor,
+                    metadata.get("qos"))
 
             handler = self.handlers[topic]
 
             # Receive and publish messages
             while not self._stop_flag.is_set():
                 # Read message length
-                length_bytes = conn.recv(4)
-                if len(length_bytes) < 4:
+                length_bytes = _recv_exact(conn, 4)
+                if length_bytes is None:
                     break
 
                 msg_len = struct.unpack("<I", length_bytes)[0]
+                if msg_len > MAX_MESSAGE_BYTES:
+                    raise ValueError(
+                        f"bridge message too large: {msg_len} bytes")
 
                 # Read message data
-                msg_data = b""
-                while len(msg_data) < msg_len:
-                    chunk = conn.recv(min(msg_len - len(msg_data), 65536))
-                    if not chunk:
-                        break
-                    msg_data += chunk
-
-                if len(msg_data) < msg_len:
+                msg_data = _recv_exact(conn, msg_len)
+                if msg_data is None:
                     break
 
                 # Publish
