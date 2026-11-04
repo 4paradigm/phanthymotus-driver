@@ -31,23 +31,29 @@ def test_loco_servo_packaged_and_enabled():
     assert {"name": "loco_servo", "type": "actuator"} in metadata["cards"]
 
 
-def test_loco_servo_registered_independently_with_dedicated_transport(monkeypatch):
+def test_loco_servo_registered_independently_on_shared_direct_rpc(monkeypatch):
     calls = []
-    transport = object()
+    views = []
+    def direct(proxy):
+        view = SimpleNamespace(shared_proxy=proxy)
+        views.append(view)
+        return view
     state = SimpleNamespace(get_fsm=lambda: {})
     class Servo:
         def __init__(self, *args): calls.append(args)
     class State:
         def __init__(self, *args): self.node = state
     monkeypatch.setitem(sys.modules, "loco_servo", SimpleNamespace(LocoServoPlugin=Servo))
-    monkeypatch.setitem(sys.modules, "loco_servo_transport", SimpleNamespace(create_g1_loco_servo_transport=lambda: transport))
+    monkeypatch.setitem(sys.modules, "rpc_proxy", SimpleNamespace(DirectLocoClient=direct))
     monkeypatch.setitem(sys.modules, "device", SimpleNamespace(LocoStatePlugin=State))
     cfg = {"plugins": {"loco_servo": {"enabled": True}, "smart_motion": {"enabled": False}}}
     executor, client = object(), object()
     bundle = load_bundle()(cfg, "robot", executor, object(), client, object(), object())
-    assert calls == [(cfg["plugins"]["loco_servo"], "robot", executor, transport, state.get_fsm)]
+    assert len(views) == 1 and views[0].shared_proxy is client
+    assert calls == [(cfg["plugins"]["loco_servo"], "robot", executor, views[0], state.get_fsm)]
     assert len(bundle._plugins) == 2
-    assert "COPY loco_servo_transport.py /work/loco_servo_transport.py" in (MAIN.parent / "Dockerfile").read_text()
+    assert "loco_servo_transport" not in MAIN.read_text()
+    assert "COPY loco_servo_transport.py" not in (MAIN.parent / "Dockerfile").read_text()
 
 
 def test_motion_and_capture_stop_before_feedback_and_producers():

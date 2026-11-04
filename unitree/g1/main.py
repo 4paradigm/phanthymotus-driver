@@ -143,10 +143,9 @@ class G1DeviceBundle:
 
         if plugins_cfg.get("loco_servo", {}).get("enabled", False):
             from loco_servo import LocoServoPlugin
-            from loco_servo_transport import create_g1_loco_servo_transport
-            transport = create_g1_loco_servo_transport()
+            from rpc_proxy import DirectLocoClient
             self._plugins.append(LocoServoPlugin(
-                plugins_cfg["loco_servo"], namespace, executor, transport, loco_state.node.get_fsm,
+                plugins_cfg["loco_servo"], namespace, executor, DirectLocoClient(loco_client), loco_state.node.get_fsm,
             ))
             print("[bundle] LocoServoPlugin loaded")
 
@@ -522,10 +521,10 @@ def make_handler():
                         err(-32601, f"Unknown tool: {name}")
                     else:
                         reply = {"content": [{"type": "text", "text": json.dumps(result)}]}
-                        # Interrupt hooks must not treat an unacknowledged or
-                        # failed servo stop as a successful MCP tool call.
+                        # R1-style stopped/paused describe local consumption,
+                        # not an acknowledged or physically confirmed stop.
                         if (name == "loco_servo" and isinstance(result, dict)
-                                and result.get("state") in ("error", "stop_pending", "stop_failed")):
+                                and result.get("state") == "error"):
                             reply["isError"] = True
                         ok(reply)
                 else:

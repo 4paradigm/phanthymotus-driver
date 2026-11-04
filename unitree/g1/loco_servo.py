@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""G1 motus.control/1 twist stream; direct SDK path, not SmartMotion safety.
+"""G1 motus.control/1 twist stream with the R1 Move/StopMove semantics.
 
-ControlSink checks the stream contract, freshness and declared limits. It does
-not provide SmartMotion obstacle/collision checks. No cross-card
-arbitration is performed. The operator must avoid competing chassis writers.
+ControlSink handles freshness, limits and a 300ms software watchdog. Each live
+command calls the shared RPC client's continuous Move (SDK duration 864000s).
+StopMove is best effort: a failed stop does not latch or prevent the next valid
+command. This is not SmartMotion, obstacle avoidance, or cross-card arbitration.
 """
 from __future__ import annotations
 
@@ -48,16 +49,13 @@ class LocoServoPlugin:
     PREFIX = "locoservo"
     _TOGGLES = ("dry_run", "rotate_only", "require_standing")
 
-    def __init__(self, plugin_config, namespace, executor, transport, fsm_reader):
+    def __init__(self, plugin_config, namespace, executor, loco_client, fsm_reader):
         config = plugin_config or {}
-        self._ns, self._executor, self._transport = namespace, executor, transport
+        self._ns, self._executor, self._client = namespace, executor, loco_client
         self._fsm_reader = fsm_reader
-        self._command = None
-        self._stop_requested = False
-        self._physical_dirty = False
         self._expected_hz = float(config.get("expected_hz", DEFAULT_EXPECTED_HZ))
-        if not math.isfinite(self._expected_hz) or not 1000 / WATCHDOG_MS < self._expected_hz <= MAX_HZ:
-            raise ValueError(f"loco_servo.expected_hz must be in ({1000 / WATCHDOG_MS}, {MAX_HZ}]")
+        if not math.isfinite(self._expected_hz) or not 0 < self._expected_hz <= MAX_HZ:
+            raise ValueError(f"loco_servo.expected_hz must be in (0, {MAX_HZ}]")
         self._dry_run = bool(config.get("dry_run", True))
         self._rotate_only = bool(config.get("rotate_only", False))
         self._require_standing = bool(config.get("require_standing", True))
@@ -66,18 +64,13 @@ class LocoServoPlugin:
         self._lock = threading.RLock()
         self._sink = self._sub_node = self._ticker = None
         self._running = self._paused = False
-        self._auto_resume = False
-        self._manual_pause = False
-        self._shutdown = False
+        self._shutdown = self._stopping = False
         self._input_topic = ""
         self._last_command = None
-        self._stop_failed = False
-        self._submitted_values = self._effective_values = None
         self._applied = self._holds = self._refused = self._sdk_errors = 0
         self._suppressed = 0
         self._last_ret = 0
-        self._last_error = self._fsm_problem = ""
-        self._fsm_checked_at = float("-inf")
+        self._fsm_problem = ""
 
     def get_tool(self):
         return {"name": "loco_servo", "type": "actuator", "multiInstance": False,
@@ -86,7 +79,7 @@ class LocoServoPlugin:
                     "action": {"type": "string", "enum": ["start", "stop", "pause", "resume", "info"]},
                     "input_topic": {"type": "string", "description": "control/velocity 指令流话题"}},
                     "required": ["action"],
-                    "x-action-params": {"pause": {"params": [], "description": "停止底盘并保留订阅"},
+                    "x-action-params": {"pause": {"params": [], "description": "请求停止底盘并保留订阅"},
                                         "resume": {"params": [], "description": "继续执行"}},
                     "x-hooks": {"on_interrupt_motion": {"action": "pause"},
                                 "on_interrupt_all": {"action": "pause"}},
@@ -110,41 +103,12 @@ class LocoServoPlugin:
         pass  # Bundle start must not subscribe or move.
 
     def stop(self):
-        # Seal the bundle lifecycle before waiting, so an in-flight HTTP start
-        # cannot restart this card after shutdown has passed it.
         with self._lock:
             self._shutdown = True
-        result = self._stop()
-        if result.get("state") == "stop_pending":
-            # Give the dedicated writer and SDK response a bounded opportunity
-            # before the process exits; timeout still cannot prove standstill.
-            self._transport.wait_stop(1.5)
-            result = self._stop()
-        if result.get("state") not in ("stopped", "idle"):
-            raise RuntimeError(result.get("error") or "stop not confirmed by SDK")
-        if result.get("error"):
-            raise RuntimeError(result["error"])
-        return result
-
-    def _transport_status(self):
-        status = self._transport.status()
-        if status.get("paused") or status.get("stop_status") != "ok":
-            self._paused = True
-        if status.get("last_error"):
-            self._last_error = str(status["last_error"])
-        return status
+        return self._stop()
 
     def _config(self, args):
         with self._lock:
-            if args.get("dry_run") is True and not self._dry_run and self._running:
-                if not self._stop_requested:
-                    self._hold()
-                status = self._transport_status()
-                if self._stop_failed or status.get("stop_status") != "ok":
-                    return {"ok": False, "state": "stop_failed" if self._stop_failed else "stop_" + status.get("stop_status", "failed"),
-                            "error": self._last_error or "stop not confirmed by SDK"}
-            if args.get("dry_run") is True and not self._dry_run:
-                self._physical_dirty = False
             for key in self._TOGGLES:
                 if key in args:
                     setattr(self, "_" + key, bool(args[key]))
@@ -152,11 +116,6 @@ class LocoServoPlugin:
                     **{key: getattr(self, "_" + key) for key in self._TOGGLES}}
 
     def _state(self):
-        status = self._transport_status()
-        if self._stop_failed:
-            return "stop_failed"
-        if status.get("stop_status") != "ok":
-            return "stop_" + status.get("stop_status", "failed")
         return "paused" if self._running and self._paused else "running" if self._running else "idle"
 
     def _start(self, args):
@@ -168,17 +127,12 @@ class LocoServoPlugin:
         if self._executor is None:
             return {"state": "error", "message": "没有 ROS 上下文，无法订阅"}
         with self._lock:
-            if self._shutdown:
-                return {"state": "error", "message": "驱动正在关闭"}
+            if self._shutdown or self._stopping:
+                return {"state": "error", "message": "驱动正在关闭或停止"}
             if self._running:
                 return {"state": "error", "message": f"已经在运行（{self._input_topic}）"}
-            if not self._transport.resume():
-                return {"state": "error", "error": "transport stop not confirmed"}
-            self._stop_requested = False
             self._sink = ControlSink(self._descriptor, self._apply,
-                                     on_watchdog=self._watchdog_hold, on_abort=self._hold)
-            self._auto_resume = False
-            self._manual_pause = False
+                                     on_watchdog=self._hold, on_abort=self._hold)
             self._running, self._paused, self._input_topic = True, False, topic
             self._applied = self._holds = 0
             try:
@@ -197,43 +151,30 @@ class LocoServoPlugin:
                 return {"state": "error", "message": "驱动正在关闭"}
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
-            status = self._transport_status()
-            if halted:
-                self._manual_pause = True
-                self._auto_resume = False
-                if (not self._stop_requested or self._stop_failed
-                        or status.get("stop_status") in ("failed", "pending")):
-                    self._hold()
-                return {"state": self._state(), "input": self._input_topic,
-                        "stop_ack": self._transport.status().get("stop_status")}
-            if self._stop_failed or not self._transport.resume():
-                return {"state": "error", "input": self._input_topic,
-                        "error": self._last_error or "stop not confirmed by SDK"}
-            self._paused = False
-            self._manual_pause = False
-            self._auto_resume = False
-            self._stop_requested = False
-            self._last_error = ""
-            return {"state": "running", "input": self._input_topic}
+            self._paused = bool(halted)
+        if halted:
+            self._hold()
+        return {"state": "paused" if halted else "running", "input": self._input_topic,
+                "physical_stop_confirmed": False}
 
     def _stop(self):
         with self._lock:
+            if self._stopping:
+                return {"state": "error", "message": "停止调用仍在进行，物理停止未知"}
             if not self._running:
                 return {"state": "idle"}
-            status = self._transport_status()
-            if not self._stop_requested or self._stop_failed or status.get("stop_status") == "failed":
-                self._hold()
-                status = self._transport_status()
-            if self._stop_failed or not self._stop_requested:
-                return {"state": "stop_failed", "error": self._last_error}
-            if status.get("stop_status") != "ok":
-                return {"state": "stop_" + status.get("stop_status", "failed"),
-                        "error": self._last_error or "stop not confirmed by SDK"}
-            self._physical_dirty = False
+            self._stopping = True
             self._running = self._paused = False
             self._sink = None
-            self._close_node()
-            return {"state": "stopped", "stop_ack": "ok", "physical_stop_confirmed": False}
+            node, ticker = self._sub_node, self._ticker
+            self._sub_node = self._ticker = None
+        try:
+            self._hold()
+        finally:
+            self._close_node(node, ticker)
+            with self._lock:
+                self._stopping = False
+        return {"state": "stopped", "physical_stop_confirmed": False}
 
     def _interface(self):
         out = dict(self._descriptor_raw)
@@ -248,9 +189,8 @@ class LocoServoPlugin:
                     "require_standing": self._require_standing,
                     "suppressed_translations": self._suppressed, "applied": self._applied,
                     "holds": self._holds, "refused": self._refused, "sdk_errors": self._sdk_errors,
-                    "last_ret": self._last_ret, "last_error": self._last_error,
-                    "posture_problem": self._fsm_problem, "last": self._last_command,
-                    "transport": self._transport.status(), "physical_stop_confirmed": False,
+                    "last_ret": self._last_ret, "posture_problem": self._fsm_problem,
+                    "last": self._last_command, "physical_stop_confirmed": False,
                     "control_interface": self._interface()}
 
     def _posture_problem(self):
@@ -275,16 +215,17 @@ class LocoServoPlugin:
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
         from std_msgs.msg import String
         node = Node(f"g1_loco_servo_{abs(hash(topic)) % 100000}")
-        self._sub_node = node  # visible for partial setup cleanup
+        self._sub_node = node
         qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
                          reliability=ReliabilityPolicy.BEST_EFFORT)
         node.create_subscription(String, topic, self._on_message, qos)
         self._ticker = node.create_timer(WATCHDOG_MS / 2000., self._tick)
         self._executor.add_node(node)
 
-    def _close_node(self):
-        node, ticker = self._sub_node, self._ticker
-        self._sub_node = self._ticker = None
+    def _close_node(self, node=None, ticker=None):
+        if node is None:
+            node, ticker = self._sub_node, self._ticker
+            self._sub_node = self._ticker = None
         if node is None: return
         if ticker is not None:
             try: node.destroy_timer(ticker)
@@ -296,119 +237,55 @@ class LocoServoPlugin:
 
     def _on_message(self, message):
         with self._lock:
-            status = self._transport_status()
-            auto = (not self._manual_pause and not self._stop_failed
-                    and status.get("stop_status") == "ok"
-                    and (self._auto_resume or status.get("stop_reason") == "watchdog"))
-            if self._shutdown or not self._running or self._sink is None or (self._paused and not auto): return
-            if self._paused and auto:
-                self._sink._last_values = (0.,) * 6
-            try:
-                command = json.loads(message.data)
-            except (ValueError, TypeError):
+            sink = self._sink
+            if self._shutdown or not self._running or sink is None or self._paused:
                 return
-            self._command = command
-            self._submitted_values = command.get("values") if isinstance(command, dict) else None
-            self._effective_values = None
-            try:
-                outcome = self._sink.submit(command)
-                if self._effective_values is not None:
-                    # The sink stores its clamped output after apply; retain what was
-                    # actually sent so subsequent steps cannot resurrect zero axes.
-                    self._sink._last_values = self._effective_values
-            except Exception as exc:
-                self._last_command = {"verdict": "ERROR", "reason": str(exc), "at": time.time()}
-                self._hold()
-                return
-            finally:
-                self._submitted_values = None
-                self._command = None
-            self._last_command = {"verdict": str(getattr(outcome.verdict, "name", outcome.verdict)),
-                                  "reason": outcome.reason, "at": time.time()}
+        try:
+            command = json.loads(message.data)
+        except (ValueError, TypeError):
+            return
+        outcome = sink.submit(command)
+        self._last_command = {"verdict": str(getattr(outcome.verdict, "name", outcome.verdict)),
+                              "reason": outcome.reason, "at": time.time()}
 
     def _tick(self):
         with self._lock:
-            if self._running and self._state() == "running" and self._sink is not None:
-                self._sink.tick()
+            sink = self._sink if self._running and not self._paused else None
+        if sink is not None:
+            sink.tick()
 
     def _apply(self, values, _gripper=None):
-        # apply is reached only after contract, freshness and arbitration checks.
-        # An explicit zero must not be turned into motion by step clamping.
-        values = list(values)
-        if self._submitted_values is not None:
-            for i in (0, 1, 5):
-                if self._submitted_values[i] == 0:
-                    values[i] = 0.
+        with self._lock:
+            if self._shutdown or not self._running or self._paused:
+                return
         vx, vy, wz = float(values[0]), float(values[1]), float(values[5])
         if self._rotate_only and (vx or vy):
             self._suppressed += 1
             vx = vy = 0.
-        values[0], values[1], values[5] = vx, vy, wz
         problem = self._posture_problem()
         if problem:
             self._refused += 1
-            raise RuntimeError(problem)
-        if self._paused:
-            if not self._transport.resume():
-                raise RuntimeError("transport stop not confirmed")
-            self._paused = False
-            self._auto_resume = False
-            self._stop_requested = False
-        if self._dry_run:
-            self._effective_values = tuple(values)
-            self._applied += 1
             return
-        # Translate the earliest wall-clock expiry into a monotonic deadline,
-        # after all admission checks and immediately before enqueueing.
-        cmd = self._command
-        wall = time.time() * 1000
-        mono = time.monotonic()
-        # Permit small cross-host clock skew, not arbitrarily future-dated input.
-        if any(isinstance(cmd.get(key), (int, float)) and cmd[key] > wall + 100
-               for key in ("stamp_ms", "obs_stamp_ms")):
-            raise RuntimeError("command timestamp is too far in the future")
-        expiry = cmd["stamp_ms"] + cmd["ttl_ms"]
-        if cmd.get("obs_stamp_ms") is not None:
-            expiry = min(expiry, cmd["obs_stamp_ms"] + MAX_OBS_AGE_MS)
-        deadline = mono + (expiry - wall) / 1000
-        if deadline <= time.monotonic():
-            raise RuntimeError("command expired before transport submission")
-        try:
-            # G1's SDK uses a one-second zero command for StopMove; subsecond
-            # durations are not reliable. Neither value proves crash-time stop.
-            if not self._transport.submit_velocity(vx, vy, wz, 1.0, deadline=deadline):
-                raise RuntimeError("transport rejected velocity (paused, failed or expired)")
-        except Exception as exc:
+        self._refused = 0
+        self._applied += 1
+        if self._dry_run:
+            return
+        ret = self._client.Move(vx, vy, wz, True)
+        if ret != 0:
             self._sdk_errors += 1
-            self._last_error = str(exc)
-            raise
-        self._physical_dirty = True
-        self._effective_values = tuple(values)
-        self._applied += 1  # queued, not SDK ACK or physical motion
-        self._last_error = ""
-
-    def _watchdog_hold(self, *_args):
-        result = self._hold()
-        self._auto_resume = result
-        return result
+            self._last_ret = ret
+            if self._sdk_errors == 1 or self._sdk_errors % 100 == 0:
+                print(f"[loco_servo] Move returned ret={ret}; execution unconfirmed", flush=True)
+        else:
+            self._sdk_errors = 0
+            self._last_ret = 0
 
     def _hold(self, *_args):
-        self._auto_resume = False
+        # Like R1, watchdog/abort do not pause or latch; a valid command resumes.
         self._holds += 1
-        self._paused = True
-        if self._sink is not None:
-            self._sink._last_values = (0.,) * 6
+        if self._dry_run:
+            return
         try:
-            if not self._physical_dirty:
-                self._stop_requested = True
-                return True
-            if not self._transport.pause():
-                raise RuntimeError("transport refused stop request")
-            self._stop_requested = True
-            self._stop_failed = False
-            return True
+            self._client.StopMove()
         except Exception as exc:
-            self._stop_failed = True
-            self._sdk_errors += 1
-            self._last_error = str(exc)
-            return False
+            print(f"[loco_servo] StopMove failed: {exc}", flush=True)

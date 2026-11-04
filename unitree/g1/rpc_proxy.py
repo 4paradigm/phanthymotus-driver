@@ -100,7 +100,11 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
                                                  "fsm_id": final})
                 continue  # next cmd
 
-            if method == "TimedMove":
+            if method == "__direct_Move":
+                result = loco.Move(*args, **kwargs)
+            elif method == "__direct_StopMove":
+                result = loco.StopMove()
+            elif method == "TimedMove":
                 result = motion.start(*args, **kwargs)
             elif method == "GetMotionResult":
                 result = motion.get_result(*args, **kwargs)
@@ -118,6 +122,23 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
             respond(cmd, result=result)
         except Exception as e:
             respond(cmd, error=str(e))
+
+
+class DirectLocoClient:
+    """R1-shaped stream API on the shared RPC worker, bypassing TimedMotion.
+
+    The ordinary RpcProxy Move/StopMove routes remain unchanged for loco.
+    Calls share its queue/response lock; a blocked RPC can delay a stop.
+    """
+
+    def __init__(self, proxy):
+        self._proxy = proxy
+
+    def Move(self, vx, vy, vyaw, continous_move=False):
+        return self._proxy._call_code("__direct_Move", vx, vy, vyaw, continous_move)
+
+    def StopMove(self):
+        return self._proxy._call_code("__direct_StopMove")
 
 
 class RpcProxy:
