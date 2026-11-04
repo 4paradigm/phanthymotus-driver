@@ -1,6 +1,6 @@
 """Franka camera cards, reusing the existing RealSense capture backend."""
 
-import copy
+import threading
 import re
 
 from common.camera_info import build as camera_info
@@ -8,27 +8,30 @@ from franka.fr3.camera_contract import stream_semantics
 from franka.fr3 import camera_backend as shared_camera
 
 
-class ExtCameraPlugin(shared_camera.ExtCameraPlugin):
+class ExtCameraPlugin:
     """Explicit per-card device binding; one shared session per USB serial."""
 
+    PREFIX = "ext_camera"
+
     def __init__(self, plugin_cfg, namespace="franka", executor=None):
-        super().__init__(plugin_cfg, namespace.strip("/") or "franka", executor)
+        self._namespace = namespace.strip("/") or "franka"
+        self._lock = threading.RLock()
+        self._nodes = {}
+        self._instance_configs = {}
+        self._sessions = {}
+        self._available_devices = shared_camera._enumerate_ext_cameras()
         self._closed = False
         self._generations = {}
-        self._device_names = {}
 
     def get_tools(self):
-        definition = copy.deepcopy(super().get_tools()[0])
-        definition["description"] = "外接 RealSense 相机：每张卡独立选择相机及彩色、深度或近红外通道。"
-        # One dynamic port per instance; info supplies its selected wire format.
-        definition["topic_out"] = [{"desc": "当前通道；话题及格式由实例 info 返回"}]
-        schema = definition["configSchema"]
-        selection = schema["properties"]["device_path"]
-        selection.update(title="相机", **{
+        self._available_devices = shared_camera._enumerate_ext_cameras()
+        options = {device["path"]: f"{device['name']} ({device['serial_number']})"
+                   for device in self._available_devices}
+        selection = {
+            "type": "string", "title": "相机", "scope": "instance",
             "x-sensitive": True,
             "description": "按相机序列号选择；同一相机可添加多张卡分别显示不同通道。",
-        })
-        options = {row["const"]: row["title"] for row in selection["oneOf"] if row["const"]}
+        }
         with self._lock:
             for cfg in self._instance_configs.values():
                 path = cfg["device_path"]
@@ -36,15 +39,30 @@ class ExtCameraPlugin(shared_camera.ExtCameraPlugin):
         selection["oneOf"] = [
             {"const": path, "title": title} for path, title in sorted(options.items())
         ] or [{"const": "", "title": "无可用 RealSense 相机"}]
-        schema["properties"]["channel"].update(
-            title="通道", description="rgb 彩色；depth 毫米深度（0 无效，未对齐 RGB）；infrared 左近红外灰度（非温度）。运行中保存配置会自动切换当前实例；关闭预览不会停止采集。")
-        schema["properties"]["channel"]["oneOf"] = [
-            {"const": "rgb", "title": "彩色（RGB）"},
-            {"const": "depth", "title": "深度（距离）"},
-            {"const": "infrared", "title": "近红外（黑白，非热成像）"},
-        ]
-        schema["required"] = ["device_path"]
-        return [definition]
+        channel = {
+            "type": "string", "title": "通道", "scope": "instance", "default": "rgb",
+            "enum": list(shared_camera.CHANNELS),
+            "description": "深度单位为毫米（0 无效，未对齐 RGB）；近红外为灰度图。运行中保存配置会切换当前实例；关闭预览不会停止采集。",
+            "oneOf": [
+                {"const": "rgb", "title": "彩色（RGB）"},
+                {"const": "depth", "title": "深度（距离）"},
+                {"const": "infrared", "title": "近红外（黑白，非热成像）"},
+            ],
+        }
+        return [{
+            "name": self.PREFIX, "type": "sensor", "multiInstance": True,
+            "description": "外接 RealSense 相机：每张卡独立选择相机及彩色、深度或近红外通道。",
+            "inputSchema": {"type": "object", "properties": {}},
+            "configSchema": {
+                "type": "object", "required": ["device_path"],
+                "properties": {"device_path": selection, "channel": channel},
+            },
+            "topic_in": [],
+            "topic_out": [{"desc": "当前通道；话题及格式由实例 info 返回"}],
+        }]
+
+    def start(self):
+        pass
 
     def _validate(self, cfg):
         channel = cfg.get("channel", "rgb")
@@ -73,8 +91,30 @@ class ExtCameraPlugin(shared_camera.ExtCameraPlugin):
         return shared_camera._RealSenseCameraNode(
             self._sessions[serial], instance_id, cfg["channel"])
 
+    def _topic(self, instance_id, channel):
+        topic = (
+            f"/{self._namespace}/ext_camera/"
+            f"{instance_id.replace('-', '_')}/{channel}"
+            if instance_id else ""
+        )
+        return [{"topic": topic, "format": shared_camera.TOPIC_FORMATS[channel]}]
+
     def _info(self, instance_id):
-        result = super()._info(instance_id)
+        cfg = self._instance_configs.get(instance_id, {})
+        channel = cfg.get("channel", "rgb")
+        info = (
+            self._nodes[instance_id]._status_dict()
+            if instance_id in self._nodes else {"state": "idle"}
+        )
+        result = {
+            **info,
+            "channel": channel,
+            "device_path": cfg.get("device_path", ""),
+            "topic_in": [],
+            "topic_out": self._topic(instance_id, channel),
+            "available_devices": self._available_devices,
+            "active_instances": list(self._nodes),
+        }
         path = result["device_path"]
         result.update(stream_semantics(self._namespace, path.removeprefix("realsense://"), result["channel"]))
         output = result["topic_out"][0]
@@ -140,8 +180,6 @@ class ExtCameraPlugin(shared_camera.ExtCameraPlugin):
                 # against an older snapshot while discovery was in progress.
                 self._generations[instance_id] += 1
             self._instance_configs[instance_id] = cfg
-            if device.get("name"):
-                self._device_names[cfg["device_path"]] = device["name"]
             if action == "start" or restart:
                 if node is None:
                     node = self._make_node(instance_id, cfg, device)
