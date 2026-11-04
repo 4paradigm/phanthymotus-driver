@@ -9,6 +9,11 @@ import xml.etree.ElementTree as ET
 
 JOINT_NAMES = tuple(f"joint{i}" for i in range(1, 7))
 MODEL_COMMIT = "ec201c40d5db63185a3593ec9c39f80fe25aa527"
+# Center planes of the straight portions in the official J2/J3 CAD meshes.
+# The actual rods are offset from the joint origins: drawing only origin-to-
+# origin translations loses their out-and-back connectors. See resource/README.
+LINK2_CENTER_Z = 0.1288
+LINK3_CENTER_Z = 0.0123
 
 
 @lru_cache(maxsize=1)
@@ -18,9 +23,9 @@ def skeleton_urdf():
     The platform draws each fixed/revolute origin as a straight segment and
     applies multi-axis RPY using THREE's XYZ Euler order. Factor the original
     URDF Rz*Ry*Rx into single-axis fixed frames so both interpretations agree.
-    Split joint4's (-0.23, 0, 0.1283) offset at its right-angle corner, not along
-    the diagonal. The +90/-90 frames cancel: every original joint/link transform
-    is preserved, including the six physical axes and their names/limits.
+    Route the two long rods through their actual offset center planes, adding
+    two rigid corners per rod. Frame rotations cancel at each route's end:
+    every original physical link transform and six-axis joint contract remains.
     """
     source = ET.parse(Path(__file__).with_name("resource") / "cr3_robot.urdf").getroot()
     root = ET.Element("robot", name="cr3a_rigid_skeleton")
@@ -37,6 +42,23 @@ def skeleton_urdf():
         ET.SubElement(joint, "origin", xyz=" ".join(map(str, xyz)), rpy=" ".join(map(str, rpy)))
         return link
 
+    def rigid_rod(parent, prefix, xyz, center_z, turns):
+        x, y, z = xyz
+        if y != 0:
+            raise ValueError("unexpected lateral rod offset; review CAD centerline")
+        points = ((0, 0, center_z), (x, 0, center_z), (x, 0, z))
+        previous = (0, 0, 0)
+        theta = 0.0
+        for label, point, turn in zip(("corner1", "corner2", "end"), points, turns):
+            dx, dy, dz = (point[i] - previous[i] for i in range(3))
+            # Express the next segment in the preceding rigid frame.
+            local = (math.cos(theta) * dx - math.sin(theta) * dz,
+                     dy, math.sin(theta) * dx + math.cos(theta) * dz)
+            parent = fixed(parent, prefix + "_" + label, local, (0, turn, 0))
+            theta += turn
+            previous = point
+        return parent
+
     for original in source.findall("joint"):
         if original.get("type") == "fixed":
             root.append(copy.deepcopy(original))
@@ -46,12 +68,12 @@ def skeleton_urdf():
         origin = original.find("origin")
         xyz = [float(v) for v in origin.get("xyz", "0 0 0").split()]
         roll, pitch, yaw = [float(v) for v in origin.get("rpy", "0 0 0").split()]
-        if name == "joint4":
-            x, y, z = xyz
-            if y != 0:
-                raise ValueError("unexpected CR3 joint4 offset; review the rigid decomposition")
-            parent = fixed(parent, "joint4_right_angle", (x, 0, 0), (0, math.pi / 2, 0))
-            parent = fixed(parent, "joint4_right_angle_restore", (-z, 0, 0), (0, -math.pi / 2, 0))
+        if name == "joint3":
+            parent = rigid_rod(parent, "upper_arm_rigid", xyz, LINK2_CENTER_Z,
+                               (math.pi / 2, math.pi / 2, -math.pi))
+        elif name == "joint4":
+            parent = rigid_rod(parent, "forearm_rigid", xyz, LINK3_CENTER_Z,
+                               (math.pi / 2, -math.pi / 2, 0))
         elif any(xyz):
             parent = fixed(parent, name + "_offset", xyz)
         for label, rotation in (("yaw", (0, 0, yaw)), ("pitch", (0, pitch, 0)), ("roll", (roll, 0, 0))):

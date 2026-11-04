@@ -59,17 +59,23 @@ def test_all_physical_link_poses_preserved_for_standard_urdf_and_platform():
                 np.testing.assert_allclose(actual[name], expected[name], atol=1e-12)
 
 
-def test_right_angle_has_two_rigid_legs_and_only_six_actuated_axes():
+def test_two_offset_rods_have_four_fixed_corners_and_only_six_actuated_axes():
     root = ET.fromstring(skeleton_urdf())
     actuated = [j for j in root.findall('joint') if j.get('type') != 'fixed']
     assert [j.get('name') for j in actuated] == list(JOINT_NAMES)
-    bend = root.find("joint[@name='joint4_right_angle']")
-    assert bend.get('type') == 'fixed'
-    assert float(bend.find('origin').get('rpy').split()[1]) == math.pi / 2
+    corners = [j for j in root.findall('joint') if j.get('name').endswith(('_corner1', '_corner2'))]
+    assert len(corners) == 4
+    for bend in corners:
+        assert bend.get('type') == 'fixed'
+        assert abs(float(bend.find('origin').get('rpy').split()[1])) == math.pi / 2
     poses = fk(root, {name: 0 for name in JOINT_NAMES}, platform=True)
-    parent = poses['Link3'][:3, 3]
-    corner = poses['joint4_right_angle_link'][:3, 3]
-    tip = poses['joint4_right_angle_restore_link'][:3, 3]
-    np.testing.assert_allclose(np.linalg.norm(corner - parent), .23, atol=1e-12)
-    np.testing.assert_allclose(np.linalg.norm(tip - corner), .1283, atol=1e-12)
-    np.testing.assert_allclose(np.dot(corner - parent, tip - corner), 0, atol=1e-12)
+    for prefix, parent_name, lengths in (
+        ('upper_arm_rigid', 'Link2', (.1288, .274, .1288)),
+        ('forearm_rigid', 'Link3', (.0123, .23, .116)),
+    ):
+        points = [poses[parent_name][:3, 3]]
+        points.extend(poses[prefix + suffix + '_link'][:3, 3] for suffix in ('_corner1', '_corner2', '_end'))
+        vectors = np.diff(points, axis=0)
+        np.testing.assert_allclose(np.linalg.norm(vectors, axis=1), lengths, atol=1e-12)
+        for before, after in zip(vectors, vectors[1:]):
+            np.testing.assert_allclose(np.dot(before, after), 0, atol=1e-12)
