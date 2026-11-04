@@ -281,3 +281,23 @@ remain separate; stopping without backend confirmation is an error. These are
 software interlocks, not collision-free path planning or a substitute for the
 physical emergency stop. Neither Cartesian control nor automatic obstacle
 avoidance is provided. Build/installation alone does not pass physical acceptance.
+
+## Franka Hand gripper
+
+Add a `gripper` actuator and select its FR3 controller in the card configuration.
+Starting the card reads the opening without moving the fingers.
+
+- `set_position` sets the total finger spacing in millimetres. The upper
+  command limit is the smaller of 80 mm and the measured maximum opening.
+- `grasp` takes the expected object width, force in newtons, and optional
+  width tolerances. The default force applies only to this action.
+- `homing` moves the fingers to calibrate the opening range.
+- `stopmotion` requests a stop and waits for confirmation. It may release
+  a held object.
+
+The `data/json` state stream reports actual and maximum opening, grasp
+status, and the latest action result. The three motion actions return an
+`action_id` and report their terminal result through Core ACP over HTTPS.
+The deployment mounts the Core certificate read-only and exposes its path
+as `AGENT_CORE_CA_CERT`. For an end-to-end check, match the action ID in
+the motion result and the ACP acknowledgement.
