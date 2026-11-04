@@ -1,0 +1,47 @@
+# Official SDK provenance
+
+- Upstream: https://github.com/Dobot-Arm/TCP-IP-Python-V4
+- Commit: `55ec1ec82201aaf2e6d54aa47b6272bbaa14c815`
+- Python distribution: `dobot_sdk`, version `2.0.0`
+- License: MIT; upstream source archive includes `LICENSE`.
+- Source artifact: https://codeload.github.com/Dobot-Arm/TCP-IP-Python-V4/zip/55ec1ec82201aaf2e6d54aa47b6272bbaa14c815
+- SHA-256: `b7bccfc2b6970441f3a73e7f2252a1d15a7225e23bdf4606973457a9789903b1`
+
+`requirements.txt` pins both the commit and the artifact hash. Docker installs
+the official package into the driver image. No SDK installation on the Jetson
+host, shared-object mount, or controller-side installation is required. The SDK
+is Python/numpy/requests, with no x86-only native robot library.
+
+The adapter imports upstream `DobotConnection`, `FeedbackParser`, `MyType` and
+the SDK version. It deliberately does not instantiate `DobotRobot`, whose
+connection lifecycle also opens Dashboard. A single feedback connection is
+enough for all sensors, even outside TCP control mode. It never transmits data.
+
+Compatibility baseline: CRA six-axis V4 feedback layout, 1440 bytes, little
+endian, test magic `0x0123456789abcdef`, as documented by the supplied TCP/IP
+V4.6.6 manual. Framing and protocol-offset tests use that specification rather
+than generating their input from the SDK dtype. Other robot families and
+firmware layouts are not claimed supported.
+
+Upstream is unmodified. The adapter handles:
+
+- TCP packet splitting/coalescing, malformed-byte resynchronization and bounded
+  buffering, reconnects, freshness, and NaN/Inf rejection.
+- `BrakeStatus` as a per-joint bitmask, not the SDK parser's collapsed boolean.
+- Mode 11 as collision per the interface manual, rather than upstream's JOG
+  label. Unknown mode values remain unknown rather than becoming INIT.
+- `SafeState`, dynamically assigned by the SDK parser but omitted by its
+  dataclass serialization; both safety bytes retain their unsigned high bits.
+- Guaranteed socket close after upstream disconnect, including failed-connect
+  sockets for which shutdown can fail before the SDK reaches its close call.
+
+The SDK's command APIs are installed for future extensions, but are not
+reachable through this sensor-only driver. There is no automatic
+`RequestControl`, enable, alarm clearing, IO write, arbitrary command endpoint
+or motion API. Alarm codes and controller firmware version are not in the
+feedback record; cards explicitly mark them unavailable instead of fabricating
+values or opening another connection.
+
+For an SDK update, download the new immutable commit artifact, compute its
+SHA-256, update requirements and this file plus `SDK_COMMIT`, and run the
+protocol and MCP tests before building a new ARM64 image.

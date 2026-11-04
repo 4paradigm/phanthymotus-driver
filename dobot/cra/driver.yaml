@@ -1,0 +1,18 @@
+id: dobot-cra-driver
+name: Dobot CRA Sensors
+category: driver
+hardware_provider: dobot
+hardware_model: cra
+image_name: dobot-cra
+port: 15746
+mcp_url: "http://localhost:15746/mcp"
+description: "Read-only Dobot CRA V4 feedback sensors using the official Python SDK; no motion or automatic TCP control takeover"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: connection, type: sensor }
+  - { name: joint_states, type: sensor }
+  - { name: robot_info, type: sensor }
+  - { name: software_info, type: sensor }
+  - { name: arm_all_state, type: sensor }
+  - { name: controller_state, type: sensor }

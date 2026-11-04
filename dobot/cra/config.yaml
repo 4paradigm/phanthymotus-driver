@@ -1,0 +1,17 @@
+mcp_port: 15746
+name: "Dobot CRA 状态传感器"
+ros_namespace: dobot_cra
+# Configure through DOBOT_CONTROLLER_IP or the connection card. No robot is
+# contacted until an address is supplied.
+controller_ip: ""
+feedback_port: 30004
+model_name: ""
+publish_hz: 10
+stale_timeout_s: 2
+connect_timeout_s: 2
+receive_timeout_s: 1
+reconnect_delay_s: 1
+ros:
+  robot_domain_id: 42
+  core_domain_id: 42
+  robot_interface: eno1
