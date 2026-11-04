@@ -1968,8 +1968,6 @@ class DepthCameraPlugin:
         self._worker = None
         self._worker_shutdown = False
         self._next_publish_due = 0.0
-        self._last_transform_ms = self._max_transform_ms = 0.0
-        self._last_compress_ms = self._max_compress_ms = 0.0
         self._last_encode_ms = self._max_encode_ms = 0.0
         self._last_bridge_publish_ms = self._max_bridge_publish_ms = 0.0
         self._last_processing_ms = self._max_processing_ms = 0.0
@@ -1996,8 +1994,9 @@ class DepthCameraPlugin:
 
     def _start_stream(self):
         from sensor_msgs.msg import Image
+        import cv2
         import numpy as np
-        self._np = np
+        self._cv2, self._np = cv2, np
         latest_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                                 history=HistoryPolicy.KEEP_LAST, depth=1,
                                 durability=DurabilityPolicy.VOLATILE)
@@ -2020,8 +2019,6 @@ class DepthCameraPlugin:
             self._publish_errors = 0
             self._source_geometry = self._latest_image = None
             self._next_publish_due = 0.0
-            self._last_transform_ms = self._max_transform_ms = 0.0
-            self._last_compress_ms = self._max_compress_ms = 0.0
             self._last_encode_ms = self._max_encode_ms = 0.0
             self._last_bridge_publish_ms = self._max_bridge_publish_ms = 0.0
             self._last_processing_ms = self._max_processing_ms = 0.0
@@ -2114,32 +2111,20 @@ class DepthCameraPlugin:
             return
         try:
             dashboard = self._to_dashboard_depth(msg)
-            transformed_at = time.monotonic()
-            transform_ms = (transformed_at - started) * 1000
             if dashboard is None:
                 with self._frame_ready:
                     if generation == self._generation:
                         self._invalid_frames += 1
                 return
-            # Keep the existing plain-zlib wire contract, but avoid zlib's
-            # general match search. Real Orbbec depth contains enough sensor
-            # noise that the default strategy took 200-480 ms per frame on the
-            # Jetson. Z_RLE is still a standards-compliant, lossless zlib
-            # stream (ordinary zlib.decompress/DecompressionStream readers do
-            # not know or care which encoder strategy produced it), while its
-            # bounded search keeps the navigation observation lane responsive.
+            # 640x480 raw z16 is ~614 KB. Level-1 zlib keeps the existing
+            # dashboard wire contract while reducing bridge traffic sharply.
             import zlib as _zlib
             from sensor_msgs.msg import CompressedImage
             out = CompressedImage()
             out.header = msg.header
             out.format = "16UC1; compressedDepth zlib"
-            raw = dashboard.astype("<u2", copy=False).tobytes()
-            compressor = _zlib.compressobj(
-                level=1, method=_zlib.DEFLATED, wbits=_zlib.MAX_WBITS,
-                memLevel=8, strategy=_zlib.Z_RLE)
-            out.data = compressor.compress(raw) + compressor.flush()
+            out.data = _zlib.compress(dashboard.astype("<u2", copy=False).tobytes(), 1)
             encoded_at = time.monotonic()
-            compress_ms = (encoded_at - transformed_at) * 1000
             encode_ms = (encoded_at - started) * 1000
             if encoded_at - received_at >= 0.5:
                 self._record_stale(generation)
@@ -2177,10 +2162,6 @@ class DepthCameraPlugin:
                 if self._first_published_at is None:
                     self._first_published_at = finished
                 self._forwarded_frames += 1
-                self._last_transform_ms = transform_ms
-                self._max_transform_ms = max(self._max_transform_ms, transform_ms)
-                self._last_compress_ms = compress_ms
-                self._max_compress_ms = max(self._max_compress_ms, compress_ms)
                 self._last_encode_ms = encode_ms
                 self._max_encode_ms = max(self._max_encode_ms, encode_ms)
                 self._last_bridge_publish_ms = bridge_ms
@@ -2228,14 +2209,7 @@ class DepthCameraPlugin:
             crop_height = width * 3 // 4
             top = (height - crop_height) // 2
             depth = depth[top:top + crop_height, :]
-        # Direct nearest-neighbour sampling avoids OpenCV's worker-pool setup
-        # and scheduling jitter on Jetson. The integer mapping is the same
-        # floor(source_index * source_size / target_size) convention used by
-        # INTER_NEAREST, and it keeps the exact uint16 millimetre samples.
-        source_height, source_width = depth.shape
-        rows = self._np.arange(480, dtype=self._np.intp) * source_height // 480
-        cols = self._np.arange(640, dtype=self._np.intp) * source_width // 640
-        return depth[rows[:, None], cols[None, :]]
+        return self._cv2.resize(depth, (640, 480), interpolation=self._cv2.INTER_NEAREST)
     def dispatch(self, action, args):
         now = time.monotonic()
         duration = now - self._first_published_at if self._first_published_at is not None else 0
@@ -2256,11 +2230,6 @@ class DepthCameraPlugin:
                     if self._forwarded_frames else None,
                 "worker_alive": bool(self._worker and self._worker.is_alive()),
                 "pending_frame": self._latest_image is not None,
-                "compression_strategy": "zlib-level1-rle",
-                "last_transform_ms": round(self._last_transform_ms, 1),
-                "max_transform_ms": round(self._max_transform_ms, 1),
-                "last_compress_ms": round(self._last_compress_ms, 1),
-                "max_compress_ms": round(self._max_compress_ms, 1),
                 "last_encode_ms": round(self._last_encode_ms, 1),
                 "max_encode_ms": round(self._max_encode_ms, 1),
                 "last_bridge_publish_ms": round(self._last_bridge_publish_ms, 1),

@@ -112,48 +112,6 @@ def test_lossless_depth_and_header_reach_consumer(depth_plugin, padding):
     assert plugin.dispatch("info", {})["topic_out"] == expected_port
 
 
-def test_depth_uses_fast_lossless_rle_zlib_strategy(depth_plugin, monkeypatch):
-    plugin, _, _ = depth_plugin
-    original = zlib.compressobj
-    called = {}
-
-    def record_compressor(*args, **kwargs):
-        called.update(kwargs)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(zlib, "compressobj", record_compressor)
-    message, expected = frame(1700)
-    plugin._on_image(message)
-    plugin._publish_latest()
-
-    output, = plugin._pub.messages
-    decoded = np.frombuffer(zlib.decompress(output.data), dtype="<u2").reshape(480, 640)
-    np.testing.assert_array_equal(decoded, expected)
-    assert called["level"] == 1
-    assert called["strategy"] == zlib.Z_RLE
-    info = plugin.dispatch("info", {})
-    assert info["compression_strategy"] == "zlib-level1-rle"
-    assert "last_transform_ms" in info and "last_compress_ms" in info
-
-
-def test_wide_source_is_center_cropped_and_sampled_without_opencv(depth_plugin):
-    plugin, _, _ = depth_plugin
-    height, width = 720, 1280
-    yy, xx = np.mgrid[:height, :width]
-    source = ((xx + yy * 7) % 60000).astype("<u2")
-    message = types.SimpleNamespace(
-        width=width, height=height, step=width * 2, encoding="16UC1",
-        is_bigendian=0, data=source.tobytes(),
-        header=types.SimpleNamespace(stamp="source-stamp", frame_id="depth_optical"))
-
-    actual = plugin._to_dashboard_depth(message)
-    rows = np.arange(480, dtype=np.intp) * height // 480
-    # 1280x720 is centre-cropped to 960x720 before sampling.
-    cols = 160 + np.arange(640, dtype=np.intp) * 960 // 640
-    expected = source[rows[:, None], cols[None, :]]
-    np.testing.assert_array_equal(actual, expected)
-
-
 @pytest.mark.parametrize("changes", [
     {"is_bigendian": 1}, {"encoding": "32FC1"}, {"width": 0},
     {"step": 1279}, {"data": b"short"},
