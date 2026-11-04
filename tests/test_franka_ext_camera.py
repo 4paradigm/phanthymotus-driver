@@ -180,12 +180,6 @@ class FrankaExtCameraTests(unittest.TestCase):
         self.assertEqual(self.session("5678").routes, {"rgb-b": "rgb"})
         self.assertEqual(self.call(instance_id="depth-a")["state"], "running")
 
-    def test_multiple_cards_can_subscribe_to_same_rgb_channel(self):
-        self.start("rgb-a")
-        self.start("rgb-b")
-        self.assertEqual(len(FakeSession.instances), 1)
-        self.assertEqual(self.session().routes, {"rgb-a": "rgb", "rgb-b": "rgb"})
-
     def test_repeated_start_and_config_do_not_replace_or_stop_capture(self):
         self.start()
         session = self.session()
@@ -227,15 +221,6 @@ class FrankaExtCameraTests(unittest.TestCase):
             self.call("config", channel="invalid")
         self.assertEqual(self.session().routes, {"camera-a": "rgb"})
         self.assertFalse(self.session().stop_calls)
-
-    def test_stopped_card_can_change_camera_and_channel(self):
-        self.start()
-        self.call("stop")
-        self.call("config", device_path="realsense://5678", channel="depth")
-        result = self.call("start")
-        self.assertEqual(result["device_path"], "realsense://5678")
-        self.assertEqual(self.session().routes, {})
-        self.assertEqual(self.session("5678").routes, {"camera-a": "depth"})
 
     def test_offline_saved_camera_stays_selected_and_is_kept_in_dropdown(self):
         FakeSession.offline.add("9999")

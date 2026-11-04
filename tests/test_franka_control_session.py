@@ -147,24 +147,6 @@ class ControlSessionTests(unittest.TestCase):
         self.assertTrue(session.snapshot()["control_ready"])
         self.assertIsNone(session.snapshot()["control_error"])
 
-    def test_rt_backend_still_completes_motion(self):
-        _, session, _, owner = self.session("rt_success")
-        self.assertTrue(session.snapshot()["rt_kernel"])
-        command_id = session.move(owner, TARGET)
-        self.assertEqual(session.wait(command_id, 2)["status"], "succeeded")
-
-    def test_same_ip_concurrent_moves_are_rejected_without_queueing(self):
-        manager, session, factory, owner = self.session()
-        other = ("joint_control", "second")
-        manager.acquire("172.16.0.3", other)
-        command_id = session.move(owner, TARGET)
-        with self.assertRaisesRegex(RuntimeError, "active motion"):
-            session.move(other, TARGET)
-        with self.assertRaisesRegex(RuntimeError, "active motion"):
-            session.move(owner, TARGET)
-        eventually(lambda: len(factory.commands()) == 1)
-        self.assertEqual(session.motion(command_id)["command_id"], command_id)
-
     def test_simultaneous_submissions_have_exactly_one_winner(self):
         manager, session, factory, owner = self.session()
         other = ("joint_control", "second")

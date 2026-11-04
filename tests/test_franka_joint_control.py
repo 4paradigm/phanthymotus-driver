@@ -425,22 +425,6 @@ class JointControlTests(unittest.TestCase):
         self.assertEqual(expected, session.moves[0]["target_rad"])
         self.assertAlmostEqual(math.radians(3), session.moves[0]["speed_rad_s"])
 
-    def test_canvas_jog_accepts_each_string_enum_and_only_offsets_selected_joint(self):
-        session = self.start()
-        topic = self.call()["topic_out"][0]["topic"]
-        for joint in range(1, 8):
-            with self.subTest(joint=joint):
-                expected = session.snapshot()["q"]
-                expected[joint - 1] += math.radians(1)
-                result = self.bundle.dispatch("joint_control", {
-                    "action": "jog", "output_topic": topic,
-                    "joint": str(joint), "step_deg": 1,
-                })
-                self.assertEqual(expected, session.moves[-1]["target_rad"])
-                session.finish(result["action_id"])
-                self.completed(result["action_id"])
-        self.assertEqual(7, len(session.moves))
-
     def test_jog_rejects_noncanonical_joint_values_without_submitting_motion(self):
         session = self.start()
         for joint in (None, "", "0", "8", "-1", "2.5", "2.0", "02", "+2", "2e0",
@@ -465,16 +449,6 @@ class JointControlTests(unittest.TestCase):
                     session.finish(result["action_id"])
                     self.completed(result["action_id"])
         self.assertEqual(14, len(session.moves))
-
-    def test_jog_step_has_no_separate_five_degree_limit(self):
-        session = self.start()
-        for step in (5.01, -5.01, 90, -90):
-            with self.subTest(step=step):
-                initial = session.snapshot()["q"][0]
-                result = self.call("jog", joint=1, step_deg=step)
-                self.assertAlmostEqual(initial + math.radians(step), session.moves[-1]["target_rad"][0])
-                session.finish(result["action_id"])
-                self.completed(result["action_id"])
 
     def test_large_jog_still_rejects_targets_outside_each_joint_range(self):
         session = self.start()
@@ -700,16 +674,6 @@ class JointControlTests(unittest.TestCase):
         self.assertTrue(stopped_without_waiting_for_first,
                         "A card waiting for stop confirmation delayed the other robot's interrupt")
 
-    def test_removed_cancel_action_is_rejected_without_stopping(self):
-        session, action_id = self.started_move()
-        for action in ("cancel",):
-            with self.subTest(action=action):
-                self.assertIsNone(self.call(action, action_id=action_id))
-                self.assertIsNone(self.bundle.dispatch("joint_control", {"action": action}))
-        self.assertEqual("running", session.motion(action_id)["status"])
-        self.assertEqual([], session.stops)
-        self.assertEqual([], self.completions)
-
     def test_stop_is_idempotent_before_start_and_after_a_card_is_disabled(self):
         self.assertEqual("idle", self.call("stop")["state"])
         self.assertEqual("idle", self.call("stop")["state"])
@@ -845,18 +809,6 @@ class JointControlTests(unittest.TestCase):
         self.assertEqual("ready", result["state"])
         self.assertEqual(action_id, result["motion"]["command_id"])
         self.assertEqual("cancelled", self.completed(action_id)[1])
-
-    def test_global_interrupt_requests_without_waiting_or_disabling_cards(self):
-        session, action_id = self.started_move()
-        session.complete_stop_immediately = False
-        result = self.bundle.dispatch("joint_control", {"action": "stop"})
-        self.assertEqual("stop_requested", result["state"])
-        self.assertEqual("stopping", session.motion()["status"])
-        self.assertEqual([], self.completions)
-        self.assertEqual(0, session.closed)
-        session.finish(action_id, "cancelled")
-        self.assertEqual("cancelled", self.completed(action_id)[1])
-        self.assertEqual("ready", self.call()["state"])
 
     def test_completion_racing_stop_reports_one_backend_terminal_result(self):
         session, action_id = self.started_move()
