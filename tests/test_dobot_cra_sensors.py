@@ -178,8 +178,7 @@ def test_single_read_only_connection_shared_by_all_cards_and_units():
         assert not connection.closed.is_set()
         joint = plugin.payload("joints")["joints"]
         assert joint[0]["q"] == pytest.approx(math.pi / 2)
-        assert joint[0]["dq"] == pytest.approx(math.pi)
-        assert joint[1]["degree"] == -30
+        assert joint[1]["q"] == pytest.approx(math.radians(-30))
         assert plugin.payload("safe_skin_control")["any_approach_paused"] is False
         snapshot = client.snapshot()
         snapshot["data"]["joint_state"]["q_actual"][0] = -999
@@ -203,10 +202,8 @@ def test_stale_data_is_withheld_even_if_socket_stays_open():
         skeleton = DobotSensors({}, client=client).payload("joints")
         assert skeleton["joints"] == []
         assert not skeleton["available"]
-        assert skeleton["model_available"]
         angles = DobotSensors({}, client=client).payload("joint_angles")
-        assert not angles["available"] and angles["stale"]
-        assert angles["angles_deg"] == angles["angles_rad"] == []
+        assert not angles["available"] and angles["angles_deg"] == []
     finally:
         client.stop()
 
@@ -226,9 +223,9 @@ def test_joints_skeleton_matches_physical_model_names_and_radians():
         assert model_names == [joint["name"] for joint in skeleton["joints"]]
         assert model_names == [f"joint{i}" for i in range(1, 7)]
         assert [joint["q"] for joint in skeleton["joints"]] == pytest.approx([math.radians(v) for v in (42, -30, 0, 0, 0, 0)])
-        assert [joint["idx"] for joint in skeleton["joints"]] == list(range(6))
-        assert "imu_quat" not in skeleton
-        assert skeleton["model_name"] == "CR3A"
+        assert set(skeleton) == {"timestamp_ms", "available", "joints"}
+        assert isinstance(skeleton["timestamp_ms"], int) and skeleton["available"]
+        assert all(set(joint) == {"name", "q"} for joint in skeleton["joints"])
         assert calls == [("127.0.0.1", 30004)]
     finally:
         client.stop()
@@ -246,11 +243,11 @@ def test_joint_angle_json_reports_actual_angles_independently_of_model(robot_typ
             {"topic": "/custom_arm/state/joint_angles", "format": "data/json"},
         ]
         angles = plugin.payload("joint_angles")
-        assert angles["available"] and angles["read_only"] and not angles["stale"]
-        assert angles["format"] == "data/json" and angles["joint_count"] == 6
+        assert angles["available"]
+        assert set(angles) == {"timestamp_ms", "available", "joint_names", "angles_deg"}
+        assert isinstance(angles["timestamp_ms"], int)
         assert angles["joint_names"] == [f"joint{i}" for i in range(1, 7)]
         assert angles["angles_deg"] == [42, -30, 0, 0, 0, 0]
-        assert angles["angles_rad"] == pytest.approx([math.radians(v) for v in angles["angles_deg"]])
         assert calls == [("127.0.0.1", 30004)]
         angles["angles_deg"][0] = -999
         assert client.snapshot()["data"]["joint_state"]["q_actual"][0] == 42
@@ -276,9 +273,9 @@ def test_unknown_robot_skeleton_withholds_joints():
     try:
         wait_until(lambda: client.snapshot()["connected"])
         result = DobotSensors({}, client=client).payload("joints")
-        assert result["model_available"] is False
+        assert result["available"] is False
         assert result["joints"] == []
-        assert result["model_error"]
+        assert set(result) == {"timestamp_ms", "available", "joints"}
     finally:
         client.stop()
 
@@ -345,11 +342,11 @@ def test_publish_all_health_states_without_network_calls():
                           for name, outputs in plugin._topics.items() for index in range(len(outputs))}
     plugin._publish()
     assert len(plugin._publishers) == 3
-    for (name, _), pub in plugin._publishers.items():
+    for (name, index), pub in plugin._publishers.items():
         assert not pub.messages[0]["available"]
         if name == "joints":
-            assert pub.messages[0]["stale"]
-            assert pub.messages[0]["read_only"]
+            assert set(pub.messages[0]) == ({"timestamp_ms", "available", "joints"} if index == 0
+                                          else {"timestamp_ms", "available", "joint_names", "angles_deg"})
         else:
             assert pub.messages[0]["regions"] == dict.fromkeys(("arm", "j4", "j5", "j6"))
     assert plugin._publishers[("joints", 1)].messages[0]["angles_deg"] == []
@@ -412,8 +409,8 @@ def test_ros_start_registers_both_joint_outputs_and_publishes_one_feedback_sampl
         assert samples == [1]
         skeleton = publishers["/dobot_cra/state/joints"].messages[0]
         angles = publishers["/dobot_cra/state/joint_angles"].messages[0]
-        assert angles["angles_deg"] == [joint["degree"] for joint in skeleton["joints"]]
-        assert angles["angles_rad"] == [joint["q"] for joint in skeleton["joints"]]
+        assert angles["joint_names"] == [joint["name"] for joint in skeleton["joints"]]
+        assert [math.radians(angle) for angle in angles["angles_deg"]] == [joint["q"] for joint in skeleton["joints"]]
         assert angles["angles_deg"][0] == 1
     finally:
         plugin.stop()
@@ -667,7 +664,8 @@ def test_metadata_and_mcp_http_contract():
         result = rpc("tools/call", {"name": "joints", "arguments": {"action": "start"}})
         payload = json.loads(result["result"]["content"][0]["text"])
         assert payload["state"] == "running" and payload["joints"] == []
-        assert payload["feedback_port"] == 30006
+        assert plugin.client.port == 30006
+        assert "feedback_port" not in payload and "controller_ip" not in payload
         assert payload["topic_out"][0]["format"] == "sensor/skeleton"
         assert payload["topic_out"][1]["format"] == "data/json"
         removed = rpc("tools/call", {"name": "arm_all_state", "arguments": {"action": "info"}})

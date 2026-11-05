@@ -20,7 +20,7 @@ else:
 
 
 CARD_DESCRIPTIONS = {
-    "joints": "CR3A 六轴实时骨架及关节转角 JSON（度/弧度），固定直角连接保持真实关节坐标",
+    "joints": "CR3A 六轴实时骨架及关节转角 JSON（度），固定直角连接保持真实关节坐标",
 }
 
 
@@ -150,30 +150,24 @@ class DobotSensors:
 
     def payload(self, name, snapshot=None):
         snapshot = self.client.snapshot() if snapshot is None else snapshot
-        result = {key: value for key, value in snapshot.items() if key != "data"}
-        result.update(timestamp_ms=int(time.time() * 1000), source="dobot_feedback", read_only=True)
         state = snapshot["data"]
+        result = {"timestamp_ms": int(time.time() * 1000), "available": state is not None}
         if name == "joint_angles":
             angles = [] if state is None else list(state["joint_state"]["q_actual"])
             return {
-                **result, "format": "data/json", "available": state is not None,
-                "joint_count": 6, "joint_names": list(JOINT_NAMES),
-                "angles_deg": angles, "angles_rad": [math.radians(angle) for angle in angles],
+                **result, "joint_names": list(JOINT_NAMES), "angles_deg": angles,
             }
         if name == "joints":
-            skeleton = {**result, "format": "sensor/skeleton", "position_unit": "rad",
-                        "joint_count": 6, "joints": [], "available": False}
+            skeleton = {**result, "joints": [], "available": False}
             try:
-                skeleton.update(resolve_model(snapshot, self.client.model_name))
-            except ValueError as exc:
-                return {**skeleton, "model_available": False, "model_error": str(exc)}
-            skeleton["model_available"] = True
+                resolve_model(snapshot, self.client.model_name)
+            except ValueError:
+                return skeleton
             if state is not None:
                 joints = state["joint_state"]
                 skeleton["available"] = True
                 skeleton["joints"] = [
-                    {"idx": i, "name": name, "q": math.radians(joints["q_actual"][i]),
-                     "dq": math.radians(joints["qd_actual"][i]), "degree": joints["q_actual"][i]}
+                    {"name": name, "q": math.radians(joints["q_actual"][i])}
                     for i, name in enumerate(JOINT_NAMES)
                 ]
             return skeleton
@@ -238,8 +232,9 @@ class DobotSensors:
                                          args.get("feedback_port", self.client.port))
             if action == "start":
                 self.client.start()
-            return {"state": "configured" if action == "config" else "running",
-                    "topic_out": self._topics[name], **self.payload(name)}
+                return {"state": "running", "topic_out": self._topics[name], **self.payload(name)}
+            return {"state": "configured", "topic_out": self._topics[name],
+                    "controller_ip": self.client.address, "feedback_port": self.client.port}
         if action == "stop":
             return {"state": "idle"}
         raise ValueError(f"unsupported sensor action: {action}")

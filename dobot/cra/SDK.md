@@ -80,6 +80,13 @@ feedback without opening Dashboard or echoing a previous write as actual state.
 System status includes explicit enabled/running/paused/dragging/collision/error
 flags and nullable inferred power state. Unavailable feedback yields null values.
 
+Joint streams are intentionally compact: the skeleton carries timestamp,
+availability and name/q pairs in radians; the numeric JSON carries timestamp,
+availability, joint names and angles_deg. Transport diagnostics, model metadata,
+velocities and duplicate angle representations are not streamed. The model
+resource still validates robot identity and exposes geometry errors; unmatched
+models never publish skeleton joint positions.
+
 For an SDK update, download the new immutable commit artifact, compute its
 SHA-256, update requirements and this file plus `SDK_COMMIT`, and run the
 protocol and MCP tests before building a new ARM64 image.

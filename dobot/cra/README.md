@@ -18,32 +18,36 @@
 
 关节卡和安全皮肤执行卡共用一个反馈连接，默认 10Hz 发布 `std_msgs/String` JSON：
 
-- `/dobot_cra/state/joints`，`sensor/skeleton`；六关节 `q/dq` 为 rad、rad/s，
-  `degree` 保留度数，关节名为 `joint1..joint6`。
+- `/dobot_cra/state/joints`，`sensor/skeleton`；只包含 `timestamp_ms/available/joints`，
+  每个关节只包含 `name/q`，`q` 为弧度，关节名为 `joint1..joint6`。
 - `/dobot_cra/state/joint_angles`，`data/json`；`joints` 的第二个输出口，
-  `joint_names` 按 J1–J6 排列，`angles_deg` 为实际转角（度），`angles_rad` 为同一组角度的弧度值。
+  只包含 `timestamp_ms/available/joint_names/angles_deg`；关节名称及实际转角按 J1–J6 排列，
+  `angles_deg` 单位为度，不重复输出弧度数组。
 - `/dobot_cra/state/safe_skin`，`data/json`，属于 `safe_skin_control` 的输出口。
   保留原 topic 名称，画布中原有 `safe_skin` 连线需改接到 `safe_skin_control` 输出口。
 
 两个 `joints` 输出共用同一份反馈快照，不新增卡片或控制器连接。JSON 角度不依赖 URDF
-是否可用；实时数据可用时 `available=true`，断线或过期时为 `false`，两个角度数组均为空。
-例如（仅展示主要字段，数值为示例）：
+是否可用；实时数据可用时 `available=true`，断线或过期时为 `false`，角度数组为空。
+JSON 输出示例（数值为示例）：
 
 ```json
 {
+  "timestamp_ms": 1793836800000,
   "available": true,
-  "joint_count": 6,
   "joint_names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
-  "angles_deg": [90, -30, 0, 0, 0, 0],
-  "angles_rad": [1.5707963267948966, -0.5235987755982988, 0, 0, 0, 0]
+  "angles_deg": [90, -30, 0, 0, 0, 0]
 }
 ```
 
 更新后在平台重新添加 `joints` 或刷新该卡片输出定义，以显示新增 JSON 输出口。
 
-断线或过期时，关节输出为 `connected=false, stale=true`，骨架不再输出旧角度，`joints=[]`；
+断线或过期时，关节输出为 `available=false`，骨架不再输出旧角度，`joints=[]`；
 皮肤输出为 `available=false`，触发状态为 `null`，不会把未知当作“没有触发”。
-关节输出 JSON 同时包含连接地址、端口、反馈新鲜度及重连诊断。
+关节数据流不再输出 IP/端口、连接/超时诊断、包计数、SDK 来源、型号来源及错误记录。
+骨架移除了 `idx/dq/degree` 等冗余字段，型号识别及错误说明保留在后台 `model` 资源中；
+无法匹配模型时骨架为 `available=false, joints=[]`。`config` 响应仍确认实际配置的 IP/端口，
+这些配置确认字段不混入实时输出。旧下游如依赖 `angles_rad`，请由 `angles_deg` 转换，
+骨架渲染器仍直接使用弧度 `q`。
 
 ## 卡片介绍与状态查询
 
