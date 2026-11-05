@@ -588,13 +588,13 @@ class StatePlugin:
     def _odom_interface():
         from common.odom import build_interface
 
-        return {**build_interface(
+        return build_interface(
             provides=StatePlugin.ODOM_AXES,
             rate_hz=10,
             # Wheel/leg dead reckoning is useful as measured velocity but not as
             # an absolute pose source.
             pose_drift="unbounded",
-        ), "slam_pose": {"available": False}}
+        )
 
     def _loco_state_info(self):
         result = {
