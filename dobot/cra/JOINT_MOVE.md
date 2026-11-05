@@ -9,7 +9,7 @@
 
 | action | 内容 |
 |---|---|
-| `move_j` | 检查状态后执行 EnableSafeSkin(0) 和 ClearError，成功后复查状态，再运动至六个绝对关节目标角度 |
+| `move_j` | 检查状态并完成使能后执行 EnableSafeSkin(0) 和 ClearError，成功后复查状态，再运动至六个绝对关节目标角度 |
 | `stop_motion` | 停止控制器运动队列/工程，也可停止点动 |
 | `pause` | 暂停当前运动队列/工程，不暂停点动 |
 | `resume` | 继续当前已暂停的队列/工程 |
@@ -91,7 +91,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/dobot-build-fix-venv/bin/python -m pytest 
 
 ## 运动前清错
 
-每次 `move_j` 都在同一命令锁内执行 `EnableSafeSkin(0)` → 检查成功应答 → `ClearError()` → 检查成功应答 → 复查反馈状态 → 必要时 EnableRobot 并等待确认 → `MovJ()`。
+每次 `move_j` 都在同一命令锁内执行 检查使能 → 必要时 EnableRobot 并等待反馈确认 → `EnableSafeSkin(0)` → 检查成功应答 → `ClearError()` → 检查成功应答 → 复查反馈状态 → `MovJ()`。
 清错拒绝、应答异常或超时均中止本次运动，不自动重试。返回结果中的 `clear_error_response`
 记录成功清错的应答。此应答不代表物理故障已消除。
 原有运动前置检查保留：存在碰撞、保护触发、报警时仍拒绝运动，不能用清错绕过保护。
@@ -99,9 +99,9 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/dobot-build-fix-venv/bin/python -m pytest 
 
 ## 运动前关闭安全皮肤
 
-每次有效的 `move_j` 和 `resume` 请求均先发送 `EnableSafeSkin(0)`，包括复用连接时。
+每次有效的 `move_j` 和 `resume` 请求均在确认使能后发送 `EnableSafeSkin(0)`，包括复用连接时。
 收到成功应答后重新检查运动条件；拒绝、无效应答或超时均中止，不自动重试。
-`move_j` 随后执行清错、必要时使能，再执行 MovJ；`resume` 必要时使能后执行 Continue，不额外清错。
+`move_j` 随后执行清错和 MovJ；`resume` 随后执行 Continue，不额外清错。
 应答记录在 `safe_skin_disable_response`，不宣称已通过状态读回验证关闭效果。
 保留原有运动前置检查，已有碰撞、皮肤暂停或其他保护触发仍会阻止请求。
 停止和暂停不关闭安全皮肤，卡片不自动重新开启安全皮肤。

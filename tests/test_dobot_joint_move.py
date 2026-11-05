@@ -498,7 +498,7 @@ def test_disabled_robot_is_enabled_once_before_motion(action, mode):
     try:
         result = control.execute_motion(action, {**TARGET, 'confirm_move': True})
         expected = ['EnableSafeSkin(0)'] + (['ClearError()'] if action == 'move_j' else [])
-        assert dashboard.commands == expected + ['EnableRobot()', MOVJ if action == 'move_j' else 'Continue()']
+        assert dashboard.commands == ['EnableRobot()'] + expected + [MOVJ if action == 'move_j' else 'Continue()']
         assert result['enable_response'].startswith('0,')
     finally:
         control.close()
@@ -545,7 +545,7 @@ def test_resume_does_not_continue_if_enabling_loses_paused_state():
     dashboard.send_receive_text = send
     with pytest.raises(RuntimeError, match='mode 10'):
         control.execute_motion('resume', {'confirm_move': True})
-    assert dashboard.commands == ['EnableSafeSkin(0)', 'EnableRobot()']
+    assert dashboard.commands == ['EnableRobot()']
 
 
 def test_enable_ack_waits_for_later_feedback_before_sending_move():
@@ -572,3 +572,19 @@ def test_enable_ack_waits_for_later_feedback_before_sending_move():
         assert dashboard.commands[-1] == MOVJ
     finally:
         control.close()
+
+
+@pytest.mark.parametrize('action,mode', [('move_j', 5), ('resume', 10)])
+def test_enable_lost_after_disabling_skin_blocks_final_motion(action, mode):
+    feedback, dashboard, control, _ = ready()
+    set_mode(feedback, mode)
+    original = dashboard.send_receive_text
+    def send(command):
+        reply = original(command)
+        if command == 'EnableSafeSkin(0)':
+            feedback.sample['data']['enable_status'] = False
+        return reply
+    dashboard.send_receive_text = send
+    with pytest.raises(RuntimeError, match='enabled robot'):
+        control.execute_motion(action, {**TARGET, 'confirm_move': True})
+    assert not any(c.startswith('MovJ(') or c == 'Continue()' for c in dashboard.commands)

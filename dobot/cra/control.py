@@ -205,18 +205,6 @@ class RobotController:
                     self._update(dashboard_connected=True)
                 # Connecting can take long enough for feedback/state to change.
                 check_state(action)
-                if card == "joint_move" and action in ("move_j", "resume"):
-                    skin_reply = self._api.EnableSafeSkin(0)
-                    parse_response(skin_reply, "EnableSafeSkin")
-                    request["safe_skin_disable_response"] = skin_reply
-                    check_state(action)
-                if command == "MovJ":
-                    # Keep clear + state recheck + move serialized as one request.
-                    # A failed/uncertain clear must never be followed by motion.
-                    clear_reply = self._api.ClearError()
-                    parse_response(clear_reply, "ClearError")
-                    request["clear_error_response"] = clear_reply
-                    check_state(action)
                 if action in ("move_j", "resume"):
                     sample = check_state(action)
                     if not sample["data"]["enable_status"]:
@@ -233,6 +221,20 @@ class RobotController:
                             time.sleep(0.02)
                     # In particular, enabling must not turn a lost paused queue
                     # into a Continue request against an idle controller.
+                    self._check_motion_state(action)
+                if card == "joint_move" and action in ("move_j", "resume"):
+                    skin_reply = self._api.EnableSafeSkin(0)
+                    parse_response(skin_reply, "EnableSafeSkin")
+                    request["safe_skin_disable_response"] = skin_reply
+                    check_state(action)
+                if command == "MovJ":
+                    # Keep clear + state recheck + move serialized as one request.
+                    # A failed/uncertain clear must never be followed by motion.
+                    clear_reply = self._api.ClearError()
+                    parse_response(clear_reply, "ClearError")
+                    request["clear_error_response"] = clear_reply
+                    check_state(action)
+                if action in ("move_j", "resume"):
                     self._check_motion_state(action)
                 api = self._motion_api if command == "MovJ" else self._api
                 reply = getattr(api, command)(*parameters, **(options or {}))

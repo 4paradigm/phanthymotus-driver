@@ -71,10 +71,10 @@ SHA-256, update requirements and this file plus `SDK_COMMIT`, and run the
 protocol and MCP tests before building a new ARM64 image.
 
 Joint motion uses SDK MovJ with joint coordinates and per-command v/a, cp=0.
-Each move_j first sends EnableSafeSkin(0), then ClearError; resume sends
+After confirming enabled feedback, move_j sends EnableSafeSkin(0), then ClearError; resume sends
 EnableSafeSkin(0) before Continue. All acknowledgements are checked, with no
 automatic retry or skin re-enable. Successful replies are not verified state readback.
 
-Before MovJ/Continue, disabled feedback triggers exactly one EnableRobot()
+Before disabling skin or sending MovJ/Continue, disabled feedback triggers exactly one EnableRobot()
 without load arguments. Motion waits for enabled feedback (default timeout 5s);
 ACK alone is insufficient. Resume must still be paused after enabling.
