@@ -165,6 +165,37 @@ def test_first_boot_gate_does_not_allow_device_access_before_pairing(rig, monkey
     usb.ensure_not_pairing(rig.hand)
 
 
+@pytest.mark.parametrize("with_session", [False, True])
+def test_lifecycle_start_is_noop_without_session_id_or_device_io(rig, with_session):
+    if with_session:
+        call(rig, "begin")
+    session = rig.plugin.session
+    closed = len(rig.closed)
+    rig.hand._teleop_active = True
+    assert call(rig, "start") == {"state": "ready"}
+    assert rig.plugin.session is session
+    assert len(rig.closed) == closed and rig.probes == []
+    assert not usb.pairing_file().exists()
+
+
+@pytest.mark.parametrize("with_session", [False, True])
+def test_lifecycle_stop_is_idempotent_and_preserves_mapping(rig, with_session):
+    if with_session:
+        review(rig)
+    data = {"version": 1, "receiver": RECEIVER, "hands": {"left": HAND}}
+    usb.pairing_file().write_text(json.dumps(data))
+    previous = usb.pairing_file().read_bytes()
+    closed, probes = len(rig.closed), len(rig.probes)
+    rig.hand._teleop_active = True
+    rig.glove._cleanup_done.clear()
+    for _ in range(2):
+        assert call(rig, "stop") == {"state": "idle"}
+    assert rig.plugin.session is None
+    assert usb.pairing_file().read_bytes() == previous
+    assert rig.glove.glove_port == "/dev/old-glove"
+    assert len(rig.closed) == closed and len(rig.probes) == probes
+
+
 @pytest.mark.parametrize("data", [
     {"version": 1, "receiver": RECEIVER, "hands": {"left": RECEIVER}},
     {"version": 1, "receiver": "/tmp/fake", "hands": {"left": HAND}},

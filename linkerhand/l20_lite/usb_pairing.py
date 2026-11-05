@@ -93,6 +93,8 @@ class UsbPairingPlugin:
     def get_tool(self):
         definition = tool(self.PREFIX, "actuator", "按插入顺序配对手套接收器和灵巧手，无需填写串口路径。",
             action_schema({
+                "start": ([], "画布生命周期启动；不打开设备或开始配对"),
+                "stop": ([], "画布生命周期停止；取消配对，不修改已保存配置"),
                 "status": ([], "查看配对状态"),
                 "begin": ([], "断开接收器和灵巧手 USB 后开始；会停止预览并清除会话标定"),
                 "receiver": (["session_id"], "仅插入无线接收器后确认"),
@@ -133,6 +135,11 @@ class UsbPairingPlugin:
         # Do not hold the bus lock while stopping preview: its cleanup worker
         # needs that lock even when there are no active clients.
         with self.hand._ownership_lock:
+            if action == "start":
+                return {"state": "ready"}
+            if action == "stop":
+                self.session = None
+                return {"state": "idle"}
             self.active()
             if action in ("info", "status"):
                 saved = load_pairing()
@@ -161,7 +168,7 @@ class UsbPairingPlugin:
                 raise ValueError("配对会话已过期或不匹配，请重新开始")
             session["touched"] = self.clock()
             self._idle()
-            if action in ("cancel", "stop"):
+            if action == "cancel":
                 self.session = None
                 return {"state": "cancelled"}
             current = set(self.list_devices())
