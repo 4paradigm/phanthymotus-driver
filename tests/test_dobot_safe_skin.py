@@ -99,10 +99,10 @@ def test_merged_skin_card_advertises_stream_for_every_lifecycle_action():
     feedback, dashboard, control, calls = setup_control()
     plugin = DobotSensors({}, namespace='custom_arm', client=feedback, controller=control)
     output = [{'topic': '/custom_arm/state/safe_skin', 'format': 'data/json'}]
-    for action in ('config', 'start', 'info', 'stop'):
+    for action in ('config', 'start', 'info', 'get_status', 'stop'):
         result = plugin.dispatch(action, {'_tool_name': 'safe_skin_control'})
         assert result['topic_out'] == output
-        if action == 'info':
+        if action == 'get_status':
             assert result['feedback']['regions'] == {'arm': False, 'j4': False, 'j5': False, 'j6': False}
     assert not calls and not dashboard.commands
     assert plugin.dispatch('info', {'_tool_name': 'safe_skin'}) is None
@@ -154,7 +154,7 @@ def test_sdk_global_switch_submission_and_unknown_readback(enabled):
     assert result['configuration_verified'] is False
     sensor = DobotSensors({}, client=feedback, controller=control).payload('safe_skin_control')
     assert 'enabled' not in sensor and 'sensitivity' not in sensor and 'control' not in sensor
-    info = DobotSensors({}, client=feedback, controller=control).dispatch('info', {'_tool_name': 'safe_skin_control'})
+    info = DobotSensors({}, client=feedback, controller=control).dispatch('get_status', {'_tool_name': 'safe_skin_control'})
     assert info['last_request']['enabled'] is enabled
     assert info['last_request']['configuration_verified'] is False
     control.close()

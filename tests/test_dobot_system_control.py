@@ -66,14 +66,14 @@ def test_system_lifecycle_and_info_do_not_send_commands_and_stop_does_not_stop_r
     plugin = DobotSensors({}, client=feedback, controller=control)
     for action, expected in [('start', 'ready'), ('config', 'configured'), ('stop', 'idle')]:
         assert plugin.dispatch(action, {'_tool_name': 'systemcontrol'})['state'] == expected
-    info = plugin.dispatch('info', {'_tool_name': 'systemcontrol'})
+    info = plugin.dispatch('get_status', {'_tool_name': 'systemcontrol'})
     assert info['available'] and info['robot_status']['robot_mode'] == 7
     assert not calls and not dashboard.commands
     control.execute_system('pause', {'confirm_change': True})
     plugin.dispatch('stop', {'_tool_name': 'systemcontrol'})
     assert dashboard.closed and dashboard.commands == ['Pause()']
     feedback.sample.update(connected=False, stale=True, data=None)
-    assert plugin.dispatch('info', {'_tool_name': 'systemcontrol'})['robot_status'] is None
+    assert plugin.dispatch('get_status', {'_tool_name': 'systemcontrol'})['robot_status'] is None
 
 
 @pytest.mark.parametrize('changed', [{'stale': True}, {'connected': False}, {'data': None}])
@@ -206,7 +206,7 @@ def test_both_cards_share_one_serial_transport_and_keep_separate_request_history
     assert entered.wait(1)
     second.start()
     try:
-        assert plugin.dispatch('info', {'_tool_name': 'systemcontrol'})['available']
+        assert plugin.dispatch('get_status', {'_tool_name': 'systemcontrol'})['available']
         assert plugin.payload('safe_skin_control')['available']
     finally:
         release.set()
@@ -228,6 +228,80 @@ def test_system_card_metadata_covers_actions_and_keeps_motion_stop_distinct():
     assert tool['type'] == 'actuator' and tool['inputSchema']['x-is-dangerous'] is True
     assert tool['inputSchema']['x-resource'] == 'arm'
     assert set(tool['inputSchema']['properties']['action']['enum']) == {
-        'info', 'get_errors', 'request_control', 'power_on', 'enable', 'disable', 'clear_error',
+        'info', 'get_status', 'get_errors', 'request_control', 'power_on', 'enable', 'disable', 'clear_error',
         'stop_motion', 'pause', 'resume', 'set_speed_factor', 'start_drag', 'stop_drag', 'start', 'stop', 'config',
     }
+
+
+@pytest.mark.parametrize('name', ['joints', 'safe_skin_control', 'systemcontrol'])
+def test_info_is_static_metadata_and_status_is_a_visible_action(name, monkeypatch):
+    feedback, dashboard, control, calls = setup_control()
+    plugin = DobotSensors({}, client=feedback, controller=control)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('info must not read live feedback or request history')
+
+    monkeypatch.setattr(feedback, 'snapshot', forbidden)
+    monkeypatch.setattr(control, 'snapshot', forbidden)
+    info = plugin.dispatch('info', {'_tool_name': name})
+    assert info['name'] == name and info['description']
+    assert not {'robot_status', 'enabled', 'feedback', 'last_request', 'available'} & info.keys()
+    actions = info['inputSchema']['properties']['action']['enum']
+    # Core hides these reserved lifecycle names from the action selector.
+    visible = set(actions) - {'start', 'stop', 'info', 'config'}
+    assert 'get_status' in visible
+    assert info['inputSchema']['x-action-params']['get_status']['params'] == []
+    if name != 'systemcontrol':
+        assert info['topic_out']
+    assert not calls and not dashboard.commands
+
+
+@pytest.mark.parametrize('mode,expected', [
+    (3, {'powered_on': False, 'enabled': False}),
+    (4, {'powered_on': True, 'enabled': False}),
+    (5, {'powered_on': True, 'enabled': True, 'running': False}),
+    (6, {'dragging': True}),
+    (7, {'enabled': True, 'running': True, 'paused': False}),
+    (8, {'running': True}),
+    (9, {'powered_on': None, 'has_error': True}),
+    (10, {'enabled': True, 'paused': True}),
+    (11, {'collision': True}),
+])
+def test_get_status_reports_current_effects_from_feedback(mode, expected):
+    feedback, dashboard, control, calls = setup_control()
+    set_mode(feedback, mode)
+    feedback.sample['data']['speed_scaling'] = 0.25
+    plugin = DobotSensors({}, client=feedback, controller=control)
+    result = plugin.dispatch('get_status', {'_tool_name': 'systemcontrol'})
+    assert result['available'] and result['read_only']
+    for key, value in expected.items():
+        assert result[key] is value
+    assert result['speed_scaling'] == 0.25
+    assert result['robot_status']['robot_mode'] == mode
+    assert not calls and not dashboard.commands
+
+
+@pytest.mark.parametrize('changed', [{'stale': True}, {'connected': False}, {'data': None}])
+def test_get_status_withholds_all_live_effects_when_feedback_is_unavailable(changed):
+    feedback, dashboard, control, calls = setup_control()
+    set_mode(feedback, 5)
+    feedback.sample.update(changed)
+    result = DobotSensors({}, client=feedback, controller=control).dispatch('get_status', {'_tool_name': 'systemcontrol'})
+    assert result['available'] is False
+    for key in ('powered_on', 'enabled', 'running', 'paused', 'dragging', 'collision', 'has_error', 'speed_scaling', 'robot_status'):
+        assert result[key] is None
+    assert not calls and not dashboard.commands
+
+
+def test_enable_acknowledgement_does_not_replace_actual_enable_feedback():
+    feedback, dashboard, control, calls = setup_control()
+    plugin = DobotSensors({}, client=feedback, controller=control)
+    set_mode(feedback, 4)
+    try:
+        plugin.dispatch('enable', {'_tool_name': 'systemcontrol', 'confirm_change': True})
+        assert plugin.dispatch('get_status', {'_tool_name': 'systemcontrol'})['enabled'] is False
+        set_mode(feedback, 5)
+        assert plugin.dispatch('get_status', {'_tool_name': 'systemcontrol'})['enabled'] is True
+        assert dashboard.commands == ['EnableRobot()'] and len(calls) == 1
+    finally:
+        control.close()

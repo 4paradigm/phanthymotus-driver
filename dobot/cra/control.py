@@ -119,14 +119,25 @@ class RobotController:
                     self._update(card, last_request=None, last_error=None)
                 self.feedback.configure(address, port)
 
-    def system_info(self):
+    def system_status(self):
         sample = self.feedback.snapshot()
         state = sample.get("data")
         available = bool(sample.get("connected") and not sample.get("stale") and state is not None)
         keys = ("robot_mode", "robot_mode_name", "enable_status", "running_status", "error_status",
                 "collision_state", "drag_status", "pause_cmd_flag", "brake_released",
                 "speed_scaling", "safety_state", "safe_state", "current_command_id", "load")
+        # Alarm/initialization modes can mask the underlying power state.
+        mode = None if not available else state["robot_mode"]
+        powered_on = False if mode == 3 else True if mode in (2, 4, 5, 6, 7, 8, 10, 11) else None
         return {"available": available, "timestamp_ms": int(time.time() * 1000),
+                "powered_on": powered_on,
+                "enabled": None if not available else bool(state["enable_status"]),
+                "running": None if not available else bool(state["running_status"] or mode in (7, 8)),
+                "paused": None if not available else bool(state["pause_cmd_flag"] or mode == 10),
+                "dragging": None if not available else bool(state["drag_status"] or mode == 6),
+                "collision": None if not available else bool(state["collision_state"] or mode == 11),
+                "has_error": None if not available else bool(state["error_status"] or mode == 9),
+                "speed_scaling": None if not available else state["speed_scaling"],
                 "robot_status": None if not available else {key: state[key] for key in keys},
                 **self.snapshot("systemcontrol")}
 

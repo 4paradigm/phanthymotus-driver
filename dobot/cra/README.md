@@ -43,7 +43,21 @@
 
 断线或过期时，关节输出为 `connected=false, stale=true`，骨架不再输出旧角度，`joints=[]`；
 皮肤输出为 `available=false`，触发状态为 `null`，不会把未知当作“没有触发”。
-连接地址、端口、反馈新鲜度及重连诊断可通过 `joints` 的 `info` 查看。
+连接地址、端口、反馈新鲜度及重连诊断可通过 `joints.get_status` 查看。
+
+## 卡片介绍与状态查询
+
+三张可见卡片均提供平台内部 `info` 和可执行的 `get_status`，职责分开：
+
+- `info` 只返回名称、功能介绍、参数 schema、配置 schema 和输入输出口定义。
+  平台用于详情按钮及端口解析；不读取反馈、连接状态或请求记录。
+- `get_status` 在 action 下拉框中可选，查询最新有效反馈和请求记录；不发送控制命令，
+  不要求 `confirm_change`，不会打开 Dashboard 连接。
+- ROS JSON 输出口持续发布实时数据，其结构不因这次分离而改变。
+
+`joints.get_status` 返回关节和连接有效性；`safe_skin_control.get_status` 返回触发反馈、
+命令连接状态和最近设置请求；`systemcontrol.get_status` 返回系统实际状态和本卡请求记录。
+旧调用方若通过 `info` 读取运行数据，请改用 `get_status`。
 
 ## 固定直角结构
 
@@ -81,21 +95,22 @@
 此精简格式移除了 `regions` 内的 `part/raw_flag/approach_paused` 嵌套对象，以及系统状态、
 连接诊断、控制请求记录和无读回依据的配置字段。使用旧路径的下游条件需改为直接读取
 `regions.arm/j4/j5/j6`。最近控制请求、执行结果和 Dashboard 状态通过 `safe_skin_control`
-的 `info` 查看；`last_request` 只是请求记录，不是实际配置读回。
+的 `get_status` 查看；`last_request` 只是请求记录，不是实际配置读回。
 
 反馈不提供皮肤安装检测、总开关或灵敏度读回；四区均为 false 不证明皮肤已安装或开启。
 本版不虚构距离读数或 TCP 复位指令。
 
 ## 安全皮肤控制
 
-启动驱动、添加卡片、点击 start/info 均不打开 Dashboard、不接管控制、不写入设置。
+启动驱动、添加卡片、点击 start/info/get_status 均不打开 Dashboard、不接管控制、不写入设置。
 只有显式控制请求才懒连接 `29999`。所有请求通过一条序列化连接调用官方 SDK；
 接收按分号完整组帧，断线/超时不自动重放写入。停止控制卡或容器会关闭该连接，
 但不取消控制器已经接受的队列指令，也不自动退出设备的 TCP 模式。
 
 | action | 参数 | 官方 SDK |
 |---|---|---|
-| `info` | 无 | 只读本地状态 |
+| `info` | 无 | 平台内部卡片介绍、参数和输出口定义 |
+| `get_status` | 无 | 当前触发反馈、命令连接状态和最近设置请求 |
 | `start/config/stop` | 无 | 返回 JSON 输出口定义；start 读取反馈，stop 关闭命令连接，均不修改皮肤设置 |
 | `request_control` | `confirm_change=true` | `RequestControl()` |
 | `set_enabled` | `enabled=true/false`, `confirm_change=true` | `EnableSafeSkin(1/0)` |
@@ -109,7 +124,7 @@
 
 开关和灵敏度是**队列指令**：返回 0 只说明接受请求。返回 ResultID 时状态为
 `submitted`；旧固件不返回 ID 时为 `accepted_unverified`。无配置读回接口，所以即使
-接受也始终标记 `configuration_verified=false`。可通过控制卡 `info` 查看请求返回的队列编号，
+接受也始终标记 `configuration_verified=false`。可通过控制卡 `get_status` 查看请求返回的队列编号，
 并在厂家软件中核对实际设置；下使能时接受的队列可能等待后续使能，不会由驱动自动执行使能。
 明确错误码返回 `rejected`，通信不确定性返回 `failed_or_outcome_unknown`，均不自动重试。
 
@@ -124,7 +139,8 @@
 
 | action | 参数 | SDK / 行为 |
 |---|---|---|
-| `info` | 无 | 只读反馈模式、使能/运行/报警/碰撞、拖拽/暂停、抱闸、速度比例、安全字节、队列编号及负载 |
+| `info` | 无 | 平台内部卡片介绍及参数说明 |
+| `get_status` | 无 | 查询实际使能/上电/运行/暂停/拖拽/碰撞/报警状态，另含原始状态、安全字节、队列编号及负载 |
 | `get_errors` | 无 | `GetErrorID()`，返回 `error_ids` 数组；不清错 |
 | `request_control` | `confirm_change=true` | `RequestControl()`；保留皮肤卡同名动作以兼容旧流程 |
 | `power_on` | `confirm_change=true` | `PowerOn()`，仅给机械臂本体上电，不是控制柜开机 |
@@ -149,9 +165,13 @@
 清错只允许静止状态，不会代为消除故障原因，也不保证复位皮肤。
 速度调整允许模式 4/5/7；每次写操作均要求布尔值 `confirm_change=true`。
 
-写命令返回 `effect_verified=false`：ACK 不代表物理状态已改变，请在后续 `info` 中核对反馈。
+写命令返回 `effect_verified=false`：ACK 不代表物理状态已改变，请在后续 `get_status` 中核对反馈。
 `tcp_control_requested` 只记录本次连接期间请求过控制权，不是控制器当前控制模式的读回。
-反馈过期时 `info.available=false, robot_status=null`，不会将旧状态当作当前状态。
+`get_status` 顶层提供 `enabled/powered_on/running/paused/dragging/collision/has_error/speed_scaling`，
+并保留 `robot_status` 中的协议字段。`powered_on` 由模式推断：模式 3 为 false，
+模式 2/4/5/6/7/8/10/11 为 true，报警、初始化或未知模式为 null。
+反馈过期时 `available=false`，上述实时字段及 `robot_status` 全部为 null，
+不会将旧状态或最近一次命令的目标值当作当前状态。
 超时/连接失败不重放写命令，也不串联清错、使能、继续等动作。
 
 ## 网络与配置
@@ -197,4 +217,5 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra
 4. 在受控现场停止机器人后，显式执行所需皮肤设置，对照厂家软件确认队列执行及实际配置。
    本地模拟测试不替代这一项硬件验证。
 5. 本次开发验证不得自动在真机上关闭安全皮肤、使能或恢复运动。
-6. 核对 `systemcontrol` 的只读状态和报警查询；硬件动作须在受控现场单独验收。
+6. 从 action 下拉框执行 `systemcontrol.get_status`，核对实际状态；`get_errors` 查询报警编号。
+   `info` 只用于卡片介绍和端口发现。硬件动作须在受控现场单独验收。

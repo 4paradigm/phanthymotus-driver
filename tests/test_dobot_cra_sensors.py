@@ -680,7 +680,18 @@ def test_metadata_and_mcp_http_contract():
         info = rpc("tools/call", {"name": "safe_skin_control", "arguments": {"action": "info"}})
         skin_info = json.loads(info["result"]["content"][0]["text"])
         assert skin_info["topic_out"] == skin_tool["topic_out"]
-        assert skin_info["feedback"]["available"] is False
+        assert skin_info["description"] == skin_tool["description"]
+        assert "feedback" not in skin_info and "last_request" not in skin_info
+        for name in ("joints", "safe_skin_control", "systemcontrol"):
+            result = rpc("tools/call", {"name": name, "arguments": {"action": "get_status"}})
+            status = json.loads(result["result"]["content"][0]["text"])
+            assert status["read_only"]
+            if name == "safe_skin_control":
+                assert status["feedback"]["available"] is False
+            else:
+                assert status["available"] is False
+            if name == "systemcontrol":
+                assert status["enabled"] is None
     finally:
         server.shutdown()
         server.server_close()

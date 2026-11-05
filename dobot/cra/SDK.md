@@ -69,8 +69,15 @@ controller's configured payload and center parameters.
 
 Acknowledgements are not verified physical state changes. Skin switch and
 sensitivity readback are absent; the skin actuator's compact JSON output only reports trigger flags,
-and request records live in the actuator info response. Each card keeps its own
+and request records live in the actuator get_status response. Each card keeps its own
 request/error history. Writes are never automatically replayed.
+
+All three visible cards expose get_status as a public action. The platform
+filters the reserved info action out of its selector; info now returns static
+card metadata only (description, schemas and ports). Status queries use fresh
+feedback without opening Dashboard or echoing a previous write as actual state.
+System status includes explicit enabled/running/paused/dragging/collision/error
+flags and nullable inferred power state. Unavailable feedback yields null values.
 
 For an SDK update, download the new immutable commit artifact, compute its
 SHA-256, update requirements and this file plus `SDK_COMMIT`, and run the

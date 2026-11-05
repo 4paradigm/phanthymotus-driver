@@ -57,8 +57,16 @@ class DobotSensors:
                                   "description": "反馈端口；30006 自动使用至少 3 秒超时", "scope": "shared"},
             },
         }
+        definitions[0]["inputSchema"] = action_schema({
+            "info": ([], "查看卡片功能、参数及输出口定义，不读取运行状态"),
+            "get_status": ([], "查询当前关节角度及反馈有效性"),
+            "start": ([], "启动实时关节输出"),
+            "stop": ([], "停止卡片，不改变机器人状态"),
+            "config": (["controller_ip", "feedback_port"], "配置共享反馈 IP 和端口"),
+        }, definitions[0]["configSchema"]["properties"])
         schema = action_schema({
-            "info": ([], "查看连接、控制请求记录及反馈；不发送控制命令"),
+            "info": ([], "查看卡片功能、参数及输出口定义，不读取运行状态"),
+            "get_status": ([], "查询当前触发状态和最近设置请求；请求记录不等于配置读回"),
             "request_control": (["confirm_change"], "显式请求 TCP 控制模式；仅下使能/下电时允许，不使能机器人"),
             "set_enabled": (["enabled", "confirm_change"], "提交安全皮肤总开关；关闭会移除皮肤接近保护，不能用于碰撞复位"),
             "set_sensitivity": (["part", "level", "confirm_change"], "提交指定部位灵敏度；0 关闭，1 低，2 中，3 高"),
@@ -76,7 +84,8 @@ class DobotSensors:
         definitions.append(tool("safe_skin_control", "actuator", "安全皮肤：实时触发 JSON 输出、总开关和分区灵敏度；队列提交不等于配置读回",
                                 schema, topic_out=self._topics["safe_skin_control"]))
         system_schema = action_schema({
-            "info": ([], "读取系统实时状态及本卡最近请求，不发送命令"),
+            "info": ([], "查看卡片功能和参数说明，不读取运行状态"),
+            "get_status": ([], "查询当前使能、上电、运行、暂停、拖拽、碰撞和报警状态，不发送控制命令"),
             "get_errors": ([], "通过 SDK 查询控制器当前报警编号，不清除报警"),
             "request_control": (["confirm_change"], "请求 TCP 控制权；仅未上电/下使能时允许，不自动使能"),
             "power_on": (["confirm_change"], "给机械臂本体上电；等待反馈初始化完成后才能另行使能"),
@@ -201,9 +210,13 @@ class DobotSensors:
         name = args.get("_tool_name", action)
         if name == "model":
             return model_resource(self.client.snapshot(), self.client.model_name)
+        if action in ("info", name):
+            # Core calls info for descriptions and topic discovery. Keep live
+            # state exclusively in visible get_status actions and ROS outputs.
+            return next((definition for definition in self.get_tools() if definition["name"] == name), None)
         if name == "systemcontrol":
-            if action in ("info", name):
-                return {"state": "ready", **self.control.system_info()}
+            if action == "get_status":
+                return {"read_only": True, **self.control.system_status()}
             if action in ("start", "stop", "config"):
                 if action == "stop":
                     self.control.close()
@@ -212,8 +225,8 @@ class DobotSensors:
                 return {"state": {"start": "ready", "stop": "idle", "config": "configured"}[action]}
             return self.control.execute_system(action, args)
         if name == "safe_skin_control":
-            if action in ("info", name):
-                return {"state": "ready", "topic_out": self._topics[name],
+            if action == "get_status":
+                return {"read_only": True, "topic_out": self._topics[name],
                         **self.control.snapshot(), "feedback": self.payload(name)}
             if action in ("start", "stop", "config"):
                 # Lifecycle does not claim control or cancel queued settings.
@@ -236,7 +249,7 @@ class DobotSensors:
                     "topic_out": self._topics[name], **self.payload(name)}
         if action == "stop":
             return {"state": "idle"}
-        if action in ("info", name):
+        if action == "get_status":
             return {"topic_out": self._topics[name], **self.payload(name)}
         raise ValueError(f"unsupported sensor action: {action}")
 
