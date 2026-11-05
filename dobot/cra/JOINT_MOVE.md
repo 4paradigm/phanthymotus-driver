@@ -9,7 +9,7 @@
 
 | action | 内容 |
 |---|---|
-| `move_j` | 检查状态并完成使能后执行 EnableSafeSkin(0) 和 ClearError，成功后复查状态，再运动至六个绝对关节目标角度 |
+| `move_j` | 先 ClearError，检查并完成使能后执行 EnableSafeSkin(0) 和 ClearError，成功后复查状态，再运动至六个绝对关节目标角度 |
 | `stop_motion` | 停止控制器运动队列/工程，也可停止点动 |
 | `pause` | 暂停当前运动队列/工程，不暂停点动 |
 | `resume` | 继续当前已暂停的队列/工程 |
@@ -67,9 +67,9 @@ MovJ(joint={10.000000,-30.000000,60.000000,0.000000,90.000000,-10.000000},a=10,v
 - 复用 `joints` 中配置的 IP 和反馈端口；本卡也提供相同共享配置，不依赖 joints 卡片启动。
 - 准备阶段要求反馈有效、型号匹配、机器人静止且非拖拽/松抱闸。模式 9/11 和报警、碰撞、
   皮肤接近暂停标志不再提前阻止准备命令。
-- `move_j`：必要时使能并等待确认 → 关闭安全皮肤 → 清错 → 等待反馈确认已使能、
+- `move_j`：先 ClearError，再必要时使能并等待确认 → 关闭安全皮肤 → 清错 → 等待反馈确认已使能、
   模式 5 且无保护触发 → MovJ。已有暂停队列不会被当作新的 move_j 执行。
-- `resume`：必要时使能并等待确认 → 关闭安全皮肤 → 确认已使能、模式 10 且无保护触发
+- `resume`：先 ClearError，再必要时使能并等待确认 → 关闭安全皮肤 → 确认已使能、模式 10 且无保护触发
   → Continue；不额外清错。
 - `stop_motion` 在反馈失效时仍可尝试发送，但必须已经配置控制器 IP。
 - `info` 只介绍功能，`start/config/stop` 为内部生命周期，不发送物理运动指令。
@@ -104,11 +104,11 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/dobot-build-fix-venv/bin/python -m pytest 
 
 ## 运动前清错
 
-每次 `move_j` 都在同一命令锁内执行 检查使能 → 必要时 EnableRobot 并等待反馈确认 → `EnableSafeSkin(0)` → 检查成功应答 → `ClearError()` → 检查成功应答 → 复查反馈状态 → `MovJ()`。
+每次 `move_j` 都在同一命令锁内执行 `ClearError()` → 检查成功应答 → 检查使能 → 必要时 EnableRobot 并等待反馈确认 → `EnableSafeSkin(0)` → 检查成功应答 → `ClearError()` → 检查成功应答 → 复查反馈状态 → `MovJ()`。
 清错拒绝、应答异常或超时均中止本次运动，不自动重试。内部请求记录中的 `clear_error_response`
 记录成功清错的应答。此应答不代表物理故障已消除。
 最终运动检查保留：准备完成后若仍存在碰撞、保护触发或报警，则拒绝运动。
-`pause`、`stop_motion` 和 `resume` 不追加清错，以免影响暂停队列。
+`resume` 只执行 enable 检查前的清错，不在关闭皮肤后再次清错；`pause` 和 `stop_motion` 不清错。
 
 ## 运动前关闭安全皮肤
 
@@ -137,3 +137,5 @@ resume 在使能后还必须保持模式 10；若暂停队列已丢失、回到�
 DOBOT_AGENT_CORE_HOSTNAME、DOBOT_AGENT_CORE_ADDRESS、DOBOT_CA_DIR 和 DOBOT_AGENT_CORE_CA_CERT 覆盖。
 TLS 不关闭校验，完成通知最多尝试三次，每次使用同一个 action_id；通知重试不重发机器人命令。缺少 CA 时拒绝开始运动/继续/暂停；显式 Stop 仍允许下发，回调失败会记入日志。
 运动确认最长 joint_move.motion_timeout_s 秒（默认 300）；x-completion 的 timeout 另计准备与通信余量。
+
+enable 检查前的清错应答保存在内部 pre_enable_clear_error_response；该步骤失败时不发送 EnableRobot、皮肤设置或运动命令。

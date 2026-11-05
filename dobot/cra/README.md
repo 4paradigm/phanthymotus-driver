@@ -111,7 +111,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra
 ## 关节运动
 
 joint_move 与 joints 共用底层反馈服务和连接配置，均可独立启动。
-move_j/resume 先检查使能，未使能时发送一次 EnableRobot 并等待反馈确认。
+move_j/resume 先 ClearError，再检查使能，未使能时发送一次 EnableRobot 并等待反馈确认。
 然后发送 EnableSafeSkin(0)；move_j 再发送 ClearError 和 MovJ，resume 发送 Continue。
 失败不继续也不重试。
 不自动重新 enable 安全皮肤。模式 11 等保护状态不会提前阻止准备命令；

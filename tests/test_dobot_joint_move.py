@@ -130,7 +130,7 @@ def test_absolute_degrees_use_joint_coordinates_and_explicit_default_rates():
         reply = original(command)
         if command.startswith('MovJ('):
             feedback.sample['data']['joint_state']['q_actual'] = list(TARGET.values())
-            feedback.sample['data']['current_command_id'] = 3
+            feedback.sample['data']['current_command_id'] = 4
         return reply
     def snapshot():
         packet_count[0] += 1
@@ -146,9 +146,9 @@ def test_absolute_degrees_use_joint_coordinates_and_explicit_default_rates():
         while not completions and time.monotonic() < deadline:
             time.sleep(0.005)
         assert completions and completions[0][:2] == (result['action_id'], 'completed')
-        assert dashboard.commands == ['EnableSafeSkin(0)', 'ClearError()', MOVJ] and len(calls) == 1
+        assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)', 'ClearError()', MOVJ] and len(calls) == 1
         request = control.snapshot('joint_move')['last_request']
-        assert request['state'] == 'submitted' and request['result_id'] == 3
+        assert request['state'] == 'submitted' and request['result_id'] == 4
         assert request['effect_verified'] is False
         assert {key: request[key] for key in TARGET} == TARGET
     finally:
@@ -159,7 +159,7 @@ def test_custom_rates_are_per_command_without_global_speed_or_coordinate_setting
     _, dashboard, control, calls = ready()
     try:
         result = move(control, velocity=25, acceleration=15)
-        assert dashboard.commands == ['EnableSafeSkin(0)', 'ClearError()', MOVJ.replace('a=10,v=10', 'a=15,v=25')]
+        assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)', 'ClearError()', MOVJ.replace('a=10,v=10', 'a=15,v=25')]
         assert result['velocity'] == 25 and result['acceleration'] == 15 and len(calls) == 1
     finally:
         control.close()
@@ -194,7 +194,7 @@ def test_documented_cr3a_degree_limits_are_enforced(joint, sign):
     assert not calls and not dashboard.commands
     try:
         move(control, **{joint: sign * limit})
-        assert len(calls) == 1 and len(dashboard.commands) == 3
+        assert len(calls) == 1 and len(dashboard.commands) == 4
     finally:
         control.close()
 
@@ -283,7 +283,7 @@ def test_pause_and_resume_use_sdk_without_chained_actions(action, mode, command)
     set_mode(feedback, mode)
     try:
         control.execute_motion(action, {'confirm_move': True})
-        assert dashboard.commands == (['EnableSafeSkin(0)', command] if action == 'resume' else [command]) and len(calls) == 1
+        assert dashboard.commands == (['ClearError()', 'EnableSafeSkin(0)', command] if action == 'resume' else [command]) and len(calls) == 1
     finally:
         control.close()
 
@@ -295,7 +295,7 @@ def test_pause_cannot_pause_jogging_and_resume_requires_paused_mode(action, mode
     with pytest.raises(RuntimeError):
         control.execute_motion(action, {'confirm_move': True})
     if action == 'resume' and mode == 5:
-        assert dashboard.commands == ['EnableSafeSkin(0)']
+        assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)']
         assert len(calls) == 1
     else:
         assert not calls and not dashboard.commands
@@ -335,14 +335,14 @@ def test_uncertain_move_is_not_replayed_or_reported_as_arrival(failure):
         move(control)
     request = control.snapshot('joint_move')['last_request']
     assert request['state'] == 'failed_or_outcome_unknown' and request['effect_verified'] is False
-    assert len(calls) == 1 and dashboard.commands == ['EnableSafeSkin(0)', 'ClearError()', MOVJ] and dashboard.closed
+    assert len(calls) == 1 and dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)', 'ClearError()', MOVJ] and dashboard.closed
 
 
 def test_controller_rejection_is_retained_only_in_motion_history():
     _, dashboard, control, calls = ready(Dashboard(reply=f'-1,{{}},{MOVJ};'))
     with pytest.raises(CommandRejected):
         move(control)
-    assert dashboard.commands == ['EnableSafeSkin(0)', 'ClearError()', MOVJ] and len(calls) == 1
+    assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)', 'ClearError()', MOVJ] and len(calls) == 1
     assert control.snapshot('joint_move')['last_request']['state'] == 'rejected'
 
 
@@ -383,7 +383,7 @@ def test_each_move_clears_error_even_on_reused_connection():
     try:
         move(control)
         move(control)
-        assert dashboard.commands == ['EnableSafeSkin(0)', 'ClearError()', MOVJ, 'EnableSafeSkin(0)', 'ClearError()', MOVJ]
+        assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)', 'ClearError()', MOVJ, 'ClearError()', 'EnableSafeSkin(0)', 'ClearError()', MOVJ]
         assert len(calls) == 1
     finally:
         control.close()
@@ -401,7 +401,7 @@ def test_rejected_or_invalid_clear_never_sends_move(reply):
     dashboard.send_receive_text = send
     with pytest.raises((CommandRejected, ValueError)):
         move(control)
-    assert dashboard.commands == ['EnableSafeSkin(0)', 'ClearError()'] and dashboard.closed
+    assert dashboard.commands == ['ClearError()'] and dashboard.closed
 
 
 def test_clear_timeout_never_sends_move_or_retries():
@@ -415,7 +415,7 @@ def test_clear_timeout_never_sends_move_or_retries():
     dashboard.send_receive_text = send
     with pytest.raises(TimeoutError):
         move(control)
-    assert dashboard.commands == ['EnableSafeSkin(0)', 'ClearError()'] and len(calls) == 1
+    assert dashboard.commands == ['ClearError()'] and len(calls) == 1
 
 
 def test_protection_state_is_checked_again_after_clear():
@@ -429,7 +429,7 @@ def test_protection_state_is_checked_again_after_clear():
     dashboard.send_receive_text = send
     with pytest.raises(RuntimeError):
         move(control)
-    assert dashboard.commands == ['EnableSafeSkin(0)', 'ClearError()'] and dashboard.closed
+    assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)', 'ClearError()'] and dashboard.closed
 
 
 @pytest.mark.parametrize('action,mode', [('move_j', 5), ('resume', 10)])
@@ -439,13 +439,15 @@ def test_skin_disable_failure_blocks_motion_and_resume(action, mode, failure):
     set_mode(feedback, mode)
     def send(command):
         dashboard.commands.append(command)
+        if command == 'ClearError()':
+            return '0,{},ClearError();'
         if failure == 'timeout':
             raise TimeoutError('skin disable acknowledgement lost')
         return '-1,{},EnableSafeSkin(0);' if failure == 'rejected' else 'invalid'
     dashboard.send_receive_text = send
     with pytest.raises((CommandRejected, ValueError, TimeoutError)):
         control.execute_motion(action, {**TARGET, 'confirm_move': True})
-    assert dashboard.commands == ['EnableSafeSkin(0)']
+    assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)']
     assert len(calls) == 1 and dashboard.closed
 
 
@@ -456,7 +458,7 @@ def test_each_resume_disables_skin_on_reused_connection():
         for _ in range(2):
             result = control.execute_motion('resume', {'confirm_move': True})
             assert result['safe_skin_disable_response'].startswith('0,')
-        assert dashboard.commands == ['EnableSafeSkin(0)', 'Continue()'] * 2
+        assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)', 'Continue()'] * 2
         assert len(calls) == 1
     finally:
         control.close()
@@ -496,7 +498,7 @@ def test_stop_cannot_interleave_skin_clear_and_move_sequence():
     try:
         assert entered.wait(1)
         second.start()
-        assert dashboard.commands == ['EnableSafeSkin(0)']
+        assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)']
     finally:
         release.set()
         first.join(2)
@@ -504,7 +506,7 @@ def test_stop_cannot_interleave_skin_clear_and_move_sequence():
             second.join(2)
     try:
         assert not first.is_alive() and not second.is_alive() and not errors
-        assert dashboard.commands == ['EnableSafeSkin(0)', 'ClearError()', MOVJ, 'Stop()']
+        assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)', 'ClearError()', MOVJ, 'Stop()']
     finally:
         control.close()
 
@@ -524,7 +526,7 @@ def test_disabled_robot_is_enabled_once_before_motion(action, mode):
     try:
         result = control.execute_motion(action, {**TARGET, 'confirm_move': True})
         expected = ['EnableSafeSkin(0)'] + (['ClearError()'] if action == 'move_j' else [])
-        assert dashboard.commands == ['EnableRobot()'] + expected + [MOVJ if action == 'move_j' else 'Continue()']
+        assert dashboard.commands == ['ClearError()', 'EnableRobot()'] + expected + [MOVJ if action == 'move_j' else 'Continue()']
         assert result['enable_response'].startswith('0,')
     finally:
         control.close()
@@ -571,7 +573,7 @@ def test_resume_does_not_continue_if_enabling_loses_paused_state():
     dashboard.send_receive_text = send
     with pytest.raises(RuntimeError, match='mode 10'):
         control.execute_motion('resume', {'confirm_move': True})
-    assert dashboard.commands == ['EnableRobot()', 'EnableSafeSkin(0)']
+    assert dashboard.commands == ['ClearError()', 'EnableRobot()', 'EnableSafeSkin(0)']
 
 
 def test_enable_ack_waits_for_later_feedback_before_sending_move():
@@ -624,14 +626,14 @@ def test_alarm_and_collision_can_reach_clear_before_final_motion_check(mode):
     original = dashboard.send_receive_text
     def send(command):
         reply = original(command)
-        if command == 'ClearError()':
+        if command == 'ClearError()' and 'EnableSafeSkin(0)' in dashboard.commands:
             set_mode(feedback, 5)
             feedback.sample['data']['collision_state'] = 0
         return reply
     dashboard.send_receive_text = send
     try:
         move(control)
-        assert dashboard.commands == ['EnableSafeSkin(0)', 'ClearError()', MOVJ]
+        assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)', 'ClearError()', MOVJ]
     finally:
         control.close()
 
@@ -645,7 +647,7 @@ def test_persistent_protection_blocks_only_final_motion_after_preparation(action
     feedback.sample['data'][flag] = 1
     with pytest.raises(RuntimeError, match='blocked by alarm'):
         control.execute_motion(action, {**TARGET, 'confirm_move': True})
-    assert dashboard.commands == ['EnableSafeSkin(0)'] + (['ClearError()'] if action == 'move_j' else [])
+    assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)'] + (['ClearError()'] if action == 'move_j' else [])
     assert dashboard.closed
 
 
@@ -656,7 +658,7 @@ def test_clear_ack_waits_for_feedback_to_leave_collision_mode():
     original = feedback.snapshot
     polls = []
     def snapshot():
-        if 'ClearError()' in dashboard.commands:
+        if dashboard.commands.count('ClearError()') >= 2:
             polls.append(True)
             if len(polls) >= 3:
                 set_mode(feedback, 5)
@@ -678,13 +680,49 @@ def test_disabled_collision_state_prepares_in_enable_skin_clear_move_order():
         reply = original(command)
         if command == 'EnableRobot()':
             feedback.sample['data']['enable_status'] = True
-        if command == 'ClearError()':
+        if command == 'ClearError()' and 'EnableSafeSkin(0)' in dashboard.commands:
             set_mode(feedback, 5)
             feedback.sample['data']['collision_state'] = 0
         return reply
     dashboard.send_receive_text = send
     try:
         move(control)
-        assert dashboard.commands == ['EnableRobot()', 'EnableSafeSkin(0)', 'ClearError()', MOVJ]
+        assert dashboard.commands == ['ClearError()', 'EnableRobot()', 'EnableSafeSkin(0)', 'ClearError()', MOVJ]
     finally:
         control.close()
+
+
+@pytest.mark.parametrize('action,mode', [('move_j', 4), ('resume', 10)])
+@pytest.mark.parametrize('failure', ['rejected', 'malformed', 'timeout'])
+def test_pre_enable_clear_failure_blocks_enable_and_later_commands(action, mode, failure):
+    feedback, dashboard, control, calls = ready()
+    set_mode(feedback, mode)
+    feedback.sample['data']['enable_status'] = False
+    def send(command):
+        dashboard.commands.append(command)
+        if failure == 'timeout':
+            raise TimeoutError('pre-enable clear timed out')
+        return '-1,{},ClearError();' if failure == 'rejected' else 'invalid'
+    dashboard.send_receive_text = send
+    with pytest.raises((CommandRejected, ValueError, TimeoutError)):
+        control.execute_motion(action, {**TARGET, 'confirm_move': True})
+    assert dashboard.commands == ['ClearError()'] and len(calls) == 1
+    assert dashboard.closed
+
+
+@pytest.mark.parametrize('failure', ['rejected', 'timeout'])
+def test_post_skin_clear_failure_still_blocks_move(failure):
+    _, dashboard, control, _ = ready()
+    original = dashboard.send_receive_text
+    def send(command):
+        if command == 'ClearError()' and 'EnableSafeSkin(0)' in dashboard.commands:
+            dashboard.commands.append(command)
+            if failure == 'timeout':
+                raise TimeoutError('post-skin clear timed out')
+            return '-1,{},ClearError();'
+        return original(command)
+    dashboard.send_receive_text = send
+    with pytest.raises((CommandRejected, TimeoutError)):
+        move(control)
+    assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)', 'ClearError()']
+    assert dashboard.closed

@@ -65,10 +65,10 @@ class DobotSensors:
         motion_schema = action_schema({
             "info": ([], "查看关节运动卡功能、参数和单位说明，不读取运行状态"),
             "move_j": ([*angle_fields, "velocity", "acceleration", "confirm_move"],
-                       "参数/连接检查后先检查使能，未使能则 EnableRobot 并等待确认，再 EnableSafeSkin(0)、ClearError，最后执行绝对关节运动（度）；六个角度必填，速度/加速度留空为 10%"),
+                       "参数/连接检查后先 ClearError，再检查使能，未使能则 EnableRobot 并等待确认，再 EnableSafeSkin(0)、ClearError，最后执行绝对关节运动（度）；六个角度必填，速度/加速度留空为 10%"),
             "stop_motion": (["confirm_move"], "停止控制器运动队列/工程，包括点动；不下使能"),
             "pause": (["confirm_move"], "暂停当前运动队列/工程；不支持点动暂停"),
-            "resume": (["confirm_move"], "先检查使能，未使能则 EnableRobot 并等待确认，再 EnableSafeSkin(0)，成功后继续暂停队列；不自动清错"),
+            "resume": (["confirm_move"], "先 ClearError，再检查使能，未使能则 EnableRobot 并等待确认，再 EnableSafeSkin(0)，成功后继续暂停队列"),
             "start": ([], "启动反馈读取，不发送运动指令"),
             "stop": ([], "关闭共享命令连接，不发送停止运动指令"),
             "config": ([], "确认卡片配置；本卡与 joints 共用 IP/端口配置"),

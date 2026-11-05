@@ -101,3 +101,7 @@ paused joint target when applicable). Pause/Stop require two new feedback packet
 with no running/jog flags and absolute joint velocities <=0.1 deg/s; Pause also
 requires mode 10 and pause flag. Stop remains available without feedback or CA,
 but cannot report verified completion without fresh stationary feedback.
+
+Every move_j/resume first sends and validates ClearError before checking enable.
+Failure aborts all later commands. move_j retains the second ClearError after
+disabling skin; resume does not add a second clear after disabling skin.

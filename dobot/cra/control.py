@@ -230,6 +230,9 @@ class RobotController:
                 # Connecting can take long enough for feedback/state to change.
                 check_state(action)
                 if action in ("move_j", "resume"):
+                    pre_enable_clear = self._api.ClearError()
+                    parse_response(pre_enable_clear, "ClearError")
+                    request["pre_enable_clear_error_response"] = pre_enable_clear
                     sample = check_state(action)
                     if not sample["data"]["enable_status"]:
                         enable_reply = self._api.EnableRobot()
