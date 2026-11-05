@@ -2657,7 +2657,7 @@ class CameraPlugin:
                 "description": f"Bumi Realsense D435i depth registered to the RGB image — 640x480 zlib-compressed Z16 @ 30fps. Publishes to {self._depth_topic}",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"},
-                              {"topic": f"/{self._namespace}/camera/depth_metric", "format": "sensor/depth-f32"}],
+                              {"topic": f"/{self._namespace}/camera/depth_metric", "format": "image/depth-zlib"}],
             },
         ]
 
@@ -2715,14 +2715,14 @@ class CameraPlugin:
                 topic, fmt = topic_map[tool_name]
                 if tool_name == "depth":
                     metric_topic = f"/{self._namespace}/camera/depth_metric"
-                    metric_info = self._camera_info(tool_name, metric_topic, "sensor/depth-f32")
+                    metric_info = self._camera_info(tool_name, metric_topic, "image/depth-zlib")
                     for declaration in metric_info:
                         declaration.setdefault("vendor", {}).update(
-                            depth_unit="m", timestamp_semantics="source_capture_mapped",
+                            depth_unit="mm", depth_source="measured", timestamp_semantics="source_capture_mapped",
                             clock_mapping="shared_camera_mapper")
                     return {"state": "running",
                             "topic_out": [{"topic": topic, "format": fmt},
-                                          {"topic": metric_topic, "format": "sensor/depth-f32"}],
+                                          {"topic": metric_topic, "format": "image/depth-zlib"}],
                             "camera_info": self._camera_info(tool_name, topic, fmt) + metric_info}
                 return {"state": "running",
                         "topic_out": [{"topic": topic, "format": fmt}],

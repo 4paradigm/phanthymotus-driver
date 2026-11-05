@@ -7,6 +7,7 @@ Run: python3 -m pytest -q tests/bumi_visual_odometry/test_inputs.py
 """
 from array import array
 import json
+import zlib
 from pathlib import Path
 import sys
 from types import SimpleNamespace as NS
@@ -63,7 +64,7 @@ def raw_ros(monkeypatch):
     node = NS(create_publisher=lambda cls, topic, qos: NS(
         publish=messages.setdefault(topic, []).append,
         get_subscription_count=lambda: 1))
-    monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(Image=Image, CameraInfo=Image))
+    monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(Image=Image, CameraInfo=Image, CompressedImage=Image))
     monkeypatch.setitem(sys.modules, 'std_msgs.msg', NS(String=String))
     return messages, node
 
@@ -126,18 +127,20 @@ def test_computational_depth_shares_capture_time_and_survives_vo_stop(raw_ros, m
     aligned = frames()
     monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 10_000_000_000)
 
+    aligned.get_depth_frame().get_data = lambda: np.full((480, 640), 500, dtype='<u2')
     depth_publisher.publish(aligned, aligned)
     raw_publisher.publish(aligned, aligned)
     compute = messages['/robot/camera/depth_metric'][0]
     vo_depth = messages['/robot/odometry_input/depth'][0]
     assert _stamp(compute) == _stamp(vo_depth) == 10_010_000_000
     assert compute.header.frame_id == vo_depth.header.frame_id == 'robot_rgb_optical'
-    assert compute.encoding == '32FC1'
-    assert np.frombuffer(compute.data, dtype='<f4').tolist() == pytest.approx([1.] * 6)
+    assert compute.format == '16UC1; compressedDepth zlib'
+    assert np.frombuffer(zlib.decompress(compute.data), dtype='<u2').tolist() == [1000] * (480*640)
 
     raw_publisher.enabled = False
     depth_publisher.last_publish = None
     next_frames = frames(ms=1033)
+    next_frames.get_depth_frame().get_data = lambda: np.full((480, 640), 500, dtype='<u2')
     monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 10_033_000_000)
     depth_publisher.publish(next_frames, next_frames)
     raw_publisher.publish(next_frames, next_frames)
@@ -166,6 +169,7 @@ def test_metric_depth_keeps_global_capture_stamp_after_processing_delay(raw_ros,
     aligned.get_color_frame().get_frame_timestamp_domain = lambda: 'timestamp_domain.global_time'
     aligned.get_depth_frame().get_frame_timestamp_domain = lambda: 'timestamp_domain.global_time'
     monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 1_100_000_000)
+    aligned.get_depth_frame().get_data = lambda: np.full((480, 640), 500, dtype='<u2')
     metric.publish(aligned, aligned)
     assert _stamp(messages['/robot/camera/depth_metric'][0]) == 1_010_000_000
 
@@ -202,6 +206,8 @@ def test_metric_depth_is_rate_limited_to_two_hz(raw_ros, monkeypatch):
     monkeypatch.setattr(visual_inputs.time, 'monotonic', lambda: next(ticks))
     monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 10_000_000_000)
     first, second, third = frames(), frames(ms=1010), frames(ms=1030)
+    for source in (first, second, third):
+        source.get_depth_frame().get_data = lambda: np.full((480, 640), 500, dtype='<u2')
     metric.publish(first, first)
     metric.publish(second, second)
     metric.publish(third, third)
@@ -351,3 +357,28 @@ def test_raw_publisher_starts_disabled_until_the_card_latches_enable(raw_ros):
     raw_publisher.enabled = True
     raw_publisher.publish(frames(), frames())
     assert len(messages['/robot/odometry_input/rgb']) == 1
+
+
+def test_computational_depth_quantizes_mm_without_wrapping(raw_ros):
+    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
+    _, node = raw_ros
+    metric = ComputationalDepthPublisher(node, 'robot', CaptureTimeMapper(.0015), object())
+    data = frames()
+    pixels = np.zeros((480, 640), dtype='<u2')
+    pixels[0, :6] = [0, 1, 1001, 43690, 43691, 65535]
+    data.get_depth_frame().get_data = lambda: pixels
+    metric.publish(data, data)
+    output = raw_ros[0]['/robot/camera/depth_metric'][0]
+    decoded = np.frombuffer(zlib.decompress(output.data), dtype='<u2').reshape(480, 640)
+    assert decoded[0, :6].tolist() == [0, 2, 1502, 65535, 0, 0]
+    assert len(decoded.tobytes()) == 614400
+
+
+def test_computational_depth_rejects_non_contract_dimensions(raw_ros):
+    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
+    _, node = raw_ros
+    metric = ComputationalDepthPublisher(node, 'robot', CaptureTimeMapper(.002), object())
+    data = frames()
+    with pytest.raises(ValueError, match='640x480'):
+        metric.publish(data, data)
+    assert not raw_ros[0]['/robot/camera/depth_metric']

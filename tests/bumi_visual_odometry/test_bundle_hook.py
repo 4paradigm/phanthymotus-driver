@@ -242,13 +242,14 @@ def test_depth_card_declares_both_outputs_and_their_actual_intrinsics(capture, m
     result = card.dispatch('info', {'_tool_name': 'depth'})
     assert tool['topic_out'] == result['topic_out'] == [
         {'topic': '/robot/camera/depth', 'format': 'image/depth-zlib'},
-        {'topic': '/robot/camera/depth_metric', 'format': 'sensor/depth-f32'}]
+        {'topic': '/robot/camera/depth_metric', 'format': 'image/depth-zlib'}]
     infos = {entry['topic']: entry for entry in result['camera_info']}
     assert infos['/robot/camera/depth_metric']['K'][0] == 600.
     assert infos['/robot/camera/depth_metric']['source'] == 'derived-from-K'
     assert infos['/robot/camera/depth_metric']['distortion_model'] == 'pinhole'
     vendor = infos['/robot/camera/depth_metric']['vendor']
-    assert vendor['depth_unit'] == 'm'
+    assert vendor['depth_unit'] == 'mm'
+    assert vendor['depth_source'] == 'measured'
     assert vendor['timestamp_semantics'] == 'source_capture_mapped'
     assert vendor['clock_mapping'] == 'shared_camera_mapper'
 

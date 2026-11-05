@@ -44,7 +44,6 @@ EXECUTABLE = 'rgbd_odometry'
 # Namespaced so two bundles in the same DDS domain cannot collide. These are
 # suffixes; the runtime prefixes them with ``/<namespace>``.
 OUTPUT_TOPIC = '/bumi_visual_odometry/state/odom'
-STATUS_TOPIC = '/bumi_visual_odometry/status'
 
 # A gap in RTAB-Map results is not immediately fatal: walking increases its
 # processing time (observed 0.13 s stationary -> 0.37 s walking). Wait for the
@@ -245,9 +244,7 @@ class VisualOdometryNode:
         self.active = False
         self.closed = False
         self.output = f'/{namespace}'+OUTPUT_TOPIC
-        self.status_topic = f'/{namespace}'+STATUS_TOPIC
         self.publisher = self.node.create_publisher(String, self.output, self.qos)
-        self.status_publisher = self.node.create_publisher(String, self.status_topic, self.qos)
         # The raw RGB-D producer lives in the camera subprocess. This private
         # control topic is the lifecycle signal: stop disables the shared
         # branch, start re-enables it, matching what sensor-card stop means.
@@ -336,8 +333,6 @@ class VisualOdometryNode:
         self.summary_origin = None
         self.yaw_origin_rad = None
         self.turn_angle_deg = None
-        self.last_summary_ns = None
-        self.last_summary_state = None
 
     def base_frame(self):
         return self.segment+'_base'
@@ -352,46 +347,26 @@ class VisualOdometryNode:
 
     def publish(self):
         sample = make_sample(self.health, self.now(), self.estimate, self.pose_reference())
-        if not self.active:
-            sample['vendor'].update(status='initializing', reason='visual odometry stopped')
-            sample['pose'] = None
-        self.publisher.publish(self.String(data=json.dumps(sample, allow_nan=False)))
-        self.publish_status(sample)
-        return sample
-
-    def publish_status(self, sample):
         quality = sample['vendor']
-        state = (quality['status'], quality['reason'])
-        now = time.monotonic_ns()
-        if (self.last_summary_ns is not None and now-self.last_summary_ns < 200_000_000
-                and state == self.last_summary_state):
-            return
+        if not self.active:
+            quality.update(status='initializing', reason='visual odometry stopped')
+            quality['motus_slam']['status'] = 'initializing'
+            sample['pose'] = None
         position = sample['pose']['position'] if sample['pose'] is not None else None
         distance = None
         if position is not None:
             if self.summary_origin is None:
                 self.summary_origin = list(position)
             distance = math.sqrt(sum((a-b)**2 for a, b in zip(position, self.summary_origin)))
-        stamp = quality['visual_stamp_ns']
-        summary = dict(status=quality['status'],
-                       turn_angle_deg=(round(self.turn_angle_deg, 1)
-                                       if self.turn_angle_deg is not None else None),
-                       displacement_m=round(distance, 3) if distance is not None else None,
-                       position_m=[round(v, 3) for v in position] if position is not None else None,
-                       pose_reference=quality['pose_reference'],
-                       age_ms=round((quality['published_ns']-stamp)/1e6, 1)
-                       if stamp is not None else None,
-                       reason=quality['reason'])
-        self.status_publisher.publish(self.String(data=json.dumps(summary, allow_nan=False)))
-        self.last_summary_ns, self.last_summary_state = now, state
+        quality.update(turn_angle_deg=self.turn_angle_deg, displacement_m=distance)
+        self.publisher.publish(self.String(data=json.dumps(sample, allow_nan=False)))
+        return sample
 
     def info(self):
         from common.odom import build_interface
         sample = self.publish()
         return dict(state='running' if self.active else 'idle',
-                    topic_out=[{'topic': self.status_topic, 'format': 'data/json',
-                                'message_type': 'std_msgs/msg/String'},
-                               {'topic': self.output, 'format': 'state/odom',
+                    topic_out=[{'topic': self.output, 'format': 'state/odom',
                                 'message_type': 'std_msgs/msg/String'}],
                     odom_topic=self.output,
                     sample=sample,
@@ -950,7 +925,7 @@ class VisualOdometryPlugin:
                             + ('body IMU rotation assistance; no inertial translation/EKF, '
                                if self._node.imu_assisted else 'no IMU/EKF/fusion, ')+
                             'not in the motion path. '
-                            f'Canvas status: {self._node.status_topic}; full odometry: {self._node.output}'),
+                            f'Odometry: {self._node.output}'),
             'inputSchema': {
                 'type': 'object',
                 'properties': {
@@ -963,8 +938,7 @@ class VisualOdometryPlugin:
                                # reset is no longer exposed; recovery creates a
                                # new segment automatically.
                                'enum': ['start', 'stop', 'info']}}},
-            'topic_out': [{'topic': self._node.status_topic, 'format': 'data/json'},
-                          {'topic': self._node.output, 'format': 'state/odom'}],
+            'topic_out': [{'topic': self._node.output, 'format': 'state/odom'}],
         }]
 
     def start(self) -> None:

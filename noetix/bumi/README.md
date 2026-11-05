@@ -212,10 +212,13 @@ sudo systemctl start noetix-video-capture.service
 降级（而不是一帧一帧地发现问题）的前提。
 
 Depth 卡片保留原来的 `/<namespace>/camera/depth` 压缩展示输出，另提供
-`/<namespace>/camera/depth_metric`（`sensor/depth-f32`，ROS Image 的
-`32FC1` 米制深度，有订阅时最多 2 Hz），供需要几何计算的消费者使用。它来自同一
+`/<namespace>/camera/depth_metric`（`image/depth-zlib`，ROS `CompressedImage`，
+640×480 小端 uint16 毫米深度，有订阅时最多 2 Hz），供需要几何计算的消费者使用。它来自同一
 相机采集进程和对齐后的 RGB 光学坐标系，header 携带源深度帧采集时间映射
-及 `frame_id`；卡片 `camera_info` 为两路分别声明相同像素网格的运行时内参。
+及 `frame_id`。`format="16UC1; compressedDepth zlib"`，载荷为直接 zlib 压缩的
+640×480 小端 uint16；按 SDK `depth_scale` 换算并四舍五入到毫米，0 表示无效，
+四舍五入后超出 65535 mm 的值置 0。`camera_info.vendor` 声明 `depth_unit=mm`、
+`depth_source=measured` 和 `timestamp_semantics=source_capture_mapped`；卡片 `camera_info` 为两路分别声明相同像素网格的运行时内参。
 运行时内参缺失或畸变尚不能按针孔模型处理时，不应把兜底 FOV 当作已标定
 几何。新输出不依赖 VO 卡片的启停；同一帧的 VO 原始输入和计算深度共享
 时间映射。设备硬件时钟使用到达时刻估计一次偏移，该映射是近似值，不代表
@@ -488,7 +491,7 @@ capture continue as before. `main.py` sets `BUMI_VISUAL_ODOMETRY=1` only when th
 card is enabled — a disabled card costs no extra DDS traffic and starts no
 estimator.
 
-The compact status includes `turn_angle_deg`: body yaw relative to the first IMU
+The single `state/odom` output includes `vendor.turn_angle_deg`: body yaw relative to the first IMU
 sample of the current segment, wrapped to -180..180 degrees.
 
 `plugins.visual_odometry.imu_assisted` defaults to true with
@@ -498,9 +501,10 @@ orientation as a rotation prior; translation is still estimated from RGB-D, with
 no inertial position integration or robot_localization/EKF. `imu_source: state`
 falls back to the StatePlugin topic. Set `imu_assisted: false` to run visual-only.
 The output is not wired
-into `loco_target`/`loco_servo`. The full `motus.odom/1` sample is also declared
-as a second `state/odom` canvas output for future consumers, but no loco card is
-wired to it. The shipped config applies the standard level-forward mount so `position` uses robot body axes (x forward, y left, z up;
+into `loco_target`/`loco_servo`. The full `motus.odom/1` sample is the only
+canvas output (`state/odom`); Core renders it directly. `vendor.displacement_m`
+is the distance from the first tracking pose in the segment. There is no
+separate status topic, and no loco card is wired to this output. The shipped config applies the standard level-forward mount so `position` uses robot body axes (x forward, y left, z up;
 reported as `pose_reference: body_axes`, a convention rather than a measured
 extrinsic). The card defaults to `initializing` and
 publishes no pose until the estimator is tracking; a fault ends that segment and recovery

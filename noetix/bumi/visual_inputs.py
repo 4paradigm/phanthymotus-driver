@@ -11,6 +11,7 @@ from array import array
 import json
 import time
 import uuid
+import zlib
 
 try:  # imported as part of the noetix.bumi namespace in tests
     from .visual_odometry_contract import ClockMap, MAX_TRANSPORT_NS, finite
@@ -76,12 +77,12 @@ class CaptureTimeMapper:
 
 
 class ComputationalDepthPublisher:
-    """Bounded metric depth output from the existing aligned camera frames."""
+    """Capture-timed depth in the existing 640x480 uint16 millimetre zlib format."""
 
     def __init__(self, node, namespace, time_mapper, qos):
-        from sensor_msgs.msg import Image
-        self.Image, self.namespace, self.time_mapper = Image, namespace, time_mapper
-        self.publisher = node.create_publisher(Image, f'/{namespace}/camera/depth_metric', qos)
+        from sensor_msgs.msg import CompressedImage
+        self.CompressedImage, self.namespace, self.time_mapper = CompressedImage, namespace, time_mapper
+        self.publisher = node.create_publisher(CompressedImage, f'/{namespace}/camera/depth_metric', qos)
         self.last_publish = None
 
     def publish(self, source_frames, aligned_frames):
@@ -100,13 +101,16 @@ class ComputationalDepthPublisher:
         if model not in ('none', 'brown_conrady', 'inverse_brown_conrady', 'modified_brown_conrady') or any(coeffs):
             raise ValueError('metric depth requires rectified pinhole intrinsics')
         _, stamps = self.time_mapper.sample(source_color, source_depth)
-        pixels = np.asanyarray(depth.get_data()).astype('<f4') * self.time_mapper.depth_scale
-        msg = self.Image()
+        pixels = np.asanyarray(depth.get_data())
+        if pixels.shape != (480, 640):
+            raise ValueError('compressed depth requires a 640x480 pixel grid')
+        millimetres = np.rint(pixels.astype(np.float64) * (self.time_mapper.depth_scale * 1000.))
+        millimetres[(millimetres < 1) | (millimetres > 65535) | ~np.isfinite(millimetres)] = 0
+        msg = self.CompressedImage()
         msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(stamps[1], 10**9)
         msg.header.frame_id = f'{self.namespace}_rgb_optical'
-        msg.height, msg.width = pixels.shape[:2]
-        msg.encoding, msg.is_bigendian, msg.step = '32FC1', False, msg.width * 4
-        msg.data = array('B', pixels.tobytes())
+        msg.format = '16UC1; compressedDepth zlib'
+        msg.data = array('B', zlib.compress(millimetres.astype('<u2').tobytes(), 1))
         self.publisher.publish(msg)
         self.last_publish = time.monotonic()
 

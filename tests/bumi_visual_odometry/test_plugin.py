@@ -108,7 +108,6 @@ def test_card_is_a_read_only_sensor_on_its_own_topic(plugin):
     assert tool['name'] == 'rgbd_visual_odometry'
     assert tool['type'] == 'sensor' and tool['multiInstance'] is False
     assert tool['topic_out'] == [
-        {'topic': '/robot/bumi_visual_odometry/status', 'format': 'data/json'},
         {'topic': '/robot/bumi_visual_odometry/state/odom', 'format': 'state/odom'}]
     assert set(tool['inputSchema']['properties']['action']['enum']) == {
         'start', 'stop', 'info'}
@@ -195,20 +194,18 @@ def tracking(plugin):
 
 
 def summary(node):
-    return json.loads(node.node.topics['/robot/bumi_visual_odometry/status'][-1].data)
+    return json.loads(node.node.messages[-1].data)['vendor']
 
 
-def test_summary_is_small_and_measures_segment_displacement_without_changing_odom(plugin):
+def test_odom_carries_segment_displacement_without_a_second_output(plugin):
     node = tracking(plugin)
     node.publish()
-    assert summary(node) == dict(status='tracking', turn_angle_deg=None,
-                                displacement_m=0., position_m=[1., 2., 3.],
-                                pose_reference='rgb_optical', age_ms=0., reason=None)
+    assert summary(node)['status'] == 'tracking'
+    assert summary(node)['displacement_m'] == 0.
+    assert '/robot/bumi_visual_odometry/status' not in node.node.topics
     node.estimate['pose']['position'] = [1., 2., 5.123456]
-    node.last_summary_ns = None
     node.publish()
-    assert summary(node)['displacement_m'] == 2.123
-    assert summary(node)['position_m'] == [1., 2., 5.123]
+    assert summary(node)['displacement_m'] == pytest.approx(2.123456)
     assert last(plugin)['pose']['position'] == [1., 2., 5.123456]
     assert last(plugin)['pose']['covariance'] == [0.]*36
     assert last(plugin)['vendor']['visual_diagnostic']['inliers'] == 20
@@ -231,19 +228,17 @@ def test_turn_angle_is_relative_to_the_first_imu_sample(plugin, monkeypatch):
     node.body_imu_pub = NS(publish=lambda msg: None)
     node._publish_body_imu([0., 0., 0., 1.], [0., 0., 0.], [0., 0., 0.],
                            node.now(), 'read_completion')
-    node.last_summary_ns = None
     node.publish()
     assert summary(node)['turn_angle_deg'] == 0.
     node.node.time += 100_000_000
     node._publish_body_imu([0., 0., math.sin(math.pi/4), math.cos(math.pi/4)],
                            [0., 0., 0.], [0., 0., 0.],
                            node.now(), 'read_completion')
-    node.last_summary_ns = None
     node.publish()
-    assert summary(node)['turn_angle_deg'] == 90.
+    assert summary(node)['turn_angle_deg'] == pytest.approx(90.)
 
 
-def test_summary_throttle_keeps_the_twenty_hz_odom_and_immediate_lost_transition(
+def test_single_output_keeps_twenty_hz_odom_and_immediate_lost_transition(
         plugin, monkeypatch):
     node = tracking(plugin)
     clock = [0]
@@ -252,17 +247,14 @@ def test_summary_throttle_keeps_the_twenty_hz_odom_and_immediate_lost_transition
         clock[0] = i*50_000_000
         node.publish()
     assert len(node.node.messages) == 20
-    assert len(node.node.topics['/robot/bumi_visual_odometry/status']) == 5
+    assert '/robot/bumi_visual_odometry/status' not in node.node.topics
     assert node.node.timers[0][0] == .05
     # Lose freshness after the one-second camera watchdog: do not wait for 5 Hz.
     clock[0] = 1_450_000_000
     node.node.time += 1_000_000_001
     node.tick()
-    assert len(node.node.topics['/robot/bumi_visual_odometry/status']) == 6
     assert summary(node)['status'] == 'lost'
-    assert summary(node)['position_m'] is None
     assert summary(node)['displacement_m'] is None
-    assert summary(node)['age_ms'] == 1000.
     assert last(plugin)['pose'] is None
 
 
@@ -271,7 +263,7 @@ def test_stop_and_reset_do_not_display_a_previous_segment_pose(plugin):
     node.publish()
     plugin.dispatch('stop', {})
     assert summary(node)['status'] == 'initializing'
-    assert summary(node)['position_m'] is None
+    assert summary(node)['motus_slam']['status'] == 'initializing'
     assert summary(node)['displacement_m'] is None
     plugin.dispatch('start', {})
     tracking(plugin)
@@ -283,7 +275,7 @@ def test_stop_and_reset_do_not_display_a_previous_segment_pose(plugin):
 def test_info_keeps_full_sample_and_exposes_it_in_canvas_details(plugin):
     node = tracking(plugin)
     result = plugin.dispatch('info', {})
-    assert result['topic_out'][0]['format'] == 'data/json'
+    assert [port['format'] for port in result['topic_out']] == ['state/odom']
     assert result['odom_topic'] == '/robot'+module.OUTPUT_TOPIC
     assert result['sample'] == last(plugin)
     assert result['quality']['visual_diagnostic']['inliers'] == 20
@@ -488,7 +480,5 @@ def test_output_topics_follow_the_bundle_namespace(executor):
     plugin = module.VisualOdometryPlugin({}, 'alpha', executor)
     tool = plugin.get_tools()[0]
     assert plugin._node.output == '/alpha'+module.OUTPUT_TOPIC
-    assert plugin._node.status_topic == '/alpha'+module.STATUS_TOPIC
     assert tool['topic_out'] == [
-        {'topic': '/alpha'+module.STATUS_TOPIC, 'format': 'data/json'},
         {'topic': '/alpha'+module.OUTPUT_TOPIC, 'format': 'state/odom'}]
