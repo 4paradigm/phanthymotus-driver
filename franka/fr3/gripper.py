@@ -13,8 +13,7 @@ from hardware import SessionManager
 class GripperPlugin(JointControlPlugin):
     PREFIX = "gripper"
     CONFIG_FIELDS = FrankaPlugin.CONFIG_FIELDS + ("speed_mm_s", "force_n")
-    MOTION_ACTIONS = ("set_position", "grasp", "homing")
-    ARM_ACTIONS = (*MOTION_ACTIONS, "stopmotion")
+    MOTION_ACTIONS = ("set_position", "grasp", "reset")
 
     def __init__(self, *args, manager=None, **kwargs):
         # The Hand has its own SDK connection, independently of the arm FCI loop.
@@ -29,62 +28,50 @@ class GripperPlugin(JointControlPlugin):
         cfg["force_n"] = JointControlPlugin._number(cfg.get("force_n", 30), "force_n", 30, 70)
         return cfg
 
+    def _grasp_options(self, args):
+        width = self._number(args.get("width_mm"), "width_mm", 0, 80)
+        force = self._number(args.get("force_n"), "force_n", 30, 70)
+        low = self._number(args.get("min_width_mm", max(0, width - 5)), "min_width_mm", 0, 80)
+        high = self._number(args.get("max_width_mm", min(80, width + 5)), "max_width_mm", 0, 80)
+        if not low <= width <= high or low >= high:
+            raise ValueError("Opening bounds must satisfy min_width_mm <= width_mm <= max_width_mm and min_width_mm < max_width_mm")
+        return {"force_n": force, "epsilon_inner_m": (width - low) / 1000,
+                "epsilon_outer_m": (high - width) / 1000}
+
     def get_tools(self):
-        config = FrankaPlugin.get_tools(self)[0]["configSchema"]
-        # Match joint_control's per-card binding on older actuator canvases.
-        config.pop("required", None)
-        config["properties"].pop("publish_hz", None)
-        config["properties"].update({
-            "speed_mm_s": {"type": "number", "title": "默认开口速度 (mm/s)",
-                           "scope": "instance", "minimum": 0.1, "maximum": 100, "default": 20},
-            "force_n": {"type": "number", "title": "默认抓取力 (N)",
-                        "scope": "instance", "minimum": 30, "maximum": 70, "default": 30},
-        })
         properties = {
-            "output_topic": {"type": "string",
-                             "description": "由画布输出端口自动传入，用于匹配本卡；无需填写。"},
-            "width_mm": {"type": "number", "title": "目标开口宽度 (mm)",
+            "width_mm": {"type": "number", "title": "Target opening (mm)",
                          "minimum": 0, "maximum": 80,
-                         "description": "两指之间的总距离；上限取 80 mm 与当前标定最大开口中的较小值。"},
-            "speed_mm_s": {"type": "number", "title": "开口速度 (mm/s)",
+                         "description": "Total distance between the fingers, limited to the smaller of 80 mm and the calibrated maximum."},
+            "speed_mm_s": {"type": "number", "title": "Opening speed (mm/s)",
                            "minimum": 0.1, "maximum": 100,
-                           "description": "总开口宽度的变化速度；留空使用卡片默认速度。"},
-            "force_n": {"type": "number", "title": "抓取力 (N)",
+                           "description": "Required rate of change of the total opening for this action."},
+            "force_n": {"type": "number", "title": "Grasp force (N)",
                         "minimum": 30, "maximum": 70,
-                        "description": "留空使用卡片默认抓取力。"},
-            "epsilon_inner_mm": {"type": "number", "title": "内侧容差 (mm)",
-                                 "minimum": 0, "maximum": 80, "default": 5,
-                                 "description": "允许实际物体宽度比目标宽度小的范围。"},
-            "epsilon_outer_mm": {"type": "number", "title": "外侧容差 (mm)",
-                                 "minimum": 0, "maximum": 80, "default": 5,
-                                 "description": "允许实际物体宽度比目标宽度大的范围。"},
+                        "description": "Required commanded grasp force; no default."},
+            "min_width_mm": {"type": "number", "title": "Minimum opening (mm, optional)",
+                             "minimum": 0, "maximum": 80,
+                             "description": "Absolute lower acceptable opening, e.g. 18 for a 20 mm target. Omit for target minus 5 mm, bounded at zero."},
+            "max_width_mm": {"type": "number", "title": "Maximum opening (mm, optional)",
+                             "minimum": 0, "maximum": 80,
+                             "description": "Absolute upper acceptable opening, e.g. 22 for a 20 mm target. Omit for target plus 5 mm, bounded at 80 mm."},
         }
         schema = action_schema({
-            "set_position": (["width_mm", "speed_mm_s"], "将夹爪移动到指定开口宽度（mm）。"),
-            "grasp": (["width_mm", "speed_mm_s", "force_n", "epsilon_inner_mm", "epsilon_outer_mm"],
-                      "按目标物体宽度和抓取力夹持；成功后保持夹持力。"),
-            "homing": ([], "执行夹爪标定，夹爪会完整打开并闭合，以测量最大开口。"),
-            "stopmotion": ([], "停止本机械臂夹爪动作，并解除夹持力；卡片保持可用。"),
-            "info": ([], "查看实际开口、最大开口、抓取状态、温度及执行结果。"),
+            "set_position": (["width_mm", "speed_mm_s"], "Move the gripper to the requested opening in millimeters."),
+            "grasp": (["width_mm", "speed_mm_s", "force_n", "min_width_mm", "max_width_mm"],
+                      "Grasp using the target object width and force; retain holding force after completion."),
+            "reset": ([], "Reset by running the existing homing calibration: fully open and close the fingers to measure the maximum opening."),
+            "stopmotion": ([], "Stop the selected gripper and release holding force; keep the card available."),
+            "info": ([], "Read measured and maximum opening, grasp status, temperature and execution results."),
         }, properties)
-        schema["properties"]["target_robot_ip"] = {
-            "type": "string",
-            "description": "填写要执行动作的机械臂 IP，须与已启动卡片的配置一致。",
-        }
-        for action in schema["x-action-params"].values():
-            action["params"].append("target_robot_ip")
-        self._arm_schema(config, schema)
+        self._target_schema(schema)
         schema["x-completion"] = {"actions": list(self.MOTION_ACTIONS), "timeout": 130}
         schema["x-resource"] = "arm"
         schema["x-is-dangerous"] = True
-        schema["x-hooks"] = {key: {"action": "stop"}
+        schema["x-hooks"] = {key: {"action": "stopmotion"}
                              for key in ("on_interrupt_motion", "on_interrupt_all")}
-        return [{**tool(self.PREFIX, "actuator", "Franka 夹爪：开口宽度、抓取、标定与停止。", schema),
-                 "multiInstance": True, "configSchema": config}]
-
-    def _topic(self, instance_id):
-        return [{"topic": f"/{self._namespace}/{instance_id.replace('-', '_')}/state/gripper",
-                 "format": "data/json"}]
+        return [{**tool(self.PREFIX, "actuator", "Franka gripper: opening, grasp, reset calibration and confirmed stop.", schema),
+                 "multiInstance": False, "topic_out": self._status_topic()}]
 
     def _info(self, instance_id, instance):
         snapshot = instance.session.snapshot() if instance.session is not None else {}
@@ -127,9 +114,6 @@ class GripperPlugin(JointControlPlugin):
     def _dispatch(self, action, args):
         if args.get("_tool_name", action) != self.PREFIX:
             return None
-        if action in (*self.MOTION_ACTIONS, "stopmotion") or (
-                action in ("info", "stop") and "output_topic" in args):
-            args = self._resolve_card(args)
         if action == "stop" and not args.get("instance_id"):
             # Interrupt only in-flight commands. A completed grasp keeps holding.
             with self._lock:
@@ -168,24 +152,25 @@ class GripperPlugin(JointControlPlugin):
             if getattr(instance, "configuration_error", None):
                 raise RuntimeError("Resolve this card's rejected configuration before motion: "
                                    + instance.configuration_error)
+            self._check_execution(args.get("_execution_epoch", self._execution_epoch))
             options = {"timeout_s": 120}
-            if action != "homing":
+            if action != "reset":
                 options.update(
                     width_m=self._number(args.get("width_mm"), "width_mm", 0, 80) / 1000,
-                    speed_m_s=self._number(args.get("speed_mm_s", instance.config["speed_mm_s"]),
+                    speed_m_s=self._number(args.get("speed_mm_s"),
                                            "speed_mm_s", 0.1, 100) / 1000,
-                    speed_source="argument" if "speed_mm_s" in args else "config")
+                    speed_source="argument")
             if action == "grasp":
-                options.update(
-                    force_n=self._number(args.get("force_n", instance.config["force_n"]), "force_n", 30, 70),
-                    epsilon_inner_m=self._number(args.get("epsilon_inner_mm", 5), "epsilon_inner_mm", 0, 80) / 1000,
-                    epsilon_outer_m=self._number(args.get("epsilon_outer_mm", 5), "epsilon_outer_mm", 0, 80) / 1000)
-            action_id = session.command(self._owner_key(instance_id), action, **options)
+                options.update(self._grasp_options(args))
+            action_id = session.command(self._owner_key(instance_id), "homing" if action == "reset" else action, **options)
             instance.last_action_id = action_id
             instance.acp = {"action_id": action_id, "state": "waiting_for_motion"}
+            self._status_event("running", action=action, action_id=action_id,
+                               robot_ip=instance.config.get("robot_ip"),
+                               result={"action": action, "parameters": dict(options)})
             threading.Thread(target=self._complete, args=(instance, session, action_id),
                              name=f"franka-gripper-acp-{instance_id}", daemon=True).start()
             return {"state": "running", "action_id": action_id, "action": action,
-                    "target_width_mm": None if action == "homing" else options["width_m"] * 1000,
-                    "speed_mm_s": None if action == "homing" else options["speed_m_s"] * 1000,
+                    "target_width_mm": None if action == "reset" else options["width_m"] * 1000,
+                    "speed_mm_s": None if action == "reset" else options["speed_m_s"] * 1000,
                     "speed_source": options.get("speed_source")}

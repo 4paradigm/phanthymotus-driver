@@ -35,7 +35,7 @@ def rpc():
 
 def invoke(rpc, action, **args):
     response = rpc("tools/call", {"name": "joint_control", "arguments": {
-        "action": action, "instance_id": "http_card", **args}})
+        "action": action, "robot_ip": "172.16.0.3", "speed_deg_s": 5, **args}})
     assert "error" not in response, response
     result = response["result"]
     assert not result.get("isError"), result
@@ -48,7 +48,8 @@ def test_mcp_schema_lifecycle_and_confirmed_stop(rpc):
     tool = next(t for t in request("tools/list")["result"]["tools"]
                 if t["name"] == "joint_control")
     assert tool["type"] == "actuator"
-    assert "robot_ip" not in tool["configSchema"].get("required", [])
+    assert "configSchema" not in tool
+    assert tool["multiInstance"] is False
     assert not fixture.sessions
     invoke(request, "config", robot_ip="172.16.0.3")
     assert not fixture.sessions
@@ -64,7 +65,7 @@ def test_invalid_motion_is_mcp_error_without_submission(rpc):
     invoke(request, "config", robot_ip="172.16.0.3")
     invoke(request, "start")
     response = request("tools/call", {"name": "joint_control", "arguments": {
-        "action": "set", "instance_id": "http_card", "joint1_deg": 100,
+        "action": "set", "robot_ip": "172.16.0.3", "joint1_deg": 100,
         "speed_deg_s": 0.1}})
     assert "error" in response or response.get("result", {}).get("isError"), response
     assert fixture.sessions[0].moves == []

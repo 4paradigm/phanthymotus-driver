@@ -73,32 +73,33 @@ limits do not model obstacles in the workcell.
 
 ## Franka Hand
 
-Start `gripper` after selecting its controller. Starting reads the opening.
+`joint_control` and `gripper` are single-instance cards with no configuration panel.
+Select `arm` and enter speed, force and other parameters directly in each action.
+Without a workstation arm mapping, enter `robot_ip` in the action instead.
+The first execution connects and waits up to five seconds for fresh, control-ready
+feedback before submitting motion. Offline or unsafe states still reject motion.
 
 | Action | Parameters |
 | --- | --- |
-| `set_position` | Total finger spacing in mm and optional speed in mm/s. |
-| `grasp` | Expected object width, optional speed, force in N, and width tolerances. |
-| `homing` | Calibrates the opening range by moving the fingers. |
+| `set_position` | Total finger spacing in mm and speed in mm/s. |
+| `grasp` | Expected object width, speed, force in N, and optional opening bounds. |
+| `reset` | Calibrates the opening range by moving the fingers. |
 | `stopmotion` | Requests a confirmed stop and may release a held object. |
 
 The width limit is the smaller of 80 mm and the measured maximum opening.
-Speed defaults to 20 mm/s (range 0.1–100). Force defaults to 30 N (range 30–70)
-and applies to `grasp`. The `info` action reports the current and maximum opening.
+Speed must be supplied for each opening/grasp action (range 0.1–100 mm/s). Grasp requires force (30–70 N). The `info` action reports the current and maximum opening.
 
-The motion cards expose command responses and ACP completion events.
-On canvases that omit the instance ID, enter `target_robot_ip` when executing
-an action. It must match exactly one started card of that type. Motion cards
-do not advertise or publish status streams. Re-add existing motion cards
-if their saved canvas layout still contains an old output topic.
+## Action feedback
 
-## Action completion
+Motion calls return `state=running` and a unique `action_id`. On termination,
+the driver posts `completed`, `cancelled`, or `error` to `/api/acp/complete`
+using the same ID and verifies HTTPS with `AGENT_CORE_CA_CERT`.
 
-Joint `set` and `jog`, and gripper `set_position`, `grasp`, and `homing`,
-return an `action_id` and report `completed`, `cancelled`, or `error` to Core
-at `/api/acp/complete`. The driver uses the read-only Core CA at
-`AGENT_CORE_CA_CERT` to verify HTTPS. Match the motion result and
-`acp.state=accepted` by action ID when verifying completion.
+**View data stream** shows the latest motion result, ACP delivery status,
+recent events and available measurements. Activity receives start and terminal
+notifications through `/api/event`. On authenticated hosts, provision the
+event credential separately in a restricted file at `/run/franka/event-token`
+or set `AGENT_CORE_EVENT_TOKEN_FILE` to its path.
 
 ## External RealSense camera
 
@@ -130,8 +131,16 @@ Confirm fresh joint state, the three camera channels and USB reconnect,
 then verify arm and gripper motion, stop behavior, and ACP acknowledgement
 with the operator monitoring the workcell.
 
-With `motion_arm_ips` configured, select the arm in each action. Multiple
-cards can start without binding a side. Each arm accepts one in-flight action
-per control type. Set the controller addresses under `motion_arm_ips.left`
-and `motion_arm_ips.right`. When the canvas omits the card ID, use matching
-card defaults or supply the differing parameters in the action.
+With `motion_arm_ips` configured, each action selects the left or right arm.
+Each arm accepts one in-flight action per control type. The workstation mapping
+is stored under `motion_arm_ips.left` and `motion_arm_ips.right` in the driver
+configuration; it is not a canvas card configuration.
+
+## Grasp limits
+
+Grasp requires `width_mm`, `speed_mm_s` and `force_n`; missing fields are listed
+in the error before connecting to hardware. Optional `min_width_mm` and
+`max_width_mm` are absolute opening bounds. A 20 mm target with bounds 18 and
+22 mm is converted to SDK inner/outer tolerances of 2 mm each (total span 4 mm).
+An omitted lower/upper bound uses target minus/plus 5 mm, bounded to 0–80 mm.
+The limits describe acceptable grasp width, not extra move commands.

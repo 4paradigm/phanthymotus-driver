@@ -28,37 +28,37 @@ class ExtCameraPlugin:
         options = {device["path"]: f"{device['name']} ({device['serial_number']})"
                    for device in self._available_devices}
         selection = {
-            "type": "string", "title": "相机", "scope": "instance",
+            "type": "string", "title": "Camera", "scope": "instance",
             "x-sensitive": True,
-            "description": "按相机序列号选择；同一相机可添加多张卡分别显示不同通道。",
+            "description": "Select a camera by serial number. Multiple cards can share a camera with different channels.",
         }
         with self._lock:
             for cfg in self._instance_configs.values():
                 path = cfg["device_path"]
-                options.setdefault(path, f"已配置 · {path.removeprefix('realsense://')}（暂未发现）")
+                options.setdefault(path, f"Configured: {path.removeprefix('realsense://')} (currently unavailable)")
         selection["oneOf"] = [
             {"const": path, "title": title} for path, title in sorted(options.items())
-        ] or [{"const": "", "title": "无可用 RealSense 相机"}]
+        ] or [{"const": "", "title": "No RealSense camera available"}]
         channel = {
-            "type": "string", "title": "通道", "scope": "instance", "default": "rgb",
+            "type": "string", "title": "Channel", "scope": "instance", "default": "rgb",
             "enum": list(shared_camera.CHANNELS),
-            "description": "深度单位为毫米（0 无效，未对齐 RGB）；近红外为灰度图。运行中保存配置会切换当前实例；关闭预览不会停止采集。",
+            "description": "Depth is in millimeters (0 is invalid; not aligned to RGB). Infrared is grayscale. Saving configuration switches this instance; closing the preview does not stop capture.",
             "oneOf": [
-                {"const": "rgb", "title": "彩色（RGB）"},
-                {"const": "depth", "title": "深度（距离）"},
-                {"const": "infrared", "title": "近红外（黑白，非热成像）"},
+                {"const": "rgb", "title": "Color (RGB)"},
+                {"const": "depth", "title": "Depth (distance)"},
+                {"const": "infrared", "title": "Near infrared (grayscale, not thermal)"},
             ],
         }
         return [{
             "name": self.PREFIX, "type": "sensor", "multiInstance": True,
-            "description": "外接 RealSense 相机：每张卡独立选择相机及彩色、深度或近红外通道。",
+            "description": "External RealSense camera: select a device and RGB, depth or infrared channel per card.",
             "inputSchema": {"type": "object", "properties": {}},
             "configSchema": {
                 "type": "object", "required": ["device_path"],
                 "properties": {"device_path": selection, "channel": channel},
             },
             "topic_in": [],
-            "topic_out": [{"desc": "当前通道；话题及格式由实例 info 返回"}],
+            "topic_out": [{"desc": "Current channel; instance info supplies the topic and format"}],
         }]
 
     def start(self):

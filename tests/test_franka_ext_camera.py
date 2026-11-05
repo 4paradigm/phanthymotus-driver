@@ -123,8 +123,8 @@ class FrankaExtCameraTests(unittest.TestCase):
         for field in ("device_path", "channel"):
             self.assertEqual(props[field]["scope"], "instance")
         self.assertTrue(props["device_path"]["x-sensitive"])
-        self.assertEqual(props["device_path"]["title"], "相机")
-        self.assertEqual(props["channel"]["title"], "通道")
+        self.assertEqual(props["device_path"]["title"], "Camera")
+        self.assertEqual(props["channel"]["title"], "Channel")
         self.assertEqual(props["channel"]["enum"], ["rgb", "depth", "infrared"])
         self.assertEqual(props["channel"]["default"], "rgb")
         self.assertEqual({option["const"] for option in props["device_path"]["oneOf"]},

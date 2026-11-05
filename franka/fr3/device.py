@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import queue
 import re
 import threading
 import time
@@ -391,96 +392,286 @@ class JointControlPlugin(FrankaPlugin):
     PUBLISH_STATE = False
 
     PREFIX = "joint_control"
-    ARM_ACTIONS = ("set", "jog", "stopmotion", "Stop")
+    MOTION_ACTIONS = ("set", "jog")
+    READY_TIMEOUT = 5.0
     CONFIG_FIELDS = FrankaPlugin.CONFIG_FIELDS + ("speed_deg_s",)
 
-    def __init__(self, *args, acp_callback=None, **kwargs):
+    def __init__(self, *args, acp_callback=None, activity_callback=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._acp_callback = acp_callback or self._post_completion
         config = args[0] if args else kwargs.get("config", {})
         self._arm_ips = {side: canonical_ip(ip) for side, ip in config.get("motion_arm_ips", {}).items()}
         if self._arm_ips and (set(self._arm_ips) != {"left", "right"} or len(set(self._arm_ips.values())) != 2):
             raise ValueError("motion_arm_ips requires distinct left and right IPs")
-        self._arm_lock = threading.RLock()
-        self._armed_cards = set()
-        self._arm_settings = {}
+        self._enabled = True
+        self._execution_epoch = 0
+        self._stopping = False
+        self._status_publisher = None
+        self._status_lock = threading.RLock()
+        self._status_events = []
+        self._status_sequence = 0
+        self._status_error = None
+        self._activity_callback = activity_callback or self._post_activity
+        self._activity_queue = queue.Queue(maxsize=64)
+        self._activity_thread = None
 
-    def _arm_schema(self, config, schema):
-        if not self._arm_ips:
-            return
-        for key in ("robot_ip", "manual_robot_ip"):
-            config["properties"].pop(key, None)
-        schema["properties"].pop("target_robot_ip", None)
-        schema["properties"]["arm"] = {"type": "string", "enum": ["left", "right"],
-                                       "description": "按 Franka 自身方向选择左臂或右臂。"}
-        for action in schema["x-action-params"].values():
-            action["params"].remove("target_robot_ip")
-            action["params"].append("arm")
+    def _activity_worker(self):
+        while True:
+            event = self._activity_queue.get()
+            try:
+                if event is None:
+                    return
+                self._activity_callback(event)
+            except Exception as exc:
+                log.warning("%s Activity delivery failed: %s", self.PREFIX, str(exc)[:200])
+            finally:
+                self._activity_queue.task_done()
 
-    def _dispatch_arm(self, action, args):
-        """Route by the action's side, independently of canvas layout."""
-        key = args.get("instance_id")
-        if action in ("config", "start", "info", "stop") and key:
-            with self._arm_lock:
-                if action in ("config", "start"):
-                    previous = self._arm_settings.get(key, {})
-                    settings = {**previous, **{k: args[k] for k in self.CONFIG_FIELDS
-                                if k in args and k not in ("robot_ip", "manual_robot_ip", "publish_hz")}}
-                    self._validate(settings)
-                    if key in self._armed_cards and settings != previous:
-                        raise ValueError("停止卡片后再修改默认参数")
-                    self._arm_settings[key] = settings
-                    if action == "start":
-                        self._armed_cards.add(key)
-                elif action == "stop" and key in self._armed_cards:
-                    for side in self._arm_ips:
-                        self._dispatch("stop", {**args, "instance_id": f"arm_{side}"})
-                    self._armed_cards.remove(key)
-                return {"state": "ready" if key in self._armed_cards else "idle", "topic_out": []}
-        if action not in self.ARM_ACTIONS:
-            return self._dispatch(action, args)
-        with self._arm_lock:
-            side = args.get("arm")
-            if side is None and action == "stopmotion" and not key:
-                return self._dispatch(action, args)
-            if not isinstance(side, str) or side not in self._arm_ips:
-                raise ValueError("Select left or right before executing")
-            if not self._armed_cards or (key and key not in self._armed_cards):
-                raise ValueError("Start the control card before executing")
-            instance_id = f"arm_{side}"
-            forwarded = {k: v for k, v in args.items() if k not in ("output_topic", "target_robot_ip")}
-            forwarded["instance_id"] = instance_id
-            if action != "stopmotion":
-                options = {}
-                if key:
-                    options = self._arm_settings[key]
-                else:
-                    configs = [self._validate(self._arm_settings[card]) for card in self._armed_cards]
-                    for field in self.CONFIG_FIELDS:
-                        if field in FrankaPlugin.CONFIG_FIELDS:
-                            continue
-                        values = {cfg[field] for cfg in configs}
-                        if len(values) == 1:
-                            options[field] = values.pop()
-                        elif field not in args and (field != "force_n" or action == "grasp") and action != "homing":
-                            raise ValueError(f"卡片默认值不同，请在动作中填写 {field}")
-                # Session configuration is stable while a motion is in flight.
-                # Pass card defaults as action options so the backend arbitrates busy state.
-                for field, value in options.items():
-                    forwarded.setdefault(field, value)
-                self._dispatch("start", {"_tool_name": self.PREFIX, "instance_id": instance_id,
-                                         "robot_ip": self._arm_ips[side]})
-            return self._dispatch(action, forwarded)
+    def _post_activity(self, event):
+        # Use the platform's existing event API; ACP completion remains separate.
+        import os
+        import ssl
+        import urllib.request
+        ca = os.environ.get("AGENT_CORE_CA_CERT")
+        if not ca:
+            raise RuntimeError("AGENT_CORE_CA_CERT is required for Activity feedback")
+        headers = {"Content-Type": "application/json"}
+        token_file = os.environ.get("AGENT_CORE_EVENT_TOKEN_FILE", "/run/franka/event-token")
+        if Path(token_file).is_file():
+            token = Path(token_file).read_text().strip()
+            if token:
+                headers["Authorization"] = "Bearer " + token
+        # Activity displays trigger.text verbatim; retain the complete protocol
+        # record rather than shortening it to a state label or bracketed ID.
+        record = {"status": event.get("status", event["state"]),
+                  "action_id": event.get("action_id"), "tool": self.PREFIX, **event}
+        message = json.dumps(record, ensure_ascii=False, allow_nan=False)
+        body = {"source": "mcp:franka-fr3:" + self.PREFIX, "text": message,
+                "payload": {"type": "motion_feedback", **record}}
+        context = ssl.create_default_context(cafile=ca)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                             urllib.request.HTTPSHandler(context=context))
+        url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+        request = urllib.request.Request(url + "/api/event", data=json.dumps(body, allow_nan=False).encode(),
+                                         headers=headers, method="POST")
+        with opener.open(request, timeout=3) as response:
+            result = json.load(response)
+        if result.get("code") != 200:
+            raise RuntimeError("Platform did not accept Activity feedback")
+
+    def _status_topic(self):
+        return [{"topic": f"/{self._namespace}/{self.PREFIX}/status", "format": "data/json"}]
+
+    def start(self):
+        # One read-only publisher for the singleton card; no hardware connection.
+        with self._status_lock:
+            if not self._closed and self._activity_thread is None:
+                self._activity_thread = threading.Thread(target=self._activity_worker,
+                    name="franka-activity-" + self.PREFIX, daemon=True)
+                self._activity_thread.start()
+            if not self._closed and self._status_publisher is None:
+                self._status_publisher = self._publisher_factory(
+                    self._status_topic()[0]["topic"], 5, self._publish_status)
+
+    def stop(self):
+        try:
+            super().stop()
+        finally:
+            with self._status_lock:
+                publisher, self._status_publisher = self._status_publisher, None
+            if publisher is not None:
+                publisher.close()
+            if self._activity_thread is not None:
+                try:
+                    self._activity_queue.put_nowait(None)
+                except queue.Full:
+                    pass
+                self._activity_thread.join(timeout=.5)
+
+    def _status_event(self, state, **fields):
+        with self._status_lock:
+            self._status_sequence += 1
+            self._status_events.append({"sequence": self._status_sequence,
+                "timestamp_ms": int(time.time() * 1000), "ts": time.time(),
+                "tool": self.PREFIX, "state": state,
+                **({"status": state} if state in ("completed", "error", "cancelled") else {}), **fields})
+            del self._status_events[:-32]
+            if state in ("running", "completed", "error", "cancelled", "stopped"):
+                try:
+                    self._activity_queue.put_nowait(dict(self._status_events[-1]))
+                except queue.Full:
+                    log.warning("%s Activity queue full; event retained in status stream", self.PREFIX)
+        self._publish_status()
+
+    def _publish_status(self):
+        try:
+            with self._lock:
+                instances = list(self._instances.items())
+            robots = [self._info(key, instance) for key, instance in instances]
+            with self._status_lock:
+                if self._status_publisher is None:
+                    return
+                visible = [event for event in self._status_events
+                           if event["state"] not in ("acp_accepted", "acp_failed")]
+                latest = dict(visible[-1]) if visible else {"state": "ready"}
+                delivery = next((dict(event) for event in reversed(self._status_events)
+                                 if event["state"] in ("acp_accepted", "acp_failed")
+                                 and event.get("action_id") == latest.get("action_id")), None)
+                self._status_publisher.publish({"tool": self.PREFIX,
+                    "timestamp_ms": int(time.time() * 1000), "latest": latest,
+                    "acp_delivery": delivery, "events": list(self._status_events), "robots": robots})
+                self._status_error = None
+        except Exception as exc:
+            # A viewer failure must not break the ROS executor or alter motion results.
+            self._status_error = str(exc)[:240]
+            log.warning("%s status publication failed: %s", self.PREFIX, self._status_error)
 
     def dispatch(self, action, args):
         if args.get("_tool_name", action) != self.PREFIX:
             return None
+        motion = action in self.MOTION_ACTIONS
+        try:
+            if action == "start":
+                self.start()
+            if motion:
+                self._status_event("preparing", action=action, arm=args.get("arm"),
+                                   robot_ip=args.get("robot_ip"))
+            result = self._dispatch_request(action, args)
+            if result is not None:
+                result["topic_out"] = self._status_topic()
+                if self._status_error:
+                    result["status_stream_error"] = self._status_error
+            if action in ("stop", "stopmotion"):
+                self._status_event("stopped", action=action, arm=args.get("arm"))
+            return result
+        except Exception as exc:
+            if motion or action in ("stop", "stopmotion"):
+                self._status_event("error", action=action, arm=args.get("arm"), error=str(exc))
+            raise
+
+
+    def _target_schema(self, schema):
+        key = "arm" if self._arm_ips else "robot_ip"
+        schema["properties"][key] = (
+            {"type": "string", "title": "Arm", "enum": ["left", "right"],
+             "description": "Select the arm from the robot's own perspective."}
+            if self._arm_ips else
+            {"type": "string", "title": "Robot IP", "x-sensitive": True,
+             "description": "Controller IP address for this action."})
+        for definition in schema["x-action-params"].values():
+            definition["params"].insert(0, key)
+
+    def _target_ip(self, args):
         if self._arm_ips:
-            return self._dispatch_arm(action, args)
-        return self._dispatch(action, args)
+            side = args.get("arm")
+            if not isinstance(side, str) or side not in self._arm_ips:
+                raise ValueError("Select left or right before executing")
+            return self._arm_ips[side]
+        return canonical_ip(args.get("robot_ip"))
+
+    def _check_execution(self, epoch):
+        if self._closed or not self._enabled or self._stopping or epoch != self._execution_epoch:
+            raise RuntimeError("Execution cancelled; start the card before trying again")
+
+    def _await_ready(self, instance, epoch):
+        # First execution connects and waits for a real sample in the same call.
+        # Never replace missing/stale measurements with a target or a cached pose.
+        deadline = time.monotonic() + self.READY_TIMEOUT
+        while True:
+            self._check_execution(epoch)
+            snapshot = instance.session.snapshot() if instance.session is not None else {}
+            if snapshot.get("connected") and snapshot.get("control_ready"):
+                return
+            if snapshot.get("connected") and snapshot.get("control_error"):
+                raise RuntimeError(snapshot["control_error"])
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Robot did not become ready within " + str(self.READY_TIMEOUT)
+                                   + " s: " + str(snapshot.get("error") or "no fresh state received"))
+            time.sleep(0.02)
+
+    def _stop_all(self, release=False):
+        with self._lock:
+            self._execution_epoch += 1
+            self._stopping = True
+            if release:
+                self._enabled = False
+            instances = list(self._instances.items())
+        outcomes, errors = [], []
+        try:
+            for key, instance in instances:
+                try:
+                    if release or (instance.session is not None and
+                            instance.session.motion().get("status") in
+                            ("submitted", "accepted", "queued", "running", "stopping")):
+                        outcomes.append(self._dispatch("stop" if release else "stopmotion",
+                            {"_tool_name": self.PREFIX, "instance_id": key}))
+                except Exception as exc:
+                    errors.append(str(exc))
+            if errors:
+                raise RuntimeError("Stop was not confirmed: " + "; ".join(errors))
+            return {"state": "idle" if release else "ready", "robots": outcomes, "topic_out": []}
+        finally:
+            with self._lock:
+                self._stopping = False
+
+    def _dispatch_request(self, action, args):
+        if args.get("_tool_name", action) != self.PREFIX:
+            return None
+        if action == "Stop":
+            action = "stopmotion"
+        if action in ("config", "start"):
+            # No saved card configuration: all command parameters are action inputs.
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("Driver is shutting down")
+                if action == "start":
+                    self._enabled = True
+            return {"state": "ready" if self._enabled else "idle", "topic_out": []}
+        if action == "stop":
+            return self._stop_all(release=True)
+        if action == "stopmotion" and not any(args.get(k) for k in ("arm", "robot_ip")):
+            return self._stop_all()
+        if action == "info" and not any(args.get(k) for k in ("arm", "robot_ip")):
+            with self._lock:
+                instances = list(self._instances.items())
+            return {"state": "ready" if self._enabled else "idle", "topic_out": [],
+                    "robots": [self._info(key, instance) for key, instance in instances]}
+        if action not in (*self.MOTION_ACTIONS, "stopmotion", "info"):
+            return None
+        if action in self.MOTION_ACTIONS:
+            required = (["width_mm", "speed_mm_s", "force_n"] if action == "grasp" else
+                        ["width_mm", "speed_mm_s"] if action == "set_position" else
+                        ["joint", "step_deg", "speed_deg_s"] if action == "jog" else
+                        ["speed_deg_s"] if action == "set" else [])
+            missing = [name for name in required if args.get(name) is None or args.get(name) == ""]
+            if missing:
+                raise ValueError("Missing required parameter(s): " + ", ".join(missing))
+            if action == "set" and not any(args.get(f"joint{i}_deg") is not None for i in range(1, 8)):
+                raise ValueError("Missing required parameter: at least one joint1_deg through joint7_deg")
+        if action in self.MOTION_ACTIONS and action != "reset":
+            speed_key, high = ("speed_deg_s", 10) if self.PREFIX == "joint_control" else ("speed_mm_s", 100)
+            self._number(args.get(speed_key), speed_key, 0.1, high)
+        if action == "grasp":
+            self._grasp_options(args)
+        address = self._target_ip(args)
+        key = "robot_" + address.encode("ascii").hex()
+        forwarded = {k: v for k, v in args.items()
+                     if k not in ("instance_id", "output_topic", "target_robot_ip")}
+        forwarded.update(_tool_name=self.PREFIX, instance_id=key)
+        instance = self._get_instance(key)
+        if action in self.MOTION_ACTIONS or (action == "stopmotion" and instance.session is None):
+            epoch = self._execution_epoch
+            self._check_execution(epoch)
+            self._dispatch("start", {"_tool_name": self.PREFIX, "instance_id": key, "robot_ip": address})
+            if action in self.MOTION_ACTIONS:
+                self._await_ready(instance, epoch)
+            forwarded["_execution_epoch"] = epoch
+        return self._dispatch(action, forwarded)
 
     @staticmethod
     def _number(value, name, low=None, high=None):
+        if value is None or value == "":
+            raise ValueError(f"Missing required parameter: {name}")
         error = f"{name} must be a finite number"
         if low is not None and high is not None:
             error += f" from {low:g} to {high:g}"
@@ -503,89 +694,40 @@ class JointControlPlugin(FrankaPlugin):
         return cfg
 
     def get_tools(self):
-        definition = super().get_tools()[0]
-        config = definition["configSchema"]
-        # Official Core actuator click handler may omit instance_id. Its
-        # preflight cannot resolve an instance-scoped required robot_ip then.
-        # Backend still requires configured IP at start and exact card binding
-        # plus fresh, control-ready state before any motion; never guess an IP.
-        config.pop("required", None)
-        config["properties"].pop("publish_hz", None)
-        config["properties"]["speed_deg_s"] = {
-            "type": "number", "title": "默认速度 (度/秒)", "scope": "instance",
-            "minimum": 0.1, "maximum": 10, "default": 5,
-        }
         properties = {
             f"joint{i + 1}_deg": {
-                "type": "number", "title": f"J{i + 1} 目标角度 (度)",
+                "type": "number", "title": f"J{i + 1} target angle (deg)",
                 "minimum": math.degrees(low + JOINT_MARGIN),
                 "maximum": math.degrees(high - JOINT_MARGIN),
-                "description": "绝对角度；留空则保持本次开始时的实际角度。",
+                "description": "Absolute angle; omitted joints keep their measured position at action start.",
             } for i, (low, high) in enumerate(zip(JOINT_LOWER, JOINT_UPPER))
         }
         properties.update({
-            "output_topic": {"type": "string",
-                             "description": "兼容旧画布传入的输出话题，用于识别卡片实例。"},
-            "speed_deg_s": {"type": "number", "title": "速度 (度/秒)",
+            "speed_deg_s": {"type": "number", "title": "Speed (deg/s)",
                             "minimum": 0.1, "maximum": 10,
-                            "description": "各轴速度上限；留空使用卡片默认速度。"},
-            "joint": {"type": "integer", "title": "关节", "enum": list(range(1, 8))},
-            "step_deg": {"type": "number", "title": "点动增量 (度)",
+                            "description": "Required maximum speed per joint; enter a new value for each action."},
+            "joint": {"type": "integer", "title": "Joint", "enum": list(range(1, 8))},
+            "step_deg": {"type": "number", "title": "Jog increment (deg)",
                          "default": 1,
-                         "description": "有符号单次增量，不能为零；每次点击执行一次。"},
+                         "description": "Signed, nonzero increment; one movement per execution."},
         })
         schema = action_schema({
             "set": ([*(f"joint{i}_deg" for i in range(1, 8)), "speed_deg_s"],
-                    "设置一个或多个关节的绝对角度（度）；至少填写一个关节。"),
-            "jog": (["joint", "step_deg", "speed_deg_s"], "单关节点动，按有符号增量移动一次。"),
+                    "Set absolute joint angles in degrees; provide at least one joint."),
+            "jog": (["joint", "step_deg", "speed_deg_s"], "Jog one joint by a signed increment."),
             # Match RealMan's public name; lifecycle "stop" remains internal.
-            "stopmotion": ([], "停止所选机械臂当前运动并保留本控制卡，不需要动作 ID；独立状态卡继续读取。"),
-            "info": ([], "查看实际角度、目标角度、执行状态及控制就绪条件。"),
+            "stopmotion": ([], "Stop the selected arm and keep this card available; no action ID is required."),
+            "info": ([], "Read measured angles, targets, execution status and control readiness."),
         }, properties)
-        schema["properties"]["target_robot_ip"] = {
-            "type": "string",
-            "description": "填写要执行动作的机械臂 IP，须与已启动卡片的配置一致。",
-        }
-        for action in schema["x-action-params"].values():
-            action["params"].append("target_robot_ip")
-        self._arm_schema(config, schema)
+        self._target_schema(schema)
         schema["x-completion"] = {"actions": ["set", "jog"], "timeout": 130}
         schema["x-resource"] = "arm"
         schema["x-is-dangerous"] = True
         schema["x-hooks"] = {key: {"action": "stopmotion"}
                              for key in ("on_interrupt_motion", "on_interrupt_all")}
         return [{**tool(self.PREFIX, "actuator",
-                        "Franka FR3 关节控制：J1–J7 角度设置、单次点动及运动停止。", schema),
-                 "multiInstance": True, "configSchema": config}]
-
-    def _topic(self, instance_id):
-        return [{"topic": f"/{self._namespace}/{instance_id.replace('-', '_')}/state/joint_control",
-                 "format": "data/json"}]
-
-    def _resolve_card(self, args):
-        """Use the existing output-port binding when the canvas omits the ID."""
-        instance_id = args.get("instance_id")
-        topic = args.get("output_topic")
-        target_ip = args.get("target_robot_ip")
-        if "output_topic" in args and (not isinstance(topic, str) or not topic):
-            raise ValueError("output_topic must identify this control card")
-        if instance_id:
-            instance_id = self._instance_id(args)
-            if topic is not None and topic != self._topic(instance_id)[0]["topic"]:
-                raise ValueError("Control card instance_id and output_topic do not match")
-            if target_ip is not None and self._get_instance(instance_id).config.get("robot_ip") != target_ip:
-                raise ValueError("target_robot_ip does not match this card")
-            return args
-        with self._lock:
-            matches = [key for key in self._instances
-                       if (topic is not None or target_ip is not None)
-                       and (topic is None or self._topic(key)[0]["topic"] == topic)
-                       and (target_ip is None or (
-                           self._instances[key].session is not None
-                           and self._instances[key].config.get("robot_ip") == target_ip))]
-        if len(matches) != 1:
-            raise ValueError("Control card identity is missing or unknown; start this card and refresh the canvas")
-        return {**args, "instance_id": matches[0]}
+                        "Franka FR3 joint control: J1-J7 absolute targets, single-step jog and confirmed stop.", schema),
+                 "multiInstance": False, "topic_out": self._status_topic()}]
 
     def _info(self, instance_id, instance):
         snapshot = instance.session.snapshot() if instance.session is not None else {}
@@ -660,7 +802,7 @@ class JointControlPlugin(FrankaPlugin):
         for i, value in enumerate(target):
             if not JOINT_LOWER[i] + JOINT_MARGIN <= value <= JOINT_UPPER[i] - JOINT_MARGIN:
                 raise ValueError(f"J{i + 1} target is outside the allowed joint range")
-        speed = self._number(args.get("speed_deg_s", instance.config["speed_deg_s"]),
+        speed = self._number(args.get("speed_deg_s"),
                              "speed_deg_s", 0.1, 10)
         if not snapshot.get("control_ready"):
             raise RuntimeError(snapshot.get("control_error") or "Robot backend is not ready for motion")
@@ -668,7 +810,7 @@ class JointControlPlugin(FrankaPlugin):
         duration = max(1.0, 2.1875 * distance / math.radians(speed),
                        math.sqrt(7.514 * distance / 0.3), (52.5 * distance) ** (1 / 3))
         if duration + 2.0 > 120:
-            raise ValueError(f"预计轨迹耗时 {duration:.1f} 秒，超过120秒动作限制；请减小角度或自行选择更高速度")
+            raise ValueError(f"Estimated duration {duration:.1f} s exceeds the 120 s limit; reduce the angle or select a higher speed")
         return target, math.radians(speed)
 
     def _complete(self, instance, session, action_id):
@@ -682,11 +824,19 @@ class JointControlPlugin(FrankaPlugin):
                 result = {"status": "failed", "error": f"{exc}; stop failed: {stop_error}"}
             else:
                 result = {"status": "failed", "error": str(exc)}
+        # Preserve terminal measurements alongside the command outcome. They
+        # may be unavailable after a disconnect; never fabricate a final pose.
+        snapshot = session.snapshot()
+        measured = {key: snapshot[key] for key in
+                    ("connected", "data_age_ms", "q", "q_d", "width", "max_width", "is_grasped", "temperature")
+                    if key in snapshot}
+        result = {**result, "feedback": measured}
         status = {"succeeded": "completed", "cancelled": "cancelled"}.get(result.get("status"), "error")
         with instance.lock:
             if getattr(instance, "last_action_id", None) == action_id:
                 instance.last_result = {"action_id": action_id, "status": status, "result": result}
                 instance.acp = {"action_id": action_id, "state": "pending"}
+        self._status_event(status, action_id=action_id, robot_ip=session.address, result=result)
         error = None
         # Completion IDs are idempotent at Core; bounded retry handles transient failures.
         for attempt in range(3):
@@ -702,6 +852,8 @@ class JointControlPlugin(FrankaPlugin):
             if getattr(instance, "last_action_id", None) == action_id:
                 instance.acp = {"action_id": action_id, "state": "failed" if error else "accepted",
                                 "error": error}
+        self._status_event("acp_failed" if error else "acp_accepted", action_id=action_id,
+                           outcome=status, error=error)
 
     def _post_completion(self, action_id, status, result):
         import os
@@ -729,10 +881,6 @@ class JointControlPlugin(FrankaPlugin):
     def _dispatch(self, action, args):
         if args.get("_tool_name", action) != self.PREFIX:
             return None
-        if action in ("set", "jog", "Stop") or (action == "stopmotion" and
-                (args.get("instance_id") or "output_topic" in args or "target_robot_ip" in args)) or (
-                action in ("info", "stop") and "output_topic" in args):
-            args = self._resolve_card(args)
         # Keep old saved canvas actions working without advertising a second stop.
         if action == "Stop":
             action = "stopmotion"
@@ -775,12 +923,17 @@ class JointControlPlugin(FrankaPlugin):
             if "target_robot_ip" in args and instance.config.get("robot_ip") != args["target_robot_ip"]:
                 raise ValueError("target_robot_ip does not match this card")
             if action in ("set", "jog"):
+                self._check_execution(args.get("_execution_epoch", self._execution_epoch))
                 target, speed = self._prepare_target(action, args, instance)
                 session = instance.session
                 action_id = session.move(self._owner_key(instance_id), target,
                                          speed_rad_s=speed, tolerance_rad=math.radians(0.5), timeout_s=120)
                 instance.last_action_id = action_id
                 instance.acp = {"action_id": action_id, "state": "waiting_for_motion"}
+                self._status_event("running", action=action, action_id=action_id,
+                                   robot_ip=instance.config.get("robot_ip"),
+                                   result={"target_deg": [math.degrees(q) for q in target],
+                                           "speed_deg_s": math.degrees(speed)})
                 threading.Thread(target=self._complete, args=(instance, session, action_id),
                                  name=f"franka-acp-{instance_id}", daemon=True).start()
                 return {"state": "running", "action_id": action_id,

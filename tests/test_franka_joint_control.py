@@ -186,7 +186,8 @@ class JointControlTests(unittest.TestCase):
         self.module_patch.start()
         self.addCleanup(self.module_patch.stop)
         self.sessions = []
-        self.publishers = mock.Mock(side_effect=AssertionError("Motion cards must not publish"))
+        self.targets = {}
+        self.publishers = mock.Mock(return_value=mock.Mock())
         self.completions = []
 
         def session_factory(address, **options):
@@ -207,17 +208,26 @@ class JointControlTests(unittest.TestCase):
         }
         self.sensor = device.FrankaPlugin({}, **options)
         self.controller = device.JointControlPlugin(
-            {}, **options, acp_callback=lambda *args: self.completions.append(args),
+            {}, **options, acp_callback=lambda *args: self.completions.append(args), activity_callback=mock.Mock(),
         )
+        self.controller.READY_TIMEOUT = .1
         self.addCleanup(self.controller.stop)
         self.addCleanup(self.sensor.stop)
         self.bundle = DriverBundle([self.sensor, self.controller])
 
     def call(self, action="info", instance_id="control-a", tool="joint_control", **args):
-        return self.bundle.dispatch(tool, {"action": action, "instance_id": instance_id, **args})
+        if action in ("set", "jog"):
+            args.setdefault("speed_deg_s", 5)
+        if instance_id in self.targets:
+            args.setdefault("robot_ip", self.targets[instance_id])
+        return self.bundle.dispatch(tool, {"action": action, **args})
 
     def start(self, instance_id="control-a", ip="172.16.0.3", **args):
-        self.call("start", instance_id, robot_ip=ip, **args)
+        # Attach a ready fake session for tests of an already connected robot.
+        self.targets[instance_id] = ip
+        self.controller.dispatch("start", {"_tool_name": "joint_control"})
+        key = "robot_" + ip.encode("ascii").hex()
+        self.controller._dispatch("start", {"_tool_name": "joint_control", "instance_id": key, "robot_ip": ip})
         return next(session for session in self.sessions if session.address == ip)
 
     def started_move(self, **args):
@@ -240,7 +250,7 @@ class JointControlTests(unittest.TestCase):
         self.assertEqual({"joint_states", "model", "joint_control"}, set(tools))
         spec = tools["joint_control"]
         self.assertEqual("actuator", spec["type"])
-        self.assertTrue(spec["multiInstance"])
+        self.assertFalse(spec["multiInstance"])
         schema = spec["inputSchema"]
         self.assertEqual({"set", "jog"}, set(schema["x-completion"]["actions"]))
         self.assertEqual({"action": "stopmotion"}, schema["x-hooks"]["on_interrupt_motion"])
@@ -252,16 +262,13 @@ class JointControlTests(unittest.TestCase):
         self.assertEqual(1, schema["properties"]["action"]["enum"].count("stopmotion"))
         self.assertNotIn("stop", schema["properties"]["action"]["enum"])
         self.assertNotIn("action_id", schema["properties"])
-        self.assertEqual(["target_robot_ip"], schema["x-action-params"]["stopmotion"]["params"])
-        self.assertFalse(spec.get("topic_out"))
-        self.assertNotIn("robot_ip", spec["configSchema"].get("required", []))
+        self.assertEqual(["robot_ip"], schema["x-action-params"]["stopmotion"]["params"])
+        self.assertEqual("data/json", spec["topic_out"][0]["format"])
+        self.assertNotIn("configSchema", spec)
         self.assertIn("robot_ip", tools["joint_states"]["configSchema"]["required"])
-        self.assertEqual("string", schema["properties"]["output_topic"]["type"])
-        config = spec["configSchema"]["properties"]
-        self.assertEqual("instance", config["robot_ip"]["scope"])
-        self.assertTrue(config["robot_ip"]["x-sensitive"])
-        self.assertTrue(config["manual_robot_ip"]["x-sensitive"])
-        self.assertEqual(5, config["speed_deg_s"]["default"])
+        self.assertNotIn("output_topic", schema["properties"])
+        self.assertTrue(schema["properties"]["robot_ip"]["x-sensitive"])
+        self.assertNotIn("default", schema["properties"]["speed_deg_s"])
         self.assertEqual(0.1, schema["properties"]["speed_deg_s"]["minimum"])
         self.assertEqual(10, schema["properties"]["speed_deg_s"]["maximum"])
         self.assertNotIn("minimum", schema["properties"]["step_deg"])
@@ -269,6 +276,66 @@ class JointControlTests(unittest.TestCase):
         self.assertEqual(1, schema["properties"]["step_deg"]["default"])
         self.assertEqual("sensor", tools["joint_states"]["type"])
         self.assertEqual("resource", tools["model"]["type"])
+
+    def test_first_execution_waits_for_sample_and_can_be_cancelled(self):
+        ready = threading.Event()
+        original = FakeSession.snapshot
+        def snapshot(session):
+            return original(session) if ready.is_set() else {"connected": False}
+        timer = threading.Timer(.04, ready.set)
+        timer.start()
+        try:
+            with mock.patch.object(FakeSession, "snapshot", snapshot):
+                result = self.bundle.dispatch("joint_control", {
+                    "action": "jog", "robot_ip": "172.16.0.3", "joint": 1, "step_deg": 1, "speed_deg_s": 5})
+            self.assertEqual("running", result["state"])
+            self.sessions[0].finish(result["action_id"])
+            self.assertEqual("completed", self.completed(result["action_id"])[1])
+        finally:
+            timer.join(1)
+        self.controller._stop_all(release=True)
+        with self.assertRaises(RuntimeError):
+            self.bundle.dispatch("joint_control", {
+                "action": "jog", "robot_ip": "172.16.0.3", "joint": 1, "step_deg": 1, "speed_deg_s": 5})
+
+    def test_missing_speed_rejected_and_status_stream_retains_start_and_end(self):
+        for speed in (None, "", True):
+            with self.assertRaises(ValueError):
+                self.bundle.dispatch("joint_control", {"action": "set", "robot_ip": "172.16.0.3",
+                    "joint1_deg": 1, **({} if speed is None else {"speed_deg_s": speed})})
+        self.assertEqual([], self.sessions)
+        self.controller.start()
+        session, action_id = self.started_move()
+        session.finish(action_id)
+        self.completed(action_id)
+        wait_for(lambda: any(e["state"] == "acp_accepted" for e in self.controller._status_events))
+        states = [e["state"] for e in self.controller._status_events if e.get("action_id") == action_id]
+        self.assertIn("running", states)
+        self.assertIn("completed", states)
+        self.controller._publish_status()
+        payload = self.publishers.return_value.publish.call_args.args[0]
+        self.assertEqual("completed", payload["latest"]["status"])
+        self.assertEqual(action_id, payload["acp_delivery"]["action_id"])
+        self.assertEqual("joint_control", payload["tool"])
+
+    def test_acp_wire_payload_matches_readme(self):
+        import io
+        import json
+        requests = []
+        opener = mock.Mock()
+        def respond(request, timeout):
+            requests.append(json.loads(request.data))
+            self.assertEqual("POST", request.get_method())
+            self.assertTrue(request.full_url.endswith("/api/acp/complete"))
+            return io.BytesIO(b'{"ok":true,"action_id":"action-test"}')
+        opener.open.side_effect = respond
+        with mock.patch.dict("os.environ", {"AGENT_CORE_CA_CERT": "/test/ca.pem"}), mock.patch("ssl.create_default_context"), mock.patch("urllib.request.build_opener", return_value=opener):
+            for status in ("completed", "error", "cancelled"):
+                self.controller._post_completion("action-test", status, {"measured": True})
+        self.assertEqual(["completed", "error", "cancelled"], [r["status"] for r in requests])
+        for payload in requests:
+            self.assertEqual({"action_id", "status", "result", "tool", "ts"}, set(payload))
+            self.assertEqual("joint_control", payload["tool"])
 
     def test_schema_limits_leave_the_backend_margin_inside_all_seven_urdf_joints(self):
         schema = next(item for item in self.controller.get_tools() if item["name"] == "joint_control")["inputSchema"]
@@ -282,92 +349,16 @@ class JointControlTests(unittest.TestCase):
             self.assertAlmostEqual(math.degrees(float(limit.attrib["lower"]) + 0.01), prop["minimum"], places=4)
             self.assertAlmostEqual(math.degrees(float(limit.attrib["upper"]) - 0.01), prop["maximum"], places=4)
 
-    def test_canvas_topic_routes_each_control_card_to_its_own_ip(self):
-        first = self.start("control-a", "172.16.0.2")
-        second = self.start("control-b", "172.16.0.3")
-        for key, session, degrees in (("control-a", first, 1), ("control-b", second, 2)):
-            topic = self.controller._topic(key)[0]["topic"]
-            result = self.bundle.dispatch("joint_control", {
-                "action": "jog", "output_topic": topic, "joint": 1, "step_deg": degrees,
-            })
-            self.assertEqual(("joint_control", key), session.moves[-1]["owner"])
-            self.assertAlmostEqual(math.radians(degrees), session.moves[-1]["target_rad"][0])
-            info = self.bundle.dispatch("joint_control", {"action": "info", "output_topic": topic})
-            self.assertEqual(session.address, info["robot_ip"])
-            session.finish(result["action_id"])
-            self.completed(result["action_id"])
-        self.assertEqual(1, len(first.moves))
-        self.assertEqual(1, len(second.moves))
-
-    def test_canvas_stop_only_stops_the_card_bound_to_its_output_port(self):
-        first = self.start("control-a", "172.16.0.2")
-        second = self.start("control-b", "172.16.0.3")
-        a = self.call("set", "control-a", joint1_deg=1)
-        b = self.call("set", "control-b", joint1_deg=1)
-        topic = self.controller._topic("control-b")[0]["topic"]
-        result = self.bundle.dispatch("joint_control", {"action": "stopmotion", "output_topic": topic})
-        self.assertEqual("ready", result["state"])
-        self.assertEqual("cancelled", self.completed(b["action_id"])[1])
-        self.assertEqual([], first.stops)
-        self.assertEqual("running", first.motion()["status"])
-        self.assertEqual([(None, None)], second.stops)
-        first.finish(a["action_id"])
-        self.completed(a["action_id"])
-
-    def test_missing_unknown_or_conflicting_card_binding_never_selects_an_arm(self):
-        first = self.start("control-a", "172.16.0.2")
-        second = self.start("control-b", "172.16.0.3")
-        topic = self.controller._topic("control-b")[0]["topic"]
-        bindings = [{}, {"output_topic": ""}, {"output_topic": 42},
-                    {"output_topic": topic + "/stale"},
-                    {"instance_id": "control-a", "output_topic": topic}]
-        for action in ("set", "jog", "stopmotion", "Stop"):
-            for binding in bindings:
-                if action == "stopmotion" and not binding:
-                    continue  # Driver-wide interrupt hook explicitly stops all arms.
-                with self.subTest(action=action, binding=binding), self.assertRaises(ValueError):
-                    self.bundle.dispatch("joint_control", {"action": action, **binding,
-                        "joint1_deg": 1, "joint": 1, "step_deg": 1})
-        for session in (first, second):
-            self.assertEqual([], session.moves)
-            self.assertEqual([], session.stops)
-
-    def test_topic_binding_does_not_bypass_start_or_required_robot_ip(self):
-        with self.assertRaisesRegex(ValueError, "robot_ip is required"):
-            self.call("start")
-        self.assertEqual([], self.sessions)
-        self.call("config", robot_ip="172.16.0.3")
-        topic = self.controller._topic("control-a")[0]["topic"]
-        with self.assertRaisesRegex(RuntimeError, "Start this joint_control card"):
-            self.bundle.dispatch("joint_control", {"action": "set", "output_topic": topic, "joint1_deg": 1})
-        self.assertEqual([], self.sessions)
-
-    def test_rejected_configuration_blocks_topic_motion_using_old_ip(self):
-        session = self.start()
-        topic = self.controller._topic("control-a")[0]["topic"]
-        for ip in ("172.16.0.2", "invalid-ip"):
-            with self.subTest(ip=ip):
-                with self.assertRaises(ValueError):
-                    self.call("config", robot_ip=ip)
-                self.assertFalse(self.call()["control_ready"])
-                with self.assertRaisesRegex(RuntimeError, "rejected configuration"):
-                    self.bundle.dispatch("joint_control", {
-                        "action": "set", "output_topic": topic, "joint1_deg": 1})
-                self.assertEqual([], session.moves)
-                self.call("config", robot_ip="172.16.0.3")
-                self.assertTrue(self.call()["control_ready"])
-        self.assertEqual(1, len(self.sessions))
-
     def test_set_converts_units_and_omitted_joints_keep_actual_positions(self):
-        session = self.start(speed_deg_s=2)
+        session = self.start()
         original = session.snapshot()["q"]
-        result = self.call("set", joint1_deg=10, joint3_deg=-20)
+        result = self.call("set", joint1_deg=10, joint3_deg=-20, speed_deg_s=2)
         command = session.moves[0]
         expected = list(original)
         expected[0], expected[2] = math.radians(10), math.radians(-20)
         self.assertEqual(expected, command["target_rad"])
         self.assertAlmostEqual(math.radians(2), command["speed_rad_s"])
-        self.assertEqual(("joint_control", "control-a"), command["owner"])
+        self.assertEqual(("joint_control", "robot_" + session.address.encode("ascii").hex()), command["owner"])
         self.assertAlmostEqual(math.radians(0.5), command["tolerance_rad"])
         self.assertEqual(120, command["timeout_s"])
         self.assertEqual(result["action_id"], command["action_id"])
@@ -380,15 +371,14 @@ class JointControlTests(unittest.TestCase):
 
     def test_canvas_jog_accepts_large_signed_steps_for_each_joint(self):
         session = self.start()
-        topic = self.controller._topic("control-a")[0]["topic"]
         for joint in range(1, 8):
             for step in (15, -15):
                 with self.subTest(joint=joint, step=step):
                     expected = session.snapshot()["q"]
                     expected[joint - 1] += math.radians(step)
                     result = self.bundle.dispatch("joint_control", {
-                        "action": "jog", "output_topic": topic,
-                        "joint": str(joint), "step_deg": step,
+                        "action": "jog", "robot_ip": session.address,
+                        "joint": str(joint), "step_deg": step, "speed_deg_s": 5,
                     })
                     self.assertEqual(expected, session.moves[-1]["target_rad"])
                     session.finish(result["action_id"])
@@ -431,7 +421,7 @@ class JointControlTests(unittest.TestCase):
         ]
         for change in variants:
             session.value = {**copy.deepcopy(original), **change}
-            with self.subTest(change=change), self.assertRaises((ValueError, RuntimeError, PermissionError)):
+            with self.subTest(change=change), self.assertRaises((ValueError, RuntimeError, TimeoutError, PermissionError)):
                 self.call("set", joint1_deg=1)
         self.assertEqual([], session.moves)
 
@@ -469,7 +459,7 @@ class JointControlTests(unittest.TestCase):
                 second_id = self.call("set", "control-b", joint1_deg=2)["action_id"]
                 # Core forwards exactly the hook arguments, without instance_id.
                 response = self.bundle.dispatch("joint_control", dict(hooks[name]))
-                self.assertEqual("stop_requested", response["state"])
+                self.assertEqual("ready", response["state"])
                 self.assertEqual({"172.16.0.3", "172.16.0.2"},
                                  {record["robot_ip"] for record in response["robots"]})
                 self.assertEqual("cancelled", self.completed(first_id)[1])
@@ -487,9 +477,8 @@ class JointControlTests(unittest.TestCase):
         second_id = self.call("set", "control-b", joint1_deg=2)["action_id"]
         first.stop_error = RuntimeError("First robot stop unavailable")
         try:
-            response = self.bundle.dispatch("joint_control", {"action": "stop"})
-            self.assertEqual("error", response["state"])
-            self.assertIn("First robot stop unavailable", response["error"])
+            with self.assertRaisesRegex(RuntimeError, "First robot stop unavailable"):
+                self.bundle.dispatch("joint_control", {"action": "stopmotion"})
             self.assertEqual([(None, None)], first.stops)
             self.assertEqual([(None, None)], second.stops)
             self.assertEqual("running", first.motion(first_id)["status"])
@@ -516,7 +505,7 @@ class JointControlTests(unittest.TestCase):
             self.assertEqual(0, session.closed)
             self.assertEqual([], self.completions)
             self.assertEqual("stopping", self.call()["motion"]["status"])
-            self.publishers.assert_not_called()
+            self.assertFalse(self.controller.PUBLISH_STATE)
         finally:
             session.wait = original_wait
             session.finish(action_id, "cancelled")
@@ -599,7 +588,7 @@ class JointControlTests(unittest.TestCase):
             self.assertTrue(first_done.wait(1))
         # Synchronize with the completed worker after its callback, so the
         # assertion covers the status write following that callback too.
-        prefix = "franka-acp-control-a"
+        prefix = "franka-acp-robot_" + session.address.encode("ascii").hex()
         for worker in threading.enumerate():
             if worker.name == prefix:
                 worker.join(1)
