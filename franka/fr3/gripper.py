@@ -13,7 +13,7 @@ from hardware import SessionManager
 class GripperPlugin(JointControlPlugin):
     PREFIX = "gripper"
     CONFIG_FIELDS = FrankaPlugin.CONFIG_FIELDS + ("speed_mm_s", "force_n")
-    MOTION_ACTIONS = ("set_position", "grasp", "reset")
+    MOTION_ACTIONS = ("set_position", "grasp", "homing")
 
     def __init__(self, *args, manager=None, **kwargs):
         # The Hand has its own SDK connection, independently of the arm FCI loop.
@@ -60,7 +60,7 @@ class GripperPlugin(JointControlPlugin):
             "set_position": (["width_mm", "speed_mm_s"], "Move the gripper to the requested opening in millimeters."),
             "grasp": (["width_mm", "speed_mm_s", "force_n", "min_width_mm", "max_width_mm"],
                       "Grasp using the target object width and force; retain holding force after completion."),
-            "reset": ([], "Reset by running the existing homing calibration: fully open and close the fingers to measure the maximum opening."),
+            "homing": ([], "Run the Franka Hand calibration to measure the maximum opening."),
             "stopmotion": ([], "Stop the selected gripper and release holding force; keep the card available."),
             "info": ([], "Read measured and maximum opening, grasp status, temperature and execution results."),
         }, properties)
@@ -70,7 +70,7 @@ class GripperPlugin(JointControlPlugin):
         schema["x-is-dangerous"] = True
         schema["x-hooks"] = {key: {"action": "stopmotion"}
                              for key in ("on_interrupt_motion", "on_interrupt_all")}
-        return [{**tool(self.PREFIX, "actuator", "Franka gripper: opening, grasp, reset calibration and confirmed stop.", schema),
+        return [{**tool(self.PREFIX, "actuator", "Franka gripper: opening, grasp, homing calibration and confirmed stop.", schema),
                  "multiInstance": False, "topic_out": self._status_topic()}]
 
     def _info(self, instance_id, instance):
@@ -154,7 +154,7 @@ class GripperPlugin(JointControlPlugin):
                                    + instance.configuration_error)
             self._check_execution(args.get("_execution_epoch", self._execution_epoch))
             options = {"timeout_s": 120}
-            if action != "reset":
+            if action != "homing":
                 options.update(
                     width_m=self._number(args.get("width_mm"), "width_mm", 0, 80) / 1000,
                     speed_m_s=self._number(args.get("speed_mm_s"),
@@ -162,7 +162,7 @@ class GripperPlugin(JointControlPlugin):
                     speed_source="argument")
             if action == "grasp":
                 options.update(self._grasp_options(args))
-            action_id = session.command(self._owner_key(instance_id), "homing" if action == "reset" else action, **options)
+            action_id = session.command(self._owner_key(instance_id), action, **options)
             instance.last_action_id = action_id
             instance.acp = {"action_id": action_id, "state": "waiting_for_motion"}
             self._status_event("running", action=action, action_id=action_id,
@@ -171,6 +171,6 @@ class GripperPlugin(JointControlPlugin):
             threading.Thread(target=self._complete, args=(instance, session, action_id),
                              name=f"franka-gripper-acp-{instance_id}", daemon=True).start()
             return {"state": "running", "action_id": action_id, "action": action,
-                    "target_width_mm": None if action == "reset" else options["width_m"] * 1000,
-                    "speed_mm_s": None if action == "reset" else options["speed_m_s"] * 1000,
+                    "target_width_mm": None if action == "homing" else options["width_m"] * 1000,
+                    "speed_mm_s": None if action == "homing" else options["speed_m_s"] * 1000,
                     "speed_source": options.get("speed_source")}

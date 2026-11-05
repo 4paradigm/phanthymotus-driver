@@ -648,7 +648,7 @@ class JointControlPlugin(FrankaPlugin):
                 raise ValueError("Missing required parameter(s): " + ", ".join(missing))
             if action == "set" and not any(args.get(f"joint{i}_deg") is not None for i in range(1, 8)):
                 raise ValueError("Missing required parameter: at least one joint1_deg through joint7_deg")
-        if action in self.MOTION_ACTIONS and action != "reset":
+        if action in self.MOTION_ACTIONS and action != "homing":
             speed_key, high = ("speed_deg_s", 10) if self.PREFIX == "joint_control" else ("speed_mm_s", 100)
             self._number(args.get(speed_key), speed_key, 0.1, high)
         if action == "grasp":

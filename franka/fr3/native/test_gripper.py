@@ -69,6 +69,7 @@ class Gripper {
   }
  public:
   explicit Gripper(const std::string&) {
+    if (std::getenv("FR3_GRIPPER_CLOSED")) state_.width = -.0001;
     if (std::getenv("FR3_GRIPPER_UNHOMED")) state_.max_width = 0;
     if (std::getenv("FR3_GRIPPER_NARROW")) state_.max_width = .04;
   }
@@ -145,6 +146,12 @@ class NativeGripperTest(NativeProcessCase):
         self.send(item, "QUIT")
         self.assertEqual(item[0].wait(timeout=3), 0)
         self.assertEqual(self.calls(item), [])
+
+    def test_homing_accepts_negative_measured_opening(self):
+        item = self.start(FR3_GRIPPER_CLOSED="1")
+        self.assertLess(self.ready(item)["width"], 0)
+        self.send(item, "HOME test 30")
+        self.assertEqual(self.terminal(item)["status"], "succeeded")
 
     def test_move_reports_actual_width_after_sdk_completion(self):
         item, result = self.run_motion()

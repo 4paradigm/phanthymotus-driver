@@ -128,9 +128,9 @@ class GripperCardTests(unittest.TestCase):
         definition, = self.bundle.get_all_tools()
         self.assertEqual("actuator", definition["type"])
         self.assertFalse(definition["multiInstance"])
-        self.assertEqual(["set_position", "grasp", "reset", "stopmotion", "info"],
+        self.assertEqual(["set_position", "grasp", "homing", "stopmotion", "info"],
                          definition["inputSchema"]["properties"]["action"]["enum"])
-        self.assertEqual(["set_position", "grasp", "reset"],
+        self.assertEqual(["set_position", "grasp", "homing"],
                          definition["inputSchema"]["x-completion"]["actions"])
         self.assertEqual("arm", definition["inputSchema"]["x-resource"])
         self.assertNotIn("configSchema", definition)
@@ -162,10 +162,10 @@ class GripperCardTests(unittest.TestCase):
         self.complete(session, result, "failed")
         self.assertEqual("error", self.completions[0][1])
 
-    def test_reset_runs_existing_homing_and_has_no_width(self):
+    def test_homing_calls_sdk_without_width(self):
         session = self.start()
         session.value["max_width"] = 0
-        result = self.call("reset")
+        result = self.call("homing")
         self.assertEqual("homing", session.commands[0]["action"])
         self.assertNotIn("width_m", session.commands[0])
         self.complete(session, result)
@@ -196,7 +196,7 @@ class GripperCardTests(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 self.call("grasp", **args)
         with self.assertRaises(ValueError):
-            self.call("reset", robot_ip="invalid-ip")
+            self.call("homing", robot_ip="invalid-ip")
         self.assertEqual([], session.commands)
 
 

@@ -252,8 +252,9 @@ class Session {
         // This is the sole readOnce caller, including final-state verification.
         value.state = gripper_.readOnce();
         value.received = Clock::now();
+        // Match the Python reader: closed fingers can report a signed opening.
         if (!std::isfinite(value.state.width) || !std::isfinite(value.state.max_width) ||
-            value.state.width < 0 || value.state.max_width < 0)
+            value.state.max_width < 0)
           throw std::runtime_error("Invalid gripper width in backend state");
         {
           std::lock_guard<std::mutex> lock(sample_mutex_);

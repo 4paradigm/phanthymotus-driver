@@ -83,7 +83,7 @@ feedback before submitting motion. Offline or unsafe states still reject motion.
 | --- | --- |
 | `set_position` | Total finger spacing in mm and speed in mm/s. |
 | `grasp` | Expected object width, speed, force in N, and optional opening bounds. |
-| `reset` | Calibrates the opening range by moving the fingers. |
+| `homing` | Calibrates the opening range by moving the fingers. |
 | `stopmotion` | Requests a confirmed stop and may release a held object. |
 
 The width limit is the smaller of 80 mm and the measured maximum opening.
