@@ -192,6 +192,9 @@ class PluginContractTests(unittest.TestCase):
         dockerfile = (base / "Dockerfile").read_text()
         self.assertIn("COPY lidar.py", dockerfile)
         self.assertIn("source /livox_ws/install/setup.bash", dockerfile)
+        self.assertEqual(2, dockerfile.count(
+            "> /etc/apt/sources.list.d/ros2.list"))
+        self.assertIn("signed-by=/usr/share/keyrings/ros2-archive-keyring.gpg", dockerfile)
         self.assertIn("c0796f04c143143899c87a773d9f6b7136453c0b", dockerfile)
         self.assertIn("21445540f0d100dc86a7e6df312dd70bbdb4afdf", dockerfile)
 
