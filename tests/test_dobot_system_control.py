@@ -1,14 +1,88 @@
 """System control contracts using the pinned SDK and simulated transports only."""
 
-import json
+import copy
+import time
 import threading
 
+import numpy as np
 import pytest
 
 from common.vendor_runtime import DriverBundle
 from dobot.cra.device import DobotSensors
-from dobot.cra.feedback import ROBOT_MODES
-from test_dobot_safe_skin import Dashboard, setup_control
+from dobot.cra.feedback import ROBOT_MODES, decode_packet, endpoint
+from dobot.cra.control import RobotController, CommandRejected, DashboardConnection, parse_reply
+from dobot_sdk.protocol.data_types import MyType, TEST_VALUE_MAGIC
+
+
+class Feedback:
+    address = "127.0.0.1"
+    port = 30004
+    model_name = "CR3A"
+
+    def __init__(self):
+        record = np.zeros(1, dtype=MyType)
+        record['len'] = 1440
+        record['TestValue'] = TEST_VALUE_MAGIC
+        record['RobotMode'] = 4
+        record['CRRobotType'] = 113
+        self.sample = dict(connected=True, stale=False, controller_ip=self.address,
+                           robot_type_code=113, data=decode_packet(record.tobytes()))
+        self.starts = self.stops = 0
+
+    def snapshot(self):
+        return copy.deepcopy(self.sample)
+
+    def start(self):
+        self.starts += 1
+
+    def stop(self):
+        self.stops += 1
+
+    def configure(self, address, port):
+        self.address, self.port = endpoint(address, port)
+        self.sample.update(controller_ip=address, connected=False, stale=True, data=None)
+
+
+class Dashboard:
+    def __init__(self, reply=None, failure=None):
+        self.commands = []
+        self.reply = reply
+        self.failure = failure
+        self.closed = False
+        self.connects = 0
+        self.on_connect = None
+
+    def set_timeout(self, *args):
+        self.timeouts = args
+
+    def connect(self):
+        self.connects += 1
+        if self.on_connect:
+            self.on_connect()
+
+    def disconnect(self):
+        self.closed = True
+
+    def send_receive_text(self, command):
+        self.commands.append(command)
+        if self.failure:
+            raise self.failure
+        if self.reply is not None:
+            return self.reply
+        return f"0,{{{len(self.commands)}}},{command};"
+
+
+def setup_control(dashboard=None):
+    feedback = Feedback()
+    dashboard = Dashboard() if dashboard is None else dashboard
+    factories = []
+
+    def factory(address, port):
+        factories.append((address, port))
+        return dashboard
+
+    controller = RobotController(feedback, {}, connection_factory=factory)
+    return feedback, dashboard, controller, factories
 
 
 def set_mode(feedback, mode):
@@ -20,15 +94,9 @@ def set_mode(feedback, mode):
 
 
 WRITES = [
-    ('request_control', 4, {}, 'RequestControl()'),
-    ('power_on', 3, {}, 'PowerOn()'),
     ('enable', 4, {}, 'EnableRobot()'),
     ('disable', 7, {}, 'DisableRobot()'),
     ('clear_error', 9, {}, 'ClearError()'),
-    ('stop_motion', 8, {}, 'Stop()'),
-    ('pause', 7, {}, 'Pause()'),
-    ('resume', 10, {}, 'Continue()'),
-    ('set_speed_factor', 5, {'ratio': 20}, 'SpeedFactor(20)'),
     ('start_drag', 5, {}, 'StartDrag()'),
     ('stop_drag', 6, {}, 'StopDrag()'),
 ]
@@ -44,8 +112,7 @@ def test_system_actions_use_exact_sdk_commands_without_chained_effects(action, m
         assert dashboard.commands == [command]
         assert calls == [('127.0.0.1', 29999)]
         assert result['action'] == action and result['effect_verified'] is False
-        assert control.snapshot('systemcontrol')['last_request'] == result
-        assert control.snapshot()['last_request'] is None
+        assert control.snapshot()['last_request'] == result
     finally:
         control.close()
 
@@ -69,28 +136,25 @@ def test_system_lifecycle_and_info_do_not_send_commands_and_stop_does_not_stop_r
     info = plugin.dispatch('get_status', {'_tool_name': 'systemcontrol'})
     assert info['available'] and info['robot_status']['robot_mode'] == 7
     assert not calls and not dashboard.commands
-    control.execute_system('pause', {'confirm_change': True})
+    control.execute_system('disable', {'confirm_change': True})
     plugin.dispatch('stop', {'_tool_name': 'systemcontrol'})
-    assert dashboard.closed and dashboard.commands == ['Pause()']
+    assert dashboard.closed and dashboard.commands == ['DisableRobot()']
     feedback.sample.update(connected=False, stale=True, data=None)
     assert plugin.dispatch('get_status', {'_tool_name': 'systemcontrol'})['robot_status'] is None
 
 
 @pytest.mark.parametrize('changed', [{'stale': True}, {'connected': False}, {'data': None}])
-@pytest.mark.parametrize('action,mode', [('power_on', 3), ('enable', 4), ('clear_error', 9),
-                                      ('request_control', 4), ('pause', 7), ('resume', 10),
-                                      ('set_speed_factor', 5), ('start_drag', 5)])
+@pytest.mark.parametrize('action,mode', [('enable', 4), ('clear_error', 9), ('start_drag', 5)])
 def test_actions_that_change_operating_state_require_fresh_feedback(changed, action, mode):
     feedback, dashboard, control, calls = setup_control()
     set_mode(feedback, mode)
     feedback.sample.update(changed)
     with pytest.raises(RuntimeError, match='fresh feedback'):
-        control.execute_system(action, {'confirm_change': True, 'ratio': 20})
+        control.execute_system(action, {'confirm_change': True})
     assert not calls and not dashboard.commands
 
 
-@pytest.mark.parametrize('action,command', [('stop_motion', 'Stop()'), ('disable', 'DisableRobot()'),
-                                         ('stop_drag', 'StopDrag()')])
+@pytest.mark.parametrize('action,command', [('disable', 'DisableRobot()'), ('stop_drag', 'StopDrag()')])
 def test_stopping_actions_remain_available_when_feedback_is_lost(action, command):
     feedback, dashboard, control, calls = setup_control()
     feedback.sample.update(connected=False, stale=True, data=None)
@@ -101,7 +165,7 @@ def test_stopping_actions_remain_available_when_feedback_is_lost(action, command
         control.close()
 
 
-@pytest.mark.parametrize('action', ['stop_motion', 'disable', 'stop_drag', 'get_errors'])
+@pytest.mark.parametrize('action', ['disable', 'stop_drag'])
 def test_no_command_endpoint_means_no_dashboard_connection(action):
     feedback, dashboard, control, calls = setup_control()
     feedback.address = ''
@@ -110,53 +174,13 @@ def test_no_command_endpoint_means_no_dashboard_connection(action):
     assert not calls and not dashboard.commands
 
 
-@pytest.mark.parametrize('errors', ['[]', '[134]', '[134,1538]'])
-def test_error_query_parses_documented_flat_array_even_without_feedback(errors):
-    feedback, dashboard, control, calls = setup_control(Dashboard(reply=f'0,{{{errors}}},GetErrorID();'))
-    feedback.sample.update(connected=False, stale=True, data=None)
-    try:
-        result = control.execute_system('get_errors', {})
-        assert result['state'] == 'queried' and result['read_only'] is True
-        assert result['error_ids'] == json.loads(errors)
-        assert dashboard.commands == ['GetErrorID()'] and len(calls) == 1
-    finally:
-        control.close()
-
-
-@pytest.mark.parametrize('payload', ['1', 'null', '[true]', '["134"]', '[[134]]', '[134,]'])
-def test_malformed_alarm_arrays_fail_without_replay(payload):
-    _, dashboard, control, calls = setup_control(Dashboard(reply=f'0,{{{payload}}},GetErrorID();'))
-    with pytest.raises(ValueError):
-        control.execute_system('get_errors', {})
-    assert dashboard.closed and dashboard.commands == ['GetErrorID()'] and len(calls) == 1
-
-
-@pytest.mark.parametrize('ratio', [None, True, 0, 101, 1.5, '20'])
-def test_speed_ratio_is_validated_before_connecting(ratio):
-    _, dashboard, control, calls = setup_control()
-    with pytest.raises(ValueError, match='ratio'):
-        control.execute_system('set_speed_factor', {'ratio': ratio, 'confirm_change': True})
-    assert not calls and not dashboard.commands
-
-
-@pytest.mark.parametrize('action,mode', [('power_on', 4), ('enable', 3), ('enable', 9), ('enable', 10),
-                                      ('resume', 5), ('pause', 8), ('start_drag', 7), ('clear_error', 7)])
+@pytest.mark.parametrize('action,mode', [('enable', 3), ('enable', 9), ('enable', 10),
+                                      ('start_drag', 7), ('clear_error', 7)])
 def test_wrong_operating_modes_are_rejected_without_automatic_recovery(action, mode):
     feedback, dashboard, control, calls = setup_control()
     set_mode(feedback, mode)
     with pytest.raises(RuntimeError):
         control.execute_system(action, {'confirm_change': True})
-    assert not calls and not dashboard.commands
-
-
-@pytest.mark.parametrize('change', [{'error_status': True}, {'collision_state': 1}, {'arm_approach_state': 1},
-                                  {'brake_released': [True] * 6}, {'drag_status': 1}, {'enable_status': False}])
-def test_continue_is_blocked_by_active_protection_or_disabled_state(change):
-    feedback, dashboard, control, calls = setup_control()
-    set_mode(feedback, 10)
-    feedback.sample['data'].update(change)
-    with pytest.raises(RuntimeError):
-        control.execute_system('resume', {'confirm_change': True})
     assert not calls and not dashboard.commands
 
 
@@ -173,13 +197,76 @@ def test_uncertain_system_writes_are_not_replayed(failure):
     _, dashboard, control, calls = setup_control(Dashboard(failure=failure))
     with pytest.raises(type(failure)):
         control.execute_system('enable', {'confirm_change': True})
-    status = control.snapshot('systemcontrol')
+    status = control.snapshot()
     assert status['last_request']['state'] == 'failed_or_outcome_unknown'
     assert status['last_request']['effect_verified'] is False
     assert len(calls) == 1 and dashboard.commands == ['EnableRobot()'] and dashboard.closed
 
 
-def test_both_cards_share_one_serial_transport_and_keep_separate_request_history():
+@pytest.mark.parametrize('code', [-1, -2, -3, -9])
+def test_rejected_system_command_records_failure_without_replaying(code):
+    _, dashboard, control, calls = setup_control(Dashboard(reply=f'{code},{{}},EnableRobot();'))
+    with pytest.raises(CommandRejected):
+        control.execute_system('enable', {'confirm_change': True})
+    assert dashboard.commands == ['EnableRobot()'] and len(calls) == 1
+    assert control.snapshot()['last_request']['state'] == 'rejected'
+    assert control.snapshot()['last_error'] and dashboard.closed
+
+
+def test_empty_success_acknowledgement_does_not_claim_actual_enable():
+    feedback, dashboard, control, calls = setup_control(Dashboard(reply='0,{},EnableRobot();'))
+    try:
+        result = control.execute_system('enable', {'confirm_change': True})
+        assert result['state'] == 'accepted_unverified' and result['result_id'] is None
+        assert result['effect_verified'] is False
+        assert control.system_status()['enabled'] is False
+        assert dashboard.commands == ['EnableRobot()'] and len(calls) == 1
+    finally:
+        control.close()
+
+
+@pytest.mark.parametrize('reply', ['Control Mode Is Not Tcp', '0,{1},Other();',
+                                 '0,{oops},EnableRobot();', '0,{1},EnableRobot();junk'])
+def test_malformed_command_acknowledgements_are_rejected(reply):
+    with pytest.raises(ValueError):
+        parse_reply(reply, 'EnableRobot')
+
+
+def test_system_card_exposes_only_status_enable_clear_error_and_drag():
+    tool = next(tool for tool in DobotSensors({}).get_tools() if tool['name'] == 'systemcontrol')
+    assert tool['type'] == 'actuator' and tool['inputSchema']['x-is-dangerous'] is True
+    assert tool['inputSchema']['x-resource'] == 'arm'
+    assert 'ratio' not in tool['inputSchema']['properties']
+    assert set(tool['inputSchema']['properties']['action']['enum']) == {
+        'info', 'get_status', 'enable', 'disable', 'clear_error', 'start_drag', 'stop_drag', 'start', 'stop', 'config',
+    }
+
+
+@pytest.mark.parametrize('action', ['get_errors', 'request_control', 'power_on', 'stop_motion',
+                                  'pause', 'resume', 'set_speed_factor', 'set_sensitivity'])
+def test_removed_system_actions_cannot_send_commands_even_when_confirmed(action):
+    feedback, dashboard, control, calls = setup_control()
+    plugin = DobotSensors({}, client=feedback, controller=control)
+    with pytest.raises(ValueError, match='unsupported system control action'):
+        plugin.dispatch(action, {'_tool_name': 'systemcontrol', 'confirm_change': True, 'ratio': 20})
+    assert not calls and not dashboard.commands
+
+
+@pytest.mark.parametrize('action,mode', [('enable', 4), ('start_drag', 5)])
+@pytest.mark.parametrize('change', [{'error_status': True}, {'collision_state': 1}, {'arm_approach_state': 1},
+                                  {'j4_approach_state': 1}, {'j5_approach_state': 1}, {'j6_approach_state': 1},
+                                  {'brake_released': [True] * 6}, {'drag_status': 1},
+                                  {'running_status': 1}, {'jog_status': 1}, {'pause_cmd_flag': 1}])
+def test_enable_and_drag_are_blocked_by_active_protection_or_movement(action, mode, change):
+    feedback, dashboard, control, calls = setup_control()
+    set_mode(feedback, mode)
+    feedback.sample['data'].update(change)
+    with pytest.raises(RuntimeError):
+        control.execute_system(action, {'confirm_change': True})
+    assert not calls and not dashboard.commands
+
+
+def test_system_writes_are_serialized_while_status_and_joints_remain_readable():
     feedback, dashboard, control, calls = setup_control()
     plugin = DobotSensors({}, client=feedback, controller=control)
     entered, release = threading.Event(), threading.Event()
@@ -187,53 +274,43 @@ def test_both_cards_share_one_serial_transport_and_keep_separate_request_history
     failures = []
 
     def blocked(command):
-        if command.startswith('SetSafeSkin'):
+        if command == 'DisableRobot()':
             entered.set()
             assert release.wait(2)
         return original(command)
 
     dashboard.send_receive_text = blocked
 
-    def execute(name, action, args):
+    def execute(action):
         try:
-            plugin.dispatch(action, {'_tool_name': name, 'confirm_change': True, **args})
+            plugin.dispatch(action, {'_tool_name': 'systemcontrol', 'confirm_change': True})
         except Exception as exc:
             failures.append(exc)
 
-    first = threading.Thread(target=execute, args=('safe_skin_control', 'set_sensitivity', {'part': 4, 'level': 2}))
-    second = threading.Thread(target=execute, args=('systemcontrol', 'set_speed_factor', {'ratio': 20}))
+    first = threading.Thread(target=execute, args=('disable',))
+    second = threading.Thread(target=execute, args=('stop_drag',))
     first.start()
     assert entered.wait(1)
     second.start()
     try:
         assert plugin.dispatch('get_status', {'_tool_name': 'systemcontrol'})['available']
-        assert plugin.payload('safe_skin_control')['available']
+        assert plugin.payload('joints')['available']
+        assert not dashboard.commands
     finally:
         release.set()
         first.join(2)
         second.join(2)
+    try:
+        assert not first.is_alive() and not second.is_alive() and not failures
+        assert dashboard.commands == ['DisableRobot()', 'StopDrag()'] and len(calls) == 1
+        plugin.dispatch('config', {'_tool_name': 'joints', 'controller_ip': '127.0.0.2'})
+        assert dashboard.closed and control.snapshot()['last_request'] is None
+        assert plugin.payload('joint_angles')['joint1_deg'] is None
+    finally:
         control.close()
-    assert not first.is_alive() and not second.is_alive() and not failures
-    assert dashboard.commands == ['SetSafeSkin(4,2)', 'SpeedFactor(20)']
-    assert len(calls) == 1
-    assert control.snapshot()['last_request']['action'] == 'set_sensitivity'
-    assert control.snapshot('systemcontrol')['last_request']['action'] == 'set_speed_factor'
-    plugin.dispatch('config', {'_tool_name': 'joints', 'controller_ip': '127.0.0.2'})
-    assert control.snapshot()['last_request'] is None
-    assert control.snapshot('systemcontrol')['last_request'] is None
 
 
-def test_system_card_metadata_covers_actions_and_keeps_motion_stop_distinct():
-    tool = next(tool for tool in DobotSensors({}).get_tools() if tool['name'] == 'systemcontrol')
-    assert tool['type'] == 'actuator' and tool['inputSchema']['x-is-dangerous'] is True
-    assert tool['inputSchema']['x-resource'] == 'arm'
-    assert set(tool['inputSchema']['properties']['action']['enum']) == {
-        'info', 'get_status', 'get_errors', 'request_control', 'power_on', 'enable', 'disable', 'clear_error',
-        'stop_motion', 'pause', 'resume', 'set_speed_factor', 'start_drag', 'stop_drag', 'start', 'stop', 'config',
-    }
-
-
-@pytest.mark.parametrize('name', ['joints', 'safe_skin_control', 'systemcontrol'])
+@pytest.mark.parametrize('name', ['joints', 'systemcontrol'])
 def test_info_is_static_metadata_and_status_is_a_visible_action(name, monkeypatch):
     feedback, dashboard, control, calls = setup_control()
     plugin = DobotSensors({}, client=feedback, controller=control)
@@ -308,3 +385,30 @@ def test_enable_acknowledgement_does_not_replace_actual_enable_feedback():
         assert dashboard.commands == ['EnableRobot()'] and len(calls) == 1
     finally:
         control.close()
+
+
+def test_transport_reassembles_fragmented_acknowledgement():
+    import socket
+    reader, writer = socket.socketpair()
+    connection = DashboardConnection('127.0.0.1', 29999)
+    connection._socket = reader
+    connection._connected = True
+    reader.settimeout(1)
+    received = []
+
+    def server():
+        received.append(writer.recv(4096))
+        writer.sendall(b'0,{12},EnableRo')
+        time.sleep(0.02)
+        writer.sendall(b'bot();')
+
+    thread = threading.Thread(target=server)
+    thread.start()
+    try:
+        result = connection.send_receive_text('EnableRobot()')
+        assert parse_reply(result, 'EnableRobot') == 12
+        assert received == [b'EnableRobot()\n']
+    finally:
+        connection.disconnect()
+        thread.join(1)
+        writer.close()

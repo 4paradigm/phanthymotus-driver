@@ -1,38 +1,33 @@
-# Dobot CRA joints, safe skin and system control
+# Dobot CRA joints and system control
 
-基于官方 V4 Python SDK 的 Jetson Docker 驱动。提供关节骨架/转角、安全皮肤状态与设置，
-以及系统控制；不修改平台前端，不加载 STL 外壳。SDK 版本见 [SDK.md](SDK.md)。
+基于官方 V4 Python SDK 的 Jetson Docker 驱动。本版只提供 `joints` 与 `systemcontrol`
+两张可见卡片，URDF 由后台 `model` 资源提供。SDK 版本见 [SDK.md](SDK.md)。
 
 ## 卡片
 
 | 名称 | 类型 | 内容 |
 |---|---|---|
-| `joints` | sensor | 六轴实际角度驱动的 CR3A 结构骨架及转角 JSON 输出；共享连接配置入口 |
-| `safe_skin_control` | actuator | 实时触发状态 JSON 输出、总开关和分区灵敏度 |
-| `systemcontrol` | actuator | 系统状态/报警、本体上电、使能、停止/暂停/继续、速度和拖拽示教 |
-| `model` | resource | 平台渲染器使用的固定直角骨架 URDF，不发布 ROS topic |
+| `joints` | sensor | 六轴实际角度驱动的 CR3A 结构骨架、逐关节转角 JSON，以及共享连接配置 |
+| `systemcontrol` | actuator | 系统状态查询、上/下使能、清除报警、进入/退出拖拽示教 |
 
-已移除 `connection`、`joint_states`、`robot_info`、`software_info`、`arm_all_state`、
-`controller_state` 及独立 `safe_skin` sensor 卡片。升级后请删除画布中的旧卡片，在 `joints` 齿轮处重新配置连接。
-不会自动改动已有画布或把旧 sensor 重命名为新控制功能。
+`model` 为渲染器内部读取的 resource，不是可见卡片。
+本版不注册 `safe_skin` 或 `safe_skin_control`，不发布安全皮肤 topic，也不提供皮肤设置入口。
+升级后请移除画布中的旧安全皮肤卡片及连线；不会自动修改已有画布。
 
-关节卡和安全皮肤执行卡共用一个反馈连接，默认 10Hz 发布 `std_msgs/String` JSON：
+## 关节输出
 
-- `/dobot_cra/state/joints`，`sensor/skeleton`；只包含 `timestamp_ms/available/joints`，
-  每个关节只包含 `name/q`，`q` 为弧度，关节名为 `joint1..joint6`。
-- `/dobot_cra/state/joint_angles`，`data/json`；`joints` 的第二个输出口，
-  只包含 `timestamp_ms/available` 和 `joint1_deg` 至 `joint6_deg` 六个独立字段；
-  每个关节转角单独一行，单位为度，不重复输出名称数组或弧度数组。
-- `/dobot_cra/state/safe_skin`，`data/json`，属于 `safe_skin_control` 的输出口。
-  保留原 topic 名称，画布中原有 `safe_skin` 连线需改接到 `safe_skin_control` 输出口。
+默认以 10Hz 发布 `std_msgs/String` JSON，两个输出共用同一份反馈快照：
 
-两个 `joints` 输出共用同一份反馈快照，不新增卡片或控制器连接。JSON 角度不依赖 URDF
-是否可用；实时数据可用时 `available=true`，断线或过期时为 `false`，六个角度均为 `null`。
+- `/dobot_cra/state/joints`，`sensor/skeleton`；仅包含 `timestamp_ms/available/joints`。
+  每个关节包含 `name/q`，`q` 为弧度，关节名为 `joint1..joint6`。
+- `/dobot_cra/state/joint_angles`，`data/json`；包含 `timestamp_ms/available` 和
+  `joint1_deg` 至 `joint6_deg`，每个关节转角单独一行，单位为度。
+
 JSON 输出示例（数值为示例）：
 
 ```json
 {
-  "timestamp_ms": 1793836800000,
+  "timestamp_ms": 1793856449751,
   "available": true,
   "joint1_deg": 90,
   "joint2_deg": -30,
@@ -43,31 +38,29 @@ JSON 输出示例（数值为示例）：
 }
 ```
 
-更新后在平台重新添加 `joints` 或刷新该卡片输出定义，以显示新增 JSON 输出口。
+断线或过期时 `available=false`，骨架 `joints=[]`，六个角度字段均为 `null`，不输出旧角度。
+角度 JSON 不依赖 URDF 是否可用；型号不匹配时仅骨架停止提供关节位置。
+输出不含 IP/端口、连接诊断、包计数、SDK 来源或冗余角度数组。
+旧下游若依赖 `joint_names/angles_deg`，请改读 `joint1_deg` 至 `joint6_deg`。
 
-断线或过期时，关节输出为 `available=false`，骨架不再输出旧角度，`joints=[]`；
-皮肤输出为 `available=false`，触发状态为 `null`，不会把未知当作“没有触发”。
-关节数据流不再输出 IP/端口、连接/超时诊断、包计数、SDK 来源、型号来源及错误记录。
-骨架移除了 `idx/dq/degree` 等冗余字段，型号识别及错误说明保留在后台 `model` 资源中；
-无法匹配模型时骨架为 `available=false, joints=[]`。`config` 响应仍确认实际配置的 IP/端口，
-这些配置确认字段不混入实时输出。旧下游如依赖 `joint_names/angles_deg` 数组，请改读对应的
-`joint1_deg` 至 `joint6_deg` 字段；如需弧度，请由各角度字段转换，
-骨架渲染器仍直接使用弧度 `q`。
+## 卡片介绍与系统状态
 
-## 卡片介绍与状态查询
+两张卡片的内部 `info` 只返回介绍、参数 schema、配置 schema 和输入输出口定义。
+`joints` 通过输出口持续发布数据，不提供业务 action。
+`systemcontrol.get_status` 为可选 action，读取当前反馈和最近请求记录，不打开命令连接。
 
-三张可见卡片均保留平台内部 `info`；只有两张执行卡提供可执行的 `get_status`：
+| 状态字段 | 含义 |
+|---|---|
+| `available`、`timestamp_ms` | 反馈是否有效、本次查询的 Unix 毫秒时间 |
+| `powered_on` | 从机器人模式推断的本体上电状态；报警、初始化或未知模式为 `null` |
+| `enabled`、`running`、`paused`、`dragging` | 当前使能、运行、暂停、拖拽状态 |
+| `collision`、`has_error` | 当前碰撞及是否存在报警 |
+| `speed_scaling`、`robot_status` | 速度比例及协议状态字段 |
+| `dashboard_connected`、`last_request`、`last_error` | 驱动命令连接状态、最近请求及错误记录 |
 
-- `info` 只返回名称、功能介绍、参数 schema、配置 schema 和输入输出口定义。
-  平台用于详情按钮及端口解析；不读取反馈、连接状态或请求记录。
-- 执行卡的 `get_status` 在 action 下拉框中可选，查询最新有效反馈和请求记录；不发送控制命令，
-  不要求 `confirm_change`，不会打开 Dashboard 连接。
-- ROS JSON 输出口持续发布实时数据，其结构不因这次分离而改变。
-
-`joints` 不提供业务 action，通过骨架和 JSON 输出口持续发布数据，保留平台内部启停和配置。
-`safe_skin_control.get_status` 返回触发反馈、
-命令连接状态和最近设置请求；`systemcontrol.get_status` 返回系统实际状态和本卡请求记录。
-旧执行卡调用方若通过 `info` 读取运行数据，请改用 `get_status`。
+反馈失效时，实时状态和 `robot_status` 均为 `null`。请求记录不等于实际状态；
+上使能请求的 ACK 不会把 `enabled` 强行置为 true。
+本版不提供独立的 `get_errors` 动作，`has_error` 表示是否存在报警，不是报警编号列表。
 
 ## 固定直角结构
 
@@ -85,126 +78,32 @@ JSON 输出示例（数值为示例）：
 模型只用于结构显示，不是运动规划模型或完整 CAD 外壳。未知/不匹配型号不会套用 CR3A。
 先确认反馈有效再打开 `joints`，以便平台首次加载模型时取得正确型号。
 
-## 安全皮肤状态
-
-`safe_skin_control` 的 JSON 输出口只发布以下四项（示例值）：
-
-```json
-{
-  "timestamp_ms": 1793836800000,
-  "available": true,
-  "any_approach_paused": false,
-  "regions": {"arm": false, "j4": false, "j5": false, "j6": false}
-}
-```
-
-`regions` 的值直接表示各区域是否触发接近暂停，`any_approach_paused` 为其汇总。
-`timestamp_ms` 是本次输出的 Unix 毫秒时间；`available` 表示反馈是否新鲜有效。
-断线或过期时 `available=false`，汇总和四区值均为 `null`。普通碰撞不等同于皮肤接近暂停。
-
-此精简格式移除了 `regions` 内的 `part/raw_flag/approach_paused` 嵌套对象，以及系统状态、
-连接诊断、控制请求记录和无读回依据的配置字段。使用旧路径的下游条件需改为直接读取
-`regions.arm/j4/j5/j6`。最近控制请求、执行结果和 Dashboard 状态通过 `safe_skin_control`
-的 `get_status` 查看；`last_request` 只是请求记录，不是实际配置读回。
-
-反馈不提供皮肤安装检测、总开关或灵敏度读回；四区均为 false 不证明皮肤已安装或开启。
-本版不虚构距离读数或 TCP 复位指令。
-
-## 安全皮肤控制
-
-启动驱动、添加卡片、点击 start/info/get_status 均不打开 Dashboard、不接管控制、不写入设置。
-只有显式控制请求才懒连接 `29999`。所有请求通过一条序列化连接调用官方 SDK；
-接收按分号完整组帧，断线/超时不自动重放写入。停止控制卡或容器会关闭该连接，
-但不取消控制器已经接受的队列指令，也不自动退出设备的 TCP 模式。
-
-| action | 参数 | 官方 SDK |
-|---|---|---|
-| `info` | 无 | 平台内部卡片介绍、参数和输出口定义 |
-| `get_status` | 无 | 当前触发反馈、命令连接状态和最近设置请求 |
-| `start/config/stop` | 无 | 返回 JSON 输出口定义；start 读取反馈，stop 关闭命令连接，均不修改皮肤设置 |
-| `enable` | `confirm_change=true` | `EnableSafeSkin(1)`，开启安全皮肤总开关，不改变各部位灵敏度 |
-| `disable` | `confirm_change=true` | `EnableSafeSkin(0)`，关闭安全皮肤总开关，不是机械臂下使能或碰撞复位 |
-| `set_sensitivity` | `part=arm/j4/j5/j6`, `level=0/1/2/3`, `confirm_change=true` | 内部映射后调用 `SetSafeSkin(part,level)` |
-
-部位下拉框显示“小臂、J4（第4关节）、J5（第5关节）、J6（第6关节）”，
-对应参数值 `arm/j4/j5/j6`，SDK 使用的 3/4/5/6 编号只在内部映射。
-请求记录返回 `part` 名称及中文 `part_name`，不再只输出数字部位。
-总开关不再要求输入 `enabled`：选择 `enable` 或 `disable`，将 `confirm_change` 下拉框选择为
-“确认执行本次设置”后提交即可。默认“未确认（不执行）”，不会发送设置命令。
-旧的 `set_enabled` 动作已移除，调用方需改用 `enable/disable`。
-
-灵敏度下拉框直接标出接近距离，依据《DOBOT 安全皮肤用户手册 (CRA)》V1.4（2026-01-22）
-第 4.1 节（正文第 5 页）：
-
-| level | 下拉框显示 |
-|---|---|
-| 0 | 关闭该部位 |
-| 1 | 低灵敏度（接近距离 ≤5 cm） |
-| 2 | 中灵敏度（接近距离 ≤10 cm） |
-| 3 | 高灵敏度（接近距离 ≤15 cm） |
-
-这是手册给出的档位范围，不是实时距离读数。手册参数表另注明不同部位感知距离有区别，
-感知目标为人体、金属、液体等导体，对非导体感应能力较弱。
-原有直接 API 调用的整数部位编号仍可解析，但新卡片不再展示数字部位选项。
-每次写操作都要明确确认，平台按 actuator 危险操作处理。驱动要求新鲜反馈、机器人停止，
-没有报警、碰撞、皮肤触发、拖拽、暂停或抱闸松开。
-TCP 控制权统一通过 `systemcontrol.request_control` 请求，安全皮肤卡不提供此动作，
-后台也拒绝从皮肤卡调用；皮肤查询不再混入 `tcp_control_requested`。
-条件不满足时返回原因，不代为使能、清错、关闭其他保护或恢复运动。
-设置过程中再次检查反馈，避免连接耗时后仍按旧状态发送。
-
-开关和灵敏度是**队列指令**：返回 0 只说明接受请求。返回 ResultID 时状态为
-`submitted`；旧固件不返回 ID 时为 `accepted_unverified`。无配置读回接口，所以即使
-接受也始终标记 `configuration_verified=false`。可通过控制卡 `get_status` 查看请求返回的队列编号，
-并在厂家软件中核对实际设置；下使能时接受的队列可能等待后续使能，不会由驱动自动执行使能。
-明确错误码返回 `rejected`，通信不确定性返回 `failed_or_outcome_unknown`，均不自动重试。
-
-文档没有单独的 TCP 皮肤复位函数；关闭/重开皮肤不作为复位动作。TCP 设置只在对应
-控制模式中生效，退出后按厂家规则恢复原配置。SDK 错误 -1 还可能表示没有安装安全皮肤。
-
 ## 系统控制
-
-`systemcontrol` 是独立的 actuator，与 `safe_skin_control` 共用同一个 `RobotController`、
-29999 连接和命令锁，避免两张卡互相抢占 TCP 连接。两张卡分别保存 `last_request/last_error`，
-互不覆盖；切换控制器地址/反馈端口时关闭命令连接并清空两张卡的请求记录。
 
 | action | 参数 | SDK / 行为 |
 |---|---|---|
-| `info` | 无 | 平台内部卡片介绍及参数说明 |
-| `get_status` | 无 | 查询实际使能/上电/运行/暂停/拖拽/碰撞/报警状态，另含原始状态、安全字节、队列编号及负载 |
-| `get_errors` | 无 | `GetErrorID()`，返回 `error_ids` 数组；不清错 |
-| `request_control` | `confirm_change=true` | `RequestControl()`；仅系统控制卡提供 |
-| `power_on` | `confirm_change=true` | `PowerOn()`，仅给机械臂本体上电，不是控制柜开机 |
-| `enable` | `confirm_change=true` | `EnableRobot()`，不覆盖已配置负载/偏心参数 |
+| `get_status` | 无 | 读取系统状态和最近请求记录 |
+| `enable` | `confirm_change=true` | `EnableRobot()`，沿用控制器已有负载设置 |
 | `disable` | `confirm_change=true` | `DisableRobot()` |
 | `clear_error` | `confirm_change=true` | `ClearError()`，不自动使能或恢复运动 |
-| `stop_motion` | `confirm_change=true` | `Stop()`，停止运动指令队列/工程 |
-| `pause` | `confirm_change=true` | `Pause()`，仅运行队列/工程（模式 7），点动请用 `stop_motion` |
-| `resume` | `confirm_change=true` | `Continue()`，显式恢复已暂停的运动队列 |
-| `set_speed_factor` | `ratio=1..100`, `confirm_change=true` | `SpeedFactor(ratio)` |
 | `start_drag` | `confirm_change=true` | `StartDrag()`，进入关节拖拽示教 |
 | `stop_drag` | `confirm_change=true` | `StopDrag()`，退出拖拽示教 |
 
-卡片生命周期 `start/config/info/stop` 不发送物理控制命令。`stop` 只关闭共享 Dashboard
-连接，真正停止机械臂需要显式 `stop_motion`；关闭任意执行卡的连接不会取消已接受的队列。
-下一次显式命令按需建立连接，不自动接管 TCP。反馈超时不阻止 `stop_motion/disable/stop_drag`
-及 `get_errors` 尝试发送，但仍需要已配置 IP；这些 TCP 操作不能替代硬件急停。
+已移除 `get_errors`、`request_control`、`power_on`、`stop_motion`、`pause`、`resume` 和
+`set_speed_factor`。后台也拒绝这些动作，不保留隐式调用入口。运动控制留待后续运动卡片。
 
-其他操作要求新鲜反馈并在连接后再次校验。请求 TCP 控制要求未使能/下电，
-且关闭手自动模式切换功能。上电要求模式 3，使能要求模式 4，
-继续要求模式 10 且已使能；上电初始化期间不能越过模式检查立即使能。
-上电/使能/继续/进入拖拽被报警、碰撞、皮肤触发、松抱闸等状态阻止。
-清错只允许静止状态，不会代为消除故障原因，也不保证复位皮肤。
-速度调整允许模式 4/5/7；每次写操作均要求布尔值 `confirm_change=true`。
+`start/config/info/stop` 是平台内部生命周期动作。`start` 启动反馈，`config` 确认配置，
+`stop` 仅关闭命令连接，不发送机器人停止运动指令。
+本版不会申请 TCP 控制权或给本体上电，操作前须在厂家软件中完成相应准备。
 
-写命令返回 `effect_verified=false`：ACK 不代表物理状态已改变，请在后续 `get_status` 中核对反馈。
-`tcp_control_requested` 只记录本次连接期间请求过控制权，不是控制器当前控制模式的读回。
-`get_status` 顶层提供 `enabled/powered_on/running/paused/dragging/collision/has_error/speed_scaling`，
-并保留 `robot_status` 中的协议字段。`powered_on` 由模式推断：模式 3 为 false，
-模式 2/4/5/6/7/8/10/11 为 true，报警、初始化或未知模式为 null。
-反馈过期时 `available=false`，上述实时字段及 `robot_status` 全部为 null，
-不会将旧状态或最近一次命令的目标值当作当前状态。
-超时/连接失败不重放写命令，也不串联清错、使能、继续等动作。
+写操作按需建立一条序列化的 SDK Dashboard 连接，每次都要求布尔值 `confirm_change=true`。
+上使能仅允许模式 4，进入拖拽允许模式 4/5，均要求新鲜反馈、机器人停止，无报警、碰撞、
+皮肤接近暂停或松抱闸；连接后再次检查状态。清错仅允许静止状态，不代为排除故障原因。
+下使能和退出拖拽允许在反馈失效时尝试发送，但仍须已配置控制器 IP。
+切换 IP/端口会关闭旧连接并清空请求记录。
+
+返回 `effect_verified=false`：ACK 仅代表控制器的应答，请通过后续 `get_status` 核对效果。
+超时或连接失败不会重放写命令，不自动串联清错、使能或恢复运动。
 
 ## 网络与配置
 
@@ -236,18 +135,14 @@ MCP 端口 `15746`，容器名 `embodied-dobot-cra`；无需主机 SDK 或 privi
 python3 -m venv .venv
 .venv/bin/pip install -r dobot/cra/build-requirements.txt
 .venv/bin/pip install --no-build-isolation -r dobot/cra/requirements.txt pytest
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra_sensors.py tests/test_dobot_safe_skin.py tests/test_dobot_skeleton_structure.py tests/test_dobot_system_control.py -q
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra_sensors.py tests/test_dobot_skeleton_structure.py tests/test_dobot_system_control.py -q
 .venv/bin/python scripts/check_service_yml.py
 ```
 
 ## PR 验收
 
-1. 升级镜像后确认只有 `joints` 一张 sensor、`safe_skin_control/systemcontrol` 两张执行卡和后台 model 资源。
-   删除旧 `safe_skin` 卡，将其下游连线改接到 `safe_skin_control` 的 JSON 输出口。
-2. 配置并启动 `joints`，确认六轴与实时角度一致，J4 前连杆可见直角而非斜杆；固定拐点不可控。
-3. 核对 `safe_skin_control` JSON 输出的各分区标志；断网时应变为未知，重连后恢复。
-4. 在受控现场停止机器人后，显式执行所需皮肤设置，对照厂家软件确认队列执行及实际配置。
-   本地模拟测试不替代这一项硬件验证。
-5. 本次开发验证不得自动在真机上关闭安全皮肤、使能或恢复运动。
-6. 从 action 下拉框执行 `systemcontrol.get_status`，核对实际状态；`get_errors` 查询报警编号。
-   `info` 只用于卡片介绍和端口发现。硬件动作须在受控现场单独验收。
+1. 卡片列表仅有 `joints` 和 `systemcontrol`；`model` 保留为后台资源。
+2. `joints` 的骨架使用六轴实际角度，JSON 的六个角度字段分别占一行。
+3. 系统卡 action 仅有状态查询、上/下使能、清错和进入/退出拖拽；移除动作不能通过直接 API 调用。
+4. `get_status` 在反馈失效时返回未知状态，`info` 只返回卡片介绍。
+5. 本地模拟验证不操作真机，硬件操作由现场单独验收。

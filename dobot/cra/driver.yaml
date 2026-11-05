@@ -1,16 +1,15 @@
 id: dobot-cra-driver
-name: Dobot CRA Joints, Safe Skin and System Control
+name: Dobot CRA Joints and System Control
 category: driver
 hardware_provider: dobot
 hardware_model: cra
 image_name: dobot-cra
 port: 15746
 mcp_url: "http://localhost:15746/mcp"
-description: "CR3A skeleton and joint-angle JSON, safe-skin feedback/settings, explicit system control through one shared SDK command connection"
+description: "CR3A skeleton and joint-angle JSON, system status, enable/disable, alarm clearing and drag teaching through the official SDK"
 build_context_extras:
   - ../../common
 cards:
   - { name: joints, type: sensor }
-  - { name: safe_skin_control, type: actuator }
   - { name: systemcontrol, type: actuator }
   - { name: model, type: resource }

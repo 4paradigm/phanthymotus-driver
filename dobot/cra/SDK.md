@@ -23,13 +23,15 @@ The upstream SDK source and artifact checksum remain unchanged.
 The adapter imports upstream `DobotConnection`, `FeedbackParser`, `MyType` and
 the SDK version. It deliberately does not instantiate `DobotRobot`, whose
 connection lifecycle also opens Dashboard. A single receive-only feedback
-connection supplies joints and the safe_skin_control JSON output, even outside
-TCP control mode. There is no standalone safe_skin sensor. The safe_skin_control and systemcontrol actuators share one
-RobotController and a lazily created, serialized DashboardConnection. They call
-the official RobotControl methods for skin settings, operating state, diagnostics
-and explicit system actions. Startup never transmits control commands. SDK
-formatting is retained; the adapter uses sendall and complete semicolon framing
-to handle partial TCP writes/reads. No second Dashboard client is created.
+connection supplies the joints skeleton and joint-angle JSON, even outside
+TCP control mode. Only joints and systemcontrol are visible cards in this
+release; the model resource supplies background URDF geometry. No skin card,
+settings action or skin output topic is registered.
+
+System writes use a lazily created, serialized DashboardConnection and the
+official RobotControl methods. Startup never transmits control commands. SDK
+formatting is retained; sendall and complete semicolon framing handle partial
+TCP writes/reads. No second Dashboard client is created.
 
 Compatibility baseline: CRA six-axis V4 feedback layout, 1440 bytes, little
 endian, test magic `0x0123456789abcdef`, as documented by the supplied TCP/IP
@@ -57,34 +59,24 @@ Upstream is unmodified. The adapter handles:
   including after port changes from the joints configuration. Port 30006 therefore
   gets at least 3 seconds instead of timing out at its 1-second packet interval.
 
-All writes require explicit confirmation. No automatic takeover, enable, alarm
-clearing, motion resumption, IO write, arbitrary command endpoint or invented
-safe-skin reset is exposed. The system card calls RequestControl, PowerOn,
-EnableRobot, DisableRobot, ClearError, Stop, Pause, Continue, SpeedFactor,
-StartDrag and StopDrag; its explicit read-only GetErrorID query parses the
-documented flat JSON array of alarm codes. State guards are action-specific;
-stale feedback does not block stopping/disable/exit-drag requests or error
-queries. EnableRobot is called without load arguments, preserving the
-controller's configured payload and center parameters.
+All writes require explicit confirmation. The system card exposes only
+EnableRobot, DisableRobot, ClearError, StartDrag and StopDrag. RequestControl,
+PowerOn, GetErrorID, Stop, Pause, Continue and SpeedFactor are not routed by
+this release. Unknown and removed actions fail before opening a connection.
+State guards are action-specific; stale feedback does not block explicit
+disable or exit-drag requests. EnableRobot is called without load arguments,
+preserving the controller's configured payload and center parameters.
 
-Acknowledgements are not verified physical state changes. Skin switch and
-sensitivity readback are absent; the skin actuator's compact JSON output only reports trigger flags,
-and request records live in the actuator get_status response. Each card keeps its own
-request/error history. Writes are never automatically replayed.
+Acknowledgements are not verified physical state changes. The get_status
+action uses fresh feedback without opening Dashboard or echoing a previous
+write as actual state. It reports current enabled/running/paused/dragging/
+collision/error flags and nullable inferred power state, plus request history.
+Unavailable feedback yields null values. Writes are never replayed automatically.
+There is no separate alarm-number query in this release.
 
-RequestControl is exposed only by systemcontrol; the skin card rejects that
-action and omits the control-mode request flag. Skin regions are selected using
-arm/j4/j5/j6 names with human-readable titles. The adapter maps them to SDK
-part IDs internally and reports a part_name in request records. The original
-integer part values remain accepted by the Python adapter for existing callers.
-
-Only the two actuator cards expose get_status as a public action. The joints
-sensor publishes its data through output topics without business actions. The platform
-filters the reserved info action out of its selector; info now returns static
-card metadata only (description, schemas and ports). Status queries use fresh
-feedback without opening Dashboard or echoing a previous write as actual state.
-System status includes explicit enabled/running/paused/dragging/collision/error
-flags and nullable inferred power state. Unavailable feedback yields null values.
+Only systemcontrol exposes get_status as a public action. The joints sensor
+publishes through output topics without business actions. The reserved info
+action returns static card metadata (description, schemas and ports).
 
 Joint streams are intentionally compact: the skeleton carries timestamp,
 availability and name/q pairs in radians; the numeric JSON carries timestamp,

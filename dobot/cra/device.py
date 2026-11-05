@@ -1,4 +1,4 @@
-"""Joint skeleton and safe-skin cards sharing one feedback stream."""
+"""Joint skeleton and system control cards sharing one feedback stream."""
 
 from __future__ import annotations
 
@@ -12,11 +12,11 @@ from common.vendor_runtime import action_schema, tool
 if __package__:
     from .feedback import FeedbackClient, positive_number
     from .model import JOINT_NAMES, model_resource, resolve_model
-    from .control import PARTS, PART_LABELS, RobotController
+    from .control import RobotController
 else:
     from feedback import FeedbackClient, positive_number
     from model import JOINT_NAMES, model_resource, resolve_model
-    from control import PARTS, PART_LABELS, RobotController
+    from control import RobotController
 
 
 CARD_DESCRIPTIONS = {
@@ -42,7 +42,6 @@ class DobotSensors:
                 {"topic": f"/{prefix}/state/joints", "format": "sensor/skeleton"},
                 {"topic": f"/{prefix}/state/joint_angles", "format": "data/json"},
             ],
-            "safe_skin_control": [{"topic": f"/{prefix}/state/safe_skin", "format": "data/json"}],
         }
 
     def get_tools(self):
@@ -57,55 +56,23 @@ class DobotSensors:
                                   "description": "反馈端口；30006 自动使用至少 3 秒超时", "scope": "shared"},
             },
         }
-        schema = action_schema({
-            "info": ([], "查看卡片功能、参数及输出口定义，不读取运行状态"),
-            "get_status": ([], "查询当前触发状态和最近设置请求；请求记录不等于配置读回"),
-            "enable": (["confirm_change"], "开启安全皮肤总开关；不改变各部位灵敏度，不执行机械臂上使能"),
-            "disable": (["confirm_change"], "关闭安全皮肤总开关；移除皮肤接近保护，不执行机械臂下使能或碰撞复位"),
-            "set_sensitivity": (["part", "level", "confirm_change"], "设置部位灵敏度：0 关闭、1 ≤5 cm、2 ≤10 cm、3 ≤15 cm；手册范围，不同部位有区别"),
-            "start": ([], "启动实时触发状态输出，不发送设置命令"),
-            "stop": ([], "关闭共享命令连接，不修改安全皮肤设置"),
-            "config": ([], "确认卡片配置；共享 IP/端口通过 joints 配置"),
-        }, {
-            "part": {"type": "string", "enum": list(PARTS.values()),
-                     "oneOf": [{"const": name, "title": PART_LABELS[code]} for code, name in PARTS.items()],
-                     "description": "选择安全皮肤部位：小臂、J4（第4关节）、J5（第5关节）、J6（第6关节）"},
-            "level": {"type": "integer", "enum": [0, 1, 2, 3],
-                      "oneOf": [{"const": code, "title": label} for code, label in enumerate(("关闭该部位", "低灵敏度（接近距离 ≤5 cm）", "中灵敏度（接近距离 ≤10 cm）", "高灵敏度（接近距离 ≤15 cm）"))],
-                      "description": "手册标称接近范围：低 ≤5 cm、中 ≤10 cm、高 ≤15 cm；不同部位有区别，对非导体感应较弱，不是实时测距值"},
-            "confirm_change": {"type": "boolean", "enum": [False, True],
-                               "oneOf": [{"const": False, "title": "未确认（不执行）"}, {"const": True, "title": "确认执行本次设置"}],
-                               "default": False, "description": "选择“确认执行本次设置”才会提交；未确认不会发送命令"},
-        })
-        schema["x-is-dangerous"] = True
-        schema["x-resource"] = "arm"
-        definitions.append(tool("safe_skin_control", "actuator", "安全皮肤：实时触发 JSON 输出、总开关和分区灵敏度；队列提交不等于配置读回",
-                                schema, topic_out=self._topics["safe_skin_control"]))
         system_schema = action_schema({
             "info": ([], "查看卡片功能和参数说明，不读取运行状态"),
             "get_status": ([], "查询当前使能、上电、运行、暂停、拖拽、碰撞和报警状态，不发送控制命令"),
-            "get_errors": ([], "通过 SDK 查询控制器当前报警编号，不清除报警"),
-            "request_control": (["confirm_change"], "请求 TCP 控制权；仅未上电/下使能时允许，不自动使能"),
-            "power_on": (["confirm_change"], "给机械臂本体上电；等待反馈初始化完成后才能另行使能"),
             "enable": (["confirm_change"], "上使能，使用控制器已有负载设置，不清错或继续队列"),
             "disable": (["confirm_change"], "下使能；反馈过期时仍可尝试发送"),
             "clear_error": (["confirm_change"], "机器人静止时清除报警；不自动使能、复位皮肤或恢复运动"),
-            "stop_motion": (["confirm_change"], "停止运动指令队列/工程；与卡片 stop 不同"),
-            "pause": (["confirm_change"], "暂停正在执行的队列/工程；点动请使用 stop_motion"),
-            "resume": (["confirm_change"], "显式继续已暂停队列；可能恢复机械臂运动"),
-            "set_speed_factor": (["ratio", "confirm_change"], "设置全局速度比例，1–100%"),
             "start_drag": (["confirm_change"], "机器人静止且无报警/碰撞时进入关节拖拽示教"),
             "stop_drag": (["confirm_change"], "退出拖拽示教；反馈过期时仍可尝试发送"),
             "start": ([], "启动反馈读取，不发送控制命令"),
-            "stop": ([], "关闭共享 Dashboard 连接；不会发送停止运动指令"),
+            "stop": ([], "关闭 Dashboard 命令连接；不会发送停止运动指令"),
             "config": ([], "确认卡片配置；共享 IP/端口通过 joints 配置"),
         }, {
-            "ratio": {"type": "integer", "minimum": 1, "maximum": 100, "description": "全局速度百分比"},
             "confirm_change": {"type": "boolean", "description": "确认本次系统操作；写请求必须为 true"},
         })
         system_schema["x-is-dangerous"] = True
         system_schema["x-resource"] = "arm"
-        definitions.append(tool("systemcontrol", "actuator", "系统状态、报警查询、TCP 控制权、本体上电、使能及运行控制", system_schema))
+        definitions.append(tool("systemcontrol", "actuator", "系统状态查询、使能、报警清除及拖拽示教", system_schema))
         definitions.append(tool("model", "resource", "六轴 CR3A 直角连杆骨架 URDF，附加连接全部为固定关节"))
         return definitions
 
@@ -178,17 +145,6 @@ class DobotSensors:
                     for i, name in enumerate(JOINT_NAMES)
                 ]
             return skeleton
-        if name == "safe_skin_control":
-            # Feedback has proximity stops, not distance/configuration readback.
-            regions = {
-                name: None if state is None else bool(state[f"{name}_approach_state"])
-                for name in PARTS.values()
-            }
-            return {
-                "timestamp_ms": result["timestamp_ms"], "available": state is not None,
-                "any_approach_paused": None if state is None else any(regions.values()),
-                "regions": regions,
-            }
         raise ValueError(f"unknown sensor: {name}")
 
     def _publish(self):
@@ -219,19 +175,6 @@ class DobotSensors:
                     self.client.start()
                 return {"state": {"start": "ready", "stop": "idle", "config": "configured"}[action]}
             return self.control.execute_system(action, args)
-        if name == "safe_skin_control":
-            if action == "get_status":
-                return {"read_only": True, "topic_out": self._topics[name],
-                        **self.control.snapshot(), "feedback": self.payload(name)}
-            if action in ("start", "stop", "config"):
-                # Lifecycle does not claim control or cancel queued settings.
-                if action == "stop":
-                    self.control.close()
-                elif action == "start":
-                    self.client.start()
-                return {"state": {"start": "ready", "stop": "idle", "config": "configured"}[action],
-                        "topic_out": self._topics[name]}
-            return self.control.execute(action, args)
         if name not in CARD_DESCRIPTIONS:
             return None
         if action in ("config", "start"):
