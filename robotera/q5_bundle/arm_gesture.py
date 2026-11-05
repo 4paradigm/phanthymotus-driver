@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# arm_gesture —— Q5 手臂语义手势 (composes arm_control low-level joint positioning)
+# arm_gesture - Q5 semantic arm gestures (composes arm_control low-level joint positioning)
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ TOPIC = "/{ns}/q5/arm_gesture"
 FMT = "data/json"
 HZ = 2.0
 NODE = "q5_arm_gesture"
-DESC = "Q5 手臂语义手势：敬礼、欢迎、举手、握手、击掌、侧平举（保持）及归零，由 arm_control 绝对关节插补驱动"
+DESC = "Q5 semantic arm gestures: salute, welcome, raise, shake hands, high five, arms out with pose holding, and reset; driven by arm_control absolute joint interpolation."
 
 # ── Joint definitions ────────────────────────────────────────────────────────
 
@@ -64,15 +64,16 @@ _GESTURES_DEG = {
     "raise":           [-10, 95, 0, -15, 0, 0, 0],
     "shake_hands":     [-45, -10, -15, -20, 0, 0, 0],
     "high_five":       [-40, 40, -20, -80, 0, 0, 50],
-    # 侧平举：肩横滚 90°（左 +，右镜像为 −），肘伸直。到位后保持，不自动回正；放下用 reset。
+    # Horizontal arms: shoulder roll +90 degrees on the left, mirrored on the right,
+    # with straight elbows. Hold the target pose; use reset to lower the arms.
     "arms_out":        [0, 90, 0, 0, 0, 0, 0],
 }
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 _GESTURE_LABELS = {
-    "salute": "敬礼", "welcome": "欢迎", "raise": "举手",
-    "shake_hands": "握手", "high_five": "击掌", "arms_out": "侧平举并保持",
+    "salute": "Salute", "welcome": "Welcome", "raise": "Raise arm",
+    "shake_hands": "Shake hands", "high_five": "High five", "arms_out": "Arms out (hold)",
 }
 
 # Neutral pose: shoulder_pitch -30° (~-0.52 rad) so arms rest naturally in
@@ -252,12 +253,12 @@ class Plugin:
         actions = ["salute", "welcome", "raise", "shake_hands", "high_five", "arms_out", "reset",
                    "cancel", "stop", "start", "info"]
         one_of_actions = [
-            {"const": "start", "title": "检查连接状态"},
+            {"const": "start", "title": "Check connection"},
             *[{"const": name, "title": label} for name, label in _GESTURE_LABELS.items()],
-            {"const": "reset", "title": "归零"},
-            {"const": "cancel", "title": "取消并保持"},
-            {"const": "stop", "title": "停止并归零"},
-            {"const": "info", "title": "查看状态"},
+            {"const": "reset", "title": "Reset"},
+            {"const": "cancel", "title": "Cancel and hold"},
+            {"const": "stop", "title": "Stop"},
+            {"const": "info", "title": "View status"},
         ]
         return {
             "name": CARD,
@@ -269,49 +270,49 @@ class Plugin:
                 "properties": {
                     "action": {"type": "string", "enum": actions, "oneOf": one_of_actions},
                     "side": {
-                        "type": "string", "title": "执行侧", "enum": ["left", "right", "both"],
+                        "type": "string", "title": "Arm side", "enum": ["left", "right", "both"],
                         "default": "right",
                         "oneOf": [
-                            {"const": "left", "title": "左臂"},
-                            {"const": "right", "title": "右臂"},
-                            {"const": "both", "title": "双臂"},
+                            {"const": "left", "title": "Left arm"},
+                            {"const": "right", "title": "Right arm"},
+                            {"const": "both", "title": "Both arms"},
                         ],
-                        "description": "执行手臂选择。",
+                        "description": "Select the arm or arms to move.",
                     },
                     "salute_side": {
-                        "type": "string", "title": "敬礼侧", "enum": ["left", "right"],
+                        "type": "string", "title": "Salute side", "enum": ["left", "right"],
                         "default": "right",
                         "oneOf": [
-                            {"const": "left", "title": "左臂敬礼"},
-                            {"const": "right", "title": "右臂敬礼"},
+                            {"const": "left", "title": "Left-arm salute"},
+                            {"const": "right", "title": "Right-arm salute"},
                         ],
-                        "description": "敬礼只支持单臂，默认右臂。",
+                        "description": "Salute supports one arm at a time; defaults to the right arm.",
                     },
                     "cycles": {
-                        "type": "integer", "title": "循环次数",
+                        "type": "integer", "title": "Cycles",
                         "minimum": 1, "maximum": 5, "default": 2,
-                        "description": "握手/欢迎的摆动循环次数 [1,5]。",
+                        "description": "Number of shake-hands or welcome oscillation cycles, from 1 to 5.",
                     },
                     "speed": {
-                        "type": "number", "title": "关节速度(rad/s)",
+                        "type": "number", "title": "Joint speed (rad/s)",
                         "minimum": 0.2, "maximum": 1.5, "default": 0.8,
-                        "description": "关节插补速度，范围[0.2,1.5]，默认0.8。",
+                        "description": "Joint interpolation speed in rad/s, from 0.2 to 1.5; defaults to 0.8.",
                     },
                 },
                 "required": ["action"],
                 "additionalProperties": False,
                 "x-action-params": {
-                    "salute": {"params": ["salute_side", "speed"], "description": "抬起小臂、将手靠近额侧、停留后回正"},
-                    "welcome": {"params": ["side", "cycles", "speed"], "description": "在身体侧上方抬起手掌并左右摆动后回正"},
-                    "raise": {"params": ["side", "speed"], "description": "将手臂高举到头部上方后回正"},
-                    "shake_hands": {"params": ["side", "cycles", "speed"], "description": "向前伸手并轻柔上下摆动，做出握手动作"},
-                    "high_five": {"params": ["side", "speed"], "description": "将手掌伸到身体前方并保持在肩部附近，做出击掌等待姿势"},
-                    "arms_out": {"params": ["side", "speed"], "description": "手臂向身体侧面平举到水平并保持，不自动回正；放下用 reset"},
-                    "reset": {"params": ["speed"], "description": "取消序列并回到中性姿态"},
-                    "cancel": {"params": [], "description": "取消尚未发送的后续动作帧，并保持当前位置"},
-                    "stop": {"params": [], "description": "停止当前手势并回到中性姿态（归零）"},
-                    "start": {"params": [], "description": "检查 ROS 连接和机器人状态"},
-                    "info": {"params": [], "description": "查看当前运动和安全条件"},
+                    "salute": {"params": ["salute_side", "speed"], "description": "Raise the forearm toward the forehead, pause, then return to neutral."},
+                    "welcome": {"params": ["side", "cycles", "speed"], "description": "Raise a hand beside the body, wave, then return to neutral."},
+                    "raise": {"params": ["side", "speed"], "description": "Raise the arm above the head, then return to neutral."},
+                    "shake_hands": {"params": ["side", "cycles", "speed"], "description": "Extend a hand forward, gently oscillate it for a handshake, then return to neutral."},
+                    "high_five": {"params": ["side", "speed"], "description": "Extend a hand in front of the body near shoulder height for a high five, then return to neutral."},
+                    "arms_out": {"params": ["side", "speed"], "description": "Extend the arm or arms sideways to horizontal and hold; use reset to lower them."},
+                    "reset": {"params": ["speed"], "description": "Cancel the sequence and return both arms to neutral."},
+                    "cancel": {"params": [], "description": "Cancel remaining motion frames and hold the current position."},
+                    "stop": {"params": [], "description": "Stop the current gesture and hold the current position."},
+                    "start": {"params": [], "description": "Check ROS connectivity and robot status."},
+                    "info": {"params": [], "description": "View the current motion status and safety conditions."},
                 },
                 "x-completion": {
                     "actions": ["salute", "welcome", "raise", "shake_hands", "high_five", "arms_out", "reset"],
