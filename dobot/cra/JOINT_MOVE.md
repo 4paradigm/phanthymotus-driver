@@ -74,18 +74,29 @@ MovJ(joint={10.000000,-30.000000,60.000000,0.000000,90.000000,-10.000000},a=10,v
 - `stop_motion` 在反馈失效时仍可尝试发送，但必须已经配置控制器 IP。
 - `info` 只介绍功能，`start/config/stop` 为内部生命周期，不发送物理运动指令。
   其中内部 `stop` 只关闭连接，真正停止运动须使用 `stop_motion`。
-- 执行结果由 action 返回；实时角度继续读取 `joints`。
-  不新增运动 sensor，不提供 `get_status` action，不自动判断“已到达”。
+- action 返回异步任务 ID，终态通过 ACP 回调上报；实时角度继续读取 `joints`。
+  不新增运动 sensor，不提供 `get_status` action。
 
-返回 ACK 时记录 `submitted` 或 `accepted_unverified`，并保留 `effect_verified=false`。
-超时或断线记录为结果不确定，不自动重发。本卡保存最近请求记录，
-切换控制器地址/反馈端口时同时清空。
+四个 action 立即返回 `state=running` 和唯一 `action_id`，后台完成准备、提交和反馈监测。
+通过 ACP POST 上报 `completed/error/cancelled`，对应同一个 action_id；SDK 应答和队列号不是到位通知。
+
+| action | 完成条件 |
+|---|---|
+| move_j | 新反馈确认队列关联或已观察到运行，随后空闲且六轴实际角度到达目标（默认误差 ≤0.5°） |
+| resume | 已观察到关联队列/运行结束；若有本卡暂停的目标，还要确认到达该目标 |
+| pause | 连续两包新反馈确认模式 10、暂停标志，并且无运行/点动、六轴实际速度均 ≤0.1°/s |
+| stop_motion | 连续两包新反馈确认无运行/点动、队列不再运行、六轴实际速度均 ≤0.1°/s |
+
+运动超时或反馈异常返回 error，不把 ACK 当成完成；运动监测失败后尝试一次 Stop。
+暂停/停止可中断当前动作，原动作以 cancelled 结束，新动作有独立 ID 和完成通知。
+停止在反馈失效时仍可下发，但上报无法确认停稳，不上报 completed。
+不自动重放运动命令；命令/反馈诊断保留在驱动内部，不新增状态输出口。
 
 ## 本地验证
 
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/dobot-build-fix-venv/bin/python -m pytest \
-  tests/test_dobot_joint_move.py \
+  tests/test_dobot_joint_move.py tests/test_dobot_completion.py \
   tests/test_dobot_cra_sensors.py tests/test_dobot_skeleton_structure.py -q
 ```
 
@@ -94,7 +105,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/dobot-build-fix-venv/bin/python -m pytest 
 ## 运动前清错
 
 每次 `move_j` 都在同一命令锁内执行 检查使能 → 必要时 EnableRobot 并等待反馈确认 → `EnableSafeSkin(0)` → 检查成功应答 → `ClearError()` → 检查成功应答 → 复查反馈状态 → `MovJ()`。
-清错拒绝、应答异常或超时均中止本次运动，不自动重试。返回结果中的 `clear_error_response`
+清错拒绝、应答异常或超时均中止本次运动，不自动重试。内部请求记录中的 `clear_error_response`
 记录成功清错的应答。此应答不代表物理故障已消除。
 最终运动检查保留：准备完成后若仍存在碰撞、保护触发或报警，则拒绝运动。
 `pause`、`stop_motion` 和 `resume` 不追加清错，以免影响暂停队列。
@@ -104,7 +115,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/dobot-build-fix-venv/bin/python -m pytest 
 每次有效的 `move_j` 和 `resume` 请求均在确认使能后发送 `EnableSafeSkin(0)`，包括复用连接时。
 收到成功应答后重新检查运动条件；拒绝、无效应答或超时均中止，不自动重试。
 `move_j` 随后执行清错和 MovJ；`resume` 随后执行 Continue，不额外清错。
-应答记录在 `safe_skin_disable_response`，不宣称已通过状态读回验证关闭效果。
+内部请求的应答记录在 `safe_skin_disable_response`，不宣称已通过状态读回验证关闭效果。
 已有碰撞、皮肤暂停或报警允许进入准备步骤，但未消除时会阻止最终运动。
 停止和暂停不关闭安全皮肤，卡片不自动重新开启安全皮肤。
 
@@ -118,3 +129,11 @@ resume 在使能后还必须保持模式 10；若暂停队列已丢失、回到�
 
 最终状态确认最多等待 joint_move.enable_timeout_s 秒；应答成功不代表保护状态已经解除。
 使能、皮肤设置或清错被控制器拒绝时直接中止，不改变上述顺序，也不自动重试。
+
+## 完成通知部署
+
+部署通过只读证书目录挂载提供 AGENT_CORE_CA_CERT，并使用带正确主机名的 AGENT_CORE_URL。
+默认地址 https://phanthy-motus:15678，地址映射至 127.0.0.1；可通过 DOBOT_AGENT_CORE_URL、
+DOBOT_AGENT_CORE_HOSTNAME、DOBOT_AGENT_CORE_ADDRESS、DOBOT_CA_DIR 和 DOBOT_AGENT_CORE_CA_CERT 覆盖。
+TLS 不关闭校验，完成通知最多尝试三次，每次使用同一个 action_id；通知重试不重发机器人命令。缺少 CA 时拒绝开始运动/继续/暂停；显式 Stop 仍允许下发，回调失败会记入日志。
+运动确认最长 joint_move.motion_timeout_s 秒（默认 300）；x-completion 的 timeout 另计准备与通信余量。

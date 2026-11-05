@@ -1,14 +1,19 @@
+# syntax=docker/dockerfile:1
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
-FROM ${ROS_BASE_IMAGE}
+FROM ${ROS_BASE_IMAGE} AS sdk-builder
 ARG PYPI_MIRROR=https://pypi.org/simple/
+WORKDIR /build
+COPY build-requirements.txt requirements.txt ./
+RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} -r build-requirements.txt \
+    && python3 -m pip wheel --no-cache-dir --no-build-isolation -i ${PYPI_MIRROR} -r requirements.txt -w /build/wheels
 
+FROM ${ROS_BASE_IMAGE}
 WORKDIR /work
-COPY build-requirements.txt requirements.txt /work/dobot/cra/
-RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} -r /work/dobot/cra/build-requirements.txt \
-    && python3 -m pip install --no-cache-dir --no-build-isolation -i ${PYPI_MIRROR} -r /work/dobot/cra/requirements.txt \
+RUN --mount=type=bind,from=sdk-builder,source=/build/wheels,target=/tmp/dobot-wheels \
+    python3 -m pip install --no-cache-dir --no-index /tmp/dobot-wheels/*.whl \
     && python3 -c 'from dobot_sdk.protocol.data_types import MyType; assert MyType.itemsize == 1440'
 COPY common/ /work/common/
-COPY main.py device.py feedback.py control.py model.py config.yaml driver.yaml SDK.md /work/dobot/cra/
+COPY main.py device.py feedback.py control.py completion.py model.py config.yaml driver.yaml SDK.md /work/dobot/cra/
 COPY resource/ /work/dobot/cra/resource/
 COPY deploy/ /deploy/
 

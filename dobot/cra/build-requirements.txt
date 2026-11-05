@@ -1,3 +1,4 @@
+# Build-stage only: these packages are not copied into the runtime image.
 # Explicit PEP 517 toolchain for the Ubuntu 22.04 / Python 3.10 ROS image.
 # The SDK declares setuptools-scm>=6.2 with no upper bound; newer releases can
 # pull vcs-versioning and conflict with the base image's system packaging.

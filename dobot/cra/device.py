@@ -13,10 +13,12 @@ if __package__:
     from .feedback import FeedbackClient, positive_number
     from .model import JOINT_NAMES, model_resource, resolve_model
     from .control import JOINT_LIMITS_DEG, RobotController
+    from .completion import MotionCompletion
 else:
     from feedback import FeedbackClient, positive_number
     from model import JOINT_NAMES, model_resource, resolve_model
     from control import JOINT_LIMITS_DEG, RobotController
+    from completion import MotionCompletion
 
 
 CARD_DESCRIPTIONS = {
@@ -25,9 +27,12 @@ CARD_DESCRIPTIONS = {
 
 
 class DobotSensors:
+    PREFIX = "dobot_cra"
+
     def __init__(self, config, namespace="dobot_cra", ros2=None, client=None, controller=None):
         self.client = client if client is not None else FeedbackClient(config)
         self.control = controller if controller is not None else RobotController(self.client, config)
+        self.completion = MotionCompletion(self.control, config)
         self._hz = positive_number(config.get("publish_hz", 30), "publish_hz")
         if self._hz > 125:
             raise ValueError("publish_hz must not exceed the 125 Hz feedback rate")
@@ -80,6 +85,8 @@ class DobotSensors:
                                        {"const": True, "title": "确认执行本次运动操作"}],
                              "description": "本卡每次运动控制操作都需明确确认"},
         })
+        motion_schema["x-completion"] = {"actions": ["move_j", "resume", "pause", "stop_motion"], "timeout": self.completion.contract_timeout}
+        motion_schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop_motion", "params": {"confirm_move": True}}}
         motion_schema["x-is-dangerous"] = True
         motion_schema["x-resource"] = "arm"
         motion_tool = tool("joint_move", "actuator", "CR3A 绝对关节角度运动、停止、暂停与继续；角度单位为度", motion_schema)
@@ -119,6 +126,7 @@ class DobotSensors:
             self.client.start()
 
     def stop(self):
+        self.completion.shutdown()
         with self._lifecycle:
             node, self._node = self._node, None
             if node is not None:
@@ -187,6 +195,8 @@ class DobotSensors:
                 elif action == "start":
                     self.client.start()
                 return {"state": {"start": "ready", "stop": "idle", "config": "configured"}[action]}
+            if action in ("move_j", "resume", "pause", "stop_motion"):
+                return self.completion.start(action, args)
             return self.control.execute_motion(action, args)
         if name not in CARD_DESCRIPTIONS:
             return None

@@ -87,6 +87,8 @@ bash build.sh --mirror none dobot/cra
 ```
 
 SDK 及构建工具固定版本，源码校验 SHA-256；构建机需访问 GitHub codeload。
+两阶段构建仅在 builder 中安装构建工具，运行镜像仍包含 SDK、numpy、requests、PyYAML 等必要第三方依赖。
+这些运行依赖会增加镜像体积；本次未测量实际 ARM64 镜像体积。
 部署使用 `/deploy/service.yml`、host 网络、平台 DDS loopback 配置，domain 42，
 MCP 端口 `15746`，容器名 `embodied-dobot-cra`；无需主机 SDK 或 privileged。
 
@@ -94,7 +96,7 @@ MCP 端口 `15746`，容器名 `embodied-dobot-cra`；无需主机 SDK 或 privi
 python3 -m venv .venv
 .venv/bin/pip install -r dobot/cra/build-requirements.txt
 .venv/bin/pip install --no-build-isolation -r dobot/cra/requirements.txt pytest
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra_sensors.py tests/test_dobot_skeleton_structure.py tests/test_dobot_joint_move.py -q
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra_sensors.py tests/test_dobot_skeleton_structure.py tests/test_dobot_joint_move.py tests/test_dobot_completion.py -q
 .venv/bin/python scripts/check_service_yml.py
 ```
 
@@ -114,3 +116,7 @@ move_j/resume 先检查使能，未使能时发送一次 EnableRobot 并等待�
 失败不继续也不重试。
 不自动重新 enable 安全皮肤。模式 11 等保护状态不会提前阻止准备命令；
 仅在准备完成后确认模式 5（move_j）或模式 10（resume）、已使能且无保护触发，才发送最终运动命令。
+
+四个运动 action 均返回 action_id，通过 ACP 完成回调报告真实终态；命令应答不等于运动完成。
+暂停/停止也要等待新反馈确认状态与实际速度，缺失反馈不宣称停稳。
+部署增加 Agent Core CA 证书只读挂载与主机名映射，保持 TLS 校验；详细要求见 JOINT_MOVE.md。

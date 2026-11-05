@@ -180,7 +180,7 @@ class RobotController:
             raise RuntimeError("move_j requires an idle robot without a paused or running queue")
         return sample
 
-    def execute_motion(self, action, args):
+    def execute_motion(self, action, args, *, cancel=None):
         commands = {"move_j": "MovJ", "stop_motion": "Stop", "pause": "Pause", "resume": "Continue"}
         if action not in commands:
             raise ValueError(f"unsupported joint motion action: {action}")
@@ -203,6 +203,8 @@ class RobotController:
             requested = {f"{joint}_deg": angle for joint, angle in zip(JOINT_NAMES, angles)}
             requested.update(velocity=options["v"], acceleration=options["a"])
         def check_state(current_action):
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("motion interrupted")
             if current_action in ("move_j", "resume"):
                 return self._check_preparation_state(current_action)
             return self._check_motion_state(current_action)

@@ -13,8 +13,10 @@ host, shared-object mount, or controller-side installation is required. The SDK
 is Python/numpy/requests, with no x86-only native robot library.
 
 The SDK source declares an unbounded `setuptools_scm>=6.2` build requirement.
-`build-requirements.txt` pins the build toolchain before pip installs the SDK
-with `--no-build-isolation`. This prevents an isolated build from resolving a
+`build-requirements.txt` pins the toolchain in a disposable sdk-builder stage.
+That stage runs pip wheel with `--no-build-isolation`; the final stage installs
+only runtime wheels using a temporary BuildKit bind mount. The pinned build
+toolchain and downloaded wheel archives are not copied into runtime layers. This prevents an isolated build from resolving a
 new scm/vcs-versioning stack against Ubuntu's older system `packaging`.
 All required build dependencies are installed explicitly, as required by
 [pip's build isolation contract](https://pip.pypa.io/en/stable/reference/build-system/#disabling-build-isolation).
@@ -83,3 +85,19 @@ Preparation validates connection, model, and stationary/locked-brake conditions
 without requiring mode 5 or clear alarm/collision/approach flags. Those final
 conditions are checked after EnableRobot/EnableSafeSkin/ClearError (move_j),
 with bounded feedback waiting. Persistent protection prevents MovJ/Continue.
+
+
+The runtime still includes third-party dependencies: the pinned SDK, numpy,
+requests, PyYAML and their runtime dependencies. These increase image size over
+the ROS base; no zero-growth claim is made. The exact ARM64 image delta requires
+an actual container build and has not been measured locally.
+
+All four actuator actions advertise x-completion and return action_id immediately.
+Preparation/submission errors and monitored terminal results are posted to
+Agent Core /api/acp/complete using verified HTTPS and a matching action_id ACK.
+move_j requires new feedback, queue/running correlation, idle state and actual
+joint target tolerance; resume requires correlated queue end (and the known
+paused joint target when applicable). Pause/Stop require two new feedback packets
+with no running/jog flags and absolute joint velocities <=0.1 deg/s; Pause also
+requires mode 10 and pause flag. Stop remains available without feedback or CA,
+but cannot report verified completion without fresh stationary feedback.

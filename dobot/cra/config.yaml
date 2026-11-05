@@ -17,6 +17,8 @@ joint_move:
   connect_timeout_s: 2
   receive_timeout_s: 2
   enable_timeout_s: 5
+  motion_timeout_s: 300
+  target_tolerance_deg: 0.5
 ros:
   robot_domain_id: 42
   core_domain_id: 42

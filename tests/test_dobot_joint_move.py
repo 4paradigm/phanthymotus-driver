@@ -120,17 +120,39 @@ def move(control, **changes):
 
 def test_absolute_degrees_use_joint_coordinates_and_explicit_default_rates():
     feedback, dashboard, control, calls = ready()
-    bundle = DriverBundle([DobotSensors({}, client=feedback, controller=control)])
+    plugin = DobotSensors({}, client=feedback, controller=control)
+    completions = []
+    plugin.completion._notify = lambda *event: completions.append(event)
+    original = dashboard.send_receive_text
+    original_snapshot = feedback.snapshot
+    packet_count = [0]
+    def send(command):
+        reply = original(command)
+        if command.startswith('MovJ('):
+            feedback.sample['data']['joint_state']['q_actual'] = list(TARGET.values())
+            feedback.sample['data']['current_command_id'] = 3
+        return reply
+    def snapshot():
+        packet_count[0] += 1
+        return {**original_snapshot(), 'packets_received': packet_count[0]}
+    dashboard.send_receive_text = send
+    feedback.snapshot = snapshot
+    bundle = DriverBundle([plugin])
     try:
         result = bundle.dispatch('joint_move', {'action': 'move_j', **TARGET, 'confirm_move': True})
+        assert result['state'] == 'running' and result['action_id'].startswith('dobot_cra_move_j_')
+        import time
+        deadline = time.monotonic() + 1
+        while not completions and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert completions and completions[0][:2] == (result['action_id'], 'completed')
         assert dashboard.commands == ['EnableSafeSkin(0)', 'ClearError()', MOVJ] and len(calls) == 1
-        assert result['state'] == 'submitted' and result['result_id'] == 3
-        assert result['effect_verified'] is False
-        assert {key: result[key] for key in TARGET} == TARGET
-        assert result['velocity'] == 10 and result['acceleration'] == 10
-        assert control.snapshot('joint_move')['last_request'] == result
+        request = control.snapshot('joint_move')['last_request']
+        assert request['state'] == 'submitted' and request['result_id'] == 3
+        assert request['effect_verified'] is False
+        assert {key: request[key] for key in TARGET} == TARGET
     finally:
-        control.close()
+        plugin.stop()
 
 
 def test_custom_rates_are_per_command_without_global_speed_or_coordinate_settings():
