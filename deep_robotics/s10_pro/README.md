@@ -2,7 +2,7 @@
 
 This is the final S10 Pro bundle. It combines the upstream isolated ROS reader
 and skeleton mapping with the validated native TCP control cards, ACP
-completion callbacks, four camera lanes, split raw/map LiDAR streams, lights,
+completion callbacks, four RTSP camera lanes, split raw/map LiDAR streams, lights,
 charging and navigation.
 
 | Card | Input | Output |
@@ -10,6 +10,7 @@ charging and navigation.
 | Battery | `/BATTERY_DATA` (`drdds/msg/BatteryData`) | `soc`, `soh`, `current`, `voltage`, `cell_vol`, `temperature`, `cycle` as JSON |
 | Joints | `/JOINTS_DATA_10HZ` (`drdds/msg/JointsData`) and `/IMU` | `joints_info` JSON with joint names/angles/speeds/torques/temperatures; `joints` skeleton with 16 joints and IMU orientation |
 | LiDAR | 22 historical/live PointCloud2 candidates; `/ACCUMULATED_POINTS_MAP` remains the map source | Split `lidar_cloud` and `lidar_map` `sensor/pointcloud` streams with bounded latest-frame workers; only one fresh cloud source is active at a time |
+| Cameras | S10/S10 Pro default RTSP service at `10.21.33.103:8554` | `camera_front` `/video4`, `camera_rear` `/video0`, `camera_left` `/video2`, `camera_right` `/video6`; direct RTSP outputs, not ROS image subscriptions |
 | IMU | `/IMU` (`sensor_msgs/msg/Imu`) | source `header.stamp`, quaternion (w,x,y,z), angular velocity, linear acceleration, Euler angles (radians), temperature |
 
 `model` returns the S10 skeleton URDF used by the joint renderer. It is a
@@ -27,12 +28,16 @@ Joint latency and LiDAR coordinate refinements remain separate local work.
 Motion uses native S10 TCP commands and reports long-running completion through
 `/api/acp/complete`; locomotion movement accepts `yaw_rate_deg_s` in degrees per
 second and a bounded duration. Head and tail lights are independent cards.
+RTSP host defaults to the configured `basic_server.host` and can be overridden
+with `S10_RTSP_HOST`. The supplied vendor guide documents the stream URLs and
+VLC playback; it does not specify the video codec, so `video/h265` remains to
+be confirmed against the target robot firmware.
 
 ## Runtime
 
 The MCP server listens on loopback port 15745. `ROS_NAMESPACE` defaults to
-`s10_pro`; output topics follow `/<namespace>/<stream>` (for example
-`/s10_pro/imu`).
+`s10_pro`; DDS output topics follow `/<namespace>/<stream>` (for example
+`/s10_pro/imu`). Camera cards expose the direct RTSP URLs documented above.
 Four sensor calls use empty arguments. Start/stop/status/config lifecycle calls
 remain supported by the shared MCP bundle; stopping a card releases only its
 own subscription lease. Data is published only while the relevant input is
@@ -40,17 +45,17 @@ fresh. Input freshness uses local monotonic receipt time, not ROS clock time.
 
 Fast DDS profile selection is process-global. The parent and its domain-42
 publishers are loopback-only, while the robot ROS participant uses the validated
-S10-facing interface and vendor UDP profile. Media conversion and publication
-use independent bounded lanes so a camera or point-cloud frame cannot block
-control/state callbacks.
+S10-facing interface and vendor UDP profile. Point-cloud packing uses bounded
+lanes so it cannot block control/state callbacks. Camera cards expose RTSP URLs
+directly and do not subscribe to ROS image topics.
 
 ## Image and deployment
 
 Build with the repository's normal driver build workflow. `driver.yaml` declares
 `../../common` as a build-context extra; the Dockerfile expects the staged
-`common/` directory. It pins the ROS Jazzy base image by digest, builds the six
-required vendor message definitions in a build stage, and copies only their
-runtime interfaces into the final image. See `vendor/SOURCE.md` for provenance.
+`common/` directory. It uses the configured ROS Humble base image, builds the
+required vendor message definitions in a build stage, and copies their runtime
+interfaces into the final image. See `vendor/SOURCE.md` for provenance.
 
 `deploy/service.yml` is a service fragment for the normal platform deployment.
 Before starting, provision these host files:

@@ -92,7 +92,7 @@ class S10Nodes:
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
         from drdds.msg import BatteryData, JointsData, MotionInfo
-        from sensor_msgs.msg import CompressedImage, Image, Imu, PointCloud2
+        from sensor_msgs.msg import Imu, PointCloud2
         from std_msgs.msg import String
 
         self.json = json
@@ -111,33 +111,17 @@ class S10Nodes:
             "lidar_cloud": {"topic": base + "lidar_cloud", "format": "sensor/pointcloud"},
             "lidar_map": {"topic": base + "lidar_map", "format": "sensor/pointcloud"},
         }
-        # The Pro camera service numbers its physical inputs tail, left, head,
-        # right. Subscribe to USB names and semantic aliases alike.
-        camera_topics = dict(config.get("camera_topics", {
-            "camera_rear": ["/camera/rear/image_raw", "/camera/rear/image_raw/compressed",
-                         "/camera/rear/color/image_raw", "/camera/rear/color/image_raw/compressed",
-                         "/camera_back/image_raw", "/camera_0/image_raw",
-                         "/usb_camera_1/image_raw", "/usb_camera_1/image_raw/compressed",
-                         "/DEPTH_IMAGE"],
-            "camera_left": ["/camera/left/image_raw", "/camera/left/image_raw/compressed",
-                         "/camera/left/color/image_raw", "/camera/left/color/image_raw/compressed",
-                         "/camera_left/image_raw", "/camera_1/image_raw",
-                         "/usb_camera_2/image_raw", "/usb_camera_2/image_raw/compressed",
-                         ],
-            "camera_front": ["/camera/front/image_raw", "/camera/front/image_raw/compressed",
-                         "/camera/front/color/image_raw", "/camera/front/color/image_raw/compressed",
-                         "/camera_front/image_raw", "/camera_2/image_raw",
-                         ],
-            "camera_right": ["/camera/right/image_raw", "/camera/right/image_raw/compressed",
-                         "/camera/right/color/image_raw", "/camera/right/color/image_raw/compressed",
-                         "/camera_right/image_raw", "/camera_3/image_raw",
-                         "/usb_camera_1/image_raw_2", "/usb_camera_1/image_raw_2/compressed",
-                         ],
-        }))
-        for lane in CAMERA_LANES:
-            camera_topics.setdefault(lane, [])
-        self.topics.update({key: {"topic": base + key, "format": "image/jpeg"}
-                            for key in camera_topics})
+        camera_config = dict(config.get("camera_rtsp", {}))
+        camera_format = str(camera_config.pop("format", "video/h265"))
+        camera_host = str(os.environ.get("S10_RTSP_HOST") or camera_config.pop(
+            "host", config.get("basic_server", {}).get("host", "10.21.33.103")))
+        for key in CAMERA_LANES:
+            path = camera_config.get(key)
+            if path:
+                self.topics[key] = {
+                    "topic": f"rtsp://{camera_host}:8554/{str(path).lstrip('/')}",
+                    "format": camera_format,
+                }
         self.publishers = {
             key: self.bridge.create_publisher(key, spec["topic"], String)
             for key, spec in self.topics.items() if key not in LIDAR_LANES
@@ -149,20 +133,9 @@ class S10Nodes:
             for lane in LIDAR_LANES
         }
         self.lidar_publisher = self.lidar_publishers["lidar_cloud"]
-        from sensor_msgs.msg import CompressedImage
-        self.camera_publishers = {
-            key: self.bridge.create_publisher(key, self.topics[key]["topic"], CompressedImage)
-            for key in camera_topics
-        }
         self.media_workers = None
         if config.get("media_workers", False):
             self.media_workers = MediaWorkers(self._handle_media_result)
-            for key, configured_topics in camera_topics.items():
-                source_topics = [configured_topics] if isinstance(configured_topics, str) else configured_topics
-                if source_topics and all(topic.endswith("/compressed") for topic in source_topics):
-                    self.media_workers.add_compressed_camera(key)
-                else:
-                    self.media_workers.add_camera(key)
             for lane in LIDAR_LANES:
                 self.media_workers.add_lidar(lane)
         topics = config.get("topics", {})
@@ -172,20 +145,18 @@ class S10Nodes:
                                 reliability=ReliabilityPolicy.BEST_EFFORT,
                                 durability=DurabilityPolicy.VOLATILE)
         self._sensor_qos = stream_qos
-        # The node's default callback group is mutually exclusive. Give each
-        # media lane its own group so slow point-cloud ingress cannot block
-        # camera callbacks, while aliases within one camera remain serialized.
+        # The node's default callback group is mutually exclusive. Keep LiDAR
+        # callbacks independent so point-cloud ingress cannot block state data.
         self._media_callback_groups = {
-            lane: MutuallyExclusiveCallbackGroup() for lane in (*CAMERA_LANES, *LIDAR_LANES)
+            lane: MutuallyExclusiveCallbackGroup() for lane in LIDAR_LANES
         }
         self._stream_lock = threading.Lock()
-        self._camera_source_lock = threading.Lock()
         self._stream_stats = {
             name: {"received": 0, "published": 0, "dropped": 0,
                    "last_received": None, "last_published": None,
                    "last_rate_log": time.monotonic(), "last_rate_count": 0,
                    "received_hz": 0.0, "published_hz": 0.0}
-            for name in self.topics
+            for name in self.topics if not name.startswith("camera_")
         }
         self._motion_lock = threading.Lock()
         self.motion_sequence = 0
@@ -200,7 +171,6 @@ class S10Nodes:
             "lidar_cloud": topics.get("lidar_cloud", topics.get("lidar", "/DEPTH_POINTS")),
             "lidar_map": topics.get("lidar_map", "/ACCUMULATED_POINTS_MAP"),
         }
-        self._source_topics.update({key: value for key, value in camera_topics.items()})
         self.robot.create_subscription(Imu, topics.get("imu", "/IMU"), self._forward_imu, stream_qos)
         self.robot.create_subscription(JointsData, topics.get("joints", "/JOINTS_DATA_10HZ"), self._forward_joints, stream_qos)
         self.robot.create_subscription(BatteryData, topics.get("battery", "/BATTERY_DATA"), self._forward_battery, stream_qos)
@@ -215,39 +185,13 @@ class S10Nodes:
         self._lidar_source_last_seen = {}
         self._lidar_topic_stats = {}
         self._lidar_source_lock = threading.Lock()
-        self._configured_camera_lanes = {
-            topic: key for key, values in camera_topics.items()
-            for topic in ([values] if isinstance(values, str) else values)
-        }
-        # Reserve lane assignments while scanning the ROS graph, but only let
-        # a lane's first callback claim its active source. This avoids assigning
-        # several newly discovered image topics to one lane before any frame arrives.
-        self._camera_topic_lanes = {}
         self._lidar_callback_groups = {}
         self._media_topic_subscriptions = set()
         self._media_topic_types = {}
         self._media_subscription_handles = {}
         self._discovered_media = set()
         self._media_subscriptions = []
-        self._camera_lane_sources = {}
         self._scan_media_topics()
-        # Keep configured aliases as a compatibility fallback when a ROS graph
-        # implementation does not report publishers until after discovery.
-        for topic, key in self._configured_camera_lanes.items():
-            if topic in self._media_topic_subscriptions:
-                continue
-            msg_type = CompressedImage if topic.endswith("/compressed") else Image
-            callback = lambda msg, camera=key, source=topic: self._forward_camera_alias(
-                camera, source, msg)
-            handle = self.robot.create_subscription(
-                msg_type, topic, callback, self._sensor_qos,
-                callback_group=self._media_callback_groups[key])
-            self._media_subscriptions.append(handle)
-            self._media_topic_subscriptions.add(topic)
-            self._media_topic_types[topic] = msg_type
-            self._media_subscription_handles[topic] = handle
-            if not self._source_topics.get(key):
-                self._source_topics[key] = topic
         for topic in self._lidar_topics:
             self._subscribe_lidar_candidate(topic, PointCloud2)
         if self._lidar_map_topic not in self._media_topic_subscriptions:
@@ -258,28 +202,18 @@ class S10Nodes:
             self._media_topic_subscriptions.add(self._lidar_map_topic)
             self._media_topic_types[self._lidar_map_topic] = PointCloud2
             self._media_subscription_handles[self._lidar_map_topic] = handle
-        camera_subscriptions = sum(
-            1 for topic in self._media_topic_subscriptions
-            if topic in self._configured_camera_lanes or
-            topic in self._camera_topic_lanes
-        )
-        lidar_subscriptions = sum(
-            1 for topic in self._media_topic_subscriptions
-            if topic not in self._configured_camera_lanes and
-            topic not in self._camera_topic_lanes
-        )
-        print(f"[ros2] media subscriptions ready: camera_topics={camera_subscriptions} "
-              f"lidar_topics={lidar_subscriptions} lanes=6", flush=True)
+        print(f"[ros2] media subscriptions ready: camera_topics=0 "
+              f"lidar_topics={len(self._media_topic_subscriptions)} lanes=2", flush=True)
         if hasattr(self.robot, "create_timer"):
             self._media_discovery_timer = self.robot.create_timer(2.0, self._scan_media_topics)
 
     def _scan_media_topics(self):
-        """Discover actual image and point-cloud endpoints as robot nodes start."""
+        """Discover point-cloud endpoints as robot nodes start."""
         try:
             discovered = self.robot.get_topic_names_and_types()
         except (AttributeError, RuntimeError):
             return
-        from sensor_msgs.msg import CompressedImage, Image, PointCloud2
+        from sensor_msgs.msg import PointCloud2
         for topic, type_names in discovered:
             types = set(type_names)
             if "sensor_msgs/msg/PointCloud2" in types:
@@ -287,47 +221,6 @@ class S10Nodes:
                 # lane separate and publish only the selected cloud candidate.
                 self._subscribe_lidar_candidate(topic, PointCloud2, discovered=True)
                 continue
-            msg_type = (CompressedImage if "sensor_msgs/msg/CompressedImage" in types else
-                        Image if "sensor_msgs/msg/Image" in types else None)
-            if msg_type is None:
-                continue
-            # Do not require a publisher at discovery time. The S10 camera
-            # process can register its topic before DDS endpoints become
-            # visible; creating the subscription now lets late publishers
-            # connect instead of leaving the card permanently without a lane.
-            # Do not let unrelated depth imagery (for example /DEPTH_IMAGE)
-            # claim a directional camera card before the four RGB sources.
-            if topic not in self._configured_camera_lanes and self._camera_key_for_topic(topic) is None:
-                continue
-            key = self._assign_camera_lane(topic)
-            if key is None:
-                print(f"[ros2] ignoring extra camera topic (four lanes are occupied): {topic}", flush=True)
-                continue
-            if topic in self._media_topic_subscriptions:
-                if self._media_topic_types.get(topic) is msg_type:
-                    continue
-                old_handle = self._media_subscription_handles.get(topic)
-                if old_handle is not None and hasattr(self.robot, "destroy_subscription"):
-                    self.robot.destroy_subscription(old_handle)
-                self._media_subscriptions = [handle for handle in self._media_subscriptions
-                                             if handle is not old_handle]
-                self._media_topic_subscriptions.discard(topic)
-            identity = (topic, key)
-            if identity in self._discovered_media:
-                continue
-            self._discovered_media.add(identity)
-            callback = lambda msg, camera=key, source=topic: self._forward_camera_alias(
-                camera, source, msg)
-            handle = self.robot.create_subscription(
-                msg_type, topic, callback, self._sensor_qos,
-                callback_group=self._media_callback_groups[key])
-            self._media_subscriptions.append(handle)
-            self._media_topic_subscriptions.add(topic)
-            self._media_topic_types[topic] = msg_type
-            self._media_subscription_handles[topic] = handle
-            if not self._source_topics.get(key):
-                self._source_topics[key] = topic
-            print(f"[ros2] discovered {key} subscription: {topic} ({msg_type.__name__})", flush=True)
 
     def _subscribe_lidar_candidate(self, topic, message_type, discovered=False):
         from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
@@ -350,88 +243,6 @@ class S10Nodes:
         if discovered:
             print(f"[ros2] discovered lidar_cloud candidate: {topic}", flush=True)
 
-    def _forward_camera_alias(self, key, topic, msg):
-        """Use the first active configured alias for each physical camera lane."""
-        from sensor_msgs.msg import CompressedImage
-
-        stale_handles = []
-        with self._camera_source_lock:
-            source = self._camera_lane_sources.get(key)
-            if source is not None and source != topic:
-                # The S10 node exposes raw and compressed aliases for the same
-                # USB camera. Prefer the raw Image topic: it avoids the
-                # vendor's compressed-topic cache, which can contain old
-                # frames. A compressed alias may only be used as fallback
-                # when no raw source has produced a frame.
-                if not (not topic.endswith("/compressed") and source.endswith("/compressed")):
-                    return
-                old_handle = self._media_subscription_handles.get(source)
-                if old_handle is not None:
-                    stale_handles.append(old_handle)
-                    if hasattr(self.robot, "destroy_subscription"):
-                        self.robot.destroy_subscription(old_handle)
-                    self._media_subscriptions = [handle for handle in self._media_subscriptions
-                                                 if handle is not old_handle]
-                    self._media_topic_subscriptions.discard(source)
-                    self._media_subscription_handles.pop(source, None)
-            self._camera_lane_sources[key] = topic
-            self._camera_topic_lanes[topic] = key
-            self._source_topics[key] = topic
-        self._record_stream(key, "received")
-        if isinstance(msg, CompressedImage):
-            self._forward_compressed_camera(key, msg, already_received=True)
-        else:
-            self._forward_camera(key, msg, already_received=True)
-
-    def _assign_camera_lane(self, topic):
-        key = self._configured_camera_lanes.get(topic) or self._camera_topic_lanes.get(topic)
-        if key is None:
-            key = self._camera_key_for_topic(topic)
-        # Unknown USB inputs are not safe to assign by discovery order: doing
-        # so can expose the left camera as front/right. Only use explicitly
-        # mapped USB topics; semantic camera names may still use the fallback.
-        if key is None and topic.lower().startswith("/usb_camera_"):
-            return None
-        if key is None:
-            reserved = set(self._camera_topic_lanes.values())
-            key = next((lane for lane in CAMERA_LANES if lane not in reserved), None)
-        if key is not None:
-            self._camera_topic_lanes[topic] = key
-        return key
-
-    @staticmethod
-    def _camera_key_for_topic(topic):
-        name = topic.lower()
-        import re
-        # usb_cam_multi_node uses one base topic and numbered suffixes.  Do
-        # this before the generic camera_N rule, which otherwise interprets
-        # the service's ``camera_1`` prefix as the lane for every image.
-        usb = re.search(r"/usb_camera_(\d+)/image_raw(?:_(\d+))?(?:/|$)", name)
-        if usb:
-            camera_number, suffix = usb.groups()
-            if suffix is not None:
-                return None
-            return {"1": "camera_rear", "2": "camera_left",
-                    "3": "camera_front", "4": "camera_right"}.get(camera_number)
-        # Do not let the generic camera_N matcher reinterpret aliases such as
-        # /usb_camera_2/image_raw as a physical front camera. Only the vendor
-        # image_raw suffix mapping above is trusted.
-        if name.startswith("/usb_camera_"):
-            return None
-        tokens = set(filter(None, re.split(r"[^a-z0-9]+", name)))
-        numbered = re.search(r"(?:^|[/_])camera[_-]?(\d+)(?:$|[/_])", name)
-        if numbered:
-            index = int(numbered.group(1))
-            if 0 <= index < 4:
-                return CAMERA_LANES[index]
-        for directions, key in ((("rear", "back", "backward"), "camera_rear"),
-                                (("left",), "camera_left"),
-                                (("front", "forward"), "camera_front"),
-                                (("right",), "camera_right")):
-            if tokens.intersection(directions):
-                return key
-        return None
-
     def _record_stream(self, key, stage):
         now = time.time()
         monotonic_now = time.monotonic()
@@ -448,7 +259,7 @@ class S10Nodes:
                     stats[f"_{stage}_rate_count"] = stats[stage]
                     stats[f"_{stage}_rate_time"] = monotonic_now
             first = stats[stage] == 1
-            report_rate = (key in {"camera_left", "camera_rear", *LIDAR_LANES} and
+            report_rate = (key in LIDAR_LANES and
                            monotonic_now - stats.get("last_rate_log", monotonic_now) >= 10.0)
             if report_rate:
                 stats["last_rate_log"] = monotonic_now
@@ -470,6 +281,8 @@ class S10Nodes:
         with self._stream_lock:
             result = {key: dict(value) for key, value in self._stream_stats.items()}
         for key, spec in self.topics.items():
+            if key.startswith("camera_"):
+                continue
             try:
                 source = self._source_topics[key]
                 if key == "lidar_cloud":
@@ -485,7 +298,7 @@ class S10Nodes:
             result[key]["bridge_alive"] = lane["alive"]
             result[key]["bridge_errors"] = lane.get("errors", 0)
             result[key]["bridge_last_error"] = lane.get("last_error")
-            if self.media_workers is not None and (key.startswith("camera_") or key in LIDAR_LANES):
+            if self.media_workers is not None and key in LIDAR_LANES:
                 result[key]["worker_alive"] = self.media_workers.is_alive(key)
             if key == "lidar_cloud":
                 with self._lidar_source_lock:
@@ -504,11 +317,6 @@ class S10Nodes:
             elif key == "lidar_map":
                 result[key]["source"] = self._lidar_map_topic
                 result[key]["source_publishers"] = self._count_publishers(self._lidar_map_topic)
-            elif key.startswith("camera_"):
-                result[key]["active_source"] = self._camera_lane_sources.get(key)
-                source = result[key]["active_source"]
-                result[key]["source_publishers"] = (
-                    self._count_publishers(source) if source else None)
         return result
 
     def _count_publishers(self, topic):
@@ -621,30 +429,6 @@ class S10Nodes:
         self._publish_json("loco_state", data)
 
     @staticmethod
-    def _jpeg_from_ros_image(msg):
-        from io import BytesIO
-        from PIL import Image as PillowImage
-
-        encoding = str(msg.encoding).lower()
-        mode, raw_mode = {
-            "rgb8": ("RGB", "RGB"), "bgr8": ("RGB", "BGR"),
-            "rgba8": ("RGBA", "RGBA"), "bgra8": ("RGBA", "BGRA"),
-            "mono8": ("L", "L"), "8uc1": ("L", "L"),
-        }.get(encoding, (None, None))
-        if mode is None:
-            return None
-        try:
-            image = PillowImage.frombytes(mode, (int(msg.width), int(msg.height)),
-                                          bytes(msg.data), "raw", raw_mode, int(msg.step), 1)
-            if image.mode == "RGBA":
-                image = image.convert("RGB")
-            stream = BytesIO()
-            image.save(stream, format="JPEG", quality=85, optimize=False)
-            return stream.getvalue()
-        except (ValueError, OSError):
-            return None
-
-    @staticmethod
     def _fresh_header(header):
         """Reject DDS samples that were already stale before this callback."""
         if header is None or not hasattr(header, "stamp"):
@@ -655,88 +439,6 @@ class S10Nodes:
             return True
         age = time.time() - seconds
         return -0.25 <= age <= MEDIA_MAX_AGE_S
-
-    def _forward_camera(self, key, msg, already_received=False):
-        # S10 camera timestamps come from the AOS clock and are not guaranteed
-        # to share the container wall clock. Do not discard valid frames based
-        # on that clock skew; the worker/bridge latest-only queues provide the
-        # latency bound without blacking out the camera.
-        if not already_received:
-            self._record_stream(key, "received")
-        # The S10 camera node declares MJPEG as sensor_msgs/Image. For a valid
-        # JPEG payload, publish directly from the callback: sending it through
-        # a worker only adds an IPC hop and a frame of latency. Raw/NV12 frames
-        # still use the isolated encoder worker below.
-        payload = msg.data
-        if str(msg.encoding).lower() in {"jpeg", "jpg", "mjpeg"} and \
-                len(payload) >= 4 and payload[0] == 0xff and payload[1] == 0xd8 and \
-                payload[-2] == 0xff and payload[-1] == 0xd9:
-            from sensor_msgs.msg import CompressedImage
-            output = CompressedImage()
-            output.header = msg.header
-            output.format = "jpeg"
-            output.data = payload
-            self.camera_publishers[key].publish(output)
-            self._record_stream(key, "published")
-            return
-        if self.media_workers is not None:
-            header = (msg.header.frame_id, msg.header.stamp.sec, msg.header.stamp.nanosec)
-            submitted = self.media_workers.submit(
-                key, (header, msg.width, msg.height, msg.step, msg.encoding, bytes(msg.data)))
-            if not submitted:
-                self._record_stream(key, "dropped")
-            return
-        packet = self._jpeg_from_ros_image(msg)
-        if packet is None:
-            self._record_stream(key, "dropped")
-            return
-        from sensor_msgs.msg import CompressedImage
-        output = CompressedImage()
-        output.header = msg.header
-        output.format = "jpeg"
-        output.data = packet
-        self.camera_publishers[key].publish(output)
-        self._record_stream(key, "published")
-
-    def _forward_compressed_camera(self, key, msg, already_received=False):
-        # The vendor declares MJPEG as sensor_msgs/Image. Its timestamp may be
-        # from a different clock domain, so freshness is diagnostic-only here.
-        if not already_received:
-            self._record_stream(key, "received")
-        payload = bytes(msg.data)
-        if payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9"):
-            from sensor_msgs.msg import CompressedImage
-            output = CompressedImage()
-            output.header = msg.header
-            output.format = "jpeg"
-            output.data = payload
-            self.camera_publishers[key].publish(output)
-            self._record_stream(key, "published")
-            return
-        if self.media_workers is not None:
-            header = (msg.header.frame_id, msg.header.stamp.sec, msg.header.stamp.nanosec)
-            submitted = self.media_workers.submit(key, (header, bytes(msg.data)))
-            if not submitted:
-                self._record_stream(key, "dropped")
-            return
-        from io import BytesIO
-        from PIL import Image as PillowImage
-        from sensor_msgs.msg import CompressedImage
-
-        try:
-            image = PillowImage.open(BytesIO(bytes(msg.data))).convert("RGB")
-            stream = BytesIO()
-            image.save(stream, format="JPEG", quality=85, optimize=False)
-            packet = stream.getvalue()
-        except (OSError, ValueError):
-            self._record_stream(key, "dropped")
-            return
-        output = CompressedImage()
-        output.header = msg.header
-        output.format = "jpeg"
-        output.data = packet
-        self.camera_publishers[key].publish(output)
-        self._record_stream(key, "published")
 
     def _forward_lidar(self, source, msg=None):
         if msg is None:
@@ -811,24 +513,14 @@ class S10Nodes:
         self.lidar_publishers[lane].publish(output)
         self._record_stream(lane, "published")
 
-    def _handle_media_result(self, lane, header, packet):
+    def _handle_media_result(self, lane, _header, packet):
         if packet is None:
             self._record_stream(lane, "dropped")
             return
-        if lane in LIDAR_LANES:
-            from std_msgs.msg import UInt8MultiArray
-            output = UInt8MultiArray()
-            output.data = array.array("B", packet)
-            self.lidar_publishers[lane].publish(output)
-        else:
-            from sensor_msgs.msg import CompressedImage
-            output = CompressedImage()
-            output.header.frame_id = header[0]
-            output.header.stamp.sec = header[1]
-            output.header.stamp.nanosec = header[2]
-            output.format = "jpeg"
-            output.data = packet
-            self.camera_publishers[lane].publish(output)
+        from std_msgs.msg import UInt8MultiArray
+        output = UInt8MultiArray()
+        output.data = array.array("B", packet)
+        self.lidar_publishers[lane].publish(output)
         self._record_stream(lane, "published")
 
     @staticmethod
@@ -1095,7 +787,7 @@ class S10StatePlugin:
         if name in LIDAR_LANES and self.nodes:
             return {"state": "streaming", **self.nodes.topics[name]}
         if name.startswith("camera_") and self.nodes:
-            return {"state": "streaming", **self.nodes.topics[name]}
+            return {"state": "ready", **self.nodes.topics[name]}
         if name not in keys: return {"state": "unsupported_card", "card": name}
         report = reports.get(keys[name])
         # Some firmware revisions serialize Type/Command as decimal strings,

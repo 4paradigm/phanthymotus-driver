@@ -259,7 +259,12 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
         ctx_robot=object(), ctx_core=object(),
         executor_robot=Executor(), executor_core=Executor(),
     )
-    nodes = device.S10Nodes({"camera_topics": {"camera_rear": "/CAMERA/RAW"}}, "robot", ros2)
+    nodes = device.S10Nodes({"basic_server": {"host": "10.21.33.103"},
+                             "camera_rtsp": {"camera_rear": "/video0",
+                                             "camera_left": "/video2",
+                                             "camera_front": "/video4",
+                                             "camera_right": "/video6",
+                                             "format": "video/h265"}}, "robot", ros2)
     callbacks = nodes.robot.subscriptions
     assert nodes.topics["imu"]["topic"] == "/robot/imu"
     assert "/s10/depth" in callbacks
@@ -302,14 +307,6 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     loco_state = json.loads(nodes.publishers["loco_state"].messages[-1].data)
     assert loco_state["vel_x"] == 0.3
 
-    camera_msg = SimpleNamespace(width=2, height=1, step=6, encoding="rgb8",
-                                 data=bytes((255, 0, 0, 0, 255, 0)), header={"stamp": 1})
-    callbacks["/CAMERA/RAW"](camera_msg)
-    camera_output = nodes.camera_publishers["camera_rear"].messages[-1]
-    assert camera_output.format == "jpeg"
-    assert bytes(camera_output.data).startswith(b"\xff\xd8")
-    assert camera_output.header == camera_msg.header
-
     point_data = struct.pack("<ffffff", 1.0, 2.0, 3.0, math.nan, 5.0, 6.0)
     lidar = SimpleNamespace(
         fields=[SimpleNamespace(name=name, offset=offset, datatype=7, count=1)
@@ -332,18 +329,26 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert stream_status["joints"]["received"] == stream_status["joint_state"]["received"] == 1
     assert stream_status["lidar_cloud"]["received"] == stream_status["lidar_cloud"]["published"] == 1
     assert stream_status["lidar_map"]["received"] == stream_status["lidar_map"]["published"] == 1
-    assert stream_status["camera_rear"]["received"] == stream_status["camera_rear"]["published"] == 1
-    assert "/s10/front/image" in nodes.robot.subscriptions
-    assert nodes._source_topics["camera_rear"] == "/CAMERA/RAW"
-    assert nodes._source_topics["camera_left"] == "/s10/left/image"
-    assert nodes._source_topics["camera_front"] == "/s10/front/image"
-    assert nodes._source_topics["camera_right"] == "/s10/right/image"
-    assert "/s10/depth" in nodes.robot.subscriptions
+    assert not any("camera" in topic.lower() or topic == "/CAMERA/RAW"
+                   for topic in nodes.robot.subscriptions)
+    assert nodes.topics["camera_front"] == {
+        "topic": "rtsp://10.21.33.103:8554/video4", "format": "video/h265"}
+    assert nodes.topics["camera_rear"]["topic"].endswith("/video0")
+    assert nodes.topics["camera_left"]["topic"].endswith("/video2")
+    assert nodes.topics["camera_right"]["topic"].endswith("/video6")
+    assert not any("image" in topic.lower() or "camera" in topic.lower()
+                   for topic in nodes.robot.subscriptions)
+    state_plugin = device.S10StatePlugin(FakeNative({}), nodes)
+    camera_cards = {card["name"]: card for card in state_plugin.get_tools()
+                    if card["name"].startswith("camera_")}
+    assert set(camera_cards) == {
+        "camera_rear", "camera_left", "camera_front", "camera_right"}
+    assert camera_cards["camera_front"]["topic_out"] == [nodes.topics["camera_front"]]
+    assert state_plugin.dispatch("read", {"_tool_name": "camera_front"}) == {
+        "state": "ready", **nodes.topics["camera_front"]}
+    assert "/s10/depth" in nodes._lidar_topics
     groups = nodes.robot.subscription_groups
-    assert groups["/s10/rear/image/compressed"] is groups["/CAMERA/RAW"]
-    assert groups["/s10/left/image"] is not groups["/s10/rear/image/compressed"]
-    assert groups["/DEPTH_POINTS"] is not groups["/s10/rear/image/compressed"]
-    assert groups["/s10/depth"] is not groups["/DEPTH_POINTS"]
+    assert groups["/DEPTH_POINTS"] is not groups["/ACCUMULATED_POINTS_MAP"]
     assert nodes._sensor_qos.kwargs == {
         "depth": 1, "history": 1, "reliability": 2, "durability": 2}
     nodes.close()
@@ -405,28 +410,6 @@ def test_nv12_camera_image_encodes_without_numpy(monkeypatch, encoding):
     assert encoded.startswith(b"\xff\xd8") and encoded.endswith(b"\xff\xd9")
 
 
-def test_vendor_mjpeg_image_is_published_without_worker_hop(monkeypatch):
-    device = _load_device(monkeypatch)
-    sensor_msg = ModuleType("sensor_msgs.msg")
-    sensor_msg.CompressedImage = type("CompressedImage", (), {"__init__": lambda self: None})
-    monkeypatch.setitem(__import__("sys").modules, "sensor_msgs.msg", sensor_msg)
-    nodes = device.S10Nodes.__new__(device.S10Nodes)
-    published = []
-    nodes.camera_publishers = {"camera_rear": SimpleNamespace(publish=published.append)}
-    nodes.media_workers = SimpleNamespace(submit=lambda *_args: (_ for _ in ()).throw(
-        AssertionError("valid MJPEG must bypass worker")))
-    nodes._stream_lock = threading.Lock()
-    nodes._source_topics = {"camera_rear": "/usb_camera_1/image_raw"}
-    nodes.topics = {"camera_rear": {"topic": "/host/s10_pro/camera_rear"}}
-    nodes._stream_stats = {"camera_rear": {"received": 0, "published": 0, "dropped": 0,
-                                            "last_received": None, "last_published": None}}
-    msg = SimpleNamespace(encoding="jpeg", data=b"\xff\xd8jpeg\xff\xd9",
-                          header=SimpleNamespace(stamp=SimpleNamespace(sec=0, nanosec=0)))
-    nodes._forward_camera("camera_rear", msg)
-    assert len(published) == 1
-    assert published[0].data == msg.data
-
-
 def test_compressed_jpeg_is_downscaled_for_low_latency_preview(monkeypatch):
     _load_device(monkeypatch)
     import media_workers
@@ -466,14 +449,15 @@ def test_model_resource_returns_official_urdf(monkeypatch):
         subprocess.run([checker, str(urdf_path)], check=True, capture_output=True, text=True)
 
 
-def test_camera_config_has_four_directional_lanes_and_common_aliases():
+def test_camera_config_uses_documented_four_lane_rtsp_urls():
     config = yaml.safe_load((DRIVER / "config.yaml").read_text())
-    cameras = config["camera_topics"]
+    cameras = config["camera_rtsp"]
     lanes = ("camera_rear", "camera_left", "camera_front", "camera_right")
-    assert set(cameras) == set(lanes)
-    for lane, direction, index in zip(lanes, ("rear", "left", "front", "right"), range(4)):
-        assert f"/camera/{direction}/color/image_raw" in cameras[lane]
-        assert f"/camera_{index}/image_raw" in cameras[lane]
+    assert {lane: cameras[lane] for lane in lanes} == {
+        "camera_rear": "/video0", "camera_left": "/video2",
+        "camera_front": "/video4", "camera_right": "/video6",
+    }
+    assert cameras["format"] == "video/h265"
 
 
 def test_lidar_cloud_probes_previous_pointcloud_topics_but_keeps_map_separate():
@@ -483,41 +467,6 @@ def test_lidar_cloud_probes_previous_pointcloud_topics_but_keeps_map_separate():
     assert "/ACCUMULATED_POINTS_MAP" not in candidates
     assert {"/DEPTH_POINTS", "/local_scans", "/ALIGNED_POINTS",
             "/CLOUD_REGISTERED_BODY", "/FULL_CLOUD_MAP", "/LIDAR/POINTS"} <= set(candidates)
-
-
-def test_discovered_unclassified_camera_topics_reserve_distinct_lanes(monkeypatch):
-    device = _load_device(monkeypatch)
-    nodes = device.S10Nodes.__new__(device.S10Nodes)
-    nodes._configured_camera_lanes = {}
-    nodes._camera_topic_lanes = {}
-
-    lanes = [nodes._assign_camera_lane(f"/stream/camera_{index}/image")
-             for index in range(4)]
-
-    assert lanes == ["camera_rear", "camera_left", "camera_front", "camera_right"]
-
-
-def test_camera_lane_recognizes_numbered_camera_topic_independent_of_discovery_order(monkeypatch):
-    device = _load_device(monkeypatch)
-    nodes = device.S10Nodes.__new__(device.S10Nodes)
-    nodes._configured_camera_lanes = {}
-    nodes._camera_topic_lanes = {}
-
-    assert nodes._assign_camera_lane("/camera_3/image_raw") == "camera_right"
-    assert nodes._assign_camera_lane("/camera_1/image_raw") == "camera_left"
-    assert nodes._assign_camera_lane("/usb_camera_2/image_raw") == "camera_left"
-    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_0") is None
-    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_1") is None
-    assert nodes._assign_camera_lane("/camera_0/image_raw") == "camera_rear"
-
-
-def test_unclassified_depth_image_does_not_claim_directional_camera_lane(monkeypatch):
-    device = _load_device(monkeypatch)
-    assert device.S10Nodes._camera_key_for_topic("/DEPTH_IMAGE") is None
-    nodes = device.S10Nodes.__new__(device.S10Nodes)
-    nodes._configured_camera_lanes = {"/usb_camera_1/image_raw_2": "camera_right"}
-    nodes._camera_topic_lanes = {}
-    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_2") == "camera_right"
 
 
 def test_light_cycle_controls_are_scoped_to_breathe_and_blink_actions(monkeypatch):
