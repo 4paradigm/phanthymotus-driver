@@ -22,7 +22,10 @@ MAX_OBS_AGE_MS = 600
 CANCEL_AFTER_MS = 1000
 FOLLOW_KEYS = ("wz_limit",)
 SPEED_PRESETS = {"slow": 0.15, "normal": 0.30, "fast": 0.50}
-FOOTPRINT_HALF_WIDTH_M = 0.275  # Measured 0.55 m across, arms at rest.
+# Operator-requested conservative envelope; the measured arms-rest width is
+# 0.55 m. Keep provenance honest instead of calling the 0.70 m declaration a
+# physical measurement. Navi adds its separate clearance margin afterward.
+FOOTPRINT_HALF_WIDTH_M = 0.35
 TOGGLES = {"dry_run": True, "rotate_only": False, "require_standing": False}
 CONFIG_KEYS = (*TOGGLES, "speed_preset", "min_vx",
                "linear_acceleration", "angular_acceleration", *FOLLOW_KEYS)
@@ -206,12 +209,10 @@ def build_descriptor(hz=10.0, max_vx=0.3, max_wz=1.0, min_vx=0.0,
                  "watchdog_ms": WATCHDOG_MS, "max_obs_age_ms": MAX_OBS_AGE_MS,
                  "cancel_after_ms": CANCEL_AFTER_MS},
         "force_torque": None,
-        # Static outside width measured on the physical Tianyi in its normal
-        # navigation posture. Navi adds its own dynamic clearance margin; this
-        # declaration must remain the robot envelope rather than baking that
-        # policy-specific margin in twice.
+        # Conservative declared envelope, not a replacement for Navi's own
+        # clearance margin and not a claim that the chassis measured 0.70 m.
         "footprint": {"half_width": FOOTPRINT_HALF_WIDTH_M,
-                      "source": "measured"},
+                      "source": "estimate"},
     }
     if response is not None:
         descriptor["response"] = copy.deepcopy(response)

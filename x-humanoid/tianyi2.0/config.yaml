@@ -29,6 +29,8 @@ plugins:
     enabled: true
   camera:
     enabled: true
+    # Require the device's live RGB calibration before Core snapshots geometry.
+    require_camera_info: true
   camera_snapshot:
     enabled: true
     output_dir: "/opt/phanthy-motus/data/images"
@@ -44,6 +46,10 @@ plugins:
     enabled: true
     # Compressed hardware depth, latest frame only; directly connects to navi.
     hz: 15
+    # Factory head_330_ty.launch.py: depth_registration=true, align_mode=HW,
+    # align_target_stream=COLOR, matching 1280x720 source profiles.
+    # Use native on a deployment that has not enabled hardware D2C.
+    alignment: vendor_hw_d2c
   camera_pointcloud:
     enabled: true
     # Head camera height above the floor. The point-cloud renderer uses Y=0

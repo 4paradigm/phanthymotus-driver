@@ -74,6 +74,7 @@ class CompressedImage:
 def depth_plugin(monkeypatch):
     # Isolate the production class from unrelated joint/ROS imports in device.py.
     source = Path(__file__).parents[1] / "device.py"
+    monkeypatch.syspath_prepend(str(source.parent))
     tree = ast.parse(source.read_text(encoding="utf-8"))
     definition = next(node for node in tree.body
                       if isinstance(node, ast.ClassDef) and node.name == "DepthCameraPlugin")
@@ -86,6 +87,7 @@ def depth_plugin(monkeypatch):
     exec(compile(ast.Module(body=[definition], type_ignores=[]), str(source), "exec"), namespace)
     messages = types.ModuleType("sensor_msgs.msg")
     messages.Image = type("Image", (), {})
+    messages.CameraInfo = type("CameraInfo", (), {})
     messages.CompressedImage = CompressedImage
     package = types.ModuleType("sensor_msgs")
     package.msg = messages
