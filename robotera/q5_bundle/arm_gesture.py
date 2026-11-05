@@ -273,9 +273,9 @@ class Plugin:
                         "type": "string", "title": "Arm side", "enum": ["left", "right", "both"],
                         "default": "right",
                         "oneOf": [
-                            {"const": "left", "title": "Left arm"},
-                            {"const": "right", "title": "Right arm"},
-                            {"const": "both", "title": "Both arms"},
+                            {"const": "left", "title": "left"},
+                            {"const": "right", "title": "right"},
+                            {"const": "both", "title": "both"},
                         ],
                         "description": "Select the arm or arms to move.",
                     },
@@ -283,8 +283,8 @@ class Plugin:
                         "type": "string", "title": "Salute side", "enum": ["left", "right"],
                         "default": "right",
                         "oneOf": [
-                            {"const": "left", "title": "Left-arm salute"},
-                            {"const": "right", "title": "Right-arm salute"},
+                            {"const": "left", "title": "left"},
+                            {"const": "right", "title": "right"},
                         ],
                         "description": "Salute supports one arm at a time; defaults to the right arm.",
                     },
