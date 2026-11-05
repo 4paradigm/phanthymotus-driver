@@ -6,6 +6,7 @@ import json
 import ipaddress
 import fcntl
 import os
+from pathlib import Path
 import shlex
 import shutil
 import socket
@@ -114,7 +115,12 @@ class S10ControlledSpatialPlugin:
             argv = ["/bin/sh", "-lc", command]
         else:
             target = f"{self.user}@{self.host}" if self.user else self.host
-            ssh_args = ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new",
+            known_hosts = os.environ.get(
+                "S10_SSH_KNOWN_HOSTS",
+                str(Path(__file__).with_name("resource") / "ssh_known_hosts"),
+            )
+            ssh_args = ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=yes",
+                        "-o", f"UserKnownHostsFile={known_hosts}", "-o", "GlobalKnownHostsFile=/dev/null",
                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", "--", target, command]
             if self.password:
                 argv = ["sshpass", "-e", *ssh_args]
@@ -159,4 +165,4 @@ class S10ControlledSpatialPlugin:
             return self._run_drmap(["mapping", "start"])
         if action == "mapping_stop":
             return self._run_drmap(["mapping", "stop"])
-        raise ValueError(f"unsupported S10 controlled_spatial action: {action}")
+        return None

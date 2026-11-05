@@ -137,6 +137,7 @@ class S10Nodes:
                          "/usb_camera_1/image_raw_2", "/usb_camera_1/image_raw_2/compressed",
                          ],
         }))
+        self._discover_camera_aliases = bool(config.get("camera_discovery", True))
         for lane in CAMERA_LANES:
             camera_topics.setdefault(lane, [])
         self.topics.update({key: {"topic": base + key, "format": "image/jpeg"}
@@ -301,7 +302,8 @@ class S10Nodes:
             # connect instead of leaving the card permanently without a lane.
             # Do not let unrelated depth imagery (for example /DEPTH_IMAGE)
             # claim a directional camera card before the four RGB sources.
-            if topic not in self._configured_camera_lanes and self._camera_key_for_topic(topic) is None:
+            if topic not in self._configured_camera_lanes and (
+                    not self._discover_camera_aliases or self._camera_key_for_topic(topic) is None):
                 continue
             key = self._assign_camera_lane(topic)
             if key is None:

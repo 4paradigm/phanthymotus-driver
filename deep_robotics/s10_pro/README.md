@@ -96,6 +96,9 @@ loopback-profiled; media/state publishers and the `loco_servo` subscriber are
 isolated child processes. Media conversion and publication
 use independent bounded lanes so a camera or point-cloud frame cannot block
 control/state callbacks.
+The driver subscribes only to the four canonical `/camera/{rear,left,front,right}/image_raw`
+topics. The vendor also exposes aliases for the same physical streams; subscribing
+to every alias multiplies large DDS frames and board load.
 
 ## Image and deployment
 
@@ -109,7 +112,10 @@ The final image is larger than the base image because this driver needs the
 Fast DDS RMW package, ALSA command-line tools (`alsa-utils`), PyYAML, Pillow,
 `openssh-client`, and `sshpass`.
 The SSH packages support the current one-click NOS `drmap` password path; they
-can be removed when deployment supports a managed SSH key/secret. Apt
+can be removed when deployment supports a managed SSH key/secret. The image
+includes the current AOS/NOS ED25519 host key pin in `resource/ssh_known_hosts`;
+SSH uses strict checking and accepts an alternate pinned file via
+`S10_SSH_KNOWN_HOSTS`. Apt
 recommends and pip caches are disabled/removed to keep this growth limited to
 the component.
 
@@ -148,10 +154,9 @@ is the NOS map-management endpoint. `controlled_spatial` auto-selects local
 operations run over SSH to the NOS host as
 `user` (overridable with `S10_DRMAP_SSH_USER`). The service fragment defaults
 `S10_DRMAP_PASSWORD` to the robot's reported default password; override it via
-the deployment environment after changing the robot credential. This default
-is weak and is stored in the deployment configuration, not the image. SSH uses
-`accept-new` host-key handling, so the first connection pins the presented host
-key and later changes fail closed. The tutorial demonstrates `/var/opt/robot/data/maps`,
+the deployment environment after changing the robot credential. SSH verifies
+the pinned AOS/NOS host key before sending this credential; host-key changes
+fail closed. The tutorial demonstrates `/var/opt/robot/data/maps`,
 `drmap mapping start`, `drmap mapping stop`, and `drmap map list`; responses
 from `drmap --format json map list` are parsed when valid. The SSH management
 host is set with `S10_DRMAP_SSH_HOST` and defaults to `10.21.33.106`. Map

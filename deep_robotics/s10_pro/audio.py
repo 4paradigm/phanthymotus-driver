@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import queue
 import shlex
 import shutil
@@ -56,7 +57,12 @@ def _audio_launch(program, device, mode, host, user, password):
         return command, None
     target = f"{user}@{host}" if user else host
     remote_command = "exec " + shlex.join(command)
-    ssh = ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new",
+    known_hosts = os.environ.get(
+        "S10_SSH_KNOWN_HOSTS",
+        str(Path(__file__).with_name("resource") / "ssh_known_hosts"),
+    )
+    ssh = ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=yes",
+           "-o", f"UserKnownHostsFile={known_hosts}", "-o", "GlobalKnownHostsFile=/dev/null",
            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", "--",
            target, remote_command]
     if password:
@@ -246,7 +252,7 @@ class S10MicPlugin:
             if self._last_error:
                 result["error"] = self._last_error
             return result
-        raise ValueError(f"unsupported S10 microphone action: {action}")
+        return None
 
 
 class S10SpeakerPlugin:
@@ -391,4 +397,4 @@ class S10SpeakerPlugin:
                     "input_topic": self._topic or None, "frames_played": self._frames,
                     "frames_dropped": self._dropped, "last_error": self._last_error,
                     "mode": self.mode, "audio_host": self.host if self.mode == "ssh" else None}
-        raise ValueError(f"unsupported S10 speaker action: {action}")
+        return None

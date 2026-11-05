@@ -104,7 +104,7 @@ class S10LocoServoPlugin:
                 self._hold()
             if "dry_run" in args: self._dry_run = args["dry_run"]
             return {"ok": True, "dry_run": self._dry_run}
-        raise ValueError(f"unsupported loco_servo action: {action}")
+        return None
 
     def _start(self, args):
         topic = str(args.get("input_topic") or "").strip()
@@ -141,7 +141,7 @@ class S10LocoServoPlugin:
                 self._sink = None
                 self._topic = ""
                 return {"state": "error", "message": f"启动 control/velocity 订阅失败: {exc}"}
-        return {"state": "running", "input": topic, "control_interface": self._descriptor_raw}
+        return {"state": "ready", "input": topic, "control_interface": self._descriptor_raw}
 
     def _stop(self):
         with self._lock:

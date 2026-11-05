@@ -30,6 +30,7 @@ deep-robotics-s10-pro:
     - S10_AUDIO_SSH_HOST=${S10_AUDIO_SSH_HOST:-10.21.33.103}
     - S10_AUDIO_SSH_USER=${S10_AUDIO_SSH_USER:-user}
     - S10_AUDIO_SSH_PASSWORD=${S10_AUDIO_SSH_PASSWORD:-'}
+    - S10_SSH_KNOWN_HOSTS=${S10_SSH_KNOWN_HOSTS:-/work/deep_robotics/s10_pro/resource/ssh_known_hosts}
     - AGENT_CORE_URL=https://localhost:15678
   logging:
     driver: local

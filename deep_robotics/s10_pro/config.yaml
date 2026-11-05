@@ -43,47 +43,13 @@ topics:
     - "/path"
   lidar_map: "/ACCUMULATED_POINTS_MAP"
 camera_topics:
-  camera_rear:
-    - "/camera/rear/image_raw"
-    - "/camera/rear/image_raw/compressed"
-    - "/camera/rear/color/image_raw"
-    - "/camera/rear/color/image_raw/compressed"
-    - "/camera_back/image_raw"
-    - "/camera_back/image_raw/compressed"
-    - "/camera_0/image_raw"
-    - "/camera_0/image_raw/compressed"
-    - "/usb_camera_1/image_raw"
-    - "/usb_camera_1/image_raw/compressed"
-    - "/usb_camera_1/image_raw_0"
-  camera_left:
-    - "/camera/left/image_raw"
-    - "/camera/left/image_raw/compressed"
-    - "/camera/left/color/image_raw"
-    - "/camera/left/color/image_raw/compressed"
-    - "/camera_left/image_raw"
-    - "/camera_left/image_raw/compressed"
-    - "/camera_1/image_raw"
-    - "/camera_1/image_raw/compressed"
-    - "/usb_camera_2/image_raw"
-    - "/usb_camera_2/image_raw/compressed"
-  camera_front:
-    - "/camera/front/image_raw"
-    - "/camera/front/image_raw/compressed"
-    - "/camera/front/color/image_raw"
-    - "/camera/front/color/image_raw/compressed"
-    - "/camera_front/image_raw"
-    - "/camera_front/image_raw/compressed"
-    - "/camera_2/image_raw"
-    - "/camera_2/image_raw/compressed"
-  camera_right:
-    - "/camera/right/image_raw"
-    - "/camera/right/image_raw/compressed"
-    - "/camera/right/color/image_raw"
-    - "/camera/right/color/image_raw/compressed"
-    - "/camera_right/image_raw"
-    - "/camera_right/image_raw/compressed"
-    - "/camera_3/image_raw"
-    - "/camera_3/image_raw/compressed"
+  camera_rear: "/camera/rear/image_raw"
+  camera_left: "/camera/left/image_raw"
+  camera_front: "/camera/front/image_raw"
+  camera_right: "/camera/right/image_raw"
+# The vendor node publishes several aliases per physical camera. Subscribe to
+# the four canonical image topics only to avoid multiplying large DDS frames.
+camera_discovery: false
 # JPEG encoding and point-cloud packing run in one bounded worker process per
 # stream; this keeps the robot ROS executor available for control/state topics.
 media_workers: true

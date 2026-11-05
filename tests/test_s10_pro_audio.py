@@ -37,6 +37,8 @@ def test_audio_cards_advertise_asr_and_tts_contracts(monkeypatch):
     }]
     assert mic.dispatch("start", {})["state"] == "error"
     assert speaker.dispatch("start", {})["error"] == "input_topic is required"
+    assert mic.dispatch("unknown", {}) is None
+    assert speaker.dispatch("unknown", {}) is None
 
 
 def test_audio_device_names_and_pcm_commands(monkeypatch):

@@ -487,15 +487,54 @@ def test_model_resource_returns_official_urdf(monkeypatch):
         subprocess.run([checker, str(urdf_path)], check=True, capture_output=True, text=True)
 
 
-def test_camera_config_has_four_directional_lanes_and_common_aliases():
+def test_camera_config_uses_only_four_canonical_topics():
     config = yaml.safe_load((DRIVER / "config.yaml").read_text())
     cameras = config["camera_topics"]
     lanes = ("camera_rear", "camera_left", "camera_front", "camera_right")
     assert set(cameras) == set(lanes)
-    for lane, direction, index in zip(lanes, ("rear", "left", "front", "right"), range(4)):
-        assert f"/camera/{direction}/color/image_raw" in cameras[lane]
-        assert f"/camera_{index}/image_raw" in cameras[lane]
-    assert "/usb_camera_1/image_raw_0" in cameras["camera_rear"]
+    assert cameras == {
+        "camera_rear": "/camera/rear/image_raw",
+        "camera_left": "/camera/left/image_raw",
+        "camera_front": "/camera/front/image_raw",
+        "camera_right": "/camera/right/image_raw",
+    }
+    assert config["camera_discovery"] is False
+
+
+def test_camera_discovery_skips_unconfigured_vendor_aliases(monkeypatch):
+    device = _load_device(monkeypatch)
+    sensor_msg = ModuleType("sensor_msgs.msg")
+    sensor_msg.CompressedImage = type("CompressedImage", (), {})
+    sensor_msg.Image = type("Image", (), {})
+    sensor_msg.PointCloud2 = type("PointCloud2", (), {})
+    monkeypatch.setitem(__import__("sys").modules, "sensor_msgs.msg", sensor_msg)
+
+    nodes = device.S10Nodes.__new__(device.S10Nodes)
+    nodes.robot = SimpleNamespace(
+        get_topic_names_and_types=lambda: [
+            ("/camera/front/image_raw", ["sensor_msgs/msg/Image"]),
+            ("/usb_camera_3/image_raw", ["sensor_msgs/msg/Image"]),
+        ],
+        create_subscription=lambda msg_type, topic, callback, qos, callback_group=None:
+        (msg_type, topic, callback),
+        destroy_subscription=lambda _handle: None,
+    )
+    nodes._discover_camera_aliases = False
+    nodes._configured_camera_lanes = {"/camera/front/image_raw": "camera_front"}
+    nodes._camera_topic_lanes = {}
+    nodes._media_topic_subscriptions = set()
+    nodes._media_topic_types = {}
+    nodes._media_subscription_handles = {}
+    nodes._discovered_media = set()
+    nodes._media_subscriptions = []
+    nodes._media_callback_groups = {"camera_front": object()}
+    nodes._source_topics = {"camera_front": None}
+    nodes._sensor_qos = object()
+
+    nodes._scan_media_topics()
+
+    assert nodes._media_topic_subscriptions == {"/camera/front/image_raw"}
+    assert nodes._source_topics["camera_front"] == "/camera/front/image_raw"
 
 
 def test_lidar_cloud_probes_previous_pointcloud_topics_but_keeps_map_separate():
@@ -859,12 +898,16 @@ def test_service_configures_verified_s10_robot_network_without_shell_exports():
     assert environment["S10_AUDIO_MODE"] == "${S10_AUDIO_MODE:-auto}"
     assert environment["S10_AUDIO_SSH_HOST"] == "${S10_AUDIO_SSH_HOST:-10.21.33.103}"
     assert environment["S10_AUDIO_SSH_PASSWORD"] == "${S10_AUDIO_SSH_PASSWORD:-'}"
+    assert environment["S10_SSH_KNOWN_HOSTS"] == (
+        "${S10_SSH_KNOWN_HOSTS:-/work/deep_robotics/s10_pro/resource/ssh_known_hosts}")
     assert environment["ROBOT_NETWORK_CIDR"] == "10.21.33.0/24"
     config = yaml.safe_load((DRIVER / "config.yaml").read_text(encoding="utf-8"))
     assert config["basic_server"]["host"] == "10.21.33.103"
     assert config["basic_server"]["timeout"] == 2.0
     assert config["controlled_spatial"]["ssh_host"] == "10.21.33.106"
     assert config["controlled_spatial"]["timeout"] == 30
+    known_hosts = (DRIVER / "resource" / "ssh_known_hosts").read_text(encoding="utf-8")
+    assert known_hosts.startswith("10.21.33.103,10.21.33.106 ssh-ed25519 ")
 
 
 def test_audio_auto_selects_local_aos_or_ssh_transport(monkeypatch):
@@ -889,6 +932,8 @@ def test_audio_auto_selects_local_aos_or_ssh_transport(monkeypatch):
         "plughw:CARD=rockchipes8388,DEV=0", "plughw:CARD=rockchipes8388,DEV=0")
     command, env = audio._audio_launch("arecord", capture_device, mode, host, user, password)
     assert command[:3] == ["sshpass", "-e", "ssh"]
+    assert "StrictHostKeyChecking=yes" in command
+    assert "GlobalKnownHostsFile=/dev/null" in command
     assert command[-2] == "user@10.21.33.103"
     assert "arecord" in command[-1]
     assert env["SSHPASS"] == "'"
@@ -1387,12 +1432,16 @@ def test_controlled_spatial_uses_fixed_drmap_commands_and_confirmation(monkeypat
                                          "controlled_spatial": {"mode": "ssh", "ssh_host": "10.21.33.106"}})
     assert plugin.dispatch("start", {}) == {"state": "ready"}
     assert plugin.dispatch("stop", {}) == {"state": "idle"}
+    assert plugin.dispatch("unknown", {}) is None
     assert plugin.dispatch("mapping_start", {})["code"] == "INVALID_ARGUMENT"
     assert calls == []
     listed = plugin.dispatch("map_list", {})
     assert listed["data"] == {"maps": []}
     command = calls[-1][0]
-    assert command[:7] == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new"]
+    assert command[:3] == ["ssh", "-o", "BatchMode=yes"]
+    assert "StrictHostKeyChecking=yes" in command
+    assert any(value.startswith("UserKnownHostsFile=") for value in command)
+    assert "GlobalKnownHostsFile=/dev/null" in command
     assert "user@10.21.33.106" in command
     assert "drmap --format json map list" in command[-1]
     assert plugin.dispatch("mapping_start", {"confirm": True})["ok"] is True
@@ -1532,12 +1581,13 @@ def test_loco_servo_is_a_dry_run_velocity_sink_by_default(monkeypatch):
     assert descriptor["limits"]["upper"] == [1.67, 0.4, 0, 0, 0, 1.0]
     assert "groups" not in descriptor
     assert plugin.dispatch("info", {})["dry_run"] is True
+    assert plugin.dispatch("unknown", {}) is None
     assert plugin.dispatch("config", {"dry_run": False})["code"] == "CONFIRM_REQUIRED"
     denied = plugin.dispatch("config", {"dry_run": False, "confirm": True})
     assert denied["code"] == "MOTION_DISABLED"
     assert plugin.dispatch("info", {})["dry_run"] is True
     result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": True})
-    assert result["state"] == "running"
+    assert result["state"] == "ready"
     assert plugin.dispatch("info", {})["dry_run"] is True
     plugin.stop()
     assert plugin.dispatch("config", {"dry_run": False, "confirm": True})["code"] == "MOTION_DISABLED"
@@ -1583,7 +1633,7 @@ def test_loco_servo_start_can_atomically_arm_with_confirmation(monkeypatch):
         started = plugin.dispatch("start", {
             "input_topic": "/policy/velocity", "dry_run": False, "confirm": True,
         })
-        assert started["state"] == "running"
+        assert started["state"] == "ready"
         assert plugin.dispatch("info", {})["dry_run"] is False
     finally:
         plugin.stop()
@@ -1647,7 +1697,7 @@ def test_loco_servo_holds_if_core_subscriber_dies(monkeypatch):
     plugin = S10LocoServoPlugin(native, ros2=object())
     try:
         assert plugin.dispatch("config", {"dry_run": False, "confirm": True}) == {"ok": True, "dry_run": False}
-        assert plugin.dispatch("start", {"input_topic": "/policy/velocity"})["state"] == "running"
+        assert plugin.dispatch("start", {"input_topic": "/policy/velocity"})["state"] == "ready"
         plugin._apply([0.2, 0.0, 0.0, 0.0, 0.0, 0.1])
         assert native.calls[-1][0][2]["X"] == 0.2
 
@@ -1706,7 +1756,7 @@ def test_loco_servo_core_stream_validates_messages_and_watchdog_holds(monkeypatc
     plugin = S10LocoServoPlugin(native, ros2=object())
     try:
         plugin.dispatch("config", {"dry_run": False, "confirm": True})
-        assert plugin.dispatch("start", {"input_topic": "/policy/velocity"})["state"] == "running"
+        assert plugin.dispatch("start", {"input_topic": "/policy/velocity"})["state"] == "ready"
 
         subscriber.payloads.append(command([0.2, 0.1, 0.0, 0.0, 0.0, -0.2]))
         wait_for(lambda: len(native.calls) == 1)
