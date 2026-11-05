@@ -7,7 +7,7 @@
 
 | 名称 | 类型 | 内容 |
 |---|---|---|
-| `joints` | sensor | 六轴实际角度驱动的 CR3A 结构骨架；共享连接配置入口 |
+| `joints` | sensor | 六轴实际角度驱动的 CR3A 结构骨架及转角 JSON 输出；共享连接配置入口 |
 | `safe_skin` | sensor | 小臂、J4/J5/J6 接近暂停标志及状态有效性、最近控制请求 |
 | `safe_skin_control` | actuator | 显式请求 TCP 控制、总开关、分区灵敏度 |
 | `model` | resource | 平台渲染器使用的固定直角骨架 URDF，不发布 ROS topic |
@@ -20,7 +20,25 @@
 
 - `/dobot_cra/state/joints`，`sensor/skeleton`；六关节 `q/dq` 为 rad、rad/s，
   `degree` 保留度数，关节名为 `joint1..joint6`。
+- `/dobot_cra/state/joint_angles`，`data/json`；`joints` 的第二个输出口，
+  `joint_names` 按 J1–J6 排列，`angles_deg` 为实际转角（度），`angles_rad` 为同一组角度的弧度值。
 - `/dobot_cra/state/safe_skin`，`data/json`。
+
+两个 `joints` 输出共用同一份反馈快照，不新增卡片或控制器连接。JSON 角度不依赖 URDF
+是否可用；实时数据可用时 `available=true`，断线或过期时为 `false`，两个角度数组均为空。
+例如（仅展示主要字段，数值为示例）：
+
+```json
+{
+  "available": true,
+  "joint_count": 6,
+  "joint_names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
+  "angles_deg": [90, -30, 0, 0, 0, 0],
+  "angles_rad": [1.5707963267948966, -0.5235987755982988, 0, 0, 0, 0]
+}
+```
+
+更新后在平台重新添加 `joints` 或刷新该卡片输出定义，以显示新增 JSON 输出口。
 
 断线或过期时 `connected=false, stale=true`；骨架不再输出旧角度，`joints=[]`；
 皮肤触发状态为 `null`，不会把未知当作“没有触发”。所有卡片可查看连接新鲜度。

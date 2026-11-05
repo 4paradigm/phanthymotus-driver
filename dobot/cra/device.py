@@ -20,7 +20,7 @@ else:
 
 
 CARD_DESCRIPTIONS = {
-    "joints": "CR3A 六轴实时骨架，固定直角连接保持真实关节坐标和六个可动轴",
+    "joints": "CR3A 六轴实时骨架及关节转角 JSON（度/弧度），固定直角连接保持真实关节坐标",
     "safe_skin": "小臂及 J4/J5/J6 安全皮肤接近暂停标志、数据有效性和最近控制请求",
 }
 
@@ -43,6 +43,7 @@ class DobotSensors:
                     "format": "sensor/skeleton" if name == "joints" else "data/json"}]
             for name in CARD_DESCRIPTIONS
         }
+        self._topics["joints"].append({"topic": f"/{prefix}/state/joint_angles", "format": "data/json"})
 
     def get_tools(self):
         definitions = [tool(name, "sensor", description, topic_out=self._topics[name])
@@ -87,8 +88,11 @@ class DobotSensors:
                                  durability=DurabilityPolicy.VOLATILE)
                 node = Node("dobot_cra_sensors", context=self._ros2.ctx_core)
                 try:
-                    self._publishers = {name: node.create_publisher(String, topics[0]["topic"], qos)
-                                        for name, topics in self._topics.items()}
+                    self._publishers = {
+                        (name, index): node.create_publisher(String, output["topic"], qos)
+                        for name, topics in self._topics.items()
+                        for index, output in enumerate(topics)
+                    }
                     self._message_type = String
                     self._node = node
                     node.create_timer(1.0 / self._hz, self._publish)
@@ -119,6 +123,13 @@ class DobotSensors:
         result = {key: value for key, value in snapshot.items() if key != "data"}
         result.update(timestamp_ms=int(time.time() * 1000), source="dobot_feedback", read_only=True)
         state = snapshot["data"]
+        if name == "joint_angles":
+            angles = [] if state is None else list(state["joint_state"]["q_actual"])
+            return {
+                **result, "format": "data/json", "available": state is not None,
+                "joint_count": 6, "joint_names": list(JOINT_NAMES),
+                "angles_deg": angles, "angles_rad": [math.radians(angle) for angle in angles],
+            }
         if name == "joints":
             skeleton = {**result, "format": "sensor/skeleton", "position_unit": "rad",
                         "joint_count": 6, "joints": [], "available": False}
@@ -158,9 +169,10 @@ class DobotSensors:
     def _publish(self):
         with self._lifecycle:
             snapshot = self.client.snapshot()
-            for name, publisher in self._publishers.items():
+            for (name, index), publisher in self._publishers.items():
                 message = self._message_type()
-                message.data = json.dumps(self.payload(name, snapshot), ensure_ascii=False, allow_nan=False)
+                output_name = "joint_angles" if name == "joints" and index == 1 else name
+                message.data = json.dumps(self.payload(output_name, snapshot), ensure_ascii=False, allow_nan=False)
                 publisher.publish(message)
 
     def dispatch(self, action, args):

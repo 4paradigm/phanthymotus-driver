@@ -203,6 +203,9 @@ def test_stale_data_is_withheld_even_if_socket_stays_open():
         assert skeleton["joints"] == []
         assert not skeleton["available"]
         assert skeleton["model_available"]
+        angles = DobotSensors({}, client=client).payload("joint_angles")
+        assert not angles["available"] and angles["stale"]
+        assert angles["angles_deg"] == angles["angles_rad"] == []
     finally:
         client.stop()
 
@@ -228,6 +231,32 @@ def test_joints_skeleton_matches_physical_model_names_and_radians():
         assert calls == [("127.0.0.1", 30004)]
     finally:
         client.stop()
+
+
+@pytest.mark.parametrize("robot_type", [113, 130])
+def test_joint_angle_json_reports_actual_angles_independently_of_model(robot_type):
+    client, _, calls = running_client([packet(angle=42, robot_type=robot_type)])
+    try:
+        wait_until(lambda: client.snapshot()["connected"])
+        plugin = DobotSensors({}, namespace="custom_arm", client=client)
+        outputs = next(t for t in plugin.get_tools() if t["name"] == "joints")["topic_out"]
+        assert outputs == [
+            {"topic": "/custom_arm/state/joints", "format": "sensor/skeleton"},
+            {"topic": "/custom_arm/state/joint_angles", "format": "data/json"},
+        ]
+        angles = plugin.payload("joint_angles")
+        assert angles["available"] and angles["read_only"] and not angles["stale"]
+        assert angles["format"] == "data/json" and angles["joint_count"] == 6
+        assert angles["joint_names"] == [f"joint{i}" for i in range(1, 7)]
+        assert angles["angles_deg"] == [42, -30, 0, 0, 0, 0]
+        assert angles["angles_rad"] == pytest.approx([math.radians(v) for v in angles["angles_deg"]])
+        assert calls == [("127.0.0.1", 30004)]
+        angles["angles_deg"][0] = -999
+        assert client.snapshot()["data"]["joint_state"]["q_actual"][0] == 42
+    finally:
+        client.stop()
+    assert plugin.payload("joint_angles")["available"] is False
+    assert plugin.payload("joint_angles")["angles_deg"] == []
 
 
 @pytest.mark.parametrize("code,configured", [(None, ""), (130, ""), (113, "CR5A"), (130, "CR3A")])
@@ -311,12 +340,77 @@ def test_publish_all_health_states_without_network_calls():
             self.messages.append(json.loads(message.data))
 
     plugin._message_type = Message
-    plugin._publishers = {name: Publisher() for name in CARD_DESCRIPTIONS}
+    plugin._publishers = {(name, index): Publisher()
+                          for name, outputs in plugin._topics.items() for index in range(len(outputs))}
     plugin._publish()
-    assert len(plugin._publishers) == 2
+    assert len(plugin._publishers) == 3
     for pub in plugin._publishers.values():
         assert pub.messages[0]["stale"]
         assert pub.messages[0]["read_only"]
+    assert plugin._publishers[("joints", 1)].messages[0]["angles_deg"] == []
+
+
+def test_ros_start_registers_both_joint_outputs_and_publishes_one_feedback_sample(monkeypatch):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    class Publisher:
+        def __init__(self):
+            self.messages = []
+
+        def publish(self, message):
+            self.messages.append(json.loads(message.data))
+
+    class Node:
+        def __init__(self, *args, **kwargs):
+            self.publishers = {}
+
+        def create_publisher(self, message_type, topic, qos):
+            publisher = self.publishers[topic] = Publisher()
+            return publisher
+
+        def create_timer(self, period, callback):
+            self.tick = callback
+
+        def destroy_node(self):
+            pass
+
+    node_module, qos_module, message_module = (ModuleType(name) for name in ("rclpy.node", "rclpy.qos", "std_msgs.msg"))
+    node_module.Node = Node
+    qos_module.QoSProfile = SimpleNamespace
+    qos_module.ReliabilityPolicy = SimpleNamespace(BEST_EFFORT=1)
+    qos_module.HistoryPolicy = SimpleNamespace(KEEP_LAST=1)
+    qos_module.DurabilityPolicy = SimpleNamespace(VOLATILE=1)
+    message_module.String = SimpleNamespace
+    for name, module in (("rclpy", ModuleType("rclpy")), ("rclpy.node", node_module),
+                         ("rclpy.qos", qos_module), ("std_msgs", ModuleType("std_msgs")),
+                         ("std_msgs.msg", message_module)):
+        monkeypatch.setitem(sys.modules, name, module)
+
+    client = FeedbackClient({})
+    samples = []
+
+    def snapshot():
+        samples.append(len(samples) + 1)
+        return {"connected": True, "stale": False, "robot_type_code": 113,
+                "data": decode_packet(packet(angle=samples[-1]))}
+
+    monkeypatch.setattr(client, "snapshot", snapshot)
+    executor = SimpleNamespace(add_node=lambda node: None, remove_node=lambda node: None)
+    plugin = DobotSensors({}, ros2=SimpleNamespace(ctx_core=None, executor_core=executor), client=client)
+    plugin.start()
+    try:
+        publishers = plugin._node.publishers
+        assert set(publishers) == {"/dobot_cra/state/joints", "/dobot_cra/state/joint_angles", "/dobot_cra/state/safe_skin"}
+        plugin._node.tick()
+        assert samples == [1]
+        skeleton = publishers["/dobot_cra/state/joints"].messages[0]
+        angles = publishers["/dobot_cra/state/joint_angles"].messages[0]
+        assert angles["angles_deg"] == [joint["degree"] for joint in skeleton["joints"]]
+        assert angles["angles_rad"] == [joint["q"] for joint in skeleton["joints"]]
+        assert angles["angles_deg"][0] == 1
+    finally:
+        plugin.stop()
 
 
 def test_failed_connect_socket_is_closed_even_if_sdk_shutdown_fails():
@@ -524,6 +618,7 @@ def test_metadata_and_mcp_http_contract():
     assert next(t for t in tools if t["name"] == "safe_skin_control")["type"] == "actuator"
     assert next(t for t in tools if t["name"] == "model")["type"] == "resource"
     assert all(t["topic_out"][0]["format"] == ("sensor/skeleton" if t["name"] == "joints" else "data/json") for t in sensors)
+    assert tools[0]["topic_out"][1] == {"topic": "/dobot_cra/state/joint_angles", "format": "data/json"}
     assert tools[0]["configSchema"]["properties"]["controller_ip"]["x-sensitive"]
     bundle = DriverBundle([plugin])
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(lambda: bundle, "dobot-cra", metadata["id"]))
@@ -546,6 +641,7 @@ def test_metadata_and_mcp_http_contract():
         payload = json.loads(result["result"]["content"][0]["text"])
         assert payload["state"] == "running" and payload["joints"] == []
         assert payload["topic_out"][0]["format"] == "sensor/skeleton"
+        assert payload["topic_out"][1]["format"] == "data/json"
         removed = rpc("tools/call", {"name": "arm_all_state", "arguments": {"action": "info"}})
         assert removed["error"]["code"] == -32601
         control = rpc("tools/call", {"name": "safe_skin_control", "arguments": {"action": "start"}})
