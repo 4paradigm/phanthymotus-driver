@@ -550,9 +550,11 @@ def test_joints_configuration_accepts_delayed_one_hz_packets_without_reconnectin
     client = FeedbackClient({}, connection_factory=factory)
     plugin = DobotSensors({}, client=client)
     # Exercise the same port-selection path as the UI, not just initial config.
-    plugin.dispatch("start", {
+    configured = plugin.dispatch("config", {
         "_tool_name": "joints", "controller_ip": "127.0.0.1", "feedback_port": 30006,
     })
+    assert configured["state"] == "configured" and configured["feedback_port"] == 30006
+    plugin.dispatch("start", {"_tool_name": "joints"})
     try:
         writer.sendall(packet(angle=10))
         wait_until(lambda: client.snapshot()["packets_received"] == 1)
@@ -563,6 +565,12 @@ def test_joints_configuration_accepts_delayed_one_hz_packets_without_reconnectin
         snapshot = client.snapshot()
         assert snapshot["data"]["joint_state"]["q_actual"][0] == 20
         assert snapshot["error"] is None
+        assert calls == [30006]
+        # Core replays saved configuration before each start: keep a healthy stream.
+        for _ in range(2):
+            plugin.dispatch("config", {"_tool_name": "joints", "feedback_port": 30006})
+            plugin.dispatch("start", {"_tool_name": "joints"})
+        assert client.snapshot()["packets_received"] == 2
         assert calls == [30006]
     finally:
         client.stop()
@@ -637,9 +645,21 @@ def test_metadata_and_mcp_http_contract():
     try:
         assert rpc("initialize", {})["result"]["serverInfo"]["name"] == "dobot-cra"
         assert len(rpc("tools/list", {})["result"]["tools"]) == 4
+        result = rpc("tools/call", {"name": "joints", "arguments": {
+            "action": "config", "controller_ip": "", "feedback_port": 30006,
+        }})
+        configured = json.loads(result["result"]["content"][0]["text"])
+        assert configured["state"] == "configured"
+        assert configured["controller_ip"] == "" and configured["feedback_port"] == 30006
+        invalid = rpc("tools/call", {"name": "joints", "arguments": {
+            "action": "config", "controller_ip": "", "feedback_port": 29999,
+        }})
+        assert invalid["error"]["code"] == -32602
+        assert plugin.client.port == 30006
         result = rpc("tools/call", {"name": "joints", "arguments": {"action": "start"}})
         payload = json.loads(result["result"]["content"][0]["text"])
         assert payload["state"] == "running" and payload["joints"] == []
+        assert payload["feedback_port"] == 30006
         assert payload["topic_out"][0]["format"] == "sensor/skeleton"
         assert payload["topic_out"][1]["format"] == "data/json"
         removed = rpc("tools/call", {"name": "arm_all_state", "arguments": {"action": "info"}})

@@ -95,6 +95,39 @@ def test_start_info_stop_and_sensors_do_not_claim_control_or_send_commands():
     assert feedback.stops == 1
 
 
+def test_joints_config_closes_dashboard_and_clears_old_state_without_sending_commands():
+    feedback, dashboard, control, calls = setup_control()
+    plugin = DobotSensors({}, client=feedback, controller=control)
+    control.execute('set_sensitivity', dict(part=4, level=2, confirm_change=True))
+    assert control.snapshot()['last_request'] is not None
+    result = plugin.dispatch('config', {
+        '_tool_name': 'joints', 'controller_ip': '127.0.0.2', 'feedback_port': 30006,
+    })
+    assert result['state'] == 'configured'
+    assert feedback.address == '127.0.0.2' and feedback.port == 30006
+    assert dashboard.closed
+    assert dashboard.commands == ['SetSafeSkin(4,2)'] and len(calls) == 1
+    assert control.snapshot()['last_request'] is None
+    assert not control.snapshot()['dashboard_connected']
+    assert plugin.payload('joints')['joints'] == []
+    assert plugin.payload('joint_angles')['angles_deg'] == []
+    assert plugin.payload('safe_skin')['robot_status'] is None
+
+
+@pytest.mark.parametrize('changed', [{'controller_ip': 'invalid'}, {'feedback_port': 29999}])
+def test_invalid_joints_config_preserves_current_endpoint_and_dashboard(changed):
+    feedback, dashboard, control, calls = setup_control()
+    plugin = DobotSensors({}, client=feedback, controller=control)
+    control.execute('set_sensitivity', dict(part=4, level=2, confirm_change=True))
+    previous = control.snapshot()
+    with pytest.raises(ValueError):
+        plugin.dispatch('config', {'_tool_name': 'joints', **changed})
+    assert (feedback.address, feedback.port) == ('127.0.0.1', 30004)
+    assert not dashboard.closed and control.snapshot() == previous
+    assert len(calls) == 1 and dashboard.commands == ['SetSafeSkin(4,2)']
+    control.close()
+
+
 @pytest.mark.parametrize('enabled', [True, False])
 def test_sdk_global_switch_submission_and_unknown_readback(enabled):
     feedback, dashboard, control, calls = setup_control()

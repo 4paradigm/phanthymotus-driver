@@ -190,12 +190,14 @@ class DobotSensors:
             return self.control.execute(action, args)
         if name not in CARD_DESCRIPTIONS:
             return None
-        if action == "start":
+        if action in ("config", "start"):
             if any(key in args for key in ("controller_ip", "feedback_port")):
                 self.control.reconfigure(args.get("controller_ip", self.client.address),
                                          args.get("feedback_port", self.client.port))
-            self.client.start()
-            return {"state": "running", "topic_out": self._topics[name], **self.payload(name)}
+            if action == "start":
+                self.client.start()
+            return {"state": "configured" if action == "config" else "running",
+                    "topic_out": self._topics[name], **self.payload(name)}
         if action == "stop":
             return {"state": "idle"}
         if action in ("info", name):
