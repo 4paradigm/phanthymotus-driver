@@ -123,6 +123,32 @@ def test_standard_state_cards_read_native_reports(monkeypatch):
     assert plugin.dispatch("battery", {"_tool_name": "battery"}) == {"batteries": [{"SOC": 88}]}
 
 
+def test_actuator_start_surfaces_tls_reboot_requirement_to_frontend(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+
+    def require_reboot():
+        raise RuntimeError("配置已保存，重启服务失败，请重启机器狗使配置生效")
+
+    native.ensure_plaintext_transport = require_reboot
+    motion = device.S10MotionPlugin(native)
+    light = device.S10SingleLightPlugin(native, "head")
+    servo = device.S10LocoServoPlugin(native, ros2=object(), motion=motion)
+    navigation = device.S10NavigationPlugin(native)
+    charging = device.S10ChargePlugin(native)
+    expected = {
+        "state": "error",
+        "message": "配置已保存，重启服务失败，请重启机器狗使配置生效",
+    }
+
+    assert motion.dispatch("start", {}) == expected
+    assert light.dispatch("start", {}) == expected
+    assert servo.dispatch("start", {"input_topic": "/control/velocity"}) == expected
+    assert navigation.dispatch("start", {}) == expected
+    assert charging.dispatch("start", {}) == expected
+    assert not motion._thread.is_alive()
+
+
 def test_state_cards_expose_core_topics_when_ros_nodes_are_present(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
@@ -2048,6 +2074,60 @@ def test_basic_server_uses_tcp_for_request_response(monkeypatch):
         assert client.snapshot()["reports"]["1048676:5"] == response
     finally:
         client.close()
+
+
+def test_plaintext_gate_runs_aos_script_and_switches_client_to_tcp(monkeypatch):
+    client = BasicServerClient({"basic_server": {
+        "host": "10.21.33.103", "transport": "tls", "tcp_port": 30003,
+        "tls_tcp_port": 30003,
+    }})
+    client.ssh_password = "robot-password"
+    calls = []
+    monkeypatch.setattr("deep_robotics.s10_pro.basic_server.shutil.which", lambda _name: "/usr/bin/ssh")
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0, stdout="加密已关闭，无需重启\n", stderr="")
+
+    monkeypatch.setattr("deep_robotics.s10_pro.basic_server.subprocess.run", run)
+
+    assert client.ensure_plaintext_transport() == {
+        "state": "ready", "transport": "TCP", "cached": False,
+    }
+    assert client.transport == "tcp"
+    assert client.port == 30003
+    assert calls[0][0][:3] == ["sshpass", "-e", "ssh"]
+    assert "sudo -S -p '' bash -c" in calls[0][0][-1]
+    assert "systemd-detect-virt --container" in calls[0][0][-1]
+    assert calls[0][1]["input"] == "robot-password\n"
+    assert client.ensure_plaintext_transport()["cached"] is True
+    assert len(calls) == 1
+
+
+def test_plaintext_gate_reports_reboot_requirement_and_fails_closed(monkeypatch):
+    client = BasicServerClient({"basic_server": {
+        "host": "10.21.33.103", "transport": "tcp", "tcp_port": 30003,
+    }})
+    monkeypatch.setattr("deep_robotics.s10_pro.basic_server.shutil.which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr("deep_robotics.s10_pro.basic_server.subprocess.run", lambda *_a, **_k:
+                       SimpleNamespace(returncode=1, stdout="", stderr=
+                           "配置已保存，重启服务失败，请重启机器狗使配置生效"))
+
+    with pytest.raises(RuntimeError, match="请重启机器狗"):
+        client.ensure_plaintext_transport()
+
+
+def test_plaintext_gate_treats_script_reboot_message_as_failure_even_on_zero_exit(monkeypatch):
+    client = BasicServerClient({"basic_server": {
+        "host": "10.21.33.103", "transport": "tcp", "tcp_port": 30003,
+    }})
+    monkeypatch.setattr("deep_robotics.s10_pro.basic_server.shutil.which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr("deep_robotics.s10_pro.basic_server.subprocess.run", lambda *_a, **_k:
+                       SimpleNamespace(returncode=0,
+                           stdout="配置已保存，请重启机器狗使配置生效。", stderr=""))
+
+    with pytest.raises(RuntimeError, match="请重启机器狗"):
+        client.ensure_plaintext_transport()
 
 
 def test_basic_server_matches_string_encoded_response_type_and_command(monkeypatch):

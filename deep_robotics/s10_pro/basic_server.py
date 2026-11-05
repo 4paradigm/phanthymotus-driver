@@ -7,9 +7,13 @@ import json
 import hashlib
 import hmac
 import os
+from pathlib import Path
+import shlex
+import shutil
 import socket
 import ssl
 import struct
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -21,6 +25,53 @@ MAX_ASDU = 1000
 DEFAULT_TLS_SHA256_FINGERPRINT = (
     "6cd411bfaffed2c5d93f80d30edb514e6b194ef2e33a199a851bbff9ce50b415"
 )
+PLAINTEXT_GATE_TTL = 15.0
+
+_DISABLE_TLS_SCRIPT = r'''set -eu
+fail(){ echo "$*" >&2; exit 1; }
+d=/var/opt/robot/conf/robot_server
+f="$d/Network.toml"
+u=robot_server.service
+systemd-detect-virt --container >/dev/null || fail "请在目标容器内执行"
+[ -f "$f" ] && [ ! -L "$f" ] || fail "配置文件不可用"
+exec 9<"$d"
+flock -n 9 || fail "已有脚本在执行"
+key="^[[:space:]]*enableTls[[:space:]]*="
+[ "$(grep -Ec "$key" "$f")" = 1 ] || fail "enableTls 缺失或重复"
+if [ -f "$d/user_conf.toml" ] && grep -Eq "$key" "$d/user_conf.toml"; then
+  fail "user_conf.toml 含 enableTls，请先核对覆盖配置"
+fi
+valid(){ awk -v v="$1" '/^[[:space:]]*\[/ {n=($0 ~ /^[[:space:]]*\[Network\][[:space:]]*(#.*)?$/)} n && $0 ~ ("^[[:space:]]*enableTls[[:space:]]*=[[:space:]]*" v "[[:space:]]*(#.*)?$") {ok=1} END {exit !ok}' "$f"; }
+valid "(true|false)" || fail "[Network] 的 enableTls 格式异常"
+if ! valid false; then
+  b="$f.bak.$(date +%Y%m%d-%H%M%S).$$"
+  cp -p "$f" "$b"
+  echo "备份：$b"
+  if ! sed -i -E 's/^([[:space:]]*enableTls[[:space:]]*=[[:space:]]*)true([[:space:]]*(#.*)?)$/\1false\2/' "$f" || ! valid false; then
+    if cp -p "$b" "$f"; then fail "写入失败，已恢复原配置"; fi
+    fail "写入失败，请从备份恢复：$b"
+  fi
+  sync
+fi
+echo "配置已确认：enableTls=false"
+sce(){ python3 -c 'import socket,struct,json,datetime; m=bytes.fromhex("eb90eb90"); h=struct.Struct("<4sHHBBB5s"); b=json.dumps({"PatrolDevice":{"Type":1048676,"Command":1,"Time":datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),"Items":{}}}).encode(); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(1); s.connect(("127.0.0.1",40000)); s.send(h.pack(m,len(b),1,1,0,1,bytes(5))+b); r=s.recv(4096); magic,n,*_=h.unpack_from(r); p=json.loads(r[h.size:])["PatrolDevice"]; v=p["Items"]["SCE"]; assert magic==m and n==len(r)-h.size and p["Type"]==1048676 and p["Command"]==1 and type(v) is int and v in (0,1); print(v)' 2>/dev/null; }
+state=$(sce || true)
+if [ "$state" = 0 ]; then echo "加密已关闭，无需重启"; exit 0; fi
+if ! systemctl is-active --quiet "$u"; then echo "配置已保存，请重启机器狗使配置生效。"; exit 0; fi
+old=$(systemctl show -p InvocationID --value "$u")
+[ -n "$old" ] || fail "配置已保存，无法读取服务实例，请重启机器狗使配置生效"
+systemctl restart --no-block "$u" || fail "配置已保存，重启服务失败，请重启机器狗使配置生效"
+echo "检测加密关闭中…"
+deadline=$((SECONDS+60))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  now=$(systemctl show -p InvocationID --value "$u" 2>/dev/null || true)
+  if [ -n "$now" ] && [ "$now" != "$old" ] && systemctl is-active --quiet "$u" && valid false && [ "$(sce || true)" = 0 ]; then
+    echo "加密已关闭"
+    exit 0
+  fi
+  sleep 1
+done
+fail "配置已保存，检测超时，请重启机器狗后重新执行本命令确认状态"'''
 
 
 def _protocol_int(value: object) -> int:
@@ -151,6 +202,16 @@ class BasicServerClient:
             raise ValueError("S10 basic_server TLS SHA-256 fingerprint must contain 64 hex digits")
         self.tls_sha256_fingerprint = normalized_pin
         self.config = config
+        self.ssh_user = os.environ.get("S10_BASIC_SERVER_SSH_USER") or os.environ.get(
+            "S10_AUDIO_SSH_USER", native.get("ssh_user", "user"))
+        self.ssh_password = os.environ.get(
+            "S10_BASIC_SERVER_SSH_PASSWORD",
+            os.environ.get("S10_AUDIO_SSH_PASSWORD", os.environ.get("S10_DRMAP_PASSWORD", "")))
+        self.ssh_known_hosts = os.environ.get(
+            "S10_SSH_KNOWN_HOSTS",
+            str(Path(__file__).with_name("resource") / "ssh_known_hosts"))
+        self._gate_lock = threading.Lock()
+        self._gate_verified_at = None
         self.enabled = bool(native.get("enabled", True))
         self._socket = None
         self._decoder = StreamDecoder()
@@ -242,6 +303,54 @@ class BasicServerClient:
             self._socket.sendall(encode_frame(message_id, message_type, command, items))
             return {"state": "sent", "transport": "TCP", "message_id": message_id,
                     "type": int(message_type), "command": int(command)}
+
+    def ensure_plaintext_transport(self):
+        """Verify/disable AOS basic_server TLS before the frontend starts execution cards."""
+        if not self.enabled:
+            raise RuntimeError("S10 basic_server is disabled")
+        with self._gate_lock:
+            now = time.monotonic()
+            if (self._gate_verified_at is not None
+                    and now - self._gate_verified_at < PLAINTEXT_GATE_TTL):
+                return {"state": "ready", "transport": "TCP", "cached": True}
+            if not shutil.which("ssh"):
+                raise RuntimeError("AOS TLS 检查失败：驱动容器中没有 ssh 客户端")
+            target = f"{self.ssh_user}@{self.host}" if self.ssh_user else self.host
+            sudo = ("sudo -S -p '' bash -c " if self.ssh_password
+                    else "sudo -n bash -c ")
+            remote = sudo + shlex.quote(_DISABLE_TLS_SCRIPT)
+            command = ["ssh", "-T", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=yes",
+                       "-o", f"UserKnownHostsFile={self.ssh_known_hosts}",
+                       "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ServerAliveInterval=5",
+                       "-o", "ServerAliveCountMax=2"]
+            env = None
+            if self.ssh_password:
+                if not shutil.which("sshpass"):
+                    raise RuntimeError("AOS TLS 检查失败：配置了 AOS 密码但 sshpass 不可用")
+                command = ["sshpass", "-e", *command]
+                env = os.environ.copy()
+                env["SSHPASS"] = self.ssh_password
+            else:
+                command.extend(["-o", "BatchMode=yes"])
+            command.extend(["--", target, remote])
+            sudo_stdin = f"{self.ssh_password}\n" if self.ssh_password else None
+            try:
+                result = subprocess.run(command, input=sudo_stdin, capture_output=True,
+                                        text=True, timeout=75, check=False, env=env)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise RuntimeError(f"AOS TLS 检查失败，执行卡未启动：{exc}") from exc
+            output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+            if "请重启机器狗" in output:
+                raise RuntimeError(f"{output}\n请重启机器狗后，再次开启智能控制。")
+            if result.returncode != 0:
+                raise RuntimeError(f"AOS TLS 检查失败，执行卡未启动：{output or '远程脚本未成功'}")
+            if "加密已关闭" not in output:
+                raise RuntimeError(f"AOS TLS 检查未确认加密状态，执行卡未启动：{output or '无状态结果'}")
+            self.close_socket()
+            self.transport = "tcp"
+            self.port = int(self.config.get("basic_server", {}).get("tcp_port", 30003))
+            self._gate_verified_at = time.monotonic()
+            return {"state": "ready", "transport": "TCP", "cached": False}
 
     def _ensure_reader(self):
         if self._reader_thread and self._reader_thread.is_alive():

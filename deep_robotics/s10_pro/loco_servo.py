@@ -107,6 +107,12 @@ class S10LocoServoPlugin:
         return None
 
     def _start(self, args):
+        ensure_plaintext = getattr(self.native, "ensure_plaintext_transport", None)
+        if ensure_plaintext is not None:
+            try:
+                ensure_plaintext()
+            except Exception as exc:
+                return {"state": "error", "message": str(exc)}
         topic = str(args.get("input_topic") or "").strip()
         if not topic: return {"state": "error", "message": "缺少 input_topic，请连接 control/velocity 输出"}
         if "dry_run" in args and type(args["dry_run"]) is not bool:

@@ -57,15 +57,23 @@ Joint latency and LiDAR coordinate refinements remain separate local work.
 
 Motion and lighting use the vendor `basic_server` JSON framing on port `30003`.
 The deployed S10 service currently uses plain TCP (`S10_BASIC_SERVER_TRANSPORT=tcp`)
-because TLS is disabled on this robot. Set the transport to `tls` only when the
-vendor TLS service and its client identity are provisioned. In TLS mode the client verifies the `server.local` endpoint using the
-S10 certificate SHA-256 pin in `config.yaml`; deployments can override the
-name/pin or provide a CA with `S10_BASIC_SERVER_TLS_CA`. The robot server
-requests a client certificate, so set `S10_BASIC_SERVER_TLS_CLIENT_CERT` and
-`S10_BASIC_SERVER_TLS_CLIENT_KEY` to the vendor-issued identity files. There
-is no implicit plaintext fallback from TLS mode. Motion uses native S10 commands and reports long-running completion through
+because the execution startup gate below ensures TLS is disabled before use.
+The TLS client options remain available for standalone diagnostics; they do not
+override the execution gate. In TLS mode the client verifies the `server.local`
+endpoint using the S10 certificate SHA-256 pin in `config.yaml`; deployments can
+override the name/pin or provide a CA with `S10_BASIC_SERVER_TLS_CA`. The robot
+server requests a client certificate, so set `S10_BASIC_SERVER_TLS_CLIENT_CERT`
+and `S10_BASIC_SERVER_TLS_CLIENT_KEY` to the vendor-issued identity files.
+Motion uses native S10 commands and reports long-running completion through
 `/api/acp/complete`; locomotion movement accepts `yaw_rate_deg_s` in degrees per
 second and a bounded duration. Head and tail lights are independent cards.
+When Agent Core starts an execution card (`loco`, `loco_servo`, navigation,
+charging, or a light), the driver checks AOS `robot_server` TLS state first by
+SSH and runs the vendor's guarded `Network.toml` procedure. If SCE confirms TLS
+is already disabled, startup proceeds without restarting the service. If the
+procedure cannot confirm plaintext or reports that the robot must be rebooted,
+the card start fails with the reason shown in the frontend; no execution command
+is sent. After a successful check, this driver uses TCP for basic_server.
 `loco_servo` is the streaming counterpart for visual navigation policies. It
 subscribes on Core domain 42 through a loopback-only bridge process, requires
 `S10_MOTION_ENABLED=1` at deployment plus `confirm=true` before switching out

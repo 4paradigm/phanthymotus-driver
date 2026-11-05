@@ -39,6 +39,17 @@ def _mark_dangerous(result, actions):
     return result
 
 
+def _plaintext_start_error(native):
+    ensure = getattr(native, "ensure_plaintext_transport", None)
+    if ensure is None:
+        return None
+    try:
+        ensure()
+    except Exception as exc:
+        return {"state": "error", "message": str(exc)}
+    return None
+
+
 def _confirmation_error(action, args):
     if args.get("confirm") is True:
         return None
@@ -1336,6 +1347,9 @@ class S10MotionPlugin:
         if self._servo is not None and action not in {"start", "info"}:
             self._servo.pause_for_explicit_command(action)
         if action == "start":
+            error = _plaintext_start_error(self.native)
+            if error:
+                return error
             self.start()
             return {"state": "ready"}
         if action == "stop":
@@ -1551,7 +1565,8 @@ class S10NavigationPlugin:
             error = _confirmation_error(action, args)
             if error:
                 return error
-        if action == "start": return {"state": "ready"}
+        if action == "start":
+            return _plaintext_start_error(self.native) or {"state": "ready"}
         if action == "stop":
             self.stop()
             return {"state": "idle"}
@@ -1662,7 +1677,7 @@ class S10SingleLightPlugin:
 
     def dispatch(self, action, args):
         if action == "start":
-            return {"state": "ready"}
+            return _plaintext_start_error(self.native) or {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
@@ -1705,7 +1720,8 @@ class S10ChargePlugin:
             error = _confirmation_error(action, args)
             if error:
                 return error
-        if action == "start": return {"state": "ready"}
+        if action == "start":
+            return _plaintext_start_error(self.native) or {"state": "ready"}
         if action == "stop": return {"state": "idle"}
         if action == "info": return {"state": "ready"}
         if action == "start_charging": return self.native.request(0x00100004, 0x00100002, {"Charge": 1})
