@@ -151,3 +151,39 @@ def test_every_imported_sibling_is_copied(dockerfile):
         f'{dockerfile.relative_to(ROOT)} does not copy modules the driver '
         f'imports: ' + '; '.join(missing)
     )
+
+
+def _sibling_files_named(driver_dir: Path, shipped: set) -> dict:
+    """`{file: [shipped files naming it]}` for sibling `.py` files named as strings.
+
+    Not every neighbour is imported. `ext_devices.py` reaches `audio_sender.py`
+    as `Path(__file__).parent / "audio_sender.py"` and copies it to another
+    computer over SSH, which the import check above cannot see — so the Tianyi
+    image shipped the deploy code without the file it deploys, and a new robot's
+    remote mic never got a sender. Only shipped files count: a file that is not
+    in the image cannot need anything at runtime.
+    """
+    siblings = {p.name for p in driver_dir.glob('*.py')}
+    pattern = re.compile(r'''["']([A-Za-z_][A-Za-z0-9_]*\.py)["']''')
+    found: dict = {}
+    for source in driver_dir.glob('*.py'):
+        if source.name not in shipped or _is_test_module(source.stem):
+            continue
+        for name in set(pattern.findall(source.read_text(errors='ignore'))):
+            if name in siblings and name != source.name:
+                found.setdefault(name, []).append(source.name)
+    return found
+
+
+@pytest.mark.parametrize('dockerfile', DOCKERFILES, ids=lambda p: str(p.relative_to(ROOT)))
+def test_every_sibling_file_named_by_shipped_code_is_copied(dockerfile):
+    copied = _copied_names(dockerfile)
+    missing = [
+        f'{name} (named in {", ".join(sorted(users))})'
+        for name, users in sorted(_sibling_files_named(dockerfile.parent, copied).items())
+        if name not in copied
+    ]
+    assert not missing, (
+        f'{dockerfile.relative_to(ROOT)} does not copy files its code refers to by '
+        f'name: ' + '; '.join(missing)
+    )

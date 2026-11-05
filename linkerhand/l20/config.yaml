@@ -1,0 +1,108 @@
+mcp_port: 15734
+ros_namespace: ""
+
+ros:
+  robot_domain_id: 42
+  core_domain_id: 42
+
+name: "LinkerHand L20"
+side: "left"
+can_channel: "can0"
+baudrate: 1000000
+left_can_id: 0x28
+right_can_id: 0x27
+response_timeout_s: 0.5
+
+plugins:
+  hand:
+    enabled: true
+    auto_detect_gestures: true
+    motion_speed: 85
+    motion_torque: 200
+    motion_timeout_s: 8.0
+    position_tolerance: 18
+    poll_interval_s: 0.08
+
+    # 20-element vector layout:
+    #   [0:5]   finger_base pitch (thumb, index, middle, ring, pinky)
+    #   [5:10]  yaw angles        (thumb, index, middle, ring, pinky)
+    #   [10:15] thumb roll        (thumb_roll, 0, 0, 0, 0)
+    #   [15:20] fingertip flexion (thumb, index, middle, ring, pinky)
+    open_pose:         [255, 255, 255, 255, 255,  70, 200, 132,  55,   0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+    fist_pose:         [110,   0,   0,   0,   0, 140, 193, 158, 128,  91, 255, 255, 255, 255, 255, 119,   0,   0,   0,   0]
+    natural_pose:      [135, 255, 255, 255, 255,  70, 110, 100,  99, 100, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+    left_open_pose:    [255, 255, 255, 255, 255,  70, 200, 132,  55,   0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+    left_fist_pose:    [110,   0,   0,   0,   0, 140, 193, 158, 128,  91, 255, 255, 255, 255, 255, 119,   0,   0,   0,   0]
+    left_natural_pose: [135, 255, 255, 255, 255,  70, 110, 100,  99, 100, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+
+  hand_gesture:
+    enabled: true
+    motion_speed: 85
+    count_speed: 85
+    thumb_speed_scaling: true
+    motion_torque: 200
+    motion_timeout_s: 2.5
+    position_tolerance: 20
+    poll_interval_s: 0.08
+
+    right_poses: &gesture_poses
+      ok_gesture:       [214, 166, 255, 255, 255,  85, 164, 110,  50,   0, 199, 255, 255, 255, 255,  94,  71, 255, 255, 255]
+      thumb_up_gesture: [100,   0,   0,   0,   0, 255, 145, 142, 132, 111, 210, 255, 255, 255, 255, 255,   0,   0,   0,   0]
+      v_sign_gesture:   [ 96, 255, 255,   0,   0,  59, 190,  66, 127, 102, 197, 255, 255, 255, 255, 144, 255, 255,   0,   0]
+      natural_gesture:  [135, 255, 255, 255, 255,  70, 110, 100,  99, 100, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+      grasp_prep:       [255, 255, 255, 255, 255,  70, 200, 132,  55,   0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+      grasp_target:     [110,   0,   0,   0,   0, 140, 193, 158, 128,  91, 255, 255, 255, 255, 255, 119,   0,   0,   0,   0]
+    left_poses: *gesture_poses
+
+    right_number_poses: &number_poses
+      0: [110,   0,   0,   0,   0, 140, 193, 158, 128,  91, 255, 255, 255, 255, 255, 119,   0,   0,   0,   0]
+      1: [110, 255,   0,   0,   0,  81, 125, 162, 127,  80, 177, 255, 255, 255, 255, 132, 255,   0,   0,   0]
+      2: [ 96, 255, 255,   0,   0,  59, 190,  66, 127,  80, 197, 255, 255, 255, 255, 144, 255, 255,   0,   0]
+      3: [ 96, 255, 255, 255,   0,  22, 200, 132,  55,  80, 233, 255, 255, 255, 255, 144, 255, 255, 255,   0]
+      4: [ 96, 255, 255, 255, 255,  22, 200, 132,  55,   0, 233, 255, 255, 255, 255, 144, 255, 255, 255, 255]
+      5: [255, 255, 255, 255, 255,  70, 200, 132,  55,   0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+      6: [255,   0,   0,   0, 255,  70, 200, 132,  55,   0, 255, 255, 255, 255, 255, 255,   0,   0,   0, 255]
+      7: [173,  34,  15,   0,   0, 111, 132, 132,  55,   0, 125, 255, 255, 255, 255, 131, 168, 168,   0,   0]
+      8: [173, 255,   0,   0,   0, 172, 132, 132,  55,   0, 255, 255, 255, 255, 255, 255, 255,   0,   0,   0]
+      9: [188, 255,   0,   0,   0,  60, 162, 162, 144, 100, 189, 255, 255, 255, 255,  65,   0,   0,   0,   0]
+    left_number_poses: *number_poses
+
+  hand_grasp:
+    enabled: true
+    prep_pose: [255, 255, 255, 255, 255, 70, 200, 132, 55, 0, 73, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+    close_limit_pose: [60, 0, 0, 0, 0, 70, 200, 132, 55, 0, 73, 255, 255, 255, 255, 142, 0, 0, 0, 0]
+    # Raw motor output limit (same setting as vendor GUI), not measured force/current.
+    motion_current: 230
+    # Grasp action speed_ratio has a fixed baseline of 85 (1.0x).
+    approach_speed: 85
+    release_speed: 80
+    # Per-finger 12x6 matrix peak at which reference advance latches off.
+    # Not a constant-pressure target; actual peak can continue rising.
+    tactile_threshold: 15
+    # Position target increments; lag >= slowdown_error_threshold uses step_size.
+    step_size: 5
+    fast_step_size: 10
+    slowdown_error_threshold: 10
+    # Trial position-lag criteria; tolerance is the full observation-window spread.
+    stall_error_threshold: 20
+    stall_position_tolerance: 3
+    stall_duration_s: 0.5
+    poll_interval_s: 0.05
+    matrix_timeout_s: 0.25
+    pose_timeout_s: 5.0
+    timeout_s: 15.0
+    position_tolerance: 20
+
+  hand_tactile:
+    enabled: true
+    # Streaming uses the top-level side/can_channel; every scalar sample needs five new replies.
+    poll_hz: 20.0
+    auto_start: true
+    matrix_enabled: true
+    # Each matrix query requires all 60 new rows. Actual rate includes CAN query time.
+    matrix_request_interval_s: 0.05
+    tactile_timeout_s: 0.25
+    matrix_timeout_s: 0.25
+    stale_after_s: 1.0
+    # Raw scalar >= threshold OR a positive matrix sum sets the contact flag.
+    contact_threshold: 8

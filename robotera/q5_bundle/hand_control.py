@@ -279,10 +279,17 @@ class Plugin:
             return {"ok": self._hold_current(), "state": "held"}
         if action not in ("open_hand", "close_hand", "set_hand", "set_finger"):
             return None
+        return self._execute_motion(action, args, self._profile_targets)
+
+    def set_targets(self, args, source):
+        """Execute joint targets for internal cards, outside the public schema."""
+        return self._execute_motion(source, args, lambda action, values: self._targets(values))
+
+    def _execute_motion(self, action, args, build_command):
         allowed = self._allowed(args)
         if allowed.get("ok") is False:
             return allowed
-        command = self._profile_targets(action, args)
+        command = build_command(action, args)
         if command.get("ok") is False:
             return command
         action_id = str(args.get("action_id") or f"hand_control_{action}_{int(time.time() * 1000)}")

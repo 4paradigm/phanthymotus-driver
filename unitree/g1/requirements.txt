@@ -1,6 +1,21 @@
 netifaces>=0.11.0
 pyyaml>=6.0
-opencv-python-headless>=4.8
-numpy>=1.24
+opencv-python-headless==4.11.0.86
+numpy==2.2.6
 pyrealsense2>=2.54
 sounddevice>=0.4.6
+pyalsaaudio
+casadi==3.8.1
+scipy==1.15.3
+libpinocchio==4.1.0
+coal==3.0.3
+eigenpy==3.13.0
+cmeel==0.61.0
+cmeel-boost==1.90.0
+cmeel-urdfdom==6.0.0
+cmeel-eigen==3.4.1
+cmeel-urdfdom-headers==3.0.0
+jrl-cmakemodules==2.1.0
+# Link the Python binding to the CycloneDDS library built by Dockerfile.
+--no-binary=cyclonedds
+cyclonedds==0.10.5

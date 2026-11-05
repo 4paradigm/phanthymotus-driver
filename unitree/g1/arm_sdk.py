@@ -226,7 +226,8 @@ class ArmSdkChannel:
 
     def __init__(self, *, send_crc: bool = True, grippers: bool = True,
                  waist: bool = False, driven_arm_ids=None,
-                 driven_waist_names=None):
+                 driven_waist_names=None, low_state=None):
+        self._low_state = low_state
         self._send_crc = bool(send_crc)
         self._grippers = bool(grippers)
         self._waist = bool(waist)
@@ -266,9 +267,15 @@ class ArmSdkChannel:
         from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
 
         arm_pub = ChannelPublisher(ARM_SDK_TOPIC, LowCmd_)
+        # Retain partially initialized publishers so a failed stream claim can
+        # close them explicitly instead of leaving an unowned DDS writer.
+        with self._lock:
+            self._arm_pub = arm_pub
         arm_pub.Init()
 
         gripper_pubs = {}
+        with self._lock:
+            self._gripper_pubs = gripper_pubs
         if self._grippers:
             try:
                 from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_
@@ -281,8 +288,8 @@ class ArmSdkChannel:
                 ) from exc
             for side, topic in DEX1_CMD_TOPICS.items():
                 publisher = ChannelPublisher(topic, MotorCmds_)
-                publisher.Init()
                 gripper_pubs[side] = publisher
+                publisher.Init()
 
         # **先读实测，再建消息。** 顺序是有意的：读失败就在建立任何发布器之后、
         # 发出任何一条指令之前抛出，而 `_start` 会把卡片回滚成 idle。
@@ -333,9 +340,14 @@ class ArmSdkChannel:
 
     def close(self):
         with self._lock:
+            publishers = [self._arm_pub, *self._gripper_pubs.values()]
             self._arm_pub = None
             self._gripper_pubs = {}
             self._last_target = None
+        for publisher in publishers:
+            close = getattr(publisher, 'Close', None)
+            if close is not None:
+                close()
 
     def _read_measured_arms(self):
         """等一帧 `rt/lowstate`，返回 14 个臂关节的实测角（左 7 + 右 7）。
@@ -348,42 +360,48 @@ class ArmSdkChannel:
         「用零位兜底」好，理由和这个仓库里每一条「拒绝而不是猜」一样：猜错的代价
         不是一条报错，是手臂以 kp=300 甩到一个没人要求过的位置。
         """
-        from unitree_sdk2py.core.channel import ChannelSubscriber
-        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+        if self._low_state is not None:
+            sample = self._low_state.snapshot()
+            if sample is None or not 0 <= time.monotonic_ns()-sample.sampled_ns <= 200_000_000:
+                raise RuntimeError('arm_feedback_stale')
+            frame = sample.message
+        else:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
 
-        received: dict = {}
+            received: dict = {}
 
-        def _on_state(message):
-            if "m" not in received:
-                received["m"] = message
+            def _on_state(message):
+                if "m" not in received:
+                    received["m"] = message
 
-        # **只要一帧，拿到就关。** 留着它意味着一条 500 Hz 的订阅活到进程结束，
-        # 而这个仓库里「孤儿订阅」的历史是：卡片 stop 之后回调还在跑，图看着健康，
-        # 全栈订阅却在某一次 teardown 顺序错误时一起停摆。
-        subscriber = ChannelSubscriber(LOW_STATE_TOPIC, LowState_)
-        subscriber.Init(_on_state, 10)
-        try:
-            deadline = time.monotonic() + self.LOW_STATE_TIMEOUT_S
-            while "m" not in received and time.monotonic() < deadline:
-                time.sleep(0.01)
-        finally:
-            # SDK 的 `Close()` 是 `del self.__reader` 然后置 None，而 DDS 的回调
-            # 可能正在飞 —— 那会在日志里留一条 `'NoneType' object has no attribute
-            # 'take'`。**这是 SDK 自己的 teardown 竞态，不是我们的错**，而且确定性地
-            # 关掉比让它被 GC 回收要好：窗口从「不确定」缩到几微秒，且只有一次。
+            # **只要一帧，拿到就关。** 留着它意味着一条 500 Hz 的订阅活到进程结束，
+            # 而这个仓库里「孤儿订阅」的历史是：卡片 stop 之后回调还在跑，图看着健康，
+            # 全栈订阅却在某一次 teardown 顺序错误时一起停摆。
+            subscriber = ChannelSubscriber(LOW_STATE_TOPIC, LowState_)
+            subscriber.Init(_on_state, 10)
             try:
-                subscriber.Close()
-            except Exception:  # noqa: BLE001 —— 关不掉也不能挡住启动
-                pass
+                deadline = time.monotonic() + self.LOW_STATE_TIMEOUT_S
+                while "m" not in received and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            finally:
+                # SDK 的 `Close()` 是 `del self.__reader` 然后置 None，而 DDS 的回调
+                # 可能正在飞 —— 那会在日志里留一条 `'NoneType' object has no attribute
+                # 'take'`。**这是 SDK 自己的 teardown 竞态，不是我们的错**，而且确定性地
+                # 关掉比让它被 GC 回收要好：窗口从「不确定」缩到几微秒，且只有一次。
+                try:
+                    subscriber.Close()
+                except Exception:  # noqa: BLE001 —— 关不掉也不能挡住启动
+                    pass
 
-        if "m" not in received:
-            raise RuntimeError(
-                f"{self.LOW_STATE_TIMEOUT_S:g} 秒内没有收到 {LOW_STATE_TOPIC} —— "
-                "拿不到实测关节角就不能接管手臂（指令里 q 的默认值 0.0 是「去零位」，"
-                "不是「不动」）。检查 NETWORK_INTERFACE 和机器人是否上电"
-            )
+            if "m" not in received:
+                raise RuntimeError(
+                    f"{self.LOW_STATE_TIMEOUT_S:g} 秒内没有收到 {LOW_STATE_TOPIC} —— "
+                    "拿不到实测关节角就不能接管手臂（指令里 q 的默认值 0.0 是「去零位」，"
+                    "不是「不动」）。检查 NETWORK_INTERFACE 和机器人是否上电"
+                )
 
-        frame = received["m"]
+            frame = received["m"]
         # 型号握手用的两个字段，和实测角来自同一帧。
         self._mode_machine = int(getattr(frame, "mode_machine", 0))
         self._mode_pr = int(getattr(frame, "mode_pr", 0))
@@ -491,7 +509,64 @@ class ArmSdkChannel:
             values = dict(zip(("roll", "pitch", "yaw"), (float(v) for v in waist)))
             for name in self._driven_waist:
                 message.motor_cmd[WAIST_MOTOR_IDS[name]].q = values[name]
-        self._write(message)
+        return self._write(message)
+
+    def publish_servo_position(self, radians, *, weight):
+        """Use the existing servo gains and position writer, without RNEA.
+
+        The execution owner supplies takeover/handback weight. This is not
+        trajectory interpolation; each accepted target is written unchanged.
+        """
+        import math
+        if len(radians) != len(self._driven_arm_ids) or any(
+                type(v) not in (int, float) or not math.isfinite(v) for v in radians):
+            raise ValueError('invalid_servo_position')
+        if type(weight) not in (int, float) or not math.isfinite(weight) or not 0 <= weight <= 1:
+            raise ValueError('invalid_servo_weight')
+        with self._lock:
+            if self._arm_pub is None or self._message is None:
+                raise RuntimeError('arm_stream_not_open')
+            self._weight = float(weight)
+            for motor_id in self._driven_arm_ids:
+                cmd = self._message.motor_cmd[motor_id]
+                cmd.kp, cmd.kd = (40.0, 1.5) if motor_id in WRIST_MOTOR_IDS else (80.0, 3.0)
+        return self.publish_arms(radians)
+
+    def publish_stream(self, radians, tau_ff, *, weight):
+        """Strict arm-only stream write with a real SDK write receipt.
+
+        Legacy servo entry points retain their existing behavior. The stream
+        passes final, validated q and gravity compensation, never an IK target.
+        tau_ff=None is reserved for hold/handback, retaining the last gains/tau.
+        """
+        import math
+        n = len(self._driven_arm_ids)
+        for name, values in (('q', radians), ('tau', tau_ff)):
+            if values is None and name == 'tau':
+                continue
+            if (not isinstance(values, (list, tuple)) or len(values) != n
+                    or any(type(v) not in (int, float) or not math.isfinite(v) for v in values)):
+                raise ValueError('invalid_stream_'+name)
+        if type(weight) not in (int, float) or not math.isfinite(weight) or not 0 <= weight <= 1:
+            raise ValueError('invalid_stream_weight')
+        with self._lock:
+            if self._arm_pub is None or self._message is None:
+                raise RuntimeError('arm_stream_not_open')
+            for i, motor_id in enumerate(self._driven_arm_ids):
+                cmd = self._message.motor_cmd[motor_id]
+                # G1_23 visible-follow hardware.py (2026-09-19): arm weak
+                # motors use 80/3, wrist roll 40/1.5. Keep the legacy servo
+                # defaults above unchanged; the new stream retains its baseline.
+                cmd.mode = 1
+                cmd.kp, cmd.kd = (40.0, 1.5) if motor_id in WRIST_MOTOR_IDS else (80.0, 3.0)
+                cmd.q, cmd.dq = float(radians[i]), 0.0
+                if tau_ff is not None:
+                    cmd.tau = float(tau_ff[i])
+            self._weight = float(weight)
+            if self._write(self._message) is not True:
+                raise RuntimeError('arm_sdk_write_failed')
+            self._last_target = list(radians)
+            return True
 
     def publish_gripper(self, side: str, closure):
         publisher = self._gripper_pubs.get(side)
@@ -548,4 +623,5 @@ class ArmSdkChannel:
             message.crc = self._crc.Crc(message)
         publisher = self._arm_pub
         if publisher is not None:
-            publisher.Write(message)
+            return publisher.Write(message)
+        return False

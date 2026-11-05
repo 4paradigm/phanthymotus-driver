@@ -1,0 +1,59 @@
+{
+  "schema": "motus.teleop.command/1",
+  "instance_id": "vr-1",
+  "device_id": "f02151a2-e893-4e74-ab97-14c952b26cc1",
+  "connection_epoch": 1,
+  "space_epoch": 1,
+  "sequence": 17,
+  "source_monotonic_ns": 123456000,
+  "received_monotonic_ns": 888888000,
+  "clock_id": "test-host-boot",
+  "tracking_frame": "tracking_x_forward_y_left_z_up",
+  "head_reference": {
+    "tracked": true,
+    "position": [
+      0,
+      0,
+      1.6
+    ],
+    "orientation_xyzw": [
+      0,
+      0,
+      0,
+      1
+    ]
+  },
+  "left": {
+    "tracked": true,
+    "position": [
+      0.3,
+      0.25,
+      1.2
+    ],
+    "orientation_xyzw": [
+      0,
+      0,
+      0,
+      1
+    ],
+    "grip": 1,
+    "trigger": 0
+  },
+  "right": {
+    "tracked": true,
+    "position": [
+      0.3,
+      -0.25,
+      1.2
+    ],
+    "orientation_xyzw": [
+      0,
+      0,
+      0,
+      1
+    ],
+    "grip": 1,
+    "trigger": 0
+  },
+  "kind": "input"
+}

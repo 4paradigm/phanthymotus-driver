@@ -834,6 +834,8 @@ class U1CardContractTests(unittest.TestCase):
         head = device.HeadPlugin(expression.audio)
         expression_schema = expression.get_tool()["inputSchema"]
         head_schema = head.get_tool()["inputSchema"]
+        self.assertEqual(expression_schema["x-resource"], device.VENDOR_ACTION_RESOURCE)
+        self.assertEqual(head_schema["x-resource"], device.VENDOR_ACTION_RESOURCE)
         self.assertNotIn("list_actions", expression_schema["properties"]["action"]["enum"])
         self.assertNotIn("list_actions", head_schema["properties"]["action"]["enum"])
         self.assertNotIn("look_down", expression_schema["properties"]["name"]["enum"])
@@ -1287,6 +1289,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(tool["name"], "tts")
         self.assertEqual(schema["properties"]["action"]["enum"], ["start", "speak", "interrupt", "stop", "info"])
         self.assertEqual(schema["x-completion"]["actions"], ["speak"])
+        self.assertEqual(schema["x-resource"], device.VENDOR_ACTION_RESOURCE)
 
     def test_head_card_uses_readable_preset_names(self):
         import device

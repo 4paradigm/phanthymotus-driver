@@ -405,6 +405,17 @@ class LocoServoPlugin:
             # Lets every call-shaped card pause this one before it acts.
             loco_plugin.attach_servo(self)
 
+    def distance_full_scale(self) -> dict:
+        """Normalised command -> m/s for the pure-IMU distance cross-check.
+
+        Same measured calibration this card converts with. The distance worker
+        uses it as an independent travel estimate; it never routes motion
+        through this card.
+        """
+        vx = self._calibration["full_scale_vx_mps"]
+        vy = self._calibration["full_scale_vy_mps"]
+        return {'forward': vx, 'backward': vx, 'left': vy, 'right': vy}
+
     # ── tool ─────────────────────────────────────────────────────────────────
 
     def get_tool(self) -> dict:

@@ -1,0 +1,16 @@
+id: linkerhand-l20-driver
+name: LinkerHand L20 Dexterous Hand
+category: driver
+hardware_provider: linkerhand
+hardware_model: "l20"
+image_name: linkerhand-l20
+port: 15734
+mcp_url: "http://localhost:15734/mcp"
+description: "灵心巧手 L20 — USB-CAN 1Mbps，16 主动关节控制、数字手势、自适应接触停止抓握与独立触觉传感器卡片"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: hand, type: actuator }
+  - { name: hand_gesture, type: actuator }
+  - { name: hand_grasp, type: actuator }
+  - { name: hand_tactile, type: sensor }

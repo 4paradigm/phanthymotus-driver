@@ -1,0 +1,8 @@
+{
+  "schema": "motus.g1-reset-pose.v1",
+  "arm_joint_names": [
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint", "left_elbow_joint", "left_wrist_roll_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint", "right_elbow_joint", "right_wrist_roll_joint"
+  ],
+  "q": [0.24598820507526398, 0.3036922514438629, -0.06961636245250702, 0.8058313131332397, 0.01176850963383913, 0.25368207693099976, -0.2930622398853302, 0.08230765908956528, 0.772563099861145, 0.007514109369367361]
+}

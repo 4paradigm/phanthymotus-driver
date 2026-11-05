@@ -49,6 +49,11 @@ SDK_AUDIO_CLOSE = "/robo/audio/call/close_stream"
 MOTION_LIST_SERVICE = "/robo/audio/call/get_motion_info_list"
 JPEG_MAX_PIXELS = 1280 * 720
 
+# U1's native text and preset motions share the vendor action queue. Keep
+# those calls mutually exclusive while allowing an independent perception TTS
+# stream (resource "mouth") to overlap expressions and head motions.
+VENDOR_ACTION_RESOURCE = "u1_action"
+
 EVENT_TOPICS = {"playback_state": PLAYBACK_TOPIC}
 
 
@@ -1422,6 +1427,7 @@ class AudioPlugin:
         }
         schema = action_schema(actions, properties)
         schema["x-completion"] = {"actions": ["speak"], "timeout": 120}
+        schema["x-resource"] = VENDOR_ACTION_RESOURCE
         return tool(self.PREFIX, "actuator", "U1 Pro 文本转语音输出。提交文本即可播报；本卡不提供预设动作或原始音频播放。", schema)
 
     def start(self):
@@ -1861,6 +1867,7 @@ class ExpressionPlugin:
             "action_id": {"type": "string", "description": "Optional ACP action correlation ID."},
         })
         schema["x-completion"] = {"actions": ["play"], "timeout": 120}
+        schema["x-resource"] = VENDOR_ACTION_RESOURCE
         return tool(self.PREFIX, "actuator", "控制 U1 Pro 预设表情和轻量手势，例如微笑和眨眼；头部动作由 head 卡片提供。", schema)
 
     def start(self):
@@ -2028,6 +2035,7 @@ class HeadPlugin:
             "action_id": {"type": "string", "description": "Optional ACP action correlation ID."},
         })
         schema["x-completion"] = {"actions": ["play"], "timeout": 120}
+        schema["x-resource"] = VENDOR_ACTION_RESOURCE
         return tool(self.PREFIX, "actuator",
                     "控制 U1 Pro 预设头部动作，不提供原始关节角度控制。",
                     schema)

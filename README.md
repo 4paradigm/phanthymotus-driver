@@ -6,10 +6,12 @@ Hardware drivers for the **[Phanthy Motus](https://github.com/4paradigm/phanthym
 
 Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server that exposes hardware capabilities as tools. Drivers automatically register with the [Phanthy Motus Agent Core](https://github.com/4paradigm/phanthymotus) on startup.
 
+
 ## Available Drivers
 
 | Driver | Hardware | Port | Description |
 |--------|----------|------|-------------|
+| `pico/4ultra` | PICO 4 Ultra | 15742 | Independent teleop_device; signed App, pairing, DDS controller input |
 | `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
 | `unitree/go1` | Unitree Go1 (EDU) Quadruped | 15715 | State, locomotion, camera (RGB/depth/pointcloud), ext peripherals, URDF |
 | `unitree/go2` | Unitree Go2 Quadruped | 15703 | Locomotion, obstacle avoidance, voice, video, navigation |
@@ -21,6 +23,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `noetix/bumi` | Noetix Bumi-EDU Humanoid | 15704 | Mic, speaker, locomotion, RealSense camera, state monitoring |
 | `x-humanoid/tianyi2.0` | X-humanoid Tianyi 2.0 Pro Bundle | 15707 | 35DOF (wheeled chassis + dual arms + dexterous hands + head + navigation) |
 | `deep_robotics/lynx_m20` | DEEPRobotics Lynx M20 | 15716 | Official ROS 2/Fast DDS interfaces and basic_server TCP/UDP native control, with Standard/Pro capability isolation |
+| `deep_robotics/s10_pro` | DEEPRobotics S10 Pro | 15745 | Plain TCP native protocol, state/fault reporting, locomotion, device and navigation controls |
 | `chasing/qianjiao_p200_pro` | Chasing Qianjiao P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF motion control, lock/unlock, heartbeat and link status |
 | [`limx/tron2`](limx/tron2/README.md) | LimX TRON2 dual-arm robot | 15791 | Head/wrist RGB cameras, joint skeleton with gripper outlines, arm MoveJ and verified saved-home reset |
 | `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
@@ -40,6 +43,8 @@ The easiest way to deploy a driver is through the Agent Core Web Dashboard. Navi
 ### Build & Deploy Your Own Driver
 
 If you need to build from source or develop a custom driver:
+
+For G1 image build details, see the [G1 build instructions](unitree/g1/README.md#构建).
 
 ```bash
 cp .env.example .env  # Fill in registry credentials

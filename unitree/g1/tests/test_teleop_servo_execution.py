@@ -1,0 +1,227 @@
+"""Real executor with fake SDK I/O; these tests never connect to a robot."""
+import pytest
+from test_arm_stream import rig, packet
+
+
+def setup_servo(tmp_path):
+    arm, sample, channel, advance, gravity, sdk = rig(tmp_path, servo=True)
+    channel.positions = []
+    channel.forgotten = 0
+    def publish(q, *, weight):
+        channel.positions.append((list(q), weight))
+        return True
+    def forget():
+        channel.forgotten += 1
+    channel.publish_servo_position = publish
+    channel.forget_target = forget
+    return arm, sample, channel, advance, gravity, sdk
+
+
+def test_single_valid_target_advances_on_every_tick_without_gravity(tmp_path):
+    import math
+    arm, sample, channel, advance, gravity, sdk = setup_servo(tmp_path)
+    command = packet(arm, target=.1)
+    assert arm.accept_control(command)
+    for _ in range(25):
+        advance(4, follow=False); arm.tick()
+    values = [q[0] for q, _ in channel.positions]
+    assert len(values) == 25
+    assert all(a < b < .1 for a, b in zip(values, values[1:]))
+    assert values[-1] == pytest.approx(.1 * (1 - math.exp(-.1 / .12)))
+    assert max(b-a for a, b in zip([0.] + values, values)) <= .004
+    assert arm.applied_seq == command['seq']
+    assert arm.latest['valid_until_ns'] == command['valid_until_ns']
+    assert gravity == channel.writes == sdk == []
+
+
+def test_replacement_target_continues_from_last_output_and_settled_target_does_not_drift(tmp_path):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    arm.accept_control(packet(arm, target=.1))
+    for _ in range(10):
+        advance(4); arm.tick()
+    previous = arm.last_q[:]
+    arm.accept_control(packet(arm, seq=2, target=-.1))
+    sample['q'] = [.2]*10
+    advance(4); arm.tick()
+    assert all(0 < p-q <= .004 for p, q in zip(previous, arm.last_q))
+    settled = arm.last_q[0]
+    arm.accept_control(packet(arm, seq=3, target=settled))
+    for i in range(10):
+        sample['q'] = [settled + (-1)**i * .001]*10
+        advance(4); arm.tick()
+        assert arm.last_q == [settled]*10
+    assert arm.applied_seq == 3
+
+
+@pytest.mark.parametrize('ending', ['expiry', 'pause', 'feedback', 'envelope', 'sdk'])
+def test_continuing_target_keeps_execution_guards(tmp_path, ending):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    command = packet(arm, target=.5, width=.006 if ending == 'envelope' else 1.)
+    arm.accept_control(command)
+    advance(4); arm.tick()
+    assert len(channel.positions) == 1
+    if ending == 'expiry': advance(296)
+    elif ending == 'pause': arm.hold('operator_pause')
+    elif ending == 'feedback': sample['error'] = 'invalid_sample'
+    elif ending == 'sdk': channel.publish_servo_position = lambda *a, **k: False
+    if ending != 'expiry': advance(4)
+    arm.tick()
+    for _ in range(3):
+        advance(4); arm.tick()
+    assert len(channel.positions) == 1
+    assert arm.applied_seq == command['seq']
+    assert arm.state in ('hold', 'fault')
+
+
+def test_replay_keeps_exact_targets_without_between_frame_interpolation(tmp_path):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    arm.replay_deadline_ns = arm.clock() + 200_000_000
+    for seq, target in [(1, .1), (2, -.1)]:
+        advance(20)
+        arm.write_replay(packet(arm, seq=seq, target=target, life=200))
+        assert arm.last_q == [target]*10
+        for _ in range(5):
+            advance(4); arm.tick()
+        assert len(channel.positions) == seq
+    assert [q for q, _ in channel.positions] == [[.1]*10, [-.1]*10]
+
+
+def test_timeout_holds_without_new_target_and_fresh_input_resumes(tmp_path):
+    arm, sample, channel, advance, gravity, sdk = setup_servo(tmp_path)
+    arm.accept_control(packet(arm)); advance(10); arm.tick()
+    sample['q'] = [.5]*10
+    advance(301); arm.tick()
+    advance(10); arm.tick()
+    assert arm.status()['continuation_ready']
+    assert channel.forgotten == 1 and len(channel.positions) == 1
+    session = arm.session_id
+    arm.accept_control(packet(arm, seq=2, target=.1)); advance(10); arm.tick()
+    assert arm.session_id == session and arm.applied_seq == 2
+    assert all(0 < x < .1 for x in channel.positions[-1][0])
+    assert gravity == sdk == []
+
+
+def test_failed_write_is_not_reported_applied(tmp_path):
+    arm, sample, channel, advance, gravity, sdk = setup_servo(tmp_path)
+    channel.publish_servo_position = lambda *args, **kwargs: False
+    arm.accept_control(packet(arm)); advance(10); arm.tick()
+    assert arm.applied_seq == -1
+    assert arm.status()['reason'] == 'arm_sdk_write_failed'
+
+
+def test_first_ik_rejection_does_not_wait_for_uncommanded_motion(tmp_path):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    session=arm.session_id
+    sample['dq']=[.035]*10
+    arm.hold('ik_recoverable',recoverable=True)
+    advance(10);arm.tick()
+    assert arm.status()['continuation_ready']
+    assert not channel.positions
+    assert arm.accept_control(packet(arm,seq=1,target=.1))
+    advance(10);arm.tick()
+    assert arm.session_id==session and arm.applied_seq==1
+    assert len(channel.positions)==1
+    arm.hold('ik_recoverable',recoverable=True)
+    advance(10);arm.tick();advance(10);arm.tick()
+    assert arm.status()['continuation_ready']
+    assert not arm.status()['hold_confirmed']  # No fabricated physical stop.
+    assert arm.accept_control(packet(arm,seq=2,target=.2))
+    advance(10);arm.tick()
+    assert arm.applied_seq==2 and arm.session_id==session
+    arm.hold('operator_pause',recoverable=False)
+    advance(10);arm.tick()
+    assert not arm.status()['continuation_ready']
+    with pytest.raises(ValueError,match='hold_not_resumable'):
+        arm.accept_control(packet(arm,seq=3,target=.3))
+
+
+def test_regrip_can_resume_while_moving_and_large_gap_is_smoothed(tmp_path):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    arm.accept_control(packet(arm,seq=1,target=.5));advance(10);arm.tick()
+    previous=channel.positions[-1][0][:]
+    arm.hold('operator_pause',recoverable=False)
+    sample['dq']=[.1]*10
+    advance(10);arm.tick()
+    assert not arm.status()['hold_confirmed'] and arm.status()['resume_ready']
+    result=arm.dispatch('resume',{'session_id':arm.session_id,'secret':arm.secret})
+    assert result['state']=='ready'
+    advance(2000)
+    assert arm.accept_control(packet(arm,seq=1,target=-.5))
+    advance(10);arm.tick()
+    current=channel.positions[-1][0]
+    assert all(-.5 < x < p for x,p in zip(current,previous))
+    assert max(abs(x-p) for x,p in zip(current,previous)) < .2
+    assert not arm.status()['stop_confirmed']
+
+
+def test_smoothing_converges_without_resetting_to_measured(tmp_path):
+    arm,sample,channel,advance,_,_=setup_servo(tmp_path)
+    for seq in range(1,41):
+        assert arm.accept_control(packet(arm,seq=seq,target=.5))
+        advance(50,follow=False);arm.tick()
+    values=[x[0][0] for x in channel.positions]
+    assert all(a < b < .5 for a,b in zip(values,values[1:]))
+    assert values[-1] == pytest.approx(.5,abs=1e-5)
+    assert sample['q']==[0.]*10
+
+
+def test_joint_reference_speed_bound_with_irregular_inputs_and_gaps(tmp_path):
+    arm,sample,channel,advance,_,_=setup_servo(tmp_path)
+    previous=[0.]*10
+    for seq,ms in enumerate([5,20,50,150,10,80],1):
+        advance(ms,follow=False)
+        target=.8 if seq%2 else -.8
+        assert arm.accept_control(packet(arm,seq=seq,target=target))
+        arm.tick()
+        current=channel.positions[-1][0]
+        assert max(abs(a-b) for a,b in zip(current,previous)) <= min(ms/1000,.05)+1e-12
+        previous=current
+
+
+@pytest.mark.parametrize('ready', [False, True])
+@pytest.mark.parametrize('hold_kind', ['recoverable', 'operator_pause', 'release'])
+def test_inflight_candidate_cannot_bypass_hold_but_next_fresh_target_can_continue(tmp_path, ready, hold_kind):
+    from motion_control import MotionControl
+    from test_motion_control_contract import Worker
+    from common.motion.protocol import envelope
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    arm.set_joint_publisher(arm.accept_control)
+    motion = MotionControl({}, arm)
+    motion.solver = Worker()
+    motion.solver.profile, motion.solver.profile_sha256 = arm.profile, arm.profile_sha256
+    motion._live_session = arm.session_id
+    def submit(seq):
+        now = arm.clock()
+        motion.receive_eef(envelope(motion._lease(), seq=seq, source_seq=seq, mapping_epoch=0,
+            generated_ns=now, valid_until_ns=now+300_000_000, mode='eef_pose',
+            values=[0,0,0,0,0,0,1]*2, **motion.versions))
+        return motion.process_latest()
+    assert submit(1)
+    advance(10); arm.tick()
+    session, applied, intent = arm.session_id, arm.applied_seq, motion._intent
+    reason = 'motion_envelope_exceeded' if hold_kind == 'recoverable' else hold_kind
+    solve = motion.solver.solve_frame
+    def hold_during_solve(*args):
+        result = solve(*args)
+        arm.hold(reason, recoverable=hold_kind == 'recoverable', release=hold_kind == 'release')
+        if ready:
+            advance(1); arm.tick()
+        return result
+    motion.solver.solve_frame = hold_during_solve
+    assert not submit(2)
+    assert arm.state == 'hold' and arm.reason == reason
+    assert arm.latest is None and arm.applied_seq == applied
+    assert motion._intent is intent and len(channel.positions) == 1
+    assert motion._decision['state'] == 'rejected'
+    advance(10); arm.tick()
+    motion.solver.solve_frame = solve
+    if hold_kind != 'recoverable':
+        assert not submit(3)
+        assert arm.state == 'hold' and arm.reason == reason
+        assert arm.applied_seq == applied and len(channel.positions) == 1
+        assert arm.release_requested == (hold_kind == 'release')
+        return
+    assert submit(3)
+    advance(10); arm.tick()
+    assert arm.session_id == session and arm.applied_seq > applied
+    assert len(channel.positions) == 2

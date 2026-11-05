@@ -1,0 +1,19 @@
+deep-robotics-s10-pro:
+  image: __IMAGE__
+  container_name: embodied-deep-robotics-s10-pro
+  network_mode: host
+  environment:
+    - PYTHONUNBUFFERED=1
+    - RCUTILS_COLORIZED_OUTPUT=0
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - ROS_LOCALHOST_ONLY=0
+    - NETWORK_INTERFACE=eth0
+    - ROBOT_NETWORK_CIDR=10.21.33.0/24
+    - AGENT_CORE_URL=https://localhost:15678
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always
+  stop_grace_period: 30s

@@ -59,6 +59,7 @@ class HeadCompletion(ArmCompletion):
         super().__init__(reader, report)
         self.admission_lock = asyncio.Lock()
         self.recovering = False
+        self.follow_guard = None
 
     async def dispatch(self, action, target, duration, details):
         # Invalid new input must never clear a previous task.
@@ -204,6 +205,11 @@ class HeadCompletion(ArmCompletion):
 
     async def send(self, target, duration):
         self.validate_admission_feedback()
+        token = (self.active or {}).get('details',{}).get('head_follow_guard')
+        if token is not None:
+            if self.follow_guard is None:
+                raise MoveError('头部跟随保护未配置',False)
+            return await self.reader.send_moveh(target, duration, guard=lambda:self.follow_guard(token))
         return await self.reader.send_moveh(target, duration)
 
     async def wait_for_arrival(self, job):
