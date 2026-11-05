@@ -1,4 +1,4 @@
-"""Joint skeleton and system control cards sharing one feedback stream."""
+"""Joint skeleton and angles sharing one receive-only feedback stream."""
 
 from __future__ import annotations
 
@@ -7,16 +7,14 @@ import math
 import threading
 import time
 
-from common.vendor_runtime import action_schema, tool
+from common.vendor_runtime import tool
 
 if __package__:
     from .feedback import FeedbackClient, positive_number
     from .model import JOINT_NAMES, model_resource, resolve_model
-    from .control import RobotController
 else:
     from feedback import FeedbackClient, positive_number
     from model import JOINT_NAMES, model_resource, resolve_model
-    from control import RobotController
 
 
 CARD_DESCRIPTIONS = {
@@ -25,9 +23,8 @@ CARD_DESCRIPTIONS = {
 
 
 class DobotSensors:
-    def __init__(self, config, namespace="dobot_cra", ros2=None, client=None, controller=None):
+    def __init__(self, config, namespace="dobot_cra", ros2=None, client=None):
         self.client = client if client is not None else FeedbackClient(config)
-        self.control = controller if controller is not None else RobotController(self.client, config)
         self._hz = positive_number(config.get("publish_hz", 30), "publish_hz")
         if self._hz > 125:
             raise ValueError("publish_hz must not exceed the 125 Hz feedback rate")
@@ -56,23 +53,6 @@ class DobotSensors:
                                   "description": "反馈端口；30006 自动使用至少 3 秒超时", "scope": "shared"},
             },
         }
-        system_schema = action_schema({
-            "info": ([], "查看卡片功能和参数说明，不读取运行状态"),
-            "get_status": ([], "查询当前使能、上电、运行、暂停、拖拽、碰撞和报警状态，不发送控制命令"),
-            "enable": (["confirm_change"], "上使能，使用控制器已有负载设置，不清错或继续队列"),
-            "disable": (["confirm_change"], "下使能；反馈过期时仍可尝试发送"),
-            "clear_error": (["confirm_change"], "机器人静止时清除报警；不自动使能、复位皮肤或恢复运动"),
-            "start_drag": (["confirm_change"], "机器人静止且无报警/碰撞时进入关节拖拽示教"),
-            "stop_drag": (["confirm_change"], "退出拖拽示教；反馈过期时仍可尝试发送"),
-            "start": ([], "启动反馈读取，不发送控制命令"),
-            "stop": ([], "关闭 Dashboard 命令连接；不会发送停止运动指令"),
-            "config": ([], "确认卡片配置；共享 IP/端口通过 joints 配置"),
-        }, {
-            "confirm_change": {"type": "boolean", "description": "确认本次系统操作；写请求必须为 true"},
-        })
-        system_schema["x-is-dangerous"] = True
-        system_schema["x-resource"] = "arm"
-        definitions.append(tool("systemcontrol", "actuator", "系统状态查询、使能、报警清除及拖拽示教", system_schema))
         definitions.append(tool("model", "resource", "六轴 CR3A 直角连杆骨架 URDF，附加连接全部为固定关节"))
         return definitions
 
@@ -115,10 +95,7 @@ class DobotSensors:
                 finally:
                     node.destroy_node()
             self._publishers = {}
-            try:
-                self.control.close()
-            finally:
-                self.client.stop()
+            self.client.stop()
 
     def payload(self, name, snapshot=None):
         snapshot = self.client.snapshot() if snapshot is None else snapshot
@@ -163,23 +140,13 @@ class DobotSensors:
             return model_resource(self.client.snapshot(), self.client.model_name)
         if action in ("info", name):
             # Core calls info for descriptions and topic discovery. Keep live
-            # state exclusively in visible get_status actions and ROS outputs.
+            # state exclusively in ROS outputs.
             return next((definition for definition in self.get_tools() if definition["name"] == name), None)
-        if name == "systemcontrol":
-            if action == "get_status":
-                return {"read_only": True, **self.control.system_status()}
-            if action in ("start", "stop", "config"):
-                if action == "stop":
-                    self.control.close()
-                elif action == "start":
-                    self.client.start()
-                return {"state": {"start": "ready", "stop": "idle", "config": "configured"}[action]}
-            return self.control.execute_system(action, args)
         if name not in CARD_DESCRIPTIONS:
             return None
         if action in ("config", "start"):
             if any(key in args for key in ("controller_ip", "feedback_port")):
-                self.control.reconfigure(args.get("controller_ip", self.client.address),
+                self.client.configure(args.get("controller_ip", self.client.address),
                                          args.get("feedback_port", self.client.port))
             if action == "start":
                 self.client.start()

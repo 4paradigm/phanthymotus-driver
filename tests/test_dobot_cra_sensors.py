@@ -166,9 +166,9 @@ def test_single_read_only_connection_shared_by_all_cards_and_units():
         wait_until(lambda: client.snapshot()["connected"])
         plugin = DobotSensors({}, client=client)
         for _ in range(3):
-            for name in ("joints", "systemcontrol"):
+            for name in ("joints",):
                 result = plugin.dispatch("start", {"_tool_name": name})
-                assert result["state"] == ("ready" if name == "systemcontrol" else "running")
+                assert result["state"] == "running"
                 if name == "joints":
                     assert result["available"]
                 else:
@@ -622,8 +622,8 @@ def test_metadata_and_mcp_http_contract():
     assert {t["name"] for t in tools} == {t["name"] for t in metadata["cards"]}
     sensors = [t for t in tools if t["type"] == "sensor"]
     assert len(sensors) == 1 and sensors[0]["name"] == "joints"
-    assert {t["name"] for t in tools} == {"joints", "systemcontrol", "model"}
-    assert {t["name"] for t in tools if t["type"] != "resource"} == {"joints", "systemcontrol"}
+    assert {t["name"] for t in tools} == {"joints", "model"}
+    assert {t["name"] for t in tools if t["type"] != "resource"} == {"joints"}
     assert next(t for t in tools if t["name"] == "model")["type"] == "resource"
     assert all(t["topic_out"][0]["format"] == ("sensor/skeleton" if t["name"] == "joints" else "data/json") for t in sensors)
     assert tools[0]["topic_out"][1] == {"topic": "/dobot_cra/state/joint_angles", "format": "data/json"}
@@ -644,7 +644,7 @@ def test_metadata_and_mcp_http_contract():
 
     try:
         assert rpc("initialize", {})["result"]["serverInfo"]["name"] == "dobot-cra"
-        assert len(rpc("tools/list", {})["result"]["tools"]) == 3
+        assert len(rpc("tools/list", {})["result"]["tools"]) == 2
         result = rpc("tools/call", {"name": "joints", "arguments": {
             "action": "config", "controller_ip": "", "feedback_port": 30006,
         }})
@@ -672,17 +672,14 @@ def test_metadata_and_mcp_http_contract():
                 "action": action, "confirm_change": True,
             }})
             assert omitted_skin["error"]["code"] == -32601
-        for action in ("get_errors", "request_control", "power_on", "stop_motion", "pause", "resume", "set_speed_factor"):
-            removed_action = rpc("tools/call", {"name": "systemcontrol", "arguments": {
-                "action": action, "confirm_change": True, "ratio": 20,
-            }})
-            assert removed_action["error"]["code"] == -32602
+        for name in ("systemcontrol", "joint_motion"):
+            for action in ("info", "start", "stop", "config", "get_status", "enable", "disable", "clear_error", "start_drag", "stop_drag"):
+                removed_action = rpc("tools/call", {"name": name, "arguments": {
+                    "action": action, "confirm_change": True,
+                }})
+                assert removed_action["error"]["code"] == -32601
         sensor_query = rpc("tools/call", {"name": "joints", "arguments": {"action": "get_status"}})
         assert sensor_query["error"]["code"] == -32602
-        result = rpc("tools/call", {"name": "systemcontrol", "arguments": {"action": "get_status"}})
-        status = json.loads(result["result"]["content"][0]["text"])
-        assert status["read_only"] and status["available"] is False
-        assert status["enabled"] is None
     finally:
         server.shutdown()
         server.server_close()

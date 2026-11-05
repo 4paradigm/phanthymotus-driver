@@ -24,14 +24,9 @@ The adapter imports upstream `DobotConnection`, `FeedbackParser`, `MyType` and
 the SDK version. It deliberately does not instantiate `DobotRobot`, whose
 connection lifecycle also opens Dashboard. A single receive-only feedback
 connection supplies the joints skeleton and joint-angle JSON, even outside
-TCP control mode. Only joints and systemcontrol are visible cards in this
-release; the model resource supplies background URDF geometry. No skin card,
-settings action or skin output topic is registered.
-
-System writes use a lazily created, serialized DashboardConnection and the
-official RobotControl methods. Startup never transmits control commands. SDK
-formatting is retained; sendall and complete semicolon framing handle partial
-TCP writes/reads. No second Dashboard client is created.
+TCP control mode. Only joints is a visible card in this release; the model
+resource supplies background URDF geometry. No actuator, Dashboard command
+connection, skin settings action or skin output topic is registered.
 
 Compatibility baseline: CRA six-axis V4 feedback layout, 1440 bytes, little
 endian, test magic `0x0123456789abcdef`, as documented by the supplied TCP/IP
@@ -44,7 +39,7 @@ Upstream is unmodified. The adapter handles:
 - TCP packet splitting/coalescing, malformed-byte resynchronization and bounded
   buffering, reconnects, freshness, and NaN/Inf rejection.
 - `BrakeStatus` as a per-joint bitmask, not the SDK parser's collapsed boolean.
-  The published array is ordered J1..J6 (wire bits 5..0, respectively).
+  The decoded array is ordered J1..J6 (wire bits 5..0, respectively).
 - `CRRobotType` as an unsigned byte, preserving values above 127; type 113 is
   identified as CR3A for the bundled official skeleton model.
 - Mode 11 as collision per the interface manual, rather than upstream's JOG
@@ -59,24 +54,9 @@ Upstream is unmodified. The adapter handles:
   including after port changes from the joints configuration. Port 30006 therefore
   gets at least 3 seconds instead of timing out at its 1-second packet interval.
 
-All writes require explicit confirmation. The system card exposes only
-EnableRobot, DisableRobot, ClearError, StartDrag and StopDrag. RequestControl,
-PowerOn, GetErrorID, Stop, Pause, Continue and SpeedFactor are not routed by
-this release. Unknown and removed actions fail before opening a connection.
-State guards are action-specific; stale feedback does not block explicit
-disable or exit-drag requests. EnableRobot is called without load arguments,
-preserving the controller's configured payload and center parameters.
-
-Acknowledgements are not verified physical state changes. The get_status
-action uses fresh feedback without opening Dashboard or echoing a previous
-write as actual state. It reports current enabled/running/paused/dragging/
-collision/error flags and nullable inferred power state, plus request history.
-Unavailable feedback yields null values. Writes are never replayed automatically.
-There is no separate alarm-number query in this release.
-
-Only systemcontrol exposes get_status as a public action. The joints sensor
-publishes through output topics without business actions. The reserved info
-action returns static card metadata (description, schemas and ports).
+The joints sensor publishes through output topics without business actions.
+The reserved info action returns static card metadata (description, schemas
+and ports). Removed systemcontrol actions are rejected as unknown tools.
 
 Joint streams are intentionally compact: the skeleton carries timestamp,
 availability and name/q pairs in radians; the numeric JSON carries timestamp,
