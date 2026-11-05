@@ -44,6 +44,8 @@ def check(glove_port=None, hand_port=None, files_only=False):
 
 
 if __name__ == "__main__":
+    from usb_pairing import restore_pairing
+    restore_pairing()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--files-only", action="store_true")
     args = ap.parse_args()

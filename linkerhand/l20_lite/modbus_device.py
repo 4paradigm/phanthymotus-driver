@@ -518,6 +518,10 @@ class HandPlugin:
 
 
 def build_plugins(config: dict, _namespace: str, _ros2) -> list:
+    from usb_pairing import restore_pairing, UsbPairingPlugin
+    saved_pairing = restore_pairing()
+    if saved_pairing:
+        config = {**config, "usb_paired_hands": saved_pairing["hands"]}
     # Resolve the host-specific fallback once. Discovered per-hand ports must
     # still override it when constructing individual connections.
     if os.environ.get("L20_SERIAL_PORT"):
@@ -537,6 +541,7 @@ def build_plugins(config: dict, _namespace: str, _ros2) -> list:
         glove = GloveTeleopPlugin(hand, glove_config, _namespace, _ros2)
         hand._glove_plugin = glove
         plugins.append(glove)
+        plugins.append(UsbPairingPlugin(hand, glove))
     return plugins
 
 
@@ -597,9 +602,13 @@ class MultiHandPlugin:
             self._legacy.stop()
 
     def _ports(self) -> list[str]:
-        candidates = [self.config.get("serial_port", "/dev/ttyUSB0")]
-        candidates += glob.glob("/dev/serial/by-path/*")
-        candidates += glob.glob("/dev/ttyUSB*")
+        paired = self.config.get("usb_paired_hands")
+        if paired:
+            candidates = list(paired.values())
+        else:
+            candidates = [self.config.get("serial_port", "/dev/ttyUSB0")]
+            candidates += glob.glob("/dev/serial/by-path/*")
+            candidates += glob.glob("/dev/ttyUSB*")
         glove_config = self.config.get("plugins", {}).get("glove_teleop", {})
         glove_port = (os.environ.get("GLOVE_SERIAL_PORT") or
                       glove_config.get("glove_port", "/dev/ttyUSB0"))
@@ -664,6 +673,9 @@ class MultiHandPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         with self._ownership_lock:
+            if action not in ("stop", "config"):
+                from usb_pairing import ensure_not_pairing
+                ensure_not_pairing(self)
             return self._dispatch_owned(action, args)
 
     def _dispatch_owned(self, action: str, args: dict) -> dict | None:

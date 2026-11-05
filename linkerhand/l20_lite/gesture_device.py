@@ -374,6 +374,9 @@ class GesturePlugin:
 
     def dispatch(self, action, args):
         with self.hand._ownership_lock:
+            if action not in ("stop", "config"):
+                from usb_pairing import ensure_not_pairing
+                ensure_not_pairing(self.hand)
             return self._dispatch_owned(action, args)
 
     def _dispatch_owned(self, action, args):

@@ -15,7 +15,8 @@ from modbus_device import build_plugins
 
 def plugins():
     config = yaml.safe_load((ROOT / "linkerhand/l20_lite/config.yaml").read_text())
-    return build_plugins(config, "test", None)
+    plugins_by_name = {plugin.PREFIX: plugin for plugin in build_plugins(config, "test", None)}
+    return [plugins_by_name[name] for name in ("hand", "hand_gesture", "glove_teleop")]
 
 
 def test_hand_motion_waits_for_teleop_disarm_before_dispatch(monkeypatch):

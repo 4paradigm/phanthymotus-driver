@@ -1099,6 +1099,8 @@ class GloveTeleopPlugin:
                 "重新创建容器，再显式 arm(confirm_motion=true)"
             )
         with self.hand._ownership_lock, self._lock:
+            from usb_pairing import ensure_not_pairing
+            ensure_not_pairing(self.hand)
             if self._armed:
                 raise RuntimeError("already armed; disarm before arming again")
             if self._arm_completion_failed:
@@ -1546,6 +1548,11 @@ class GloveTeleopPlugin:
         return {"state": "idle", "armed": False}
 
     def dispatch(self, action, args):
+        if action == "start":
+            with self.hand._ownership_lock:
+                from usb_pairing import ensure_not_pairing
+                ensure_not_pairing(self.hand)
+                return self._start()
         if action == "model":
             return {
                 "urdf": self.skeleton.urdf,

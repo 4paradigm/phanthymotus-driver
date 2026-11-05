@@ -22,6 +22,7 @@ FILES = (
     "glove_skeleton.py",
     "glove_thumb.py",
     "check_runtime.py",
+    "usb_pairing.py",
     "config.yaml",
     "driver.yaml",
 )
