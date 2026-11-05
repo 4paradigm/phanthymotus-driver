@@ -43,6 +43,13 @@ from rosidl_runtime_py.utilities import get_message
 PROGRESS_INTERVAL_S = 300.0
 MAX_METADATA_BYTES = 64 * 1024
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+# This is only the bridge-side budget.  camera_depth has already spent part of
+# Navi's 500 ms lease transforming, compressing, serializing and writing the
+# Unix frame, so a depth sample must not wait here for another full lease.
+DEPTH_MAX_PENDING_AGE_S = 0.05
+DEPTH_WORKER_JOIN_TIMEOUT_S = 1.0
+DEPTH_STALE_LOG_INTERVAL_S = 30.0
+SLOW_LOG_INTERVAL_S = 30.0
 
 # Default QoS profiles
 RELIABLE_QOS = QoSProfile(
@@ -131,6 +138,19 @@ class TopicHandler:
         self.last_publish_ms = 0.0
         self.max_publish_ms = 0.0
         self._last_receive_ts = None
+        self.received_count = 0
+        self.coalesced_count = 0
+        self.stale_pending_count = 0
+        self._state = threading.Condition()
+        self._pending_depth = None
+        self._closing = False
+        self._worker_error = None
+        self._worker = None
+        self._active_inline_publishes = 0
+        self._close_timeout_reported = False
+        self._last_stale_log_ts = 0.0
+        self._last_slow_log_ts = 0.0
+        self._slow_event_count = 0
         # Starts at 0 so the very first message always prints; after that the
         # interval governs.
         self._last_progress_ts = 0.0
@@ -149,42 +169,153 @@ class TopicHandler:
         self.pub = self.node.create_publisher(self.msg_class, topic, qos)
         executor.add_node(self.node)
 
+        if self.is_hardware_depth:
+            self._worker = threading.Thread(
+                target=self._depth_publish_loop,
+                name="tianyi2-depth-dds",
+                daemon=True,
+            )
+            self._worker.start()
+
         print(f"[socket-bridge] topic handler created: {topic} ({msg_type_name})", flush=True)
 
     def publish(self, serialized_msg: bytes):
-        """Publish the original CDR bytes without a Python decode/re-encode."""
-        try:
-            now = time.monotonic()
+        """Accept one original-CDR frame for publication.
+
+        Non-depth topics retain the historical inline behaviour.  Hardware
+        depth is a latest-value stream: the socket reader only replaces one
+        pending slot, while a dedicated worker performs the DDS write.  Thus a
+        temporary DDS slowdown cannot create a Python FIFO of stale images.
+        """
+        received_at = time.monotonic()
+        with self._state:
+            if self._closing:
+                reason = self._worker_error or "topic handler is closed"
+                raise RuntimeError(str(reason))
+            if self.context_invalid:
+                raise RuntimeError("publisher's context is invalid")
+            if self.is_hardware_depth and (
+                    self._worker is None or not self._worker.is_alive()):
+                reason = self._worker_error or "depth DDS worker is not running"
+                raise RuntimeError(str(reason))
+
             if self._last_receive_ts is not None:
-                gap_ms = (now - self._last_receive_ts) * 1000
+                gap_ms = (received_at - self._last_receive_ts) * 1000
                 self.last_receive_gap_ms = gap_ms
                 self.max_receive_gap_ms = max(self.max_receive_gap_ms, gap_ms)
-            self._last_receive_ts = now
+            self._last_receive_ts = received_at
+            self.received_count += 1
 
+            if self.is_hardware_depth:
+                if self._pending_depth is not None:
+                    self.coalesced_count += 1
+                self._pending_depth = (serialized_msg, received_at)
+                self._state.notify()
+                return True
+            self._active_inline_publishes += 1
+
+        # Preserve the legacy non-depth call contract (inline side effect, no
+        # return value).  Only depth uses the asynchronous acceptance result.
+        try:
+            self._publish_now(serialized_msg)
+        finally:
+            with self._state:
+                self._active_inline_publishes -= 1
+                self._state.notify_all()
+        return None
+
+    def _depth_publish_loop(self):
+        """Publish only the newest pending hardware-depth frame."""
+        while True:
+            with self._state:
+                while not self._closing and self._pending_depth is None:
+                    self._state.wait()
+                # Closing wins over pending: shutdown never drains stale data.
+                if self._closing:
+                    self._pending_depth = None
+                    return
+                serialized_msg, received_at = self._pending_depth
+                self._pending_depth = None
+
+            age_s = time.monotonic() - received_at
+            if age_s >= DEPTH_MAX_PENDING_AGE_S:
+                with self._state:
+                    self.stale_pending_count += 1
+                    now = time.monotonic()
+                    report_stale = (
+                        self.stale_pending_count == 1 or
+                        now - self._last_stale_log_ts >=
+                        DEPTH_STALE_LOG_INTERVAL_S)
+                    if report_stale:
+                        self._last_stale_log_ts = now
+                        stale_pending_count = self.stale_pending_count
+                if report_stale:
+                    print(
+                        f"[socket-bridge] DROP stale {self.topic}: "
+                        f"queue_age_ms={age_s * 1000:.1f} "
+                        f"bytes={len(serialized_msg)} "
+                        f"total={stale_pending_count}",
+                        flush=True,
+                    )
+                continue
+
+            try:
+                self._publish_now(serialized_msg)
+            except Exception as exc:
+                # Context-invalid is the fatal path re-raised by _publish_now.
+                # Save it so the socket reader closes the connection on the
+                # next frame and BridgedPublisher can reconnect to a recreated
+                # handler.  Do not let a dead worker silently accept frames.
+                with self._state:
+                    self._worker_error = exc
+                    self._closing = True
+                    self._pending_depth = None
+                    self._state.notify_all()
+                return
+
+    def _publish_now(self, serialized_msg: bytes):
+        """Publish original CDR bytes without a Python decode/re-encode."""
+        try:
             publish_started = time.monotonic()
             # ROS 2 Humble Publisher.publish(bytes) uses publish_raw /
             # rcl_publish_serialized_message.  The CDR produced in the driver
             # process is therefore forwarded byte-for-byte to domain 42.
             self.pub.publish(serialized_msg)
             publish_ms = (time.monotonic() - publish_started) * 1000
-            self.last_publish_ms = publish_ms
-            self.max_publish_ms = max(self.max_publish_ms, publish_ms)
-            self.msg_count += 1
+            with self._state:
+                self.last_publish_ms = publish_ms
+                self.max_publish_ms = max(self.max_publish_ms, publish_ms)
+                self.msg_count += 1
+                msg_count = self.msg_count
+                receive_gap_ms = self.last_receive_gap_ms
 
             # Debug first few messages for camera and imu
-            if ("camera" in self.topic or "imu" in self.topic) and self.msg_count <= 5:
-                print(f"[socket-bridge] {self.topic}: msg #{self.msg_count}, serialized={len(serialized_msg)} bytes, raw_cdr=true", flush=True)
+            if ("camera" in self.topic or "imu" in self.topic) and msg_count <= 5:
+                print(f"[socket-bridge] {self.topic}: msg #{msg_count}, serialized={len(serialized_msg)} bytes, raw_cdr=true", flush=True)
 
-            if publish_ms >= 100.0 or (
+            now = time.monotonic()
+            slow_event = publish_ms >= 100.0 or (
                     self.is_hardware_depth and
-                    self.last_receive_gap_ms is not None
-                    and self.last_receive_gap_ms >= 400.0):
-                print(
-                    f"[socket-bridge] SLOW {self.topic}: "
-                    f"rx_gap_ms={self.last_receive_gap_ms!r} "
-                    f"dds_publish_ms={publish_ms:.1f} bytes={len(serialized_msg)}",
-                    flush=True,
-                )
+                    receive_gap_ms is not None
+                    and receive_gap_ms >= 400.0)
+            if slow_event:
+                with self._state:
+                    self._slow_event_count += 1
+                    report_slow = (
+                        self._slow_event_count == 1 or
+                        now - self._last_slow_log_ts >= SLOW_LOG_INTERVAL_S)
+                    if report_slow:
+                        self._last_slow_log_ts = now
+                        slow_event_count = self._slow_event_count
+                if report_slow:
+                    print(
+                        f"[socket-bridge] SLOW {self.topic}: "
+                        f"rx_gap_ms={receive_gap_ms!r} "
+                        f"dds_publish_ms={publish_ms:.1f} "
+                        f"bytes={len(serialized_msg)} "
+                        f"total={slow_event_count}",
+                        flush=True,
+                    )
 
             # Progress on a clock, not on a message count.
             #
@@ -200,13 +331,28 @@ class TopicHandler:
             # joint state or 16 kHz of audio. The first message is still logged
             # immediately, because "did this bridge ever work" is a different
             # question and it wants an instant answer.
-            now = time.monotonic()
-            if self.msg_count == 1 or now - self._last_progress_ts >= PROGRESS_INTERVAL_S:
-                self._last_progress_ts = now
+            with self._state:
+                report_progress = (
+                    msg_count == 1 or
+                    now - self._last_progress_ts >= PROGRESS_INTERVAL_S)
+                if report_progress:
+                    self._last_progress_ts = now
+                    received_count = self.received_count
+                    coalesced_count = self.coalesced_count
+                    stale_pending_count = self.stale_pending_count
+            if report_progress:
+                depth_stats = ""
+                if self.is_hardware_depth:
+                    depth_stats = (
+                        f", received={received_count}, "
+                        f"coalesced={coalesced_count}, "
+                        f"stale_pending={stale_pending_count}")
                 print(
-                    f"[socket-bridge] {self.topic}: published {self.msg_count} messages",
+                    f"[socket-bridge] {self.topic}: published {msg_count} "
+                    f"messages{depth_stats}",
                     flush=True,
                 )
+            return True
         except Exception as e:
             error_msg = str(e)
             print(f"[socket-bridge] ERROR publishing to {self.topic}: {e}", flush=True)
@@ -218,9 +364,43 @@ class TopicHandler:
                 raise  # Re-raise to let caller know this handler is broken
 
             print(f"[socket-bridge]   serialized length: {len(serialized_msg)} bytes", flush=True)
-            print(f"[socket-bridge]   first 100 bytes: {serialized_msg[:100]}", flush=True)
             import traceback
             traceback.print_exc()
+            return False
+
+    def close(self, timeout=DEPTH_WORKER_JOIN_TIMEOUT_S) -> bool:
+        """Stop the optional depth worker without draining its pending slot.
+
+        Returns whether no worker remains alive.  The result matters during a
+        handler recreation: destroying a publisher still in use by a worker is
+        unsafe, so the server refuses that replacement if a bounded join fails.
+        """
+        worker = self._worker
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._state:
+            self._closing = True
+            self._pending_depth = None
+            self._state.notify_all()
+            while self._active_inline_publishes:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._state.wait(remaining)
+
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        with self._state:
+            stopped = (
+                self._active_inline_publishes == 0 and
+                (worker is None or not worker.is_alive()))
+        if not stopped and not self._close_timeout_reported:
+            self._close_timeout_reported = True
+            print(
+                f"[socket-bridge] WARNING: worker for {self.topic} did not "
+                f"stop within {float(timeout):.1f}s",
+                flush=True,
+            )
+        return stopped
 
 
 def qos_from(spec: dict) -> QoSProfile:
@@ -380,7 +560,10 @@ class SocketBridgeServer:
         )
 
         self.handlers: Dict[str, TopicHandler] = {}
+        self._handlers_lock = threading.Lock()
         self._stop_flag = threading.Event()
+        self._stop_lock = threading.Lock()
+        self._stopped = False
 
         # Create socket directory
         os.makedirs(self.SOCKET_DIR, exist_ok=True)
@@ -418,23 +601,28 @@ class SocketBridgeServer:
                 self.handle_inbound(conn, topic, msg_type, metadata.get("qos"))
                 return
 
-            # Create handler if not exists or if previous handler has invalid context
-            if topic not in self.handlers or getattr(self.handlers.get(topic), 'context_invalid', False):
-                if topic in self.handlers:
-                    print(f"[socket-bridge] recreating handler for {topic} (previous context was invalid)", flush=True)
-                    # Clean up old handler
-                    old_handler = self.handlers[topic]
-                    try:
-                        self.executor.remove_node(old_handler.node)
-                        old_handler.node.destroy_node()
-                    except Exception as e:
-                        print(f"[socket-bridge] cleanup error for {topic}: {e}", flush=True)
+            # Creation and context-invalid replacement are serialized per
+            # server.  Two reconnecting clients must never create two workers
+            # for the same depth topic.
+            with self._handlers_lock:
+                current = self.handlers.get(topic)
+                if current is None or getattr(current, "context_invalid", False):
+                    if current is not None:
+                        print(
+                            f"[socket-bridge] recreating handler for {topic} "
+                            "(previous context was invalid)",
+                            flush=True,
+                        )
+                        if not self._close_handler(current):
+                            raise RuntimeError(
+                                f"worker for {topic} did not stop; refusing "
+                                "unsafe handler replacement")
+                        self.handlers.pop(topic, None)
+                    self.handlers[topic] = TopicHandler(
+                        topic, msg_type, self.ctx, self.executor,
+                        metadata.get("qos"))
 
-                self.handlers[topic] = TopicHandler(
-                    topic, msg_type, self.ctx, self.executor,
-                    metadata.get("qos"))
-
-            handler = self.handlers[topic]
+                handler = self.handlers[topic]
 
             # Receive and publish messages
             while not self._stop_flag.is_set():
@@ -460,6 +648,16 @@ class SocketBridgeServer:
             print(f"[socket-bridge] client handler error: {e}", flush=True)
         finally:
             conn.close()
+
+    def _close_handler(self, handler: TopicHandler) -> bool:
+        """Stop a handler before destroying the ROS entities it owns."""
+        if not handler.close():
+            return False
+        try:
+            self.executor.remove_node(handler.node)
+        finally:
+            handler.node.destroy_node()
+        return True
 
     def handle_inbound(self, conn: socket.socket, topic: str, msg_type: str,
                        qos_spec):
@@ -536,8 +734,46 @@ class SocketBridgeServer:
 
     def stop(self):
         """Stop bridge server."""
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+
         print("[socket-bridge] stopping...", flush=True)
         self._stop_flag.set()
+
+        main_sock = getattr(self, "main_sock", None)
+        if main_sock is not None:
+            try:
+                main_sock.close()
+            except OSError:
+                pass
+
+        # Stop every depth worker and discard its pending slot while the ROS
+        # context is still valid.  Only then is it safe to destroy publishers.
+        with self._handlers_lock:
+            handlers = list(self.handlers.values())
+            self.handlers.clear()
+        stopped_handlers = []
+        for handler in handlers:
+            if handler.close():
+                stopped_handlers.append(handler)
+            else:
+                print(
+                    f"[socket-bridge] WARNING: leaving live handler node "
+                    f"intact during shutdown: {handler.topic}",
+                    flush=True,
+                )
+        for handler in stopped_handlers:
+            try:
+                self.executor.remove_node(handler.node)
+                handler.node.destroy_node()
+            except Exception as exc:
+                print(
+                    f"[socket-bridge] cleanup error for {handler.topic}: {exc}",
+                    flush=True,
+                )
+
         self.executor.shutdown()
         rclpy.shutdown(context=self.ctx)
 

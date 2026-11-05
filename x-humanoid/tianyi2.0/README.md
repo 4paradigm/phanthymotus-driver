@@ -18,19 +18,26 @@ remains invalid depth. Compression preserves every original depth value and the
 source header. This replaces the previous raw `image/depth-z16` output and
 requires a consumer/bridge that supports `image/depth-zlib`.
 
-The default rate is 15Hz (previously 8Hz), configurable with
+The default rate is 5Hz, configurable with
 `plugins.camera_depth.hz` up to 30Hz. The source camera and available CPU/network
 still determine the actual rate. Both source and output retain only the newest
-frame; a frame waiting locally for 500ms is discarded. A single ROS timer
-has been replaced by one latest-only worker: the ROS callback only swaps the
-pending frame, while crop, zlib compression, and the synchronous bridge write
-run outside both executors. The worker never replays old frames or catches up
-in a burst. Compression uses libdeflate level 1 (still a standard zlib stream)
+frame. A frame that has spent 300ms in the local pipeline is discarded. The
+socket bridge then gives its pending slot at most another 50ms; this leaves the
+remaining budget for the Unix write and DDS inside Navi's 500ms observation
+lease instead of accidentally starting a second 500ms clock. A single ROS timer has
+been replaced by two latest-only workers: the ROS callback only swaps the raw
+pending frame, one worker crops and compresses it, and a second worker writes
+the newest encoded frame to the bridge. Both hand-offs have capacity one, so a
+slow write replaces an intermediate frame instead of creating a stale FIFO.
+Neither worker replays old frames or catches up in a burst. Compression uses
+libdeflate level 1 (still a standard zlib stream)
 instead of CPython's much slower stock encoder on ARM. `info` reports the
 active compression backend, target/average Hz,
-coalesced/stale/error counts, worker health, payload size, and
-transform/compress/bridge/total processing and interval timings so a remaining
-device or socket bottleneck is visible on the robot.
+raw/encoded coalescing and staged stale/error counts, both workers' health,
+payload size, queue age, and transform/compress/bridge/total processing and
+interval timings so a remaining device or socket bottleneck is visible on the
+robot. The domain-42 socket bridge applies the same capacity-one policy before
+DDS publication and never logs raw CDR bytes on an error path.
 
 On the canvas, connect head RGB to `vop`, `vop` to `navi`, `camera_depth` to
 `navi`'s depth input, `loco_state` to its odometry input, and `navi` to
