@@ -93,12 +93,9 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(leftovers, [], f"还有按条数的触发: {leftovers}")
 
     def test_both_directions_report_on_the_clock(self):
-        # TopicHandler.publish now only puts hardware depth into a one-frame
-        # mailbox.  Progress is emitted after the actual DDS write, which lives
-        # in _publish_now for both inline and worker-driven outbound topics.
-        outbound = ast.unparse(self._method("TopicHandler", "_publish_now"))
+        outbound = ast.unparse(self._method("TopicHandler", "publish"))
         inbound = ast.unparse(self._method("SubscriptionHandler", "_forward"))
-        for name, body in (("_publish_now", outbound), ("_forward", inbound)):
+        for name, body in (("publish", outbound), ("_forward", inbound)):
             self.assertIn("PROGRESS_INTERVAL_S", body, f"{name} 不是按时间计")
             self.assertIn("msg_count == 1", body, f"{name} 丢了首条立即上报")
 
@@ -120,7 +117,7 @@ class SourceTests(unittest.TestCase):
 
     def test_errors_are_not_rate_limited(self):
         """限流只针对进度行；发布失败每次都要看得见。"""
-        publish = self.src[self.src.index("def _publish_now(self"):]
+        publish = self.src[self.src.index("def publish(self"):]
         publish = publish[:publish.index("\n    def ")] if "\n    def " in publish else publish
         err = publish[publish.index("except Exception"):]
         self.assertIn("ERROR publishing", err)

@@ -1944,54 +1944,38 @@ class ImuPlugin(_JsonSensor):
 class DepthCameraPlugin:
     """Bridge only the newest Orbbec Z16 frame to Agent Core.
 
-    Cropping/compression and the synchronous socket-bridge write run on two
-    dedicated workers, never on either ROS executor.  Both hand-off points are
-    capacity-one latest-value slots: a slow bridge can replace an encoded
-    frame, but it can never build a FIFO of stale depth behind it.
+    Cropping, compression, and the synchronous socket-bridge write all run on
+    one dedicated worker, never on either ROS executor.
     """
-    # Navi expires an observation at 500 ms.  Stop feeding a frame once its
-    # local age reaches 300 ms so serialization, the observed ~144 ms worst
-    # Unix write, the bridge's 50 ms latest-slot budget and DDS still fit in
-    # that lease.  The bridge must not start a second 500 ms clock.
-    _MAX_LOCAL_FRAME_AGE_S = 0.30
-
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False
         # Legacy Navi binds /visual_depth before consulting the ROS graph.
         # This is still hardware depth; the suffix is a wire-role convention.
         self._topic = f"/{namespace}/camera/head/depth/visual_depth"
-        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 5)), 30.0))
+        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 15)), 30.0))
         self._last_published_at = 0.0
         self._last_received_at = None
         self._first_published_at = None
         self._forwarded_frames = 0
         self._received_frames = self._invalid_frames = self._stale_frames = 0
-        self._coalesced_frames = self._encoded_coalesced_frames = 0
-        self._encoded_frames = self._publish_errors = 0
-        self._encode_errors = self._bridge_errors = 0
-        self._stale_before_encode = self._stale_after_encode = 0
-        self._stale_before_bridge = 0
+        self._coalesced_frames = self._publish_errors = 0
         self._source_geometry = None
         self._latest_image = None
-        self._latest_encoded = None
         self._latest_image_lock = threading.Lock()
         self._frame_ready = threading.Condition(self._latest_image_lock)
-        self._encoded_ready = threading.Condition(self._latest_image_lock)
         self._publish_lock = threading.RLock()
         self._generation = 0
         self._worker = None
-        self._bridge_worker = None
         self._worker_shutdown = False
         self._next_publish_due = 0.0
         self._compress_depth = None
         self._compression_backend = "uninitialized"
         self._last_transform_ms = self._max_transform_ms = 0.0
         self._last_compress_ms = self._max_compress_ms = 0.0
+        self._last_message_pack_ms = self._max_message_pack_ms = 0.0
         self._last_encode_ms = self._max_encode_ms = 0.0
         self._last_bridge_publish_ms = self._max_bridge_publish_ms = 0.0
-        self._last_bridge_queue_ms = self._max_bridge_queue_ms = 0.0
         self._last_processing_ms = self._max_processing_ms = 0.0
-        self._last_frame_age_ms = self._max_frame_age_ms = 0.0
         self._last_publish_interval_ms = self._max_publish_interval_ms = None
         self._last_payload_bytes = 0
         self._last_error = ""
@@ -2001,7 +1985,7 @@ class DepthCameraPlugin:
         self._pub_node = Node("tianyi2_depth_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
     def get_tool(self):
-        return {"name": "camera_depth", "type": "sensor", "description": "天轶2.0 Orbbec 硬件深度：默认5Hz，米制深度图，可直接连接 navi；不使用单目估算。",
+        return {"name": "camera_depth", "type": "sensor", "description": "天轶2.0 Orbbec 硬件深度：默认15Hz，米制深度图，可直接连接 navi；不使用单目估算。",
                 "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-zlib"}]}
     def start(self):
         with self._publish_lock:
@@ -2051,42 +2035,32 @@ class DepthCameraPlugin:
             self._last_published_at = 0.0
             self._forwarded_frames = self._received_frames = 0
             self._invalid_frames = self._stale_frames = self._coalesced_frames = 0
-            self._encoded_frames = self._encoded_coalesced_frames = 0
-            self._stale_before_encode = self._stale_after_encode = 0
-            self._stale_before_bridge = self._publish_errors = 0
-            self._encode_errors = self._bridge_errors = 0
-            self._source_geometry = self._latest_image = self._latest_encoded = None
+            self._publish_errors = 0
+            self._source_geometry = self._latest_image = None
             self._next_publish_due = 0.0
             self._last_transform_ms = self._max_transform_ms = 0.0
             self._last_compress_ms = self._max_compress_ms = 0.0
+            self._last_message_pack_ms = self._max_message_pack_ms = 0.0
             self._last_encode_ms = self._max_encode_ms = 0.0
             self._last_bridge_publish_ms = self._max_bridge_publish_ms = 0.0
-            self._last_bridge_queue_ms = self._max_bridge_queue_ms = 0.0
             self._last_processing_ms = self._max_processing_ms = 0.0
-            self._last_frame_age_ms = self._max_frame_age_ms = 0.0
             self._last_publish_interval_ms = self._max_publish_interval_ms = None
             self._last_payload_bytes = 0
             self._last_error = ""
             self._frame_ready.notify_all()
         self._start_worker()
         print(
-            f"[DepthCameraPlugin] forwarding newest Z16 frame on decoupled workers at "
+            f"[DepthCameraPlugin] forwarding newest Z16 frame on worker at "
             f"<= {self._max_hz:g} Hz ({self._compression_backend})", flush=True)
 
     def _start_worker(self):
         worker = self._worker
+        if worker is not None and worker.is_alive():
+            return
         self._worker_shutdown = False
-        if worker is None or not worker.is_alive():
-            self._worker = threading.Thread(
-                target=self._publish_loop, daemon=True,
-                name="tianyi2-depth-encoder")
-            self._worker.start()
-        bridge_worker = self._bridge_worker
-        if bridge_worker is None or not bridge_worker.is_alive():
-            self._bridge_worker = threading.Thread(
-                target=self._bridge_publish_loop, daemon=True,
-                name="tianyi2-depth-bridge")
-            self._bridge_worker.start()
+        self._worker = threading.Thread(
+            target=self._publish_loop, daemon=True, name="tianyi2-depth-publisher")
+        self._worker.start()
 
     def stop(self):
         with self._publish_lock:
@@ -2097,10 +2071,8 @@ class DepthCameraPlugin:
                 self._running = False
                 self._generation += 1
                 self._latest_image = None
-                self._latest_encoded = None
                 self._next_publish_due = 0.0
                 self._frame_ready.notify_all()
-                self._encoded_ready.notify_all()
 
     def _on_image(self, msg):
         with self._frame_ready:
@@ -2121,22 +2093,13 @@ class DepthCameraPlugin:
             latest, self._latest_image = self._latest_image, None
             return latest
 
-    def _take_latest_encoded(self):
-        with self._encoded_ready:
-            latest, self._latest_encoded = self._latest_encoded, None
-            return latest
-
     def _publish_latest(self):
-        """Synchronously run both capacity-one stages for focused tests."""
+        """Synchronously process one pending frame (kept for focused tests)."""
         latest = self._take_latest()
         if latest is not None:
-            self._encode_frame(latest)
-        encoded = self._take_latest_encoded()
-        if encoded is not None:
-            self._publish_encoded_frame(encoded)
+            self._publish_frame(latest)
 
     def _publish_loop(self):
-        """Transform/compress at the configured rate without waiting on DDS."""
         period = 1.0 / self._max_hz
         while True:
             with self._frame_ready:
@@ -2153,7 +2116,7 @@ class DepthCameraPlugin:
                     continue
                 latest, self._latest_image = self._latest_image, None
             started = time.monotonic()
-            self._encode_frame(latest)
+            self._publish_frame(latest)
             completed = time.monotonic()
             with self._frame_ready:
                 if latest[2] == self._generation:
@@ -2161,27 +2124,14 @@ class DepthCameraPlugin:
                     # period, immediately take the newest frame instead.
                     self._next_publish_due = max(started + period, completed)
 
-    def _bridge_publish_loop(self):
-        """Send the newest encoded frame; never drain an old FIFO."""
-        while True:
-            with self._encoded_ready:
-                while (not self._worker_shutdown and
-                       (not self._running or self._latest_encoded is None)):
-                    self._encoded_ready.wait()
-                if self._worker_shutdown:
-                    self._latest_encoded = None
-                    return
-                encoded, self._latest_encoded = self._latest_encoded, None
-            self._publish_encoded_frame(encoded)
-
-    def _encode_frame(self, latest):
+    def _publish_frame(self, latest):
         msg, received_at, generation = latest
         with self._frame_ready:
             if not self._running or generation != self._generation:
                 return
         started = time.monotonic()
-        if started - received_at >= self._MAX_LOCAL_FRAME_AGE_S:
-            self._record_stale(generation, "before_encode")
+        if started - received_at >= 0.5:
+            self._record_stale(generation)
             return
         try:
             dashboard = self._to_dashboard_depth(msg)
@@ -2190,22 +2140,39 @@ class DepthCameraPlugin:
                     if generation == self._generation:
                         self._invalid_frames += 1
                 return
+            raw_depth = dashboard.astype("<u2", copy=False).tobytes()
             transformed_at = time.monotonic()
             transform_ms = (transformed_at - started) * 1000
             # Keep the exact 640x480 little-endian uint16 zlib wire contract.
             # libdeflate reduces encoder CPU without changing a depth sample.
+            compressed = self._compress_depth(raw_depth, 1)
+            compressed_at = time.monotonic()
+            compress_ms = (compressed_at - transformed_at) * 1000
+            from array import array
             from sensor_msgs.msg import CompressedImage
             out = CompressedImage()
             out.header = msg.header
             out.format = "16UC1; compressedDepth zlib"
-            out.data = self._compress_depth(
-                dashboard.astype("<u2", copy=False).tobytes(), 1)
+            # Humble's generated uint8[] setter accepts array('B') directly.
+            # Assigning bytes instead performs two Python per-byte validation
+            # passes before making the same array, holding the GIL throughout.
+            out.data = array("B", compressed)
             encoded_at = time.monotonic()
-            compress_ms = (encoded_at - transformed_at) * 1000
+            message_pack_ms = (encoded_at - compressed_at) * 1000
             encode_ms = (encoded_at - started) * 1000
-            if encoded_at - received_at >= self._MAX_LOCAL_FRAME_AGE_S:
-                self._record_stale(generation, "after_encode")
+            if encoded_at - received_at >= 0.5:
+                self._record_stale(generation)
                 return
+            with self._frame_ready:
+                if not self._running or generation != self._generation:
+                    return
+                publisher = self._pub
+            bridge_started = time.monotonic()
+            accepted = publisher.publish(out)
+            if accepted is False:
+                raise ConnectionError("socket bridge did not accept depth frame")
+            finished = time.monotonic()
+            bridge_ms = (finished - bridge_started) * 1000
             width, height = int(msg.width), int(msg.height)
             crop_width, crop_height = width, height
             if width * 3 > height * 4:
@@ -2220,53 +2187,7 @@ class DepthCameraPlugin:
                               crop_width, crop_height],
                 "output_size": [640, 480],
             }
-            encoded = (out, received_at, started, encoded_at,
-                       generation, geometry)
-            with self._encoded_ready:
-                if not self._running or generation != self._generation:
-                    return
-                if self._latest_encoded is not None:
-                    self._encoded_coalesced_frames += 1
-                self._latest_encoded = encoded
-                self._encoded_frames += 1
-                self._last_transform_ms = transform_ms
-                self._max_transform_ms = max(self._max_transform_ms, transform_ms)
-                self._last_compress_ms = compress_ms
-                self._max_compress_ms = max(self._max_compress_ms, compress_ms)
-                self._last_encode_ms = encode_ms
-                self._max_encode_ms = max(self._max_encode_ms, encode_ms)
-                self._last_payload_bytes = len(out.data)
-                self._encoded_ready.notify()
-        except Exception as exc:
             with self._frame_ready:
-                if generation == self._generation:
-                    self._encode_errors += 1
-                    self._publish_errors += 1
-                    self._last_error = str(exc)
-            print(f"[DepthCameraPlugin] encode error: {exc}", flush=True)
-
-    def _publish_encoded_frame(self, encoded):
-        (out, received_at, encode_started, encoded_at,
-         generation, geometry) = encoded
-        with self._encoded_ready:
-            if not self._running or generation != self._generation:
-                return
-            publisher = self._pub
-        bridge_started = time.monotonic()
-        bridge_queue_ms = (bridge_started - encoded_at) * 1000
-        if bridge_started - received_at >= self._MAX_LOCAL_FRAME_AGE_S:
-            self._record_stale(generation, "before_bridge")
-            return
-        try:
-            accepted = publisher.publish(out)
-            if accepted is False:
-                raise ConnectionError("socket bridge did not accept depth frame")
-            finished = time.monotonic()
-            bridge_ms = (finished - bridge_started) * 1000
-            with self._encoded_ready:
-                # A stop/restart invalidates the in-flight generation.  The
-                # call may already have reached the socket, but its counters
-                # and state must never leak into the new run.
                 if not self._running or generation != self._generation:
                     return
                 previous = self._last_published_at if self._forwarded_frames else None
@@ -2275,20 +2196,21 @@ class DepthCameraPlugin:
                 if self._first_published_at is None:
                     self._first_published_at = finished
                 self._forwarded_frames += 1
-                self._last_bridge_queue_ms = bridge_queue_ms
-                self._max_bridge_queue_ms = max(
-                    self._max_bridge_queue_ms, bridge_queue_ms)
+                self._last_transform_ms = transform_ms
+                self._max_transform_ms = max(self._max_transform_ms, transform_ms)
+                self._last_compress_ms = compress_ms
+                self._max_compress_ms = max(self._max_compress_ms, compress_ms)
+                self._last_message_pack_ms = message_pack_ms
+                self._max_message_pack_ms = max(
+                    self._max_message_pack_ms, message_pack_ms)
+                self._last_encode_ms = encode_ms
+                self._max_encode_ms = max(self._max_encode_ms, encode_ms)
                 self._last_bridge_publish_ms = bridge_ms
-                self._max_bridge_publish_ms = max(
-                    self._max_bridge_publish_ms, bridge_ms)
-                processing_ms = (finished - encode_started) * 1000
+                self._max_bridge_publish_ms = max(self._max_bridge_publish_ms, bridge_ms)
+                processing_ms = (finished - started) * 1000
                 self._last_processing_ms = processing_ms
-                self._max_processing_ms = max(
-                    self._max_processing_ms, processing_ms)
-                frame_age_ms = (finished - received_at) * 1000
-                self._last_frame_age_ms = frame_age_ms
-                self._max_frame_age_ms = max(
-                    self._max_frame_age_ms, frame_age_ms)
+                self._max_processing_ms = max(self._max_processing_ms, processing_ms)
+                self._last_payload_bytes = len(out.data)
                 self._last_error = ""
                 if previous is not None:
                     interval_ms = (finished - previous) * 1000
@@ -2296,23 +2218,16 @@ class DepthCameraPlugin:
                     self._max_publish_interval_ms = max(
                         self._max_publish_interval_ms or 0.0, interval_ms)
         except Exception as exc:
-            with self._encoded_ready:
+            with self._frame_ready:
                 if generation == self._generation:
-                    self._bridge_errors += 1
                     self._publish_errors += 1
                     self._last_error = str(exc)
-            print(f"[DepthCameraPlugin] bridge publish error: {exc}", flush=True)
+            print(f"[DepthCameraPlugin] publish error: {exc}", flush=True)
 
-    def _record_stale(self, generation, stage):
+    def _record_stale(self, generation):
         with self._frame_ready:
             if generation == self._generation:
                 self._stale_frames += 1
-                if stage == "before_encode":
-                    self._stale_before_encode += 1
-                elif stage == "after_encode":
-                    self._stale_after_encode += 1
-                elif stage == "before_bridge":
-                    self._stale_before_bridge += 1
 
     def _to_dashboard_depth(self, msg):
         if msg.encoding not in ("16UC1", "mono16") or msg.is_bigendian:
@@ -2351,10 +2266,6 @@ class DepthCameraPlugin:
         now = time.monotonic()
         duration = now - self._first_published_at if self._first_published_at is not None else 0
         geometry = self._source_geometry
-        pending_encoded = self._latest_encoded
-        encoder_alive = bool(self._worker and self._worker.is_alive())
-        bridge_worker_alive = bool(
-            self._bridge_worker and self._bridge_worker.is_alive())
         return {"state": "running" if self._running else "idle",
                 "topic_out": [{"topic": self._topic, "format": "image/depth-zlib"}],
                 "input_topic": "/ob_camera_head/depth/image_raw", "target_hz": self._max_hz,
@@ -2363,51 +2274,33 @@ class DepthCameraPlugin:
                 "registration_note": "输入为厂商原生 depth/image_raw；仅作居中裁剪及缩放，未验证已投影到 RGB 视角。",
                 "compression_backend": self._compression_backend,
                 "compression_level": 1,
-                "local_frame_deadline_ms": round(
-                    self._MAX_LOCAL_FRAME_AGE_S * 1000),
                 "received_frames": self._received_frames, "published_frames": self._forwarded_frames,
-                "encoded_frames": self._encoded_frames,
                 "invalid_frames": self._invalid_frames, "stale_frames": self._stale_frames,
                 "coalesced_frames": self._coalesced_frames,
-                "raw_coalesced_frames": self._coalesced_frames,
-                "encoded_coalesced_frames": self._encoded_coalesced_frames,
-                "stale_before_encode": self._stale_before_encode,
-                "stale_after_encode": self._stale_after_encode,
-                "stale_before_bridge": self._stale_before_bridge,
                 "average_hz": round(max(0, self._forwarded_frames - 1) / duration, 2) if duration > 0 else 0,
                 "last_receive_age_ms": round((now - self._last_received_at) * 1000, 1)
                     if self._last_received_at is not None else None,
                 "last_publish_age_ms": round((now - self._last_published_at) * 1000, 1)
                     if self._forwarded_frames else None,
-                "pipeline_capacity": {"raw": 1, "encoded": 1},
-                "worker_alive": encoder_alive and bridge_worker_alive,
-                "encoder_worker_alive": encoder_alive,
-                "bridge_worker_alive": bridge_worker_alive,
+                "worker_alive": bool(self._worker and self._worker.is_alive()),
                 "pending_frame": self._latest_image is not None,
-                "pending_encoded_frame": pending_encoded is not None,
-                "pending_encoded_age_ms": round((now - pending_encoded[3]) * 1000, 1)
-                    if pending_encoded is not None else None,
                 "last_transform_ms": round(self._last_transform_ms, 1),
                 "max_transform_ms": round(self._max_transform_ms, 1),
                 "last_compress_ms": round(self._last_compress_ms, 1),
                 "max_compress_ms": round(self._max_compress_ms, 1),
+                "last_message_pack_ms": round(self._last_message_pack_ms, 1),
+                "max_message_pack_ms": round(self._max_message_pack_ms, 1),
                 "last_encode_ms": round(self._last_encode_ms, 1),
                 "max_encode_ms": round(self._max_encode_ms, 1),
                 "last_bridge_publish_ms": round(self._last_bridge_publish_ms, 1),
                 "max_bridge_publish_ms": round(self._max_bridge_publish_ms, 1),
-                "last_bridge_queue_ms": round(self._last_bridge_queue_ms, 1),
-                "max_bridge_queue_ms": round(self._max_bridge_queue_ms, 1),
                 "last_processing_ms": round(self._last_processing_ms, 1),
                 "max_processing_ms": round(self._max_processing_ms, 1),
-                "last_frame_age_ms": round(self._last_frame_age_ms, 1),
-                "max_frame_age_ms": round(self._max_frame_age_ms, 1),
                 "last_publish_interval_ms": round(self._last_publish_interval_ms, 1)
                     if self._last_publish_interval_ms is not None else None,
                 "max_publish_interval_ms": round(self._max_publish_interval_ms, 1)
                     if self._max_publish_interval_ms is not None else None,
                 "last_payload_bytes": self._last_payload_bytes,
-                "encode_errors": self._encode_errors,
-                "bridge_errors": self._bridge_errors,
                 "publish_errors": self._publish_errors,
                 "last_error": self._last_error}
 

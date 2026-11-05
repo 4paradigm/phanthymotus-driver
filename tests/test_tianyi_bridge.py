@@ -344,7 +344,6 @@ class _ServerNode:
 
     def __init__(self, *args, **kwargs):
         self.created_qos = None
-        self.destroyed = False
 
     def create_publisher(self, msg_class, topic, qos):
         self.created_qos = qos
@@ -352,28 +351,10 @@ class _ServerNode:
         self.published = messages
         return types.SimpleNamespace(publish=messages.append)
 
-    def destroy_node(self):
-        self.destroyed = True
-
 
 class _Executor:
-    def __init__(self):
-        self.removed = []
-
     def add_node(self, node):
         self.node = node
-
-    def remove_node(self, node):
-        self.removed.append(node)
-
-
-def _wait_until(predicate, timeout=1.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.002)
-    return bool(predicate())
 
 
 def test_hardware_depth_is_raw_relayed_with_depth_one_qos(monkeypatch):
@@ -388,155 +369,13 @@ def test_hardware_depth_is_raw_relayed_with_depth_one_qos(monkeypatch):
         {"reliability": "best_effort", "depth": 1},
     )
 
-    try:
-        handler.publish(payload)
+    handler.publish(payload)
 
-        assert _wait_until(lambda: handler.node.published == [payload])
-        assert handler.node.published[0] is payload
-        assert handler.node.created_qos.depth == 1
-        assert handler.msg_count == 1
-        assert handler.max_publish_ms >= 0
-    finally:
-        assert handler.close()
-
-
-class _BlockingPublisher:
-    def __init__(self, fail=None):
-        self.entered = threading.Event()
-        self.release = threading.Event()
-        self.published = []
-        self.fail = fail
-
-    def publish(self, payload):
-        self.published.append(payload)
-        self.entered.set()
-        if len(self.published) == 1:
-            assert self.release.wait(2)
-        if self.fail is not None:
-            raise self.fail
-
-
-def _depth_handler(monkeypatch):
-    server = _server_module()
-    monkeypatch.setattr(server, "Node", _ServerNode)
-    monkeypatch.setattr(
-        server, "QoSProfile", lambda **kwargs: types.SimpleNamespace(**kwargs))
-    handler = server.TopicHandler(
-        "/nvidia_desktop/camera/head/depth/visual_depth",
-        "std_msgs/msg/FakeMsg", object(), _Executor(),
-        {"reliability": "best_effort", "depth": 1},
-    )
-    return server, handler
-
-
-def test_depth_worker_keeps_one_latest_pending_frame(monkeypatch):
-    server, handler = _depth_handler(monkeypatch)
-    publisher = _BlockingPublisher()
-    handler.pub = publisher
-    try:
-        assert handler.publish(b"A")
-        assert publisher.entered.wait(1)
-        assert handler.publish(b"B")
-        assert handler.publish(b"C")
-        with handler._state:
-            assert handler._pending_depth == (b"C", handler._pending_depth[1])
-            assert handler.coalesced_count == 1
-        publisher.release.set()
-        assert _wait_until(lambda: publisher.published == [b"A", b"C"])
-        assert handler.received_count == 3
-        assert handler.msg_count == 2
-    finally:
-        publisher.release.set()
-        assert handler.close()
-
-
-def test_depth_worker_drops_a_pending_frame_at_the_delivery_deadline(monkeypatch):
-    server, handler = _depth_handler(monkeypatch)
-    assert server.DEPTH_MAX_PENDING_AGE_S == pytest.approx(0.05)
-    publisher = _BlockingPublisher()
-    handler.pub = publisher
-    try:
-        assert handler.publish(b"in-flight")
-        assert publisher.entered.wait(1)
-        assert handler.publish(b"stale")
-        # Meet the configured local deadline without making the unit test wait.
-        # It is intentionally below Navi's 500 ms lease so DDS has time left.
-        with handler._state:
-            payload, received_at = handler._pending_depth
-            handler._pending_depth = (
-                payload, received_at - server.DEPTH_MAX_PENDING_AGE_S)
-        publisher.release.set()
-        assert _wait_until(lambda: handler.stale_pending_count == 1)
-        assert publisher.published == [b"in-flight"]
-        assert handler.msg_count == 1
-    finally:
-        publisher.release.set()
-        assert handler.close()
-
-
-def test_repeated_stale_depth_drops_are_log_rate_limited(monkeypatch, capsys):
-    server, handler = _depth_handler(monkeypatch)
-    try:
-        for payload in (b"stale-1", b"stale-2"):
-            with handler._state:
-                handler._pending_depth = (
-                    payload,
-                    time.monotonic() - server.DEPTH_MAX_PENDING_AGE_S,
-                )
-                handler._state.notify()
-            assert _wait_until(
-                lambda: handler.stale_pending_count ==
-                (1 if payload == b"stale-1" else 2))
-
-        output = capsys.readouterr().out
-        assert output.count("DROP stale") == 1
-        assert "total=1" in output
-    finally:
-        assert handler.close()
-
-
-def test_depth_close_discards_pending_and_is_idempotent(monkeypatch):
-    _, handler = _depth_handler(monkeypatch)
-    publisher = _BlockingPublisher()
-    handler.pub = publisher
-    close_result = []
-    try:
-        handler.publish(b"in-flight")
-        assert publisher.entered.wait(1)
-        handler.publish(b"must-not-drain")
-        closer = threading.Thread(
-            target=lambda: close_result.append(handler.close()), daemon=True)
-        closer.start()
-        assert _wait_until(lambda: handler._closing)
-        with handler._state:
-            assert handler._pending_depth is None
-        publisher.release.set()
-        closer.join(1)
-        assert close_result == [True]
-        assert publisher.published == [b"in-flight"]
-        assert handler.close()
-        with pytest.raises(RuntimeError, match="closed"):
-            handler.publish(b"after-close")
-    finally:
-        publisher.release.set()
-        handler.close()
-
-
-def test_depth_worker_failure_is_reported_to_the_next_submit(monkeypatch):
-    _, handler = _depth_handler(monkeypatch)
-    publisher = _BlockingPublisher(
-        RuntimeError("publisher's context is invalid"))
-    publisher.release.set()
-    handler.pub = publisher
-    try:
-        handler.publish(b"broken")
-        assert _wait_until(lambda: handler.context_invalid)
-        assert _wait_until(lambda: handler._worker_error is not None)
-        with pytest.raises(RuntimeError, match="context is invalid"):
-            handler.publish(b"next")
-    finally:
-        publisher.release.set()
-        assert handler.close()
+    assert handler.node.published == [payload]
+    assert handler.node.published[0] is payload
+    assert handler.node.created_qos.depth == 1
+    assert handler.msg_count == 1
+    assert handler.max_publish_ms >= 0
 
 
 def test_other_outbound_topics_keep_the_historical_queue_depth(monkeypatch):
@@ -546,15 +385,7 @@ def test_other_outbound_topics_keep_the_historical_queue_depth(monkeypatch):
         "/nvidia_desktop/state/odom", "std_msgs/msg/FakeMsg",
         object(), _Executor(), {"depth": 1},
     )
-    try:
-        assert handler.node.created_qos is server.BEST_EFFORT_QOS
-        # Non-depth topics keep the historical inline path: publication has
-        # completed when publish() returns, rather than entering the worker.
-        assert handler.publish(b"odom") is None
-        assert handler.node.published == [b"odom"]
-        assert handler._worker is None
-    finally:
-        assert handler.close()
+    assert handler.node.created_qos is server.BEST_EFFORT_QOS
 
 
 def test_publish_error_does_not_log_raw_cdr_bytes(monkeypatch, capsys):
@@ -564,17 +395,17 @@ def test_publish_error_does_not_log_raw_cdr_bytes(monkeypatch, capsys):
         "/nvidia_desktop/state/odom", "std_msgs/msg/FakeMsg",
         object(), _Executor(), {"depth": 1},
     )
-    secret = b"raw-cdr-secret-that-must-not-reach-logs"
-    handler.pub = types.SimpleNamespace(
-        publish=lambda _: (_ for _ in ()).throw(ValueError("publish failed")))
-    try:
-        assert handler.publish(secret) is None
-        output = capsys.readouterr().out
-        assert "serialized length" in output
-        assert secret.decode() not in output
-        assert "first 100 bytes" not in output
-    finally:
-        assert handler.close()
+    payload = b"raw-cdr-content-must-not-be-logged"
+
+    def fail_publish(_):
+        raise ValueError("publish failed")
+
+    handler.pub = types.SimpleNamespace(publish=fail_publish)
+    handler.publish(payload)
+    output = capsys.readouterr()
+    assert "serialized length" in output.out
+    assert payload.decode() not in output.out + output.err
+    assert "first 100 bytes" not in output.out
 
 
 def test_slow_warning_does_not_flag_intentionally_low_rate_topics(
@@ -587,11 +418,9 @@ def test_slow_warning_does_not_flag_intentionally_low_rate_topics(
     )
     handler._last_receive_ts = server.time.monotonic() - 1.0
 
-    try:
-        handler.publish(b"battery")
-        assert "SLOW" not in capsys.readouterr().out
-    finally:
-        assert handler.close()
+    handler.publish(b"battery")
+
+    assert "SLOW" not in capsys.readouterr().out
 
 
 def test_exact_reader_reassembles_split_header_and_large_payload():
@@ -624,67 +453,6 @@ def test_fastdds_async_mode_is_selected_before_participant_creation(
 
     assert os.environ["RMW_FASTRTPS_PUBLICATION_MODE"] == "ASYNCHRONOUS"
     assert "RMW_FASTRTPS_USE_QOS_FROM_XML" not in os.environ
-
-
-def test_server_stop_closes_handlers_before_ros_shutdown(monkeypatch, tmp_path):
-    server = _server_module()
-    events = []
-
-    class Handler:
-        topic = "/depth"
-        node = types.SimpleNamespace(
-            destroy_node=lambda: events.append("destroy"))
-
-        def close(self):
-            events.append("close")
-            return True
-
-    class Executor:
-        def remove_node(self, node):
-            events.append("remove")
-
-        def shutdown(self):
-            events.append("executor-shutdown")
-
-    instance = server.SocketBridgeServer.__new__(server.SocketBridgeServer)
-    instance.SOCKET_DIR = str(tmp_path)
-    instance.handlers = {"/depth": Handler()}
-    instance._handlers_lock = threading.Lock()
-    instance._stop_flag = threading.Event()
-    instance._stop_lock = threading.Lock()
-    instance._stopped = False
-    instance.executor = Executor()
-    instance.ctx = object()
-    instance.main_sock = types.SimpleNamespace(
-        close=lambda: events.append("socket-close"))
-    monkeypatch.setattr(
-        server.rclpy, "shutdown",
-        lambda context: events.append("rclpy-shutdown"), raising=False)
-
-    instance.stop()
-    instance.stop()  # idempotent
-
-    assert events.count("close") == 1
-    assert events.index("close") < events.index("remove")
-    assert events.index("remove") < events.index("destroy")
-    assert events.index("destroy") < events.index("executor-shutdown")
-    assert events.index("executor-shutdown") < events.index("rclpy-shutdown")
-
-
-def test_handler_replacement_never_destroys_a_live_worker():
-    server = _server_module()
-    events = []
-    instance = server.SocketBridgeServer.__new__(server.SocketBridgeServer)
-    instance.executor = types.SimpleNamespace(
-        remove_node=lambda node: events.append("remove"))
-    handler = types.SimpleNamespace(
-        close=lambda: events.append("close") or False,
-        node=types.SimpleNamespace(
-            destroy_node=lambda: events.append("destroy")),
-    )
-
-    assert instance._close_handler(handler) is False
-    assert events == ["close"]
 
 
 def test_the_server_can_serialize_what_it_forwards():

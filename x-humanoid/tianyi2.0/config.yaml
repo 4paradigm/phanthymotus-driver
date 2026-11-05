@@ -43,9 +43,7 @@ plugins:
   camera_depth:
     enabled: true
     # Compressed hardware depth, latest frame only; directly connects to navi.
-    # 5 Hz leaves time for lossless Z16 compression on Jetson while retaining
-    # margin for Navi's 500 ms observation-freshness bound.
-    hz: 5
+    hz: 15
   camera_pointcloud:
     enabled: true
     # Head camera height above the floor. The point-cloud renderer uses Y=0
