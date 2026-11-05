@@ -87,9 +87,9 @@ python main.py
 PointCloud2；该输出描述符中的 `associated_imu` 声明实际配置的 IMU topic、格式、
 ROS 类型、QoS、坐标系和时间语义。第三项为 `navigation_imu` 端口，直接公开同一
 IMU 的 ROS topic 描述符；消费端能否直接使用该端口或元数据取决于其实现。
-当前 controlled semantic spatial 卡只连接 `navigation_lidar`，通过其 `imu_topic`
-配置订阅 IMU（默认为 `/ubuntu/navigation/imu`），不会自动绑定 IMU 端口或读取
-`associated_imu`；使用自定义 topic 时必须配置并核对对应 IMU。两路点云的 format
+controlled semantic spatial 卡通过 Core 的 `input_bindings` 显式绑定两路输入
+（导航点云与 IMU 通道），不会读取 `associated_imu`，也不从点云 topic 推导 IMU
+topic；绑定后必须核对解析出的实际 topic。两路点云的 format
 都是 `sensor/pointcloud`，FAST-LIVO2 必须选择 `navigation_lidar`，不能误连旧二进制点云。
 不提供独立 `lidar_imu` 卡；
 原机身 `imu` 不变。`lidar_cloud` 同时管理两路导航数据，停止时释放两路请求及 worker；
@@ -115,7 +115,7 @@ RealSense 插件通过 `camera_rgb` 的 `rgb` 端口发布 `/ubuntu/camera/rgb` 
 | 原卡片 | 新卡片 / 端口 |
 |---|---|
 | navigation_lidar | lidar_cloud / navigation_lidar |
-| navigation_imu、lidar_imu | 支持端口的消费端使用 lidar_cloud / navigation_imu；当前 controlled semantic spatial 卡改用其 `imu_topic` 配置 |
+| navigation_imu、lidar_imu | 支持端口的消费端使用 lidar_cloud / navigation_imu；controlled semantic spatial 卡改用 Core `input_bindings` 显式绑定 |
 
 移除的名字不保留隐藏别名。原点云输出维持列表首位及原有数据格式；IMU topic
 及其 ROS 类型保持可用。Canvas 和消费端需要支持传递描述符。此轮整合尚未部署或

@@ -132,7 +132,6 @@ plugins:
                              0.0, 0.0, -1.0]
     clock_warmup_samples: 32
     # Legacy compatibility only; navigation uses a 30s bounded sample window.
-    clock_window_samples: 400
     clock_reset_threshold_ms: 1000
     clock_reset_confirm_samples: 8
   slam:

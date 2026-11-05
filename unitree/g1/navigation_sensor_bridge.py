@@ -126,7 +126,6 @@ class _NavigationSensorNode(Node):
         # get_clock() returns it internally.
         self._clock_offset = NavigationClockOffsetEstimator(
             warmup_samples=int(config.get("clock_warmup_samples", 32)),
-            window_samples=int(config.get("clock_window_samples", 400)),
             reset_threshold_ns=int(
                 float(config.get("clock_reset_threshold_ms", 1000.0)) * 1_000_000
             ),

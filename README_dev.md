@@ -648,6 +648,13 @@ acceleration is m/s², and the covariance arrays retain ROS row-major order and
 units. Do not publish JSON in place of the native ROS topic; this JSON is only
 the Agent Core WebSocket representation.
 
+This JSON is a **consumer-side** view: it documents what Core renders for a
+dashboard, not a conversion that navigation algorithms receive. A navigation
+consumer that needs IMU data must bind the native `sensor_msgs/msg/Imu` topic
+explicitly (for example through `input_bindings`) and be verified on hardware;
+nothing in the Driver guarantees that a given Core build converts native IMU
+into this JSON for the navigation path.
+
 The last three carry a declared schema rather than free-form JSON, and the port
 format is what a *consumer* matches on when wiring a canvas — the renderer is
 incidental. `control/*` is an **input** port on a driver command card;

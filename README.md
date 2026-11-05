@@ -118,10 +118,10 @@ its `associated_imu` metadata with the configured IMU topic, `sensor/imu` format
 ROS type, QoS, frame and timestamp semantics. Consumers can use the IMU port or
 this metadata rather than deriving a topic name from the cloud topic. The IMU
 normally uses `/ubuntu/navigation/imu`; there is no independent `lidar_imu` card.
-The current controlled semantic spatial card connects `navigation_lidar` and
-subscribes to the IMU via its `imu_topic` configuration (default
-`/ubuntu/navigation/imu`); it does not automatically bind the IMU port or read
-`associated_imu`. For custom topics, configure and verify the matching IMU topic.
+The controlled semantic spatial card binds its inputs explicitly through the
+Core `input_bindings` (navigation cloud plus IMU channel); it does not read
+`associated_imu` or derive a topic name. Bind both inputs and verify the
+resolved topics before a navigation run.
 Both cloud outputs advertise `sensor/pointcloud`, so select `navigation_lidar`,
 not the legacy binary cloud, for FAST-LIVO2.
 
@@ -162,10 +162,10 @@ Migration: replace saved Canvas `navigation_lidar` with `lidar_cloud`'s
 `navigation_lidar` port.
 Where supported, replace saved `lidar_imu` or `navigation_imu` card connections
 with the `lidar_cloud` card's `navigation_imu` port; the cloud descriptor's
-`associated_imu` metadata also remains available. The current controlled semantic
-spatial card instead uses its configured `imu_topic` as described above. Consumer
-and Canvas support for ports or metadata is required; hardware/ROS acceptance is
-pending, and local tests are not a deployment claim.
+`associated_imu` metadata also remains available. The controlled semantic
+spatial card instead binds its IMU input explicitly through `input_bindings`, as
+described above. Consumer and Canvas support for ports or metadata is required;
+hardware/ROS acceptance is pending, and local tests are not a deployment claim.
 
 ## Writing a New Driver
 
