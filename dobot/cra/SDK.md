@@ -24,9 +24,9 @@ The adapter imports upstream `DobotConnection`, `FeedbackParser`, `MyType` and
 the SDK version. It deliberately does not instantiate `DobotRobot`, whose
 connection lifecycle also opens Dashboard. A single receive-only feedback
 connection supplies the joints skeleton and joint-angle JSON, even outside
-TCP control mode. Only joints is a visible card in this release; the model
-resource supplies background URDF geometry. No actuator, Dashboard command
-connection, skin settings action or skin output topic is registered.
+TCP control mode. joints and joint_move are visible cards in this release; the model
+resource supplies background URDF geometry. The joint_move actuator lazily opens one serialized Dashboard connection.
+No systemcontrol or skin card is registered.
 
 Compatibility baseline: CRA six-axis V4 feedback layout, 1440 bytes, little
 endian, test magic `0x0123456789abcdef`, as documented by the supplied TCP/IP
@@ -69,3 +69,8 @@ models never publish skeleton joint positions.
 For an SDK update, download the new immutable commit artifact, compute its
 SHA-256, update requirements and this file plus `SDK_COMMIT`, and run the
 protocol and MCP tests before building a new ARM64 image.
+
+Joint motion uses SDK MovJ with joint coordinates and per-command v/a, cp=0.
+Each move_j first sends EnableSafeSkin(0), then ClearError; resume sends
+EnableSafeSkin(0) before Continue. All acknowledgements are checked, with no
+automatic retry or skin re-enable. Successful replies are not verified state readback.

@@ -622,8 +622,8 @@ def test_metadata_and_mcp_http_contract():
     assert {t["name"] for t in tools} == {t["name"] for t in metadata["cards"]}
     sensors = [t for t in tools if t["type"] == "sensor"]
     assert len(sensors) == 1 and sensors[0]["name"] == "joints"
-    assert {t["name"] for t in tools} == {"joints", "model"}
-    assert {t["name"] for t in tools if t["type"] != "resource"} == {"joints"}
+    assert {t["name"] for t in tools} == {"joints", "joint_move", "model"}
+    assert {t["name"] for t in tools if t["type"] != "resource"} == {"joints", "joint_move"}
     assert next(t for t in tools if t["name"] == "model")["type"] == "resource"
     assert all(t["topic_out"][0]["format"] == ("sensor/skeleton" if t["name"] == "joints" else "data/json") for t in sensors)
     assert tools[0]["topic_out"][1] == {"topic": "/dobot_cra/state/joint_angles", "format": "data/json"}
@@ -644,7 +644,7 @@ def test_metadata_and_mcp_http_contract():
 
     try:
         assert rpc("initialize", {})["result"]["serverInfo"]["name"] == "dobot-cra"
-        assert len(rpc("tools/list", {})["result"]["tools"]) == 2
+        assert len(rpc("tools/list", {})["result"]["tools"]) == 3
         result = rpc("tools/call", {"name": "joints", "arguments": {
             "action": "config", "controller_ip": "", "feedback_port": 30006,
         }})
@@ -678,6 +678,10 @@ def test_metadata_and_mcp_http_contract():
                     "action": action, "confirm_change": True,
                 }})
                 assert removed_action["error"]["code"] == -32601
+        motion_info = rpc("tools/call", {"name": "joint_move", "arguments": {"action": "info"}})
+        assert json.loads(motion_info["result"]["content"][0]["text"])["type"] == "actuator"
+        motion_query = rpc("tools/call", {"name": "joint_move", "arguments": {"action": "get_status"}})
+        assert motion_query["error"]["code"] == -32602
         sensor_query = rpc("tools/call", {"name": "joints", "arguments": {"action": "get_status"}})
         assert sensor_query["error"]["code"] == -32602
     finally:

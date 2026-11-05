@@ -1,12 +1,13 @@
-# Dobot CRA joints
+# Dobot CRA joints and joint_move
 
-基于官方 V4 Python SDK 的 Jetson Docker 驱动。本版只提供 `joints`
-一张可见卡片，URDF 由后台 `model` 资源提供。SDK 版本见 [SDK.md](SDK.md)。
+基于官方 V4 Python SDK 的 Jetson Docker 驱动。本版提供并列的 `joints` 与 `joint_move`
+两张可见卡片，URDF 由后台 `model` 资源提供。SDK 版本见 [SDK.md](SDK.md)。
 
 ## 卡片
 
 | 名称 | 类型 | 内容 |
 |---|---|---|
+| `joint_move` | actuator | 绝对关节运动、停止、暂停及继续，详见 [JOINT_MOVE.md](JOINT_MOVE.md) |
 | `joints` | sensor | 六轴实际角度驱动的 CR3A 结构骨架、逐关节转角 JSON，以及共享连接配置 |
 
 `model` 为渲染器内部读取的 resource，不是可见卡片。
@@ -45,7 +46,7 @@ JSON 输出示例（数值为示例）：
 ## 卡片介绍
 
 内部 `info` 只返回卡片介绍、参数 schema、配置 schema 和输入输出口定义。
-`joints` 通过输出口持续发布数据，不提供业务 action，也不建立 Dashboard 命令连接。
+`joints` 通过输出口持续发布数据，不提供业务 action；joint_move 按需建立 Dashboard 命令连接。
 
 ## 固定直角结构
 
@@ -93,14 +94,21 @@ MCP 端口 `15746`，容器名 `embodied-dobot-cra`；无需主机 SDK 或 privi
 python3 -m venv .venv
 .venv/bin/pip install -r dobot/cra/build-requirements.txt
 .venv/bin/pip install --no-build-isolation -r dobot/cra/requirements.txt pytest
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra_sensors.py tests/test_dobot_skeleton_structure.py -q
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra_sensors.py tests/test_dobot_skeleton_structure.py tests/test_dobot_joint_move.py -q
 .venv/bin/python scripts/check_service_yml.py
 ```
 
 ## PR 验收
 
-1. 可见卡片仅有 `joints`；`model` 保留为后台资源。
+1. 可见卡片仅有 `joints` 和 `joint_move`；`model` 保留为后台资源。
 2. 骨架使用六轴实际角度，默认 30 Hz；JSON 的六个角度字段分别占一行。
-3. 系统控制和运动卡片不注册，直接 API 调用也不能执行控制命令。
+3. systemcontrol 不注册，joint_move 不提供使能或上电动作。
 4. 反馈失效时骨架为空、角度为 null；`info` 只返回卡片介绍。
 5. 本地模拟验证不操作真机，模型与实际机械臂的显示效果由现场验收。
+
+## 关节运动
+
+joint_move 与 joints 共用底层反馈服务和连接配置，均可独立启动。
+每次 move_j 前发送 EnableSafeSkin(0)、ClearError，再发送 MovJ；
+resume 前发送 EnableSafeSkin(0)，成功后发送 Continue。失败不继续也不重试。
+不自动重新 enable 安全皮肤；原有运动前置保护检查保留。
