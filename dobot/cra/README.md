@@ -43,21 +43,22 @@
 
 断线或过期时，关节输出为 `connected=false, stale=true`，骨架不再输出旧角度，`joints=[]`；
 皮肤输出为 `available=false`，触发状态为 `null`，不会把未知当作“没有触发”。
-连接地址、端口、反馈新鲜度及重连诊断可通过 `joints.get_status` 查看。
+关节输出 JSON 同时包含连接地址、端口、反馈新鲜度及重连诊断。
 
 ## 卡片介绍与状态查询
 
-三张可见卡片均提供平台内部 `info` 和可执行的 `get_status`，职责分开：
+三张可见卡片均保留平台内部 `info`；只有两张执行卡提供可执行的 `get_status`：
 
 - `info` 只返回名称、功能介绍、参数 schema、配置 schema 和输入输出口定义。
   平台用于详情按钮及端口解析；不读取反馈、连接状态或请求记录。
-- `get_status` 在 action 下拉框中可选，查询最新有效反馈和请求记录；不发送控制命令，
+- 执行卡的 `get_status` 在 action 下拉框中可选，查询最新有效反馈和请求记录；不发送控制命令，
   不要求 `confirm_change`，不会打开 Dashboard 连接。
 - ROS JSON 输出口持续发布实时数据，其结构不因这次分离而改变。
 
-`joints.get_status` 返回关节和连接有效性；`safe_skin_control.get_status` 返回触发反馈、
+`joints` 不提供业务 action，通过骨架和 JSON 输出口持续发布数据，保留平台内部启停和配置。
+`safe_skin_control.get_status` 返回触发反馈、
 命令连接状态和最近设置请求；`systemcontrol.get_status` 返回系统实际状态和本卡请求记录。
-旧调用方若通过 `info` 读取运行数据，请改用 `get_status`。
+旧执行卡调用方若通过 `info` 读取运行数据，请改用 `get_status`。
 
 ## 固定直角结构
 

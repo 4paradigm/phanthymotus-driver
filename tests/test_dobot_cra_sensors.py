@@ -682,7 +682,9 @@ def test_metadata_and_mcp_http_contract():
         assert skin_info["topic_out"] == skin_tool["topic_out"]
         assert skin_info["description"] == skin_tool["description"]
         assert "feedback" not in skin_info and "last_request" not in skin_info
-        for name in ("joints", "safe_skin_control", "systemcontrol"):
+        sensor_query = rpc("tools/call", {"name": "joints", "arguments": {"action": "get_status"}})
+        assert sensor_query["error"]["code"] == -32602
+        for name in ("safe_skin_control", "systemcontrol"):
             result = rpc("tools/call", {"name": name, "arguments": {"action": "get_status"}})
             status = json.loads(result["result"]["content"][0]["text"])
             assert status["read_only"]

@@ -57,13 +57,6 @@ class DobotSensors:
                                   "description": "反馈端口；30006 自动使用至少 3 秒超时", "scope": "shared"},
             },
         }
-        definitions[0]["inputSchema"] = action_schema({
-            "info": ([], "查看卡片功能、参数及输出口定义，不读取运行状态"),
-            "get_status": ([], "查询当前关节角度及反馈有效性"),
-            "start": ([], "启动实时关节输出"),
-            "stop": ([], "停止卡片，不改变机器人状态"),
-            "config": (["controller_ip", "feedback_port"], "配置共享反馈 IP 和端口"),
-        }, definitions[0]["configSchema"]["properties"])
         schema = action_schema({
             "info": ([], "查看卡片功能、参数及输出口定义，不读取运行状态"),
             "get_status": ([], "查询当前触发状态和最近设置请求；请求记录不等于配置读回"),
@@ -249,8 +242,6 @@ class DobotSensors:
                     "topic_out": self._topics[name], **self.payload(name)}
         if action == "stop":
             return {"state": "idle"}
-        if action == "get_status":
-            return {"topic_out": self._topics[name], **self.payload(name)}
         raise ValueError(f"unsupported sensor action: {action}")
 
 

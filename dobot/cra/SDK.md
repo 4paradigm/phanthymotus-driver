@@ -72,7 +72,8 @@ sensitivity readback are absent; the skin actuator's compact JSON output only re
 and request records live in the actuator get_status response. Each card keeps its own
 request/error history. Writes are never automatically replayed.
 
-All three visible cards expose get_status as a public action. The platform
+Only the two actuator cards expose get_status as a public action. The joints
+sensor publishes its data through output topics without business actions. The platform
 filters the reserved info action out of its selector; info now returns static
 card metadata only (description, schemas and ports). Status queries use fresh
 feedback without opening Dashboard or echoing a previous write as actual state.

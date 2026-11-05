@@ -246,11 +246,14 @@ def test_info_is_static_metadata_and_status_is_a_visible_action(name, monkeypatc
     info = plugin.dispatch('info', {'_tool_name': name})
     assert info['name'] == name and info['description']
     assert not {'robot_status', 'enabled', 'feedback', 'last_request', 'available'} & info.keys()
-    actions = info['inputSchema']['properties']['action']['enum']
-    # Core hides these reserved lifecycle names from the action selector.
-    visible = set(actions) - {'start', 'stop', 'info', 'config'}
-    assert 'get_status' in visible
-    assert info['inputSchema']['x-action-params']['get_status']['params'] == []
+    if name == 'joints':
+        assert 'action' not in info['inputSchema']['properties']
+    else:
+        actions = info['inputSchema']['properties']['action']['enum']
+        # Core hides these reserved lifecycle names from the action selector.
+        visible = set(actions) - {'start', 'stop', 'info', 'config'}
+        assert 'get_status' in visible
+        assert info['inputSchema']['x-action-params']['get_status']['params'] == []
     if name != 'systemcontrol':
         assert info['topic_out']
     assert not calls and not dashboard.commands
