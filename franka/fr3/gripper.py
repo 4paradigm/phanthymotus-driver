@@ -71,7 +71,7 @@ class GripperPlugin(JointControlPlugin):
         schema["x-hooks"] = {key: {"action": "stopmotion"}
                              for key in ("on_interrupt_motion", "on_interrupt_all")}
         return [{**tool(self.PREFIX, "actuator", "Franka gripper: opening, grasp, homing calibration and confirmed stop.", schema),
-                 "multiInstance": False, "topic_out": self._status_topic()}]
+                 "multiInstance": False}]
 
     def _info(self, instance_id, instance):
         snapshot = instance.session.snapshot() if instance.session is not None else {}
@@ -165,7 +165,7 @@ class GripperPlugin(JointControlPlugin):
             action_id = session.command(self._owner_key(instance_id), action, **options)
             instance.last_action_id = action_id
             instance.acp = {"action_id": action_id, "state": "waiting_for_motion"}
-            self._status_event("running", action=action, action_id=action_id,
+            self._activity_event("running", action=action, action_id=action_id,
                                robot_ip=instance.config.get("robot_ip"),
                                result={"action": action, "parameters": dict(options)})
             threading.Thread(target=self._complete, args=(instance, session, action_id),

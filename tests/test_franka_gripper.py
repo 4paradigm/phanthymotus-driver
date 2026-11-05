@@ -29,10 +29,6 @@ class FakeGripper(fixtures.FakeSession):
         self._motions[action_id]["target"] = {"action": action, "width_m": options.get("width_m")}
         return action_id
 
-    def finish(self, action_id, status="succeeded", **result):
-        # The joint fixture updates q as a list, but card assertions only use Hand fields.
-        super().finish(action_id, status, **result)
-
     def stop_gripper(self, owner):
         if owner not in self._owners:
             raise RuntimeError("Unknown owner")
@@ -48,6 +44,7 @@ class GripperCardTests(unittest.TestCase):
     def setUp(self):
         self.sessions, self.completions = [], []
         self.targets = {}
+        self.activities = []
         self.publishers = mock.Mock(return_value=mock.Mock())
 
         def session_factory(address, **options):
@@ -59,7 +56,7 @@ class GripperCardTests(unittest.TestCase):
         discovery = mock.Mock()
         discovery.snapshot.return_value = {"state": "ready", "robots": []}
         self.plugin = gripper.GripperPlugin({}, manager=self.manager, discovery=discovery,
-            publisher_factory=self.publishers, acp_callback=lambda *args: self.completions.append(args), activity_callback=mock.Mock())
+            publisher_factory=self.publishers, acp_callback=lambda *args: self.completions.append(args), activity_callback=self.activities.append)
         self.plugin.READY_TIMEOUT = .1
         self.bundle = DriverBundle([self.plugin])
         self.addCleanup(self.plugin.stop)
@@ -82,11 +79,16 @@ class GripperCardTests(unittest.TestCase):
     def complete(self, session, result, status="succeeded"):
         session.finish(result["action_id"], status)
         fixtures.wait_for(lambda: any(c[0] == result["action_id"] for c in self.completions))
+        terminal = "completed" if status == "succeeded" else "cancelled" if status == "cancelled" else "error"
+        fixtures.wait_for(lambda: any(e["state"] == terminal and e.get("action_id") == result["action_id"]
+                                     for e in self.activities))
+        self.publishers.assert_not_called()
 
     def test_arm_selection_routes_without_a_topic_or_card_id(self):
         self.plugin._arm_ips = {"left": "172.16.0.3", "right": "172.16.0.2"}
         spec, = self.bundle.get_all_tools()
         self.assertNotIn("configSchema", spec)
+        self.assertNotIn("topic_out", spec)
         self.assertNotIn("target_robot_ip", spec["inputSchema"]["properties"])
         self.assertEqual("ready", self.call("start", speed_mm_s=15)["state"])
         self.call("start", "hand-b", speed_mm_s=15)

@@ -406,11 +406,8 @@ class JointControlPlugin(FrankaPlugin):
         self._enabled = True
         self._execution_epoch = 0
         self._stopping = False
-        self._status_publisher = None
-        self._status_lock = threading.RLock()
-        self._status_events = []
-        self._status_sequence = 0
-        self._status_error = None
+        self._activity_lock = threading.RLock()
+        self._activity_sequence = 0
         self._activity_callback = activity_callback or self._post_activity
         self._activity_queue = queue.Queue(maxsize=64)
         self._activity_thread = None
@@ -459,28 +456,18 @@ class JointControlPlugin(FrankaPlugin):
         if result.get("code") != 200:
             raise RuntimeError("Platform did not accept Activity feedback")
 
-    def _status_topic(self):
-        return [{"topic": f"/{self._namespace}/{self.PREFIX}/status", "format": "data/json"}]
-
     def start(self):
-        # One read-only publisher for the singleton card; no hardware connection.
-        with self._status_lock:
+        # Start feedback delivery without connecting to hardware.
+        with self._activity_lock:
             if not self._closed and self._activity_thread is None:
                 self._activity_thread = threading.Thread(target=self._activity_worker,
                     name="franka-activity-" + self.PREFIX, daemon=True)
                 self._activity_thread.start()
-            if not self._closed and self._status_publisher is None:
-                self._status_publisher = self._publisher_factory(
-                    self._status_topic()[0]["topic"], 5, self._publish_status)
 
     def stop(self):
         try:
             super().stop()
         finally:
-            with self._status_lock:
-                publisher, self._status_publisher = self._status_publisher, None
-            if publisher is not None:
-                publisher.close()
             if self._activity_thread is not None:
                 try:
                     self._activity_queue.put_nowait(None)
@@ -488,43 +475,16 @@ class JointControlPlugin(FrankaPlugin):
                     pass
                 self._activity_thread.join(timeout=.5)
 
-    def _status_event(self, state, **fields):
-        with self._status_lock:
-            self._status_sequence += 1
-            self._status_events.append({"sequence": self._status_sequence,
-                "timestamp_ms": int(time.time() * 1000), "ts": time.time(),
-                "tool": self.PREFIX, "state": state,
-                **({"status": state} if state in ("completed", "error", "cancelled") else {}), **fields})
-            del self._status_events[:-32]
-            if state in ("running", "completed", "error", "cancelled", "stopped"):
-                try:
-                    self._activity_queue.put_nowait(dict(self._status_events[-1]))
-                except queue.Full:
-                    log.warning("%s Activity queue full; event retained in status stream", self.PREFIX)
-        self._publish_status()
-
-    def _publish_status(self):
-        try:
-            with self._lock:
-                instances = list(self._instances.items())
-            robots = [self._info(key, instance) for key, instance in instances]
-            with self._status_lock:
-                if self._status_publisher is None:
-                    return
-                visible = [event for event in self._status_events
-                           if event["state"] not in ("acp_accepted", "acp_failed")]
-                latest = dict(visible[-1]) if visible else {"state": "ready"}
-                delivery = next((dict(event) for event in reversed(self._status_events)
-                                 if event["state"] in ("acp_accepted", "acp_failed")
-                                 and event.get("action_id") == latest.get("action_id")), None)
-                self._status_publisher.publish({"tool": self.PREFIX,
-                    "timestamp_ms": int(time.time() * 1000), "latest": latest,
-                    "acp_delivery": delivery, "events": list(self._status_events), "robots": robots})
-                self._status_error = None
-        except Exception as exc:
-            # A viewer failure must not break the ROS executor or alter motion results.
-            self._status_error = str(exc)[:240]
-            log.warning("%s status publication failed: %s", self.PREFIX, self._status_error)
+    def _activity_event(self, state, **fields):
+        with self._activity_lock:
+            self._activity_sequence += 1
+            event = {"sequence": self._activity_sequence,
+                     "timestamp_ms": int(time.time() * 1000), "ts": time.time(),
+                     "tool": self.PREFIX, "state": state, **fields}
+            try:
+                self._activity_queue.put_nowait(event)
+            except queue.Full:
+                log.warning("%s Activity queue full; ACP completion remains independent", self.PREFIX)
 
     def dispatch(self, action, args):
         if args.get("_tool_name", action) != self.PREFIX:
@@ -533,20 +493,13 @@ class JointControlPlugin(FrankaPlugin):
         try:
             if action == "start":
                 self.start()
-            if motion:
-                self._status_event("preparing", action=action, arm=args.get("arm"),
-                                   robot_ip=args.get("robot_ip"))
             result = self._dispatch_request(action, args)
-            if result is not None:
-                result["topic_out"] = self._status_topic()
-                if self._status_error:
-                    result["status_stream_error"] = self._status_error
             if action in ("stop", "stopmotion"):
-                self._status_event("stopped", action=action, arm=args.get("arm"))
+                self._activity_event("stopped", action=action, arm=args.get("arm"))
             return result
         except Exception as exc:
             if motion or action in ("stop", "stopmotion"):
-                self._status_event("error", action=action, arm=args.get("arm"), error=str(exc))
+                self._activity_event("error", action=action, arm=args.get("arm"), error=str(exc))
             raise
 
 
@@ -727,7 +680,7 @@ class JointControlPlugin(FrankaPlugin):
                              for key in ("on_interrupt_motion", "on_interrupt_all")}
         return [{**tool(self.PREFIX, "actuator",
                         "Franka FR3 joint control: J1-J7 absolute targets, single-step jog and confirmed stop.", schema),
-                 "multiInstance": False, "topic_out": self._status_topic()}]
+                 "multiInstance": False}]
 
     def _info(self, instance_id, instance):
         snapshot = instance.session.snapshot() if instance.session is not None else {}
@@ -836,7 +789,7 @@ class JointControlPlugin(FrankaPlugin):
             if getattr(instance, "last_action_id", None) == action_id:
                 instance.last_result = {"action_id": action_id, "status": status, "result": result}
                 instance.acp = {"action_id": action_id, "state": "pending"}
-        self._status_event(status, action_id=action_id, robot_ip=session.address, result=result)
+        self._activity_event(status, action_id=action_id, robot_ip=session.address, result=result)
         error = None
         # Completion IDs are idempotent at Core; bounded retry handles transient failures.
         for attempt in range(3):
@@ -852,8 +805,6 @@ class JointControlPlugin(FrankaPlugin):
             if getattr(instance, "last_action_id", None) == action_id:
                 instance.acp = {"action_id": action_id, "state": "failed" if error else "accepted",
                                 "error": error}
-        self._status_event("acp_failed" if error else "acp_accepted", action_id=action_id,
-                           outcome=status, error=error)
 
     def _post_completion(self, action_id, status, result):
         import os
@@ -930,7 +881,7 @@ class JointControlPlugin(FrankaPlugin):
                                          speed_rad_s=speed, tolerance_rad=math.radians(0.5), timeout_s=120)
                 instance.last_action_id = action_id
                 instance.acp = {"action_id": action_id, "state": "waiting_for_motion"}
-                self._status_event("running", action=action, action_id=action_id,
+                self._activity_event("running", action=action, action_id=action_id,
                                    robot_ip=instance.config.get("robot_ip"),
                                    result={"target_deg": [math.degrees(q) for q in target],
                                            "speed_deg_s": math.degrees(speed)})

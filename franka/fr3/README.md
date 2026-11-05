@@ -95,9 +95,10 @@ Motion calls return `state=running` and a unique `action_id`. On termination,
 the driver posts `completed`, `cancelled`, or `error` to `/api/acp/complete`
 using the same ID and verifies HTTPS with `AGENT_CORE_CA_CERT`.
 
-**View data stream** shows the latest motion result, ACP delivery status,
-recent events and available measurements. Activity receives start and terminal
-notifications through `/api/event`. On authenticated hosts, provision the
+Motion cards have no monitor output. Activity receives start and terminal
+notifications with `action_id` and the final result through `/api/event`.
+The `info` action retains the last result and ACP delivery status.
+On authenticated hosts, provision the
 event credential separately in a restricted file at `/run/franka/event-token`
 or set `AGENT_CORE_EVENT_TOKEN_FILE` to its path.
 

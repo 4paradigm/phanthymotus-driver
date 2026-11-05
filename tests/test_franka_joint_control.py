@@ -189,6 +189,7 @@ class JointControlTests(unittest.TestCase):
         self.targets = {}
         self.publishers = mock.Mock(return_value=mock.Mock())
         self.completions = []
+        self.activities = []
 
         def session_factory(address, **options):
             session = FakeSession(address, **options)
@@ -208,7 +209,7 @@ class JointControlTests(unittest.TestCase):
         }
         self.sensor = device.FrankaPlugin({}, **options)
         self.controller = device.JointControlPlugin(
-            {}, **options, acp_callback=lambda *args: self.completions.append(args), activity_callback=mock.Mock(),
+            {}, **options, acp_callback=lambda *args: self.completions.append(args), activity_callback=self.activities.append,
         )
         self.controller.READY_TIMEOUT = .1
         self.addCleanup(self.controller.stop)
@@ -263,7 +264,7 @@ class JointControlTests(unittest.TestCase):
         self.assertNotIn("stop", schema["properties"]["action"]["enum"])
         self.assertNotIn("action_id", schema["properties"])
         self.assertEqual(["robot_ip"], schema["x-action-params"]["stopmotion"]["params"])
-        self.assertEqual("data/json", spec["topic_out"][0]["format"])
+        self.assertNotIn("topic_out", spec)
         self.assertNotIn("configSchema", spec)
         self.assertIn("robot_ip", tools["joint_states"]["configSchema"]["required"])
         self.assertNotIn("output_topic", schema["properties"])
@@ -298,7 +299,7 @@ class JointControlTests(unittest.TestCase):
             self.bundle.dispatch("joint_control", {
                 "action": "jog", "robot_ip": "172.16.0.3", "joint": 1, "step_deg": 1, "speed_deg_s": 5})
 
-    def test_missing_speed_rejected_and_status_stream_retains_start_and_end(self):
+    def test_missing_speed_and_feedback_without_joint_monitor(self):
         for speed in (None, "", True):
             with self.assertRaises(ValueError):
                 self.bundle.dispatch("joint_control", {"action": "set", "robot_ip": "172.16.0.3",
@@ -308,15 +309,12 @@ class JointControlTests(unittest.TestCase):
         session, action_id = self.started_move()
         session.finish(action_id)
         self.completed(action_id)
-        wait_for(lambda: any(e["state"] == "acp_accepted" for e in self.controller._status_events))
-        states = [e["state"] for e in self.controller._status_events if e.get("action_id") == action_id]
-        self.assertIn("running", states)
-        self.assertIn("completed", states)
-        self.controller._publish_status()
-        payload = self.publishers.return_value.publish.call_args.args[0]
-        self.assertEqual("completed", payload["latest"]["status"])
-        self.assertEqual(action_id, payload["acp_delivery"]["action_id"])
-        self.assertEqual("joint_control", payload["tool"])
+        wait_for(lambda: any(e["state"] == "completed" for e in self.activities))
+        events = [e for e in self.activities if e.get("action_id") == action_id]
+        self.assertEqual(["running", "completed"], [e["state"] for e in events])
+        self.assertIn("result", events[-1])
+        self.publishers.assert_not_called()
+        self.assertEqual("completed", self.call()["last_result"]["status"])
 
     def test_acp_wire_payload_matches_readme(self):
         import io
