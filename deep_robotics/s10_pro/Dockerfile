@@ -1,7 +1,12 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base@sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f
+ARG UBUNTU_MIRROR=http://ports.ubuntu.com/ubuntu-ports
 FROM ${ROS_BASE_IMAGE} AS drdds-builder
+ARG UBUNTU_MIRROR
 RUN set -eu; package=python3-colcon-common-extensions; \
     if [ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != "install ok installed" ]; then \
+        find /etc/apt \( -name '*.list' -o -name '*.sources' \) -type f -exec sed -i \
+            -e "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_MIRROR}|g" \
+            -e "s|http://ports.ubuntu.com/ubuntu-ports|${UBUNTU_MIRROR}|g" {} + && \
         apt-get update && apt-get install -y --no-install-recommends "$package" && rm -rf /var/lib/apt/lists/*; \
     fi
 WORKDIR /s10_pro_ws
@@ -10,6 +15,7 @@ COPY resource/audio_msgs/ /s10_pro_ws/src/audio_msgs/
 RUN . /opt/ros/humble/setup.sh && cd /s10_pro_ws && colcon build --packages-select drdds audio_msgs && rm -rf build log src
 
 FROM ${ROS_BASE_IMAGE}
+ARG UBUNTU_MIRROR
 ARG PYPI_MIRROR=https://pypi.org/simple/
 RUN set -eu; missing=""; \
     for package in alsa-utils ca-certificates ffmpeg openssh-client python3-pip ros-humble-rmw-fastrtps-cpp sshpass; do \
@@ -18,6 +24,9 @@ RUN set -eu; missing=""; \
         fi; \
     done; \
     if [ -n "$missing" ]; then \
+        find /etc/apt \( -name '*.list' -o -name '*.sources' \) -type f -exec sed -i \
+            -e "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_MIRROR}|g" \
+            -e "s|http://ports.ubuntu.com/ubuntu-ports|${UBUNTU_MIRROR}|g" {} + && \
         apt-get update && apt-get install -y --no-install-recommends $missing && rm -rf /var/lib/apt/lists/*; \
     fi
 COPY --from=drdds-builder /s10_pro_ws/install/ /s10_pro_ws/install/
