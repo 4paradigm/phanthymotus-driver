@@ -34,7 +34,7 @@ TOPIC = "/{ns}/q5/arm_gesture"
 FMT = "data/json"
 HZ = 2.0
 NODE = "q5_arm_gesture"
-DESC = "Q5 手臂语义手势：敬礼、欢迎、举手、握手、击掌及归零，由 arm_control 绝对关节插补驱动"
+DESC = "Q5 手臂语义手势：敬礼、欢迎、举手、握手、击掌、侧平举（保持）及归零，由 arm_control 绝对关节插补驱动"
 
 # ── Joint definitions ────────────────────────────────────────────────────────
 
@@ -53,6 +53,9 @@ ARM_JOINT_NAMES = ARM_JOINTS_LEFT + ARM_JOINTS_RIGHT
 # Mirrored index: shoulder_roll(1), arm_yaw(2), elbow_yaw(4), wrist_roll(6) flip sign
 _MIRROR_MASK = [1, 2, 4, 6]
 
+# Gestures that stay at their target instead of returning to neutral.
+_HOLD_GESTURES = {"arms_out"}
+
 # ── Gesture definitions (degrees) ────────────────────────────────────────────
 
 _GESTURES_DEG = {
@@ -61,13 +64,15 @@ _GESTURES_DEG = {
     "raise":           [-10, 95, 0, -15, 0, 0, 0],
     "shake_hands":     [-45, -10, -15, -20, 0, 0, 0],
     "high_five":       [-40, 40, -20, -80, 0, 0, 50],
+    # 侧平举：肩横滚 90°（左 +，右镜像为 −），肘伸直。到位后保持，不自动回正；放下用 reset。
+    "arms_out":        [0, 90, 0, 0, 0, 0, 0],
 }
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 _GESTURE_LABELS = {
     "salute": "敬礼", "welcome": "欢迎", "raise": "举手",
-    "shake_hands": "握手", "high_five": "击掌",
+    "shake_hands": "握手", "high_five": "击掌", "arms_out": "侧平举并保持",
 }
 
 # Neutral pose: shoulder_pitch -30° (~-0.52 rad) so arms rest naturally in
@@ -162,6 +167,10 @@ def _build_frames(gesture: str, cycles: int) -> list:
 
     target = _GESTURES_DEG[gesture]
 
+    # Hold gestures stop at the target: no return-to-neutral frame.
+    if gesture in _HOLD_GESTURES:
+        return [(target, 0.3, 1.0)]
+
     # Single smooth transition to the gesture target
     if gesture == "salute":
         frames.append((target, 0.4, 0.85))
@@ -240,7 +249,7 @@ class Plugin:
     # ── Tool definition ──────────────────────────────────────────────────
 
     def get_tool(self) -> dict:
-        actions = ["salute", "welcome", "raise", "shake_hands", "high_five", "reset",
+        actions = ["salute", "welcome", "raise", "shake_hands", "high_five", "arms_out", "reset",
                    "cancel", "stop", "start", "info"]
         one_of_actions = [
             {"const": "start", "title": "检查连接状态"},
@@ -297,6 +306,7 @@ class Plugin:
                     "raise": {"params": ["side", "speed"], "description": "将手臂高举到头部上方后回正"},
                     "shake_hands": {"params": ["side", "cycles", "speed"], "description": "向前伸手并轻柔上下摆动，做出握手动作"},
                     "high_five": {"params": ["side", "speed"], "description": "将手掌伸到身体前方并保持在肩部附近，做出击掌等待姿势"},
+                    "arms_out": {"params": ["side", "speed"], "description": "手臂向身体侧面平举到水平并保持，不自动回正；放下用 reset"},
                     "reset": {"params": ["speed"], "description": "取消序列并回到中性姿态"},
                     "cancel": {"params": [], "description": "取消尚未发送的后续动作帧，并保持当前位置"},
                     "stop": {"params": [], "description": "停止当前手势并回到中性姿态（归零）"},
@@ -304,7 +314,7 @@ class Plugin:
                     "info": {"params": [], "description": "查看当前运动和安全条件"},
                 },
                 "x-completion": {
-                    "actions": ["salute", "welcome", "raise", "shake_hands", "high_five", "reset"],
+                    "actions": ["salute", "welcome", "raise", "shake_hands", "high_five", "arms_out", "reset"],
                     "timeout": 60,
                 },
                 # Both arms, deliberately. `side` picks left/right/both per call, but
