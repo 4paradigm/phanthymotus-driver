@@ -5,15 +5,10 @@ python3 -m unittest discover -s franka/fr3/native -p 'test_gripper.py'
 import fcntl
 import json
 import os
-from pathlib import Path
-import queue
-import shutil
-import subprocess
-import tempfile
-import threading
-import time
 import unittest
+from pathlib import Path
 
+from franka.fr3.native.test_support import NativeProcessCase
 
 FAKE_SDK = r'''
 #pragma once
@@ -109,48 +104,11 @@ class Gripper {
 '''
 
 
-class NativeGripperTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        compiler = shutil.which("c++")
-        if compiler is None:
-            raise unittest.SkipTest("C++ compiler unavailable")
-        cls.temporary = tempfile.TemporaryDirectory(prefix="fr3-gripper-native-test-")
-        cls.directory = Path(cls.temporary.name)
-        headers = cls.directory / "franka"
-        headers.mkdir()
-        (headers / "fake.h").write_text(FAKE_SDK)
-        for name in ("gripper.h", "gripper_state.h"):
-            (headers / name).write_text('#include "fake.h"\n')
-        cls.binary = cls.directory / "franka-gripper"
-        built = subprocess.run(
-            [compiler, "-std=c++17", "-pthread", "-Wall", "-Wextra", "-Wpedantic",
-             "-I", str(cls.directory), str(Path(__file__).with_name("gripper.cpp")),
-             "-o", str(cls.binary)], capture_output=True, text=True)
-        if built.returncode:
-            raise RuntimeError(built.stderr)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.temporary.cleanup()
-
-    def setUp(self):
-        self.processes = []
-        self.lock_dir = tempfile.TemporaryDirectory(prefix="fr3-gripper-lock-test-")
-
-    def tearDown(self):
-        for process, _, _, _ in self.processes:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=4)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=2)
-            for pipe in (process.stdin, process.stdout, process.stderr):
-                if pipe and not pipe.closed:
-                    pipe.close()
-        self.lock_dir.cleanup()
+class NativeGripperTest(NativeProcessCase):
+    event_timeout = 5
+    source = "gripper.cpp"
+    headers = ('gripper.h', 'gripper_state.h')
+    fake_sdk = FAKE_SDK
 
     def start(self, address=None, consume=True, **options):
         if address is None:
@@ -158,41 +116,10 @@ class NativeGripperTest(unittest.TestCase):
         log = Path(self.lock_dir.name) / f"calls-{len(self.processes)}.txt"
         env = dict(os.environ, FRANKA_LOCK_DIR=self.lock_dir.name,
                    FR3_GRIPPER_LOG=str(log), **options)
-        process = subprocess.Popen([str(self.binary), address], stdin=subprocess.PIPE,
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   text=True, bufsize=1, env=env)
-        received = queue.Queue()
-        history = []
-
-        def receive():
-            for line in process.stdout:
-                record = json.loads(line)
-                history.append(record)
-                received.put(record)
-
-        if consume:
-            threading.Thread(target=receive, daemon=True).start()
-        item = process, received, history, log
-        self.processes.append(item)
-        return item
-
-    def wait_for(self, item, predicate, timeout=5):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                message = item[1].get(timeout=max(0.001, deadline - time.monotonic()))
-            except queue.Empty:
-                break
-            if predicate(message):
-                return message
-        self.fail(f"Expected native event missing; observed {item[2][-8:]}")
+        return (*self.spawn(address, env, consume=consume), log)
 
     def ready(self, item):
         return self.wait_for(item, lambda r: r.get("type") == "state")
-
-    def send(self, item, line):
-        item[0].stdin.write(line + "\n")
-        item[0].stdin.flush()
 
     def terminal(self, item, identifier="test"):
         return self.wait_for(item, lambda r: r.get("event") == "motion" and

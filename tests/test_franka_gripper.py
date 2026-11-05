@@ -1,13 +1,12 @@
 """Gripper card routing, units and ACP, without opening any hardware connection."""
 
 import importlib.util
-from pathlib import Path
 import sys
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from common.vendor_runtime import DriverBundle
-
 
 spec = importlib.util.spec_from_file_location(
     "franka_gripper_card_fixtures", Path(__file__).with_name("test_franka_joint_control.py"))
@@ -47,23 +46,19 @@ class FakeGripper(fixtures.FakeSession):
 
 class GripperCardTests(unittest.TestCase):
     def setUp(self):
-        self.sessions, self.publishers, self.completions = [], [], []
+        self.sessions, self.completions = [], []
+        self.publishers = mock.Mock(side_effect=AssertionError("Motion cards must not publish"))
 
         def session_factory(address, **options):
             session = FakeGripper(address, **options)
             self.sessions.append(session)
             return session
 
-        def publisher_factory(topic, hz, callback):
-            publisher = fixtures.FakePublisher(topic, hz, callback)
-            self.publishers.append(publisher)
-            return publisher
-
         self.manager = fixtures.hardware.SessionManager(session_factory=session_factory)
         discovery = mock.Mock()
         discovery.snapshot.return_value = {"state": "ready", "robots": []}
         self.plugin = gripper.GripperPlugin({}, manager=self.manager, discovery=discovery,
-            publisher_factory=publisher_factory, acp_callback=lambda *args: self.completions.append(args))
+            publisher_factory=self.publishers, acp_callback=lambda *args: self.completions.append(args))
         self.bundle = DriverBundle([self.plugin])
         self.addCleanup(self.plugin.stop)
 
@@ -170,14 +165,14 @@ class GripperCardTests(unittest.TestCase):
         self.assertEqual("ready", self.call("stopmotion")["state"])
         self.assertEqual(1, len(first.physical_stops))
         self.assertEqual([], second.physical_stops)
-        self.assertEqual([], self.publishers)
+        self.publishers.assert_not_called()
 
     def test_stop_failure_is_not_reported_as_stopped(self):
         session = self.start()
         session.stop_error = RuntimeError("SDK stop failed")
         with self.assertRaisesRegex(RuntimeError, "SDK stop failed"):
             self.call("stopmotion")
-        self.assertEqual([], self.publishers)
+        self.publishers.assert_not_called()
 
     def test_invalid_input_and_rejected_ip_never_submit(self):
         session = self.start()

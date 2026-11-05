@@ -3,14 +3,11 @@
 import importlib.util
 import json
 import math
-from pathlib import Path
-import subprocess
-import sys
-import tempfile
 import threading
-import time
 import unittest
+from pathlib import Path
 
+from franka.fr3.native.test_support import PipeSessionCase, eventually
 
 SPEC = importlib.util.spec_from_file_location(
     "franka_control_session_test", Path(__file__).resolve().parents[1] / "franka/fr3/hardware.py")
@@ -83,48 +80,12 @@ while True:
 '''
 
 
-def eventually(predicate, timeout=2):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.005)
-    raise AssertionError("Session condition did not become true")
-
-
-class NativeFactory:
-    def __init__(self, path, mode):
-        self.path, self.mode = path, mode
-        self.processes = []
-        self.lock = threading.Lock()
-
-    def __call__(self, args, **kwargs):
-        with self.lock:
-            process = subprocess.Popen(
-                [sys.executable, "-u", "-c", BACKEND, self.mode, self.path], **kwargs)
-            self.processes.append(process)
-            return process
-
-    def commands(self):
-        return Path(self.path).read_text().splitlines()
-
-
-class ControlSessionTests(unittest.TestCase):
-    def session(self, mode="hold", **options):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        path = str(Path(directory.name) / "commands.log")
-        Path(path).touch()
-        factory = NativeFactory(path, mode)
-        defaults = dict(connect_timeout=0.3, stale_after=0.15, retry_delay=0.1,
-                        retry_max=0.2, stop_timeout=0.1, motion_stop_timeout=0.4)
-        defaults.update(options)
-        manager = hardware.SessionManager(process_factory=factory, **defaults)
-        self.addCleanup(manager.close)
-        owner = ("joint_control", "first")
-        session = manager.acquire("172.16.0.3", owner)
-        eventually(lambda: session.snapshot()["connected"])
-        return manager, session, factory, owner
+class ControlSessionTests(PipeSessionCase):
+    hardware = hardware
+    backend = BACKEND
+    owner_tool = "joint_control"
+    session_type = hardware.RobotSession
+    split_commands = False
 
     def test_move_uses_one_native_process_and_waits_for_backend_completion(self):
         manager, session, factory, owner = self.session("success")

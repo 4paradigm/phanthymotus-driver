@@ -5,16 +5,15 @@ from __future__ import annotations
 import copy
 import importlib.util
 import math
-from pathlib import Path
 import sys
 import threading
 import time
 import unittest
-from unittest import mock
 import xml.etree.ElementTree as ET
+from pathlib import Path
+from unittest import mock
 
 from common.vendor_runtime import DriverBundle
-
 
 DRIVER = Path(__file__).resolve().parents[1] / "franka" / "fr3"
 
@@ -181,37 +180,19 @@ class FakeSession:
             self.closed += 1
 
 
-class FakePublisher:
-    def __init__(self, topic, hz, callback):
-        self.topic, self.hz, self.callback = topic, hz, callback
-        self.frames = []
-        self.closed = 0
-
-    def publish(self, payload):
-        self.frames.append(copy.deepcopy(payload))
-
-    def close(self):
-        self.closed += 1
-
-
 class JointControlTests(unittest.TestCase):
     def setUp(self):
         self.module_patch = mock.patch.dict(sys.modules, {"hardware": hardware, "discovery": discovery})
         self.module_patch.start()
         self.addCleanup(self.module_patch.stop)
         self.sessions = []
-        self.publishers = []
+        self.publishers = mock.Mock(side_effect=AssertionError("Motion cards must not publish"))
         self.completions = []
 
         def session_factory(address, **options):
             session = FakeSession(address, **options)
             self.sessions.append(session)
             return session
-
-        def publisher_factory(topic, hz, callback):
-            publisher = FakePublisher(topic, hz, callback)
-            self.publishers.append(publisher)
-            return publisher
 
         self.session_patch = mock.patch.object(hardware, "RobotSession", session_factory)
         self.session_patch.start()
@@ -222,7 +203,7 @@ class JointControlTests(unittest.TestCase):
         self.discovery.snapshot.return_value = {"state": "ready", "robots": []}
         options = {
             "namespace": "test_franka", "manager": self.manager,
-            "publisher_factory": publisher_factory, "discovery": self.discovery,
+            "publisher_factory": self.publishers, "discovery": self.discovery,
         }
         self.sensor = device.FrankaPlugin({}, **options)
         self.controller = device.JointControlPlugin(
@@ -535,7 +516,7 @@ class JointControlTests(unittest.TestCase):
             self.assertEqual(0, session.closed)
             self.assertEqual([], self.completions)
             self.assertEqual("stopping", self.call()["motion"]["status"])
-            self.assertEqual([], self.publishers)
+            self.publishers.assert_not_called()
         finally:
             session.wait = original_wait
             session.finish(action_id, "cancelled")

@@ -2,15 +2,12 @@
 
 import importlib.util
 import json
-from pathlib import Path
-import subprocess
 import sys
-import tempfile
-import threading
-import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
+from franka.fr3.native.test_support import PipeSessionCase, eventually
 
 DRIVER = Path(__file__).resolve().parents[1] / "franka/fr3"
 
@@ -97,48 +94,12 @@ while True:
 '''
 
 
-def eventually(predicate, timeout=2):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.005)
-    raise AssertionError("Gripper session condition did not become true")
-
-
-class NativeFactory:
-    def __init__(self, path, mode):
-        self.path, self.mode = path, mode
-        self.calls = []
-        self.lock = threading.Lock()
-
-    def __call__(self, args, **options):
-        with self.lock:
-            self.calls.append(args)
-        return subprocess.Popen(
-            [sys.executable, "-u", "-c", BACKEND, self.mode, self.path], **options)
-
-    def commands(self):
-        return [line.split() for line in Path(self.path).read_text().splitlines()]
-
-
-class GripperSessionTests(unittest.TestCase):
-    def session(self, mode="hold", **options):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        path = str(Path(directory.name) / "commands.log")
-        Path(path).touch()
-        factory = NativeFactory(path, mode)
-        defaults = dict(connect_timeout=.3, stale_after=.15, retry_delay=.1,
-                        retry_max=.2, stop_timeout=.1, motion_stop_timeout=.4)
-        defaults.update(options)
-        manager = hardware.SessionManager(
-            session_factory=gripper.GripperSession, process_factory=factory, **defaults)
-        self.addCleanup(manager.close)
-        owner = ("gripper", "first")
-        session = manager.acquire("172.16.0.3", owner)
-        eventually(lambda: session.snapshot()["connected"])
-        return manager, session, factory, owner
+class GripperSessionTests(PipeSessionCase):
+    hardware = hardware
+    backend = BACKEND
+    owner_tool = "gripper"
+    session_type = gripper.GripperSession
+    split_commands = True
 
     def test_move_uses_meters_and_returns_actual_state(self):
         _, session, factory, owner = self.session("success")
