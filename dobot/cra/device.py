@@ -12,11 +12,11 @@ from common.vendor_runtime import action_schema, tool
 if __package__:
     from .feedback import FeedbackClient, positive_number
     from .model import JOINT_NAMES, model_resource, resolve_model
-    from .control import PARTS, RobotController
+    from .control import PARTS, PART_LABELS, RobotController
 else:
     from feedback import FeedbackClient, positive_number
     from model import JOINT_NAMES, model_resource, resolve_model
-    from control import PARTS, RobotController
+    from control import PARTS, PART_LABELS, RobotController
 
 
 CARD_DESCRIPTIONS = {
@@ -60,7 +60,6 @@ class DobotSensors:
         schema = action_schema({
             "info": ([], "查看卡片功能、参数及输出口定义，不读取运行状态"),
             "get_status": ([], "查询当前触发状态和最近设置请求；请求记录不等于配置读回"),
-            "request_control": (["confirm_change"], "显式请求 TCP 控制模式；仅下使能/下电时允许，不使能机器人"),
             "set_enabled": (["enabled", "confirm_change"], "提交安全皮肤总开关；关闭会移除皮肤接近保护，不能用于碰撞复位"),
             "set_sensitivity": (["part", "level", "confirm_change"], "提交指定部位灵敏度；0 关闭，1 低，2 中，3 高"),
             "start": ([], "启动实时触发状态输出，不发送设置命令"),
@@ -68,8 +67,12 @@ class DobotSensors:
             "config": ([], "确认卡片配置；共享 IP/端口通过 joints 配置"),
         }, {
             "enabled": {"type": "boolean", "description": "安全皮肤总开关"},
-            "part": {"type": "integer", "enum": [3, 4, 5, 6], "description": "3 小臂；4/5/6 为 J4/J5/J6"},
-            "level": {"type": "integer", "enum": [0, 1, 2, 3], "description": "0 关闭；1 低；2 中；3 高"},
+            "part": {"type": "string", "enum": list(PARTS.values()),
+                     "oneOf": [{"const": name, "title": PART_LABELS[code]} for code, name in PARTS.items()],
+                     "description": "选择安全皮肤部位：小臂、J4（第4关节）、J5（第5关节）、J6（第6关节）"},
+            "level": {"type": "integer", "enum": [0, 1, 2, 3],
+                      "oneOf": [{"const": code, "title": label} for code, label in enumerate(("关闭", "低灵敏度", "中灵敏度", "高灵敏度"))],
+                      "description": "安全皮肤灵敏度：关闭、低、中、高"},
             "confirm_change": {"type": "boolean", "description": "确认本次安全设置变更；每次写请求必须为 true"},
         })
         schema["x-is-dangerous"] = True

@@ -72,6 +72,12 @@ sensitivity readback are absent; the skin actuator's compact JSON output only re
 and request records live in the actuator get_status response. Each card keeps its own
 request/error history. Writes are never automatically replayed.
 
+RequestControl is exposed only by systemcontrol; the skin card rejects that
+action and omits the control-mode request flag. Skin regions are selected using
+arm/j4/j5/j6 names with human-readable titles. The adapter maps them to SDK
+part IDs internally and reports a part_name in request records. The original
+integer part values remain accepted by the Python adapter for existing callers.
+
 Only the two actuator cards expose get_status as a public action. The joints
 sensor publishes its data through output topics without business actions. The platform
 filters the reserved info action out of its selector; info now returns static

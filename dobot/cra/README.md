@@ -8,7 +8,7 @@
 | 名称 | 类型 | 内容 |
 |---|---|---|
 | `joints` | sensor | 六轴实际角度驱动的 CR3A 结构骨架及转角 JSON 输出；共享连接配置入口 |
-| `safe_skin_control` | actuator | 实时触发状态 JSON 输出、显式请求 TCP 控制、总开关和分区灵敏度 |
+| `safe_skin_control` | actuator | 实时触发状态 JSON 输出、总开关和分区灵敏度 |
 | `systemcontrol` | actuator | 系统状态/报警、本体上电、使能、停止/暂停/继续、速度和拖拽示教 |
 | `model` | resource | 平台渲染器使用的固定直角骨架 URDF，不发布 ROS topic |
 
@@ -117,14 +117,19 @@ JSON 输出示例（数值为示例）：
 | `info` | 无 | 平台内部卡片介绍、参数和输出口定义 |
 | `get_status` | 无 | 当前触发反馈、命令连接状态和最近设置请求 |
 | `start/config/stop` | 无 | 返回 JSON 输出口定义；start 读取反馈，stop 关闭命令连接，均不修改皮肤设置 |
-| `request_control` | `confirm_change=true` | `RequestControl()` |
 | `set_enabled` | `enabled=true/false`, `confirm_change=true` | `EnableSafeSkin(1/0)` |
-| `set_sensitivity` | `part=3/4/5/6`, `level=0/1/2/3`, `confirm_change=true` | `SetSafeSkin(part,level)` |
+| `set_sensitivity` | `part=arm/j4/j5/j6`, `level=0/1/2/3`, `confirm_change=true` | 内部映射后调用 `SetSafeSkin(part,level)` |
 
-部位 3=小臂，4/5/6=J4/J5/J6；等级 0=关闭，1=低，2=中，3=高。
+部位下拉框显示“小臂、J4（第4关节）、J5（第5关节）、J6（第6关节）”，
+对应参数值 `arm/j4/j5/j6`，SDK 使用的 3/4/5/6 编号只在内部映射。
+请求记录返回 `part` 名称及中文 `part_name`，不再只输出数字部位。
+灵敏度下拉框显示“关闭、低灵敏度、中灵敏度、高灵敏度”，对应等级 0/1/2/3。
+原有直接 API 调用的整数部位编号仍可解析，但新卡片不再展示数字部位选项。
 每次写操作都要明确确认，平台按 actuator 危险操作处理。驱动要求新鲜反馈、机器人停止，
-没有报警、碰撞、皮肤触发、拖拽、暂停或抱闸松开。请求 TCP 控制另要求未使能/下电，
-且关闭手自动模式切换功能。条件不满足时返回原因，不代为使能、清错、关闭其他保护或恢复运动。
+没有报警、碰撞、皮肤触发、拖拽、暂停或抱闸松开。
+TCP 控制权统一通过 `systemcontrol.request_control` 请求，安全皮肤卡不提供此动作，
+后台也拒绝从皮肤卡调用；皮肤查询不再混入 `tcp_control_requested`。
+条件不满足时返回原因，不代为使能、清错、关闭其他保护或恢复运动。
 设置过程中再次检查反馈，避免连接耗时后仍按旧状态发送。
 
 开关和灵敏度是**队列指令**：返回 0 只说明接受请求。返回 ResultID 时状态为
@@ -147,7 +152,7 @@ JSON 输出示例（数值为示例）：
 | `info` | 无 | 平台内部卡片介绍及参数说明 |
 | `get_status` | 无 | 查询实际使能/上电/运行/暂停/拖拽/碰撞/报警状态，另含原始状态、安全字节、队列编号及负载 |
 | `get_errors` | 无 | `GetErrorID()`，返回 `error_ids` 数组；不清错 |
-| `request_control` | `confirm_change=true` | `RequestControl()`；保留皮肤卡同名动作以兼容旧流程 |
+| `request_control` | `confirm_change=true` | `RequestControl()`；仅系统控制卡提供 |
 | `power_on` | `confirm_change=true` | `PowerOn()`，仅给机械臂本体上电，不是控制柜开机 |
 | `enable` | `confirm_change=true` | `EnableRobot()`，不覆盖已配置负载/偏心参数 |
 | `disable` | `confirm_change=true` | `DisableRobot()` |
@@ -164,7 +169,8 @@ JSON 输出示例（数值为示例）：
 下一次显式命令按需建立连接，不自动接管 TCP。反馈超时不阻止 `stop_motion/disable/stop_drag`
 及 `get_errors` 尝试发送，但仍需要已配置 IP；这些 TCP 操作不能替代硬件急停。
 
-其他操作要求新鲜反馈并在连接后再次校验。上电要求模式 3，使能要求模式 4，
+其他操作要求新鲜反馈并在连接后再次校验。请求 TCP 控制要求未使能/下电，
+且关闭手自动模式切换功能。上电要求模式 3，使能要求模式 4，
 继续要求模式 10 且已使能；上电初始化期间不能越过模式检查立即使能。
 上电/使能/继续/进入拖拽被报警、碰撞、皮肤触发、松抱闸等状态阻止。
 清错只允许静止状态，不会代为消除故障原因，也不保证复位皮肤。

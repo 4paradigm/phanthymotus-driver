@@ -108,7 +108,14 @@ def test_merged_skin_card_advertises_stream_for_every_lifecycle_action():
     assert plugin.dispatch('info', {'_tool_name': 'safe_skin'}) is None
     tool = next(tool for tool in plugin.get_tools() if tool['name'] == 'safe_skin_control')
     assert tool['topic_out'] == output
-    assert {'start', 'stop', 'config', 'info', 'set_enabled', 'set_sensitivity'} <= set(tool['inputSchema']['properties']['action']['enum'])
+    assert set(tool['inputSchema']['properties']['action']['enum']) == {
+        'start', 'stop', 'config', 'info', 'get_status', 'set_enabled', 'set_sensitivity',
+    }
+    part = tool['inputSchema']['properties']['part']
+    assert part['type'] == 'string' and part['enum'] == ['arm', 'j4', 'j5', 'j6']
+    assert {item['const']: item['title'] for item in part['oneOf']} == {
+        'arm': '小臂', 'j4': 'J4（第4关节）', 'j5': 'J5（第5关节）', 'j6': 'J6（第6关节）',
+    }
 
 
 def test_joints_config_closes_dashboard_and_clears_old_state_without_sending_commands():
@@ -172,12 +179,33 @@ def test_sdk_each_region_and_sensitivity(part, level):
 
 def test_request_control_is_explicit_and_never_enables_robot():
     _, dashboard, control, _ = setup_control()
-    assert control.execute('request_control', {'confirm_change': True})['state'] == 'tcp_control_requested'
+    assert control.execute_system('request_control', {'confirm_change': True})['state'] == 'tcp_control_requested'
     assert dashboard.commands == ['RequestControl()']
     control.execute('set_enabled', dict(enabled=True, confirm_change=True))
     assert dashboard.commands == ['RequestControl()', 'EnableSafeSkin(1)']
-    assert control.snapshot()['tcp_control_requested'] is True
+    assert control.snapshot('systemcontrol')['tcp_control_requested'] is True
+    assert 'tcp_control_requested' not in control.snapshot()
     control.close()
+
+
+@pytest.mark.parametrize('part,code,label', [('arm', 3, '小臂'), ('j4', 4, 'J4（第4关节）'),
+                                          ('j5', 5, 'J5（第5关节）'), ('j6', 6, 'J6（第6关节）')])
+@pytest.mark.parametrize('level', ['0', '1', '2', '3'])
+def test_named_skin_parts_and_canvas_level_values_use_correct_sdk_mapping(part, code, label, level):
+    feedback, dashboard, control, calls = setup_control()
+    plugin = DobotSensors({}, client=feedback, controller=control)
+    try:
+        result = plugin.dispatch('set_sensitivity', {
+            '_tool_name': 'safe_skin_control', 'part': part, 'level': level, 'confirm_change': True,
+        })
+        assert dashboard.commands == [f'SetSafeSkin({code},{level})'] and len(calls) == 1
+        assert result['part'] == part and result['part_name'] == label and result['level'] == int(level)
+        assert plugin.dispatch('get_status', {'_tool_name': 'safe_skin_control'})['last_request']['part_name'] == label
+        with pytest.raises(ValueError, match='unsupported safe-skin action'):
+            plugin.dispatch('request_control', {'_tool_name': 'safe_skin_control', 'confirm_change': True})
+        assert dashboard.commands == [f'SetSafeSkin({code},{level})'] and len(calls) == 1
+    finally:
+        control.close()
 
 
 @pytest.mark.parametrize('action,args', [
@@ -190,6 +218,7 @@ def test_request_control_is_explicit_and_never_enables_robot():
     ('set_sensitivity', {'part': 4, 'level': False, 'confirm_change': True}),
     ('reset', {'confirm_change': True}),
     ('EnableRobot', {'confirm_change': True}),
+    ('request_control', {'confirm_change': True}),
 ])
 def test_invalid_or_unsupported_actions_never_open_connection(action, args):
     _, dashboard, control, calls = setup_control()
@@ -231,7 +260,7 @@ def test_takeover_has_its_own_disabled_and_mode_requirements(key, value):
     feedback, _, control, calls = setup_control()
     feedback.sample['data'][key] = value
     with pytest.raises(RuntimeError, match='TCP takeover'):
-        control.execute('request_control', {'confirm_change': True})
+        control.execute_system('request_control', {'confirm_change': True})
     assert calls == []
 
 

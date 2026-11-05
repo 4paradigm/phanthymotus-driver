@@ -22,6 +22,7 @@ else:
 
 
 PARTS = {3: "arm", 4: "j4", 5: "j5", 6: "j6"}
+PART_LABELS = {3: "小臂", 4: "J4（第4关节）", 5: "J5（第5关节）", 6: "J6（第6关节）"}
 
 
 class DashboardConnection(DobotConnection):
@@ -87,7 +88,10 @@ class RobotController:
     def snapshot(self, card="safe_skin_control"):
         import copy
         with self._state_lock:
-            return copy.deepcopy({**self._status, **self._requests[card]})
+            status = {**self._status, **self._requests[card]}
+            if card == "safe_skin_control":
+                status.pop("tcp_control_requested", None)
+            return copy.deepcopy(status)
 
     def _update(self, card="safe_skin_control", **values):
         with self._state_lock:
@@ -153,7 +157,11 @@ class RobotController:
         if not sample.get("connected") or sample.get("stale") or state is None:
             raise RuntimeError("fresh feedback is required for this system control action")
         if action == "request_control":
-            return self._check_state(action)
+            sample = self._check_state(action)
+            state = sample["data"]
+            if state["robot_mode"] not in (3, 4) or state["auto_manual_mode"] != 0:
+                raise RuntimeError("TCP takeover requires power-off/disabled state and hand/auto switching disabled")
+            return sample
         mode = state["robot_mode"]
         if action == "pause":
             if mode != 7:
@@ -207,8 +215,6 @@ class RobotController:
                 state["pause_cmd_flag"] or any(state["brake_released"]) or
                 any(state[key] for key in ("arm_approach_state", "j4_approach_state", "j5_approach_state", "j6_approach_state"))):
             raise RuntimeError("robot must be stopped, without alarm, collision, skin trigger, drag or released brakes")
-        if action == "request_control" and (state["robot_mode"] not in (3, 4) or state["auto_manual_mode"] != 0):
-            raise RuntimeError("TCP takeover requires power-off/disabled state and hand/auto switching disabled")
         return sample
 
     def execute(self, action, args):
@@ -222,14 +228,17 @@ class RobotController:
             requested = {"enabled": args["enabled"]}
         elif action == "set_sensitivity":
             part, level = args.get("part"), args.get("level")
+            if isinstance(part, str):
+                part = {name: code for code, name in PARTS.items()}.get(part)
+            # Canvas select controls send strings; accept only exact enum values.
+            if isinstance(level, str) and level in ("0", "1", "2", "3"):
+                level = int(level)
             if type(part) is not int or part not in PARTS:
-                raise ValueError("part must be 3 (arm), 4, 5 or 6")
+                raise ValueError("part must be arm (小臂), j4, j5 or j6")
             if type(level) is not int or level not in (0, 1, 2, 3):
                 raise ValueError("level must be 0=off, 1=low, 2=middle or 3=high")
             command, parameters = "SetSafeSkin", (part, level)
-            requested = {"part": part, "level": level}
-        elif action == "request_control":
-            command, parameters, requested = "RequestControl", (), {}
+            requested = {"part": PARTS[part], "part_name": PART_LABELS[part], "level": level}
         else:
             raise ValueError(f"unsupported safe-skin action: {action}")
         return self._execute("safe_skin_control", action, command, parameters, requested, self._check_state)
