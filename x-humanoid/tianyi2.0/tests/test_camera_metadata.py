@@ -9,7 +9,6 @@ import pytest
 from test_camera_lifecycle import (  # same ROS/codec fakes, real worker/lifecycle
     _Camera, _raw_frame, _stubbed_modules, device,
 )
-from test_camera_depth_metadata import color_info
 
 
 def wait_until(predicate, timeout=1.0):
@@ -69,71 +68,6 @@ def test_missing_first_frame_is_a_bounded_start_error(camera):
     assert camera.plugin.dispatch("info", {})["camera_info"][0]["width"] is None
 
 
-def test_required_color_calibration_is_ready_before_start_snapshot(camera):
-    camera.plugin._require_camera_info = True
-    thread, result = begin_start(camera)
-    camera.feed(_raw_frame(12, 8))
-    assert camera.wait_published(1)
-    assert thread.is_alive()
-    camera.plugin._on_color_camera_info(color_info(12, 8, "another_frame"))
-    assert not camera.plugin.dispatch("info", {})["ready"]
-    calibration = color_info(12, 8, "color_optical")
-    camera.plugin._on_color_camera_info(calibration)
-    thread.join(1)
-    assert not thread.is_alive()
-    info, = result
-    assert info["ready"]
-    declaration, = info["camera_info"]
-    assert declaration["K"] == calibration.k
-    assert declaration["D"] == calibration.d
-    assert declaration["source"] == "derived-from-K"
-
-
-def test_color_camera_info_reader_accepts_sensor_data_publishers(camera):
-    camera.plugin.start()
-    reader = camera.plugin._camera_info_subscription
-    assert reader.topic == "/ob_camera_head/color/camera_info"
-    assert reader.qos.depth == 1
-    assert reader.qos.reliability == device.ReliabilityPolicy.BEST_EFFORT
-    assert camera.plugin._subscription.qos.reliability == device.ReliabilityPolicy.RELIABLE
-
-
-def test_required_calibration_timeout_and_stop_are_bounded(camera):
-    camera.plugin._require_camera_info = True
-    camera.plugin._START_FRAME_TIMEOUT_S = 0.03
-    thread, result = begin_start(camera)
-    camera.feed(_raw_frame(12, 8))
-    thread.join(0.3)
-    assert not thread.is_alive()
-    assert result[0]["state"] == "error"
-    assert not camera.plugin._running
-    camera.plugin._START_FRAME_TIMEOUT_S = 2
-    thread, result = begin_start(camera)
-    camera.feed(_raw_frame(12, 8))
-    camera.plugin.stop()
-    thread.join(0.3)
-    assert not thread.is_alive()
-    assert result[0]["state"] == "idle"
-
-
-def test_color_stamp_updates_preserve_ready_but_K_changes_require_restart(camera):
-    camera.plugin._require_camera_info = True
-    thread, result = begin_start(camera)
-    calibration = color_info(12, 8, "color_optical")
-    camera.plugin._on_color_camera_info(calibration)
-    camera.feed(_raw_frame(12, 8))
-    thread.join(1)
-    assert result[0]["ready"]
-    calibration.header.stamp.sec += 1
-    camera.plugin._on_color_camera_info(calibration)
-    assert camera.plugin.dispatch("info", {})["ready"]
-    calibration.k[0] += 10
-    camera.plugin._on_color_camera_info(calibration)
-    info = camera.plugin.dispatch("info", {})
-    assert not info["ready"] and info["camera_info"][0]["K"] is None
-    assert "restart" in info["last_encode_error"]
-
-
 def test_stop_cancels_first_frame_wait_without_blocking_for_timeout(camera):
     camera.plugin._START_FRAME_TIMEOUT_S = 5
     thread, result = begin_start(camera)
@@ -190,7 +124,7 @@ def test_concurrent_starters_share_one_verified_stream(camera):
     second.join(1)
     assert first_result[0]["ready"] and second_result[0]["ready"]
     assert len(camera.plugin._pub_node.publishers_created) == 1
-    assert len(camera.plugin._sub_node.subscriptions_created) == 2
+    assert len(camera.plugin._sub_node.subscriptions_created) == 1
 
 
 def test_stop_new_start_cannot_interleave_between_arm_and_generation_capture(camera, monkeypatch):

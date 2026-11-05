@@ -43,40 +43,24 @@ depth. After redeploying, refresh the card's port metadata and reconnect the
 depth wire to the new `/depth/visual_depth` topic with `image/depth-zlib`.
 No `lidar_depth` or `visual_depth` processing card is needed in this path.
 
-`camera_head` reads `/ob_camera_head/color/camera_info` and declares its live RGB
-intrinsics and distortion alongside the actual published image dimensions.
-With `plugins.camera.require_camera_info: true`, startup waits up to 10 seconds
-for both a JPEG and matching calibration before Core snapshots this geometry.
-Unavailable or incompatible calibration is never replaced by guessed values.
+`camera_head.info.camera_info` now declares the actual RGB dimensions after the
+first successfully published JPEG, preserving the source header. The camera
+start call waits up to 10 seconds for this frame before reporting success, so
+downstream VOP/Navi can snapshot the correct dimensions for bounding boxes.
+Unknown intrinsics and field of view remain null. After redeploying, restart
+the connected camera/VOP/Navi chain to refresh those startup snapshots.
+`camera_depth.info.source_geometry` reports the source frame size, frame ID and
+crop; `registration_to_color` remains `unknown` until verified on hardware.
+Host camera setup now preserves existing vendor launch arguments while changing
+only the three point-cloud/IMU enable flags.
 
-The factory `head_330_ty.launch.py` profile uses `depth_registration=true`,
-`align_mode=HW`, `align_target_stream=COLOR`, with matching 1280x720 profiles.
-For that profile the bundle explicitly sets
-`plugins.camera_depth.alignment: vendor_hw_d2c`. Depth retains the full source
-view and is resized with nearest-neighbour sampling to 640x480; it is no longer
-cropped independently of RGB. Its declaration uses the registration target's
-live RGB calibration and identity, with the two rows of K scaled independently
-for the output width and height. The zlib format, millimetre samples, source
-header, 15Hz target, 500ms checks and bulk `array('B')` packing stay unchanged.
-Some older Orbbec wrappers still publish the native depth K even when D2C is
-enabled, so this configured mode does not use that K as the aligned projection.
-
-`camera_depth.info` reports the configured registration source and whether a
-matching calibration is ready. Hardware D2C is a vendor configuration claim,
-not a pixel-level test: `pixel_alignment_verified` remains false. A missing
-calibration, wrong frame ID or mismatched source size does not produce a false
-RGB geometry declaration. For a different camera setup without confirmed HW
-D2C, select `alignment: native`; that retains the original native-depth crop
-and reports registration as unknown. The host camera startup script is not
-changed by this geometry setting.
-
-After redeploying, restart the connected camera/VOP/depth/Navi cards so Core
-takes a fresh metadata snapshot. Verify a stationary doorway's RGB and depth
-edges, centrally and off-centre, with the servo paused, then compare reported
-distance against tape measurements before testing passage. Software tests
-verify projection bookkeeping and wire bytes, not physical alignment or the
-chassis clearance. The declared conservative 0.70m envelope plus Navi's default
-0.15m margin on each side requests a 1.00m free corridor.
+This conversion does not register raw depth to RGB or change the existing
+centre-crop/nearest-neighbour resize to 640x480. RGB/depth correspondence,
+camera intrinsics, and the vendor's millimetre scale still require hardware
+verification. Keep the servo paused while checking reported target distance
+against lens-to-target tape measurements at 1, 1.5, and 2 metres, both centrally
+and off-centre, before testing approach/stop behaviour. The software tests
+verify the wire payload, not distance accuracy or navigation safety on hardware.
 
 ## Locomotion state card
 
@@ -204,12 +188,11 @@ ratings. Non-finite values, unsupported axes and out-of-range commands are
 rejected. `ControlSink` checks the schema, TTL, observation age, sequence and
 source priority. Rejected/stale messages never feed the watchdog.
 
-The control descriptor declares the operator-requested conservative footprint
-as `half_width: 0.35` m (`0.70` m overall, source `estimate`). The physical
-arms-rest width was measured as `0.55` m; the larger declaration must not be
-reported as a measurement. Navi owns its separate dynamic clearance margin;
-with the default 0.15 m on each side the displayed avoidance corridor is 1.00 m
-wide. A 0.70 m footprint declaration is not a 0.70 m passage-width setting.
+The control descriptor declares the measured navigation-posture footprint as
+`half_width: 0.275` m (`0.55` m overall, source `measured`). Navi owns the
+separate dynamic clearance margin; with its default 0.15 m on each side the
+displayed avoidance corridor is therefore 0.85 m wide, rather than the 1.00 m
+conservative fallback used when a chassis declares no footprint.
 
 The domain-42 input uses the existing socket subscription bridge. Output now
 uses the official Slamware C++ SDK, **not ROS `/cmd_vel`**: the Tianyi hardware

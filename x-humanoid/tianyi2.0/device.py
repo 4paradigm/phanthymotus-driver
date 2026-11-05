@@ -964,11 +964,6 @@ class CameraPlugin:
         self._last_encode_error = ""
         self._pub = None
         self._subscription = None
-        self._camera_info_subscription = None
-        self._color_calibration = None
-        self._require_camera_info = bool(plugin_config.get("require_camera_info", False))
-        self._declared_color_geometry = None
-        self._camera_geometry_fault = ""
         self._encode_thread = None
         # Serializes start/stop. Every tools/call runs on its own thread of the
         # ThreadingHTTPServer, and the canvas issues stop→start within seconds.
@@ -1027,7 +1022,7 @@ class CameraPlugin:
             self._ensure_orbbec_service()
 
             try:
-                from sensor_msgs.msg import Image, CompressedImage, CameraInfo
+                from sensor_msgs.msg import Image, CompressedImage
                 import numpy as np
                 import cv2
             except ImportError as e:
@@ -1051,9 +1046,6 @@ class CameraPlugin:
                 self._frame_size = None
                 self._frame_id = ""
                 self._last_encode_error = ""
-                self._color_calibration = None
-                self._declared_color_geometry = None
-                self._camera_geometry_fault = ""
 
             # Publish JPEG as CompressedImage
             if self._pub is None:
@@ -1063,14 +1055,6 @@ class CameraPlugin:
             if self._subscription is None:
                 self._subscription = self._sub_node.create_subscription(
                     Image, "/ob_camera_head/color/image_raw", self._on_image_grab, _RELIABLE_QOS)
-            if self._camera_info_subscription is None:
-                info_qos = QoSProfile(
-                    reliability=ReliabilityPolicy.BEST_EFFORT,
-                    history=HistoryPolicy.KEEP_LAST, depth=1,
-                    durability=DurabilityPolicy.VOLATILE)
-                self._camera_info_subscription = self._sub_node.create_subscription(
-                    CameraInfo, "/ob_camera_head/color/camera_info",
-                    self._on_color_camera_info, info_qos)
 
             self._running = True
             self._armed_at = time.time()
@@ -1244,34 +1228,6 @@ else:
             if self._running:
                 self._latest_frame = (msg, getattr(self, "_frame_generation", 0))
 
-    def _on_color_camera_info(self, msg):
-        from camera_geometry import camera_info_snapshot
-
-        snapshot = camera_info_snapshot(msg)
-        with self._frame_ready:
-            if self._running:
-                geometry = {k: v for k, v in (snapshot or {}).items() if k != "stamp_ms"}
-                if (snapshot is not None and self._declared_color_geometry is not None
-                        and geometry != self._declared_color_geometry):
-                    self._camera_geometry_fault = "RGB calibration changed; restart camera and downstream cards"
-                    self._last_encode_error = self._camera_geometry_fault
-                self._color_calibration = snapshot
-                self._frame_ready.notify_all()
-
-    def _metadata_ready_locked(self):
-        if self._frame_size is None or self._camera_geometry_fault:
-            return False
-        calibration = self._color_calibration
-        matching = bool(calibration and
-                        (calibration["width"], calibration["height"]) == self._frame_size and
-                        calibration["frame_id"] == self._frame_id)
-        if matching and self._declared_color_geometry is None:
-            self._declared_color_geometry = {
-                k: v for k, v in calibration.items() if k != "stamp_ms"}
-        if not self._require_camera_info:
-            return True
-        return matching
-
     def _encode_loop(self):
         """Separate thread: encode and publish the latest frame. Always processes newest, skips stale."""
         np = self._np
@@ -1307,8 +1263,6 @@ else:
                 # previous write outlives the bounded start-time join.
                 with self._frame_lock:
                     if not self._running or generation != self._frame_generation:
-                        continue
-                    if self._camera_geometry_fault:
                         continue
                     size = (int(msg.width), int(msg.height))
                     previous_size = self._frame_size
@@ -1423,45 +1377,34 @@ else:
 
     def _info(self) -> dict:
         from common.camera_info import build
-        from camera_geometry import color_camera_declaration
 
         with self._frame_lock:
             running, size = self._running, self._frame_size
             frame_id, error = self._frame_id, self._last_encode_error
-            calibration = self._color_calibration if not self._camera_geometry_fault else None
-            ready = bool(running and self._metadata_ready_locked())
-        declaration = color_camera_declaration(
-            calibration, topic=self._topic, format="image/jpeg",
-            source_size=size, output_size=size, frame_id=frame_id,
+        declaration = build(
+            topic=self._topic, id="x-humanoid/tianyi2.0/head/color",
+            format="image/jpeg", width=size[0] if size else None,
+            height=size[1] if size else None, source="unknown",
             pipeline=["x-humanoid/tianyi2.0/camera_head"],
             vendor={"input_topic": "/ob_camera_head/color/image_raw", "frame_id": frame_id})
-        if declaration is None:
-            declaration = build(
-                topic=self._topic, id="x-humanoid/tianyi2.0/head/color",
-                format="image/jpeg", width=size[0] if size else None,
-                height=size[1] if size else None, source="unknown",
-                pipeline=["x-humanoid/tianyi2.0/camera_head"],
-                vendor={"input_topic": "/ob_camera_head/color/image_raw", "frame_id": frame_id})
-        return {"state": ("running" if ready else "loading") if running else "idle",
-                "ready": ready,
+        return {"state": ("running" if size else "loading") if running else "idle",
+                "ready": bool(running and size),
                 "topic_out": [{"topic": self._topic, "format": "image/jpeg"}],
                 "camera_info": [declaration], "source_frame_id": frame_id,
                 "last_encode_error": error,
-                "camera_info_note": ("K、D 来自本次匹配的厂商 color/camera_info。"
-                                     if declaration["K"] is not None else
-                                     "尚无与当前 RGB 尺寸及坐标系匹配的 CameraInfo，几何参数保持未知。")}
+                "camera_info_note": "宽高来自本次成功发布的 RGB 帧；K、视场角及与硬件深度的注册关系未知。"}
 
     def _wait_for_first_frame(self, generation: int) -> bool:
         deadline = time.monotonic() + self._START_FRAME_TIMEOUT_S
         with self._frame_ready:
             while (self._running and generation == self._frame_generation
-                   and not self._metadata_ready_locked()):
+                   and self._frame_size is None):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
                 self._frame_ready.wait(remaining)
             return bool(self._running and generation == self._frame_generation
-                        and self._metadata_ready_locked())
+                        and self._frame_size is not None)
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
@@ -1486,11 +1429,11 @@ else:
                 if not self._running or generation != self._frame_generation:
                     return {"state": "idle", "message": "camera start cancelled"}
                 with self._frame_lock:
-                    ready = self._metadata_ready_locked()
+                    ready = self._frame_size is not None
                 if ready:
                     return self._info()
                 self.stop()
-            return {"state": "error", "error": "no RGB frame or matching required CameraInfo during camera startup"}
+            return {"state": "error", "error": "no RGB frame was published during camera startup"}
         if action == "stop":
             self.stop()
             return {"state": "idle"}
@@ -2004,20 +1947,8 @@ class DepthCameraPlugin:
     Cropping, compression, and the synchronous socket-bridge write all run on
     one dedicated worker, never on either ROS executor.
     """
-    _START_GEOMETRY_TIMEOUT_S = 10.0
-
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False
-        self._alignment = plugin_config.get("alignment", "native")
-        if self._alignment not in ("native", "vendor_hw_d2c"):
-            raise ValueError("camera_depth.alignment must be native or vendor_hw_d2c")
-        self._color_calibration = None
-        self._camera_info_subscription = None
-        self._camera_declaration = None
-        self._geometry_revision = 0
-        self._declared_color_geometry = None
-        self._camera_geometry_fault = ""
-        self._geometry_problem = "waiting for a depth frame and matching color CameraInfo"
         # Legacy Navi binds /visual_depth before consulting the ROS graph.
         # This is still hardware depth; the suffix is a wire-role convention.
         self._topic = f"/{namespace}/camera/head/depth/visual_depth"
@@ -2097,11 +2028,6 @@ class DepthCameraPlugin:
         if self._subscription is None:
             self._subscription = self._sub_node.create_subscription(
                 Image, "/ob_camera_head/depth/image_raw", self._on_image, ingress_qos)
-        if self._alignment == "vendor_hw_d2c" and self._camera_info_subscription is None:
-            from sensor_msgs.msg import CameraInfo
-            self._camera_info_subscription = self._sub_node.create_subscription(
-                CameraInfo, "/ob_camera_head/color/camera_info",
-                self._on_color_camera_info, latest_qos)
         with self._frame_ready:
             self._generation += 1
             self._running = True
@@ -2111,11 +2037,6 @@ class DepthCameraPlugin:
             self._invalid_frames = self._stale_frames = self._coalesced_frames = 0
             self._publish_errors = 0
             self._source_geometry = self._latest_image = None
-            self._color_calibration = self._camera_declaration = None
-            self._geometry_revision += 1
-            self._declared_color_geometry = None
-            self._camera_geometry_fault = ""
-            self._geometry_problem = "waiting for a depth frame and matching color CameraInfo"
             self._next_publish_due = 0.0
             self._last_transform_ms = self._max_transform_ms = 0.0
             self._last_compress_ms = self._max_compress_ms = 0.0
@@ -2150,61 +2071,8 @@ class DepthCameraPlugin:
                 self._running = False
                 self._generation += 1
                 self._latest_image = None
-                self._color_calibration = self._camera_declaration = None
-                self._source_geometry = None
                 self._next_publish_due = 0.0
                 self._frame_ready.notify_all()
-
-    def _on_color_camera_info(self, msg):
-        from camera_geometry import camera_info_snapshot
-
-        snapshot = camera_info_snapshot(msg)
-        with self._frame_ready:
-            if not self._running:
-                return
-            geometry = {k: v for k, v in (snapshot or {}).items() if k != "stamp_ms"}
-            previous = {k: v for k, v in (self._color_calibration or {}).items()
-                        if k != "stamp_ms"}
-            if (snapshot is not None and self._declared_color_geometry is not None
-                    and geometry != self._declared_color_geometry):
-                self._camera_geometry_fault = "color calibration changed; restart depth and downstream cards"
-            if geometry != previous:
-                self._camera_declaration = None
-                self._geometry_revision += 1
-            self._color_calibration = snapshot
-            if self._camera_geometry_fault:
-                self._geometry_problem = self._camera_geometry_fault
-            elif snapshot is None:
-                self._geometry_problem = "invalid color CameraInfo"
-            self._frame_ready.notify_all()
-
-    def _color_declaration_for_frame(self, msg):
-        from camera_geometry import color_camera_declaration
-
-        with self._frame_ready:
-            if self._camera_geometry_fault:
-                return None
-            calibration = self._color_calibration
-        return color_camera_declaration(
-            calibration, topic=self._topic, format="image/depth-zlib",
-            source_size=(int(msg.width), int(msg.height)), output_size=(640, 480),
-            frame_id=str(getattr(msg.header, "frame_id", "")),
-            pipeline=["x-humanoid/tianyi2.0/camera_depth", "full-frame-resize"],
-            vendor={"input_topic": "/ob_camera_head/depth/image_raw",
-                    "registration_source": "configured-vendor-hw-d2c",
-                    "pixel_alignment_verified": False})
-
-    def _wait_for_geometry(self, generation):
-        deadline = time.monotonic() + self._START_GEOMETRY_TIMEOUT_S
-        with self._frame_ready:
-            while (self._running and generation == self._generation and
-                   self._camera_declaration is None):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._frame_ready.wait(remaining)
-            return bool(self._running and generation == self._generation and
-                        self._camera_declaration is not None)
 
     def _on_image(self, msg):
         with self._frame_ready:
@@ -2266,18 +2134,6 @@ class DepthCameraPlugin:
             self._record_stale(generation)
             return
         try:
-            declaration = None
-            geometry_revision = None
-            if self._alignment == "vendor_hw_d2c":
-                with self._frame_ready:
-                    geometry_revision = self._geometry_revision
-                declaration = self._color_declaration_for_frame(msg)
-                if declaration is None:
-                    with self._frame_ready:
-                        if generation == self._generation:
-                            self._geometry_problem = (self._camera_geometry_fault or
-                                "missing color CameraInfo or depth size/frame does not match it")
-                    return
             dashboard = self._to_dashboard_depth(msg)
             if dashboard is None:
                 with self._frame_ready:
@@ -2310,9 +2166,6 @@ class DepthCameraPlugin:
             with self._frame_ready:
                 if not self._running or generation != self._generation:
                     return
-                if (geometry_revision is not None and
-                        geometry_revision != self._geometry_revision):
-                    return
                 publisher = self._pub
             bridge_started = time.monotonic()
             accepted = publisher.publish(out)
@@ -2322,9 +2175,9 @@ class DepthCameraPlugin:
             bridge_ms = (finished - bridge_started) * 1000
             width, height = int(msg.width), int(msg.height)
             crop_width, crop_height = width, height
-            if self._alignment == "native" and width * 3 > height * 4:
+            if width * 3 > height * 4:
                 crop_width = height * 4 // 3
-            elif self._alignment == "native" and width * 3 < height * 4:
+            elif width * 3 < height * 4:
                 crop_height = width * 3 // 4
             geometry = {
                 "width": width, "height": height,
@@ -2337,16 +2190,8 @@ class DepthCameraPlugin:
             with self._frame_ready:
                 if not self._running or generation != self._generation:
                     return
-                if (geometry_revision is not None and
-                        geometry_revision != self._geometry_revision):
-                    return
                 previous = self._last_published_at if self._forwarded_frames else None
                 self._source_geometry = geometry
-                if declaration is not None:
-                    self._camera_declaration = declaration
-                    self._declared_color_geometry = {
-                        k: v for k, v in self._color_calibration.items() if k != "stamp_ms"}
-                    self._geometry_problem = ""
                 self._last_published_at = finished
                 if self._first_published_at is None:
                     self._first_published_at = finished
@@ -2372,7 +2217,6 @@ class DepthCameraPlugin:
                     self._last_publish_interval_ms = interval_ms
                     self._max_publish_interval_ms = max(
                         self._max_publish_interval_ms or 0.0, interval_ms)
-                self._frame_ready.notify_all()
         except Exception as exc:
             with self._frame_ready:
                 if generation == self._generation:
@@ -2398,11 +2242,11 @@ class DepthCameraPlugin:
         depth = raw[:needed].reshape(height, step)[:, :width * 2].view(self._np.uint16).reshape(height, width)
         if width == 640 and height == 480:
             return depth
-        if self._alignment == "native" and width * 3 > height * 4:
+        if width * 3 > height * 4:
             crop_width = height * 4 // 3
             left = (width - crop_width) // 2
             depth = depth[:, left:left + crop_width]
-        elif self._alignment == "native" and width * 3 < height * 4:
+        elif width * 3 < height * 4:
             crop_height = width * 3 // 4
             top = (height - crop_height) // 2
             depth = depth[top:top + crop_height, :]
@@ -2414,42 +2258,20 @@ class DepthCameraPlugin:
         # ``running`` state and Agent Core timed out waiting for an idle ack.
         if action == "start":
             try:
-                with self._publish_lock:
-                    self.start()
-                    generation = self._generation
+                self.start()
             except Exception as exc:
                 return {"state": "error", "error": str(exc)}
-            if self._alignment == "vendor_hw_d2c" and not self._wait_for_geometry(generation):
-                with self._publish_lock:
-                    if not self._running or generation != self._generation:
-                        return {"state": "idle", "message": "depth start cancelled"}
-                    with self._frame_ready:
-                        ready = self._camera_declaration is not None
-                        problem = self._geometry_problem
-                    if not ready:
-                        self.stop()
-                        return {"state": "error", "error": "depth geometry startup failed: " + problem}
         elif action == "stop":
             self.stop()
         now = time.monotonic()
         duration = now - self._first_published_at if self._first_published_at is not None else 0
         geometry = self._source_geometry
-        with self._frame_ready:
-            declaration = self._camera_declaration
-            geometry_problem = self._geometry_problem
-        ready = self._running and (self._alignment == "native" or declaration is not None)
-        result = {"state": ("running" if ready else "loading") if self._running else "idle",
-                "ready": bool(ready),
+        return {"state": "running" if self._running else "idle",
                 "topic_out": [{"topic": self._topic, "format": "image/depth-zlib"}],
                 "input_topic": "/ob_camera_head/depth/image_raw", "target_hz": self._max_hz,
                 "source_geometry": dict(geometry) if geometry else None,
-                "alignment": self._alignment,
-                "geometry_problem": geometry_problem if self._alignment == "vendor_hw_d2c" else "",
-                "registration_to_color": ("vendor-declared-hw-d2c"
-                                          if self._alignment == "vendor_hw_d2c" else "unknown"),
-                "registration_note": ("按配置的厂商 HW D2C 使用彩色内参；保留全幅视野，尚未做像素级叠加验证。"
-                                      if self._alignment == "vendor_hw_d2c" else
-                                      "输入为厂商原生 depth/image_raw；仅作居中裁剪及缩放，未验证已投影到 RGB 视角。"),
+                "registration_to_color": "unknown",
+                "registration_note": "输入为厂商原生 depth/image_raw；仅作居中裁剪及缩放，未验证已投影到 RGB 视角。",
                 "compression_backend": self._compression_backend,
                 "compression_level": 1,
                 "received_frames": self._received_frames, "published_frames": self._forwarded_frames,
@@ -2481,9 +2303,6 @@ class DepthCameraPlugin:
                 "last_payload_bytes": self._last_payload_bytes,
                 "publish_errors": self._publish_errors,
                 "last_error": self._last_error}
-        if declaration is not None:
-            result["camera_info"] = [declaration]
-        return result
 
 
 class PointCloudPlugin:

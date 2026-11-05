@@ -26,8 +26,6 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parents[1]))
-
 
 # ── harness ───────────────────────────────────────────────────────────────────
 
@@ -42,10 +40,9 @@ class _Publisher:
 
 
 class _Subscription:
-    def __init__(self, topic, callback, qos):
+    def __init__(self, topic, callback):
         self.topic = topic
         self.callback = callback
-        self.qos = qos
         self.destroyed = False
 
 
@@ -62,7 +59,7 @@ class _Node:
         return pub
 
     def create_subscription(self, msg_type, topic, callback, qos):
-        sub = _Subscription(topic, callback, qos)
+        sub = _Subscription(topic, callback)
         self.subscriptions_created.append(sub)
         return sub
 
@@ -118,10 +115,10 @@ def _load_device_module():
 
     class QoSProfile:
         def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
+            pass
 
     class Enum:
-        BEST_EFFORT, RELIABLE, KEEP_LAST, VOLATILE = 1, 2, 3, 4
+        BEST_EFFORT = RELIABLE = KEEP_LAST = VOLATILE = 0
 
     rclpy.node.Node = _Node
     rclpy.qos.QoSProfile = QoSProfile
@@ -138,7 +135,7 @@ def _load_device_module():
 
     sensor_msgs = types.ModuleType("sensor_msgs")
     sensor_msgs.msg = types.ModuleType("sensor_msgs.msg")
-    for name in ("Image", "CompressedImage", "CameraInfo"):
+    for name in ("Image", "CompressedImage"):
         setattr(sensor_msgs.msg, name, type(name, (), {}))
     sys.modules.update({"sensor_msgs": sensor_msgs, "sensor_msgs.msg": sensor_msgs.msg})
 
@@ -302,7 +299,7 @@ def test_restart_reuses_both_ros_endpoints(camera):
     camera.plugin.dispatch("start", {})
 
     assert len(camera.plugin._pub_node.publishers_created) == 1
-    assert len(camera.plugin._sub_node.subscriptions_created) == 2
+    assert len(camera.plugin._sub_node.subscriptions_created) == 1
     assert camera.plugin._subscription is first_sub
 
 
@@ -312,7 +309,7 @@ def test_many_quick_cycles_keep_publishing(camera):
     for _ in range(5):
         camera.plugin.dispatch("stop", {})
         camera.plugin.dispatch("start", {})
-    assert len(camera.plugin._sub_node.subscriptions_created) == 2
+    assert len(camera.plugin._sub_node.subscriptions_created) == 1
     assert len(camera.plugin._pub_node.publishers_created) == 1
     before = len(camera._pub.published)
     camera.feed()
@@ -341,7 +338,7 @@ def test_repeated_start_does_not_stack_workers_or_endpoints(camera):
     for _ in range(3):
         camera.plugin.dispatch("start", {})
     assert len(camera.plugin._pub_node.publishers_created) == 1
-    assert len(camera.plugin._sub_node.subscriptions_created) == 2
+    assert len(camera.plugin._sub_node.subscriptions_created) == 1
     # Counted as a delta: a stacked worker is unreachable from _encode_thread,
     # so only the live-thread set can catch it.
     assert len(_live_encode_loops() - before) == 1, \
