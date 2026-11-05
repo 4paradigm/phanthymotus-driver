@@ -203,7 +203,7 @@ def test_stale_data_is_withheld_even_if_socket_stays_open():
         assert skeleton["joints"] == []
         assert not skeleton["available"]
         angles = DobotSensors({}, client=client).payload("joint_angles")
-        assert not angles["available"] and angles["angles_deg"] == []
+        assert not angles["available"] and all(angles[f"joint{i}_deg"] is None for i in range(1, 7))
     finally:
         client.stop()
 
@@ -244,17 +244,16 @@ def test_joint_angle_json_reports_actual_angles_independently_of_model(robot_typ
         ]
         angles = plugin.payload("joint_angles")
         assert angles["available"]
-        assert set(angles) == {"timestamp_ms", "available", "joint_names", "angles_deg"}
+        assert set(angles) == {"timestamp_ms", "available", *(f"joint{i}_deg" for i in range(1, 7))}
         assert isinstance(angles["timestamp_ms"], int)
-        assert angles["joint_names"] == [f"joint{i}" for i in range(1, 7)]
-        assert angles["angles_deg"] == [42, -30, 0, 0, 0, 0]
+        assert [angles[f"joint{i}_deg"] for i in range(1, 7)] == [42, -30, 0, 0, 0, 0]
         assert calls == [("127.0.0.1", 30004)]
-        angles["angles_deg"][0] = -999
+        angles["joint1_deg"] = -999
         assert client.snapshot()["data"]["joint_state"]["q_actual"][0] == 42
     finally:
         client.stop()
     assert plugin.payload("joint_angles")["available"] is False
-    assert plugin.payload("joint_angles")["angles_deg"] == []
+    assert all(plugin.payload("joint_angles")[f"joint{i}_deg"] is None for i in range(1, 7))
 
 
 @pytest.mark.parametrize("code,configured", [(None, ""), (130, ""), (113, "CR5A"), (130, "CR3A")])
@@ -346,10 +345,10 @@ def test_publish_all_health_states_without_network_calls():
         assert not pub.messages[0]["available"]
         if name == "joints":
             assert set(pub.messages[0]) == ({"timestamp_ms", "available", "joints"} if index == 0
-                                          else {"timestamp_ms", "available", "joint_names", "angles_deg"})
+                                          else {"timestamp_ms", "available", *(f"joint{i}_deg" for i in range(1, 7))})
         else:
             assert pub.messages[0]["regions"] == dict.fromkeys(("arm", "j4", "j5", "j6"))
-    assert plugin._publishers[("joints", 1)].messages[0]["angles_deg"] == []
+    assert all(plugin._publishers[("joints", 1)].messages[0][f"joint{i}_deg"] is None for i in range(1, 7))
 
 
 def test_ros_start_registers_both_joint_outputs_and_publishes_one_feedback_sample(monkeypatch):
@@ -359,8 +358,10 @@ def test_ros_start_registers_both_joint_outputs_and_publishes_one_feedback_sampl
     class Publisher:
         def __init__(self):
             self.messages = []
+            self.raw_messages = []
 
         def publish(self, message):
+            self.raw_messages.append(message.data)
             self.messages.append(json.loads(message.data))
 
     class Node:
@@ -409,9 +410,12 @@ def test_ros_start_registers_both_joint_outputs_and_publishes_one_feedback_sampl
         assert samples == [1]
         skeleton = publishers["/dobot_cra/state/joints"].messages[0]
         angles = publishers["/dobot_cra/state/joint_angles"].messages[0]
-        assert angles["joint_names"] == [joint["name"] for joint in skeleton["joints"]]
-        assert [math.radians(angle) for angle in angles["angles_deg"]] == [joint["q"] for joint in skeleton["joints"]]
-        assert angles["angles_deg"][0] == 1
+        assert [math.radians(angles[f"{joint['name']}_deg"]) for joint in skeleton["joints"]] == [joint["q"] for joint in skeleton["joints"]]
+        assert angles["joint1_deg"] == 1
+        angle_lines = publishers["/dobot_cra/state/joint_angles"].raw_messages[0].splitlines()
+        assert [line.strip().split(':')[0] for line in angle_lines if '_deg"' in line] == [
+            f'"joint{i}_deg"' for i in range(1, 7)
+        ]
     finally:
         plugin.stop()
 

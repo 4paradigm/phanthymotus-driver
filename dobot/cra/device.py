@@ -60,20 +60,22 @@ class DobotSensors:
         schema = action_schema({
             "info": ([], "查看卡片功能、参数及输出口定义，不读取运行状态"),
             "get_status": ([], "查询当前触发状态和最近设置请求；请求记录不等于配置读回"),
-            "set_enabled": (["enabled", "confirm_change"], "提交安全皮肤总开关；关闭会移除皮肤接近保护，不能用于碰撞复位"),
-            "set_sensitivity": (["part", "level", "confirm_change"], "提交指定部位灵敏度；0 关闭，1 低，2 中，3 高"),
+            "enable": (["confirm_change"], "开启安全皮肤总开关；不改变各部位灵敏度，不执行机械臂上使能"),
+            "disable": (["confirm_change"], "关闭安全皮肤总开关；移除皮肤接近保护，不执行机械臂下使能或碰撞复位"),
+            "set_sensitivity": (["part", "level", "confirm_change"], "设置部位灵敏度：0 关闭、1 ≤5 cm、2 ≤10 cm、3 ≤15 cm；手册范围，不同部位有区别"),
             "start": ([], "启动实时触发状态输出，不发送设置命令"),
             "stop": ([], "关闭共享命令连接，不修改安全皮肤设置"),
             "config": ([], "确认卡片配置；共享 IP/端口通过 joints 配置"),
         }, {
-            "enabled": {"type": "boolean", "description": "安全皮肤总开关"},
             "part": {"type": "string", "enum": list(PARTS.values()),
                      "oneOf": [{"const": name, "title": PART_LABELS[code]} for code, name in PARTS.items()],
                      "description": "选择安全皮肤部位：小臂、J4（第4关节）、J5（第5关节）、J6（第6关节）"},
             "level": {"type": "integer", "enum": [0, 1, 2, 3],
-                      "oneOf": [{"const": code, "title": label} for code, label in enumerate(("关闭", "低灵敏度", "中灵敏度", "高灵敏度"))],
-                      "description": "安全皮肤灵敏度：关闭、低、中、高"},
-            "confirm_change": {"type": "boolean", "description": "确认本次安全设置变更；每次写请求必须为 true"},
+                      "oneOf": [{"const": code, "title": label} for code, label in enumerate(("关闭该部位", "低灵敏度（接近距离 ≤5 cm）", "中灵敏度（接近距离 ≤10 cm）", "高灵敏度（接近距离 ≤15 cm）"))],
+                      "description": "手册标称接近范围：低 ≤5 cm、中 ≤10 cm、高 ≤15 cm；不同部位有区别，对非导体感应较弱，不是实时测距值"},
+            "confirm_change": {"type": "boolean", "enum": [False, True],
+                               "oneOf": [{"const": False, "title": "未确认（不执行）"}, {"const": True, "title": "确认执行本次设置"}],
+                               "default": False, "description": "选择“确认执行本次设置”才会提交；未确认不会发送命令"},
         })
         schema["x-is-dangerous"] = True
         schema["x-resource"] = "arm"
@@ -156,9 +158,11 @@ class DobotSensors:
         state = snapshot["data"]
         result = {"timestamp_ms": int(time.time() * 1000), "available": state is not None}
         if name == "joint_angles":
-            angles = [] if state is None else list(state["joint_state"]["q_actual"])
             return {
-                **result, "joint_names": list(JOINT_NAMES), "angles_deg": angles,
+                **result, **{
+                    f"{joint}_deg": None if state is None else state["joint_state"]["q_actual"][index]
+                    for index, joint in enumerate(JOINT_NAMES)
+                },
             }
         if name == "joints":
             skeleton = {**result, "joints": [], "available": False}
@@ -193,7 +197,8 @@ class DobotSensors:
             for (name, index), publisher in self._publishers.items():
                 message = self._message_type()
                 output_name = "joint_angles" if name == "joints" and index == 1 else name
-                message.data = json.dumps(self.payload(output_name, snapshot), ensure_ascii=False, allow_nan=False)
+                message.data = json.dumps(self.payload(output_name, snapshot), ensure_ascii=False, allow_nan=False,
+                                          indent=2 if output_name == "joint_angles" else None)
                 publisher.publish(message)
 
     def dispatch(self, action, args):

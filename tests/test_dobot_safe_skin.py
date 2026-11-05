@@ -109,13 +109,23 @@ def test_merged_skin_card_advertises_stream_for_every_lifecycle_action():
     tool = next(tool for tool in plugin.get_tools() if tool['name'] == 'safe_skin_control')
     assert tool['topic_out'] == output
     assert set(tool['inputSchema']['properties']['action']['enum']) == {
-        'start', 'stop', 'config', 'info', 'get_status', 'set_enabled', 'set_sensitivity',
+        'start', 'stop', 'config', 'info', 'get_status', 'enable', 'disable', 'set_sensitivity',
     }
     part = tool['inputSchema']['properties']['part']
     assert part['type'] == 'string' and part['enum'] == ['arm', 'j4', 'j5', 'j6']
     assert {item['const']: item['title'] for item in part['oneOf']} == {
         'arm': '小臂', 'j4': 'J4（第4关节）', 'j5': 'J5（第5关节）', 'j6': 'J6（第6关节）',
     }
+    schema = tool['inputSchema']
+    assert 'enabled' not in schema['properties']
+    assert 'oneOf' not in schema['properties']['action']
+    for action in ('enable', 'disable'):
+        assert schema['x-action-params'][action]['params'] == ['confirm_change']
+    confirmation = schema['properties']['confirm_change']
+    assert confirmation['enum'] == [False, True] and confirmation['default'] is False
+    assert [item['title'] for item in schema['properties']['level']['oneOf']] == [
+        '关闭该部位', '低灵敏度（接近距离 ≤5 cm）', '中灵敏度（接近距离 ≤10 cm）', '高灵敏度（接近距离 ≤15 cm）',
+    ]
 
 
 def test_joints_config_closes_dashboard_and_clears_old_state_without_sending_commands():
@@ -133,7 +143,7 @@ def test_joints_config_closes_dashboard_and_clears_old_state_without_sending_com
     assert control.snapshot()['last_request'] is None
     assert not control.snapshot()['dashboard_connected']
     assert plugin.payload('joints')['joints'] == []
-    assert plugin.payload('joint_angles')['angles_deg'] == []
+    assert all(plugin.payload('joint_angles')[f'joint{i}_deg'] is None for i in range(1, 7))
     assert not plugin.payload('safe_skin_control')['available']
 
 
@@ -154,7 +164,8 @@ def test_invalid_joints_config_preserves_current_endpoint_and_dashboard(changed)
 @pytest.mark.parametrize('enabled', [True, False])
 def test_sdk_global_switch_submission_and_unknown_readback(enabled):
     feedback, dashboard, control, calls = setup_control()
-    result = control.execute('set_enabled', dict(enabled=enabled, confirm_change=True))
+    plugin = DobotSensors({}, client=feedback, controller=control)
+    result = plugin.dispatch('enable' if enabled else 'disable', {'_tool_name': 'safe_skin_control', 'confirm_change': True})
     assert dashboard.commands == [f'EnableSafeSkin({int(enabled)})']
     assert calls == [('127.0.0.1', 29999)]
     assert result['result_id'] == 1 and result['state'] == 'submitted'
@@ -181,7 +192,7 @@ def test_request_control_is_explicit_and_never_enables_robot():
     _, dashboard, control, _ = setup_control()
     assert control.execute_system('request_control', {'confirm_change': True})['state'] == 'tcp_control_requested'
     assert dashboard.commands == ['RequestControl()']
-    control.execute('set_enabled', dict(enabled=True, confirm_change=True))
+    control.execute('enable', dict(confirm_change=True))
     assert dashboard.commands == ['RequestControl()', 'EnableSafeSkin(1)']
     assert control.snapshot('systemcontrol')['tcp_control_requested'] is True
     assert 'tcp_control_requested' not in control.snapshot()
@@ -209,7 +220,11 @@ def test_named_skin_parts_and_canvas_level_values_use_correct_sdk_mapping(part, 
 
 
 @pytest.mark.parametrize('action,args', [
-    ('set_enabled', {'enabled': True}),
+    ('enable', {}),
+    ('disable', {}),
+    ('enable', {'confirm_change': 'true'}),
+    ('disable', {'confirm_change': False}),
+    ('enable', {'confirm_change': 1}),
     ('set_enabled', {'enabled': 1, 'confirm_change': True}),
     ('set_enabled', {'enabled': 'false', 'confirm_change': True}),
     ('set_sensitivity', {'part': True, 'level': 1, 'confirm_change': True}),
@@ -233,16 +248,18 @@ def test_invalid_or_unsupported_actions_never_open_connection(action, args):
     ('brake_released', [False, False, True, False, False, False]),
     ('arm_approach_state', 1), ('j4_approach_state', 1), ('j5_approach_state', 1), ('j6_approach_state', 1),
 ])
-def test_settings_blocked_while_moving_triggered_or_unsafe(key, value):
+@pytest.mark.parametrize('action', ['enable', 'disable'])
+def test_settings_blocked_while_moving_triggered_or_unsafe(key, value, action):
     feedback, dashboard, control, calls = setup_control()
     feedback.sample['data'][key] = value
     with pytest.raises(RuntimeError):
-        control.execute('set_enabled', {'enabled': False, 'confirm_change': True})
+        control.execute(action, {'confirm_change': True})
     assert calls == [] and dashboard.commands == []
 
 
 @pytest.mark.parametrize('change', ['stale', 'disconnected', 'no_data'])
-def test_settings_require_fresh_feedback(change):
+@pytest.mark.parametrize('action', ['enable', 'disable'])
+def test_settings_require_fresh_feedback(change, action):
     feedback, dashboard, control, calls = setup_control()
     if change == 'stale':
         feedback.sample['stale'] = True
@@ -251,7 +268,7 @@ def test_settings_require_fresh_feedback(change):
     else:
         feedback.sample['data'] = None
     with pytest.raises(RuntimeError, match='fresh feedback'):
-        control.execute('set_enabled', {'enabled': True, 'confirm_change': True})
+        control.execute(action, {'confirm_change': True})
     assert calls == []
 
 
@@ -268,7 +285,7 @@ def test_state_is_rechecked_after_slow_connect():
     feedback, dashboard, control, _ = setup_control()
     dashboard.on_connect = lambda: feedback.sample['data'].update(running_status=1)
     with pytest.raises(RuntimeError):
-        control.execute('set_enabled', dict(enabled=True, confirm_change=True))
+        control.execute('enable', dict(confirm_change=True))
     assert dashboard.commands == [] and dashboard.closed
 
 
@@ -276,7 +293,7 @@ def test_state_is_rechecked_after_slow_connect():
 def test_rejected_setting_does_not_update_as_success_or_retry(code):
     _, dashboard, control, _ = setup_control(Dashboard(reply=f'{code},{{}},EnableSafeSkin(1);'))
     with pytest.raises(CommandRejected):
-        control.execute('set_enabled', dict(enabled=True, confirm_change=True))
+        control.execute('enable', dict(confirm_change=True))
     assert len(dashboard.commands) == 1
     assert control.snapshot()['last_request']['state'] == 'rejected'
     assert dashboard.closed
@@ -285,7 +302,7 @@ def test_rejected_setting_does_not_update_as_success_or_retry(code):
 def test_timeout_is_not_replayed_and_outcome_is_explicitly_unknown():
     _, dashboard, control, _ = setup_control(Dashboard(failure=TimeoutError('lost reply')))
     with pytest.raises(TimeoutError):
-        control.execute('set_enabled', dict(enabled=True, confirm_change=True))
+        control.execute('enable', dict(confirm_change=True))
     control.close()
     assert dashboard.commands == ['EnableSafeSkin(1)']
     assert control.snapshot()['last_request']['state'] == 'failed_or_outcome_unknown'
@@ -293,7 +310,7 @@ def test_timeout_is_not_replayed_and_outcome_is_explicitly_unknown():
 
 def test_old_ack_without_queue_id_is_not_claimed_executed():
     _, _, control, _ = setup_control(Dashboard(reply='0,{},EnableSafeSkin(1);'))
-    result = control.execute('set_enabled', dict(enabled=True, confirm_change=True))
+    result = control.execute('enable', dict(confirm_change=True))
     assert result['state'] == 'accepted_unverified' and result['result_id'] is None
     control.close()
 

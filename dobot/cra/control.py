@@ -221,11 +221,10 @@ class RobotController:
         # Validate everything before opening a Dashboard connection.
         if args.get("confirm_change") is not True:
             raise ValueError("confirm_change=true is required for each control request")
-        if action == "set_enabled":
-            if not isinstance(args.get("enabled"), bool):
-                raise ValueError("enabled must be a boolean")
-            command, parameters = "EnableSafeSkin", (int(args["enabled"]),)
-            requested = {"enabled": args["enabled"]}
+        if action in ("enable", "disable"):
+            enabled = action == "enable"
+            command, parameters = "EnableSafeSkin", (int(enabled),)
+            requested = {"enabled": enabled}
         elif action == "set_sensitivity":
             part, level = args.get("part"), args.get("level")
             if isinstance(part, str):

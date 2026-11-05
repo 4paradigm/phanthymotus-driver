@@ -21,21 +21,25 @@
 - `/dobot_cra/state/joints`，`sensor/skeleton`；只包含 `timestamp_ms/available/joints`，
   每个关节只包含 `name/q`，`q` 为弧度，关节名为 `joint1..joint6`。
 - `/dobot_cra/state/joint_angles`，`data/json`；`joints` 的第二个输出口，
-  只包含 `timestamp_ms/available/joint_names/angles_deg`；关节名称及实际转角按 J1–J6 排列，
-  `angles_deg` 单位为度，不重复输出弧度数组。
+  只包含 `timestamp_ms/available` 和 `joint1_deg` 至 `joint6_deg` 六个独立字段；
+  每个关节转角单独一行，单位为度，不重复输出名称数组或弧度数组。
 - `/dobot_cra/state/safe_skin`，`data/json`，属于 `safe_skin_control` 的输出口。
   保留原 topic 名称，画布中原有 `safe_skin` 连线需改接到 `safe_skin_control` 输出口。
 
 两个 `joints` 输出共用同一份反馈快照，不新增卡片或控制器连接。JSON 角度不依赖 URDF
-是否可用；实时数据可用时 `available=true`，断线或过期时为 `false`，角度数组为空。
+是否可用；实时数据可用时 `available=true`，断线或过期时为 `false`，六个角度均为 `null`。
 JSON 输出示例（数值为示例）：
 
 ```json
 {
   "timestamp_ms": 1793836800000,
   "available": true,
-  "joint_names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
-  "angles_deg": [90, -30, 0, 0, 0, 0]
+  "joint1_deg": 90,
+  "joint2_deg": -30,
+  "joint3_deg": 0,
+  "joint4_deg": 0,
+  "joint5_deg": 0,
+  "joint6_deg": 0
 }
 ```
 
@@ -46,7 +50,8 @@ JSON 输出示例（数值为示例）：
 关节数据流不再输出 IP/端口、连接/超时诊断、包计数、SDK 来源、型号来源及错误记录。
 骨架移除了 `idx/dq/degree` 等冗余字段，型号识别及错误说明保留在后台 `model` 资源中；
 无法匹配模型时骨架为 `available=false, joints=[]`。`config` 响应仍确认实际配置的 IP/端口，
-这些配置确认字段不混入实时输出。旧下游如依赖 `angles_rad`，请由 `angles_deg` 转换，
+这些配置确认字段不混入实时输出。旧下游如依赖 `joint_names/angles_deg` 数组，请改读对应的
+`joint1_deg` 至 `joint6_deg` 字段；如需弧度，请由各角度字段转换，
 骨架渲染器仍直接使用弧度 `q`。
 
 ## 卡片介绍与状态查询
@@ -117,13 +122,29 @@ JSON 输出示例（数值为示例）：
 | `info` | 无 | 平台内部卡片介绍、参数和输出口定义 |
 | `get_status` | 无 | 当前触发反馈、命令连接状态和最近设置请求 |
 | `start/config/stop` | 无 | 返回 JSON 输出口定义；start 读取反馈，stop 关闭命令连接，均不修改皮肤设置 |
-| `set_enabled` | `enabled=true/false`, `confirm_change=true` | `EnableSafeSkin(1/0)` |
+| `enable` | `confirm_change=true` | `EnableSafeSkin(1)`，开启安全皮肤总开关，不改变各部位灵敏度 |
+| `disable` | `confirm_change=true` | `EnableSafeSkin(0)`，关闭安全皮肤总开关，不是机械臂下使能或碰撞复位 |
 | `set_sensitivity` | `part=arm/j4/j5/j6`, `level=0/1/2/3`, `confirm_change=true` | 内部映射后调用 `SetSafeSkin(part,level)` |
 
 部位下拉框显示“小臂、J4（第4关节）、J5（第5关节）、J6（第6关节）”，
 对应参数值 `arm/j4/j5/j6`，SDK 使用的 3/4/5/6 编号只在内部映射。
 请求记录返回 `part` 名称及中文 `part_name`，不再只输出数字部位。
-灵敏度下拉框显示“关闭、低灵敏度、中灵敏度、高灵敏度”，对应等级 0/1/2/3。
+总开关不再要求输入 `enabled`：选择 `enable` 或 `disable`，将 `confirm_change` 下拉框选择为
+“确认执行本次设置”后提交即可。默认“未确认（不执行）”，不会发送设置命令。
+旧的 `set_enabled` 动作已移除，调用方需改用 `enable/disable`。
+
+灵敏度下拉框直接标出接近距离，依据《DOBOT 安全皮肤用户手册 (CRA)》V1.4（2026-01-22）
+第 4.1 节（正文第 5 页）：
+
+| level | 下拉框显示 |
+|---|---|
+| 0 | 关闭该部位 |
+| 1 | 低灵敏度（接近距离 ≤5 cm） |
+| 2 | 中灵敏度（接近距离 ≤10 cm） |
+| 3 | 高灵敏度（接近距离 ≤15 cm） |
+
+这是手册给出的档位范围，不是实时距离读数。手册参数表另注明不同部位感知距离有区别，
+感知目标为人体、金属、液体等导体，对非导体感应能力较弱。
 原有直接 API 调用的整数部位编号仍可解析，但新卡片不再展示数字部位选项。
 每次写操作都要明确确认，平台按 actuator 危险操作处理。驱动要求新鲜反馈、机器人停止，
 没有报警、碰撞、皮肤触发、拖拽、暂停或抱闸松开。

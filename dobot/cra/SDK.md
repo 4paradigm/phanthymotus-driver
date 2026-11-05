@@ -88,7 +88,8 @@ flags and nullable inferred power state. Unavailable feedback yields null values
 
 Joint streams are intentionally compact: the skeleton carries timestamp,
 availability and name/q pairs in radians; the numeric JSON carries timestamp,
-availability, joint names and angles_deg. Transport diagnostics, model metadata,
+availability and six independent degree fields, joint1_deg through joint6_deg,
+one per line. Unavailable angles are null. Transport diagnostics, model metadata,
 velocities and duplicate angle representations are not streamed. The model
 resource still validates robot identity and exposes geometry errors; unmatched
 models never publish skeleton joint positions.
