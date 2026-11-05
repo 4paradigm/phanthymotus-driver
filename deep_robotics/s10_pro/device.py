@@ -149,6 +149,12 @@ class S10Nodes:
                          ],
         }))
         self._discover_camera_aliases = bool(config.get("camera_discovery", True))
+        self._camera_source_mode = str(config.get("camera_source", "ros")).lower()
+        self._rtsp_sources = dict(config.get("camera_rtsp", {}))
+        if self._camera_source_mode not in {"ros", "rtsp"}:
+            raise ValueError("camera_source must be ros or rtsp")
+        if self._camera_source_mode == "rtsp" and set(self._rtsp_sources) != set(CAMERA_LANES):
+            raise ValueError("camera_rtsp must define front, rear, left, and right camera lanes")
         for lane in CAMERA_LANES:
             camera_topics.setdefault(lane, [])
         self.topics.update({key: {"topic": base + key, "format": "image/jpeg"}
@@ -172,12 +178,13 @@ class S10Nodes:
         self.media_workers = None
         if config.get("media_workers", False):
             self.media_workers = MediaWorkers(self._handle_media_result)
-            for key, configured_topics in camera_topics.items():
-                source_topics = [configured_topics] if isinstance(configured_topics, str) else configured_topics
-                if source_topics and all(topic.endswith("/compressed") for topic in source_topics):
-                    self.media_workers.add_compressed_camera(key)
-                else:
-                    self.media_workers.add_camera(key)
+            if self._camera_source_mode == "ros":
+                for key, configured_topics in camera_topics.items():
+                    source_topics = [configured_topics] if isinstance(configured_topics, str) else configured_topics
+                    if source_topics and all(topic.endswith("/compressed") for topic in source_topics):
+                        self.media_workers.add_compressed_camera(key)
+                    else:
+                        self.media_workers.add_camera(key)
             for lane in LIDAR_LANES:
                 self.media_workers.add_lidar(lane)
         topics = config.get("topics", {})
@@ -217,6 +224,8 @@ class S10Nodes:
             "lidar_map": topics.get("lidar_map", "/ACCUMULATED_POINTS_MAP"),
         }
         self._source_topics.update({key: value for key, value in camera_topics.items()})
+        if self._camera_source_mode == "rtsp":
+            self._source_topics.update(self._rtsp_sources)
         self.robot.create_subscription(Imu, topics.get("imu", "/IMU"), self._forward_imu, stream_qos)
         self.robot.create_subscription(JointsData, topics.get("joints", "/JOINTS_DATA_10HZ"), self._forward_joints, stream_qos)
         self.robot.create_subscription(BatteryData, topics.get("battery", "/BATTERY_DATA"), self._forward_battery, stream_qos)
@@ -234,7 +243,7 @@ class S10Nodes:
         self._configured_camera_lanes = {
             topic: key for key, values in camera_topics.items()
             for topic in ([values] if isinstance(values, str) else values)
-        }
+        } if self._camera_source_mode == "ros" else {}
         # Reserve lane assignments while scanning the ROS graph, but only let
         # a lane's first callback claim its active source. This avoids assigning
         # several newly discovered image topics to one lane before any frame arrives.
@@ -288,6 +297,12 @@ class S10Nodes:
               f"lidar_topics={lidar_subscriptions} lanes=6", flush=True)
         if hasattr(self.robot, "create_timer"):
             self._media_discovery_timer = self.robot.create_timer(2.0, self._scan_media_topics)
+        if self._camera_source_mode == "rtsp":
+            if self.media_workers is None:
+                raise ValueError("media_workers must be enabled for RTSP camera streams")
+            for lane, url in self._rtsp_sources.items():
+                self.media_workers.add_rtsp_camera(lane, url)
+                print(f"[rtsp] pulling {lane} from {url}", flush=True)
 
     def _scan_media_topics(self):
         """Discover actual image and point-cloud endpoints as robot nodes start."""
@@ -306,6 +321,8 @@ class S10Nodes:
             msg_type = (CompressedImage if "sensor_msgs/msg/CompressedImage" in types else
                         Image if "sensor_msgs/msg/Image" in types else None)
             if msg_type is None:
+                continue
+            if getattr(self, "_camera_source_mode", "ros") == "rtsp":
                 continue
             # Do not require a publisher at discovery time. The S10 camera
             # process can register its topic before DDS endpoints become
@@ -487,15 +504,18 @@ class S10Nodes:
         with self._stream_lock:
             result = {key: dict(value) for key, value in self._stream_stats.items()}
         for key, spec in self.topics.items():
-            try:
-                source = self._source_topics[key]
-                if key == "lidar_cloud":
-                    source = self._lidar_topics
-                sources = [source] if isinstance(source, str) else list(source)
-                result[key]["robot_publishers"] = sum(
-                    self.robot.count_publishers(topic) for topic in sources)
-            except (AttributeError, RuntimeError, TypeError, ValueError):
+            if key.startswith("camera_") and getattr(self, "_camera_source_mode", "ros") == "rtsp":
                 result[key]["robot_publishers"] = None
+            else:
+                try:
+                    source = self._source_topics[key]
+                    if key == "lidar_cloud":
+                        source = self._lidar_topics
+                    sources = [source] if isinstance(source, str) else list(source)
+                    result[key]["robot_publishers"] = sum(
+                        self.robot.count_publishers(topic) for topic in sources)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    result[key]["robot_publishers"] = None
             lane = self.bridge.stats(key)
             result[key]["bridge_enqueued"] = lane["enqueued"]
             result[key]["bridge_dropped"] = lane["dropped"]
@@ -503,7 +523,9 @@ class S10Nodes:
             result[key]["bridge_errors"] = lane.get("errors", 0)
             result[key]["bridge_last_error"] = lane.get("last_error")
             if self.media_workers is not None and (key.startswith("camera_") or key in LIDAR_LANES):
-                result[key]["worker_alive"] = self.media_workers.is_alive(key)
+                result[key]["worker_alive"] = (
+                    self.media_workers.rtsp_alive(key) if key.startswith("camera_") and
+                    getattr(self, "_camera_source_mode", "ros") == "rtsp" else self.media_workers.is_alive(key))
             if key == "lidar_cloud":
                 with self._lidar_source_lock:
                     result[key]["active_source"] = self._active_lidar_source
@@ -522,9 +544,11 @@ class S10Nodes:
                 result[key]["source"] = self._lidar_map_topic
                 result[key]["source_publishers"] = self._count_publishers(self._lidar_map_topic)
             elif key.startswith("camera_"):
-                result[key]["active_source"] = self._camera_lane_sources.get(key)
+                result[key]["active_source"] = (self._rtsp_sources.get(key)
+                                                  if getattr(self, "_camera_source_mode", "ros") == "rtsp"
+                                                  else self._camera_lane_sources.get(key))
                 source = result[key]["active_source"]
-                result[key]["source_publishers"] = (
+                result[key]["source_publishers"] = None if getattr(self, "_camera_source_mode", "ros") == "rtsp" else (
                     self._count_publishers(source) if source else None)
         return result
 
@@ -843,9 +867,17 @@ class S10Nodes:
         else:
             from sensor_msgs.msg import CompressedImage
             output = CompressedImage()
-            output.header.frame_id = header[0]
-            output.header.stamp.sec = header[1]
-            output.header.stamp.nanosec = header[2]
+            if header is None:
+                import time as wall_time
+                stamp = wall_time.time()
+                output.header.frame_id = lane
+                output.header.stamp.sec = int(stamp)
+                output.header.stamp.nanosec = int((stamp % 1) * 1e9)
+                self._record_stream(lane, "received")
+            else:
+                output.header.frame_id = header[0]
+                output.header.stamp.sec = header[1]
+                output.header.stamp.nanosec = header[2]
             output.format = "jpeg"
             output.data = packet
             self.camera_publishers[lane].publish(output)

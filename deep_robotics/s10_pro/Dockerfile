@@ -12,7 +12,7 @@ RUN . /opt/ros/humble/setup.sh && cd /s10_pro_ws && colcon build --packages-sele
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR=https://pypi.org/simple/
 RUN set -eu; missing=""; \
-    for package in alsa-utils ca-certificates openssh-client python3-pip ros-humble-rmw-fastrtps-cpp sshpass; do \
+    for package in alsa-utils ca-certificates ffmpeg openssh-client python3-pip ros-humble-rmw-fastrtps-cpp sshpass; do \
         if [ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != "install ok installed" ]; then \
             missing="$missing $package"; \
         fi; \

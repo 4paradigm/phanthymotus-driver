@@ -9,6 +9,7 @@ charging and navigation.
 | --- | --- | --- |
 | Battery | `/BATTERY_DATA` (`drdds/msg/BatteryData`) | `soc`, `soh`, `current`, `voltage`, `cell_vol`, `temperature`, `cycle` as JSON |
 | Joints | `/JOINTS_DATA_10HZ` (`drdds/msg/JointsData`) and `/IMU` | `joints_info` JSON with joint names/angles/speeds/torques/temperatures; `joints` skeleton with 16 joints and IMU orientation |
+| Cameras | AOS RTSP streams on `10.21.33.103:8554` | Four JPEG streams on the existing `camera_front`, `camera_rear`, `camera_left`, and `camera_right` topics |
 | LiDAR | 22 historical/live PointCloud2 candidates; `/ACCUMULATED_POINTS_MAP` remains the map source | Split `lidar_cloud` and `lidar_map` `sensor/pointcloud` streams with bounded latest-frame workers; only one fresh cloud source is active at a time |
 | IMU | `/IMU` (`sensor_msgs/msg/Imu`) | source `header.stamp`, quaternion (w,x,y,z), angular velocity, linear acceleration, Euler angles (radians), temperature |
 | `loco_servo` | `control/velocity` (`motus.control/1`, twist) | bounded continuous velocity commands to the native S10 TCP controller; dry-run by default |
@@ -104,9 +105,14 @@ loopback-profiled; media/state publishers and the `loco_servo` subscriber are
 isolated child processes. Media conversion and publication
 use independent bounded lanes so a camera or point-cloud frame cannot block
 control/state callbacks.
-The driver subscribes only to the four canonical `/camera/{rear,left,front,right}/image_raw`
-topics. The vendor also exposes aliases for the same physical streams; subscribing
-to every alias multiplies large DDS frames and board load.
+The camera cards use the AOS RTSP endpoints supplied by the vendor: front wide
+`/video4`, rear wide `/video0`, left wide `/video2`, and right wide `/video6`.
+The driver pulls each stream over RTSP/TCP with FFmpeg, extracts MJPEG frames,
+and publishes them to the existing Core-domain JPEG topics. A one-frame
+low-latency pipeline reconnects after stream interruption. The previous ROS
+image-topic source remains available by setting `camera_source: ros`; RTSP is
+the default because the robot camera service does not publish the required DDS
+image topics. The final image includes the `ffmpeg` runtime for RTSP demuxing.
 
 ## Image and deployment
 

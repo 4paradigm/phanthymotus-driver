@@ -525,6 +525,42 @@ def test_camera_config_uses_only_four_canonical_topics():
         "camera_right": "/camera/right/image_raw",
     }
     assert config["camera_discovery"] is False
+    assert config["camera_source"] == "rtsp"
+    assert config["camera_rtsp"] == {
+        "camera_front": "rtsp://10.21.33.103:8554/video4",
+        "camera_rear": "rtsp://10.21.33.103:8554/video0",
+        "camera_left": "rtsp://10.21.33.103:8554/video2",
+        "camera_right": "rtsp://10.21.33.103:8554/video6",
+    }
+
+
+def test_rtsp_mjpeg_parser_handles_fragmented_and_multiple_frames():
+    from deep_robotics.s10_pro.media_workers import MediaWorkers, _rtsp_command
+
+    class FragmentedStream:
+        def __init__(self, data):
+            self.data = data
+
+        def read(self, _size):
+            chunk, self.data = self.data[:5], self.data[5:]
+            return chunk
+
+    frames = []
+    worker = MediaWorkers.__new__(MediaWorkers)
+    worker._closed = False
+    worker._on_result = lambda lane, header, packet: frames.append((lane, header, packet))
+    worker._read_mjpeg("camera_front", FragmentedStream(
+        b"discard" + b"\xff\xd8frame-one\xff\xd9" + b"\xff\xd8frame-two\xff\xd9"))
+
+    assert frames == [
+        ("camera_front", None, b"\xff\xd8frame-one\xff\xd9"),
+        ("camera_front", None, b"\xff\xd8frame-two\xff\xd9"),
+    ]
+    command = _rtsp_command("rtsp://10.21.33.103:8554/video4")
+    assert command[0] == "ffmpeg"
+    assert command[command.index("-rtsp_transport") + 1] == "tcp"
+    assert command[command.index("-i") + 1] == "rtsp://10.21.33.103:8554/video4"
+    assert command[-1] == "pipe:1"
 
 
 def test_camera_discovery_skips_unconfigured_vendor_aliases(monkeypatch):
