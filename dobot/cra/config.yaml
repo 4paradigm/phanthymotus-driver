@@ -16,6 +16,7 @@ reconnect_delay_s: 1
 joint_move:
   connect_timeout_s: 2
   receive_timeout_s: 2
+  enable_timeout_s: 5
 ros:
   robot_domain_id: 42
   core_domain_id: 42

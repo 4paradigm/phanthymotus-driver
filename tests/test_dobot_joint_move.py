@@ -207,11 +207,11 @@ def test_motion_and_resume_require_fresh_feedback(action, mode, changed):
 
 @pytest.mark.parametrize('action,mode', [('move_j', 5), ('resume', 10)])
 @pytest.mark.parametrize('changed', [
-    {'enable_status': False}, {'running_status': 1}, {'jog_status': 1}, {'error_status': True},
+    {'running_status': 1}, {'jog_status': 1}, {'error_status': True},
     {'collision_state': 1}, {'drag_status': 1}, {'brake_released': [True] * 6},
     {'arm_approach_state': 1}, {'j4_approach_state': 1}, {'j5_approach_state': 1}, {'j6_approach_state': 1},
 ])
-def test_motion_does_not_bypass_protection_or_auto_enable(action, mode, changed):
+def test_motion_does_not_bypass_protection(action, mode, changed):
     feedback, dashboard, control, calls = ready()
     set_mode(feedback, mode)
     feedback.sample['data'].update(changed)
@@ -220,7 +220,7 @@ def test_motion_does_not_bypass_protection_or_auto_enable(action, mode, changed)
     assert not calls and not dashboard.commands
 
 
-@pytest.mark.parametrize('mode', [3, 4, 6, 7, 8, 9, 10, 11])
+@pytest.mark.parametrize('mode', [3, 6, 7, 8, 9, 10, 11])
 def test_new_absolute_move_requires_idle_enabled_mode(mode):
     feedback, dashboard, control, calls = ready()
     set_mode(feedback, mode)
@@ -479,5 +479,96 @@ def test_stop_cannot_interleave_skin_clear_and_move_sequence():
     try:
         assert not first.is_alive() and not second.is_alive() and not errors
         assert dashboard.commands == ['EnableSafeSkin(0)', 'ClearError()', MOVJ, 'Stop()']
+    finally:
+        control.close()
+
+
+@pytest.mark.parametrize('action,mode', [('move_j', 4), ('resume', 10)])
+def test_disabled_robot_is_enabled_once_before_motion(action, mode):
+    feedback, dashboard, control, _ = ready()
+    set_mode(feedback, mode)
+    feedback.sample['data']['enable_status'] = False
+    original = dashboard.send_receive_text
+    def send(command):
+        reply = original(command)
+        if command == 'EnableRobot()':
+            set_mode(feedback, 5 if action == 'move_j' else 10)
+        return reply
+    dashboard.send_receive_text = send
+    try:
+        result = control.execute_motion(action, {**TARGET, 'confirm_move': True})
+        expected = ['EnableSafeSkin(0)'] + (['ClearError()'] if action == 'move_j' else [])
+        assert dashboard.commands == expected + ['EnableRobot()', MOVJ if action == 'move_j' else 'Continue()']
+        assert result['enable_response'].startswith('0,')
+    finally:
+        control.close()
+
+
+@pytest.mark.parametrize('action,mode', [('move_j', 4), ('resume', 10)])
+@pytest.mark.parametrize('failure', ['rejected', 'malformed', 'timeout', 'no_feedback', 'protection'])
+def test_enable_failure_or_missing_confirmation_blocks_motion(action, mode, failure):
+    feedback, dashboard, control, _ = ready()
+    set_mode(feedback, mode)
+    feedback.sample['data']['enable_status'] = False
+    control.enable_timeout = 0.03
+    original = dashboard.send_receive_text
+    def send(command):
+        if command == 'EnableRobot()':
+            dashboard.commands.append(command)
+            if failure == 'timeout':
+                raise TimeoutError('enable acknowledgement lost')
+            if failure == 'rejected':
+                return '-1,{},EnableRobot();'
+            if failure == 'malformed':
+                return 'invalid'
+            if failure == 'protection':
+                feedback.sample['data']['collision_state'] = 1
+            return '0,{},EnableRobot();'
+        return original(command)
+    dashboard.send_receive_text = send
+    with pytest.raises((CommandRejected, ValueError, TimeoutError, RuntimeError)):
+        control.execute_motion(action, {**TARGET, 'confirm_move': True})
+    assert dashboard.commands.count('EnableRobot()') == 1
+    assert not any(c.startswith('MovJ(') or c == 'Continue()' for c in dashboard.commands)
+    assert dashboard.closed
+
+
+def test_resume_does_not_continue_if_enabling_loses_paused_state():
+    feedback, dashboard, control, _ = ready()
+    set_mode(feedback, 4)
+    original = dashboard.send_receive_text
+    def send(command):
+        reply = original(command)
+        if command == 'EnableRobot()':
+            set_mode(feedback, 5)
+        return reply
+    dashboard.send_receive_text = send
+    with pytest.raises(RuntimeError, match='mode 10'):
+        control.execute_motion('resume', {'confirm_move': True})
+    assert dashboard.commands == ['EnableSafeSkin(0)', 'EnableRobot()']
+
+
+def test_enable_ack_waits_for_later_feedback_before_sending_move():
+    feedback, dashboard, control, _ = ready()
+    set_mode(feedback, 4)
+    original_send = dashboard.send_receive_text
+    original_snapshot = feedback.snapshot
+    polls = []
+    def send(command):
+        if command.startswith('MovJ('):
+            assert len(polls) >= 3 and feedback.sample['data']['enable_status']
+        return original_send(command)
+    def snapshot():
+        if 'EnableRobot()' in dashboard.commands:
+            polls.append(True)
+            if len(polls) >= 3:
+                set_mode(feedback, 5)
+        return original_snapshot()
+    dashboard.send_receive_text = send
+    feedback.snapshot = snapshot
+    try:
+        move(control)
+        assert dashboard.commands.count('EnableRobot()') == 1
+        assert dashboard.commands[-1] == MOVJ
     finally:
         control.close()

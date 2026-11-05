@@ -102,7 +102,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra
 
 1. 可见卡片仅有 `joints` 和 `joint_move`；`model` 保留为后台资源。
 2. 骨架使用六轴实际角度，默认 30 Hz；JSON 的六个角度字段分别占一行。
-3. systemcontrol 不注册，joint_move 不提供使能或上电动作。
+3. systemcontrol 不注册，joint_move 不提供独立使能或上电动作；运动前未使能时自动使能。
 4. 反馈失效时骨架为空、角度为 null；`info` 只返回卡片介绍。
 5. 本地模拟验证不操作真机，模型与实际机械臂的显示效果由现场验收。
 
@@ -110,5 +110,6 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra
 
 joint_move 与 joints 共用底层反馈服务和连接配置，均可独立启动。
 每次 move_j 前发送 EnableSafeSkin(0)、ClearError，再发送 MovJ；
-resume 前发送 EnableSafeSkin(0)，成功后发送 Continue。失败不继续也不重试。
+resume 前发送 EnableSafeSkin(0)。move_j/resume 未使能时发送一次 EnableRobot，
+等待反馈确认后再发送 MovJ/Continue；失败不继续也不重试。
 不自动重新 enable 安全皮肤；原有运动前置保护检查保留。

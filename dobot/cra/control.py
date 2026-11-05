@@ -80,6 +80,7 @@ class RobotController:
         settings = config.get("joint_move", {})
         self.connect_timeout = positive_number(settings.get("connect_timeout_s", 2), "joint_move.connect_timeout_s")
         self.receive_timeout = positive_number(settings.get("receive_timeout_s", 2), "joint_move.receive_timeout_s")
+        self.enable_timeout = positive_number(settings.get("enable_timeout_s", 5), "joint_move.enable_timeout_s")
         self._factory = connection_factory
         self._command_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -127,7 +128,7 @@ class RobotController:
                     self._update(card, last_request=None, last_error=None)
                 self.feedback.configure(address, port)
 
-    def _check_motion_state(self, action):
+    def _check_motion_state(self, action, *, allow_disabled=False):
         sample = self.feedback.snapshot()
         if not self.feedback.address:
             raise RuntimeError("configure the controller IP before sending commands")
@@ -146,7 +147,8 @@ class RobotController:
             raise RuntimeError("joint motion currently requires controller-identified CR3A (type 113)")
         resolve_model(sample, self.feedback.model_name)
         required_mode = 5 if action == "move_j" else 10
-        if mode != required_mode or not state["enable_status"]:
+        disabled_preparation = allow_disabled and not state["enable_status"] and mode in (4, required_mode)
+        if not disabled_preparation and (mode != required_mode or not state["enable_status"]):
             raise RuntimeError(f"{action} requires an enabled robot in mode {required_mode}; current mode is {mode}")
         if (state["error_status"] or state["collision_state"] or state["drag_status"] or
                 any(state["brake_released"]) or
@@ -180,7 +182,9 @@ class RobotController:
             options = {"v": args.get("velocity", 10), "a": args.get("acceleration", 10), "cp": 0}
             requested = {f"{joint}_deg": angle for joint, angle in zip(JOINT_NAMES, angles)}
             requested.update(velocity=options["v"], acceleration=options["a"])
-        return self._execute(action, commands[action], self._check_motion_state, card="joint_move",
+        def check_state(current_action):
+            return self._check_motion_state(current_action, allow_disabled=current_action in ("move_j", "resume"))
+        return self._execute(action, commands[action], check_state, card="joint_move",
                              parameters=parameters, options=options, requested=requested)
 
     def _execute(self, action, command, check_state, *, card="joint_move", parameters=(), options=None, requested=None):
@@ -213,6 +217,23 @@ class RobotController:
                     parse_response(clear_reply, "ClearError")
                     request["clear_error_response"] = clear_reply
                     check_state(action)
+                if action in ("move_j", "resume"):
+                    sample = check_state(action)
+                    if not sample["data"]["enable_status"]:
+                        enable_reply = self._api.EnableRobot()
+                        parse_response(enable_reply, "EnableRobot")
+                        request["enable_response"] = enable_reply
+                        deadline = time.monotonic() + self.enable_timeout
+                        while True:
+                            sample = check_state(action)
+                            if sample["data"]["enable_status"]:
+                                break
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError("EnableRobot acknowledged but enabled feedback was not confirmed")
+                            time.sleep(0.02)
+                    # In particular, enabling must not turn a lost paused queue
+                    # into a Continue request against an idle controller.
+                    self._check_motion_state(action)
                 api = self._motion_api if command == "MovJ" else self._api
                 reply = getattr(api, command)(*parameters, **(options or {}))
                 queue_id = parse_reply(reply, command)

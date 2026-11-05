@@ -74,3 +74,7 @@ Joint motion uses SDK MovJ with joint coordinates and per-command v/a, cp=0.
 Each move_j first sends EnableSafeSkin(0), then ClearError; resume sends
 EnableSafeSkin(0) before Continue. All acknowledgements are checked, with no
 automatic retry or skin re-enable. Successful replies are not verified state readback.
+
+Before MovJ/Continue, disabled feedback triggers exactly one EnableRobot()
+without load arguments. Motion waits for enabled feedback (default timeout 5s);
+ACK alone is insufficient. Resume must still be paused after enabling.
