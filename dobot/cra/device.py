@@ -21,7 +21,7 @@ else:
 
 CARD_DESCRIPTIONS = {
     "joints": "CR3A 六轴实时骨架及关节转角 JSON（度/弧度），固定直角连接保持真实关节坐标",
-    "safe_skin": "小臂及 J4/J5/J6 安全皮肤接近暂停标志、数据有效性和最近控制请求",
+    "safe_skin": "小臂及 J4/J5/J6 安全皮肤接近暂停标志、汇总触发和数据有效性",
 }
 
 
@@ -150,19 +150,13 @@ class DobotSensors:
         if name == "safe_skin":
             # Feedback has proximity stops, not distance/configuration readback.
             regions = {
-                name: {"part": part, "raw_flag": None if state is None else state[f"{name}_approach_state"],
-                       "approach_paused": None if state is None else bool(state[f"{name}_approach_state"])}
-                for part, name in PARTS.items()
+                name: None if state is None else bool(state[f"{name}_approach_state"])
+                for name in PARTS.values()
             }
-            keys = ("robot_mode", "robot_mode_name", "enable_status", "running_status", "error_status",
-                    "collision_state", "safety_state", "safe_state", "current_command_id")
             return {
-                **result, "available": state is not None, "regions": regions,
-                "any_approach_paused": None if state is None else any(v["approach_paused"] for v in regions.values()),
-                "robot_status": None if state is None else {key: state[key] for key in keys},
-                "configuration_readback_available": False, "hardware_presence": "unknown",
-                "enabled": None, "sensitivity": {name: None for name in PARTS.values()},
-                "control": self.control.snapshot(), "reset_supported": False,
+                "timestamp_ms": result["timestamp_ms"], "available": state is not None,
+                "any_approach_paused": None if state is None else any(regions.values()),
+                "regions": regions,
             }
         raise ValueError(f"unknown sensor: {name}")
 

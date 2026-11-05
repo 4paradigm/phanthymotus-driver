@@ -111,7 +111,7 @@ def test_joints_config_closes_dashboard_and_clears_old_state_without_sending_com
     assert not control.snapshot()['dashboard_connected']
     assert plugin.payload('joints')['joints'] == []
     assert plugin.payload('joint_angles')['angles_deg'] == []
-    assert plugin.payload('safe_skin')['robot_status'] is None
+    assert not plugin.payload('safe_skin')['available']
 
 
 @pytest.mark.parametrize('changed', [{'controller_ip': 'invalid'}, {'feedback_port': 29999}])
@@ -137,9 +137,10 @@ def test_sdk_global_switch_submission_and_unknown_readback(enabled):
     assert result['result_id'] == 1 and result['state'] == 'submitted'
     assert result['configuration_verified'] is False
     sensor = DobotSensors({}, client=feedback, controller=control).payload('safe_skin')
-    assert sensor['enabled'] is None
-    assert sensor['control']['last_request']['enabled'] is enabled
-    assert not sensor['configuration_readback_available']
+    assert 'enabled' not in sensor and 'sensitivity' not in sensor and 'control' not in sensor
+    info = DobotSensors({}, client=feedback, controller=control).dispatch('info', {'_tool_name': 'safe_skin_control'})
+    assert info['last_request']['enabled'] is enabled
+    assert info['last_request']['configuration_verified'] is False
     control.close()
 
 
@@ -263,15 +264,17 @@ def test_skin_sensor_regions_do_not_misreport_collision_as_proximity():
     feedback.sample['data'].update(j4_approach_state=1, j6_approach_state=1, collision_state=0)
     plugin = DobotSensors({}, client=feedback, controller=control)
     result = plugin.payload('safe_skin')
+    assert set(result) == {'timestamp_ms', 'available', 'any_approach_paused', 'regions'}
+    assert isinstance(result['timestamp_ms'], int) and result['available'] is True
     assert result['any_approach_paused']
-    assert result['regions']['j4']['approach_paused'] is True
-    assert result['regions']['arm']['approach_paused'] is False
-    assert result['robot_status']['collision_state'] == 0
-    assert result['hardware_presence'] == 'unknown'
+    assert result['regions'] == {'arm': False, 'j4': True, 'j5': False, 'j6': True}
+    feedback.sample['data'].update(j4_approach_state=0, j6_approach_state=0, collision_state=1)
+    assert plugin.payload('safe_skin')['any_approach_paused'] is False
     feedback.sample.update(connected=False, stale=True, data=None)
     result = plugin.payload('safe_skin')
     assert result['any_approach_paused'] is None
-    assert all(v['raw_flag'] is None for v in result['regions'].values())
+    assert result['available'] is False
+    assert result['regions'] == dict.fromkeys(('arm', 'j4', 'j5', 'j6'))
 
 
 def test_control_requests_are_serialized_but_sensor_snapshot_does_not_block():

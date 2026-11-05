@@ -169,7 +169,7 @@ def test_single_read_only_connection_shared_by_all_cards_and_units():
             for name in CARD_DESCRIPTIONS:
                 result = plugin.dispatch("start", {"_tool_name": name})
                 assert result["state"] == "running"
-                assert result["read_only"]
+                assert result["available"]
                 assert plugin.dispatch("stop", {"_tool_name": name}) == {"state": "idle"}
         assert calls == [("127.0.0.1", 30004)]
         assert not connection.closed.is_set()
@@ -177,8 +177,7 @@ def test_single_read_only_connection_shared_by_all_cards_and_units():
         assert joint[0]["q"] == pytest.approx(math.pi / 2)
         assert joint[0]["dq"] == pytest.approx(math.pi)
         assert joint[1]["degree"] == -30
-        assert plugin.payload("safe_skin")["robot_status"]["robot_mode_name"] == "disabled"
-        assert plugin.payload("safe_skin")["configuration_readback_available"] is False
+        assert plugin.payload("safe_skin")["any_approach_paused"] is False
         snapshot = client.snapshot()
         snapshot["data"]["joint_state"]["q_actual"][0] = -999
         assert client.snapshot()["data"]["joint_state"]["q_actual"][0] == 90
@@ -195,10 +194,9 @@ def test_stale_data_is_withheld_even_if_socket_stays_open():
         received = client._received_at
         client._clock = lambda: received + 3
         result = DobotSensors({}, client=client).payload("safe_skin")
-        assert result["transport_connected"]
-        assert result["stale"] and not result["available"]
-        assert result["robot_status"] is None
-        assert all(region["approach_paused"] is None for region in result["regions"].values())
+        assert client.snapshot()["transport_connected"]
+        assert not result["available"] and result["any_approach_paused"] is None
+        assert all(region is None for region in result["regions"].values())
         skeleton = DobotSensors({}, client=client).payload("joints")
         assert skeleton["joints"] == []
         assert not skeleton["available"]
@@ -344,9 +342,13 @@ def test_publish_all_health_states_without_network_calls():
                           for name, outputs in plugin._topics.items() for index in range(len(outputs))}
     plugin._publish()
     assert len(plugin._publishers) == 3
-    for pub in plugin._publishers.values():
-        assert pub.messages[0]["stale"]
-        assert pub.messages[0]["read_only"]
+    for (name, _), pub in plugin._publishers.items():
+        assert not pub.messages[0]["available"]
+        if name == "joints":
+            assert pub.messages[0]["stale"]
+            assert pub.messages[0]["read_only"]
+        else:
+            assert pub.messages[0]["regions"] == dict.fromkeys(("arm", "j4", "j5", "j6"))
     assert plugin._publishers[("joints", 1)].messages[0]["angles_deg"] == []
 
 

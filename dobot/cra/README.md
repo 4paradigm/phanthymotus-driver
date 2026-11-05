@@ -8,7 +8,7 @@
 | 名称 | 类型 | 内容 |
 |---|---|---|
 | `joints` | sensor | 六轴实际角度驱动的 CR3A 结构骨架及转角 JSON 输出；共享连接配置入口 |
-| `safe_skin` | sensor | 小臂、J4/J5/J6 接近暂停标志及状态有效性、最近控制请求 |
+| `safe_skin` | sensor | 小臂、J4/J5/J6 接近暂停标志、汇总触发和数据有效性 |
 | `safe_skin_control` | actuator | 显式请求 TCP 控制、总开关、分区灵敏度 |
 | `model` | resource | 平台渲染器使用的固定直角骨架 URDF，不发布 ROS topic |
 
@@ -40,8 +40,9 @@
 
 更新后在平台重新添加 `joints` 或刷新该卡片输出定义，以显示新增 JSON 输出口。
 
-断线或过期时 `connected=false, stale=true`；骨架不再输出旧角度，`joints=[]`；
-皮肤触发状态为 `null`，不会把未知当作“没有触发”。所有卡片可查看连接新鲜度。
+断线或过期时，关节输出为 `connected=false, stale=true`，骨架不再输出旧角度，`joints=[]`；
+皮肤输出为 `available=false`，触发状态为 `null`，不会把未知当作“没有触发”。
+连接地址、端口、反馈新鲜度及重连诊断可通过 `joints` 的 `info` 查看。
 
 ## 固定直角结构
 
@@ -61,16 +62,28 @@
 
 ## 安全皮肤状态
 
-`safe_skin.regions` 包含 `arm/j4/j5/j6` 四个区域，每个区域输出 `part`、`raw_flag`、
-`approach_paused`；`any_approach_paused` 汇总区域触发状态。`robot_status` 提供模式、
-使能、运行、报警、碰撞、安全字节及当前队列指令号，便于区分普通碰撞与皮肤接近暂停。
+`safe_skin` 只发布以下四项（示例值）：
 
-反馈不提供皮肤安装检测、总开关或灵敏度读回，因此：
+```json
+{
+  "timestamp_ms": 1793836800000,
+  "available": true,
+  "any_approach_paused": false,
+  "regions": {"arm": false, "j4": false, "j5": false, "j6": false}
+}
+```
 
-- `hardware_presence="unknown"`；全零标志不证明安全皮肤已安装或已开启。
-- `enabled=null`、`sensitivity` 各区为 `null`，`configuration_readback_available=false`。
-- `control.last_request` 仅记录本驱动最近提交的设置，不能当作当前真实配置。
-- 本版不虚构距离读数或 TCP 复位指令；`reset_supported=false`。
+`regions` 的值直接表示各区域是否触发接近暂停，`any_approach_paused` 为其汇总。
+`timestamp_ms` 是本次输出的 Unix 毫秒时间；`available` 表示反馈是否新鲜有效。
+断线或过期时 `available=false`，汇总和四区值均为 `null`。普通碰撞不等同于皮肤接近暂停。
+
+此精简格式移除了 `regions` 内的 `part/raw_flag/approach_paused` 嵌套对象，以及系统状态、
+连接诊断、控制请求记录和无读回依据的配置字段。使用旧路径的下游条件需改为直接读取
+`regions.arm/j4/j5/j6`。最近控制请求、执行结果和 Dashboard 状态通过 `safe_skin_control`
+的 `info` 查看；`last_request` 只是请求记录，不是实际配置读回。
+
+反馈不提供皮肤安装检测、总开关或灵敏度读回；四区均为 false 不证明皮肤已安装或开启。
+本版不虚构距离读数或 TCP 复位指令。
 
 ## 安全皮肤控制
 
@@ -94,7 +107,7 @@
 
 开关和灵敏度是**队列指令**：返回 0 只说明接受请求。返回 ResultID 时状态为
 `submitted`；旧固件不返回 ID 时为 `accepted_unverified`。无配置读回接口，所以即使
-接受也始终标记 `configuration_verified=false`。可在 sensor 查看当前队列指令号，
+接受也始终标记 `configuration_verified=false`。可通过控制卡 `info` 查看请求返回的队列编号，
 并在厂家软件中核对实际设置；下使能时接受的队列可能等待后续使能，不会由驱动自动执行使能。
 明确错误码返回 `rejected`，通信不确定性返回 `failed_or_outcome_unknown`，均不自动重试。
 
