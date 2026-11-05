@@ -192,11 +192,14 @@ Run from repository root:
 python3 -m pytest -q tests/test_s10_pro_control.py tests/test_s10_pro_audio.py
 ```
 
-The latest local run passed 81 tests. Tests use synthetic messages, fake native
+The latest local run passed 99 tests. Tests use synthetic messages, fake native
 TCP clients, and fake Core-domain subscribers; they do not send robot commands.
 They cover interface auto-detection, AOS/NOS separation, control confirmation,
 valid/invalid continuous-control messages, tested `loco` speed-limit parity,
 start-time confirmation, sanitized remote output, watchdog stopping, and
-subscriber failure stopping. A new Bot build and robot-level validation are still required
-before claiming this version accepted. Audio tests validate contracts and frame
-filtering only; ALSA capture/playback still needs validation on the target host.
+subscriber failure stopping, PCM chunk contracts, AOS TLS-gate success/failure,
+and frontend-visible reboot errors. The service-fragment isolation check also
+passes. These checks do not send robot commands or execute the TLS script on the
+robot. A new Bot build and robot-level validation are still required before
+claiming deployment acceptance. ALSA capture/playback still needs validation on
+the target host.
