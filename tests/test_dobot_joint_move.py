@@ -100,6 +100,7 @@ MOVJ = 'MovJ(joint={10.000000,-30.000000,60.000000,0.000000,90.000000,-10.000000
 def ready(dashboard=None):
     feedback, dashboard, control, calls = setup_control(dashboard)
     set_mode(feedback, 5)
+    control.enable_timeout = 0.05
     original = dashboard.send_receive_text
     def send(command):
         if command == 'EnableSafeSkin(0)':
@@ -207,9 +208,8 @@ def test_motion_and_resume_require_fresh_feedback(action, mode, changed):
 
 @pytest.mark.parametrize('action,mode', [('move_j', 5), ('resume', 10)])
 @pytest.mark.parametrize('changed', [
-    {'running_status': 1}, {'jog_status': 1}, {'error_status': True},
-    {'collision_state': 1}, {'drag_status': 1}, {'brake_released': [True] * 6},
-    {'arm_approach_state': 1}, {'j4_approach_state': 1}, {'j5_approach_state': 1}, {'j6_approach_state': 1},
+    {'running_status': 1}, {'jog_status': 1},
+    {'drag_status': 1}, {'brake_released': [True] * 6},
 ])
 def test_motion_does_not_bypass_protection(action, mode, changed):
     feedback, dashboard, control, calls = ready()
@@ -220,7 +220,7 @@ def test_motion_does_not_bypass_protection(action, mode, changed):
     assert not calls and not dashboard.commands
 
 
-@pytest.mark.parametrize('mode', [3, 6, 7, 8, 9, 10, 11])
+@pytest.mark.parametrize('mode', [3, 6, 7, 8, 10])
 def test_new_absolute_move_requires_idle_enabled_mode(mode):
     feedback, dashboard, control, calls = ready()
     set_mode(feedback, mode)
@@ -272,7 +272,11 @@ def test_pause_cannot_pause_jogging_and_resume_requires_paused_mode(action, mode
     set_mode(feedback, mode)
     with pytest.raises(RuntimeError):
         control.execute_motion(action, {'confirm_move': True})
-    assert not calls and not dashboard.commands
+    if action == 'resume' and mode == 5:
+        assert dashboard.commands == ['EnableSafeSkin(0)']
+        assert len(calls) == 1
+    else:
+        assert not calls and not dashboard.commands
 
 
 def test_explicit_stop_remains_possible_when_feedback_is_unavailable():
@@ -296,7 +300,7 @@ def test_unconfigured_endpoint_cannot_send_motion(action):
 
 def test_robot_state_is_checked_again_after_connecting():
     feedback, dashboard, control, calls = ready()
-    dashboard.on_connect = lambda: feedback.sample['data'].update(collision_state=1)
+    dashboard.on_connect = lambda: feedback.sample['data'].update(running_status=1)
     with pytest.raises(RuntimeError):
         move(control)
     assert not dashboard.commands and len(calls) == 1 and dashboard.closed
@@ -545,7 +549,7 @@ def test_resume_does_not_continue_if_enabling_loses_paused_state():
     dashboard.send_receive_text = send
     with pytest.raises(RuntimeError, match='mode 10'):
         control.execute_motion('resume', {'confirm_move': True})
-    assert dashboard.commands == ['EnableRobot()']
+    assert dashboard.commands == ['EnableRobot()', 'EnableSafeSkin(0)']
 
 
 def test_enable_ack_waits_for_later_feedback_before_sending_move():
@@ -588,3 +592,77 @@ def test_enable_lost_after_disabling_skin_blocks_final_motion(action, mode):
     with pytest.raises(RuntimeError, match='enabled robot'):
         control.execute_motion(action, {**TARGET, 'confirm_move': True})
     assert not any(c.startswith('MovJ(') or c == 'Continue()' for c in dashboard.commands)
+
+
+@pytest.mark.parametrize('mode', [9, 11])
+def test_alarm_and_collision_can_reach_clear_before_final_motion_check(mode):
+    feedback, dashboard, control, _ = ready()
+    set_mode(feedback, mode)
+    feedback.sample['data'].update(enable_status=True, collision_state=int(mode == 11))
+    original = dashboard.send_receive_text
+    def send(command):
+        reply = original(command)
+        if command == 'ClearError()':
+            set_mode(feedback, 5)
+            feedback.sample['data']['collision_state'] = 0
+        return reply
+    dashboard.send_receive_text = send
+    try:
+        move(control)
+        assert dashboard.commands == ['EnableSafeSkin(0)', 'ClearError()', MOVJ]
+    finally:
+        control.close()
+
+
+@pytest.mark.parametrize('action,mode', [('move_j', 5), ('resume', 10)])
+@pytest.mark.parametrize('flag', ['error_status', 'collision_state', 'arm_approach_state',
+                                'j4_approach_state', 'j5_approach_state', 'j6_approach_state'])
+def test_persistent_protection_blocks_only_final_motion_after_preparation(action, mode, flag):
+    feedback, dashboard, control, _ = ready()
+    set_mode(feedback, mode)
+    feedback.sample['data'][flag] = 1
+    with pytest.raises(RuntimeError, match='blocked by alarm'):
+        control.execute_motion(action, {**TARGET, 'confirm_move': True})
+    assert dashboard.commands == ['EnableSafeSkin(0)'] + (['ClearError()'] if action == 'move_j' else [])
+    assert dashboard.closed
+
+
+def test_clear_ack_waits_for_feedback_to_leave_collision_mode():
+    feedback, dashboard, control, _ = ready()
+    set_mode(feedback, 11)
+    feedback.sample['data']['enable_status'] = True
+    original = feedback.snapshot
+    polls = []
+    def snapshot():
+        if 'ClearError()' in dashboard.commands:
+            polls.append(True)
+            if len(polls) >= 3:
+                set_mode(feedback, 5)
+        return original()
+    feedback.snapshot = snapshot
+    try:
+        move(control)
+        assert len(polls) >= 3 and dashboard.commands[-1] == MOVJ
+    finally:
+        control.close()
+
+
+def test_disabled_collision_state_prepares_in_enable_skin_clear_move_order():
+    feedback, dashboard, control, _ = ready()
+    set_mode(feedback, 11)
+    feedback.sample['data'].update(enable_status=False, collision_state=1)
+    original = dashboard.send_receive_text
+    def send(command):
+        reply = original(command)
+        if command == 'EnableRobot()':
+            feedback.sample['data']['enable_status'] = True
+        if command == 'ClearError()':
+            set_mode(feedback, 5)
+            feedback.sample['data']['collision_state'] = 0
+        return reply
+    dashboard.send_receive_text = send
+    try:
+        move(control)
+        assert dashboard.commands == ['EnableRobot()', 'EnableSafeSkin(0)', 'ClearError()', MOVJ]
+    finally:
+        control.close()

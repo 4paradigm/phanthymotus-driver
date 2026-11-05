@@ -78,3 +78,8 @@ automatic retry or skin re-enable. Successful replies are not verified state rea
 Before disabling skin or sending MovJ/Continue, disabled feedback triggers exactly one EnableRobot()
 without load arguments. Motion waits for enabled feedback (default timeout 5s);
 ACK alone is insufficient. Resume must still be paused after enabling.
+
+Preparation validates connection, model, and stationary/locked-brake conditions
+without requiring mode 5 or clear alarm/collision/approach flags. Those final
+conditions are checked after EnableRobot/EnableSafeSkin/ClearError (move_j),
+with bounded feedback waiting. Persistent protection prevents MovJ/Continue.

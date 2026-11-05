@@ -128,7 +128,28 @@ class RobotController:
                     self._update(card, last_request=None, last_error=None)
                 self.feedback.configure(address, port)
 
-    def _check_motion_state(self, action, *, allow_disabled=False):
+    def _check_preparation_state(self, action):
+        """Validate preparation without requiring the final idle/protection state."""
+        sample = self.feedback.snapshot()
+        if not self.feedback.address:
+            raise RuntimeError("configure the controller IP before sending commands")
+        state = sample.get("data")
+        if not sample.get("connected") or sample.get("stale") or state is None:
+            raise RuntimeError("fresh feedback is required for joint motion")
+        if sample.get("robot_type_code") != 113:
+            raise RuntimeError("joint motion currently requires controller-identified CR3A (type 113)")
+        resolve_model(sample, self.feedback.model_name)
+        # ClearError must not interrupt active motion/drag or operate with released brakes.
+        # Alarm/collision/approach flags are intentionally checked only after preparation.
+        if (state["robot_mode"] not in (4, 5, 9, 10, 11) or state["running_status"] or
+                state["jog_status"] or state["drag_status"] or any(state["brake_released"])):
+            raise RuntimeError("robot must be stationary with locked brakes before preparing motion")
+        if action == "move_j" and state["robot_mode"] not in (9, 11) and (
+                state["pause_cmd_flag"] or state["run_queued_cmd"]):
+            raise RuntimeError("move_j requires an idle robot without a paused or running queue")
+        return sample
+
+    def _check_motion_state(self, action):
         sample = self.feedback.snapshot()
         if not self.feedback.address:
             raise RuntimeError("configure the controller IP before sending commands")
@@ -147,8 +168,7 @@ class RobotController:
             raise RuntimeError("joint motion currently requires controller-identified CR3A (type 113)")
         resolve_model(sample, self.feedback.model_name)
         required_mode = 5 if action == "move_j" else 10
-        disabled_preparation = allow_disabled and not state["enable_status"] and mode in (4, required_mode)
-        if not disabled_preparation and (mode != required_mode or not state["enable_status"]):
+        if mode != required_mode or not state["enable_status"]:
             raise RuntimeError(f"{action} requires an enabled robot in mode {required_mode}; current mode is {mode}")
         if (state["error_status"] or state["collision_state"] or state["drag_status"] or
                 any(state["brake_released"]) or
@@ -183,7 +203,9 @@ class RobotController:
             requested = {f"{joint}_deg": angle for joint, angle in zip(JOINT_NAMES, angles)}
             requested.update(velocity=options["v"], acceleration=options["a"])
         def check_state(current_action):
-            return self._check_motion_state(current_action, allow_disabled=current_action in ("move_j", "resume"))
+            if current_action in ("move_j", "resume"):
+                return self._check_preparation_state(current_action)
+            return self._check_motion_state(current_action)
         return self._execute(action, commands[action], check_state, card="joint_move",
                              parameters=parameters, options=options, requested=requested)
 
@@ -219,9 +241,6 @@ class RobotController:
                             if time.monotonic() >= deadline:
                                 raise TimeoutError("EnableRobot acknowledged but enabled feedback was not confirmed")
                             time.sleep(0.02)
-                    # In particular, enabling must not turn a lost paused queue
-                    # into a Continue request against an idle controller.
-                    self._check_motion_state(action)
                 if card == "joint_move" and action in ("move_j", "resume"):
                     skin_reply = self._api.EnableSafeSkin(0)
                     parse_response(skin_reply, "EnableSafeSkin")
@@ -235,7 +254,18 @@ class RobotController:
                     request["clear_error_response"] = clear_reply
                     check_state(action)
                 if action in ("move_j", "resume"):
-                    self._check_motion_state(action)
+                    # ACKs can precede the feedback packet reporting the effect.
+                    # Wait for final motion conditions only after all preparation.
+                    deadline = time.monotonic() + self.enable_timeout
+                    while True:
+                        check_state(action)
+                        try:
+                            self._check_motion_state(action)
+                            break
+                        except RuntimeError:
+                            if time.monotonic() >= deadline:
+                                raise
+                            time.sleep(0.02)
                 api = self._motion_api if command == "MovJ" else self._api
                 reply = getattr(api, command)(*parameters, **(options or {}))
                 queue_id = parse_reply(reply, command)
