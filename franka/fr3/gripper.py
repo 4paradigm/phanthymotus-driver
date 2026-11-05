@@ -14,6 +14,7 @@ class GripperPlugin(JointControlPlugin):
     PREFIX = "gripper"
     CONFIG_FIELDS = FrankaPlugin.CONFIG_FIELDS + ("speed_mm_s", "force_n")
     MOTION_ACTIONS = ("set_position", "grasp", "homing")
+    ARM_ACTIONS = (*MOTION_ACTIONS, "stopmotion")
 
     def __init__(self, *args, manager=None, **kwargs):
         # The Hand has its own SDK connection, independently of the arm FCI loop.
@@ -32,6 +33,7 @@ class GripperPlugin(JointControlPlugin):
         config = FrankaPlugin.get_tools(self)[0]["configSchema"]
         # Match joint_control's per-card binding on older actuator canvases.
         config.pop("required", None)
+        config["properties"].pop("publish_hz", None)
         config["properties"].update({
             "speed_mm_s": {"type": "number", "title": "默认开口速度 (mm/s)",
                            "scope": "instance", "minimum": 0.1, "maximum": 100, "default": 20},
@@ -65,13 +67,19 @@ class GripperPlugin(JointControlPlugin):
             "stopmotion": ([], "停止本机械臂夹爪动作，并解除夹持力；卡片保持可用。"),
             "info": ([], "查看实际开口、最大开口、抓取状态、温度及执行结果。"),
         }, properties)
+        schema["properties"]["target_robot_ip"] = {
+            "type": "string",
+            "description": "填写要执行动作的机械臂 IP，须与已启动卡片的配置一致。",
+        }
+        for action in schema["x-action-params"].values():
+            action["params"].append("target_robot_ip")
+        self._arm_schema(config, schema)
         schema["x-completion"] = {"actions": list(self.MOTION_ACTIONS), "timeout": 130}
         schema["x-resource"] = "arm"
         schema["x-is-dangerous"] = True
         schema["x-hooks"] = {key: {"action": "stop"}
                              for key in ("on_interrupt_motion", "on_interrupt_all")}
-        return [{**tool(self.PREFIX, "actuator", "Franka 夹爪：开口宽度、抓取、标定与停止。", schema,
-                        topic_out=[{"format": "data/json"}]),
+        return [{**tool(self.PREFIX, "actuator", "Franka 夹爪：开口宽度、抓取、标定与停止。", schema),
                  "multiInstance": True, "configSchema": config}]
 
     def _topic(self, instance_id):
@@ -81,13 +89,13 @@ class GripperPlugin(JointControlPlugin):
     def _info(self, instance_id, instance):
         snapshot = instance.session.snapshot() if instance.session is not None else {}
         motion = instance.session.motion() if instance.session is not None else {}
-        active = instance.publisher is not None
+        active = instance.session is not None
         connected = snapshot.get("connected", False)
         configuration_error = getattr(instance, "configuration_error", None)
         state = ("ready" if connected else "loading") if active else "idle"
         if active and motion.get("status") in ("submitted", "accepted", "running", "stopping"):
             state = "running"
-        if configuration_error or instance.publish_error:
+        if configuration_error:
             state = "error"
         width = snapshot.get("width")
         maximum = snapshot.get("max_width")
@@ -111,13 +119,12 @@ class GripperPlugin(JointControlPlugin):
             "homed": None if maximum is None else maximum > 0,
             "motion": motion, "last_result": getattr(instance, "last_result", None),
             "acp": getattr(instance, "acp", None), "read_only": False,
-            "error": configuration_error or instance.publish_error or snapshot.get("error"),
-            "publication_error": instance.publish_error,
+            "error": configuration_error or snapshot.get("error"),
             "position_unit": "mm", "speed_unit": "mm/s", "force_unit": "N",
-            "topic_in": [], "topic_out": self._topic(instance_id),
+            "topic_in": [], "topic_out": [],
         }
 
-    def dispatch(self, action, args):
+    def _dispatch(self, action, args):
         if args.get("_tool_name", action) != self.PREFIX:
             return None
         if action in (*self.MOTION_ACTIONS, "stopmotion") or (
@@ -146,8 +153,10 @@ class GripperPlugin(JointControlPlugin):
         instance_id = self._instance_id(args)
         instance = self._get_instance(instance_id)
         with instance.lock:
+            if "target_robot_ip" in args and instance.config.get("robot_ip") != args["target_robot_ip"]:
+                raise ValueError("target_robot_ip does not match this card")
             session = instance.session
-            if session is None or instance.publisher is None:
+            if session is None:
                 raise RuntimeError("Start this gripper card before requesting an action")
             if action == "stopmotion":
                 motion = session.stop_gripper(self._owner_key(instance_id))

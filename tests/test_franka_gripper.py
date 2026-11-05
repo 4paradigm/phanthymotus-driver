@@ -78,6 +78,21 @@ class GripperCardTests(unittest.TestCase):
         session.finish(result["action_id"], status)
         fixtures.wait_for(lambda: any(c[0] == result["action_id"] for c in self.completions))
 
+    def test_arm_selection_routes_without_a_topic_or_card_id(self):
+        self.plugin._arm_ips = {"left": "172.16.0.3", "right": "172.16.0.2"}
+        spec, = self.bundle.get_all_tools()
+        self.assertNotIn("robot_ip", spec["configSchema"]["properties"])
+        self.assertNotIn("target_robot_ip", spec["inputSchema"]["properties"])
+        self.assertEqual("ready", self.call("start", speed_mm_s=15)["state"])
+        self.call("start", "hand-b", speed_mm_s=15)
+        self.assertEqual([], self.sessions)
+        left = self.call("set_position", instance_id="", arm="left", width_mm=20)
+        right = self.call("set_position", instance_id="", arm="right", width_mm=20)
+        self.assertEqual(["172.16.0.3", "172.16.0.2"], [session.address for session in self.sessions])
+        self.assertEqual(15, left["speed_mm_s"])
+        self.complete(self.sessions[0], left)
+        self.complete(self.sessions[1], right)
+
     def test_contract_and_start_are_read_only(self):
         definition, = self.bundle.get_all_tools()
         self.assertEqual("actuator", definition["type"])
@@ -130,10 +145,15 @@ class GripperCardTests(unittest.TestCase):
     def test_each_ip_is_independent_and_output_topic_selects_exact_card(self):
         first = self.start()
         second = self.start("hand-b", "172.16.0.3")
-        topic = self.call(instance_id="hand-b")["topic_out"][0]["topic"]
+        topic = self.plugin._topic("hand-b")[0]["topic"]
         result = self.call("set_position", instance_id="", output_topic=topic, width_mm=10)
         self.assertEqual([], first.commands)
         self.assertEqual(1, len(second.commands))
+        self.complete(second, result)
+        self.assertEqual([], self.call(instance_id="hand-b")["topic_out"])
+        result = self.call("set_position", instance_id="", target_robot_ip="172.16.0.3", width_mm=12)
+        self.assertEqual([], first.commands)
+        self.assertEqual(2, len(second.commands))
         self.complete(second, result)
         for args in ({}, {"output_topic": "/unknown"},
                      {"instance_id": "hand-a", "output_topic": topic}):
@@ -150,14 +170,14 @@ class GripperCardTests(unittest.TestCase):
         self.assertEqual("ready", self.call("stopmotion")["state"])
         self.assertEqual(1, len(first.physical_stops))
         self.assertEqual([], second.physical_stops)
-        self.assertEqual(0, self.publishers[0].closed)
+        self.assertEqual([], self.publishers)
 
     def test_stop_failure_is_not_reported_as_stopped(self):
         session = self.start()
         session.stop_error = RuntimeError("SDK stop failed")
         with self.assertRaisesRegex(RuntimeError, "SDK stop failed"):
             self.call("stopmotion")
-        self.assertEqual(0, self.publishers[0].closed)
+        self.assertEqual([], self.publishers)
 
     def test_invalid_input_and_rejected_ip_never_submit(self):
         session = self.start()

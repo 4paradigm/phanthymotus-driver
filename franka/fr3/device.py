@@ -72,6 +72,7 @@ class _Instance:
 class FrankaPlugin:
     """Canvas instances are consumers; sessions own physical connections."""
 
+    PUBLISH_STATE = True
     PREFIX = "joint_states"
     CONFIG_FIELDS = ("robot_ip", "manual_robot_ip", "publish_hz")
 
@@ -364,11 +365,12 @@ class FrankaPlugin:
                         if self._start_cancelled(instance, epoch):
                             self._stop_instance(instance_id, instance)
                             return self._info(instance_id, instance)
-                        instance.publisher = self._publisher_factory(
-                            self._topic(instance_id)[0]["topic"],
-                            cfg["publish_hz"],
-                            lambda: self._publish(instance, epoch),
-                        )
+                        if self.PUBLISH_STATE:
+                            instance.publisher = self._publisher_factory(
+                                self._topic(instance_id)[0]["topic"],
+                                cfg["publish_hz"],
+                                lambda: self._publish(instance, epoch),
+                            )
                         if self._start_cancelled(instance, epoch):
                             self._stop_instance(instance_id, instance)
                     except Exception:
@@ -386,12 +388,96 @@ class FrankaPlugin:
 class JointControlPlugin(FrankaPlugin):
     """Discrete joint targets; the shared session owns hardware arbitration."""
 
+    PUBLISH_STATE = False
+
     PREFIX = "joint_control"
+    ARM_ACTIONS = ("set", "jog", "stopmotion", "Stop")
     CONFIG_FIELDS = FrankaPlugin.CONFIG_FIELDS + ("speed_deg_s",)
 
     def __init__(self, *args, acp_callback=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._acp_callback = acp_callback or self._post_completion
+        config = args[0] if args else kwargs.get("config", {})
+        self._arm_ips = {side: canonical_ip(ip) for side, ip in config.get("motion_arm_ips", {}).items()}
+        if self._arm_ips and (set(self._arm_ips) != {"left", "right"} or len(set(self._arm_ips.values())) != 2):
+            raise ValueError("motion_arm_ips requires distinct left and right IPs")
+        self._arm_lock = threading.RLock()
+        self._armed_cards = set()
+        self._arm_settings = {}
+
+    def _arm_schema(self, config, schema):
+        if not self._arm_ips:
+            return
+        for key in ("robot_ip", "manual_robot_ip"):
+            config["properties"].pop(key, None)
+        schema["properties"].pop("target_robot_ip", None)
+        schema["properties"]["arm"] = {"type": "string", "enum": ["left", "right"],
+                                       "description": "按 Franka 自身方向选择左臂或右臂。"}
+        for action in schema["x-action-params"].values():
+            action["params"].remove("target_robot_ip")
+            action["params"].append("arm")
+
+    def _dispatch_arm(self, action, args):
+        """Route by the action's side, independently of canvas layout."""
+        key = args.get("instance_id")
+        if action in ("config", "start", "info", "stop") and key:
+            with self._arm_lock:
+                if action in ("config", "start"):
+                    previous = self._arm_settings.get(key, {})
+                    settings = {**previous, **{k: args[k] for k in self.CONFIG_FIELDS
+                                if k in args and k not in ("robot_ip", "manual_robot_ip", "publish_hz")}}
+                    self._validate(settings)
+                    if key in self._armed_cards and settings != previous:
+                        raise ValueError("停止卡片后再修改默认参数")
+                    self._arm_settings[key] = settings
+                    if action == "start":
+                        self._armed_cards.add(key)
+                elif action == "stop" and key in self._armed_cards:
+                    for side in self._arm_ips:
+                        self._dispatch("stop", {**args, "instance_id": f"arm_{side}"})
+                    self._armed_cards.remove(key)
+                return {"state": "ready" if key in self._armed_cards else "idle", "topic_out": []}
+        if action not in self.ARM_ACTIONS:
+            return self._dispatch(action, args)
+        with self._arm_lock:
+            side = args.get("arm")
+            if side is None and action == "stopmotion" and not key:
+                return self._dispatch(action, args)
+            if not isinstance(side, str) or side not in self._arm_ips:
+                raise ValueError("Select left or right before executing")
+            if not self._armed_cards or (key and key not in self._armed_cards):
+                raise ValueError("Start the control card before executing")
+            instance_id = f"arm_{side}"
+            forwarded = {k: v for k, v in args.items() if k not in ("output_topic", "target_robot_ip")}
+            forwarded["instance_id"] = instance_id
+            if action != "stopmotion":
+                options = {}
+                if key:
+                    options = self._arm_settings[key]
+                else:
+                    configs = [self._validate(self._arm_settings[card]) for card in self._armed_cards]
+                    for field in self.CONFIG_FIELDS:
+                        if field in FrankaPlugin.CONFIG_FIELDS:
+                            continue
+                        values = {cfg[field] for cfg in configs}
+                        if len(values) == 1:
+                            options[field] = values.pop()
+                        elif field not in args and (field != "force_n" or action == "grasp") and action != "homing":
+                            raise ValueError(f"卡片默认值不同，请在动作中填写 {field}")
+                # Session configuration is stable while a motion is in flight.
+                # Pass card defaults as action options so the backend arbitrates busy state.
+                for field, value in options.items():
+                    forwarded.setdefault(field, value)
+                self._dispatch("start", {"_tool_name": self.PREFIX, "instance_id": instance_id,
+                                         "robot_ip": self._arm_ips[side]})
+            return self._dispatch(action, forwarded)
+
+    def dispatch(self, action, args):
+        if args.get("_tool_name", action) != self.PREFIX:
+            return None
+        if self._arm_ips:
+            return self._dispatch_arm(action, args)
+        return self._dispatch(action, args)
 
     @staticmethod
     def _number(value, name, low=None, high=None):
@@ -424,6 +510,7 @@ class JointControlPlugin(FrankaPlugin):
         # Backend still requires configured IP at start and exact card binding
         # plus fresh, control-ready state before any motion; never guess an IP.
         config.pop("required", None)
+        config["properties"].pop("publish_hz", None)
         config["properties"]["speed_deg_s"] = {
             "type": "number", "title": "默认速度 (度/秒)", "scope": "instance",
             "minimum": 0.1, "maximum": 10, "default": 5,
@@ -438,7 +525,7 @@ class JointControlPlugin(FrankaPlugin):
         }
         properties.update({
             "output_topic": {"type": "string",
-                             "description": "由画布输出端口自动传入，用于匹配控制卡；无需填写。"},
+                             "description": "兼容旧画布传入的输出话题，用于识别卡片实例。"},
             "speed_deg_s": {"type": "number", "title": "速度 (度/秒)",
                             "minimum": 0.1, "maximum": 10,
                             "description": "各轴速度上限；留空使用卡片默认速度。"},
@@ -455,14 +542,20 @@ class JointControlPlugin(FrankaPlugin):
             "stopmotion": ([], "停止所选机械臂当前运动并保留本控制卡，不需要动作 ID；独立状态卡继续读取。"),
             "info": ([], "查看实际角度、目标角度、执行状态及控制就绪条件。"),
         }, properties)
+        schema["properties"]["target_robot_ip"] = {
+            "type": "string",
+            "description": "填写要执行动作的机械臂 IP，须与已启动卡片的配置一致。",
+        }
+        for action in schema["x-action-params"].values():
+            action["params"].append("target_robot_ip")
+        self._arm_schema(config, schema)
         schema["x-completion"] = {"actions": ["set", "jog"], "timeout": 130}
         schema["x-resource"] = "arm"
         schema["x-is-dangerous"] = True
         schema["x-hooks"] = {key: {"action": "stopmotion"}
                              for key in ("on_interrupt_motion", "on_interrupt_all")}
         return [{**tool(self.PREFIX, "actuator",
-                        "Franka FR3 关节控制：J1–J7 角度设置、单次点动及运动停止。", schema,
-                        topic_out=[{"format": "data/json"}]),
+                        "Franka FR3 关节控制：J1–J7 角度设置、单次点动及运动停止。", schema),
                  "multiInstance": True, "configSchema": config}]
 
     def _topic(self, instance_id):
@@ -473,16 +566,23 @@ class JointControlPlugin(FrankaPlugin):
         """Use the existing output-port binding when the canvas omits the ID."""
         instance_id = args.get("instance_id")
         topic = args.get("output_topic")
+        target_ip = args.get("target_robot_ip")
         if "output_topic" in args and (not isinstance(topic, str) or not topic):
             raise ValueError("output_topic must identify this control card")
         if instance_id:
             instance_id = self._instance_id(args)
             if topic is not None and topic != self._topic(instance_id)[0]["topic"]:
                 raise ValueError("Control card instance_id and output_topic do not match")
+            if target_ip is not None and self._get_instance(instance_id).config.get("robot_ip") != target_ip:
+                raise ValueError("target_robot_ip does not match this card")
             return args
         with self._lock:
             matches = [key for key in self._instances
-                       if topic is not None and self._topic(key)[0]["topic"] == topic]
+                       if (topic is not None or target_ip is not None)
+                       and (topic is None or self._topic(key)[0]["topic"] == topic)
+                       and (target_ip is None or (
+                           self._instances[key].session is not None
+                           and self._instances[key].config.get("robot_ip") == target_ip))]
         if len(matches) != 1:
             raise ValueError("Control card identity is missing or unknown; start this card and refresh the canvas")
         return {**args, "instance_id": matches[0]}
@@ -490,13 +590,13 @@ class JointControlPlugin(FrankaPlugin):
     def _info(self, instance_id, instance):
         snapshot = instance.session.snapshot() if instance.session is not None else {}
         motion = instance.session.motion() if instance.session is not None else {}
-        active = instance.publisher is not None
+        active = instance.session is not None
         connected = snapshot.get("connected", False)
         configuration_error = getattr(instance, "configuration_error", None)
         state = ("ready" if connected else "loading") if active else "idle"
         if motion.get("status") in ("submitted", "accepted", "queued", "running", "stopping") and active:
             state = "running"
-        if instance.publish_error or configuration_error:
+        if configuration_error:
             state = "error"
         actual = snapshot.get("q")
         target = motion.get("target")
@@ -514,29 +614,13 @@ class JointControlPlugin(FrankaPlugin):
             "desired_rad": snapshot.get("q_d"), "robot_mode": snapshot.get("robot_mode"),
             "motion": motion, "last_result": getattr(instance, "last_result", None),
             "acp": getattr(instance, "acp", None),
-            "error": configuration_error or instance.publish_error or snapshot.get("error"),
-            "publication_error": instance.publish_error,
+            "error": configuration_error or snapshot.get("error"),
             "position_unit": "deg", "speed_unit": "deg/s",
-            "topic_in": [], "topic_out": self._topic(instance_id),
+            "topic_in": [], "topic_out": [],
         }
 
-    def _publish(self, instance, epoch):
-        if not instance.lock.acquire(blocking=False):
-            return
-        try:
-            if (self._start_cancelled(instance, epoch) or instance.publisher is None
-                    or instance.session is None):
-                return
-            # Status frames carry freshness explicitly; stale actual angles are null.
-            instance.publisher.publish(self._info(instance.instance_id, instance))
-            instance.publish_error = None
-        except Exception as exc:
-            instance.publish_error = f"Control status publication failed: {str(exc)[:200]}"
-        finally:
-            instance.lock.release()
-
     def _stop_instance(self, key, instance):
-        # Do not detach the publisher/session before confirmed backend termination.
+        # Keep the session attached until backend termination is confirmed.
         if instance.session is not None:
             instance.session.release_owner(self._owner_key(key))
         super()._stop_instance(key, instance)
@@ -545,7 +629,7 @@ class JointControlPlugin(FrankaPlugin):
         if getattr(instance, "configuration_error", None):
             raise RuntimeError("Resolve this card's rejected configuration before motion: "
                                + instance.configuration_error)
-        if instance.publisher is None or instance.session is None:
+        if instance.session is None:
             raise RuntimeError("Start this joint_control card before requesting motion")
         snapshot = instance.session.snapshot()
         current = snapshot.get("q")
@@ -642,11 +726,11 @@ class JointControlPlugin(FrankaPlugin):
                 or acknowledgement.get("action_id") != action_id):
             raise RuntimeError("Agent Core did not acknowledge this action_id")
 
-    def dispatch(self, action, args):
+    def _dispatch(self, action, args):
         if args.get("_tool_name", action) != self.PREFIX:
             return None
         if action in ("set", "jog", "Stop") or (action == "stopmotion" and
-                (args.get("instance_id") or "output_topic" in args)) or (
+                (args.get("instance_id") or "output_topic" in args or "target_robot_ip" in args)) or (
                 action in ("info", "stop") and "output_topic" in args):
             args = self._resolve_card(args)
         # Keep old saved canvas actions working without advertising a second stop.
@@ -685,9 +769,11 @@ class JointControlPlugin(FrankaPlugin):
             # startup before waiting on its lock, then stop the selected robot
             # and detach this card only after backend confirmation.
             with self._lock:
-                if instance.publisher is None:
+                if instance.session is None:
                     instance.start_epoch += 1
         with instance.lock:
+            if "target_robot_ip" in args and instance.config.get("robot_ip") != args["target_robot_ip"]:
+                raise ValueError("target_robot_ip does not match this card")
             if action in ("set", "jog"):
                 target, speed = self._prepare_target(action, args, instance)
                 session = instance.session

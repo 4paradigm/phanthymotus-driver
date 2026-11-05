@@ -69,9 +69,7 @@ Speed is 0.1–10 degrees/s. The driver checks target limits with a 0.01 rad
 margin and rejects trajectories exceeding the 120 s motion budget. Joint
 limits do not model obstacles in the workcell.
 
-The `data/json` state includes `actual_deg`, `target_deg`, and motion status.
-Fields ending in `_rad`, as well as `motion.target` and `motion.max_error`, use
-radians. `desired_rad` is the instantaneous desired position.
+`joint_states` publishes joint feedback for monitoring.
 
 ## Franka Hand
 
@@ -86,8 +84,13 @@ Start `gripper` after selecting its controller. Starting reads the opening.
 
 The width limit is the smaller of 80 mm and the measured maximum opening.
 Speed defaults to 20 mm/s (range 0.1–100). Force defaults to 30 N (range 30–70)
-and applies to `grasp`. The state stream reports actual and maximum opening,
-grasp status, temperature, and action result.
+and applies to `grasp`. The `info` action reports the current and maximum opening.
+
+The motion cards expose command responses and ACP completion events.
+On canvases that omit the instance ID, enter `target_robot_ip` when executing
+an action. It must match exactly one started card of that type. Motion cards
+do not advertise or publish status streams. Re-add existing motion cards
+if their saved canvas layout still contains an old output topic.
 
 ## Action completion
 
@@ -126,3 +129,9 @@ For hardware acceptance, record the image version and controller tested.
 Confirm fresh joint state, the three camera channels and USB reconnect,
 then verify arm and gripper motion, stop behavior, and ACP acknowledgement
 with the operator monitoring the workcell.
+
+With `motion_arm_ips` configured, select the arm in each action. Multiple
+cards can start without binding a side. Each arm accepts one in-flight action
+per control type. Set the controller addresses under `motion_arm_ips.left`
+and `motion_arm_ips.right`. When the canvas omits the card ID, use matching
+card defaults or supply the differing parameters in the action.

@@ -271,7 +271,8 @@ class JointControlTests(unittest.TestCase):
         self.assertEqual(1, schema["properties"]["action"]["enum"].count("stopmotion"))
         self.assertNotIn("stop", schema["properties"]["action"]["enum"])
         self.assertNotIn("action_id", schema["properties"])
-        self.assertEqual([], schema["x-action-params"]["stopmotion"]["params"])
+        self.assertEqual(["target_robot_ip"], schema["x-action-params"]["stopmotion"]["params"])
+        self.assertFalse(spec.get("topic_out"))
         self.assertNotIn("robot_ip", spec["configSchema"].get("required", []))
         self.assertIn("robot_ip", tools["joint_states"]["configSchema"]["required"])
         self.assertEqual("string", schema["properties"]["output_topic"]["type"])
@@ -304,7 +305,7 @@ class JointControlTests(unittest.TestCase):
         first = self.start("control-a", "172.16.0.2")
         second = self.start("control-b", "172.16.0.3")
         for key, session, degrees in (("control-a", first, 1), ("control-b", second, 2)):
-            topic = self.call("info", key)["topic_out"][0]["topic"]
+            topic = self.controller._topic(key)[0]["topic"]
             result = self.bundle.dispatch("joint_control", {
                 "action": "jog", "output_topic": topic, "joint": 1, "step_deg": degrees,
             })
@@ -322,7 +323,7 @@ class JointControlTests(unittest.TestCase):
         second = self.start("control-b", "172.16.0.3")
         a = self.call("set", "control-a", joint1_deg=1)
         b = self.call("set", "control-b", joint1_deg=1)
-        topic = self.call("info", "control-b")["topic_out"][0]["topic"]
+        topic = self.controller._topic("control-b")[0]["topic"]
         result = self.bundle.dispatch("joint_control", {"action": "stopmotion", "output_topic": topic})
         self.assertEqual("ready", result["state"])
         self.assertEqual("cancelled", self.completed(b["action_id"])[1])
@@ -335,7 +336,7 @@ class JointControlTests(unittest.TestCase):
     def test_missing_unknown_or_conflicting_card_binding_never_selects_an_arm(self):
         first = self.start("control-a", "172.16.0.2")
         second = self.start("control-b", "172.16.0.3")
-        topic = self.call("info", "control-b")["topic_out"][0]["topic"]
+        topic = self.controller._topic("control-b")[0]["topic"]
         bindings = [{}, {"output_topic": ""}, {"output_topic": 42},
                     {"output_topic": topic + "/stale"},
                     {"instance_id": "control-a", "output_topic": topic}]
@@ -355,14 +356,14 @@ class JointControlTests(unittest.TestCase):
             self.call("start")
         self.assertEqual([], self.sessions)
         self.call("config", robot_ip="172.16.0.3")
-        topic = self.call()["topic_out"][0]["topic"]
+        topic = self.controller._topic("control-a")[0]["topic"]
         with self.assertRaisesRegex(RuntimeError, "Start this joint_control card"):
             self.bundle.dispatch("joint_control", {"action": "set", "output_topic": topic, "joint1_deg": 1})
         self.assertEqual([], self.sessions)
 
     def test_rejected_configuration_blocks_topic_motion_using_old_ip(self):
         session = self.start()
-        topic = self.call()["topic_out"][0]["topic"]
+        topic = self.controller._topic("control-a")[0]["topic"]
         for ip in ("172.16.0.2", "invalid-ip"):
             with self.subTest(ip=ip):
                 with self.assertRaises(ValueError):
@@ -398,7 +399,7 @@ class JointControlTests(unittest.TestCase):
 
     def test_canvas_jog_accepts_large_signed_steps_for_each_joint(self):
         session = self.start()
-        topic = self.call()["topic_out"][0]["topic"]
+        topic = self.controller._topic("control-a")[0]["topic"]
         for joint in range(1, 8):
             for step in (15, -15):
                 with self.subTest(joint=joint, step=step):
@@ -520,7 +521,6 @@ class JointControlTests(unittest.TestCase):
         session, action_id = self.started_move()
         session.complete_stop_immediately = False
         original_wait = session.wait
-        publisher = self.publishers[-1]
 
         def unconfirmed(command_id, timeout=None):
             if timeout == 3.5:
@@ -534,9 +534,8 @@ class JointControlTests(unittest.TestCase):
             self.assertEqual("stopping", session.motion()["status"])
             self.assertEqual(0, session.closed)
             self.assertEqual([], self.completions)
-            publisher.callback()
-            self.assertEqual(1, len(publisher.frames))
-            self.assertEqual("stopping", publisher.frames[-1]["motion"]["status"])
+            self.assertEqual("stopping", self.call()["motion"]["status"])
+            self.assertEqual([], self.publishers)
         finally:
             session.wait = original_wait
             session.finish(action_id, "cancelled")
