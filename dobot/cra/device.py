@@ -28,7 +28,7 @@ class DobotSensors:
     def __init__(self, config, namespace="dobot_cra", ros2=None, client=None, controller=None):
         self.client = client if client is not None else FeedbackClient(config)
         self.control = controller if controller is not None else RobotController(self.client, config)
-        self._hz = positive_number(config.get("publish_hz", 10), "publish_hz")
+        self._hz = positive_number(config.get("publish_hz", 30), "publish_hz")
         if self._hz > 125:
             raise ValueError("publish_hz must not exceed the 125 Hz feedback rate")
         self._ros2 = ros2

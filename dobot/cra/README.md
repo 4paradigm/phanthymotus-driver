@@ -16,7 +16,7 @@
 
 ## 关节输出
 
-默认以 10Hz 发布 `std_msgs/String` JSON，两个输出共用同一份反馈快照：
+默认以 30Hz（约每 33ms）发布 `std_msgs/String` JSON，两个输出共用同一份反馈快照：
 
 - `/dobot_cra/state/joints`，`sensor/skeleton`；仅包含 `timestamp_ms/available/joints`。
   每个关节包含 `name/q`，`q` 为弧度，关节名为 `joint1..joint6`。
