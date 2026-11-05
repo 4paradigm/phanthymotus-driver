@@ -1,4 +1,4 @@
-"""Process-isolated camera encoding and point-cloud packing for S10 media."""
+"""Process-isolated point-cloud packing and RTSP camera pulling for S10 media."""
 
 from __future__ import annotations
 
@@ -30,12 +30,6 @@ class MediaWorkers:
         self._closed = False
         self._rtsp_threads = {}
         self._rtsp_processes = {}
-
-    def add_camera(self, lane):
-        self._add(lane, "camera")
-
-    def add_compressed_camera(self, lane):
-        self._add(lane, "compressed_camera")
 
     def add_lidar(self, lane):
         self._add(lane, "lidar")
@@ -223,109 +217,14 @@ def _worker(jobs, results, kind, lane):
         if job is None:
             return
         try:
-            if kind in ("camera", "compressed_camera"):
-                if len(job) == 2:
-                    header, data = job
-                    packet = _reencode_jpeg(data)
-                else:
-                    header, width, height, step, encoding, data = job
-                    packet = _jpeg(width, height, step, encoding, data)
-            else:
-                header, fields, bigendian, width, height, row_step, point_step, data = job
-                packet = encode_pointcloud(fields, bigendian, width, height, row_step,
-                                           point_step, data)
-            # Each lane has its own one-frame result queue, so camera traffic
-            # cannot evict a newer lidar frame (or vice versa).
+            header, fields, bigendian, width, height, row_step, point_step, data = job
+            packet = encode_pointcloud(fields, bigendian, width, height, row_step,
+                                       point_step, data)
             _put_latest(results, (lane, header, packet))
         except Exception as exc:
             failures += 1
             if failures == 1 or failures % 100 == 0:
                 print(f"[media-worker] {lane} failed ({failures}): {exc!r}", flush=True)
-
-
-def _jpeg(width, height, step, encoding, data):
-    from io import BytesIO
-    from PIL import Image
-    encoding = str(encoding).lower()
-    if encoding in ("jpeg", "jpg", "mjpeg"):
-        payload = bytes(data)
-        try:
-            image = Image.open(BytesIO(payload)).convert("RGB")
-        except (OSError, ValueError):
-            return None
-        stream = BytesIO()
-        _save_preview(image, stream)
-        return stream.getvalue()
-    if encoding in ("nv12", "nv21"):
-        try:
-            width, height, step = int(width), int(height), int(step)
-            raw = bytes(data)
-            y_size = step * height
-            uv_rows = (height + 1) // 2
-            if width <= 0 or height <= 0 or step < width or len(raw) < y_size + step * uv_rows:
-                return None
-            # Keep this conversion dependency-free. The camera driver commonly
-            # publishes NV12/NV21, and adding NumPy just for this path adds a
-            # large wheel to the runtime image.
-            rgb = bytearray(width * height * 3)
-            out = 0
-            for y in range(height):
-                y_row = y * step
-                uv_row = y_size + (y // 2) * step
-                for x in range(width):
-                    chroma = uv_row + (x // 2) * 2
-                    u, v = raw[chroma], raw[chroma + 1]
-                    if encoding == "nv21":
-                        u, v = v, u
-                    luminance = raw[y_row + x]
-                    c = luminance - 16
-                    d, e = u - 128, v - 128
-                    rgb[out] = max(0, min(255, (298 * c + 409 * e + 128) >> 8))
-                    rgb[out + 1] = max(0, min(255, (298 * c - 100 * d - 208 * e + 128) >> 8))
-                    rgb[out + 2] = max(0, min(255, (298 * c + 516 * d + 128) >> 8))
-                    out += 3
-            image = Image.frombytes("RGB", (width, height), bytes(rgb))
-        except (IndexError, ValueError, TypeError):
-            return None
-        stream = BytesIO()
-        _save_preview(image, stream)
-        return stream.getvalue()
-    mode, raw_mode = {"rgb8": ("RGB", "RGB"), "bgr8": ("RGB", "BGR"),
-                      "rgba8": ("RGBA", "RGBA"), "bgra8": ("RGBA", "BGRA"),
-                      "mono8": ("L", "L"), "8uc1": ("L", "L")}.get(encoding, (None, None))
-    if mode is None:
-        return None
-    image = Image.frombytes(mode, (int(width), int(height)), bytes(data), "raw", raw_mode, int(step), 1)
-    if image.mode == "RGBA":
-        image = image.convert("RGB")
-    stream = BytesIO()
-    _save_preview(image, stream)
-    return stream.getvalue()
-
-
-def _save_preview(image, stream):
-    """Encode a bounded dashboard preview instead of queuing full frames."""
-    max_dimension = 640
-    if max(image.size) > max_dimension:
-        scale = max_dimension / float(max(image.size))
-        image = image.resize((max(1, int(image.width * scale)),
-                              max(1, int(image.height * scale))))
-    image.save(stream, format="JPEG", quality=65, optimize=False)
-
-
-def _reencode_jpeg(data):
-    # The vendor sometimes declares an already encoded JPEG as sensor_msgs/Image
-    # with encoding=jpeg. Preserve valid payloads byte-for-byte; decoding these
-    # non-standard Image samples can produce black frames or corrupt the image.
-    payload = bytes(data)
-    if payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9"):
-        return payload
-    from io import BytesIO
-    from PIL import Image
-    image = Image.open(BytesIO(payload)).convert("RGB")
-    stream = BytesIO()
-    _save_preview(image, stream)
-    return stream.getvalue()
 
 
 def encode_pointcloud(fields, bigendian, width, height, row_step, point_step, data,

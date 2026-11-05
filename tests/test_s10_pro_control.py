@@ -208,7 +208,7 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
                 ("/s10/rear/image/compressed", ["sensor_msgs/msg/CompressedImage"]),
                 ("/s10/left/image", ["sensor_msgs/msg/Image"]),
                 ("/s10/right/image", ["sensor_msgs/msg/Image"]),
-                    ("/s10/depth", ["sensor_msgs/msg/PointCloud2"]),
+                ("/s10/depth", ["sensor_msgs/msg/PointCloud2"]),
             ]
 
         def destroy_node(self):
@@ -228,10 +228,9 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
 
     class Imu: pass
     class PointCloud2: pass
-    class Image: pass
     class CompressedImage:
         def __init__(self):
-            self.header = None
+            self.header = SimpleNamespace(frame_id="", stamp=SimpleNamespace(sec=0, nanosec=0))
             self.format = ""
             self.data = []
     class JointsData: pass
@@ -260,7 +259,7 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     qos_module.QoSProfile = QoSProfile
     sensor_msg = ModuleType("sensor_msgs.msg")
     sensor_msg.Imu, sensor_msg.PointCloud2 = Imu, PointCloud2
-    sensor_msg.Image, sensor_msg.CompressedImage = Image, CompressedImage
+    sensor_msg.CompressedImage = CompressedImage
     standard_msg = ModuleType("std_msgs.msg")
     standard_msg.String, standard_msg.UInt8MultiArray = String, UInt8MultiArray
     drdds_msg = ModuleType("drdds.msg")
@@ -283,13 +282,42 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
             return {"enqueued": 1, "dropped": 0, "alive": True}
         def stop(self):
             pass
+
+    class FakeMediaWorkers:
+        def __init__(self, on_result):
+            self.on_result = on_result
+            self.rtsp_sources = {}
+        def add_lidar(self, _lane):
+            pass
+        def add_rtsp_camera(self, lane, url):
+            self.rtsp_sources[lane] = url
+        def submit(self, lane, job):
+            header, fields, bigendian, width, height, row_step, point_step, data = job
+            packet = device.encode_pointcloud(fields, bigendian, width, height,
+                                              row_step, point_step, data)
+            self.on_result(lane, header, packet)
+            return True
+        def rtsp_alive(self, _lane):
+            return True
+        def is_alive(self, _lane):
+            return True
+        def close(self):
+            pass
+
     monkeypatch.setattr(device, "CoreBridge", FakeBridge)
+    monkeypatch.setattr(device, "MediaWorkers", FakeMediaWorkers)
 
     ros2 = SimpleNamespace(
         ctx_robot=object(), ctx_core=object(),
         executor_robot=Executor(), executor_core=Executor(),
     )
-    nodes = device.S10Nodes({"camera_topics": {"camera_rear": "/CAMERA/RAW"}}, "robot", ros2)
+    camera_rtsp = {
+        "camera_front": "rtsp://10.21.33.103:8554/video4",
+        "camera_rear": "rtsp://10.21.33.103:8554/video0",
+        "camera_left": "rtsp://10.21.33.103:8554/video2",
+        "camera_right": "rtsp://10.21.33.103:8554/video6",
+    }
+    nodes = device.S10Nodes({"camera_rtsp": camera_rtsp, "media_workers": True}, "robot", ros2)
     callbacks = nodes.robot.subscriptions
     assert nodes.topics["imu"]["topic"] == "/robot/imu"
     assert "/s10/depth" in callbacks
@@ -347,13 +375,10 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     odom_definition = next(card for card in state_card.get_tools() if card["name"] == "odom")
     assert odom_definition["topic_out"] == [nodes.topics["odom"]]
 
-    camera_msg = SimpleNamespace(width=2, height=1, step=6, encoding="rgb8",
-                                 data=bytes((255, 0, 0, 0, 255, 0)), header={"stamp": 1})
-    callbacks["/CAMERA/RAW"](camera_msg)
+    nodes._handle_media_result("camera_rear", None, b"\xff\xd8jpeg\xff\xd9")
     camera_output = nodes.camera_publishers["camera_rear"].messages[-1]
     assert camera_output.format == "jpeg"
-    assert bytes(camera_output.data).startswith(b"\xff\xd8")
-    assert camera_output.header == camera_msg.header
+    assert bytes(camera_output.data) == b"\xff\xd8jpeg\xff\xd9"
 
     point_data = struct.pack("<ffffff", 1.0, 2.0, 3.0, math.nan, 5.0, 6.0)
     lidar = SimpleNamespace(
@@ -378,16 +403,14 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert stream_status["lidar_cloud"]["received"] == stream_status["lidar_cloud"]["published"] == 1
     assert stream_status["lidar_map"]["received"] == stream_status["lidar_map"]["published"] == 1
     assert stream_status["camera_rear"]["received"] == stream_status["camera_rear"]["published"] == 1
-    assert "/s10/front/image" in nodes.robot.subscriptions
-    assert nodes._source_topics["camera_rear"] == "/CAMERA/RAW"
-    assert nodes._source_topics["camera_left"] == "/s10/left/image"
-    assert nodes._source_topics["camera_front"] == "/s10/front/image"
-    assert nodes._source_topics["camera_right"] == "/s10/right/image"
+    assert not any("image" in topic for topic in nodes.robot.subscriptions)
+    assert nodes._source_topics["camera_rear"] == camera_rtsp["camera_rear"]
+    assert nodes._source_topics["camera_front"] == camera_rtsp["camera_front"]
+    assert nodes.media_workers.rtsp_sources == camera_rtsp
     assert "/s10/depth" in nodes.robot.subscriptions
     groups = nodes.robot.subscription_groups
-    assert groups["/s10/rear/image/compressed"] is groups["/CAMERA/RAW"]
-    assert groups["/s10/left/image"] is not groups["/s10/rear/image/compressed"]
-    assert groups["/DEPTH_POINTS"] is not groups["/s10/rear/image/compressed"]
+    assert "/s10/rear/image/compressed" not in groups
+    assert "/s10/left/image" not in groups
     assert groups["/s10/depth"] is not groups["/DEPTH_POINTS"]
     assert nodes._sensor_qos.kwargs == {
         "depth": 1, "history": 1, "reliability": 2, "durability": 2}
@@ -430,61 +453,6 @@ def test_lidar_packet_supports_float64_big_endian_and_validates_layout(monkeypat
     assert device.S10Nodes._pointcloud_packet(lidar) is None
 
 
-def test_camera_ros_image_encodes_to_frontend_jpeg(monkeypatch):
-    device = _load_device(monkeypatch)
-    msg = SimpleNamespace(width=2, height=1, step=6, encoding="rgb8",
-                          data=bytes((255, 0, 0, 0, 255, 0)))
-    encoded = device.S10Nodes._jpeg_from_ros_image(msg)
-    assert encoded.startswith(b"\xff\xd8") and encoded.endswith(b"\xff\xd9")
-
-
-@pytest.mark.parametrize("encoding", ["nv12", "nv21"])
-def test_nv12_camera_image_encodes_without_numpy(monkeypatch, encoding):
-    _load_device(monkeypatch)
-    import media_workers
-
-    # 2x2 neutral gray frame: Y=128, U=V=128. NV12 and NV21 differ only in
-    # chroma byte order, so both must produce a valid JPEG without NumPy.
-    payload = bytes([128, 128, 128, 128, 128, 128])
-    encoded = media_workers._jpeg(2, 2, 2, encoding, payload)
-    assert encoded.startswith(b"\xff\xd8") and encoded.endswith(b"\xff\xd9")
-
-
-def test_vendor_mjpeg_image_is_published_without_worker_hop(monkeypatch):
-    device = _load_device(monkeypatch)
-    sensor_msg = ModuleType("sensor_msgs.msg")
-    sensor_msg.CompressedImage = type("CompressedImage", (), {"__init__": lambda self: None})
-    monkeypatch.setitem(__import__("sys").modules, "sensor_msgs.msg", sensor_msg)
-    nodes = device.S10Nodes.__new__(device.S10Nodes)
-    published = []
-    nodes.camera_publishers = {"camera_rear": SimpleNamespace(publish=published.append)}
-    nodes.media_workers = SimpleNamespace(submit=lambda *_args: (_ for _ in ()).throw(
-        AssertionError("valid MJPEG must bypass worker")))
-    nodes._stream_lock = threading.Lock()
-    nodes._source_topics = {"camera_rear": "/usb_camera_1/image_raw"}
-    nodes.topics = {"camera_rear": {"topic": "/host/s10_pro/camera_rear"}}
-    nodes._stream_stats = {"camera_rear": {"received": 0, "published": 0, "dropped": 0,
-                                            "last_received": None, "last_published": None}}
-    msg = SimpleNamespace(encoding="jpeg", data=b"\xff\xd8jpeg\xff\xd9",
-                          header=SimpleNamespace(stamp=SimpleNamespace(sec=0, nanosec=0)))
-    nodes._forward_camera("camera_rear", msg)
-    assert len(published) == 1
-    assert published[0].data == msg.data
-
-
-def test_compressed_jpeg_is_downscaled_for_low_latency_preview(monkeypatch):
-    _load_device(monkeypatch)
-    import media_workers
-    from io import BytesIO
-    from PIL import Image
-    source = BytesIO()
-    Image.new("RGB", (1280, 720), (255, 0, 0)).save(source, format="JPEG")
-    payload = media_workers._reencode_jpeg(source.getvalue())
-    assert payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9")
-    with Image.open(BytesIO(payload)) as image:
-        assert image.size == (1280, 720)
-
-
 def test_model_resource_returns_official_urdf(monkeypatch):
     device = _load_device(monkeypatch)
     plugin = device.S10ModelPlugin()
@@ -513,19 +481,11 @@ def test_model_resource_returns_official_urdf(monkeypatch):
         subprocess.run([checker, str(urdf_path)], check=True, capture_output=True, text=True)
 
 
-def test_camera_config_uses_only_four_canonical_topics():
+def test_camera_config_uses_only_four_rtsp_streams():
     config = yaml.safe_load((DRIVER / "config.yaml").read_text())
-    cameras = config["camera_topics"]
-    lanes = ("camera_rear", "camera_left", "camera_front", "camera_right")
-    assert set(cameras) == set(lanes)
-    assert cameras == {
-        "camera_rear": "/camera/rear/image_raw",
-        "camera_left": "/camera/left/image_raw",
-        "camera_front": "/camera/front/image_raw",
-        "camera_right": "/camera/right/image_raw",
-    }
-    assert config["camera_discovery"] is False
-    assert config["camera_source"] == "rtsp"
+    assert "camera_topics" not in config
+    assert "camera_discovery" not in config
+    assert "camera_source" not in config
     assert config["camera_rtsp"] == {
         "camera_front": "rtsp://10.21.33.103:8554/video4",
         "camera_rear": "rtsp://10.21.33.103:8554/video0",
@@ -563,40 +523,31 @@ def test_rtsp_mjpeg_parser_handles_fragmented_and_multiple_frames():
     assert command[-1] == "pipe:1"
 
 
-def test_camera_discovery_skips_unconfigured_vendor_aliases(monkeypatch):
+def test_camera_ros_topics_are_not_subscribed(monkeypatch):
     device = _load_device(monkeypatch)
     sensor_msg = ModuleType("sensor_msgs.msg")
-    sensor_msg.CompressedImage = type("CompressedImage", (), {})
-    sensor_msg.Image = type("Image", (), {})
     sensor_msg.PointCloud2 = type("PointCloud2", (), {})
     monkeypatch.setitem(__import__("sys").modules, "sensor_msgs.msg", sensor_msg)
-
     nodes = device.S10Nodes.__new__(device.S10Nodes)
+    subscriptions = []
     nodes.robot = SimpleNamespace(
         get_topic_names_and_types=lambda: [
             ("/camera/front/image_raw", ["sensor_msgs/msg/Image"]),
-            ("/usb_camera_3/image_raw", ["sensor_msgs/msg/Image"]),
+            ("/usb_camera_3/image_raw", ["sensor_msgs/msg/CompressedImage"]),
         ],
-        create_subscription=lambda msg_type, topic, callback, qos, callback_group=None:
-        (msg_type, topic, callback),
-        destroy_subscription=lambda _handle: None,
+        create_subscription=lambda *args, **kwargs: subscriptions.append((args, kwargs)),
     )
-    nodes._discover_camera_aliases = False
-    nodes._configured_camera_lanes = {"/camera/front/image_raw": "camera_front"}
-    nodes._camera_topic_lanes = {}
     nodes._media_topic_subscriptions = set()
+    nodes._lidar_topics = []
+    nodes._lidar_map_topic = "/ACCUMULATED_POINTS_MAP"
+    nodes._source_topics = {}
+    nodes._sensor_qos = object()
+    nodes._lidar_callback_groups = {}
+    nodes._media_subscriptions = []
     nodes._media_topic_types = {}
     nodes._media_subscription_handles = {}
-    nodes._discovered_media = set()
-    nodes._media_subscriptions = []
-    nodes._media_callback_groups = {"camera_front": object()}
-    nodes._source_topics = {"camera_front": None}
-    nodes._sensor_qos = object()
-
     nodes._scan_media_topics()
-
-    assert nodes._media_topic_subscriptions == {"/camera/front/image_raw"}
-    assert nodes._source_topics["camera_front"] == "/camera/front/image_raw"
+    assert subscriptions == []
 
 
 def test_lidar_cloud_probes_previous_pointcloud_topics_but_keeps_map_separate():
@@ -606,44 +557,6 @@ def test_lidar_cloud_probes_previous_pointcloud_topics_but_keeps_map_separate():
     assert "/ACCUMULATED_POINTS_MAP" not in candidates
     assert {"/DEPTH_POINTS", "/local_scans", "/ALIGNED_POINTS",
             "/CLOUD_REGISTERED_BODY", "/FULL_CLOUD_MAP", "/LIDAR/POINTS"} <= set(candidates)
-
-
-def test_discovered_unclassified_camera_topics_reserve_distinct_lanes(monkeypatch):
-    device = _load_device(monkeypatch)
-    nodes = device.S10Nodes.__new__(device.S10Nodes)
-    nodes._configured_camera_lanes = {}
-    nodes._camera_topic_lanes = {}
-
-    lanes = [nodes._assign_camera_lane(f"/stream/camera_{index}/image")
-             for index in range(4)]
-
-    assert lanes == ["camera_rear", "camera_left", "camera_front", "camera_right"]
-
-
-def test_camera_lane_recognizes_numbered_camera_topic_independent_of_discovery_order(monkeypatch):
-    device = _load_device(monkeypatch)
-    nodes = device.S10Nodes.__new__(device.S10Nodes)
-    nodes._configured_camera_lanes = {}
-    nodes._camera_topic_lanes = {}
-
-    assert nodes._assign_camera_lane("/camera_3/image_raw") == "camera_right"
-    assert nodes._assign_camera_lane("/camera_1/image_raw") == "camera_left"
-    assert nodes._assign_camera_lane("/usb_camera_2/image_raw") == "camera_left"
-    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_0") is None
-    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_1") is None
-    assert nodes._assign_camera_lane("/camera_0/image_raw") == "camera_rear"
-
-
-def test_unclassified_depth_image_does_not_claim_directional_camera_lane(monkeypatch):
-    device = _load_device(monkeypatch)
-    config = yaml.safe_load((DRIVER / "config.yaml").read_text())
-    assert all("/DEPTH_IMAGE" not in topics
-               for topics in config["camera_topics"].values())
-    assert device.S10Nodes._camera_key_for_topic("/DEPTH_IMAGE") is None
-    nodes = device.S10Nodes.__new__(device.S10Nodes)
-    nodes._configured_camera_lanes = {"/usb_camera_1/image_raw_2": "camera_right"}
-    nodes._camera_topic_lanes = {}
-    assert nodes._assign_camera_lane("/usb_camera_1/image_raw_2") == "camera_right"
 
 
 def test_light_cycle_controls_are_scoped_to_breathe_and_blink_actions(monkeypatch):
@@ -658,6 +571,7 @@ def test_light_cycle_controls_are_scoped_to_breathe_and_blink_actions(monkeypatc
     native = Native()
     plugin = device.S10SingleLightPlugin(native, "head")
     schema = plugin.get_tool()["inputSchema"]
+    assert schema["x-resource"] == "head_light"
     actions = schema["x-action-params"]
     assert set(actions) == {"constant", "fill_flow", "moving_flow", "gradient_flow", "breathe", "blink"}
     for action in ("constant", "fill_flow", "moving_flow", "gradient_flow"):
@@ -1147,10 +1061,28 @@ def test_navigation_declares_completion_and_rejects_unconfirmed_goals(monkeypatc
     schema = plugin.get_tool()["inputSchema"]
     assert schema["x-is-dangerous"] is True
     assert schema["x-completion"] == {"actions": ["goal", "route"], "timeout": 55}
+    assert schema["x-resource"] == ["base", "map"]
     assert "confirm" in schema["x-action-params"]["goal"]["params"]
     assert "confirm" in schema["x-action-params"]["route"]["params"]
     assert plugin.dispatch("goal", {"x": 1, "y": 2, "yaw_degrees": 0})["code"] == "INVALID_ARGUMENT"
     assert native.calls == []
+
+
+def test_navigation_pauses_an_active_servo_before_starting_goal(monkeypatch):
+    device = _load_device(monkeypatch)
+    plugin = device.S10NavigationPlugin(FakeNative({"navigation_task_timeout": 1}))
+    paused = []
+    plugin.attach_servo(SimpleNamespace(pause_for_explicit_command=paused.append))
+    plugin._acp_callback = lambda *_args: None
+
+    result = plugin.dispatch("goal", {"x": 1, "y": 2, "yaw_degrees": 0, "confirm": True})
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and plugin.is_moving():
+        time.sleep(0.01)
+
+    assert result["state"] == "accepted"
+    assert paused == ["goal"]
+    assert not plugin.is_moving()
 
 
 def test_navigation_route_uses_native_multi_item_contract(monkeypatch):
@@ -1270,6 +1202,7 @@ def test_loco_card_uses_shared_action_names_and_native_velocity_commands(monkeyp
     for action in ("move", "manual_control", "stand_up", "stand_down", "stop_move"):
         assert "confirm" not in definition["inputSchema"]["x-action-params"][action]["params"]
     assert definition["inputSchema"]["x-is-dangerous"] is True
+    assert definition["inputSchema"]["x-resource"] == "base"
     assert "x-completion" not in definition
     assert definition["name"] == "loco"
     assert {"move", "stop_move", "stand_up", "stand_down", "damp"} <= set(definition["inputSchema"]["x-action-params"])
@@ -1416,18 +1349,16 @@ def test_axis_stream_has_action_id_and_acp_cancel(monkeypatch):
         plugin.stop()
 
 
-def test_zero_duration_stream_completes_acp_immediately(monkeypatch):
+def test_zero_duration_stream_is_synchronous_and_does_not_register_acp(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
     plugin = device.S10MotionPlugin(native)
     terminals = []
     plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
-    result = plugin.dispatch("axis", {"x": 0, "duration": 0})
+    result = plugin.dispatch("move", {"vx": 0, "duration": 0})
     assert result["state"] == "stopped"
-    assert result["action_id"].startswith("s10_axis_")
-    assert terminals == [(result["action_id"], "completed", {
-        "state": "stopped", "reason": "zero_duration",
-    })]
+    assert "action_id" not in result
+    assert terminals == []
 
 
 def test_loco_stream_send_error_reports_terminal_error(monkeypatch):
@@ -1492,6 +1423,7 @@ def test_controlled_spatial_uses_fixed_drmap_commands_and_confirmation(monkeypat
     monkeypatch.setattr(subprocess, "run", run)
     plugin = S10ControlledSpatialPlugin({"basic_server": {"host": "10.21.33.103"},
                                          "controlled_spatial": {"mode": "ssh", "ssh_host": "10.21.33.106"}})
+    assert plugin.get_tool()["inputSchema"]["x-resource"] == "map"
     assert plugin.dispatch("start", {}) == {"state": "ready"}
     assert plugin.dispatch("stop", {}) == {"state": "idle"}
     assert plugin.dispatch("unknown", {}) is None
@@ -1637,6 +1569,7 @@ def test_loco_servo_is_a_dry_run_velocity_sink_by_default(monkeypatch):
     assert "groups" not in build_descriptor()
     definition = plugin.get_tool()
     assert definition["name"] == "loco_servo"
+    assert definition["inputSchema"]["x-resource"] == "base"
     assert definition["topic_in"][0]["format"] == "control/velocity"
     descriptor = build_descriptor()
     assert descriptor["limits"]["lower"] == [-1.67, -0.4, 0, 0, 0, -1.0]
@@ -1658,6 +1591,19 @@ def test_loco_servo_is_a_dry_run_velocity_sink_by_default(monkeypatch):
                                        "confirm": True})
     assert result["state"] == "error"
     assert "S10_MOTION_ENABLED" in result["message"]
+
+
+def test_loco_servo_refuses_to_start_while_navigation_owns_base(monkeypatch):
+    device = _load_device(monkeypatch)
+    from loco_servo import S10LocoServoPlugin
+
+    plugin = S10LocoServoPlugin(FakeNative({}), ros2=object())
+    plugin.attach_navigation(SimpleNamespace(is_moving=lambda: True))
+
+    result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": True})
+
+    assert result["state"] == "error"
+    assert "navigation" in result["message"]
 
 
 def test_loco_servo_start_can_atomically_arm_with_confirmation(monkeypatch):
@@ -1876,6 +1822,7 @@ def test_control_schema_exposes_supported_navigation_and_light_options(monkeypat
     assert light_tool["name"] == "head_light"
     charge_schema = device.S10ChargePlugin(native).get_tool()["inputSchema"]
     assert charge_schema["x-is-dangerous"] is True
+    assert charge_schema["x-resource"] == "base"
     assert "confirm" in charge_schema["x-action-params"]["start_charging"]["params"]
     assert "confirm" in charge_schema["x-action-params"]["stop_charging"]["params"]
 
@@ -2037,6 +1984,35 @@ def test_loco_completion_is_delivered_asynchronously(monkeypatch):
     assert callback["action_id"] == "s10-test"
     assert callback["status"] == "completed"
     assert callback["tool"] == "loco"
+
+
+def test_acp_callback_posts_standard_terminal_envelope(monkeypatch):
+    device = _load_device(monkeypatch)
+    monkeypatch.setenv("AGENT_CORE_URL", "https://localhost:15678")
+    requests = []
+
+    class Response:
+        status = 204
+        def __enter__(self): return self
+        def __exit__(self, *_args): pass
+
+    def urlopen(request, **kwargs):
+        requests.append((request, kwargs))
+        return Response()
+
+    monkeypatch.setattr(device.urllib.request, "urlopen", urlopen)
+    device._post_acp_callback("s10_action_123", "cancelled", {"reason": "stopped"}, "loco")
+
+    request, kwargs = requests[0]
+    payload = json.loads(request.data)
+    assert request.full_url == "https://localhost:15678/api/acp/complete"
+    assert request.method == "POST"
+    assert payload["action_id"] == "s10_action_123"
+    assert payload["status"] == "cancelled"
+    assert payload["result"] == {"reason": "stopped"}
+    assert payload["tool"] == "loco"
+    assert isinstance(payload["ts"], (int, float))
+    assert kwargs["timeout"] == 3
 
 
 def test_malformed_final_fragment_is_discarded_without_killing_decoder():

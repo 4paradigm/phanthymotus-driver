@@ -32,6 +32,7 @@ class S10LocoServoPlugin:
 
     def __init__(self, native, ros2=None, motion=None):
         self.native, self.ros2, self.motion = native, ros2, motion
+        self.navigation = None
         self._motion_enabled = False
         self._descriptor_raw = build_descriptor()
         self._descriptor = parse_descriptor(self._descriptor_raw)
@@ -61,7 +62,7 @@ class S10LocoServoPlugin:
                     "x-action-params": {"start": {"params": ["input_topic", "dry_run", "confirm"]}, "stop": {"params": []},
                         "pause": {"params": []}, "resume": {"params": []}, "info": {"params": []},
                         "config": {"params": ["dry_run", "confirm"]}},
-                    "x-resource": ["base"]},
+                    "x-resource": "base"},
                 "topic_in": [{"format": "control/velocity", "desc": "motus.control/1 twist [vx,vy,vz,wx,wy,wz]"}]}
 
     def start(self):
@@ -130,6 +131,8 @@ class S10LocoServoPlugin:
             return {"state": "error", "message": "没有 ROS runtime，无法接入 control/velocity"}
         if self.motion is not None and self.motion.is_moving():
             return {"state": "error", "message": "loco 正在控制底盘，请先停止"}
+        if self.navigation is not None and self.navigation.is_moving():
+            return {"state": "error", "message": "navigation 正在控制底盘，请先停止"}
         profile = os.environ.get("S10_CORE_FASTDDS_PROFILE", "/tmp/s10-pro-core-fastdds.xml")
         with self._lock:
             if self._running: return {"state": "error", "message": "loco_servo 已在运行"}
@@ -174,6 +177,9 @@ class S10LocoServoPlugin:
             self._paused = True
             self._hold()
         return True
+
+    def attach_navigation(self, plugin):
+        self.navigation = plugin
 
     def _on_message(self, message):
         with self._lock:

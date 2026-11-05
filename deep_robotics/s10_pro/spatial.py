@@ -99,6 +99,7 @@ class S10ControlledSpatialPlugin:
                           "confirm": {"type": "boolean", "description": "Required true for mapping start/stop."},
                       }))
         result["inputSchema"]["x-is-dangerous"] = True
+        result["inputSchema"]["x-resource"] = "map"
         return result
 
     def start(self):

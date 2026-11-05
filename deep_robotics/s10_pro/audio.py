@@ -103,6 +103,8 @@ def _audio_tool(name, description, actions, *, topic_out=None, topic_in=None):
         result["topic_out"] = topic_out
     if topic_in:
         result["topic_in"] = topic_in
+    if name == "speaker":
+        result["inputSchema"]["x-resource"] = "mouth"
     return result
 
 

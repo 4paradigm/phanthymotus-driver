@@ -35,6 +35,7 @@ def test_audio_cards_advertise_asr_and_tts_contracts(monkeypatch):
         "format": "audio/pcm-16k",
         "message_type": "audio_msgs/msg/AudioChunk",
     }]
+    assert speaker_tool["inputSchema"]["x-resource"] == "mouth"
     assert mic.dispatch("start", {})["state"] == "error"
     assert speaker.dispatch("start", {})["error"] == "input_topic is required"
     assert mic.dispatch("unknown", {}) is None

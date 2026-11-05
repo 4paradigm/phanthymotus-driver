@@ -87,6 +87,13 @@ claimed as measured hardware limits.
 The `navigation.route` action sends a sequence of up to 64 vendor `Item` targets
 in one native task request; each point has map coordinates, yaw, and point type,
 while the route shares gait, speed, direction, obstacle, and navigation mode.
+ACP assigns `base` to `loco`, `loco_servo`, navigation, and charging, and `map`
+to navigation and map management; lights and speaker use independent `head_light`,
+`tail_light`, and `mouth` resources. Long-running locomotion and navigation calls
+return unique `action_id` values and post one terminal completion. A zero-duration
+loco command is a synchronous stop and creates no ACP pending action. The continuous
+servo has no ACP completion because it is a persistent stream: navigation pauses it
+before taking the base, and the servo refuses to start while a navigation task owns it.
 
 ## Runtime
 
@@ -102,17 +109,18 @@ Fast DDS profile selection is process-global. The robot-domain participant is
 intentionally reachable on the validated S10-facing subnet (and loopback) so it
 can consume vendor ROS topics. The Core-domain participant is domain 42 and is
 loopback-profiled; media/state publishers and the `loco_servo` subscriber are
-isolated child processes. Media conversion and publication
-use independent bounded lanes so a camera or point-cloud frame cannot block
-control/state callbacks.
+isolated child processes. RTSP pulls use independent threads; lidar conversion
+and Core-domain publication use bounded queues so media work does not block
+robot control/state callbacks.
 The camera cards use the AOS RTSP endpoints supplied by the vendor: front wide
 `/video4`, rear wide `/video0`, left wide `/video2`, and right wide `/video6`.
 The driver pulls each stream over RTSP/TCP with FFmpeg, extracts MJPEG frames,
-and publishes them to the existing Core-domain JPEG topics. A one-frame
-low-latency pipeline reconnects after stream interruption. The previous ROS
-image-topic source remains available by setting `camera_source: ros`; RTSP is
-the default because the robot camera service does not publish the required DDS
-image topics. The final image includes the `ffmpeg` runtime for RTSP demuxing.
+and publishes them to the existing Core-domain JPEG topics. Camera input is
+RTSP-only: the robot ROS graph is scanned for point clouds, never image topics.
+A one-frame low-latency pipeline reconnects after stream interruption. The
+previous ROS image-topic receive path has been removed because the vendor camera service
+does not publish camera images over DDS. The final image includes the `ffmpeg`
+runtime for RTSP demuxing.
 
 ## Image and deployment
 
@@ -123,8 +131,8 @@ required vendor message definitions plus shared `audio_msgs/AudioChunk` in a
 build stage, and copies only their
 runtime interfaces into the final image. See `vendor/SOURCE.md` for provenance.
 The final image is larger than the base image because this driver needs the
-Fast DDS RMW package, ALSA command-line tools (`alsa-utils`), PyYAML, Pillow,
-`openssh-client`, and `sshpass`.
+Fast DDS RMW package, ALSA command-line tools (`alsa-utils`), PyYAML,
+`openssh-client`, and `sshpass`. FFmpeg is also required for RTSP camera input.
 The SSH packages support the current one-click NOS `drmap` password path; they
 can be removed when deployment supports a managed SSH key/secret. The image
 includes the current AOS/NOS ED25519 host key pin in `resource/ssh_known_hosts`;

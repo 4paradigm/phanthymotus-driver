@@ -42,21 +42,13 @@ topics:
     - "/height_map"
     - "/path"
   lidar_map: "/ACCUMULATED_POINTS_MAP"
-camera_topics:
-  camera_rear: "/camera/rear/image_raw"
-  camera_left: "/camera/left/image_raw"
-  camera_front: "/camera/front/image_raw"
-  camera_right: "/camera/right/image_raw"
-# Kept as the ROS-source fallback when camera_source is set to ros.
-camera_discovery: false
-camera_source: rtsp
 camera_rtsp:
   camera_front: "rtsp://10.21.33.103:8554/video4"
   camera_rear: "rtsp://10.21.33.103:8554/video0"
   camera_left: "rtsp://10.21.33.103:8554/video2"
   camera_right: "rtsp://10.21.33.103:8554/video6"
-# JPEG encoding and point-cloud packing run in one bounded worker process per
-# stream; this keeps the robot ROS executor available for control/state topics.
+# Point-cloud packing runs in bounded worker processes; RTSP camera pulling
+# uses independent FFmpeg threads so media cannot block robot ROS callbacks.
 media_workers: true
 basic_server:
   enabled: true
