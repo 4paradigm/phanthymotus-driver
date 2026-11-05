@@ -166,18 +166,21 @@ def test_single_read_only_connection_shared_by_all_cards_and_units():
         wait_until(lambda: client.snapshot()["connected"])
         plugin = DobotSensors({}, client=client)
         for _ in range(3):
-            for name in CARD_DESCRIPTIONS:
+            for name in (*CARD_DESCRIPTIONS, "safe_skin_control"):
                 result = plugin.dispatch("start", {"_tool_name": name})
-                assert result["state"] == "running"
-                assert result["available"]
-                assert plugin.dispatch("stop", {"_tool_name": name}) == {"state": "idle"}
+                assert result["state"] == ("ready" if name == "safe_skin_control" else "running")
+                if name == "joints":
+                    assert result["available"]
+                else:
+                    assert result["topic_out"] == [{"topic": "/dobot_cra/state/safe_skin", "format": "data/json"}]
+                assert plugin.dispatch("stop", {"_tool_name": name})["state"] == "idle"
         assert calls == [("127.0.0.1", 30004)]
         assert not connection.closed.is_set()
         joint = plugin.payload("joints")["joints"]
         assert joint[0]["q"] == pytest.approx(math.pi / 2)
         assert joint[0]["dq"] == pytest.approx(math.pi)
         assert joint[1]["degree"] == -30
-        assert plugin.payload("safe_skin")["any_approach_paused"] is False
+        assert plugin.payload("safe_skin_control")["any_approach_paused"] is False
         snapshot = client.snapshot()
         snapshot["data"]["joint_state"]["q_actual"][0] = -999
         assert client.snapshot()["data"]["joint_state"]["q_actual"][0] == 90
@@ -193,7 +196,7 @@ def test_stale_data_is_withheld_even_if_socket_stays_open():
         wait_until(lambda: client.snapshot()["connected"])
         received = client._received_at
         client._clock = lambda: received + 3
-        result = DobotSensors({}, client=client).payload("safe_skin")
+        result = DobotSensors({}, client=client).payload("safe_skin_control")
         assert client.snapshot()["transport_connected"]
         assert not result["available"] and result["any_approach_paused"] is None
         assert all(region is None for region in result["regions"].values())
@@ -404,6 +407,7 @@ def test_ros_start_registers_both_joint_outputs_and_publishes_one_feedback_sampl
     try:
         publishers = plugin._node.publishers
         assert set(publishers) == {"/dobot_cra/state/joints", "/dobot_cra/state/joint_angles", "/dobot_cra/state/safe_skin"}
+        assert plugin._publishers[("safe_skin_control", 0)] is publishers["/dobot_cra/state/safe_skin"]
         plugin._node.tick()
         assert samples == [1]
         skeleton = publishers["/dobot_cra/state/joints"].messages[0]
@@ -623,9 +627,11 @@ def test_metadata_and_mcp_http_contract():
     tools = plugin.get_tools()
     assert {t["name"] for t in tools} == {t["name"] for t in metadata["cards"]}
     sensors = [t for t in tools if t["type"] == "sensor"]
-    assert len(sensors) == 2
-    assert {t["name"] for t in tools} == {"joints", "safe_skin", "safe_skin_control", "systemcontrol", "model"}
-    assert next(t for t in tools if t["name"] == "safe_skin_control")["type"] == "actuator"
+    assert len(sensors) == 1 and sensors[0]["name"] == "joints"
+    assert {t["name"] for t in tools} == {"joints", "safe_skin_control", "systemcontrol", "model"}
+    skin_tool = next(t for t in tools if t["name"] == "safe_skin_control")
+    assert skin_tool["type"] == "actuator"
+    assert skin_tool["topic_out"] == [{"topic": "/dobot_cra/state/safe_skin", "format": "data/json"}]
     assert next(t for t in tools if t["name"] == "model")["type"] == "resource"
     assert all(t["topic_out"][0]["format"] == ("sensor/skeleton" if t["name"] == "joints" else "data/json") for t in sensors)
     assert tools[0]["topic_out"][1] == {"topic": "/dobot_cra/state/joint_angles", "format": "data/json"}
@@ -646,7 +652,7 @@ def test_metadata_and_mcp_http_contract():
 
     try:
         assert rpc("initialize", {})["result"]["serverInfo"]["name"] == "dobot-cra"
-        assert len(rpc("tools/list", {})["result"]["tools"]) == 5
+        assert len(rpc("tools/list", {})["result"]["tools"]) == 4
         result = rpc("tools/call", {"name": "joints", "arguments": {
             "action": "config", "controller_ip": "", "feedback_port": 30006,
         }})
@@ -666,8 +672,15 @@ def test_metadata_and_mcp_http_contract():
         assert payload["topic_out"][1]["format"] == "data/json"
         removed = rpc("tools/call", {"name": "arm_all_state", "arguments": {"action": "info"}})
         assert removed["error"]["code"] == -32601
+        removed_skin = rpc("tools/call", {"name": "safe_skin", "arguments": {"action": "start"}})
+        assert removed_skin["error"]["code"] == -32601
         control = rpc("tools/call", {"name": "safe_skin_control", "arguments": {"action": "start"}})
-        assert json.loads(control["result"]["content"][0]["text"])["state"] == "ready"
+        control_state = json.loads(control["result"]["content"][0]["text"])
+        assert control_state["state"] == "ready" and control_state["topic_out"] == skin_tool["topic_out"]
+        info = rpc("tools/call", {"name": "safe_skin_control", "arguments": {"action": "info"}})
+        skin_info = json.loads(info["result"]["content"][0]["text"])
+        assert skin_info["topic_out"] == skin_tool["topic_out"]
+        assert skin_info["feedback"]["available"] is False
     finally:
         server.shutdown()
         server.server_close()

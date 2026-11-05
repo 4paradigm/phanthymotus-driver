@@ -21,7 +21,6 @@ else:
 
 CARD_DESCRIPTIONS = {
     "joints": "CR3A 六轴实时骨架及关节转角 JSON（度/弧度），固定直角连接保持真实关节坐标",
-    "safe_skin": "小臂及 J4/J5/J6 安全皮肤接近暂停标志、汇总触发和数据有效性",
 }
 
 
@@ -39,11 +38,12 @@ class DobotSensors:
         self._lifecycle = threading.RLock()
         prefix = namespace.strip("/") or "dobot_cra"
         self._topics = {
-            name: [{"topic": f"/{prefix}/state/{name}",
-                    "format": "sensor/skeleton" if name == "joints" else "data/json"}]
-            for name in CARD_DESCRIPTIONS
+            "joints": [
+                {"topic": f"/{prefix}/state/joints", "format": "sensor/skeleton"},
+                {"topic": f"/{prefix}/state/joint_angles", "format": "data/json"},
+            ],
+            "safe_skin_control": [{"topic": f"/{prefix}/state/safe_skin", "format": "data/json"}],
         }
-        self._topics["joints"].append({"topic": f"/{prefix}/state/joint_angles", "format": "data/json"})
 
     def get_tools(self):
         definitions = [tool(name, "sensor", description, topic_out=self._topics[name])
@@ -62,6 +62,9 @@ class DobotSensors:
             "request_control": (["confirm_change"], "显式请求 TCP 控制模式；仅下使能/下电时允许，不使能机器人"),
             "set_enabled": (["enabled", "confirm_change"], "提交安全皮肤总开关；关闭会移除皮肤接近保护，不能用于碰撞复位"),
             "set_sensitivity": (["part", "level", "confirm_change"], "提交指定部位灵敏度；0 关闭，1 低，2 中，3 高"),
+            "start": ([], "启动实时触发状态输出，不发送设置命令"),
+            "stop": ([], "关闭共享命令连接，不修改安全皮肤设置"),
+            "config": ([], "确认卡片配置；共享 IP/端口通过 joints 配置"),
         }, {
             "enabled": {"type": "boolean", "description": "安全皮肤总开关"},
             "part": {"type": "integer", "enum": [3, 4, 5, 6], "description": "3 小臂；4/5/6 为 J4/J5/J6"},
@@ -70,7 +73,8 @@ class DobotSensors:
         })
         schema["x-is-dangerous"] = True
         schema["x-resource"] = "arm"
-        definitions.append(tool("safe_skin_control", "actuator", "安全皮肤 TCP 控制：总开关和分区灵敏度；队列提交不等于配置读回", schema))
+        definitions.append(tool("safe_skin_control", "actuator", "安全皮肤：实时触发 JSON 输出、总开关和分区灵敏度；队列提交不等于配置读回",
+                                schema, topic_out=self._topics["safe_skin_control"]))
         system_schema = action_schema({
             "info": ([], "读取系统实时状态及本卡最近请求，不发送命令"),
             "get_errors": ([], "通过 SDK 查询控制器当前报警编号，不清除报警"),
@@ -171,7 +175,7 @@ class DobotSensors:
                     for i, name in enumerate(JOINT_NAMES)
                 ]
             return skeleton
-        if name == "safe_skin":
+        if name == "safe_skin_control":
             # Feedback has proximity stops, not distance/configuration readback.
             regions = {
                 name: None if state is None else bool(state[f"{name}_approach_state"])
@@ -209,12 +213,16 @@ class DobotSensors:
             return self.control.execute_system(action, args)
         if name == "safe_skin_control":
             if action in ("info", name):
-                return {"state": "ready", **self.control.snapshot(), "feedback": self.payload("safe_skin")}
-            if action in ("start", "stop"):
+                return {"state": "ready", "topic_out": self._topics[name],
+                        **self.control.snapshot(), "feedback": self.payload(name)}
+            if action in ("start", "stop", "config"):
                 # Lifecycle does not claim control or cancel queued settings.
                 if action == "stop":
                     self.control.close()
-                return {"state": "ready" if action == "start" else "idle"}
+                elif action == "start":
+                    self.client.start()
+                return {"state": {"start": "ready", "stop": "idle", "config": "configured"}[action],
+                        "topic_out": self._topics[name]}
             return self.control.execute(action, args)
         if name not in CARD_DESCRIPTIONS:
             return None

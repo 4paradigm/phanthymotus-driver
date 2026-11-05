@@ -8,22 +8,22 @@
 | 名称 | 类型 | 内容 |
 |---|---|---|
 | `joints` | sensor | 六轴实际角度驱动的 CR3A 结构骨架及转角 JSON 输出；共享连接配置入口 |
-| `safe_skin` | sensor | 小臂、J4/J5/J6 接近暂停标志、汇总触发和数据有效性 |
-| `safe_skin_control` | actuator | 显式请求 TCP 控制、总开关、分区灵敏度 |
+| `safe_skin_control` | actuator | 实时触发状态 JSON 输出、显式请求 TCP 控制、总开关和分区灵敏度 |
 | `systemcontrol` | actuator | 系统状态/报警、本体上电、使能、停止/暂停/继续、速度和拖拽示教 |
 | `model` | resource | 平台渲染器使用的固定直角骨架 URDF，不发布 ROS topic |
 
 已移除 `connection`、`joint_states`、`robot_info`、`software_info`、`arm_all_state`、
-`controller_state` 卡片。升级后请删除画布中的旧卡片，在 `joints` 齿轮处重新配置连接。
+`controller_state` 及独立 `safe_skin` sensor 卡片。升级后请删除画布中的旧卡片，在 `joints` 齿轮处重新配置连接。
 不会自动改动已有画布或把旧 sensor 重命名为新控制功能。
 
-两个 sensor 共用一个反馈连接，默认 10Hz 发布 `std_msgs/String` JSON：
+关节卡和安全皮肤执行卡共用一个反馈连接，默认 10Hz 发布 `std_msgs/String` JSON：
 
 - `/dobot_cra/state/joints`，`sensor/skeleton`；六关节 `q/dq` 为 rad、rad/s，
   `degree` 保留度数，关节名为 `joint1..joint6`。
 - `/dobot_cra/state/joint_angles`，`data/json`；`joints` 的第二个输出口，
   `joint_names` 按 J1–J6 排列，`angles_deg` 为实际转角（度），`angles_rad` 为同一组角度的弧度值。
-- `/dobot_cra/state/safe_skin`，`data/json`。
+- `/dobot_cra/state/safe_skin`，`data/json`，属于 `safe_skin_control` 的输出口。
+  保留原 topic 名称，画布中原有 `safe_skin` 连线需改接到 `safe_skin_control` 输出口。
 
 两个 `joints` 输出共用同一份反馈快照，不新增卡片或控制器连接。JSON 角度不依赖 URDF
 是否可用；实时数据可用时 `available=true`，断线或过期时为 `false`，两个角度数组均为空。
@@ -63,7 +63,7 @@
 
 ## 安全皮肤状态
 
-`safe_skin` 只发布以下四项（示例值）：
+`safe_skin_control` 的 JSON 输出口只发布以下四项（示例值）：
 
 ```json
 {
@@ -96,6 +96,7 @@
 | action | 参数 | 官方 SDK |
 |---|---|---|
 | `info` | 无 | 只读本地状态 |
+| `start/config/stop` | 无 | 返回 JSON 输出口定义；start 读取反馈，stop 关闭命令连接，均不修改皮肤设置 |
 | `request_control` | `confirm_change=true` | `RequestControl()` |
 | `set_enabled` | `enabled=true/false`, `confirm_change=true` | `EnableSafeSkin(1/0)` |
 | `set_sensitivity` | `part=3/4/5/6`, `level=0/1/2/3`, `confirm_change=true` | `SetSafeSkin(part,level)` |
@@ -189,9 +190,10 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra
 
 ## PR 验收
 
-1. 升级镜像后确认有两个 sensor、两张执行卡和后台 model 资源，清理旧画布卡片。
+1. 升级镜像后确认只有 `joints` 一张 sensor、`safe_skin_control/systemcontrol` 两张执行卡和后台 model 资源。
+   删除旧 `safe_skin` 卡，将其下游连线改接到 `safe_skin_control` 的 JSON 输出口。
 2. 配置并启动 `joints`，确认六轴与实时角度一致，J4 前连杆可见直角而非斜杆；固定拐点不可控。
-3. 核对 `safe_skin` 各分区标志；断网时应变为未知，重连后恢复。
+3. 核对 `safe_skin_control` JSON 输出的各分区标志；断网时应变为未知，重连后恢复。
 4. 在受控现场停止机器人后，显式执行所需皮肤设置，对照厂家软件确认队列执行及实际配置。
    本地模拟测试不替代这一项硬件验证。
 5. 本次开发验证不得自动在真机上关闭安全皮肤、使能或恢复运动。

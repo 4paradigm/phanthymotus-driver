@@ -22,8 +22,9 @@ The upstream SDK source and artifact checksum remain unchanged.
 
 The adapter imports upstream `DobotConnection`, `FeedbackParser`, `MyType` and
 the SDK version. It deliberately does not instantiate `DobotRobot`, whose
-connection lifecycle also opens Dashboard. A single receive-only feedback connection supplies both sensors, even outside
-TCP control mode. The safe_skin_control and systemcontrol actuators share one
+connection lifecycle also opens Dashboard. A single receive-only feedback
+connection supplies joints and the safe_skin_control JSON output, even outside
+TCP control mode. There is no standalone safe_skin sensor. The safe_skin_control and systemcontrol actuators share one
 RobotController and a lazily created, serialized DashboardConnection. They call
 the official RobotControl methods for skin settings, operating state, diagnostics
 and explicit system actions. Startup never transmits control commands. SDK
@@ -67,7 +68,7 @@ queries. EnableRobot is called without load arguments, preserving the
 controller's configured payload and center parameters.
 
 Acknowledgements are not verified physical state changes. Skin switch and
-sensitivity readback are absent; the compact sensor only reports trigger flags,
+sensitivity readback are absent; the skin actuator's compact JSON output only reports trigger flags,
 and request records live in the actuator info response. Each card keeps its own
 request/error history. Writes are never automatically replayed.
 

@@ -207,7 +207,7 @@ def test_both_cards_share_one_serial_transport_and_keep_separate_request_history
     second.start()
     try:
         assert plugin.dispatch('info', {'_tool_name': 'systemcontrol'})['available']
-        assert plugin.payload('safe_skin')['available']
+        assert plugin.payload('safe_skin_control')['available']
     finally:
         release.set()
         first.join(2)

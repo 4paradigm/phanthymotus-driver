@@ -86,13 +86,29 @@ def setup_control(dashboard=None):
 def test_start_info_stop_and_sensors_do_not_claim_control_or_send_commands():
     feedback, dashboard, control, calls = setup_control()
     plugin = DobotSensors({}, client=feedback, controller=control)
-    for name in ('joints', 'safe_skin', 'safe_skin_control'):
+    for name in ('joints', 'safe_skin_control'):
         assert plugin.dispatch('start', {'_tool_name': name})['state'] in ('running', 'ready')
         assert plugin.dispatch('info', {'_tool_name': name})
         assert plugin.dispatch('stop', {'_tool_name': name})['state'] == 'idle'
     assert calls == [] and dashboard.commands == []
     plugin.stop()
     assert feedback.stops == 1
+
+
+def test_merged_skin_card_advertises_stream_for_every_lifecycle_action():
+    feedback, dashboard, control, calls = setup_control()
+    plugin = DobotSensors({}, namespace='custom_arm', client=feedback, controller=control)
+    output = [{'topic': '/custom_arm/state/safe_skin', 'format': 'data/json'}]
+    for action in ('config', 'start', 'info', 'stop'):
+        result = plugin.dispatch(action, {'_tool_name': 'safe_skin_control'})
+        assert result['topic_out'] == output
+        if action == 'info':
+            assert result['feedback']['regions'] == {'arm': False, 'j4': False, 'j5': False, 'j6': False}
+    assert not calls and not dashboard.commands
+    assert plugin.dispatch('info', {'_tool_name': 'safe_skin'}) is None
+    tool = next(tool for tool in plugin.get_tools() if tool['name'] == 'safe_skin_control')
+    assert tool['topic_out'] == output
+    assert {'start', 'stop', 'config', 'info', 'set_enabled', 'set_sensitivity'} <= set(tool['inputSchema']['properties']['action']['enum'])
 
 
 def test_joints_config_closes_dashboard_and_clears_old_state_without_sending_commands():
@@ -111,7 +127,7 @@ def test_joints_config_closes_dashboard_and_clears_old_state_without_sending_com
     assert not control.snapshot()['dashboard_connected']
     assert plugin.payload('joints')['joints'] == []
     assert plugin.payload('joint_angles')['angles_deg'] == []
-    assert not plugin.payload('safe_skin')['available']
+    assert not plugin.payload('safe_skin_control')['available']
 
 
 @pytest.mark.parametrize('changed', [{'controller_ip': 'invalid'}, {'feedback_port': 29999}])
@@ -136,7 +152,7 @@ def test_sdk_global_switch_submission_and_unknown_readback(enabled):
     assert calls == [('127.0.0.1', 29999)]
     assert result['result_id'] == 1 and result['state'] == 'submitted'
     assert result['configuration_verified'] is False
-    sensor = DobotSensors({}, client=feedback, controller=control).payload('safe_skin')
+    sensor = DobotSensors({}, client=feedback, controller=control).payload('safe_skin_control')
     assert 'enabled' not in sensor and 'sensitivity' not in sensor and 'control' not in sensor
     info = DobotSensors({}, client=feedback, controller=control).dispatch('info', {'_tool_name': 'safe_skin_control'})
     assert info['last_request']['enabled'] is enabled
@@ -263,15 +279,15 @@ def test_skin_sensor_regions_do_not_misreport_collision_as_proximity():
     feedback, _, control, _ = setup_control()
     feedback.sample['data'].update(j4_approach_state=1, j6_approach_state=1, collision_state=0)
     plugin = DobotSensors({}, client=feedback, controller=control)
-    result = plugin.payload('safe_skin')
+    result = plugin.payload('safe_skin_control')
     assert set(result) == {'timestamp_ms', 'available', 'any_approach_paused', 'regions'}
     assert isinstance(result['timestamp_ms'], int) and result['available'] is True
     assert result['any_approach_paused']
     assert result['regions'] == {'arm': False, 'j4': True, 'j5': False, 'j6': True}
     feedback.sample['data'].update(j4_approach_state=0, j6_approach_state=0, collision_state=1)
-    assert plugin.payload('safe_skin')['any_approach_paused'] is False
+    assert plugin.payload('safe_skin_control')['any_approach_paused'] is False
     feedback.sample.update(connected=False, stale=True, data=None)
-    result = plugin.payload('safe_skin')
+    result = plugin.payload('safe_skin_control')
     assert result['any_approach_paused'] is None
     assert result['available'] is False
     assert result['regions'] == dict.fromkeys(('arm', 'j4', 'j5', 'j6'))
@@ -309,7 +325,7 @@ def test_control_requests_are_serialized_but_sensor_snapshot_does_not_block():
     assert entered.wait(1)
     workers[1].start()
     snapshot_done = threading.Event()
-    reader = threading.Thread(target=lambda: (DobotSensors({}, client=feedback, controller=control).payload('safe_skin'), snapshot_done.set()))
+    reader = threading.Thread(target=lambda: (DobotSensors({}, client=feedback, controller=control).payload('safe_skin_control'), snapshot_done.set()))
     reader.start()
     try:
         assert snapshot_done.wait(0.5)
