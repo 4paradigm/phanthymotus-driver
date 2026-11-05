@@ -23,11 +23,12 @@ The upstream SDK source and artifact checksum remain unchanged.
 The adapter imports upstream `DobotConnection`, `FeedbackParser`, `MyType` and
 the SDK version. It deliberately does not instantiate `DobotRobot`, whose
 connection lifecycle also opens Dashboard. A single receive-only feedback connection supplies both sensors, even outside
-TCP control mode. The explicit safe_skin_control actuator lazily creates a
-separate serialized DashboardConnection and calls the official RobotControl
-RequestControl, EnableSafeSkin and SetSafeSkin methods. Startup never transmits
-control commands. SDK formatting is retained; the adapter uses sendall and
-complete semicolon framing to handle partial TCP writes/reads.
+TCP control mode. The safe_skin_control and systemcontrol actuators share one
+RobotController and a lazily created, serialized DashboardConnection. They call
+the official RobotControl methods for skin settings, operating state, diagnostics
+and explicit system actions. Startup never transmits control commands. SDK
+formatting is retained; the adapter uses sendall and complete semicolon framing
+to handle partial TCP writes/reads. No second Dashboard client is created.
 
 Compatibility baseline: CRA six-axis V4 feedback layout, 1440 bytes, little
 endian, test magic `0x0123456789abcdef`, as documented by the supplied TCP/IP
@@ -55,12 +56,20 @@ Upstream is unmodified. The adapter handles:
   including after port changes from the joints configuration. Port 30006 therefore
   gets at least 3 seconds instead of timing out at its 1-second packet interval.
 
-Only the three explicit safe-skin/control-mode methods are exposed as writes.
-There is no automatic takeover, enable, alarm clearing, motion, IO write,
-arbitrary command endpoint, or invented safe-skin reset. Queued acknowledgements
-are reported as submissions, not verified configuration. Neither skin switch
-nor sensitivity readback is present in feedback; sensor values remain unknown
-rather than echoing requested settings. Writes are never automatically replayed.
+All writes require explicit confirmation. No automatic takeover, enable, alarm
+clearing, motion resumption, IO write, arbitrary command endpoint or invented
+safe-skin reset is exposed. The system card calls RequestControl, PowerOn,
+EnableRobot, DisableRobot, ClearError, Stop, Pause, Continue, SpeedFactor,
+StartDrag and StopDrag; its explicit read-only GetErrorID query parses the
+documented flat JSON array of alarm codes. State guards are action-specific;
+stale feedback does not block stopping/disable/exit-drag requests or error
+queries. EnableRobot is called without load arguments, preserving the
+controller's configured payload and center parameters.
+
+Acknowledgements are not verified physical state changes. Skin switch and
+sensitivity readback are absent; the compact sensor only reports trigger flags,
+and request records live in the actuator info response. Each card keeps its own
+request/error history. Writes are never automatically replayed.
 
 For an SDK update, download the new immutable commit artifact, compute its
 SHA-256, update requirements and this file plus `SDK_COMMIT`, and run the

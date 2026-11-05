@@ -1,16 +1,17 @@
 id: dobot-cra-driver
-name: Dobot CRA Joints and Safe Skin
+name: Dobot CRA Joints, Safe Skin and System Control
 category: driver
 hardware_provider: dobot
 hardware_model: cra
 image_name: dobot-cra
 port: 15746
 mcp_url: "http://localhost:15746/mcp"
-description: "CR3A rigid-elbow skeleton, safe-skin feedback and explicit SDK skin settings; no motion or automatic control takeover"
+description: "CR3A skeleton and joint-angle JSON, safe-skin feedback/settings, explicit system control through one shared SDK command connection"
 build_context_extras:
   - ../../common
 cards:
   - { name: joints, type: sensor }
   - { name: safe_skin, type: sensor }
   - { name: safe_skin_control, type: actuator }
+  - { name: systemcontrol, type: actuator }
   - { name: model, type: resource }

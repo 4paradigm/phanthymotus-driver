@@ -1,4 +1,4 @@
-"""Explicit, serialized safe-skin settings using the official V4 SDK.
+"""One serialized Dashboard transport for skin and system control cards.
 
 No connection, control takeover, enable, error clearing or motion on startup.
 Write requests are never replayed after a network error. Queued acknowledgements
@@ -8,6 +8,7 @@ are reported as submissions, not as verified configuration readback.
 from __future__ import annotations
 
 import re
+import json
 import threading
 import time
 
@@ -50,20 +51,24 @@ class CommandRejected(RuntimeError):
     pass
 
 
-def parse_reply(reply, command):
+def parse_response(reply, command):
     match = re.fullmatch(r"\s*(-?\d+),\{([^{}]*)\},([A-Za-z][A-Za-z0-9_]*)\(.*\);\s*", reply, re.S)
     if match is None or match[3] != command:
         raise ValueError(f"invalid {command} acknowledgement: {reply!r}")
     code = int(match[1])
     if code:
         raise CommandRejected(f"{command} rejected with ErrorID={code}: {reply}")
-    identifier = match[2].strip()
+    return match[2].strip()
+
+
+def parse_reply(reply, command):
+    identifier = parse_response(reply, command)
     if identifier and not identifier.isdecimal():
         raise ValueError(f"invalid queue identifier: {identifier!r}")
     return int(identifier) if identifier else None
 
 
-class SafeSkinController:
+class RobotController:
     def __init__(self, feedback, config, connection_factory=DashboardConnection):
         self.feedback = feedback
         settings = config.get("safe_skin_control", {})
@@ -75,17 +80,20 @@ class SafeSkinController:
         self._connection = None
         self._api = None
         self._address = None
-        self._status = {"dashboard_connected": False, "tcp_control_requested": False,
-                        "last_request": None, "last_error": None}
+        self._status = {"dashboard_connected": False, "tcp_control_requested": False}
+        self._requests = {name: {"last_request": None, "last_error": None}
+                          for name in ("safe_skin_control", "systemcontrol")}
 
-    def snapshot(self):
+    def snapshot(self, card="safe_skin_control"):
         import copy
         with self._state_lock:
-            return copy.deepcopy(self._status)
+            return copy.deepcopy({**self._status, **self._requests[card]})
 
-    def _update(self, **values):
+    def _update(self, card="safe_skin_control", **values):
         with self._state_lock:
-            self._status.update(values)
+            for key, value in values.items():
+                target = self._requests[card] if key in ("last_request", "last_error") else self._status
+                target[key] = value
 
     def _close(self):
         connection, self._connection = self._connection, None
@@ -107,8 +115,76 @@ class SafeSkinController:
         with self._command_lock:
             if (address, port) != (self.feedback.address, self.feedback.port):
                 self._close()
-                self._update(last_request=None, last_error=None)
+                for card in self._requests:
+                    self._update(card, last_request=None, last_error=None)
                 self.feedback.configure(address, port)
+
+    def system_info(self):
+        sample = self.feedback.snapshot()
+        state = sample.get("data")
+        available = bool(sample.get("connected") and not sample.get("stale") and state is not None)
+        keys = ("robot_mode", "robot_mode_name", "enable_status", "running_status", "error_status",
+                "collision_state", "drag_status", "pause_cmd_flag", "brake_released",
+                "speed_scaling", "safety_state", "safe_state", "current_command_id", "load")
+        return {"available": available, "timestamp_ms": int(time.time() * 1000),
+                "robot_status": None if not available else {key: state[key] for key in keys},
+                **self.snapshot("systemcontrol")}
+
+    def _check_system_state(self, action):
+        sample = self.feedback.snapshot()
+        # A lost feedback stream must not prevent an explicit stop or diagnostic
+        # query. These operations still need a configured command endpoint.
+        if action in ("stop_motion", "disable", "stop_drag", "get_errors"):
+            if not self.feedback.address:
+                raise RuntimeError("configure the controller IP before sending commands")
+            return {**sample, "controller_ip": self.feedback.address}
+        state = sample.get("data")
+        if not sample.get("connected") or sample.get("stale") or state is None:
+            raise RuntimeError("fresh feedback is required for this system control action")
+        if action == "request_control":
+            return self._check_state(action)
+        mode = state["robot_mode"]
+        if action == "pause":
+            if mode != 7:
+                raise RuntimeError("pause requires a running queue/program (mode 7); use stop_motion for jogging")
+            return sample
+        if action == "clear_error":
+            if (mode not in (3, 4, 5, 9, 11) or state["running_status"] or state["jog_status"] or
+                    state["drag_status"] or any(state["brake_released"])):
+                raise RuntimeError("stop motion and drag before clearing alarms")
+            return sample
+        allowed = {"power_on": (3,), "enable": (4,), "resume": (10,),
+                   "set_speed_factor": (4, 5, 7), "start_drag": (4, 5)}
+        if mode not in allowed[action]:
+            raise RuntimeError(f"{action} requires robot mode {allowed[action]}, current mode is {mode}")
+        if (state["error_status"] or state["collision_state"] or state["drag_status"] or
+                any(state["brake_released"]) or
+                any(state[f"{part}_approach_state"] for part in PARTS.values())):
+            raise RuntimeError("clear the alarm/collision/skin trigger and lock brakes before this action")
+        if action != "set_speed_factor" and (state["running_status"] or state["jog_status"]):
+            raise RuntimeError("robot must be stopped before this action")
+        if action != "resume" and state["pause_cmd_flag"]:
+            raise RuntimeError("robot is paused; this action does not resume it")
+        if action == "resume" and not state["enable_status"]:
+            raise RuntimeError("resume requires an already enabled robot; no automatic enable is performed")
+        return sample
+
+    def execute_system(self, action, args):
+        commands = {"get_errors": "GetErrorID", "request_control": "RequestControl", "power_on": "PowerOn",
+                    "enable": "EnableRobot", "disable": "DisableRobot", "clear_error": "ClearError",
+                    "stop_motion": "Stop", "pause": "Pause", "resume": "Continue",
+                    "set_speed_factor": "SpeedFactor", "start_drag": "StartDrag", "stop_drag": "StopDrag"}
+        if action not in commands:
+            raise ValueError(f"unsupported system control action: {action}")
+        if action != "get_errors" and args.get("confirm_change") is not True:
+            raise ValueError("confirm_change=true is required for each control request")
+        parameters, requested = (), {}
+        if action == "set_speed_factor":
+            ratio = args.get("ratio")
+            if type(ratio) is not int or not 1 <= ratio <= 100:
+                raise ValueError("ratio must be an integer from 1 to 100")
+            parameters, requested = (ratio,), {"ratio": ratio}
+        return self._execute("systemcontrol", action, commands[action], parameters, requested, self._check_system_state)
 
     def _check_state(self, action):
         sample = self.feedback.snapshot()
@@ -145,11 +221,18 @@ class SafeSkinController:
             command, parameters, requested = "RequestControl", (), {}
         else:
             raise ValueError(f"unsupported safe-skin action: {action}")
+        return self._execute("safe_skin_control", action, command, parameters, requested, self._check_state)
+
+    def _execute(self, card, action, command, parameters, requested, check_state):
         with self._command_lock:
-            sample = self._check_state(action)
+            sample = check_state(action)
             request = {"action": action, **requested, "timestamp_ms": int(time.time() * 1000),
-                       "controller_ip": sample["controller_ip"], "configuration_verified": False}
-            self._update(last_request={**request, "state": "sending"}, last_error=None)
+                       "controller_ip": sample["controller_ip"], "read_only": action == "get_errors"}
+            if card == "safe_skin_control":
+                request["configuration_verified"] = False
+            else:
+                request["effect_verified"] = False
+            self._update(card, last_request={**request, "state": "sending"}, last_error=None)
             try:
                 if self._connection is None or self._address != sample["controller_ip"]:
                     self._close()
@@ -160,19 +243,30 @@ class SafeSkinController:
                     self._api = RobotControl(self._connection)
                     self._update(dashboard_connected=True)
                 # Connecting can take long enough for feedback/state to change.
-                self._check_state(action)
+                check_state(action)
                 reply = getattr(self._api, command)(*parameters)
-                queue_id = parse_reply(reply, command)
-                request.update(state="submitted" if queue_id is not None else "accepted_unverified",
-                               result_id=queue_id, response=reply)
+                if action == "get_errors":
+                    errors = json.loads(parse_response(reply, command))
+                    if not isinstance(errors, list) or any(type(code) is not int for code in errors):
+                        raise ValueError("GetErrorID must return a JSON list of integer error codes")
+                    request.update(state="queried", error_ids=errors, response=reply)
+                    request.pop("effect_verified")
+                else:
+                    queue_id = parse_reply(reply, command)
+                    request.update(state="submitted" if queue_id is not None else "accepted_unverified",
+                                   result_id=queue_id, response=reply)
                 if action == "request_control":
                     request["state"] = "tcp_control_requested"
                     self._update(tcp_control_requested=True)
-                self._update(last_request=request)
+                self._update(card, last_request=request)
                 return request
             except Exception as exc:
                 # A timeout may happen after transmission; never replay the write.
                 request.update(state="rejected" if isinstance(exc, CommandRejected) else "failed_or_outcome_unknown", error=str(exc))
-                self._update(last_request=request, last_error=str(exc))
+                self._update(card, last_request=request, last_error=str(exc))
                 self._close()
                 raise
+
+
+# Keep the original Python import usable for integrations of the skin-only driver.
+SafeSkinController = RobotController

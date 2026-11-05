@@ -1,7 +1,7 @@
-# Dobot CRA joints and safe skin
+# Dobot CRA joints, safe skin and system control
 
-基于官方 V4 Python SDK 的 Jetson Docker 驱动。本版只保留关节骨架，并新增安全皮肤
-状态和控制；不修改平台前端，不加载 STL 外壳。SDK 版本见 [SDK.md](SDK.md)。
+基于官方 V4 Python SDK 的 Jetson Docker 驱动。提供关节骨架/转角、安全皮肤状态与设置，
+以及系统控制；不修改平台前端，不加载 STL 外壳。SDK 版本见 [SDK.md](SDK.md)。
 
 ## 卡片
 
@@ -10,6 +10,7 @@
 | `joints` | sensor | 六轴实际角度驱动的 CR3A 结构骨架及转角 JSON 输出；共享连接配置入口 |
 | `safe_skin` | sensor | 小臂、J4/J5/J6 接近暂停标志、汇总触发和数据有效性 |
 | `safe_skin_control` | actuator | 显式请求 TCP 控制、总开关、分区灵敏度 |
+| `systemcontrol` | actuator | 系统状态/报警、本体上电、使能、停止/暂停/继续、速度和拖拽示教 |
 | `model` | resource | 平台渲染器使用的固定直角骨架 URDF，不发布 ROS topic |
 
 已移除 `connection`、`joint_states`、`robot_info`、`software_info`、`arm_all_state`、
@@ -114,6 +115,44 @@
 文档没有单独的 TCP 皮肤复位函数；关闭/重开皮肤不作为复位动作。TCP 设置只在对应
 控制模式中生效，退出后按厂家规则恢复原配置。SDK 错误 -1 还可能表示没有安装安全皮肤。
 
+## 系统控制
+
+`systemcontrol` 是独立的 actuator，与 `safe_skin_control` 共用同一个 `RobotController`、
+29999 连接和命令锁，避免两张卡互相抢占 TCP 连接。两张卡分别保存 `last_request/last_error`，
+互不覆盖；切换控制器地址/反馈端口时关闭命令连接并清空两张卡的请求记录。
+
+| action | 参数 | SDK / 行为 |
+|---|---|---|
+| `info` | 无 | 只读反馈模式、使能/运行/报警/碰撞、拖拽/暂停、抱闸、速度比例、安全字节、队列编号及负载 |
+| `get_errors` | 无 | `GetErrorID()`，返回 `error_ids` 数组；不清错 |
+| `request_control` | `confirm_change=true` | `RequestControl()`；保留皮肤卡同名动作以兼容旧流程 |
+| `power_on` | `confirm_change=true` | `PowerOn()`，仅给机械臂本体上电，不是控制柜开机 |
+| `enable` | `confirm_change=true` | `EnableRobot()`，不覆盖已配置负载/偏心参数 |
+| `disable` | `confirm_change=true` | `DisableRobot()` |
+| `clear_error` | `confirm_change=true` | `ClearError()`，不自动使能或恢复运动 |
+| `stop_motion` | `confirm_change=true` | `Stop()`，停止运动指令队列/工程 |
+| `pause` | `confirm_change=true` | `Pause()`，仅运行队列/工程（模式 7），点动请用 `stop_motion` |
+| `resume` | `confirm_change=true` | `Continue()`，显式恢复已暂停的运动队列 |
+| `set_speed_factor` | `ratio=1..100`, `confirm_change=true` | `SpeedFactor(ratio)` |
+| `start_drag` | `confirm_change=true` | `StartDrag()`，进入关节拖拽示教 |
+| `stop_drag` | `confirm_change=true` | `StopDrag()`，退出拖拽示教 |
+
+卡片生命周期 `start/config/info/stop` 不发送物理控制命令。`stop` 只关闭共享 Dashboard
+连接，真正停止机械臂需要显式 `stop_motion`；关闭任意执行卡的连接不会取消已接受的队列。
+下一次显式命令按需建立连接，不自动接管 TCP。反馈超时不阻止 `stop_motion/disable/stop_drag`
+及 `get_errors` 尝试发送，但仍需要已配置 IP；这些 TCP 操作不能替代硬件急停。
+
+其他操作要求新鲜反馈并在连接后再次校验。上电要求模式 3，使能要求模式 4，
+继续要求模式 10 且已使能；上电初始化期间不能越过模式检查立即使能。
+上电/使能/继续/进入拖拽被报警、碰撞、皮肤触发、松抱闸等状态阻止。
+清错只允许静止状态，不会代为消除故障原因，也不保证复位皮肤。
+速度调整允许模式 4/5/7；每次写操作均要求布尔值 `confirm_change=true`。
+
+写命令返回 `effect_verified=false`：ACK 不代表物理状态已改变，请在后续 `info` 中核对反馈。
+`tcp_control_requested` 只记录本次连接期间请求过控制权，不是控制器当前控制模式的读回。
+反馈过期时 `info.available=false, robot_status=null`，不会将旧状态当作当前状态。
+超时/连接失败不重放写命令，也不串联清错、使能、继续等动作。
+
 ## 网络与配置
 
 Jetson 有线口接控制柜 LAN2：Jetson `192.168.200.10/24`，控制柜默认 `192.168.200.1`，
@@ -144,15 +183,16 @@ MCP 端口 `15746`，容器名 `embodied-dobot-cra`；无需主机 SDK 或 privi
 python3 -m venv .venv
 .venv/bin/pip install -r dobot/cra/build-requirements.txt
 .venv/bin/pip install --no-build-isolation -r dobot/cra/requirements.txt pytest
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra_sensors.py tests/test_dobot_safe_skin.py tests/test_dobot_skeleton_structure.py -q
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra_sensors.py tests/test_dobot_safe_skin.py tests/test_dobot_skeleton_structure.py tests/test_dobot_system_control.py -q
 .venv/bin/python scripts/check_service_yml.py
 ```
 
 ## PR 验收
 
-1. 升级镜像后确认只有两个 sensor、一张控制卡和 model 资源，清理旧画布卡片。
+1. 升级镜像后确认有两个 sensor、两张执行卡和后台 model 资源，清理旧画布卡片。
 2. 配置并启动 `joints`，确认六轴与实时角度一致，J4 前连杆可见直角而非斜杆；固定拐点不可控。
 3. 核对 `safe_skin` 各分区标志；断网时应变为未知，重连后恢复。
 4. 在受控现场停止机器人后，显式执行所需皮肤设置，对照厂家软件确认队列执行及实际配置。
    本地模拟测试不替代这一项硬件验证。
 5. 本次开发验证不得自动在真机上关闭安全皮肤、使能或恢复运动。
+6. 核对 `systemcontrol` 的只读状态和报警查询；硬件动作须在受控现场单独验收。

@@ -12,11 +12,11 @@ from common.vendor_runtime import action_schema, tool
 if __package__:
     from .feedback import FeedbackClient, positive_number
     from .model import JOINT_NAMES, model_resource, resolve_model
-    from .control import PARTS, SafeSkinController
+    from .control import PARTS, RobotController
 else:
     from feedback import FeedbackClient, positive_number
     from model import JOINT_NAMES, model_resource, resolve_model
-    from control import PARTS, SafeSkinController
+    from control import PARTS, RobotController
 
 
 CARD_DESCRIPTIONS = {
@@ -28,7 +28,7 @@ CARD_DESCRIPTIONS = {
 class DobotSensors:
     def __init__(self, config, namespace="dobot_cra", ros2=None, client=None, controller=None):
         self.client = client if client is not None else FeedbackClient(config)
-        self.control = controller if controller is not None else SafeSkinController(self.client, config)
+        self.control = controller if controller is not None else RobotController(self.client, config)
         self._hz = positive_number(config.get("publish_hz", 10), "publish_hz")
         if self._hz > 125:
             raise ValueError("publish_hz must not exceed the 125 Hz feedback rate")
@@ -71,6 +71,30 @@ class DobotSensors:
         schema["x-is-dangerous"] = True
         schema["x-resource"] = "arm"
         definitions.append(tool("safe_skin_control", "actuator", "安全皮肤 TCP 控制：总开关和分区灵敏度；队列提交不等于配置读回", schema))
+        system_schema = action_schema({
+            "info": ([], "读取系统实时状态及本卡最近请求，不发送命令"),
+            "get_errors": ([], "通过 SDK 查询控制器当前报警编号，不清除报警"),
+            "request_control": (["confirm_change"], "请求 TCP 控制权；仅未上电/下使能时允许，不自动使能"),
+            "power_on": (["confirm_change"], "给机械臂本体上电；等待反馈初始化完成后才能另行使能"),
+            "enable": (["confirm_change"], "上使能，使用控制器已有负载设置，不清错或继续队列"),
+            "disable": (["confirm_change"], "下使能；反馈过期时仍可尝试发送"),
+            "clear_error": (["confirm_change"], "机器人静止时清除报警；不自动使能、复位皮肤或恢复运动"),
+            "stop_motion": (["confirm_change"], "停止运动指令队列/工程；与卡片 stop 不同"),
+            "pause": (["confirm_change"], "暂停正在执行的队列/工程；点动请使用 stop_motion"),
+            "resume": (["confirm_change"], "显式继续已暂停队列；可能恢复机械臂运动"),
+            "set_speed_factor": (["ratio", "confirm_change"], "设置全局速度比例，1–100%"),
+            "start_drag": (["confirm_change"], "机器人静止且无报警/碰撞时进入关节拖拽示教"),
+            "stop_drag": (["confirm_change"], "退出拖拽示教；反馈过期时仍可尝试发送"),
+            "start": ([], "启动反馈读取，不发送控制命令"),
+            "stop": ([], "关闭共享 Dashboard 连接；不会发送停止运动指令"),
+            "config": ([], "确认卡片配置；共享 IP/端口通过 joints 配置"),
+        }, {
+            "ratio": {"type": "integer", "minimum": 1, "maximum": 100, "description": "全局速度百分比"},
+            "confirm_change": {"type": "boolean", "description": "确认本次系统操作；写请求必须为 true"},
+        })
+        system_schema["x-is-dangerous"] = True
+        system_schema["x-resource"] = "arm"
+        definitions.append(tool("systemcontrol", "actuator", "系统状态、报警查询、TCP 控制权、本体上电、使能及运行控制", system_schema))
         definitions.append(tool("model", "resource", "六轴 CR3A 直角连杆骨架 URDF，附加连接全部为固定关节"))
         return definitions
 
@@ -173,6 +197,16 @@ class DobotSensors:
         name = args.get("_tool_name", action)
         if name == "model":
             return model_resource(self.client.snapshot(), self.client.model_name)
+        if name == "systemcontrol":
+            if action in ("info", name):
+                return {"state": "ready", **self.control.system_info()}
+            if action in ("start", "stop", "config"):
+                if action == "stop":
+                    self.control.close()
+                elif action == "start":
+                    self.client.start()
+                return {"state": {"start": "ready", "stop": "idle", "config": "configured"}[action]}
+            return self.control.execute_system(action, args)
         if name == "safe_skin_control":
             if action in ("info", name):
                 return {"state": "ready", **self.control.snapshot(), "feedback": self.payload("safe_skin")}
