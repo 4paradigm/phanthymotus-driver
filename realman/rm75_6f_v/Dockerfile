@@ -29,6 +29,8 @@ WORKDIR /work
 COPY common/ /work/common/
 COPY vendor/Robotic_Arm/ /work/Robotic_Arm/
 COPY main.py device.py hardware.py servo.py camera.py realsense.py vision_capture.py config.yaml driver.yaml /work/realman/rm75_6f_v/
+COPY waypoint.py /work/realman/rm75_6f_v/
+RUN install -d -m 0700 /opt/phanthy-motus/data/waypoints/realman
 COPY resource/ /work/realman/rm75_6f_v/resource/
 COPY pick_place/ /work/realman/rm75_6f_v/pick_place/
 COPY deploy/ /deploy/
