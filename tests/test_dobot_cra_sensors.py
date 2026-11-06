@@ -622,8 +622,8 @@ def test_metadata_and_mcp_http_contract():
     assert {t["name"] for t in tools} == {t["name"] for t in metadata["cards"]}
     sensors = [t for t in tools if t["type"] == "sensor"]
     assert len(sensors) == 1 and sensors[0]["name"] == "joints"
-    assert {t["name"] for t in tools} == {"joints", "joint_move", "model"}
-    assert {t["name"] for t in tools if t["type"] != "resource"} == {"joints", "joint_move"}
+    assert {t["name"] for t in tools} == {"joints", "joint_move", "teach", "model"}
+    assert {t["name"] for t in tools if t["type"] != "resource"} == {"joints", "joint_move", "teach"}
     assert next(t for t in tools if t["name"] == "model")["type"] == "resource"
     assert all(t["topic_out"][0]["format"] == ("sensor/skeleton" if t["name"] == "joints" else "data/json") for t in sensors)
     assert tools[0]["topic_out"][1] == {"topic": "/dobot_cra/state/joint_angles", "format": "data/json"}
@@ -644,7 +644,7 @@ def test_metadata_and_mcp_http_contract():
 
     try:
         assert rpc("initialize", {})["result"]["serverInfo"]["name"] == "dobot-cra"
-        assert len(rpc("tools/list", {})["result"]["tools"]) == 3
+        assert len(rpc("tools/list", {})["result"]["tools"]) == 4
         result = rpc("tools/call", {"name": "joints", "arguments": {
             "action": "config", "controller_ip": "", "feedback_port": 30006,
         }})

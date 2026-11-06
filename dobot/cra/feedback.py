@@ -12,6 +12,7 @@ import dataclasses
 import ipaddress
 import math
 import os
+import queue
 import threading
 import time
 
@@ -134,6 +135,32 @@ def decode_packet(packet):
     return state
 
 
+class FeedbackSubscription:
+    """Bounded recording tap; neither disk IO nor resampling runs on receive."""
+
+    def __init__(self, client, capacity):
+        self.client = client
+        self.queue = queue.Queue(capacity)
+        self.error = None
+
+    def put(self, item):
+        if self.error is not None:
+            return
+        try:
+            self.queue.put_nowait(item)
+        except queue.Full:
+            self.error = "recording feedback buffer overflow"
+
+    def read(self, timeout=0.1):
+        if self.error is not None:
+            raise RuntimeError(self.error)
+        return self.queue.get(timeout=timeout)
+
+    def close(self):
+        with self.client._lock:
+            self.client._subscriptions.discard(self)
+
+
 class FeedbackClient:
     def __init__(self, config, connection_factory=DobotConnection, clock=time.monotonic):
         self.address, self.port = endpoint(
@@ -161,6 +188,20 @@ class FeedbackClient:
         self._packets = 0
         self._invalid_packets = 0
         self._discarded_bytes = 0
+        self._subscriptions = set()
+
+    def subscribe(self, capacity=2048):
+        if type(capacity) is not int or capacity < 1:
+            raise ValueError("recording buffer capacity must be a positive integer")
+        subscription = FeedbackSubscription(self, capacity)
+        with self._lock:
+            self._subscriptions.add(subscription)
+        return subscription
+
+    def _recording_error(self, reason):
+        with self._lock:
+            for subscription in self._subscriptions:
+                subscription.error = reason
 
     @property
     def receive_timeout(self):
@@ -207,6 +248,7 @@ class FeedbackClient:
 
     def stop(self):
         with self._lifecycle:
+            self._recording_error("feedback stopped during recording")
             self._stop.set()
             with self._lock:
                 connection = self._connection
@@ -258,12 +300,16 @@ class FeedbackClient:
                             self._packets += 1
                             self._error = None
                             self._cleanup_error = None
+                            for subscription in self._subscriptions:
+                                subscription.put({"data": state, "packet": self._packets,
+                                                  "received_at": last_valid})
                     with self._lock:
                         self._discarded_bytes += stream.discarded_bytes
                     stream.discarded_bytes = 0
                     if self._clock() - last_valid > self.stale_timeout:
                         raise TimeoutError("no valid feedback within stale_timeout_s")
             except Exception as exc:
+                self._recording_error(f"feedback lost during recording: {exc}")
                 with self._lock:
                     if not self._stop.is_set():
                         self._error = str(exc)

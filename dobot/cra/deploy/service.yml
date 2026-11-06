@@ -5,6 +5,7 @@ dobot-cra:
   extra_hosts:
     - "${DOBOT_AGENT_CORE_HOSTNAME:-phanthy-motus}:${DOBOT_AGENT_CORE_ADDRESS:-127.0.0.1}"
   volumes:
+    - ${DOBOT_TEACH_DATA_DIR:-/opt/phanthy-motus/data/dobot-teach}:/work/data/dobot-teach
     - ${DOBOT_CA_DIR:-/opt/phanthy-motus/data/certs}:/opt/phanthy-motus/data/certs:ro
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
@@ -19,6 +20,9 @@ dobot-cra:
     - DOBOT_CONTROLLER_IP=${DOBOT_CONTROLLER_IP:-192.168.200.1}
     - DOBOT_FEEDBACK_PORT=${DOBOT_FEEDBACK_PORT:-30004}
     - DOBOT_MODEL_NAME=${DOBOT_MODEL_NAME:-}
+    - DOBOT_TEACH_DATA_DIR=/work/data/dobot-teach
+    - DOBOT_TEACH_CSV_PROFILE=${DOBOT_TEACH_CSV_PROFILE:-}
+    - DOBOT_TEACH_CONTROLLER_DIR=${DOBOT_TEACH_CONTROLLER_DIR:-}
   logging:
     driver: local
     options:
