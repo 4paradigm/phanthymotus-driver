@@ -2,9 +2,11 @@
 """Morse code card for the Noetix Bumi bundle.
 
 The card takes Morse code as text, decodes it to English and speaks the result
-on the robot speaker.  Everything happens locally: ``espeak-ng`` synthesises the
-English text and ``ffmpeg`` converts it to the 16 kHz stereo PCM that the
-vendor ``MediaController`` playback route expects.  No cloud TTS, no network.
+on the robot speaker.  Everything happens locally with tools the image already
+ships: ffmpeg's ``flite`` source synthesises the English text and the same
+ffmpeg process converts it to the 16 kHz stereo PCM that the vendor
+``MediaController`` playback route expects.  No extra system package, no cloud
+TTS, no network.
 
 Input convention: dots/dashes (``.``/``-``, full-width variants accepted),
 letters separated by one space, words separated by ``/``, ``|`` or two or more
@@ -17,6 +19,7 @@ exercises the decoder and the card contract without rclpy or the vendor SDK.
 
 from __future__ import annotations
 
+import math
 import re
 import shutil
 import struct
@@ -68,7 +71,23 @@ _FRAME_SECONDS = _FRAME_MS / 1000
 _FRAME_BYTES = _SAMPLE_RATE * _CHANNELS * 2 * _FRAME_MS // 1000
 _CONFIG_INTERVAL_S = 0.5
 
-_VOICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_+\-]{0,31}")
+# libflite voices registered by ffmpeg's `flite` source.
+_FLITE_VOICES = frozenset(("kal", "kal16", "awb", "rms", "slt"))
+_MIN_SPEED = 0.5
+_MAX_SPEED = 2.0
+
+# flite takes its text inside the ffmpeg filtergraph, where punctuation is
+# syntax, and all-caps text can be spelled letter by letter.  Speak lowercase
+# words with punctuation names instead of feeding raw characters through.
+_SPOKEN_PUNCTUATION = {
+    ".": " period ", ",": " comma ", "?": " question mark ",
+    "!": " exclamation mark ", "'": " apostrophe ", "/": " slash ",
+    "(": " open parenthesis ", ")": " close parenthesis ",
+    "&": " ampersand ", ":": " colon ", ";": " semicolon ",
+    "=": " equals ", "+": " plus ", "-": " hyphen ", "_": " underscore ",
+    '"': " quote ", "$": " dollar ", "@": " at ",
+}
+_UNSPEAKABLE = re.compile(r"[^a-z0-9 ]+")
 
 
 class MorseInputError(ValueError):
@@ -132,26 +151,43 @@ def decode_morse(value) -> dict:
     }
 
 
-def _bounded_int(value, default: int, low: int, high: int) -> int:
+def _speed_scale(value) -> float:
     if isinstance(value, bool):
-        return default
+        return 1.0
     try:
-        number = int(value)
+        number = float(value)
     except (TypeError, ValueError):
-        return default
-    return min(high, max(low, number))
+        return 1.0
+    if not math.isfinite(number):
+        return 1.0
+    return min(_MAX_SPEED, max(_MIN_SPEED, number))
 
 
 def _voice_name(value) -> str:
-    return value if isinstance(value, str) and _VOICE.fullmatch(value) else "en-us"
+    if isinstance(value, str) and value.strip().lower() in _FLITE_VOICES:
+        return value.strip().lower()
+    return "slt"
 
 
-def _find_engine():
-    for name in ("espeak-ng", "espeak"):
-        path = shutil.which(name)
-        if path:
-            return path
-    return None
+def speakable_text(text: str) -> str:
+    """Turn decoded Morse into plain lowercase words for flite."""
+    spoken = "".join(_SPOKEN_PUNCTUATION.get(char, char) for char in text)
+    return " ".join(_UNSPEAKABLE.sub(" ", spoken.lower()).split())
+
+
+def _find_ffmpeg_flite():
+    """Return ffmpeg's path when it was built with the libflite `flite` source."""
+    path = shutil.which("ffmpeg")
+    if not path:
+        return None
+    try:
+        listed = subprocess.run(
+            [path, "-hide_banner", "-filters"],
+            capture_output=True, timeout=10, check=False, text=True)
+    except Exception:
+        return None
+    return path if re.search(r"^\s*\S+\s+flite\s", listed.stdout or "",
+                             re.MULTILINE) else None
 
 
 class MorsePlugin:
@@ -164,9 +200,8 @@ class MorsePlugin:
         self._namespace = namespace
         self._media_ctrl = media_ctrl
         self._voice = _voice_name(plugin_config.get("voice"))
-        self._speed_wpm = _bounded_int(plugin_config.get("speed_wpm"), 150, 80, 300)
-        self._engine = _find_engine()
-        self._ffmpeg = shutil.which("ffmpeg")
+        self._speed = _speed_scale(plugin_config.get("speed", 1.0))
+        self._ffmpeg = _find_ffmpeg_flite()
         self._active = None
         self._thread = None
         self._last = None
@@ -220,7 +255,7 @@ class MorsePlugin:
                     "info": {"params": [],
                              "description": "返回语音组件可用性、当前播放状态和最近一次结果。"},
                     "start": {"params": [],
-                              "description": "检查 espeak-ng/ffmpeg 是否可用，不朗读任何内容。"},
+                              "description": "检查镜像内 ffmpeg 的 flite 语音是否可用，不朗读任何内容。"},
                 },
             },
             "topic_out": [],
@@ -307,7 +342,7 @@ class MorsePlugin:
             "letters": result["letters"],
             "action_id": record["action_id"],
             "voice": self._voice,
-            "speed_wpm": self._speed_wpm,
+            "speed": self._speed,
             "message": "正在用英文语音朗读。",
         }
 
@@ -392,31 +427,29 @@ class MorsePlugin:
         return record is not None
 
     def _synthesize(self, text: str) -> bytes:
-        if not self._engine or not self._ffmpeg:
+        if not self._ffmpeg:
             raise RuntimeError(self._unavailable_message())
+        spoken = speakable_text(text)
+        if not spoken:
+            raise RuntimeError("没有可朗读的英文内容")
+        # `flite` is a lavfi source: ffmpeg synthesises the utterance and the
+        # same process resamples it to the playback contract.  The text was
+        # reduced to lowercase words, so it contains no filtergraph syntax.
+        graph = f"flite=text='{spoken}':voice={self._voice}"
         with tempfile.TemporaryDirectory(prefix="bumi_morse_") as directory:
-            wav = Path(directory) / "speech.wav"
             raw = Path(directory) / "speech.pcm"
-            # The leading space keeps a decoded message that starts with "-"
-            # (Morse -....-) from being parsed as an espeak option.
-            spoken = subprocess.run(
-                [self._engine, "-v", self._voice, "-s", str(self._speed_wpm),
-                 "-w", str(wav), " " + text],
-                capture_output=True, timeout=30, check=False)
-            if (spoken.returncode != 0 or not wav.is_file()
-                    or wav.stat().st_size <= 44):
-                detail = spoken.stderr.decode("utf-8", "replace").strip()[:300]
-                raise RuntimeError(
-                    f"espeak-ng 合成失败（退出码 {spoken.returncode}）：{detail}")
-            converted = subprocess.run(
-                [self._ffmpeg, "-nostdin", "-y", "-loglevel", "error",
-                 "-i", str(wav), "-ar", str(_SAMPLE_RATE), "-ac", str(_CHANNELS),
-                 "-f", "s16le", str(raw)],
-                capture_output=True, timeout=30, check=False)
+            command = [self._ffmpeg, "-nostdin", "-y", "-loglevel", "error",
+                       "-f", "lavfi", "-i", graph]
+            if abs(self._speed - 1.0) > 1e-6:
+                command += ["-af", f"atempo={self._speed:.2f}"]
+            command += ["-ar", str(_SAMPLE_RATE), "-ac", str(_CHANNELS),
+                        "-f", "s16le", str(raw)]
+            converted = subprocess.run(command, capture_output=True, timeout=30,
+                                       check=False)
             if converted.returncode != 0 or not raw.is_file():
                 detail = converted.stderr.decode("utf-8", "replace").strip()[:300]
                 raise RuntimeError(
-                    f"ffmpeg 转码失败（退出码 {converted.returncode}）：{detail}")
+                    f"ffmpeg flite 合成失败（退出码 {converted.returncode}）：{detail}")
             pcm = raw.read_bytes()
         if len(pcm) % 4:
             pcm = pcm[:-(len(pcm) % 4)]
@@ -474,14 +507,11 @@ class MorsePlugin:
     # ── Status ───────────────────────────────────────────────────────────────
 
     def _tts_ready(self) -> bool:
-        return self._engine is not None and self._ffmpeg is not None
+        return self._ffmpeg is not None
 
     def _unavailable_message(self) -> str:
-        missing = [name for name, path in
-                   (("espeak-ng", self._engine), ("ffmpeg", self._ffmpeg))
-                   if not path]
-        return ("缺少语音组件：" + "、".join(missing) +
-                "；请重新构建驱动镜像（Dockerfile 已安装 espeak-ng 与 ffmpeg）")
+        return ("缺少语音组件：ffmpeg 的 flite 语音滤镜不可用；"
+                "请检查驱动镜像中的 ffmpeg 构建（Ubuntu 版 ffmpeg 已链接 libflite1）")
 
     def _info(self) -> dict:
         with self._state_lock:
@@ -497,10 +527,10 @@ class MorsePlugin:
             "state": "speaking" if active else ("idle" if ready else "unavailable"),
             "tts": {
                 "available": ready,
-                "engine": Path(self._engine).name if self._engine else None,
+                "engine": "ffmpeg-flite" if ready else None,
                 "ffmpeg": bool(self._ffmpeg),
                 "voice": self._voice,
-                "speed_wpm": self._speed_wpm,
+                "speed": self._speed,
             },
             "active": active,
             "last": last,

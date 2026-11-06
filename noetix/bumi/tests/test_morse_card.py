@@ -122,6 +122,16 @@ def test_invalid_symbol_is_reported(module):
     assert decoded["unknown"][0]["reason"] == "invalid_symbol"
 
 
+def test_speakable_text_is_flite_safe(module):
+    # flite gets its text inside an ffmpeg filtergraph: punctuation must not
+    # reach it as syntax, and lowercase keeps all-caps words from being spelled.
+    assert module.speakable_text("HELLO WORLD") == "hello world"
+    assert module.speakable_text("A, B?") == "a comma b question mark"
+    assert module.speakable_text("-") == "hyphen"
+    assert module.speakable_text("A-B") == "a hyphen b"
+    assert module.speakable_text("<>") == ""
+
+
 @pytest.mark.parametrize("value", [None, 5, [], {}])
 def test_non_string_input_is_rejected(module, value):
     with pytest.raises(module.MorseInputError):
@@ -165,14 +175,14 @@ def test_tool_contract(module):
 
 
 def test_config_validates_voice_and_speed(module):
-    card = module.MorsePlugin({"voice": "en-gb", "speed_wpm": 999},
+    card = module.MorsePlugin({"voice": "kal", "speed": 99},
                               "robot", None, _FakeMedia())
-    assert card._voice == "en-gb"
-    assert card._speed_wpm == 300
-    card = module.MorsePlugin({"voice": "--*", "speed_wpm": "fast"},
+    assert card._voice == "kal"
+    assert card._speed == 2.0
+    card = module.MorsePlugin({"voice": "--*", "speed": "fast"},
                               "robot", None, _FakeMedia())
-    assert card._voice == "en-us"
-    assert card._speed_wpm == 150
+    assert card._voice == "slt"
+    assert card._speed == 1.0
 
 
 def test_decode_action_needs_no_tts(module):
@@ -198,10 +208,10 @@ def test_speak_refuses_unknown_codes(module):
 
 def test_speak_without_tts_is_unavailable(module):
     card = module.MorsePlugin({}, "robot", None, _FakeMedia())
-    card._engine = None
+    card._ffmpeg = None
     result = card.dispatch("speak", {"morse": ".... .."})
     assert result["state"] == "unavailable"
-    assert "espeak-ng" in result["message"]
+    assert "flite" in result["message"]
 
 
 def test_speak_streams_decoded_text(module, monkeypatch):
@@ -275,7 +285,7 @@ def test_stop_without_speech_is_a_no_op(module):
 
 def test_info_reports_missing_tts(module):
     card = module.MorsePlugin({}, "robot", None, None)
-    card._engine = None
+    card._ffmpeg = None
     info = card.dispatch("info", {})
     assert info["state"] == "unavailable"
     assert info["tts"]["available"] is False

@@ -23,6 +23,12 @@ WORKDIR /work
 # unavailable on ordinary networks and on the Bumi host. Replace it with the
 # public HTTPS mirror before the first apt invocation; packages remain signed
 # and subject to apt's normal verification.
+#
+# Do not add packages casually here.  On a non-arm64 build host this layer runs
+# under qemu-user, and qemu 8.1.1-9.2.0 segfaults in libc-bin's ldconfig
+# trigger (Ubuntu bug 2072564), which fails the whole build with exit 100.
+# The Morse card therefore uses the ffmpeg flite source installed here instead
+# of espeak-ng.
 RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
         -exec sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_MIRROR}|g" {} + && \
     apt-get update && \
@@ -40,8 +46,7 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
         libasound2-dev \
         libssl-dev \
         libeigen3-dev \
-        libboost-dev \
-        espeak-ng && \
+        libboost-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # RTAB-Map RGB-D odometry, bundle-local (single container). The estimator runs as
