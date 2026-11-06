@@ -204,7 +204,7 @@ class RobotController:
         if args.get("confirm_move") is not True:
             raise ValueError("confirm_move=true is required for each motion request")
         parameters, options, requested = (), {}, {}
-        if action in ("move_j", "rel_joint_mov_j", "resume"):
+        if action in ("move_j", "rel_joint_mov_j"):
             detect_collision = args.get("detect_collision", False)
             if type(detect_collision) is not bool:
                 raise ValueError("detect_collision must be a boolean true or false")
@@ -240,7 +240,7 @@ class RobotController:
         def check_state(current_action, *, allow_own_queue=False):
             if cancel is not None and cancel.is_set():
                 raise RuntimeError("motion interrupted")
-            if current_action in ("move_j", "rel_joint_mov_j", "resume"):
+            if current_action in ("move_j", "rel_joint_mov_j"):
                 return self._check_preparation_state(current_action, allow_own_queue=allow_own_queue)
             return self._check_motion_state(current_action)
         return self._execute(action, commands[action], check_state, card="joint_move",
@@ -290,7 +290,7 @@ class RobotController:
                     self._update(dashboard_connected=True)
                 # Connecting can take long enough for feedback/state to change.
                 check_state(action)
-                if action in ("move_j", "rel_joint_mov_j", "resume"):
+                if action in ("move_j", "rel_joint_mov_j"):
                     pre_enable_clear = self._api.ClearError()
                     parse_response(pre_enable_clear, "ClearError")
                     request["pre_enable_clear_error_response"] = pre_enable_clear
@@ -307,7 +307,7 @@ class RobotController:
                             if time.monotonic() >= deadline:
                                 raise TimeoutError("EnableRobot acknowledged but enabled feedback was not confirmed")
                             time.sleep(0.02)
-                if card == "joint_move" and action in ("move_j", "rel_joint_mov_j", "resume"):
+                if card == "joint_move" and action in ("move_j", "rel_joint_mov_j"):
                     baseline = check_state(action).get("packets_received")
                     detect_collision = request["detect_collision"]
                     skin_reply = self._api.EnableSafeSkin(int(detect_collision))
@@ -331,7 +331,7 @@ class RobotController:
                     parse_response(clear_reply, "ClearError")
                     request["clear_error_response"] = clear_reply
                     self._wait_preparation_queue(action, check_state, skin_queue_id, baseline)
-                if action in ("move_j", "rel_joint_mov_j", "resume"):
+                if action in ("move_j", "rel_joint_mov_j"):
                     # ACKs can precede the feedback packet reporting the effect.
                     # Wait for final motion conditions only after all preparation.
                     deadline = time.monotonic() + self.enable_timeout
@@ -353,6 +353,9 @@ class RobotController:
                     if command == "MovJ":
                         parameters = (target, CoordinateType.JOINT)
                         request.update({f"{joint}_deg": value for joint, value in zip(JOINT_NAMES, target)})
+                if action == "resume":
+                    paused_sample = self._check_motion_state(action)
+                    request["resumed_command_id"] = paused_sample["data"].get("current_command_id")
                 api = self._motion_api if command in ("MovJ", "RelJointMovJ") else self._api
                 reply = getattr(api, command)(*parameters, **(options or {}))
                 queue_id = parse_reply(reply, command)

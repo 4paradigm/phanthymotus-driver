@@ -111,12 +111,14 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra
 ## 关节运动
 
 joint_move 与 joints 共用底层反馈服务和连接配置，均可独立启动。
-move_j/resume 先 ClearError，再检查使能，未使能时发送一次 EnableRobot 并等待反馈确认。
+move_j/rel_joint_mov_j 先 ClearError，再检查使能，未使能时发送一次 EnableRobot 并等待反馈确认。
 然后按 detect_collision 配置安全皮肤：默认 false 关闭；true 开启并将四个区域设为 low。
-move_j 再发送 ClearError 和 MovJ，resume 发送 Continue。
+新运动再发送 ClearError 和 MovJ/RelJointMovJ。
+resume 只检查已使能、模式 10 和保护状态，然后复用命令连接发送 Continue；
+不清错、不自动使能、不设置安全皮肤，保持暂停前配置。未使能或保护未解除时拒绝继续。
 失败不继续也不重试。
 皮肤设置由 detect_collision 显式选择。模式 11 等保护状态不会提前阻止准备命令；
-仅在准备完成后确认模式 5（move_j）或模式 10（resume）、已使能且无保护触发，才发送最终运动命令。
+新运动准备完成后必须确认模式 5、已使能且无保护触发，才发送位移命令。
 
 五个运动 action 均返回 action_id，通过 ACP 完成回调报告真实终态；命令应答不等于运动完成。
 暂停/停止也要等待新反馈确认状态与实际速度，缺失反馈不宣称停稳。
@@ -132,7 +134,7 @@ rel_joint_mov_j 新增相对关节偏移运动，单位为度，0 表示该轴�
 | `move_j` | `joint1_deg` 至 `joint6_deg` 为绝对目标角度，留空保持下发前实际角度 |
 | `rel_joint_mov_j` | `joint1_offset_deg` 至 `joint6_offset_deg` 为相对偏移，留空按 0 |
 | `pause` | 暂停控制器队列或工程，不适用于点动 |
-| `resume` | 继续已暂停的队列或工程 |
+| `resume` | 仅需手动 confirm_move=true，检查后直接 Continue，保持暂停前安全皮肤配置 |
 | `stop_motion` | 停止控制器队列或工程，包括点动 |
 
 两种角度运动至少填写一个关节，明确填入绝对角度 0 表示回到零度。
@@ -145,3 +147,6 @@ rel_joint_mov_j 新增相对关节偏移运动，单位为度，0 表示该轴�
 CA 路径为 /opt/phanthy-motus/data/certs/cert.pem。部署支持 DOBOT_AGENT_CORE_URL、
 DOBOT_AGENT_CORE_HOSTNAME、DOBOT_AGENT_CORE_ADDRESS、DOBOT_CA_DIR、DOBOT_AGENT_CORE_CA_CERT 覆盖。
 TLS 保持校验；停止在反馈或证书配置异常时仍可下发，但不能宣称已停稳或已成功通知平台。
+
+暂停完成以模式 10 及连续两包新反馈确认停稳为依据，不强制要求 pause_cmd_flag=1；
+实测该字段可以为 0。resume 同样以模式 10 判断暂停状态，不依赖该标志。

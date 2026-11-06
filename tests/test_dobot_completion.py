@@ -298,3 +298,72 @@ def test_transient_callback_failure_retries_same_id_without_replaying_motion():
     assert attempts == ['same-id', 'same-id']
     assert completion.last_completion['callback'] == 'accepted'
     assert not dashboard.commands
+
+
+@pytest.mark.parametrize('pause_flag', [0, 1])
+def test_pause_completion_accepts_mode10_even_when_queue_pause_flag_is_zero(pause_flag):
+    feedback, dashboard, _, completion, events = completion_fixture()
+    set_mode(feedback, 7)
+    original_send, original_snapshot = dashboard.send_receive_text, feedback.snapshot
+    packets = [0]
+    def send(command):
+        reply = original_send(command)
+        if command == 'Pause()':
+            set_mode(feedback, 10)
+            feedback.sample['data']['pause_cmd_flag'] = pause_flag
+        return reply
+    def snapshot():
+        packets[0] += 1
+        return {**original_snapshot(), 'packets_received': packets[0]}
+    dashboard.send_receive_text, feedback.snapshot = send, snapshot
+    result = completion.start('pause', {'confirm_move': True})
+    record = wait_result(completion)
+    assert record['action_id'] == result['action_id'] and record['status'] == 'completed'
+    assert record['result']['reason'] == 'paused' and dashboard.commands == ['Pause()']
+
+
+def test_resume_acp_with_real_observed_mode10_and_zero_pause_flag():
+    feedback, dashboard, _, completion, events = completion_fixture()
+    set_mode(feedback, 10)
+    feedback.sample['data']['pause_cmd_flag'] = 0
+    original_send, original_snapshot = dashboard.send_receive_text, feedback.snapshot
+    packets = [0]
+    sequence = []
+    def send(command):
+        reply = original_send(command)
+        if command == 'Continue()':
+            sequence.extend([10, 7, 5])
+        return reply
+    def snapshot():
+        packets[0] += 1
+        if sequence:
+            set_mode(feedback, sequence.pop(0))
+            feedback.sample['data']['pause_cmd_flag'] = 0
+        return {**original_snapshot(), 'packets_received': packets[0]}
+    dashboard.send_receive_text, feedback.snapshot = send, snapshot
+    result = completion.start('resume', {'confirm_move': True})
+    record = wait_result(completion)
+    assert record['action_id'] == result['action_id'] and record['status'] == 'completed'
+    assert dashboard.commands == ['Continue()']
+
+
+def test_short_resume_completes_using_original_queue_id_without_observed_mode7():
+    feedback, dashboard, _, completion, events = completion_fixture()
+    set_mode(feedback, 10)
+    feedback.sample['data'].update(pause_cmd_flag=0, current_command_id=3)
+    original_send, original_snapshot = dashboard.send_receive_text, feedback.snapshot
+    packets = [0]
+    def send(command):
+        reply = original_send(command)
+        if command == 'Continue()':
+            set_mode(feedback, 5)
+        return reply
+    def snapshot():
+        packets[0] += 1
+        return {**original_snapshot(), 'packets_received': packets[0]}
+    dashboard.send_receive_text, feedback.snapshot = send, snapshot
+    result = completion.start('resume', {'confirm_move': True})
+    record = wait_result(completion)
+    assert record['action_id'] == result['action_id'] and record['status'] == 'completed'
+    assert record['result']['result_id'] == 3
+    assert dashboard.commands == ['Continue()']

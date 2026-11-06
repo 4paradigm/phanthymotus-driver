@@ -71,7 +71,7 @@ class DobotSensors:
                                 "六轴相对关节运动（度），0 表示该轴不变；空白偏移量按 0，至少填写一轴，复用 move_j 的准备、皮肤和完成流程"),
             "stop_motion": (["confirm_move"], "停止控制器运动队列/工程，包括点动；不下使能"),
             "pause": (["confirm_move"], "暂停当前运动队列/工程；不支持点动暂停"),
-            "resume": (["detect_collision", "confirm_move"], "先 ClearError，再检查使能，未使能则 EnableRobot 并等待确认，再按 detect_collision 设置安全皮肤，成功后继续暂停队列"),
+            "resume": (["confirm_move"], "检查已使能、暂停及保护状态后直接 Continue，保持暂停前安全皮肤配置；不清错、不自动使能、不设置皮肤"),
             "start": ([], "启动反馈读取，不发送运动指令"),
             "stop": ([], "关闭共享命令连接，不发送停止运动指令"),
             "config": ([], "确认卡片配置；本卡与 joints 共用 IP/端口配置"),

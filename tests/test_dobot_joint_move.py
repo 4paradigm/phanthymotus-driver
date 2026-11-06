@@ -287,7 +287,7 @@ def test_pause_and_resume_use_sdk_without_chained_actions(action, mode, command)
     set_mode(feedback, mode)
     try:
         control.execute_motion(action, {'confirm_move': True})
-        assert dashboard.commands == (['ClearError()', 'EnableSafeSkin(0)', command] if action == 'resume' else [command]) and len(calls) == 1
+        assert dashboard.commands == [command] and len(calls) == 1
     finally:
         control.close()
 
@@ -298,11 +298,8 @@ def test_pause_cannot_pause_jogging_and_resume_requires_paused_mode(action, mode
     set_mode(feedback, mode)
     with pytest.raises(RuntimeError):
         control.execute_motion(action, {'confirm_move': True})
-    if action == 'resume' and mode == 5:
-        assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)']
-        assert len(calls) == 1
-    else:
-        assert not calls and not dashboard.commands
+    assert not calls and not dashboard.commands
+
 
 
 def test_explicit_stop_remains_possible_when_feedback_is_unavailable():
@@ -436,7 +433,7 @@ def test_protection_state_is_checked_again_after_clear():
     assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)', 'ClearError()'] and dashboard.closed
 
 
-@pytest.mark.parametrize('action,mode', [('move_j', 5), ('resume', 10)])
+@pytest.mark.parametrize('action,mode', [('move_j', 5)])
 @pytest.mark.parametrize('failure', ['rejected', 'malformed', 'timeout'])
 def test_skin_disable_failure_blocks_motion_and_resume(action, mode, failure):
     feedback, dashboard, control, calls = ready()
@@ -455,14 +452,14 @@ def test_skin_disable_failure_blocks_motion_and_resume(action, mode, failure):
     assert len(calls) == 1 and dashboard.closed
 
 
-def test_each_resume_disables_skin_on_reused_connection():
+def test_each_resume_preserves_skin_on_reused_connection():
     feedback, dashboard, control, calls = ready()
     set_mode(feedback, 10)
     try:
         for _ in range(2):
             result = control.execute_motion('resume', {'confirm_move': True})
-            assert result['safe_skin_disable_response'].startswith('0,')
-        assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)', 'Continue()'] * 2
+            assert 'safe_skin_disable_response' not in result and 'enable_response' not in result
+        assert dashboard.commands == ['Continue()'] * 2
         assert len(calls) == 1
     finally:
         control.close()
@@ -515,7 +512,7 @@ def test_stop_cannot_interleave_skin_clear_and_move_sequence():
         control.close()
 
 
-@pytest.mark.parametrize('action,mode', [('move_j', 4), ('resume', 10)])
+@pytest.mark.parametrize('action,mode', [('move_j', 4)])
 def test_disabled_robot_is_enabled_once_before_motion(action, mode):
     feedback, dashboard, control, _ = ready()
     set_mode(feedback, mode)
@@ -536,7 +533,7 @@ def test_disabled_robot_is_enabled_once_before_motion(action, mode):
         control.close()
 
 
-@pytest.mark.parametrize('action,mode', [('move_j', 4), ('resume', 10)])
+@pytest.mark.parametrize('action,mode', [('move_j', 4)])
 @pytest.mark.parametrize('failure', ['rejected', 'malformed', 'timeout', 'no_feedback', 'protection'])
 def test_enable_failure_or_missing_confirmation_blocks_motion(action, mode, failure):
     feedback, dashboard, control, _ = ready()
@@ -565,19 +562,12 @@ def test_enable_failure_or_missing_confirmation_blocks_motion(action, mode, fail
     assert dashboard.closed
 
 
-def test_resume_does_not_continue_if_enabling_loses_paused_state():
-    feedback, dashboard, control, _ = ready()
+def test_resume_rejects_disabled_robot_without_attempting_recovery():
+    feedback, dashboard, control, calls = ready()
     set_mode(feedback, 4)
-    original = dashboard.send_receive_text
-    def send(command):
-        reply = original(command)
-        if command == 'EnableRobot()':
-            set_mode(feedback, 5)
-        return reply
-    dashboard.send_receive_text = send
     with pytest.raises(RuntimeError, match='mode 10'):
         control.execute_motion('resume', {'confirm_move': True})
-    assert dashboard.commands == ['ClearError()', 'EnableRobot()', 'EnableSafeSkin(0)']
+    assert not calls and not dashboard.commands
 
 
 def test_enable_ack_waits_for_later_feedback_before_sending_move():
@@ -606,7 +596,7 @@ def test_enable_ack_waits_for_later_feedback_before_sending_move():
         control.close()
 
 
-@pytest.mark.parametrize('action,mode', [('move_j', 5), ('resume', 10)])
+@pytest.mark.parametrize('action,mode', [('move_j', 5)])
 def test_enable_lost_after_disabling_skin_blocks_final_motion(action, mode):
     feedback, dashboard, control, _ = ready()
     set_mode(feedback, mode)
@@ -642,7 +632,7 @@ def test_alarm_and_collision_can_reach_clear_before_final_motion_check(mode):
         control.close()
 
 
-@pytest.mark.parametrize('action,mode', [('move_j', 5), ('resume', 10)])
+@pytest.mark.parametrize('action,mode', [('move_j', 5)])
 @pytest.mark.parametrize('flag', ['error_status', 'collision_state', 'arm_approach_state',
                                 'j4_approach_state', 'j5_approach_state', 'j6_approach_state'])
 def test_persistent_protection_blocks_only_final_motion_after_preparation(action, mode, flag):
@@ -696,7 +686,7 @@ def test_disabled_collision_state_prepares_in_enable_skin_clear_move_order():
         control.close()
 
 
-@pytest.mark.parametrize('action,mode', [('move_j', 4), ('resume', 10)])
+@pytest.mark.parametrize('action,mode', [('move_j', 4)])
 @pytest.mark.parametrize('failure', ['rejected', 'malformed', 'timeout'])
 def test_pre_enable_clear_failure_blocks_enable_and_later_commands(action, mode, failure):
     feedback, dashboard, control, calls = ready()
@@ -742,7 +732,7 @@ def test_confirmation_uses_plain_boolean_schema_like_rm75():
         assert 'confirm_move' in schema['x-action-params'][action]['params']
 
 
-@pytest.mark.parametrize('action', ['move_j', 'resume'])
+@pytest.mark.parametrize('action', ['move_j'])
 def test_own_setting_queue_mode7_is_waited_out_before_next_command(action):
     feedback, dashboard, control, _ = ready()
     final_mode = 5 if action == 'move_j' else 10
@@ -825,7 +815,7 @@ def test_initial_mode7_is_not_treated_as_our_own_preparation_queue():
     assert not calls and not dashboard.commands
 
 
-@pytest.mark.parametrize('action,mode', [('move_j', 5), ('resume', 10)])
+@pytest.mark.parametrize('action,mode', [('move_j', 5)])
 @pytest.mark.parametrize('setting', [None, False, True])
 def test_collision_option_controls_skin_and_all_four_low_thresholds(action, mode, setting):
     feedback, dashboard, control, _ = ready()
@@ -852,7 +842,7 @@ def test_collision_option_controls_skin_and_all_four_low_thresholds(action, mode
         control.close()
 
 
-@pytest.mark.parametrize('action', ['move_j', 'resume'])
+@pytest.mark.parametrize('action', ['move_j'])
 @pytest.mark.parametrize('bad', [None, 0, 1, 'true', 'false'])
 def test_collision_option_requires_boolean_before_sending_any_command(action, bad):
     _, dashboard, control, calls = ready()
@@ -882,7 +872,43 @@ def test_collision_option_schema_defaults_false_and_confirmation_stays_manual():
     schema = next(t for t in plugin.get_tools() if t['name'] == 'joint_move')['inputSchema']
     assert schema['properties']['detect_collision']['type'] == 'boolean'
     assert schema['properties']['detect_collision']['default'] is False
-    for action in ('move_j', 'resume'):
+    for action in ('move_j', 'rel_joint_mov_j'):
         assert 'detect_collision' in schema['x-action-params'][action]['params']
     assert 'default' not in schema['properties']['confirm_move']
     assert 'enum' not in schema['properties']['confirm_move']
+
+
+@pytest.mark.parametrize('flag', [0, 1])
+@pytest.mark.parametrize('legacy_skin_option', [None, False, True])
+def test_resume_only_continues_and_preserves_previous_skin_configuration(flag, legacy_skin_option):
+    feedback, dashboard, control, _ = ready()
+    set_mode(feedback, 10)
+    feedback.sample['data']['pause_cmd_flag'] = flag
+    args = {'confirm_move': True}
+    if legacy_skin_option is not None:
+        args['detect_collision'] = legacy_skin_option
+    try:
+        control.execute_motion('resume', args)
+        assert dashboard.commands == ['Continue()']
+    finally:
+        control.close()
+
+
+@pytest.mark.parametrize('changed', [
+    {'enable_status': False}, {'error_status': True}, {'collision_state': 1},
+    {'arm_approach_state': 1}, {'j4_approach_state': 1}, {'j5_approach_state': 1}, {'j6_approach_state': 1},
+])
+def test_resume_with_unrecovered_condition_rejects_without_recovery_commands(changed):
+    feedback, dashboard, control, calls = ready()
+    set_mode(feedback, 10)
+    feedback.sample['data'].update(changed)
+    with pytest.raises(RuntimeError):
+        control.execute_motion('resume', {'confirm_move': True})
+    assert not calls and not dashboard.commands
+
+
+def test_resume_schema_has_no_skin_or_other_preparation_parameters():
+    schema = next(t for t in DobotSensors({}).get_tools() if t['name'] == 'joint_move')['inputSchema']
+    assert schema['x-action-params']['resume']['params'] == ['confirm_move']
+    assert 'detect_collision' in schema['x-action-params']['move_j']['params']
+    assert 'detect_collision' in schema['x-action-params']['rel_joint_mov_j']['params']

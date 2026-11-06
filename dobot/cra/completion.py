@@ -100,7 +100,11 @@ class MotionCompletion:
                 if action == "stop_motion":
                     self._last_target = None
             else:
-                result = self._monitor(active["cancel"], target, response.get("result_id"), baseline)
+                queue_id = response.get("result_id")
+                resumed_id = response.get("resumed_command_id")
+                if action == "resume" and type(resumed_id) is int and resumed_id > 0:
+                    queue_id = resumed_id
+                result = self._monitor(active["cancel"], target, queue_id, baseline)
                 self._last_target = None
             status = "completed"
         except Exception as exc:
@@ -142,7 +146,7 @@ class MotionCompletion:
                 stopped = (len(velocities) == 6 and all(abs(v) <= 0.1 for v in velocities)
                            and not state["running_status"] and not state["jog_status"]
                            and state["robot_mode"] in (3, 4, 5, 9, 10, 11))
-                paused = state["robot_mode"] == 10 and bool(state["pause_cmd_flag"])
+                paused = state["robot_mode"] == 10
                 confirmed = stopped and (paused if action == "pause" else not state["run_queued_cmd"])
                 stable_packets = stable_packets + 1 if confirmed else 0
                 if stable_packets >= 2:
