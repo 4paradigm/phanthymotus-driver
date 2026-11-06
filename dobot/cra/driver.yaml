@@ -1,0 +1,15 @@
+id: dobot-cra-driver
+name: Dobot CRA Joints and Joint Move
+category: driver
+hardware_provider: dobot
+hardware_model: cra
+image_name: dobot-cra
+port: 15746
+mcp_url: "http://localhost:15746/mcp"
+description: "CR3A joint feedback at 30 Hz and absolute and relative joint-angle motion through the official SDK"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: joints, type: sensor }
+  - { name: joint_move, type: actuator }
+  - { name: model, type: resource }

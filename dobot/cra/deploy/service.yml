@@ -1,0 +1,27 @@
+dobot-cra:
+  container_name: embodied-dobot-cra
+  image: __IMAGE__
+  network_mode: host
+  extra_hosts:
+    - "${DOBOT_AGENT_CORE_HOSTNAME:-phanthy-motus}:${DOBOT_AGENT_CORE_ADDRESS:-127.0.0.1}"
+  volumes:
+    - ${DOBOT_CA_DIR:-/opt/phanthy-motus/data/certs}:/opt/phanthy-motus/data/certs:ro
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - ROS_LOCALHOST_ONLY=0
+    - PYTHONUNBUFFERED=1
+    - RCUTILS_COLORIZED_OUTPUT=0
+    - AGENT_CORE_URL=${DOBOT_AGENT_CORE_URL:-https://phanthy-motus:15678}
+    - AGENT_CORE_CA_CERT=${DOBOT_AGENT_CORE_CA_CERT:-/opt/phanthy-motus/data/certs/cert.pem}
+    - DOBOT_CONTROLLER_IP=${DOBOT_CONTROLLER_IP:-192.168.200.1}
+    - DOBOT_FEEDBACK_PORT=${DOBOT_FEEDBACK_PORT:-30004}
+    - DOBOT_MODEL_NAME=${DOBOT_MODEL_NAME:-}
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always
