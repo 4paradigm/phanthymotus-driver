@@ -62,7 +62,7 @@ git apply --reverse --check "$driver_checkout/noetix/bumi/simulation/detaforce_g
 
 已知平台时序限制：本地 Agent Core 在收到工具调用返回后才注册待完成动作；若回调先于注册到达，接口仍返回成功，但无法解除之后注册的等待。需在平台侧提供可靠的提前回调缓存或注册确认，并在端到端验收中覆盖快速异常和取消；当前卡片的 HTTP 回调单元测试不能证明该竞态已解决。
 
-观察到播放模式 23 后退出到 walking 模式 2，回报 `completed`，依据记录为 `completion_basis=sdk_workmode_exit`。用户停止且确认退出播放时回报 `cancelled`。异常模式、SDK 故障、停止失败或播放超时回报 `error`。`playback_timeout_s` 默认 60 秒，可配置为 5–120 秒，ACP 兜底上限为 150 秒。超时清理仅退出本卡已持有的播放模式。
+SDK 工作模式无法区分自然结束与外部打断，因此未请求的播放模式退出会回报 `error` 并锁定后续动作，不能当作成功完成。用户停止且确认退出播放时回报 `cancelled`。异常模式、SDK 故障、停止失败或播放超时也回报 `error`。当前没有可靠的自动成功完成信号，无法实现真机动作的自动成功串联；需要厂家提供可区分完成和中断的反馈。`playback_timeout_s` 默认 60 秒，可配置为 5–120 秒，ACP 兜底上限为 150 秒。超时清理仅退出本卡已持有的播放模式。
 
 `start_unconfirmed` 表示命令已经发送、播放模式尚待确认，期间保留动作占用直至监控结束或取消。若起播或停止未确认，或播放被异常工作模式中断，卡片会锁定后续动作并报告 `safety_fault`；须由现场人员检查机器人，再重启驱动。实际动作形态、人体净空与最终姿态仍需现场核验，结果保持 `motion_completion_verified=false` 和 `physical_interaction_validated=false`。共享 SDK 提供工作模式回读，实机验收期间需由单一操作者独占动作控制。Gazebo 页面通过已有 `run_id` 与状态查询完成本地试播。
 

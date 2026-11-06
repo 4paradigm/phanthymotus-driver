@@ -230,11 +230,13 @@ def test_verified_recording_is_used_without_inventing_completion(modules):
     assert p.dispatch("config", {"countdown_recording_id": 38})["state"] == "error"
     ctrl.mode = 2
     receipt = wait_completion(p, backend)
-    assert receipt["status"] == "completed"
+    assert receipt["status"] == "error"
     assert receipt["action_id"] == result["action_id"]
-    assert receipt["result"]["completion_basis"] == "sdk_workmode_exit"
+    assert "without a verified completion signal" in receipt["result"]["error"]
     assert not receipt["result"]["motion_completion_verified"]
-    assert p.dispatch("status", {})["state"] == "playback_exited"
+    assert p.dispatch("status", {})["state"] == "error"
+    assert p.dispatch("status", {})["safety_fault"]
+    assert p.dispatch("countdown", {})["command_sent"] is False
     p.stop()
     assert len(backend.calls) == 1
 
@@ -313,11 +315,11 @@ def test_each_gesture_has_a_unique_acp_id_and_one_terminal_callback(modules, act
         identities.append(result["action_id"])
         assert result["state"] == "running"
         assert result["expected_duration_s"] == 60
-        ctrl.mode = 2
+        assert p.dispatch("stop_action", {})["state"] == "idle"
         receipt = wait_completion(p, backend)
         assert receipt["action_id"] == result["action_id"]
         assert receipt["tool"] == "detaforce_rps"
-        assert receipt["status"] == "completed"
+        assert receipt["status"] == "cancelled"
         assert receipt["result"]["action"] == action
         p.dispatch("status", {})
         p.stop()
@@ -438,6 +440,18 @@ def test_unconfirmed_start_cannot_be_reported_as_cancelled(modules):
     assert p.dispatch("mouse", {})["command_sent"] is False
 
 
+def test_stop_after_external_playback_exit_is_not_cancelled(modules):
+    p, ctrl, backend = plugin(modules[1], hardware_enabled=True, mouse_recording_id=12)
+    p.dispatch("mouse", {})
+    with p._lock:
+        ctrl.mode = 2
+        assert p._stop_action()["state"] == "error"
+    assert wait_completion(p, backend)["status"] == "error"
+    assert p.dispatch("status", {})["safety_fault"]
+    assert p.dispatch("mouse", {})["command_sent"] is False
+    assert len(backend.calls) == 1
+
+
 def test_callback_failure_does_not_leave_the_card_busy(modules):
     def failed_callback(*_):
         raise RuntimeError("Agent Core offline")
@@ -449,7 +463,7 @@ def test_callback_failure_does_not_leave_the_card_busy(modules):
     worker.join(timeout=2)
     assert not worker.is_alive() and p._active is None
     report = p.dispatch("status", {})
-    assert report["terminal_status"] == "completed"
+    assert report["terminal_status"] == "error"
     assert not report["completion_notified"]
     assert report["completion_callback_error"] == "Agent Core offline"
 
@@ -502,9 +516,9 @@ def test_actual_acp_http_callback_contract(monkeypatch, modules):
         worker.join(timeout=2)
         assert path == "/api/acp/complete" and content_type == "application/json"
         assert payload["action_id"] == result["action_id"]
-        assert payload["status"] == "completed" and payload["tool"] == "detaforce_rps"
+        assert payload["status"] == "error" and payload["tool"] == "detaforce_rps"
         assert isinstance(payload["ts"], (int, float))
-        assert payload["result"]["completion_basis"] == "sdk_workmode_exit"
+        assert "without a verified completion signal" in payload["result"]["error"]
         assert p.dispatch("status", {})["completion_notified"]
     finally:
         p.stop()

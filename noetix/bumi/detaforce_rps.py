@@ -136,7 +136,7 @@ class DetaforceRpsPlugin:
             started = self._active["playback_started_verified"]
             self._last = {**self._active, "workmode": mode,
                           "state": "running" if mode == 23 else
-                                   "playback_exited" if mode == 2 and started else
+                                   "playback_exit_unverified" if mode == 2 and started else
                                    "start_unconfirmed" if mode == 2 else "interrupted",
                           "motion_completion_verified": False}
         return {**deepcopy(self._last), "backend": "official_action_recording",
@@ -145,7 +145,7 @@ class DetaforceRpsPlugin:
                 "parameters": self._parameters.copy(),
                 "recording_bound": {name: self._parameters[f"{name}_recording_id"] >= 0 for name in LABELS},
                 "physical_interaction_validated": False,
-                "completion_note": "playback_exited 仅表示观察到退出播放模式，动作形态和结束姿态仍需现场核验。"}
+                "completion_note": "退出播放模式不能证明动作完成，动作形态和结束姿态需现场核验。"}
 
     def _stop_action(self):
         if not self._active:
@@ -169,11 +169,10 @@ class DetaforceRpsPlugin:
                 if not isinstance(result, dict):
                     return {"state": "error", "confirmed": False, "error": "Invalid stop response"}
                 return result
-            if mode == 2 and self._active and not self._active["playback_started_verified"]:
+            if mode == 2:
                 return {"state": "error", "command_sent": False, "confirmed": False,
-                        "workmode": mode, "error": "Playback start was never observed; inspect the robot."}
-            return {"state": "idle" if mode == 2 else "error", "command_sent": False,
-                    "confirmed": mode == 2, "workmode": mode}
+                        "workmode": mode, "error": "Playback was not active when stop was requested; inspect the robot."}
+            return {"state": "error", "command_sent": False, "confirmed": False, "workmode": mode}
         except Exception as exc:
             return {"state": "error", "confirmed": False, "error": str(exc)}
 
@@ -192,9 +191,8 @@ class DetaforceRpsPlugin:
                         break
                     mode = observation["workmode"]
                     if mode == 2 and record["playback_started_verified"]:
-                        status = "completed"
-                        result = {**observation, "state": "playback_exited",
-                                  "completion_basis": "sdk_workmode_exit"}
+                        result = {**observation, "state": "error",
+                                  "error": "Playback exited without a verified completion signal."}
                         break
                     if mode not in (2, 23):
                         result = {**observation, "state": "error",
