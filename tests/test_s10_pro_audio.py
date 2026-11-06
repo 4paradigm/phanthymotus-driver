@@ -53,8 +53,9 @@ def test_audio_device_names_and_pcm_commands(monkeypatch):
     ]
     capture_setup = audio._capture_launch_command("default")
     assert capture_setup[:2] == ["sh", "-lc"]
+    assert "Left Line Mux' MicL" in capture_setup[2]
+    assert "Right Line Mux' MicR" in capture_setup[2]
     assert "Left PGA Mux' DifferentialL" in capture_setup[2]
-    assert "Line Mux" not in capture_setup[2]
     assert "case \"$gate\" in" in capture_setup[2]
     assert "off) : ;;" in capture_setup[2]
     assert "ALC Capture NG Switch' off" in capture_setup[2]
@@ -109,7 +110,7 @@ def test_mic_capture_uses_bounded_latest_only_queue_and_reports_drops(monkeypatc
     assert status["pcm_rms"] == 0.0
 
 
-def test_mic_capture_leaves_raw_pipe_timestamp_untrusted(monkeypatch):
+def test_mic_capture_stamps_frames_from_pipe_arrival(monkeypatch):
     audio = _load_audio(monkeypatch)
 
     class AudioChunk:
@@ -153,7 +154,8 @@ def test_mic_capture_leaves_raw_pipe_timestamp_untrusted(monkeypatch):
     assert plugin._pcm_rms == 1.0
     assert plugin._pcm_nonzero_ratio == 1.0
     stamp = published[0].header.stamp
-    assert (stamp.sec, stamp.nanosec) == (0, 0)
+    assert stamp.sec > 0
+    assert 0 <= stamp.nanosec < 1_000_000_000
 
 
 def test_build_plugins_registers_audio_cards_for_pro_only(monkeypatch):

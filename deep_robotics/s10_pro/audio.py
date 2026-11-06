@@ -46,6 +46,8 @@ def _playback_command(device):
 def _capture_launch_command(device):
     route = (
         "set -e; "
+        "amixer -c 0 cset name='Left Line Mux' MicL >/dev/null; "
+        "amixer -c 0 cset name='Right Line Mux' MicR >/dev/null; "
         "amixer -c 0 cset name='Left PGA Mux' DifferentialL >/dev/null; "
         "amixer -c 0 cset name='Right PGA Mux' DifferentialR >/dev/null; "
         "amixer -c 0 cset name='Main Mic Switch' on >/dev/null; "
@@ -238,9 +240,13 @@ class S10MicPlugin:
                                      len(samples)) ** 0.5
                     self._pcm_nonzero_ratio = sum(sample != 0 for sample in samples) / len(samples)
                     message = AudioChunk()
-                    # Raw arecord/SSH PCM does not include ALSA capture time.
-                    # Leave stamp zero instead of labeling pipe-read time as
-                    # a trusted capture timestamp.
+                    # Raw arecord/SSH PCM has no timestamp. Approximate the
+                    # first sample time when the complete frame arrives.
+                    capture_time = time.time() - FRAME_DURATION_NS / 1_000_000_000
+                    whole_seconds = int(capture_time)
+                    message.header.stamp.sec = whole_seconds
+                    message.header.stamp.nanosec = int(
+                        (capture_time - whole_seconds) * 1_000_000_000)
                     message.format = AUDIO_FORMAT
                     message.data = payload
                     self._publisher.publish(message)

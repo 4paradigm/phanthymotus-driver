@@ -41,8 +41,8 @@ published signal to near-zero; `mic info` includes latest-frame PCM peak, RMS,
 and nonzero-sample ratio to distinguish live audio from a silent input.
 The mic bridge keeps at most four 32 ms frames (128 ms) and replaces the oldest
 queued frame if its publisher falls behind. Raw `arecord`/SSH output has no
-hardware capture timestamp, so mic messages use a zero header stamp and
-consumers must treat capture time as untrusted. `mic info` reports bridge
+hardware capture timestamp, so mic messages use a pipe-arrival estimate in
+the header and consumers must treat capture time as untrusted. `mic info` reports bridge
 frames dropped during the current capture session.
 `S10_AUDIO_CAPTURE_DEVICE` and `S10_AUDIO_PLAYBACK_DEVICE` override the
 respective ALSA devices. Set `S10_AUDIO_MODE=local` or `ssh` to force a mode.
