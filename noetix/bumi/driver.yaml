@@ -13,6 +13,7 @@ build_context_extras:
 # Available cards; config.yaml controls which are enabled by default. Keep this
 # in sync with `plugins.*.enabled`, including the navigation `loco_servo` path.
 cards:
+  - { name: zone_presence,     type: processor }
   - { name: imu,               type: sensor }
   - { name: battery,           type: sensor }
   - { name: joints,            type: sensor }

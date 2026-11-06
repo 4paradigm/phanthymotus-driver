@@ -2,6 +2,8 @@ mcp_port: 15704
 ros_namespace: ""   # 留空则自动使用 hostname
 
 plugins:
+  zone_presence:
+    enabled: true
   state:
     enabled: true
   loco:
