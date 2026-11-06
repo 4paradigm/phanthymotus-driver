@@ -13,17 +13,24 @@ basic_server:
   udp_port: 30000
   tcp_port: 30001
   timeout: 1.5
+lidar_visualization:
+  accumulate_frames: 5
+  min_points: 32
+  max_points: 500000
+  publish_max_points: 80000
+  publish_hz: 3.0
+  voxel_size: 0.08
 topics:
   motion_info: "/MOTION_INFO"
   motion_state: "/MOTION_STATE"
   gait: "/GAIT"
   nav_cmd: "/NAV_CMD"
   imu: "/IMU"
-  lidar: "/LIDAR/POINTS"
-  lidar_rear: "/LIDAR/POINTS2"
+  lidar: "/grid_map_3d"
   hard_estop: "/HES_STATUS"
   charge: "/CHARGE"
   charge_status: "/CHARGE_STATUS"
   gps: "/GPS"
   joints: "/JOINTS_DATA"
   odometry: "/ODOM"
+  slam_odometry: "/ODOM"
