@@ -7,10 +7,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3-pip pyt
 COPY requirements.txt /tmp/agibot-x2-requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/agibot-x2-requirements.txt
 COPY aimdk_msgs-${AIMDK_MSGS_REV}.zip /tmp/aimdk_msgs.zip
+COPY vendor/audio_msgs /aimdk_x2_ws/src/audio_msgs
 RUN echo "${AIMDK_MSGS_SHA256}  /tmp/aimdk_msgs.zip" | sha256sum -c - && \
     mkdir -p /aimdk_x2_ws/src/aimdk_msgs && \
     python3 -m zipfile -e /tmp/aimdk_msgs.zip /aimdk_x2_ws/src/aimdk_msgs && \
-    . /opt/ros/humble/setup.sh && cd /aimdk_x2_ws && colcon build --packages-select aimdk_msgs && \
+    . /opt/ros/humble/setup.sh && cd /aimdk_x2_ws && colcon build --packages-select aimdk_msgs audio_msgs && \
     rm -rf /tmp/aimdk_msgs.zip
 WORKDIR /work
 COPY common/ /work/common/
