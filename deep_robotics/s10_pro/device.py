@@ -206,6 +206,7 @@ class S10Nodes:
         self._motion_lock = threading.Lock()
         self.motion_sequence = 0
         self.motion_state = None
+        self.motion_received_at = None
         self.gait_state = None
         self._source_topics = {
             "imu": topics.get("imu", "/IMU"),
@@ -483,6 +484,7 @@ class S10Nodes:
         with self._motion_lock:
             self.motion_sequence += 1
             self.motion_state = motion.get("state") if isinstance(motion, dict) else None
+            self.motion_received_at = time.monotonic()
             self.gait_state = gait.get("gait") if isinstance(gait, dict) else None
         self._publish_json("loco_state", data)
         motion_info = data.get("motion_info", data) if isinstance(data, dict) else {}
@@ -1000,6 +1002,38 @@ class S10MotionPlugin:
                 except (TypeError, ValueError):
                     return basic[field], id(report)
         return None, None
+
+    def standing_problem(self, max_age_s=1.0):
+        """Return why the robot is not known to be freshly standing."""
+        state = received_at = None
+        if self.nodes is not None:
+            with self.nodes._motion_lock:
+                state = self.nodes.motion_state
+                received_at = self.nodes.motion_received_at
+        else:
+            snapshot = self.native.snapshot()
+            reports = snapshot.get("reports", {})
+            received = snapshot.get("report_received_at", {})
+            for key, report in reports.items():
+                body = report.get("PatrolDevice", {}) if isinstance(report, dict) else {}
+                items = body.get("Items", {}) if isinstance(body, dict) else {}
+                basic = items.get("BasicStatus", {}) if isinstance(items, dict) else {}
+                if "MotionState" in basic:
+                    state = basic["MotionState"]
+                    received_at = received.get(key)
+                    break
+        if state is None or received_at is None:
+            return "没有可用的 MotionState，拒绝速度命令"
+        age = time.monotonic() - received_at
+        if age < 0 or age > max_age_s:
+            return f"MotionState 已过期（{max(0.0, age):.2f}s），拒绝速度命令"
+        try:
+            state = int(state)
+        except (TypeError, ValueError):
+            return "MotionState 无效，拒绝速度命令"
+        if state not in {1, 17}:
+            return f"机器人当前 MotionState={state}，不是站立状态，拒绝速度命令"
+        return ""
 
     def _finish_transition(self, action_id, status, result):
         with self._transition_lock:

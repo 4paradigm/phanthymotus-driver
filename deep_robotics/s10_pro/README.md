@@ -83,16 +83,19 @@ procedure cannot confirm plaintext or reports that the robot must be rebooted,
 the card start fails with the reason shown in the frontend; no execution command
 is sent. After a successful check, this driver uses TCP for basic_server.
 `loco_servo` is the streaming counterpart for visual navigation policies. It
-subscribes on Core domain 42 through a loopback-only bridge process, requires
-`S10_MOTION_ENABLED=1` at deployment plus `confirm=true` before switching out
-of dry-run (also accepted atomically on `start`), and stops on its watchdog.
-The supplied service fragment enables the deployment permission by default
-(`S10_MOTION_ENABLED=1`), but the servo itself remains in dry-run mode until a
-frontend start explicitly supplies `dry_run=false` and `confirm=true`. Set
-`S10_MOTION_ENABLED=0` in the deployment environment to revoke permission. The speed limits
+subscribes on Core domain 42 through a loopback-only bridge process. A frontend
+`start` action arms real velocity input by default; this action is the operator
+confirmation, so no separate `dry_run=false` or `confirm=true` arguments are
+needed. Set `dry_run=true` explicitly for validation without native movement.
+Real motion still requires `S10_MOTION_ENABLED=1` in the deployment environment;
+the supplied service fragment enables that deployment permission by default.
+Set `S10_MOTION_ENABLED=0` to revoke it. The servo stops on its watchdog. The speed limits
 match the real-robot-tested `loco` card (`vx=1.67 m/s`, `vy=0.4 m/s`,
 `wz=1.0 rad/s`). Per-step delta limits are additional software shaping, not
-claimed as measured hardware limits.
+claimed as measured hardware limits. Before every velocity command, it also
+requires a fresh (at most 1 second old) standing `MotionState` (`1` or `17`)
+from `/MOTION_INFO` or the BasicServer status report. Missing, stale, or
+non-standing state causes a zero-velocity hold and the command is refused.
 The `navigation.route` action sends a sequence of up to 64 vendor `Item` targets
 in one native task request; each point has map coordinates, yaw, and point type,
 while the route shares gait, speed, direction, obstacle, and navigation mode.

@@ -226,6 +226,7 @@ class BasicServerClient:
         self._responses = {}
         self._pending = {}
         self.reports = {}
+        self.report_received_at = {}
         self.last_error = None
 
     def _next_id(self):
@@ -271,6 +272,7 @@ class BasicServerClient:
             key = f"{body.get('Type')}:{body.get('Command')}"
         with self._state_lock:
             self.reports[key] = payload
+            self.report_received_at[key] = time.monotonic()
 
     def request(self, message_type: int, command: int, items: dict | None = None, *, response_timeout: float | None = None):
         if not self.enabled:
@@ -405,9 +407,11 @@ class BasicServerClient:
     def snapshot(self):
         with self._state_lock:
             reports = dict(self.reports)
+            report_received_at = dict(self.report_received_at)
         return {"enabled": self.enabled, "transport": self.transport.upper(), "host": self.host,
                 "port": self.port, "connected": self._socket is not None,
-                "last_error": self.last_error, "reports": reports}
+                "last_error": self.last_error, "reports": reports,
+                "report_received_at": report_received_at}
 
     def close_socket(self):
         with self._lock:

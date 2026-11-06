@@ -1644,7 +1644,8 @@ def test_navigation_vendor_state_codes_are_not_misclassified(monkeypatch):
     assert terminal({"NavStatus": {"Status": 0, "ErrorCode": "0x2300"}})[0] == "completed"
 
 
-def test_loco_servo_is_a_dry_run_velocity_sink_by_default(monkeypatch):
+def test_loco_servo_start_defaults_to_live_velocity_when_authorized(monkeypatch):
+    monkeypatch.setenv("S10_MOTION_ENABLED", "1")
     device = _load_device(monkeypatch)
     from loco_servo import S10LocoServoPlugin, build_descriptor
     from common.control import parse_descriptor
@@ -1679,19 +1680,19 @@ def test_loco_servo_is_a_dry_run_velocity_sink_by_default(monkeypatch):
     assert plugin.dispatch("info", {})["dry_run"] is True
     assert plugin.dispatch("unknown", {}) is None
     assert plugin.dispatch("config", {"dry_run": False})["code"] == "CONFIRM_REQUIRED"
+    monkeypatch.setenv("S10_MOTION_ENABLED", "0")
     denied = plugin.dispatch("config", {"dry_run": False, "confirm": True})
     assert denied["code"] == "MOTION_DISABLED"
     assert plugin.dispatch("info", {})["dry_run"] is True
-    result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": True})
+    denied_start = plugin.dispatch("start", {"input_topic": "/policy/velocity"})
+    assert denied_start["state"] == "error"
+    assert "S10_MOTION_ENABLED" in denied_start["message"]
+    monkeypatch.setenv("S10_MOTION_ENABLED", "1")
+    result = plugin.dispatch("start", {"input_topic": "/policy/velocity"})
     assert result["state"] == "ready"
-    assert plugin.dispatch("info", {})["dry_run"] is True
+    assert plugin.dispatch("info", {})["dry_run"] is False
     plugin.stop()
-    assert plugin.dispatch("config", {"dry_run": False, "confirm": True})["code"] == "MOTION_DISABLED"
-    assert plugin.dispatch("info", {})["dry_run"] is True
-    result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": False,
-                                       "confirm": True})
-    assert result["state"] == "error"
-    assert "S10_MOTION_ENABLED" in result["message"]
+    assert plugin.dispatch("info", {})["dry_run"] is False
 
 
 def test_loco_servo_refuses_to_start_while_navigation_owns_base(monkeypatch):
@@ -1707,7 +1708,7 @@ def test_loco_servo_refuses_to_start_while_navigation_owns_base(monkeypatch):
     assert "navigation" in result["message"]
 
 
-def test_loco_servo_start_can_atomically_arm_with_confirmation(monkeypatch):
+def test_loco_servo_start_arms_without_separate_confirmation_arguments(monkeypatch):
     monkeypatch.syspath_prepend(str(DRIVER))
     monkeypatch.setenv("S10_MOTION_ENABLED", "1")
     from loco_servo import S10LocoServoPlugin
@@ -1730,22 +1731,47 @@ def test_loco_servo_start_can_atomically_arm_with_confirmation(monkeypatch):
     plugin = S10LocoServoPlugin(FakeNative({}), ros2=object())
     try:
         tool_schema = plugin.get_tool()["inputSchema"]
-        assert set(tool_schema["x-action-params"]["start"]["params"]) == {
-            "input_topic", "dry_run", "confirm",
-        }
-        refused = plugin.dispatch("start", {
-            "input_topic": "/policy/velocity", "dry_run": False,
-        })
-        assert refused["code"] == "CONFIRM_REQUIRED"
-        assert plugin.dispatch("info", {})["state"] == "idle"
-
-        started = plugin.dispatch("start", {
-            "input_topic": "/policy/velocity", "dry_run": False, "confirm": True,
-        })
+        assert tool_schema["x-action-params"]["start"]["params"] == ["input_topic"]
+        started = plugin.dispatch("start", {"input_topic": "/policy/velocity"})
         assert started["state"] == "ready"
         assert plugin.dispatch("info", {})["dry_run"] is False
     finally:
         plugin.stop()
+
+
+@pytest.mark.parametrize("state,age,expected", [
+    (1, 0.1, ""), (17, 0.1, ""), (4, 0.1, "不是站立"),
+    (1, 2.0, "已过期"), (None, 0.1, "没有可用的 MotionState"),
+])
+def test_s10_motion_posture_gate_requires_fresh_standing_state(monkeypatch, state, age, expected):
+    device = _load_device(monkeypatch)
+    nodes = SimpleNamespace(
+        _motion_lock=threading.Lock(), motion_state=state,
+        motion_received_at=time.monotonic() - age,
+    )
+    plugin = device.S10MotionPlugin(FakeNative({}), nodes)
+
+    assert expected in plugin.standing_problem()
+
+
+def test_loco_servo_holds_and_refuses_velocity_when_robot_is_not_standing(monkeypatch):
+    monkeypatch.syspath_prepend(str(DRIVER))
+    from loco_servo import S10LocoServoPlugin
+
+    native = FakeNative({})
+    motion = SimpleNamespace(standing_problem=lambda: "机器人当前 MotionState=4")
+    plugin = S10LocoServoPlugin(native, ros2=object(), motion=motion)
+    plugin._dry_run = False
+
+    plugin._apply((0.5, 0.0, 0.0, 0.0, 0.0, 0.2))
+
+    assert plugin._refused == 1
+    assert plugin._applied == 0
+    assert len(native.calls) == 1
+    assert native.calls[0][0][2] == {
+        "X": 0.0, "Y": 0.0, "Z": 0.0,
+        "Roll": 0.0, "Pitch": 0.0, "Yaw": 0.0,
+    }
 
 
 def test_loco_servo_rechecks_motion_permission_after_environment_revocation(monkeypatch):
@@ -1762,7 +1788,7 @@ def test_loco_servo_rechecks_motion_permission_after_environment_revocation(monk
     denied_config = plugin.dispatch("config", {"dry_run": False, "confirm": True})
     assert denied_config["code"] == "MOTION_DISABLED"
     denied_start = plugin.dispatch("start", {
-        "input_topic": "/policy/velocity", "dry_run": False, "confirm": True,
+        "input_topic": "/policy/velocity",
     })
     assert denied_start["state"] == "error"
     assert "S10_MOTION_ENABLED" in denied_start["message"]

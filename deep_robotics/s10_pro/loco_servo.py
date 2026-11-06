@@ -51,6 +51,7 @@ class S10LocoServoPlugin:
         self._last = None
         self._applied = 0
         self._refused = 0
+        self._posture_refused = 0
 
     def get_tool(self):
         return {"name": self.PREFIX, "type": "actuator", "multiInstance": False,
@@ -60,7 +61,7 @@ class S10LocoServoPlugin:
                     "input_topic": {"type": "string"}, "dry_run": {"type": "boolean"},
                     "confirm": {"type": "boolean"}}, "required": ["action"],
                     "x-is-dangerous": True,
-                    "x-action-params": {"start": {"params": ["input_topic", "dry_run", "confirm"]}, "stop": {"params": []},
+                    "x-action-params": {"start": {"params": ["input_topic"]}, "stop": {"params": []},
                         "pause": {"params": []}, "resume": {"params": []}, "info": {"params": []},
                         "config": {"params": ["dry_run", "confirm"]}},
                     "x-resource": "base"},
@@ -119,9 +120,11 @@ class S10LocoServoPlugin:
         if not topic: return {"state": "error", "message": "缺少 input_topic，请连接 control/velocity 输出"}
         if "dry_run" in args and type(args["dry_run"]) is not bool:
             return {"state": "error", "code": "INVALID_ARGUMENT", "message": "dry_run must be a boolean"}
-        if args.get("dry_run") is False and self._dry_run and args.get("confirm") is not True:
+        requested_dry_run = args.get("dry_run", False)
+        if not requested_dry_run and args.get("confirm") is False:
             return {"state": "error", "code": "CONFIRM_REQUIRED", "message": "启用实时底盘控制需要 confirm=true"}
-        requested_dry_run = args.get("dry_run", self._dry_run)
+        # The frontend's explicit start action is the confirmation to arm the
+        # connected velocity stream; dry-run remains available as an override.
         motion_enabled, valid_permission = self._refresh_motion_permission()
         if not requested_dry_run and not valid_permission:
             return {"state": "error", "code": "INVALID_MOTION_PERMISSION",
@@ -137,8 +140,7 @@ class S10LocoServoPlugin:
         profile = os.environ.get("S10_CORE_FASTDDS_PROFILE", "/tmp/s10-pro-core-fastdds.xml")
         with self._lock:
             if self._running: return {"state": "error", "message": "loco_servo 已在运行"}
-            if "dry_run" in args:
-                self._dry_run = args["dry_run"]
+            self._dry_run = requested_dry_run
             self._sink = ControlSink(self._descriptor, self._apply, on_watchdog=self._hold, on_abort=self._hold)
             self._topic, self._running, self._paused = topic, True, False
             self._reader_stop.clear()
@@ -220,6 +222,18 @@ class S10LocoServoPlugin:
             if self._running and not self._paused and self._sink: self._sink.tick()
 
     def _apply(self, values, _gripper=None):
+        standing_problem = getattr(self.motion, "standing_problem", None)
+        if standing_problem is not None:
+            problem = standing_problem()
+            if problem:
+                self._refused += 1
+                self._posture_refused += 1
+                if self._posture_refused == 1 or self._posture_refused % 100 == 0:
+                    print(f"[loco_servo] 拒绝速度命令（第 {self._posture_refused} 条）：{problem}",
+                          flush=True)
+                self._hold()
+                return
+        self._posture_refused = 0
         if self._dry_run: self._applied += 1; return
         try:
             ret = self.native.send(0x00100001, 0x00110002,
