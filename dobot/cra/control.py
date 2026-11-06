@@ -11,6 +11,7 @@ import re
 import math
 import threading
 import time
+import json
 
 from dobot_sdk.api.robot_control import RobotControl
 from dobot_sdk.api.motion import Motion, CoordinateType
@@ -19,9 +20,11 @@ from dobot_sdk.core.connection import DobotConnection
 if __package__:
     from .feedback import disconnect, endpoint, positive_number
     from .model import JOINT_NAMES, resolve_model
+    from .ownership import ArmOwnership
 else:
     from feedback import disconnect, endpoint, positive_number
     from model import JOINT_NAMES, resolve_model
+    from ownership import ArmOwnership
 
 
 # CRA hardware manual V3.2, Appendix A, CR3A (degrees). The visualization
@@ -74,9 +77,34 @@ def parse_reply(reply, command):
     return int(identifier) if identifier else None
 
 
+def trajectory_filename(value):
+    # A controller filename is a protocol argument, never a path or expression.
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,96}\.csv", value):
+        raise ValueError("trajectory filename must be a plain ASCII .csv basename")
+    return value
+
+
+def parse_start_pose(reply):
+    match = re.fullmatch(r"\s*(-?\d+),(\{.*\}),GetStartPose\(.*\);\s*", reply, re.S)
+    if match is None:
+        raise ValueError("invalid GetStartPose response")
+    if int(match[1]):
+        raise CommandRejected(f"GetStartPose rejected with ErrorID={match[1]}")
+    data = json.loads(match[2].replace("{", "[").replace("}", "]"))
+    if (not isinstance(data, list) or len(data) < 2 or type(data[0]) is not int or
+            data[0] not in (0, 1) or not isinstance(data[1], list) or len(data[1]) != 6):
+        raise ValueError("GetStartPose must return a joint or teaching point")
+    joints = data[1]
+    for value, (lo, hi) in zip(joints, JOINT_LIMITS_DEG):
+        if type(value) not in (int, float) or not math.isfinite(value) or not lo <= value <= hi:
+            raise ValueError("GetStartPose returned invalid joint angles")
+    return joints
+
+
 class RobotController:
     def __init__(self, feedback, config, connection_factory=DashboardConnection):
         self.feedback = feedback
+        self.ownership = ArmOwnership()
         settings = config.get("joint_move", {})
         self.connect_timeout = positive_number(settings.get("connect_timeout_s", 2), "joint_move.connect_timeout_s")
         self.receive_timeout = positive_number(settings.get("receive_timeout_s", 2), "joint_move.receive_timeout_s")
@@ -90,7 +118,7 @@ class RobotController:
         self._address = None
         self._status = {"dashboard_connected": False}
         self._requests = {card: {"last_request": None, "last_error": None}
-                          for card in ("joint_move",)}
+                          for card in ("joint_move", "teach")}
 
     def snapshot(self, card="joint_move"):
         import copy
@@ -123,6 +151,8 @@ class RobotController:
         address, port = endpoint(address, port)
         with self._command_lock:
             if (address, port) != (self.feedback.address, self.feedback.port):
+                if self.ownership.owner is not None:
+                    raise RuntimeError("stop the active arm operation before changing its address or feedback port")
                 self._close()
                 for card in self._requests:
                     self._update(card, last_request=None, last_error=None)
@@ -145,7 +175,9 @@ class RobotController:
         if (state["robot_mode"] not in allowed_modes or state["running_status"] or
                 state["jog_status"] or state["drag_status"] or any(state["brake_released"])):
             raise RuntimeError("robot must be stationary with locked brakes before preparing motion")
-        if action in ("move_j", "rel_joint_mov_j") and state["robot_mode"] not in (9, 11) and (
+        if action in ("move_j", "rel_joint_mov_j", "start_record") and state["robot_mode"] == 10:
+            raise RuntimeError("stop the paused queue before preparing a new motion or recording")
+        if action in ("move_j", "rel_joint_mov_j", "start_record") and state["robot_mode"] not in (9, 11) and (
                 state["pause_cmd_flag"] or (state["run_queued_cmd"] and not allow_own_queue)):
             raise RuntimeError("move_j requires an idle robot without a paused or running queue")
         return sample
@@ -197,7 +229,9 @@ class RobotController:
             raise RuntimeError("move_j requires an idle robot without a paused or running queue")
         return sample
 
-    def execute_motion(self, action, args, *, cancel=None):
+    def execute_motion(self, action, args, *, cancel=None, owner="joint_move"):
+        if action not in ("stop_motion", "pause"):
+            self.ownership.check(owner)
         commands = {"move_j": "MovJ", "rel_joint_mov_j": "RelJointMovJ", "stop_motion": "Stop", "pause": "Pause", "resume": "Continue"}
         if action not in commands:
             raise ValueError(f"unsupported joint motion action: {action}")
@@ -246,6 +280,68 @@ class RobotController:
         return self._execute(action, commands[action], check_state, card="joint_move",
                              parameters=parameters, options=options, requested=requested)
 
+    def _connect(self, address):
+        if self._connection is None or self._address != address:
+            self._close()
+            self._address = address
+            self._connection = self._factory(address, 29999)
+            self._connection.set_timeout(self.connect_timeout, self.receive_timeout)
+            self._connection.connect()
+            self._api = RobotControl(self._connection)
+            self._motion_api = Motion(self._connection)
+            self._update(dashboard_connected=True)
+
+    def get_start_pose(self, filename):
+        filename = trajectory_filename(filename)
+        self.ownership.check("teach")
+        with self._command_lock:
+            if not self.feedback.address:
+                raise RuntimeError("configure the controller IP first")
+            try:
+                self._connect(self.feedback.address)
+                return parse_start_pose(self._motion_api.GetStartPose(filename, 1))
+            except Exception:
+                self._close()
+                raise
+
+    def execute_drag(self, start, *, cancel=None):
+        self.ownership.check("teach")
+        action = "start_record" if start else "stop_record"
+
+        def check(current_action, *, allow_own_queue=False):
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("teaching interrupted")
+            if start:
+                return self._check_preparation_state(current_action, allow_own_queue=allow_own_queue)
+            # Always allow an explicit attempt to leave drag after feedback loss.
+            if not self.feedback.address:
+                raise RuntimeError("configure the controller IP first")
+            return {**self.feedback.snapshot(), "controller_ip": self.feedback.address}
+
+        return self._execute(action, "StartDrag" if start else "StopDrag", check, card="teach")
+
+    def execute_path(self, filename, start_joints, args, *, cancel=None):
+        filename = trajectory_filename(filename)
+        self.ownership.check("teach")
+        if args.get("confirm_move") is not True:
+            raise ValueError("confirm_move=true is required")
+        speed = args.get("speed_multiplier", 1.0)
+        if type(speed) not in (int, float) or not math.isfinite(speed) or not 0.25 <= speed <= 2:
+            raise ValueError("speed_multiplier must be between 0.25 and 2")
+        skin = args.get("detect_collision", False)
+        if type(skin) is not bool:
+            raise ValueError("detect_collision must be a boolean")
+
+        def check(action, *, allow_own_queue=False):
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("teaching interrupted")
+            return self._check_preparation_state(action, allow_own_queue=allow_own_queue)
+
+        return self._execute("move_j", "StartPath", check, card="teach", parameters=(filename,),
+                             options={"is_const": 0, "multi": speed, "sample": 50, "freq": 1.0},
+                             requested={"detect_collision": skin, "expected_start": start_joints,
+                                        "start_tolerance_deg": args.get("start_tolerance_deg", 0.5)})
+
     @staticmethod
     def _absolute_target(sample, requested):
         current = sample["data"]["joint_state"]["q_actual"]
@@ -279,18 +375,10 @@ class RobotController:
                        "controller_ip": sample["controller_ip"], "read_only": False, "effect_verified": False}
             self._update(card, last_request={**request, "state": "sending"}, last_error=None)
             try:
-                if self._connection is None or self._address != sample["controller_ip"]:
-                    self._close()
-                    self._address = sample["controller_ip"]
-                    self._connection = self._factory(self._address, 29999)
-                    self._connection.set_timeout(self.connect_timeout, self.receive_timeout)
-                    self._connection.connect()
-                    self._api = RobotControl(self._connection)
-                    self._motion_api = Motion(self._connection)
-                    self._update(dashboard_connected=True)
+                self._connect(sample["controller_ip"])
                 # Connecting can take long enough for feedback/state to change.
                 check_state(action)
-                if action in ("move_j", "rel_joint_mov_j"):
+                if action in ("move_j", "rel_joint_mov_j", "start_record"):
                     pre_enable_clear = self._api.ClearError()
                     parse_response(pre_enable_clear, "ClearError")
                     request["pre_enable_clear_error_response"] = pre_enable_clear
@@ -307,7 +395,7 @@ class RobotController:
                             if time.monotonic() >= deadline:
                                 raise TimeoutError("EnableRobot acknowledged but enabled feedback was not confirmed")
                             time.sleep(0.02)
-                if card == "joint_move" and action in ("move_j", "rel_joint_mov_j"):
+                if action in ("move_j", "rel_joint_mov_j"):
                     baseline = check_state(action).get("packets_received")
                     detect_collision = request["detect_collision"]
                     skin_reply = self._api.EnableSafeSkin(int(detect_collision))
@@ -323,7 +411,7 @@ class RobotController:
                             skin_queue_id = parse_reply(sensitivity_reply, "SetSafeSkin")
                             request["safe_skin_sensitivity_responses"].append(sensitivity_reply)
                             self._wait_preparation_queue(action, check_state, skin_queue_id, baseline)
-                if command in ("MovJ", "RelJointMovJ"):
+                if command in ("MovJ", "RelJointMovJ", "StartPath"):
                     # Keep clear + state recheck + move serialized as one request.
                     # A failed/uncertain clear must never be followed by motion.
                     baseline = check_state(action).get("packets_received")
@@ -331,14 +419,14 @@ class RobotController:
                     parse_response(clear_reply, "ClearError")
                     request["clear_error_response"] = clear_reply
                     self._wait_preparation_queue(action, check_state, skin_queue_id, baseline)
-                if action in ("move_j", "rel_joint_mov_j"):
+                if action in ("move_j", "rel_joint_mov_j", "start_record"):
                     # ACKs can precede the feedback packet reporting the effect.
                     # Wait for final motion conditions only after all preparation.
                     deadline = time.monotonic() + self.enable_timeout
                     while True:
                         check_state(action)
                         try:
-                            self._check_motion_state(action)
+                            self._check_motion_state("move_j" if action == "start_record" else action)
                             break
                         except RuntimeError:
                             if time.monotonic() >= deadline:
@@ -356,7 +444,13 @@ class RobotController:
                 if action == "resume":
                     paused_sample = self._check_motion_state(action)
                     request["resumed_command_id"] = paused_sample["data"].get("current_command_id")
-                api = self._motion_api if command in ("MovJ", "RelJointMovJ") else self._api
+                if command == "StartPath":
+                    current = self._check_motion_state("move_j")["data"]["joint_state"]["q_actual"]
+                    if max(abs(a - b) for a, b in zip(current, request["expected_start"])) > request["start_tolerance_deg"]:
+                        raise RuntimeError("robot is not at the trajectory start; run go_to_start first")
+                request["submission_baseline"] = self.feedback.snapshot().get("packets_received")
+                api = self._motion_api if command in ("MovJ", "RelJointMovJ", "StartPath") else self._api
+                request["command_attempted"] = command
                 reply = getattr(api, command)(*parameters, **(options or {}))
                 queue_id = parse_reply(reply, command)
                 request.update(state="submitted" if queue_id is not None else "accepted_unverified",
@@ -364,6 +458,7 @@ class RobotController:
                 self._update(card, last_request=request)
                 return request
             except Exception as exc:
+                exc.dobot_command_attempted = request.get("command_attempted")
                 # A timeout may happen after transmission; never replay the write.
                 request.update(state="rejected" if isinstance(exc, CommandRejected) else "failed_or_outcome_unknown", error=str(exc))
                 self._update(card, last_request=request, last_error=str(exc))
