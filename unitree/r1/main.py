@@ -132,6 +132,12 @@ class R1DeviceBundle:
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, executor))
             print("[bundle] CameraPlugin loaded")
 
+        if plugins_cfg.get("vision_capture", {}).get("enabled", False):
+            from vision_capture import VisionCapturePlugin
+            self._plugins.append(VisionCapturePlugin(
+                plugins_cfg["vision_capture"], namespace, executor))
+            print("[bundle] VisionCapturePlugin loaded")
+
         if plugins_cfg.get("ext_mic", {}).get("enabled", False):
             from ext_devices import ExtMicPlugin
             self._plugins.append(ExtMicPlugin(plugins_cfg["ext_mic"], namespace, executor))
