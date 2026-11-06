@@ -16,6 +16,8 @@
 
 测试命令为 `python -X utf8 -m pytest noetix/bumi/tests/test_zone_presence.py -q`。
 
+PR #486 复审补充适配层测试。运行 `python -X utf8 -m pytest noetix/bumi/tests/test_zone_presence.py noetix/bumi/tests/test_zone_presence_card.py tests/test_bumi_bundle.py -q`，25 项通过。覆盖 PREFIX、完整动作参数声明、启停前后 info 话题发现、重复启停、配置与部分启动失败的资源回收。ROS 资源故障测试使用替身；新镜像上的真实画布接线与 Bumi 验收仍需执行。
+
 ## 本地 Gazebo 验证
 
 仿真页面为 <http://127.0.0.1:15715/>，由 Ubuntu 中的 `zone_presence_sim.py` 提供。它读取已有 Gazebo 服务 15713 的真实 YOLO 检测框，仅转换到 VOP 的中心相对坐标，经隔离 ROS 域 78 发布，再交由生产 `ZonePresencePlugin` 订阅处理。只转发新的、有效的图像时间戳，重复读取同一帧不会刷新 Card 的输入时效。

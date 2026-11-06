@@ -6,6 +6,8 @@ from zone_presence import Occupancy
 
 
 class ZonePresencePlugin:
+    PREFIX = "zone_presence"
+
     def __init__(self, config, namespace, executor):
         self.executor = executor
         self.namespace = namespace
@@ -22,7 +24,12 @@ class ZonePresencePlugin:
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "stop", "info", "read"]},
                 "input_topic": {"type": "string"}}, "required": ["action"],
-                "x-action-params": {"read": {"params": [], "description": "读取最新区域占用状态与持续时间。"}}},
+                "x-action-params": {
+                    "start": {"params": ["input_topic"], "required": ["input_topic"],
+                              "description": "订阅连接的 VOP 输出并开始检测区域占用。"},
+                    "stop": {"params": [], "description": "停止并释放本卡的 ROS 资源。"},
+                    "info": {"params": [], "description": "查看占用状态及实际输入输出话题。"},
+                    "read": {"params": [], "description": "读取最新区域占用状态与持续时间。"}}},
             "configSchema": {"type": "object", "properties": {
                 "region": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4,
                            "default": [-.6, -.8, .6, 1], "description": "画面区域[left,top,right,bottom]，每项-1..1"},
@@ -44,6 +51,7 @@ class ZonePresencePlugin:
                 self.node.destroy_node()
                 self.node = None
             self.event_pub = None
+            self.input_topic = None
             self.engine = Occupancy(region=self.engine.region, enter_s=self.engine.enter_s,
                                     leave_s=self.engine.leave_s, confidence=self.engine.confidence)
 
@@ -73,22 +81,28 @@ class ZonePresencePlugin:
                 state, event = self.engine.read()
                 if event and self.event_pub is not None:
                     self._publish(self.event_pub, event)
-                return {**state, "running": self.node is not None, "input_topic": self.input_topic}
+                result = {**state, "running": self.node is not None, "input_topic": self.input_topic}
+                if action == "info":
+                    tool = self.get_tool()
+                    result["topic_out"] = tool["topic_out"]
+                    result["topic_in"] = [
+                        {**port, "topic": self.input_topic} for port in tool["topic_in"]
+                    ] if self.input_topic else tool["topic_in"]
+                return result
             if action != "start":
                 return None
             topic = args.get("input_topic")
             if not isinstance(topic, str) or not topic.startswith("/"):
                 return {"state": "error", "error": "Connect a VOP output topic first."}
             if self.node is not None:
-                return {"state": "running"} if topic == self.input_topic else {
+                return {"state": "running", "input_topic": topic,
+                        "topic_out": self.get_tool()["topic_out"]} if topic == self.input_topic else {
                     "state": "error", "error": "Stop before changing input topic."}
             from rclpy.node import Node
             from rclpy.qos import QoSProfile, ReliabilityPolicy
             from std_msgs.msg import String
             node = Node("zone_presence")
             outputs = self.get_tool()["topic_out"]
-            state_pub = node.create_publisher(String, outputs[0]["topic"], 10)
-            event_pub = node.create_publisher(String, outputs[1]["topic"], 10)
 
             def receive(message):
                 with self.lock:
@@ -108,13 +122,17 @@ class ZonePresencePlugin:
                         self._publish(event_pub, event)
 
             try:
+                state_pub = node.create_publisher(String, outputs[0]["topic"], 10)
+                event_pub = node.create_publisher(String, outputs[1]["topic"], 10)
                 node.create_subscription(String, topic, receive,
                     QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
                 node.create_timer(.2, tick)
                 self.executor.add_node(node)
             except Exception:
+                self.executor.remove_node(node)
                 node.destroy_node()
                 raise
             self.node, self.input_topic = node, topic
             self.event_pub = event_pub
-            return {"state": "running", "input_topic": topic}
+            return {"state": "running", "input_topic": topic,
+                    "topic_out": self.get_tool()["topic_out"]}
