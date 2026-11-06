@@ -26,7 +26,7 @@ class AudioClient(Client):
 
     ## API Call ##
     def TtsMaker(self, text: str, speaker_id: int):
-        self.tts_index += self.tts_index
+        self.tts_index += 1
         p = {}
         p["index"] = self.tts_index
         p["text"] = text
