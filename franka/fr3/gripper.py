@@ -165,9 +165,6 @@ class GripperPlugin(JointControlPlugin):
             action_id = session.command(self._owner_key(instance_id), action, **options)
             instance.last_action_id = action_id
             instance.acp = {"action_id": action_id, "state": "waiting_for_motion"}
-            self._activity_event("running", action=action, action_id=action_id,
-                               robot_ip=instance.config.get("robot_ip"),
-                               result={"action": action, "parameters": dict(options)})
             threading.Thread(target=self._complete, args=(instance, session, action_id),
                              name=f"franka-gripper-acp-{instance_id}", daemon=True).start()
             return {"state": "running", "action_id": action_id, "action": action,

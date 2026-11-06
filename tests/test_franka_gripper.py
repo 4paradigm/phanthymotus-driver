@@ -44,7 +44,6 @@ class GripperCardTests(unittest.TestCase):
     def setUp(self):
         self.sessions, self.completions = [], []
         self.targets = {}
-        self.activities = []
         self.publishers = mock.Mock(return_value=mock.Mock())
 
         def session_factory(address, **options):
@@ -56,7 +55,7 @@ class GripperCardTests(unittest.TestCase):
         discovery = mock.Mock()
         discovery.snapshot.return_value = {"state": "ready", "robots": []}
         self.plugin = gripper.GripperPlugin({}, manager=self.manager, discovery=discovery,
-            publisher_factory=self.publishers, acp_callback=lambda *args: self.completions.append(args), activity_callback=self.activities.append)
+            publisher_factory=self.publishers, acp_callback=lambda *args: self.completions.append(args))
         self.plugin.READY_TIMEOUT = .1
         self.bundle = DriverBundle([self.plugin])
         self.addCleanup(self.plugin.stop)
@@ -80,8 +79,9 @@ class GripperCardTests(unittest.TestCase):
         session.finish(result["action_id"], status)
         fixtures.wait_for(lambda: any(c[0] == result["action_id"] for c in self.completions))
         terminal = "completed" if status == "succeeded" else "cancelled" if status == "cancelled" else "error"
-        fixtures.wait_for(lambda: any(e["state"] == terminal and e.get("action_id") == result["action_id"]
-                                     for e in self.activities))
+        completion = next(c for c in self.completions if c[0] == result["action_id"])
+        self.assertEqual(terminal, completion[1])
+        self.assertIn("feedback", completion[2])
         self.publishers.assert_not_called()
 
     def test_arm_selection_routes_without_a_topic_or_card_id(self):

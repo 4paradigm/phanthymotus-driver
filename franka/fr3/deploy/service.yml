@@ -28,7 +28,7 @@ franka-fr3:
     - ROS_LOCALHOST_ONLY=0
     - PYTHONUNBUFFERED=1
     - RCUTILS_COLORIZED_OUTPUT=0
-    - AGENT_CORE_URL=${FRANKA_AGENT_CORE_URL:-https://localhost:15678}
+    - AGENT_CORE_URL=${FRANKA_AGENT_CORE_URL:-https://127.0.0.1:15678}
     - AGENT_CORE_CA_CERT=/opt/phanthy-motus/data/certs/cert.pem
   logging:
     driver: local

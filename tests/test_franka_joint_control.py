@@ -189,7 +189,6 @@ class JointControlTests(unittest.TestCase):
         self.targets = {}
         self.publishers = mock.Mock(return_value=mock.Mock())
         self.completions = []
-        self.activities = []
 
         def session_factory(address, **options):
             session = FakeSession(address, **options)
@@ -209,7 +208,7 @@ class JointControlTests(unittest.TestCase):
         }
         self.sensor = device.FrankaPlugin({}, **options)
         self.controller = device.JointControlPlugin(
-            {}, **options, acp_callback=lambda *args: self.completions.append(args), activity_callback=self.activities.append,
+            {}, **options, acp_callback=lambda *args: self.completions.append(args),
         )
         self.controller.READY_TIMEOUT = .1
         self.addCleanup(self.controller.stop)
@@ -309,10 +308,9 @@ class JointControlTests(unittest.TestCase):
         session, action_id = self.started_move()
         session.finish(action_id)
         self.completed(action_id)
-        wait_for(lambda: any(e["state"] == "completed" for e in self.activities))
-        events = [e for e in self.activities if e.get("action_id") == action_id]
-        self.assertEqual(["running", "completed"], [e["state"] for e in events])
-        self.assertIn("result", events[-1])
+        completion = next(c for c in self.completions if c[0] == action_id)
+        self.assertEqual("completed", completion[1])
+        self.assertIn("feedback", completion[2])
         self.publishers.assert_not_called()
         self.assertEqual("completed", self.call()["last_result"]["status"])
 
@@ -547,8 +545,11 @@ class JointControlTests(unittest.TestCase):
 
         self.controller._acp_callback = failed_callback
         session, action_id = self.started_move()
-        session.finish(action_id)
-        wait_for(lambda: (self.call()["acp"] or {}).get("state") == "failed")
+        with self.assertLogs(device.log, level="WARNING") as logs:
+            session.finish(action_id)
+            wait_for(lambda: (self.call()["acp"] or {}).get("state") == "failed")
+        self.assertIn(action_id, " ".join(logs.output))
+        self.assertIn("Core unavailable", " ".join(logs.output))
         info = self.call()
         self.assertEqual("succeeded", info["motion"]["status"])
         self.assertEqual("completed", info["last_result"]["status"])

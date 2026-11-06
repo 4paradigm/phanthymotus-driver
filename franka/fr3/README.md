@@ -93,14 +93,16 @@ Speed must be supplied for each opening/grasp action (range 0.1–100 mm/s). Gra
 
 Motion calls return `state=running` and a unique `action_id`. On termination,
 the driver posts `completed`, `cancelled`, or `error` to `/api/acp/complete`
-using the same ID and verifies HTTPS with `AGENT_CORE_CA_CERT`.
+using the same ID. Loopback callbacks (`localhost` and numeric loopback IPs)
+follow the Core example without TLS certificate verification. Remote HTTPS
+callbacks require `AGENT_CORE_CA_CERT` and retain certificate/hostname verification.
 
-Motion cards have no monitor output. Activity receives start and terminal
-notifications with `action_id` and the final result through `/api/event`.
-The `info` action retains the last result and ACP delivery status.
-On authenticated hosts, provision the
-event credential separately in a restricted file at `/run/franka/event-token`
-or set `AGENT_CORE_EVENT_TOKEN_FILE` to its path.
+Motion cards have no monitor output and do not send extra `/api/event`
+notifications. Core handles the initial MCP response and the standard ACP
+completion event. With intelligent control running, completion can appear in
+Activity as a collector trigger or a current-turn notification; Core may
+summarize successful results. The `info` action retains the full last result
+and ACP delivery status. No Activity token is required by this driver.
 
 ## External RealSense camera
 

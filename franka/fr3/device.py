@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import queue
 import re
 import threading
 import time
@@ -19,6 +18,27 @@ from hardware import JOINT_LOWER, JOINT_UPPER, JOINT_MARGIN, SessionManager, can
 JOINT_NAMES = tuple(f"fr3_joint{i}" for i in range(1, 8))
 JOINT_FORMAT = "sensor/skeleton"
 log = logging.getLogger(__name__)
+
+
+def _core_tls_context(url):
+    """Match the Core example for loopback; keep remote TLS verification."""
+    import ipaddress
+    import os
+    import ssl
+    from urllib.parse import urlsplit
+
+    host = urlsplit(url).hostname
+    local = host == "localhost"
+    try:
+        local = local or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        pass
+    if local:
+        return ssl._create_unverified_context()
+    ca = os.environ.get("AGENT_CORE_CA_CERT")
+    if not ca:
+        raise RuntimeError("AGENT_CORE_CA_CERT is required for Core callbacks")
+    return ssl.create_default_context(cafile=ca)
 
 
 class RosPublisher:
@@ -396,7 +416,7 @@ class JointControlPlugin(FrankaPlugin):
     READY_TIMEOUT = 5.0
     CONFIG_FIELDS = FrankaPlugin.CONFIG_FIELDS + ("speed_deg_s",)
 
-    def __init__(self, *args, acp_callback=None, activity_callback=None, **kwargs):
+    def __init__(self, *args, acp_callback=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._acp_callback = acp_callback or self._post_completion
         config = args[0] if args else kwargs.get("config", {})
@@ -406,102 +426,10 @@ class JointControlPlugin(FrankaPlugin):
         self._enabled = True
         self._execution_epoch = 0
         self._stopping = False
-        self._activity_lock = threading.RLock()
-        self._activity_sequence = 0
-        self._activity_callback = activity_callback or self._post_activity
-        self._activity_queue = queue.Queue(maxsize=64)
-        self._activity_thread = None
-
-    def _activity_worker(self):
-        while True:
-            event = self._activity_queue.get()
-            try:
-                if event is None:
-                    return
-                self._activity_callback(event)
-            except Exception as exc:
-                log.warning("%s Activity delivery failed: %s", self.PREFIX, str(exc)[:200])
-            finally:
-                self._activity_queue.task_done()
-
-    def _post_activity(self, event):
-        # Use the platform's existing event API; ACP completion remains separate.
-        import os
-        import ssl
-        import urllib.request
-        ca = os.environ.get("AGENT_CORE_CA_CERT")
-        if not ca:
-            raise RuntimeError("AGENT_CORE_CA_CERT is required for Activity feedback")
-        headers = {"Content-Type": "application/json"}
-        token_file = os.environ.get("AGENT_CORE_EVENT_TOKEN_FILE", "/run/franka/event-token")
-        if Path(token_file).is_file():
-            token = Path(token_file).read_text().strip()
-            if token:
-                headers["Authorization"] = "Bearer " + token
-        # Activity displays trigger.text verbatim; retain the complete protocol
-        # record rather than shortening it to a state label or bracketed ID.
-        record = {"status": event.get("status", event["state"]),
-                  "action_id": event.get("action_id"), "tool": self.PREFIX, **event}
-        message = json.dumps(record, ensure_ascii=False, allow_nan=False)
-        body = {"source": "mcp:franka-fr3:" + self.PREFIX, "text": message,
-                "payload": {"type": "motion_feedback", **record}}
-        context = ssl.create_default_context(cafile=ca)
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
-                                             urllib.request.HTTPSHandler(context=context))
-        url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
-        request = urllib.request.Request(url + "/api/event", data=json.dumps(body, allow_nan=False).encode(),
-                                         headers=headers, method="POST")
-        with opener.open(request, timeout=3) as response:
-            result = json.load(response)
-        if result.get("code") != 200:
-            raise RuntimeError("Platform did not accept Activity feedback")
 
     def start(self):
-        # Start feedback delivery without connecting to hardware.
-        with self._activity_lock:
-            if not self._closed and self._activity_thread is None:
-                self._activity_thread = threading.Thread(target=self._activity_worker,
-                    name="franka-activity-" + self.PREFIX, daemon=True)
-                self._activity_thread.start()
-
-    def stop(self):
-        try:
-            super().stop()
-        finally:
-            if self._activity_thread is not None:
-                try:
-                    self._activity_queue.put_nowait(None)
-                except queue.Full:
-                    pass
-                self._activity_thread.join(timeout=.5)
-
-    def _activity_event(self, state, **fields):
-        with self._activity_lock:
-            self._activity_sequence += 1
-            event = {"sequence": self._activity_sequence,
-                     "timestamp_ms": int(time.time() * 1000), "ts": time.time(),
-                     "tool": self.PREFIX, "state": state, **fields}
-            try:
-                self._activity_queue.put_nowait(event)
-            except queue.Full:
-                log.warning("%s Activity queue full; ACP completion remains independent", self.PREFIX)
-
-    def dispatch(self, action, args):
-        if args.get("_tool_name", action) != self.PREFIX:
-            return None
-        motion = action in self.MOTION_ACTIONS
-        try:
-            if action == "start":
-                self.start()
-            result = self._dispatch_request(action, args)
-            if action in ("stop", "stopmotion"):
-                self._activity_event("stopped", action=action, arm=args.get("arm"))
-            return result
-        except Exception as exc:
-            if motion or action in ("stop", "stopmotion"):
-                self._activity_event("error", action=action, arm=args.get("arm"), error=str(exc))
-            raise
-
+        # Motion connections are acquired lazily by explicit action requests.
+        pass
 
     def _target_schema(self, schema):
         key = "arm" if self._arm_ips else "robot_ip"
@@ -567,7 +495,7 @@ class JointControlPlugin(FrankaPlugin):
             with self._lock:
                 self._stopping = False
 
-    def _dispatch_request(self, action, args):
+    def dispatch(self, action, args):
         if args.get("_tool_name", action) != self.PREFIX:
             return None
         if action == "Stop":
@@ -789,7 +717,6 @@ class JointControlPlugin(FrankaPlugin):
             if getattr(instance, "last_action_id", None) == action_id:
                 instance.last_result = {"action_id": action_id, "status": status, "result": result}
                 instance.acp = {"action_id": action_id, "state": "pending"}
-        self._activity_event(status, action_id=action_id, robot_ip=session.address, result=result)
         error = None
         # Completion IDs are idempotent at Core; bounded retry handles transient failures.
         for attempt in range(3):
@@ -801,6 +728,9 @@ class JointControlPlugin(FrankaPlugin):
                 error = str(exc)[:240]
                 if attempt < 2:
                     time.sleep(0.25 * (attempt + 1))
+        if error:
+            log.warning("%s ACP delivery failed for action_id=%s after 3 attempts: %s",
+                        self.PREFIX, action_id, error)
         with instance.lock:
             if getattr(instance, "last_action_id", None) == action_id:
                 instance.acp = {"action_id": action_id, "state": "failed" if error else "accepted",
@@ -808,18 +738,14 @@ class JointControlPlugin(FrankaPlugin):
 
     def _post_completion(self, action_id, status, result):
         import os
-        import ssl
         import urllib.request
 
-        ca = os.environ.get("AGENT_CORE_CA_CERT")
-        if not ca:
-            raise RuntimeError("AGENT_CORE_CA_CERT is required for ACP completion")
-        context = ssl.create_default_context(cafile=ca)
+        url = os.environ.get("AGENT_CORE_URL", "https://127.0.0.1:15678").rstrip("/")
+        context = _core_tls_context(url)
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
         body = {"action_id": action_id, "status": status, "result": result,
                 "tool": self.PREFIX, "ts": time.time()}
-        url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
         request = urllib.request.Request(url + "/api/acp/complete",
                                          data=json.dumps(body, allow_nan=False).encode(),
                                          headers={"Content-Type": "application/json"}, method="POST")
@@ -881,10 +807,6 @@ class JointControlPlugin(FrankaPlugin):
                                          speed_rad_s=speed, tolerance_rad=math.radians(0.5), timeout_s=120)
                 instance.last_action_id = action_id
                 instance.acp = {"action_id": action_id, "state": "waiting_for_motion"}
-                self._activity_event("running", action=action, action_id=action_id,
-                                   robot_ip=instance.config.get("robot_ip"),
-                                   result={"target_deg": [math.degrees(q) for q in target],
-                                           "speed_deg_s": math.degrees(speed)})
                 threading.Thread(target=self._complete, args=(instance, session, action_id),
                                  name=f"franka-acp-{instance_id}", daemon=True).start()
                 return {"state": "running", "action_id": action_id,
