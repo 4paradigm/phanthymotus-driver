@@ -1095,6 +1095,40 @@ def _acp_callback(self, action_id: str, status: str, result: dict):
 
 Call this from your worker thread when the action finishes. `AGENT_CORE_URL` env var is set in all driver containers.
 
+**Do not turn on hostname verification for this call.** Agent Core's certificate is
+self-signed with `-subj /CN=phanthy-motus` and carries **no subjectAltName**. Since
+Python 3.7, hostname checking reads SAN only, so `ssl.create_default_context(cafile=...)`
+against `https://localhost:15678` fails every time with
+`CERTIFICATE_VERIFY_FAILED: Hostname mismatch, certificate is not valid for 'localhost'`.
+Mounting `/opt/phanthy-motus/data/certs/cert.pem` as the CA does not help — the chain is
+fine, the hostname is not. Two working options:
+
+- the snippet above (`check_hostname = False`, `CERT_NONE`). The endpoint only accepts
+  loopback callers anyway (`auth.py`), so the driver must run with `network_mode: host`;
+- or, to keep pinning the certificate: keep `cafile` and set only `ctx.check_hostname = False`
+  (leave `verify_mode` at `CERT_REQUIRED`) — the chain is still verified, and against a
+  self-signed certificate that *is* the pin.
+
+The same applies to anything else the driver POSTs to Agent Core (`/api/event`, ...).
+
+This failure is **silent from the outside**: the web activity stream shows nothing, and the
+barrier quietly waits out `x-completion.timeout` before the next action dispatches — so a
+wrong callback looks like "the robot hesitates for two minutes", not like an error. Two rules
+follow:
+
+- **Log every failed callback** with its `action_id` (`print(..., file=sys.stderr)` or
+  `log.warning`), after retries if you retry. Storing the error only in the card's state
+  makes it invisible in `docker logs`.
+- **Verify on a machine, not only in tests.** Unit tests inject a fake callback and never
+  meet the real certificate. Trigger one action on a rig and check that Agent Core's
+  `docker logs` shows `POST /api/acp/complete ... 200`.
+
+How a completion appears in the dashboard: there is no dedicated `acp_complete` row. The
+completion enters Agent Core's event bus and, when it starts a main-agent turn, shows up in
+the activity stream as a `trigger` row whose text is
+`{"type": "action_complete", "action_id": ..., "status": ...}`. With the agent loop switched
+off, the barrier is still released but no row appears — check `docker logs` instead.
+
 #### 4. No SSE endpoint needed
 
 Drivers do NOT need to implement an `/sse` endpoint. The completion notification is a simple HTTP POST.
