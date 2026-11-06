@@ -1,6 +1,6 @@
 # Noetix Bumi driver
 
-The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
+The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`, the Morse card in `Morse.py`; the other cards remain in `device.py`.
 
 ## `mic` and `sound_direction`
 
@@ -447,6 +447,47 @@ ros2 topic echo /<robot_namespace>/motion/state
 ros2 topic hz /<robot_namespace>/motion/state
 docker logs -f embodied-noetix-bumi
 ```
+
+## `morse`
+
+输入摩斯电码，翻译成英文，并用机器人扬声器朗读。卡片自带解码与本地语音合成，
+不依赖 perception 的 TTS 卡片，也不需要联网。
+
+- `speak`：解码并朗读。新的 `speak` 会先停掉上一段语音。
+- `decode`：只返回英文文本，不播放语音。
+- `stop`：停止当前语音。
+- `info`：TTS 组件、当前状态与最近一次结果。
+- `start`：检查 `espeak-ng` / `ffmpeg` 是否可用，不朗读。
+
+输入格式：`.` / `-` 表示点划，字母之间一个空格，单词之间 `/`、`|` 或两个以上空格；
+全角点划、全角空格和换行都接受。支持 A–Z、0–9 和常用标点（ITU-R M.1677-1）：
+
+```text
+.... . .-.. .-.. --- / .-- --- .-. .-.. -..
+→ HELLO WORLD
+```
+
+无法识别的电码会用 `?` 标出，并在 `unknown` 列表里给出单词/字母序号、原始电码和原因
+（`unknown_code`、`invalid_symbol`）。`speak` 不会朗读含 `?` 的内容，避免把笔误读成
+一句自信的话；`decode` 仍返回带 `?` 的译文便于定位。
+
+语音在本地用 `espeak-ng` 合成，再由 `ffmpeg` 转成 16 kHz 双声道 PCM16，走
+`MediaController` 的外部播放通道——也就是 `speaker` 卡片的同一条通道。因此：
+
+- 镜像需要 `espeak-ng`（Dockerfile 已安装）。缺少时 `start` / `info` 报 `unavailable`，
+  `speak` 返回明确错误而不是静默成功。
+- 这张卡片与 `speaker` 卡片共用机器人扬声器，同一时刻只能有一个在发声。
+- 每次朗读前都会重新打开播放通道（`speaker.stop` 会关闭它），不缓存“已打开”状态。
+- `stop` 会暂停该播放通道，和 `speaker.stop` 的行为一致。
+
+配置（`config.yaml`）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `voice` | `en-us` | espeak-ng 英文发音人 |
+| `speed_wpm` | `150` | 语速（词/分钟），范围 80–300 |
+
+测试：`python -m pytest noetix/bumi/tests/test_morse_card.py -q`
 
 ## Read-only RGB-D visual odometry card (`rgbd_visual_odometry`)
 

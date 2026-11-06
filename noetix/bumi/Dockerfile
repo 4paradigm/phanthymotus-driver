@@ -40,7 +40,8 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
         libasound2-dev \
         libssl-dev \
         libeigen3-dev \
-        libboost-dev && \
+        libboost-dev \
+        espeak-ng && \
     rm -rf /var/lib/apt/lists/*
 
 # RTAB-Map RGB-D odometry, bundle-local (single container). The estimator runs as
@@ -154,6 +155,7 @@ COPY visual_odometry_probe.py /work/visual_odometry_probe.py
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
+COPY Morse.py /work/Morse.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 

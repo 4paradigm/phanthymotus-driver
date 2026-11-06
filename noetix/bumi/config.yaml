@@ -42,6 +42,12 @@ plugins:
     enabled: true
   speaker:
     enabled: true
+  # 摩斯密码卡片：输入点划文本，翻译成英文并用机器人扬声器朗读。
+  # 语音在本地合成（espeak-ng），不需要联网，也不依赖 perception 的 TTS 卡片。
+  morse:
+    enabled: true
+    voice: en-us        # espeak-ng 英文发音人
+    speed_wpm: 150      # 语速（词/分钟），范围 80–300
   camera:
     enabled: true
     # Bumi supports either official App video transfer or Phanthy's direct

@@ -175,6 +175,15 @@ class BumiDeviceBundle:
             self._plugins.append(SpeakerPlugin(plugins_cfg["speaker"], namespace, executor, media_ctrl))
             print("[bundle] SpeakerPlugin loaded")
 
+        if plugins_cfg.get("morse", {}).get("enabled", False) and media_ctrl is not None:
+            # Self-contained speech card: decodes Morse and synthesises English
+            # locally, then plays it through the same MediaController route the
+            # speaker card uses.
+            from Morse import MorsePlugin
+            self._plugins.append(MorsePlugin(
+                plugins_cfg["morse"], namespace, executor, media_ctrl))
+            print("[bundle] MorsePlugin loaded")
+
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
             camera_plugin = CameraPlugin(plugins_cfg["camera"], namespace, executor)
