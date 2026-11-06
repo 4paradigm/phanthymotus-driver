@@ -264,6 +264,50 @@ in `device.py`; no extra runtime Python file is required.
 
 ## New cards
 
+### `system_health` — 板载媒体单元的运行状态
+
+只读。Bumi 身上有两套计算单元：管腿和行走的 `HighController`，以及管听、说、看的那台
+板载媒体单元（`MediaController`）。现有卡片只用到后者的**输出**（相机画面、麦克风音频），
+没有一张说明它自己现在是什么状态 —— 于是"机器人不说话了"这件事，在仪表盘上和
+"机器人坏了"长得一模一样。
+
+输出 `/<namespace>/system/health`（`data/json`，默认 1 Hz），字段全是顶层标量，好让
+仪表盘的 KV 面板直接渲染：
+
+| 字段 | 含义 |
+| --- | --- |
+| `work_status` / `work_status_text` | `READY` 就绪 / `SLEEPED` 已休眠 / `WAKEUPED` 已唤醒 / `EXIT` 已退出（复位中） |
+| `reason` / `reason_text` | 为什么会变成现在这样：超时自动休眠、被语音或命令唤醒/休眠、出错休眠、复位、开机 |
+| `awake` | 是否处于可听可说的状态；读不到时为 `null` |
+| `healthy` | 只有 `ERROR_SLEEPED` 为 `false`；读不到时为 `null` |
+| `transitioning` | 正在 `EXIT` / `CMD_RESET` 复位途中 |
+| `sleep_after_s` | 自动休眠阈值（`get_timeout()` 的毫秒折算成秒） |
+| `error_code` / `error_message` | 最近一次错误；`0` / `""` 表示没有记录 |
+| `observed_for_s` | 本驱动观察到当前状态持续的时长 |
+| `last_wakeup_age_s` | 距最近一次**被观察到**的唤醒多久；没观察到就是 `null` |
+| `read_errors` | 连续读取失败次数，成功后归零 |
+
+三条规则：
+
+- **休眠不是故障。** 超时休眠是这台机器人最常见的正常状态，把它报成 `healthy: false`
+  会让告警在正常使用时一直响，然后被忽略。`device.py` 对播放早已采用同一条规则
+  （`_AUDIO_RESET_RECOVERED_STATUSES`："Only ERROR_SLEEPED means the audio agent
+  itself is down"）。
+- **读不到不等于正常。** 状态读失败时 `healthy` 是 `null` 而不是 `true` —— SDK 不回答
+  不是"机器人没事"的证据。
+- **时间戳是本驱动的观测，不是机器人的。** 这个 SDK 不提供任何时间戳（`odom_spec.py`
+  对 IMU 记过同一件事），所以 `observed_for_s` 从本驱动第一次看到该状态起算；一次读
+  失败会打断观测，恢复后重新计时，而不是跨过那段不知道发生了什么的时间。
+  `last_wakeup_age_s` 只有在驱动运行期间真的看到一次切到 `WAKEUPED` 时才有值。
+
+不带任何写操作：只调用 `get_system_status` / `get_system_error` / `get_timeout`，不调用
+`wakeup` / `sleep` / `restart`，也不改音量或超时。一张能顺手把被观测对象改掉的健康卡，
+需要别人先相信它不会。
+
+载荷的构造在 `system_health_spec.py`，不导入 rclpy，所以"哪些状态算故障"这条规则在
+笔记本上就能测（`tests/test_system_health.py`）。配置在 `plugins.system_health`：
+`poll_interval_s` 默认 `1.0`，允许 `[0.2, 5.0]`。
+
 ### `motion_state`
 
 Passive, read-only whole-body motion telemetry from `HighController`. The card has no action parameters or execute button. Its single JSON output combines the former summary and joint views:

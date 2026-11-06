@@ -8,6 +8,7 @@ drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
   - LocoPlugin: locomotion, stand-up/prone storage, semantic actions and action recording
   - MicPlugin: 8ch mic capture → mono PCM 16kHz
   - SpeakerPlugin: audio playback via MediaController
+  - SystemHealthPlugin: on-board media unit state (read-only)
   - CameraPlugin: Realsense D435i color + depth
   - MotionStatePlugin: combined whole-body motion state
 """
@@ -3055,6 +3056,241 @@ class MotionStatePlugin:
                 # robot reports its own motion, and which axes of it.
                 "odom_interface": self._odom_interface(),
                 **self._node.odom_health(),
+            }
+        return None
+
+
+# ── SystemHealthPlugin (read-only view of the media unit's own state) ───────
+
+# Refresh period for the auto-sleep threshold. `get_timeout()` is a separate
+# DDS query and the value only changes when somebody sets it, so it is cached
+# rather than asked for once per sample.
+_SLEEP_THRESHOLD_REFRESH_S = 60.0
+
+
+class _SystemHealthNode(Node):
+    """Polls the media unit's own status and publishes it as one JSON sample.
+
+    Read-only by construction: this node calls `get_system_status`,
+    `get_system_error` and `get_timeout`, and never `wakeup`, `sleep` or any
+    setter. A health card that could also change the thing it reports would have
+    to be trusted not to, and this one is meant to be safe to leave on screen.
+
+    The payload itself is built in `system_health_spec`, which imports no
+    rclpy, so the part where a mistake would be silent — which states count as
+    a fault — is testable on a laptop.
+    """
+
+    def __init__(self, namespace: str, media_ctrl, interval_s: float):
+        super().__init__("bumi_system_health")
+        self._media_ctrl = media_ctrl
+        self._topic = f"/{namespace}/system/health"
+        self._pub = self.create_publisher(String, self._topic, 10)
+        self._interval_s = interval_s
+        self._running = False
+        self._thread = None
+        # The (work_status, reason) pair last actually observed, and since when.
+        # Cleared on a failed read: after an outage the state was not observed
+        # continuously, so the duration must restart rather than span a gap it
+        # knows nothing about.
+        self._pair = None
+        self._pair_since = None
+        self._last_wakeup_at = None
+        self._read_errors = 0
+        self._sleep_after_ms = None
+        self._sleep_after_read_at = 0.0
+
+    @property
+    def topic(self) -> str:
+        return self._topic
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def start_polling(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="bumi_system_health")
+        self._thread.start()
+
+    def stop_polling(self):
+        self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def read_now(self) -> dict:
+        """One sample on demand, for `info` — so a canvas that only asks does
+        not have to wait a poll interval for the topic to arrive."""
+        try:
+            return self._read_once(refresh_timeout=True)
+        except Exception as exc:                              # noqa: BLE001
+            return self._failed_sample(exc)
+
+    def _loop(self):
+        while self._running:
+            try:
+                payload = self._read_once()
+            except Exception as exc:                          # noqa: BLE001
+                payload = self._failed_sample(exc)
+            message = String()
+            message.data = json.dumps(payload, ensure_ascii=False)
+            self._pub.publish(message)
+            time.sleep(self._interval_s)
+
+    def _failed_sample(self, exc) -> dict:
+        import system_health_spec
+
+        self._read_errors += 1
+        self._pair = None
+        self._pair_since = None
+        # One outage is not fifty warnings a second: keep the first failure and
+        # every hundredth visible, and let the sample's `read_errors` carry the
+        # rest. A recovered read resets the count silently.
+        if self._read_errors == 1 or self._read_errors % 100 == 0:
+            self.get_logger().warn(
+                f"system health read failed ({self._read_errors}): {exc}")
+        return system_health_spec.sample(
+            received_ms=int(time.time() * 1000), read_errors=self._read_errors)
+
+    def _read_once(self, *, refresh_timeout: bool = False) -> dict:
+        import system_health_spec
+
+        now = time.monotonic()
+        status = self._media_ctrl.get_system_status()
+        work_status = system_health_spec.status_name(getattr(status, "value", None))
+        reason = system_health_spec.status_name(getattr(status, "reason", None))
+
+        if (work_status, reason) != self._pair:
+            # A wakeup nobody watched happen has no age, so only a transition
+            # observed while this card was running is recorded. The first
+            # sample is not a transition: it says what the unit is now, not
+            # when it got there.
+            if (self._pair is not None and work_status == "WAKEUPED"
+                    and self._pair[0] != "WAKEUPED"):
+                self._last_wakeup_at = now
+            self._pair = (work_status, reason)
+            self._pair_since = now
+
+        error_code, error_message = self._read_error()
+        self._read_errors = 0
+        return system_health_spec.sample(
+            work_status=work_status,
+            reason=reason,
+            error_code=error_code,
+            error_message=error_message,
+            sleep_after_ms=self._read_sleep_after_ms(refresh=refresh_timeout, now=now),
+            received_ms=int(time.time() * 1000),
+            observed_for_s=now - self._pair_since,
+            last_wakeup_age_s=(None if self._last_wakeup_at is None
+                               else now - self._last_wakeup_at),
+            read_errors=self._read_errors,
+        )
+
+    def _read_error(self) -> tuple:
+        """The last error the unit recorded, as `(code, message)`.
+
+        A failure to read the error record is reported as "none recorded"
+        rather than as a failed sample. The state is what this card exists to
+        show, and blanking it because the error-log query failed would hide the
+        very field an operator came for; `read_errors` counts failed *status*
+        reads, which is the read that actually blanks the card.
+        """
+        try:
+            error = self._media_ctrl.get_system_error()
+            return (int(getattr(error, "code", 0) or 0),
+                    str(getattr(error, "message", "") or ""))
+        except Exception:                                     # noqa: BLE001
+            return 0, ""
+
+    def _read_sleep_after_ms(self, *, refresh: bool, now: float):
+        """Cached auto-sleep threshold in milliseconds, or the last known one.
+
+        A threshold that cannot be read is not a threshold of zero, so the
+        previous value is kept and `None` is reported until one is read.
+        """
+        if not refresh and now - self._sleep_after_read_at < _SLEEP_THRESHOLD_REFRESH_S:
+            return self._sleep_after_ms
+        try:
+            self._sleep_after_ms = int(self._media_ctrl.get_timeout())
+        except Exception:                                     # noqa: BLE001
+            pass
+        # Stamped even on failure, so an unavailable query is retried on the
+        # refresh period rather than on every sample.
+        self._sleep_after_read_at = now
+        return self._sleep_after_ms
+
+
+class SystemHealthPlugin:
+    PREFIX = "system_health"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
+        interval = _finite_number(plugin_config.get("poll_interval_s", 1.0),
+                                  "poll_interval_s")
+        if not 0.2 <= interval <= 5.0:
+            raise ValueError("poll_interval_s must be in [0.2, 5.0]")
+        self._node = _SystemHealthNode(namespace, media_ctrl, interval)
+        executor.add_node(self._node)
+
+    def _topic_out(self) -> list:
+        return [{"topic": self._node.topic, "format": "data/json"}]
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "system_health", "type": "sensor", "multiInstance": False,
+            "description": (
+                "Bumi 板载媒体单元（负责语音与相机的那套小系统）的运行健康，只读。"
+                "持续输出当前工作状态（就绪 / 已休眠 / 已唤醒 / 退出）、"
+                "**为什么会变成这个状态**（超时自动休眠、被语音或命令唤醒/休眠、"
+                "出错休眠、复位）、最近一次错误码与说明、自动休眠阈值，"
+                "以及本驱动观察到该状态持续的时长。"
+                "休眠是正常状态，不是故障 —— 只有出错休眠（ERROR_SLEEPED）才算坏；"
+                "读不到状态时 healthy 为 null 而不是 true。"
+                f"不控制机器人，也不会把它唤醒。发布到 {self._node.topic}。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "stop", "info"],
+                        "description": "卡片生命周期或实时状态查询",
+                    },
+                },
+            },
+            "topic_out": self._topic_out(),
+        }
+
+    def start(self):
+        self._node.start_polling()
+
+    def stop(self):
+        self._node.stop_polling()
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            self._node.start_polling()
+            # Report the state that is, not the one that was requested: a card
+            # that answers `running` without polling is the "silence that looks
+            # like success" this bundle avoids elsewhere.
+            return {"state": "running" if self._node.running else "unavailable",
+                    "topic_out": self._topic_out()}
+        if action == "stop":
+            self._node.stop_polling()
+            return {"state": "idle"}
+        if action == "info":
+            import system_health_spec
+
+            return {
+                **self._node.read_now(),
+                "state": "running" if self._node.running else "idle",
+                "topic_out": self._topic_out(),
+                # Read once by anything that needs to know which states mean
+                # "awake" and which reason means a real fault, instead of
+                # hard-coding the vocabulary somewhere else.
+                "interface": system_health_spec.interface(),
             }
         return None
 

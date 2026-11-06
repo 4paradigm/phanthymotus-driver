@@ -175,6 +175,13 @@ class BumiDeviceBundle:
             self._plugins.append(SpeakerPlugin(plugins_cfg["speaker"], namespace, executor, media_ctrl))
             print("[bundle] SpeakerPlugin loaded")
 
+        if (plugins_cfg.get("system_health", {}).get("enabled", False)
+                and media_ctrl is not None):
+            from device import SystemHealthPlugin
+            self._plugins.append(SystemHealthPlugin(
+                plugins_cfg["system_health"], namespace, executor, media_ctrl))
+            print("[bundle] SystemHealthPlugin loaded")
+
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
             camera_plugin = CameraPlugin(plugins_cfg["camera"], namespace, executor)
