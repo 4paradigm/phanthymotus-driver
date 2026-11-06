@@ -42,7 +42,7 @@ class MotionCompletion:
         if args.get("confirm_move") is not True:
             raise ValueError("confirm_move=true is required for each motion request")
         # Fail before transmitting motion when callback TLS is not configured.
-        if action not in ("move_j", "resume", "pause", "stop_motion"):
+        if action not in ("move_j", "rel_joint_mov_j", "resume", "pause", "stop_motion"):
             raise ValueError(f"unsupported joint motion action: {action}")
         try:
             context = None if self._notify is not None else self._callback_context()
@@ -93,7 +93,9 @@ class MotionCompletion:
             sample = self.control.feedback.snapshot()
             baseline = sample.get("packets_received")
             target = [float(args[f"joint{i}_deg"]) for i in range(1, 7)] if action == "move_j" else self._last_target
-            if action == "move_j":
+            if action == "rel_joint_mov_j":
+                target = response["target_joint_angles_deg"]
+            if action in ("move_j", "rel_joint_mov_j"):
                 self._last_target = target
             if action in ("pause", "stop_motion"):
                 result = self._monitor_control(action, active["cancel"], baseline)
@@ -106,7 +108,7 @@ class MotionCompletion:
         except Exception as exc:
             status = "cancelled" if active["cancel"].is_set() else "error"
             result = {"reason": str(exc)}
-            must_stop = (submitted and action in ("move_j", "resume")) or (action == "pause" and active["interrupting"])
+            must_stop = (submitted and action in ("move_j", "rel_joint_mov_j", "resume")) or (action == "pause" and active["interrupting"])
             if status == "error" and must_stop:
                 try:
                     self.control.execute_motion("stop_motion", {"confirm_move": True})

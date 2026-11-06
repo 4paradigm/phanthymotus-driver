@@ -5,11 +5,12 @@
 
 ## 卡片形式
 
-`joint_move` 为 actuator，提供四个可见 action，不提供 `get_status`：
+`joint_move` 为 actuator，提供五个可见 action，不提供 `get_status`：
 
 | action | 内容 |
 |---|---|
 | `move_j` | 先 ClearError，检查并完成使能后执行 EnableSafeSkin(0) 和 ClearError，成功后复查状态，再运动至六个绝对关节目标角度 |
+| `rel_joint_mov_j` | 按六轴相对偏移运动，使用同一套准备与完成流程 |
 | `stop_motion` | 停止控制器运动队列/工程，也可停止点动 |
 | `pause` | 暂停当前运动队列/工程，不暂停点动 |
 | `resume` | 继续当前已暂停的队列/工程 |
@@ -24,6 +25,7 @@
 | `joint1_deg`、`joint2_deg` | 绝对角度，[-360, 360] 度 | 无，必填 |
 | `joint3_deg` | 绝对角度，[-155, 155] 度 | 无，必填 |
 | `joint4_deg`、`joint5_deg`、`joint6_deg` | 绝对角度，[-360, 360] 度 | 无，必填 |
+| `joint1_offset_deg` 至 `joint6_offset_deg` | 相对偏移角度（度），0 表示该轴不变 | 无，必填，仅 rel_joint_mov_j |
 | `velocity` | 本条运动速度比例，整数 1–100% | 10 |
 | `acceleration` | 本条运动加速度比例，整数 1–100% | 10 |
 | `detect_collision` | true 开启安全皮肤并设为 low；false 关闭 | false |
@@ -33,7 +35,7 @@
 角度范围依据《Dobot CRA 系列硬件使用手册》V3.2 附录 A 的 CR3A 参数。
 这些是型号活动范围的输入校验，不能替代控制器中更严格的关节限制或现场避障检查。
 
-参照 RM75 的确认参数形式，不提供下拉枚举或自动确认默认值。所有四个运动 action 都需要手动输入布尔值 `confirm_move=true`；六轴角度和速率仅对 `move_j` 生效。
+参照 RM75 的确认参数形式，不提供下拉枚举或自动确认默认值。所有五个运动 action 都需要手动输入布尔值 `confirm_move=true`；六轴角度和速率仅对 `move_j` 生效。
 速度、加速度直接映射到 SDK 的 `v/a`，不是固定的度/秒或度/秒²。实际速度还受全局速率影响。
 固定发送 `cp=0`，不开放平滑过渡参数。
 
@@ -79,7 +81,7 @@ MovJ(joint={10.000000,-30.000000,60.000000,0.000000,90.000000,-10.000000},a=10,v
 - action 返回异步任务 ID，终态通过 ACP 回调上报；实时角度继续读取 `joints`。
   不新增运动 sensor，不提供 `get_status` action。
 
-四个 action 立即返回 `state=running` 和唯一 `action_id`，后台完成准备、提交和反馈监测。
+五个 action 立即返回 `state=running` 和唯一 `action_id`，后台完成准备、提交和反馈监测。
 通过 ACP POST 上报 `completed/error/cancelled`，对应同一个 action_id；SDK 应答和队列号不是到位通知。
 
 | action | 完成条件 |
@@ -98,7 +100,7 @@ MovJ(joint={10.000000,-30.000000,60.000000,0.000000,90.000000,-10.000000},a=10,v
 
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/dobot-build-fix-venv/bin/python -m pytest \
-  tests/test_dobot_joint_move.py tests/test_dobot_completion.py \
+  tests/test_dobot_joint_move.py tests/test_dobot_relative_joint_move.py tests/test_dobot_completion.py \
   tests/test_dobot_cra_sensors.py tests/test_dobot_skeleton_structure.py -q
 ```
 
@@ -150,3 +152,29 @@ enable 检查前的清错应答保存在内部 pre_enable_clear_error_response�
 安全皮肤开关及灵敏度设置都是队列指令：收到成功应答后等待新反馈确认对应队列 ID 已执行且队列不再运行。
 此等待阶段允许本次准备指令导致的模式 7，但不允许实际运行、点动、拖拽或松抱闸。
 清错后再次等待队列稳定，最后仍要求模式 5/10；等待超时记录队列 ID、模式及运行标志。
+
+## 相对关节运动
+
+rel_joint_mov_j 使用官方 SDK RelJointMovJ，六个偏移量单位为度，全部必填，不变的轴显式填写 0。
+复用 move_j 的速度/加速度默认值、cp=0、detect_collision 默认 false、手动 confirm_move=true，
+以及清错、使能、皮肤设置、队列等待、最终状态检查和 ACP 完成流程。
+下发前用最新实际角度重新计算最终目标，校验实际角度加偏移不超出六轴标称行程；不进行角度绕回。
+完成监测使用下发前计算的绝对目标，而不是将偏移量当作目标角度。
+
+例如只让 J1 增加 10°、J3 减少 5°：
+
+```json
+{
+  "action": "rel_joint_mov_j",
+  "joint1_offset_deg": 10,
+  "joint2_offset_deg": 0,
+  "joint3_offset_deg": -5,
+  "joint4_offset_deg": 0,
+  "joint5_offset_deg": 0,
+  "joint6_offset_deg": 0,
+  "velocity": 10,
+  "acceleration": 10,
+  "detect_collision": false,
+  "confirm_move": true
+}
+```

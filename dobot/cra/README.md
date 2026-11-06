@@ -7,7 +7,7 @@
 
 | 名称 | 类型 | 内容 |
 |---|---|---|
-| `joint_move` | actuator | 绝对关节运动、停止、暂停及继续，详见 [JOINT_MOVE.md](JOINT_MOVE.md) |
+| `joint_move` | actuator | 绝对/相对关节运动、停止、暂停及继续，详见 [JOINT_MOVE.md](JOINT_MOVE.md) |
 | `joints` | sensor | 六轴实际角度驱动的 CR3A 结构骨架、逐关节转角 JSON，以及共享连接配置 |
 
 `model` 为渲染器内部读取的 resource，不是可见卡片。
@@ -118,6 +118,9 @@ move_j 再发送 ClearError 和 MovJ，resume 发送 Continue。
 皮肤设置由 detect_collision 显式选择。模式 11 等保护状态不会提前阻止准备命令；
 仅在准备完成后确认模式 5（move_j）或模式 10（resume）、已使能且无保护触发，才发送最终运动命令。
 
-四个运动 action 均返回 action_id，通过 ACP 完成回调报告真实终态；命令应答不等于运动完成。
+五个运动 action 均返回 action_id，通过 ACP 完成回调报告真实终态；命令应答不等于运动完成。
 暂停/停止也要等待新反馈确认状态与实际速度，缺失反馈不宣称停稳。
 部署增加 Agent Core CA 证书只读挂载与主机名映射，保持 TLS 校验；详细要求见 JOINT_MOVE.md。
+
+rel_joint_mov_j 新增相对关节偏移运动，单位为度，0 表示该轴不变；其余设置复用 move_j。
+准备前及下发前校验实际角度加偏移后的最终目标，完成监测使用最终目标角度。

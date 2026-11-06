@@ -91,7 +91,7 @@ requests, PyYAML and their runtime dependencies. These increase image size over
 the ROS base; no zero-growth claim is made. The exact ARM64 image delta requires
 an actual container build and has not been measured locally.
 
-All four actuator actions advertise x-completion and return action_id immediately.
+All five actuator actions advertise x-completion and return action_id immediately.
 Preparation/submission errors and monitored terminal results are posted to
 Agent Core /api/acp/complete using verified HTTPS and a matching action_id ACK.
 move_j requires new feedback, queue/running correlation, idle state and actual
@@ -109,3 +109,8 @@ The boolean detect_collision parameter defaults to false: send EnableSafeSkin(0)
 When true, send EnableSafeSkin(1), then SetSafeSkin(part,1) for parts 3,4,5,6.
 Every setting ACK and queue completion is checked. This option controls skin
 proximity protection only; it does not change force-based collision sensitivity.
+
+rel_joint_mov_j calls the pinned SDK RelJointMovJ with six explicit degree offsets.
+Preparation and completion match move_j. Current angles plus offsets are checked
+both before preparation and immediately before submission, and the final absolute
+target is retained for ACP monitoring and a later resume of that motion.

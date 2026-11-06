@@ -30,7 +30,7 @@ def test_prefix_and_completion_contract():
     plugin = DobotSensors({})
     assert plugin.PREFIX == 'dobot_cra'
     schema = next(t for t in plugin.get_tools() if t['name'] == 'joint_move')['inputSchema']
-    assert schema['x-completion']['actions'] == ['move_j', 'resume', 'pause', 'stop_motion']
+    assert schema['x-completion']['actions'] == ['move_j', 'rel_joint_mov_j', 'resume', 'pause', 'stop_motion']
     assert schema['x-completion']['timeout'] > 300
 
 

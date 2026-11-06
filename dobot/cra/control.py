@@ -145,7 +145,7 @@ class RobotController:
         if (state["robot_mode"] not in allowed_modes or state["running_status"] or
                 state["jog_status"] or state["drag_status"] or any(state["brake_released"])):
             raise RuntimeError("robot must be stationary with locked brakes before preparing motion")
-        if action == "move_j" and state["robot_mode"] not in (9, 11) and (
+        if action in ("move_j", "rel_joint_mov_j") and state["robot_mode"] not in (9, 11) and (
                 state["pause_cmd_flag"] or (state["run_queued_cmd"] and not allow_own_queue)):
             raise RuntimeError("move_j requires an idle robot without a paused or running queue")
         return sample
@@ -184,7 +184,7 @@ class RobotController:
         if sample.get("robot_type_code") != 113:
             raise RuntimeError("joint motion currently requires controller-identified CR3A (type 113)")
         resolve_model(sample, self.feedback.model_name)
-        required_mode = 5 if action == "move_j" else 10
+        required_mode = 5 if action in ("move_j", "rel_joint_mov_j") else 10
         if mode != required_mode or not state["enable_status"]:
             raise RuntimeError(f"{action} requires an enabled robot in mode {required_mode}; current mode is {mode}")
         if (state["error_status"] or state["collision_state"] or state["drag_status"] or
@@ -193,49 +193,68 @@ class RobotController:
             raise RuntimeError("joint motion is blocked by alarm, collision, skin trigger, drag or released brakes")
         if state["running_status"] or state["jog_status"]:
             raise RuntimeError("robot must be stopped before move_j or resume")
-        if action == "move_j" and (state["pause_cmd_flag"] or state["run_queued_cmd"]):
+        if action in ("move_j", "rel_joint_mov_j") and (state["pause_cmd_flag"] or state["run_queued_cmd"]):
             raise RuntimeError("move_j requires an idle robot without a paused or running queue")
         return sample
 
     def execute_motion(self, action, args, *, cancel=None):
-        commands = {"move_j": "MovJ", "stop_motion": "Stop", "pause": "Pause", "resume": "Continue"}
+        commands = {"move_j": "MovJ", "rel_joint_mov_j": "RelJointMovJ", "stop_motion": "Stop", "pause": "Pause", "resume": "Continue"}
         if action not in commands:
             raise ValueError(f"unsupported joint motion action: {action}")
         if args.get("confirm_move") is not True:
             raise ValueError("confirm_move=true is required for each motion request")
         parameters, options, requested = (), {}, {}
-        if action in ("move_j", "resume"):
+        if action in ("move_j", "rel_joint_mov_j", "resume"):
             detect_collision = args.get("detect_collision", False)
             if type(detect_collision) is not bool:
                 raise ValueError("detect_collision must be a boolean true or false")
             requested["detect_collision"] = detect_collision
-        if action == "move_j":
-            angles = []
+        if action in ("move_j", "rel_joint_mov_j"):
+            values = []
+            relative = action == "rel_joint_mov_j"
             for joint, (lower, upper) in zip(JOINT_NAMES, JOINT_LIMITS_DEG):
-                value = args.get(f"{joint}_deg")
+                field = f"{joint}_offset_deg" if relative else f"{joint}_deg"
+                if relative:
+                    span = upper - lower
+                    lower, upper = -span, span
+                value = args.get(field)
                 if type(value) not in (int, float) or not lower <= value <= upper or not math.isfinite(value):
-                    raise ValueError(f"{joint}_deg must be a finite number in [{lower}, {upper}] degrees")
-                angles.append(float(value))
+                    raise ValueError(f"{field} must be a finite number in [{lower}, {upper}] degrees")
+                values.append(float(value))
             for key in ("velocity", "acceleration"):
                 value = args.get(key, 10)
                 if type(value) is not int or not 1 <= value <= 100:
                     raise ValueError(f"{key} must be an integer from 1 to 100 percent")
-            parameters = (angles, CoordinateType.JOINT)
+            parameters = tuple(values) if relative else (values, CoordinateType.JOINT)
             options = {"v": args.get("velocity", 10), "a": args.get("acceleration", 10), "cp": 0}
-            requested.update({f"{joint}_deg": angle for joint, angle in zip(JOINT_NAMES, angles)})
+            requested.update({f"{joint}_offset_deg" if relative else f"{joint}_deg": value
+                              for joint, value in zip(JOINT_NAMES, values)})
             requested.update(velocity=options["v"], acceleration=options["a"])
         def check_state(current_action, *, allow_own_queue=False):
             if cancel is not None and cancel.is_set():
                 raise RuntimeError("motion interrupted")
-            if current_action in ("move_j", "resume"):
+            if current_action in ("move_j", "rel_joint_mov_j", "resume"):
                 return self._check_preparation_state(current_action, allow_own_queue=allow_own_queue)
             return self._check_motion_state(current_action)
         return self._execute(action, commands[action], check_state, card="joint_move",
                              parameters=parameters, options=options, requested=requested)
 
+    @staticmethod
+    def _relative_target(sample, offsets):
+        current = sample["data"]["joint_state"]["q_actual"]
+        if len(current) != 6 or any(type(value) not in (int, float) or not math.isfinite(value) for value in current):
+            raise RuntimeError("six finite actual joint angles are required for relative motion")
+        target = [float(angle + offset) for angle, offset in zip(current, offsets)]
+        for joint, angle, (lower, upper) in zip(JOINT_NAMES, target, JOINT_LIMITS_DEG):
+            if not lower <= angle <= upper:
+                raise ValueError(f"relative target for {joint} is {angle} degrees, outside [{lower}, {upper}]")
+        return target
+
     def _execute(self, action, command, check_state, *, card="joint_move", parameters=(), options=None, requested=None):
         with self._command_lock:
             sample = check_state(action)
+            if command == "RelJointMovJ":
+                self._relative_target(sample, parameters)
             request = {"action": action, **(requested or {}), "timestamp_ms": int(time.time() * 1000),
                        "controller_ip": sample["controller_ip"], "read_only": False, "effect_verified": False}
             self._update(card, last_request={**request, "state": "sending"}, last_error=None)
@@ -251,7 +270,7 @@ class RobotController:
                     self._update(dashboard_connected=True)
                 # Connecting can take long enough for feedback/state to change.
                 check_state(action)
-                if action in ("move_j", "resume"):
+                if action in ("move_j", "rel_joint_mov_j", "resume"):
                     pre_enable_clear = self._api.ClearError()
                     parse_response(pre_enable_clear, "ClearError")
                     request["pre_enable_clear_error_response"] = pre_enable_clear
@@ -268,7 +287,7 @@ class RobotController:
                             if time.monotonic() >= deadline:
                                 raise TimeoutError("EnableRobot acknowledged but enabled feedback was not confirmed")
                             time.sleep(0.02)
-                if card == "joint_move" and action in ("move_j", "resume"):
+                if card == "joint_move" and action in ("move_j", "rel_joint_mov_j", "resume"):
                     baseline = check_state(action).get("packets_received")
                     detect_collision = request["detect_collision"]
                     skin_reply = self._api.EnableSafeSkin(int(detect_collision))
@@ -284,7 +303,7 @@ class RobotController:
                             skin_queue_id = parse_reply(sensitivity_reply, "SetSafeSkin")
                             request["safe_skin_sensitivity_responses"].append(sensitivity_reply)
                             self._wait_preparation_queue(action, check_state, skin_queue_id, baseline)
-                if command == "MovJ":
+                if command in ("MovJ", "RelJointMovJ"):
                     # Keep clear + state recheck + move serialized as one request.
                     # A failed/uncertain clear must never be followed by motion.
                     baseline = check_state(action).get("packets_received")
@@ -292,7 +311,7 @@ class RobotController:
                     parse_response(clear_reply, "ClearError")
                     request["clear_error_response"] = clear_reply
                     self._wait_preparation_queue(action, check_state, skin_queue_id, baseline)
-                if action in ("move_j", "resume"):
+                if action in ("move_j", "rel_joint_mov_j", "resume"):
                     # ACKs can precede the feedback packet reporting the effect.
                     # Wait for final motion conditions only after all preparation.
                     deadline = time.monotonic() + self.enable_timeout
@@ -305,7 +324,11 @@ class RobotController:
                             if time.monotonic() >= deadline:
                                 raise
                             time.sleep(0.02)
-                api = self._motion_api if command == "MovJ" else self._api
+                if command == "RelJointMovJ":
+                    final_sample = self._check_motion_state(action)
+                    request["start_joint_angles_deg"] = list(final_sample["data"]["joint_state"]["q_actual"])
+                    request["target_joint_angles_deg"] = self._relative_target(final_sample, parameters)
+                api = self._motion_api if command in ("MovJ", "RelJointMovJ") else self._api
                 reply = getattr(api, command)(*parameters, **(options or {}))
                 queue_id = parse_reply(reply, command)
                 request.update(state="submitted" if queue_id is not None else "accepted_unverified",

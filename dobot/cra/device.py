@@ -62,10 +62,13 @@ class DobotSensors:
             },
         }
         angle_fields = [f"{joint}_deg" for joint in JOINT_NAMES]
+        offset_fields = [f"{joint}_offset_deg" for joint in JOINT_NAMES]
         motion_schema = action_schema({
             "info": ([], "查看关节运动卡功能、参数和单位说明，不读取运行状态"),
             "move_j": ([*angle_fields, "velocity", "acceleration", "detect_collision", "confirm_move"],
                        "参数/连接检查后先 ClearError，再检查使能，未使能则 EnableRobot 并等待确认，再按 detect_collision 设置安全皮肤、ClearError，最后执行绝对关节运动（度）；六个角度必填，速度/加速度留空为 10%"),
+            "rel_joint_mov_j": ([*offset_fields, "velocity", "acceleration", "detect_collision", "confirm_move"],
+                                "六轴相对关节运动（度），0 表示该轴不变；六个偏移量必填，复用 move_j 的准备、皮肤和完成流程"),
             "stop_motion": (["confirm_move"], "停止控制器运动队列/工程，包括点动；不下使能"),
             "pause": (["confirm_move"], "暂停当前运动队列/工程；不支持点动暂停"),
             "resume": (["detect_collision", "confirm_move"], "先 ClearError，再检查使能，未使能则 EnableRobot 并等待确认，再按 detect_collision 设置安全皮肤，成功后继续暂停队列"),
@@ -76,6 +79,9 @@ class DobotSensors:
             **{field: {"type": "number", "minimum": lower, "maximum": upper,
                        "description": f"J{index} 绝对目标角度（度），范围 [{lower}, {upper}]，必填"}
                for index, (field, (lower, upper)) in enumerate(zip(angle_fields, JOINT_LIMITS_DEG), 1)},
+            **{field: {"type": "number", "minimum": lower - upper, "maximum": upper - lower,
+                       "description": f"J{index} 相对偏移（度），0 表示不变；实际角度加偏移后的目标也必须在行程内，必填"}
+               for index, (field, (lower, upper)) in enumerate(zip(offset_fields, JOINT_LIMITS_DEG), 1)},
             "velocity": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10,
                          "description": "本条运动速度比例 1–100%，留空为 10%；实际速度还受全局速率影响"},
             "acceleration": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10,
@@ -84,11 +90,11 @@ class DobotSensors:
                                  "description": "是否启用安全皮肤接近检测：true 开启并将小臂、J4、J5、J6 设为 low；false 关闭安全皮肤（默认）。不修改本体碰撞检测等级"},
             "confirm_move": {"type": "boolean", "description": "必须手动输入 true，确认本次运动操作"},
         })
-        motion_schema["x-completion"] = {"actions": ["move_j", "resume", "pause", "stop_motion"], "timeout": self.completion.contract_timeout}
+        motion_schema["x-completion"] = {"actions": ["move_j", "rel_joint_mov_j", "resume", "pause", "stop_motion"], "timeout": self.completion.contract_timeout}
         motion_schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop_motion", "params": {"confirm_move": True}}}
         motion_schema["x-is-dangerous"] = True
         motion_schema["x-resource"] = "arm"
-        motion_tool = tool("joint_move", "actuator", "CR3A 绝对关节角度运动、停止、暂停与继续；角度单位为度", motion_schema)
+        motion_tool = tool("joint_move", "actuator", "CR3A 绝对/相对关节角度运动、停止、暂停与继续；角度单位为度", motion_schema)
         motion_tool["configSchema"] = definitions[0]["configSchema"]
         definitions.append(motion_tool)
         definitions.append(tool("model", "resource", "六轴 CR3A 直角连杆骨架 URDF，附加连接全部为固定关节"))
@@ -194,7 +200,7 @@ class DobotSensors:
                 elif action == "start":
                     self.client.start()
                 return {"state": {"start": "ready", "stop": "idle", "config": "configured"}[action]}
-            if action in ("move_j", "resume", "pause", "stop_motion"):
+            if action in ("move_j", "rel_joint_mov_j", "resume", "pause", "stop_motion"):
                 return self.completion.start(action, args)
             return self.control.execute_motion(action, args)
         if name not in CARD_DESCRIPTIONS:

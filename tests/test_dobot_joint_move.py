@@ -364,7 +364,7 @@ def test_motion_schema_has_only_the_four_public_actions_and_no_default_angles():
     schema = tool['inputSchema']
     assert schema['x-is-dangerous'] and schema['x-resource'] == 'arm'
     assert set(schema['properties']['action']['enum']) - {'info', 'start', 'stop', 'config'} == {
-        'move_j', 'stop_motion', 'pause', 'resume',
+        'move_j', 'rel_joint_mov_j', 'stop_motion', 'pause', 'resume',
     }
     for key in TARGET:
         assert 'default' not in schema['properties'][key]
