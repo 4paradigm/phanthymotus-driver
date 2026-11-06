@@ -1904,6 +1904,31 @@ def test_loco_servo_core_stream_validates_messages_and_watchdog_holds(monkeypatc
         plugin.stop()
 
 
+@pytest.mark.parametrize("failure", [RuntimeError("send failed"), {"ErrorCode": 7}])
+def test_loco_servo_native_send_failure_holds_and_disarms(monkeypatch, failure):
+    monkeypatch.syspath_prepend(str(DRIVER))
+    monkeypatch.setenv("S10_MOTION_ENABLED", "1")
+    from loco_servo import S10LocoServoPlugin
+
+    class Native(FakeNative):
+        def send(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            if len(self.calls) == 1:
+                return failure if not isinstance(failure, Exception) else (_ for _ in ()).throw(failure)
+            return {"state": "held"}
+
+    plugin = S10LocoServoPlugin(Native({}), ros2=object())
+    plugin._dry_run = False
+    plugin._running = True
+    plugin._sink = object()
+    with pytest.raises((RuntimeError, Exception)):
+        plugin._apply([0.2, 0, 0, 0, 0, 0.1])
+    assert plugin._running is False
+    assert plugin._paused is True
+    assert plugin._sink is None
+    assert plugin.native.calls[-1][0][2]["X"] == 0.0
+
+
 def test_control_schema_exposes_supported_navigation_and_light_options(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})

@@ -30,6 +30,7 @@ class MediaWorkers:
         self._closed = False
         self._rtsp_threads = {}
         self._rtsp_processes = {}
+        self._rtsp_frame_failures = {}
 
     def add_lidar(self, lane):
         self._add(lane, "lidar")
@@ -38,6 +39,7 @@ class MediaWorkers:
         thread = threading.Thread(target=self._rtsp_loop, args=(lane, url),
                                   name=f"s10-pro-rtsp-{lane}", daemon=True)
         self._rtsp_threads[lane] = thread
+        self._rtsp_frame_failures[lane] = 0
         thread.start()
 
     def _rtsp_loop(self, lane, url):
@@ -92,7 +94,10 @@ class MediaWorkers:
                 try:
                     self._on_result(lane, None, frame)
                 except Exception as exc:
-                    print(f"[rtsp] {lane} frame publish failed: {exc}", flush=True)
+                    count = self._rtsp_frame_failures.get(lane, 0) + 1
+                    self._rtsp_frame_failures[lane] = count
+                    if count == 1 or count % 100 == 0:
+                        print(f"[rtsp] {lane} frame publish failed count={count}: {exc}", flush=True)
 
     def rtsp_alive(self, lane):
         process = self._rtsp_processes.get(lane)

@@ -225,9 +225,20 @@ class S10LocoServoPlugin:
             ret = self.native.send(0x00100001, 0x00110002,
                                    {"X": float(values[0]), "Y": float(values[1]), "Z": 0.0,
                                     "Roll": 0.0, "Pitch": 0.0, "Yaw": float(values[5])})
-            if isinstance(ret, dict) and ret.get("ErrorCode", 0) not in (0, "0"): self._refused += 1
-            else: self._applied += 1
-        except Exception: self._refused += 1
+            if isinstance(ret, dict) and ret.get("ErrorCode", 0) not in (0, "0"):
+                raise RuntimeError(f"native velocity command rejected: {ret.get('ErrorCode')}")
+            self._applied += 1
+        except Exception:
+            self._refused += 1
+            # A failed send cannot satisfy ControlSink's watchdog. Hold the
+            # chassis and disarm the stream before another non-zero command.
+            self._reader_stop.set()
+            self._hold()
+            with self._lock:
+                self._running = False
+                self._paused = True
+                self._sink = None
+            raise
 
     def _hold(self, *_args):
         if not self._dry_run:
