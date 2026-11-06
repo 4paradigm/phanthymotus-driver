@@ -23,8 +23,10 @@ from uuid import uuid4
 
 if __package__:
     from .control import JOINT_LIMITS_DEG, trajectory_filename
+    from .native_mounts import readable_profile, writable_controller_directory
 else:
     from control import JOINT_LIMITS_DEG, trajectory_filename
+    from native_mounts import readable_profile, writable_controller_directory
 
 SAMPLE_MS = 50
 MAX_POINTS = 10000
@@ -58,7 +60,7 @@ No production profile is bundled because no controller sample is available.
 """
 
     def __init__(self, path):
-        profile_path = Path(path)
+        profile_path = readable_profile(path)
         if profile_path.stat().st_size > 65536:
             raise ValueError("native CSV profile exceeds 64 KiB")
         self.data = json.loads(profile_path.read_text(encoding="utf-8"))
@@ -107,10 +109,11 @@ No production profile is bundled because no controller sample is available.
 
 
 class TrajectoryStore:
-    def __init__(self, directory, controller_directory="", profile_path=""):
+    def __init__(self, directory, controller_directory="", profile_path="", *, require_network_mount=True):
         self.root = Path(directory).expanduser().resolve()
         self.controller_root = Path(controller_directory).expanduser().resolve() if controller_directory else None
         self.profile_path = profile_path
+        self.require_network_mount = require_network_mount
         self._lock = threading.RLock()
         # Lazy directory creation: simply discovering cards has no disk effects.
         self._recovered = False
@@ -244,6 +247,7 @@ class TrajectoryStore:
             record.update(native_state="transfer_required")
             self.save(record)
             return record
+        writable_controller_directory(self.controller_root, require_network_mount=self.require_network_mount)
         filename = trajectory_filename(f"teach_{identifier}.csv")
         destination = self.controller_root / filename
         digest = hashlib.sha256(native).hexdigest()

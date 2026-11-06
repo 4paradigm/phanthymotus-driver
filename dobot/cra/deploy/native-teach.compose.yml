@@ -1,0 +1,20 @@
+# Optional overlay for /opt/phanthy-motus/docker-compose.yml, NOT a service
+# fragment for Agent Core. See README's native-playback deployment procedure.
+services:
+  dobot-cra:
+    volumes:
+      - type: bind
+        source: ${DOBOT_TEACH_PROFILE_HOST_FILE:?Set an absolute host path to the native CSV profile JSON}
+        target: /work/config/dobot-teach/profile.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DOBOT_TEACH_CONTROLLER_HOST_DIR:?Set an absolute host path within the mounted controller trajectory share}
+        target: /work/controller-trajectories
+        read_only: false
+        bind:
+          create_host_path: false
+    environment:
+      DOBOT_TEACH_CSV_PROFILE: /work/config/dobot-teach/profile.json
+      DOBOT_TEACH_CONTROLLER_DIR: /work/controller-trajectories

@@ -196,7 +196,7 @@ StartPath 的 ACK 可以不带队列号；此时必须观察到本次运行，�
 不会把内部 JSON 当原生轨迹，也不会在此状态下发送准备或位移命令。**
 
 要启用原生导出，需要从当前控制器样本确认字段后提供数据格式配置，并把控制器轨迹共享目录
-预先挂载到驱动可访问的目录。该桥接只做文件写入与 SHA-256 回读校验，不开启 SSH、自动挂载、
+预先通过 CIFS/SMB 或 NFS 挂载到驱动可访问的目录。该桥接只做文件写入与 SHA-256 回读校验，不开启 SSH、自动挂载、
 尝试未知 HTTP 写接口或安装 SMB 客户端。GetStartPose 会进一步验证控制器读出的起点；
 这不替代现场对整条 CSV 的兼容性验证。当前测试中的 CSV 明确标记为 SIMULATOR_ONLY，不能部署为真机格式。
 
@@ -205,16 +205,53 @@ StartPath 的 ACK 可以不带队列号；此时必须观察到本次运行，�
 | 配置/变量 | 作用 |
 |---|---|
 | data_dir / DOBOT_TEACH_DATA_DIR | 本地持久化录制目录；部署默认 /work/data/dobot-teach |
-| controller_directory / DOBOT_TEACH_CONTROLLER_DIR | 已挂载的控制器 process/trajectory 目录，留空时返回 transfer_required |
-| native_csv_profile / DOBOT_TEACH_CSV_PROFILE | 从控制器样本确认的 CSV 布局 JSON，留空时返回 format_required |
+| controller_directory / DOBOT_TEACH_CONTROLLER_DIR | **容器内**的控制器轨迹目录；原生覆盖配置固定为 /work/controller-trajectories |
+| native_csv_profile / DOBOT_TEACH_CSV_PROFILE | **容器内**的 CSV 布局文件路径；原生覆盖配置固定为 /work/config/dobot-teach/profile.json |
 
 布局 JSON 使用 version=1、非空 format_id、columns、可选 header（CSV 行数组）及 delimiter。
 columns 支持 joint1_deg..joint6_deg、time_ms、time_s、user、tool，或者 {"literal": 值} 常量列；
 六轴必须各出现一次，单位为度。header 为原样输出的常量行。若控制器样本需要其他结构，应先扩展并验证
 编码器，不能用常量伪造动态位姿或 IO。不自动记录/回放 DO，也不改变工具负载设置。
 
-部署仅新增本地数据目录的持久化挂载；控制器共享目录需要在现场明确挂载并映射进容器后配置。
-原生 profile 可放在持久化目录中。CSV 文件名由轨迹编号生成，不覆盖不同内容的已有控制器文件。
+默认 service.yml 仅启用本地录制，两个原生路径环境变量为空，因此不要求主机上存在 profile 或控制器共享目录。
+Agent Core 只自动提取 service.yml，不会自动加载可选覆盖文件。启用原生回放须按以下步骤，
+将镜像自带的 deploy/native-teach.compose.yml 与平台统一 Compose 文件一起加载。
+
+1. 在 Linux 部署主机上，先通过现场已有的共享配置，将控制器的 process/trajectory 目录挂载到
+   例如 /mnt/dobot-trajectory。该目录必须实际位于 CIFS/SMB 或 NFS 文件系统中，且允许读写。
+   普通 mkdir 创建的目录、失效后落到本地磁盘的目录、只读挂载不能代替控制器共享。
+2. 准备从当前控制器样本确认的 profile JSON 文件。使用下面两个**宿主机路径变量**：
+
+| 宿主机变量 | 内容 | 容器映射及权限 |
+|---|---|---|
+| DOBOT_TEACH_PROFILE_HOST_FILE | 已存在的 profile JSON 绝对路径 | /work/config/dobot-teach/profile.json，只读 |
+| DOBOT_TEACH_CONTROLLER_HOST_DIR | 已挂载共享中轨迹目录的绝对路径 | /work/controller-trajectories，读写 |
+
+3. 默认录制容器由平台创建后，在有部署目录写权限及 Docker 权限的账号下执行：
+
+```bash
+cd /opt/phanthy-motus
+export DOBOT_TEACH_PROFILE_HOST_FILE=/opt/phanthy-motus/data/dobot-teach/native-profile.json
+export DOBOT_TEACH_CONTROLLER_HOST_DIR=/mnt/dobot-trajectory
+
+docker cp embodied-dobot-cra:/deploy/native-teach.compose.yml ./dobot-native-teach.compose.yml
+docker cp embodied-dobot-cra:/work/dobot/cra/native_mounts.py ./check-dobot-native-mounts.py
+python3 ./check-dobot-native-mounts.py
+
+docker compose -f docker-compose.yml -f dobot-native-teach.compose.yml config --quiet
+docker compose -f docker-compose.yml -f dobot-native-teach.compose.yml up -d --no-deps dobot-cra
+```
+
+宿主机预检查仅依赖 Python 标准库，无需安装机械臂 SDK。它会读取 profile JSON，核对 Linux 挂载信息，
+并在共享目录创建、回读及删除一个临时探测文件。它不向机器人命令端口发送指令。
+覆盖配置使用长格式 bind mount 和 create_host_path=false，缺失的宿主机路径不会被自动创建为空目录。
+运行时导出也重新检查 profile 可读、共享确为网络文件系统及可写，失败时不会向该目录写入轨迹。
+
+将这两个 HOST 变量保存到 /opt/phanthy-motus/.env 后，后续维护仍应使用同一组 -f 文件。
+平台重新部署驱动时只使用基础 service.yml，原生回放会恢复关闭状态；须重新提取新版覆盖文件并按上述命令启用。
+只设置 DOBOT_TEACH_CSV_PROFILE/DOBOT_TEACH_CONTROLLER_DIR 为宿主机路径不能启用回放。
+
+CSV 文件名由轨迹编号生成，不覆盖不同内容的已有控制器文件。
 控制器 IP、坐标系、原始文件校验值、原生文件起点不匹配时拒绝播放。
 
 本次新增代码仅使用标准库，requirements.txt 与 SDK pin 不变。Dockerfile 仅增加 Python 文件打包，

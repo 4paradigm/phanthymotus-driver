@@ -23,7 +23,8 @@ teach:
   data_dir: data/dobot-teach
   max_recording_s: 500
   max_gap_ms: 50
-  # Operator-mounted controller trajectory directory and sample-derived layout.
+  # Absolute container paths: existing writable CIFS/NFS trajectory share and
+  # readable sample-derived profile JSON. Deploy using native-teach.compose.yml.
   # No native CSV layout is assumed when these are empty.
   controller_directory: ""
   native_csv_profile: ""

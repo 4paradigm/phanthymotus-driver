@@ -411,3 +411,15 @@ def test_joint_move_holds_the_same_arm_and_teach_stop_reaches_it(rig):
     terminal(events, moved, status="cancelled")
     assert "StartDrag()" not in robot.commands
     assert plugin.control.ownership.owner is None
+
+
+def test_production_mount_guard_rejects_a_local_folder_before_any_dashboard_command(rig, monkeypatch):
+    plugin, robot, store, events = rig
+    record, _ = recording(store)
+    store.require_network_mount = True
+    monkeypatch.setattr("dobot.cra.native_mounts._mountinfo_text",
+                        lambda: "1 0 0:1 / / rw - ext4 /dev/root rw\n")
+    result = terminal(events, dispatch(plugin, "play", trajectory_id=record["trajectory_id"]), status="error")
+    assert "CIFS/NFS" in result["reason"]
+    assert not robot.commands
+    assert not list(store.controller_root.iterdir())

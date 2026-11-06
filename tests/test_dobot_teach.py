@@ -28,7 +28,9 @@ def recorded_store(tmp_path, native=True, shared=True):
         "header": [["SIMULATOR_ONLY_NOT_A_DOBOT_FORMAT"]],
         "columns": [f"joint{i}_deg" for i in range(1, 7)],
     }))
-    store = TrajectoryStore(root, str(controller) if shared else "", str(profile) if native else "")
+    # The loopback simulator uses a temporary local folder, never a real share.
+    store = TrajectoryStore(root, str(controller) if shared else "", str(profile) if native else "",
+                            require_network_mount=False)
     return store
 
 
