@@ -132,6 +132,11 @@ class R1DeviceBundle:
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, executor))
             print("[bundle] CameraPlugin loaded")
 
+        if plugins_cfg.get("pose_check", {}).get("enabled", False):
+            from pose_plugin import PoseCheckPlugin
+            self._plugins.append(PoseCheckPlugin(plugins_cfg["pose_check"], namespace, executor))
+            print("[bundle] PoseCheckPlugin loaded")
+
         if plugins_cfg.get("ext_mic", {}).get("enabled", False):
             from ext_devices import ExtMicPlugin
             self._plugins.append(ExtMicPlugin(plugins_cfg["ext_mic"], namespace, executor))
