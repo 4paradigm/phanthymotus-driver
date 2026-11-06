@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
 import sys
+import textwrap
 import types
 from pathlib import Path
 
@@ -237,3 +240,32 @@ def test_the_media_probe_does_not_depend_on_the_leg_controller(
 
     assert bundle_module._init_high_controller() is None
     assert bundle_module._init_media_controller() is media
+
+def test_main_calls_both_initialisers_unconditionally(bundle_module):
+    """The defect review round 2 reported lived at the call site, not inside the
+    function: `MediaController` init sat under `if high_ctrl is not None`, so an
+    unreachable leg controller skipped the media probe entirely. A test that
+    calls `_init_media_controller()` on its own passes against that shape — I
+    checked by re-nesting the call, and the whole suite stayed green — so it
+    cannot keep the regression out.
+
+    Assert the shape of `main` instead: both initialisers are plain statements of
+    the function body, in order. Nesting either one under a condition is what
+    makes the two subsystems depend on each other again.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(bundle_module.main)))
+
+    calls = {}
+    for statement in tree.body[0].body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        if not isinstance(statement.value, ast.Call):
+            continue
+        function = getattr(statement.value.func, "id", "")
+        if function in {"_init_high_controller", "_init_media_controller"}:
+            calls[getattr(statement.targets[0], "id", "")] = function
+
+    assert calls == {
+        "high_ctrl": "_init_high_controller",
+        "media_ctrl": "_init_media_controller",
+    }
