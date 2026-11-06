@@ -128,7 +128,7 @@ class RobotController:
                     self._update(card, last_request=None, last_error=None)
                 self.feedback.configure(address, port)
 
-    def _check_preparation_state(self, action):
+    def _check_preparation_state(self, action, *, allow_own_queue=False):
         """Validate preparation without requiring the final idle/protection state."""
         sample = self.feedback.snapshot()
         if not self.feedback.address:
@@ -141,13 +141,30 @@ class RobotController:
         resolve_model(sample, self.feedback.model_name)
         # ClearError must not interrupt active motion/drag or operate with released brakes.
         # Alarm/collision/approach flags are intentionally checked only after preparation.
-        if (state["robot_mode"] not in (4, 5, 9, 10, 11) or state["running_status"] or
+        allowed_modes = (4, 5, 7, 9, 10, 11) if allow_own_queue else (4, 5, 9, 10, 11)
+        if (state["robot_mode"] not in allowed_modes or state["running_status"] or
                 state["jog_status"] or state["drag_status"] or any(state["brake_released"])):
             raise RuntimeError("robot must be stationary with locked brakes before preparing motion")
         if action == "move_j" and state["robot_mode"] not in (9, 11) and (
-                state["pause_cmd_flag"] or state["run_queued_cmd"]):
+                state["pause_cmd_flag"] or (state["run_queued_cmd"] and not allow_own_queue)):
             raise RuntimeError("move_j requires an idle robot without a paused or running queue")
         return sample
+
+    def _wait_preparation_queue(self, action, check_state, queue_id, baseline):
+        deadline = time.monotonic() + self.enable_timeout
+        while True:
+            sample = check_state(action, allow_own_queue=True)
+            state = sample["data"]
+            fresh = baseline is None or sample.get("packets_received", baseline) > baseline
+            queue_seen = queue_id is None or state.get("current_command_id") == queue_id
+            if fresh and queue_seen and state["robot_mode"] != 7 and not state["run_queued_cmd"]:
+                return sample
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"preparation queue did not finish: submitted_id={queue_id}, "
+                    f"current_id={state.get('current_command_id')}, mode={state['robot_mode']}, "
+                    f"run_queued_cmd={state['run_queued_cmd']}, running_status={state['running_status']}")
+            time.sleep(0.02)
 
     def _check_motion_state(self, action):
         sample = self.feedback.snapshot()
@@ -187,6 +204,11 @@ class RobotController:
         if args.get("confirm_move") is not True:
             raise ValueError("confirm_move=true is required for each motion request")
         parameters, options, requested = (), {}, {}
+        if action in ("move_j", "resume"):
+            detect_collision = args.get("detect_collision", False)
+            if type(detect_collision) is not bool:
+                raise ValueError("detect_collision must be a boolean true or false")
+            requested["detect_collision"] = detect_collision
         if action == "move_j":
             angles = []
             for joint, (lower, upper) in zip(JOINT_NAMES, JOINT_LIMITS_DEG):
@@ -200,13 +222,13 @@ class RobotController:
                     raise ValueError(f"{key} must be an integer from 1 to 100 percent")
             parameters = (angles, CoordinateType.JOINT)
             options = {"v": args.get("velocity", 10), "a": args.get("acceleration", 10), "cp": 0}
-            requested = {f"{joint}_deg": angle for joint, angle in zip(JOINT_NAMES, angles)}
+            requested.update({f"{joint}_deg": angle for joint, angle in zip(JOINT_NAMES, angles)})
             requested.update(velocity=options["v"], acceleration=options["a"])
-        def check_state(current_action):
+        def check_state(current_action, *, allow_own_queue=False):
             if cancel is not None and cancel.is_set():
                 raise RuntimeError("motion interrupted")
             if current_action in ("move_j", "resume"):
-                return self._check_preparation_state(current_action)
+                return self._check_preparation_state(current_action, allow_own_queue=allow_own_queue)
             return self._check_motion_state(current_action)
         return self._execute(action, commands[action], check_state, card="joint_move",
                              parameters=parameters, options=options, requested=requested)
@@ -247,17 +269,29 @@ class RobotController:
                                 raise TimeoutError("EnableRobot acknowledged but enabled feedback was not confirmed")
                             time.sleep(0.02)
                 if card == "joint_move" and action in ("move_j", "resume"):
-                    skin_reply = self._api.EnableSafeSkin(0)
-                    parse_response(skin_reply, "EnableSafeSkin")
-                    request["safe_skin_disable_response"] = skin_reply
-                    check_state(action)
+                    baseline = check_state(action).get("packets_received")
+                    detect_collision = request["detect_collision"]
+                    skin_reply = self._api.EnableSafeSkin(int(detect_collision))
+                    skin_queue_id = parse_reply(skin_reply, "EnableSafeSkin")
+                    response_key = "safe_skin_enable_response" if detect_collision else "safe_skin_disable_response"
+                    request[response_key] = skin_reply
+                    self._wait_preparation_queue(action, check_state, skin_queue_id, baseline)
+                    if detect_collision:
+                        request["safe_skin_sensitivity_responses"] = []
+                        for part in (3, 4, 5, 6):
+                            baseline = check_state(action).get("packets_received")
+                            sensitivity_reply = self._api.SetSafeSkin(part, 1)
+                            skin_queue_id = parse_reply(sensitivity_reply, "SetSafeSkin")
+                            request["safe_skin_sensitivity_responses"].append(sensitivity_reply)
+                            self._wait_preparation_queue(action, check_state, skin_queue_id, baseline)
                 if command == "MovJ":
                     # Keep clear + state recheck + move serialized as one request.
                     # A failed/uncertain clear must never be followed by motion.
+                    baseline = check_state(action).get("packets_received")
                     clear_reply = self._api.ClearError()
                     parse_response(clear_reply, "ClearError")
                     request["clear_error_response"] = clear_reply
-                    check_state(action)
+                    self._wait_preparation_queue(action, check_state, skin_queue_id, baseline)
                 if action in ("move_j", "resume"):
                     # ACKs can precede the feedback packet reporting the effect.
                     # Wait for final motion conditions only after all preparation.

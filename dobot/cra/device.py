@@ -64,11 +64,11 @@ class DobotSensors:
         angle_fields = [f"{joint}_deg" for joint in JOINT_NAMES]
         motion_schema = action_schema({
             "info": ([], "查看关节运动卡功能、参数和单位说明，不读取运行状态"),
-            "move_j": ([*angle_fields, "velocity", "acceleration", "confirm_move"],
-                       "参数/连接检查后先 ClearError，再检查使能，未使能则 EnableRobot 并等待确认，再 EnableSafeSkin(0)、ClearError，最后执行绝对关节运动（度）；六个角度必填，速度/加速度留空为 10%"),
+            "move_j": ([*angle_fields, "velocity", "acceleration", "detect_collision", "confirm_move"],
+                       "参数/连接检查后先 ClearError，再检查使能，未使能则 EnableRobot 并等待确认，再按 detect_collision 设置安全皮肤、ClearError，最后执行绝对关节运动（度）；六个角度必填，速度/加速度留空为 10%"),
             "stop_motion": (["confirm_move"], "停止控制器运动队列/工程，包括点动；不下使能"),
             "pause": (["confirm_move"], "暂停当前运动队列/工程；不支持点动暂停"),
-            "resume": (["confirm_move"], "先 ClearError，再检查使能，未使能则 EnableRobot 并等待确认，再 EnableSafeSkin(0)，成功后继续暂停队列"),
+            "resume": (["detect_collision", "confirm_move"], "先 ClearError，再检查使能，未使能则 EnableRobot 并等待确认，再按 detect_collision 设置安全皮肤，成功后继续暂停队列"),
             "start": ([], "启动反馈读取，不发送运动指令"),
             "stop": ([], "关闭共享命令连接，不发送停止运动指令"),
             "config": ([], "确认卡片配置；本卡与 joints 共用 IP/端口配置"),
@@ -80,10 +80,9 @@ class DobotSensors:
                          "description": "本条运动速度比例 1–100%，留空为 10%；实际速度还受全局速率影响"},
             "acceleration": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10,
                              "description": "本条运动加速度比例 1–100%，留空为 10%"},
-            "confirm_move": {"type": "boolean", "enum": [False, True], "default": False,
-                             "oneOf": [{"const": False, "title": "未确认（不执行）"},
-                                       {"const": True, "title": "确认执行本次运动操作"}],
-                             "description": "本卡每次运动控制操作都需明确确认"},
+            "detect_collision": {"type": "boolean", "default": False,
+                                 "description": "是否启用安全皮肤接近检测：true 开启并将小臂、J4、J5、J6 设为 low；false 关闭安全皮肤（默认）。不修改本体碰撞检测等级"},
+            "confirm_move": {"type": "boolean", "description": "必须手动输入 true，确认本次运动操作"},
         })
         motion_schema["x-completion"] = {"actions": ["move_j", "resume", "pause", "stop_motion"], "timeout": self.completion.contract_timeout}
         motion_schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop_motion", "params": {"confirm_move": True}}}

@@ -26,13 +26,14 @@
 | `joint4_deg`、`joint5_deg`、`joint6_deg` | 绝对角度，[-360, 360] 度 | 无，必填 |
 | `velocity` | 本条运动速度比例，整数 1–100% | 10 |
 | `acceleration` | 本条运动加速度比例，整数 1–100% | 10 |
-| `confirm_move` | 下拉选择是否确认本次操作 | false |
+| `detect_collision` | true 开启安全皮肤并设为 low；false 关闭 | false |
+| `confirm_move` | 手动输入布尔值 true 确认本次操作 | 无 |
 
 角度无隐式零值，不进行角度绕回或超限截断。初版只支持反馈识别为 CR3A（型号码 113）的设备，
 角度范围依据《Dobot CRA 系列硬件使用手册》V3.2 附录 A 的 CR3A 参数。
 这些是型号活动范围的输入校验，不能替代控制器中更严格的关节限制或现场避障检查。
 
-所有四个运动 action 都需要布尔值 `confirm_move=true`；六轴角度和速率仅对 `move_j` 生效。
+参照 RM75 的确认参数形式，不提供下拉枚举或自动确认默认值。所有四个运动 action 都需要手动输入布尔值 `confirm_move=true`；六轴角度和速率仅对 `move_j` 生效。
 速度、加速度直接映射到 SDK 的 `v/a`，不是固定的度/秒或度/秒²。实际速度还受全局速率影响。
 固定发送 `cp=0`，不开放平滑过渡参数。
 
@@ -51,6 +52,7 @@
     "joint6_deg": -10,
     "velocity": 10,
     "acceleration": 10,
+    "detect_collision": false,
     "confirm_move": true
   }
 }
@@ -67,9 +69,9 @@ MovJ(joint={10.000000,-30.000000,60.000000,0.000000,90.000000,-10.000000},a=10,v
 - 复用 `joints` 中配置的 IP 和反馈端口；本卡也提供相同共享配置，不依赖 joints 卡片启动。
 - 准备阶段要求反馈有效、型号匹配、机器人静止且非拖拽/松抱闸。模式 9/11 和报警、碰撞、
   皮肤接近暂停标志不再提前阻止准备命令。
-- `move_j`：先 ClearError，再必要时使能并等待确认 → 关闭安全皮肤 → 清错 → 等待反馈确认已使能、
+- `move_j`：先 ClearError，再必要时使能并等待确认 → 按 detect_collision 配置安全皮肤 → 清错 → 等待反馈确认已使能、
   模式 5 且无保护触发 → MovJ。已有暂停队列不会被当作新的 move_j 执行。
-- `resume`：先 ClearError，再必要时使能并等待确认 → 关闭安全皮肤 → 确认已使能、模式 10 且无保护触发
+- `resume`：先 ClearError，再必要时使能并等待确认 → 按 detect_collision 配置安全皮肤 → 确认已使能、模式 10 且无保护触发
   → Continue；不额外清错。
 - `stop_motion` 在反馈失效时仍可尝试发送，但必须已经配置控制器 IP。
 - `info` 只介绍功能，`start/config/stop` 为内部生命周期，不发送物理运动指令。
@@ -104,20 +106,25 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/dobot-build-fix-venv/bin/python -m pytest 
 
 ## 运动前清错
 
-每次 `move_j` 都在同一命令锁内执行 `ClearError()` → 检查成功应答 → 检查使能 → 必要时 EnableRobot 并等待反馈确认 → `EnableSafeSkin(0)` → 检查成功应答 → `ClearError()` → 检查成功应答 → 复查反馈状态 → `MovJ()`。
+每次 `move_j` 都在同一命令锁内执行 `ClearError()` → 检查成功应答 → 检查使能 → 必要时 EnableRobot 并等待反馈确认 → 配置安全皮肤 → 检查成功应答 → `ClearError()` → 检查成功应答 → 复查反馈状态 → `MovJ()`。
 清错拒绝、应答异常或超时均中止本次运动，不自动重试。内部请求记录中的 `clear_error_response`
 记录成功清错的应答。此应答不代表物理故障已消除。
 最终运动检查保留：准备完成后若仍存在碰撞、保护触发或报警，则拒绝运动。
 `resume` 只执行 enable 检查前的清错，不在关闭皮肤后再次清错；`pause` 和 `stop_motion` 不清错。
 
-## 运动前关闭安全皮肤
+## 运动前安全皮肤设置
 
-每次有效的 `move_j` 和 `resume` 请求均在确认使能后发送 `EnableSafeSkin(0)`，包括复用连接时。
-收到成功应答后重新检查运动条件；拒绝、无效应答或超时均中止，不自动重试。
-`move_j` 随后执行清错和 MovJ；`resume` 随后执行 Continue，不额外清错。
-内部请求的应答记录在 `safe_skin_disable_response`，不宣称已通过状态读回验证关闭效果。
+move_j 和 resume 提供布尔参数 detect_collision，默认 false：
+
+- false：发送 EnableSafeSkin(0)，关闭安全皮肤。
+- true：发送 EnableSafeSkin(1)，然后对小臂、J4、J5、J6 分别发送 SetSafeSkin(3,1)、
+  SetSafeSkin(4,1)、SetSafeSkin(5,1)、SetSafeSkin(6,1)，灵敏度设为 low。
+
+每条设置指令都检查应答并等待对应队列完成，失败或超时即中止，不自动重试。
+本参数只控制安全皮肤，不修改机械臂本体的碰撞检测等级。
+move_j 完成皮肤设置后再清错、最终检查并运动；resume 设置后最终检查并继续。
 已有碰撞、皮肤暂停或报警允许进入准备步骤，但未消除时会阻止最终运动。
-停止和暂停不关闭安全皮肤，卡片不自动重新开启安全皮肤。
+停止和暂停不修改安全皮肤设置；info 仅介绍功能，不提供设置状态读回。
 
 ## 自动使能
 
@@ -139,3 +146,7 @@ TLS 不关闭校验，完成通知最多尝试三次，每次使用同一个 act
 运动确认最长 joint_move.motion_timeout_s 秒（默认 300）；x-completion 的 timeout 另计准备与通信余量。
 
 enable 检查前的清错应答保存在内部 pre_enable_clear_error_response；该步骤失败时不发送 EnableRobot、皮肤设置或运动命令。
+
+安全皮肤开关及灵敏度设置都是队列指令：收到成功应答后等待新反馈确认对应队列 ID 已执行且队列不再运行。
+此等待阶段允许本次准备指令导致的模式 7，但不允许实际运行、点动、拖拽或松抱闸。
+清错后再次等待队列稳定，最后仍要求模式 5/10；等待超时记录队列 ID、模式及运行标志。

@@ -29,7 +29,7 @@ class MotionCompletion:
         self.last_completion = None
         self._notify = notify
         # Includes preparation, each bounded SDK request, and callback delivery.
-        self.contract_timeout = self.timeout + 2 * control.enable_timeout + 6 * control.receive_timeout + control.connect_timeout + 30
+        self.contract_timeout = self.timeout + 8 * control.enable_timeout + 10 * control.receive_timeout + control.connect_timeout + 30
 
     @staticmethod
     def _callback_context():

@@ -73,11 +73,10 @@ SHA-256, update requirements and this file plus `SDK_COMMIT`, and run the
 protocol and MCP tests before building a new ARM64 image.
 
 Joint motion uses SDK MovJ with joint coordinates and per-command v/a, cp=0.
-After confirming enabled feedback, move_j sends EnableSafeSkin(0), then ClearError; resume sends
-EnableSafeSkin(0) before Continue. All acknowledgements are checked, with no
-automatic retry or skin re-enable. Successful replies are not verified state readback.
+After confirming enabled feedback, move_j configures skin, then ClearError; resume configures skin before Continue. All acknowledgements are checked, with no
+automatic command retry. Successful replies are not verified state readback.
 
-Before disabling skin or sending MovJ/Continue, disabled feedback triggers exactly one EnableRobot()
+Before configuring skin or sending MovJ/Continue, disabled feedback triggers exactly one EnableRobot()
 without load arguments. Motion waits for enabled feedback (default timeout 5s);
 ACK alone is insufficient. Resume must still be paused after enabling.
 
@@ -104,4 +103,9 @@ but cannot report verified completion without fresh stationary feedback.
 
 Every move_j/resume first sends and validates ClearError before checking enable.
 Failure aborts all later commands. move_j retains the second ClearError after
-disabling skin; resume does not add a second clear after disabling skin.
+disabling skin; resume does not add a second clear after configuring skin.
+
+The boolean detect_collision parameter defaults to false: send EnableSafeSkin(0).
+When true, send EnableSafeSkin(1), then SetSafeSkin(part,1) for parts 3,4,5,6.
+Every setting ACK and queue completion is checked. This option controls skin
+proximity protection only; it does not change force-based collision sensitivity.

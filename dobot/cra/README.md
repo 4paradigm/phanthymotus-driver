@@ -112,9 +112,10 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra
 
 joint_move 与 joints 共用底层反馈服务和连接配置，均可独立启动。
 move_j/resume 先 ClearError，再检查使能，未使能时发送一次 EnableRobot 并等待反馈确认。
-然后发送 EnableSafeSkin(0)；move_j 再发送 ClearError 和 MovJ，resume 发送 Continue。
+然后按 detect_collision 配置安全皮肤：默认 false 关闭；true 开启并将四个区域设为 low。
+move_j 再发送 ClearError 和 MovJ，resume 发送 Continue。
 失败不继续也不重试。
-不自动重新 enable 安全皮肤。模式 11 等保护状态不会提前阻止准备命令；
+皮肤设置由 detect_collision 显式选择。模式 11 等保护状态不会提前阻止准备命令；
 仅在准备完成后确认模式 5（move_j）或模式 10（resume）、已使能且无保护触发，才发送最终运动命令。
 
 四个运动 action 均返回 action_id，通过 ACP 完成回调报告真实终态；命令应答不等于运动完成。

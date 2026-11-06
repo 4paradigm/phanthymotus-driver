@@ -726,3 +726,159 @@ def test_post_skin_clear_failure_still_blocks_move(failure):
         move(control)
     assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)', 'ClearError()']
     assert dashboard.closed
+
+
+def test_confirmation_uses_plain_boolean_schema_like_rm75():
+    plugin = DobotSensors({})
+    schema = next(t for t in plugin.get_tools() if t['name'] == 'joint_move')['inputSchema']
+    confirm = schema['properties']['confirm_move']
+    assert confirm['type'] == 'boolean'
+    assert not {'enum', 'oneOf', 'default'} & confirm.keys()
+    for action in ('move_j', 'resume', 'pause', 'stop_motion'):
+        assert 'confirm_move' in schema['x-action-params'][action]['params']
+
+
+@pytest.mark.parametrize('action', ['move_j', 'resume'])
+def test_own_setting_queue_mode7_is_waited_out_before_next_command(action):
+    feedback, dashboard, control, _ = ready()
+    final_mode = 5 if action == 'move_j' else 10
+    set_mode(feedback, final_mode)
+    control.enable_timeout = 0.2
+    original_send, original_snapshot = dashboard.send_receive_text, feedback.snapshot
+    pending = [None]
+    polls = [0]
+    packets = [10]
+    completed_phases = []
+    def send(command):
+        if command == 'EnableSafeSkin(0)':
+            dashboard.commands.append(command)
+            pending[0], polls[0] = 'skin', 0
+            set_mode(feedback, 7)
+            feedback.sample['data'].update(running_status=0, run_queued_cmd=1, current_command_id=16)
+            return '0,{17},EnableSafeSkin(0);'
+        if command == 'ClearError()' and 'EnableSafeSkin(0)' in dashboard.commands:
+            assert 'skin' in completed_phases
+            pending[0], polls[0] = 'post_clear', 0
+            set_mode(feedback, 7)
+            feedback.sample['data'].update(running_status=0, run_queued_cmd=1)
+        if command.startswith('MovJ(') or command == 'Continue()':
+            assert pending[0] is None
+            assert 'skin' in completed_phases
+            if action == 'move_j': assert 'post_clear' in completed_phases
+        return original_send(command)
+    def snapshot():
+        packets[0] += 1
+        if pending[0]:
+            polls[0] += 1
+            if polls[0] >= 3:
+                completed_phases.append(pending[0])
+                pending[0] = None
+                set_mode(feedback, final_mode)
+                feedback.sample['data'].update(run_queued_cmd=0, current_command_id=17)
+        return {**original_snapshot(), 'packets_received': packets[0]}
+    dashboard.send_receive_text, feedback.snapshot = send, snapshot
+    try:
+        control.execute_motion(action, {**TARGET, 'confirm_move': True})
+        assert dashboard.commands[-1] == (MOVJ if action == 'move_j' else 'Continue()')
+    finally:
+        control.close()
+
+
+@pytest.mark.parametrize('failure', ['stuck_mode7', 'wrong_queue_id', 'no_new_packet', 'actual_running', 'feedback_lost'])
+def test_setting_queue_wait_never_bypasses_invalid_or_unconfirmed_state(failure):
+    feedback, dashboard, control, _ = ready()
+    original_send, original_snapshot = dashboard.send_receive_text, feedback.snapshot
+    def send(command):
+        if command == 'EnableSafeSkin(0)':
+            dashboard.commands.append(command)
+            if failure == 'stuck_mode7':
+                set_mode(feedback, 7)
+                feedback.sample['data'].update(running_status=0, run_queued_cmd=1)
+            if failure == 'actual_running':
+                set_mode(feedback, 7)
+            if failure == 'feedback_lost':
+                feedback.sample['stale'] = True
+            feedback.sample['data']['current_command_id'] = 99 if failure == 'wrong_queue_id' else 17
+            return '0,{17},EnableSafeSkin(0);'
+        return original_send(command)
+    count = [10]
+    def snapshot():
+        if failure != 'no_new_packet': count[0] += 1
+        return {**original_snapshot(), 'packets_received': count[0]}
+    dashboard.send_receive_text, feedback.snapshot = send, snapshot
+    with pytest.raises((RuntimeError, TimeoutError)):
+        move(control)
+    assert dashboard.commands == ['ClearError()', 'EnableSafeSkin(0)']
+    assert dashboard.closed
+
+
+def test_initial_mode7_is_not_treated_as_our_own_preparation_queue():
+    feedback, dashboard, control, calls = ready()
+    set_mode(feedback, 7)
+    feedback.sample['data'].update(running_status=0, run_queued_cmd=1)
+    with pytest.raises(RuntimeError):
+        move(control)
+    assert not calls and not dashboard.commands
+
+
+@pytest.mark.parametrize('action,mode', [('move_j', 5), ('resume', 10)])
+@pytest.mark.parametrize('setting', [None, False, True])
+def test_collision_option_controls_skin_and_all_four_low_thresholds(action, mode, setting):
+    feedback, dashboard, control, _ = ready()
+    set_mode(feedback, mode)
+    original = dashboard.send_receive_text
+    def send(command):
+        if command == 'EnableSafeSkin(1)' or command.startswith('SetSafeSkin('):
+            dashboard.commands.append(command)
+            return f'0,{{}},{command};'
+        return original(command)
+    dashboard.send_receive_text = send
+    args = {**TARGET, 'confirm_move': True}
+    if setting is not None:
+        args['detect_collision'] = setting
+    try:
+        result = control.execute_motion(action, args)
+        skin_commands = ['EnableSafeSkin(1)'] + [f'SetSafeSkin({part},1)' for part in (3, 4, 5, 6)] if setting is True else ['EnableSafeSkin(0)']
+        expected = ['ClearError()'] + skin_commands + (['ClearError()', MOVJ] if action == 'move_j' else ['Continue()'])
+        assert dashboard.commands == expected
+        assert result['detect_collision'] is (setting is True)
+        if setting is True:
+            assert len(result['safe_skin_sensitivity_responses']) == 4
+    finally:
+        control.close()
+
+
+@pytest.mark.parametrize('action', ['move_j', 'resume'])
+@pytest.mark.parametrize('bad', [None, 0, 1, 'true', 'false'])
+def test_collision_option_requires_boolean_before_sending_any_command(action, bad):
+    _, dashboard, control, calls = ready()
+    with pytest.raises(ValueError, match='detect_collision'):
+        control.execute_motion(action, {**TARGET, 'confirm_move': True, 'detect_collision': bad})
+    assert not calls and not dashboard.commands
+
+
+@pytest.mark.parametrize('part', [3, 4, 5, 6])
+def test_low_sensitivity_failure_blocks_motion(part):
+    _, dashboard, control, _ = ready()
+    original = dashboard.send_receive_text
+    def send(command):
+        if command == 'EnableSafeSkin(1)' or command.startswith('SetSafeSkin('):
+            dashboard.commands.append(command)
+            return f'{-1 if command == f"SetSafeSkin({part},1)" else 0},{{}},{command};'
+        return original(command)
+    dashboard.send_receive_text = send
+    with pytest.raises(CommandRejected):
+        move(control, detect_collision=True)
+    assert dashboard.commands[-1] == f'SetSafeSkin({part},1)'
+    assert MOVJ not in dashboard.commands and dashboard.closed
+
+
+def test_collision_option_schema_defaults_false_and_confirmation_stays_manual():
+    plugin = DobotSensors({})
+    schema = next(t for t in plugin.get_tools() if t['name'] == 'joint_move')['inputSchema']
+    assert schema['properties']['detect_collision']['type'] == 'boolean'
+    assert schema['properties']['detect_collision']['default'] is False
+    for action in ('move_j', 'resume'):
+        assert 'detect_collision' in schema['x-action-params'][action]['params']
+    assert 'default' not in schema['properties']['confirm_move']
+    assert 'enum' not in schema['properties']['confirm_move']
