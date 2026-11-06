@@ -784,6 +784,45 @@ class ConcurrentStopTests(GuardTestCase):
         self.assertTrue(second.active)
         self.assertEqual(second.close_calls, 0)
 
+    def test_superseded_shutdown_cannot_finalize_newer_shutdown(self):
+        for fail_first_close in (False, True):
+            with self.subTest(fail_first_close=fail_first_close):
+                runtime = BlockingCloseRuntime()
+                runtime.close_failures = int(fail_first_close)
+                card, _, _ = self.card(factory=RuntimeFactory(lambda: runtime))
+                self.start_card(card)
+                run_id = card.info()["run_id"]
+                lock = GatedLifecycleLock("new-shutdown")
+                card._lifecycle_lock = lock
+                entered, resume = lock.gates["new-shutdown"]
+                threads = []
+                self.addCleanup(self.release_and_finish,
+                                [runtime.close_release, resume], threads)
+
+                old = self.launch("old-shutdown", card.shutdown, threads)
+                self.assertTrue(runtime.close_entered.wait(1))
+                new = self.launch("new-shutdown", card.shutdown, threads)
+                self.assertTrue(entered.wait(1))
+                runtime.close_release.set()
+                self.assertEqual(self.finish(old)["state"], "stopping")
+
+                # The newer shutdown still owns finalization, including when
+                # the older close failed and its resource must be retried.
+                pending = card.info()
+                self.assertEqual(pending["state"], "stopping")
+                self.assertEqual(pending["run_id"], run_id)
+                self.assertTrue(pending["shutdown"])
+                self.assertIsNone(pending["error"])
+                self.assertEqual(pending["resources_pending"], fail_first_close)
+                self.assertEqual(runtime.close_calls, 1)
+
+                resume.set()
+                self.assertEqual(self.finish(new)["state"], "idle")
+                self.assertEqual(runtime.close_calls, 1 + int(fail_first_close))
+                self.assertFalse(runtime.active)
+                self.assertIsNone(card.info()["run_id"])
+                self.assertFalse(card.info()["resources_pending"])
+
     def test_two_stops_cancel_slow_start_and_release_partial_runtime_only_once(self):
         runtime = SlowRuntime()
         card, factory, _ = self.card(factory=RuntimeFactory(lambda: runtime))
@@ -1159,6 +1198,9 @@ class StrictRunIdentityTests(GuardTestCase):
             thread.join(2)
         self.assertFalse(thread.is_alive())
         self.assertEqual(results[0]["code"], "CLEANUP_FAILED")
+        self.assertEqual(card.info()["state"], "error")
+        self.assertEqual(card.info()["error"], results[0]["error"])
+        self.assertTrue(card.info()["resources_pending"])
         self.assertEqual(card.info()["run_id"], run_id)
         self.assertEqual(card.shutdown()["state"], "idle")
         self.assertEqual(card.shutdown()["state"], "idle")

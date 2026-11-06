@@ -501,6 +501,10 @@ class ImageQualityGuardPlugin:
                 runtime = self._runtime
             error = self._release(runtime) if runtime is not None else None
             with self._lock:
+                if token != self._generation:
+                    return self._info_locked()
+                if error:
+                    self._state, self._last_error = "error", error
                     return self._failure("CLEANUP_FAILED", error)
                 if self._run_id is not None:
                     self._history[self._run_id]["state"] = "closed"
