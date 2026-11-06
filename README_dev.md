@@ -1681,6 +1681,57 @@ correct until a robot accelerates like it was kicked.
 `max_velocity` is optional in `parse_descriptor`, so omitting it is the correct
 action, not a workaround.
 
+`max_delta_per_step` is a bound on the change in **one accepted command**;
+`ControlSink` does not multiply it by elapsed time. To configure a nominal
+acceleration in SI units, declare `acceleration / expected_hz` per active axis
+(e.g. 0.3 m/s² at 10 Hz becomes a 0.03 m/s step). This matches the nominal
+cadence, not a strict wall-clock acceleration guarantee under a different frame
+rate. Keep this limit in the descriptor and let the shared sink clamp it; do
+not implement another ramp inside the driver's SDK callback.
+
+A velocity base may explicitly declare `limits.zero_immediate: true` to treat
+an exact zero on any twist axis as an immediate stop on that axis, bypassing
+only the step clamp. This opt-in is valid only for `twist`; other modes and
+omitted/false declarations keep the ordinary clamp. Freshness, ordering,
+arbitration and all other checks still apply to zero commands.
+
+### `response` — optional, driver-owned closed-loop response
+
+Limits say what a robot accepts; response says what its measured motion does
+after an accepted command. A planner may use that distinction to choose a
+stable gain, but the numbers belong in the driver descriptor rather than in a
+robot-name table in the planner:
+
+```python
+"response": {
+    "wz": {
+        "gain": measured_steady_wz / commanded_wz,
+        "delay_s": measured_onset_delay_s,
+        "settling_s": measured_settling_s,
+        "source": "measured",
+    },
+},
+```
+
+The block and each axis are optional and currently apply only to a `twist`
+descriptor. An axis key must occur in `joint_names`; `gain` must be positive,
+delay/settling non-negative, and all three numbers finite. `source` is required
+when an axis is declared and is one of `measured`, `vendor-spec`, or
+`estimate`. Do not copy a value from another robot of the same model and label
+it measured. If no traceable value exists, omit the response block and let the
+consumer use its documented fallback. Response metadata is descriptive: it is
+not a card configuration knob and does not change `ControlSink` checks or the
+driver's SDK command.
+
+When an external stop has changed the actual velocity, call
+`ControlSink.rebase(actual_values)` to synchronize its step baseline. This does
+not count as a command or renew the watchdog, and does not clear source,
+sequence or priority state. Seed a zero baseline before the first frame if
+startup must also be step-limited. For compatible live limit changes, use
+`reconfigure(descriptor)` to preserve admission and arbitration state rather
+than calling `reset()`.
+
+
 **Give an unactuatable axis `lower == upper == 0`, do not omit it.** A ground
 base has no `vz`, `wx` or `wy`, and the vector is six wide regardless. Pinning
 them to zero makes the sink **reject** a policy that puts anything there;
@@ -2013,8 +2064,17 @@ existing `info()` path carries it with no changes.
 # info()
 {"odom_interface": {"schema": "motus.odom/1", "frame": "body",
                     "provides": ["vx", "vy", "wz"],
-                    "rate_hz": 10, "pose_drift": "unbounded"}}
+                    "rate_hz": 10, "pose_drift": "unbounded",
+                    "timing": {"stamp_source": "received"}}}
 ```
+
+`timing` is optional, so declarations produced before it existed remain valid.
+When present, `stamp_source` is required: `robot` means the sample carries a
+usable robot measurement clock; `received` means the host stamped the received
+sample. `max_measurement_delay_ms` may be added only when that delay has a
+defensible upper bound. Do not substitute a socket/HTTP timeout: a timeout is
+how long a failed request may block, not how old a successful measurement is.
+An unknown delay is represented by omitting the field.
 
 ```python
 # one message on the topic
@@ -2048,6 +2108,7 @@ state card.
    self._odom_interface = build_interface(
        provides=["vx", "vy", "wz"],      # ONLY the axes you actually measure
        rate_hz=10, pose_drift="unbounded",
+       timing={"stamp_source": "received"},  # REST reply has no robot stamp
    )
    ```
 
@@ -2213,6 +2274,8 @@ cannot push a stalled robot over navi's "below 20% of commanded" stuck threshold
       publishing one reading out of every N
 - [ ] vendor-specific fields are under `vendor`, not at the top level
 - [ ] `pose_drift` is honest; `unbounded` unless there is a correction source
+- [ ] `timing.stamp_source` states `robot` or `received` when known; unknown
+      measurement delay is omitted rather than copied from an I/O timeout
 - [ ] a unit test calls `parse_interface()` on your declaration
 
 ## Camera Parameters (`camera_info`)
@@ -2360,3 +2423,4 @@ Checklist before you call it done:
 - [ ] the spec module is listed in the bundle's Dockerfile `COPY` lines
       (`tests/test_dockerfile_copies.py` checks this)
 - [ ] a unit test calls `parse()` on every declaration the driver can emit
+
