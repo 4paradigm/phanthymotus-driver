@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from common.vendor_runtime import action_schema, jsonable, tool
+from system_health import SystemHealthPlugin, observation
 
 
 SERVICE_TIMEOUT = 10.0
@@ -1411,6 +1412,8 @@ class AudioPlugin:
         self.running = False
         self._lock = threading.Lock()
         self._active: dict | None = None
+        self._last_health_error = None
+        self._last_playback_at = None
         self.nodes.add_playback_listener(self._on_playback_state)
 
     def get_tool(self):
@@ -1431,7 +1434,8 @@ class AudioPlugin:
         return tool(self.PREFIX, "actuator", "U1 Pro 文本转语音输出。提交文本即可播报；本卡不提供预设动作或原始音频播放。", schema)
 
     def start(self):
-        self.running = True
+        with self._lock:
+            self.running = True
         return {"state": "ready"}
 
     def stop(self):
@@ -1444,9 +1448,12 @@ class AudioPlugin:
                 result["interrupt"] = self.nodes.trigger_call("interrupt")
             except Exception as exc:
                 result["interrupt_error"] = str(exc)
+                with self._lock:
+                    self._last_health_error = {"message": str(exc)[:256], "sampled_at": time.time()}
             finally:
                 _acp_notify(active["action_id"], "cancelled", {"state": "cancelled", "action_id": active["action_id"]}, active["tool_name"])
-        self.running = False
+        with self._lock:
+            self.running = False
         return result
 
     def _queue(self, kind: str, payload: dict, action_id: str, tool_name: str = "audio") -> dict:
@@ -1456,11 +1463,13 @@ class AudioPlugin:
             vendor_uuid = str(uuid.uuid4())
             vendor_payload = dict(payload)
             vendor_payload["uuid"] = vendor_uuid
-            self._active = {"action_id": action_id, "vendor_uuid": vendor_uuid, "kind": kind, "tool_name": tool_name}
+            self._active = {"action_id": action_id, "vendor_uuid": vendor_uuid, "kind": kind, "tool_name": tool_name, "queued_at": time.time(),
+                            "queued_monotonic": time.monotonic()}
         try:
             result = self.nodes.string_call(kind, vendor_payload)
         except Exception as exc:
             with self._lock:
+                self._last_health_error = {"message": str(exc)[:256], "sampled_at": time.time()}
                 if self._active and self._active["action_id"] == action_id:
                     self._active = None
             _acp_notify(action_id, "error", {"state": "error", "message": str(exc)}, tool_name)
@@ -1473,6 +1482,8 @@ class AudioPlugin:
                 if self._active and self._active["action_id"] == action_id:
                     self._active = None
             message = str(result.get("message") or result.get("error") or "vendor rejected the request")
+            with self._lock:
+                self._last_health_error = {"message": message[:256], "sampled_at": time.time()}
             error = {"state": "error", "message": message[:512], "action_id": action_id}
             _acp_notify(action_id, "error", error, tool_name)
             raise RuntimeError(message)
@@ -1485,6 +1496,8 @@ class AudioPlugin:
 
     def _on_playback_state(self, event: dict) -> None:
         data = _event_data(event)
+        with self._lock:
+            self._last_playback_at = time.time()
         if data.get("phase") != "result":
             return
         event_uuid = data.get("uuid")
@@ -1497,7 +1510,38 @@ class AudioPlugin:
         failed = state_name == "FAILED" or data.get("success") is False
         success = not failed and (data.get("success") is True or state_name == "COMPLETED")
         status = "completed" if success else "error"
+        if not success:
+            with self._lock:
+                self._last_health_error = {"message": "matched playback result: " + state_name[:128],
+                                           "sampled_at": time.time()}
         _acp_notify(active["action_id"], status, {"state": state_name.lower() or status, "action_id": active["action_id"], "playback": _bounded_playback(data)}, active["tool_name"])
+
+    def health_snapshot(self, config):
+        with self._lock:
+            active = dict(self._active) if self._active else None
+            error = dict(self._last_health_error) if self._last_health_error else None
+            last_event = self._last_playback_at
+            running = self.running
+        age = None
+        if active:
+            queued = active.pop("queued_monotonic", None)
+            age = time.monotonic() - queued if queued is not None else None
+        status, reasons = "ok", []
+        if active and age is None:
+            status, reasons = "unknown", ["active task sampling time unavailable"]
+        elif active and age >= config["playback_stale_seconds"]:
+            status, reasons = "stale", ["active task has no matched completion within configured observation window"]
+        elif not active and not running:
+            status, reasons = "not_started", ["TTS card is not started; no local playback task"]
+        if error:
+            reasons.append("recent playback error retained in driver")
+            if status != "stale":
+                status = "error"
+        return observation(status, "AudioPlugin shared TTS/expression/head queue", "driver",
+                           {"running": running, "active": active, "task_age_seconds": age,
+                            "last_playback_event_at": last_event, "recent_error": error,
+                            "coverage": "driver-managed tasks only; firmware autonomous playback unknown"},
+                           reasons, time.time())
 
     def dispatch(self, action, args):
         if action == "start":
@@ -1561,21 +1605,71 @@ class EyeCameraPlugin:
         self.PREFIX = f"camera_{eye}"
         self.source_topic = f"/sensor/camera/{eye}_eye/color/raw"
         self.topic = f"/{nodes.namespace}/camera/{eye}"
+        self._frame_condition = threading.Condition()
         self.running = False
         self._publisher = None
         self._metadata = {}
         self._frame_ready = threading.Event()
-        self._frame_condition = threading.Condition()
         self._latest_jpeg = None
         self._frame_sequence = 0
         self._frames = 0
         self._last_error = ""
+        self._recent_health_error = None
+        self._last_frame_at = None
+        self._last_frame_monotonic = None
         self._reader = None
         self._subscription = None
         self._video_open = False
         self._frame_queue = queue.Queue(maxsize=1)
         self._frame_worker = None
         self._frame_worker_stop = threading.Event()
+
+    @property
+    def running(self):
+        with self._frame_condition:
+            return self._running
+
+    @running.setter
+    def running(self, value):
+        with self._frame_condition:
+            self._running = value
+            if not value:
+                self._last_frame_monotonic = None
+
+    @property
+    def _last_error(self):
+        with self._frame_condition:
+            return self._health_current_error
+
+    @_last_error.setter
+    def _last_error(self, value):
+        with self._frame_condition:
+            self._health_current_error = value
+            if value:
+                self._recent_health_error = {"message": value[:256], "sampled_at": time.time()}
+
+    def health_snapshot(self, config):
+        with self._frame_condition:
+            now = time.monotonic()
+            # A previous session's frame cannot establish freshness after restart.
+            last = self._last_frame_monotonic
+            age = now - last if last is not None else None
+            error = self._health_current_error or getattr(self._reader, "_error", "")
+            if error:
+                status, reasons = "error", [error[:256]]
+            elif not self._running:
+                status, reasons = "not_started", ["camera not started; health query will not start it"]
+            elif age is None:
+                status, reasons = "stale", ["no valid frame received in this camera session"]
+            elif age >= config["frame_stale_seconds"]:
+                status, reasons = "stale", ["last valid frame exceeds freshness policy"]
+            else:
+                status, reasons = "ok", []
+            return observation(status, "EyeCameraPlugin:" + self.source_topic, "driver",
+                               {"running": self._running, "frames_published": self._frames,
+                                "last_frame_at": self._last_frame_at, "frame_age_seconds": age,
+                                "recent_error": dict(self._recent_health_error) if self._recent_health_error else None},
+                               reasons, time.time())
 
     def get_tool(self):
         return tool(
@@ -1588,6 +1682,8 @@ class EyeCameraPlugin:
     def start(self):
         if self.running:
             return self._state()
+        with self._frame_condition:
+            self._last_frame_monotonic = None
         self._frame_ready.clear()
         self._frame_worker_stop.clear()
         self._frame_worker = threading.Thread(target=self._process_frames, daemon=True,
@@ -1751,6 +1847,8 @@ class EyeCameraPlugin:
                 self._latest_jpeg = jpeg
                 self._frame_sequence += 1
                 self._frames += 1
+                self._last_frame_at = time.time()
+                self._last_frame_monotonic = time.monotonic()
                 self._frame_condition.notify_all()
             self._frame_ready.set()
         except Exception as exc:
@@ -2123,4 +2221,8 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
                HeadPlugin(audio, motion_catalog, catalog_available),
                SystemControlsPlugin(nodes),
                camera_left, camera_right]
+    health_config = config.get("plugins", {}).get("system_health", {})
+    if health_config.get("enabled", True):
+        plugins.append(SystemHealthPlugin((camera_left, camera_right), audio,
+                                          {k: v for k, v in health_config.items() if k != "enabled"}))
     return plugins
