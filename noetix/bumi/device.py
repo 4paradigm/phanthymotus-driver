@@ -3099,6 +3099,15 @@ class _SystemHealthNode(Node):
         self._read_errors = 0
         self._sleep_after_ms = None
         self._sleep_after_read_at = 0.0
+        # Bumped on every start. `stop` joins for one second, which is shorter
+        # than the longest allowed interval, so a thread from an earlier start
+        # can still be sleeping when the next one begins. Each thread therefore
+        # carries the generation it was started for and exits once superseded;
+        # otherwise stop-then-start leaves two threads publishing the same
+        # topic and nothing in the payload would reveal the doubled rate.
+        self._generation = 0
+        # Set by `stop` so a stop does not have to wait out `interval_s`.
+        self._stopped = threading.Event()
 
     @property
     def topic(self) -> str:
@@ -3111,15 +3120,22 @@ class _SystemHealthNode(Node):
     def start_polling(self):
         if self._running:
             return
+        # Clear before the thread exists, so a stop from a previous cycle
+        # cannot be mistaken for this one's.
+        self._stopped.clear()
         self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True,
+        self._generation += 1
+        self._thread = threading.Thread(target=self._loop, args=(self._generation,),
+                                        daemon=True,
                                         name="bumi_system_health")
         self._thread.start()
 
     def stop_polling(self):
         self._running = False
+        self._stopped.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
+        self._thread = None
 
     def read_now(self) -> dict:
         """One sample on demand, for `info` — so a canvas that only asks does
@@ -3129,8 +3145,8 @@ class _SystemHealthNode(Node):
         except Exception as exc:                              # noqa: BLE001
             return self._failed_sample(exc)
 
-    def _loop(self):
-        while self._running:
+    def _loop(self, generation: int):
+        while self._running and generation == self._generation:
             try:
                 payload = self._read_once()
             except Exception as exc:                          # noqa: BLE001
@@ -3138,7 +3154,11 @@ class _SystemHealthNode(Node):
             message = String()
             message.data = json.dumps(payload, ensure_ascii=False)
             self._pub.publish(message)
-            time.sleep(self._interval_s)
+            # Interruptible on purpose: a plain sleep would make `stop` take up
+            # to `interval_s` to be believed, and the canvas toggles a card off
+            # by asking for `idle`.
+            if self._stopped.wait(self._interval_s):
+                break
 
     def _failed_sample(self, exc) -> dict:
         import system_health_spec

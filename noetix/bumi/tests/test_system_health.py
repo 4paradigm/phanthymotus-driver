@@ -300,3 +300,33 @@ def test_an_out_of_range_poll_interval_is_rejected(monkeypatch):
         module.SystemHealthPlugin({"poll_interval_s": 30.0}, "robot",
                                   executor, _Media())
 
+
+
+def test_a_superseded_polling_thread_publishes_nothing(monkeypatch):
+    """`stop` joins for one second, which is shorter than the longest allowed
+    interval, so the thread from an earlier start can still be asleep when the
+    next one begins. It must bow out instead of publishing on the same topic
+    twice per interval — a doubled rate that the payload cannot reveal."""
+    _, node, _, _ = _node(monkeypatch, _Media(), interval=5.0)
+    node._running = True
+    node._generation = 7
+
+    node._loop(6)                     # the thread an earlier start handed out
+
+    assert node.published == []
+
+
+def test_a_stopped_card_leaves_no_thread_behind(monkeypatch):
+    _, node, _, _ = _node(monkeypatch, _Media(), interval=0.2)
+
+    node.start_polling()
+    first = node._thread
+    node.start_polling()              # already running: still one thread
+
+    assert node._thread is first
+
+    node.stop_polling()
+
+    assert node.running is False
+    assert node._thread is None
+    assert not first.is_alive()
