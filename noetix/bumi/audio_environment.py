@@ -248,7 +248,7 @@ class AudioEnvironmentPlugin:
                     "state": "running" if self.node else "idle",
                     "message": "Quiet baseline will be collected from new audio",
                 }
-            if action in ("read", "info"):
+            if action in ("read", "info", "audio_environment"):
                 return dict(
                     self.monitor.read(self.clock()),
                     state="running" if self.node else "idle",
@@ -256,7 +256,7 @@ class AudioEnvironmentPlugin:
                     last_error=self.error,
                     topic_out=self.get_tool()["topic_out"],
                 )
-            return {"state": "error", "message": f"unknown action: {action}"}
+            return None
 
     def _emit(self, publisher, data):
         message = self.string_type()

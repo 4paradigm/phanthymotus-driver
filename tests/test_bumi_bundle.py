@@ -123,6 +123,25 @@ def test_bad_audio_config_does_not_prevent_other_cards(bundle_module):
     assert [t['name'] for t in bundle.get_all_tools()] == ['speaker']
 
 
+def test_audio_environment_bare_bundle_call_returns_info_without_starting(bundle_module):
+    bundle = bundle_module.BumiDeviceBundle(
+        {"plugins": {"audio_environment": {"enabled": True}}},
+        "bumi_test", object(), None, None)
+    result = bundle.dispatch("audio_environment", {})
+    assert result["state"] == "idle"
+    assert result["status"] == "unknown"
+    assert result["input_topic"] == ""
+    assert result["topic_out"] == bundle.get_all_tools()[0]["topic_out"]
+
+
+def test_audio_environment_unknown_bundle_action_returns_none(bundle_module):
+    bundle = bundle_module.BumiDeviceBundle(
+        {"plugins": {"audio_environment": {"enabled": True}}},
+        "bumi_test", object(), None, None)
+    assert bundle.dispatch("audio_environment", {"action": "unsupported"}) is None
+    assert bundle.dispatch("audio_environment", {})["state"] == "idle"
+
+
 def test_enabled_loco_servo_registers_and_reuses_loco(bundle_module):
     high_ctrl = FakeHighCtrl()
     executor = object()
