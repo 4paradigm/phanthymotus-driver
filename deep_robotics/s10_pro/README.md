@@ -131,6 +131,13 @@ Development Manual v1.0.2 sections 1.6 and 1.9. These values are converted
 from millimetres to metres. The manual provides no camera orientation, and the
 RTSP stream provides no intrinsics, so orientation and optical calibration
 remain unknown.
+The front camera currently carries a preliminary manual horizontal half-FOV
+estimate of `0.423 rad` (about 48.5 degrees full FOV), obtained with the rough
+`measure_fov.py wall` check on `/s10_pro/camera_front/visual_depth`. That check
+also indicates the depth values are ray range, so lateral projection should use
+`sin(theta) * range`. This estimate is intentionally marked `source=manual`
+and `confidence=rough`; it must be replaced after a precise per-camera
+calibration. The other camera FOVs remain unknown.
 A one-frame low-latency pipeline reconnects after stream interruption. The
 previous ROS image-topic receive path has been removed because the vendor camera service
 does not publish camera images over DDS. The final image includes the `ffmpeg`

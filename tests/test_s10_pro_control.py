@@ -151,7 +151,13 @@ def test_s10_camera_info_exposes_vendor_body_mount_positions(monkeypatch):
         assert info["vendor"]["mounting"]["intrinsics_range"]["fx"] == [579.0, 639.0]
         assert info["vendor"]["mounting"]["intrinsics_range"]["cx"] == [750.0, 850.0]
         assert info["K"] is None and info["D"] is None
-        assert info["source"] == "unknown"
+        if camera == "camera_front":
+            assert info["source"] == "manual"
+            assert info["half_fov_rad"] == 0.423
+            assert info["vendor"]["mounting"]["fov_estimate"]["depth_semantics"] == "ray_range"
+        else:
+            assert info["source"] == "unknown"
+            assert info["half_fov_rad"] is None
 def test_actuator_start_surfaces_tls_reboot_requirement_to_frontend(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})

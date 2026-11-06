@@ -42,6 +42,21 @@ CAMERA_INTRINSICS_RANGE = {
     "source": "vendor-spec",
     "note": "Range only; K/D remain null until per-camera calibration at the published resolution.",
 }
+# Preliminary wall-fit estimate for the front visual-depth stream only. It is
+# intentionally marked manual: the test used a rough indoor wall and the
+# visual-depth output, not a per-camera checkerboard calibration.
+CAMERA_FRONT_HALF_FOV_RAD = 0.423
+CAMERA_FRONT_FOV_NOTE = {
+    "half_fov_rad": CAMERA_FRONT_HALF_FOV_RAD,
+    "full_fov_deg": 48.5,
+    "source": "manual",
+    "confidence": "rough",
+    "measured_with": "measure_fov.py wall on /s10_pro/camera_front/visual_depth",
+    "sample_frames": 30,
+    "depth_semantics": "ray_range",
+    "lateral_projection": "sin(theta) * range; not tan(theta) * z_depth",
+    "note": "Preliminary estimate; replace after precise per-camera calibration.",
+}
 LIDAR_LANES = ("lidar_cloud", "lidar_map")
 PREFERRED_LIDAR_SOURCE = "/ALIGNED_POINTS"
 LIDAR_SOURCE_STALE_SECONDS = 0.5
@@ -825,11 +840,13 @@ class S10StatePlugin:
                     topic=topics[name]["topic"],
                     id=f"deeprobotics/s10_pro/{name}",
                     format="image/jpeg", width=640, height=360,
-                    source="unknown",
+                    half_fov_rad=CAMERA_FRONT_HALF_FOV_RAD if name == "camera_front" else None,
+                    source="manual" if name == "camera_front" else "unknown",
                     vendor={"transport": "rtsp", "mounting": {
                         "frame_id": "body", "position_m": list(CAMERA_MOUNTS[name]),
                         "orientation_xyzw": None, "source": "vendor-spec",
                         "intrinsics_range": CAMERA_INTRINSICS_RANGE,
+                        **({"fov_estimate": CAMERA_FRONT_FOV_NOTE} if name == "camera_front" else {}),
                         "stream": {"width": 640, "height": 360, "fps_max": 15,
                                    "codec": "mjpeg", "source": "driver_output",
                                    "source_resolution": {"width": 1024, "height": 576, "fps": 30},
@@ -867,7 +884,8 @@ class S10StatePlugin:
                     format="image/jpeg",
                     width=640,
                     height=360,
-                    source="unknown",
+                    half_fov_rad=CAMERA_FRONT_HALF_FOV_RAD if name == "camera_front" else None,
+                    source="manual" if name == "camera_front" else "unknown",
                     vendor={
                         "mounting": {
                             "frame_id": "body",
@@ -880,6 +898,7 @@ class S10StatePlugin:
                             },
                             "reference": "DeepRobotics S10 Hardware Development Manual v1.0.2, sections 1.6 and 1.9",
                             "intrinsics_range": CAMERA_INTRINSICS_RANGE,
+                            **({"fov_estimate": CAMERA_FRONT_FOV_NOTE} if name == "camera_front" else {}),
                             "stream": {"width": 640, "height": 360, "fps_max": 15,
                                        "codec": "mjpeg", "source": "driver_output",
                                        "source_resolution": {"width": 1024, "height": 576, "fps": 30},
