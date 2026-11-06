@@ -159,6 +159,12 @@ class BumiDeviceBundle:
             ))
             print("[bundle] LocoServoPlugin loaded")
 
+        if plugins_cfg.get("detaforce_rps", {}).get("enabled", False):
+            from detaforce_rps import DetaforceRpsPlugin
+            self._plugins.append(DetaforceRpsPlugin(
+                plugins_cfg["detaforce_rps"], loco_plugin, high_ctrl))
+            print("[bundle] DetaforceRpsPlugin loaded (explicit recording bindings required)")
+
         if plugins_cfg.get("mic", {}).get("enabled", False) and media_ctrl is not None:
             from device import MicPlugin
             self._plugins.append(MicPlugin(plugins_cfg["mic"], namespace, executor, media_ctrl))

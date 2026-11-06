@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bumi · DetaForce 动作试播</title>
+<style>
+  :root{color-scheme:dark}*{box-sizing:border-box}body{max-width:1240px;margin:32px auto;padding:0 24px;background:#111820;color:#e7edf5;font:16px system-ui}
+  a{color:#a8e0d0}h1{font-size:30px;margin:12px 0}p{color:#b9c8d5;line-height:1.7}small{color:#b9c8d5}
+  main{display:grid;grid-template-columns:minmax(0,1.8fr) minmax(280px,1fr);gap:24px;margin-top:24px}.panel{background:#1c2834;border:1px solid #344858;border-radius:12px;padding:18px}
+  img{display:block;width:100%;background:#24313e;border-radius:8px}button{font:inherit;color:inherit;padding:12px;border:1px solid #53616f;border-radius:7px;background:#293a4b;cursor:pointer}button:hover{border-color:#a8e0d0}button:disabled{opacity:.4;cursor:wait}
+  #actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}#actions button{text-align:left;min-height:66px}#actions button.active{border-color:#a8e0d0;background:#294d47}.controls{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}#play-all{background:#a8e0d0;color:#132c29}#stop{border-color:#dba58e;color:#ffd1bd}
+  #status{font-size:19px;line-height:1.7}#detail{min-height:44px;font-size:14px}progress{width:100%;height:8px;accent-color:#a8e0d0}#gallery{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:18px}figure{margin:0}figcaption{font-size:13px;color:#b9c8d5;padding:6px 0}#speech audio{width:100%}#notice{color:#ffd1bd;white-space:pre-wrap}
+  @media(max-width:850px){main{grid-template-columns:1fr}body{padding:0 16px}#gallery{grid-template-columns:1fr 1fr}}
+</style>
+<a href="/">← 迎宾仿真</a>
+<h1>Bumi / DetaForce</h1>
+<p>猜拳基础动作试播 · 6 个独立动作 · 手臂运动，双脚保持站立</p>
+<main>
+  <section class="panel">
+    <img id="body" src="/body.jpg" alt="Gazebo 中 Bumi 的实时全身画面">
+    <p><small>正面侧视 · Gazebo 实时回读。Bumi 末端形状固定，用整只手臂表现姿态。</small></p>
+    <div id="status" role="status" aria-live="polite">正在连接仿真…</div>
+    <p id="detail"></p><progress id="progress" value="0" max="1" aria-label="动作进度"></progress>
+    <p id="notice" role="alert"></p><div id="speech"></div>
+  </section>
+  <section class="panel">
+    <div id="actions">
+      <button data-action="invite_one">01　单手邀请<br><small>掌心靠近面部，招手两次</small></button>
+      <button data-action="invite_both">01　双手邀请<br><small>双掌靠近面部，招手两次</small></button>
+      <button data-action="countdown">02　猜拳起手<br><small>双臂上下交替转动</small></button>
+      <button data-action="double_punch">03　猛攻 · 双拳<br><small>双拳一前一后交替</small></button>
+      <button data-action="mouse">04　鼠鼠<br><small>双手举高，保持姿态</small></button>
+      <button data-action="confident">05　花来<br><small>举拳、肯定下压、回举</small></button>
+    </div>
+    <div class="controls"><button id="play-all">依次试播全部</button><button id="stop">停止动作</button><button id="reset">复位站姿</button></div>
+    <p>邀请试播同时组合本地语音：“来，玩一局猜拳！”</p>
+    <p><small>这里逐项试播动作 Card，不判断玩家出拳或游戏胜负。运动学仿真用于检查动作形态；接触力与站立平衡尚未验证。</small></p>
+    <details><summary>相机视角</summary><img id="camera" src="/frame.jpg" alt="机器人相机实时画面"></details>
+  </section>
+</main>
+<div id="gallery" aria-label="当前动作的阶段回放"></div>
+<script>
+const $=s=>document.querySelector(s);
+const labels=Object.fromEntries([...document.querySelectorAll('[data-action]')].map(b=>[b.dataset.action,b.firstChild.textContent.trim().replace(/^\d+\s*/, '')]));
+const states={running:'正在执行',stopping:'正在停止',completed:'已完成',failed:'执行失败',cancelled:'已停止',idle:'就绪'};
+const phases={reach:'向前伸手',beckon_to_chest:'拉向胸口',beckon_to_face:'拉向面部招手',invite_hold:'邀请停留',alternate_orbit:'上下交替转动',left_forward:'左拳在前',right_forward:'右拳在前',double_guard:'双拳收回',hands_up:'双手举高',mouse_hold:'举手停留',fist_before_face:'花来 · 单拳举至面前',confident_hold:'花来姿态停留',affirm_downstroke:'肯定下压',restore_fist:'恢复面前举拳',return_to_rest:'放下手臂'};
+let busy=false,executing=false,stopRequested=false,current=null,galleryKey='';
+function controls(){document.querySelectorAll('[data-action],#play-all,#reset').forEach(b=>b.disabled=busy||executing);}
+async function json(url,body){const r=await fetch(url,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await r.json();if(!r.ok||(data.error&&!data.state))throw Error(typeof data.error==='object'?data.error.message:data.error||r.statusText);return data;}
+async function mcp(name,action){const d=await json('/mcp',{jsonrpc:'2.0',id:Date.now(),method:'tools/call',params:{name,arguments:{action}}});if(d.error)throw Error(d.error.message);const v=JSON.parse(d.result.content[0].text);if(d.result.isError)throw Error(v.error||'调用失败');return v;}
+function render(s){
+  current=s;const rps=s.action==='rps_motion';const running=['running','stopping'].includes(s.state);busy=running;controls();
+  if(rps){const clip=s.rps||{},pose=[...(s.events||[])].reverse().find(e=>e.phase==='rps_pose');
+    $('#status').textContent=`${clip.label||labels[clip.gesture]||'动作'} · ${states[s.state]||s.state}`;
+    $('#detail').textContent=pose?(phases[pose.pose_phase]||pose.pose_phase)+' · '+(clip.pose_feedback_verified||s.pose_feedback_verified?'已收到 Gazebo 位姿回读':'等待位姿回读'): '准备动作与画面';
+    $('#progress').value=s.state==='completed'?1:Math.min(1,(pose?.clip_time_s||0)/(clip.planned_duration_s||1));
+    document.querySelectorAll('[data-action]').forEach(b=>b.classList.toggle('active',b.dataset.action===clip.gesture&&running));
+    const images=(s.events||[]).filter(e=>e.body_image);const key=s.run_id+':'+images.length;
+    if(key!==galleryKey){galleryKey=key;$('#gallery').replaceChildren();for(const e of images.slice(-6)){const f=document.createElement('figure'),im=document.createElement('img'),c=document.createElement('figcaption');im.src=e.body_image;im.alt='动作阶段画面';c.textContent=phases[e.pose_phase]||({rps_started:'动作开始',rps_completed:'返回站姿'}[e.phase]||'动作回放');f.append(im,c);$('#gallery').append(f);}}
+    const voice=(s.events||[]).find(e=>e.audio);if(voice&&$('#speech').dataset.run!==s.run_id){$('#speech').dataset.run=s.run_id;const p=document.createElement('p'),a=document.createElement('audio');p.textContent=voice.text;a.controls=true;a.src=voice.audio;$('#speech').replaceChildren(p,a);}
+  }else{$('#status').textContent=running?'仿真正在执行其他动作':'就绪 · 选择一个基础动作';$('#detail').textContent=running?'请等待当前动作结束，再试播猜拳动作。':'邀请、起手、猛攻、鼠鼠与花来均可单独试播。';}
+  if(s.error&&s.state==='failed')$('#notice').textContent=s.error;
+}
+async function untilDone(id){for(let i=0;i<700;i++){await new Promise(r=>setTimeout(r,250));const s=await json('/status');render(s);if(s.run_id!==id)throw Error('动作已被其他仿真操作替换');if(!['running','stopping'].includes(s.state)){if(s.state==='cancelled'){stopRequested=true;return s;}if(s.state!=='completed')throw Error(s.error||states[s.state]||s.state);return s;}}throw Error('等待动作超时');}
+async function play(action){const s=await json('/detaforce/play',{action});render(s);return untilDone(s.run_id);}
+async function execute(actions){if(busy||executing)return;executing=true;stopRequested=false;$('#notice').textContent='';controls();try{for(const a of actions){if(stopRequested)break;await play(a);}}catch(e){$('#notice').textContent=e.message;}finally{executing=false;controls();}}
+document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>execute([b.dataset.action]));
+$('#play-all').onclick=()=>execute(Object.keys(labels));
+$('#stop').onclick=async()=>{stopRequested=true;try{await mcp('detaforce_rps','stop_action');}catch(e){$('#notice').textContent=e.message;}};
+$('#reset').onclick=async()=>{if(busy||executing)return;executing=true;controls();$('#notice').textContent='';try{const s=await mcp('bumi_gazebo','reset');await untilDone(s.run_id);}catch(e){$('#notice').textContent=e.message;}finally{executing=false;controls();}};
+async function poll(){try{render(await json('/status'));}catch(e){$('#status').textContent='仿真连接不可用';$('#notice').textContent=e.message;}setTimeout(poll,700);}
+setInterval(()=>{for(const id of ['body','camera']){const img=$('#'+id);if(img.complete)img.src=(id==='body'?'/body.jpg':'/frame.jpg')+'?t='+Date.now();}},300);
+poll();
+</script>
+</html>

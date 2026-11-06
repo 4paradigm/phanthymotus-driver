@@ -23,6 +23,7 @@ cards:
   - { name: stand_up_lie_prone, type: actuator }
   - { name: semantic_action,   type: actuator }
   - { name: action_recording,  type: actuator }
+  - { name: detaforce_rps,     type: actuator }
   - { name: mic,               type: sensor }
   - { name: sound_direction,   type: sensor }
   - { name: speaker,           type: actuator }
