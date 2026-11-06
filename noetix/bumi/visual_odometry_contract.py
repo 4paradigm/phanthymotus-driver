@@ -223,5 +223,9 @@ def make_sample(health, now_ns, estimate, pose_reference='rgb_optical'):
         vendor={**quality, 'source': 'rtabmap_rgbd_odometry',
                 'pose_reference': pose_reference,
                 'accuracy_validated': False,
+                'motus_slam': {'status': quality['status'],
+                               'segment_id': quality['segment_id'],
+                               'stamp_source': 'measurement' if valid else 'unknown',
+                               'clock_id': 'ros'},
                 'twist_source': None,
                 'published_ns': now_ns, **deepcopy(health.details)})

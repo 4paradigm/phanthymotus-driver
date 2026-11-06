@@ -2421,6 +2421,17 @@ def _camera_subprocess(namespace: str):
     # main.py sets BUMI_VISUAL_ODOMETRY only when that card is enabled; the branch
     # shares this pipeline and must never take media production down: construction
     # and every publish are wrapped, and a fault only logs.
+    metric_depth = None
+    shared_time_mapper = None
+    metric_failures = 0
+    try:
+        from visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
+        depth_scale = pipeline.get_active_profile().get_device().first_depth_sensor().get_depth_scale()
+        shared_time_mapper = CaptureTimeMapper(depth_scale)
+        metric_depth = ComputationalDepthPublisher(node, namespace, shared_time_mapper, _QOS)
+    except Exception as _e:
+        print(f"[camera_subprocess] metric depth unavailable: {_e}", flush=True)
+
     raw_inputs = None
     raw_publish_failures = 0
     if os.environ.get("BUMI_VISUAL_ODOMETRY") == "1":
@@ -2445,6 +2456,8 @@ def _camera_subprocess(namespace: str):
             raw_inputs = RawCameraPublisher(
                 node, namespace, pipeline, _QOS,
                 min_interval_s=(1.0/raw_rate_hz if raw_rate_hz > 0 else 0.0))
+            if shared_time_mapper is not None:
+                raw_inputs.time_mapper = shared_time_mapper
         except Exception as _e:
             print(f"[camera_subprocess] raw RGB-D branch unavailable: {_e}", flush=True)
         if raw_inputs is not None:
@@ -2498,6 +2511,15 @@ def _camera_subprocess(namespace: str):
                 msg.format = "16UC1; compressedDepth zlib"
                 msg.data = array('B', compressed)
                 depth_pub.publish(msg)
+
+            if metric_depth is not None:
+                try:
+                    metric_depth.publish(source_frames, frames)
+                except Exception as _e:
+                    metric_failures += 1
+                    if metric_failures == 1 or metric_failures % 100 == 0:
+                        print(f"[camera_subprocess] metric depth failed (failure #{metric_failures}): "
+                              f"{' '.join(str(_e).split())[:300]}", flush=True)
 
             if raw_inputs is not None and getattr(raw_inputs, 'enabled', True):
                 try:
@@ -2634,7 +2656,8 @@ class CameraPlugin:
                 "multiInstance": False,
                 "description": f"Bumi Realsense D435i depth registered to the RGB image — 640x480 zlib-compressed Z16 @ 30fps. Publishes to {self._depth_topic}",
                 "inputSchema": {"type": "object", "properties": {}},
-                "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}],
+                "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"},
+                              {"topic": f"/{self._namespace}/camera/depth_metric", "format": "image/depth-zlib"}],
             },
         ]
 
@@ -2690,6 +2713,17 @@ class CameraPlugin:
             }
             if tool_name in topic_map:
                 topic, fmt = topic_map[tool_name]
+                if tool_name == "depth":
+                    metric_topic = f"/{self._namespace}/camera/depth_metric"
+                    metric_info = self._camera_info(tool_name, metric_topic, "image/depth-zlib")
+                    for declaration in metric_info:
+                        declaration.setdefault("vendor", {}).update(
+                            depth_unit="mm", depth_source="measured", timestamp_semantics="source_capture_mapped",
+                            clock_mapping="shared_camera_mapper")
+                    return {"state": "running",
+                            "topic_out": [{"topic": topic, "format": fmt},
+                                          {"topic": metric_topic, "format": "image/depth-zlib"}],
+                            "camera_info": self._camera_info(tool_name, topic, fmt) + metric_info}
                 return {"state": "running",
                         "topic_out": [{"topic": topic, "format": fmt}],
                         "camera_info": self._camera_info(tool_name, topic, fmt)}

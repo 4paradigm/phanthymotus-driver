@@ -7,6 +7,7 @@ hardware, codec, ROS and child-process boundaries are replaced here.
 from array import array
 import importlib.util
 import sys
+import threading
 import zlib
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -63,7 +64,8 @@ def capture(monkeypatch):
             intr = NS(width=640, height=480, fx=600., fy=601., ppx=320., ppy=240.,
                       model='distortion.brown_conrady', coeffs=[0.]*5)
             return NS(get_stream=lambda stream: NS(
-                as_video_stream_profile=lambda: NS(intrinsics=intr)))
+                as_video_stream_profile=lambda: NS(intrinsics=intr)),
+                get_device=lambda: NS(first_depth_sensor=lambda: NS(get_depth_scale=lambda: .001)))
 
         def wait_for_frames(self, timeout_ms):
             state.iterations += 1
@@ -147,6 +149,109 @@ def capture(monkeypatch):
 
     rclpy.spin_once = spin_once
     return device, state
+
+
+def test_metric_depth_runs_without_visual_odometry(capture, monkeypatch):
+    device, state = capture
+    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
+    seen = []
+
+    class Mapper:
+        def __init__(self, scale):
+            assert scale == .001
+
+    class Metric:
+        def __init__(self, node, namespace, mapper, qos):
+            seen.append(('init', namespace))
+
+        def publish(self, source, aligned):
+            seen.append(('publish', source, aligned))
+
+    monkeypatch.setitem(sys.modules, 'visual_inputs',
+                        NS(CaptureTimeMapper=Mapper, ComputationalDepthPublisher=Metric))
+    device._camera_subprocess('robot')
+    assert [x[0] for x in seen] == ['init', 'publish']
+    assert state.published['/robot/camera/color'] and state.published['/robot/camera/depth']
+
+
+def test_metric_depth_and_vo_use_same_time_mapper(capture, monkeypatch):
+    device, state = capture
+    monkeypatch.setenv('BUMI_VISUAL_ODOMETRY', '1')
+    state.frame_limit = 2
+    seen = []
+
+    class Mapper:
+        def __init__(self, scale):
+            pass
+
+    class Metric:
+        def __init__(self, node, namespace, mapper, qos):
+            seen.append(mapper)
+
+        def publish(self, source, aligned):
+            pass
+
+    class Raw:
+        enabled = True
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def publish(self, source, aligned):
+            seen.append(self.time_mapper)
+
+    monkeypatch.setitem(sys.modules, 'visual_inputs', NS(
+        CaptureTimeMapper=Mapper, ComputationalDepthPublisher=Metric, RawCameraPublisher=Raw))
+    device._camera_subprocess('robot')
+    assert len(seen) == 3 and all(item is seen[0] for item in seen)
+
+
+def test_metric_depth_failure_does_not_stop_legacy_camera_output(capture, monkeypatch):
+    device, state = capture
+    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
+    state.frame_limit = 2
+
+    class Mapper:
+        def __init__(self, scale):
+            pass
+
+    class Metric:
+        def __init__(self, *args):
+            pass
+
+        def publish(self, source, aligned):
+            raise ValueError('invalid capture timestamp')
+
+    monkeypatch.setitem(sys.modules, 'visual_inputs',
+                        NS(CaptureTimeMapper=Mapper, ComputationalDepthPublisher=Metric))
+    device._camera_subprocess('robot')
+    assert len(state.published['/robot/camera/color']) == 2
+    assert len(state.published['/robot/camera/depth']) == 2
+
+
+def test_depth_card_declares_both_outputs_and_their_actual_intrinsics(capture, monkeypatch):
+    device, _ = capture
+    monkeypatch.syspath_prepend(str(BUMI))
+    card = device.CameraPlugin.__new__(device.CameraPlugin)
+    card._namespace = 'robot'
+    card._color_topic, card._depth_topic = '/robot/camera/color', '/robot/camera/depth'
+    card._intrinsics_lock = threading.Lock()
+    card._intrinsics = {'depth': {'width': 640, 'height': 480, 'fx': 600., 'fy': 601.,
+                                   'ppx': 320., 'ppy': 240., 'model': 'none', 'coeffs': [0.] * 5}}
+    tool = next(x for x in card.get_tools() if x['name'] == 'depth')
+    result = card.dispatch('info', {'_tool_name': 'depth'})
+    assert tool['topic_out'] == result['topic_out'] == [
+        {'topic': '/robot/camera/depth', 'format': 'image/depth-zlib'},
+        {'topic': '/robot/camera/depth_metric', 'format': 'image/depth-zlib'}]
+    infos = {entry['topic']: entry for entry in result['camera_info']}
+    assert infos['/robot/camera/depth_metric']['K'][0] == 600.
+    assert infos['/robot/camera/depth_metric']['source'] == 'derived-from-K'
+    assert infos['/robot/camera/depth_metric']['distortion_model'] == 'pinhole'
+    vendor = infos['/robot/camera/depth_metric']['vendor']
+    assert vendor['depth_unit'] == 'mm'
+    assert vendor['depth_source'] == 'measured'
+    assert vendor['timestamp_semantics'] == 'source_capture_mapped'
+    assert vendor['clock_mapping'] == 'shared_camera_mapper'
 
 
 def test_media_uses_byte_buffers_without_changing_encoded_payloads(capture, monkeypatch):
