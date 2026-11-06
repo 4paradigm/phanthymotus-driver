@@ -1,17 +1,17 @@
 # Dobot CRA joints and joint_move
 
 基于官方 V4 Python SDK 的 Jetson Docker 驱动。本版提供并列的 `joints` 与 `joint_move`
-两张可见卡片，URDF 由后台 `model` 资源提供。SDK 版本见 [SDK.md](SDK.md)。
+两张可见卡片，URDF 由后台 `model` 资源提供。SDK 版本及源码校验值固定在 [requirements.txt](requirements.txt)。
 
 ## 卡片
 
 | 名称 | 类型 | 内容 |
 |---|---|---|
-| `joint_move` | actuator | 绝对/相对关节运动、停止、暂停及继续，详见 [JOINT_MOVE.md](JOINT_MOVE.md) |
+| `joint_move` | actuator | 绝对/相对关节运动、停止、暂停及继续 |
 | `joints` | sensor | 六轴实际角度驱动的 CR3A 结构骨架、逐关节转角 JSON，以及共享连接配置 |
 
 `model` 为渲染器内部读取的 resource，不是可见卡片。
-本版不注册 `safe_skin` 或 `safe_skin_control`，不发布安全皮肤 topic，也不提供皮肤设置入口。
+本版不注册 `safe_skin` 或 `safe_skin_control`，不发布安全皮肤 topic。
 升级后请移除画布中的旧安全皮肤卡片及连线；不会自动修改已有画布。
 
 ## 关节输出
@@ -96,7 +96,7 @@ MCP 端口 `15746`，容器名 `embodied-dobot-cra`；无需主机 SDK 或 privi
 python3 -m venv .venv
 .venv/bin/pip install -r dobot/cra/build-requirements.txt
 .venv/bin/pip install --no-build-isolation -r dobot/cra/requirements.txt pytest
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra_sensors.py tests/test_dobot_skeleton_structure.py tests/test_dobot_joint_move.py tests/test_dobot_completion.py -q
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/test_dobot_cra_sensors.py tests/test_dobot_skeleton_structure.py tests/test_dobot_joint_move.py tests/test_dobot_relative_joint_move.py tests/test_dobot_partial_joint_move.py tests/test_dobot_completion.py -q
 .venv/bin/python scripts/check_service_yml.py
 ```
 
@@ -120,9 +120,28 @@ move_j 再发送 ClearError 和 MovJ，resume 发送 Continue。
 
 五个运动 action 均返回 action_id，通过 ACP 完成回调报告真实终态；命令应答不等于运动完成。
 暂停/停止也要等待新反馈确认状态与实际速度，缺失反馈不宣称停稳。
-部署增加 Agent Core CA 证书只读挂载与主机名映射，保持 TLS 校验；详细要求见 JOINT_MOVE.md。
+部署增加 Agent Core CA 证书只读挂载与主机名映射，保持 TLS 校验。
 
 rel_joint_mov_j 新增相对关节偏移运动，单位为度，0 表示该轴不变；其余设置复用 move_j。
 准备前及下发前校验实际角度加偏移后的最终目标，完成监测使用最终目标角度。
 
 绝对运动的空白关节保持下发前实际角度，相对运动的空白偏移按 0；至少填写一个关节。
+
+| action | 输入与行为 |
+|---|---|
+| `move_j` | `joint1_deg` 至 `joint6_deg` 为绝对目标角度，留空保持下发前实际角度 |
+| `rel_joint_mov_j` | `joint1_offset_deg` 至 `joint6_offset_deg` 为相对偏移，留空按 0 |
+| `pause` | 暂停控制器队列或工程，不适用于点动 |
+| `resume` | 继续已暂停的队列或工程 |
+| `stop_motion` | 停止控制器队列或工程，包括点动 |
+
+两种角度运动至少填写一个关节，明确填入绝对角度 0 表示回到零度。
+每次操作要求手动输入 `confirm_move=true`。速度和加速度为 1–100%，默认 10%，固定 cp=0。
+目标行程为 J1/J2/J4/J5/J6 ±360°、J3 ±155°；实际还受控制器自定义软限位约束。
+安全皮肤开关与灵敏度设置均等待新反馈确认对应队列完成，允许本次设置产生的短暂模式 7，
+失败或超时不继续发送运动命令。暂停、继续和停止作用于整个控制器队列，不限于本卡片。
+
+完成通知使用 `AGENT_CORE_URL` 和 `AGENT_CORE_CA_CERT`，默认地址为 https://phanthy-motus:15678，
+CA 路径为 /opt/phanthy-motus/data/certs/cert.pem。部署支持 DOBOT_AGENT_CORE_URL、
+DOBOT_AGENT_CORE_HOSTNAME、DOBOT_AGENT_CORE_ADDRESS、DOBOT_CA_DIR、DOBOT_AGENT_CORE_CA_CERT 覆盖。
+TLS 保持校验；停止在反馈或证书配置异常时仍可下发，但不能宣称已停稳或已成功通知平台。
