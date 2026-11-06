@@ -344,14 +344,17 @@ class InputTests(unittest.TestCase):
 
 class PluginTests(unittest.TestCase):
     def make_plugin(self):
-        return load_plugin()({}, "g1", object(), types.SimpleNamespace(
+        p = load_plugin()({}, "g1", object(), types.SimpleNamespace(
             is_running=lambda: True, _color_topic="/g1/camera/rgb"))
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        p._output_dir = Path(tmp.name).resolve()
+        return p
 
     def test_default_and_canvas_audio_parameter(self):
         p = self.make_plugin()
         schema = p.get_tool()["inputSchema"]
-        self.assertIs(False, schema["properties"]["include_audio"]["default"])
-        self.assertIn("include_audio", schema["x-action-params"]["record_video"]["params"])
+        self.assertIs(True, schema["properties"]["include_audio"]["default"])
+        self.assertNotIn("include_audio", schema["x-action-params"]["record_video"]["params"])
 
     def test_non_boolean_audio_option_rejected(self):
         p = self.make_plugin()
@@ -359,10 +362,10 @@ class PluginTests(unittest.TestCase):
             self.assertEqual("INVALID_AUDIO_OPTION", p._start_video_recording(
                 {"duration_s": 1, "include_audio": value})["code"])
 
-    def test_omitted_audio_uses_original_branch(self):
+    def test_explicit_false_preserves_silent_option(self):
         p = self.make_plugin()
         with patch.object(shutil, "which", return_value="ffmpeg"), patch.object(threading, "Thread"):
-            self.assertTrue(p._start_video_recording({"duration_s": 1})["ok"])
+            self.assertTrue(p._start_video_recording({"duration_s": 1, "include_audio": False})["ok"])
         self.assertIs(False, p._active_recording["include_audio"])
 
     def test_audio_option_routes_to_helper(self):
@@ -425,7 +428,7 @@ class EncodingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.directory = Path(self.temp.name)
+        self.directory = Path(self.temp.name).resolve()
         self.jpeg = self.directory / "000000.jpg"
         subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
                         "color=c=red:s=64x48", "-frames:v", "1", str(self.jpeg)], check=True)
