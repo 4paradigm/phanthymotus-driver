@@ -1,10 +1,19 @@
-"""Process-isolated camera encoding and point-cloud packing for S10 media."""
+"""Process-isolated point-cloud packing and RTSP camera pulling for S10 media."""
 
 from __future__ import annotations
 
 import multiprocessing as mp
 import queue
+import subprocess
 import threading
+import time
+
+
+def _rtsp_command(url):
+    return ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-rtsp_transport", "tcp", "-fflags", "nobuffer", "-flags", "low_delay",
+            "-i", str(url), "-an", "-vf", "fps=15,scale='min(640,iw)':-2",
+            "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
 
 
 class MediaWorkers:
@@ -19,15 +28,81 @@ class MediaWorkers:
         self._collector_threads = {}
         self._result_failures = 0
         self._closed = False
-
-    def add_camera(self, lane):
-        self._add(lane, "camera")
-
-    def add_compressed_camera(self, lane):
-        self._add(lane, "compressed_camera")
+        self._rtsp_threads = {}
+        self._rtsp_processes = {}
+        self._rtsp_frame_failures = {}
 
     def add_lidar(self, lane):
         self._add(lane, "lidar")
+
+    def add_rtsp_camera(self, lane, url):
+        thread = threading.Thread(target=self._rtsp_loop, args=(lane, url),
+                                  name=f"s10-pro-rtsp-{lane}", daemon=True)
+        self._rtsp_threads[lane] = thread
+        self._rtsp_frame_failures[lane] = 0
+        thread.start()
+
+    def _rtsp_loop(self, lane, url):
+        while not self._closed:
+            process = None
+            try:
+                process = subprocess.Popen(_rtsp_command(url), stdout=subprocess.PIPE,
+                                           stderr=subprocess.DEVNULL, bufsize=0)
+                self._rtsp_processes[lane] = process
+                self._read_mjpeg(lane, process.stdout)
+            except (OSError, ValueError) as exc:
+                print(f"[rtsp] {lane} pull failed: {exc}", flush=True)
+            finally:
+                self._rtsp_processes.pop(lane, None)
+                if process is not None:
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=1)
+                    if process.stdout:
+                        process.stdout.close()
+            if not self._closed:
+                if process is not None and process.returncode not in (None, 0, -15):
+                    print(f"[rtsp] {lane} ffmpeg exited with {process.returncode}; reconnecting",
+                          flush=True)
+                time.sleep(1)
+
+    def _read_mjpeg(self, lane, stream):
+        buffer = bytearray()
+        while not self._closed:
+            chunk = stream.read(65536)
+            if not chunk:
+                return
+            buffer.extend(chunk)
+            while True:
+                start = buffer.find(b"\xff\xd8")
+                if start < 0:
+                    buffer[:] = buffer[-1:]
+                    break
+                end = buffer.find(b"\xff\xd9", start + 2)
+                if end < 0:
+                    if start:
+                        del buffer[:start]
+                    if len(buffer) > 8 * 1024 * 1024:
+                        buffer.clear()
+                    break
+                frame = bytes(buffer[start:end + 2])
+                del buffer[:end + 2]
+                try:
+                    self._on_result(lane, None, frame)
+                except Exception as exc:
+                    count = self._rtsp_frame_failures.get(lane, 0) + 1
+                    self._rtsp_frame_failures[lane] = count
+                    if count == 1 or count % 100 == 0:
+                        print(f"[rtsp] {lane} frame publish failed count={count}: {exc}", flush=True)
+
+    def rtsp_alive(self, lane):
+        process = self._rtsp_processes.get(lane)
+        thread = self._rtsp_threads.get(lane)
+        return bool(thread and thread.is_alive() and process and process.poll() is None)
 
     def _add(self, lane, kind):
         # Media is a live view: never queue historical frames.  A single slot
@@ -83,6 +158,19 @@ class MediaWorkers:
 
     def close(self):
         self._closed = True
+        for process in self._rtsp_processes.values():
+            if process.poll() is None:
+                process.terminate()
+        for thread in self._rtsp_threads.values():
+            thread.join(timeout=2)
+        for lane, process in list(self._rtsp_processes.items()):
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=1)
+            if process.stdout:
+                process.stdout.close()
+        self._rtsp_threads.clear()
+        self._rtsp_processes.clear()
         for jobs in self._jobs.values():
             try:
                 jobs.put_nowait(None)
@@ -134,19 +222,9 @@ def _worker(jobs, results, kind, lane):
         if job is None:
             return
         try:
-            if kind in ("camera", "compressed_camera"):
-                if len(job) == 2:
-                    header, data = job
-                    packet = _reencode_jpeg(data)
-                else:
-                    header, width, height, step, encoding, data = job
-                    packet = _jpeg(width, height, step, encoding, data)
-            else:
-                header, fields, bigendian, width, height, row_step, point_step, data = job
-                packet = encode_pointcloud(fields, bigendian, width, height, row_step,
-                                           point_step, data)
-            # Each lane has its own one-frame result queue, so camera traffic
-            # cannot evict a newer lidar frame (or vice versa).
+            header, fields, bigendian, width, height, row_step, point_step, data = job
+            packet = encode_pointcloud(fields, bigendian, width, height, row_step,
+                                       point_step, data)
             _put_latest(results, (lane, header, packet))
         except Exception as exc:
             failures += 1
@@ -154,93 +232,8 @@ def _worker(jobs, results, kind, lane):
                 print(f"[media-worker] {lane} failed ({failures}): {exc!r}", flush=True)
 
 
-def _jpeg(width, height, step, encoding, data):
-    from io import BytesIO
-    from PIL import Image
-    encoding = str(encoding).lower()
-    if encoding in ("jpeg", "jpg", "mjpeg"):
-        payload = bytes(data)
-        try:
-            image = Image.open(BytesIO(payload)).convert("RGB")
-        except (OSError, ValueError):
-            return None
-        stream = BytesIO()
-        _save_preview(image, stream)
-        return stream.getvalue()
-    if encoding in ("nv12", "nv21"):
-        try:
-            width, height, step = int(width), int(height), int(step)
-            raw = bytes(data)
-            y_size = step * height
-            uv_rows = (height + 1) // 2
-            if width <= 0 or height <= 0 or step < width or len(raw) < y_size + step * uv_rows:
-                return None
-            # Keep this conversion dependency-free. The camera driver commonly
-            # publishes NV12/NV21, and adding NumPy just for this path adds a
-            # large wheel to the runtime image.
-            rgb = bytearray(width * height * 3)
-            out = 0
-            for y in range(height):
-                y_row = y * step
-                uv_row = y_size + (y // 2) * step
-                for x in range(width):
-                    chroma = uv_row + (x // 2) * 2
-                    u, v = raw[chroma], raw[chroma + 1]
-                    if encoding == "nv21":
-                        u, v = v, u
-                    luminance = raw[y_row + x]
-                    c = luminance - 16
-                    d, e = u - 128, v - 128
-                    rgb[out] = max(0, min(255, (298 * c + 409 * e + 128) >> 8))
-                    rgb[out + 1] = max(0, min(255, (298 * c - 100 * d - 208 * e + 128) >> 8))
-                    rgb[out + 2] = max(0, min(255, (298 * c + 516 * d + 128) >> 8))
-                    out += 3
-            image = Image.frombytes("RGB", (width, height), bytes(rgb))
-        except (IndexError, ValueError, TypeError):
-            return None
-        stream = BytesIO()
-        _save_preview(image, stream)
-        return stream.getvalue()
-    mode, raw_mode = {"rgb8": ("RGB", "RGB"), "bgr8": ("RGB", "BGR"),
-                      "rgba8": ("RGBA", "RGBA"), "bgra8": ("RGBA", "BGRA"),
-                      "mono8": ("L", "L"), "8uc1": ("L", "L")}.get(encoding, (None, None))
-    if mode is None:
-        return None
-    image = Image.frombytes(mode, (int(width), int(height)), bytes(data), "raw", raw_mode, int(step), 1)
-    if image.mode == "RGBA":
-        image = image.convert("RGB")
-    stream = BytesIO()
-    _save_preview(image, stream)
-    return stream.getvalue()
-
-
-def _save_preview(image, stream):
-    """Encode a bounded dashboard preview instead of queuing full frames."""
-    max_dimension = 640
-    if max(image.size) > max_dimension:
-        scale = max_dimension / float(max(image.size))
-        image = image.resize((max(1, int(image.width * scale)),
-                              max(1, int(image.height * scale))))
-    image.save(stream, format="JPEG", quality=65, optimize=False)
-
-
-def _reencode_jpeg(data):
-    # The vendor sometimes declares an already encoded JPEG as sensor_msgs/Image
-    # with encoding=jpeg. Preserve valid payloads byte-for-byte; decoding these
-    # non-standard Image samples can produce black frames or corrupt the image.
-    payload = bytes(data)
-    if payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9"):
-        return payload
-    from io import BytesIO
-    from PIL import Image
-    image = Image.open(BytesIO(payload)).convert("RGB")
-    stream = BytesIO()
-    _save_preview(image, stream)
-    return stream.getvalue()
-
-
 def encode_pointcloud(fields, bigendian, width, height, row_step, point_step, data,
-                      max_points=2000):
+                      max_points=10000):
     """Pack XYZ only as little-endian float32 records for the cloud renderer."""
     import math
     import struct

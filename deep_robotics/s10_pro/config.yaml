@@ -6,21 +6,23 @@ navigation_task_timeout: 180
 ros:
   robot_domain_id: 0
   core_domain_id: null
+  robot_interface: auto
+  robot_network_cidr: 10.21.33.0/24
 # service.yml targets the S10 onboard host: robot_server runs there and listens
-# on TCP 30003. NETWORK_INTERFACE/CIDR constrain robot-domain DDS; domain 42 is
-# published only by isolated loopback-profiled subprocesses.
+# on TCP 30003. NETWORK_INTERFACE/CIDR constrain robot-domain DDS; domain 42
+# publishers and the control subscriber run in loopback-profiled subprocesses.
 topics:
   imu: "/IMU"
   joints: "/JOINTS_DATA_10HZ"
   battery: "/BATTERY_DATA"
   motion_info: "/MOTION_INFO"
-  # Probe candidates in parallel. Direct sensor sources outrank derived clouds;
-  # otherwise keep the selected source until it has gone stale.
+  # Keep the preferred aligned cloud selected; use another live source only
+  # while it is stale, then switch back as soon as it resumes.
   lidar_cloud:
+    - "/ALIGNED_POINTS"
     - "/local_scans"
     - "/DEPTH_POINTS"
     - "/LIDAR/POINTS"
-    - "/ALIGNED_POINTS"
     - "/CLOUD_REGISTERED_BODY"
     - "/FULL_CLOUD_MAP"
     - "/HANDLER_POINTS_DEBUG"
@@ -40,57 +42,39 @@ topics:
     - "/height_map"
     - "/path"
   lidar_map: "/ACCUMULATED_POINTS_MAP"
-camera_topics:
-  camera_rear:
-    - "/camera/rear/image_raw"
-    - "/camera/rear/image_raw/compressed"
-    - "/camera/rear/color/image_raw"
-    - "/camera/rear/color/image_raw/compressed"
-    - "/camera_back/image_raw"
-    - "/camera_back/image_raw/compressed"
-    - "/camera_0/image_raw"
-    - "/camera_0/image_raw/compressed"
-    - "/usb_camera_1/image_raw"
-    - "/usb_camera_1/image_raw/compressed"
-    # S10 Pro firmware currently exposes the active depth imager here even
-    # when the four RGB camera nodes are not started.
-    - "/DEPTH_IMAGE"
-  camera_left:
-    - "/camera/left/image_raw"
-    - "/camera/left/image_raw/compressed"
-    - "/camera/left/color/image_raw"
-    - "/camera/left/color/image_raw/compressed"
-    - "/camera_left/image_raw"
-    - "/camera_left/image_raw/compressed"
-    - "/camera_1/image_raw"
-    - "/camera_1/image_raw/compressed"
-    - "/usb_camera_2/image_raw"
-    - "/usb_camera_2/image_raw/compressed"
-  camera_front:
-    - "/camera/front/image_raw"
-    - "/camera/front/image_raw/compressed"
-    - "/camera/front/color/image_raw"
-    - "/camera/front/color/image_raw/compressed"
-    - "/camera_front/image_raw"
-    - "/camera_front/image_raw/compressed"
-    - "/camera_2/image_raw"
-    - "/camera_2/image_raw/compressed"
-  camera_right:
-    - "/camera/right/image_raw"
-    - "/camera/right/image_raw/compressed"
-    - "/camera/right/color/image_raw"
-    - "/camera/right/color/image_raw/compressed"
-    - "/camera_right/image_raw"
-    - "/camera_right/image_raw/compressed"
-    - "/camera_3/image_raw"
-    - "/camera_3/image_raw/compressed"
-# JPEG encoding and point-cloud packing run in one bounded worker process per
-# stream; this keeps the robot ROS executor available for control/state topics.
+camera_rtsp:
+  camera_front: "rtsp://10.21.33.103:8554/video4"
+  camera_rear: "rtsp://10.21.33.103:8554/video0"
+  camera_left: "rtsp://10.21.33.103:8554/video2"
+  camera_right: "rtsp://10.21.33.103:8554/video6"
+# Point-cloud packing runs in bounded worker processes; RTSP camera pulling
+# uses independent FFmpeg threads so media cannot block robot ROS callbacks.
 media_workers: true
 basic_server:
   enabled: true
   # On the onboard host, robot_server is reachable at this host address. For a
   # separate driver host, override with the S10 host's reachable address.
   host: "10.21.33.103"
+  transport: tcp
   tcp_port: 30003
+  tls_tcp_port: 30003
+  tls_server_name: server.local
+  tls_sha256_fingerprint: 6cd411bfaffed2c5d93f80d30edb514e6b194ef2e33a199a851bbff9ce50b415
+  tls_client_cert: null
+  tls_client_key: null
   timeout: 2.0
+audio:
+  mode: auto
+  ssh_host: "10.21.33.103"
+  ssh_user: user
+  capture_device: default
+  playback_device: default
+controlled_spatial:
+  # drmap lives on NOS, separate from AOS/basic_server. Auto uses local only
+  # when this host is the NOS management host; otherwise it connects by SSH.
+  mode: auto
+  ssh_user: user
+  ssh_host: "10.21.33.106"
+  directory: /var/opt/robot/data/maps
+  tags_file: /opt/phanthy-motus/data/s10_pro/tags.json
+  timeout: 30

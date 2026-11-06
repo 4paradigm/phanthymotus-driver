@@ -2,13 +2,37 @@ deep-robotics-s10-pro:
   image: __IMAGE__
   container_name: embodied-deep-robotics-s10-pro
   network_mode: host
+  devices:
+    - /dev/snd:/dev/snd
+  volumes:
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
   environment:
     - PYTHONUNBUFFERED=1
     - RCUTILS_COLORIZED_OUTPUT=0
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - ROS_LOCALHOST_ONLY=0
-    - NETWORK_INTERFACE=eth0
+    - NETWORK_INTERFACE=${S10_NETWORK_INTERFACE:-auto}
     - ROBOT_NETWORK_CIDR=10.21.33.0/24
+    - S10_BASIC_SERVER_HOST=${S10_BASIC_SERVER_HOST:-10.21.33.103}
+    - S10_BASIC_SERVER_TRANSPORT=${S10_BASIC_SERVER_TRANSPORT:-tcp}
+    - S10_BASIC_SERVER_TLS_NAME=${S10_BASIC_SERVER_TLS_NAME:-server.local}
+    - S10_BASIC_SERVER_TLS_SHA256=${S10_BASIC_SERVER_TLS_SHA256:-6cd411bfaffed2c5d93f80d30edb514e6b194ef2e33a199a851bbff9ce50b415}
+    - S10_BASIC_SERVER_TLS_CLIENT_CERT=${S10_BASIC_SERVER_TLS_CLIENT_CERT:-}
+    - S10_BASIC_SERVER_TLS_CLIENT_KEY=${S10_BASIC_SERVER_TLS_CLIENT_KEY:-}
+    # Real motion requires explicit deployment authorization.
+    - S10_MOTION_ENABLED=${S10_MOTION_ENABLED:-1}
+    - S10_DRMAP_MODE=${S10_DRMAP_MODE:-auto}
+    - S10_DRMAP_SSH_HOST=${S10_DRMAP_SSH_HOST:-10.21.33.106}
+    - S10_DRMAP_SSH_USER=${S10_DRMAP_SSH_USER:-user}
+    - S10_DRMAP_PASSWORD=${S10_DRMAP_PASSWORD:-'}
+    - S10_DRMAP_DIRECTORY=${S10_DRMAP_DIRECTORY:-/var/opt/robot/data/maps}
+    - S10_AUDIO_CAPTURE_DEVICE=${S10_AUDIO_CAPTURE_DEVICE:-plughw:CARD=rockchipes8388,DEV=0}
+    - S10_AUDIO_PLAYBACK_DEVICE=${S10_AUDIO_PLAYBACK_DEVICE:-default}
+    - S10_AUDIO_MODE=${S10_AUDIO_MODE:-auto}
+    - S10_AUDIO_SSH_HOST=${S10_AUDIO_SSH_HOST:-10.21.33.103}
+    - S10_AUDIO_SSH_USER=${S10_AUDIO_SSH_USER:-user}
+    - S10_AUDIO_SSH_PASSWORD=${S10_AUDIO_SSH_PASSWORD:-'}
+    - S10_SSH_KNOWN_HOSTS=${S10_SSH_KNOWN_HOSTS:-/work/deep_robotics/s10_pro/resource/ssh_known_hosts}
     - AGENT_CORE_URL=https://localhost:15678
   logging:
     driver: local
