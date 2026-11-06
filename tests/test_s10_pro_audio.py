@@ -108,6 +108,8 @@ def test_mic_capture_uses_bounded_latest_only_queue_and_reports_drops(monkeypatc
     assert status["capture_timestamp_trusted"] is False
     assert status["pcm_peak"] == 0
     assert status["pcm_rms"] == 0.0
+    assert status["pcm_window_ms"] == 0
+    assert status["pcm_peak_window"] == 0
 
 
 def test_mic_capture_stamps_frames_from_pipe_arrival(monkeypatch):
@@ -153,6 +155,11 @@ def test_mic_capture_stamps_frames_from_pipe_arrival(monkeypatch):
     assert plugin._pcm_peak == 1
     assert plugin._pcm_rms == 1.0
     assert plugin._pcm_nonzero_ratio == 1.0
+    info = plugin.dispatch("info", {})
+    assert info["pcm_peak_window"] == 1
+    assert info["pcm_rms_window"] == 1.0
+    assert info["pcm_nonzero_ratio_window"] == 1.0
+    assert info["pcm_window_ms"] == 32
     stamp = published[0].header.stamp
     assert stamp.sec > 0
     assert 0 <= stamp.nanosec < 1_000_000_000

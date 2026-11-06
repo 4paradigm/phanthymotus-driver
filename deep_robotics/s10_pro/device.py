@@ -309,7 +309,7 @@ class S10Nodes:
                     stats[f"_{stage}_rate_count"] = stats[stage]
                     stats[f"_{stage}_rate_time"] = monotonic_now
             first = stats[stage] == 1
-            report_rate = (key in {"camera_left", "camera_rear", *LIDAR_LANES} and
+            report_rate = (key in {*CAMERA_LANES, *LIDAR_LANES} and
                            monotonic_now - stats.get("last_rate_log", monotonic_now) >= 10.0)
             if report_rate:
                 stats["last_rate_log"] = monotonic_now

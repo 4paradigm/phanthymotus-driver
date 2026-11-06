@@ -38,7 +38,8 @@ and enables `Main Mic`. It reads the codec's low-level noise-gate state and turn
 the gate off only when it is enabled; an already-disabled gate is left alone.
 The AOS factory ALSA state selected Line 1 and enabled a gate that reduced the
 published signal to near-zero; `mic info` includes latest-frame PCM peak, RMS,
-and nonzero-sample ratio to distinguish live audio from a silent input.
+and nonzero-sample ratio plus a rolling 3.2-second peak/RMS/nonzero ratio to
+distinguish live audio from a silent input after a short speech test.
 The mic bridge keeps at most four 32 ms frames (128 ms) and replaces the oldest
 queued frame if its publisher falls behind. Raw `arecord`/SSH output has no
 hardware capture timestamp, so mic messages use a pipe-arrival estimate in

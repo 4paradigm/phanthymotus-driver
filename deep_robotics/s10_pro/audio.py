@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections import deque
 from pathlib import Path
 import queue
 import shlex
@@ -26,6 +27,7 @@ FRAME_DURATION_NS = FRAME_BYTES * 1_000_000_000 // (16_000 * 2)
 MAX_AUDIO_FRAME_BYTES = 256 * 1024
 AUDIO_EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"
 MIC_BRIDGE_QUEUE_DEPTH = 4  # 128 ms at 32 ms per PCM frame.
+MIC_STATS_WINDOW_FRAMES = 100  # 3.2 s at 32 ms per frame.
 
 
 def _pcm_card(device):
@@ -146,6 +148,8 @@ class S10MicPlugin:
         self._pcm_peak = 0
         self._pcm_rms = 0.0
         self._pcm_nonzero_ratio = 0.0
+        self._pcm_window = deque(maxlen=MIC_STATS_WINDOW_FRAMES)
+        self._pcm_lock = threading.Lock()
         self._bridge_dropped_at_start = 0
         self._last_error = None
 
@@ -199,9 +203,11 @@ class S10MicPlugin:
                 return {"state": "error", "error": self._last_error}
             self._stop.clear()
             self._frames = 0
-            self._pcm_peak = 0
-            self._pcm_rms = 0.0
-            self._pcm_nonzero_ratio = 0.0
+            with self._pcm_lock:
+                self._pcm_peak = 0
+                self._pcm_rms = 0.0
+                self._pcm_nonzero_ratio = 0.0
+                self._pcm_window.clear()
             self._last_error = None
             self._reader = threading.Thread(target=self._capture_loop, daemon=True,
                                             name="s10-mic-capture")
@@ -235,10 +241,13 @@ class S10MicPlugin:
                     del buffer[:FRAME_BYTES]
                     samples = struct.unpack("<512h", payload)
                     peak = max(abs(sample) for sample in samples)
-                    self._pcm_peak = peak
-                    self._pcm_rms = (sum(sample * sample for sample in samples) /
-                                     len(samples)) ** 0.5
-                    self._pcm_nonzero_ratio = sum(sample != 0 for sample in samples) / len(samples)
+                    sample_squares = sum(sample * sample for sample in samples)
+                    nonzero_samples = sum(sample != 0 for sample in samples)
+                    with self._pcm_lock:
+                        self._pcm_peak = peak
+                        self._pcm_rms = (sample_squares / len(samples)) ** 0.5
+                        self._pcm_nonzero_ratio = nonzero_samples / len(samples)
+                        self._pcm_window.append((peak, sample_squares, len(samples), nonzero_samples))
                     message = AudioChunk()
                     # Raw arecord/SSH PCM has no timestamp. Approximate the
                     # first sample time when the complete frame arrives.
@@ -283,11 +292,24 @@ class S10MicPlugin:
             return self._stop_capture()
         if action == "info":
             running = self._process is not None and self._process.poll() is None
+            with self._pcm_lock:
+                window = tuple(self._pcm_window)
+                pcm_peak, pcm_rms, pcm_nonzero_ratio = (
+                    self._pcm_peak, self._pcm_rms, self._pcm_nonzero_ratio)
+            window_samples = sum(item[2] for item in window)
+            window_rms = ((sum(item[1] for item in window) / window_samples) ** 0.5
+                          if window_samples else 0.0)
+            window_nonzero = (sum(item[3] for item in window) / window_samples
+                              if window_samples else 0.0)
             result = {"state": "running" if running else "idle", "frames": self._frames,
                       "frames_dropped": max(0, self._bridge_drop_count() - self._bridge_dropped_at_start),
-                      "pcm_peak": self._pcm_peak,
-                      "pcm_rms": round(self._pcm_rms, 2),
-                      "pcm_nonzero_ratio": round(self._pcm_nonzero_ratio, 4),
+                      "pcm_peak": pcm_peak,
+                      "pcm_rms": round(pcm_rms, 2),
+                      "pcm_nonzero_ratio": round(pcm_nonzero_ratio, 4),
+                      "pcm_peak_window": max((item[0] for item in window), default=0),
+                      "pcm_rms_window": round(window_rms, 2),
+                      "pcm_nonzero_ratio_window": round(window_nonzero, 4),
+                      "pcm_window_ms": len(window) * FRAME_DURATION_NS // 1_000_000,
                       "capture_timestamp_trusted": False,
                       "topic_out": self.get_tool()["topic_out"], "mode": self.mode,
                       "audio_host": self.host if self.mode == "ssh" else None}
