@@ -178,6 +178,20 @@ def test_actuator_start_surfaces_tls_reboot_requirement_to_frontend(monkeypatch)
     assert not motion._thread.is_alive()
 
 
+def test_s10_plugins_return_none_for_unknown_actions(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    plugins = [
+        device.S10ModelPlugin(),
+        device.S10MotionPlugin(native),
+        device.S10NavigationPlugin(native),
+        device.S10SingleLightPlugin(native, "head"),
+        device.S10ChargePlugin(native),
+    ]
+    for plugin in plugins:
+        assert plugin.dispatch("unknown_action", {}) is None
+
+
 def test_state_cards_expose_core_topics_when_ros_nodes_are_present(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})

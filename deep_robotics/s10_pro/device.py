@@ -797,7 +797,7 @@ class S10ModelPlugin:
             return {"state": "ready"}
         if action == "model":
             return {"urdf": URDF_PATH.read_text(encoding="utf-8")}
-        return {"state": "ready"}
+        return None
 
 
 class S10StatePlugin:
@@ -1191,7 +1191,7 @@ class S10MotionPlugin:
             return {**sent, "state": "streaming", "frequency_hz": 10,
                     "duration": 60 if duration == -1 else duration, "auto_stop": True,
                     "action_id": action_id}
-        raise ValueError(f"unsupported S10 loco action: {action}")
+        return None
 
 
 class S10NavigationPlugin:
@@ -1417,7 +1417,7 @@ class S10NavigationPlugin:
                 return {"ok": False, "code": "WORKER_START_FAILED", "error": str(exc)}
             return {"state": "accepted", "action": action, "waypoint_count": len(items),
                     "action_id": action_id, "task_timeout": timeout}
-        raise ValueError(f"unsupported S10 navigation action: {action}")
+        return None
 
 
 LIGHT_COLORS = {"黑色": 0, "白色": 1, "绿色": 2, "蓝色": 3}
@@ -1474,7 +1474,7 @@ class S10SingleLightPlugin:
         if action == "info":
             return {"state": "ready"}
         if action not in self.ACTIONS:
-            raise ValueError(f"unsupported S10 {self.side} light action: {action}")
+            return None
         effect_code = LIGHT_ACTION_EFFECTS[action][1]
         led = {"Type": effect_code}
         color = args.get("color", "白色")
@@ -1518,7 +1518,7 @@ class S10ChargePlugin:
         if action == "info": return {"state": "ready"}
         if action == "start_charging": return self.native.request(0x00100004, 0x00100002, {"Charge": 1})
         if action == "stop_charging": return self.native.request(0x00100004, 0x00100002, {"Charge": 0})
-        raise ValueError(f"unsupported S10 charging action: {action}")
+        return None
 
 
 def build_plugins(config, namespace=None, ros2=None):
