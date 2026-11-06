@@ -123,6 +123,7 @@ class BumiDeviceBundle:
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
         loco_plugin = None
+        motion_state_plugin = None
         # The camera subprocess reads this env var; set it before any plugin can
         # start that subprocess, so the raw RGB-D branch is published only when
         # the visual odometry card is enabled.
@@ -197,6 +198,18 @@ class BumiDeviceBundle:
                 plugins_cfg["motion_state"], namespace, executor, high_ctrl)
             self._plugins.append(motion_state_plugin)
             print("[bundle] MotionStatePlugin loaded")
+
+        if (plugins_cfg.get("foot_pose", {}).get("enabled", False)
+                and high_ctrl is not None and loco_plugin is not None):
+            from foot_pose import FootPosePlugin
+            from device import _acp_notify
+            self._plugins.append(FootPosePlugin(
+                plugins_cfg["foot_pose"], namespace, executor, high_ctrl, loco_plugin,
+                snapshot_reader=(motion_state_plugin._node._read_once
+                                 if motion_state_plugin is not None else None),
+                notifier=_acp_notify,
+            ))
+            print("[bundle] FootPosePlugin loaded (physical assets required)")
 
         if plugins_cfg.get("vision_capture", {}).get("enabled", False):
             from device import VisionCapturePlugin
