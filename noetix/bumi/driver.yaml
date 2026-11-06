@@ -24,6 +24,7 @@ cards:
   - { name: semantic_action,   type: actuator }
   - { name: action_recording,  type: actuator }
   - { name: mic,               type: sensor }
+  - { name: audio_environment, type: processor }
   - { name: sound_direction,   type: sensor }
   - { name: speaker,           type: actuator }
   - { name: camera,            type: sensor }

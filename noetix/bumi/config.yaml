@@ -38,6 +38,13 @@ plugins:
     min_wz_moving_rads: 0.25    # 归一化边界 0.30 × 0.83
   mic:
     enabled: true
+  audio_environment:
+    enabled: true
+    calibration_s: 5.0
+    hold_s: 2.0
+    recover_s: 2.0
+    rise_db: 12.0
+    fall_db: 6.0
   sound_direction:
     enabled: true
   speaker:
