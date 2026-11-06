@@ -12,3 +12,5 @@ if __name__ == "__main__":
         server_name="realman-rm75-6f-v",
         build_plugins=build_plugins,
     )
+
+# TEST ONLY: PR-scoped Deploy Approval COS evidence E2E; do not merge.
