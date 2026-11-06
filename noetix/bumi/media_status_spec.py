@@ -171,7 +171,7 @@ def interface() -> dict:
     description rather than from a second schema that can drift.
     """
     return {
-        "card": "system_health",
+        "card": "media_status",
         "read_only": True,
         "awake_statuses": list(AWAKE_STATUSES),
         "fault_reasons": list(HARD_FAULT_REASONS),

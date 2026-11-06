@@ -81,7 +81,7 @@ plugins:
       camera_to_body:
         translation: [0.0, 0.0, 0.0]
         quaternion: [-0.5, 0.5, -0.5, 0.5]
-  system_health:
+  media_status:
     enabled: true
     # 只读：读工作状态、变化原因、错误码和自动休眠阈值，不下发任何命令。
     # 1 Hz 足够 —— 状态变化本身很慢，休眠/唤醒的跳变 1 秒内必被看到，

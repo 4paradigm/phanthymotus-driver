@@ -8,7 +8,7 @@ drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
   - LocoPlugin: locomotion, stand-up/prone storage, semantic actions and action recording
   - MicPlugin: 8ch mic capture → mono PCM 16kHz
   - SpeakerPlugin: audio playback via MediaController
-  - SystemHealthPlugin: on-board media unit state (read-only)
+  - MediaStatusPlugin: on-board media unit state (read-only)
   - CameraPlugin: Realsense D435i color + depth
   - MotionStatePlugin: combined whole-body motion state
 """
@@ -3060,7 +3060,7 @@ class MotionStatePlugin:
         return None
 
 
-# ── SystemHealthPlugin (read-only view of the media unit's own state) ───────
+# ── MediaStatusPlugin (read-only view of the media unit's own state) ───────
 
 # Refresh period for the auto-sleep threshold. `get_timeout()` is a separate
 # DDS query and the value only changes when somebody sets it, so it is cached
@@ -3068,7 +3068,7 @@ class MotionStatePlugin:
 _SLEEP_THRESHOLD_REFRESH_S = 60.0
 
 
-class _SystemHealthNode(Node):
+class _MediaStatusNode(Node):
     """Polls the media unit's own status and publishes it as one JSON sample.
 
     Read-only by construction: this node calls `get_system_status`,
@@ -3076,15 +3076,15 @@ class _SystemHealthNode(Node):
     setter. A health card that could also change the thing it reports would have
     to be trusted not to, and this one is meant to be safe to leave on screen.
 
-    The payload itself is built in `system_health_spec`, which imports no
+    The payload itself is built in `media_status_spec`, which imports no
     rclpy, so the part where a mistake would be silent — which states count as
     a fault — is testable on a laptop.
     """
 
     def __init__(self, namespace: str, media_ctrl, interval_s: float):
-        super().__init__("bumi_system_health")
+        super().__init__("bumi_media_status")
         self._media_ctrl = media_ctrl
-        self._topic = f"/{namespace}/system/health"
+        self._topic = f"/{namespace}/media/status"
         self._pub = self.create_publisher(String, self._topic, 10)
         self._interval_s = interval_s
         self._running = False
@@ -3127,7 +3127,7 @@ class _SystemHealthNode(Node):
         self._generation += 1
         self._thread = threading.Thread(target=self._loop, args=(self._generation,),
                                         daemon=True,
-                                        name="bumi_system_health")
+                                        name="bumi_media_status")
         self._thread.start()
 
     def stop_polling(self):
@@ -3161,7 +3161,7 @@ class _SystemHealthNode(Node):
                 break
 
     def _failed_sample(self, exc) -> dict:
-        import system_health_spec
+        import media_status_spec
 
         self._read_errors += 1
         self._pair = None
@@ -3172,16 +3172,16 @@ class _SystemHealthNode(Node):
         if self._read_errors == 1 or self._read_errors % 100 == 0:
             self.get_logger().warn(
                 f"system health read failed ({self._read_errors}): {exc}")
-        return system_health_spec.sample(
+        return media_status_spec.sample(
             received_ms=int(time.time() * 1000), read_errors=self._read_errors)
 
     def _read_once(self, *, refresh_timeout: bool = False) -> dict:
-        import system_health_spec
+        import media_status_spec
 
         now = time.monotonic()
         status = self._media_ctrl.get_system_status()
-        work_status = system_health_spec.status_name(getattr(status, "value", None))
-        reason = system_health_spec.status_name(getattr(status, "reason", None))
+        work_status = media_status_spec.status_name(getattr(status, "value", None))
+        reason = media_status_spec.status_name(getattr(status, "reason", None))
 
         if (work_status, reason) != self._pair:
             # A wakeup nobody watched happen has no age, so only a transition
@@ -3196,7 +3196,7 @@ class _SystemHealthNode(Node):
 
         error_code, error_message = self._read_error()
         self._read_errors = 0
-        return system_health_spec.sample(
+        return media_status_spec.sample(
             work_status=work_status,
             reason=reason,
             error_code=error_code,
@@ -3243,15 +3243,15 @@ class _SystemHealthNode(Node):
         return self._sleep_after_ms
 
 
-class SystemHealthPlugin:
-    PREFIX = "system_health"
+class MediaStatusPlugin:
+    PREFIX = "media_status"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
         interval = _finite_number(plugin_config.get("poll_interval_s", 1.0),
                                   "poll_interval_s")
         if not 0.2 <= interval <= 5.0:
             raise ValueError("poll_interval_s must be in [0.2, 5.0]")
-        self._node = _SystemHealthNode(namespace, media_ctrl, interval)
+        self._node = _MediaStatusNode(namespace, media_ctrl, interval)
         executor.add_node(self._node)
 
     def _topic_out(self) -> list:
@@ -3259,7 +3259,7 @@ class SystemHealthPlugin:
 
     def get_tool(self) -> dict:
         return {
-            "name": "system_health", "type": "sensor", "multiInstance": False,
+            "name": "media_status", "type": "sensor", "multiInstance": False,
             "description": (
                 "Bumi 板载媒体单元（负责语音与相机的那套小系统）的运行健康，只读。"
                 "持续输出当前工作状态（就绪 / 已休眠 / 已唤醒 / 退出）、"
@@ -3301,7 +3301,7 @@ class SystemHealthPlugin:
             self._node.stop_polling()
             return {"state": "idle"}
         if action == "info":
-            import system_health_spec
+            import media_status_spec
 
             return {
                 **self._node.read_now(),
@@ -3310,7 +3310,7 @@ class SystemHealthPlugin:
                 # Read once by anything that needs to know which states mean
                 # "awake" and which reason means a real fault, instead of
                 # hard-coding the vocabulary somewhere else.
-                "interface": system_health_spec.interface(),
+                "interface": media_status_spec.interface(),
             }
         return None
 

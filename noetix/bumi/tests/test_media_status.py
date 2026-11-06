@@ -1,6 +1,6 @@
 """The media-unit state card's payload rules, exercised off a robot.
 
-`system_health_spec` imports no `rclpy` precisely so that these can run on a
+`media_status_spec` imports no `rclpy` precisely so that these can run on a
 laptop. What is worth pinning down here is not that the dictionary has the right
 keys but the three decisions that would be silent if they broke: sleep is not a
 fault, an unreadable status is not a healthy one, and nothing is nested (the
@@ -16,7 +16,7 @@ from test_mic_card import _load_device
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import system_health_spec as spec  # noqa: E402
+import media_status_spec as spec  # noqa: E402
 
 
 def _sample(**overrides):
@@ -201,7 +201,7 @@ def _node(monkeypatch, media, interval=1.0):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
     clock = _Clock()
     monkeypatch.setattr(module, "time", clock)
-    node = module._SystemHealthNode("robot", media, interval)
+    node = module._MediaStatusNode("robot", media, interval)
     # The shared rclpy stub has no logger; record warnings instead.
     warned = []
     node.get_logger = lambda: types.SimpleNamespace(warn=warned.append,
@@ -211,14 +211,14 @@ def _node(monkeypatch, media, interval=1.0):
 
 def test_the_card_declares_one_read_only_json_topic(monkeypatch):
     module, _ = _load_device(monkeypatch)
-    plugin = module.SystemHealthPlugin(
+    plugin = module.MediaStatusPlugin(
         {}, "robot", types.SimpleNamespace(add_node=lambda _: None), _Media())
     tool = plugin.get_tool()
 
-    assert tool["name"] == "system_health"
+    assert tool["name"] == "media_status"
     assert tool["type"] == "sensor"
     assert tool["multiInstance"] is False
-    assert tool["topic_out"] == [{"topic": "/robot/system/health",
+    assert tool["topic_out"] == [{"topic": "/robot/media/status",
                                   "format": "data/json"}]
     assert tool["inputSchema"]["properties"]["action"]["enum"] == [
         "start", "stop", "info"]
@@ -274,7 +274,7 @@ def test_an_outage_breaks_the_observation_and_restarts_it(monkeypatch):
 def test_info_answers_live_values_without_waiting_for_the_topic(monkeypatch):
     module, _ = _load_device(monkeypatch)
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
-    plugin = module.SystemHealthPlugin(
+    plugin = module.MediaStatusPlugin(
         {}, "robot", types.SimpleNamespace(add_node=lambda _: None),
         _Media("SLEEPED", "TIMEOUT_SLEEPED", timeout_ms=90000))
 
@@ -283,7 +283,7 @@ def test_info_answers_live_values_without_waiting_for_the_topic(monkeypatch):
     assert result["state"] == "idle"          # not started in this test
     assert result["work_status_text"] == "已休眠"
     assert result["sleep_after_s"] == 90.0
-    assert result["topic_out"] == [{"topic": "/robot/system/health",
+    assert result["topic_out"] == [{"topic": "/robot/media/status",
                                     "format": "data/json"}]
     # The vocabulary travels with the card so nothing else has to hard-code it.
     assert result["interface"]["fault_reasons"] == ["ERROR_SLEEPED"]
@@ -297,7 +297,7 @@ def test_an_out_of_range_poll_interval_is_rejected(monkeypatch):
     executor = types.SimpleNamespace(add_node=lambda _: None)
 
     with pytest.raises(ValueError):
-        module.SystemHealthPlugin({"poll_interval_s": 30.0}, "robot",
+        module.MediaStatusPlugin({"poll_interval_s": 30.0}, "robot",
                                   executor, _Media())
 
 
@@ -330,3 +330,15 @@ def test_a_stopped_card_leaves_no_thread_behind(monkeypatch):
     assert node.running is False
     assert node._thread is None
     assert not first.is_alive()
+
+
+def test_the_spec_module_reaches_the_image():
+    """`device.py` imports the spec at runtime, and this bundle copies modules
+    into the image one by one instead of copying the directory. A spec that is
+    on disk but not in the image passes every test here and then publishes
+    nothing at all on the robot — the import fails inside the polling thread and
+    the card never appears. The COPY line is part of the contract."""
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(
+        encoding="utf-8")
+
+    assert "COPY media_status_spec.py /work/media_status_spec.py" in dockerfile

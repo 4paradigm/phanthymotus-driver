@@ -264,14 +264,17 @@ in `device.py`; no extra runtime Python file is required.
 
 ## New cards
 
-### `system_health` — 板载媒体单元的运行状态
+### `media_status` — 板载媒体单元的运行状态
 
 只读。Bumi 身上有两套计算单元：管腿和行走的 `HighController`，以及管听、说、看的那台
 板载媒体单元（`MediaController`）。现有卡片只用到后者的**输出**（相机画面、麦克风音频），
 没有一张说明它自己现在是什么状态 —— 于是"机器人不说话了"这件事，在仪表盘上和
 "机器人坏了"长得一模一样。
 
-输出 `/<namespace>/system/health`（`data/json`，默认 1 Hz），字段全是顶层标量，好让
+命名上刻意与 `system_health` 区分：那张卡看的是算力板的操作系统指标（温度、CPU、
+内存、文件系统），这张看的是厂商媒体栈自己的状态机与错误码，两者没有重叠字段。
+
+输出 `/<namespace>/media/status`（`data/json`，默认 1 Hz），字段全是顶层标量，好让
 仪表盘的 KV 面板直接渲染：
 
 | 字段 | 含义 |
@@ -304,9 +307,10 @@ in `device.py`; no extra runtime Python file is required.
 `wakeup` / `sleep` / `restart`，也不改音量或超时。一张能顺手把被观测对象改掉的健康卡，
 需要别人先相信它不会。
 
-载荷的构造在 `system_health_spec.py`，不导入 rclpy，所以"哪些状态算故障"这条规则在
-笔记本上就能测（`tests/test_system_health.py`）。配置在 `plugins.system_health`：
-`poll_interval_s` 默认 `1.0`，允许 `[0.2, 5.0]`。
+载荷的构造在 `media_status_spec.py`，不导入 rclpy，所以"哪些状态算故障"这条规则在
+笔记本上就能测（`tests/test_media_status.py`）。配置在 `plugins.media_status`：
+`poll_interval_s` 默认 `1.0`，允许 `[0.2, 5.0]`。该模块必须在镜像里单独 `COPY`
+（见 `Dockerfile` 末尾的模块清单），否则容器内 import 失败，卡片不会有任何输出。
 
 ### `motion_state`
 
