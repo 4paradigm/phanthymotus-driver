@@ -918,7 +918,7 @@ def test_service_configures_verified_s10_robot_network_without_shell_exports():
     assert environment["NETWORK_INTERFACE"] == "${S10_NETWORK_INTERFACE:-auto}"
     assert environment["S10_BASIC_SERVER_HOST"] == "${S10_BASIC_SERVER_HOST:-10.21.33.103}"
     assert environment["S10_BASIC_SERVER_TRANSPORT"] == "${S10_BASIC_SERVER_TRANSPORT:-tcp}"
-    assert environment["S10_MOTION_ENABLED"] == "${S10_MOTION_ENABLED:-0}"
+    assert environment["S10_MOTION_ENABLED"] == "${S10_MOTION_ENABLED:-1}"
     assert environment["S10_DRMAP_MODE"] == "${S10_DRMAP_MODE:-auto}"
     assert environment["S10_DRMAP_SSH_HOST"] == "${S10_DRMAP_SSH_HOST:-10.21.33.106}"
     assert environment["S10_DRMAP_SSH_USER"] == "${S10_DRMAP_SSH_USER:-user}"

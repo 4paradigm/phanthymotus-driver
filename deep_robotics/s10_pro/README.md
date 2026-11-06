@@ -86,8 +86,10 @@ is sent. After a successful check, this driver uses TCP for basic_server.
 subscribes on Core domain 42 through a loopback-only bridge process, requires
 `S10_MOTION_ENABLED=1` at deployment plus `confirm=true` before switching out
 of dry-run (also accepted atomically on `start`), and stops on its watchdog.
-The supplied service fragment defaults to read-only; explicitly set
-`S10_MOTION_ENABLED=1` for supervised physical operation. The speed limits
+The supplied service fragment enables the deployment permission by default
+(`S10_MOTION_ENABLED=1`), but the servo itself remains in dry-run mode until a
+frontend start explicitly supplies `dry_run=false` and `confirm=true`. Set
+`S10_MOTION_ENABLED=0` in the deployment environment to revoke permission. The speed limits
 match the real-robot-tested `loco` card (`vx=1.67 m/s`, `vy=0.4 m/s`,
 `wz=1.0 rad/s`). Per-step delta limits are additional software shaping, not
 claimed as measured hardware limits.
