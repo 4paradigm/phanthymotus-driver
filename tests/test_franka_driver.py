@@ -35,12 +35,13 @@ with mock.patch.dict(sys.modules, {"hardware": hardware, "discovery": discovery}
 
 
 class FakeSession:
-    """Only the read-only session interface exists; no motion API is available."""
+    """A session fixture for the existing state-card lifecycle tests."""
 
     def __init__(self, address, **options):
         self.address = address
         self.closed = 0
         self._stop = threading.Event()
+        self.owners = set()
         self.close_deadline = 0.5
         self.value = {
             "robot_ip": address, "state": "connecting", "connected": False,
@@ -49,6 +50,15 @@ class FakeSession:
 
     def snapshot(self):
         return copy.deepcopy(self.value)
+
+    def register_owner(self, owner):
+        self.owners.add(owner)
+
+    def release_owner(self, owner):
+        self.owners.discard(owner)
+
+    def begin_close(self):
+        self._stop.set()
 
     @property
     def stopping(self):
