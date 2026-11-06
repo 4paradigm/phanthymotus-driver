@@ -113,7 +113,7 @@ def labels(work_status, reason) -> tuple[str, str]:
 def sample(*, work_status=None, reason=None, error_code: int = 0,
            error_message: str = "", sleep_after_ms=None, received_ms: int,
            observed_for_s=None, last_wakeup_age_s=None,
-           read_errors: int = 0) -> dict:
+           read_errors: int = 0, controller_present: bool = True) -> dict:
     """One `data/json` sample of the media unit's state.
 
     Every field is a top-level scalar because the dashboard's `data/json`
@@ -123,6 +123,11 @@ def sample(*, work_status=None, reason=None, error_code: int = 0,
 
     `work_status=None` means the read failed, not that the unit is idle: the
     state fields then report `unknown` and `healthy` is `None`.
+
+    `controller_present=False` says the SDK object was never created, so no
+    number of retries will change the answer. Both cases report
+    `healthy: None`, and a renderer that showed only that would leave an
+    operator waiting on a unit that is not coming back.
     """
     bare_status = status_name(work_status)
     bare_reason = status_name(reason)
@@ -155,6 +160,7 @@ def sample(*, work_status=None, reason=None, error_code: int = 0,
         "error_message": str(error_message or ""),
         "observed_for_s": _seconds(observed_for_s),
         "last_wakeup_age_s": _seconds(last_wakeup_age_s),
+        "controller_present": bool(controller_present),
         "read_errors": int(read_errors or 0),
     }
 

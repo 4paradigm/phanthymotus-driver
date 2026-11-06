@@ -342,3 +342,47 @@ def test_the_spec_module_reaches_the_image():
         encoding="utf-8")
 
     assert "COPY media_status_spec.py /work/media_status_spec.py" in dockerfile
+
+def test_a_missing_controller_is_not_the_same_as_a_failed_read():
+    """Both report `healthy: null`, so a renderer showing only that cannot tell
+    "ask again in a second" from "this will not change until the container is
+    restarted". `controller_present` is the difference."""
+    failed_read = spec.sample(received_ms=0, read_errors=3)
+    missing = spec.sample(received_ms=0, read_errors=3, controller_present=False)
+
+    assert failed_read["healthy"] is None and missing["healthy"] is None
+    assert failed_read["controller_present"] is True
+    assert missing["controller_present"] is False
+
+
+def test_a_media_unit_that_never_initialised_still_reports(monkeypatch):
+    """`main.py` registers this card without a controller, because the media
+    unit failing to come up is the condition the card exists to show. It must
+    then publish a sample rather than die on the way in: `healthy: null`,
+    `controller_present: false`, and a `read_errors` that keeps climbing."""
+    _, node, _, warned = _node(monkeypatch, None)
+
+    first = node.read_now()
+    second = node.read_now()
+
+    assert first["healthy"] is None
+    assert first["awake"] is None
+    assert first["controller_present"] is False
+    assert first["read_errors"] == 1
+    assert second["read_errors"] == 2
+    # The log line is a diagnosis, not "NoneType has no attribute ...".
+    assert "MediaController did not initialise" in str(warned[0])
+
+
+def test_start_answers_the_documented_sensor_shape(monkeypatch):
+    """One `state` and nothing else, as `motion_state` does: the topic
+    description belongs to `get_tool()` and to `info`, and a bundle-level
+    consumer that validates the lifecycle reply rejects extra fields."""
+    module, _ = _load_device(monkeypatch)
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    plugin = module.MediaStatusPlugin(
+        {}, "robot", types.SimpleNamespace(add_node=lambda _: None), _Media())
+
+    assert plugin.dispatch("start", {}) == {"state": "running"}
+
+    plugin.dispatch("stop", {})

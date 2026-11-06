@@ -175,8 +175,12 @@ class BumiDeviceBundle:
             self._plugins.append(SpeakerPlugin(plugins_cfg["speaker"], namespace, executor, media_ctrl))
             print("[bundle] SpeakerPlugin loaded")
 
-        if (plugins_cfg.get("media_status", {}).get("enabled", False)
-                and media_ctrl is not None):
+        if plugins_cfg.get("media_status", {}).get("enabled", False):
+            # Deliberately not gated on `media_ctrl is not None`, unlike the
+            # cards above. They consume the media unit, so without it they have
+            # nothing to do; this card *reports* it, and the state worth seeing
+            # — the controller never came up — is exactly the one a gate would
+            # delete the card for. It publishes `healthy: null` instead.
             from device import MediaStatusPlugin
             self._plugins.append(MediaStatusPlugin(
                 plugins_cfg["media_status"], namespace, executor, media_ctrl))

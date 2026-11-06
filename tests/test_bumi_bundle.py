@@ -61,6 +61,23 @@ class FakeSpeakerPlugin:
         pass
 
 
+class FakeMediaStatusPlugin:
+    def __init__(self, plugin_config, namespace, executor, media_ctrl):
+        self.media_ctrl = media_ctrl
+
+    def get_tool(self):
+        return {"name": "media_status", "type": "sensor"}
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, _args):
+        return {"state": action}
+
+
 @pytest.fixture
 def bundle_module(monkeypatch):
     """Load the real bundle and servo card with hardware imports replaced."""
@@ -73,6 +90,7 @@ def bundle_module(monkeypatch):
     fake_device = types.ModuleType("device")
     fake_device.LocoPlugin = FakeLocoPlugin
     fake_device.SpeakerPlugin = FakeSpeakerPlugin
+    fake_device.MediaStatusPlugin = FakeMediaStatusPlugin
     monkeypatch.setitem(sys.modules, "device", fake_device)
     monkeypatch.syspath_prepend(str(BUMI))
     previous_loco_servo = sys.modules.pop("loco_servo", None)
@@ -170,3 +188,20 @@ def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
     assert [tool["name"] for tool in bundle.get_all_tools()] == [
         "loco", "loco_servo", "speaker"]
 
+@pytest.mark.parametrize("media_ctrl", [None, object()])
+def test_media_status_registers_even_without_a_media_controller(
+        bundle_module, media_ctrl):
+    """Unlike the cards that consume the media unit, this one reports it. The
+    controller failing to initialise is precisely the state it exists to make
+    visible, so gating registration on `media_ctrl is not None` would delete the
+    card in the only situation an operator needs it: `tools/list` would carry no
+    `media_status`, no `/media/status` topic would ever appear, and a
+    disconnected unit would look exactly like a driver without the card."""
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["media_status"] = {"enabled": True}
+
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), FakeHighCtrl(), media_ctrl)
+
+    assert [tool["name"] for tool in bundle.get_all_tools()] == ["media_status"]
+    assert bundle._plugins[0].media_ctrl is media_ctrl

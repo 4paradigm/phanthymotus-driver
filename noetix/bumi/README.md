@@ -289,8 +289,9 @@ in `device.py`; no extra runtime Python file is required.
 | `observed_for_s` | 本驱动观察到当前状态持续的时长 |
 | `last_wakeup_age_s` | 距最近一次**被观察到**的唤醒多久；没观察到就是 `null` |
 | `read_errors` | 连续读取失败次数，成功后归零 |
+| `controller_present` | 媒体控制器是否真的创建成功；`false` 时重试不会自行恢复 |
 
-三条规则：
+四条规则：
 
 - **休眠不是故障。** 超时休眠是这台机器人最常见的正常状态，把它报成 `healthy: false`
   会让告警在正常使用时一直响，然后被忽略。`device.py` 对播放早已采用同一条规则
@@ -302,6 +303,10 @@ in `device.py`; no extra runtime Python file is required.
   对 IMU 记过同一件事），所以 `observed_for_s` 从本驱动第一次看到该状态起算；一次读
   失败会打断观测，恢复后重新计时，而不是跨过那段不知道发生了什么的时间。
   `last_wakeup_age_s` 只有在驱动运行期间真的看到一次切到 `WAKEUPED` 时才有值。
+- **控制器没起来也要注册。** 与 `mic` / `speaker` 那些消费媒体单元的卡片不同，这张卡
+  不因 `media_ctrl is None` 被跳过（`main.py`）：媒体单元初始化失败恰好是它要报的病，
+  按控制器是否可用决定注册与否，等于把卡片从唯一需要的场景里删掉。此时它照常发布
+  `healthy: null`、`controller_present: false`，`read_errors` 持续增长。
 
 不带任何写操作：只调用 `get_system_status` / `get_system_error` / `get_timeout`，不调用
 `wakeup` / `sleep` / `restart`，也不改音量或超时。一张能顺手把被观测对象改掉的健康卡，

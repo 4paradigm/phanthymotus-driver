@@ -3068,6 +3068,17 @@ class MotionStatePlugin:
 _SLEEP_THRESHOLD_REFRESH_S = 60.0
 
 
+class _MediaUnitUnavailable(RuntimeError):
+    """The media controller was never created, so there is nothing to poll.
+
+    Distinct from a failed read: a failed read may well succeed on the next
+    sample, while this one cannot clear without restarting the container. The
+    payload says which of the two it is (`controller_present`), because an
+    operator waiting for `healthy` to come back needs to know whether waiting
+    can help.
+    """
+
+
 class _MediaStatusNode(Node):
     """Polls the media unit's own status and publishes it as one JSON sample.
 
@@ -3171,12 +3182,22 @@ class _MediaStatusNode(Node):
         # rest. A recovered read resets the count silently.
         if self._read_errors == 1 or self._read_errors % 100 == 0:
             self.get_logger().warn(
-                f"system health read failed ({self._read_errors}): {exc}")
+                f"media status read failed ({self._read_errors}): {exc}")
         return media_status_spec.sample(
-            received_ms=int(time.time() * 1000), read_errors=self._read_errors)
+            received_ms=int(time.time() * 1000), read_errors=self._read_errors,
+            controller_present=self._media_ctrl is not None)
 
     def _read_once(self, *, refresh_timeout: bool = False) -> dict:
         import media_status_spec
+
+        if self._media_ctrl is None:
+            # The bundle registers this card without a controller on purpose
+            # (see `main.py`), so reaching here means the media unit never
+            # initialised — the failure this card exists to make visible.
+            # Raising keeps that a diagnosis in the log and a `healthy: null`
+            # sample on the topic, rather than an AttributeError on None.
+            raise _MediaUnitUnavailable(
+                "media unit unavailable: MediaController did not initialise at startup")
 
         now = time.monotonic()
         status = self._media_ctrl.get_system_status()
@@ -3267,7 +3288,8 @@ class MediaStatusPlugin:
                 "出错休眠、复位）、最近一次错误码与说明、自动休眠阈值，"
                 "以及本驱动观察到该状态持续的时长。"
                 "休眠是正常状态，不是故障 —— 只有出错休眠（ERROR_SLEEPED）才算坏；"
-                "读不到状态时 healthy 为 null 而不是 true。"
+                "读不到状态时 healthy 为 null 而不是 true，"
+                "媒体单元始终没连上时 controller_present 为 false（重试不会自行恢复）。"
                 f"不控制机器人，也不会把它唤醒。发布到 {self._node.topic}。"
             ),
             "inputSchema": {
@@ -3292,11 +3314,12 @@ class MediaStatusPlugin:
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
             self._node.start_polling()
-            # Report the state that is, not the one that was requested: a card
-            # that answers `running` without polling is the "silence that looks
-            # like success" this bundle avoids elsewhere.
-            return {"state": "running" if self._node.running else "unavailable",
-                    "topic_out": self._topic_out()}
+            # The documented sensor lifecycle answer, matching `motion_state`:
+            # one `state` and no topic description, which belongs to `info` and
+            # to the tool declaration. Reporting the state that is rather than
+            # the one requested — a card that answers `running` without polling
+            # is the "silence that looks like success" this bundle avoids.
+            return {"state": "running" if self._node.running else "unavailable"}
         if action == "stop":
             self._node.stop_polling()
             return {"state": "idle"}
