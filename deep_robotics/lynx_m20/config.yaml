@@ -1,7 +1,7 @@
 mcp_port: 15716
 ros_namespace: ""
 name: "云深处山猫 M20"
-model_variant: "standard"
+model_variant: "pro"
 velocity_command_timeout: 0.5
 ros:
   robot_domain_id: 0
@@ -13,6 +13,20 @@ basic_server:
   udp_port: 30000
   tcp_port: 30001
   timeout: 1.5
+mapping:
+  enabled: true
+  host: "10.21.31.106"
+  user: "user"
+  port: 22
+  identity_file: "/run/secrets/m20_nos_ssh_key"
+  known_hosts_file: "/run/secrets/m20_nos_known_hosts"
+  timeout: 15
+mapping_visualization:
+  occupied_threshold: 50
+  max_points: 50000
+  max_buffer_points: 200000
+  voxel_size: 0.08
+  publish_hz: 2.0
 topics:
   motion_info: "/MOTION_INFO"
   motion_state: "/MOTION_STATE"
@@ -27,3 +41,6 @@ topics:
   gps: "/GPS"
   joints: "/JOINTS_DATA"
   odometry: "/ODOM"
+  grid_map: "/GRID_MAP"
+  grid_map_3d: "/grid_map_3d"
+  slam_odometry: "/SLAM_ODOM"
