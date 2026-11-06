@@ -24,6 +24,8 @@ DEFAULT_CAPTURE_DEVICE = "plughw:CARD=rockchipes8388,DEV=0"
 DEFAULT_PLAYBACK_DEVICE = "plughw:CARD=rockchipes8388,DEV=0"
 FRAME_BYTES = 1024  # 32 ms of mono PCM S16_LE at 16 kHz.
 FRAME_DURATION_NS = FRAME_BYTES * 1_000_000_000 // (16_000 * 2)
+CAPTURE_CHANNELS = 2
+CAPTURE_FRAME_BYTES = FRAME_BYTES * CAPTURE_CHANNELS
 MAX_AUDIO_FRAME_BYTES = 256 * 1024
 AUDIO_EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"
 MIC_BRIDGE_QUEUE_DEPTH = 4  # 128 ms at 32 ms per PCM frame.
@@ -37,7 +39,12 @@ def _pcm_card(device):
 
 def _capture_command(device):
     return ["arecord", "-q", "-D", _pcm_card(device), "-t", "raw",
-            "-f", "S16_LE", "-r", "16000", "-c", "1"]
+            "-f", "S16_LE", "-r", "16000", "-c", str(CAPTURE_CHANNELS)]
+
+
+def _right_channel_pcm(payload):
+    stereo = struct.unpack("<1024h", payload)
+    return struct.pack("<512h", *stereo[1::2])
 
 
 def _playback_command(device):
@@ -53,6 +60,8 @@ def _capture_launch_command(device):
         "amixer -c 0 cset name='Left PGA Mux' DifferentialL >/dev/null; "
         "amixer -c 0 cset name='Right PGA Mux' DifferentialR >/dev/null; "
         "amixer -c 0 cset name='Main Mic Switch' on >/dev/null; "
+        "amixer -c 0 cset name='Left Channel Capture Volume' 4 >/dev/null; "
+        "amixer -c 0 cset name='Right Channel Capture Volume' 4 >/dev/null; "
         "gate=$(amixer -c 0 cget name='ALC Capture NG Switch' | "
         "sed -n 's/.*: values=//p'); "
         "case \"$gate\" in "
@@ -227,7 +236,7 @@ class S10MicPlugin:
         buffer = bytearray()
         try:
             while not self._stop.is_set() and process is not None:
-                chunk = process.stdout.read(FRAME_BYTES)
+                chunk = process.stdout.read(CAPTURE_FRAME_BYTES)
                 if not chunk:
                     if process.poll() is not None:
                         details = process.stderr.read(2048).decode(errors="replace")
@@ -236,9 +245,9 @@ class S10MicPlugin:
                     time.sleep(0.005)
                     continue
                 buffer.extend(chunk)
-                while len(buffer) >= FRAME_BYTES:
-                    payload = bytes(buffer[:FRAME_BYTES])
-                    del buffer[:FRAME_BYTES]
+                while len(buffer) >= CAPTURE_FRAME_BYTES:
+                    payload = _right_channel_pcm(bytes(buffer[:CAPTURE_FRAME_BYTES]))
+                    del buffer[:CAPTURE_FRAME_BYTES]
                     samples = struct.unpack("<512h", payload)
                     peak = max(abs(sample) for sample in samples)
                     sample_squares = sum(sample * sample for sample in samples)

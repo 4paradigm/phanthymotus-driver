@@ -33,8 +33,11 @@ Capture and playback both default to the verified AOS onboard codec
 `plughw:CARD=rockchipes8388,DEV=0` (ALSA card 0); the USB `Speaker` device is
 playback-only on this robot. These device settings are used in both local and
 SSH modes; override them independently when the AOS card names differ.
-On each mic start, the driver selects the ES8323 differential mic PGA inputs
-and enables `Main Mic`. It reads the codec's low-level noise-gate state and turns
+On each mic start, the driver selects the ES8323 differential mic PGA inputs,
+enables `Main Mic`, and sets both capture-channel gains to +12 dB (ALSA step 4).
+It captures both hardware channels and publishes the stronger right channel as
+mono PCM; an AOS speech check measured roughly 3x the RMS on the right channel.
+The driver reads the codec's low-level noise-gate state and turns
 the gate off only when it is enabled; an already-disabled gate is left alone.
 The AOS factory ALSA state selected Line 1 and enabled a gate that reduced the
 published signal to near-zero; `mic info` includes latest-frame PCM peak, RMS,

@@ -262,6 +262,10 @@ def _run_subscriber(messages, profile, topic, domain):
     node.create_subscription(String, topic, receive, 1)
     try:
         rclpy.spin(node)
+    except Exception as exc:
+        from rclpy.executors import ExternalShutdownException
+        if not isinstance(exc, ExternalShutdownException):
+            raise
     finally:
         node.destroy_node()
         if rclpy.ok():

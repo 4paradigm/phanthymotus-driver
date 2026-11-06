@@ -745,6 +745,57 @@ def test_domain_bridge_log_topic_is_escaped_and_bounded():
     assert escaped.endswith("...")
 
 
+def test_domain_control_subscriber_treats_external_shutdown_as_clean_exit(monkeypatch):
+    import queue
+    import sys
+    from deep_robotics.s10_pro import domain_bridge
+
+    shutdown = {"called": False, "destroyed": False}
+
+    class ExternalShutdownException(Exception):
+        pass
+
+    class Node:
+        def __init__(self, _name):
+            pass
+
+        def create_subscription(self, *_args):
+            pass
+
+        def destroy_node(self):
+            shutdown["destroyed"] = True
+
+    class Logs:
+        @staticmethod
+        def install(**_kwargs):
+            pass
+
+    common = ModuleType("common")
+    common.logsafe = Logs
+    rclpy = ModuleType("rclpy")
+    rclpy.init = lambda **_kwargs: None
+    rclpy.spin = lambda _node: (_ for _ in ()).throw(ExternalShutdownException())
+    rclpy.ok = lambda: True
+    rclpy.shutdown = lambda: shutdown.update(called=True)
+    rclpy_node = ModuleType("rclpy.node")
+    rclpy_node.Node = Node
+    rclpy_executors = ModuleType("rclpy.executors")
+    rclpy_executors.ExternalShutdownException = ExternalShutdownException
+    std_msgs = ModuleType("std_msgs")
+    std_msgs_msg = ModuleType("std_msgs.msg")
+    std_msgs_msg.String = type("String", (), {})
+    std_msgs.msg = std_msgs_msg
+    for name, module in (("common", common), ("rclpy", rclpy),
+                         ("rclpy.node", rclpy_node),
+                         ("rclpy.executors", rclpy_executors),
+                         ("std_msgs", std_msgs), ("std_msgs.msg", std_msgs_msg)):
+        monkeypatch.setitem(sys.modules, name, module)
+
+    domain_bridge._run_subscriber(queue.Queue(), "/tmp/profile.xml", "/control/velocity", 42)
+
+    assert shutdown == {"called": True, "destroyed": True}
+
+
 def test_media_worker_uses_independent_result_queue_per_lane():
     import ast
 

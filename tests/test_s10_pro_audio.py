@@ -49,13 +49,18 @@ def test_audio_device_names_and_pcm_commands(monkeypatch):
     assert audio._pcm_card("hw:1,0") == "hw:1,0"
     assert audio._capture_command("default") == [
         "arecord", "-q", "-D", "default", "-t", "raw", "-f", "S16_LE",
-        "-r", "16000", "-c", "1",
+        "-r", "16000", "-c", "2",
     ]
+    interleaved = [sample for pair in zip([100] * 512, [-20] * 512) for sample in pair]
+    assert audio._right_channel_pcm(audio.struct.pack("<1024h", *interleaved)) == audio.struct.pack(
+        "<512h", *([-20] * 512))
     capture_setup = audio._capture_launch_command("default")
     assert capture_setup[:2] == ["sh", "-lc"]
     assert "Left Line Mux' MicL" in capture_setup[2]
     assert "Right Line Mux' MicR" in capture_setup[2]
     assert "Left PGA Mux' DifferentialL" in capture_setup[2]
+    assert "Left Channel Capture Volume' 4" in capture_setup[2]
+    assert "Right Channel Capture Volume' 4" in capture_setup[2]
     assert "case \"$gate\" in" in capture_setup[2]
     assert "off) : ;;" in capture_setup[2]
     assert "ALC Capture NG Switch' off" in capture_setup[2]
@@ -125,7 +130,10 @@ def test_mic_capture_stamps_frames_from_pipe_arrival(monkeypatch):
 
     class Stdout:
         def __init__(self):
-            self.chunks = [b"\x01\x00" * 512, b""]
+            left = [100] * 512
+            right = [1] * 512
+            interleaved = [sample for pair in zip(left, right) for sample in pair]
+            self.chunks = [audio.struct.pack("<1024h", *interleaved), b""]
 
         def read(self, _size):
             return self.chunks.pop(0)
