@@ -32,6 +32,7 @@ import socket
 import subprocess
 import sys
 import threading
+from uuid import uuid4
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -120,6 +121,7 @@ def _disable_vendor_video_capture_service(cfg: dict) -> None:
 class BumiDeviceBundle:
     def __init__(self, cfg: dict, namespace: str, executor, high_ctrl, media_ctrl):
         self._plugins: list = []
+        self._driver_boot_id = str(uuid4())
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
         loco_plugin = None
@@ -204,6 +206,13 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        if plugins_cfg.get("image_quality_guard", {}).get("enabled", False):
+            from image_quality_guard import ImageQualityGuardPlugin
+            self._plugins.append(ImageQualityGuardPlugin(
+                plugins_cfg["image_quality_guard"], namespace, executor,
+                driver_boot_id=self._driver_boot_id))
+            print("[bundle] ImageQualityGuardPlugin loaded")
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):
@@ -223,9 +232,43 @@ class BumiDeviceBundle:
 
     def stop_all(self) -> None:
         # Stop media consumers before tearing down the camera producer.
+        failed = 0
         for p in reversed(self._plugins):
-            p.stop()
-        print("[bundle] All plugins stopped")
+            try:
+                tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
+                strict = any(t.get('x-lifecycle', {}).get('schema') == 'motus.lifecycle/1'
+                             for t in tools)
+                result = p.shutdown() if strict else p.stop()
+                if isinstance(result, dict) and result.get('state') == 'error':
+                    failed += 1
+                    print(f"[bundle] {type(p).__name__} cleanup failed: {result.get('error')}", flush=True)
+            except Exception as exc:
+                failed += 1
+                # One broken consumer must not prevent other resources closing.
+                print(f"[bundle] {type(p).__name__} cleanup failed: {exc}", flush=True)
+        print(f"[bundle] Cleanup completed with {failed} failure(s)" if failed
+              else "[bundle] All plugins stopped", flush=True)
+
+    def lifecycle_dispatch(self, method: str, params: dict):
+        if not isinstance(params, dict):
+            return {'state': 'error', 'code': 'INVALID_ARGUMENT',
+                    'error': 'lifecycle params must be an object'}
+        tool_name = params.get('tool', '')
+        for plugin in self._plugins:
+            tools = plugin.get_tools() if hasattr(plugin, 'get_tools') else [plugin.get_tool()]
+            if not any(t['name'] == tool_name and
+                       t.get('x-lifecycle', {}).get('schema') == 'motus.lifecycle/1'
+                       for t in tools):
+                continue
+            if method == 'motus.lifecycle.status':
+                return plugin.lifecycle_status()
+            if method == 'motus.lifecycle.bind':
+                return plugin.bind_epoch(
+                    driver_boot_id=params.get('driver_boot_id'),
+                    expected_epoch=params.get('expected_epoch'),
+                    proposed_epoch=params.get('proposed_epoch'))
+        return {'state': 'error', 'code': 'UNKNOWN_LIFECYCLE_TOOL',
+                'error': 'tool does not implement motus.lifecycle/1'}
 
     def get_all_tools(self) -> list:
         tools = []
@@ -237,6 +280,9 @@ class BumiDeviceBundle:
         return tools
 
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
+        # A request owns its argument snapshot. Concurrent dispatchers must not
+        # pop action or inject context into a caller's shared dictionary.
+        args = dict(args)
         for p in self._plugins:
             plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
             for tool_def in plugin_tools:
@@ -343,6 +389,8 @@ def make_handler():
                     })
                 elif method == "tools/list":
                     ok({"tools": _bundle.get_all_tools()})
+                elif method in ("motus.lifecycle.status", "motus.lifecycle.bind"):
+                    ok(_bundle.lifecycle_dispatch(method, params))
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
