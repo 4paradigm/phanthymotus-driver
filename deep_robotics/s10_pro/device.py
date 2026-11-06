@@ -33,6 +33,15 @@ CAMERA_MOUNTS = {
     "camera_left": (0.0, 0.06480, 0.05990),
     "camera_right": (0.0, -0.06480, 0.05990),
 }
+CAMERA_INTRINSICS_RANGE = {
+    # Vendor values are acceptance ranges for the original calibration and
+    # are not a calibration for the 1024x576 RTSP/cropped output.
+    "fx": [579.0, 639.0], "fy": [579.0, 639.0],
+    "cx": [750.0, 850.0], "cy": [550.0, 650.0],
+    "distortion_abs_max": 10.0,
+    "source": "vendor-spec",
+    "note": "Range only; K/D remain null until per-camera calibration at the published resolution.",
+}
 LIDAR_LANES = ("lidar_cloud", "lidar_map")
 PREFERRED_LIDAR_SOURCE = "/ALIGNED_POINTS"
 LIDAR_SOURCE_STALE_SECONDS = 0.5
@@ -820,6 +829,7 @@ class S10StatePlugin:
                     vendor={"transport": "rtsp", "mounting": {
                         "frame_id": "body", "position_m": list(CAMERA_MOUNTS[name]),
                         "orientation_xyzw": None, "source": "vendor-spec",
+                        "intrinsics_range": CAMERA_INTRINSICS_RANGE,
                         "stream": {"width": 640, "height": 360, "fps_max": 15,
                                    "codec": "mjpeg", "source": "driver_output",
                                    "source_resolution": {"width": 1024, "height": 576, "fps": 30},
@@ -869,6 +879,7 @@ class S10StatePlugin:
                                 "origin": "body geometric center shown in section 1.6",
                             },
                             "reference": "DeepRobotics S10 Hardware Development Manual v1.0.2, sections 1.6 and 1.9",
+                            "intrinsics_range": CAMERA_INTRINSICS_RANGE,
                             "stream": {"width": 640, "height": 360, "fps_max": 15,
                                        "codec": "mjpeg", "source": "driver_output",
                                        "source_resolution": {"width": 1024, "height": 576, "fps": 30},
