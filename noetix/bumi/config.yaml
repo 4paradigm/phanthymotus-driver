@@ -11,6 +11,7 @@ plugins:
     # 新动作先在 Gazebo 验证。真机仅回放已人工验收的厂家示教动作；
     # 不把运动学预览轨迹直接发给全身 LowController。
     hardware_enabled: false
+    playback_timeout_s: 60
     invite_one_recording_id: -1
     invite_both_recording_id: -1
     countdown_recording_id: -1

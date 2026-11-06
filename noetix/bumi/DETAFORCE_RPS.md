@@ -56,7 +56,19 @@ git apply --reverse --check "$driver_checkout/noetix/bumi/simulation/detaforce_g
 
 真实执行通过已有 `action_recording.play_recording(recording_id)`。后续需在有人监护的条件下，用厂家示教录制并逐项验收六个动作，将实际编号填入卡片设置，确认静止、walking 模式与环境条件后再启用硬件。不能凭空分配编号，也不会用通用挥手/欢呼冒充新动作。本轮未部署或测试真机。
 
-`running` 只代表已观察到 play_teach 模式。`playback_exited` 只代表播放模式已退出，不宣称物理动作完成。没有观察到开始时保留 `start_unconfirmed`，阻止再次发送；需先现场核验。该后端不声明 ACP 物理完成事件。共享 SDK 不提供回放任务编号，无法区分其他控制端在同一播放模式下替换任务，实机验收期间需单一操作者独占动作控制。
+`start()` 和画布 `start` 返回 `ready`。`stop()`、画布 `stop` 与成功的 `stop_action` 返回 `idle`；`stop_action` 失败时返回 `error`，`action_status` 保存停止详情。停止会取消本卡监控的回放，并等待后台完成回报线程退出。
+
+六种真机动作通过 `x-completion` 声明 ACP 协议，每次接受的回放返回唯一 `action_id`。后台线程持续监控该次回放，并向 `${AGENT_CORE_URL}/api/acp/complete` 发送一次终态回报。默认地址为 `https://localhost:15678`，沿用现有 Bumi 卡片的本地自签名 HTTPS 约定。
+
+观察到播放模式 23 后退出到 walking 模式 2，回报 `completed`，依据记录为 `completion_basis=sdk_workmode_exit`。用户停止且确认退出播放时回报 `cancelled`。异常模式、SDK 故障、停止失败或播放超时回报 `error`。`playback_timeout_s` 默认 60 秒，可配置为 5–120 秒，ACP 兜底上限为 150 秒。超时清理仅退出本卡已持有的播放模式。
+
+`start_unconfirmed` 表示命令已经发送、播放模式尚待确认，期间保留动作占用直至监控结束或取消。若起播或停止未确认，卡片会锁定后续动作并报告 `safety_fault`；须由现场人员检查机器人，再重启驱动。实际动作形态、人体净空与最终姿态仍需现场核验，结果保持 `motion_completion_verified=false` 和 `physical_interaction_validated=false`。共享 SDK 提供工作模式回读，实机验收期间需由单一操作者独占动作控制。Gazebo 页面通过已有 `run_id` 与状态查询完成本地试播。
+
+## PR #485 评审修复
+
+生命周期与后台完成回报均已加入契约测试，覆盖六种动作的独立关联 ID、一次终态回报、取消、超时、异常工作模式、SDK 故障、回调失败清理及实际 HTTP 回调字段。
+
+Dockerfile 中两条 COPY 用于将 Card 和共享动作定义装入 Bumi 镜像。新增部分为 Python 源文件，依赖使用现有镜像环境。`driver.yaml` 的注册项用于资源目录发现。镜像构建及最终体积以 Bot 构建产物为准。
 
 ## 验证命令
 

@@ -1,8 +1,13 @@
 """Motion geometry and command-boundary tests; no ROS or robot connection."""
 
 import importlib
+import json
 import math
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import queue
+import threading
+import time
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -31,6 +36,13 @@ class Playback:
         self.calls = []
         self.moving = False
         self.confirm_start = True
+        self.completions = []
+        self.completed = threading.Event()
+
+    def notify(self, action_id, status, result, tool):
+        self.completions.append({"action_id": action_id, "status": status, "result": result, "tool": tool})
+        self.completed.set()
+        return True
 
     def is_moving(self):
         return self.moving
@@ -48,10 +60,22 @@ class Playback:
         return {"state": "completed", "command_sent": True, "confirmed": True, "workmode": 2}
 
 
-def plugin(module, **config):
+def plugin(module, *, clock=None, completion_callback=None, **config):
     ctrl = Controller()
     backend = Playback(ctrl)
-    return module.DetaforceRpsPlugin(config, backend, ctrl), ctrl, backend
+    return module.DetaforceRpsPlugin(config, backend, ctrl,
+                                    completion_callback=completion_callback or backend.notify,
+                                    clock=clock), ctrl, backend
+
+
+def wait_completion(card, backend):
+    assert backend.completed.wait(2), "Expected an ACP terminal callback"
+    worker = card._worker
+    if worker:
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+    assert card._active is None
+    return backend.completions[-1]
 
 
 def frame_points(pose):
@@ -183,13 +207,16 @@ def test_invalid_motion_options_are_rejected(modules, kwargs):
 def test_boot_info_config_and_unbound_actions_never_move(modules):
     motion, card = modules
     p, _, backend = plugin(card)
-    p.start()
+    assert p.start() == {"state": "ready"}
+    assert p.dispatch("start", {}) == {"state": "ready"}
     for action in ("info", "start", "status", "stop", *motion.LABELS):
         p.dispatch(action, {})
     assert p.dispatch("config", {"hardware_enabled": True})["state"] == "configured"
     assert p.dispatch("countdown", {})["state"] == "unavailable"
-    p.stop()
+    assert p.stop()["state"] == "idle"
+    assert p.dispatch("stop", {})["state"] == "idle"
     assert not backend.calls
+    assert not backend.completions
 
 
 def test_verified_recording_is_used_without_inventing_completion(modules):
@@ -202,6 +229,11 @@ def test_verified_recording_is_used_without_inventing_completion(modules):
     assert p.dispatch("countdown", {})["command_sent"] is False
     assert p.dispatch("config", {"countdown_recording_id": 38})["state"] == "error"
     ctrl.mode = 2
+    receipt = wait_completion(p, backend)
+    assert receipt["status"] == "completed"
+    assert receipt["action_id"] == result["action_id"]
+    assert receipt["result"]["completion_basis"] == "sdk_workmode_exit"
+    assert not receipt["result"]["motion_completion_verified"]
     assert p.dispatch("status", {})["state"] == "playback_exited"
     p.stop()
     assert len(backend.calls) == 1
@@ -228,9 +260,13 @@ def test_stop_only_exits_this_cards_playback_and_is_idempotent(modules):
     p, _, backend = plugin(modules[1], hardware_enabled=True, mouse_recording_id=12)
     assert not p.dispatch("stop_action", {})["command_sent"]
     p.dispatch("mouse", {})
-    assert p.dispatch("stop_action", {})["state"] == "stopped"
+    response = p.dispatch("stop_action", {})
+    assert response["state"] == "idle"
+    assert response["action_status"]["state"] == "stopped"
+    assert wait_completion(p, backend)["status"] == "cancelled"
     p.dispatch("stop_action", {})
     assert [action for action, _ in backend.calls] == ["play_recording", "stop_playback"]
+    assert len(backend.completions) == 1
 
 
 def test_unconfirmed_start_is_not_forgotten_or_retried(modules):
@@ -238,11 +274,11 @@ def test_unconfirmed_start_is_not_forgotten_or_retried(modules):
     backend.confirm_start = False
     assert p.dispatch("mouse", {})["state"] == "start_unconfirmed"
     assert not p.dispatch("mouse", {})["command_sent"]
-    assert not p.dispatch("stop_action", {})["command_sent"]
     assert len(backend.calls) == 1
     ctrl.mode = 23
     assert p.dispatch("status", {})["state"] == "running"
-    assert p.dispatch("stop_action", {})["state"] == "stopped"
+    assert p.dispatch("stop_action", {})["state"] == "idle"
+    assert wait_completion(p, backend)["status"] == "cancelled"
 
 
 @pytest.mark.parametrize("value", [True, 1.5, "7", -2, 65536, float("nan")])
@@ -261,4 +297,213 @@ def test_tool_contract_and_interrupt_are_shared_with_preview(modules):
         actions = spec["inputSchema"]["x-action-params"]
         assert set(actions) == set(motion.LABELS) | {"status", "stop_action"}
         assert spec["inputSchema"]["x-hooks"]["on_interrupt_motion"]["action"] == "stop_action"
-        assert "x-completion" not in spec["inputSchema"]
+        if simulation:
+            assert "x-completion" not in spec["inputSchema"]
+        else:
+            assert spec["inputSchema"]["x-completion"] == {"actions": list(motion.LABELS), "timeout": 150}
+
+
+@pytest.mark.parametrize("action", ["invite_one", "invite_both", "countdown", "double_punch", "mouse", "confident"])
+def test_each_gesture_has_a_unique_acp_id_and_one_terminal_callback(modules, action):
+    p, ctrl, backend = plugin(modules[1], hardware_enabled=True, **{action+"_recording_id": 21})
+    identities = []
+    for _ in range(2):
+        backend.completed.clear()
+        result = p.dispatch(action, {})
+        identities.append(result["action_id"])
+        assert result["state"] == "running"
+        assert result["expected_duration_s"] == 60
+        ctrl.mode = 2
+        receipt = wait_completion(p, backend)
+        assert receipt["action_id"] == result["action_id"]
+        assert receipt["tool"] == "detaforce_rps"
+        assert receipt["status"] == "completed"
+        assert receipt["result"]["action"] == action
+        p.dispatch("status", {})
+        p.stop()
+    assert identities[0] != identities[1]
+    assert len(backend.completions) == 2
+
+
+def test_mode_observation_does_not_complete_a_still_running_recording(modules):
+    p, ctrl, backend = plugin(modules[1], hardware_enabled=True, mouse_recording_id=12)
+    result = p.dispatch("mouse", {})
+    for _ in range(3):
+        assert p.dispatch("status", {})["state"] == "running"
+    assert not backend.completions
+    ctrl.mode = 2
+    assert wait_completion(p, backend)["action_id"] == result["action_id"]
+
+
+@pytest.mark.parametrize("mode", [0, 8, 26])
+def test_protection_and_unexpected_modes_report_error_without_changing_mode(modules, mode):
+    p, ctrl, backend = plugin(modules[1], hardware_enabled=True, mouse_recording_id=12)
+    result = p.dispatch("mouse", {})
+    ctrl.mode = mode
+    receipt = wait_completion(p, backend)
+    assert receipt["action_id"] == result["action_id"]
+    assert receipt["status"] == "error"
+    assert receipt["result"]["workmode"] == mode
+    assert len(backend.calls) == 1
+    assert p.stop()["state"] == "idle"
+
+
+class Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+@pytest.mark.parametrize("confirmed_start", [True, False])
+def test_timeout_reports_error_and_only_exits_observed_playback(modules, confirmed_start):
+    clock = Clock()
+    p, ctrl, backend = plugin(modules[1], clock=clock, hardware_enabled=True,
+                              playback_timeout_s=5, mouse_recording_id=12)
+    backend.confirm_start = confirmed_start
+    result = p.dispatch("mouse", {})
+    clock.now = 6
+    receipt = wait_completion(p, backend)
+    assert receipt["action_id"] == result["action_id"]
+    assert receipt["status"] == "error"
+    assert receipt["result"]["state"] == "timeout"
+    assert not receipt["result"]["motion_completion_verified"]
+    assert len(backend.calls) == (2 if confirmed_start else 1)
+    assert ctrl.mode == 2
+    if not confirmed_start:
+        assert not receipt["result"]["stop_result"]["confirmed"]
+        assert p.dispatch("status", {})["safety_fault"]
+        assert p.dispatch("mouse", {})["command_sent"] is False
+
+
+def test_shutdown_cancels_and_joins_the_completion_worker(modules):
+    p, _, backend = plugin(modules[1], hardware_enabled=True, mouse_recording_id=12)
+    result = p.dispatch("mouse", {})
+    worker = p._worker
+    assert p.stop()["state"] == "idle"
+    assert not worker.is_alive()
+    assert wait_completion(p, backend)["status"] == "cancelled"
+    assert backend.completions[0]["action_id"] == result["action_id"]
+
+
+def test_monitor_sdk_failure_still_finishes_acp(monkeypatch, modules):
+    p, ctrl, backend = plugin(modules[1], hardware_enabled=True, mouse_recording_id=12)
+    result = p.dispatch("mouse", {})
+    def unavailable():
+        raise RuntimeError("telemetry unavailable")
+    monkeypatch.setattr(ctrl, "get_mode", unavailable)
+    receipt = wait_completion(p, backend)
+    assert receipt["action_id"] == result["action_id"]
+    assert receipt["status"] == "error"
+    assert "telemetry unavailable" in receipt["result"]["error"]
+    assert not receipt["result"]["stop_result"]["confirmed"]
+    assert receipt["result"]["physical_interaction_validated"] is False
+
+
+def test_failed_stop_reports_error_and_releases_the_pending_action(monkeypatch, modules):
+    p, ctrl, backend = plugin(modules[1], hardware_enabled=True, mouse_recording_id=12)
+    result = p.dispatch("mouse", {})
+    def stop_failure(*_):
+        return {"state": "accepted", "command_sent": True, "confirmed": False, "workmode": 23}
+    monkeypatch.setattr(backend, "dispatch", stop_failure)
+    assert p.stop()["state"] == "idle"
+    receipt = wait_completion(p, backend)
+    assert receipt["action_id"] == result["action_id"]
+    assert receipt["status"] == "error"
+    assert p.dispatch("mouse", {})["command_sent"] is False
+    assert ctrl.mode == 23
+
+
+def test_stop_action_reports_unconfirmed_stop_as_error(monkeypatch, modules):
+    p, ctrl, backend = plugin(modules[1], hardware_enabled=True, mouse_recording_id=12)
+    p.dispatch("mouse", {})
+    monkeypatch.setattr(backend, "dispatch", lambda *_: {"confirmed": False})
+    assert p.dispatch("stop_action", {})["state"] == "error"
+    assert wait_completion(p, backend)["status"] == "error"
+    ctrl.mode = 2
+    assert p.dispatch("mouse", {})["command_sent"] is False
+
+
+def test_unconfirmed_start_cannot_be_reported_as_cancelled(modules):
+    p, _, backend = plugin(modules[1], hardware_enabled=True, mouse_recording_id=12)
+    backend.confirm_start = False
+    p.dispatch("mouse", {})
+    assert p.dispatch("stop_action", {})["state"] == "error"
+    assert wait_completion(p, backend)["status"] == "error"
+    assert p.dispatch("mouse", {})["command_sent"] is False
+
+
+def test_callback_failure_does_not_leave_the_card_busy(modules):
+    def failed_callback(*_):
+        raise RuntimeError("Agent Core offline")
+    p, ctrl, _ = plugin(modules[1], completion_callback=failed_callback,
+                        hardware_enabled=True, mouse_recording_id=12)
+    p.dispatch("mouse", {})
+    worker = p._worker
+    ctrl.mode = 2
+    worker.join(timeout=2)
+    assert not worker.is_alive() and p._active is None
+    report = p.dispatch("status", {})
+    assert report["terminal_status"] == "completed"
+    assert not report["completion_notified"]
+    assert report["completion_callback_error"] == "Agent Core offline"
+
+
+def test_worker_start_failure_exits_playback_without_an_acp_id(monkeypatch, modules):
+    p, ctrl, backend = plugin(modules[1], hardware_enabled=True, mouse_recording_id=12)
+    def start_failure(_):
+        raise RuntimeError("thread creation failed")
+    monkeypatch.setattr(threading.Thread, "start", start_failure)
+    response = p.dispatch("mouse", {})
+    assert response["state"] == "error" and "action_id" not in response
+    assert response["stop_result"]["confirmed"]
+    assert ctrl.mode == 2 and p._active is None
+    assert not backend.completions
+
+
+@pytest.mark.parametrize("value", [True, 0, 4.99, 121, float("nan"), float("inf"), "60"])
+def test_playback_timeout_configuration_is_bounded(modules, value):
+    p, _, backend = plugin(modules[1])
+    assert p.dispatch("config", {"playback_timeout_s": value})["state"] == "error"
+    assert p.dispatch("info", {})["parameters"]["playback_timeout_s"] == 60
+    assert not backend.calls
+
+
+def test_actual_acp_http_callback_contract(monkeypatch, modules):
+    requests = queue.Queue()
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.put((self.path, self.headers.get_content_type(), payload))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{}')
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("AGENT_CORE_URL", f"http://127.0.0.1:{server.server_port}/")
+    ctrl = Controller()
+    backend = Playback(ctrl)
+    p = modules[1].DetaforceRpsPlugin({"hardware_enabled": True, "mouse_recording_id": 12}, backend, ctrl)
+    try:
+        result = p.dispatch("mouse", {})
+        worker = p._worker
+        ctrl.mode = 2
+        path, content_type, payload = requests.get(timeout=2)
+        worker.join(timeout=2)
+        assert path == "/api/acp/complete" and content_type == "application/json"
+        assert payload["action_id"] == result["action_id"]
+        assert payload["status"] == "completed" and payload["tool"] == "detaforce_rps"
+        assert isinstance(payload["ts"], (int, float))
+        assert payload["result"]["completion_basis"] == "sdk_workmode_exit"
+        assert p.dispatch("status", {})["completion_notified"]
+    finally:
+        p.stop()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
