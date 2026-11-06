@@ -48,6 +48,14 @@ plugins:
     volume: 100
     input_gain: 6.0
     xos_http_base: "http://192.168.8.100:1888"
+  pose_game:
+    enabled: true
+    topic: "/nvidia_desktop/camera/rgb/poses"
+    max_frames: 300
+    max_rounds: 10
+    max_frames_per_round: 300
+    max_raw_bytes: 8192
+    barrier_timeout_seconds: 1.0
   audio:
     enabled: true
     device: "plughw:2,0"
