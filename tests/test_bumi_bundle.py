@@ -205,3 +205,35 @@ def test_media_status_registers_even_without_a_media_controller(
 
     assert [tool["name"] for tool in bundle.get_all_tools()] == ["media_status"]
     assert bundle._plugins[0].media_ctrl is media_ctrl
+
+def test_the_media_probe_does_not_depend_on_the_leg_controller(
+        bundle_module, monkeypatch):
+    """A failed HighController probe must not decide whether the media unit is
+    even attempted. The two controllers reach different subsystems, and the
+    media probe itself runs in a child process that never builds a
+    HighController, so initialisation cannot depend on one. Nesting it under the
+    leg probe made an unreachable leg controller report a working media unit as
+    `controller_present: false` — the card blaming the wrong subsystem in
+    exactly the situation it exists to describe."""
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda _seconds: None)
+
+    high = types.SimpleNamespace(init=lambda: None)
+    media = types.SimpleNamespace(init=lambda: None)
+    fake_high = types.ModuleType("highcontrol_py")
+    fake_high.HighController = types.SimpleNamespace(instance=lambda: high)
+    fake_media = types.ModuleType("mediacontrol_py")
+    fake_media.MediaController = types.SimpleNamespace(instance=lambda: media)
+    monkeypatch.setitem(sys.modules, "highcontrol_py", fake_high)
+    monkeypatch.setitem(sys.modules, "mediacontrol_py", fake_media)
+
+    def probe(cmd, **_kwargs):
+        """The legs are unreachable, the media unit answers."""
+        if "highcontrol_py" in cmd[-1]:
+            return types.SimpleNamespace(stdout="", stderr="no route to host")
+        return types.SimpleNamespace(stdout="OK", stderr="")
+
+    monkeypatch.setattr(bundle_module.subprocess, "run", probe)
+
+    assert bundle_module._init_high_controller() is None
+    assert bundle_module._init_media_controller() is media

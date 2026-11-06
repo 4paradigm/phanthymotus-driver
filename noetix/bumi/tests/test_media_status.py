@@ -386,3 +386,22 @@ def test_start_answers_the_documented_sensor_shape(monkeypatch):
     assert plugin.dispatch("start", {}) == {"state": "running"}
 
     plugin.dispatch("stop", {})
+
+def test_start_reports_running_even_without_a_controller(monkeypatch):
+    """The bundle registers this card when the media controller never came up,
+    so `start` has to accept exactly that state. A start that refused, or that
+    threw on the first poll, would leave an empty card on the canvas — the
+    registered-but-silent failure this PR already had to fix once."""
+    module, _ = _load_device(monkeypatch)
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    plugin = module.MediaStatusPlugin(
+        {}, "robot", types.SimpleNamespace(add_node=lambda _: None), None)
+    # The shared rclpy stub has no logger; the polling thread warns on every
+    # first failure.
+    plugin._node.get_logger = lambda: types.SimpleNamespace(
+        warn=lambda *_: None, info=lambda *_: None)
+
+    assert plugin.dispatch("start", {}) == {"state": "running"}
+    assert plugin._node.read_now()["controller_present"] is False
+
+    plugin.dispatch("stop", {})
