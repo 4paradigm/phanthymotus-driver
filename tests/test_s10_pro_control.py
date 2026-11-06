@@ -51,7 +51,9 @@ class FakeNative:
     def request(self, *args, **kwargs):
         self.calls.append((args, kwargs))
         if len(args) > 1 and args[1] == 0x00100001:
-            return {"PatrolDevice": {"Items": {"NavigationState": "completed"}}}
+            return {"PatrolDevice": {"Items": {"Status": 4, "ErrorCode": 0}}}
+        if len(args) > 1 and args[1] == 0x00100004:
+            return {"PatrolDevice": {"Items": {"ErrorCode": 0}}}
         return {"state": "sent"}
 
     def send(self, *args, **kwargs):
@@ -810,7 +812,7 @@ def test_navigation_actions_use_s10_pro_native_commands(monkeypatch):
         time.sleep(0.01)
     assert terminals == [(result["action_id"], "completed", {
         "state": "completed",
-        "response": {"PatrolDevice": {"Items": {"NavigationState": "completed"}}},
+        "response": {"PatrolDevice": {"Items": {"Status": 4, "ErrorCode": 0}}},
         "command_response": {"state": "sent"},
     })]
     args, kwargs = next((args, kwargs) for args, kwargs in native.calls
@@ -825,6 +827,35 @@ def test_navigation_actions_use_s10_pro_native_commands(monkeypatch):
 
     plugin.dispatch("cancel", {})
     assert native.calls[-1][0][:2] == (0x00100003, 0x00100004)
+
+
+@pytest.mark.parametrize("status", [0, 1, 2, 3, 5, 6, 255])
+def test_navigation_vendor_nonterminal_statuses_are_not_reported_as_success(monkeypatch, status):
+    device = _load_device(monkeypatch)
+    assert device.S10NavigationPlugin._navigation_terminal(
+        {"PatrolDevice": {"Items": {"Status": status, "ErrorCode": 0}}}
+    ) is None
+
+
+def test_navigation_vendor_completion_and_error_code(monkeypatch):
+    device = _load_device(monkeypatch)
+    terminal = device.S10NavigationPlugin._navigation_terminal
+    assert terminal({"PatrolDevice": {"Items": {"Status": 4, "ErrorCode": 0}}}) == ("completed", {})
+    assert terminal({"PatrolDevice": {"Items": {"Status": 3, "ErrorCode": 7}}}) == (
+        "error", {"message": "navigation task failed", "error_code": 7})
+
+
+@pytest.mark.parametrize("response, expected", [
+    ({"PatrolDevice": {"Items": {"ErrorCode": 1}}}, "error"),
+    ({"state": "sent"}, "error"),
+    ({"PatrolDevice": {"Items": {"ErrorCode": 0}}}, "ok"),
+])
+def test_navigation_cancel_requires_explicit_success_code(monkeypatch, response, expected):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    native.request = lambda *_args, **_kwargs: response
+    result = device.S10NavigationPlugin(native)._request_cancel()
+    assert ("ok" if result["state"] == "sent" else "error") == expected
 
 
 def test_navigation_pose_reports_angles_in_degrees(monkeypatch):
@@ -863,7 +894,7 @@ def test_navigation_cancel_reports_one_terminal_callback(monkeypatch):
                 started.set()
                 assert release.wait(1)
                 return {"state": "finished"}
-            return {"state": "cancel_sent"}
+            return {"PatrolDevice": {"Items": {"ErrorCode": 0}}}
 
     native = BlockingNative({"navigation_task_timeout": 2})
     plugin = device.S10NavigationPlugin(native)
@@ -873,7 +904,7 @@ def test_navigation_cancel_reports_one_terminal_callback(monkeypatch):
     assert started.wait(1)
     conflict = plugin.dispatch("goal", {"x": 3, "y": 4, "yaw_degrees": 0, "confirm": True})
     assert conflict["code"] == "ACTION_IN_PROGRESS"
-    assert plugin.dispatch("cancel", {}) == {"state": "cancel_sent"}
+    assert plugin.dispatch("cancel", {}) == {"PatrolDevice": {"Items": {"ErrorCode": 0}}}
     release.set()
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline and not terminals:
@@ -900,6 +931,8 @@ def test_navigation_request_timeout_reports_acp_error(monkeypatch):
         time.sleep(0.01)
     assert terminals == [(accepted["action_id"], "error", {
         "state": "error", "message": "navigation task timed out",
+        "cancel_result": {"state": "error", "reason": "navigation_cancel_failed",
+                          "message": "navigation task timed out"},
     })]
 
 
@@ -915,7 +948,7 @@ def test_navigation_cancel_timeout_releases_action_and_reports_error(monkeypatch
                 return {"state": "accepted"}
             if len(args) > 1 and args[1] == 0x00100004:
                 raise TimeoutError("cancel timed out")
-            return {"PatrolDevice": {"Items": {"NavigationState": "running"}}}
+            return {"PatrolDevice": {"Items": {"Status": 3, "ErrorCode": 0}}}
 
     native = CancelFailNative({"navigation_task_timeout": 5})
     plugin = device.S10NavigationPlugin(native)
