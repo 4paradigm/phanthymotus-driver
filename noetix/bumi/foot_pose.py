@@ -1,4 +1,4 @@
-"""Reusable Bumi foot-pose Card using operator-validated factory recordings.
+"""Bumi foot observations and an operator-validated factory recording adapter.
 
 No raw joint command, inverse-kinematics guess, or low-controller fallback exists.
 An empty asset manifest supports previews only. Physical execution stays blocked.
@@ -13,7 +13,8 @@ from pathlib import Path
 import threading
 import time
 import uuid
-import weakref
+
+from foot_pose_state import describe_feet, source_freshness
 
 POSES = ("feet_together", "feet_apart", "feet_staggered", "neutral")
 LABELS = {"feet_together": "双脚靠拢", "feet_apart": "双脚分开",
@@ -49,8 +50,8 @@ def load_assets(path):
     if not isinstance(data.get("verification_record"), str) or not data["verification_record"].strip():
         raise ValueError("A physical validation record must be identified")
     poses = data["poses"]
-    if not isinstance(poses, dict) or set(poses) != set(POSES):
-        raise ValueError("All four foot poses, including neutral, must be validated together")
+    if not set(poses) <= set(POSES):
+        raise ValueError("Unknown foot-pose name in manifest")
     checked = {}
     ids = set()
     for name, item in poses.items():
@@ -122,9 +123,6 @@ class FootPosePlugin:
         self._cancel = threading.Event()
         self._lease = "foot_pose:" + uuid.uuid4().hex
         self._owned = False
-        self._received = None
-        self._callback_attached = False
-        self._alive = True
         self._dry_run = cfg.get("dry_run", True)
         if type(self._dry_run) is not bool:
             raise ValueError("foot_pose.dry_run must be boolean")
@@ -138,29 +136,21 @@ class FootPosePlugin:
         self._state = {"state": "idle", "command_sent": False, "pose_confirmed": False, "last_result": None}
 
     def start(self):
-        # Attaching a receive callback sends no motion commands. There is no
-        # other external hardware-status callback in the inspected bundle.
-        subscribe = getattr(self._high, "subscribe_robot_hardware_status", None)
-        if self._profiles and callable(subscribe) and not self._callback_attached:
-            reference = weakref.ref(self)
-            def on_status(_status):
-                instance = reference()
-                if instance is not None and instance._alive:
-                    instance._received = time.monotonic()
-            self._callback = on_status
-            subscribe(on_status)
-            self._callback_attached = True
+        # The shipped HighController has getters, not a receive callback API.
         return self.info()
 
     def get_tools(self):
-        actions = ["info", "status", "config", "preview", *POSES, "stop"]
+        actions = ["info", "status", "config", "read_feet", "check_pose", "reload_assets", "preview", *POSES, "stop"]
         mapping = {name: {"params": [], "description": LABELS[name] + "；默认仅预览，真实模式需要已验证动作资产。"} for name in POSES}
         mapping.update({"info": {"params": [], "description": "查询已验证动作、真实执行门槛和缺失条件。"},
+                        "read_feet": {"params": [], "description": "只读腿部关节，估算机身坐标系中的双脚位置、间距及前后差；不执行动作，不证明着地或平衡。"},
+                        "check_pose": {"params": ["pose"], "description": "只读比对已有资产的关节终态；不播放动作，不把缓存匹配当作真机动作完成。"},
+                        "reload_assets": {"params": [], "description": "重新载入资产清单，支持逐个姿态接入；同时关闭真实输出授权。"},
                         "status": {"params": [], "description": "查询当前任务和真实完成结果。"},
                         "preview": {"params": ["pose"], "description": "预览动作定义，不调用机器人 SDK。"},
                         "stop": {"params": [], "description": "停止本卡拥有的播放，报告是否返回 walking；不代表所有关节已停止。"}})
         return [{"name": self.PREFIX, "type": "actuator", "multiInstance": False,
-                 "description": "Bumi 通用脚部姿态：并脚、分脚、前后错脚、中立。当前没有已验证资产时仅可预览；不会使用猜测关节角或普通走动代替指定脚步。",
+                 "description": "Bumi 脚步基础卡：读取双脚位置与间距估计、比对脚姿、预览并载入已验证录制资产。真实脚姿执行需动作资产和可验证的新鲜遥测；不会用普通走动代替指定脚步。",
                  "inputSchema": {"type": "object", "properties": {
                      "action": {"type": "string", "enum": actions},
                      "pose": {"type": "string", "enum": list(POSES)}}, "required": ["action"],
@@ -175,10 +165,50 @@ class FootPosePlugin:
     def _busy(self):
         return self._worker is not None and self._worker.is_alive()
 
+    def _read_sample(self):
+        if self._reader is not None:
+            sample = self._reader()
+            if not isinstance(sample, dict):
+                raise ValueError("Telemetry reader must return an object")
+            return sample
+        # Observation-only fallback uses the actual vendor getter surface.
+        getter = getattr(self._high, "get_joint_state", None)
+        if not callable(getter):
+            raise RuntimeError("SDK joint state reader is unavailable")
+        joints = [{"motor_id": int(j.motor_id), "position": float(j.pos),
+                   "velocity": float(j.vel)} for j in getter()]
+        return {"joint_states": joints, "source_freshness_verified": False}
+
     def _snapshot(self):
-        if self._reader is None or self._received is None or time.monotonic() - self._received > 0.5:
-            raise RuntimeError("No recent hardware receive callback; physical execution is blocked")
-        return healthy_snapshot(self._reader())
+        sample = self._read_sample()
+        if not source_freshness(sample)["source_recent"]:
+            raise RuntimeError("Verified source receive time is unavailable or stale; physical execution is blocked")
+        return healthy_snapshot(sample)
+
+    def read_feet(self):
+        return describe_feet(self._read_sample())
+
+    def check_pose(self, pose):
+        with self._lock:
+            if pose not in POSES:
+                raise ValueError("Unknown foot pose")
+            if pose not in self._profiles:
+                raise ValueError("No validated asset is loaded for this pose")
+            sample = self._read_sample()
+            result = describe_feet(sample)
+            result.update(requested_pose=pose,
+                          joint_signature_matches=signature_matches(sample, self._profiles[pose]),
+                          verification="read_only_joint_signature_comparison")
+            return result
+
+    def reload_assets(self):
+        with self._lock:
+            if self._busy() or self._owned:
+                raise RuntimeError("Stop the owned task before reloading assets")
+            # Even an invalid newly edited file must not leave real output armed.
+            self._armed = False
+            self._dry_run = True
+            return self.configure({"dry_run": True, "assets_file": self._assets_file})
 
     def info(self):
         with self._lock:
@@ -186,16 +216,22 @@ class FootPosePlugin:
             if self._asset_problem:
                 blockers.append(self._asset_problem)
             if not self._profiles:
-                blockers.append("All four operator-validated physical recordings are required")
-            if self._reader is None or not self._callback_attached:
-                blockers.append("Fresh SDK telemetry watchdog is not ready")
-            elif self._received is None or time.monotonic() - self._received > 0.5:
-                blockers.append("Hardware telemetry receive watchdog is stale")
+                blockers.append("No operator-validated physical recording is loaded")
+            if self._profiles and "neutral" not in self._profiles:
+                blockers.append("A validated neutral recording is required before physical execution")
+            if self._loco is None:
+                blockers.append("Locomotion ownership adapter is unavailable")
+            try:
+                self._snapshot()
+            except (ValueError, TypeError, RuntimeError, OSError) as error:
+                blockers.append(str(error))
             if self._dry_run or not self._armed:
                 blockers.append("Physical execution is not armed")
             return {"name": "FootPose", "state": "running" if self._busy() else "ready" if not blockers else "preview_only",
                     "dry_run": self._dry_run, "physical_execution_ready": not blockers,
                     "available_poses": list(self._profiles), "preview_poses": list(POSES),
+                    "missing_poses": [p for p in POSES if p not in self._profiles],
+                    "observation_available": self._reader is not None or callable(getattr(self._high, "get_joint_state", None)),
                     "assets_file": self._assets_file, "assets_sha256": self._asset_hash,
                     "blockers": blockers, "task": copy.deepcopy(self._state)}
 
@@ -207,6 +243,12 @@ class FootPosePlugin:
                 return self.start()
             if action == "config":
                 return self.configure(args)
+            if action == "read_feet":
+                return self.read_feet()
+            if action == "check_pose":
+                return self.check_pose(args.get("pose"))
+            if action == "reload_assets":
+                return self.reload_assets()
             if action == "stop":
                 return self.stop()
             if action == "preview":
@@ -214,7 +256,7 @@ class FootPosePlugin:
             if action in POSES:
                 return self.execute(action)
             raise ValueError("Unknown foot-pose action")
-        except (ValueError, RuntimeError, OSError) as error:
+        except (ValueError, TypeError, RuntimeError, OSError) as error:
             return {"state": "error", "command_sent": False, "pose_confirmed": False, "error": str(error)}
 
     def preview(self, pose):
@@ -236,15 +278,14 @@ class FootPosePlugin:
                 raise ValueError("dry_run must be boolean")
             path = str(args.get("assets_file", self._assets_file))
             profiles, problem, fingerprint = load_assets(path)
-            if not dry and (args.get("confirm") is not True or not profiles or self._reader is None):
-                raise RuntimeError("Real mode requires explicit confirm, all validated assets, and robot telemetry")
+            if not dry and (args.get("confirm") is not True or "neutral" not in profiles or self._loco is None):
+                raise RuntimeError("Real mode requires explicit confirm, a validated neutral asset, and locomotion ownership")
             if not dry:
                 healthy_snapshot(self._snapshot(), stationary=True)
             old = (self._dry_run, self._assets_file, self._profiles, self._asset_problem, self._asset_hash, self._armed)
             self._dry_run, self._assets_file = dry, path
             self._profiles, self._asset_problem, self._asset_hash = profiles, problem, fingerprint
             self._armed = not dry
-            # A newly selected manifest may introduce the callback for the first time.
             try:
                 self.start()
             except Exception:
@@ -253,6 +294,8 @@ class FootPosePlugin:
             return self.info()
 
     def _claim(self):
+        if self._loco is None:
+            raise RuntimeError("Locomotion ownership adapter is unavailable")
         with self._loco._rotate_lock:
             if self._loco._body_action or self._loco.is_moving():
                 raise RuntimeError("Another locomotion operation owns the robot")
@@ -260,6 +303,9 @@ class FootPosePlugin:
             self._owned = True
 
     def _release(self):
+        if self._loco is None:
+            self._owned = False
+            return
         with self._loco._rotate_lock:
             if self._loco._body_action == self._lease:
                 self._loco._body_action = None

@@ -200,7 +200,7 @@ class BumiDeviceBundle:
             print("[bundle] MotionStatePlugin loaded")
 
         if (plugins_cfg.get("foot_pose", {}).get("enabled", False)
-                and high_ctrl is not None and loco_plugin is not None):
+                and high_ctrl is not None):
             from foot_pose import FootPosePlugin
             from device import _acp_notify
             self._plugins.append(FootPosePlugin(

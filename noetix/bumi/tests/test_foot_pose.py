@@ -17,9 +17,11 @@ sys.path.insert(0, str(BUNDLE_ROOT))
 import foot_pose as card
 
 
-def sample(mode=2, position=0, moving=False, fault=False):
+def sample(mode=2, position=0, moving=False, fault=False, age_s=0, verified=True):
     return {"fresh": True, "workmode": {"code": mode, "protection": mode == 26},
             "activity": "moving" if moving else "stationary", "motor_faults": [1] if fault else [],
+            "source_received_monotonic": time.monotonic() - age_s,
+            "source_freshness_verified": verified,
             "joint_states": [{"motor_id": i, "position": position, "velocity": 0.0} for i in card.LEG_IDS]}
 
 
@@ -35,12 +37,9 @@ def fixture_manifest():
 
 class High:
     def __init__(self):
-        self.mode, self.callback = 2, None
+        self.mode, self.stale = 2, False
     def get_mode(self):
         return self.mode
-    def subscribe_robot_hardware_status(self, callback):
-        self.callback = callback
-        callback(None)
 
 
 class Loco:
@@ -72,9 +71,7 @@ class CardTests(unittest.TestCase):
         loco = Loco(high)
         results = []
         def reader():
-            if high.callback:
-                high.callback(None)
-            return sample(high.mode, moving=moving)
+            return sample(high.mode, moving=moving, age_s=2 if high.stale else 0)
         plugin = card.FootPosePlugin({"assets_file": str(path)}, "test", None, high, loco,
                                      snapshot_reader=reader, notifier=lambda *args: results.append(args))
         plugin.start()
@@ -98,10 +95,10 @@ class CardTests(unittest.TestCase):
             self.assertEqual(plugin.info()["state"], "preview_only")
             self.assertEqual(loco.calls, [])
 
-    def test_manifest_requires_all_legs_distinct_assets_and_stop_validation(self):
+    def test_manifest_requires_known_pose_names_all_legs_distinct_ids_and_stop_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "assets.json"
-            modifications = [lambda d: d["poses"].pop("neutral"),
+            modifications = [lambda d: d["poses"].update(unknown_pose={}),
                              lambda d: d["poses"]["feet_together"].update(safe_stop_verified=False),
                              lambda d: d["poses"]["feet_together"]["joint_signature_rad"].pop("4"),
                              lambda d: d["poses"]["feet_together"].update(recording_id=True),
@@ -119,9 +116,9 @@ class CardTests(unittest.TestCase):
             for args in ({"dry_run": False}, {"dry_run": "false"}, {"dry_run": False, "confirm": False}):
                 self.assertEqual(plugin.dispatch("config", args)["state"], "error")
                 self.assertTrue(plugin.info()["dry_run"])
-            plugin._received = time.monotonic() - 2
+            high.stale = True
             self.assertEqual(plugin.dispatch("config", {"dry_run": False, "confirm": True})["state"], "error")
-            high.callback(None)
+            high.stale = False
             result = plugin.dispatch("config", {"dry_run": False, "confirm": True})
             self.assertTrue(result["physical_execution_ready"])
             self.assertEqual(loco.calls, [])
@@ -245,8 +242,99 @@ class CardTests(unittest.TestCase):
         state["joint_states"][0]["velocity"] = float('nan')
         self.assertFalse(card.signature_matches(state, profile))
 
+    def test_partial_assets_can_be_loaded_without_all_four_poses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "assets.json"
+            data = fixture_manifest()
+            data["poses"] = {"feet_apart": data["poses"]["feet_apart"]}
+            path.write_text(json.dumps(data), encoding="utf-8")
+            profiles, problem, _ = card.load_assets(path)
+            self.assertEqual(set(profiles), {"feet_apart"})
+            self.assertIsNone(problem)
+            high = High()
+            loco = Loco(high)
+            plugin = card.FootPosePlugin({"assets_file": str(path)}, "test", None, high, loco,
+                                         snapshot_reader=sample)
+            result = plugin.dispatch("config", {"dry_run": False, "confirm": True})
+            self.assertEqual(result["state"], "error")
+            self.assertTrue(plugin.info()["dry_run"])
+            self.assertEqual(loco.calls, [])
+
+    def test_reload_disarms_and_partial_read_only_comparison_never_plays(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin, _, loco, _ = self.make(directory)
+            plugin.configure({"dry_run": False, "confirm": True})
+            data = fixture_manifest()
+            data["poses"] = {"neutral": data["poses"]["neutral"]}
+            Path(plugin._assets_file).write_text(json.dumps(data), encoding="utf-8")
+            info = plugin.dispatch("reload_assets", {})
+            self.assertTrue(info["dry_run"])
+            self.assertFalse(info["physical_execution_ready"])
+            self.assertEqual(info["available_poses"], ["neutral"])
+            comparison = plugin.dispatch("check_pose", {"pose": "neutral"})
+            self.assertTrue(comparison["joint_signature_matches"])
+            self.assertFalse(comparison["pose_confirmed"])
+            self.assertFalse(comparison["command_sent"])
+            self.assertEqual(loco.calls, [])
+            self.assertEqual(plugin.dispatch("check_pose", {"pose": "feet_apart"})["state"], "error")
+
+    def test_invalid_reload_leaves_physical_output_disarmed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin, _, loco, _ = self.make(directory)
+            plugin.configure({"dry_run": False, "confirm": True})
+            Path(plugin._assets_file).write_text("[]", encoding="utf-8")
+            self.assertEqual(plugin.dispatch("reload_assets", {})["state"], "error")
+            self.assertTrue(plugin.info()["dry_run"])
+            self.assertFalse(plugin._armed)
+            self.assertEqual(loco.calls, [])
+
+    def test_successful_poll_without_receive_evidence_does_not_arm_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin, _, loco, _ = self.make(directory)
+            plugin._reader = lambda: sample(verified=False)
+            self.assertEqual(plugin.dispatch("config", {"dry_run": False, "confirm": True})["state"], "error")
+            self.assertFalse(plugin.info()["physical_execution_ready"])
+            self.assertEqual(loco.calls, [])
+
+    def test_native_getter_only_sdk_can_observe_without_loco_or_receive_callback(self):
+        class GetterOnly:
+            def get_joint_state(self):
+                return [types.SimpleNamespace(motor_id=i, pos=0.0, vel=0.0) for i in range(21)]
+        plugin = card.FootPosePlugin({}, "test", None, GetterOnly(), None)
+        observation = plugin.dispatch("read_feet", {})
+        self.assertEqual(observation["state"], "observed")
+        self.assertAlmostEqual(observation["separation"]["lateral_width_m"], 0.199)
+        self.assertFalse(observation["source_freshness_verified"])
+        self.assertFalse(observation["pose_confirmed"])
+        self.assertFalse(observation["command_sent"])
+        self.assertTrue(plugin.stop()["stopped"])
+
+    def test_read_feet_rejects_invalid_input_without_sending_a_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin, _, loco, _ = self.make(directory, assets=False)
+            plugin._reader = lambda: {"joint_states": []}
+            self.assertEqual(plugin.dispatch("read_feet", {})["state"], "error")
+            self.assertEqual(loco.calls, [])
+
 
 class RegistrationTests(unittest.TestCase):
+    def test_bundle_read_only_observation_works_without_loco_or_motion_plugins(self):
+        source = (BUNDLE_ROOT / "main.py").read_text(encoding="utf-8")
+        node = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "BumiDeviceBundle")
+        class GetterOnly:
+            def get_joint_state(self):
+                return [types.SimpleNamespace(motor_id=i, pos=0.0, vel=0.0) for i in range(21)]
+        device = types.ModuleType("device")
+        device._acp_notify = lambda *args: None
+        namespace = {"os": os}
+        with patch.dict(sys.modules, {"device": device, "foot_pose": card}), patch.dict(os.environ):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), "bundle-test", "exec", flags=__future__.annotations.compiler_flag), namespace)
+            bundle = namespace["BumiDeviceBundle"]({"plugins": {"foot_pose": {"enabled": True}}}, "test", None, GetterOnly(), None)
+            result = bundle.dispatch("foot_pose", {"action": "read_feet"})
+            self.assertEqual(result["state"], "observed")
+            self.assertFalse(result["command_sent"])
+            self.assertFalse(bundle.dispatch("foot_pose", {"action": "info"})["physical_execution_ready"])
+
     def test_real_bundle_constructor_registers_and_dispatches_the_new_card(self):
         source = (BUNDLE_ROOT / "main.py").read_text(encoding="utf-8")
         node = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "BumiDeviceBundle")

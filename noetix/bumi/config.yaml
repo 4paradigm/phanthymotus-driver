@@ -7,7 +7,8 @@ plugins:
   loco:
     enabled: true
   # Reusable pose interface; no validated leg recordings are shipped.
-  # Default requests only preview. Real output also needs explicit arming.
+  # Motion requests default to preview; read_feet works without motion assets.
+  # Real output also requires verified source freshness and explicit arming.
   foot_pose:
     enabled: true
     dry_run: true

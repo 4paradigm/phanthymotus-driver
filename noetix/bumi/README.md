@@ -503,8 +503,11 @@ status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
 
 ## Foot-pose prototype and scene Skills
 
-`foot_pose` exposes reusable pose names and a validated factory-recording adapter.
-It defaults to preview-only: this repository ships no verified leg-motion assets.
+`foot_pose` reads leg-joint snapshots, estimates body-frame foot positions and
+separation, compares saved pose signatures, and reloads individual assets.
+The geometry calculator also runs offline without ROS or the SDK. Motion requests
+default to preview-only: no verified leg-motion assets or source-reception
+freshness adapter are shipped.
 See [FOOT_POSE.md](FOOT_POSE.md) for its execution boundary and checks.
 
 The [scene Skill sources](skills/README.md) include doorway greeting with wave
