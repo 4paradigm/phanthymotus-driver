@@ -175,6 +175,17 @@ class BumiDeviceBundle:
             self._plugins.append(SpeakerPlugin(plugins_cfg["speaker"], namespace, executor, media_ctrl))
             print("[bundle] SpeakerPlugin loaded")
 
+        if plugins_cfg.get("media_status", {}).get("enabled", False):
+            # Deliberately not gated on `media_ctrl is not None`, unlike the
+            # cards above. They consume the media unit, so without it they have
+            # nothing to do; this card *reports* it, and the state worth seeing
+            # — the controller never came up — is exactly the one a gate would
+            # delete the card for. It publishes `healthy: null` instead.
+            from device import MediaStatusPlugin
+            self._plugins.append(MediaStatusPlugin(
+                plugins_cfg["media_status"], namespace, executor, media_ctrl))
+            print("[bundle] MediaStatusPlugin loaded")
+
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
             camera_plugin = CameraPlugin(plugins_cfg["camera"], namespace, executor)
@@ -395,29 +406,18 @@ def _start_registration(mcp_port: int, name: str, category: str):
     threading.Thread(target=_run, daemon=True, name="register").start()
 
 
-def main():
-    global _bundle
+def _init_high_controller():
+    """Create and initialise the locomotion controller, or return `None`.
 
-    cfg       = _load_config()
-    namespace = _resolve_namespace(cfg)
-    mcp_port  = int(cfg.get("mcp_port", 15704))
-
-    print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
-
-    # Must happen before the CameraPlugin creates its RealSense pipeline.
-    _disable_vendor_video_capture_service(cfg)
-
-    # ── Initialize Noetix SDK ──
-    high_ctrl = None
-    media_ctrl = None
-
+    `init()` may block indefinitely if the robot is unreachable (the GIL is held
+    inside C++), so a child process probes reachability first and the real init
+    only runs once that probe has answered.
+    """
     try:
         sys.path.insert(0, "/work/noetix_sdk_bumi/build")
         from highcontrol_py import HighController
         high_ctrl = HighController.instance()
 
-        # init() may block indefinitely if robot is unreachable (GIL held in C++).
-        # Use subprocess probe to check if DDS connection is possible first.
         probe_code = (
             "import sys; sys.path.insert(0, '/work/noetix_sdk_bumi/build'); "
             "from highcontrol_py import HighController; "
@@ -433,46 +433,78 @@ def main():
                 # Probe succeeded, safe to init in main process
                 high_ctrl.init()
                 print("[bundle] HighController initialized")
-            else:
-                print(f"[bundle] WARNING: HighController probe failed: {result.stderr.strip()}")
-                high_ctrl = None
+                return high_ctrl
+            print(f"[bundle] WARNING: HighController probe failed: {result.stderr.strip()}")
         except subprocess.TimeoutExpired:
             print("[bundle] WARNING: HighController.init() timed out (robot unreachable?)")
             print("[bundle] MCP server will start without robot connection")
-            high_ctrl = None
     except Exception as e:
         print(f"[bundle] WARNING: HighController init failed: {e}")
-        high_ctrl = None
+    return None
 
-    if high_ctrl is not None:
-        try:
-            from mediacontrol_py import MediaController
-            media_ctrl = MediaController.instance()
 
-            probe_code2 = (
-                "import sys; sys.path.insert(0, '/work/noetix_sdk_bumi/build'); "
-                "from mediacontrol_py import MediaController; "
-                "ctrl = MediaController.instance(); ctrl.init(); "
-                "print('OK')"
-            )
-            result = subprocess.run(
-                [sys.executable, "-c", probe_code2],
-                capture_output=True, text=True, timeout=10,
-            )
-            if "OK" in result.stdout:
-                media_ctrl.init()
-                import time
-                time.sleep(5)  # Wait for data sync per SDK docs
-                print("[bundle] MediaController initialized")
-            else:
-                print(f"[bundle] MediaController probe failed: {result.stderr.strip()}")
-                media_ctrl = None
-        except subprocess.TimeoutExpired:
-            print("[bundle] MediaController timed out")
-            media_ctrl = None
-        except Exception as e:
-            print(f"[bundle] MediaController unavailable: {e}")
-            media_ctrl = None
+def _init_media_controller():
+    """Create and initialise the media unit controller, or return `None`.
+
+    Deliberately not called from inside `_init_high_controller`: the legs talk to
+    the motion board and the media unit to the voice module, and the probe below
+    already runs in a child process that never constructs a HighController, so
+    initialisation cannot depend on one. Gating this on the leg probe reported a
+    working media unit as `controller_present: false` whenever locomotion was
+    unreachable, so the card blamed the wrong subsystem in its own worst case.
+
+    The cost is bounded: when the robot is unreachable this adds at most the
+    probe timeout and the SDK's fixed data-sync wait to startup, and both
+    controllers failing is the honest report that nothing is connected.
+    """
+    try:
+        sys.path.insert(0, "/work/noetix_sdk_bumi/build")
+        from mediacontrol_py import MediaController
+        media_ctrl = MediaController.instance()
+
+        probe_code = (
+            "import sys; sys.path.insert(0, '/work/noetix_sdk_bumi/build'); "
+            "from mediacontrol_py import MediaController; "
+            "ctrl = MediaController.instance(); ctrl.init(); "
+            "print('OK')"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe_code],
+            capture_output=True, text=True, timeout=10,
+        )
+        if "OK" in result.stdout:
+            media_ctrl.init()
+            import time
+            time.sleep(5)  # Wait for data sync per SDK docs
+            print("[bundle] MediaController initialized")
+            return media_ctrl
+        print(f"[bundle] MediaController probe failed: {result.stderr.strip()}")
+    except subprocess.TimeoutExpired:
+        print("[bundle] MediaController timed out")
+    except Exception as e:
+        print(f"[bundle] MediaController unavailable: {e}")
+    return None
+
+
+def main():
+    global _bundle
+
+    cfg       = _load_config()
+    namespace = _resolve_namespace(cfg)
+    mcp_port  = int(cfg.get("mcp_port", 15704))
+
+    print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
+
+    # Must happen before the CameraPlugin creates its RealSense pipeline.
+    _disable_vendor_video_capture_service(cfg)
+
+    # ── Initialize Noetix SDK ──
+    # Two independent subsystems, initialised independently. Nesting the media
+    # probe under the locomotion one made a leg-controller outage report as a
+    # missing media unit, which is precisely the confusion `media_status` is
+    # built to end.
+    high_ctrl = _init_high_controller()
+    media_ctrl = _init_media_controller()
 
     # ── ROS2 ──
     rclpy.init()
