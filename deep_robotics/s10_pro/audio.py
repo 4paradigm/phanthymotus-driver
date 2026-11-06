@@ -48,8 +48,6 @@ def _capture_launch_command(device):
         "set -e; "
         "amixer -c 0 cset name='Left PGA Mux' DifferentialL >/dev/null; "
         "amixer -c 0 cset name='Right PGA Mux' DifferentialR >/dev/null; "
-        "amixer -c 0 cset name='Left Line Mux' MicL >/dev/null; "
-        "amixer -c 0 cset name='Right Line Mux' MicR >/dev/null; "
         "amixer -c 0 cset name='Main Mic Switch' on >/dev/null; "
         "gate=$(amixer -c 0 cget name='ALC Capture NG Switch' | "
         "sed -n 's/.*: values=//p'); "

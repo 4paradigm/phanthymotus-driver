@@ -16,13 +16,13 @@ topics:
   joints: "/JOINTS_DATA_10HZ"
   battery: "/BATTERY_DATA"
   motion_info: "/MOTION_INFO"
-  # Probe candidates in parallel. Direct sensor sources outrank derived clouds;
-  # otherwise keep the selected source until it has gone stale.
+  # Keep the preferred aligned cloud selected; use another live source only
+  # while it is stale, then switch back as soon as it resumes.
   lidar_cloud:
+    - "/ALIGNED_POINTS"
     - "/local_scans"
     - "/DEPTH_POINTS"
     - "/LIDAR/POINTS"
-    - "/ALIGNED_POINTS"
     - "/CLOUD_REGISTERED_BODY"
     - "/FULL_CLOUD_MAP"
     - "/HANDLER_POINTS_DEBUG"
@@ -76,4 +76,5 @@ controlled_spatial:
   ssh_user: user
   ssh_host: "10.21.33.106"
   directory: /var/opt/robot/data/maps
+  tags_file: /opt/phanthy-motus/data/s10_pro/tags.json
   timeout: 30

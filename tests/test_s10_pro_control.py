@@ -76,7 +76,7 @@ def test_pro_config_registers_navigation_and_matches_marketplace_cards(monkeypat
     card_names = {card["name"] for card in driver["cards"]}
 
     assert config["model_variant"] == "pro"
-    assert "navigation" in card_names
+    assert "controlled_spatial" in card_names
     assert {"head_light", "tail_light"} <= card_names
     assert "light" not in card_names
     assert "loco" in card_names and "motion" not in card_names
@@ -86,7 +86,7 @@ def test_pro_config_registers_navigation_and_matches_marketplace_cards(monkeypat
     assert {"camera_rear", "camera_left", "camera_front", "camera_right"} <= card_names
     assert "device" not in card_names
     assert not card_names.intersection({"motion_info", "native_basic_status", "native_device_status", "hard_estop", "charge_status"})
-    assert any(plugin.__class__.__name__ == "S10NavigationPlugin" for plugin in plugins)
+    assert not any(plugin.__class__.__name__ == "S10NavigationPlugin" for plugin in plugins)
     assert config["mcp_port"] == driver["port"] == 15745
     assert config["mcp_port"] != yaml.safe_load((ROOT / "agibot/AimDK_X2/driver.yaml").read_text())["port"]
     dockerfile = (DRIVER / "Dockerfile").read_text()
@@ -142,6 +142,8 @@ def test_s10_camera_info_exposes_vendor_body_mount_positions(monkeypatch):
         info = plugin.dispatch("info", {"_tool_name": camera})["camera_info"][0]
         assert info["schema"] == "motus.camera/1"
         assert info["topic"] == topics[camera]["topic"]
+        assert info["width"] == 640
+        assert info["height"] == 360
         assert info["vendor"]["mounting"]["frame_id"] == "body"
         assert info["vendor"]["mounting"]["position_m"] == position
         assert info["vendor"]["mounting"]["orientation_xyzw"] is None
@@ -544,6 +546,7 @@ def test_rtsp_mjpeg_parser_handles_fragmented_and_multiple_frames():
     assert command[0] == "ffmpeg"
     assert command[command.index("-rtsp_transport") + 1] == "tcp"
     assert command[command.index("-i") + 1] == "rtsp://10.21.33.103:8554/video4"
+    assert command[command.index("-vf") + 1] == "fps=15,scale='min(640,iw)':-2"
     assert command[-1] == "pipe:1"
 
 
@@ -578,6 +581,7 @@ def test_lidar_cloud_probes_previous_pointcloud_topics_but_keeps_map_separate():
     config = yaml.safe_load((DRIVER / "config.yaml").read_text())
     candidates = config["topics"]["lidar_cloud"]
     assert len(candidates) == 22
+    assert candidates[0] == "/ALIGNED_POINTS"
     assert "/ACCUMULATED_POINTS_MAP" not in candidates
     assert {"/DEPTH_POINTS", "/local_scans", "/ALIGNED_POINTS",
             "/CLOUD_REGISTERED_BODY", "/FULL_CLOUD_MAP", "/LIDAR/POINTS"} <= set(candidates)
@@ -876,7 +880,8 @@ def test_controlled_spatial_auto_detects_aos_and_external_execution(monkeypatch,
     assert plugin.mode == "local"
 
     monkeypatch.setattr("spatial.shutil.which", lambda _command: None)
-    with pytest.raises(ValueError, match="S10 NOS address is local but drmap"):
+    # Auto mode falls back to SSH when a NOS-local host has no drmap/data mount.
+    with pytest.raises(ValueError, match="ssh client is required"):
         S10ControlledSpatialPlugin({
             "basic_server": {"host": "10.21.33.103"},
             "controlled_spatial": {"mode": "auto", "ssh_host": "10.21.33.106", "directory": str(tmp_path)},
@@ -1462,8 +1467,27 @@ def test_controlled_spatial_uses_fixed_drmap_commands_and_confirmation(monkeypat
     assert "GlobalKnownHostsFile=/dev/null" in command
     assert "user@10.21.33.106" in command
     assert "drmap --format json map list" in command[-1]
+    assert plugin.dispatch("map_disk", {})["ok"] is True
+    assert "drmap map disk" in calls[-1][0][-1]
+    assert plugin.dispatch("mapping_status", {})["ok"] is True
+    assert "drmap mapping status" in calls[-2][0][-1]
+    assert "systemctl is-active mapping.service" in calls[-1][0][-1]
+    assert "systemctl is-active localization.service" in calls[-1][0][-1]
+    assert "cat /tmp/mapping_path.env" in calls[-1][0][-1]
+    assert plugin.dispatch("map_activate", {"map_name": "office"})["code"] == "INVALID_ARGUMENT"
+    assert plugin.dispatch("map_activate", {"confirm": True, "map_name": "office"})["ok"] is True
+    assert "drmap map activate office" in calls[-1][0][-1]
+    assert plugin.dispatch("map_apply", {"confirm": True, "map_name": "office"})["ok"] is True
+    assert "drmap map apply office && systemctl restart localization.service" in calls[-1][0][-1]
     assert plugin.dispatch("mapping_start", {"confirm": True})["ok"] is True
     assert "drmap mapping start" in calls[-1][0][-1]
+    assert plugin.dispatch("mapping_start", {
+        "confirm": True, "map_name": "office north", "no_activate": True, "no_rviz": True,
+    })["ok"] is True
+    assert "drmap mapping start 'office north' --no-activate --no-rviz" in calls[-1][0][-1]
+    assert plugin.dispatch("mapping_start", {
+        "confirm": True, "map_name": "bad\nname",
+    })["code"] == "INVALID_ARGUMENT"
     assert plugin.dispatch("mapping_stop", {"confirm": True})["ok"] is True
     assert "drmap mapping stop" in calls[-1][0][-1]
 
@@ -1479,6 +1503,36 @@ def test_controlled_spatial_reports_invalid_json_and_remote_failures(monkeypatch
                                          "controlled_spatial": {"mode": "ssh"}})
     assert plugin.dispatch("map_list", {})["code"] == "INVALID_JSON_OUTPUT"
     assert plugin.dispatch("mapping_start", {"confirm": True})["code"] == "DRMAP_FAILED"
+
+
+def test_controlled_spatial_tags_match_g1_contract_and_persist_by_map(monkeypatch, tmp_path):
+    monkeypatch.syspath_prepend(str(DRIVER))
+    from spatial import S10ControlledSpatialPlugin
+
+    class Navigation:
+        def dispatch(self, action, args):
+            if action == "pose":
+                return {"PatrolDevice": {"Items": {"PosX": 1.25, "PosY": -0.5,
+                                                     "PosZ": 0, "YawDegrees": 90}}}
+            return {"state": "accepted", "action": action, "args": args}
+
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs:
+                        SimpleNamespace(returncode=0, stdout="", stderr=""))
+    tags_file = tmp_path / "tags.json"
+    plugin = S10ControlledSpatialPlugin({"basic_server": {"host": "10.21.33.103"},
+        "controlled_spatial": {"mode": "ssh", "tags_file": str(tags_file)}}, Navigation())
+    plugin._tags["active_map"] = "office"
+    tagged = plugin.dispatch("tag_place", {"name": "dock", "description": "charging bay"})
+    assert tagged["ok"] is True
+    assert tagged["tag"]["x"] == 1.25
+    listed = plugin.dispatch("list_tags", {})
+    assert listed["map"] == "office" and listed["tags"][0]["name"] == "dock"
+    nav = plugin.dispatch("navigate_to_tag", {"tag_name": "dock", "speed": 0.5,
+                                                "mode": 1, "confirm": True})
+    assert nav["args"]["x"] == 1.25
+    assert nav["args"]["yaw_degrees"] == 90
+    assert nav["args"]["avoid_obstacles"] is False
+    assert tags_file.exists()
 
 
 def test_controlled_spatial_sanitizes_and_bounds_remote_output(monkeypatch):
@@ -1950,9 +2004,9 @@ def test_lidar_source_locks_to_first_valid_configured_stream(monkeypatch):
 def test_lidar_source_fails_over_after_active_source_stales(monkeypatch):
     device = _load_device(monkeypatch)
     nodes = object.__new__(device.S10Nodes)
-    nodes._lidar_topics = ["/DEPTH_POINTS", "/local_scans", "/LIDAR/POINTS"]
-    nodes._active_lidar_source = "/DEPTH_POINTS"
-    nodes._lidar_source_last_seen = {"/DEPTH_POINTS": time.monotonic() - 4.0}
+    nodes._lidar_topics = ["/ALIGNED_POINTS", "/DEPTH_POINTS", "/local_scans", "/LIDAR/POINTS"]
+    nodes._active_lidar_source = "/ALIGNED_POINTS"
+    nodes._lidar_source_last_seen = {"/ALIGNED_POINTS": time.monotonic() - 1.0}
     nodes._lidar_topic_stats = {}
     nodes._lidar_source_lock = threading.Lock()
     nodes._stream_lock = threading.Lock()
@@ -1965,12 +2019,15 @@ def test_lidar_source_fails_over_after_active_source_stales(monkeypatch):
     nodes._forward_lidar("/local_scans", msg)
     assert nodes._active_lidar_source == "/local_scans"
     assert nodes._stream_stats["lidar_cloud"]["received"] == 1
+    nodes._forward_lidar("/ALIGNED_POINTS", msg)
+    assert nodes._active_lidar_source == "/ALIGNED_POINTS"
+    assert nodes._stream_stats["lidar_cloud"]["received"] == 2
 
 
-def test_lidar_direct_sensor_source_preempts_derived_candidate(monkeypatch):
+def test_lidar_preferred_source_immediately_reclaims_stream_after_failover(monkeypatch):
     device = _load_device(monkeypatch)
     nodes = object.__new__(device.S10Nodes)
-    nodes._lidar_topics = ["/FULL_CLOUD_MAP", "/DEPTH_POINTS"]
+    nodes._lidar_topics = ["/ALIGNED_POINTS", "/FULL_CLOUD_MAP", "/DEPTH_POINTS"]
     nodes._active_lidar_source = "/FULL_CLOUD_MAP"
     nodes._lidar_source_last_seen = {"/FULL_CLOUD_MAP": time.monotonic()}
     nodes._lidar_topic_stats = {}
@@ -1985,9 +2042,9 @@ def test_lidar_direct_sensor_source_preempts_derived_candidate(monkeypatch):
     msg = SimpleNamespace(fields=[], is_bigendian=False, width=0, height=0,
                           row_step=0, point_step=0, data=b"")
 
-    nodes._forward_lidar("/DEPTH_POINTS", msg)
+    nodes._forward_lidar("/ALIGNED_POINTS", msg)
 
-    assert nodes._active_lidar_source == "/DEPTH_POINTS"
+    assert nodes._active_lidar_source == "/ALIGNED_POINTS"
     assert nodes._stream_stats["lidar_cloud"]["received"] == 1
     assert len(accepted) == 1
 

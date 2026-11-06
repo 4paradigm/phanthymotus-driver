@@ -34,8 +34,8 @@ CAMERA_MOUNTS = {
     "camera_right": (0.0, -0.06480, 0.05990),
 }
 LIDAR_LANES = ("lidar_cloud", "lidar_map")
-LIDAR_SOURCE_STALE_SECONDS = 3.0
-DIRECT_LIDAR_SOURCES = frozenset({"/DEPTH_POINTS", "/local_scans", "/LIDAR/POINTS"})
+PREFERRED_LIDAR_SOURCE = "/ALIGNED_POINTS"
+LIDAR_SOURCE_STALE_SECONDS = 0.5
 
 
 def _mark_dangerous(result, actions):
@@ -505,9 +505,7 @@ class S10Nodes:
                     self._active_lidar_source = source
                 elif source != self._active_lidar_source:
                     active_seen = self._lidar_source_last_seen.get(self._active_lidar_source, 0.0)
-                    active_is_direct = self._active_lidar_source in DIRECT_LIDAR_SOURCES
-                    candidate_is_direct = source in DIRECT_LIDAR_SOURCES
-                    if ((candidate_is_direct and not active_is_direct) or
+                    if (source == PREFERRED_LIDAR_SOURCE or
                             now - active_seen >= LIDAR_SOURCE_STALE_SECONDS):
                         self._active_lidar_source = source
                 selected = source == self._active_lidar_source
@@ -812,7 +810,23 @@ class S10StatePlugin:
         definitions = []
         for name, description in cards.items():
             outputs = [topics[name]] if name in topics else None
-            definitions.append(tool(name, "sensor", description, topic_out=outputs))
+            definition = tool(name, "sensor", description, topic_out=outputs)
+            if name in CAMERA_MOUNTS and outputs:
+                definition["camera_info"] = [build_camera_info(
+                    topic=topics[name]["topic"],
+                    id=f"deeprobotics/s10_pro/{name}",
+                    format="image/jpeg", width=640, height=360,
+                    source="unknown",
+                    vendor={"transport": "rtsp", "mounting": {
+                        "frame_id": "body", "position_m": list(CAMERA_MOUNTS[name]),
+                        "orientation_xyzw": None, "source": "vendor-spec",
+                        "stream": {"width": 640, "height": 360, "fps_max": 15,
+                                   "codec": "mjpeg", "source": "driver_output",
+                                   "source_resolution": {"width": 1024, "height": 576, "fps": 30},
+                                   "source_codec": "h264"},
+                    }},
+                )]
+            definitions.append(definition)
         return definitions
 
     def _topic_result(self, name, state):
@@ -841,6 +855,8 @@ class S10StatePlugin:
                     topic=self.nodes.topics[name]["topic"],
                     id=f"deeprobotics/s10_pro/{name}",
                     format="image/jpeg",
+                    width=640,
+                    height=360,
                     source="unknown",
                     vendor={
                         "mounting": {
@@ -853,6 +869,10 @@ class S10StatePlugin:
                                 "origin": "body geometric center shown in section 1.6",
                             },
                             "reference": "DeepRobotics S10 Hardware Development Manual v1.0.2, sections 1.6 and 1.9",
+                            "stream": {"width": 640, "height": 360, "fps_max": 15,
+                                       "codec": "mjpeg", "source": "driver_output",
+                                       "source_resolution": {"width": 1024, "height": 576, "fps": 30},
+                                       "source_codec": "h264"},
                         },
                     },
                 )]
@@ -1508,6 +1528,6 @@ def build_plugins(config, namespace=None, ros2=None):
                S10ChargePlugin(native)]
     if str(config.get("model_variant", "standard")).lower() == "pro":
         from audio import S10MicPlugin, S10SpeakerPlugin
-        plugins.extend([navigation, S10ControlledSpatialPlugin(config),
+        plugins.extend([S10ControlledSpatialPlugin(config, navigation),
                         S10MicPlugin(config, namespace or "", nodes), S10SpeakerPlugin(config)])
     return plugins

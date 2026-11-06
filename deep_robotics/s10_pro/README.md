@@ -33,8 +33,8 @@ Capture and playback both default to the verified AOS onboard codec
 `plughw:CARD=rockchipes8388,DEV=0` (ALSA card 0); the USB `Speaker` device is
 playback-only on this robot. These device settings are used in both local and
 SSH modes; override them independently when the AOS card names differ.
-On each mic start, the driver selects the ES8323 differential mic inputs and
-enables `Main Mic`. It reads the codec's low-level noise-gate state and turns
+On each mic start, the driver selects the ES8323 differential mic PGA inputs
+and enables `Main Mic`. It reads the codec's low-level noise-gate state and turns
 the gate off only when it is enabled; an already-disabled gate is left alone.
 The AOS factory ALSA state selected Line 1 and enabled a gate that reduced the
 published signal to near-zero; `mic info` includes latest-frame PCM peak, RMS,
@@ -120,7 +120,9 @@ and Core-domain publication use bounded queues so media work does not block
 robot control/state callbacks.
 The camera cards use the AOS RTSP endpoints supplied by the vendor: front wide
 `/video4`, rear wide `/video0`, left wide `/video2`, and right wide `/video6`.
-The driver pulls each stream over RTSP/TCP with FFmpeg, extracts MJPEG frames,
+The validated vendor streams are H.264 at 1024x576 and 30 fps. The driver
+pulls each stream over RTSP/TCP with FFmpeg, caps output at 15 fps,
+scales frames to at most 640 pixels wide, and extracts MJPEG frames,
 and publishes them to the existing Core-domain JPEG topics. Camera input is
 RTSP-only: the robot ROS graph is scanned for point clouds, never image topics.
 The driver also reports each camera's body-frame mount position in
@@ -190,25 +192,41 @@ operations run over SSH to the NOS host as
 `S10_DRMAP_PASSWORD` to the robot's reported default password; override it via
 the deployment environment after changing the robot credential. SSH verifies
 the pinned AOS/NOS host key before sending this credential; host-key changes
-fail closed. The tutorial demonstrates `/var/opt/robot/data/maps`,
-`drmap mapping start`, `drmap mapping stop`, and `drmap map list`; responses
-from `drmap --format json map list` are parsed when valid. The SSH management
-host is set with `S10_DRMAP_SSH_HOST` and defaults to `10.21.33.106`. Map
-activation, deletion, and mapping status remain unavailable until their exact
-CLI schema and error semantics are verified on target firmware.
+fail closed. The vendor's body-mapping guide documents a recommended maximum
+area of `50m x 50m`, a static environment, a loop-closure route, unobstructed
+LiDAR, online LiDAR/IMU, and a stationary standing robot in normal mode, agile
+mode, basic gait before mapping starts. `controlled_spatial` exposes `map_disk`,
+`map_list`, and read-only `mapping_status`, plus confirmed `map_activate`,
+`map_apply`, `mapping_start`, and `mapping_stop`. The guide documents
+`drmap map activate MAP_NAME` after mapping and `drmap map apply MAP_NAME`
+followed by a localization restart when switching an existing map; the card
+preserves those two workflows separately. Start accepts an optional map name,
+`no_activate`, and
+`no_rviz`, matching the documented `drmap mapping start` options. A map started
+with `no_activate` can later be activated through the card's confirmed
+`map_activate` action.
+Stopping mapping is documented to restart localization automatically; status
+uses `drmap mapping status` plus both systemd services and
+`/tmp/mapping_path.env` for operator verification. The vendor CLI has no
+semantic tag/POI command in the target firmware. The driver therefore stores
+G1/Tianyi-compatible named tags in the persistent
+`/opt/phanthy-motus/data/s10_pro/tags.json` volume, using the current localized
+pose and scoping tags by selected map. Named navigation points use the
+documented map-coordinate route contract. The SSH
+management host is set with `S10_DRMAP_SSH_HOST` and
+defaults to `10.21.33.106`.
 
-The native navigation card uses the currently loaded map and supports pose
-initialization, goal/route execution, status, cancellation, and perception
-status. The S10 software development guide documents the TCP `Item[]` route
-contract and navigation status/location fields. It does not define map CRUD,
-route persistence, or a mapping API. The separate [mapping tutorial](https://support.deeprobotics.cn/docs/?lang=zh-CN#/259675993)
-documents only the interactive `drmap mapping start` / `drmap mapping stop`
-workflow, says it must be run from the robot's map-management directory, and
-does not specify the directory, executable deployment path, status/output
-schema, map selection, or error contract. `controlled_spatial` therefore
-implements only the demonstrated map listing and mapping start/stop operations;
-it does not claim support for map CRUD or persistent saved routes. The existing
-multi-point native route remains the supported navigation route contract.
+The single `controlled_spatial` card uses the currently loaded map and is the
+full-stack mapping/localization/navigation card: mapping lifecycle, map
+listing/activation, tags, native pose initialization, goal/route execution,
+status, cancellation, and perception status. The separate `navigation` card is
+not registered, matching the Tianyi/G1 contract. The S10 software development
+guide documents the TCP `Item[]` route contract and navigation status/location
+fields; the vendor [body-mapping guide](https://support.deeprobotics.cn/docs/?lang=zh-CN#/259676041)
+documents `drmap mapping start/stop`, map listing and disk checks, service
+status, start options, and result files. `controlled_spatial` combines those
+documented operations with driver-managed tags because the vendor CLI does not
+expose a tag API.
 
 ## Validation
 

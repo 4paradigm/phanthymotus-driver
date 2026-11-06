@@ -54,7 +54,7 @@ def test_audio_device_names_and_pcm_commands(monkeypatch):
     capture_setup = audio._capture_launch_command("default")
     assert capture_setup[:2] == ["sh", "-lc"]
     assert "Left PGA Mux' DifferentialL" in capture_setup[2]
-    assert "Left Line Mux' MicL" in capture_setup[2]
+    assert "Line Mux" not in capture_setup[2]
     assert "case \"$gate\" in" in capture_setup[2]
     assert "off) : ;;" in capture_setup[2]
     assert "ALC Capture NG Switch' off" in capture_setup[2]

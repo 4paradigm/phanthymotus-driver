@@ -4,6 +4,8 @@ deep-robotics-s10-pro:
   network_mode: host
   devices:
     - /dev/snd:/dev/snd
+  volumes:
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
   environment:
     - PYTHONUNBUFFERED=1
     - RCUTILS_COLORIZED_OUTPUT=0

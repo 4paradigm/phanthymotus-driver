@@ -12,7 +12,7 @@ import time
 def _rtsp_command(url):
     return ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
             "-rtsp_transport", "tcp", "-fflags", "nobuffer", "-flags", "low_delay",
-            "-i", str(url), "-an", "-vf", "scale='min(640,iw)':-2",
+            "-i", str(url), "-an", "-vf", "fps=15,scale='min(640,iw)':-2",
             "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
 
 

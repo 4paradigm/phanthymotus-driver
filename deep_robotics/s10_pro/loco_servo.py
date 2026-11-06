@@ -22,6 +22,7 @@ def build_descriptor(expected_hz=10.0):
                    "upper": [VX_LIMIT, VY_LIMIT, 0, 0, 0, WZ_LIMIT],
                    "max_delta_per_step": [0.25, 0.15, 1e-6, 1e-6, 1e-6, 0.2]},
         "frame": "base_link",
+        "footprint": {"half_width": 0.35, "source": "vendor-spec"},
         "rate": {"max_hz": 20.0, "expected_hz": float(expected_hz), "watchdog_ms": 300, "max_obs_age_ms": 500},
         "force_torque": None,
     }
