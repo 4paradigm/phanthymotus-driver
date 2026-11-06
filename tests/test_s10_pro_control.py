@@ -123,6 +123,30 @@ def test_standard_state_cards_read_native_reports(monkeypatch):
     assert plugin.dispatch("battery", {"_tool_name": "battery"}) == {"batteries": [{"SOC": 88}]}
 
 
+def test_s10_camera_info_exposes_vendor_body_mount_positions(monkeypatch):
+    device = _load_device(monkeypatch)
+    topics = {
+        "camera_front": {"topic": "/s10_pro/camera_front", "format": "image/jpeg"},
+        "camera_rear": {"topic": "/s10_pro/camera_rear", "format": "image/jpeg"},
+        "camera_left": {"topic": "/s10_pro/camera_left", "format": "image/jpeg"},
+        "camera_right": {"topic": "/s10_pro/camera_right", "format": "image/jpeg"},
+    }
+    plugin = device.S10StatePlugin(FakeNative({}), SimpleNamespace(topics=topics))
+    expected = {
+        "camera_front": [0.27065, 0.0, 0.04673],
+        "camera_rear": [-0.27065, 0.0, 0.04670],
+        "camera_left": [0.0, 0.06480, 0.05990],
+        "camera_right": [0.0, -0.06480, 0.05990],
+    }
+    for camera, position in expected.items():
+        info = plugin.dispatch("info", {"_tool_name": camera})["camera_info"][0]
+        assert info["schema"] == "motus.camera/1"
+        assert info["topic"] == topics[camera]["topic"]
+        assert info["vendor"]["mounting"]["frame_id"] == "body"
+        assert info["vendor"]["mounting"]["position_m"] == position
+        assert info["vendor"]["mounting"]["orientation_xyzw"] is None
+        assert info["vendor"]["mounting"]["source"] == "vendor-spec"
+        assert info["source"] == "unknown"
 def test_actuator_start_surfaces_tls_reboot_requirement_to_frontend(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
@@ -419,7 +443,7 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
 
 def test_lidar_packet_uniformly_caps_large_point_cloud(monkeypatch):
     device = _load_device(monkeypatch)
-    width = 10000
+    width = 40000
     data = b"".join(struct.pack("<fff", float(index), 0.0, 0.0) for index in range(width))
     lidar = SimpleNamespace(
         fields=[SimpleNamespace(name=name, offset=offset, datatype=7, count=1)
@@ -430,9 +454,9 @@ def test_lidar_packet_uniformly_caps_large_point_cloud(monkeypatch):
     encoded = device.S10Nodes._pointcloud_packet(lidar)
     point_step, point_count = struct.unpack_from("<II", encoded)
 
-    assert (point_step, point_count) == (12, 2000)
+    assert (point_step, point_count) == (12, 10000)
     assert struct.unpack_from("<f", encoded, 8)[0] == 0.0
-    assert struct.unpack_from("<f", encoded, 8 + (point_count - 1) * point_step)[0] == 9999.0
+    assert struct.unpack_from("<f", encoded, 8 + (point_count - 1) * point_step)[0] == 39999.0
 
 
 def test_lidar_packet_supports_float64_big_endian_and_validates_layout(monkeypatch):

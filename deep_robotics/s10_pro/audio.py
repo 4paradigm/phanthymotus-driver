@@ -8,6 +8,7 @@ import queue
 import shlex
 import shutil
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -42,6 +43,25 @@ def _playback_command(device):
             "-f", "S16_LE", "-r", "16000", "-c", "1"]
 
 
+def _capture_launch_command(device):
+    route = (
+        "set -e; "
+        "amixer -c 0 cset name='Left PGA Mux' DifferentialL >/dev/null; "
+        "amixer -c 0 cset name='Right PGA Mux' DifferentialR >/dev/null; "
+        "amixer -c 0 cset name='Left Line Mux' MicL >/dev/null; "
+        "amixer -c 0 cset name='Right Line Mux' MicR >/dev/null; "
+        "amixer -c 0 cset name='Main Mic Switch' on >/dev/null; "
+        "gate=$(amixer -c 0 cget name='ALC Capture NG Switch' | "
+        "sed -n 's/.*: values=//p'); "
+        "case \"$gate\" in "
+        "on) amixer -c 0 cset name='ALC Capture NG Switch' off >/dev/null ;; "
+        "off) : ;; "
+        "*) echo 'cannot determine ALC noise-gate state' >&2; exit 1 ;; "
+        "esac; exec "
+    )
+    return ["sh", "-lc", route + shlex.join(_capture_command(device))]
+
+
 def _is_local_address(address):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -52,7 +72,8 @@ def _is_local_address(address):
 
 
 def _audio_launch(program, device, mode, host, user, password):
-    command = _capture_command(device) if program == "arecord" else _playback_command(device)
+    command = (_capture_launch_command(device) if program == "arecord"
+               else _playback_command(device))
     if mode == "local":
         return command, None
     target = f"{user}@{host}" if user else host
@@ -122,6 +143,9 @@ class S10MicPlugin:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._frames = 0
+        self._pcm_peak = 0
+        self._pcm_rms = 0.0
+        self._pcm_nonzero_ratio = 0.0
         self._bridge_dropped_at_start = 0
         self._last_error = None
 
@@ -175,6 +199,9 @@ class S10MicPlugin:
                 return {"state": "error", "error": self._last_error}
             self._stop.clear()
             self._frames = 0
+            self._pcm_peak = 0
+            self._pcm_rms = 0.0
+            self._pcm_nonzero_ratio = 0.0
             self._last_error = None
             self._reader = threading.Thread(target=self._capture_loop, daemon=True,
                                             name="s10-mic-capture")
@@ -206,6 +233,12 @@ class S10MicPlugin:
                 while len(buffer) >= FRAME_BYTES:
                     payload = bytes(buffer[:FRAME_BYTES])
                     del buffer[:FRAME_BYTES]
+                    samples = struct.unpack("<512h", payload)
+                    peak = max(abs(sample) for sample in samples)
+                    self._pcm_peak = peak
+                    self._pcm_rms = (sum(sample * sample for sample in samples) /
+                                     len(samples)) ** 0.5
+                    self._pcm_nonzero_ratio = sum(sample != 0 for sample in samples) / len(samples)
                     message = AudioChunk()
                     # Raw arecord/SSH PCM does not include ALSA capture time.
                     # Leave stamp zero instead of labeling pipe-read time as
@@ -248,6 +281,9 @@ class S10MicPlugin:
             running = self._process is not None and self._process.poll() is None
             result = {"state": "running" if running else "idle", "frames": self._frames,
                       "frames_dropped": max(0, self._bridge_drop_count() - self._bridge_dropped_at_start),
+                      "pcm_peak": self._pcm_peak,
+                      "pcm_rms": round(self._pcm_rms, 2),
+                      "pcm_nonzero_ratio": round(self._pcm_nonzero_ratio, 4),
                       "capture_timestamp_trusted": False,
                       "topic_out": self.get_tool()["topic_out"], "mode": self.mode,
                       "audio_host": self.host if self.mode == "ssh" else None}

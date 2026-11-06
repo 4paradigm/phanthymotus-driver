@@ -22,8 +22,17 @@ from media_workers import MediaWorkers, encode_pointcloud
 from loco_servo import S10LocoServoPlugin
 from spatial import S10ControlledSpatialPlugin
 from common.odom import build_interface, build_sample
+from common.camera_info import build as build_camera_info
 
 CAMERA_LANES = ("camera_rear", "camera_left", "camera_front", "camera_right")
+CAMERA_MOUNTS = {
+    # DeepRobotics S10 Hardware Development Manual v1.0.2, sections 1.6/1.9.
+    # The vendor table gives millimetres and no camera orientation.
+    "camera_front": (0.27065, 0.0, 0.04673),
+    "camera_rear": (-0.27065, 0.0, 0.04670),
+    "camera_left": (0.0, 0.06480, 0.05990),
+    "camera_right": (0.0, -0.06480, 0.05990),
+}
 LIDAR_LANES = ("lidar_cloud", "lidar_map")
 LIDAR_SOURCE_STALE_SECONDS = 3.0
 DIRECT_LIDAR_SOURCES = frozenset({"/DEPTH_POINTS", "/local_scans", "/LIDAR/POINTS"})
@@ -595,7 +604,7 @@ JOINT_NAMES = (
     "hr_hipx_joint", "hr_hipy_joint", "hr_knee_joint", "hr_wheel_joint",
 )
 URDF_PATH = Path(__file__).with_name("resource") / "S10_kinematic.urdf"
-MAX_LIDAR_RENDER_POINTS = 2000
+MAX_LIDAR_RENDER_POINTS = 10000
 JOINT_DIRECTIONS = (1, 1, -1, 1, 1, -1, 1, -1,
                     -1, 1, -1, 1, -1, -1, 1, -1)
 JOINT_OFFSETS_DEG = (-35, -145, 156, 0, 35, -145, 156, 0,
@@ -799,7 +808,7 @@ class S10StatePlugin:
         }
         topics = self.nodes.topics if self.nodes else {}
         for camera in (key for key in topics if key.startswith("camera_")):
-            cards[camera] = f"山猫 S10 机载相机 {camera.removeprefix('camera_')} 图像流；不推断物理方位"
+            cards[camera] = f"山猫 S10 机载相机 {camera.removeprefix('camera_')} 图像流"
         definitions = []
         for name, description in cards.items():
             outputs = [topics[name]] if name in topics else None
@@ -827,6 +836,26 @@ class S10StatePlugin:
             return self._topic_result(name, "idle")
         if action == "info":
             result = self._topic_result(name, "ready")
+            if name in CAMERA_MOUNTS and self.nodes:
+                result["camera_info"] = [build_camera_info(
+                    topic=self.nodes.topics[name]["topic"],
+                    id=f"deeprobotics/s10_pro/{name}",
+                    format="image/jpeg",
+                    source="unknown",
+                    vendor={
+                        "mounting": {
+                            "frame_id": "body",
+                            "position_m": list(CAMERA_MOUNTS[name]),
+                            "orientation_xyzw": None,
+                            "source": "vendor-spec",
+                            "coordinate_convention": {
+                                "x": "forward", "y": "left", "z": "up",
+                                "origin": "body geometric center shown in section 1.6",
+                            },
+                            "reference": "DeepRobotics S10 Hardware Development Manual v1.0.2, sections 1.6 and 1.9",
+                        },
+                    },
+                )]
             if name == "loco_state":
                 result["odom_interface"] = build_interface(
                     provides=["vx", "vy", "wz"], frame="body", rate_hz=10,

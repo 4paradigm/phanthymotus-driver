@@ -33,6 +33,12 @@ Capture and playback both default to the verified AOS onboard codec
 `plughw:CARD=rockchipes8388,DEV=0` (ALSA card 0); the USB `Speaker` device is
 playback-only on this robot. These device settings are used in both local and
 SSH modes; override them independently when the AOS card names differ.
+On each mic start, the driver selects the ES8323 differential mic inputs and
+enables `Main Mic`. It reads the codec's low-level noise-gate state and turns
+the gate off only when it is enabled; an already-disabled gate is left alone.
+The AOS factory ALSA state selected Line 1 and enabled a gate that reduced the
+published signal to near-zero; `mic info` includes latest-frame PCM peak, RMS,
+and nonzero-sample ratio to distinguish live audio from a silent input.
 The mic bridge keeps at most four 32 ms frames (128 ms) and replaces the oldest
 queued frame if its publisher falls behind. Raw `arecord`/SSH output has no
 hardware capture timestamp, so mic messages use a zero header stamp and
@@ -117,6 +123,12 @@ The camera cards use the AOS RTSP endpoints supplied by the vendor: front wide
 The driver pulls each stream over RTSP/TCP with FFmpeg, extracts MJPEG frames,
 and publishes them to the existing Core-domain JPEG topics. Camera input is
 RTSP-only: the robot ROS graph is scanned for point clouds, never image topics.
+The driver also reports each camera's body-frame mount position in
+`camera_info[].vendor.mounting.position_m`, based on the vendor Hardware
+Development Manual v1.0.2 sections 1.6 and 1.9. These values are converted
+from millimetres to metres. The manual provides no camera orientation, and the
+RTSP stream provides no intrinsics, so orientation and optical calibration
+remain unknown.
 A one-frame low-latency pipeline reconnects after stream interruption. The
 previous ROS image-topic receive path has been removed because the vendor camera service
 does not publish camera images over DDS. The final image includes the `ffmpeg`

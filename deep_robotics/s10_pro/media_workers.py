@@ -228,7 +228,7 @@ def _worker(jobs, results, kind, lane):
 
 
 def encode_pointcloud(fields, bigendian, width, height, row_step, point_step, data,
-                      max_points=2000):
+                      max_points=10000):
     """Pack XYZ only as little-endian float32 records for the cloud renderer."""
     import math
     import struct

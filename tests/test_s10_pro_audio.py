@@ -51,6 +51,14 @@ def test_audio_device_names_and_pcm_commands(monkeypatch):
         "arecord", "-q", "-D", "default", "-t", "raw", "-f", "S16_LE",
         "-r", "16000", "-c", "1",
     ]
+    capture_setup = audio._capture_launch_command("default")
+    assert capture_setup[:2] == ["sh", "-lc"]
+    assert "Left PGA Mux' DifferentialL" in capture_setup[2]
+    assert "Left Line Mux' MicL" in capture_setup[2]
+    assert "case \"$gate\" in" in capture_setup[2]
+    assert "off) : ;;" in capture_setup[2]
+    assert "ALC Capture NG Switch' off" in capture_setup[2]
+    assert "arecord -q" in capture_setup[2]
     assert audio._playback_command("default")[0:4] == ["aplay", "-q", "-D", "default"]
 
 
@@ -97,6 +105,8 @@ def test_mic_capture_uses_bounded_latest_only_queue_and_reports_drops(monkeypatc
     status = plugin.dispatch("info", {})
     assert status["frames_dropped"] == 3
     assert status["capture_timestamp_trusted"] is False
+    assert status["pcm_peak"] == 0
+    assert status["pcm_rms"] == 0.0
 
 
 def test_mic_capture_leaves_raw_pipe_timestamp_untrusted(monkeypatch):
@@ -139,6 +149,9 @@ def test_mic_capture_leaves_raw_pipe_timestamp_untrusted(monkeypatch):
     assert len(published) == 1
     assert published[0].format == audio.AUDIO_FORMAT
     assert len(published[0].data) == 1024
+    assert plugin._pcm_peak == 1
+    assert plugin._pcm_rms == 1.0
+    assert plugin._pcm_nonzero_ratio == 1.0
     stamp = published[0].header.stamp
     assert (stamp.sec, stamp.nanosec) == (0, 0)
 
