@@ -1,5 +1,8 @@
 mcp_port: 15740
 ros_namespace: ""
+# Field acceptance reported no visible head turn despite vendor success.
+# Only an operator-controlled experimental build may opt in; not a physical fix.
+head_orientation_experimental_turn: false
 ros:
   # Vendor control, authorization, TTS, and motion services run on domain 20.
   robot_domain_id: 20
