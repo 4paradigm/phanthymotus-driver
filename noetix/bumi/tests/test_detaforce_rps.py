@@ -346,6 +346,10 @@ def test_protection_and_unexpected_modes_report_error_without_changing_mode(modu
     assert receipt["result"]["workmode"] == mode
     assert len(backend.calls) == 1
     assert p.stop()["state"] == "idle"
+    ctrl.mode = 2
+    assert p.dispatch("status", {})["safety_fault"]
+    assert p.dispatch("mouse", {})["command_sent"] is False
+    assert len(backend.calls) == 1
 
 
 class Clock:

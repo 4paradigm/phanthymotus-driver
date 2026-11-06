@@ -216,7 +216,7 @@ class DetaforceRpsPlugin:
                 if claimed:
                     record["terminal_status"] = status
                     if status == "error" and (not record["playback_started_verified"] or
-                                              not result.get("stop_result", {}).get("confirmed", True)):
+                                              not result.get("stop_result", {}).get("confirmed", False)):
                         self._fault = "Playback state uncertain; inspect the robot before restarting the driver."
                     self._last = {**record, **result, "terminal_status": status,
                                   "motion_completion_verified": False,
