@@ -110,7 +110,11 @@ When true, send EnableSafeSkin(1), then SetSafeSkin(part,1) for parts 3,4,5,6.
 Every setting ACK and queue completion is checked. This option controls skin
 proximity protection only; it does not change force-based collision sensitivity.
 
-rel_joint_mov_j calls the pinned SDK RelJointMovJ with six explicit degree offsets.
+rel_joint_mov_j calls the pinned SDK RelJointMovJ with six resolved degree offsets.
 Preparation and completion match move_j. Current angles plus offsets are checked
 both before preparation and immediately before submission, and the final absolute
 target is retained for ACP monitoring and a later resume of that motion.
+
+Blank/missing/null joint fields hold the latest pre-submission actual angle for
+MovJ, or resolve to zero offset for RelJointMovJ. At least one explicit joint
+value is required. ACP always monitors the fully resolved submission target.

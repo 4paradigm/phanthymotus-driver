@@ -22,10 +22,10 @@
 
 | 参数 | 单位或范围 | 默认值 |
 |---|---|---|
-| `joint1_deg`、`joint2_deg` | 绝对角度，[-360, 360] 度 | 无，必填 |
-| `joint3_deg` | 绝对角度，[-155, 155] 度 | 无，必填 |
-| `joint4_deg`、`joint5_deg`、`joint6_deg` | 绝对角度，[-360, 360] 度 | 无，必填 |
-| `joint1_offset_deg` 至 `joint6_offset_deg` | 相对偏移角度（度），0 表示该轴不变 | 无，必填，仅 rel_joint_mov_j |
+| `joint1_deg`、`joint2_deg` | 绝对角度，[-360, 360] 度 | 留空使用下发前的实际角度 |
+| `joint3_deg` | 绝对角度，[-155, 155] 度 | 留空使用下发前的实际角度 |
+| `joint4_deg`、`joint5_deg`、`joint6_deg` | 绝对角度，[-360, 360] 度 | 留空使用下发前的实际角度 |
+| `joint1_offset_deg` 至 `joint6_offset_deg` | 相对偏移角度（度），0 表示该轴不变 | 留空按 0，仅 rel_joint_mov_j |
 | `velocity` | 本条运动速度比例，整数 1–100% | 10 |
 | `acceleration` | 本条运动加速度比例，整数 1–100% | 10 |
 | `detect_collision` | true 开启安全皮肤并设为 low；false 关闭 | false |
@@ -155,7 +155,7 @@ enable 检查前的清错应答保存在内部 pre_enable_clear_error_response�
 
 ## 相对关节运动
 
-rel_joint_mov_j 使用官方 SDK RelJointMovJ，六个偏移量单位为度，全部必填，不变的轴显式填写 0。
+rel_joint_mov_j 使用官方 SDK RelJointMovJ，六个偏移量单位为度，可只填写需要变化的关节，其余留空按 0。
 复用 move_j 的速度/加速度默认值、cp=0、detect_collision 默认 false、手动 confirm_move=true，
 以及清错、使能、皮肤设置、队列等待、最终状态检查和 ACP 完成流程。
 下发前用最新实际角度重新计算最终目标，校验实际角度加偏移不超出六轴标称行程；不进行角度绕回。
@@ -178,3 +178,10 @@ rel_joint_mov_j 使用官方 SDK RelJointMovJ，六个偏移量单位为度，�
   "confirm_move": true
 }
 ```
+
+## 部分关节输入
+
+绝对和相对运动都至少填写一个关节，其余字段允许省略、null、空字符串或纯空白字符串。
+move_j 在真正下发前读取最新实际角度，空白关节使用该角度保持位置；明确输入 0 表示运动到零度。
+rel_joint_mov_j 的空白偏移量按 0 处理。所有字段均空白时拒绝执行，不发送准备命令。
+完整目标仍进行行程校验，完成监测使用解析后的六轴目标，速度、皮肤与确认参数不变。

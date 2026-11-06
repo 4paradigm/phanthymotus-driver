@@ -66,9 +66,9 @@ class DobotSensors:
         motion_schema = action_schema({
             "info": ([], "查看关节运动卡功能、参数和单位说明，不读取运行状态"),
             "move_j": ([*angle_fields, "velocity", "acceleration", "detect_collision", "confirm_move"],
-                       "参数/连接检查后先 ClearError，再检查使能，未使能则 EnableRobot 并等待确认，再按 detect_collision 设置安全皮肤、ClearError，最后执行绝对关节运动（度）；六个角度必填，速度/加速度留空为 10%"),
+                       "参数/连接检查后先 ClearError，再检查使能，未使能则 EnableRobot 并等待确认，再按 detect_collision 设置安全皮肤、ClearError，最后执行绝对关节运动（度）；空白关节保持下发前实际角度，至少填写一轴，速度/加速度留空为 10%"),
             "rel_joint_mov_j": ([*offset_fields, "velocity", "acceleration", "detect_collision", "confirm_move"],
-                                "六轴相对关节运动（度），0 表示该轴不变；六个偏移量必填，复用 move_j 的准备、皮肤和完成流程"),
+                                "六轴相对关节运动（度），0 表示该轴不变；空白偏移量按 0，至少填写一轴，复用 move_j 的准备、皮肤和完成流程"),
             "stop_motion": (["confirm_move"], "停止控制器运动队列/工程，包括点动；不下使能"),
             "pause": (["confirm_move"], "暂停当前运动队列/工程；不支持点动暂停"),
             "resume": (["detect_collision", "confirm_move"], "先 ClearError，再检查使能，未使能则 EnableRobot 并等待确认，再按 detect_collision 设置安全皮肤，成功后继续暂停队列"),
@@ -77,10 +77,10 @@ class DobotSensors:
             "config": ([], "确认卡片配置；本卡与 joints 共用 IP/端口配置"),
         }, {
             **{field: {"type": "number", "minimum": lower, "maximum": upper,
-                       "description": f"J{index} 绝对目标角度（度），范围 [{lower}, {upper}]，必填"}
+                       "description": f"J{index} 绝对目标角度（度），范围 [{lower}, {upper}]，留空保持当前角度"}
                for index, (field, (lower, upper)) in enumerate(zip(angle_fields, JOINT_LIMITS_DEG), 1)},
             **{field: {"type": "number", "minimum": lower - upper, "maximum": upper - lower,
-                       "description": f"J{index} 相对偏移（度），0 表示不变；实际角度加偏移后的目标也必须在行程内，必填"}
+                       "description": f"J{index} 相对偏移（度），0 表示不变；实际角度加偏移后的目标也必须在行程内，留空按 0"}
                for index, (field, (lower, upper)) in enumerate(zip(offset_fields, JOINT_LIMITS_DEG), 1)},
             "velocity": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10,
                          "description": "本条运动速度比例 1–100%，留空为 10%；实际速度还受全局速率影响"},

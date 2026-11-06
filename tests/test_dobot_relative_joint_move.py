@@ -30,7 +30,7 @@ def test_relative_motion_uses_official_sdk_and_existing_preparation_order():
 
 
 @pytest.mark.parametrize('joint', list(OFFSETS))
-@pytest.mark.parametrize('bad', [None, True, False, '10', float('nan'), float('inf'), 10**1000])
+@pytest.mark.parametrize('bad', [True, False, '10', float('nan'), float('inf'), 10**1000])
 def test_invalid_relative_offsets_send_no_commands(joint, bad):
     _, dashboard, control, calls = ready()
     with pytest.raises(ValueError, match=joint):
@@ -39,13 +39,15 @@ def test_invalid_relative_offsets_send_no_commands(joint, bad):
 
 
 @pytest.mark.parametrize('joint', list(OFFSETS))
-def test_all_relative_offsets_are_explicitly_required(joint):
-    _, dashboard, control, calls = ready()
+def test_missing_relative_offset_defaults_to_zero(joint):
+    _, dashboard, control, _ = ready()
     args = {**OFFSETS, 'confirm_move': True}
     del args[joint]
-    with pytest.raises(ValueError, match=joint):
-        control.execute_motion('rel_joint_mov_j', args)
-    assert not calls and not dashboard.commands
+    try:
+        result = control.execute_motion('rel_joint_mov_j', args)
+        assert result[joint] == 0
+    finally:
+        control.close()
 
 
 @pytest.mark.parametrize('index,limit', [(0, 360), (1, 360), (2, 155), (3, 360), (4, 360), (5, 360)])

@@ -211,6 +211,7 @@ class RobotController:
             requested["detect_collision"] = detect_collision
         if action in ("move_j", "rel_joint_mov_j"):
             values = []
+            provided = 0
             relative = action == "rel_joint_mov_j"
             for joint, (lower, upper) in zip(JOINT_NAMES, JOINT_LIMITS_DEG):
                 field = f"{joint}_offset_deg" if relative else f"{joint}_deg"
@@ -218,9 +219,15 @@ class RobotController:
                     span = upper - lower
                     lower, upper = -span, span
                 value = args.get(field)
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    values.append(0.0 if relative else None)
+                    continue
+                provided += 1
                 if type(value) not in (int, float) or not lower <= value <= upper or not math.isfinite(value):
                     raise ValueError(f"{field} must be a finite number in [{lower}, {upper}] degrees")
                 values.append(float(value))
+            if not provided:
+                raise ValueError("provide at least one joint angle or offset")
             for key in ("velocity", "acceleration"):
                 value = args.get(key, 10)
                 if type(value) is not int or not 1 <= value <= 100:
@@ -240,6 +247,17 @@ class RobotController:
                              parameters=parameters, options=options, requested=requested)
 
     @staticmethod
+    def _absolute_target(sample, requested):
+        current = sample["data"]["joint_state"]["q_actual"]
+        if len(current) != 6 or any(type(v) not in (int, float) or not math.isfinite(v) for v in current):
+            raise RuntimeError("six finite actual joint angles are required to hold omitted joints")
+        target = [float(actual if wanted is None else wanted) for actual, wanted in zip(current, requested)]
+        for joint, angle, (lower, upper) in zip(JOINT_NAMES, target, JOINT_LIMITS_DEG):
+            if not lower <= angle <= upper:
+                raise ValueError(f"absolute target for {joint} is {angle} degrees, outside [{lower}, {upper}]")
+        return target
+
+    @staticmethod
     def _relative_target(sample, offsets):
         current = sample["data"]["joint_state"]["q_actual"]
         if len(current) != 6 or any(type(value) not in (int, float) or not math.isfinite(value) for value in current):
@@ -255,6 +273,8 @@ class RobotController:
             sample = check_state(action)
             if command == "RelJointMovJ":
                 self._relative_target(sample, parameters)
+            elif command == "MovJ":
+                self._absolute_target(sample, parameters[0])
             request = {"action": action, **(requested or {}), "timestamp_ms": int(time.time() * 1000),
                        "controller_ip": sample["controller_ip"], "read_only": False, "effect_verified": False}
             self._update(card, last_request={**request, "state": "sending"}, last_error=None)
@@ -324,10 +344,15 @@ class RobotController:
                             if time.monotonic() >= deadline:
                                 raise
                             time.sleep(0.02)
-                if command == "RelJointMovJ":
+                if command in ("MovJ", "RelJointMovJ"):
                     final_sample = self._check_motion_state(action)
                     request["start_joint_angles_deg"] = list(final_sample["data"]["joint_state"]["q_actual"])
-                    request["target_joint_angles_deg"] = self._relative_target(final_sample, parameters)
+                    target = (self._relative_target(final_sample, parameters) if command == "RelJointMovJ"
+                              else self._absolute_target(final_sample, parameters[0]))
+                    request["target_joint_angles_deg"] = target
+                    if command == "MovJ":
+                        parameters = (target, CoordinateType.JOINT)
+                        request.update({f"{joint}_deg": value for joint, value in zip(JOINT_NAMES, target)})
                 api = self._motion_api if command in ("MovJ", "RelJointMovJ") else self._api
                 reply = getattr(api, command)(*parameters, **(options or {}))
                 queue_id = parse_reply(reply, command)

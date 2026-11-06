@@ -92,9 +92,7 @@ class MotionCompletion:
             submitted = True
             sample = self.control.feedback.snapshot()
             baseline = sample.get("packets_received")
-            target = [float(args[f"joint{i}_deg"]) for i in range(1, 7)] if action == "move_j" else self._last_target
-            if action == "rel_joint_mov_j":
-                target = response["target_joint_angles_deg"]
+            target = response["target_joint_angles_deg"] if action in ("move_j", "rel_joint_mov_j") else self._last_target
             if action in ("move_j", "rel_joint_mov_j"):
                 self._last_target = target
             if action in ("pause", "stop_motion"):

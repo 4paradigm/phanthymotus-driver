@@ -166,7 +166,7 @@ def test_custom_rates_are_per_command_without_global_speed_or_coordinate_setting
 
 
 @pytest.mark.parametrize('joint', list(TARGET))
-@pytest.mark.parametrize('bad', [None, True, False, '10', float('nan'), float('inf'), float('-inf'), 10**1000])
+@pytest.mark.parametrize('bad', [True, False, '10', float('nan'), float('inf'), float('-inf'), 10**1000])
 def test_invalid_joint_values_never_open_command_connection(joint, bad):
     _, dashboard, control, calls = ready()
     with pytest.raises(ValueError, match=joint):
@@ -175,13 +175,17 @@ def test_invalid_joint_values_never_open_command_connection(joint, bad):
 
 
 @pytest.mark.parametrize('joint', list(TARGET))
-def test_every_joint_is_required_and_has_no_implicit_zero(joint):
-    _, dashboard, control, calls = ready()
+def test_missing_absolute_joint_keeps_actual_angle(joint):
+    feedback, dashboard, control, _ = ready()
+    feedback.sample['data']['joint_state']['q_actual'] = [20, 30, 40, 50, 60, 70]
     args = {**TARGET, 'confirm_move': True}
     del args[joint]
-    with pytest.raises(ValueError, match=joint):
-        control.execute_motion('move_j', args)
-    assert not calls and not dashboard.commands
+    try:
+        result = control.execute_motion('move_j', args)
+        index = int(joint[5]) - 1
+        assert result[joint] == feedback.sample['data']['joint_state']['q_actual'][index]
+    finally:
+        control.close()
 
 
 @pytest.mark.parametrize('joint', list(TARGET))
