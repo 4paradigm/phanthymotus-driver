@@ -6,7 +6,7 @@ hardware_model: "g1"
 image_name: g1
 port: 15701
 mcp_url: "http://localhost:15701/mcp"
-description: "Unitree G1 — 麦克风 + 内置TTS + LED + 运动控制 + 闭环相对位移与转向(loco_relative_move) + 手臂动作 + G1_23 双臂遥操 + 状态感知 + 拍照/录像采集"
+description: "Unitree G1 — 麦克风 + 内置TTS + LED + 运动控制 + 闭环相对位移与转向 + 手臂动作 + G1_23 双臂遥操 + 状态感知 + 导航 LiDAR/IMU + 自描述 RGB + 拍照/录像采集"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
@@ -24,6 +24,7 @@ cards:
   - { name: loco_motion_state,      type: sensor }
   - { name: motion_events,          type: sensor }
   - { name: loco,                   type: actuator }
+  - { name: loco_servo,             type: actuator }
   - { name: loco_relative_move,     type: actuator }
   - { name: switch_mode,            type: actuator }
   - { name: switch_mode_expert,     type: actuator }

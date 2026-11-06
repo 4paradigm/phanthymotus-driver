@@ -119,10 +119,15 @@ class G1DeviceBundle:
             self._plugins.append(LedPlugin(plugins_cfg["led"], namespace, executor, audio_client))
             print("[bundle] LedPlugin loaded")
 
-        if plugins_cfg.get("loco", {}).get("enabled", False):
-            from device import LocoStatePlugin, LocoPlugin, StatePlugin
-            loco_state = LocoStatePlugin(plugins_cfg["loco"], namespace, executor)
+        loco_state = None
+        if (plugins_cfg.get("loco", {}).get("enabled", False)
+                or plugins_cfg.get("loco_servo", {}).get("enabled", False)):
+            from device import LocoStatePlugin
+            loco_state = LocoStatePlugin(plugins_cfg.get("loco", {}), namespace, executor)
             self._plugins.append(loco_state)
+
+        if plugins_cfg.get("loco", {}).get("enabled", False):
+            from device import LocoPlugin, StatePlugin
             # LocoPlugin reuses StatePlugin's posture computed from the shared source.
             posture_source = None
             if plugins_cfg.get("state", {}).get("enabled", False):
@@ -135,6 +140,14 @@ class G1DeviceBundle:
                                             state_node=loco_state.node,
                                             posture_node=posture_source))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
+
+        if plugins_cfg.get("loco_servo", {}).get("enabled", False):
+            from loco_servo import LocoServoPlugin
+            from rpc_proxy import DirectLocoClient
+            self._plugins.append(LocoServoPlugin(
+                plugins_cfg["loco_servo"], namespace, executor, DirectLocoClient(loco_client), loco_state.node.get_fsm,
+            ))
+            print("[bundle] LocoServoPlugin loaded")
 
         if plugins_cfg.get("loco_relative_move", {}).get("enabled", False):
             if not plugins_cfg.get("loco", {}).get("enabled", False):
@@ -251,9 +264,23 @@ class G1DeviceBundle:
                 plugins_cfg["vision_capture"], namespace, executor, camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        navigation_sensors = None
+        if plugins_cfg.get("navigation_sensors", {}).get("enabled", False):
+            from navigation_sensor_bridge import NavigationSensorPlugin
+            navigation_sensors = NavigationSensorPlugin(
+                plugins_cfg["navigation_sensors"],
+                namespace,
+                executor,
+                network_iface,
+                lidar_enabled=plugins_cfg.get("lidar", {}).get("enabled", False),
+            )
+            self._plugins.append(navigation_sensors)
+            print("[bundle] NavigationSensorPlugin loaded")
+
         if plugins_cfg.get("lidar", {}).get("enabled", False):
             from device import LidarPlugin
-            self._plugins.append(LidarPlugin(plugins_cfg["lidar"], namespace, executor))
+            self._plugins.append(LidarPlugin(
+                plugins_cfg["lidar"], namespace, executor, navigation_sensors))
             print("[bundle] LidarPlugin loaded")
 
         if plugins_cfg.get("slam", {}).get("enabled", False):
@@ -320,19 +347,38 @@ class G1DeviceBundle:
         print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
 
     def stop_all(self) -> None:
-        # Cancel capture consumers before stopping the shared RealSense producer.
-        capture_plugins = [
-            p for p in self._plugins if getattr(p, "PREFIX", "") == "vision_capture"]
-        other_plugins = [
-            p for p in self._plugins if getattr(p, "PREFIX", "") != "vision_capture"]
-        # Stop the direct closed-loop task before other base plugins.
-        point_plugins = [p for p in other_plugins if getattr(p, "PREFIX", "") == "loco_relative_move"]
-        remaining_plugins = [p for p in other_plugins if p not in point_plugins]
-        for p in capture_plugins + point_plugins + remaining_plugins:
-            p.stop()
-        # Keep feedback alive until every control owner has completed its stop.
-        if self._low_state is not None:
-            self._low_state.stop()
+        # Quiesce the direct closed-loop owner before the main loco
+        # owner, then capture consumers before the camera producer.
+        ordered_plugins = sorted(
+            enumerate(self._plugins),
+            key=lambda item: getattr(
+                item[1], "STOP_PRIORITY",
+                -10 if getattr(item[1], "PREFIX", "") == "loco_relative_move"
+                else 50 if getattr(item[1], "PREFIX", "") == "vision_capture" else 100,
+            ),
+        )
+        failure = None
+        servo_failure = None
+        for i, p in ordered_plugins:
+            try:
+                p.stop()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+                if getattr(p, "PREFIX", "") == "locoservo":
+                    servo_failure = exc
+                print(
+                    f"[bundle] Plugin {i} ({type(p).__name__}) stop() FAILED: {exc}",
+                    flush=True,
+                )
+        # Keep feedback alive when any owner failed to complete its shutdown.
+        low_state = getattr(self, "_low_state", None)
+        if servo_failure is not None:
+            raise servo_failure
+        if low_state is not None:
+            if failure is not None:
+                raise failure
+            low_state.stop()
         print("[bundle] All plugins stopped")
 
     def get_all_tools(self) -> list:
@@ -476,7 +522,13 @@ def make_handler():
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
-                        ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                        reply = {"content": [{"type": "text", "text": json.dumps(result)}]}
+                        # R1-style stopped/paused describe local consumption,
+                        # not an acknowledged or physically confirmed stop.
+                        if (name == "loco_servo" and isinstance(result, dict)
+                                and result.get("state") == "error"):
+                            reply["isError"] = True
+                        ok(reply)
                 else:
                     err(-32601, f"Method not found: {method}")
             except Exception as e:
@@ -601,6 +653,7 @@ def main():
 
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
+        # The serving thread performs the single ordered cleanup in finally.
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
