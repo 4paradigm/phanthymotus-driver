@@ -147,6 +147,9 @@ COPY loco_servo.py /work/loco_servo.py
 COPY imu_distance_control.py /work/imu_distance_control.py
 COPY leg_odometry.py /work/leg_odometry.py
 COPY camera_specs.py /work/camera_specs.py
+COPY image_quality.py /work/image_quality.py
+COPY image_quality_guard.py /work/image_quality_guard.py
+COPY image_quality_runtime.py /work/image_quality_runtime.py
 COPY visual_inputs.py /work/visual_inputs.py
 COPY visual_odometry.py /work/visual_odometry.py
 COPY visual_odometry_contract.py /work/visual_odometry_contract.py
@@ -155,10 +158,13 @@ COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
 COPY config.yaml /work/config.yaml
+COPY tools/ /work/tools/
 COPY deploy/     /deploy/
 
 # Add SDK DDS libs + pybind modules to paths
-ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH}
+# The pinned base has no LD_LIBRARY_PATH; avoid an empty component (cwd).
+# The CMD sources ROS workspaces to add their own library directories.
+ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib
 ENV PYTHONPATH=/work:/work/noetix_sdk_bumi/build
 ENV PYTHONUNBUFFERED=1
 # rclpy logs bypass the Python stdout guard; keep container logs plain text.

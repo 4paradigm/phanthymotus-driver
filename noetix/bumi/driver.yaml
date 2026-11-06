@@ -31,3 +31,4 @@ cards:
   - { name: motion_state,      type: sensor }
   - { name: rgbd_visual_odometry, type: sensor }
   - { name: vision_capture,    type: actuator }
+  - { name: image_quality_guard, type: processor }

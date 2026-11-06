@@ -2,6 +2,13 @@ mcp_port: 15704
 ros_namespace: ""   # 留空则自动使用 hostname
 
 plugins:
+  # Passive RGB quality processor. A Core-issued run ticket and canvas input
+  # are required; bundle boot does not activate a subscription.
+  image_quality_guard:
+    enabled: true
+    analysis_hz: 2.0
+    confirm_samples: 3
+    recover_samples: 5
   state:
     enabled: true
   loco:
