@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 import pytest
+import yaml
 
 
 BUMI = Path(__file__).resolve().parents[1]
@@ -357,6 +358,34 @@ def test_protection_and_unexpected_modes_report_error_without_changing_mode(modu
     assert p.dispatch("status", {})["safety_fault"]
     assert p.dispatch("mouse", {})["command_sent"] is False
     assert len(backend.calls) == 1
+
+
+@pytest.mark.parametrize("action,measured_s,exit_s", [
+    ("invite_one", 6.67, 7.17),
+    ("invite_both", 5.98, 6.48),
+    ("countdown", 6.88, 7.38),
+    ("double_punch", 6.65, 7.15),
+    ("confident", 6.62, 7.12),
+    ("mouse", 6.70, 7.20),
+])
+def test_recorded_timing_config_preserves_margin_and_exits(modules, action, measured_s, exit_s):
+    config = yaml.safe_load((BUMI / "config.yaml").read_text(encoding="utf-8"))["plugins"]["detaforce_rps"]
+    assert config["hardware_enabled"] is False
+    assert all(config[name + "_recording_id"] == -1 for name in modules[0].LABELS)
+    assert config[action + "_auto_exit_after_s"] == exit_s
+    clock = Clock()
+    config.update(hardware_enabled=True, **{action + "_recording_id": 100})
+    p, ctrl, backend = plugin(modules[1], clock=clock, **config)
+    p.dispatch(action, {})
+    clock.now = measured_s
+    assert not backend.completed.wait(.08)
+    assert ctrl.mode == 23
+    assert len(backend.calls) == 1
+    clock.now = exit_s
+    receipt = wait_completion(p, backend)
+    assert receipt["status"] == "completed"
+    assert receipt["result"]["state"] == "scheduled_exit"
+    assert ctrl.mode == 2
 
 
 def test_timed_playback_exits_and_accepts_the_next_gesture(modules):

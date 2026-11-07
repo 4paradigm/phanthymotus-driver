@@ -18,6 +18,13 @@ plugins:
     double_punch_recording_id: -1
     mouse_recording_id: -1
     confident_recording_id: -1
+    # 本次现场录制时长 + 0.50 秒余量。更换录制必须重新验收时长。
+    invite_one_auto_exit_after_s: 7.17
+    invite_both_auto_exit_after_s: 6.48
+    countdown_auto_exit_after_s: 7.38
+    double_punch_auto_exit_after_s: 7.15
+    mouse_auto_exit_after_s: 7.20
+    confident_auto_exit_after_s: 7.12
   # 底盘的流式控制卡片（motus.control/1 的 twist）。和上面的 loco 是同一个身体的
   # 两条路径：loco 是调用形态，一次 tools/call 一个动作；这张是数据面，订阅一路
   # control/velocity 指令流，给 actucore 的 navi 这类策略用。两者显式仲裁 ——
