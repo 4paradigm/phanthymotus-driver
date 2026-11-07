@@ -1,11 +1,17 @@
-# PiPER Arm control, Joints and On camera
+# PiPER Arm control, Joints, On camera and Health
 
-The current bundle provides three canvas cards: **Arm control** (`arm_control`),
-**Joints** (`joints`) and **On camera** (`piper_camera_live`). Joints and On camera
+The current bundle provides **Arm control** (`arm_control`), **Joints** (`joints`),
+**On camera** (`piper_camera_live`) and **Health** (`piper_health`), plus optional
+**Photo** (`piper_photo`) and the background model resource. Joints and On camera
 are independent read-only sensors. They share the existing driver lifecycle and
 keep monitoring when the control card stops. No Parameters or
 `state/parameters` stream is published; **Get status** returns feedback, limits,
 motor state, faults, capabilities and actual task outcomes.
+
+Health adds a separate 2 Hz `state/health` JSON stream for connection, feedback
+freshness, motor enables, faults and unmet direct-control prerequisites. It reads
+the existing passive snapshot without connecting CAN or changing control state.
+See [HEALTH.md](HEALTH.md) for the diagnostic scope and offline verification.
 
 | Action | Input and meaning |
 | --- | --- |
