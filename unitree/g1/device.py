@@ -44,8 +44,10 @@ from std_msgs.msg import Header, String
 from audio_msgs.msg import AudioChunk
 
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
-from pointcloud_utils import gravity_align_inplace
+from pointcloud_utils import gravity_align_inplace, pack_slam_cloud
+from slam_odometry import MappingOdometry
 import sport_mode_state as _SMS
+from common.slam_input import input_declaration, native_frame_metadata
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 
@@ -1226,11 +1228,12 @@ class _LocoStateNode(Node):
 
     _ODOM_INTERVAL = 0.1  # 10 Hz throttle
 
-    def __init__(self, odom_topic: str, motion_topic: str):
+    def __init__(self, odom_topic: str, motion_topic: str, mapping_topic: str):
         super().__init__("g1_loco_state")
         self._odom_pub   = self.create_publisher(String, odom_topic,   _LOW_LAT_QOS)
         self._motion_pub = self.create_publisher(String, motion_topic, _LOW_LAT_QOS)
         self._last_state: dict = {}
+        self._last_native_state: dict = {}
         self._last_fsm: dict = {}
         self._lock       = threading.Lock()
         self._last_odom_time: float = 0.0
@@ -1252,6 +1255,41 @@ class _LocoStateNode(Node):
             self.get_logger().info(f"LocoStateNode subscribed rt/sportmodestate → {motion_topic}")
         except Exception as e:
             self.get_logger().warn(f"LocoStateNode: failed to subscribe rt/sportmodestate: {e}")
+
+        self._mapping_adapter = MappingOdometry()
+        self._mapping_sample = None
+        self._mapping_error = None
+        self._mapping_pub = self._mapping_sub = None
+        try:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.nav_msgs.msg.dds_ import Odometry_
+            self._mapping_pub = self.create_publisher(String, mapping_topic, _LOW_LAT_QOS)
+            self._mapping_sub = ChannelSubscriber("rt/unitree/slam_mapping/odom", Odometry_)
+            self._mapping_sub.Init(self._on_mapping_odom, 10)
+        except Exception as exc:
+            self._mapping_error = str(exc)
+            self.get_logger().warn(f"LocoStateNode: mapping odometry unavailable: {exc}")
+
+    def _on_mapping_odom(self, msg) -> None:
+        with self._lock:
+            sample = self._mapping_adapter.convert(msg)
+            self._mapping_sample = sample
+        try:
+            out = String()
+            out.data = json.dumps(sample, allow_nan=False)
+            self._mapping_pub.publish(out)
+            with self._lock:
+                self._mapping_error = None
+        except Exception as exc:
+            with self._lock:
+                self._mapping_error = str(exc)
+
+    def get_mapping_info(self, topic: str) -> dict:
+        from copy import deepcopy
+        with self._lock:
+            return {"available": False, "sample": deepcopy(self._mapping_sample),
+                    "error": self._mapping_error,
+                    "input_metadata": [self._mapping_adapter.declaration(topic)]}
 
     def _format_state(self, msg) -> dict:
         imu = msg.imu_state
@@ -1278,8 +1316,19 @@ class _LocoStateNode(Node):
         self._last_odom_time = now
 
         state = self._format_state(msg)
+        # rt/odommodestate uses the generated unitree_go SportModeState_
+        # dataclass (idl/unitree_go/msg/dds_/_SportModeState_.py), including
+        # nested TimeSpec_, IMUState_ and PathPoint_. Keep their order untouched.
+        from dataclasses import asdict
+        native_state = {
+            "source_topic": "rt/odommodestate",
+            "source_type": "unitree_go.msg.dds_.SportModeState_",
+            "native": asdict(msg), "received_ns": time.time_ns(),
+            "received_monotonic_ns": time.monotonic_ns(),
+        }
         with self._lock:
             self._last_state = state
+            self._last_native_state = native_state
         out = String()
         out.data = json.dumps(state)
         self._odom_pub.publish(out)
@@ -1306,6 +1355,11 @@ class _LocoStateNode(Node):
         with self._lock:
             return dict(self._last_state)
 
+    def get_native_state(self) -> dict:
+        from copy import deepcopy
+        with self._lock:
+            return deepcopy(self._last_native_state)
+
     def get_fsm(self) -> dict:
         """Latest rt/sportmodestate snapshot, or {} if the topic has not been seen."""
         with self._lock:
@@ -1318,7 +1372,8 @@ class LocoStatePlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor):
         self._odom_topic   = f"/{namespace}/loco/state"
         self._motion_topic = f"/{namespace}/loco/motion_state"
-        self._node = _LocoStateNode(self._odom_topic, self._motion_topic)
+        self._mapping_topic = f"/{namespace}/slam/mapping/odom"
+        self._node = _LocoStateNode(self._odom_topic, self._motion_topic, self._mapping_topic)
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
@@ -1331,7 +1386,9 @@ class LocoStatePlugin:
             "multiInstance": False,
             "description": f"G1 locomotion state (always active) — mode, velocity, position, body_height, foot_force, IMU. Publishes at 10Hz to {self._odom_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._odom_topic, "format": "data/json"}],
+            "topic_out": [{"topic": self._odom_topic, "format": "data/json"},
+                          {"topic": self._mapping_topic, "format": "state/odom"}],
+            "input_metadata": self._node.get_mapping_info(self._mapping_topic)['input_metadata'],
         }
 
     def _motion_tool(self) -> dict:
@@ -1367,7 +1424,23 @@ class LocoStatePlugin:
             tool_name = args.get('_tool_name', '')
             if tool_name == 'loco_motion_state':
                 return {"state": "running", "topic_out": [{"topic": self._motion_topic, "format": "data/json"}]}
-            return {"state": "running", "topic_out": [{"topic": self._odom_topic, "format": "data/json"}]}
+            tool = self._odom_tool()
+            return {"state": "running", "topic_out": tool['topic_out'],
+                    "input_metadata": tool['input_metadata'],
+                    "mapping_odom": self._node.get_mapping_info(self._mapping_topic),
+                    "native_snapshot": self._node.get_native_state(),
+                    "slam_pose": {"available": False,
+                                  "documented_facts": {
+                                      "source": "https://support.unitree.com/home/en/G1_developer/odometer_service_interface",
+                                      "length_unit": "m", "quaternion_order": "wxyz",
+                                      "pose_reference": "robot_base_center",
+                                      "axes": ["forward", "left", "up"],
+                                      "requires_high_level_motion_control": True,
+                                      "minimum_state_estimator_version": "1.0.0.1"},
+                                  "missing_facts": ["measurement_stamp", "clock_domain_and_epoch", "pose_frame",
+                                                    "reference_point", "tracking_quality",
+                                                    "sensor_extrinsic", "clock_relation_to_lidar",
+                                                    "tracking_reset_and_relocalization"]}}
         return None
 
 
@@ -2379,6 +2452,19 @@ class _LidarNode(Node):
         super().__init__("g1_lidar")
         from std_msgs.msg import UInt8MultiArray
         self._cloud_pub = self.create_publisher(UInt8MultiArray, cloud_topic, _LOW_LAT_QOS)
+        self._source_generation = uuid4().hex
+        self._native_source_header = None
+        self._native_error = None
+        self._native_pub = self._native_meta_pub = None
+        try:
+            from sensor_msgs.msg import PointCloud2
+            native_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                                    history=HistoryPolicy.KEEP_LAST, depth=2,
+                                    durability=DurabilityPolicy.VOLATILE)
+            self._native_pub = self.create_publisher(PointCloud2, cloud_topic+'_native', native_qos)
+            self._native_meta_pub = self.create_publisher(String, cloud_topic+'_native/metadata', native_qos)
+        except Exception as exc:
+            self._native_error = str(exc)
         self._last_cloud_time: float = 0.0
         self._imu_roll:  float = 0.0
         self._imu_pitch: float = 0.0
@@ -2421,6 +2507,12 @@ class _LidarNode(Node):
         Runs directly in CycloneDDS receive thread (queueLen=0).
         """
         self._cb_count += 1
+        header = getattr(msg, 'header', None)
+        stamp = getattr(header, 'stamp', None)
+        self._native_source_header = (
+            {'frame_id': getattr(header, 'frame_id', None),
+             'stamp': {'sec': getattr(stamp, 'sec', None), 'nanosec': getattr(stamp, 'nanosec', None)}}
+            if header is not None else None)
         now = time.monotonic()
         if now - self._last_cloud_time < LIDAR_CLOUD_INTERVAL:
             return
@@ -2433,11 +2525,34 @@ class _LidarNode(Node):
         point_step = msg.point_step
         total_points = msg.width * msg.height
         data = msg.data if isinstance(msg.data, (bytes, bytearray)) else bytes(msg.data)
+        native = metadata = None
+        try:
+            if (self._native_pub is not None and self._native_meta_pub is not None and
+                    self._native_pub.get_subscription_count() > 0):
+                import array as _array
+                from sensor_msgs.msg import PointCloud2, PointField
+                # Freeze SDK-owned buffers before queueing or gravity rotation.
+                data = bytes(data)
+                raw = PointCloud2()
+                raw.header.stamp.sec = msg.header.stamp.sec
+                raw.header.stamp.nanosec = msg.header.stamp.nanosec
+                raw.header.frame_id = msg.header.frame_id
+                raw.height, raw.width = msg.height, msg.width
+                raw.is_bigendian, raw.is_dense = False, msg.is_dense
+                raw.point_step, raw.row_step = msg.point_step, msg.width * msg.point_step
+                raw.fields = [PointField(name=f.name, offset=f.offset, datatype=f.datatype, count=f.count)
+                              for f in msg.fields]
+                raw.data = _array.array('B', pack_slam_cloud(msg))
+                metadata = native_frame_metadata(raw, source_generation=self._source_generation)
+                native = raw
+                self._native_error = None
+        except Exception as exc:
+            self._native_error = str(exc)
 
         # Non-blocking put; drop frame if worker is busy
         try:
             self._cloud_queue.put_nowait((point_step, total_points, data,
-                                         self._imu_roll, self._imu_pitch))
+                                         self._imu_roll, self._imu_pitch, native, metadata))
         except queue.Full:
             self._cb_dropped += 1
 
@@ -2460,8 +2575,17 @@ class _LidarNode(Node):
             item = self._cloud_queue.get()
             if item is None:
                 break
-            point_step, total_points, data, roll, pitch = item
+            point_step, total_points, data, roll, pitch, native, metadata = item
             t0 = time.monotonic()
+
+            if native is not None:
+                try:
+                    self._native_pub.publish(native)
+                    packet = String()
+                    packet.data = json.dumps(metadata, allow_nan=False)
+                    self._native_meta_pub.publish(packet)
+                except Exception as exc:
+                    self._native_error = str(exc)
 
             # Apply gravity alignment (returns bytearray, avoids extra copy)
             data = gravity_align_inplace(data, point_step, total_points, roll, pitch)
@@ -2497,6 +2621,7 @@ class LidarPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor):
         self._cloud_topic = f"/{namespace}/lidar/cloud"
+        self._native_topic = f"/{namespace}/lidar/cloud_native"
         self._node = _LidarNode(self._cloud_topic)
         executor.add_node(self._node)
 
@@ -2504,13 +2629,23 @@ class LidarPlugin:
         return [self._cloud_tool()]
 
     def _cloud_tool(self) -> dict:
+        from copy import deepcopy
+        source_header = deepcopy(self._node._native_source_header)
         return {
             "name": "lidar_cloud",
             "type": "sensor",
             "multiInstance": False,
             "description": f"Livox Mid-360 full point cloud passthrough at 10Hz. Binary format: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]. Publishes to {self._cloud_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}],
+            "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"},
+                          {"topic": self._native_topic, "format": "sensor/pointcloud2"}],
+            "input_metadata": [input_declaration(
+                self._native_topic, 'sensor/pointcloud2', 'cloud', self._native_topic,
+                frame_metadata_topic=self._native_topic+'/metadata',
+                source_topic='rt/utlidar/cloud_livox_mid360',
+                source_type='sensor_msgs.msg.dds_.PointCloud2_',
+                frame_id=source_header['frame_id'] if source_header else None,
+                source_header=source_header)],
             "configSchema": {
                 "type": "object",
                 "properties": {},
@@ -2529,7 +2664,9 @@ class LidarPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running", "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}]}
+            tool = self._cloud_tool()
+            return {"state": "running", "topic_out": tool['topic_out'],
+                    "input_metadata": tool['input_metadata'], "native_error": self._node._native_error}
         return None
 
 
