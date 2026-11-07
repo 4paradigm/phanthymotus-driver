@@ -297,6 +297,11 @@ def test_tool_contract_and_interrupt_are_shared_with_preview(modules):
     for simulation in (False, True):
         spec = card.tool_spec(simulation=simulation)
         actions = spec["inputSchema"]["x-action-params"]
+        choices = spec["inputSchema"]["properties"]["action"]
+        assert {item["const"] for item in choices["oneOf"]} == set(choices["enum"])
+        labels = {item["const"]: item["title"] for item in choices["oneOf"]}
+        assert labels["mouse"] == "鼠鼠举手"
+        assert labels["confident"] == "花来"
         assert set(actions) == set(motion.LABELS) | {"status", "stop_action"}
         assert spec["inputSchema"]["x-hooks"]["on_interrupt_motion"]["action"] == "stop_action"
         if simulation:
@@ -352,6 +357,90 @@ def test_protection_and_unexpected_modes_report_error_without_changing_mode(modu
     assert p.dispatch("status", {})["safety_fault"]
     assert p.dispatch("mouse", {})["command_sent"] is False
     assert len(backend.calls) == 1
+
+
+def test_timed_playback_exits_and_accepts_the_next_gesture(modules):
+    clock = Clock()
+    p, ctrl, backend = plugin(modules[1], clock=clock, hardware_enabled=True,
+                              mouse_recording_id=12, mouse_auto_exit_after_s=2)
+    identities = []
+    for _ in range(2):
+        backend.completed.clear()
+        identities.append(p.dispatch("mouse", {})["action_id"])
+        assert ctrl.mode == 23
+        assert len(backend.completions) == len(identities) - 1
+        clock.now += 2
+        receipt = wait_completion(p, backend)
+        assert receipt["status"] == "completed"
+        assert receipt["result"]["state"] == "scheduled_exit"
+        assert receipt["result"]["completion_basis"] == "configured_playback_window_and_walk_exit"
+        assert not receipt["result"]["motion_completion_verified"]
+        assert ctrl.mode == 2
+    assert identities[0] != identities[1]
+    assert [a for a, _ in backend.calls] == ["play_recording", "stop_playback"] * 2
+
+
+def test_timed_playback_does_not_exit_before_start_confirmation(modules):
+    clock = Clock()
+    p, _, backend = plugin(modules[1], clock=clock, hardware_enabled=True,
+                           mouse_recording_id=12, mouse_auto_exit_after_s=2)
+    backend.confirm_start = False
+    p.dispatch("mouse", {})
+    clock.now = 3
+    assert not backend.completed.wait(.12)
+    assert len(backend.calls) == 1
+    p.stop()
+    assert wait_completion(p, backend)["status"] == "error"
+
+
+def test_timed_playback_failed_exit_latches_fault(monkeypatch, modules):
+    clock = Clock()
+    p, _, backend = plugin(modules[1], clock=clock, hardware_enabled=True,
+                           mouse_recording_id=12, mouse_auto_exit_after_s=2)
+    p.dispatch("mouse", {})
+    monkeypatch.setattr(backend, "dispatch", lambda *_: {"confirmed": False, "workmode": 23})
+    clock.now = 2
+    assert wait_completion(p, backend)["status"] == "error"
+    assert p.dispatch("status", {})["safety_fault"]
+    assert not p.dispatch("mouse", {})["command_sent"]
+
+
+def test_timed_playback_external_exit_is_not_success(modules):
+    clock = Clock()
+    p, ctrl, backend = plugin(modules[1], clock=clock, hardware_enabled=True,
+                              mouse_recording_id=12, mouse_auto_exit_after_s=2)
+    p.dispatch("mouse", {})
+    ctrl.mode = 2
+    clock.now = 2
+    assert wait_completion(p, backend)["status"] == "error"
+    assert p.dispatch("status", {})["safety_fault"]
+    assert len(backend.calls) == 1
+
+
+def test_timed_playback_deadline_remains_an_error(modules):
+    clock = Clock()
+    p, _, backend = plugin(modules[1], clock=clock, hardware_enabled=True,
+                           mouse_recording_id=12, mouse_auto_exit_after_s=2, playback_timeout_s=5)
+    p.dispatch("mouse", {})
+    clock.now = 6
+    receipt = wait_completion(p, backend)
+    assert receipt["status"] == "error" and receipt["result"]["state"] == "timeout"
+
+
+@pytest.mark.parametrize("value", [True, -1, .5, 111, float("nan"), float("inf"), "2"])
+def test_auto_exit_configuration_rejects_invalid_durations(modules, value):
+    p, _, _ = plugin(modules[1])
+    assert p.dispatch("config", {"mouse_auto_exit_after_s": value})["state"] == "error"
+    assert p._parameters["mouse_auto_exit_after_s"] == 0
+
+
+def test_rebinding_requires_revalidating_the_auto_exit_duration(modules):
+    p, _, _ = plugin(modules[1], mouse_recording_id=12, mouse_auto_exit_after_s=2)
+    assert p.dispatch("config", {"playback_timeout_s": 5, "mouse_auto_exit_after_s": 3})["state"] == "error"
+    assert p._parameters["playback_timeout_s"] == 60
+    # Canvas forms resubmit all fields, including the old timing value.
+    p.dispatch("config", {"mouse_recording_id": 13, "mouse_auto_exit_after_s": 2})
+    assert p._parameters["mouse_auto_exit_after_s"] == 0
 
 
 class Clock:

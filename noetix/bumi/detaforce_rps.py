@@ -30,6 +30,10 @@ CONFIG_PROPERTIES = {
         "type": "integer", "minimum": -1, "maximum": 65535, "default": -1,
         "description": f"{label}的厂家示教编号；-1=未绑定，不发送动作。"}
        for name, label in LABELS.items()},
+    **{f"{name}_auto_exit_after_s": {
+        "type": "number", "minimum": 0, "maximum": 110, "default": 0,
+        "description": f"{label}自动退出回放的时间（秒）。填写现场验收的完整录制时长并留余量；0=手动收尾。退出不保证手臂复位，录制须包含回位。"}
+       for name, label in LABELS.items()},
 }
 
 
@@ -62,7 +66,10 @@ def tool_spec(*, simulation=False):
         "inputSchema": {
             "type": "object", "additionalProperties": False,
             "properties": {"action": {"type": "string",
-                                       "enum": [*LABELS, "status", "stop_action"]}},
+                                       "enum": [*LABELS, "status", "stop_action"],
+                                       "oneOf": [{"const": name, "title": label}
+                                                 for name, label in {**LABELS, "status": "查看状态",
+                                                                     "stop_action": "停止并退出回放"}.items()]}},
             "required": ["action"],
             "x-action-params": {
                 **{name: {"params": [], "description": label + (
@@ -107,9 +114,21 @@ class DetaforceRpsPlugin:
             elif name == "playback_timeout_s":
                 if type(value) not in (int, float) or not 5 <= value <= 120:
                     raise ValueError("playback_timeout_s must be finite and in 5..120")
+            elif name.endswith("_auto_exit_after_s"):
+                if type(value) not in (int, float) or not (value == 0 or 1 <= value <= 110):
+                    raise ValueError(name + " must be 0 (manual) or finite and in 1..110")
             elif type(value) is not int or not -1 <= value <= 65535:
                 raise ValueError(name + " must be an integer in -1..65535")
-        self._parameters.update(changes)
+        updated = {**self._parameters, **changes}
+        for action in LABELS:
+            binding = action + "_recording_id"
+            timing = action + "_auto_exit_after_s"
+            if (binding in changes and changes[binding] != self._parameters[binding]
+                    and self._parameters[timing]):
+                updated[timing] = 0
+            if updated[timing] and updated[timing] + 3 > updated["playback_timeout_s"]:
+                raise ValueError(timing + " must leave at least 3 seconds before playback_timeout_s")
+        self._parameters.update(updated)
 
     def get_tool(self):
         return tool_spec()
@@ -168,7 +187,7 @@ class DetaforceRpsPlugin:
                 result = self._loco.dispatch("stop_playback", {"_tool_name": "action_recording"})
                 if not isinstance(result, dict):
                     return {"state": "error", "confirmed": False, "error": "Invalid stop response"}
-                return result
+                return {**result, "confirmed": bool(result.get("confirmed") and result.get("workmode") == 2)}
             if mode == 2:
                 return {"state": "error", "command_sent": False, "confirmed": False,
                         "workmode": mode, "error": "Playback was not active when stop was requested; inspect the robot."}
@@ -176,7 +195,7 @@ class DetaforceRpsPlugin:
         except Exception as exc:
             return {"state": "error", "confirmed": False, "error": str(exc)}
 
-    def _monitor_playback(self, record, cancel, deadline):
+    def _monitor_playback(self, record, cancel, deadline, observed_playback_at):
         status = "error"
         result = {"state": "error", "error": "Playback monitor ended unexpectedly"}
         try:
@@ -198,11 +217,23 @@ class DetaforceRpsPlugin:
                         result = {**observation, "state": "error",
                                   "error": f"Playback interrupted by workmode {mode}"}
                         break
-                    if self._clock() >= deadline:
+                    now = self._clock()
+                    if now >= deadline:
                         result = {**observation, "state": "timeout",
                                   "error": "Playback mode did not exit before its timeout",
                                   "stop_result": self._exit_playback()}
                         break
+                    if mode == 23 and record["auto_exit_after_s"]:
+                        if observed_playback_at is None:
+                            observed_playback_at = now
+                        if now - observed_playback_at >= record["auto_exit_after_s"]:
+                            stop = self._exit_playback()
+                            status = "completed" if stop.get("confirmed") and stop.get("workmode") == 2 else "error"
+                            result = {**observation, "state": "scheduled_exit" if status == "completed" else "error",
+                                      "stop_result": stop,
+                                      "completion_basis": "configured_playback_window_and_walk_exit",
+                                      "completion_note": "按配置时长退出且回读行走模式，不证明录制自然结束或手臂已回位。"}
+                            break
                 cancel.wait(PLAYBACK_POLL_S)
         except Exception as exc:
             with self._lock:
@@ -278,14 +309,16 @@ class DetaforceRpsPlugin:
                 self._cancel = threading.Event()
                 self._active = {"run_id": run_id, "action_id": f"bumi_detaforce_rps_{run_id}", "action": action,
                                 "recording_id": recording_id, "command_sent": True,
+                                "auto_exit_after_s": self._parameters[action+"_auto_exit_after_s"],
                                 "playback_started_verified": result.get("workmode") == 23,
                                 "playback_result": deepcopy(result)}
                 record = self._active
                 try:
                     deadline = self._clock()+self._parameters["playback_timeout_s"]
                     response = {**self._status(), "expected_duration_s": self._parameters["playback_timeout_s"]}
+                    observed_playback_at = self._clock() if record["playback_started_verified"] else None
                     self._worker = threading.Thread(target=self._monitor_playback,
-                                                    args=(record, self._cancel, deadline), daemon=True,
+                                                    args=(record, self._cancel, deadline, observed_playback_at), daemon=True,
                                                     name="bumi_detaforce_playback")
                     self._worker.start()
                 except Exception as exc:
