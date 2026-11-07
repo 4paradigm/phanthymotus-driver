@@ -2304,7 +2304,7 @@ class SpeakerPlugin:
 
 # ── CameraPlugin (sensor, subprocess) ────────────────────────────────────────
 
-def _camera_subprocess(namespace: str):
+def _camera_subprocess(namespace: str, snapshot_fd=None):
     """Camera subprocess — captures Realsense D435i color+depth, publishes to ROS2."""
     # Match the Q5 camera worker's child-process logging protection.
     # Idempotent when the launcher has already installed it before importing device.
@@ -2462,6 +2462,24 @@ def _camera_subprocess(namespace: str):
             except Exception as _e:
                 print(f"[camera_subprocess] raw enable control unavailable: {_e}", flush=True)
 
+    # Independent optional request branch: never toggles VO's raw_enabled.
+    snapshot_producer = None
+    if snapshot_fd is not None:
+        import socket as _socket
+        snapshot_socket = None
+        try:
+            snapshot_socket = _socket.socket(fileno=snapshot_fd)
+            from rgbd_snapshot import SnapshotProducer
+            _device = pipeline.get_active_profile().get_device()
+            snapshot_producer = SnapshotProducer(
+                snapshot_socket,
+                _device.get_info(rs.camera_info.serial_number),
+                _device.first_depth_sensor().get_depth_scale())
+        except Exception as _e:
+            if snapshot_socket is not None:
+                snapshot_socket.close()
+            print(f"[camera_subprocess] RGB-D snapshots unavailable: {_e}", flush=True)
+
     frame_count = 0
     t_start = _time.monotonic()
     try:
@@ -2470,11 +2488,25 @@ def _camera_subprocess(namespace: str):
             # separate process from the bundle executor, so it must service its
             # own callbacks; otherwise card stop/start never reaches it.
             _rclpy.spin_once(node, timeout_sec=0)
+            if snapshot_producer is not None:
+                try:
+                    snapshot_producer.poll()
+                except Exception as _e:
+                    snapshot_producer.close()
+                    snapshot_producer = None
+                    print(f"[camera_subprocess] snapshot channel disabled: {_e}", flush=True)
             t0 = _time.monotonic()
             source_frames = pipeline.wait_for_frames(timeout_ms=1000)
             t_wait = _time.monotonic() - t0
 
             frames = align_to_color.process(source_frames)
+            if snapshot_producer is not None:
+                try:
+                    snapshot_producer.observe(source_frames, frames)
+                except Exception as _e:
+                    snapshot_producer.close()
+                    snapshot_producer = None
+                    print(f"[camera_subprocess] snapshot branch disabled: {_e}", flush=True)
 
             color_frame = frames.get_color_frame()
             if color_frame:
@@ -2522,6 +2554,8 @@ def _camera_subprocess(namespace: str):
     except Exception as e:
         print(f"[camera_subprocess] error: {e}", flush=True)
     finally:
+        if snapshot_producer is not None:
+            snapshot_producer.close()
         pipeline.stop()
 
 
@@ -2596,6 +2630,7 @@ class CameraPlugin:
         # fallback — the declaration has to be answerable before the camera runs.
         self._intrinsics: dict = {}
         self._intrinsics_lock = threading.Lock()
+        self._snapshot_client = None
 
     def _camera_info(self, tool_name: str, topic: str, fmt: str) -> list:
         """This port's optics — `motus.camera/1`, see `camera_specs.py`.
@@ -2639,20 +2674,38 @@ class CameraPlugin:
         ]
 
     def start(self) -> None:
+        if self.is_running():
+            return
         import sys
         env = dict(os.environ)
-        self._proc = subprocess.Popen(
-            [sys.executable, "-c",
-             # Protect import-time output as well as the child entry point.
-             "import sys; sys.path.insert(0, '/work'); "
-             "from common import logsafe; logsafe.install(check_fd=False); "
-             f"from device import _camera_subprocess; _camera_subprocess({self._namespace!r})"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
-        )
+        import socket
+        from rgbd_snapshot import SnapshotClient
+        if self._snapshot_client is not None:
+            self._snapshot_client.close()
+        parent_socket, child_socket = socket.socketpair()
+        self._snapshot_client = SnapshotClient(parent_socket)
+        try:
+            self._proc = subprocess.Popen(
+                [sys.executable, "-c",
+                 # Protect import-time output as well as the child entry point.
+                 "import sys; sys.path.insert(0, '/work'); "
+                 "from common import logsafe; logsafe.install(check_fd=False); "
+                 f"from device import _camera_subprocess; _camera_subprocess({self._namespace!r}, {child_socket.fileno()})"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+                pass_fds=(child_socket.fileno(),),
+            )
+        except Exception:
+            self._snapshot_client.close()
+            self._snapshot_client = None
+            raise
+        finally:
+            child_socket.close()
+        proc = self._proc
+
         def _fwd():
             from camera_specs import parse_intrinsics_line
 
-            for line in self._proc.stdout:
+            for line in proc.stdout:
                 text = line.decode(errors='replace').rstrip()
                 # Printed either way: the declaration is what the cards serve,
                 # but the line itself is what somebody debugging a wrong field
@@ -2667,12 +2720,22 @@ class CameraPlugin:
         threading.Thread(target=_fwd, daemon=True).start()
 
     def stop(self) -> None:
+        if self._snapshot_client is not None:
+            self._snapshot_client.close()
+            self._snapshot_client = None
         if self._proc:
             self._proc.terminate()
             self._proc = None
 
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+    def capture_rgbd(self, request_id, deadline, cancel):
+        from rgbd_snapshot import SnapshotError
+        client = self._snapshot_client
+        if client is None:
+            raise SnapshotError('CAMERA_UNAVAILABLE', 'Snapshot channel unavailable')
+        return client.capture(request_id, deadline, cancel)
 
     def wait_for_color_frame(self, after_sequence=None, timeout_s=5.0):
         return self._frame_node.wait_for_frame(after_sequence, timeout_s)
@@ -3096,18 +3159,25 @@ class VisionCapturePlugin:
         self._max_duration_s = max(1, min(30, int(plugin_config.get("max_duration_s", 30))))
         self._recording_lock = threading.Lock()
         self._active_recording = None
+        from rgbd_snapshot import SnapshotCapture
+        self._rgbd_capture = SnapshotCapture(camera_plugin, self._output_dir)
 
     def get_tool(self):
         return {
             "name": CARD, "type": "actuator", "multiInstance": False,
-            "description": "Capture a Bumi RGB photo or record a video (1–30 seconds) to persistent storage.",
+            "description": "Capture a Bumi RGB photo, verified level-B RGB-D pair, or video (1–30 seconds) to persistent storage.",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["start", "capture_photo", "record_video", "info", "stop"]},
+                "action": {"type": "string", "enum": ["start", "capture_photo", "capture_rgbd", "record_video", "info", "stop"]},
+                "timeout_s": {"type": "number", "minimum": 0.1, "maximum": 10, "default": 5},
+                "require_exposure_after_request": {"type": "boolean", "default": False,
+                    "description": "严格曝光证明当前不支持；true 返回 EXPOSURE_UNVERIFIABLE"},
                 "duration_s": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5,
                                "description": "默认值为5秒（可填写1–30秒）"},
             }, "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
                     "start": {"params": [], "description": "检查相机 worker 是否就绪。"},
+                    "capture_rgbd": {"params": ["timeout_s", "require_exposure_after_request"],
+                        "description": "保存请求关联的设备新帧 RGB-D 和标定/来源；B级，不证明请求后曝光。"},
                     "capture_photo": {"params": [], "description": "拍摄并保存一张当前 RGB 照片。"},
                     "record_video": {"params": ["duration_s"], "description": "录制并保存 1–30 秒 RGB 视频，默认 5 秒。"},
                     "info": {"params": [], "description": "查看保存目录与相机状态。"},
@@ -3129,6 +3199,7 @@ class VisionCapturePlugin:
         # ``BumiDeviceBundle.stop_all`` calls this during SIGTERM/redeploy. Completing
         # the ACP action here prevents Agent Core from retaining a pending
         # recording while the daemon thread and its encoder are torn down.
+        self._rgbd_capture.cancel()
         return self._stop_recording()
 
     def _camera_ready(self):
@@ -3151,7 +3222,8 @@ class VisionCapturePlugin:
                 "photos_dir": str(self._output_dir / "photos"),
                 "videos_dir": str(self._output_dir / "videos"), "fps": self._fps,
                 "max_duration_s": self._max_duration_s, "latest_frame_age_s": age,
-                "source": "bumi_camera", "active_recording": active}
+                "source": "bumi_camera", "active_recording": active,
+                "rgbd_snapshot": self._rgbd_capture.info()}
 
     def _frame(self, after_sequence=None, timeout_s=_FIRST_FRAME_TIMEOUT_S):
         if not self._camera_ready():
@@ -3383,10 +3455,13 @@ class VisionCapturePlugin:
                     "message": "" if self._camera_ready() else "Bumi camera worker is unavailable"}
         if action == "info":
             return self._info()
+        if action == "capture_rgbd":
+            return self._rgbd_capture.capture(args)
         if action == "capture_photo":
             return self._capture_photo(args)
         if action == "record_video":
             return self._start_video_recording(args)
         if action == "stop":
-            return self._stop_recording()
+            rgbd_cancelled = self._rgbd_capture.cancel()
+            return {**self._stop_recording(), "rgbd_cancel_requested": rgbd_cancelled}
         return None
