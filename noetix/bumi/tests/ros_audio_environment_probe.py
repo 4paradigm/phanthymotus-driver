@@ -60,6 +60,32 @@ def main():
             spin(0.25)
         assert [e["event"] for e in events] == ["loud", "recovered"], events
         assert states[-1]["status"] == "normal", states[-1]
+        for comparison, levels in (
+            ("above", [100] * 2 + [1000] * 3 + [100] * 3),
+            ("below", [1000] * 2 + [100] * 3 + [1000] * 3),
+        ):
+            response = card.dispatch(
+                "config",
+                {
+                    "mode": "threshold",
+                    "threshold_dbfs": -40,
+                    "comparison": comparison,
+                },
+            )
+            assert response["ok"] and response["state"] == "running", response
+            for level in levels:
+                msg = AudioChunk()
+                msg.header.stamp = peer.get_clock().now().to_msg()
+                msg.format = "audio/pcm-16k"
+                msg.data = list(struct.pack("<4000h", *([level] * 4000)))
+                pub.publish(msg)
+                spin(0.25)
+            assert [e["event"] for e in events[-2:]] == [
+                "threshold_entered",
+                "threshold_cleared",
+            ], events
+            assert events[-1]["comparison"] == comparison
+        assert [e["sequence"] for e in events] == list(range(1, 7))
         spin(2.3)
         assert states[-1]["status"] == "unknown" and states[-1]["rms"] is None
         card.stop()

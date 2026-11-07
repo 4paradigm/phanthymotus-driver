@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import struct
+import math
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,144 @@ def load():
 
 def pcm(value, n=4000):
     return struct.pack("<" + "h" * n, *([value] * n))
+
+
+def test_absolute_above_threshold_is_strict_held_and_recovers_once():
+    boundary = 20 * math.log10(1000 / 32768)
+    monitor = load().AudioMonitor(
+        mode="threshold",
+        threshold_dbfs=boundary,
+        comparison="above",
+        hold_s=0.5,
+        recover_s=0.5,
+        hysteresis_db=3,
+    )
+    assert monitor.feed(pcm(1000), 0) == []  # Equality is not greater-than.
+    assert monitor.read(0)["status"] == "normal"
+    assert monitor.feed(pcm(2000), 0.25) == []
+    assert [e["event"] for e in monitor.feed(pcm(2000), 0.5)] == ["threshold_entered"]
+    assert monitor.read(0.5)["status"] == "triggered"
+    assert monitor.feed(pcm(2000), 0.75) == []
+    assert monitor.feed(pcm(1000), 1) == []  # Hysteresis keeps it triggered.
+    assert monitor.feed(pcm(500), 1.25) == []
+    assert [e["event"] for e in monitor.feed(pcm(500), 1.5)] == ["threshold_cleared"]
+    assert monitor.read(1.5)["baseline_dbfs"] is None
+
+
+def test_absolute_below_threshold_silence_and_stale_input():
+    monitor = load().AudioMonitor(
+        mode="threshold",
+        comparison="below",
+        threshold_dbfs=-40,
+        hold_s=0.5,
+        recover_s=0.25,
+    )
+    monitor.feed(pcm(1000), 0)
+    assert monitor.feed(pcm(0), 0.25) == []
+    assert [e["event"] for e in monitor.feed(pcm(0), 0.5)] == ["threshold_entered"]
+    assert monitor.read(0.5)["rms_dbfs"] is None
+    json.dumps(monitor.read(0.5), allow_nan=False)
+    assert monitor.read(3)["status"] == "unknown"
+    # A gap discards the prior active state and cannot emit a false recovery.
+    assert monitor.feed(pcm(1000), 3) == []
+    assert monitor.read(3)["status"] == "normal"
+    monitor.feed(pcm(100), 3.25)
+    assert [e["event"] for e in monitor.feed(pcm(100), 3.5)] == ["threshold_entered"]
+    assert [e["event"] for e in monitor.feed(pcm(1000), 3.75)] == ["threshold_cleared"]
+
+
+def test_below_equality_transient_gap_and_invalid_audio_do_not_trigger():
+    boundary = 20 * math.log10(1000 / 32768)
+    monitor = load().AudioMonitor(
+        mode="threshold", comparison="below", threshold_dbfs=boundary, hold_s=0.5
+    )
+    assert monitor.feed(pcm(1000), 0) == []
+    assert monitor.feed(pcm(500), 0.25) == []
+    assert monitor.feed(pcm(1000), 0.5) == []
+    assert monitor.feed(pcm(500), 0.75) == []
+    assert monitor.feed(pcm(500), 2) == []  # Gap resets pending time.
+    with pytest.raises(ValueError):
+        monitor.feed(b"bad", 2.25)
+    assert monitor.read(2.25)["status"] == "unknown"
+    assert monitor.feed(pcm(500), 2.5) == []
+    assert monitor.read(2.5)["status"] == "normal"
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"mode": "other"},
+        {"comparison": "equal"},
+        {"threshold_dbfs": True},
+        {"threshold_dbfs": float("nan")},
+        {"threshold_dbfs": 1},
+        {"threshold_dbfs": -161},
+        {"hysteresis_db": -1},
+        {"hysteresis_db": float("inf")},
+        {"mode": "threshold", "comparison": "below", "threshold_dbfs": -1},
+    ],
+)
+def test_invalid_threshold_settings_are_rejected(settings):
+    with pytest.raises(ValueError):
+        load().AudioMonitor(**settings)
+
+
+def test_card_config_is_live_atomic_and_does_not_restart_ros():
+    from types import SimpleNamespace as NS
+
+    node = FakeNode()
+    card = load().AudioEnvironmentPlugin(
+        {},
+        "test",
+        FakeExecutor(),
+        runtime=lambda: (node, object, lambda: NS(data=""), 10),
+        clock=lambda: 0,
+    )
+    schema = card.get_tool()["configSchema"]["properties"]
+    assert schema["threshold_dbfs"]["maximum"] == 0
+    assert card.dispatch("start", {"input_topic": "/mic"})["state"] == "running"
+    result = card.dispatch(
+        "config", {"mode": "threshold", "threshold_dbfs": -30, "hold_s": 0.25}
+    )
+    assert result["state"] == "running" and result["ok"] is True
+    assert not node.destroyed
+    node.input(NS(format="audio/pcm-16k", data=pcm(2000)))
+    assert node.published[-1][1]["event"] == "threshold_entered"
+    assert card.dispatch("config", {"mode": "threshold"})["ok"] is True
+    assert (
+        card.dispatch("read", {})["status"] == "triggered"
+    )  # Same settings preserve state.
+    old = card.dispatch("info", {})["settings"]
+    bad = card.dispatch("config", {"threshold_dbfs": 10, "comparison": "below"})
+    assert bad["ok"] is False
+    assert card.dispatch("info", {})["settings"] == old
+    assert card.dispatch("info", {})["status"] == "triggered"
+    result = card.dispatch("config", {"comparison": "below"})
+    assert result["settings"]["comparison"] == "below"
+    assert card.dispatch("info", {})["status"] == "unknown"
+    assert card.dispatch("calibrate", {})["ok"] is False
+    card.stop()
+
+
+def test_yaml_settings_and_config_validation_preserve_event_sequence():
+    card = load().AudioEnvironmentPlugin(
+        {
+            "mode": "threshold",
+            "comparison": "below",
+            "threshold_dbfs": -40,
+            "hold_s": 0.25,
+            "hysteresis_db": 0,
+        },
+        "test",
+        FakeExecutor(),
+        clock=lambda: 0,
+    )
+    assert card.dispatch("info", {})["settings"]["threshold_dbfs"] == -40
+    assert card.dispatch("config", {"hysteresis_db": False})["ok"] is False
+    assert card.dispatch("config", {"typo": -20})["ok"] is False
+    assert card.monitor.feed(pcm(100), 0)[0]["sequence"] == 1
+    assert card.dispatch("config", {"threshold_dbfs": -30})["ok"] is True
+    assert card.monitor.feed(pcm(100), 0.25)[0]["sequence"] == 2
 
 
 def test_full_scale_statistics_and_json_safe_silence():

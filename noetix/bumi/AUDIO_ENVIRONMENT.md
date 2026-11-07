@@ -4,6 +4,55 @@
 It uses existing microphone PCM; it opens no recording device, changes no gain,
 saves no audio and issues no motion commands. No new dependencies are needed.
 
+## Operator-set dBFS threshold
+
+In the Card's **配置** panel choose **固定 dBFS 界限**, set a negative threshold
+(for example `-20`), and choose **大于界限触发** or **小于界限触发**. `-20 dBFS`
+is louder than `-40 dBFS`. This is digital signal level, not acoustic dB SPL;
+do not enter a sound-level-meter value such as `60 dB`.
+
+- `mode=threshold`: compare each 0.25-second RMS window directly with
+  `threshold_dbfs` (-160 to 0), without a quiet-background calibration.
+- `comparison=above`: strictly greater than the threshold; equality does not enter.
+- `comparison=below`: strictly less than the threshold; equality does not enter.
+- `hold_s` (default 2 seconds): valid audio duration needed to enter. Continued
+  matching audio emits no duplicate event.
+- `hysteresis_db` (default 3): above-mode recovery is at or below threshold minus
+  this margin; below-mode recovery is at or above threshold plus the margin.
+  Below-mode recovery must not exceed 0 dBFS, or configuration is rejected.
+- `recover_s` (default 2 seconds): valid audio duration needed to clear.
+
+Threshold mode publishes `threshold_entered` / `threshold_cleared`, including
+`comparison`, `threshold_dbfs`, `rms_dbfs` and a sequence number. State is
+`normal` / `triggered` / `unknown`; `baseline_dbfs` and `relative_db` stay null.
+Connect the **events** port to Decision Core and update the consuming Skill to
+handle these names. `loud` / `recovered` remain exclusive to relative mode.
+
+Valid all-zero audio qualifies for below-mode detection, with `rms_dbfs=null`
+rather than negative infinity. Missing/malformed audio never counts as quiet:
+continuity resets discard pending/active detections, and stale state is unknown.
+Short peaks or dips must not be confused with sustained threshold crossings.
+Gaps, stop and changed settings reset detection without emitting a clearing
+event. Events are discrete notifications, not a permanently latched state;
+consumers must check `state`/`read`, freshness and settings after interruptions.
+
+```json
+{"name":"audio_environment","arguments":{"action":"config","mode":"threshold","threshold_dbfs":-20,"comparison":"above","hold_s":2,"recover_s":2,"hysteresis_db":3}}
+```
+
+Use `comparison: "below"` to trigger below the selected level. `config` with no
+settings queries the current values. Invalid changes are rejected atomically.
+Changes take effect on new audio, clear statistics and pending detection, and
+retain event sequence numbers; they do not restart the ROS subscription or the
+microphone. Reapplying identical valid settings preserves current detection.
+`calibrate` is rejected in threshold mode because no background is needed.
+Direct MCP changes are in-memory; use deployment YAML for driver-start defaults.
+PM saves panel settings and reapplies them through its existing config mechanism;
+after recreating a driver verify `read.settings` before treating it as configured.
+
+Default `mode=relative` preserves the original behavior described below. Neither
+mode saves raw audio or calibrates physical sound pressure.
+
 ## Canvas
 
 Connect `mic` (or an existing mono PCM16k source) to `audio_environment`.
@@ -40,7 +89,7 @@ Baseline comparison floors levels at -90 dBFS to make silence comparisons finite
 `relative_db` compares the current window with the fixed calibrated baseline.
 These are digital signal levels, **not calibrated dB SPL or exposure limits**.
 
-States: `unknown`, `calibrating`, `normal`, `loud`. `normal` only means below
+Relative-mode states: `unknown`, `calibrating`, `normal`, `loud`. `normal` only means below
 the configured relative event criterion; it does not mean an acoustically safe
 or legally compliant noise level. No automatic speech or alarm is performed.
 
