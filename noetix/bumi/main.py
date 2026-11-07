@@ -164,6 +164,16 @@ class BumiDeviceBundle:
             self._plugins.append(MicPlugin(plugins_cfg["mic"], namespace, executor, media_ctrl))
             print("[bundle] MicPlugin loaded")
 
+        if plugins_cfg.get("audio_environment", {}).get("enabled", False):
+            from audio_environment import AudioEnvironmentPlugin
+            try:
+                plugin = AudioEnvironmentPlugin(
+                    plugins_cfg["audio_environment"], namespace, executor)
+                self._plugins.append(plugin)
+                print("[bundle] AudioEnvironmentPlugin loaded")
+            except ValueError as exc:
+                print(f"[bundle] AudioEnvironmentPlugin skipped: {exc}")
+
         if plugins_cfg.get("sound_direction", {}).get("enabled", False) and media_ctrl is not None:
             from direction_card import SoundDirectionPlugin
             self._plugins.append(SoundDirectionPlugin(
