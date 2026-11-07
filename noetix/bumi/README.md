@@ -500,3 +500,42 @@ media cards and motion cards keep running.
 
 The output contract, quality states, assumed body-axis calibration, validation
 status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
+
+
+## Read-only `joint_activity_stats` processor
+
+Connect Bumi `joints` (`sensor/skeleton`, `std_msgs/String` JSON) to this card.
+Canvas `start` supplies `input_topic` (or one-element `input_topics`). Bundle
+startup waits for that binding; no SDK/controller is used. Stop destroys only
+this card's node, subscription, publisher and timer, and clears its window.
+Stop before rebinding; restarting begins a new observation session.
+
+`plugins.joint_activity_stats` configures `enabled`, `window_s` (default 10,
+0.1?300 seconds) and `publish_hz` (default 1, 0.1?10 Hz). These are deployment
+settings, not live configSchema settings. Output is `data/json` on
+`/<namespace>/joint_activity_stats`, published periodically even without input.
+It contains 21 named joint records with `min`, `max`, `range`, `count`,
+`status`, `range_valid`, and `last_valid_age_s`. Units remain `q` radians.
+An overflowing numeric range is null with `range_valid: false`.
+
+The window is `(now-window_s, now]` using local monotonic receive time, **not
+hardware sample time**. Missing/invalid joints do not erase earlier valid
+samples. After expiry values become null/count zero, with `expired` or
+`no_valid_sample`; this is not a claim about physical motion or sensor health.
+Malformed messages and invalid entries have session counters. Duplicate names
+within one message invalidate that joint for that message. Identical messages
+are counted separately: the existing producer provides no verified sample ID.
+Unknown names are rejected; names follow the existing 21-joint producer map.
+At most 30,000 samples per joint are retained; capacity drops are reported and
+`window_complete` remains false for the session after any drop. Messages over
+262,144 characters or 256 joint entries are rejected. Data is in-memory only.
+
+This card does not classify start/stop motion, modes, faults or DDS transitions
+(the scope of upstream PR #199), and cannot prove action completion.
+Offline tests: `python -m pytest noetix/bumi/tests/test_joint_activity_stats.py tests/test_bumi_bundle.py -q`.
+Real ROS Humble discovery/QoS, canvas binding, dashboard JSON display, and ARM64
+image integration require separate acceptance; offline fakes do not verify them.
+
+Multiple or conflicting canvas inputs are rejected. `info.topic_in` reports the actual binding.
+Capacity loss marks retained joint statistics `incomplete`; numeric range overflow marks
+that joint `invalid_range`. Neither can produce an overall `valid` verdict.
