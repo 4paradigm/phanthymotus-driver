@@ -500,3 +500,104 @@ media cards and motion cards keep running.
 
 The output contract, quality states, assumed body-axis calibration, validation
 status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
+
+## Read-only host health card (system_health)
+
+`system_health` is an SDK-independent **sensor**, enabled by default. It observes
+the compute board without starting vendor devices or sending robot commands.
+Battery, joints and IMU remain the responsibility of `battery` and `motion_state`.
+The bundle starts one background sampler immediately, then every 2 seconds by
+default. `robot_info` only reads a copy of the latest cache; it never reads files,
+runs shell commands or waits for the sampler.
+
+| Check | Source | Scope | Default warning policy |
+| --- | --- | --- | --- |
+| Temperature | `/sys/class/thermal/thermal_zone*/{type,temp}` | `host_sysfs`; physical component identity unverified | None; reported as `unrated` |
+| CPU load / usage | `/proc/loadavg`, `/proc/stat` | `host_kernel` or `container_lxcfs` | 1-minute load / cores >= 1.0; usage is informational |
+| Memory | `/proc/meminfo` (`MemTotal`, `MemAvailable`) | `host_kernel` or `container_lxcfs` | Used >= 90% |
+| Disk | `statvfs` of each configured `disk_paths` entry | `mounted_filesystem` | Used >= 90% (same reserved-block denominator as `df`) |
+
+These thresholds are local observation policies, not vendor safety limits. The
+temperature limit defaults to `null` because neither a Bumi thermal safety limit
+nor each zone's hardware identity has been verified. Valid readings are retained
+when some zones fail; `coverage_complete: false` prevents an all-normal verdict.
+A known high temperature still produces a warning even if another zone is
+unreadable, and the observation remains incomplete.
+
+The existing deployment uses host PID mode and has no configured CPU/memory
+limits. Proc metrics describe the visible kernel data, not the driver process's
+own resource use. LXCFS file mounts are detected per metric; if the mount table
+cannot be read, scope is `unknown`, rather than assumed to be host data. This
+card does not assess cgroup resource limits. The default disk path is the existing
+host bind mount `/opt/phanthy-motus/data`, where `vision_capture` saves media.
+Container `/` is the image overlay and does not identify the host root partition.
+
+Checks have `ok`, `warning`, `unrated` or `unreadable` status; monitoring additionally
+uses `unknown`, `not_started` and `stale`. Any measured warning or stale cache makes
+`overall: warning`; an unassessed/missing check otherwise makes `overall: unknown`.
+`overall: ok` requires all checks to be assessed and normal. `complete` means all
+observations were available and assessed (a warning can still be complete).
+`fresh` only describes the sampler cache, not whether the machine is healthy.
+**With shipped defaults, overall remains unknown unless another check warns,
+because temperature is unrated.**
+
+The `/<namespace>/state/system_health` `data/json` output is a `std_msgs/String`.
+It carries a compact report with `timestamp_ms`, `fresh`, verdict and problems.
+Measurements and their status are top-level fields so the generic JSON viewer
+can display each independently, without clipping a large nested `checks` value:
+
+- `temperature_celsius`, `temperature_status`, `temperature_coverage_complete`;
+- `cpu_load_1_5_15`, `cpu_load_per_core`, `cpu_usage_percent`, `cpu_load_status`;
+- `memory_used_percent`, `memory_available_bytes`, `memory_status`;
+- `disk:<path>:used_percent`, `disk:<path>:available_bytes`, `disk:<path>:status`
+  for each configured path;
+- `monitoring_status`, `samples`, `sample_age_s`.
+
+Unavailable measurements are explicitly `null` to clear previous readings.
+Nested checks, zone lists, source/scope metadata, `host` and policy are omitted
+to limit background LLM input. `robot_info` returns the full cached observation,
+zone errors, host metadata, sample age and sampler state. `info` returns
+`topic_out`, sample count/age, publisher availability and policy.
+
+Samples older than three sampling intervals are stale. An independent ROS
+executor timer republishes stale/unknown cache status even if the sampling
+thread is blocked; the original observation timestamp is preserved. If the
+executor, transport or driver itself stops, consumers must still expire the last
+message using its timestamp. The timer is not an external process watchdog.
+
+Canvas `start` only returns the actual sampler state and `topic_out`; it never
+creates or revives a worker. Canvas `stop` acknowledges `idle` without stopping
+this persistent sensor. Actual startup and shutdown belong to the bundle's
+`start_all` and `stop_all`; shutdown signals
+the thread and joins for at most 2 seconds. A blocked read leaves the card
+`stopping` and prevents overlapping restart. Python cannot cancel that blocked
+filesystem call; sampling resumes only after it returns and the card is restarted
+(or the driver is restarted). ROS publisher creation failure leaves cached
+queries available; invalid policy skips only this card during bundle assembly.
+No new runtime dependencies or deployment permissions are needed.
+
+Hardware-free checks from the repository root:
+
+```bash
+python3 -m pytest noetix/bumi/tests/test_system_health.py tests/test_bumi_bundle.py -q
+python3 -m pytest noetix/bumi/tests tests/test_bumi_bundle.py -q
+python3 -m pytest tests/test_dockerfile_copies.py -q -k bumi
+python3 scripts/check_service_yml.py noetix/bumi
+```
+
+On-robot acceptance remains required after an authorized deployment:
+
+```bash
+docker exec embodied-noetix-bumi python3 -c 'import json, system_health as s; print(json.dumps(s.SystemProbe().collect(s.parse_policy({})), allow_nan=False))'
+ros2 topic echo /<namespace>/state/system_health
+cat /sys/class/thermal/thermal_zone*/{type,temp}
+uptime
+free -b
+df -P /opt/phanthy-motus/data
+```
+
+Compare the container observations against host values, verify canvas discovery
+and `robot_info`, identify the thermal zones, and observe load/logging/other cards
+for 10 minutes. Linux/WSL tests do not establish Bumi sensor identity, safe thermal
+limits or live ROS/Agent Core connectivity. Disable `plugins.system_health.enabled`
+or revert the change to roll back; the card writes no persistent state.
