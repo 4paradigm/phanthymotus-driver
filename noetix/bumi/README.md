@@ -500,3 +500,7 @@ media cards and motion cards keep running.
 
 The output contract, quality states, assumed body-axis calibration, validation
 status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
+
+## 可验证 RGB-D 快照
+
+vision_capture 新增 capture_rgbd，复用唯一相机采集进程，提供 A/B 级来源与配对证据，不证明请求后曝光。接口、保存格式和验收边界见 [RGBD_SNAPSHOT.md](RGBD_SNAPSHOT.md)。
