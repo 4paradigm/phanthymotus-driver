@@ -108,6 +108,104 @@ def drain(node):
     node._process_loop()
 
 
+@pytest.mark.parametrize('bigendian', [False, True])
+def test_padded_display_with_rotation_keeps_native_stream_and_channels(runtime, bigendian):
+    node = runtime.node
+    node._imu_roll, node._imu_pitch = .3, -.2
+    source = cloud(padded=True, bigendian=bigendian)
+    original = bytes(source.data)
+    for tick in (100., 101.):
+        runtime.clock.monotonic = lambda: tick
+        node._on_cloud(source)
+    drain(node)
+    native = node.topics['/alpha/lidar/cloud_native']
+    assert len(native) == 2
+    expected = struct.pack('<fffHBB', 1., 2., 3., 54321, 17, 29)
+    assert all(bytes(frame.data) == expected for frame in native)
+    assert len(node.topics['/alpha/lidar/cloud_native/metadata']) == 2
+    display = node.topics['/alpha/lidar/cloud']
+    assert len(display) == 2
+    rotated = gravity_align_inplace(expected, 16, 1, .3, -.2)
+    assert all(bytes(frame.data) == struct.pack('<II', 16, 1) + rotated for frame in display)
+    assert bytes(source.data) == original
+
+
+def test_display_failure_drops_only_that_display_frame(runtime):
+    node = runtime.node
+    publish = node._cloud_pub.publish
+    calls = []
+
+    def fail_once(msg):
+        calls.append(msg)
+        if len(calls) == 1:
+            raise RuntimeError('display transport failed')
+        publish(msg)
+
+    node._cloud_pub.publish = fail_once
+    for tick in (100., 101.):
+        runtime.clock.monotonic = lambda: tick
+        node._on_cloud(cloud())
+    drain(node)
+    assert len(node.topics['/alpha/lidar/cloud_native']) == 2
+    assert len(node.topics['/alpha/lidar/cloud_native/metadata']) == 2
+    assert len(node.topics['/alpha/lidar/cloud']) == 1
+    assert node._worker_count == 2
+
+
+def test_rotation_failure_cannot_interrupt_following_native_frame(runtime):
+    node = runtime.node
+    runtime.namespace['gravity_align_inplace'] = lambda *args: (_ for _ in ()).throw(ValueError('bad display layout'))
+    for tick in (100., 101.):
+        runtime.clock.monotonic = lambda: tick
+        node._on_cloud(cloud())
+    drain(node)
+    assert len(node.topics['/alpha/lidar/cloud_native']) == 2
+    assert len(node.topics['/alpha/lidar/cloud_native/metadata']) == 2
+    assert not node.topics['/alpha/lidar/cloud']
+    assert node._display_error == 'bad display layout'
+
+
+def test_display_layout_rejection_keeps_native_fields_and_next_display_frame(runtime):
+    source = cloud()
+    source.fields[0].name, source.fields[2].name = 'z', 'x'
+    runtime.node._on_cloud(source)
+    runtime.clock.monotonic = lambda: 101.
+    runtime.node._on_cloud(cloud())
+    drain(runtime.node)
+    native = runtime.node.topics['/alpha/lidar/cloud_native']
+    assert len(native) == 2
+    assert native[0].fields[0].name == 'z' and native[0].fields[2].name == 'x'
+    assert len(runtime.node.topics['/alpha/lidar/cloud']) == 1
+
+
+def test_padded_display_is_normalized_without_native_subscribers(runtime):
+    node = runtime.node
+    node._native_pub.get_subscription_count = lambda: 0
+    node._imu_roll, node._imu_pitch = .3, -.2
+    source = cloud(padded=True, bigendian=True)
+    node._on_cloud(source)
+    drain(node)
+    expected = gravity_align_inplace(pack_slam_cloud(source), 16, 1, .3, -.2)
+    assert bytes(node.topics['/alpha/lidar/cloud'][0].data) == struct.pack('<II', 16, 1) + expected
+    assert not node.topics['/alpha/lidar/cloud_native']
+
+
+def test_display_does_not_rotate_sdk_buffer_before_native_consumer_connects(runtime):
+    node = runtime.node
+    node._native_pub.get_subscription_count = lambda: 0
+    node._imu_roll, node._imu_pitch = .3, -.2
+    source = cloud()
+    original = bytes(source.data)
+    node._on_cloud(source)
+    drain(node)
+    assert bytes(source.data) == original
+    node._native_pub.get_subscription_count = lambda: 1
+    runtime.clock.monotonic = lambda: 101.
+    node._on_cloud(source)
+    drain(node)
+    assert bytes(node.topics['/alpha/lidar/cloud_native'][0].data) == original
+
+
 @pytest.mark.parametrize('padded,bigendian', [(False, False), (True, True)])
 def test_native_pointcloud_preserves_frozen_header_layout_channels_and_bytes(runtime, padded, bigendian):
     source = cloud(padded=padded, bigendian=bigendian)

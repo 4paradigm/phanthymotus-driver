@@ -2455,6 +2455,7 @@ class _LidarNode(Node):
         self._source_generation = uuid4().hex
         self._native_source_header = None
         self._native_error = None
+        self._display_error = None
         self._native_pub = self._native_meta_pub = None
         try:
             from sensor_msgs.msg import PointCloud2
@@ -2524,15 +2525,14 @@ class _LidarNode(Node):
 
         point_step = msg.point_step
         total_points = msg.width * msg.height
-        data = msg.data if isinstance(msg.data, (bytes, bytearray)) else bytes(msg.data)
+        # 显示旋转也必须使用独立缓冲，避免污染后续原生订阅读到的 SDK 数据。
+        data = bytes(msg.data)
         native = metadata = None
         try:
             if (self._native_pub is not None and self._native_meta_pub is not None and
                     self._native_pub.get_subscription_count() > 0):
                 import array as _array
                 from sensor_msgs.msg import PointCloud2, PointField
-                # Freeze SDK-owned buffers before queueing or gravity rotation.
-                data = bytes(data)
                 raw = PointCloud2()
                 raw.header.stamp.sec = msg.header.stamp.sec
                 raw.header.stamp.nanosec = msg.header.stamp.nanosec
@@ -2549,6 +2549,20 @@ class _LidarNode(Node):
         except Exception as exc:
             self._native_error = str(exc)
 
+        try:
+            # 显示包要求 XYZ float32 LE 在前三列；行填充不能交给旋转函数。
+            fields = getattr(msg, 'fields', None)
+            if fields is not None and any(
+                    not any(f.name == name and f.offset == offset and f.datatype == 7 and f.count == 1
+                            for f in fields) for name, offset in (('x', 0), ('y', 4), ('z', 8))):
+                raise ValueError('display requires float32 XYZ at offsets 0/4/8')
+            if native is not None:
+                data = bytes(native.data)
+            elif msg.row_step != msg.width * point_step or msg.is_bigendian:
+                data = pack_slam_cloud(msg)
+        except Exception as exc:
+            self._display_error = str(exc)
+            data = None
         # Non-blocking put; drop frame if worker is busy
         try:
             self._cloud_queue.put_nowait((point_step, total_points, data,
@@ -2587,17 +2601,20 @@ class _LidarNode(Node):
                 except Exception as exc:
                     self._native_error = str(exc)
 
-            # Apply gravity alignment (returns bytearray, avoids extra copy)
-            data = gravity_align_inplace(data, point_step, total_points, roll, pitch)
-
-            # Publish — pre-allocate buffer to avoid header + data concat copy
-            header = struct.pack('<II', point_step, total_points)
-            buf = bytearray(8 + len(data))
-            buf[:8] = header
-            buf[8:] = data
-            ros_msg = UInt8MultiArray()
-            ros_msg.data = _array.array('B', buf)
-            self._cloud_pub.publish(ros_msg)
+            # 显示转换或发布失败只丢这一帧显示，不能终止原生点云的工作线程。
+            try:
+                if data is not None:
+                    data = gravity_align_inplace(data, point_step, total_points, roll, pitch)
+                    header = struct.pack('<II', point_step, total_points)
+                    buf = bytearray(8 + len(data))
+                    buf[:8] = header
+                    buf[8:] = data
+                    ros_msg = UInt8MultiArray()
+                    ros_msg.data = _array.array('B', buf)
+                    self._cloud_pub.publish(ros_msg)
+                    self._display_error = None
+            except Exception as exc:
+                self._display_error = str(exc)
 
             elapsed_ms = (time.monotonic() - t0) * 1000
             self._worker_count += 1
@@ -2666,7 +2683,8 @@ class LidarPlugin:
         if action == "info":
             tool = self._cloud_tool()
             return {"state": "running", "topic_out": tool['topic_out'],
-                    "input_metadata": tool['input_metadata'], "native_error": self._node._native_error}
+                    "input_metadata": tool['input_metadata'], "native_error": self._node._native_error,
+                    "display_error": self._node._display_error}
         return None
 
 
