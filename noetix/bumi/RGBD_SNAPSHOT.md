@@ -1,6 +1,7 @@
 # Bumi `vision_capture.capture_rgbd`
 
-开发基线：官方 upstream/main `d97045825a685d4a81176a59b53f8d3a9803e744`。
+初始开发基线为官方 upstream/main `d97045825a685d4a81176a59b53f8d3a9803e744`。
+PR #498 的合并基线为 `814b3ca953d33eba0aca9a61dcefa773f5da483b`。
 独立 worktree：`D:/university/phanthymotus-driver-rgbd`，分支 `refactor/bumi-rgbd-snapshot`。
 只修改本 Driver；ActiveSearch 原型、原工作区、主仓库审查代码及补丁均未修改。
 
@@ -14,11 +15,22 @@
 ```
 
 timeout_s 是有限数值，范围0.1–10秒，默认5。严格曝光参数必须是布尔值。
-同步返回最终结果；没有 action_id，也不加入 x-completion。采集等待和常规保存共用单调时钟预算，
-每个阻塞接收轮询最多20ms，控制发送超时50ms；保存前后检查取消/截止时间。
-普通磁盘系统调用不能被 Python 安全强杀，因此此预算不是故障磁盘下的硬实时返回上限。
-慢磁盘期间 stop 仍能设置取消，后续禁止成功返回并清理该请求；当前请求退出前维持 BUSY。
-不通过后台假成功或过早释放请求槽掩盖仍在进行的写盘。
+已受理的调用立即返回以下对象。`action_id` 和 `request_id` 使用同一个 UUID。
+
+```json
+{"ok":true,"state":"queued","action_id":"<32hex>","request_id":"<32hex>"}
+```
+
+后台 worker 将最终结果作为 `result`，通过 `POST /api/acp/complete` 发送一次终态。
+成功使用 `completed`，采集或保存失败及超时使用 `error`，取消并完成清理使用
+`cancelled`。`x-completion` 同时声明快照和录像，保留录像原有的
+`max_duration_s + 15` 秒等待上限（默认 45 秒，最短 16 秒）。
+HTTP 回调失败时 Driver 记录日志。`info.rgbd_snapshot.last_completion` 保留当前进程中
+最近一个终态及完整结果，供调用者核对。后续快照完成会替换此记录。
+
+采集等待和常规保存共用单调时钟预算，每次接收轮询最多 20 ms，控制发送超时 50 ms。
+普通磁盘系统调用无法由 Python 安全中断。慢磁盘期间 `stop` 仍能设置取消，
+取消获胜时禁止成功返回并清理该请求。当前请求退出前维持 `BUSY`。
 
 成功示例（路径以实际配置为准）：
 
@@ -30,16 +42,31 @@ timeout_s 是有限数值，范围0.1–10秒，默认5。严格曝光参数必�
           "calibration.json":".../calibration.json","metadata.json":".../metadata.json"}}
 ```
 
-失败返回 `ok=false, request_id, code`，通常附 message；保存失败附 cleanup_errors。
-主要错误：BUSY、INVALID_TIMEOUT、INVALID_ARGUMENT、CAMERA_UNAVAILABLE、CAMERA_DISCONNECTED、
-CAMERA_CHANNEL_ERROR、CAMERA_RESTART、CLOCK_DOMAIN_CHANGED、CLOCK_DISCONTINUITY、PAIR_DOMAIN_MISMATCH、
-PAIR_SKEW、INVALID_PAIR、INVALID_PIXELS、INVALID_CALIBRATION、TIMEOUT、CANCELLED。
-require_exposure_after_request=true 直接返回 EXPOSURE_UNVERIFIABLE，不向相机发请求、不写文件。
+终态失败结果包含 `ok=false, request_id, code`，通常附 `message`。
+保存失败时附 `cleanup_errors`。主要运行时错误包括 CAMERA_UNAVAILABLE、
+CAMERA_DISCONNECTED、CAMERA_CHANNEL_ERROR、CAMERA_RESTART、CLOCK_DOMAIN_CHANGED、
+CLOCK_DISCONTINUITY、PAIR_DOMAIN_MISMATCH、PAIR_SKEW、INVALID_PAIR、INVALID_PIXELS、
+INVALID_CALIBRATION、TIMEOUT 和 CANCELLED。BUSY、INVALID_TIMEOUT、INVALID_ARGUMENT
+及 EXPOSURE_UNVERIFIABLE 在受理前同步返回，无 `action_id` 或 ACP 回调。
+严格曝光请求直接拒绝，且不会发起采集或保存。
 
-`info.rgbd_snapshot` 声明能力、是否活动、单飞策略及严格曝光不支持。
-`stop` 取消当前快照并保留旧录像取消行为；新增 rgbd_cancel_requested 表示是否设置了快照取消。
-它不是完成清理的证明；当前同步调用的最终结果才是任务结果。生命周期 stop() 也取消快照。
-同一 Card 同时最多一项 RGB-D请求，第二项立即 BUSY；旧 RGB照片和录像保持原行为，不共享这项单飞槽。
+`stop` 取消当前快照并保留原有录像取消行为。`rgbd_cancel_requested` 仅表示
+本次设置了取消标志，清理结果由终态报告。快照单飞，旧 RGB 照片和录像保持原有行为。
+Agent Core 的普通工具调用可能等待 ACP 屏障。已注册的系统中断
+`on_interrupt_all` 通过 `hooks.fire → call_tool_direct → vision_capture.stop`
+绕开屏障；本地验证覆盖了从 `hooks.fire` 开始的路径。
+
+### ACP 顺序限制
+
+MCP handler 写出受理响应后解除 Driver 本地回调门，等待设有上限，无固定延时。
+Agent Core 解析响应后才登记 Pending。目前正式接口没有 Pending 登记确认，
+`/api/acp/complete` 即使没有匹配项也会返回 `ok: true`，且不会缓存该终态。
+因此，先写出 MCP 响应仍可能遇到 Core 尚未解析响应的情况。这个场景下快照文件和
+Driver 的最近终态仍可查询，Core 的 ACP 屏障则只能等自身超时或被中断。
+
+上游可在 Core 按 `action_id` 有界缓存可信的早到完成事件，在登记 Pending 时消费，
+并对已完成或已回收的 ID 去重；或者在登记后发出明确的 ACK，让 Driver 在收到 ACK
+后才发送完成事件。仅延时或依据 HTTP 200 无法保证时序。
 
 ## 唯一 Pipeline 与请求流程
 
@@ -47,7 +74,7 @@ require_exposure_after_request=true 直接返回 EXPOSURE_UNVERIFIABLE，不向�
 tools/call -> 原 Bundle.dispatch -> VisionCapturePlugin -> SnapshotCapture
   -> CameraPlugin.capture_rgbd -> inherited socketpair -> 相机采集子进程
   -> 请求ID + producer-side设备帧基线 -> 后续frameset -> 原rs.align结果
-  -> 校验 + 有界像素复制 -> 有界发送线程 -> 调用侧 -> 临时目录 -> 原子改名 -> 成功
+  -> 校验 + 有界像素复制 -> 有界发送线程 -> 后台任务 -> 原子发布 -> ACP 终态
 ```
 
 CameraPlugin 仍只启动一个相机子进程；子进程仍只有原来的 rs.pipeline。
@@ -141,9 +168,21 @@ ARM64 FD继承和Socket吞吐、请求耗时、30fps预览及VO负载影响、�
 若未来要求C级，还需传感器曝光元数据、可信跨域映射及误差上界；本版严格请求始终拒绝。
 没有连接真机、控制运动、修改dry_run、启动RTAB-Map或部署Docker；本地通过不能代替硬件验收。
 
-### 最终实际运行记录
+### 初版回归记录
 
 Ubuntu-22.04/WSL、Python3.10.12、pytest6.2.5、numpy1.21.5：上述完整命令 396 passed in 58.26s，0失败、0跳过。新增两个测试文件合计22项，原有相关回归374项。Python3.10 AST检查四个新增/修改Python文件通过，git diff --check通过。没有执行真实相机/ROS/Docker部署或真实ffmpeg编码。
 
 
-取消包若发送失败，父进程关闭快照通道，避免残留半包污染下一次请求。快照通道故障后需重启相机进程恢复。MCP 驱动层的并发取消由本地 HTTP handler 回归验证，Agent Core 的调用调度仍需集成验证。
+取消包若发送失败，父进程关闭快照通道，避免残留半包污染下一次请求。快照通道故障后需重启相机进程恢复。MCP 并发取消由真实本地 HTTP handler 验证。额外 ACP 契约测试需要将
+`BUMI_ACP_CORE_SOURCE` 指向官方 `agent-core/src`，并安装 `aiohttp` 和
+`jsonschema`。测试基于官方提交
+`990257f881af540a1949237678b71dceaab5ab1c`，运行实际 `mcp_client.py`、
+`hooks.py` 以及 `start.py` 中的完成端点函数，HTTP 入口使用本地测试服务。
+测试刻意暂停 MCP JSON 解析，复现 HTTP 回调成功但迟建的 Pending 未被释放的情况；
+先登记的正常路径和中断钩子路径则验证了 Core 屏障确实解除。
+完整 Agent Core 服务的启动、鉴权及真实设备部署仍待验证。
+
+本轮 ACP 修订使用上述完整 Bumi 命令，额外设置 BUMI_ACP_CORE_SOURCE 指向固定提交源码，
+并通过 PYTHONPATH 加载隔离的 HTTP 测试依赖。Ubuntu-22.04/WSL 上定向测试 29 项通过，
+完整回归 405 项通过、0 失败、0 跳过。Python AST、Card JSON Schema、ACP 声明及 Docker COPY
+静态检查均通过。

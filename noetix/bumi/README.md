@@ -215,7 +215,8 @@ sudo systemctl start noetix-video-capture.service
 
 ## `vision_capture` card
 
-Persistent RGB photo/video capture, with the card/action names and file layout
+Persistent RGB photo/video capture and on-demand RGB-D snapshots. The RGB
+photo/video actions and file layout are inherited
 from Q5 PR #220. This replaces `state_record`; existing workflows must select
 the new card. State scopes, JSON snapshots, labels and interval logging are no
 longer supported. Historical files under `/opt/phanthy-motus/data/bumi/state-records`
@@ -223,17 +224,21 @@ are left untouched.
 
 - `start`: check whether the camera process is ready (does not take a photo).
 - `capture_photo`: save one current RGB JPEG.
+- `capture_rgbd`: queue a verified RGB-D snapshot and return an ACP action ID.
+  The completion result identifies the saved pair, calibration and provenance.
 - `record_video`: asynchronously save an RGB MP4/H.264 video; `duration_s` is
   an integer from 1 to 30, default 5 seconds.
-- `info`: return storage directories, camera/frame freshness and active recording.
-- `stop`: cancel recording and remove the incomplete video. This is not
-  “finish early and save”. It does not stop the existing camera sensor card.
+- `info`: return storage directories, camera/frame freshness, active recording
+  and RGB-D snapshot status.
+- `stop`: request cancellation of active capture jobs and discard incomplete
+  output. The camera sensor card continues running.
 
 Bumi reuses its existing 640x480 JPEG topic `/<namespace>/camera/color`.
 A recent cached frame is used for a photo; if none is available or it is older
 than 3 seconds, capture waits for a fresh frame (up to 5 seconds per wait).
 Recording requests a strictly later frame sequence for each encoded frame.
-No second RealSense pipeline, depth capture, audio or state JSON is added.
+RGB-D snapshots use the same RealSense pipeline through the camera subprocess.
+Video remains RGB-only.
 
 Default persistent output:
 

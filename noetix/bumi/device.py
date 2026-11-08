@@ -3177,14 +3177,15 @@ class VisionCapturePlugin:
                 "x-action-params": {
                     "start": {"params": [], "description": "检查相机 worker 是否就绪。"},
                     "capture_rgbd": {"params": ["timeout_s", "require_exposure_after_request"],
-                        "description": "保存请求关联的设备新帧 RGB-D 和标定/来源；B级，不证明请求后曝光。"},
+                        "description": "异步保存请求关联的设备新帧 RGB-D 和标定/来源；B级，不证明请求后曝光。"},
                     "capture_photo": {"params": [], "description": "拍摄并保存一张当前 RGB 照片。"},
                     "record_video": {"params": ["duration_s"], "description": "录制并保存 1–30 秒 RGB 视频，默认 5 秒。"},
                     "info": {"params": [], "description": "查看保存目录与相机状态。"},
-                    "stop": {"params": [], "description": "取消当前录像并删除未完成的视频。"},
+                    "stop": {"params": [], "description": "取消当前录像和 RGB-D 快照，清理未完成文件。"},
                 },
+                "x-hooks": {"on_interrupt_all": {"action": "stop"}},
                 "x-completion": {
-                    "actions": ["record_video"],
+                    "actions": ["record_video", "capture_rgbd"],
                     "timeout": self._max_duration_s + 15,
                 }},
         }
@@ -3196,11 +3197,12 @@ class VisionCapturePlugin:
         return {"state": "ready" if self._camera_ready() else "error"}
 
     def stop(self):
-        # ``BumiDeviceBundle.stop_all`` calls this during SIGTERM/redeploy. Completing
-        # the ACP action here prevents Agent Core from retaining a pending
-        # recording while the daemon thread and its encoder are torn down.
+        # Bundle shutdown cancels both consumers before tearing down the camera.
         self._rgbd_capture.cancel()
-        return self._stop_recording()
+        try:
+            return self._stop_recording()
+        finally:
+            self._rgbd_capture.cancel(wait=True)
 
     def _camera_ready(self):
         return self._worker is not None and self._worker.is_running()
@@ -3449,14 +3451,16 @@ class VisionCapturePlugin:
                 "message": "Video recording cancelled" if state == "idle"
                 else "Waiting for video recording to cancel"}
 
-    def dispatch(self, action, args):
+    def dispatch(self, action, args, *, response_sent=None):
         if action == "start":
             return {"state": "ready" if self._camera_ready() else "error",
                     "message": "" if self._camera_ready() else "Bumi camera worker is unavailable"}
         if action == "info":
             return self._info()
         if action == "capture_rgbd":
-            return self._rgbd_capture.capture(args)
+            return self._rgbd_capture.start(
+                args, lambda action_id, status, result: _acp_notify(action_id, status, result, CARD),
+                response_sent=response_sent)
         if action == "capture_photo":
             return self._capture_photo(args)
         if action == "record_video":

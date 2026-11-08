@@ -297,24 +297,30 @@ class SnapshotClient:
 
 
 class SnapshotCapture:
-    """Synchronous Card action; no locks held across acquisition or disk writes."""
+    """Single-flight ACP action over the shared camera."""
     def __init__(self, camera, output_dir):
         self.camera, self.output_dir = camera, Path(output_dir)
         self.lock, self.active = threading.Lock(), None
+        self.worker = None
+        self.last_completion = None
 
-    def cancel(self):
+    def cancel(self, *, wait=False):
         with self.lock:
-            if self.active:
+            requested = self.active is not None and not self.active.is_set()
+            if requested:
                 self.active.set()
-                return True
-            return False
+            worker = self.worker
+        if wait and worker is not None:
+            worker.join(timeout=6)
+        return requested
 
     def info(self):
         with self.lock:
             return {'active': self.active is not None, 'guarantee_levels': ['A', 'B'],
-                    'exposure_after_request_supported': False, 'single_flight': True}
+                    'exposure_after_request_supported': False, 'single_flight': True,
+                    'last_completion': deepcopy(self.last_completion)}
 
-    def capture(self, args):
+    def start(self, args, notify, response_sent=None):
         request_id = uuid.uuid4().hex
         if type(args.get('require_exposure_after_request', False)) is not bool:
             return {'ok': False, 'code': 'INVALID_ARGUMENT', 'request_id': request_id}
@@ -329,7 +335,46 @@ class SnapshotCapture:
             if self.active is not None:
                 return {'ok': False, 'code': 'BUSY', 'request_id': request_id}
             self.active = cancel
-        deadline = time.monotonic() + timeout
+            deadline = time.monotonic() + timeout
+            worker = threading.Thread(
+                target=self._run, args=(request_id, deadline, cancel, notify, response_sent),
+                name='bumi-rgbd-snapshot', daemon=True)
+            try:
+                worker.start()
+            except RuntimeError as exc:
+                self.active = None
+                return {'ok': False, 'code': 'CAPTURE_RGBD_FAILED', 'request_id': request_id,
+                        'message': str(exc)}
+            self.worker = worker
+        return {'ok': True, 'state': 'queued', 'action_id': request_id, 'request_id': request_id}
+
+    def _settle(self, status, result):
+        # Called with the lock held, including at the successful commit boundary.
+        self.last_completion = {'action_id': result['request_id'], 'status': status, 'result': result}
+        self.active = None
+
+    def _run(self, request_id, deadline, cancel, notify, response_sent):
+        try:
+            result = self._capture(request_id, deadline, cancel)
+        except Exception as exc:
+            result = {'ok': False, 'request_id': request_id, 'code': 'CAPTURE_RGBD_FAILED',
+                      'message': str(exc), 'exposure_after_request_verified': False}
+        status = 'completed'
+        if not result['ok']:
+            with self.lock:
+                cleanup_failed = bool(result.get('cleanup_errors'))
+                if cancel.is_set() and not cleanup_failed:
+                    result.update(code='CANCELLED', message='Snapshot cancelled')
+                status = 'cancelled' if result['code'] == 'CANCELLED' and not cleanup_failed else 'error'
+                self._settle(status, result)
+        if response_sent is not None:
+            # Core registers pending after parsing the MCP response. Its current
+            # API has no registration acknowledgement or early-completion buffer.
+            if not response_sent.wait(timeout=5):
+                print(f'[Bumi ACP] MCP response write did not finish for {request_id}', flush=True)
+        notify(request_id, status, result)
+
+    def _capture(self, request_id, deadline, cancel):
         temporary = final = None
         owns_temporary = published = False
         try:
@@ -370,12 +415,13 @@ class SnapshotCapture:
             check(cancel, deadline)
             temporary.rename(final)  # All-or-nothing directory visibility on one filesystem.
             published = True
+            result = {'ok': True, 'request_id': request_id, 'guarantee_level': 'B',
+                      'exposure_after_request_verified': False, 'directory': str(final),
+                      'files': {n: str(final/n) for n in (*packet['files'], 'metadata.json')}}
             with self.lock:
                 check(cancel, deadline)
-                self.active = None  # Commit wins atomically against stop.
-            return {'ok': True, 'request_id': request_id, 'guarantee_level': 'B',
-                    'exposure_after_request_verified': False, 'directory': str(final),
-                    'files': {n: str(final/n) for n in (*packet['files'], 'metadata.json')}}
+                self._settle('completed', result)  # Commit wins atomically against stop.
+            return result
         except Exception as exc:
             cleanup_errors = []
             for path, owned in ((temporary, owns_temporary), (final, published)):
@@ -389,7 +435,3 @@ class SnapshotCapture:
             return {'ok': False, 'request_id': request_id, 'code': getattr(exc, 'code', 'CAPTURE_RGBD_FAILED'),
                     'message': str(exc), 'exposure_after_request_verified': False,
                     'cleanup_errors': cleanup_errors}
-        finally:
-            with self.lock:
-                if self.active is cancel:
-                    self.active = None
