@@ -140,20 +140,13 @@ Development Manual v1.0.2 sections 1.6 and 1.9. These values are converted
 from millimetres to metres. The manual provides no camera orientation, and the
 RTSP stream provides no intrinsics, so orientation and optical calibration
 remain unknown.
-The front camera declares a horizontal half-FOV of `0.7926 rad` (90.8 degrees
-full), `source=measured`, from a chessboard calibration of this lens on
-2026-11-07 (RTSP `/video4` at 1024x576, 103 frames, RMS 0.21 px, plumb_bob).
-It is the angle consistent with the calibrated focal length: a consumer that
-derives a pinhole from it gets fx = 315 px at 640x360, which is correct near
-the image centre. The raw stream is barrel-distorted (k1 = -0.265), so its real
-edge rays are wider than that angle and no single pinhole angle describes the
-whole frame; consumers that need full-frame geometry should read the rectified
-output of the perception `undistort` card, which carries the full K/D and
-rewrites the declaration downstream. Depth values are ray range, so lateral
-projection should use `sin(theta) * range`. This replaces the earlier `0.423
-rad` (48.5 degrees) rough wall fit on `/s10_pro/camera_front/visual_depth`, which
-implied fx = 711 px, 2.26x the measured value. The other camera FOVs remain
-unknown until they are calibrated.
+The front camera currently carries a preliminary manual horizontal half-FOV
+estimate of `0.423 rad` (about 48.5 degrees full FOV), obtained with the rough
+`measure_fov.py wall` check on `/s10_pro/camera_front/visual_depth`. That check
+also indicates the depth values are ray range, so lateral projection should use
+`sin(theta) * range`. This estimate is intentionally marked `source=manual`
+and `confidence=rough`; it must be replaced after a precise per-camera
+calibration. The other camera FOVs remain unknown.
 A one-frame low-latency pipeline reconnects after stream interruption. The
 previous ROS image-topic receive path has been removed because the vendor camera service
 does not publish camera images over DDS. The final image includes the `ffmpeg`

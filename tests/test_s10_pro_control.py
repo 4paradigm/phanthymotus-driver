@@ -150,22 +150,11 @@ def test_s10_camera_info_exposes_vendor_body_mount_positions(monkeypatch):
         assert info["vendor"]["mounting"]["source"] == "vendor-spec"
         assert info["vendor"]["mounting"]["intrinsics_range"]["fx"] == [579.0, 639.0]
         assert info["vendor"]["mounting"]["intrinsics_range"]["cx"] == [750.0, 850.0]
-        assert info["K"] is None and info["D"] is None
-        if camera == "camera_front":
-            assert info["source"] == "measured"
-            assert info["measured_on"] == "2026-11-07"
-            assert info["half_fov_rad"] == device.CAMERA_FRONT_HALF_FOV_RAD
-            # The point of the number: a consumer deriving a pinhole from it
-            # must land on the chessboard focal length (314.96 px at 640 wide),
-            # not on the 711 px the old 0.423 rad wall fit implied.
-            implied_fx = 320 / math.tan(info["half_fov_rad"])
-            assert abs(implied_fx - 314.96) < 0.5
-            estimate = info["vendor"]["mounting"]["fov_estimate"]
-            assert estimate["depth_semantics"] == "ray_range"
-            assert estimate["superseded"]["half_fov_rad"] == 0.423
-        else:
-            assert info["source"] == "unknown"
-            assert info["half_fov_rad"] is None
+        assert info["distortion_model"] == "pinhole"
+        assert info["K"][0] > 300 and info["D"] == [0.] * 5
+        assert info["source"] == "measured"
+        assert "deeprobotics/s10_pro/undistort" in info["pipeline"]
+        assert info["vendor"]["undistortion"]["state"] == "rectified"
 def test_actuator_start_surfaces_tls_reboot_requirement_to_frontend(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
@@ -348,6 +337,8 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
             pass
         def add_rtsp_camera(self, lane, url):
             self.rtsp_sources[lane] = url
+        def restart_rtsp_camera(self, lane):
+            pass
         def submit(self, lane, job):
             header, fields, bigendian, width, height, row_step, point_step, data = job
             packet = device.encode_pointcloud(fields, bigendian, width, height,
