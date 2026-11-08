@@ -1,0 +1,10 @@
+name: Samsung Galaxy Watch7 Bundle
+mcp_port: 15750
+ingress_port: 15751
+ingress_host: "0.0.0.0"
+ros_namespace: ""
+plugins:
+  heart_rate:
+    enabled: true
+  device_state:
+    enabled: true
