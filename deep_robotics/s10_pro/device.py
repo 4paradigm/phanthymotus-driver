@@ -857,11 +857,8 @@ class S10StatePlugin:
                 }, {})
                 settings = self.camera_undistortion.settings(name)
                 definition["configSchema"] = {"type": "object", "properties": {
-                    "undistort": {"type": "boolean", "title": "去畸变", "scope": "instance",
+                    "undistort": {"type": "boolean", "title": "广角畸变校正", "scope": "instance",
                                   "default": settings["undistort"]},
-                    "calibration": {"type": "object", "title": "Camera calibration",
-                                    "scope": "instance", "default": settings["calibration"],
-                                    "description": "{} 使用本相机内置标定；可填 width=640、height=360、K、D、distortion_model 覆盖。"},
                 }}
             definitions.append(definition)
         return definitions
