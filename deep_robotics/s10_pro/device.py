@@ -42,20 +42,42 @@ CAMERA_INTRINSICS_RANGE = {
     "source": "vendor-spec",
     "note": "Range only; K/D remain null until per-camera calibration at the published resolution.",
 }
-# Preliminary wall-fit estimate for the front visual-depth stream only. It is
-# intentionally marked manual: the test used a rough indoor wall and the
-# visual-depth output, not a per-camera checkerboard calibration.
-CAMERA_FRONT_HALF_FOV_RAD = 0.423
+# Front camera horizontal half-FOV from a chessboard calibration of this lens.
+#
+# It is the angle consistent with the measured focal length: a consumer that
+# derives a pinhole from it gets fx = 320 / tan(0.7926) = 315 px at 640x360,
+# which is the calibrated fx, so the mapping is right near the image centre
+# where an avoidance corridor is sampled. The raw stream is barrel-distorted
+# (k1 = -0.265), so its true edge rays are wider than this angle (about 54 deg
+# on the right; the left edge lies beyond the calibrated range) and no single
+# pinhole angle describes the whole frame. Geometry-sensitive consumers should
+# read the rectified output of the perception `undistort` card, which carries
+# the full K/D and rewrites this declaration.
+#
+# Replaces 0.423 rad, a rough wall fit on the visual_depth output that implied
+# fx = 711 px, 2.26x the measured value.
+CAMERA_FRONT_HALF_FOV_RAD = 0.7926
+CAMERA_FRONT_FOV_MEASURED_ON = "2026-11-07"
 CAMERA_FRONT_FOV_NOTE = {
     "half_fov_rad": CAMERA_FRONT_HALF_FOV_RAD,
-    "full_fov_deg": 48.5,
-    "source": "manual",
-    "confidence": "rough",
-    "measured_with": "measure_fov.py wall on /s10_pro/camera_front/visual_depth",
-    "sample_frames": 30,
+    "full_fov_deg": 90.8,
+    "source": "measured",
+    "confidence": "chessboard",
+    "measured_with": ("perception/tools/calibrate_chessboard.py on RTSP /video4 "
+                      "1024x576, 10x13 inner corners, 18 mm squares"),
+    "measured_on": CAMERA_FRONT_FOV_MEASURED_ON,
+    "frames_used": 103,
+    "rms_px": 0.213,
+    "derivation": "pinhole angle of the calibrated K at 640x360 (fx=314.96, cx=336.65)",
+    "raw_edges": ("barrel distortion k1=-0.265: true edge rays are wider than this "
+                  "angle; use the perception undistort card for full-frame geometry"),
     "depth_semantics": "ray_range",
     "lateral_projection": "sin(theta) * range; not tan(theta) * z_depth",
-    "note": "Preliminary estimate; replace after precise per-camera calibration.",
+    "superseded": {
+        "half_fov_rad": 0.423, "full_fov_deg": 48.5,
+        "method": "rough measure_fov.py wall fit on the visual_depth output",
+        "error": "implied fx 711 px, 2.26x the measured 315 px",
+    },
 }
 LIDAR_LANES = ("lidar_cloud", "lidar_map")
 PREFERRED_LIDAR_SOURCE = "/ALIGNED_POINTS"
@@ -843,7 +865,8 @@ class S10StatePlugin:
                     id=f"deeprobotics/s10_pro/{name}",
                     format="image/jpeg", width=640, height=360,
                     half_fov_rad=CAMERA_FRONT_HALF_FOV_RAD if name == "camera_front" else None,
-                    source="manual" if name == "camera_front" else "unknown",
+                    source="measured" if name == "camera_front" else "unknown",
+                    measured_on=CAMERA_FRONT_FOV_MEASURED_ON if name == "camera_front" else "",
                     vendor={"transport": "rtsp", "mounting": {
                         "frame_id": "body", "position_m": list(CAMERA_MOUNTS[name]),
                         "orientation_xyzw": None, "source": "vendor-spec",
@@ -887,7 +910,8 @@ class S10StatePlugin:
                     width=640,
                     height=360,
                     half_fov_rad=CAMERA_FRONT_HALF_FOV_RAD if name == "camera_front" else None,
-                    source="manual" if name == "camera_front" else "unknown",
+                    source="measured" if name == "camera_front" else "unknown",
+                    measured_on=CAMERA_FRONT_FOV_MEASURED_ON if name == "camera_front" else "",
                     vendor={
                         "mounting": {
                             "frame_id": "body",

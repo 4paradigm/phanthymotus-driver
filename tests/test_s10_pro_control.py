@@ -152,9 +152,17 @@ def test_s10_camera_info_exposes_vendor_body_mount_positions(monkeypatch):
         assert info["vendor"]["mounting"]["intrinsics_range"]["cx"] == [750.0, 850.0]
         assert info["K"] is None and info["D"] is None
         if camera == "camera_front":
-            assert info["source"] == "manual"
-            assert info["half_fov_rad"] == 0.423
-            assert info["vendor"]["mounting"]["fov_estimate"]["depth_semantics"] == "ray_range"
+            assert info["source"] == "measured"
+            assert info["measured_on"] == "2026-11-07"
+            assert info["half_fov_rad"] == device.CAMERA_FRONT_HALF_FOV_RAD
+            # The point of the number: a consumer deriving a pinhole from it
+            # must land on the chessboard focal length (314.96 px at 640 wide),
+            # not on the 711 px the old 0.423 rad wall fit implied.
+            implied_fx = 320 / math.tan(info["half_fov_rad"])
+            assert abs(implied_fx - 314.96) < 0.5
+            estimate = info["vendor"]["mounting"]["fov_estimate"]
+            assert estimate["depth_semantics"] == "ray_range"
+            assert estimate["superseded"]["half_fov_rad"] == 0.423
         else:
             assert info["source"] == "unknown"
             assert info["half_fov_rad"] is None
