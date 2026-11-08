@@ -22,6 +22,97 @@ def pcm(value, n=4000):
     return struct.pack("<" + "h" * n, *([value] * n))
 
 
+def test_manual_baseline_applies_without_quiet_calibration_and_recovers():
+    monitor = load().AudioMonitor(
+        baseline_mode="manual",
+        manual_baseline_dbfs=-40,
+        hold_s=0.5,
+        recover_s=0.5,
+    )
+    assert monitor.feed(pcm(500), 0) == []
+    assert monitor.read(0)["status"] == "normal"
+    assert monitor.read(0)["baseline_dbfs"] == -40
+    assert monitor.feed(pcm(2000), 0.25) == []
+    assert [e["event"] for e in monitor.feed(pcm(2000), 0.5)] == ["loud"]
+    assert monitor.feed(pcm(500), 0.75) == []
+    assert [e["event"] for e in monitor.feed(pcm(500), 1)] == ["recovered"]
+    assert monitor.read(1)["relative_db"] == pytest.approx(
+        20 * math.log10(500 / 32768) + 40
+    )
+
+
+def test_manual_baseline_partial_window_gap_and_invalid_data():
+    monitor = load().AudioMonitor(
+        baseline_mode="manual", manual_baseline_dbfs=-40, hold_s=0.5
+    )
+    monitor.feed(pcm(2000, 2000), 0)
+    assert monitor.read(0)["relative_db"] is None
+    assert monitor.read(0)["status"] == "unknown"
+    assert monitor.feed(pcm(2000, 2000), 0.125) == []
+    assert monitor.read(0.125)["relative_db"] is not None
+    assert monitor.feed(pcm(2000), 2) == []  # Gap resets pending entry.
+    with pytest.raises(ValueError):
+        monitor.feed(b"bad", 2.25)
+    assert monitor.read(2.25)["baseline_dbfs"] is None
+    assert monitor.read(2.25)["settings"]["manual_baseline_dbfs"] == -40
+    assert monitor.feed(pcm(2000), 2.5) == []
+    assert monitor.read(2.5)["baseline_dbfs"] == -40
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"baseline_mode": "other"},
+        {"manual_baseline_dbfs": True},
+        {"manual_baseline_dbfs": float("nan")},
+        {"manual_baseline_dbfs": -91},
+        {"manual_baseline_dbfs": 1},
+        {"baseline_mode": "manual", "manual_baseline_dbfs": -5},
+    ],
+)
+def test_invalid_manual_baselines_are_rejected(settings):
+    with pytest.raises(ValueError):
+        load().AudioMonitor(**settings)
+
+
+def test_card_can_adjust_manual_baseline_then_return_to_auto_live():
+    from types import SimpleNamespace as NS
+
+    node, clock = FakeNode(), [0]
+    card = load().AudioEnvironmentPlugin(
+        {"calibration_s": 0.25, "hold_s": 0.25},
+        "test",
+        FakeExecutor(),
+        runtime=lambda: (node, object, lambda: NS(data=""), 10),
+        clock=lambda: clock[0],
+    )
+    schema = card.get_tool()["configSchema"]["properties"]
+    assert schema["baseline_mode"]["default"] == "auto"
+    assert card.dispatch("start", {"input_topic": "/mic"})["state"] == "running"
+    assert card.dispatch(
+        "config", {"baseline_mode": "manual", "manual_baseline_dbfs": -40}
+    )["ok"]
+    node.input(NS(format="audio/pcm-16k", data=pcm(2000)))
+    assert card.dispatch("read", {})["status"] == "loud"
+    assert card.dispatch("calibrate", {})["ok"] is False
+    assert card.dispatch("config", {"manual_baseline_dbfs": -5})["ok"] is False
+    assert card.dispatch("read", {})["baseline_dbfs"] == -40
+    assert card.dispatch("config", {"manual_baseline_dbfs": -30})["ok"]
+    clock[0] = 0.25
+    node.input(NS(format="audio/pcm-16k", data=pcm(2000)))
+    assert card.dispatch("read", {})["status"] == "normal"
+    assert card.dispatch("read", {})["baseline_dbfs"] == -30
+    assert card.dispatch("config", {"baseline_mode": "auto"})["ok"]
+    assert card.dispatch("read", {})["baseline_dbfs"] is None
+    clock[0] = 0.5
+    node.input(NS(format="audio/pcm-16k", data=pcm(1000)))
+    assert card.dispatch("read", {})["baseline_dbfs"] == pytest.approx(
+        20 * math.log10(1000 / 32768)
+    )
+    assert not node.destroyed
+    card.stop()
+
+
 def test_absolute_above_threshold_is_strict_held_and_recovers_once():
     boundary = 20 * math.log10(1000 / 32768)
     monitor = load().AudioMonitor(

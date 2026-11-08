@@ -85,7 +85,25 @@ def main():
                 "threshold_cleared",
             ], events
             assert events[-1]["comparison"] == comparison
-        assert [e["sequence"] for e in events] == list(range(1, 7))
+        response = card.dispatch(
+            "config",
+            {
+                "mode": "relative",
+                "baseline_mode": "manual",
+                "manual_baseline_dbfs": -40,
+            },
+        )
+        assert response["ok"] and response["state"] == "running", response
+        for level in [100] * 2 + [2000] * 3 + [100] * 3:
+            msg = AudioChunk()
+            msg.header.stamp = peer.get_clock().now().to_msg()
+            msg.format = "audio/pcm-16k"
+            msg.data = list(struct.pack("<4000h", *([level] * 4000)))
+            pub.publish(msg)
+            spin(0.25)
+        assert [e["event"] for e in events[-2:]] == ["loud", "recovered"]
+        assert card.dispatch("read", {})["baseline_dbfs"] == -40
+        assert [e["sequence"] for e in events] == list(range(1, 9))
         spin(2.3)
         assert states[-1]["status"] == "unknown" and states[-1]["rms"] is None
         card.stop()

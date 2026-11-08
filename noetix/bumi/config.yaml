@@ -41,6 +41,8 @@ plugins:
   audio_environment:
     enabled: true
     mode: relative           # relative (existing behavior) or threshold (fixed dBFS)
+    baseline_mode: auto       # auto quiet sampling, or manual (relative mode only)
+    manual_baseline_dbfs: -40.0 # used only with relative + manual; not acoustic dB SPL
     threshold_dbfs: -20.0     # digital signal level, not acoustic dB SPL
     comparison: above        # above: > threshold; below: < threshold
     hysteresis_db: 3.0        # recovery margin; below threshold + margin must be <= 0

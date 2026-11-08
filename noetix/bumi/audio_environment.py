@@ -23,6 +23,8 @@ class AudioMonitor:
         threshold_dbfs=-20,
         comparison="above",
         hysteresis_db=3,
+        baseline_mode="auto",
+        manual_baseline_dbfs=-40,
     ):
         values = (calibration_s, hold_s, recover_s, rise_db, fall_db)
         if any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
@@ -53,6 +55,26 @@ class AudioMonitor:
             raise ValueError("below-mode recovery threshold must not exceed 0 dBFS")
         self.mode, self.threshold_dbfs = mode, threshold_dbfs
         self.comparison, self.hysteresis_db = comparison, hysteresis_db
+        if baseline_mode not in ("auto", "manual"):
+            raise ValueError("baseline_mode must be auto or manual")
+        if (
+            type(manual_baseline_dbfs) not in (int, float)
+            or not math.isfinite(manual_baseline_dbfs)
+            or not -90 <= manual_baseline_dbfs <= 0
+        ):
+            raise ValueError(
+                "manual baseline must be a finite value from -90 to 0 dBFS"
+            )
+        if (
+            mode == "relative"
+            and baseline_mode == "manual"
+            and manual_baseline_dbfs + rise_db > 0
+        ):
+            raise ValueError("manual baseline plus rise_db must not exceed 0 dBFS")
+        self.baseline_mode, self.manual_baseline_dbfs = (
+            baseline_mode,
+            manual_baseline_dbfs,
+        )
         self.sequence = 0
         self.reset()
 
@@ -69,13 +91,19 @@ class AudioMonitor:
                 "threshold_dbfs",
                 "comparison",
                 "hysteresis_db",
+                "baseline_mode",
+                "manual_baseline_dbfs",
             )
         }
 
     def reset(self):
         self.metrics = dict(rms=None, peak=None, rms_dbfs=None, clip_ratio=None)
         self.status = "unknown"
-        self.baseline = None
+        self.baseline = (
+            self.manual_baseline_dbfs
+            if self.mode == "relative" and self.baseline_mode == "manual"
+            else None
+        )
         self.levels = []
         self.last = None
         self.pending = 0
@@ -156,6 +184,8 @@ class AudioMonitor:
                             )
                         )
                     continue
+                if self.status == "unknown" and self.baseline_mode == "manual":
+                    self.status = "normal"
                 if self.baseline is None:
                     self.status = "calibrating"
                     self.levels.append(level)
@@ -198,7 +228,7 @@ class AudioMonitor:
             baseline_dbfs=self.baseline if fresh else None,
             relative_db=(
                 (max(-90, db if db is not None else -90) - self.baseline)
-                if fresh and self.baseline is not None
+                if fresh and self.baseline is not None and metrics["rms"] is not None
                 else None
             ),
             window_s=0.25,
@@ -238,6 +268,8 @@ class AudioEnvironmentPlugin:
             "threshold_dbfs",
             "comparison",
             "hysteresis_db",
+            "baseline_mode",
+            "manual_baseline_dbfs",
         )
         self.monitor = AudioMonitor(**{k: config[k] for k in keys if k in config})
         self.executor, self.runtime, self.clock = executor, runtime, clock
@@ -260,6 +292,8 @@ class AudioEnvironmentPlugin:
             "calibration_s": "背景校准时间（秒）",
             "rise_db": "相对增强阈值（dB）",
             "fall_db": "相对恢复阈值（dB）",
+            "baseline_mode": "背景基线来源（相对模式）",
+            "manual_baseline_dbfs": "手动背景基线（dBFS）",
         }
         properties = {
             key: dict(type="number", default=value, title=labels[key], scope="shared")
@@ -269,7 +303,7 @@ class AudioEnvironmentPlugin:
             type="string",
             enum=["relative", "threshold"],
             oneOf=[
-                {"const": "relative", "title": "相对安静背景（原有模式）"},
+                {"const": "relative", "title": "相对背景基线"},
                 {"const": "threshold", "title": "固定 dBFS 界限"},
             ],
         )
@@ -280,6 +314,20 @@ class AudioEnvironmentPlugin:
                 {"const": "above", "title": "大于界限触发"},
                 {"const": "below", "title": "小于界限触发"},
             ],
+        )
+        properties["baseline_mode"].update(
+            type="string",
+            enum=["auto", "manual"],
+            oneOf=[
+                {"const": "auto", "title": "自动采集安静背景"},
+                {"const": "manual", "title": "手动输入背景基线"},
+            ],
+            description="仅相对模式生效。手动基线不需要等待安静采样。",
+        )
+        properties["manual_baseline_dbfs"].update(
+            minimum=-90,
+            maximum=0,
+            description="仅相对模式+手动基线生效，不是声压分贝；该值加 rise_db 不能超过 0 dBFS。",
         )
         for key in ("calibration_s", "hold_s", "recover_s"):
             properties[key].update(minimum=0.25, maximum=60)
@@ -295,6 +343,13 @@ class AudioEnvironmentPlugin:
         )
         for key in ("rise_db", "fall_db"):
             properties[key].update(minimum=0, maximum=60)
+        properties["rise_db"].update(
+            exclusiveMinimum=0,
+            description="相对模式：当前电平达到或超过基线加此增量时开始触发计时。须大于 fall_db。",
+        )
+        properties["fall_db"].update(
+            description="相对模式：响亮状态下，电平回落到基线加此增量或更低时开始恢复计时。须小于 rise_db。"
+        )
         return dict(
             name="audio_environment",
             type="processor",
@@ -425,6 +480,12 @@ class AudioEnvironmentPlugin:
                         "ok": False,
                         "state": "error",
                         "message": "Fixed dBFS mode needs no baseline calibration",
+                    }
+                if self.monitor.baseline_mode == "manual":
+                    return {
+                        "ok": False,
+                        "state": "error",
+                        "message": "Manual baseline is configured; select baseline_mode=auto to calibrate",
                     }
                 self.monitor.reset()
                 self.error = ""

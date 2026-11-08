@@ -53,14 +53,45 @@ after recreating a driver verify `read.settings` before treating it as configure
 Default `mode=relative` preserves the original behavior described below. Neither
 mode saves raw audio or calibrates physical sound pressure.
 
+## Adjustable relative-mode baseline
+
+The background baseline is an absolute digital RMS level in **dBFS**. `rise_db`
+and `fall_db` are **dB differences from that baseline**, not baseline values.
+In PM configuration choose `baseline_mode=auto` (default) to collect the median
+of quiet calibration-window levels, or `manual` to enter `manual_baseline_dbfs`.
+The manual field defaults to -40 dBFS but is unused while auto is selected.
+Manual baseline range is -90 to 0 dBFS, matching the relative comparator's
+-90 dBFS floor; baseline plus `rise_db` must not exceed 0 dBFS.
+
+For a manual baseline of -40 dBFS, `rise_db=12` and `fall_db=6`:
+
+- Level **at or above -28 dBFS** for `hold_s` (default 2 seconds of valid audio)
+  enters `loud` once.
+- While loud, level **at or below -34 dBFS** for `recover_s` (default 2 seconds)
+  emits `recovered` once.
+- The -34 to -28 dBFS band prevents rapid repeated transitions.
+
+```json
+{"name":"audio_environment","arguments":{"action":"config","mode":"relative","baseline_mode":"manual","manual_baseline_dbfs":-40,"rise_db":12,"fall_db":6,"hold_s":2,"recover_s":2}}
+```
+
+Manual mode skips quiet sampling. Changing the baseline takes effect on new
+audio, resets pending detection and retains event sequence numbers. Stop, gaps
+and invalid packets clear observations; manual settings remain available for
+the next valid input. `calibrate` rejects manual mode instead of overwriting
+the chosen baseline; switch back to auto to collect a new quiet baseline.
+With no complete window, `relative_db` remains null even if the manual baseline
+is configured. In threshold mode both baseline settings are unused.
+
 ## Canvas
 
 Connect `mic` (or an existing mono PCM16k source) to `audio_environment`.
 Connect **events** to Decision Core; use **state** for the dashboard. Sending
 the 4 Hz state stream to the model creates unnecessary model traffic.
 
-Start with the room quiet for five seconds. `calibrate` discards the current
-baseline and collects a new one. `read`/`info` report state without consuming
+In relative/auto mode, start with the room quiet for five seconds of valid audio.
+`calibrate` discards the current auto baseline and collects a new one.
+`read`/`info` report state without consuming
 events; `stop` releases this Card's ROS node, subscription and timer and clears
 its measurements. It never stops the microphone or other subscribers.
 
