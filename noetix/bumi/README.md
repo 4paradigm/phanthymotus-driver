@@ -306,6 +306,48 @@ nothing, therefore we have hit something") fire on every step. So:
 `pose` is `null` and `pose_drift` is `none` for the same reason: there is no
 position to report, which is a different statement from a position that drifts.
 
+### `clock` — 时间查询、倒计时与提醒
+
+Self-contained card for the interaction flows the first release needs: query the
+current local time and weekday, compute how long remains until a target, and
+schedule one-shot, daily or weekly reminders. It needs neither the Noetix SDK
+nor the camera, so it keeps working when those Cards are unavailable.
+
+Actions:
+
+| Action | Parameters | Result |
+|--------|-----------|--------|
+| `now` | — | Local year/month/day, hour/minute/second, ISO timestamp and weekday |
+| `weekday` | — | Today's weekday only |
+| `until` | `time` | Signed interval to a target ISO-8601 timestamp |
+| `countdown` | `time` or `id` | Countdown to a target, or to an existing reminder |
+| `create` | `content`, `time` / `time_of_day`, `repeat`, `weekday` | Writes the reminder into the card's scheduler and returns its ID |
+| `list` | — | Pending reminders by due time, followed by fired ones |
+| `cancel` | `id` | Removes the reminder |
+| `update` | `id`, plus any scheduling field | Changes content or schedule; fired reminders cannot be updated |
+
+`repeat` is `none` (default, one-shot), `daily` or `weekly`. A one-shot reminder
+needs `time`; a daily one needs `time_of_day` (`HH:MM[:SS]`); a weekly one needs
+`weekday` (1 = Monday … 7 = Sunday) and `time_of_day`. Accepts ordinary weekday
+names too. A timestamp without an offset is interpreted in the robot's local
+timezone.
+
+The scheduler is a 0.5 s thread inside the driver. When a reminder is due, the
+card publishes one JSON event on `/<namespace>/clock/reminder` (format
+`data/json`):
+
+```json
+{"type": "reminder", "id": "rmd_1a2b3c4d", "content": "吃药",
+ "repeat": "none", "due_at": "2026-11-09T09:30:00+08:00",
+ "late_seconds": 0.0, "fired_count": 1}
+```
+
+One-shot reminders move to state `fired`; daily/weekly reminders reschedule to
+their next occurrence, including after a driver restart. Reminders live in
+`/opt/phanthy-motus/data/bumi/reminders.json` and are written atomically, so
+they survive container replacement. After downtime only one event is published
+per recurring reminder, not one per missed occurrence.
+
 ### `loco_servo` — 底盘的流式速度控制
 
 订阅一路 `motus.control/1` 的 **twist**（6 维 `[vx, vy, vz, wx, wy, wz]`，机体系，
