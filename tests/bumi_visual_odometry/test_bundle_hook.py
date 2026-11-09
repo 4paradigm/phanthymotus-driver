@@ -30,7 +30,8 @@ def _load_device(monkeypatch):
 def capture(monkeypatch):
     device = _load_device(monkeypatch)
     state = NS(iterations=0, frame_limit=1, published={}, stopped=False,
-               aligned=False, streams=[], alignment=[], spin_calls=0)
+               aligned=False, streams=[], alignment=[], spin_calls=0,
+               depth_scale=.001, scale_error=None)
     raw = NS(color=b'BGR', depth=b'\x01\x00\x02\x00')
 
     class Pixels:
@@ -63,9 +64,16 @@ def capture(monkeypatch):
         def get_active_profile(self):
             intr = NS(width=640, height=480, fx=600., fy=601., ppx=320., ppy=240.,
                       model='distortion.brown_conrady', coeffs=[0.]*5)
+
+            def get_depth_scale():
+                if state.scale_error is not None:
+                    raise state.scale_error
+                return state.depth_scale
+
             return NS(get_stream=lambda stream: NS(
                 as_video_stream_profile=lambda: NS(intrinsics=intr)),
-                get_device=lambda: NS(first_depth_sensor=lambda: NS(get_depth_scale=lambda: .001)))
+                get_device=lambda: NS(first_depth_sensor=lambda: NS(
+                    get_depth_scale=get_depth_scale)))
 
         def wait_for_frames(self, timeout_ms):
             state.iterations += 1
@@ -241,6 +249,67 @@ def test_capture_timed_depth_failure_falls_back_to_legacy_publish(capture, monke
     assert len(state.published['/robot/camera/depth']) == 2
     # The fallback is the legacy contract byte-for-byte: navi keeps decoding.
     assert zlib.decompress(state.published['/robot/camera/depth'][0].data) == b'\x01\x00\x02\x00'
+
+
+def test_depth_fallback_applies_the_sdk_scale_when_the_publisher_fails(
+        capture, monkeypatch):
+    """The fallback publishes the declared millimetre payload, not raw units.
+
+    On a camera whose SDK depth scale is not 1 mm, publishing the raw Z16
+    values under the depth card's `depth_unit=mm` declaration would make every
+    range/point-cloud decision systematically wrong on the error path. The
+    fallback therefore applies the same scale and quantization as the normal
+    path.
+    """
+    device, state = capture
+    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
+    state.depth_scale = .002
+
+    class Mapper:
+        def __init__(self, scale):
+            assert scale == .002
+
+    class CaptureTimed:
+        def __init__(self, *args):
+            pass
+
+        def publish(self, source, aligned, *, fallback_stamp_ns=None):
+            raise ValueError('invalid capture timestamp')
+
+    monkeypatch.setitem(sys.modules, 'visual_inputs',
+                        NS(CaptureTimeMapper=Mapper, CaptureTimedDepthPublisher=CaptureTimed))
+    device._camera_subprocess('robot')
+    published = state.published['/robot/camera/depth']
+    assert len(published) == 1
+    assert published[0].format == '16UC1; compressedDepth zlib'
+    # raw z16 values 1, 2 -> 2 mm, 4 mm at a 0.002 depth scale.
+    assert zlib.decompress(published[0].data) == b'\x02\x00\x04\x00'
+
+
+def test_depth_fallback_applies_the_sdk_scale_without_the_capture_time_module(
+        capture, monkeypatch):
+    device, state = capture
+    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
+    state.depth_scale = .002
+    monkeypatch.setitem(sys.modules, 'visual_inputs', None)
+    device._camera_subprocess('robot')
+    assert state.published['/robot/camera/color']
+    published = state.published['/robot/camera/depth']
+    assert len(published) == 1
+    assert zlib.decompress(published[0].data) == b'\x02\x00\x04\x00'
+
+
+def test_depth_stream_is_disabled_when_the_sdk_scale_is_unavailable(
+        capture, monkeypatch, capsys):
+    device, state = capture
+    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
+    state.scale_error = RuntimeError('no depth sensor')
+    device._camera_subprocess('robot')
+    # Media production continues; a depth stream with unknown units is not
+    # published under the millimetre declaration.
+    assert state.published['/robot/camera/color']
+    assert state.published['/robot/camera/depth'] == []
+    assert 'SDK depth scale unavailable; depth stream disabled' in capsys.readouterr().out
 
 
 def test_depth_card_declares_one_capture_timed_output(capture, monkeypatch):

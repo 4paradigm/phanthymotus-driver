@@ -2304,6 +2304,39 @@ class SpeakerPlugin:
 
 # ── CameraPlugin (sensor, subprocess) ────────────────────────────────────────
 
+def _depth_millimetre_bytes(raw, depth_scale):
+    """The declared depth payload: little-endian uint16 millimetres.
+
+    Used by the camera subprocess fallback when the capture-timed publisher is
+    unavailable or fails. It must apply the SDK ``depth_scale`` itself:
+    publishing raw sensor units under the card's ``depth_unit=mm`` declaration
+    is only correct on a 1 mm sensor scale, and on the error path a wrong unit
+    would make every range decision systematically off. NumPy is used when
+    available; the pure-Python path keeps the fallback honest even when the
+    optional visual-inputs module (and therefore its NumPy conversion) is the
+    thing that failed.
+    """
+    try:
+        import numpy as np
+        pixels = np.frombuffer(bytes(raw), dtype='<u2')
+        millimetres = np.rint(pixels.astype(np.float64) * (depth_scale * 1000.))
+        millimetres[(millimetres < 1) | (millimetres > 65535) | ~np.isfinite(millimetres)] = 0
+        return np.ascontiguousarray(millimetres.astype('<u2')).tobytes()
+    except Exception:                                          # noqa: BLE001
+        pass
+    data = bytes(raw)
+    out = bytearray(len(data))
+    scale = depth_scale * 1000.
+    for index in range(0, len(data)-1, 2):
+        value = data[index] | (data[index+1] << 8)
+        millimetres = int(round(value * scale))
+        if not 1 <= millimetres <= 65535:
+            millimetres = 0
+        out[index] = millimetres & 0xFF
+        out[index+1] = millimetres >> 8
+    return bytes(out)
+
+
 def _camera_subprocess(namespace: str):
     """Camera subprocess — captures Realsense D435i color+depth, publishes to ROS2."""
     # Match the Q5 camera worker's child-process logging protection.
@@ -2419,19 +2452,28 @@ def _camera_subprocess(namespace: str):
 
     # Capture-timed depth is the depth card's one output. It shares this
     # pipeline and the clock mapping with the optional VO raw branch; a fault
-    # here must never take media production down, so construction and every
-    # publish are wrapped and a failure only falls back to the legacy
-    # publication-time stamp for that frame.
+    # here must never take media production down. The fallback still publishes
+    # scaled millimetres with an arrival stamp, so a failure changes the
+    # timestamp provenance, never the declared unit.
     depth_stream = None
     shared_time_mapper = None
+    depth_scale = None
     try:
-        from visual_inputs import CaptureTimeMapper, CaptureTimedDepthPublisher
         depth_scale = pipeline.get_active_profile().get_device().first_depth_sensor().get_depth_scale()
-        shared_time_mapper = CaptureTimeMapper(depth_scale)
-        depth_stream = CaptureTimedDepthPublisher(depth_pub, namespace, shared_time_mapper)
     except Exception as _e:
-        print(f"[camera_subprocess] capture-timed depth unavailable, "
-              f"publishing legacy depth: {_e}", flush=True)
+        # Without the SDK scale the fallback cannot honour the declared uint16
+        # millimetre payload; disable the depth stream rather than publish
+        # mislabelled units.
+        print(f"[camera_subprocess] SDK depth scale unavailable; "
+              f"depth stream disabled: {_e}", flush=True)
+    if depth_scale is not None:
+        try:
+            from visual_inputs import CaptureTimeMapper, CaptureTimedDepthPublisher
+            shared_time_mapper = CaptureTimeMapper(depth_scale)
+            depth_stream = CaptureTimedDepthPublisher(depth_pub, namespace, shared_time_mapper)
+        except Exception as _e:
+            print(f"[camera_subprocess] capture-timed depth unavailable, "
+                  f"using the scaled fallback publish: {_e}", flush=True)
 
     raw_inputs = None
     raw_publish_failures = 0
@@ -2480,6 +2522,7 @@ def _camera_subprocess(namespace: str):
     t_start = _time.monotonic()
     capture_time_failures = 0
     depth_publish_failures = 0
+    depth_encode_failures = 0
     try:
         while True:
             # The camera node owns the raw_enabled subscription. This is a
@@ -2505,7 +2548,7 @@ def _camera_subprocess(namespace: str):
                 color_pub.publish(msg)
 
             depth_frame = frames.get_depth_frame()
-            if depth_frame:
+            if depth_frame and depth_scale is not None:
                 published = False
                 if depth_stream is not None:
                     try:
@@ -2517,25 +2560,33 @@ def _camera_subprocess(namespace: str):
                             capture_time_failures += 1
                             if capture_time_failures == 1 or capture_time_failures % 100 == 0:
                                 print(f"[camera_subprocess] depth capture time unavailable, "
-                                      f"legacy stamp used (failure #{capture_time_failures})",
+                                      f"arrival stamp used (failure #{capture_time_failures})",
                                       flush=True)
                     except Exception as _e:
                         # A bug in the capture-time path must cost the mapping,
-                        # not the depth frame: publish the legacy bytes below.
+                        # not the depth frame: fall back to scaled millimetres
+                        # with the arrival stamp below.
                         depth_publish_failures += 1
                         if depth_publish_failures == 1 or depth_publish_failures % 100 == 0:
                             print(f"[camera_subprocess] capture-timed depth failed, "
-                                  f"legacy publish used (failure #{depth_publish_failures}): "
+                                  f"scaled fallback used (failure #{depth_publish_failures}): "
                                   f"{' '.join(str(_e).split())[:300]}", flush=True)
                 if not published:
-                    depth_image = _np.asanyarray(depth_frame.get_data())
-                    import zlib as _zlib
-                    compressed = _zlib.compress(depth_image.tobytes(), 1)
-                    msg = _CompressedImage()
-                    msg.header.stamp = node.get_clock().now().to_msg()
-                    msg.format = "16UC1; compressedDepth zlib"
-                    msg.data = array('B', compressed)
-                    depth_pub.publish(msg)
+                    try:
+                        payload = _depth_millimetre_bytes(depth_frame.get_data(), depth_scale)
+                    except Exception as _e:
+                        depth_encode_failures += 1
+                        if depth_encode_failures == 1 or depth_encode_failures % 100 == 0:
+                            print(f"[camera_subprocess] depth payload encode failed, frame "
+                                  f"not published (failure #{depth_encode_failures}): "
+                                  f"{' '.join(str(_e).split())[:300]}", flush=True)
+                    else:
+                        import zlib as _zlib
+                        msg = _CompressedImage()
+                        msg.header.stamp = node.get_clock().now().to_msg()
+                        msg.format = "16UC1; compressedDepth zlib"
+                        msg.data = array('B', _zlib.compress(payload, 1))
+                        depth_pub.publish(msg)
 
             if raw_inputs is not None and getattr(raw_inputs, 'enabled', True):
                 try:
