@@ -853,8 +853,9 @@ class S10StatePlugin:
                 definition["inputSchema"] = action_schema({
                     "start": ([], "开始相机图像流"), "stop": ([], "停止卡片"),
                     "info": ([], "相机参数和去畸变状态"),
-                    "config": ([], "修改本相机去畸变设置；修改后重启下游视觉卡"),
-                }, {})
+                    "config": (["undistort"], "修改本相机去畸变设置；修改后重启下游视觉卡"),
+                }, {"undistort": {"type": "boolean",
+                                  "description": "广角畸变校正：true 开启，false 关闭"}})
                 settings = self.camera_undistortion.settings(name)
                 definition["configSchema"] = {"type": "object", "properties": {
                     "undistort": {"type": "boolean", "title": "广角畸变校正", "scope": "instance",

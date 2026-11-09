@@ -1,9 +1,9 @@
 """Per-camera lens undistortion for the S10 Pro RTSP cameras.
 
-Each camera card carries an `undistort` option (on by default) and an optional
-`calibration` override. When undistortion is active the lane's FFmpeg command
-gains a `remap` stage, so the JPEG published on the camera topic is already
-rectified and the card declares the rectified geometry (`pinhole`, the
+Each camera card carries an `undistort` option (on by default). The per-camera
+calibration is the built-in table below. When undistortion is active the lane's
+FFmpeg command gains a `remap` stage, so the JPEG published on the camera topic
+is already rectified and the card declares the rectified geometry (`pinhole`, the
 calibrated K, zero D). Downstream cards need nothing extra: they read K from the
 declaration as they would for any camera.
 
@@ -39,8 +39,8 @@ PIPELINE_STAGE = "deeprobotics/s10_pro/undistort"
 # Calibrated on the 1024x576 RTSP streams (10x13 inner corners, 18 mm squares,
 # robot standing) with tools/calibrate_chessboard.py and scaled to the 640x360
 # the driver publishes (K x 0.625, D unchanged). The id is per model, not per
-# unit, so these are the default for every S10 Pro; a camera card's
-# `calibration` override replaces its row for one robot.
+# unit, so these are the calibration used for every S10 Pro. A new measurement
+# replaces a row here (tools/calibrate_chessboard.py writes one).
 CALIBRATIONS = {
     "deeprobotics/s10_pro/camera_front": {
         "id": "deeprobotics/s10_pro/camera_front",
@@ -321,7 +321,7 @@ class CameraUndistortion:
         self.map_dir = Path(map_dir or os.environ.get("S10_CAMERA_UNDISTORT_MAPS", DEFAULT_MAP_DIR))
         self.on_change = on_change
         self._lock = threading.RLock()
-        self._settings = {lane: {"undistort": True, "calibration": {}} for lane in self.lanes}
+        self._settings = {lane: {"undistort": True} for lane in self.lanes}
         self._runtime = {lane: self._fresh_runtime() for lane in self.lanes}
         self.persist_error = None
         self._generations = {lane: 0 for lane in self.lanes}
@@ -367,28 +367,29 @@ class CameraUndistortion:
             print(f"[camera-undistort] {self.persist_error}; setting kept in memory", flush=True)
 
     def _normalize(self, lane, values):
+        # Only `undistort` is a setting. Anything else in a saved file (for
+        # example a calibration written by an earlier build) is ignored on load,
+        # and rejected in `configure` so a client is never told it took effect.
         enabled = values.get("undistort", True)
         if not isinstance(enabled, bool):
             raise ValueError("undistort must be true or false")
-        calibration = values.get("calibration", {})
-        if not isinstance(calibration, dict):
-            raise ValueError("calibration must be an object; {} selects the built-in calibration")
-        if calibration:
-            calibration = validate(calibration, lane)
-        return {"undistort": enabled, "calibration": calibration}
+        return {"undistort": enabled}
 
     def settings(self, lane):
         with self._lock:
             return copy.deepcopy(self._settings[lane])
 
     def configure(self, lane, values):
-        """Apply `undistort` / `calibration` from a card call. Returns True when
-        something changed. Invalid values raise ValueError and change nothing."""
+        """Apply the `undistort` switch from a card call. Returns True when it
+        changed. Unknown settings and invalid values raise ValueError and change
+        nothing."""
+        unknown = sorted(set(values) - {"undistort"})
+        if unknown:
+            raise ValueError(f"unsupported camera setting: {', '.join(unknown)}; "
+                             "the only setting is undistort (true/false)")
         with self._lock:
             current = self._settings[lane]
-            merged = {key: values[key] if key in values else current[key]
-                      for key in ("undistort", "calibration")}
-            updated = self._normalize(lane, merged)
+            updated = self._normalize(lane, {**current, **values})
             if updated == current:
                 return False
             self._settings[lane] = updated
@@ -418,10 +419,6 @@ class CameraUndistortion:
 
     def calibration(self, lane):
         """(calibration, source) or (None, reason)."""
-        with self._lock:
-            override = self._settings[lane]["calibration"]
-        if override:
-            return copy.deepcopy(override), "manual"
         row = CALIBRATIONS.get(camera_id(lane))
         if row is None:
             return None, f"no calibration for {camera_id(lane)}"

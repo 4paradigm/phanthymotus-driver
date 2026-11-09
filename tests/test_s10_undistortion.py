@@ -29,7 +29,7 @@ def test_map_matches_opencv(ident):
     assert np.max(abs(y.astype(float) - expected_y)) <= 0.501
 
 
-def test_per_lane_settings_persist_and_invalid_override_is_atomic(controller):
+def test_per_lane_settings_persist_and_rejected_settings_change_nothing(controller):
     changed = []
     controller.on_change = changed.append
     assert controller.active('camera_front')
@@ -40,9 +40,22 @@ def test_per_lane_settings_persist_and_invalid_override_is_atomic(controller):
     loaded = u.CameraUndistortion(controller.lanes, config_path=controller.config_path)
     assert not loaded.active('camera_front')
     before = controller.config_path.read_bytes()
-    with pytest.raises(ValueError):
-        controller.configure('camera_rear', {'calibration': {'K': [1]}})
+    generation = controller.generation('camera_rear')
+    for bad in ({'calibration': {'K': [1]}}, {'undistort': 'yes'}, {'unknown': 1}):
+        with pytest.raises(ValueError):
+            controller.configure('camera_rear', bad)
     assert controller.config_path.read_bytes() == before
+    assert controller.generation('camera_rear') == generation
+    assert changed == ['camera_front']
+
+
+def test_saved_calibration_from_an_earlier_build_is_ignored(tmp_path):
+    path = tmp_path / 'settings.json'
+    path.write_text(json.dumps({'version': 1, 'cameras': {
+        'camera_front': {'undistort': True, 'calibration': {'K': [1]}}}}))
+    loaded = u.CameraUndistortion(('camera_front',), config_path=path)
+    assert loaded.settings('camera_front') == {'undistort': True}
+    assert loaded.calibration('camera_front')[1] == 'table:' + u.camera_id('camera_front')
 
 
 @pytest.mark.parametrize('model,coefficients', [
@@ -50,7 +63,8 @@ def test_per_lane_settings_persist_and_invalid_override_is_atomic(controller):
     ('rational_polynomial', [-.2, .03, 0., 0., 0., .01, 0., 0.]),
     ('equidistant', [.01, -.001, 0., 0.]),
 ])
-def test_override_models_match_opencv(model, coefficients):
+def test_every_supported_model_matches_opencv(model, coefficients):
+    """The table only holds plumb_bob rows today; another lens may need the others."""
     cv2 = pytest.importorskip('cv2')
     cal = dict(u.CALIBRATIONS['deeprobotics/s10_pro/camera_front'],
                distortion_model=model, D=coefficients)
@@ -64,7 +78,7 @@ def test_override_models_match_opencv(model, coefficients):
     assert np.max(abs(y[valid].astype(float) - ey[valid])) <= .501
 
 
-def test_declaration_tracks_switch_and_manual_override(controller):
+def test_declaration_tracks_the_switch(controller):
     from common.camera_info import build
     lane = 'camera_front'
     declared = controller.declaration(lane)
@@ -74,16 +88,13 @@ def test_declaration_tracks_switch_and_manual_override(controller):
     assert info['D'] == [0.] * 5
     assert info['half_fov_rad'] == pytest.approx(0.7926, abs=.001)
     assert u.PIPELINE_STAGE in info['pipeline']
+    assert controller.status(lane)['calibration_source'] == 'table:' + u.camera_id(lane)
     controller.configure(lane, {'undistort': False})
     assert 'K' not in controller.declaration(lane)
-    cal = dict(u.CALIBRATIONS[u.camera_id(lane)])
-    cal['K'] = [300, 0, 320, 0, 300, 180, 0, 0, 1]
-    controller.configure(lane, {'undistort': True, 'calibration': cal})
-    assert controller.declaration(lane)['K'][0] == 300
-    assert controller.status(lane)['calibration_source'] == 'manual'
+    assert controller.declaration(lane)['undistortion']['state'] == 'raw'
 
 
-def test_camera_card_config_and_info_use_same_geometry(controller, monkeypatch):
+def _camera_card(controller, monkeypatch):
     import importlib.util
     from types import SimpleNamespace
     driver = Path(__file__).parents[1] / 'deep_robotics' / 's10_pro'
@@ -93,7 +104,11 @@ def test_camera_card_config_and_info_use_same_geometry(controller, monkeypatch):
     spec.loader.exec_module(module)
     nodes = SimpleNamespace(camera_undistortion=controller, topics={
         lane: {'topic': '/' + lane, 'format': 'image/jpeg'} for lane in controller.lanes})
-    plugin = module.S10StatePlugin(SimpleNamespace(start=lambda: None), nodes)
+    return module.S10StatePlugin(SimpleNamespace(start=lambda: None), nodes)
+
+
+def test_camera_card_config_and_info_use_same_geometry(controller, monkeypatch):
+    plugin = _camera_card(controller, monkeypatch)
     before = {t['name']: t for t in plugin.get_tools()}
     assert before['camera_front']['configSchema']['properties']['undistort']['default'] is True
     result = plugin.dispatch('config', {'_tool_name': 'camera_front', 'undistort': False})
@@ -104,6 +119,29 @@ def test_camera_card_config_and_info_use_same_geometry(controller, monkeypatch):
                                         'config': {'undistort': True}})
     assert result['camera_info'][0]['K'][0] == pytest.approx(314.963248)
     assert plugin.dispatch('info', {'_tool_name': 'camera_front'})['camera_info'] == result['camera_info']
+
+
+@pytest.mark.parametrize('lane', ['camera_front', 'camera_rear', 'camera_left', 'camera_right'])
+def test_camera_card_schema_declares_exactly_what_the_card_accepts(controller, monkeypatch, lane):
+    """The advertised surface and the implementation must not drift: every
+    parameter the schemas offer is accepted, and nothing the schemas do not
+    offer (a per-robot calibration, say) is quietly accepted."""
+    plugin = _camera_card(controller, monkeypatch)
+    card = {t['name']: t for t in plugin.get_tools()}[lane]
+    declared = card['inputSchema']['x-action-params']['config']['params']
+    assert declared == ['undistort']
+    assert set(card['inputSchema']['properties']) - {'action'} == set(declared)
+    assert card['inputSchema']['properties']['undistort']['type'] == 'boolean'
+    assert set(card['configSchema']['properties']) == set(declared)
+    assert card['configSchema']['properties']['undistort']['type'] == 'boolean'
+    for value in (False, True):
+        result = plugin.dispatch('config', {'_tool_name': lane, 'undistort': value})
+        assert result['state'] == 'configured'
+        assert result['config'] == {'undistort': value}
+    for hidden in ({'calibration': {'K': [1]}}, {'config': {'calibration': {}}}):
+        result = plugin.dispatch('config', {'_tool_name': lane, **hidden})
+        assert result['state'] == 'error' and 'undistort' in result['message']
+        assert plugin.dispatch('info', {'_tool_name': lane})['config'] == {'undistort': True}
 
 
 def test_only_changed_lane_restarts_and_old_generation_frames_are_dropped(controller):
