@@ -23,9 +23,14 @@ def check_items(required_items: str, carried_items: str) -> dict:
 
 
 class LeavingHomeChecklistPlugin:
+    PREFIX = "leaving_home_checklist"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor):
+        """Accept the bundle's standard plugin inputs for this stateless card."""
+
     def get_tool(self) -> dict:
         return {
-            "name": "leaving_home_checklist",
+            "name": self.PREFIX,
             "type": "processor",
             "multiInstance": False,
             "description": "出门物品清单。比对必带物品和手动填写的已带物品，返回缺失物品。",

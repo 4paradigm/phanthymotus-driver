@@ -206,7 +206,8 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("leaving_home_checklist", {}).get("enabled", False):
             from leaving_home_checklist import LeavingHomeChecklistPlugin
-            self._plugins.append(LeavingHomeChecklistPlugin())
+            self._plugins.append(LeavingHomeChecklistPlugin(
+                plugins_cfg["leaving_home_checklist"], namespace, executor))
             print("[bundle] LeavingHomeChecklistPlugin loaded")
 
     def start_all(self) -> None:
