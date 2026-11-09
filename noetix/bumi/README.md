@@ -511,7 +511,7 @@ this card's node, subscription, publisher and timer, and clears its window.
 Stop before rebinding; restarting begins a new observation session.
 
 `plugins.joint_activity_stats` configures `enabled`, `window_s` (default 10,
-0.1?300 seconds) and `publish_hz` (default 1, 0.1?10 Hz). These are deployment
+0.1 to 300 seconds) and `publish_hz` (default 1, 0.1 to 10 Hz). These are deployment
 settings, not live configSchema settings. Output is `data/json` on
 `/<namespace>/joint_activity_stats`, published periodically even without input.
 It contains 21 named joint records with `min`, `max`, `range`, `count`,
@@ -539,3 +539,45 @@ image integration require separate acceptance; offline fakes do not verify them.
 Multiple or conflicting canvas inputs are rejected. `info.topic_in` reports the actual binding.
 Capacity loss marks retained joint statistics `incomplete`; numeric range overflow marks
 that joint `invalid_range`. Neither can produce an overall `valid` verdict.
+
+
+### Action-debugging summary and observation quality
+
+Use this processor to compare **observed angle excursions**, e.g. which arm
+joints actually changed during a wave. `joints` remains the instantaneous source;
+`motion_state` classifies current velocity/activity; proposed `motion_events`
+(PR #199) records transitions. This processor does none of those classifications.
+It is a rolling observation window, not a segmented action recorder or a test
+that an action completed. Start it just before the observation and stop after.
+
+`top_1` through `top_5` are compact, separately rendered JSON strings containing
+name, range/min/max (rad), count and observation state. They rank joints with at
+least two usable samples and a finite range by descending range, breaking ties
+by name. Missing ranks contain an explicit `none` message to clear stale display.
+Display numbers use six significant digits; the original 21 `joints` records
+retain their numeric precision and all legacy fields. A zero range means only
+that the retained readings were equal, not that a physical joint stayed still.
+
+New `observation_state` is authoritative for sample sufficiency: `observed`
+means all 21 joints have at least two usable samples, `insufficient_samples`
+means some retained data is insufficient, `no_samples` means none received,
+`expired` means previous valid data aged out, `invalid_range` rejects overflow,
+and `truncated` reports capacity loss. This is data quality, not a motion event.
+Legacy `status`, `range_valid`, and `window_complete` remain for compatibility;
+they do not prove sample sufficiency or continuous observation.
+
+`session_elapsed_s` starts when this subscription starts; `window_elapsed`
+only says that the configured window duration has passed since then.
+Each joint's `observation_span_s` is its latest minus earliest retained local
+receive time (zero for a single sample), separate from count and per-joint
+`capacity_dropped_samples`. Neither elapsed time nor span proves continuous,
+lossless sampling. Identical packets are still counted individually; no verified
+sample identifier is available. Capacity loss remains conservatively latched
+for the session. No hardware-time, safety, health or completion claim is made.
+
+Examples: a synthetic wave varies left arm pitch by 1.2, left elbow by 0.8 and
+right arm pitch by 0.3 rad; they should lead the summary in that order. A
+multi-joint sequence with excursions `(index+1)/10` rad should put waist yaw
+(2.1 rad) first. A single sample has legacy range zero but quality
+`insufficient_samples` and no ranked entry; silence eventually produces
+`expired`, null statistics and cleared summary rows.

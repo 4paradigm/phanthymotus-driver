@@ -25,12 +25,14 @@ class JointWindow:
     def __init__(self, window_s=10, clock=time.monotonic):
         self.window_s = bounded(window_s, 'window_s', 0.1, 300)
         self.clock = clock
+        self.started = clock()
         self.lock = threading.RLock()
         self.samples = {name: deque() for name in JOINT_NAMES}
         self.last = {name: None for name in JOINT_NAMES}
         self.received = self.invalid_messages = 0
         self.invalid_entries = self.duplicate_entries = 0
         self.capacity_drops = 0
+        self.joint_drops = {name: 0 for name in JOINT_NAMES}
 
     def _expire(self, now):
         for samples in self.samples.values():
@@ -62,6 +64,7 @@ class JointWindow:
                 if len(self.samples[name]) >= 30000:
                     self.samples[name].popleft()
                     self.capacity_drops += 1
+                    self.joint_drops[name] += 1
                 self.samples[name].append((now, q))
                 self.last[name] = now
 
@@ -74,11 +77,32 @@ class JointWindow:
                 values = [q for _, q in samples]
                 low, high = (min(values), max(values)) if values else (None, None)
                 joints.append(dict(name=name, min=low, max=high,
-                    range=(high-low if math.isfinite(high-low) else None) if values else None, count=len(values),
-                    range_valid=bool(values) and math.isfinite(high-low),
-                    status=('incomplete' if self.capacity_drops else ('valid' if math.isfinite(high-low) else 'invalid_range')) if values else ('expired' if self.last[name] is not None else 'no_valid_sample'),
+                    range=(high-low if finite_number(high-low) else None) if values else None, count=len(values),
+                    range_valid=bool(values) and finite_number(high-low),
+                    status=('incomplete' if self.capacity_drops else ('valid' if finite_number(high-low) else 'invalid_range')) if values else ('expired' if self.last[name] is not None else 'no_valid_sample'),
+                    observation_span_s=samples[-1][0]-samples[0][0] if samples else None,
+                    capacity_dropped_samples=self.joint_drops[name],
+                    observation_state=('truncated' if self.joint_drops[name] else
+                        ('invalid_range' if len(values) >= 2 and not finite_number(high-low) else
+                         ('observed' if len(values) >= 2 else 'insufficient_samples'))) if values else
+                        ('expired' if self.last[name] is not None else 'no_samples'),
                     last_valid_age_s=now-self.last[name] if self.last[name] is not None else None))
-            return dict(window_s=self.window_s, window_start_monotonic_s=now-self.window_s,
+            ranked = sorted((j for j in joints if j['count'] >= 2 and j['range_valid']),
+                            key=lambda j: (-j['range'], j['name']))[:5]
+            state = ('truncated' if self.capacity_drops else
+                     ('invalid_range' if any(j['observation_state'] == 'invalid_range' for j in joints) else
+                      ('observed' if all(j['count'] >= 2 for j in joints) else
+                       ('insufficient_samples' if any(j['count'] for j in joints) else
+                        ('expired' if any(t is not None for t in self.last.values()) else 'no_samples')))))
+            summary = {f'top_{i+1}': (
+                f"{ranked[i]['name']} range={ranked[i]['range']:.6g} min={ranked[i]['min']:.6g} "
+                f"max={ranked[i]['max']:.6g} count={ranked[i]['count']} {ranked[i]['observation_state']}"
+                if i < len(ranked) else 'none: fewer than two usable samples') for i in range(5)}
+            return dict(observation_state=state, summary_limit=5, **summary,
+                session_elapsed_s=now-self.started, window_elapsed=now-self.started >= self.window_s,
+                continuity='unverified_receive_span_is_not_lossless_coverage',
+                range_interpretation='one_sample_zero_is_not_evidence_of_no_motion',
+                window_s=self.window_s, window_start_monotonic_s=now-self.window_s,
                 window_end_monotonic_s=now, interval='(start, end]', unit='rad',
                 time_basis='local_monotonic_receive_time_not_hardware_sample_time',
                 deduplication='unavailable_no_verified_sample_id_repeated_messages_counted',
@@ -150,6 +174,7 @@ class JointActivityStatsPlugin:
                 return {'state': 'running' if topic == self.topic else 'error', 'input_topic': self.topic,
                         'topic_out': self.get_tool()['topic_out'],
                         'message': 'stop before changing input topic'}
+            self.window = JointWindow(self.window_s, self.clock)
             node = None
             try:
                 from rclpy.node import Node

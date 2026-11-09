@@ -256,3 +256,82 @@ def test_executor_refusal_cleans_node(runtime, monkeypatch):
     monkeypatch.setattr(executor, 'add_node', lambda node: False)
     assert p.dispatch('start', {'input_topic': '/x'})['state'] == 'error'
     assert nodes[0].destroyed and p.node is None
+
+
+def test_large_json_integer_range_does_not_raise():
+    window = m.JointWindow()
+    window.observe(packet(-10**308))
+    window.observe(packet(10**308))
+    report = window.snapshot()
+    joint = report['joints'][0]
+    assert joint['count'] == 2
+    assert joint['range'] is None
+    assert joint['range_valid'] is False
+    assert joint['status'] == 'invalid_range'
+    assert report['status'] != 'valid'
+    json.dumps(report, allow_nan=False)
+
+
+def test_summary_ranks_ranges_and_keeps_all_joints():
+    w = m.JointWindow()
+    w.observe({'joints': [{'name': n, 'q': 0} for n in m.JOINT_NAMES]})
+    w.observe({'joints': [{'name': n, 'q': i/10} for i, n in enumerate(m.JOINT_NAMES)]})
+    r = w.snapshot()
+    assert len(r['joints']) == 21
+    assert r['top_1'].startswith(m.JOINT_NAMES[20] + ' range=2 ')
+    assert r['top_5'].startswith(m.JOINT_NAMES[16] + ' range=1.6 ')
+    assert all(len(r[f'top_{i}']) < 200 for i in range(1, 6))
+    assert r['observation_state'] == 'observed'
+
+
+def test_single_sample_elapsed_span_and_expiry_are_distinct():
+    now = [0.0]
+    w = m.JointWindow(clock=lambda: now[0])
+    now[0] = 11
+    w.observe(packet(0))
+    r = w.snapshot()
+    assert r['window_elapsed'] and r['session_elapsed_s'] == 11
+    assert r['joints'][0]['observation_span_s'] == 0
+    assert r['joints'][0]['observation_state'] == 'insufficient_samples'
+    assert r['observation_state'] == 'insufficient_samples'
+    assert r['top_1'].startswith('none:')
+    now[0] = 12
+    w.observe(packet(0))
+    assert w.snapshot()['joints'][0]['observation_span_s'] == 1
+    assert w.snapshot()['continuity'].startswith('unverified')
+    now[0] = 22
+    r = w.snapshot()
+    assert r['observation_state'] == 'expired'
+    assert r['top_1'].startswith('none:')
+
+
+def test_capacity_truncation_quality_is_per_joint_and_session():
+    w = m.JointWindow(clock=lambda: 0)
+    for _ in range(30001): w.observe(packet(1))
+    r = w.snapshot()
+    assert r['observation_state'] == 'truncated'
+    assert r['joints'][0]['capacity_dropped_samples'] == 1
+    assert r['joints'][0]['observation_state'] == 'truncated'
+    assert r['joints'][1]['capacity_dropped_samples'] == 0
+    assert r['joints'][1]['observation_state'] == 'no_samples'
+
+
+def test_summary_ties_are_deterministic_and_invalid_ranges_excluded():
+    w = m.JointWindow()
+    for q in [-1e308, 1e308]: w.observe(packet(q))
+    w.observe(packet(1, m.JOINT_NAMES[1]));w.observe(packet(1, m.JOINT_NAMES[1]))
+    r = w.snapshot()
+    assert r['observation_state'] == 'invalid_range'
+    assert r['top_1'].startswith(m.JOINT_NAMES[1])
+    assert r['joints'][1]['observation_span_s'] >= 0
+
+
+def test_subscription_start_resets_observation_session_clock(runtime):
+    p, executor, _ = runtime
+    now = [100.0]
+    p.clock = lambda: now[0]
+    assert p.dispatch('start', {'input_topic': '/x'})['state'] == 'running'
+    assert p.window.snapshot()['session_elapsed_s'] == 0
+    now[0] = 102
+    assert p.window.snapshot()['session_elapsed_s'] == 2
+    p.stop()
