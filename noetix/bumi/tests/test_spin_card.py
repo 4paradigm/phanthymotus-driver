@@ -101,6 +101,29 @@ def test_unknown_direction_is_rejected(module, value):
     assert module.normalize_direction(value) is None
 
 
+@pytest.mark.parametrize("value, expected", [
+    (None, 0.55), (0.55, 0.55), (0.80, 0.80), ("0.70", 0.70),
+])
+def test_valid_speed(module, value, expected):
+    assert module.validate_speed(value, 0.80) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("value", [
+    0.54, 0.81, 1.0, 0, -1, True, False, "fast",
+])
+def test_invalid_speed_is_rejected(module, value):
+    with pytest.raises(module.SpinInputError):
+        module.validate_speed(value, 0.80)
+
+
+def test_speed_is_bounded_by_the_configured_limit(module):
+    assert module.validate_speed(0.60, 0.65) == pytest.approx(0.60)
+    with pytest.raises(module.SpinInputError):
+        module.validate_speed(0.80, 0.65)
+    with pytest.raises(module.SpinInputError):
+        module.validate_speed(0.80, 0.60)
+
+
 def test_clockwise_is_negative_and_ccw_is_positive(module):
     assert module.spin_target_deg(1, "clockwise") == -360.0
     assert module.spin_target_deg(5, "clockwise") == -1800.0
@@ -122,6 +145,10 @@ def test_speed_profile_tapers_to_zero(module):
     assert module.speed_for_remaining(10, max_vyaw) == 0.45
     assert module.speed_for_remaining(8, max_vyaw) == 0.0
     assert module.speed_for_remaining(2, max_vyaw) == 0.0
+    # The faster setting cruises faster, but the final taper still stops.
+    assert module.speed_for_remaining(180, 0.80) == 0.80
+    assert module.speed_for_remaining(20, 0.80) == pytest.approx(0.64)
+    assert module.speed_for_remaining(8, 0.80) == 0.0
 
 
 def test_pulse_duration_is_bounded(module):
@@ -133,8 +160,10 @@ def test_pulse_duration_is_bounded(module):
 def test_expected_duration_grows_with_turns(module):
     one = module.expected_duration_s(1, 0.55)
     five = module.expected_duration_s(5, 0.55)
+    fast = module.expected_duration_s(1, 0.80)
     assert 10.0 < one < 30.0
     assert five > one * 2
+    assert fast < one
 
 
 # ── Card contract ────────────────────────────────────────────────────────────
@@ -153,13 +182,17 @@ def test_tool_contract(module):
     assert schema["properties"]["turns"]["maximum"] == 5
     assert schema["properties"]["direction"]["enum"] == [
         "clockwise", "counterclockwise"]
+    assert schema["properties"]["speed"]["minimum"] == 0.55
+    assert schema["properties"]["speed"]["maximum"] == 0.80
+    assert schema["properties"]["speed"]["default"] == 0.55
     assert schema["x-completion"] == {"actions": ["spin"], "timeout": 180}
     assert schema["x-hooks"] == {"on_interrupt_motion": {"action": "stop"}}
     assert set(schema["x-action-params"]) == {"spin", "stop", "info", "start"}
 
 
 @pytest.mark.parametrize("configured, expected", [
-    (2.0, 0.80), (0.1, 0.45), (0.55, 0.55), ("bad", 0.55), (None, 0.55),
+    (2.0, 0.80), (0.1, 0.55), (0.55, 0.55), (0.80, 0.80),
+    ("bad", 0.80), (None, 0.80),
 ])
 def test_max_vyaw_is_clamped(module, configured, expected):
     plugin = module.SpinPlugin({"max_vyaw": configured}, "robot", None,
@@ -177,6 +210,8 @@ def test_info_is_idle_before_any_spin(module):
     info = card.dispatch("info", {})
     assert info["state"] == "idle"
     assert info["max_turns"] == 5
+    assert info["speed_range"] == [0.55, 0.80]
+    assert info["default_speed"] == 0.55
     assert info["last"] is None
 
 
@@ -192,6 +227,24 @@ def test_invalid_direction_never_reach_the_robot(module):
     result = card.dispatch("spin", {"turns": 1, "direction": "up"})
     assert result["state"] == "error"
     assert "direction" in result["error"]
+
+
+def test_invalid_speed_never_reach_the_robot(module):
+    card = module.SpinPlugin({}, "robot", None, _FakeHighCtrl())
+    result = card.dispatch(
+        "spin", {"turns": 1, "direction": "clockwise", "speed": 0.9})
+    assert result["state"] == "error"
+    assert "speed" in result["error"]
+
+
+def test_speed_is_validated_before_preflight(module):
+    # A valid 0.70 must pass validation and reach the workmode check; an
+    # invalid speed would have been reported as a speed error instead.
+    card = module.SpinPlugin({}, "robot", None, _FakeHighCtrl(mode=0))
+    result = card.dispatch(
+        "spin", {"turns": 1, "direction": "clockwise", "speed": 0.70})
+    assert result["state"] == "error"
+    assert "workmode=2" in result["error"]
 
 
 def test_spin_requires_walking_mode(module):

@@ -2,8 +2,9 @@
 """Gentle in-place spin card for the Noetix Bumi bundle.
 
 The card turns the robot in place by a whole number of revolutions (1-5) in a
-chosen direction.  It is deliberately slow: angular velocity is capped well
-below the chassis full scale, ramps in over 0.6 s, decelerates near the target
+chosen direction.  The operator can pick a speed between the original gentle
+setting and a bounded faster one; angular velocity stays below the chassis full
+scale, ramps in over 0.6 s, decelerates near the target
 and finishes with short IMU-corrected pulses instead of a hard stop.
 
 The module keeps ROS and the vendor SDK out of module scope: the plugin receives
@@ -25,8 +26,10 @@ import uuid
 # Bumi's measured full-scale yaw rate at a normalised vyaw of 1.0 (README).
 _FULL_SCALE_WZ_RAD_S = 0.83
 _MAX_TURNS = 5
-_DEFAULT_MAX_VYAW = 0.55
-_MIN_MAX_VYAW = 0.45
+_DEFAULT_MAX_VYAW = 0.80
+_MIN_SPIN_VYAW = 0.55
+_MAX_SPIN_VYAW = 0.80
+_MIN_MAX_VYAW = 0.55
 _MAX_MAX_VYAW = 0.80
 # Above the ~0.40 normalised stiction boundary, so the final pulses move the
 # robot instead of being absorbed by the legs.
@@ -73,6 +76,32 @@ def validate_turns(value) -> int:
     if not 1 <= value <= _MAX_TURNS:
         raise SpinInputError(f"turns 必须在 1–{_MAX_TURNS} 圈之间，当前为 {value}")
     return value
+
+
+def validate_speed(value, maximum: float) -> float:
+    """Return the requested normalised yaw speed, or raise SpinInputError.
+
+    The lower bound is the original card speed (0.55), so the previous gentle
+    behaviour stays the default and the slowest choice.  The upper bound is the
+    plugin's configured capability limit (0.80 by default).
+    """
+    if value is None:
+        return _MIN_SPIN_VYAW
+    if isinstance(value, bool):
+        raise SpinInputError(
+            f"speed 必须是 {_MIN_SPIN_VYAW:.2f}–{maximum:.2f} 的数字")
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        raise SpinInputError(
+            f"speed 必须是 {_MIN_SPIN_VYAW:.2f}–{maximum:.2f} 的数字")
+    if not math.isfinite(speed):
+        raise SpinInputError(
+            f"speed 必须是 {_MIN_SPIN_VYAW:.2f}–{maximum:.2f} 的数字")
+    if not (_MIN_SPIN_VYAW - 1e-9) <= speed <= (maximum + 1e-9):
+        raise SpinInputError(
+            f"speed 必须在 {_MIN_SPIN_VYAW:.2f}–{maximum:.2f} 之间，当前为 {speed}")
+    return min(maximum, max(_MIN_SPIN_VYAW, speed))
 
 
 def normalize_direction(value):
@@ -151,8 +180,9 @@ class SpinPlugin:
             "type": "actuator",
             "multiInstance": False,
             "description": (
-                "让 Bumi 原地缓慢转圈。输入圈数（1–5）并选择顺时针或逆时针；"
-                "卡片用 IMU 闭环控制，起步平滑、接近目标自动减速，最后用小幅修正停准。"
+                "让 Bumi 原地缓慢转圈。输入圈数（1–5）并选择顺时针或逆时针，"
+                "还可以调整旋转速度；卡片用 IMU 闭环控制，起步平滑、接近目标自动减速，"
+                "最后用小幅修正停准。"
                 "执行前必须确认机器人已稳定站立并处于行走模式，地面平坦防滑，"
                 "周围至少 3m×3m 无人无障碍物；旋转过程中不要靠近或推拉机器人。"
             ),
@@ -176,13 +206,22 @@ class SpinPlugin:
                         "description": ("clockwise=顺时针（向右转），"
                                         "counterclockwise=逆时针（向左转）。"),
                     },
+                    "speed": {
+                        "type": "number",
+                        "minimum": _MIN_SPIN_VYAW,
+                        "maximum": _MAX_SPIN_VYAW,
+                        "default": _MIN_SPIN_VYAW,
+                        "description": ("旋转速度（归一化角速度）：0.55 是之前的速度，"
+                                        "0.80 是上限；越大转得越快。"),
+                    },
                 },
                 "required": ["action"],
                 "additionalProperties": False,
                 "x-action-params": {
-                    "spin": {"params": ["turns", "direction"],
+                    "spin": {"params": ["turns", "direction", "speed"],
                              "description": ("缓慢原地转 turns 圈：clockwise 顺时针、"
-                                             "counterclockwise 逆时针。最大 5 圈。")},
+                                             "counterclockwise 逆时针；speed 0.55–0.80，"
+                                             "默认 0.55。最大 5 圈。")},
                     "stop": {"params": [],
                              "description": "立即停止转圈并发送零速度。"},
                     "info": {"params": [],
@@ -247,6 +286,7 @@ class SpinPlugin:
             if direction is None:
                 raise SpinInputError(
                     "direction 只能是 clockwise 或 counterclockwise")
+            speed = validate_speed(args.get("speed"), self._max_vyaw)
         except SpinInputError as exc:
             return {"state": "error", "code": "INVALID_PARAMETERS",
                     "error": str(exc)}
@@ -265,6 +305,7 @@ class SpinPlugin:
                 "action_id": f"bumi_spin_{uuid.uuid4().hex}",
                 "turns": turns,
                 "direction": direction,
+                "speed": speed,
                 "target_deg": target,
                 "started_at": time.time(),
                 "stop_event": threading.Event(),
@@ -280,9 +321,10 @@ class SpinPlugin:
             "action_id": record["action_id"],
             "turns": turns,
             "direction": direction,
+            "speed": speed,
             "target_deg": target,
             "max_vyaw": self._max_vyaw,
-            "expected_duration_s": round(expected_duration_s(turns, self._max_vyaw), 1),
+            "expected_duration_s": round(expected_duration_s(turns, speed), 1),
         }
 
     def _info(self) -> dict:
@@ -291,6 +333,7 @@ class SpinPlugin:
                 "action_id": self._active["action_id"],
                 "turns": self._active["turns"],
                 "direction": self._active["direction"],
+                "speed": self._active["speed"],
                 "started_at": self._active["started_at"],
             }
             last = dict(self._last) if self._last else None
@@ -304,6 +347,8 @@ class SpinPlugin:
             "state": "running" if active else "idle",
             "max_turns": _MAX_TURNS,
             "max_vyaw": self._max_vyaw,
+            "speed_range": [_MIN_SPIN_VYAW, self._max_vyaw],
+            "default_speed": _MIN_SPIN_VYAW,
             "workmode": mode,
             "active": active,
             "last": last,
@@ -343,6 +388,7 @@ class SpinPlugin:
                 "action": "spin",
                 "turns": record["turns"],
                 "direction": record["direction"],
+                "speed": record["speed"],
                 "target_deg": record["target_deg"],
                 "duration_s": round(time.time() - record["started_at"], 1),
             }
@@ -436,7 +482,7 @@ class SpinPlugin:
             if now >= next_mode_check:
                 self._require_walking()
                 next_mode_check = now + _MODE_CHECK_S
-            speed = speed_for_remaining(abs(remaining), self._max_vyaw)
+            speed = speed_for_remaining(abs(remaining), float(record["speed"]))
             ramp = min(1.0, (now - started) / _ACCEL_S)
             self._publish(math.copysign(speed * ramp, remaining))
             time.sleep(_CONTROL_PERIOD_S)
