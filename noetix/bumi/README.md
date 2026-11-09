@@ -2,6 +2,11 @@
 
 The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
 
+The optional `planar_rectify` processor flattens a selected quadrilateral from
+the existing JPEG stream for document/board reading. It performs image geometry
+only and is disabled by default. See [Planar region rectification](PLANAR_RECTIFY.md)
+for configuration, limitations and acceptance steps.
+
 ## `mic` and `sound_direction`
 
 `mic` publishes mono PCM `AudioChunk` messages on `/<namespace>/mic/audio`.

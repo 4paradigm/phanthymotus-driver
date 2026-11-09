@@ -191,6 +191,15 @@ class BumiDeviceBundle:
                     high_ctrl=high_ctrl))
                 print("[bundle] VisualOdometryPlugin loaded")
 
+        if plugins_cfg.get("planar_rectify", {}).get("enabled", False):
+            from planar_rectify import PlanarRectifyPlugin
+            try:
+                self._plugins.append(PlanarRectifyPlugin(
+                    plugins_cfg["planar_rectify"], namespace, executor))
+                print("[bundle] PlanarRectifyPlugin loaded")
+            except ValueError as exc:
+                print(f"[bundle] PlanarRectifyPlugin skipped: {exc}")
+
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
             from device import MotionStatePlugin
             motion_state_plugin = MotionStatePlugin(
