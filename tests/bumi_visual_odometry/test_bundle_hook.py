@@ -31,8 +31,8 @@ def capture(monkeypatch):
     device = _load_device(monkeypatch)
     state = NS(iterations=0, frame_limit=1, published={}, stopped=False,
                aligned=False, streams=[], alignment=[], spin_calls=0,
-               depth_scale=.001, scale_error=None)
-    raw = NS(color=b'BGR', depth=b'\x01\x00\x02\x00')
+               depth_scale=.001, scale_error=None, depth_dims=(640, 480))
+    raw = NS(color=b'BGR', depth=b'\x01\x00\x02\x00' + bytes(640 * 480 * 2 - 4))
 
     class Pixels:
         def __init__(self, data):
@@ -48,6 +48,12 @@ def capture(monkeypatch):
         def get_data(self):
             return self.data
 
+        def get_width(self):
+            return state.depth_dims[0]
+
+        def get_height(self):
+            return state.depth_dims[1]
+
     class Frames:
         def get_color_frame(self):
             assert state.aligned
@@ -55,7 +61,7 @@ def capture(monkeypatch):
 
         def get_depth_frame(self):
             assert state.aligned
-            return Frame(raw.depth)
+            return Frame(getattr(state, 'raw_depth_override', raw.depth))
 
     class Pipeline:
         def start(self, config):
@@ -248,7 +254,7 @@ def test_capture_timed_depth_failure_falls_back_to_legacy_publish(capture, monke
     assert len(state.published['/robot/camera/color']) == 2
     assert len(state.published['/robot/camera/depth']) == 2
     # The fallback is the legacy contract byte-for-byte: navi keeps decoding.
-    assert zlib.decompress(state.published['/robot/camera/depth'][0].data) == b'\x01\x00\x02\x00'
+    assert zlib.decompress(state.published['/robot/camera/depth'][0].data) == b'\x01\x00\x02\x00' + bytes(640 * 480 * 2 - 4)
 
 
 def test_depth_fallback_applies_the_sdk_scale_when_the_publisher_fails(
@@ -283,7 +289,7 @@ def test_depth_fallback_applies_the_sdk_scale_when_the_publisher_fails(
     assert len(published) == 1
     assert published[0].format == '16UC1; compressedDepth zlib'
     # raw z16 values 1, 2 -> 2 mm, 4 mm at a 0.002 depth scale.
-    assert zlib.decompress(published[0].data) == b'\x02\x00\x04\x00'
+    assert zlib.decompress(published[0].data) == b'\x02\x00\x04\x00' + bytes(640 * 480 * 2 - 4)
 
 
 def test_depth_fallback_applies_the_sdk_scale_without_the_capture_time_module(
@@ -296,7 +302,7 @@ def test_depth_fallback_applies_the_sdk_scale_without_the_capture_time_module(
     assert state.published['/robot/camera/color']
     published = state.published['/robot/camera/depth']
     assert len(published) == 1
-    assert zlib.decompress(published[0].data) == b'\x02\x00\x04\x00'
+    assert zlib.decompress(published[0].data) == b'\x02\x00\x04\x00' + bytes(640 * 480 * 2 - 4)
 
 
 def test_depth_stream_is_disabled_when_the_sdk_scale_is_unavailable(
@@ -350,7 +356,7 @@ def test_media_uses_byte_buffers_without_changing_encoded_payloads(capture, monk
     assert isinstance(depth.data, array) and depth.data.typecode == 'B'
     assert bytes(color.data) == b'JPEG'
     assert color.format == 'jpeg'
-    assert zlib.decompress(depth.data) == b'\x01\x00\x02\x00'
+    assert zlib.decompress(depth.data) == b'\x01\x00\x02\x00' + bytes(640 * 480 * 2 - 4)
     assert depth.format == '16UC1; compressedDepth zlib'
 
 
@@ -576,3 +582,52 @@ def test_invalid_raw_rate_falls_back_to_the_documented_default(capture, monkeypa
                         NS(RawCameraPublisher=RawCameraPublisher))
     device._camera_subprocess('robot')
     assert len(seen) == 1 and abs(seen[0]-0.1) < 1e-9
+
+
+@pytest.mark.parametrize('scale', [0.0, -0.001, 0.1, 1.0,
+                                   float('nan'), float('inf'),
+                                   -float('inf'), True, None])
+def test_invalid_sdk_depth_scale_disables_depth_but_keeps_color(
+        capture, monkeypatch, capsys, scale):
+    device, state = capture
+    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
+    state.depth_scale = scale
+    monkeypatch.setitem(sys.modules, 'visual_inputs', None)
+    device._camera_subprocess('robot')
+    assert state.published['/robot/camera/color']
+    assert state.published['/robot/camera/depth'] == []
+    assert 'depth stream disabled' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(('dimensions', 'payload'), [
+    ((320, 960), b'\x01\x00' + bytes(640 * 480 * 2 - 2)),
+    ((640, 479), b'\x01\x00' + bytes(640 * 480 * 2 - 2)),
+    ((640, 480), b'\x01\x00'),
+    ((640, 480), b'\x01'),
+    ((640, 480), b'\x01\x00' + bytes(640 * 480 * 2)),
+])
+def test_fallback_rejects_wrong_dimensions_and_raw_buffer_sizes(
+        capture, monkeypatch, dimensions, payload, capsys):
+    device, state = capture
+    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
+    monkeypatch.setitem(sys.modules, 'visual_inputs', None)
+    state.depth_dims = dimensions
+    state.raw_depth_override = payload
+    state.frame_limit = 2
+    device._camera_subprocess('robot')
+    assert len(state.published['/robot/camera/color']) == 2
+    assert state.published['/robot/camera/depth'] == []
+    output = capsys.readouterr().out
+    assert output.count('depth payload contract invalid; depth stream disabled') == 1
+
+
+def test_fallback_encoder_validates_scale_shape_even_without_numpy(capture):
+    device, _ = capture
+    raw = b'\x01\x00' + bytes(640 * 480 * 2 - 2)
+    assert device._depth_millimetre_bytes(raw, 0.001, width=640, height=480) == raw
+    with pytest.raises(ValueError, match='uint16'):
+        device._depth_millimetre_bytes(raw[:-1], 0.001, width=640, height=480)
+    with pytest.raises(ValueError, match='640x480'):
+        device._depth_millimetre_bytes(raw, 0.001, width=320, height=960)
+    with pytest.raises(ValueError, match='SDK depth scale'):
+        device._depth_millimetre_bytes(raw, float('nan'), width=640, height=480)

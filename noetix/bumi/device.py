@@ -2304,36 +2304,55 @@ class SpeakerPlugin:
 
 # ── CameraPlugin (sensor, subprocess) ────────────────────────────────────────
 
-def _depth_millimetre_bytes(raw, depth_scale):
-    """The declared depth payload: little-endian uint16 millimetres.
+def _validate_depth_scale(depth_scale):
+    """Fail closed if RealSense did not provide a usable meters-per-unit scale."""
+    if isinstance(depth_scale, bool) or not isinstance(depth_scale, (int, float)):
+        raise ValueError('SDK depth scale must be finite and within (0, 0.1) m/unit')
+    try:
+        value = float(depth_scale)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError('SDK depth scale must be finite and within (0, 0.1) m/unit') from exc
+    if not math.isfinite(value) or not 0.0 < value < 0.1:
+        raise ValueError('SDK depth scale must be finite and within (0, 0.1) m/unit')
+    return value
 
-    Used by the camera subprocess fallback when the capture-timed publisher is
-    unavailable or fails. It must apply the SDK ``depth_scale`` itself:
-    publishing raw sensor units under the card's ``depth_unit=mm`` declaration
-    is only correct on a 1 mm sensor scale, and on the error path a wrong unit
-    would make every range decision systematically off. NumPy is used when
-    available; the pure-Python path keeps the fallback honest even when the
-    optional visual-inputs module (and therefore its NumPy conversion) is the
-    thing that failed.
+
+def _depth_millimetre_bytes(raw, depth_scale, *, width=None, height=None):
+    """Encode exactly one 640x480 aligned Z16 frame as uint16 millimetres.
+
+    Every fallback must enforce the same wire contract as the normal
+    CaptureTimedDepthPublisher; failing to establish the dimensions or unit
+    is an error, not permission to publish an arbitrary byte buffer.
     """
+    scale = _validate_depth_scale(depth_scale)
+    if (type(width) is not int or type(height) is not int
+            or (width, height) != (640, 480)):
+        raise ValueError('compressed depth requires a 640x480 pixel grid')
+    data = bytes(raw)
+    if len(data) != width * height * 2:
+        raise ValueError('compressed depth requires exactly 640x480 uint16 pixels')
+    # No conversion is necessary for the standard 1 mm sensor scale.
+    if scale == .001:
+        return data
     try:
         import numpy as np
-        pixels = np.frombuffer(bytes(raw), dtype='<u2')
-        millimetres = np.rint(pixels.astype(np.float64) * (depth_scale * 1000.))
+        pixels = np.frombuffer(data, dtype='<u2')
+        millimetres = np.rint(pixels.astype(np.float64) * (scale * 1000.))
         millimetres[(millimetres < 1) | (millimetres > 65535) | ~np.isfinite(millimetres)] = 0
         return np.ascontiguousarray(millimetres.astype('<u2')).tobytes()
-    except Exception:                                          # noqa: BLE001
+    except (ImportError, AttributeError):
+        # A deliberately supported fallback when optional numerical modules
+        # are missing; scale and buffer geometry were already validated.
         pass
-    data = bytes(raw)
     out = bytearray(len(data))
-    scale = depth_scale * 1000.
-    for index in range(0, len(data)-1, 2):
-        value = data[index] | (data[index+1] << 8)
-        millimetres = int(round(value * scale))
+    factor = scale * 1000.
+    for index in range(0, len(data), 2):
+        value = data[index] | (data[index + 1] << 8)
+        millimetres = int(round(value * factor))
         if not 1 <= millimetres <= 65535:
             millimetres = 0
         out[index] = millimetres & 0xFF
-        out[index+1] = millimetres >> 8
+        out[index + 1] = millimetres >> 8
     return bytes(out)
 
 
@@ -2452,15 +2471,17 @@ def _camera_subprocess(namespace: str):
 
     # Capture-timed depth is the depth card's one output. It shares this
     # pipeline and the clock mapping with the optional VO raw branch; a fault
-    # here must never take media production down. The fallback still publishes
-    # scaled millimetres with an arrival stamp, so a failure changes the
-    # timestamp provenance, never the declared unit.
+    # here must never take media production down. The fallback publishes only
+    # a validated 640x480 scaled-millimetre frame with an arrival stamp; an
+    # invalid scale or raw buffer disables the depth output rather than
+    # changing the advertised geometry or unit.
     depth_stream = None
     shared_time_mapper = None
     depth_scale = None
     try:
-        depth_scale = pipeline.get_active_profile().get_device().first_depth_sensor().get_depth_scale()
-    except Exception as _e:
+        depth_scale = _validate_depth_scale(
+            pipeline.get_active_profile().get_device().first_depth_sensor().get_depth_scale())
+    except Exception as _e:                            # noqa: BLE001
         # Without the SDK scale the fallback cannot honour the declared uint16
         # millimetre payload; disable the depth stream rather than publish
         # mislabelled units.
@@ -2573,7 +2594,19 @@ def _camera_subprocess(namespace: str):
                                   f"{' '.join(str(_e).split())[:300]}", flush=True)
                 if not published:
                     try:
-                        payload = _depth_millimetre_bytes(depth_frame.get_data(), depth_scale)
+                        payload = _depth_millimetre_bytes(
+                            depth_frame.get_data(), depth_scale,
+                            width=depth_frame.get_width(), height=depth_frame.get_height())
+                    except ValueError as _e:
+                        # Wrong negotiated dimensions, odd/truncated buffers or
+                        # invalid SDK units break the advertised depth contract.
+                        # Do not keep publishing under that declaration, even
+                        # if the capture-time helper has already failed.
+                        depth_scale = None
+                        depth_encode_failures += 1
+                        print(f"[camera_subprocess] depth payload contract invalid; "
+                              f"depth stream disabled: {' '.join(str(_e).split())[:300]}",
+                              flush=True)
                     except Exception as _e:
                         depth_encode_failures += 1
                         if depth_encode_failures == 1 or depth_encode_failures % 100 == 0:

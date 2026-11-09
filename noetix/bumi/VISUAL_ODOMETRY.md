@@ -197,3 +197,22 @@ code validates the published mount using the ROS-free
 `calibrated=false` means a human must still configure a compatible
 `child_from_cloud` matrix on the SLAM card; it does not mean the system has
 verified optical-to-body installation accuracy.
+
+
+## Depth fallback safety
+
+The single `image/depth-zlib` port remains a 640×480, little-endian uint16
+millimetre stream. Both the capture-time publisher and its resilience fallback
+must honor that contract. Before enabling depth publication, the subprocess
+requires a finite SDK `depth_scale` strictly within `(0, 0.1)` meters per
+sensor unit. The fallback additionally checks the aligned frame's reported
+width and height and requires exactly `640 * 480 * 2` raw bytes; truncated,
+odd-length, oversized, or differently negotiated frames are never compressed
+under the declared dimensions. An invalid scale or fallback payload disables
+the depth output for the remainder of the camera subprocess lifetime, while
+color/JPEG media production continues. A timestamp mapping failure alone
+continues to use the previously documented arrival-stamp/empty-frame fallback.
+
+The checks are in `device._validate_depth_scale` and
+`device._depth_millimetre_bytes` and have ROS-free negative cases in
+`tests/bumi_visual_odometry/test_bundle_hook.py`.
