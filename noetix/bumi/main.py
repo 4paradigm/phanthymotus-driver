@@ -204,6 +204,11 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        if plugins_cfg.get("leaving_home_checklist", {}).get("enabled", False):
+            from leaving_home_checklist import LeavingHomeChecklistPlugin
+            self._plugins.append(LeavingHomeChecklistPlugin())
+            print("[bundle] LeavingHomeChecklistPlugin loaded")
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):
