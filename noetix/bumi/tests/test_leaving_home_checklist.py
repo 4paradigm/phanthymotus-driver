@@ -22,11 +22,20 @@ def test_plugin_contract_and_lifecycle(card):
     card.stop()
 
 
+def test_schema_declares_optional_lists_and_defaults(card):
+    schema = card.get_tool()["inputSchema"]
+    assert schema["required"] == ["action"]
+    assert schema["properties"]["required_items"]["default"] == "钥匙、手机、雨伞"
+    assert schema["properties"]["carried_items"]["default"] == ""
+
+
 def test_default_list(card):
     assert card.dispatch("check", {"carried_items": "钥匙、手机"}) == {
         "missing_items": ["雨伞"], "all_ready": False, "message": "还没带：雨伞",
     }
-    assert card.dispatch("check", {})["missing_items"] == ["钥匙", "手机", "雨伞"]
+    omitted = card.dispatch("check", {})
+    assert omitted["missing_items"] == ["钥匙", "手机", "雨伞"]
+    assert card.dispatch("check", {"required_items": "", "carried_items": ""}) == omitted
 
 
 def test_delimiters_and_duplicate_items(card):

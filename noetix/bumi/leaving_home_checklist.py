@@ -33,7 +33,10 @@ class LeavingHomeChecklistPlugin:
             "name": self.PREFIX,
             "type": "processor",
             "multiInstance": False,
-            "description": "出门物品清单。比对必带物品和手动填写的已带物品，返回缺失物品。",
+            "description": (
+                "出门物品清单，返回缺失物品。两项清单均可省略或留空。"
+                f"必带物品默认是{DEFAULT_REQUIRED_ITEMS}，已带物品默认为空清单。"
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -41,11 +44,12 @@ class LeavingHomeChecklistPlugin:
                     "required_items": {
                         "type": "string",
                         "default": DEFAULT_REQUIRED_ITEMS,
-                        "description": "必带物品，用顿号或逗号分隔。留空用钥匙、手机、雨伞。",
+                        "description": f"必带物品，用顿号或逗号分隔。省略或留空时使用{DEFAULT_REQUIRED_ITEMS}。",
                     },
                     "carried_items": {
                         "type": "string",
-                        "description": "已带物品，用顿号或逗号分隔。留空表示未带任何物品。",
+                        "default": "",
+                        "description": "已带物品，用顿号或逗号分隔。省略或留空时按未带任何物品处理。",
                     },
                 },
                 "required": ["action"],
@@ -68,7 +72,7 @@ class LeavingHomeChecklistPlugin:
         if action != "check":
             return None
 
-        required = args.get("required_items", "")
+        required = args.get("required_items", DEFAULT_REQUIRED_ITEMS)
         carried = args.get("carried_items", "")
         if not isinstance(required, str) or not isinstance(carried, str):
             return {"state": "invalid_parameters", "message": "必带物品和已带物品都应填写为文本。"}
