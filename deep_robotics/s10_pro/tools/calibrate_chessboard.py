@@ -1,7 +1,9 @@
 """Offline S10 camera calibration (requires numpy and OpenCV on the workstation).
 
 python calibrate_chessboard.py FRAME_DIR --lane camera_rear --out OUTPUT_DIR
-10x13 inner corners, 18 mm squares; outputs calibration.json for the camera card.
+10x13 inner corners, 18 mm squares. Writes calibration.json in the shape of a
+CALIBRATIONS row in undistortion.py; the camera cards take no calibration at
+runtime, so a new measurement is installed by replacing that row.
 """
 import argparse
 from datetime import date

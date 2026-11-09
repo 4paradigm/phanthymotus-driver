@@ -10,6 +10,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 from types import ModuleType, SimpleNamespace
@@ -37,6 +38,10 @@ DRIVER = ROOT / "deep_robotics" / "s10_pro"
 
 def _load_device(monkeypatch):
     monkeypatch.syspath_prepend(str(DRIVER))
+    # The camera cards read their saved undistort switch from the host data
+    # directory; a robot or dev box that has one must not change these results.
+    monkeypatch.setenv("S10_CAMERA_UNDISTORT_CONFIG",
+                       str(Path(tempfile.mkdtemp()) / "camera_undistort.json"))
     spec = importlib.util.spec_from_file_location("s10_pro_device_for_test", DRIVER / "device.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
