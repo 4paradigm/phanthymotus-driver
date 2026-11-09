@@ -186,3 +186,18 @@ Ubuntu-22.04/WSL、Python3.10.12、pytest6.2.5、numpy1.21.5：上述完整命�
 并通过 PYTHONPATH 加载隔离的 HTTP 测试依赖。Ubuntu-22.04/WSL 上定向测试 29 项通过，
 完整回归 405 项通过、0 失败、0 跳过。Python AST、Card JSON Schema、ACP 声明及 Docker COPY
 静态检查均通过。
+
+## Jetson 真机时钟异常诊断
+
+在相机子进程日志中保留带容器时间戳的第一条 [rgbd_snapshot] clock_fault。
+每个 Snapshot epoch 最多一条，即使首次故障发生在调用前。该记录含两个源流的前后帧号、
+时间戳域、SDK 时间增量、SDK 增量减主机单调增量，以及主机 wall 增量、相邻 wait 返回间隔、
+本次 wait 耗时和 wait 返回到 Snapshot 取元数据的耗时。最后一项包括对齐等处理耗时。
+不记录设备序列号、图像或音频。
+
+同时保留相机子进程启动时间、第一条 raw RGB-D publish failed 和前后 FPS 日志。
+若设备增量异常而 wait 返回间隔正常，优先查 SDK 源时钟或映射。
+若 wait 返回间隔或对齐耗时异常，优先查帧投递、调度和处理开销。
+若 wall 与单调增量明显分离，核对宿主机校时。
+VO 使用独立的 epoch 和 ClockMap，其告警不能单独证明与 Snapshot 同源。
+Snapshot 保持原阈值和会话内故障锁定，仍由新的相机采集会话建立基线。

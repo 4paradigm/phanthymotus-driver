@@ -2495,14 +2495,16 @@ def _camera_subprocess(namespace: str, snapshot_fd=None):
                     snapshot_producer.close()
                     snapshot_producer = None
                     print(f"[camera_subprocess] snapshot channel disabled: {_e}", flush=True)
-            t0 = _time.monotonic()
+            wait_start_ns = _time.monotonic_ns()
             source_frames = pipeline.wait_for_frames(timeout_ms=1000)
-            t_wait = _time.monotonic() - t0
+            wait_end_ns = _time.monotonic_ns()
+            t_wait = (wait_end_ns - wait_start_ns) / 1e9
 
             frames = align_to_color.process(source_frames)
             if snapshot_producer is not None:
                 try:
-                    snapshot_producer.observe(source_frames, frames)
+                    snapshot_producer.observe(source_frames, frames,
+                                              wait_window_ns=(wait_start_ns, wait_end_ns))
                 except Exception as _e:
                     snapshot_producer.close()
                     snapshot_producer = None

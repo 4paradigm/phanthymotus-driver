@@ -46,8 +46,11 @@ def test_one_pipeline_and_independent_optional_branches(capture, monkeypatch, sn
             self.sock = sock
             assert source == 'actual-serial' and scale == .001
         def poll(self): pass
-        def observe(self, source, aligned):
+        def observe(self, source, aligned, *, wait_window_ns):
             assert source is aligned  # One frameset passed through existing align hook.
+            start_ns, end_ns = wait_window_ns
+            assert isinstance(start_ns, int) and isinstance(end_ns, int)
+            assert 0 < start_ns <= end_ns
             seen.append((instances[0].enabled, self.pending))
             if snapshot_fault:
                 raise RuntimeError('snapshot failure')

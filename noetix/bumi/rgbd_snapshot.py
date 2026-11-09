@@ -117,6 +117,8 @@ class SnapshotProducer:
         self.receiver = Receiver(sock)
         self.epoch, self.latest, self.pending = uuid.uuid4().hex, None, None
         self.clock_fault = None
+        self.latest_wait_end_ns = None
+        self.observed_pairs = 0
         self.outbox = queue.Queue(maxsize=1)
         self.closed = threading.Event()
         self.sender = threading.Thread(target=self._send, daemon=True, name='rgbd-snapshot-send')
@@ -164,7 +166,40 @@ class SnapshotProducer:
         except Exception:
             self.close()
 
-    def observe(self, source_frames, aligned_frames):
+    def _log_clock_fault(self, meta, stream, host_delta_ms, wait_window_ns):
+        # The fault is latched before logging, so there is at most one record
+        # per producer epoch, even if the fault preceded the first request.
+        wait_end_ns = wait_window_ns[1] if wait_window_ns is not None else None
+        record = {
+            'code': self.clock_fault[0], 'epoch': self.epoch, 'stream': stream,
+            'pairs_before_fault': self.observed_pairs, 'request_pending': self.pending is not None,
+            'host_monotonic_delta_ms': host_delta_ms,
+            'host_wall_delta_ms': (meta['received_ns'] - self.latest['received_ns']) / 1e6,
+            'wait_return_delta_ms': ((wait_end_ns - self.latest_wait_end_ns) / 1e6
+                                     if wait_end_ns is not None and self.latest_wait_end_ns is not None
+                                     else None),
+            'wait_duration_ms': ((wait_end_ns - wait_window_ns[0]) / 1e6
+                                 if wait_window_ns is not None else None),
+            'post_wait_to_observe_ms': ((meta['received_monotonic_ns'] - wait_end_ns) / 1e6
+                                       if wait_end_ns is not None else None),
+        }
+        for key in ('rgb', 'depth'):
+            previous, current = self.latest[key], meta[key]
+            delta_ms = current['source_ms'] - previous['source_ms']
+            delta_ms = delta_ms if math.isfinite(delta_ms) else None
+            record[key] = {
+                'previous_domain': previous['domain'], 'current_domain': current['domain'],
+                'previous_frame_number': previous['frame_number'],
+                'current_frame_number': current['frame_number'],
+                'device_delta_ms': delta_ms,
+                'device_minus_host_ms': delta_ms - host_delta_ms if delta_ms is not None else None,
+            }
+        try:
+            print('[rgbd_snapshot] clock_fault ' + json.dumps(record, allow_nan=False, separators=(',', ':')), flush=True)
+        except (OSError, ValueError):
+            pass  # Failure to log must not replace the clock error.
+
+    def observe(self, source_frames, aligned_frames, *, wait_window_ns=None):
         if self.closed.is_set() or self.clock_fault:
             return
         try:
@@ -188,8 +223,11 @@ class SnapshotProducer:
                     elif abs(delta_ms - host_delta_ms) > 1000:
                         self.clock_fault = ('CLOCK_DISCONTINUITY', 'Device/host elapsed times diverged by over 1 s')
                     if self.clock_fault:
+                        self._log_clock_fault(meta, key, host_delta_ms, wait_window_ns)
                         raise SnapshotError(*self.clock_fault)
             self.latest = meta
+            self.latest_wait_end_ns = wait_window_ns[1] if wait_window_ns is not None else None
+            self.observed_pairs += 1
             request = self.pending
             if not request:
                 return

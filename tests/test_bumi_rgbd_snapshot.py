@@ -635,6 +635,95 @@ def test_partial_cancel_closes_channel(harness, monkeypatch):
     assert h.producer.closed.is_set()
 
 
+def observe_with_clock(monkeypatch, producer, pair, host_ns, wall_ns):
+    from noetix.bumi import rgbd_snapshot
+
+    camera_metadata = rgbd_snapshot.camera_metadata
+
+    def sample(*args, **kwargs):
+        metadata = camera_metadata(*args, **kwargs)
+        return {**metadata, 'received_monotonic_ns': host_ns, 'received_ns': wall_ns}
+
+    with monkeypatch.context() as patch:
+        patch.setattr(rgbd_snapshot, 'camera_metadata', sample)
+        producer.observe(pair, pair, wait_window_ns=(host_ns - 8_000_000, host_ns - 2_000_000))
+
+
+@pytest.mark.parametrize('device_delta_ms, host_delta_ms', [(1500, 30), (30, 1500)])
+def test_clock_discontinuity_before_request_is_logged_once(
+        harness, monkeypatch, capsys, device_delta_ms, host_delta_ms):
+    h = harness
+    producer = h.producer
+    first_host = producer.latest['received_monotonic_ns'] + 30_000_000
+    first_wall = producer.latest['received_ns'] + 30_000_000
+    observe_with_clock(monkeypatch, producer, frames(2), first_host, first_wall)
+    rejected = frames(3, stamp=60 + device_delta_ms)
+    observe_with_clock(monkeypatch, producer, rejected,
+                       first_host + host_delta_ms * 1_000_000, first_wall + 1500_000_000)
+
+    # A plausible later pair and two requests must not clear the same epoch.
+    producer.observe(frames(4), frames(4))
+    assert producer.latest['rgb']['frame_number'] == 2
+    for _ in range(2):
+        ack = h.card.dispatch('capture_rgbd', {})
+        deadline = time.monotonic() + 1
+        while h.callbacks.empty() and time.monotonic() < deadline:
+            producer.poll()
+            time.sleep(.001)
+        assert result_for(h, ack, 'error')['code'] == 'CLOCK_DISCONTINUITY'
+    assert not list(h.output.rglob('metadata.json'))
+
+    prefix = '[rgbd_snapshot] clock_fault '
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith(prefix)]
+    assert len(lines) == 1 and producer.source not in lines[0]
+    event = json.loads(lines[0][len(prefix):])
+    assert (event['code'], event['epoch'], event['stream']) == (
+        'CLOCK_DISCONTINUITY', producer.epoch, 'rgb')
+    assert event['pairs_before_fault'] == 2 and event['request_pending'] is False
+    assert event['host_monotonic_delta_ms'] == event['wait_return_delta_ms'] == host_delta_ms
+    assert event['host_wall_delta_ms'] == 1500
+    assert event['wait_duration_ms'] == 6 and event['post_wait_to_observe_ms'] == 2
+    for stream in ('rgb', 'depth'):
+        assert event[stream] == {
+            'previous_domain': 'hardware_clock', 'current_domain': 'hardware_clock',
+            'previous_frame_number': 2, 'current_frame_number': 3,
+            'device_delta_ms': device_delta_ms,
+            'device_minus_host_ms': device_delta_ms - host_delta_ms,
+        }
+
+
+def test_new_producer_epoch_recovers_and_accepts_long_consistent_elapsed_time(harness, monkeypatch):
+    h = harness
+    old = h.producer
+    ack = begin(h)
+    assert finish(h, ack, frames(0), status='error')['code'] == 'CAMERA_RESTART'
+    old.close()
+    h.client.close()
+
+    parent, child = socket.socketpair()
+    client = SnapshotClient(parent)
+    h.producer = SnapshotProducer(child, old.source, .001)
+    h.camera.capture_rgbd = client.capture
+    try:
+        assert h.producer.epoch != old.epoch
+        host, wall = time.monotonic_ns(), time.time_ns()
+        observe_with_clock(monkeypatch, h.producer, frames(1), host, wall)
+        elapsed_ms = 12 * 60 * 60 * 1000
+        observe_with_clock(monkeypatch, h.producer, frames(1_440_001, stamp=30 + elapsed_ms),
+                           host + elapsed_ms * 1_000_000, wall + elapsed_ms * 1_000_000)
+        ack = begin(h)
+        observe_with_clock(monkeypatch, h.producer, frames(1_440_002, stamp=60 + elapsed_ms),
+                           host + (elapsed_ms + 30) * 1_000_000, wall + (elapsed_ms + 30) * 1_000_000)
+        result = result_for(h, ack, 'completed')
+        metadata = json.loads(Path(result['files']['metadata.json']).read_text())
+        assert metadata['metadata']['epoch'] == h.producer.epoch
+        assert metadata['baseline']['rgb']['frame_number'] == 1_440_001
+    finally:
+        client.close()
+        h.producer.close()
+        h.producer.sender.join(timeout=1)
+
+
 def test_counter_reset_cannot_reclassify_delayed_old_frames(harness):
     h = harness
     ack = begin(h)
