@@ -357,9 +357,45 @@ class VisualOdometryNode:
         # assumed axis mapping for a measured reference point.
         return 'body_axes' if self.calibration.assumed else 'body'
 
+    def slam_extrinsic(self):
+        """Describe the actual estimator mount, without claiming assumed=calibrated.
+
+        In the public odometry message this is producer evidence, not a second
+        ROS topic or an extra canvas port. A generic consumer may use a
+        calibrated mount automatically, but must require an operator-supplied
+        matrix when the installed mount is only an axis assumption.
+        """
+        if self.calibration is None or not self.frame_id:
+            return None
+        mount = self.calibration.data['camera_to_body']
+        rotation = quat_matrix(mount['quaternion'])
+        translation = [float(v) for v in mount['translation']]
+        matrix = [[*rotation[i], translation[i]] for i in range(3)]
+        matrix.append([0., 0., 0., 1.])
+        return {
+            'mode': 'static',
+            'parent_frame': self.base_frame(),
+            'child_frame': self.frame_id,
+            'matrix': matrix,
+            'source': 'bumi_axis_assumption' if self.calibration.assumed else 'measured_mount',
+            'version': self.calibration.id,
+            'calibrated': not self.calibration.assumed,
+            'pose_reference': self.pose_reference(),
+        }
+
     def publish(self):
         sample = make_sample(self.health, self.now(), self.estimate, self.pose_reference())
         quality = sample['vendor']
+        slam = quality['motus_slam']
+        # Odom and depth derive from the same RealSense capture-time mapper,
+        # which uses an arrival-offset approximation for hardware timestamps.
+        # Do not label this a verified independent-clock relation.
+        slam['source_id'] = 'noetix/bumi/camera_color'
+        slam['clock_mapping'] = 'shared_camera_mapper'
+        slam['clock_verified'] = False
+        mount = self.slam_extrinsic()
+        if mount is not None:
+            slam['extrinsic'] = mount
         if not self.active:
             quality.update(status='initializing', reason='visual odometry stopped')
             # Keep the additive SLAM metadata coherent with the legacy status:
@@ -438,6 +474,9 @@ class VisualOdometryNode:
                     quality=sample['vendor'],
                     namespace=self.namespace,
                     pose_reference=self.pose_reference(),
+                    slam_geometry={'extrinsic': self.slam_extrinsic(),
+                                   'clock_mapping': 'shared_camera_mapper',
+                                   'clock_verified': False},
                     segment_id=self.segment,
                     calibration_id=self.calibration.id if self.calibration else None)
 

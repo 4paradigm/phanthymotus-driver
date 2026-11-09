@@ -168,3 +168,23 @@ plugin lifecycle/actions, static TF/mount and the gated camera raw branch.
 On-robot verification: the body-IMU path reaches `tracking`; controller-source
 direct polling and stop/start behavior still need hardware stress validation.
 The camera-IMU RSUSB build path and its modules have been removed.
+
+
+## Generic pointcloud SLAM input evidence
+
+The visual-odometry `motus.odom/1` stream retains its existing status and pose
+ports. Each sample now carries `vendor.motus_slam.source_id`,
+`clock_mapping`, `clock_verified=false`, and, once the optical frame is known,
+`vendor.motus_slam.extrinsic`. This describes the same `base -> optical`
+mount used to launch RTAB-Map. An assumed, level-forward mount is explicitly
+`calibrated=false`; it must not be silently promoted into verified geometry.
+An installation with a measured mount can set `assumed: false` only after
+calibration and will publish `calibrated=true` with the calibration ID.
+
+The depth port's existing `motus.camera/1` declaration includes a
+`vendor.slam_geometry` hint naming the measured cloud frame and ROS timestamp
+mapping; this hint deliberately does not assert a verified clock relationship.
+The unified Perception SLAM card derives frame/clock names from actual tracking
+odometry and native PointCloud2 messages when Core main supplies only topic
+paths. It accepts a verified producer mount, or an explicit 4x4 manual matrix
+on the card. No Bumi-only platform robot preset is required.

@@ -239,11 +239,35 @@ def declare(tool_name: str, topic: str, fmt: str, intrinsics: dict = None) -> li
         "measured_on": spec.get("measured_on", ""),
         "vendor": spec.get("vendor"),
     }
+    if tool_name == "depth":
+        # This is an input hint for the perception pointcloud producer; the
+        # frame is derived from the same namespaced camera subprocess that
+        # stamps capture-timed depth. An arrival-offset mapper is NOT a
+        # verified independent-clock synchronization proof.
+        namespace = topic.strip("/").split("/", 1)[0]
+        fields["vendor"] = {
+            **(fields.get("vendor") or {}),
+            "slam_geometry": {
+                "frame_id": f"{namespace}_rgb_optical",
+                "clock_id": "ros",
+                "clock_mapping": "shared_camera_mapper",
+                "clock_verified": False,
+                "observation_model": "pinhole",
+                "cloud_semantics": "depth_frame",
+            },
+        }
     stream = (intrinsics or {}).get(_STREAM_OF_TOOL.get(tool_name, ""))
     if isinstance(stream, dict):
         runtime = _from_intrinsics(spec, stream)
         if runtime:
+            # Runtime K replaces datasheet optics, not the SLAM input identity.
+            # _from_intrinsics returns its own vendor dict: preserve the
+            # geometry hint rather than silently losing it after startup.
+            slam_geometry = (fields.get("vendor") or {}).get("slam_geometry")
             fields.update(runtime)
+            if slam_geometry is not None:
+                fields["vendor"] = {**(fields.get("vendor") or {}),
+                                    "slam_geometry": slam_geometry}
 
     return [build(topic=topic, format=fmt, id=spec["id"],
                   pipeline=spec.get("pipeline") or [spec["id"]], **fields)]
