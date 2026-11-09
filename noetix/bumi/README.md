@@ -448,6 +448,75 @@ ros2 topic hz /<robot_namespace>/motion/state
 docker logs -f embodied-noetix-bumi
 ```
 
+## Bottle game cards (`bottle_detect` / `bottle_chase` / `stool_claim`)
+
+三张卡片串成“抢板凳”小游戏，每张只做一个基础动作，靠话题连接：
+
+```text
+bottle_detect ──/bottle/target──▶ bottle_chase ──/bottle/event──▶ stool_claim
+```
+
+### `bottle_detect`（sensor）
+
+订阅相机卡片的 `/<ns>/camera/color`（JPEG）和 `/<ns>/camera/depth`
+（`16UC1; compressedDepth zlib`，已对齐到彩色像素）。用 OpenCV 找轮廓，只保留
+像矿泉水瓶的剪影：
+
+- 高宽比 2.0–6.0；
+- 瓶颈宽度 / 瓶身宽度 0.25–0.85；
+- 轮廓面积 / 外接矩形面积 0.40–0.95；
+- 凸包实心度 ≥ 0.80；
+- 必须能从深度图取到有效距离（0.2–6 m）。
+
+满足条件的候选按深度选最近的一瓶，以 5 Hz 发布到
+`/<ns>/bottle/target`：
+
+```json
+{"state": "fresh", "bottle": {"distance_m": 1.84, "bearing_deg": -6.2,
+ "bbox": [292, 130, 58, 290], "confidence": 0.86}, "count": 1}
+```
+
+无目标时发布 `{"state": "no_target"}`，画面/深度过期时发布 `{"state": "stale"}`。
+`bearing_deg` 使用机器人坐标系：前方 0，左侧为正。检测只依赖形状，不依赖颜色；
+透明瓶、逆光或强烈反光时可能漏检。
+
+### `bottle_chase`（actuator）
+
+`start` 订阅连接的 `input_topic`（默认 `/<ns>/bottle/target`）。`chase` 开始追最近
+的一瓶：
+
+- 巡航 0.72 归一化（约 0.40 m/s，比普通行走略快）；
+- 进入 1.2 m 开始线性减速，最低 0.45（约 0.25 m/s，底盘前进死区之上）；
+- 离瓶 0.55 m 停车；
+- 按目标方位转向，方位大于 55° 时原地转；
+- 目标丢失超过 0.8 s、workmode 不是 2、保护模式或底盘被其他动作占用时停车/拒绝；
+- 完成后向 `/<ns>/bottle/event` 发布 `{"state": "arrived", ...}`。
+
+`stop` 立即停车；异步动作通过 `x-completion` 上报 ACP 完成（超时 100 s）。
+
+### `stool_claim`（actuator）
+
+`start` 订阅连接的 `input_topic`（默认 `/<ns>/bottle/event`）。收到
+`{"state": "arrived"}` 后自动播放内置中文语音“抢到板凳！”，3 秒内不重复播放；
+也可以手动 `claim`。音频在 `resource/claim_stool.mp3`，用镜像已有 ffmpeg 转成
+16 kHz 双声道 PCM16，走 `MediaController` 外部播放通道（与 `speaker` 共用）。
+
+### 配置（`config.yaml`）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `bottle_detect.detect_hz` | `5` | 检测频率 |
+| `bottle_chase.cruise_speed` | `0.72` | 巡航速度（归一化） |
+| `bottle_chase.slow_distance_m` | `1.2` | 开始减速的距离 |
+| `bottle_chase.stop_distance_m` | `0.55` | 停车距离 |
+| `stool_claim.auto_claim` | `true` | 收到 arrived 自动播报 |
+
+安全要求：地面平坦防滑，前方至少 3 m 无人无障碍，矿泉水瓶放在地面/低处且不要移动；
+机器人必须已站立并处于 workmode=2。检测到目标后先确认距离和方位合理，再执行
+`chase`；随时可以 `stop`。
+
+测试：`python -m pytest noetix/bumi/tests/test_bottle_cards.py -q`
+
 ## Read-only RGB-D visual odometry card (`rgbd_visual_odometry`)
 
 Single container: the estimator runs inside this bundle, not in a sidecar.

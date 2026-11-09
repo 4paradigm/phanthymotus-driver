@@ -36,6 +36,19 @@ plugins:
     min_wz_rads: 0.33           # 归一化边界 0.40 × 0.83
     # 已经在走的时候的偏航死区。
     min_wz_moving_rads: 0.25    # 归一化边界 0.30 × 0.83
+  # 抢板凳游戏：检测矿泉水瓶 → 追瓶 → 播报“抢到板凳！”。
+  bottle_detect:
+    enabled: true
+    detect_hz: 5
+  bottle_chase:
+    enabled: true
+    # 归一化前进速度；0.72 约为 0.40 m/s，比普通行走略快。
+    cruise_speed: 0.72
+    slow_distance_m: 1.2       # 进入该距离开始减速
+    stop_distance_m: 0.55      # 离瓶该距离停车
+  stool_claim:
+    enabled: true
+    auto_claim: true           # 收到 bottle_chase 的 arrived 自动播报
   mic:
     enabled: true
   sound_direction:

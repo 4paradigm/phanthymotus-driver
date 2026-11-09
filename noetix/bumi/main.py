@@ -159,6 +159,21 @@ class BumiDeviceBundle:
             ))
             print("[bundle] LocoServoPlugin loaded")
 
+        if plugins_cfg.get("bottle_detect", {}).get("enabled", False):
+            from BottleDetect import BottleDetectPlugin
+            self._plugins.append(BottleDetectPlugin(
+                plugins_cfg["bottle_detect"], namespace, executor))
+            print("[bundle] BottleDetectPlugin loaded")
+
+        if (plugins_cfg.get("bottle_chase", {}).get("enabled", False)
+                and high_ctrl is not None):
+            from BottleChase import BottleChasePlugin
+            self._plugins.append(BottleChasePlugin(
+                plugins_cfg["bottle_chase"], namespace, executor, high_ctrl,
+                loco_plugin=loco_plugin,
+            ))
+            print("[bundle] BottleChasePlugin loaded")
+
         if plugins_cfg.get("mic", {}).get("enabled", False) and media_ctrl is not None:
             from device import MicPlugin
             self._plugins.append(MicPlugin(plugins_cfg["mic"], namespace, executor, media_ctrl))
@@ -174,6 +189,12 @@ class BumiDeviceBundle:
             from device import SpeakerPlugin
             self._plugins.append(SpeakerPlugin(plugins_cfg["speaker"], namespace, executor, media_ctrl))
             print("[bundle] SpeakerPlugin loaded")
+
+        if plugins_cfg.get("stool_claim", {}).get("enabled", False) and media_ctrl is not None:
+            from StoolClaim import StoolClaimPlugin
+            self._plugins.append(StoolClaimPlugin(
+                plugins_cfg["stool_claim"], namespace, executor, media_ctrl))
+            print("[bundle] StoolClaimPlugin loaded")
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
