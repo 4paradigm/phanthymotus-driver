@@ -155,7 +155,7 @@ COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
 COPY patrol_baseline.py /work/patrol_baseline.py
-COPY examples/ /work/examples/
+COPY examples/patrol-baseline-bumi-fixed.json /work/examples/patrol-baseline-bumi-fixed.json
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
