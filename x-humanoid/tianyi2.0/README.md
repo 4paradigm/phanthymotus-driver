@@ -258,7 +258,7 @@ properties for a planner to consume, not operator tuning knobs. Tianyi leaves
 the block absent until the response has been measured or obtained from a
 traceable vendor specification; it does not publish guessed timing values.
 
-Input TTL and observation age (600ms) are admission checks: an already-stale
+Input TTL and observation age (1000ms) are admission checks: an already-stale
 command is dropped and cannot resume motion or renew the watchdog. Once
 admitted, a command no longer stops motion at its producer's per-frame TTL
 (commonly 200ms). Its execution deadline ends 500ms after the original
@@ -272,9 +272,10 @@ without cancelling the held SDK action or its firmware heartbeat. A fresh
 accepted frame can then update the same action directly. If no new valid frame
 arrives for 1000ms, the action is cancelled and its heartbeat stops.
 IPC, local queue and SDK reply time consume the original receive budgets,
-never renew them. A detection older than 600ms is never admitted, however
+never renew them. A detection older than 1000ms is never admitted, however
 many new packets reuse it. `control_interface.rate.watchdog_ms` reports 500 and
-`max_obs_age_ms` reports 600 (admission). Deploy Python and the native
+`max_obs_age_ms` reports 1000 (admission), matching Navi's observation window.
+Deploy Python and the native
 worker together; staged stopping requires the worker's advertised capability.
 Python uses the original monotonic receipt time for its silence watchdog; the
 native layer receives the remaining bounded execution deadline and independently
@@ -437,7 +438,7 @@ live lease updates the held SDK action to zero without cancelling it, so a
 following fresh command can update the same action. A zero received while idle
 is a no-op. Lifecycle stop/pause/handover still cancels immediately; the 500ms
 receive watchdog first commands zero and the one-second cancellation deadline
-then cancels a silent stream. The 600ms observation admission limit still
+then cancels a silent stream. The 1000ms observation admission limit still
 rejects stale commands.
 
 Configure loco_servo exposes live settings via `action: config`:

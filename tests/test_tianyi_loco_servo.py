@@ -1572,6 +1572,47 @@ def test_sdk_lease_uses_receipt_watchdog_only(setup):
     assert plugin._backend.deadlines[-1] == pytest.approx(cmd["stamp_ms"] + 500, abs=1)
 
 
+@pytest.mark.parametrize("observation_age_ms", [900, 1000])
+def test_one_second_observation_window_keeps_receipt_stop_deadlines(setup, observation_age_ms):
+    plugin = start(setup)
+    cmd = command(setup, obs_stamp_ms=int(setup.clock.time() * 1000) - observation_age_ms)
+    send(plugin, cmd)
+    assert plugin._counts["accepted"] == 1
+    rate = plugin._info()["control_interface"]["rate"]
+    assert rate["max_obs_age_ms"] == 1000
+    assert rate["watchdog_ms"] == 500
+    assert rate["cancel_after_ms"] == 1000
+    assert plugin._backend.deadlines[-1] == pytest.approx(cmd["stamp_ms"] + 500, abs=1)
+    assert plugin._backend.cancel_deadlines[-1] == pytest.approx(cmd["stamp_ms"] + 1000, abs=1)
+
+
+def test_observation_over_one_second_is_dropped_without_renewing_motion(setup):
+    plugin = start(setup)
+    send(plugin, command(setup))
+    original_valid_at = plugin._last_valid_at
+    original_motion_deadline = plugin._lease_expiry_ms
+    original_cancel_deadline = plugin._cancel_deadline_ms
+    original_writes = len(plugin._backend.messages)
+    setup.clock.advance(0.1)
+    cmd = command(setup, seq=2, obs_stamp_ms=int(setup.clock.time() * 1000) - 1001)
+    send(plugin, cmd)
+    assert plugin._counts["accepted"] == 1
+    assert plugin._counts["dropped"] == 1
+    assert plugin._last["verdict"] == "DROPPED"
+    assert "limit 1000 ms" in plugin._last["reason"]
+    assert len(plugin._backend.messages) == original_writes
+    assert plugin._last_valid_at == original_valid_at
+    assert plugin._lease_expiry_ms == original_motion_deadline
+    assert plugin._cancel_deadline_ms == original_cancel_deadline
+    setup.clock.advance(0.41)
+    plugin._tick()
+    assert plugin._backend.messages[-1] == [0] * 6
+    assert plugin._backend.action_id != 0
+    setup.clock.advance(0.5)
+    plugin._tick()
+    assert plugin._backend.action_id == 0
+
+
 def test_old_but_admissible_observations_do_not_cap_output_at_one_step(setup):
     # Regression: with obs_stamp_ms + 500 as an execution deadline, a steady
     # 10Hz stream of ~420ms-old detections soft-zeroed every frame and the
