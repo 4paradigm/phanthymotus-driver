@@ -81,7 +81,9 @@ def runtime(monkeypatch):
                      HistoryPolicy=NS(KEEP_LAST='keep_last'),
                      DurabilityPolicy=NS(VOLATILE='volatile'),
                      gravity_align_inplace=gravity_align_inplace, pack_slam_cloud=pack_slam_cloud,
-                     input_declaration=slam_input.input_declaration, MappingOdometry=MappingOdometry)
+                     input_declaration=slam_input.input_declaration,
+                     validate_extrinsic_candidate=slam_input.validate_extrinsic_candidate,
+                     MappingOdometry=MappingOdometry)
     if hasattr(slam_input, 'native_frame_metadata'):
         namespace['native_frame_metadata'] = slam_input.native_frame_metadata
     lidar, plugin = extract(namespace, '_LidarNode', 'LidarPlugin')
@@ -643,3 +645,61 @@ def test_actual_mapping_packets_and_metadata_are_rejected_by_perception(runtime,
                                     experimental=experimental)
         fields = {d['field'] for d in error.value.diagnostics}
         assert {'clock_id', 'stamp_source', 'extrinsic', 'clock.relation_id'} <= fields
+
+
+def test_unverified_lidar_extrinsic_candidate_is_visible_but_not_admissible(runtime):
+    matrix = [[1., 0., 0., 0.1], [0., 1., 0., -0.2],
+              [0., 0., 1., 0.3], [0., 0., 0., 1.]]
+    plugin = runtime.plugin({
+        'slam_extrinsic_candidate': {
+            'parent_frame': 'source_imu', 'child_frame': 'livox_native',
+            'source': 'operator_candidate', 'version': 'unverified-v1',
+            'matrix': matrix,
+        },
+    }, 'alpha', NS(add_node=lambda _: None))
+    initial = plugin.dispatch('info', {})
+    declaration = initial['input_metadata'][0]
+    assert declaration['extrinsic'] is None
+    candidate = declaration['extrinsic_candidate']
+    assert candidate['matrix'] == matrix
+    assert candidate['calibrated'] is False and candidate['verified'] is False
+    assert initial['extrinsic_candidate_error'] is None
+    plugin._node._on_cloud(cloud())
+    observed = plugin.dispatch('info', {})['input_metadata'][0]
+    assert observed['extrinsic_candidate']['child_frame'] == 'livox_native'
+    assert observed['extrinsic'] is None
+
+
+def test_candidate_frame_mismatch_diagnostic_does_not_stop_display(runtime):
+    plugin = runtime.plugin({
+        'slam_extrinsic_candidate': {
+            'parent_frame': 'source_imu', 'child_frame': 'incorrect_frame',
+            'source': 'operator_candidate', 'version': 'v1',
+            'matrix': [[1, 0, 0, 0], [0, 1, 0, 0],
+                       [0, 0, 1, 0], [0, 0, 0, 1]],
+        },
+    }, 'alpha', NS(add_node=lambda _: None))
+    plugin._node._on_cloud(cloud())
+    info = plugin.dispatch('info', {})
+    assert 'candidate cloud frame differs' in info['extrinsic_candidate_error']
+    assert info['input_metadata'][0]['extrinsic_candidate'] is None
+    assert info['input_metadata'][0]['extrinsic'] is None
+    drain(plugin._node)
+    assert len(plugin._node.topics['/alpha/lidar/cloud']) == 1
+
+
+def test_invalid_candidate_is_diagnostic_only_and_legacy_lidar_survives(runtime):
+    plugin = runtime.plugin({
+        'slam_extrinsic_candidate': {
+            'parent_frame': 'source_imu', 'child_frame': 'livox_native',
+            'source': 'operator', 'version': 'v1',
+            'matrix': [[2, 0, 0, 0], [0, 1, 0, 0],
+                       [0, 0, 1, 0], [0, 0, 0, 1]],
+        },
+    }, 'alpha', NS(add_node=lambda _: None))
+    info = plugin.dispatch('info', {})
+    assert 'not orthonormal' in info['extrinsic_candidate_error']
+    assert info['input_metadata'][0]['extrinsic'] is None
+    plugin._node._on_cloud(cloud())
+    drain(plugin._node)
+    assert len(plugin._node.topics['/alpha/lidar/cloud']) == 1

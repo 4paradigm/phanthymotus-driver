@@ -141,3 +141,52 @@ def test_unproven_quality_and_coordinate_reset_never_promote_to_tracking():
         q = sample['vendor']['motus_slam']
         assert q['status'] == 'unavailable' and q['segment_id'] is None
         assert q['clock_epoch'] is None and q['stamp_source'] is None
+
+
+def test_discontinuity_quarantines_following_poses_without_inventing_segment():
+    a = adapter()
+    first = a.convert(message())
+    rollback = a.convert(message(sec=26))
+    later = a.convert(message(sec=29))
+    assert first['pose'] is not None
+    assert rollback['pose'] is None and later['pose'] is None
+    assert rollback['vendor']['motus_slam']['rejection'] == 'out_of_order_source_stamp'
+    assert later['vendor']['motus_slam']['rejection'] == 'unverified_continuity_after_discontinuity'
+    observation = a.observation_status()
+    assert observation['continuity_quarantined'] is True
+    assert observation['possible_discontinuities'] == 1
+    assert observation['accepted_samples'] == 1
+    assert observation['rejected_samples'] == 2
+    assert observation['last_accepted_frames'] == ['source_map', 'source_imu']
+    assert observation['segment_id'] is None and observation['clock_epoch'] is None
+    assert later['vendor']['motus_slam']['status'] == 'unavailable'
+    # A new adapter can observe raw evidence but still cannot claim tracking.
+    restarted = adapter().convert(message(sec=29))
+    assert restarted['pose'] is not None
+    assert restarted['vendor']['motus_slam']['status'] == 'unavailable'
+    assert restarted['vendor']['motus_slam']['segment_id'] is None
+
+
+def test_frame_change_does_not_mutate_trusted_source_frame_baseline():
+    a = adapter()
+    a.convert(message(frame='original_map'))
+    changed = a.convert(message(sec=28, frame='relocalized_map'))
+    assert changed['vendor']['motus_slam']['rejection'] == 'source_frames_changed'
+    assert a.declaration('/alpha/slam/mapping/odom')['frame_id'] == 'original_map'
+    assert a.convert(message(sec=29, frame='original_map'))['pose'] is None
+    assert a.observation_status()['continuity_quarantined'] is True
+
+
+def test_receipt_stale_detection_is_diagnostic_not_timestamp_rewriting():
+    a = adapter()
+    assert a.observation_status()['state'] == 'waiting'
+    sample = a.convert(message())
+    observed = a.observation_status(now_monotonic_ns=a._last_received_monotonic_ns)
+    assert observed['state'] == 'observed_unverified'
+    assert observed['receipt_stale'] is False
+    later = a.observation_status(now_monotonic_ns=a._last_received_monotonic_ns + 3_000_000_000)
+    assert later['state'] == 'stale_observation' and later['receipt_stale'] is True
+    assert sample['stamp_ms'] == 27123
+    assert sample['vendor']['motus_slam']['clock_id'] is None
+    assert sample['vendor']['motus_slam']['observation']['received_monotonic_ns'] > 0
+    assert a.observation_status()['segment_id'] is None

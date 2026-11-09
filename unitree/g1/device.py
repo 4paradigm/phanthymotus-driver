@@ -47,7 +47,7 @@ from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from pointcloud_utils import gravity_align_inplace, pack_slam_cloud
 from slam_odometry import MappingOdometry
 import sport_mode_state as _SMS
-from common.slam_input import input_declaration, native_frame_metadata
+from common.slam_input import input_declaration, native_frame_metadata, validate_extrinsic_candidate
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 
@@ -1289,6 +1289,7 @@ class _LocoStateNode(Node):
         with self._lock:
             return {"available": False, "sample": deepcopy(self._mapping_sample),
                     "error": self._mapping_error,
+                    "observation": self._mapping_adapter.observation_status(),
                     "input_metadata": [self._mapping_adapter.declaration(topic)]}
 
     def _format_state(self, msg) -> dict:
@@ -2639,6 +2640,16 @@ class LidarPlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor):
         self._cloud_topic = f"/{namespace}/lidar/cloud"
         self._native_topic = f"/{namespace}/lidar/cloud_native"
+        # Store optional operator measurements as UNVERIFIED diagnostics only.
+        # Do not populate the authoritative 'extrinsic' input declaration.
+        self._extrinsic_candidate = None
+        self._extrinsic_candidate_error = None
+        candidate = (plugin_config or {}).get('slam_extrinsic_candidate')
+        if candidate is not None:
+            try:
+                self._extrinsic_candidate = validate_extrinsic_candidate(candidate)
+            except (TypeError, ValueError) as error:
+                self._extrinsic_candidate_error = str(error)
         self._node = _LidarNode(self._cloud_topic)
         executor.add_node(self._node)
 
@@ -2648,6 +2659,14 @@ class LidarPlugin:
     def _cloud_tool(self) -> dict:
         from copy import deepcopy
         source_header = deepcopy(self._node._native_source_header)
+        candidate = deepcopy(self._extrinsic_candidate)
+        candidate_error = self._extrinsic_candidate_error
+        if (candidate is not None and source_header is not None and
+                source_header.get('frame_id') and
+                candidate['child_frame'] != source_header['frame_id']):
+            candidate_error = ('candidate cloud frame differs from observed source header: ' +
+                               str(source_header['frame_id']))
+            candidate = None
         return {
             "name": "lidar_cloud",
             "type": "sensor",
@@ -2662,10 +2681,28 @@ class LidarPlugin:
                 source_topic='rt/utlidar/cloud_livox_mid360',
                 source_type='sensor_msgs.msg.dds_.PointCloud2_',
                 frame_id=source_header['frame_id'] if source_header else None,
-                source_header=source_header)],
+                source_header=source_header,
+                extrinsic_candidate=candidate)],
+            "extrinsic_candidate_error": candidate_error,
             "configSchema": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "slam_extrinsic_candidate": {
+                        "type": "object",
+                        "title": "Unverified lidar-to-odometry transform candidate",
+                        "description": ("Measured 4x4 rigid transform in meters, parent=odometry "
+                                        "child frame and child=raw lidar frame. Diagnostic only; "
+                                        "does not assert calibration or enable mapping."),
+                        "properties": {
+                            "parent_frame": {"type": "string"},
+                            "child_frame": {"type": "string"},
+                            "source": {"type": "string"},
+                            "version": {"type": "string"},
+                            "matrix": {"type": "array"},
+                        },
+                        "required": ["parent_frame", "child_frame", "source", "version", "matrix"],
+                    },
+                },
             },
         }
 
@@ -2684,7 +2721,8 @@ class LidarPlugin:
             tool = self._cloud_tool()
             return {"state": "running", "topic_out": tool['topic_out'],
                     "input_metadata": tool['input_metadata'], "native_error": self._node._native_error,
-                    "display_error": self._node._display_error}
+                    "display_error": self._node._display_error,
+                    "extrinsic_candidate_error": tool['extrinsic_candidate_error']}
         return None
 
 

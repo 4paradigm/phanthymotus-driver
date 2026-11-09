@@ -8,6 +8,7 @@ promote these samples to tracking. Raw covariance is evidence, not a claim of
 estimator uncertainty; it is retained under vendor rather than pose.
 """
 import math
+import time
 from uuid import uuid4
 
 from common.odom import DEFAULT_UNITS
@@ -31,11 +32,52 @@ def _numbers(values):
 
 class MappingOdometry:
     def __init__(self):
+        # This is an adapter-process generation, NEVER a robot clock epoch
+        # or a verified odometry segment identifier.
         self.source_generation = uuid4().hex
         self._last_stamp_ns = None
         self._frames = None
+        self._last_received_monotonic_ns = None
+        self._accepted_samples = 0
+        self._rejected_samples = 0
+        self._possible_discontinuities = 0
+        self._continuity_latched = False
+        self._last_rejection = None
+        self._observation_state = 'waiting'
+
+    def observation_status(self, *, now_monotonic_ns=None, stale_after_s=2.0):
+        """Diagnostic receipt health, not a SLAM tracking or clock assertion.
+
+        A receipt gap alone does not prove the robot reset or relocalized.
+        Once a timestamp rollback or source-frame change is observed, the
+        candidate stream is quarantined until a new adapter generation.
+        """
+        if (isinstance(stale_after_s, bool) or not isinstance(stale_after_s, (int, float))
+                or not math.isfinite(stale_after_s) or stale_after_s <= 0):
+            raise ValueError('stale_after_s must be positive and finite')
+        if now_monotonic_ns is None:
+            now_monotonic_ns = time.monotonic_ns()
+        if type(now_monotonic_ns) is not int or now_monotonic_ns < 0:
+            raise ValueError('invalid monotonic observation time')
+        last = self._last_received_monotonic_ns
+        age_s = max(0, now_monotonic_ns - last) / 1e9 if last is not None else None
+        stale = age_s > stale_after_s if age_s is not None else None
+        state = ('waiting' if last is None else
+                 'stale_observation' if stale else self._observation_state)
+        return dict(available=False, state=state, receipt_age_s=age_s,
+                    receipt_stale=stale, last_source_stamp_ns=self._last_stamp_ns,
+                    last_accepted_frames=list(self._frames) if self._frames else None,
+                    accepted_samples=self._accepted_samples,
+                    rejected_samples=self._rejected_samples,
+                    possible_discontinuities=self._possible_discontinuities,
+                    continuity_quarantined=self._continuity_latched,
+                    last_rejection=self._last_rejection,
+                    source_generation=self.source_generation,
+                    clock_epoch=None, segment_id=None)
 
     def convert(self, msg):
+        received_monotonic_ns = time.monotonic_ns()
+        self._last_received_monotonic_ns = received_monotonic_ns
         quality = dict(status='unavailable', stamp_source=None, clock_id=None,
                        clock_epoch=None, segment_id=None, source_stamp_ns=None,
                        source_generation=self.source_generation,
@@ -63,8 +105,6 @@ class MappingOdometry:
             if len(covariance) != 36:
                 raise ValueError('invalid_source_covariance_length')
             result['vendor']['source_covariance'] = _numbers(covariance)
-            previous_frames = self._frames
-            self._frames = frames
             if self._last_stamp_ns is not None:
                 if stamp_ns == self._last_stamp_ns:
                     raise ValueError('duplicate_source_stamp')
@@ -72,13 +112,36 @@ class MappingOdometry:
                     raise ValueError('out_of_order_source_stamp')
                 if stamp_ns // 1_000_000 == self._last_stamp_ns // 1_000_000:
                     raise ValueError('duplicate_profile_stamp')
-            self._last_stamp_ns = stamp_ns
-            if previous_frames is not None and frames != previous_frames:
+            if self._frames is not None and frames != self._frames:
                 raise ValueError('source_frames_changed')
+            if self._continuity_latched:
+                raise ValueError('unverified_continuity_after_discontinuity')
+            # Commit the new reference only after all checks pass. Invalid
+            # packets cannot silently establish a new frame or time baseline.
+            self._last_stamp_ns = stamp_ns
+            self._frames = frames
+            self._accepted_samples += 1
+            self._last_rejection = None
+            self._observation_state = 'observed_unverified'
             result['pose'] = dict(frame_id=frames[0], child_frame_id=frames[1],
                                   position=position, quaternion=quaternion)
         except (AttributeError, TypeError, ValueError, OverflowError) as error:
-            quality['rejection'] = str(error)
+            reason = str(error)
+            self._rejected_samples += 1
+            self._last_rejection = reason
+            if reason in ('out_of_order_source_stamp', 'source_frames_changed'):
+                if not self._continuity_latched:
+                    self._possible_discontinuities += 1
+                self._continuity_latched = True
+            self._observation_state = ('possible_discontinuity' if self._continuity_latched
+                                       else 'invalid_sample')
+            quality['rejection'] = reason
+        quality['observation'] = dict(state=self._observation_state,
+                                      accepted_samples=self._accepted_samples,
+                                      rejected_samples=self._rejected_samples,
+                                      possible_discontinuities=self._possible_discontinuities,
+                                      continuity_quarantined=self._continuity_latched,
+                                      received_monotonic_ns=received_monotonic_ns)
         return result
 
     def declaration(self, topic):

@@ -58,3 +58,57 @@ def test_source_mutation_does_not_rewrite_a_captured_evidence_packet():
     msg.header.frame_id = 'changed_frame'
     msg.data[:] = b'mutated'
     assert packet == original
+
+
+def test_raw_packet_marks_source_evidence_without_promoting_clock():
+    from common.slam_input import native_frame_metadata
+    valid = native_frame_metadata(cloud(), source_generation='source-adapter-1')
+    assert valid['source_evidence'] == {
+        'raw_header_present': True, 'source_stamp_valid': True,
+        'source_frame_valid': True, 'payload_size_bytes': len(cloud().data),
+        'measurement_stamp_verified': False, 'clock_relation_verified': False,
+    }
+    invalid = native_frame_metadata(cloud(0, 0), source_generation='source-adapter-1')
+    assert invalid['source_evidence']['source_stamp_valid'] is False
+    assert invalid['mapping']['verified'] is False
+    assert invalid['stamp_ns'] is None
+
+
+def test_rigid_candidate_is_only_diagnostic_and_never_calibrated():
+    from common.slam_input import validate_extrinsic_candidate
+    candidate = {'parent_frame': 'robot_reference', 'child_frame': 'lidar_native',
+                 'source': 'operator_candidate', 'version': 'unverified-v1',
+                 'matrix': [[1, 0, 0, 0.2], [0, 1, 0, 0.1],
+                            [0, 0, 1, -0.3], [0, 0, 0, 1]]}
+    result = validate_extrinsic_candidate(candidate)
+    assert result['calibrated'] is False and result['verified'] is False
+    assert result['matrix'][0][3] == 0.2
+    assert candidate['matrix'][0][3] == 0.2
+    result['matrix'][0][3] = 100
+    assert candidate['matrix'][0][3] == 0.2
+
+
+@pytest.mark.parametrize('matrix', [
+    [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]],
+    [[2, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+    [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 1, 1]],
+    [[True, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+    [[float('nan'), 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+])
+def test_invalid_extrinsic_candidate_is_rejected(matrix):
+    from common.slam_input import validate_extrinsic_candidate
+    with pytest.raises(ValueError, match='slam_extrinsic_candidate'):
+        validate_extrinsic_candidate({
+            'parent_frame': 'robot_reference', 'child_frame': 'lidar_native',
+            'source': 'operator', 'version': 'v1', 'matrix': matrix,
+        })
+
+
+def test_candidate_cannot_self_assert_calibration():
+    from common.slam_input import validate_extrinsic_candidate
+    raw = {'parent_frame': 'robot', 'child_frame': 'lidar', 'source': 'manual',
+           'version': 'v1', 'matrix': [[1, 0, 0, 0], [0, 1, 0, 0],
+                                     [0, 0, 1, 0], [0, 0, 0, 1]],
+           'calibrated': True}
+    with pytest.raises(ValueError, match='cannot assert verified'):
+        validate_extrinsic_candidate(raw)
