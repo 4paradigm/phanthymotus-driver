@@ -23,11 +23,13 @@ cards:
   - { name: stand_up_lie_prone, type: actuator }
   - { name: semantic_action,   type: actuator }
   - { name: action_recording,  type: actuator }
+  - { name: traffic_police_gesture, type: actuator }
   - { name: mic,               type: sensor }
   - { name: sound_direction,   type: sensor }
   - { name: speaker,           type: actuator }
   - { name: camera,            type: sensor }
   - { name: depth,             type: sensor }
+  - { name: traffic_light,     type: processor }
   - { name: motion_state,      type: sensor }
   - { name: rgbd_visual_odometry, type: sensor }
   - { name: vision_capture,    type: actuator }

@@ -388,7 +388,8 @@ class LocoPlugin:
         self._move_thread: threading.Thread | None = None
         self._move_stop_event = threading.Event()
         # loco_relative_move rotate bookkeeping, read by _rotate_status.
-        self._rotate_lock = threading.Lock()
+        # Observation admission and destination reservation share one reentrant lock.
+        self._rotate_lock = threading.RLock()
         self._rotate_stop_event = threading.Event()
         self._rotate_state: dict = {"state": "idle", "last_result": None}
         self._body_action: str | None = None
@@ -396,6 +397,7 @@ class LocoPlugin:
         # action whose terminal callback fires exactly once.
         self._rotate_worker: threading.Thread | None = None
         self._active_action_id: str | None = None
+        self._last_action_id: str | None = None
         self._destination_action = "rotate"
         # Card configuration, like the other cards: the slip factors are
         # operator-settable through the config action (configSchema below) and
@@ -413,6 +415,12 @@ class LocoPlugin:
         # Set by LocoServoPlugin at construction. `loco` is built first, so the
         # link cannot be a constructor argument in this direction.
         self._servo = None
+        from observation_safety import ObservationSafety
+        self._observation = ObservationSafety(self)
+        from traffic_police_gesture import TrafficPoliceGesture
+        self._traffic_gesture = TrafficPoliceGesture(
+            self, plugin_config.get("traffic_police_gesture", {}),
+            lambda *args: _acp_notify(*args))
 
     def attach_servo(self, servo) -> None:
         """Let the streaming chassis card be paused before we drive it ourselves."""
@@ -436,7 +444,7 @@ class LocoPlugin:
         logs as nothing at all.
         """
         thread = self._move_thread
-        return bool((thread is not None and thread.is_alive())
+        return bool(self._observation.reserved or (thread is not None and thread.is_alive())
                     or self._rotate_state["state"] == "running" or self._body_action)
 
     def publish_velocity(self, x: float, y: float, z: float) -> None:
@@ -447,6 +455,8 @@ class LocoPlugin:
         with separate limiters can interleave inside a single publish, and the
         SDK has no way to tell us that happened.
         """
+        if (self._observation.reserved or self._body_action) and any((x, y, z)):
+            raise RuntimeError("observation or body action reserves the chassis")
         self._publish_cmd(x, y, z, _get_default_cmd(), 0)
 
     def _preempt_servo(self, reason: str) -> bool:
@@ -473,13 +483,16 @@ class LocoPlugin:
             self._servo.set_explicit_velocity_owner(owned)
 
     def get_tools(self) -> list:
-        return [
+        tools = [
             self._loco_tool(),
             self._loco_relative_move_tool(),
             self._stand_up_lie_prone_tool(),
             self._semantic_action_tool(),
             self._action_recording_tool(),
         ]
+        if self._traffic_gesture.enabled:
+            tools.append(self._traffic_gesture.get_tool())
+        return tools
 
     def _loco_tool(self) -> dict:
         return {
@@ -537,7 +550,10 @@ class LocoPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["rotate", "move", "stop_move", "status"]},
+                    "action": {"type": "string", "enum": ["rotate", "move", "stop_move", "status",
+                        "observation_begin", "observation_rotate", "observation_status", "observation_end"]},
+                    "session_id": {"type": "string", "description": "observation_begin 返回的会话编号"},
+                    "request_id": {"type": "string", "description": "观察转角的唯一请求编号；重试保持相同编号"},
                     "x_m": {"type": "number", "minimum": -3, "maximum": 3,
                             "description": "move 动作：目标点在启动时机身系的前后坐标（米，正=前）。"},
                     "y_m": {"type": "number", "minimum": -3, "maximum": 3,
@@ -552,10 +568,19 @@ class LocoPlugin:
                                "description": "走到启动机身系下的目标点 (x,y)：朝向目标先转/边走边转，只前进不横移；到达位置容差后停车。距离 0.1–3 m。"},
                     "stop_move": {"params": [], "description": "立即停止当前目标移动或旋转并刹停。"},
                     "status": {"params": [], "description": "查询当前目标动作、距离反馈来源及估计位移或转角结果。"},
+                    "observation_begin": {"params": [], "description": "只读检查并独占观察会话；不移动。每次最多三次、单次10度、累计绝对值30度。"},
+                    "observation_rotate": {"params": ["session_id", "request_id", "angle_deg"],
+                        "required": ["session_id", "request_id", "angle_deg"],
+                        "description": "安全观察转角；返回 running 仅表示接受。须 observation_status=ready 且 stop_confirmed 才可复看。"},
+                    "observation_status": {"params": ["session_id"], "required": ["session_id"],
+                        "description": "读取会话预算、动作编号和反馈停稳状态。"},
+                    "observation_end": {"params": ["session_id"], "required": ["session_id"],
+                        "description": "取消、停止、检查停稳并释放观察会话；locked 不能当作正常结束。"},
                 },
-                "x-hooks": {"on_interrupt_motion": {"action": "stop_move"}},
+                "x-hooks": {"on_interrupt_motion": {"action": "stop_move"},
+                            "on_interrupt_all": {"action": "stop_move"}},
                 # Both actions retain the existing asynchronous ACP contract.
-                "x-completion": {"actions": ["rotate", "move"], "timeout": 120},
+                "x-completion": {"actions": ["rotate", "move", "observation_rotate"], "timeout": 120},
             },
             "configSchema": {
                 "type": "object",
@@ -664,8 +689,13 @@ class LocoPlugin:
         # own completion fires the ACP "cancelled" callback — joining here
         # completes the ACP action before Agent Core is left holding a
         # pending action (mirrors VisionCapturePlugin.stop).
+        gesture_stop = self._traffic_gesture.shutdown()
+        if gesture_stop.get("state") == "locked":
+            print("[traffic_police_gesture] shutdown: playback exit is unconfirmed", flush=True)
         self._stop_move()
         self._wait_for_rotate_idle()
+        if self._observation.reserved:
+            self._observation.end(self._observation.session['session_id'])
 
     def _wait_for_rotate_idle(self, timeout_s: float = 6.0) -> bool:
         # Cover the dispatch-acceptance window: stop may land after the
@@ -688,6 +718,13 @@ class LocoPlugin:
         return False
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        # Resolve this tool before the generic lifecycle stop: its explicit
+        # stop(execute=true) means a parking gesture, never a chassis brake.
+        if args.get('_tool_name') == "traffic_police_gesture":
+            return self._traffic_gesture.dispatch(action, args)
+        if (args.get('_tool_name') == "action_recording" and action == "stop_playback"
+                and self._traffic_gesture.active is not None):
+            return self._traffic_gesture.cancel()
         if action == "config" and args.get('_tool_name') == 'loco_relative_move':
             return self._apply_distance_config(args)
         if action == "start":
@@ -699,9 +736,19 @@ class LocoPlugin:
             # log connecting the two.
             self._preempt_servo("loco.stop")
             self._stop_move()
-            return {"state": "idle"}
+            return self._finish_observation_stop({"state": "idle"})
 
         tool_name = args.pop('_tool_name', '')
+        if tool_name == "loco_relative_move" and action.startswith("observation_"):
+            if action == "observation_begin":
+                return self._observation.begin()
+            if action == "observation_rotate":
+                return self._observation.rotate(args)
+            if action == "observation_status":
+                return self._observation.status(args.get("session_id"))
+            if action == "observation_end":
+                return self._observation.end(args.get("session_id"))
+            return None
 
         handler = None
         if tool_name == "loco" and action == "move":
@@ -725,21 +772,45 @@ class LocoPlugin:
         if handler is None:
             return None
 
-        # Before touching the robot, not after: otherwise this command and the
-        # policy's next one race, and which one the robot ends up obeying
-        # depends on timing nobody controls. Every action reachable from here
-        # moves the body, so every one of them preempts.
         body_action = tool_name in ("stand_up_lie_prone", "semantic_action", "action_recording")
         if body_action:
-            with self._rotate_lock:
-                if self._body_action:
-                    return {"state": "error", "command_sent": False,
-                            "error": f"chassis reserved by {self._body_action}"}
-                self._body_action = f"{tool_name}.{action}"
-                self._rotate_stop_event.set()
+            return self._execute_body_action(tool_name, action, handler)
+        preempted = self._preempt_servo(f"{tool_name}.{action}")
+        result = handler()
+        if action == "stop_move":
+            result = self._finish_observation_stop(result)
+        if preempted and isinstance(result, dict):
+            result["preempted_loco_servo"] = True
+        return result
+
+    def _execute_body_action(self, tool_name, action, handler, *, retain=False,
+                             owned_by=None, preflight=None, on_reserved=None):
+        """One reservation/preemption path for posture, semantic and teaching calls.
+
+        A gesture retains this same reservation across firmware playback; its
+        cancel path may reenter only the reservation it owns. JSON arguments
+        cannot set retain/owned_by or replace the callable handler.
+        """
+        reservation = owned_by or f"{tool_name}.{action}"
+        with self._rotate_lock:
+            if self._observation.reserved:
+                return {"state": "error", "command_sent": False,
+                        "reason": "observation_busy", "error": "observation session reserves the chassis"}
+            if ((owned_by is not None and self._body_action != owned_by)
+                    or (owned_by is None and self._body_action)):
+                return {"state": "error", "command_sent": False,
+                        "reason": "body_action_busy", "error": f"chassis reserved by {self._body_action}"}
+            if preflight is not None:
+                refusal = preflight()
+                if refusal is not None:
+                    return refusal
+            self._body_action = reservation
+            if on_reserved is not None:
+                on_reserved()
+            self._rotate_stop_event.set()
         try:
-            preempted = self._preempt_servo(f"{tool_name}.{action}")
-            if body_action and not self._wait_for_rotate_idle():
+            preempted = self._preempt_servo(reservation)
+            if not self._wait_for_rotate_idle():
                 return {"state": "error", "command_sent": False,
                         "error": "rotation has not stopped; competing action was not sent"}
             result = handler()
@@ -747,9 +818,26 @@ class LocoPlugin:
                 result["preempted_loco_servo"] = True
             return result
         finally:
-            if body_action:
-                with self._rotate_lock:
-                    self._body_action = None
+            if not retain:
+                self._release_body_action(reservation)
+
+    def _release_body_action(self, reservation) -> bool:
+        with self._rotate_lock:
+            if self._body_action != reservation:
+                return False
+            self._body_action = None
+            return True
+
+    def _finish_observation_stop(self, result: dict) -> dict:
+        """Interrupt cleanup cannot depend on another LLM turn executing finally."""
+        if not self._observation.reserved:
+            return result
+        session_id = self._observation.session['session_id']
+        observation = self._observation.end(session_id)
+        result = {**result, "observation": observation}
+        if not observation.get('released') or not observation.get('stop_confirmed'):
+            result.update(state="error", code="STOP_UNCONFIRMED")
+        return result
 
     def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0,
                      *, cancel_event: threading.Event | None = None):
@@ -770,6 +858,9 @@ class LocoPlugin:
         # Reserve move startup until its worker exists, so rotate cannot
         # enter between the busy check and launching the move thread.
         with self._rotate_lock:
+            if self._observation.reserved:
+                return {"state": "error", "command_sent": False,
+                        "error": "translation is forbidden during an observation session"}
             if self._body_action:
                 return {"state": "error", "error": f"chassis reserved by {self._body_action}"}
             if self._rotate_state["state"] == "running":
@@ -851,6 +942,7 @@ class LocoPlugin:
             return {"state": "moving", "vx": vx, "vy": vy, "vyaw": vyaw, "duration": "continuous (5s watchdog)"}
 
     def _stop_move(self) -> dict:
+        self._observation.on_stop()
         self._rotate_stop_event.set()
         self._move_stop_event.set()
         if self._move_thread and self._move_thread.is_alive():
@@ -872,6 +964,10 @@ class LocoPlugin:
         # to the bumi_rotate daemon thread, which records idle + the full
         # result and fires the ACP terminal exactly once.
         with self._rotate_lock:
+            token = args.pop('_observation_token', None)
+            if self._observation.reserved and (action != "rotate" or token is not self._observation.token):
+                return {"state": "error", "command_sent": False,
+                        "error": "use observation_rotate with the current session_id; raw motion is blocked"}
             if self._body_action:
                 return {"state": "error", "error": f"chassis reserved by {self._body_action}"}
             if self._rotate_state["state"] == "running":
@@ -965,6 +1061,7 @@ class LocoPlugin:
                 self._rotate_state["state"] = "idle"
                 if result is not None:
                     self._rotate_state["last_result"] = result
+                self._last_action_id = action_id
 
     def _rotate_preflight(self, args: dict) -> tuple[float | None, dict | None]:
         # Synchronous pre-motion checks (Task 2 impl steps 1–2), shared by
@@ -1342,6 +1439,8 @@ class LocoPlugin:
         with self._rotate_lock:
             return {"state": self._rotate_state["state"],
                     "last_result": self._rotate_state["last_result"],
+                    **({"action_id": self._active_action_id} if self._active_action_id else {}),
+                    **({"last_action_id": self._last_action_id} if self._last_action_id else {}),
                     **({"action": self._destination_action} if self._rotate_state["state"] == "running" else {})}
 
     def _do_posture_action(self, action: str, args: dict) -> dict:
@@ -1546,6 +1645,11 @@ class LocoPlugin:
         if mode == 26:
             return self._protection_error(requested_action, steps, mode)
 
+        if (self._traffic_gesture.active is not None
+                and self._body_action == self._traffic_gesture.active['owner'] and mode != 2):
+            return {"state": "error", "command_sent": False, "reason": "unsafe_robot_state",
+                    "error": "Gesture playback requires an already standing walking-mode robot; no enable/stand-up chain was sent"}
+
         stable_modes = {0, 1, 2, 30}
         if mode not in stable_modes:
             mode = self._wait_for_workmode(stable_modes, timeout_s=15.0)
@@ -1606,6 +1710,11 @@ class LocoPlugin:
                              expected_modes: set[int], preparation_steps: list[dict],
                              safety_requirements: str, index: int = 0,
                              recording_id: int | None = None) -> dict:
+        gesture = self._traffic_gesture.active
+        if (gesture is not None and self._body_action == gesture['owner']
+                and gesture['cancel'].is_set()):
+            return {"state": "error", "command_sent": False,
+                    "reason": "gesture_cancelled_before_command", "error": "Gesture was cancelled before playback submission"}
         observed = self._send_edge_and_wait(
             _get_control_cmd(command_name), expected_modes | {26}, index=index, timeout_s=3.0)
         if observed == 26:
@@ -3081,8 +3190,12 @@ def _acp_notify(action_id, status, result, tool):
         context = ssl._create_unverified_context() if url.startswith("https://") else None
         with urllib.request.urlopen(request, timeout=5, context=context) as response:
             response.read()
+        # Transport receipt only: Core may acknowledge an early callback even
+        # when it has not registered the action. Other ACP callers may ignore it.
+        return {"state": "sent", "error": None}
     except Exception as exc:
         print(f"[Bumi ACP] callback failed for {action_id}: {exc}", flush=True)
+        return {"state": "failed", "error": f"{type(exc).__name__}: {exc}"}
 
 
 class VisionCapturePlugin:

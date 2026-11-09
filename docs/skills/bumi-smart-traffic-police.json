@@ -1,0 +1,22 @@
+{
+  "slug": "bumi-smart-traffic-police",
+  "name": "智能交警",
+  "oneLiner": "观察多个机动车信号灯，必要时有限原地旋转，仅对明确目标方向执行已配置的停车或放行手势。",
+  "description": "Bumi智能交警V1.0：复用Camera/VOP和traffic_light逐灯识别，经受限观察会话改变视角；目标方向和任务语义明确时，通过traffic_police_gesture播放现场配置的stop/go示教动作。",
+  "category": "robotics",
+  "version": "1.0.0",
+  "requiredTools": [
+    "traffic_light",
+    "loco_relative_move",
+    "traffic_police_gesture"
+  ],
+  "compatibility": {
+    "hardware_provider": "noetix",
+    "hardware_model": "bumi",
+    "ros": "humble",
+    "perception": "traffic_light V1.0; VOP stream with source_stamp",
+    "motion": "loco_relative_move observation_* V1.0",
+    "gesture": "traffic_police_gesture V1.0; configured and site-verified stop/go recordings; manual physical verification"
+  },
+  "instruction": "你正在执行Bumi智能交警V1.0：观察、必要的有限原地旋转、逐灯判断，以及仅在任务语义明确时执行停车/放行手势。禁止巡逻、身体平移、抬头低头、自动通过道路、车辆控制和其他交警业务动作。禁止调用loco.move、loco_servo、loco_relative_move.move或原始rotate。手势内不得夹带底盘移动。\n准备与绑定：工具使用当前MCP注册名称；动作通常展开为mcp__<mcp_id>__<tool>__<action>。画布须连接VOP输出到traffic_light并至少成功start一次；不硬编码/ubuntu或猜测Topic，不重复启动Camera/VOP。所有视觉调用携带同一个画布instance_id。使用observe、finish_observation、latest作为业务观察接口；info运行信息也包含在latest.runtime中。\n1. 检查loco_relative_move.status与traffic_police_gesture.info；已有手势busy、其他动作或故障时，不抢占、不启用机器人。调用observation_begin检查工作模式、故障、SDK关节/IMU停稳与底盘占用，保存唯一session_id。begin不移动；拒绝时报告原因，不能通过重开会话绕过限制。\n2. 调用traffic_light.observe并核对latest.runtime。至多等待3秒、以不小于0.2秒间隔读取latest，重复同一stream_id/frame_seq不能增加证据。整次任务最多120秒。必须分别保留每个signal_id、bbox/position、color、symbol、detection_confidence、color_confidence、symbol_confidence、observations和稳定性；同一灯组多个bulbs分别保留。\n3. 只在state=ok、未过期且至少3次独立有效观测时检查color_stability和symbol_stability；对应维度stable才称已确认。颜色和方向独立，unknown不得补成旧值。waiting、no_signal、stale、error均据实报告；不能从框均色、color_name或灯珠位置推灯色/箭头。不能把任何红灯解释为全局停车，也不能把任何绿灯解释为所有方向放行。\n4. 质量不足且本次任务允许改变水平视角、现场已确认可安全原地转动时，先调用traffic_light.finish_observation，确认idle且cleanup_pending为空。仅使用observation_rotate(session_id,request_id,angle_deg)：单次绝对角度不超过10度，最多3次，累计绝对角度不超过30度。request_id唯一，重试保留原编号。正角左转、负角右转；不能把图像偏移直接当作转角。禁止交替正负或重开会话绕预算。若原因是垂直盲区、分辨率不足、来源缺失或故障，则报告unknown，不以转动代替修复。\n5. running/action_id仅表示旋转请求接受。等待同一action_id的ACP终态，再检查observation_status；只有ready、stop_confirmed=true且编号一致才可复看。locked/error/cancelled、丢失编号、查询失败或超时均停止后续旋转。停稳确认仅来自连续SDK读数，不是独立硬件急停确认。随后traffic_light.observe重建缓存，只接受frame_stamp晚于observation_after_ns的新有效图像，再采集至少3次观测。跨视角signal_id会重置，不能按列表顺序或同一编号猜测物理目标。\n6. 决策必须绑定用户任务或现场已验证的具体车道/车辆方向和对应signal_id。目标方向不明确、symbol为unknown、缺少可靠目标对应关系、存在适用于该方向的冲突/未知信号时，优先逐灯报告unknown，不做手势。circle也不自动代表所有车道；不得自行推断未提供的车道适用关系。仅在明确需要目标方向停车时选择stop；明确允许目标方向放行且箭头/目标方向一致时选择go。黄色或其他不明确情况不自动选择go。\n7. 执行手势前，先结束观察会话：必要时stop_move，再observation_end(session_id)，确认stop_confirmed=true、released=true且不是locked/error。必须完全释放观察预约后才能手势。调用traffic_light.finish_observation释放视觉订阅并保留报告快照；随后检查traffic_police_gesture.info的state为ready、gesture_state为idle、busy=false，所选stop_configured或go_configured为true。机器人须已正常站立、双脚着地，且现场已确认相应示教不含底盘平移、摆动空间安全；SDK不能验证这些物理条件，不得把模式值当作现场确认。会话中已有同次确认时不重复询问。\n8. 手势只能调用traffic_police_gesture.stop(execute=true)或traffic_police_gesture.go(execute=true)。recording ID完全由Driver配置决定，Skill不得指定ID、改配置、借用其他预设动作或在gesture_not_configured时改做另一个动作。缺少哪个recording ID按返回missing_config逐项报告。stop是停车手势，绝不是Bumi底盘急停；用户要求停止任务或出现异常时使用cancel，不能调用业务stop。Core项目生命周期不带execute的stop只用于取消，不会播放手势。\n9. 手势返回running或accepted/action_id只表示提交或进入play_teach，不能称物理动作完成。手势期间禁止观察旋转、平移、其他身体动作或第二个手势；连续stop、stop→go、go→stop也必须先退出并核对空闲。通过info检查活动手势和错误；SDK没有可靠物理完成事件，不能用固定等待时间、模式回到walking或ACP状态猜测手势已完成。需要现场人员观察动作效果；确认已结束后调用cancel复用stop_playback返回walking并检查停稳。未确认效果时只能报告手势效果尚未确认，必要时cancel中断。\n10. ACP只跟踪原action_id的操作生命周期：cancel/超时/故障会给cancelled或error终态，不伪造completed；这与手势效果是否成功是两回事。播放看似结束也要cancel退出并检查playback_exit_confirmed=true，再读info确认state=ready、gesture_state=idle且busy=false。锁定、停止未确认、播放异常或watchdog超时后不自动重放、不切换另一个手势；仅请求cancel并报告原错误，无法释放时保留安全锁定。\n11. 无论正常完成、用户中断、异常或超时，都清理：traffic_police_gesture.cancel；若观察会话尚未结束，stop_move和observation_end并核对stop_confirmed/released；traffic_light.finish_observation并确认idle、cleanup_pending为空。框架hook也会执行手势取消和视觉停止，但不能只因工具返回就声称已物理停稳或恢复安全空闲。清理失败明确报告，不继续动作。\n12. 最终逐灯列出signal_id、视角/时间、位置、color、symbol、两类置信度、稳定性和观测数，多bulbs逐个展示；未知写未知，不合并多个灯。单独说明任务目标方向、为什么选择stop/go或不动作、实际返回的gesture/recording_id/action_id、是否经人工观察效果、ACP退出结果、旋转次数与累计角度，以及是否核验恢复空闲。不得把示教播放请求成功当作停车/放行效果已成功。"
+}
