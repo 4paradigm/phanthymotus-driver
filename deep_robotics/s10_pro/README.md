@@ -145,15 +145,15 @@ lane's FFmpeg command gains a `remap` stage at the 1024x576 source resolution
 and the published JPEG is already rectified; `camera_info` then declares
 `pinhole`, the calibrated K and zero D, with the half-FOV derived from that K
 (about 0.79 rad horizontal). When it is off the raw, barrel-distorted stream is
-published and only the pinhole half-FOV of the calibrated K is declared, which
-understates the edge rays. Changing the switch reconnects only that lane;
+published and its geometry is declared `unknown`: no pinhole angle fits it (the
+calibrated K's is about 10 degrees short at the edges). Changing the switch reconnects only that lane;
 restart downstream vision cards so they re-read the declaration, and do not
 chain a separate undistortion card behind a rectified camera.
 The per-camera K/D are the chessboard calibrations in `undistortion.py`
 (`CALIBRATIONS`, measured 2026-11-07/08, RMS 0.21-0.22 px). They are per model,
 not per unit, and are not editable from the card; re-measure with
-`tools/calibrate_chessboard.py` (needs numpy and OpenCV on the workstation) and
-replace the row. These replace the earlier rough front-camera wall estimate of
+`tools/calibrate_chessboard.py` (a workstation tool needing numpy and OpenCV; it
+is not shipped in the image) and replace the row. These replace the earlier rough front-camera wall estimate of
 `0.423 rad`.
 A one-frame low-latency pipeline reconnects after stream interruption. The
 previous ROS image-topic receive path has been removed because the vendor camera service

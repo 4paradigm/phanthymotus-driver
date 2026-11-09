@@ -92,6 +92,13 @@ def test_declaration_tracks_the_switch(controller):
     controller.configure(lane, {'undistort': False})
     assert 'K' not in controller.declaration(lane)
     assert controller.declaration(lane)['undistortion']['state'] == 'raw'
+    raw = controller.declaration(lane)
+    raw.pop('undistortion')
+    info = build(topic='/front', id=u.camera_id(lane), width=640, height=360, **raw)
+    # A distorted frame has no valid pinhole angle; declaring K's would be
+    # ~10 degrees short at the edges, so the declaration says "unknown".
+    assert info['half_fov_rad'] is None and info['K'] is None
+    assert info['source'] == 'unknown'
 
 
 def _camera_card(controller, monkeypatch):

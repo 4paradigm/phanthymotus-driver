@@ -35,7 +35,6 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/s10-pro-requirements.t
 WORKDIR /work
 COPY common/ /work/common/
 COPY main.py device.py basic_server.py domain_bridge.py loco_servo.py spatial.py media_workers.py undistortion.py audio.py config.yaml driver.yaml /work/deep_robotics/s10_pro/
-COPY tools/ /work/deep_robotics/s10_pro/tools/
 COPY resource/S10_kinematic.urdf /work/deep_robotics/s10_pro/resource/S10_kinematic.urdf
 COPY resource/ssh_known_hosts /work/deep_robotics/s10_pro/resource/ssh_known_hosts
 COPY deploy/ /deploy/

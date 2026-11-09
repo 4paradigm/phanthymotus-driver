@@ -493,17 +493,20 @@ class CameraUndistortion:
                     "method": "FFmpeg remap at the source resolution, then scaled to 640x360",
                 },
             }
-        # Raw, barrel-distorted frames. The driver spec has no plumb_bob model,
-        # so only the pinhole angle of the calibrated K is declared: right near
-        # the image centre, narrower than the true edge rays.
-        h, v = half_fov(cal["K"], width, height)
+        # Raw, barrel-distorted frames. motus.camera/1 has no plumb_bob model,
+        # and no single pinhole angle describes this image: the calibrated K's
+        # angle is right at the centre and ~10 degrees short at the edges. So the
+        # geometry is declared unknown, which consumers handle as "not told" and
+        # say so, instead of a number that is wrong where it matters. The
+        # calibration stays visible under vendor.undistortion for people.
         return {
-            "half_fov_rad": h, "half_fov_v_rad": v,
-            "source": "measured", "measured_on": cal.get("measured_on", ""),
+            "half_fov_rad": None, "source": "unknown",
             "undistortion": {
                 "state": "raw", "calibration_source": source,
-                "note": ("raw stream is barrel-distorted; half_fov_rad is the pinhole angle "
-                         "of the calibrated K and understates the edge rays. Enable the "
-                         "camera card's undistort option for exact geometry."),
+                "input_calibration": {k: cal[k] for k in
+                                      ("distortion_model", "K", "D", "source_resolution")},
+                "note": ("raw stream is barrel-distorted and not expressible as pinhole "
+                         "geometry, so none is declared. Enable the camera card's "
+                         "undistort option for exact geometry."),
             },
         }
