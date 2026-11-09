@@ -1,0 +1,28 @@
+{
+  "schema": "motus.patrol-baseline/1",
+  "site_id": "bumi-fixed-test",
+  "revision": "fixed-point-v1",
+  "mode": "rehearsal",
+  "max_age_seconds": 90,
+  "review_route": "duty-review",
+  "routes": {
+    "duty-review": "值班复核记录",
+    "facilities": "物业设施工单"
+  },
+  "points": [
+    {
+      "point_id": "fixed-passage",
+      "label": "现场选定的通道口",
+      "waypoint_id": "manual-fixed-point",
+      "view_id": "bumi-front-fixed",
+      "checks": [
+        {
+          "check_id": "clear-walkway",
+          "normal": "从现场确认的固定视角，能看清指定通行区域全段，通行区域连续畅通。",
+          "evidence_kind": "visual",
+          "route_id": "facilities"
+        }
+      ]
+    }
+  ]
+}
