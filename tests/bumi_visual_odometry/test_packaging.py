@@ -80,6 +80,20 @@ def test_estimator_module_has_no_fusion_path():
     assert not (ROOT/'common/visual_odometry.py').exists()
 
 
+def test_visual_odometry_keeps_both_declared_output_ports():
+    """The legacy status summary port must not be removed in place.
+
+    `motus.odom/1`'s additive rule is to publish alongside an existing output,
+    not to convert it; saved canvas layouts reference topic_out ports by index
+    and direct ROS subscribers use the status topic. This guard exists because
+    the PR once deleted the status publisher while calling the change additive.
+    """
+    text = (BUMI/'visual_odometry.py').read_text()
+    assert "STATUS_TOPIC = '/bumi_visual_odometry/status'" in text
+    assert "'topic_out': [{'topic': self._node.status_topic, 'format': 'data/json'}," in text
+    assert "{'topic': self.status_topic, 'format': 'data/json'" in text
+
+
 def test_the_feature_does_not_ship_a_second_driver_or_planning_docs():
     assert not (ROOT/'noetix/bumi_visual_odometry').exists()
     assert not (ROOT/'docs/superpowers').exists()

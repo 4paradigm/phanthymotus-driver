@@ -491,26 +491,34 @@ capture continue as before. `main.py` sets `BUMI_VISUAL_ODOMETRY=1` only when th
 card is enabled — a disabled card costs no extra DDS traffic and starts no
 estimator.
 
-The single `state/odom` output includes `vendor.turn_angle_deg`: body yaw relative to the first IMU
-sample of the current segment, wrapped to -180..180 degrees.
-
 `plugins.visual_odometry.imu_assisted` defaults to true with
 `imu_source: controller`: the visual card polls the HighController body IMU
 directly and republishes changed samples as `sensor_msgs/Imu`. RTAB-Map uses the
 orientation as a rotation prior; translation is still estimated from RGB-D, with
 no inertial position integration or robot_localization/EKF. `imu_source: state`
 falls back to the StatePlugin topic. Set `imu_assisted: false` to run visual-only.
-The output is not wired
-into `loco_target`/`loco_servo`. The full `motus.odom/1` sample is the only
-canvas output (`state/odom`); Core renders it directly. `vendor.displacement_m`
-is the distance from the first tracking pose in the segment. There is no
-separate status topic, and no loco card is wired to this output. The shipped config applies the standard level-forward mount so `position` uses robot body axes (x forward, y left, z up;
-reported as `pose_reference: body_axes`, a convention rather than a measured
-extrinsic). The card defaults to `initializing` and
-publishes no pose until the estimator is tracking; a fault ends that segment and recovery
-starts a fresh one automatically. Stopping the card reaps its estimator and private topics and disables the
-shared raw RGB-D branch through `/NS/odometry_input/raw_enabled`; the camera,
-media cards and motion cards keep running.
+These outputs are not wired into `loco_target`/`loco_servo`.
+
+The card declares two outputs, both pre-existing contracts: the full
+`state/odom` sample (`motus.odom/1`, rendered directly by Core) and the concise
+`data/json` status summary on `/<namespace>/bumi_visual_odometry/status`. The
+summary is the legacy display payload (`status`, `turn_angle_deg`,
+`displacement_m`, `position_m`, `pose_reference`, `age_ms`, `reason`) published
+with a 200 ms same-state throttle; transitions publish immediately. It is kept
+additively next to the new SLAM metadata rather than removed: saved canvas
+layouts reference the declared ports by index and direct ROS subscribers use
+the status topic. The full sample includes `vendor.turn_angle_deg` (body yaw
+relative to the first IMU sample of the current segment, wrapped to -180..180
+degrees) and `vendor.displacement_m` (distance from the first tracking pose in
+the segment). No loco card is wired to either output. The shipped config applies
+the standard level-forward mount so `position` uses robot body axes (x forward,
+y left, z up; reported as `pose_reference: body_axes`, a convention rather than
+a measured extrinsic). The card defaults to `initializing` and publishes no pose
+until the estimator is tracking; a fault ends that segment and recovery starts a
+fresh one automatically. Stopping the card reaps its estimator and private
+topics and disables the shared raw RGB-D branch through
+`/NS/odometry_input/raw_enabled`; the camera, media cards and motion cards keep
+running.
 
 The output contract, quality states, assumed body-axis calibration, validation
 status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).

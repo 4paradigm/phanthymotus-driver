@@ -20,7 +20,7 @@ uses. Disabled means no raw branch, no estimator child, no extra DDS traffic.
 | --- | --- |
 | Tool / card | `rgbd_visual_odometry` (sensor, read-only) |
 | MCP actions | `start`, `stop`, `info` (system actions only; no execution form/button) |
-| Canvas / ROS output | `/<namespace>/bumi_visual_odometry/state/odom`, `std_msgs/msg/String`, `motus.odom/1`, port format `state/odom`, 20 Hz |
+| Canvas / ROS output | full sample: `/<namespace>/bumi_visual_odometry/state/odom`, `std_msgs/msg/String`, `motus.odom/1`, port format `state/odom`, 20 Hz — status summary: `/<namespace>/bumi_visual_odometry/status`, `std_msgs/msg/String`, `data/json`, 200 ms same-state throttle |
 | Consumer | none; it is not wired into `loco_target`/`loco_servo` |
 
 `stop` reaps the estimator/filter children and the card's private topics, and sends a
@@ -32,7 +32,8 @@ to disabled. `start` sends `Bool(true)` and resumes it. The shared camera pipeli
 `camera`/`depth` cards, photo/video capture, audio and every motion card keep
 running; only the visual-odometry branch and estimator are affected.
 
-Core renders the single `state/odom` output. Segment turn angle and displacement
+Core renders the `state/odom` sample; the canvas status panel renders the
+concise `data/json` summary. Segment turn angle and displacement
 are carried in `vendor.turn_angle_deg` and `vendor.displacement_m`, alongside
 `vendor.pose_reference` and `vendor.reason`; position is in `pose.position`. Positions and displacement are rounded
 to millimetres and the turn angle to 0.1 degree for display; the full odometry
@@ -48,10 +49,18 @@ standard level, forward-facing camera: `x` forward, `y` left, `z` up
 the pose origin is the camera because the default translation is zero. Reset
 starts a new segment and distance origin.
 
-The canvas declares only the full `state/odom` sample (`motus.odom/1`), used
-by both the renderer and downstream consumers. No separate `data/json` status
-output or status publisher is created. Existing ROS subscribers can also use
-`/<namespace>/bumi_visual_odometry/state/odom` directly. The card's details button fetches `info`, whose
+The card declares two outputs, both pre-existing contracts: the full
+`state/odom` sample (`motus.odom/1`, used by renderers and downstream consumers)
+and the concise `data/json` status summary on
+`/<namespace>/bumi_visual_odometry/status`. The summary is the display payload
+the canvas status panel has always rendered — `status`, `turn_angle_deg`,
+`displacement_m`, `position_m`, `pose_reference`, `age_ms`, `reason` — with the
+legacy 200 ms same-state throttle; a state transition is published immediately.
+Both are built from the same sample, so `status` and the full sample's
+`vendor.status`/`vendor.motus_slam.status` never disagree. Keeping the summary
+is required for compatibility: removing it would drop a declared port from saved
+canvas layouts and stop the ROS status topic. Existing ROS subscribers can also
+use `/<namespace>/bumi_visual_odometry/state/odom` directly. The card's details button fetches `info`, whose
 description contains the complete current sample, including covariance, timing,
 segment/calibration IDs and visual diagnostics; the same sample is returned as
 `sample`, with `odom_topic` pointing to the original ROS output. Details are a
