@@ -188,3 +188,12 @@ The unified Perception SLAM card derives frame/clock names from actual tracking
 odometry and native PointCloud2 messages when Core main supplies only topic
 paths. It accepts a verified producer mount, or an explicit 4x4 manual matrix
 on the card. No Bumi-only platform robot preset is required.
+
+
+The cross-robot field definitions and clock/extrinsic trust requirements live
+in [Spatial SLAM Input Contract](../../docs/spatial_slam_input.md). The Driver
+code validates the published mount using the ROS-free
+`common.spatial_slam.validate_mount` helper. In the default configuration
+`calibrated=false` means a human must still configure a compatible
+`child_from_cloud` matrix on the SLAM card; it does not mean the system has
+verified optical-to-body installation accuracy.

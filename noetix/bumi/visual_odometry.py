@@ -358,7 +358,7 @@ class VisualOdometryNode:
         return 'body_axes' if self.calibration.assumed else 'body'
 
     def slam_extrinsic(self):
-        """Describe the actual estimator mount, without claiming assumed=calibrated.
+        """Describe and validate the installed mount, without assuming calibration.
 
         In the public odometry message this is producer evidence, not a second
         ROS topic or an extra canvas port. A generic consumer may use a
@@ -372,7 +372,10 @@ class VisualOdometryNode:
         translation = [float(v) for v in mount['translation']]
         matrix = [[*rotation[i], translation[i]] for i in range(3)]
         matrix.append([0., 0., 0., 1.])
-        return {
+        # Validate the same shape expected from every robot's upstream source.
+        # This does not elevate an assumed axis mapping into calibrated evidence.
+        from common.spatial_slam import validate_mount
+        return validate_mount({
             'mode': 'static',
             'parent_frame': self.base_frame(),
             'child_frame': self.frame_id,
@@ -381,7 +384,7 @@ class VisualOdometryNode:
             'version': self.calibration.id,
             'calibrated': not self.calibration.assumed,
             'pose_reference': self.pose_reference(),
-        }
+        }, parent_frame=self.base_frame(), child_frame=self.frame_id)
 
     def publish(self):
         sample = make_sample(self.health, self.now(), self.estimate, self.pose_reference())
