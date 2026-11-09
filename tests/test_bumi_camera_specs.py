@@ -168,6 +168,27 @@ def test_aligned_depth_adopts_the_published_depth_outputs_rgb_intrinsics():
     assert info.id == "noetix/bumi/camera_color"
 
 
+def test_depth_declaration_carries_the_capture_time_and_unit_contract():
+    """The single depth output is also the computational input.
+
+    These vendor flags are what a point-cloud consumer checks before treating
+    the stream as metric; they belong to the depth output itself, not to a
+    second topic. The datasheet fallback stays `manual`, which a strict consumer
+    is expected to refuse until the runtime intrinsics arrive.
+    """
+    fallback = parse(camera_specs.declare("depth", DEPTH_TOPIC, "image/depth-zlib")[0])
+    runtime = parse(camera_specs.declare(
+        "depth", DEPTH_TOPIC, "image/depth-zlib",
+        {"depth": _color_intrinsics()["color"]})[0])
+    for info in (fallback, runtime):
+        assert info.vendor["depth_unit"] == "mm"
+        assert info.vendor["depth_source"] == "measured"
+        assert info.vendor["timestamp_semantics"] == "source_capture_mapped"
+        assert info.vendor["clock_mapping"] == "shared_camera_mapper"
+    assert fallback.source == "manual"
+    assert runtime.source == "derived-from-K"
+
+
 def test_rectified_coefficients_are_declared_pinhole():
     """All-zero distortion is the rectified case, which is what a consumer's
     pinhole assumption actually needs to know."""

@@ -135,7 +135,8 @@ def capture(monkeypatch):
             return NS()
 
         def get_clock(self):
-            return NS(now=lambda: NS(to_msg=lambda: NS(sec=1, nanosec=2)))
+            return NS(now=lambda: NS(to_msg=lambda: NS(sec=1, nanosec=2),
+                                     nanoseconds=1_000_000_002))
 
     monkeypatch.setattr(sys.modules['rclpy.node'], 'Node', Node)
     rclpy = sys.modules['rclpy']
@@ -151,7 +152,7 @@ def capture(monkeypatch):
     return device, state
 
 
-def test_metric_depth_runs_without_visual_odometry(capture, monkeypatch):
+def test_capture_timed_depth_runs_without_visual_odometry(capture, monkeypatch):
     device, state = capture
     monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
     seen = []
@@ -160,21 +161,28 @@ def test_metric_depth_runs_without_visual_odometry(capture, monkeypatch):
         def __init__(self, scale):
             assert scale == .001
 
-    class Metric:
-        def __init__(self, node, namespace, mapper, qos):
-            seen.append(('init', namespace))
+    class CaptureTimed:
+        def __init__(self, publisher, namespace, mapper):
+            seen.append(('init', namespace, publisher is not None))
 
-        def publish(self, source, aligned):
-            seen.append(('publish', source, aligned))
+        def publish(self, source, aligned, *, fallback_stamp_ns=None):
+            seen.append(('publish', source, aligned, fallback_stamp_ns))
 
     monkeypatch.setitem(sys.modules, 'visual_inputs',
-                        NS(CaptureTimeMapper=Mapper, ComputationalDepthPublisher=Metric))
+                        NS(CaptureTimeMapper=Mapper, CaptureTimedDepthPublisher=CaptureTimed))
     device._camera_subprocess('robot')
     assert [x[0] for x in seen] == ['init', 'publish']
-    assert state.published['/robot/camera/color'] and state.published['/robot/camera/depth']
+    # The media loop hands the arrival stamp to the publisher as the honest
+    # fallback, so a clock-mapping failure never drops a depth frame.
+    assert seen[1][3] == 1_000_000_002
+    assert state.published['/robot/camera/color']
+    # One publisher on the original topic; no second depth topic is created,
+    # and the fake publisher owns publication so the legacy path does not run.
+    assert '/robot/camera/depth_metric' not in state.published
+    assert state.published['/robot/camera/depth'] == []
 
 
-def test_metric_depth_and_vo_use_same_time_mapper(capture, monkeypatch):
+def test_depth_stream_and_vo_use_same_time_mapper(capture, monkeypatch):
     device, state = capture
     monkeypatch.setenv('BUMI_VISUAL_ODOMETRY', '1')
     state.frame_limit = 2
@@ -184,12 +192,13 @@ def test_metric_depth_and_vo_use_same_time_mapper(capture, monkeypatch):
         def __init__(self, scale):
             pass
 
-    class Metric:
-        def __init__(self, node, namespace, mapper, qos):
+    class CaptureTimed:
+        def __init__(self, publisher, namespace, mapper):
+            self.time_mapper = mapper
             seen.append(mapper)
 
-        def publish(self, source, aligned):
-            pass
+        def publish(self, source, aligned, *, fallback_stamp_ns=None):
+            seen.append(self.time_mapper)
 
     class Raw:
         enabled = True
@@ -201,12 +210,15 @@ def test_metric_depth_and_vo_use_same_time_mapper(capture, monkeypatch):
             seen.append(self.time_mapper)
 
     monkeypatch.setitem(sys.modules, 'visual_inputs', NS(
-        CaptureTimeMapper=Mapper, ComputationalDepthPublisher=Metric, RawCameraPublisher=Raw))
+        CaptureTimeMapper=Mapper, CaptureTimedDepthPublisher=CaptureTimed,
+        RawCameraPublisher=Raw))
     device._camera_subprocess('robot')
-    assert len(seen) == 3 and all(item is seen[0] for item in seen)
+    # One constructor plus one publish each from the depth output and the two
+    # raw-branch frames: every one of them sees the single shared mapper.
+    assert len(seen) == 5 and all(item is seen[0] for item in seen)
 
 
-def test_metric_depth_failure_does_not_stop_legacy_camera_output(capture, monkeypatch):
+def test_capture_timed_depth_failure_falls_back_to_legacy_publish(capture, monkeypatch):
     device, state = capture
     monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
     state.frame_limit = 2
@@ -215,21 +227,23 @@ def test_metric_depth_failure_does_not_stop_legacy_camera_output(capture, monkey
         def __init__(self, scale):
             pass
 
-    class Metric:
+    class CaptureTimed:
         def __init__(self, *args):
             pass
 
-        def publish(self, source, aligned):
+        def publish(self, source, aligned, *, fallback_stamp_ns=None):
             raise ValueError('invalid capture timestamp')
 
     monkeypatch.setitem(sys.modules, 'visual_inputs',
-                        NS(CaptureTimeMapper=Mapper, ComputationalDepthPublisher=Metric))
+                        NS(CaptureTimeMapper=Mapper, CaptureTimedDepthPublisher=CaptureTimed))
     device._camera_subprocess('robot')
     assert len(state.published['/robot/camera/color']) == 2
     assert len(state.published['/robot/camera/depth']) == 2
+    # The fallback is the legacy contract byte-for-byte: navi keeps decoding.
+    assert zlib.decompress(state.published['/robot/camera/depth'][0].data) == b'\x01\x00\x02\x00'
 
 
-def test_depth_card_declares_both_outputs_and_their_actual_intrinsics(capture, monkeypatch):
+def test_depth_card_declares_one_capture_timed_output(capture, monkeypatch):
     device, _ = capture
     monkeypatch.syspath_prepend(str(BUMI))
     card = device.CameraPlugin.__new__(device.CameraPlugin)
@@ -240,14 +254,16 @@ def test_depth_card_declares_both_outputs_and_their_actual_intrinsics(capture, m
                                    'ppx': 320., 'ppy': 240., 'model': 'none', 'coeffs': [0.] * 5}}
     tool = next(x for x in card.get_tools() if x['name'] == 'depth')
     result = card.dispatch('info', {'_tool_name': 'depth'})
+    # Exactly one depth output: the original topic, enriched rather than duplicated.
     assert tool['topic_out'] == result['topic_out'] == [
-        {'topic': '/robot/camera/depth', 'format': 'image/depth-zlib'},
-        {'topic': '/robot/camera/depth_metric', 'format': 'image/depth-zlib'}]
+        {'topic': '/robot/camera/depth', 'format': 'image/depth-zlib'}]
     infos = {entry['topic']: entry for entry in result['camera_info']}
-    assert infos['/robot/camera/depth_metric']['K'][0] == 600.
-    assert infos['/robot/camera/depth_metric']['source'] == 'derived-from-K'
-    assert infos['/robot/camera/depth_metric']['distortion_model'] == 'pinhole'
-    vendor = infos['/robot/camera/depth_metric']['vendor']
+    assert set(infos) == {'/robot/camera/depth'}
+    info = infos['/robot/camera/depth']
+    assert info['K'][0] == 600.
+    assert info['source'] == 'derived-from-K'
+    assert info['distortion_model'] == 'pinhole'
+    vendor = info['vendor']
     assert vendor['depth_unit'] == 'mm'
     assert vendor['depth_source'] == 'measured'
     assert vendor['timestamp_semantics'] == 'source_capture_mapped'

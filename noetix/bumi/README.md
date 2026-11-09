@@ -211,18 +211,20 @@ sudo systemctl start noetix-video-capture.service
 相机没起来时走兜底 —— 声明必须在不串流时也答得出来，这是消费者能在 `start` 时就
 降级（而不是一帧一帧地发现问题）的前提。
 
-Depth 卡片保留原来的 `/<namespace>/camera/depth` 压缩展示输出，另提供
-`/<namespace>/camera/depth_metric`（`image/depth-zlib`，ROS `CompressedImage`，
-640×480 小端 uint16 毫米深度，有订阅时最多 2 Hz），供需要几何计算的消费者使用。它来自同一
-相机采集进程和对齐后的 RGB 光学坐标系，header 携带源深度帧采集时间映射
-及 `frame_id`。`format="16UC1; compressedDepth zlib"`，载荷为直接 zlib 压缩的
-640×480 小端 uint16；按 SDK `depth_scale` 换算并四舍五入到毫米，0 表示无效，
-四舍五入后超出 65535 mm 的值置 0。`camera_info.vendor` 声明 `depth_unit=mm`、
-`depth_source=measured` 和 `timestamp_semantics=source_capture_mapped`；卡片 `camera_info` 为两路分别声明相同像素网格的运行时内参。
-运行时内参缺失或畸变尚不能按针孔模型处理时，不应把兜底 FOV 当作已标定
-几何。新输出不依赖 VO 卡片的启停；同一帧的 VO 原始输入和计算深度共享
-时间映射。设备硬件时钟使用到达时刻估计一次偏移，该映射是近似值，不代表
-精确曝光同步；源时间无效时不以回调时间代替。旧压缩流的时间语义不变。
+Depth 卡片只有一个输出 `/<namespace>/camera/depth`（`image/depth-zlib`，ROS
+`CompressedImage`，640×480 小端 uint16 毫米深度，30 Hz 每帧发布，不看订阅者）。
+它既是画布/navi 的展示流，也是需要几何计算的消费者的输入 —— 不再另开第二路：
+header 携带对齐后深度帧的采集时间映射和 `frame_id`，`format="16UC1; compressedDepth
+zlib"`，载荷为 zlib 压缩的 640×480 小端 uint16；按 SDK `depth_scale` 换算并四舍五入
+到毫米，0 表示无效，四舍五入后超出 65535 mm 的值置 0。`camera_info.vendor` 声明
+`depth_unit=mm`、`depth_source=measured`、`timestamp_semantics=source_capture_mapped`
+和 `clock_mapping=shared_camera_mapper`，并使用对齐后的 RGB 像素网格运行时内参。
+运行时内参缺失或畸变尚不能按针孔模型处理时，声明仍是 `manual`，不应把兜底 FOV
+当作已标定几何（严格的几何消费者应拒绝）。深度输出不依赖 VO 卡片的启停；同一帧的
+VO 原始输入和这一路深度共享时间映射。设备硬件时钟使用到达时刻估计一次偏移，该映射
+是近似值，不代表精确曝光同步。时间映射失败时该帧仍会发布，但使用发布时刻的 stamp
+和空 `frame_id`：展示/navi 照常解码，要求采集时刻的消费者应跳过它，绝不把发布
+时刻当作测量时刻。
 
 镜头换了必须重来一遍：`phanthymotus/actucore/tools/measure_fov.py`。
 

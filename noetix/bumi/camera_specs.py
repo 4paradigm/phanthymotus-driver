@@ -109,7 +109,18 @@ SPECS = {
                            "rs.align(rs.stream.color) 把它重投影到 RGB 像素网格。"
                            "因此这个输出声明 RGB 的几何；相机起来后会被 RGB "
                            "运行时内参顶掉。",
-                   "depth_aligned_to": "color"},
+                   "depth_aligned_to": "color",
+                   # The payload is uint16 millimetres and its header stamp is
+                   # the source capture time mapped into the host clock; both
+                   # are facts about the one depth output, so they live on the
+                   # declaration rather than on a second topic. A consumer that
+                   # needs proven metric geometry (the point-cloud computation)
+                   # checks these fields and refuses the datasheet fallback,
+                   # whose `source` is `manual`.
+                   "depth_unit": "mm",
+                   "depth_source": "measured",
+                   "timestamp_semantics": "source_capture_mapped",
+                   "clock_mapping": "shared_camera_mapper"},
     },
 }
 

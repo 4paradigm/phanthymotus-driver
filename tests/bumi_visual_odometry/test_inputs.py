@@ -94,6 +94,15 @@ def _stamp(msg):
     return msg.header.stamp.sec*10**9+msg.header.stamp.nanosec
 
 
+def depth_stream(raw_ros, depth_scale=.002):
+    from noetix.bumi.visual_inputs import CaptureTimeMapper, CaptureTimedDepthPublisher
+    messages, node = raw_ros
+    mapper = CaptureTimeMapper(depth_scale)
+    publisher = CaptureTimedDepthPublisher(
+        node.create_publisher(object, '/robot/camera/depth', object()), 'robot', mapper)
+    return publisher, mapper, messages
+
+
 def test_shared_raw_publisher_uses_sdk_scale_and_separate_source_times(raw_ros):
     raw_publisher, messages = publisher(raw_ros)
     aligned = frames()
@@ -117,128 +126,70 @@ def test_shared_raw_publisher_uses_sdk_scale_and_separate_source_times(raw_ros):
     assert meta['clock_mapping'] == 'device_to_host'
 
 
-def test_computational_depth_shares_capture_time_and_survives_vo_stop(raw_ros, monkeypatch):
-    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
-
+def test_capture_timed_depth_shares_capture_time_with_vo_raw_branch(raw_ros, monkeypatch):
     raw_publisher, messages = publisher(raw_ros)
-    mapper = CaptureTimeMapper(raw_publisher.depth_scale)
+    depth, mapper, messages = depth_stream(raw_ros)
     raw_publisher.time_mapper = mapper
-    depth_publisher = ComputationalDepthPublisher(raw_publisher.node, 'robot', mapper, object())
     aligned = frames()
+    aligned.get_depth_frame().get_data = lambda: np.full((480, 640), 500, dtype='<u2')
     monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 10_000_000_000)
 
-    aligned.get_depth_frame().get_data = lambda: np.full((480, 640), 500, dtype='<u2')
-    depth_publisher.publish(aligned, aligned)
+    assert depth.publish(aligned, aligned, fallback_stamp_ns=1) is True
     raw_publisher.publish(aligned, aligned)
-    compute = messages['/robot/camera/depth_metric'][0]
+    captured = messages['/robot/camera/depth'][0]
     vo_depth = messages['/robot/odometry_input/depth'][0]
-    assert _stamp(compute) == _stamp(vo_depth) == 10_010_000_000
-    assert compute.header.frame_id == vo_depth.header.frame_id == 'robot_rgb_optical'
-    assert compute.format == '16UC1; compressedDepth zlib'
-    assert np.frombuffer(zlib.decompress(compute.data), dtype='<u2').tolist() == [1000] * (480*640)
+    assert _stamp(captured) == _stamp(vo_depth) == 10_010_000_000
+    assert captured.header.frame_id == vo_depth.header.frame_id == 'robot_rgb_optical'
+    assert captured.format == '16UC1; compressedDepth zlib'
+    assert np.frombuffer(zlib.decompress(captured.data), dtype='<u2').tolist() == [1000] * (480*640)
 
+    # The depth card's single output is not gated by the VO card lifecycle.
     raw_publisher.enabled = False
-    depth_publisher.last_publish = None
     next_frames = frames(ms=1033)
     next_frames.get_depth_frame().get_data = lambda: np.full((480, 640), 500, dtype='<u2')
     monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 10_033_000_000)
-    depth_publisher.publish(next_frames, next_frames)
+    assert depth.publish(next_frames, next_frames, fallback_stamp_ns=1) is True
     raw_publisher.publish(next_frames, next_frames)
-    assert len(messages['/robot/camera/depth_metric']) == 2
+    assert len(messages['/robot/camera/depth']) == 2
     assert len(messages['/robot/odometry_input/depth']) == 1
 
 
-def test_computational_depth_does_not_replace_missing_source_time(raw_ros):
-    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
-
-    raw_publisher, messages = publisher(raw_ros)
-    depth_publisher = ComputationalDepthPublisher(raw_publisher.node, 'robot',
-                                                  CaptureTimeMapper(.002), object())
+def test_capture_timed_depth_falls_back_to_arrival_stamp_without_claiming_capture(raw_ros):
+    depth, mapper, messages = depth_stream(raw_ros)
     bad = frames()
     bad.get_depth_frame().get_frame_timestamp_domain = lambda: 'unknown'
-    with pytest.raises(ValueError):
-        depth_publisher.publish(bad, bad)
-    assert not messages['/robot/camera/depth_metric']
+    bad.get_depth_frame().get_data = lambda: np.full((480, 640), 500, dtype='<u2')
+    assert depth.publish(bad, bad, fallback_stamp_ns=42) is False
+    msg = messages['/robot/camera/depth'][0]
+    assert _stamp(msg) == 42
+    # No physical frame advertised: a metric consumer skips the frame instead
+    # of mistaking publication time for measurement time.
+    assert msg.header.frame_id == ''
+    # Display/navi still decode the declared millimetre stream.
+    assert np.frombuffer(zlib.decompress(msg.data), dtype='<u2').tolist() == [1000] * (480*640)
 
 
-def test_metric_depth_keeps_global_capture_stamp_after_processing_delay(raw_ros, monkeypatch):
-    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
-    raw_publisher, messages = publisher(raw_ros)
-    metric = ComputationalDepthPublisher(raw_publisher.node, 'robot', CaptureTimeMapper(.002), object())
+def test_capture_timed_depth_keeps_global_capture_stamp_after_processing_delay(raw_ros, monkeypatch):
+    depth, mapper, messages = depth_stream(raw_ros)
     aligned = frames()
     aligned.get_color_frame().get_frame_timestamp_domain = lambda: 'timestamp_domain.global_time'
     aligned.get_depth_frame().get_frame_timestamp_domain = lambda: 'timestamp_domain.global_time'
-    monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 1_100_000_000)
     aligned.get_depth_frame().get_data = lambda: np.full((480, 640), 500, dtype='<u2')
-    metric.publish(aligned, aligned)
-    assert _stamp(messages['/robot/camera/depth_metric'][0]) == 1_010_000_000
+    monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 1_100_000_000)
+    assert depth.publish(aligned, aligned, fallback_stamp_ns=1) is True
+    assert _stamp(messages['/robot/camera/depth'][0]) == 1_010_000_000
 
 
-def test_shared_time_mapper_rejects_reset_and_changes_epoch(monkeypatch):
-    from noetix.bumi.visual_inputs import CaptureTimeMapper
-    mapper = CaptureTimeMapper(.002)
+def test_capture_timed_depth_publishes_every_frame_without_a_subscriber_gate(raw_ros, monkeypatch):
+    depth, mapper, messages = depth_stream(raw_ros)
     monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 10_000_000_000)
-    first = frames()
-    meta, _ = mapper.sample(first.get_color_frame(), first.get_depth_frame())
-    reset = frames(ms=1)
-    with pytest.raises(ValueError, match='reset'):
-        mapper.sample(reset.get_color_frame(), reset.get_depth_frame())
-    new_meta, _ = mapper.sample(reset.get_color_frame(), reset.get_depth_frame())
-    assert new_meta['epoch'] != meta['epoch']
-
-
-def test_shared_time_mapper_does_not_reuse_a_stale_cached_frame(monkeypatch):
-    from noetix.bumi.visual_inputs import CaptureTimeMapper
-    mapper = CaptureTimeMapper(.002)
-    wall = iter([10_000_000_000, 10_400_000_000])
-    monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: next(wall))
-    source = frames()
-    mapper.sample(source.get_color_frame(), source.get_depth_frame())
-    with pytest.raises(ValueError, match='transport delay'):
-        mapper.sample(source.get_color_frame(), source.get_depth_frame())
-
-
-def test_metric_depth_is_rate_limited_to_two_hz(raw_ros, monkeypatch):
-    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
-    raw_publisher, messages = publisher(raw_ros)
-    metric = ComputationalDepthPublisher(raw_publisher.node, 'robot', CaptureTimeMapper(.002), object())
-    ticks = iter([10., 10.1, 10.6, 10.6])
-    monkeypatch.setattr(visual_inputs.time, 'monotonic', lambda: next(ticks))
-    monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 10_000_000_000)
-    first, second, third = frames(), frames(ms=1010), frames(ms=1030)
-    for source in (first, second, third):
-        source.get_depth_frame().get_data = lambda: np.full((480, 640), 500, dtype='<u2')
-    metric.publish(first, first)
-    metric.publish(second, second)
-    metric.publish(third, third)
-    assert len(messages['/robot/camera/depth_metric']) == 2
-
-
-def test_metric_depth_does_not_convert_or_publish_without_subscribers(raw_ros):
-    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
-    raw_publisher, messages = publisher(raw_ros)
-    mapper = CaptureTimeMapper(.002)
-    metric = ComputationalDepthPublisher(raw_publisher.node, 'robot', mapper, object())
-    metric.publisher.get_subscription_count = lambda: 0
-    data = frames()
-    metric.publish(data, data)
-    assert not messages['/robot/camera/depth_metric']
-    assert mapper.cached_key is None
-
-
-@pytest.mark.parametrize('model,coeffs', [
-    ('distortion.unknown', [0.] * 5),
-    ('distortion.none', [.1, 0., 0., 0., 0.]),
-    ('distortion.brown_conrady', [.1, 0., 0., 0., 0.]),
-])
-def test_computational_depth_rejects_unproven_pinhole_geometry(raw_ros, model, coeffs):
-    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
-    raw_publisher, messages = publisher(raw_ros)
-    metric = ComputationalDepthPublisher(raw_publisher.node, 'robot', CaptureTimeMapper(.002), object())
-    bad = frames(model=model, coeffs=coeffs)
-    with pytest.raises(ValueError, match='pinhole'):
-        metric.publish(bad, bad)
-    assert not messages['/robot/camera/depth_metric']
+    aligned = frames()
+    aligned.get_depth_frame().get_data = lambda: np.full((480, 640), 500, dtype='<u2')
+    # This is the card's media output, not a 2 Hz computational side-channel:
+    # there is no 0.5 s throttle and no "publish only when subscribed" gate.
+    for _ in range(3):
+        assert depth.publish(aligned, aligned, fallback_stamp_ns=1) is True
+    assert len(messages['/robot/camera/depth']) == 3
 
 
 def test_estimator_gets_one_validated_pair_with_original_stamps(raw_ros, monkeypatch):
@@ -359,26 +310,22 @@ def test_raw_publisher_starts_disabled_until_the_card_latches_enable(raw_ros):
     assert len(messages['/robot/odometry_input/rgb']) == 1
 
 
-def test_computational_depth_quantizes_mm_without_wrapping(raw_ros):
-    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
-    _, node = raw_ros
-    metric = ComputationalDepthPublisher(node, 'robot', CaptureTimeMapper(.0015), object())
+def test_capture_timed_depth_quantizes_mm_without_wrapping(raw_ros):
+    depth, mapper, messages = depth_stream(raw_ros, depth_scale=.0015)
     data = frames()
     pixels = np.zeros((480, 640), dtype='<u2')
     pixels[0, :6] = [0, 1, 1001, 43690, 43691, 65535]
     data.get_depth_frame().get_data = lambda: pixels
-    metric.publish(data, data)
-    output = raw_ros[0]['/robot/camera/depth_metric'][0]
+    assert depth.publish(data, data, fallback_stamp_ns=1) is True
+    output = messages['/robot/camera/depth'][0]
     decoded = np.frombuffer(zlib.decompress(output.data), dtype='<u2').reshape(480, 640)
     assert decoded[0, :6].tolist() == [0, 2, 1502, 65535, 0, 0]
     assert len(decoded.tobytes()) == 614400
 
 
-def test_computational_depth_rejects_non_contract_dimensions(raw_ros):
-    from noetix.bumi.visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
-    _, node = raw_ros
-    metric = ComputationalDepthPublisher(node, 'robot', CaptureTimeMapper(.002), object())
+def test_capture_timed_depth_rejects_non_contract_dimensions(raw_ros):
+    depth, mapper, messages = depth_stream(raw_ros)
     data = frames()
     with pytest.raises(ValueError, match='640x480'):
-        metric.publish(data, data)
-    assert not raw_ros[0]['/robot/camera/depth_metric']
+        depth.publish(data, data, fallback_stamp_ns=1)
+    assert not messages['/robot/camera/depth']

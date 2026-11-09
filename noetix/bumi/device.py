@@ -2417,20 +2417,21 @@ def _camera_subprocess(namespace: str):
         # over a failed introspection call would be the worse trade.
         print(f"[camera_subprocess] intrinsics unavailable: {_e}", flush=True)
 
-    # Optional read-only RGB-D branch for the bundle-local visual odometry card.
-    # main.py sets BUMI_VISUAL_ODOMETRY only when that card is enabled; the branch
-    # shares this pipeline and must never take media production down: construction
-    # and every publish are wrapped, and a fault only logs.
-    metric_depth = None
+    # Capture-timed depth is the depth card's one output. It shares this
+    # pipeline and the clock mapping with the optional VO raw branch; a fault
+    # here must never take media production down, so construction and every
+    # publish are wrapped and a failure only falls back to the legacy
+    # publication-time stamp for that frame.
+    depth_stream = None
     shared_time_mapper = None
-    metric_failures = 0
     try:
-        from visual_inputs import CaptureTimeMapper, ComputationalDepthPublisher
+        from visual_inputs import CaptureTimeMapper, CaptureTimedDepthPublisher
         depth_scale = pipeline.get_active_profile().get_device().first_depth_sensor().get_depth_scale()
         shared_time_mapper = CaptureTimeMapper(depth_scale)
-        metric_depth = ComputationalDepthPublisher(node, namespace, shared_time_mapper, _QOS)
+        depth_stream = CaptureTimedDepthPublisher(depth_pub, namespace, shared_time_mapper)
     except Exception as _e:
-        print(f"[camera_subprocess] metric depth unavailable: {_e}", flush=True)
+        print(f"[camera_subprocess] capture-timed depth unavailable, "
+              f"publishing legacy depth: {_e}", flush=True)
 
     raw_inputs = None
     raw_publish_failures = 0
@@ -2477,6 +2478,8 @@ def _camera_subprocess(namespace: str):
 
     frame_count = 0
     t_start = _time.monotonic()
+    capture_time_failures = 0
+    depth_publish_failures = 0
     try:
         while True:
             # The camera node owns the raw_enabled subscription. This is a
@@ -2503,23 +2506,36 @@ def _camera_subprocess(namespace: str):
 
             depth_frame = frames.get_depth_frame()
             if depth_frame:
-                depth_image = _np.asanyarray(depth_frame.get_data())
-                import zlib as _zlib
-                compressed = _zlib.compress(depth_image.tobytes(), 1)
-                msg = _CompressedImage()
-                msg.header.stamp = node.get_clock().now().to_msg()
-                msg.format = "16UC1; compressedDepth zlib"
-                msg.data = array('B', compressed)
-                depth_pub.publish(msg)
-
-            if metric_depth is not None:
-                try:
-                    metric_depth.publish(source_frames, frames)
-                except Exception as _e:
-                    metric_failures += 1
-                    if metric_failures == 1 or metric_failures % 100 == 0:
-                        print(f"[camera_subprocess] metric depth failed (failure #{metric_failures}): "
-                              f"{' '.join(str(_e).split())[:300]}", flush=True)
+                published = False
+                if depth_stream is not None:
+                    try:
+                        mapped = depth_stream.publish(
+                            source_frames, frames,
+                            fallback_stamp_ns=node.get_clock().now().nanoseconds)
+                        published = True
+                        if not mapped:
+                            capture_time_failures += 1
+                            if capture_time_failures == 1 or capture_time_failures % 100 == 0:
+                                print(f"[camera_subprocess] depth capture time unavailable, "
+                                      f"legacy stamp used (failure #{capture_time_failures})",
+                                      flush=True)
+                    except Exception as _e:
+                        # A bug in the capture-time path must cost the mapping,
+                        # not the depth frame: publish the legacy bytes below.
+                        depth_publish_failures += 1
+                        if depth_publish_failures == 1 or depth_publish_failures % 100 == 0:
+                            print(f"[camera_subprocess] capture-timed depth failed, "
+                                  f"legacy publish used (failure #{depth_publish_failures}): "
+                                  f"{' '.join(str(_e).split())[:300]}", flush=True)
+                if not published:
+                    depth_image = _np.asanyarray(depth_frame.get_data())
+                    import zlib as _zlib
+                    compressed = _zlib.compress(depth_image.tobytes(), 1)
+                    msg = _CompressedImage()
+                    msg.header.stamp = node.get_clock().now().to_msg()
+                    msg.format = "16UC1; compressedDepth zlib"
+                    msg.data = array('B', compressed)
+                    depth_pub.publish(msg)
 
             if raw_inputs is not None and getattr(raw_inputs, 'enabled', True):
                 try:
@@ -2654,10 +2670,11 @@ class CameraPlugin:
                 "name": "depth",
                 "type": "sensor",
                 "multiInstance": False,
-                "description": f"Bumi Realsense D435i depth registered to the RGB image — 640x480 zlib-compressed Z16 @ 30fps. Publishes to {self._depth_topic}",
+                "description": (f"Bumi Realsense D435i depth registered to the RGB image — "
+                                f"640x480 zlib-compressed Z16 @ 30fps, uint16 millimetres "
+                                f"with mapped capture time. Publishes to {self._depth_topic}"),
                 "inputSchema": {"type": "object", "properties": {}},
-                "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"},
-                              {"topic": f"/{self._namespace}/camera/depth_metric", "format": "image/depth-zlib"}],
+                "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}],
             },
         ]
 
@@ -2713,17 +2730,6 @@ class CameraPlugin:
             }
             if tool_name in topic_map:
                 topic, fmt = topic_map[tool_name]
-                if tool_name == "depth":
-                    metric_topic = f"/{self._namespace}/camera/depth_metric"
-                    metric_info = self._camera_info(tool_name, metric_topic, "image/depth-zlib")
-                    for declaration in metric_info:
-                        declaration.setdefault("vendor", {}).update(
-                            depth_unit="mm", depth_source="measured", timestamp_semantics="source_capture_mapped",
-                            clock_mapping="shared_camera_mapper")
-                    return {"state": "running",
-                            "topic_out": [{"topic": topic, "format": fmt},
-                                          {"topic": metric_topic, "format": "image/depth-zlib"}],
-                            "camera_info": self._camera_info(tool_name, topic, fmt) + metric_info}
                 return {"state": "running",
                         "topic_out": [{"topic": topic, "format": fmt}],
                         "camera_info": self._camera_info(tool_name, topic, fmt)}

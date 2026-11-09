@@ -34,7 +34,7 @@ def camera_metadata(color, depth, *, epoch, depth_scale, received_ns):
 
 
 class CaptureTimeMapper:
-    """One mapping per camera process, shared by VO and metric depth."""
+    """One mapping per camera process, shared by VO and the depth output."""
 
     def __init__(self, depth_scale):
         self.depth_scale = depth_scale
@@ -76,43 +76,62 @@ class CaptureTimeMapper:
             raise
 
 
-class ComputationalDepthPublisher:
-    """Capture-timed depth in the existing 640x480 uint16 millimetre zlib format."""
+class CaptureTimedDepthPublisher:
+    """The depth card's single output: capture-timed 640x480 uint16 mm zlib.
 
-    def __init__(self, node, namespace, time_mapper, qos):
+    The canvas, navi and the point-cloud computation all read this one topic.
+    It is published on every aligned frame (30 Hz), not gated on subscribers
+    and not throttled: it is the card's media output, and a viewer opening late
+    must not change what the rest of the robot receives.
+
+    Frames whose capture time cannot be mapped are still published, with the
+    arrival stamp and an empty ``frame_id``. Display/navi decode them normally,
+    while a consumer that requires proven capture time (the point-cloud
+    computation) skips them instead of mistaking publication time for
+    measurement time. The SDK ``depth_scale`` is applied here so the payload is
+    the declared uint16 millimetre contract on every camera, not only on the
+    usual 1 mm scale.
+    """
+
+    def __init__(self, publisher, namespace, time_mapper):
         from sensor_msgs.msg import CompressedImage
-        self.CompressedImage, self.namespace, self.time_mapper = CompressedImage, namespace, time_mapper
-        self.publisher = node.create_publisher(CompressedImage, f'/{namespace}/camera/depth_metric', qos)
-        self.last_publish = None
+        self.CompressedImage = CompressedImage
+        self.namespace = namespace
+        self.time_mapper = time_mapper
+        self.publisher = publisher
 
-    def publish(self, source_frames, aligned_frames):
+    def publish(self, source_frames, aligned_frames, *, fallback_stamp_ns=None):
+        """Publish one aligned depth frame; True when it carried capture time."""
         import numpy as np
-        if self.publisher.get_subscription_count() == 0:
-            return
-        if self.last_publish is not None and time.monotonic() - self.last_publish < .5:
-            return
-        source_color, source_depth = source_frames.get_color_frame(), source_frames.get_depth_frame()
-        color, depth = aligned_frames.get_color_frame(), aligned_frames.get_depth_frame()
-        if not all((source_color, source_depth, color, depth)):
-            return
-        intr = color.profile.as_video_stream_profile().intrinsics
-        coeffs = finite(list(intr.coeffs), 5)
-        model = str(intr.model).rsplit('.', 1)[-1]
-        if model not in ('none', 'brown_conrady', 'inverse_brown_conrady', 'modified_brown_conrady') or any(coeffs):
-            raise ValueError('metric depth requires rectified pinhole intrinsics')
-        _, stamps = self.time_mapper.sample(source_color, source_depth)
+        depth = aligned_frames.get_depth_frame()
+        if depth is None:
+            return False
         pixels = np.asanyarray(depth.get_data())
         if pixels.shape != (480, 640):
             raise ValueError('compressed depth requires a 640x480 pixel grid')
+        mapped, frame_id = False, ''
+        stamp_ns = fallback_stamp_ns
+        source_color = source_frames.get_color_frame()
+        source_depth = source_frames.get_depth_frame()
+        if source_color is not None and source_depth is not None:
+            try:
+                _, stamps = self.time_mapper.sample(source_color, source_depth)
+                stamp_ns, frame_id, mapped = stamps[1], f'{self.namespace}_rgb_optical', True
+            except Exception:                                  # noqa: BLE001
+                # Media first: a broken clock mapping must not drop a depth
+                # frame the display/navi path can still use.
+                mapped = False
+        if stamp_ns is None:
+            raise ValueError('arrival stamp required for the depth fallback')
         millimetres = np.rint(pixels.astype(np.float64) * (self.time_mapper.depth_scale * 1000.))
         millimetres[(millimetres < 1) | (millimetres > 65535) | ~np.isfinite(millimetres)] = 0
         msg = self.CompressedImage()
-        msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(stamps[1], 10**9)
-        msg.header.frame_id = f'{self.namespace}_rgb_optical'
+        msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(int(stamp_ns), 10**9)
+        msg.header.frame_id = frame_id
         msg.format = '16UC1; compressedDepth zlib'
         msg.data = array('B', zlib.compress(millimetres.astype('<u2').tobytes(), 1))
         self.publisher.publish(msg)
-        self.last_publish = time.monotonic()
+        return mapped
 
 
 class RawCameraPublisher:
