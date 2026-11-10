@@ -196,7 +196,7 @@ class BunkerCAN:
             time.sleep(0.02)
         raise RuntimeError("未收到目标控制模式反馈；遥控器可能仍拥有控制权")
 
-    def set_target(self, linear: float, angular: float, lease_s: float = 0.35) -> None:
+    def validate_target(self, linear: float, angular: float) -> tuple[float, float]:
         state = self._fresh_system_state()
         if state["vehicle_state"] != protocol.VEHICLE_NORMAL:
             raise RuntimeError("底盘状态异常或急停；拒绝运动指令")
@@ -204,6 +204,10 @@ class BunkerCAN:
             raise RuntimeError("底盘不在 CAN 控制模式；请显式调用 enable_can")
         linear = self._limit(linear, float(self.config.get("max_linear_m_s", 0.4)), "linear")
         angular = self._limit(angular, float(self.config.get("max_angular_rad_s", 0.8)), "angular")
+        return linear, angular
+
+    def set_target(self, linear: float, angular: float, lease_s: float = 0.35) -> None:
+        linear, angular = self.validate_target(linear, angular)
         with self._lock:
             self._target = (linear, angular)
             self._target_deadline = time.monotonic() + lease_s

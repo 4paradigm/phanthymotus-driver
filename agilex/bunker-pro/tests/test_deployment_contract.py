@@ -33,3 +33,11 @@ def test_runtime_image_has_deployment_fragment_and_plain_ros_logs():
     assert "--address=\"$bus_address\"" in bootstrap
     assert "RestartUnit ss phanthy-bunker-can.service replace" in bootstrap
     assert "\nsystemctl " not in bootstrap
+
+
+def test_host_sys_mount_is_read_only_and_required_persistent_paths_are_explicit():
+    service = (DRIVER_DIR / "deploy" / "service.yml").read_text()
+    assert "/sys:/sys:ro" in service
+    assert "/lib/modules:/lib/modules:rw" in service
+    assert "/etc/systemd/system:/etc/systemd/system:rw" in service
+    assert "privileged:" not in service

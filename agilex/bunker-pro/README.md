@@ -16,6 +16,17 @@ built because the host does not already provide it. The container calls the
 host systemd manager over the mounted system D-Bus socket with `busctl`; it does
 not try to run `systemctl` against the container's non-systemd PID 1.
 
+The host access is limited to the bootstrap lifecycle: `SYS_MODULE` loads the
+matching `gs_usb` kernel module; `NET_ADMIN` configures the CAN link; `NET_RAW`
+opens SocketCAN raw sockets. `/lib/modules` is writable for the module and
+`depmod` index, `/etc/modules-load.d` and `/etc/systemd/system` persist reboot
+configuration, and `/usr/local/sbin` stores the helper called by the host unit.
+`/usr/src` and `/sys` are read-only inputs (kernel headers and USB/interface
+discovery); the system D-Bus mount is used to ask host systemd to enable and
+restart that unit. Host networking provides the local Agent Core/DDS endpoints.
+The container needs root to write the specific host bind mounts, but it does
+not need all host capabilities or device access granted by privileged mode.
+
 The CAN decoder follows AgileX `ugv_sdk` v2 layouts. It reads status (`0x211`),
 measured velocity (`0x221`) and raw wheel counts (`0x311`). It does not infer
 position from undocumented wheel-count scaling. Startup never changes chassis

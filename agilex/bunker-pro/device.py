@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import ssl
 import threading
 import time
+import urllib.request
+from uuid import uuid4
 
 from can_runtime import BunkerCAN, find_gs_usb_interface
 from common.odom import build_interface, build_sample
@@ -13,6 +17,44 @@ from common.control.sink import ControlSink
 from common.vendor_runtime import tool
 from dds_bridge import BunkerDDSBridge
 import protocol
+
+MOVE_MIN_DURATION_S = 0.05
+MOVE_MAX_DURATION_S = 10.0
+MOVE_COMPLETION_TIMEOUT_S = 20
+REJECTION_LOG_INTERVAL_S = 5.0
+
+
+def _validate_move_duration(value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(value) \
+            or not MOVE_MIN_DURATION_S <= value <= MOVE_MAX_DURATION_S:
+        raise ValueError(
+            f"duration_s must be a finite number between "
+            f"{MOVE_MIN_DURATION_S:g} and {MOVE_MAX_DURATION_S:g} seconds"
+        )
+    return float(value)
+
+
+def _acp_notify(action_id: str, status: str, result: dict) -> None:
+    url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    body = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": "bunker_base",
+        "ts": time.time(),
+    }).encode()
+    request = urllib.request.Request(
+        f"{url}/api/acp/complete", data=body,
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=5, context=context):
+            pass
+    except Exception as exc:
+        print(f"[ACP] completion callback failed ({type(exc).__name__})", flush=True)
 
 
 class BunkerProDevice:
@@ -35,6 +77,11 @@ class BunkerProDevice:
         self._motion_enabled = os.environ.get("BUNKER_MOTION_ENABLED", "1") == "1"
         self._direct_until = 0.0
         self._motion_lock = threading.Lock()
+        self._active_move_id = None
+        self._active_move_stop = None
+        self._rejection_log_lock = threading.Lock()
+        self._rejection_counts = {}
+        self._last_rejection_log_at = 0.0
         self._sink = ControlSink(self._control_descriptor(), self._apply_stream,
                                  on_watchdog=self._watchdog_stop,
                                  on_abort=self._watchdog_stop)
@@ -111,22 +158,85 @@ class BunkerProDevice:
         try:
             payload = json.loads(message.data)
             if not self._motion_enabled:
-                raise RuntimeError("movement is disabled by BUNKER_MOTION_ENABLED=0")
+                self._log_stream_rejection("motion_disabled")
+                return
             values = payload.get("values")
             if not isinstance(values, list) or len(values) != 6:
-                raise ValueError("control/velocity requires a six-axis twist values list")
+                self._log_stream_rejection("invalid_twist_shape")
+                return
             if any(abs(float(values[index])) > 1e-9 for index in (1, 2, 3, 4)):
-                raise ValueError("Bunker Pro supports only vx and wz")
+                self._log_stream_rejection("unsupported_twist_axis")
+                return
             with self._motion_lock:
                 if time.monotonic() < self._direct_until:
                     return
                 result = self._sink.submit(payload)
             if not result.applied and result.verdict.value != "dropped":
-                print(f"[bunker] rejected control command: {result.reason}", flush=True)
+                self._log_stream_rejection("control_sink_rejected")
             elif result.applied:
                 self._sink.tick()
+        except json.JSONDecodeError:
+            self._log_stream_rejection("invalid_json")
+        except (TypeError, ValueError):
+            self._log_stream_rejection("invalid_command")
+        except Exception:
+            self._log_stream_rejection("control_callback_error")
+
+    def _log_stream_rejection(self, category: str) -> None:
+        now = time.monotonic()
+        with self._rejection_log_lock:
+            self._rejection_counts[category] = self._rejection_counts.get(category, 0) + 1
+            if self._last_rejection_log_at and \
+                    now - self._last_rejection_log_at < REJECTION_LOG_INTERVAL_S:
+                return
+            summary = ", ".join(
+                f"{name}={count}" for name, count in sorted(self._rejection_counts.items()))
+            self._rejection_counts.clear()
+            self._last_rejection_log_at = now
+        print(f"[bunker] rejected streamed control messages ({summary})", flush=True)
+
+    def _run_move(self, action_id: str, stop_event: threading.Event,
+                  linear: float, angular: float, duration: float) -> None:
+        status = "error"
+        result = {}
+        target_started = False
+        try:
+            # Serialize target acquisition with stop so a cancellation that
+            # arrives before this worker starts cannot be followed by motion.
+            with self._motion_lock:
+                if stop_event.is_set():
+                    status = "cancelled"
+                else:
+                    self.can.set_target(linear, angular, lease_s=duration)
+                    target_started = True
+            if status != "cancelled":
+                deadline = time.monotonic() + duration
+                while not stop_event.is_set():
+                    snapshot = self.can.snapshot()
+                    if snapshot.get("last_tx_error"):
+                        raise RuntimeError("CAN command transmission failed")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    stop_event.wait(min(0.02, remaining))
+                status = "cancelled" if stop_event.is_set() else "completed"
+            if target_started:
+                result = self.can.stop_motion()
         except Exception as exc:
-            print(f"[bunker] rejected streamed velocity command: {exc}", flush=True)
+            status = "cancelled" if stop_event.is_set() else "error"
+            result = {"error": type(exc).__name__}
+            if target_started:
+                try:
+                    self.can.stop_motion()
+                except Exception:
+                    pass
+        finally:
+            with self._motion_lock:
+                if self._active_move_id == action_id:
+                    self._active_move_id = None
+                    self._active_move_stop = None
+                    self._direct_until = 0.0
+        _acp_notify(action_id, status, result)
 
     def get_tools(self):
         schema = {
@@ -143,6 +253,10 @@ class BunkerProDevice:
                 "enable_can": {"params": [], "description": "Explicitly request CAN control mode"},
                 "move": {"params": ["vx", "wz", "duration_s"], "description": "Move for a bounded duration"},
                 "stop": {"params": [], "description": "Stop base motion"},
+            },
+            "x-completion": {
+                "actions": ["move"],
+                "timeout": MOVE_COMPLETION_TIMEOUT_S,
             },
             "x-resource": "base",
         }
@@ -180,6 +294,8 @@ class BunkerProDevice:
         if tool_name == "bunker_base" and action == "stop":
             self.bridge.bind_control_topic(None)
             with self._motion_lock:
+                if self._active_move_stop is not None:
+                    self._active_move_stop.set()
                 self._direct_until = 0.0
                 return self.can.stop_motion()
         if action == "info":
@@ -196,13 +312,22 @@ class BunkerProDevice:
                 raise RuntimeError("movement is disabled by BUNKER_MOTION_ENABLED=0")
             if args.get("_tool_name") != "bunker_base":
                 raise ValueError("invalid tool")
-            duration = float(args.get("duration_s", 0))
+            duration = _validate_move_duration(args.get("duration_s"))
+            linear, angular = self.can.validate_target(args.get("vx"), args.get("wz"))
+            action_id = f"bunker_move_{uuid4().hex[:12]}"
+            stop_event = threading.Event()
             with self._motion_lock:
+                if self._active_move_id is not None:
+                    return {"error": "a timed base move is already running"}
                 self.can.stop_motion()
                 self._direct_until = time.monotonic() + duration
-            try:
-                return self.can.move_for(float(args["vx"]), float(args["wz"]), duration)
-            finally:
-                with self._motion_lock:
-                    self._direct_until = 0.0
+                self._active_move_id = action_id
+                self._active_move_stop = stop_event
+            worker = threading.Thread(
+                target=self._run_move,
+                args=(action_id, stop_event, linear, angular, duration),
+                daemon=True, name="bunker-timed-move")
+            worker.start()
+            return {"state": "running", "action_id": action_id,
+                    "duration_s": duration}
         raise ValueError(f"unknown bunker_base action: {action}")
