@@ -1,5 +1,7 @@
 """Bumi geometry evidence consumed by generic, robot-agnostic SLAM."""
 import numpy as np
+import yaml
+from pathlib import Path
 
 from noetix.bumi.visual_odometry import VisualOdometryNode
 from noetix.bumi.visual_odometry_contract import CameraCalibration
@@ -33,6 +35,19 @@ def test_assumed_bumi_mount_is_described_not_declared_calibrated():
     assert mount['pose_reference'] == 'body_axes'
     assert mount['source'] == 'bumi_axis_assumption'
     assert mount['version'] == ASSUMED['calibration_id']
+    np.testing.assert_allclose(mount['matrix'], [
+        [0, 0, 1, 0], [-1, 0, 0, 0],
+        [0, -1, 0, 0], [0, 0, 0, 1]])
+
+
+def test_shipped_bumi_mount_is_accepted_as_calibrated_for_slam():
+    config_path = Path(__file__).resolve().parents[2] / 'noetix/bumi/config.yaml'
+    calibration = yaml.safe_load(config_path.read_text())['plugins']['visual_odometry']['calibration']
+    mount = _node(calibration).slam_extrinsic()
+    assert mount['calibrated'] is True
+    assert mount['source'] == 'measured_mount'
+    assert mount['pose_reference'] == 'body'
+    assert mount['version'] == 'verified-bumi-level-forward-optical-to-body-v1'
     np.testing.assert_allclose(mount['matrix'], [
         [0, 0, 1, 0], [-1, 0, 0, 0],
         [0, -1, 0, 0], [0, 0, 0, 1]])

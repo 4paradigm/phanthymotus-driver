@@ -43,11 +43,11 @@ is derived from the IMU quaternion, not integrated angular velocity, and resets
 with each segment.
 Displacement is the 3-D straight-line distance from the **first tracking pose of
 the current segment**, not accumulated walking distance or validated accuracy.
-The shipping `config.yaml` sets a permanent **body-axis convention** for the
-standard level, forward-facing camera: `x` forward, `y` left, `z` up
-(`pose_reference=body_axes`). It is an axis assumption, not a measured extrinsic;
-the pose origin is the camera because the default translation is zero. Reset
-starts a new segment and distance origin.
+The shipping `config.yaml` uses the operator-verified Bumi level-forward
+optical-to-body mount: `x` forward, `y` left, `z` up
+(`pose_reference=body`, `extrinsic.calibrated=true`). The origin remains at
+the camera because the verified translation is zero; changing the installation
+requires new verification. Reset starts a new segment and distance origin.
 
 The card declares two outputs, both pre-existing contracts: the full
 `state/odom` sample (`motus.odom/1`, used by renderers and downstream consumers)
@@ -176,10 +176,12 @@ The visual-odometry `motus.odom/1` stream retains its existing status and pose
 ports. Each sample now carries `vendor.motus_slam.source_id`,
 `clock_mapping`, `clock_verified=false`, and, once the optical frame is known,
 `vendor.motus_slam.extrinsic`. This describes the same `base -> optical`
-mount used to launch RTAB-Map. An assumed, level-forward mount is explicitly
-`calibrated=false`; it must not be silently promoted into verified geometry.
-An installation with a measured mount can set `assumed: false` only after
-calibration and will publish `calibrated=true` with the calibration ID.
+mount used to launch RTAB-Map. The Bumi shipping preset is now marked
+`assumed: false` after operator verification, so it publishes
+`calibrated=true` with the `verified-bumi-level-forward-optical-to-body-v1`
+calibration ID. Other installations without a verified mount must retain
+`assumed: true`, publish `calibrated=false`, and provide a measured transform
+before SLAM mapping.
 
 The depth port's existing `motus.camera/1` declaration includes a
 `vendor.slam_geometry` hint naming the measured cloud frame and ROS timestamp
@@ -193,10 +195,10 @@ on the card. No Bumi-only platform robot preset is required.
 The cross-robot field definitions and clock/extrinsic trust requirements live
 in [Spatial SLAM Input Contract](../../docs/spatial_slam_input.md). The Driver
 code validates the published mount using the ROS-free
-`common.spatial_slam.validate_mount` helper. In the default configuration
-`calibrated=false` means a human must still configure a compatible
-`child_from_cloud` matrix on the SLAM card; it does not mean the system has
-verified optical-to-body installation accuracy.
+`common.spatial_slam.validate_mount` helper. With the operator-verified Bumi
+default, `calibrated=true` allows the generic SLAM card to use this transform
+automatically. A missing or unverified upstream mount still requires a
+compatible, manually configured `child_from_cloud` matrix.
 
 
 ## Depth fallback safety

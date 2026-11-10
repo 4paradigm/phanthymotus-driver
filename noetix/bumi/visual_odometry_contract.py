@@ -9,9 +9,9 @@ agree with it" and nothing more.
 ``motus.odom/1`` stays unchanged. Everything visual-specific lives in ``vendor``:
 segment, diagnostic counters, input ages and the frame the pose is expressed in.
 The pose is in the camera optical frame unless a mount is configured. The
-shipped config uses an explicitly assumed level-forward mount to report robot
-body axes (``pose_reference=body_axes``); only a measured ``camera_to_body`` is
-reported as ``body`` with a measured reference point.
+shipped Bumi config uses an operator-verified level-forward optical-to-body
+mount (``pose_reference=body``); unverified installations keep
+``assumed=true`` and report ``pose_reference=body_axes`` instead.
 """
 from __future__ import annotations
 import math
