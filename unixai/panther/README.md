@@ -7,6 +7,11 @@ process publishes normalized sensor-card data to Agent Core on FastDDS domain
 42 using `/opt/phanthy-motus/dds-local.xml`; raw robot command topics never
 cross that bridge.
 
+The robot-side CycloneDDS context loads the host Panther profile from
+`/home/unix_ai/config/cyclonedds.xml`. Panther confines its domain-0 graph to
+`127.0.0.1`; host networking and the shared profile are therefore both
+required for discovery.
+
 ## Implemented cards
 
 - Sensors: `joints`/`model`, consolidated `robot_state`, `imu`, `odom`,

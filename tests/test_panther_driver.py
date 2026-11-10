@@ -140,6 +140,11 @@ class PantherDriverTest(unittest.TestCase):
         self.assertIn("AGENT_CORE_ROS_DOMAIN_ID=42", service)
         self.assertIn("PANTHER_ROS_DOMAIN_ID=0", service)
         self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
+        self.assertIn(
+            "/home/unix_ai/config/cyclonedds.xml:/etc/cyclonedds/panther.xml:ro",
+            service,
+        )
+        self.assertIn("CYCLONEDDS_URI=file:///etc/cyclonedds/panther.xml", service)
         self.assertIn("network_mode: host", service)
         self.assertIn("stop_grace_period: 15s", service)
 
