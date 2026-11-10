@@ -165,6 +165,12 @@ class BumiDeviceBundle:
                 plugins_cfg["person_detect"], namespace, executor))
             print("[bundle] PersonDetectPlugin loaded")
 
+        if plugins_cfg.get("person_contour", {}).get("enabled", False):
+            from PersonContour import PersonContourPlugin
+            self._plugins.append(PersonContourPlugin(
+                plugins_cfg["person_contour"], namespace, executor))
+            print("[bundle] PersonContourPlugin loaded")
+
         if plugins_cfg.get("mic", {}).get("enabled", False) and media_ctrl is not None:
             from device import MicPlugin
             self._plugins.append(MicPlugin(plugins_cfg["mic"], namespace, executor, media_ctrl))

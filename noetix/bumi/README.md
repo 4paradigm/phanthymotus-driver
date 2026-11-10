@@ -510,6 +510,35 @@ by the depth/aspect filters.
 
 Tests: `python -m pytest noetix/bumi/tests/test_person_detect.py -q`
 
+## Person contour display card (`person_contour`)
+
+Shows the live camera view with every detected person outlined in green. It
+subscribes to the camera colour/depth pair and to `person_detect`'s target JSON
+(which now also carries a `people` list of all current detections, not just the
+nearest one). For each person box it keeps the depth band within
+`depth_tolerance_m` of that person's distance, cleans the mask with open/close,
+finds the external contour and draws it on the colour frame. When depth is
+missing or too noisy it falls back to a green rectangle, so the operator still
+sees which person is tracked.
+
+Output: `/<ns>/person/contour` (`image/jpeg`) at `display_hz` (default 10 Hz).
+On the canvas, connect `person_detect`'s target output (purple port) to this
+card's input; the annotated camera image is then available as the card's image
+output. It is display-only: no chassis command and no second person detector.
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `display_hz` | `10` | Annotated frame rate |
+| `depth_tolerance_m` | `0.40` | Depth band treated as the same person |
+| `line_width` | `2` | Green contour thickness |
+| `jpeg_quality` | `80` | Output JPEG quality |
+
+If the person is close to a wall or the depth is too noisy, the green outline
+may follow the depth blob rather than the exact body edge; the fallback box
+keeps the tracked person visible. The camera card must be running.
+
+Tests: `python -m pytest noetix/bumi/tests/test_person_contour.py -q`
+
 ## Read-only RGB-D visual odometry card (`rgbd_visual_odometry`)
 
 Single container: the estimator runs inside this bundle, not in a sidecar.

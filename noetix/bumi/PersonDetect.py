@@ -439,12 +439,14 @@ class PersonDetectPlugin:
                 "state": "fresh",
                 "trigger": "person_hog",
                 "person": confirmed,
+                "people": people,
                 "count": len(people),
                 "timestamp_ms": int(time.time() * 1000),
             }
         elif people:
             payload = {
                 "state": "candidate",
+                "people": people,
                 "count": len(people),
                 "tracker": self._tracker.progress(),
                 "timestamp_ms": int(time.time() * 1000),

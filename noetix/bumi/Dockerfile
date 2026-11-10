@@ -161,6 +161,7 @@ COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
 COPY PersonDetect.py /work/PersonDetect.py
+COPY PersonContour.py /work/PersonContour.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 

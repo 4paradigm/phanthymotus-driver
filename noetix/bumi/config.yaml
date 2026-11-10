@@ -44,6 +44,13 @@ plugins:
     confirm_frames: 2          # 连续命中多少帧才发布 fresh
     depth_mad_m: 0.80          # 框内深度离散度上限
     publish_debug: true        # 发布 /<ns>/person/debug JPEG
+  # 人形轮廓显示：摄像头画面 + 绿色人形轮廓，供仪表盘查看。
+  person_contour:
+    enabled: true
+    display_hz: 10
+    depth_tolerance_m: 0.40    # 人物前后多深范围内的像素算作同一个人
+    line_width: 2
+    jpeg_quality: 80
   mic:
     enabled: true
   sound_direction:
