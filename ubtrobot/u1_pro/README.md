@@ -13,6 +13,46 @@
 - `system_controls`：统一控制 `wakeup`、`wakeup_followup` 和 `visual_behavior` 三个固件行为开关。
 - `camera_left`、`camera_right`：打开 SDK video stream，并分别订阅 domain `2` 的 `/sensor/camera/left_eye/color/raw`、`/sensor/camera/right_eye/color/raw`，转换后输出 JPEG。SDK 共享内存视频流没有选择左右眼的参数；只有元数据明确标记了对应眼睛时，才会将环形缓冲帧作为该眼的备用输入，避免把一幅画面伪装成左右两路。
 
+- `visitor_badge`：访客贴打印。访客贴在范式+ 上生成，打印机用 USB 接在前台电脑上，所以卡片不直接连打印机，而是向前台电脑上的桥接服务发 HTTP 请求：`skill → visitor_badge → 前台电脑桥接服务 → 范式+ / USB 打印机`。不依赖 SDK，见下文“访客贴打印”。
+
+## 访客贴打印（`visitor_badge`）
+
+### 动作
+
+| action | 参数 | 返回 |
+|---|---|---|
+| `check` | — | `status=ok/not_ready`，`printer.ready`、`visitor_system.ready`、`problems` |
+| `find` | `keyword`：访客姓名或手机后四位 | `status=found/multiple/not_found`，`visitors[]`：`visitor_id`、`name`、`company`、`host`、`visit_time`、`phone_tail`、`printed` |
+| `print` | `visitor_id`（必须来自 `find`）、`reprint`（默认 false）、`wait`（默认 true） | `status=printed/printing/failed/already_printed` 和 `job_id` |
+| `job` | `job_id` | 同 `print` |
+
+出错时统一返回 `status=error`、`code` 和可以直接转述的中文 `error`，例如 `unreachable`（前台电脑没开或网络不通）、`unauthorized`（令牌不对）、`printer_not_ready`、`visitor_not_found`。
+
+安全约束：`print` 只接受 `find` 返回的 `visitor_id`。卡片不会按名字直接打印；范式+ 里查不到预约的访客打不出访客贴。同一位访客重复打印要显式传 `reprint=true`。`find` 只把姓名、单位、被访人、时间、手机后四位交给模型，不转发证件号、完整手机号等字段。
+
+### 配置
+
+画布上卡片的配置项：`bridge_url`（必填，例如 `http://192.168.1.20:8765`，前台电脑要设固定 IP）、`token`（和桥接服务一致）、`timeout_s`、`print_wait_s`。`config.yaml` 的 `visitor_badge.enabled: false` 可以关掉这张卡。
+
+### 桥接服务接口约定
+
+前台电脑上的桥接服务要实现下面四个接口。请求都带 `Authorization: Bearer <token>`，返回 JSON；出错时返回非 2xx 状态码，响应体为 `{"error": "中文说明", "code": "..."}`。
+
+| 接口 | 请求 | 响应 |
+|---|---|---|
+| `GET /health` | — | `{"printer": {"ready": true, "name": "...", "message": ""}, "visitor_system": {"ready": true, "message": ""}}` |
+| `GET /visitors?keyword=王磊` | 只查当天的预约 | `{"visitors": [{"id", "name", "company", "host", "visit_time", "phone_tail", "printed"}]}` |
+| `POST /print` | `{"visitor_id": "V1001", "reprint": false}` | `{"job_id": "...", "status": "printing"}`；已打印过且 `reprint=false` 时返回 `{"status": "already_printed"}` |
+| `GET /jobs/<job_id>` | — | `{"status": "queued/printing/done/failed", "error": ""}` |
+
+[`visitor_badge_mock_bridge.py`](visitor_badge_mock_bridge.py) 是这套接口的模拟实现，不连范式+ 和打印机，用于在真机上联调卡片：
+
+```bash
+python3 ubtrobot/u1_pro/visitor_badge_mock_bridge.py --port 8765 --token test-token
+```
+
+然后把卡片的 `bridge_url` 配成 `http://<运行它的电脑IP>:8765`，`token` 配成 `test-token`。示例访客为王磊、李娜（两位同名）。
+
 ## 启动与行为控制
 
 启动时先检查/完成 SDK 授权，然后依次关闭并读取确认 `wakeup`、`wakeup_followup` 和 `visual_behavior`。任一关闭请求失败或读回状态不符，驱动启动失败，不会注册卡片。需要使用时，可通过 `system_controls` 单独或批量重新开启。

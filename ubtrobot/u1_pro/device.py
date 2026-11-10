@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from common.vendor_runtime import action_schema, jsonable, tool
+from visitor_badge import VisitorBadgePlugin
 
 
 SERVICE_TIMEOUT = 10.0
@@ -2123,4 +2124,8 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
                HeadPlugin(audio, motion_catalog, catalog_available),
                SystemControlsPlugin(nodes),
                camera_left, camera_right]
+    # 访客贴打印只走局域网 HTTP，不依赖 SDK；config.yaml 里 visitor_badge.enabled=false 可关掉。
+    badge_cfg = config.get("visitor_badge") or {}
+    if badge_cfg.get("enabled", True):
+        plugins.append(VisitorBadgePlugin(badge_cfg))
     return plugins
