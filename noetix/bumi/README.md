@@ -374,8 +374,9 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 `start` 时给出——`duration_s`（来回转身持续时间，秒，0=持续到 stop，到时自动
 收尾）、`amplitude_deg`（转身幅度，单侧 5–60 度，默认 20，首周期从 0 渐入）、
 `speed`（快慢两档：slow=慢，约 8 秒一个来回；medium=中，约 4 秒一个来回）。
-**`start` 必须带 `confirm=true`**（危险动作确认：机器人站立、范围内无人、有人
-看护、App 急停就绪）。运行期间站立静止时摆动，`loco` / `loco_relative_move` /
+`confirm` 在**运行时**校验：start 不带 `confirm=true` 时卡片静默停止，**不发出
+任何关节指令**（`info` 的 `preempted_by=confirm_missing` 可查，不报错）；智能控制
+（Agent）调用自动携带布尔 true，画布手动表单不保证传递该字段。运行期间站立静止时摆动，`loco` / `loco_relative_move` /
 `loco_servo` 行走期间继续发送；`semantic_action`、`action_recording`、
 `stand_up_lie_prone` 或保护/摔倒等占用腰部的动作一旦出现，自动停止并释放腰部
 （`info` 的 `preempted_by` 记录原因）。再次 `start` 会先收尾当前摆动再按新参数

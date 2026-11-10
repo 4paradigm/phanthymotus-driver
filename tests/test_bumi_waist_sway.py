@@ -254,35 +254,38 @@ def test_start_parameter_validation(make_card):
     assert low.cmds == []
 
 
-def test_start_requires_confirmation(make_card):
+def test_unconfirmed_start_is_silenced_without_any_joint_command(make_card):
+    # The confirmation gate runs in the stream (runtime, by design): a start
+    # without an explicit true is accepted, the card silences itself before
+    # its first joint command — zero set_joint calls — and settles to off with
+    # no error. The agent's boolean true is what actually moves the robot.
     card, low, _high, _loco = make_card()
-    refused = _start(card, confirm=False, amplitude_deg=20.0)
-    assert refused["state"] == "error"
-    assert "confirm" in refused["error"]
-    missing = card.dispatch("start", {"amplitude_deg": 20.0})
-    assert missing["state"] == "error"
-    assert low.cmds == []
-    assert _start(card)["state"] == "streaming"   # confirm=true engages
+    for unconfirmed in ({"amplitude_deg": 20.0},
+                        {"confirm": False, "amplitude_deg": 20.0},
+                        {"confirm": "yes"}, {"confirm": "1"}, {"confirm": 1}):
+        assert card.dispatch("start", unconfirmed)["state"] == "streaming"
+        assert _wait(lambda: card._info()["state"] == "off")
+        assert card._info()["preempted_by"] == "confirm_missing"
+    assert low.cmds == []                         # not one joint command sent
+    assert card._info()["last_error"] is None     # silenced, not an error
+    assert _start(card)["state"] == "streaming"   # boolean true engages
+    assert _wait(lambda: len(low.cmds) > 10)
 
 
 def test_confirm_accepts_the_canvas_string_form(make_card):
     # The canvas form serializes its fields as strings (verified on the real
-    # machine: "confirm": "true" was refused with the confirmation error).
-    # The exact string "true" — any case, any padding — is the same deliberate
-    # confirmation as boolean true; every other value keeps the gate shut.
+    # machine); the exact string "true" — any case, any padding — is the same
+    # deliberate confirmation as boolean true.
     card, low, _high, _loco = make_card()
-    for bad in ("yes", "1", "false", ""):
-        refused = card.dispatch("start", {"confirm": bad, "amplitude_deg": 20.0})
-        assert refused["state"] == "error"
-        assert "confirm" in refused["error"]
-    assert card.dispatch("start", {"confirm": 1})["state"] == "error"
-    assert low.cmds == []                         # nothing streamed past the gate
-
     assert card.dispatch("start", {"confirm": "true"})["state"] == "streaming"
+    assert _wait(lambda: len(low.cmds) > 10)
     card.dispatch("stop", {})
     assert _wait(lambda: card._info()["state"] == "off")
+
     assert card.dispatch("start", {"confirm": " True "})["state"] == "streaming"
+    assert _wait(lambda: len(low.cmds) > 20)
     card.dispatch("stop", {})
+    assert _wait(lambda: card._info()["state"] == "off")
 
 
 # ── fail-closed engagement (review issues) ───────────────────────────────────
@@ -408,6 +411,10 @@ def test_chassis_idle_labels_of_real_callers_clear_the_flag(make_card):
 def test_body_action_auto_disables_and_restores(make_card):
     loco = FakeLoco()
     card, low, high, _unused = make_card(loco=loco)
+    # Isolate the dispatch-path preemption: the fail-closed supervisor would
+    # legitimately stamp its own preempted_by (workmode_1_ready) over the body
+    # action's label during the wind-down window once this test sets mode=1.
+    card._supervisor_stop.set()
     assert _start(card)["state"] == "streaming"
     assert _wait(lambda: len(low.cmds) > 10)
 
@@ -442,6 +449,29 @@ def test_supervisor_disables_on_external_workmodes(make_card):
     assert _start(card)["state"] == "streaming"
     high.mode = 8   # greet, e.g. started from the vendor App
     assert _wait(lambda: "workmode_8" in (card._info()["preempted_by"] or ""))
+
+
+def test_supervisor_fails_closed_on_ready_enabled_transitions(make_card):
+    # bot review: WALK->ready/enabled (0/1) is not a named body mode, but the
+    # robot may be lying or mid-transition there — an engaged sway must fail
+    # closed on any mode the engage gate would refuse.
+    card, low, high, _loco = make_card()
+    assert _start(card)["state"] == "streaming"
+    assert _wait(lambda: len(low.cmds) > 5)
+
+    high.mode = 1
+    assert _wait(lambda: card._info()["state"] == "off"), \
+        "WALK->ready must release an engaged sway"
+    assert "workmode_1_ready" in card._info()["preempted_by"]
+    stopped_at = len(low.cmds)
+    time.sleep(0.2)
+    assert len(low.cmds) == stopped_at
+
+    high.mode = 2
+    assert _start(card)["state"] == "streaming"
+    assert _wait(lambda: len(low.cmds) > stopped_at + 5)
+    high.mode = 0
+    assert _wait(lambda: "workmode_0_enabled" in (card._info()["preempted_by"] or ""))
 
 
 # ── failure paths ────────────────────────────────────────────────────────────

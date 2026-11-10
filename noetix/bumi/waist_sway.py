@@ -123,8 +123,8 @@ _WORKMODE_NAMES = {
     29: "save_teach_2", 30: "disabled", 31: "dance1", 32: "dance2", 33: "tear",
 }
 # Presets, dances, teaching, protection and fall transitions all move or own
-# the waist; observing any of them releases the sway and clears `enabled`.
-_BODY_MODES = {5, 8, 9, 10, 11, 12, 14, 23, 26, 27, 28, 29, 30, 31, 32, 33}
+# the waist; so do ready/enabled (the robot may be lying there). The
+# supervisor releases the sway on every mode the engage gate would refuse.
 
 _SUPERVISOR_HZ = 10.0
 _BLEND_IN_S = 1.0        # measured pose -> stand table
@@ -171,6 +171,7 @@ class WaistSwayPlugin:
         self._cmds_sent = 0
         self._waist_tracking = "unknown"
         self._workmode: int | None = None
+        self._confirmed = False        # runtime gate: no command without it
         self._restore_needed = False   # a real set_joint went out since last restore
 
         self._stream_thread: threading.Thread | None = None
@@ -203,8 +204,9 @@ class WaistSwayPlugin:
                 "实现走 SDK 低层 set_joint（高层无腰部通道，行走与上身动画在固件互斥），"
                 "以官方示例站立角表做全 21 关节位置保持。注意：固件对高层行走与低层关节"
                 "流并存的仲裁未知——若低层被忽略则行走正常、腰部停转；若低层生效则机器"
-                "人保持站立、底盘命令可能失效。调用 start 需 confirm=true 确认；首次"
-                "真机请小幅度、慢档、有人看护并确保 App 急停可用。"
+                "人保持站立、底盘命令可能失效。confirm 在运行时校验：非 true 时卡片"
+                "静默停止且不发出任何关节指令（智能控制/Agent 调用自动携带布尔 true）。"
+                "首次真机请小幅度、慢档、有人看护并确保 App 急停可用。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -233,17 +235,18 @@ class WaistSwayPlugin:
                     },
                     "confirm": {
                         "type": "boolean",
-                        "description": "start 必须传 true：确认机器人已站立、摆动范围内"
-                                       "无人、有人看护且 App 急停可用",
+                        "description": "运行时校验：非 true 时卡片静默停止、不发出任何"
+                                       "关节指令（info.preempted_by=confirm_missing 可查）；"
+                                       "Agent 调用自动传布尔 true，字符串 \"true\" 亦认可",
                     },
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "start": {
                         "params": ["duration_s", "amplitude_deg", "speed", "confirm"],
-                        "description": "按参数开始摆动（需 confirm=true）；再次调用会先"
-                                       "收尾当前摆动再按新参数重启。要求机器人处于行走"
-                                       "模式站立（workmode=2）",
+                        "description": "按参数开始摆动（confirm 在运行时校验，非 true 卡片"
+                                       "静默停机不发指令）；再次调用会先收尾当前摆动再按"
+                                       "新参数重启。要求机器人处于行走模式站立（workmode=2）",
                     },
                     "stop": {"params": [], "description": "幅度归零后停止并释放腰部"},
                     "info": {"params": [], "description": "状态、剩余时间、腰跟踪自检、"
@@ -300,20 +303,16 @@ class WaistSwayPlugin:
         return None
 
     def _start_action(self, args: dict) -> dict:
-        # A 21-joint low-level stream is a dangerous action: it must not be
-        # startable by an action name alone (review issue; same gate shape as
-        # loco_servo's confirm for clearing dry_run). The canvas form may
-        # serialize its fields as strings — the numeric params already accept
-        # "20" through float() — so the one exact string form "true" counts as
-        # the deliberate confirmation here too; anything else (missing, false,
-        # "yes", 1) is still refused.
+        # A 21-joint low-level stream must not execute on an action name
+        # alone. The confirmation gate runs in the stream itself (runtime, by
+        # the card owner's design): a start without an explicit true is
+        # accepted, but the stream silences the card before its first joint
+        # command — zero set_joint calls, no error — so only an explicit true
+        # (the agent's boolean, or the canvas's string "true") ever moves the
+        # robot.
         confirm = args.get("confirm")
         if isinstance(confirm, str) and confirm.strip().lower() == "true":
             confirm = True
-        if confirm is not True:
-            return {"state": "error", "command_sent": False,
-                    "error": "开启腰部摆动需要确认：机器人站立、摆动范围内无人、"
-                             "有人看护且 App 急停可用时传 confirm=true"}
         raw_duration = args.get("duration_s", 0)
         try:
             duration_s = float(raw_duration)
@@ -369,6 +368,7 @@ class WaistSwayPlugin:
             self._amplitude_rad = math.radians(amplitude_deg)
             self._period_s = _SPEED_PERIODS[speed]
             self._speed = speed
+            self._confirmed = confirm is True
             self._end_time = (time.monotonic() + duration_s
                               if duration_s > 0 else None)
         return self._try_engage(generation)
@@ -587,10 +587,15 @@ class WaistSwayPlugin:
                 enabled = self._enabled
                 state = self._state
                 end_time = self._end_time
-            if mode is not None and mode in _BODY_MODES:
-                # Covers everything the dispatch hooks cannot see: preset
-                # actions and teaching started from the vendor App, protection,
-                # and fall transitions.
+            if mode is not None and mode not in _ENGAGE_MODES:
+                # Fail closed on every mode the engage gate would refuse, not
+                # just the named body modes: an App/operator WALK->ready or
+                # WALK->enabled edge can leave the robot lying down while a
+                # 21-joint stand-pose stream keeps running, and no dispatch
+                # hook sees an App-triggered transition. An unreadable mode
+                # (None) is not a transition — the stream's own error paths
+                # cover a dying SDK, and one flaky read must not tear down a
+                # healthy sway.
                 if enabled or state == "streaming":
                     self.disable_for_body_action(
                         f"workmode_{mode}_{_WORKMODE_NAMES.get(mode, 'unknown')}")
@@ -609,6 +614,21 @@ class WaistSwayPlugin:
     # ── the stream ───────────────────────────────────────────────────────────
 
     def _stream_loop(self, stop_event: threading.Event) -> None:
+        with self._lock:
+            confirmed = self._confirmed
+        if not confirmed:
+            # The confirmation gate, at runtime by design: without an explicit
+            # true the card goes silent — not one joint command is sent, the
+            # state settles to off, and no error is raised. `info` records
+            # why, so a silenced start stays diagnosable without nagging.
+            with self._lock:
+                self._enabled = False
+                self._state = "off"
+                self._stream_thread = None
+                self._preempted_by = "confirm_missing"
+            print("[waist_sway] unconfirmed start silenced; no joint command sent",
+                  flush=True)
+            return
         low = self._ensure_low()
         if low is None:
             self._on_stream_error(
