@@ -332,6 +332,12 @@ def test_depth_card_declares_one_capture_timed_output(capture, monkeypatch):
     # Exactly one depth output: the original topic, enriched rather than duplicated.
     assert tool['topic_out'] == result['topic_out'] == [
         {'topic': '/robot/camera/depth', 'format': 'image/depth-zlib'}]
+    metadata = result['input_metadata']
+    assert len(metadata) == 1
+    assert metadata[0]['topic'] == '/robot/camera/depth'
+    assert metadata[0]['frame_metadata_topic'] == '/robot/camera/depth/metadata'
+    assert metadata[0]['stamp_source'] == 'measurement'
+    assert metadata[0]['clock']['verified'] is False
     infos = {entry['topic']: entry for entry in result['camera_info']}
     assert set(infos) == {'/robot/camera/depth'}
     info = infos['/robot/camera/depth']
