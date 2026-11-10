@@ -1,0 +1,15 @@
+id: agilex-bunker-pro-driver
+name: AgileX Bunker Pro Driver
+category: driver
+hardware_provider: agilex
+hardware_model: bunker-pro
+image_name: agilex-bunker-pro
+port: 15742
+mcp_url: "http://localhost:15742/mcp"
+description: "AgileX Bunker Pro v2 differential mobile base over USB SocketCAN."
+build_context_extras:
+  - ../../common
+cards:
+  - { name: bunker_state, type: sensor }
+  - { name: bunker_odom, type: sensor }
+  - { name: bunker_base, type: actuator }

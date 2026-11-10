@@ -1,0 +1,10 @@
+mcp_port: 15742
+name: "AgileX Bunker Pro"
+ros_namespace: bunker_pro
+can_interface: ""
+max_linear_m_s: 0.2
+max_angular_rad_s: 0.4
+ros:
+  robot_domain_id: 0
+  core_domain_id: 42
+  robot_interface: lo
