@@ -30,4 +30,5 @@ cards:
   - { name: depth,             type: sensor }
   - { name: motion_state,      type: sensor }
   - { name: rgbd_visual_odometry, type: sensor }
+  - { name: fused_odometry, type: sensor }
   - { name: vision_capture,    type: actuator }
