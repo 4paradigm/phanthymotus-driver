@@ -176,7 +176,7 @@ def test_capture_timed_depth_runs_without_visual_odometry(capture, monkeypatch):
             assert scale == .001
 
     class CaptureTimed:
-        def __init__(self, publisher, namespace, mapper):
+        def __init__(self, publisher, namespace, mapper, *, metadata_publisher=None):
             seen.append(('init', namespace, publisher is not None))
 
         def publish(self, source, aligned, *, fallback_stamp_ns=None):
@@ -207,7 +207,7 @@ def test_depth_stream_and_vo_use_same_time_mapper(capture, monkeypatch):
             pass
 
     class CaptureTimed:
-        def __init__(self, publisher, namespace, mapper):
+        def __init__(self, publisher, namespace, mapper, *, metadata_publisher=None):
             self.time_mapper = mapper
             seen.append(mapper)
 
@@ -242,7 +242,7 @@ def test_capture_timed_depth_failure_falls_back_to_legacy_publish(capture, monke
             pass
 
     class CaptureTimed:
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             pass
 
         def publish(self, source, aligned, *, fallback_stamp_ns=None):
@@ -276,7 +276,7 @@ def test_depth_fallback_applies_the_sdk_scale_when_the_publisher_fails(
             assert scale == .002
 
     class CaptureTimed:
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             pass
 
         def publish(self, source, aligned, *, fallback_stamp_ns=None):
@@ -479,7 +479,7 @@ def test_raw_branch_is_off_when_the_visual_odometry_card_is_disabled(capture, mo
     seen = []
 
     class RawCameraPublisher:
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             seen.append(args)
 
     monkeypatch.setitem(sys.modules, 'visual_inputs',
