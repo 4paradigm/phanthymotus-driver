@@ -148,6 +148,10 @@ class FakeIO:
         if self.switch_fail_after is not None and len(self.named("switch")) >= self.switch_fail_after:
             raise RuntimeError("the controller manager rejected the controller switch")
         self._do("switch", tuple(activate), tuple(deactivate))
+        for name in activate:                # the robot does what it was asked, so a test can compare states
+            self.controllers[name] = "active"
+        for name in deactivate:
+            self.controllers[name] = "inactive"
 
     def publish_twist(self, vx, vy, wz):
         self._do("twist", vx, vy, wz)
@@ -393,6 +397,9 @@ def test_dockerfile_exposes_the_port_and_copies_what_the_code_imports():
                      "controller_manager_msgs.srv import ListControllers, SwitchController"):
         assert imported in dockerfile
     assert "command -v nsenter" in dockerfile
+    # The build log must say which packages the base image lacked, so a reviewer can see what the
+    # image really grows by (and whether any interface package was already in ros-base).
+    assert "installing packages the base image lacks" in dockerfile and "nothing installed" in dockerfile
     assert "AS interface-builder" in dockerfile and "COPY --from=interface-builder" in dockerfile
     assert "COPY vendor/unix_msgs/ " in dockerfile
     assert "systemd" not in dockerfile, "nsenter uses the host's systemctl, so none is installed here"
@@ -1652,7 +1659,48 @@ def test_every_motion_command_is_refused_while_the_commissioning_switch_is_off(d
         assert result["state"] == "error" and "commissioning_motion_enabled" in result["message"], card
     assert io.calls == [], "nothing reached the robot"
     info = closed.dispatch("head", "info", {})
-    assert info["state"] == "idle" and info["commissioning_motion_enabled"] is False and "禁止" in info["note"]
+    assert info["state"] == "ready" and info["commissioning_motion_enabled"] is False
+    assert info["accepts_motion"] is False and "禁止" in info["note"]
+
+
+def test_start_is_ready_even_while_the_commissioning_switch_is_off(device, config, hub, io, motion_module):
+    """The cards are gated by default on purpose; a lifecycle `start` must still say `ready`
+    (README_dev: an actuator's start returns ready), or all five fail their lifecycle."""
+    assert config["safety"]["commissioning_motion_enabled"] is False
+    open_gate(hub)                                           # robot ready, only the switch is off
+    closed = motion_module.Motion(config, io, hub, spawn=lambda t, n: t(), notify=lambda *a: None)
+    for card in ("base_drive", "arm_control", "gripper", "lifting", "head"):
+        started = closed.dispatch(card, "start", {})
+        assert started["state"] == "ready", card
+        assert started["commissioning_motion_enabled"] is False and started["accepts_motion"] is False
+        assert started["ready_for_motion"] is True
+    assert io.calls == []
+
+
+def test_start_is_ready_while_the_robot_is_not_ready_and_says_why(motion, hub, io):
+    for card in ("base_drive", "arm_control", "gripper", "lifting", "head"):     # no joints, no estop yet
+        started = motion.dispatch(card, "start", {})
+        assert started["state"] == "ready", card
+        assert started["ready_for_motion"] is False and started["accepts_motion"] is False
+        assert len(started["not_ready_reasons"]) == 2
+    assert io.calls == []
+
+
+def test_start_stays_ready_when_the_controller_manager_is_down(motion, io):
+    io.list_controllers = lambda: (_ for _ in ()).throw(RuntimeError("down"))
+    assert motion.dispatch("arm_control", "start", {})["state"] == "ready"
+
+
+def test_stop_makes_the_card_idle_and_start_or_a_command_makes_it_ready_again(motion, hub, io):
+    open_gate(hub)
+    for card in ("base_drive", "arm_control", "gripper", "lifting", "head"):
+        assert motion.dispatch(card, "start", {})["state"] == "ready"
+        assert motion.dispatch(card, "stop", {})["state"] == "idle"
+        assert motion.dispatch(card, "info", {})["state"] == "idle", card
+        assert motion.dispatch(card, "start", {})["state"] == "ready", card
+    motion.dispatch("head", "stop", {})
+    motion.dispatch("head", "look", {"head0_rad": 0.1, "head1_rad": 0.1, "confirm_motion": True})
+    assert motion.dispatch("head", "info", {})["state"] == "ready", "using a card brings it back"
 
 
 def test_nothing_moves_without_confirm_motion_even_with_the_gate_open(motion, hub, io):
@@ -1738,26 +1786,100 @@ def test_a_new_drive_supersedes_the_old_one(motion, hub, io, completions):
     assert [c[1] for c in completions].count("cancelled") == 1 and [c[1] for c in completions].count("completed") == 1
 
 
+LEFT_P2P = "left_arm_joint_trajectory_position_controller"
+RIGHT_P2P = "right_arm_joint_trajectory_position_controller"
+FORWARD = "dual_arm_forward_position_controller"
+
+
+def _switches(io):
+    return [c for c in io.calls if c[0] == "switch"]
+
+
+def _touched(io):
+    """Every controller any switch activated or deactivated."""
+    return {name for _, activate, deactivate in _switches(io) for name in (*activate, *deactivate)}
+
+
 def test_an_arm_move_switches_controllers_sends_the_goal_and_restores_them(motion, hub, io, completions):
     open_gate(hub)
+    before = dict(io.controllers)
     result = motion.dispatch("arm_control", "move", ARM)
     assert result["state"] == "moving" and result["action_id"].startswith("panther_arm_")
-    p2p = ("left_arm_joint_trajectory_position_controller", "right_arm_joint_trajectory_position_controller")
-    forward = "dual_arm_forward_position_controller"
+    assert result["controllers_activated"] == [LEFT_P2P] and result["controllers_deactivated"] == [FORWARD]
     assert [c[0] for c in io.calls] == ["switch", "goal", "switch"]
-    assert io.calls[0] == ("switch", p2p, (forward,))
+    assert io.calls[0] == ("switch", (LEFT_P2P,), (FORWARD,)), "only the arm being moved, not both"
     assert io.calls[1] == ("goal", "left", tuple(LEFT_TARGET), 3.0)
-    assert io.calls[2] == ("switch", (forward,), p2p), "the original controller is back"
+    assert io.calls[2] == ("switch", (FORWARD,), (LEFT_P2P,)), "the exact inverse"
+    assert io.controllers == before, "every controller is in the state it was in before the move"
     (action_id, status, detail, tool), = completions
     assert (status, tool, detail["controllers_restored"]) == ("completed", "arm_control", True)
     assert detail["left"]["error_code"] == 0
 
 
+def test_a_one_arm_move_never_touches_the_other_arms_trajectory_controller(motion, hub, io, completions):
+    """Review finding: it used to activate both trajectory controllers and deactivate both afterwards."""
+    open_gate(hub)
+    motion.dispatch("arm_control", "move", ARM)
+    assert RIGHT_P2P not in _touched(io)
+    io.calls.clear()
+    motion.dispatch("arm_control", "move", {"side": "right", "positions": RIGHT_TARGET, "duration_s": 3.0,
+                                            "confirm_motion": True})
+    assert LEFT_P2P not in _touched(io) and RIGHT_P2P in _touched(io)
+
+
+def test_a_trajectory_controller_that_was_already_active_for_the_other_arm_stays_active(
+        motion, hub, io, completions):
+    open_gate(hub)
+    io.controllers[RIGHT_P2P] = "active"                 # someone else is using the right arm
+    io.controllers[FORWARD] = "inactive"
+    before = dict(io.controllers)
+    motion.dispatch("arm_control", "move", ARM)          # a move of the *left* arm
+    assert _switches(io) == [("switch", (LEFT_P2P,), ()), ("switch", (), (LEFT_P2P,))]
+    assert RIGHT_P2P not in _touched(io)
+    assert io.controllers == before and io.controllers[RIGHT_P2P] == "active"
+    assert completions[-1][1] == "completed"
+
+
+def test_a_requested_controller_that_was_already_active_is_not_switched_off_afterwards(
+        motion, hub, io, completions):
+    open_gate(hub)
+    io.controllers[LEFT_P2P] = "active"
+    io.controllers[FORWARD] = "inactive"
+    before = dict(io.controllers)
+    result = motion.dispatch("arm_control", "move", ARM)
+    assert result["controllers_activated"] == [] and result["controllers_deactivated"] == []
+    assert _switches(io) == [], "nothing to change, so no switch request at all"
+    assert [c[0] for c in io.calls] == ["goal"] and io.controllers == before
+
+
+def test_both_arms_activate_both_trajectory_controllers_and_restore_the_forward_one(motion, hub, io, completions):
+    open_gate(hub)
+    before = dict(io.controllers)
+    motion.dispatch("arm_control", "move", {"side": "both", "left_positions": LEFT_TARGET,
+                                            "right_positions": RIGHT_TARGET, "duration_s": 3.0,
+                                            "confirm_motion": True})
+    assert _switches(io) == [("switch", (LEFT_P2P, RIGHT_P2P), (FORWARD,)),
+                             ("switch", (FORWARD,), (LEFT_P2P, RIGHT_P2P))]
+    assert io.controllers == before
+
+
+def test_the_controller_state_is_restored_after_a_failure_and_after_stop_too(motion, hub, io, completions):
+    open_gate(hub)
+    io.controllers[RIGHT_P2P] = "active"
+    io.controllers[FORWARD] = "inactive"
+    before = dict(io.controllers)
+    io.arm_results = [{"status": 6, "error_code": -4, "error_string": "path tolerance violated"}]
+    motion.dispatch("arm_control", "move", ARM)
+    assert completions[-1][1] == "error" and io.controllers == before
+    assert RIGHT_P2P not in _touched(io)
+
+
 def test_an_arm_move_leaves_the_forward_controller_off_if_it_was_off(motion, hub, io, completions):
     open_gate(hub)
-    io.controllers["dual_arm_forward_position_controller"] = "inactive"
+    io.controllers[FORWARD] = "inactive"
     motion.dispatch("arm_control", "move", ARM)
     assert io.calls[0][2] == () and io.calls[2][1] == (), "no controller is activated that was not active before"
+    assert io.controllers[FORWARD] == "inactive"
 
 
 def test_an_arm_goal_that_is_refused_never_switches_controllers(motion, hub, io):

@@ -204,6 +204,7 @@ class Motion:
         self._arm_cancel = threading.Event()
         self._arm_done = threading.Event()
         self._arm_done.set()
+        self._stopped: set = set()
 
     # ── gate ─────────────────────────────────────────────────────────────────
 
@@ -231,18 +232,31 @@ class Motion:
                    "lifting": self.lifting, "head": self.head}[card]
         payload = dict(args)
         payload["action"] = action
+        if action not in ("stop", "info"):
+            self._stopped.discard(card)          # any other action means the card is in use again
         try:
             return handler(payload)
         except (ValueError, RuntimeError, TimeoutError) as exc:
             return {"state": "error", "message": str(exc)}
 
+    def start(self, card: str) -> dict:
+        """The lifecycle marker: the card is up and answering. It says nothing about whether a
+        command would be accepted -- that is `ready_for_motion` / `commissioning_motion_enabled`
+        in the same result -- so a card that is deliberately gated by default still starts."""
+        self._stopped.discard(card)
+        return self.info(card)
+
     def info(self, card: str) -> dict:
         """Never raises: `start` must succeed on a robot that is not ready (agent-core rolls the
-        whole project back on one failed start), so what is wrong is reported here."""
+        whole project back on one failed start), so what is wrong is reported here.
+
+        `state` is the card's lifecycle (`ready` until it is stopped, `idle` after), kept apart
+        from whether motion would be accepted right now."""
         ready, reasons = self._state.motion_ready()
-        result = {"state": "ready" if self.motion_enabled() and ready else "idle",
+        result = {"state": "idle" if card in self._stopped else "ready",
                   "commissioning_motion_enabled": self.motion_enabled(),
-                  "ready_for_motion": ready, "not_ready_reasons": reasons}
+                  "ready_for_motion": ready, "not_ready_reasons": reasons,
+                  "accepts_motion": self.motion_enabled() and ready}
         needed = {"base_drive": [DRIVE_CONTROLLER],
                   "arm_control": [ARM_FORWARD_CONTROLLER, *ARM_P2P_CONTROLLERS.values()],
                   "gripper": [GRIPPER_CONTROLLER.format(side=s) for s in ("left", "right")],
@@ -266,6 +280,7 @@ class Motion:
                 print(f"[panther] stopping {card} failed: {type(exc).__name__}: {exc}", flush=True)
 
     def stop(self, card: str) -> dict:
+        self._stopped.add(card)
         if card == "base_drive":
             return self._stop_drive()
         if card == "arm_control":
@@ -290,8 +305,10 @@ class Motion:
     def drive(self, args: dict) -> dict:
         action = args.get("action", "info")
         if action == "stop":
-            return self._stop_drive()
-        if action in ("start", "info"):
+            return self.stop("base_drive")
+        if action == "start":
+            return self.start("base_drive")
+        if action == "info":
             return self.info("base_drive")
         if action != "move":
             raise ValueError(f"unsupported base_drive action: {action}")
@@ -344,8 +361,10 @@ class Motion:
     def arm(self, args: dict) -> dict:
         action = args.get("action", "info")
         if action == "stop":
-            return self._stop_arm()
-        if action in ("start", "info"):
+            return self.stop("arm_control")
+        if action == "start":
+            return self.start("arm_control")
+        if action == "info":
             return self.info("arm_control")
         if action != "move":
             raise ValueError(f"unsupported arm_control action: {action}")
@@ -371,9 +390,11 @@ class Motion:
             positions = args.get("positions" if side == arm_side else own_key)
             targets[arm_side] = (names, validate_joint_target(names, positions, limits, current, step))
         states = self._io.list_controllers()
-        for name in ARM_P2P_CONTROLLERS.values():
+        requested = [ARM_P2P_CONTROLLERS[arm_side] for arm_side in targets]
+        for name in requested:
             if name not in states:
                 raise RuntimeError(f"controller {name} does not exist on this robot")
+        plan = self._switch_plan(states, requested)
         with self._arm_lock:
             if self._arm_running:
                 raise RuntimeError("arm_control is already moving; send stop first")
@@ -381,25 +402,34 @@ class Motion:
             self._arm_cancel.clear()
             self._arm_done.clear()
         action_id = f"panther_arm_{uuid4().hex[:8]}"
-        was_forward_active = states.get(ARM_FORWARD_CONTROLLER) == "active"
-        self._spawn(lambda: self._arm_worker(action_id, targets, duration, was_forward_active),
-                    "panther-arm")
-        return {"state": "moving", "action_id": action_id, "side": side, "duration_s": duration}
+        self._spawn(lambda: self._arm_worker(action_id, targets, duration, plan), "panther-arm")
+        return {"state": "moving", "action_id": action_id, "side": side, "duration_s": duration,
+                "controllers_activated": list(plan[0]), "controllers_deactivated": list(plan[1])}
 
-    def _switch_arm(self, p2p: bool, forward_was_active: bool) -> None:
-        p2p_names = list(ARM_P2P_CONTROLLERS.values())
-        if p2p:
-            self._io.switch_controllers(activate=p2p_names, deactivate=[ARM_FORWARD_CONTROLLER]
-                                        if forward_was_active else [])
-        else:
-            self._io.switch_controllers(
-                activate=[ARM_FORWARD_CONTROLLER] if forward_was_active else [], deactivate=p2p_names)
+    @staticmethod
+    def _switch_plan(states: dict, requested: list) -> tuple:
+        """`(activate, deactivate)` for the move, from what is active right now.
 
-    def _arm_worker(self, action_id: str, targets: dict, duration: float,
-                    forward_was_active: bool) -> None:
+        Only the trajectory controllers of the arms being moved are touched, and only if they
+        are not already active. The forward-position controller owns the joints of both arms, so
+        it has to be released for the move and is put back afterwards if it was active. Anything
+        that was already active and is not in the way is left exactly as it is.
+        """
+        activate = tuple(name for name in requested if states.get(name) != "active")
+        deactivate = (ARM_FORWARD_CONTROLLER,) if states.get(ARM_FORWARD_CONTROLLER) == "active" else ()
+        return activate, deactivate
+
+    def _switch_arm(self, plan: tuple, restore: bool) -> None:
+        """Apply `plan`, or its exact inverse. Nothing is sent if there is nothing to change."""
+        activate, deactivate = plan
+        first, second = (deactivate, activate) if restore else (activate, deactivate)
+        if first or second:
+            self._io.switch_controllers(activate=list(first), deactivate=list(second))
+
+    def _arm_worker(self, action_id: str, targets: dict, duration: float, plan: tuple) -> None:
         status, result, handles, switched = "completed", {}, {}, False
         try:
-            self._switch_arm(True, forward_was_active)
+            self._switch_arm(plan, restore=False)
             switched = True
             for arm_side, (names, positions) in targets.items():
                 handles[arm_side] = self._io.send_arm_goal(arm_side, list(names), positions, duration)
@@ -431,7 +461,7 @@ class Motion:
                         pass
             if switched:
                 try:
-                    self._switch_arm(False, forward_was_active)
+                    self._switch_arm(plan, restore=True)
                     result["controllers_restored"] = True
                 except Exception as exc:  # noqa: BLE001
                     result["controllers_restored"] = False
@@ -457,7 +487,9 @@ class Motion:
         action = args.get("action", "info")
         if action == "stop":
             return self.stop("gripper")
-        if action in ("start", "info"):
+        if action == "start":
+            return self.start("gripper")
+        if action == "info":
             return self.info("gripper")
         if action != "set":
             raise ValueError(f"unsupported gripper action: {action}")
@@ -480,7 +512,9 @@ class Motion:
         action = args.get("action", "info")
         if action == "stop":
             return self.stop("lifting")
-        if action in ("start", "info"):
+        if action == "start":
+            return self.start("lifting")
+        if action == "info":
             return self.info("lifting")
         if action != "set_position":
             raise ValueError(f"unsupported lifting action: {action}")
@@ -505,7 +539,9 @@ class Motion:
         action = args.get("action", "info")
         if action == "stop":
             return self.stop("head")
-        if action in ("start", "info"):
+        if action == "start":
+            return self.start("head")
+        if action == "info":
             return self.info("head")
         if action != "look":
             raise ValueError(f"unsupported head action: {action}")

@@ -62,7 +62,10 @@ RUN test -s /usr/share/keyrings/ros2-archive-keyring.gpg || \
         fi; \
     done && \
     if [ -n "$missing" ]; then \
+        echo "[panther] installing packages the base image lacks:$missing"; \
         apt-get update && apt-get install -y --no-install-recommends $missing && rm -rf /var/lib/apt/lists/*; \
+    else \
+        echo "[panther] the base image already has every runtime package; nothing installed"; \
     fi
 
 COPY requirements.txt /tmp/panther-requirements.txt
