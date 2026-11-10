@@ -48,8 +48,8 @@ def terminal(motion):
 def pose(health, stationary=True):
     require(isinstance(health, dict) and health.get('robot_connected') is True and health.get('ready') is True,
             '机器人未就绪；不发送新指令')
-    require(str(health.get('version', '')).startswith(('0.14.','0.15.')), '需核对新的驱动版本兼容性')
-    sample = health.get('samples', {}).get('joint_state') or {}
+    require(str(health.get('version', '')).startswith(('0.14.','0.15.','0.25.')), '需核对新的驱动版本兼容性')
+    sample = health.get('samples', {}).get('joint_state') or health.get('samples', {}).get('joints') or {}
     data = sample.get('data') or {}
     q, dq = data.get('q'), data.get('dq')
     require(sample.get('available') is True and finite(sample.get('reception_age_seconds')) and

@@ -60,3 +60,53 @@ def select_fields(data, fields):
         else:
             raise ValueError('Invalid status value: ' + key)
     return result
+
+
+def configuration(accid):
+    """Classify the reported identity, never a configured ROBOT_TYPE or pose.
+
+    DACH/WF were observed on hardware; SF is documented but not field verified.
+    This is a process-start observation, not physical assembly verification.
+    """
+    prefix = accid.split('_', 1)[0] if isinstance(accid, str) else ''
+    modes = {'DACH': 'upper_limb', 'WF': 'wheel_foot', 'SF': 'sole_foot'}
+    return {'state': 'identified' if prefix in modes else 'unknown',
+            'mode': modes.get(prefix, 'unknown'), 'accid': accid,
+            'source': 'notify_robot_info.accid',
+            'field_verified': prefix in ('DACH', 'WF'),
+            'fixed_for_process': True, 'enforces_card_restrictions': False}
+
+
+def _bms_integer(value, nonnegative=False):
+    if isinstance(value,bool):return None
+    try:
+        if isinstance(value,str) and len(value)>32:return None
+        number=float(value)
+        if not math.isfinite(number) or not number.is_integer() or (nonnegative and number<0):return None
+        return int(number)
+    except (TypeError,ValueError,OverflowError):return None
+
+def battery_state(data):
+    """SDK notify_robot_info.battery; firmware also returns numeric strings."""
+    value = data.get('battery')
+    if isinstance(value, str):
+        if not value.strip() or len(value) > 32:
+            raise ValueError('Invalid battery percentage')
+        try:
+            value = float(value)
+        except ValueError:
+            raise ValueError('Invalid battery percentage') from None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not 0 <= value <= 100 or not math.isfinite(value):
+        raise ValueError('Invalid battery percentage')
+    return {'percentage': value, 'current': _bms_integer(data.get('bms_current')) if data.get('bms_current_valid') is True else None,
+            'cycle': _bms_integer(data.get('bms_charging_cycle'), nonnegative=True), 'unit': '%',
+            'source': 'notify_robot_info.data.battery'}
+
+
+def battery_stream(sample):
+    """Same measurement keys as Go2; unavailable values are null, never invented zero."""
+    data=sample.get('data') if sample.get('available') else None
+    if not data:return {'soc':None,'current':None,'cycle':None}
+    soc=data['percentage']
+    return {'soc':int(soc) if float(soc).is_integer() else soc,'current':data.get('current'),'cycle':data.get('cycle')}

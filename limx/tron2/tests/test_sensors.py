@@ -30,12 +30,12 @@ from reset import ARM_NAMES
 
 
 def settings(**updates):
-    return {'serial': 'TEST_TRON2A', 'url': 'ws://127.0.0.1:5000',
+    return {'serial': 'DACH_TRON2A_TEST', 'url': 'ws://127.0.0.1:5000',
             'poll_interval_seconds': .5, 'response_timeout_seconds': 5,
             'stale_after_seconds': 5, 'enabled_cards': list(TOPICS), **updates}
 
 
-def info(serial='TEST_TRON2A'):
+def info(serial='DACH_TRON2A_TEST'):
     return {'title': 'notify_robot_info', 'accid': serial,
             'data': {'imu': 'OK', 'motor': 'OK', 'camera': 'UNKNOW',
                      'working_mode': 'developer_mode', 'working_mode_valid': True,
@@ -173,7 +173,7 @@ class CacheTests(unittest.TestCase):
     def test_auto_identity_is_bound_once_per_process(self):
         reader = RobotReader(settings(serial=''))
         reader.accept_info(info())
-        self.assertEqual(reader.serial, 'TEST_TRON2A')
+        self.assertEqual(reader.serial, 'DACH_TRON2A_TEST')
         reader.disconnect('Disconnected')
         with self.assertRaises(ValueError):
             reader.accept_info(info('OTHER'))
@@ -232,7 +232,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         class WS:
             async def send_json(self, body):
                 sent.append(body)
-                response = {'title': 'response_get_joint_state', 'accid': 'TEST_TRON2A'}
+                response = {'title': 'response_get_joint_state', 'accid': 'DACH_TRON2A_TEST'}
                 queue.extend([{**response, 'guid': 'wrong', 'data': joints(q=[9]*16)},
                     {**response, 'guid': body['guid'], 'data': joints()}])
             async def receive(self):
@@ -243,7 +243,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]['title'], 'request_get_joint_state')
         self.assertEqual(sent[0]['data'], {})
-        self.assertEqual(sent[0]['accid'], 'TEST_TRON2A')
+        self.assertEqual(sent[0]['accid'], 'DACH_TRON2A_TEST')
 
     async def test_response_serial_mismatch_is_not_cached(self):
         reader = RobotReader(settings())
@@ -290,7 +290,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 body = json.loads(message.data)
                 requests.append(body)
                 await ws.send_json({'title': 'response_get_joint_state',
-                    'accid': 'TEST_TRON2A', 'guid': body['guid'], 'data': joints()})
+                    'accid': 'DACH_TRON2A_TEST', 'guid': body['guid'], 'data': joints()})
                 if len(connections) == 1:
                     await ws.close()
                     break
@@ -338,10 +338,10 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 body = json.loads(msg.data)
                 requests.append(body)
                 if body['title'] == 'request_get_joint_state':
-                    await ws.send_json({'title': 'response_get_joint_state', 'accid': 'TEST_TRON2A',
+                    await ws.send_json({'title': 'response_get_joint_state', 'accid': 'DACH_TRON2A_TEST',
                         'guid': body['guid'], 'data': joints()})
                 else:
-                    ack = {'title': 'response_movej', 'accid': 'TEST_TRON2A', 'guid': body['guid']}
+                    ack = {'title': 'response_movej', 'accid': 'DACH_TRON2A_TEST', 'guid': body['guid']}
                     # These wrong ACKs must never satisfy the pending command.
                     await ws.send_json({**ack, 'guid': 'wrong', 'data': {'result': 'success'}})
                     await ws.send_json({**ack, 'accid': 'OTHER', 'data': {'result': 'success'}})
@@ -706,7 +706,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
 
     def reset_pose_fixture(self, path, **updates):
         pose = {'schema': 'tron2-arms-reset-pose-v1', 'scope': 'arms_only',
-                'unit': 'rad', 'joint_names': ARM_NAMES, 'accid': 'TEST_TRON2A',
+                'unit': 'rad', 'joint_names': ARM_NAMES, 'accid': 'DACH_TRON2A_TEST',
                 'firmware': 'TEST_FW', 'target_q': [.1]*14,
                 'head_policy': 'unchanged', 'gripper_policy': 'unchanged', **updates}
         path.write_text(json.dumps(pose))
@@ -828,7 +828,7 @@ class PackagingTests(unittest.TestCase):
         reader=RobotReader(settings())
         for connected in (False,True):
             if connected: reader.accept_info(info())
-            with self.assertRaisesRegex(ValueError,'Unknown sensor'):reader.sample('battery_state')
+            self.assertFalse(reader.sample('battery_state')['available'])
         with self.assertRaisesRegex(ValueError,'Unknown TRON2 card'):
             Adapter(lambda *args:None,settings(enabled_cards=['battery_state']))
 
@@ -853,7 +853,7 @@ class PackagingTests(unittest.TestCase):
         from device import VERSION
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','completion.py','trajectory.py','pose.py','head.py','gripper.py','camera.py','ros2.py','config.yaml'):
+            for name in ('main.py','device.py','vendor.py','arm_servo.py','stand.py','sit_down.py','walk.py','state.py','reset.py','skeleton.py','completion.py','trajectory.py','pose.py','head.py','gripper.py','camera.py','ros2.py','config.yaml'):
                 shutil.copyfile(DRIVER/name, root/name)
             shutil.copytree(DRIVER/'resource', root/'resource')
             shutil.copytree(DRIVER/'head_follow', root/'head_follow')
@@ -870,7 +870,7 @@ class PackagingTests(unittest.TestCase):
         source = ast.parse((DRIVER/'vendor.py').read_text())
         calls = [n for n in ast.walk(source) if isinstance(n,ast.Call)
                  and isinstance(n.func,ast.Attribute) and n.func.attr == 'send_json']
-        self.assertEqual(len(calls),5)
+        self.assertEqual(len(calls),6)
         payloads = [{k.value:v for k,v in zip(c.args[0].keys,c.args[0].values)} for c in calls]
         literal = [p for p in payloads if isinstance(p['title'], ast.Constant)]
         self.assertEqual({p['title'].value for p in literal}, {'request_get_joint_state', 'request_movej', 'request_moveh', 'request_servoj'})
@@ -900,7 +900,7 @@ class PackagingTests(unittest.TestCase):
                 with patch.dict(os.environ,CONFIG_PATH=str(path)), self.assertRaisesRegex(ValueError, 'read-only sensor'): load()
                 path.write_text(yaml.safe_dump(config))
                 with patch.dict(os.environ,CONFIG_PATH=str(path)):
-                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'move_head', 'pose', 'gripper', 'camera', 'camera_left', 'camera_right', 'head_visual_follow'})
+                    self.assertEqual(set(load()['enabled_cards']),{'battery', 'joints', 'loco_leg', 'loco_servo_arm', 'arm_control', 'move_head', 'pose', 'gripper', 'camera', 'camera_left', 'camera_right', 'head_visual_follow'})
 
     def test_camera_only_and_fixed_source_configuration(self):
         load = self.function('load_settings')

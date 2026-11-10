@@ -1,0 +1,140 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="bipedal_robot">
+  <link name="base_Link">
+    </link>
+  <link name="base_imu">
+    </link>
+  <joint name="base_imu_Joint" type="fixed">
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0" />
+    <parent link="base_Link" />
+    <child link="base_imu" />
+  </joint>
+  <link name="proximal_pitch_L_Link">
+    </link>
+  <joint name="proximal_pitch_L_Joint" type="revolute">
+    <origin xyz="-0.00044 0.09178 0.05474" rpy="0.0 0.0 0.0" />
+    <parent link="base_Link" />
+    <child link="proximal_pitch_L_Link" />
+    <axis xyz="0.0 0.996194726892931 -0.0871554135479712" />
+    <limit lower="-3.141592653589793" upper="2.600540585471551" effort="150.0" velocity="18.3" />
+  </joint>
+  <link name="proximal_roll_L_Link">
+    </link>
+  <joint name="proximal_roll_L_Joint" type="revolute">
+    <origin xyz="-0.032 0.0758 -0.00663" rpy="0.0 0.0 0.0" />
+    <parent link="proximal_pitch_L_Link" />
+    <child link="proximal_roll_L_Link" />
+    <axis xyz="1.0 0.0 0.0" />
+    <limit lower="-0.2617993877991494" upper="3.1939524787897455" effort="150.0" velocity="18.3" />
+  </joint>
+  <link name="proximal_yaw_L_Link">
+    </link>
+  <joint name="proximal_yaw_L_Joint" type="revolute">
+    <origin xyz="0.032 0.0 -0.1374" rpy="0.0 0.0 0.0" />
+    <parent link="proximal_roll_L_Link" />
+    <child link="proximal_yaw_L_Link" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit lower="-3.6651914291880923" upper="1.4835298641951802" effort="60.0" velocity="22.52" />
+  </joint>
+  <link name="knee_L_Link">
+    </link>
+  <joint name="knee_L_Joint" type="revolute">
+    <origin xyz="0.004 0.032 -0.2126" rpy="0.0 0.0 0.0" />
+    <parent link="proximal_yaw_L_Link" />
+    <child link="knee_L_Link" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit lower="-2.6179938779914944" upper="0.2617993877991494" effort="150.0" velocity="18.3" />
+  </joint>
+  <link name="ankle_pitch_L_Link">
+    </link>
+  <joint name="ankle_pitch_L_Joint" type="revolute">
+    <origin xyz="-0.004 -0.06775 -0.35" rpy="0.0 0.0 0.0" />
+    <parent link="knee_L_Link" />
+    <child link="ankle_pitch_L_Link" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit lower="-1.6231562043547265" upper="1.6231562043547265" effort="60.0" velocity="22.52" />
+  </joint>
+  <link name="proximal_pitch_R_Link">
+    </link>
+  <joint name="proximal_pitch_R_Joint" type="revolute">
+    <origin xyz="-0.00044 -0.09178 0.05474" rpy="0.0 0.0 0.0" />
+    <parent link="base_Link" />
+    <child link="proximal_pitch_R_Link" />
+    <axis xyz="0.0 0.996194726892931 0.0871554135479712" />
+    <limit lower="-3.141592653589793" upper="2.600540585471551" effort="150.0" velocity="18.3" />
+  </joint>
+  <link name="proximal_roll_R_Link">
+    </link>
+  <joint name="proximal_roll_R_Joint" type="revolute">
+    <origin xyz="-0.032 -0.0758 -0.00663" rpy="0.0 0.0 0.0" />
+    <parent link="proximal_pitch_R_Link" />
+    <child link="proximal_roll_R_Link" />
+    <axis xyz="1.0 0.0 0.0" />
+    <limit lower="-3.1939524787897455" upper="0.2617993877991494" effort="150.0" velocity="18.3" />
+  </joint>
+  <link name="proximal_yaw_R_Link">
+    </link>
+  <joint name="proximal_yaw_R_Joint" type="revolute">
+    <origin xyz="0.032 -0.0 -0.1374" rpy="0.0 0.0 0.0" />
+    <parent link="proximal_roll_R_Link" />
+    <child link="proximal_yaw_R_Link" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit lower="-1.4835298641951802" upper="3.6651914291880923" effort="60.0" velocity="22.52" />
+  </joint>
+  <link name="knee_R_Link">
+    </link>
+  <joint name="knee_R_Joint" type="revolute">
+    <origin xyz="0.004 -0.032 -0.2126" rpy="0.0 0.0 0.0" />
+    <parent link="proximal_yaw_R_Link" />
+    <child link="knee_R_Link" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit lower="-2.6179938779914944" upper="0.2617993877991494" effort="150.0" velocity="18.3" />
+  </joint>
+  <link name="ankle_pitch_R_Link">
+    </link>
+  <joint name="ankle_pitch_R_Joint" type="revolute">
+    <origin xyz="-0.004 0.06775 -0.35" rpy="0.0 0.0 0.0" />
+    <parent link="knee_R_Link" />
+    <child link="ankle_pitch_R_Link" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit lower="-1.6231562043547265" upper="1.6231562043547265" effort="60.0" velocity="22.52" />
+  </joint>
+  <link name="d435_Link">
+    </link>
+  <joint name="d435_Joint" type="fixed">
+    <origin xyz="0.0968 0.01759 -0.00409" rpy="0 2.7227 0" />
+    <parent link="base_Link" />
+    <child link="d435_Link" />
+  </joint>
+  <link name="d435_optical_frame">
+    </link>
+  <joint name="d435_optical_Joint" type="fixed">
+    <origin rpy="-1.5707963267948966 0 -1.5707963267948966" xyz="0 0 0" />
+    <parent link="d435_Link" />
+    <child link="d435_optical_frame" />
+  </joint>
+  <link name="display_sole_L_0_Link" />
+  <joint name="display_sole_L_0_Joint" type="fixed">
+    <origin xyz="0.13 0 -0.04" rpy="0 0 0" />
+    <parent link="ankle_pitch_L_Link" />
+    <child link="display_sole_L_0_Link" />
+  </joint>
+  <link name="display_sole_L_1_Link" />
+  <joint name="display_sole_L_1_Joint" type="fixed">
+    <origin xyz="-0.07 0 -0.04" rpy="0 0 0" />
+    <parent link="ankle_pitch_L_Link" />
+    <child link="display_sole_L_1_Link" />
+  </joint>
+  <link name="display_sole_R_0_Link" />
+  <joint name="display_sole_R_0_Joint" type="fixed">
+    <origin xyz="0.13 0 -0.04" rpy="0 0 0" />
+    <parent link="ankle_pitch_R_Link" />
+    <child link="display_sole_R_0_Link" />
+  </joint>
+  <link name="display_sole_R_1_Link" />
+  <joint name="display_sole_R_1_Joint" type="fixed">
+    <origin xyz="-0.07 0 -0.04" rpy="0 0 0" />
+    <parent link="ankle_pitch_R_Link" />
+    <child link="display_sole_R_1_Link" />
+  </joint>
+</robot>

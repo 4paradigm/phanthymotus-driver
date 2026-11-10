@@ -63,7 +63,7 @@ def load_settings():
     if settings['stale_after_seconds'] < settings['poll_interval_seconds']:
         raise ValueError('Stale threshold must cover the poll interval')
     plugins = config.get('plugins', {})
-    allowed = {'joint_state', 'arm_control', 'move_head', 'pose', 'gripper', 'gripper_left', 'gripper_right','head_visual_follow'} | set(CAMERA_SOURCES)
+    allowed = {'loco_servo_arm', 'loco_leg', 'battery','joints','joint_state', 'arm_control', 'move_head', 'pose', 'gripper', 'gripper_left', 'gripper_right','head_visual_follow'} | set(CAMERA_SOURCES)
     if not isinstance(plugins, dict) or set(plugins) - allowed:
         raise ValueError('Only TRON2 sensor, arm_control and gripper plugins may be configured')
     enabled = []
@@ -72,10 +72,11 @@ def load_settings():
             raise ValueError('Expected boolean enabled for ' + name)
         if value['enabled']:
             enabled.append(name)
-    if not set(enabled) & ({'joint_state'} | set(CAMERA_SOURCES)):
+    if not set(enabled) & ({'joints','battery','joint_state'} | set(CAMERA_SOURCES)):
         raise ValueError('Enable at least one read-only sensor')
-    if 'head_visual_follow' in enabled and not {'joint_state','camera','move_head'} <= set(enabled):
+    if 'head_visual_follow' in enabled and (not {'camera','move_head'} <= set(enabled) or not {'joint_state','joints'} & set(enabled)):
         raise ValueError('头部跟随需要joint_state、camera和move_head')
+    settings['loco_servo_arm'] = plugins.get('loco_servo_arm', {})
     settings['enabled_cards'] = enabled
     settings['home_file'] = os.environ.get('TRON2_HOME_FILE', '/config/tron2/home.json')
     # Fixed read-only video source on the same configured robot host. Callers
@@ -87,12 +88,24 @@ def load_settings():
     return settings
 
 
+async def identify_configuration(reader):
+    """Wait for actual vendor feedback, then classify once for this process."""
+    from state import configuration
+    if reader.configuration['state'] != 'pending':
+        return
+    while reader.info_at is None:
+        await asyncio.sleep(.05)
+    reader.configuration = configuration(reader.serial)
+    logging.getLogger('tron2').info('Startup configuration: %s (%s)',
+        reader.configuration['mode'], reader.configuration['state'])
+
+
 async def run():
-    from device import Adapter, TOPICS, PORT, LOG
+    from device import Adapter, SENSOR_TOPICS, PORT, LOG
     from ros2 import JsonPublisher
     from camera import CAMERA_SOURCES
     settings = load_settings()
-    publisher = JsonPublisher([TOPICS[name] for name in settings['enabled_cards'] if name in TOPICS],
+    publisher = JsonPublisher([SENSOR_TOPICS[name] for name in settings['enabled_cards'] if name in SENSOR_TOPICS],
         image_topics=[source[0] for name, source in CAMERA_SOURCES.items() if name in settings['enabled_cards']])
     tasks = []
     runner = None
@@ -105,6 +118,7 @@ async def run():
         async with aiohttp.ClientSession(trust_env=False,
                 timeout=aiohttp.ClientTimeout(total=8)) as session:
             adapter = Adapter(publisher.publish, settings, session=session)
+            adapter.arm_servo.publisher = publisher
             if 'head_visual_follow' in adapter.enabled:
                 from head_follow.runtime import Runtime
                 adapter.follow_runtime = Runtime(adapter, publisher)
@@ -123,12 +137,15 @@ async def run():
             tasks = [asyncio.create_task(adapter.reader.run(session)),
                      asyncio.create_task(adapter.publish_loop()),
                      asyncio.create_task(adapter.register_loop(session)),
-                     asyncio.create_task(stopping.wait())]
+                     asyncio.create_task(stopping.wait()),
+                     asyncio.create_task(identify_configuration(adapter.reader))]
             try:
-                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                # One-shot identification finishing must not stop the services.
+                done, _ = await asyncio.wait(tasks[:-1], return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
                     task.result()
             finally:
+                await adapter.arm_servo.close()
                 if adapter.follow_runtime is not None:
                     await adapter.follow_runtime.close()
                 await asyncio.gather(*(stream.close() for stream in adapter.cameras.values()))
@@ -142,6 +159,8 @@ async def run():
     finally:
         if adapter is not None and adapter.follow_runtime is not None:
             await adapter.follow_runtime.close()
+        if adapter is not None:
+            await adapter.arm_servo.close()
         if runner:
             await runner.cleanup()
         publisher.close()

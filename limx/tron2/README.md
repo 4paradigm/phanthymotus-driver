@@ -1,10 +1,13 @@
 # LimX TRON2 传感器、双臂、头部与夹爪控制驱动
 
-为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂/头部控制卡片、预设pose动作卡片和一张可选择左右的夹爪控制卡片，新增一张基于 Perception Stack VOP 的人物头部视觉跟随卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.15.0`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供构型识别、电池状态、原生关节骨架、下肢运动及双臂/头部流式伺服，保留原有RGB相机、双臂动作、夹爪和VOP人物跟随。运行于通过以太网连接TRON2的Jetson / ARM64主机。驱动版本：`0.25.0`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
-| `joint_state` | sensor | 左右臂及头部16关节URDF实时骨架，附随腕运动的左右夹爪示意；info保留原始rad/deg、dq/tau | `/limx_tron2/joint_state`（sensor/skeleton） |
+| `joints` | sensor | 按ACCID选择DACH上肢16轴、WF轮足或SF足式10轴；独立model提供URDF | `/limx_tron2/state/joints`（sensor/skeleton） |
+| `battery` | sensor | 1Hz发布soc、current、cycle；无效值为null | `/limx_tron2/state/battery`（data/json） |
+| `loco_leg` | actuator | stand_up、sit_down、move、stop_move；轮足速度与时间控制 | 无 |
+| `loco_servo_arm` | actuator | 双臂14轴与头部2轴连续伺服；单位rad | 输入control/joint |
 | `pose` | actuator | salute/wave/welcome预设轨迹；挥手含右夹爪一次开合；整套ACP完成 | 无；详情显示共享双臂任务 |
 | `gripper` | actuator | 选择左/右夹爪并设置目标开口，0mm闭合 | 无；详情显示所选侧反馈 |
 | `camera` | sensor | 按需读取头部RGB，原始JPEG限10fps发布，不录像 | `/limx_tron2/camera`（image/jpeg） |
@@ -13,15 +16,15 @@
 | `arm_control` | actuator | move自定义目标、reset复位并自动校验；ACP完成通知 | 无 |
 | `move_head` | actuator | 俯仰-60～45°（上正）、偏航-88～88°（自身左正）绝对目标；ACP确认到位 | 无 |
 | `head_visual_follow` | actuator | 平滑人物跟随；不跟随模式含暂停与头部复位；ACP会话跟踪 | 左侧输入 `/limx_tron2/camera/objects`（data/json） |
-| `model` | resource | 厂家DACH_TRON2A骨架URDF，供平台自动加载 | 无 |
+| `model` | resource | 随DACH/WF/SF构型选择官方URDF，供平台自动加载 | 无 |
 
 夹爪卡片说明见 [夹爪卡片使用说明](GRIPPER.md)。只填写side（left/right）、opening_mm（0至85mm）、speed、force；没有action/close/recover选项。驱动按底层值=毫米数×94/85名义换算，0mm闭合。非法输入在占用任务和发送前拒绝，两侧独立管理；合法指令仍保留未到位或断连保护。
 
 头部卡片使用步骤、坐标系和完成判定见 [头部控制说明](HEAD.md)。pitch_deg和yaw_deg均须明确填写，单位为度；驱动仅在显式move时发送两轴MoveH。头部与双臂/夹爪互斥，不改变原arm_control的14项目标或自然垂下home。
 
-传感器通过Motus本机ROS2总线发布JSON：joint_state声明sensor/skeleton。默认每0.5秒查询关节并发布缓存，实际频率受厂家响应影响。robot_status不再作为卡片或ROS2 topic公开，但通知中的连接、固件、模式等仍供内部运动校验；值不变不表示这些信息没有用途。
+传感器通过Motus本机ROS2总线发布JSON：joints声明sensor/skeleton，旧joint_state入口保留兼容。默认每0.5秒查询关节并发布缓存，实际频率受厂家响应影响。robot_status不再作为卡片或ROS2 topic公开，但通知中的连接、固件、模式等仍供内部运动校验；值不变不表示这些信息没有用途。
 
-battery_state卡片、配置、topic和电池计算/显示代码已从本版本移除；当前双臂版本不收录电池功能，后续有明确双腿需求再设计。
+`battery`直接复用厂家状态通知：soc为0～100%的电量，current为厂家原始有符号电流（单位及正负约定未确认），cycle为非负充电循环数。缺失、断线、过期值不伪装成0。旧joint_state话题仍兼容，默认使用joints；骨架流只含joints数组，模型由独立model资源提供，不伪造IMU姿态。
 
 ## 人物头部视觉跟随
 
@@ -235,3 +238,26 @@ sudo docker exec embodied-limx-tron2 /bin/bash -c 'source /opt/ros/humble/setup.
 测试使用合成MJPEG，覆盖启停/并发/中断等待、断流清空/重连、无效响应/畸形/截断/超限/停滞帧、RPC元数据与禁止运动；左右腕分开输出/独立停止、失败不影响其他源/JSON就绪，以及三路CompressedImage原始二进制、独立frame_id/单帧队列。只读隧道现场诊断确认三路同时连续视频，左停止后头部/右继续发布；实际图像/现场标识不进入仓库或公开PR。源/中继测试不能代替新镜像部署后的DDS/Core/平台验收。
 
 预设动作卡片的使用、起始姿态、停止与验证范围见 [POSE.md](POSE.md)。pose与arm_control复用同一双臂执行器；不扩展arm_control的公开动作，不更改原始home。
+
+
+## 构型与连续控制
+
+启动后按实际notify_robot_info.accid识别DACH/WF/SF；未知构型不根据关节数量猜测。DACH、WF有现场观察，SF只有文档与模型测试。默认卡片为battery、joints、loco_leg、loco_servo_arm及已有上肢卡片。旧画布中的leg_loco/arm_servo需重新添加为loco_leg/loco_servo_arm。
+
+- loco_leg：stand_up先进入STAND准备，再进入WALK平衡；sit_down先发零速度后请求折叠。完成依据发送后收到的厂家status。move参数vx为m/s、[-3,3]（正前负后），vyaw为deg/s、约±85.943669（正左负右），duration为0停止或0.1～60秒，默认2秒。无横移，结束另发约1秒零速度。start/stop是生命周期，不自动起立/坐下；需要停车用stop_move。不宣称精确距离、转角或物理停稳。
+- loco_servo_arm：将标准control/joint流接到输入口，motus.control/1、joint_position、16维绝对rad目标，顺序为左臂7轴、右臂7轴、头部pitch/yaw。消息包含seq、stamp_ms、obs_stamp_ms、ttl_ms、source、priority、mode、dof、values。时间戳为Unix毫秒。建议30Hz，最大50Hz；Driver从实测姿态插值，目标300Hz发送官方ServoJ。应用速度上限0.5rad/s、加速度1.5rad/s²，不是电机额定极限或硬实时保证。夹爪独立控制。
+- 伺服start仅订阅；pause清空目标并暂停，resume接受新目标，stop释放订阅。dry_run=true只校验、不发电机指令；切换空跑设置后需resume。200ms断流、目标过期停止后续输出。ServoJ无成功ACK，提交数不表示到位。双臂/头部显式动作优先并暂停流，不自动回零。没有增加确认弹窗或持久保护文件。
+
+通用下肢入口使用厂家SIT/DAMPING/STAND/WALK状态。现场固件若把已确认的折叠状态报告为UNKNOW，可通过TRON2_STARTUP_PROFILE指定本地标定文件；未配置时拒绝猜测。文件包含accid、mode、sw_version、working_mode、status、folded_statuses、stationary_dq_limit_rad_s、pose_indices、pose_ranges、name；仅用于匹配，不作为关节目标。真机序列号与观察数据不随驱动分发。
+
+接口依据：[官方SDK指南](https://www.limxdynamics.com/zh/documents/847884267345285120) §3.6.4、§3.8；模型来源见resource/SOURCE.md。Core与Perception无需修改，无新增运行依赖。
+
+### 本地验证
+
+从仓库根目录执行（Python含aiohttp、PyYAML）：
+
+```bash
+PYTHONPATH=.:limx/tron2:limx/tron2/tests python3 -m unittest test_native_skeleton_loco test_walk test_lower_control test_arm_servo test_servo_packet_path -v
+```
+
+普通测试不需要机器人；DDS专用项默认跳过，仅在私有网络/IPC隔离容器中设置TRON2_TEST_PRIVATE_DDS=1、ROS_DOMAIN_ID=TRON2_CORE_DOMAIN_ID=213及独立FastDDS profile时运行。它使用真实DDS与真实ServoJ组包、模拟机器人WebSocket，不打开机器人连接。物理运动效果仍需独立验收。

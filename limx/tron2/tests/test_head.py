@@ -313,10 +313,10 @@ class HeadWireTests(unittest.IsolatedAsyncioTestCase):
                 body=json.loads(msg.data);requests.append(body)
                 if body['title']=='request_get_joint_state':
                     stamp[0]+=1
-                    await ws.send_json({'title':'response_get_joint_state','accid':'TEST_TRON2A','guid':body['guid'],
+                    await ws.send_json({'title':'response_get_joint_state','accid':'DACH_TRON2A_TEST','guid':body['guid'],
                         'data':joints(q=[0]*14+head_q,timestamp=stamp[0])})
                 elif body['title']=='request_moveh':
-                    ack={'title':'response_moveh','accid':'TEST_TRON2A','guid':body['guid'],'data':{'result':'success'}}
+                    ack={'title':'response_moveh','accid':'DACH_TRON2A_TEST','guid':body['guid'],'data':{'result':'success'}}
                     await ws.send_json({**ack,'guid':'wrong'})
                     await ws.send_json({**ack,'accid':'wrong'})
                     await ws.send_json({**ack,'title':'response_movej'})

@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from urllib.parse import urlparse
 
 import aiohttp
-from state import joint_state, select_fields, STATUS_FIELDS
+from state import joint_state, select_fields, STATUS_FIELDS, battery_state
 
 HEAD_API_PORT = 8888  # Read-only vendor UI endpoint, on the same robot host.
 POSE_JOINT_POLL_SECONDS = .1
@@ -110,6 +110,8 @@ def motion_readiness(data):
 class RobotReader:
     def __init__(self, settings):
         self.settings = settings
+        self.configuration = {'state': 'pending', 'mode': 'unknown',
+                              'fixed_for_process': True, 'enforces_card_restrictions': False}
         self.connected = False
         self.serial = settings['serial'] or None
         self.info = self.joints = None
@@ -118,6 +120,9 @@ class RobotReader:
         self.last_error = None
         self.last_round_trip = None
         self.ws = None
+        self.walk = None
+        self.sit_down = None
+        self.stand = None
         self.move_pending = None
         self.head_pending = None
         self.gripper_pending = {}
@@ -159,6 +164,11 @@ class RobotReader:
                 pass
 
     def disconnect(self, reason):
+        if self.walk is not None:self.walk.disconnect()
+        if self.sit_down is not None:
+            self.sit_down.disconnect()
+        if self.stand is not None:
+            self.stand.disconnect()
         if self._pose_servo is not None:
             self._pose_servo['error'] = 'Robot disconnected during ServoJ'
         self.connected = False
@@ -233,6 +243,11 @@ class RobotReader:
                 future.set_result(body.get('data'))
             elif not future.done() and body.get('title') == 'notify_invalid_request':
                 future.set_result({'result': 'fail_invalid_cmd'})
+        if self.walk is not None:self.walk.receive(body)
+        if self.sit_down is not None:
+            self.sit_down.receive(body)
+        if self.stand is not None:
+            self.stand.receive(body)
         if body.get('title') == 'notify_robot_info':
             self.accept_info(body)
         return body
@@ -404,6 +419,28 @@ class RobotReader:
         except (OSError,aiohttp.ClientError,asyncio.TimeoutError) as exc:
             raise MoveError('ServoJ socket submission uncertain; no retry',None,'trajectory_send_unknown') from exc
 
+    async def send_arm_servoj(self, q, token):
+        """General 16-axis stream writer; pose retains its separate zero-head rule."""
+        if token is not self._pose_servo or token.get('error'):
+            raise MoveError((token or {}).get('error') or 'ServoJ owner changed', False)
+        if not isinstance(q, list) or len(q) != 16:
+            raise MoveError('ServoJ requires 16 native joint radians', False)
+        validate_movej(q[:14], .1)
+        for value, (low, high) in zip(q[14:], HEAD_RAD_LIMITS):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not low <= value <= high:
+                raise MoveError('ServoJ head target outside vendor limit', False)
+        if self.configuration.get('mode') != 'upper_limb' or not self.connected or self.ws is not token['ws'] or self.serial != token['serial'] or self.ws.closed:
+            raise MoveError('ServoJ configuration or connection changed', False)
+        status = self.sample('robot_status')
+        if not status['available'] or not motion_readiness(status['data'])['ready'] or status['data'].get('motor') != 'OK':
+            raise MoveError('ServoJ robot status not ready', False)
+        try:
+            await asyncio.wait_for(self.ws.send_json({'title': 'request_servoj', 'accid': self.serial,
+                'guid': str(uuid.uuid4()), 'timestamp': int(time.time() * 1000),
+                'data': {'q': q, 'filter_ratio': 1.0}}), .02)
+        except (OSError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise MoveError('ServoJ submission uncertain; no retry', None) from exc
+
     async def _gripper_request(self, title, data, motion):
         if (motion is True and title != 'request_set_limx_2fclaw_cmd') or \
                 (motion is False and (title != 'request_get_limx_2fclaw_state' or data != {})) or type(motion) is not bool:
@@ -456,7 +493,7 @@ class RobotReader:
         return await self._gripper_request('request_set_limx_2fclaw_cmd', data, True)
 
     def sample(self, name):
-        if name not in ('joint_state', 'robot_status'):
+        if name not in ('joint_state', 'robot_status', 'battery_state'):
             raise ValueError('Unknown sensor')
         info_card = name != 'joint_state'
         at = self.info_at if info_card else self.joints_at
@@ -472,8 +509,12 @@ class RobotReader:
                 data = self.joints
             elif name == 'robot_status':
                 data = select_fields(self.info, STATUS_FIELDS)
-            else:
-                raise ValueError('Unknown sensor')
+            elif name == 'battery_state':
+                try:
+                    data = battery_state(self.info)
+                except ValueError:
+                    available = False
+                    status = 'invalid_battery'
         return {'schema_version': 1, 'accid': self.serial, 'read_only': True, 'connected': self.connected,
                 'available': available, 'sample_status': status,
                 'received_at': received, 'reception_age_seconds': age,
