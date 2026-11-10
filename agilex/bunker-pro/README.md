@@ -12,7 +12,9 @@ The service needs host networking, root for host setup, `SYS_MODULE`,
 paths listed in `deploy/service.yml`. It does not use `privileged: true`. The
 startup fails with a clear error if the adapter or host system D-Bus is
 unavailable. Matching kernel headers are required only when `gs_usb` must be
-built because the host does not already provide it.
+built because the host does not already provide it. The container calls the
+host systemd manager over the mounted system D-Bus socket with `busctl`; it does
+not try to run `systemctl` against the container's non-systemd PID 1.
 
 The CAN decoder follows AgileX `ugv_sdk` v2 layouts. It reads status (`0x211`),
 measured velocity (`0x221`) and raw wheel counts (`0x311`). It does not infer

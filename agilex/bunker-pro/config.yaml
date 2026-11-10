@@ -1,4 +1,4 @@
-mcp_port: 15742
+mcp_port: 15744
 name: "AgileX Bunker Pro"
 ros_namespace: bunker_pro
 can_interface: ""

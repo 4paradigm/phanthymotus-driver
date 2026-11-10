@@ -46,13 +46,23 @@ install -m 0755 "$SCRIPT_DIR/bunker-can.sh" /usr/local/sbin/phanthy-bunker-can
 install -m 0644 "$SCRIPT_DIR/bunker-can.service" \
     /etc/systemd/system/phanthy-bunker-can.service
 
-export DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket
-systemctl daemon-reload
-systemctl enable --now phanthy-bunker-can.service
-
-# Re-apply interface settings on each container start; USB re-enumeration can
-# create a fresh canX device even while the persistent oneshot unit is active.
-/usr/local/sbin/phanthy-bunker-can up >/dev/null || fail "could not configure USB-CAN interface"
+# Use the host system bus directly. systemctl refuses to operate when the
+# container's PID 1 is not systemd, even if the host D-Bus socket is mounted.
+busctl=/usr/bin/busctl
+bus_address=unix:path=/run/dbus/system_bus_socket
+systemd_destination=org.freedesktop.systemd1
+systemd_path=/org/freedesktop/systemd1
+systemd_manager=org.freedesktop.systemd1.Manager
+[[ -x "$busctl" ]] || fail "busctl is unavailable in the driver image"
+"$busctl" --address="$bus_address" call "$systemd_destination" "$systemd_path" \
+    "$systemd_manager" Reload || fail "could not reload host systemd over D-Bus"
+"$busctl" --address="$bus_address" call "$systemd_destination" "$systemd_path" \
+    "$systemd_manager" EnableUnitFiles as 1 phanthy-bunker-can.service false true || \
+    fail "could not enable the persistent host CAN service over D-Bus"
+# Restart on each container start so USB re-enumeration gets a fresh bitrate setup.
+"$busctl" --address="$bus_address" call "$systemd_destination" "$systemd_path" \
+    "$systemd_manager" RestartUnit ss phanthy-bunker-can.service replace || \
+    fail "could not start the host CAN service over D-Bus"
 
 iface=$(/usr/local/sbin/phanthy-bunker-can interface) || \
     fail "no network interface bound to gs_usb after module load"
