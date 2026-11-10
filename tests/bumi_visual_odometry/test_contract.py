@@ -265,6 +265,7 @@ def test_slam_input_declaration_never_upgrades_arrival_clock_or_unknown_pose():
         'mapping': 'shared_camera_mapper', 'verified': False, 'uncertainty_ns': None}
     assert declaration['stamp_source'] == 'unknown'
     assert declaration['child_frame_id'] == 's_base'
+    assert declaration['segment_id'] == 's'
     assert 'extrinsic' not in declaration
 
 
@@ -283,6 +284,8 @@ def test_slam_input_declaration_retains_measured_pose_child_and_mount_evidence()
         '/vo', sample, fallback_child='not_the_pose_frame',
         pose_reference='body', extrinsic=mount)
     assert declaration['child_frame_id'] == 's_base'
+    assert declaration['segment_id'] == 's'
+    assert declaration['frame_id'] == 's_odom'
     assert declaration['extrinsic'] == mount
     assert declaration['clock']['verified'] is False
     assert declaration['stamp_source'] == 'measurement'
