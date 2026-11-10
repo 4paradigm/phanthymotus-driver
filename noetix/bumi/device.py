@@ -2372,6 +2372,7 @@ def _camera_subprocess(namespace: str):
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
     from sensor_msgs.msg import CompressedImage as _CompressedImage
     from sensor_msgs.msg import Image as _SensorImage
+    from std_msgs.msg import String as _String
 
     _QOS = QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -2408,6 +2409,8 @@ def _camera_subprocess(namespace: str):
     depth_topic = f"/{namespace}/camera/depth"
     color_pub = node.create_publisher(_CompressedImage, color_topic, _QOS)
     depth_pub = node.create_publisher(_CompressedImage, depth_topic, _QOS)
+    # Sidecar is deliberately independent of the original depth media topic.
+    depth_metadata_pub = node.create_publisher(_String, depth_topic + '/metadata', _QOS)
 
     pipeline = rs.pipeline()
     config = rs.config()
@@ -2491,7 +2494,9 @@ def _camera_subprocess(namespace: str):
         try:
             from visual_inputs import CaptureTimeMapper, CaptureTimedDepthPublisher
             shared_time_mapper = CaptureTimeMapper(depth_scale)
-            depth_stream = CaptureTimedDepthPublisher(depth_pub, namespace, shared_time_mapper)
+            depth_stream = CaptureTimedDepthPublisher(
+                depth_pub, namespace, shared_time_mapper,
+                metadata_publisher=depth_metadata_pub)
         except Exception as _e:
             print(f"[camera_subprocess] capture-timed depth unavailable, "
                   f"using the scaled fallback publish: {_e}", flush=True)
@@ -2814,9 +2819,14 @@ class CameraPlugin:
             }
             if tool_name in topic_map:
                 topic, fmt = topic_map[tool_name]
-                return {"state": "running",
-                        "topic_out": [{"topic": topic, "format": fmt}],
-                        "camera_info": self._camera_info(tool_name, topic, fmt)}
+                payload = {"state": "running",
+                           "topic_out": [{"topic": topic, "format": fmt}],
+                           "camera_info": self._camera_info(tool_name, topic, fmt)}
+                if tool_name == "depth":
+                    from camera_specs import depth_slam_source_declaration
+                    payload["input_metadata"] = [
+                        depth_slam_source_declaration(topic, self._namespace)]
+                return payload
             return {"state": "running"}
         return None
 
