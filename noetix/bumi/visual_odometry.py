@@ -32,12 +32,14 @@ try:  # imported as part of the noetix.bumi namespace in tests
     from .visual_odometry_contract import (CameraCalibration, Health, MAX_INPUT_AGE_NS,
                                            MAX_POSITION_SIGMA_M, MAX_SKEW_NS,
                                            MAX_TRANSPORT_NS, MAX_VISUAL_AGE_NS,
-                                           finite, make_sample, quat_matrix)
+                                           finite, make_sample, quat_matrix,
+                                           slam_input_declaration)
 except ImportError:  # imported as a top-level /work module inside the bundle image
     from visual_odometry_contract import (CameraCalibration, Health, MAX_INPUT_AGE_NS,
                                           MAX_POSITION_SIGMA_M, MAX_SKEW_NS,
                                           MAX_TRANSPORT_NS, MAX_VISUAL_AGE_NS,
-                                          finite, make_sample, quat_matrix)
+                                          finite, make_sample, quat_matrix,
+                                          slam_input_declaration)
 
 PACKAGE = 'rtabmap_odom'
 EXECUTABLE = 'rgbd_odometry'
@@ -472,6 +474,10 @@ class VisualOdometryNode:
                                 'message_type': 'std_msgs/msg/String'}],
                     odom_topic=self.output,
                     sample=sample,
+                    input_metadata=[slam_input_declaration(
+                        self.output, sample, fallback_child=self.base_frame(),
+                        pose_reference=self.pose_reference(),
+                        extrinsic=self.slam_extrinsic())],
                     # The existing canvas details dialog renders info.description.
                     description=('Read-only RGB-D visual odometry. Canvas status: '+self.status_topic+
                                  '; full odometry: '+self.output+
