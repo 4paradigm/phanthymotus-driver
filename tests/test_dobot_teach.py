@@ -160,7 +160,7 @@ def test_mode5_with_activity_is_not_an_idle_pause(tmp_path, field, phase):
     rec, state, _ = waiting(tmp_path)
     if phase == "pause":
         feed(rec, state, 6, 10)
-        feed(rec, state, 5, 5)
+        feed(rec, state, 5, 15)  # past the 100 ms post-drag running blip window
     state[field] = 1
     with pytest.raises(RuntimeError, match="interrupted"):
         feed(rec, state, 5, 1)
@@ -190,6 +190,87 @@ def test_protection_is_checked_before_mode5_is_accepted(tmp_path, fault):
     if fault == "disabled": state["enable_status"] = False
     with pytest.raises(RuntimeError, match="recording interrupted: "):
         feed(rec, state, 5, 1)
+    rec.subscription.close()
+
+
+def replay(rec, state, rows, step_ms=8):
+    """rows: (packets, mode, drag_status, running_status, joint1 velocity deg/s)."""
+    results = []
+    for packets, mode, drag, running, velocity in rows:
+        for _ in range(packets):
+            state["timestamp"] += step_ms
+            state["robot_mode"], state["drag_status"], state["running_status"] = mode, drag, running
+            state["joint_state"]["q_actual"][0] += velocity * step_ms / 1000
+            results.append(rec._consume({"data": copy.deepcopy(state)}))
+    return results
+
+
+# CR3A drag-button capture, 2026-11-10 11:45 (30004, 8 ms): entering drag reports
+# mode 0 with enable=1/drag=1 for ~24 ms; mode 6 has running=1 while the hand moves;
+# leaving drag reports one mode-5 packet with running=1 before mode 5 is clean.
+FIELD_DRAG = [(10, 5, 0, 0, 0), (3, 0, 1, 0, 0), (30, 6, 1, 1, 6), (1, 5, 0, 1, 0), (20, 5, 0, 0, 0)]
+
+
+def test_field_drag_button_sequence_replays_without_interruption(tmp_path):
+    rec, state, _ = waiting(tmp_path)
+    results = replay(rec, state, FIELD_DRAG * 2)
+    assert results[:10] == [None] * 10
+    # Mode 0 already carries real angles and starts the time axis.
+    assert results[10]["robot_mode"] == 0 and results[10]["time_ms"] == 0
+    assert rec.drag_entries == 2 and all(item is not None for item in results[10:])
+    times = [point["time_ms"] for point in rec._points]
+    assert times == list(range(0, len(times) * 50, 50))
+    rec.subscription.close()
+
+
+@pytest.mark.parametrize("rows,match", [
+    ([(1, 0, 0, 0, 0)], "mode 0 without drag status"),
+    ([(14, 0, 1, 0, 0)], "mode 0 lasting over 100 ms"),
+    ([(3, 0, 1, 0, 0), (1, 5, 0, 0, 0)], "drag transition ended in mode 5"),
+    ([(3, 0, 1, 0, 0), (1, 7, 0, 0, 0)], "controller mode 7"),
+])
+def test_only_the_short_drag_entry_mode0_is_accepted(tmp_path, rows, match):
+    rec, state, _ = waiting(tmp_path)
+    with pytest.raises(RuntimeError, match=match):
+        replay(rec, state, rows)
+    rec.subscription.close()
+
+
+def test_mode0_without_enable_is_a_protection_fault(tmp_path):
+    rec, state, _ = waiting(tmp_path)
+    state["enable_status"] = False
+    with pytest.raises(RuntimeError, match="robot disabled"):
+        replay(rec, state, [(1, 0, 1, 0, 0)])
+    rec.subscription.close()
+
+
+@pytest.mark.parametrize("rows,flag", [
+    ([(13, 5, 0, 1, 0)], None),                       # running > 100 ms after drag
+    ([(1, 5, 0, 1, 0)], "run_queued_cmd"),            # running plus a queue is a motion
+    ([(1, 5, 0, 1, 0)], "jog_status"),
+])
+def test_running_after_drag_is_only_tolerated_as_a_short_blip(tmp_path, rows, flag):
+    rec, state, _ = waiting(tmp_path)
+    replay(rec, state, [(3, 0, 1, 0, 0), (10, 6, 1, 0, 5)])
+    if flag:
+        state[flag] = 1
+    with pytest.raises(RuntimeError, match="recording interrupted: "):
+        replay(rec, state, rows)
+    rec.subscription.close()
+
+
+def test_running_in_mode5_before_any_drag_is_not_a_blip(tmp_path):
+    rec, state, _ = waiting(tmp_path)
+    with pytest.raises(RuntimeError, match="robot is running"):
+        replay(rec, state, [(1, 5, 0, 1, 0)])
+    rec.subscription.close()
+
+
+def test_mode6_without_drag_status_is_an_inconsistent_controller_state(tmp_path):
+    rec, state, _ = waiting(tmp_path)
+    replay(rec, state, [(3, 0, 1, 0, 0), (10, 6, 1, 0, 5)])
+    with pytest.raises(RuntimeError, match="drag state inconsistent"):
+        replay(rec, state, [(1, 6, 0, 0, 0)])
     rec.subscription.close()
 
 

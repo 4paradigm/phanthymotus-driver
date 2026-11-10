@@ -29,7 +29,7 @@ SDK_COMMIT = "55ec1ec82201aaf2e6d54aa47b6272bbaa14c815"
 ROBOT_MODES = {
     0: "unknown", 1: "initializing", 2: "brake_open", 3: "power_off",
     4: "disabled", 5: "enabled_idle", 6: "backdrive", 7: "running",
-    8: "single_move", 9: "error", 10: "paused", 11: "collision",
+    8: "single_move", 9: "error", 10: "paused", 11: "jog",
 }
 
 
@@ -120,7 +120,7 @@ def decode_packet(packet):
             raise ValueError("non-finite number in feedback")
 
     check_finite(state)
-    # SDK 2.0.0 collapses BrakeStatus to bool and labels mode 11 as JOG.
+    # SDK 2.0.0 collapses BrakeStatus to bool; mode 11 is JOG (official RobotMode).
     # Keep its code unmodified; correct semantics here against V4.6.6 docs.
     state["robot_mode"] = int(raw["RobotMode"])
     state["robot_type"] = int(raw["CRRobotType"]) & 0xFF

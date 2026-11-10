@@ -32,6 +32,10 @@ SAMPLE_MS = 50
 MAX_POINTS = 10000
 MAX_BYTES = 32 * 1024 * 1024
 REST_SPEED_DEG_S = 0.1
+# Field capture (CR3A, drag button): 5 -> 0 (enabled, drag_status=1, ~24 ms) -> 6.
+DRAG_ENTRY_TRANSITION_MS = 100
+# Field capture: one mode-5 packet with running_status=1 right after leaving drag.
+DRAG_EXIT_RUNNING_MS = 100
 
 
 def protection_fault(state):
@@ -61,6 +65,15 @@ def interval_fault(state):
         return "command queue is active"
     if state["pause_cmd_flag"]:
         return "command queue is paused"
+    return None
+
+
+def drag_state_fault(state):
+    """Mode 6 without drag_status: the arm stays back-drivable/damped but the
+    controller no longer reports drag (seen after StopDrag during a button drag)."""
+    if state["robot_mode"] == 6 and not state["drag_status"]:
+        return ("controller drag state inconsistent (mode 6 without drag status); "
+                "recover drag on the arm or teach pendant")
     return None
 
 
@@ -337,6 +350,8 @@ class TrajectoryRecorder:
         self.limit_reached = False
         self.drag_entries = 0
         self._mode = None
+        self._transition_since = None
+        self._last_drag_ms = None
         self._points = []
         self._previous = None
         self._origin = None
@@ -367,25 +382,42 @@ class TrajectoryRecorder:
     def _consume(self, item):
         """Return the raw sample, or None while still waiting for the first drag."""
         state = item["data"]
-        # Protection first: mode 5/6 never bypasses it.
-        fault = protection_fault(state)
+        # Protection first: mode 0/5/6 never bypasses it.
+        fault = protection_fault(state) or drag_state_fault(state)
         if fault:
             raise RuntimeError(f"recording interrupted: {fault}")
-        mode = state["robot_mode"]
-        if mode == 5:
-            fault = interval_fault(state)
-            if fault:
-                raise RuntimeError(f"recording interrupted: {fault}")
-        elif mode != 6:
-            raise RuntimeError(f"recording interrupted by controller mode {mode}")
-        if mode == 6 and self._mode != 6:
-            self.drag_entries += 1
-        self._mode = mode
-        if self._previous is None and mode != 6:
-            return None
         timestamp = state["timestamp"]
         if type(timestamp) is not int or timestamp < 0:
             raise ValueError("invalid controller timestamp")
+        mode = state["robot_mode"]
+        if mode not in (0, 5, 6):
+            raise RuntimeError(f"recording interrupted by controller mode {mode}")
+        if self._mode == 0 and mode != 6 and mode != 0:
+            raise RuntimeError(f"recording interrupted by controller mode 0: drag transition ended in mode {mode}")
+        if mode == 0:
+            # Only the short button-drag entry transition is accepted as mode 0.
+            if not state["drag_status"]:
+                raise RuntimeError("recording interrupted by controller mode 0 without drag status")
+            if self._mode != 0:
+                self._transition_since = timestamp
+            if timestamp - self._transition_since > DRAG_ENTRY_TRANSITION_MS:
+                raise RuntimeError(f"recording interrupted by controller mode 0 lasting over "
+                                   f"{DRAG_ENTRY_TRANSITION_MS} ms")
+        elif mode == 6:
+            self._last_drag_ms = timestamp
+        else:
+            fault = interval_fault(state)
+            # Leaving drag, the controller may report running_status for a packet.
+            blip = (fault == "robot is running" and self._last_drag_ms is not None and
+                    interval_fault({**state, "running_status": 0}) is None and
+                    timestamp - self._last_drag_ms <= DRAG_EXIT_RUNNING_MS)
+            if fault and not blip:
+                raise RuntimeError(f"recording interrupted: {fault}")
+        if mode in (0, 6) and self._mode not in (0, 6):
+            self.drag_entries += 1
+        self._mode = mode
+        if self._previous is None and mode == 5:
+            return None
         joints = check_joints(state["joint_state"]["q_actual"])
         frames = {"user": state["user_coordinate"], "tool": state["tool_coordinate"],
                   "user_value": state["user_value"], "tool_value": state["tool_value"]}

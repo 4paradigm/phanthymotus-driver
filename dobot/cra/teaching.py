@@ -15,12 +15,12 @@ if __package__:
     from .completion import MotionCompletion
     from .feedback import positive_number
     from .model import JOINT_NAMES
-    from .trajectory import TrajectoryRecorder, TrajectoryStore, at_rest_after_drag, protection_fault
+    from .trajectory import TrajectoryRecorder, TrajectoryStore, at_rest_after_drag, drag_state_fault, protection_fault
 else:
     from completion import MotionCompletion
     from feedback import positive_number
     from model import JOINT_NAMES
-    from trajectory import TrajectoryRecorder, TrajectoryStore, at_rest_after_drag, protection_fault
+    from trajectory import TrajectoryRecorder, TrajectoryStore, at_rest_after_drag, drag_state_fault, protection_fault
 
 
 class Teaching(MotionCompletion):
@@ -35,6 +35,11 @@ class Teaching(MotionCompletion):
         self.gap_ms = positive_number(settings.get("max_gap_ms", 50), "teach.max_gap_ms")
         if self.gap_ms > 50:
             raise ValueError("teach.max_gap_ms must not exceed the 50 ms sample interval")
+        # Time for the operator to press the drag button after stop_record/stop_motion.
+        self.drag_exit_timeout = positive_number(settings.get("drag_exit_timeout_s", 60), "teach.drag_exit_timeout_s")
+        if self.drag_exit_timeout > 600:
+            raise ValueError("teach.drag_exit_timeout_s must not exceed 600")
+        self._shutting_down = False
         self.store = store if store is not None else TrajectoryStore(
             os.environ.get("DOBOT_TEACH_DATA_DIR", settings.get("data_dir", "data/dobot-teach")),
             os.environ.get("DOBOT_TEACH_CONTROLLER_DIR", settings.get("controller_directory", "")),
@@ -52,7 +57,7 @@ class Teaching(MotionCompletion):
         schema = action_schema({
             "info": ([], "查看示教卡功能和参数说明"),
             "start_record": (["name", "confirm_move"], "清错、按需使能后启动录制任务并等待首次手动拖拽（不发送 StartDrag）；完成通知仅表示已开始等待"),
-            "stop_record": (["confirm_move"], "结束整次录制：仍在拖拽则退出拖拽，以新反馈确认模式 5 停稳后保存；本地录制状态与原生 CSV 状态分开返回"),
+            "stop_record": (["confirm_move"], "结束整次录制：不发送 StopDrag；仍在拖拽时请按机械臂拖拽键退出，以新反馈确认模式 5 停稳后保存；本地录制状态与原生 CSV 状态分开返回"),
             "list_records": ([], "列出本地轨迹名称、时长、点数、完整性和原生文件状态"),
             "delete_record": (["trajectory_id", "confirm_move"], "删除指定本地录制；保留控制器上的副本"),
             "go_to_start": (["trajectory_id", "velocity", "acceleration", "detect_collision", "confirm_move"],
@@ -61,7 +66,7 @@ class Teaching(MotionCompletion):
                      "先确认已在起点，准备使能/皮肤后调用原生 StartPath；保留录制时间比例，关闭额外滤波"),
             "pause": (["confirm_move"], "暂停当前回放/到起点运动，保留控制器队列"),
             "resume": (["confirm_move"], "直接 Continue 继续本卡暂停的队列，不清错、不重新 Enable、不设置安全皮肤"),
-            "stop_motion": (["confirm_move"], "终止回放；录制时退出拖拽并保留标为不完整的数据"),
+            "stop_motion": (["confirm_move"], "终止回放；录制时中断并保留标为不完整的数据，等待按拖拽键退出拖拽并确认停稳后释放机械臂"),
             "start": ([], "启动共享反馈连接"),
             "stop": ([], "结束本卡后台任务并释放资源"),
             "config": ([], "更新共享控制柜 IP/反馈端口；录制要求端口 30004"),
@@ -168,47 +173,43 @@ class Teaching(MotionCompletion):
             except queue.Empty:
                 continue
 
-    def _confirm_drag_exit(self):
-        """Stop drag only if still dragging; then require two consecutive packets,
-        all received after the stop request (or after StopDrag), at rest in mode 5."""
-        feedback = self.control.feedback
-        subscription = feedback.subscribe()
+    def _confirm_drag_exit(self, wait_s):
+        """Never sends StopDrag: a button-initiated drag is left with the arm button
+        (StopDrag mid-drag left the field arm damped in mode 6 without drag status).
+        Success requires two consecutive packets, received after this request, at
+        rest in mode 5."""
+        subscription = self.control.feedback.subscribe()
         try:
-            try:
-                first = self._read_fresh(subscription, time.monotonic() + self.control.receive_timeout)
-            except RuntimeError:
-                first = None  # feedback lost: still attempt StopDrag, success needs fresh feedback
-            if first is None or first["data"]["robot_mode"] == 6 or first["data"]["drag_status"]:
-                # Attempt StopDrag even without feedback; success still needs confirmation.
-                self.control.stop_drag()
-                subscription.close()
-                subscription = feedback.subscribe()
-                first = None
-            deadline = time.monotonic() + self.control.enable_timeout
-            item, previous, settled = first, None, 0
+            started = time.monotonic()
+            previous, settled, last = None, 0, None
             while True:
-                if item is not None:
-                    state = item["data"]
-                    fault = protection_fault(state)
-                    if fault:
-                        raise RuntimeError(f"cannot confirm exit from drag: {fault}")
-                    if at_rest_after_drag(state):
-                        consecutive = previous is not None and item["packet"] == previous + 1
-                        settled = settled + 1 if settled and consecutive else 1
-                    else:
-                        settled = 0
-                    previous = item["packet"]
-                    if settled >= 2:
-                        return
-                item = self._read_fresh(subscription, deadline)
+                if self._shutting_down:
+                    # A stopping driver cannot wait for the operator indefinitely.
+                    wait_s = min(wait_s, self.control.enable_timeout)
+                item = self._read_fresh(subscription, started + wait_s)
                 if item is None:
+                    if last is not None and (last["robot_mode"] in (0, 6) or last["drag_status"]):
+                        raise TimeoutError(f"arm still in drag after {wait_s:g} s; press the drag button "
+                                           "on the arm to exit drag, then run stop_motion or stop_record")
                     raise TimeoutError("fresh feedback did not confirm leaving drag at rest in mode 5")
+                state = last = item["data"]
+                fault = protection_fault(state) or drag_state_fault(state)
+                if fault:
+                    raise RuntimeError(f"cannot confirm exit from drag: {fault}")
+                if at_rest_after_drag(state):
+                    consecutive = previous is not None and item["packet"] == previous + 1
+                    settled = settled + 1 if settled and consecutive else 1
+                else:
+                    settled = 0
+                previous = item["packet"]
+                if settled >= 2:
+                    return
         finally:
             subscription.close()
 
     def _leave_drag(self, lease):
         try:
-            self._confirm_drag_exit()
+            self._confirm_drag_exit(self.drag_exit_timeout)
             self._drag_cleanup_failed = False
             self.control.ownership.release(lease)
             return None
@@ -253,8 +254,7 @@ class Teaching(MotionCompletion):
             raise RuntimeError("no recording has been started")
         if not recorder.finished.is_set():
             recorder.stop("recording cancelled" if aborted else None)
-            if not recorder.finished.wait(self.control.enable_timeout + 2 * self.control.receive_timeout +
-                                          self.control.connect_timeout + 5):
+            if not recorder.finished.wait(self.drag_exit_timeout + self.control.receive_timeout + 5):
                 raise TimeoutError("recording cleanup did not finish")
         result = self.store.summary(recorder.record)
         if recorder.record["state"] != "recorded" and not aborted:
@@ -424,6 +424,13 @@ class Teaching(MotionCompletion):
                     self._jobs.pop(active["action_id"], None)
 
     def shutdown(self):
+        self._shutting_down = True
+        try:
+            self._shutdown()
+        finally:
+            self._shutting_down = False
+
+    def _shutdown(self):
         self.interrupt()
         if self.recorder is not None and not self.recorder.finished.is_set():
             self.recorder.stop("driver stopped during recording")

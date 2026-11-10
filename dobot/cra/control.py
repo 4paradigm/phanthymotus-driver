@@ -315,17 +315,6 @@ class RobotController:
 
         return self._execute("start_record", None, check, card="teach")
 
-    def stop_drag(self):
-        self.ownership.check("teach")
-
-        def check(current_action, *, allow_own_queue=False):
-            # Always allow an explicit attempt to leave drag after feedback loss.
-            if not self.feedback.address:
-                raise RuntimeError("configure the controller IP first")
-            return {**self.feedback.snapshot(), "controller_ip": self.feedback.address}
-
-        return self._execute("stop_record", "StopDrag", check, card="teach")
-
     def execute_path(self, filename, start_joints, args, *, cancel=None):
         filename = trajectory_filename(filename)
         self.ownership.check("teach")

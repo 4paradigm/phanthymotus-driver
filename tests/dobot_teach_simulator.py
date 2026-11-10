@@ -32,6 +32,9 @@ class RobotSimulator:
         self.motion = None
         self.hand_velocity = 0.0
         self.joint_speed = None  # overrides QDActual, e.g. an arm still coasting in mode 5
+        self.drag_status = None  # overrides DragStatus, e.g. the field-observed mode 6 without drag
+        self.running_packets = 0  # mode-5 packets reporting RunningStatus=1 (field: right after drag)
+        self.entry_packets = 0  # mode-6 packets first reported as mode 0 (field: drag-button entry)
         self.failure_command = None
         self.feedback_enabled = True
         self.skin = 0
@@ -71,7 +74,7 @@ class RobotSimulator:
         now = time.monotonic()
         dt = now - self.clock
         self.clock = now
-        if self.mode == 6:
+        if self.mode in (0, 6):
             self.joints[0] += self.hand_velocity * dt
         elif self.mode == 7 and self.motion is not None:
             motion = self.motion
@@ -119,8 +122,6 @@ class RobotSimulator:
                 result = str(self.command_id)
             elif name == "StartDrag":
                 self.mode = 6
-            elif name == "StopDrag":
-                self.mode, self.hand_velocity = 5, 0
             elif name == "GetStartPose":
                 filename = re.search(r'"([^"\n]+)"', command)[1]
                 values = ",".join(str(value) for value in self._rows(filename)[0])
@@ -177,11 +178,20 @@ class RobotSimulator:
                     record["len"], record["TestValue"] = 1440, TEST_VALUE_MAGIC
                     self.timestamp += 8
                     record["TimeStamp"] = self.timestamp
-                    record["RobotMode"] = self.mode
+                    reported = self.mode
+                    if self.mode == 6 and self.entry_packets:
+                        self.entry_packets -= 1
+                        reported = 0
+                    record["RobotMode"] = reported
                     record["CRRobotType"] = 113
                     record["EnableStatus"] = int(self.enabled)
-                    record["DragStatus"] = int(self.mode == 6)
-                    record["RunningStatus"] = int(self.mode == 7 and self.motion is not None)
+                    record["DragStatus"] = (int(self.mode in (0, 6)) if self.drag_status is None
+                                            else int(self.drag_status))
+                    running = self.mode == 7 and self.motion is not None
+                    if self.mode == 5 and self.running_packets:
+                        self.running_packets -= 1
+                        running = True
+                    record["RunningStatus"] = int(running)
                     record["RunQueuedCmd"] = int(self.mode == 7)
                     record["PauseCmdFlag"] = 0  # Matches the actual controller observation.
                     record["ErrorStatus"] = int(self.alarm)

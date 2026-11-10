@@ -85,7 +85,7 @@ def running_client(chunks, **config):
 def test_sdk_layout_and_raw_brake_bits():
     state = decode_packet(packet(mode=11, brake=0b100101))
     assert state["robot_mode"] == 11
-    assert state["robot_mode_name"] == "collision"
+    assert state["robot_mode_name"] == "jog"
     assert state["brake_status"] == 0b100101
     assert state["brake_released"] == [True, False, False, True, False, True]
     assert state["joint_state"]["q_actual"] == [90, -30, 0, 0, 0, 0]
