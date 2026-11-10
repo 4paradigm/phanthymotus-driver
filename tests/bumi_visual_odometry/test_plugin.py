@@ -286,6 +286,24 @@ def test_stop_and_reset_do_not_display_a_previous_segment_pose(plugin):
     assert summary(node)['reason'] is None
 
 
+def test_preflight_info_is_side_effect_free_and_normal_info_remains_compatible(plugin):
+    node = tracking(plugin)
+    before_odom = len(node.node.messages)
+    before_status = len(node.node.topics[node.status_topic])
+    before_origin = node.summary_origin
+    snapshot = plugin.dispatch('info', {'read_only': True})
+    assert snapshot['sample']['vendor']['status'] == 'tracking'
+    assert snapshot['input_metadata'][0]['clock']['verified'] is False
+    assert len(node.node.messages) == before_odom
+    assert len(node.node.topics[node.status_topic]) == before_status
+    assert node.summary_origin == before_origin
+
+    legacy = plugin.dispatch('info', {})
+    assert len(node.node.messages) == before_odom + 1
+    assert legacy['sample'] == last(plugin)
+    assert node.summary_origin == [1., 2., 3.]
+
+
 def test_info_keeps_full_sample_and_exposes_it_in_canvas_details(plugin):
     node = tracking(plugin)
     result = plugin.dispatch('info', {})
