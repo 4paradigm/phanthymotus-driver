@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 
 from noetix.bumi.visual_odometry_contract import (CameraCalibration, ClockMap, Health,
-                                    camera_to_body, finite, make_sample, quat_matrix)
+                                    camera_to_body, finite, make_sample, quat_matrix,
+                                    slam_input_declaration)
 from noetix.bumi.visual_odometry import estimate, mount_transform, parameter_file
 
 
@@ -247,3 +248,41 @@ def test_slam_metadata_distinguishes_pose_time_from_publication_time():
     assert lost['vendor']['motus_slam']['status'] == 'lost'
     assert lost['vendor']['motus_slam']['stamp_source'] == 'unknown'
     assert lost['pose'] is None
+
+
+def test_slam_input_declaration_never_upgrades_arrival_clock_or_unknown_pose():
+    sample = make_sample(Health('s', None, started_ns=0), 100, None)
+    sample['vendor']['motus_slam'].update(
+        source_id='noetix/bumi/camera_color',
+        clock_mapping='shared_camera_mapper', clock_verified=False)
+    declaration = slam_input_declaration(
+        '/bumi/vo/odom', sample, fallback_child='s_base',
+        pose_reference='rgb_optical', extrinsic=None)
+    assert declaration['topic'] == '/bumi/vo/odom'
+    assert declaration['format'] == 'state/odom'
+    assert declaration['schema'] == 'motus.slam_input/1'
+    assert declaration['clock'] == {
+        'mapping': 'shared_camera_mapper', 'verified': False, 'uncertainty_ns': None}
+    assert declaration['stamp_source'] == 'unknown'
+    assert declaration['child_frame_id'] == 's_base'
+    assert 'extrinsic' not in declaration
+
+
+def test_slam_input_declaration_retains_measured_pose_child_and_mount_evidence():
+    sample = make_sample(healthy(), 1_100_000_000, {
+        'stamp_ns': 1_090_000_000,
+        'pose': {'frame_id': 's_odom', 'child_frame_id': 's_base',
+                 'position': [0., 0., 0.], 'quaternion': [0., 0., 0., 1.]}})
+    sample['vendor']['motus_slam'].update(
+        source_id='noetix/bumi/camera_color',
+        clock_mapping='shared_camera_mapper', clock_verified=False)
+    mount = {'parent_frame': 's_base', 'child_frame': 'rgb',
+             'matrix': [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+             'source': 'test_measurement', 'version': '1', 'calibrated': True}
+    declaration = slam_input_declaration(
+        '/vo', sample, fallback_child='not_the_pose_frame',
+        pose_reference='body', extrinsic=mount)
+    assert declaration['child_frame_id'] == 's_base'
+    assert declaration['extrinsic'] == mount
+    assert declaration['clock']['verified'] is False
+    assert declaration['stamp_source'] == 'measurement'
