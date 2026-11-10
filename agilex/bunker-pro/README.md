@@ -17,9 +17,14 @@ built because the host does not already provide it.
 The CAN decoder follows AgileX `ugv_sdk` v2 layouts. It reads status (`0x211`),
 measured velocity (`0x221`) and raw wheel counts (`0x311`). It does not infer
 position from undocumented wheel-count scaling. Startup never changes chassis
-control mode. The `bunker_base` tool must explicitly request CAN mode with
-`enable_can`; movement also requires fresh NORMAL/CAN feedback and is disabled
-unless `BUNKER_MOTION_ENABLED=1` is deliberately set for commissioning.
+control mode. Software movement permission defaults to enabled and can be
+disabled with `BUNKER_MOTION_ENABLED=0`. Before movement, call the
+`bunker_base` tool action `enable_can`; it sends the CAN control-mode request
+(`0x421`) and waits for chassis feedback. This does not move a physical remote
+switch. If the chassis does not accept CAN mode while the remote has control,
+set the remote as described in the Bunker Pro manual, then retry. Movement still
+requires fresh NORMAL/CAN feedback and stays within the configured low speed
+limits.
 
 The `motus.control/1` six-axis twist stream enters on the Agent Core domain and
 is bridged to the private robot domain. State and `motus.odom/1` return through

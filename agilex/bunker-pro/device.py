@@ -32,7 +32,7 @@ class BunkerProDevice:
         self._state_thread = None
         self._stop = threading.Event()
         self._enabled_sensors = set()
-        self._motion_enabled = os.environ.get("BUNKER_MOTION_ENABLED", "0") == "1"
+        self._motion_enabled = os.environ.get("BUNKER_MOTION_ENABLED", "1") == "1"
         self._direct_until = 0.0
         self._motion_lock = threading.Lock()
         self._sink = ControlSink(self._control_descriptor(), self._apply_stream,
@@ -111,7 +111,7 @@ class BunkerProDevice:
         try:
             payload = json.loads(message.data)
             if not self._motion_enabled:
-                raise RuntimeError("movement is disabled; set BUNKER_MOTION_ENABLED=1 after commissioning")
+                raise RuntimeError("movement is disabled by BUNKER_MOTION_ENABLED=0")
             values = payload.get("values")
             if not isinstance(values, list) or len(values) != 6:
                 raise ValueError("control/velocity requires a six-axis twist values list")
@@ -193,7 +193,7 @@ class BunkerProDevice:
             return self.can.stop_motion()
         if action == "move":
             if not self._motion_enabled:
-                raise RuntimeError("movement is disabled; set BUNKER_MOTION_ENABLED=1 after commissioning")
+                raise RuntimeError("movement is disabled by BUNKER_MOTION_ENABLED=0")
             if args.get("_tool_name") != "bunker_base":
                 raise ValueError("invalid tool")
             duration = float(args.get("duration_s", 0))
