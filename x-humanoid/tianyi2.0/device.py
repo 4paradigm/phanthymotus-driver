@@ -2080,7 +2080,14 @@ class PointCloudPlugin:
         from std_msgs.msg import UInt8MultiArray
         out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)
     def dispatch(self, action, args):
-        if action == 'info':
+        if action == 'start':
+            # Bundle dispatcher only calls start() on first activation.
+            # A previously stopped sensor must re-arm on later start actions.
+            if not self._running:
+                self.start()
+        elif action == 'stop':
+            self.stop()
+        elif action == 'info':
             return {'state': 'running' if self._running else 'idle',
                     **self._native_info()}
         return {'state': 'running' if self._running else 'idle',
