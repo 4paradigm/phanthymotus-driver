@@ -42,14 +42,38 @@ class MediaWorkers:
         self._rtsp_frame_failures[lane] = 0
         thread.start()
 
+    def restart_rtsp_camera(self, lane):
+        """Reconnect only this lane after its camera settings change."""
+        process = self._rtsp_processes.get(lane)
+        if process is not None and process.poll() is None:
+            process.terminate()
+
     def _rtsp_loop(self, lane, url):
         while not self._closed:
             process = None
+            errors_thread = None
             try:
-                process = subprocess.Popen(_rtsp_command(url), stdout=subprocess.PIPE,
-                                           stderr=subprocess.DEVNULL, bufsize=0)
+                controller = getattr(self, "camera_undistortion", None)
+                generation = controller.generation(lane) if controller else None
+                command = controller.rtsp_command(lane, url) if controller else _rtsp_command(url)
+                process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE if controller else subprocess.DEVNULL,
+                                            bufsize=0)
                 self._rtsp_processes[lane] = process
-                self._read_mjpeg(lane, process.stdout)
+                if controller:
+                    def drain_errors(proc=process, version=generation):
+                        # Drain continuously so ffmpeg cannot block on stderr.
+                        # Keep diagnostics bounded; camera info exposes the last error.
+                        for line in iter(proc.stderr.readline, b""):
+                            text = line.decode("utf-8", errors="replace").strip()
+                            if text:
+                                controller.record_error(lane, version, text)
+                    errors_thread = threading.Thread(target=drain_errors, daemon=True,
+                                                     name=f"s10-ffmpeg-errors-{lane}")
+                    errors_thread.start()
+                if controller and generation != controller.generation(lane):
+                    process.terminate()
+                self._read_mjpeg(lane, process.stdout, generation)
             except (OSError, ValueError) as exc:
                 print(f"[rtsp] {lane} pull failed: {exc}", flush=True)
             finally:
@@ -64,13 +88,17 @@ class MediaWorkers:
                         process.wait(timeout=1)
                     if process.stdout:
                         process.stdout.close()
+                    if errors_thread is not None:
+                        errors_thread.join(timeout=1)
+                        if process.stderr:
+                            process.stderr.close()
             if not self._closed:
                 if process is not None and process.returncode not in (None, 0, -15):
                     print(f"[rtsp] {lane} ffmpeg exited with {process.returncode}; reconnecting",
                           flush=True)
                 time.sleep(1)
 
-    def _read_mjpeg(self, lane, stream):
+    def _read_mjpeg(self, lane, stream, generation=None):
         buffer = bytearray()
         while not self._closed:
             chunk = stream.read(65536)
@@ -91,8 +119,15 @@ class MediaWorkers:
                     break
                 frame = bytes(buffer[start:end + 2])
                 del buffer[:end + 2]
+                controller = getattr(self, "camera_undistortion", None)
+                if controller and generation != controller.generation(lane):
+                    continue
                 try:
-                    self._on_result(lane, None, frame)
+                    if controller:
+                        controller.publish_if_current(lane, generation,
+                            lambda: self._on_result(lane, None, frame))
+                    else:
+                        self._on_result(lane, None, frame)
                 except Exception as exc:
                     count = self._rtsp_frame_failures.get(lane, 0) + 1
                     self._rtsp_frame_failures[lane] = count
