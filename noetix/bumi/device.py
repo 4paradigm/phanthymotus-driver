@@ -885,6 +885,19 @@ class LocoPlugin:
         if self._sway is not None:
             self._sway.notify_chassis_active("loco.move")
 
+        def _end_move_stream():
+            # Both move workers end through this one epilogue — natural end,
+            # watchdog, stop, replacement, or an SDK publisher raise — so the
+            # final zero, the velocity-ownership handback and the sway chassis
+            # label release can never drift apart between the timed and
+            # continuous variants again (a review round caught exactly that
+            # drift: the continuous finally had lost the label release).
+            try:
+                self._publish_cmd(0, 0, 0, default_cmd, 0)
+            finally:
+                self._set_servo_velocity_owner(False)
+                self._release_sway_chassis_label()
+
         if duration > 0:
             # Timed move
             def _move_timed():
@@ -894,13 +907,7 @@ class LocoPlugin:
                         self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
                         time.sleep(0.02)  # 50 Hz
                 finally:
-                    # Stop before returning zero refresh to the paused servo,
-                    # including if the SDK publisher itself raises.
-                    try:
-                        self._publish_cmd(0, 0, 0, default_cmd, 0)
-                    finally:
-                        self._set_servo_velocity_owner(False)
-                        self._release_sway_chassis_label()
+                    _end_move_stream()
 
             self._move_thread = threading.Thread(target=_move_timed, daemon=True, name="bumi_move")
             self._move_thread.start()
@@ -914,10 +921,7 @@ class LocoPlugin:
                         self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
                         time.sleep(0.02)
                 finally:
-                    try:
-                        self._publish_cmd(0, 0, 0, default_cmd, 0)
-                    finally:
-                        self._set_servo_velocity_owner(False)
+                    _end_move_stream()
 
             self._move_thread = threading.Thread(target=_move_continuous, daemon=True, name="bumi_move")
             self._move_thread.start()

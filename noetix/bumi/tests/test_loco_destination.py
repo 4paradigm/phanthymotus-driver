@@ -857,6 +857,28 @@ def test_refused_move_never_marks_sway_chassis(monkeypatch):
     assert sway.calls == []                          # 未标记，无需清理
 
 
+def test_continuous_move_releases_sway_chassis_label(monkeypatch):
+    # bot review：continuous（duration=0）worker 的 finally 曾漏清 sway 标签
+    # （timed 修了、continuous 没跟上的两块漂移）。watchdog 到点与 stop_move
+    # 走同一个 finally，这里用 stop_move 快速覆盖该收尾路径。
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl()
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    sway = RecordingSway()
+    plugin.attach_sway(sway)
+    move = plugin.dispatch('move', {'_tool_name': 'loco', 'vx': 0.2, 'duration': 0})
+    assert move['state'] == 'moving'
+    assert sway.calls == [("active", "loco.move")]
+    time.sleep(0.05)                                 # 让 continuous worker 发几帧
+    plugin.dispatch('stop_move', {'_tool_name': 'loco'})
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and plugin._move_thread.is_alive():
+        time.sleep(0.01)
+    assert ("idle", "loco.move") in sway.calls       # worker finally（本 bug 修复点）
+    assert ("idle", "loco.stop_move") in sway.calls  # dispatch 路径清理
+    assert fake.cmds[-1] == (0, 0, 0)                # 退出必零速
+
+
 def test_replacement_move_keeps_sway_chassis_label(monkeypatch):
     # 换发 move：旧 worker 的 straggler finally 不得清掉新 move 的标签——
     # join 超时后新线程先接管、旧 finally 后到时，所有权判断必须拦下。
