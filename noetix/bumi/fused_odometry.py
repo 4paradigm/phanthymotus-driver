@@ -23,6 +23,7 @@ class FusedOdometryPlugin:
 
     def __init__(self, config, namespace, executor, high_ctrl):
         from rclpy.node import Node
+        from rclpy.qos import qos_profile_sensor_data
         from std_msgs.msg import String
         if high_ctrl is None:
             raise ValueError('fused odometry needs HighController')
@@ -36,7 +37,7 @@ class FusedOdometryPlugin:
         self.pub = self.node.create_publisher(String, self.topic, 10)
         self.status_pub = self.node.create_publisher(String, self.status_topic, 10)
         self.sub = self.node.create_subscription(String, self.visual_topic,
-                                                 self._on_visual, 10)
+                                                 self._on_visual, qos_profile_sensor_data)
         self.timer = self.node.create_timer(.05, self._publish)
         executor.add_node(self.node)
         self.lock = threading.RLock()
