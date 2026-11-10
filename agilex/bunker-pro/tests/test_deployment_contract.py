@@ -44,7 +44,10 @@ def test_runtime_image_has_deployment_fragment_and_plain_ros_logs():
 
 def test_host_sys_mount_is_read_only_and_required_persistent_paths_are_explicit():
     service = (DRIVER_DIR / "deploy" / "service.yml").read_text()
+    metadata = yaml.safe_load(service)["agilex-bunker-pro"]
     assert "/sys:/sys:ro" in service
     assert "/lib/modules:/lib/modules:rw" in service
     assert "/etc/systemd/system:/etc/systemd/system:rw" in service
     assert "privileged:" not in service
+    assert set(metadata["cap_add"]) == {
+        "SYS_MODULE", "NET_ADMIN", "NET_RAW", "SETUID", "SETGID", "SETPCAP"}

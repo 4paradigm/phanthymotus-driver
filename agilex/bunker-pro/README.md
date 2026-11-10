@@ -18,7 +18,10 @@ not try to run `systemctl` against the container's non-systemd PID 1.
 
 The host access is limited to the bootstrap lifecycle: `SYS_MODULE` loads the
 matching `gs_usb` kernel module; `NET_ADMIN` configures the CAN link; `NET_RAW`
-opens SocketCAN raw sockets. `/lib/modules` is writable for the module and
+opens SocketCAN raw sockets. `SETUID` and `SETGID` let the entrypoint switch to
+the unprivileged runtime account, and `SETPCAP` lets `setpriv` remove the
+bootstrap capabilities. They are discarded before the driver starts.
+`/lib/modules` is writable for the module and
 `depmod` index, `/etc/modules-load.d` and `/etc/systemd/system` persist reboot
 configuration, and `/usr/local/sbin` stores the helper called by the host unit.
 `/usr/src` and `/sys` are read-only inputs (kernel headers and USB/interface

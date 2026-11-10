@@ -9,6 +9,9 @@ agilex-bunker-pro:
     - SYS_MODULE
     - NET_ADMIN
     - NET_RAW
+    - SETUID
+    - SETGID
+    - SETPCAP
   security_opt:
     - no-new-privileges:true
   volumes:
