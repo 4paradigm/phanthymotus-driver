@@ -241,14 +241,39 @@ class FusedOdometryPlugin:
 
     def info(self):
         with self.lock:
+            sample = self._build()
+            pose = sample.get('pose') or {}
             return dict(state='running' if self.active else 'idle',
+                        topic_out=self.get_tools()[0]['topic_out'],
                         status_topic=self.status_topic, odom_topic=self.topic,
                         odom_interface={
                             'schema': 'motus.odom/1', 'frame': 'body',
                             'provides': ['vx', 'vy', 'wz'], 'rate_hz': 20,
                             'pose_drift': 'unbounded',
-                            'units': {'linear': 'm/s', 'angular': 'rad/s', 'length': 'm'}},
-                        estimate=self._build(),
+                            'units': {'linear': 'm/s', 'angular': 'rad/s', 'length': 'm'},
+                            # Planar EKF cannot truthfully enable 6-DoF SLAM.
+                            'slam_pose': {
+                                'available': False, 'profile': 'motus_slam/1',
+                                'missing_facts': ['full_6dof_pose',
+                                                  'measurement_timestamp',
+                                                  'verified_clock_relation']}},
+                        input_metadata=[{
+                            'schema': 'motus.slam_input/1', 'topic': self.topic,
+                            'format': 'state/odom', 'kind': 'pose',
+                            'source_id': 'noetix/bumi/planar_fusion',
+                            'reference_point': 'robot_body',
+                            'frame_id': pose.get('frame_id'),
+                            'child_frame_id': pose.get('child_frame_id') or 'base_link',
+                            'clock_id': 'unknown',
+                            'stamp_source': 'receive',
+                            'length_unit': 'm',
+                            'clock': {'mapping': 'sdk_read_completion',
+                                      'verified': False, 'uncertainty_ns': None},
+                            'planar_only': True,
+                            'unfused_axes': ['z', 'roll', 'pitch'],
+                            'accuracy_validated': False,
+                        }],
+                        estimate=sample,
                         description=('Experimental read-only 2-D leg/IMU/visual EKF. '
                                      'Covariance grows without visual correction; '
                                      'not calibrated for full 6-DoF SLAM.'))
