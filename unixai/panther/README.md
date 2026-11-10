@@ -70,11 +70,21 @@ What `stop` does, honestly:
   controller owns the motion, and this driver has no halt to call (the vendor's halt/disable
   services are deliberately not used). `stop` there promises only that **nothing more is sent**.
 
-`arm_control` switches controllers: it activates both `*_arm_joint_trajectory_position_controller`
-and, only if `dual_arm_forward_position_controller` was active, deactivates it, then puts back
-exactly what was active before. If putting it back fails, the completion status is `error`, it says
-`controllers_restored: false`, and the log says to check `ros2 control list_controllers`. A
-SIGTERM mid-move cancels and restores first (`stop_grace_period: 30s`).
+`arm_control` switches controllers, and only as far as the move needs: it takes a snapshot of what
+is active, activates the trajectory controller of **each arm being moved** (and only if it is not
+already active), and releases `dual_arm_forward_position_controller` if it was active (it owns the
+joints of both arms, so it has to give way; the other arm's forward control pauses for the
+duration). Afterwards it applies the exact inverse, so every controller ends as it began: a
+trajectory controller someone else already had active stays active, and the other arm's trajectory
+controller is never touched. If nothing needs changing no switch request is sent. If putting it
+back fails, the completion status is `error`, it says `controllers_restored: false`, and the log
+says to check `ros2 control list_controllers`. A SIGTERM mid-move cancels and restores first
+(`stop_grace_period: 30s`).
+
+`start` on a motion card always answers `state: "ready"` (the card is up), whatever the
+commissioning switch or the robot's readiness; those are reported next to it as
+`commissioning_motion_enabled`, `ready_for_motion`, `not_ready_reasons` and `accepts_motion`.
+`stop` makes the card `idle` until the next `start` or command.
 
 ### Things a user of these cards needs to know
 
