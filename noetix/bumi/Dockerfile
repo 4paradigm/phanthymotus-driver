@@ -98,8 +98,14 @@ RUN apt-get update && \
         librealsense2-utils || true && \
     rm -rf /var/lib/apt/lists/*
 
+# OpenCV 5 wheels can ship without HOGDescriptor; the person-detection card
+# needs the 4.x default HOG people detector. Remove any copy carried by the
+# base image first so a stale 5.x cannot shadow the pinned 4.x, then install
+# the version required by requirements.txt.
+RUN pip3 uninstall -y opencv-python opencv-contrib-python \
+        opencv-python-headless opencv-contrib-python-headless || true
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11
+    pyyaml netifaces numpy "opencv-python-headless<5" pyrealsense2 pybind11
 
 # The bundle image must be able to start the estimator child and this card's
 # Python imports; fail the build here rather than on a robot. Docker's default
