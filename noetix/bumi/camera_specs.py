@@ -288,7 +288,7 @@ def depth_slam_source_declaration(topic: str, namespace: str) -> dict:
         'reference_point': 'rgb_optical_origin',
         'frame_id': f'{namespace}_rgb_optical',
         'clock_id': 'ros', 'stamp_source': 'measurement',
-        'length_unit': 'm',
+        'length_unit': 'mm',
         'cloud_semantics': 'depth_frame', 'observation_model': 'pinhole',
         'timing_model': 'instantaneous',
         'frame_metadata_topic': topic + '/metadata',
