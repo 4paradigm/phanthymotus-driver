@@ -1,4 +1,4 @@
-"""TRON2 stream-shaped dual-arm and head control; R1 loco_servo's contract, TRON2 ServoJ.
+"""TRON2 stream-shaped dual-arm, head and paired-gripper control; R1 loco_servo's contract, TRON2 ServoJ.
 
 One input wire, ControlSink, lifecycle/pause hooks, explicit owner handover.
 ROS callbacks only overwrite a bounded mailbox; all state and motor output run
@@ -30,18 +30,27 @@ MAX_OUTPUT_GAP = .05
 MAX_VELOCITY = .5  # rad/s, initial application envelope, not motor maximum
 MAX_ACCELERATION = 1.5  # rad/s²
 TRACKING_LIMIT = math.radians(8)
+# Official tron2_env DEFAULT_LAYOUT_WITH_HEAD, not native ServoJ order.
+CONTROL_JOINT_NAMES = tuple(JOINT_NAMES[:7]) + ("left_gripper",) + tuple(JOINT_NAMES[7:14]) + ("right_gripper",) + tuple(JOINT_NAMES[14:])
+ARM_INDICES = tuple(range(7)) + tuple(range(8, 15)) + (16, 17)
+GRIPPER_INDICES = (7, 15)
+GRIPPER_MAX_VELOCITY = 2.0  # normalized opening/s, application envelope
 
 
 def build_descriptor(expected_hz=DEFAULT_EXPECTED_HZ):
+    lower = list(SERVO_LOWER[:7]) + [0.] + list(SERVO_LOWER[7:14]) + [0.] + list(SERVO_LOWER[14:])
+    upper = list(SERVO_UPPER[:7]) + [1.] + list(SERVO_UPPER[7:14]) + [1.] + list(SERVO_UPPER[14:])
+    velocity = [MAX_VELOCITY] * 7 + [GRIPPER_MAX_VELOCITY] + [MAX_VELOCITY] * 7 + [GRIPPER_MAX_VELOCITY] + [MAX_VELOCITY] * 2
     return {'control_interface': 'motus.control/1', 'mode': 'joint_position',
-        'dof': 16, 'joint_names': list(JOINT_NAMES),
-        'units': {'angle': 'rad', 'time': 's'}, 'frame': 'base_Link',
+        'dof': 18, 'joint_names': list(CONTROL_JOINT_NAMES),
+        'units': {'angle': 'rad', 'gripper': 'normalized', 'time': 's'}, 'frame': 'base_Link',
         'groups': [{'name': 'arm_l', 'offset': 0, 'count': 7, 'unit': 'rad', 'resource': 'arm_l'},
-                   {'name': 'arm_r', 'offset': 7, 'count': 7, 'unit': 'rad', 'resource': 'arm_r'},
-                   {'name': 'head', 'offset': 14, 'count': 2, 'unit': 'rad', 'resource': 'head'}],
-        'limits': {'lower': list(SERVO_LOWER), 'upper': list(SERVO_UPPER),
-            'max_velocity': [MAX_VELOCITY] * 16,
-            'max_delta_per_step': [MAX_VELOCITY / expected_hz] * 16},
+                   {'name': 'gripper_l', 'offset': 7, 'count': 1, 'unit': 'normalized', 'resource': 'gripper_l'},
+                   {'name': 'arm_r', 'offset': 8, 'count': 7, 'unit': 'rad', 'resource': 'arm_r'},
+                   {'name': 'gripper_r', 'offset': 15, 'count': 1, 'unit': 'normalized', 'resource': 'gripper_r'},
+                   {'name': 'head', 'offset': 16, 'count': 2, 'unit': 'rad', 'resource': 'head'}],
+        'limits': {'lower': lower, 'upper': upper, 'max_velocity': velocity,
+            'max_delta_per_step': [v / expected_hz for v in velocity]},
         'rate': {'expected_hz': expected_hz, 'max_hz': MAX_HZ,
             'watchdog_ms': WATCHDOG_MS, 'max_obs_age_ms': MAX_OBS_AGE_MS},
         'force_torque': None, 'urdf_ref': 'model'}
@@ -93,6 +102,9 @@ class ArmServoPlugin:
         self.sink = None
         self.input_topic = None
         self.target = None
+        self.gripper_target = None
+        self.gripper_task = None
+        self.gripper_commands = 0
         self.deadline = 0.
         self.output_task = self.watchdog_task = None
         self.commands = self.applied = self.overwritten = 0
@@ -107,17 +119,17 @@ class ArmServoPlugin:
 
     def get_tool(self):
         return {'name': self.PREFIX, 'type': 'actuator', 'multiInstance': False,
-            'description': 'TRON2上肢双臂连续伺服：接收一路motus.control/1关节目标流，左臂7维+右臂7维+头部俯仰/偏航2维，单位rad；建议30Hz、最多50Hz。Driver限速插值并以目标300Hz发送ServoJ；双臂与头部同步控制，头部使用厂家原始方向，夹爪单独控制。普通动作使用arm_control/pose；本卡片供遥操作或执行模型接线使用。断流200ms或指令过期停止后续目标输出，不自动回零；不是硬件急停。',
+            'description': 'TRON2上肢双臂连续伺服：接收一路motus.control/1关节目标流，官方18维顺序：左臂7维、左夹爪1维、右臂7维、右夹爪1维、头部俯仰/偏航2维；关节单位rad，夹爪0～1（0闭合、1全开）；建议30Hz、最多50Hz。Driver限速插值并以目标300Hz发送ServoJ；头部使用厂家原始方向；夹爪独立发送SDK开合协议，默认速度100、力50，0～1线性转为0～100开口度。普通动作使用arm_control/pose；本卡片供遥操作或执行模型接线使用。断流200ms或指令过期停止后续目标输出，不自动回零；不是硬件急停。',
             'inputSchema': {'type': 'object', 'properties': {
                 'action': {'type': 'string', 'enum': ['start', 'stop', 'pause', 'resume', 'info']},
                 'input_topic': {'type': 'string', 'description': 'control/joint指令流话题'}},
                 'required': ['action'],
                 'x-action-params': {
-                    'pause': {'params': [], 'description': '暂停关节输出并清空旧目标，保留订阅'},
+                    'pause': {'params': [], 'description': '暂停关节和夹爪输出并清空旧目标，保留订阅'},
                     'resume': {'params': [], 'description': '恢复接收新目标，从实测关节角平滑接管'}},
                 'x-hooks': {'on_interrupt_motion': {'action': 'pause'}, 'on_interrupt_all': {'action': 'pause'}},
-                'x-is-dangerous': True, 'x-resource': ['arm_l', 'arm_r', 'head']},
-            'topic_in': [{'format': 'control/joint', 'desc': 'motus.control/1 joint_position，16维rad，左臂、右臂、头部pitch/yaw'}],
+                'x-is-dangerous': True, 'x-resource': ['arm_l', 'arm_r', 'head', 'gripper_l', 'gripper_r']},
+            'topic_in': [{'format': 'control/joint', 'desc': 'motus.control/1 joint_position，18维：左臂7(rad)、左夹爪1(0～1)、右臂7(rad)、右夹爪1(0～1)、头部pitch/yaw(rad)'}],
             'configSchema': {'type': 'object', 'properties': {
                 'dry_run': {'type': 'boolean', 'default': False, 'description': '空跑：接收并检查目标，不发送电机指令；切换后暂停，需resume继续'}}}}
 
@@ -125,7 +137,7 @@ class ArmServoPlugin:
         return {'state': 'idle' if not self.running else 'paused' if self.paused else 'running',
             'input': self.input_topic, 'dry_run': self.dry_run,
             'control_interface': self.descriptor_raw, 'output_target_hz': OUTPUT_HZ,
-            'commands_submitted': self.commands, 'targets_applied': self.applied,
+            'commands_submitted': self.commands, 'gripper_commands_acknowledged': self.gripper_commands, 'targets_applied': self.applied,
             'mailbox_overwritten': self.overwritten, 'last_outcome': self.last_outcome,
             'error': self.error, 'max_output_gap_seconds': self.max_output_gap,
             'counters': dict(self.sink.counters) if self.sink else {},
@@ -133,13 +145,16 @@ class ArmServoPlugin:
             'vendor_acknowledged': False, 'arrival_verified': False,
             'physical_stop_verified': False, 'motion_sent': False}
 
-    def _conflict(self):
+    def _conflict(self, token=None):
+        for owner in getattr(self.adapter, 'grippers', {}).values():
+            if owner.active or owner.recovering or owner.pose_step or owner.waiting:
+                raise ValueError('夹爪动作正在占用控制权')
         if self.adapter.motion.active or self.adapter.head.active:
             raise ValueError('双臂或头部动作正在占用控制权')
         follow = self.adapter.follow_runtime
         if follow is not None and follow.info().get('state') not in ('idle', 'paused', 'stopped', 'settled'):
             raise ValueError('请先暂停人物头部跟随')
-        if self.reader.move_pending or self.reader.head_pending or self.reader._pose_servo is not None:
+        if self.reader.move_pending or self.reader.head_pending or (self.reader._pose_servo is not None and self.reader._pose_servo is not token):
             raise ValueError('厂家运动通道正在占用')
 
     def _feedback(self):
@@ -164,12 +179,14 @@ class ArmServoPlugin:
 
     def _clear(self):
         self.target = None
+        self.gripper_target = None
         self.deadline = 0.
 
     def _apply(self, values, gripper):
         if gripper is not None:
-            raise ValueError('本卡片不控制夹爪，请使用独立夹爪卡片')
-        self.target = list(values)
+            raise ValueError('夹爪须填写18维values的索引7和15，不接受单独gripper字段')
+        self.target = [values[i] for i in ARM_INDICES]
+        self.gripper_target = tuple(values[i] for i in GRIPPER_INDICES)
         self.deadline = self._pending_deadline
         self.applied += 1
         if self.output_task is None or self.output_task.done():
@@ -209,7 +226,13 @@ class ArmServoPlugin:
             if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in (stamp, ttl)):
                 raise ValueError('stamp_ms/ttl_ms必须为有限数值')
             if message.get('gripper') is not None:
-                raise ValueError('本卡片不接收gripper字段')
+                raise ValueError('双夹爪须放在18维values的索引7和15，不接受单独gripper字段')
+            values = message.get('values')
+            if isinstance(values, list) and len(values) == 18:
+                for i in GRIPPER_INDICES:
+                    v = values[i]
+                    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 1:
+                        raise ValueError('夹爪目标必须为0～1归一化开口度')
             self._pending_deadline = time.monotonic() + max(0., (stamp + ttl - now) / 1000)
             outcome = self.sink.submit(message)
             self.last_outcome = {'verdict': outcome.verdict.value, 'reason': outcome.reason}
@@ -226,6 +249,7 @@ class ArmServoPlugin:
             changed_at = last
             # Use the reader's existing exclusive writer and faster feedback lease.
             with self.reader.pose_feedback(), self.reader.pose_servo({'motion_tool': self.PREFIX}) as token:
+                self.gripper_task = asyncio.create_task(self._gripper_output(token))
                 while self.running and not self.paused and self.target is not None:
                     now = time.monotonic()
                     if now >= self.deadline:
@@ -258,6 +282,31 @@ class ArmServoPlugin:
             self.paused = True
             self._clear()
         finally:
+            self._clear()
+            if self.gripper_task is not None:
+                self.gripper_task.cancel()
+                await asyncio.gather(self.gripper_task, return_exceptions=True)
+                self.gripper_task = None
+
+    async def _gripper_output(self, token):
+        """Paired latest-target commands; ACK waiting never blocks 300 Hz ServoJ."""
+        previous = None
+        try:
+            while self.running and not self.paused and self.target is not None:
+                if time.monotonic() >= self.deadline:
+                    return
+                target = self.gripper_target
+                if target is not None and target != previous:
+                    self._conflict(token)
+                    self._feedback()
+                    if not self.dry_run:
+                        await self.reader.send_arm_grippers(target, token)
+                        self.gripper_commands += 1
+                    previous = target
+                await asyncio.sleep(1 / self.descriptor.expected_hz)
+        except Exception as exc:
+            self.error = '夹爪控制失败: ' + str(exc)
+            self.paused = True
             self._clear()
 
     async def _watchdog(self):

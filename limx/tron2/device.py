@@ -58,6 +58,9 @@ class Adapter:
             raise ValueError('Unknown TRON2 card in configuration')
         if 'head_visual_follow' in self.enabled and (not {'camera','move_head'} <= set(self.enabled) or not {'joint_state','joints'} & set(self.enabled)):
             raise ValueError('头部跟随需要joint_state、camera和move_head')
+        self._lower_stopping = False
+        self._lower_closed = False
+        self._lower_stop_task = None
         self.follow_runtime = None
         self.reader = reader or RobotReader(settings)
         self.stand = Stand(self.reader, self._report_lower_completion)
@@ -275,7 +278,7 @@ class Adapter:
             action=args.get('action','info')
             if action=='stand_down':action='sit_down'  # Legacy saved canvas alias only.
             if action in ('info','start','stop'):
-                result=self.walk.stop() if action=='stop' else self.walk.info()
+                result=self.walk.info()
                 return {**result,'state':'ready' if action=='start' else 'idle' if action=='stop' else result['state'],'motion_sent':False}
             if action not in ('stand_up','sit_down','move','stop_move'):raise ValueError('Unsupported locomotion action')
             if action=='move':
@@ -429,12 +432,56 @@ class Adapter:
                 self.publish(SENSOR_TOPICS[name], data)
             await asyncio.sleep(self.settings['poll_interval_seconds'])
 
+    async def _finish_lower_tasks(self):
+        owners = (self.stand, self.sit_down, self.walk)
+        active = [o for o in owners if o.task is not None and not o.task.done()]
+        for owner in active:
+            if owner is not self.walk:
+                owner._transition_stop_requested = True
+        self.walk.stop()
+        tasks = [o.task for o in active]
+        for task in tasks:
+            task.cancel()
+        try:
+            if tasks:
+                # Let Walk send its bounded zero-velocity cleanup before joining.
+                _, pending = await asyncio.wait(tasks, timeout=6)
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            for owner in active:
+                if owner.state not in ('completed', 'stopped', 'unconfirmed'):
+                    owner.pending = None
+                    owner.state = 'unconfirmed'
+                    owner.result = {'error': 'Lifecycle stop', 'motion_sent': getattr(owner, 'motion_sent', False),
+                                    'physical_stop_verified': False}
+            return {'state': 'idle', 'physical_stop_verified': False,
+                    'motion_sent': any(bool((o.result or {}).get('zero_velocity_sent')) for o in active),
+                    'owners': {name: owner.state for name, owner in
+                               zip(('stand', 'sit_down', 'walk'), owners)},
+                    'message': 'Driver任务已结束；厂家已接收的动作不可撤销，物理姿态未确认'}
+        finally:
+            if not self._lower_closed:
+                self._lower_stopping = False
+
+    async def close_lower(self, shutting_down=False):
+        self._lower_closed = self._lower_closed or shutting_down
+        self._lower_stopping = True
+        if self._lower_stop_task is None or self._lower_stop_task.done():
+            self._lower_stop_task = asyncio.create_task(self._finish_lower_tasks())
+        return await asyncio.shield(self._lower_stop_task)
+
     async def execute_tool(self, name, args, *, follow_guard=None):
         if name == 'model' and self.reader.configuration.get('state') == 'pending':
             deadline = time.monotonic() + self.settings['response_timeout_seconds']
             while self.skeleton_configuration().get('state') == 'pending' and time.monotonic() < deadline:
                 await asyncio.sleep(.05)
         data = self.call(name, args)
+        if name == 'loco_leg':
+            if args.get('action') == 'stop':
+                return await self.close_lower()
+            if self._lower_stopping and args.get('action') != 'info':
+                raise ValueError('下肢任务正在停止，暂不接受新动作')
         if name == 'loco_servo_arm' and name in self.enabled:
             return await self.arm_servo.call(args)
         # Explicit commands outrank the stream. Await its in-flight send and
@@ -443,6 +490,7 @@ class Adapter:
                 name == 'pose' and data.get('status') == 'validated' or
                 name == 'arm_control' and data.get('action') in ('move', 'reset') or
                 name == 'move_head' and data.get('action') == 'move' or
+                (name == 'gripper' or name in GRIPPER_SIDES) and data.get('action') in ('open', 'close', 'recover') or
                 name == 'head_visual_follow' and (args.get('action', 'follow') == 'follow' or
                     args.get('action') == 'not_follow' and args.get('non_follow_action') == 'reset')):
             await self.arm_servo.preempt()

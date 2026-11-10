@@ -145,6 +145,7 @@ async def run():
                 for task in done:
                     task.result()
             finally:
+                await adapter.close_lower(shutting_down=True)
                 await adapter.arm_servo.close()
                 if adapter.follow_runtime is not None:
                     await adapter.follow_runtime.close()
@@ -160,6 +161,7 @@ async def run():
         if adapter is not None and adapter.follow_runtime is not None:
             await adapter.follow_runtime.close()
         if adapter is not None:
+            await adapter.close_lower(shutting_down=True)
             await adapter.arm_servo.close()
         if runner:
             await runner.cleanup()

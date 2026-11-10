@@ -498,7 +498,7 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
     def test_readiness_sensor_sampling_has_no_undefined_discovery_dependency(self):
         import check
         with patch.object(check,'rpc',return_value={'content':[{'text':json.dumps({'sample':{'available':True}})}]}) as rpc:
-            self.assertEqual(check.read_samples(),{'joint_state':{'available':True}})
+            self.assertEqual(check.read_samples(),{'joints':{'available':True}})
         self.assertEqual(rpc.call_args.args[1]['arguments']['action'],'info')
 
     async def test_frozen_vendor_timestamp_cannot_complete_sequence(self):

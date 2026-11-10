@@ -7,7 +7,7 @@
 | `joints` | sensor | 按ACCID选择DACH上肢16轴、WF轮足或SF足式10轴；独立model提供URDF | `/limx_tron2/state/joints`（sensor/skeleton） |
 | `battery` | sensor | 1Hz发布soc、current、cycle；无效值为null | `/limx_tron2/state/battery`（data/json） |
 | `loco_leg` | actuator | stand_up、sit_down、move、stop_move；轮足速度与时间控制 | 无 |
-| `loco_servo_arm` | actuator | 双臂14轴与头部2轴连续伺服；单位rad | 输入control/joint |
+| `loco_servo_arm` | actuator | 双臂14轴、双夹爪2维与头部2轴；关节rad、夹爪0～1 | 输入control/joint |
 | `pose` | actuator | salute/wave/welcome预设轨迹；挥手含右夹爪一次开合；整套ACP完成 | 无；详情显示共享双臂任务 |
 | `gripper` | actuator | 选择左/右夹爪并设置目标开口，0mm闭合 | 无；详情显示所选侧反馈 |
 | `camera` | sensor | 按需读取头部RGB，原始JPEG限10fps发布，不录像 | `/limx_tron2/camera`（image/jpeg） |
@@ -87,7 +87,7 @@ VOP发布时间、可选处理耗时、本地接收时间只用于新鲜度/重�
 
 主对话已完成组件296项离线回归，另有真实本地MCP/ACP HTTP端到端场景覆盖连线跟随、连续目标、暂停和复位。
 这些都是模拟机器人数据的离线验证；没有发送实机运动，不能替代现场平滑性、连线和模式操作验收。
-配置仍需启用 `joint_state`、`camera`、`move_head`、`head_visual_follow`。
+人物跟随需启用 `joints`（或兼容的 `joint_state`）、`camera`、`move_head`、`head_visual_follow`。
 
 构建仅在原 TRON2 镜像中复制五个 head_follow Python 模块及导入检查，不增加模型、apt/pip依赖或其它容器。
 运行离线回归：`python3 -m unittest discover -s tests -v`。
@@ -104,7 +104,7 @@ VOP发布时间、可选处理耗时、本地接收时间只用于新鲜度/重�
 - 厂家关节时间戳的时钟及单位尚未验证，因此 `robot_timestamp` 仅作为原始值保留，`measurement_time_verified` 为 `false`。接收年龄不能证明测量数据的真实年龄。
 - 默认超过5秒没有对应数据则`available: false`、`sample_status: stale`、缓存`data: null`。骨架发布空joints与不可用状态。断连时立即清空。
 
-关节传感器start/stop兼容单实例生命周期，不启动/停止机器人，也不停止后台采样。info读取缓存，不额外请求机器人。camera的start/stop实际开启/释放只读视频连接。公开四张sensor、arm_control/pose/move_head/gripper/head_visual_follow五张actuator及model resource；不提供独立robot_status/reset_pose卡片或助手卡片。
+关节传感器start/stop兼容单实例生命周期，不启动/停止机器人，也不停止后台采样。info读取缓存，不额外请求机器人。camera的start/stop实际开启/释放只读视频连接。公开传感器及 arm_control/pose/move_head/gripper/head_visual_follow/loco_leg/loco_servo_arm 动作卡片和 model resource；不提供独立robot_status/reset_pose卡片或助手卡片。
 
 兼容Agent Core自动注入的instance_id和_trace_id：最长128字符、无控制字符，不参与机器人请求或回显。关节传感器通过内部info查看当前原始缓存。
 
@@ -155,7 +155,7 @@ sudo docker exec embodied-limx-tron2 python3 /work/check.py
 
 脚本等待就绪，检查Core注册、joint_state骨架sensor、可选camera/arm_control及model类型、骨架格式和URDF名称，验证生命周期及关节接收时间更新。它不调用move/reset，也不验证真实运动。
 
-升级后刷新Motus，移除画布上的旧robot_status、reset_pose、joint_angles、battery_state实例，重新添加joint_state以更新缓存的渲染格式。相机、骨架与运动卡片按需添加；视觉跟随卡片单独放置，只需camera与VOP连线；model由骨架组件自动读取，不需要手动执行或连接。开启后从监控查看joint_state的厂家双臂/头部骨架。监控和查看数据流均加载同一model资源；升级后应重新加载组件以更新缓存。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
+升级后刷新Motus，移除画布上的旧robot_status、reset_pose、joint_angles、battery_state实例，重新添加joints以更新缓存的渲染格式。相机、骨架与运动卡片按需添加；视觉跟随卡片单独放置，只需camera与VOP连线；model由骨架组件自动读取，不需要手动执行或连接。开启后从监控查看joints的当前构型骨架。监控和查看数据流均加载同一model资源；升级后应重新加载组件以更新缓存。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
 
 `GET http://127.0.0.1:15791/health` 返回卡片状态：启用关节时，机器人连接且这些已启用传感器全部有最近接收数据为HTTP 200。可选camera的idle/断流不会阻塞它们或机械臂任务。只启用相机时，所有已启用相机都有最近成功发布的JPEG才就绪，否则为503。配置必须启用至少一张传感器，禁止仅开启arm_control却将空样本集合当成就绪。`registered_mcp_id` 单独表明 Core 注册是否完成；机器人可读与 Core 已注册是两项独立条件。
 
@@ -245,8 +245,8 @@ sudo docker exec embodied-limx-tron2 /bin/bash -c 'source /opt/ros/humble/setup.
 启动后按实际notify_robot_info.accid识别DACH/WF/SF；未知构型不根据关节数量猜测。DACH、WF有现场观察，SF只有文档与模型测试。默认卡片为battery、joints、loco_leg、loco_servo_arm及已有上肢卡片。旧画布中的leg_loco/arm_servo需重新添加为loco_leg/loco_servo_arm。
 
 - loco_leg：stand_up先进入STAND准备，再进入WALK平衡；sit_down先发零速度后请求折叠。完成依据发送后收到的厂家status。move参数vx为m/s、[-3,3]（正前负后），vyaw为deg/s、约±85.943669（正左负右），duration为0停止或0.1～60秒，默认2秒。无横移，结束另发约1秒零速度。start/stop是生命周期，不自动起立/坐下；需要停车用stop_move。不宣称精确距离、转角或物理停稳。
-- loco_servo_arm：将标准control/joint流接到输入口，motus.control/1、joint_position、16维绝对rad目标，顺序为左臂7轴、右臂7轴、头部pitch/yaw。消息包含seq、stamp_ms、obs_stamp_ms、ttl_ms、source、priority、mode、dof、values。时间戳为Unix毫秒。建议30Hz，最大50Hz；Driver从实测姿态插值，目标300Hz发送官方ServoJ。应用速度上限0.5rad/s、加速度1.5rad/s²，不是电机额定极限或硬实时保证。夹爪独立控制。
-- 伺服start仅订阅；pause清空目标并暂停，resume接受新目标，stop释放订阅。dry_run=true只校验、不发电机指令；切换空跑设置后需resume。200ms断流、目标过期停止后续输出。ServoJ无成功ACK，提交数不表示到位。双臂/头部显式动作优先并暂停流，不自动回零。没有增加确认弹窗或持久保护文件。
+- loco_servo_arm：将标准control/joint流接到输入口，motus.control/1、joint_position、18维目标，采用官方tron2_env启用头部的DEFAULT_LAYOUT_WITH_HEAD：索引0～6左臂(rad)、7左夹爪(0～1)、8～14右臂(rad)、15右夹爪(0～1)、16头部pitch(rad)、17头部yaw(rad)。消息包含seq、stamp_ms、obs_stamp_ms、ttl_ms、source、priority、mode、dof、values。时间戳为Unix毫秒。建议30Hz，最大50Hz；Driver从实测姿态插值，目标300Hz发送官方ServoJ。应用速度上限0.5rad/s、加速度1.5rad/s²，不是电机额定极限或硬实时保证。夹爪0表示闭合、1表示全开，按官方实现乘100并取整，独立发送request_set_limx_2fclaw_cmd（双侧速度100、夹持力50，无量纲）；ServoJ仍只发送16个关节角。夹爪输入应用步长与速度上限2归一化开口/秒；目标仅在变化时发送，最多跟随声明的expected_hz频率，等待ACK不阻塞关节输出；ACK不代表到位。原单侧gripper卡片的0～94开口限制保持原样，本流式接口按官方0～100协议执行。
+- 伺服start仅订阅；pause清空目标并暂停，resume接受新目标，stop释放订阅。dry_run=true只校验、不发电机指令；切换空跑设置后需resume。200ms断流、目标过期停止后续输出。ServoJ无成功ACK，提交数不表示到位。双臂/头部/夹爪显式动作优先并暂停整路流，不自动回零。没有增加确认弹窗或持久保护文件。
 
 通用下肢入口使用厂家SIT/DAMPING/STAND/WALK状态。现场固件若把已确认的折叠状态报告为UNKNOW，可通过TRON2_STARTUP_PROFILE指定本地标定文件；未配置时拒绝猜测。文件包含accid、mode、sw_version、working_mode、status、folded_statuses、stationary_dq_limit_rad_s、pose_indices、pose_ranges、name；仅用于匹配，不作为关节目标。真机序列号与观察数据不随驱动分发。
 
@@ -257,7 +257,11 @@ sudo docker exec embodied-limx-tron2 /bin/bash -c 'source /opt/ros/humble/setup.
 从仓库根目录执行（Python含aiohttp、PyYAML）：
 
 ```bash
-PYTHONPATH=.:limx/tron2:limx/tron2/tests python3 -m unittest test_native_skeleton_loco test_walk test_lower_control test_arm_servo test_servo_packet_path -v
+PYTHONPATH=.:limx/tron2:limx/tron2/tests python3 -m unittest test_battery test_joints test_loco_leg test_loco_servo_arm -v
 ```
 
 普通测试不需要机器人；DDS专用项默认跳过，仅在私有网络/IPC隔离容器中设置TRON2_TEST_PRIVATE_DDS=1、ROS_DOMAIN_ID=TRON2_CORE_DOMAIN_ID=213及独立FastDDS profile时运行。它使用真实DDS与真实ServoJ组包、模拟机器人WebSocket，不打开机器人连接。物理运动效果仍需独立验收。
+
+下肢生命周期stop会取消并等待起立、坐下和行走任务；行走沿原有路径尝试零速度收尾。停止期间拒绝新下肢动作，退出时先完成同一收尾再断连接。任务结束不等同物理停稳，已提交厂家动作无法撤销，未确认结果保留为unconfirmed，不自动重发。
+
+18维输入布局依据：[官方layout.py](https://github.com/limxdynamics/tron2_env/blob/main/src/tron2_env/layout.py)、[官方夹爪归一化适配](https://github.com/limxdynamics/tron2_env/blob/main/src/tron2_env/end_effector/gripper.py)、[官方WebSocket默认参数](https://github.com/limxdynamics/tron2_env/blob/main/src/tron2_env/transport/websocket.py)。本卡片声明的gripper_l/gripper_r分组与其他Motus混合关节卡片一致。旧16维上游须更新dof、values与布局，不能简单在尾部追加夹爪值；不猜测18维数据的排列。暂停、断流、过期或关闭会清空关节与夹爪目标并等待两个输出任务退出；已受理的夹爪运动不能通过停止发包撤销。

@@ -39,6 +39,7 @@ class SitDown(Stand):
             raise MoveError('当前不在准备/站立/行走或已记录折叠状态，未发送坐下',False)
         if r.move_pending or r.head_pending or r._pose_servo is not None:
             raise MoveError('其他动作占用，未发送坐下',False)
+        self._transition_stop_requested = False
         action_id=str(uuid.uuid4())
         self.state,self.result,self.stages,self.events,self.motion_sent='accepted',None,[],[],False
         self.zero_velocity_frames=0

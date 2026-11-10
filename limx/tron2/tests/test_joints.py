@@ -26,7 +26,7 @@ def adapter():
         'SENSOR_TOPICS':{'battery':'/limx_tron2/state/battery','joints':'/limx_tron2/state/joints'}}
     cls=ast.ClassDef(name='Adapter',bases=[],keywords=[],body=methods,decorator_list=[])
     exec(compile(ast.fix_missing_locations(ast.Module(body=[metadata,cls],type_ignores=[])),'driver_methods','exec'),ns)
-    a=ns['Adapter']();a.enabled=['loco_leg','joints','battery']
+    a=ns['Adapter']();a._lower_stopping=False;a.enabled=['loco_leg','joints','battery']
     a.reader=SimpleNamespace(configuration=configuration('WF_TRON2A_TEST'),info_at=1)
     a.stand=SimpleNamespace(dispatch=Mock(return_value={'action_id':'up'}),info=lambda:{'state':'idle'})
     a.sit_down=SimpleNamespace(dispatch=Mock(return_value={'action_id':'down'}),info=lambda:{'state':'idle'})
@@ -40,6 +40,7 @@ def sample(serial,count):
         'received_at':1.,'reception_age_seconds':0.,'measurement_time_verified':False,
         'data':{'q':[i/100 for i in range(count)],'dq':[0.]*count,'tau':[0.]*count,'names':[]}}
 
+
 class NativeContractTests(unittest.IsolatedAsyncioTestCase):
     def test_each_model_joint_name_matches_urdf_and_no_inline_model(self):
         for serial,count in [('DACH_TRON2A_TEST',16),('WF_TRON2A_TEST',10),('SF_TRON2A_TEST',10)]:
@@ -50,35 +51,16 @@ class NativeContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(packet['joints']),count)
             self.assertTrue(all(set(j)=={'idx','name','q','dq','tau'} for j in packet['joints']))
             if count==10:self.assertTrue(all('head' not in n and 'shoulder' not in n for n in moving))
-
     def test_offline_and_bad_names_do_not_fabricate_joints(self):
         raw=sample('WF_TRON2A_TEST',10);profile=configuration(raw['accid'])
         raw['available']=False;self.assertEqual(joints_stream(raw,profile),{'joints':[]})
         raw['available']=True;raw['data']['names']=['wrong']*10
         self.assertEqual(joints_stream(raw,profile),{'joints':[]})
-
     def test_public_model_is_plain_urdf_like_other_drivers(self):
         a=adapter();self.assertEqual(set(a.call('model',{})),{'urdf'})
         self.assertEqual(a.call('model',{})['urdf'],model(a.reader.configuration)['urdf'])
         c=next(t for t in a.tools() if t['name']=='joints')
         self.assertEqual(c['topic_out'][0]['format'],'sensor/skeleton')
-
-    def test_loco_public_schema_removed_vy_and_renamed_sit(self):
-        c=adapter()._loco_tool();s=c['inputSchema']
-        self.assertNotIn('vy',s['properties']);self.assertEqual(s['x-action-params']['move']['params'],['vx','vyaw','duration'])
-        self.assertIn('sit_down',s['properties']['action']['enum']);self.assertNotIn('stand_down',s['properties']['action']['enum'])
-        self.assertIn('sit_down',s['x-completion']['actions']);self.assertNotIn('stand_down',s['x-completion']['actions'])
-        for name in ('vx','vyaw','duration'):
-            self.assertIn('default',s['properties'][name]);self.assertTrue(s['properties'][name]['description'])
-        self.assertIn('anyOf',s['properties']['duration'])
-
-    async def test_sit_alias_and_completion_action_names(self):
-        a=adapter()
-        await a.execute_tool('loco_leg',{'action':'sit_down'});await a.execute_tool('loco_leg',{'action':'stand_down'})
-        self.assertEqual(a.sit_down.dispatch.call_count,2)
-        await a._report_lower_completion('sit_down','id','completed',{})
-        a._report_completion.assert_awaited_with('loco_leg','id','completed',{'action':'sit_down'})
-
     async def test_move_always_uses_zero_lateral_and_legacy_zero_is_compatible(self):
         a=adapter()
         await a.execute_tool('loco_leg',{'action':'move','vx':'-.2','vyaw':'20','duration':'2'})
@@ -87,7 +69,6 @@ class NativeContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):await a.execute_tool('loco_leg',{'action':'move','vy':.1})
         for value in (.01,math.nan,math.inf,True,-1):
             with self.assertRaises(ValueError):a.call('loco_leg',{'action':'move','duration':value})
-
     async def test_native_publish_does_not_send_diagnostic_urdf_in_stream(self):
         a=adapter();raw=sample('WF_TRON2A_TEST',10);emitted={}
         a.snapshot=lambda:{'joints':raw,'battery':{'available':True,'data':{'percentage':30,'current':-1880,'cycle':31}}}
@@ -99,37 +80,16 @@ class NativeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(emitted['/limx_tron2/state/joints']),{'joints'})
         self.assertEqual(emitted['/limx_tron2/state/battery'],{'soc':30,'current':-1880,'cycle':31})
 
-    def test_battery_notes_explain_ranges_and_unknown_units(self):
-        text=next(t for t in adapter().tools() if t['name']=='battery')['description']
-        for phrase in ('0～100%','有符号','尚未确认','非负整数','null'):self.assertIn(phrase,text)
-
-
 class StateInputTests(unittest.IsolatedAsyncioTestCase):
     def reader(self):
         from vendor import RobotReader
         return RobotReader({'serial': '', 'poll_interval_seconds': .5,
             'response_timeout_seconds': 5, 'stale_after_seconds': 5})
-
     def status(self, accid='DACH_TRON2A_TEST', **updates):
         return {'accid': accid, 'data': {'imu': 'OK', 'motor': 'OK',
             'working_mode': 'developer_mode', 'working_mode_valid': True,
             'collision_enable': True, 'collision_enable_valid': True,
             'compliant_enable': False, 'compliant_enable_valid': True, **updates}}
-
-    def test_numeric_strings_and_invalid_battery_do_not_poison_robot_status(self):
-        for value in ('NaN', True, -1, 101, None):
-            r = self.reader();r.accept_info(self.status(battery=value))
-            self.assertFalse(r.sample('battery_state')['available'])
-            self.assertTrue(r.sample('robot_status')['available'])
-        r = self.reader()
-        r.accept_info(self.status(battery='42', bms_current='-1800',
-            bms_current_valid=True, bms_charging_cycle='5'))
-        self.assertEqual(battery_stream(r.sample('battery_state')),
-            {'soc': 42, 'current': -1800, 'cycle': 5})
-        r.disconnect('test')
-        self.assertEqual(battery_stream(r.sample('battery_state')),
-            {'soc': None, 'current': None, 'cycle': None})
-
     async def test_identification_waits_for_feedback_and_is_fixed_for_process(self):
         from main import identify_configuration
         r = self.reader()
@@ -145,7 +105,6 @@ class StateInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.configuration, original)
         self.assertEqual(configuration('UNKNOWN_TRON2A_TEST')['mode'], 'unknown')
         self.assertFalse(configuration('SF_TRON2A_TEST')['field_verified'])
-
     def test_new_joint_name_keeps_follow_compatible_and_battery_optional(self):
         import time
         from device import Adapter

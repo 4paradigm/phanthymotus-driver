@@ -441,6 +441,27 @@ class RobotReader:
         except (OSError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise MoveError('ServoJ submission uncertain; no retry', None) from exc
 
+    async def send_arm_grippers(self, openings, token):
+        """Official paired normalized openings, owned by loco_servo_arm.
+
+        ServoJ remains 16D. Match tron2_env's opening*100, speed=100,
+        force=50 defaults; the legacy single-side card retains its own limits.
+        """
+        if token is not self._pose_servo or token.get('error'):
+            raise MoveError('Gripper stream owner changed', False)
+        if self.configuration.get('mode') != 'upper_limb' or not self.connected or self.ws is not token['ws'] or self.serial != token['serial'] or self.ws.closed:
+            raise MoveError('Gripper stream configuration or connection changed', False)
+        if not isinstance(openings, (tuple, list)) or len(openings) != 2 or any(
+                isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 1 for v in openings):
+            raise MoveError('Paired grippers require two normalized openings in [0, 1]', False)
+        status = self.sample('robot_status')
+        if not status['available'] or not motion_readiness(status['data'])['ready'] or status['data'].get('motor') != 'OK':
+            raise MoveError('Gripper stream robot status not ready', False)
+        data = {}
+        for side, opening in zip(('left', 'right'), openings):
+            data.update({side + '_opening': int(opening * 100), side + '_speed': 100, side + '_force': 50})
+        return await self._gripper_request('request_set_limx_2fclaw_cmd', data, True)
+
     async def _gripper_request(self, title, data, motion):
         if (motion is True and title != 'request_set_limx_2fclaw_cmd') or \
                 (motion is False and (title != 'request_get_limx_2fclaw_state' or data != {})) or type(motion) is not bool:

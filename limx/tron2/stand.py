@@ -99,6 +99,8 @@ class Stand:
             self.pending['error'] = 'Connection lost; result unconfirmed; no retry'
 
     def _read_status(self):
+        if getattr(self, "_transition_stop_requested", False) and asyncio.current_task() is self.task:
+            raise MoveError("Lifecycle stop; physical result unconfirmed", self.motion_sent)
         r = self.reader
         sample = r.sample('robot_status')
         data = sample.get('data') or {}
@@ -138,6 +140,7 @@ class Stand:
             raise MoveError('当前状态未匹配起立入口: '+str(mode),False)
         if r.move_pending or r.head_pending or r._pose_servo is not None:
             raise MoveError('其他运动请求正在进行，未发送起立指令',False)
+        self._transition_stop_requested = False
         action_id = str(uuid.uuid4())
         self.state, self.result, self.stages, self.events, self.motion_sent = 'accepted',None,[],[],False
         self.task = asyncio.create_task(self._run(action_id))
