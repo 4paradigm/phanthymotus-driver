@@ -30,7 +30,7 @@ def test_runtime_image_has_deployment_fragment_and_plain_ros_logs():
     dockerfile = (DRIVER_DIR / "Dockerfile").read_text()
     assert "COPY deploy/ /deploy/" in dockerfile
     assert "RCUTILS_COLORIZED_OUTPUT=0" in dockerfile
-    assert "COPY . /work/agilex/bunker-pro" not in dockerfile
+    assert "COPY . /work/agilex/bunker-mini" not in dockerfile
 
     bootstrap = (DRIVER_DIR / "deploy" / "host-can-bootstrap.sh").read_text()
     assert "--address=\"$bus_address\"" in bootstrap
@@ -47,7 +47,7 @@ def test_runtime_image_has_deployment_fragment_and_plain_ros_logs():
 
 def test_host_sys_mount_is_read_only_and_required_persistent_paths_are_explicit():
     service = (DRIVER_DIR / "deploy" / "service.yml").read_text()
-    metadata = yaml.safe_load(service)["agilex-bunker-pro"]
+    metadata = yaml.safe_load(service)["agilex-bunker-mini"]
     assert "/sys:/sys:ro" in service
     assert "/lib/modules:/lib/modules:rw" in service
     assert "/etc/systemd/system:/etc/systemd/system:rw" in service

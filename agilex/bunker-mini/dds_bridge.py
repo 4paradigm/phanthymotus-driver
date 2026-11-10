@@ -14,8 +14,8 @@ class BunkerDDSBridge:
 
         self._String = String
         self._ros2 = ros2
-        self._robot = Node("bunker_pro_robot_bridge", context=ros2.ctx_robot)
-        self._core = Node("bunker_pro_core_bridge", context=ros2.ctx_core)
+        self._robot = Node("bunker_mini_robot_bridge", context=ros2.ctx_robot)
+        self._core = Node("bunker_mini_core_bridge", context=ros2.ctx_core)
         ros2.executor_robot.add_node(self._robot)
         ros2.executor_core.add_node(self._core)
         prefix = f"/{namespace}" if namespace else ""

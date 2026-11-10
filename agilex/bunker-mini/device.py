@@ -1,4 +1,4 @@
-"""MCP tools and ROS topic adapters for AgileX Bunker Pro v2."""
+"""MCP tools and ROS topic adapters for AgileX Bunker Mini v2."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ def _acp_notify(action_id: str, status: str, result: dict) -> None:
         print(f"[ACP] completion callback failed ({type(exc).__name__})", flush=True)
 
 
-class BunkerProDevice:
+class BunkerMiniDevice:
     def __init__(self, config: dict, namespace: str, ros2):
         self.config = config
         self._ros2 = ros2
@@ -282,15 +282,15 @@ class BunkerProDevice:
         odom_topics.extend({"topic": topic, "format": "data/json"}
                            for topic in self.bridge._odom_field_topics.values())
         return [
-            tool("motor_state", "sensor", "Bunker Pro chassis feedback, motor telemetry and faults",
+            tool("motor_state", "sensor", "Bunker Mini chassis feedback, motor telemetry and faults",
                  topic_out=[{"topic": self.bridge._state_topic, "format": "data/json"}]),
-            tool("battery", "sensor", "Bunker Pro BMS state, voltage, current, temperature and alarms",
+            tool("battery", "sensor", "Bunker Mini BMS state, voltage, current, temperature and alarms",
                  topic_out=[{"topic": self.bridge._battery_topic, "format": "data/json"}]),
-            tool("remote_controller", "sensor", "Bunker Pro remote switches and stick positions",
+            tool("remote_controller", "sensor", "Bunker Mini remote switches and stick positions",
                  topic_out=[{"topic": self.bridge._remote_controller_topic, "format": "data/json"}]),
-            tool("odom", "sensor", "Measured Bunker Pro odometry",
+            tool("odom", "sensor", "Measured Bunker Mini odometry",
                  topic_out=odom_topics),
-            tool("base_drive", "actuator", "Guarded Bunker Pro base movement", schema),
+            tool("base_drive", "actuator", "Guarded Bunker Mini base movement", schema),
         ]
 
     def dispatch(self, action, args):

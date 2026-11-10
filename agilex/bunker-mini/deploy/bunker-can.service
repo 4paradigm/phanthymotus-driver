@@ -1,5 +1,5 @@
 [Unit]
-Description=AgileX Bunker Pro USB CAN interface
+Description=AgileX Bunker Mini USB CAN interface
 After=systemd-modules-load.service systemd-udev-settle.service
 Wants=systemd-udev-settle.service
 

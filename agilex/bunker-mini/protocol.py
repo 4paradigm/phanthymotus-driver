@@ -1,4 +1,4 @@
-"""Pure Bunker Pro v2 SocketCAN frame codec, checked against AgileX ugv_sdk."""
+"""Pure Bunker Mini v2 SocketCAN frame codec, checked against AgileX ugv_sdk."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""SocketCAN lifecycle and guarded Bunker Pro base commands."""
+"""SocketCAN lifecycle and guarded Bunker Mini base commands."""
 
 from __future__ import annotations
 

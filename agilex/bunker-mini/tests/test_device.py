@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
-from device import BunkerProDevice, _validate_move_duration
+from device import BunkerMiniDevice, _validate_move_duration
 
 
 class FakeCAN:
@@ -35,19 +35,19 @@ class FakeCAN:
 
 
 def _bare_device():
-    device = BunkerProDevice.__new__(BunkerProDevice)
+    device = BunkerMiniDevice.__new__(BunkerMiniDevice)
     device._motion_enabled = True
     device._motion_lock = threading.Lock()
     device._active_move_id = None
     device._active_move_stop = None
     device._direct_until = 0.0
     device.bridge = types.SimpleNamespace(
-        _state_topic="/bunker_pro/state/motor_state",
-        _battery_topic="/bunker_pro/state/battery",
-        _remote_controller_topic="/bunker_pro/state/remote_controller",
-        _odom_topic="/bunker_pro/state/odom",
+        _state_topic="/bunker_mini/state/motor_state",
+        _battery_topic="/bunker_mini/state/battery",
+        _remote_controller_topic="/bunker_mini/state/remote_controller",
+        _odom_topic="/bunker_mini/state/odom",
         _odom_field_topics={
-            name: f"/bunker_pro/state/odom/{name}"
+            name: f"/bunker_mini/state/odom/{name}"
             for name in ("vx", "steering_angle_deg", "left_wheel_mm", "right_wheel_mm")},
     )
     device.config = {}
@@ -136,7 +136,7 @@ def test_motor_state_fields_are_flat_and_freshness_aware():
         "motor_state": {2: {"speed_rpm": 100, "motor_temperature_c": 40}, 3: {}},
         "motor_state_age_ms": {2: 10, 3: None},
     }
-    state = BunkerProDevice._motor_state(snapshot)
+    state = BunkerMiniDevice._motor_state(snapshot)
     assert state["vehicle_state"] == "normal"
     assert state["control_mode"] == "can"
     assert state["remote_lost"] and state["emergency_stop"]
@@ -145,7 +145,7 @@ def test_motor_state_fields_are_flat_and_freshness_aware():
 
 
 def test_battery_and_remote_fields_are_flat():
-    battery = BunkerProDevice._battery_state({
+    battery = BunkerMiniDevice._battery_state({
         "battery_state": {"soc_percent": 95, "voltage_v": 48.2},
         "battery_state_age_ms": 400,
         "battery_alarm": {"alarm_status_1": 4, "alarm_status_2": 1},
@@ -154,7 +154,7 @@ def test_battery_and_remote_fields_are_flat():
     assert battery["soc_percent"] == 95
     assert battery["alarm_undervoltage"] is True
     assert battery["alarm_charge_overcurrent"] is True
-    assert BunkerProDevice._remote_controller_state({
+    assert BunkerMiniDevice._remote_controller_state({
         "remote_controller": {"swa": 2, "left_stick_x": -15},
         "remote_controller_age_ms": 20}) == {
             "swa": 2, "left_stick_x": -15, "feedback_age_ms": 20}
@@ -219,5 +219,5 @@ def test_dds_bridge_binds_forwards_and_closes_entities():
     assert ("/bunker/state/odom/vx", "0.1") in events
     assert ("/bunker/state/odom/right_wheel_mm", "11") in events
     assert ("/bunker/state/motor_state", '{"ok":true}') in events
-    assert ("destroy_node", "bunker_pro_core_bridge") in events
-    assert ("destroy_node", "bunker_pro_robot_bridge") in events
+    assert ("destroy_node", "bunker_mini_core_bridge") in events
+    assert ("destroy_node", "bunker_mini_robot_bridge") in events

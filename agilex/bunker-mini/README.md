@@ -1,4 +1,4 @@
-# AgileX Bunker Pro v2
+# AgileX Bunker Mini v2
 
 This driver uses the USB CAN adapter (`gs_usb`) on the Jetson host. The container
 entrypoint first checks the attached adapter and the running host kernel. If the
@@ -39,13 +39,13 @@ runtime SocketCAN dependency. These packages increase image size, but removing
 the build tools would break the requested automatic bootstrap on hosts without
 the module.
 
-The CAN decoder follows the Bunker Pro 2.0 protocol tables. `motor_state`
+The CAN decoder follows the Bunker Mini 2.0 protocol tables. `motor_state`
 combines chassis feedback (`0x211`), measured linear speed and steering angle
 (`0x221`), and both motor high/low telemetry frames (`0x252`-`0x253`,
 `0x262`-`0x263`) into flat fields. `battery` publishes BMS SOC, SOH, voltage,
 current, temperature and alarm/warning flags (`0x361`-`0x362`), with chassis
 voltage as a fallback. `remote_controller` exposes switch positions, stick
-values and frame counter (`0x241`). No IMU frame appears in the Bunker Pro
+values and frame counter (`0x241`). No IMU frame appears in the Bunker Mini
 interfaces you provided, so this driver does not advertise an `imu` card.
 
 `odom` publishes the standard `motus.odom/1` format and separate scalar ports
@@ -66,5 +66,5 @@ permission defaults to enabled and can be disabled with
 navigation/control topic without changing `base_drive`.
 
 Build from the repository driver build system so `common/` is included in the
-Docker context. Run protocol tests with `pytest agilex/bunker-pro/tests` and the
-service contract check with `python3 scripts/check_service_yml.py agilex/bunker-pro`.
+Docker context. Run protocol tests with `pytest agilex/bunker-mini/tests` and the
+service contract check with `python3 scripts/check_service_yml.py agilex/bunker-mini`.

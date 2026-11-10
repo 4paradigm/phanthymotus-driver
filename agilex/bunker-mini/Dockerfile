@@ -8,9 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt /work/requirements.txt
 RUN python3 -m pip install --no-cache-dir -r /work/requirements.txt
 COPY common /work/common
-COPY main.py device.py protocol.py can_runtime.py dds_bridge.py config.yaml /work/agilex/bunker-pro/
+COPY main.py device.py protocol.py can_runtime.py dds_bridge.py config.yaml /work/agilex/bunker-mini/
 COPY deploy/ /deploy/
-ENV PYTHONPATH=/work/agilex/bunker-pro:/work
+ENV PYTHONPATH=/work/agilex/bunker-mini:/work
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml

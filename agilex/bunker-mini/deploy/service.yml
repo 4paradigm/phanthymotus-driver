@@ -1,5 +1,5 @@
-agilex-bunker-pro:
-  container_name: embodied-agilex-bunker-pro
+agilex-bunker-mini:
+  container_name: embodied-agilex-bunker-mini
   image: __IMAGE__
   user: "0:0"
   network_mode: host

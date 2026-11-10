@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WORK=/work/agilex/bunker-pro
+WORK=/work/agilex/bunker-mini
 /usr/bin/bash /deploy/host-can-bootstrap.sh
 export BUNKER_CAN_INTERFACE=$(/usr/bin/bash /deploy/bunker-can.sh interface)
 set +u
