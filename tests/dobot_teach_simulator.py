@@ -1,12 +1,5 @@
-"""Loopback-only Dashboard + 1440-byte feedback simulator (not firmware validation).
+"""Loopback-only Dashboard + 1440-byte feedback simulator (not firmware validation)."""
 
-Its CSV is intentionally synthetic. It tests the configurable bridge without
-presenting an invented layout as a controller-native format.
-"""
-
-import csv
-import json
-from pathlib import Path
 import re
 import socket
 import threading
@@ -17,8 +10,7 @@ from dobot_sdk.protocol.data_types import MyType, TEST_VALUE_MAGIC
 
 
 class RobotSimulator:
-    def __init__(self, directory):
-        self.directory = Path(directory)
+    def __init__(self):
         self.lock = threading.RLock()
         self.done = threading.Event()
         self.commands = []
@@ -41,7 +33,8 @@ class RobotSimulator:
         self.skin_setting = [0, 0, 0, 0]
         self.alarm = False
         self.collision = False
-        self.return_path_id = False
+        self.servo_hold_s = 0.06  # mode 7 persists this long after the last ServoJ target
+        self.servo_gap = None  # stop following ServoJ targets (tracking loss)
         self.timestamp = 100000
         self.clock = time.monotonic()
         self.listeners = []
@@ -80,7 +73,7 @@ class RobotSimulator:
             motion = self.motion
             fraction = min(1.0, (now - motion["start"]) / motion["duration"])
             self.joints = [a + (b - a) * fraction for a, b in zip(motion["origin"], motion["target"])]
-            if fraction >= 1:
+            if fraction >= 1 and now >= motion.get("hold_until", 0):
                 self.mode, self.motion = 5, None
         elif self.mode == 7 and now >= self.setting_until:
             self.mode = 5
@@ -90,12 +83,6 @@ class RobotSimulator:
         self.command_id += 1
         self.motion = dict(start=time.monotonic(), duration=max(0.1, duration),
                            origin=list(self.joints), target=list(target))
-
-    def _rows(self, filename):
-        with (self.directory / filename).open() as file:
-            rows = list(csv.reader(file))
-        assert rows[0] == ["SIMULATOR_ONLY_NOT_A_DOBOT_FORMAT"]
-        return [[float(value) for value in row] for row in rows[1:]]
 
     def handle(self, command):
         with self.lock:
@@ -122,20 +109,19 @@ class RobotSimulator:
                 result = str(self.command_id)
             elif name == "StartDrag":
                 self.mode = 6
-            elif name == "GetStartPose":
-                filename = re.search(r'"([^"\n]+)"', command)[1]
-                values = ",".join(str(value) for value in self._rows(filename)[0])
-                return f"0,{{1,{{{values}}}}},{command};"
+            elif name == "ServoJ":
+                values = command[len(name) + 1:-1].split(",")
+                target = [float(value) for value in values[:6]]
+                if self.servo_gap is not None:
+                    target = [value + self.servo_gap for value in target]
+                period = float(re.search(r"t=([\d.]+)", command)[1])
+                self._move(target, period)
+                self.motion.update(duration=period, hold_until=time.monotonic() + period + self.servo_hold_s)
+                result = str(self.command_id)
             elif name == "MovJ":
                 target = [float(value) for value in re.search(r"joint=\{([^}]+)\}", command)[1].split(",")]
                 self._move(target, 0.14)
                 result = str(self.command_id)
-            elif name == "StartPath":
-                filename = re.search(r'"([^"\n]+)"', command)[1]
-                rows = self._rows(filename)
-                speed = float(re.search(r"multi=([\d.]+)", command)[1])
-                self._move(rows[-1], (len(rows) - 1) * 0.05 / speed)
-                result = str(self.command_id) if self.return_path_id else ""
             elif name == "Pause":
                 if self.motion is None:
                     return f"-1,{{}},{command};"

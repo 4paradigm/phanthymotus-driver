@@ -6,7 +6,7 @@ hardware_model: cra
 image_name: dobot-cra
 port: 15746
 mcp_url: "http://localhost:15746/mcp"
-description: "CR3A joint feedback at 30 Hz, joint motion, drag recording and native trajectory playback through the official SDK"
+description: "CR3A joint feedback at 30 Hz, joint motion, drag recording and ServoJ trajectory playback through the official SDK"
 build_context_extras:
   - ../../common
 cards:

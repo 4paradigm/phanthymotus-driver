@@ -31,7 +31,7 @@ def wait_until(predicate, timeout=3):
 @pytest.fixture
 def rig(tmp_path, monkeypatch):
     store = recorded_store(tmp_path)
-    robot = RobotSimulator(store.controller_root)
+    robot = RobotSimulator()
     monkeypatch.setenv("DOBOT_CONTROLLER_IP", "127.0.0.1")
     monkeypatch.setenv("DOBOT_FEEDBACK_PORT", "30004")
     monkeypatch.setenv("DOBOT_MODEL_NAME", "CR3A")
@@ -108,63 +108,167 @@ def perform_recording(rig):
     stop = dispatch(plugin, "stop_record")
     release_later(robot).join()
     result = terminal(events, stop)
-    assert result["state"] == "recorded" and result["native_state"] == "exported"
+    assert result["state"] == "recorded" and "native_state" not in result
     assert result["point_count"] >= 3
     return identifier
 
 
-def test_record_go_to_start_native_play_and_completion_over_real_local_tcp(rig):
+def servo_targets(commands):
+    """ServoJ joint targets in send order."""
+    return [[float(v) for v in c[len("ServoJ("):-1].split(",")[:6]] for c in commands if c.startswith("ServoJ(")]
+
+
+def nothing_after_stop(commands):
+    stop = commands.index("Stop()")
+    return not any(c.startswith(("ServoJ", "MovJ", "Continue")) for c in commands[stop + 1:])
+
+
+def start_play(plugin, robot, angles=(0, 1, 2, 3, 4, 5, 6, 7), **args):
+    record, _ = recording(plugin.teach.store, list(angles))
+    played = dispatch(plugin, "play", trajectory_id=record["trajectory_id"], speed_multiplier=.25, **args)
+    wait_until(lambda: len(servo_targets(robot.commands)) >= 3)
+    return record["trajectory_id"], played
+
+
+def test_record_go_to_start_servo_play_and_completion_over_real_local_tcp(rig):
     plugin, robot, store, events = rig
     identifier = perform_recording(rig)
     commands = list(robot.commands)
     assert commands[0] == "ClearError()" and "StartDrag()" not in commands
     # stop_record during a button drag never sends StopDrag; the operator exits.
     assert "StopDrag()" not in commands
+    count = len(robot.commands)
     blocked = terminal(events, dispatch(plugin, "play", trajectory_id=identifier), status="error")
-    assert "go_to_start" in blocked["reason"]
-    assert not any(command.startswith("StartPath") for command in robot.commands)
+    assert "go_to_start" in blocked["reason"] and len(robot.commands) == count
     terminal(events, dispatch(plugin, "go_to_start", trajectory_id=identifier))
-    result = terminal(events, dispatch(plugin, "play", trajectory_id=identifier))
+    count = len(robot.commands)
+    result = terminal(events, dispatch(plugin, "play", trajectory_id=identifier), timeout=5)
     assert result["trajectory_id"] == identifier and result["reason"] == "target_reached"
-    assert sum(command.startswith("StartPath") for command in robot.commands) == 1
+    played = robot.commands[count:]
+    assert not any(c.startswith(("StartPath", "GetStartPose", "MovJ")) for c in played)
+    points = [p["joints_deg"] for p in store.samples(identifier)["points"]]
+    targets = servo_targets(played)
+    # 50 Hz targets along the 50 ms recording at 1x: about 2.5 targets per sample.
+    assert len(targets) >= 2 * (len(points) - 1)
+    assert all("t=0.020" in c and "aheadtime=50.0" in c and "gain=500.0" in c
+               for c in played if c.startswith("ServoJ"))
+    assert targets[-1] == pytest.approx(points[-1], abs=1e-5)
+    assert all(b[0] >= a[0] - 1e-6 for a, b in zip(targets, targets[1:]))
     assert robot.mode == 5 and plugin.control.ownership.owner is None
-    assert any("sample=50" in command and "freq=1.0" in command for command in robot.commands)
 
 
-@pytest.mark.parametrize("path_id", [False, True])
-def test_pause_zero_flag_resume_keeps_queue_and_skin_configuration(rig, path_id):
+@pytest.mark.parametrize("card", ["teach", "joint_move"])
+def test_pause_decelerates_along_the_path_and_resume_streams_to_the_end(rig, card):
     plugin, robot, store, events = rig
-    robot.return_path_id = path_id
-    record, _ = recording(store, [0, 1, 2, 3, 4, 5, 6, 7])
-    identifier = record["trajectory_id"]
-    played = dispatch(plugin, "play", trajectory_id=identifier, speed_multiplier=.25, detect_collision=True)
-    wait_until(lambda: robot.motion is not None and robot.mode == 7)
-    terminal(events, dispatch(plugin, "pause"))
-    terminal(events, played, status="cancelled")
-    assert plugin.client.snapshot()["data"]["pause_cmd_flag"] == 0
+    identifier, played = start_play(plugin, robot, detect_collision=True)
+    paused = terminal(events, plugin.dispatch("pause", {"_tool_name": card, "confirm_move": True}), timeout=5)
+    stream = terminal(events, played, status="cancelled")
+    assert stream["reason"] == "paused" and 0 < stream["position_s"] < .35
+    assert paused["reason"] == "paused" and paused["trajectory_id"] == identifier
+    assert "Pause()" not in robot.commands and robot.mode == 5
     assert plugin.control.ownership.owner == "teach"
-    previous = len(robot.commands)
-    result = terminal(events, dispatch(plugin, "resume"))
-    assert robot.commands[previous:] == ["Continue()"]
+    targets = servo_targets(robot.commands)
+    steps = [b[0] - a[0] for a, b in zip(targets, targets[1:])]
+    # The 0.5 s ramp: the per-target step shrinks to zero rather than stopping abruptly.
+    assert steps[-1] < max(steps) / 4
+    with pytest.raises(RuntimeError, match="resume or stop"):
+        dispatch(plugin, "play", trajectory_id=identifier)
+    count = len(robot.commands)
+    result = terminal(events, plugin.dispatch("resume", {"_tool_name": card, "confirm_move": True}), timeout=5)
+    resumed = robot.commands[count:]
+    assert resumed and all(c.startswith("ServoJ") for c in resumed)
     assert robot.skin == 1 and robot.skin_setting == [1, 1, 1, 1]
+    assert servo_targets(resumed)[-1][0] == pytest.approx(7)
     assert result["trajectory_id"] == identifier and plugin.control.ownership.owner is None
+    with pytest.raises(RuntimeError, match="no teaching motion"):
+        dispatch(plugin, "resume")
 
 
 def test_two_cards_cannot_start_competing_motion_and_stop_routes_to_owner(rig):
     plugin, robot, store, events = rig
-    record, _ = recording(store, [0, 1, 2, 3, 4, 5, 6, 7])
-    played = dispatch(plugin, "play", trajectory_id=record["trajectory_id"], speed_multiplier=.25)
-    wait_until(lambda: robot.motion is not None)
-    count = len(robot.commands)
+    _, played = start_play(plugin, robot)
     with pytest.raises(RuntimeError, match="occupied"):
         plugin.dispatch("move_j", {"_tool_name": "joint_move", "joint1_deg": 10, "confirm_move": True})
-    assert len(robot.commands) == count
+    assert not any(c.startswith("MovJ") for c in robot.commands)
     stopped = plugin.dispatch("stop_motion", {"_tool_name": "joint_move", "confirm_move": True})
     terminal(events, stopped)
     terminal(events, played, status="cancelled")
+    assert robot.commands.count("Stop()") == 1 and nothing_after_stop(robot.commands)
     assert robot.mode == 5 and plugin.control.ownership.owner is None
     with pytest.raises(RuntimeError, match="no teaching motion"):
         dispatch(plugin, "resume")
+
+
+def test_stop_during_pause_ramp_cancels_both_and_sends_no_late_target(rig):
+    plugin, robot, store, events = rig
+    _, played = start_play(plugin, robot)
+    pause = dispatch(plugin, "pause")
+    stopped = dispatch(plugin, "stop_motion")
+    terminal(events, stopped)
+    terminal(events, played, status="cancelled")
+    terminal(events, pause, status="cancelled")
+    assert robot.commands.count("Stop()") == 1 and nothing_after_stop(robot.commands)
+    assert plugin.teach._resume_context is None and plugin.control.ownership.owner is None
+
+
+def test_resume_after_the_arm_moved_is_rejected_without_commands(rig):
+    plugin, robot, store, events = rig
+    _, played = start_play(plugin, robot)
+    terminal(events, dispatch(plugin, "pause"), timeout=5)
+    terminal(events, played, status="cancelled")
+    with robot.lock:
+        robot.joints[0] += 2
+    time.sleep(.05)
+    count = len(robot.commands)
+    result = terminal(events, dispatch(plugin, "resume"), status="error")
+    assert "moved away" in result["reason"] and len(robot.commands) == count
+    assert plugin.control.ownership.owner == "teach" and plugin.teach._resume_context is not None
+    terminal(events, dispatch(plugin, "stop_motion"))
+    assert plugin.control.ownership.owner is None
+
+
+def test_arm_not_following_the_stream_stops_once(rig):
+    plugin, robot, store, events = rig
+    record, _ = recording(store, [0, 1, 2, 3, 4, 5, 6, 7])
+    robot.servo_gap = 5
+    result = terminal(events, dispatch(plugin, "play", trajectory_id=record["trajectory_id"]), status="error")
+    assert "streamed path" in result["reason"]
+    assert robot.commands.count("Stop()") == 1 and nothing_after_stop(robot.commands)
+    assert plugin.control.ownership.owner is None
+
+
+def test_driver_stop_during_stream_stops_the_arm(rig):
+    plugin, robot, store, events = rig
+    _, played = start_play(plugin, robot)
+    plugin.dispatch("stop", {"_tool_name": "teach"})
+    terminal(events, played, status="cancelled")
+    assert robot.commands.count("Stop()") == 1 and nothing_after_stop(robot.commands)
+    assert plugin.control.ownership.owner is None
+
+
+def test_go_to_start_pause_and_resume_use_the_controller_queue(rig):
+    plugin, robot, store, events = rig
+    record, _ = recording(store, [20, 21, 22])
+    original = robot.handle
+
+    def slow_movj(command):
+        reply = original(command)
+        if command.startswith("MovJ"):
+            with robot.lock:
+                robot.motion["duration"] = 1
+        return reply
+
+    robot.handle = slow_movj
+    moving = dispatch(plugin, "go_to_start", trajectory_id=record["trajectory_id"])
+    wait_until(lambda: robot.motion is not None)
+    terminal(events, dispatch(plugin, "pause"))
+    terminal(events, moving, status="cancelled")
+    assert robot.commands[-1] == "Pause()" and robot.mode == 10
+    count = len(robot.commands)
+    result = terminal(events, dispatch(plugin, "resume"), timeout=5)
+    assert robot.commands[count:] == ["Continue()"]
+    assert result["trajectory_id"] == record["trajectory_id"] and robot.joints[0] == pytest.approx(20)
+    assert plugin.control.ownership.owner is None
 
 
 def test_recording_owns_arm_after_start_transition_completes(rig):
@@ -180,15 +284,6 @@ def test_recording_owns_arm_after_start_transition_completes(rig):
     result = terminal(events, stopped)
     assert result["state"] == "incomplete" and robot.mode == 5
     assert plugin.control.ownership.owner is None
-
-
-def test_missing_native_profile_never_sends_preparation_or_motion(rig):
-    plugin, robot, store, events = rig
-    store.profile_path = ""
-    record, _ = recording(store)
-    result = terminal(events, dispatch(plugin, "play", trajectory_id=record["trajectory_id"]), status="error")
-    assert "format_required" in result["reason"]
-    assert robot.commands == []
 
 
 def test_start_record_while_already_dragging_is_rejected_without_commands(rig):
@@ -230,7 +325,7 @@ def test_multiple_drags_continue_one_recording_until_stop_record_in_pause(rig):
     assert len(events) == 1
     result = terminal(events, dispatch(plugin, "stop_record"))
     assert result["state"] == "recorded" and result["end_reason"] == "stop_record"
-    assert result["native_state"] == "exported" and result["duration_s"] >= .5
+    assert result["duration_s"] >= .5
     assert store.load(identifier)["drag_entries"] == 2
     assert "StartDrag()" not in robot.commands and "StopDrag()" not in robot.commands
     assert plugin.control.ownership.owner is None
@@ -435,20 +530,6 @@ def test_persistence_failure_reports_error(rig, monkeypatch):
     assert plugin.teach.recorder.record["state"] == "incomplete"
 
 
-def test_native_export_failure_keeps_local_recording_recorded(rig, monkeypatch):
-    plugin, robot, store, events = rig
-    terminal(events, dispatch(plugin, "start_record", name="share offline"))
-    drag_cycle(robot)
-
-    def offline(identifier):
-        raise RuntimeError("controller share offline")
-    monkeypatch.setattr(store, "export", offline)
-    result = terminal(events, dispatch(plugin, "stop_record"))
-    assert result["state"] == "recorded" and result["reason"] is None
-    assert result["native_state"] == "export_failed" and "offline" in result["native_reason"]
-    assert plugin.control.ownership.owner is None
-
-
 def test_stop_record_before_manual_drag_reports_no_drag(rig):
     plugin, robot, store, events = rig
     terminal(events, dispatch(plugin, "start_record", name="never dragged"))
@@ -474,17 +555,6 @@ def test_feedback_loss_during_recording_saves_incomplete_after_button_exit(rig):
     assert "feedback" in plugin.teach.recorder.record["reason"]
     assert robot.mode == 5 and "StopDrag()" not in robot.commands
     assert plugin.control.ownership.owner is None
-
-
-def test_profile_mismatch_stops_before_any_motion(rig):
-    plugin, robot, store, events = rig
-    record, _ = recording(store)
-    original = plugin.control.get_start_pose
-    plugin.control.get_start_pose = lambda name: [100, 0, 0, 0, 0, 0]
-    result = terminal(events, dispatch(plugin, "go_to_start", trajectory_id=record["trajectory_id"]), status="error")
-    assert "does not match" in result["reason"]
-    assert not robot.commands
-    plugin.control.get_start_pose = original
 
 
 def test_mcp_http_card_discovery_recording_and_results(rig):
@@ -594,22 +664,18 @@ def test_disabled_recording_prepares_enable_without_changing_skin(rig):
 
 def test_protection_during_playback_stops_once_and_reports_error(rig):
     plugin, robot, store, events = rig
-    record, _ = recording(store, [0, 1, 2, 3, 4, 5])
-    play = dispatch(plugin, "play", trajectory_id=record["trajectory_id"], speed_multiplier=.25)
-    wait_until(lambda: robot.motion is not None)
+    _, play = start_play(plugin, robot)
     robot.collision = True
     result = terminal(events, play, status="error")
-    assert "protection" in result["reason"]
-    assert robot.commands.count("Stop()") == 1
+    assert "collision" in result["reason"]
+    assert robot.commands.count("Stop()") == 1 and nothing_after_stop(robot.commands)
     assert robot.commands.count("Continue()") == 0
 
 
 def test_resume_rejected_by_protection_does_not_clear_or_lose_paused_context(rig):
     plugin, robot, store, events = rig
-    record, _ = recording(store, [0, 1, 2, 3, 4, 5])
-    play = dispatch(plugin, "play", trajectory_id=record["trajectory_id"], speed_multiplier=.25)
-    wait_until(lambda: robot.motion is not None)
-    terminal(events, dispatch(plugin, "pause"))
+    _, play = start_play(plugin, robot)
+    terminal(events, dispatch(plugin, "pause"), timeout=5)
     terminal(events, play, status="cancelled")
     robot.collision = True
     wait_until(lambda: plugin.client.snapshot()["data"]["collision_state"])
@@ -642,21 +708,36 @@ def test_card_stop_cancels_recording_and_exits_drag(rig):
     assert robot.mode == 5 and plugin.control.ownership.owner is None
 
 
-def test_short_resume_uses_original_queue_id_when_mode7_is_not_observed(rig):
+def test_stop_motion_during_recorder_handoff_stops_the_installed_recorder(rig, monkeypatch):
+    from dobot.cra import teaching
+
     plugin, robot, store, events = rig
-    record, _ = recording(store, [0, 1, 2, 3, 4, 5])
-    play = dispatch(plugin, "play", trajectory_id=record["trajectory_id"], speed_multiplier=.25)
-    wait_until(lambda: robot.motion is not None)
-    terminal(events, dispatch(plugin, "pause"))
-    terminal(events, play, status="cancelled")
-    with robot.lock:
-        robot.motion["duration"] = .001
-    count = len(robot.commands)
-    terminal(events, dispatch(plugin, "resume"))
-    assert robot.commands[count:] == ["Continue()"]
+    starting, release_start = threading.Event(), threading.Event()
+    original_start = teaching.TrajectoryRecorder.start
+
+    def held_start(recorder):
+        starting.set()
+        assert release_start.wait(2)
+        return original_start(recorder)
+
+    monkeypatch.setattr(teaching.TrajectoryRecorder, "start", held_start)
+    starting_action = dispatch(plugin, "start_record", name="handoff race")
+    assert starting.wait(2)
+    stopped = []
+    stop_thread = threading.Thread(target=lambda: stopped.append(dispatch(plugin, "stop_motion")))
+    stop_thread.start()
+    time.sleep(.02)
+    assert stop_thread.is_alive()
+    release_start.set()
+    stop_thread.join(2)
+    assert not stop_thread.is_alive() and stopped
+    terminal(events, starting_action)
+    terminal(events, stopped[0])
+    assert plugin.teach.recorder is not None and plugin.teach.recorder.finished.is_set()
+    assert plugin.control.ownership.owner is None
 
 
-def test_stop_during_preparation_never_submits_late_startpath(rig):
+def test_stop_during_preparation_never_submits_late_servoj(rig):
     plugin, robot, store, events = rig
     record, _ = recording(store)
     original = robot.handle
@@ -675,7 +756,7 @@ def test_stop_during_preparation_never_submits_late_startpath(rig):
     assert setting_seen.wait(2)
     terminal(events, dispatch(plugin, "stop_motion"))
     terminal(events, play, status="cancelled")
-    assert not any(command.startswith("StartPath") for command in robot.commands)
+    assert not any(command.startswith("ServoJ") for command in robot.commands)
     assert robot.commands.count("Stop()") == 1
 
 
@@ -705,15 +786,3 @@ def test_joint_move_holds_the_same_arm_and_teach_stop_reaches_it(rig):
     terminal(events, moved, status="cancelled")
     assert "StartDrag()" not in robot.commands
     assert plugin.control.ownership.owner is None
-
-
-def test_production_mount_guard_rejects_a_local_folder_before_any_dashboard_command(rig, monkeypatch):
-    plugin, robot, store, events = rig
-    record, _ = recording(store)
-    store.require_network_mount = True
-    monkeypatch.setattr("dobot.cra.native_mounts._mountinfo_text",
-                        lambda: "1 0 0:1 / / rw - ext4 /dev/root rw\n")
-    result = terminal(events, dispatch(plugin, "play", trajectory_id=record["trajectory_id"]), status="error")
-    assert "CIFS/NFS" in result["reason"]
-    assert not robot.commands
-    assert not list(store.controller_root.iterdir())

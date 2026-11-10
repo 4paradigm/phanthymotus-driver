@@ -13,7 +13,7 @@ RUN --mount=type=bind,from=sdk-builder,source=/build/wheels,target=/tmp/dobot-wh
     python3 -m pip install --no-cache-dir --no-index /tmp/dobot-wheels/*.whl \
     && python3 -c 'from dobot_sdk.protocol.data_types import MyType; assert MyType.itemsize == 1440'
 COPY common/ /work/common/
-COPY main.py device.py feedback.py control.py completion.py model.py teaching.py trajectory.py ownership.py native_mounts.py config.yaml driver.yaml /work/dobot/cra/
+COPY main.py device.py feedback.py control.py completion.py model.py teaching.py trajectory.py ownership.py config.yaml driver.yaml /work/dobot/cra/
 COPY resource/ /work/dobot/cra/resource/
 COPY deploy/ /deploy/
 

@@ -21,10 +21,6 @@ dobot-cra:
     - DOBOT_FEEDBACK_PORT=${DOBOT_FEEDBACK_PORT:-30004}
     - DOBOT_MODEL_NAME=${DOBOT_MODEL_NAME:-}
     - DOBOT_TEACH_DATA_DIR=/work/data/dobot-teach
-    # Container paths and bind mounts are supplied together by the optional
-    # native-teach.compose.yml overlay. Host paths must not be passed here.
-    - DOBOT_TEACH_CSV_PROFILE=
-    - DOBOT_TEACH_CONTROLLER_DIR=
   logging:
     driver: local
     options:

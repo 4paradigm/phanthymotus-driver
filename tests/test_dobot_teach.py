@@ -1,38 +1,24 @@
-"""Offline recording integrity, native-format boundary and card contracts."""
+"""Offline recording integrity, playback samples and card contracts."""
 
 import copy
 import hashlib
-import json
 import struct
 import threading
 import time
 
 import pytest
 
-from dobot.cra.control import parse_start_pose, trajectory_filename
 from dobot.cra.device import DobotSensors
 from dobot.cra.feedback import FeedbackClient, FeedbackSubscription
 from dobot.cra import trajectory
-from dobot.cra.trajectory import NativeCsvProfile, TrajectoryRecorder, TrajectoryStore, at_rest_after_drag, atomic_json
+from dobot.cra.teaching import ServoPlayback
+from dobot.cra.trajectory import TrajectoryRecorder, TrajectoryStore, at_rest_after_drag, atomic_json
 from test_dobot_joint_move import Feedback, set_mode
 from test_dobot_cra_sensors import FakeConnection, packet, wait_until
 
 
-def recorded_store(tmp_path, native=True, shared=True):
-    root = tmp_path / "records"
-    controller = tmp_path / "controller"
-    if shared:
-        controller.mkdir(exist_ok=True)
-    profile = tmp_path / "simulator-profile.json"
-    profile.write_text(json.dumps({
-        "version": 1, "format_id": "SIMULATOR_ONLY_NOT_A_DOBOT_FORMAT",
-        "header": [["SIMULATOR_ONLY_NOT_A_DOBOT_FORMAT"]],
-        "columns": [f"joint{i}_deg" for i in range(1, 7)],
-    }))
-    # The loopback simulator uses a temporary local folder, never a real share.
-    store = TrajectoryStore(root, str(controller) if shared else "", str(profile) if native else "",
-                            require_network_mount=False)
-    return store
+def recorded_store(tmp_path):
+    return TrajectoryStore(tmp_path / "records")
 
 
 def recording(store, angles=None, name="测试轨迹"):
@@ -345,38 +331,37 @@ def test_restart_marks_unfinished_recording_incomplete(tmp_path):
     assert "restarted" in recovered.load(record["trajectory_id"])["reason"]
 
 
-@pytest.mark.parametrize("native,shared,state", [(False, True, "format_required"), (True, False, "transfer_required")])
-def test_missing_native_contract_blocks_playback_but_keeps_recording(tmp_path, native, shared, state):
-    store = recorded_store(tmp_path, native, shared)
-    record, _ = recording(store)
-    assert store.export(record["trajectory_id"])["native_state"] == state
-    with pytest.raises(RuntimeError, match=state):
-        store.playback(record["trajectory_id"], "127.0.0.1")
-    assert store.load(record["trajectory_id"])["state"] == "recorded"
-
-
-def test_native_bridge_readback_collision_and_local_delete(tmp_path):
+def test_playback_returns_verified_samples_and_delete_removes_local_files(tmp_path):
     store = recorded_store(tmp_path)
     record, data = recording(store)
-    result = store.export(record["trajectory_id"])
-    remote = store.controller_root / result["controller_file"]
-    assert result["native_state"] == "exported"
-    assert hashlib.sha256(remote.read_bytes()).hexdigest() == result["native_sha256"]
-    store.playback(record["trajectory_id"], "127.0.0.1")
-    remote.write_text("different file")
-    with pytest.raises(RuntimeError, match="overwrite"):
-        store.export(record["trajectory_id"])
-    store.delete(record["trajectory_id"])
-    assert remote.exists()
-    assert store.list_records() == []
+    directory = store._directory(record["trajectory_id"])
+    (directory / "native.csv").write_text("left by an earlier version")
+    loaded, samples = store.playback(record["trajectory_id"], "127.0.0.1")
+    assert loaded["trajectory_id"] == record["trajectory_id"] and samples["points"] == data["points"]
+    assert "native_state" not in store.summary(loaded)
+    assert store.delete(record["trajectory_id"]) == {"trajectory_id": record["trajectory_id"], "state": "deleted"}
+    assert not directory.exists() and store.list_records() == []
 
 
-def test_wrong_controller_does_not_upload_anything(tmp_path):
+def test_wrong_controller_is_rejected(tmp_path):
     store = recorded_store(tmp_path)
     record, _ = recording(store)
     with pytest.raises(RuntimeError, match="different controller"):
         store.playback(record["trajectory_id"], "127.0.0.2")
-    assert not list(store.controller_root.iterdir())
+
+
+def test_incomplete_recording_cannot_be_played(tmp_path):
+    store = recorded_store(tmp_path)
+    record = store.create("unfinished", "127.0.0.1")
+    with pytest.raises(RuntimeError, match="not complete"):
+        store.playback(record["trajectory_id"], "127.0.0.1")
+
+
+def test_servo_playback_interpolates_along_the_recording():
+    playback = ServoPlayback("a" * 32, [[0.0] * 6, [1.0] + [0.0] * 5, [3.0] + [0.0] * 5], 1)
+    assert playback.duration_ms == 100
+    assert playback.at(0)[0] == 0 and playback.at(25)[0] == pytest.approx(0.5)
+    assert playback.at(75)[0] == pytest.approx(2.0) and playback.at(100)[0] == 3.0
 
 
 def test_tampered_recording_is_rejected(tmp_path):
@@ -387,29 +372,9 @@ def test_tampered_recording_is_rejected(tmp_path):
         store.samples(record["trajectory_id"])
 
 
-@pytest.mark.parametrize("bad", ["../x", "../x.csv", "x.csv);Stop();", "x\n.csv", "x.csv/", "", None])
-def test_paths_and_protocol_injection_are_rejected(tmp_path, bad):
-    with pytest.raises(ValueError): trajectory_filename(bad)
+@pytest.mark.parametrize("bad", ["../x", "x);Stop();", "x\n", "", None, "A" * 32])
+def test_trajectory_ids_are_validated(tmp_path, bad):
     with pytest.raises(ValueError): TrajectoryStore(tmp_path)._directory(bad)
-
-
-@pytest.mark.parametrize("reply", [
-    '0,{1,{1,2,3,4,5,6}},GetStartPose("a.csv",1);',
-    '0,{0,{1,2,3,4,5,6},0,0,{1,2,3,4,5,6}},GetStartPose("a.csv",1);',
-])
-def test_nested_start_pose_reply_is_parsed(reply):
-    assert parse_start_pose(reply) == [1, 2, 3, 4, 5, 6]
-
-
-@pytest.mark.parametrize("reply", [
-    '0,{2,{1,2,3,4,5,6}},GetStartPose("a.csv",1);',
-    '0,{1,{1,2,156,4,5,6}},GetStartPose("a.csv",1);',
-    '0,{1,{1,2}},GetStartPose("a.csv",1);',
-    '-1,{},GetStartPose("a.csv",1);', '0,{},MovJ();',
-])
-def test_unusable_start_pose_is_rejected(reply):
-    with pytest.raises((ValueError, RuntimeError)):
-        parse_start_pose(reply)
 
 
 def test_card_contract_keeps_sensor_and_confirmation_conventions():

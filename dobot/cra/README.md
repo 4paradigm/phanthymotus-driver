@@ -9,7 +9,7 @@
 |---|---|---|
 | `joint_move` | actuator | 绝对/相对关节运动、停止、暂停及继续 |
 | `joints` | sensor | 六轴实际角度驱动的 CR3A 结构骨架、逐关节转角 JSON，以及共享连接配置 |
-| `teach` | actuator | 后台拖拽录制、轨迹管理、到起点运动、原生回放及暂停/恢复 |
+| `teach` | actuator | 后台拖拽录制、轨迹管理、到起点运动、ServoJ 流式回放及暂停/恢复 |
 
 `model` 为渲染器内部读取的 resource，不是可见卡片。
 本版不注册 `safe_skin` 或 `safe_skin_control`，不发布安全皮肤 topic。
@@ -162,14 +162,14 @@ TLS 保持校验；停止在反馈或证书配置异常时仍可下发，但不�
 | action | 行为 |
 |---|---|
 | `start_record` | 指定 `name`，ClearError、按需 EnableRobot，不发送 StartDrag；之后等待操作者按机械臂拖拽键首次进入拖拽 |
-| `stop_record` | 结束整次录制；**不发送 StopDrag**，仍在拖拽时等待操作者按拖拽键退出；以新反馈确认模式 5 停稳后保存，并尝试原生文件导出 |
-| `list_records` | 返回轨迹编号、名称、完整性、结束原因、时长、点数、原生文件状态 |
-| `delete_record` | 删除本地录制，保留控制器副本；禁止删除正在使用的录制 |
-| `go_to_start` | 校验原生文件和坐标系，使用 MovJ 到起点并确认到位 |
-| `play` | 确认已在起点，复用新运动准备，执行 StartPath，等待实际结束 |
-| `pause` | 暂停当前队列；模式 10 可对应 pause_cmd_flag=0 |
-| `resume` | 直接 Continue，保留原队列和安全皮肤设置，不清错、不 Enable、不重新设置皮肤 |
-| `stop_motion` | 终止回放；录制时作为中断处理，等待按拖拽键退出拖拽，保留标为不完整的采集数据 |
+| `stop_record` | 结束整次录制；**不发送 StopDrag**，仍在拖拽时等待操作者按拖拽键退出；以新反馈确认模式 5 停稳后保存到本地 |
+| `list_records` | 返回轨迹编号、名称、完整性、结束原因、时长、点数 |
+| `delete_record` | 删除本地录制；禁止删除正在使用或暂停中的录制 |
+| `go_to_start` | 校验本地录制（校验值、控制器 IP），使用 MovJ 到起点并确认到位 |
+| `play` | 确认已在起点，复用新运动准备（清错、使能、皮肤），由驱动以 50 Hz ServoJ 逐点发送录制关节角，等待实际结束 |
+| `pause` | 回放中：沿轨迹在 0.5 秒内线性减速到停，停在路径上并以模式 5 停稳确认；到起点运动中：控制器 Pause（模式 10） |
+| `resume` | 回放：确认停稳、无保护、仍在暂停位置后沿轨迹 0.5 秒加速继续；到起点：Continue。均不清错、不 Enable、不重新设置皮肤 |
+| `stop_motion` | 立即结束 ServoJ 流并发送 Stop，之后不会再发出任何目标点；录制时作为中断处理，等待按拖拽键退出拖拽，保留标为不完整的采集数据 |
 
 除列表查询外，业务 action 都需要手动填写 `confirm_move=true`；该字段不设默认值或枚举。
 
@@ -206,8 +206,7 @@ TLS 保持校验；停止在反馈或证书配置异常时仍可下发，但不�
   直到后续 stop_motion/stop_record 确认停稳；成功后才释放。旧任务不会释放新任务的占用。
 - **ACP**：start_record 完成仅表示“已准备，等待首次拖拽”；进入/退出拖拽不发送完成通知；
   stop_record 在退出确认和保存后才完成。只有采样完整、至少 2 点、退出已确认且保存成功才为 `recorded`。
-  `end_reason` 为 `stop_record`、`limit_reached` 或 `interrupted`。`native_state`（含导出失败 `export_failed`
-  及 `native_reason`）独立于本地录制状态，导出失败不改变 `recorded`。
+  `end_reason` 为 `stop_record`、`limit_reached` 或 `interrupted`。
 - start_record 前机械臂不能已处于拖拽，否则拒绝且不发送任何命令。从未进入拖拽就结束会标为不完整。
 
 采集从共享 30004 接收线程进入独立有界缓冲，不经过网页、ROS 发布或 joints 的 30 Hz 定时器。
@@ -217,78 +216,40 @@ TLS 保持校验；停止在反馈或证书配置异常时仍可下发，但不�
 小于 50 ms 的采样间隙才参与重采样；原始文件保留实际时间，不把重复旧包当新数据。
 
 录制不改安全皮肤或本体碰撞等级。go_to_start/play 的 detect_collision 沿用 joint_move 的定义，
-默认 false，true 开启安全皮肤并将四个区域设为 low。play 按录制时间比例回放，
-speed_multiplier 为 0.25–2，默认 1；固定 sample=50、isConst=0、freq=1（不增加额外滤波）。
-回放超时按时长/倍率增加余量，不直接套用 300 秒。到起点使用 velocity/acceleration，默认各 10%。
-StartPath 的 ACK 可以不带队列号；此时必须观察到本次运行，再通过连续新反馈的空闲、停稳和末点角度确认完成。
-通信中断不重复发送 StartPath/MovJ/Continue；错误后尝试一次 Stop，无法确认停止则保留错误状态。
+默认 false，true 开启安全皮肤并将四个区域设为 low。到起点使用 velocity/acceleration，默认各 10%。
 
-### 原生 CSV 与部署边界
+### ServoJ 流式回放
 
-**本地原始录制和原生回放文件是不同格式。当前没有这台控制器导出的原生 CSV 样本，
-因此没有随驱动内置任何“已兼容”CSV 布局。默认可以录制，回放明确返回 `format_required`，
-不会把内部 JSON 当原生轨迹，也不会在此状态下发送准备或位移命令。**
+不向控制器上传任何文件：录制只保存在本地（`data_dir`，50 ms 一点、单位为度的六轴关节角），
+play 时由驱动通过 Dashboard 连接逐点发送 `ServoJ(J1..J6,t=0.020,aheadtime=50.0,gain=500.0)`。
 
-要启用原生导出，需要从当前控制器样本确认字段后提供数据格式配置，并把控制器轨迹共享目录
-预先通过 CIFS/SMB 或 NFS 挂载到驱动可访问的目录。该桥接只做文件写入与 SHA-256 回读校验，不开启 SSH、自动挂载、
-尝试未知 HTTP 写接口或安装 SMB 客户端。GetStartPose 会进一步验证控制器读出的起点；
-这不替代现场对整条 CSV 的兼容性验证。当前测试中的 CSV 明确标记为 SIMULATOR_ONLY，不能部署为真机格式。
+- **时间比例**：每 20 ms 发送一个目标，按录制点线性插值；speed_multiplier 为 0.25–2，默认 1，
+  即路径位置每 20 ms 前进 20×倍率 ms。不受全局速度比例控制。
+- **每个目标发送前检查**：反馈新鲜；无报警、碰撞、皮肤触发、下使能、抱闸松开；未拖拽；模式为 5 或 7；
+  实际关节角与最近 0.5 秒内已发送的某个目标相差不超过 3°（跟随偏离即中断）。发送比计划晚 100 ms 以上
+  （控制器已断流）也中断。任一失败都发送一次 Stop 并以 error 结束。
+- **完成**：最后一个目标发送后，以连续新反馈的模式 5、停稳及末点误差不超过 target_tolerance_deg 确认，最长 10 秒。
+- **暂停**：沿路径把播放速率在 0.5 秒内线性降到 0（不离开录制轨迹），停发后以连续两包模式 5 停稳确认；
+  play 以 cancelled、`reason=paused` 和 `position_s` 结束，pause 完成后 teach 保持占用。
+- **继续**：要求停稳的模式 5、无保护、实际角度仍在暂停位置（target_tolerance_deg 内），否则拒绝且不发送任何命令，
+  暂停上下文保留，可再次 resume 或 stop_motion。被手动挪动后须 stop_motion 再 go_to_start。
+  继续时沿路径 0.5 秒加速，不清错、不 Enable、不设置皮肤（沿用暂停前的配置）。
+- **停止**：stop_motion（任一卡片）、驱动停止都会取消流并发送 Stop；取消检查与 ServoJ 发送在同一命令锁内，
+  Stop 之后不会再有目标发出。暂停减速过程中也可以直接停止。
+- **到起点**：go_to_start 仍是控制器队列中的 MovJ，其暂停/继续使用控制器 Pause/Continue（模式 10）。
+- 通信中断不重发 ServoJ/MovJ/Continue；错误后尝试一次 Stop，无法确认停止则保留错误状态和占用。
+
+现场实测（CR3A，经 Jetson 有线连接）：50 Hz ServoJ 发送间隔 19.97–20.03 ms，ACK 往返 p50 5.5 ms、最大 13.5 ms；
+J6 0→+3°→0 的跟随滞后约 92 ms，去滞后后 RMS 误差 0.027°，过程中模式 5→7→5，无报警。
 
 配置项（config.yaml 的 teach 或对应环境变量）：
 
 | 配置/变量 | 作用 |
 |---|---|
 | data_dir / DOBOT_TEACH_DATA_DIR | 本地持久化录制目录；部署默认 /work/data/dobot-teach |
-| controller_directory / DOBOT_TEACH_CONTROLLER_DIR | **容器内**的控制器轨迹目录；原生覆盖配置固定为 /work/controller-trajectories |
-| native_csv_profile / DOBOT_TEACH_CSV_PROFILE | **容器内**的 CSV 布局文件路径；原生覆盖配置固定为 /work/config/dobot-teach/profile.json |
 
-布局 JSON 使用 version=1、非空 format_id、columns、可选 header（CSV 行数组）及 delimiter。
-columns 支持 joint1_deg..joint6_deg、time_ms、time_s、user、tool，或者 {"literal": 值} 常量列；
-六轴必须各出现一次，单位为度。header 为原样输出的常量行。若控制器样本需要其他结构，应先扩展并验证
-编码器，不能用常量伪造动态位姿或 IO。不自动记录/回放 DO，也不改变工具负载设置。
+早期版本录制目录中遗留的 `native.csv` 不再使用，delete_record 时一并删除。不自动记录/回放 DO，也不改变工具负载设置。
 
-默认 service.yml 仅启用本地录制，两个原生路径环境变量为空，因此不要求主机上存在 profile 或控制器共享目录。
-Agent Core 只自动提取 service.yml，不会自动加载可选覆盖文件。启用原生回放须按以下步骤，
-将镜像自带的 deploy/native-teach.compose.yml 与平台统一 Compose 文件一起加载。
-
-1. 在 Linux 部署主机上，先通过现场已有的共享配置，将控制器的 process/trajectory 目录挂载到
-   例如 /mnt/dobot-trajectory。该目录必须实际位于 CIFS/SMB 或 NFS 文件系统中，且允许读写。
-   普通 mkdir 创建的目录、失效后落到本地磁盘的目录、只读挂载不能代替控制器共享。
-2. 准备从当前控制器样本确认的 profile JSON 文件。使用下面两个**宿主机路径变量**：
-
-| 宿主机变量 | 内容 | 容器映射及权限 |
-|---|---|---|
-| DOBOT_TEACH_PROFILE_HOST_FILE | 已存在的 profile JSON 绝对路径 | /work/config/dobot-teach/profile.json，只读 |
-| DOBOT_TEACH_CONTROLLER_HOST_DIR | 已挂载共享中轨迹目录的绝对路径 | /work/controller-trajectories，读写 |
-
-3. 默认录制容器由平台创建后，在有部署目录写权限及 Docker 权限的账号下执行：
-
-```bash
-cd /opt/phanthy-motus
-export DOBOT_TEACH_PROFILE_HOST_FILE=/opt/phanthy-motus/data/dobot-teach/native-profile.json
-export DOBOT_TEACH_CONTROLLER_HOST_DIR=/mnt/dobot-trajectory
-
-docker cp embodied-dobot-cra:/deploy/native-teach.compose.yml ./dobot-native-teach.compose.yml
-docker cp embodied-dobot-cra:/work/dobot/cra/native_mounts.py ./check-dobot-native-mounts.py
-python3 ./check-dobot-native-mounts.py
-
-docker compose -f docker-compose.yml -f dobot-native-teach.compose.yml config --quiet
-docker compose -f docker-compose.yml -f dobot-native-teach.compose.yml up -d --no-deps dobot-cra
-```
-
-宿主机预检查仅依赖 Python 标准库，无需安装机械臂 SDK。它会读取 profile JSON，核对 Linux 挂载信息，
-并在共享目录创建、回读及删除一个临时探测文件。它不向机器人命令端口发送指令。
-覆盖配置使用长格式 bind mount 和 create_host_path=false，缺失的宿主机路径不会被自动创建为空目录。
-运行时导出也重新检查 profile 可读、共享确为网络文件系统及可写，失败时不会向该目录写入轨迹。
-
-将这两个 HOST 变量保存到 /opt/phanthy-motus/.env 后，后续维护仍应使用同一组 -f 文件。
-平台重新部署驱动时只使用基础 service.yml，原生回放会恢复关闭状态；须重新提取新版覆盖文件并按上述命令启用。
-只设置 DOBOT_TEACH_CSV_PROFILE/DOBOT_TEACH_CONTROLLER_DIR 为宿主机路径不能启用回放。
-
-CSV 文件名由轨迹编号生成，不覆盖不同内容的已有控制器文件。
-控制器 IP、坐标系、原始文件校验值、原生文件起点不匹配时拒绝播放。
-
-本次新增代码仅使用标准库，requirements.txt 与 SDK pin 不变。Dockerfile 仅增加 Python 文件打包，
-并非新增运行时第三方依赖；原有 SDK/numpy/requests/PyYAML 的镜像占用仍然存在。
-本地测试覆盖真实回环 TCP 的官方 SDK、1440 字节反馈、MCP HTTP、ACP、录制/传输/回放模拟，
-不验证控制器固件接受 CSV，不进行 Jetson 或真机测试。
+本次新增代码仅使用标准库，requirements.txt 与 SDK pin 不变。
+本地测试覆盖真实回环 TCP 的官方 SDK、1440 字节反馈、MCP HTTP、ACP、录制与 ServoJ 回放/暂停/继续/停止模拟；
+模拟器不代表控制器固件行为。

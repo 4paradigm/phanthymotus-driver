@@ -11,7 +11,6 @@ import re
 import math
 import threading
 import time
-import json
 
 from dobot_sdk.api.robot_control import RobotControl
 from dobot_sdk.api.motion import Motion, CoordinateType
@@ -31,6 +30,10 @@ else:
 # URDF rounds radians and is not used as a controller safety configuration.
 JOINT_LIMITS_DEG = ((-360, 360), (-360, 360), (-155, 155),
                     (-360, 360), (-360, 360), (-360, 360))
+# ServoJ follow parameters (SDK defaults). Field-tested on CR3A at a 20 ms period:
+# about 90 ms constant lag, 0.03 deg RMS tracking error after removing that lag.
+SERVO_AHEAD_TIME = 50.0
+SERVO_GAIN = 500.0
 
 
 class DashboardConnection(DobotConnection):
@@ -75,30 +78,6 @@ def parse_reply(reply, command):
     if identifier and not identifier.isdecimal():
         raise ValueError(f"invalid queue identifier: {identifier!r}")
     return int(identifier) if identifier else None
-
-
-def trajectory_filename(value):
-    # A controller filename is a protocol argument, never a path or expression.
-    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,96}\.csv", value):
-        raise ValueError("trajectory filename must be a plain ASCII .csv basename")
-    return value
-
-
-def parse_start_pose(reply):
-    match = re.fullmatch(r"\s*(-?\d+),(\{.*\}),GetStartPose\(.*\);\s*", reply, re.S)
-    if match is None:
-        raise ValueError("invalid GetStartPose response")
-    if int(match[1]):
-        raise CommandRejected(f"GetStartPose rejected with ErrorID={match[1]}")
-    data = json.loads(match[2].replace("{", "[").replace("}", "]"))
-    if (not isinstance(data, list) or len(data) < 2 or type(data[0]) is not int or
-            data[0] not in (0, 1) or not isinstance(data[1], list) or len(data[1]) != 6):
-        raise ValueError("GetStartPose must return a joint or teaching point")
-    joints = data[1]
-    for value, (lo, hi) in zip(joints, JOINT_LIMITS_DEG):
-        if type(value) not in (int, float) or not math.isfinite(value) or not lo <= value <= hi:
-            raise ValueError("GetStartPose returned invalid joint angles")
-    return joints
 
 
 class RobotController:
@@ -291,19 +270,6 @@ class RobotController:
             self._motion_api = Motion(self._connection)
             self._update(dashboard_connected=True)
 
-    def get_start_pose(self, filename):
-        filename = trajectory_filename(filename)
-        self.ownership.check("teach")
-        with self._command_lock:
-            if not self.feedback.address:
-                raise RuntimeError("configure the controller IP first")
-            try:
-                self._connect(self.feedback.address)
-                return parse_start_pose(self._motion_api.GetStartPose(filename, 1))
-            except Exception:
-                self._close()
-                raise
-
     def prepare_record(self, *, cancel=None):
         """ClearError/EnableRobot only; the operator enters drag manually."""
         self.ownership.check("teach")
@@ -315,14 +281,12 @@ class RobotController:
 
         return self._execute("start_record", None, check, card="teach")
 
-    def execute_path(self, filename, start_joints, args, *, cancel=None):
-        filename = trajectory_filename(filename)
+    def prepare_playback(self, start_joints, args, *, cancel=None):
+        """Same preparation as move_j (ClearError, enable, skin, ClearError), then
+        confirm the arm is at the trajectory start. Sends no motion."""
         self.ownership.check("teach")
         if args.get("confirm_move") is not True:
             raise ValueError("confirm_move=true is required")
-        speed = args.get("speed_multiplier", 1.0)
-        if type(speed) not in (int, float) or not math.isfinite(speed) or not 0.25 <= speed <= 2:
-            raise ValueError("speed_multiplier must be between 0.25 and 2")
         skin = args.get("detect_collision", False)
         if type(skin) is not bool:
             raise ValueError("detect_collision must be a boolean")
@@ -332,10 +296,26 @@ class RobotController:
                 raise RuntimeError("teaching interrupted")
             return self._check_preparation_state(action, allow_own_queue=allow_own_queue)
 
-        return self._execute("move_j", "StartPath", check, card="teach", parameters=(filename,),
-                             options={"is_const": 0, "multi": speed, "sample": 50, "freq": 1.0},
-                             requested={"detect_collision": skin, "expected_start": start_joints,
+        return self._execute("move_j", "ServoJ", check, card="teach",
+                             requested={"detect_collision": skin, "expected_start": list(start_joints),
                                         "start_tolerance_deg": args.get("start_tolerance_deg", 0.5)})
+
+    def servo_j(self, joints, period_s, cancel):
+        """One ServoJ follow target. Checked against cancel under the command lock,
+        so no target can be transmitted after a Stop that follows the cancellation."""
+        self.ownership.check("teach")
+        with self._command_lock:
+            if cancel.is_set():
+                raise RuntimeError("teaching interrupted")
+            try:
+                self._connect(self.feedback.address)
+                reply = self._motion_api.ServoJ(list(joints), t=period_s, aheadtime=SERVO_AHEAD_TIME, gain=SERVO_GAIN)
+                return parse_reply(reply, "ServoJ")
+            except Exception as exc:
+                exc.dobot_command_attempted = "ServoJ"
+                self._update("teach", last_error=str(exc))
+                self._close()
+                raise
 
     @staticmethod
     def _absolute_target(sample, requested):
@@ -406,7 +386,7 @@ class RobotController:
                             skin_queue_id = parse_reply(sensitivity_reply, "SetSafeSkin")
                             request["safe_skin_sensitivity_responses"].append(sensitivity_reply)
                             self._wait_preparation_queue(action, check_state, skin_queue_id, baseline)
-                if command in ("MovJ", "RelJointMovJ", "StartPath"):
+                if command in ("MovJ", "RelJointMovJ", "ServoJ"):
                     # Keep clear + state recheck + move serialized as one request.
                     # A failed/uncertain clear must never be followed by motion.
                     baseline = check_state(action).get("packets_received")
@@ -443,12 +423,16 @@ class RobotController:
                 if action == "resume":
                     paused_sample = self._check_motion_state(action)
                     request["resumed_command_id"] = paused_sample["data"].get("current_command_id")
-                if command == "StartPath":
+                if command == "ServoJ":
                     current = self._check_motion_state("move_j")["data"]["joint_state"]["q_actual"]
                     if max(abs(a - b) for a, b in zip(current, request["expected_start"])) > request["start_tolerance_deg"]:
                         raise RuntimeError("robot is not at the trajectory start; run go_to_start first")
+                    # The ServoJ stream itself is sent by the teach card, target by target.
+                    request["state"] = "prepared"
+                    self._update(card, last_request=request)
+                    return request
                 request["submission_baseline"] = self.feedback.snapshot().get("packets_received")
-                api = self._motion_api if command in ("MovJ", "RelJointMovJ", "StartPath") else self._api
+                api = self._motion_api if command in ("MovJ", "RelJointMovJ") else self._api
                 request["command_attempted"] = command
                 reply = getattr(api, command)(*parameters, **(options or {}))
                 queue_id = parse_reply(reply, command)

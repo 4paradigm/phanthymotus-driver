@@ -1,16 +1,13 @@
-"""Persistent timestamped recordings and an explicitly configured native bridge.
+"""Persistent timestamped recordings, played back by the driver as a ServoJ stream.
 
-The public TCP manual does not define native CSV columns. No native format is
-guessed here: an installation must supply a profile derived from its controller.
-The default records locally and refuses native playback until that is supplied.
+Nothing is uploaded to the controller: recordings stay local (50 ms joint samples
+in degrees) and the teach card streams them over the Dashboard connection.
 """
 
 from __future__ import annotations
 
 import copy
-import csv
 import hashlib
-import io
 import json
 import math
 import os
@@ -22,11 +19,9 @@ import time
 from uuid import uuid4
 
 if __package__:
-    from .control import JOINT_LIMITS_DEG, trajectory_filename
-    from .native_mounts import readable_profile, writable_controller_directory
+    from .control import JOINT_LIMITS_DEG
 else:
-    from control import JOINT_LIMITS_DEG, trajectory_filename
-    from native_mounts import readable_profile, writable_controller_directory
+    from control import JOINT_LIMITS_DEG
 
 SAMPLE_MS = 50
 MAX_POINTS = 10000
@@ -101,69 +96,9 @@ def atomic_json(path, value):
     os.replace(temporary, path)
 
 
-class NativeCsvProfile:
-    """Data-only layout; never execute a format script or presume six columns.
-
-Supported fields are joint1_deg..joint6_deg, time_ms/time_s, user and tool.
-Other constant columns/header rows can be specified as literal CSV cells.
-No production profile is bundled because no controller sample is available.
-"""
-
-    def __init__(self, path):
-        profile_path = readable_profile(path)
-        if profile_path.stat().st_size > 65536:
-            raise ValueError("native CSV profile exceeds 64 KiB")
-        self.data = json.loads(profile_path.read_text(encoding="utf-8"))
-        self.digest = hashlib.sha256(profile_path.read_bytes()).hexdigest()
-        data = self.data
-        if data.get("version") != 1 or not isinstance(data.get("format_id"), str) or not data["format_id"]:
-            raise ValueError("native CSV profile requires version=1 and format_id")
-        columns = data.get("columns")
-        if not isinstance(columns, list) or not 6 <= len(columns) <= 64:
-            raise ValueError("native CSV profile requires 6..64 columns")
-        fields = []
-        allowed = {f"joint{i}_deg" for i in range(1, 7)} | {"time_ms", "time_s", "user", "tool"}
-        for column in columns:
-            if isinstance(column, str) and column in allowed:
-                fields.append(column)
-            elif (isinstance(column, dict) and set(column) == {"literal"}
-                  and type(column["literal"]) in (str, int, float)):
-                if isinstance(column["literal"], float) and not math.isfinite(column["literal"]):
-                    raise ValueError("invalid CSV literal")
-            else:
-                raise ValueError("unsupported native CSV column")
-        if any(fields.count(f"joint{i}_deg") != 1 for i in range(1, 7)):
-            raise ValueError("native CSV profile must map every joint exactly once")
-        header = data.get("header", [])
-        if not isinstance(header, list) or len(header) > 32 or any(
-                not isinstance(row, list) or len(row) > 64 or any(type(v) not in (str, int) for v in row)
-                for row in header):
-            raise ValueError("invalid CSV header rows")
-        if data.get("delimiter", ",") not in (",", ";", "\t"):
-            raise ValueError("unsupported CSV delimiter")
-
-    def encode(self, recording):
-        output = io.StringIO(newline="")
-        writer = csv.writer(output, delimiter=self.data.get("delimiter", ","), lineterminator="\n")
-        writer.writerows(self.data.get("header", []))
-        for point in recording["points"]:
-            joints = check_joints(point["joints_deg"])
-            values = {f"joint{i}_deg": format(v, ".9f") for i, v in enumerate(joints, 1)}
-            values.update(time_ms=point["time_ms"], time_s=point["time_ms"] / 1000,
-                          user=recording["frames"]["user"], tool=recording["frames"]["tool"])
-            writer.writerow([values[column] if isinstance(column, str) else column["literal"]
-                             for column in self.data["columns"]])
-            if output.tell() > MAX_BYTES:
-                raise ValueError("native CSV exceeds storage size limit")
-        return output.getvalue().encode("utf-8")
-
-
 class TrajectoryStore:
-    def __init__(self, directory, controller_directory="", profile_path="", *, require_network_mount=True):
+    def __init__(self, directory):
         self.root = Path(directory).expanduser().resolve()
-        self.controller_root = Path(controller_directory).expanduser().resolve() if controller_directory else None
-        self.profile_path = profile_path
-        self.require_network_mount = require_network_mount
         self._lock = threading.RLock()
         # Lazy directory creation: simply discovering cards has no disk effects.
         self._recovered = False
@@ -209,7 +144,7 @@ class TrajectoryStore:
             record = {"trajectory_id": identifier, "name": name.strip(), "version": 1,
                       "controller_ip": address, "robot_type": 113, "state": "recording",
                       "created_at_ms": int(time.time() * 1000), "sample_ms": SAMPLE_MS,
-                      "point_count": 0, "duration_s": 0, "native_state": "format_required"}
+                      "point_count": 0, "duration_s": 0}
             atomic_json(directory / "manifest.json", record)
             return record
 
@@ -253,8 +188,7 @@ class TrajectoryStore:
 
     @staticmethod
     def summary(record):
-        keys = ("trajectory_id", "name", "state", "end_reason", "sample_ms", "duration_s", "point_count",
-                "native_state", "native_reason", "controller_file", "reason")
+        keys = ("trajectory_id", "name", "state", "end_reason", "sample_ms", "duration_s", "point_count", "reason")
         return {key: record[key] for key in keys if key in record}
 
     def delete(self, identifier):
@@ -263,69 +197,21 @@ class TrajectoryStore:
             raise RuntimeError("stop recording before deleting it")
         with self._lock:
             directory = self._directory(identifier)
-            # Only delete our own local artifacts. A controller copy is not ours
-            # to remove while another controller program may reference it.
-            for name in ("raw.jsonl", "samples.json", "manifest.json", "native.csv"):
-                path = directory / name
-                if path.is_symlink():
-                    raise ValueError("trajectory files may not be symlinks")
-            for name in ("raw.jsonl", "samples.json", "manifest.json", "native.csv"):
+            # native.csv: left by earlier versions that exported controller CSV files.
+            names = ("raw.jsonl", "samples.json", "manifest.json", "native.csv")
+            if any((directory / name).is_symlink() for name in names):
+                raise ValueError("trajectory files may not be symlinks")
+            for name in names:
                 (directory / name).unlink(missing_ok=True)
             directory.rmdir()
-        return {"trajectory_id": identifier, "state": "deleted", "controller_copy_deleted": False}
-
-    def export(self, identifier):
-        """Publish via an already mounted controller trajectory share.
-
-        No SSH credentials, implicit mount, guessed HTTP route or new SMB
-        dependency. The deployment maps the operator's mounted share into us.
-        """
-        data = self.samples(identifier)
-        record = self.load(identifier)
-        if not self.profile_path:
-            record.update(native_state="format_required")
-            self.save(record)
-            return record
-        profile = NativeCsvProfile(self.profile_path)
-        native = profile.encode(data)
-        local = self._directory(identifier) / "native.csv"
-        with local.open("wb") as file:
-            file.write(native)
-            file.flush()
-            os.fsync(file.fileno())
-        if self.controller_root is None or not self.controller_root.is_dir():
-            record.update(native_state="transfer_required")
-            self.save(record)
-            return record
-        writable_controller_directory(self.controller_root, require_network_mount=self.require_network_mount)
-        filename = trajectory_filename(f"teach_{identifier}.csv")
-        destination = self.controller_root / filename
-        digest = hashlib.sha256(native).hexdigest()
-        if destination.exists() or destination.is_symlink():
-            if destination.is_symlink() or destination.stat().st_size > MAX_BYTES or destination.read_bytes() != native:
-                raise RuntimeError("refusing to overwrite a different controller trajectory")
-        else:
-            # O_EXCL: do not overwrite another creator. A failed upload is never
-            # reported ready, nor automatically replayed as a motion command.
-            with destination.open("xb") as file:
-                file.write(native)
-                file.flush()
-                os.fsync(file.fileno())
-        if hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
-            raise RuntimeError("controller trajectory readback checksum mismatch")
-        record.update(native_state="exported", controller_file=filename, native_sha256=digest,
-                      native_format_id=profile.data["format_id"], profile_sha256=profile.digest)
-        self.save(record)
-        return record
+        return {"trajectory_id": identifier, "state": "deleted"}
 
     def playback(self, identifier, address):
+        """Verified local samples for joint-space ServoJ playback on this controller."""
         data = self.samples(identifier)
         record = self.load(identifier)
         if record["controller_ip"] != address:
             raise RuntimeError("trajectory belongs to a different controller")
-        record = self.export(identifier)
-        if record["native_state"] != "exported":
-            raise RuntimeError(f"native playback unavailable: {record['native_state']}")
         return record, data
 
 
@@ -503,13 +389,6 @@ class TrajectoryRecorder:
                                    duration_s=(len(self._points) - 1) * SAMPLE_MS / 1000 if self._points else 0,
                                    samples_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
                 self.store.save(self.record)
-                if reason is None:
-                    # Native CSV is independent: a local take stays recorded even if export fails.
-                    try:
-                        self.record = self.store.export(self.record["trajectory_id"])
-                    except Exception as exc:
-                        self.record.update(native_state="export_failed", native_reason=str(exc))
-                        self.store.save(self.record)
             except Exception as exc:
                 self.record.update(state="incomplete", end_reason="interrupted",
                                    reason=f"recording persistence failed: {exc}")
