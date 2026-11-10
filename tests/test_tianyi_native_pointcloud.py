@@ -67,7 +67,11 @@ def test_invalid_pointcloud_layout_is_rejected(field, value):
 
 def test_no_zero_timestamp_missing_frame_or_oversize_payload():
     with pytest.raises(ValueError, match='time or empty frame'):
-        module.native_cloud_evidence(cloud(stamp=0, frame=''))
+        zero = cloud(stamp=0)
+        zero.header.stamp.nanosec = 0
+        module.native_cloud_evidence(zero)
+    with pytest.raises(ValueError, match='time or empty frame'):
+        module.native_cloud_evidence(cloud(frame=''))
     with pytest.raises(ValueError, match='bounded transport'):
         module.native_cloud_evidence(cloud(), max_bytes=10)
     with pytest.raises(ValueError, match='XYZ'):
