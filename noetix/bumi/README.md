@@ -527,3 +527,53 @@ running.
 
 The output contract, quality states, verified default mount, validation status,
 and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
+
+## Experimental fused leg/IMU/RGB-D odometry (`fused_odometry`)
+
+This is an **opt-in, read-only planar (x/y/yaw) sensor**, disabled by default.
+It does not replace the existing `rgbd_visual_odometry` card or send locomotion
+commands. Enable **both** `plugins.visual_odometry.enabled: true` and
+`plugins.fused_odometry.enabled: true` in `config.yaml`, then deploy the Bumi
+driver image. A live HighController connection is required.
+
+* 40 Hz SDK joint and body-IMU reads drive the existing stance-foot kinematic
+  estimator (with cautious, direction-dependent slip scales). This estimator
+  has no vendor hardware timestamps and is not intrinsically slip-free.
+* A fixed-lag planar EKF consumes the unmodified
+  `/<namespace>/bumi_visual_odometry/state/odom` payload. Only fresh, valid,
+  body-frame RTAB-Map poses with enough inliers can correct it. The filter
+  applies corrections at their capture times and replays buffered leg steps.
+* RTAB-Map segment resets re-anchor the new visual segment to the **current
+  fused frame** so the externally visible odometry frame does not jump.
+* A visual-versus-leg residual is exposed as `slip_residual_m` and
+  `slip_suspected`; a suspected slip increases process noise. Slip
+  scale adaptation is slow and only attempted for high-inlier, near-axis
+  motion. This is a heuristic, not a calibrated foot-contact detector.
+* During white-wall/turning visual loss, estimated pose continues from
+  leg kinematics and IMU yaw, but status becomes **degraded** and covariance
+  increases. Without a fresh SDK sample, pose becomes null and status is
+  **lost**. Stopped means stopped, with no stale pose reuse.
+* The card does **not** implement depth ICP, independently observe motion
+  along a textureless wall, or provide 6-DoF inertial estimation. It does not
+  advertise `motus_slam/1` as a validated mapping odometry source.
+
+Outputs:
+
+| Topic | Format | Rate |
+| --- | --- | --- |
+| `/<namespace>/bumi_fused_odometry/status` | `data/json` | Up to 5 Hz; changes immediately |
+| `/<namespace>/bumi_fused_odometry/state/odom` | `state/odom` / `motus.odom/1` | 20 Hz |
+
+The odometry's `pose` is planar and explicitly marks
+`vendor.accuracy_validated=false`, `planar_only=true` and
+`drift=unbounded`; z/roll/pitch uncertainty is deliberately high.
+Do **not** feed it straight into production SLAM or autonomous motion until
+body mounting, SDK timing, slip, drift and dropout behavior are validated on
+the actual Bumi.
+
+Suggested on-robot verification: record straight forward/backward/lateral
+motion, corner turns, a flat white wall, a floor where the feet visibly slip,
+and stop/start of the visual card. Compare the fused and raw VO/leg positions
+against measured ground truth, verify topic QoS and latency, and inspect
+`slip_residual_m`, `visual_age_s` and covariance. Do not enable
+automatic motion control as part of this experiment.
