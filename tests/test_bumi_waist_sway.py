@@ -78,14 +78,19 @@ class FakeLowController:
 
     `waist_pos=None` makes the measured waist follow the last commanded value
     (a perfectly tracking robot); a float pins it (a robot ignoring commands).
+    `state_mode` breaks get_joint_state ("raise" / "empty"), and
+    `duplicate_index` makes two joint names resolve to one hardware index.
     """
 
     _the = None
 
-    def __init__(self, *, init_error=None, waist_pos=None):
+    def __init__(self, *, init_error=None, waist_pos=None,
+                 state_mode="ok", duplicate_index=False):
         self.cmds = []
         self.init_error = init_error
         self.waist_pos = waist_pos
+        self.state_mode = state_mode
+        self.duplicate_index = duplicate_index
         FakeLowController._the = self
 
     @classmethod
@@ -98,6 +103,8 @@ class FakeLowController:
         return True
 
     def getJointsIndex(self, name):
+        if self.duplicate_index and name == "leg_l2_joint":
+            return 0   # same hardware index as leg_l1_joint
         if name == "waist_1_joint":
             return 20
         try:
@@ -110,15 +117,18 @@ class FakeLowController:
         self.cmds.append(list(cmds))
 
     def get_joint_state(self):
+        if self.state_mode == "raise":
+            raise RuntimeError("joint-state read failed")
         waist = self.waist_pos
         if waist is None:
             waist = self.cmds[-1][20].pos if self.cmds else 0.0
-        return [
+        states = [
             types.SimpleNamespace(
                 pos=(waist if i == 20 else 0.0), vel=0.0, tau=0.0,
                 motor_id=i, error=0, temperature=25)
             for i in range(21)
         ]
+        return states[:3] if self.state_mode == "empty" else states
 
 
 class FakeHighCtrl:
@@ -170,6 +180,7 @@ def _wait(predicate, timeout=2.5):
 
 
 def _start(card, **params):
+    params.setdefault("confirm", True)
     return card.dispatch("start", params)
 
 
@@ -230,6 +241,43 @@ def test_start_parameter_validation(make_card):
     assert _start(card, duration_s=-1.0)["state"] == "error"
     assert _start(card, duration_s="soon")["state"] == "error"
     assert _start(card, amplitude_deg=True)["state"] == "error"
+    assert low.cmds == []
+
+
+def test_start_requires_confirmation(make_card):
+    card, low, _high, _loco = make_card()
+    refused = _start(card, confirm=False, amplitude_deg=20.0)
+    assert refused["state"] == "error"
+    assert "confirm" in refused["error"]
+    missing = card.dispatch("start", {"amplitude_deg": 20.0})
+    assert missing["state"] == "error"
+    assert low.cmds == []
+    assert _start(card)["state"] == "streaming"   # confirm=true engages
+
+
+# ── fail-closed engagement (review issues) ───────────────────────────────────
+
+@pytest.mark.parametrize("state_mode", ["raise", "empty"])
+def test_bad_initial_joint_state_refuses_to_stream(make_card, state_mode):
+    # A failed/short initial read must never be turned into a commanded pose:
+    # zeros are the vendor's lie pose and would fold a standing robot.
+    low = FakeLowController(state_mode=state_mode)
+    card, low, _high, _loco = make_card(low=low)
+    assert _start(card)["state"] == "streaming"   # the failure surfaces in the thread
+    assert _wait(lambda: card._info()["state"] == "error")
+    info = card._info()
+    assert "initial state" in info["last_error"]
+    assert low.cmds == [], "no joint command may be sent without a valid read"
+
+
+def test_duplicate_hardware_index_mapping_refuses(make_card):
+    low = FakeLowController(duplicate_index=True)
+    card, low, _high, _loco = make_card(low=low)
+    assert _start(card)["state"] == "streaming"
+    assert _wait(lambda: card._info()["state"] == "error")
+    info = card._info()
+    assert "unmapped" in info["last_error"] or "ambiguous" in info["last_error"] \
+        or "mapping" in info["last_error"]
     assert low.cmds == []
 
 

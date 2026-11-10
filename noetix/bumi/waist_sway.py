@@ -195,8 +195,8 @@ class WaistSwayPlugin:
                 "实现走 SDK 低层 set_joint（高层无腰部通道，行走与上身动画在固件互斥），"
                 "以官方示例站立角表做全 21 关节位置保持。注意：固件对高层行走与低层关节"
                 "流并存的仲裁未知——若低层被忽略则行走正常、腰部停转；若低层生效则机器"
-                "人保持站立、底盘命令可能失效。首次真机请小幅度、慢档、有人看护并确保 "
-                "App 急停可用。"
+                "人保持站立、底盘命令可能失效。调用 start 需 confirm=true 确认；首次"
+                "真机请小幅度、慢档、有人看护并确保 App 急停可用。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -223,13 +223,19 @@ class WaistSwayPlugin:
                         "description": "转身快慢两档：slow=慢（约 8 秒一个来回，默认），"
                                        "medium=中（约 4 秒一个来回）",
                     },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "start 必须传 true：确认机器人已站立、摆动范围内"
+                                       "无人、有人看护且 App 急停可用",
+                    },
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "start": {
-                        "params": ["duration_s", "amplitude_deg", "speed"],
-                        "description": "按参数开始摆动；再次调用会先收尾当前摆动再按新参数"
-                                       "重启。要求机器人处于行走模式站立（workmode=2）",
+                        "params": ["duration_s", "amplitude_deg", "speed", "confirm"],
+                        "description": "按参数开始摆动（需 confirm=true）；再次调用会先"
+                                       "收尾当前摆动再按新参数重启。要求机器人处于行走"
+                                       "模式站立（workmode=2）",
                     },
                     "stop": {"params": [], "description": "幅度归零后停止并释放腰部"},
                     "info": {"params": [], "description": "状态、剩余时间、腰跟踪自检、"
@@ -285,6 +291,13 @@ class WaistSwayPlugin:
         return None
 
     def _start_action(self, args: dict) -> dict:
+        # A 21-joint low-level stream is a dangerous action: it must not be
+        # startable by an action name alone (review issue; same gate shape as
+        # loco_servo's confirm for clearing dry_run).
+        if args.get("confirm") is not True:
+            return {"state": "error", "command_sent": False,
+                    "error": "开启腰部摆动需要确认：机器人站立、摆动范围内无人、"
+                             "有人看护且 App 急停可用时传 confirm=true"}
         raw_duration = args.get("duration_s", 0)
         try:
             duration_s = float(raw_duration)
@@ -543,7 +556,14 @@ class WaistSwayPlugin:
             return
         tick_s = 1.0 / _RATE_HZ
         start = time.perf_counter()
-        measured = self._read_positions(low) or [0.0] * 21
+        measured = self._read_positions(low)
+        if len(measured) != 21 or not all(math.isfinite(v) for v in measured):
+            # Zero is the vendor's *lie* pose: a missing or malformed
+            # measurement must not be synthesised into a commanded pose —
+            # during the blend-in that would fold a standing robot. Refuse.
+            self._on_stream_error(
+                "cannot read a valid 21-joint initial state; refusing to engage")
+            return
         start_pose = list(measured)
         tracking_bad_since: float | None = None
         try:
@@ -567,7 +587,7 @@ class WaistSwayPlugin:
                 waist_cmd = max(-_WAIST_LIMIT_RAD, min(_WAIST_LIMIT_RAD, waist_cmd))
 
                 fresh = self._read_positions(low)
-                if fresh is not None:
+                if len(fresh) == 21 and all(math.isfinite(v) for v in fresh):
                     measured = fresh
 
                 cmds = []
@@ -668,8 +688,15 @@ class WaistSwayPlugin:
         """
         try:
             table = [None] * 21
+            seen: set[int] = set()
             for name, angle in zip(_SDK_JOINT_NAMES, _STAND_ANGLES):
                 idx = int(low.getJointsIndex(name))
+                if idx in seen:
+                    print(f"[waist_sway] getJointsIndex maps multiple joint names "
+                          f"to hardware index {idx}; refusing an ambiguous table",
+                          flush=True)
+                    return None, -1
+                seen.add(idx)
                 if 0 <= idx < 21:
                     table[idx] = angle
             if any(value is None for value in table):
@@ -688,12 +715,13 @@ class WaistSwayPlugin:
             return None, -1
 
     @staticmethod
-    def _read_positions(low) -> list[float] | None:
+    def _read_positions(low) -> list:
+        """The 21 joint positions, or an empty list when the read fails."""
         try:
             state = low.get_joint_state()
             return [float(joint.pos) for joint in state]
         except Exception:                                     # noqa: BLE001
-            return None
+            return []
 
     def _read_mode(self) -> int | None:
         try:

@@ -374,16 +374,20 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 `start` 时给出——`duration_s`（来回转身持续时间，秒，0=持续到 stop，到时自动
 收尾）、`amplitude_deg`（转身幅度，单侧 5–60 度，默认 20，首周期从 0 渐入）、
 `speed`（快慢两档：slow=慢，约 8 秒一个来回；medium=中，约 4 秒一个来回）。
-运行期间站立静止时摆动，`loco` / `loco_relative_move` / `loco_servo` 行走期间
-继续发送；`semantic_action`、`action_recording`、`stand_up_lie_prone` 或保护/
-摔倒等占用腰部的动作一旦出现，自动停止并释放腰部（`info` 的 `preempted_by`
-记录原因）。再次 `start` 会先收尾当前摆动再按新参数重启。
+**`start` 必须带 `confirm=true`**（危险动作确认：机器人站立、范围内无人、有人
+看护、App 急停就绪）。运行期间站立静止时摆动，`loco` / `loco_relative_move` /
+`loco_servo` 行走期间继续发送；`semantic_action`、`action_recording`、
+`stand_up_lie_prone` 或保护/摔倒等占用腰部的动作一旦出现，自动停止并释放腰部
+（`info` 的 `preempted_by` 记录原因）。再次 `start` 会先收尾当前摆动再按新参数
+重启。
 
 为什么必须是低层：高层 `publish_cmd` 没有腰部通道，行走与上身动画在固件里是互斥
 的 workmode；唯一执行面是 `LowController.set_joint`（21 关节全量）。实现复用官方
 `example_policy_walk.cpp` 的站立保持（固定角表 + kp=10/kd=0.5，500 Hz），在腰关节
 上叠加慢正弦，接手时从实测姿态 1 s 混入。映射通过 `getJointsIndex` 解析，腰应为
-电机 20；解析失败拒绝发流（零角表是官方的*躺平*姿态，会把站立机器人折倒）。
+电机 20；解析失败或两个关节名映射到同一硬件索引时拒绝发流，启动时读不到完整
+21 关节有效位姿也拒绝发流（零角表是官方的*躺平*姿态，会把站立机器人折倒，
+任何"缺测"都不得合成指令位姿）。
 
 **三个固件未知数**（控制器闭源，任何示例都没有混用过高低两层）：
 
