@@ -10,6 +10,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 from types import ModuleType, SimpleNamespace
@@ -37,6 +38,10 @@ DRIVER = ROOT / "deep_robotics" / "s10_pro"
 
 def _load_device(monkeypatch):
     monkeypatch.syspath_prepend(str(DRIVER))
+    # The camera cards read their saved undistort switch from the host data
+    # directory; a robot or dev box that has one must not change these results.
+    monkeypatch.setenv("S10_CAMERA_UNDISTORT_CONFIG",
+                       str(Path(tempfile.mkdtemp()) / "camera_undistort.json"))
     spec = importlib.util.spec_from_file_location("s10_pro_device_for_test", DRIVER / "device.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -150,14 +155,11 @@ def test_s10_camera_info_exposes_vendor_body_mount_positions(monkeypatch):
         assert info["vendor"]["mounting"]["source"] == "vendor-spec"
         assert info["vendor"]["mounting"]["intrinsics_range"]["fx"] == [579.0, 639.0]
         assert info["vendor"]["mounting"]["intrinsics_range"]["cx"] == [750.0, 850.0]
-        assert info["K"] is None and info["D"] is None
-        if camera == "camera_front":
-            assert info["source"] == "manual"
-            assert info["half_fov_rad"] == 0.423
-            assert info["vendor"]["mounting"]["fov_estimate"]["depth_semantics"] == "ray_range"
-        else:
-            assert info["source"] == "unknown"
-            assert info["half_fov_rad"] is None
+        assert info["distortion_model"] == "pinhole"
+        assert info["K"][0] > 300 and info["D"] == [0.] * 5
+        assert info["source"] == "measured"
+        assert "deeprobotics/s10_pro/undistort" in info["pipeline"]
+        assert info["vendor"]["undistortion"]["state"] == "rectified"
 def test_actuator_start_surfaces_tls_reboot_requirement_to_frontend(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
@@ -340,6 +342,8 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
             pass
         def add_rtsp_camera(self, lane, url):
             self.rtsp_sources[lane] = url
+        def restart_rtsp_camera(self, lane):
+            pass
         def submit(self, lane, job):
             header, fields, bigendian, width, height, row_step, point_step, data = job
             packet = device.encode_pointcloud(fields, bigendian, width, height,
