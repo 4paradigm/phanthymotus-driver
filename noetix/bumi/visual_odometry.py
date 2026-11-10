@@ -396,8 +396,7 @@ class VisualOdometryNode:
             'pose_reference': self.pose_reference(),
         }, parent_frame=self.base_frame(), child_frame=self.frame_id)
 
-    def _sample(self):
-        """Return the current VO state without changing ROS output or status."""
+    def publish(self):
         sample = make_sample(self.health, self.now(), self.estimate, self.pose_reference())
         quality = sample['vendor']
         slam = quality['motus_slam']
@@ -419,10 +418,6 @@ class VisualOdometryNode:
             sample['pose'] = None
         quality.update(turn_angle_deg=self.turn_angle_deg,
                        displacement_m=self._segment_displacement(sample))
-        return sample
-
-    def publish(self):
-        sample = self._sample()
         self.publisher.publish(self.String(data=json.dumps(sample, allow_nan=False)))
         self.publish_status(sample)
         return sample
@@ -471,9 +466,7 @@ class VisualOdometryNode:
 
     def info(self):
         from common.odom import build_interface
-        # Read-only queries (including SLAM preflight) cannot cause an extra
-        # odometry or status publish in the middle of a live frame sequence.
-        sample = self._sample()
+        sample = self.publish()
         return dict(state='running' if self.active else 'idle',
                     topic_out=[{'topic': self.status_topic, 'format': 'data/json',
                                 'message_type': 'std_msgs/msg/String'},
