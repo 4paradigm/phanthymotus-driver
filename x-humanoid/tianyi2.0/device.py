@@ -1905,23 +1905,71 @@ class PointCloudPlugin:
     _format = "sensor/pointcloud"
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/points"; self._last = 0.0; self._intrinsics = None
+        # A separate native topic keeps the original Orbbec frame and bytes.
+        # The display output continues to use gravity leveling and floor shift.
+        self._native_topic = f"/{namespace}/camera/head/points_native"
+        self._native_metadata_topic = self._native_topic + "/metadata"
+        self._native_last = 0.0
+        self._native_hz = max(0.2, min(float(plugin_config.get("native_hz", 2.0)), 5.0))
+        self._native_max_bytes = max(1024, min(int(plugin_config.get("native_max_bytes", 12_000_000)), 20_000_000))
+        self._native_generation = uuid4().hex
+        self._native_evidence = None
+        self._native_error = None
+        self._native_forwarded = 0
+        self._native_pub = self._native_metadata_pub = None
+        self._subscriptions_registered = False
         self._floor_offset_m = max(-3.0, min(float(plugin_config.get("floor_offset_m", 1.50)), 3.0))
         self._gravity_world = None; self._gravity_lock = threading.Lock()
         self._sub_node = Node("tianyi2_points_sub", context=ros2.ctx_tianyi); self._pub_node = Node("tianyi2_points_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
+    def _outputs(self):
+        return [{"topic": self._topic, "format": self._format},
+                {"topic": self._native_topic, "format": "sensor/pointcloud2"}]
+
+    def _native_info(self):
+        from slam_pointcloud import input_declaration
+        return {
+            "topic_out": self._outputs(),
+            "input_metadata": [input_declaration(
+                self._native_topic, self._native_metadata_topic, self._native_evidence)],
+            "native_status": {
+                "frames_forwarded": self._native_forwarded,
+                "source_header": self._native_evidence,
+                "error": self._native_error,
+                "clock_verified": False,
+                "extrinsic_verified": False,
+                "note": "Orbbec header clock semantics and dynamic head mount are unverified",
+            },
+        }
+
     def get_tool(self):
-        return {"name": "camera_pointcloud", "type": "sensor", "description": "天轶2.0 Orbbec 头部彩色点云（限频、限点）", "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": self._format}]}
+        return {"name": "camera_pointcloud", "type": "sensor",
+                "description": "天轶2.0 Orbbec display cloud and bounded raw PointCloud2 (unverified for SLAM)",
+                "inputSchema": {"type": "object", "properties": {}}, **self._native_info()}
+
     def start(self):
         from sensor_msgs.msg import PointCloud2, Image, CameraInfo, Imu
         from std_msgs.msg import UInt8MultiArray
-        self._running = True; self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
+        self._running = True
+        if self._subscriptions_registered:
+            return
+        latest = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                            history=HistoryPolicy.KEEP_LAST, depth=1,
+                            durability=DurabilityPolicy.VOLATILE)
+        self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
+        self._native_pub = self._pub_node.create_publisher(PointCloud2, self._native_topic, latest)
+        self._native_metadata_pub = self._pub_node.create_publisher(String, self._native_metadata_topic, latest)
         self._sub_node.create_subscription(PointCloud2, "/ob_camera_head/depth/points", self._on_cloud, _LOW_LAT_QOS)
         # Gemini 336 currently has its depth image enabled even when the vendor
-        # point-cloud stream is disabled.  This fallback keeps the card live.
+        # point-cloud stream is disabled. The display fallback remains unchanged;
+        # it is NOT silently promoted to the native PointCloud2 output.
         self._sub_node.create_subscription(CameraInfo, "/ob_camera_head/depth/camera_info", self._on_info, _RELIABLE_QOS)
         self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_depth, _LOW_LAT_QOS)
         self._sub_node.create_subscription(Imu, "/ob_camera_head/accel/sample", self._on_accel, _LOW_LAT_QOS)
-    def stop(self): self._running = False
+        self._subscriptions_registered = True
+
+    def stop(self):
+        self._running = False
     def _on_accel(self, msg):
         """Estimate display-frame up from the camera's stationary IMU vector."""
         # Optical raw coordinates are (right, down, forward); the renderer's
@@ -1969,8 +2017,36 @@ class PointCloudPlugin:
         wy += floor_offset_m
         # Invert the renderer map above to pack the leveled world point.
         return -wz, wx, -wy
+    def _forward_native(self, msg):
+        """Cross Domain 0 -> 42 while preserving the original PointCloud2.
+
+        Both topics use bounded BEST_EFFORT queues. Any missed sidecar is
+        discarded by the strict consumer, not paired with another frame.
+        """
+        if time.monotonic() - self._native_last < 1.0 / self._native_hz:
+            return
+        from slam_pointcloud import native_cloud_evidence, frame_declaration
+        try:
+            evidence = native_cloud_evidence(msg, max_bytes=self._native_max_bytes)
+            # The original msg carries the vendor's frame/fields/stamp/data.
+            # Neither display transform nor receive-time restamp is applied.
+            self._native_pub.publish(msg)
+            sidecar = String(data=json.dumps(
+                frame_declaration(evidence, self._native_generation),
+                allow_nan=False))
+            self._native_metadata_pub.publish(sidecar)
+        except (ValueError, TypeError, AttributeError, OverflowError, RuntimeError) as error:
+            self._native_error = str(error)
+            return
+        self._native_last = time.monotonic()
+        self._native_forwarded += 1
+        self._native_evidence = evidence
+        self._native_error = None
+
     def _on_cloud(self, msg):
-        if not self._running or time.monotonic() - self._last < 0.5: return
+        if not self._running: return
+        self._forward_native(msg)
+        if time.monotonic() - self._last < 0.5: return
         fields = {f.name: f.offset for f in msg.fields}
         if not all(k in fields for k in ("x", "y", "z")): return
         self._last = time.monotonic(); raw = bytes(msg.data); count = min(msg.width * msg.height, 10000); gravity = self._gravity_snapshot()
@@ -2003,7 +2079,12 @@ class PointCloudPlugin:
         if not count: return
         from std_msgs.msg import UInt8MultiArray
         out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)
-    def dispatch(self, action, args): return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": self._format}]}
+    def dispatch(self, action, args):
+        if action == 'info':
+            return {'state': 'running' if self._running else 'idle',
+                    **self._native_info()}
+        return {'state': 'running' if self._running else 'idle',
+                'topic_out': self._outputs()}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
