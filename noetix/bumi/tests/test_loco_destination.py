@@ -807,6 +807,79 @@ def test_concurrent_move_is_refused_while_rotate_runs(monkeypatch):
     assert fake.cmds[-1] == (0, 0, 0)                # 退出必零速
 
 
+class RecordingSway:
+    """记录型 waist_sway 桩：只记 notify 调用，验证 loco.move 的标签生命周期。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def notify_chassis_active(self, label):
+        self.calls.append(("active", label))
+
+    def notify_chassis_idle(self, label):
+        self.calls.append(("idle", label))
+
+    def disable_for_body_action(self, label):
+        self.calls.append(("disable", label))
+        return None
+
+
+def test_move_worker_clears_sway_chassis_label_on_natural_end(monkeypatch):
+    # bot review 缺口：loco.move 定时自然结束（无人再发 stop_move）时，worker
+    # 的 finally 必须清 sway 的 chassis-active 标签——否则一次 move 之后
+    # waist_sway 的空闲腰跟踪自检被永久抑制，不跟的腰流不再 fail-closed。
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl()
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    sway = RecordingSway()
+    plugin.attach_sway(sway)
+    move = plugin.dispatch('move', {'_tool_name': 'loco', 'vx': 0.2, 'duration': 0.1})
+    assert move['state'] == 'moving'
+    assert sway.calls == [("active", "loco.move")]   # 接受后才标记
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and plugin._move_thread.is_alive():
+        time.sleep(0.01)
+    assert not plugin._move_thread.is_alive()        # 定时到点自然退出
+    assert sway.calls[-1] == ("idle", "loco.move")   # finally 清标签
+    assert fake.cmds[-1] == (0, 0, 0)                # 退出必零速
+
+
+def test_refused_move_never_marks_sway_chassis(monkeypatch):
+    # 被拒的 move（模式不对）不得标记 chassis-active：拒绝路径没有 worker，
+    # 标了就没人清（原实现在 dispatch 里先标后拒，正是泄漏路径）。
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(mode=1)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    sway = RecordingSway()
+    plugin.attach_sway(sway)
+    refused = plugin.dispatch('move', {'_tool_name': 'loco', 'vx': 0.2, 'duration': 3})
+    assert refused['state'] == 'error'
+    assert sway.calls == []                          # 未标记，无需清理
+
+
+def test_replacement_move_keeps_sway_chassis_label(monkeypatch):
+    # 换发 move：旧 worker 的 straggler finally 不得清掉新 move 的标签——
+    # join 超时后新线程先接管、旧 finally 后到时，所有权判断必须拦下。
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl()
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    sway = RecordingSway()
+    plugin.attach_sway(sway)
+    first = plugin.dispatch('move', {'_tool_name': 'loco', 'vx': 0.2, 'duration': 3})
+    assert first['state'] == 'moving'
+    time.sleep(0.03)
+    second = plugin.dispatch('move', {'_tool_name': 'loco', 'vx': -0.2, 'duration': 3})
+    assert second['state'] == 'moving'
+    assert sway.calls.count(("active", "loco.move")) == 2
+    time.sleep(0.1)                                  # 新 move 运行中，标签必须保持
+    assert sway.calls[-1] == ("active", "loco.move")
+    plugin.dispatch('stop_move', {'_tool_name': 'loco'})
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and plugin._move_thread.is_alive():
+        time.sleep(0.01)
+    assert ("idle", "loco.stop_move") in sway.calls  # stop_move 路径清理
+
+
 def test_concurrent_rotate_is_refused_while_rotate_runs(monkeypatch):
     # busy-guard（T4-3）：rotate 运行中重入第二个 rotate 必须被拒绝——否则第二个
     # 前导的 clear() 会擦掉第一个 rotate 待读的 stop 信号（显式 stop 被静默吞掉）。

@@ -479,22 +479,32 @@ class LocoPlugin:
         Body tools (posture, presets, teaching) change `workmode` and need the
         waist itself: the sway card releases and switches itself off, the same
         "an explicit instruction outranks a background stream" rule the servo
-        preemption follows. Chassis tools keep walking; `loco.move` only marks
-        the chassis active — the sway keeps streaming (its own documented
-        experiment). Returns the sway card's preemption report for body tools
-        (None when no sway was active, and always None for chassis tools), so
-        the caller can say so in its own result — including a release that
-        did not actually finish.
+        preemption follows. Chassis tools keep walking — the sway keeps
+        streaming (its own documented experiment). `loco.move`'s chassis-active
+        marking lives in `_do_move_impl`, stamped only once the move is
+        actually accepted: a refused move never moves, and a label it stamped
+        would have no worker to clear it. Returns the sway card's preemption
+        report for body tools (None when no sway was active, and always None
+        for chassis tools), so the caller can say so in its own result —
+        including a release that did not actually finish.
         """
         if self._sway is None:
             return None
         if tool_name in ("stand_up_lie_prone", "semantic_action", "action_recording"):
             return self._sway.disable_for_body_action(f"{tool_name}.{action}")
-        if (tool_name, action) == ("loco", "move"):
-            self._sway.notify_chassis_active(f"{tool_name}.{action}")
-        elif action in ("stop_move", "stop"):
+        if action in ("stop_move", "stop"):
             self._sway.notify_chassis_idle(f"{tool_name}.{action}")
         return None
+
+    def _release_sway_chassis_label(self) -> None:
+        """A loco.move worker ended; the sway's idle tracking self-check may
+        resume. Ownership matches the activation: only the thread that is
+        still THE move thread clears the label, so a straggler finally (the
+        replacement's join timed out, its zero publish ran late) cannot clear
+        a label the newer loco.move already owns."""
+        sway = self._sway
+        if sway is not None and self._move_thread is threading.current_thread():
+            sway.notify_chassis_idle("loco.move")
 
     def prepare_walk_mode(self, requester: str) -> dict:
         """Reach workmode 2 through the documented mode edges, for a sibling card.
@@ -867,6 +877,13 @@ class LocoPlugin:
         # The servo keeps refreshing zero until this point.  From here until
         # this move's final zero, this loop is the sole velocity publisher.
         self._set_servo_velocity_owner(True)
+        # Chassis-active for the sway card is stamped here — past the mode
+        # checks and busy guards, right before the worker starts — and the
+        # worker's finally clears it (natural end, watchdog, failure, or
+        # replacement). A refused move never stamps, so no path can leak the
+        # label and permanently suppress the sway's idle tracking self-check.
+        if self._sway is not None:
+            self._sway.notify_chassis_active("loco.move")
 
         if duration > 0:
             # Timed move
@@ -883,6 +900,7 @@ class LocoPlugin:
                         self._publish_cmd(0, 0, 0, default_cmd, 0)
                     finally:
                         self._set_servo_velocity_owner(False)
+                        self._release_sway_chassis_label()
 
             self._move_thread = threading.Thread(target=_move_timed, daemon=True, name="bumi_move")
             self._move_thread.start()
