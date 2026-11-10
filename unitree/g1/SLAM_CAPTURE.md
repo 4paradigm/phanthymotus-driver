@@ -62,6 +62,66 @@ The canonical contract is `common/spatial_slam.py`. Its source must stay
 cross-repository test, set `PERCEPTION_REFERENCE_ROOT` to the local
 `phanthymotus` checkout at the tested PR #371 SHA before running pytest.
 
+## G1 RealSense runtime intrinsics (RGB and unaligned depth)
+
+The G1 driver runs a single isolated RealSense pipeline, with **unaligned**
+Z16 depth (640x480) and independent RGB (1920x1080). After successful
+`pipeline.start()`, it reads both *negotiated* video stream profiles'
+`get_intrinsics()` in that child process, sends a small profile dictionary
+over a one-way multiprocessing Pipe, validates it in the parent and returns
+the same depth-camera `motus.camera/1` declaration via
+`camera_depth` tool metadata and `camera_depth.info().camera_info`.
+`camera_rgb.info().camera_info` receives its **own** RGB profile rather than
+reusing the depth K. No new DDS topic, camera process or image encoding is
+introduced. The existing camera stream and capture endpoints are unchanged.
+
+The G1 depth declaration uses `id=unitree/g1/realsense/depth`,
+`format=image/depth-zlib`, and the actual `K` row-major 3x3
+`[fx,0,cx, 0,fy,cy, 0,0,1]` with `D` and its RealSense distortion
+model. Only all-zero distortion is called a rectified `pinhole` stream;
+nonzero distortion remains explicitly unrectified until a rectification
+pipeline is implemented. Actual negotiated dimensions must match the
+published depth image. When RealSense hasn't started, calibration is
+unavailable or mismatched, `K: null, source: unknown`; no datasheet
+fallback is substituted.
+
+**A real camera K is not enough to admit SLAM:** the current G1 depth
+frame `header.stamp` is assigned in the ROS callback, not independently
+validated hardware exposure time. The calibration declaration therefore
+sets `vendor.timestamp_semantics=ros_callback_receipt_unverified` and
+`timestamp_clock_relation_verified=false`. Do not claim
+`source_capture_mapped`, change these flags to bypass Perception or use
+camera callback timestamps to declare verified mapping. The regular
+`pointcloud` card can use the measured K for more accurate visualization;
+`metric_cloud=true` and `pointcloud_slam` still require authenticated
+capture-time provenance, verified odometry timing, corresponding camera
+extrinsics and true tracking status. The existing source guard remains on.
+
+Read-only checks in the running G1 driver container:
+
+```bash
+python3 - <<'PY'
+import json, urllib.request
+for name in ("camera_depth", "camera_rgb"):
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": name, "arguments": {"action": "info"}}
+    }).encode()
+    req = urllib.request.Request(
+        "http://127.0.0.1:15701/mcp", body,
+        {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as response:
+        rpc = json.load(response)
+    info = json.loads(rpc["result"]["content"][0]["text"])
+    print(name, json.dumps(info.get("camera_info"), indent=2))
+PY
+```
+
+If `camera_info[0].K` remains null, inspect the RealSense process and
+`docker logs embodied-unitree-g1` for "negotiated intrinsics", device
+availability and calibration-channel warnings. Restarting the camera clears
+the prior profile; the driver never reuses an older camera's K.
+
 ## On-robot collection (no motion commands)
 
 Before collecting, check that a G1 image **built from PR #499** is actually

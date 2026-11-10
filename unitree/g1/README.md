@@ -27,7 +27,7 @@
 
 ## SLAM 传感器采集与外参
 
-G1 的通用 SLAM 输入从普通 `rt/odommodestate` 构建，**不依赖原厂建图里程计**。原生点云、普通里程计候选协议、已测试 URDF 固定外参与数据采集参见 [SLAM 离线适配与数据采集](SLAM_CAPTURE.md)。URDF 的标定标志不代表里程计跟踪、时钟关系或 RTAB-Map 已通过实机验收。
+G1 的通用 SLAM 输入从普通 `rt/odommodestate` 构建，**不依赖原厂建图里程计**。 G1 RealSense 相机启动后，驱动会从协商后的独立深度/RGB 流读取实测 K、D，并通过 `camera_depth.info().camera_info` 和 `camera_rgb.info().camera_info` 提供给点云卡；深度图未对齐 RGB，不能共用 RGB 的 K。若未能取得标定，声明为 `source: unknown`，不填猜测内参。**相机回调时间尚未验证为曝光时间**，因此补全 K 不代表 `metric_cloud` 或 SLAM 已满足时间同步校验。原生点云、普通里程计候选协议、已测试 URDF 固定外参与数据采集参见 [SLAM 离线适配与数据采集](SLAM_CAPTURE.md)。URDF 的标定标志不代表里程计跟踪、时钟关系或 RTAB-Map 已通过实机验收。
 
 ## 构建
 

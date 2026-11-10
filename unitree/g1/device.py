@@ -4185,7 +4185,51 @@ class RealSensePlugin:
         self._executor = executor
         self._proc = None
         self._frame_node = None
+        self._intrinsics_lock = threading.Lock()
+        self._intrinsics = {}
+        self._intrinsics_reader = None
+        self._intrinsics_thread = None
         self._ensure_frame_node()
+
+    def _camera_info(self, tool_name, topic, fmt):
+        """Declare the *negotiated* RGB/depth intrinsics, never a guessed K."""
+        from camera_specs import declare
+        with self._intrinsics_lock:
+            profiles = {name: dict(value) for name, value in self._intrinsics.items()}
+        return declare(tool_name, topic, fmt, profiles)
+
+    def _adopt_intrinsics(self, payload, process=None):
+        """Single validated calibration source shared by card info and pointcloud."""
+        from camera_specs import validated_profiles
+        profiles = validated_profiles(payload)
+        with self._intrinsics_lock:
+            if process is not None and self._proc is not process:
+                return
+            self._intrinsics = profiles
+        if profiles:
+            print("[camera] G1 RealSense active intrinsics: " +
+                  ", ".join(sorted(profiles)), flush=True)
+        else:
+            print("[camera] G1 RealSense intrinsics missing or invalid; K unavailable",
+                  flush=True)
+
+    def _receive_intrinsics(self, receiver, process):
+        """Read one small camera-profile message from the isolated child process."""
+        try:
+            while True:
+                if receiver.poll(0.25):
+                    try:
+                        payload = receiver.recv()
+                    except EOFError:
+                        return
+                    self._adopt_intrinsics(payload, process)
+                    return
+                if not process.is_alive():
+                    return
+        except (EOFError, OSError) as exc:
+            print(f"[camera] RealSense calibration channel closed: {exc}", flush=True)
+        finally:
+            receiver.close()
 
     def _ensure_frame_node(self) -> None:
         """Create the cache subscription once for this plugin lifecycle."""
@@ -4206,6 +4250,7 @@ class RealSensePlugin:
             "description": f"RealSense color camera — {RS_COLOR_W}x{RS_COLOR_H} JPEG @ {RS_COLOR_FPS}fps. Publishes CompressedImage to {self._color_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}],
+            "camera_info": self._camera_info("camera_rgb", self._color_topic, "image/jpeg"),
         }
 
     def _depth_tool(self) -> dict:
@@ -4216,6 +4261,8 @@ class RealSensePlugin:
             "description": f"RealSense depth camera — {RS_DEPTH_W}x{RS_DEPTH_H} 16UC1 zlib (mm) @ {RS_DEPTH_FPS}fps. Publishes to {self._depth_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}],
+            "camera_info": self._camera_info("camera_depth", self._depth_topic,
+                                             "image/depth-zlib"),
         }
 
     def _dist_tool(self) -> dict:
@@ -4231,26 +4278,51 @@ class RealSensePlugin:
     def start(self) -> None:
         import multiprocessing as mp
         # A stopped plugin may be started again in the same driver process.
-        # Recreate the cache node that stop() explicitly destroyed.
         self._ensure_frame_node()
         if self._proc is not None and self._proc.is_alive():
             return
         ctx = mp.get_context("spawn")
-        self._proc = ctx.Process(
-            target=run_realsense_process, args=(self._namespace,),
+        receiver, sender = ctx.Pipe(duplex=False)
+        with self._intrinsics_lock:
+            self._intrinsics = {}  # Never reuse a prior device's calibration.
+        process = ctx.Process(
+            target=run_realsense_process, args=(self._namespace, sender),
             name="realsense", daemon=True,
         )
-        self._proc.start()
-        print(f"[bundle] RealSense capture forked → pid={self._proc.pid}")
+        try:
+            process.start()
+        except Exception:
+            sender.close()
+            receiver.close()
+            raise
+        sender.close()
+        self._proc = process
+        self._intrinsics_reader = receiver
+        self._intrinsics_thread = threading.Thread(
+            target=self._receive_intrinsics, args=(receiver, process),
+            name="g1_realsense_intrinsics", daemon=True)
+        self._intrinsics_thread.start()
+        print(f"[bundle] RealSense capture forked → pid={process.pid}")
 
     def stop(self) -> None:
-        if self._proc is not None and self._proc.is_alive():
-            self._proc.terminate()
-            self._proc.join(timeout=3.0)
-            if self._proc.is_alive():
-                self._proc.kill()
-                self._proc.join(timeout=2.0)
+        process = self._proc
         self._proc = None
+        if process is not None and process.is_alive():
+            process.terminate()
+            process.join(timeout=3.0)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=2.0)
+        receiver = self._intrinsics_reader
+        self._intrinsics_reader = None
+        if receiver is not None:
+            receiver.close()
+        thread = self._intrinsics_thread
+        self._intrinsics_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.5)
+        with self._intrinsics_lock:
+            self._intrinsics = {}
         node = self._frame_node
         self._frame_node = None
         if node is not None:
@@ -4283,14 +4355,18 @@ class RealSensePlugin:
         if action == "info":
             tool_name = args.get('_tool_name', '')
             if tool_name == 'camera_depth':
-                return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}]}
-            if tool_name == 'camera_distance':
-                return {"state": "running", "topic_out": [{"topic": self._dist_topic, "format": "data/json"}]}
-            return {"state": "running", "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]}
+                tool = self._depth_tool()
+            elif tool_name == 'camera_distance':
+                tool = self._dist_tool()
+            else:
+                tool = self._color_tool()
+            return {"state": "running", "topic_out": tool["topic_out"],
+                    **({"camera_info": tool["camera_info"]}
+                       if "camera_info" in tool else {})}
         return None
 
 
-def run_realsense_process(namespace: str) -> None:
+def run_realsense_process(namespace: str, calibration_sender=None) -> None:
     """RealSense subprocess entry — independent GIL for full 1080p@15fps throughput.
 
     All heavy imports (cv2, numpy, pyrealsense2, sensor_msgs) happen here
@@ -4366,8 +4442,22 @@ def run_realsense_process(namespace: str) -> None:
             self._color_worker = threading.Thread(target=self._color_loop, name="rs_color", daemon=True)
             self._color_worker.start()
 
-            pipeline.start(config, self._on_frame)
+            active_profile = pipeline.start(config, self._on_frame)
             self._pipeline = pipeline
+            # G1 publishes raw UNALIGNED depth, so the depth K must come from
+            # the negotiated depth stream (not the RGB stream, unlike Bumi).
+            # This is calibration, not evidence of capture-time synchronization.
+            try:
+                from camera_specs import active_stream_profiles
+                profiles = active_stream_profiles(active_profile, rs)
+                if calibration_sender is not None:
+                    calibration_sender.send(profiles)
+                self.get_logger().info(
+                    "G1 RealSense negotiated intrinsics: " +
+                    ", ".join(sorted(profiles)))
+            except Exception as error:
+                self.get_logger().warning(
+                    f"G1 RealSense capture active, but intrinsics unavailable: {error}")
             self.get_logger().info(f"RealSense capture started — device {serial}")
 
         def stop_capture(self):
@@ -4500,6 +4590,8 @@ def run_realsense_process(namespace: str) -> None:
                 rclpy.shutdown()
             except Exception:
                 pass
+        if calibration_sender is not None:
+            calibration_sender.close()
         print("[realsense-proc] stopped", flush=True)
 
 
