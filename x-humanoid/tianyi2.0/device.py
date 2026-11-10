@@ -3724,6 +3724,7 @@ class ArmGesturePlugin:
         "raise": [0, 130, 0, -15, 0, 0, 0],
         "shake_hands": [-55, 15, 5, -35, 0, 0, 0],
         "high_five": [-40, 40, -20, -80, 0, 0, 50],
+        "clarify": [-40, 15, 0, -50, 0, 0, 0],
     }
     _PREPARE_POSES = {
         # Flex the elbow while establishing the lifting plane instead of first
@@ -3733,6 +3734,7 @@ class ArmGesturePlugin:
         "raise": [0, 75, 0, -30, 0, 0, 0],
         "shake_hands": [-30, 10, 0, -20, 0, 0, 0],
         "high_five": [-25, 25, -10, -45, 0, 0, 10],
+        "clarify": [-20, 10, 0, -30, 0, 0, 0],
     }
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
@@ -3751,7 +3753,7 @@ class ArmGesturePlugin:
         return {
             "name": "arm_gesture",
             "type": "actuator",
-            "description": "天轶2.0 手臂语义动作 — 敬礼、欢迎、举手、握手、击掌和回正",
+            "description": "天轶2.0 手臂语义动作 — 敬礼、欢迎、举手、握手、击掌、讲解和回正",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3759,10 +3761,10 @@ class ArmGesturePlugin:
                         "type": "string",
                         "enum": [
                             "salute", "welcome", "raise", "shake_hands",
-                            "high_five", "reset", "cancel",
+                            "high_five", "reset", "cancel","clarify",
                         ],
                         "default": "welcome",
-                        "description": "手臂动作，可选[salute, welcome, raise, shake_hands, high_five, reset, cancel]",
+                        "description": "手臂动作，可选[salute, welcome,clarify, raise, shake_hands, high_five, reset, cancel]",
                     },
                     "side": {
                         "type": "string", "enum": ["left", "right", "both"],
@@ -3787,7 +3789,7 @@ class ArmGesturePlugin:
                 },
                 "required": ["action"],
                 "x-completion": {
-                    "actions": ["salute", "welcome", "shake_hands"],
+                    "actions": ["salute", "welcome", "shake_hands", "clarify"],
                     "timeout": 30,
                 },
                 # Both arms: the gestures are static per schema and some are
@@ -3800,6 +3802,9 @@ class ArmGesturePlugin:
                     "raise": {"params": ["side", "speed"], "description": "将手臂高举到头部上方后回正"},
                     "shake_hands": {"params": ["side", "cycles", "speed"], "description": "向前伸手并轻柔上下摆动，做出握手动作"},
                     "high_five": {"params": ["side", "speed"], "description": "将手掌伸到身体前方并保持在肩部附近，做出击掌等待姿势"},
+                    "clarify": {
+                        "params": ["side", "cycles", "speed"], "description": "单臂向前伸出、小幅展开后收回，支持left或right",
+                    },
                     "reset": {"params": ["side", "speed"], "description": "取消序列并回到中性姿态"},
                     "cancel": {"params": [], "description": "取消尚未发送的后续动作帧"},
                 },
@@ -3905,7 +3910,35 @@ class ArmGesturePlugin:
                 else:
                     welcome_pose[3] = -90
                 frames.append((welcome_pose, 0.35, 0.85))
-        frames.append((self._NEUTRAL, 1.0, 1.0))
+        elif action == "clarify":
+            if side == "both":
+                return self._error_result(
+                    "clarify_single_arm_only",
+                    "clarify 初版仅支持 left 或 right",
+                    gesture=action,
+                )
+
+            speed = _clamp(args.get("speed", 0.2), 0.2, 0.35)
+            cycles = int(_clamp(args.get("cycles", 1), 1, 5))
+            prepare = self._PREPARE_POSES[action]
+
+            open_pose = list(pose)
+            open_pose[1] = 30
+            open_pose[3] = -40
+
+            frames = [
+                (prepare, 0.25, 1.0),
+                (pose, 0.50, 1.0),
+            ]
+
+            for _ in range(cycles):
+                frames.extend([
+                    (open_pose, 0.60, 1.0),
+                    (pose, 0.30, 1.0),
+                ])
+
+            frames.append((prepare, 0.20, 1.0))
+            frames.append((self._NEUTRAL, 1.0, 1.0))
         for frame, _, _ in frames:
             violations = self._pose_violations(side, frame)
             if violations:
@@ -3936,7 +3969,7 @@ class ArmGesturePlugin:
         # ACP: for long gestures, return action_id and callback on done
         action_id = None
         on_done = None
-        if action in ("salute", "welcome", "shake_hands"):
+        if action in ("salute", "welcome", "shake_hands", "clarify"):
             from uuid import uuid4
             action_id = f"arm_gesture_{action}_{uuid4().hex[:8]}"
 
