@@ -279,6 +279,12 @@ def test_dockerfile_exposes_the_port_and_copies_what_the_code_imports():
         assert name in copied
     assert "COPY common/ /work/common/" in dockerfile
     assert "rmw-cyclonedds-cpp" in dockerfile and "rmw-fastrtps-cpp" in dockerfile
+    # The ros-base image has the ROS install and key but no ROS apt source; the first bot build
+    # failed with "ros-humble-rmw-cyclonedds-cpp has no installation candidate" without this.
+    assert dockerfile.index("ros2-archive-keyring.gpg") < dockerfile.index("apt-get update")
+    assert "/etc/apt/sources.list.d/ros2.list" in dockerfile
+    assert "ros-base@sha256:" in dockerfile.splitlines()[0], "pinned like the other ROS drivers"
+    assert "print('panther imports ok'" in dockerfile, "build fails here, not on the robot"
     assert "numpy==1.26.4" in (DRIVER / "requirements.txt").read_text(encoding="utf-8")
 
 
