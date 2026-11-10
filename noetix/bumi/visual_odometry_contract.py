@@ -256,6 +256,10 @@ def slam_input_declaration(topic, sample, *, fallback_child, pose_reference, ext
         'length_unit': 'm',
         'reference_point': pose_reference,
         'pose_reference': pose_reference,
+        # A VO relocalization changes its {segment_id}_odom/base frames. The
+        # consumer uses this identity for segment-safe frame templating, never
+        # to alter the measured camera mount or fabricate a continuous pose.
+        'segment_id': quality.get('segment_id'),
         'frame_id': pose.get('frame_id'),
         'child_frame_id': pose.get('child_frame_id') or fallback_child,
         'clock': {
