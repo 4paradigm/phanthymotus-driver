@@ -291,6 +291,7 @@ def test_depth_capture_metadata_remains_unverified_and_matches_qualified_source(
     assert d['frame_metadata_topic'] == '/robot/camera/depth/metadata'
     assert d['clock_id'] == 'ros'
     assert d['stamp_source'] == 'measurement'
+    assert d['length_unit'] == 'mm'
     assert d['clock']['verified'] is False
     assert d['clock']['uncertainty_ns'] is None
     assert 'extrinsic' not in d, 'camera must not claim VO calibration'
