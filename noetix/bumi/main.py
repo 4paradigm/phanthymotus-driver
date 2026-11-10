@@ -191,6 +191,18 @@ class BumiDeviceBundle:
                     high_ctrl=high_ctrl))
                 print("[bundle] VisualOdometryPlugin loaded")
 
+        # Opt-in fused leg+IMU+RGB-D estimate. Keep the original VO output
+        # and card intact; this experimental planar sensor never controls motion.
+        if plugins_cfg.get("fused_odometry", {}).get("enabled", False):
+            if (high_ctrl is None or camera_plugin is None or
+                    not plugins_cfg.get("visual_odometry", {}).get("enabled", False)):
+                print("[bundle] FusedOdometryPlugin needs HighController, camera, and visual_odometry; skipped")
+            else:
+                from fused_odometry import FusedOdometryPlugin
+                self._plugins.append(FusedOdometryPlugin(
+                    plugins_cfg["fused_odometry"], namespace, executor, high_ctrl))
+                print("[bundle] FusedOdometryPlugin loaded")
+
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
             from device import MotionStatePlugin
             motion_state_plugin = MotionStatePlugin(
