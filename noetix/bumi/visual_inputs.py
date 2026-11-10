@@ -8,6 +8,7 @@ production down with it.
 from __future__ import annotations
 
 from array import array
+import hashlib
 import json
 import time
 import uuid
@@ -39,6 +40,8 @@ class CaptureTimeMapper:
     def __init__(self, depth_scale):
         self.depth_scale = depth_scale
         self.epoch = uuid.uuid4().hex
+        # Stable for this capture subprocess; epoch changes on clock discontinuity.
+        self.source_generation = uuid.uuid4().hex
         self.clocks = [ClockMap(), ClockMap()]
         self.cached_key = self.cached_value = None
 
@@ -76,6 +79,32 @@ class CaptureTimeMapper:
             raise
 
 
+def depth_frame_metadata(capture, stamp_ns, frame_id, payload, source_generation):
+    """Correlate one capture-mapped depth frame with its exact zlib data bytes.
+
+    An arrival-offset clock is never certified by a plausible-looking offset.
+    Fallback frames have empty frame_id and intentionally get no sidecar.
+    """
+    depth = capture['depth']
+    source_ms = float(depth['source_ms'])
+    source_ns = int(source_ms * 1_000_000)
+    if type(stamp_ns) is not int or stamp_ns <= 0 or not frame_id:
+        raise ValueError('only capture-mapped depth frames may have provenance')
+    return {
+        'schema': 'motus.slam_frame/1',
+        'stamp_ns': stamp_ns, 'frame_id': frame_id, 'clock_id': 'ros',
+        'clock_epoch': capture['epoch'],
+        'source_generation': source_generation,
+        'source_clock': str(depth['domain']),
+        'source_stamp': source_ms, 'source_unit': 'ms',
+        'mapping': {'method': capture['clock_mapping'],
+                    'version': 'shared_camera_mapper/1',
+                    'offset_ns': stamp_ns-source_ns,
+                    'verified': False, 'uncertainty_ns': None},
+        'data_sha256': hashlib.sha256(bytes(payload)).hexdigest(),
+    }
+
+
 class CaptureTimedDepthPublisher:
     """The depth card's single output: capture-timed 640x480 uint16 mm zlib.
 
@@ -93,12 +122,17 @@ class CaptureTimedDepthPublisher:
     usual 1 mm scale.
     """
 
-    def __init__(self, publisher, namespace, time_mapper):
+    def __init__(self, publisher, namespace, time_mapper, *, metadata_publisher=None):
         from sensor_msgs.msg import CompressedImage
         self.CompressedImage = CompressedImage
         self.namespace = namespace
         self.time_mapper = time_mapper
         self.publisher = publisher
+        self.metadata_publisher = metadata_publisher
+        self._metadata_failures = 0
+        if metadata_publisher is not None:
+            from std_msgs.msg import String
+            self.String = String
 
     def publish(self, source_frames, aligned_frames, *, fallback_stamp_ns=None):
         """Publish one aligned depth frame; True when it carried capture time."""
@@ -131,6 +165,21 @@ class CaptureTimedDepthPublisher:
         msg.format = '16UC1; compressedDepth zlib'
         msg.data = array('B', zlib.compress(millimetres.astype('<u2').tobytes(), 1))
         self.publisher.publish(msg)
+        # Evidence is about the exact compressed frame transmitted above, not
+        # its raw Z16 predecessor. No sidecar is emitted for arrival-time fallback.
+        if mapped and self.metadata_publisher is not None:
+            try:
+                packet = depth_frame_metadata(
+                    meta, int(stamp_ns), frame_id, msg.data,
+                    self.time_mapper.source_generation)
+                self.metadata_publisher.publish(
+                    self.String(data=json.dumps(packet, allow_nan=False)))
+                self._metadata_failures = 0
+            except Exception as error:
+                self._metadata_failures += 1
+                if self._metadata_failures in (1, 100):
+                    print('[camera] depth provenance publish failed: ' +
+                          str(error)[:200], flush=True)
         return mapped
 
 
