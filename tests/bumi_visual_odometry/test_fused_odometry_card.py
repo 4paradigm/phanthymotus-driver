@@ -79,7 +79,16 @@ def test_plugin_outputs_and_does_not_copy_old_segment_frame(monkeypatch):
     assert payload['vendor']['planar_only'] is True
     assert payload['pose']['frame_id']=='bumi_fused_odom'
     assert payload['pose']['covariance'][14]==1.0
-    assert plugin.dispatch('info',{})['odom_interface']['pose_drift']=='unbounded'
+    info = plugin.dispatch('info', {})
+    assert info['odom_interface']['pose_drift']=='unbounded'
+    assert info['odom_interface']['slam_pose']['available'] is False
+    assert [p['format'] for p in info['topic_out']] == ['data/json', 'state/odom']
+    declaration = info['input_metadata'][0]
+    assert declaration['topic'] == plugin.topic
+    assert declaration['planar_only'] is True
+    assert declaration['unfused_axes'] == ['z', 'roll', 'pitch']
+    assert declaration['stamp_source'] == 'receive'
+    assert declaration['clock']['verified'] is False
     plugin.stop()
     plugin._publish()
     stopped=json.loads(plugin.node.pubs[plugin.topic][-1].data)
