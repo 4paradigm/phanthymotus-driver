@@ -229,3 +229,41 @@ def make_sample(health, now_ns, estimate, pose_reference='rgb_optical'):
                                'clock_id': 'ros'},
                 'twist_source': None,
                 'published_ns': now_ns, **deepcopy(health.details)})
+
+
+def slam_input_declaration(topic, sample, *, fallback_child, pose_reference, extrinsic):
+    """Static producer evidence for this VO output, not a tracking assertion.
+
+    On startup the estimator may not yet have returned a pose. The child frame
+    is still the local estimator's configured base frame; a later tracking
+    sample must agree with it. Neither an arrival-offset clock nor an assumed
+    mount becomes verified by inclusion in info().
+    """
+    vendor = sample.get('vendor') if isinstance(sample, dict) else None
+    vendor = vendor if isinstance(vendor, dict) else {}
+    quality = vendor.get('motus_slam')
+    quality = quality if isinstance(quality, dict) else {}
+    pose = sample.get('pose') if isinstance(sample, dict) else None
+    pose = pose if isinstance(pose, dict) else {}
+    out = {
+        'schema': 'motus.slam_input/1',
+        'topic': topic,
+        'format': 'state/odom',
+        'kind': 'pose',
+        'source_id': quality.get('source_id') or 'unknown',
+        'clock_id': quality.get('clock_id') or 'unknown',
+        'stamp_source': quality.get('stamp_source') or 'unknown',
+        'length_unit': 'm',
+        'reference_point': pose_reference,
+        'pose_reference': pose_reference,
+        'frame_id': pose.get('frame_id'),
+        'child_frame_id': pose.get('child_frame_id') or fallback_child,
+        'clock': {
+            'mapping': quality.get('clock_mapping') or 'unknown',
+            'verified': quality.get('clock_verified') is True,
+            'uncertainty_ns': None,
+        },
+    }
+    if extrinsic is not None:
+        out['extrinsic'] = deepcopy(extrinsic)
+    return out
