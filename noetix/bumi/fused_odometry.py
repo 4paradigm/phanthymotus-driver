@@ -163,6 +163,11 @@ class FusedOdometryPlugin:
             with self.lock:
                 if not self.active:
                     return
+                # The 20 Hz VO card repeats its most recent *measured* pose.
+                # Avoid treating identical capture stamps as new observations.
+                if (self.filter.last_visual_stamp is not None and
+                        stamp_ns <= self.filter.last_visual_stamp):
+                    return
                 self.last_visual_result = self.filter.visual(
                     stamp_ns=stamp_ns, segment=segment,
                     position=pose['position'], quaternion=pose['quaternion'],
