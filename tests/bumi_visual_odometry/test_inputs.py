@@ -329,3 +329,40 @@ def test_capture_timed_depth_rejects_non_contract_dimensions(raw_ros):
     with pytest.raises(ValueError, match='640x480'):
         depth.publish(data, data, fallback_stamp_ns=1)
     assert not messages['/robot/camera/depth']
+
+
+def test_depth_frame_sidecar_hashes_actual_zlib_and_keeps_clock_unverified(raw_ros, monkeypatch):
+    from noetix.bumi.visual_inputs import CaptureTimeMapper, CaptureTimedDepthPublisher
+    import hashlib
+    messages, node = raw_ros
+    mapper = CaptureTimeMapper(.002)
+    depth = CaptureTimedDepthPublisher(
+        node.create_publisher(object, '/robot/camera/depth', object()),
+        'robot', mapper,
+        metadata_publisher=node.create_publisher(
+            object, '/robot/camera/depth/metadata', object()))
+    aligned = frames()
+    aligned.get_depth_frame().get_data = lambda: np.full((480, 640), 500, dtype='<u2')
+    monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 10_000_000_000)
+    assert depth.publish(aligned, aligned, fallback_stamp_ns=123) is True
+    msg = messages['/robot/camera/depth'][0]
+    sidecar = json.loads(messages['/robot/camera/depth/metadata'][0].data)
+    assert sidecar['schema'] == 'motus.slam_frame/1'
+    assert sidecar['stamp_ns'] == _stamp(msg)
+    assert sidecar['frame_id'] == msg.header.frame_id == 'robot_rgb_optical'
+    assert sidecar['source_stamp'] == 1010
+    assert sidecar['clock_epoch'] == mapper.epoch
+    assert sidecar['source_generation'] == mapper.source_generation
+    assert sidecar['data_sha256'] == hashlib.sha256(bytes(msg.data)).hexdigest()
+    assert sidecar['mapping']['verified'] is False
+    assert sidecar['mapping']['uncertainty_ns'] is None
+    assert (int(sidecar['source_stamp'] * 1_000_000)
+            + sidecar['mapping']['offset_ns'] == sidecar['stamp_ns'])
+
+    # An invalid timestamp domain produces media for display but NEVER proof.
+    bad = frames(ms=1033)
+    bad.get_depth_frame().get_frame_timestamp_domain = lambda: 'unknown'
+    bad.get_depth_frame().get_data = lambda: np.full((480, 640), 500, dtype='<u2')
+    assert depth.publish(bad, bad, fallback_stamp_ns=10_033_000_000) is False
+    assert len(messages['/robot/camera/depth']) == 2
+    assert len(messages['/robot/camera/depth/metadata']) == 1
