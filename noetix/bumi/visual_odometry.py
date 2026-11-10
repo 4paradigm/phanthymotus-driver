@@ -396,7 +396,10 @@ class VisualOdometryNode:
             'pose_reference': self.pose_reference(),
         }, parent_frame=self.base_frame(), child_frame=self.frame_id)
 
-    def publish(self):
+    def publish(self, *, emit=True):
+        # A preflight info() query must not emit a synthetic sensor sample or
+        # consume the first-pose displacement origin. Normal calls still
+        # preserve the legacy publish/summary side effects.
         sample = make_sample(self.health, self.now(), self.estimate, self.pose_reference())
         quality = sample['vendor']
         slam = quality['motus_slam']
@@ -416,10 +419,18 @@ class VisualOdometryNode:
             # lost in the other.
             quality['motus_slam']['status'] = 'initializing'
             sample['pose'] = None
+        if emit:
+            displacement = self._segment_displacement(sample)
+        else:
+            position = (sample.get('pose') or {}).get('position')
+            origin = self.summary_origin
+            displacement = (math.sqrt(sum((a-b)**2 for a, b in zip(position, origin)))
+                            if position is not None and origin is not None else None)
         quality.update(turn_angle_deg=self.turn_angle_deg,
-                       displacement_m=self._segment_displacement(sample))
-        self.publisher.publish(self.String(data=json.dumps(sample, allow_nan=False)))
-        self.publish_status(sample)
+                       displacement_m=displacement)
+        if emit:
+            self.publisher.publish(self.String(data=json.dumps(sample, allow_nan=False)))
+            self.publish_status(sample)
         return sample
 
     def _segment_displacement(self, sample):
@@ -464,9 +475,9 @@ class VisualOdometryNode:
         self.status_publisher.publish(self.String(data=json.dumps(summary, allow_nan=False)))
         self.last_summary_ns, self.last_summary_state = now, state
 
-    def info(self):
+    def info(self, *, read_only=False):
         from common.odom import build_interface
-        sample = self.publish()
+        sample = self.publish(emit=not read_only)
         return dict(state='running' if self.active else 'idle',
                     topic_out=[{'topic': self.status_topic, 'format': 'data/json',
                                 'message_type': 'std_msgs/msg/String'},
@@ -1073,7 +1084,7 @@ class VisualOdometryPlugin:
             if action == 'config':
                 return node.configure(args)
             if action in ('info', 'rgbd_visual_odometry'):
-                # The bundle dispatcher passes the bare tool name when a client
-                # calls the card without an explicit action; keep that as info.
-                return node.info()
+                # Preserve the historical info() behavior for existing callers;
+                # preflight can explicitly request a side-effect-free snapshot.
+                return node.info(read_only=args.get('read_only') is True)
             return None  # unknown actions must be rejected, not reported as success
