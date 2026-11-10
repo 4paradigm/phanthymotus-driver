@@ -121,10 +121,12 @@ class ArmServoPlugin:
         return {'name': self.PREFIX, 'type': 'actuator', 'multiInstance': False,
             'description': 'TRON2上肢双臂连续伺服：接收一路motus.control/1关节目标流，官方18维顺序：左臂7维、左夹爪1维、右臂7维、右夹爪1维、头部俯仰/偏航2维；关节单位rad，夹爪0～1（0闭合、1全开）；建议30Hz、最多50Hz。Driver限速插值并以目标300Hz发送ServoJ；头部使用厂家原始方向；夹爪独立发送SDK开合协议，默认速度100、力50，0～1线性转为0～100开口度。普通动作使用arm_control/pose；本卡片供遥操作或执行模型接线使用。断流200ms或指令过期停止后续目标输出，不自动回零；不是硬件急停。',
             'inputSchema': {'type': 'object', 'properties': {
-                'action': {'type': 'string', 'enum': ['start', 'stop', 'pause', 'resume', 'info']},
-                'input_topic': {'type': 'string', 'description': 'control/joint指令流话题'}},
+                'action': {'type': 'string', 'enum': ['start', 'stop', 'pause', 'resume', 'info', 'config']},
+                'input_topic': {'type': 'string', 'description': 'control/joint指令流话题'},
+                'dry_run': {'type': 'boolean', 'description': 'config操作必填：true仅校验不发送，false允许输出；切换后暂停，需resume继续'}},
                 'required': ['action'],
                 'x-action-params': {
+                    'config': {'params': ['dry_run'], 'description': '设置空跑模式；dry_run须为布尔值，切换后暂停'},
                     'pause': {'params': [], 'description': '暂停关节和夹爪输出并清空旧目标，保留订阅'},
                     'resume': {'params': [], 'description': '恢复接收新目标，从实测关节角平滑接管'}},
                 'x-hooks': {'on_interrupt_motion': {'action': 'pause'}, 'on_interrupt_all': {'action': 'pause'}},
@@ -134,7 +136,8 @@ class ArmServoPlugin:
                 'dry_run': {'type': 'boolean', 'default': False, 'description': '空跑：接收并检查目标，不发送电机指令；切换后暂停，需resume继续'}}}}
 
     def info(self):
-        return {'state': 'idle' if not self.running else 'paused' if self.paused else 'running',
+        return {'state': 'ready' if self.running else 'idle',
+            'paused': self.running and self.paused,
             'input': self.input_topic, 'dry_run': self.dry_run,
             'control_interface': self.descriptor_raw, 'output_target_hz': OUTPUT_HZ,
             'commands_submitted': self.commands, 'gripper_commands_acknowledged': self.gripper_commands, 'targets_applied': self.applied,

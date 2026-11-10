@@ -117,7 +117,7 @@ class ContractTests(unittest.TestCase):
         t = plugin().get_tool()
         self.assertFalse(t['multiInstance'])
         self.assertEqual(t['topic_in'][0]['format'], 'control/joint')
-        self.assertEqual(set(t['inputSchema']['x-action-params']), {'pause', 'resume'})
+        self.assertEqual(set(t['inputSchema']['x-action-params']), {'pause', 'resume', 'config'})
         self.assertIsNone(build_descriptor()['force_torque'])
 
     def test_first_target_and_reversal_slew_are_bounded(self):
@@ -149,7 +149,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_stop_inert_and_restartable(self):
         with self.assertRaises(ValueError):
             await self.p.call({'action': 'start'})
-        self.assertEqual((await self.start())['state'], 'running')
+        self.assertEqual((await self.start())['state'], 'ready')
         await asyncio.sleep(.025)
         self.assertEqual(self.p.reader.sent, [])
         self.assertEqual((await self.p.call({'action': 'stop'}))['state'], 'idle')
@@ -333,6 +333,48 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_public_mcp_lifecycle_and_declared_config(self):
+        from device import Adapter
+        a = Adapter(lambda *args: None, {'enabled_cards': ['loco_servo_arm'],
+            'poll_interval_seconds': .5, 'response_timeout_seconds': 5,
+            'stale_after_seconds': 5, 'serial': ''})
+        a.arm_servo.publisher = Bus()
+        async def rpc(method, params):
+            request = SimpleNamespace(json=AsyncMock(return_value={
+                'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params}))
+            response = await a.rpc(request)
+            return json.loads(response.body)['result']
+        async def call(**args):
+            result = await rpc('tools/call', {'name': 'loco_servo_arm', 'arguments': args})
+            return result['isError'], json.loads(result['content'][0]['text'])
+        try:
+            tools = (await rpc('tools/list', {}))['tools']
+            card = next(t for t in tools if t['name'] == 'loco_servo_arm')
+            schema = card['inputSchema']
+            self.assertIn('config', schema['properties']['action']['enum'])
+            self.assertEqual(schema['properties']['dry_run']['type'], 'boolean')
+            self.assertEqual(schema['x-action-params']['config']['params'], ['dry_run'])
+            error, result = await call(action='start', input_topic='/test/public_servo')
+            self.assertFalse(error); self.assertEqual(result['state'], 'ready')
+            error, result = await call(action='info')
+            self.assertFalse(error); self.assertEqual(result['state'], 'ready')
+            for value in (None, 'true', 1):
+                error, result = await call(action='config', dry_run=value)
+                self.assertTrue(error)
+                self.assertFalse(a.arm_servo.dry_run)
+            error, result = await call(action='config', dry_run=True)
+            self.assertFalse(error); self.assertTrue(result['dry_run'])
+            self.assertTrue(result['paused']); self.assertEqual(result['state'], 'ready')
+            error, result = await call(action='start', input_topic='/test/public_servo')
+            self.assertFalse(error); self.assertEqual(result['state'], 'ready')
+            self.assertTrue(result['paused'])  # Repeated start never resumes a paused stream.
+            error, result = await call(action='stop')
+            self.assertFalse(error); self.assertEqual(result['state'], 'idle')
+            self.assertFalse(result['paused'])
+            self.assertEqual(a.reader.gripper_pending, {})
+        finally:
+            await a.arm_servo.close()
+
     async def test_real_adapter_discovery_and_manual_action_handover(self):
         from device import Adapter
         a = Adapter(lambda *args: None, {'enabled_cards': ['loco_servo_arm', 'arm_control', 'joints'],
