@@ -290,14 +290,15 @@ class BunkerProDevice:
             if not input_topic:
                 return {"error": "Missing input_topic"}
             self.bridge.bind_control_topic(input_topic)
-            return {"state": "running", "input_topic": input_topic}
+            return {"state": "ready", "input_topic": input_topic}
         if tool_name == "bunker_base" and action == "stop":
             self.bridge.bind_control_topic(None)
             with self._motion_lock:
                 if self._active_move_stop is not None:
                     self._active_move_stop.set()
                 self._direct_until = 0.0
-                return self.can.stop_motion()
+                result = self.can.stop_motion()
+                return {**result, "state": "idle"}
         if action == "info":
             return {"state": self.can.snapshot(),
                     "control_interface": self._control_descriptor(),
@@ -306,7 +307,8 @@ class BunkerProDevice:
         if action == "enable_can":
             return self.can.request_control_mode(protocol.CONTROL_CAN)
         if action == "stop":
-            return self.can.stop_motion()
+            result = self.can.stop_motion()
+            return {**result, "state": "idle"}
         if action == "move":
             if not self._motion_enabled:
                 raise RuntimeError("movement is disabled by BUNKER_MOTION_ENABLED=0")

@@ -26,6 +26,15 @@ discovery); the system D-Bus mount is used to ask host systemd to enable and
 restart that unit. Host networking provides the local Agent Core/DDS endpoints.
 The container needs root to write the specific host bind mounts, but it does
 not need all host capabilities or device access granted by privileged mode.
+After setup, the entrypoint runs the ROS driver as UID 65534 with only ambient
+`NET_RAW`, which SocketCAN needs to open raw CAN sockets. The running driver has
+no `SYS_MODULE` or `NET_ADMIN` capability and cannot write the root-owned host
+directories or access the root-owned system D-Bus socket. The container image
+includes a compiler and kernel build helpers because a missing host `gs_usb`
+module must be built against that host's matching headers; `python-can` is the
+runtime SocketCAN dependency. These packages increase image size, but removing
+the build tools would break the requested automatic bootstrap on hosts without
+the module.
 
 The CAN decoder follows AgileX `ugv_sdk` v2 layouts. It reads status (`0x211`),
 measured velocity (`0x221`) and raw wheel counts (`0x311`). It does not infer

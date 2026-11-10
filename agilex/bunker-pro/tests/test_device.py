@@ -114,6 +114,21 @@ def test_move_advertises_async_completion_contract():
     assert schema["x-completion"] == {"actions": ["move"], "timeout": 20}
 
 
+def test_actuator_start_and_stop_follow_lifecycle_contract():
+    device = _bare_device()
+    calls = []
+    device.bridge = types.SimpleNamespace(
+        bind_control_topic=lambda topic: calls.append(topic))
+    assert device.dispatch("start", {"_tool_name": "bunker_base",
+                                      "input_topic": "/agent/control"}) == {
+        "state": "ready", "input_topic": "/agent/control"}
+    assert calls == ["/agent/control"]
+    assert device.dispatch("stop", {"_tool_name": "bunker_base"}) == {
+        "state": "idle"}
+    assert calls[-1] is None
+    assert device.dispatch("stop", {}) == {"state": "idle"}
+
+
 def test_dds_bridge_binds_forwards_and_closes_entities():
     events = []
 

@@ -3,7 +3,7 @@ FROM ${ROS_BASE_IMAGE}
 
 WORKDIR /work
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential kmod iproute2 systemd python3-pip && \
+    build-essential kmod iproute2 systemd python3-pip util-linux && \
     rm -rf /var/lib/apt/lists/*
 COPY requirements.txt /work/requirements.txt
 RUN python3 -m pip install --no-cache-dir -r /work/requirements.txt

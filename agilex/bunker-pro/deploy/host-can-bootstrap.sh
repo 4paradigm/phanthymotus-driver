@@ -57,7 +57,7 @@ systemd_manager=org.freedesktop.systemd1.Manager
 "$busctl" --address="$bus_address" call "$systemd_destination" "$systemd_path" \
     "$systemd_manager" Reload || fail "could not reload host systemd over D-Bus"
 "$busctl" --address="$bus_address" call "$systemd_destination" "$systemd_path" \
-    "$systemd_manager" EnableUnitFiles as 1 phanthy-bunker-can.service false true || \
+    "$systemd_manager" EnableUnitFiles asbb 1 phanthy-bunker-can.service false true || \
     fail "could not enable the persistent host CAN service over D-Bus"
 # Restart on each container start so USB re-enumeration gets a fresh bitrate setup.
 "$busctl" --address="$bus_address" call "$systemd_destination" "$systemd_path" \

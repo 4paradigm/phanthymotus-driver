@@ -31,8 +31,12 @@ def test_runtime_image_has_deployment_fragment_and_plain_ros_logs():
 
     bootstrap = (DRIVER_DIR / "deploy" / "host-can-bootstrap.sh").read_text()
     assert "--address=\"$bus_address\"" in bootstrap
+    assert "EnableUnitFiles asbb 1 phanthy-bunker-can.service false true" in bootstrap
     assert "RestartUnit ss phanthy-bunker-can.service replace" in bootstrap
     assert "\nsystemctl " not in bootstrap
+    entrypoint = (DRIVER_DIR / "deploy" / "entrypoint.sh").read_text()
+    assert "--bounding-set=-all,+net_raw" in entrypoint
+    assert "--ambient-caps=+net_raw" in entrypoint
 
 
 def test_host_sys_mount_is_read_only_and_required_persistent_paths_are_explicit():
