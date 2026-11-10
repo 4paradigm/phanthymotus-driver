@@ -75,11 +75,22 @@ def terminal(events, result, status="completed", timeout=3):
     return event[2]
 
 
+def manual_drag(robot, active=True):
+    """Simulate the operator pressing the drag button on the arm."""
+    with robot.lock:
+        robot._advance()
+        robot.mode = 6 if active else 5
+        if not active:
+            robot.hand_velocity = 0
+
+
 def perform_recording(rig):
     plugin, robot, store, events = rig
     event = terminal(events, dispatch(plugin, "start_record", name="本地端到端测试"))
-    assert event["state"] == "recording"
+    assert event["state"] == "recording" and event["drag"] == "waiting_for_first_manual_drag"
     identifier = event["trajectory_id"]
+    time.sleep(.05)
+    manual_drag(robot)
     with robot.lock:
         robot.hand_velocity = 30
     time.sleep(.25)
@@ -93,7 +104,8 @@ def test_record_go_to_start_native_play_and_completion_over_real_local_tcp(rig):
     plugin, robot, store, events = rig
     identifier = perform_recording(rig)
     commands = list(robot.commands)
-    assert commands[:2] == ["ClearError()", "StartDrag()"]
+    assert commands[0] == "ClearError()" and "StartDrag()" not in commands
+    # stop_record while the operator is still dragging exits drag once.
     assert commands[-1] == "StopDrag()"
     blocked = terminal(events, dispatch(plugin, "play", trajectory_id=identifier), status="error")
     assert "go_to_start" in blocked["reason"]
@@ -166,18 +178,225 @@ def test_missing_native_profile_never_sends_preparation_or_motion(rig):
     assert robot.commands == []
 
 
-def test_failed_start_drag_does_not_claim_recording_started(rig):
+def test_start_record_while_already_dragging_is_rejected_without_commands(rig):
     plugin, robot, store, events = rig
-    robot.failure_command = "StartDrag"
-    result = terminal(events, dispatch(plugin, "start_record", name="failed"), status="error")
-    assert "StartDrag rejected" in result["reason"]
+    manual_drag(robot)
+    wait_until(lambda: plugin.client.snapshot()["data"]["drag_status"])
+    result = terminal(events, dispatch(plugin, "start_record", name="already dragging"), status="error")
+    assert "stationary" in result["reason"]
+    assert robot.commands == []
     assert store.list_records()[0]["state"] == "incomplete"
+    assert plugin.control.ownership.owner is None
+
+
+def move_j_rejected(plugin):
+    with pytest.raises(RuntimeError, match="occupied"):
+        plugin.dispatch("move_j", {"_tool_name": "joint_move", "joint1_deg": 5, "confirm_move": True})
+
+
+def drag_cycle(robot, drag_s=.2, pause_s=.2):
+    manual_drag(robot)
+    with robot.lock:
+        robot.hand_velocity = 30
+    time.sleep(drag_s)
+    manual_drag(robot, False)
+    time.sleep(pause_s)
+
+
+def test_multiple_drags_continue_one_recording_until_stop_record_in_pause(rig):
+    plugin, robot, store, events = rig
+    started = dispatch(plugin, "start_record", name="multi drag")
+    identifier = terminal(events, started)["trajectory_id"]
+    time.sleep(.1)
+    for _ in range(2):
+        drag_cycle(robot)
+        assert not plugin.teach.recorder.finished.is_set()
+        assert plugin.control.ownership.owner == "teach"
+        move_j_rejected(plugin)
+    # Entering or leaving drag never produces another ACP completion.
+    assert len(events) == 1
+    result = terminal(events, dispatch(plugin, "stop_record"))
+    assert result["state"] == "recorded" and result["end_reason"] == "stop_record"
+    assert result["native_state"] == "exported" and result["duration_s"] >= .5
+    assert store.load(identifier)["drag_entries"] == 2
+    assert "StartDrag()" not in robot.commands and "StopDrag()" not in robot.commands
+    assert plugin.control.ownership.owner is None
+    points = store.samples(identifier)["points"]
+    assert [p["time_ms"] for p in points] == list(range(0, len(points) * 50, 50))
+    # Idle pauses stay on the axis as runs of unchanged angles, not removed.
+    angles = [p["joints_deg"][0] for p in points]
+    assert sum(abs(a - b) < 1e-9 for a, b in zip(angles, angles[1:])) >= 4
+    assert angles[-1] > angles[0]
+
+
+def test_stop_record_waits_for_mode5_coasting_to_reach_rest(rig):
+    plugin, robot, store, events = rig
+    terminal(events, dispatch(plugin, "start_record", name="coasting"))
+    drag_cycle(robot, pause_s=0)
+    robot.joint_speed = [5, 0, 0, 0, 0, 0]
+    stop = dispatch(plugin, "stop_record")
+    time.sleep(.3)
+    assert not any(event[0] == stop["action_id"] for event in events)
+    robot.joint_speed = None
+    result = terminal(events, stop)
+    assert result["state"] == "recorded" and "StopDrag()" not in robot.commands
+    assert plugin.control.ownership.owner is None
+
+
+def test_unconfirmed_exit_is_not_success_and_keeps_the_arm_until_stop_motion(rig):
+    plugin, robot, store, events = rig
+    identifier = terminal(events, dispatch(plugin, "start_record", name="never settles"))["trajectory_id"]
+    drag_cycle(robot, pause_s=0)
+    robot.joint_speed = [5, 0, 0, 0, 0, 0]
+    result = terminal(events, dispatch(plugin, "stop_record"), status="error", timeout=5)
+    assert "could not confirm exit from drag" in result["reason"]
+    record = store.load(identifier)
+    assert record["state"] == "incomplete" and "could not confirm" in record["reason"]
+    assert plugin.control.ownership.owner == "teach"
+    move_j_rejected(plugin)
+    robot.joint_speed = None
+    stopped = terminal(events, plugin.dispatch("stop_motion", {"_tool_name": "joint_move", "confirm_move": True}))
+    assert stopped["state"] == "incomplete"
+    assert plugin.control.ownership.owner is None
+
+
+@pytest.mark.parametrize("interrupt", ["stop_motion", "driver_stop"])
+def test_interruption_during_exit_confirmation_is_never_saved_as_recorded(rig, interrupt):
+    plugin, robot, store, events = rig
+    identifier = terminal(events, dispatch(plugin, "start_record", name="late interrupt"))["trajectory_id"]
+    drag_cycle(robot, pause_s=0)
+    robot.joint_speed = [5, 0, 0, 0, 0, 0]  # keeps the exit confirmation pending
+    stop = dispatch(plugin, "stop_record")
+    wait_until(lambda: plugin.teach.recorder.stop_event.is_set())
+    time.sleep(.1)
+    assert not plugin.teach.recorder.finished.is_set()
+    settle = threading.Timer(.3, lambda: setattr(robot, "joint_speed", None))
+    settle.start()
+    try:
+        if interrupt == "stop_motion":
+            stopped = terminal(events, plugin.dispatch("stop_motion", {"_tool_name": "joint_move", "confirm_move": True}))
+            assert stopped["state"] == "incomplete"
+            expected = "recording cancelled"
+        else:
+            plugin.dispatch("stop", {"_tool_name": "teach"})
+            expected = "driver stopped during recording"
+    finally:
+        settle.join()
+    wait_until(lambda: any(event[0] == stop["action_id"] for event in events))
+    assert next(event for event in events if event[0] == stop["action_id"])[1] != "completed"
+    record = store.load(identifier)
+    assert record["state"] == "incomplete" and record["end_reason"] == "interrupted"
+    assert expected in record["reason"]
+    assert plugin.control.ownership.owner is None
+
+
+def test_feedback_loss_during_exit_confirmation_is_not_reported_as_success(rig):
+    plugin, robot, store, events = rig
+    terminal(events, dispatch(plugin, "start_record", name="lost confirmation"))
+    manual_drag(robot)
+    time.sleep(.1)
+    robot.feedback_enabled = False
+    result = terminal(events, dispatch(plugin, "stop_record"), status="error", timeout=5)
+    assert "incomplete" in result["reason"]
+    assert robot.commands.count("StopDrag()") == 1
+    assert plugin.control.ownership.owner == "teach"
+    robot.feedback_enabled = True
+    terminal(events, dispatch(plugin, "stop_motion"), timeout=5)
+    assert plugin.control.ownership.owner is None
+
+
+@pytest.mark.parametrize("mode", [7, 10])
+def test_non_idle_mode_during_pause_ends_incomplete_without_recovery_commands(rig, mode):
+    plugin, robot, store, events = rig
+    terminal(events, dispatch(plugin, "start_record", name="bad pause"))
+    drag_cycle(robot, pause_s=.1)
+    count = len(robot.commands)
+    with robot.lock:
+        robot.mode = mode
+        robot.setting_until = time.monotonic() + .3  # hold simulated mode 7 briefly
+    wait_until(lambda: plugin.teach.recorder.finished.is_set(), 5)
+    record = plugin.teach.recorder.record
+    assert record["state"] == "incomplete" and f"controller mode {mode}" in record["reason"]
+    assert record["end_reason"] == "interrupted" and record["point_count"] >= 3
+    assert not any(c in robot.commands[count:] for c in ("ClearError()", "EnableRobot()", "Continue()"))
+    if mode == 7:
+        # The simulated motion returns to rest in mode 5, so the exit is confirmed.
+        assert plugin.control.ownership.owner is None
+        return
+    # A paused queue never confirms rest in mode 5, so the arm stays reserved.
+    assert plugin.control.ownership.owner == "teach"
+    with robot.lock:
+        robot.mode = 5
+    terminal(events, dispatch(plugin, "stop_motion"))
+    assert plugin.control.ownership.owner is None
+
+
+def test_recording_limit_exits_drag_and_saves_as_recorded(rig):
+    plugin, robot, store, events = rig
+    plugin.teach.max_duration = .5
+    terminal(events, dispatch(plugin, "start_record", name="limit"))
+    manual_drag(robot)
+    with robot.lock:
+        robot.hand_velocity = 30
+    wait_until(lambda: plugin.teach.recorder.finished.is_set())
+    record = plugin.teach.recorder.record
+    assert record["state"] == "recorded" and record["end_reason"] == "limit_reached"
+    assert robot.commands.count("StopDrag()") == 1 and robot.mode == 5
+    assert plugin.control.ownership.owner is None
+    assert terminal(events, dispatch(plugin, "stop_record"))["end_reason"] == "limit_reached"
+
+
+def test_waiting_limit_without_drag_is_incomplete(rig):
+    plugin, robot, store, events = rig
+    plugin.teach.max_duration = .3
+    terminal(events, dispatch(plugin, "start_record", name="no drag"))
+    wait_until(lambda: plugin.teach.recorder.finished.is_set())
+    record = plugin.teach.recorder.record
+    assert record["state"] == "incomplete" and "no manual drag within" in record["reason"]
+    assert "StopDrag()" not in robot.commands and plugin.control.ownership.owner is None
+
+
+def test_persistence_failure_reports_error(rig, monkeypatch):
+    plugin, robot, store, events = rig
+    terminal(events, dispatch(plugin, "start_record", name="disk full"))
+    drag_cycle(robot)
+
+    def full(record):
+        raise OSError("disk full")
+    monkeypatch.setattr(store, "save", full)
+    result = terminal(events, dispatch(plugin, "stop_record"), status="error")
+    assert "persistence failed" in result["reason"]
+    assert plugin.teach.recorder.record["state"] == "incomplete"
+
+
+def test_native_export_failure_keeps_local_recording_recorded(rig, monkeypatch):
+    plugin, robot, store, events = rig
+    terminal(events, dispatch(plugin, "start_record", name="share offline"))
+    drag_cycle(robot)
+
+    def offline(identifier):
+        raise RuntimeError("controller share offline")
+    monkeypatch.setattr(store, "export", offline)
+    result = terminal(events, dispatch(plugin, "stop_record"))
+    assert result["state"] == "recorded" and result["reason"] is None
+    assert result["native_state"] == "export_failed" and "offline" in result["native_reason"]
+    assert plugin.control.ownership.owner is None
+
+
+def test_stop_record_before_manual_drag_reports_no_drag(rig):
+    plugin, robot, store, events = rig
+    terminal(events, dispatch(plugin, "start_record", name="never dragged"))
+    time.sleep(.1)
+    result = terminal(events, dispatch(plugin, "stop_record"), status="error")
+    assert "no manual drag" in result["reason"]
+    assert "StopDrag()" not in robot.commands
     assert plugin.control.ownership.owner is None
 
 
 def test_feedback_loss_during_recording_saves_incomplete_and_exits_drag(rig):
     plugin, robot, store, events = rig
     terminal(events, dispatch(plugin, "start_record", name="drop"))
+    manual_drag(robot)
     time.sleep(.1)
     robot.feedback_enabled = False
     wait_until(lambda: "StopDrag()" in robot.commands)
@@ -222,6 +441,7 @@ def test_mcp_http_card_discovery_recording_and_results(rig):
         tools = rpc("tools/list", {})["result"]["tools"]
         assert {tool["name"] for tool in tools} == {"joints", "joint_move", "teach", "model"}
         terminal(events, call("start_record", name="HTTP recording", confirm_move=True))
+        manual_drag(robot)
         time.sleep(.15)
         result = terminal(events, call("stop_record", confirm_move=True))
         assert result["state"] == "recorded"
@@ -278,8 +498,8 @@ def test_verified_https_acp_retry_keeps_action_id_tool_and_does_not_repeat_robot
         wait_until(lambda: any(item["action_id"] == stop["action_id"] for item in received))
         stopped = next(item for item in received if item["action_id"] == stop["action_id"])
         assert stopped["tool"] == "joint_move" and stopped["status"] == "completed"
-        assert robot.commands.count("StartDrag()") == 1
-        assert robot.commands.count("StopDrag()") == 1
+        assert robot.commands.count("StartDrag()") == 0
+        assert robot.commands.count("StopDrag()") == 0
     finally:
         server.shutdown()
         server.server_close()
@@ -292,8 +512,9 @@ def test_disabled_recording_prepares_enable_without_changing_skin(rig):
         robot.mode, robot.enabled, robot.skin = 4, False, 1
     wait_until(lambda: plugin.client.snapshot()["data"]["robot_mode"] == 4)
     terminal(events, dispatch(plugin, "start_record", name="disabled"))
-    assert robot.commands == ["ClearError()", "EnableRobot()", "StartDrag()"]
+    assert robot.commands == ["ClearError()", "EnableRobot()"]
     assert robot.skin == 1
+    manual_drag(robot)
     time.sleep(.1)
     terminal(events, dispatch(plugin, "stop_record"))
 

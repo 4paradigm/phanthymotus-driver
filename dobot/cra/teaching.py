@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import queue
 import threading
 import time
 from uuid import uuid4
@@ -14,12 +15,12 @@ if __package__:
     from .completion import MotionCompletion
     from .feedback import positive_number
     from .model import JOINT_NAMES
-    from .trajectory import TrajectoryRecorder, TrajectoryStore
+    from .trajectory import TrajectoryRecorder, TrajectoryStore, at_rest_after_drag, protection_fault
 else:
     from completion import MotionCompletion
     from feedback import positive_number
     from model import JOINT_NAMES
-    from trajectory import TrajectoryRecorder, TrajectoryStore
+    from trajectory import TrajectoryRecorder, TrajectoryStore, at_rest_after_drag, protection_fault
 
 
 class Teaching(MotionCompletion):
@@ -50,8 +51,8 @@ class Teaching(MotionCompletion):
     def definition(self, config_schema):
         schema = action_schema({
             "info": ([], "查看示教卡功能和参数说明"),
-            "start_record": (["name", "confirm_move"], "进入拖拽模式后在后台录制，50 ms 一点；完成通知表示录制已启动"),
-            "stop_record": (["confirm_move"], "结束录制、退出拖拽并持久化保存；明确返回原生 CSV/传输是否就绪"),
+            "start_record": (["name", "confirm_move"], "清错、按需使能后启动录制任务并等待首次手动拖拽（不发送 StartDrag）；完成通知仅表示已开始等待"),
+            "stop_record": (["confirm_move"], "结束整次录制：仍在拖拽则退出拖拽，以新反馈确认模式 5 停稳后保存；本地录制状态与原生 CSV 状态分开返回"),
             "list_records": ([], "列出本地轨迹名称、时长、点数、完整性和原生文件状态"),
             "delete_record": (["trajectory_id", "confirm_move"], "删除指定本地录制；保留控制器上的副本"),
             "go_to_start": (["trajectory_id", "velocity", "acceleration", "detect_collision", "confirm_move"],
@@ -155,29 +156,59 @@ class Teaching(MotionCompletion):
                 raise
         return {"state": "running", "action_id": identifier}
 
-    def _wait_drag(self, enabled, baseline, cancel=None):
-        deadline = time.monotonic() + self.control.enable_timeout
-        while time.monotonic() < deadline:
-            if cancel is not None and cancel.is_set():
-                raise RuntimeError("teaching interrupted")
-            sample = self.control.feedback.snapshot()
-            state = sample.get("data")
-            fresh = baseline is not None and sample.get("packets_received", baseline) > baseline
-            if sample.get("connected") and not sample.get("stale") and state is not None and fresh:
-                if enabled:
-                    verified = state["robot_mode"] == 6 and state["enable_status"] and state["drag_status"]
-                else:
-                    verified = state["robot_mode"] != 6 and not state["drag_status"]
-                if verified:
-                    return sample
-            time.sleep(0.01)
-        raise TimeoutError("fresh feedback did not confirm entering drag" if enabled else
-                           "fresh feedback did not confirm leaving drag")
+    @staticmethod
+    def _read_fresh(subscription, deadline):
+        """Next packet delivered to this subscription, or None at the deadline."""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                return subscription.read(timeout=min(remaining, 0.05))
+            except queue.Empty:
+                continue
+
+    def _confirm_drag_exit(self):
+        """Stop drag only if still dragging; then require two consecutive packets,
+        all received after the stop request (or after StopDrag), at rest in mode 5."""
+        feedback = self.control.feedback
+        subscription = feedback.subscribe()
+        try:
+            try:
+                first = self._read_fresh(subscription, time.monotonic() + self.control.receive_timeout)
+            except RuntimeError:
+                first = None  # feedback lost: still attempt StopDrag, success needs fresh feedback
+            if first is None or first["data"]["robot_mode"] == 6 or first["data"]["drag_status"]:
+                # Attempt StopDrag even without feedback; success still needs confirmation.
+                self.control.stop_drag()
+                subscription.close()
+                subscription = feedback.subscribe()
+                first = None
+            deadline = time.monotonic() + self.control.enable_timeout
+            item, previous, settled = first, None, 0
+            while True:
+                if item is not None:
+                    state = item["data"]
+                    fault = protection_fault(state)
+                    if fault:
+                        raise RuntimeError(f"cannot confirm exit from drag: {fault}")
+                    if at_rest_after_drag(state):
+                        consecutive = previous is not None and item["packet"] == previous + 1
+                        settled = settled + 1 if settled and consecutive else 1
+                    else:
+                        settled = 0
+                    previous = item["packet"]
+                    if settled >= 2:
+                        return
+                item = self._read_fresh(subscription, deadline)
+                if item is None:
+                    raise TimeoutError("fresh feedback did not confirm leaving drag at rest in mode 5")
+        finally:
+            subscription.close()
 
     def _leave_drag(self, lease):
         try:
-            response = self.control.execute_drag(False)
-            self._wait_drag(False, response["submission_baseline"])
+            self._confirm_drag_exit()
             self._drag_cleanup_failed = False
             self.control.ownership.release(lease)
             return None
@@ -194,26 +225,25 @@ class Teaching(MotionCompletion):
             raise RuntimeError("recording feedback subscription is unavailable")
         record = self.store.create(args.get("name"), feedback.address)
         subscription = None
-        response = None
         try:
-            response = self.control.execute_drag(True, cancel=active["cancel"])
-            self._wait_drag(True, response["submission_baseline"], active["cancel"])
+            # No StartDrag: the operator enters/leaves drag with the arm button,
+            # as many times as needed, until stop_record or the recording limit.
+            self.control.prepare_record(cancel=active["cancel"])
             subscription = feedback.subscribe()
             recorder = TrajectoryRecorder(self.store, record, subscription,
                                           lambda: self._leave_drag(active["lease"]),
-                                          max_gap_ms=self.gap_ms, max_duration_s=self.max_duration)
+                                          max_gap_ms=self.gap_ms, max_duration_s=self.max_duration,
+                                          max_wait_s=self.max_duration)
             with self._lock:
                 if active["cancel"].is_set():
                     raise RuntimeError("teaching interrupted")
                 self.recorder = recorder
                 recorder.start()
-            return self.store.summary(record)
+            return {**self.store.summary(record), "drag": "waiting_for_first_manual_drag"}
         except Exception as exc:
             if subscription is not None:
                 subscription.close()
-            cleanup = (self._leave_drag(active["lease"]) if response is not None or
-                       getattr(exc, "dobot_command_attempted", None) == "StartDrag" else None)
-            record.update(state="incomplete", reason=str(exc) + (f"; {cleanup}" if cleanup else ""))
+            record.update(state="incomplete", reason=str(exc))
             self.store.save(record)
             raise
 

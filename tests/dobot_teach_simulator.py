@@ -31,6 +31,7 @@ class RobotSimulator:
         self.setting_until = 0
         self.motion = None
         self.hand_velocity = 0.0
+        self.joint_speed = None  # overrides QDActual, e.g. an arm still coasting in mode 5
         self.failure_command = None
         self.feedback_enabled = True
         self.skin = 0
@@ -187,7 +188,8 @@ class RobotSimulator:
                     record["CollisionState"] = int(self.collision)
                     record["CurrentCommandId"] = self.command_id
                     record["QActual"] = self.joints
-                    record["QDActual"] = [1 if self.mode == 7 and self.motion is not None else 0] * 6
+                    record["QDActual"] = (self.joint_speed if self.joint_speed is not None else
+                                          [1 if self.mode == 7 and self.motion is not None else 0] * 6)
                     data = record.tobytes()
                 connection.sendall(data[:37])
                 connection.sendall(data[37:])

@@ -31,6 +31,43 @@ else:
 SAMPLE_MS = 50
 MAX_POINTS = 10000
 MAX_BYTES = 32 * 1024 * 1024
+REST_SPEED_DEG_S = 0.1
+
+
+def protection_fault(state):
+    """Protection reasons that end a recording regardless of mode 5/6."""
+    if not state["enable_status"]:
+        return "robot disabled"
+    if state["error_status"]:
+        return "controller alarm"
+    if state["collision_state"]:
+        return "collision detected"
+    if any(state[f"{part}_approach_state"] for part in ("arm", "j4", "j5", "j6")):
+        return "safe skin triggered"
+    if any(state["brake_released"]):
+        return "brakes released"
+    if state["robot_type"] != 113:
+        return "controller is not CR3A (type 113)"
+    return None
+
+
+def interval_fault(state):
+    """Mode 5 is only an acceptable pause between drags when nothing else runs."""
+    if state["running_status"]:
+        return "robot is running"
+    if state["jog_status"]:
+        return "robot is jogging"
+    if state["run_queued_cmd"]:
+        return "command queue is active"
+    if state["pause_cmd_flag"]:
+        return "command queue is paused"
+    return None
+
+
+def at_rest_after_drag(state):
+    return (state["robot_mode"] == 5 and state["enable_status"] and not state["drag_status"]
+            and interval_fault(state) is None
+            and all(abs(v) <= REST_SPEED_DEG_S for v in state["joint_state"]["qd_actual"]))
 
 
 def check_joints(values):
@@ -203,8 +240,8 @@ class TrajectoryStore:
 
     @staticmethod
     def summary(record):
-        keys = ("trajectory_id", "name", "state", "sample_ms", "duration_s", "point_count",
-                "native_state", "controller_file", "reason")
+        keys = ("trajectory_id", "name", "state", "end_reason", "sample_ms", "duration_s", "point_count",
+                "native_state", "native_reason", "controller_file", "reason")
         return {key: record[key] for key in keys if key in record}
 
     def delete(self, identifier):
@@ -280,15 +317,26 @@ class TrajectoryStore:
 
 
 class TrajectoryRecorder:
-    def __init__(self, store, record, subscription, on_finished, *, max_gap_ms=50, max_duration_s=500):
+    """One recording: wait for the first manual drag, then a continuous time axis
+    across any number of drag (mode 6) and idle (mode 5) phases until stopped."""
+
+    def __init__(self, store, record, subscription, on_finished, *, max_gap_ms=50, max_duration_s=500,
+                 max_wait_s=None, clock=time.monotonic):
         self.store, self.record, self.subscription = store, record, subscription
         self.on_finished = on_finished
         self.max_gap_ms = max_gap_ms
         self.max_duration_s = max_duration_s
+        self.max_wait_s = max_duration_s if max_wait_s is None else max_wait_s
+        self._clock = clock
         self.stop_event = threading.Event()
         self.finished = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True, name="dobot-teach-recorder")
         self.reason = None
+        self._reason_lock = threading.Lock()
+        self._sealed = False
+        self.limit_reached = False
+        self.drag_entries = 0
+        self._mode = None
         self._points = []
         self._previous = None
         self._origin = None
@@ -298,15 +346,43 @@ class TrajectoryRecorder:
         self.thread.start()
 
     def stop(self, reason=None):
-        self.reason = reason
+        """reason=None is a normal stop_record; any reason marks the take incomplete.
+        An interruption is irrevocable: a later normal stop never clears it. Returns
+        False once the outcome is sealed (the interruption arrived too late to apply)."""
+        with self._reason_lock:
+            if reason and self.reason is None and not self._sealed:
+                self.reason = reason
+            accepted = not self._sealed
         self.stop_event.set()
+        return accepted
+
+    def _seal(self, reason):
+        """Final, synchronized check: merge any interruption received while exiting drag."""
+        with self._reason_lock:
+            self._sealed = True
+            if self.reason and (reason is None or self.reason not in reason):
+                return f"{reason}; {self.reason}" if reason else self.reason
+            return reason
 
     def _consume(self, item):
+        """Return the raw sample, or None while still waiting for the first drag."""
         state = item["data"]
-        if (state["robot_mode"] != 6 or not state["enable_status"] or state["error_status"] or
-                state["collision_state"] or state["robot_type"] != 113 or
-                any(state[f"{part}_approach_state"] for part in ("arm", "j4", "j5", "j6"))):
-            raise RuntimeError("recording interrupted by mode, enable or protection change")
+        # Protection first: mode 5/6 never bypasses it.
+        fault = protection_fault(state)
+        if fault:
+            raise RuntimeError(f"recording interrupted: {fault}")
+        mode = state["robot_mode"]
+        if mode == 5:
+            fault = interval_fault(state)
+            if fault:
+                raise RuntimeError(f"recording interrupted: {fault}")
+        elif mode != 6:
+            raise RuntimeError(f"recording interrupted by controller mode {mode}")
+        if mode == 6 and self._mode != 6:
+            self.drag_entries += 1
+        self._mode = mode
+        if self._previous is None and mode != 6:
+            return None
         timestamp = state["timestamp"]
         if type(timestamp) is not int or timestamp < 0:
             raise ValueError("invalid controller timestamp")
@@ -322,7 +398,7 @@ class TrajectoryRecorder:
             gap = timestamp - self._previous["timestamp_ms"]
             if not 0 < gap <= self.max_gap_ms:
                 raise RuntimeError("recording timestamps are discontinuous or feedback is missing")
-        raw = {"timestamp_ms": timestamp, "time_ms": elapsed, "joints_deg": joints}
+        raw = {"timestamp_ms": timestamp, "time_ms": elapsed, "robot_mode": mode, "joints_deg": joints}
         if self._previous is None:
             self._points.append({"time_ms": 0, "joints_deg": joints})
         else:
@@ -332,11 +408,14 @@ class TrajectoryRecorder:
                 values = [a + alpha * (b - a) for a, b in zip(self._previous["joints_deg"], joints)]
                 self._points.append({"time_ms": target_time, "joints_deg": values})
         self._previous = raw
+        # Limits count from the first drag and include every idle pause.
+        if len(self._points) >= MAX_POINTS or elapsed >= self.max_duration_s * 1000:
+            self.limit_reached = True
         return raw
 
     def _run(self):
         reason = None
-        start = last_packet = time.monotonic()
+        armed = last_packet = self._clock()
         directory = self.store._directory(self.record["trajectory_id"])
         try:
             with (directory / "raw.jsonl").open("x", encoding="utf-8") as file:
@@ -344,18 +423,22 @@ class TrajectoryRecorder:
                     try:
                         item = self.subscription.read(timeout=0.05)
                     except queue.Empty:
-                        if time.monotonic() - last_packet > 0.25:
+                        if self._clock() - last_packet > 0.25:
                             raise RuntimeError("feedback missing during recording")
                         continue
-                    last_packet = time.monotonic()
+                    last_packet = self._clock()
                     if last_packet - item["received_at"] > 0.25:
                         raise RuntimeError("recording consumer fell behind feedback")
                     raw = self._consume(item)
+                    if raw is None:
+                        if last_packet - armed >= self.max_wait_s:
+                            raise RuntimeError(f"no manual drag within {self.max_wait_s:g} s")
+                        continue
                     file.write(json.dumps(raw, allow_nan=False, separators=(",", ":")) + "\n")
                     file.flush()
                     if file.tell() > MAX_BYTES:
                         raise RuntimeError("recording exceeds storage size limit")
-                    if len(self._points) >= MAX_POINTS or last_packet - start >= self.max_duration_s:
+                    if self.limit_reached:
                         break
                 file.flush()
                 os.fsync(file.fileno())
@@ -364,29 +447,39 @@ class TrajectoryRecorder:
             reason = str(exc)
         finally:
             self.subscription.close()
-            if len(self._points) < 2:
+            if not self._points:
+                reason = reason or "no manual drag was detected before the recording ended"
+            elif len(self._points) < 2:
                 reason = reason or "recording needs at least two samples (50 ms apart)"
             try:
+                # Leave drag if still in it and confirm rest from post-stop feedback.
                 cleanup_error = self.on_finished()
-                reason = reason or cleanup_error
             except Exception as exc:
-                reason = reason or f"could not confirm exit from drag: {exc}"
+                cleanup_error = f"could not confirm exit from drag: {exc}"
+            if cleanup_error:
+                reason = f"{reason}; {cleanup_error}" if reason else cleanup_error
+            # stop_motion/shutdown may arrive while the exit is being confirmed.
+            reason = self._seal(reason)
+            end_reason = "interrupted" if reason else ("limit_reached" if self.limit_reached else "stop_record")
             try:
                 data = {"version": 1, "sample_ms": SAMPLE_MS, "frames": self._frames, "points": self._points}
                 path = directory / "samples.json"
                 atomic_json(path, data)
                 self.record.update(state="incomplete" if reason else "recorded", reason=reason,
+                                   end_reason=end_reason, drag_entries=self.drag_entries,
                                    point_count=len(self._points),
                                    duration_s=(len(self._points) - 1) * SAMPLE_MS / 1000 if self._points else 0,
                                    samples_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
                 self.store.save(self.record)
                 if reason is None:
+                    # Native CSV is independent: a local take stays recorded even if export fails.
                     try:
                         self.record = self.store.export(self.record["trajectory_id"])
                     except Exception as exc:
-                        self.record.update(native_state="export_failed", reason=str(exc))
+                        self.record.update(native_state="export_failed", native_reason=str(exc))
                         self.store.save(self.record)
             except Exception as exc:
-                self.record.update(state="incomplete", reason=f"recording persistence failed: {exc}")
+                self.record.update(state="incomplete", end_reason="interrupted",
+                                   reason=f"recording persistence failed: {exc}")
             finally:
                 self.finished.set()

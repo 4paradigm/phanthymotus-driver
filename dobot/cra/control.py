@@ -304,21 +304,27 @@ class RobotController:
                 self._close()
                 raise
 
-    def execute_drag(self, start, *, cancel=None):
+    def prepare_record(self, *, cancel=None):
+        """ClearError/EnableRobot only; the operator enters drag manually."""
         self.ownership.check("teach")
-        action = "start_record" if start else "stop_record"
 
         def check(current_action, *, allow_own_queue=False):
             if cancel is not None and cancel.is_set():
                 raise RuntimeError("teaching interrupted")
-            if start:
-                return self._check_preparation_state(current_action, allow_own_queue=allow_own_queue)
+            return self._check_preparation_state(current_action, allow_own_queue=allow_own_queue)
+
+        return self._execute("start_record", None, check, card="teach")
+
+    def stop_drag(self):
+        self.ownership.check("teach")
+
+        def check(current_action, *, allow_own_queue=False):
             # Always allow an explicit attempt to leave drag after feedback loss.
             if not self.feedback.address:
                 raise RuntimeError("configure the controller IP first")
             return {**self.feedback.snapshot(), "controller_ip": self.feedback.address}
 
-        return self._execute(action, "StartDrag" if start else "StopDrag", check, card="teach")
+        return self._execute("stop_record", "StopDrag", check, card="teach")
 
     def execute_path(self, filename, start_joints, args, *, cancel=None):
         filename = trajectory_filename(filename)
@@ -432,6 +438,10 @@ class RobotController:
                             if time.monotonic() >= deadline:
                                 raise
                             time.sleep(0.02)
+                if command is None:
+                    request["state"] = "prepared"
+                    self._update(card, last_request=request)
+                    return request
                 if command in ("MovJ", "RelJointMovJ"):
                     final_sample = self._check_motion_state(action)
                     request["start_joint_angles_deg"] = list(final_sample["data"]["joint_state"]["q_actual"])

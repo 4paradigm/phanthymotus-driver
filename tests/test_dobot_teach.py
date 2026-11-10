@@ -12,7 +12,8 @@ import pytest
 from dobot.cra.control import parse_start_pose, trajectory_filename
 from dobot.cra.device import DobotSensors
 from dobot.cra.feedback import FeedbackClient, FeedbackSubscription
-from dobot.cra.trajectory import NativeCsvProfile, TrajectoryRecorder, TrajectoryStore, atomic_json
+from dobot.cra import trajectory
+from dobot.cra.trajectory import NativeCsvProfile, TrajectoryRecorder, TrajectoryStore, at_rest_after_drag, atomic_json
 from test_dobot_joint_move import Feedback, set_mode
 from test_dobot_cra_sensors import FakeConnection, packet, wait_until
 
@@ -73,7 +74,7 @@ def test_resampling_uses_controller_timestamps_not_display_or_arrival_time(tmp_p
     rec.subscription.close()
 
 
-@pytest.mark.parametrize("fault", ["gap", "duplicate", "backward", "mode", "disabled", "alarm", "collision", "skin", "model", "frame", "nan", "limit"])
+@pytest.mark.parametrize("fault", ["gap", "duplicate", "backward", "disabled", "alarm", "collision", "skin", "model", "frame", "nan", "limit"])
 def test_recording_rejects_discontinuities_and_protection_changes(tmp_path, fault):
     rec, state, _ = recorder(tmp_path)
     rec._consume({"data": copy.deepcopy(state)})
@@ -81,7 +82,6 @@ def test_recording_rejects_discontinuities_and_protection_changes(tmp_path, faul
     if fault == "gap": state["timestamp"] += 100
     if fault == "duplicate": state["timestamp"] = 1000
     if fault == "backward": state["timestamp"] = 999
-    if fault == "mode": state["robot_mode"] = 5
     if fault == "disabled": state["enable_status"] = False
     if fault == "alarm": state["error_status"] = True
     if fault == "collision": state["collision_state"] = True
@@ -92,6 +92,124 @@ def test_recording_rejects_discontinuities_and_protection_changes(tmp_path, faul
     if fault == "limit": state["joint_state"]["q_actual"][2] = 156
     with pytest.raises((ValueError, RuntimeError)):
         rec._consume({"data": state})
+    rec.subscription.close()
+
+
+def feed(rec, state, mode, packets, *, step_ms=8, velocity=0.0):
+    """Advance the controller clock; the hand moves joint1 at `velocity` deg/s."""
+    results = []
+    for _ in range(packets):
+        state["timestamp"] += step_ms
+        state["robot_mode"], state["drag_status"] = mode, mode == 6
+        state["joint_state"]["q_actual"][0] += velocity * step_ms / 1000
+        results.append(rec._consume({"data": copy.deepcopy(state)}))
+    return results
+
+
+def waiting(tmp_path):
+    rec, state, finished = recorder(tmp_path)
+    state["robot_mode"], state["drag_status"] = 5, False
+    return rec, state, finished
+
+
+def test_waiting_for_first_drag_produces_no_points(tmp_path):
+    rec, state, _ = waiting(tmp_path)
+    assert feed(rec, state, 5, 50) == [None] * 50
+    assert rec._points == [] and rec.drag_entries == 0 and rec._origin is None
+    rec.subscription.close()
+
+
+def test_multiple_drag_cycles_share_one_continuous_time_axis(tmp_path):
+    rec, state, _ = waiting(tmp_path)
+    feed(rec, state, 5, 10)
+    first = feed(rec, state, 6, 25, velocity=100)         # 200 ms drag
+    held = state["joint_state"]["q_actual"][0]
+    pause = feed(rec, state, 5, 50)                        # 400 ms idle pause
+    feed(rec, state, 6, 25, velocity=-50)                  # second drag
+    feed(rec, state, 5, 25)
+    assert first[0]["time_ms"] == 0 and all(item is not None for item in pause)
+    assert {item["robot_mode"] for item in pause} == {5}
+    assert rec.drag_entries == 2 and not rec.limit_reached
+    times = [point["time_ms"] for point in rec._points]
+    assert times == list(range(0, len(times) * 50, 50))
+    # 124 packets * 8 ms after the first drag packet: one axis, no reset per drag.
+    assert rec._previous["time_ms"] == 124 * 8 and times[-1] == 124 * 8 // 50 * 50
+    # The pause is kept as real time at the held angle, not removed or spliced.
+    paused = [p["joints_deg"][0] for p in rec._points if 250 <= p["time_ms"] <= 550]
+    assert len(paused) == 7 and all(abs(q - held) < 1e-9 for q in paused)
+    assert rec._points[-1]["joints_deg"][0] < held
+    rec.subscription.close()
+
+
+def test_mode5_coasting_after_drag_is_still_captured(tmp_path):
+    rec, state, _ = recorder(tmp_path)
+    feed(rec, state, 6, 10, velocity=50)
+    state["joint_state"]["qd_actual"] = [20, 0, 0, 0, 0, 0]
+    coasting = feed(rec, state, 5, 10, velocity=20)
+    assert all(item["robot_mode"] == 5 for item in coasting)
+    assert coasting[-1]["joints_deg"][0] > coasting[0]["joints_deg"][0]
+    assert not at_rest_after_drag(state)
+    state["joint_state"]["qd_actual"] = [0.1, -0.1, 0, 0, 0, 0]
+    assert at_rest_after_drag(state)
+    rec.subscription.close()
+
+
+@pytest.mark.parametrize("field", ["running_status", "jog_status", "run_queued_cmd", "pause_cmd_flag"])
+@pytest.mark.parametrize("phase", ["waiting", "pause"])
+def test_mode5_with_activity_is_not_an_idle_pause(tmp_path, field, phase):
+    rec, state, _ = waiting(tmp_path)
+    if phase == "pause":
+        feed(rec, state, 6, 10)
+        feed(rec, state, 5, 5)
+    state[field] = 1
+    with pytest.raises(RuntimeError, match="interrupted"):
+        feed(rec, state, 5, 1)
+    rec.subscription.close()
+
+
+@pytest.mark.parametrize("mode", [7, 8, 9, 10, 11])
+@pytest.mark.parametrize("phase", ["waiting", "drag", "pause"])
+def test_other_modes_with_clean_flags_end_recording(tmp_path, mode, phase):
+    rec, state, _ = waiting(tmp_path)
+    if phase != "waiting":
+        feed(rec, state, 6, 10)
+    if phase == "pause":
+        feed(rec, state, 5, 5)
+    with pytest.raises(RuntimeError, match=f"controller mode {mode}"):
+        feed(rec, state, mode, 1)
+    rec.subscription.close()
+
+
+@pytest.mark.parametrize("fault", ["brake", "skin", "alarm", "disabled"])
+def test_protection_is_checked_before_mode5_is_accepted(tmp_path, fault):
+    rec, state, _ = recorder(tmp_path)
+    feed(rec, state, 6, 10)
+    if fault == "brake": state["brake_released"][3] = True
+    if fault == "skin": state["arm_approach_state"] = True
+    if fault == "alarm": state["error_status"] = True
+    if fault == "disabled": state["enable_status"] = False
+    with pytest.raises(RuntimeError, match="recording interrupted: "):
+        feed(rec, state, 5, 1)
+    rec.subscription.close()
+
+
+def test_recording_limit_includes_pauses_and_is_not_reset_by_reentering_drag(tmp_path):
+    rec, state, _ = waiting(tmp_path)
+    rec.max_duration_s = .5
+    feed(rec, state, 5, 20)                                # waiting does not count
+    feed(rec, state, 6, 12)
+    feed(rec, state, 5, 37)                                # ~392 ms elapsed incl. pause
+    assert not rec.limit_reached
+    feed(rec, state, 6, 20)                                # re-entering drag keeps the origin
+    assert rec.limit_reached and rec._previous["time_ms"] >= 500
+    rec.subscription.close()
+
+
+def test_point_count_never_exceeds_max_points(tmp_path, monkeypatch):
+    monkeypatch.setattr(trajectory, "MAX_POINTS", 3)
+    rec, state, _ = recorder(tmp_path)
+    feed(rec, state, 6, 40)
+    assert len(rec._points) == 3 and rec.limit_reached
     rec.subscription.close()
 
 
@@ -233,3 +351,14 @@ def test_teaching_requires_literal_true(bad):
     plugin = DobotSensors({})
     with pytest.raises(ValueError, match="confirm_move"):
         plugin.teach.start("start_record", {"name": "a", "confirm_move": bad})
+
+
+def test_interruption_is_irrevocable_and_sealed_at_final_save(tmp_path):
+    rec, state, _ = recorder(tmp_path)
+    assert rec.stop("driver stopped during recording")
+    rec.stop(None)
+    assert rec.reason == "driver stopped during recording"
+    assert rec._seal(None) == "driver stopped during recording"
+    assert rec._seal("cleanup; driver stopped during recording").count("driver stopped") == 1
+    assert rec.stop("late") is False and rec.reason == "driver stopped during recording"
+    rec.subscription.close()
