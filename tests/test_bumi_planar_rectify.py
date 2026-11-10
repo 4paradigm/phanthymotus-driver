@@ -54,6 +54,15 @@ def manual_config(rect):
                           "output_width": 220, "output_height": 300, "max_fps": 5})
 
 
+def test_canvas_bare_tool_call_reports_state_without_starting_worker(rect):
+    obj = rect.PlanarRectifyPlugin({}, "test", None)
+    result = obj.dispatch("planar_rectify", {})
+    assert result["state"] == "idle"
+    assert result["config"]["mode"] == "auto"
+    assert obj._thread is None
+    assert obj.dispatch("unknown_action", {}) is None
+
+
 def test_manual_rectification_restores_pixels_orientation_and_homography(rect):
     page, image, quad = scene()
     report, output = rect.rectify(encode(image), manual_config(rect))
@@ -76,6 +85,51 @@ def test_auto_detects_tilted_boundary_without_claiming_document_identity(rect):
     assert output is not None and report["valid"]
     assert report["selection"] == "geometric_candidate"
     assert np.max(np.linalg.norm(np.asarray(report["corners_px"]) - quad, axis=1)) < 5
+
+
+def test_auto_detects_small_slanted_page_below_old_area_cutoff(rect):
+    image = np.full((480, 640, 3), 45, np.uint8)
+    quad = np.int32([[260, 150], [425, 200], [380, 345], [220, 295]])
+    cv2.fillConvexPoly(image, quad, (220, 220, 220))
+    assert 0.05 < cv2.contourArea(quad) / (640 * 480) < 0.15
+    report, output = rect.rectify(encode(image), rect.settings({}))
+    assert report["valid"] and report["status"] == "ok" and output is not None
+    assert np.max(np.linalg.norm(np.asarray(report["corners_px"]) - quad, axis=1)) < 5
+
+
+def test_auto_detects_low_contrast_page_and_merges_detection_passes(rect):
+    image = np.full((480, 640, 3), 110, np.uint8)
+    quad = np.int32([[150, 55], [430, 100], [470, 420], [100, 390]])
+    cv2.fillConvexPoly(image, quad, (138, 138, 138))
+    report, output = rect.rectify(encode(image), rect.settings({}))
+    assert report["valid"] and output is not None
+    assert report["candidate_count"] == 1
+    assert np.max(np.linalg.norm(np.asarray(report["corners_px"]) - quad, axis=1)) < 5
+
+
+def test_two_small_pages_still_require_selection(rect):
+    image = np.full((480, 640, 3), 60, np.uint8)
+    cv2.rectangle(image, (65, 160), (225, 325), (220, 220, 220), -1)
+    cv2.rectangle(image, (385, 170), (545, 335), (220, 220, 220), -1)
+    report, output = rect.rectify(encode(image), rect.settings({}))
+    assert report["status"] == "ambiguous_boundary"
+    assert not report["valid"] and output is None
+
+
+@pytest.mark.parametrize("shape", ["tiny", "circle", "cropped", "smooth_light"])
+def test_enhanced_detection_does_not_invent_missing_corners(rect, shape):
+    image = np.full((480, 640, 3), 90, np.uint8)
+    if shape == "tiny":
+        cv2.rectangle(image, (290, 210), (350, 270), (220, 220, 220), -1)
+    elif shape == "circle":
+        cv2.circle(image, (320, 240), 130, (220, 220, 220), -1)
+    elif shape == "cropped":
+        cv2.rectangle(image, (-10, 120), (160, 330), (220, 220, 220), -1)
+    else:
+        gradient = np.linspace(70, 180, 640).astype(np.uint8)
+        image[:] = gradient[None, :, None]
+    report, output = rect.rectify(encode(image), rect.settings({}))
+    assert not report["valid"] and output is None
 
 
 def test_no_boundary_and_ambiguous_pages_never_emit_a_fake_scan(rect):

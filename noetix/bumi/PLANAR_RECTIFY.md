@@ -43,10 +43,13 @@ ratio of an unknown rectangle. The default 4:3 output is not an A4 detector.
 There is no text-orientation inference or automatic portrait rotation. Manual
 corner order selects orientation; automatic ordering is a geometric heuristic.
 
-Automatic mode uses contrast edges, closed contours and convex quadrilaterals,
-bounded to a 640-pixel detection image. Candidates cover 15%-95% of the image;
-cropped borders, tiny shapes and a substantial distinct second candidate are
-rejected. Success means a **geometric candidate**, not a claim that paper or a
+Automatic mode uses two bounded edge passes (original grayscale and local
+contrast enhancement), closed contours and convex quadrilaterals on a
+640-pixel detection image. Candidates cover 5%-95% of the image so that a
+smaller/slanted target is not rejected by the former 15% minimum. Duplicate
+boundaries across passes are merged; a quadrilateral must agree with its
+observed contour area. Cropped borders, tiny shapes and a substantial distinct
+second candidate are rejected. Success means a **geometric candidate**, not a claim that paper or a
 whiteboard was semantically recognized. Manual mode is the fallback when the
 boundary is unclear. This is planar rectification; it cannot uncurve a book,
 remove lens distortion, recover hidden corners or restore blurred text.

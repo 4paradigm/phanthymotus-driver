@@ -24,7 +24,7 @@ DEFAULTS = {
 MAX_JPEG_BYTES = 2 * 1024 * 1024
 MAX_PIXELS = 1920 * 1080
 MAX_AGE_S = 2.0
-MIN_AREA_RATIO = 0.15
+MIN_AREA_RATIO = 0.05
 _TOPIC = re.compile(r"/(?:[A-Za-z_][A-Za-z0-9_]*)(?:/[A-Za-z_][A-Za-z0-9_]*)*")
 
 
@@ -109,30 +109,48 @@ def find_quad(image):
     scale = min(1.0, 640 / max(width, height))
     small = cv2.resize(image, (round(width * scale), round(height * scale)))
     gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     candidates = []
     small_height, small_width = gray.shape
-    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:40]:
-        area = cv2.contourArea(contour)
-        if not MIN_AREA_RATIO <= area / gray.size <= 0.95:
-            continue
-        approx = cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True)
-        if len(approx) != 4:
-            continue
-        quad = _ordered(approx[:, 0, :].astype(np.float32))
-        try:
-            _validate_quad(quad, gray.size * MIN_AREA_RATIO, 16)
-        except ValueError:
-            continue
-        if (np.any(quad < 2) or np.any(quad[:, 0] > small_width - 3)
-                or np.any(quad[:, 1] > small_height - 3)):
-            continue
-        # Canny's inner/outer boundary must not become two separate candidates.
-        if any(np.max(np.linalg.norm(quad - old, axis=1)) < 8 for old in candidates):
-            continue
-        candidates.append(quad)
+    # A small/slanted page can occupy well below 15% of a live camera frame.
+    # Keep the original edge pass and add a bounded, contrast-enhanced pass for
+    # shadowed/faint edges. Neither pass labels an object as paper.
+    contrast = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    kernel = np.ones((3, 3), np.uint8)
+    for plane, low, high in ((gray, 50, 150), (contrast, 20, 60)):
+        edges = cv2.Canny(cv2.GaussianBlur(plane, (5, 5), 0), low, high)
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:40]:
+            area = cv2.contourArea(contour)
+            if not MIN_AREA_RATIO <= area / gray.size <= 0.95:
+                continue
+            points = contour[:, 0, :]
+            # Check the whole observed contour, not only the simplified corners:
+            # polygon approximation must not hide a border that leaves the frame.
+            if (np.any(points < 2) or np.any(points[:, 0] > small_width - 3)
+                    or np.any(points[:, 1] > small_height - 3)):
+                continue
+            perimeter = cv2.arcLength(contour, True)
+            for tolerance in (0.02, 0.03):
+                approx = cv2.approxPolyDP(contour, tolerance * perimeter, True)
+                if len(approx) != 4:
+                    continue
+                quad = _ordered(approx[:, 0, :].astype(np.float32))
+                try:
+                    _validate_quad(quad, gray.size * MIN_AREA_RATIO, 16)
+                except ValueError:
+                    continue
+                # Mild boundary noise is acceptable; a hand, curved shape or
+                # missing region must not simply be filled with a bounding box.
+                quad_area = cv2.contourArea(quad)
+                if abs(area - quad_area) > 0.10 * quad_area:
+                    continue
+                # Merge inner/outer edges and the two detection passes before
+                # deciding whether there are multiple distinct targets.
+                if not any(np.max(np.linalg.norm(quad - old, axis=1)) < 8
+                           for old in candidates):
+                    candidates.append(quad)
+                break
     if not candidates:
         return None, "no_boundary", 0
     candidates.sort(key=cv2.contourArea, reverse=True)
@@ -404,7 +422,9 @@ class PlanarRectifyPlugin:
         return result
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action in ("info", "robot_info"):
+        # Canvas calls without an action are dispatched using the tool name.
+        # Match other Bumi processors: a bare call reports current state.
+        if action in ("info", "robot_info", "planar_rectify"):
             return self.info()
         if action == "stop":
             self.stop()
