@@ -495,16 +495,20 @@ def test_mode6_without_drag_status_is_reported_as_inconsistent(rig):
     assert plugin.control.ownership.owner is None
 
 
-def test_long_mode0_is_not_accepted_as_drag_entry(rig):
+def test_long_mode0_does_not_interrupt_recording_or_count_as_drag_by_itself(rig):
     plugin, robot, store, events = rig
-    terminal(events, dispatch(plugin, "start_record", name="mode 0 too long"))
-    manual_drag(robot, entry_packets=40)  # ~320 ms of mode 0
-    wait_until(lambda: plugin.teach.recorder.finished.is_set(), 5)
+    started = terminal(events, dispatch(plugin, "start_record", name="mode 0 accepted"))
+    manual_drag(robot, entry_packets=40)
+    time.sleep(.2)
     record = plugin.teach.recorder.record
-    assert record["state"] == "incomplete" and "mode 0 lasting over 100 ms" in record["reason"]
-    manual_drag(robot, False)
-    terminal(events, dispatch(plugin, "stop_motion"))
-    assert plugin.control.ownership.owner is None
+    assert record["state"] == "recording" and not plugin.teach.recorder.finished.is_set()
+    stopped = dispatch(plugin, "stop_record")
+    with robot.lock:
+        robot.mode, robot.drag_status = 5, False
+        robot.hand_velocity, robot.running_packets = 0, 0
+    result = terminal(events, stopped)
+    assert result["state"] == "recorded" and result["point_count"] > 1
+    assert started["state"] == "recording"
 
 
 def test_waiting_limit_without_drag_is_incomplete(rig):

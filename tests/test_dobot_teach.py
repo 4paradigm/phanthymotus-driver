@@ -209,16 +209,22 @@ def test_field_drag_button_sequence_replays_without_interruption(tmp_path):
     rec.subscription.close()
 
 
-@pytest.mark.parametrize("rows,match", [
-    ([(1, 0, 0, 0, 0)], "mode 0 without drag status"),
-    ([(14, 0, 1, 0, 0)], "mode 0 lasting over 100 ms"),
-    ([(3, 0, 1, 0, 0), (1, 5, 0, 0, 0)], "drag transition ended in mode 5"),
-    ([(3, 0, 1, 0, 0), (1, 7, 0, 0, 0)], "controller mode 7"),
+@pytest.mark.parametrize("rows", [
+    [(1, 0, 0, 0, 0)],
+    [(14, 0, 1, 0, 0)],
+    [(3, 0, 1, 0, 0), (1, 5, 0, 0, 0)],
 ])
-def test_only_the_short_drag_entry_mode0_is_accepted(tmp_path, rows, match):
+def test_mode0_is_not_an_error_or_drag_transition_gate(tmp_path, rows):
     rec, state, _ = waiting(tmp_path)
-    with pytest.raises(RuntimeError, match=match):
-        replay(rec, state, rows)
+    results = replay(rec, state, rows)
+    assert all(item is not None for item in results)
+    rec.subscription.close()
+
+
+def test_mode0_does_not_whitelist_other_unsupported_modes(tmp_path):
+    rec, state, _ = waiting(tmp_path)
+    with pytest.raises(RuntimeError, match="controller mode 7"):
+        replay(rec, state, [(3, 0, 1, 0, 0), (1, 7, 0, 0, 0)])
     rec.subscription.close()
 
 

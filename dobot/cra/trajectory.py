@@ -27,8 +27,6 @@ SAMPLE_MS = 50
 MAX_POINTS = 10000
 MAX_BYTES = 32 * 1024 * 1024
 REST_SPEED_DEG_S = 0.1
-# Field capture (CR3A, drag button): 5 -> 0 (enabled, drag_status=1, ~24 ms) -> 6.
-DRAG_ENTRY_TRANSITION_MS = 100
 # Field capture: one mode-5 packet with running_status=1 right after leaving drag.
 DRAG_EXIT_RUNNING_MS = 100
 
@@ -278,18 +276,7 @@ class TrajectoryRecorder:
         mode = state["robot_mode"]
         if mode not in (0, 5, 6):
             raise RuntimeError(f"recording interrupted by controller mode {mode}")
-        if self._mode == 0 and mode != 6 and mode != 0:
-            raise RuntimeError(f"recording interrupted by controller mode 0: drag transition ended in mode {mode}")
-        if mode == 0:
-            # Only the short button-drag entry transition is accepted as mode 0.
-            if not state["drag_status"]:
-                raise RuntimeError("recording interrupted by controller mode 0 without drag status")
-            if self._mode != 0:
-                self._transition_since = timestamp
-            if timestamp - self._transition_since > DRAG_ENTRY_TRANSITION_MS:
-                raise RuntimeError(f"recording interrupted by controller mode 0 lasting over "
-                                   f"{DRAG_ENTRY_TRANSITION_MS} ms")
-        elif mode == 6:
+        if mode == 6:
             self._last_drag_ms = timestamp
         else:
             fault = interval_fault(state)

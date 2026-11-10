@@ -233,7 +233,7 @@ class Teaching(MotionCompletion):
                     wait_s = min(wait_s, self.control.enable_timeout)
                 item = self._read_fresh(subscription, started + wait_s)
                 if item is None:
-                    if last is not None and (last["robot_mode"] in (0, 6) or last["drag_status"]):
+                    if last is not None and (last["robot_mode"] == 6 or last["drag_status"]):
                         raise TimeoutError(f"arm still in drag after {wait_s:g} s; press the drag button "
                                            "on the arm to exit drag, then run stop_motion or stop_record")
                     raise TimeoutError("fresh feedback did not confirm leaving drag at rest in mode 5")
