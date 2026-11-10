@@ -1,0 +1,26 @@
+id: unixai-panther-driver
+name: UniX AI Panther Bundle
+category: driver
+hardware_provider: unixai
+hardware_model: panther
+image_name: unixai-panther
+port: 15792
+mcp_url: "http://localhost:15792/mcp"
+description: "UniX AI Panther mobile manipulator — joints, consolidated state, IMU, odometry, merged lidar, lazy RGB-D camera, omnidirectional base, dual-arm P2P, grippers, lifting and head"
+build_context_extras:
+  - ../../common
+cards:
+  - {name: joints, type: sensor}
+  - {name: model, type: resource}
+  - {name: robot_state, type: sensor}
+  - {name: imu, type: sensor}
+  - {name: odom, type: sensor}
+  - {name: laser_scan, type: sensor}
+  - {name: camera_rgb, type: sensor}
+  - {name: camera_depth, type: sensor}
+  - {name: base_drive, type: actuator}
+  - {name: arm_control, type: actuator}
+  - {name: gripper, type: actuator}
+  - {name: lifting, type: actuator}
+  - {name: head, type: actuator}
+

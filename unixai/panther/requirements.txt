@@ -1,0 +1,4 @@
+PyYAML>=6.0
+numpy>=1.23
+opencv-python-headless>=4.8
+

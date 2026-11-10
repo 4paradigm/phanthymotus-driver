@@ -1,0 +1,25 @@
+unixai-panther:
+  image: __IMAGE__
+  container_name: embodied-unixai-panther
+  network_mode: host
+  pid: host
+  privileged: true
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+  environment:
+    - PANTHER_ROS_DOMAIN_ID=0
+    - AGENT_CORE_ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - PYTHONUNBUFFERED=1
+    - RCUTILS_COLORIZED_OUTPUT=0
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  # Allow camera workers and the isolated Agent Core bridge to stop cleanly.
+  stop_grace_period: 15s
+  restart: always
+

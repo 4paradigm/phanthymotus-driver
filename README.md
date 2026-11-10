@@ -23,6 +23,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `engineai/t800` | EngineAI T800 Development Edition | 15708 | ROS2/Native SDK, full state, dance/gesture sequences, virtual gamepad, locomotion and low-level joint control |
 | `noetix/bumi` | Noetix Bumi-EDU Humanoid | 15704 | Mic, speaker, locomotion, RealSense camera, state monitoring |
 | `x-humanoid/tianyi2.0` | X-humanoid Tianyi 2.0 Pro Bundle | 15707 | 35DOF (wheeled chassis + dual arms + dexterous hands + head + navigation) |
+| [`unixai/panther`](unixai/panther/README.md) | UniX AI Panther | 15792 | CycloneDDS/domain 0 robot link, process-isolated Agent Core bridge, state sensing and safety-gated mobile manipulation |
 | `deep_robotics/lynx_m20` | DEEPRobotics Lynx M20 | 15716 | Official ROS 2/Fast DDS interfaces and basic_server TCP/UDP native control, with Standard/Pro capability isolation |
 | `deep_robotics/s10_pro` | DEEPRobotics S10 Pro | 15745 | Plain TCP native protocol, state/fault reporting, locomotion, device and navigation controls |
 | `chasing/qianjiao_p200_pro` | Chasing Qianjiao P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF motion control, lock/unlock, heartbeat and link status |

@@ -1,0 +1,56 @@
+name: "UniX AI Panther Bundle"
+mcp_port: 15792
+ros_namespace: "unixai_panther"
+
+ros:
+  robot_domain_id: 0
+  core_domain_id: 42
+  robot_rmw: "rmw_cyclonedds_cpp"
+
+safety:
+  # Keep all physical movement blocked until commissioning caps are approved
+  # for this Panther and this workspace. Sensor cards and info calls still run.
+  commissioning_motion_enabled: false
+
+plugins:
+  joints: {enabled: true}
+  robot_state: {enabled: true}
+  imu: {enabled: true}
+  odom: {enabled: true}
+  laser_scan: {enabled: true}
+
+  camera:
+    startup_timeout_s: 30.0
+    first_frame_grace_s: 30.0
+    frame_stall_s: 15.0
+    max_watchdog_restarts: 2
+    rgb_hz: 10.0
+    depth_hz: 8.0
+    jpeg_quality: 70
+  camera_rgb: {enabled: true}
+  camera_depth: {enabled: true}
+
+  base_drive:
+    enabled: true
+    # Commissioning caps, intentionally below the documented hardware maximum.
+    topic: "/cmd_vel_teleop"
+    max_linear_mps: 0.20
+    max_angular_radps: 0.30
+    max_duration_s: 3.0
+    publish_rate_hz: 20.0
+    stop_repetitions: 5
+  arm_control:
+    enabled: true
+    max_duration_s: 20.0
+    # Additional commissioning gate; URDF hard limits are always enforced too.
+    max_target_delta_rad: 0.35
+  gripper: {enabled: true}
+  lifting:
+    enabled: true
+    max_position_m: 0.8
+  head: {enabled: true}
+
+  # Continuous 50 Hz arm servo remains disabled until watchdog/hold behavior
+  # has been measured on Panther hardware.
+  servo: {enabled: false}
+
