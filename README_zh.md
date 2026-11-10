@@ -21,6 +21,7 @@
 | `linkerhand/l20_lite` | 灵心巧手 L20 Lite | 15733 | USB-RS485/Modbus 115200、10 关节控制与状态读取 |
 | [`linkerhand/l20`](linkerhand/l20/README.md) | 灵心巧手 L20-10 | 15734 | USB-CAN、16 主动关节控制、数字手势、自适应接触停止抓握与独立触觉感知，共四张卡片 |
 | `phanthy/remote_control` | 远程控制桥接 | 15710 | 远程控制中继 |
+| [`unixai/panther`](unixai/panther/README.md) | 优理奇 Panther 双臂轮式机器人 | 15747 | 关节骨架、IMU、里程计、合并状态（电池/诊断/急停/夹爪/升降）、前后雷达合并、RGB-D 相机，以及默认关闭的运动控制（底盘、双臂、夹爪、升降、头部） |
 
 ## 快速开始
 

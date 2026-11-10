@@ -2,6 +2,11 @@ unixai-panther:
   image: __IMAGE__
   container_name: embodied-unixai-panther
   network_mode: host
+  # The first camera card started creates a transient systemd unit on the robot to run the
+  # Orbbec driver (host_camera.py, through `nsenter -t 1`), which needs PID 1's namespaces and
+  # the privilege to enter them. Nothing else in the driver uses either.
+  pid: host
+  privileged: true
   volumes:
     # The fleet's loopback-only FastDDS profile, used by the domain-42 bridge processes.
     # Without it the container cannot reach Agent Core at all (see README_dev "DDS isolation").
@@ -21,4 +26,5 @@ unixai-panther:
       max-size: "10m"
       max-file: "3"
   restart: always
+  # Time for a running arm move to be cancelled and its controllers restored on SIGTERM.
   stop_grace_period: 30s

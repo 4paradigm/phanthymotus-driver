@@ -18,9 +18,15 @@ core_bridge:
   # The fleet's loopback-only FastDDS profile, mounted by deploy/service.yml.
   profile: /opt/phanthy-motus/dds-local.xml
 
-# Robot topics, read-only. Names confirmed with `ros2 topic list -t` on a Panther (2026-11-10).
+safety:
+  # Every motion card (base_drive, arm_control, gripper, lifting, head) is listed and answers
+  # `info`, but refuses every command while this is false. Turn it on only after the caps below
+  # have been checked on this robot, with the operator present. Sensor cards are unaffected.
+  commissioning_motion_enabled: false
+
+# Robot topics. Names confirmed with `ros2 topic list -t` on a Panther (2026-11-10).
 # /imu and /scan exist but have no publisher on this robot; the broadcaster topics and the
-# per-lidar scans are the live ones.
+# per-lidar scans are the live ones. /tf_static and /robot_description are latched.
 topics:
   joints: /joint_states
   battery: /battery_state_broadcaster/battery_state
@@ -32,7 +38,8 @@ topics:
   diagnostics: /diagnostics
   laser_front: /lidar_front/scan
   laser_rear: /lidar_rear/scan
-  # The Orbbec driver is not started by the robot's own bring-up; see README.md.
+  tf_static: /tf_static
+  robot_description: /robot_description
   camera_color: /camera/color/image_raw
   camera_depth: /camera/depth/image_raw
 
@@ -40,49 +47,84 @@ topics:
 # nearest-return pooling (lidar) is done before the rate is cut, not instead of it.
 rates_hz:
   joints: 10
-  battery: 1
   imu: 10
   odom: 10
-  gripper_lift_state: 10
-  health: 2
-  estop: 1
+  robot_state: 2
   laser_scan: 5
   laser_view: 1
   camera_color: 10
   camera_depth: 5
 
-# How old a reading may be before a card reports it as stale.
+# How old a reading may be before a card (or a robot_state block) reports it as stale.
 stale_after_s:
   joints: 1.0
-  battery: 5.0
   imu: 1.0
   odom: 1.0
-  gripper_lift_state: 1.0
-  health: 5.0
-  estop: 3.0
+  robot_state: 5.0
   laser_scan: 1.5
   camera: 2.0
+  battery: 5.0
+  diagnostics: 5.0
+  estop: 3.0
+  grippers: 1.0
+  lift: 1.0
+  controllers: 3.0
 
 camera:
   jpeg_quality: 80
   max_width: 640
+  # The first camera card started creates a transient unit on the robot (through nsenter, which
+  # needs privileged + pid: host) that runs the vendor's gemini2.launch.py. See host_camera.py.
+  host:
+    user: unix_ai
+    workspace: /home/unix_ai/orbbec_ws
+    cyclonedds_profile: /home/unix_ai/config/cyclonedds.xml
+    start_wait_s: 5.0
+    first_frame_grace_s: 30.0
+    frame_stall_s: 15.0
+    max_watchdog_restarts: 2
 
 laser:
   max_points: 360
   view_range_m: 6.0
+  # The frame both lidars are merged into. Their mounting poses are read from /tf_static.
+  base_frame: base_link
 
 # One switch per card; driver.yaml's card list is kept in step with it by hand and by
 # tests/test_unixai_panther.py.
 plugins:
   model: {enabled: true}
   joints: {enabled: true}
-  battery: {enabled: true}
   imu: {enabled: true}
   odom: {enabled: true}
-  gripper_lift_state: {enabled: true}
-  health: {enabled: true}
-  estop: {enabled: true}
-  laser_scan_front: {enabled: true}
-  laser_scan_rear: {enabled: true}
+  robot_state: {enabled: true}
+  laser_scan: {enabled: true}
   camera_color: {enabled: true}
   camera_depth: {enabled: true}
+
+  # Motion caps. Deliberately below what the hardware allows; raise only with the operator
+  # present. Every command also needs confirm_motion=true and a fresh, normal emergency-stop
+  # diagnostic, and the matching ros2_control controller must be active.
+  base_drive:
+    enabled: true
+    topic: /cmd_vel_teleop
+    max_linear_mps: 0.20
+    max_angular_radps: 0.30
+    max_duration_s: 3.0
+    publish_rate_hz: 20.0
+    stop_repetitions: 5
+  arm_control:
+    enabled: true
+    max_duration_s: 20.0
+    # Largest change of any single joint in one command, from where it is now.
+    max_target_delta_rad: 0.35
+  gripper:
+    enabled: true
+  lifting:
+    enabled: true
+    # Units are not confirmed by the vendor; the reading was 0.61 with the URDF limit at 0.6.
+    max_position: 0.65
+    max_target_delta: 0.10
+  head:
+    enabled: true
+    max_target_delta_rad: 0.35
