@@ -13,8 +13,11 @@ plugins:
     enabled: true
   loco:
     enabled: true
-    # RTAB-Map SLAM pose input is now derived from rt/odommodestate,
-    # not the original Unitree slam_mapping service.
+    # RTAB-Map SLAM pose input is derived from rt/odommodestate,
+    # not the original Unitree slam_mapping service. Native ~500 Hz is
+    # rate-limited to ~20 Hz on /slam/odom; /loco/state stays ~10 Hz.
+    # G1 source stamp=(0,0): keep raw values and callback receipt times for
+    # diagnostics only; never claim tracking or rewrite the measurement time.
     # Source SportModeState has no frame_id; both labels must be verified
     # on the robot and configured together before publishing a candidate pose.
     # This is an example only, not a calibrated default:

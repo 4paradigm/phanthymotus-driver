@@ -116,10 +116,54 @@ def test_invalid_input_never_leaks_nonfinite_or_stale_pose(mutation):
 
 
 @pytest.mark.parametrize('sec,nsec', [(0,0), (0, 999999)])
-def test_zero_stamp_is_invalid_and_not_replaced_with_receipt(sec,nsec):
-    x = SportOdometry().convert(packet(sec, nsec))
+def test_zero_stamp_preserves_raw_motion_and_receipt_without_fake_measurement_time(sec,nsec):
+    raw = packet(sec, nsec)
+    adapter = SportOdometry(frame_id='odom', child_frame_id='body')
+    x = adapter.convert(raw)
+    vendor = x['vendor']
+    q = vendor['motus_slam']
+
     assert x['pose'] is None and x['stamp_ms'] is None
-    assert x['vendor']['motus_slam']['source_stamp_ns'] is None
+    assert vendor['raw_source_stamp'] == {'sec': sec, 'nanosec': nsec}
+    assert vendor['raw_position'] == [1.2, -2.3, .4]
+    assert vendor['raw_velocity'] == [.1, .2, .3]
+    assert vendor['raw_yaw_speed'] == .25
+    assert vendor['raw_imu_quaternion_wxyz'] == [math.sqrt(.5), 0., 0., math.sqrt(.5)]
+    assert vendor['raw_imu_quaternion_xyzw'] == [0., 0., math.sqrt(.5), math.sqrt(.5)]
+    assert vendor['received_time_kind'] == 'driver_callback_receipt_not_measurement'
+    assert type(vendor['received_ns']) is int and vendor['received_ns'] > 0
+    assert type(vendor['received_monotonic_ns']) is int and vendor['received_monotonic_ns'] > 0
+    assert q['source_stamp_ns'] is None and q['source_stamp_valid'] is False
+    assert q['rejection'] == 'invalid_source_stamp'
+    assert q['status'] == 'unavailable' and q['stamp_source'] is None
+    assert q['clock_id'] is None and q['clock_epoch'] is None and q['segment_id'] is None
+    assert q['observation']['received_wall_ns'] == vendor['received_ns']
+    assert q['observation']['received_monotonic_ns'] == vendor['received_monotonic_ns']
+    assert adapter.observation_status()['accepted_samples'] == 0
+    assert adapter.observation_status()['rejected_samples'] == 1
+
+    # The output owns its own copy; later SDK buffer reuse must not mutate it.
+    raw.position[0] = 900.
+    raw.imu_state.quaternion[0] = 0.
+    assert vendor['raw_position'][0] == 1.2
+    assert vendor['raw_imu_quaternion_wxyz'][0] == math.sqrt(.5)
+    json.dumps(x, allow_nan=False)
+
+
+def test_zero_stamp_is_not_a_segment_reset_or_an_obstacle_to_later_valid_evidence():
+    adapter = SportOdometry(frame_id='odom', child_frame_id='body')
+    a = adapter.convert(packet(0, 0))
+    b = adapter.convert(packet(27, 123456789))
+    assert a['pose'] is None
+    assert b['pose'] is not None
+    assert b['vendor']['motus_slam']['source_stamp_valid'] is True
+    assert b['vendor']['motus_slam']['status'] == 'unavailable'
+    assert b['vendor']['raw_source_stamp'] == {'sec': 27, 'nanosec': 123456789}
+    assert adapter.observation_status()['accepted_samples'] == 1
+    assert adapter.observation_status()['rejected_samples'] == 1
+    assert adapter.observation_status()['continuity_quarantined'] is False
+    with pytest.raises(SpatialSlamError):
+        validate_tracking_pose(b)
 
 
 def test_bad_error_code_does_not_become_tracking():

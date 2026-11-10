@@ -67,35 +67,36 @@ class SportOdometry:
         self._last_observation = 'waiting'
 
     def convert(self, msg):
+        # Keep callback receipt times as diagnostics only. Neither timestamp
+        # can substitute for the missing *measurement* time in G1 SportModeState.
         received = time.monotonic_ns()
+        received_wall_ns = time.time_ns()
         self._last_received_monotonic_ns = received
         quality = dict(
             status='unavailable', stamp_source=None, clock_id=None,
             clock_epoch=None, segment_id=None, source_stamp_ns=None,
+            source_stamp_valid=False,
             source_generation=self.source_generation, rejection=None,
             missing_facts=list(MISSING_FACTS),
         )
-        vendor = dict(source_topic=SOURCE_TOPIC, source_type=SOURCE_TYPE,
-                      motus_slam=quality)
+        vendor = dict(
+            source_topic=SOURCE_TOPIC, source_type=SOURCE_TYPE,
+            received_ns=received_wall_ns,
+            received_monotonic_ns=received,
+            received_time_kind='driver_callback_receipt_not_measurement',
+            motus_slam=quality,
+        )
         result = dict(
             schema='motus.odom/1', stamp_ms=None, frame='world',
             units=dict(DEFAULT_UNITS), twist=[None] * 6, pose=None,
             vendor=vendor,
         )
         try:
-            sec, nsec = msg.stamp.sec, msg.stamp.nanosec
-            if (type(sec) is not int or sec < 0 or type(nsec) is not int or
-                    not 0 <= nsec < 1_000_000_000):
-                raise ValueError('invalid_source_stamp')
-            stamp_ns = sec * 1_000_000_000 + nsec
-            if stamp_ns < 1_000_000:
-                raise ValueError('invalid_source_stamp')
-            quality['source_stamp_ns'] = stamp_ns
-            result['stamp_ms'] = stamp_ns // 1_000_000
+            # Real G1 rt/odommodestate and rt/lf/odommodestate currently report
+            # stamp=(0, 0). Validate/copy finite raw motion evidence FIRST, so
+            # a missing sensor stamp never hides the position and orientation.
             position = _numbers(msg.position, 3)
             raw_quat = _numbers(msg.imu_state.quaternion, 4)  # WXYZ in Unitree SDK.
-            if abs(sum(q*q for q in raw_quat) - 1.) > .002:
-                raise ValueError('non_unit_imu_quaternion')
             q = [raw_quat[1], raw_quat[2], raw_quat[3], raw_quat[0]]
             velocity = _numbers(msg.velocity, 3)
             yaw_speed = _numbers([msg.yaw_speed], 1)[0]
@@ -103,14 +104,35 @@ class SportOdometry:
             if type(error_code) is not int or error_code < 0:
                 raise ValueError('invalid_source_error_code')
             vendor.update(
-                raw_position=position, raw_imu_quaternion_xyzw=q,
+                raw_position=position,
+                raw_imu_quaternion_wxyz=raw_quat,
+                raw_imu_quaternion_xyzw=q,
                 raw_velocity=velocity, raw_yaw_speed=yaw_speed,
                 source_error_code=error_code,
                 position_reference='unknown',
                 imu_orientation_reference='unknown',
             )
+            if abs(sum(v*v for v in raw_quat) - 1.) > .002:
+                raise ValueError('non_unit_imu_quaternion')
             if error_code:
                 raise ValueError('nonzero_source_error_code')
+
+            sec, nsec = msg.stamp.sec, msg.stamp.nanosec
+            # Exact native values (including 0,0) are evidence; never relabel
+            # receipt time as source time or promote it to stamp_ms.
+            vendor['raw_source_stamp'] = {
+                'sec': sec if type(sec) is int else None,
+                'nanosec': nsec if type(nsec) is int else None,
+            }
+            if (type(sec) is not int or sec < 0 or type(nsec) is not int or
+                    not 0 <= nsec < 1_000_000_000):
+                raise ValueError('invalid_source_stamp')
+            stamp_ns = sec * 1_000_000_000 + nsec
+            if stamp_ns < 1_000_000:
+                raise ValueError('invalid_source_stamp')
+            quality['source_stamp_ns'] = stamp_ns
+            quality['source_stamp_valid'] = True
+            result['stamp_ms'] = stamp_ns // 1_000_000
             if self._last_stamp_ns is not None:
                 if stamp_ns == self._last_stamp_ns:
                     raise ValueError('duplicate_source_stamp')
@@ -147,6 +169,7 @@ class SportOdometry:
             suspected_resets=self._suspected_resets,
             continuity_quarantined=self._continuity_quarantined,
             received_monotonic_ns=received,
+            received_wall_ns=received_wall_ns,
         )
         return result
 

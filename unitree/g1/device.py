@@ -1227,7 +1227,8 @@ class _LocoStateNode(Node):
     Subscribing to the latter with the go type silently never matches.
     """
 
-    _ODOM_INTERVAL = 0.1  # 10 Hz throttle
+    _ODOM_INTERVAL = 0.1   # Existing /loco/state JSON at ~10 Hz.
+    _SPORT_INTERVAL = 0.05  # Independent /slam/odom diagnostic at ~20 Hz.
 
     def __init__(self, odom_topic: str, motion_topic: str, mapping_topic: str,
                  sport_topic: str = None, sport_config: dict = None):
@@ -1246,6 +1247,7 @@ class _LocoStateNode(Node):
         self._last_fsm: dict = {}
         self._lock       = threading.Lock()
         self._last_odom_time: float = 0.0
+        self._last_sport_time: float = 0.0
 
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
@@ -1344,21 +1346,34 @@ class _LocoStateNode(Node):
         }
 
     def _on_odom(self, msg) -> None:
-        # Convert every native SportModeState sample, before the old 10 Hz
-        # display throttle. A poor sample must not break the legacy state card.
+        # G1 rt/odommodestate can arrive at ~500 Hz. Cap the diagnostic
+        # candidate conversion AND JSON serialization at ~20 Hz, independently
+        # of the legacy /loco/state 10 Hz stream. No interpolation or timing
+        # provenance is inferred from this rate limiter.
+        now = time.monotonic()
+        sample = None
         with self._lock:
-            sample = self._sport_adapter.convert(msg)
-            self._sport_sample = sample
-        if self._sport_pub is not None:
+            # Reserve the interval atomically if the SDK delivers callbacks
+            # on multiple DDS worker threads.
+            if now - self._last_sport_time >= self._SPORT_INTERVAL:
+                self._last_sport_time = now
+                try:
+                    sample = self._sport_adapter.convert(msg)
+                    self._sport_sample = sample
+                except Exception as error:
+                    # A diagnostic adapter failure must not break /loco/state.
+                    self._sport_error = str(error)
+        if sample is not None and self._sport_pub is not None:
             try:
                 out = String()
                 out.data = json.dumps(sample, allow_nan=False)
                 self._sport_pub.publish(out)
-                self._sport_error = None
+                with self._lock:
+                    self._sport_error = None
             except (TypeError, ValueError, RuntimeError, AttributeError) as error:
-                self._sport_error = str(error)
+                with self._lock:
+                    self._sport_error = str(error)
 
-        now = time.monotonic()
         if now - self._last_odom_time < self._ODOM_INTERVAL:
             return
         self._last_odom_time = now

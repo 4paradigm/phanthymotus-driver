@@ -938,3 +938,99 @@ def test_regular_odom_publish_failure_is_isolated_from_legacy_json(runtime):
     plugin._node._on_odom(sport_state())
     assert 'not reachable' in plugin.dispatch('info', {})['regular_odom']['error']
     assert len(plugin._node.topics['/alpha/loco/state']) == 1
+
+
+def test_500hz_native_odom_is_downsampled_without_changing_legacy_state(runtime):
+    """500 Hz native DDS: <= 21 Hz sport candidate, old ~10 Hz loco JSON."""
+    _, plugin_cls = extract(runtime.namespace, '_LocoStateNode', 'LocoStatePlugin')
+    plugin = plugin_cls({}, 'alpha', NS(add_node=lambda _: None))
+    callback_clock = [100.]
+    runtime.clock.monotonic = lambda: callback_clock[0]
+    adapter = plugin._node._sport_adapter
+    original_convert = adapter.convert
+    conversion_count = [0]
+
+    def counted_convert(msg):
+        conversion_count[0] += 1
+        return original_convert(msg)
+
+    adapter.convert = counted_convert
+    source = sport_state()
+    source.stamp.sec = 0
+    source.stamp.nanosec = 0
+    source.imu_state.quaternion = [1., 0., 0., 0.]
+    # Simulate one second of the measured ~500 Hz source.
+    for i in range(500):
+        callback_clock[0] = 100. + i / 500.
+        plugin._node._on_odom(source)
+
+    sport_samples = plugin._node.topics['/alpha/slam/odom']
+    legacy_samples = plugin._node.topics['/alpha/loco/state']
+    assert 19 <= len(sport_samples) <= 21
+    assert conversion_count[0] == len(sport_samples)
+    assert 9 <= len(legacy_samples) <= 11
+    assert len(sport_samples) < 500
+    assert plugin.dispatch('info', {})['topic_out'] == [
+        {'topic': '/alpha/loco/state', 'format': 'data/json'},
+        {'topic': '/alpha/slam/odom', 'format': 'state/odom'}]
+    # The zero-stamped source yields diagnostic data but no fake SLAM pose.
+    first = json.loads(sport_samples[0].data)
+    last = json.loads(sport_samples[-1].data)
+    for sample in (first, last):
+        vendor = sample['vendor']
+        assert vendor['source_topic'] == 'rt/odommodestate'
+        assert vendor['raw_source_stamp'] == {'sec': 0, 'nanosec': 0}
+        assert vendor['raw_position'] == [8., 9., 10.]
+        assert vendor['raw_imu_quaternion_wxyz'] == [1., 0., 0., 0.]
+        assert vendor['received_time_kind'] == 'driver_callback_receipt_not_measurement'
+        assert sample['stamp_ms'] is None and sample['pose'] is None
+        assert vendor['motus_slam']['rejection'] == 'invalid_source_stamp'
+        assert vendor['motus_slam']['status'] == 'unavailable'
+        assert vendor['motus_slam']['segment_id'] is None
+    assert json.loads(legacy_samples[-1].data)['position'] == [8., 9., 10.]
+
+
+def test_sport_and_legacy_rate_limits_are_independent(runtime):
+    """The 20 Hz path must not delay 10 Hz state or send 500 Hz JSON."""
+    _, plugin_cls = extract(runtime.namespace, '_LocoStateNode', 'LocoStatePlugin')
+    plugin = plugin_cls({}, 'alpha', NS(add_node=lambda _: None))
+    callback_clock = [100.]
+    runtime.clock.monotonic = lambda: callback_clock[0]
+    sample = sport_state()
+    sample.stamp.sec = 0
+    sample.stamp.nanosec = 0
+    sample.imu_state.quaternion = [1., 0., 0., 0.]
+    for current in (100.000, 100.010, 100.020, 100.049,
+                    100.051, 100.098, 100.102):
+        callback_clock[0] = current
+        plugin._node._on_odom(sample)
+    assert len(plugin._node.topics['/alpha/slam/odom']) == 3
+    assert len(plugin._node.topics['/alpha/loco/state']) == 2
+    assert plugin._node.get_regular_info('/alpha/slam/odom')['observation']['accepted_samples'] == 0
+    assert plugin._node.get_regular_info('/alpha/slam/odom')['observation']['rejected_samples'] == 3
+
+
+def test_unverified_zero_stamp_reports_raw_values_in_info_without_frame_claim(runtime):
+    _, plugin_cls = extract(runtime.namespace, '_LocoStateNode', 'LocoStatePlugin')
+    plugin = plugin_cls({'slam_regular_odometry': {
+        'frame_id': 'odom', 'child_frame_id': 'imu_in_torso',
+    }}, 'alpha', NS(add_node=lambda _: None))
+    raw = sport_state()
+    raw.stamp.sec = 0
+    raw.stamp.nanosec = 0
+    raw.imu_state.quaternion = [1., 0., 0., 0.]
+    plugin._node._on_odom(raw)
+    info = plugin.dispatch('info', {})['regular_odom']
+    msg = info['sample']
+    assert msg['vendor']['raw_position'] == [8., 9., 10.]
+    assert msg['vendor']['raw_imu_quaternion_wxyz'] == [1., 0., 0., 0.]
+    assert msg['vendor']['received_ns'] > 0
+    assert msg['stamp_ms'] is None and msg['pose'] is None
+    assert msg['vendor']['motus_slam']['status'] == 'unavailable'
+    assert info['input_metadata'][0]['available'] is False
+    assert info['input_metadata'][0]['clock']['verified'] is False
+    assert plugin._node.get_regular_child_frame() is None
+    # Even a manually entered frame name does not grant tracking capability.
+    from common.spatial_slam import SpatialSlamError, validate_tracking_pose
+    with pytest.raises(SpatialSlamError):
+        validate_tracking_pose(msg)

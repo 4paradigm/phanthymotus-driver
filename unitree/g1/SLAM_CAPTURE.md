@@ -15,10 +15,27 @@ are unchanged. Do not connect `sensor/pointcloud` to the native SLAM input.
 converted directly from ordinary `rt/odommodestate` (position[3], velocity[3],
 IMU quaternion WXYZ and source TimeSpec). `/loco/state` remains unchanged.
 
+**G1 live finding (2026-11-10):** Both native `rt/odommodestate` (~500 Hz)
+and `rt/lf/odommodestate` (~20 Hz) provided `stamp.sec=0`,
+`stamp.nanosec=0`. Native position/velocity/IMU fields were populated and
+the error code was zero. The driver continues to subscribe to the high-rate
+source, but independently samples its `/<namespace>/slam/odom` diagnostic
+candidate at approximately 20 Hz; existing `/<namespace>/loco/state` remains
+at approximately 10 Hz. Neither rate is an estimator quality claim.
+
+Missing or invalid source timestamps do **not** hide finite raw motion values:
+`vendor.raw_position`, `raw_imu_quaternion_wxyz`,
+`raw_imu_quaternion_xyzw`, `raw_velocity`, `raw_yaw_speed`,
+`raw_source_stamp`, `received_ns`, and `received_monotonic_ns` stay
+available for diagnosis. Wall and monotonic times are explicitly labeled
+`driver_callback_receipt_not_measurement`; the output `stamp_ms` remains
+null for zero source stamps. No arrival time is substituted for exposure
+time, no fake clock relation is created and unknown frames are not guessed.
+
 **Not yet an admitted tracking pose:** This G1 SportModeState message lacks
 explicit pose frame IDs, verified measurement-clock semantics, an unambiguous
 position/IMU orientation reference, tracking status and reset identity. The
-adapter preserves the raw coordinates in `vendor` but deliberately reports
+adapter preserves raw observations in `vendor` but deliberately reports
 `vendor.motus_slam.status = unavailable`,
 `odom_interface.slam_pose.available = false` and `segment_id: null`.
 A correctly shaped sample is not proof of tracking, so the driver must not
@@ -158,8 +175,11 @@ This is an **illustrative example, not a verified G1 default**.
 Do not guess that a position referenced to the robot base center is identical
 to the body IMU frame; they may require an additional transform.
 With no labels, the candidate publishes `pose: null` with full raw
-position/orientation evidence under `vendor`. With explicit labels it publishes
-a candidate pose, but still correctly reports `status: unavailable` until
+position/orientation evidence under `vendor`. Even with explicit labels, a
+zero native timestamp still produces `pose: null`, `stamp_ms: null` and
+`invalid_source_stamp`, alongside preserved raw measurements and receipt
+times. If a subsequently verified source timestamp is present, labels can
+enable a candidate pose, but it still reports `status: unavailable` until
 tracking, timestamp provenance and reset guarantees are verified.
 
 To check the non-lidar data while Mid360 is unavailable:
