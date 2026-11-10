@@ -79,6 +79,11 @@ plugins:
       camera_to_body:
         translation: [0.0, 0.0, 0.0]
         quaternion: [-0.5, 0.5, -0.5, 0.5]
+  # Experimental planar EKF: 40 Hz leg/IMU prediction and timestamped VO
+  # correction. Opt in only after on-robot latency and accuracy validation.
+  # Does not replace rgbd_visual_odometry or send movement commands.
+  fused_odometry:
+    enabled: false
   motion_state:
     enabled: true
     # 2 Hz: sufficient for Agent-facing motion telemetry without excessive DDS reads.
