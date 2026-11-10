@@ -99,8 +99,14 @@ def parameters(segment, frame_id, imu_assisted=False):
                 wait_imu_to_init=imu_assisted, subscribe_rgbd=True,
                 qos=2, qos_camera_info=2, topic_queue_size=5, sync_queue_size=5,
                 **{'Odom/ResetCountdown': '0'})
-    # Experimental wider feature correspondence search for turns.
-    config['Vis/CorGuessWinSize'] = '60'
+    # Turn-tracking experiment: more features, wider search, earlier keyframes,
+    # and a larger local feature map. Leave RGB-D / IMU rates unchanged.
+    config.update({
+        'Vis/MaxFeatures': '1500',
+        'Vis/CorGuessWinSize': '60',
+        'Odom/KeyFrameThr': '0.5',
+        'OdomF2M/MaxSize': '3000',
+    })
     if imu_assisted:
         config['Odom/GuessSmoothingDelay'] = '0'  # orientation only, no acceleration prediction
     return config
