@@ -9,6 +9,7 @@ COPY requirements.txt /work/requirements.txt
 RUN python3 -m pip install --no-cache-dir -r /work/requirements.txt
 COPY common /work/common
 COPY . /work/agilex/bunker-pro
+COPY deploy/ /deploy/
 COPY deploy/entrypoint.sh /usr/local/bin/bunker-entrypoint
 RUN chmod 0755 /usr/local/bin/bunker-entrypoint
 ENV PYTHONPATH=/work/agilex/bunker-pro:/work
