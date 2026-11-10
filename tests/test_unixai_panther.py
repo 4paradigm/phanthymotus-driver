@@ -115,6 +115,89 @@ def hub(device, config, clock, sink):
     return device.Hub(config, "panther", sink, clock=lambda: clock.wall, monotonic=lambda: clock.mono)
 
 
+ALL_CONTROLLERS = ("movebase3_drive_controller", "dual_arm_forward_position_controller",
+                   "left_arm_joint_trajectory_position_controller",
+                   "right_arm_joint_trajectory_position_controller", "head_forward_position_controller",
+                   "lifting_controller", "left_unix_gripper3_controller", "right_unix_gripper3_controller")
+
+
+class FakeIO:
+    """Stands in for `RosMotionIO`: records every command that would have gone to the robot."""
+
+    def __init__(self):
+        self.calls = []
+        self.controllers = {name: "active" for name in ALL_CONTROLLERS}
+        self.controllers["left_arm_joint_trajectory_position_controller"] = "inactive"
+        self.controllers["right_arm_joint_trajectory_position_controller"] = "inactive"
+        self.arm_results = []                # outcomes poll_arm_result hands out, in order
+        self.fail_on = set()
+        self.switch_fail_after = None        # the Nth controller switch (1-based) and later raise
+
+    def _do(self, name, *args):
+        if name in self.fail_on:
+            raise RuntimeError(f"{name} failed")
+        self.calls.append((name, *args))
+
+    def named(self, name):
+        return [c[1:] for c in self.calls if c[0] == name]
+
+    def list_controllers(self):
+        return dict(self.controllers)
+
+    def switch_controllers(self, activate, deactivate):
+        if self.switch_fail_after is not None and len(self.named("switch")) >= self.switch_fail_after:
+            raise RuntimeError("the controller manager rejected the controller switch")
+        self._do("switch", tuple(activate), tuple(deactivate))
+
+    def publish_twist(self, vx, vy, wz):
+        self._do("twist", vx, vy, wz)
+
+    def publish_head(self, values):
+        self._do("head", tuple(values))
+
+    def publish_lift(self, position):
+        self._do("lift", position)
+
+    def publish_gripper(self, side, mode, position):
+        self._do("gripper", side, mode, position)
+
+    def send_arm_goal(self, side, names, positions, duration):
+        self._do("goal", side, tuple(positions), duration)
+        return f"handle-{side}"
+
+    def poll_arm_result(self, handle, timeout):
+        if self.arm_results:
+            return self.arm_results.pop(0)
+        return {"status": 4, "error_code": 0, "error_string": ""}
+
+    def cancel_arm_goal(self, handle):
+        self._do("cancel", handle)
+
+
+@pytest.fixture
+def io():
+    return FakeIO()
+
+
+@pytest.fixture
+def completions():
+    return []
+
+
+@pytest.fixture
+def motion(device, config, hub, io, completions, clock):
+    """Motion with the gate open (as an operator would have it) and threads run inline."""
+    motion_module = importlib.import_module("panther_motion")
+    config["safety"]["commissioning_motion_enabled"] = True
+
+    def sleep(seconds):
+        clock.advance(seconds)
+
+    return motion_module.Motion(config, io, hub, spawn=lambda target, name: target(),
+                                notify=lambda *a: completions.append(a), sleep=sleep,
+                                monotonic=lambda: clock.mono)
+
+
 # ── message builders ─────────────────────────────────────────────────────────
 
 def header(sec=1_794_300_000, nanosec=0, frame_id=""):
@@ -187,12 +270,19 @@ def test_driver_config_and_cards_agree(device, config):
     driver = yaml.safe_load((DRIVER / "driver.yaml").read_text(encoding="utf-8"))
     cards = {c["name"]: c["type"] for c in driver["cards"]}
     assert set(cards) == set(config["plugins"]) == set(device.CARD_ORDER)
+    assert [c["name"] for c in driver["cards"]] == list(device.CARD_ORDER)
     assert cards["model"] == "resource"
-    assert {t for n, t in cards.items() if n != "model"} == {"sensor"}, "first batch is read-only"
+    assert {n for n, t in cards.items() if t == "actuator"} == {
+        "base_drive", "arm_control", "gripper", "lifting", "head"}
+    assert {n for n, t in cards.items() if t == "sensor"} == set(device.SENSOR_CARDS) - {"model"}
     assert driver["port"] == config["mcp_port"] == 15747
     assert driver["mcp_url"] == "http://localhost:15747/mcp"
     assert (driver["hardware_provider"], driver["hardware_model"]) == ("unixai", "panther")
     assert driver["build_context_extras"] == ["../../common"]
+
+
+def test_motion_is_off_unless_the_operator_turns_it_on(config):
+    assert config["safety"]["commissioning_motion_enabled"] is False
 
 
 def test_port_is_not_used_by_another_driver():
@@ -202,17 +292,21 @@ def test_port_is_not_used_by_another_driver():
     assert ports[15747] == ["panther"]
 
 
-def test_tools_match_the_driver_manifest_and_use_renderable_formats(device, hub):
-    tools = device.PantherPlugin(hub).get_tools()
+def test_tools_match_the_driver_manifest_and_use_renderable_formats(device, hub, motion, config):
+    tools = device.PantherPlugin(hub, motion=motion, config=config).get_tools()
     assert [t["name"] for t in tools] == list(device.CARD_ORDER)
     for definition in tools:
         assert definition["description"] and definition["inputSchema"]["type"] == "object"
-        assert definition["type"] in ("sensor", "resource")
+        assert definition["type"] in ("sensor", "resource", "actuator")
         assert definition["multiInstance"] is False
         for output in definition.get("topic_out", []):
             assert output["format"] in ALLOWED_FORMATS, "sensor/lidar* does not render from the topic bus"
             assert output["topic"].startswith("/panther/")
     json.dumps(tools, allow_nan=False)
+
+
+def test_sensor_only_plugin_lists_no_motion_cards(device, hub):
+    assert [t["name"] for t in device.PantherPlugin(hub).get_tools()] == list(device.SENSOR_CARDS)
 
 
 def test_topic_names_are_unique(hub):
@@ -231,7 +325,10 @@ def test_service_yml_satisfies_the_fleet_checker():
     (name, body), = service.items()
     assert body["restart"] == "always" and body["network_mode"] == "host"
     assert body["image"] == "__IMAGE__"
-    assert "privileged" not in body and "devices" not in body, "a read-only driver needs no hardware access"
+    # host_camera.py enters PID 1's namespaces to start the Orbbec driver on the robot.
+    assert body["privileged"] is True and body["pid"] == "host"
+    assert "devices" not in body
+    assert body["stop_grace_period"] == "30s", "a running arm move is cancelled and restored on SIGTERM"
     assert not any("PASSWORD" in v.upper() or "TOKEN" in v.upper() for v in body["environment"])
 
 
@@ -275,17 +372,39 @@ def test_dockerfile_exposes_the_port_and_copies_what_the_code_imports():
     dockerfile = (DRIVER / "Dockerfile").read_text(encoding="utf-8")
     assert "EXPOSE 15747" in dockerfile
     copied = re.search(r"COPY (main\.py[^\n]*) /work/unixai/panther/", dockerfile).group(1).split()
-    for name in ("main.py", "device.py", "panther_payloads.py", "panther_bridge.py", "config.yaml", "driver.yaml"):
+    for name in ("main.py", "device.py", "contracts.py", "host_camera.py", "panther_motion.py",
+                 "panther_payloads.py", "panther_bridge.py", "config.yaml", "driver.yaml"):
         assert name in copied
+        assert (DRIVER / name).is_file()
     assert "COPY common/ /work/common/" in dockerfile
     assert "rmw-cyclonedds-cpp" in dockerfile and "rmw-fastrtps-cpp" in dockerfile
     # The ros-base image has the ROS install and key but no ROS apt source; the first bot build
     # failed with "ros-humble-rmw-cyclonedds-cpp has no installation candidate" without this.
-    assert dockerfile.index("ros2-archive-keyring.gpg") < dockerfile.index("apt-get update")
-    assert "/etc/apt/sources.list.d/ros2.list" in dockerfile
+    for stage in dockerfile.split("FROM ")[1:]:
+        assert stage.index("ros2-archive-keyring.gpg") < stage.index("apt-get update")
+    assert dockerfile.count("/etc/apt/sources.list.d/ros2.list") == 2
     assert "ros-base@sha256:" in dockerfile.splitlines()[0], "pinned like the other ROS drivers"
     assert "print('panther imports ok'" in dockerfile, "build fails here, not on the robot"
+    # What the motion cards import at run time must be installed and checked at build time.
+    for package in ("ros-humble-control-msgs", "ros-humble-controller-manager-msgs",
+                    "ros-humble-trajectory-msgs", "ros-humble-geometry-msgs", "ros-humble-tf2-msgs"):
+        assert package in dockerfile
+    for imported in ("unix_msgs.msg import GripperCommand", "control_msgs.action import FollowJointTrajectory",
+                     "controller_manager_msgs.srv import ListControllers, SwitchController"):
+        assert imported in dockerfile
+    assert "command -v nsenter" in dockerfile
+    assert "AS interface-builder" in dockerfile and "COPY --from=interface-builder" in dockerfile
+    assert "COPY vendor/unix_msgs/ " in dockerfile
+    assert "systemd" not in dockerfile, "nsenter uses the host's systemctl, so none is installed here"
     assert "numpy==1.26.4" in (DRIVER / "requirements.txt").read_text(encoding="utf-8")
+
+
+def test_vendor_message_package_matches_the_robots_gripper_command():
+    message = (DRIVER / "vendor" / "unix_msgs" / "msg" / "GripperCommand.msg").read_text(encoding="utf-8")
+    fields = [line.split() for line in message.splitlines() if line.strip() and not line.startswith("#")]
+    assert fields == [["string", "mode"], ["sensor_msgs/JointState", "command"]]
+    package = ET.parse(DRIVER / "vendor" / "unix_msgs" / "package.xml").getroot()
+    assert package.findtext("name") == "unix_msgs"
 
 
 def test_main_is_guarded_so_spawned_children_do_not_start_a_second_driver():
@@ -294,16 +413,41 @@ def test_main_is_guarded_so_spawned_children_do_not_start_a_second_driver():
     assert source.index("logsafe.install()") < source.index("from device import")
 
 
-def test_driver_never_writes_to_the_robot():
-    """Read-only is the whole contract of this batch; a source-level tripwire for anyone adding a card."""
-    source = "\n".join(p.read_text(encoding="utf-8") for p in DRIVER.glob("*.py"))
-    for forbidden in ("create_publisher(", "create_client(", "create_service(", "call_async(", "create_action",
-                      "geometry_msgs", "trajectory_msgs", "Twist", "SetBool", "switch_controller",
-                      "subprocess", "os.system", "os.dup(1)", "dup2("):
-        code = [line for line in source.splitlines() if forbidden in line and not line.strip().startswith(("#", '"""'))]
-        # panther_bridge legitimately publishes on domain 42 (Agent Core), nothing on the robot domain.
-        code = [line for line in code if "node.create_publisher(msg_type, topic, qos)" not in line]
-        assert not code, f"{forbidden!r}: {code}"
+def _code(path):
+    return [line for line in path.read_text(encoding="utf-8").splitlines()
+            if not line.strip().startswith(("#", '"""'))]
+
+
+def test_modules_that_decide_things_do_not_import_ros():
+    """Hub, Motion and the payload rules are tested on a laptop only because they cannot reach ROS."""
+    for name in ("contracts.py", "panther_motion.py", "panther_payloads.py", "host_camera.py"):
+        for line in _code(DRIVER / name):
+            if line.startswith(("import ", "from ")):
+                assert not re.search(r"\b(rclpy|sensor_msgs|geometry_msgs|std_msgs|nav_msgs|control_msgs|"
+                                     r"controller_manager_msgs|trajectory_msgs|unix_msgs|tf2_msgs)\b", line), (name, line)
+
+
+def test_only_the_expected_modules_publish_call_services_or_touch_the_host():
+    """A source-level tripwire: robot-facing writes live in RosMotionIO, host access in host_camera."""
+    sources = {p.name: "\n".join(_code(p)) for p in DRIVER.glob("*.py")}
+    for name, code in sources.items():
+        for forbidden in ("os.system", "os.dup(1)", "dup2("):
+            assert forbidden not in code, (name, forbidden)
+        if name != "host_camera.py":
+            assert "subprocess" not in code, name
+            assert "nsenter" not in code, name
+        if name != "device.py":
+            for forbidden in ("create_publisher(", "create_client(", "ActionClient(", "call_async("):
+                # panther_bridge legitimately publishes on domain 42 (Agent Core), nothing on the robot domain.
+                lines = [l for l in code.splitlines() if forbidden in l
+                         and "node.create_publisher(msg_type, topic, qos)" not in l]
+                assert not lines, (name, forbidden, lines)
+    device_code = sources["device.py"]
+    publishers = device_code.index("class RosMotionIO")
+    nodes = device_code.index("class PantherNodes")
+    for forbidden in ("create_publisher(", "create_client(", "ActionClient("):
+        for position in [m.start() for m in re.finditer(re.escape(forbidden), device_code)]:
+            assert publishers < position < nodes, f"{forbidden} outside RosMotionIO"
 
 
 # ── URDF ─────────────────────────────────────────────────────────────────────
@@ -582,58 +726,199 @@ def test_odom_interface_declaration_lists_only_measured_axes(hub):
     assert interface["provides"] == ["vx", "vy", "wz"] and interface["pose_drift"] == "none"
 
 
-def test_gripper_and_lift_are_merged_with_their_age(hub, sink, clock):
+def _state(sink):
+    return sink.last("/panther/robot_state")
+
+
+def test_robot_state_merges_grippers_and_lift_with_their_age(hub, sink, clock):
     hub.on_gripper_left(joint_state(["joint_lf"], [0.023], [0.0], [-32.763]))
     hub.on_lift(joint_state(["body_joint"], [0.61], [-0.0], [0.0]))
     clock.advance(0.2)
     hub.tick()
-    state = sink.last("/panther/gripper_lift_state")
-    assert state["left_gripper"]["position"] == 0.023 and state["left_gripper"]["effort"] == -32.763
+    state = _state(sink)
+    assert state["grippers"]["left"]["position"] == 0.023 and state["grippers"]["left"]["effort"] == -32.763
     assert state["lift"]["position"] == 0.61, "not clamped to the URDF's stale 0.6 limit"
-    assert state["right_gripper"] is None, "a joint that never reported is null, not zero"
-    assert state["left_gripper"]["age_ms"] == 200
+    assert state["grippers"]["right"] is None, "a joint that never reported is null, not zero"
+    assert state["grippers"]["left"]["age_ms"] == 200 and state["grippers"]["left"]["fresh"] is True
+    clock.advance(2.0)
+    hub.tick()
+    assert _state(sink)["lift"]["fresh"] is False and _state(sink)["lift"]["age_ms"] == 2200
 
 
-def test_gripper_lift_is_silent_until_something_arrives(hub, sink, clock):
+def test_robot_state_carries_battery_diagnostics_estop_and_controllers_in_blocks(hub, sink, clock):
+    hub.on_battery(battery(0.99))
+    hub.on_diagnostics(normal_diagnostics())
+    hub.on_controllers({"lifting_controller": "active", "head_forward_position_controller": "active"})
+    clock.advance(0.6)
+    hub.tick()
+    state = _state(sink)
+    strict(state)
+    assert state["battery"]["percent"] == 99.0 and state["battery"]["fresh"] is True
+    assert state["diagnostics"]["available"] and state["diagnostics"]["count"] == 3
+    assert [s["name"] for s in state["diagnostics"]["statuses"]] == sorted(
+        s["name"] for s in state["diagnostics"]["statuses"]), "the robot's order changes per message"
+    assert state["estop"]["found"] and state["estop"]["stop_button_status"] == "正常"
+    assert state["controllers"]["states"]["lifting_controller"] == "active"
+    assert set(state) == {"stamp_ms", "ready_for_motion", "not_ready_reasons", "battery", "diagnostics",
+                          "estop", "grippers", "lift", "controllers"}
+
+
+def test_robot_state_says_so_when_nothing_has_arrived_instead_of_looking_healthy(hub, sink, clock):
     clock.advance(1)
     hub.tick()
-    assert sink.count("/panther/gripper_lift_state") == 0
+    state = _state(sink)
+    assert state["battery"] is None and state["lift"] is None and state["controllers"] is None
+    assert state["diagnostics"] == {"available": False, "statuses": []}
+    assert state["estop"]["found"] is False and state["estop"]["stale"] is True
+    assert state["ready_for_motion"] is False
 
 
-def test_health_and_estop_publish_on_change_and_on_a_timer(hub, sink, clock):
+def test_robot_state_is_published_at_its_rate_and_at_once_on_a_diagnostics_change(hub, sink, clock):
     hub.on_diagnostics(normal_diagnostics())
-    assert sink.last("/panther/health")["worst_level"] == 0
-    assert sink.last("/panther/estop")["stop_button_status"] == "正常"
-    published = sink.count("/panther/estop")
+    assert _state(sink)["estop"]["level"] == 0
+    published = sink.count("/panther/robot_state")
 
     pressed = diagnostics(status("diagnostic_broadcaster: Emergency stop", level=b"\x02",
                                  message="急停已按下", stop_button_status="按下"))
     clock.advance(0.05)
     hub.on_diagnostics(pressed)
-    assert sink.count("/panther/estop") == published + 1, "a change is published at once, not on the next second"
-    assert sink.last("/panther/estop")["level"] == 2
-    assert sink.last("/panther/health")["worst_level"] == 2
+    assert sink.count("/panther/robot_state") == published + 1, "a change is sent at once, not at the next slot"
+    assert _state(sink)["estop"]["level"] == 2
+    assert _state(sink)["diagnostics"]["worst_level"] == 2
+
+    sink.jsons.clear()
+    for _ in range(100):                                    # 10 s of 10 Hz timer ticks, nothing changing
+        clock.advance(0.1)
+        hub.tick()
+    assert 19 <= sink.count("/panther/robot_state") <= 21, "2 Hz"
 
 
 def test_estop_goes_stale_when_diagnostics_stop(hub, sink, clock):
     hub.on_diagnostics(normal_diagnostics())
-    assert sink.last("/panther/estop")["stale"] is False
+    assert _state(sink)["estop"]["stale"] is False
     for _ in range(60):                                     # 6 s of timer ticks and no diagnostics
         clock.advance(0.1)
         hub.tick()
-    latest = sink.last("/panther/estop")
+    latest = _state(sink)["estop"]
     assert latest["stale"] is True and latest["stop_button_status"] == "正常", "old text kept, flagged as old"
     assert latest["age_ms"] >= 3_000
+
+
+def test_motion_ready_needs_fresh_joints_and_a_fresh_normal_estop_diagnostic(hub, clock):
+    ready, reasons = hub.motion_ready()
+    assert not ready and len(reasons) == 2
+    hub.on_joint_state(joint_state(URDF_JOINTS, [0.0] * 18))
+    hub.on_diagnostics(normal_diagnostics())
+    assert hub.motion_ready() == (True, [])
+
+    # An unrelated error elsewhere (an absent camera, say) does not stop the robot moving ...
+    hub.on_diagnostics(diagnostics(status("diagnostic_broadcaster: Camera", level=b"\x02", message="missing")))
+    assert hub.motion_ready()[0] is True
+    # ... but the emergency-stop diagnostic leaving "ok" does, whatever its text says.
+    hub.on_diagnostics(diagnostics(status("diagnostic_broadcaster: Emergency stop", level=b"\x02",
+                                          message="anything", stop_button_status="whatever")))
+    ready, reasons = hub.motion_ready()
+    assert not ready and "level is 2" in reasons[0]
+
+    hub.on_diagnostics(normal_diagnostics())
+    clock.advance(1.5)                                      # joints are older than 1 s now
+    assert hub.motion_ready()[0] is False
+    hub.on_joint_state(joint_state(URDF_JOINTS, [0.0] * 18))
+    clock.advance(3.5)                                      # and the estop diagnostic is older than 3 s
+    hub.on_joint_state(joint_state(URDF_JOINTS, [0.0] * 18))
+    ready, reasons = hub.motion_ready()
+    assert not ready and "stale" in reasons[0]
+
+
+def test_joint_positions_lift_and_limits_come_from_the_hub(hub, clock):
+    assert hub.joint_positions() is None and hub.lift_position() is None
+    hub.on_joint_state(joint_state(["joint_la0", "joint_head0"], [0.1, NAN]))
+    assert hub.joint_positions() == {"joint_la0": 0.1}, "a NaN position is not a position"
+    hub.on_lift(joint_state(["body_joint"], [0.61]))
+    assert hub.lift_position() == 0.61
+    clock.advance(2)
+    assert hub.joint_positions() is None and hub.lift_position() is None
+
+    limits, source = hub.joint_limits()
+    assert source == "bundled URDF" and limits["joint_head1"] == (-1.57, 1.57)
+    hub.on_robot_description(NS(data='<robot name="x"><joint name="joint_la0" type="revolute">'
+                                     '<limit lower="-1" upper="1"/></joint></robot>'))
+    limits, source = hub.joint_limits()
+    assert source == "live /robot_description" and limits == {"joint_la0": (-1.0, 1.0)}
 
 
 def test_laser_json_always_publishes_and_the_view_waits_for_start(hub, sink):
     pytest.importorskip("cv2")
     hub.on_laser("front", scan())
-    assert sink.count("/panther/laser_scan_front") == 1 and not sink.images
-    hub.activate("laser_scan_front")
+    assert sink.count("/panther/laser_scan") == 1 and not sink.images
+    hub.activate("laser_scan")
     hub.on_laser("front", scan())
-    assert [i[1] for i in sink.images] == ["/panther/laser_scan_front_view"]
+    assert [i[1] for i in sink.images] == ["/panther/laser_scan_view"]
     assert sink.images[0][2] == "jpeg" and sink.images[0][0] == "views"
+
+
+def _tf(*edges):
+    """A /tf_static message: (parent, child, (x, y, z), (qx, qy, qz, qw))."""
+    return NS(transforms=[NS(header=NS(frame_id=parent), child_frame_id=child,
+                             transform=NS(translation=NS(x=t[0], y=t[1], z=t[2]),
+                                          rotation=NS(x=q[0], y=q[1], z=q[2], w=q[3])))
+                          for parent, child, t, q in edges])
+
+
+REAR_FACING = (0.0, 0.0, 1.0, 0.0)                                          # yaw = pi
+
+
+def test_front_and_rear_lidars_are_merged_into_one_scan_round_base_link(hub, sink, clock):
+    hub.on_tf_static(_tf(("base_link", "link_front_radar", (0.3, 0.0, 0.1), (0, 0, 0, 1)),
+                         ("base_link", "link_back_radar", (-0.3, 0.0, 0.1), REAR_FACING)))
+    # Each lidar sees a wall 1 m dead ahead of itself: the front one at x=1.3, the rear one at x=-1.3.
+    front = scan(n=360, fill=INF, header=header(frame_id="link_front_radar"), angle_min=-3.14159,
+                 angle_increment=2 * 3.14159 / 360)
+    front.ranges[180] = 1.0
+    rear = scan(n=360, fill=INF, header=header(frame_id="link_back_radar"), angle_min=-3.14159,
+                angle_increment=2 * 3.14159 / 360)
+    rear.ranges[180] = 1.0
+    hub.on_laser("front", front)
+    clock.advance(0.2)                                      # the next 5 Hz slot
+    hub.on_laser("rear", rear)
+    merged = sink.last("/panther/laser_scan")
+    strict(merged)
+    assert merged["frame_id"] == "base_link" and merged["transformed"] is True
+    hits = {round(i * merged["angle_increment"] + merged["angle_min"], 2): r
+            for i, r in enumerate(merged["ranges"]) if r is not None}
+    assert hits[0.0] == pytest.approx(1.3, abs=0.01), "front wall ahead of base_link"
+    assert max(hits.items(), key=lambda kv: abs(kv[0]))[1] == pytest.approx(1.3, abs=0.01), "rear wall behind it"
+    assert merged["sources"]["front"]["used"] and merged["sources"]["rear"]["used"]
+    assert merged["nearest_m"] == pytest.approx(1.3, abs=0.01)
+
+
+def test_a_lidar_without_a_known_transform_is_left_out_and_the_reason_is_given(hub, sink, clock):
+    hub.on_tf_static(_tf(("base_link", "link_front_radar", (0.3, 0, 0), (0, 0, 0, 1))))
+    hub.on_laser("front", scan(fill=2.0))
+    clock.advance(0.2)
+    hub.on_laser("rear", scan(fill=2.0, header=header(frame_id="link_back_radar")))
+    merged = sink.last("/panther/laser_scan")
+    assert merged["sources"]["front"]["used"] is True
+    assert merged["sources"]["rear"]["used"] is False
+    assert "no fixed transform from link_back_radar to base_link" in merged["sources"]["rear"]["reason"]
+
+
+def test_with_no_transform_at_all_the_first_lidar_is_shown_in_its_own_frame(hub, sink):
+    hub.on_laser("front", scan(fill=2.0))
+    merged = sink.last("/panther/laser_scan")
+    assert merged["transformed"] is False and merged["frame_id"] == "link_front_radar"
+    assert "no /tf_static transform" in merged["sources"]["front"]["note"]
+    assert merged["sources"]["rear"] == {"used": False, "reason": "no data received"}
+
+
+def test_a_stale_lidar_drops_out_of_the_merged_scan(hub, sink, clock):
+    hub.on_laser("rear", scan(fill=2.0, header=header(frame_id="link_back_radar")))
+    clock.advance(2.0)
+    hub.on_laser("front", scan(fill=3.0))
+    merged = sink.last("/panther/laser_scan")
+    assert merged["sources"]["rear"] == {"frame_id": "link_back_radar", "age_ms": 2000,
+                                         "used": False, "reason": "stale"}
+    assert merged["nearest_m"] == 3.0
 
 
 def test_cameras_do_no_work_until_started_and_unsupported_frames_are_reported(hub, sink, clock):
@@ -683,7 +968,7 @@ def test_a_handler_failure_is_counted_and_never_reaches_the_executor(hub, capsys
     hub.on_battery(Hostile())
     hub.on_diagnostics(NS(status=[NS()]))
     assert hub.stream("joints")["errors"] == 1 and "AttributeError" in hub.stream("joints")["last_error"]
-    assert hub.stream("battery")["errors"] == 1 and "RuntimeError" in hub.stream("battery")["last_error"]
+    assert hub.stream("robot_state")["errors"] == 1 and "RuntimeError" in hub.stream("robot_state")["last_error"]
     assert "handler failed" in capsys.readouterr().out
     clock.advance(0.2)
     hub.on_joint_state(joint_state(["joint_la0"], [0.1]))   # and the hub still works afterwards
@@ -695,21 +980,23 @@ def test_a_ten_hertz_timer_that_ticks_slightly_early_does_not_lose_samples(hub, 
     for _ in range(100):
         clock.advance(0.0995)                               # jittery 10 Hz timer
         hub.tick()
-    assert 99 <= sink.count("/panther/gripper_lift_state") <= 100
+    assert 19 <= sink.count("/panther/robot_state") <= 21, "the 2 Hz state keeps its rate under timer jitter"
 
 
-def test_non_finite_numbers_cannot_reach_the_wire(hub, sink, monkeypatch, device):
+def test_non_finite_numbers_cannot_reach_the_wire(hub, sink, monkeypatch, device, clock):
     monkeypatch.setattr(device, "battery_payload", lambda msg: {"percent": float("nan")})
     hub.on_battery(battery())
-    assert sink.count("/panther/battery") == 0, "allow_nan=False rejects it before it is sent"
-    assert hub.stream("battery")["errors"] == 1
+    hub.tick()
+    assert sink.count("/panther/robot_state") == 0, "allow_nan=False rejects it before it is sent"
+    assert hub.stream("robot_state")["errors"] == 1
 
 
 def test_a_full_bridge_is_counted_not_blocked_on(device, config, clock):
     full = Sink(accept=False)
     hub = device.Hub(config, "panther", full, clock=lambda: clock.wall, monotonic=lambda: clock.mono)
     hub.on_battery(battery())
-    assert hub.stream("battery") ["dropped"] == 1 and hub.stream("battery")["published"] == 0
+    hub.tick()
+    assert hub.stream("robot_state")["dropped"] == 1 and hub.stream("robot_state")["published"] == 0
 
 
 # ── hub: honesty about missing data ──────────────────────────────────────────
@@ -729,19 +1016,19 @@ def test_a_card_with_no_feed_still_starts_and_says_why(device, hub):
     plugin = device.PantherPlugin(hub)
     started = plugin.dispatch("start", {"_tool_name": "camera_color"})
     assert started["state"] == "running", "agent-core rolls the whole project back if a start fails"
-    assert "orbbec_camera" in started["warning"]
-    rear = plugin.dispatch("info", {"_tool_name": "laser_scan_rear"})
-    assert rear["state"] == "idle" and "后雷达" in rear["warning"]
-    never = plugin.dispatch("info", {"_tool_name": "battery"})
+    assert "panther_orbbec" in started["warning"]
+    laser = plugin.dispatch("info", {"_tool_name": "laser_scan"})
+    assert laser["state"] == "idle" and "雷达" in laser["warning"]
+    never = plugin.dispatch("info", {"_tool_name": "robot_state"})
     assert "/battery_state_broadcaster/battery_state" in never["warning"]
 
 
 def test_stale_feed_is_flagged_on_the_card(device, hub, clock):
     plugin = device.PantherPlugin(hub)
     hub.on_battery(battery())
-    assert "warning" not in plugin.dispatch("info", {"_tool_name": "battery"})
+    assert "warning" not in plugin.dispatch("info", {"_tool_name": "robot_state"})
     clock.advance(6)
-    info = plugin.dispatch("info", {"_tool_name": "battery"})
+    info = plugin.dispatch("info", {"_tool_name": "robot_state"})
     assert "过期" in info["warning"] and info["stream"]["fresh"] is False
 
 
@@ -764,7 +1051,7 @@ def test_model_card_returns_the_urdf_as_a_plain_dict(device, hub):
 
 def test_every_sensor_answers_start_stop_info_with_a_state(device, hub):
     plugin = device.PantherPlugin(hub)
-    for card in device.CARD_ORDER[1:]:
+    for card in device.SENSOR_CARDS[1:]:
         started = plugin.dispatch("start", {"_tool_name": card})
         assert started["state"] == "running" and started["topic_out"], card
         assert hub.is_active(card)
@@ -787,14 +1074,15 @@ def test_disabled_cards_are_not_listed_or_served(device, hub):
     assert plugin.dispatch("start", {"_tool_name": "camera_depth"})["state"] == "error"
 
 
-def test_the_shared_bundle_runtime_can_drive_the_plugin(device, hub):
+def test_the_shared_bundle_runtime_can_drive_the_plugin(device, hub, motion, config):
     from common.vendor_runtime import DriverBundle, jsonable
-    bundle = DriverBundle([device.PantherPlugin(hub)])
-    assert len(bundle.get_all_tools()) == 12
-    for name, arguments in (("model", {}), ("battery", {"action": "start"}), ("estop", {"action": "info"}),
-                            ("odom", {"action": "stop"})):
+    bundle = DriverBundle([device.PantherPlugin(hub, motion=motion, config=config)])
+    assert len(bundle.get_all_tools()) == 13
+    for name, arguments in (("model", {}), ("robot_state", {"action": "start"}), ("laser_scan", {"action": "info"}),
+                            ("odom", {"action": "stop"}), ("base_drive", {"action": "info"}),
+                            ("arm_control", {"action": "stop"}), ("head", {"action": "stop"})):
         result = bundle.dispatch(name, arguments)
-        assert isinstance(result, dict)
+        assert isinstance(result, dict), name
         json.dumps(jsonable(result), allow_nan=False)
     assert bundle.dispatch("nope", {}) is None
 
@@ -808,14 +1096,54 @@ def test_plugin_stop_releases_the_ros_node_and_the_bridge(device, hub, sink):
 
 # ── rclpy wiring (against a stand-in for rclpy) ──────────────────────────────
 
+class _Future:
+    """An already-completed rclpy future."""
+
+    def __init__(self, result=None):
+        self._result = result
+
+    def add_done_callback(self, callback):
+        callback(self)
+
+    def exception(self):
+        return None
+
+    def result(self):
+        return self._result
+
+
 class _FakeRos:
-    """Just enough of rclpy to check what PantherNodes subscribes to, and nothing else."""
+    """Just enough of rclpy to check what PantherNodes subscribes to, publishes and calls."""
 
     def __init__(self, monkeypatch):
         import types
 
         self.nodes, self.subscriptions, self.timers, self.groups = [], [], [], []
+        self.publishers, self.published, self.clients, self.action_clients = {}, {}, {}, {}
         fake = self
+
+        class Publisher:
+            def __init__(self, topic):
+                self.topic = topic
+
+            def publish(self, message):
+                fake.published.setdefault(self.topic, []).append(message)
+
+        class Client:
+            def __init__(self, name):
+                self.name = name
+                self.controllers = [NS(name="lifting_controller", state="active")]
+                self.requests = []
+
+            def wait_for_service(self, timeout_sec=None):
+                return True
+
+            def service_is_ready(self):
+                return True
+
+            def call_async(self, request):
+                self.requests.append(request)
+                return _Future(NS(controller=self.controllers, ok=True))
 
         class Node:
             def __init__(self, name, **kwargs):
@@ -831,10 +1159,20 @@ class _FakeRos:
             def destroy_node(self):
                 self.destroyed = True
 
-            def create_publisher(self, *args, **kwargs):
-                raise AssertionError("the robot-domain node must never publish")
+            def create_publisher(self, msg_type, topic, qos):
+                fake.publishers[topic] = msg_type
+                return Publisher(topic)
 
-            create_client = create_service = create_publisher
+            def create_client(self, srv_type, name):
+                fake.clients[name] = srv_type
+                return Client(name)
+
+            def count_publishers(self, topic):
+                return 0
+
+        class ActionClient:
+            def __init__(self, node, action_type, name):
+                fake.action_clients[name] = action_type
 
         class QoSProfile:
             def __init__(self, **kwargs):
@@ -853,12 +1191,22 @@ class _FakeRos:
         def message_types(*names):
             return {name: type(name, (), {}) for name in names}
 
+        class Twist:
+            def __init__(self):
+                self.linear, self.angular = NS(x=0.0, y=0.0, z=0.0), NS(x=0.0, y=0.0, z=0.0)
+
+        class SwitchRequest:
+            def __init__(self):
+                self.activate_controllers, self.deactivate_controllers = [], []
+                self.strictness, self.activate_asap, self.timeout = 0, False, NS(sec=0)
+
         module("rclpy")
         module("rclpy.node", Node=Node)
+        module("rclpy.action", ActionClient=ActionClient)
         module("rclpy.qos", QoSProfile=QoSProfile,
                HistoryPolicy=NS(KEEP_LAST="keep_last"),
                ReliabilityPolicy=NS(BEST_EFFORT="best_effort", RELIABLE="reliable"),
-               DurabilityPolicy=NS(VOLATILE="volatile"))
+               DurabilityPolicy=NS(VOLATILE="volatile", TRANSIENT_LOCAL="transient_local"))
         module("rclpy.callback_groups", MutuallyExclusiveCallbackGroup=Group)
         self.sensor = message_types("BatteryState", "Image", "Imu", "JointState", "LaserScan")
         module("sensor_msgs"); module("sensor_msgs.msg", **self.sensor)
@@ -866,13 +1214,27 @@ class _FakeRos:
         module("nav_msgs"); module("nav_msgs.msg", **self.nav)
         self.diag = message_types("DiagnosticArray")
         module("diagnostic_msgs"); module("diagnostic_msgs.msg", **self.diag)
+        module("std_msgs"); module("std_msgs.msg", **message_types("String", "Float64MultiArray"))
+        module("tf2_msgs"); module("tf2_msgs.msg", **message_types("TFMessage"))
+        module("geometry_msgs"); module("geometry_msgs.msg", Twist=Twist)
+        module("unix_msgs"); module("unix_msgs.msg", **message_types("GripperCommand"))
+        module("control_msgs"); module("control_msgs.action", FollowJointTrajectory=type(
+            "FollowJointTrajectory", (), {"Goal": type("Goal", (), {})}))
+        module("builtin_interfaces"); module("builtin_interfaces.msg", Duration=lambda sec, nanosec: NS(sec=sec, nanosec=nanosec))
+        module("trajectory_msgs"); module("trajectory_msgs.msg", **message_types("JointTrajectory", "JointTrajectoryPoint"))
+        module("controller_manager_msgs"); module("controller_manager_msgs.srv", **{
+            "ListControllers": type("ListControllers", (), {"Request": staticmethod(lambda: NS())}),
+            "SwitchController": type("SwitchController", (), {"Request": staticmethod(SwitchRequest)})})
         self.executor = NS(added=[], removed=[])
         self.executor.add_node = self.executor.added.append
         self.executor.remove_node = self.executor.removed.append
         self.ros2 = NS(ctx_robot="robot-context", executor_robot=self.executor)
 
 
-def test_nodes_subscribe_read_only_to_exactly_the_configured_robot_topics(device, config, hub, monkeypatch):
+MOTION_PLUGINS = ("base_drive", "arm_control", "gripper", "lifting", "head")
+
+
+def test_nodes_subscribe_to_exactly_the_configured_robot_topics(device, config, hub, monkeypatch):
     fake = _FakeRos(monkeypatch)
     nodes = device.PantherNodes(config, fake.ros2, hub)
 
@@ -887,20 +1249,126 @@ def test_nodes_subscribe_read_only_to_exactly_the_configured_robot_topics(device
         ("JointState", "/lifting_controller/joint_states"), ("DiagnosticArray", "/diagnostics"),
         ("LaserScan", "/lidar_front/scan"), ("LaserScan", "/lidar_rear/scan"),
         ("Image", "/camera/color/image_raw"), ("Image", "/camera/depth/image_raw"),
+        ("TFMessage", "/tf_static"), ("String", "/robot_description"),
     }
     assert {(s.type.__name__, s.topic) for s in fake.subscriptions} == wanted
     assert len(fake.subscriptions) == len(wanted), "one subscription per topic"
     for subscription in fake.subscriptions:
-        # Best-effort is compatible with reliable and best-effort publishers alike, and cannot
-        # back-pressure the robot's own controllers.
-        assert subscription.qos.reliability == "best_effort"
-        assert subscription.qos.durability == "volatile" and subscription.qos.depth >= 1
+        if subscription.topic in ("/tf_static", "/robot_description"):
+            # Published once and latched: a volatile subscriber that starts later never sees it.
+            assert (subscription.qos.reliability, subscription.qos.durability) == ("reliable", "transient_local")
+        else:
+            # Best-effort is compatible with reliable and best-effort publishers alike, and cannot
+            # back-pressure the robot's own controllers.
+            assert subscription.qos.reliability == "best_effort"
+            assert subscription.qos.durability == "volatile" and subscription.qos.depth >= 1
 
-    (timer,) = fake.timers
-    assert timer.period == 0.1 and timer.callback == hub.tick
+    assert [t.period for t in fake.timers] == [0.1, 1.0]
+    assert fake.timers[0].callback == hub.tick
 
     nodes.close()
     assert fake.executor.removed == [node] and node.destroyed
+
+
+def test_a_sensor_only_configuration_adds_no_publisher_client_or_action_to_the_robot_graph(
+        device, config, hub, monkeypatch):
+    for name in MOTION_PLUGINS:
+        config["plugins"][name]["enabled"] = False
+    fake = _FakeRos(monkeypatch)
+    nodes = device.PantherNodes(config, fake.ros2, hub)
+    assert nodes.motion_io is None
+    assert not fake.publishers and not fake.clients and not fake.action_clients
+    assert [t.period for t in fake.timers] == [0.1]
+
+
+def test_motion_io_creates_exactly_the_command_endpoints_and_nothing_else(device, config, hub, monkeypatch):
+    fake = _FakeRos(monkeypatch)
+    device.PantherNodes(config, fake.ros2, hub)
+    assert set(fake.publishers) == {"/cmd_vel_teleop", "/head_forward_position_controller/commands",
+                                    "/lifting_controller/commands", "/left_gripper/gripper_command",
+                                    "/right_gripper/gripper_command"}
+    assert set(fake.clients) == {"/controller_manager/list_controllers", "/controller_manager/switch_controller"}
+    assert set(fake.action_clients) == {
+        "/left_arm_joint_trajectory_position_controller/follow_joint_trajectory",
+        "/right_arm_joint_trajectory_position_controller/follow_joint_trajectory"}
+
+
+def test_motion_io_sends_the_messages_the_controllers_expect(device, config, hub, monkeypatch):
+    fake = _FakeRos(monkeypatch)
+    io = device.PantherNodes(config, fake.ros2, hub).motion_io
+    io.publish_twist(0.1, -0.1, 0.2)
+    twist = fake.published["/cmd_vel_teleop"][-1]
+    assert (twist.linear.x, twist.linear.y, twist.angular.z) == (0.1, -0.1, 0.2)
+    io.publish_head([0.1, -0.2])
+    assert fake.published["/head_forward_position_controller/commands"][-1].data == [0.1, -0.2]
+    io.publish_lift(0.55)
+    lift = fake.published["/lifting_controller/commands"][-1]
+    assert (lift.name, lift.position) == ([""], [0.55])
+    io.publish_gripper("right", "parallel", 0.4)
+    gripper = fake.published["/right_gripper/gripper_command"][-1]
+    assert gripper.mode == "parallel" and gripper.command.position == [0.4]
+    assert "/left_gripper/gripper_command" not in fake.published
+
+    assert io.list_controllers() == {"lifting_controller": "active"}
+    delivered = []
+    io.poll_controllers(delivered.append)
+    assert delivered == [{"lifting_controller": "active"}]
+
+
+def test_motion_io_sends_a_trajectory_goal_polls_its_result_and_cancels_it(device, config, hub, monkeypatch):
+    fake = _FakeRos(monkeypatch)
+    io = device.PantherNodes(config, fake.ros2, hub).motion_io
+    seen = []
+
+    class Handle:
+        accepted = True
+
+        def get_result_async(self):
+            return _Future(NS(status=4, result=NS(error_code=0, error_string="")))
+
+        def cancel_goal_async(self):
+            seen.append("cancelled")
+
+    class Server:
+        up, accept = True, True
+
+        def wait_for_server(self, timeout_sec):
+            return self.up
+
+        def send_goal_async(self, goal):
+            seen.append(goal)
+            handle = Handle()
+            handle.accepted = self.accept
+            return _Future(handle)
+
+    server = Server()
+    io._arm["left"] = server
+    handle = io.send_arm_goal("left", ["joint_la0", "joint_la1"], [0.1, -0.1], 2.5)
+    goal = seen[0]
+    point = goal.trajectory.points[0]
+    assert goal.trajectory.joint_names == ["joint_la0", "joint_la1"] and point.positions == [0.1, -0.1]
+    assert (point.time_from_start.sec, point.time_from_start.nanosec) == (2, 500_000_000)
+    assert io.poll_arm_result(handle, 0.1) == {"status": 4, "error_code": 0, "error_string": ""}
+    io.cancel_arm_goal(handle)
+    assert seen[-1] == "cancelled"
+    server.accept = False
+    with pytest.raises(RuntimeError, match="rejected"):
+        io.send_arm_goal("left", ["joint_la0"], [0.0], 2.0)
+    server.up = False
+    with pytest.raises(RuntimeError, match="unavailable"):
+        io.send_arm_goal("left", ["joint_la0"], [0.0], 2.0)
+
+
+def test_switching_controllers_asks_for_a_strict_switch(device, config, hub, monkeypatch):
+    fake = _FakeRos(monkeypatch)
+    io = device.PantherNodes(config, fake.ros2, hub).motion_io
+    sent = []
+    original = io._switch.call_async
+    io._switch.call_async = lambda request: sent.append(request) or original(request)
+    io.switch_controllers(["left_arm"], ["forward"])
+    (request,) = sent
+    assert request.activate_controllers == ["left_arm"] and request.deactivate_controllers == ["forward"]
+    assert request.strictness == 2 and request.activate_asap is True
 
 
 def test_heavy_streams_run_in_their_own_callback_groups(device, config, hub, monkeypatch):
@@ -923,30 +1391,36 @@ def test_subscription_callbacks_reach_the_matching_hub_handlers(device, config, 
     by_topic["/imu_sensor_broadcaster/imu"].callback(imu())
     by_topic["/odom"].callback(odometry(0.1))
     by_topic["/diagnostics"].callback(normal_diagnostics())
+    by_topic["/tf_static"].callback(_tf(("base_link", "link_front_radar", (0.3, 0, 0), (0, 0, 0, 1)),
+                                        ("base_link", "link_back_radar", (-0.3, 0, 0), REAR_FACING)))
     by_topic["/lidar_front/scan"].callback(scan())
+    clock.advance(0.2)
     by_topic["/lidar_rear/scan"].callback(scan(header=header(frame_id="link_back_radar")))
     by_topic["/left_gripper/joint_states"].callback(joint_state(["joint_lf"], [0.02]))
     by_topic["/right_gripper/joint_states"].callback(joint_state(["joint_rf"], [0.03]))
     by_topic["/lifting_controller/joint_states"].callback(joint_state(["body_joint"], [0.61]))
+    by_topic["/robot_description"].callback(NS(data='<robot name="x"><joint name="joint_la0" type="revolute">'
+                                                    '<limit lower="-1" upper="1"/></joint></robot>'))
     hub.activate("camera_depth")
     by_topic["/camera/color/image_raw"].callback(image(2, 2, "rgb8", bytes(12)))
     by_topic["/camera/depth/image_raw"].callback(image(2, 2, "16UC1", bytes(8)))
-    clock.advance(0.1)
+    clock.advance(0.6)                                      # past the 2 Hz robot_state slot
     fake.timers[0].callback()
 
-    for topic in ("/panther/joints", "/panther/battery", "/panther/imu", "/panther/state/odom", "/panther/health",
-                  "/panther/estop", "/panther/laser_scan_front", "/panther/laser_scan_rear",
-                  "/panther/gripper_lift_state"):
+    for topic in ("/panther/joints", "/panther/imu", "/panther/state/odom", "/panther/robot_state",
+                  "/panther/laser_scan"):
         assert sink.count(topic) >= 1, topic
-    assert sink.last("/panther/laser_scan_rear")["frame_id"] == "link_back_radar"
+    assert sink.last("/panther/laser_scan")["frame_id"] == "base_link", "both lidars placed by /tf_static"
+    assert sink.last("/panther/robot_state")["grippers"]["right"]["position"] == 0.03
+    assert hub.joint_limits()[1] == "live /robot_description"
     assert [i[1] for i in sink.images] == ["/panther/camera_depth"], "colour is not started, depth is"
-    assert all(hub.stream(c)["errors"] == 0 for c in device.CARD_ORDER[1:]), \
-        {c: hub.stream(c)["last_error"] for c in device.CARD_ORDER[1:]}
+    assert all(hub.stream(c)["errors"] == 0 for c in device.STREAM_CARDS), \
+        {c: hub.stream(c)["last_error"] for c in device.STREAM_CARDS}
 
 
 def test_every_topic_the_nodes_use_is_in_the_config(config):
     keys = {"joints", "battery", "imu", "odom", "gripper_left", "gripper_right", "lift", "diagnostics",
-            "laser_front", "laser_rear", "camera_color", "camera_depth"}
+            "laser_front", "laser_rear", "camera_color", "camera_depth", "tf_static", "robot_description"}
     assert keys <= set(config["topics"])
 
 
@@ -1081,3 +1555,682 @@ def test_child_refuses_to_publish_without_the_isolation_profile(bridge, capsys, 
 def test_log_text_from_outside_is_escaped_and_capped(bridge):
     assert bridge.safe_text("a\x1b[31mred\nline") == "a\\x1b[31mred\\nline"
     assert len(bridge.safe_text("x" * 500)) == 120
+
+
+# ── contracts: the rules that decide whether a command may be sent ───────────
+
+@pytest.fixture(scope="module")
+def contracts(device):
+    return importlib.import_module("contracts")
+
+
+@pytest.fixture(scope="module")
+def motion_module(device):
+    return importlib.import_module("panther_motion")
+
+
+ARM_LIMITS = {name: (-1.0, 1.0) for name in [f"joint_la{i}" for i in range(8)]}
+
+
+def test_a_joint_target_must_be_finite_inside_the_limits_and_a_bounded_step(contracts):
+    current = {name: 0.0 for name in contracts.LEFT_ARM_JOINTS}
+    names = contracts.LEFT_ARM_JOINTS
+    assert contracts.validate_joint_target(names, [0.1] * 8, ARM_LIMITS, current, 0.35) == [0.1] * 8
+    with pytest.raises(ValueError, match="exactly 8"):
+        contracts.validate_joint_target(names, [0.1] * 7, ARM_LIMITS, current, 0.35)
+    with pytest.raises(ValueError, match="must be finite"):
+        contracts.validate_joint_target(names, [NAN] + [0.0] * 7, ARM_LIMITS, current, 0.35)
+    with pytest.raises(ValueError, match="must be a number"):
+        contracts.validate_joint_target(names, [True] + [0.0] * 7, ARM_LIMITS, current, 0.35)
+    with pytest.raises(ValueError, match="outside the URDF limit"):
+        contracts.validate_joint_target(names, [1.5] + [0.0] * 7, ARM_LIMITS, current, 5.0)
+    with pytest.raises(ValueError, match="over the commissioning step limit"):
+        contracts.validate_joint_target(names, [0.5] + [0.0] * 7, ARM_LIMITS, current, 0.35)
+    with pytest.raises(ValueError, match="no joint limits known for: joint_la7"):
+        contracts.validate_joint_target(names, [0.0] * 8, {k: v for k, v in ARM_LIMITS.items() if k != "joint_la7"}, current, 0.35)
+    with pytest.raises(ValueError, match="fresh joint state is missing"):
+        contracts.validate_joint_target(names, [0.0] * 8, ARM_LIMITS, {}, 0.35)
+
+
+def test_a_drive_command_needs_confirmation_and_respects_the_configured_caps(contracts, config):
+    cap = config["plugins"]["base_drive"]
+    ok = {"linear_x": 0.1, "angular_z": -0.2, "duration_s": 1.0, "confirm_motion": True}
+    assert contracts.validate_drive(ok, cap) == (0.1, 0.0, -0.2, 1.0)
+    with pytest.raises(ValueError, match="confirm_motion"):
+        contracts.validate_drive({**ok, "confirm_motion": "yes"}, cap)
+    with pytest.raises(ValueError, match="confirm_motion"):
+        contracts.validate_drive({k: v for k, v in ok.items() if k != "confirm_motion"}, cap)
+    for bad, text in (({"linear_x": 0.21}, "linear speed"), ({"linear_y": -0.5}, "linear speed"),
+                      ({"angular_z": 0.31}, "angular speed"), ({"duration_s": 3.1}, "duration_s"),
+                      ({"duration_s": 0.0}, "duration_s"), ({"linear_x": NAN}, "finite")):
+        with pytest.raises(ValueError, match=text):
+            contracts.validate_drive({**ok, **bad}, cap)
+
+
+def test_switch_requests_are_filled_for_both_generations_of_the_interface(contracts):
+    new = NS(activate_controllers=[], deactivate_controllers=[], strictness=0, activate_asap=False, timeout=NS(sec=0))
+    contracts.populate_switch_request(new, ["a"], ["b"])
+    assert (new.activate_controllers, new.deactivate_controllers, new.strictness, new.activate_asap) == (["a"], ["b"], 2, True)
+    old = NS(start_controllers=[], stop_controllers=[], strictness=0, start_asap=False, timeout=NS(sec=0))
+    contracts.populate_switch_request(old, ["a"], ["b"])
+    assert (old.start_controllers, old.stop_controllers, old.start_asap) == (["a"], ["b"], True)
+    with pytest.raises(RuntimeError, match="unsupported"):
+        contracts.populate_switch_request(NS(timeout=NS(sec=0)), [], [])
+
+
+def test_the_bundled_urdf_gives_limits_for_every_joint_the_motion_cards_move(contracts):
+    limits = contracts.parse_joint_limits((DRIVER / "resource" / "panther.urdf").read_text(encoding="utf-8"))
+    for name in (*contracts.LEFT_ARM_JOINTS, *contracts.RIGHT_ARM_JOINTS, *contracts.HEAD_JOINTS):
+        assert name in limits and limits[name][0] < limits[name][1], name
+    assert contracts.parse_joint_limits("") == {}
+
+
+# ── Motion: gate, stop, completion ───────────────────────────────────────────
+
+def open_gate(hub, positions=None, lift=True):
+    hub.on_joint_state(joint_state(URDF_JOINTS, positions or [0.0] * len(URDF_JOINTS)))
+    hub.on_diagnostics(normal_diagnostics())
+    if lift:
+        hub.on_lift(joint_state(["body_joint"], [0.61]))
+
+
+DRIVE = {"linear_x": 0.1, "duration_s": 0.5, "confirm_motion": True}
+# 0.1 rad from the all-zero pose, and inside every bundled-URDF limit (la4 and ra4 top out at 0).
+LEFT_TARGET = [0.1, -0.1, 0.1, 0.1, -0.1, 0.1, 0.1, 0.1]
+RIGHT_TARGET = [-0.1, -0.1, -0.1, 0.1, -0.1, 0.1, 0.1, 0.1]
+ARM = {"side": "left", "positions": LEFT_TARGET, "duration_s": 3.0, "confirm_motion": True}
+
+
+def test_every_motion_command_is_refused_while_the_commissioning_switch_is_off(device, config, hub, io, motion_module):
+    open_gate(hub)
+    closed = motion_module.Motion(config, io, hub, spawn=lambda t, n: t(), notify=lambda *a: None)
+    for card, action, args in (("base_drive", "move", DRIVE), ("arm_control", "move", ARM),
+                               ("gripper", "set", {"side": "left", "position": 0.5, "confirm_motion": True}),
+                               ("lifting", "set_position", {"position": 0.62, "confirm_motion": True}),
+                               ("head", "look", {"head0_rad": 0.1, "head1_rad": 0.1, "confirm_motion": True})):
+        result = closed.dispatch(card, action, args)
+        assert result["state"] == "error" and "commissioning_motion_enabled" in result["message"], card
+    assert io.calls == [], "nothing reached the robot"
+    info = closed.dispatch("head", "info", {})
+    assert info["state"] == "idle" and info["commissioning_motion_enabled"] is False and "禁止" in info["note"]
+
+
+def test_nothing_moves_without_confirm_motion_even_with_the_gate_open(motion, hub, io):
+    open_gate(hub)
+    for card, action, args in (("base_drive", "move", DRIVE), ("arm_control", "move", ARM),
+                               ("gripper", "set", {"side": "left", "position": 0.5}),
+                               ("lifting", "set_position", {"position": 0.62}),
+                               ("head", "look", {"head0_rad": 0.1, "head1_rad": 0.1})):
+        args = {k: v for k, v in args.items() if k != "confirm_motion"}
+        result = motion.dispatch(card, action, args)
+        assert result["state"] == "error" and "confirm_motion" in result["message"], card
+    assert io.calls == []
+
+
+def test_motion_is_refused_without_fresh_joints_or_with_the_estop_not_normal(motion, hub, io):
+    result = motion.dispatch("base_drive", "move", DRIVE)
+    assert result["state"] == "error" and "motion refused" in result["message"]
+    open_gate(hub)
+    hub.on_diagnostics(diagnostics(status("diagnostic_broadcaster: Emergency stop", level=b"\x02",
+                                          message="x", stop_button_status="y")))
+    result = motion.dispatch("base_drive", "move", DRIVE)
+    assert result["state"] == "error" and "level is 2" in result["message"]
+    assert io.calls == []
+
+
+def test_a_drive_runs_for_its_duration_then_zeroes_and_reports_completion(motion, hub, io, completions):
+    open_gate(hub)
+    result = motion.dispatch("base_drive", "move", DRIVE)
+    assert result["state"] == "moving" and result["action_id"].startswith("panther_drive_")
+    sent = io.named("twist")
+    moving = [c for c in sent if c != (0.0, 0.0, 0.0)]
+    assert 9 <= len(moving) <= 11 and set(moving) == {(0.1, 0.0, 0.0)}
+    assert sent[-5:] == [(0.0, 0.0, 0.0)] * 5, "ends with repeated zero velocity"
+    (action_id, status, detail, tool), = completions
+    assert (action_id, status, tool) == (result["action_id"], "completed", "base_drive")
+
+
+def test_a_drive_that_breaks_the_caps_or_needs_a_dead_controller_never_publishes(motion, hub, io):
+    open_gate(hub)
+    assert "linear speed" in motion.dispatch("base_drive", "move", {**DRIVE, "linear_x": 0.5})["message"]
+    io.controllers["movebase3_drive_controller"] = "inactive"
+    assert "movebase3_drive_controller" in motion.dispatch("base_drive", "move", DRIVE)["message"]
+    assert io.named("twist") == []
+
+
+def test_stopping_a_drive_zeroes_at_once_and_the_worker_reports_cancelled(motion, hub, io, completions):
+    open_gate(hub)
+    original = io.publish_twist
+
+    def hooked(vx, vy, wz):
+        original(vx, vy, wz)
+        if vx and len(io.named("twist")) == 3:
+            assert motion.stop("base_drive")["state"] == "idle"     # as if another request arrived
+
+    io.publish_twist = hooked
+    motion.dispatch("base_drive", "move", {**DRIVE, "duration_s": 3.0})
+    sent = io.named("twist")
+    assert sum(1 for c in sent if c[0]) == 3, "no further motion command after stop"
+    assert sent[3:8] == [(0.0, 0.0, 0.0)] * 5
+    assert completions[-1][1] == "cancelled"
+
+
+def test_a_failing_publish_zeroes_and_reports_error(motion, hub, io, completions):
+    open_gate(hub)
+    io.fail_on = {"twist"}
+    motion.dispatch("base_drive", "move", DRIVE)
+    assert completions[-1][1] == "error" and "twist failed" in completions[-1][2]["message"]
+
+
+def test_a_new_drive_supersedes_the_old_one(motion, hub, io, completions):
+    open_gate(hub)
+    original = io.publish_twist
+    state = {"nested": False}
+
+    def hooked(vx, vy, wz):
+        original(vx, vy, wz)
+        if vx and not state["nested"] and len(io.named("twist")) == 2:
+            state["nested"] = True
+            motion.dispatch("base_drive", "move", {**DRIVE, "linear_x": -0.1, "duration_s": 0.2})
+
+    io.publish_twist = hooked
+    motion.dispatch("base_drive", "move", {**DRIVE, "duration_s": 2.0})
+    assert [c[1] for c in completions].count("cancelled") == 1 and [c[1] for c in completions].count("completed") == 1
+
+
+def test_an_arm_move_switches_controllers_sends_the_goal_and_restores_them(motion, hub, io, completions):
+    open_gate(hub)
+    result = motion.dispatch("arm_control", "move", ARM)
+    assert result["state"] == "moving" and result["action_id"].startswith("panther_arm_")
+    p2p = ("left_arm_joint_trajectory_position_controller", "right_arm_joint_trajectory_position_controller")
+    forward = "dual_arm_forward_position_controller"
+    assert [c[0] for c in io.calls] == ["switch", "goal", "switch"]
+    assert io.calls[0] == ("switch", p2p, (forward,))
+    assert io.calls[1] == ("goal", "left", tuple(LEFT_TARGET), 3.0)
+    assert io.calls[2] == ("switch", (forward,), p2p), "the original controller is back"
+    (action_id, status, detail, tool), = completions
+    assert (status, tool, detail["controllers_restored"]) == ("completed", "arm_control", True)
+    assert detail["left"]["error_code"] == 0
+
+
+def test_an_arm_move_leaves_the_forward_controller_off_if_it_was_off(motion, hub, io, completions):
+    open_gate(hub)
+    io.controllers["dual_arm_forward_position_controller"] = "inactive"
+    motion.dispatch("arm_control", "move", ARM)
+    assert io.calls[0][2] == () and io.calls[2][1] == (), "no controller is activated that was not active before"
+
+
+def test_an_arm_goal_that_is_refused_never_switches_controllers(motion, hub, io):
+    open_gate(hub)
+    for bad, text in (({"positions": [0.1] * 7}, "exactly 8"), ({"positions": [0.5] + [0.0] * 7}, "step limit"),
+                      ({"positions": [9.0] + [0.0] * 7}, "outside the URDF limit"),
+                      ({"side": "both"}, "exactly 8"), ({"side": "middle"}, "side must be"),
+                      ({"duration_s": 99.0}, "duration_s must be")):
+        result = motion.dispatch("arm_control", "move", {**ARM, **bad})
+        assert result["state"] == "error" and text in result["message"], (bad, result)
+    assert io.calls == []
+
+
+def test_both_arms_take_their_own_targets(motion, hub, io, completions):
+    open_gate(hub)
+    motion.dispatch("arm_control", "move", {"side": "both", "left_positions": LEFT_TARGET,
+                                            "right_positions": RIGHT_TARGET, "duration_s": 3.0,
+                                            "confirm_motion": True})
+    assert [c[1:3] for c in io.calls if c[0] == "goal"] == [("left", tuple(LEFT_TARGET)),
+                                                            ("right", tuple(RIGHT_TARGET))]
+
+
+def test_a_failed_trajectory_cancels_the_goal_restores_the_controllers_and_says_so(motion, hub, io, completions):
+    open_gate(hub)
+    io.arm_results = [{"status": 6, "error_code": -4, "error_string": "path tolerance violated"}]
+    motion.dispatch("arm_control", "move", ARM)
+    status, detail = completions[-1][1], completions[-1][2]
+    assert status == "error" and "path tolerance violated" in detail["message"]
+    assert io.named("cancel") == [("handle-left",)]
+    assert io.calls[-1][0] == "switch" and detail["controllers_restored"] is True
+
+
+def test_failing_to_restore_the_controllers_is_an_error_and_is_logged_loudly(motion, hub, io, completions, capsys):
+    open_gate(hub)
+    io.switch_fail_after = 1
+    motion.dispatch("arm_control", "move", ARM)
+    status, detail = completions[-1][1], completions[-1][2]
+    assert status == "error" and detail["controllers_restored"] is False and "rejected" in detail["restore_error"]
+    assert "could not restore the arm controllers" in capsys.readouterr().out
+
+
+def test_a_trajectory_that_never_finishes_times_out_and_restores(motion, hub, io, completions, clock):
+    open_gate(hub)
+    io.poll_arm_result = lambda handle, timeout: clock.advance(2.0)             # never done; time passes
+    motion.dispatch("arm_control", "move", ARM)
+    assert completions[-1][1] == "error" and "did not finish" in completions[-1][2]["message"]
+    assert io.calls[-1][0] == "switch"
+
+
+def _running_motion(device, config, hub, completions, clock, motion_module, io):
+    """Real worker thread, and an arm goal that never finishes on its own."""
+    import time
+
+    class Hanging(FakeIO):
+        def poll_arm_result(self, handle, timeout):
+            time.sleep(0.005)
+            return None
+
+    io.__class__ = Hanging
+    config["safety"]["commissioning_motion_enabled"] = True
+    return motion_module.Motion(config, io, hub, notify=lambda *a: completions.append(a),
+                                monotonic=lambda: clock.mono)
+
+
+def _wait_for(condition, seconds=3.0):
+    import time
+
+    end = time.time() + seconds
+    while time.time() < end:
+        if condition():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+def test_stopping_the_arm_cancels_the_goal_restores_the_controllers_and_reports_cancelled(
+        device, config, hub, io, completions, clock, motion_module):
+    motion = _running_motion(device, config, hub, completions, clock, motion_module, io)
+    open_gate(hub)
+    assert motion.dispatch("arm_control", "move", ARM)["state"] == "moving"
+    assert _wait_for(lambda: io.named("goal"))
+    assert motion.dispatch("arm_control", "info", {})["busy"] is True
+    busy = motion.dispatch("arm_control", "move", ARM)
+    assert busy["state"] == "error" and "already moving" in busy["message"]
+
+    stopped = motion.stop("arm_control")
+    assert stopped["state"] == "idle"
+    assert completions[-1][1] == "cancelled"
+    assert io.named("cancel") == [("handle-left",)]
+    assert io.calls[-1][0] == "switch" and io.calls[-1][1] == ("dual_arm_forward_position_controller",)
+    assert motion.dispatch("arm_control", "info", {})["busy"] is False
+    assert motion.stop("arm_control") == {"state": "idle"}, "stop with nothing running is a no-op"
+
+
+def test_stop_all_stops_the_drive_and_the_arm_and_survives_a_failure(motion, hub, io, capsys):
+    motion.stop_all()
+    assert io.named("twist") == [(0.0, 0.0, 0.0)] * 5
+    io.fail_on = {"twist"}
+    motion.stop_all()
+    assert "stopping base_drive failed" in capsys.readouterr().out
+
+
+def test_gripper_lifting_and_head_stop_only_promise_that_nothing_more_is_sent(motion, io):
+    for card in ("gripper", "lifting", "head"):
+        result = motion.dispatch(card, "stop", {})
+        assert result["state"] == "idle" and "no further command" in result["note"], card
+    assert io.calls == []
+
+
+def test_a_gripper_command_is_checked_and_goes_to_the_right_side(motion, hub, io):
+    open_gate(hub)
+    result = motion.dispatch("gripper", "set", {"side": "right", "position": 0.4, "confirm_motion": True})
+    assert result == {"state": "commanded", "side": "right", "mode": "parallel", "position": 0.4}
+    assert io.named("gripper") == [("right", "parallel", 0.4)]
+    for bad, text in (({"position": 1.5}, r"\[0, 1\]"), ({"position": NAN}, "finite"), ({"side": "both"}, "left or right"),
+                      ({"mode": "claw"}, "mode must be")):
+        result = motion.dispatch("gripper", "set", {"side": "left", "position": 0.5, "confirm_motion": True, **bad})
+        assert result["state"] == "error" and re.search(text, result["message"]), bad
+    io.controllers["left_unix_gripper3_controller"] = "inactive"
+    assert "left_unix_gripper3_controller" in motion.dispatch(
+        "gripper", "set", {"side": "left", "position": 0.5, "confirm_motion": True})["message"]
+    assert len(io.named("gripper")) == 1
+
+
+def test_a_lift_command_is_capped_and_a_bounded_step_from_the_reading(motion, hub, io):
+    open_gate(hub)
+    ok = motion.dispatch("lifting", "set_position", {"position": 0.65, "confirm_motion": True})
+    assert ok["state"] == "commanded" and ok["previous_reading"] == 0.61
+    assert io.named("lift") == [(0.65,)]
+    for position, text in ((0.3, "step limit"), (0.9, "must be in"), (-0.1, "must be in")):
+        result = motion.dispatch("lifting", "set_position", {"position": position, "confirm_motion": True})
+        assert result["state"] == "error" and text in result["message"], position
+    assert len(io.named("lift")) == 1
+
+
+def test_a_lift_command_needs_a_fresh_reading(motion, hub, io):
+    open_gate(hub, lift=False)
+    result = motion.dispatch("lifting", "set_position", {"position": 0.6, "confirm_motion": True})
+    assert result["state"] == "error" and "fresh lift reading" in result["message"]
+    assert io.calls == []
+
+
+def test_a_head_command_is_checked_against_urdf_limits_and_a_bounded_step(motion, hub, io):
+    open_gate(hub)
+    ok = motion.dispatch("head", "look", {"head0_rad": 0.2, "head1_rad": -0.3, "confirm_motion": True})
+    assert ok == {"state": "commanded", "head0_rad": 0.2, "head1_rad": -0.3}
+    assert io.named("head") == [((0.2, -0.3),)]
+    for args, text in (({"head0_rad": -0.5, "head1_rad": 0.0}, "outside the URDF limit"),   # head0 floor is -0.348
+                       ({"head0_rad": 0.0, "head1_rad": 1.0}, "step limit"),
+                       ({"head0_rad": 0.2}, "must be a number")):
+        result = motion.dispatch("head", "look", {**args, "confirm_motion": True})
+        assert result["state"] == "error" and text in result["message"], args
+    assert len(io.named("head")) == 1
+
+
+def test_info_never_raises_even_when_the_controller_manager_is_unreachable(motion, hub, io):
+    open_gate(hub)
+    io.list_controllers = lambda: (_ for _ in ()).throw(RuntimeError("no list_controllers"))
+    for card in ("base_drive", "arm_control", "gripper", "lifting", "head"):
+        info = motion.dispatch(card, "start", {})
+        assert info["state"] == "ready" and "no list_controllers" in info["controllers_error"], card
+
+
+def test_info_reports_which_controllers_are_missing(motion, hub, io):
+    open_gate(hub)
+    del io.controllers["lifting_controller"]
+    assert motion.dispatch("lifting", "info", {})["controllers"] == {"lifting_controller": "missing"}
+
+
+def test_unsupported_actions_are_errors(motion):
+    for card in ("base_drive", "arm_control", "gripper", "lifting", "head"):
+        result = motion.dispatch(card, "fly", {})
+        assert result["state"] == "error" and "unsupported" in result["message"], card
+
+
+# ── motion cards as tools ────────────────────────────────────────────────────
+
+def test_every_actuator_declares_a_stop_a_resource_and_confirmation(motion_module, config):
+    tools = {t["name"]: t for t in motion_module.motion_tools(config)}
+    assert list(tools) == ["base_drive", "arm_control", "gripper", "lifting", "head"]
+    for name, definition in tools.items():
+        schema = definition["inputSchema"]
+        assert definition["type"] == "actuator" and schema["additionalProperties"] is False
+        assert {"start", "stop", "info"} <= set(schema["properties"]["action"]["enum"]), name
+        assert schema["properties"]["confirm_motion"] == {
+            "type": "boolean", "const": True, "description": schema["properties"]["confirm_motion"]["description"]}
+        assert schema["x-resource"], name
+        assert set(schema["x-action-params"]) == set(schema["properties"]["action"]["enum"])
+        assert "confirm_motion" in max(schema["x-action-params"].values(), key=lambda v: len(v["params"]))["params"]
+        json.dumps(definition, allow_nan=False)
+    assert "cancel" not in json.dumps(tools), "base_drive's cancel became the required stop"
+
+
+def test_long_running_actions_declare_x_completion_and_the_rest_do_not(motion_module, config):
+    tools = {t["name"]: t["inputSchema"] for t in motion_module.motion_tools(config)}
+    assert tools["arm_control"]["x-completion"] == {"actions": ["move"], "timeout": 35}
+    assert tools["base_drive"]["x-completion"] == {"actions": ["move"], "timeout": 13}
+    assert tools["arm_control"]["x-completion"]["timeout"] > config["plugins"]["arm_control"]["max_duration_s"]
+    for name in ("gripper", "lifting", "head"):
+        assert "x-completion" not in tools[name], "no feedback exists to define their completion"
+    assert tools["base_drive"]["x-resource"] == "base"
+    assert set(tools["arm_control"]["x-resource"]) == {"arm_l", "arm_r"}
+
+
+def test_tool_limits_come_from_the_configured_caps(motion_module, config):
+    config["plugins"]["base_drive"]["max_linear_mps"] = 0.05
+    props = {t["name"]: t["inputSchema"]["properties"] for t in motion_module.motion_tools(config)}
+    assert props["base_drive"]["linear_x"] == {"type": "number", "minimum": -0.05, "maximum": 0.05}
+    assert props["lifting"]["position"]["maximum"] == config["plugins"]["lifting"]["max_position"]
+
+
+def test_a_disabled_motion_card_is_not_listed(device, hub, motion, config):
+    config["plugins"]["head"]["enabled"] = False
+    plugin = device.PantherPlugin(hub, motion=motion, config=config,
+                                  enabled={n: s["enabled"] for n, s in config["plugins"].items()})
+    assert "head" not in [t["name"] for t in plugin.get_tools()]
+
+
+def test_the_plugin_routes_motion_calls_and_turns_failures_into_error_results(device, hub, motion, config, io):
+    open_gate(hub)
+    plugin = device.PantherPlugin(hub, motion=motion, config=config)
+    ok = plugin.dispatch("look", {"_tool_name": "head", "head0_rad": 0.1, "head1_rad": 0.1, "confirm_motion": True})
+    assert ok["state"] == "commanded"
+    refused = plugin.dispatch("look", {"_tool_name": "head", "head0_rad": 0.1, "head1_rad": 0.1})
+    assert refused["state"] == "error"
+    assert plugin.dispatch("stop", {"_tool_name": "gripper"})["state"] == "idle"
+    motion.stop = lambda card: (_ for _ in ()).throw(RuntimeError("bus down"))
+    failed = plugin.dispatch("stop", {"_tool_name": "base_drive"})
+    assert failed["state"] == "error" and "bus down" in failed["message"], "a failed stop is never reported as idle"
+
+
+def test_without_motion_the_actuator_cards_say_so(device, hub):
+    result = device.PantherPlugin(hub).dispatch("move", {"_tool_name": "base_drive"})
+    assert result["state"] == "error" and "not available" in result["message"]
+
+
+def test_plugin_stop_stops_motion_first_then_releases_everything(device, hub, sink):
+    order = []
+    plugin = device.PantherPlugin(
+        hub, nodes=NS(close=lambda: order.append("nodes")), sink=NS(close=lambda: order.append("bridge")),
+        motion=NS(stop_all=lambda: order.append("motion")), camera=NS(close=lambda: order.append("camera")))
+    plugin.stop()
+    assert order == ["motion", "camera", "nodes", "bridge"]
+
+
+# ── completion callback to Agent Core ────────────────────────────────────────
+
+class _Response:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_completion_is_posted_to_agent_core_in_the_documented_shape(motion_module, monkeypatch):
+    import urllib.request
+
+    sent = []
+    monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout, context: sent.append((request, context)) or _Response())
+    monkeypatch.delenv("AGENT_CORE_URL", raising=False)
+    monkeypatch.delenv("AGENT_CORE_CA_CERT", raising=False)
+    motion_module.post_acp_callback("panther_arm_1", "completed", {"left": {"error_code": 0}}, "arm_control")
+    (request, context), = sent
+    body = json.loads(request.data)
+    assert request.full_url == "https://localhost:15678/api/acp/complete" and request.get_method() == "POST"
+    assert body["action_id"] == "panther_arm_1" and body["status"] == "completed" and body["tool"] == "arm_control"
+    assert body["result"] == {"left": {"error_code": 0}} and isinstance(body["ts"], float)
+    assert context.check_hostname is False, "Agent Core's certificate has no subjectAltName"
+
+
+def test_completion_is_retried_three_times_then_reported_not_swallowed(motion_module, monkeypatch, capsys):
+    import urllib.request
+
+    attempts = []
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: attempts.append(1) or (_ for _ in ()).throw(OSError("refused")))
+    monkeypatch.setattr(motion_module.time, "sleep", lambda s: None)
+    with pytest.raises(RuntimeError, match="after 3 attempts"):
+        motion_module.post_acp_callback("a", "error", {}, "base_drive")
+    assert len(attempts) == 3
+
+    class Inline:
+        def __init__(self, target, daemon, name):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(motion_module, "threading", NS(Thread=Inline))
+    motion_module.notify_async("panther_drive_9", "completed", {}, "base_drive")
+    assert "callback failed action_id=panther_drive_9" in capsys.readouterr().out
+
+
+# ── host camera: lazy start of the Orbbec driver ─────────────────────────────
+
+@pytest.fixture(scope="module")
+def host_camera(device):
+    return importlib.import_module("host_camera")
+
+
+class FakeRun:
+    def __init__(self, host_camera, active="inactive", start_rc=1, raises=None):
+        self.prefix = list(host_camera.HostCamera.NSENTER)
+        self.active, self.start_rc, self.raises, self.calls = active, start_rc, raises, []
+
+    def __call__(self, command, check, capture_output, text, timeout):
+        self.calls.append(list(command))
+        if self.raises:
+            raise self.raises
+        tail = list(command)[len(self.prefix):]
+        if tail[:2] == ["systemctl", "is-active"]:
+            return NS(stdout=self.active + "\n", returncode=0 if self.active == "active" else 3)
+        if tail[:2] == ["systemctl", "start"]:
+            return NS(stdout="", returncode=self.start_rc)
+        return NS(stdout="", returncode=0)
+
+    def tails(self):
+        return [c[len(self.prefix):] for c in self.calls]
+
+
+TOPICS = {"color": "/camera/color/image_raw", "depth": "/camera/depth/image_raw"}
+
+
+def _camera(host_camera, config, clock, run, publishers=None, age=lambda kind: None):
+    counts = publishers if publishers is not None else {}
+    return host_camera.HostCamera(config["camera"]["host"], TOPICS, lambda topic: counts.get(topic, 0), age,
+                                  run=run, sleep=clock.advance, monotonic=lambda: clock.mono, watchdog=False)
+
+
+def test_an_existing_camera_publisher_is_never_competed_with(host_camera, config, clock):
+    run = FakeRun(host_camera)
+    camera = _camera(host_camera, config, clock, run, {TOPICS["color"]: 1})
+    info = camera.start("color")
+    assert run.calls == [], "another process owns the device: no host command at all"
+    assert info["host_service_managed"] is False and info["publisher_count"] == 1
+
+
+def test_starting_a_camera_creates_a_transient_host_unit_through_nsenter(host_camera, config, clock):
+    run = FakeRun(host_camera)
+    camera = _camera(host_camera, config, clock, run)
+    info = camera.start("color")
+    assert all(call[:len(run.prefix)] == run.prefix for call in run.calls), "every command enters PID 1's namespaces"
+    assert run.prefix[:3] == ["nsenter", "-t", "1"]
+    tails = run.tails()
+    assert tails[0] == ["systemctl", "is-active", "panther_orbbec.service"]
+    assert tails[1] == ["systemctl", "start", "panther_orbbec.service"]
+    create = tails[2]
+    assert create[0] == "systemd-run" and "--unit=panther_orbbec.service" in create and "--uid=unix_ai" in create
+    assert "--property=Restart=on-failure" in create
+    script = create[-1]
+    assert "gemini2.launch.py" in script and "ROS_DOMAIN_ID=0" in script and "rmw_cyclonedds_cpp" in script
+    assert "/home/unix_ai/orbbec_ws" in script and "file:///home/unix_ai/config/cyclonedds.xml" in script
+    assert info["host_service_managed"] is True
+
+
+def test_an_already_running_host_unit_is_reused(host_camera, config, clock):
+    run = FakeRun(host_camera, active="active")
+    camera = _camera(host_camera, config, clock, run)
+    assert camera.start("depth")["host_service_managed"] is True
+    assert [t[0] for t in run.tails()] == ["systemctl"] and len(run.calls) == 1
+
+
+def test_a_failed_unit_is_restarted_not_duplicated(host_camera, config, clock):
+    run = FakeRun(host_camera, start_rc=0)
+    _camera(host_camera, config, clock, run).start("color")
+    assert [t[0] for t in run.tails()] == ["systemctl", "systemctl"], "no systemd-run for a unit that restarts"
+
+
+def test_a_camera_that_cannot_be_started_is_reported_not_raised(host_camera, config, clock, capsys):
+    run = FakeRun(host_camera, raises=FileNotFoundError("nsenter"))
+    info = _camera(host_camera, config, clock, run).start("color")
+    assert "FileNotFoundError" in info["start_error"], "agent-core rolls the project back if a start raises"
+    assert "camera source could not be started" in capsys.readouterr().out
+
+
+def test_stopping_a_card_never_stops_the_shared_host_service(host_camera, config, clock):
+    run = FakeRun(host_camera)
+    camera = _camera(host_camera, config, clock, run)
+    camera.start("color")
+    camera.start("depth")
+    before = len(run.calls)
+    camera.stop("color")
+    camera.stop("depth")
+    camera.close()
+    assert len(run.calls) == before and not any("stop" in t[:2] for t in run.tails())
+
+
+def test_the_watchdog_restarts_a_stalled_unit_a_bounded_number_of_times(host_camera, config, clock, capsys):
+    run = FakeRun(host_camera)
+    camera = _camera(host_camera, config, clock, run)
+    camera.start("color")
+    clock.advance(10)
+    assert camera.check() is False, "inside the first-frame grace"
+    restarts = 0
+    for _ in range(5):
+        clock.advance(31)
+        restarts += bool(camera.check())
+    assert restarts == 2 == config["camera"]["host"]["max_watchdog_restarts"]
+    assert sum(1 for t in run.tails() if t[:2] == ["systemctl", "restart"]) == 2
+    assert camera.info("color")["watchdog_restarts"] == 2
+    assert "restarted panther_orbbec.service (2/2)" in capsys.readouterr().out
+
+
+def test_the_watchdog_leaves_a_flowing_or_foreign_camera_alone(host_camera, config, clock):
+    run = FakeRun(host_camera)
+    flowing = _camera(host_camera, config, clock, run, age=lambda kind: 0.1)
+    flowing.start("color")
+    clock.advance(100)
+    assert flowing.check() is False
+
+    foreign = _camera(host_camera, config, clock, FakeRun(host_camera), {TOPICS["color"]: 1})
+    foreign.start("color")
+    clock.advance(100)
+    assert foreign.check() is False, "the driver does not own that camera, so it never restarts it"
+
+
+def test_camera_plugin_starts_and_stops_the_host_runtime_with_the_card(device, hub):
+    calls = []
+    camera = NS(start=lambda kind: calls.append(("start", kind)) or {"host_service_managed": True},
+                stop=lambda kind: calls.append(("stop", kind)) or {}, info=lambda kind: {"kind": kind},
+                close=lambda: calls.append(("close",)))
+    plugin = device.PantherPlugin(hub, camera=camera)
+    started = plugin.dispatch("start", {"_tool_name": "camera_color"})
+    assert started["state"] == "running" and started["camera_runtime"] == {"host_service_managed": True}
+    assert plugin.dispatch("info", {"_tool_name": "camera_depth"})["camera_runtime"] == {"kind": "depth"}
+    plugin.dispatch("stop", {"_tool_name": "camera_depth"})
+    plugin.dispatch("start", {"_tool_name": "laser_scan"})
+    plugin.stop()
+    assert calls == [("start", "color"), ("stop", "depth"), ("close",)], "only camera cards touch the camera runtime"
+
+
+def test_a_stream_of_unsupported_frames_logs_a_transition_and_a_throttled_sample(hub, clock, capsys):
+    hub.activate("camera_color")
+    for _ in range(300):                                   # 33 s of frames the driver cannot convert
+        clock.advance(0.11)
+        hub.on_image("camera_color", image(4, 4, "yuv422", bytes(32)))
+    lines = [l for l in capsys.readouterr().out.splitlines() if "camera_color" in l]
+    assert hub.stream("camera_color")["errors"] == 300, "every dropped frame is counted"
+    assert 2 <= len(lines) <= 3, f"one line per frame would be 300: {len(lines)}"
+    assert "frames dropped so far" in lines[-1]
+
+
+# ── static transforms and the merged scan ────────────────────────────────────
+
+def test_static_tf_composes_a_chain_including_rotation(payloads):
+    tf = payloads.StaticTf()
+    assert tf.add_message(_tf(("base_link", "torso", (1, 0, 0), (0, 0, 0, 1)),
+                              ("/torso", "/lidar", (0, 2, 0), (0, 0, 0.70710678, 0.70710678)))) == 2
+    rotation, translation = tf.lookup("lidar", "base_link")
+    x = rotation[0][0] * 1.0 + translation[0]
+    y = rotation[1][0] * 1.0 + translation[1]
+    assert (x, y) == pytest.approx((1.0, 3.0), abs=1e-6), "1 m ahead of a lidar yawed 90 degrees, 2 m left of the torso"
+    identity, zero = tf.lookup("base_link", "base_link")
+    assert identity[0][0] == 1.0 and zero == [0.0, 0.0, 0.0]
+    assert tf.lookup("lidar", "elsewhere") is None and tf.lookup("nowhere", "base_link") is None
+
+
+def test_static_tf_ignores_unusable_transforms_and_cycles(payloads):
+    tf = payloads.StaticTf()
+    assert tf.add_message(_tf(("a", "b", (0, 0, 0), (0, 0, 0, 0)), ("a", "c", (NAN, 0, 0), (0, 0, 0, 1)))) == 0
+    tf.add_message(_tf(("a", "b", (0, 0, 0), (0, 0, 0, 1)), ("b", "a", (0, 0, 0), (0, 0, 0, 1))))
+    assert tf.lookup("a", "z") is None, "a loop in the tree ends, it does not hang"
+
+
+def test_merging_keeps_the_nearest_return_where_two_lidars_overlap(payloads):
+    near = scan(n=360, fill=INF, angle_min=-3.14159, angle_increment=2 * 3.14159 / 360)
+    far = scan(n=360, fill=INF, angle_min=-3.14159, angle_increment=2 * 3.14159 / 360)
+    near.ranges[180], far.ranges[180] = 1.0, 2.0
+    far.ranges[90] = 0.05                                      # below range_min: invalid
+    merged = strict(payloads.merge_scans([(near, None), (far, None)], "base_link", 360))
+    assert merged["ranges"][180] == pytest.approx(1.0, abs=1e-3) and merged["ranges"][90] is None
+    assert merged["nearest_m"] == pytest.approx(1.0, abs=1e-3) and merged["beams"] == 720 and merged["bins"] == 360
+    empty = strict(payloads.merge_scans([], "base_link", 360))
+    assert set(empty["ranges"]) == {None} and empty["nearest_m"] is None and empty["valid_ratio"] == 0.0

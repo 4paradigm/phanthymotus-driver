@@ -352,6 +352,121 @@ def laser_topdown_jpeg(scan: dict, size: int = 400, max_range_m: float = 6.0,
     return bytes(encoded) if ok else None
 
 
+class StaticTf:
+    """The robot's fixed frame tree from `/tf_static`, enough to place a lidar in `base_link`.
+
+    The vendor URDF has one lidar frame (`base_laser_link`) and none for the individual
+    lidars, so where the front and rear lidars sit can only be read from the robot itself.
+    Full 3-D composition (rotation matrix and translation) is used rather than a planar
+    shortcut so that a lidar mounted tilted or upside down is still placed correctly; only the
+    resulting x and y are used, because a scan is a plane.
+    """
+
+    def __init__(self):
+        self._edges: dict = {}          # child -> (parent, rotation 3x3, translation 3)
+
+    @staticmethod
+    def _matrix(q) -> list | None:
+        x, y, z, w = (num(q.x), num(q.y), num(q.z), num(q.w))
+        if None in (x, y, z, w):
+            return None
+        norm = math.sqrt(x * x + y * y + z * z + w * w)
+        if norm < 1e-6:
+            return None
+        x, y, z, w = x / norm, y / norm, z / norm, w / norm
+        return [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]]
+
+    def add_message(self, msg) -> int:
+        """Record every usable transform of a `tf2_msgs/TFMessage`; returns how many were kept."""
+        kept = 0
+        for item in getattr(msg, "transforms", []):
+            child = str(item.child_frame_id).lstrip("/")
+            parent = str(item.header.frame_id).lstrip("/")
+            rotation = self._matrix(item.transform.rotation)
+            t = item.transform.translation
+            translation = [num(t.x), num(t.y), num(t.z)]
+            if not child or not parent or rotation is None or None in translation:
+                continue
+            self._edges[child] = (parent, rotation, translation)
+            kept += 1
+        return kept
+
+    def lookup(self, frame: str, target: str):
+        """`(rotation, translation)` taking a point in `frame` to `target`, or None if unconnected."""
+        frame, target = str(frame).lstrip("/"), str(target).lstrip("/")
+        rotation = [[1.0, 0, 0], [0, 1.0, 0], [0, 0, 1.0]]
+        translation = [0.0, 0.0, 0.0]
+        current = frame
+        for _ in range(32):
+            if current == target:
+                return rotation, translation
+            edge = self._edges.get(current)
+            if edge is None:
+                return None
+            parent, r, t = edge
+            translation = [sum(r[i][k] * translation[k] for k in range(3)) + t[i] for i in range(3)]
+            rotation = [[sum(r[i][k] * rotation[k][j] for k in range(3)) for j in range(3)]
+                        for i in range(3)]
+            current = parent
+        return None
+
+    def __len__(self) -> int:
+        return len(self._edges)
+
+
+def merge_scans(parts: list, target_frame: str, max_points: int = 360) -> dict:
+    """One polar scan around `target_frame` from several lidars, keeping the nearest return per bin.
+
+    `parts` is `[(msg, transform)]`, where `transform` is `StaticTf.lookup`'s result or None for
+    a scan already in `target_frame`. Each valid beam is turned into a point, moved into the
+    target frame, and put back into one of `max_points` bins round the robot; where two lidars
+    see the same direction the nearer return wins, as in the single-lidar pooling. Ranges are
+    therefore measured from the target frame's origin, not from either lidar.
+    """
+    bins = max(8, int(max_points))
+    step = 2.0 * math.pi / bins
+    merged = [None] * bins
+    beams, range_mins, range_maxs = 0, [], []
+    for msg, transform in parts:
+        ranges = list(getattr(msg, "ranges", []))
+        beams += len(ranges)
+        low = num(getattr(msg, "range_min", None)) or 0.0
+        high = num(getattr(msg, "range_max", None))
+        high = high if high is not None else float("inf")
+        range_mins.append(low)
+        range_maxs.append(high)
+        angle = num(getattr(msg, "angle_min", None))
+        increment = num(getattr(msg, "angle_increment", None))
+        if angle is None or increment is None:
+            continue
+        for index, raw in enumerate(ranges):
+            value = num(raw)
+            if value is None or value < low or value > high:
+                continue
+            theta = angle + index * increment
+            x, y = value * math.cos(theta), value * math.sin(theta)
+            if transform is not None:
+                (r, t) = transform
+                x, y = r[0][0] * x + r[0][1] * y + t[0], r[1][0] * x + r[1][1] * y + t[1]
+            distance = math.hypot(x, y)
+            slot = int(round((math.atan2(y, x) + math.pi) / step)) % bins
+            if merged[slot] is None or distance < merged[slot]:
+                merged[slot] = distance
+    out = [None if v is None else round(v, 3) for v in merged]
+    valid = sum(1 for v in out if v is not None)
+    return {
+        "frame_id": target_frame,
+        "angle_min": round(-math.pi, 5), "angle_increment": round(step, 6),
+        "range_min": round(min(range_mins), 3) if range_mins else None,
+        "range_max": round(max(range_maxs), 3) if range_maxs and math.isfinite(max(range_maxs)) else None,
+        "beams": beams, "bins": bins, "beams_per_bin": None,
+        "valid_ratio": round(valid / bins, 3), "nearest_m": min((v for v in out if v is not None), default=None),
+        "ranges": out, "stamp_ms": None,
+    }
+
+
 # ── images ───────────────────────────────────────────────────────────────────
 
 class UnsupportedImage(ValueError):

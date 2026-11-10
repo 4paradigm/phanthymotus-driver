@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""UniX AI Panther driver: read-only sensor cards.
+"""UniX AI Panther driver: sensor cards and the five motion cards.
 
-The robot (ROS 2 Humble, CycloneDDS, domain 0, loopback-bound) is read in this process;
-finished payloads are handed to `panther_bridge.CoreBridge`, whose child processes publish
-them to Agent Core on domain 42. Nothing here publishes to the robot, calls one of its
-services or switches a controller: every card is a `sensor` or a `resource`.
+The robot (ROS 2 Humble, CycloneDDS, domain 0, loopback-bound) is read and commanded in this
+process; finished payloads are handed to `panther_bridge.CoreBridge`, whose child processes
+publish them to Agent Core on domain 42. Robot command topics never cross that bridge.
 
-`Hub` holds all the logic and knows nothing about ROS, so it is tested with plain objects.
-`PantherNodes` is the thin rclpy layer that feeds it. `PantherPlugin` is the MCP surface.
+`Hub` holds all the sensor logic and knows nothing about ROS, so it is tested with plain
+objects. `panther_motion.Motion` holds the motion rules, also ROS-free. `PantherNodes` is the
+thin rclpy layer that feeds the first and carries out the second (`RosMotionIO`).
+`PantherPlugin` is the MCP surface.
+
+Motion is off unless `safety.commissioning_motion_enabled` is true in config.yaml: the cards are
+listed and answer `info`, and every motion command is refused.
 """
 from __future__ import annotations
 
@@ -20,49 +24,49 @@ from pathlib import Path
 from common.camera_info import build as build_camera_info
 from common.odom import build_interface, build_sample, mean_twist, resolve_stamp_ms
 from common.vendor_runtime import tool
+from contracts import parse_joint_limits, populate_switch_request
+from host_camera import HostCamera
 from panther_bridge import CoreBridge, DEFAULT_PROFILE, safe_text
+from panther_motion import MOTION_CARDS, Motion, motion_tools
 from panther_payloads import (
-    DEPTH_FORMAT, DEPTH_OUTPUT_SIZE, UnsupportedImage, battery_payload, diagnostic_entries,
+    DEPTH_FORMAT, DEPTH_OUTPUT_SIZE, StaticTf, UnsupportedImage, battery_payload, diagnostic_entries,
     encode_color_jpeg, encode_depth_zlib, estop_payload, health_payload, imu_payload,
-    joint_state_payload, laser_payload, laser_topdown_jpeg, odom_reading, single_joint,
+    joint_state_payload, laser_topdown_jpeg, merge_scans, odom_reading, single_joint,
 )
 
 URDF_PATH = Path(__file__).with_name("resource") / "panther.urdf"
 CAMERA_ID = "unixai/panther/{}"
 
 # Conversion work that is skipped until the card is started: the camera encodes, and the
-# lasers' top-down picture. Everything else is cheap and always publishes. Skipping matters
+# laser's top-down picture. Everything else is cheap and always publishes. Skipping matters
 # for the cameras: a colour JPEG and a resampled depth frame every 100-200 ms are real load
 # on a Jetson that is also running the robot.
-LASER_CARDS = ("laser_scan_front", "laser_scan_rear")
 CAMERA_CARDS = ("camera_color", "camera_depth")
+SENSOR_CARDS = ("model", "joints", "imu", "odom", "robot_state", "laser_scan") + CAMERA_CARDS
+CARD_ORDER = SENSOR_CARDS + MOTION_CARDS
+STREAM_CARDS = tuple(c for c in SENSOR_CARDS if c != "model")
 
 DESCRIPTIONS = {
     "model": "UniX AI Panther 运动学骨架（URDF，机器人名 mh3），供 joints 骨架渲染使用",
     "joints": "Panther 18 个关节（双臂 16 + 头部 2）实时角度，约 10Hz，3D 骨架。"
-              "升降和夹爪不在此骨架内，见 gripper_lift_state",
-    "battery": "Panther 电池：电量百分比、电压、电流、温度、充放电状态，约 1Hz",
+              "升降和夹爪不在此骨架内，见 robot_state",
     "imu": "Panther IMU：姿态四元数/欧拉角、角速度、线加速度，约 10Hz。传感器未提供的量为 null",
     "odom": "Panther 底盘速度里程计（机体坐标系 vx/vy/wz，不含位姿），约 10Hz",
-    "gripper_lift_state": "Panther 左右夹爪和升降的原始关节读数（位置/速度/力矩），约 10Hz。"
-                          "夹爪数值的开合含义和升降单位以厂商文档为准，本卡片不做换算",
-    "health": "Panther 硬件诊断汇总：CAN 总线、串口通信、底盘电机、手臂电机、急停，约 2Hz",
-    "estop": "Panther 急停诊断（厂商原文原样透传，附数据年龄和是否过期），约 1Hz。"
-             "stale 为 true 时不代表安全",
-    "laser_scan_front": "Panther 前激光雷达：最近障碍物降采样距离 JSON，约 5Hz；启动后另发 1Hz 俯视图",
-    "laser_scan_rear": "Panther 后激光雷达：最近障碍物降采样距离 JSON，约 5Hz；启动后另发 1Hz 俯视图。"
-                       "该话题目前可能没有数据",
-    "camera_color": "Panther 头部 RGB 相机（奥比中光 Gemini 2）彩色图像。需要机器人上已启动相机驱动",
-    "camera_depth": "Panther 头部 RGB-D 相机深度图（640x480 uint16 毫米，zlib）。需要机器人上已启动相机驱动",
+    "robot_state": "Panther 低频状态汇总，约 2Hz：电池（电量/电压/电流/温度）、硬件诊断（CAN、电机等）、"
+                   "急停诊断（厂商原文原样透传，附数据年龄和是否过期，stale 为 true 时不代表安全）、"
+                   "左右夹爪与升降的原始读数、ros2_control 控制器状态、是否允许运动。每一块各带自己的 age_ms",
+    "laser_scan": "Panther 前后激光雷达合并为一圈：以 base_link 为中心的最近障碍物距离 JSON，约 5Hz；"
+                  "启动后另发 1Hz 俯视图。雷达安装位姿取自机器人的 /tf_static",
+    "camera_color": "Panther 头部 RGB 相机（奥比中光 Gemini 2）彩色图像。启动卡片时在机器人本机拉起相机驱动",
+    "camera_depth": "Panther 头部 RGB-D 相机深度图（640x480 uint16 毫米，zlib）。启动卡片时在机器人本机拉起相机驱动",
 }
-CARD_ORDER = tuple(DESCRIPTIONS)
 
 NO_DATA_HINTS = {
-    "camera_color": "没有收到图像：机器人上的相机驱动没有运行。请在机器人上启动 "
-                    "`ros2 launch orbbec_camera gemini2.launch.py`（本驱动不会替你启动）",
-    "camera_depth": "没有收到深度图：机器人上的相机驱动没有运行。请在机器人上启动 "
-                    "`ros2 launch orbbec_camera gemini2.launch.py`（本驱动不会替你启动）",
-    "laser_scan_rear": "没有收到后雷达数据：该话题可能没有发布者",
+    "camera_color": "启动后仍未收到图像：检查机器人本机的 panther_orbbec.service"
+                    "（`journalctl -u panther_orbbec`），或相机是否被别的程序占用",
+    "camera_depth": "启动后仍未收到深度图：检查机器人本机的 panther_orbbec.service"
+                    "（`journalctl -u panther_orbbec`），或相机是否被别的程序占用",
+    "laser_scan": "没有收到任何雷达数据：前后雷达话题都没有发布者",
 }
 
 
@@ -106,13 +110,13 @@ class Hub:
         self._lock = threading.RLock()
         self._started = self._mono()
 
-        rates = {"joints": 10, "battery": 1, "imu": 10, "odom": 10, "gripper_lift_state": 10,
-                 "health": 2, "estop": 1, "laser_scan": 5, "laser_view": 1,
-                 "camera_color": 10, "camera_depth": 5}
+        rates = {"joints": 10, "imu": 10, "odom": 10, "robot_state": 2, "laser_scan": 5,
+                 "laser_view": 1, "camera_color": 10, "camera_depth": 5}
         rates.update(self._config.get("rates_hz", {}))
         self._rates = rates
-        stale = {"joints": 1.0, "battery": 5.0, "imu": 1.0, "odom": 1.0, "gripper_lift_state": 1.0,
-                 "health": 5.0, "estop": 3.0, "laser_scan": 1.5, "camera": 2.0}
+        stale = {"joints": 1.0, "imu": 1.0, "odom": 1.0, "robot_state": 5.0, "laser_scan": 1.5,
+                 "camera": 2.0, "battery": 5.0, "diagnostics": 5.0, "estop": 3.0,
+                 "grippers": 1.0, "lift": 1.0, "controllers": 3.0}
         stale.update(self._config.get("stale_after_s", {}))
         self._stale = stale
         camera = self._config.get("camera", {})
@@ -121,38 +125,42 @@ class Hub:
         laser = self._config.get("laser", {})
         self._laser_points = int(laser.get("max_points", 360))
         self._view_range = float(laser.get("view_range_m", 6.0))
+        self._base_frame = str(laser.get("base_frame", "base_link"))
 
         base = f"/{namespace}/" if namespace else "/"
         self.topics = {
             "joints": {"topic": base + "joints", "format": "sensor/skeleton"},
-            "battery": {"topic": base + "battery", "format": "data/json"},
             "imu": {"topic": base + "imu", "format": "data/json"},
             "odom": {"topic": base + "state/odom", "format": "state/odom"},
-            "gripper_lift_state": {"topic": base + "gripper_lift_state", "format": "data/json"},
-            "health": {"topic": base + "health", "format": "data/json"},
-            "estop": {"topic": base + "estop", "format": "data/json"},
-            "laser_scan_front": {"topic": base + "laser_scan_front", "format": "data/json"},
-            "laser_scan_rear": {"topic": base + "laser_scan_rear", "format": "data/json"},
+            "robot_state": {"topic": base + "robot_state", "format": "data/json"},
+            "laser_scan": {"topic": base + "laser_scan", "format": "data/json"},
             "camera_color": {"topic": base + "camera_color", "format": "image/jpeg"},
             "camera_depth": {"topic": base + "camera_depth", "format": "image/depth-zlib"},
         }
-        self.views = {card: {"topic": base + card + "_view", "format": "image/jpeg"}
-                      for card in LASER_CARDS}
+        self.views = {"laser_scan": {"topic": base + "laser_scan_view", "format": "image/jpeg"}}
         self.sources = dict(self._config.get("topics", {}))
 
-        self._stats = {card: self._blank_stat() for card in CARD_ORDER if card != "model"}
-        self._active = {card: False for card in CARD_ORDER if card != "model"}
+        self._stats = {card: self._blank_stat() for card in STREAM_CARDS}
+        self._active = {card: False for card in STREAM_CARDS}
         self._next: dict = {}
-        self._latest: dict = {}
+        self._latest: dict = {}                 # battery, gripper_left/right, lift: (seen, record)
         self._odom_burst: list = []
         self._odom_meta: dict = {}
         self._diag: dict = {}
+        self._diag_seen = None
         self._diag_signature = None
-        self._estop_signature = None
-        self._scans: dict = {}
+        self._controllers = None                # (seen, {name: state})
+        self._joint_pos = None                  # (seen, {name: position})
+        self._live_limits = None
+        self._scans: dict = {}                  # side -> (seen, msg)
+        self._last_scan = None
+        self._tf = StaticTf()
+        self._tf_logged = False
+        self._bundled_limits = None
         self._image_info: dict = {}
         self._unknown_joint_warned = False
         self._link_logged = 0.0
+        self._image_log: dict = {}
 
     # ── bookkeeping ──────────────────────────────────────────────────────────
 
@@ -203,13 +211,12 @@ class Hub:
                 print(f"[panther] {card} handler failed (#{stat['errors']}): "
                       f"{type(exc).__name__}: {safe_text(exc, 160)}", flush=True)
 
-    def _emit(self, card: str, payload: dict, topic_key: str | None = None, lane: str = "state") -> None:
+    def _emit(self, card: str, payload: dict, lane: str = "state") -> None:
         # allow_nan=False turns a NaN that slipped past the payload code into an error here,
         # not into invalid JSON on the wire.
         text = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        topic = self.topics[topic_key or card]["topic"]
         stat = self._stats[card]
-        if self._sink.json(lane, topic, text):
+        if self._sink.json(lane, self.topics[card]["topic"], text):
             stat["published"] += 1
         else:
             stat["dropped"] += 1
@@ -240,6 +247,16 @@ class Hub:
 
     def _joint_state(self, msg) -> None:
         self._rx("joints")
+        positions = {}
+        for name, value in zip(msg.name, msg.position):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number == number and abs(number) != float("inf"):
+                positions[name] = number
+        with self._lock:
+            self._joint_pos = (self._mono(), positions)
         if not self._due("joints", self._rates["joints"]):
             return
         if not self._unknown_joint_warned:
@@ -249,14 +266,6 @@ class Hub:
                 print(f"[panther] /joint_states names not in the URDF are left out of the "
                       f"skeleton: {safe_text(unknown, 200)}", flush=True)
         self._emit("joints", joint_state_payload(msg, self._known_joints))
-
-    def on_battery(self, msg) -> None:
-        self._run("battery", self._battery, msg)
-
-    def _battery(self, msg) -> None:
-        self._rx("battery")
-        if self._due("battery", self._rates["battery"]):
-            self._emit("battery", battery_payload(msg))
 
     def on_imu(self, msg) -> None:
         self._run("imu", self._imu, msg)
@@ -289,76 +298,247 @@ class Hub:
                     "child_frame_id": meta["child_frame_id"]})
         self._emit("odom", sample)
 
+    # robot_state inputs: stored, then published by the timer (or at once on a diagnostics change)
+
+    def on_battery(self, msg) -> None:
+        self._run("robot_state", self._store, "battery", battery_payload, msg)
+
     def on_gripper_left(self, msg) -> None:
-        self._run("gripper_lift_state", self._store_joint, "left_gripper", msg)
+        self._run("robot_state", self._store, "gripper_left", single_joint, msg)
 
     def on_gripper_right(self, msg) -> None:
-        self._run("gripper_lift_state", self._store_joint, "right_gripper", msg)
+        self._run("robot_state", self._store, "gripper_right", single_joint, msg)
 
     def on_lift(self, msg) -> None:
-        self._run("gripper_lift_state", self._store_joint, "lift", msg)
+        self._run("robot_state", self._store, "lift", single_joint, msg)
 
-    def _store_joint(self, key: str, msg) -> None:
-        self._rx("gripper_lift_state")
+    def _store(self, key: str, shape, msg) -> None:
+        self._rx("robot_state")
+        record = shape(msg)
         with self._lock:
-            self._latest[key] = (self._mono(), single_joint(msg))
+            self._latest[key] = (self._mono(), record)
+
+    def on_controllers(self, states: dict) -> None:
+        self._run("robot_state", self._controller_states, states)
+
+    def _controller_states(self, states: dict) -> None:
+        self._rx("robot_state")
+        with self._lock:
+            self._controllers = (self._mono(), dict(states))
 
     def on_diagnostics(self, msg) -> None:
-        self._run("health", self._diagnostics, msg)
+        self._run("robot_state", self._diagnostics, msg)
 
     def _diagnostics(self, msg) -> None:
-        self._rx("health")
-        self._stats["estop"]["last_rx"] = self._mono()
-        self._stats["estop"]["received"] += 1
+        self._rx("robot_state")
         received_ms = self._now_ms()
         with self._lock:
+            self._diag_seen = self._mono()
             for entry in diagnostic_entries(msg):
                 self._diag[entry["name"]] = {"entry": entry, "received_ms": received_ms}
             signature = tuple(sorted((n, r["entry"]["level"], r["entry"]["message"])
                                      for n, r in self._diag.items()))
             changed = signature != self._diag_signature
             self._diag_signature = signature
-        if changed or self._due("health", self._rates["health"]):
-            self._mark("health", self._rates["health"])
-            self._emit("health", health_payload(self._snapshot_diag(), received_ms,
-                                                int(self._stale["health"] * 1000)))
-        self._publish_estop(force_if_changed=True)
+        if changed:
+            # A level change, above all the emergency stop's, is worth sending now, not at the
+            # next 500 ms slot.
+            self._publish_state(force=True)
 
-    def _snapshot_diag(self) -> dict:
+    def on_robot_description(self, msg) -> None:
+        self._run("joints", self._robot_description, msg)
+
+    def _robot_description(self, msg) -> None:
+        limits = parse_joint_limits(msg.data)
+        if not limits:
+            return
         with self._lock:
-            return dict(self._diag)
+            first = self._live_limits is None
+            self._live_limits = limits
+        if first:
+            print(f"[panther] live /robot_description: {len(limits)} joint limits "
+                  "(used to check motion targets)", flush=True)
 
-    def _publish_estop(self, force_if_changed: bool = False) -> None:
+    def on_tf_static(self, msg) -> None:
+        self._run("laser_scan", self._tf_static, msg)
+
+    def _tf_static(self, msg) -> None:
+        with self._lock:
+            kept = self._tf.add_message(msg)
+            frames = len(self._tf)
+        if kept and not self._tf_logged:
+            self._tf_logged = True
+            print(f"[panther] /tf_static: {frames} fixed frames known", flush=True)
+
+    # ── robot_state ──────────────────────────────────────────────────────────
+
+    def _aged(self, seen, record: dict, limit_key: str) -> dict:
+        age = None if seen is None else self._mono() - seen
+        return {**record, "age_ms": None if age is None else int(round(age * 1000)),
+                "fresh": age is not None and age <= self._stale[limit_key]}
+
+    def _state_payload(self) -> dict:
         now_ms = self._now_ms()
-        payload = estop_payload(self._snapshot_diag(), now_ms, int(self._stale["estop"] * 1000))
-        signature = (payload.get("found"), payload.get("level"), payload.get("message"),
-                     payload.get("stop_button_status"), payload.get("stale"))
-        changed = signature != self._estop_signature
-        if (force_if_changed and changed) or self._due("estop", self._rates["estop"]):
-            self._mark("estop", self._rates["estop"])
-            self._estop_signature = signature
-            self._emit("estop", payload)
+        with self._lock:
+            latest, controllers = dict(self._latest), self._controllers
+            diag, diag_seen = dict(self._diag), self._diag_seen
+        battery = latest.get("battery")
+        diagnostics = {"available": False, "statuses": []}
+        if diag:
+            diagnostics = {"available": True, **health_payload(
+                diag, now_ms, int(self._stale["diagnostics"] * 1000))}
+            diagnostics["age_ms"] = int(round((self._mono() - diag_seen) * 1000))
+        ready, reasons = self.motion_ready()
+        grippers = {}
+        for side in ("left", "right"):
+            record = latest.get(f"gripper_{side}")
+            grippers[side] = self._aged(record[0], record[1], "grippers") if record else None
+        lift = latest.get("lift")
+        return {
+            "stamp_ms": now_ms,
+            "ready_for_motion": ready, "not_ready_reasons": reasons,
+            "battery": self._aged(battery[0], battery[1], "battery") if battery else None,
+            "diagnostics": diagnostics,
+            "estop": estop_payload(diag, now_ms, int(self._stale["estop"] * 1000)),
+            "grippers": grippers,
+            "lift": self._aged(lift[0], lift[1], "lift") if lift else None,
+            "controllers": (self._aged(controllers[0], {"states": dict(sorted(controllers[1].items()))},
+                                       "controllers") if controllers else None),
+        }
+
+    def _publish_state(self, force: bool = False) -> None:
+        if force:
+            self._mark("robot_state", self._rates["robot_state"])
+        elif not self._due("robot_state", self._rates["robot_state"]):
+            return
+        self._emit("robot_state", self._state_payload())
+
+    # ── the facts the motion gate needs ──────────────────────────────────────
+
+    def motion_ready(self) -> tuple:
+        """`(ready, reasons)`: fresh joints and a fresh, normal emergency-stop diagnostic.
+
+        The emergency-stop test uses only the diagnostic's standard `level` (0 is OK) and its
+        age. The vendor's text is never interpreted: only "normal" has ever been seen, so no
+        other string is known to mean anything. The other diagnostics are not part of the test:
+        a robot can report an unrelated error (an absent camera, say) and still be safe to move.
+        """
+        reasons = []
+        now = self._mono()
+        with self._lock:
+            joints = self._joint_pos
+            diag = dict(self._diag)
+        if joints is None or now - joints[0] > self._stale["joints"]:
+            reasons.append("no fresh /joint_states")
+        estop = estop_payload(diag, self._now_ms(), int(self._stale["estop"] * 1000))
+        if not estop["found"]:
+            reasons.append("no emergency-stop diagnostic has been received")
+        elif estop["stale"]:
+            reasons.append("the emergency-stop diagnostic is stale")
+        elif estop["level"] != 0:
+            reasons.append(f"emergency-stop diagnostic level is {estop['level']} ({estop['level_name']}): "
+                           f"{safe_text(estop['message'], 80)}")
+        return not reasons, reasons
+
+    def joint_positions(self, max_age_s: float | None = None):
+        """`{joint: position}` if `/joint_states` is fresh, else None."""
+        limit = self._stale["joints"] if max_age_s is None else max_age_s
+        with self._lock:
+            joints = self._joint_pos
+        if joints is None or self._mono() - joints[0] > limit:
+            return None
+        return dict(joints[1])
+
+    def lift_position(self):
+        with self._lock:
+            lift = self._latest.get("lift")
+        if lift is None or self._mono() - lift[0] > self._stale["lift"]:
+            return None
+        return lift[1]["position"]
+
+    def joint_limits(self) -> tuple:
+        """`(limits, source)`: the robot's live `/robot_description` if it has been received,
+        otherwise the bundled copy of the same vendor URDF."""
+        with self._lock:
+            if self._live_limits:
+                return dict(self._live_limits), "live /robot_description"
+            if self._bundled_limits is None:
+                self._bundled_limits = parse_joint_limits(self.urdf())
+            return dict(self._bundled_limits), "bundled URDF"
+
+    # ── laser ────────────────────────────────────────────────────────────────
 
     def on_laser(self, side: str, msg) -> None:
-        card = f"laser_scan_{side}"
-        self._run(card, self._laser, card, msg)
+        self._run("laser_scan", self._laser, side, msg)
 
-    def _laser(self, card: str, msg) -> None:
-        self._rx(card)
+    def _laser(self, side: str, msg) -> None:
+        self._rx("laser_scan")
+        with self._lock:
+            self._scans[side] = (self._mono(), msg)
         scan = None
-        if self._due(card, self._rates["laser_scan"]):
-            scan = laser_payload(msg, self._laser_points)
-            with self._lock:
-                self._scans[card] = scan
-            self._emit(card, scan)
-        if self.is_active(card) and self._due(card + "_view", self._rates["laser_view"]):
-            scan = scan or self._scans.get(card) or laser_payload(msg, self._laser_points)
+        if self._due("laser_scan", self._rates["laser_scan"]):
+            scan = self._merged_scan()
+            if scan is not None:
+                self._emit("laser_scan", scan)
+        if self.is_active("laser_scan") and self._due("laser_scan_view", self._rates["laser_view"]):
+            scan = scan or self._last_scan or self._merged_scan()
+            if scan is None:
+                return
             jpeg = laser_topdown_jpeg(scan, max_range_m=self._view_range)
             if jpeg is None:
-                self._stats[card]["last_error"] = "top-down view unavailable: OpenCV is not installed"
+                self._stats["laser_scan"]["last_error"] = "top-down view unavailable: OpenCV is not installed"
                 return
-            self._emit_image(card, "views", self.views[card]["topic"], "jpeg", jpeg,
+            self._emit_image("laser_scan", "views", self.views["laser_scan"]["topic"], "jpeg", jpeg,
                              scan.get("frame_id", ""))
+
+    def _merged_scan(self):
+        """Front and rear lidars as one scan round `base_link`; None if neither is fresh.
+
+        A side is left out, with the reason in `sources`, if it is stale or if no fixed
+        transform from its frame to `base_link` is known. If *no* side has a transform yet, the
+        first fresh one is shown in its own frame rather than nothing, and `transformed` says so.
+        """
+        now = self._mono()
+        with self._lock:
+            scans = dict(self._scans)
+        sources, usable = {}, []
+        for side in ("front", "rear"):
+            record = scans.get(side)
+            if record is None:
+                sources[side] = {"used": False, "reason": "no data received"}
+                continue
+            seen, msg = record
+            frame = str(getattr(getattr(msg, "header", None), "frame_id", ""))
+            entry = {"frame_id": frame, "age_ms": int(round((now - seen) * 1000))}
+            sources[side] = entry
+            if now - seen > self._stale["laser_scan"]:
+                entry.update(used=False, reason="stale")
+                continue
+            with self._lock:
+                transform = self._tf.lookup(frame, self._base_frame)
+            usable.append((side, msg, frame, transform))
+        if not usable:
+            return None
+        placed = [u for u in usable if u[3] is not None]
+        if placed:
+            parts, target, transformed = [(u[1], u[3]) for u in placed], self._base_frame, True
+            for side, _, frame, transform in usable:
+                if transform is None:
+                    sources[side].update(used=False, reason=f"no fixed transform from {frame} to {self._base_frame}")
+        else:
+            side, msg, frame, _ = usable[0]
+            parts, target, transformed = [(msg, None)], frame, False
+            sources[side]["note"] = f"no /tf_static transform to {self._base_frame} yet; drawn in its own frame"
+        used = {u[0] for u in (placed or usable[:1])}
+        for side in used:
+            sources[side]["used"] = True
+        scan = merge_scans(parts, target, self._laser_points)
+        scan.update(sources=sources, transformed=transformed, stamp_ms=self._now_ms())
+        with self._lock:
+            self._last_scan = scan
+        return scan
+
+    # ── images ───────────────────────────────────────────────────────────────
 
     def on_image(self, card: str, msg) -> None:
         self._run(card, self._image, card, msg)
@@ -377,13 +557,19 @@ class Hub:
                 data, size, source = encode_depth_zlib(msg, DEPTH_OUTPUT_SIZE)
                 image_format = DEPTH_FORMAT
         except UnsupportedImage as exc:
-            # Say so once in the log, and always in `info`: a frame silently dropped here
-            # looks exactly like a camera that is not running.
+            # A frame silently dropped here looks exactly like a camera that is not running, so
+            # it is counted and always visible in `info`. In the log it is a transition plus a
+            # sample at most every 30 s: a stream that is wrong on every frame would otherwise
+            # write a line per frame.
             stat = self._stats[card]
-            if stat["last_error"] != str(exc):
-                print(f"[panther] {card}: {safe_text(exc, 200)}", flush=True)
             stat["errors"] += 1
+            changed = stat["last_error"] != str(exc)
             stat["last_error"] = str(exc)
+            now = self._mono()
+            if changed or now - self._image_log.get(card, -1e9) >= 30.0:
+                self._image_log[card] = now
+                print(f"[panther] {card}: {safe_text(exc, 200)} ({stat['errors']} frames dropped so far)",
+                      flush=True)
             return
         self._image_info[card] = {"width": size[0], "height": size[1], "encoding": encoding,
                                   "source_width": source[0], "source_height": source[1]}
@@ -392,24 +578,8 @@ class Hub:
     # ── timer ────────────────────────────────────────────────────────────────
 
     def tick(self) -> None:
-        self._run("gripper_lift_state", self._tick_gripper_lift)
-        self._run("estop", self._publish_estop)
+        self._run("robot_state", self._publish_state)
         self._link_watch()
-
-    def _tick_gripper_lift(self) -> None:
-        with self._lock:
-            latest = dict(self._latest)
-        if not latest or not self._due("gripper_lift_state", self._rates["gripper_lift_state"]):
-            return
-        now = self._mono()
-        payload = {"stamp_ms": self._now_ms()}
-        for key in ("left_gripper", "right_gripper", "lift"):
-            if key in latest:
-                seen, record = latest[key]
-                payload[key] = {**record, "age_ms": int(round((now - seen) * 1000))}
-            else:
-                payload[key] = None
-        self._emit("gripper_lift_state", payload)
 
     def _link_watch(self) -> None:
         """If the robot has never produced anything, say so loudly: that is the signature of
@@ -428,8 +598,7 @@ class Hub:
     # ── introspection ────────────────────────────────────────────────────────
 
     def robot_link(self) -> dict:
-        received = [s["last_rx"] for c, s in self._stats.items()
-                    if c not in ("estop",) and s["last_rx"] is not None]
+        received = [s["last_rx"] for s in self._stats.values() if s["last_rx"] is not None]
         if not received:
             return {"state": "never_received", "uptime_s": round(self._mono() - self._started, 1),
                     "message": "尚未从机器人 DDS 收到任何数据：检查容器网络模式和 CYCLONEDDS_URI"}
@@ -437,20 +606,15 @@ class Hub:
         return {"state": "receiving" if age < 3.0 else "silent", "last_data_age_s": round(age, 2)}
 
     def _stale_after(self, card: str) -> float:
-        if card in LASER_CARDS:
-            return self._stale["laser_scan"]
-        if card in CAMERA_CARDS:
-            return self._stale["camera"]
-        return self._stale[card]
+        return self._stale["camera"] if card in CAMERA_CARDS else self._stale[card]
 
     def _source_of(self, card: str) -> str:
-        keys = {"joints": "joints", "battery": "battery", "imu": "imu", "odom": "odom",
-                "health": "diagnostics", "estop": "diagnostics", "laser_scan_front": "laser_front",
-                "laser_scan_rear": "laser_rear", "camera_color": "camera_color",
-                "camera_depth": "camera_depth"}
-        if card == "gripper_lift_state":
-            return ", ".join(str(self.sources.get(k, "?")) for k in ("gripper_left", "gripper_right", "lift"))
-        return str(self.sources.get(keys.get(card, ""), "?"))
+        if card == "robot_state":
+            return ", ".join(str(self.sources.get(k, "?")) for k in
+                             ("battery", "diagnostics", "gripper_left", "gripper_right", "lift"))
+        if card == "laser_scan":
+            return ", ".join(str(self.sources.get(k, "?")) for k in ("laser_front", "laser_rear"))
+        return str(self.sources.get(card, "?"))
 
     def stream(self, card: str) -> dict:
         stat = self._stats[card]
@@ -479,7 +643,7 @@ class Hub:
                                      "没有新数据，下面的内容已过期")
         if camera_off:
             result["note"] = "相机卡片未启动，不转换图像（节省 CPU）；启动后才会发布"
-        elif card in LASER_CARDS and not self.is_active(card):
+        elif card == "laser_scan" and not self.is_active(card):
             result["note"] = "俯视图在卡片启动后才发布；距离 JSON 始终发布"
         if card == "odom":
             result["odom_interface"] = build_interface(
@@ -489,11 +653,15 @@ class Hub:
             result["camera_info"] = [self.camera_info(card)]
             if card in self._image_info:
                 result["image"] = self._image_info[card]
-        if card in LASER_CARDS:
-            scan = self._scans.get(card)
+        if card == "laser_scan":
+            scan = self._last_scan
             if scan:
                 result["scan"] = {k: scan[k] for k in ("frame_id", "beams", "bins", "valid_ratio",
-                                                       "nearest_m", "range_min", "range_max")}
+                                                       "nearest_m", "range_min", "range_max",
+                                                       "transformed", "sources")}
+        if card == "robot_state":
+            ready, reasons = self.motion_ready()
+            result["ready_for_motion"], result["not_ready_reasons"] = ready, reasons
         return result
 
     def topic_out(self, card: str) -> list:
@@ -523,8 +691,158 @@ class Hub:
         return URDF_PATH.read_text(encoding="utf-8")
 
 
+class RosMotionIO:
+    """The ROS side of `panther_motion.Motion`: publishers, the controller-manager clients and the
+    two trajectory action clients, all on the robot-domain node. Created only if a motion card is
+    enabled, so a sensor-only configuration adds nothing but subscriptions to the robot's graph."""
+
+    HEAD_TOPIC = "/head_forward_position_controller/commands"
+    LIFT_TOPIC = "/lifting_controller/commands"
+    GRIPPER_TOPIC = "/{side}_gripper/gripper_command"
+    ARM_ACTION = "/{side}_arm_joint_trajectory_position_controller/follow_joint_trajectory"
+
+    def __init__(self, node, config: dict, reliable_qos):
+        from control_msgs.action import FollowJointTrajectory
+        from controller_manager_msgs.srv import ListControllers, SwitchController
+        from geometry_msgs.msg import Twist
+        from rclpy.action import ActionClient
+        from sensor_msgs.msg import JointState
+        from std_msgs.msg import Float64MultiArray
+
+        self._node = node
+        self._results: dict = {}
+        drive_topic = ((config.get("plugins") or {}).get("base_drive") or {}).get("topic", "/cmd_vel_teleop")
+        self._twist = node.create_publisher(Twist, drive_topic, reliable_qos)
+        self._head = node.create_publisher(Float64MultiArray, self.HEAD_TOPIC, reliable_qos)
+        self._lift = node.create_publisher(JointState, self.LIFT_TOPIC, reliable_qos)
+        self._gripper_pub = None
+        try:
+            from unix_msgs.msg import GripperCommand
+            self._gripper_pub = {side: node.create_publisher(
+                GripperCommand, self.GRIPPER_TOPIC.format(side=side), reliable_qos)
+                for side in ("left", "right")}
+        except ImportError:
+            print("[panther] unix_msgs is not installed: the gripper card cannot send commands", flush=True)
+        self._list = node.create_client(ListControllers, "/controller_manager/list_controllers")
+        self._switch = node.create_client(SwitchController, "/controller_manager/switch_controller")
+        self._arm = {side: ActionClient(node, FollowJointTrajectory, self.ARM_ACTION.format(side=side))
+                     for side in ("left", "right")}
+        self._poll_future = None
+
+    @staticmethod
+    def _wait(future, timeout_s: float):
+        done = threading.Event()
+        future.add_done_callback(lambda _: done.set())
+        if not done.wait(timeout_s):
+            raise TimeoutError(f"ROS operation timed out after {timeout_s:g}s")
+        if future.exception() is not None:
+            raise future.exception()
+        return future.result()
+
+    # reads
+
+    def list_controllers(self) -> dict:
+        from controller_manager_msgs.srv import ListControllers
+        if not self._list.wait_for_service(timeout_sec=2.0):
+            raise RuntimeError("/controller_manager/list_controllers is unavailable")
+        result = self._wait(self._list.call_async(ListControllers.Request()), 3.0)
+        return {entry.name: entry.state for entry in result.controller}
+
+    def poll_controllers(self, deliver) -> None:
+        """Non-blocking 1 Hz poll for robot_state; `deliver(states)` runs on the executor."""
+        from controller_manager_msgs.srv import ListControllers
+        if self._poll_future is not None or not self._list.service_is_ready():
+            return
+        future = self._list.call_async(ListControllers.Request())
+        self._poll_future = future
+
+        def done(finished):
+            self._poll_future = None
+            try:
+                deliver({entry.name: entry.state for entry in finished.result().controller})
+            except Exception as exc:  # noqa: BLE001
+                print(f"[panther] controller poll failed: {type(exc).__name__}: {exc}", flush=True)
+        future.add_done_callback(done)
+
+    # commands
+
+    def switch_controllers(self, activate: list, deactivate: list) -> None:
+        from controller_manager_msgs.srv import SwitchController
+        if not self._switch.wait_for_service(timeout_sec=2.0):
+            raise RuntimeError("/controller_manager/switch_controller is unavailable")
+        request = SwitchController.Request()
+        populate_switch_request(request, activate, deactivate)
+        if not self._wait(self._switch.call_async(request), 7.0).ok:
+            raise RuntimeError("the controller manager rejected the controller switch")
+
+    def publish_twist(self, vx: float, vy: float, wz: float) -> None:
+        from geometry_msgs.msg import Twist
+        message = Twist()
+        message.linear.x, message.linear.y, message.angular.z = vx, vy, wz
+        self._twist.publish(message)
+
+    def publish_head(self, values: list) -> None:
+        from std_msgs.msg import Float64MultiArray
+        message = Float64MultiArray()
+        message.data = [float(v) for v in values]
+        self._head.publish(message)
+
+    def publish_lift(self, position: float) -> None:
+        from sensor_msgs.msg import JointState
+        message = JointState()
+        message.name, message.position = [""], [float(position)]
+        self._lift.publish(message)
+
+    def publish_gripper(self, side: str, mode: str, position: float) -> None:
+        from sensor_msgs.msg import JointState
+        from unix_msgs.msg import GripperCommand
+        if self._gripper_pub is None:
+            raise RuntimeError("unix_msgs is not installed in this image")
+        command = JointState()
+        command.name, command.position = [""], [float(position)]
+        message = GripperCommand()
+        message.mode, message.command = mode, command
+        self._gripper_pub[side].publish(message)
+
+    def send_arm_goal(self, side: str, names: list, positions: list, duration_s: float):
+        from builtin_interfaces.msg import Duration
+        from control_msgs.action import FollowJointTrajectory
+        from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+        client = self._arm[side]
+        if not client.wait_for_server(timeout_sec=3.0):
+            raise RuntimeError(f"the {side} FollowJointTrajectory action server is unavailable")
+        point = JointTrajectoryPoint()
+        point.positions = [float(p) for p in positions]
+        point.time_from_start = Duration(sec=int(duration_s), nanosec=int((duration_s % 1.0) * 1e9))
+        trajectory = JointTrajectory()
+        trajectory.joint_names, trajectory.points = list(names), [point]
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = trajectory
+        handle = self._wait(client.send_goal_async(goal), 5.0)
+        if not handle.accepted:
+            raise RuntimeError(f"the {side} trajectory goal was rejected")
+        return handle
+
+    def poll_arm_result(self, handle, timeout_s: float):
+        future = self._results.get(id(handle))
+        if future is None:
+            future = self._results[id(handle)] = handle.get_result_async()
+        done = threading.Event()
+        future.add_done_callback(lambda _: done.set())
+        if not done.wait(timeout_s):
+            return None
+        self._results.pop(id(handle), None)
+        wrapped = future.result()
+        return {"status": int(wrapped.status), "error_code": int(wrapped.result.error_code),
+                "error_string": str(wrapped.result.error_string)}
+
+    def cancel_arm_goal(self, handle) -> None:
+        self._results.pop(id(handle), None)
+        handle.cancel_goal_async()
+
+
 class PantherNodes:
-    """The rclpy side: subscriptions on the robot domain only. Nothing is published to it."""
+    """The rclpy side: subscriptions on the robot domain, and `RosMotionIO` if motion is enabled."""
 
     def __init__(self, config: dict, ros2, hub: Hub):
         from diagnostic_msgs.msg import DiagnosticArray
@@ -533,10 +851,12 @@ class PantherNodes:
         from rclpy.node import Node
         from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
         from sensor_msgs.msg import BatteryState, Image, Imu, JointState, LaserScan
+        from std_msgs.msg import String
+        from tf2_msgs.msg import TFMessage
 
         self._ros2 = ros2
         # No rosout publisher and no parameter services: the driver adds nothing to the
-        # robot's graph beyond its subscriptions.
+        # robot's graph beyond what it is configured to use.
         self.node = Node("panther_driver", context=ros2.ctx_robot, enable_rosout=False,
                          start_parameter_services=False)
         ros2.executor_robot.add_node(self.node)
@@ -546,6 +866,12 @@ class PantherNodes:
             return QoSProfile(depth=depth, history=HistoryPolicy.KEEP_LAST,
                               reliability=ReliabilityPolicy.BEST_EFFORT,
                               durability=DurabilityPolicy.VOLATILE)
+
+        def latched() -> QoSProfile:
+            # /tf_static and /robot_description are published once and latched.
+            return QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
+                              reliability=ReliabilityPolicy.RELIABLE,
+                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
         topics = hub.sources
         groups = {name: MutuallyExclusiveCallbackGroup() for name in
@@ -567,9 +893,23 @@ class PantherNodes:
                   callback_group=groups["color"])
         subscribe(Image, topics["camera_depth"], lambda m: hub.on_image("camera_depth", m), qos(1),
                   callback_group=groups["depth"])
+        subscribe(TFMessage, topics["tf_static"], hub.on_tf_static, latched())
+        subscribe(String, topics["robot_description"], hub.on_robot_description, latched())
         self._timer = self.node.create_timer(0.1, hub.tick, callback_group=groups["timer"])
-        print("[panther] subscribed (read-only) to: " +
-              ", ".join(sorted(str(t) for t in topics.values())), flush=True)
+
+        self.motion_io = None
+        plugins = config.get("plugins") or {}
+        if any((plugins.get(card) or {}).get("enabled", False) for card in MOTION_CARDS):
+            def reliable() -> QoSProfile:
+                return QoSProfile(depth=10, history=HistoryPolicy.KEEP_LAST,
+                                  reliability=ReliabilityPolicy.RELIABLE)
+            self.motion_io = RosMotionIO(self.node, config, reliable())
+            self._poll = self.node.create_timer(1.0, lambda: self.motion_io.poll_controllers(hub.on_controllers),
+                                                callback_group=groups["timer"])
+        print("[panther] subscribed to: " + ", ".join(sorted(str(t) for t in topics.values())) +
+              ("; motion cards enabled (commands are still refused unless "
+               "safety.commissioning_motion_enabled is true)" if self.motion_io else
+               "; no motion cards enabled"), flush=True)
 
     def close(self) -> None:
         try:
@@ -582,15 +922,24 @@ class PantherNodes:
 class PantherPlugin:
     PREFIX = "panther"
 
-    def __init__(self, hub: Hub, nodes=None, sink=None, enabled=None):
+    def __init__(self, hub: Hub, nodes=None, sink=None, enabled=None, motion=None,
+                 camera=None, config=None):
         self._hub = hub
         self._nodes = nodes
         self._sink = sink
+        self._motion = motion
+        self._camera = camera
+        self._config = config or {}
         self._enabled = tuple(c for c in CARD_ORDER if enabled is None or enabled.get(c, True))
 
     def get_tools(self) -> list:
         tools = []
+        motion_defs = {t["name"]: t for t in motion_tools(self._config)} if self._motion else {}
         for card in self._enabled:
+            if card in MOTION_CARDS:
+                if card in motion_defs:
+                    tools.append(motion_defs[card])
+                continue
             if card == "model":
                 tools.append(tool("model", "resource", DESCRIPTIONS[card]))
                 continue
@@ -604,10 +953,19 @@ class PantherPlugin:
         pass  # subscriptions are created with the plugin; cards are started individually
 
     def stop(self) -> None:
+        # Stop anything moving first, then release the hardware, then the ROS node and bridge.
+        if self._motion is not None:
+            self._motion.stop_all()
+        if self._camera is not None:
+            self._camera.close()
         if self._nodes is not None:
             self._nodes.close()
         if self._sink is not None:
             self._sink.close()
+
+    @staticmethod
+    def _kind(card: str) -> str:
+        return "color" if card == "camera_color" else "depth"
 
     def dispatch(self, action, args):
         card = args.get("_tool_name", "")
@@ -615,14 +973,32 @@ class PantherPlugin:
             return {"urdf": self._hub.urdf(), "robot": "mh3"}
         if card not in self._enabled or card == "model":
             return {"state": "error", "message": f"unknown card {card!r}"}
+        if card in MOTION_CARDS:
+            if self._motion is None:
+                return {"state": "error", "message": "motion is not available in this process"}
+            if action == "stop":
+                try:
+                    return self._motion.stop(card)
+                except Exception as exc:  # noqa: BLE001
+                    return {"state": "error", "message": f"stop failed: {type(exc).__name__}: {exc}"}
+            return self._motion.dispatch(card, action, {k: v for k, v in args.items() if k != "_tool_name"})
         if action == "start":
             self._hub.activate(card)
-            return self._hub.card_info(card)
+            camera = self._camera.start(self._kind(card)) if card in CAMERA_CARDS and self._camera else None
+            info = self._hub.card_info(card)
+            if camera is not None:
+                info["camera_runtime"] = camera
+            return info
         if action == "stop":
             self._hub.deactivate(card)
+            if card in CAMERA_CARDS and self._camera:
+                self._camera.stop(self._kind(card))
             return {"state": "idle", "topic_out": self._hub.topic_out(card)}
         if action == "info" or action == card:
-            return self._hub.card_info(card)
+            info = self._hub.card_info(card)
+            if card in CAMERA_CARDS and self._camera:
+                info["camera_runtime"] = self._camera.info(self._kind(card))
+            return info
         return {"state": "error", "message": f"unknown action {action!r}; "
                                               "sensor cards take start, stop and info"}
 
@@ -634,6 +1010,13 @@ def build_plugins(config, namespace=None, ros2=None):
     sink = BridgeSink(bridge)
     hub = Hub(config, namespace or "panther", sink)
     nodes = PantherNodes(config, ros2, hub)
+    motion = Motion(config, nodes.motion_io, hub) if nodes.motion_io is not None else None
+    topics = hub.sources
+    camera = HostCamera(
+        config.get("camera", {}).get("host", {}),
+        {"color": topics["camera_color"], "depth": topics["camera_depth"]},
+        publisher_count=nodes.node.count_publishers,
+        frame_age=lambda kind: hub.stream("camera_" + kind)["last_data_age_s"])
     enabled = {name: bool(spec.get("enabled", True))
                for name, spec in (config.get("plugins") or {}).items()}
-    return [PantherPlugin(hub, nodes, sink, enabled)]
+    return [PantherPlugin(hub, nodes, sink, enabled, motion=motion, camera=camera, config=config)]
