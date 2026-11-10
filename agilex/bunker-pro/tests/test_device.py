@@ -1,4 +1,3 @@
-import json
 import sys
 import threading
 import types
@@ -15,8 +14,13 @@ class FakeCAN:
     def __init__(self):
         self.targets = []
         self.stops = 0
+        self.target_validation = None
+
+    def request_control_mode(self, mode):
+        return {"changed": False, "control_mode": mode}
 
     def validate_target(self, linear, angular):
+        self.target_validation = (linear, angular)
         return float(linear), float(angular)
 
     def set_target(self, linear, angular, lease_s):
@@ -37,9 +41,16 @@ def _bare_device():
     device._active_move_id = None
     device._active_move_stop = None
     device._direct_until = 0.0
-    device._rejection_log_lock = threading.Lock()
-    device._rejection_counts = {}
-    device._last_rejection_log_at = 0.0
+    device.bridge = types.SimpleNamespace(
+        _state_topic="/bunker_pro/state/motor_state",
+        _battery_topic="/bunker_pro/state/battery",
+        _remote_controller_topic="/bunker_pro/state/remote_controller",
+        _odom_topic="/bunker_pro/state/odom",
+        _odom_field_topics={
+            name: f"/bunker_pro/state/odom/{name}"
+            for name in ("vx", "steering_angle_deg", "left_wheel_mm", "right_wheel_mm")},
+    )
+    device.config = {}
     device.can = FakeCAN()
     return device
 
@@ -48,7 +59,7 @@ def _bare_device():
 def test_invalid_move_duration_is_rejected_before_motion_state_changes(value):
     device = _bare_device()
     with pytest.raises(ValueError):
-        device.dispatch("move", {"duration_s": value, "vx": 0.1, "wz": 0})
+        device.dispatch("move", {"duration_s": value, "vx": 0.1, "vyaw": 0})
     assert device.can.stops == 0
     assert device._active_move_id is None
     assert device._direct_until == 0.0
@@ -79,53 +90,82 @@ def test_move_worker_sets_target_and_reports_completion():
     notify.assert_called_once_with("action-2", "completed", {"state": "stopped"})
 
 
-def test_stream_rejection_logs_are_throttled(capsys):
-    device = _bare_device()
-    device._motion_enabled = False
-    message = types.SimpleNamespace(data=json.dumps({"values": [0] * 6}))
-    for _ in range(20):
-        device._on_command(message)
-    assert capsys.readouterr().out.count("rejected streamed control messages") == 1
-    assert device._rejection_counts == {"motion_disabled": 19}
-
-
-def test_stream_acceptance_is_submitted_and_applied():
-    device = _bare_device()
-    calls = []
-    device._motion_enabled = True
-    device._direct_until = 0.0
-    device._sink = types.SimpleNamespace(
-        submit=lambda payload: (calls.append(payload) or types.SimpleNamespace(
-            applied=True, verdict=types.SimpleNamespace(value="accepted"))),
-        tick=lambda: calls.append("tick"),
-    )
-    payload = {"values": [0.1, 0, 0, 0, 0, 0.2]}
-    device._on_command(types.SimpleNamespace(data=json.dumps(payload)))
-    assert calls == [payload, "tick"]
-
-
 def test_move_advertises_async_completion_contract():
     device = _bare_device()
-    device.bridge = types.SimpleNamespace(_state_topic="/bunker/state/base",
-                                          _odom_topic="/bunker/state/odom")
-    device.config = {}
     schema = next(item["inputSchema"] for item in device.get_tools()
-                  if item["name"] == "bunker_base")
+                  if item["name"] == "base_drive")
     assert schema["x-completion"] == {"actions": ["move"], "timeout": 20}
+    assert schema["properties"]["action"]["enum"] == ["move"]
+    assert schema["properties"]["vyaw"]["description"].endswith("degrees/s")
+    assert all("topic_in" not in card for card in device.get_tools())
+
+
+def test_base_drive_uses_degrees_per_second_and_requests_can_mode_internally():
+    device = _bare_device()
+
+    class DeferredThread:
+        def __init__(self, target, args, **_kwargs):
+            self.target, self.args = target, args
+        def start(self):
+            pass
+
+    with patch("device.threading.Thread", DeferredThread):
+        result = device.dispatch("move", {
+            "_tool_name": "base_drive", "vx": 0.1, "vyaw": 30, "duration_s": 1})
+    assert device.can.target_validation == pytest.approx((0.1, 0.5235987756))
+    assert result["state"] == "running"
+    assert result["vyaw_deg_s"] == 30
+
+
+def test_sensor_cards_use_familiar_names_and_flat_odometry_ports():
+    cards = {card["name"]: card for card in _bare_device().get_tools()}
+    assert set(cards) == {"motor_state", "battery", "remote_controller", "odom", "base_drive"}
+    odom_ports = cards["odom"]["topic_out"]
+    assert len(odom_ports) == 5
+    assert [port["topic"].rsplit("/", 1)[-1] for port in odom_ports[1:]] == [
+        "vx", "steering_angle_deg", "left_wheel_mm", "right_wheel_mm"]
+
+
+def test_motor_state_fields_are_flat_and_freshness_aware():
+    snapshot = {
+        "connected": True,
+        "system_state": {"vehicle_state": 0, "control_mode": 1, "error_flags": 0x85},
+        "system_state_age_ms": 20,
+        "motion_state": {"linear_velocity_m_s": 0.2, "steering_angle_deg": 12.5},
+        "motion_state_age_ms": 25,
+        "motor_state": {2: {"speed_rpm": 100, "motor_temperature_c": 40}, 3: {}},
+        "motor_state_age_ms": {2: 10, 3: None},
+    }
+    state = BunkerProDevice._motor_state(snapshot)
+    assert state["vehicle_state"] == "normal"
+    assert state["control_mode"] == "can"
+    assert state["remote_lost"] and state["emergency_stop"]
+    assert state["motor_2_speed_rpm"] == 100
+    assert state["motor_3_speed_rpm"] is None
+
+
+def test_battery_and_remote_fields_are_flat():
+    battery = BunkerProDevice._battery_state({
+        "battery_state": {"soc_percent": 95, "voltage_v": 48.2},
+        "battery_state_age_ms": 400,
+        "battery_alarm": {"alarm_status_1": 4, "alarm_status_2": 1},
+        "battery_alarm_age_ms": 500,
+    })
+    assert battery["soc_percent"] == 95
+    assert battery["alarm_undervoltage"] is True
+    assert battery["alarm_charge_overcurrent"] is True
+    assert BunkerProDevice._remote_controller_state({
+        "remote_controller": {"swa": 2, "left_stick_x": -15},
+        "remote_controller_age_ms": 20}) == {
+            "swa": 2, "left_stick_x": -15, "feedback_age_ms": 20}
 
 
 def test_actuator_start_and_stop_follow_lifecycle_contract():
     device = _bare_device()
     calls = []
-    device.bridge = types.SimpleNamespace(
-        bind_control_topic=lambda topic: calls.append(topic))
-    assert device.dispatch("start", {"_tool_name": "bunker_base",
-                                      "input_topic": "/agent/control"}) == {
-        "state": "ready", "input_topic": "/agent/control"}
-    assert calls == ["/agent/control"]
-    assert device.dispatch("stop", {"_tool_name": "bunker_base"}) == {
+    assert device.dispatch("start", {"_tool_name": "base_drive"}) == {"state": "ready"}
+    assert device.dispatch("stop", {"_tool_name": "base_drive"}) == {
         "state": "idle"}
-    assert calls[-1] is None
     assert device.dispatch("stop", {}) == {"state": "idle"}
 
 
@@ -166,11 +206,18 @@ def test_dds_bridge_binds_forwards_and_closes_entities():
         ros = types.SimpleNamespace(ctx_robot=object(), ctx_core=object(),
                                     executor_robot=Executor(), executor_core=Executor())
         bridge = BunkerDDSBridge(ros, "bunker")
-        bridge.bind_control_topic("/agent/control")
-        bridge._on_command(types.SimpleNamespace(data='{"values":[]}'))
-        bridge._on_state(types.SimpleNamespace(data='{"ok":true}'))
+        bridge.publish_battery({"voltage_v": 51.0})
+        bridge.publish_remote_controller({"swa": 2})
+        bridge.publish_odom({"twist": [0.1, None, None, None, None, None]},
+                            {"vx": 0.1, "steering_angle_deg": 2.0,
+                             "left_wheel_mm": 10, "right_wheel_mm": 11})
+        bridge._robot_state_sub.callback(types.SimpleNamespace(data='{"ok":true}'))
         bridge.close()
-    assert ("/bunker/control/velocity", '{"values":[]}') in events
-    assert ("/bunker/state/base", '{"ok":true}') in events
+    assert ("/bunker/state/battery", '{"voltage_v":51.0}') in events
+    assert ("/bunker/state/remote_controller", '{"swa":2}') in events
+    assert ("/bunker/state/odom", '{"twist":[0.1,null,null,null,null,null]}') in events
+    assert ("/bunker/state/odom/vx", "0.1") in events
+    assert ("/bunker/state/odom/right_wheel_mm", "11") in events
+    assert ("/bunker/state/motor_state", '{"ok":true}') in events
     assert ("destroy_node", "bunker_pro_core_bridge") in events
     assert ("destroy_node", "bunker_pro_robot_bridge") in events

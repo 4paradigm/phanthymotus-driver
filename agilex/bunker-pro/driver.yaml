@@ -10,6 +10,8 @@ description: "AgileX Bunker Pro v2 differential mobile base over USB SocketCAN."
 build_context_extras:
   - ../../common
 cards:
-  - { name: bunker_state, type: sensor }
-  - { name: bunker_odom, type: sensor }
-  - { name: bunker_base, type: actuator }
+  - { name: motor_state, type: sensor }
+  - { name: battery, type: sensor }
+  - { name: remote_controller, type: sensor }
+  - { name: odom, type: sensor }
+  - { name: base_drive, type: actuator }

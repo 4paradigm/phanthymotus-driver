@@ -46,6 +46,14 @@ class BunkerCAN:
         self._motion_state: dict | None = None
         self._motion_state_at = 0.0
         self._wheel_odometry: dict | None = None
+        self._motor_state = {2: {}, 3: {}}
+        self._motor_state_at = {2: 0.0, 3: 0.0}
+        self._battery_state: dict | None = None
+        self._battery_alarm: dict | None = None
+        self._battery_state_at = 0.0
+        self._battery_alarm_at = 0.0
+        self._remote_controller: dict | None = None
+        self._remote_controller_at = 0.0
         self._odom_samples = deque()
         self._target: tuple[float, float] | None = None
         self._target_deadline = 0.0
@@ -102,13 +110,38 @@ class BunkerCAN:
                         self._motion_state_at = now
                         self._odom_samples.append((
                             now,
-                            [value["linear_velocity_m_s"], None, None, None, None,
-                             value["angular_velocity_rad_s"]],
+                            [value["linear_velocity_m_s"], None, None, None, None, None],
                         ))
                 elif frame.arbitration_id == protocol.ODOMETRY_ID:
                     value = protocol.decode_odometry(bytes(frame.data))
                     with self._lock:
                         self._wheel_odometry = value
+                elif frame.arbitration_id in protocol.MOTOR_HIGH_STATE_IDS:
+                    motor = frame.arbitration_id - 0x250
+                    with self._lock:
+                        self._motor_state[motor].update(
+                            protocol.decode_motor_high_state(bytes(frame.data)))
+                        self._motor_state_at[motor] = now
+                elif frame.arbitration_id in protocol.MOTOR_LOW_STATE_IDS:
+                    motor = frame.arbitration_id - 0x260
+                    with self._lock:
+                        self._motor_state[motor].update(
+                            protocol.decode_motor_low_state(bytes(frame.data)))
+                        self._motor_state_at[motor] = now
+                elif frame.arbitration_id == protocol.BATTERY_STATE_ID:
+                    value = protocol.decode_battery_state(bytes(frame.data))
+                    with self._lock:
+                        self._battery_state = value
+                        self._battery_state_at = now
+                elif frame.arbitration_id == protocol.BATTERY_ALARM_ID:
+                    with self._lock:
+                        self._battery_alarm = protocol.decode_battery_alarms(bytes(frame.data))
+                        self._battery_alarm_at = now
+                elif frame.arbitration_id == protocol.REMOTE_CONTROLLER_ID:
+                    value = protocol.decode_remote_controller(bytes(frame.data))
+                    with self._lock:
+                        self._remote_controller = value
+                        self._remote_controller_at = now
             except Exception as exc:  # transport failure must be visible in info()
                 if not self._stop.is_set():
                     with self._lock:
@@ -173,10 +206,25 @@ class BunkerCAN:
             raise RuntimeError("CAN system-state feedback is missing or stale")
         return state
 
-    def request_control_mode(self, mode: int, timeout_s: float = 2.0) -> dict:
+    def validate_target(self, linear: float, angular: float) -> tuple[float, float]:
+        state = self._fresh_system_state()
+        if state["vehicle_state"] != protocol.VEHICLE_NORMAL:
+            raise RuntimeError("底盘状态异常或急停；拒绝运动指令")
+        if state.get("error_flags", 0) & 0xB5:
+            raise RuntimeError("底盘故障位指示遥控器失联、电机通讯故障或急停；拒绝运动")
+        if state["control_mode"] != protocol.CONTROL_CAN:
+            raise RuntimeError("底盘不在 CAN 控制模式；请先通过物理遥控器切换控制权")
+        linear = self._limit(linear, float(self.config.get("max_linear_m_s", 0.4)), "linear")
+        angular = self._limit(angular, float(self.config.get("max_angular_rad_s", 0.8)), "angular")
+        return linear, angular
+
+    def request_control_mode(self, mode: int = protocol.CONTROL_CAN,
+                             timeout_s: float = 2.0) -> dict:
         state = self._fresh_system_state()
         if state["vehicle_state"] != protocol.VEHICLE_NORMAL:
             raise RuntimeError("底盘状态异常或急停；拒绝切换控制模式")
+        if state.get("error_flags", 0) & 0xB5:
+            raise RuntimeError("底盘故障位指示遥控器失联、电机通讯故障或急停；拒绝切换模式")
         if state["control_mode"] == mode:
             return {"changed": False, "control_mode": mode}
         self.stop_motion()
@@ -194,17 +242,7 @@ class BunkerCAN:
             if state["control_mode"] == mode:
                 return {"changed": True, "control_mode": mode}
             time.sleep(0.02)
-        raise RuntimeError("未收到目标控制模式反馈；遥控器可能仍拥有控制权")
-
-    def validate_target(self, linear: float, angular: float) -> tuple[float, float]:
-        state = self._fresh_system_state()
-        if state["vehicle_state"] != protocol.VEHICLE_NORMAL:
-            raise RuntimeError("底盘状态异常或急停；拒绝运动指令")
-        if state["control_mode"] != protocol.CONTROL_CAN:
-            raise RuntimeError("底盘不在 CAN 控制模式；请显式调用 enable_can")
-        linear = self._limit(linear, float(self.config.get("max_linear_m_s", 0.4)), "linear")
-        angular = self._limit(angular, float(self.config.get("max_angular_rad_s", 0.8)), "angular")
-        return linear, angular
+        raise RuntimeError("未收到 CAN 控制模式反馈；检查遥控器控制权后重试")
 
     def set_target(self, linear: float, angular: float, lease_s: float = 0.35) -> None:
         linear, angular = self.validate_target(linear, angular)
@@ -279,6 +317,16 @@ class BunkerCAN:
                 "motion_state": motion,
                 "motion_state_age_ms": None if motion_age is None else int(motion_age * 1000),
                 "wheel_odometry_raw": dict(self._wheel_odometry) if self._wheel_odometry else None,
+                "motor_state": {motor: dict(value) for motor, value in self._motor_state.items()},
+                "motor_state_age_ms": {
+                    motor: None if stamp == 0 else int((now - stamp) * 1000)
+                    for motor, stamp in self._motor_state_at.items()},
+                "battery_state": dict(self._battery_state) if self._battery_state else None,
+                "battery_alarm": dict(self._battery_alarm) if self._battery_alarm else None,
+                "battery_state_age_ms": None if self._battery_state_at == 0 else int((now - self._battery_state_at) * 1000),
+                "battery_alarm_age_ms": None if self._battery_alarm_at == 0 else int((now - self._battery_alarm_at) * 1000),
+                "remote_controller": dict(self._remote_controller) if self._remote_controller else None,
+                "remote_controller_age_ms": None if self._remote_controller_at == 0 else int((now - self._remote_controller_at) * 1000),
                 "last_error": self._last_error,
                 "last_tx_error": self._last_tx_error,
                 "requested_mode": self._requested_mode,
