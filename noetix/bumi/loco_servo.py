@@ -400,10 +400,37 @@ class LocoServoPlugin:
         self._last_dry_run_target = None
         self._dry_run_log_count = 0
         self._lifecycle_token = 0
+        # Set by main.py wiring (WaistSwayPlugin is built after this card).
+        self._sway = None
 
         if loco_plugin is not None and hasattr(loco_plugin, "attach_servo"):
             # Lets every call-shaped card pause this one before it acts.
             loco_plugin.attach_servo(self)
+
+    def attach_sway(self, sway) -> None:
+        """Let the waist card be told before/after this card drives the chassis."""
+        self._sway = sway
+
+    def is_active(self) -> bool:
+        """Whether this card currently owns the chassis publisher (not paused).
+
+        `waist_sway` asks through `loco.is_chassis_busy()` before it re-engages
+        while `suspend_during_loco` is on: a paused card is not driving the
+        robot, a running one is (even while its current target is zero).
+        """
+        with self._lock:
+            return bool(self._running and not self._paused)
+
+    def _notify_sway(self, label: str, active: bool) -> None:
+        # Called outside this card's lock, so the sway card never waits on a
+        # stream teardown that is waiting on the chassis to stop.
+        sway = self._sway
+        if sway is None:
+            return
+        if active:
+            sway.notify_chassis_active(label)
+        else:
+            sway.notify_chassis_idle(label)
 
     def distance_full_scale(self) -> dict:
         """Normalised command -> m/s for the pure-IMU distance cross-check.
@@ -644,6 +671,10 @@ class LocoServoPlugin:
             self._destroy_node(node)
             return {"state": "idle", "message": "启动已被 stop 取消"}
 
+        # The chassis is about to be driven by this card's stream; a running
+        # waist sway either picks its concurrent leg policy or parks (config).
+        self._notify_sway("loco_servo.start", active=True)
+
         print(f"[loco_servo] streaming from {topic} "
               f"(dry_run={self._dry_run}, "
               f"calibration={self._calibration.source})", flush=True)
@@ -704,6 +735,8 @@ class LocoServoPlugin:
 
         self._destroy_node(node)
         del sink
+        # Chassis free again: a sway parked for this stream may re-engage.
+        self._notify_sway("loco_servo.stop", active=False)
         # Actuator lifecycle: a successfully torn-down stream is idle and may
         # be started again.  ``stopped`` is not a lifecycle state understood by
         # the canvas/framework and leaves the card looking non-restartable.

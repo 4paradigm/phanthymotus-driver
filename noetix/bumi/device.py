@@ -413,10 +413,16 @@ class LocoPlugin:
         # Set by LocoServoPlugin at construction. `loco` is built first, so the
         # link cannot be a constructor argument in this direction.
         self._servo = None
+        # Set by WaistSwayPlugin wiring in main.py, same deferred direction.
+        self._sway = None
 
     def attach_servo(self, servo) -> None:
         """Let the streaming chassis card be paused before we drive it ourselves."""
         self._servo = servo
+
+    def attach_sway(self, sway) -> None:
+        """Let the waist sway card be told before body actions change workmode."""
+        self._sway = sway
 
     def _distance_full_scale(self):
         """Measured normalised-command-to-m/s calibration from the servo card.
@@ -438,6 +444,18 @@ class LocoPlugin:
         thread = self._move_thread
         return bool((thread is not None and thread.is_alive())
                     or self._rotate_state["state"] == "running" or self._body_action)
+
+    def is_chassis_busy(self) -> bool:
+        """Whether this plugin or the streaming card currently drives the chassis.
+
+        `waist_sway` asks before it engages or resumes: with
+        `suspend_during_loco` on, a chassis in flight must not get a low-level
+        joint stream landing on top of it.
+        """
+        if self.is_moving():
+            return True
+        servo = self._servo
+        return bool(servo is not None and getattr(servo, "is_active", lambda: False)())
 
     def publish_velocity(self, x: float, y: float, z: float) -> None:
         """One normalised velocity command, through this plugin's rate limiter.
@@ -466,6 +484,40 @@ class LocoPlugin:
         if self._servo is None:
             return False
         return bool(self._servo.pause_for_explicit_command(reason))
+
+    def _notify_sway_dispatch(self, tool_name: str, action: str) -> bool:
+        """Tell the waist sway card what is about to claim the robot.
+
+        Body tools (posture, presets, teaching) change `workmode` and need the
+        waist itself: the sway card releases and switches itself off, the same
+        "an explicit instruction outranks a background stream" rule the servo
+        preemption follows. Chassis tools keep walking; `loco.move` only marks
+        the chassis active — the sway keeps streaming by default (its own
+        documented experiment) or pauses when the operator configured
+        `suspend_during_loco`. Returns whether a body action actually
+        disabled an active sway, so the caller can say so in its result.
+        """
+        if self._sway is None:
+            return False
+        if tool_name in ("stand_up_lie_prone", "semantic_action", "action_recording"):
+            return bool(self._sway.disable_for_body_action(f"{tool_name}.{action}"))
+        if (tool_name, action) == ("loco", "move"):
+            self._sway.notify_chassis_active(f"{tool_name}.{action}")
+        elif action in ("stop_move", "stop"):
+            self._sway.notify_chassis_idle(f"{tool_name}.{action}")
+        return False
+
+    def prepare_walk_mode(self, requester: str) -> dict:
+        """Reach workmode 2 through the documented mode edges, for a sibling card.
+
+        `waist_sway` calls this after dropping its low-level joint stream, so
+        the next high-level action finds the robot in walking mode instead of
+        whatever mode the low-level takeover left behind. Same machinery as
+        the public actions use (`_prepare_workmode`), including its
+        move/rotate cancellation semantics — a caller releasing the waist
+        mid-rotation wants that rotation stopped, same as a preset action.
+        """
+        return self._prepare_workmode(2, requester)
 
     def _set_servo_velocity_owner(self, owned: bool) -> None:
         """Transfer the shared velocity publisher after/before loco.move."""
@@ -699,6 +751,9 @@ class LocoPlugin:
             # log connecting the two.
             self._preempt_servo("loco.stop")
             self._stop_move()
+            if self._sway is not None:
+                # Chassis idle: a sway parked in waiting/suspended may re-engage.
+                self._sway.notify_chassis_idle("loco.stop")
             return {"state": "idle"}
 
         tool_name = args.pop('_tool_name', '')
@@ -739,12 +794,18 @@ class LocoPlugin:
                 self._rotate_stop_event.set()
         try:
             preempted = self._preempt_servo(f"{tool_name}.{action}")
+            # Same pre-touch rule as the servo preemption: the sway card learns
+            # about the body action before any mode edge runs, so its release
+            # and restore finish before this action's own preparation starts.
+            sway_was_active = self._notify_sway_dispatch(tool_name, action)
             if body_action and not self._wait_for_rotate_idle():
                 return {"state": "error", "command_sent": False,
                         "error": "rotation has not stopped; competing action was not sent"}
             result = handler()
             if preempted and isinstance(result, dict):
                 result["preempted_loco_servo"] = True
+            if sway_was_active and isinstance(result, dict):
+                result["preempted_waist_sway"] = True
             return result
         finally:
             if body_action:
@@ -936,6 +997,8 @@ class LocoPlugin:
                 # Rotation is already reserved, so servo start/resume sees
                 # a busy chassis before this publisher takes ownership.
                 self._preempt_servo(f"loco_relative_move.{action}")
+                if self._sway is not None:
+                    self._sway.notify_chassis_active(f"loco_relative_move.{action}")
                 owns_velocity = True
             result = self._do_rotate_impl(args) if action == "rotate" else self._do_target_impl(args)
             result["action"] = action
@@ -951,6 +1014,8 @@ class LocoPlugin:
         finally:
             if owns_velocity:
                 self._set_servo_velocity_owner(False)
+                if self._sway is not None:
+                    self._sway.notify_chassis_idle(f"loco_relative_move.{action}")
             with self._rotate_lock:
                 claimed = self._active_action_id == action_id
                 if claimed:

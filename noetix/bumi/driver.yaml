@@ -20,6 +20,7 @@ cards:
   - { name: loco,              type: actuator }
   - { name: loco_relative_move,       type: actuator }
   - { name: loco_servo,        type: actuator }
+  - { name: waist_sway,        type: actuator }
   - { name: stand_up_lie_prone, type: actuator }
   - { name: semantic_action,   type: actuator }
   - { name: action_recording,  type: actuator }

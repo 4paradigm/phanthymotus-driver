@@ -36,6 +36,26 @@ plugins:
     min_wz_rads: 0.33           # 归一化边界 0.40 × 0.83
     # 已经在走的时候的偏航死区。
     min_wz_moving_rads: 0.25    # 归一化边界 0.30 × 0.83
+  # 腰部巡视摆动卡：enabled=true 时站立/行走期间腰部 yaw 持续小幅来回转动。
+  # 走 SDK 低层 set_joint + 官方站立角表；semantic_action / action_recording /
+  # stand_up_lie_prone 或保护、摔倒模式会自动把它置回 false 并释放腰部。
+  # 固件对高层行走与低层关节流并存的仲裁未知（详见卡片描述），首次真机
+  # 小幅度、有人看护、App 急停就绪。
+  waist_sway:
+    enabled: true
+    # **默认只计数不驱动电机**（与 loco_servo 同一安全惯例）。真机确认
+    # 场地与看护后在卡片 config 动作里关闭（需 confirm=true）。
+    dry_run: true
+    amplitude_rad: 0.3   # 单侧幅度（弧度），硬上限 1.2，首周期从 0 渐入
+    period_s: 6.0        # 一个完整来回的周期（秒）
+    rate_hz: 500         # 低层指令频率，对齐官方示例 2ms 循环
+    # false（默认）：loco / loco_relative_move / loco_servo 行走期间继续
+    # 发送低层流（并存行为属固件未知实验）；true：行走即暂停、结束自动恢复。
+    suspend_during_loco: false
+    # 并发期非腰关节策略：stand_hold=继续发站立角表（低层生效则机器人保持
+    # 站立、底盘命令可能失效）；echo=随实测位姿近零增益回发（唯一可能真正
+    # 边走边转的档，全局低层模式下腿失撑有摔倒风险，仅看护下实验）。
+    concurrent_legs: stand_hold
   mic:
     enabled: true
   sound_direction:
