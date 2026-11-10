@@ -1,0 +1,88 @@
+mcp_port: 15747
+ros_namespace: "panther"
+name: "UniX AI Panther"
+
+# Robot side: the Panther's own nodes run ROS 2 Humble on CycloneDDS, domain 0, bound to
+# 127.0.0.1 (its ~/config/cyclonedds.xml). This process must be configured identically or it
+# will see the topic list and receive nothing -- so it is set here, in one place, rather than
+# left to whatever the container environment happens to carry. Agent Core (domain 42,
+# FastDDS) is reached only through the child processes in panther_bridge.py, hence null.
+ros:
+  robot_domain_id: 0
+  core_domain_id: null
+  robot_interface: lo
+  cyclonedds_uri: "<CycloneDDS xmlns=\"https://cdds.io/config\"><Domain id=\"any\"><General><Interfaces><NetworkInterface address=\"127.0.0.1\" multicast=\"true\"/></Interfaces><AllowMulticast>spdp</AllowMulticast><DontRoute>true</DontRoute></General><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
+
+core_bridge:
+  domain: 42
+  # The fleet's loopback-only FastDDS profile, mounted by deploy/service.yml.
+  profile: /opt/phanthy-motus/dds-local.xml
+
+# Robot topics, read-only. Names confirmed with `ros2 topic list -t` on a Panther (2026-11-10).
+# /imu and /scan exist but have no publisher on this robot; the broadcaster topics and the
+# per-lidar scans are the live ones.
+topics:
+  joints: /joint_states
+  battery: /battery_state_broadcaster/battery_state
+  imu: /imu_sensor_broadcaster/imu
+  odom: /odom
+  gripper_left: /left_gripper/joint_states
+  gripper_right: /right_gripper/joint_states
+  lift: /lifting_controller/joint_states
+  diagnostics: /diagnostics
+  laser_front: /lidar_front/scan
+  laser_rear: /lidar_rear/scan
+  # The Orbbec driver is not started by the robot's own bring-up; see README.md.
+  camera_color: /camera/color/image_raw
+  camera_depth: /camera/depth/image_raw
+
+# Publish rates to Agent Core. The robot publishes 50-100 Hz; averaging (odom) or
+# nearest-return pooling (lidar) is done before the rate is cut, not instead of it.
+rates_hz:
+  joints: 10
+  battery: 1
+  imu: 10
+  odom: 10
+  gripper_lift_state: 10
+  health: 2
+  estop: 1
+  laser_scan: 5
+  laser_view: 1
+  camera_color: 10
+  camera_depth: 5
+
+# How old a reading may be before a card reports it as stale.
+stale_after_s:
+  joints: 1.0
+  battery: 5.0
+  imu: 1.0
+  odom: 1.0
+  gripper_lift_state: 1.0
+  health: 5.0
+  estop: 3.0
+  laser_scan: 1.5
+  camera: 2.0
+
+camera:
+  jpeg_quality: 80
+  max_width: 640
+
+laser:
+  max_points: 360
+  view_range_m: 6.0
+
+# One switch per card; driver.yaml's card list is kept in step with it by hand and by
+# tests/test_unixai_panther.py.
+plugins:
+  model: {enabled: true}
+  joints: {enabled: true}
+  battery: {enabled: true}
+  imu: {enabled: true}
+  odom: {enabled: true}
+  gripper_lift_state: {enabled: true}
+  health: {enabled: true}
+  estop: {enabled: true}
+  laser_scan_front: {enabled: true}
+  laser_scan_rear: {enabled: true}
+  camera_color: {enabled: true}
+  camera_depth: {enabled: true}

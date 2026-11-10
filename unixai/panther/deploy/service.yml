@@ -1,0 +1,24 @@
+unixai-panther:
+  image: __IMAGE__
+  container_name: embodied-unixai-panther
+  network_mode: host
+  volumes:
+    # The fleet's loopback-only FastDDS profile, used by the domain-42 bridge processes.
+    # Without it the container cannot reach Agent Core at all (see README_dev "DDS isolation").
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+  environment:
+    - PYTHONUNBUFFERED=1
+    - RCUTILS_COLORIZED_OUTPUT=0
+    # The robot side is CycloneDDS on domain 0, set in config.yaml (ros.cyclonedds_uri) so it
+    # matches the robot's own ~/config/cyclonedds.xml. Domain 42 is Agent Core's.
+    - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    - ROS_DOMAIN_ID=42
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - AGENT_CORE_URL=https://localhost:15678
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always
+  stop_grace_period: 30s
