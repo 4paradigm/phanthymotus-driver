@@ -159,6 +159,12 @@ class BumiDeviceBundle:
             ))
             print("[bundle] LocoServoPlugin loaded")
 
+        if plugins_cfg.get("bottle_detect", {}).get("enabled", False):
+            from BottleDetect import BottleDetectPlugin
+            self._plugins.append(BottleDetectPlugin(
+                plugins_cfg["bottle_detect"], namespace, executor))
+            print("[bundle] BottleDetectPlugin loaded")
+
         if plugins_cfg.get("mic", {}).get("enabled", False) and media_ctrl is not None:
             from device import MicPlugin
             self._plugins.append(MicPlugin(plugins_cfg["mic"], namespace, executor, media_ctrl))

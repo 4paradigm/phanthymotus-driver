@@ -448,6 +448,65 @@ ros2 topic hz /<robot_namespace>/motion/state
 docker logs -f embodied-noetix-bumi
 ```
 
+## Bottle-contour detection card (`bottle_detect`)
+
+A sensor card for the "grab the stool" game. It subscribes to the camera card's
+aligned `/<ns>/camera/color` (JPEG) and `/<ns>/camera/depth` (zlib-compressed
+`16UC1`) streams, finds bottle-shaped contours and publishes the nearest one.
+It never commands the chassis.
+
+Detection is shape-based, so it does not depend on the bottle being blue or
+opaque. A silhouette must satisfy all of:
+
+- aspect ratio 2.0–6.0 (tall and narrow);
+- neck/body width 0.25–0.85 (a real bottleneck);
+- contour/bounding-box fill 0.40–0.95 and convexity (solidity) ≥ 0.80;
+- left/right symmetry offset ≤ 0.20;
+- a valid aligned depth sample between 0.2 and 6 m, with median absolute
+  deviation ≤ `depth_mad_m` (rejects a box that mixes bottle and background).
+
+Three edge sources (grey Canny, saturation Canny, adaptive threshold) are
+merged, so a coloured label or cap can still outline a bottle whose grey edges
+are weak. Candidates are de-duplicated by IoU and the nearest valid one is
+tracked. A target becomes `fresh` only after `confirm_frames` consecutive
+detections, and its distance/bearing are smoothed, which suppresses single-frame
+false positives and jitter.
+
+Output (`/<ns>/bottle/target`, 5 Hz):
+
+```json
+{"state": "fresh", "bottle": {"distance_m": 1.84, "bearing_deg": -6.2,
+ "bbox": [292, 130, 58, 290], "confidence": 0.86,
+ "confirmed_frames": 2}, "count": 1}
+```
+
+- `bearing_deg` uses the robot frame: front 0, left positive;
+- `candidate` means a bottle was seen but not yet confirmed;
+- `no_target` means nothing passed the shape/depth rules;
+- `stale` means colour or depth stopped arriving.
+
+With `publish_debug: true` the card also publishes
+`/<ns>/bottle/debug` (`image/jpeg`) with every candidate boxed; the confirmed
+target is green, other candidates yellow. This is the fastest way to tune
+thresholds on the robot.
+
+### Configuration (`config.yaml`)
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `detect_hz` | `5` | Detection rate |
+| `min_confidence` | `0.45` | Reject weak silhouettes |
+| `confirm_frames` | `2` | Consecutive hits before `fresh` |
+| `depth_mad_m` | `0.35` | Max depth spread inside the box |
+| `publish_debug` | `true` | Publish the annotated JPEG |
+
+Safety: the card only reads camera frames. It does not move the robot, so it can
+run while the robot is standing. Detection is a silhouette heuristic: a very
+transparent bottle in backlight, or one heavily occluded, may be missed; place
+the bottle upright, roughly 1.2–2.5 m away, with its label/cap visible.
+
+Tests: `python -m pytest noetix/bumi/tests/test_bottle_detect.py -q`
+
 ## Read-only RGB-D visual odometry card (`rgbd_visual_odometry`)
 
 Single container: the estimator runs inside this bundle, not in a sidecar.
