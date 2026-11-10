@@ -256,7 +256,7 @@ class G1DeviceBundle:
             from device import LidarPlugin
             self._plugins.append(LidarPlugin(
                 plugins_cfg["lidar"], namespace, executor,
-                pose_frame_provider=(loco_state.node.get_mapping_child_frame
+                pose_frame_provider=(loco_state.node.get_regular_child_frame
                                      if loco_state is not None else None)))
             print("[bundle] LidarPlugin loaded")
 

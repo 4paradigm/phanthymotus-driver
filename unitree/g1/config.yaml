@@ -13,6 +13,14 @@ plugins:
     enabled: true
   loco:
     enabled: true
+    # RTAB-Map SLAM pose input is now derived from rt/odommodestate,
+    # not the original Unitree slam_mapping service.
+    # Source SportModeState has no frame_id; both labels must be verified
+    # on the robot and configured together before publishing a candidate pose.
+    # This is an example only, not a calibrated default:
+    # slam_regular_odometry:
+    #   frame_id: odom
+    #   child_frame_id: imu_in_torso
   loco_relative_move:
     enabled: true
     # Closed-loop speed caps; requires only the loco_state publisher.

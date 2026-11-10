@@ -21,6 +21,7 @@ from uuid import uuid4
 
 
 SOURCES = (
+    ('sport_odom', 'rt/odommodestate', 'unitree_go'),
     ('odom', 'rt/unitree/slam_mapping/odom', 'nav_msgs'),
     ('cloud', 'rt/utlidar/cloud_livox_mid360', 'sensor_msgs'),
     ('slam_info', 'rt/slam_info', 'std_msgs'),
@@ -54,7 +55,21 @@ def to_record(kind, msg, *, received_ns, received_monotonic_ns,
         'measurement_clock_verified': False,
         'tracking_verified': False,
     }
-    if kind == 'odom':
+    if kind == 'sport_odom':
+        stamp = msg.stamp
+        row.update(
+            source_header={'stamp': {'sec': stamp.sec, 'nanosec': stamp.nanosec},
+                           'frame_id': None},
+            position_xyz=list(msg.position),
+            velocity=list(msg.velocity),
+            yaw_speed=msg.yaw_speed,
+            quaternion_wxyz=list(msg.imu_state.quaternion),
+            imu_gyroscope=list(msg.imu_state.gyroscope),
+            error_code=msg.error_code,
+            position_reference='unknown',
+            imu_orientation_reference='unknown',
+        )
+    elif kind == 'odom':
         pose = msg.pose.pose
         q, p = pose.orientation, pose.position
         row.update(
@@ -104,10 +119,12 @@ def main(argv=None):
     # Lazy import: conversion and CLI validation remain ROS-free and testable.
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
     from unitree_sdk2py.idl.nav_msgs.msg.dds_ import Odometry_
+    from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
     from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
     from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
 
-    classes = {'nav_msgs': Odometry_, 'sensor_msgs': PointCloud2_, 'std_msgs': String_}
+    classes = {'unitree_go': SportModeState_, 'nav_msgs': Odometry_,
+               'sensor_msgs': PointCloud2_, 'std_msgs': String_}
     ChannelFactoryInitialize(0, args.iface)
     generation = uuid4().hex  # sampler identity; NOT sensor epoch
     messages = queue.Queue(maxsize=256)

@@ -46,6 +46,7 @@ from audio_msgs.msg import AudioChunk
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from pointcloud_utils import gravity_align_inplace, pack_slam_cloud
 from slam_odometry import MappingOdometry
+from sport_odometry import SportOdometry
 import sport_mode_state as _SMS
 from common.slam_input import input_declaration, native_frame_metadata, validate_extrinsic_candidate
 
@@ -1228,10 +1229,18 @@ class _LocoStateNode(Node):
 
     _ODOM_INTERVAL = 0.1  # 10 Hz throttle
 
-    def __init__(self, odom_topic: str, motion_topic: str, mapping_topic: str):
+    def __init__(self, odom_topic: str, motion_topic: str, mapping_topic: str,
+                 sport_topic: str = None, sport_config: dict = None):
         super().__init__("g1_loco_state")
         self._odom_pub   = self.create_publisher(String, odom_topic,   _LOW_LAT_QOS)
         self._motion_pub = self.create_publisher(String, motion_topic, _LOW_LAT_QOS)
+        # SLAM candidate now comes from regular sport odometry (rt/odommodestate).
+        # The old vendor SLAM mapping source is retained only for diagnostics.
+        self._sport_adapter = SportOdometry(**(sport_config or {}))
+        self._sport_pub = (self.create_publisher(String, sport_topic, _LOW_LAT_QOS)
+                           if sport_topic else None)
+        self._sport_sample = None
+        self._sport_error = None
         self._last_state: dict = {}
         self._last_native_state: dict = {}
         self._last_fsm: dict = {}
@@ -1284,6 +1293,22 @@ class _LocoStateNode(Node):
             with self._lock:
                 self._mapping_error = str(exc)
 
+    def get_regular_child_frame(self):
+        """Only an explicitly configured frame can be used for a URDF mount."""
+        with self._lock:
+            if (self._sport_adapter._last_stamp_ns is None or
+                    self._sport_adapter._continuity_quarantined):
+                return None
+            return self._sport_adapter.child_frame_id
+
+    def get_regular_info(self, topic: str) -> dict:
+        from copy import deepcopy
+        with self._lock:
+            return {"available": False, "sample": deepcopy(self._sport_sample),
+                    "error": self._sport_error,
+                    "observation": self._sport_adapter.observation_status(),
+                    "input_metadata": [self._sport_adapter.declaration(topic)]}
+
     def get_mapping_child_frame(self):
         """Latest valid mapping pose child frame, never inferred from leg odom."""
         with self._lock:
@@ -1319,6 +1344,20 @@ class _LocoStateNode(Node):
         }
 
     def _on_odom(self, msg) -> None:
+        # Convert every native SportModeState sample, before the old 10 Hz
+        # display throttle. A poor sample must not break the legacy state card.
+        with self._lock:
+            sample = self._sport_adapter.convert(msg)
+            self._sport_sample = sample
+        if self._sport_pub is not None:
+            try:
+                out = String()
+                out.data = json.dumps(sample, allow_nan=False)
+                self._sport_pub.publish(out)
+                self._sport_error = None
+            except (TypeError, ValueError, RuntimeError, AttributeError) as error:
+                self._sport_error = str(error)
+
         now = time.monotonic()
         if now - self._last_odom_time < self._ODOM_INTERVAL:
             return
@@ -1382,7 +1421,10 @@ class LocoStatePlugin:
         self._odom_topic   = f"/{namespace}/loco/state"
         self._motion_topic = f"/{namespace}/loco/motion_state"
         self._mapping_topic = f"/{namespace}/slam/mapping/odom"
-        self._node = _LocoStateNode(self._odom_topic, self._motion_topic, self._mapping_topic)
+        self._sport_topic = f"/{namespace}/slam/odom"
+        sport_cfg = (plugin_config or {}).get('slam_regular_odometry') or {}
+        self._node = _LocoStateNode(self._odom_topic, self._motion_topic,
+                                    self._mapping_topic, self._sport_topic, sport_cfg)
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
@@ -1396,9 +1438,9 @@ class LocoStatePlugin:
             "description": f"G1 locomotion state (always active) — mode, velocity, position, body_height, foot_force, IMU. Publishes at 10Hz to {self._odom_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._odom_topic, "format": "data/json"},
-                          {"topic": self._mapping_topic, "format": "state/odom"}],
-            "input_metadata": self._node.get_mapping_info(self._mapping_topic)['input_metadata'],
-            "odom_interface": self._node._mapping_adapter.interface(),
+                          {"topic": self._sport_topic, "format": "state/odom"}],
+            "input_metadata": self._node.get_regular_info(self._sport_topic)['input_metadata'],
+            "odom_interface": self._node._sport_adapter.interface(),
         }
 
     def _motion_tool(self) -> dict:
@@ -1438,6 +1480,7 @@ class LocoStatePlugin:
             return {"state": "running", "topic_out": tool['topic_out'],
                     "input_metadata": tool['input_metadata'],
                     "odom_interface": tool['odom_interface'],
+                    "regular_odom": self._node.get_regular_info(self._sport_topic),
                     "mapping_odom": self._node.get_mapping_info(self._mapping_topic),
                     "native_snapshot": self._node.get_native_state(),
                     "slam_pose": {"available": False,
@@ -1448,10 +1491,8 @@ class LocoStatePlugin:
                                       "axes": ["forward", "left", "up"],
                                       "requires_high_level_motion_control": True,
                                       "minimum_state_estimator_version": "1.0.0.1"},
-                                  "missing_facts": ["measurement_stamp", "clock_domain_and_epoch", "pose_frame",
-                                                    "reference_point", "tracking_quality",
-                                                    "sensor_extrinsic", "clock_relation_to_lidar",
-                                                    "tracking_reset_and_relocalization"]}}
+                                  "missing_facts": list(self._node._sport_adapter.interface()[
+                                      "slam_pose"]["missing_facts"])}}
         return None
 
 

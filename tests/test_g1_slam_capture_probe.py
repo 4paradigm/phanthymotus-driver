@@ -93,3 +93,27 @@ def test_cli_rejects_invalid_resource_limits_without_sdk_import(args):
     with pytest.raises(SystemExit) as error:
         main(args)
     assert error.value.code == 2
+
+
+def test_regular_sport_odom_is_captured_without_native_slam_or_lidar():
+    msg = NS(
+        stamp=NS(sec=44, nanosec=12345678),
+        position=[1., 2., 3.], velocity=[.1, .2, .3],
+        yaw_speed=.25, error_code=0,
+        imu_state=NS(quaternion=[1., 0., 0., 0.],
+                     gyroscope=[.1, .2, .3]),
+    )
+    record = to_record('sport_odom', msg,
+                       received_ns=123, received_monotonic_ns=456)
+    assert record['source_topic'] == 'rt/odommodestate'
+    assert record['source_header'] == {'stamp': {'sec': 44, 'nanosec': 12345678},
+                                       'frame_id': None}
+    assert record['position_xyz'] == [1., 2., 3.]
+    assert record['quaternion_wxyz'] == [1., 0., 0., 0.]
+    assert record['position_reference'] == 'unknown'
+    assert record['imu_orientation_reference'] == 'unknown'
+    assert record['measurement_clock_verified'] is False
+    assert record['tracking_verified'] is False
+    msg.position[0] = 99.
+    assert record['position_xyz'][0] == 1.
+    json.dumps(record, allow_nan=False)

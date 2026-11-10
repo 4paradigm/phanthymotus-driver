@@ -15,6 +15,7 @@ import pytest
 
 import common.slam_input as slam_input
 from unitree.g1.slam_odometry import MappingOdometry
+from unitree.g1.sport_odometry import SportOdometry
 from unitree.g1.pointcloud_utils import gravity_align_inplace, pack_slam_cloud
 
 
@@ -84,7 +85,7 @@ def runtime(monkeypatch):
                      gravity_align_inplace=gravity_align_inplace, pack_slam_cloud=pack_slam_cloud,
                      input_declaration=slam_input.input_declaration,
                      validate_extrinsic_candidate=slam_input.validate_extrinsic_candidate,
-                     MappingOdometry=MappingOdometry)
+                     MappingOdometry=MappingOdometry, SportOdometry=SportOdometry)
     if hasattr(slam_input, 'native_frame_metadata'):
         namespace['native_frame_metadata'] = slam_input.native_frame_metadata
     lidar, plugin = extract(namespace, '_LidarNode', 'LidarPlugin')
@@ -428,11 +429,12 @@ def test_loco_info_retains_complete_native_facts_without_claiming_a_slam_pose(ru
     source.imu_state.quaternion[:] = [999.]*4
     info = plugin.dispatch('info', {'_tool_name': 'loco_state'})
     assert info['topic_out'] == [{'topic': '/alpha/loco/state', 'format': 'data/json'},
-                                 {'topic': '/alpha/slam/mapping/odom', 'format': 'state/odom'}]
+                                 {'topic': '/alpha/slam/odom', 'format': 'state/odom'}]
     assert plugin.get_tools()[0]['topic_out'] == info['topic_out']
     assert info.get('slam_pose', {}).get('available') is False
-    assert set(info['slam_pose']['missing_facts']) >= {'measurement_stamp', 'clock_domain_and_epoch',
-                                                    'pose_frame', 'reference_point', 'tracking_quality'}
+    assert set(info['slam_pose']['missing_facts']) >= {'measurement_stamp_semantics',
+                                                    'clock_domain_and_epoch',
+                                                    'pose_reference_frame', 'tracking_quality'}
     evidence = info['native_snapshot']
     assert evidence['source_topic'] == 'rt/odommodestate'
     assert evidence['source_type'] == 'unitree_go.msg.dds_.SportModeState_'
@@ -463,6 +465,10 @@ def test_loco_info_retains_complete_native_facts_without_claiming_a_slam_pose(ru
         validate_slam_capability(odom_interface)
     assert info['mapping_odom']['available'] is False
     assert info['mapping_odom']['sample'] is None
+    assert info['regular_odom']['sample']['vendor']['source_topic'] == 'rt/odommodestate'
+    assert info['regular_odom']['sample']['vendor']['motus_slam']['status'] == 'unavailable'
+    assert info['regular_odom']['input_metadata'][0]['source_topic'] == 'rt/odommodestate'
+    assert info['regular_odom']['sample']['pose'] is None
 
 
 @pytest.mark.parametrize('stamp', [(0, 0), (9, 1_000_000_000), (-1, 0)])
@@ -557,7 +563,7 @@ def test_mapping_port_subscribes_official_source_and_publishes_separately(runtim
     tool = plugin.get_tools()[0]
     assert tool['topic_out'] == [
         {'topic': '/alpha/loco/state', 'format': 'data/json'},
-        {'topic': '/alpha/slam/mapping/odom', 'format': 'state/odom'}]
+        {'topic': '/alpha/slam/odom', 'format': 'state/odom'}]
     assert any(t == 'rt/unitree/slam_mapping/odom' for t, _, _ in runtime.subscriptions)
     assert not any('relocation' in t for t, _, _ in runtime.subscriptions)
     callback = next(cb for t, cb, _ in runtime.subscriptions if t == 'rt/unitree/slam_mapping/odom')
@@ -571,7 +577,8 @@ def test_mapping_port_subscribes_official_source_and_publishes_separately(runtim
     info = plugin.dispatch('info', {})
     assert info['topic_out'] == tool['topic_out']
     assert info['mapping_odom']['sample'] == emitted
-    assert info['input_metadata'][0]['frame_id'] == 'source_map'
+    assert info['input_metadata'][0]['frame_id'] is None
+    assert info['input_metadata'][0]['source_topic'] == 'rt/odommodestate'
     info['mapping_odom']['sample']['pose']['position'][0] = 99
     assert plugin.dispatch('info', {})['mapping_odom']['sample']['pose']['position'][0] == 1.25
     assert plugin.dispatch('info', {'_tool_name': 'loco_motion_state'})['topic_out'] == [
@@ -885,3 +892,49 @@ def test_invalid_urdf_alias_config_never_admits_calibrated_input(runtime):
     assert info['urdf_mount'] is None
     assert 'slam_urdf_frame_aliases' in info['urdf_calibration_error']
     assert info['input_metadata'][0]['extrinsic'] is None
+
+
+def test_g1_regular_odom_publishes_slam_candidate_independently_of_vendor_mapping(runtime):
+    from common.spatial_slam import SpatialSlamError, validate_tracking_pose
+    _, plugin_cls = extract(runtime.namespace, '_LocoStateNode', 'LocoStatePlugin')
+    plugin = plugin_cls({
+        'slam_regular_odometry': {'frame_id': 'odom', 'child_frame_id': 'imu_in_torso'}
+    }, 'alpha', NS(add_node=lambda _: None))
+    source = sport_state()
+    source.imu_state.quaternion = [1., 0., 0., 0.]
+    plugin._node._on_odom(source)
+    regular = json.loads(plugin._node.topics['/alpha/slam/odom'][0].data)
+    assert regular['vendor']['source_topic'] == 'rt/odommodestate'
+    assert regular['pose']['position'] == [8., 9., 10.]
+    assert regular['pose']['quaternion'] == [0., 0., 0., 1.]
+    assert regular['vendor']['motus_slam']['status'] == 'unavailable'
+    assert regular['vendor']['motus_slam']['segment_id'] is None
+    assert plugin.dispatch('info', {})['input_metadata'][0]['source_topic'] == 'rt/odommodestate'
+    assert plugin._node.get_regular_child_frame() == 'imu_in_torso'
+    assert plugin._node.topics['/alpha/slam/mapping/odom'] == []
+    with pytest.raises(SpatialSlamError):
+        validate_tracking_pose(regular)
+    # Old visualization/state JSON is unaffected.
+    legacy = json.loads(plugin._node.topics['/alpha/loco/state'][0].data)
+    assert legacy['position'] == [8., 9., 10.]
+
+
+def test_regular_odom_invalid_packet_does_not_break_old_loco_state(runtime):
+    _, plugin_cls = extract(runtime.namespace, '_LocoStateNode', 'LocoStatePlugin')
+    plugin = plugin_cls({}, 'alpha', NS(add_node=lambda _: None))
+    legacy = sport_state()
+    plugin._node._on_odom(legacy)
+    regular = json.loads(plugin._node.topics['/alpha/slam/odom'][0].data)
+    assert regular['pose'] is None
+    assert regular['vendor']['motus_slam']['rejection'] == 'non_unit_imu_quaternion'
+    assert json.loads(plugin._node.topics['/alpha/loco/state'][0].data)['position'] == [8., 9., 10.]
+    assert plugin.dispatch('info', {})['regular_odom']['sample']['pose'] is None
+
+
+def test_regular_odom_publish_failure_is_isolated_from_legacy_json(runtime):
+    _, plugin_cls = extract(runtime.namespace, '_LocoStateNode', 'LocoStatePlugin')
+    plugin = plugin_cls({}, 'alpha', NS(add_node=lambda _: None))
+    plugin._node._sport_pub.publish = lambda _: (_ for _ in ()).throw(RuntimeError('not reachable'))
+    plugin._node._on_odom(sport_state())
+    assert 'not reachable' in plugin.dispatch('info', {})['regular_odom']['error']
+    assert len(plugin._node.topics['/alpha/loco/state']) == 1

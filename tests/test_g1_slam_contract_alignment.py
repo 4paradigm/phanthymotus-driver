@@ -36,8 +36,8 @@ def test_real_g1_declarations_remain_inadmissible_without_evidence():
 
 
 def test_false_slam_capability_is_rejected_even_if_profile_matches():
-    from unitree.g1.slam_odometry import MappingOdometry
-    iface = MappingOdometry().interface()
+    from unitree.g1.sport_odometry import SportOdometry
+    iface = SportOdometry().interface()
     assert iface['slam_pose']['profile'] == 'motus_slam/1'
     assert iface['slam_pose']['available'] is False
     with pytest.raises(SpatialSlamError, match='availability'):

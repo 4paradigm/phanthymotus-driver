@@ -27,7 +27,7 @@
 
 ## SLAM 传感器采集与外参
 
-G1 的原生点云、里程计输入与已测试 URDF 固定外参参见 [SLAM 离线适配与数据采集](SLAM_CAPTURE.md)。URDF 的标定标志不代表里程计跟踪、时钟关系或 RTAB-Map 已通过实机验收。
+G1 的通用 SLAM 输入从普通 `rt/odommodestate` 构建，**不依赖原厂建图里程计**。原生点云、普通里程计候选协议、已测试 URDF 固定外参与数据采集参见 [SLAM 离线适配与数据采集](SLAM_CAPTURE.md)。URDF 的标定标志不代表里程计跟踪、时钟关系或 RTAB-Map 已通过实机验收。
 
 ## 构建
 

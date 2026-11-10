@@ -3,19 +3,26 @@
 This driver branch implements two **candidate** inputs for the generic
 `pointcloud_slam` Perception card:
 
-- `/<namespace>/slam/mapping/odom` — ROS `std_msgs/msg/String`, `motus.odom/1`
+- `/<namespace>/slam/odom` — **regular** G1 `rt/odommodestate` converted to ROS `std_msgs/msg/String`, `motus.odom/1`.
+- `/<namespace>/slam/mapping/odom` — legacy vendor SLAM diagnostics, **not the selected RTAB-Map input**.
 - `/<namespace>/lidar/cloud_native` — ROS `sensor_msgs/msg/PointCloud2`
 - `/<namespace>/lidar/cloud_native/metadata` — ROS `std_msgs/msg/String`
 
 The existing `/<namespace>/loco/state` and `/<namespace>/lidar/cloud` outputs
 are unchanged. Do not connect `sensor/pointcloud` to the native SLAM input.
 
-**Not ready for mapping:** The G1 odometry adapter deliberately reports
-`vendor.motus_slam.status = unavailable` and declares
-`odom_interface.slam_pose.available = false` until measurement-time clock
-semantics, tracking-quality/status, pose reset/relocalization boundaries and
-measured lidar extrinsics are proven on the installed robot. This guard must
-not be disabled merely to start RTAB-Map.
+**No dependency on vendor mapping SLAM:** The new `state/odom` output is
+converted directly from ordinary `rt/odommodestate` (position[3], velocity[3],
+IMU quaternion WXYZ and source TimeSpec). `/loco/state` remains unchanged.
+
+**Not yet an admitted tracking pose:** This G1 SportModeState message lacks
+explicit pose frame IDs, verified measurement-clock semantics, an unambiguous
+position/IMU orientation reference, tracking status and reset identity. The
+adapter preserves the raw coordinates in `vendor` but deliberately reports
+`vendor.motus_slam.status = unavailable`,
+`odom_interface.slam_pose.available = false` and `segment_id: null`.
+A correctly shaped sample is not proof of tracking, so the driver must not
+force `tracking` to bypass PR #371.
 
 ## Offline contract tests
 
@@ -25,6 +32,7 @@ Run from the driver repo root on the branch corresponding to PR #499:
 python3 -m pytest -q \
   tests/test_spatial_slam.py \
   tests/test_g1_mapping_odom.py \
+  tests/test_g1_sport_odometry.py \
   tests/test_g1_slam_input.py \
   tests/test_g1_pointcloud_layout.py \
   tests/test_slam_input_metadata.py \
@@ -59,8 +67,10 @@ Use the actual robot-facing interface instead of `eth0` if different.
 The script subscribes to the following native **Unitree domain 0** DDS topics,
 never starts mapping or issues robot motion commands:
 
-- `rt/unitree/slam_mapping/odom`: source header, position, xyzw orientation,
-  covariance
+- `rt/odommodestate`: **ordinary odometry** source stamp, position, velocity,
+  IMU WXYZ orientation, gyroscope and error code
+- `rt/unitree/slam_mapping/odom`: old vendor mapping/SLAM diagnostic (optional;
+  this topic need not publish for regular odometry to work)
 - `rt/utlidar/cloud_livox_mid360`: header and field/layout information;
   **no raw cloud payload** in this small JSONL
 - `rt/slam_info` and `rt/slam_key_info`: capped vendor status strings
@@ -78,10 +88,10 @@ and record the three ROS outputs with `ros2 bag record`. For example:
 ```bash
 source /opt/ros/humble/setup.bash
 source /ros_ws/install/setup.bash
-ros2 topic list -t | grep -E 'slam/mapping/odom|lidar/cloud_native'
+ros2 topic list -t | grep -E 'slam/odom|slam/mapping/odom|camera/depth|lidar/cloud_native'
 # Replace <namespace> with the namespace actually reported by ROS:
 ros2 bag record -o /opt/phanthy-motus/data/slam_capture/static \
-  /<namespace>/slam/mapping/odom \
+  /<namespace>/slam/odom \
   /<namespace>/lidar/cloud_native \
   /<namespace>/lidar/cloud_native/metadata
 ```
@@ -102,8 +112,8 @@ and marks that **URDF transform** `calibrated: true` with source
 The calibrated model mount, `torso_link -> mid360_link`, is exposed in
 `lidar_cloud.info().urdf_mount` even before the ROS sources publish.
 The native SLAM input declaration's `extrinsic` is populated only when both
-`rt/unitree/slam_mapping/odom`'s actual `child_frame_id` and raw
-`rt/utlidar/cloud_livox_mid360`'s `header.frame_id` can be mapped through
+the explicitly configured ordinary odometry reference `child_frame_id` and
+raw `rt/utlidar/cloud_livox_mid360`'s `header.frame_id` can be mapped through
 **fixed joints in that same URDF**, with the parent and child names preserved.
 Do not assume that a vendor frame named `source_imu` is `imu_in_torso`,
 or that `livox_native` means `mid360_link`.
@@ -125,15 +135,52 @@ a dynamic-joint chain (such as pelvis to torso), a missing URDF, or a
 conflicting manual transform fails closed: `extrinsic: null` plus
 `urdf_calibration_error` in `lidar_cloud.info()`.
 
-The G1 `motus.odom/1` producer remains `unavailable` until tracking,
-clock and segment identity are verified. `calibrated: true` on the
+The new G1 ordinary `motus.odom/1` producer remains `unavailable` until
+pose frame, tracking, clock and segment identity are verified. `calibrated: true` on the
 physical URDF mount does **not** make the whole SLAM input stream valid.
+
+## Optional ordinary odometry frame labels
+
+The native `SportModeState_` has `position[3]`, IMU quaternion WXYZ and
+`stamp`, but **does not identify the pose's world or child frame**.
+When the real frame relationship has been verified, configure BOTH labels:
+
+```yaml
+plugins:
+  loco:
+    enabled: true
+    slam_regular_odometry:
+      frame_id: odom
+      child_frame_id: imu_in_torso
+```
+
+This is an **illustrative example, not a verified G1 default**.
+Do not guess that a position referenced to the robot base center is identical
+to the body IMU frame; they may require an additional transform.
+With no labels, the candidate publishes `pose: null` with full raw
+position/orientation evidence under `vendor`. With explicit labels it publishes
+a candidate pose, but still correctly reports `status: unavailable` until
+tracking, timestamp provenance and reset guarantees are verified.
+
+To check the non-lidar data while Mid360 is unavailable:
+
+```bash
+ros2 topic echo --once /<namespace>/loco/state
+ros2 topic echo --once /<namespace>/slam/odom
+ros2 topic info -v /<namespace>/camera/depth
+```
+
+For RealSense-based RTAB-Map mapping, an upstream depth-to-metric-PointCloud2
+converter must also supply real camera intrinsics, capture-time provenance and
+camera-to-odom-reference extrinsics. A raw compressed depth image is not
+`sensor/pointcloud2`.
 
 ## What remains dependent on the robot
 
-- Whether Odometry and Livox scan headers are **measurement timestamps** and
-  share a verified clock/epoch; scan timing and deskew semantics
-- Grounded per-pose tracking/invalid status from vendor state messages
+- Whether SportModeState and RealSense/depth-derived pointcloud stamps are
+  **measurement timestamps**, and a verified clock relationship/epoch exists
+- Grounded per-pose tracking/invalid status and source frame semantics for
+  ordinary `rt/odommodestate` (without assuming the vendor SLAM service)
 - Restart, disconnect, localization loss, relocation and coordinate-reset
   segment boundaries
 - Confirm the real vendor odometry/cloud frame labels or explicit mappings
