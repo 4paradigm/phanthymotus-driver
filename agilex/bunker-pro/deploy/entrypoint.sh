@@ -4,7 +4,9 @@ set -euo pipefail
 WORK=/work/agilex/bunker-pro
 /usr/bin/bash /deploy/host-can-bootstrap.sh
 export BUNKER_CAN_INTERFACE=$(/usr/bin/bash /deploy/bunker-can.sh interface)
+set +u
 source /opt/ros/humble/setup.bash
+set -u
 # The persistent driver only needs raw SocketCAN access. Drop the bootstrap
 # capabilities and host-root identity before starting the long-running process.
 export HOME=/tmp

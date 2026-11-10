@@ -35,8 +35,11 @@ def test_runtime_image_has_deployment_fragment_and_plain_ros_logs():
     assert "RestartUnit ss phanthy-bunker-can.service replace" in bootstrap
     assert "\nsystemctl " not in bootstrap
     entrypoint = (DRIVER_DIR / "deploy" / "entrypoint.sh").read_text()
+    assert "set +u\nsource /opt/ros/humble/setup.bash\nset -u" in entrypoint
     assert "--bounding-set=-all,+net_raw" in entrypoint
     assert "--ambient-caps=+net_raw" in entrypoint
+    assert "for _ in $(seq 1 30)" in bootstrap
+    assert "did not reach UP at 500000 bit/s within 30 seconds" in bootstrap
 
 
 def test_host_sys_mount_is_read_only_and_required_persistent_paths_are_explicit():

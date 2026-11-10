@@ -64,10 +64,21 @@ systemd_manager=org.freedesktop.systemd1.Manager
     "$systemd_manager" RestartUnit ss phanthy-bunker-can.service replace || \
     fail "could not start the host CAN service over D-Bus"
 
-iface=$(/usr/local/sbin/phanthy-bunker-can interface) || \
-    fail "no network interface bound to gs_usb after module load"
-details=$(/usr/sbin/ip -j -details link show dev "$iface")
-python3 -c 'import json,sys; info=json.load(sys.stdin)[0]; can=info.get("linkinfo",{}).get("info_data",{}); state=can.get("state"); bitrate=can.get("bittiming",{}).get("bitrate"); assert info["flags"] and "UP" in info["flags"], "CAN link is down"; assert bitrate == 500000, "expected 500000 bit/s, got %s" % bitrate; print("[bunker-can-setup] %s %s %s bit/s" % (info["ifname"], state, bitrate))' <<<"$details"
+ready=false
+for _ in $(seq 1 30); do
+    iface=$(/usr/local/sbin/phanthy-bunker-can interface 2>/dev/null || true)
+    if [[ -n "$iface" ]]; then
+        details=$(/usr/sbin/ip -j -details link show dev "$iface" 2>/dev/null || true)
+        if python3 -c 'import json,sys; info=json.load(sys.stdin)[0]; can=info.get("linkinfo",{}).get("info_data",{}); assert "UP" in info["flags"] and can.get("bittiming",{}).get("bitrate") == 500000' \
+                <<<"${details:-[]}" >/dev/null 2>&1; then
+            ready=true
+            break
+        fi
+    fi
+    sleep 1
+done
+$ready || fail "CAN interface did not reach UP at 500000 bit/s within 30 seconds"
+echo "[bunker-can-setup] ${iface} configured at 500000 bit/s"
 
 export BUNKER_CAN_INTERFACE="$iface"
 echo "[bunker-can-setup] host CAN ready: ${BUNKER_CAN_INTERFACE}"
