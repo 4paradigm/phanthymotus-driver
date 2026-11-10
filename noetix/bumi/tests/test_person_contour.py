@@ -105,3 +105,13 @@ def test_encode_jpeg_returns_a_jpeg(contour):
     encoded = contour.encode_jpeg(frame, 70)
     assert encoded is not None
     assert encoded[:2] == b"\xff\xd8"
+
+
+def test_start_returns_running_for_a_sensor(contour):
+    plugin = contour.PersonContourPlugin.__new__(contour.PersonContourPlugin)
+    plugin._target_topic = "/robot/person/target"
+    plugin._subscription_topic = "/robot/person/target"
+    plugin._subscribe = lambda topic: None
+    result = plugin.start({})
+    assert result["state"] == "running"
+    assert result["topic_in"][0]["topic"] == "/robot/person/target"

@@ -246,7 +246,7 @@ class PersonContourPlugin:
         args = args or {}
         topic = str(args.get("input_topic") or "").strip()
         self._subscribe(topic or self._target_topic)
-        return {"state": "ready", "topic_in": [{
+        return {"state": "running", "topic_in": [{
             "topic": self._subscription_topic,
             "format": "data/json",
             "message_type": "std_msgs/msg/String",

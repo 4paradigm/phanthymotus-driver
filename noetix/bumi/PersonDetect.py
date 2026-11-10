@@ -278,9 +278,9 @@ class PersonDetectPlugin:
         except (TypeError, ValueError):
             confirm = _DEFAULT_CONFIRM_FRAMES
         self._tracker = PersonTracker(confirm_frames=confirm)
-        self._publish_debug = bool(plugin_config.get("publish_debug", True))
+        self._debug_enabled = bool(plugin_config.get("publish_debug", True))
         self._target_out = [{"topic": self._target_topic, "format": "data/json"}]
-        if self._publish_debug:
+        if self._debug_enabled:
             self._target_out.append({"topic": self._debug_topic,
                                      "format": "image/jpeg"})
 
@@ -311,7 +311,7 @@ class PersonDetectPlugin:
         executor.add_node(self._node)
         self._pub = self._node.create_publisher(String, self._target_topic, qos)
         self._debug_pub = (self._node.create_publisher(
-            CompressedImage, self._debug_topic, qos) if self._publish_debug
+            CompressedImage, self._debug_topic, qos) if self._debug_enabled
             else None)
         self._node.create_subscription(
             CompressedImage, self._color_topic, self._on_color, qos)
@@ -466,7 +466,7 @@ class PersonDetectPlugin:
         self._pub.publish(msg)
 
     def _publish_debug(self, frame, people: list, confirmed) -> None:
-        if not self._publish_debug or self._debug_pub is None:
+        if not self._debug_enabled or self._debug_pub is None:
             return
         debug = frame.copy()
         for person in people:

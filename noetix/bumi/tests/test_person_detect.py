@@ -6,6 +6,7 @@ detection is a hardware test.
 """
 
 import importlib.util
+import inspect
 import sys
 from pathlib import Path
 
@@ -118,3 +119,54 @@ def test_tracker_resets_without_a_person(detect):
     tracker.update([])
     assert tracker.hits == 0
     assert tracker.last is None
+
+
+# ── Debug publisher regression (P1: flag must not shadow the method) ─────────
+
+def test_debug_flag_does_not_shadow_the_publish_method(detect):
+    assert callable(detect.PersonDetectPlugin._publish_debug)
+    source = inspect.getsource(detect.PersonDetectPlugin.__init__)
+    assert "self._publish_debug =" not in source
+    assert "self._debug_enabled =" in source
+
+
+def test_debug_publish_path_with_stub_ros_objects(detect):
+    cv2 = pytest.importorskip("cv2")
+
+    class FakeClock:
+        def now(self):
+            return self
+
+        def to_msg(self):
+            return "stamp"
+
+    class FakeNode:
+        def get_clock(self):
+            return FakeClock()
+
+    class FakeHeader:
+        stamp = None
+
+    class FakeImage:
+        def __init__(self):
+            self.header = FakeHeader()
+            self.format = ""
+            self.data = None
+
+    class FakePublisher:
+        def __init__(self):
+            self.message = None
+
+        def publish(self, msg):
+            self.message = msg
+
+    plugin = detect.PersonDetectPlugin.__new__(detect.PersonDetectPlugin)
+    plugin._debug_enabled = True
+    plugin._debug_pub = FakePublisher()
+    plugin._CompressedImage = FakeImage
+    plugin._node = FakeNode()
+    frame = np.zeros((64, 96, 3), dtype=np.uint8)
+    plugin._publish_debug(frame, [], None)
+    assert plugin._debug_pub.message is not None
+    assert plugin._debug_pub.message.format == "jpeg"
+    assert bytes(plugin._debug_pub.message.data[:2]) == b"\xff\xd8"
