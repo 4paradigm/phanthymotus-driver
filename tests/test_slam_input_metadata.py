@@ -112,3 +112,89 @@ def test_candidate_cannot_self_assert_calibration():
            'calibrated': True}
     with pytest.raises(ValueError, match='cannot assert verified'):
         validate_extrinsic_candidate(raw)
+
+
+def test_candidate_obeys_canonical_strict_rotation_tolerance():
+    from common.slam_input import validate_extrinsic_candidate
+    almost_orthogonal = [
+        [1., 0.00005, 0., 0.],
+        [0., 1., 0., 0.],
+        [0., 0., 1., 0.],
+        [0., 0., 0., 1.],
+    ]
+    with pytest.raises(ValueError, match='slam_extrinsic_candidate'):
+        validate_extrinsic_candidate({
+            'parent_frame': 'source_imu', 'child_frame': 'livox_native',
+            'source': 'operator_candidate', 'version': 'unverified-v1',
+            'matrix': almost_orthogonal,
+        })
+
+
+def test_native_frame_evidence_is_rejected_by_canonical_clock_verifier():
+    from common.slam_input import native_frame_metadata
+    from common.spatial_slam import SpatialSlamError, validate_frame_identity
+    packet = native_frame_metadata(cloud(), source_generation='driver-process-1')
+    with pytest.raises(SpatialSlamError, match='clock_id'):
+        validate_frame_identity(packet, clock_id='test')
+
+
+def test_user_confirmed_urdf_fixed_mount_passes_strict_calibration_contract():
+    import math
+    from pathlib import Path
+    from common.slam_input import calibrated_urdf_mount
+    from common.spatial_slam import validate_mount
+    urdf = Path(__file__).resolve().parents[1] / 'unitree/g1/resource/g1_model.urdf'
+    mount = calibrated_urdf_mount(urdf, 'torso_link', 'mid360_link')
+    assert mount['calibrated'] is True
+    assert mount['calibration_evidence'] == 'operator_confirmed_prior_g1_test'
+    assert mount['matrix'][0][3] == pytest.approx(.0002835)
+    assert mount['matrix'][1][3] == pytest.approx(.00003)
+    assert mount['matrix'][2][3] == pytest.approx(.40618)
+    assert mount['matrix'][0][0] == pytest.approx(math.cos(.04014257279586953))
+    assert mount['matrix'][2][0] == pytest.approx(-math.sin(.04014257279586953))
+    validate_mount(mount, parent_frame='torso_link',
+                   child_frame='mid360_link', require_calibrated=True)
+
+
+def test_urdf_fixed_chain_inverse_and_imu_chain_are_metric():
+    from pathlib import Path
+    from common.slam_input import calibrated_urdf_mount
+    urdf = Path(__file__).resolve().parents[1] / 'unitree/g1/resource/g1_model.urdf'
+    imu_to_lidar = calibrated_urdf_mount(urdf, 'imu_in_torso', 'mid360_link')
+    inverse = calibrated_urdf_mount(urdf, 'mid360_link', 'torso_link')
+    assert imu_to_lidar['matrix'][0][3] == pytest.approx(.0398735)
+    assert imu_to_lidar['matrix'][1][3] == pytest.approx(.00227)
+    assert imu_to_lidar['matrix'][2][3] == pytest.approx(.26826)
+    # Composition of forward and reverse transforms is the identity.
+    forward = calibrated_urdf_mount(urdf, 'torso_link', 'mid360_link')['matrix']
+    backward = inverse['matrix']
+    for i in range(4):
+        for j in range(4):
+            assert sum(forward[i][k] * backward[k][j] for k in range(4)) == pytest.approx(
+                1. if i == j else 0., abs=1e-9)
+
+
+def test_urdf_unknown_links_and_dynamic_joint_chain_fail_closed():
+    from pathlib import Path
+    from common.slam_input import calibrated_urdf_mount
+    urdf = Path(__file__).resolve().parents[1] / 'unitree/g1/resource/g1_model.urdf'
+    with pytest.raises(ValueError, match='URDF does not contain'):
+        calibrated_urdf_mount(urdf, 'source_imu', 'livox_native')
+    with pytest.raises(ValueError, match='not joined by a fixed chain'):
+        calibrated_urdf_mount(urdf, 'pelvis', 'mid360_link')
+    with pytest.raises(ValueError, match='cannot be assigned'):
+        calibrated_urdf_mount(urdf, 'torso_link', 'torso_link',
+                              urdf_child_frame='mid360_link')
+
+
+def test_urdf_bad_origin_does_not_produce_calibrated_mount(tmp_path):
+    from common.slam_input import calibrated_urdf_mount
+    path = tmp_path / 'invalid.urdf'
+    path.write_text(
+        '<robot name="test"><link name="a"/><link name="b"/>'
+        '<joint name="bad" type="fixed">'
+        '<parent link="a"/><child link="b"/>'
+        '<origin xyz="nan 0 0" rpy="0 0 0"/>'
+        '</joint></robot>')
+    with pytest.raises(ValueError, match='nonfinite'):
+        calibrated_urdf_mount(path, 'a', 'b')

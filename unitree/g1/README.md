@@ -25,6 +25,10 @@
 
 旧 `slam` 插件默认关闭。独立 `motion_control` 卡片入口已移除；双臂遥操使用 `teleop_control`。旧配置显式启用 `motion_control` 时，驱动会报迁移错误。
 
+## SLAM 传感器采集与外参
+
+G1 的原生点云、里程计输入与已测试 URDF 固定外参参见 [SLAM 离线适配与数据采集](SLAM_CAPTURE.md)。URDF 的标定标志不代表里程计跟踪、时钟关系或 RTAB-Map 已通过实机验收。
+
 ## 构建
 
 G1 使用 `unitree/g1/Dockerfile`，默认从 `bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest` 安装系统库、数值依赖、Pinocchio wheel 和 CycloneDDS，再复制业务源码。普通 pip 依赖统一维护在 `requirements.txt`，Dockerfile 在编译 CycloneDDS 库后通过 `pip install -r` 安装，包括从源码安装其 Python 绑定。依赖步骤位于业务源码 COPY 之前，正常构建可复用 Docker 缓存。

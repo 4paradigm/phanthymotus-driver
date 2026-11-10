@@ -1284,6 +1284,14 @@ class _LocoStateNode(Node):
             with self._lock:
                 self._mapping_error = str(exc)
 
+    def get_mapping_child_frame(self):
+        """Latest valid mapping pose child frame, never inferred from leg odom."""
+        with self._lock:
+            if self._mapping_adapter._continuity_latched:
+                return None
+            frames = self._mapping_adapter._frames
+            return frames[1] if frames else None
+
     def get_mapping_info(self, topic: str) -> dict:
         from copy import deepcopy
         with self._lock:
@@ -1390,6 +1398,7 @@ class LocoStatePlugin:
             "topic_out": [{"topic": self._odom_topic, "format": "data/json"},
                           {"topic": self._mapping_topic, "format": "state/odom"}],
             "input_metadata": self._node.get_mapping_info(self._mapping_topic)['input_metadata'],
+            "odom_interface": self._node._mapping_adapter.interface(),
         }
 
     def _motion_tool(self) -> dict:
@@ -1428,6 +1437,7 @@ class LocoStatePlugin:
             tool = self._odom_tool()
             return {"state": "running", "topic_out": tool['topic_out'],
                     "input_metadata": tool['input_metadata'],
+                    "odom_interface": tool['odom_interface'],
                     "mapping_odom": self._node.get_mapping_info(self._mapping_topic),
                     "native_snapshot": self._node.get_native_state(),
                     "slam_pose": {"available": False,
@@ -2637,9 +2647,31 @@ class _LidarNode(Node):
 class LidarPlugin:
     PREFIX = "lidar"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 pose_frame_provider=None):
+        from common.slam_input import calibrated_urdf_mount
         self._cloud_topic = f"/{namespace}/lidar/cloud"
         self._native_topic = f"/{namespace}/lidar/cloud_native"
+        self._pose_frame_provider = pose_frame_provider
+        self._urdf_path = Path(__file__).parent / "resource" / "g1_model.urdf"
+        self._urdf_frame_aliases = (plugin_config or {}).get('slam_urdf_frame_aliases') or {}
+        self._urdf_mount = None
+        self._urdf_mount_error = None
+        if (not isinstance(self._urdf_frame_aliases, dict) or
+                any(not isinstance(k, str) or not k.strip() or
+                    not isinstance(v, str) or not v.strip()
+                    for k, v in self._urdf_frame_aliases.items())):
+            self._urdf_mount_error = 'slam_urdf_frame_aliases must map real frame names to URDF links'
+            self._urdf_frame_aliases = {}
+        try:
+            # The operator has already verified this installed G1's URDF
+            # mount. Expose the model transform as calibrated, but attach it
+            # as a SLAM input only once both native source frames are known.
+            if self._urdf_mount_error is None:
+                self._urdf_mount = calibrated_urdf_mount(
+                    self._urdf_path, 'torso_link', 'mid360_link')
+        except (OSError, ValueError) as error:
+            self._urdf_mount_error = str(error)
         # Store optional operator measurements as UNVERIFIED diagnostics only.
         # Do not populate the authoritative 'extrinsic' input declaration.
         self._extrinsic_candidate = None
@@ -2667,6 +2699,31 @@ class LidarPlugin:
             candidate_error = ('candidate cloud frame differs from observed source header: ' +
                                str(source_header['frame_id']))
             candidate = None
+        calibrated = None
+        calibration_error = self._urdf_mount_error
+        cloud_frame = source_header.get('frame_id') if source_header else None
+        try:
+            pose_frame = (self._pose_frame_provider()
+                          if callable(self._pose_frame_provider) else None)
+            if self._urdf_mount is not None and pose_frame and cloud_frame:
+                from common.slam_input import calibrated_urdf_mount
+                calibrated = calibrated_urdf_mount(
+                    self._urdf_path, pose_frame, cloud_frame,
+                    urdf_parent_frame=self._urdf_frame_aliases.get(pose_frame),
+                    urdf_child_frame=self._urdf_frame_aliases.get(cloud_frame))
+                # A manually supplied transform cannot silently override the
+                # calibrated model. Conflicts require operator resolution.
+                if (candidate is not None and
+                        candidate['parent_frame'] == calibrated['parent_frame'] and
+                        candidate['child_frame'] == calibrated['child_frame'] and
+                        any(abs(candidate['matrix'][i][j] - calibrated['matrix'][i][j])
+                            > 1e-6 for i in range(4) for j in range(4))):
+                    calibrated = None
+                    calibration_error = 'manual candidate conflicts with calibrated G1 URDF'
+            elif self._urdf_mount is not None:
+                calibration_error = 'awaiting live odometry child frame and lidar header frame'
+        except (OSError, ValueError, TypeError) as error:
+            calibration_error = str(error)
         return {
             "name": "lidar_cloud",
             "type": "sensor",
@@ -2682,11 +2739,20 @@ class LidarPlugin:
                 source_type='sensor_msgs.msg.dds_.PointCloud2_',
                 frame_id=source_header['frame_id'] if source_header else None,
                 source_header=source_header,
+                extrinsic=calibrated,
                 extrinsic_candidate=candidate)],
+            "urdf_mount": deepcopy(self._urdf_mount),
+            "urdf_calibration_error": calibration_error,
             "extrinsic_candidate_error": candidate_error,
             "configSchema": {
                 "type": "object",
                 "properties": {
+                    "slam_urdf_frame_aliases": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": ("Explicit operator-confirmed mapping from exact native "
+                                        "frame_id to URDF link name; no inferred aliases"),
+                    },
                     "slam_extrinsic_candidate": {
                         "type": "object",
                         "title": "Unverified lidar-to-odometry transform candidate",
@@ -2722,6 +2788,8 @@ class LidarPlugin:
             return {"state": "running", "topic_out": tool['topic_out'],
                     "input_metadata": tool['input_metadata'], "native_error": self._node._native_error,
                     "display_error": self._node._display_error,
+                    "urdf_mount": tool['urdf_mount'],
+                    "urdf_calibration_error": tool['urdf_calibration_error'],
                     "extrinsic_candidate_error": tool['extrinsic_candidate_error']}
         return None
 

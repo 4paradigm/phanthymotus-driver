@@ -11,7 +11,7 @@ import math
 import time
 from uuid import uuid4
 
-from common.odom import DEFAULT_UNITS
+from common.odom import DEFAULT_UNITS, build_interface
 from common.slam_input import input_declaration
 
 
@@ -143,6 +143,21 @@ class MappingOdometry:
                                       continuity_quarantined=self._continuity_latched,
                                       received_monotonic_ns=received_monotonic_ns)
         return result
+
+    def interface(self):
+        """Describe a pose-only G1 source without claiming SLAM readiness.
+
+        This report is compatible with the generic motus.odom/1 interface,
+        but an unknown vendor tracking/clock/segment is not an available
+        motus_slam/1 pose. No twist axes or update rate are invented.
+        """
+        interface = build_interface(provides=[], frame='world',
+                                    rate_hz=0., pose_drift='unbounded')
+        interface['slam_pose'] = {
+            'available': False, 'profile': 'motus_slam/1',
+            'missing_facts': list(MISSING_FACTS),
+        }
+        return interface
 
     def declaration(self, topic):
         return input_declaration(

@@ -74,6 +74,7 @@ def runtime(monkeypatch):
                monotonic_ns=lambda: 800_000_000_000)
     monkeypatch.setattr(slam_input, 'time', clock)
     namespace = dict(Node=Node, String=Message, queue=queue, time=clock, json=json,
+                     __file__=str(DEVICE), Path=Path,
                      struct=struct, uuid4=uuid4, threading=NS(Thread=Thread, Lock=threading.Lock),
                      _LOW_LAT_QOS=object(), LIDAR_CLOUD_INTERVAL=.05,
                      QoSProfile=lambda **values: NS(**values),
@@ -447,7 +448,19 @@ def test_loco_info_retains_complete_native_facts_without_claiming_a_slam_pose(ru
         'foot_position_body': [.5]*12, 'foot_speed_body': [.6]*12,
         'path_point': [{'t_from_start': 1., 'x': 2., 'y': 3., 'yaw': 4., 'vx': 5., 'vy': 6., 'vyaw': 7.}]*10,
     }
-    assert 'odom_interface' not in info
+    odom_interface = info['odom_interface']
+    assert odom_interface['schema'] == 'motus.odom/1'
+    assert odom_interface['frame'] == 'world'
+    assert odom_interface['provides'] == []
+    assert odom_interface['rate_hz'] == 0.
+    assert odom_interface['pose_drift'] == 'unbounded'
+    assert odom_interface['slam_pose']['profile'] == 'motus_slam/1'
+    assert odom_interface['slam_pose']['available'] is False
+    from common.odom import parse_interface
+    parse_interface(odom_interface)
+    from common.spatial_slam import SpatialSlamError, validate_slam_capability
+    with pytest.raises(SpatialSlamError, match='availability'):
+        validate_slam_capability(odom_interface)
     assert info['mapping_odom']['available'] is False
     assert info['mapping_odom']['sample'] is None
 
@@ -703,3 +716,172 @@ def test_invalid_candidate_is_diagnostic_only_and_legacy_lidar_survives(runtime)
     plugin._node._on_cloud(cloud())
     drain(plugin._node)
     assert len(plugin._node.topics['/alpha/lidar/cloud']) == 1
+
+
+def test_slam_consumer_canonical_validator_never_admits_g1_packet(runtime):
+    from common.spatial_slam import (
+        SpatialSlamError, validate_input_port, validate_tracking_pose,
+        validate_frame_identity,
+    )
+    from test_g1_mapping_odom import message
+    _, plugin_cls = extract(runtime.namespace, '_LocoStateNode', 'LocoStatePlugin')
+    plugin = plugin_cls({}, 'alpha', NS(add_node=lambda _: None))
+    plugin._node._on_mapping_odom(message())
+    packet = json.loads(plugin._node.topics['/alpha/slam/mapping/odom'][-1].data)
+    with pytest.raises(SpatialSlamError, match='tracking pose'):
+        validate_tracking_pose(packet)
+    with pytest.raises(SpatialSlamError, match='clock_id'):
+        validate_input_port(plugin.get_tools()[0]['input_metadata'][0])
+    cloud_plugin = runtime.plugin({}, 'alpha', NS(add_node=lambda _: None))
+    cloud_plugin._node._on_cloud(cloud())
+    drain(cloud_plugin._node)
+    meta_packet = json.loads(cloud_plugin._node.topics[
+        '/alpha/lidar/cloud_native/metadata'][0].data)
+    with pytest.raises(SpatialSlamError, match='clock_id'):
+        validate_frame_identity(meta_packet, clock_id='unverified')
+
+
+def test_mapping_odom_info_reports_quarantine_without_claiming_segment(runtime):
+    from test_g1_mapping_odom import message
+    _, plugin_cls = extract(runtime.namespace, '_LocoStateNode', 'LocoStatePlugin')
+    plugin = plugin_cls({}, 'alpha', NS(add_node=lambda _: None))
+    plugin._node._on_mapping_odom(message(sec=27))
+    plugin._node._on_mapping_odom(message(sec=26))
+    info = plugin.dispatch('info', {})
+    observation = info['mapping_odom']['observation']
+    assert observation['continuity_quarantined'] is True
+    assert observation['possible_discontinuities'] == 1
+    assert observation['last_accepted_frames'] == ['source_map', 'source_imu']
+    assert observation['clock_epoch'] is None and observation['segment_id'] is None
+    assert info['odom_interface']['slam_pose']['available'] is False
+    assert info['mapping_odom']['sample']['pose'] is None
+
+
+def test_user_verified_g1_urdf_mount_admitted_when_real_frames_match(runtime):
+    plugin = runtime.plugin({}, 'alpha', NS(add_node=lambda _: None),
+                            pose_frame_provider=lambda: 'torso_link')
+    raw = cloud()
+    raw.header.frame_id = 'mid360_link'
+    plugin._node._on_cloud(raw)
+    info = plugin.dispatch('info', {})
+    d = info['input_metadata'][0]
+    mount = d['extrinsic']
+    assert mount is not None
+    assert mount['parent_frame'] == 'torso_link'
+    assert mount['child_frame'] == 'mid360_link'
+    assert mount['calibrated'] is True
+    assert mount['source'] == 'g1_model.urdf:operator_confirmed'
+    assert mount['version'].startswith('sha256:')
+    assert mount['matrix'][0][3] == pytest.approx(.0002835)
+    assert mount['matrix'][1][3] == pytest.approx(.00003)
+    assert mount['matrix'][2][3] == pytest.approx(.40618)
+    assert mount['matrix'][0][2] == pytest.approx(.04013179, abs=2e-5)
+    assert mount['calibration_evidence'] == 'operator_confirmed_prior_g1_test'
+    assert info['urdf_mount']['calibrated'] is True
+    assert info['urdf_calibration_error'] is None
+    # An explicitly verified geometric transform is not proof of odometry or time.
+    assert d['clock_id'] is None and d['stamp_source'] is None
+    assert d['clock']['verified'] is False
+
+
+def test_explicit_urdf_frame_aliases_use_fixed_imu_to_lidar_chain(runtime):
+    plugin = runtime.plugin({
+        'slam_urdf_frame_aliases': {
+            'source_imu': 'imu_in_torso',
+            'livox_native': 'mid360_link',
+        },
+    }, 'alpha', NS(add_node=lambda _: None),
+       pose_frame_provider=lambda: 'source_imu')
+    raw = cloud()
+    raw.header.frame_id = 'livox_native'
+    plugin._node._on_cloud(raw)
+    info = plugin.dispatch('info', {})
+    mount = info['input_metadata'][0]['extrinsic']
+    assert mount['calibrated'] is True
+    assert mount['parent_frame'] == 'source_imu'
+    assert mount['child_frame'] == 'livox_native'
+    assert mount['urdf_frames'] == {'parent': 'imu_in_torso',
+                                    'child': 'mid360_link'}
+    assert mount['matrix'][0][3] == pytest.approx(.0398735)
+    assert mount['matrix'][1][3] == pytest.approx(.00227)
+    assert mount['matrix'][2][3] == pytest.approx(.26826)
+    assert info['urdf_calibration_error'] is None
+
+
+def test_unknown_native_frames_do_not_inherit_verified_model_mount(runtime):
+    plugin = runtime.plugin({}, 'alpha', NS(add_node=lambda _: None),
+                            pose_frame_provider=lambda: 'source_imu')
+    plugin._node._on_cloud(cloud())  # livox_native is not an URDF link
+    info = plugin.dispatch('info', {})
+    assert info['urdf_mount']['calibrated'] is True
+    assert info['input_metadata'][0]['extrinsic'] is None
+    assert 'URDF does not contain' in info['urdf_calibration_error']
+
+
+def test_dynamic_joint_chain_cannot_be_misdeclared_as_static_mount(runtime):
+    plugin = runtime.plugin({}, 'alpha', NS(add_node=lambda _: None),
+                            pose_frame_provider=lambda: 'pelvis')
+    raw = cloud()
+    raw.header.frame_id = 'mid360_link'
+    plugin._node._on_cloud(raw)
+    info = plugin.dispatch('info', {})
+    assert info['input_metadata'][0]['extrinsic'] is None
+    assert 'not joined by a fixed chain' in info['urdf_calibration_error']
+
+
+def test_conflicting_manual_candidate_cannot_override_calibrated_urdf(runtime):
+    plugin = runtime.plugin({
+        'slam_extrinsic_candidate': {
+            'parent_frame': 'torso_link', 'child_frame': 'mid360_link',
+            'source': 'operator_candidate', 'version': 'manual-v1',
+            'matrix': [[1, 0, 0, 0], [0, 1, 0, 0],
+                       [0, 0, 1, 0], [0, 0, 0, 1]],
+        },
+    }, 'alpha', NS(add_node=lambda _: None),
+       pose_frame_provider=lambda: 'torso_link')
+    raw = cloud()
+    raw.header.frame_id = 'mid360_link'
+    plugin._node._on_cloud(raw)
+    info = plugin.dispatch('info', {})
+    assert info['input_metadata'][0]['extrinsic'] is None
+    assert info['input_metadata'][0]['extrinsic_candidate']['calibrated'] is False
+    assert 'conflicts with calibrated G1 URDF' in info['urdf_calibration_error']
+
+
+def test_urdf_model_is_packaged_in_g1_image():
+    docker = (DEVICE.parent / 'Dockerfile').read_text()
+    assert 'COPY resource/' in docker
+    assert (DEVICE.parent / 'resource/g1_model.urdf').exists()
+
+
+def test_explicit_alias_is_bound_to_exact_source_frame_name(runtime):
+    plugin = runtime.plugin({
+        'slam_urdf_frame_aliases': {
+            'source_imu': 'imu_in_torso',
+            'livox_native': 'mid360_link',
+        },
+    }, 'alpha', NS(add_node=lambda _: None),
+       pose_frame_provider=lambda: 'source_imu')
+    plugin._node._on_cloud(cloud())
+    first = plugin.dispatch('info', {})['input_metadata'][0]
+    assert first['extrinsic']['calibrated'] is True
+    changed = cloud()
+    changed.header.frame_id = 'another_livox_frame'
+    plugin._node._on_cloud(changed)  # header observation precedes throttling
+    info = plugin.dispatch('info', {})
+    assert info['input_metadata'][0]['extrinsic'] is None
+    assert 'URDF does not contain' in info['urdf_calibration_error']
+
+
+def test_invalid_urdf_alias_config_never_admits_calibrated_input(runtime):
+    plugin = runtime.plugin({
+        'slam_urdf_frame_aliases': {'source_imu': 37},
+    }, 'alpha', NS(add_node=lambda _: None),
+       pose_frame_provider=lambda: 'torso_link')
+    source = cloud()
+    source.header.frame_id = 'mid360_link'
+    plugin._node._on_cloud(source)
+    info = plugin.dispatch('info', {})
+    assert info['urdf_mount'] is None
+    assert 'slam_urdf_frame_aliases' in info['urdf_calibration_error']
+    assert info['input_metadata'][0]['extrinsic'] is None
