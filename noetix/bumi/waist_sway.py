@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Waist sway for Noetix Bumi — a standing patrol sway through the low-level joint stream.
 
-`waist_sway` is a background toggle, not a one-shot action: while enabled the
-robot keeps rotating its upper body left and right around the waist yaw, both
-when standing still and while the chassis cards (`loco`, `loco_relative_move`,
-`loco_servo`) are walking. Any action that needs the waist itself — the preset
-animations, teaching, posture changes, protection and fall states — switches
-the card off automatically, exactly like `loco` outranks `loco_servo`.
+`waist_sway` is a call-shaped action like `loco.move`, not a deploy-time
+configured toggle: the card is dropped onto a canvas bare, and every parameter
+— how long, how far, how fast — is given at call time (`start`). While
+running, the robot rotates its upper body left and right around the waist yaw,
+both when standing still and while the chassis cards (`loco`,
+`loco_relative_move`, `loco_servo`) are walking. Any action that needs the
+waist itself — the preset animations, teaching, posture changes, protection
+and fall states — stops the sway automatically, exactly like `loco` outranks
+`loco_servo`.
 
 ── why this card has to be low-level, and what that costs ────────────────────
 
@@ -38,17 +41,16 @@ no example mixes high- and low-level):
 The card is built to make all three observable from `info`: a waist tracking
 self-check reports whether the physical joint follows the command, and the
 release path records what the restore attempt saw. First runs belong at low
-amplitude with a person holding the e-stop, `dry_run` cleared deliberately.
+amplitude on the slow speed, with a person holding the e-stop.
 
 ── arbitration, mirroring the `loco` / `loco_servo` split ─────────────────────
 
-Chassis cards coexist with the sway by default (the whole point is swaying
-while walking). `suspend_during_loco` flips that to pause-and-resume for
-operators who want the chassis alone to own the robot while it moves. Body
-cards never coexist: `LocoPlugin` notifies this card from its dispatch entry
-points, and the supervisor also watches `workmode` so actions started from the
-vendor App get the same release. An explicit instruction outranks a background
-sway, never the other way round.
+Chassis cards coexist with the sway (the whole point is swaying while
+walking). Body cards never coexist: `LocoPlugin` notifies this card from its
+dispatch entry points, and the supervisor also watches `workmode` so actions
+started from the vendor App get the same release, and ends a timed sway when
+its duration elapses. An explicit instruction outranks a running sway, never
+the other way round.
 """
 
 from __future__ import annotations
@@ -86,21 +88,26 @@ _STAND_ANGLES = [
 _WAIST_SDK_NAME = "waist_1_joint"
 _EXPECTED_WAIST_HW_INDEX = 20
 
-# The vendor standing hold. `_ECHO_*` are the vendor damping-mode gains,
-# used for the experimental echo leg policy while the chassis walks.
+# The vendor standing hold, applied to every non-waist joint.
 _HOLD_KP = 10.0
 _HOLD_KD = 0.5
-_ECHO_KP = 0.0
-_ECHO_KD = 0.1
 
 # URDF waist_yaw_joint limit is ±1.57 rad; the operator ceiling stays below it.
 _WAIST_LIMIT_RAD = 1.57
 _MAX_AMPLITUDE_RAD = 1.2
-_MIN_AMPLITUDE_RAD = 0.05
-_MIN_PERIOD_S = 2.0
-_MAX_PERIOD_S = 60.0
-_MIN_RATE_HZ = 50.0
-_MAX_RATE_HZ = 500.0
+
+# Operator-facing parameters ride on the `start` action (configured on the
+# canvas after the card is dropped in, like `loco.move`'s velocities) — there
+# is deliberately no deploy-time configSchema. Speed is two presets rather
+# than a free period: a patrol sway has a "how fast does it feel" answer, not
+# a tuned number.
+_SPEED_PERIODS = {"slow": 8.0, "medium": 4.0}   # seconds per full left-right cycle
+_DEFAULT_SPEED = "slow"
+_DEFAULT_AMPLITUDE_DEG = 20.0
+_MIN_AMPLITUDE_DEG = 5.0
+_MAX_AMPLITUDE_DEG = 60.0
+_MAX_DURATION_S = 600.0
+_RATE_HZ = 500.0   # vendor example loop rate; fixed, not operator-facing
 
 # Workmode gate and the modes that mean somebody else owns the waist. Names
 # mirror device.py `_WORKMODE_NAMES` (kept local so this file loads without
@@ -137,26 +144,16 @@ class WaistSwayPlugin:
         self._executor = executor
         self._loco = loco_plugin
 
-        self._dry_run = bool(plugin_config.get("dry_run", True))
-        self._amplitude_rad = self._clamp_number(
-            plugin_config.get("amplitude_rad", 0.3),
-            _MIN_AMPLITUDE_RAD, _MAX_AMPLITUDE_RAD, "amplitude_rad", 0.3)
-        self._period_s = self._clamp_number(
-            plugin_config.get("period_s", 6.0),
-            _MIN_PERIOD_S, _MAX_PERIOD_S, "period_s", 6.0)
-        self._rate_hz = self._clamp_number(
-            plugin_config.get("rate_hz", 500.0),
-            _MIN_RATE_HZ, _MAX_RATE_HZ, "rate_hz", 500.0)
-        self._suspend_during_loco = bool(plugin_config.get("suspend_during_loco", False))
-        self._concurrent_legs = plugin_config.get("concurrent_legs", "stand_hold")
-        if self._concurrent_legs not in ("stand_hold", "echo"):
-            print(f"[waist_sway] unknown concurrent_legs "
-                  f"{self._concurrent_legs!r}; using stand_hold", flush=True)
-            self._concurrent_legs = "stand_hold"
+        # No deploy-time tuning: the operator parameters below are the `start`
+        # action's arguments, and these are just their pre-start defaults.
+        self._amplitude_rad = math.radians(_DEFAULT_AMPLITUDE_DEG)
+        self._period_s = _SPEED_PERIODS[_DEFAULT_SPEED]
+        self._speed = _DEFAULT_SPEED
+        self._end_time: float | None = None   # monotonic deadline; None = until stop
 
         self._lock = threading.RLock()
         self._enabled = False
-        self._state = "off"          # off|waiting_chassis|suspended|streaming|error
+        self._state = "off"          # off|streaming|error
         self._preempted_by: str | None = None
         self._last_error: str | None = None
         self._last_restore: dict | None = None
@@ -187,102 +184,61 @@ class WaistSwayPlugin:
             "type": "actuator",
             "multiInstance": False,
             "description": (
-                "Bumi 腰部巡视摆动（实验性）。enabled=true 期间机器人持续小幅来回转动"
-                "上身腰部 yaw：站立静止时摆动，loco / loco_relative_move / loco_servo 行走"
-                "期间默认继续发送。semantic_action / action_recording / stand_up_lie_prone "
-                "或保护、摔倒等占用腰部的动作一旦出现，卡片自动把 enabled 置为 false 并"
-                "释放腰部。实现走 SDK 低层 set_joint（高层 API 无腰部通道，行走与上身动画"
-                "在固件里互斥），以官方示例的站立角表做全 21 关节位置保持。注意：固件对"
-                "高层行走与低层关节流并存的仲裁未知——若低层被忽略则行走正常、腰部停转；"
-                "若低层生效则机器人保持站立、底盘命令可能失效。首次真机请保持小幅度、"
-                "有人看护并确保 App 急停可用；默认 dry_run=true 只计数不驱动电机。"
+                "Bumi 腰部巡视摆动（实验性）：开始后上身腰部 yaw 持续小幅来回转动，"
+                f"持续 duration_s 秒（0=直到 stop）。幅度、快慢、时长在调用时给定：单侧"
+                f"幅度 {_MIN_AMPLITUDE_DEG:g}–{_MAX_AMPLITUDE_DEG:g} 度，快慢分慢"
+                f"（约 {_SPEED_PERIODS['slow']:g} 秒一个来回）/中（约 "
+                f"{_SPEED_PERIODS['medium']:g} 秒一个来回）两档。站立静止时摆动，"
+                "loco / loco_relative_move / loco_servo 行走期间继续发送；"
+                "semantic_action / action_recording / stand_up_lie_prone 或保护、摔倒等"
+                "占用腰部的动作一旦出现，自动停止并释放腰部（preempted_by 记录原因）。"
+                "实现走 SDK 低层 set_joint（高层无腰部通道，行走与上身动画在固件互斥），"
+                "以官方示例站立角表做全 21 关节位置保持。注意：固件对高层行走与低层关节"
+                "流并存的仲裁未知——若低层被忽略则行走正常、腰部停转；若低层生效则机器"
+                "人保持站立、底盘命令可能失效。首次真机请小幅度、慢档、有人看护并确保 "
+                "App 急停可用。"
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["set", "start", "stop", "info", "config"],
-                        "description": "set=开关摆动；start/stop=set true/false 的别名；"
-                                       "info=查看状态；config=运行时改参数",
+                        "enum": ["start", "stop", "info"],
+                        "description": "start=按参数开始摆动；stop=幅度归零后停止并释放；"
+                                       "info=查看状态",
                     },
-                    "enabled": {
-                        "type": "boolean",
-                        "description": "set 动作：true 开启持续摆动（机器人须处于行走模式"
-                                       "站立），false 释放腰部并恢复高层行走模式",
+                    "duration_s": {
+                        "type": "number", "minimum": 0, "maximum": _MAX_DURATION_S,
+                        "description": "来回转身持续时间（秒，默认 0=持续到 stop）；"
+                                       "到时自动收尾并释放腰部",
                     },
-                    "confirm": {
-                        "type": "boolean",
-                        "description": "config 动作关闭 dry_run 时必须传 true，确认允许"
-                                       "真实电机输出",
+                    "amplitude_deg": {
+                        "type": "number",
+                        "minimum": _MIN_AMPLITUDE_DEG, "maximum": _MAX_AMPLITUDE_DEG,
+                        "description": f"转身幅度（度，单侧，默认 {_DEFAULT_AMPLITUDE_DEG:g}）。"
+                                       "首周期从 0 渐入；首次真机建议不超过 30 度",
+                    },
+                    "speed": {
+                        "type": "string", "enum": list(_SPEED_PERIODS),
+                        "description": "转身快慢两档：slow=慢（约 8 秒一个来回，默认），"
+                                       "medium=中（约 4 秒一个来回）",
                     },
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "set": {
-                        "params": ["enabled"],
-                        "description": "开启/关闭持续摆动。开启要求机器人已站立"
-                                       "（workmode=2）；被占用腰部的动作抢占后会自动变回 "
-                                       "false，info 里 preempted_by 记录原因",
+                    "start": {
+                        "params": ["duration_s", "amplitude_deg", "speed"],
+                        "description": "按参数开始摆动；再次调用会先收尾当前摆动再按新参数"
+                                       "重启。要求机器人处于行走模式站立（workmode=2）",
                     },
-                    "start": {"params": [], "description": "等同 set enabled=true"},
-                    "stop": {"params": [], "description": "等同 set enabled=false：幅度归零"
-                                                         "后停止并释放腰部"},
-                    "info": {"params": [], "description": "状态、腰跟踪自检、恢复结果"},
-                    "config": {
-                        "params": ["amplitude_rad", "period_s", "rate_hz",
-                                   "suspend_during_loco", "concurrent_legs",
-                                   "dry_run", "confirm"],
-                        "description": "运行时改参数，立即生效（rate_hz 下次开启生效）",
-                    },
+                    "stop": {"params": [], "description": "幅度归零后停止并释放腰部"},
+                    "info": {"params": [], "description": "状态、剩余时间、腰跟踪自检、"
+                                                         "恢复结果"},
                 },
                 "x-hooks": {"on_interrupt_motion": {"action": "stop"},
                              "on_interrupt_all": {"action": "stop"}},
                 "x-is-dangerous": True,
                 "x-resource": ["waist"],
-            },
-            "configSchema": {
-                "type": "object",
-                "properties": {
-                    "dry_run": {
-                        "type": "boolean", "default": True,
-                        "description": "空跑：照常读状态、构造并发计数，但不调用 SDK —— "
-                                       "机器人不会动。真机确认场地与看护后在卡片上关闭"
-                                       "（需 confirm=true，立即生效）",
-                    },
-                    "amplitude_rad": {
-                        "type": "number", "default": 0.3,
-                        "minimum": _MIN_AMPLITUDE_RAD, "maximum": _MAX_AMPLITUDE_RAD,
-                        "description": "腰部摆动幅度（弧度，单侧）。硬上限 "
-                                       f"{_MAX_AMPLITUDE_RAD}（URDF 限位 ±1.57），"
-                                       "首周期从 0 渐入。首次真机建议 ≤0.3",
-                    },
-                    "period_s": {
-                        "type": "number", "default": 6.0,
-                        "minimum": _MIN_PERIOD_S, "maximum": _MAX_PERIOD_S,
-                        "description": "一个完整来回的周期（秒）",
-                    },
-                    "rate_hz": {
-                        "type": "number", "default": 500.0,
-                        "minimum": _MIN_RATE_HZ, "maximum": _MAX_RATE_HZ,
-                        "description": "低层指令发送频率，对齐官方示例 500 Hz；下次开启生效",
-                    },
-                    "suspend_during_loco": {
-                        "type": "boolean", "default": False,
-                        "description": "true 时底盘动作（loco / loco_relative_move / "
-                                       "loco_servo）启动即暂停摆动、结束后自动恢复；"
-                                       "false（默认）行走期间继续发送低层流 —— 并存行为"
-                                       "属固件未知，见卡片描述",
-                    },
-                    "concurrent_legs": {
-                        "type": "string", "default": "stand_hold",
-                        "description": "并发期非腰关节策略：stand_hold=继续发站立角表"
-                                       "（若固件低层生效，机器人保持站立、底盘命令可能"
-                                       "失效，但不失稳）；echo=随实测位姿近零增益回发"
-                                       "（唯一可能真正边走边转的档，但若固件是全局低层"
-                                       "模式，腿部失撑可能摔倒 —— 仅吊架/看护下实验）",
-                    },
-                },
             },
             "topic_out": [],
         }
@@ -310,7 +266,8 @@ class WaistSwayPlugin:
         self._supervisor_stop.set()
         with self._lock:
             self._enabled = False
-        self._release(0.0, "plugin_stop", full=True, target="off")
+            self._end_time = None
+        self._release(0.0, "plugin_stop")
         thread = self._supervisor_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
@@ -319,37 +276,72 @@ class WaistSwayPlugin:
     # ── actions ──────────────────────────────────────────────────────────────
 
     def dispatch(self, action: str, args: dict):
-        if action == "set":
-            return self._set_action(args)
         if action == "start":
-            return self._set_enabled(True)
+            return self._start_action(args)
         if action == "stop":
-            return self._set_enabled(False)
+            return self._stop_action()
         if action == "info":
             return self._info()
-        if action == "config":
-            return self._config(args)
         return None
 
-    def _set_action(self, args: dict) -> dict:
-        raw = args.get("enabled")
-        if not isinstance(raw, bool):
+    def _start_action(self, args: dict) -> dict:
+        raw_duration = args.get("duration_s", 0)
+        try:
+            duration_s = float(raw_duration)
+        except (TypeError, ValueError):
             return {"state": "error",
-                    "error": "set requires enabled=true or enabled=false"}
-        return self._set_enabled(raw)
+                    "error": f"duration_s 必须是数字，收到 {raw_duration!r}"}
+        if isinstance(raw_duration, bool) or not math.isfinite(duration_s) \
+                or not 0.0 <= duration_s <= _MAX_DURATION_S:
+            return {"state": "error",
+                    "error": f"duration_s 必须在 0 与 {_MAX_DURATION_S:g} 秒之间"
+                             "（0=持续到 stop）"}
 
-    def _set_enabled(self, enabled: bool) -> dict:
-        if enabled:
-            with self._lock:
-                self._enabled = True
-                self._preempted_by = None
-                self._last_error = None
-                self._waist_tracking = "unknown"
-            return self._try_engage()
+        raw_amplitude = args.get("amplitude_deg", _DEFAULT_AMPLITUDE_DEG)
+        try:
+            amplitude_deg = float(raw_amplitude)
+        except (TypeError, ValueError):
+            return {"state": "error",
+                    "error": f"amplitude_deg 必须是数字，收到 {raw_amplitude!r}"}
+        if isinstance(raw_amplitude, bool) or not math.isfinite(amplitude_deg) \
+                or not _MIN_AMPLITUDE_DEG <= amplitude_deg <= _MAX_AMPLITUDE_DEG:
+            return {"state": "error",
+                    "error": f"amplitude_deg 必须在 {_MIN_AMPLITUDE_DEG:g} 与 "
+                             f"{_MAX_AMPLITUDE_DEG:g} 度之间（单侧）"}
+
+        speed = args.get("speed", _DEFAULT_SPEED)
+        if speed not in _SPEED_PERIODS:
+            return {"state": "error",
+                    "error": f"speed 只能是 slow（慢）或 medium（中），收到 {speed!r}"}
+
+        with self._lock:
+            streaming = (self._stream_thread is not None
+                         and self._stream_thread.is_alive())
+        if streaming:
+            # A start while streaming replaces the running sway: quick
+            # wind-down first, then the fresh parameters engage a new stream —
+            # the same "a new instruction replaces the old one" rule as
+            # `loco.move` restarting the chassis.
+            self._release(_PREEMPT_WIND_DOWN_S, "restart")
+
+        with self._lock:
+            self._enabled = True
+            self._preempted_by = None
+            self._last_error = None
+            self._waist_tracking = "unknown"
+            self._amplitude_rad = math.radians(amplitude_deg)
+            self._period_s = _SPEED_PERIODS[speed]
+            self._speed = speed
+            self._end_time = (time.monotonic() + duration_s
+                              if duration_s > 0 else None)
+        return self._try_engage()
+
+    def _stop_action(self) -> dict:
         with self._lock:
             self._enabled = False
             self._preempted_by = None
-        restore = self._release(_WIND_DOWN_S, "stop", full=True, target="off")
+            self._end_time = None
+        restore = self._release(_WIND_DOWN_S, "stop")
         return {"state": "off", "restore": self._restore_summary(restore)}
 
     # ── engage / release ─────────────────────────────────────────────────────
@@ -374,11 +366,6 @@ class WaistSwayPlugin:
                 # its bookkeeping; reap it so two loops can never overlap.
                 self._stream_thread.join(timeout=0.5)
                 self._stream_thread = None
-            if self._suspend_during_loco and self._chassis_busy_now_locked():
-                self._state = "waiting_chassis"
-                return {"state": "waiting_chassis",
-                        "message": "chassis card active and suspend_during_loco "
-                                   "is on; the sway will engage once it is idle"}
             self._state = "streaming"
             self._wind_down_end = None
             stop_event = threading.Event()
@@ -388,11 +375,11 @@ class WaistSwayPlugin:
                 daemon=True, name="bumi_waist_sway_stream")
             self._stream_thread = thread
         thread.start()
-        print(f"[waist_sway] stream engaged (dry_run={self._dry_run}, "
-              f"amplitude={self._amplitude_rad} rad, period={self._period_s} s, "
-              f"rate={self._rate_hz:g} Hz)", flush=True)
-        return {"state": "streaming", "dry_run": self._dry_run,
-                "amplitude_rad": self._amplitude_rad, "period_s": self._period_s}
+        print(f"[waist_sway] stream engaged (amplitude={self._amplitude_rad:.3f} rad, "
+              f"period={self._period_s:g} s, rate={_RATE_HZ:g} Hz, "
+              f"duration={'until stop' if self._end_time is None else 'timed'})",
+              flush=True)
+        return {"state": "streaming"}
 
     def _engage_refused(self, message: str) -> dict:
         with self._lock:
@@ -401,15 +388,9 @@ class WaistSwayPlugin:
             self._last_error = message
         return {"state": "error", "enabled": False, "error": message}
 
-    def _release(self, graceful_s: float, reason: str, *, full: bool,
-                 target: str) -> dict | None:
+    def _release(self, graceful_s: float, reason: str) -> dict | None:
         """Stop the stream thread (optionally winding amplitude down), then
-        restore high-level walking mode if this card ever really streamed.
-
-        `full=False` limits the restore to the fast path (mode already 2): it
-        is used when a chassis action is about to run and must not have a
-        mode-preparation sequence cancel rotations out from under it.
-        """
+        restore high-level walking mode if this card ever really streamed."""
         with self._lock:
             thread = self._stream_thread
             stop_event = self._stop_event
@@ -423,9 +404,9 @@ class WaistSwayPlugin:
         if not alive:
             # Nothing to join; restore first, then settle the state so a slow
             # mode-preparation sequence does not run under the lock.
-            restore = self._restore(reason, full=full)
+            restore = self._restore(reason)
             with self._lock:
-                self._settle_state(target)
+                self._settle_off()
             return restore
         thread.join(timeout=graceful_s + 3.0)
         if thread.is_alive():
@@ -440,21 +421,19 @@ class WaistSwayPlugin:
                 self._last_error = "stream thread did not stop during release"
                 return None
             self._stream_thread = None
-            self._settle_state(target)
-        return self._restore(reason, full=full)
+            self._settle_off()
+        return self._restore(reason)
 
-    def _settle_state(self, target: str) -> None:
-        """After a release: keep errors visible, otherwise land on `target`.
+    def _settle_off(self) -> None:
+        """After a release: keep errors visible, otherwise land on off.
 
-        Caller holds the lock. An enabled card that released for a chassis
-        action parks in `suspended`; a disabled one goes to the target state.
-        """
+        Caller holds the lock."""
         if self._state == "error":
             return
-        if not self._enabled or target == "suspended":
-            self._state = target
+        if not self._enabled:
+            self._state = "off"
 
-    def _restore(self, reason: str, *, full: bool) -> dict | None:
+    def _restore(self, reason: str) -> dict | None:
         """Hand the robot back to the high-level walking controller.
 
         Consumed exactly once per streaming session: `_restore_needed` is set
@@ -463,17 +442,13 @@ class WaistSwayPlugin:
         both run a mode-preparation sequence.
         """
         with self._lock:
-            if not self._restore_needed or self._dry_run:
+            if not self._restore_needed:
                 return None
             self._restore_needed = False
         mode = self._read_mode()
         if mode == 2:
             result = {"state": "completed", "workmode": 2,
                       "note": "already in walking mode"}
-        elif not full:
-            result = {"state": "skipped", "workmode": mode,
-                      "note": "fast path only: not walking, leaving the mode "
-                              "to the chassis action about to run"}
         elif self._loco is not None and hasattr(self._loco, "prepare_walk_mode"):
             result = self._loco.prepare_walk_mode(f"waist_sway.{reason}")
         else:
@@ -488,7 +463,7 @@ class WaistSwayPlugin:
     # ── notifications from the sibling cards ─────────────────────────────────
 
     def disable_for_body_action(self, label: str) -> bool:
-        """An action that needs the waist is about to run: switch off now.
+        """An action that needs the waist is about to run: stop now.
 
         Returns whether this card was enabled or streaming, so the caller can
         say so in its own result. Mirrors `loco_servo.pause_for_explicit_command`.
@@ -500,35 +475,28 @@ class WaistSwayPlugin:
                 return False
             self._enabled = False
             self._preempted_by = label
+            self._end_time = None
         print(f"[waist_sway] disabled by {label}", flush=True)
-        restore = self._release(_PREEMPT_WIND_DOWN_S, label, full=True, target="off")
+        restore = self._release(_PREEMPT_WIND_DOWN_S, label)
         self._last_preempt_restore = self._restore_summary(restore)
         return True
 
     def notify_chassis_active(self, label: str) -> None:
-        """A chassis card started driving the robot."""
+        """A chassis card started driving the robot.
+
+        The sway keeps streaming (the whole point is swaying while walking);
+        the label only gates the tracking self-check, because a firmware that
+        ignores the low-level stream *during* walking is an expected outcome,
+        not a fault.
+        """
         with self._lock:
-            if self._chassis_active == label:
-                return
             self._chassis_active = label
-            suspend = self._suspend_during_loco
-            streaming = (self._stream_thread is not None
-                         and self._stream_thread.is_alive())
-        if suspend and streaming:
-            print(f"[waist_sway] suspended for {label}", flush=True)
-            self._release(_PREEMPT_WIND_DOWN_S, f"chassis:{label}",
-                          full=False, target="suspended")
 
     def notify_chassis_idle(self, label: str) -> None:
         """A chassis card stopped driving the robot."""
         with self._lock:
-            if self._chassis_active not in (None, label):
-                return   # another chassis action still owns the slot
-            self._chassis_active = None
-            enabled = self._enabled
-            state = self._state
-        if enabled and state in ("waiting_chassis", "suspended"):
-            self._try_engage()
+            if self._chassis_active in (None, label):
+                self._chassis_active = None
 
     # ── supervisor ───────────────────────────────────────────────────────────
 
@@ -539,7 +507,7 @@ class WaistSwayPlugin:
                 self._workmode = mode
                 enabled = self._enabled
                 state = self._state
-                suspend = self._suspend_during_loco
+                end_time = self._end_time
             if mode is not None and mode in _BODY_MODES:
                 # Covers everything the dispatch hooks cannot see: preset
                 # actions and teaching started from the vendor App, protection,
@@ -550,26 +518,14 @@ class WaistSwayPlugin:
                 continue
             if not enabled:
                 continue
-            if state in ("waiting_chassis", "suspended"):
-                if not self._chassis_busy_now():
-                    self._try_engage()
-            elif state == "streaming" and suspend and self._chassis_busy_now():
-                self._release(_PREEMPT_WIND_DOWN_S, "chassis_busy",
-                              full=False, target="suspended")
-
-    def _chassis_busy_now(self) -> bool:
-        with self._lock:
-            if self._chassis_active is not None:
-                return True
-        loco = self._loco
-        return bool(loco is not None and getattr(loco, "is_chassis_busy", lambda: False)())
-
-    def _chassis_busy_now_locked(self) -> bool:
-        # Caller holds self._lock (RLock); reuse the same facts.
-        if self._chassis_active is not None:
-            return True
-        loco = self._loco
-        return bool(loco is not None and getattr(loco, "is_chassis_busy", lambda: False)())
+            if (end_time is not None and time.monotonic() > end_time
+                    and state == "streaming"):
+                # Duration elapsed: graceful wind-down and hand-back, the same
+                # path an operator `stop` takes.
+                with self._lock:
+                    self._enabled = False
+                    self._end_time = None
+                self._release(_WIND_DOWN_S, "duration_elapsed")
 
     # ── the stream ───────────────────────────────────────────────────────────
 
@@ -585,7 +541,7 @@ class WaistSwayPlugin:
                 "cannot map the vendor stand pose through getJointsIndex; "
                 "refusing to command an unmapped joint table")
             return
-        tick_s = 1.0 / self._rate_hz
+        tick_s = 1.0 / _RATE_HZ
         start = time.perf_counter()
         measured = self._read_positions(low) or [0.0] * 21
         start_pose = list(measured)
@@ -597,7 +553,6 @@ class WaistSwayPlugin:
                 with self._lock:
                     amplitude = self._amplitude_rad
                     sway_period = self._period_s
-                    legs_mode = self._concurrent_legs
                     chassis_busy = self._chassis_active is not None
                     wind_down_end = self._wind_down_end
                 scale = min(1.0, t / sway_period) if sway_period > 0 else 1.0
@@ -614,7 +569,6 @@ class WaistSwayPlugin:
                 fresh = self._read_positions(low)
                 if fresh is not None:
                     measured = fresh
-                echo = chassis_busy and legs_mode == "echo"
 
                 cmds = []
                 for i in range(21):
@@ -626,16 +580,6 @@ class WaistSwayPlugin:
                         cmd.kp = _HOLD_KP
                         cmd.kd = _HOLD_KD
                         cmd.tau = 0.0
-                    elif echo:
-                        # Experimental: near-zero gains tracking the measured
-                        # pose, so a per-joint firmware merge leaves the legs
-                        # to the walk controller. If the firmware is global
-                        # low-mode this damps the legs instead of holding them.
-                        cmd.pos = float(measured[i])
-                        cmd.vel = 0.0
-                        cmd.kp = _ECHO_KP
-                        cmd.kd = _ECHO_KD
-                        cmd.tau = 0.0
                     else:
                         cmd.pos = float(start_pose[i] * (1.0 - blend)
                                         + table[i] * blend)
@@ -644,37 +588,32 @@ class WaistSwayPlugin:
                         cmd.kd = _HOLD_KD
                         cmd.tau = 0.0
                     cmds.append(cmd)
-                if self._dry_run:
-                    with self._lock:
-                        self._cmds_sent += 1
-                        self._waist_tracking = "dry_run"
-                else:
-                    low.set_joint(cmds)
-                    with self._lock:
-                        self._cmds_sent += 1
-                        self._restore_needed = True
-                    # Self-check only while idle: during concurrent walking the
-                    # firmware ignoring the stream is an expected outcome, not
-                    # a fault worth tearing the card down for.
-                    if not chassis_busy:
-                        error = abs(float(measured[waist]) - waist_cmd)
-                        if error > _TRACKING_TOLERANCE_RAD:
-                            if tracking_bad_since is None:
-                                tracking_bad_since = time.monotonic()
-                            elif (time.monotonic() - tracking_bad_since
-                                  > _TRACKING_GRACE_S):
-                                with self._lock:
-                                    self._waist_tracking = "not_tracking"
-                                self._on_stream_error(
-                                    f"waist is not tracking (|measured-command| = "
-                                    f"{error:.2f} rad for over {_TRACKING_GRACE_S:g} s); "
-                                    "the firmware is likely ignoring the low-level "
-                                    "stream")
-                                return
-                        else:
-                            tracking_bad_since = None
+                low.set_joint(cmds)
+                with self._lock:
+                    self._cmds_sent += 1
+                    self._restore_needed = True
+                # Self-check only while the chassis is idle: during walking the
+                # firmware ignoring the stream is an expected outcome, not a
+                # fault worth tearing the card down for.
+                if not chassis_busy:
+                    error = abs(float(measured[waist]) - waist_cmd)
+                    if error > _TRACKING_TOLERANCE_RAD:
+                        if tracking_bad_since is None:
+                            tracking_bad_since = time.monotonic()
+                        elif (time.monotonic() - tracking_bad_since
+                              > _TRACKING_GRACE_S):
                             with self._lock:
-                                self._waist_tracking = "ok"
+                                self._waist_tracking = "not_tracking"
+                            self._on_stream_error(
+                                f"waist is not tracking (|measured-command| = "
+                                f"{error:.2f} rad for over {_TRACKING_GRACE_S:g} s); "
+                                "the firmware is likely ignoring the low-level "
+                                "stream")
+                            return
+                    else:
+                        tracking_bad_since = None
+                        with self._lock:
+                            self._waist_tracking = "ok"
                 spent = time.perf_counter() - now
                 if spent < tick_s:
                     time.sleep(tick_s - spent)
@@ -688,7 +627,7 @@ class WaistSwayPlugin:
             self._last_error = message
             self._stream_thread = None
         print(f"[waist_sway] stream error: {message}", flush=True)
-        self._restore("stream_error", full=True)
+        self._restore("stream_error")
 
     # ── SDK access ───────────────────────────────────────────────────────────
 
@@ -762,77 +701,22 @@ class WaistSwayPlugin:
         except Exception:                                     # noqa: BLE001
             return None
 
-    # ── config / info ────────────────────────────────────────────────────────
-
-    _NUMERIC_FIELDS = {
-        "amplitude_rad": (_MIN_AMPLITUDE_RAD, _MAX_AMPLITUDE_RAD),
-        "period_s": (_MIN_PERIOD_S, _MAX_PERIOD_S),
-        "rate_hz": (_MIN_RATE_HZ, _MAX_RATE_HZ),
-    }
-
-    def _config(self, args: dict) -> dict:
-        changed = {}
-        with self._lock:
-            if ("dry_run" in args and self._dry_run
-                    and not bool(args["dry_run"])
-                    and args.get("confirm") is not True):
-                return {"ok": False, "state": self._state,
-                        "error": "关闭 dry_run 需要确认：场地无人、有人看护、"
-                                 "App 急停可用时传 confirm=true"}
-            for field, (low_bound, high_bound) in self._NUMERIC_FIELDS.items():
-                if field not in args:
-                    continue
-                try:
-                    value = float(args[field])
-                except (TypeError, ValueError):
-                    return {"ok": False, "error": f"{field} 必须是数字"}
-                if not math.isfinite(value) or not low_bound <= value <= high_bound:
-                    return {"ok": False,
-                            "error": f"{field} 必须在 {low_bound} 与 {high_bound} 之间"}
-                attr = f"_{field}"
-                if getattr(self, attr) != value:
-                    setattr(self, attr, value)
-                    changed[field] = value
-            if "dry_run" in args:
-                new = bool(args["dry_run"])
-                if self._dry_run != new:
-                    self._dry_run = new
-                    changed["dry_run"] = new
-            if "suspend_during_loco" in args:
-                new = bool(args["suspend_during_loco"])
-                if self._suspend_during_loco != new:
-                    self._suspend_during_loco = new
-                    changed["suspend_during_loco"] = new
-            if "concurrent_legs" in args:
-                new = args["concurrent_legs"]
-                if new not in ("stand_hold", "echo"):
-                    return {"ok": False,
-                            "error": "concurrent_legs 只能是 stand_hold 或 echo"}
-                if self._concurrent_legs != new:
-                    self._concurrent_legs = new
-                    changed["concurrent_legs"] = new
-            state = self._state
-        if changed:
-            print(f"[waist_sway] config changed while {state}: "
-                  + ", ".join(f"{k}={v}" for k, v in changed.items()), flush=True)
-        return {"ok": True, "state": state, **changed,
-                "note": "rate_hz 在下次开启时生效" if "rate_hz" in changed else ""}
+    # ── info ─────────────────────────────────────────────────────────────────
 
     def _info(self) -> dict:
         with self._lock:
             mode = self._workmode
+            remaining = (None if self._end_time is None
+                         else max(0.0, self._end_time - time.monotonic()))
             return {
                 "state": self._state,
-                "enabled": self._enabled,
+                "amplitude_deg": round(math.degrees(self._amplitude_rad), 1),
+                "speed": self._speed,
+                "period_s": self._period_s,
+                "remaining_s": (None if remaining is None else round(remaining, 1)),
                 "preempted_by": self._preempted_by,
                 "last_error": self._last_error,
                 "last_restore": self._last_restore,
-                "dry_run": self._dry_run,
-                "amplitude_rad": self._amplitude_rad,
-                "period_s": self._period_s,
-                "rate_hz": self._rate_hz,
-                "suspend_during_loco": self._suspend_during_loco,
-                "concurrent_legs": self._concurrent_legs,
                 "chassis_active": self._chassis_active,
                 "workmode": ({"code": mode,
                               "name": _WORKMODE_NAMES.get(mode, "unknown")}
@@ -849,13 +733,3 @@ class WaistSwayPlugin:
             return None
         return {key: restore.get(key) for key in ("state", "workmode", "error", "note")
                 if key in restore}
-
-    @staticmethod
-    def _clamp_number(raw, low_bound, high_bound, name, default):
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            return default
-        if not math.isfinite(value):
-            return default
-        return max(low_bound, min(high_bound, value))

@@ -445,18 +445,6 @@ class LocoPlugin:
         return bool((thread is not None and thread.is_alive())
                     or self._rotate_state["state"] == "running" or self._body_action)
 
-    def is_chassis_busy(self) -> bool:
-        """Whether this plugin or the streaming card currently drives the chassis.
-
-        `waist_sway` asks before it engages or resumes: with
-        `suspend_during_loco` on, a chassis in flight must not get a low-level
-        joint stream landing on top of it.
-        """
-        if self.is_moving():
-            return True
-        servo = self._servo
-        return bool(servo is not None and getattr(servo, "is_active", lambda: False)())
-
     def publish_velocity(self, x: float, y: float, z: float) -> None:
         """One normalised velocity command, through this plugin's rate limiter.
 

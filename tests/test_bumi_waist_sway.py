@@ -1,8 +1,9 @@
 """Waist sway card tests — no robot, no ROS, no Noetix SDK at module level.
 
-The card streams low-level joint commands, so the tests fake `lowcontrol_py`
-(the SDK module the card imports lazily inside its stream thread) and drive
-the state machine through the same entry points the sibling cards use.
+The card is call-shaped (like `loco.move`): parameters ride on the `start`
+action. The tests fake `lowcontrol_py` (the SDK module the card imports
+lazily inside its stream thread) and drive the state machine through the
+same entry points the sibling cards use.
 
 Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_bumi_waist_sway.py -q
 """
@@ -10,6 +11,7 @@ Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_bumi_waist_swa
 from __future__ import annotations
 
 import importlib.util
+import math
 import sys
 import time
 import types
@@ -128,12 +130,8 @@ class FakeHighCtrl:
 
 
 class FakeLoco:
-    def __init__(self, busy=False):
-        self.busy = busy
+    def __init__(self):
         self.prepare_calls = []
-
-    def is_chassis_busy(self):
-        return self.busy
 
     def prepare_walk_mode(self, requester):
         self.prepare_calls.append(requester)
@@ -145,16 +143,14 @@ def make_card(ws, monkeypatch):
     """Build a started card plus its fakes; every card is stopped on teardown."""
     made = []
 
-    def _make(*, high=None, loco=None, low=None, **config):
+    def _make(*, high=None, loco=None, low=None):
         low = low or FakeLowController()
         fake_module = types.ModuleType("lowcontrol_py")
         fake_module.LowController = FakeLowController
         fake_module.MotorCmd = FakeMotorCmd
         monkeypatch.setitem(sys.modules, "lowcontrol_py", fake_module)
-        config.setdefault("dry_run", False)
-        config.setdefault("rate_hz", 200.0)
         high = high or FakeHighCtrl()
-        card = ws.WaistSwayPlugin(config, "bumi", None, high, loco_plugin=loco)
+        card = ws.WaistSwayPlugin({}, "bumi", None, high, loco_plugin=loco)
         card.start()
         made.append(card)
         return card, low, high, loco
@@ -173,8 +169,8 @@ def _wait(predicate, timeout=2.5):
     return predicate()
 
 
-def _engage(card, **kwargs):
-    return card.dispatch("set", {"enabled": True, **kwargs})
+def _start(card, **params):
+    return card.dispatch("start", params)
 
 
 # ── the vendor tables the whole stream rests on ──────────────────────────────
@@ -183,18 +179,19 @@ def test_source_tables_match_vendor_example(ws):
     assert ws._SDK_JOINT_NAMES == VENDOR_JOINT_NAMES
     assert ws._STAND_ANGLES == VENDOR_STAND_ANGLES
     assert len(ws._STAND_ANGLES) == 21
+    assert ws._SPEED_PERIODS == {"slow": 8.0, "medium": 4.0}
+    assert ws._RATE_HZ == 500.0
 
 
 # ── the stream itself ────────────────────────────────────────────────────────
 
-def test_stream_sends_stand_hold_with_waist_sine(make_card):
-    card, low, _high, _loco = make_card(amplitude_rad=0.3, period_s=2.0)
-    result = _engage(card)
-    assert result["state"] == "streaming"
+def test_start_streams_stand_hold_with_waist_sine(make_card):
+    card, low, _high, _loco = make_card()
+    assert _start(card, amplitude_deg=30.0, speed="medium")["state"] == "streaming"
 
-    # >1.1 s of ticks: past the 1 s blend-in and past the first sine zero
-    # crossing, so both waist directions have been commanded.
-    assert _wait(lambda: len(low.cmds) > 230, timeout=3.0), "stream did not run"
+    # ~2.3 s of ticks at 500 Hz: past the 1 s blend-in and into the sine's
+    # second half-cycle, so both waist directions have been commanded.
+    assert _wait(lambda: len(low.cmds) > 1150, timeout=3.5), "stream did not run"
     table = stand_table_by_hw()
 
     for cmd in low.cmds:
@@ -203,122 +200,108 @@ def test_stream_sends_stand_hold_with_waist_sine(make_card):
 
     last = low.cmds[-1]
     for i, c in enumerate(last):
+        expected_kp = 10.0
         if i == 20:
-            assert c.kp == pytest.approx(10.0)
+            assert c.kp == pytest.approx(expected_kp)
             assert c.kd == pytest.approx(0.5)
-            assert c.vel == 0.0 and c.tau == 0.0
         else:
             # Past the blend window the hold targets the vendor stand pose.
             assert c.pos == pytest.approx(table[i]), f"joint {i}"
-            assert c.kp == pytest.approx(10.0)
+            assert c.kp == pytest.approx(expected_kp)
             assert c.kd == pytest.approx(0.5)
-            assert c.vel == 0.0 and c.tau == 0.0
+        assert c.vel == 0.0 and c.tau == 0.0
 
     waist = [cmd[20].pos for cmd in low.cmds]
     assert max(waist) > 0.05, "waist never swung one way"
     assert min(waist) < -0.05, "waist never swung back"
-    assert max(waist) <= 0.3 + 1e-9 and min(waist) >= -0.3 - 1e-9
+    amplitude = math.radians(30.0)
+    assert max(waist) <= amplitude + 1e-9
+    assert min(waist) >= -amplitude - 1e-9
     assert card._info()["waist_tracking"] == "ok"
+    assert card._info()["amplitude_deg"] == pytest.approx(30.0)
+    assert card._info()["speed"] == "medium"
 
 
-def test_constructor_clamps_out_of_range_config(make_card):
-    card, _low, _high, _loco = make_card(
-        amplitude_rad=99.0, period_s=0.1, rate_hz=10000.0,
-        concurrent_legs="bogus")
-    info = card._info()
-    assert info["amplitude_rad"] == pytest.approx(1.2)
-    assert info["period_s"] == pytest.approx(2.0)
-    assert info["rate_hz"] == pytest.approx(500.0)
-    assert info["concurrent_legs"] == "stand_hold"
-
-
-def test_dry_run_counts_without_touching_the_sdk(make_card):
-    card, low, _high, _loco = make_card(dry_run=True)
-    assert _engage(card)["state"] == "streaming"
-    assert _wait(lambda: card._info()["cmds_sent"] > 5)
+def test_start_parameter_validation(make_card):
+    card, low, _high, _loco = make_card()
+    assert _start(card, speed="fast")["state"] == "error"
+    assert _start(card, amplitude_deg=70.0)["state"] == "error"
+    assert _start(card, amplitude_deg=2.0)["state"] == "error"
+    assert _start(card, duration_s=-1.0)["state"] == "error"
+    assert _start(card, duration_s="soon")["state"] == "error"
+    assert _start(card, amplitude_deg=True)["state"] == "error"
     assert low.cmds == []
-    assert card._info()["waist_tracking"] == "dry_run"
 
 
-# ── engage gates ─────────────────────────────────────────────────────────────
+# ── engage gates and timing ──────────────────────────────────────────────────
 
 def test_engage_refused_when_not_standing(make_card):
     card, low, _high, _loco = make_card(high=FakeHighCtrl(mode=5))
-    result = _engage(card)
+    result = _start(card)
     assert result["state"] == "error"
     assert "workmode" in result["error"]
     info = card._info()
-    assert info["enabled"] is False
     assert info["state"] == "error"
     assert low.cmds == []
 
 
-def test_set_action_validates_its_argument(make_card):
-    card, _low, _high, _loco = make_card()
-    assert card.dispatch("set", {})["state"] == "error"
-    assert card.dispatch("set", {"enabled": "yes"})["state"] == "error"
+def test_untimed_start_runs_until_stop(make_card):
+    card, low, _high, _loco = make_card()
+    assert _start(card, duration_s=0)["state"] == "streaming"
+    assert card._info()["remaining_s"] is None
+    assert _wait(lambda: len(low.cmds) > 100)
+    time.sleep(0.3)   # several supervisor ticks: still streaming
+    assert card._info()["state"] == "streaming"
+    assert card.dispatch("stop", {})["state"] == "off"
 
 
-def test_waiting_when_chassis_busy_in_suspend_mode(make_card):
-    loco = FakeLoco(busy=True)
-    card, low, high, _unused = make_card(loco=loco, suspend_during_loco=True)
-    result = _engage(card)
-    assert result["state"] == "waiting_chassis"
-    assert low.cmds == []
+def test_timed_start_auto_stops_and_hands_back(make_card):
+    card, low, _high, _loco = make_card()
+    assert _start(card, duration_s=1.0)["state"] == "streaming"
+    assert card._info()["remaining_s"] is not None
+    assert _wait(lambda: len(low.cmds) > 50)
 
-    loco.busy = False
-    high.mode = 2
-    assert _wait(lambda: card._info()["state"] == "streaming"), \
-        "supervisor did not engage once the chassis went idle"
-    assert _wait(lambda: len(low.cmds) > 3)
+    # duration (1 s) + supervisor tick + wind-down (1 s) — then it must be off.
+    assert _wait(lambda: card._info()["state"] == "off", timeout=4.0), \
+        "timed sway did not stop itself"
+    stopped_at = len(low.cmds)
+    time.sleep(0.2)
+    assert len(low.cmds) == stopped_at
+    assert card._info()["last_restore"]["reason"] == "duration_elapsed"
+
+
+def test_restart_replaces_the_running_sway(make_card):
+    card, low, _high, _loco = make_card()
+    assert _start(card, amplitude_deg=20.0, speed="slow")["state"] == "streaming"
+    assert _wait(lambda: len(low.cmds) > 100)
+
+    assert _start(card, amplitude_deg=40.0, speed="medium")["state"] == "streaming"
+    info = card._info()
+    assert info["amplitude_deg"] == pytest.approx(40.0)
+    assert info["speed"] == "medium"
+    # The new stream keeps running past the replacement window.
+    assert _wait(lambda: len(low.cmds) > 1200, timeout=4.0)
+    assert card._info()["state"] == "streaming"
 
 
 # ── chassis coexistence ──────────────────────────────────────────────────────
 
-def test_concurrent_default_keeps_streaming_and_switches_leg_policy(make_card):
-    card, low, _high, _loco = make_card()
-    assert _engage(card)["state"] == "streaming"
-    assert _wait(lambda: len(low.cmds) > 10)
-
+def test_chassis_notify_keeps_streaming_and_gates_the_self_check(make_card):
+    # A waist that never follows (pinned at 0) with a 60 deg amplitude: the
+    # self-check would abort within a few seconds — unless the chassis label
+    # says the robot is walking, where being ignored is expected.
+    low = FakeLowController(waist_pos=0.0)
+    card, low, _high, _loco = make_card(low=low)
+    assert _start(card, amplitude_deg=60.0, speed="medium")["state"] == "streaming"
     card.notify_chassis_active("loco.move")
-    before = len(low.cmds)
-    assert _wait(lambda: len(low.cmds) > before + 10), \
+    assert _wait(lambda: len(low.cmds) > 1400, timeout=4.0), \
         "default policy must keep streaming while the chassis walks"
-    last = low.cmds[-1]
-    assert last[0].kp == pytest.approx(10.0), "stand_hold legs expected"
-
-    assert card.dispatch("config", {"concurrent_legs": "echo"})["ok"] is True
-    assert _wait(lambda: low.cmds[-1][0].kp == pytest.approx(0.0)), \
-        "echo policy must switch the non-waist gains off"
-    echo_cmd = low.cmds[-1]
-    assert echo_cmd[0].kd == pytest.approx(0.1)
-    assert echo_cmd[0].pos == pytest.approx(0.0)   # measured (zero) pose
-    assert echo_cmd[20].kp == pytest.approx(10.0), "waist stays actively held"
+    assert card._info()["state"] == "streaming"
+    assert card._info()["chassis_active"] == "loco.move"
 
     card.notify_chassis_idle("loco.move")
-    assert _wait(lambda: low.cmds[-1][0].kp == pytest.approx(10.0)), \
-        "idle chassis must restore the stand-hold legs"
-
-
-def test_suspend_during_loco_releases_fast_and_resumes(make_card):
-    loco = FakeLoco()
-    card, low, high, _unused = make_card(loco=loco, suspend_during_loco=True)
-    assert _engage(card)["state"] == "streaming"
-    assert _wait(lambda: len(low.cmds) > 10)
-
-    high.mode = 1   # not walking: the fast restore path must decline to prep
-    card.notify_chassis_active("loco.move")
-    assert _wait(lambda: card._info()["state"] == "suspended")
-    stopped_at = len(low.cmds)
-    time.sleep(0.15)
-    assert len(low.cmds) == stopped_at, "suspended card must stop streaming"
-    assert loco.prepare_calls == [], "chassis suspend must not run mode prep"
-    assert card._info()["last_restore"]["state"] == "skipped"
-
-    high.mode = 2
-    card.notify_chassis_idle("loco.move")
-    assert _wait(lambda: card._info()["state"] == "streaming")
-    assert _wait(lambda: len(low.cmds) > stopped_at + 5)
+    assert _wait(lambda: card._info()["state"] == "error", timeout=3.0), \
+        "self-check must resume once the chassis goes idle"
 
 
 # ── auto-disable on body actions ─────────────────────────────────────────────
@@ -326,16 +309,16 @@ def test_suspend_during_loco_releases_fast_and_resumes(make_card):
 def test_body_action_auto_disables_and_restores(make_card):
     loco = FakeLoco()
     card, low, high, _unused = make_card(loco=loco)
-    assert _engage(card)["state"] == "streaming"
+    assert _start(card)["state"] == "streaming"
     assert _wait(lambda: len(low.cmds) > 10)
 
     high.mode = 1   # force the restore through the loco card's mode prep
     assert card.disable_for_body_action("semantic_action.wave") is True
     info = card._info()
-    assert info["enabled"] is False
+    assert info["state"] == "off"
     assert info["preempted_by"] == "semantic_action.wave"
     stopped_at = len(low.cmds)
-    time.sleep(0.15)
+    time.sleep(0.2)
     assert len(low.cmds) == stopped_at
     assert loco.prepare_calls, "release must hand the robot back via loco"
 
@@ -344,21 +327,19 @@ def test_body_action_auto_disables_and_restores(make_card):
 
 def test_supervisor_disables_on_external_workmodes(make_card):
     card, low, high, _loco = make_card()
-    assert _engage(card)["state"] == "streaming"
+    assert _start(card)["state"] == "streaming"
     assert _wait(lambda: len(low.cmds) > 5)
 
     high.mode = 26   # protection, e.g. after a fall nobody reported
-    # Wait for the full release (wind-down included), not just the flag flip.
     assert _wait(lambda: card._info()["state"] == "off"), \
         "supervisor missed the protection mode"
-    assert card._info()["enabled"] is False
     assert "workmode_26" in card._info()["preempted_by"]
     stopped_at = len(low.cmds)
-    time.sleep(0.15)
+    time.sleep(0.2)
     assert len(low.cmds) == stopped_at
 
     high.mode = 2
-    assert _engage(card)["state"] == "streaming"
+    assert _start(card)["state"] == "streaming"
     high.mode = 8   # greet, e.g. started from the vendor App
     assert _wait(lambda: "workmode_8" in (card._info()["preempted_by"] or ""))
 
@@ -367,26 +348,24 @@ def test_supervisor_disables_on_external_workmodes(make_card):
 
 def test_tracking_abort_when_firmware_ignores_the_stream(make_card):
     low = FakeLowController(waist_pos=0.0)   # the waist never moves
-    card, low, _high, _loco = make_card(low=low, amplitude_rad=1.2, period_s=2.0)
-    assert _engage(card)["state"] == "streaming"
-    assert _wait(lambda: card._info()["state"] == "error", timeout=5.0), \
+    card, low, _high, _loco = make_card(low=low, )
+    assert _start(card, amplitude_deg=60.0, speed="medium")["state"] == "streaming"
+    assert _wait(lambda: card._info()["state"] == "error", timeout=6.0), \
         "an ignored stream must tear itself down"
     info = card._info()
-    assert info["enabled"] is False
     assert "not tracking" in info["last_error"]
     stopped_at = len(low.cmds)
-    time.sleep(0.15)
+    time.sleep(0.2)
     assert len(low.cmds) == stopped_at
 
 
 def test_low_controller_init_failure_is_reported(make_card):
     low = FakeLowController(init_error="boom")
     card, _low, _high, _loco = make_card(low=low)
-    result = _engage(card)
+    result = _start(card)
     assert result["state"] == "streaming"   # the failure surfaces in the thread
     assert _wait(lambda: card._info()["state"] == "error")
     info = card._info()
-    assert info["enabled"] is False
     assert "boom" in info["low_controller"]
     assert info["last_error"]
 
@@ -395,13 +374,12 @@ def test_low_controller_init_failure_is_reported(make_card):
 
 def test_stop_action_winds_down_and_releases(make_card):
     card, low, _high, _loco = make_card()
-    assert _engage(card)["state"] == "streaming"
+    assert _start(card)["state"] == "streaming"
     assert _wait(lambda: len(low.cmds) > 10)
 
     result = card.dispatch("stop", {})
     assert result["state"] == "off"
     info = card._info()
-    assert info["enabled"] is False
     assert info["state"] == "off"
     deadline = time.monotonic() + 2.0   # wind-down is 1 s
     count = len(low.cmds)
@@ -414,18 +392,3 @@ def test_stop_action_winds_down_and_releases(make_card):
             return
         count = stopped
     pytest.fail("stream did not stop after the wind-down")
-
-
-def test_config_requires_confirm_to_clear_dry_run(make_card):
-    card, _low, _high, _loco = make_card(dry_run=True)
-    assert card._info()["dry_run"] is True
-    refused = card.dispatch("config", {"dry_run": False})
-    assert refused["ok"] is False
-    assert card._info()["dry_run"] is True
-
-    accepted = card.dispatch("config", {"dry_run": False, "confirm": True})
-    assert accepted["ok"] is True
-    assert card._info()["dry_run"] is False
-
-    assert card.dispatch("config", {"amplitude_rad": 5.0})["ok"] is False
-    assert card.dispatch("config", {"period_s": 0.5})["ok"] is False

@@ -411,16 +411,6 @@ class LocoServoPlugin:
         """Let the waist card be told before/after this card drives the chassis."""
         self._sway = sway
 
-    def is_active(self) -> bool:
-        """Whether this card currently owns the chassis publisher (not paused).
-
-        `waist_sway` asks through `loco.is_chassis_busy()` before it re-engages
-        while `suspend_during_loco` is on: a paused card is not driving the
-        robot, a running one is (even while its current target is zero).
-        """
-        with self._lock:
-            return bool(self._running and not self._paused)
-
     def _notify_sway(self, label: str, active: bool) -> None:
         # Called outside this card's lock, so the sway card never waits on a
         # stream teardown that is waiting on the chassis to stop.
