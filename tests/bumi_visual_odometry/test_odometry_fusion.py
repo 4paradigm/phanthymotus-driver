@@ -86,3 +86,29 @@ def test_imu_yaw_tracks_increment_and_wrap():
     ekf.predict(1_025_000_000,-math.pi+.05, (.02,0),True)
     assert abs(ekf.steps[-1].state[2]-.10)<1e-6
     assert math.isclose(yaw_from_quat(q(.3)),.3)
+
+
+def test_plausible_high_inlier_visual_delta_flags_leg_slip():
+    ekf = PlanarFusion()
+    for i in range(36):
+        ekf.predict(1_000_000_000+i*25_000_000, 0, (.01, 0), True)
+    assert ekf.visual(stamp_ns=1_250_000_000, segment='s', position=[0,0,0],
+                      quaternion=q(0), covariance=cov(), inliers=50) == 'anchored'
+    assert ekf.visual(stamp_ns=1_750_000_000, segment='s', position=[.01,0,0],
+                      quaternion=q(0), covariance=cov(), inliers=50) == 'corrected'
+    assert ekf.slip_suspected
+    assert ekf.slip_residual_m > .07
+
+
+def test_clean_motion_slowly_calibrates_directional_leg_scale():
+    ekf = PlanarFusion()
+    for i in range(48):
+        ekf.predict(1_000_000_000+i*25_000_000, 0, (.004, 0), True)
+    assert ekf.visual(stamp_ns=1_250_000_000, segment='s', position=[0,0,0],
+                      quaternion=q(0), covariance=cov(), inliers=50) == 'anchored'
+    assert ekf.visual(stamp_ns=1_275_000_000, segment='s', position=[.008,0,0],
+                      quaternion=q(0), covariance=cov(), inliers=50) == 'corrected'
+    initial_scale = ekf.scales['forward']
+    assert ekf.visual(stamp_ns=1_800_000_000, segment='s', position=[.176,0,0],
+                      quaternion=q(0), covariance=cov(), inliers=50) == 'corrected'
+    assert ekf.scales['forward'] > initial_scale
