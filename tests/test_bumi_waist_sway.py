@@ -265,6 +265,26 @@ def test_start_requires_confirmation(make_card):
     assert _start(card)["state"] == "streaming"   # confirm=true engages
 
 
+def test_confirm_accepts_the_canvas_string_form(make_card):
+    # The canvas form serializes its fields as strings (verified on the real
+    # machine: "confirm": "true" was refused with the confirmation error).
+    # The exact string "true" — any case, any padding — is the same deliberate
+    # confirmation as boolean true; every other value keeps the gate shut.
+    card, low, _high, _loco = make_card()
+    for bad in ("yes", "1", "false", ""):
+        refused = card.dispatch("start", {"confirm": bad, "amplitude_deg": 20.0})
+        assert refused["state"] == "error"
+        assert "confirm" in refused["error"]
+    assert card.dispatch("start", {"confirm": 1})["state"] == "error"
+    assert low.cmds == []                         # nothing streamed past the gate
+
+    assert card.dispatch("start", {"confirm": "true"})["state"] == "streaming"
+    card.dispatch("stop", {})
+    assert _wait(lambda: card._info()["state"] == "off")
+    assert card.dispatch("start", {"confirm": " True "})["state"] == "streaming"
+    card.dispatch("stop", {})
+
+
 # ── fail-closed engagement (review issues) ───────────────────────────────────
 
 @pytest.mark.parametrize("state_mode", ["raise", "empty"])

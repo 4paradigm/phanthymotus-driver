@@ -302,8 +302,15 @@ class WaistSwayPlugin:
     def _start_action(self, args: dict) -> dict:
         # A 21-joint low-level stream is a dangerous action: it must not be
         # startable by an action name alone (review issue; same gate shape as
-        # loco_servo's confirm for clearing dry_run).
-        if args.get("confirm") is not True:
+        # loco_servo's confirm for clearing dry_run). The canvas form may
+        # serialize its fields as strings — the numeric params already accept
+        # "20" through float() — so the one exact string form "true" counts as
+        # the deliberate confirmation here too; anything else (missing, false,
+        # "yes", 1) is still refused.
+        confirm = args.get("confirm")
+        if isinstance(confirm, str) and confirm.strip().lower() == "true":
+            confirm = True
+        if confirm is not True:
             return {"state": "error", "command_sent": False,
                     "error": "开启腰部摆动需要确认：机器人站立、摆动范围内无人、"
                              "有人看护且 App 急停可用时传 confirm=true"}
