@@ -130,6 +130,8 @@ _SUPERVISOR_HZ = 10.0
 _BLEND_IN_S = 1.0        # measured pose -> stand table
 _WIND_DOWN_S = 1.0       # operator stop: amplitude decays to zero
 _PREEMPT_WIND_DOWN_S = 0.5   # body action / chassis suspend: snappier decay
+_RELEASE_JOIN_S = 3.0        # after the graceful window, insist on a join
+_RELEASE_FINAL_JOIN_S = 2.0  # after insisting: the thread is declared stuck
 _TRACKING_TOLERANCE_RAD = 0.35
 _TRACKING_GRACE_S = 0.5
 
@@ -153,6 +155,12 @@ class WaistSwayPlugin:
 
         self._lock = threading.RLock()
         self._enabled = False
+        # Bumped by every disable (operator stop, body-action preemption,
+        # bundle teardown). A start whose slow release window overlapped a
+        # disable rechecks it before re-enabling — the lifecycle-token rule
+        # from loco_servo, so a stop can never be silently overwritten by the
+        # restart it raced.
+        self._generation = 0
         self._state = "off"          # off|streaming|error
         self._preempted_by: str | None = None
         self._last_error: str | None = None
@@ -273,6 +281,7 @@ class WaistSwayPlugin:
         with self._lock:
             self._enabled = False
             self._end_time = None
+            self._generation += 1
         self._release(0.0, "plugin_stop")
         thread = self._supervisor_thread
         if thread is not None and thread.is_alive():
@@ -330,6 +339,7 @@ class WaistSwayPlugin:
         with self._lock:
             streaming = (self._stream_thread is not None
                          and self._stream_thread.is_alive())
+            generation = self._generation
         if streaming:
             # A start while streaming replaces the running sway: quick
             # wind-down first, then the fresh parameters engage a new stream —
@@ -338,6 +348,13 @@ class WaistSwayPlugin:
             self._release(_PREEMPT_WIND_DOWN_S, "restart")
 
         with self._lock:
+            if generation != self._generation:
+                # A stop or a body-action preemption landed while the old
+                # stream was still winding down (an interrupt hook racing the
+                # agent's restart is the realistic pairing). It wins; this
+                # start is dropped instead of silently re-enabling over it.
+                return {"state": self._state,
+                        "message": "启动已被并发的 stop 或抢占取消"}
             self._enabled = True
             self._preempted_by = None
             self._last_error = None
@@ -347,19 +364,29 @@ class WaistSwayPlugin:
             self._speed = speed
             self._end_time = (time.monotonic() + duration_s
                               if duration_s > 0 else None)
-        return self._try_engage()
+        return self._try_engage(generation)
 
     def _stop_action(self) -> dict:
         with self._lock:
             self._enabled = False
+            self._generation += 1
             self._preempted_by = None
             self._end_time = None
-        restore = self._release(_WIND_DOWN_S, "stop")
-        return {"state": "off", "restore": self._restore_summary(restore)}
+        release = self._release(_WIND_DOWN_S, "stop")
+        with self._lock:
+            state = self._state
+            error = self._last_error if state == "error" else None
+        # Honest stop: a stream thread that refused to die leaves state
+        # "error"; answering "off" here would tell the operator the waist is
+        # free while a 500 Hz stream may still be live.
+        result = {"state": state, "restore": self._restore_summary(release["restore"])}
+        if error is not None:
+            result["error"] = error
+        return result
 
     # ── engage / release ─────────────────────────────────────────────────────
 
-    def _try_engage(self) -> dict:
+    def _try_engage(self, generation: int) -> dict:
         """Start the stream if the robot stands in walking mode and is free."""
         mode = self._read_mode()
         if mode is None:
@@ -371,6 +398,11 @@ class WaistSwayPlugin:
                 f"(workmode=2); current mode is {mode} ({name}). Bring the robot "
                 "to a standing walk mode first, then enable again.")
         with self._lock:
+            if generation != self._generation:
+                # The mode read above is an SDK call; a stop may have landed
+                # during it. Never spawn a stream nobody asked for.
+                return {"state": self._state,
+                        "message": "启动已被并发的 stop 或抢占取消"}
             if self._stream_thread is not None and self._stream_thread.is_alive():
                 self._state = "streaming"
                 return {"state": "streaming"}
@@ -401,9 +433,14 @@ class WaistSwayPlugin:
             self._last_error = message
         return {"state": "error", "enabled": False, "error": message}
 
-    def _release(self, graceful_s: float, reason: str) -> dict | None:
+    def _release(self, graceful_s: float, reason: str) -> dict:
         """Stop the stream thread (optionally winding amplitude down), then
-        restore high-level walking mode if this card ever really streamed."""
+        restore high-level walking mode if this card ever really streamed.
+
+        Returns {'stopped': bool, 'restore': dict|None}; `stopped` is False
+        only when the thread refused to die, and every caller must surface
+        that instead of reporting a clean stop.
+        """
         with self._lock:
             thread = self._stream_thread
             stop_event = self._stop_event
@@ -420,22 +457,22 @@ class WaistSwayPlugin:
             restore = self._restore(reason)
             with self._lock:
                 self._settle_off()
-            return restore
-        thread.join(timeout=graceful_s + 3.0)
+            return {"stopped": True, "restore": restore}
+        thread.join(timeout=graceful_s + _RELEASE_JOIN_S)
         if thread.is_alive():
             # The loop refused to stop (a blocking SDK call, most likely).
             # Insist once, and refuse to hand the waist back silently dirty.
             stop_event.set()
-            thread.join(timeout=2.0)
+            thread.join(timeout=_RELEASE_FINAL_JOIN_S)
         with self._lock:
             if thread.is_alive():
                 self._enabled = False
                 self._state = "error"
                 self._last_error = "stream thread did not stop during release"
-                return None
+                return {"stopped": False, "restore": None}
             self._stream_thread = None
             self._settle_off()
-        return self._restore(reason)
+        return {"stopped": True, "restore": self._restore(reason)}
 
     def _settle_off(self) -> None:
         """After a release: keep errors visible, otherwise land on off.
@@ -475,24 +512,34 @@ class WaistSwayPlugin:
 
     # ── notifications from the sibling cards ─────────────────────────────────
 
-    def disable_for_body_action(self, label: str) -> bool:
+    def disable_for_body_action(self, label: str) -> dict | None:
         """An action that needs the waist is about to run: stop now.
 
-        Returns whether this card was enabled or streaming, so the caller can
-        say so in its own result. Mirrors `loco_servo.pause_for_explicit_command`.
+        Returns None when this card was neither enabled nor streaming, and
+        otherwise a report of whether the release actually finished: a 500 Hz
+        stream that refused to stop is a fact the caller's own result must
+        carry (device.py surfaces it as `waist_release: "failed"`), not
+        something this card absorbs. Mirrors
+        `loco_servo.pause_for_explicit_command`.
         """
         with self._lock:
             was_active = self._enabled or (
                 self._stream_thread is not None and self._stream_thread.is_alive())
             if not was_active:
-                return False
+                return None
             self._enabled = False
+            self._generation += 1
             self._preempted_by = label
             self._end_time = None
         print(f"[waist_sway] disabled by {label}", flush=True)
-        restore = self._release(_PREEMPT_WIND_DOWN_S, label)
-        self._last_preempt_restore = self._restore_summary(restore)
-        return True
+        release = self._release(_PREEMPT_WIND_DOWN_S, label)
+        report = {"preempted": True,
+                  "release": "ok" if release["stopped"] else "failed"}
+        if not release["stopped"]:
+            report["error"] = ("stream thread did not stop; low-level joint "
+                               "stream may still be live")
+        self._last_preempt_restore = self._restore_summary(release["restore"])
+        return report
 
     def notify_chassis_active(self, label: str) -> None:
         """A chassis card started driving the robot.
@@ -506,9 +553,21 @@ class WaistSwayPlugin:
             self._chassis_active = label
 
     def notify_chassis_idle(self, label: str) -> None:
-        """A chassis card stopped driving the robot."""
+        """A chassis card stopped driving the robot.
+
+        The idle side never repeats the active side's action suffix —
+        `loco.move` is ended by `loco.stop_move` (dispatch) or a lifecycle
+        `loco.stop`, and `loco_servo.start` by `loco_servo.stop` — so
+        matching whole strings leaves the label stuck and the tracking
+        self-check permanently skipped. The tool prefix is the stable part
+        and stays distinct between chassis cards (`loco` vs
+        `loco_relative_move`), so an idle from one card cannot clear
+        another card's active label.
+        """
+        tool = label.split(".")[0]
         with self._lock:
-            if self._chassis_active in (None, label):
+            if self._chassis_active is not None \
+                    and self._chassis_active.split(".")[0] == tool:
                 self._chassis_active = None
 
     # ── supervisor ───────────────────────────────────────────────────────────

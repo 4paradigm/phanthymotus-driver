@@ -473,27 +473,28 @@ class LocoPlugin:
             return False
         return bool(self._servo.pause_for_explicit_command(reason))
 
-    def _notify_sway_dispatch(self, tool_name: str, action: str) -> bool:
+    def _notify_sway_dispatch(self, tool_name: str, action: str) -> dict | None:
         """Tell the waist sway card what is about to claim the robot.
 
         Body tools (posture, presets, teaching) change `workmode` and need the
         waist itself: the sway card releases and switches itself off, the same
         "an explicit instruction outranks a background stream" rule the servo
         preemption follows. Chassis tools keep walking; `loco.move` only marks
-        the chassis active — the sway keeps streaming by default (its own
-        documented experiment) or pauses when the operator configured
-        `suspend_during_loco`. Returns whether a body action actually
-        disabled an active sway, so the caller can say so in its result.
+        the chassis active — the sway keeps streaming (its own documented
+        experiment). Returns the sway card's preemption report for body tools
+        (None when no sway was active, and always None for chassis tools), so
+        the caller can say so in its own result — including a release that
+        did not actually finish.
         """
         if self._sway is None:
-            return False
+            return None
         if tool_name in ("stand_up_lie_prone", "semantic_action", "action_recording"):
-            return bool(self._sway.disable_for_body_action(f"{tool_name}.{action}"))
+            return self._sway.disable_for_body_action(f"{tool_name}.{action}")
         if (tool_name, action) == ("loco", "move"):
             self._sway.notify_chassis_active(f"{tool_name}.{action}")
         elif action in ("stop_move", "stop"):
             self._sway.notify_chassis_idle(f"{tool_name}.{action}")
-        return False
+        return None
 
     def prepare_walk_mode(self, requester: str) -> dict:
         """Reach workmode 2 through the documented mode edges, for a sibling card.
@@ -785,15 +786,20 @@ class LocoPlugin:
             # Same pre-touch rule as the servo preemption: the sway card learns
             # about the body action before any mode edge runs, so its release
             # and restore finish before this action's own preparation starts.
-            sway_was_active = self._notify_sway_dispatch(tool_name, action)
+            sway_report = self._notify_sway_dispatch(tool_name, action)
             if body_action and not self._wait_for_rotate_idle():
                 return {"state": "error", "command_sent": False,
                         "error": "rotation has not stopped; competing action was not sent"}
             result = handler()
             if preempted and isinstance(result, dict):
                 result["preempted_loco_servo"] = True
-            if sway_was_active and isinstance(result, dict):
+            if sway_report and isinstance(result, dict):
                 result["preempted_waist_sway"] = True
+                if sway_report.get("release") != "ok":
+                    # The preemption flag alone would claim the waist is free;
+                    # a stuck 500 Hz stream says otherwise and belongs in the
+                    # result the operator reads.
+                    result["waist_release"] = "failed"
             return result
         finally:
             if body_action:

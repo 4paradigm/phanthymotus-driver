@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import math
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -91,6 +92,12 @@ class FakeLowController:
         self.waist_pos = waist_pos
         self.state_mode = state_mode
         self.duplicate_index = duplicate_index
+        # Hang-in-set_joint support: flip `stall` and the next command blocks
+        # inside the "SDK call" until `unstall` — a stream thread stuck in a
+        # blocking call, the release-timeout path's trigger.
+        self.stall = False
+        self.stalled = threading.Event()
+        self.unstall = threading.Event()
         FakeLowController._the = self
 
     @classmethod
@@ -115,6 +122,9 @@ class FakeLowController:
 
     def set_joint(self, cmds):
         self.cmds.append(list(cmds))
+        if self.stall:
+            self.stalled.set()
+            self.unstall.wait(timeout=10.0)
 
     def get_joint_state(self):
         if self.state_mode == "raise":
@@ -352,6 +362,27 @@ def test_chassis_notify_keeps_streaming_and_gates_the_self_check(make_card):
         "self-check must resume once the chassis goes idle"
 
 
+def test_chassis_idle_labels_of_real_callers_clear_the_flag(make_card):
+    # The production callers never repeat the active label on the idle side:
+    # loco.move ends with loco.stop_move (dispatch) or loco.stop (lifecycle),
+    # loco_servo.start with loco_servo.stop. Whole-string matching leaves
+    # _chassis_active stuck forever and the tracking self-check permanently
+    # skipped — the bug the tool-prefix match exists for.
+    card, _low, _high, _loco = make_card()
+    for active, idle in [("loco.move", "loco.stop_move"),
+                         ("loco.move", "loco.stop"),
+                         ("loco_servo.start", "loco_servo.stop"),
+                         ("loco_relative_move.move", "loco_relative_move.move")]:
+        card.notify_chassis_active(active)
+        assert card._info()["chassis_active"] == active
+        card.notify_chassis_idle(idle)
+        assert card._info()["chassis_active"] is None, f"{active} stuck after {idle}"
+    # An idle from a different chassis card must not clear another's label.
+    card.notify_chassis_active("loco.move")
+    card.notify_chassis_idle("loco_servo.stop")
+    assert card._info()["chassis_active"] == "loco.move"
+
+
 # ── auto-disable on body actions ─────────────────────────────────────────────
 
 def test_body_action_auto_disables_and_restores(make_card):
@@ -361,7 +392,8 @@ def test_body_action_auto_disables_and_restores(make_card):
     assert _wait(lambda: len(low.cmds) > 10)
 
     high.mode = 1   # force the restore through the loco card's mode prep
-    assert card.disable_for_body_action("semantic_action.wave") is True
+    report = card.disable_for_body_action("semantic_action.wave")
+    assert report == {"preempted": True, "release": "ok"}
     info = card._info()
     assert info["state"] == "off"
     assert info["preempted_by"] == "semantic_action.wave"
@@ -370,7 +402,7 @@ def test_body_action_auto_disables_and_restores(make_card):
     assert len(low.cmds) == stopped_at
     assert loco.prepare_calls, "release must hand the robot back via loco"
 
-    assert card.disable_for_body_action("semantic_action.wave") is False
+    assert card.disable_for_body_action("semantic_action.wave") is None
 
 
 def test_supervisor_disables_on_external_workmodes(make_card):
@@ -440,3 +472,91 @@ def test_stop_action_winds_down_and_releases(make_card):
             return
         count = stopped
     pytest.fail("stream did not stop after the wind-down")
+
+
+# ── honesty of stop / preemption under a stuck stream ────────────────────────
+
+def test_stop_is_honest_when_the_stream_thread_hangs(make_card, monkeypatch, ws):
+    # A stream thread blocked inside a blocking SDK call cannot wind down; the
+    # release join times out. The stop response must say "error", not "off":
+    # "off" would tell the operator the waist is free while the 500 Hz stream
+    # may still be live.
+    monkeypatch.setattr(ws, "_WIND_DOWN_S", 0.1)
+    monkeypatch.setattr(ws, "_RELEASE_JOIN_S", 0.2)
+    monkeypatch.setattr(ws, "_RELEASE_FINAL_JOIN_S", 0.2)
+    low = FakeLowController()
+    card, low, _high, _loco = make_card(low=low)
+    assert _start(card)["state"] == "streaming"
+    assert _wait(lambda: len(low.cmds) > 20)
+    low.stall = True
+    assert low.stalled.wait(timeout=3.0), "stream never entered the stalled call"
+
+    result = card.dispatch("stop", {})
+    assert result["state"] == "error"
+    assert "did not stop" in result["error"]
+    info = card._info()
+    assert info["state"] == "error"
+
+    low.unstall.set()   # let the stuck thread see stop_event and exit
+
+
+def test_concurrent_stop_during_restart_wins(make_card):
+    # An interrupt hook (or the operator) can stop the sway in the same moment
+    # the agent restarts it with new parameters. The stop must win: the
+    # restart is dropped, not silently re-enabled after the stop returned.
+    card, low, _high, _loco = make_card()
+    assert _start(card, amplitude_deg=20.0)["state"] == "streaming"
+    assert _wait(lambda: len(low.cmds) > 50)
+
+    real_release = card._release
+    stop_injected = []
+
+    def release_with_racing_stop(graceful_s, reason):
+        result = real_release(graceful_s, reason)
+        if reason == "restart" and not stop_injected:
+            stop_injected.append(True)
+            card._stop_action()   # the stop lands while the restart holds the floor
+        return result
+
+    card._release = release_with_racing_stop
+    restart = card.dispatch("start", {"confirm": True, "amplitude_deg": 40.0,
+                                      "speed": "medium"})
+    card._release = real_release
+
+    assert restart["state"] == "off"
+    assert "取消" in restart["message"]
+    info = card._info()
+    assert info["state"] == "off"
+    # The restart's parameters must not have stuck.
+    assert info["amplitude_deg"] == pytest.approx(20.0)
+    stopped_at = len(low.cmds)
+    time.sleep(0.3)
+    assert len(low.cmds) == stopped_at, "a new stream must not start after the stop"
+
+
+def test_body_preempt_reports_a_failed_release(make_card):
+    # device.py proceeds with its body action either way, so a release that
+    # did not finish must be visible in the preemption report instead of
+    # silently claimed as released.
+    card, low, _high, _loco = make_card()
+    assert _start(card)["state"] == "streaming"
+    assert _wait(lambda: len(low.cmds) > 5)
+
+    real_release = card._release
+
+    def stuck_release(graceful_s, reason):
+        # The join-timeout outcome without paying its wall clock.
+        with card._lock:
+            card._enabled = False
+            card._state = "error"
+            card._last_error = "stream thread did not stop during release"
+        return {"stopped": False, "restore": None}
+
+    card._release = stuck_release
+    report = card.disable_for_body_action("semantic_action.wave")
+    card._release = real_release
+
+    assert report["preempted"] is True
+    assert report["release"] == "failed"
+    assert "did not stop" in report["error"]
+    assert card._info()["state"] == "error"
