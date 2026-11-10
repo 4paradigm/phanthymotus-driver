@@ -3669,3 +3669,196 @@ class VisionCapturePlugin:
         if action == "stop":
             return self._stop_recording()
         return None
+
+
+# ── MediaConfigPlugin (get/set the media unit's configurable settings) ──────
+
+class MediaConfigPlugin:
+    """Read and write Bumi media-unit settings that no other card exposes.
+
+    Covers the auto-sleep timeout, the audio-cue flag, and the wake/sleep
+    response words — all reachable through ``MediaController`` getters/setters
+    that ``speaker`` (volume only) and ``media_status`` (read-only health) leave
+    untouched. The wake word itself is read-only on this vendor: the SDK ships
+    ``get_wakeup_words`` and no ``set_wakeup_words``, so this card reports it but
+    rejects any attempt to write it.
+
+    The SDK requires at least 500 ms between ``set_*`` calls (shortening it can
+    crash the voice system and needs a factory return), so writes share the same
+    ``_config_lock`` / ``_wait_for_config_slot`` gate ``speaker`` already uses.
+    This is an on-demand get/set card, not a poller: nothing is published, so
+    there is no ROS node and no ``topic_out``.
+    """
+    PREFIX = "media_config"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
+        self._media_ctrl = media_ctrl
+        self._config_lock = threading.Lock()
+        self._last_config_change = 0.0
+
+    def _controller_present(self) -> bool:
+        return self._media_ctrl is not None
+
+    def _wait_for_config_slot(self) -> None:
+        """Honor the SDK's 500 ms minimum interval between set calls."""
+        remaining = _AUDIO_CONFIG_INTERVAL_S - (
+            time.monotonic() - self._last_config_change
+        )
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def _read_setting(self, key: str):
+        import media_config_spec
+
+        getter = getattr(self._media_ctrl, media_config_spec.getter_name(key))
+        value = getter()
+        # Normalise pybind enum/object values to a JSON-safe scalar.
+        name = getattr(value, "name", None)
+        if name is not None:
+            return str(name)
+        return value
+
+    def _write_setting(self, key: str, value):
+        import media_config_spec
+
+        normalised = media_config_spec.validate(key, value)
+        with self._config_lock:
+            self._wait_for_config_slot()
+            setter = getattr(self._media_ctrl, media_config_spec.setter_name(key))
+            setter(normalised)
+            self._last_config_change = time.monotonic()
+        return normalised
+
+    def get_tool(self) -> dict:
+        import media_config_spec
+
+        writable_descriptions = {
+            "timeout": "设置自动休眠超时（毫秒）。取值必须落在接口声明的区间内；单位是毫秒不是秒。",
+            "audio_cue": "开关提示音（true/false）。",
+            "wakeup_response": "设置被唤醒时说的应答词（非空字符串）。",
+            "sleep_response": "设置被催眠时说的应答词（非空字符串）。",
+        }
+        x_action_params = {"get": {"params": [], "description": "读取全部配置项当前值。"}}
+        for key in media_config_spec.WRITABLE_KEYS:
+            x_action_params[f"set_{key}"] = {
+                "params": [key],
+                "description": writable_descriptions[key],
+            }
+        properties = {
+            "action": {
+                "type": "string",
+                "enum": ["start", "stop", "info", "get",
+                         *[f"set_{k}" for k in media_config_spec.WRITABLE_KEYS]],
+                "description": "卡片生命周期、读取或写入媒体配置项",
+            },
+        }
+        for key in media_config_spec.WRITABLE_KEYS:
+            if key == "timeout":
+                properties["timeout"] = {
+                    "type": "integer",
+                    "minimum": media_config_spec.TIMEOUT_MIN_MS,
+                    "maximum": media_config_spec.TIMEOUT_MAX_MS,
+                    "description": "自动休眠超时，单位毫秒",
+                }
+            elif key == "audio_cue":
+                properties["audio_cue"] = {
+                    "type": "boolean",
+                    "description": "提示音开关",
+                }
+            else:
+                properties[key] = {
+                    "type": "string",
+                    "maxLength": media_config_spec.RESPONSE_WORDS_MAX_CHARS,
+                    "description": media_config_spec.label(key),
+                }
+        return {
+            "name": "media_config", "type": "actuator", "multiInstance": False,
+            "description": (
+                "Bumi 媒体单元（负责语音与相机的小系统）的可配置项，读写。"
+                "覆盖自动休眠超时（毫秒）、提示音开关、唤醒应答词、休眠应答词；"
+                "唤醒词本身只读（厂商锁定，SDK 无 set 接口）。"
+                "写操作遵守厂商 ≥500ms 间隔约束。"
+                "读不到时返回 null 而不是编一个值；媒体单元没连上时 "
+                "controller_present 为 false，任何 set 都会被拒绝。"
+                "不发布话题、不控制机器人动作。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": properties,
+                "required": ["action"],
+                "x-action-params": x_action_params,
+            },
+            "topic_out": [],
+        }
+
+    def start(self):
+        return {"state": "ready" if self._controller_present() else "error"}
+
+    def stop(self):
+        return {"state": "idle"}
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        import media_config_spec
+
+        args.pop('_tool_name', None)
+        if action == "start":
+            return {"state": "ready" if self._controller_present() else "error"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            if not self._controller_present():
+                return {
+                    "state": "idle",
+                    "controller_present": False,
+                    "interface": media_config_spec.interface(),
+                    "values": None,
+                }
+            try:
+                values = {key: self._read_setting(key)
+                          for key in media_config_spec.SETTING_KEYS}
+            except Exception as exc:
+                return {
+                    "state": "error",
+                    "controller_present": True,
+                    "interface": media_config_spec.interface(),
+                    "values": None,
+                    "error": str(exc),
+                }
+            return {
+                "state": "idle",
+                "controller_present": True,
+                "interface": media_config_spec.interface(),
+                "values": values,
+            }
+        if action == "get":
+            if not self._controller_present():
+                return {"controller_present": False, "values": None}
+            try:
+                return {"controller_present": True,
+                        "values": {key: self._read_setting(key)
+                                   for key in media_config_spec.SETTING_KEYS}}
+            except Exception as exc:
+                return {"controller_present": True, "values": None, "error": str(exc)}
+        if action.startswith("set_"):
+            key = action[len("set_"):]
+            if key not in media_config_spec.WRITABLE_KEYS:
+                return {"state": "error", "error": f"未知或只读配置项: {key}"}
+            if not self._controller_present():
+                return {"state": "error", "error": "媒体单元未连接，无法写入"}
+            if key not in args:
+                return {"state": "error", "error": f"缺少参数 {key}"}
+            try:
+                value = self._write_setting(key, args[key])
+            except ValueError as exc:
+                return {"state": "error", "error": str(exc)}
+            except Exception as exc:
+                return {"state": "error", "error": str(exc)}
+            # Read back the value so a caller can confirm the write landed,
+            # rather than trusting a fire-and-forget setter.
+            try:
+                readback = self._read_setting(key)
+            except Exception as exc:
+                readback = None
+            return {"state": "set", "key": key, "value": value,
+                    "readback": readback}
+        return None

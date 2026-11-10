@@ -81,6 +81,23 @@ class FakeMediaStatusPlugin:
         return {"state": action}
 
 
+class FakeMediaConfigPlugin:
+    def __init__(self, plugin_config, namespace, executor, media_ctrl):
+        self.media_ctrl = media_ctrl
+
+    def get_tool(self):
+        return {"name": "media_config", "type": "actuator"}
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, _args):
+        return {"state": action}
+
+
 @pytest.fixture
 def bundle_module(monkeypatch):
     """Load the real bundle and servo card with hardware imports replaced."""
@@ -94,6 +111,7 @@ def bundle_module(monkeypatch):
     fake_device.LocoPlugin = FakeLocoPlugin
     fake_device.SpeakerPlugin = FakeSpeakerPlugin
     fake_device.MediaStatusPlugin = FakeMediaStatusPlugin
+    fake_device.MediaConfigPlugin = FakeMediaConfigPlugin
     monkeypatch.setitem(sys.modules, "device", fake_device)
     monkeypatch.syspath_prepend(str(BUMI))
     previous_loco_servo = sys.modules.pop("loco_servo", None)
@@ -269,3 +287,33 @@ def test_main_calls_both_initialisers_unconditionally(bundle_module):
         "high_ctrl": "_init_high_controller",
         "media_ctrl": "_init_media_controller",
     }
+
+
+def test_media_config_registers_only_when_the_media_unit_is_present(
+        bundle_module):
+    """`media_config` *writes* the media unit's settings, so unlike
+    `media_status` — which reports a missing unit — it is gated on
+    `media_ctrl is not None`. A write card registered with no controller could
+    only fail its `set_*` actions; the gate keeps it off the canvas in exactly
+    that state."""
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["media_config"] = {"enabled": True}
+
+    with_ctrl = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), FakeHighCtrl(), media_ctrl=object())
+    without_ctrl = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), FakeHighCtrl(), media_ctrl=None)
+
+    assert [tool["name"] for tool in with_ctrl.get_all_tools()] == [
+        "media_config"]
+    assert without_ctrl.get_all_tools() == []
+
+
+def test_media_config_is_skipped_when_disabled(bundle_module):
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["media_config"] = {"enabled": False}
+
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), FakeHighCtrl(), media_ctrl=object())
+
+    assert bundle.get_all_tools() == []

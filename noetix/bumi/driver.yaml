@@ -30,5 +30,6 @@ cards:
   - { name: depth,             type: sensor }
   - { name: motion_state,      type: sensor }
   - { name: media_status,     type: sensor }
+  - { name: media_config,     type: actuator }
   - { name: rgbd_visual_odometry, type: sensor }
   - { name: vision_capture,    type: actuator }

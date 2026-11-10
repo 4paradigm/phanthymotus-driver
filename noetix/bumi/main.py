@@ -186,6 +186,20 @@ class BumiDeviceBundle:
                 plugins_cfg["media_status"], namespace, executor, media_ctrl))
             print("[bundle] MediaStatusPlugin loaded")
 
+        if plugins_cfg.get("media_config", {}).get("enabled", False):
+            # Gated on `media_ctrl is not None`: unlike `media_status`, which
+            # *reports* a missing unit, this card writes its settings, and with
+            # no controller there is nothing to write. The gate keeps the card
+            # off the canvas in exactly the state where its `set_*` actions
+            # could only fail; `info` still answers honestly via `get_tool`.
+            if media_ctrl is not None:
+                from device import MediaConfigPlugin
+                self._plugins.append(MediaConfigPlugin(
+                    plugins_cfg["media_config"], namespace, executor, media_ctrl))
+                print("[bundle] MediaConfigPlugin loaded")
+            else:
+                print("[bundle] MediaConfigPlugin skipped: media unit unavailable")
+
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
             camera_plugin = CameraPlugin(plugins_cfg["camera"], namespace, executor)
