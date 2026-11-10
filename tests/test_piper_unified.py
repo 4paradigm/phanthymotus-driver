@@ -70,12 +70,15 @@ class UnifiedTests(unittest.TestCase):
     def test_three_card_schema_topics_and_legacy_request_rejection(self):
         self.config['camera'] = {'live': {'enabled': True}}
         tools = {t['name']: t for t in self.bundle.get_all_tools()}
-        self.assertEqual(set(tools), {'arm_control', 'joints', 'model', 'piper_photo', 'piper_camera_live'})
+        self.assertEqual(set(tools), {'arm_control', 'waypoints', 'joints', 'model', 'piper_photo', 'piper_camera_live'})
         arm = tools['arm_control']
         self.assertEqual(arm['title'], 'Arm control')
         schema = arm['inputSchema']
         self.assertEqual(schema['x-completion']['actions'], sorted(self.runtime.task_actions))
-        self.assertNotRegex(json.dumps(tools, ensure_ascii=False), r'[\u3400-\u9fff]')
+        # The user requested the same Chinese decision-control menu label as
+        # the simulation card; all other existing interface text stays English.
+        self.assertNotRegex(json.dumps(tools, ensure_ascii=False).replace('智能托管（decision_core）', ''),
+                            r'[\u3400-\u9fff]')
         self.assertEqual(arm['topic_out'], [])
         self.assertEqual(tools['piper_camera_live']['type'], 'sensor')
         self.assertEqual(tools['piper_camera_live']['title'], 'On camera')
@@ -107,6 +110,15 @@ class UnifiedTests(unittest.TestCase):
         self.assertEqual(len(info['snapshot']['tip_pose_mm_deg']), 6)
         self.assertEqual(len(info['snapshot']['joint_limits_deg']), 6)
         self.assertIn('urdf', self.bundle.dispatch('model', {}))
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_disconnected_status_remains_available_during_platform_discovery(self):
+        self.runtime.disconnect()
+        with patch.object(self.runtime, 'connected', side_effect=AssertionError('Status must not reconnect')):
+            info = self.call('get_status')
+        self.assertFalse(info['snapshot']['connected'])
+        self.assertFalse(info['snapshot']['fresh'])
+        self.assertFalse(info['snapshot']['controller_recovery']['required'])
         self.assertEqual(self.sdk.calls, [])
 
     def test_tip_axes_follow_rotation_in_all_six_directions(self):
@@ -713,9 +725,10 @@ class UnifiedTests(unittest.TestCase):
         self.sdk.follow = False
         with patch('agilex.piper.arm.time.sleep', side_effect=lambda seconds: self.call('stop_motion')):
             with self.assertRaisesRegex(RuntimeError, 'cancelled'):
-                self.call('set_gripper_opening', width_mm=50)
+                self.call('set_gripper_opening', width_mm=50, torque_nm=.2)
         commands = [c[1] for c in self.sdk.calls if c[0] == 'gripper']
         self.assertEqual(commands, [50000,50000,20000])
+        self.assertTrue(all(c[2] == 200 for c in self.sdk.calls if c[0] == 'gripper'))
         self.assertEqual(self.call('get_status')['state'], 'cancelled')
 
     def test_component_frame_stale_despite_fresh_aggregate_blocks_move(self):
@@ -800,12 +813,15 @@ class UnifiedTests(unittest.TestCase):
                 self.runtime.closed = False
         self.assertEqual(self.sdk.calls, [])
 
-    def test_gripper_menu_is_one_width_field_with_effective_bounds(self):
+    def test_gripper_menu_has_width_and_torque_fields_with_effective_bounds(self):
         schema = self.runtime.get_tools()[0]['inputSchema']
         self.assertIn({'const': 'set_gripper_opening', 'title': 'Set gripper'},
                       schema['properties']['action']['oneOf'])
         prop = schema['properties']['width_mm']
         self.assertEqual((prop['minimum'], prop['maximum'], prop['default']), (0, 70, 20))
+        self.assertEqual(schema['x-action-params']['set_gripper_opening']['params'], ['width_mm', 'torque_nm'])
+        torque = schema['properties']['torque_nm']
+        self.assertEqual((torque['minimum'], torque['maximum'], torque['default']), (.001, 1, .5))
         for width in (0, 20, 70):
             self.sdk.gripper_enabled = True
             self.sdk.calls.clear()
@@ -817,6 +833,41 @@ class UnifiedTests(unittest.TestCase):
             with self.subTest(width=width), self.assertRaises(ValueError):
                 self.call('set_gripper_opening', width_mm=width)
         self.assertEqual(self.sdk.calls, [])
+
+    def test_gripper_torque_reaches_enable_target_and_followup_commands(self):
+        self.sdk.gripper_enabled = False
+        result = self.call('set_gripper_opening', width_mm=25, torque_nm=.2344)
+        commands = [c for c in self.sdk.calls if c[0] == 'gripper']
+        self.assertGreater(len(commands), 2)
+        self.assertEqual(commands[0][1], 20000)  # Enable at measured opening.
+        self.assertEqual(commands[-1][1], 25000)
+        self.assertTrue(all(c[2:] == (234, 1, 0) for c in commands))
+        self.assertEqual(result['commanded_torque_nm'], .234)
+        self.assertEqual(self.runtime.task['request']['torque_nm'], .2344)
+        self.assertEqual(self.runtime.gripper_torque, .5)
+
+    def test_gripper_torque_omitted_or_empty_uses_configured_default(self):
+        self.runtime.gripper_torque = .35
+        for args in ({}, {'torque_nm': ''}):
+            self.sdk.calls.clear()
+            result = self.call('set_gripper_opening', width_mm=20, **args)
+            self.assertEqual(result['commanded_torque_nm'], .35)
+            self.assertTrue(all(c[2] == 350 for c in self.sdk.calls if c[0] == 'gripper'))
+
+    def test_invalid_gripper_torque_is_rejected_before_preparation_or_commands(self):
+        self.sdk.mode = 'TEACHING_MODE(0x2)'
+        for torque in (0, -.1, 1.001, float('nan'), float('inf'), True, '0.3'):
+            with self.subTest(torque=torque), self.assertRaises(ValueError):
+                self.call('set_gripper_opening', width_mm=25, torque_nm=torque)
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_gripper_torque_bounds_are_accepted_without_changing_deployment_default(self):
+        for torque in (.001, 1):
+            self.sdk.calls.clear()
+            result = self.call('set_gripper_opening', width_mm=20, torque_nm=torque)
+            self.assertEqual(result['commanded_torque_nm'], torque)
+            self.assertTrue(all(c[2] == round(torque*1000) for c in self.sdk.calls if c[0] == 'gripper'))
+        self.assertEqual(self.runtime.gripper_torque, .5)
 
 
 class TransformTests(unittest.TestCase):
