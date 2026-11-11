@@ -16,8 +16,8 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         alsa-utils \
         libasound2-dev \
         sshpass \
-        openssh-client \\
-        libusb-1.0-0 && \\
+        openssh-client \
+        libusb-1.0-0 && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
@@ -25,7 +25,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 
 # Official RealSense Linux ARM64 / CPython 3.10 wheel. Do not build the
 # native SDK from source in this image; camera SDK runs in isolated workers.
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --only-binary=:all: \\
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --only-binary=:all: \
     pyrealsense2==2.56.5.9235
 
 # Build tianyi ROS2 message packages (bodyctrl_msgs + lyre_msgs)
