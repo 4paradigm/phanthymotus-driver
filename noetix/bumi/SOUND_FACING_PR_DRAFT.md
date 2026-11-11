@@ -71,8 +71,8 @@ messages and Fake Controllers; no real robot SDK or motors were used.
   post-fix run was **677 passed, 5 failed, 1 skipped** (see below). These counts
   include the Sound Facing/Bumi subsets and must not be added together.
 - Four of those failures reproduce on latest official Driver main (**144 passed,
-  4 failed** for the two global files): three Pico upload-glue expectations and
-  one S10 Pro missing sibling COPY. No unrelated fixes are included.
+  4 failed** for the two global files): two Pico upload-glue checks, one global
+  bundle-count expectation, and one S10 Pro missing sibling COPY. No unrelated fixes are included.
 - Opt-in real ROS2/MCP/Fake Controller integration: initial clock-related failure,
   subsequent **1 passed**. It covers three turns, cancellation and no orphan ACPs.
 - Current official Core/API/Canvas/Agent/ACP harness: initial clock-related
@@ -82,7 +82,7 @@ messages and Fake Controllers; no real robot SDK or motors were used.
   loss and unconsumed duplicate-result overwrite. Internal Card turns do not
   depend on these paths; Core was not modified.
 - Ten cancellation evidence cases acknowledged the software signal with maximum
-  measured delay **0.0001768101 s** (assertion bound 0.2 s), not physical stop time.
+  measured delay **0.0001704210 s** (assertion bound 0.2 s), not physical stop time.
 
 Raw host-clock sampling confirmed four realtime jumps while monotonic/raw/
 boottime remained continuous. Later integration runs were scheduled after a host

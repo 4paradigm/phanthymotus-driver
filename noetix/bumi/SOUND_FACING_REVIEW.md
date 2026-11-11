@@ -77,7 +77,7 @@ and its process lock: disable completed before releasing that source lock,
 with a 0.000245495 s software signal delay and no restart or deadlock.
 
 Ten directed evidence cases acknowledged Fake Controller cancellation. Maximum
-measured software signal delay was 0.0001768101 seconds (assertion bound 0.2 s).
+measured software signal delay was 0.0001704210 seconds (assertion bound 0.2 s).
 This is not physical braking time. Tests also cover actual Card stop/disable/
 cancel, late enable, stale-result replacement, renew/revoke and bounded workers.
 
@@ -113,8 +113,9 @@ excluded the real robot SDK. Counts are current, not historical.
 | Real Core/API/Canvas/Agent/ACP | initial clock failure; subsequent 20 scenarios passed |
 | Generic Core ACP edge reproductions | 2 failed, baseline defects |
 
-The four extended failures are Pico `test_every_http_bundle_is_wired`,
-`test_the_glue_precedes_the_body_read_and_any_path_check`,
+The four extended failures are the global bundle-count expectation
+`test_every_http_bundle_is_wired`, the two Pico upload-glue checks
+`test_the_glue_precedes_the_body_read_and_any_path_check` and
 `test_the_glue_is_self_contained`, and S10 Pro
 `test_every_imported_sibling_is_copied`. They also fail on latest official main;
 no unrelated device fix is included. The ordinary Bumi skip is opt-in ROS,
