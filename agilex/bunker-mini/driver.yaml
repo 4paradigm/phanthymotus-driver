@@ -15,3 +15,4 @@ cards:
   - { name: remote_controller, type: sensor }
   - { name: odom, type: sensor }
   - { name: base_drive, type: actuator }
+  - { name: bunker_servo, type: actuator }

@@ -73,8 +73,30 @@ The physical remote can still take priority; set its control switch as
 described in the product manual. Motion requires fresh normal state, no critical
 fault flags, and remains within configured speed limits. Software movement
 permission defaults to enabled and can be disabled with
-`BUNKER_MOTION_ENABLED=0`. A future servo card can separately consume a
-navigation/control topic without changing `base_drive`.
+`BUNKER_MOTION_ENABLED=0`.
+
+`bunker_servo` consumes ActuCore navi's `control/velocity` output. Connect navi's
+command output to this card and connect the single `odom` output to navi's
+`state/odom` input. The servo's `info` and `start` responses advertise its
+`motus.control/1` descriptor for Agent Core negotiation. Its six-axis body
+twist is `[vx, vy, vz, wx, wy, wz]`, in m/s and **rad/s**; only `vx` and `wz`
+are supported, with the other axes pinned to zero. This stream uses rad/s even
+though the human-facing `base_drive.move.vyaw` uses degrees/s.
+
+The subscription runs in the Agent Core DDS domain with BEST_EFFORT QoS and a
+one-message queue. `ControlSink` checks the schema, timestamps/observation age,
+sequence/source arbitration and limits, and caps each command step to 0.1 m/s
+and 0.2 rad/s. Both the sink watchdog and the CAN target lease expire after
+300 ms without accepted commands. Fresh chassis state, CAN mode and critical
+fault checks still apply. `pause` stops the servo while keeping its subscription;
+`resume` rechecks the chassis and creates a fresh sink. `stop` removes the
+subscription. A direct `base_drive.move` pauses the servo and leaves it paused
+after completion; resume explicitly to let navigation take control again.
+Servo start/resume is refused while a direct move is active.
+
+No footprint or minimum usable speed has been measured on this chassis, so
+the descriptor does not invent these values. The odometry reports measured
+forward velocity only; navigation has no measured yaw-rate feedback.
 
 Build from the repository driver build system so `common/` is included in the
 Docker context. Run protocol tests with `pytest agilex/bunker-mini/tests` and the

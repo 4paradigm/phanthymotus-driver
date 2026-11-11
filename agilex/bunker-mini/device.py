@@ -12,6 +12,7 @@ import urllib.request
 from uuid import uuid4
 
 from can_runtime import BunkerCAN, find_gs_usb_interface
+from bunker_servo import BunkerServo
 from common.odom import build_interface, build_sample
 from common.vendor_runtime import tool
 from dds_bridge import BunkerDDSBridge
@@ -70,6 +71,7 @@ class BunkerMiniDevice:
         self._motion_lock = threading.Lock()
         self._active_move_id = None
         self._active_move_stop = None
+        self.servo = BunkerServo(self)
 
     def start(self):
         interface = (os.environ.get("BUNKER_CAN_INTERFACE")
@@ -85,11 +87,14 @@ class BunkerMiniDevice:
         self._stop.set()
         if self._state_thread:
             self._state_thread.join(timeout=2)
+        self.servo.dispatch("stop", {})
         self.can.stop()
         self.bridge.close()
 
     def _publish_loop(self):
         while not self._stop.wait(0.1):
+            if getattr(self, "servo", None) is not None:
+                self.servo.tick()
             snapshot = self.can.snapshot()
             if "motor_state" in self._enabled_sensors:
                 self.bridge.publish_state(self._motor_state(snapshot))
@@ -289,10 +294,13 @@ class BunkerMiniDevice:
             tool("odom", "sensor", "Measured Bunker Mini odometry",
                  topic_out=odom_topics),
             tool("base_drive", "actuator", "Guarded Bunker Mini base movement", schema),
+            self.servo.get_tool(),
         ]
 
     def dispatch(self, action, args):
         tool_name = args.get("_tool_name", "base_drive")
+        if tool_name == "bunker_servo":
+            return self.servo.dispatch(action, args)
         if tool_name in ("motor_state", "battery", "remote_controller", "odom"):
             if action == "start":
                 self._enabled_sensors.add(tool_name)
@@ -316,6 +324,7 @@ class BunkerMiniDevice:
             return {"state": "ready"}
         if tool_name == "base_drive" and action == "stop":
             with self._motion_lock:
+                self.servo.pause_locked()
                 if self._active_move_stop is not None:
                     self._active_move_stop.set()
                 self._direct_until = 0.0
@@ -347,6 +356,7 @@ class BunkerMiniDevice:
             with self._motion_lock:
                 if self._active_move_id is not None:
                     return {"error": "a timed base move is already running"}
+                self.servo.pause_locked()
                 self.can.stop_motion()
                 self._direct_until = time.monotonic() + duration
                 self._active_move_id = action_id

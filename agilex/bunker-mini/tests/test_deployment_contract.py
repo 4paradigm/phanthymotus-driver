@@ -16,7 +16,7 @@ def test_mcp_port_is_unique_and_consistent():
     assert port == config["mcp_port"] == 15744
     assert metadata["mcp_url"] == f"http://localhost:{port}/mcp"
     assert {card["name"] for card in metadata["cards"]} == {
-        "motor_state", "battery", "remote_controller", "odom", "base_drive"}
+        "motor_state", "battery", "remote_controller", "odom", "base_drive", "bunker_servo"}
     assert sum(card["type"] == "sensor" for card in metadata["cards"]) == 4
     assert f"EXPOSE {port}" in dockerfile
     for path in REPO_ROOT.rglob("driver.yaml"):

@@ -65,6 +65,19 @@ class BunkerDDSBridge:
     def publish_odom(self, sample: dict) -> None:
         self._publish(self._robot_odom, sample)
 
+    def bind_control(self, topic: str, callback):
+        # Navi publishes in the Core domain. BEST_EFFORT also matches reliable
+        # publishers, with a shallow queue so old commands do not accumulate.
+        from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
+                               ReliabilityPolicy)
+        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                         history=HistoryPolicy.KEEP_LAST, depth=1,
+                         durability=DurabilityPolicy.VOLATILE)
+        return self._core.create_subscription(self._String, topic, callback, qos)
+
+    def unbind_control(self, subscription):
+        self._core.destroy_subscription(subscription)
+
     def close(self) -> None:
         self._ros2.executor_core.remove_node(self._core)
         self._ros2.executor_robot.remove_node(self._robot)

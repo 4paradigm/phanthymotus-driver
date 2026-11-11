@@ -51,6 +51,8 @@ def _bare_device():
     )
     device.config = {}
     device.can = FakeCAN()
+    from bunker_servo import BunkerServo
+    device.servo = BunkerServo(device)
     return device
 
 
@@ -96,7 +98,8 @@ def test_move_advertises_async_completion_contract():
     assert schema["x-completion"] == {"actions": ["move"], "timeout": 20}
     assert schema["properties"]["action"]["enum"] == ["move"]
     assert schema["properties"]["vyaw"]["description"].endswith("degrees/s")
-    assert all("topic_in" not in card for card in device.get_tools())
+    assert all("topic_in" not in card for card in device.get_tools()
+               if card["name"] != "bunker_servo")
 
 
 def test_base_drive_uses_degrees_per_second_and_requests_can_mode_internally():
@@ -173,7 +176,7 @@ def test_base_drive_accepts_configured_velocity_limits():
 
 def test_sensor_cards_expose_one_navi_compatible_odometry_port():
     cards = {card["name"]: card for card in _bare_device().get_tools()}
-    assert set(cards) == {"motor_state", "battery", "remote_controller", "odom", "base_drive"}
+    assert set(cards) == {"motor_state", "battery", "remote_controller", "odom", "base_drive", "bunker_servo"}
     odom_ports = cards["odom"]["topic_out"]
     assert odom_ports == [{"topic": "/bunker_mini/state/odom", "format": "state/odom"}]
 
@@ -287,16 +290,27 @@ def test_dds_bridge_binds_forwards_and_closes_entities():
 
     node_module = types.ModuleType("rclpy.node")
     node_module.Node = Node
+    qos_module = types.ModuleType("rclpy.qos")
+    qos_module.QoSProfile = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    qos_module.ReliabilityPolicy = types.SimpleNamespace(BEST_EFFORT="best_effort")
+    qos_module.HistoryPolicy = types.SimpleNamespace(KEEP_LAST="keep_last")
+    qos_module.DurabilityPolicy = types.SimpleNamespace(VOLATILE="volatile")
     std_msgs = types.ModuleType("std_msgs.msg")
     std_msgs.String = String
     with patch.dict(sys.modules, {"rclpy": types.ModuleType("rclpy"),
                                   "rclpy.node": node_module,
+                                  "rclpy.qos": qos_module,
                                   "std_msgs": types.ModuleType("std_msgs"),
                                   "std_msgs.msg": std_msgs}):
         from dds_bridge import BunkerDDSBridge
         ros = types.SimpleNamespace(ctx_robot=object(), ctx_core=object(),
                                     executor_robot=Executor(), executor_core=Executor())
         bridge = BunkerDDSBridge(ros, "bunker")
+        callback = lambda message: None
+        subscription = bridge.bind_control("/actucore/navi/cmd", callback)
+        assert subscription in bridge._core.subscriptions
+        assert subscription not in bridge._robot.subscriptions
+        bridge.unbind_control(subscription)
         bridge.publish_battery({"voltage_v": 51.0})
         bridge.publish_remote_controller({"swa": 2})
         bridge.publish_odom({"twist": [0.1, None, None, None, None, None]})
@@ -309,6 +323,7 @@ def test_dds_bridge_binds_forwards_and_closes_entities():
     assert ("/bunker/state/motor_state", '{"ok":true}') in events
     assert ("destroy_node", "bunker_mini_core_bridge") in events
     assert ("destroy_node", "bunker_mini_robot_bridge") in events
+    assert ("destroy_subscription", "/actucore/navi/cmd") in events
 
 
 def test_battery_fallback_only_reports_available_measurements():
