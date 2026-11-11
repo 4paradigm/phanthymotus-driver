@@ -37,7 +37,6 @@ cards:
   - { name: mainboard,              type: sensor }
   - { name: model,                  type: resource }
   - { name: camera_rgb,             type: sensor }
-  - { name: camera_rgbd,            type: sensor }
   - { name: camera_depth,           type: sensor }
   - { name: camera_distance,        type: sensor }
   - { name: vision_capture,         type: actuator }
