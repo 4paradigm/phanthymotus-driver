@@ -30,7 +30,7 @@ The four sensor cards are **independent** in Agent Core:
 | `camera_wrist_right_depth` | `/<namespace>/camera/wrist/right/depth` | `image/depth-zlib` |
 
 Each D405 is owned by **one** `pyrealsense2` process; the RGB and depth
-cards for that wrist share its RGB8/Z16 640x480 at 15 FPS pipeline.
+cards for that wrist share its RGB8/Z16 640x480 at 30 FPS pipeline.
 Activating one does not activate the other card's output. Stopping one
 channel preserves the other; stopping both releases the USB device.
 All four wrist streams start automatically when the driver service starts,

@@ -194,7 +194,8 @@ def test_capture_worker_protects_python_logs_before_initialization(monkeypatch, 
         return False
 
     monkeypatch.setattr(wrist.os.path, "isfile", missing_profile)
-    for name in ("ROS_DOMAIN_ID", "RMW_IMPLEMENTATION", "FASTRTPS_DEFAULT_PROFILES_FILE"):
+    for name in ("ROS_DOMAIN_ID", "RMW_IMPLEMENTATION", "FASTRTPS_DEFAULT_PROFILES_FILE",
+                 "RCUTILS_COLORIZED_OUTPUT"):
         monkeypatch.setenv(name, wrist.os.environ.get(name, ""))
     status = queue.Queue()
     wrist._capture_worker("test_robot", "left", "261922273335", 85,
@@ -303,3 +304,13 @@ def test_bundle_starts_all_wrist_previews_without_project_start(monkeypatch):
         assert left._proc.is_alive() and left._channels.value == 1
     finally:
         bundle.stop_all()
+
+
+def test_plugins_are_discoverable_by_the_wrist_prefix():
+    assert wrist.WristCameraPlugin.PREFIX == "camera_wrist"
+    cards = [wrist.WristCameraPlugin(session(side), channel)
+             for side in ("left", "right") for channel in ("rgb", "depth")]
+    discovered = {card.get_tool()["name"] for card in cards
+                  if card.PREFIX == "camera_wrist"}
+    assert discovered == {"camera_wrist_left_rgb", "camera_wrist_left_depth",
+                          "camera_wrist_right_rgb", "camera_wrist_right_depth"}

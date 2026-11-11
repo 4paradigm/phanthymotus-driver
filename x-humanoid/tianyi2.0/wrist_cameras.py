@@ -19,7 +19,7 @@ import zlib
 
 WIDTH = 640
 HEIGHT = 480
-FPS = 15
+FPS = 30
 STARTUP_SECONDS = 12.0
 STALE_SECONDS = 5.0
 CHANNELS = ("rgb", "depth")
@@ -94,6 +94,7 @@ def _capture_worker(namespace, side, serial, quality, channels,
     logsafe.install()
 
     # Set before rclpy creates a participant; never expose camera data on LAN.
+    os.environ["RCUTILS_COLORIZED_OUTPUT"] = "0"
     os.environ["ROS_DOMAIN_ID"] = "42"
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
     os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = DDS_PROFILE
@@ -354,14 +355,20 @@ class WristCameraSession:
 
 
 class WristCameraPlugin:
-    """One fixed wrist/modality sensor card; no implicit camera motion."""
+    """One fixed wrist/modality sensor card; no implicit camera motion.
+
+    TianyiDeviceBundle owns configuration and explicitly injects the shared
+    session and channel, so RGB/depth cannot create competing device owners.
+    """
+
+    PREFIX = "camera_wrist"
 
     def __init__(self, session: WristCameraSession, channel: str):
         if channel not in CHANNELS:
             raise ValueError("invalid wrist channel")
         self._session = session
         self._channel = channel
-        self._name = f"camera_wrist_{session.side}_{channel}"
+        self._name = f"{self.PREFIX}_{session.side}_{channel}"
 
     def get_tool(self):
         return {
