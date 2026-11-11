@@ -67,7 +67,7 @@ class NativeContractTests(unittest.IsolatedAsyncioTestCase):
         a.walk.dispatch_velocity.assert_called_once_with(-.2,0.,20.,2.)
         await a.execute_tool('loco_leg',{'action':'move','vy':'0'})
         with self.assertRaises(ValueError):await a.execute_tool('loco_leg',{'action':'move','vy':.1})
-        for value in (.01,math.nan,math.inf,True,-1):
+        for value in (.01,math.nan,math.inf,True,-2):
             with self.assertRaises(ValueError):a.call('loco_leg',{'action':'move','duration':value})
     async def test_native_publish_does_not_send_diagnostic_urdf_in_stream(self):
         a=adapter();raw=sample('WF_TRON2A_TEST',10);emitted={}
@@ -144,7 +144,7 @@ class ReconnectionIdentityTests(unittest.TestCase):
         self.assertEqual(r.configuration['state'], 'pending')
         r.accept_info(notify('WF_TRON2A_TEST'))
         self.assertEqual(r.configuration['mode'], 'wheel_foot')
-        self.assertEqual(battery_stream(r.sample('battery_state')), {'soc': 94, 'current': -1740, 'cycle': 32})
+        self.assertEqual(battery_stream(r.sample('battery_state')), {'soc': 94, 'current': -1740, 'cycle': 32, 'bms_current_valid': True})
         self.assertEqual(model(r.configuration)['model_id'], 'WF_TRON2A')
         self.assertEqual(len(joints_stream(sample(r.serial, 10), r.configuration)['joints']), 10)
 
@@ -154,3 +154,15 @@ class ReconnectionIdentityTests(unittest.TestCase):
         r.disconnect('test')
         with self.assertRaises(ValueError):
             r.accept_info({'accid': 'WF_TRON2A_TEST', 'data': {}})
+
+
+class DisplayFrameTests(unittest.TestCase):
+    def test_lower_models_have_upright_display_frame_without_changing_motor_axes(self):
+        for mode in ('wheel_foot', 'sole_foot'):
+            root = ET.fromstring(model({'mode': mode})['urdf'])
+            joint = root.find("joint[@name='display_world_Joint']")
+            self.assertEqual(joint.find('parent').get('link'), 'display_world')
+            self.assertEqual(joint.find('child').get('link'), 'base_Link')
+            pitch = float(joint.find('origin').get('rpy').split()[1])
+            self.assertAlmostEqual(-math.sin(pitch), 1.)  # native +X -> display +Z
+            self.assertEqual(len([j for j in root.findall('joint') if j.get('type') != 'fixed']), 10)

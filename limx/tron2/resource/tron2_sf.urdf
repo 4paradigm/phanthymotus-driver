@@ -1,5 +1,11 @@
 <?xml version='1.0' encoding='utf-8'?>
 <robot name="bipedal_robot">
+  <link name="display_world" />
+  <joint name="display_world_Joint" type="fixed">
+    <parent link="display_world" />
+    <child link="base_Link" />
+    <origin xyz="0 0 0" rpy="0 -1.5707963267948966 0" />
+  </joint>
   <link name="base_Link">
     </link>
   <link name="base_imu">

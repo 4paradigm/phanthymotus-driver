@@ -29,7 +29,7 @@ TOPICS = {name: '/limx_tron2/' + name for name in
 # Existing skeleton topics remain public; all JSON sensors use this map.
 SENSOR_TOPICS = {'joints':'/limx_tron2/state/joints','battery':'/limx_tron2/state/battery',**TOPICS}
 DESCRIPTIONS = {
-    'battery':'TRON2电池状态（只读，1Hz）：输出剩余电量soc（0～100%）、电池电流current（mA，保留厂家原始有符号读数）和充电循环次数cycle（非负整数）。字段为null表示暂无有效数据。',
+    'battery':'TRON2电池状态（只读，1Hz）：soc为剩余电量0～100%（首项）；current为有符号电流mA；cycle为非负整数充电循环数。bms_voltage为厂家原始电压读数；bms_current_valid为电流有效标志；bms_current_updated_at为厂家电流更新时间原值；bms_temp1～bms_temp5为5路温度采样原值（未确认倍率，不换算为摄氏度）。其他bms_字段按固件原名输出；不推测未公开字段语义。null表示暂无有效数据。',
     'joints':'TRON2当前构型骨架：按厂家ACCID自动识别上肢DACH（16关节）或下肢WF/SF（10关节），发布官方关节名及q/dq/tau；使用平台原生sensor/skeleton与独立model模型资源，不伪造IMU姿态。',
     'camera': 'TRON2 头部RGB实时画面；start连接厂家MJPEG并发布JPEG图像，stop释放连接；限10fps，不录像、不控制头部，接收时间不是测量时间（只读）',
     'camera_left': 'TRON2 左腕RGB实时画面；厂家left校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',
@@ -171,17 +171,17 @@ class Adapter:
 
     def _loco_tool(self):
         return {'name':'loco_leg','type':'actuator','multiInstance':False,
-            'description':'TRON2下肢运动：stand_up完整起立，sit_down停止并坐下，move定时移动，stop_move停止移动并保持站立。仅支持下肢构型；轮足无横移。vx范围-3～3 m/s（正前负后），vyaw约±85.943669 deg/s（正左负右），默认均为0；duration为0表示停止，或0.1～60秒，默认2秒。计时结束另发约1秒零速度，不保证精确距离或转角。',
+            'description':'TRON2下肢运动：stand_up完整起立，sit_down停止并坐下，move定时移动，stop_move停止移动并保持站立。仅支持下肢构型；轮足无横移。vx范围-3～3 m/s（正前负后），vyaw约±85.943669 deg/s（正左负右），默认均为0；duration为-1持续移动、0停止，或0.1～60秒，默认2秒。计时结束另发约1秒零速度，不保证精确距离或转角。',
             'inputSchema':{'type':'object','additionalProperties':False,
                 'properties':{'action':{'type':'string','enum':['stand_up','sit_down','move','stop_move','start','stop','info'],'description':'选择要执行的动作'},
                     'vx':{'type':'number','minimum':-3,'maximum':3,'default':0,'title':'vx','description':'前后速度，单位m/s，范围-3～3，默认0；正值前进、负值后退、0不前后移动。'},
                     'vyaw':{'type':'number','minimum':-85.94366926962348,'maximum':85.94366926962348,'default':0,'title':'vyaw','description':'转向角速度，单位deg/s，范围约-85.943669～85.943669，默认0；正值左转、负值右转、0不转向。内部转换为厂家rad/s。'},
-                    'duration':{'type':'number','minimum':0,'maximum':60,'anyOf':[{'const':0},{'minimum':.1,'maximum':60}],'default':2,'title':'duration','description':'运动时间，单位秒；0表示停止，或0.1～60，默认2。结束后另发约1秒零速度，不支持-1无限持续。'},
+                    'duration':{'type':'number','minimum':-1,'maximum':60,'anyOf':[{'const':-1},{'const':0},{'minimum':.1,'maximum':60}],'default':2,'title':'duration','description':'运动时间，单位秒；-1持续移动直到stop_move或生命周期stop；0停止，0.1～60定时，默认2。停止后另发约1秒零速度。'},
                     **metadata_properties()},'required':['action'],
                 'x-resource':['lower_body'],'x-completion':{'actions':['stand_up','sit_down','move'],'timeout':150},
                 'x-action-params':{'stand_up':{'params':[],'description':'从启动/准备姿态完整起立并保持站立，厂家状态WALK表示完成；无速度和时间参数，不命令前进或转向。'},
                     'sit_down':{'params':[],'description':'停止移动并折叠坐回启动姿态；厂家状态SIT或DAMPING表示完成，无速度和时间参数。'},
-                    'move':{'params':['vx','vyaw','duration'],'description':'轮足定时移动：vx为-3～3 m/s（正前负后），vyaw约±85.943669 deg/s（正左负右），默认0；duration为0停止或0.1～60秒，默认2秒。需要先起立进入WALK，结束后发送零速度，无横移。'},
+                    'move':{'params':['vx','vyaw','duration'],'description':'轮足定时移动：vx为-3～3 m/s（正前负后），vyaw约±85.943669 deg/s（正左负右），默认0；duration为-1持续移动、0停止或0.1～60秒，默认2秒。需要先起立进入WALK，结束后发送零速度，无横移。'},
                     'stop_move':{'params':[],'description':'请求零速度停止移动，保持站立，不执行坐下。'}}}}
 
 
@@ -283,8 +283,8 @@ class Adapter:
             if action not in ('stand_up','sit_down','move','stop_move'):raise ValueError('Unsupported locomotion action')
             if action=='move':
                 value=form_number(args.get('duration'),'duration',2)
-                if isinstance(value,bool) or not isinstance(value,(int,float)) or not 0<=value<=60:raise ValueError('duration must be 0 or 0.1 to 60 seconds')
-                if value and value<.1:raise ValueError('duration must be 0 or 0.1 to 60 seconds')
+                if isinstance(value,bool) or not isinstance(value,(int,float)) or not (value == -1 or 0<=value<=60):raise ValueError('duration must be -1, 0 or 0.1 to 60 seconds')
+                if value not in (-1, 0) and value<.1:raise ValueError('duration must be -1, 0 or 0.1 to 60 seconds')
                 if form_number(args.get('vy'),'vy',0)!=0:raise ValueError('Lateral travel is not supported; remove the legacy vy field or set it to 0')
                 return {'status':'validated','duration':value,**{k:form_number(args.get(k),k,0) for k in ('vx','vyaw')}}
             return {'status':'validated'}

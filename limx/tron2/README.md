@@ -244,7 +244,7 @@ sudo docker exec embodied-limx-tron2 /bin/bash -c 'source /opt/ros/humble/setup.
 
 启动后按实际notify_robot_info.accid识别DACH/WF/SF；未知构型不根据关节数量猜测。DACH、WF有现场观察，SF只有文档与模型测试。默认卡片为battery、joints、loco_leg、loco_servo_arm及已有上肢卡片。旧画布中的leg_loco/arm_servo需重新添加为loco_leg/loco_servo_arm。
 
-- loco_leg：stand_up先进入STAND准备，再进入WALK平衡；sit_down先发零速度后请求折叠。完成依据发送后收到的厂家status。move参数vx为m/s、[-3,3]（正前负后），vyaw为deg/s、约±85.943669（正左负右），duration为0停止或0.1～60秒，默认2秒。无横移，结束另发约1秒零速度。start/stop是生命周期，不自动起立/坐下；需要停车用stop_move。不宣称精确距离、转角或物理停稳。
+- loco_leg：stand_up先进入STAND准备，再进入WALK平衡；sit_down先发零速度后请求折叠。完成依据发送后收到的厂家status。move参数vx为m/s、[-3,3]（正前负后），vyaw为deg/s、约±85.943669（正左负右），duration为-1持续移动、0停止或0.1～60秒，默认2秒。无横移，结束另发约1秒零速度。start/stop是生命周期，不自动起立/坐下；需要停车用stop_move。不宣称精确距离、转角或物理停稳。
 - loco_servo_arm：将标准control/joint流接到输入口，motus.control/1、joint_position、18维目标，采用官方tron2_env启用头部的DEFAULT_LAYOUT_WITH_HEAD：索引0～6左臂(rad)、7左夹爪(0～1)、8～14右臂(rad)、15右夹爪(0～1)、16头部pitch(rad)、17头部yaw(rad)。消息包含seq、stamp_ms、obs_stamp_ms、ttl_ms、source、priority、mode、dof、values。时间戳为Unix毫秒。建议30Hz，最大50Hz；Driver从实测姿态插值，目标300Hz发送官方ServoJ。应用速度上限0.5rad/s、加速度1.5rad/s²，不是电机额定极限或硬实时保证。夹爪0表示闭合、1表示全开，按官方实现乘100并取整，独立发送request_set_limx_2fclaw_cmd（双侧速度100、夹持力50，无量纲）；ServoJ仍只发送16个关节角。夹爪输入应用步长与速度上限2归一化开口/秒；目标仅在变化时发送，最多跟随声明的expected_hz频率，等待ACK不阻塞关节输出；ACK不代表到位。原单侧gripper卡片的0～94开口限制保持原样，本流式接口按官方0～100协议执行。
 - 伺服生命周期start及已启动时info返回state=ready，stop返回state=idle；暂停状态由paused布尔字段表示，内部运行标志保持独立。公开config动作接收dry_run布尔参数，与configSchema一致；切换后暂停，需显式resume。伺服start仅订阅；pause清空目标并暂停，resume接受新目标，stop释放订阅。dry_run=true只校验、不发电机指令；切换空跑设置后需resume。200ms断流、目标过期停止后续输出。ServoJ无成功ACK，提交数不表示到位。双臂/头部/夹爪显式动作优先并暂停整路流，不自动回零。没有增加确认弹窗或持久保护文件。
 
@@ -270,3 +270,11 @@ PYTHONPATH=.:limx/tron2:limx/tron2/tests python3 -m unittest test_battery test_j
 
 
 准备姿态默认从stand.py内置标定读取，无需在Orin上另外放置startup_profile.json或设置环境变量。显式TRON2_STARTUP_PROFILE仍可覆盖内置值以兼容既有部署。
+
+### 电池扩展、持续移动与下肢显示坐标
+
+电池发布顺序以soc开头，保留current（mA）、cycle，并按固件实际通知补充bms_voltage（原始电压）、bms_current_valid（电流有效标志）、bms_current_updated_at（厂家更新时间原值）、bms_temp1～5（五路原始温度，倍率未确认）及其他bms_扩展字段。不存在的扩展字段不伪造；未知倍率不换算。该通道仅覆盖现有notify_robot_info可读字段，不额外启用底层SDK或修改机器人网络。
+
+move.duration=-1持续发送最新设定速度，直到stop_move、生命周期stop、断连或模式异常；0停车，0.1～60定时。持续模式立即返回continuous=true，不创建等待150秒完成的ACP任务；不自动重试，停止后尝试零速度收尾。无限时长不意味着允许断线后自动恢复移动。
+
+下肢URDF增加display_world固定显示坐标，绕Y轴旋转-90度，使本体前端/顶部标记朝显示+Z。官方base_Link与各电机关节坐标和q值保持原样。该固定视图用于准备跪姿的直观显示，不是IMU测得的地面姿态，不动态跟踪本体倾斜；上肢模型不变。刷新Dashboard重新加载model才能更新已缓存的显示坐标。

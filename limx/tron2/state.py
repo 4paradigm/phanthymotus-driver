@@ -99,9 +99,28 @@ def battery_state(data):
     if isinstance(value, bool) or not isinstance(value, (int, float)) \
             or not 0 <= value <= 100 or not math.isfinite(value):
         raise ValueError('Invalid battery percentage')
-    return {'percentage': value, 'current': _bms_integer(data.get('bms_current')) if data.get('bms_current_valid') is True else None,
+    result = {'percentage': value, 'current': _bms_integer(data.get('bms_current')) if data.get('bms_current_valid') is True else None,
             'cycle': _bms_integer(data.get('bms_charging_cycle'), nonnegative=True), 'unit': '%',
             'source': 'notify_robot_info.data.battery'}
+    # Preserve firmware BMS extensions without guessing scale or inventing values.
+    result['bms'] = {}
+    for key, raw in data.items():
+        if not isinstance(key, str) or not key.startswith('bms_') or len(key) > 80:
+            continue
+        if raw is None or type(raw) is bool:
+            parsed = raw
+        elif isinstance(raw, (int, float, str)):
+            if isinstance(raw, str) and len(raw) > 128:
+                continue
+            try:
+                number = float(raw)
+                parsed = (int(number) if number.is_integer() else number) if math.isfinite(number) else None
+            except (ValueError, OverflowError):
+                parsed = raw if isinstance(raw, str) else None
+        else:
+            continue
+        result['bms'][key] = parsed
+    return result
 
 
 def battery_stream(sample):
@@ -109,4 +128,8 @@ def battery_stream(sample):
     data=sample.get('data') if sample.get('available') else None
     if not data:return {'soc':None,'current':None,'cycle':None}
     soc=data['percentage']
-    return {'soc':int(soc) if float(soc).is_integer() else soc,'current':data.get('current'),'cycle':data.get('cycle')}
+    result = {'soc':int(soc) if float(soc).is_integer() else soc,'current':data.get('current'),'cycle':data.get('cycle')}
+    for key, value in data.get('bms', {}).items():
+        if key not in ('bms_current', 'bms_charging_cycle'):
+            result[key] = value
+    return result

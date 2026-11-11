@@ -237,8 +237,21 @@ class WalkTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(MoveError):w.dispatch('forward',1)
         r.ws.send_json.assert_not_called()
 
+    async def test_continuous_move_runs_until_explicit_stop_without_acp_timeout(self):
+        w,r,report,_ = self.make()
+        result = w.dispatch_velocity(.1, 0., 0., -1)
+        self.assertTrue(result['continuous'])
+        self.assertNotIn('action_id', result)
+        await asyncio.sleep(.12)
+        self.assertFalse(w.task.done())
+        await w.stop_move()
+        await asyncio.wait_for(w.task, 1)
+        self.assertTrue(w.result['zero_velocity_sent'])
+        self.assertEqual(r.ws.send_json.call_args.args[0]['data'], {'x':0.,'y':0.,'z':0.})
+        report.assert_not_awaited()
+
     async def test_invalid_time_and_direction(self):
-        for value in (True,None,'2',0,-1,61,math.nan,math.inf,10**400):
+        for value in (True,None,'2',0,-2,61,math.nan,math.inf,10**400):
             with self.subTest(value=value),self.assertRaises(ValueError):duration(value)
         w,r,_,_=self.make()
         with self.assertRaises(ValueError):w.dispatch('arbitrary',1)

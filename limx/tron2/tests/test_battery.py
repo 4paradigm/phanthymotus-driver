@@ -65,7 +65,23 @@ class StateInputTests(unittest.IsolatedAsyncioTestCase):
         r.accept_info(self.status(battery='42', bms_current='-1800',
             bms_current_valid=True, bms_charging_cycle='5'))
         self.assertEqual(battery_stream(r.sample('battery_state')),
-            {'soc': 42, 'current': -1800, 'cycle': 5})
+            {'soc': 42, 'current': -1800, 'cycle': 5, 'bms_current_valid': True})
         r.disconnect('test')
         self.assertEqual(battery_stream(r.sample('battery_state')),
             {'soc': None, 'current': None, 'cycle': None})
+
+
+class ExtendedBatteryTests(unittest.TestCase):
+    def test_actual_notification_preserves_bms_fields_and_soc_order(self):
+        from vendor import RobotReader
+        r = RobotReader({'serial': '', 'stale_after_seconds': 5})
+        r.accept_info({'accid': 'WF_TRON2A_TEST', 'data': {'battery': '80',
+            'bms_voltage': '53000', 'bms_current': '-1800', 'bms_current_valid': True,
+            'bms_current_updated_at': 1794365000000, 'bms_charging_cycle': '32',
+            **{'bms_temp'+str(i): str(30+i) for i in range(1,6)}, 'bms_future': '7'}})
+        data = battery_stream(r.sample('battery_state'))
+        self.assertEqual(next(iter(data)), 'soc')
+        self.assertEqual(data['bms_voltage'], 53000)
+        self.assertEqual(data['bms_temp5'], 35)
+        self.assertEqual(data['bms_future'], 7)
+        self.assertEqual(data['current'], -1800)

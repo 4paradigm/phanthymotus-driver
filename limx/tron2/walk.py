@@ -26,10 +26,10 @@ def form_number(value,name,default):
 
 def duration(value):
     if isinstance(value,bool) or not isinstance(value,(int,float)):
-        raise ValueError('行走时间须为0.1至60秒的数字')
-    try: valid=math.isfinite(value) and .1<=value<=60
+        raise ValueError('行走时间须为-1（持续移动）或0.1至60秒')
+    try: valid=math.isfinite(value) and (value == -1 or .1<=value<=60)
     except OverflowError:valid=False
-    if not valid:raise ValueError('行走时间须为0.1至60秒的有限数字')
+    if not valid:raise ValueError('行走时间须为-1或0.1至60秒的有限数字')
     return float(value)
 
 
@@ -97,9 +97,14 @@ class Walk:
         self.state,self.result,self.error,self.stop_requested='accepted',None,None,False
         action_id=str(uuid.uuid4())
         self.task=asyncio.create_task(self._run(action_id,action,seconds,velocity))
-        return {'status':'accepted','action_id':action_id,'motion_sent':False,
+        result = {'status':'accepted','action_id':action_id,'motion_sent':False,
                 'direction':action,'time_seconds':seconds,'vx':velocity[0],'vy':velocity[1],
                 'vyaw':math.degrees(velocity[2]),'duration':seconds}
+        if seconds == -1:
+            # A continuous stream has no finite ACP completion deadline.
+            result.pop('action_id')
+            result.update(continuous=True, completion='explicit_stop_required')
+        return result
 
     async def stop_move(self):
         if self.task is not None and not self.task.done():
@@ -141,7 +146,7 @@ class Walk:
     async def _run(self,action_id,action,seconds,velocity):
         ws=self.reader.ws;sent=False;failure=None;zero_sent=False;started=time.monotonic()
         try:
-            self.state='moving';deadline=started+seconds;next_frame=started
+            self.state='moving';deadline=math.inf if seconds == -1 else started+seconds;next_frame=started
             while time.monotonic()<deadline and not self.stop_requested:
                 if self.error:raise MoveError(self.error,sent)
                 self._ready()
@@ -172,5 +177,5 @@ class Walk:
             'completion':'timed_command_stream_finished_and_zero_velocity_sent'}
         if failure:self.result['error']=failure
         self.state='reporting'
-        delivered=await self.report('walk',action_id,'error' if failure or stopped else 'completed',self.result)
+        delivered=True if seconds == -1 else await self.report('walk',action_id,'error' if failure or stopped else 'completed',self.result)
         self.state='unconfirmed' if failure or not delivered else ('stopped' if stopped else 'completed')
