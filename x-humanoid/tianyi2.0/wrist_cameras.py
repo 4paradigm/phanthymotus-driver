@@ -254,6 +254,23 @@ class WristCameraSession:
                 q.close()
         self._queue = self._commands = self._quit = None
 
+    def _send_wanted(self):
+        """Send latest channel selection without blocking the MCP HTTP thread."""
+        if self._commands is None:
+            return
+        state = tuple(sorted(self._wanted))
+        try:
+            self._commands.put_nowait(state)
+        except queue.Full:
+            try:
+                self._commands.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._commands.put_nowait(state)
+            except queue.Full:
+                pass
+
     def start(self, channel):
         with self._lock:
             if channel not in CHANNELS:
@@ -285,7 +302,7 @@ class WristCameraSession:
                     name=f"tianyi_wrist_{self.side}", daemon=True)
                 self._proc.start()
             else:
-                self._commands.put(tuple(self._wanted))
+                self._send_wanted()
             return self.info(channel)
 
     def stop(self, channel):
@@ -296,7 +313,7 @@ class WristCameraSession:
                 self._close()
                 self._status = {}
             elif self._commands is not None:
-                self._commands.put(tuple(self._wanted))
+                self._send_wanted()
             return self.info(channel)
 
     def info(self, channel):
