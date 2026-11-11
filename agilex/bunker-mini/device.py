@@ -331,12 +331,19 @@ class BunkerMiniDevice:
             if not self._motion_enabled:
                 raise RuntimeError("movement is disabled by BUNKER_MOTION_ENABLED=0")
             duration = _validate_move_duration(args.get("duration_s"))
+            max_linear = min(0.2, float(self.config.get("max_linear_m_s", 0.2)))
+            linear = BunkerCAN._limit(args.get("vx"), max_linear, "linear")
             vyaw = args.get("vyaw")
             if isinstance(vyaw, bool) or not isinstance(vyaw, (int, float)) or not math.isfinite(vyaw):
                 raise ValueError("vyaw must be a finite number in degrees/s")
+            max_yaw_rad_s = min(
+                0.4, float(self.config.get("max_angular_rad_s", 0.4)))
+            angular = BunkerCAN._limit(
+                math.radians(float(vyaw)), max_yaw_rad_s, "angular")
             self.can.request_control_mode(protocol.CONTROL_CAN)
-            linear, angular = self.can.validate_target(
-                args.get("vx"), math.radians(float(vyaw)))
+            # Recheck live chassis state and configured bounds immediately
+            # before the target is registered, after mode negotiation.
+            linear, angular = self.can.validate_target(linear, angular)
             action_id = f"bunker_move_{uuid4().hex[:12]}"
             stop_event = threading.Event()
             with self._motion_lock:

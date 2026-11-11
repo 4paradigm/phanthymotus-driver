@@ -15,8 +15,10 @@ class FakeCAN:
         self.targets = []
         self.stops = 0
         self.target_validation = None
+        self.mode_requests = 0
 
     def request_control_mode(self, mode):
+        self.mode_requests += 1
         return {"changed": False, "control_mode": mode}
 
     def validate_target(self, linear, angular):
@@ -111,10 +113,24 @@ def test_base_drive_uses_degrees_per_second_and_requests_can_mode_internally():
 
     with patch("device.threading.Thread", DeferredThread):
         result = device.dispatch("move", {
-            "_tool_name": "base_drive", "vx": 0.1, "vyaw": 30, "duration_s": 1})
-    assert device.can.target_validation == pytest.approx((0.1, 0.5235987756))
+            "_tool_name": "base_drive", "vx": 0.1, "vyaw": 20, "duration_s": 1})
+    assert device.can.target_validation == pytest.approx((0.1, 0.3490658504))
     assert result["state"] == "running"
-    assert result["vyaw_deg_s"] == 30
+    assert result["vyaw_deg_s"] == 20
+    assert device.can.mode_requests == 1
+
+
+@pytest.mark.parametrize("vx", [None, "bad", True, float("nan"), float("inf"), 0.21, -0.21])
+def test_invalid_linear_velocity_is_rejected_before_requesting_can_mode(vx):
+    device = _bare_device()
+
+    with pytest.raises(ValueError):
+        device.dispatch("move", {
+            "_tool_name": "base_drive", "vx": vx, "vyaw": 0, "duration_s": 1})
+
+    assert device.can.mode_requests == 0
+    assert device.can.stops == 0
+    assert device._active_move_id is None
 
 
 def test_sensor_cards_use_familiar_names_and_flat_odometry_ports():
