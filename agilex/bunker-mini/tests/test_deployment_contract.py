@@ -1,0 +1,80 @@
+from pathlib import Path
+
+import yaml
+
+
+DRIVER_DIR = Path(__file__).resolve().parents[1]
+REPO_ROOT = DRIVER_DIR.parents[1]
+
+
+def test_mcp_port_is_unique_and_consistent():
+    metadata = yaml.safe_load((DRIVER_DIR / "driver.yaml").read_text())
+    config = yaml.safe_load((DRIVER_DIR / "config.yaml").read_text())
+    dockerfile = (DRIVER_DIR / "Dockerfile").read_text()
+    port = metadata["port"]
+
+    assert port == config["mcp_port"] == 15744
+    assert metadata["mcp_url"] == f"http://localhost:{port}/mcp"
+    assert {card["name"] for card in metadata["cards"]} == {
+        "motor_state", "battery", "remote_controller", "odom", "base_drive", "bunker_servo"}
+    assert sum(card["type"] == "sensor" for card in metadata["cards"]) == 4
+    assert f"EXPOSE {port}" in dockerfile
+    for path in REPO_ROOT.rglob("driver.yaml"):
+        if path == DRIVER_DIR / "driver.yaml":
+            continue
+        other = yaml.safe_load(path.read_text()) or {}
+        assert other.get("port") != port, f"{path} already uses port {port}"
+
+
+def test_runtime_image_has_deployment_fragment_and_plain_ros_logs():
+    dockerfile = (DRIVER_DIR / "Dockerfile").read_text()
+    assert "COPY deploy/ /deploy/" in dockerfile
+    assert "RCUTILS_COLORIZED_OUTPUT=0" in dockerfile
+    assert "COPY . /work/agilex/bunker-mini" not in dockerfile
+
+    bootstrap = (DRIVER_DIR / "deploy" / "host-can-bootstrap.sh").read_text()
+    assert "--address=\"$bus_address\"" in bootstrap
+    assert "EnableUnitFiles asbb 1 phanthy-bunker-can.service false true" in bootstrap
+    assert "RestartUnit ss phanthy-bunker-can.service replace" in bootstrap
+    assert "\nsystemctl " not in bootstrap
+    entrypoint = (DRIVER_DIR / "deploy" / "entrypoint.sh").read_text()
+    assert "set +u\nsource /opt/ros/humble/setup.bash\nset -u" in entrypoint
+    assert "--bounding-set=-all,+net_raw" in entrypoint
+    assert "--ambient-caps=+net_raw" in entrypoint
+    assert "for _ in $(seq 1 30)" in bootstrap
+    assert "did not reach UP at 500000 bit/s within 30 seconds" in bootstrap
+
+
+def test_host_sys_mount_is_read_only_and_required_persistent_paths_are_explicit():
+    service = (DRIVER_DIR / "deploy" / "service.yml").read_text()
+    metadata = yaml.safe_load(service)["agilex-bunker-mini"]
+    assert "/sys:/sys:ro" in service
+    assert "/lib/modules:/lib/modules:rw" in service
+    assert "/etc/systemd/system:/etc/systemd/system:rw" in service
+    assert "privileged:" not in service
+    assert set(metadata["cap_add"]) == {
+        "SYS_MODULE", "NET_ADMIN", "NET_RAW", "SETUID", "SETGID", "SETPCAP"}
+
+
+def test_every_host_write_mount_and_bootstrap_capability_is_explicit():
+    service = (DRIVER_DIR / "deploy" / "service.yml").read_text()
+    metadata = yaml.safe_load(service)["agilex-bunker-mini"]
+    mounts = metadata["volumes"]
+    writable_host_paths = {mount.split(":", 1)[0]
+                           for mount in mounts if mount.endswith(":rw")}
+    assert writable_host_paths == {
+        "/lib/modules", "/etc/modules-load.d", "/etc/systemd/system",
+        "/usr/local/sbin"}
+    assert "/run/dbus/system_bus_socket:/run/dbus/system_bus_socket" in mounts
+    assert "/sys:/sys:ro" in mounts
+    assert metadata["cap_add"] == [
+        "SYS_MODULE", "NET_ADMIN", "NET_RAW", "SETUID", "SETGID", "SETPCAP"]
+    readme = (DRIVER_DIR / "README.md").read_text()
+    for package, purpose in {
+        "build-essential": "compiles `gs_usb`",
+        "kmod": "`modinfo`,",
+        "iproute2": "provides `ip` for CAN link setup",
+        "systemd": "supplies `busctl`",
+        "util-linux": "supplies `setpriv`",
+    }.items():
+        assert package in readme and purpose in readme

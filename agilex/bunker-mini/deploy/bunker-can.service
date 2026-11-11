@@ -1,0 +1,13 @@
+[Unit]
+Description=AgileX Bunker Mini USB CAN interface
+After=systemd-modules-load.service systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/bash /usr/local/sbin/phanthy-bunker-can up
+ExecStop=/usr/bin/bash /usr/local/sbin/phanthy-bunker-can down
+
+[Install]
+WantedBy=multi-user.target
