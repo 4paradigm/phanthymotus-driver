@@ -19,7 +19,7 @@ import zlib
 
 WIDTH = 640
 HEIGHT = 480
-FPS = 30
+FPS = 15
 STARTUP_SECONDS = 12.0
 STALE_SECONDS = 5.0
 CHANNELS = ("rgb", "depth")
@@ -143,6 +143,8 @@ def _capture_worker(namespace, side, serial, quality, channels,
             qos_profile_sensor_data) for channel in CHANNELS}
 
         last_report = 0.0
+        # This timeout detects a stalled pipeline. Session.info() separately
+        # enforces each requested channel's deadline from its last_frame stamp.
         last_input = time.monotonic()
         while not stop_event.is_set():
             # One shared snapshot: rapid toggles cannot drop the final request.

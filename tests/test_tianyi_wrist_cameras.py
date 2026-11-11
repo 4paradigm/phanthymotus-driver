@@ -314,3 +314,33 @@ def test_plugins_are_discoverable_by_the_wrist_prefix():
                   if card.PREFIX == "camera_wrist"}
     assert discovered == {"camera_wrist_left_rgb", "camera_wrist_left_depth",
                           "camera_wrist_right_rgb", "camera_wrist_right_depth"}
+
+
+@pytest.mark.parametrize("stalled,healthy", [("rgb", "depth"), ("depth", "rgb")])
+def test_missing_channel_times_out_while_sibling_keeps_publishing(monkeypatch, stalled, healthy):
+    import queue
+    from types import SimpleNamespace
+
+    s = session()
+    s._proc = SimpleNamespace(is_alive=lambda: True)
+    s._wanted = {"rgb", "depth"}
+    s._requested_at = {"rgb": 100.0, "depth": 100.0}
+    s._queue = queue.Queue()
+    clock = [100.0]
+    monkeypatch.setattr(wrist.time, "monotonic", lambda: clock[0])
+    # Replay worker reports: the pipeline is alive and one stream never stops.
+    for seconds in range(1, 14):
+        clock[0] = 100.0 + seconds
+        s._queue.put({"error": None, "last_frame": {healthy: clock[0]},
+                      "frames": {healthy: seconds}})
+        active = s.info(healthy)
+        missing = s.info(stalled)
+        assert active["state"] == "running"
+        assert active["fresh"] is True
+        assert active["error"] is None
+        if seconds < 12:
+            assert missing["state"] == "loading"
+        else:
+            assert missing["state"] == "error"
+            assert missing["error"] == "D405 not supplying fresh frames"
+            assert missing["fresh"] is False

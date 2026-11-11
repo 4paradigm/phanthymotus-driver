@@ -30,7 +30,7 @@ The four sensor cards are **independent** in Agent Core:
 | `camera_wrist_right_depth` | `/<namespace>/camera/wrist/right/depth` | `image/depth-zlib` |
 
 Each D405 is owned by **one** `pyrealsense2` process; the RGB and depth
-cards for that wrist share its RGB8/Z16 640x480 at 30 FPS pipeline.
+cards for that wrist share its RGB8/Z16 640x480 at 15 FPS pipeline.
 Activating one does not activate the other card's output. Stopping one
 channel preserves the other; stopping both releases the USB device.
 All four wrist streams start automatically when the driver service starts,
@@ -41,7 +41,9 @@ Stopping a card or the project still stops its output; starting the project
 again reopens stopped streams. Each wrist continues to use one shared process.
 A wrist card reports `loading` while waiting for fresh frames, `running` once
 they arrive, and `error` on worker failure or a 12-second first-frame timeout.
-Agent Core polls `info` while a card is `loading`.
+Agent Core polls `info` while a card is `loading`. Readiness and timeout are
+checked independently per requested channel: ongoing RGB frames cannot hide
+a missing depth stream, and a missing channel does not stop its healthy sibling.
 
 The workers publish directly to domain 42 under the loopback-only
 `/opt/phanthy-motus/dds-local.xml` FastDDS profile; they do not join the
