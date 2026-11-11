@@ -456,6 +456,12 @@ class Hub:
             return None
         return lift[1]["position"]
 
+    def gripper_feedback(self, side: str) -> dict | None:
+        """Read the same feedback snapshot used by `robot_state`."""
+        with self._lock:
+            record = self._latest.get(f"gripper_{side}")
+        return self._aged(record[0], record[1], "grippers") if record else None
+
     def joint_limits(self) -> tuple:
         """`(limits, source)`: the robot's live `/robot_description` if it has been received,
         otherwise the bundled copy of the same vendor URDF."""

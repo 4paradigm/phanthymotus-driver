@@ -42,6 +42,7 @@ HEAD_CONTROLLER = "head_forward_position_controller"
 LIFT_CONTROLLER = "lifting_controller"
 GRIPPER_CONTROLLER = "{side}_unix_gripper3_controller"
 GRIPPER_MODES = ("2-finger", "parallel", "centric")
+GRIPPER_ENDPOINT_TOLERANCE = 0.05
 
 MOTION_CARDS = ("base_drive", "arm_control", "gripper", "lifting", "head")
 
@@ -151,15 +152,17 @@ def motion_tools(config: dict) -> list:
     if on("gripper"):
         tools.append({
             "name": "gripper", "type": "actuator", "multiInstance": False,
-            "description": "Panther 左右夹爪位置指令（0~1，开合含义以厂商文档为准，未经实测）。"
-                           "单次指令，下发后由机器人控制器执行；stop 仅保证本驱动不再下发",
+            "description": "Panther 左右夹爪。set 下发一次位置指令（0~1）；"
+                           "check 只读实际位置、反馈时效和开合状态，开合判断使用实测端点；"
+                           "stop 仅保证本驱动不再下发",
             "inputSchema": schema(
-                ["start", "stop", "info", "set"],
+                ["start", "stop", "info", "set", "check"],
                 {"side": {"type": "string", "enum": ["left", "right"]},
                  "mode": {"type": "string", "enum": list(GRIPPER_MODES), "default": "parallel"},
                  "position": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                  "confirm_motion": _confirm()},
-                {"set": ["side", "mode", "position", "confirm_motion"]}, ["hand_l", "hand_r"])})
+                {"set": ["side", "mode", "position", "confirm_motion"],
+                 "check": ["side"]}, ["hand_l", "hand_r"])})
     if on("lifting"):
         cap = plugins["lifting"]
         tools.append({
@@ -232,8 +235,8 @@ class Motion:
                    "lifting": self.lifting, "head": self.head}[card]
         payload = dict(args)
         payload["action"] = action
-        if action not in ("stop", "info"):
-            self._stopped.discard(card)          # any other action means the card is in use again
+        if action not in ("stop", "info", "check"):
+            self._stopped.discard(card)
         try:
             return handler(payload)
         except (ValueError, RuntimeError, TimeoutError) as exc:
@@ -491,12 +494,15 @@ class Motion:
             return self.start("gripper")
         if action == "info":
             return self.info("gripper")
-        if action != "set":
+        if action not in ("set", "check"):
             raise ValueError(f"unsupported gripper action: {action}")
-        require_confirmation(args)
+        if action == "set":
+            require_confirmation(args)
         side = args.get("side")
         if side not in ("left", "right"):
             raise ValueError("side must be left or right")
+        if action == "check":
+            return self._check_gripper(side)
         position = finite_number(args.get("position"), "position")
         if not 0.0 <= position <= 1.0:
             raise ValueError("position must be in [0, 1]")
@@ -507,6 +513,43 @@ class Motion:
         self._require_active(GRIPPER_CONTROLLER.format(side=side))
         self._io.publish_gripper(side, mode, position)
         return {"state": "commanded", "side": side, "mode": mode, "position": position}
+
+    def _check_gripper(self, side: str) -> dict:
+        feedback = self._state.gripper_feedback(side)
+        result = {"side": side, "opening": "unknown", "position": None, "age_ms": None, "fresh": False}
+        if feedback is None:
+            return {**result, "state": "unavailable", "reason": "no_feedback"}
+        result.update(feedback)
+        if not feedback["fresh"]:
+            return {**result, "state": "unavailable", "reason": "stale_feedback"}
+        if feedback["position"] is None:
+            return {**result, "state": "unavailable", "reason": "invalid_position"}
+
+        result["state"] = "ok"
+        endpoints = (self._plugins.get("gripper") or {}).get("feedback_endpoints") or {}
+        if not isinstance(endpoints, dict):
+            raise ValueError("gripper feedback_endpoints must map sides to measured positions")
+        calibration = endpoints.get(side)
+        if calibration is None:
+            return {**result, "reason": "uncalibrated"}
+        if not isinstance(calibration, dict):
+            raise ValueError(f"{side} feedback endpoints must contain closed and open positions")
+        closed = finite_number(calibration.get("closed"), f"{side} closed feedback endpoint")
+        opened = finite_number(calibration.get("open"), f"{side} open feedback endpoint")
+        span = finite_number(opened - closed, f"{side} feedback span")
+        if span == 0:
+            raise ValueError(f"{side} open and closed feedback endpoints must differ")
+
+        fraction = (feedback["position"] - closed) / span
+        if abs(fraction) <= GRIPPER_ENDPOINT_TOLERANCE:
+            result["opening"] = "closed"
+        elif 1.0 - GRIPPER_ENDPOINT_TOLERANCE <= fraction <= 1.0 + GRIPPER_ENDPOINT_TOLERANCE:
+            result["opening"] = "open"
+        elif 0.0 < fraction < 1.0:
+            result["opening"] = "partial"
+        else:
+            result["reason"] = "outside_calibrated_range"
+        return result
 
     def lifting(self, args: dict) -> dict:
         action = args.get("action", "info")

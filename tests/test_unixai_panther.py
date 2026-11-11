@@ -1085,6 +1085,12 @@ def test_the_shared_bundle_runtime_can_drive_the_plugin(device, hub, motion, con
     from common.vendor_runtime import DriverBundle, jsonable
     bundle = DriverBundle([device.PantherPlugin(hub, motion=motion, config=config)])
     assert len(bundle.get_all_tools()) == 13
+    schema = next(tool["inputSchema"] for tool in bundle.get_all_tools() if tool["name"] == "gripper")
+    assert "check" in schema["properties"]["action"]["enum"]
+    assert schema["x-action-params"]["check"]["params"] == ["side"]
+    hub.on_gripper_left(joint_state(["joint_lf"], [0.023]))
+    result = bundle.dispatch("gripper", {"action": "check", "side": "left"})
+    assert result["position"] == 0.023 and result["reason"] == "uncalibrated"
     for name, arguments in (("model", {}), ("robot_state", {"action": "start"}), ("laser_scan", {"action": "info"}),
                             ("odom", {"action": "stop"}), ("base_drive", {"action": "info"}),
                             ("arm_control", {"action": "stop"}), ("head", {"action": "stop"})):
@@ -2002,6 +2008,41 @@ def test_a_gripper_command_is_checked_and_goes_to_the_right_side(motion, hub, io
     assert "left_unix_gripper3_controller" in motion.dispatch(
         "gripper", "set", {"side": "left", "position": 0.5, "confirm_motion": True})["message"]
     assert len(io.named("gripper")) == 1
+
+
+def test_gripper_check_reads_the_selected_side_even_when_motion_is_disabled(motion, config, hub, io):
+    config["safety"]["commissioning_motion_enabled"] = False
+    config["plugins"]["gripper"]["feedback_endpoints"] = {
+        "left": {"closed": 0.01, "open": 0.08},
+        "right": {"closed": 0.08, "open": 0.01},
+    }
+    motion.dispatch("gripper", "stop", {})
+    hub.on_gripper_left(joint_state(["joint_lf"], [0.013]))
+    hub.on_gripper_right(joint_state(["joint_rf"], [0.013]))
+    for side, opening in (("left", "closed"), ("right", "open")):
+        result = motion.dispatch("gripper", "check", {"side": side})
+        assert (result["state"], result["opening"], result["position"], result["fresh"]) == (
+            "ok", opening, 0.013, True)
+    hub.on_gripper_left(joint_state(["joint_lf"], [0.05]))
+    assert motion.dispatch("gripper", "check", {"side": "left"})["opening"] == "partial"
+    hub.on_gripper_left(joint_state(["joint_lf"], [0.1]))
+    assert motion.dispatch("gripper", "check", {"side": "left"})["reason"] == "outside_calibrated_range"
+    assert motion.dispatch("gripper", "info", {})["state"] == "idle"
+    assert io.calls == []
+
+
+def test_gripper_check_handles_missing_invalid_and_stale_feedback(motion, hub, clock):
+    args = {"side": "left"}
+    assert motion.dispatch("gripper", "check", {})["state"] == "error"
+    result = motion.dispatch("gripper", "check", args)
+    assert (result["opening"], result["reason"], result["fresh"]) == ("unknown", "no_feedback", False)
+    hub.on_gripper_left(joint_state(["joint_lf"], [NAN]))
+    result = motion.dispatch("gripper", "check", args)
+    assert (result["opening"], result["reason"], result["position"]) == ("unknown", "invalid_position", None)
+    hub.on_gripper_left(joint_state(["joint_lf"], [0.023]))
+    clock.advance(1.1)
+    result = motion.dispatch("gripper", "check", args)
+    assert (result["opening"], result["reason"], result["age_ms"]) == ("unknown", "stale_feedback", 1100)
 
 
 def test_a_lift_command_is_capped_and_a_bounded_step_from_the_reading(motion, hub, io):

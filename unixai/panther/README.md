@@ -38,17 +38,26 @@ shown in its own frame and `transformed` is `false`. Ranges are measured from `b
 not from either lidar. The card does not use `/scan` (the vendor's merged scan): it has no
 publisher on this robot, and PR #520 reports otherwise, so confirm with `ros2 topic hz /scan`.
 
-### Motion (all `actuator`, all refused unless the commissioning switch is on)
+### Actuator cards
 
 | Card | Actions | Does | Completion |
 |---|---|---|---|
 | `base_drive` | `start` `stop` `info` `move` | `/cmd_vel_teleop` at 20 Hz for `duration_s` (max 3 s, 0.2 m/s, 0.3 rad/s), then zero velocity five times | `action_id` now, completion posted when it ends |
 | `arm_control` | `start` `stop` `info` `move` | point-to-point `FollowJointTrajectory`, one or both arms | `action_id` now, completion posted when it ends |
-| `gripper` | `start` `stop` `info` `set` | one `unix_msgs/GripperCommand`, `position` 0..1 | none: no feedback defines it |
+| `gripper` | `start` `stop` `info` `set` `check` | `set` sends one `unix_msgs/GripperCommand` with `position` 0..1. `check` reads actual feedback. | immediate snapshot for `check` |
 | `lifting` | `start` `stop` `info` `set_position` | one `JointState` on `/lifting_controller/commands` | none |
 | `head` | `start` `stop` `info` `look` | one `Float64MultiArray` `[head0, head1]` | none |
 
-Every command needs all of these, checked in `panther_motion.py` before anything is sent:
+`gripper` accepts `{"action":"check","side":"left"}` (or `"right"`) even while motion
+is disabled. It reads the latest `/<side>_gripper/joint_states` sample and returns
+`position`, `fresh`, `age_ms`, and `opening`. Set `plugins.gripper.feedback_endpoints.<side>.closed`
+and `.open` to that side's measured closed and open positions in feedback units. The 5% of
+travel around each endpoint counts as `closed` or `open`, with `partial` in between.
+`opening` is `unknown` with a reason when feedback is missing, stale, invalid, uncalibrated,
+or outside the calibrated range and tolerance. `check` reports the sampled position at the
+time of the call.
+
+Every motion command needs all of these, checked in `panther_motion.py` before anything is sent:
 
 - `safety.commissioning_motion_enabled: true` in `config.yaml`;
 - `confirm_motion: true` in the call;

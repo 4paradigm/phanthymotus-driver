@@ -20,7 +20,7 @@ core_bridge:
 
 safety:
   # Every motion card (base_drive, arm_control, gripper, lifting, head) is listed and answers
-  # `info`, but refuses every command while this is false. Turn it on only after the caps below
+  # read-only actions, but refuses motion commands while this is false. Turn it on only after the caps below
   # have been checked on this robot, with the operator present. Sensor cards are unaffected.
   commissioning_motion_enabled: false
 
@@ -120,6 +120,9 @@ plugins:
     max_target_delta_rad: 0.35
   gripper:
     enabled: true
+    # For each side, set `closed` and `open` to measured positions from that gripper's
+    # joint_states topic. Leave empty until measured. These are feedback units.
+    feedback_endpoints: {}
   lifting:
     enabled: true
     # Units are not confirmed by the vendor; the reading was 0.61 with the URDF limit at 0.6.
