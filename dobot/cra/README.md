@@ -161,15 +161,24 @@ TLS 保持校验；停止在反馈或证书配置异常时仍可下发，但不�
 
 | action | 行为 |
 |---|---|
-| `start_trajectory` | 指定 `name`（已存在则报错，不覆盖）；ClearError、按需 EnableRobot，**由驱动发送 StartDrag 进入拖拽**并开始录制；完成通知表示机械臂已进入拖拽 |
+| `start_trajectory` | 指定 `name`（已存在则报错，不覆盖）；ClearError、按需 EnableRobot、**关闭安全皮肤**（拖拽必然触发它），**由驱动发送 StartDrag 进入拖拽**并开始录制；完成通知表示机械臂已进入拖拽。录制自行结束（按拖拽键、达到上限、异常）时另有一条通知，见下文 ACP |
 | `stop_trajectory` | 结束录制；驱动发送 StopDrag 退出拖拽，以新反馈确认模式 5 停稳后保存到本地。若操作者已提前退出拖拽，录制已自动结束，本操作返回其结果 |
 | `list_trajectories` | 返回名称、录制时间、完整性、结束原因、时长、点数（按录制时间由新到旧） |
 | `delete_trajectory` | 按名称删除本地轨迹；禁止删除正在录制、使用或暂停中的轨迹 |
-| `go_to_start` | 校验本地轨迹（校验值、控制器 IP），使用 MovJ 到起点并确认到位；保留为独立 action |
-| `play` | 先核验当前位置：不在起点（target_tolerance_deg 内）则 MovJ 到起点并以新反馈确认到位，已在起点则跳过；之后复用新运动准备（清错、使能、皮肤），由驱动以 50 Hz ServoJ 逐点发送录制关节角，等待实际结束。结果含 `moved_to_start` |
-| `pause` | 回放中：沿轨迹在 0.5 秒内线性减速到停，停在路径上并以模式 5 停稳确认；到起点运动中（含 play 的到起点阶段）：控制器 Pause（模式 10） |
-| `resume` | 回放：确认停稳、无保护、仍在暂停位置后沿轨迹 0.5 秒加速继续；到起点：Continue，到位确认后接着开始回放。均不清错、不 Enable（到起点后的回放准备除外）、不重新设置皮肤 |
+| `play` | 先核验当前位置：不在起点（target_tolerance_deg 内）则 MovJ 到起点并以新反馈确认到位，已在起点则跳过；`pause_at_start=true` 时到位后停住等待 resume；否则复用新运动准备（清错、使能、皮肤，**安全皮肤默认开启**），由驱动以 50 Hz ServoJ 逐点发送录制关节角，等待实际结束；`return_to_start=true` 时回放结束后再 MovJ 回起点并核验。结果含 `moved_to_start`、`returned_to_start`、`elapsed_s` |
+| `pause` | 回放中：沿轨迹在 0.5 秒内线性减速到停，停在路径上并以模式 5 停稳确认；到起点/回起点运动中：控制器 Pause（模式 10） |
+| `resume` | 回放：确认停稳、无保护、仍在暂停位置后沿轨迹 0.5 秒加速继续；到起点/回起点：Continue，到位确认后接着开始回放（回起点则结束）；停在起点（pause_at_start）：开始回放。均不清错、不 Enable（到起点后的回放准备除外）、不重新设置皮肤 |
 | `stop_motion` | 立即结束 ServoJ 流并发送 Stop，之后不会再发出任何目标点；录制时作为中断处理，StopDrag 并确认停稳，保留标为不完整的采集数据 |
+
+`play` 参数：
+
+| 参数 | 取值 | 说明 |
+|---|---|---|
+| `speed` | `0.25x` `0.5x` `1x`（默认） `1.5x` `2x` | 回放速度档位，1x 为录制原速；不再使用百分比或任意倍率，也没有加速度倍率 |
+| `approach_speed` | `slow`（默认） `normal` `fast` | 运动到起点/回起点的 MovJ 速度档位，对应速度和加速度均为 10 / 25 / 50 |
+| `pause_at_start` | 布尔，默认 false | 到达并核验起点后停住，占用保持，以 cancelled、`reason=paused_at_start` 通知（与 pause 一致），resume 开始回放，stop_motion 放弃 |
+| `return_to_start` | 布尔，默认 false | 回放结束后运动回起点并核验；回起点失败时 play 以 error 结束并说明“回放已完成但回起点失败” |
+| `detect_collision` | 布尔，默认 **true** | 仅控制安全皮肤：true 开启并将四个区域设为 low，false 关闭；不影响本体碰撞等级 |
 
 除列表查询外，业务 action 都需要手动填写 `confirm_move=true`；该字段不设默认值或枚举。
 
@@ -190,8 +199,8 @@ start_trajectory 遇到同名轨迹（含不完整的）直接报错，不扫描
   StartDrag 被拒绝不再发其他命令；结果不明（超时）会按下面的退出规则确认并退出拖拽。
 - **操作者意外结束拖拽**（按机械臂拖拽键）：模式 5 持续 ≥ 24 ms 即视为已退出拖拽，录制自动停止，
   状态为 `recorded`，`end_reason=drag_exited` 并带 `note`（“the arm left drag; recording stopped automatically and is usable”），
-  可直接回放；驱动不再发送 StopDrag，确认停稳后释放机械臂。该事件不产生 ACP 完成通知，用 stop_trajectory 或
-  list_trajectories 取得状态。
+  可直接回放；驱动不再发送 StopDrag，确认停稳后释放机械臂。此时没有待完成的 action，驱动会主动发一条 ACP 完成通知
+  （见下文 ACP）。
 - **StopDrag 守卫**：StopDrag 只在请求之后收到的新反馈显示 `drag_status` 时发送，且只发一次。反馈过期/断线时不发送，
   待反馈恢复后再判断；模式 6 但 drag_status=0（控制器拖拽状态不一致）也不发送。现场曾在按钮拖拽中途收到 StopDrag
   后卡在带阻尼的模式 6，这些守卫用于避免再次触发。
@@ -211,9 +220,19 @@ start_trajectory 遇到同名轨迹（含不完整的）直接报错，不扫描
   中断标记不可撤销，后续的 stop_trajectory 不会清除；退出确认期间收到的 stop_motion 或驱动停止，会在最终保存前同步核对。
 - **占用**：start_trajectory 完成后到录制结束，teach 一直占用机械臂，joint_move 不能插入运动。退出无法确认时继续占用，
   直到后续 stop_motion/stop_trajectory 确认停稳；成功后才释放。旧任务不会释放新任务的占用。
-- **ACP**：start_trajectory 完成表示机械臂已进入拖拽、正在录制；stop_trajectory 在退出确认和保存后才完成。
-  只有采样完整、至少 2 点、退出已确认且保存成功才为 `recorded`。
-  `end_reason` 为 `stop_trajectory`、`drag_exited`、`limit_reached` 或 `interrupted`。
+- **ACP**（平台的 Action Completion Protocol：派发时立即返回 `action_id`，结束时驱动向 Agent Core 的
+  `/api/acp/complete` 回调，Agent Core 据此唤醒 agent）：
+  - 所有 action 都是“立即返回 + 结束回调”：start_trajectory 在机械臂进入拖拽、开始录制时回调；
+    stop_trajectory 在退出确认和保存后回调；play/pause/resume/stop_motion 在真实终态后回调，
+    status 为 completed / error / cancelled，`result.reason` 给出原因。
+  - start_trajectory 若一直挂起到录制结束，会让 stop_trajectory 被同资源（arm）的屏障挡住，所以它在进入拖拽时即回调；
+    录制**自行结束**（操作者按拖拽键、达到上限、异常中断）时没有待完成的 action，驱动改为主动发一条回调：
+    `action_id=dobot_cra_teach_recording_<end_reason>_<随机串>`；成功（`recorded`，含 drag_exited、limit_reached）
+    为 completed，不完整为 error，result 含 `name`、`state`、`end_reason`、`reason`、`note`、`duration_s`、`point_count`。
+    平台对成功结果只保留耗时类字段，所以结束原因同时写在 action_id 里。
+  - 由 stop_trajectory / stop_motion 结束的录制只由该 action 自己回调，不会重复发送。
+  - 只有采样完整、至少 2 点、退出已确认且保存成功才为 `recorded`。
+    `end_reason` 为 `stop_trajectory`、`drag_exited`、`limit_reached` 或 `interrupted`。
 - 机械臂已处于拖拽、运行或暂停时 start_trajectory 被拒绝，且不发送任何命令。
 
 采集从共享 30004 接收线程进入独立有界缓冲，不经过网页、ROS 发布或 joints 的 30 Hz 定时器。
@@ -222,15 +241,15 @@ start_trajectory 遇到同名轨迹（含不完整的）直接报错，不扫描
 均将录制标为不完整，不自动拼接。重启遗留的录制也标为不完整。坐标范围按 CR3A 限制校验。
 小于 50 ms 的采样间隙才参与重采样；原始文件保留实际时间，不把重复旧包当新数据。
 
-录制不改安全皮肤或本体碰撞等级。go_to_start/play 的 detect_collision 沿用 joint_move 的定义，
-默认 false，true 开启安全皮肤并将四个区域设为 low。到起点使用 velocity/acceleration，默认各 10%。
+录制开始时关闭安全皮肤（拖拽会触发皮肤检测，EnableSafeSkin(0)），不改本体碰撞等级。
+play 的 detect_collision 默认 true：开启安全皮肤并将四个区域设为 low；设为 false 则关闭。
 
 ### ServoJ 流式回放
 
 不向控制器上传任何文件：录制只保存在本地（`data_dir`，50 ms 一点、单位为度的六轴关节角），
 play 时由驱动通过 Dashboard 连接逐点发送 `ServoJ(J1..J6,t=0.020,aheadtime=50.0,gain=500.0)`。
 
-- **时间比例**：每 20 ms 发送一个目标，按录制点线性插值；speed_multiplier 为 0.25–2，默认 1，
+- **时间比例**：每 20 ms 发送一个目标，按录制点线性插值；`speed` 为档位 0.25x–2x，默认 1x，
   即路径位置每 20 ms 前进 20×倍率 ms。不受全局速度比例控制。
 - **每个目标发送前检查**：反馈新鲜；无报警、碰撞、皮肤触发、下使能、抱闸松开；未拖拽；模式为 5 或 7；
   实际关节角与最近 0.5 秒内已发送的某个目标相差不超过 3°（跟随偏离即中断）。发送比计划晚 100 ms 以上
@@ -239,12 +258,13 @@ play 时由驱动通过 Dashboard 连接逐点发送 `ServoJ(J1..J6,t=0.020,ahea
 - **暂停**：沿路径把播放速率在 0.5 秒内线性降到 0（不离开录制轨迹），停发后以连续两包模式 5 停稳确认；
   play 以 cancelled、`reason=paused` 和 `position_s` 结束，pause 完成后 teach 保持占用。
 - **继续**：要求停稳的模式 5、无保护、实际角度仍在暂停位置（target_tolerance_deg 内），否则拒绝且不发送任何命令，
-  暂停上下文保留，可再次 resume 或 stop_motion。被手动挪动后须 stop_motion 再 go_to_start。
+  暂停上下文保留，可再次 resume 或 stop_motion。被手动挪动后须 stop_motion 再重新 play。
   继续时沿路径 0.5 秒加速，不清错、不 Enable、不设置皮肤（沿用暂停前的配置）。
 - **停止**：stop_motion（任一卡片）、驱动停止都会取消流并发送 Stop；取消检查与 ServoJ 发送在同一命令锁内，
   Stop 之后不会再有目标发出。暂停减速过程中也可以直接停止。
-- **到起点**：go_to_start 与 play 的到起点阶段都是控制器队列中的 MovJ，暂停/继续使用控制器 Pause/Continue（模式 10）；
-  play 在该阶段被暂停后，resume 先 Continue 并确认到位，随后接着做回放准备和 ServoJ 流。到位核验以新反馈为准，未到位不开始流。
+- **到起点/回起点**：play 的到起点阶段和 return_to_start 的回起点阶段都是控制器队列中的 MovJ，暂停/继续使用控制器 Pause/Continue（模式 10）；
+  play 在到起点阶段被暂停后，resume 先 Continue 并确认到位，随后接着做回放准备和 ServoJ 流（pause_at_start 则停在起点）。
+  到位核验以新反馈为准，未到位不开始流。回起点被暂停后 resume 到位即结束。
 - 通信中断不重发 ServoJ/MovJ/Continue；错误后尝试一次 Stop，无法确认停止则保留错误状态和占用。
 
 现场实测（CR3A，经 Jetson 有线连接）：50 Hz ServoJ 发送间隔 19.97–20.03 ms，ACK 往返 p50 5.5 ms、最大 13.5 ms；

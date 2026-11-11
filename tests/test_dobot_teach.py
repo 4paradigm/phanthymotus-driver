@@ -444,8 +444,17 @@ def test_card_contract_keeps_sensor_and_confirmation_conventions():
     assert schema["x-completion"]["timeout"] > 2000
     assert plugin.dispatch("info", {"_tool_name": "teach"}) == teach
     actions = schema["properties"]["action"]["enum"]
-    assert {"start_trajectory", "stop_trajectory", "list_trajectories", "delete_trajectory", "go_to_start",
-            "play"} <= set(actions)
+    assert {"start_trajectory", "stop_trajectory", "list_trajectories", "delete_trajectory", "play"} <= set(actions)
+    assert "go_to_start" not in actions
+    play = schema["x-action-params"]["play"]["params"]
+    assert play == ["name", "speed", "approach_speed", "detect_collision", "pause_at_start", "return_to_start",
+                    "confirm_move"]
+    properties = schema["properties"]
+    assert properties["speed"]["enum"] == ["0.25x", "0.5x", "1x", "1.5x", "2x"] and properties["speed"]["default"] == "1x"
+    assert properties["approach_speed"]["enum"] == ["slow", "normal", "fast"]
+    assert properties["detect_collision"]["default"] is True
+    assert properties["pause_at_start"]["default"] is False and properties["return_to_start"]["default"] is False
+    assert not {"velocity", "acceleration", "speed_multiplier"} & set(properties)
     assert not any("record" in action for action in actions)
     assert "trajectory_id" not in schema["properties"]
     assert "name" in schema["properties"]

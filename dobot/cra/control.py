@@ -271,7 +271,8 @@ class RobotController:
             self._update(dashboard_connected=True)
 
     def prepare_record(self, *, cancel=None):
-        """ClearError/EnableRobot only; start_drag follows once recording is subscribed."""
+        """ClearError/EnableRobot and safe skin off (dragging the arm would trigger it);
+        start_drag follows once recording is subscribed."""
         self.ownership.check("teach")
 
         def check(current_action, *, allow_own_queue=False):
@@ -279,7 +280,8 @@ class RobotController:
                 raise RuntimeError("teaching interrupted")
             return self._check_preparation_state(current_action, allow_own_queue=allow_own_queue)
 
-        return self._execute("start_trajectory", None, check, card="teach")
+        return self._execute("start_trajectory", None, check, card="teach",
+                             requested={"detect_collision": False})
 
     def _immediate(self, command, cancel=None, *, require_idle):
         """One immediate Dashboard command, serialized with every other command.
@@ -406,7 +408,7 @@ class RobotController:
                             if time.monotonic() >= deadline:
                                 raise TimeoutError("EnableRobot acknowledged but enabled feedback was not confirmed")
                             time.sleep(0.02)
-                if action in ("move_j", "rel_joint_mov_j"):
+                if action in ("move_j", "rel_joint_mov_j", "start_trajectory"):
                     baseline = check_state(action).get("packets_received")
                     detect_collision = request["detect_collision"]
                     skin_reply = self._api.EnableSafeSkin(int(detect_collision))
@@ -462,7 +464,7 @@ class RobotController:
                 if command == "ServoJ":
                     current = self._check_motion_state("move_j")["data"]["joint_state"]["q_actual"]
                     if max(abs(a - b) for a, b in zip(current, request["expected_start"])) > request["start_tolerance_deg"]:
-                        raise RuntimeError("robot is not at the trajectory start; run go_to_start first")
+                        raise RuntimeError("robot is not at the trajectory start; play moves to the start first")
                     # The ServoJ stream itself is sent by the teach card, target by target.
                     request["state"] = "prepared"
                     self._update(card, last_request=request)
