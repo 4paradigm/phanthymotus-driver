@@ -342,8 +342,8 @@ class TianyiDeviceBundle:
         if wrist_cfg.get("enabled", False):
             from wrist_cameras import WristCameraSession, WristCameraPlugin
             serials = {
-                "left": str(wrist_cfg.get("left_serial") or "").strip(),
-                "right": str(wrist_cfg.get("right_serial") or "").strip(),
+                "left": str(os.environ.get("TIANYI_WRIST_LEFT_SERIAL") or wrist_cfg.get("left_serial") or "").strip(),
+                "right": str(os.environ.get("TIANYI_WRIST_RIGHT_SERIAL") or wrist_cfg.get("right_serial") or "").strip(),
             }
             sessions = {
                 side: WristCameraSession(
