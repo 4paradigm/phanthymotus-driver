@@ -3,10 +3,22 @@ unixai-panther:
   container_name: embodied-unixai-panther
   network_mode: host
   # The first camera card started creates a transient systemd unit on the robot to run the
-  # Orbbec driver (host_camera.py, through `nsenter -t 1`), which needs PID 1's namespaces and
-  # the privilege to enter them. Nothing else in the driver uses either.
+  # Orbbec driver (host_camera.py, through `nsenter -t 1`). That needs two things, and only
+  # these: to see the host's PID 1 (pid: host) and CAP_SYS_ADMIN, which setns(2) requires to join
+  # another process's mount, PID, network, IPC and UTS namespaces (CAP_SYS_CHROOT, also needed for
+  # the mount one, is in Docker's default set). `privileged: true` would add every other
+  # capability, every host device and no seccomp/AppArmor confinement, none of which is used, so
+  # a compromise of this host-networked container would own the host instead of being limited to
+  # this one operation. Nothing else in the driver uses either setting.
+  #
+  # Whether SYS_ADMIN alone is enough on a given robot depends on its seccomp/AppArmor profile and
+  # on nsenter being allowed to read /proc/1/ns/*, which the manual page does not settle, so it is
+  # checked on the robot (README, Acceptance step 7). If the camera cannot be started the card
+  # says so, quoting nsenter's own message and what to check. If a robot does need something more,
+  # find out which capability or profile rule it is and add that one; do not go back to `privileged`.
   pid: host
-  privileged: true
+  cap_add:
+    - SYS_ADMIN
   volumes:
     # The fleet's loopback-only FastDDS profile, used by the domain-42 bridge processes.
     # Without it the container cannot reach Agent Core at all (see README_dev "DDS isolation").

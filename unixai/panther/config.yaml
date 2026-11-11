@@ -79,7 +79,8 @@ camera:
   jpeg_quality: 80
   max_width: 640
   # The first camera card started creates a transient unit on the robot (through nsenter, which
-  # needs privileged + pid: host) that runs the vendor's gemini2.launch.py. See host_camera.py.
+  # needs pid: host and the SYS_ADMIN capability, not privileged) that runs the vendor's
+  # gemini2.launch.py. See host_camera.py and deploy/service.yml.
   host:
     user: unix_ai
     workspace: /home/unix_ai/orbbec_ws

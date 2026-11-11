@@ -329,9 +329,10 @@ def test_service_yml_satisfies_the_fleet_checker():
     (name, body), = service.items()
     assert body["restart"] == "always" and body["network_mode"] == "host"
     assert body["image"] == "__IMAGE__"
-    # host_camera.py enters PID 1's namespaces to start the Orbbec driver on the robot.
-    assert body["privileged"] is True and body["pid"] == "host"
-    assert "devices" not in body
+    # host_camera.py enters PID 1's namespaces to start the Orbbec driver on the robot: it needs the
+    # host PID namespace and CAP_SYS_ADMIN, and nothing more (review: privileged was far too broad).
+    assert body["pid"] == "host" and body["cap_add"] == ["SYS_ADMIN"]
+    assert "privileged" not in body and "devices" not in body
     assert body["stop_grace_period"] == "30s", "a running arm move is cancelled and restored on SIGTERM"
     assert not any("PASSWORD" in v.upper() or "TOKEN" in v.upper() for v in body["environment"])
 
@@ -3063,3 +3064,194 @@ def test_a_stop_before_a_move_began_does_not_cancel_it(device, config, hub, io, 
     motion.dispatch("arm_control", "stop", {})
     assert motion.dispatch("arm_control", "move", ARM)["state"] == "moving"
     assert completions[-1][1] == "completed"
+
+# ── nsenter itself failing must be reported as nsenter failing ───────────────────────────────
+
+class DeniedRun:
+    """What a container that lacks a capability sees: nsenter exits non-zero with its own message,
+    for every command, including the ones the driver calls with check=False."""
+
+    def __init__(self, host_camera, message, returncode=1):
+        self.prefix = list(host_camera.HostCamera.NSENTER)
+        self.message, self.returncode, self.calls = message, returncode, []
+
+    def __call__(self, command, check, capture_output, text, timeout):
+        self.calls.append(list(command))
+        return NS(stdout="", stderr=self.message, returncode=self.returncode)
+
+    def tails(self):
+        return [c[len(self.prefix):] for c in self.calls]
+
+
+DENIED = "nsenter: cannot open /proc/1/ns/mnt: Permission denied"
+
+
+def test_a_denied_nsenter_is_reported_as_nsenter_and_names_the_missing_privilege(host_camera, config, clock, capsys):
+    """With check=False on is-active/start, a denied nsenter used to look like 'the unit does not
+    exist', and the error that surfaced was systemd-run's, pointing at the wrong thing."""
+    run = DeniedRun(host_camera, DENIED)
+    info = _camera(host_camera, config, clock, run).start("color")
+    assert "nsenter" in info["start_error"] and "Permission denied" in info["start_error"]
+    assert "systemd-run" not in info["start_error"]
+    assert "cap_add" in info["start_error"] and "SYS_ADMIN" in info["start_error"], \
+        "says what to check, not only what failed"
+    assert [t[0] for t in run.tails()] == ["systemctl"], "stopped at the first denied call; no further host commands"
+    assert "could not enter the host's namespaces" in capsys.readouterr().out
+
+
+def test_a_denied_nsenter_is_not_mistaken_for_a_unit_that_is_merely_not_running(host_camera, config, clock):
+    """`systemctl is-active` legitimately exits non-zero for a unit that does not exist; only nsenter's
+    own message identifies a failure to enter the namespaces."""
+    ordinary = FakeRun(host_camera)                          # is-active=inactive rc 3, no stderr
+    _camera(host_camera, config, clock, ordinary).start("color")
+    assert [t[0] for t in ordinary.tails()] == ["systemctl", "systemctl", "systemd-run"], \
+        "an inactive unit still goes on to be created"
+
+
+@pytest.mark.parametrize("message", [
+    "nsenter: cannot open /proc/1/ns/pid: Permission denied",
+    "nsenter: reassociate to namespace 'ns/ipc' failed: Operation not permitted",
+    "nsenter: neither filename nor target pid supplied for ns/net",
+    "/usr/bin/nsenter: cannot open /proc/1/ns/uts: No such file or directory",
+])
+def test_every_way_nsenter_can_refuse_is_recognised(host_camera, config, clock, message):
+    info = _camera(host_camera, config, clock, DeniedRun(host_camera, message)).start("depth")
+    assert "could not enter the host" in info["start_error"], message
+
+
+@pytest.mark.parametrize("stderr", [
+    "Unit panther_orbbec.service could not be found (started by nsenter earlier).",
+    "systemctl: nsenter: not a denial, the word is only in the middle of a systemctl line",
+    "Failed to start panther_orbbec.service: see `journalctl` (the nsenter: prefix is on a later line)\nnsenter: x",
+    "mynsenter: looks similar but is a different program",
+    "xnsenter: neither is this",
+])
+def test_a_message_that_is_not_nsenters_own_refusal_is_not_taken_for_one(host_camera, config, clock, stderr):
+    """Only a message that STARTS with `nsenter:` (optionally with a path in front) is nsenter refusing.
+    Cases where a looser pattern would fire: the word appearing mid-line, on a later line, or as the
+    tail of another program's name."""
+    class Quirky(FakeRun):
+        def __call__(self, command, check, capture_output, text, timeout):
+            result = super().__call__(command, check, capture_output, text, timeout)
+            result.stderr = stderr
+            return result
+
+    info = _camera(host_camera, config, clock, Quirky(host_camera)).start("color")
+    assert "start_error" not in info, stderr
+
+
+def test_the_denial_pattern_is_anchored_at_the_start_of_the_first_line(host_camera):
+    refuse = host_camera.HostCamera._nsenter_refused
+    assert refuse(NS(stderr="nsenter: cannot open x: Permission denied", returncode=1))
+    assert refuse(NS(stderr="/usr/bin/nsenter: cannot open x", returncode=1))
+    assert refuse(NS(stderr="nsenter: a\nsecond line", returncode=1)) == "nsenter: a"
+    assert refuse(NS(stderr="nsenter: cannot open x", returncode=0)) is None, "a zero exit is not a refusal"
+    assert refuse(NS(stderr="", returncode=1)) is None and refuse(NS(returncode=1)) is None
+    assert refuse(NS(stderr=None, returncode=1)) is None
+
+def test_a_stop_that_cannot_enter_the_namespaces_says_so_and_still_does_not_raise(host_camera, config, clock, capsys):
+    run = FakeRun(host_camera)
+    camera = _camera(host_camera, config, clock, run)
+    camera.start("color")
+    run_denied = DeniedRun(host_camera, DENIED)
+    camera._run = run_denied
+    camera.close()
+    out = capsys.readouterr().out
+    assert "could not stop panther_orbbec.service" in out and "sudo systemctl stop panther_orbbec.service" in out
+
+# ── the container gets the privilege nsenter needs and no more ──────────────────────────────────
+
+def _service_body():
+    (_, body), = yaml.safe_load((DRIVER / "deploy" / "service.yml").read_text(encoding="utf-8")).items()
+    return body
+
+
+def test_the_container_is_not_privileged_and_asks_for_exactly_one_capability():
+    """Review finding: privileged gives every capability, every host device and no seccomp/AppArmor
+    confinement, when the one thing that needs it is entering PID 1's namespaces."""
+    body = _service_body()
+    assert body.get("privileged") in (None, False), "privileged: true is back"
+    assert body["cap_add"] == ["SYS_ADMIN"], "exactly the capability setns(2) needs, nothing else"
+    for broadening in ("devices", "device_cgroup_rules", "ipc", "userns_mode", "cgroup", "security_opt"):
+        assert broadening not in body, f"{broadening} widens the container beyond what nsenter needs"
+    for capability in ("ALL", "SYS_PTRACE", "SYS_MODULE", "NET_ADMIN", "SYS_RAWIO", "DAC_READ_SEARCH"):
+        assert capability not in body["cap_add"], capability
+
+
+def test_the_privilege_is_explained_next_to_where_it_is_granted():
+    """A reader of service.yml must find why, and what to do if a robot refuses, without hunting."""
+    text = (DRIVER / "deploy" / "service.yml").read_text(encoding="utf-8")
+    anchor = re.search(r"^  pid: host$", text, re.M).start()                  # the setting, not a comment that quotes it
+    block = re.sub(r"\s*#\s*|\s+", " ", text[:anchor])                          # comment wrapping is not content
+    for fragment in ("CAP_SYS_ADMIN", "setns(2)", "privileged: true", "seccomp", "Acceptance step 7",
+                     "do not go back to"):
+        assert fragment in block, fragment
+
+
+def test_nothing_in_the_driver_still_claims_it_needs_privileged():
+    """The docs must not describe the old design. Mentioning the word is fine (the explanations say what
+    it replaced, and `docker inspect` prints a `Privileged` field); what is not fine is saying it is
+    needed, required or why the container is it."""
+    claims = re.compile(r"(needs?|requires?|required|why the container is|must be|has to be)\W+(`?privileged)"
+                        r"|privileged\W+(is|are)\W+(needed|required|necessary)"
+                        r"|privileged\s*\+\s*pid", re.I)
+    for name in ("README.md", "host_camera.py", "config.yaml", "device.py", "panther_motion.py"):
+        text = (DRIVER / name).read_text(encoding="utf-8")
+        flattened = re.sub(r"\s*\n\s*(#\s*)?", " ", text)               # a claim may wrap across lines
+        found = claims.search(flattened)
+        assert not found, f"{name} still says privileged is needed: ...{flattened[max(0, found.start() - 60):found.end() + 60]}..."
+    service = (DRIVER / "deploy" / "service.yml").read_text(encoding="utf-8")
+    assert not claims.search(re.sub(r"\s*\n\s*#?\s*", " ", service)), "service.yml's comment still says it is needed"
+
+
+def test_the_claim_detector_actually_detects_the_old_claims():
+    """A checker that never fires proves nothing: it must catch the sentences this PR removed."""
+    claims = re.compile(r"(needs?|requires?|required|why the container is|must be|has to be)\W+(`?privileged)"
+                        r"|privileged\W+(is|are)\W+(needed|required|necessary)"
+                        r"|privileged\s*\+\s*pid", re.I)
+    for old in ("This is why the container is `privileged` with `pid: host`",
+                "which needs privileged + pid: host", "This needs `privileged: true` and `pid: host`",
+                "privileged is required for nsenter", "the container must be privileged"):
+        assert claims.search(old), old
+    for fine in ("not `privileged: true`, which would also give every capability",
+                 "`docker inspect` prints {{.HostConfig.Privileged}}", "only ever tried under `privileged`",
+                 "do not return to `privileged`", "needs pid: host and the SYS_ADMIN capability, not privileged"):
+        assert not claims.search(fine), fine
+
+def test_host_camera_only_ever_runs_commands_through_nsenter_with_fixed_arguments(host_camera, config, clock):
+    """What the one capability is spent on: every host command goes through nsenter and none of its
+    arguments comes from outside the driver."""
+    run = FakeRun(host_camera)
+    camera = _camera(host_camera, config, clock, run)
+    camera.start("color")
+    camera.close()
+    assert run.calls, "precondition: the camera did run host commands"
+    for call in run.calls:
+        assert call[:len(run.prefix)] == run.prefix and run.prefix[0] == "nsenter"
+        assert call[len(run.prefix)] in ("systemctl", "systemd-run"), call
+    assert run.prefix == ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"], \
+        "the namespaces entered are the ones the capability and pid: host were granted for"
+
+def test_the_driver_documents_are_not_corrupted_by_the_tools_that_wrote_them():
+    """Shell quoting once ate backticks and turned `\n` into a newline in this README, which would have
+    sent an operator a broken command. Control characters and a dropped initial letter are the signs."""
+    for path in [*DRIVER.glob("*.md"), *DRIVER.glob("*.py"), *DRIVER.glob("*.yaml"), *DRIVER.glob("deploy/*.yml")]:
+        text = path.read_text(encoding="utf-8")
+        for number, line in enumerate(text.splitlines(), 1):
+            assert not re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", line), f"{path.name}:{number} has a control character"
+        assert "\ufffd" not in text, f"{path.name} has a replacement character"
+    readme = (DRIVER / "README.md").read_text(encoding="utf-8")
+    for command in ("docker inspect embodied-unixai-panther", "systemctl is-active panther_orbbec",
+                    "ros2 run tf2_ros tf2_echo"):
+        assert f"`{command}" in readme, f"{command!r} is not in a code span"
+    assert "must print `false [SYS_ADMIN] host`" in readme, "the expected inspect output is exact"
+    assert "`nsenter` may read `/proc/1/ns/*`" in readme
+
+
+def test_the_acceptance_step_for_the_reduced_privilege_has_a_failure_branch():
+    """A check that only says what success looks like leaves an operator stuck when it fails."""
+    readme = (DRIVER / "README.md").read_text(encoding="utf-8")
+    step = readme[readme.index("7. **Cameras, with the reduced privilege**"):readme.index("8. **Odometry**")]
+    assert "could not\n      enter the host's namespaces" in step or "could not enter the host's namespaces" in step.replace("\n      ", " ")
+    assert "do not return to `privileged`" in step.replace("\n      ", " ")
+    assert "record what it was" in step.replace("\n      ", " ")

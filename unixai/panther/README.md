@@ -179,10 +179,21 @@ commissioning switch or the robot's readiness; those are reported next to it as
   is never touched, and a container that is killed rather than stopped leaves the unit running
   for the next start to reuse. A watchdog restarts it at most twice if frames stall, and cannot
   restart it once the container has begun to stop. If the topics already have a publisher, the
-  driver leaves it alone. This is why the container is `privileged` with `pid: host`; nothing else
-  uses either. If the camera cannot be started, the card still starts and says why in
-  `camera_runtime.start_error`. Tried on the robot: starting `camera_color` created the unit and
-  frames reached the canvas (colour about 3 fps, depth about 4 fps, top-down view about 4 fps).
+  driver leaves it alone.
+  
+  **What the container is granted for this, and what is not yet proven.** Entering PID 1's
+  namespaces needs `pid: host` and the capability `SYS_ADMIN` (`setns(2)`). `deploy/service.yml`
+  grants those two and not `privileged: true`, which would also give every other capability, every
+  host device and no seccomp/AppArmor confinement; nothing else in the driver uses either.
+  **The camera start was verified on the robot (unit created, colour about 3 fps, depth about 4
+  fps, top-down view about 4 fps) only while the container was still `privileged`. It has not been
+  run with `SYS_ADMIN` alone yet, and the manual pages do not settle it**: whether the host's
+  seccomp/AppArmor profile lets `setns` through, and whether `nsenter` may read `/proc/1/ns/*`,
+  can only be found out on the robot. Acceptance step 7 is therefore the check that matters for
+  this change. If it fails, the card says so in `camera_runtime.start_error`, quoting nsenter's own
+  message and what to check, rather than looking like a unit that does not exist.
+  If the camera cannot be started, the card still starts and says why in
+  `camera_runtime.start_error`.
 - **The camera cards and the lidar top-down view show nothing until the project is running and the
   card has been started** (the canvas's own start, not just the container being up). The first
   test on the robot looked like a broken driver for exactly this reason: `info` said `state: idle`.
@@ -279,16 +290,25 @@ turn motion on only for step 11, and only after everything before it is right.
    this robot has no rear lidar (see above). Start the card and check the top-down view: `nearest_m` should be a real obstacle, not the robot's body, and
    `self_filtered_beams` should be greater than 0. If part of the body is still drawn, raise
    `laser.self_filter_radius_m`; if a real obstacle at the corner disappears, lower it.
-7. **Cameras**: before starting any camera card, `systemctl is-active panther_orbbec` should be
-   `inactive` (or `could not be found`), and nothing should be publishing
-   `/camera/color/image_raw`. Start `camera_color`: `docker logs` and `camera_runtime` show it started
-   `panther_orbbec.service`, and the picture appears. Then `camera_depth`. Stop both cards:
-   `systemctl is-active panther_orbbec` must still be `active`. Record the encoding and size in
-   each card's `info`. Then stop the container (`... --down`): `systemctl is-active panther_orbbec`
-   must become `inactive` within a few seconds, and the log says `asked systemd to stop`. Repeat
-   with the camera started by hand first (`ros2 launch orbbec_camera gemini2.launch.py`): the
-   card must reuse it, `camera_runtime.host_service_managed` must be `false`, and stopping the
-   container must leave it running.
+7. **Cameras, with the reduced privilege** (the check this container's `SYS_ADMIN`-only setup
+   depends on; the camera start was only ever tried under `privileged`):
+   1. `docker inspect embodied-unixai-panther --format '{{.HostConfig.Privileged}} {{.HostConfig.CapAdd}} {{.HostConfig.PidMode}}'`
+      must print `false [SYS_ADMIN] host`.
+   2. Before starting any camera card, `systemctl is-active panther_orbbec` should be `inactive`
+      (or `could not be found`), and nothing should be publishing
+      `/camera/color/image_raw`.
+   3. Start `camera_color`. It must show `camera_runtime.host_service_managed: true` and no
+      `start_error`, and the picture appears. **If it shows a `start_error` beginning "could not
+      enter the host's namespaces", the reduced privilege is not enough on this robot**: read
+      nsenter's own message in it, find which capability or seccomp/AppArmor rule is missing, and
+      add that one (do not return to `privileged`); record what it was here and in the PR.
+   4. Then `camera_depth`. Stop both cards: `systemctl is-active panther_orbbec` must still be
+      `active`. Record the encoding and size in each card's `info`.
+   5. Stop the container (`... --down`): `systemctl is-active panther_orbbec` must become
+      `inactive` within a few seconds, and the log says `asked systemd to stop`.
+   6. Repeat with the camera started by hand first (`ros2 launch orbbec_camera gemini2.launch.py`):
+      the card must reuse it, `camera_runtime.host_service_managed` must be `false`, and stopping
+      the container must leave it running.
 8. **Odometry**: at rest `vx`, `vy`, `wz` are 0.0 (not `null`). While the operator drives the base
    slowly with the vendor's own teleoperation (clear floor, emergency stop in reach), they must
    change. Do not push the 100 kg base by hand.

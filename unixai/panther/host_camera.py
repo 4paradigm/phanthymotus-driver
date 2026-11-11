@@ -10,9 +10,16 @@ but only a unit this driver started or found under its own name: a camera some o
 already publishing is never touched. A unit left behind by a killed container (SIGKILL, crash)
 is reused by the next start.
 
-This needs `privileged: true` and `pid: host` (deploy/service.yml). It is the only thing in the
-driver that acts on the host, so it is deliberately small: fixed commands, no caller-supplied
-text, and a unit that is reused if it already exists.
+This needs `pid: host` and the one capability `SYS_ADMIN` (deploy/service.yml), not `privileged:
+true`. `setns(2)` requires CAP_SYS_ADMIN to join the mount, PID, network, IPC and UTS namespaces of
+another process, and CAP_SYS_CHROOT as well for the mount one (Docker grants that by default);
+`privileged` would add every other capability, every host device and no seccomp/AppArmor
+confinement, none of which this uses. Whether SYS_ADMIN alone is enough on a given robot depends on
+its seccomp/AppArmor profile and on `nsenter` being allowed to read `/proc/1/ns/*`, which the
+manual page does not settle: it is checked on the robot (README "Acceptance"), and if it is
+refused the failure says so (`_denied`) rather than looking like a unit that does not exist.
+It is the only thing in the driver that acts on the host, so it is deliberately small: fixed
+commands, no caller-supplied text, and a unit that is reused if it already exists.
 
 Nothing here raises into a card start: agent-core rolls a whole project back when one start
 fails, so a camera that cannot be started is reported in the card's `warning`, not by failing.
@@ -23,11 +30,24 @@ times, so a camera that is simply broken is not restarted forever.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import threading
 import time
 
 KINDS = ("color", "depth")
+
+_ADVICE = ("this container could not enter the host's namespaces. It needs `pid: host` and "
+           "`cap_add: [SYS_ADMIN]` in deploy/service.yml, and the host's seccomp/AppArmor profile "
+           "must allow `setns`; see the driver README, Acceptance step 7")
+
+
+class NsenterDenied(RuntimeError):
+    """`nsenter` refused to enter PID 1's namespaces. Raised for every host command, including
+    the ones run with check=False, so it cannot be mistaken for "the unit is not running"."""
+
+    def __init__(self, message: str):
+        super().__init__(f"could not enter the host's namespaces ({message}); {_ADVICE}")
 
 
 class HostCamera:
@@ -134,9 +154,28 @@ class HostCamera:
 
     # ── host side ────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _nsenter_refused(result) -> str | None:
+        """nsenter's own refusal message, or None.
+
+        Told apart from `systemctl`'s ordinary non-zero exits (`is-active` is non-zero for a unit
+        that is not running, `start` for one that does not exist) by the message, not the return
+        code: nsenter's errors begin with its own name, possibly with a path. A message that merely
+        *mentions* nsenter does not count.
+        """
+        stderr = str(getattr(result, "stderr", "") or "").strip()
+        first = stderr.splitlines()[0] if stderr else ""
+        if getattr(result, "returncode", 0) != 0 and re.match(r"^(\S*/)?nsenter:", first):
+            return first
+        return None
+
     def _host(self, command, timeout: float = 15.0, check: bool = True):
-        return self._run([*self.NSENTER, *command], check=check, capture_output=True, text=True,
-                         timeout=timeout)
+        result = self._run([*self.NSENTER, *command], check=check, capture_output=True, text=True,
+                           timeout=timeout)
+        refused = self._nsenter_refused(result)
+        if refused:
+            raise NsenterDenied(refused)
+        return result
 
     def _launch_script(self) -> str:
         workspace = self._cfg.get("workspace", "/home/unix_ai/orbbec_ws")
