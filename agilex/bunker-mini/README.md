@@ -16,19 +16,25 @@ built because the host does not already provide it. The container calls the
 host systemd manager over the mounted system D-Bus socket with `busctl`; it does
 not try to run `systemctl` against the container's non-systemd PID 1.
 
-The host access is limited to the bootstrap lifecycle: `SYS_MODULE` loads the
-matching `gs_usb` kernel module; `NET_ADMIN` configures the CAN link; `NET_RAW`
-opens SocketCAN raw sockets. `SETUID` and `SETGID` let the entrypoint switch to
-the unprivileged runtime account, and `SETPCAP` lets `setpriv` remove the
-bootstrap capabilities. They are discarded before the driver starts.
+The bootstrap runs as host-root-equivalent trusted code. Before dropping
+privileges, the image has `SYS_MODULE`, writable host module and persistence
+directories, and unrestricted access to the host system D-Bus socket. A
+compromised image or bootstrap command can load a malicious kernel module,
+replace host startup files, or request arbitrary operations from host systemd.
+This is a host compromise boundary, not a sandboxed or narrowly scoped setup
+interface. Only deploy a reviewed, trusted image on a host whose operator
+accepts that risk. `SETUID` and `SETGID` let the entrypoint switch to the
+unprivileged runtime account, and `SETPCAP` lets `setpriv` remove the bootstrap
+capabilities; they are discarded before the driver starts, but this does not
+reduce the bootstrap-time trust requirement.
 `/lib/modules` is writable for the module and
 `depmod` index, `/etc/modules-load.d` and `/etc/systemd/system` persist reboot
 configuration, and `/usr/local/sbin` stores the helper called by the host unit.
 `/usr/src` and `/sys` are read-only inputs (kernel headers and USB/interface
-discovery); the system D-Bus mount is used to ask host systemd to enable and
-restart that unit. Host networking provides the local Agent Core/DDS endpoints.
-The container needs root to write the specific host bind mounts, but it does
-not need all host capabilities or device access granted by privileged mode.
+discovery); the system D-Bus mount permits host systemd manager calls. Host
+networking provides the local Agent Core/DDS endpoints. The container does not
+use Docker `privileged` mode, but these mounts, capabilities, and D-Bus access
+still allow host-level compromise during bootstrap.
 After setup, the entrypoint runs the ROS driver as UID 65534 with only ambient
 `NET_RAW`, which SocketCAN needs to open raw CAN sockets. The running driver has
 no `SYS_MODULE` or `NET_ADMIN` capability and cannot write the root-owned host

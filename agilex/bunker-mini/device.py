@@ -100,21 +100,21 @@ class BunkerMiniDevice:
                     self.bridge.publish_battery(battery)
                     self._last_battery_publish = time.monotonic()
             if "remote_controller" in self._enabled_sensors:
-                remote = snapshot.get("remote_controller")
+                remote = self._remote_controller_state(snapshot)
                 if remote is not None:
                     self.bridge.publish_remote_controller(remote)
             rows, _ = self.can.odometry_window()
             if rows and "odom" in self._enabled_sensors:
-                stamp_ms = int(time.time() * 1000)
+                stamp_ms, twist = rows[-1]
                 interface = build_interface(provides=["vx"], rate_hz=10,
                                             pose_drift="none")
                 sample = build_sample(stamp_ms=stamp_ms,
-                    twist=rows[-1], frame="body", pose=None)
+                    twist=twist, frame="body", pose=None)
                 wheel = snapshot.get("wheel_odometry_raw") or {}
                 motion_state = snapshot.get("motion_state") or {}
                 self.bridge.publish_odom(
                     {"odom_interface": interface, **sample},
-                    {"vx": rows[-1][0],
+                    {"vx": twist[0],
                      "steering_angle_deg": motion_state.get("steering_angle_deg"),
                      "left_wheel_mm": wheel.get("left_wheel_mm"),
                      "right_wheel_mm": wheel.get("right_wheel_mm")})

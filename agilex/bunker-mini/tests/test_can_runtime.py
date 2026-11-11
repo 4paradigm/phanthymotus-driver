@@ -76,3 +76,14 @@ def test_motion_lease_expiry_sends_one_zero_velocity_frame():
     assert stop_message.arbitration_id == protocol.MOTION_COMMAND_ID
     assert bytes(stop_message.data) == bytes(8)
     assert timeout == 0.05
+
+
+def test_odometry_window_preserves_receive_wall_timestamp():
+    can = BunkerCAN({}, "can1")
+    can._odom_samples.append((10.0, 1_800_000_000_123,
+                              [0.15, None, None, None, None, None]))
+
+    rows, _ = can.odometry_window(now=10.1)
+
+    assert rows == [(1_800_000_000_123,
+                     [0.15, None, None, None, None, None])]

@@ -158,6 +158,43 @@ def test_battery_and_remote_fields_are_flat():
         "remote_controller": {"swa": 2, "left_stick_x": -15},
         "remote_controller_age_ms": 20}) == {
             "swa": 2, "left_stick_x": -15, "feedback_age_ms": 20}
+    assert BunkerMiniDevice._remote_controller_state({
+        "remote_controller": {"swa": 2, "left_stick_x": -15},
+        "remote_controller_age_ms": 501}) is None
+
+
+def test_publish_loop_drops_stale_remote_and_keeps_odom_receive_timestamp():
+    device = _bare_device()
+    device._enabled_sensors = {"remote_controller", "odom"}
+    device._stop = threading.Event()
+    device._state_thread = None
+    device._last_battery_publish = 0.0
+    snapshot = {
+        "remote_controller": {"swa": 2, "left_stick_x": -15},
+        "remote_controller_age_ms": 501,
+        "wheel_odometry_raw": {},
+        "motion_state": {},
+    }
+    device.can.snapshot = lambda: snapshot
+    device.can.odometry_window = lambda: (
+        [(1_800_000_000_123, [0.15, None, None, None, None, None])], None)
+    published_remote = []
+    published_odom = []
+    device.bridge.publish_remote_controller = published_remote.append
+    device.bridge.publish_odom = lambda sample, fields: published_odom.append((sample, fields))
+
+    class OnePublish:
+        calls = 0
+        def wait(self, _timeout):
+            self.calls += 1
+            return self.calls > 1
+
+    device._stop = OnePublish()
+    device._publish_loop()
+
+    assert published_remote == []
+    assert published_odom[0][0]["stamp_ms"] == 1_800_000_000_123
+    assert published_odom[0][0]["twist"][0] == 0.15
 
 
 def test_actuator_start_and_stop_follow_lifecycle_contract():

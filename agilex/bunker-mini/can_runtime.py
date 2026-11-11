@@ -95,6 +95,7 @@ class BunkerCAN:
                 if frame is None or frame.is_extended_id or frame.is_remote_frame:
                     continue
                 now = time.monotonic()
+                received_wall_ms = int(time.time() * 1000)
                 with self._lock:
                     self._frame_count += 1
                     self._last_rx_at = now
@@ -110,6 +111,7 @@ class BunkerCAN:
                         self._motion_state_at = now
                         self._odom_samples.append((
                             now,
+                            received_wall_ms,
                             [value["linear_velocity_m_s"], None, None, None, None, None],
                         ))
                 elif frame.arbitration_id == protocol.ODOMETRY_ID:
@@ -294,7 +296,9 @@ class BunkerCAN:
     def odometry_window(self, now: float | None = None) -> tuple[list, dict | None]:
         now = time.monotonic() if now is None else now
         with self._lock:
-            rows = [values for stamp, values in self._odom_samples if stamp <= now]
+            rows = [(wall_stamp_ms, values)
+                    for monotonic_stamp, wall_stamp_ms, values in self._odom_samples
+                    if monotonic_stamp <= now]
             self._odom_samples.clear()
             motion = dict(self._motion_state) if self._motion_state else None
             motion_fresh = now - self._motion_state_at <= STATUS_TIMEOUT_S
