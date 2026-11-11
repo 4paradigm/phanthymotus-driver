@@ -7,6 +7,7 @@ rays also removes its distortion. The resulting two 640x480 images share K.
 from collections import deque
 from copy import deepcopy
 import json
+import os
 import queue
 import threading
 import time
@@ -14,6 +15,8 @@ import uuid
 import zlib
 
 import numpy as np
+
+from common.camera_mount import BodyMountSource
 
 
 def make_geometry(color, depth, *, registered):
@@ -73,6 +76,21 @@ def _stamp(msg):
     return msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
 
 
+class _MountNode:
+    """TF stays on robot domain 0; mount packets follow images to domain 42."""
+    def __init__(self, source, output):
+        self.source, self.output = source, output
+
+    def __getattr__(self, name):
+        return getattr(self.source, name)
+
+    def create_publisher(self, *args, **kwargs):
+        return self.output.create_publisher(*args, **kwargs)
+
+    def destroy_publisher(self, publisher):
+        return self.output.destroy_publisher(publisher)
+
+
 class RgbdCameraPlugin:
     def __init__(self, config, namespace, ros2):
         from rclpy.node import Node
@@ -101,6 +119,7 @@ class RgbdCameraPlugin:
         self.imu_epoch = None
         self.imu_last_stamp = 0
         self.imu_translation_reason = 'waiting for camera motion TF translation'
+        self.body_mount = None
 
     def get_tool(self):
         return {'name': 'camera_rgbd', 'type': 'sensor',
@@ -111,10 +130,20 @@ class RgbdCameraPlugin:
     def _outputs(self):
         return [{'topic': self.root + '/color', 'format': 'image/jpeg'},
                 {'topic': self.root + '/depth', 'format': 'image/depth-zlib'},
-                {'topic': self.root + '/imu', 'format': 'sensor/imu'}]
+                {'topic': self.root + '/imu', 'format': 'sensor/imu'},
+                {'topic': self.root + '/body_mount', 'format': 'state/extrinsic'}]
 
     def _declarations(self):
-        return camera_declarations(self.root, self.geometry, self.clock) if self.geometry is not None else []
+        declarations = camera_declarations(self.root, self.geometry, self.clock) if self.geometry is not None else []
+        if getattr(self, 'body_mount', None) is not None:
+            for entry in declarations:
+                entry['vendor']['body_mount'] = self.body_mount.declaration()
+        return declarations
+
+    def _body_mount_status(self):
+        if getattr(self, 'body_mount', None) is not None:
+            return self.body_mount.status()
+        return dict(status='unavailable', reason='body mount source not started', accuracy_validated=False)
 
     def start(self):
         from sensor_msgs.msg import Image, CameraInfo, CompressedImage
@@ -147,6 +176,12 @@ class RgbdCameraPlugin:
                 samples.clear()
             self.imu_reason = 'waiting for camera motion samples and TF'
             self._attach_imu()
+            if self.body_mount is not None:
+                self.body_mount.close()
+            self.body_mount = BodyMountSource(_MountNode(self.sub_node, self.pub_node), self.root,
+                body_frame=os.environ.get('CAMERA_BODY_FRAME', 'base_link'),
+                camera_frame=lambda: self.geometry['frame_id'] if self.geometry is not None else None,
+                clock_id=lambda: self.clock)
             self.stop_event.clear()
             self.worker = threading.Thread(target=self._work, name='tianyi_rgbd_source', daemon=True)
             self.worker.start()
@@ -360,6 +395,7 @@ class RgbdCameraPlugin:
                 with self.lock:
                     if not self.running or self.stop_event.is_set():
                         continue
+                    self.body_mount.publish(_stamp(depth))
                     self.color_pub.publish(out_color)
                     self.depth_pub.publish(out_depth)
                     self.count += 1
@@ -378,6 +414,8 @@ class RgbdCameraPlugin:
             if self.worker.is_alive():
                 raise RuntimeError('RGB-D source worker did not stop')
         with self.lock:
+            if self.body_mount is not None:
+                self.body_mount.close()
             for samples in self.imu_samples.values():
                 samples.clear()
             for frames in self.frames.values():
@@ -401,4 +439,5 @@ class RgbdCameraPlugin:
                     'camera_info': self._declarations(), 'frames_forwarded': self.count,
                     'registered_source': self.registered,
                     'imu_status': self._imu_status(),
+                    'body_mount_status': self._body_mount_status(),
                     **({'error': self.error} if self.error else {})}

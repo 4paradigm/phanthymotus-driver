@@ -255,6 +255,26 @@ mount or native orientation is assumed. Consumer attitude assistance remains
 off until its `imu_assisted` option is enabled. A source restart or capture
 interruption over 500 ms creates a new motion epoch.
 
+The optional fourth `state/extrinsic` port publishes `motus.camera_mount/1`
+JSON on `camera/rgbd/body_mount`. Both RGB-D `camera_info.vendor.body_mount`
+entries declare this topic automatically, so the generic consumer needs no
+manual body matrix or extra input wire. Each packet queries TF from the actual
+rectified optical frame into `base_link` at the original depth capture
+nanoseconds and is published before its matching images. `CAMERA_BODY_FRAME`
+can select another body frame name; it does not supply a transform. The
+`matrix` field is a 4×4 body-from-camera transform with translations in metres.
+Head motion is supported by querying every capture rather than freezing a
+startup transform. A source restart creates a new body-mount epoch.
+
+Missing TF, invalid frames/timestamps or unavailable `tf2_ros` produce an
+explicit unavailable packet without a held matrix; images and IMU continue.
+`info.body_mount_status` reports this independently of camera readiness. TF
+availability is not physical calibration: `accuracy_validated` stays false,
+and the local visualization URDF does not establish the installed optical
+chain. Real TF availability, timing and mount accuracy remain hardware checks.
+Camera odometry and pointcloud SLAM keep their camera reference; a compatible
+consumer may attach a separately named body pose from matching capture evidence.
+
 The native cloud budget is configured to 20 MB for the observed 1280×720
 source. Clock and physical alignment acceptance remain real-device checks;
 source declarations do not turn the unverified PR519 SLAM metadata into a
