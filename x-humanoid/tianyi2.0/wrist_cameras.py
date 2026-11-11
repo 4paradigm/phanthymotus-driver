@@ -147,10 +147,6 @@ def _capture_worker(namespace, side, serial, quality, channels,
         # enforces each requested channel's deadline from its last_frame stamp.
         last_input = time.monotonic()
         while not stop_event.is_set():
-            # One shared snapshot: rapid toggles cannot drop the final request.
-            selection = channels.value
-            wanted = {channel for bit, channel in enumerate(CHANNELS)
-                      if selection & (1 << bit)}
             try:
                 frameset = pipe.wait_for_frames(timeout_ms=1000)
             except RuntimeError:
@@ -158,9 +154,9 @@ def _capture_worker(namespace, side, serial, quality, channels,
                     raise RuntimeError("No D405 RGB-D frames received within timeout")
                 continue
             last_input = time.monotonic()
-            for channel, frame in (("rgb", frameset.get_color_frame()),
-                                   ("depth", frameset.get_depth_frame())):
-                if channel not in wanted or not frame:
+            for bit, (channel, frame) in enumerate((("rgb", frameset.get_color_frame()),
+                                                    ("depth", frameset.get_depth_frame()))):
+                if stop_event.is_set() or not frame or not channels.value & (1 << bit):
                     continue
                 if channel not in status["intrinsics"]:
                     status["intrinsics"][channel] = _frame_intrinsics(frame)
@@ -183,7 +179,12 @@ def _capture_worker(namespace, side, serial, quality, channels,
                 else:
                     msg.format = "16UC1; compressedDepth zlib"
                     msg.data = encode_depth_mm(raw, scale)
-                pubs[channel].publish(msg)
+                # Serialize the final check and publish with start/stop's shared
+                # selection update. Do not hold this lock while waiting/encoding.
+                with channels.get_lock():
+                    if stop_event.is_set() or not channels.value & (1 << bit):
+                        continue
+                    pubs[channel].publish(msg)
                 now = time.monotonic()
                 status["last_frame"][channel] = now
                 status["frames"][channel] = status["frames"].get(channel, 0) + 1
@@ -260,8 +261,21 @@ class WristCameraSession:
     def _send_wanted(self):
         """Replace the worker's desired channels without a queued backlog."""
         if self._channels is not None:
-            self._channels.value = sum(1 << bit for bit, channel in enumerate(CHANNELS)
-                                       if channel in self._wanted)
+            lock = self._channels.get_lock()
+            # Native publication may crash while holding this semaphore. Never
+            # let an abandoned lock prevent stop, info, or a later restart.
+            if not lock.acquire(timeout=1.0):
+                error = "D405 channel update timed out"
+                if self._proc is not None and not self._proc.is_alive():
+                    error = "D405 capture worker exited"
+                self._close()
+                self._status = {"error": error}
+                return
+            try:
+                self._channels.value = sum(1 << bit for bit, channel in enumerate(CHANNELS)
+                                           if channel in self._wanted)
+            finally:
+                lock.release()
 
     def start(self, channel):
         with self._lock:

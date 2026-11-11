@@ -33,6 +33,12 @@ Each D405 is owned by **one** `pyrealsense2` process; the RGB and depth
 cards for that wrist share its RGB8/Z16 640x480 at 15 FPS pipeline.
 Activating one does not activate the other card's output. Stopping one
 channel preserves the other; stopping both releases the USB device.
+Selection is checked again after frame acquisition and encoding. Stop waits for
+an already executing publish to complete before returning; it does not retract
+DDS messages already queued in transport or in a subscriber. If a crashed or
+unresponsive native publisher holds the selection lock for over one second,
+the session closes that worker and reports an error instead of hanging stop.
+A later start allocates a fresh worker and selection lock.
 All four wrist streams start automatically when the driver service starts,
 matching the always-on preview behavior of the G1 and Bumi camera drivers.
 Dragging a wrist card onto the canvas subscribes to the existing stream; no
@@ -83,8 +89,14 @@ The SDK is required for direct D405 acquisition; it increases image size.
 The pinned ARM64 CPython 3.10 wheel is 4,338,854 bytes to download and
 13,796,155 bytes unpacked (about 4.14 / 13.16 MiB), before image compression
 and pip metadata. These are package sizes, not a measured image-size delta.
-`libusb-1.0-0` is explicitly requested as a runtime USB dependency; apt reuses
-it if already present in the base image. No SDK source tree, compiler build
+`libusb-1.0-0` is required by this exact ARM64 wheel: its ELF `DT_NEEDED`
+entries include `libusb-1.0.so.0`. The default `ros-base:latest` checked on
+2026-11-11 (digest `sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f`)
+has neither the package nor the library: `dpkg-query -W libusb-1.0-0` fails,
+and `ctypes.CDLL("libusb-1.0.so.0")` reports a missing shared object. The Tianyi
+runtime resolves it to `/lib/aarch64-linux-gnu/libusb-1.0.so.0` via `ldd`
+(package `2:1.0.25-1ubuntu2`). Keep the explicit runtime dependency; apt reuses
+it if a custom base already supplies it. No SDK source tree, compiler build
 artifacts, or pip cache are added by this dependency installation.
 
 ### Wire format and timestamp semantics

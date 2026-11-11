@@ -5,6 +5,7 @@ ARG PYPI_MIRROR
 
 WORKDIR /work
 
+# The ARM64 RealSense wheel links libusb-1.0.so.0; ros-base does not supply it.
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
