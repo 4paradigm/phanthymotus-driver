@@ -528,6 +528,60 @@ running.
 The output contract, quality states, verified default mount, validation status,
 and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
 
+### Generic Perception RGB-D input
+
+When the camera plugin is enabled it also exposes the `camera_rgbd` sensor card.
+Connect both `/bumi/camera/rgbd/color` (`image/jpeg`) and
+`/bumi/camera/rgbd/depth` (`image/depth-zlib`) to Perception's RGB-D odometry
+card; the namespace follows the bundle configuration. Its `info` and `start`
+responses include both `camera_info` declarations and `sourceReady`.
+
+This branch shares the existing RealSense pipeline. It aligns color into the
+native depth optical frame, then rectifies both images on the same 640x480 rays.
+Depth is measured little-endian uint16 millimetres using the SDK depth scale.
+The original display camera/depth streams remain available.
+
+The output headers preserve separate source capture times through the existing
+clock mapping. A hardware clock uses one fixed arrival-derived offset; its
+source domain and offset are disclosed and `clock_mapping_verified` is false.
+No publication-time fallback is emitted on these computation topics. Unsupported
+nonzero inverse/modified Brown distortion, invalid calibration/scale, capture
+clock discontinuity or excessive skew makes the source unavailable with an
+error; it does not stop the display streams. No body mount is assumed, and
+neither physical accuracy nor hardware performance has been validated.
+
+The same owner optionally publishes `/bumi/camera/rgbd/imu` (`sensor/imu`), a
+`motus.imu/1` JSON packet over ROS `std_msgs/String`. Connect it only when IMU
+assistance is enabled on the receiving card. It carries raw SDK gyro/accel,
+factory motion-to-depth rotations, capture-generation identity and exactly the
+RGB-D clock ID and fixed offset. The approximate mapping is marked unverified.
+`imu_status` reports motion availability separately. Motion profiles are
+actually discovered; no device model is assumed to include an IMU. Supported
+motion uses a bounded video queue on the existing pipeline callback; unsupported
+motion preserves the original blocking video path, and negotiation failure
+retries video on the same pipeline. No quaternion or camera-to-body mount is
+invented. Hardware motion/callback acceptance remains pending.
+
+### Generic RGB-D short-term compensation
+
+Perception's generic `rgbd_odometry` card supports the instance settings
+`imu_assisted=true`, `short_term_compensation=true`, `depth_geometry=true`.
+Connect the same RGB-D pair and optional camera IMU port. The driver reports
+full factory/TF sensor-origin translations in `motus.imu/1`; inspect
+`imu_status.fusion` for calibration availability. Rotation-only or unsupported
+motion sources still support the existing video/attitude modes but cannot
+provide translational compensation. No extra SDK owner or robot-specific
+fusion algorithm is added.
+
+Keep the camera still for at least0.5s of visual/IMU initialization. The
+consumer estimates camera pose using ESKF and conditionally uses observable
+depth geometry. Inertial/depth predictions are explicitly non-mapping; SLAM
+pauses during coasting/recovery. The hard visual correction timeout is1s
+and modeled position sigma limit0.10m; these are software/model thresholds,
+not measured robot accuracy. Source clock/mount identity must remain fixed.
+Only code/offline tests have been completed; hardware verification and
+deployment remain pending explicit user instruction.
+
 ## Experimental fused leg/IMU/RGB-D odometry (`fused_odometry`)
 
 This is an **opt-in, read-only planar (x/y/yaw) sensor**, disabled by default.

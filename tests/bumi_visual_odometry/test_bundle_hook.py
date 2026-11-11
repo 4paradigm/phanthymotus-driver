@@ -325,6 +325,8 @@ def test_depth_card_declares_one_capture_timed_output(capture, monkeypatch):
     card._namespace = 'robot'
     card._color_topic, card._depth_topic = '/robot/camera/color', '/robot/camera/depth'
     card._intrinsics_lock = threading.Lock()
+    card._rgbd_status = dict(ready=False, camera_info=[], error='awaiting calibrated capture')
+    card._proc = None
     card._intrinsics = {'depth': {'width': 640, 'height': 480, 'fx': 600., 'fy': 601.,
                                    'ppx': 320., 'ppy': 240., 'model': 'none', 'coeffs': [0.] * 5}}
     tool = next(x for x in card.get_tools() if x['name'] == 'depth')

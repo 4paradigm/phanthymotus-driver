@@ -149,6 +149,7 @@ COPY leg_odometry.py /work/leg_odometry.py
 COPY odometry_fusion.py /work/odometry_fusion.py
 COPY fused_odometry.py /work/fused_odometry.py
 COPY camera_specs.py /work/camera_specs.py
+COPY rgbd_camera.py /work/rgbd_camera.py
 COPY visual_inputs.py /work/visual_inputs.py
 COPY visual_odometry.py /work/visual_odometry.py
 COPY visual_odometry_contract.py /work/visual_odometry_contract.py
