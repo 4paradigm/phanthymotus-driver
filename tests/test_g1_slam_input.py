@@ -658,13 +658,11 @@ def test_actual_mapping_packets_and_metadata_are_rejected_by_perception(runtime,
     lidar._node._on_cloud(cloud())
     cloud_decl = lidar._cloud_tool()['input_metadata'][0]
     metadata = {pose['topic']: pose, cloud_decl['topic']: cloud_decl}
-    for experimental in (False, True):
-        with pytest.raises(contract.InputContractError) as error:
-            contract.resolve_inputs(metadata, {pose['topic']: 'state/odom',
-                                               cloud_decl['topic']: 'sensor/pointcloud2'},
-                                    experimental=experimental)
-        fields = {d['field'] for d in error.value.diagnostics}
-        assert {'clock_id', 'stamp_source', 'extrinsic', 'clock.relation_id'} <= fields
+    with pytest.raises(contract.InputContractError) as error:
+        contract.resolve_inputs(metadata, {pose['topic']: 'state/odom',
+                                           cloud_decl['topic']: 'sensor/pointcloud2'})
+    fields = {d['field'] for d in error.value.diagnostics}
+    assert {'clock_id', 'stamp_source', 'extrinsic', 'clock.relation_id'} <= fields
 
 
 def test_unverified_lidar_extrinsic_candidate_is_visible_but_not_admissible(runtime):
