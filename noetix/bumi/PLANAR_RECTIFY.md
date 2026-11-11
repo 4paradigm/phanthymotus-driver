@@ -1,15 +1,13 @@
-# Automatic white-paper rectification
+# Automatic white-paper geometry rectification
 
-`planar_rectify` is an optional single-instance processor in the existing Bumi
-bundle. It automatically proposes white-paper-like quadrilaterals, rectifies
-the region and asks the existing perception OCR service for a reading direction.
-There are no manual-corner or manual-rotation controls. No UVDoc, extra model,
-text recognition engine, physical motion or camera capture is added here.
+The optional single-instance `planar_rectify` Card automatically finds a
+white-paper-like quadrilateral in the existing JPEG stream and flattens it.
+It runs independently of perception/OCR: no OCR API, network client, new
+model, new hardware resource or companion repository change is required.
+It does not evaluate text direction, recognize text or turn an upside-down
+page upright. Downstream OCR remains a separate existing capability.
 
-## Setup and migration
-
-The existing camera must publish JPEG images; this Card never opens it.
-Enable the Card in config.yaml:
+## Setup
 
     plugins:
       planar_rectify:
@@ -18,138 +16,114 @@ Enable the Card in config.yaml:
         output_height: 905
         max_fps: 5.0
         preview: true
-        ocr_port: 15720
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| output_width | 640 | Final pixels, integer 64-1280 |
-| output_height | 905 | Final pixels, integer 64-1280 |
+| output_width | 640 | Output pixels, integer 64-1280 |
+| output_height | 905 | Output pixels, integer 64-1280 |
 | max_fps | 5 | Processing cap, 1-15 Hz; actual throughput must be measured |
-| preview | true | Labelled original-image detection preview |
-| ocr_port | 15720 | YAML-only same-host perception port, integer 1-65535 |
+| preview | true | Publish labelled original-image detection preview |
 
-Remove old manual mode/corners settings. Legacy mode=auto and corners=[] are
-accepted for migration, but are not advertised. Manual settings fail explicitly.
-The output size is retained after automatic quarter-turns by composing a new
-source-to-final homography, not by stretching the already rotated result.
-The requested aspect ratio is an operator-supplied target, not a measurement of
-a sheet's real dimensions. Blank/uncertain documents do not establish a true
-reading orientation or portrait/landscape aspect ratio.
+There are no manual-corner or manual-rotation controls. Legacy mode=auto and
+corners=[] are accepted for migration; manual settings fail explicitly.
+Remove the former ocr_port setting: it is no longer used or advertised.
 
-The default input is /<namespace>/camera/color. start accepts one input_topic
-or the Core's single input_topics connection. All three of this Card's own
-output topics are rejected as feedback inputs.
+The configured aspect ratio is a target, not a measurement of a sheet's
+physical size or reading direction. The default is approximately portrait A4;
+this does not automatically establish which way text should face.
 
-## Automatic detection
+The existing camera must publish JPEGs. The default input topic is
+/<namespace>/camera/color. start accepts input_topic or one input_topics
+connection. The Card never opens or starts the camera, and rejects its own
+image/state/preview topics as feedback inputs.
+
+## Detection and limits
 
 Two edge passes and a light/neutral-region mask propose observed closed
 quadrilaterals on an image at most 640 pixels across. Candidate area is 5%-95%
-of the image. The neutral-color coverage, convexity, edge length, full-contour
-border check and contour/quad area agreement reject unsuitable shapes.
-Duplicate contours across passes are merged. A substantial distinct second
-candidate produces ambiguous_boundary instead of an arbitrary selection.
+of the image. Neutral-color coverage, convexity, edge length, full-contour
+border checks and contour/quad area agreement reject unsuitable shapes.
+Duplicate contours are merged. A substantial distinct second candidate
+produces ambiguous_boundary instead of an arbitrary selection.
 
-This is a geometric/color heuristic, not semantic paper recognition. White
-walls, screens and other rectangular objects can still be confused with paper.
-Occluded/out-of-frame corners, strongly curved pages and indistinct boundaries
-can fail. No hidden corner, missing text, real paper size or dewarping mesh is
-invented. Enlarging the output does not restore missing source detail.
-
-## Automatic direction: companion OCR API required
-
-The matching change in the phanthymotus repository adds
-ocr.classify_orientation to the existing perception service. That service
-reuses its one shared OCR detector/classifier and inference locks; it does not
-run text recognition or construct a second model set for the request. The
-existing OCR bundle may load on first use, using its normal loader/cache.
-
-An old perception image does NOT expose this action. Updating only the driver
-therefore gives geometry and preview, with orientation explicitly unknown;
-it does not silently provide automatic upright images. The two local changes
-must be reviewed/built together before direction can be accepted on hardware.
-
-The driver calls only http://127.0.0.1:<ocr_port>/mcp. JPEG data stays in memory
-(base64, at most 2 MiB); proxies and redirects are disabled. There is one bounded
-pending sample, one in-flight socket-timeout-limited request, and normally at
-most one new request per second. Missing/unsupported OCR backs off for 10 s.
-RPC runs outside the image worker so model loading/requests do not set its FPS.
-
-Responses use schema motus.document-orientation/1 and a clockwise correction of
-0, 90, 180 or 270 degrees. Direction is accepted only with sufficient line-level
-classifier evidence and consensus. Empty, short/square or conflicting text
-leaves direction unknown. A normalized appearance signature invalidates old
-page results; a cached result expires after 3 s, reports its originating frame
-and age, and is never described as a fresh per-frame OCR measurement. This
-association is a heuristic, not a semantic document identity guarantee.
+This is a geometric/color heuristic, not semantic paper recognition.
+White walls, clothing, screens and other rectangular objects can still be
+confused with paper. Occluded/out-of-frame corners, curved pages and
+indistinct boundaries may fail. No hidden corner, missing text, true paper
+size or dewarping mesh is invented. Enlarging the output cannot restore
+source detail. Text reading direction is explicitly not evaluated.
 
 ## Calls and lifecycle
 
     {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"planar_rectify","arguments":{"action":"start","input_topic":"/ubuntu/camera/color"}}}
 
-start/stop control only this processor's resources. info, robot_info and a bare
-planar_rectify call return status. config validates first. Unchanged config is
-a no-op; parameter changes retain the ROS node, invalidate in-flight results
-and direction, and apply to new work. Only changing the input topic rebinds its
-subscription. Invalid settings preserve the existing running instance.
+start/stop control only this processor's resources. info, robot_info and a
+bare planar_rectify call return status. config validates before changing
+anything. Unchanged settings are a no-op. Parameter changes retain the ROS
+node and invalidate old in-flight results; only changing the input topic
+rebinds the subscription. Invalid settings preserve the running instance.
 
-The worker always processes the latest input, without an accumulating queue.
-Its deadline counts processing time toward the requested frame period; the
-configured wait is no longer added on top of every processing step. Stopping
-wakes and joins image/direction workers and releases the ROS node. Changes made
-by MCP remain in memory and do not change config.yaml.
+The worker takes only the latest frame and never accumulates a frame queue.
+Its deadline includes processing time instead of adding the full configured
+wait after every frame. Stop wakes/joins the worker and releases the node.
+MCP configuration changes remain in memory and do not edit config.yaml.
 
 ## Outputs
 
 | Topic suffix under /<namespace>/planar_rectify | Format | Meaning |
 | --- | --- | --- |
-| /image | image/jpeg | Newly rectified region, only while geometry/input is valid |
-| /state | data/json | 2 Hz validity, age, homography, direction and measured processing statistics |
-| /preview | image/jpeg | Labelled ORIGINAL image with current outline/status, including no_boundary |
+| /image | image/jpeg | Newly rectified region, only for valid recent geometry |
+| /state | data/json | 2 Hz validity, age, homography and processing statistics |
+| /preview | image/jpeg | Labelled ORIGINAL image with outline/status, including no_boundary |
 
-The preview is NOT the rectified output. Its frame ID is
-planar_preview_original_pixels; the rectified frame ID is
-planar_rectified_pixels. Failure does not pass the original off as successful
-rectification. Invalid JPEGs and lost input do not create invented live images.
-Viewers may retain their last frame: always check status and input age.
+The preview is not the rectified output. Its frame ID is
+planar_preview_original_pixels; the rectified output uses
+planar_rectified_pixels. A failure never passes the original off as a
+successful rectification. Invalid JPEGs/lost input do not create invented
+live images. A viewer may retain its last frame, so inspect status and age.
 
-State fields include:
+State includes:
 
-- valid: geometric/input validity, not verified reading direction.
-- orientation_verified: whether a sufficiently supported current cached OCR
-  direction was applied; false on invalid geometry/input.
-- orientation: ready/unknown, bounded reason, model support (not a calibrated
-  probability), originating frame and cache age.
-- rotation_cw_degrees: applied 0/90/180/270, or null when direction is unknown.
-- corners_px, homography, source_size, output_size: final pixel geometry.
-- selection: white_paper_candidate, not a semantic detection label.
-- processing_ms and actual_output_fps: measured worker time/output rate,
-  not the camera's capture rate or a promised Jetson performance result.
-- input_ros_stamp, input_received_monotonic_s, input_age_s: source stamp plus
-  host-receipt/result age; capture_time_verified remains false.
-- state: running/idle/error; status includes no_input, ok, no_boundary,
-  ambiguous_boundary, config_changed, invalid_image, replayed_input, stale_input,
-  stale_result, processing_error, worker_error and idle.
+- valid: geometric/input validity, not verified text reading direction.
+- reading_direction: not_evaluated; there is no automatic text rotation.
+- corners_px, homography, source_size, output_size: pixel geometry. The matrix
+  maps source pixels into the configured output rectangle.
+- selection: white_paper_candidate, not a semantic recognition label.
+- processing_ms and actual_output_fps: measured worker time/publication rate,
+  not camera capture rate or a promised Jetson performance result.
+- input_ros_stamp, input_received_monotonic_s and input_age_s: source stamp and
+  host-receipt/result age. capture_time_verified remains false.
+- state: running/idle/error. status includes no_input, ok, no_boundary,
+  ambiguous_boundary, config_changed, invalid_image, replayed_input,
+  stale_input, stale_result, processing_error, worker_error and idle.
 
-Geometry may be valid while reading direction is unknown: in that case /image
-contains an unrotated rectified crop and orientation_verified=false. Consumers
-requiring an upright page must check both fields.
+JPEGs are limited to 2 MiB and 1920x1080 source pixels before decoding.
+Repeated/regressing nonzero stamps invalidate the input baseline. Ages above
+2 s invalidate a processed result and suppress its image; new input alone
+cannot make an old processed result valid. Topics are best effort and not an
+atomic image/JSON transaction or an exactly-once notification.
 
-Images are limited to 2 MiB and 1920x1080 source pixels, checked before decoding.
-Repeated/regressing nonzero source stamps invalidate the input baseline. Ages
-above 2 s invalidate a processed result and suppress its image; new input alone
-cannot make an old result valid. The JSON/image topics are best effort and are
-not an atomic transaction or an exactly-once notification.
-
-camera_info remains empty and metric_geometry=false. The rectified image is not
+camera_info remains empty and metric_geometry=false. Rectified pixels are not
 a pinhole-camera view: source intrinsics, raw depth and odometry must not be
-reused on these pixels.
+reused on them.
 
-## Validation boundaries
+## Local validation boundaries
 
-Local tests use real OpenCV/synthetic known geometry, model/ROS doubles, and a
-loopback HTTP contract server. They cover white-vs-colored candidates, absent
-boundaries, quarter-turn homographies, API bounds, unknown direction, stale
-responses, rate limiting, config lifecycle and worker shutdown. They do not
-establish pretrained-model accuracy, Jetson FPS, real paper detection reliability
-or deployed two-service compatibility. Hardware testing requires separate
-authorization; no robot, canvas or container is changed by local development.
+Tests use real OpenCV/synthetic known geometry and ROS doubles. They cover
+white-vs-colored candidates, missing boundaries, live original previews,
+JPEG/parameter bounds, stale/replayed input, configuration races and worker
+cleanup. A test also forbids service connections while geometry runs.
+
+A separate smoke check uses synthetic JPEGs over isolated localhost-only
+ROS2/DDS. These checks do not establish real paper detection accuracy, Jetson
+FPS, OCR improvement, Docker build success or hardware acceptance.
+
+## Scope correction after commit 697bf9b5
+
+The earlier committed draft introduced an OCR direction dependency. This
+follow-up removes its client, Docker COPY, config, tests and direction claims
+while retaining white-paper detection, preview and frame/lifecycle changes.
+The existing commit/PR can remain; the user can append a correction commit.
+The unsubmitted companion OCR worktree is not needed for this Card and is not
+part of its submission. No commit, push, deployment or comment is performed
+by these code changes.

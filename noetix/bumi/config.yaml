@@ -10,8 +10,6 @@ plugins:
     output_height: 905
     max_fps: 5.0
     preview: true
-    # Existing perception OCR, loopback only; requires classify_orientation API.
-    ocr_port: 15720
   state:
     enabled: true
   loco:

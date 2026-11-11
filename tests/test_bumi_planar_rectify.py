@@ -24,10 +24,7 @@ BUMI = ROOT / "noetix" / "bumi"
 @pytest.fixture
 def rect(monkeypatch):
     monkeypatch.syspath_prepend(str(BUMI))
-    module = importlib.import_module("planar_rectify")
-    monkeypatch.setattr(module.OCROrientation, "_request", lambda self, data:
-                        self._unknown("test_no_ocr"))
-    return module
+    return importlib.import_module("planar_rectify")
 
 
 def encode(image):
@@ -481,43 +478,17 @@ def test_colored_rectangle_does_not_override_white_paper(rect):
     assert min(p[0] for p in report["corners_px"]) > 370
 
 
-@pytest.mark.parametrize("angle", [90, 180, 270])
-def test_automatic_rotation_composes_homography_and_keeps_final_size(rect, angle):
-    data = encode(scene()[1])
-    config = automatic_config(rect)
-    report, _ = rect.rectify(data, config)
-    turned, image = rect.orient_rectified(data, report, config, angle)
-    assert rect.jpeg_size(image) == (220, 300)
-    points = np.asarray(report["corners_px"], np.float32)
-    mapped = cv2.perspectiveTransform(points[None], np.asarray(turned["homography"]))[0]
-    expected = {90: [[219, 0], [219, 299], [0, 299], [0, 0]],
-                180: [[219, 299], [0, 299], [0, 0], [219, 0]],
-                270: [[0, 299], [0, 0], [219, 0], [219, 299]]}[angle]
-    assert np.allclose(mapped, expected, atol=0.001)
-
-
-def test_worker_reports_unknown_direction_without_guessing(rect, plugin):
+def test_worker_runs_without_ocr_or_network_and_does_not_claim_text_direction(rect, plugin, monkeypatch):
+    import socket
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs:
+                        pytest.fail("geometry Card must not call a service"))
     obj, node, _ = plugin
     obj.start()
     obj._on_frame(message(encode(scene()[1])))
     wait_for(lambda: bool(node.images))
     report = obj.info()
-    assert report["valid"] and not report["orientation_verified"]
-    assert report["rotation_cw_degrees"] is None
-    assert report["orientation"]["status"] == "unknown"
-
-
-@pytest.mark.parametrize("angle", [0, 90, 180, 270])
-def test_worker_applies_only_accepted_automatic_direction(rect, plugin, monkeypatch, angle):
-    obj, node, _ = plugin
-    monkeypatch.setattr(obj._orientation, "consider", lambda *args:
-                        {"status": "ready", "rotation_cw_degrees": angle, "support": 1.0,
-                         "based_on_frame_sequence": 1})
-    obj.start()
-    obj._on_frame(message(encode(scene()[1])))
-    wait_for(lambda: bool(node.images))
-    report = obj.info()
-    assert report["orientation_verified"] and report["rotation_cw_degrees"] == angle
+    assert report["valid"] and report["reading_direction"] == "not_evaluated"
+    assert "ocr_port" not in report["config"] and not hasattr(obj, "_orientation")
     assert rect.jpeg_size(node.images[-1][0]) == (220, 300)
 
 

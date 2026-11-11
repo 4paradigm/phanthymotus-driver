@@ -17,12 +17,10 @@ from collections import deque
 import cv2
 import numpy as np
 
-from planar_orientation import OCROrientation
-
 
 DEFAULTS = {
     "output_width": 640, "output_height": 905, "max_fps": 5.0,
-    "preview": True, "ocr_port": 15720,
+    "preview": True,
 }
 MAX_JPEG_BYTES = 2 * 1024 * 1024
 MAX_PIXELS = 1920 * 1080
@@ -44,8 +42,6 @@ def settings(config: dict) -> dict:
         raise ValueError("max_fps must be finite and in 1..15")
     if type(cfg["preview"]) is not bool:
         raise ValueError("preview must be boolean")
-    if type(cfg["ocr_port"]) is not int or not 1 <= cfg["ocr_port"] <= 65535:
-        raise ValueError("ocr_port must be an integer in 1..65535 on loopback")
     return cfg
 
 
@@ -200,31 +196,6 @@ def rectify(data: bytes, config: dict) -> tuple[dict, bytes | None]:
     return report, jpeg.tobytes()
 
 
-def orient_rectified(data, report, config, angle):
-    """Compose a quarter-turn with the source homography; one final resampling.
-
-    Swapping the pre-rotation canvas for 90/270 keeps the requested final size
-    and aspect ratio instead of stretching an already warped portrait image.
-    """
-    if angle not in (90, 180, 270):
-        raise ValueError("expected an automatic clockwise quarter-turn")
-    jpeg_size(data)
-    source = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    width, height = config["output_width"], config["output_height"]
-    pre_w, pre_h = (height, width) if angle in (90, 270) else (width, height)
-    destination = np.float32([[0, 0], [pre_w - 1, 0], [pre_w - 1, pre_h - 1], [0, pre_h - 1]])
-    matrix = cv2.getPerspectiveTransform(np.asarray(report["corners_px"], np.float32), destination)
-    turns = {90: [[0, -1, pre_h - 1], [1, 0, 0], [0, 0, 1]],
-             180: [[-1, 0, pre_w - 1], [0, -1, pre_h - 1], [0, 0, 1]],
-             270: [[0, 1, 0], [-1, 0, pre_w - 1], [0, 0, 1]]}
-    matrix = np.asarray(turns[angle], np.float64) @ matrix
-    output = cv2.warpPerspective(source, matrix, (width, height))
-    ok, encoded = cv2.imencode(".jpg", output, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    if not ok:
-        raise ValueError("output JPEG encoding failed")
-    return {**report, "homography": matrix.tolist()}, encoded.tobytes()
-
-
 def preview_jpeg(data, report):
     """An explicitly labelled original-image preview, never a rectified result."""
     jpeg_size(data)
@@ -236,8 +207,8 @@ def preview_jpeg(data, report):
         cv2.polylines(image, [np.round(corners).astype(np.int32)], True, (0, 200, 0), 2)
     cv2.rectangle(image, (0, 0), (image.shape[1] - 1, 25), (0, 0, 0), -1)
     text = "ORIGINAL PREVIEW: " + report.get("status", "unknown").upper()
-    if report.get("valid") and not report.get("orientation_verified"):
-        text += " / DIRECTION UNKNOWN"
+    if report.get("valid"):
+        text += " / GEOMETRY ONLY"
     cv2.putText(image, text, (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
     ok, output = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return output.tobytes() if ok else None
@@ -265,7 +236,6 @@ class PlanarRectifyPlugin:
         self._last_stamp = None
         self._generation = 0
         self._output_times = deque(maxlen=31)
-        self._orientation = OCROrientation(self._config["ocr_port"])
         self._result = {"valid": False, "status": "idle"}
 
     def get_tool(self):
@@ -282,8 +252,8 @@ class PlanarRectifyPlugin:
             "name": self.PREFIX, "type": "processor", "multiInstance": False,
             "x-resource": ["image_processing"],
             "description": "Automatically locate a white-paper-like quadrilateral and flatten it. "
-                           "Reuse the same-robot OCR det/cls for automatic page direction; uncertain "
-                           "direction remains explicitly unknown. No manual corners, extra model, "
+                           "Image geometry only: reading direction is not evaluated. "
+                           "No manual corners, OCR service dependency, extra model, "
                            "text recognition, motion or metric measurements.",
             "inputSchema": {
                 "type": "object", "properties": {
@@ -297,7 +267,7 @@ class PlanarRectifyPlugin:
             "configSchema": config_schema,
             "topic_in": [{"format": "image/jpeg", "desc": "Planar scene"}],
             "topic_out": [{"topic": self._image_topic, "format": "image/jpeg", "desc": "Rectified region"},
-                          {"topic": self._state_topic, "format": "data/json", "desc": "Validity, direction and transform"},
+                          {"topic": self._state_topic, "format": "data/json", "desc": "Validity and transform"},
                           {"topic": self._preview_topic, "format": "image/jpeg", "desc": "Original-image detection preview"}],
         }
 
@@ -383,13 +353,11 @@ class PlanarRectifyPlugin:
                     self._output_times.clear()
                     self._result = {"valid": False, "status": "no_input"}
                 self._cancel.clear()
-                self._orientation.start()
                 thread = threading.Thread(target=self._run_guarded, name="bumi_planar_rectify", daemon=True)
                 self._node, self._thread = node, thread
                 thread.start()
             except BaseException:
                 self._cancel.set()
-                self._orientation.stop()
                 self._node = self._thread = None
                 try:
                     if registered:
@@ -407,7 +375,6 @@ class PlanarRectifyPlugin:
                 if self._thread.is_alive():
                     raise RuntimeError("planar rectification worker did not stop")
                 self._thread = None
-            self._orientation.stop()
             with self._lock:
                 self._latest = None
                 self._output_times.clear()
@@ -447,17 +414,6 @@ class PlanarRectifyPlugin:
             preview = None
             try:
                 result, image = rectify(data, cfg)
-                if image is not None:
-                    decoded = cv2.imdecode(np.frombuffer(image, np.uint8), cv2.IMREAD_COLOR)
-                    direction = self._orientation.consider(decoded, sequence)
-                    angle = direction.get("rotation_cw_degrees")
-                    verified = direction.get("status") == "ready"
-                    if verified and angle:
-                        result, image = orient_rectified(data, result, cfg, angle)
-                    result.update(orientation=direction, orientation_verified=verified,
-                                  rotation_cw_degrees=angle if verified else None)
-                else:
-                    self._orientation.invalidate()
                 if cfg["preview"]:
                     preview = preview_jpeg(data, result)
             except (ValueError, cv2.error):
@@ -478,8 +434,6 @@ class PlanarRectifyPlugin:
                     # A rejected newer input must not be overwritten by old work.
                     if self._latest is None or self._generation != generation:
                         continue
-                    if not result["valid"]:
-                        result["orientation_verified"] = False
                     self._result = result
                 if image is not None:
                     self._node.send_image(image, stamp)
@@ -516,8 +470,7 @@ class PlanarRectifyPlugin:
                       input_topic=self._input_topic, config=config,
                       topic_out=self.get_tool()["topic_out"], camera_info=[],
                       metric_geometry=False, output_geometry="planar_projective_pixels")
-        if not result["valid"]:
-            result["orientation_verified"] = False
+        result["reading_direction"] = "not_evaluated"
         result["actual_output_fps"] = (
             round((len(output_times) - 1) / (output_times[-1] - output_times[0]), 2)
             if len(output_times) > 1 and now - output_times[-1] <= MAX_AGE_S
@@ -556,7 +509,6 @@ class PlanarRectifyPlugin:
                             self._result = {"valid": False, "status": "config_changed"}
                             self._output_times.clear()
                             self._config, self._input_topic = cfg, topic
-                        self._orientation.configure(cfg["ocr_port"])
                         self._wake.set()
                 if action == "start" or running:
                     self.start()

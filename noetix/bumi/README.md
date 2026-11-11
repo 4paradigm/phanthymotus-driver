@@ -3,11 +3,10 @@
 The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
 
 The optional `planar_rectify` processor automatically locates a white-paper-like
-quadrilateral in the existing JPEG stream and reuses the existing perception
-OCR det/cls for page orientation. It publishes a labelled original-image preview
-and explicitly reports unknown direction when OCR cannot decide or its companion
-API is unavailable. No new model is loaded in this driver. It is disabled by
-default. See [Planar region rectification](PLANAR_RECTIFY.md)
+quadrilateral in the existing JPEG stream and flattens it for downstream use.
+It publishes a labelled original-image detection preview and performs geometry
+only: it does not evaluate text direction or require an OCR service/model.
+It is disabled by default. See [Planar region rectification](PLANAR_RECTIFY.md)
 for configuration, limitations and acceptance steps.
 
 ## `mic` and `sound_direction`
