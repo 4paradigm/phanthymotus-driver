@@ -242,6 +242,19 @@ Connect these ports to Perception's `rgbd_odometry` card. Its camera-frame
 `state/odom` and PR519's native PointCloud2 can feed the SLAM card; do not use
 the visualization cloud or invent a camera-to-body mount.
 
+The optional third `sensor/imu` port publishes `motus.imu/1` JSON through
+`std_msgs/String`, using the existing `/ob_camera_head/{gyro,accel}/sample`
+streams. Each raw vector keeps its actual source frame and capture timestamp;
+separate timestamped TF rotations express both source frames in the RGB-D
+camera optical frame. It reuses the RGB-D global header clock gate and pairs
+motion captures within 20 ms. Missing streams, TF, calibration or fresh captures
+withhold only IMU; `info.imu_status` explains availability independently of
+RGB-D readiness. `camera_rgbd.imu_enabled: false` disables these subscriptions
+on startup. No camera or vendor service is started for motion, and no body/head
+mount or native orientation is assumed. Consumer attitude assistance remains
+off until its `imu_assisted` option is enabled. A source restart or capture
+interruption over 500 ms creates a new motion epoch.
+
 The native cloud budget is configured to 20 MB for the observed 1280×720
 source. Clock and physical alignment acceptance remain real-device checks;
 source declarations do not turn the unverified PR519 SLAM metadata into a

@@ -2320,6 +2320,8 @@ def _camera_subprocess(namespace: str):
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
     from sensor_msgs.msg import CompressedImage as _CompressedImage
     from sensor_msgs.msg import Image as _SensorImage
+    from std_msgs.msg import String as _String
+    from common.realsense_imu import MotionSource, CaptureQueue, motion_profiles, start_optional_motion
 
     _QOS = QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -2362,8 +2364,41 @@ def _camera_subprocess(namespace: str):
     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
     config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
 
+    rgbd_inputs = None
+    imu_pub = node.create_publisher(_String, f'/{namespace}/camera/rgbd/imu', _QOS)
+    def publish_imu(packet):
+        msg = _String()
+        msg.data = json.dumps(packet, allow_nan=False)
+        imu_pub.publish(msg)
+    def map_motion(source_ms, domain):
+        if rgbd_inputs is None:
+            raise ValueError('RGB-D capture clock mapping unavailable')
+        stamp = rgbd_inputs.motion_stamp(source_ms, domain)
+        imu.clock_mapping = dict(method='fixed_arrival_offset' if domain == 'hardware_clock' else 'device_wall',
+                                 source_clock=domain, offset_ns=rgbd_inputs.clocks[0].offset, verified=False)
+        return stamp
+    imu = MotionSource(f'/{namespace}/camera/rgbd/imu', f'{namespace}_depth_optical', rs,
+                       map_motion, publish_imu,
+                       clock_id=lambda: rgbd_inputs.clock_id + '/' + rgbd_inputs.clocks[0].domain)
+    capture = CaptureQueue(imu)
     try:
-        pipeline.start(config)
+        try:
+            device = config.resolve(rs.pipeline_wrapper(pipeline)).get_device()
+            if not motion_profiles(rs, device):
+                raise ValueError('camera motion streams unsupported')
+        except Exception as exc:
+            imu.unavailable('motion discovery failed: ' + str(exc))
+            active = pipeline.start(config)
+            capture = pipeline
+        else:
+            active, imu_error = start_optional_motion(rs, pipeline, config, device, capture)
+            if imu_error:
+                imu.unavailable(imu_error)
+            else:
+                try:
+                    imu.configure(active)
+                except Exception as exc:
+                    imu.unavailable(exc)
     except Exception as e:
         print(f"[camera_subprocess] Realsense pipeline start failed: {e}", flush=True)
         pipeline.stop()
@@ -2464,9 +2499,9 @@ def _camera_subprocess(namespace: str):
 
     # Generic Perception card inputs share the already-open capture pipeline.
     # Its calibration/clock failures must leave the display media path running.
-    rgbd_inputs = None
     def report_rgbd(status):
         import json
+        status = dict(status, imu_status=imu.status())
         print("[camera_subprocess] RGBD " + json.dumps(status, allow_nan=False), flush=True)
     try:
         from rgbd_camera import RgbdCameraPublisher
@@ -2476,6 +2511,7 @@ def _camera_subprocess(namespace: str):
         report_rgbd(dict(ready=False, camera_info=[], error=str(exc)))
 
     frame_count = 0
+    last_imu_report = 0.
     t_start = _time.monotonic()
     try:
         while True:
@@ -2484,7 +2520,7 @@ def _camera_subprocess(namespace: str):
             # own callbacks; otherwise card stop/start never reaches it.
             _rclpy.spin_once(node, timeout_sec=0)
             t0 = _time.monotonic()
-            source_frames = pipeline.wait_for_frames(timeout_ms=1000)
+            source_frames = capture.wait_for_frames(timeout_ms=1000)
             t_wait = _time.monotonic() - t0
 
             frames = align_to_color.process(source_frames)
@@ -2530,6 +2566,9 @@ def _camera_subprocess(namespace: str):
                 except Exception as exc:
                     rgbd_inputs.unavailable(exc)
 
+            if _time.monotonic() - last_imu_report >= .2:
+                print('[camera_subprocess] IMU ' + json.dumps(imu.status(), allow_nan=False), flush=True)
+                last_imu_report = _time.monotonic()
             frame_count += 1
             # Log every 300 frames (~15s at 20fps)
             if frame_count % 300 == 0:
@@ -2624,11 +2663,16 @@ class CameraPlugin:
         if status["ready"] and not self.is_running():
             status = dict(ready=False, camera_info=[], error="camera capture process unavailable")
         root = f"/{self._namespace}/camera/rgbd"
+        imu_status = status.get('imu_status', dict(state='unavailable', reason='waiting for camera motion'))
+        if not self.is_running() or not -50_000_000 <= time.time_ns() - imu_status.get('last_capture_ns', 0) <= 500_000_000:
+            imu_status.update(state='unavailable', reason=imu_status.get('reason') or 'motion capture stale')
         return {"state": "running" if status["ready"] else "unavailable",
                 "sourceReady": status["ready"], "camera_info": status["camera_info"],
+                "imu_status": imu_status,
                 **({"error": status["error"]} if status.get("error") else {}),
                 "topic_out": [{"topic": root + "/color", "format": "image/jpeg"},
-                              {"topic": root + "/depth", "format": "image/depth-zlib"}]}
+                              {"topic": root + "/depth", "format": "image/depth-zlib"},
+                              {"topic": root + "/imu", "format": "sensor/imu", "optional": True}]}
 
     def _camera_info(self, tool_name: str, topic: str, fmt: str) -> list:
         """This port's optics — `motus.camera/1`, see `camera_specs.py`.
@@ -2673,7 +2717,8 @@ class CameraPlugin:
              "description": "Bumi calibrated registered RGB-D inputs for Perception odometry; camera optical frame, capture-mapped time.",
              "inputSchema": {"type": "object", "properties": {}},
              "topic_out": self._rgbd_info()["topic_out"],
-             "camera_info": self._rgbd_info()["camera_info"]},
+             "camera_info": self._rgbd_info()["camera_info"],
+             "imu_status": self._rgbd_info()["imu_status"]},
         ]
 
     def start(self) -> None:
@@ -2698,6 +2743,15 @@ class CameraPlugin:
                 # but the line itself is what somebody debugging a wrong field
                 # of view will grep for in `docker logs`.
                 print(text, flush=True)
+                imu_marker = "[camera_subprocess] IMU "
+                if imu_marker in text:
+                    try:
+                        imu_status = json.loads(text.split(imu_marker, 1)[1])
+                        if isinstance(imu_status, dict):
+                            with self._intrinsics_lock:
+                                self._rgbd_status['imu_status'] = imu_status
+                    except (ValueError, TypeError):
+                        pass
                 marker = "[camera_subprocess] RGBD "
                 if marker in text:
                     try:

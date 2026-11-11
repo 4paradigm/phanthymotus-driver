@@ -97,6 +97,8 @@ SDK 先把彩色图配准到深度光学平面，再用实测深度内参对两�
 
 `info` 仅在有效采集后返回 `motus.camera/1` 声明；缺少标定、时钟或数据失效时返回 `state=unavailable`、原因和空 `camera_info`。支持无畸变、标准 Brown，以及系数全零的 inverse/modified Brown 深度内参；其他模型明确不可用。当前仅完成离线验证，未执行实机验收。
 
+相机实际支持 gyro 和 accel 时，同一采集管线还输出可选 `/{namespace}/camera/rgbd/imu`（`sensor/imu`，ROS `std_msgs/String` JSON，`motus.imu/1`）。仅在通用卡启用 IMU 辅助时连接此端口。原始角速度和加速度保留各自 SDK 坐标轴，随包携带实际 motion→depth 工厂旋转（SDK 列优先数组正确转换为行优先矩阵）、采集代次和与 RGB-D 完全一致的全局时钟标识；不提供虚构的姿态或机体安装关系。`imu_status` 独立报告可用性。驱动按实际 SDK motion profiles 探测，不假定 D435 含 IMU；不支持或 motion 启动失败会保留视频/RGB-D，后者使用同一管线重试视频配置。未执行相机硬件验证。
+
 ## 开发与验证入口
 
 - [仓库构建流程](../../CONTRIBUTING.md#building-docker-images)：业务镜像构建与发布入口。

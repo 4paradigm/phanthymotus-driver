@@ -80,6 +80,19 @@ class RgbdCameraPublisher:
         self.last_emit = None
         self.min_interval_s = min_interval_s
 
+    def motion_stamp(self, source_ms, domain):
+        # Reuse the image clock's established offset; motion must never fit its
+        # own arrival offset, even before the first valid RGB-D publication.
+        clock = self.clocks[0]
+        if clock.offset is None:
+            raise ValueError('RGB-D capture clock mapping unavailable')
+        if domain != clock.domain:
+            raise ValueError('motion and RGB-D capture clock domains differ')
+        stamp = int(source_ms * 1e6) + clock.offset
+        if not -50_000_000 <= time.time_ns() - stamp <= 500_000_000:
+            raise ValueError('stale or future motion capture time')
+        return stamp
+
     def unavailable(self, error):
         if self.ready or self.last_error is None:
             self.report(dict(ready=False, camera_info=[], error=str(error)[:300]))

@@ -3897,7 +3897,11 @@ class RealSensePlugin:
             status['reason'] = status.get('reason') or 'waiting for live calibrated RGB-D capture'
         root = f"/{self._namespace}/camera/rgbd"
         status['topic_out'] = [{'topic': root + '/color', 'format': 'image/jpeg'},
-                               {'topic': root + '/depth', 'format': 'image/depth-zlib'}]
+                               {'topic': root + '/depth', 'format': 'image/depth-zlib'},
+                               {'topic': root + '/imu', 'format': 'sensor/imu', 'optional': True}]
+        imu = status.setdefault('imu_status', dict(state='unavailable', reason='waiting for camera motion'))
+        if not self.is_running() or not -50_000_000 <= time.time_ns() - imu.get('last_capture_ns', 0) <= 500_000_000:
+            imu.update(state='unavailable', reason=imu.get('reason') or 'motion capture stale')
         return status
 
     def _rgbd_tool(self):
@@ -3905,7 +3909,8 @@ class RealSensePlugin:
         return {'name': 'camera_rgbd', 'type': 'sensor', 'multiInstance': False,
                 'description': 'Calibrated registered 640x480 RealSense RGB-D for computation; shares the camera capture process.',
                 'inputSchema': {'type': 'object', 'properties': {}},
-                'topic_out': info['topic_out'], 'camera_info': info.get('camera_info', [])}
+                'topic_out': info['topic_out'], 'camera_info': info.get('camera_info', []),
+                'imu_status': info['imu_status']}
 
     def _color_tool(self) -> dict:
         return {
@@ -4031,6 +4036,7 @@ def run_realsense_process(namespace: str, rgbd_status_queue=None) -> None:
     import numpy as np
     import pyrealsense2 as rs
     from rgbd_camera import RgbdSource
+    from common.realsense_imu import MotionSource, start_optional_motion
     import rclpy
     from rclpy.node import Node as _Node
     from rclpy.executors import SingleThreadedExecutor
@@ -4066,6 +4072,10 @@ def run_realsense_process(namespace: str, rgbd_status_queue=None) -> None:
             self._worker_stop = threading.Event()
             root = f"/{namespace}/camera/rgbd"
             self._rgbd = RgbdSource(root, rs)
+            self._imu_pub = self.create_publisher(_String, root + '/imu', _QOS)
+            self._imu = MotionSource(root + '/imu', 'camera_depth_optical_frame', rs,
+                                     self._rgbd.motion_stamp, self._publish_imu,
+                                     clock_id=lambda: 'realsense_sdk_global_time_unix')
             self._rgbd_pubs = [self.create_publisher(CompressedImage, root + suffix, _QOS)
                                for suffix in ('/color', '/depth')]
             self._rgbd_q = queue.Queue(maxsize=1)
@@ -4107,7 +4117,14 @@ def run_realsense_process(namespace: str, rgbd_status_queue=None) -> None:
                         sensor.set_option(rs.option.global_time_enabled, 1.)
                 except Exception as exc:
                     self.get_logger().warn(f"RGB-D capture clock: {exc}")
-            profile = pipeline.start(config, self._on_frame)
+            profile, imu_error = start_optional_motion(rs, pipeline, config, devs[0], self._on_frame)
+            if imu_error:
+                self._imu.unavailable(imu_error)
+            else:
+                try:
+                    self._imu.configure(profile)
+                except Exception as exc:
+                    self._imu.unavailable(exc)
             self._pipeline = pipeline
             try:
                 self._rgbd.configure(profile)
@@ -4138,15 +4155,22 @@ def run_realsense_process(namespace: str, rgbd_status_queue=None) -> None:
                 self._color_worker = None
             self.get_logger().info("RealSense capture stopped")
 
+        def _publish_imu(self, packet):
+            msg = _String()
+            msg.data = json.dumps(packet, allow_nan=False)
+            self._imu_pub.publish(msg)
+
         def _publish_rgbd_status(self):
             if rgbd_status_queue is None:
                 return
+            status = self._rgbd.info()
+            status['imu_status'] = self._imu.status()
             try:
-                rgbd_status_queue.put_nowait(self._rgbd.info())
+                rgbd_status_queue.put_nowait(status)
             except queue.Full:
                 try:
                     rgbd_status_queue.get_nowait()
-                    rgbd_status_queue.put_nowait(self._rgbd.info())
+                    rgbd_status_queue.put_nowait(status)
                 except (queue.Empty, queue.Full):
                     pass
 
@@ -4210,13 +4234,16 @@ def run_realsense_process(namespace: str, rgbd_status_queue=None) -> None:
                     self.get_logger().error(f"[realsense] color publish error: {e}")
 
         def _on_frame(self, frame):
+            self._imu.on_frame(frame)
             try:
                 if not frame.is_frameset():
                     return
                 fs = frame.as_frameset()
                 color_frame = fs.get_color_frame()
                 depth_frame = fs.get_depth_frame()
-                if self._rgbd_configured:
+                if not color_frame and not depth_frame:
+                    return
+                if self._rgbd_configured and color_frame and depth_frame:
                     try:
                         self._rgbd_q.get_nowait()
                     except queue.Empty:

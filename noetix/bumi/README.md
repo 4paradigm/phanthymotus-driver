@@ -522,3 +522,15 @@ nonzero inverse/modified Brown distortion, invalid calibration/scale, capture
 clock discontinuity or excessive skew makes the source unavailable with an
 error; it does not stop the display streams. No body mount is assumed, and
 neither physical accuracy nor hardware performance has been validated.
+
+The same owner optionally publishes `/bumi/camera/rgbd/imu` (`sensor/imu`), a
+`motus.imu/1` JSON packet over ROS `std_msgs/String`. Connect it only when IMU
+assistance is enabled on the receiving card. It carries raw SDK gyro/accel,
+factory motion-to-depth rotations, capture-generation identity and exactly the
+RGB-D clock ID and fixed offset. The approximate mapping is marked unverified.
+`imu_status` reports motion availability separately. Motion profiles are
+actually discovered; no device model is assumed to include an IMU. Supported
+motion uses a bounded video queue on the existing pipeline callback; unsupported
+motion preserves the original blocking video path, and negotiation failure
+retries video on the same pipeline. No quaternion or camera-to-body mount is
+invented. Hardware motion/callback acceptance remains pending.

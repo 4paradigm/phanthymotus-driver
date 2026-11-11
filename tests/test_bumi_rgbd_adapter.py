@@ -194,7 +194,8 @@ def test_camera_rgbd_card_returns_both_declarations_on_start_and_info(monkeypatc
         assert 'error' not in result  # MCP treats even error=None as a failed tool call.
         assert result['camera_info'] == declarations
         assert result['topic_out'] == [{'topic': '/robot/camera/rgbd/color', 'format': 'image/jpeg'},
-                                       {'topic': '/robot/camera/rgbd/depth', 'format': 'image/depth-zlib'}]
+                                       {'topic': '/robot/camera/rgbd/depth', 'format': 'image/depth-zlib'},
+                                       {'topic': '/robot/camera/rgbd/imu', 'format': 'sensor/imu', 'optional': True}]
     plugin._proc = NS(poll=lambda: 1)
     assert plugin.dispatch('info', {'_tool_name': 'camera_rgbd'})['sourceReady'] is False
     plugin._proc = NS(poll=lambda: None)

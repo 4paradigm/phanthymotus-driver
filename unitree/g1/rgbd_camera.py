@@ -6,6 +6,7 @@ Only SDK global-time timestamps are accepted, never callback receipt times.
 """
 from copy import deepcopy
 import math
+import time
 import zlib
 
 import cv2
@@ -51,6 +52,14 @@ class RgbdSource:
         self.geometry = True
         self.previous = [0, 0]
         self.last_capture_ns = 0
+
+    def motion_stamp(self, source_ms, domain):
+        if domain != 'global_time':
+            raise ValueError('SDK global capture clock unavailable for motion')
+        stamp = int(source_ms // 1000) * 1_000_000_000 + round((source_ms % 1000) * 1_000_000)
+        if not -50_000_000 <= time.time_ns() - stamp <= 500_000_000:
+            raise ValueError('stale or future motion capture time')
+        return stamp
 
     def encode(self, frames, now_ns):
         self.reason = 'waiting for valid capture'

@@ -6,9 +6,11 @@ rays also removes its distortion. The resulting two 640x480 images share K.
 """
 from collections import deque
 from copy import deepcopy
+import json
 import queue
 import threading
 import time
+import uuid
 import zlib
 
 import numpy as np
@@ -92,6 +94,12 @@ class RgbdCameraPlugin:
         self.count = 0
         self.error = None
         self.future = None
+        self.imu_enabled = config.get('imu_enabled', True)
+        self.imu_attached = False
+        self.imu_reason = 'waiting for camera motion samples and TF'
+        self.imu_samples = {kind: deque(maxlen=512) for kind in ('gyro', 'accel')}
+        self.imu_epoch = None
+        self.imu_last_stamp = 0
 
     def get_tool(self):
         return {'name': 'camera_rgbd', 'type': 'sensor',
@@ -101,7 +109,8 @@ class RgbdCameraPlugin:
 
     def _outputs(self):
         return [{'topic': self.root + '/color', 'format': 'image/jpeg'},
-                {'topic': self.root + '/depth', 'format': 'image/depth-zlib'}]
+                {'topic': self.root + '/depth', 'format': 'image/depth-zlib'},
+                {'topic': self.root + '/imu', 'format': 'sensor/imu'}]
 
     def _declarations(self):
         return camera_declarations(self.root, self.geometry, self.clock) if self.geometry is not None else []
@@ -130,9 +139,116 @@ class RgbdCameraPlugin:
             self.signature = None
             self.future = None
             self.error = None
+            self.imu_epoch = uuid.uuid4().hex
+            self.imu_last_stamp = 0
+            for samples in self.imu_samples.values():
+                samples.clear()
+            self.imu_reason = 'waiting for camera motion samples and TF'
+            self._attach_imu()
             self.stop_event.clear()
             self.worker = threading.Thread(target=self._work, name='tianyi_rgbd_source', daemon=True)
             self.worker.start()
+
+    def _attach_imu(self):
+        if not self.imu_enabled or self.imu_attached:
+            return
+        try:
+            from sensor_msgs.msg import Imu
+            from std_msgs.msg import String
+            from rclpy.qos import qos_profile_sensor_data
+            from tf2_ros import Buffer, TransformListener
+            self.imu_buffer = Buffer()
+            self.imu_listener = TransformListener(self.imu_buffer, self.sub_node)
+            self.imu_pub = self.pub_node.create_publisher(String, self.root + '/imu', qos_profile_sensor_data)
+            for kind in ('gyro', 'accel'):
+                self.sub_node.create_subscription(Imu, '/ob_camera_head/' + kind + '/sample',
+                    lambda msg, k=kind: self._imu(k, msg), qos_profile_sensor_data)
+            self.imu_attached = True
+        except Exception as error:
+            self.imu_reason = 'camera motion unavailable: ' + str(error)
+
+    def _imu_rotation(self, msg):
+        from rclpy.time import Time
+        frame = msg.header.frame_id
+        if not frame:
+            raise ValueError('camera motion frame is missing')
+        # Each motion stream has its own real frame and capture timestamp.
+        transform = self.imu_buffer.lookup_transform(
+            self.geometry['frame_id'], frame, Time.from_msg(msg.header.stamp))
+        q = transform.transform.rotation
+        values = np.array([q.x, q.y, q.z, q.w], dtype=float)
+        if not np.isfinite(values).all() or not np.isclose(values @ values, 1., atol=1e-5):
+            raise ValueError('camera motion TF quaternion is not a unit rotation')
+        values /= np.linalg.norm(values)
+        x, y, z, w = values
+        return [[1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
+                [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
+                [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)]]
+
+    def _imu(self, kind, msg):
+        with self.lock:
+            if not self.running or not self.imu_enabled:
+                return
+            try:
+                if not self.registered:
+                    raise ValueError('waiting for source global capture clock confirmation')
+                if self.geometry is None:
+                    raise ValueError('waiting for RGB-D camera optical calibration')
+                stamp = _stamp(msg)
+                now = self.sub_node.get_clock().now().nanoseconds
+                if stamp <= 0 or not -50_000_000 <= now-stamp <= 500_000_000:
+                    raise ValueError('stale, future or invalid camera motion capture stamp')
+                if not msg.header.frame_id:
+                    raise ValueError('camera motion frame is missing')
+                vector = getattr(msg, 'angular_velocity' if kind == 'gyro' else 'linear_acceleration')
+                if not np.isfinite([vector.x, vector.y, vector.z]).all():
+                    raise ValueError('nonfinite camera motion measurement')
+                if kind == 'gyro' and stamp <= self.imu_last_stamp:
+                    raise ValueError('nonmonotonic camera gyro capture stamp')
+                self.imu_samples[kind].append(msg)
+                gyro_samples, accel_samples = self.imu_samples['gyro'], self.imu_samples['accel']
+                while gyro_samples and accel_samples:
+                    gyro = gyro_samples[0]
+                    gyro_stamp = _stamp(gyro)
+                    accel = min(accel_samples, key=lambda sample: abs(_stamp(sample)-gyro_stamp))
+                    accel_stamp = _stamp(accel)
+                    if abs(gyro_stamp-accel_stamp) > 20_000_000:
+                        self.imu_reason = 'camera gyro/accel capture skew exceeds 20ms'
+                        if accel_stamp > gyro_stamp:
+                            gyro_samples.popleft()
+                            continue
+                        break
+                    gyro_samples.popleft()
+                    if (gyro_stamp <= self.imu_last_stamp or
+                            any(not -50_000_000 <= now-s <= 500_000_000 for s in (gyro_stamp, accel_stamp))):
+                        raise ValueError('stale or nonmonotonic camera motion capture stamp')
+                    if self.imu_last_stamp and gyro_stamp-self.imu_last_stamp > 500_000_000:
+                        self.imu_epoch = uuid.uuid4().hex
+                    packet = dict(schema='motus.imu/1', source_id='/ob_camera_head/gyro+accel',
+                        epoch=self.imu_epoch, stamp_ns=gyro_stamp, accel_stamp_ns=accel_stamp,
+                        stamp_source='measurement', clock_id=self.clock,
+                        camera_frame_id=self.geometry['frame_id'], gyro_frame_id=gyro.header.frame_id,
+                        accel_frame_id=accel.header.frame_id,
+                        camera_from_gyro=self._imu_rotation(gyro), camera_from_accel=self._imu_rotation(accel),
+                        rotation_source='tf', units=dict(angular_velocity='rad/s', linear_acceleration='m/s^2'),
+                        angular_velocity=[gyro.angular_velocity.x, gyro.angular_velocity.y, gyro.angular_velocity.z],
+                        linear_acceleration=[accel.linear_acceleration.x, accel.linear_acceleration.y, accel.linear_acceleration.z])
+                    from std_msgs.msg import String
+                    self.imu_pub.publish(String(data=json.dumps(packet, allow_nan=False)))
+                    self.imu_last_stamp = gyro_stamp
+                    self.imu_reason = None
+            except Exception as error:
+                self.imu_reason = 'camera motion unavailable: ' + str(error)
+
+    def _imu_status(self):
+        if not getattr(self, 'imu_enabled', True):
+            return dict(state='disabled', reason='camera motion source disabled')
+        reason = getattr(self, 'imu_reason', 'waiting for camera motion samples and TF')
+        if not self.running:
+            reason = 'camera motion source stopped'
+        elif getattr(self, 'imu_last_stamp', 0) and self.sub_node.get_clock().now().nanoseconds-self.imu_last_stamp > 500_000_000:
+            reason = 'camera motion source stale'
+        return dict(state='unavailable' if reason else 'available', **({'reason': reason} if reason else {}))
 
     def _parameters(self):
         from rcl_interfaces.srv import GetParameters
@@ -241,6 +357,8 @@ class RgbdCameraPlugin:
             if self.worker.is_alive():
                 raise RuntimeError('RGB-D source worker did not stop')
         with self.lock:
+            for samples in self.imu_samples.values():
+                samples.clear()
             for frames in self.frames.values():
                 frames.clear()
             while not self.pending.empty():
@@ -261,4 +379,5 @@ class RgbdCameraPlugin:
             return {'state': 'running' if self.running else 'idle', 'topic_out': self._outputs(),
                     'camera_info': self._declarations(), 'frames_forwarded': self.count,
                     'registered_source': self.registered,
+                    'imu_status': self._imu_status(),
                     **({'error': self.error} if self.error else {})}
