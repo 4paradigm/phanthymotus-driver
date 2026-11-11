@@ -520,7 +520,9 @@ class Teaching(MotionCompletion):
                 # From here a pause goes through the controller queue, like the move to the start.
                 active["moving"] = True
             try:
-                back = self._move_to_start(active, playback.name, playback.points[0], playback.plan["args"])
+                # prepare_playback already set the skin for this play; do not redo it before the return.
+                back = self._move_to_start(active, playback.name, playback.points[0], playback.plan["args"],
+                                           skin_applied=True)
             except Exception as exc:
                 if active["cancel"].is_set():
                     raise
@@ -529,11 +531,12 @@ class Teaching(MotionCompletion):
             result.update(returned_to_start=True, return_max_error_deg=back["max_error_deg"])
         return "completed", result
 
-    def _move_to_start(self, active, name, start, args, then=None):
+    def _move_to_start(self, active, name, start, args, then=None, *, skin_applied=False):
         """MovJ to the first recorded pose; a pause during it uses the controller queue
         and keeps `then` so that resume continues into the stream."""
         parameters = {**args, **{f"{joint}_deg": value for joint, value in zip(JOINT_NAMES, start)}}
-        response = self.control.execute_motion("move_j", parameters, cancel=active["cancel"], owner="teach")
+        response = self.control.execute_motion("move_j", parameters, cancel=active["cancel"], owner="teach",
+                                               skin_applied=skin_applied)
         active["submitted"] = True
         context = {"name": name, "target": start, "timeout": self.timeout}
         if then is not None:

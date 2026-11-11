@@ -243,6 +243,7 @@ start_trajectory 遇到同名轨迹（含不完整的）直接报错，不扫描
 
 录制开始时关闭安全皮肤（拖拽会触发皮肤检测，EnableSafeSkin(0)），不改本体碰撞等级。
 play 的 detect_collision 默认 true：开启安全皮肤并将四个区域设为 low；设为 false 则关闭。
+同一次 play 只设置一次皮肤：回放结束后的 return_to_start MovJ 不再重复设置（减少回起点延迟）。
 
 ### ServoJ 流式回放
 

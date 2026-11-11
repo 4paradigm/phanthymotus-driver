@@ -208,7 +208,7 @@ class RobotController:
             raise RuntimeError("move_j requires an idle robot without a paused or running queue")
         return sample
 
-    def execute_motion(self, action, args, *, cancel=None, owner="joint_move"):
+    def execute_motion(self, action, args, *, cancel=None, owner="joint_move", skin_applied=False):
         if action not in ("stop_motion", "pause"):
             self.ownership.check(owner)
         commands = {"move_j": "MovJ", "rel_joint_mov_j": "RelJointMovJ", "stop_motion": "Stop", "pause": "Pause", "resume": "Continue"}
@@ -222,6 +222,8 @@ class RobotController:
             if type(detect_collision) is not bool:
                 raise ValueError("detect_collision must be a boolean true or false")
             requested["detect_collision"] = detect_collision
+            # Only the teach card sets this: it has just applied the same skin setting in this play.
+            requested["skin_applied"] = bool(skin_applied)
         if action in ("move_j", "rel_joint_mov_j"):
             values = []
             provided = 0

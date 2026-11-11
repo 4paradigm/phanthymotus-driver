@@ -181,6 +181,10 @@ def test_record_with_drag_commands_then_play_goes_to_start_and_streams_over_real
     assert sum(c.startswith("MovJ") for c in played) == 2
     assert max(i for i, c in enumerate(played) if c.startswith("MovJ")) > last_servo
     assert robot.joints[0] == pytest.approx(points[0][0]) and result["elapsed_s"] > 0
+    # The skin was set once for the whole play; the return MovJ must not redo it (latency).
+    assert sum(c.startswith(("EnableSafeSkin", "SetSafeSkin")) for c in played) == 5
+    after_stream = played[last_servo + 1:]
+    assert not any(c.startswith(("EnableSafeSkin", "SetSafeSkin")) for c in after_stream)
     # At the start, play skips the MovJ and stays at the end of the take.
     count = len(robot.commands)
     result = terminal(events, dispatch(plugin, "play", name=name), timeout=5)
