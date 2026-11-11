@@ -78,6 +78,28 @@ def test_motion_lease_expiry_sends_one_zero_velocity_frame():
     assert timeout == 0.05
 
 
+def test_critical_fault_during_motion_cancels_target_and_sends_zero():
+    can = BunkerCAN({}, "can1")
+    can._bus = FakeBus()
+    can._stop = FakeStop()
+    can._system_state = {"vehicle_state": protocol.VEHICLE_NORMAL,
+                         "control_mode": protocol.CONTROL_CAN,
+                         "error_flags": 0x04}
+    can._system_state_at = time.monotonic()
+    can._target = (0.1, 0.2)
+    can._target_deadline = time.monotonic() + 1
+    can._tx_active = True
+
+    with patch.dict(sys.modules, {"can": _can_module()}):
+        can._transmit_loop()
+
+    assert can._target is None
+    assert not can._tx_active
+    assert len(can._bus.sent) == 1
+    message, _timeout = can._bus.sent[0]
+    assert bytes(message.data) == bytes(8)
+
+
 def test_odometry_window_preserves_receive_wall_timestamp():
     can = BunkerCAN({}, "can1")
     can._odom_samples.append((10.0, 1_800_000_000_123,

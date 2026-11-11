@@ -159,11 +159,13 @@ class BunkerCAN:
                 active = target is not None and now < self._target_deadline
                 system = self._system_state
                 status_fresh = now - self._system_state_at <= STATUS_TIMEOUT_S
+                no_critical_faults = system is not None and not (system.get("error_flags", 0) & 0xB5)
                 was_active = self._tx_active
                 if not active:
                     self._target = None
                     self._tx_active = False
-                elif status_fresh and system and system["vehicle_state"] == protocol.VEHICLE_NORMAL \
+                elif status_fresh and system and no_critical_faults \
+                        and system["vehicle_state"] == protocol.VEHICLE_NORMAL \
                         and system["control_mode"] == protocol.CONTROL_CAN:
                     self._tx_active = True
                 else:
