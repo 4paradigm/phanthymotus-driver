@@ -21,6 +21,10 @@ cards:
   - { name: force_sensor,       type: sensor }
   - { name: model,              type: resource }
   - { name: camera_head,        type: sensor }
+  - { name: camera_wrist_left_rgb,    type: sensor }
+  - { name: camera_wrist_left_depth,  type: sensor }
+  - { name: camera_wrist_right_rgb,   type: sensor }
+  - { name: camera_wrist_right_depth, type: sensor }
   - { name: imu,                type: sensor }
   - { name: camera_depth,       type: sensor }
   - { name: camera_pointcloud,  type: sensor }

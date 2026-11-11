@@ -87,9 +87,12 @@ def _report(status_queue, status):
             pass
 
 
-def _capture_worker(namespace, side, serial, quality, initial_channels,
-                    commands, stop_event, status_queue):
+def _capture_worker(namespace, side, serial, quality, channels,
+                    stop_event, status_queue):
     """Run on its own process: only this process creates an rs.pipeline."""
+    from common import logsafe
+    logsafe.install()
+
     # Set before rclpy creates a participant; never expose camera data on LAN.
     os.environ["ROS_DOMAIN_ID"] = "42"
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
@@ -138,15 +141,13 @@ def _capture_worker(namespace, side, serial, quality, initial_channels,
             CompressedImage, camera_topic(namespace, side, channel),
             qos_profile_sensor_data) for channel in CHANNELS}
 
-        wanted = set(initial_channels)
         last_report = 0.0
         last_input = time.monotonic()
         while not stop_event.is_set():
-            while True:
-                try:
-                    wanted = set(commands.get_nowait())
-                except queue.Empty:
-                    break
+            # One shared snapshot: rapid toggles cannot drop the final request.
+            selection = channels.value
+            wanted = {channel for bit, channel in enumerate(CHANNELS)
+                      if selection & (1 << bit)}
             try:
                 frameset = pipe.wait_for_frames(timeout_ms=1000)
             except RuntimeError:
@@ -222,7 +223,7 @@ class WristCameraSession:
         self.blocked_reason = None
         self._ctx = mp.get_context("spawn")
         self._lock = threading.RLock()
-        self._proc = self._commands = self._queue = self._quit = None
+        self._proc = self._channels = self._queue = self._quit = None
         self._wanted = set()
         self._requested_at = {}
         self._status = {}
@@ -248,28 +249,16 @@ class WristCameraSession:
                 self._proc.join(timeout=0.5)
             self._proc.close()
             self._proc = None
-        for q in (self._queue, self._commands):
-            if q is not None:
-                q.cancel_join_thread()
-                q.close()
-        self._queue = self._commands = self._quit = None
+        if self._queue is not None:
+            self._queue.cancel_join_thread()
+            self._queue.close()
+        self._queue = self._channels = self._quit = None
 
     def _send_wanted(self):
-        """Send latest channel selection without blocking the MCP HTTP thread."""
-        if self._commands is None:
-            return
-        state = tuple(sorted(self._wanted))
-        try:
-            self._commands.put_nowait(state)
-        except queue.Full:
-            try:
-                self._commands.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._commands.put_nowait(state)
-            except queue.Full:
-                pass
+        """Replace the worker's desired channels without a queued backlog."""
+        if self._channels is not None:
+            self._channels.value = sum(1 << bit for bit, channel in enumerate(CHANNELS)
+                                       if channel in self._wanted)
 
     def start(self, channel):
         with self._lock:
@@ -292,13 +281,14 @@ class WristCameraSession:
                 self._status = {}
                 for name in self._wanted:
                     self._requested_at[name] = time.monotonic()
-                self._commands = self._ctx.Queue(maxsize=8)
+                self._channels = self._ctx.Value("B", 0)
+                self._send_wanted()
                 self._queue = self._ctx.Queue(maxsize=8)
                 self._quit = self._ctx.Event()
                 self._proc = self._ctx.Process(
                     target=_capture_worker,
                     args=(self.namespace, self.side, self.serial, self.jpeg_quality,
-                          tuple(self._wanted), self._commands, self._quit, self._queue),
+                          self._channels, self._quit, self._queue),
                     name=f"tianyi_wrist_{self.side}", daemon=True)
                 self._proc.start()
             else:
@@ -312,7 +302,7 @@ class WristCameraSession:
             if not self._wanted:
                 self._close()
                 self._status = {}
-            elif self._commands is not None:
+            elif self._channels is not None:
                 self._send_wanted()
             return self.info(channel)
 

@@ -52,7 +52,7 @@ plugins:
     floor_offset_m: 1.50
   # Shared SDK session per physical wrist; four sensor cards registered.
   # Do NOT swap ASIC Serial Number (lsusb) with RealSense SDK Serial Number.
-  # Fill these two values only after visually confirming physical left/right.
+  # Physical left/right bindings confirmed on this robot. Override for other units.
   wrist_cameras:
     enabled: true
     left_serial: "261922273335"    # D405 SDK Serial Number, NOT ASIC Serial Number

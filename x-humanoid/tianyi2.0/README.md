@@ -42,10 +42,12 @@ vendor domain-0 participant or modify head Orbbec services.
 The robot's `rs-enumerate-devices` reported two **SDK Serial Number** values:
 `261922273335` and `262122270344`. These are *not* the ASIC serials
 `261043072850` and `261043072635` visible under `/dev/v4l/by-id`.
-The physical side corresponding to each SDK serial has not yet been verified.
+The physical mapping has been confirmed on this robot: **left `261922273335`**,
+**right `262122270344`**. These are the defaults in `config.yaml`; other robots
+must supply their own verified bindings.
 
 **Never guess left/right by USB video index or enumeration order.**
-Confirm the placement from labels, cables, or a safe preview, then set
+For a different robot, confirm placement from labels, cables, or a safe preview, then set
 `plugins.wrist_cameras.left_serial` and `right_serial` in `config.yaml`.
 Deployment overrides are also supported without rebuilding the image:
 
@@ -60,6 +62,18 @@ robot cards. Starting a wrist card with no SDK installed, a missing device,
 or missing loopback DDS profile reports an error; do not install
 `pyrealsense2` on the host solely for this bundle. The driver image pins
 the CPython 3.10 Linux ARM64 wheel `pyrealsense2==2.56.5.9235`.
+All Python dependencies are declared in `requirements.txt` and installed from
+that file during the image build (`--only-binary=pyrealsense2` avoids a native
+SDK source build). For a matching Linux environment, the same dependency path is
+`pip3 install --only-binary=pyrealsense2 -r requirements.txt`.
+
+The SDK is required for direct D405 acquisition; it increases image size.
+The pinned ARM64 CPython 3.10 wheel is 4,338,854 bytes to download and
+13,796,155 bytes unpacked (about 4.14 / 13.16 MiB), before image compression
+and pip metadata. These are package sizes, not a measured image-size delta.
+`libusb-1.0-0` is explicitly requested as a runtime USB dependency; apt reuses
+it if already present in the base image. No SDK source tree, compiler build
+artifacts, or pip cache are added by this dependency installation.
 
 ### Wire format and timestamp semantics
 

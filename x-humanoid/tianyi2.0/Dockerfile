@@ -20,13 +20,10 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         libusb-1.0-0 && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml numpy opencv-python-headless phonemizer pyalsaaudio sounddevice
-
-# Official RealSense Linux ARM64 / CPython 3.10 wheel. Do not build the
-# native SDK from source in this image; camera SDK runs in isolated workers.
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --only-binary=:all: \
-    pyrealsense2==2.56.5.9235
+COPY requirements.txt /work/requirements.txt
+# Use the prebuilt RealSense wheel; never compile the native SDK in this image.
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --only-binary=pyrealsense2 \
+    -r /work/requirements.txt
 
 # Build tianyi ROS2 message packages (bodyctrl_msgs + lyre_msgs)
 COPY msgs/ /tianyi_ws/src/

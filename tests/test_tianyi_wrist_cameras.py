@@ -5,6 +5,7 @@ import sys
 import zlib
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -44,11 +45,11 @@ def test_unbound_serial_registers_cards_but_cannot_open_camera():
     assert left._proc is None
 
 
-def test_wrong_asic_serial_is_not_accepted_implicitly():
-    # The ASIC identifier is also 12 digits and cannot be reliably recognized
-    # syntactically. It is NOT copied automatically from lsusb into the config.
-    main = (ROOT / "x-humanoid" / "tianyi2.0" / "config.yaml").read_text()
-    assert 'left_serial: ""' in main and 'right_serial: ""' in main
+def test_default_bindings_match_confirmed_physical_wrists():
+    cfg = yaml.safe_load((SOURCE.parent / "config.yaml").read_text())
+    bindings = cfg["plugins"]["wrist_cameras"]
+    assert bindings["left_serial"] == "261922273335"
+    assert bindings["right_serial"] == "262122270344"
 
 
 def test_bad_or_duplicate_binding_fails_closed_without_usb():
@@ -125,3 +126,76 @@ def test_worker_is_separate_process_and_not_opened_during_construction():
     assert s._wanted == set()
     assert s.info("rgb")["state"] == "idle"
     assert s.info("depth")["state"] == "idle"
+
+
+def test_wrist_cards_are_listed_in_marketplace():
+    manifest = yaml.safe_load((SOURCE.parent / "driver.yaml").read_text())
+    declared = {card["name"]: card["type"] for card in manifest["cards"]}
+    for side in ("left", "right"):
+        for channel in ("rgb", "depth"):
+            assert declared[f"camera_wrist_{side}_{channel}"] == "sensor"
+
+
+@pytest.mark.parametrize("final_channel", ["rgb", "depth"])
+def test_rapid_channel_switches_preserve_final_selection(monkeypatch, final_channel):
+    # Stub only the camera process; exercise real start/stop and shared memory.
+    # The capture process is deliberately not consuming during the burst.
+    class CaptureProcess:
+        def __init__(self, *, target, args, **kwargs):
+            self.args = args
+            self.alive = False
+
+        def start(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout):
+            self.alive = False
+
+        def close(self):
+            pass
+
+    s = session()
+    monkeypatch.setattr(s._ctx, "Process", CaptureProcess)
+    s.start("rgb")
+    worker = s._proc
+    selection = worker.args[4]
+    try:
+        for _ in range(100):
+            s.start("depth")
+            s.stop("depth")
+        if final_channel == "depth":
+            s.start("depth")
+            s.stop("rgb")
+        assert s._proc is worker
+        # Bit 0 is RGB; bit 1 is depth. Read the worker's view, not _wanted.
+        assert selection.value == (1 if final_channel == "rgb" else 2)
+    finally:
+        s.stop("rgb")
+        s.stop("depth")
+
+
+def test_capture_worker_protects_python_logs_before_initialization(monkeypatch, capfd):
+    import queue
+    import threading
+    from common import logsafe
+
+    # Restore pytest's streams after the real logsafe.install() replaces them.
+    monkeypatch.setattr(sys, "stdout", sys.stdout)
+    monkeypatch.setattr(sys, "stderr", sys.stderr)
+    monkeypatch.setattr(logsafe, "_installed", False)
+
+    def missing_profile(path):
+        print("worker\x00\x1b[31m diagnostic\x1b[0m")
+        return False
+
+    monkeypatch.setattr(wrist.os.path, "isfile", missing_profile)
+    for name in ("ROS_DOMAIN_ID", "RMW_IMPLEMENTATION", "FASTRTPS_DEFAULT_PROFILES_FILE"):
+        monkeypatch.setenv(name, wrist.os.environ.get(name, ""))
+    status = queue.Queue()
+    wrist._capture_worker("test_robot", "left", "261922273335", 85,
+                          session()._ctx.Value("B", 1), threading.Event(), status)
+    assert "Missing loopback-only DDS profile" in status.get_nowait()["error"]
+    assert capfd.readouterr().out == "worker diagnostic\n"
