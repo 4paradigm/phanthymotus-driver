@@ -252,17 +252,18 @@ class BunkerMiniDevice:
         _acp_notify(action_id, status, result)
 
     def get_tools(self):
-        max_linear = min(0.2, float(self.config.get("max_linear_m_s", 0.2)))
-        max_yaw_deg_s = math.degrees(min(
-            0.4, float(self.config.get("max_angular_rad_s", 0.4))))
+        max_linear = float(self.config.get("max_linear_m_s", 1.0))
+        max_yaw_deg_s = float(self.config.get("max_angular_deg_s", 60.0))
         schema = {
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["move"]},
                 "vx": {"type": "number", "minimum": -max_linear, "maximum": max_linear,
+                       "default": 0,
                        "description": "Forward velocity in m/s"},
                 "vyaw": {"type": "number", "minimum": -max_yaw_deg_s,
                          "maximum": max_yaw_deg_s,
+                         "default": 0,
                          "description": "Yaw velocity in degrees/s"},
                 "duration_s": {"type": "number", "minimum": MOVE_MIN_DURATION_S,
                                "maximum": MOVE_MAX_DURATION_S,
@@ -331,13 +332,13 @@ class BunkerMiniDevice:
             if not self._motion_enabled:
                 raise RuntimeError("movement is disabled by BUNKER_MOTION_ENABLED=0")
             duration = _validate_move_duration(args.get("duration_s"))
-            max_linear = min(0.2, float(self.config.get("max_linear_m_s", 0.2)))
-            linear = BunkerCAN._limit(args.get("vx"), max_linear, "linear")
-            vyaw = args.get("vyaw")
+            max_linear = float(self.config.get("max_linear_m_s", 1.0))
+            linear = BunkerCAN._limit(args.get("vx", 0.0), max_linear, "linear")
+            vyaw = args.get("vyaw", 0.0)
             if isinstance(vyaw, bool) or not isinstance(vyaw, (int, float)) or not math.isfinite(vyaw):
                 raise ValueError("vyaw must be a finite number in degrees/s")
-            max_yaw_rad_s = min(
-                0.4, float(self.config.get("max_angular_rad_s", 0.4)))
+            max_yaw_rad_s = math.radians(
+                float(self.config.get("max_angular_deg_s", 60.0)))
             angular = BunkerCAN._limit(
                 math.radians(float(vyaw)), max_yaw_rad_s, "angular")
             self.can.request_control_mode(protocol.CONTROL_CAN)

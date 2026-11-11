@@ -1,3 +1,4 @@
+import math
 import sys
 import time
 import types
@@ -52,6 +53,19 @@ def test_target_requires_fresh_normal_chassis_in_can_mode():
                          "control_mode": protocol.CONTROL_RC}
     can._system_state_at = time.monotonic()
     _assert_raises(RuntimeError, "CAN 控制模式", lambda: can.set_target(0.1, 0.0))
+
+
+def test_target_uses_configured_one_meter_per_second_and_sixty_degree_limits():
+    can = BunkerCAN({"max_linear_m_s": 1.0, "max_angular_deg_s": 60}, "can1")
+    can._system_state = {"vehicle_state": protocol.VEHICLE_NORMAL,
+                         "control_mode": protocol.CONTROL_CAN}
+    can._system_state_at = time.monotonic()
+
+    assert can.validate_target(1.0, math.radians(60)) == (1.0, math.radians(60))
+    _assert_raises(ValueError, "exceeds configured limit",
+                   lambda: can.validate_target(1.01, 0.0))
+    _assert_raises(ValueError, "exceeds configured limit",
+                   lambda: can.validate_target(0.0, 1.0473))
 
 
 def test_motion_lease_expiry_sends_one_zero_velocity_frame():

@@ -218,8 +218,9 @@ class BunkerCAN:
             raise RuntimeError("底盘故障位指示遥控器失联、电机通讯故障或急停；拒绝运动")
         if state["control_mode"] != protocol.CONTROL_CAN:
             raise RuntimeError("底盘不在 CAN 控制模式；请先通过物理遥控器切换控制权")
-        linear = self._limit(linear, float(self.config.get("max_linear_m_s", 0.4)), "linear")
-        angular = self._limit(angular, float(self.config.get("max_angular_rad_s", 0.8)), "angular")
+        linear = self._limit(linear, float(self.config.get("max_linear_m_s", 1.0)), "linear")
+        angular_limit = math.radians(float(self.config.get("max_angular_deg_s", 60.0)))
+        angular = self._limit(angular, angular_limit, "angular")
         return linear, angular
 
     def request_control_mode(self, mode: int = protocol.CONTROL_CAN,

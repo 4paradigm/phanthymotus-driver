@@ -120,7 +120,7 @@ def test_base_drive_uses_degrees_per_second_and_requests_can_mode_internally():
     assert device.can.mode_requests == 1
 
 
-@pytest.mark.parametrize("vx", [None, "bad", True, float("nan"), float("inf"), 0.21, -0.21])
+@pytest.mark.parametrize("vx", [None, "bad", True, float("nan"), float("inf"), 1.01, -1.01])
 def test_invalid_linear_velocity_is_rejected_before_requesting_can_mode(vx):
     device = _bare_device()
 
@@ -131,6 +131,47 @@ def test_invalid_linear_velocity_is_rejected_before_requesting_can_mode(vx):
     assert device.can.mode_requests == 0
     assert device.can.stops == 0
     assert device._active_move_id is None
+
+
+def test_missing_motion_velocities_default_to_zero_and_schema_limits_match_config():
+    device = _bare_device()
+    device.config = {"max_linear_m_s": 1.0, "max_angular_deg_s": 60}
+    schema = next(item["inputSchema"] for item in device.get_tools()
+                  if item["name"] == "base_drive")
+    assert schema["properties"]["vx"]["maximum"] == 1.0
+    assert schema["properties"]["vyaw"]["maximum"] == 60
+    assert schema["properties"]["vx"]["default"] == 0
+    assert schema["properties"]["vyaw"]["default"] == 0
+
+    class DeferredThread:
+        def __init__(self, target, args, **_kwargs):
+            self.target, self.args = target, args
+        def start(self):
+            pass
+
+    with patch("device.threading.Thread", DeferredThread):
+        result = device.dispatch("move", {
+            "_tool_name": "base_drive", "duration_s": 1})
+    assert device.can.target_validation == (0.0, 0.0)
+    assert result["vyaw_deg_s"] == 0.0
+    assert device.can.mode_requests == 1
+
+
+def test_base_drive_accepts_configured_velocity_limits():
+    device = _bare_device()
+    device.config = {"max_linear_m_s": 1.0, "max_angular_deg_s": 60}
+
+    class DeferredThread:
+        def __init__(self, target, args, **_kwargs):
+            self.target, self.args = target, args
+        def start(self):
+            pass
+
+    with patch("device.threading.Thread", DeferredThread):
+        result = device.dispatch("move", {
+            "_tool_name": "base_drive", "vx": 1.0, "vyaw": 60, "duration_s": 1})
+    assert device.can.target_validation == pytest.approx((1.0, 1.0471975512))
+    assert result["vyaw_deg_s"] == 60
 
 
 def test_sensor_cards_use_familiar_names_and_flat_odometry_ports():

@@ -2,8 +2,8 @@ mcp_port: 15744
 name: "AgileX Bunker Mini"
 ros_namespace: bunker_mini
 can_interface: ""
-max_linear_m_s: 0.2
-max_angular_rad_s: 0.4
+max_linear_m_s: 1.0
+max_angular_deg_s: 60
 ros:
   robot_domain_id: 0
   core_domain_id: 42

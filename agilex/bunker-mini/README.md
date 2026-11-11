@@ -61,9 +61,11 @@ motion feedback does not contain yaw rate, so `wz` remains `null` rather than
 being estimated from undocumented geometry.
 
 `base_drive` exposes only a bounded `move` action and takes no `input_topic`.
-`vx` is m/s and `vyaw` is degrees/s; the driver converts yaw rate to rad/s for
-the CAN command. The move action requests CAN mode internally and verifies the
-feedback before motion, so callers do not need a separate `enable_can` action.
+`vx` is m/s and `vyaw` is degrees/s; the limits default to 1.0 m/s and 60
+degrees/s. If the frontend omits either velocity argument, it defaults to zero.
+The driver converts yaw rate to rad/s for the CAN command. The move action
+requests CAN mode internally and verifies the feedback before motion, so callers
+do not need a separate `enable_can` action.
 The physical remote can still take priority; set its control switch as
 described in the product manual. Motion requires fresh normal state, no critical
 fault flags, and remains within configured speed limits. Software movement
