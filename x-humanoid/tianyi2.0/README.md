@@ -229,3 +229,21 @@ It uses pyalsaaudio when a working one is installed and otherwise captures
 through `arecord`, so PC1 needs no pip install and no internet. If its capture
 fails, the process exits rather than keep an empty port open, and the next
 health check restarts it.
+
+## RGB-D input for generic visual odometry
+
+`camera_rgbd` exposes paired `image/jpeg` and 640×480 millimetre
+`image/depth-zlib` computation ports, separate from the existing display cards.
+It waits up to ten seconds for the vendor registration/time parameters,
+calibration and first pair before source startup returns. Color is sampled
+using its distortion and intrinsics onto the registered depth optical rays;
+both ports declare the resulting common pinhole K and retain source headers.
+Connect these ports to Perception's `rgbd_odometry` card. Its camera-frame
+`state/odom` and PR519's native PointCloud2 can feed the SLAM card; do not use
+the visualization cloud or invent a camera-to-body mount.
+
+The native cloud budget is configured to 20 MB for the observed 1280×720
+source. Clock and physical alignment acceptance remain real-device checks;
+source declarations do not turn the unverified PR519 SLAM metadata into a
+verified clock relation. Sustained tracking and map save/reopen are pending
+the user's next test window, not established by offline source tests.

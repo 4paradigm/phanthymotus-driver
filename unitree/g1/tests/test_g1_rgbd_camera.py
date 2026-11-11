@@ -162,3 +162,16 @@ def test_g1_zero_coefficient_depth_models_are_pinhole(model):
     source, _, _ = configured(model)
     source.encode(Frames(), 1700000000130000000)
     assert source.info()['state'] == 'ready'
+
+
+def test_first_rgbd_start_waits_for_source_metadata():
+    import time
+    tree=ast.parse((ROOT/'device.py').read_text())
+    node=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='RealSensePlugin')
+    namespace={'time':time}
+    exec(compile(ast.Module(body=[node],type_ignores=[]),str(ROOT/'device.py'),'exec'),namespace)
+    plugin=namespace['RealSensePlugin'].__new__(namespace['RealSensePlugin'])
+    statuses=iter([{'state':'unavailable','camera_info':[]}, {'state':'ready','camera_info':[{'schema':'motus.camera/1'}]}])
+    plugin._rgbd_info=lambda:next(statuses)
+    plugin.is_running=lambda:True
+    assert plugin.dispatch('start',{'_tool_name':'camera_rgbd'})['camera_info']

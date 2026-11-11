@@ -1,8 +1,8 @@
 """Generic Perception inputs from the existing Bumi RealSense capture owner.
 
 rs.align samples color into the native depth lens, preserving depth axial Z.
-Both images are then sampled on common rectified rays; source capture times are mapped once, never replaced by
-publication time. This is a camera optical frame, with no assumed body mount.
+Both images are then sampled on common rectified rays. Source capture times are
+mapped once, never replaced by publication time. This is a camera optical frame, with no assumed body mount.
 """
 from array import array
 from copy import deepcopy
@@ -18,20 +18,17 @@ try:
 except ImportError:
     from visual_odometry_contract import ClockMap
 
-STATUS_MARKER = '[camera_subprocess] RGBD '
-
-
 def make_geometry(intr):
     import cv2
     if (intr.width, intr.height) != (640, 480):
-        raise ValueError('RGB-D requires 640x480 color intrinsics')
+        raise ValueError('RGB-D requires 640x480 depth intrinsics')
     k = np.array([[intr.fx, 0., intr.ppx], [0., intr.fy, intr.ppy], [0., 0., 1.]])
     if not np.isfinite(k).all() or intr.fx <= 0 or intr.fy <= 0:
         raise ValueError('invalid RGB-D intrinsics')
     d = np.asarray(intr.coeffs, dtype=float)
     model = str(intr.model).rsplit('.', 1)[-1]
     if d.shape != (5,) or not np.isfinite(d).all():
-        raise ValueError('invalid color distortion coefficients')
+        raise ValueError('invalid depth distortion coefficients')
     # OpenCV's forward Brown model cannot represent RealSense inverse Brown.
     # The D435i's zero-coefficient inverse model is exactly a pinhole.
     if (model not in ('none', 'brown_conrady', 'modified_brown_conrady', 'inverse_brown_conrady') or

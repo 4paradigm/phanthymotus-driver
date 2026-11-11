@@ -1,6 +1,5 @@
 """Bumi generic RGB-D source: calibrated pixels and capture time, no hardware."""
 import importlib.util
-import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace as NS
@@ -164,7 +163,7 @@ def test_capture_owner_feeds_generic_source_and_keeps_display_on_source_failure(
         def unavailable(self, error):
             calls.append(('unavailable', str(error)))
     monkeypatch.setitem(sys.modules, 'rgbd_camera', NS(
-        RgbdCameraPublisher=BrokenSource, STATUS_MARKER=rgbd.STATUS_MARKER))
+        RgbdCameraPublisher=BrokenSource))
     monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
     device._camera_subprocess('robot')
     assert [c[0] for c in calls] == ['init', 'pair', 'unavailable']
@@ -192,6 +191,7 @@ def test_camera_rgbd_card_returns_both_declarations_on_start_and_info(monkeypatc
     for action in ('start', 'info'):
         result = plugin.dispatch(action, {'_tool_name': 'camera_rgbd'})
         assert result['sourceReady'] is True
+        assert 'error' not in result  # MCP treats even error=None as a failed tool call.
         assert result['camera_info'] == declarations
         assert result['topic_out'] == [{'topic': '/robot/camera/rgbd/color', 'format': 'image/jpeg'},
                                        {'topic': '/robot/camera/rgbd/depth', 'format': 'image/depth-zlib'}]
@@ -247,3 +247,12 @@ def test_native_depth_geometry_controls_the_computation_pair(source):
     publisher.publish(pair)
     assert notices[-1]['camera_info'][0]['K'] == [610., 0., 320., 0., 611., 240., 0., 0., 1.]
     assert messages['/robot/camera/rgbd/depth'][0].header.frame_id == 'robot_depth_optical'
+
+
+def test_first_source_start_waits_for_core_camera_metadata(monkeypatch):
+    device=_capture_fixture._load_device(monkeypatch)
+    plugin=device.CameraPlugin.__new__(device.CameraPlugin)
+    statuses=iter([dict(sourceReady=False,camera_info=[]),dict(sourceReady=True,camera_info=[{'schema':'motus.camera/1'}])])
+    plugin._rgbd_info=lambda:next(statuses)
+    plugin.is_running=lambda:True
+    assert plugin.dispatch('start',{'_tool_name':'camera_rgbd'})['camera_info']

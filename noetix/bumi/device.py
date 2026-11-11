@@ -2626,7 +2626,7 @@ class CameraPlugin:
         root = f"/{self._namespace}/camera/rgbd"
         return {"state": "running" if status["ready"] else "unavailable",
                 "sourceReady": status["ready"], "camera_info": status["camera_info"],
-                "error": status.get("error"),
+                **({"error": status["error"]} if status.get("error") else {}),
                 "topic_out": [{"topic": root + "/color", "format": "image/jpeg"},
                               {"topic": root + "/depth", "format": "image/depth-zlib"}]}
 
@@ -2732,7 +2732,13 @@ class CameraPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if args.get("_tool_name") == "camera_rgbd":
-            return self._rgbd_info()
+            status = self._rgbd_info()
+            if action == "start":
+                deadline = time.monotonic() + 10.
+                while not status.get("camera_info") and self.is_running() and time.monotonic() < deadline:
+                    time.sleep(.05)
+                    status = self._rgbd_info()
+            return status
         if action == "start":
             return {"state": "running"}
         if action == "stop":

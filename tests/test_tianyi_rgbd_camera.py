@@ -69,3 +69,30 @@ def test_healthy_source_info_is_not_flagged_as_an_mcp_error():
     source.lock=threading.RLock();source.root='/test';source.geometry=None
     source.running=True;source.registered=True;source.count=2;source.error=None
     assert 'error' not in source.dispatch('info',{})
+
+
+def test_first_source_start_waits_for_calibration_before_core_snapshots_info():
+    import threading,time
+    source=object.__new__(m.RgbdCameraPlugin)
+    source.lock=threading.RLock();source.root='/test';source.clock='capture-clock'
+    source.running=True;source.registered=False;source.count=0;source.error=None;source.geometry=None
+    source.start=lambda:None
+    geometry=m.make_geometry(info(),info(),registered=True)
+    def ready():
+        time.sleep(.02)
+        with source.lock:source.geometry=geometry;source.registered=True;source.count=1
+    thread=threading.Thread(target=ready);thread.start()
+    try:
+        result=source.dispatch('start',{})
+        assert result['camera_info'] and result['frames_forwarded']==1
+    finally:thread.join()
+
+
+def test_recovered_vendor_parameters_clear_obsolete_error(monkeypatch):
+    import sys,threading
+    monkeypatch.setitem(sys.modules,'rcl_interfaces.srv',NS(GetParameters=object))
+    source=object.__new__(m.RgbdCameraPlugin)
+    source.lock=threading.RLock();source.running=True;source.registered=False;source.error='old parameter failure'
+    source.future=NS(done=lambda:True,result=lambda:NS(values=[NS(bool_value=True),NS(string_value='global'),NS(bool_value=True)]))
+    source._parameters()
+    assert source.registered and source.error is None

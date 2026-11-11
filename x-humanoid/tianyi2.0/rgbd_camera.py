@@ -148,8 +148,8 @@ class RgbdCameraPlugin:
                 try:
                     values = self.future.result().values
                     self.registered = (values[0].bool_value and values[1].string_value == 'global' and values[2].bool_value)
-                    if not self.registered:
-                        self.error = 'Orbbec requires registered depth and source global capture time'
+                    self.error = (None if self.registered else
+                                  'Orbbec requires registered depth and source global capture time')
                 except Exception as error:
                     self.error = str(error)
                 self.future = None
@@ -249,6 +249,12 @@ class RgbdCameraPlugin:
     def dispatch(self, action, args):
         if action == 'start':
             self.start()
+            deadline = time.monotonic() + 10.
+            while time.monotonic() < deadline:
+                with self.lock:
+                    if not self.running or (self.geometry is not None and self.count > 0 and not self.error):
+                        break
+                time.sleep(.05)
         elif action == 'stop':
             self.stop()
         with self.lock:

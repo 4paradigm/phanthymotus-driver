@@ -3993,7 +3993,13 @@ class RealSensePlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if args.get("_tool_name") == "camera_rgbd" and action in ("info", "start", "camera_rgbd"):
-            return self._rgbd_info()
+            status = self._rgbd_info()
+            if action == "start":
+                deadline = time.monotonic() + 10.
+                while not status.get("camera_info") and self.is_running() and time.monotonic() < deadline:
+                    time.sleep(.05)
+                    status = self._rgbd_info()
+            return status
         if action == "start":
             return {"state": "running"}
         if action == "stop":
