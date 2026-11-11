@@ -61,11 +61,15 @@ MOTION_CARDS = ("base_drive", "arm_control", "gripper", "lifting", "head")
 def post_acp_callback(action_id: str, status: str, result: dict, tool: str) -> None:
     """POST `/api/acp/complete`; three attempts. Raises if all fail (the caller logs it)."""
     url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
-    context = ssl.create_default_context(cafile=os.environ.get("AGENT_CORE_CA_CERT") or None)
-    if not os.environ.get("AGENT_CORE_CA_CERT") and url.startswith(("https://localhost:", "https://127.0.0.1:")):
-        # Agent Core's certificate is self-signed with no subjectAltName (README_dev "ACP"):
-        # hostname checking can never pass, and the endpoint only accepts loopback callers.
-        context.check_hostname = False
+    ca_file = os.environ.get("AGENT_CORE_CA_CERT") or None
+    context = ssl.create_default_context(cafile=ca_file)
+    # Agent Core's certificate is self-signed with no subjectAltName (README_dev "ACP"), so hostname
+    # checking can never pass -- that includes the case where an operator supplies the CA, which
+    # otherwise still failed with CERTIFICATE_VERIFY_FAILED. The chain is kept when a CA is given:
+    # only the hostname check is dropped, and `verify_mode` is untouched (create_default_context's
+    # CERT_REQUIRED). Without a CA there is nothing to verify against, so the guidance's CERT_NONE.
+    context.check_hostname = False
+    if ca_file is None:
         context.verify_mode = ssl.CERT_NONE
     payload = json.dumps({"action_id": action_id, "status": status, "result": result,
                           "tool": tool, "ts": time.time()}, allow_nan=False).encode()

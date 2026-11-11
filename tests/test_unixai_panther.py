@@ -2078,6 +2078,7 @@ class _Response:
 
 
 def test_completion_is_posted_to_agent_core_in_the_documented_shape(motion_module, monkeypatch):
+    import ssl
     import urllib.request
 
     sent = []
@@ -2091,6 +2092,28 @@ def test_completion_is_posted_to_agent_core_in_the_documented_shape(motion_modul
     assert body["action_id"] == "panther_arm_1" and body["status"] == "completed" and body["tool"] == "arm_control"
     assert body["result"] == {"left": {"error_code": 0}} and isinstance(body["ts"], float)
     assert context.check_hostname is False, "Agent Core's certificate has no subjectAltName"
+    assert context.verify_mode is ssl.CERT_NONE, "no CA to verify against: the guidance's CERT_NONE"
+
+
+def test_a_supplied_ca_still_verifies_the_chain_without_hostname_checking(motion_module, monkeypatch):
+    """Agent Core's certificate has no subjectAltName, so a supplied CA used to still fail with
+    CERTIFICATE_VERIFY_FAILED. The chain must stay verified; only the hostname check goes."""
+    import ssl
+    import urllib.request
+
+    contexts, sent = [], []
+    monkeypatch.setenv("AGENT_CORE_CA_CERT", "/etc/phanthy/agent-core-ca.pem")
+    monkeypatch.setattr(motion_module, "ssl", NS(
+        create_default_context=lambda cafile=None: contexts.append(
+            NS(cafile=cafile, check_hostname=True, verify_mode=ssl.CERT_REQUIRED)) or contexts[-1],
+        CERT_NONE=ssl.CERT_NONE))
+    monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout, context: sent.append(context) or _Response())
+    motion_module.post_acp_callback("panther_head_2", "completed", {"head0_rad": 0.1}, "head")
+    context, = contexts
+    assert context.cafile == "/etc/phanthy/agent-core-ca.pem"
+    assert context.check_hostname is False
+    assert context.verify_mode is ssl.CERT_REQUIRED, "the operator's CA is there to verify the chain"
+    assert sent == [context]
 
 
 def test_completion_is_retried_three_times_then_reported_not_swallowed(motion_module, monkeypatch, capsys):
@@ -2177,11 +2200,16 @@ def test_starting_a_camera_creates_a_transient_host_unit_through_nsenter(host_ca
     assert info["host_service_managed"] is True
 
 
-def test_an_already_running_host_unit_is_reused(host_camera, config, clock):
+def test_an_already_running_host_unit_is_reused_but_not_adopted(host_camera, config, clock):
+    """A unit that is already up may be managed by something else (the name is fixed), and the
+    driver cannot tell it from its own leftover, so it must not stop or restart it."""
     run = FakeRun(host_camera, active="active")
     camera = _camera(host_camera, config, clock, run)
-    assert camera.start("depth")["host_service_managed"] is True
-    assert [t[0] for t in run.tails()] == ["systemctl"] and len(run.calls) == 1
+    info = camera.start("depth")
+    assert info["host_service_managed"] is False and "start_error" not in info
+    assert [t for t in run.tails()] == [["systemctl", "is-active", "panther_orbbec.service"]]
+    camera.close()
+    assert len(run.calls) == 1, "container exit must not stop a unit this process did not create"
 
 
 def test_a_failed_unit_is_restarted_not_duplicated(host_camera, config, clock):
@@ -2246,9 +2274,9 @@ def test_stopping_a_container_that_never_started_a_camera_stops_nothing(host_cam
     assert run.calls == []
 
 
-def test_a_unit_found_running_under_this_drivers_name_is_stopped_too(host_camera, config, clock):
-    """E.g. left by an earlier container that was killed: the name is this driver's own."""
-    run = FakeRun(host_camera, active="active")
+def test_a_unit_this_driver_created_is_stopped_on_exit(host_camera, config, clock):
+    """The only unit `close()` stops is one this process started (here through `systemd-run`)."""
+    run = FakeRun(host_camera)
     camera = _camera(host_camera, config, clock, run)
     camera.start("depth")
     camera.close()

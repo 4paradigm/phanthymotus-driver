@@ -6,9 +6,11 @@ proposed in PR #520: the first `camera_color` or `camera_depth` start creates a 
 systemd unit on the *host* (through `nsenter` into PID 1's namespaces) that runs the vendor's
 `gemini2.launch.py`; both cards share it, and stopping a *card* does not stop it, because other
 programs on the robot may be using the same camera. Stopping the *container* does (`close()`),
-but only a unit this driver started or found under its own name: a camera some other process was
-already publishing is never touched. A unit left behind by a killed container (SIGKILL, crash)
-is reused by the next start.
+but only a unit this driver started itself: a unit that is already active when a card starts is
+reused without taking ownership, because it may be a service someone else manages, so it is
+neither stopped on exit nor restarted by this driver. A camera some other process was already
+publishing is never touched either. A unit left behind by a killed container (SIGKILL, crash)
+is reused the same way, and its next container leaves it running too.
 
 This needs `pid: host` and the one capability `SYS_ADMIN` (deploy/service.yml), not `privileged:
 true`. `setns(2)` requires CAP_SYS_ADMIN to join the mount, PID, network, IPC and UTS namespaces of
@@ -194,8 +196,12 @@ class HostCamera:
             return
         active = self._host(["systemctl", "is-active", self.UNIT], timeout=5.0, check=False)
         if active.stdout.strip() == "active":
-            with self._lock:
-                self._managed = True
+            # It already runs. This process did not create it -- it may be left over from a killed
+            # container, or a unit someone else set up under the same fixed name -- and there is no
+            # way to tell those apart, so it is reused but not adopted: it is neither stopped on
+            # exit nor restarted by the watchdog, and `host_service_managed` stays false.
+            print(f"[panther] {self.UNIT} is already active; reusing it without taking ownership",
+                  flush=True)
             return
         # A transient unit that failed may still be loaded; restarting it beats creating a
         # second unit with the same name.

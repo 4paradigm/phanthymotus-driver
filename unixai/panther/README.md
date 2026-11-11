@@ -219,11 +219,14 @@ readiness; that is reported next to it as `ready_for_motion`, `not_ready_reasons
   `gemini2.launch.py` (`host_camera.py`). Both camera cards share it. Stopping a *card* never stops
   it, because other programs on the robot may use the camera; **stopping the container does**
   (once, `systemctl stop --no-block`, so it does not eat the stop grace period), but only a unit
-  this driver started or found under its own name. A camera something else was already publishing
-  is never touched, and a container that is killed rather than stopped leaves the unit running
-  for the next start to reuse. A watchdog restarts it at most twice if frames stall, and cannot
-  restart it once the container has begun to stop. If the topics already have a publisher, the
-  driver leaves it alone.
+  this driver started itself. A unit that is already active when a card starts is reused without
+  being adopted -- it could be a service someone else manages, and the driver cannot tell -- so
+  it is not stopped on exit, the watchdog does not restart it, and
+  `camera_runtime.host_service_managed` is `false`. A camera something else was already
+  publishing is never touched, and a container that is killed rather than stopped leaves its unit
+  running for the next start to reuse, which leaves it running too. A watchdog restarts a unit
+  this driver created at most twice if frames stall, and cannot restart it once the container has
+  begun to stop.
   
   **What the container is granted for this, and what is not yet proven.** Entering PID 1's
   namespaces needs `pid: host` and the capability `SYS_ADMIN` (`setns(2)`). `deploy/service.yml`
