@@ -23,16 +23,6 @@ unixai-panther:
     # The fleet's loopback-only FastDDS profile, used by the domain-42 bridge processes.
     # Without it the container cannot reach Agent Core at all (see README_dev "DDS isolation").
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
-    # The operator's motion switch (unixai/panther/motion_switch.py). Motion is refused unless
-    # `commissioning.yaml` in this directory says `commissioning_motion_enabled: true`, so the
-    # default is a refusal and an operator's choice survives a new image or container. The
-    # directory is mounted, not the file: a bind-mounted file that does not exist is created by
-    # Docker as an empty *directory*, which would then be read as a switch. Read-only: the driver
-    # never writes it. Create it on the robot, with the operator present:
-    #   sudo mkdir -p /opt/phanthy-motus/data/panther
-    #   echo 'commissioning_motion_enabled: true' | sudo tee /opt/phanthy-motus/data/panther/commissioning.yaml
-    # and restart the container. Delete the file (or set it to false) and restart to turn motion off.
-    - ${PANTHER_COMMISSIONING_DIR:-/opt/phanthy-motus/data/panther}:/opt/phanthy-motus/data/panther:ro
   environment:
     - PYTHONUNBUFFERED=1
     - RCUTILS_COLORIZED_OUTPUT=0

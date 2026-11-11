@@ -1,27 +1,33 @@
-"""Panther motion cards: the five actuators, behind one gate, with a stop for each.
+"""Panther motion cards: the five actuators, each with a stop.
 
 Nothing here imports ROS. Every ROS call goes through `io` (`RosMotionIO` in device.py in
-production, a recorder in the tests) and everything the gate needs to know about the robot
-comes from `state` (the `Hub`). That keeps the rules that decide whether the robot may move
--- the commissioning switch, confirmation, fresh state, limits, caps, stop, completion --
-checkable without a robot, which is the only place a mistake here can be found safely.
+production, a recorder in the tests) and everything the checks need to know about the robot
+comes from `state` (the `Hub`). That keeps the rules that decide whether a command is sent --
+fresh state, ranges, step limits, stop, completion -- checkable without a robot.
+
+There is no confirmation field and no motion switch: with intelligent control on, a call moves
+the robot. What still stands between a call and the robot is not a switch but conditions: fresh
+`/joint_states`, a fresh emergency-stop diagnostic at level 0, the matching controller active,
+and every value inside the range the card shows next to its box (speed and duration caps, URDF
+joint limits, and a step limit from where the joint is now).
 
 Ported from the Panther driver proposed in PR #520 and extended where its review found gaps:
 
-* every actuator answers `stop`;
-* `arm_control` and `base_drive` run in a worker and return an `action_id` at once, then POST
-  completion to Agent Core (README_dev "ACP / x-completion"), so the call does not block the
-  MCP request for the length of the motion.
+* every actuator answers `stop`, and `on_interrupt_motion` / `on_interrupt_all` call it;
+* `arm_control`, `base_drive` and the head's `home` run in a worker and return an `action_id`
+  at once, then POST completion to Agent Core (README_dev "ACP / x-completion").
 
-What `stop` can and cannot do. `base_drive` and `arm_control` have something in flight and stop
-it: zero velocity repeated, or the trajectory goal cancelled and the controller restored.
-`gripper`, `lifting` and `head` are one position command each; once published the robot's
-controller owns the motion and this driver has no halt to call (the vendor halt services are
-deliberately not used). For those, `stop` guarantees only that this driver sends nothing more.
+What `stop` can and cannot do. `base_drive`, `arm_control` and the head's `home` have something in
+flight and stop it: zero velocity repeated, the trajectory goal cancelled and the controllers
+restored, or the head's stepping halted where it is. `gripper`, `lifting` and the head's `look`
+are one position command each; once published the robot's controller owns the motion and this
+driver has no halt to call (the vendor halt services are deliberately not used). For those,
+`stop` guarantees only that this driver sends nothing more.
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import ssl
 import threading
@@ -30,8 +36,8 @@ import urllib.request
 from uuid import uuid4
 
 from contracts import (
-    HEAD_JOINTS, LEFT_ARM_JOINTS, RIGHT_ARM_JOINTS, finite_number, finite_vector,
-    require_confirmation, validate_drive, validate_joint_target,
+    HEAD_JOINTS, LEFT_ARM_JOINTS, RIGHT_ARM_JOINTS, finite_number, optional_number,
+    validate_drive, validate_joint_target,
 )
 from panther_bridge import safe_text
 
@@ -94,94 +100,150 @@ def _spawn(target, name: str) -> None:
 
 # ── tool schemas ─────────────────────────────────────────────────────────────
 
-def _confirm() -> dict:
-    return {"type": "boolean", "const": True,
-            "description": "必须为 true：确认机器人可以运动，周围无人且无障碍"}
+# The arm and head boxes are named after the robot's joints (`la0` is `joint_la0`), so a value can
+# be read off the `joints` card and typed straight in.
+ARM_FIELDS = {f"la{i}": f"joint_la{i}" for i in range(8)} | {f"ra{i}": f"joint_ra{i}" for i in range(8)}
+HEAD_FIELDS = {"head0_rad": "joint_head0", "head1_rad": "joint_head1"}
+INTERRUPT_HOOKS = {"on_interrupt_motion": {"action": "stop"}, "on_interrupt_all": {"action": "stop"}}
 
 
-def motion_tools(config: dict) -> list:
-    """Tool definitions for the enabled motion cards (type `actuator`)."""
+def _fmt(value) -> str:
+    return f"{float(value):g}"
+
+
+def _number(title: str, unit: str, low, high, detail: str, default=None) -> dict:
+    """A number box whose shown range is the one enforced: in the title, the description and the
+    schema bounds, so whichever the canvas displays, it is the same numbers."""
+    field = {"type": "number", "minimum": float(low), "maximum": float(high),
+             "title": f"{title}（{unit}，{_fmt(low)} ~ {_fmt(high)}）",
+             "description": f"{title}：范围 {_fmt(low)} ~ {_fmt(high)} {unit}。{detail}".rstrip()}
+    if default is not None:
+        field["default"] = default
+    return field
+
+
+def _choice(title: str, options: list, default: str) -> dict:
+    return {"type": "string", "enum": [value for value, _ in options], "default": default,
+            "title": title, "oneOf": [{"const": value, "title": label} for value, label in options]}
+
+
+def _actions(options: list, default: str) -> dict:
+    return _choice("操作", options, default)
+
+
+def motion_tools(config: dict, limits: dict) -> list:
+    """Tool definitions for the enabled motion cards (type `actuator`).
+
+    `limits` are the joint limits the boxes show: the driver's bundled URDF, which is what the
+    robot published when it was captured. The commands are checked against the robot's live
+    `/robot_description` once it has arrived; a difference between the two is logged at start-up.
+    """
     plugins = (config or {}).get("plugins", {})
     tools = []
 
     def on(name):
         return bool((plugins.get(name) or {}).get("enabled", False))
 
-    def schema(actions, properties, params, resource, completion=None):
-        body = {"type": "object",
-                "properties": {"action": {"type": "string", "enum": list(actions)}, **properties},
-                "required": ["action"], "additionalProperties": False,
-                "x-action-params": {a: {"params": params.get(a, [])} for a in actions},
-                "x-resource": resource}
+    def schema(properties, actions=None, params=None, resource=None, completion=None, hooks=True):
+        body = {"type": "object", "properties": dict(properties), "additionalProperties": False}
+        if actions:
+            body["properties"] = {"action": actions, **body["properties"]}
+            body["required"] = ["action"]
+            body["x-action-params"] = {name: {"params": list(fields), "description": text}
+                                       for name, (fields, text) in params.items()}
+        if resource:
+            body["x-resource"] = resource
         if completion:
             body["x-completion"] = completion
+        if hooks:
+            body["x-hooks"] = dict(INTERRUPT_HOOKS)
         return body
 
     if on("base_drive"):
         cap = plugins["base_drive"]
-        lin, ang = cap["max_linear_mps"], cap["max_angular_radps"]
+        lin, ang, longest = cap["max_linear_mps"], cap["max_angular_radps"], cap["max_duration_s"]
         tools.append({
             "name": "base_drive", "type": "actuator", "multiInstance": False,
-            "description": "Panther 全向底盘定时运动（/cmd_vel_teleop）。单次时长有上限，到时自动归零；"
-                           "stop 立即停车。默认被 safety.commissioning_motion_enabled 禁止",
+            "description": f"Panther 全向底盘定时运动（/cmd_vel_teleop）。按给定速度走 duration_s 秒后自动停车；"
+                           f"stop 立即停车。速度上限 {_fmt(lin)} m/s、{_fmt(ang)} rad/s，单次最长 {_fmt(longest)} 秒",
             "inputSchema": schema(
-                ["start", "stop", "info", "move"],
-                {"linear_x": {"type": "number", "minimum": -lin, "maximum": lin},
-                 "linear_y": {"type": "number", "minimum": -lin, "maximum": lin},
-                 "angular_z": {"type": "number", "minimum": -ang, "maximum": ang},
-                 "duration_s": {"type": "number", "minimum": 0.1, "maximum": cap["max_duration_s"]},
-                 "confirm_motion": _confirm()},
-                {"move": ["linear_x", "linear_y", "angular_z", "duration_s", "confirm_motion"]},
-                "base", {"actions": ["move"], "timeout": int(cap["max_duration_s"]) + 10})})
+                {"linear_x": _number("前后速度", "m/s", -lin, lin, "正为前进，留空为 0", 0.0),
+                 "linear_y": _number("左右速度", "m/s", -lin, lin, "正为向左，留空为 0", 0.0),
+                 "angular_z": _number("转向角速度", "rad/s", -ang, ang, "正为逆时针（向左转），留空为 0", 0.0),
+                 "duration_s": _number("持续时间", "秒", 0.1, longest, "到时自动停车", 1.0)},
+                _actions([("move", "移动"), ("stop", "停车")], "move"),
+                {"move": (["linear_x", "linear_y", "angular_z", "duration_s"], "按给定速度移动 duration_s 秒后自动停车"),
+                 "stop": ([], "立即停车")},
+                "base", {"actions": ["move"], "timeout": int(longest) + 10})})
     if on("arm_control"):
         cap = plugins["arm_control"]
-        joints = {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8}
+        step, longest = cap["max_target_delta_rad"], cap["max_duration_s"]
+        joints = {}
+        for field, joint in ARM_FIELDS.items():
+            low, high = limits.get(joint, (-math.pi, math.pi))
+            side = "左臂" if field.startswith("la") else "右臂"
+            joints[field] = _number(f"{side} {field}", "rad", low, high,
+                                    f"与当前位置相差不超过 {_fmt(step)} rad；留空则保持当前位置")
         tools.append({
             "name": "arm_control", "type": "actuator", "multiInstance": False,
-            "description": "Panther 双臂点到点运动（FollowJointTrajectory）。目标按 URDF 限位和单次步长校验；"
-                           "运动期间临时切换控制器，结束后恢复；stop 取消并恢复",
+            "description": "Panther 双臂关节运动（FollowJointTrajectory）。move：只填要动的关节（la0~la7 左臂，ra0~ra7 右臂），"
+                           f"留空的保持当前位置；每个关节一次最多动 {_fmt(step)} rad。home：所选手臂全部关节回到 0 rad，"
+                           "不受单次步长限制，时间按平均速度不超过 "
+                           f"{_fmt(cap['home_speed_rad_s'])} rad/s 自动拉长。运动期间临时切换控制器，结束或 stop 后恢复",
             "inputSchema": schema(
-                ["start", "stop", "info", "move"],
-                {"side": {"type": "string", "enum": ["left", "right", "both"]},
-                 "positions": joints, "left_positions": joints, "right_positions": joints,
-                 "duration_s": {"type": "number", "minimum": 1.0, "maximum": cap["max_duration_s"]},
-                 "confirm_motion": _confirm()},
-                {"move": ["side", "positions", "left_positions", "right_positions", "duration_s",
-                          "confirm_motion"]},
-                ["arm_l", "arm_r"], {"actions": ["move"], "timeout": int(cap["max_duration_s"]) + 15})})
+                {**joints,
+                 "duration_s": _number("运动时间", "秒", 1.0, longest, "move 用这么长时间到达目标", 6.0),
+                 "side": _choice("回零的手臂", [("both", "双臂"), ("left", "左臂"), ("right", "右臂")], "both")},
+                _actions([("move", "移动关节"), ("home", "回零（0 rad）"), ("stop", "停止")], "move"),
+                {"move": ([*ARM_FIELDS, "duration_s"], "把填写的关节移动到目标角度，留空的关节保持不动"),
+                 "home": (["side"], "所选手臂全部关节回到 0 rad"),
+                 "stop": ([], "取消正在进行的运动并恢复控制器")},
+                ["arm_l", "arm_r"], {"actions": ["move", "home"], "timeout": int(longest) + 15})})
     if on("gripper"):
         tools.append({
             "name": "gripper", "type": "actuator", "multiInstance": False,
-            "description": "Panther 左右夹爪位置指令（0~1，开合含义以厂商文档为准，未经实测）。"
-                           "单次指令，下发后由机器人控制器执行；stop 仅保证本驱动不再下发",
+            "description": "Panther 左右夹爪。position 0 = 张开，1 = 闭合（操作员实测确认，厂商未给出）；"
+                           "open/close 分别发 0 和 1。单次指令，下发后由机器人控制器执行；stop 仅保证本驱动不再下发",
             "inputSchema": schema(
-                ["start", "stop", "info", "set"],
-                {"side": {"type": "string", "enum": ["left", "right"]},
-                 "mode": {"type": "string", "enum": list(GRIPPER_MODES), "default": "parallel"},
-                 "position": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                 "confirm_motion": _confirm()},
-                {"set": ["side", "mode", "position", "confirm_motion"]}, ["hand_l", "hand_r"])})
+                {"side": _choice("夹爪", [("both", "双手"), ("left", "左手"), ("right", "右手")], "both"),
+                 "mode": _choice("夹持模式", [("parallel", "平行"), ("2-finger", "两指"), ("centric", "中心")], "parallel"),
+                 "position": _number("夹爪位置", "0=张开，1=闭合", 0.0, 1.0, "")},
+                _actions([("set", "设置位置"), ("open", "张开"), ("close", "闭合")], "set"),
+                {"set": (["side", "mode", "position"], "把夹爪移动到 position（0=张开，1=闭合）"),
+                 "open": (["side", "mode"], "张开（position 0）"),
+                 "close": (["side", "mode"], "闭合（position 1）")},
+                ["hand_l", "hand_r"], hooks=False)})
     if on("lifting"):
         cap = plugins["lifting"]
         tools.append({
             "name": "lifting", "type": "actuator", "multiInstance": False,
-            "description": "Panther 升降位置指令（单位未经厂商确认，读数约 0.61）。目标限制在配置上限内，"
-                           "且与当前读数相差不超过单次步长；stop 仅保证本驱动不再下发",
+            "description": f"Panther 升降位置指令（单位未经厂商确认，读数约 0.61）。范围 0 ~ {_fmt(cap['max_position'])}，"
+                           f"且与当前读数相差不超过 {_fmt(cap['max_target_delta'])}；stop 仅保证本驱动不再下发",
             "inputSchema": schema(
-                ["start", "stop", "info", "set_position"],
-                {"position": {"type": "number", "minimum": 0.0, "maximum": cap["max_position"]},
-                 "confirm_motion": _confirm()},
-                {"set_position": ["position", "confirm_motion"]}, "waist")})
+                {"position": _number("升降位置", "单位未确认", 0.0, cap["max_position"],
+                                     f"与当前读数相差不超过 {_fmt(cap['max_target_delta'])}")},
+                resource="waist", hooks=False)})
     if on("head"):
+        cap = plugins.get("head") or {}
+        step = cap.get("max_target_delta_rad", 0.35)
+        boxes = {}
+        for field, joint, axis in (("head0_rad", "joint_head0", "俯仰（绕 y 轴）"),
+                                   ("head1_rad", "joint_head1", "水平转动（绕 z 轴）")):
+            low, high = limits.get(joint, (-math.pi, math.pi))
+            boxes[field] = _number(f"头部 {field[:5]} {axis}", "rad", low, high,
+                                   f"与当前位置相差不超过 {_fmt(step)} rad；留空则保持当前位置")
         tools.append({
             "name": "head", "type": "actuator", "multiInstance": False,
-            "description": "Panther 头部两个关节位置指令。按 URDF：joint_head0 绕 y（俯仰），joint_head1 绕 z（偏航）；"
-                           "目标按 URDF 限位和单次步长校验；stop 仅保证本驱动不再下发",
+            "description": "Panther 头部两个关节。按 URDF：joint_head0 绕 y（俯仰），joint_head1 绕 z（水平转动）。"
+                           f"look 每次最多动 {_fmt(step)} rad；home 回到 0 rad，按平均速度不超过 "
+                           f"{_fmt(cap.get('home_speed_rad_s', 0.35))} rad/s 逐步移动，stop 可中途停下",
             "inputSchema": schema(
-                ["start", "stop", "info", "look"],
-                {"head0_rad": {"type": "number"}, "head1_rad": {"type": "number"},
-                 "confirm_motion": _confirm()},
-                {"look": ["head0_rad", "head1_rad", "confirm_motion"]}, "head")})
+                boxes,
+                _actions([("look", "转到"), ("home", "回正（0 rad）"), ("stop", "停止")], "look"),
+                {"look": (list(HEAD_FIELDS), "把头转到给定角度，留空的关节保持不动"),
+                 "home": ([], "两个关节逐步回到 0 rad"),
+                 "stop": ([], "停止正在进行的回正")},
+                "head", {"actions": ["home"], "timeout": 30})})
     return tools
 
 
@@ -211,17 +273,15 @@ class Motion:
         # it is marked as running) still cancels it, instead of being answered "idle" and then
         # followed by the whole move.
         self._arm_stop_generation = 0
+        self._head_lock = threading.Lock()
+        self._head_generation = 0                            # bumped by stop/look: supersedes a home in progress
         self._stopped: set = set()
 
     # ── gate ─────────────────────────────────────────────────────────────────
 
-    def motion_enabled(self) -> bool:
-        return (self._cfg.get("safety") or {}).get("commissioning_motion_enabled") is True
-
     def _gate(self) -> None:
-        if not self.motion_enabled():
-            raise RuntimeError("motion is disabled: set safety.commissioning_motion_enabled to true "
-                               "only after the commissioning limits have been checked on this robot")
+        """The robot's state must allow motion: fresh joints and a fresh, normal emergency-stop
+        diagnostic. This is a condition, not a switch: it clears by itself when the robot is fine."""
         ready, reasons = self._state.motion_ready()
         if not ready:
             raise RuntimeError("motion refused: " + "; ".join(reasons))
@@ -234,9 +294,17 @@ class Motion:
 
     # ── dispatch ─────────────────────────────────────────────────────────────
 
+    DEFAULT_ACTIONS = {"base_drive": "move", "arm_control": "move", "gripper": "set",
+                       "lifting": "set_position", "head": "look"}
+
     def dispatch(self, card: str, action: str, args: dict) -> dict:
         handler = {"base_drive": self.drive, "arm_control": self.arm, "gripper": self.gripper,
                    "lifting": self.lifting, "head": self.head}[card]
+        # The bundle passes the card's own name when a call carries no `action` (README_dev: "if
+        # there is no action field, it equals the tool name"). `lifting` has no action box at all,
+        # and an LLM or hook may omit it on the others: that means the card's one motion.
+        if action in (None, "", card):
+            action = self.DEFAULT_ACTIONS[card]
         payload = dict(args)
         payload["action"] = action
         if action not in ("stop", "info"):
@@ -248,8 +316,8 @@ class Motion:
 
     def start(self, card: str) -> dict:
         """The lifecycle marker: the card is up and answering. It says nothing about whether a
-        command would be accepted -- that is `ready_for_motion` / `commissioning_motion_enabled`
-        in the same result -- so a card that is deliberately gated by default still starts."""
+        command would be accepted -- that is `ready_for_motion` / `accepts_motion` in the same
+        result -- so a card on a robot that is not ready still starts."""
         self._stopped.discard(card)
         return self.info(card)
 
@@ -261,9 +329,8 @@ class Motion:
         from whether motion would be accepted right now."""
         ready, reasons = self._state.motion_ready()
         result = {"state": "idle" if card in self._stopped else "ready",
-                  "commissioning_motion_enabled": self.motion_enabled(),
                   "ready_for_motion": ready, "not_ready_reasons": reasons,
-                  "accepts_motion": self.motion_enabled() and ready}
+                  "accepts_motion": ready}
         needed = {"base_drive": [DRIVE_CONTROLLER],
                   "arm_control": [ARM_FORWARD_CONTROLLER, *ARM_P2P_CONTROLLERS.values()],
                   "gripper": [GRIPPER_CONTROLLER.format(side=s) for s in ("left", "right")],
@@ -273,14 +340,12 @@ class Motion:
             result["controllers"] = {name: states.get(name, "missing") for name in needed}
         except Exception as exc:  # noqa: BLE001
             result["controllers_error"] = f"{type(exc).__name__}: {exc}"
-        if not self.motion_enabled():
-            result["note"] = "运动被 safety.commissioning_motion_enabled 禁止；传感器卡不受影响"
         if card == "arm_control":
             result["busy"] = self._arm_running
         return result
 
     def stop_all(self) -> None:
-        for card in ("base_drive", "arm_control"):
+        for card in ("base_drive", "arm_control", "head"):
             try:
                 self.stop(card)
             except Exception as exc:  # noqa: BLE001
@@ -292,6 +357,11 @@ class Motion:
             return self._stop_drive()
         if card == "arm_control":
             return self._stop_arm()
+        if card == "head":
+            with self._head_lock:
+                self._head_generation += 1                   # a home in progress stops where it is
+            return {"state": "idle", "note": "a head home in progress stops where it is; a look "
+                                              "already sent is the robot's to finish"}
         return {"state": "idle", "note": "single position command: nothing is in flight in this "
                                           "driver, and no further command will be sent"}
 
@@ -373,31 +443,20 @@ class Motion:
             return self.start("arm_control")
         if action == "info":
             return self.info("arm_control")
-        if action != "move":
+        if action not in ("move", "home"):
             raise ValueError(f"unsupported arm_control action: {action}")
         with self._arm_lock:
             started_at = self._arm_stop_generation
-        require_confirmation(args)
         cap = self._plugins["arm_control"]
-        duration = finite_number(args.get("duration_s", 6.0), "duration_s")
-        if not 1.0 <= duration <= float(cap["max_duration_s"]):
-            raise ValueError(f"duration_s must be in [1.0, {cap['max_duration_s']}]")
-        side = args.get("side", "left")
-        if side not in ("left", "right", "both"):
-            raise ValueError("side must be left, right or both")
         self._gate()
         current = self._state.joint_positions()
         if current is None:
             raise RuntimeError("fresh /joint_states is required")
         limits, _ = self._state.joint_limits()
-        step = float(cap["max_target_delta_rad"])
-        targets = {}
-        for arm_side, names, own_key in (("left", LEFT_ARM_JOINTS, "left_positions"),
-                                         ("right", RIGHT_ARM_JOINTS, "right_positions")):
-            if side not in (arm_side, "both"):
-                continue
-            positions = args.get("positions" if side == arm_side else own_key)
-            targets[arm_side] = (names, validate_joint_target(names, positions, limits, current, step))
+        if action == "move":
+            targets, duration = self._arm_move_targets(args, cap, current, limits)
+        else:
+            targets, duration = self._arm_home_targets(args, cap, current, limits)
         states = self._io.list_controllers()
         requested = [ARM_P2P_CONTROLLERS[arm_side] for arm_side in targets]
         for name in requested:
@@ -416,8 +475,59 @@ class Motion:
             self._arm_done.clear()
         action_id = f"panther_arm_{uuid4().hex[:8]}"
         self._spawn(lambda: self._arm_worker(action_id, targets, duration, plan), "panther-arm")
-        return {"state": "moving", "action_id": action_id, "side": side, "duration_s": duration,
+        side = "both" if len(targets) == 2 else next(iter(targets))
+        return {"state": "moving", "action_id": action_id, "action": action, "side": side,
+                "duration_s": duration,
+                "targets": {arm_side: dict(zip(names, positions)) for arm_side, (names, positions) in targets.items()},
                 "controllers_activated": list(plan[0]), "controllers_deactivated": list(plan[1])}
+
+    def _arm_move_targets(self, args: dict, cap: dict, current: dict, limits: dict) -> tuple:
+        """Targets for the joints that were filled in. An empty box keeps that joint where it is, so
+        one joint can be moved alone; an arm with no box filled is not moved at all."""
+        given = {}
+        for field, joint in ARM_FIELDS.items():
+            value = optional_number(args.get(field), field)
+            if value is not None:
+                given[joint] = value
+        if not given:
+            raise ValueError("fill in at least one joint (la0~la7 for the left arm, ra0~ra7 for the right)")
+        duration = optional_number(args.get("duration_s"), "duration_s")
+        duration = 6.0 if duration is None else duration
+        if not 1.0 <= duration <= float(cap["max_duration_s"]):
+            raise ValueError(f"duration_s must be within 1 ~ {float(cap['max_duration_s']):g} s")
+        step = float(cap["max_target_delta_rad"])
+        targets = {}
+        for arm_side, names in (("left", LEFT_ARM_JOINTS), ("right", RIGHT_ARM_JOINTS)):
+            if not any(name in given for name in names):
+                continue
+            unseen = [name for name in names if name not in current]
+            if unseen:
+                raise RuntimeError("fresh joint state is missing: " + ", ".join(unseen))
+            positions = [given.get(name, float(current[name])) for name in names]
+            targets[arm_side] = (names, validate_joint_target(names, positions, limits, current, step))
+        return targets, duration
+
+    def _arm_home_targets(self, args: dict, cap: dict, current: dict, limits: dict) -> tuple:
+        """Every joint of the chosen arms to its home position (0 rad unless config.yaml's
+        `home_pose` says otherwise). Not held to the per-command step: the duration is stretched
+        instead so that no joint goes faster than `home_speed_rad_s` on average."""
+        side = args.get("side") or "both"
+        if side not in ("left", "right", "both"):
+            raise ValueError("side must be left, right or both")
+        pose = cap.get("home_pose") or {}
+        speed = float(cap["home_speed_rad_s"])
+        targets, furthest = {}, 0.0
+        for arm_side, names in (("left", LEFT_ARM_JOINTS), ("right", RIGHT_ARM_JOINTS)):
+            if side not in (arm_side, "both"):
+                continue
+            positions = [finite_number(pose.get(name, 0.0), f"home_pose.{name}") for name in names]
+            targets[arm_side] = (names, validate_joint_target(names, positions, limits, current, None))
+            furthest = max([furthest] + [abs(p - float(current[n])) for n, p in zip(names, positions)])
+        duration = max(float(cap.get("home_min_duration_s", 2.0)), furthest / speed)
+        if duration > float(cap["max_duration_s"]):
+            raise ValueError(f"home would take {duration:.1f} s at {speed} rad/s, over the "
+                             f"{cap['max_duration_s']} s limit")
+        return targets, round(duration, 3)
 
     @staticmethod
     def _switch_plan(states: dict, requested: list) -> tuple:
@@ -530,21 +640,28 @@ class Motion:
             return self.start("gripper")
         if action == "info":
             return self.info("gripper")
-        if action != "set":
+        if action not in ("set", "open", "close"):
             raise ValueError(f"unsupported gripper action: {action}")
-        require_confirmation(args)
-        side = args.get("side")
-        if side not in ("left", "right"):
-            raise ValueError("side must be left or right")
-        position = finite_number(args.get("position"), "position")
+        side = args.get("side") or "both"
+        if side not in ("left", "right", "both"):
+            raise ValueError("side must be left, right or both")
+        if action == "set":
+            position = optional_number(args.get("position"), "position")
+            if position is None:
+                raise ValueError("position is required (0 = open, 1 = closed)")
+        else:
+            position = 0.0 if action == "open" else 1.0       # 0 = open, 1 = closed, confirmed by the operator
         if not 0.0 <= position <= 1.0:
-            raise ValueError("position must be in [0, 1]")
-        mode = args.get("mode", "parallel")
+            raise ValueError("position must be within 0 ~ 1 (0 = open, 1 = closed)")
+        mode = args.get("mode") or "parallel"
         if mode not in GRIPPER_MODES:
             raise ValueError("mode must be one of " + ", ".join(GRIPPER_MODES))
         self._gate()
-        self._require_active(GRIPPER_CONTROLLER.format(side=side))
-        self._io.publish_gripper(side, mode, position)
+        sides = ["left", "right"] if side == "both" else [side]
+        for each in sides:                                   # both checked before either is sent
+            self._require_active(GRIPPER_CONTROLLER.format(side=each))
+        for each in sides:
+            self._io.publish_gripper(each, mode, position)
         return {"state": "commanded", "side": side, "mode": mode, "position": position}
 
     def lifting(self, args: dict) -> dict:
@@ -557,19 +674,22 @@ class Motion:
             return self.info("lifting")
         if action != "set_position":
             raise ValueError(f"unsupported lifting action: {action}")
-        require_confirmation(args)
         cap = self._plugins["lifting"]
-        position = finite_number(args.get("position"), "position")
+        position = optional_number(args.get("position"), "position")
+        if position is None:
+            raise ValueError("position is required")
         if not 0.0 <= position <= float(cap["max_position"]):
-            raise ValueError(f"position must be in [0, {cap['max_position']}]")
+            raise ValueError(f"position must be within 0 ~ {float(cap['max_position']):g}")
         self._gate()
         current = self._state.lift_position()
         if current is None:
             raise RuntimeError("a fresh lift reading is required before commanding it")
-        if abs(position - current) > float(cap["max_target_delta"]):
+        step = float(cap["max_target_delta"])
+        if abs(position - current) > step:
             raise ValueError(f"position is {abs(position - current):.3f} from the current reading "
-                             f"{current:.3f}, over the commissioning step limit of "
-                             f"{cap['max_target_delta']}")
+                             f"{current:.3f}; one command may move it at most {step} "
+                             f"(allowed now: {max(0.0, current - step):.3f} ~ "
+                             f"{min(float(cap['max_position']), current + step):.3f})")
         self._require_active(LIFT_CONTROLLER)
         self._io.publish_lift(position)
         return {"state": "commanded", "position": position, "previous_reading": current}
@@ -582,17 +702,60 @@ class Motion:
             return self.start("head")
         if action == "info":
             return self.info("head")
-        if action != "look":
+        if action not in ("look", "home"):
             raise ValueError(f"unsupported head action: {action}")
-        require_confirmation(args)
-        target = finite_vector([args.get("head0_rad"), args.get("head1_rad")], "head targets", 2)
+        cap = self._plugins.get("head") or {}
         self._gate()
         limits, _ = self._state.joint_limits()
         current = self._state.joint_positions()
         if current is None:
             raise RuntimeError("fresh /joint_states is required")
-        step = float((self._plugins.get("head") or {}).get("max_target_delta_rad", 0.35))
-        validated = validate_joint_target(HEAD_JOINTS, target, limits, current, step)
+        unseen = [name for name in HEAD_JOINTS if name not in current]
+        if unseen:
+            raise RuntimeError("fresh joint state is missing: " + ", ".join(unseen))
+        if action == "look":
+            given = {joint: optional_number(args.get(field), field) for field, joint in HEAD_FIELDS.items()}
+            if all(value is None for value in given.values()):
+                raise ValueError("fill in head0_rad, head1_rad or both")
+            target = [float(current[joint]) if given[joint] is None else given[joint] for joint in HEAD_JOINTS]
+            step = float(cap.get("max_target_delta_rad", 0.35))
+            validated = validate_joint_target(HEAD_JOINTS, target, limits, current, step)
+            self._require_active(HEAD_CONTROLLER)
+            with self._head_lock:
+                self._head_generation += 1                   # a look supersedes a home in progress
+            self._io.publish_head(validated)
+            return {"state": "commanded", "head0_rad": validated[0], "head1_rad": validated[1]}
+        pose = cap.get("home_pose") or {}
+        target = [finite_number(pose.get(joint, 0.0), f"home_pose.{joint}") for joint in HEAD_JOINTS]
+        validated = validate_joint_target(HEAD_JOINTS, target, limits, current, None)
         self._require_active(HEAD_CONTROLLER)
-        self._io.publish_head(validated)
-        return {"state": "commanded", "head0_rad": validated[0], "head1_rad": validated[1]}
+        start = [float(current[joint]) for joint in HEAD_JOINTS]
+        with self._head_lock:
+            self._head_generation += 1
+            generation = self._head_generation
+        action_id = f"panther_head_{uuid4().hex[:8]}"
+        speed = float(cap.get("home_speed_rad_s", 0.35))
+        period = 1.0 / float(cap.get("home_publish_rate_hz", 20.0))
+        furthest = max(abs(t - s) for t, s in zip(validated, start))
+        steps = max(1, math.ceil(furthest / (speed * period)))
+        self._spawn(lambda: self._head_home_worker(generation, start, validated, steps, period, action_id),
+                    "panther-head")
+        return {"state": "moving", "action_id": action_id, "head0_rad": validated[0],
+                "head1_rad": validated[1], "duration_s": round(steps * period, 3)}
+
+    def _head_home_worker(self, generation, start, target, steps, period, action_id) -> None:
+        """Step the forward-position controller from `start` to `target`: it moves at its own top
+        speed to whatever it is sent, so the speed limit is applied by sending small steps."""
+        status, result = "completed", {}
+        try:
+            for index in range(1, steps + 1):
+                with self._head_lock:
+                    if generation != self._head_generation:
+                        status = "cancelled"
+                        break
+                fraction = index / steps
+                self._io.publish_head([s + (t - s) * fraction for s, t in zip(start, target)])
+                self._sleep(period)
+        except Exception as exc:  # noqa: BLE001
+            status, result = "error", {"message": f"{type(exc).__name__}: {safe_text(exc, 160)}"}
+        self._notify(action_id, status, result, "head")

@@ -30,9 +30,21 @@ def finite_vector(value, field: str, length: int) -> list:
     return [finite_number(item, f"{field}[{index}]") for index, item in enumerate(value)]
 
 
-def require_confirmation(args: dict) -> None:
-    if args.get("confirm_motion") is not True:
-        raise ValueError("confirm_motion=true is required before sending a motion command")
+def optional_number(value, field: str):
+    """A number from a form field, or None when the field was left empty.
+
+    The canvas sends an empty number box as missing, `None` or `""`; a typed number may arrive as
+    a number or as its text. Anything else (a boolean, words, NaN, infinity) is an error, never
+    silently "empty": a value the operator typed must not be dropped.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, str):
+        try:
+            value = float(value.strip())
+        except ValueError:
+            raise ValueError(f"{field} must be a number") from None
+    return finite_number(value, field)
 
 
 def parse_joint_limits(urdf: str) -> dict:
@@ -58,8 +70,11 @@ def parse_joint_limits(urdf: str) -> dict:
 
 
 def validate_joint_target(joint_names, positions, limits: dict, current: dict,
-                          max_delta_rad: float) -> list:
-    """A target for `joint_names`: finite, inside the URDF limits, and a bounded step from now."""
+                          max_delta_rad: float | None) -> list:
+    """A target for `joint_names`: finite, inside the URDF limits, and a bounded step from now.
+
+    `max_delta_rad=None` checks the limits only (a preset such as `home`, which is slowed down by
+    its duration instead)."""
     target = finite_vector(positions, "positions", len(joint_names))
     missing = [name for name in joint_names if name not in limits]
     if missing:
@@ -67,36 +82,39 @@ def validate_joint_target(joint_names, positions, limits: dict, current: dict,
     unseen = [name for name in joint_names if name not in current]
     if unseen:
         raise ValueError("fresh joint state is missing: " + ", ".join(unseen))
-    step = finite_number(max_delta_rad, "max_delta_rad")
-    if step <= 0:
+    step = None if max_delta_rad is None else finite_number(max_delta_rad, "max_delta_rad")
+    if step is not None and step <= 0:
         raise ValueError("max_delta_rad must be positive")
     for name, value in zip(joint_names, target):
         lower, upper = limits[name]
         if not lower <= value <= upper:
-            raise ValueError(f"{name} target {value} is outside the URDF limit [{lower}, {upper}]")
+            raise ValueError(f"{name} target {value} is outside its range {lower} ~ {upper} rad (URDF limit)")
         delta = abs(value - float(current[name]))
-        if delta > step:
-            raise ValueError(f"{name} target is {delta:.4f} rad from its current position, "
-                             f"over the commissioning step limit of {step:.4f} rad")
+        if step is not None and delta > step:
+            raise ValueError(f"{name} target is {delta:.4f} rad from its current position "
+                             f"{float(current[name]):.4f}; one command may move it at most {step:.4f} rad "
+                             f"(allowed now: {max(lower, float(current[name]) - step):.4f} ~ "
+                             f"{min(upper, float(current[name]) + step):.4f})")
     return target
 
 
 def validate_drive(args: dict, config: dict) -> tuple:
-    """`(vx, vy, wz, duration_s)`, or ValueError. Caps come from config, never from the caller."""
-    require_confirmation(args)
-    vx = finite_number(args.get("linear_x", 0.0), "linear_x")
-    vy = finite_number(args.get("linear_y", 0.0), "linear_y")
-    wz = finite_number(args.get("angular_z", 0.0), "angular_z")
-    duration = finite_number(args.get("duration_s", 1.0), "duration_s")
+    """`(vx, vy, wz, duration_s)`, or ValueError. Caps come from config, never from the caller.
+    An empty speed box is 0; an empty duration is 1 s."""
+    vx = optional_number(args.get("linear_x"), "linear_x") or 0.0
+    vy = optional_number(args.get("linear_y"), "linear_y") or 0.0
+    wz = optional_number(args.get("angular_z"), "angular_z") or 0.0
+    duration = optional_number(args.get("duration_s"), "duration_s")
+    duration = 1.0 if duration is None else duration
     max_linear = finite_number(config["max_linear_mps"], "max_linear_mps")
     max_angular = finite_number(config["max_angular_radps"], "max_angular_radps")
     max_duration = finite_number(config["max_duration_s"], "max_duration_s")
     if abs(vx) > max_linear or abs(vy) > max_linear:
-        raise ValueError(f"linear speed is over the commissioning cap of {max_linear} m/s")
+        raise ValueError(f"linear speed must be within -{max_linear:g} ~ {max_linear:g} m/s")
     if abs(wz) > max_angular:
-        raise ValueError(f"angular speed is over the commissioning cap of {max_angular} rad/s")
+        raise ValueError(f"angular speed must be within -{max_angular:g} ~ {max_angular:g} rad/s")
     if not 0.1 <= duration <= max_duration:
-        raise ValueError(f"duration_s must be in [0.1, {max_duration}]")
+        raise ValueError(f"duration_s must be within 0.1 ~ {max_duration:g} s")
     return vx, vy, wz, duration
 
 

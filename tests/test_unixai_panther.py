@@ -190,9 +190,8 @@ def completions():
 
 @pytest.fixture
 def motion(device, config, hub, io, completions, clock):
-    """Motion with the gate open (as an operator would have it) and threads run inline."""
+    """Motion with threads run inline. There is no switch to open: readiness comes from the robot."""
     motion_module = importlib.import_module("panther_motion")
-    config["safety"]["commissioning_motion_enabled"] = True
 
     def sleep(seconds):
         clock.advance(seconds)
@@ -283,10 +282,6 @@ def test_driver_config_and_cards_agree(device, config):
     assert driver["mcp_url"] == "http://localhost:15747/mcp"
     assert (driver["hardware_provider"], driver["hardware_model"]) == ("unixai", "panther")
     assert driver["build_context_extras"] == ["../../common"]
-
-
-def test_motion_is_off_unless_the_operator_turns_it_on(config):
-    assert config["safety"]["commissioning_motion_enabled"] is False
 
 
 def test_port_is_not_used_by_another_driver():
@@ -1636,29 +1631,14 @@ def test_a_joint_target_must_be_finite_inside_the_limits_and_a_bounded_step(cont
         contracts.validate_joint_target(names, [NAN] + [0.0] * 7, ARM_LIMITS, current, 0.35)
     with pytest.raises(ValueError, match="must be a number"):
         contracts.validate_joint_target(names, [True] + [0.0] * 7, ARM_LIMITS, current, 0.35)
-    with pytest.raises(ValueError, match="outside the URDF limit"):
+    with pytest.raises(ValueError, match=r"outside its range -1.0 ~ 1.0 rad \(URDF limit\)"):
         contracts.validate_joint_target(names, [1.5] + [0.0] * 7, ARM_LIMITS, current, 5.0)
-    with pytest.raises(ValueError, match="over the commissioning step limit"):
+    with pytest.raises(ValueError, match=r"at most 0.3500 rad \(allowed now: -0.3500 ~ 0.3500\)"):
         contracts.validate_joint_target(names, [0.5] + [0.0] * 7, ARM_LIMITS, current, 0.35)
     with pytest.raises(ValueError, match="no joint limits known for: joint_la7"):
         contracts.validate_joint_target(names, [0.0] * 8, {k: v for k, v in ARM_LIMITS.items() if k != "joint_la7"}, current, 0.35)
     with pytest.raises(ValueError, match="fresh joint state is missing"):
         contracts.validate_joint_target(names, [0.0] * 8, ARM_LIMITS, {}, 0.35)
-
-
-def test_a_drive_command_needs_confirmation_and_respects_the_configured_caps(contracts, config):
-    cap = config["plugins"]["base_drive"]
-    ok = {"linear_x": 0.1, "angular_z": -0.2, "duration_s": 1.0, "confirm_motion": True}
-    assert contracts.validate_drive(ok, cap) == (0.1, 0.0, -0.2, 1.0)
-    with pytest.raises(ValueError, match="confirm_motion"):
-        contracts.validate_drive({**ok, "confirm_motion": "yes"}, cap)
-    with pytest.raises(ValueError, match="confirm_motion"):
-        contracts.validate_drive({k: v for k, v in ok.items() if k != "confirm_motion"}, cap)
-    for bad, text in (({"linear_x": 0.21}, "linear speed"), ({"linear_y": -0.5}, "linear speed"),
-                      ({"angular_z": 0.31}, "angular speed"), ({"duration_s": 3.1}, "duration_s"),
-                      ({"duration_s": 0.0}, "duration_s"), ({"linear_x": NAN}, "finite")):
-        with pytest.raises(ValueError, match=text):
-            contracts.validate_drive({**ok, **bad}, cap)
 
 
 def test_switch_requests_are_filled_for_both_generations_of_the_interface(contracts):
@@ -1688,40 +1668,15 @@ def open_gate(hub, positions=None, lift=True):
         hub.on_lift(joint_state(["body_joint"], [0.61]))
 
 
-DRIVE = {"linear_x": 0.1, "duration_s": 0.5, "confirm_motion": True}
+DRIVE = {"linear_x": 0.1, "duration_s": 0.5}
 # 0.1 rad from the all-zero pose, and inside every bundled-URDF limit (la4 and ra4 top out at 0).
 LEFT_TARGET = [0.1, -0.1, 0.1, 0.1, -0.1, 0.1, 0.1, 0.1]
 RIGHT_TARGET = [-0.1, -0.1, -0.1, 0.1, -0.1, 0.1, 0.1, 0.1]
-ARM = {"side": "left", "positions": LEFT_TARGET, "duration_s": 3.0, "confirm_motion": True}
-
-
-def test_every_motion_command_is_refused_while_the_commissioning_switch_is_off(device, config, hub, io, motion_module):
-    open_gate(hub)
-    closed = motion_module.Motion(config, io, hub, spawn=lambda t, n: t(), notify=lambda *a: None)
-    for card, action, args in (("base_drive", "move", DRIVE), ("arm_control", "move", ARM),
-                               ("gripper", "set", {"side": "left", "position": 0.5, "confirm_motion": True}),
-                               ("lifting", "set_position", {"position": 0.62, "confirm_motion": True}),
-                               ("head", "look", {"head0_rad": 0.1, "head1_rad": 0.1, "confirm_motion": True})):
-        result = closed.dispatch(card, action, args)
-        assert result["state"] == "error" and "commissioning_motion_enabled" in result["message"], card
-    assert io.calls == [], "nothing reached the robot"
-    info = closed.dispatch("head", "info", {})
-    assert info["state"] == "ready" and info["commissioning_motion_enabled"] is False
-    assert info["accepts_motion"] is False and "禁止" in info["note"]
-
-
-def test_start_is_ready_even_while_the_commissioning_switch_is_off(device, config, hub, io, motion_module):
-    """The cards are gated by default on purpose; a lifecycle `start` must still say `ready`
-    (README_dev: an actuator's start returns ready), or all five fail their lifecycle."""
-    assert config["safety"]["commissioning_motion_enabled"] is False
-    open_gate(hub)                                           # robot ready, only the switch is off
-    closed = motion_module.Motion(config, io, hub, spawn=lambda t, n: t(), notify=lambda *a: None)
-    for card in ("base_drive", "arm_control", "gripper", "lifting", "head"):
-        started = closed.dispatch(card, "start", {})
-        assert started["state"] == "ready", card
-        assert started["commissioning_motion_enabled"] is False and started["accepts_motion"] is False
-        assert started["ready_for_motion"] is True
-    assert io.calls == []
+LEFT_BOXES = {f"la{i}": value for i, value in enumerate(LEFT_TARGET)}
+RIGHT_BOXES = {f"ra{i}": value for i, value in enumerate(RIGHT_TARGET)}
+ARM = {**LEFT_BOXES, "duration_s": 3.0}
+RIGHT_ARM = {**RIGHT_BOXES, "duration_s": 3.0}
+BOTH_ARMS = {**LEFT_BOXES, **RIGHT_BOXES, "duration_s": 3.0}
 
 
 def test_start_is_ready_while_the_robot_is_not_ready_and_says_why(motion, hub, io):
@@ -1746,20 +1701,8 @@ def test_stop_makes_the_card_idle_and_start_or_a_command_makes_it_ready_again(mo
         assert motion.dispatch(card, "info", {})["state"] == "idle", card
         assert motion.dispatch(card, "start", {})["state"] == "ready", card
     motion.dispatch("head", "stop", {})
-    motion.dispatch("head", "look", {"head0_rad": 0.1, "head1_rad": 0.1, "confirm_motion": True})
+    motion.dispatch("head", "look", {"head0_rad": 0.1, "head1_rad": 0.1})
     assert motion.dispatch("head", "info", {})["state"] == "ready", "using a card brings it back"
-
-
-def test_nothing_moves_without_confirm_motion_even_with_the_gate_open(motion, hub, io):
-    open_gate(hub)
-    for card, action, args in (("base_drive", "move", DRIVE), ("arm_control", "move", ARM),
-                               ("gripper", "set", {"side": "left", "position": 0.5}),
-                               ("lifting", "set_position", {"position": 0.62}),
-                               ("head", "look", {"head0_rad": 0.1, "head1_rad": 0.1})):
-        args = {k: v for k, v in args.items() if k != "confirm_motion"}
-        result = motion.dispatch(card, action, args)
-        assert result["state"] == "error" and "confirm_motion" in result["message"], card
-    assert io.calls == []
 
 
 def test_motion_is_refused_without_fresh_joints_or_with_the_estop_not_normal(motion, hub, io):
@@ -1869,8 +1812,7 @@ def test_a_one_arm_move_never_touches_the_other_arms_trajectory_controller(motio
     motion.dispatch("arm_control", "move", ARM)
     assert RIGHT_P2P not in _touched(io)
     io.calls.clear()
-    motion.dispatch("arm_control", "move", {"side": "right", "positions": RIGHT_TARGET, "duration_s": 3.0,
-                                            "confirm_motion": True})
+    motion.dispatch("arm_control", "move", RIGHT_ARM)
     assert LEFT_P2P not in _touched(io) and RIGHT_P2P in _touched(io)
 
 
@@ -1902,9 +1844,7 @@ def test_a_requested_controller_that_was_already_active_is_not_switched_off_afte
 def test_both_arms_activate_both_trajectory_controllers_and_restore_the_forward_one(motion, hub, io, completions):
     open_gate(hub)
     before = dict(io.controllers)
-    motion.dispatch("arm_control", "move", {"side": "both", "left_positions": LEFT_TARGET,
-                                            "right_positions": RIGHT_TARGET, "duration_s": 3.0,
-                                            "confirm_motion": True})
+    motion.dispatch("arm_control", "move", BOTH_ARMS)
     assert _switches(io) == [("switch", (LEFT_P2P, RIGHT_P2P), (FORWARD,)),
                              ("switch", (FORWARD,), (LEFT_P2P, RIGHT_P2P))]
     assert io.controllers == before
@@ -1929,22 +1869,9 @@ def test_an_arm_move_leaves_the_forward_controller_off_if_it_was_off(motion, hub
     assert io.controllers[FORWARD] == "inactive"
 
 
-def test_an_arm_goal_that_is_refused_never_switches_controllers(motion, hub, io):
-    open_gate(hub)
-    for bad, text in (({"positions": [0.1] * 7}, "exactly 8"), ({"positions": [0.5] + [0.0] * 7}, "step limit"),
-                      ({"positions": [9.0] + [0.0] * 7}, "outside the URDF limit"),
-                      ({"side": "both"}, "exactly 8"), ({"side": "middle"}, "side must be"),
-                      ({"duration_s": 99.0}, "duration_s must be")):
-        result = motion.dispatch("arm_control", "move", {**ARM, **bad})
-        assert result["state"] == "error" and text in result["message"], (bad, result)
-    assert io.calls == []
-
-
 def test_both_arms_take_their_own_targets(motion, hub, io, completions):
     open_gate(hub)
-    motion.dispatch("arm_control", "move", {"side": "both", "left_positions": LEFT_TARGET,
-                                            "right_positions": RIGHT_TARGET, "duration_s": 3.0,
-                                            "confirm_motion": True})
+    motion.dispatch("arm_control", "move", BOTH_ARMS)
     assert [c[1:3] for c in io.calls if c[0] == "goal"] == [("left", tuple(LEFT_TARGET)),
                                                             ("right", tuple(RIGHT_TARGET))]
 
@@ -1986,7 +1913,6 @@ def _running_motion(device, config, hub, completions, clock, motion_module, io):
             return None
 
     io.__class__ = Hanging
-    config["safety"]["commissioning_motion_enabled"] = True
     return motion_module.Motion(config, io, hub, notify=lambda *a: completions.append(a),
                                 monotonic=lambda: clock.mono)
 
@@ -2021,65 +1947,11 @@ def test_stopping_the_arm_cancels_the_goal_restores_the_controllers_and_reports_
     assert motion.stop("arm_control") == {"state": "idle"}, "stop with nothing running is a no-op"
 
 
-def test_stop_all_stops_the_drive_and_the_arm_and_survives_a_failure(motion, hub, io, capsys):
-    motion.stop_all()
-    assert io.named("twist") == [(0.0, 0.0, 0.0)] * 5
-    io.fail_on = {"twist"}
-    motion.stop_all()
-    assert "stopping base_drive failed" in capsys.readouterr().out
-
-
-def test_gripper_lifting_and_head_stop_only_promise_that_nothing_more_is_sent(motion, io):
-    for card in ("gripper", "lifting", "head"):
-        result = motion.dispatch(card, "stop", {})
-        assert result["state"] == "idle" and "no further command" in result["note"], card
-    assert io.calls == []
-
-
-def test_a_gripper_command_is_checked_and_goes_to_the_right_side(motion, hub, io):
-    open_gate(hub)
-    result = motion.dispatch("gripper", "set", {"side": "right", "position": 0.4, "confirm_motion": True})
-    assert result == {"state": "commanded", "side": "right", "mode": "parallel", "position": 0.4}
-    assert io.named("gripper") == [("right", "parallel", 0.4)]
-    for bad, text in (({"position": 1.5}, r"\[0, 1\]"), ({"position": NAN}, "finite"), ({"side": "both"}, "left or right"),
-                      ({"mode": "claw"}, "mode must be")):
-        result = motion.dispatch("gripper", "set", {"side": "left", "position": 0.5, "confirm_motion": True, **bad})
-        assert result["state"] == "error" and re.search(text, result["message"]), bad
-    io.controllers["left_unix_gripper3_controller"] = "inactive"
-    assert "left_unix_gripper3_controller" in motion.dispatch(
-        "gripper", "set", {"side": "left", "position": 0.5, "confirm_motion": True})["message"]
-    assert len(io.named("gripper")) == 1
-
-
-def test_a_lift_command_is_capped_and_a_bounded_step_from_the_reading(motion, hub, io):
-    open_gate(hub)
-    ok = motion.dispatch("lifting", "set_position", {"position": 0.65, "confirm_motion": True})
-    assert ok["state"] == "commanded" and ok["previous_reading"] == 0.61
-    assert io.named("lift") == [(0.65,)]
-    for position, text in ((0.3, "step limit"), (0.9, "must be in"), (-0.1, "must be in")):
-        result = motion.dispatch("lifting", "set_position", {"position": position, "confirm_motion": True})
-        assert result["state"] == "error" and text in result["message"], position
-    assert len(io.named("lift")) == 1
-
-
 def test_a_lift_command_needs_a_fresh_reading(motion, hub, io):
     open_gate(hub, lift=False)
-    result = motion.dispatch("lifting", "set_position", {"position": 0.6, "confirm_motion": True})
+    result = motion.dispatch("lifting", "set_position", {"position": 0.6})
     assert result["state"] == "error" and "fresh lift reading" in result["message"]
     assert io.calls == []
-
-
-def test_a_head_command_is_checked_against_urdf_limits_and_a_bounded_step(motion, hub, io):
-    open_gate(hub)
-    ok = motion.dispatch("head", "look", {"head0_rad": 0.2, "head1_rad": -0.3, "confirm_motion": True})
-    assert ok == {"state": "commanded", "head0_rad": 0.2, "head1_rad": -0.3}
-    assert io.named("head") == [((0.2, -0.3),)]
-    for args, text in (({"head0_rad": -0.5, "head1_rad": 0.0}, "outside the URDF limit"),   # head0 floor is -0.348
-                       ({"head0_rad": 0.0, "head1_rad": 1.0}, "step limit"),
-                       ({"head0_rad": 0.2}, "must be a number")):
-        result = motion.dispatch("head", "look", {**args, "confirm_motion": True})
-        assert result["state"] == "error" and text in result["message"], args
-    assert len(io.named("head")) == 1
 
 
 def test_info_never_raises_even_when_the_controller_manager_is_unreachable(motion, hub, io):
@@ -2104,40 +1976,6 @@ def test_unsupported_actions_are_errors(motion):
 
 # ── motion cards as tools ────────────────────────────────────────────────────
 
-def test_every_actuator_declares_a_stop_a_resource_and_confirmation(motion_module, config):
-    tools = {t["name"]: t for t in motion_module.motion_tools(config)}
-    assert list(tools) == ["base_drive", "arm_control", "gripper", "lifting", "head"]
-    for name, definition in tools.items():
-        schema = definition["inputSchema"]
-        assert definition["type"] == "actuator" and schema["additionalProperties"] is False
-        assert {"start", "stop", "info"} <= set(schema["properties"]["action"]["enum"]), name
-        assert schema["properties"]["confirm_motion"] == {
-            "type": "boolean", "const": True, "description": schema["properties"]["confirm_motion"]["description"]}
-        assert schema["x-resource"], name
-        assert set(schema["x-action-params"]) == set(schema["properties"]["action"]["enum"])
-        assert "confirm_motion" in max(schema["x-action-params"].values(), key=lambda v: len(v["params"]))["params"]
-        json.dumps(definition, allow_nan=False)
-    assert "cancel" not in json.dumps(tools), "base_drive's cancel became the required stop"
-
-
-def test_long_running_actions_declare_x_completion_and_the_rest_do_not(motion_module, config):
-    tools = {t["name"]: t["inputSchema"] for t in motion_module.motion_tools(config)}
-    assert tools["arm_control"]["x-completion"] == {"actions": ["move"], "timeout": 35}
-    assert tools["base_drive"]["x-completion"] == {"actions": ["move"], "timeout": 13}
-    assert tools["arm_control"]["x-completion"]["timeout"] > config["plugins"]["arm_control"]["max_duration_s"]
-    for name in ("gripper", "lifting", "head"):
-        assert "x-completion" not in tools[name], "no feedback exists to define their completion"
-    assert tools["base_drive"]["x-resource"] == "base"
-    assert set(tools["arm_control"]["x-resource"]) == {"arm_l", "arm_r"}
-
-
-def test_tool_limits_come_from_the_configured_caps(motion_module, config):
-    config["plugins"]["base_drive"]["max_linear_mps"] = 0.05
-    props = {t["name"]: t["inputSchema"]["properties"] for t in motion_module.motion_tools(config)}
-    assert props["base_drive"]["linear_x"] == {"type": "number", "minimum": -0.05, "maximum": 0.05}
-    assert props["lifting"]["position"]["maximum"] == config["plugins"]["lifting"]["max_position"]
-
-
 def test_a_disabled_motion_card_is_not_listed(device, hub, motion, config):
     config["plugins"]["head"]["enabled"] = False
     plugin = device.PantherPlugin(hub, motion=motion, config=config,
@@ -2148,10 +1986,10 @@ def test_a_disabled_motion_card_is_not_listed(device, hub, motion, config):
 def test_the_plugin_routes_motion_calls_and_turns_failures_into_error_results(device, hub, motion, config, io):
     open_gate(hub)
     plugin = device.PantherPlugin(hub, motion=motion, config=config)
-    ok = plugin.dispatch("look", {"_tool_name": "head", "head0_rad": 0.1, "head1_rad": 0.1, "confirm_motion": True})
+    ok = plugin.dispatch("look", {"_tool_name": "head", "head0_rad": 0.1, "head1_rad": 0.1})
     assert ok["state"] == "commanded"
-    refused = plugin.dispatch("look", {"_tool_name": "head", "head0_rad": 0.1, "head1_rad": 0.1})
-    assert refused["state"] == "error"
+    refused = plugin.dispatch("look", {"_tool_name": "head", "head0_rad": 9.0})
+    assert refused["state"] == "error" and "outside its range" in refused["message"]
     assert plugin.dispatch("stop", {"_tool_name": "gripper"})["state"] == "idle"
     motion.stop = lambda card: (_ for _ in ()).throw(RuntimeError("bus down"))
     failed = plugin.dispatch("stop", {"_tool_name": "base_drive"})
@@ -2603,217 +2441,6 @@ def test_the_restart_and_the_final_stop_never_run_at_the_same_time(host_camera, 
     watchdog.join(5)
     assert overlap == [], "two systemctl calls on the unit overlapped"
 
-# ── the operator's motion switch: a supported, persistent way to turn motion on ─────────────
-
-@pytest.fixture(scope="module")
-def motion_switch(device):
-    return importlib.import_module("motion_switch")
-
-
-def _file(text=None, error=None):
-    """An `open` that serves `text`, or raises `error`; records the path it was asked for."""
-    asked = []
-
-    def opener(path, encoding=None):
-        import io
-
-        asked.append(path)
-        if error is not None:
-            raise error
-        return io.StringIO(text)
-
-    opener.asked = asked
-    return opener
-
-
-def test_a_robot_with_no_operator_file_keeps_motion_off(motion_switch, config):
-    enabled, source = motion_switch.resolve_motion_switch(
-        config, environ={}, open_file=_file(error=FileNotFoundError()))
-    assert enabled is False and "no operator file" in source and "off" in source
-
-
-def test_only_the_boolean_true_turns_motion_on(motion_switch, config):
-    def decide(text):
-        return motion_switch.resolve_motion_switch(config, environ={}, open_file=_file(text))[0]
-
-    assert decide("commissioning_motion_enabled: true\n") is True
-    for not_true in ("commissioning_motion_enabled: false", 'commissioning_motion_enabled: "true"',
-                     "commissioning_motion_enabled: 1", "commissioning_motion_enabled: yes_please",
-                     "commissioning_motion_enabled: [true]", "commissioning_motion_enabled:",
-                     "commissioning_motion_enabled: 'True'", "commissioning_motion_enabled: on1"):
-        assert decide(not_true) is False, not_true
-
-
-def test_anything_unreadable_or_malformed_leaves_motion_off_and_says_why(motion_switch, config):
-    for text, error, fragment in (
-            ("", None, "no `commissioning_motion_enabled` key"),                 # empty file
-            ("just a sentence", None, "no `commissioning_motion_enabled` key"),   # a scalar, not a mapping
-            ("- true\n- true", None, "no `commissioning_motion_enabled` key"),   # a list
-            ("a: [unclosed", None, "not valid YAML"),
-            (None, PermissionError(), "cannot read"),
-            (None, IsADirectoryError(), "cannot read"),                          # Docker's empty directory
-            ("enabled: true", None, "no `commissioning_motion_enabled` key")):   # the wrong key
-        enabled, source = motion_switch.resolve_motion_switch(
-            config, environ={}, open_file=_file(text, error))
-        assert enabled is False and fragment in source, (text, error, source)
-
-
-def test_an_unreadable_file_is_never_read_as_on_even_if_the_images_own_value_is_on(motion_switch, config):
-    """Only a *missing* file falls back to the image's value. A file that is there but cannot be
-    read (permissions, Docker's empty directory) is a mistake, and a mistake must mean off.
-
-    This needs the image's value to be on to mean anything: with it off, 'fall back' and 'off'
-    give the same answer and the difference cannot be seen.
-    """
-    config["safety"]["commissioning_motion_enabled"] = True
-    missing = motion_switch.resolve_motion_switch(config, environ={}, open_file=_file(error=FileNotFoundError()))
-    assert missing[0] is True, "no operator file at all: the image's own setting applies, as documented"
-    for error in (PermissionError(), IsADirectoryError(), OSError("I/O error")):
-        enabled, source = motion_switch.resolve_motion_switch(config, environ={}, open_file=_file(error=error))
-        assert enabled is False and "motion stays off" in source, error
-
-def test_the_file_can_switch_on_and_off_and_explains_itself(motion_switch, config):
-    on = motion_switch.resolve_motion_switch(
-        config, environ={}, open_file=_file("commissioning_motion_enabled: true"))
-    off = motion_switch.resolve_motion_switch(
-        config, environ={}, open_file=_file("commissioning_motion_enabled: false"))
-    assert on[0] is True and "sets commissioning_motion_enabled: true" in on[1]
-    assert off[0] is False and "sets commissioning_motion_enabled: false" in off[1]
-
-
-def test_the_file_decides_even_against_the_images_own_setting(motion_switch, config):
-    """An operator who writes `false` must not be overridden by something else turning it on."""
-    config["safety"]["commissioning_motion_enabled"] = True
-    enabled, _ = motion_switch.resolve_motion_switch(
-        config, environ={}, open_file=_file("commissioning_motion_enabled: false"))
-    assert enabled is False
-    # ...but a corrupt file is never read as "on", even if the image's own value is on.
-    enabled, _ = motion_switch.resolve_motion_switch(
-        config, environ={}, open_file=_file("a: [unclosed"))
-    assert enabled is False
-
-
-def test_only_the_one_switch_can_come_from_the_file_never_the_caps(motion_switch, config):
-    """The reason it is a separate file: one edit must not be able to raise every limit at once."""
-    before = {k: dict(v) if isinstance(v, dict) else v for k, v in config["plugins"].items()}
-    hostile = ("commissioning_motion_enabled: true\n"
-               "plugins:\n  base_drive: {max_linear_mps: 99}\n  lifting: {max_position: 99}\n"
-               "safety: {max_target_delta_rad: 99}\n")
-    motion_switch.apply_motion_switch(config, environ={}, open_file=_file(hostile))
-    assert config["safety"]["commissioning_motion_enabled"] is True
-    assert config["plugins"] == before, "no cap was touched"
-    assert set(config["safety"]) == {"commissioning_motion_enabled", "motion_switch_source"}
-
-
-def test_the_path_can_be_overridden_for_a_robot_that_keeps_it_elsewhere(motion_switch, config):
-    opener = _file("commissioning_motion_enabled: true")
-    motion_switch.resolve_motion_switch(config, environ={"PANTHER_COMMISSIONING_FILE": "/elsewhere/c.yaml"},
-                                        open_file=opener)
-    assert opener.asked == ["/elsewhere/c.yaml"]
-    opener = _file("commissioning_motion_enabled: true")
-    motion_switch.resolve_motion_switch(config, environ={}, open_file=opener)
-    assert opener.asked == [motion_switch.DEFAULT_PATH]
-
-
-def test_the_shipped_default_is_off_and_the_switch_is_decided_before_anything_uses_it(device, config, monkeypatch):
-    """build_plugins applies the switch first, so Motion and the log line agree on one answer."""
-    import io
-
-    assert config["safety"]["commissioning_motion_enabled"] is False
-    seen = {}
-    monkeypatch.setattr(device, "CoreBridge", lambda *a, **k: NS())
-    monkeypatch.setattr(device, "BridgeSink", lambda bridge: NS())
-    monkeypatch.setattr(device, "PantherNodes", lambda cfg, ros2, hub: seen.setdefault(
-        "config_at_nodes", dict(cfg["safety"])) and NS(motion_io=None, node=NS(count_publishers=lambda t: 0)))
-    monkeypatch.setattr(device, "HostCamera", lambda *a, **k: NS())
-    monkeypatch.setenv("PANTHER_COMMISSIONING_FILE", "/does/not/exist/commissioning.yaml")
-    device.build_plugins(config, "panther", NS())
-    assert seen["config_at_nodes"]["commissioning_motion_enabled"] is False
-    assert "no operator file" in seen["config_at_nodes"]["motion_switch_source"]
-
-
-def test_the_log_line_says_whether_motion_is_enabled_and_why(device, config, monkeypatch, capsys):
-    import tempfile
-
-    monkeypatch.setattr(device, "CoreBridge", lambda *a, **k: NS())
-    monkeypatch.setattr(device, "BridgeSink", lambda bridge: NS())
-    monkeypatch.setattr(device, "PantherNodes", lambda cfg, ros2, hub: NS(
-        motion_io=None, node=NS(count_publishers=lambda t: 0)))
-    monkeypatch.setattr(device, "HostCamera", lambda *a, **k: NS())
-    with tempfile.TemporaryDirectory() as directory:
-        target = Path(directory) / "commissioning.yaml"
-        monkeypatch.setenv("PANTHER_COMMISSIONING_FILE", str(target))
-        device.build_plugins(config, "panther", NS())
-        assert "motion disabled: no operator file" in capsys.readouterr().out
-        target.write_text("commissioning_motion_enabled: true\n", encoding="utf-8")
-        device.build_plugins(config, "panther", NS())
-        assert "motion ENABLED" in capsys.readouterr().out
-
-
-def test_the_operators_switch_reaches_the_motion_gate(device, config, hub, io, motion_module, monkeypatch):
-    """End to end through the real file: written true, a command passes the gate; absent, it is refused."""
-    import tempfile
-
-    open_gate(hub)
-    with tempfile.TemporaryDirectory() as directory:
-        target = Path(directory) / "commissioning.yaml"
-        monkeypatch.setenv("PANTHER_COMMISSIONING_FILE", str(target))
-        args = {"head0_rad": 0.1, "head1_rad": 0.1, "confirm_motion": True}
-
-        refused = importlib.import_module("motion_switch").apply_motion_switch(dict(config))
-        motion = motion_module.Motion(refused, io, hub, spawn=lambda t, n: t(), notify=lambda *a: None)
-        assert motion.dispatch("head", "look", args)["state"] == "error" and io.calls == []
-
-        target.write_text("commissioning_motion_enabled: true\n", encoding="utf-8")
-        allowed = importlib.import_module("motion_switch").apply_motion_switch(dict(config))
-        motion = motion_module.Motion(allowed, io, hub, spawn=lambda t, n: t(), notify=lambda *a: None)
-        assert motion.dispatch("head", "look", args)["state"] == "commanded"
-        assert io.named("head") == [((0.1, 0.1),)]
-
-
-# ── deploy/service.yml and the code must agree on where the switch lives ─────────────────────
-
-def _volumes():
-    service = yaml.safe_load((DRIVER / "deploy" / "service.yml").read_text(encoding="utf-8"))
-    (_, body), = service.items()
-    return body["volumes"]
-
-
-def _split_mount(mount):
-    """`${VAR:-default}:target:mode` -> (default, target, mode). The `:-` inside `${}` is not a separator."""
-    match = re.fullmatch(r"\$\{PANTHER_COMMISSIONING_DIR:-([^}]+)\}:([^:]+):([^:]+)", mount)
-    assert match, f"unexpected shape: {mount!r}"
-    return match.groups()
-
-
-def test_service_yml_mounts_the_operators_directory_read_only_where_the_code_looks(motion_switch):
-    """A path that is off by one character would leave every operator's file unread, silently."""
-    (mount,) = [v for v in _volumes() if "PANTHER_COMMISSIONING_DIR" in v]
-    host_default, target, mode = _split_mount(mount)
-    assert target == str(Path(motion_switch.DEFAULT_PATH).parent).replace("\\", "/")
-    assert mode == "ro", "the driver only reads the switch"
-    assert host_default == target, "host and container paths match, so the documented command works"
-    assert Path(motion_switch.DEFAULT_PATH).name == "commissioning.yaml"
-
-def test_service_yml_mounts_a_directory_not_a_file(motion_switch):
-    """Docker turns a missing bind-mounted *file* into an empty directory; that must not be the design."""
-    (mount,) = [v for v in _volumes() if "PANTHER_COMMISSIONING_DIR" in v]
-    assert not _split_mount(mount)[1].endswith((".yaml", ".yml"))
-
-
-def test_the_image_does_not_contain_a_commissioning_file_that_could_enable_motion():
-    """The default has to be a refusal: nothing shipped may switch motion on."""
-    shipped = [p for p in DRIVER.rglob("commissioning*")]
-    assert shipped == [], shipped
-    dockerfile = (DRIVER / "Dockerfile").read_text(encoding="utf-8")
-    assert "commissioning" not in dockerfile
-
-
-def test_the_dockerfile_copies_the_switch_module_the_device_imports():
-    dockerfile = (DRIVER / "Dockerfile").read_text(encoding="utf-8")
-    copied = re.search(r"COPY (main\.py[^\n]*) /work/unixai/panther/", dockerfile).group(1).split()
-    assert "motion_switch.py" in copied and (DRIVER / "motion_switch.py").is_file()
-
 # ── arm stop racing a worker that has not started yet ───────────────────────────────────────
 
 class DeferredSpawn:
@@ -2833,7 +2460,6 @@ class DeferredSpawn:
 
 @pytest.fixture
 def deferred_motion(device, config, hub, io, completions, clock, motion_module):
-    config["safety"]["commissioning_motion_enabled"] = True
     spawn = DeferredSpawn()
     instance = motion_module.Motion(config, io, hub, spawn=spawn, notify=lambda *a: completions.append(a),
                                     sleep=clock.advance, monotonic=lambda: clock.mono)
@@ -2869,9 +2495,7 @@ def test_a_stop_between_two_arms_goals_sends_no_further_goal_and_restores(deferr
         return handle
 
     io.send_arm_goal = stop_after_the_first_goal
-    deferred_motion.dispatch("arm_control", "move", {"side": "both", "left_positions": LEFT_TARGET,
-                                                     "right_positions": RIGHT_TARGET, "duration_s": 3.0,
-                                                     "confirm_motion": True})
+    deferred_motion.dispatch("arm_control", "move", BOTH_ARMS)
     deferred_motion.spawn.run_all()
     assert [c[1] for c in io.calls if c[0] == "goal"] == ["left"], "the right arm's goal was never sent"
     assert io.named("cancel") == [("handle-left",)], "the goal that was sent is cancelled"
@@ -3019,7 +2643,6 @@ def test_a_move_and_a_stop_racing_on_real_threads_leave_the_robot_settled(
     * a goal that was sent is cancelled or completed, never left running;
     * the controllers are back as they were, and the arm is not left busy.
     """
-    config["safety"]["commissioning_motion_enabled"] = True
     open_gate(hub)
     bad = []
     for attempt in range(80):
@@ -3032,7 +2655,6 @@ def test_a_stop_that_lands_while_the_move_is_still_being_checked_cancels_it(
         device, config, hub, io, completions, clock, motion_module):
     """The window the stress test found: stop() arrives after move() began but before it was marked
     as running. It used to answer 'idle' and then the whole move ran."""
-    config["safety"]["commissioning_motion_enabled"] = True
     open_gate(hub)
     motion = motion_module.Motion(config, io, hub, spawn=lambda t, n: t(),
                                   notify=lambda *a: completions.append(a), sleep=clock.advance,
@@ -3055,7 +2677,6 @@ def test_a_stop_that_lands_while_the_move_is_still_being_checked_cancels_it(
 
 def test_a_stop_before_a_move_began_does_not_cancel_it(device, config, hub, io, completions, clock, motion_module):
     """Only a stop that arrives *during* a move's checking cancels it; an earlier one is history."""
-    config["safety"]["commissioning_motion_enabled"] = True
     open_gate(hub)
     motion = motion_module.Motion(config, io, hub, spawn=lambda t, n: t(),
                                   notify=lambda *a: completions.append(a), sleep=clock.advance,
@@ -3255,3 +2876,511 @@ def test_the_acceptance_step_for_the_reduced_privilege_has_a_failure_branch():
     assert "could not\n      enter the host's namespaces" in step or "could not enter the host's namespaces" in step.replace("\n      ", " ")
     assert "do not return to `privileged`" in step.replace("\n      ", " ")
     assert "record what it was" in step.replace("\n      ", " ")
+
+# ── the motion cards after removing confirmation and the switch ───────────────────────────────
+
+@pytest.fixture(scope="module")
+def BUNDLED_LIMITS(device):
+    return importlib.import_module("contracts").parse_joint_limits(
+        (DRIVER / "resource" / "panther.urdf").read_text(encoding="utf-8"))
+
+
+def _tools(motion_module, config, limits):
+    return {t["name"]: t for t in motion_module.motion_tools(config, limits)}
+
+
+def test_no_confirmation_field_and_no_switch_anywhere(motion_module, config, BUNDLED_LIMITS):
+    """The operator asked for both to go: with intelligent control on, a call moves the robot."""
+    text = json.dumps(motion_module.motion_tools(config, BUNDLED_LIMITS), ensure_ascii=False)
+    assert "confirm" not in text and "commissioning" not in text
+    assert "safety" not in config
+    for name in ("panther_motion.py", "contracts.py", "device.py", "config.yaml", "Dockerfile"):
+        body = (DRIVER / name).read_text(encoding="utf-8")
+        assert "confirm_motion" not in body and "commissioning_motion_enabled" not in body, name
+    assert not (DRIVER / "motion_switch.py").exists()
+    assert "PANTHER_COMMISSIONING" not in (DRIVER / "deploy" / "service.yml").read_text(encoding="utf-8")
+
+
+def test_a_ready_robot_moves_on_a_plain_call(motion, hub, io):
+    open_gate(hub)
+    assert motion.dispatch("base_drive", "move", DRIVE)["state"] == "moving"
+    assert motion.dispatch("head", "look", {"head0_rad": 0.1})["state"] == "commanded"
+    assert motion.dispatch("lifting", "set_position", {"position": 0.62})["state"] == "commanded"
+    assert motion.dispatch("gripper", "open", {})["state"] == "commanded"
+    assert io.named("twist") and io.named("head") and io.named("lift") and io.named("gripper")
+
+
+def test_the_robots_own_state_still_refuses_motion(motion, hub, io):
+    """What replaced the switch: conditions that clear by themselves when the robot is fine."""
+    for card, action, args in (("base_drive", "move", DRIVE), ("arm_control", "move", ARM),
+                               ("gripper", "set", {"position": 0.5}), ("lifting", "set_position", {"position": 0.62}),
+                               ("head", "look", {"head0_rad": 0.1}), ("arm_control", "home", {}), ("head", "home", {})):
+        result = motion.dispatch(card, action, args)
+        assert result["state"] == "error" and "motion refused" in result["message"], card
+    assert io.calls == []
+
+
+# ── which cards keep an action, and what each one offers ───────────────────────────────────────
+
+EXPECTED_ACTIONS = {"base_drive": ["move", "stop"], "arm_control": ["move", "home", "stop"],
+                    "gripper": ["set", "open", "close"], "head": ["look", "home", "stop"]}
+
+
+def test_lifting_has_no_action_box_and_the_others_offer_only_what_they_do(motion_module, config, BUNDLED_LIMITS):
+    tools = _tools(motion_module, config, BUNDLED_LIMITS)
+    lifting = tools["lifting"]["inputSchema"]
+    assert "action" not in lifting["properties"] and "required" not in lifting and "x-action-params" not in lifting
+    assert list(lifting["properties"]) == ["position"]
+    for name, actions in EXPECTED_ACTIONS.items():
+        schema = tools[name]["inputSchema"]
+        assert schema["properties"]["action"]["enum"] == actions, name
+        assert schema["properties"]["action"]["default"] == actions[0], "the motion is preselected"
+        assert [o["const"] for o in schema["properties"]["action"]["oneOf"]] == actions
+        assert set(schema["x-action-params"]) == set(actions)
+        for action, entry in schema["x-action-params"].items():
+            assert set(entry["params"]) <= set(schema["properties"]), (name, action)
+            assert entry["description"], (name, action)
+        assert not ({"start", "info"} & set(actions)), "lifecycle actions are the framework's, not a menu item"
+
+
+def test_a_call_without_an_action_runs_the_cards_one_motion(motion, hub, io):
+    """The bundle passes the tool name when there is no action (README_dev); lifting is always called so."""
+    open_gate(hub)
+    assert motion.dispatch("lifting", "lifting", {"position": 0.62})["state"] == "commanded"
+    assert motion.dispatch("lifting", None, {"position": 0.63})["state"] == "commanded"
+    assert motion.dispatch("head", "head", {"head0_rad": 0.1})["state"] == "commanded"
+    assert motion.dispatch("gripper", "", {"position": 0.5})["state"] == "commanded"
+    assert [c[0] for c in io.calls].count("lift") == 2
+
+
+def test_the_bundle_routes_a_lifting_call_without_an_action(device, hub, motion, config, io):
+    from common.vendor_runtime import DriverBundle
+    open_gate(hub)
+    bundle = DriverBundle([device.PantherPlugin(hub, motion=motion, config=config)])
+    assert bundle.dispatch("lifting", {"position": 0.62})["state"] == "commanded"
+    assert bundle.dispatch("lifting", {"action": "start"})["state"] == "ready", "lifecycle still reaches it"
+    assert bundle.dispatch("lifting", {"action": "stop"})["state"] == "idle"
+    assert io.named("lift") == [(0.62,)]
+
+
+# ── every box shows its range, and the range shown is the one enforced ─────────────────────────
+
+def _boxes(tools):
+    for name, definition in tools.items():
+        for field, spec in definition["inputSchema"]["properties"].items():
+            if spec.get("type") == "number":
+                yield name, field, spec
+
+
+def test_every_number_box_shows_its_range_in_the_title_and_the_description(motion_module, config, BUNDLED_LIMITS):
+    boxes = list(_boxes(_tools(motion_module, config, BUNDLED_LIMITS)))
+    assert len(boxes) == 4 + 17 + 1 + 1 + 2, [f for _, f, _ in boxes]
+    for name, field, spec in boxes:
+        low, high = spec["minimum"], spec["maximum"]
+        shown = f"{low:g} ~ {high:g}"
+        assert shown in spec["title"] and shown in spec["description"], (name, field, spec)
+        assert low < high, (name, field)
+
+
+def test_the_arm_and_head_boxes_show_the_urdf_limits_of_their_own_joint(motion_module, config, BUNDLED_LIMITS):
+    props = {n: t["inputSchema"]["properties"] for n, t in _tools(motion_module, config, BUNDLED_LIMITS).items()}
+    for i in range(8):
+        for side in ("la", "ra"):
+            low, high = BUNDLED_LIMITS[f"joint_{side}{i}"]
+            assert (props["arm_control"][f"{side}{i}"]["minimum"], props["arm_control"][f"{side}{i}"]["maximum"]) == (low, high)
+    assert (props["head"]["head0_rad"]["minimum"], props["head"]["head0_rad"]["maximum"]) == BUNDLED_LIMITS["joint_head0"]
+    assert (props["head"]["head1_rad"]["minimum"], props["head"]["head1_rad"]["maximum"]) == BUNDLED_LIMITS["joint_head1"]
+    assert props["arm_control"]["la0"]["title"] == "左臂 la0（rad，-1.046 ~ 0.697）"
+    assert props["arm_control"]["ra7"]["title"] == "右臂 ra7（rad，-1.57 ~ 1.57）"
+
+
+def test_the_step_limit_is_stated_wherever_it_applies(motion_module, config, BUNDLED_LIMITS):
+    props = {n: t["inputSchema"]["properties"] for n, t in _tools(motion_module, config, BUNDLED_LIMITS).items()}
+    for field in [f"la{i}" for i in range(8)] + [f"ra{i}" for i in range(8)]:
+        assert "相差不超过 0.35 rad" in props["arm_control"][field]["description"]
+    assert "相差不超过 0.35 rad" in props["head"]["head0_rad"]["description"]
+    assert "相差不超过 0.1" in props["lifting"]["position"]["description"]
+
+
+@pytest.mark.parametrize("card, action, field, other", [
+    ("base_drive", "move", "linear_x", {"duration_s": 0.5}),
+    ("base_drive", "move", "linear_y", {"duration_s": 0.5}),
+    ("base_drive", "move", "angular_z", {"duration_s": 0.5}),
+    ("base_drive", "move", "duration_s", {}),
+    ("gripper", "set", "position", {}),
+])
+def test_a_value_on_the_shown_boundary_is_accepted_and_one_just_past_it_refused(
+        motion_module, motion, hub, io, config, BUNDLED_LIMITS, card, action, field, other):
+    spec = _tools(motion_module, config, BUNDLED_LIMITS)[card]["inputSchema"]["properties"][field]
+    open_gate(hub)
+    for value in (spec["minimum"], spec["maximum"]):
+        result = motion.dispatch(card, action, {**other, field: value})
+        assert result["state"] in ("moving", "commanded"), (field, value, result)
+        motion.stop(card)
+    for value in (spec["minimum"] - 1e-6, spec["maximum"] + 1e-6):
+        result = motion.dispatch(card, action, {**other, field: value})
+        assert result["state"] == "error", (field, value)
+        assert f"{spec['minimum']:g} ~ {spec['maximum']:g}".replace("-", "") in result["message"].replace("-", ""), \
+            "the refusal quotes the same range the box shows"
+
+
+def test_every_arm_joint_box_accepts_its_shown_limit_and_refuses_beyond_it(motion_module, device, config, hub, io,
+                                                                         BUNDLED_LIMITS, clock):
+    """The arm also has a step limit, so the robot is placed next to each limit before trying it."""
+    props = _tools(motion_module, config, BUNDLED_LIMITS)["arm_control"]["inputSchema"]["properties"]
+    motion_module_instance = motion_module.Motion(config, io, hub, spawn=lambda t, n: t(), notify=lambda *a: None,
+                                                  sleep=clock.advance, monotonic=lambda: clock.mono)
+    for field in [f"la{i}" for i in range(8)] + [f"ra{i}" for i in range(8)]:
+        joint = "joint_" + field
+        for bound in ("minimum", "maximum"):
+            limit = props[field][bound]
+            near = limit + (0.1 if bound == "minimum" else -0.1)
+            positions = [near if name == joint else 0.0 for name in URDF_JOINTS]
+            open_gate(hub, positions)
+            ok = motion_module_instance.dispatch("arm_control", "move", {field: limit})
+            assert ok["state"] == "moving", (field, bound, ok)
+            past = limit + (-1e-6 if bound == "minimum" else 1e-6)
+            refused = motion_module_instance.dispatch("arm_control", "move", {field: past})
+            assert refused["state"] == "error" and "outside its range" in refused["message"], (field, bound)
+
+
+def test_the_head_boxes_accept_their_shown_limits_and_refuse_beyond(motion_module, motion, config, hub, io, BUNDLED_LIMITS):
+    props = _tools(motion_module, config, BUNDLED_LIMITS)["head"]["inputSchema"]["properties"]
+    for field, joint in (("head0_rad", "joint_head0"), ("head1_rad", "joint_head1")):
+        for bound in ("minimum", "maximum"):
+            limit = props[field][bound]
+            positions = [limit + (0.1 if bound == "minimum" else -0.1) if n == joint else 0.0 for n in URDF_JOINTS]
+            open_gate(hub, positions)
+            assert motion.dispatch("head", "look", {field: limit})["state"] == "commanded", (field, bound)
+            past = limit + (-1e-6 if bound == "minimum" else 1e-6)
+            assert "outside its range" in motion.dispatch("head", "look", {field: past})["message"], (field, bound)
+
+
+def test_the_lift_box_accepts_its_shown_limits_and_refuses_beyond(motion_module, motion, config, hub, io, BUNDLED_LIMITS):
+    spec = _tools(motion_module, config, BUNDLED_LIMITS)["lifting"]["inputSchema"]["properties"]["position"]
+    open_gate(hub)
+    hub.on_lift(joint_state(["body_joint"], [spec["maximum"] - 0.05]))
+    assert motion.dispatch("lifting", None, {"position": spec["maximum"]})["state"] == "commanded"
+    assert "0 ~ 0.65" in motion.dispatch("lifting", None, {"position": spec["maximum"] + 1e-6})["message"]
+    hub.on_lift(joint_state(["body_joint"], [0.05]))
+    assert motion.dispatch("lifting", None, {"position": spec["minimum"]})["state"] == "commanded"
+    assert "0 ~ 0.65" in motion.dispatch("lifting", None, {"position": -1e-6})["message"]
+
+
+def test_a_step_refusal_says_what_would_be_allowed_now(motion, hub, io):
+    open_gate(hub)
+    result = motion.dispatch("arm_control", "move", {"la3": 0.5})
+    assert "allowed now: -0.3500 ~ 0.3500" in result["message"]
+    result = motion.dispatch("lifting", None, {"position": 0.3})
+    assert "allowed now: 0.510 ~ 0.650" in result["message"]
+
+
+def test_the_displayed_ranges_follow_the_config_caps(motion_module, config, BUNDLED_LIMITS):
+    config["plugins"]["base_drive"]["max_linear_mps"] = 0.05
+    config["plugins"]["lifting"]["max_position"] = 0.62
+    props = {n: t["inputSchema"]["properties"] for n, t in _tools(motion_module, config, BUNDLED_LIMITS).items()}
+    assert (props["base_drive"]["linear_x"]["minimum"], props["base_drive"]["linear_x"]["maximum"]) == (-0.05, 0.05)
+    assert "-0.05 ~ 0.05" in props["base_drive"]["linear_x"]["title"]
+    assert props["lifting"]["position"]["maximum"] == 0.62 and "0 ~ 0.62" in props["lifting"]["position"]["title"]
+
+
+def test_the_cards_show_the_bundled_limits_and_say_so_when_the_robot_differs(device, hub, capsys):
+    limits = hub.bundled_joint_limits()
+    assert hub.limit_differences(limits) == []
+    live = dict(limits)
+    live["joint_la0"] = (-1.0, 0.5)
+    del live["joint_head1"]
+    differ = hub.limit_differences(live)
+    assert differ == ["joint_la0: robot -1~0.5, shown -1.046~0.697", "joint_head1: not in the robot's URDF"]
+    urdf = (DRIVER / "resource" / "panther.urdf").read_text(encoding="utf-8").replace(
+        '<limit effort="10" lower="-0.348" upper="1.5"', '<limit effort="10" lower="-0.2" upper="1.5"')
+    hub.on_robot_description(NS(data=urdf))
+    out = capsys.readouterr().out
+    assert "WARNING: the robot's joint limits differ" in out and "joint_head0: robot -0.2~1.5" in out
+
+
+# ── arm: one box per joint ─────────────────────────────────────────────────────────────────────
+
+def test_an_empty_box_keeps_that_joint_where_it_is(motion, hub, io):
+    current = [0.0] * len(URDF_JOINTS)
+    current[URDF_JOINTS.index("joint_la4")] = -0.5
+    open_gate(hub, current)
+    motion.dispatch("arm_control", "move", {"la2": 0.3})
+    (side, positions, _), = io.named("goal")
+    assert side == "left" and positions == (0.0, 0.0, 0.3, 0.0, -0.5, 0.0, 0.0, 0.0), \
+        "la2 moves; every other joint is sent its current position, la4 included"
+
+
+def test_only_the_arms_with_a_filled_box_move(motion, hub, io):
+    open_gate(hub)
+    motion.dispatch("arm_control", "move", {"ra7": 0.2})
+    assert [c[0] for c in io.named("goal")] == ["right"]
+    io.calls.clear()
+    motion.dispatch("arm_control", "move", {"la0": 0.1, "ra0": 0.1})
+    assert [c[0] for c in io.named("goal")] == ["left", "right"]
+
+
+def test_an_arm_move_with_every_box_empty_is_refused_and_sends_nothing(motion, hub, io):
+    open_gate(hub)
+    for args in ({}, {"duration_s": 3}, {f"la{i}": None for i in range(8)}, {"la0": "", "ra3": "  "}):
+        result = motion.dispatch("arm_control", "move", args)
+        assert result["state"] == "error" and "fill in at least one joint" in result["message"], args
+    assert io.calls == []
+
+
+def test_the_canvas_may_send_a_number_as_text_but_never_words(motion, hub, io):
+    open_gate(hub)
+    assert motion.dispatch("arm_control", "move", {"la0": "0.1", "duration_s": "2"})["state"] == "moving"
+    for bad in ("abc", True, "nan", float("inf")):
+        result = motion.dispatch("arm_control", "move", {"la0": bad})
+        assert result["state"] == "error" and ("number" in result["message"] or "finite" in result["message"]), bad
+
+
+def test_the_arm_refuses_with_nothing_sent_when_a_value_is_wrong(motion, hub, io):
+    open_gate(hub)
+    for args, text in (({"la0": 0.5}, "allowed now"), ({"la0": 9.0}, "outside its range"),
+                       ({"la0": 0.1, "duration_s": 99}, "duration_s must be within 1 ~ 20"),
+                       ({"la0": 0.1, "duration_s": 0.5}, "duration_s must be within 1 ~ 20"),
+                       ({"la0": 0.1, "ra0": 9.0}, "outside its range")):
+        result = motion.dispatch("arm_control", "move", args)
+        assert result["state"] == "error" and text in result["message"], (args, result)
+    assert io.calls == [], "nothing switched and nothing sent, including the valid left arm of the last case"
+
+
+def test_the_arm_duration_defaults_to_six_seconds(motion, hub, io):
+    open_gate(hub)
+    assert motion.dispatch("arm_control", "move", {"la0": 0.1})["duration_s"] == 6.0
+
+
+# ── arm and head: home ─────────────────────────────────────────────────────────────────────────
+
+def test_arm_home_sends_every_joint_of_the_chosen_arms_to_zero(motion, hub, io, completions):
+    positions = [0.2 if name.startswith(("joint_la", "joint_ra")) and not name.endswith(("a4", "a2")) else 0.0
+                 for name in URDF_JOINTS]
+    open_gate(hub, positions)
+    result = motion.dispatch("arm_control", "home", {"side": "both"})
+    assert result["state"] == "moving" and result["action"] == "home"
+    goals = io.named("goal")
+    assert [g[0] for g in goals] == ["left", "right"]
+    assert all(g[1] == (0.0,) * 8 for g in goals)
+    assert completions[-1][1] == "completed" and completions[-1][3] == "arm_control"
+
+
+def test_arm_home_is_not_held_to_the_step_limit_but_stretches_its_duration(motion, hub, io):
+    positions = [0.0] * len(URDF_JOINTS)
+    positions[URDF_JOINTS.index("joint_la3")] = 2.1                 # far beyond one 0.35 rad step
+    open_gate(hub, positions)
+    result = motion.dispatch("arm_control", "home", {"side": "left"})
+    assert result["state"] == "moving"
+    assert result["duration_s"] == pytest.approx(2.1 / 0.35), "average speed of the furthest joint is 0.35 rad/s"
+    (side, target, duration), = io.named("goal")
+    assert side == "left" and target == (0.0,) * 8 and duration == pytest.approx(6.0)
+
+
+def test_arm_home_takes_at_least_the_minimum_duration(motion, hub, io):
+    positions = [0.0] * len(URDF_JOINTS)
+    positions[URDF_JOINTS.index("joint_ra0")] = 0.05
+    open_gate(hub, positions)
+    assert motion.dispatch("arm_control", "home", {"side": "right"})["duration_s"] == 2.0
+
+
+def test_arm_home_that_would_take_too_long_is_refused(motion, hub, io, config):
+    config["plugins"]["arm_control"]["home_speed_rad_s"] = 0.05
+    positions = [0.0] * len(URDF_JOINTS)
+    positions[URDF_JOINTS.index("joint_la1")] = -2.0
+    open_gate(hub, positions)
+    result = motion.dispatch("arm_control", "home", {"side": "left"})
+    assert result["state"] == "error" and "over the 20.0 s limit" in result["message"]
+    assert io.calls == []
+
+
+def test_arm_home_uses_home_pose_from_config_and_checks_it_against_the_limits(motion, hub, io, config):
+    open_gate(hub)
+    config["plugins"]["arm_control"]["home_pose"] = {"joint_la2": 0.5}
+    motion.dispatch("arm_control", "home", {"side": "left"})
+    assert io.named("goal")[0][1] == (0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0)
+    config["plugins"]["arm_control"]["home_pose"] = {"joint_la2": 5.0}
+    result = motion.dispatch("arm_control", "home", {"side": "left"})
+    assert result["state"] == "error" and "outside its range" in result["message"], "a bad home_pose is never sent"
+
+
+def test_arm_home_defaults_to_both_arms_and_refuses_a_bad_side(motion, hub, io):
+    open_gate(hub)
+    assert motion.dispatch("arm_control", "home", {})["side"] == "both"
+    assert "side must be" in motion.dispatch("arm_control", "home", {"side": "middle"})["message"]
+
+
+def test_head_home_steps_to_zero_at_the_configured_speed(motion, hub, io, completions):
+    positions = [0.0] * len(URDF_JOINTS)
+    positions[URDF_JOINTS.index("joint_head1")] = 1.4
+    positions[URDF_JOINTS.index("joint_head0")] = 0.7
+    open_gate(hub, positions)
+    result = motion.dispatch("head", "home", {})
+    assert result["state"] == "moving" and result["duration_s"] == pytest.approx(4.0, abs=0.06)
+    sent = [c[0] for c in io.named("head")]
+    assert sent[-1] == (0.0, 0.0)
+    assert len(sent) == 80, "1.4 rad at 0.35 rad/s, one step every 1/20 s"
+    steps = [max(abs(a - b) for a, b in zip(x, y)) for x, y in zip([(0.7, 1.4)] + sent, sent)]
+    assert max(steps) <= 0.35 / 20 + 1e-9, "no step faster than the configured speed"
+    assert completions[-1][1] == "completed" and completions[-1][3] == "head"
+
+
+def test_head_stop_halts_a_home_where_it_is(motion, hub, io, completions):
+    positions = [0.0] * len(URDF_JOINTS)
+    positions[URDF_JOINTS.index("joint_head1")] = 1.0
+    open_gate(hub, positions)
+    original = io.publish_head
+
+    def hooked(values):
+        original(values)
+        if len(io.named("head")) == 5:
+            motion.stop("head")
+
+    io.publish_head = hooked
+    motion.dispatch("head", "home", {})
+    assert len(io.named("head")) == 5, "nothing more after the stop"
+    assert io.named("head")[-1][0][1] > 0.8, "it stops part way, it does not jump to the target"
+    assert completions[-1][1] == "cancelled"
+
+
+def test_a_head_look_supersedes_a_home_in_progress(motion, hub, io, completions):
+    positions = [0.0] * len(URDF_JOINTS)
+    positions[URDF_JOINTS.index("joint_head1")] = 1.0
+    open_gate(hub, positions)
+    original = io.publish_head
+    state = {"done": False}
+
+    def hooked(values):
+        original(values)
+        if not state["done"] and len(io.named("head")) == 3:
+            state["done"] = True
+            motion.dispatch("head", "look", {"head1_rad": 0.9})
+
+    io.publish_head = hooked
+    motion.dispatch("head", "home", {})
+    assert io.named("head")[-1][0] == (0.0, 0.9) and completions[-1][1] == "cancelled"
+
+
+def test_head_look_with_one_box_keeps_the_other_joint(motion, hub, io):
+    positions = [0.0] * len(URDF_JOINTS)
+    positions[URDF_JOINTS.index("joint_head0")] = 0.3
+    open_gate(hub, positions)
+    motion.dispatch("head", "look", {"head1_rad": -0.2})
+    assert io.named("head") == [((0.3, -0.2),)]
+    assert "fill in head0_rad" in motion.dispatch("head", "look", {})["message"]
+
+
+def test_stop_all_stops_the_drive_the_arm_and_a_head_home(motion, hub, io, capsys):
+    motion.stop_all()
+    assert io.named("twist") == [(0.0, 0.0, 0.0)] * 5
+    io.fail_on = {"twist"}
+    motion.stop_all()
+    assert "stopping base_drive failed" in capsys.readouterr().out
+    assert motion._head_generation == 2, "the head was told to stop both times"
+
+
+# ── gripper ─────────────────────────────────────────────────────────────────────────────────────
+
+def test_gripper_both_checks_both_controllers_before_sending_to_either(motion, hub, io):
+    open_gate(hub)
+    result = motion.dispatch("gripper", "set", {"side": "both", "position": 0.4})
+    assert result["side"] == "both" and io.named("gripper") == [("left", "parallel", 0.4), ("right", "parallel", 0.4)]
+    io.calls.clear()
+    io.controllers["right_unix_gripper3_controller"] = "inactive"
+    result = motion.dispatch("gripper", "set", {"side": "both", "position": 0.6})
+    assert result["state"] == "error" and "right_unix_gripper3_controller" in result["message"]
+    assert io.named("gripper") == [], "the left one was not sent either"
+
+
+def test_gripper_defaults_to_both_hands(motion, hub, io):
+    open_gate(hub)
+    assert motion.dispatch("gripper", "set", {"position": 0.5})["side"] == "both"
+    assert len(io.named("gripper")) == 2
+
+
+def test_gripper_open_is_zero_and_close_is_one(motion, hub, io):
+    """0 = open, 1 = closed: confirmed by the operator on the robot; the vendor gave no answer."""
+    open_gate(hub)
+    motion.dispatch("gripper", "open", {"side": "left"})
+    motion.dispatch("gripper", "close", {"side": "right", "mode": "centric"})
+    assert io.named("gripper") == [("left", "parallel", 0.0), ("right", "centric", 1.0)]
+
+
+def test_gripper_open_and_close_ignore_a_leftover_position(motion, hub, io):
+    """The canvas may still send the box's last value: a preset must not take it."""
+    open_gate(hub)
+    motion.dispatch("gripper", "open", {"side": "left", "position": 0.7})
+    assert io.named("gripper") == [("left", "parallel", 0.0)]
+
+
+def test_gripper_refuses_what_it_cannot_send(motion, hub, io):
+    open_gate(hub)
+    for args, text in (({"position": 1.5}, "0 ~ 1"), ({"position": NAN}, "finite"), ({}, "position is required"),
+                       ({"side": "middle", "position": 0.5}, "left, right or both"),
+                       ({"mode": "claw", "position": 0.5}, "mode must be")):
+        result = motion.dispatch("gripper", "set", args)
+        assert result["state"] == "error" and text in result["message"], args
+    assert io.calls == []
+
+
+# ── interrupts reach the cards that have something to stop ────────────────────────────────────
+
+def test_interrupt_hooks_call_stop_on_the_cards_that_have_motion_in_flight(motion_module, config, BUNDLED_LIMITS):
+    """Core's emergency interrupt (on_interrupt_motion) and full interrupt must stop the base, the
+    arms and a head home. These hooks were missing before confirmation and the switch went away."""
+    tools = _tools(motion_module, config, BUNDLED_LIMITS)
+    for name in ("base_drive", "arm_control", "head"):
+        hooks = tools[name]["inputSchema"]["x-hooks"]
+        assert hooks == {"on_interrupt_motion": {"action": "stop"}, "on_interrupt_all": {"action": "stop"}}, name
+        assert "stop" in tools[name]["inputSchema"]["properties"]["action"]["enum"], "the hook's action exists"
+    for name in ("gripper", "lifting"):
+        assert "x-hooks" not in tools[name]["inputSchema"], "one position command each: nothing in flight to stop"
+
+
+def test_a_hook_call_really_stops_the_drive(device, hub, motion, config, io):
+    """What Core sends for the hook: the hook's action through the normal dispatch."""
+    from common.vendor_runtime import DriverBundle
+    open_gate(hub)
+    bundle = DriverBundle([device.PantherPlugin(hub, motion=motion, config=config)])
+    assert bundle.dispatch("base_drive", {"action": "stop"})["state"] == "idle"
+    assert io.named("twist")[-5:] == [(0.0, 0.0, 0.0)] * 5
+
+
+def test_completion_is_declared_for_every_action_that_runs_in_a_worker(motion_module, config, BUNDLED_LIMITS):
+    tools = {n: t["inputSchema"] for n, t in _tools(motion_module, config, BUNDLED_LIMITS).items()}
+    assert tools["base_drive"]["x-completion"] == {"actions": ["move"], "timeout": 13}
+    assert tools["arm_control"]["x-completion"] == {"actions": ["move", "home"], "timeout": 35}
+    assert tools["head"]["x-completion"] == {"actions": ["home"], "timeout": 30}
+    for name in ("gripper", "lifting"):
+        assert "x-completion" not in tools[name]
+    assert tools["base_drive"]["x-resource"] == "base" and set(tools["arm_control"]["x-resource"]) == {"arm_l", "arm_r"}
+    assert tools["head"]["x-resource"] == "head" and tools["lifting"]["x-resource"] == "waist"
+
+
+def test_the_head_home_timeout_covers_its_longest_possible_run(motion_module, config, BUNDLED_LIMITS):
+    """The furthest a head joint can be from 0 is its limit; at 0.35 rad/s that must fit in the timeout."""
+    furthest = max(abs(v) for j in ("joint_head0", "joint_head1") for v in BUNDLED_LIMITS[j])
+    timeout = _tools(motion_module, config, BUNDLED_LIMITS)["head"]["inputSchema"]["x-completion"]["timeout"]
+    assert furthest / config["plugins"]["head"]["home_speed_rad_s"] < timeout
+
+def test_the_readme_range_table_matches_the_ranges_the_cards_show(motion_module, config, BUNDLED_LIMITS):
+    """The README restates the ranges for people who read it instead of the canvas; it must not drift."""
+    readme = (DRIVER / "README.md").read_text(encoding="utf-8")
+    props = {n: t["inputSchema"]["properties"] for n, t in _tools(motion_module, config, BUNDLED_LIMITS).items()}
+
+    def shown(card, field):
+        return f"{props[card][field]['minimum']:g} ~ {props[card][field]['maximum']:g}"
+
+    for card, field, row in (("base_drive", "linear_x", "| `linear_x`, `linear_y` |"),
+                             ("base_drive", "angular_z", "| `angular_z` |"),
+                             ("base_drive", "duration_s", "| `duration_s` (base) |"),
+                             ("arm_control", "duration_s", "| `duration_s` (arm) |"),
+                             ("gripper", "position", "| `position` (gripper) |"),
+                             ("lifting", "position", "| `position` (lift) |"),
+                             ("head", "head0_rad", "| `head0_rad` |"),
+                             ("head", "head1_rad", "| `head1_rad` |")):
+        line = next(l for l in readme.splitlines() if l.startswith(row))
+        assert shown(card, field) in line, (row, shown(card, field), line)
+    for field in ("la0", "ra7"):
+        assert f"`{field}` {shown('arm_control', field)}" in readme, field
+    assert "左臂 la0（rad，-1.046 ~ 0.697）" in readme, "the README quotes a real box title"

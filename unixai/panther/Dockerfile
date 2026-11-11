@@ -75,7 +75,7 @@ COPY --from=interface-builder /panther_ws/install /panther_ws/install
 
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py contracts.py host_camera.py motion_switch.py panther_motion.py panther_payloads.py panther_bridge.py config.yaml driver.yaml /work/unixai/panther/
+COPY main.py device.py contracts.py host_camera.py panther_motion.py panther_payloads.py panther_bridge.py config.yaml driver.yaml /work/unixai/panther/
 COPY resource/panther.urdf /work/unixai/panther/resource/panther.urdf
 COPY deploy/ /deploy/
 

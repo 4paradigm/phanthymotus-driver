@@ -18,17 +18,6 @@ core_bridge:
   # The fleet's loopback-only FastDDS profile, mounted by deploy/service.yml.
   profile: /opt/phanthy-motus/dds-local.xml
 
-safety:
-  # Every motion card (base_drive, arm_control, gripper, lifting, head) is listed and answers
-  # `info`, but refuses every command while motion is off. Sensor cards are unaffected.
-  #
-  # This is the image's DEFAULT and must stay false: do not edit it on a robot (a change inside the
-  # container is lost with it). The operator turns motion on with a small file on the robot,
-  # /opt/phanthy-motus/data/panther/commissioning.yaml, read once at start-up (motion_switch.py;
-  # README "Turning motion on"). Only the boolean `true` in that file counts, and the caps below
-  # can not be changed from it.
-  commissioning_motion_enabled: false
-
 # Robot topics. Names confirmed with `ros2 topic list -t` on a Panther (2026-11-10).
 # /imu and /scan exist but have no publisher on this robot; the broadcaster topics and the
 # per-lidar scans are the live ones. /tf_static and /robot_description are latched.
@@ -119,9 +108,11 @@ plugins:
   camera_color: {enabled: true}
   camera_depth: {enabled: true}
 
-  # Motion caps. Deliberately below what the hardware allows; raise only with the operator
-  # present. Every command also needs confirm_motion=true and a fresh, normal emergency-stop
-  # diagnostic, and the matching ros2_control controller must be active.
+  # Motion caps. Deliberately below what the hardware allows; raise only with the operator present.
+  # There is no confirmation field and no motion switch: with intelligent control on, a call moves
+  # the robot. Every command still needs fresh /joint_states, a fresh emergency-stop diagnostic at
+  # level 0 and the matching ros2_control controller active, and every value inside the range its
+  # box shows (built from these numbers and the URDF limits, so the two cannot disagree).
   base_drive:
     enabled: true
     topic: /cmd_vel_teleop
@@ -133,8 +124,16 @@ plugins:
   arm_control:
     enabled: true
     max_duration_s: 20.0
-    # Largest change of any single joint in one command, from where it is now.
+    # Largest change of any single joint in one `move`, from where it is now.
     max_target_delta_rad: 0.35
+    # `home` is not held to the step above. It sends every joint of the chosen arms to home_pose
+    # (0 rad for any joint not listed; the operator confirmed the all-zero pose is safe on this
+    # robot, 2026-11-11; the vendor did not) and stretches the duration so that the furthest joint
+    # moves at no more than this average speed. The trajectory controller interpolates, so its peak
+    # speed is somewhat higher than the average. Nothing here checks for self-collision.
+    home_speed_rad_s: 0.35
+    home_min_duration_s: 2.0
+    home_pose: {}
   gripper:
     enabled: true
   lifting:
@@ -145,3 +144,9 @@ plugins:
   head:
     enabled: true
     max_target_delta_rad: 0.35
+    # `home` sends both head joints to home_pose (0 rad if not listed) in small steps: the head's
+    # forward-position controller goes to whatever it is sent at its own top speed, so the speed
+    # limit is applied by sending a step every 1/home_publish_rate_hz seconds.
+    home_speed_rad_s: 0.35
+    home_publish_rate_hz: 20.0
+    home_pose: {}

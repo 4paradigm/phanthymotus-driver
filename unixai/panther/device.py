@@ -10,9 +10,9 @@ objects. `panther_motion.Motion` holds the motion rules, also ROS-free. `Panther
 thin rclpy layer that feeds the first and carries out the second (`RosMotionIO`).
 `PantherPlugin` is the MCP surface.
 
-Motion is off unless the operator turns it on (see motion_switch.py: a small file on the host, read
-at start-up, where only the boolean `true` counts): the cards are
-listed and answer `info`, and every motion command is refused.
+There is no motion switch and no confirmation field: with intelligent control on, a motion card
+call moves the robot, provided the robot's state allows it (fresh joints, a normal emergency-stop
+diagnostic, the controller active) and every value is inside the range its box shows.
 """
 from __future__ import annotations
 
@@ -25,9 +25,8 @@ from pathlib import Path
 from common.camera_info import build as build_camera_info
 from common.odom import build_interface, build_sample, mean_twist, resolve_stamp_ms
 from common.vendor_runtime import tool
-from contracts import parse_joint_limits, populate_switch_request
+from contracts import HEAD_JOINTS, LEFT_ARM_JOINTS, RIGHT_ARM_JOINTS, parse_joint_limits, populate_switch_request
 from host_camera import HostCamera
-from motion_switch import apply_motion_switch
 from panther_bridge import CoreBridge, DEFAULT_PROFILE, safe_text
 from panther_motion import MOTION_CARDS, Motion, motion_tools
 from panther_payloads import (
@@ -363,6 +362,31 @@ class Hub:
         if first:
             print(f"[panther] live /robot_description: {len(limits)} joint limits "
                   "(used to check motion targets)", flush=True)
+            differ = self.limit_differences(limits)
+            if differ:
+                print("[panther] WARNING: the robot's joint limits differ from the bundled URDF that the "
+                      "motion cards show as their ranges; commands are checked against the robot's. "
+                      + safe_text("; ".join(differ), 400), flush=True)
+
+    def bundled_joint_limits(self) -> dict:
+        """The limits from the URDF shipped with the driver: what the motion cards show."""
+        with self._lock:
+            if self._bundled_limits is None:
+                self._bundled_limits = parse_joint_limits(self.urdf())
+            return dict(self._bundled_limits)
+
+    def limit_differences(self, live: dict) -> list:
+        """Where the robot's limits for the joints the cards show differ from the bundled ones."""
+        bundled = self.bundled_joint_limits()
+        shown = [*LEFT_ARM_JOINTS, *RIGHT_ARM_JOINTS, *HEAD_JOINTS]
+        out = []
+        for joint in shown:
+            if joint not in live:
+                out.append(f"{joint}: not in the robot's URDF")
+            elif joint in bundled and any(abs(a - b) > 1e-3 for a, b in zip(live[joint], bundled[joint])):
+                out.append(f"{joint}: robot {live[joint][0]:g}~{live[joint][1]:g}, "
+                           f"shown {bundled[joint][0]:g}~{bundled[joint][1]:g}")
+        return out
 
     def on_tf_static(self, msg) -> None:
         self._run("laser_scan", self._tf_static, msg)
@@ -472,9 +496,7 @@ class Hub:
         with self._lock:
             if self._live_limits:
                 return dict(self._live_limits), "live /robot_description"
-            if self._bundled_limits is None:
-                self._bundled_limits = parse_joint_limits(self.urdf())
-            return dict(self._bundled_limits), "bundled URDF"
+        return self.bundled_joint_limits(), "bundled URDF"
 
     # ── laser ────────────────────────────────────────────────────────────────
 
@@ -919,9 +941,7 @@ class PantherNodes:
             self._poll = self.node.create_timer(1.0, lambda: self.motion_io.poll_controllers(hub.on_controllers),
                                                 callback_group=groups["timer"])
         print("[panther] subscribed to: " + ", ".join(sorted(str(t) for t in topics.values())) +
-              ("; motion cards enabled (commands are still refused unless "
-               "safety.commissioning_motion_enabled is true)" if self.motion_io else
-               "; no motion cards enabled"), flush=True)
+              ("; motion cards enabled" if self.motion_io else "; no motion cards enabled"), flush=True)
 
     def close(self) -> None:
         try:
@@ -946,7 +966,8 @@ class PantherPlugin:
 
     def get_tools(self) -> list:
         tools = []
-        motion_defs = {t["name"]: t for t in motion_tools(self._config)} if self._motion else {}
+        motion_defs = ({t["name"]: t for t in motion_tools(self._config, self._hub.bundled_joint_limits())}
+                       if self._motion else {})
         for card in self._enabled:
             if card in MOTION_CARDS:
                 if card in motion_defs:
@@ -1016,12 +1037,6 @@ class PantherPlugin:
 
 
 def build_plugins(config, namespace=None, ros2=None):
-    # The operator's motion switch is decided once, here, before anything reads it: Motion and the
-    # log line below then agree. See motion_switch.py for why only one key can come from the file.
-    apply_motion_switch(config)
-    safety = config["safety"]
-    print(f"[panther] motion {'ENABLED' if safety['commissioning_motion_enabled'] else 'disabled'}: "
-          f"{safety['motion_switch_source']}", flush=True)
     bridge_config = config.get("core_bridge", {})
     bridge = CoreBridge(bridge_config.get("profile", DEFAULT_PROFILE),
                         int(bridge_config.get("domain", 42)))

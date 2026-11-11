@@ -1,10 +1,10 @@
 # UniX AI Panther driver
 
 Phanthy Motus driver bundle for the UniX AI **Panther** dual-arm wheeled robot (ROS 2 Humble,
-robot name `mh3`): sensor cards that show the robot's state, and five motion cards that can move
-it. **Motion is off by default** (`safety.commissioning_motion_enabled: false` in `config.yaml`, and no operator file on the robot, see "Turning motion on" below):
-the motion cards are listed and answer `info`, and every command is refused until an operator
-turns the switch on at the robot.
+robot name `mh3`): sensor cards that show the robot's state, and five motion cards that move it.
+**There is no confirmation field and no motion switch**: with intelligent control on, a call to a
+motion card moves the robot (the operator asked for this, 2026-11-11). What still stands between a
+call and the robot is listed under "What every command needs".
 
 The sensor cards were written first and tried on a robot's topic list; the motion cards and the
 lazy camera start come from the Panther driver proposed in PR #520 and were extended where that
@@ -76,59 +76,76 @@ version of this README blamed a missing udev rule for the rear lidar; that was w
 the vendor's config on a robot that does not have the hardware. **Do not create the missing device
 link** (for example by pointing it at `ttyACM1`): that is not a lidar, and the rear node would send
 commands to whatever it is.
-### Motion (all `actuator`, all refused unless the commissioning switch is on)
 
-| Card | Actions | Does | Completion |
-|---|---|---|---|
-| `base_drive` | `start` `stop` `info` `move` | `/cmd_vel_teleop` at 20 Hz for `duration_s` (max 3 s, 0.2 m/s, 0.3 rad/s), then zero velocity five times | `action_id` now, completion posted when it ends |
-| `arm_control` | `start` `stop` `info` `move` | point-to-point `FollowJointTrajectory`, one or both arms | `action_id` now, completion posted when it ends |
-| `gripper` | `start` `stop` `info` `set` | one `unix_msgs/GripperCommand`, `position` 0..1 | none: no feedback defines it |
-| `lifting` | `start` `stop` `info` `set_position` | one `JointState` on `/lifting_controller/commands` | none |
-| `head` | `start` `stop` `info` `look` | one `Float64MultiArray` `[head0, head1]` | none |
+### Motion (all `actuator`)
 
-Every command needs all of these, checked in `panther_motion.py` before anything is sent:
+| Card | Choices (`action`) | Boxes | Does | Completion |
+|---|---|---|---|---|
+| `base_drive` | `move` (default), `stop` | `linear_x`, `linear_y`, `angular_z`, `duration_s` | `/cmd_vel_teleop` at 20 Hz for `duration_s`, then zero velocity five times | `action_id` now, completion posted when it ends |
+| `arm_control` | `move` (default), `home`, `stop` | `la0`-`la7`, `ra0`-`ra7`, `duration_s`; `side` for `home` | `FollowJointTrajectory`, one or both arms | `action_id` now, completion posted when it ends |
+| `gripper` | `set` (default), `open`, `close` | `side` (`both` default, `left`, `right`), `mode`, `position` | one `unix_msgs/GripperCommand` per hand | none: no feedback defines it |
+| `lifting` | **no `action` box**: its one motion | `position` | one `JointState` on `/lifting_controller/commands` | none |
+| `head` | `look` (default), `home`, `stop` | `head0_rad`, `head1_rad` | `look`: one `Float64MultiArray` `[head0, head1]`; `home`: small steps to 0 | `home`: `action_id`, completion |
 
-- the operator's commissioning file on the robot says `commissioning_motion_enabled: true` (see "Turning motion on" below);
-- `confirm_motion: true` in the call;
+`start`, `stop` and `info` are always answered (the canvas lifecycle); they are not offered as
+menu items except where `stop` has something to stop. A call that names no `action` runs the card's
+default (`lifting` is always called that way).
+
+**Every number box shows the range it accepts**, in its title (`左臂 la0（rad，-1.046 ~ 0.697）`)
+and in its description, and the same numbers are the schema's `minimum`/`maximum` and what the
+driver enforces: the tests try every box on its shown boundary (accepted) and just past it
+(refused). A refusal quotes the range, and for a step limit, what would be allowed from where the
+joint is now (`allowed now: -0.35 ~ 0.35`). The ranges:
+
+| Box | Range | Plus |
+|---|---|---|
+| `linear_x`, `linear_y` | -0.2 ~ 0.2 m/s | empty = 0 |
+| `angular_z` | -0.3 ~ 0.3 rad/s | empty = 0 |
+| `duration_s` (base) | 0.1 ~ 3 s | empty = 1 s |
+| `la0`-`la7`, `ra0`-`ra7` | each joint's URDF limit (e.g. `la0` -1.046 ~ 0.697, `ra7` -1.57 ~ 1.57) | at most 0.35 rad from where the joint is now; **empty = that joint stays where it is** |
+| `duration_s` (arm) | 1 ~ 20 s | empty = 6 s |
+| `position` (gripper) | 0 ~ 1 | **0 = open, 1 = closed** (operator-confirmed; the vendor did not say) |
+| `position` (lift) | 0 ~ 0.65 (unit not confirmed by the vendor; reads about 0.61) | at most 0.10 from the current reading |
+| `head0_rad` | -0.348 ~ 1.5 rad (pitch, about y) | at most 0.35 rad from now; empty = stays |
+| `head1_rad` | -1.57 ~ 1.57 rad (turn, about z) | at most 0.35 rad from now; empty = stays |
+
+The arm and head ranges shown come from the driver's bundled URDF; commands are checked against
+the robot's live `/robot_description` once it arrives. If the two differ, the driver logs a
+`WARNING: the robot's joint limits differ ...` at start-up naming the joints, and the boxes would
+then show slightly wrong ranges: the robot's limits still win.
+
+**Presets**:
+
+- `arm_control` `home`: every joint of the chosen arms (`side`, default both) to 0 rad, the pose
+  the operator confirmed is safe on this robot (2026-11-11). `config.yaml`'s `home_pose` can change
+  any joint's value. It is **not** held to the 0.35 rad step; instead its duration is stretched so
+  the furthest joint moves at no more than 0.35 rad/s on average (at least 2 s, refused if over 20 s).
+  The trajectory controller interpolates, so the peak speed is somewhat higher than the average.
+  Nothing checks for self-collision: the URDF limits are the only bound.
+- `head` `home`: both joints to 0 rad in steps of at most 0.35/20 rad every 1/20 s (the head's
+  forward controller would otherwise jump at its own top speed). `stop` halts it where it is, and
+  a `look` supersedes it.
+- `gripper` `open` / `close`: `position` 0 / 1; a leftover number in the `position` box is ignored.
+
+### What every command needs
+
+Checked in `panther_motion.py` before anything is sent; a refusal says which one failed:
+
 - fresh `/joint_states` (under 1 s) and a fresh, **normal** emergency-stop diagnostic (the
   diagnostic's standard `level` is 0 and it is under 3 s old; the vendor's text is never
-  interpreted, and unrelated errors such as an absent camera do not block motion);
-- the matching ros2_control controller `active` (checked live, not from the 1 Hz cache);
-- values finite and inside the caps in `config.yaml`: arm and head targets inside the URDF limits
-  (live `/robot_description` if received, otherwise the bundled copy) and at most 0.35 rad from
-  where the joint is now; the lift at most 0.10 from its reading and below 0.65.
+  interpreted, and unrelated errors such as Nav2 being inactive do not block motion);
+- the matching ros2_control controller `active` (checked live, not from the 1 Hz cache); for
+  `gripper` `both`, both hands' controllers are checked before either hand is sent anything;
+- every value inside the range its box shows (above).
 
-### Turning motion on (and off)
+These are conditions, not switches: they clear by themselves when the robot is fine. **Without a
+confirmation step, a value that is inside its range but simply wrong is executed.** The step and
+speed limits bound how far one wrong command can move the robot; nothing else does.
 
-The image cannot ship with motion on, and an edit made inside the container is lost with the
-container, so the switch is a small file **on the robot**, mounted read-only by
-`deploy/service.yml`:
+**Interrupts**: `base_drive`, `arm_control` and `head` declare `x-hooks` `on_interrupt_motion` and
+`on_interrupt_all` -> `stop`, so Agent Core's emergency and full interrupts stop the base, the arms
+and a head `home` directly. `gripper` and `lifting` have nothing in flight to stop.
 
-```
-sudo mkdir -p /opt/phanthy-motus/data/panther
-echo 'commissioning_motion_enabled: true' | sudo tee /opt/phanthy-motus/data/panther/commissioning.yaml
-docker restart embodied-unixai-panther          # or redeploy from the console; the file persists
-docker logs embodied-unixai-panther 2>&1 | grep "motion "     # -> "motion ENABLED: ... sets commissioning_motion_enabled: true"
-```
-
-To turn it off: `sudo rm /opt/phanthy-motus/data/panther/commissioning.yaml` (or write `false`) and
-restart. Do both with the operator at the robot.
-
-What makes this safe to leave lying around:
-
-- **Anything but the YAML boolean `true` is off.** A missing file, an unreadable one, a directory
-  where the file should be, invalid YAML, `"true"` in quotes, `1`, `yes`, a typo in the key: all
-  leave motion refused, and the log line and every motion card's `info` (`note`) say why. A mistake
-  can only keep motion off, never turn it on.
-- **Only this one key is read from the file.** The speed, duration, step and lift limits stay in
-  `config.yaml`; a file that could also raise those would let one careless edit lift every limit at
-  once. To change a limit, change `config.yaml` and the image.
-- **It is read once, at start-up.** Turning motion on or off needs a restart, which also ends
-  anything in flight. There is no way to flip it from the canvas.
-- The directory, not the file, is mounted (Docker would turn a missing bind-mounted file into an
-  empty *directory*). `PANTHER_COMMISSIONING_DIR` moves the host directory and
-  `PANTHER_COMMISSIONING_FILE` the path inside the container, for a robot that keeps its data
-  elsewhere.
 What `stop` does, honestly:
 
 - `base_drive`: bumps a generation counter so the worker stops publishing, and publishes zero
@@ -143,9 +160,11 @@ What `stop` does, honestly:
   such a `move` has to be sent again. A stop with nothing running changes nothing and does not
   affect the next move. This is tested on real threads as well as step by step: after `stop`
   returns `idle`, nothing new is issued and the controllers are as they were.
-- `gripper`, `lifting`, `head` are one position command each. Once it is published the robot's
-  controller owns the motion, and this driver has no halt to call (the vendor's halt/disable
-  services are deliberately not used). `stop` there promises only that **nothing more is sent**.
+- `head`: a `home` in progress stops where it is (no further step is sent). A `look` is one
+  position command, which the robot's controller finishes.
+- `gripper`, `lifting` are one position command each. Once it is published the robot's controller
+  owns the motion, and this driver has no halt to call (the vendor's halt/disable services are
+  deliberately not used). `stop` there promises only that **nothing more is sent**.
 
 `arm_control` switches controllers, and only as far as the move needs: it takes a snapshot of what
 is active, activates the trajectory controller of **each arm being moved** (and only if it is not
@@ -158,9 +177,9 @@ back fails, the completion status is `error`, it says `controllers_restored: fal
 says to check `ros2 control list_controllers`. A SIGTERM mid-move cancels and restores first
 (`stop_grace_period: 30s`).
 
-`start` on a motion card always answers `state: "ready"` (the card is up), whatever the
-commissioning switch or the robot's readiness; those are reported next to it as
-`commissioning_motion_enabled`, `ready_for_motion`, `not_ready_reasons` and `accepts_motion`.
+`start` on a motion card always answers `state: "ready"` (the card is up), whatever the robot's
+readiness; that is reported next to it as `ready_for_motion`, `not_ready_reasons` and
+`accepts_motion`.
 `stop` makes the card `idle` until the next `start` or command.
 
 ### Things a user of these cards needs to know
@@ -201,9 +220,9 @@ commissioning switch or the robot's readiness; those are reported next to it as
   data and these three did not.
 - **The lift is not drawn in the skeleton.** The vendor URDF declares `body_joint` as `fixed`
   (and limits it to 0.6 m, while the robot reports 0.61), so `robot_state` carries the lift as a
-  number and `joints` does not move it. Gripper and lift values are unconverted: which end of the
-  gripper range is "open", and the lift's unit, are the vendor's to confirm. That is why the lift
-  command is step-limited from the live reading rather than trusted as an absolute position.
+  number and `joints` does not move it. The lift's unit is the vendor's to confirm, which is why
+  the lift command is step-limited from the live reading rather than trusted as an absolute
+  position. Which end of the gripper range is open (0) was confirmed by the operator, not the vendor.
 - **`joints` leaves out anything not in the URDF** and any joint whose position is not a finite
   number, rather than sending `null`.
 - **The head axes disagree between the vendor SDK document and the URDF** (the SDK says
@@ -211,14 +230,14 @@ commissioning switch or the robot's readiness; those are reported next to it as
   therefore takes `head0_rad` and `head1_rad` by joint name rather than pan/tilt. It publishes
   `[head0, head1]`, assuming that is `head_forward_position_controller`'s joint order; the step
   limit from the live joint state would show a swapped order as a refused or small move, but
-  confirm it with `ros2 param get /head_forward_position_controller joints` before enabling motion.
+  confirm it with `ros2 param get /head_forward_position_controller joints` before using `head`.
 
 ## How it connects
 
 ```
 robot, domain 0, CycloneDDS, bound to 127.0.0.1      this container (network_mode: host)
   /joint_states, /odom, /diagnostics, ...   ------>  main process: rclpy subscriptions
-  /cmd_vel_teleop, controllers, actions     <------  Motion (only if enabled and confirmed)
+  /cmd_vel_teleop, controllers, actions     <------  Motion (when the robot's state allows it)
                                                       cards: throttle, clean, encode
                                                            |  bounded queues, newest sample wins
                                                            v
@@ -312,18 +331,22 @@ turn motion on only for step 11, and only after everything before it is right.
 8. **Odometry**: at rest `vx`, `vy`, `wz` are 0.0 (not `null`). While the operator drives the base
    slowly with the vendor's own teleoperation (clear floor, emergency stop in reach), they must
    change. Do not push the 100 kg base by hand.
-9. **Motion refused while off**: with the switch still `false`, call `base_drive` `move` with
-   `confirm_motion: true`; it must come back `error` naming `commissioning_motion_enabled`, and
-   `ros2 topic echo /cmd_vel_teleop` must show nothing.
+9. **The cards show their ranges**: open each motion card. Every number box's title shows a range
+   (`左臂 la0（rad，-1.046 ~ 0.697）` and so on); `lifting` has no `操作` choice, only `position`. If
+   the canvas shows no execute button for `lifting`, report it: the fallback is one line (an
+   `action` with a single choice).
 10. **Confirm the facts the head and lift rely on**:
     `ros2 param get /head_forward_position_controller joints`; the lift's unit and range with the
     vendor; `ros2 control list_controllers` against the names in `panther_motion.py`.
 11. **Motion**, only with the operator beside the robot, the area clear and the emergency stop in
-    reach: turn motion on as described in "Turning motion on", restart, then try in this order and stop at
-    the first surprise: `base_drive` 0.05 m/s for 1 s; `base_drive` `stop` during a 3 s move;
-    `head` 0.1 rad; `lifting` 0.02 from its reading; `gripper` small step; `arm_control` 0.05 rad
-    on one joint. After each arm move check `ros2 control list_controllers` shows the original
-    controller active again, and that Agent Core received the completion.
+    reach. There is no switch to turn on: with intelligent control on, each call below moves the
+    robot. Try in this order and stop at the first surprise: `base_drive` 0.05 m/s for 1 s;
+    `base_drive` `stop` during a 3 s move; `head` `look` 0.1 rad on one box; `head` `home`, then
+    `stop` half way; `lifting` 0.02 from its reading; `gripper` `open`, then `close`, one side, then
+    `both`; `arm_control` `move` 0.05 rad on one joint (the other boxes empty); `arm_control`
+    `home` on one arm, starting near zero. After each arm move check `ros2 control list_controllers`
+    shows the original controller active again, and that Agent Core received the completion.
+    Then trigger Agent Core's interrupt during a 3 s `base_drive` move: the base must stop.
 12. **Not part of acceptance**: pressing the emergency stop cuts motor power and lets the arms
     drop. Only do it with the arms clear and the supervisor's agreement, and record `estop`'s text
     while pressed; it is the one value this driver has never seen.
@@ -333,7 +356,8 @@ described above first, then stops `panther_orbbec.service` if this driver starte
 that something else started is left running. If the container was killed instead, stop the unit
 by hand: `sudo systemctl stop panther_orbbec`.
 
-Open questions for the vendor (UniX AI): the gripper range and the lift unit; the head axis
+Open questions for the vendor (UniX AI): the lift unit, and the gripper's range beyond the
+operator's 0 = open / 1 = closed; the head axis
 naming and the head controller's joint order; what `/diagnostics` shows while the emergency stop is
 pressed; why the vendor software starts a rear-lidar `bluesea_node` on a robot that has no rear
 lidar (it publishes a topic that never has data, and shares the name `bluesea_node` with the front
