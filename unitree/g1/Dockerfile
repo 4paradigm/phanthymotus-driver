@@ -52,6 +52,7 @@ COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
 COPY camera_specs.py /work/camera_specs.py
+COPY rgbd_camera.py /work/rgbd_camera.py
 COPY led_control.py /work/led_control.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py

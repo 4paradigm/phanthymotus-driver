@@ -93,6 +93,16 @@ python3 unitree/g1/main.py eth0
 - `servo` 和 `servo_eef` 默认关闭。启用前核对关节布局、夹爪和腰部配置，并阅读对应模块说明。驱动没有统一的多控制器仲裁，不要让多个控制源同时控制同一组关节。
 - SDK 请求成功与实测动作完成是不同状态。检查返回结果和本体反馈；软件检查不能替代物理动作验收。
 
+## RGB-D 里程计计算输入
+
+`camera_rgbd` 复用 `camera` 已有 RealSense 采集进程，输出 `/{namespace}/camera/rgbd/color`（JPEG）和 `/{namespace}/camera/rgbd/depth`（640×480、小端 uint16 毫米 zlib）。同时连接这两个端口到通用 RGB-D 里程计卡。已有 `camera_rgb`、`camera_depth` 显示流保持原样。
+
+SDK 先把彩色图配准到深度光学平面，再用实测深度内参对两个图应用同一校正映射；输出声明共享 `camera_depth_optical_frame`、K 和零畸变。深度单位按 SDK 实际 `depth_scale` 换算，保留每张图自己的采集时间。仅接受 SDK `global_time`，不使用接收时间拟合偏移。两帧最大时间差 20 ms，重复、过期或未来时间会拒绝输出。
+
+`info` 仅在有效采集后返回 `motus.camera/1` 声明；缺少标定、时钟或数据失效时返回 `state=unavailable`、原因和空 `camera_info`。支持无畸变、标准 Brown，以及系数全零的 inverse/modified Brown 深度内参；其他模型明确不可用。当前仅完成离线验证，未执行实机验收。
+
+相机实际支持 gyro 和 accel 时，同一采集管线还输出可选 `/{namespace}/camera/rgbd/imu`（`sensor/imu`，ROS `std_msgs/String` JSON，`motus.imu/1`）。仅在通用卡启用 IMU 辅助时连接此端口。原始角速度和加速度保留各自 SDK 坐标轴，随包携带实际 motion→depth 工厂旋转（SDK 列优先数组正确转换为行优先矩阵）、采集代次和与 RGB-D 完全一致的全局时钟标识；不提供虚构的姿态或机体安装关系。`imu_status` 独立报告可用性。驱动按实际 SDK motion profiles 探测，不假定 D435 含 IMU；不支持或 motion 启动失败会保留视频/RGB-D，后者使用同一管线重试视频配置。未执行相机硬件验证。
+
 ## 开发与验证入口
 
 - [仓库构建流程](../../CONTRIBUTING.md#building-docker-images)：业务镜像构建与发布入口。
@@ -101,3 +111,23 @@ python3 unitree/g1/main.py eth0
 - [G1 测试目录](tests/)：音频、视觉、状态和遥操测试；[共享测试目录](../../tests/)另含 G1 SDK、连续控制和导航测试。
 
 测试环境要求和结果边界以对应测试说明为准。离线测试通过不代表设备、DDS 通信或机器人动作已验收。
+
+### Generic RGB-D short-term compensation
+
+Perception's generic `rgbd_odometry` card supports the instance settings
+`imu_assisted=true`, `short_term_compensation=true`, `depth_geometry=true`.
+Connect the same RGB-D pair and optional camera IMU port. The driver reports
+full factory/TF sensor-origin translations in `motus.imu/1`; inspect
+`imu_status.fusion` for calibration availability. Rotation-only or unsupported
+motion sources still support the existing video/attitude modes but cannot
+provide translational compensation. No extra SDK owner or robot-specific
+fusion algorithm is added.
+
+Keep the camera still for at least0.5s of visual/IMU initialization. The
+consumer estimates camera pose using ESKF and conditionally uses observable
+depth geometry. Inertial/depth predictions are explicitly non-mapping; SLAM
+pauses during coasting/recovery. The hard visual correction timeout is1s
+and modeled position sigma limit0.10m; these are software/model thresholds,
+not measured robot accuracy. Source clock/mount identity must remain fixed.
+Only code/offline tests have been completed; hardware verification and
+deployment remain pending explicit user instruction.
