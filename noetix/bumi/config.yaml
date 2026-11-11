@@ -5,12 +5,13 @@ plugins:
   # Optional planar image geometry for OCR/reading; uses the existing JPEG topic.
   planar_rectify:
     enabled: false
-    mode: auto
-    corners: []
     # Set these to the intended surface's aspect ratio (e.g. A4: 640 x 905).
     output_width: 640
-    output_height: 480
-    max_fps: 2.0
+    output_height: 905
+    max_fps: 5.0
+    preview: true
+    # Existing perception OCR, loopback only; requires classify_orientation API.
+    ocr_port: 15720
   state:
     enabled: true
   loco:

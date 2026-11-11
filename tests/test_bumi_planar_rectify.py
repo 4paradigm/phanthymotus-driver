@@ -24,7 +24,10 @@ BUMI = ROOT / "noetix" / "bumi"
 @pytest.fixture
 def rect(monkeypatch):
     monkeypatch.syspath_prepend(str(BUMI))
-    return importlib.import_module("planar_rectify")
+    module = importlib.import_module("planar_rectify")
+    monkeypatch.setattr(module.OCROrientation, "_request", lambda self, data:
+                        self._unknown("test_no_ocr"))
+    return module
 
 
 def encode(image):
@@ -48,29 +51,29 @@ def scene():
     return page, image, quad
 
 
-def manual_config(rect):
-    _, _, quad = scene()
-    return rect.settings({"mode": "manual", "corners": (quad / [639, 479]).tolist(),
-                          "output_width": 220, "output_height": 300, "max_fps": 5})
+def automatic_config(rect):
+    return rect.settings({"output_width": 220, "output_height": 300, "max_fps": 5})
 
 
 def test_canvas_bare_tool_call_reports_state_without_starting_worker(rect):
     obj = rect.PlanarRectifyPlugin({}, "test", None)
     result = obj.dispatch("planar_rectify", {})
     assert result["state"] == "idle"
-    assert result["config"]["mode"] == "auto"
+    assert "mode" not in result["config"] and "corners" not in result["config"]
     assert obj._thread is None
     assert obj.dispatch("unknown_action", {}) is None
 
 
-def test_manual_rectification_restores_pixels_orientation_and_homography(rect):
+def test_automatic_rectification_restores_pixels_orientation_and_homography(rect):
     page, image, quad = scene()
-    report, output = rect.rectify(encode(image), manual_config(rect))
+    report, output = rect.rectify(encode(image), automatic_config(rect))
     decoded = cv2.imdecode(np.frombuffer(output, np.uint8), cv2.IMREAD_COLOR)
     assert decoded.shape == page.shape
     assert report["valid"] and report["status"] == "ok"
     assert report["metric_geometry"] is False
-    mapped = cv2.perspectiveTransform(quad[None], np.asarray(report["homography"]))[0]
+    detected = np.asarray(report["corners_px"], np.float32)
+    assert np.max(np.linalg.norm(detected - quad, axis=1)) < 5
+    mapped = cv2.perspectiveTransform(detected[None], np.asarray(report["homography"]))[0]
     assert np.allclose(mapped, [[0, 0], [219, 0], [219, 299], [0, 299]], atol=0.001)
     error = np.mean(np.abs(decoded[10:-10, 10:-10].astype(float) - page[10:-10, 10:-10]))
     assert error < 12
@@ -83,7 +86,7 @@ def test_auto_detects_tilted_boundary_without_claiming_document_identity(rect):
     _, image, quad = scene()
     report, output = rect.rectify(encode(image), rect.settings({}))
     assert output is not None and report["valid"]
-    assert report["selection"] == "geometric_candidate"
+    assert report["selection"] == "white_paper_candidate"
     assert np.max(np.linalg.norm(np.asarray(report["corners_px"]) - quad, axis=1)) < 5
 
 
@@ -181,6 +184,7 @@ class Node:
     def __init__(self):
         self.images = []
         self.reports = []
+        self.previews = []
         self.destroyed = False
 
     def send_image(self, data, stamp):
@@ -188,6 +192,9 @@ class Node:
 
     def send_status(self, report):
         self.reports.append(report)
+
+    def send_preview(self, data, stamp):
+        self.previews.append((data, stamp))
 
     def destroy_node(self):
         self.destroyed = True
@@ -219,7 +226,7 @@ def wait_for(predicate):
 @pytest.fixture
 def plugin(rect, monkeypatch):
     executor, node = Executor(), Node()
-    obj = rect.PlanarRectifyPlugin(manual_config(rect), "test", executor)
+    obj = rect.PlanarRectifyPlugin(automatic_config(rect), "test", executor)
     monkeypatch.setattr(obj, "_make_node", lambda: node)
     yield obj, node, executor
     obj.stop()
@@ -234,8 +241,8 @@ def test_worker_is_latest_only_preserves_stamp_and_clears_on_stop(rect, plugin):
     data = encode(scene()[1])
     for sec in range(123, 128):
         obj._on_frame(message(data, sec))
-    wait_for(lambda: bool(node.images))
-    assert len(node.images) == 1 and node.images[0][1] == (127, 0)
+    wait_for(lambda: obj.info().get("frame_sequence") == 5)
+    assert len(node.images) <= 2 and node.images[-1][1] == (127, 0)
     assert obj.info()["frame_sequence"] == 5
     assert obj.info()["capture_time_verified"] is False
     assert obj.info()["camera_info"] == []
@@ -389,7 +396,7 @@ def test_ros_node_contract_serialization_qos_and_shutdown(rect, monkeypatch):
     stubs["std_msgs.msg"].String = String
     for name, module in stubs.items():
         monkeypatch.setitem(sys.modules, name, module)
-    obj = rect.PlanarRectifyPlugin(manual_config(rect), "test", Executor())
+    obj = rect.PlanarRectifyPlugin(automatic_config(rect), "test", Executor())
     try:
         obj.start()
         node = obj._node
@@ -431,3 +438,106 @@ def test_publisher_failure_invalidates_result_and_still_destroys_node(rect, plug
     assert obj.info()["valid"] is False and obj._latest is None
     obj.stop()
     assert not executor.nodes and node.destroyed
+
+
+def test_canvas_has_no_manual_corner_or_rotation_control(rect):
+    tool = rect.PlanarRectifyPlugin({}, "test", Executor()).get_tool()
+    for schema in (tool["inputSchema"], tool["configSchema"]):
+        assert not {"mode", "corners", "rotation"} & schema["properties"].keys()
+    assert tool["configSchema"]["properties"]["max_fps"]["maximum"] == 15
+
+
+def test_repeated_config_preserves_ros_node_and_updates_cancel_old_work(rect, plugin):
+    obj, node, executor = plugin
+    obj.start()
+    thread = obj._thread
+    generation = obj._generation
+    obj.dispatch("config", dict(obj._config))
+    assert obj._generation == generation and obj._thread is thread
+    obj.dispatch("config", {"max_fps": 10})
+    assert obj._generation == generation + 1 and obj._thread is thread
+    assert executor.nodes == [node] and not node.destroyed
+    assert obj.dispatch("config", {"mode": "manual"})["error"] == "invalid_parameters"
+
+
+def test_failure_has_live_original_preview_not_a_fake_rectified_image(rect, plugin):
+    obj, node, _ = plugin
+    obj.start()
+    blank = encode(np.full((480, 640, 3), 90, np.uint8))
+    obj._on_frame(message(blank, 1))
+    wait_for(lambda: len(node.previews) >= 1)
+    assert not node.images and obj.info()["status"] == "no_boundary"
+    obj._on_frame(message(blank, 2))
+    wait_for(lambda: len(node.previews) >= 2)
+    assert node.previews[-1][1] == (2, 0) and not obj.info()["valid"]
+
+
+def test_colored_rectangle_does_not_override_white_paper(rect):
+    image = np.full((480, 640, 3), 30, np.uint8)
+    cv2.rectangle(image, (20, 40), (280, 440), (20, 20, 230), -1)
+    cv2.rectangle(image, (380, 150), (550, 340), (220, 220, 220), -1)
+    report, output = rect.rectify(encode(image), rect.settings({}))
+    assert output and report["valid"]
+    assert min(p[0] for p in report["corners_px"]) > 370
+
+
+@pytest.mark.parametrize("angle", [90, 180, 270])
+def test_automatic_rotation_composes_homography_and_keeps_final_size(rect, angle):
+    data = encode(scene()[1])
+    config = automatic_config(rect)
+    report, _ = rect.rectify(data, config)
+    turned, image = rect.orient_rectified(data, report, config, angle)
+    assert rect.jpeg_size(image) == (220, 300)
+    points = np.asarray(report["corners_px"], np.float32)
+    mapped = cv2.perspectiveTransform(points[None], np.asarray(turned["homography"]))[0]
+    expected = {90: [[219, 0], [219, 299], [0, 299], [0, 0]],
+                180: [[219, 299], [0, 299], [0, 0], [219, 0]],
+                270: [[0, 299], [0, 0], [219, 0], [219, 299]]}[angle]
+    assert np.allclose(mapped, expected, atol=0.001)
+
+
+def test_worker_reports_unknown_direction_without_guessing(rect, plugin):
+    obj, node, _ = plugin
+    obj.start()
+    obj._on_frame(message(encode(scene()[1])))
+    wait_for(lambda: bool(node.images))
+    report = obj.info()
+    assert report["valid"] and not report["orientation_verified"]
+    assert report["rotation_cw_degrees"] is None
+    assert report["orientation"]["status"] == "unknown"
+
+
+@pytest.mark.parametrize("angle", [0, 90, 180, 270])
+def test_worker_applies_only_accepted_automatic_direction(rect, plugin, monkeypatch, angle):
+    obj, node, _ = plugin
+    monkeypatch.setattr(obj._orientation, "consider", lambda *args:
+                        {"status": "ready", "rotation_cw_degrees": angle, "support": 1.0,
+                         "based_on_frame_sequence": 1})
+    obj.start()
+    obj._on_frame(message(encode(scene()[1])))
+    wait_for(lambda: bool(node.images))
+    report = obj.info()
+    assert report["orientation_verified"] and report["rotation_cw_degrees"] == angle
+    assert rect.jpeg_size(node.images[-1][0]) == (220, 300)
+
+
+def test_config_change_discards_inflight_geometry_without_rebuilding_node(rect, plugin, monkeypatch):
+    obj, node, _ = plugin
+    entered, release = threading.Event(), threading.Event()
+    real_rectify = rect.rectify
+    def paused(*args):
+        entered.set()
+        assert release.wait(3)
+        return real_rectify(*args)
+    monkeypatch.setattr(rect, "rectify", paused)
+    obj.start()
+    obj._on_frame(message(encode(scene()[1]), 1))
+    assert entered.wait(2)
+    original_node = obj._node
+    obj.dispatch("config", {"output_width": 300, "output_height": 400})
+    release.set()
+    time.sleep(0.1)
+    assert not node.images and obj._node is original_node and not node.destroyed
+    obj._on_frame(message(encode(scene()[1]), 2))
+    wait_for(lambda: bool(node.images))
+    assert rect.jpeg_size(node.images[-1][0]) == (300, 400)

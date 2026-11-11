@@ -18,6 +18,7 @@ import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from rclpy._rclpy_pybind11 import InvalidHandle
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
@@ -40,15 +41,23 @@ def main():
                              lambda msg: reports.append(json.loads(msg.data)), qos_profile_sensor_data)
     publisher = node.create_publisher(CompressedImage, source, qos_profile_sensor_data)
     executor.add_node(node)
-    config = {"mode": "manual", "corners": [[0.1,0.1],[0.9,0.1],[0.9,0.9],[0.1,0.9]],
-              "output_width": 320, "output_height": 240, "max_fps": 5}
+    config = {"output_width": 320, "output_height": 240, "max_fps": 5}
     plugin = PlanarRectifyPlugin(config, namespace, executor)
-    spin = threading.Thread(target=executor.spin, daemon=True)
+    spin_done = threading.Event()
+    def spin_bundle():
+        while not spin_done.is_set() and rclpy.ok():
+            try:
+                executor.spin_once(timeout_sec=0.1)
+            except InvalidHandle:
+                # Match the bundle when a Card removes its node concurrently.
+                continue
+    spin = threading.Thread(target=spin_bundle, daemon=True)
     stopped = False
     try:
         plugin.start()
         spin.start()
-        image = np.full((480, 640, 3), 240, np.uint8)
+        image = np.full((480, 640, 3), 40, np.uint8)
+        cv2.rectangle(image, (70, 60), (560, 420), (240, 240, 240), -1)
         cv2.putText(image, "SYNTHETIC", (100, 230), cv2.FONT_HERSHEY_SIMPLEX, 1, (20,20,20), 2)
         ok, data = cv2.imencode(".jpg", image)
         assert ok
@@ -87,6 +96,7 @@ def main():
     finally:
         if not stopped:
             plugin.stop()
+        spin_done.set()
         executor.shutdown()
         if spin.is_alive():
             spin.join(timeout=2)

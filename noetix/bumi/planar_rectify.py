@@ -12,14 +12,17 @@ import math
 import re
 import threading
 import time
+from collections import deque
 
 import cv2
 import numpy as np
 
+from planar_orientation import OCROrientation
+
 
 DEFAULTS = {
-    "mode": "auto", "corners": [], "output_width": 640,
-    "output_height": 480, "max_fps": 2.0,
+    "output_width": 640, "output_height": 905, "max_fps": 5.0,
+    "preview": True, "ocr_port": 15720,
 }
 MAX_JPEG_BYTES = 2 * 1024 * 1024
 MAX_PIXELS = 1920 * 1080
@@ -31,26 +34,18 @@ _TOPIC = re.compile(r"/(?:[A-Za-z_][A-Za-z0-9_]*)(?:/[A-Za-z_][A-Za-z0-9_]*)*")
 def settings(config: dict) -> dict:
     """Validate fully before replacing an active configuration."""
     cfg = {key: copy.deepcopy(config.get(key, default)) for key, default in DEFAULTS.items()}
-    if cfg["mode"] not in ("auto", "manual"):
-        raise ValueError("mode must be auto or manual")
+    if config.get("mode", "auto") != "auto" or ("corners" in config and config["corners"] != []):
+        raise ValueError("only automatic white-paper detection is supported; remove manual corners")
     for key in ("output_width", "output_height"):
         if type(cfg[key]) is not int or not 64 <= cfg[key] <= 1280:
             raise ValueError(f"{key} must be an integer in 64..1280")
     if (type(cfg["max_fps"]) not in (int, float)
-            or not math.isfinite(cfg["max_fps"]) or not 1 <= cfg["max_fps"] <= 5):
-        raise ValueError("max_fps must be finite and in 1..5")
-    corners = cfg["corners"]
-    if not isinstance(corners, list):
-        raise ValueError("corners must be a list")
-    if corners:
-        if (len(corners) != 4 or any(
-                not isinstance(p, list) or len(p) != 2
-                or any(type(v) not in (int, float) or not math.isfinite(v)
-                       or not 0 <= v <= 1 for v in p) for p in corners)):
-            raise ValueError("corners must contain four normalized [x,y] pairs")
-        _validate_quad(np.asarray(corners, np.float32), min_area=0.001, min_edge=0.01)
-    if cfg["mode"] == "manual" and not corners:
-        raise ValueError("manual mode requires four corners")
+            or not math.isfinite(cfg["max_fps"]) or not 1 <= cfg["max_fps"] <= 15):
+        raise ValueError("max_fps must be finite and in 1..15")
+    if type(cfg["preview"]) is not bool:
+        raise ValueError("preview must be boolean")
+    if type(cfg["ocr_port"]) is not int or not 1 <= cfg["ocr_port"] <= 65535:
+        raise ValueError("ocr_port must be an integer in 1..65535 on loopback")
     return cfg
 
 
@@ -109,6 +104,10 @@ def find_quad(image):
     scale = min(1.0, 640 / max(width, height))
     small = cv2.resize(image, (round(width * scale), round(height * scale)))
     gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    threshold, bright = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    neutral = (hsv[:, :, 1] <= 75) & (hsv[:, :, 2] >= max(60, threshold * 0.65))
+    white_mask = np.where((bright > 0) & neutral, 255, 0).astype(np.uint8)
     candidates = []
     small_height, small_width = gray.shape
     # A small/slanted page can occupy well below 15% of a live camera frame.
@@ -116,8 +115,12 @@ def find_quad(image):
     # shadowed/faint edges. Neither pass labels an object as paper.
     contrast = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
     kernel = np.ones((3, 3), np.uint8)
-    for plane, low, high in ((gray, 50, 150), (contrast, 20, 60)):
-        edges = cv2.Canny(cv2.GaussianBlur(plane, (5, 5), 0), low, high)
+    passes = [cv2.Canny(cv2.GaussianBlur(plane, (5, 5), 0), low, high)
+              for plane, low, high in ((gray, 50, 150), (contrast, 20, 60))]
+    # A filled, neutral/light region can survive shadows/internal text when
+    # its raw edge contour is fragmented. This is still a geometric/color hint.
+    passes.append(white_mask)
+    for edges in passes:
         edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
         contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:40]:
@@ -145,6 +148,11 @@ def find_quad(image):
                 quad_area = cv2.contourArea(quad)
                 if abs(area - quad_area) > 0.10 * quad_area:
                     continue
+                region = np.zeros(gray.shape, np.uint8)
+                cv2.fillConvexPoly(region, np.round(quad).astype(np.int32), 1)
+                pixels = region.astype(bool)
+                if np.count_nonzero(neutral & pixels) < 0.60 * np.count_nonzero(pixels):
+                    continue
                 # Merge inner/outer edges and the two detection passes before
                 # deciding whether there are multiple distinct targets.
                 if not any(np.max(np.linalg.norm(quad - old, axis=1)) < 8
@@ -170,19 +178,14 @@ def rectify(data: bytes, config: dict) -> tuple[dict, bytes | None]:
     image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if image is None or image.shape[:2] != (height, width):
         raise ValueError("JPEG decoding failed or dimensions changed")
-    report = {"valid": False, "mode": config["mode"], "source_size": [width, height],
+    report = {"valid": False, "mode": "auto", "source_size": [width, height],
               "output_size": [config["output_width"], config["output_height"]],
               "corners_px": None, "homography": None,
               "geometry": "planar_projective_pixels", "metric_geometry": False}
-    if config["mode"] == "manual":
-        quad = (np.asarray(config["corners"], np.float32) * [width - 1, height - 1]).astype(np.float32)
-        _validate_quad(quad, width * height * 0.001, 2)
-        report.update(status="ok", candidate_count=None, selection="configured_corners")
-    else:
-        quad, reason, count = find_quad(image)
-        report.update(status=reason, candidate_count=count, selection="geometric_candidate")
-        if quad is None:
-            return report, None
+    quad, reason, count = find_quad(image)
+    report.update(status=reason, candidate_count=count, selection="white_paper_candidate")
+    if quad is None:
+        return report, None
     out_width, out_height = report["output_size"]
     destination = np.float32([[0, 0], [out_width - 1, 0],
                              [out_width - 1, out_height - 1], [0, out_height - 1]])
@@ -197,6 +200,49 @@ def rectify(data: bytes, config: dict) -> tuple[dict, bytes | None]:
     return report, jpeg.tobytes()
 
 
+def orient_rectified(data, report, config, angle):
+    """Compose a quarter-turn with the source homography; one final resampling.
+
+    Swapping the pre-rotation canvas for 90/270 keeps the requested final size
+    and aspect ratio instead of stretching an already warped portrait image.
+    """
+    if angle not in (90, 180, 270):
+        raise ValueError("expected an automatic clockwise quarter-turn")
+    jpeg_size(data)
+    source = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    width, height = config["output_width"], config["output_height"]
+    pre_w, pre_h = (height, width) if angle in (90, 270) else (width, height)
+    destination = np.float32([[0, 0], [pre_w - 1, 0], [pre_w - 1, pre_h - 1], [0, pre_h - 1]])
+    matrix = cv2.getPerspectiveTransform(np.asarray(report["corners_px"], np.float32), destination)
+    turns = {90: [[0, -1, pre_h - 1], [1, 0, 0], [0, 0, 1]],
+             180: [[-1, 0, pre_w - 1], [0, -1, pre_h - 1], [0, 0, 1]],
+             270: [[0, 1, 0], [-1, 0, pre_w - 1], [0, 0, 1]]}
+    matrix = np.asarray(turns[angle], np.float64) @ matrix
+    output = cv2.warpPerspective(source, matrix, (width, height))
+    ok, encoded = cv2.imencode(".jpg", output, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        raise ValueError("output JPEG encoding failed")
+    return {**report, "homography": matrix.tolist()}, encoded.tobytes()
+
+
+def preview_jpeg(data, report):
+    """An explicitly labelled original-image preview, never a rectified result."""
+    jpeg_size(data)
+    image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        return None
+    corners = report.get("corners_px")
+    if corners is not None:
+        cv2.polylines(image, [np.round(corners).astype(np.int32)], True, (0, 200, 0), 2)
+    cv2.rectangle(image, (0, 0), (image.shape[1] - 1, 25), (0, 0, 0), -1)
+    text = "ORIGINAL PREVIEW: " + report.get("status", "unknown").upper()
+    if report.get("valid") and not report.get("orientation_verified"):
+        text += " / DIRECTION UNKNOWN"
+    cv2.putText(image, text, (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    ok, output = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return output.tobytes() if ok else None
+
+
 class PlanarRectifyPlugin:
     PREFIX = "planar_rectify"
 
@@ -206,36 +252,39 @@ class PlanarRectifyPlugin:
         self._input_topic = self._default_topic
         self._image_topic = f"/{namespace}/planar_rectify/image"
         self._state_topic = f"/{namespace}/planar_rectify/state"
+        self._preview_topic = f"/{namespace}/planar_rectify/preview"
         self._executor = executor
         self._lock = threading.Lock()
         self._lifecycle = threading.RLock()
         self._publish_lock = threading.Lock()
         self._cancel = threading.Event()
+        self._wake = threading.Event()
         self._cancel.set()
         self._node = self._thread = self._latest = None
         self._sequence = 0
         self._last_stamp = None
+        self._generation = 0
+        self._output_times = deque(maxlen=31)
+        self._orientation = OCROrientation(self._config["ocr_port"])
         self._result = {"valid": False, "status": "idle"}
 
     def get_tool(self):
         config_schema = {
             "type": "object", "properties": {
-                "mode": {"type": "string", "enum": ["auto", "manual"], "default": "auto"},
-                "corners": {"type": "array", "default": [], "maxItems": 4,
-                            "items": {"type": "array", "minItems": 2, "maxItems": 2,
-                                      "items": {"type": "number", "minimum": 0, "maximum": 1}},
-                            "description": "Manual TL,TR,BR,BL normalized [x,y] corners"},
                 "output_width": {"type": "integer", "minimum": 64, "maximum": 1280, "default": 640},
-                "output_height": {"type": "integer", "minimum": 64, "maximum": 1280, "default": 480},
-                "max_fps": {"type": "number", "minimum": 1, "maximum": 5, "default": 2},
+                "output_height": {"type": "integer", "minimum": 64, "maximum": 1280, "default": 905},
+                "max_fps": {"type": "number", "minimum": 1, "maximum": 15, "default": 5},
+                "preview": {"type": "boolean", "default": True,
+                            "description": "Publish an original-image detection preview, including failures"},
             },
         }
         return {
             "name": self.PREFIX, "type": "processor", "multiInstance": False,
             "x-resource": ["image_processing"],
-            "description": "Flatten a planar quadrilateral from Bumi JPEG images for OCR or reading. "
-                           "Automatic boundaries are geometric candidates, not document recognition. "
-                           "Configure output aspect ratio; no OCR, motion or metric measurements.",
+            "description": "Automatically locate a white-paper-like quadrilateral and flatten it. "
+                           "Reuse the same-robot OCR det/cls for automatic page direction; uncertain "
+                           "direction remains explicitly unknown. No manual corners, extra model, "
+                           "text recognition, motion or metric measurements.",
             "inputSchema": {
                 "type": "object", "properties": {
                     "action": {"type": "string", "enum": ["start", "stop", "info", "config"]},
@@ -243,12 +292,13 @@ class PlanarRectifyPlugin:
                 "required": ["action"],
                 "x-action-params": {
                     "start": {"params": ["input_topic"]}, "stop": {"params": []},
-                    "info": {"params": []}, "config": {"params": list(DEFAULTS)}},
+                    "info": {"params": []}, "config": {"params": list(config_schema["properties"])}},
             },
             "configSchema": config_schema,
             "topic_in": [{"format": "image/jpeg", "desc": "Planar scene"}],
             "topic_out": [{"topic": self._image_topic, "format": "image/jpeg", "desc": "Rectified region"},
-                          {"topic": self._state_topic, "format": "data/json", "desc": "Validity and transform"}],
+                          {"topic": self._state_topic, "format": "data/json", "desc": "Validity, direction and transform"},
+                          {"topic": self._preview_topic, "format": "image/jpeg", "desc": "Original-image detection preview"}],
         }
 
     def _on_frame(self, msg):
@@ -268,6 +318,7 @@ class PlanarRectifyPlugin:
                     return
                 self._last_stamp = stamp
             self._latest = (self._sequence, bytes(msg.data), time.monotonic(), stamp)
+        self._wake.set()
 
     def _make_node(self):
         from rclpy.node import Node
@@ -283,6 +334,7 @@ class PlanarRectifyPlugin:
                              durability=DurabilityPolicy.VOLATILE)
             node.image_pub = node.create_publisher(CompressedImage, self._image_topic, qos)
             node.state_pub = node.create_publisher(String, self._state_topic, qos)
+            node.preview_pub = node.create_publisher(CompressedImage, self._preview_topic, qos)
             node.create_subscription(CompressedImage, self._input_topic, self._on_frame, qos)
 
             def status():
@@ -302,6 +354,14 @@ class PlanarRectifyPlugin:
                 node.image_pub.publish(msg)
 
             node.send_image = image
+            def preview(data, stamp):
+                msg = CompressedImage()
+                msg.format = "jpeg"
+                msg.header.stamp.sec, msg.header.stamp.nanosec = stamp
+                msg.header.frame_id = "planar_preview_original_pixels"
+                msg.data = data
+                node.preview_pub.publish(msg)
+            node.send_preview = preview
             node.create_timer(0.5, status)
             return node
         except BaseException:
@@ -320,13 +380,16 @@ class PlanarRectifyPlugin:
                 with self._lock:
                     self._latest = None
                     self._last_stamp = None
+                    self._output_times.clear()
                     self._result = {"valid": False, "status": "no_input"}
                 self._cancel.clear()
+                self._orientation.start()
                 thread = threading.Thread(target=self._run_guarded, name="bumi_planar_rectify", daemon=True)
                 self._node, self._thread = node, thread
                 thread.start()
             except BaseException:
                 self._cancel.set()
+                self._orientation.stop()
                 self._node = self._thread = None
                 try:
                     if registered:
@@ -338,13 +401,16 @@ class PlanarRectifyPlugin:
     def stop(self):
         with self._lifecycle:
             self._cancel.set()
+            self._wake.set()
             if self._thread is not None:
                 self._thread.join(timeout=5)
                 if self._thread.is_alive():
                     raise RuntimeError("planar rectification worker did not stop")
                 self._thread = None
+            self._orientation.stop()
             with self._lock:
                 self._latest = None
+                self._output_times.clear()
                 self._result = {"valid": False, "status": "idle"}
             with self._publish_lock:
                 if self._node is not None:
@@ -361,21 +427,44 @@ class PlanarRectifyPlugin:
 
     def _run(self):
         last_sequence = -1
-        while not self._cancel.wait(1 / self._config["max_fps"]):
+        deadline = 0.0
+        while not self._cancel.is_set():
+            if self._cancel.wait(max(0.0, deadline - time.monotonic())):
+                return
             with self._lock:
                 frame = self._latest
+                cfg, generation = dict(self._config), self._generation
             if frame is None or frame[0] == last_sequence:
+                self._wake.wait(0.2)
+                self._wake.clear()
                 continue
             sequence, data, received, stamp = frame
             last_sequence = sequence
             if time.monotonic() - received > MAX_AGE_S:
                 continue
+            started = time.monotonic()
+            deadline = started + 1 / cfg["max_fps"]
+            preview = None
             try:
-                result, image = rectify(data, self._config)
+                result, image = rectify(data, cfg)
+                if image is not None:
+                    decoded = cv2.imdecode(np.frombuffer(image, np.uint8), cv2.IMREAD_COLOR)
+                    direction = self._orientation.consider(decoded, sequence)
+                    angle = direction.get("rotation_cw_degrees")
+                    verified = direction.get("status") == "ready"
+                    if verified and angle:
+                        result, image = orient_rectified(data, result, cfg, angle)
+                    result.update(orientation=direction, orientation_verified=verified,
+                                  rotation_cw_degrees=angle if verified else None)
+                else:
+                    self._orientation.invalidate()
+                if cfg["preview"]:
+                    preview = preview_jpeg(data, result)
             except (ValueError, cv2.error):
                 result, image = {"valid": False, "status": "invalid_image"}, None
             except Exception:
                 result, image = {"valid": False, "status": "processing_error"}, None
+            result["processing_ms"] = round((time.monotonic() - started) * 1000, 2)
             result.update(frame_sequence=sequence, input_received_monotonic_s=received,
                           input_ros_stamp={"sec": stamp[0], "nanosec": stamp[1]},
                           timestamp_source="host_receipt", capture_time_verified=False)
@@ -387,11 +476,17 @@ class PlanarRectifyPlugin:
                     image = None
                 with self._lock:
                     # A rejected newer input must not be overwritten by old work.
-                    if self._latest is None:
+                    if self._latest is None or self._generation != generation:
                         continue
+                    if not result["valid"]:
+                        result["orientation_verified"] = False
                     self._result = result
                 if image is not None:
                     self._node.send_image(image, stamp)
+                    with self._lock:
+                        self._output_times.append(time.monotonic())
+                if preview is not None and time.monotonic() - received <= MAX_AGE_S:
+                    self._node.send_preview(preview, stamp)
 
     def _run_guarded(self):
         try:
@@ -405,6 +500,8 @@ class PlanarRectifyPlugin:
         with self._lock:
             result = copy.deepcopy(self._result)
             latest = self._latest
+            config = copy.deepcopy(self._config)
+            output_times = list(self._output_times)
         now = time.monotonic()
         received = result.get("input_received_monotonic_s")
         result["input_age_s"] = None if received is None else max(0.0, now - received)
@@ -416,9 +513,15 @@ class PlanarRectifyPlugin:
         state = "idle" if self._cancel.is_set() else (
             "error" if result["status"] == "worker_error" else "running")
         result.update(state=state,
-                      input_topic=self._input_topic, config=copy.deepcopy(self._config),
+                      input_topic=self._input_topic, config=config,
                       topic_out=self.get_tool()["topic_out"], camera_info=[],
                       metric_geometry=False, output_geometry="planar_projective_pixels")
+        if not result["valid"]:
+            result["orientation_verified"] = False
+        result["actual_output_fps"] = (
+            round((len(output_times) - 1) / (output_times[-1] - output_times[0]), 2)
+            if len(output_times) > 1 and now - output_times[-1] <= MAX_AGE_S
+            and output_times[-1] > output_times[0] else 0.0)
         return result
 
     def dispatch(self, action: str, args: dict) -> dict | None:
@@ -432,19 +535,29 @@ class PlanarRectifyPlugin:
         if action in ("start", "config"):
             with self._lifecycle:
                 try:
-                    cfg = settings({**self._config, **{k: args[k] for k in DEFAULTS if k in args}})
+                    cfg = settings({**self._config, **{k: args[k] for k in
+                                                     (*DEFAULTS, "mode", "corners") if k in args}})
                     topics = args.get("input_topics")
                     if topics is not None and (not isinstance(topics, list) or len(topics) != 1):
                         raise ValueError("exactly one image input topic is required")
                     topic = args.get("input_topic") or (topics[0] if topics else self._input_topic)
                     if (not isinstance(topic, str) or not _TOPIC.fullmatch(topic)
-                            or topic in (self._image_topic, self._state_topic)):
+                            or topic in (self._image_topic, self._state_topic, self._preview_topic)):
                         raise ValueError("invalid or feedback-loop input topic")
                 except (ValueError, TypeError) as exc:
                     return {"state": "error", "error": "invalid_parameters", "detail": str(exc)}
                 running = not self._cancel.is_set()
-                self.stop()
-                self._config, self._input_topic = cfg, topic
+                if topic != self._input_topic:
+                    self.stop()
+                if cfg != self._config or topic != self._input_topic:
+                    with self._publish_lock:
+                        with self._lock:
+                            self._generation += 1
+                            self._result = {"valid": False, "status": "config_changed"}
+                            self._output_times.clear()
+                            self._config, self._input_topic = cfg, topic
+                        self._orientation.configure(cfg["ocr_port"])
+                        self._wake.set()
                 if action == "start" or running:
                     self.start()
                 return self.info()
