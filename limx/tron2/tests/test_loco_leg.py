@@ -249,7 +249,7 @@ class WalkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.ws.send_json.call_args.args[0]['data'], {'x':0.,'y':0.,'z':0.})
         report.assert_not_awaited()
 
-    async def test_calibrated_22_5_degrees_maps_to_vendor_1_5_and_stops(self):
+    async def test_calibrated_22_5_degrees_maps_to_vendor_0_375_and_stops(self):
         w,r,report,_=self.make();packets=[]
         async def capture(packet):packets.append((time.monotonic(),packet))
         r.ws.send_json.side_effect=capture
@@ -258,11 +258,11 @@ class WalkTests(unittest.IsolatedAsyncioTestCase):
         moving=[(at,p) for at,p in packets if p['data']['z']!=0]
         zeros=[(at,p) for at,p in packets if p['data']['z']==0]
         self.assertGreater(len(moving),50)
-        self.assertTrue(all(abs(p['data']['z']-1.5)<1e-12 for _,p in moving))
+        self.assertTrue(all(abs(p['data']['z']-.375)<1e-12 for _,p in moving))
         first_zero=zeros[0][0]
         self.assertTrue(all(at<first_zero for at,_ in moving))
         self.assertLess(abs(first_zero-moving[0][0]-2.),.08)
-        self.assertAlmostEqual(w.result['vendor_z_command'],1.5)
+        self.assertAlmostEqual(w.result['vendor_z_command'],.375)
         self.assertFalse(w.result['angle_control'])
 
     async def test_invalid_time_and_direction(self):
@@ -380,8 +380,8 @@ class YawCalibrationTests(unittest.TestCase):
         from walk import Walk
         from unittest.mock import Mock
         w=object.__new__(Walk);w._dispatch=Mock(return_value={})
-        for speed,z in ((22.5,1.5),(15.,1.),(-15.,-1.),(-22.5,-1.5),(0.,0.)):
+        for speed,z in ((90.,1.5),(60.,1.),(-60.,-1.),(-90.,-1.5),(22.5,.375),(0.,0.)):
             w.dispatch_velocity(0,0,speed,2)
             self.assertEqual(w._dispatch.call_args.args[2][2],z)
-        for speed in (22.6,-22.6,45.):
+        for speed in (90.1,-90.1,180.):
             with self.assertRaises(ValueError):w.dispatch_velocity(0,0,speed,2)

@@ -244,7 +244,7 @@ sudo docker exec embodied-limx-tron2 /bin/bash -c 'source /opt/ros/humble/setup.
 
 启动后按实际notify_robot_info.accid识别DACH/WF/SF；未知构型不根据关节数量猜测。DACH、WF有现场观察，SF只有文档与模型测试。默认卡片为battery、joints、loco_leg、loco_servo_arm及已有上肢卡片。旧画布中的leg_loco/arm_servo需重新添加为loco_leg/loco_servo_arm。
 
-- loco_leg：stand_up先进入STAND准备，再进入WALK平衡；sit_down先发零速度后请求折叠。完成依据发送后收到的厂家status。move参数vx为m/s、[-3,3]（正前负后），vyaw为deg/s、约±22.5（正左负右），duration为-1持续移动、0停止或0.1～60秒，默认2秒。无横移，结束另发约1秒零速度。start/stop是生命周期，不自动起立/坐下；需要停车用stop_move。不宣称精确距离、转角或物理停稳。
+- loco_leg：stand_up先进入STAND准备，再进入WALK平衡；sit_down先发零速度后请求折叠。完成依据发送后收到的厂家status。move参数vx为m/s、[-3,3]（正前负后），vyaw为deg/s、约±90（正左负右），duration为-1持续移动、0停止或0.1～60秒，默认2秒。无横移，结束另发约1秒零速度。start/stop是生命周期，不自动起立/坐下；需要停车用stop_move。不宣称精确距离、转角或物理停稳。
 - loco_servo_arm：将标准control/joint流接到输入口，motus.control/1、joint_position、18维目标，采用官方tron2_env启用头部的DEFAULT_LAYOUT_WITH_HEAD：索引0～6左臂(rad)、7左夹爪(0～1)、8～14右臂(rad)、15右夹爪(0～1)、16头部pitch(rad)、17头部yaw(rad)。消息包含seq、stamp_ms、obs_stamp_ms、ttl_ms、source、priority、mode、dof、values。时间戳为Unix毫秒。建议30Hz，最大50Hz；Driver从实测姿态插值，目标300Hz发送官方ServoJ。应用速度上限0.5rad/s、加速度1.5rad/s²，不是电机额定极限或硬实时保证。夹爪0表示闭合、1表示全开，按官方实现乘100并取整，独立发送request_set_limx_2fclaw_cmd（双侧速度100、夹持力50，无量纲）；ServoJ仍只发送16个关节角。夹爪输入应用步长与速度上限2归一化开口/秒；目标仅在变化时发送，最多跟随声明的expected_hz频率，等待ACK不阻塞关节输出；ACK不代表到位。原单侧gripper卡片的0～94开口限制保持原样，本流式接口按官方0～100协议执行。
 - 伺服生命周期start及已启动时info返回state=ready，stop返回state=idle；暂停状态由paused布尔字段表示，内部运行标志保持独立。公开config动作接收dry_run布尔参数，与configSchema一致；切换后暂停，需显式resume。伺服start仅订阅；pause清空目标并暂停，resume接受新目标，stop释放订阅。dry_run=true只校验、不发电机指令；切换空跑设置后需resume。200ms断流、目标过期停止后续输出。ServoJ无成功ACK，提交数不表示到位。双臂/头部/夹爪显式动作优先并暂停整路流，不自动回零。没有增加确认弹窗或持久保护文件。
 
@@ -284,10 +284,12 @@ move.duration=-1持续发送最新设定速度，直到stop_move、生命周期s
 
 订阅每条机器人连接只请求一次；启用被拒绝时不阻断关节和电池读取。仅下肢使用厂家文档3.8.8接口，上肢不发送未证实支持的接口。四元数须为4个有限数且范数在0.5～1.5内，随后归一化；零四元数、布尔值、无效值不输出。超过1秒未收到IMU或断连时省略imu_quat，不输出空数组、虚构姿态或继续发送过期值。厂家euler注释为度，但当前实测数值疑似弧度，故不使用euler转换。首次升级需刷新骨架视图，清掉旧model缓存。
 
-vyaw采用现场提供的轮足标定关系：厂家z=1.5对应22.5deg/s，因此z=vyaw/15；输入范围±22.5deg/s。此为设备使用方提供的标定，并非官方新增单位定义。原先rad/s直传换算已取消，旧45deg/s输入现在越界。duration仍为发送时长，不保证精确转角。
+vyaw采用现场提供的轮足标定关系：厂家z=1.5对应90deg/s，因此z=vyaw/60；输入范围±90deg/s。此为设备使用方提供的标定，并非官方新增单位定义。原先rad/s直传换算已取消，45deg/s现在对应厂家z=0.75。duration仍为发送时长，不保证精确转角。
 
 定时模式最后一帧的发送等待不超过剩余时长；结果附vendor_z_command、commanded_vyaw_deg_s、nonzero_frames、zero_velocity_frames、command_stream_seconds及angle_control=false，用于区分发送超时、停止延迟与物理响应。command_stream_seconds是本地非零到首个零速度的组包时段，不是测得的运动时间或转角。不自动重发失败动作。
 
 偏航排查：accepted返回vendor_z_command，Driver每次动作仅记录一条带action_id的开始日志和结束时序日志，用于识别画布/LLM多次调用；日志不是实际转角测量。当前设备2.4.6固件下45°/s、2秒约150°的反馈尚未由真实角速度/姿态数据复核，未据此写入0.6等统一补偿，未进行真机转向测试。
 
 本次转向标定结果中vendor_z_command为厂家原始z，commanded_vyaw_deg_s为卡片设定速度；不再把厂家z标为rad/s。该关系与此前45deg/s指令实测72.6deg/s的记录不一致，需在当前设备上重新实测确认，不宣称已完成物理精度验收。
+
+最新现场标定：旧映射下vyaw=22.5、duration=4实际约转360°，对应厂家z=1.5、平均90deg/s，因此当前改为z=vyaw/60，输入范围±90deg/s（厂家z仍为±1.5）。22.5deg/s改发z=0.375。该关系由单次总转角估算，包含起停过程，不宣称精确转角或稳态标定已经验证；不再采用此前z=vyaw/15关系。

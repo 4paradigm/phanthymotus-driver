@@ -9,9 +9,10 @@ from vendor import MoveError
 
 LOG = logging.getLogger('tron2')
 
-# Operator-provided wheel-foot calibration: vendor z=1.5 -> 22.5 deg/s.
-YAW_DEG_S_PER_VENDOR_UNIT = 15.0
-MAX_YAW_DEG_S = 22.5
+# Operator observation: vendor z=1.5 for 4 s produced ~360 degrees.
+# Empirical average mapping, not verified steady-state or angle feedback control.
+YAW_DEG_S_PER_VENDOR_UNIT = 60.0
+MAX_YAW_DEG_S = 90.0
 
 DIRECTIONS = {'forward':(.2,0.,0.), 'backward':(-.2,0.,0.),
               'turn_left':(0.,0.,.3), 'turn_right':(0.,0.,-.3)}
