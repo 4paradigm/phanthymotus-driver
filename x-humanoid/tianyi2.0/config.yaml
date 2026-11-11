@@ -29,6 +29,8 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  camera_rgbd:
+    enabled: true
   camera_snapshot:
     enabled: true
     output_dir: "/opt/phanthy-motus/data/images"
@@ -47,6 +49,7 @@ plugins:
     hz: 8
   camera_pointcloud:
     enabled: true
+    native_max_bytes: 20000000
     # Head camera height above the floor. The point-cloud renderer uses Y=0
     # as its grid plane, so raise the gravity-levelled cloud by this amount.
     floor_offset_m: 1.50

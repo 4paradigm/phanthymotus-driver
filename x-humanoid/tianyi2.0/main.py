@@ -330,6 +330,11 @@ class TianyiDeviceBundle:
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
             print("[bundle] CameraPlugin loaded")
 
+        if plugins_cfg.get("camera_rgbd", {}).get("enabled", False):
+            from rgbd_camera import RgbdCameraPlugin
+            self._plugins.append(RgbdCameraPlugin(plugins_cfg["camera_rgbd"], namespace, ros2))
+            print("[bundle] RgbdCameraPlugin loaded")
+
         if plugins_cfg.get("camera_snapshot", {}).get("enabled", False):
             from device import CameraSnapshotPlugin
             self._plugins.append(CameraSnapshotPlugin(
