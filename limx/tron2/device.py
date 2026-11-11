@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 
@@ -233,6 +234,35 @@ class Adapter:
             tools.append(follow_tool())
         return tools
 
+    def _skeleton_display(self):
+        """Return (state, reference_q) for the lower-limb display frame.
+
+        The frame is captured once after startup and once after a completed
+        sit_down, then held. A stand_up request switches to the live native
+        frame. Live joint samples never recalculate an existing frame.
+        """
+        if self.reader.configuration.get('mode') not in ('wheel_foot', 'sole_foot'):
+            return None, None
+        frame = getattr(self.reader, '_skeleton_display_frame', None)
+        if frame is None:
+            frame = {'state': 'captured', 'reference_q': None,
+                     'after': 0., 'source': 'startup'}
+            self.reader._skeleton_display_frame = frame
+        if frame.get('state') != 'captured':
+            return 'live', None
+        if frame.get('reference_q') is not None:
+            return 'captured', list(frame['reference_q'])
+        sample = self.reader.sample('joint_state')
+        data = sample.get('data') if sample.get('available') else None
+        q = (data or {}).get('q')
+        if (sample.get('received_at') or 0) <= frame.get('after', 0.) \
+                or not isinstance(q, list) or len(q) != 10 or any(
+                    isinstance(v, bool) or not isinstance(v, (int, float))
+                    or not math.isfinite(v) for v in q):
+            return 'pending', None
+        frame['reference_q'] = list(q)
+        return 'captured', list(q)
+
     def skeleton_configuration(self):
         profile = self.reader.configuration
         if profile.get('state') == 'pending' and self.reader.info_at is not None:
@@ -240,13 +270,9 @@ class Adapter:
             from state import configuration
             return configuration(self.reader.serial)
         if profile.get('mode') in ('wheel_foot','sole_foot'):
-            calibration = getattr(self.reader, '_startup_calibration', None)
-            if calibration is None and getattr(self.reader, 'connected', False):
-                from stand import startup_match
-                startup_match(self.reader)
-                calibration = getattr(self.reader, '_startup_calibration', None)
-            if calibration and calibration.get('accid') == self.reader.serial:
-                return {**profile, 'display_reference_q': list(calibration['reference_q'])}
+            state, reference = self._skeleton_display()
+            return {**profile, 'display_frame': state,
+                    'display_reference_q': reference}
         return profile
 
     def snapshot(self):
@@ -486,7 +512,8 @@ class Adapter:
                 profile = self.skeleton_configuration()
                 if profile.get('state') != 'pending' and (
                         profile.get('mode') not in ('wheel_foot','sole_foot') or
-                        profile.get('display_reference_q') is not None or not getattr(self.reader, 'connected', False)):
+                        profile.get('display_frame') in ('captured','live') or
+                        not getattr(self.reader, 'connected', False)):
                     break
                 await asyncio.sleep(.05)
         data = self.call(name, args)

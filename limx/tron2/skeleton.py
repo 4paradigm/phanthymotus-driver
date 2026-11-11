@@ -91,21 +91,29 @@ def lower_leg_segments(urdf, mode, q):
 
 
 @lru_cache(maxsize=16)
-def shin_aligned_model(path, mode, reference):
-    """One fixed display frame per startup reference; never rewrite live q/IMU."""
+def head_up_model(path, mode, reference):
+    """One fixed head-up display frame per captured pose; never rewrite live q/IMU.
+
+    The folded pose rests on its lower legs, so the averaged knee-to-wheel/ankle
+    direction is display down and the body stays above its supports (head up).
+    If the legs do not point below the body, keep the native head-up frame
+    instead of tipping the torso. This is a display choice, not measured
+    gravity or IMU attitude.
+    """
     urdf,_=model_content(path); segments=lower_leg_segments(urdf,mode,reference)
     vectors=[tuple(foot[i]-knee[i] for i in range(3)) for knee,foot in segments]
     total=tuple(vectors[0][i]+vectors[1][i] for i in range(3))
-    forward=_unit(total if _dot(total,total)>1e-12 else vectors[0])
-    above=tuple(-(segments[0][1][i]+segments[1][1][i])/2 for i in range(3))
-    normal=_cross(*vectors)
-    if math.sqrt(_dot(normal,normal))<1e-7:
-        normal=tuple(above[i]-forward[i]*_dot(above,forward) for i in range(3))
-        if _dot(normal,normal)<1e-12:
-            axis=min(((1.,0.,0.),(0.,1.,0.),(0.,0.,1.)),key=lambda a:abs(_dot(a,forward)))
-            normal=tuple(axis[i]-forward[i]*_dot(axis,forward) for i in range(3))
-    up=_unit(normal)
-    if _dot(up,above)<0:up=tuple(-x for x in up)
+    down=_unit(total if _dot(total,total)>1e-12 else vectors[0])
+    up=tuple(-x for x in down)
+    if _dot(up,(0.,0.,1.))<.5:
+        # Lower legs are not below the body; do not rotate the head sideways.
+        up=(0.,0.,1.)
+    forward=(1.,0.,0.)
+    projected=tuple(forward[i]-up[i]*_dot(forward,up) for i in range(3))
+    if _dot(projected,projected)<1e-9:
+        forward=(0.,1.,0.)
+        projected=tuple(forward[i]-up[i]*_dot(forward,up) for i in range(3))
+    forward=_unit(projected)
     lateral=_unit(_cross(up,forward)); forward=_cross(lateral,up)
     rotation=(forward,lateral,up)
     pitch=math.asin(max(-1.,min(1.,-rotation[2][0])))
@@ -132,7 +140,7 @@ def model(profile=None):
     urdf, revision = model_content(path)
     reference = (profile or {}).get('display_reference_q')
     if mode in ('wheel_foot','sole_foot') and reference is not None:
-        urdf, revision = shin_aligned_model(path,mode,tuple(reference))
+        urdf, revision = head_up_model(path,mode,tuple(reference))
     return {'urdf': urdf, 'model_revision': revision, 'available': True,
             'configuration': mode, 'model_id': model_id}
 

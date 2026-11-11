@@ -204,19 +204,28 @@ class Stand:
             'title':'request_'+command+'_mode','timestamp':int(after*1000),
             'guid':p['guid'],'data':{}}),5)
         self.motion_sent=True
+        if command=='stand':self._use_live_skeleton()
         stage=await self._monitor(target,after,self.PHASE_TIMEOUT,sent=True)
         self.stages.append(stage);self.pending=None
+
+    def _use_live_skeleton(self):
+        # Once the stand command is sent the lower-limb model reads in its
+        # native head-up frame; no folded display rotation is re-applied.
+        self.reader._skeleton_display_frame = {'state': 'live',
+            'reference_q': None, 'source': 'stand_up_requested'}
 
     async def _run(self, action_id):
         try:
             mode=self._read_status()['data'].get('status')
             if mode=='WALK':
+                self._use_live_skeleton()
                 self.state='verifying_standing'
                 self.stages.append(await self._monitor('WALK',time.time(),5,sent=False))
             else:
                 if mode!='STAND':
                     await self._phase('stand','STAND')
                 else:
+                    self._use_live_skeleton()
                     self.state='verifying_prepare'
                     self.stages.append(await self._monitor('STAND',time.time(),5,sent=False))
                 # Recheck immediately before changing into vendor balance/walk mode.

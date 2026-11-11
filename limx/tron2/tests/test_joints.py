@@ -16,18 +16,19 @@ ROOT=Path(__file__).resolve().parents[1]
 def adapter():
     tree=ast.parse((ROOT/'device.py').read_text())
     source=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='Adapter')
-    names={'_loco_tool','tools','call','execute_tool','snapshot','skeleton_configuration','publish_loop','_report_lower_completion'}
+    names={'_loco_tool','tools','call','execute_tool','snapshot','skeleton_configuration','_skeleton_display','publish_loop','_report_lower_completion'}
     methods=[n for n in source.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name in names]
     metadata=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='metadata_properties')
     description=next(n.value for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='DESCRIPTIONS' for t in n.targets))
-    ns={'asyncio':asyncio,'time':__import__('time'),'model':model,'form_number':form_number,'Path':Path,'os':__import__('os'),
+    ns={'asyncio':asyncio,'time':__import__('time'),'math':math,'model':model,'form_number':form_number,'Path':Path,'os':__import__('os'),
         'CAMERA_SOURCES':{},'GRIPPER_SIDES':{},'DIRECTIONS':{},'PREVIEW_TOPIC':'/limx_tron2/joint_state/preview',
         'DESCRIPTIONS':ast.literal_eval(description),'battery_stream':battery_stream,'joints_stream':joints_stream,'skeleton_stream':skeleton_stream,
         'SENSOR_TOPICS':{'battery':'/limx_tron2/state/battery','joints':'/limx_tron2/state/joints'}}
     cls=ast.ClassDef(name='Adapter',bases=[],keywords=[],body=methods,decorator_list=[])
     exec(compile(ast.fix_missing_locations(ast.Module(body=[metadata,cls],type_ignores=[])),'driver_methods','exec'),ns)
     a=ns['Adapter']();a._lower_stopping=False;a.enabled=['loco_leg','joints','battery']
-    a.reader=SimpleNamespace(configuration=configuration('WF_TRON2A_TEST'),info_at=1)
+    a.reader=SimpleNamespace(configuration=configuration('WF_TRON2A_TEST'),info_at=1,
+        sample=lambda name:{'available':False,'received_at':None,'data':None})
     a.stand=SimpleNamespace(dispatch=Mock(return_value={'action_id':'up'}),info=lambda:{'state':'idle'})
     a.sit_down=SimpleNamespace(dispatch=Mock(return_value={'action_id':'down'}),info=lambda:{'state':'idle'})
     a.walk=SimpleNamespace(dispatch_velocity=Mock(return_value={'action_id':'move'}),stop_move=AsyncMock(return_value={'state':'stopped'}),
@@ -157,56 +158,145 @@ class ReconnectionIdentityTests(unittest.TestCase):
 
 
 class DisplayFrameTests(unittest.TestCase):
-    def test_startup_shins_are_horizontal_and_live_joint_values_unchanged(self):
-        from skeleton import lower_leg_segments, _axis_rotation, _multiply, _dot
-        references = [
-            [2.6029,-.2599,.2821,-2.6215,.48,2.579,.2611,.0374,-2.6208,-.61],
-            [1.1,-.1,.17,-2.6,0.,1.15,.12,-.15,-2.59,0.]]
+    REFERENCE=[2.6029,-.2599,.2821,-2.6215,.48,2.579,.2611,.0374,-2.6208,-.61]
+
+    def rotation(self, urdf):
+        from skeleton import _axis_rotation, _multiply
+        root=ET.fromstring(urdf)
+        roll,pitch,yaw=map(float,root.find(
+            "joint[@name='display_world_Joint']/origin").get('rpy').split())
+        rotation=((1.,0.,0.),(0.,1.,0.),(0.,0.,1.))
+        for axis,angle in (((0,0,1),yaw),((0,1,0),pitch),((1,0,0),roll)):
+            rotation=_multiply(rotation,_axis_rotation(axis,angle))
+        return rotation
+
+    def test_folded_reference_keeps_head_up_and_support_legs_below(self):
+        from skeleton import lower_leg_segments, _dot
         for mode in ('wheel_foot', 'sole_foot'):
-            for q in references:
-                profile={'mode': mode, 'display_reference_q': q}
-                rendered=model(profile);root=ET.fromstring(rendered['urdf'])
-                origin=root.find("joint[@name='display_world_Joint']/origin")
-                roll,pitch,yaw=map(float,origin.get('rpy').split())
-                rotation=((1.,0.,0.),(0.,1.,0.),(0.,0.,1.))
-                for axis,angle in (((0,0,1),yaw),((0,1,0),pitch),((1,0,0),roll)):
-                    rotation=_multiply(rotation,_axis_rotation(axis,angle))
-                for knee,foot in lower_leg_segments(rendered['urdf'],mode,q):
-                    self.assertAlmostEqual(_dot(rotation[2],tuple(foot[i]-knee[i] for i in range(3))),0.,places=8)
-                # Changing live q never recalculates the startup display frame.
-                serial='WF_TRON2A_TEST' if mode=='wheel_foot' else 'SF_TRON2A_TEST'
-                raw=sample(serial,10);raw['data']['q']=list(q)
-                packet=joints_stream(raw,profile)
-                self.assertEqual([j['q'] for j in packet['joints']],q)
-                raw['data']['q']=[0.]*10
-                joints_stream(raw,profile)
-                self.assertEqual(model(profile)['model_revision'],rendered['model_revision'])
-                self.assertEqual(len([j for j in root.findall('joint') if j.get('type')!='fixed']),10)
+            profile={'mode': mode, 'display_reference_q': self.REFERENCE}
+            rendered=model(profile);root=ET.fromstring(rendered['urdf'])
+            rotation=self.rotation(rendered['urdf'])
+            # Native +Z is the torso/head direction; the support legs point down.
+            self.assertGreater(_dot(rotation[2],(0.,0.,1.)),.9)
+            segments=lower_leg_segments(rendered['urdf'],mode,tuple(self.REFERENCE))
+            total=tuple(sum(f[i]-k[i] for k, f in segments) for i in range(3))
+            self.assertLess(_dot(rotation[2],total),0.)
+            self.assertNotEqual(rendered['model_revision'],
+                model({'mode':mode})['model_revision'])
+            # Changing live q never recalculates the captured display frame.
+            serial='WF_TRON2A_TEST' if mode=='wheel_foot' else 'SF_TRON2A_TEST'
+            raw=sample(serial,10);raw['data']['q']=list(self.REFERENCE)
+            self.assertEqual([j['q'] for j in joints_stream(raw,profile)['joints']],
+                self.REFERENCE)
+            raw['data']['q']=[0.]*10
+            joints_stream(raw,profile)
+            self.assertEqual(model(profile)['model_revision'],rendered['model_revision'])
+            self.assertEqual(len([j for j in root.findall('joint') if j.get('type')!='fixed']),10)
+
+    def test_horizontal_legs_do_not_tip_the_head_sideways(self):
+        q=[1.1,-.1,.17,-2.6,0.,1.15,.12,-.15,-2.59,0.]
+        root=ET.fromstring(model({'mode':'wheel_foot','display_reference_q':q})['urdf'])
+        rpy=[float(v) for v in root.find(
+            "joint[@name='display_world_Joint']/origin").get('rpy').split()]
+        self.assertTrue(all(abs(v)<1e-12 for v in rpy))
 
     def test_unidentified_reference_does_not_use_head_up_rotation(self):
         root=ET.fromstring(model({'mode':'wheel_foot'})['urdf'])
         self.assertEqual(root.find("joint[@name='display_world_Joint']/origin").get('rpy'),'0 0 0')
 
-class StartupModelIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_model_request_captures_preparation_once_then_keeps_original_live_output(self):
+class DisplayLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    FOLDED=[2.6029,-.2599,.2821,-2.6215,.48,2.579,.2611,.0374,-2.6208,-.61]
+
+    def make(self, status='SIT', q=None):
         from device import Adapter
         from vendor import RobotReader
         from state import joint_state
         import time
-        settings={'serial':'','enabled_cards':['joints'],'stale_after_seconds':5,
+        settings={'serial':'','enabled_cards':['joints','loco_leg'],'stale_after_seconds':5,
                   'poll_interval_seconds':.5,'response_timeout_seconds':.2}
         reader=RobotReader(settings)
         reader.accept_info({'accid':'WF_TRON2A_TEST','data':{'sw_version':'test-version',
-            'status':'SIT','imu':'OK','motor':'OK','working_mode':'developer_mode',
+            'status':status,'imu':'OK','motor':'OK','working_mode':'developer_mode',
             'working_mode_valid':True,'collision_enable':True,'collision_enable_valid':True,
             'compliant_enable':False,'compliant_enable_valid':True}})
-        q=[2.6,0.,0.,-2.6,0.,2.6,0.,0.,-2.6,0.]
-        reader.joints=joint_state({'result':'success','timestamp':1.,'q':q,'dq':[0.]*10,'tau':[0.]*10,'names':[]})
+        q=list(q or self.FOLDED)
+        reader.joints=joint_state({'result':'success','timestamp':1.,'q':q,
+            'dq':[0.]*10,'tau':[0.]*10,'names':[]})
         reader.joints_at=time.monotonic();reader.joints_received=time.time()
-        adapter=Adapter(lambda *args:None,settings,reader=reader)
-        first=await adapter.execute_tool('model',{})
-        self.assertEqual(reader._startup_calibration['reference_q'],q)
-        reader.info['status']='WALK';reader.joints['q']=[0.]*10
-        second=await adapter.execute_tool('model',{})
-        self.assertEqual(first,second)
-        self.assertEqual([j['q'] for j in joints_stream(reader.sample('joint_state'),adapter.skeleton_configuration())['joints']],[0.]*10)
+        return reader, Adapter(lambda *args:None,settings,reader=reader)
+
+    async def test_startup_captures_one_frame_and_holds_it(self):
+        import time
+        reader,adapter=self.make()
+        first=adapter.skeleton_configuration()
+        self.assertEqual(first['display_frame'],'captured')
+        self.assertEqual(first['display_reference_q'],self.FOLDED)
+        rendered=model(first)
+        reader.joints['q']=[0.]*10;reader.joints_at=time.monotonic()
+        reader.joints_received=time.time()+10
+        second=adapter.skeleton_configuration()
+        self.assertEqual(second['display_reference_q'],self.FOLDED)
+        self.assertEqual(model(second)['model_revision'],rendered['model_revision'])
+
+    async def test_model_request_waits_for_the_first_lower_body_frame(self):
+        import time
+        from state import joint_state
+        reader,adapter=self.make()
+        reader.joints_at=reader.joints_received=None
+        async def feed():
+            await asyncio.sleep(.01)
+            reader.joints=joint_state({'result':'success','timestamp':1.,
+                'q':self.FOLDED,'dq':[0.]*10,'tau':[0.]*10,'names':[]})
+            reader.joints_at=time.monotonic();reader.joints_received=time.time()
+        feeder=asyncio.create_task(feed())
+        rendered=await adapter.execute_tool('model',{})
+        await feeder
+        self.assertEqual(adapter.skeleton_configuration()['display_frame'],'captured')
+        self.assertEqual(rendered['urdf'],model(adapter.skeleton_configuration())['urdf'])
+        self.assertNotEqual(rendered['urdf'],model({'mode':'wheel_foot'})['urdf'])
+
+    async def test_stand_request_switches_to_live_native_frame(self):
+        import time
+        reader,adapter=self.make()
+        adapter.skeleton_configuration()
+        async def send(packet):
+            reader.info['status']='STAND' if packet['title']=='request_stand_mode' else 'WALK'
+            reader.info_at=time.monotonic();reader.info_received=time.time()
+        reader.ws=SimpleNamespace(closed=False,send_json=AsyncMock(side_effect=send))
+        adapter.stand.POLL_SECONDS=.001
+        adapter.stand.dispatch()
+        await asyncio.wait_for(adapter.stand.task,1)
+        profile=adapter.skeleton_configuration()
+        self.assertEqual(profile['display_frame'],'live')
+        self.assertIsNone(profile['display_reference_q'])
+        self.assertEqual(model(profile)['urdf'],model({'mode':'wheel_foot'})['urdf'])
+
+    async def test_sit_completion_recaptures_fresh_folded_frame_once(self):
+        import time
+        reader,adapter=self.make(status='WALK')
+        reader._skeleton_display_frame={'state':'live','reference_q':None,
+            'source':'stand_up_requested'}
+        async def send(packet):
+            if packet['title']=='request_sitdown':
+                reader.info['status']='DAMPING'
+                reader.info_at=time.monotonic();reader.info_received=time.time()
+        reader.ws=SimpleNamespace(closed=False,send_json=AsyncMock(side_effect=send))
+        adapter.sit_down.STOP_SECONDS,adapter.sit_down.BRAKE_INTERVAL=.005,.001
+        adapter.sit_down.POLL_SECONDS=.001
+        adapter.sit_down.dispatch()
+        await asyncio.wait_for(adapter.sit_down.task,1)
+        self.assertEqual(reader._skeleton_display_frame['source'],'sit_down_completed')
+        self.assertEqual(adapter.skeleton_configuration()['display_frame'],'pending')
+        folded=[2.5,-.2,.2,-2.3,.3,2.5,.2,.03,-2.3,-.4]
+        from state import joint_state
+        reader.joints=joint_state({'result':'success','timestamp':2.,'q':folded,
+            'dq':[0.]*10,'tau':[0.]*10,'names':[]})
+        reader.joints_at=time.monotonic();reader.joints_received=time.time()
+        captured=adapter.skeleton_configuration()
+        self.assertEqual(captured['display_frame'],'captured')
+        self.assertEqual(captured['display_reference_q'],folded)
+        rendered=model(captured)
+        reader.joints['q']=[0.]*10;reader.joints_received=time.time()+10
+        self.assertEqual(adapter.skeleton_configuration()['display_reference_q'],folded)
+        self.assertEqual(model(adapter.skeleton_configuration())['model_revision'],
+            rendered['model_revision'])

@@ -125,6 +125,12 @@ class SitDown(Stand):
                          'phase':self.state,'stages':list(self.stages),'automatic_retry':False}
             status='error'
         finally:self.pending=None
+        if status=='completed':
+            # Capture the folded display frame once from feedback received after
+            # this sit completed. Until then the skeleton keeps the live frame.
+            self.reader._skeleton_display_frame = {'state': 'captured',
+                'reference_q': None, 'after': time.time(),
+                'source': 'sit_down_completed'}
         self.state='reporting'
         delivered=await self.report('sit_down',action_id,status,self.result)
         self.state='completed' if delivered and status=='completed' else 'unconfirmed'

@@ -111,6 +111,7 @@ class RobotReader:
     def __init__(self, settings):
         self.settings = settings
         self._startup_calibration = None
+        self._skeleton_display_frame = None
         self.configuration = {'state': 'pending', 'mode': 'unknown',
                               'fixed_for_process': True, 'enforces_card_restrictions': False}
         self.connected = False
@@ -166,6 +167,7 @@ class RobotReader:
 
     def disconnect(self, reason):
         self._startup_calibration = None
+        self._skeleton_display_frame = None
         if self.walk is not None:self.walk.disconnect()
         if self.sit_down is not None:
             self.sit_down.disconnect()
