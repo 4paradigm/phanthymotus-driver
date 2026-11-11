@@ -64,21 +64,26 @@ def _frame_intrinsics(frame):
 
 
 def _report(status_queue, status):
+    snapshot = {
+        "error": status.get("error"),
+        "last_frame": dict(status["last_frame"]),
+        "frames": dict(status["frames"]),
+        "intrinsics": dict(status["intrinsics"]),
+        "sdk_timestamp_ms": dict(status["sdk_timestamp_ms"]),
+        "depth_scale_m": status.get("depth_scale_m"),
+        "device_name": status.get("device_name"),
+    }
     try:
-        status_queue.put_nowait({
-            "error": status.get("error"),
-            "last_frame": dict(status["last_frame"]),
-            "frames": dict(status["frames"]),
-            "intrinsics": dict(status["intrinsics"]),
-            "sdk_timestamp_ms": dict(status["sdk_timestamp_ms"]),
-            "depth_scale_m": status.get("depth_scale_m"),
-            "device_name": status.get("device_name"),
-        })
+        status_queue.put_nowait(snapshot)
     except queue.Full:
-        # Never block image acquisition waiting for a slow info() caller.
+        # Latest-only status: never block image acquisition on a slow info().
         try:
             status_queue.get_nowait()
         except queue.Empty:
+            pass
+        try:
+            status_queue.put_nowait(snapshot)
+        except queue.Full:
             pass
 
 
