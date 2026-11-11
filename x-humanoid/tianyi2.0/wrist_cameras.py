@@ -323,7 +323,7 @@ class WristCameraSession:
                     error = "D405 capture worker exited"
                 if not error and now-requested >= STARTUP_SECONDS and not fresh:
                     error = "D405 not supplying fresh frames"
-                state = "error" if error else ("running" if fresh else "starting")
+                state = "error" if error else ("running" if fresh else "loading")
             else:
                 state = "unconfigured" if not self.serial else "idle"
                 error = None
@@ -339,6 +339,7 @@ class WristCameraSession:
                 vendor={"sdk_distortion": intr["sdk_distortion"]} if intr else {})
             return {
                 "state": state, "error": error, "side": self.side, "serial": self.serial or None,
+                "message": "Waiting for D405 frames" if state == "loading" else "",
                 "channel": channel, "fresh": fresh, "width": WIDTH, "height": HEIGHT, "fps": FPS,
                 "format": FORMATS[channel], "depth_scale_m": self._status.get("depth_scale_m")
                 if channel == "depth" else None,

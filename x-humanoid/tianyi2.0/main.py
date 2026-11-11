@@ -765,7 +765,7 @@ def make_handler():
                         }
                         if (isinstance(result, dict)
                                 and (result.get("state") == "error"
-                                     or "error" in result)):
+                                     or result.get("error"))):
                             tool_result["isError"] = True
                         ok(tool_result)
                 else:

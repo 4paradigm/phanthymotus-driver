@@ -33,6 +33,12 @@ Each D405 is owned by **one** `pyrealsense2` process; the RGB and depth
 cards for that wrist share its RGB8/Z16 640x480 at 15 FPS pipeline.
 Activating one does not activate the other card's output. Stopping one
 channel preserves the other; stopping both releases the USB device.
+Dragging a card onto the canvas queries its metadata and subscribes its preview;
+it does not start acquisition. Click **Start Intelligent Control** to start the
+cards in the project. A wrist card reports `loading` while waiting for fresh
+frames, `running` once they arrive, and `error` on worker failure or a 12-second
+first-frame timeout. Agent Core polls `info` while a card is `loading`.
+
 The workers publish directly to domain 42 under the loopback-only
 `/opt/phanthy-motus/dds-local.xml` FastDDS profile; they do not join the
 vendor domain-0 participant or modify head Orbbec services.

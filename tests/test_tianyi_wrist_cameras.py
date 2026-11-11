@@ -159,7 +159,7 @@ def test_rapid_channel_switches_preserve_final_selection(monkeypatch, final_chan
 
     s = session()
     monkeypatch.setattr(s._ctx, "Process", CaptureProcess)
-    s.start("rgb")
+    assert s.start("rgb")["state"] == "loading"
     worker = s._proc
     selection = worker.args[4]
     try:
@@ -199,3 +199,71 @@ def test_capture_worker_protects_python_logs_before_initialization(monkeypatch, 
                           session()._ctx.Value("B", 1), threading.Event(), status)
     assert "Missing loopback-only DDS profile" in status.get_nowait()["error"]
     assert capfd.readouterr().out == "worker diagnostic\n"
+
+
+@pytest.mark.parametrize("now,last_frame,expected", [
+    (100.1, None, "loading"),
+    (100.2, 100.15, "running"),
+    (112.0, None, "error"),
+])
+def test_first_frame_wait_settles_to_running_or_timeout(monkeypatch, now, last_frame, expected):
+    from types import SimpleNamespace
+
+    s = session()
+    s._proc = SimpleNamespace(is_alive=lambda: True)
+    s._wanted = {"rgb"}
+    s._requested_at = {"rgb": 100.0}
+    if last_frame is not None:
+        s._status = {"last_frame": {"rgb": last_frame}}
+    monkeypatch.setattr(wrist.time, "monotonic", lambda: now)
+    info = s.info("rgb")
+    assert info["state"] == expected
+    if expected == "loading":
+        assert info["error"] is None
+        assert info["message"]
+    elif expected == "running":
+        assert info["fresh"] is True
+        assert info["error"] is None
+    else:
+        assert info["error"] == "D405 not supplying fresh frames"
+
+
+def test_capture_failure_is_not_hidden_by_loading():
+    from types import SimpleNamespace
+
+    s = session()
+    s._proc = SimpleNamespace(is_alive=lambda: True)
+    s._wanted = {"depth"}
+    s._requested_at = {"depth": wrist.time.monotonic()}
+    s._status = {"error": "D405 device is busy"}
+    info = s.info("depth")
+    assert info["state"] == "error"
+    assert info["error"] == "D405 device is busy"
+
+
+def test_loading_transitions_when_worker_reports_first_frame(monkeypatch):
+    from types import SimpleNamespace
+
+    s = session()
+    s._proc = SimpleNamespace(is_alive=lambda: True)
+    s._wanted = {"depth"}
+    s._requested_at = {"depth": 100.0}
+    monkeypatch.setattr(wrist.time, "monotonic", lambda: 101.0)
+    assert s.info("depth")["state"] == "loading"
+    s._status = {"last_frame": {"depth": 100.9}, "frames": {"depth": 1}}
+    info = s.info("depth")
+    assert info["state"] == "running"
+    assert info["fresh"] is True
+    assert info["frames_published"] == 1
+
+
+def test_worker_exit_during_loading_reports_error():
+    from types import SimpleNamespace
+
+    s = session()
+    s._proc = SimpleNamespace(is_alive=lambda: False)
+    s._wanted = {"rgb"}
+    s._requested_at = {"rgb": wrist.time.monotonic()}
+    info = s.info("rgb")
+    assert info["state"] == "error"
+    assert info["error"] == "D405 capture worker exited"
