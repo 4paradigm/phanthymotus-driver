@@ -201,3 +201,45 @@ Ubuntu-22.04/WSL、Python3.10.12、pytest6.2.5、numpy1.21.5：上述完整命�
 若 wall 与单调增量明显分离，核对宿主机校时。
 VO 使用独立的 epoch 和 ClockMap，其告警不能单独证明与 Snapshot 同源。
 Snapshot 保持原阈值和会话内故障锁定，仍由新的相机采集会话建立基线。
+
+
+### 第二轮元数据窗口
+
+同一采集进程通过固定容量 deque(maxlen=8) 保存最近 8 对帧的标量元数据。
+首次被锁定的时钟故障触发输出：最多 8 对 before、1 对 trigger、8 对 after。
+已故障的 Snapshot 路径仍立即拒绝请求，latest 和已接受帧计数不再推进。
+after 采样结束后停止 SDK 诊断读取，清空保留记录；不自动恢复，不改变 epoch。
+
+每对帧输出 host、两条 source、两条 aligned JSON，共最多 85 条采样记录，加 begin/end
+最多 87 条窗口记录。原有单条 clock_fault 保留。每条以 epoch、sequence、phase 关联。
+如果进程在 after 收集完之前退出，缺少 end 就表示窗口不完整，不能当作完整证据。
+
+frame timestamp 单位 ms，host/wait 时间单位 ns。SDK FRAME_COUNTER 单位 count，
+FRAME_TIMESTAMP/SENSOR_TIMESTAMP 按 SDK 声明为 us，TIME_OF_ARRIVAL 为 ms。
+BACKEND_TIMESTAMP 的头文件声明为 us，但后端实现还涉及平台时间转换，因此保留原始值
+与 sdk_declared_unit，不对其做单位转换。所有 delta 保持对应字段原始单位，
+跨 SDK timestamp domain 的相邻增量和跨流差值记为 null。
+depth_minus_rgb_ms 使用 Depth 减 RGB。原始帧和 aligned 帧分别读取并比较继承关系。
+aligned 检查提供来源关系证据，不能作为独立时钟正确性证明。
+
+不支持字段输出 unsupported；支持查询失败为 support_error；读取失败为 read_error；
+SDK 枚举不可用为 api_unavailable；非有限值为 invalid_value。value=null，保留支持状态，
+不记录异常原文、不用零或合成时间代替。不会访问 get_data 或记录序列号。
+
+视觉里程计只新增一次 [raw_rgbd] clock_residual。该日志在 ClockMap 原有残差校验抛错时
+记录实际 mapped_ns、received_wall_ns、offset_ns、residual_ns（wall 减 mapped），以及
+stream、帧号和 VO 自身 epoch。原异常继续抛出，原有丢弃和日志限频路径不变。
+用同一原始流帧号关联两条路径，不能直接比较两个消费者各自生成的 epoch。
+ClockMap 算法、阈值和 global_time 选项均未修改。
+
+一次授权启动需保留从相机启动到窗口 end 的容器日志。若原始 FRAME_TIMESTAMP 平稳、
+而 get_timestamp/global_time 跳变，优先调查 SDK 映射；若原始元数据同步跳变，
+优先调查设备/UVC/固件。读取缺失、回绕、缓存和跨流不同步仍需结合完整前后窗口判断。
+诊断有固定的 SDK 读取和故障时输出开销，ARM64 上的耗时与日志保留仍需实测。
+
+
+本轮本地验证（WSL Ubuntu 22.04，Python 3.10.12）：
+Snapshot + VO 输入专项 47 passed in 8.16s；完整 Bumi 回归 413 passed in 63.58s，
+0 failed、0 skipped。AST 和 git diff --check HEAD 通过。
+完整回归沿用上文同一 Bumi 文件清单和固定 Agent Core 测试源环境。
+上述开发验证阶段没有推送或构建镜像，也没有接触相机或部署到机器人。

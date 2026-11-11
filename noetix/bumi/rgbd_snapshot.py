@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 from copy import deepcopy
+from collections import deque
 import hashlib
 import json
 import math
@@ -102,6 +103,158 @@ def validate_pair(meta, baseline):
     return skew
 
 
+class ClockDiagnostics:
+    """Eight pre-fault pairs, one trigger, eight post-fault pairs; no pixels."""
+    METADATA = {
+        'frame_counter': 'count', 'frame_timestamp': 'us', 'sensor_timestamp': 'us',
+        'backend_timestamp': 'us', 'time_of_arrival': 'ms',
+    }
+
+    def __init__(self, epoch, metadata_enum=None):
+        if metadata_enum is None:
+            try:
+                import pyrealsense2 as rs
+                metadata_enum = getattr(rs, 'frame_metadata_value', None)
+            except ImportError:
+                pass
+        self.epoch, self.metadata_enum = epoch, metadata_enum
+        self.before = deque(maxlen=8)
+        self.previous = None
+        self.sequence = 0
+        self.remaining = None
+
+    @staticmethod
+    def read(getter):
+        try:
+            value = getter()
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                return {'status': 'invalid_value', 'value': None}
+            return {'status': 'ok', 'value': value}
+        except Exception:
+            return {'status': 'read_error', 'value': None}
+
+    def frame(self, frame):
+        if not frame:
+            return {'status': 'missing_frame'}
+        values = {
+            'timestamp_ms': self.read(frame.get_timestamp),
+            'frame_number': self.read(frame.get_frame_number),
+        }
+        try:
+            values['domain'] = str(frame.get_frame_timestamp_domain()).rsplit('.', 1)[-1][:64]
+            values['domain_status'] = 'ok'
+        except Exception:
+            values['domain'] = None
+            values['domain_status'] = 'read_error'
+        for name, unit in self.METADATA.items():
+            item = {'supported': None, 'status': 'api_unavailable', 'value': None,
+                    'sdk_declared_unit': unit}
+            token = getattr(self.metadata_enum, name, None)
+            if token is not None:
+                try:
+                    item['supported'] = bool(frame.supports_frame_metadata(token))
+                    item['status'] = 'unsupported'
+                    if item['supported']:
+                        item.update(self.read(lambda: frame.get_frame_metadata(token)))
+                except Exception:
+                    item['status'] = 'support_error'
+            values[name] = item
+        return values
+
+    @staticmethod
+    def difference(current, previous):
+        if current.get('status') != 'ok' or previous.get('status') != 'ok':
+            return None
+        value = current['value'] - previous['value']
+        return value if math.isfinite(value) else None
+
+    def sample(self, source, aligned, wait_window_ns):
+        if self.remaining == 0:
+            return None
+        self.sequence += 1
+        sample = {'sequence': self.sequence, 'wall_ns': time.time_ns(),
+                  'monotonic_ns': time.monotonic_ns(),
+                  'wait_start_ns': wait_window_ns[0] if wait_window_ns else None,
+                  'wait_end_ns': wait_window_ns[1] if wait_window_ns else None}
+        output = {}
+        for key, getter in (('rgb', 'get_color_frame'), ('depth', 'get_depth_frame')):
+            try:
+                item = self.frame(getattr(source, getter)())
+            except Exception:
+                item = {'status': 'read_error'}
+            try:
+                result = self.frame(getattr(aligned, getter)())
+            except Exception:
+                result = {'status': 'read_error'}
+            prior = self.previous.get(key, {}) if self.previous else {}
+            prior_aligned = self.previous['aligned'][key]['frame'] if self.previous else {}
+            for frame, previous in ((item, prior), (result, prior_aligned)):
+                frame['delta'] = {}
+                for name in ('timestamp_ms', 'frame_number', *self.METADATA):
+                    value = self.difference(frame.get(name, {}), previous.get(name, {}))
+                    if name == 'timestamp_ms' and (frame.get('domain') is None
+                                                   or frame.get('domain') != previous.get('domain')):
+                        value = None
+                    frame['delta'][name] = value
+            sample[key] = item
+            output[key] = {'frame': result, 'inherits': {
+                name: (result.get(name, {}).get('value') == item.get(name, {}).get('value')
+                       if result.get(name, {}).get('status') == item.get(name, {}).get('status') == 'ok'
+                       else None)
+                for name in ('timestamp_ms', 'frame_number', *self.METADATA)}}
+            output[key]['inherits']['domain'] = (
+                result.get('domain') == item.get('domain') if item.get('domain') is not None else None)
+        rgb, depth = sample['rgb'], sample['depth']
+        sample['depth_minus_rgb_ms'] = (
+            self.difference(depth.get('timestamp_ms', {}), rgb.get('timestamp_ms', {}))
+            if rgb.get('domain') is not None and rgb.get('domain') == depth.get('domain') else None)
+        sample['host_delta_ns'] = {
+            key: (sample[key] - self.previous[key]
+                  if self.previous and sample[key] is not None and self.previous[key] is not None
+                  else None)
+            for key in ('wall_ns', 'monotonic_ns', 'wait_start_ns', 'wait_end_ns')}
+        sample['aligned'] = output
+        self.previous = sample
+        return sample
+
+    def emit(self, **record):
+        try:
+            print('[rgbd_snapshot] clock_window ' + json.dumps(
+                {'epoch': self.epoch, **record}, allow_nan=False, separators=(',', ':')), flush=True)
+        except (OSError, ValueError):
+            pass
+
+    def emit_sample(self, sample, phase):
+        shared = {'sequence': sample['sequence'], 'phase': phase}
+        self.emit(kind='host', **shared, **{key: sample[key] for key in (
+            'wall_ns', 'monotonic_ns', 'wait_start_ns', 'wait_end_ns', 'depth_minus_rgb_ms', 'host_delta_ns')})
+        for stream in ('rgb', 'depth'):
+            self.emit(kind='source', **shared, stream=stream, **sample[stream])
+        # Split aligned streams too, so metadata cannot exceed logsafe's line cap.
+        for stream in ('rgb', 'depth'):
+            self.emit(kind='aligned', **shared, stream=stream, **sample['aligned'][stream])
+
+    def observe(self, sample, fault):
+        if sample is None:
+            return
+        if self.remaining is None:
+            if not fault:
+                self.before.append(sample)
+                return
+            self.remaining = 8
+            self.emit(kind='begin', code=fault[0], pre_count=len(self.before), post_limit=8)
+            for previous in self.before:
+                self.emit_sample(previous, 'before')
+            self.before.clear()
+            self.emit_sample(sample, 'trigger')
+        elif self.remaining > 0:
+            self.emit_sample(sample, 'after')
+            self.remaining -= 1
+            if self.remaining == 0:
+                self.emit(kind='end', post_count=8)
+                self.previous = None
+
+
 class SnapshotProducer:
     """Camera-loop hook. Metadata is observed even when no consumer is requesting.
 
@@ -119,6 +272,7 @@ class SnapshotProducer:
         self.clock_fault = None
         self.latest_wait_end_ns = None
         self.observed_pairs = 0
+        self.diagnostics = ClockDiagnostics(self.epoch)
         self.outbox = queue.Queue(maxsize=1)
         self.closed = threading.Event()
         self.sender = threading.Thread(target=self._send, daemon=True, name='rgbd-snapshot-send')
@@ -200,8 +354,13 @@ class SnapshotProducer:
             pass  # Failure to log must not replace the clock error.
 
     def observe(self, source_frames, aligned_frames, *, wait_window_ns=None):
-        if self.closed.is_set() or self.clock_fault:
+        if self.closed.is_set():
             return
+        if self.clock_fault:
+            sample = self.diagnostics.sample(source_frames, aligned_frames, wait_window_ns)
+            self.diagnostics.observe(sample, self.clock_fault)
+            return  # Diagnostic samples cannot update the accepted baseline.
+        sample = None
         try:
             rgb, depth = source_frames.get_color_frame(), source_frames.get_depth_frame()
             if not rgb or not depth:
@@ -209,6 +368,7 @@ class SnapshotProducer:
             meta = camera_metadata(rgb, depth, epoch=self.epoch,
                                    depth_scale=self.depth_scale, received_ns=time.time_ns())
             meta['source'] = self.source
+            sample = self.diagnostics.sample(source_frames, aligned_frames, wait_window_ns)
             if self.latest:
                 host_delta_ms = (meta['received_monotonic_ns'] - self.latest['received_monotonic_ns'])/1e6
                 # A delayed old frame can otherwise look like progress after a reset.
@@ -274,6 +434,8 @@ class SnapshotProducer:
                 self._reply({'request_id': self.pending['request_id'],
                              'error': getattr(exc, 'code', 'INVALID_PAIR'), 'message': str(exc)})
             self.pending = None
+        finally:
+            self.diagnostics.observe(sample, self.clock_fault)
 
     def close(self):
         self.closed.set()

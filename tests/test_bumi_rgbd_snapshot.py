@@ -754,3 +754,125 @@ def test_stop_after_rename_before_commit_cleans_published_directory(harness, mon
     assert finish(h, ack, status='cancelled')['code'] == 'CANCELLED'
     assert list((h.output/'rgbd').iterdir()) == []
     assert h.card.dispatch('stop', {})['rgbd_cancel_requested'] is False
+
+
+class MetadataFrame(Frame):
+    def supports_frame_metadata(self, token):
+        return token != 'backend_timestamp'
+
+    def get_frame_metadata(self, token):
+        if token == 'sensor_timestamp':
+            raise RuntimeError('private SDK error must not be logged')
+        return self.number if token == 'frame_counter' else self.stamp * 1000
+
+    def get_data(self):
+        raise AssertionError('Diagnostics must never read pixels')
+
+
+def diagnostic_pair(number, stamp=None):
+    pair = frames(number, stamp)
+    return NS(get_color_frame=lambda: MetadataFrame(
+        number, pair.get_color_frame().stamp, None, 'global_time'),
+        get_depth_frame=lambda: MetadataFrame(
+            number, pair.get_depth_frame().stamp, None, 'global_time'))
+
+
+def diagnostic_enum():
+    from noetix.bumi.rgbd_snapshot import ClockDiagnostics
+    return NS(**{name: name for name in ClockDiagnostics.METADATA})
+
+
+def test_metadata_diagnostics_status_deltas_and_alignment():
+    from noetix.bumi.rgbd_snapshot import ClockDiagnostics
+
+    diag = ClockDiagnostics('test-epoch', diagnostic_enum())
+    pair = diagnostic_pair(1)
+    first = diag.sample(pair, pair, (10, 20))
+    assert first['depth_minus_rgb_ms'] == 1
+    assert first['rgb']['frame_timestamp'] == {
+        'status': 'ok', 'value': 30000., 'supported': True, 'sdk_declared_unit': 'us'}
+    assert first['rgb']['backend_timestamp']['status'] == 'unsupported'
+    assert first['rgb']['backend_timestamp']['supported'] is False
+    assert first['rgb']['sensor_timestamp']['status'] == 'read_error'
+    assert first['rgb']['sensor_timestamp']['supported'] is True
+    assert first['rgb']['delta']['frame_timestamp'] is None
+    assert first['aligned']['depth']['inherits']['timestamp_ms'] is True
+    second = diag.sample(diagnostic_pair(2), diagnostic_pair(3), (30, 40))
+    assert second['rgb']['delta']['frame_timestamp'] == 30000
+    assert second['rgb']['delta']['timestamp_ms'] == 30
+    assert second['aligned']['rgb']['frame']['delta']['timestamp_ms'] == 60
+    assert second['aligned']['depth']['inherits']['timestamp_ms'] is False
+    assert second['aligned']['depth']['inherits']['frame_number'] is False
+    assert second['host_delta_ns']['wait_end_ns'] == 20
+
+
+def test_metadata_api_missing_and_support_query_failure_are_explicit():
+    from noetix.bumi.rgbd_snapshot import ClockDiagnostics
+
+    diag = ClockDiagnostics('test-epoch', NS())
+    pair = diagnostic_pair(1)
+    event = diag.sample(pair, pair, None)
+    assert event['wait_start_ns'] is None
+    assert event['rgb']['frame_counter']['status'] == 'api_unavailable'
+    assert event['rgb']['frame_counter']['value'] is None
+    diag.metadata_enum = diagnostic_enum()
+    frame = pair.get_color_frame()
+    def broken(_token):
+        raise RuntimeError('metadata support failed')
+    frame.supports_frame_metadata = broken
+    result = diag.frame(frame)
+    assert result['frame_counter']['status'] == 'support_error'
+    assert result['frame_counter']['supported'] is None
+
+
+def test_diagnostic_window_is_bounded_and_never_recovers_snapshot(harness, capsys):
+    from common.logsafe import MAX_LINE_BYTES
+
+    h = harness
+    producer = h.producer
+    for n in range(2, 31):
+        producer.observe(frames(n), frames(n))
+    assert len(producer.diagnostics.before) == 8
+    assert '[rgbd_snapshot] clock_window' not in capsys.readouterr().out
+    baseline = producer.latest
+    producer.observe(frames(31, stamp=5000), frames(31, stamp=5000))
+    for n in range(32, 70):
+        producer.observe(frames(n, stamp=5000+n*30), frames(n, stamp=5000+n*30))
+    assert producer.latest is baseline and producer.observed_pairs == 30
+    assert producer.diagnostics.sequence == 39
+    assert producer.diagnostics.remaining == 0
+    assert producer.diagnostics.previous is None and not producer.diagnostics.before
+    ack = h.card.dispatch('capture_rgbd', {})
+    deadline = time.monotonic() + 1
+    while h.callbacks.empty() and time.monotonic() < deadline:
+        producer.poll()
+        time.sleep(.001)
+    assert result_for(h, ack, 'error')['code'] == 'CLOCK_DISCONTINUITY'
+    prefix = '[rgbd_snapshot] clock_window '
+    output = capsys.readouterr().out
+    lines = [line for line in output.splitlines() if line.startswith(prefix)]
+    assert len(lines) == 87
+    assert all(len(line.encode()) <= MAX_LINE_BYTES for line in lines)
+    assert producer.source not in output
+    records = [json.loads(line[len(prefix):]) for line in lines]
+    assert all(record['epoch'] == producer.epoch for record in records)
+    assert records[0]['kind'] == 'begin' and records[0]['pre_count'] == 8
+    assert records[-1] == {'epoch': producer.epoch, 'kind': 'end', 'post_count': 8}
+    host = [record for record in records if record['kind'] == 'host']
+    assert [r['sequence'] for r in host] == list(range(23, 40))
+    assert [r['phase'] for r in host] == ['before']*8 + ['trigger'] + ['after']*8
+
+
+def test_diagnostic_partial_window_does_not_duplicate_fault(capsys):
+    from noetix.bumi.rgbd_snapshot import ClockDiagnostics
+
+    diag = ClockDiagnostics('epoch', diagnostic_enum())
+    pair = diagnostic_pair(1)
+    diag.observe(diag.sample(pair, pair, None), ('CLOCK_DISCONTINUITY', 'fault'))
+    diag.observe(diag.sample(pair, pair, None), ('CLOCK_DISCONTINUITY', 'fault'))
+    output = capsys.readouterr().out
+    records = [json.loads(line.split('clock_window ', 1)[1]) for line in output.splitlines()]
+    assert sum(r['kind'] == 'begin' for r in records) == 1
+    assert records[0]['pre_count'] == 0 and diag.remaining == 7
+    assert not any(r['kind'] == 'end' for r in records)
+    assert 'private SDK error' not in output
