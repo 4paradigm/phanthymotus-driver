@@ -260,3 +260,23 @@ source. Clock and physical alignment acceptance remain real-device checks;
 source declarations do not turn the unverified PR519 SLAM metadata into a
 verified clock relation. Sustained tracking and map save/reopen are pending
 the user's next test window, not established by offline source tests.
+
+### Generic RGB-D short-term compensation
+
+Perception's generic `rgbd_odometry` card supports the instance settings
+`imu_assisted=true`, `short_term_compensation=true`, `depth_geometry=true`.
+Connect the same RGB-D pair and optional camera IMU port. The driver reports
+full factory/TF sensor-origin translations in `motus.imu/1`; inspect
+`imu_status.fusion` for calibration availability. Rotation-only or unsupported
+motion sources still support the existing video/attitude modes but cannot
+provide translational compensation. No extra SDK owner or robot-specific
+fusion algorithm is added.
+
+Keep the camera still for at least0.5s of visual/IMU initialization. The
+consumer estimates camera pose using ESKF and conditionally uses observable
+depth geometry. Inertial/depth predictions are explicitly non-mapping; SLAM
+pauses during coasting/recovery. The hard visual correction timeout is1s
+and modeled position sigma limit0.10m; these are software/model thresholds,
+not measured robot accuracy. Source clock/mount identity must remain fixed.
+Only code/offline tests have been completed; hardware verification and
+deployment remain pending explicit user instruction.

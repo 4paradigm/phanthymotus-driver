@@ -107,3 +107,23 @@ SDK 先把彩色图配准到深度光学平面，再用实测深度内参对两�
 - [G1 测试目录](tests/)：音频、视觉、状态和遥操测试；[共享测试目录](../../tests/)另含 G1 SDK、连续控制和导航测试。
 
 测试环境要求和结果边界以对应测试说明为准。离线测试通过不代表设备、DDS 通信或机器人动作已验收。
+
+### Generic RGB-D short-term compensation
+
+Perception's generic `rgbd_odometry` card supports the instance settings
+`imu_assisted=true`, `short_term_compensation=true`, `depth_geometry=true`.
+Connect the same RGB-D pair and optional camera IMU port. The driver reports
+full factory/TF sensor-origin translations in `motus.imu/1`; inspect
+`imu_status.fusion` for calibration availability. Rotation-only or unsupported
+motion sources still support the existing video/attitude modes but cannot
+provide translational compensation. No extra SDK owner or robot-specific
+fusion algorithm is added.
+
+Keep the camera still for at least0.5s of visual/IMU initialization. The
+consumer estimates camera pose using ESKF and conditionally uses observable
+depth geometry. Inertial/depth predictions are explicitly non-mapping; SLAM
+pauses during coasting/recovery. The hard visual correction timeout is1s
+and modeled position sigma limit0.10m; these are software/model thresholds,
+not measured robot accuracy. Source clock/mount identity must remain fixed.
+Only code/offline tests have been completed; hardware verification and
+deployment remain pending explicit user instruction.
