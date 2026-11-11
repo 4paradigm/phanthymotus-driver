@@ -31,7 +31,7 @@ TOPICS = {name: '/limx_tron2/' + name for name in
 SENSOR_TOPICS = {'joints':'/limx_tron2/state/joints','battery':'/limx_tron2/state/battery',**TOPICS}
 DESCRIPTIONS = {
     'battery':'TRON2电池状态（只读，1Hz）：soc为剩余电量0～100%（首项）；current为有符号电流mA；cycle为非负整数充电循环数。bms_voltage为厂家原始电压读数；bms_current_valid为电流有效标志；bms_current_updated_at为厂家电流更新时间原值；bms_temp1～bms_temp5为5路温度采样原值（未确认倍率，不换算为摄氏度）。其他bms_字段按固件原名输出；不推测未公开字段语义。null表示暂无有效数据。',
-    'joints':'TRON2当前构型骨架：按厂家ACCID自动识别上肢DACH（16关节）或下肢WF/SF（10关节），发布官方关节名及q/dq/tau；使用平台原生sensor/skeleton与独立model模型资源，不伪造IMU姿态。',
+    'joints':'TRON2当前构型骨架：按厂家ACCID自动识别上肢DACH（16关节）或下肢WF/SF（10关节），发布官方关节名及q/dq/tau；使用平台原生sensor/skeleton与独立model模型资源；下肢接入厂家真实IMU四元数imu_quat（w,x,y,z），无有效姿态时省略。',
     'camera': 'TRON2 头部RGB实时画面；start连接厂家MJPEG并发布JPEG图像，stop释放连接；限10fps，不录像、不控制头部，接收时间不是测量时间（只读）',
     'camera_left': 'TRON2 左腕RGB实时画面；厂家left校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',
     'camera_right': 'TRON2 右腕RGB实时画面；厂家right校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',
@@ -651,6 +651,7 @@ class Adapter:
             'camera': self.camera.info() if 'camera' in self.enabled else None,
             'cameras': cameras,
             'configuration': dict(self.reader.configuration),
+            'imu_subscription': getattr(self.reader, 'imu_subscription', None),
             'robot_connected': self.reader.connected, 'registered_mcp_id': self.registered_id,
             'last_connection_error': self.reader.last_error,
             'round_trip_seconds': self.reader.last_round_trip, 'samples': samples}

@@ -90,42 +90,6 @@ def lower_leg_segments(urdf, mode, q):
     return segments
 
 
-@lru_cache(maxsize=16)
-def head_up_model(path, mode, reference):
-    """One fixed head-up display frame per captured pose; never rewrite live q/IMU.
-
-    The folded pose rests on its lower legs, so the averaged knee-to-wheel/ankle
-    direction is display down and the body stays above its supports (head up).
-    If the legs do not point below the body, keep the native head-up frame
-    instead of tipping the torso. This is a display choice, not measured
-    gravity or IMU attitude.
-    """
-    urdf,_=model_content(path); segments=lower_leg_segments(urdf,mode,reference)
-    vectors=[tuple(foot[i]-knee[i] for i in range(3)) for knee,foot in segments]
-    total=tuple(vectors[0][i]+vectors[1][i] for i in range(3))
-    down=_unit(total if _dot(total,total)>1e-12 else vectors[0])
-    up=tuple(-x for x in down)
-    if _dot(up,(0.,0.,1.))<.5:
-        # Lower legs are not below the body; do not rotate the head sideways.
-        up=(0.,0.,1.)
-    forward=(1.,0.,0.)
-    projected=tuple(forward[i]-up[i]*_dot(forward,up) for i in range(3))
-    if _dot(projected,projected)<1e-9:
-        forward=(0.,1.,0.)
-        projected=tuple(forward[i]-up[i]*_dot(forward,up) for i in range(3))
-    forward=_unit(projected)
-    lateral=_unit(_cross(up,forward)); forward=_cross(lateral,up)
-    rotation=(forward,lateral,up)
-    pitch=math.asin(max(-1.,min(1.,-rotation[2][0])))
-    if abs(math.cos(pitch))>1e-8:
-        roll=math.atan2(rotation[2][1],rotation[2][2]);yaw=math.atan2(rotation[1][0],rotation[0][0])
-    else:
-        roll=0.;yaw=math.atan2(-rotation[0][1],rotation[1][1])
-    root=ET.fromstring(urdf)
-    origin=root.find("joint[@name='display_world_Joint']/origin")
-    origin.set('rpy',' '.join(format(v,'.16g') for v in (roll,pitch,yaw)))
-    ET.indent(root,space='  '); text=ET.tostring(root,encoding='unicode')
-    return text,hashlib.sha256(text.encode()).hexdigest()
 
 
 def model(profile=None):
@@ -138,9 +102,6 @@ def model(profile=None):
                 'available': False, 'configuration': mode, 'model_id': None}
     model_id, path, _, _ = MODELS[mode]
     urdf, revision = model_content(path)
-    reference = (profile or {}).get('display_reference_q')
-    if mode in ('wheel_foot','sole_foot') and reference is not None:
-        urdf, revision = head_up_model(path,mode,tuple(reference))
     return {'urdf': urdf, 'model_revision': revision, 'available': True,
             'configuration': mode, 'model_id': model_id}
 
@@ -149,9 +110,8 @@ def skeleton_stream(sample, profile=None):
     status = {key: sample[key] for key in (
         'connected', 'available', 'sample_status', 'received_at',
         'reception_age_seconds', 'measurement_time_verified')}
-    # IMU orientation is not supplied by this vendor interface. Omit the
-    # optional field: [] is truthy in JS and the Motus renderer destructures
-    # it as [w,x,y,z], corrupting the model root with undefined components.
+    # The native URDF is invariant; real root orientation travels in imu_quat.
+    # Never send []: the renderer destructures it into undefined components.
     mode = selected_mode(profile)
     spec = MODELS.get(mode)
     result = {'joints': [], 'status': status, 'configuration': mode,
@@ -189,6 +149,8 @@ def skeleton_stream(sample, profile=None):
             if data[field]:
                 joint[field] = data[field][index]
         result['joints'].append(joint)
+    if data.get('imu_quat') is not None:
+        result['imu_quat'] = list(data['imu_quat'])
     return result
 
 
@@ -200,5 +162,10 @@ def joints_stream(sample, profile):
     Do not invent an IMU quaternion or motor temperature when not reported.
     """
     packet=skeleton_stream(sample,profile)
-    return {'joints':[{key:joint[key] for key in ('idx','name','q','dq','tau') if key in joint}
+    result = {'joints':[{key:joint[key] for key in ('idx','name','q','dq','tau') if key in joint}
                       for joint in packet['joints']]}
+    # Same public shape/order as R1/Go2: renderer applies this to the URDF root.
+    quat = (sample.get('data') or {}).get('imu_quat')
+    if packet['joints'] and quat is not None:
+        result['imu_quat'] = list(quat)
+    return result

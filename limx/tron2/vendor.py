@@ -116,6 +116,9 @@ class RobotReader:
                               'fixed_for_process': True, 'enforces_card_restrictions': False}
         self.connected = False
         self.serial = settings['serial'] or None
+        self.imu = None
+        self.imu_at = None
+        self.imu_subscription = None
         self.info = self.joints = None
         self.info_at = self.joints_at = None
         self.info_received = self.joints_received = None
@@ -188,6 +191,9 @@ class RobotReader:
             future = self.head_pending[1]
             if not future.done():
                 future.set_exception(MoveError('Head connection lost; result unknown, do not retry', None))
+        self.imu = None
+        self.imu_at = None
+        self.imu_subscription = None
         self.info = self.joints = None
         self.info_at = self.joints_at = None
         self.info_received = self.joints_received = None
@@ -219,6 +225,34 @@ class RobotReader:
             self.configuration['fixed_for_connection'] = True
         self.info, self.info_at, self.info_received = data, time.monotonic(), time.time()
         self.connected, self.last_error = True, None
+
+    def accept_imu(self, body):
+        """Official notify_imu: native base orientation, quaternion w,x,y,z."""
+        if body.get('accid') != self.serial:
+            return
+        data = body.get('data')
+        q = data.get('quat') if isinstance(data, dict) else None
+        if not isinstance(q, list) or len(q) != 4 or any(
+                isinstance(v, bool) or not isinstance(v, (int, float)) or
+                not math.isfinite(v) for v in q):
+            self.imu = self.imu_at = None
+            return
+        norm = math.hypot(*q)
+        if not .5 <= norm <= 1.5:
+            self.imu = self.imu_at = None
+            return
+        self.imu = [v/norm for v in q]
+        self.imu_at = time.monotonic()
+
+    async def enable_imu(self, ws):
+        # Sensor subscription only, no locomotion/mode commands. Once per WS.
+        if self.configuration.get('mode') not in ('wheel_foot', 'sole_foot'):
+            return
+        guid = str(uuid.uuid4())
+        self.imu_subscription = {'guid': guid, 'state': 'requested'}
+        await ws.send_json({'title': 'request_enable_imu', 'accid': self.serial,
+                           'guid': guid, 'timestamp': int(time.time()*1000),
+                           'data': {'enable': True}})
 
     async def receive(self, ws, deadline):
         remaining = deadline - time.monotonic()
@@ -263,6 +297,11 @@ class RobotReader:
             self.sit_down.receive(body)
         if self.stand is not None:
             self.stand.receive(body)
+        if body.get('title') == 'notify_imu':
+            self.accept_imu(body)
+        if body.get('title') == 'response_enable_imu' and self.imu_subscription and \
+                body.get('guid') == self.imu_subscription['guid'] and body.get('accid') == self.serial:
+            self.imu_subscription['state'] = 'enabled' if (body.get('data') or {}).get('result') == 'success' else 'rejected'
         if body.get('title') == 'notify_robot_info':
             self.accept_info(body)
         return body
@@ -542,7 +581,10 @@ class RobotReader:
         data = None
         if available:
             if name == 'joint_state':
-                data = self.joints
+                data = dict(self.joints)
+                if self.imu is not None and self.imu_at is not None and \
+                        time.monotonic()-self.imu_at <= min(1., self.settings['stale_after_seconds']):
+                    data['imu_quat'] = list(self.imu)
             elif name == 'robot_status':
                 data = select_fields(self.info, STATUS_FIELDS)
             elif name == 'battery_state':
@@ -566,6 +608,7 @@ class RobotReader:
                     deadline = time.monotonic() + self.settings['response_timeout_seconds']
                     while not self.connected:
                         await self.receive(ws, deadline)
+                    await self.enable_imu(ws)
                     while True:
                         started = time.monotonic()
                         await self.read_joints(ws)

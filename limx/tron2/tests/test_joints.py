@@ -181,7 +181,7 @@ class DisplayFrameTests(unittest.TestCase):
             segments=lower_leg_segments(rendered['urdf'],mode,tuple(self.REFERENCE))
             total=tuple(sum(f[i]-k[i] for k, f in segments) for i in range(3))
             self.assertLess(_dot(rotation[2],total),0.)
-            self.assertNotEqual(rendered['model_revision'],
+            self.assertEqual(rendered['model_revision'],
                 model({'mode':mode})['model_revision'])
             # Changing live q never recalculates the captured display frame.
             serial='WF_TRON2A_TEST' if mode=='wheel_foot' else 'SF_TRON2A_TEST'
@@ -253,7 +253,7 @@ class DisplayLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await feeder
         self.assertEqual(adapter.skeleton_configuration()['display_frame'],'captured')
         self.assertEqual(rendered['urdf'],model(adapter.skeleton_configuration())['urdf'])
-        self.assertNotEqual(rendered['urdf'],model({'mode':'wheel_foot'})['urdf'])
+        self.assertEqual(rendered['urdf'],model({'mode':'wheel_foot'})['urdf'])
 
     async def test_stand_request_switches_to_live_native_frame(self):
         import time
@@ -300,3 +300,49 @@ class DisplayLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.skeleton_configuration()['display_reference_q'],folded)
         self.assertEqual(model(adapter.skeleton_configuration())['model_revision'],
             rendered['model_revision'])
+
+
+class RealImuTests(unittest.IsolatedAsyncioTestCase):
+    def reader(self):
+        from vendor import RobotReader
+        import time
+        r=RobotReader({'serial':'','poll_interval_seconds':.1,
+            'response_timeout_seconds':5,'stale_after_seconds':5})
+        r.accept_info({'accid':'WF_TRON2A_TEST','data':{'imu':'OK'}})
+        r.joints=sample(r.serial,10)['data']
+        r.joints_at=time.monotonic();r.joints_received=time.time()
+        return r
+
+    async def test_real_notification_to_public_joints(self):
+        import aiohttp,time
+        r=self.reader();ws=SimpleNamespace(send_json=AsyncMock())
+        await r.enable_imu(ws)
+        request=ws.send_json.call_args.args[0]
+        self.assertEqual(request['title'],'request_enable_imu')
+        self.assertEqual(request['data'],{'enable':True})
+        q=[.670594,.143134,-.715425,.134103]
+        ws.receive=AsyncMock(return_value=SimpleNamespace(type=aiohttp.WSMsgType.TEXT,
+            data=__import__('json').dumps({'title':'notify_imu','accid':r.serial,'data':{'quat':q}})))
+        await r.receive(ws,time.monotonic()+1)
+        packet=joints_stream(r.sample('joint_state'),r.configuration)
+        self.assertEqual(set(packet),{'joints','imu_quat'})
+        self.assertAlmostEqual(sum(v*v for v in packet['imu_quat']),1)
+        self.assertEqual([j['q'] for j in packet['joints']],r.joints['q'])
+        # Native URDF remains constant: do not rotate both URDF and IMU.
+        self.assertEqual(model({**r.configuration,'display_reference_q':[2.6,0,0,-2.6,0]*2})['urdf'],model(r.configuration)['urdf'])
+        r.imu_at-=2
+        self.assertNotIn('imu_quat',joints_stream(r.sample('joint_state'),r.configuration))
+        r.disconnect('test');self.assertIsNone(r.imu)
+
+    def test_invalid_or_foreign_imu_is_never_published(self):
+        r=self.reader()
+        r.accept_imu({'accid':'OTHER','data':{'quat':[1,0,0,0]}})
+        self.assertIsNone(r.imu)
+        for q in ([],[0,0,0,0],[True,0,0,0],[float('nan'),0,0,1],[5,0,0,0]):
+            r.accept_imu({'accid':r.serial,'data':{'quat':q}})
+            self.assertNotIn('imu_quat',joints_stream(r.sample('joint_state'),r.configuration))
+
+    async def test_upper_limb_does_not_enable_undocumented_lower_imu_api(self):
+        r=self.reader();r.configuration={'mode':'upper_limb'}
+        ws=SimpleNamespace(send_json=AsyncMock())
+        await r.enable_imu(ws);ws.send_json.assert_not_called()
