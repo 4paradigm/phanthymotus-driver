@@ -149,7 +149,7 @@ class CaptureTimedDepthPublisher:
         source_depth = source_frames.get_depth_frame()
         if source_color is not None and source_depth is not None:
             try:
-                _, stamps = self.time_mapper.sample(source_color, source_depth)
+                meta, stamps = self.time_mapper.sample(source_color, source_depth)
                 stamp_ns, frame_id, mapped = stamps[1], f'{self.namespace}_rgb_optical', True
             except Exception:                                  # noqa: BLE001
                 # Media first: a broken clock mapping must not drop a depth

@@ -407,6 +407,35 @@ def test_a_single_pose_glitch_is_dropped_not_latched(plugin):
     assert node.jump_count == 0
 
 
+def test_rejected_pose_keeps_capture_stamp_and_is_not_fused_again(plugin):
+    import threading
+    from noetix.bumi.fused_odometry import FusedOdometryPlugin
+    from noetix.bumi.odometry_fusion import PlanarFusion
+
+    plugin._node.node.time += 123_456  # Capture precision must survive publication.
+    node = tracking(plugin)
+    node.calibration = module.CameraCalibration(calibration())
+    accepted_ns = node.estimate['stamp_ns']
+    fused = FusedOdometryPlugin.__new__(FusedOdometryPlugin)
+    fused.node, fused.lock, fused.active = node.node, threading.RLock(), True
+    fused.filter = PlanarFusion()
+    fused.filter.predict(accepted_ns, 0.)
+    fused._on_visual(NS(data=json.dumps(node.publish())))
+    assert fused.filter.last_visual_stamp == accepted_ns
+
+    fused.filter.predict(accepted_ns + 25_000_000, 0., (.01, 0.), True)
+    predicted = fused.filter.steps[-1].state.copy()
+    feed(node, [10., 2., 3.])  # Paired diagnostics, but an impossible pose jump.
+    sample = node.publish()
+    assert sample['vendor']['status'] == 'tracking'
+    assert sample['pose']['position'] == [1., 2., 3.]
+    fused._on_visual(NS(data=json.dumps(sample)))
+
+    assert fused.filter.last_visual_stamp == accepted_ns
+    assert fused.filter.steps[-1].state.tolist() == predicted.tolist()
+    assert sample['vendor']['visual_stamp_ns'] == accepted_ns
+
+
 def test_persistent_pose_reset_requests_a_new_segment(plugin):
     node = started_node(plugin)
     old_segment = node.segment

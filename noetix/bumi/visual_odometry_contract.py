@@ -213,6 +213,10 @@ def make_sample(health, now_ns, estimate, pose_reference='rgb_optical'):
     """
     quality = health.status(now_ns)
     valid = quality['status'] == 'tracking' and estimate is not None
+    if valid:
+        # Diagnostics may advance past a rejected pose; keep the accepted
+        # pose's capture time so consumers never fuse a frozen pose again.
+        quality['visual_stamp_ns'] = estimate['stamp_ns']
     return build_sample(
         stamp_ms=(estimate['stamp_ns'] if valid else now_ns)//1_000_000,
         twist=[None]*6,
