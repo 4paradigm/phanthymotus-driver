@@ -23,6 +23,10 @@ MOVE_MAX_DURATION_S = 10.0
 MOVE_COMPLETION_TIMEOUT_S = 20
 
 
+class MotionSafetyCancellation(RuntimeError):
+    pass
+
+
 def _validate_move_duration(value) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) \
             or not math.isfinite(value) \
@@ -229,12 +233,17 @@ class BunkerMiniDevice:
             if status != "cancelled":
                 deadline = time.monotonic() + duration
                 while not stop_event.is_set():
-                    snapshot = self.can.snapshot()
-                    if snapshot.get("last_tx_error"):
-                        raise RuntimeError("CAN command transmission failed")
                     remaining = deadline - time.monotonic()
+                    target_state = self.can.target_status()
+                    if target_state.get("last_tx_error"):
+                        raise RuntimeError("CAN command transmission failed")
+                    reason = target_state.get("cancel_reason")
+                    if reason and reason != "motion lease expired":
+                        raise MotionSafetyCancellation(reason)
                     if remaining <= 0:
                         break
+                    if not target_state.get("active") and not reason:
+                        raise MotionSafetyCancellation("safety watchdog cancelled motion")
                     stop_event.wait(min(0.02, remaining))
                 status = "cancelled" if stop_event.is_set() else "completed"
             if target_started:
@@ -242,6 +251,8 @@ class BunkerMiniDevice:
         except Exception as exc:
             status = "cancelled" if stop_event.is_set() else "error"
             result = {"error": type(exc).__name__}
+            if isinstance(exc, MotionSafetyCancellation):
+                result["message"] = str(exc)
             if target_started:
                 try:
                     self.can.stop_motion()

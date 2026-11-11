@@ -54,3 +54,27 @@ def test_host_sys_mount_is_read_only_and_required_persistent_paths_are_explicit(
     assert "privileged:" not in service
     assert set(metadata["cap_add"]) == {
         "SYS_MODULE", "NET_ADMIN", "NET_RAW", "SETUID", "SETGID", "SETPCAP"}
+
+
+def test_every_host_write_mount_and_bootstrap_capability_is_explicit():
+    service = (DRIVER_DIR / "deploy" / "service.yml").read_text()
+    metadata = yaml.safe_load(service)["agilex-bunker-mini"]
+    mounts = metadata["volumes"]
+    writable_host_paths = {mount.split(":", 1)[0]
+                           for mount in mounts if mount.endswith(":rw")}
+    assert writable_host_paths == {
+        "/lib/modules", "/etc/modules-load.d", "/etc/systemd/system",
+        "/usr/local/sbin"}
+    assert "/run/dbus/system_bus_socket:/run/dbus/system_bus_socket" in mounts
+    assert "/sys:/sys:ro" in mounts
+    assert metadata["cap_add"] == [
+        "SYS_MODULE", "NET_ADMIN", "NET_RAW", "SETUID", "SETGID", "SETPCAP"]
+    readme = (DRIVER_DIR / "README.md").read_text()
+    for package, purpose in {
+        "build-essential": "compiles `gs_usb`",
+        "kmod": "`modinfo`,",
+        "iproute2": "provides `ip` for CAN link setup",
+        "systemd": "supplies `busctl`",
+        "util-linux": "supplies `setpriv`",
+    }.items():
+        assert package in readme and purpose in readme

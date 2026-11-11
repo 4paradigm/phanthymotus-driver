@@ -31,6 +31,9 @@ class FakeCAN:
     def snapshot(self):
         return {"last_tx_error": ""}
 
+    def target_status(self):
+        return {"active": True, "cancel_reason": None, "last_tx_error": ""}
+
     def stop_motion(self):
         self.stops += 1
         return {"state": "stopped"}
@@ -89,6 +92,18 @@ def test_move_worker_sets_target_and_reports_completion():
     assert device.can.targets == [(0.1, -0.1, 0.05)]
     assert device.can.stops == 1
     notify.assert_called_once_with("action-2", "completed", {"state": "stopped"})
+
+
+@pytest.mark.parametrize("reason", ["chassis feedback became stale",
+                                     "critical chassis fault appeared"])
+def test_move_worker_reports_safety_cancellation_as_error(reason):
+    device = _bare_device()
+    device.can.target_status = lambda: {
+        "active": False, "cancel_reason": reason, "last_tx_error": ""}
+    with patch("device._acp_notify") as notify:
+        device._run_move("action-safety", threading.Event(), 0.1, 0.0, 1.0)
+    notify.assert_called_once_with("action-safety", "error", {
+        "error": "MotionSafetyCancellation", "message": reason})
 
 
 def test_move_advertises_async_completion_contract():

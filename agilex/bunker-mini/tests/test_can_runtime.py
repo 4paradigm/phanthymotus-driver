@@ -112,6 +112,44 @@ def test_critical_fault_during_motion_cancels_target_and_sends_zero():
     assert len(can._bus.sent) == 1
     message, _timeout = can._bus.sent[0]
     assert bytes(message.data) == bytes(8)
+    assert can.target_status() == {
+        "active": False,
+        "cancel_reason": "critical chassis fault appeared",
+        "last_tx_error": "",
+    }
+
+
+def test_feedback_staleness_during_motion_is_recorded_and_stops_stream():
+    can = BunkerCAN({}, "can1")
+    can._bus = FakeBus()
+    can._system_state = {"vehicle_state": protocol.VEHICLE_NORMAL,
+                         "control_mode": protocol.CONTROL_CAN,
+                         "error_flags": 0}
+    can._system_state_at = time.monotonic()
+    can._target = (0.1, 0.0)
+    can._target_deadline = time.monotonic() + 1
+    can._tx_active = True
+
+    class FeedbackStopsAfterOneTick:
+        calls = 0
+        def wait(self, _timeout):
+            self.calls += 1
+            if self.calls == 2:
+                can._system_state_at = time.monotonic() - 1
+            return self.calls > 2
+
+    can._stop = FeedbackStopsAfterOneTick()
+    with patch.dict(sys.modules, {"can": _can_module()}):
+        can._transmit_loop()
+
+    assert can.target_status() == {
+        "active": False,
+        "cancel_reason": "chassis feedback became stale",
+        "last_tx_error": "",
+    }
+    assert len(can._bus.sent) == 2
+    assert bytes(can._bus.sent[0][0].data) != bytes(8)
+    assert bytes(can._bus.sent[1][0].data) == bytes(8)
 
 
 def test_odometry_window_preserves_receive_wall_timestamp():

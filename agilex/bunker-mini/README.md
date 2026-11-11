@@ -45,6 +45,20 @@ runtime SocketCAN dependency. These packages increase image size, but removing
 the build tools would break the requested automatic bootstrap on hosts without
 the module.
 
+The Dockerfile's apt additions each support this bootstrap/runtime:
+`build-essential` compiles `gs_usb` only when the host lacks it; `kmod` provides
+`modinfo`, `modprobe`, and `depmod`; `iproute2` provides `ip` for CAN link setup
+and verification; `systemd` supplies `busctl` so the container can request the
+host systemd unit over D-Bus (the container itself does not run systemd); and
+`util-linux` supplies `setpriv` to drop to the unprivileged driver identity.
+The build depends on the deployed host's matching kernel headers, so moving the
+compiler into a separate Docker build stage would not build the host-compatible
+module. `python3-pip` installs the pinned `python-can` and `PyYAML` dependencies.
+The `ros-base` image contract does not guarantee these utilities, so the
+component installs them explicitly. `--no-install-recommends` and apt-list
+cleanup limit extra packages and metadata, but these tools do increase image
+size.
+
 The CAN decoder follows the Bunker Mini 2.0 protocol tables. `motor_state`
 combines chassis feedback (`0x211`), measured linear speed and steering angle
 (`0x221`), and both motor high/low telemetry frames (`0x252`-`0x253`,

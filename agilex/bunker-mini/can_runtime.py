@@ -57,6 +57,7 @@ class BunkerCAN:
         self._odom_samples = deque()
         self._target: tuple[float, float] | None = None
         self._target_deadline = 0.0
+        self._target_cancel_reason = None
         self._tx_active = False
         self._frame_count = 0
         self._last_rx_at = 0.0
@@ -162,6 +163,8 @@ class BunkerCAN:
                 no_critical_faults = system is not None and not (system.get("error_flags", 0) & 0xB5)
                 was_active = self._tx_active
                 if not active:
+                    if target is not None and now >= self._target_deadline:
+                        self._target_cancel_reason = "motion lease expired"
                     self._target = None
                     self._tx_active = False
                 elif status_fresh and system and no_critical_faults \
@@ -169,6 +172,15 @@ class BunkerCAN:
                         and system["control_mode"] == protocol.CONTROL_CAN:
                     self._tx_active = True
                 else:
+                    if target is not None:
+                        if not status_fresh:
+                            self._target_cancel_reason = "chassis feedback became stale"
+                        elif system and system.get("error_flags", 0) & 0xB5:
+                            self._target_cancel_reason = "critical chassis fault appeared"
+                        elif system and system.get("vehicle_state") != protocol.VEHICLE_NORMAL:
+                            self._target_cancel_reason = "chassis entered abnormal or e-stop state"
+                        elif system and system.get("control_mode") != protocol.CONTROL_CAN:
+                            self._target_cancel_reason = "chassis left CAN control mode"
                     self._target = None
                     self._tx_active = False
                     active = False
@@ -199,6 +211,7 @@ class BunkerCAN:
         except Exception as exc:
             with self._lock:
                 self._last_tx_error = f"{type(exc).__name__}: {exc}"
+                self._target_cancel_reason = "CAN command transmission failed"
                 self._target = None
                 self._tx_active = False
 
@@ -254,6 +267,13 @@ class BunkerCAN:
         with self._lock:
             self._target = (linear, angular)
             self._target_deadline = time.monotonic() + lease_s
+            self._target_cancel_reason = None
+
+    def target_status(self) -> dict:
+        with self._lock:
+            active = self._target is not None and time.monotonic() < self._target_deadline
+            return {"active": active, "cancel_reason": self._target_cancel_reason,
+                    "last_tx_error": self._last_tx_error}
 
     @staticmethod
     def _limit(value, limit, name):
@@ -268,6 +288,7 @@ class BunkerCAN:
             was_active = self._tx_active or self._target is not None
             self._target = None
             self._target_deadline = 0.0
+            self._target_cancel_reason = "motion stopped"
             self._tx_active = False
             state = dict(self._system_state or {})
             fresh = time.monotonic() - self._system_state_at <= STATUS_TIMEOUT_S
