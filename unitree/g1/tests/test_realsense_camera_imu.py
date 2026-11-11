@@ -22,10 +22,16 @@ def sdk():
               format=NS(motion_xyz32f='xyz'), camera_info=NS(serial_number='serial'))
 
 
-def profile(kind, fps=100, rotation=(0, 1, 0, -1, 0, 0, 0, 0, 1)):
+MISSING = object()
+
+
+def profile(kind, fps=100, rotation=(0, 1, 0, -1, 0, 0, 0, 0, 1), translation=MISSING):
+    extrinsics = NS(rotation=rotation)
+    if translation is not MISSING:
+        extrinsics.translation = translation
     return NS(stream_type=lambda:kind, format=lambda:'xyz', fps=lambda:fps,
               stream_index=lambda:0, unique_id=lambda:kind+'-17',
-              get_extrinsics_to=lambda target:NS(rotation=rotation))
+              get_extrinsics_to=lambda target:extrinsics)
 
 
 def device(profiles):
@@ -207,3 +213,67 @@ def test_g1_motion_callback_preserves_partial_video_display_frames():
     fs=NS(get_color_frame=lambda:NS(get_data=lambda:pixels),get_depth_frame=lambda:None)
     scope['_on_frame'](node,NS(is_frameset=lambda:True,as_frameset=lambda:fs))
     assert not errors and node._color_q.qsize()==1
+
+
+
+def configured_motion(profiles):
+    h = helper()
+    source = h.MotionSource('/cam/imu', 'depth_optical', sdk(), lambda ms, domain:int(ms*1e6),
+                            lambda packet:None, clock_id=lambda:'rgbd-clock')
+    active = NS(get_stream=lambda kind:next((p for p in profiles if p.stream_type()==kind), NS()),
+                get_device=lambda:device(profiles))
+    source.configure(active)
+    return source, active
+
+
+def test_factory_translation_is_sensor_origin_in_depth_axes_without_inversion():
+    source, _ = configured_motion([profile('gyro', translation=[.012, -.034, .056]),
+                                   profile('accel', translation=[-.078, .09, -.011])])
+    source.accept(motion('accel', 1000, [0, 9.81, 0]))
+    packet = source.accept(motion('gyro', 1005, [1, 2, 3]))
+    assert packet['camera_from_gyro_translation'] == [.012, -.034, .056]
+    assert packet['camera_from_accel_translation'] == [-.078, .09, -.011]
+    assert packet['translation_source'] == 'sdk_factory_extrinsics'
+    assert source.status()['fusion']['state'] == 'available'
+
+
+@pytest.mark.parametrize('translation', [MISSING, None, [1., 2.], [float('nan'), 0., 0.],
+                                        [0., float('inf'), 0.]])
+def test_missing_or_invalid_factory_translation_keeps_attitude_without_calibrated_translation(translation):
+    source, _ = configured_motion([profile('gyro', translation=[.01, .02, .03]),
+                                   profile('accel', translation=translation)])
+    source.accept(motion('accel', 1000, [0, 9.81, 0]))
+    packet = source.accept(motion('gyro', 1005, [1, 2, 3]))
+    assert packet['angular_velocity'] == [1., 2., 3.]
+    assert packet['rotation_source'] == 'sdk_factory_extrinsics'
+    assert 'camera_from_gyro_translation' not in packet
+    assert 'camera_from_accel_translation' not in packet
+    assert 'translation_source' not in packet
+    assert source.status()['fusion']['state'] == 'unavailable'
+    assert 'translation' in source.status()['fusion']['reason']
+
+
+def test_reconfigure_removes_old_factory_translation_and_pairs_only_new_epoch_samples():
+    profiles = [profile('gyro', translation=[.01, .02, .03]), profile('accel', translation=[.04, .05, .06])]
+    source, active = configured_motion(profiles)
+    source.accept(motion('accel', 1000, [0, 9.81, 0]))
+    first = source.accept(motion('gyro', 1005, [1, 2, 3]))
+    profiles[1] = profile('accel')
+    source.configure(active)
+    with pytest.raises(ValueError, match='accel'):
+        source.accept(motion('gyro', 2000, [0, 0, 0]))
+    source.accept(motion('accel', 2001, [0, 9.81, 0]))
+    resumed = source.accept(motion('gyro', 2005, [0, 0, 0]))
+    assert resumed['epoch'] != first['epoch']
+    assert 'camera_from_accel_translation' not in resumed
+    assert source.status()['fusion']['state'] == 'unavailable'
+
+
+
+def test_factory_rotation_helper_keeps_profile_to_depth_call_contract():
+    depth = object()
+    def extrinsics_to(target):
+        assert target is depth
+        return NS(rotation=[0, 1, 0, -1, 0, 0, 0, 0, 1])
+    result = helper().factory_rotation(NS(get_extrinsics_to=extrinsics_to), depth)
+    assert result == [[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]

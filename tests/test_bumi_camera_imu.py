@@ -21,7 +21,8 @@ def test_shared_bumi_callback_publishes_motion_while_rgbd_failure_keeps_video(ca
     sdk.camera_info=NS(serial_number='serial')
     profiles={kind:NS(stream_type=lambda kind=kind:kind,format=lambda:'xyz',fps=lambda:100,
                        stream_index=lambda:0,unique_id=lambda kind=kind:kind,
-                       get_extrinsics_to=lambda depth:NS(rotation=[1,0,0,0,1,0,0,0,1]))
+                       get_extrinsics_to=lambda depth, kind=kind:NS(rotation=[1,0,0,0,1,0,0,0,1],
+                           translation=[.012, -.034, .056] if kind=='gyro' else [-.078, .09, -.011]))
               for kind in ('gyro','accel','depth')}
     camera=NS(query_sensors=lambda:[NS(get_stream_profiles=lambda:list(profiles.values()))],
               get_info=lambda kind:'camera123')
@@ -72,6 +73,9 @@ def test_shared_bumi_callback_publishes_motion_while_rgbd_failure_keeps_video(ca
     packet=json.loads(state.published['/robot/camera/rgbd/imu'][0].data)
     assert packet['clock_id']=='shared_rgbd/hardware_clock'
     assert packet['camera_frame_id']=='robot_depth_optical'
+    assert packet['camera_from_gyro_translation']==[.012, -.034, .056]
+    assert packet['camera_from_accel_translation']==[-.078, .09, -.011]
+    assert packet['translation_source']=='sdk_factory_extrinsics'
     assert packet['stamp_ns']==1_000_000_000+offset
     assert packet['clock_mapping']['offset_ns']==offset
     assert packet['clock_mapping']['verified'] is False

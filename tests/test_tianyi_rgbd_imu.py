@@ -49,11 +49,15 @@ class Buffer:
         self.calls = []
         s = math.sqrt(.5)
         self.quaternions = {'gyro_optical': (0., 0., s, s), 'accel_frame': (s, 0., 0., s)}
+        self.translations = {}
     def lookup_transform(self, target, source, stamp):
         self.calls.append((target, source, stamp.nanoseconds))
         if source not in self.quaternions: raise LookupError('unknown source frame')
         x, y, z, w = self.quaternions[source]
-        return NS(transform=NS(rotation=NS(x=x, y=y, z=z, w=w)))
+        transform = NS(rotation=NS(x=x, y=y, z=z, w=w))
+        if source in self.translations:
+            transform.translation = self.translations[source]
+        return NS(transform=transform)
 
 
 @pytest.fixture
@@ -250,3 +254,57 @@ def test_out_of_order_capture_is_not_published_twice(source):
     source._imu('gyro', motion(NOW-1))
     source._imu('accel', motion(NOW+1, 'accel_frame'))
     assert len(packets(source)) == 1
+
+
+
+def test_source_time_tf_translation_and_rotation_use_one_lookup_per_sensor(source):
+    source.imu_buffer.translations = {'gyro_optical': NS(x=.012, y=-.034, z=.056),
+                                      'accel_frame': NS(x=-.078, y=.09, z=-.011)}
+    feed(source)
+    packet, = packets(source)
+    assert packet['camera_from_gyro_translation'] == [.012, -.034, .056]
+    assert packet['camera_from_accel_translation'] == [-.078, .09, -.011]
+    assert packet['translation_source'] == 'tf'
+    np.testing.assert_allclose(packet['camera_from_gyro'], [[0,-1,0],[1,0,0],[0,0,1]], atol=1e-12)
+    assert source.imu_buffer.calls == [('color_optical', 'gyro_optical', NOW),
+                                       ('color_optical', 'accel_frame', NOW-5_000_000)]
+    assert source.dispatch('info', {})['imu_status']['fusion']['state'] == 'available'
+
+
+@pytest.mark.parametrize('translation', [None, NS(x=float('nan'), y=0., z=0.),
+                                         NS(x=0., y=float('inf'), z=0.), NS(x=0., y=0.)])
+def test_missing_or_invalid_tf_translation_preserves_attitude_only(source, translation):
+    source.imu_buffer.translations = {'gyro_optical': NS(x=.01, y=.02, z=.03)}
+    if translation is not None:
+        source.imu_buffer.translations['accel_frame'] = translation
+    feed(source)
+    packet, = packets(source)
+    assert packet['angular_velocity'] == [1., 2., 3.]
+    assert 'camera_from_gyro_translation' not in packet
+    assert 'camera_from_accel_translation' not in packet
+    assert 'translation_source' not in packet
+    status = source.dispatch('info', {})['imu_status']
+    assert status['state'] == 'available'
+    assert status['fusion']['state'] == 'unavailable'
+    assert 'translation' in status['fusion']['reason']
+
+
+def test_restart_does_not_reuse_old_tf_translation_or_acceleration(source):
+    source.imu_buffer.translations = {'gyro_optical': NS(x=.01, y=.02, z=.03),
+                                      'accel_frame': NS(x=.04, y=.05, z=.06)}
+    feed(source)
+    first, = packets(source)
+    source.stop()
+    source.start()
+    source.registered = True
+    source.geometry = {'frame_id': 'color_optical', 'K': np.eye(3)}
+    source.imu_buffer.translations.clear()
+    assert source.dispatch('info', {})['imu_status']['fusion']['state'] == 'unavailable'
+    source._imu('gyro', motion(NOW+1))
+    assert len(packets(source)) == 1
+    source._imu('accel', motion(NOW+1, 'accel_frame'))
+    resumed = packets(source)[1]
+    assert resumed['epoch'] != first['epoch']
+    assert 'camera_from_accel_translation' not in resumed
+    assert source.dispatch('info', {})['imu_status']['state'] == 'available'
+    assert source.dispatch('info', {})['imu_status']['fusion']['state'] == 'unavailable'

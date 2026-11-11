@@ -100,6 +100,7 @@ class RgbdCameraPlugin:
         self.imu_samples = {kind: deque(maxlen=512) for kind in ('gyro', 'accel')}
         self.imu_epoch = None
         self.imu_last_stamp = 0
+        self.imu_translation_reason = 'waiting for camera motion TF translation'
 
     def get_tool(self):
         return {'name': 'camera_rgbd', 'type': 'sensor',
@@ -141,6 +142,7 @@ class RgbdCameraPlugin:
             self.error = None
             self.imu_epoch = uuid.uuid4().hex
             self.imu_last_stamp = 0
+            self.imu_translation_reason = 'waiting for camera motion TF translation'
             for samples in self.imu_samples.values():
                 samples.clear()
             self.imu_reason = 'waiting for camera motion samples and TF'
@@ -167,7 +169,7 @@ class RgbdCameraPlugin:
         except Exception as error:
             self.imu_reason = 'camera motion unavailable: ' + str(error)
 
-    def _imu_rotation(self, msg):
+    def _imu_extrinsics(self, msg):
         from rclpy.time import Time
         frame = msg.header.frame_id
         if not frame:
@@ -181,9 +183,17 @@ class RgbdCameraPlugin:
             raise ValueError('camera motion TF quaternion is not a unit rotation')
         values /= np.linalg.norm(values)
         x, y, z, w = values
-        return [[1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
+        rotation = [[1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
                 [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
                 [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)]]
+        try:
+            t = transform.transform.translation
+            translation = [float(t.x), float(t.y), float(t.z)]
+            if not np.isfinite(translation).all():
+                raise ValueError('nonfinite camera motion TF translation')
+        except (AttributeError, TypeError, ValueError):
+            translation = None
+        return rotation, translation
 
     def _imu(self, kind, msg):
         with self.lock:
@@ -224,15 +234,22 @@ class RgbdCameraPlugin:
                         raise ValueError('stale or nonmonotonic camera motion capture stamp')
                     if self.imu_last_stamp and gyro_stamp-self.imu_last_stamp > 500_000_000:
                         self.imu_epoch = uuid.uuid4().hex
+                    gyro_rotation, gyro_translation = self._imu_extrinsics(gyro)
+                    accel_rotation, accel_translation = self._imu_extrinsics(accel)
                     packet = dict(schema='motus.imu/1', source_id='/ob_camera_head/gyro+accel',
                         epoch=self.imu_epoch, stamp_ns=gyro_stamp, accel_stamp_ns=accel_stamp,
                         stamp_source='measurement', clock_id=self.clock,
                         camera_frame_id=self.geometry['frame_id'], gyro_frame_id=gyro.header.frame_id,
                         accel_frame_id=accel.header.frame_id,
-                        camera_from_gyro=self._imu_rotation(gyro), camera_from_accel=self._imu_rotation(accel),
+                        camera_from_gyro=gyro_rotation, camera_from_accel=accel_rotation,
                         rotation_source='tf', units=dict(angular_velocity='rad/s', linear_acceleration='m/s^2'),
                         angular_velocity=[gyro.angular_velocity.x, gyro.angular_velocity.y, gyro.angular_velocity.z],
                         linear_acceleration=[accel.linear_acceleration.x, accel.linear_acceleration.y, accel.linear_acceleration.z])
+                    self.imu_translation_reason = 'camera motion TF translation missing or invalid'
+                    if gyro_translation is not None and accel_translation is not None:
+                        packet.update(camera_from_gyro_translation=gyro_translation,
+                                      camera_from_accel_translation=accel_translation, translation_source='tf')
+                        self.imu_translation_reason = None
                     from std_msgs.msg import String
                     self.imu_pub.publish(String(data=json.dumps(packet, allow_nan=False)))
                     self.imu_last_stamp = gyro_stamp
@@ -242,13 +259,17 @@ class RgbdCameraPlugin:
 
     def _imu_status(self):
         if not getattr(self, 'imu_enabled', True):
-            return dict(state='disabled', reason='camera motion source disabled')
+            return dict(state='disabled', reason='camera motion source disabled',
+                        fusion=dict(state='unavailable', reason='camera motion source disabled'))
         reason = getattr(self, 'imu_reason', 'waiting for camera motion samples and TF')
         if not self.running:
             reason = 'camera motion source stopped'
         elif getattr(self, 'imu_last_stamp', 0) and self.sub_node.get_clock().now().nanoseconds-self.imu_last_stamp > 500_000_000:
             reason = 'camera motion source stale'
-        return dict(state='unavailable' if reason else 'available', **({'reason': reason} if reason else {}))
+        translation_reason = getattr(self, 'imu_translation_reason', 'waiting for camera motion TF translation')
+        return dict(state='unavailable' if reason else 'available', **({'reason': reason} if reason else {}),
+                    fusion=dict(state='unavailable' if translation_reason else 'available',
+                                **({'reason': translation_reason} if translation_reason else {})))
 
     def _parameters(self):
         from rcl_interfaces.srv import GetParameters

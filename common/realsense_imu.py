@@ -48,8 +48,10 @@ def start_optional_motion(rs, pipeline, config, device, callback):
         return pipeline.start(config, callback), reason
 
 
-def factory_rotation(profile, depth_profile):
-    values = list(profile.get_extrinsics_to(depth_profile).rotation)
+def factory_rotation(profile, depth_profile, *, extrinsics=None):
+    if extrinsics is None:
+        extrinsics = profile.get_extrinsics_to(depth_profile)
+    values = list(extrinsics.rotation)
     if len(values) != 9 or not all(math.isfinite(v) for v in values):
         raise ValueError('invalid factory motion rotation')
     # rs2_extrinsics.rotation is column-major, R_DEPTH_MOTION.
@@ -73,10 +75,14 @@ class MotionSource:
         self.reason = 'waiting for camera motion profiles'
         self.last_capture_ns = 0
         self.clock_mapping = None
+        self.translations = {}
+        self.translation_reason = 'waiting for factory motion translation'
 
     def configure(self, active):
         with self.lock:
             self.configured = False
+            self.translations = {}
+            self.translation_reason = 'waiting for factory motion translation'
             self.accel = None
             self.previous = {}
             self.last_capture_ns = 0
@@ -84,7 +90,18 @@ class MotionSource:
             self.epoch = uuid.uuid4().hex
             profiles = {kind: active.get_stream(kind) for kind in (self.rs.stream.gyro, self.rs.stream.accel)}
             depth = active.get_stream(self.rs.stream.depth)
-            self.rotations = {kind: factory_rotation(p, depth) for kind, p in profiles.items()}
+            extrinsics = {kind: p.get_extrinsics_to(depth) for kind, p in profiles.items()}
+            self.rotations = {kind: factory_rotation(p, depth, extrinsics=extrinsics[kind])
+                              for kind, p in profiles.items()}
+            try:
+                translations = {kind: list(value.translation) for kind, value in extrinsics.items()}
+                if any(len(values) != 3 or not all(math.isfinite(v) for v in values)
+                       for values in translations.values()):
+                    raise ValueError('invalid factory motion translation')
+                self.translations = {kind: [float(v) for v in values] for kind, values in translations.items()}
+                self.translation_reason = None
+            except (AttributeError, TypeError, ValueError):
+                self.translation_reason = 'factory motion translation missing or invalid'
             serial = active.get_device().get_info(self.rs.camera_info.serial_number)
             self.source_id = 'realsense/' + serial + '/motion'
             self.frames = {kind: f'{self.source_id}/{kind}/{p.stream_index()}/{p.unique_id()}'
@@ -135,6 +152,10 @@ class MotionSource:
                           rotation_source='sdk_factory_extrinsics', angular_velocity=values,
                           linear_acceleration=self.accel[1],
                           units=dict(angular_velocity='rad/s', linear_acceleration='m/s^2'))
+            if self.translations:
+                packet.update(camera_from_gyro_translation=self.translations[self.rs.stream.gyro],
+                              camera_from_accel_translation=self.translations[self.rs.stream.accel],
+                              translation_source='sdk_factory_extrinsics')
             if self.clock_mapping is not None:
                 packet['clock_mapping'] = dict(self.clock_mapping)
             self.last_capture_ns, self.reason = stamp, None
@@ -159,7 +180,9 @@ class MotionSource:
             live = self.reason is None and -50_000_000 <= time.time_ns()-self.last_capture_ns <= 500_000_000
             return dict(state='ready' if live else 'unavailable',
                         reason=self.reason if self.reason else (None if live else 'motion capture stale'),
-                        last_capture_ns=self.last_capture_ns)
+                        last_capture_ns=self.last_capture_ns,
+                        fusion=dict(state='unavailable' if self.translation_reason else 'available',
+                                    **({'reason': self.translation_reason} if self.translation_reason else {})))
 
 
 class CaptureQueue:
