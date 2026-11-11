@@ -11,6 +11,7 @@ records every HTTP JSON RPC call, so payload shapes are asserted too.
 from __future__ import annotations
 
 import array
+import ast
 import json
 import math
 import os
@@ -314,10 +315,36 @@ def run_concurrently(fn_a, fn_b):
 class ToolInventoryTests(unittest.TestCase):
     def test_driver_and_relay_use_robot_discovery_servers(self):
         service = (DEVICE_DIR / "deploy" / "service.yml").read_text(encoding="utf-8")
-        self.assertIn(
-            "ROS_DISCOVERY_SERVER=10.42.10.10:11811;10.42.10.12:11811",
-            service,
-        )
+        main = (DEVICE_DIR / "main.py").read_text(encoding="utf-8")
+        bridge = (DEVICE_DIR / "domain_bridge.py").read_text(encoding="utf-8")
+        relay = (DEVICE_DIR / "jazzy_relay.sh").read_text(encoding="utf-8")
+        discovery = "10.42.10.10:11811;10.42.10.12:11811"
+        self.assertNotIn("ROS_DISCOVERY_SERVER=", service)
+        self.assertIn('os.environ["ROS_DISCOVERY_SERVER"] = DISCOVERY_SERVERS', main)
+        module = ast.parse(bridge)
+        for function_name in ("_run", "_run_subscription"):
+            function = next(node for node in module.body
+                            if isinstance(node, ast.FunctionDef)
+                            and node.name == function_name)
+            pop_lines = [node.lineno for node in ast.walk(function)
+                         if isinstance(node, ast.Call)
+                         and isinstance(node.func, ast.Attribute)
+                         and node.func.attr == "pop"
+                         and isinstance(node.func.value, ast.Attribute)
+                         and node.func.value.attr == "environ"
+                         and node.args
+                         and isinstance(node.args[0], ast.Constant)
+                         and node.args[0].value == "ROS_DISCOVERY_SERVER"]
+            init_lines = [node.lineno for node in ast.walk(function)
+                          if isinstance(node, ast.Call)
+                          and isinstance(node.func, ast.Attribute)
+                          and node.func.attr == "init"
+                          and isinstance(node.func.value, ast.Name)
+                          and node.func.value.id == "rclpy"]
+            self.assertEqual(len(pop_lines), 1, function_name)
+            self.assertEqual(len(init_lines), 1, function_name)
+            self.assertLess(pop_lines[0], init_lines[0], function_name)
+        self.assertIn(f'export ROS_DISCOVERY_SERVER="{discovery}"', relay)
 
     def test_relay_start_failure_is_fatal_when_cameras_use_host_relay(self):
         dockerfile = (DEVICE_DIR / "Dockerfile").read_text(encoding="utf-8")
