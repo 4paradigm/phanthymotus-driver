@@ -9,6 +9,10 @@ from vendor import MoveError
 
 LOG = logging.getLogger('tron2')
 
+# Operator-provided wheel-foot calibration: vendor z=1.5 -> 22.5 deg/s.
+YAW_DEG_S_PER_VENDOR_UNIT = 15.0
+MAX_YAW_DEG_S = 22.5
+
 DIRECTIONS = {'forward':(.2,0.,0.), 'backward':(-.2,0.,0.),
               'turn_left':(0.,0.,.3), 'turn_right':(0.,0.,-.3)}
 
@@ -50,7 +54,7 @@ class Walk:
 
     def info(self):
         return {'state':self.state,'result':self.result,'automatic_retry':False,
-                'linear_speed_m_s':.2,'angular_speed_rad_s':.3}
+                'linear_speed_m_s':.2,'angular_speed_deg_s':.3*YAW_DEG_S_PER_VENDOR_UNIT}
 
     def stop(self):
         if self.task is not None and not self.task.done():self.stop_requested=True
@@ -79,13 +83,13 @@ class Walk:
     def dispatch_velocity(self,vx,vy,vyaw,seconds):
         values=[]
         seconds=form_number(seconds,'duration',2)
-        for name,value,limit in [('vx',vx,3.),('vy',vy,0.),('vyaw',vyaw,math.degrees(1.5))]:
+        for name,value,limit in [('vx',vx,3.),('vy',vy,0.),('vyaw',vyaw,MAX_YAW_DEG_S)]:
             value=form_number(value,name,0)
             try:valid=math.isfinite(value) and abs(value)<=limit
             except OverflowError:valid=False
             if not valid:raise ValueError(name+' exceeds the supported wheel-foot range')
             values.append(float(value))
-        return self._dispatch('move',duration(seconds),(values[0],values[1],math.radians(values[2])))
+        return self._dispatch('move',duration(seconds),(values[0],values[1],values[2]/YAW_DEG_S_PER_VENDOR_UNIT))
 
     def _dispatch(self,action,seconds,velocity):
         if self.state not in ('idle','completed','stopped'):
@@ -105,10 +109,10 @@ class Walk:
         action_id=str(uuid.uuid4())
         self.task=asyncio.create_task(self._run(action_id,action,seconds,velocity))
         LOG.info('Walk accepted action_id=%s duration=%s vyaw_deg_s=%s vendor_z=%s',
-                 action_id,seconds,math.degrees(velocity[2]),velocity[2])
+                 action_id,seconds,velocity[2]*YAW_DEG_S_PER_VENDOR_UNIT,velocity[2])
         result = {'status':'accepted','action_id':action_id,'motion_sent':False,
                 'direction':action,'time_seconds':seconds,'vx':velocity[0],'vy':velocity[1],
-                'vyaw':math.degrees(velocity[2]),'duration':seconds,'vendor_z_command':velocity[2]}
+                'vyaw':velocity[2]*YAW_DEG_S_PER_VENDOR_UNIT,'duration':seconds,'vendor_z_command':velocity[2]}
         if seconds == -1:
             # A continuous stream has no finite ACP completion deadline.
             result.pop('action_id')
@@ -189,9 +193,9 @@ class Walk:
                 if self.error:raise MoveError(self.error,sent)
             except Exception as exc:failure=str(exc)
         stopped=self.stop_requested
-        self.result={'direction':action,'vx':velocity[0],'vy':velocity[1],'vyaw':math.degrees(velocity[2]),'duration':seconds,'time_seconds':seconds,'motion_sent':sent,
+        self.result={'direction':action,'vx':velocity[0],'vy':velocity[1],'vyaw':velocity[2]*YAW_DEG_S_PER_VENDOR_UNIT,'duration':seconds,'time_seconds':seconds,'motion_sent':sent,
             'zero_velocity_sent':zero_sent,'physical_stop_verified':False,
-            'commanded_vyaw_rad_s':velocity[2], 'nonzero_frames':self.nonzero_frames,
+            'vendor_z_command':velocity[2], 'commanded_vyaw_deg_s':velocity[2]*YAW_DEG_S_PER_VENDOR_UNIT, 'nonzero_frames':self.nonzero_frames,
             'zero_velocity_frames':self.zero_frames,
             'command_stream_seconds':None if self.first_nonzero_at is None or self.first_zero_at is None else self.first_zero_at-self.first_nonzero_at,
             'angle_control':False,

@@ -172,17 +172,17 @@ class Adapter:
 
     def _loco_tool(self):
         return {'name':'loco_leg','type':'actuator','multiInstance':False,
-            'description':'TRON2下肢运动：stand_up完整起立，sit_down停止并坐下，move定时移动，stop_move停止移动并保持站立。仅支持下肢构型；轮足无横移。vx范围-3～3 m/s（正前负后），vyaw约±85.943669 deg/s（正左负右），默认均为0；duration为-1持续移动、0停止，或0.1～60秒，默认2秒。计时结束另发约1秒零速度，vyaw×duration不是目标转角，不保证精确距离或实际转角。',
+            'description':'TRON2下肢运动：stand_up完整起立，sit_down停止并坐下，move定时移动，stop_move停止移动并保持站立。仅支持下肢构型；轮足无横移。vx范围-3～3 m/s（正前负后），vyaw约±22.5 deg/s（正左负右），默认均为0；duration为-1持续移动、0停止，或0.1～60秒，默认2秒。计时结束另发约1秒零速度，vyaw×duration不是目标转角，不保证精确距离或实际转角。',
             'inputSchema':{'type':'object','additionalProperties':False,
                 'properties':{'action':{'type':'string','enum':['stand_up','sit_down','move','stop_move','start','stop','info'],'description':'选择要执行的动作'},
                     'vx':{'type':'number','minimum':-3,'maximum':3,'default':0,'title':'vx','description':'前后速度，单位m/s，范围-3～3，默认0；正值前进、负值后退、0不前后移动。'},
-                    'vyaw':{'type':'number','minimum':-85.94366926962348,'maximum':85.94366926962348,'default':0,'title':'vyaw','description':'转向角速度，单位deg/s，范围约-85.943669～85.943669，默认0；正值左转、负值右转、0不转向。内部转换为厂家rad/s。'},
+                    'vyaw':{'type':'number','minimum':-22.5,'maximum':22.5,'default':0,'title':'vyaw','description':'转向角速度，单位deg/s，范围约-22.5～22.5，默认0；正值左转、负值右转、0不转向。按现场标定z=vyaw/15换算，22.5deg/s对应厂家z=1.5；不是目标转角。'},
                     'duration':{'type':'number','minimum':-1,'maximum':60,'anyOf':[{'const':-1},{'const':0},{'minimum':.1,'maximum':60}],'default':2,'title':'duration','description':'运动时间，单位秒；-1持续移动直到stop_move或生命周期stop；0停止，0.1～60定时，默认2。停止后另发约1秒零速度。'},
                     **metadata_properties()},'required':['action'],
                 'x-resource':['lower_body'],'x-completion':{'actions':['stand_up','sit_down','move'],'timeout':150},
                 'x-action-params':{'stand_up':{'params':[],'description':'从启动/准备姿态完整起立并保持站立，厂家状态WALK表示完成；无速度和时间参数，不命令前进或转向。'},
                     'sit_down':{'params':[],'description':'停止移动并折叠坐回启动姿态；厂家状态SIT或DAMPING表示完成，无速度和时间参数。'},
-                    'move':{'params':['vx','vyaw','duration'],'description':'轮足定时移动：vx为-3～3 m/s（正前负后），vyaw约±85.943669 deg/s（正左负右），默认0；duration为-1持续移动、0停止或0.1～60秒，默认2秒。需要先起立进入WALK，结束后发送零速度，无横移。'},
+                    'move':{'params':['vx','vyaw','duration'],'description':'轮足定时移动：vx为-3～3 m/s（正前负后），vyaw约±22.5 deg/s（正左负右），默认0；duration为-1持续移动、0停止或0.1～60秒，默认2秒。需要先起立进入WALK，结束后发送零速度，无横移。'},
                     'stop_move':{'params':[],'description':'请求零速度停止移动，保持站立，不执行坐下。'}}}}
 
 
