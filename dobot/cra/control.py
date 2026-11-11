@@ -319,7 +319,7 @@ class RobotController:
         """Leave drag; callers send this only while fresh feedback shows the drag we started."""
         self._immediate("StopDrag", require_idle=False)
 
-    def prepare_playback(self, start_joints, args, *, cancel=None):
+    def prepare_playback(self, start_joints, args, *, cancel=None, skin_applied=False):
         """Same preparation as move_j (ClearError, enable, skin, ClearError), then
         confirm the arm is at the trajectory start. Sends no motion."""
         self.ownership.check("teach")
@@ -336,7 +336,8 @@ class RobotController:
 
         return self._execute("move_j", "ServoJ", check, card="teach",
                              requested={"detect_collision": skin, "expected_start": list(start_joints),
-                                        "start_tolerance_deg": args.get("start_tolerance_deg", 0.5)})
+                                        "start_tolerance_deg": args.get("start_tolerance_deg", 0.5),
+                                        "skin_applied": skin_applied})
 
     def servo_j(self, joints, period_s, cancel):
         """One ServoJ follow target. Checked against cancel under the command lock,
@@ -408,7 +409,8 @@ class RobotController:
                             if time.monotonic() >= deadline:
                                 raise TimeoutError("EnableRobot acknowledged but enabled feedback was not confirmed")
                             time.sleep(0.02)
-                if action in ("move_j", "rel_joint_mov_j", "start_trajectory"):
+                skin_queue_id = None
+                if action in ("move_j", "rel_joint_mov_j", "start_trajectory") and not request.get("skin_applied"):
                     baseline = check_state(action).get("packets_received")
                     detect_collision = request["detect_collision"]
                     skin_reply = self._api.EnableSafeSkin(int(detect_collision))

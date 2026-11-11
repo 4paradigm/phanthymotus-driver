@@ -116,7 +116,7 @@ class Teaching(MotionCompletion):
             "speed": {"type": "string", "enum": list(SPEED_TIERS), "default": "1x",
                       "description": "回放速度档位，相对录制速度：1x 为原速，2x 两倍速，0.25x 四分之一速度"},
             "approach_speed": {"type": "string", "enum": list(APPROACH_TIERS), "default": "slow",
-                               "description": "运动到起点/回到起点的速度档位：slow 慢、normal 中、fast 快"},
+                               "description": "运动到起点/回到起点的速度档位：slow 慢（默认，速度/加速度 10%，与旧版默认一致）、normal 中（25%）、fast 快（50%）"},
             "pause_at_start": {"type": "boolean", "default": False,
                                "description": "true：到达并核验起点后暂停，等待 resume 再开始回放；false：直接继续回放"},
             "return_to_start": {"type": "boolean", "default": False,
@@ -148,6 +148,19 @@ class Teaching(MotionCompletion):
                 return self.store.delete(args.get("name"))
         return self.start(action, args)
 
+    @staticmethod
+    def _flag(args, field, default):
+        """Optional boolean: omitted/null gives the default; "true"/"false" text is accepted
+        because the platform may deliver form values as strings. Anything else is rejected."""
+        value = args.get(field)
+        if value is None:
+            return default
+        if type(value) is bool:
+            return value
+        if type(value) is str and value.strip().lower() in ("true", "false"):
+            return value.strip().lower() == "true"
+        raise ValueError(f"{field} must be true or false (received {value!r})")
+
     def start(self, action, args, *, tool_name=None):
         if action not in self.ACTIONS:
             raise ValueError(f"unsupported teaching action: {action}")
@@ -162,13 +175,10 @@ class Teaching(MotionCompletion):
                 raise ValueError(f"speed must be one of {', '.join(SPEED_TIERS)}")
             if type(approach) is not str or approach not in APPROACH_TIERS:
                 raise ValueError(f"approach_speed must be one of {', '.join(APPROACH_TIERS)}")
-            for field in ("detect_collision", "pause_at_start", "return_to_start"):
-                if type(args.get(field, field == "detect_collision")) is not bool:
-                    raise ValueError(f"{field} must be a boolean")
+            flags = {field: self._flag(args, field, field == "detect_collision")
+                     for field in ("detect_collision", "pause_at_start", "return_to_start")}
             args = {"name": args.get("name"), "confirm_move": True, "speed": speed, "approach_speed": approach,
-                    "detect_collision": args.get("detect_collision", True),
-                    "pause_at_start": args.get("pause_at_start", False),
-                    "return_to_start": args.get("return_to_start", False)}
+                    **flags}
         try:
             context = None if self._notify is not None else self._callback_context()
         except Exception:
@@ -543,8 +553,9 @@ class Teaching(MotionCompletion):
             if active["cancel"].is_set():
                 raise RuntimeError("teaching interrupted")
         points = plan["points"]
+        # The MovJ that just arrived already set the skin with these same arguments.
         self.control.prepare_playback(points[0], {**plan["args"], "start_tolerance_deg": self.tolerance},
-                                      cancel=active["cancel"])
+                                      cancel=active["cancel"], skin_applied=moved)
         active["submitted"] = True
         playback = ServoPlayback(name, points, plan["speed"], plan)
         if plan["pause_at_start"]:

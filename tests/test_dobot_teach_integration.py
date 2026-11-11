@@ -352,10 +352,20 @@ def test_play_rejects_unknown_tiers_and_non_boolean_options_before_any_command(r
     plugin, robot, store, events = rig
     record, _ = recording(store, [20, 21, 22])
     for bad in ({"speed": 2}, {"speed": "3x"}, {"speed": "100%"}, {"approach_speed": "turbo"},
-                {"pause_at_start": "yes"}, {"return_to_start": 1}, {"detect_collision": "true"}):
+                {"pause_at_start": "yes"}, {"return_to_start": 1}, {"detect_collision": []}):
         with pytest.raises(ValueError):
             dispatch(plugin, "play", name=record["name"], **bad)
     assert robot.commands == [] and plugin.control.ownership.owner is None
+
+
+def test_boolean_options_accept_true_false_text_and_null(rig):
+    plugin, robot, store, events = rig
+    record, _ = recording(store, [20, 21, 22])
+    held = terminal(events, dispatch(plugin, "play", name=record["name"], pause_at_start="true",
+                                     return_to_start=None, detect_collision="false"),
+                    status="cancelled", timeout=5)
+    assert held["reason"] == "paused_at_start" and robot.skin == 0
+    terminal(events, dispatch(plugin, "stop_motion"))
 
 
 def test_play_reaches_and_verifies_the_start_before_streaming(rig):
@@ -369,6 +379,9 @@ def test_play_reaches_and_verifies_the_start_before_streaming(rig):
     assert movj < first_servo
     assert "joint={20" in robot.commands[movj] and "a=50,v=50" in robot.commands[movj]
     assert "EnableSafeSkin(1)" in robot.commands and "EnableSafeSkin(0)" not in robot.commands
+    # The MovJ preparation already set the skin; it is not set again after arrival.
+    assert robot.commands.count("EnableSafeSkin(1)") == 1
+    assert sum(c.startswith("SetSafeSkin") for c in robot.commands) == 4
     # Streaming only began from the verified start: the first target is the recorded start.
     assert servo_targets(robot.commands)[0][0] == pytest.approx(20, abs=1.5)
     assert robot.joints[0] == pytest.approx(22) and robot.mode == 5

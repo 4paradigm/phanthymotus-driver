@@ -452,6 +452,7 @@ def test_card_contract_keeps_sensor_and_confirmation_conventions():
     properties = schema["properties"]
     assert properties["speed"]["enum"] == ["0.25x", "0.5x", "1x", "1.5x", "2x"] and properties["speed"]["default"] == "1x"
     assert properties["approach_speed"]["enum"] == ["slow", "normal", "fast"]
+    assert properties["approach_speed"]["default"] == "slow"
     assert properties["detect_collision"]["default"] is True
     assert properties["pause_at_start"]["default"] is False and properties["return_to_start"]["default"] is False
     assert not {"velocity", "acceleration", "speed_multiplier"} & set(properties)
