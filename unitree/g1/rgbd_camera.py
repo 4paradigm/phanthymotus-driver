@@ -14,14 +14,19 @@ import numpy as np
 
 
 class RgbdSource:
-    def __init__(self, root, rs):
+    def __init__(self, root, rs, *, body_mount=None):
         self.root, self.rs = root, rs
+        self.body_mount = body_mount
+        self.mount_error = None
         self.geometry = None
         self.previous = [0, 0]
         self.last_capture_ns = 0
         self.reason = 'waiting for SDK calibration and global capture time'
 
     def configure(self, profile):
+        if self.body_mount is not None:
+            self.body_mount.reset()
+        self.mount_error = None
         self.geometry = None
         self.reason = "waiting for SDK calibration and global capture time"
         intr = profile.get_stream(self.rs.stream.depth).as_video_stream_profile().get_intrinsics()
@@ -97,12 +102,29 @@ class RgbdSource:
         self.previous = stamps
         self.last_capture_ns = min(stamps)
         self.reason = None
+        if self.body_mount is not None:
+            try:
+                self.body_mount.publish(stamps[1])
+                self.mount_error = None
+            except Exception as error:
+                self.mount_error = str(error)
         frame = 'camera_depth_optical_frame'
         return (dict(data=jpeg.tobytes(), stamp_ns=stamps[0], frame_id=frame, format='jpeg'),
                 dict(data=zlib.compress(mm.astype('<u2').tobytes(), 1), stamp_ns=stamps[1],
                      frame_id=frame, format='16UC1; compressedDepth zlib'))
 
+    def close(self):
+        if self.body_mount is not None:
+            self.body_mount.close()
+
     def info(self):
+        mount_status = (self.body_mount.status() if self.body_mount is not None else
+                        dict(status='unavailable', reason='body mount source not initialized'))
+        mount = self.body_mount.declaration() if self.body_mount is not None else None
+        if self.mount_error:
+            mount_status = dict(mount_status, status='unavailable', reason=self.mount_error)
+            if mount is not None:
+                mount = dict(mount, status='unavailable', reason=self.mount_error)
         outputs = [dict(topic=self.root + '/color', format='image/jpeg'),
                    dict(topic=self.root + '/depth', format='image/depth-zlib')]
         declarations = []
@@ -113,7 +135,10 @@ class RgbdSource:
                               clock_id='realsense_sdk_global_time_unix', registration='registered_rectified',
                               registration_source='librealsense_align_color_to_depth_then_opencv_rectify',
                               timestamp_semantics='source_capture_mapped'))
+            if mount is not None:
+                common['vendor']['body_mount'] = mount
             declarations = [dict(deepcopy(common), **port) for port in outputs]
             declarations[1]['vendor'].update(depth_source='measured', depth_unit='mm')
         return dict(state='ready' if declarations else 'unavailable', reason=self.reason,
-                    topic_out=outputs, camera_info=declarations, last_capture_ns=self.last_capture_ns)
+                    topic_out=outputs, camera_info=declarations, last_capture_ns=self.last_capture_ns,
+                    body_mount_status=mount_status)

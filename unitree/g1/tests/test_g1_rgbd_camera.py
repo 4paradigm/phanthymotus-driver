@@ -217,3 +217,148 @@ def test_single_capture_profile_feeds_display_calibration_and_computational_sour
     assert calls == [('capture', node._on_frame), ('imu', profile), ('rgbd', profile),
                      ('calibration', {'depth': {'fx': 420.1}, 'color': {'fx': 1020.1}})]
     assert node._pipeline is pipeline and node._rgbd_configured
+
+
+class Mount:
+    def __init__(self):
+        self.calls = []
+        self.error = False
+    def publish(self, stamp):
+        self.calls.append(('publish', stamp))
+        if self.error:
+            raise RuntimeError('TF lookup failed')
+        return True
+    def declaration(self):
+        return dict(schema='motus.camera_mount/1', topic='/robot/camera/rgbd/body_mount',
+                    parent_frame='pelvis', child_frame='camera_depth_optical_frame', status='available',
+                    source='tf', version='capture_tf_v1', epoch='test-epoch', mode='dynamic',
+                    length_unit='m', transform_direction='body_from_camera',
+                    reason=None, accuracy_validated=False)
+    def status(self):
+        return dict(status='available', parent_frame='pelvis')
+    def reset(self): self.calls.append(('reset',))
+    def close(self): self.calls.append(('close',))
+
+
+def test_g1_mount_uses_depth_capture_and_declarations_independently_of_rgbd_ready():
+    source, _, _ = configured()
+    mount = Mount()
+    source.body_mount = mount
+    assert source.info()['body_mount_status'] == mount.status()
+    source.encode(Frames(), 1700000000130000000)
+    assert mount.calls == [('publish', 1700000000128000000)]
+    a, b = source.info()['camera_info']
+    assert a['vendor']['body_mount'] == b['vendor']['body_mount'] == mount.declaration()
+
+
+def test_g1_mount_provider_failure_preserves_rgbd_and_reports_failure():
+    source, _, _ = configured()
+    source.body_mount = Mount()
+    source.body_mount.error = True
+    pair = source.encode(Frames(), 1700000000130000000)
+    assert pair[1]['stamp_ns'] == 1700000000128000000
+    assert source.info()['state'] == 'ready'
+    assert source.info()['body_mount_status']['status'] == 'unavailable'
+    assert 'TF lookup failed' in source.info()['body_mount_status']['reason']
+    assert source.info()['camera_info'][0]['vendor']['body_mount']['status'] == 'unavailable'
+
+
+def test_g1_mount_resets_with_capture_configuration_and_closes():
+    source, _, intr = configured()
+    source.body_mount = Mount()
+    profile = NS(get_stream=lambda _: NS(as_video_stream_profile=lambda: NS(get_intrinsics=lambda: intr)),
+                 get_device=lambda: NS(first_depth_sensor=lambda: NS(get_depth_scale=lambda: .001)))
+    source.configure(profile)
+    source.close()
+    assert source.body_mount.calls == [('reset',), ('close',)]
+
+
+@pytest.mark.parametrize('override,expected', [(None, 'pelvis'), ('torso_link', 'torso_link')])
+def test_g1_existing_ros_capture_owner_constructs_mount_with_optical_clock(monkeypatch, override, expected):
+    import os
+    import queue
+    import threading
+    if override is None: monkeypatch.delenv('CAMERA_BODY_FRAME', raising=False)
+    else: monkeypatch.setenv('CAMERA_BODY_FRAME', override)
+    tree = ast.parse((ROOT/'device.py').read_text())
+    owner = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == '_RealSenseNode')
+    init = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == '__init__')
+    init.name = 'initialize'
+    calls = []
+    class Node:
+        def __init__(self, *args): pass
+        def create_publisher(self, *args): return NS()
+        def get_logger(self): return NS(info=lambda _: None)
+    class Owner(Node):
+        def _publish_imu(self, packet): pass
+        def _publish_rgbd_status(self): pass
+    def mount(node, root, **kwargs):
+        calls.append((node, root, kwargs))
+        return Mount()
+    scope = dict(super=lambda: NS(__init__=lambda *args: None), queue=queue, threading=threading,
+                 namespace='g1', os=os, BodyMountSource=mount, RgbdSource=source_module().RgbdSource,
+                 rs=object(), MotionSource=lambda *args, **kwargs: NS(),
+                 CompressedImage=object, _String=object, _QOS=object())
+    import sys
+    monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(CompressedImage=object))
+    exec(compile(ast.Module(body=[init], type_ignores=[]), str(ROOT/'device.py'), 'exec'), scope)
+    node = Owner()
+    scope['initialize'](node, '/color', '/depth', '/dist')
+    assert calls == [(node, '/g1/camera/rgbd', dict(body_frame=expected,
+                      camera_frame='camera_depth_optical_frame', clock_id='realsense_sdk_global_time_unix'))]
+    assert node._rgbd.body_mount.declaration()['parent_frame'] == 'pelvis'
+
+
+def actual_mount(monkeypatch, path, parent, child, clock, events):
+    """Load the shipped provider, substituting only unavailable ROS transport."""
+    import json
+    import sys
+    spec = importlib.util.spec_from_file_location('tested_camera_mount', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    class Buffer:
+        def __init__(self): self.missing = False
+        def lookup_transform(self, target, source, capture):
+            events.append(('lookup', target, source, capture.nanoseconds))
+            if self.missing: raise LookupError(f'{target} <- {source} missing at capture')
+            return NS(header=NS(frame_id=target, stamp=NS(
+                          sec=capture.nanoseconds // 10**9, nanosec=capture.nanoseconds % 10**9)), child_frame_id=source,
+                      transform=NS(translation=NS(x=.2, y=-.1, z=.3),
+                                   rotation=NS(x=0., y=0., z=0., w=1.)))
+    class Listener:
+        def __init__(self, *args): pass
+        def unregister(self): events.append(('unregister',))
+    monkeypatch.setitem(sys.modules, 'std_msgs.msg', NS(String=lambda **kwargs: NS(**kwargs)))
+    monkeypatch.setitem(sys.modules, 'rclpy.qos', NS(qos_profile_sensor_data=object()))
+    monkeypatch.setitem(sys.modules, 'rclpy.time', NS(Time=lambda **kwargs: NS(**kwargs)))
+    monkeypatch.setitem(sys.modules, 'rclpy.clock', NS(ClockType=NS(ROS_TIME='ros')))
+    monkeypatch.setitem(sys.modules, 'tf2_ros', NS(Buffer=Buffer, TransformListener=Listener))
+    node = NS(create_publisher=lambda cls, topic, qos: NS(
+                  publish=lambda message: events.append(('packet', json.loads(message.data)))),
+              destroy_publisher=lambda _: events.append(('destroy_publisher',)))
+    return module.BodyMountSource(node, '/robot/camera/rgbd', body_frame=parent,
+                                  camera_frame=child, clock_id=clock)
+
+
+def test_g1_real_provider_receives_exact_depth_ns_and_tf_failure_keeps_images(monkeypatch):
+    source, _, _ = configured()
+    events = []
+    mount = actual_mount(monkeypatch, ROOT.parents[1] / 'common/camera_mount.py',
+                         'pelvis', 'camera_depth_optical_frame', 'realsense_sdk_global_time_unix', events)
+    source.body_mount = mount
+    pair = source.encode(Frames(), 1700000000130000000)
+    assert events[0] == ('lookup', 'pelvis', 'camera_depth_optical_frame', pair[1]['stamp_ns'])
+    assert events[1][1]['status'] == 'available'
+    assert events[1][1]['matrix'][0][3] == .2
+    assert events[1][1]['clock_id'] == 'realsense_sdk_global_time_unix'
+    assert events[1][1]['stamp_ns'] == pair[1]['stamp_ns']
+    assert source.info()['camera_info'][0]['vendor']['body_mount'] == mount.declaration()
+    mount.buffer.missing = True
+    later = Frames(Frame(np.zeros((480,640,3),np.uint8),1700000000153.),
+                   Frame(np.full((480,640),4000,np.uint16),1700000000158.))
+    assert source.encode(later, 1700000000160000000)[1]['data']
+    assert events[-1][1]['status'] == 'unavailable'
+    assert source.info()['state'] == 'ready'
+    assert source.info()['body_mount_status']['status'] == 'unavailable'
+    source.close()
+    assert events[-2:] == [('unregister',), ('destroy_publisher',)]

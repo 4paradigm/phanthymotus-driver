@@ -4259,7 +4259,9 @@ class RealSensePlugin:
         root = f"/{self._namespace}/camera/rgbd"
         status['topic_out'] = [{'topic': root + '/color', 'format': 'image/jpeg'},
                                {'topic': root + '/depth', 'format': 'image/depth-zlib'},
-                               {'topic': root + '/imu', 'format': 'sensor/imu', 'optional': True}]
+                               {'topic': root + '/imu', 'format': 'sensor/imu', 'optional': True},
+                               {'topic': root + '/body_mount', 'format': 'state/extrinsic', 'optional': True}]
+        status.setdefault('body_mount_status', dict(status='unavailable', reason='waiting for body mount source'))
         imu = status.setdefault('imu_status', dict(state='unavailable', reason='waiting for camera motion'))
         if not self.is_running() or not -50_000_000 <= time.time_ns() - imu.get('last_capture_ns', 0) <= 500_000_000:
             imu.update(state='unavailable', reason=imu.get('reason') or 'motion capture stale')
@@ -4271,7 +4273,7 @@ class RealSensePlugin:
                 'description': 'Calibrated registered 640x480 RealSense RGB-D for computation; shares the camera capture process.',
                 'inputSchema': {'type': 'object', 'properties': {}},
                 'topic_out': info['topic_out'], 'camera_info': info.get('camera_info', []),
-                'imu_status': info['imu_status']}
+                'imu_status': info['imu_status'], 'body_mount_status': info['body_mount_status']}
 
     def _color_tool(self) -> dict:
         return {
@@ -4429,6 +4431,7 @@ def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_q
     import numpy as np
     import pyrealsense2 as rs
     from rgbd_camera import RgbdSource
+    from common.camera_mount import BodyMountSource
     from common.realsense_imu import MotionSource, start_optional_motion
     import rclpy
     from rclpy.node import Node as _Node
@@ -4464,7 +4467,10 @@ def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_q
 
             self._worker_stop = threading.Event()
             root = f"/{namespace}/camera/rgbd"
-            self._rgbd = RgbdSource(root, rs)
+            body_mount = BodyMountSource(self, root,
+                body_frame=os.environ.get('CAMERA_BODY_FRAME', 'pelvis'),
+                camera_frame='camera_depth_optical_frame', clock_id='realsense_sdk_global_time_unix')
+            self._rgbd = RgbdSource(root, rs, body_mount=body_mount)
             self._imu_pub = self.create_publisher(_String, root + '/imu', _QOS)
             self._imu = MotionSource(root + '/imu', 'camera_depth_optical_frame', rs,
                                      self._rgbd.motion_stamp, self._publish_imu,
@@ -4713,6 +4719,7 @@ def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_q
             print(f"[realsense-proc] executor stopped: {e}", flush=True)
     finally:
         node.stop_capture()
+        node._rgbd.close()
         try:
             node.destroy_node()
         except Exception:

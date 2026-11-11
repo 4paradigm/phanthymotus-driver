@@ -112,6 +112,12 @@ SDK 先把彩色图配准到深度光学平面，再用实测深度内参对两�
 
 测试环境要求和结果边界以对应测试说明为准。离线测试通过不代表设备、DDS 通信或机器人动作已验收。
 
+### 采集时刻机体与相机外参
+
+`camera_rgbd` 在原有 RGB、深度、IMU 三个端口后追加可选 `state/extrinsic` 端口 `/{namespace}/camera/rgbd/body_mount`。通用卡通过两个 `camera_info.vendor.body_mount` 自动发现该话题，无需手填矩阵。驱动使用相机现有 ROS 节点的 TF 缓冲区，按原始深度采集纳秒时间查询 `pelvis <- camera_depth_optical_frame`，并先于匹配图像发布 `motus.camera_mount/1` JSON。`CAMERA_BODY_FRAME` 只覆盖机体帧名，不能提供矩阵。活动腰关节导致的变换逐帧更新，不作为重新标定。
+
+`body_mount_status` 独立报告所选帧和 TF 可用性；缺少 TF 包、帧、该采集时刻的变换或发布失败时，视频、RGB-D、IMU 继续工作，不回退到 SDK 内部外参、URDF 猜测、恒等矩阵或最新 TF。ROS 节点仍使用现有域 42；没有验证实机 TF 是否在同一域中、是否含真实光学标定链或是否具备足够精度。容器增加标准 `tf2_ros` 依赖和构建时导入检查，本次未构建镜像或部署。主里程计仍以相机光学帧为参考；可用外参只支持另行标注的派生机体位姿。
+
 ### Generic RGB-D short-term compensation
 
 Perception's generic `rgbd_odometry` card supports the instance settings
