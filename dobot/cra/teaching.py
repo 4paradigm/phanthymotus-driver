@@ -14,12 +14,14 @@ from common.vendor_runtime import action_schema, tool
 
 if __package__:
     from .completion import MotionCompletion
+    from .control import CommandRejected
     from .feedback import positive_number
     from .model import JOINT_NAMES
     from .trajectory import (SAMPLE_MS, TrajectoryRecorder, TrajectoryStore, at_rest_after_drag, drag_state_fault,
                              protection_fault)
 else:
     from completion import MotionCompletion
+    from control import CommandRejected
     from feedback import positive_number
     from model import JOINT_NAMES
     from trajectory import (SAMPLE_MS, TrajectoryRecorder, TrajectoryStore, at_rest_after_drag, drag_state_fault,
@@ -40,8 +42,8 @@ SERVO_SETTLE_S = 10
 class ServoPlayback:
     """Position along one recording, in ms of the original take."""
 
-    def __init__(self, trajectory_id, points, speed):
-        self.trajectory_id = trajectory_id
+    def __init__(self, trajectory_name, points, speed):
+        self.name = trajectory_name
         self.points = points
         self.speed = float(speed)
         self.duration_ms = (len(points) - 1) * SAMPLE_MS
@@ -58,7 +60,7 @@ class _Finished(Exception):
 
 
 class Teaching(MotionCompletion):
-    ACTIONS = ("start_record", "stop_record", "go_to_start", "play", "pause", "resume", "stop_motion")
+    ACTIONS = ("start_trajectory", "stop_trajectory", "go_to_start", "play", "pause", "resume", "stop_motion")
 
     def __init__(self, control, config, notify=None, store=None):
         super().__init__(control, config, notify=notify, tool_name="teach")
@@ -69,8 +71,12 @@ class Teaching(MotionCompletion):
         self.gap_ms = positive_number(settings.get("max_gap_ms", 50), "teach.max_gap_ms")
         if self.gap_ms > 50:
             raise ValueError("teach.max_gap_ms must not exceed the 50 ms sample interval")
-        # Time for the operator to press the drag button after stop_record/stop_motion.
-        self.drag_exit_timeout = positive_number(settings.get("drag_exit_timeout_s", 60), "teach.drag_exit_timeout_s")
+        # Time for the arm to report drag after StartDrag.
+        self.drag_start_timeout = positive_number(settings.get("drag_start_timeout_s", 5), "teach.drag_start_timeout_s")
+        if self.drag_start_timeout > 60:
+            raise ValueError("teach.drag_start_timeout_s must not exceed 60")
+        # Time for the arm to report rest in mode 5 after StopDrag (or after the operator's button).
+        self.drag_exit_timeout = positive_number(settings.get("drag_exit_timeout_s", 10), "teach.drag_exit_timeout_s")
         if self.drag_exit_timeout > 600:
             raise ValueError("teach.drag_exit_timeout_s must not exceed 600")
         self._shutting_down = False
@@ -87,23 +93,22 @@ class Teaching(MotionCompletion):
     def definition(self, config_schema):
         schema = action_schema({
             "info": ([], "查看示教卡功能和参数说明"),
-            "start_record": (["name", "confirm_move"], "清错、按需使能后启动录制任务并等待首次手动拖拽（不发送 StartDrag）；完成通知仅表示已开始等待"),
-            "stop_record": (["confirm_move"], "结束整次录制：不发送 StopDrag；仍在拖拽时请按机械臂拖拽键退出，以新反馈确认模式 5 停稳后保存"),
-            "list_records": ([], "列出本地轨迹名称、时长、点数和完整性"),
-            "delete_record": (["trajectory_id", "confirm_move"], "删除指定本地录制"),
-            "go_to_start": (["trajectory_id", "velocity", "acceleration", "detect_collision", "confirm_move"],
-                            "校验本地录制，按绝对关节运动 MovJ 到轨迹起点，等待实际到位"),
-            "play": (["trajectory_id", "speed_multiplier", "detect_collision", "confirm_move"],
-                     "先确认已在起点，准备使能/皮肤后由驱动以 50 Hz ServoJ 逐点发送录制关节角；保留录制时间比例"),
+            "start_trajectory": (["name", "confirm_move"], "清错、按需使能后由驱动发送 StartDrag 进入拖拽并开始录制；名称已存在则报错；完成通知表示机械臂已进入拖拽、正在录制"),
+            "stop_trajectory": (["confirm_move"], "结束录制：驱动发送 StopDrag 退出拖拽，以新反馈确认模式 5 停稳后保存；若操作者已提前退出拖拽，录制已自动结束，本操作返回其结果"),
+            "list_trajectories": ([], "列出本地轨迹名称、录制时间、时长、点数和完整性"),
+            "delete_trajectory": (["name", "confirm_move"], "按名称删除本地轨迹"),
+            "go_to_start": (["name", "velocity", "acceleration", "detect_collision", "confirm_move"],
+                            "校验本地轨迹，按绝对关节运动 MovJ 到轨迹起点，等待实际到位"),
+            "play": (["name", "speed_multiplier", "velocity", "acceleration", "detect_collision", "confirm_move"],
+                     "先运动到轨迹起点并核验到位（已在起点则跳过），再准备使能/皮肤，由驱动以 50 Hz ServoJ 逐点发送录制关节角；保留录制时间比例"),
             "pause": (["confirm_move"], "回放中：沿轨迹 0.5 秒减速并停在路径上；到起点运动中：暂停控制器队列"),
-            "resume": (["confirm_move"], "从暂停处继续：回放沿轨迹 0.5 秒加速，到起点运动直接 Continue；不清错、不重新 Enable、不设置安全皮肤"),
-            "stop_motion": (["confirm_move"], "终止回放；录制时中断并保留标为不完整的数据，等待按拖拽键退出拖拽并确认停稳后释放机械臂"),
+            "resume": (["confirm_move"], "从暂停处继续：回放沿轨迹 0.5 秒加速，到起点运动直接 Continue（到位后接着回放）；回放中不清错、不重新 Enable、不设置安全皮肤"),
+            "stop_motion": (["confirm_move"], "终止回放或到起点运动；录制时中断并保留标为不完整的数据，StopDrag 并确认停稳后释放机械臂"),
             "start": ([], "启动共享反馈连接"),
             "stop": ([], "结束本卡后台任务并释放资源"),
             "config": ([], "更新共享控制柜 IP/反馈端口；录制要求端口 30004"),
         }, {
-            "name": {"type": "string", "maxLength": 80, "description": "录制名称；每次生成独立编号，不覆盖同名录制"},
-            "trajectory_id": {"type": "string", "description": "start_record、stop_record 或 list_records 返回的轨迹编号"},
+            "name": {"type": "string", "maxLength": 80, "description": "轨迹名称，唯一标识一条轨迹；录制时同名将报错，回放和删除按名称查找"},
             "velocity": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10,
                          "description": "到起点运动速度，1–100%，默认 10%"},
             "acceleration": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10,
@@ -123,15 +128,18 @@ class Teaching(MotionCompletion):
         return definition
 
     def dispatch(self, action, args):
-        if action == "list_records":
-            return {"records": self.store.list_records()}
-        if action == "delete_record":
+        if action == "list_trajectories":
+            return {"trajectories": self.store.list_trajectories()}
+        if action == "delete_trajectory":
             if args.get("confirm_move") is not True:
                 raise ValueError("confirm_move=true is required")
             with self._lock:
                 if self._active is not None or self._resume_context is not None:
                     raise RuntimeError("stop the teaching operation before deleting a trajectory")
-                return self.store.delete(args.get("trajectory_id"))
+                recorder = self.recorder
+                if recorder is not None and not recorder.finished.is_set() and recorder.record["name"] == self.store.normalize(args.get("name")):
+                    raise RuntimeError("stop recording before deleting it")
+                return self.store.delete(args.get("name"))
         return self.start(action, args)
 
     def start(self, action, args, *, tool_name=None):
@@ -139,11 +147,12 @@ class Teaching(MotionCompletion):
             raise ValueError(f"unsupported teaching action: {action}")
         if args.get("confirm_move") is not True:
             raise ValueError("confirm_move=true is required")
+        if action == "start_trajectory":
+            self.store.check_new(args.get("name"))
         if action in ("go_to_start", "play"):
-            self.store._directory(args.get("trajectory_id"))
+            self.store._directory(args.get("name"))
             if type(args.get("detect_collision", False)) is not bool:
                 raise ValueError("detect_collision must be a boolean")
-        if action == "go_to_start":
             for field in ("velocity", "acceleration"):
                 value = args.get(field, 10)
                 if type(value) is not int or not 1 <= value <= 100:
@@ -155,18 +164,18 @@ class Teaching(MotionCompletion):
         try:
             context = None if self._notify is not None else self._callback_context()
         except Exception:
-            if action not in ("stop_record", "stop_motion"):
+            if action not in ("stop_trajectory", "stop_motion"):
                 raise
             context = None
         with self._lock:
             recording = self.recorder is not None and not self.recorder.finished.is_set()
-            if action == "stop_record" and self.recorder is None:
+            if action == "stop_trajectory" and self.recorder is None:
                 raise RuntimeError("no recording has been started")
             if action in ("pause", "resume") and self._resume_context is None and self._active is None:
                 raise RuntimeError("no teaching motion is available to resume or pause")
             if self._resume_context is not None and self._active is None and action not in ("resume", "stop_motion"):
                 raise RuntimeError("resume or stop the paused teaching motion first")
-            if recording and action not in ("stop_record", "stop_motion"):
+            if recording and action not in ("stop_trajectory", "stop_motion"):
                 raise RuntimeError("stop recording before starting another teaching action")
             if self._active is not None and action not in ("pause", "stop_motion"):
                 raise RuntimeError("another teach action is active")
@@ -175,23 +184,28 @@ class Teaching(MotionCompletion):
             lease = self.control.ownership.acquire("teach")
             self._held_lease = lease
             interrupted = self._active
+            # A ServoJ stream is slowed to rest along its path; a move to the start is
+            # paused through the controller queue, which needs that job cancelled.
+            stream_pause = (action == "pause" and interrupted is not None and "pause" in interrupted
+                            and not interrupted.get("moving"))
             if action == "stop_motion":
                 # Includes a stream still decelerating under a pause request.
                 for job in self._jobs.values():
                     job["cancel"].set()
             elif interrupted is not None:
-                if action == "pause" and "pause" in interrupted:
-                    # A ServoJ stream is slowed to rest along its path, not abandoned.
+                if stream_pause:
                     interrupted["pause"].set()
                 else:
                     interrupted["cancel"].set()
             identifier = f"dobot_cra_teach_{action}_{uuid4().hex}"
             active = {"action_id": identifier, "action": action, "cancel": threading.Event(), "lease": lease,
                       "tool": tool_name or "teach", "interrupting": interrupted is not None,
-                      "interrupted": interrupted}
-            if action == "play" or (action == "resume" and self._resume_context is not None
-                                    and "playback" in self._resume_context):
+                      "interrupted": interrupted, "stream_pause": stream_pause, "moving": False}
+            pending = self._resume_context or {}
+            if action == "play" or (action == "resume" and ("playback" in pending or "then" in pending)):
                 active["pause"] = threading.Event()
+            if action == "play" or (action == "resume" and "target" in pending):
+                active["moving"] = True
             self._active = active
             self._jobs[identifier] = active
             thread = threading.Thread(target=self._run_teach, args=(active, action, dict(args), context),
@@ -219,14 +233,14 @@ class Teaching(MotionCompletion):
                 continue
 
     def _confirm_drag_exit(self, wait_s):
-        """Never sends StopDrag: a button-initiated drag is left with the arm button
-        (StopDrag mid-drag left the field arm damped in mode 6 without drag status).
-        Success requires two consecutive packets, received after this request, at
-        rest in mode 5."""
+        """Leave drag and confirm it. StopDrag is sent once, and only when a packet received
+        after this request shows drag_status: never on stale feedback and never in the
+        inconsistent state (mode 6 without drag status), where it left the field arm
+        damped but unreported. Success requires two consecutive packets at rest in mode 5."""
         subscription = self.control.feedback.subscribe()
         try:
             started = time.monotonic()
-            previous, settled, last = None, 0, None
+            previous, settled, last, stop_sent = None, 0, None, False
             while True:
                 if self._shutting_down:
                     # A stopping driver cannot wait for the operator indefinitely.
@@ -235,12 +249,17 @@ class Teaching(MotionCompletion):
                 if item is None:
                     if last is not None and (last["robot_mode"] == 6 or last["drag_status"]):
                         raise TimeoutError(f"arm still in drag after {wait_s:g} s; press the drag button "
-                                           "on the arm to exit drag, then run stop_motion or stop_record")
+                                           "on the arm to exit drag, then run stop_motion or stop_trajectory")
                     raise TimeoutError("fresh feedback did not confirm leaving drag at rest in mode 5")
                 state = last = item["data"]
                 fault = protection_fault(state) or drag_state_fault(state)
                 if fault:
                     raise RuntimeError(f"cannot confirm exit from drag: {fault}")
+                if state["drag_status"] and not stop_sent:
+                    self.control.stop_drag()
+                    stop_sent, settled = True, 0
+                    previous = item["packet"]
+                    continue
                 if at_rest_after_drag(state):
                     consecutive = previous is not None and item["packet"] == previous + 1
                     settled = settled + 1 if settled and consecutive else 1
@@ -253,6 +272,7 @@ class Teaching(MotionCompletion):
             subscription.close()
 
     def _leave_drag(self, lease):
+        """Exit drag (StopDrag only per _confirm_drag_exit's guards), then release the arm."""
         try:
             self._confirm_drag_exit(self.drag_exit_timeout)
             self._drag_cleanup_failed = False
@@ -270,27 +290,60 @@ class Teaching(MotionCompletion):
         if not hasattr(feedback, "subscribe"):
             raise RuntimeError("recording feedback subscription is unavailable")
         record = self.store.create(args.get("name"), feedback.address)
+        name = record["name"]
         subscription = None
+        recorder = None
+        drag_error = None
         try:
-            # No StartDrag: the operator enters/leaves drag with the arm button,
-            # as many times as needed, until stop_record or the recording limit.
             self.control.prepare_record(cancel=active["cancel"])
             subscription = feedback.subscribe()
+            try:
+                self.control.start_drag(active["cancel"])
+            except Exception as exc:
+                # An unanswered StartDrag may still have taken effect: leave drag below.
+                if getattr(exc, "dobot_command_attempted", None) and not isinstance(exc, CommandRejected):
+                    drag_error = self._leave_drag(active["lease"])
+                raise
+            # Packets that arrived while StartDrag was in flight are stale for the recorder.
+            while True:
+                try:
+                    subscription.queue.get_nowait()
+                except queue.Empty:
+                    break
             recorder = TrajectoryRecorder(self.store, record, subscription,
                                           lambda: self._leave_drag(active["lease"]),
                                           max_gap_ms=self.gap_ms, max_duration_s=self.max_duration,
-                                          max_wait_s=self.max_duration)
+                                          max_wait_s=self.drag_start_timeout)
             with self._lock:
                 if active["cancel"].is_set():
                     raise RuntimeError("teaching interrupted")
                 self.recorder = recorder
                 recorder.start()
-            return {**self.store.summary(record), "drag": "waiting_for_first_manual_drag"}
+            deadline = time.monotonic() + self.drag_start_timeout + self.drag_exit_timeout + self.control.receive_timeout + 5
+            while not recorder.drag_started.is_set():
+                if active["cancel"].is_set():
+                    raise RuntimeError("teaching interrupted")
+                if recorder.finished.is_set():
+                    raise RuntimeError(recorder.record.get("reason") or "recording ended before the arm entered drag")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("arm did not report drag after StartDrag")
+                recorder.drag_started.wait(0.02)
+            return {**self.store.summary(record), "drag": "entered"}
         except Exception as exc:
-            if subscription is not None:
+            if recorder is not None and not recorder.finished.is_set():
+                recorder.stop(str(exc))
+                recorder.finished.wait(self.drag_exit_timeout + self.control.receive_timeout + 5)
+            elif subscription is not None:
                 subscription.close()
-            record.update(state="incomplete", reason=str(exc))
-            self.store.save(record)
+            if recorder is None or not recorder._points:
+                # Nothing was captured: do not leave the name occupied.
+                try:
+                    self.store.discard(name)
+                except Exception:
+                    record.update(state="incomplete", reason=str(exc))
+                    self.store.save(record)
+            if drag_error:
+                raise RuntimeError(f"{exc}; {drag_error}") from exc
             raise
 
     def _end_record(self, aborted=False):
@@ -304,7 +357,7 @@ class Teaching(MotionCompletion):
                 raise TimeoutError("recording cleanup did not finish")
         result = self.store.summary(recorder.record)
         if recorder.record["state"] != "recorded" and not aborted:
-            raise RuntimeError(f"recording incomplete ({result['trajectory_id']}): {result.get('reason')}")
+            raise RuntimeError(f"recording incomplete ({result['name']}): {result.get('reason')}")
         return result
 
     def _recording_to_stop(self):
@@ -408,14 +461,43 @@ class Teaching(MotionCompletion):
     def _play(self, active, playback, *, ramp_in):
         outcome = self._stream(active, playback, ramp_in=ramp_in)
         if outcome == "paused":
-            self._resume_context = {"trajectory_id": playback.trajectory_id, "playback": playback}
-            return "cancelled", {"reason": "paused", "trajectory_id": playback.trajectory_id,
+            self._resume_context = {"name": playback.name, "playback": playback}
+            return "cancelled", {"reason": "paused", "name": playback.name,
                                  "position_s": round(playback.position_ms / 1000, 3)}
         baseline = self.control.feedback.snapshot().get("packets_received")
         result = self._monitor_trajectory(active["cancel"], playback.at(playback.duration_ms), None, baseline,
                                           SERVO_SETTLE_S, observed_running=True)
-        result["trajectory_id"] = playback.trajectory_id
+        result["name"] = playback.name
         return "completed", result
+
+    def _move_to_start(self, active, name, start, args, then=None):
+        """MovJ to the first recorded pose; a pause during it uses the controller queue
+        and keeps `then` so that resume continues into the stream."""
+        parameters = {**args, **{f"{joint}_deg": value for joint, value in zip(JOINT_NAMES, start)}}
+        response = self.control.execute_motion("move_j", parameters, cancel=active["cancel"], owner="teach")
+        active["submitted"] = True
+        context = {"name": name, "target": start, "timeout": self.timeout}
+        if then is not None:
+            context["then"] = then
+        self._resume_context = context
+        result = self._monitor_trajectory(active["cancel"], start, response.get("result_id"),
+                                          response["submission_baseline"], self.timeout)
+        result["name"] = name
+        return result
+
+    def _stream_trajectory(self, active, name, points, speed, args, *, moved):
+        """Start position verified (by MovJ arrival or by prepare_playback): stream the take."""
+        with self._lock:
+            active["moving"] = False
+            self._resume_context = None
+            if active["cancel"].is_set():
+                raise RuntimeError("teaching interrupted")
+        self.control.prepare_playback(points[0], {**args, "start_tolerance_deg": self.tolerance},
+                                      cancel=active["cancel"])
+        active["submitted"] = True
+        status, result = self._play(active, ServoPlayback(name, points, speed), ramp_in=False)
+        result["moved_to_start"] = moved
+        return status, result
 
     def _monitor_trajectory(self, cancel, target, queue_id, baseline, timeout, *, observed_running=False):
         deadline = time.monotonic() + timeout
@@ -470,13 +552,12 @@ class Teaching(MotionCompletion):
 
     def _run_teach(self, active, action, args, context):
         status, result = "error", {"reason": "unknown"}
-        submitted = False
         keep_owner = False
         try:
-            if action == "start_record":
+            if action == "start_trajectory":
                 result = self._begin_record(active, args)
                 keep_owner = True
-            elif action == "stop_record":
+            elif action == "stop_trajectory":
                 if self._drag_cleanup_failed and self.recorder.finished.is_set():
                     self._leave_drag(active["lease"])
                 result = self._end_record()
@@ -492,7 +573,7 @@ class Teaching(MotionCompletion):
                 if error:
                     raise RuntimeError(error)
                 result = {"reason": "drag_stopped"}
-            elif action == "pause" and active["interrupted"] is not None and "pause" in active["interrupted"]:
+            elif action == "pause" and active["stream_pause"]:
                 stream = active["interrupted"]
                 deadline = time.monotonic() + SERVO_RAMP_S + 2 * self.control.receive_timeout + 5
                 while stream["thread"].is_alive():
@@ -504,13 +585,13 @@ class Teaching(MotionCompletion):
                 if self._resume_context is None or "playback" not in self._resume_context:
                     raise RuntimeError("playback ended before it could be paused")
                 result = self._confirm_rest(active["cancel"], self.control.enable_timeout)
-                result["trajectory_id"] = self._resume_context["trajectory_id"]
+                result["name"] = self._resume_context["name"]
                 keep_owner = True
             elif action in ("pause", "stop_motion"):
                 if action == "pause":
                     self._wait_motion_started(active["cancel"])
                 response = self.control.execute_motion(action, args, cancel=active["cancel"], owner="teach")
-                submitted = True
+                active["submitted"] = True
                 result = self._monitor_control(action, active["cancel"], response["submission_baseline"])
                 keep_owner = action == "pause"
                 if action == "stop_motion":
@@ -522,39 +603,39 @@ class Teaching(MotionCompletion):
                 if "playback" in pending:
                     self._check_servo_resume(pending["playback"])
                     self._resume_context = None
-                    submitted = True
+                    active["submitted"] = True
                     status, result = self._play(active, pending["playback"], ramp_in=True)
                     raise _Finished
                 response = self.control.execute_motion("resume", args, cancel=active["cancel"], owner="teach")
-                submitted = True
+                active["submitted"] = True
                 queue_id = response.get("resumed_command_id") or response.get("result_id")
                 result = self._monitor_trajectory(active["cancel"], pending["target"], queue_id,
                                                   response["submission_baseline"], pending["timeout"])
-                result["trajectory_id"] = pending["trajectory_id"]
+                result["name"] = pending["name"]
+                if "then" in pending:
+                    then = pending["then"]
+                    status, result = self._stream_trajectory(active, pending["name"], then["points"],
+                                                             then["speed"], then["args"], moved=True)
+                    raise _Finished
                 self._resume_context = None
             else:
-                record, data = self.store.playback(args["trajectory_id"], self.control.feedback.address)
+                record, data = self.store.playback(args["name"], self.control.feedback.address)
                 points = [point["joints_deg"] for point in data["points"]]
                 start = points[0]
                 if action == "go_to_start":
-                    parameters = {**args, **{f"{joint}_deg": value for joint, value in zip(JOINT_NAMES, start)}}
-                    response = self.control.execute_motion("move_j", parameters, cancel=active["cancel"], owner="teach")
-                    submitted = True
-                    self._resume_context = {"trajectory_id": record["trajectory_id"], "target": start,
-                                            "timeout": self.timeout}
-                    result = self._monitor_trajectory(active["cancel"], start, response.get("result_id"),
-                                                      response["submission_baseline"], self.timeout)
-                    result["trajectory_id"] = record["trajectory_id"]
+                    result = self._move_to_start(active, record["name"], start, args)
                     self._resume_context = None
                 else:
-                    actual = self.control.feedback.snapshot()["data"]["joint_state"]["q_actual"]
-                    if max(abs(a - b) for a, b in zip(actual, start)) > self.tolerance:
-                        raise RuntimeError("robot is not at the trajectory start; run go_to_start first")
-                    self.control.prepare_playback(start, {**args, "start_tolerance_deg": self.tolerance},
-                                                  cancel=active["cancel"])
-                    submitted = True
-                    playback = ServoPlayback(record["trajectory_id"], points, args.get("speed_multiplier", 1))
-                    status, result = self._play(active, playback, ramp_in=False)
+                    _, state = self._fresh_state("play")
+                    actual = state["joint_state"]["q_actual"]
+                    moved = max(abs(a - b) for a, b in zip(actual, start)) > self.tolerance
+                    speed = args.get("speed_multiplier", 1)
+                    if moved:
+                        # Reach the start first; arrival is verified from feedback before streaming.
+                        self._move_to_start(active, record["name"], start, args,
+                                            then={"points": points, "speed": speed, "args": args})
+                    status, result = self._stream_trajectory(active, record["name"], points, speed, args,
+                                                             moved=moved)
                     raise _Finished
             status = "completed"
         except _Finished:
@@ -569,7 +650,7 @@ class Teaching(MotionCompletion):
                 keep_owner = True
             # A driver shutdown cancels a ServoJ stream mid-path: stop the arm as well.
             if (status == "error" or self._shutting_down) and (
-                    (submitted and action in ("go_to_start", "play", "resume")) or
+                    (active.get("submitted") and action in ("go_to_start", "play", "resume")) or
                     uncertain_motion or (action == "pause" and active["interrupting"])):
                 try:
                     stop = self.control.execute_motion("stop_motion", {"confirm_move": True}, owner="teach")

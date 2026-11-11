@@ -154,9 +154,9 @@ class RobotController:
         if (state["robot_mode"] not in allowed_modes or state["running_status"] or
                 state["jog_status"] or state["drag_status"] or any(state["brake_released"])):
             raise RuntimeError("robot must be stationary with locked brakes before preparing motion")
-        if action in ("move_j", "rel_joint_mov_j", "start_record") and state["robot_mode"] == 10:
+        if action in ("move_j", "rel_joint_mov_j", "start_trajectory") and state["robot_mode"] == 10:
             raise RuntimeError("stop the paused queue before preparing a new motion or recording")
-        if action in ("move_j", "rel_joint_mov_j", "start_record") and state["robot_mode"] not in (9, 11) and (
+        if action in ("move_j", "rel_joint_mov_j", "start_trajectory") and state["robot_mode"] not in (9, 11) and (
                 state["pause_cmd_flag"] or (state["run_queued_cmd"] and not allow_own_queue)):
             raise RuntimeError("move_j requires an idle robot without a paused or running queue")
         return sample
@@ -271,7 +271,7 @@ class RobotController:
             self._update(dashboard_connected=True)
 
     def prepare_record(self, *, cancel=None):
-        """ClearError/EnableRobot only; the operator enters drag manually."""
+        """ClearError/EnableRobot only; start_drag follows once recording is subscribed."""
         self.ownership.check("teach")
 
         def check(current_action, *, allow_own_queue=False):
@@ -279,7 +279,43 @@ class RobotController:
                 raise RuntimeError("teaching interrupted")
             return self._check_preparation_state(current_action, allow_own_queue=allow_own_queue)
 
-        return self._execute("start_record", None, check, card="teach")
+        return self._execute("start_trajectory", None, check, card="teach")
+
+    def _immediate(self, command, cancel=None, *, require_idle):
+        """One immediate Dashboard command, serialized with every other command.
+        A cancelled request is dropped under the command lock, so it cannot follow a later stop."""
+        self.ownership.check("teach")
+        with self._command_lock:
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("teaching interrupted")
+            if not self.feedback.address:
+                raise RuntimeError("configure the controller IP before sending commands")
+            if require_idle:
+                address = self._check_motion_state("move_j")["controller_ip"]
+            else:
+                address = self.feedback.address
+            request = {"action": command, "timestamp_ms": int(time.time() * 1000), "controller_ip": address,
+                       "read_only": False, "effect_verified": False}
+            try:
+                self._connect(address)
+                reply = getattr(self._api, command)()
+                parse_response(reply, command)
+                self._update("teach", last_request={**request, "state": "accepted", "response": reply},
+                             last_error=None)
+            except Exception as exc:
+                exc.dobot_command_attempted = command
+                self._update("teach", last_request={**request, "state": "failed_or_outcome_unknown",
+                                                    "error": str(exc)}, last_error=str(exc))
+                self._close()
+                raise
+
+    def start_drag(self, cancel):
+        """Enter drag from rest (enabled, mode 5, no alarm); the effect is read from feedback."""
+        self._immediate("StartDrag", cancel, require_idle=True)
+
+    def stop_drag(self):
+        """Leave drag; callers send this only while fresh feedback shows the drag we started."""
+        self._immediate("StopDrag", require_idle=False)
 
     def prepare_playback(self, start_joints, args, *, cancel=None):
         """Same preparation as move_j (ClearError, enable, skin, ClearError), then
@@ -353,7 +389,7 @@ class RobotController:
                 self._connect(sample["controller_ip"])
                 # Connecting can take long enough for feedback/state to change.
                 check_state(action)
-                if action in ("move_j", "rel_joint_mov_j", "start_record"):
+                if action in ("move_j", "rel_joint_mov_j", "start_trajectory"):
                     pre_enable_clear = self._api.ClearError()
                     parse_response(pre_enable_clear, "ClearError")
                     request["pre_enable_clear_error_response"] = pre_enable_clear
@@ -394,14 +430,14 @@ class RobotController:
                     parse_response(clear_reply, "ClearError")
                     request["clear_error_response"] = clear_reply
                     self._wait_preparation_queue(action, check_state, skin_queue_id, baseline)
-                if action in ("move_j", "rel_joint_mov_j", "start_record"):
+                if action in ("move_j", "rel_joint_mov_j", "start_trajectory"):
                     # ACKs can precede the feedback packet reporting the effect.
                     # Wait for final motion conditions only after all preparation.
                     deadline = time.monotonic() + self.enable_timeout
                     while True:
                         check_state(action)
                         try:
-                            self._check_motion_state("move_j" if action == "start_record" else action)
+                            self._check_motion_state("move_j" if action == "start_trajectory" else action)
                             break
                         except RuntimeError:
                             if time.monotonic() >= deadline:

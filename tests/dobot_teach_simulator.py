@@ -109,6 +109,9 @@ class RobotSimulator:
                 result = str(self.command_id)
             elif name == "StartDrag":
                 self.mode = 6
+            elif name == "StopDrag":
+                # Field CR3A: one mode-5 packet still reports RunningStatus=1 after leaving drag.
+                self.mode, self.hand_velocity, self.running_packets = 5, 0.0, 1
             elif name == "ServoJ":
                 values = command[len(name) + 1:-1].split(",")
                 target = [float(value) for value in values[:6]]

@@ -1,6 +1,7 @@
 """Offline recording integrity, playback samples and card contracts."""
 
 import copy
+from datetime import datetime
 import hashlib
 import struct
 import threading
@@ -28,7 +29,7 @@ def recording(store, angles=None, name="测试轨迹"):
     data = {"version": 1, "sample_ms": 50,
             "frames": {"user": 0, "tool": 0, "user_value": [0.0] * 6, "tool_value": [0.0] * 6},
             "points": points}
-    path = store._directory(record["trajectory_id"]) / "samples.json"
+    path = store._directory(record["name"]) / "samples.json"
     atomic_json(path, data)
     record.update(state="recorded", point_count=len(points), duration_s=points[-1]["time_ms"] / 1000,
                   samples_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
@@ -101,29 +102,37 @@ def waiting(tmp_path):
 def test_waiting_for_first_drag_produces_no_points(tmp_path):
     rec, state, _ = waiting(tmp_path)
     assert feed(rec, state, 5, 50) == [None] * 50
-    assert rec._points == [] and rec.drag_entries == 0 and rec._origin is None
+    assert rec._points == [] and not rec.drag_started.is_set() and rec._origin is None
     rec.subscription.close()
 
 
-def test_multiple_drag_cycles_share_one_continuous_time_axis(tmp_path):
+def test_leaving_drag_ends_the_take_but_pauses_before_it_are_kept_on_one_time_axis(tmp_path):
     rec, state, _ = waiting(tmp_path)
     feed(rec, state, 5, 10)
     first = feed(rec, state, 6, 25, velocity=100)         # 200 ms drag
     held = state["joint_state"]["q_actual"][0]
-    pause = feed(rec, state, 5, 50)                        # 400 ms idle pause
-    feed(rec, state, 6, 25, velocity=-50)                  # second drag
-    feed(rec, state, 5, 25)
+    assert rec.drag_started.is_set() and not rec.drag_exited
+    feed(rec, state, 5, 3)                                  # 16 ms of mode 5 is not yet an exit
+    assert not rec.drag_exited
+    feed(rec, state, 6, 1)                                  # back in drag within the window
+    feed(rec, state, 5, 2)
+    assert not rec.drag_exited
+    pause = feed(rec, state, 5, 50)                         # mode 5 for >= 24 ms: the arm left drag
+    assert rec.drag_exited and not rec.limit_reached
     assert first[0]["time_ms"] == 0 and all(item is not None for item in pause)
-    assert {item["robot_mode"] for item in pause} == {5}
-    assert rec.drag_entries == 2 and not rec.limit_reached
     times = [point["time_ms"] for point in rec._points]
     assert times == list(range(0, len(times) * 50, 50))
-    # 124 packets * 8 ms after the first drag packet: one axis, no reset per drag.
-    assert rec._previous["time_ms"] == 124 * 8 and times[-1] == 124 * 8 // 50 * 50
-    # The pause is kept as real time at the held angle, not removed or spliced.
-    paused = [p["joints_deg"][0] for p in rec._points if 250 <= p["time_ms"] <= 550]
-    assert len(paused) == 7 and all(abs(q - held) < 1e-9 for q in paused)
-    assert rec._points[-1]["joints_deg"][0] < held
+    # The idle tail stays on the time axis at the held angle.
+    assert abs(rec._points[-1]["joints_deg"][0] - held) < 1.0
+    rec.subscription.close()
+
+
+def test_first_drag_packet_marks_the_drag_as_started(tmp_path):
+    rec, state, _ = waiting(tmp_path)
+    feed(rec, state, 5, 5)
+    assert not rec.drag_started.is_set() and not rec.drag_exited
+    feed(rec, state, 0, 1)                                  # field: entry is reported as mode 0
+    assert rec.drag_started.is_set()
     rec.subscription.close()
 
 
@@ -203,7 +212,7 @@ def test_field_drag_button_sequence_replays_without_interruption(tmp_path):
     assert results[:10] == [None] * 10
     # Mode 0 already carries real angles and starts the time axis.
     assert results[10]["robot_mode"] == 0 and results[10]["time_ms"] == 0
-    assert rec.drag_entries == 2 and all(item is not None for item in results[10:])
+    assert rec.drag_exited and all(item is not None for item in results[10:])
     times = [point["time_ms"] for point in rec._points]
     assert times == list(range(0, len(times) * 50, 50))
     rec.subscription.close()
@@ -326,41 +335,73 @@ def test_failed_recording_leaves_partial_data_and_confirms_cleanup(tmp_path):
     assert rec.record["state"] == "incomplete"
     assert "feedback missing" in rec.record["reason"]
     assert finished == [True]
-    assert (rec.store._directory(rec.record["trajectory_id"]) / "raw.jsonl").exists()
+    assert (rec.store._directory(rec.record["name"]) / "raw.jsonl").exists()
 
 
 def test_restart_marks_unfinished_recording_incomplete(tmp_path):
     store = recorded_store(tmp_path)
     record = store.create("unfinished", "127.0.0.1")
     recovered = TrajectoryStore(store.root)
-    assert recovered.load(record["trajectory_id"])["state"] == "incomplete"
-    assert "restarted" in recovered.load(record["trajectory_id"])["reason"]
+    assert recovered.load(record["name"])["state"] == "incomplete"
+    assert "restarted" in recovered.load(record["name"])["reason"]
 
 
 def test_playback_returns_verified_samples_and_delete_removes_local_files(tmp_path):
     store = recorded_store(tmp_path)
     record, data = recording(store)
-    directory = store._directory(record["trajectory_id"])
+    directory = store._directory(record["name"])
     (directory / "native.csv").write_text("left by an earlier version")
-    loaded, samples = store.playback(record["trajectory_id"], "127.0.0.1")
-    assert loaded["trajectory_id"] == record["trajectory_id"] and samples["points"] == data["points"]
+    loaded, samples = store.playback(record["name"], "127.0.0.1")
+    assert loaded["name"] == record["name"] and samples["points"] == data["points"]
     assert "native_state" not in store.summary(loaded)
-    assert store.delete(record["trajectory_id"]) == {"trajectory_id": record["trajectory_id"], "state": "deleted"}
-    assert not directory.exists() and store.list_records() == []
+    assert store.delete(record["name"]) == {"name": record["name"], "state": "deleted"}
+    assert not directory.exists() and store.list_trajectories() == []
+
+
+def test_names_are_the_only_identity_and_a_duplicate_is_rejected(tmp_path):
+    store = recorded_store(tmp_path)
+    created = store.create("同名轨迹", "127.0.0.1")
+    assert "trajectory_id" not in created and created["name"] == "同名轨迹"
+    store.create("e\u0301", "127.0.0.1")
+    with pytest.raises(ValueError, match="already exists"):
+        store.create("\u00e9", "127.0.0.1")  # canonically equivalent
+    with pytest.raises(ValueError, match="already exists"):
+        store.create("  同名轨迹  ", "127.0.0.1")
+    with pytest.raises(ValueError, match="already exists"):
+        store.check_new("同名轨迹")
+    store.check_new("另一个名字")
+
+
+def test_recording_time_is_stored_and_listed(tmp_path):
+    store = recorded_store(tmp_path)
+    record = store.create("timed", "127.0.0.1")
+    assert datetime.fromisoformat(record["recorded_at"]).tzinfo is not None
+    assert abs(record["created_at_ms"] / 1000 - time.time()) < 5
+    assert store.list_trajectories()[0]["recorded_at"] == record["recorded_at"]
+    assert store.summary(record)["recorded_at"] == record["recorded_at"]
+
+
+def test_trajectories_are_listed_newest_first(tmp_path):
+    store = recorded_store(tmp_path)
+    for index, name in enumerate(("old", "new")):
+        record = store.create(name, "127.0.0.1")
+        record["recorded_at"] = f"2026-11-1{index}T10:00:00+08:00"
+        store.save(record)
+    assert [item["name"] for item in store.list_trajectories()] == ["new", "old"]
 
 
 def test_wrong_controller_is_rejected(tmp_path):
     store = recorded_store(tmp_path)
     record, _ = recording(store)
     with pytest.raises(RuntimeError, match="different controller"):
-        store.playback(record["trajectory_id"], "127.0.0.2")
+        store.playback(record["name"], "127.0.0.2")
 
 
 def test_incomplete_recording_cannot_be_played(tmp_path):
     store = recorded_store(tmp_path)
     record = store.create("unfinished", "127.0.0.1")
     with pytest.raises(RuntimeError, match="not complete"):
-        store.playback(record["trajectory_id"], "127.0.0.1")
+        store.playback(record["name"], "127.0.0.1")
 
 
 def test_servo_playback_interpolates_along_the_recording():
@@ -373,14 +414,21 @@ def test_servo_playback_interpolates_along_the_recording():
 def test_tampered_recording_is_rejected(tmp_path):
     store = recorded_store(tmp_path)
     record, _ = recording(store)
-    (store._directory(record["trajectory_id"]) / "samples.json").write_text("{}")
+    (store._directory(record["name"]) / "samples.json").write_text("{}")
     with pytest.raises(RuntimeError, match="checksum"):
-        store.samples(record["trajectory_id"])
+        store.samples(record["name"])
 
 
-@pytest.mark.parametrize("bad", ["../x", "x);Stop();", "x\n", "", None, "A" * 32])
-def test_trajectory_ids_are_validated(tmp_path, bad):
+@pytest.mark.parametrize("bad", [None, 1, "", "   ", "a\x00b", "line\nbreak", "A" * 81])
+def test_invalid_names_are_rejected(tmp_path, bad):
     with pytest.raises(ValueError): TrajectoryStore(tmp_path)._directory(bad)
+
+
+def test_any_printable_name_maps_to_a_safe_directory(tmp_path):
+    store = TrajectoryStore(tmp_path)
+    for name in ("../x", "x);Stop();", "路径/轨迹", "a" * 80):
+        directory = store._directory(name)
+        assert directory.parent == store.root and len(directory.name) == 32
 
 
 def test_card_contract_keeps_sensor_and_confirmation_conventions():
@@ -395,14 +443,20 @@ def test_card_contract_keeps_sensor_and_confirmation_conventions():
     assert set(schema["properties"]["confirm_move"]) == {"type", "description"}
     assert schema["x-completion"]["timeout"] > 2000
     assert plugin.dispatch("info", {"_tool_name": "teach"}) == teach
-    assert "action" not in definitions["joints"]["inputSchema"]["properties"] or "start_record" not in str(definitions["joints"])
+    actions = schema["properties"]["action"]["enum"]
+    assert {"start_trajectory", "stop_trajectory", "list_trajectories", "delete_trajectory", "go_to_start",
+            "play"} <= set(actions)
+    assert not any("record" in action for action in actions)
+    assert "trajectory_id" not in schema["properties"]
+    assert "name" in schema["properties"]
+    assert "action" not in definitions["joints"]["inputSchema"]["properties"] or "start_trajectory" not in str(definitions["joints"])
 
 
 @pytest.mark.parametrize("bad", [None, 1, "true", False])
 def test_teaching_requires_literal_true(bad):
     plugin = DobotSensors({})
     with pytest.raises(ValueError, match="confirm_move"):
-        plugin.teach.start("start_record", {"name": "a", "confirm_move": bad})
+        plugin.teach.start("start_trajectory", {"name": "a", "confirm_move": bad})
 
 
 def test_interruption_is_irrevocable_and_sealed_at_final_save(tmp_path):

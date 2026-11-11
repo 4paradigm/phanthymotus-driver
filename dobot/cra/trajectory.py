@@ -1,4 +1,4 @@
-"""Persistent timestamped recordings, played back by the driver as a ServoJ stream.
+"""Persistent timestamped recordings named by the user, played back as a ServoJ stream.
 
 Nothing is uploaded to the controller: recordings stay local (50 ms joint samples
 in degrees) and the teach card streams them over the Dashboard connection.
@@ -7,16 +7,16 @@ in degrees) and the teach card streams them over the Dashboard connection.
 from __future__ import annotations
 
 import copy
+from datetime import datetime
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import queue
-import re
 import threading
 import time
-from uuid import uuid4
+import unicodedata
 
 if __package__:
     from .control import JOINT_LIMITS_DEG
@@ -29,6 +29,8 @@ MAX_BYTES = 32 * 1024 * 1024
 REST_SPEED_DEG_S = 0.1
 # Field capture: one mode-5 packet with running_status=1 right after leaving drag.
 DRAG_EXIT_RUNNING_MS = 100
+# Mode 5 this long after the drag began means the drag was left (e.g. the arm button).
+DRAG_EXIT_MS = 24
 
 
 def protection_fault(state):
@@ -95,19 +97,36 @@ def atomic_json(path, value):
 
 
 class TrajectoryStore:
+    """One directory per trajectory name. The directory is a hash of the name, so any
+    printable name is a safe path and creating it is an atomic uniqueness check."""
+
     def __init__(self, directory):
         self.root = Path(directory).expanduser().resolve()
         self._lock = threading.RLock()
         # Lazy directory creation: simply discovering cards has no disk effects.
         self._recovered = False
 
-    def _directory(self, identifier):
-        if not isinstance(identifier, str) or not re.fullmatch(r"[a-f0-9]{32}", identifier):
-            raise ValueError("invalid trajectory_id")
-        path = self.root / identifier
+    @staticmethod
+    def normalize(name):
+        if not isinstance(name, str):
+            raise ValueError("name must contain 1..80 printable characters")
+        name = unicodedata.normalize("NFC", name).strip()
+        if not name or len(name) > 80 or any(ord(c) < 32 or ord(c) == 127 for c in name):
+            raise ValueError("name must contain 1..80 printable characters")
+        return name
+
+    def _directory(self, name):
+        path = self.root / hashlib.sha256(self.normalize(name).encode("utf-8")).hexdigest()[:32]
         if path.is_symlink():
             raise ValueError("trajectory directory may not be a symlink")
         return path
+
+    def exists(self, name):
+        return self._directory(name).exists()
+
+    def check_new(self, name):
+        if self.exists(name):
+            raise ValueError(f"trajectory name already exists: {self.normalize(name)}")
 
     def _read(self, path):
         if path.is_symlink() or path.stat().st_size > MAX_BYTES:
@@ -132,34 +151,36 @@ class TrajectoryStore:
             self._recovered = True
 
     def create(self, name, address):
-        if not isinstance(name, str) or not name.strip() or len(name) > 80 or any(ord(c) < 32 for c in name):
-            raise ValueError("name must contain 1..80 printable characters")
+        name = self.normalize(name)
         self.recover()
         with self._lock:
-            identifier = uuid4().hex
-            directory = self._directory(identifier)
-            directory.mkdir()
-            record = {"trajectory_id": identifier, "name": name.strip(), "version": 1,
-                      "controller_ip": address, "robot_type": 113, "state": "recording",
-                      "created_at_ms": int(time.time() * 1000), "sample_ms": SAMPLE_MS,
+            directory = self._directory(name)
+            try:
+                directory.mkdir()
+            except FileExistsError:
+                raise ValueError(f"trajectory name already exists: {name}") from None
+            now = datetime.now().astimezone()
+            record = {"name": name, "version": 2, "controller_ip": address, "robot_type": 113,
+                      "state": "recording", "recorded_at": now.isoformat(timespec="seconds"),
+                      "created_at_ms": int(now.timestamp() * 1000), "sample_ms": SAMPLE_MS,
                       "point_count": 0, "duration_s": 0}
             atomic_json(directory / "manifest.json", record)
             return record
 
-    def load(self, identifier):
+    def load(self, name):
         self.recover()
         with self._lock:
-            return self._read(self._directory(identifier) / "manifest.json")
+            return self._read(self._directory(name) / "manifest.json")
 
     def save(self, record):
         with self._lock:
-            atomic_json(self._directory(record["trajectory_id"]) / "manifest.json", record)
+            atomic_json(self._directory(record["name"]) / "manifest.json", record)
 
-    def samples(self, identifier):
-        record = self.load(identifier)
+    def samples(self, name):
+        record = self.load(name)
         if record["state"] != "recorded":
             raise RuntimeError(f"trajectory is not complete: {record.get('reason', record['state'])}")
-        path = self._directory(identifier) / "samples.json"
+        path = self._directory(name) / "samples.json"
         data = self._read(path)
         if hashlib.sha256(path.read_bytes()).hexdigest() != record.get("samples_sha256"):
             raise RuntimeError("recorded trajectory checksum mismatch")
@@ -172,50 +193,58 @@ class TrajectoryStore:
             check_joints(point["joints_deg"])
         return data
 
-    def list_records(self):
+    def list_trajectories(self):
         self.recover()
         records = []
         with self._lock:
             for path in sorted(self.root.glob("*/manifest.json")):
                 try:
-                    record = self.load(path.parent.name)
+                    record = self._read(path)
+                    # Directories from versions that used generated ids are not addressable by name.
+                    if path.parent != self._directory(record["name"]):
+                        continue
                     records.append(self.summary(record))
-                except (ValueError, OSError):
+                except (KeyError, ValueError, OSError):
                     continue
-        return records
+        return sorted(records, key=lambda item: item.get("recorded_at", ""), reverse=True)
 
     @staticmethod
     def summary(record):
-        keys = ("trajectory_id", "name", "state", "end_reason", "sample_ms", "duration_s", "point_count", "reason")
+        keys = ("name", "state", "end_reason", "recorded_at", "sample_ms", "duration_s", "point_count",
+                "reason", "note")
         return {key: record[key] for key in keys if key in record}
 
-    def delete(self, identifier):
-        record = self.load(identifier)
+    def delete(self, name):
+        record = self.load(name)
         if record["state"] == "recording":
             raise RuntimeError("stop recording before deleting it")
+        self.discard(name)
+        return {"name": record["name"], "state": "deleted"}
+
+    def discard(self, name):
+        """Remove a trajectory directory (also a recording that never captured a point)."""
         with self._lock:
-            directory = self._directory(identifier)
+            directory = self._directory(name)
             # native.csv: left by earlier versions that exported controller CSV files.
             names = ("raw.jsonl", "samples.json", "manifest.json", "native.csv")
-            if any((directory / name).is_symlink() for name in names):
+            if any((directory / file).is_symlink() for file in names):
                 raise ValueError("trajectory files may not be symlinks")
-            for name in names:
-                (directory / name).unlink(missing_ok=True)
+            for file in names:
+                (directory / file).unlink(missing_ok=True)
             directory.rmdir()
-        return {"trajectory_id": identifier, "state": "deleted"}
 
-    def playback(self, identifier, address):
+    def playback(self, name, address):
         """Verified local samples for joint-space ServoJ playback on this controller."""
-        data = self.samples(identifier)
-        record = self.load(identifier)
+        data = self.samples(name)
+        record = self.load(name)
         if record["controller_ip"] != address:
             raise RuntimeError("trajectory belongs to a different controller")
         return record, data
 
 
 class TrajectoryRecorder:
-    """One recording: wait for the first manual drag, then a continuous time axis
-    across any number of drag (mode 6) and idle (mode 5) phases until stopped."""
+    """One recording: the driver has asked the arm to enter drag; points start with the
+    first drag packet and end at a stop request, the limit, or the arm leaving drag."""
 
     def __init__(self, store, record, subscription, on_finished, *, max_gap_ms=50, max_duration_s=500,
                  max_wait_s=None, clock=time.monotonic):
@@ -232,9 +261,10 @@ class TrajectoryRecorder:
         self._reason_lock = threading.Lock()
         self._sealed = False
         self.limit_reached = False
-        self.drag_entries = 0
-        self._mode = None
-        self._transition_since = None
+        self.drag_started = threading.Event()
+        # The arm left drag by itself (e.g. the operator pressed the arm's drag button).
+        self.drag_exited = False
+        self._exit_since = None
         self._last_drag_ms = None
         self._points = []
         self._previous = None
@@ -245,7 +275,7 @@ class TrajectoryRecorder:
         self.thread.start()
 
     def stop(self, reason=None):
-        """reason=None is a normal stop_record; any reason marks the take incomplete.
+        """reason=None is a normal stop_trajectory; any reason marks the take incomplete.
         An interruption is irrevocable: a later normal stop never clears it. Returns
         False once the outcome is sealed (the interruption arrived too late to apply)."""
         with self._reason_lock:
@@ -286,9 +316,13 @@ class TrajectoryRecorder:
                     timestamp - self._last_drag_ms <= DRAG_EXIT_RUNNING_MS)
             if fault and not blip:
                 raise RuntimeError(f"recording interrupted: {fault}")
-        if mode in (0, 6) and self._mode not in (0, 6):
-            self.drag_entries += 1
-        self._mode = mode
+        if mode in (0, 6):
+            self.drag_started.set()
+            self._exit_since = None
+        elif self.drag_started.is_set():
+            self._exit_since = timestamp if self._exit_since is None else self._exit_since
+            if timestamp - self._exit_since >= DRAG_EXIT_MS:
+                self.drag_exited = True
         if self._previous is None and mode == 5:
             return None
         joints = check_joints(state["joint_state"]["q_actual"])
@@ -321,7 +355,7 @@ class TrajectoryRecorder:
     def _run(self):
         reason = None
         armed = last_packet = self._clock()
-        directory = self.store._directory(self.record["trajectory_id"])
+        directory = self.store._directory(self.record["name"])
         try:
             with (directory / "raw.jsonl").open("x", encoding="utf-8") as file:
                 while not self.stop_event.is_set():
@@ -337,13 +371,13 @@ class TrajectoryRecorder:
                     raw = self._consume(item)
                     if raw is None:
                         if last_packet - armed >= self.max_wait_s:
-                            raise RuntimeError(f"no manual drag within {self.max_wait_s:g} s")
+                            raise RuntimeError(f"arm did not enter drag within {self.max_wait_s:g} s")
                         continue
                     file.write(json.dumps(raw, allow_nan=False, separators=(",", ":")) + "\n")
                     file.flush()
                     if file.tell() > MAX_BYTES:
                         raise RuntimeError("recording exceeds storage size limit")
-                    if self.limit_reached:
+                    if self.limit_reached or self.drag_exited:
                         break
                 file.flush()
                 os.fsync(file.fileno())
@@ -353,7 +387,7 @@ class TrajectoryRecorder:
         finally:
             self.subscription.close()
             if not self._points:
-                reason = reason or "no manual drag was detected before the recording ended"
+                reason = reason or "the arm did not enter drag before the recording ended"
             elif len(self._points) < 2:
                 reason = reason or "recording needs at least two samples (50 ms apart)"
             try:
@@ -365,13 +399,16 @@ class TrajectoryRecorder:
                 reason = f"{reason}; {cleanup_error}" if reason else cleanup_error
             # stop_motion/shutdown may arrive while the exit is being confirmed.
             reason = self._seal(reason)
-            end_reason = "interrupted" if reason else ("limit_reached" if self.limit_reached else "stop_record")
+            end_reason = "interrupted" if reason else (
+                "limit_reached" if self.limit_reached else "drag_exited" if self.drag_exited else "stop_trajectory")
             try:
                 data = {"version": 1, "sample_ms": SAMPLE_MS, "frames": self._frames, "points": self._points}
                 path = directory / "samples.json"
                 atomic_json(path, data)
                 self.record.update(state="incomplete" if reason else "recorded", reason=reason,
-                                   end_reason=end_reason, drag_entries=self.drag_entries,
+                                   end_reason=end_reason,
+                                   **({"note": "the arm left drag; recording stopped automatically and is usable"}
+                                      if end_reason == "drag_exited" else {}),
                                    point_count=len(self._points),
                                    duration_s=(len(self._points) - 1) * SAMPLE_MS / 1000 if self._points else 0,
                                    samples_sha256=hashlib.sha256(path.read_bytes()).hexdigest())

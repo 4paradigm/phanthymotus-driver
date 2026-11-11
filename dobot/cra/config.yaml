@@ -23,9 +23,11 @@ teach:
   data_dir: data/dobot-teach
   max_recording_s: 500
   max_gap_ms: 50
-  # stop_record/stop_motion never send StopDrag; wait this long for the
-  # operator to press the drag button and the arm to settle in mode 5.
-  drag_exit_timeout_s: 60
+  # start_trajectory sends StartDrag; wait this long for the arm to report drag.
+  drag_start_timeout_s: 5
+  # stop_trajectory/stop_motion send StopDrag only while feedback shows drag; wait
+  # this long for the arm to report rest in mode 5 (otherwise press the arm's drag button).
+  drag_exit_timeout_s: 10
 ros:
   robot_domain_id: 42
   core_domain_id: 42

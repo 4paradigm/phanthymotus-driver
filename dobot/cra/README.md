@@ -9,7 +9,7 @@
 |---|---|---|
 | `joint_move` | actuator | 绝对/相对关节运动、停止、暂停及继续 |
 | `joints` | sensor | 六轴实际角度驱动的 CR3A 结构骨架、逐关节转角 JSON，以及共享连接配置 |
-| `teach` | actuator | 后台拖拽录制、轨迹管理、到起点运动、ServoJ 流式回放及暂停/恢复 |
+| `teach` | actuator | 驱动控制的拖拽录制、按名称管理轨迹、到起点运动、ServoJ 流式回放及暂停/恢复 |
 
 `model` 为渲染器内部读取的 resource，不是可见卡片。
 本版不注册 `safe_skin` 或 `safe_skin_control`，不发布安全皮肤 topic。
@@ -161,53 +161,60 @@ TLS 保持校验；停止在反馈或证书配置异常时仍可下发，但不�
 
 | action | 行为 |
 |---|---|
-| `start_record` | 指定 `name`，ClearError、按需 EnableRobot，不发送 StartDrag；之后等待操作者按机械臂拖拽键首次进入拖拽 |
-| `stop_record` | 结束整次录制；**不发送 StopDrag**，仍在拖拽时等待操作者按拖拽键退出；以新反馈确认模式 5 停稳后保存到本地 |
-| `list_records` | 返回轨迹编号、名称、完整性、结束原因、时长、点数 |
-| `delete_record` | 删除本地录制；禁止删除正在使用或暂停中的录制 |
-| `go_to_start` | 校验本地录制（校验值、控制器 IP），使用 MovJ 到起点并确认到位 |
-| `play` | 确认已在起点，复用新运动准备（清错、使能、皮肤），由驱动以 50 Hz ServoJ 逐点发送录制关节角，等待实际结束 |
-| `pause` | 回放中：沿轨迹在 0.5 秒内线性减速到停，停在路径上并以模式 5 停稳确认；到起点运动中：控制器 Pause（模式 10） |
-| `resume` | 回放：确认停稳、无保护、仍在暂停位置后沿轨迹 0.5 秒加速继续；到起点：Continue。均不清错、不 Enable、不重新设置皮肤 |
-| `stop_motion` | 立即结束 ServoJ 流并发送 Stop，之后不会再发出任何目标点；录制时作为中断处理，等待按拖拽键退出拖拽，保留标为不完整的采集数据 |
+| `start_trajectory` | 指定 `name`（已存在则报错，不覆盖）；ClearError、按需 EnableRobot，**由驱动发送 StartDrag 进入拖拽**并开始录制；完成通知表示机械臂已进入拖拽 |
+| `stop_trajectory` | 结束录制；驱动发送 StopDrag 退出拖拽，以新反馈确认模式 5 停稳后保存到本地。若操作者已提前退出拖拽，录制已自动结束，本操作返回其结果 |
+| `list_trajectories` | 返回名称、录制时间、完整性、结束原因、时长、点数（按录制时间由新到旧） |
+| `delete_trajectory` | 按名称删除本地轨迹；禁止删除正在录制、使用或暂停中的轨迹 |
+| `go_to_start` | 校验本地轨迹（校验值、控制器 IP），使用 MovJ 到起点并确认到位；保留为独立 action |
+| `play` | 先核验当前位置：不在起点（target_tolerance_deg 内）则 MovJ 到起点并以新反馈确认到位，已在起点则跳过；之后复用新运动准备（清错、使能、皮肤），由驱动以 50 Hz ServoJ 逐点发送录制关节角，等待实际结束。结果含 `moved_to_start` |
+| `pause` | 回放中：沿轨迹在 0.5 秒内线性减速到停，停在路径上并以模式 5 停稳确认；到起点运动中（含 play 的到起点阶段）：控制器 Pause（模式 10） |
+| `resume` | 回放：确认停稳、无保护、仍在暂停位置后沿轨迹 0.5 秒加速继续；到起点：Continue，到位确认后接着开始回放。均不清错、不 Enable（到起点后的回放准备除外）、不重新设置皮肤 |
+| `stop_motion` | 立即结束 ServoJ 流并发送 Stop，之后不会再发出任何目标点；录制时作为中断处理，StopDrag 并确认停稳，保留标为不完整的采集数据 |
 
 除列表查询外，业务 action 都需要手动填写 `confirm_move=true`；该字段不设默认值或枚举。
 
-### 一次录制、多次拖拽
+### 命名与存储
 
-流程：start_record → 等待首次拖拽 → 拖拽（模式 6）⇄ 非拖拽停顿（模式 5），可反复多次 → stop_record → 确认退出拖拽并保存。
-按拖拽键退出拖拽**不会**结束录制；正常结束只有 stop_record 或达到上限。stop_motion、驱动停止与异常均视为中断。
+轨迹只用 `name` 区分（NFC 规整、去首尾空白，1–80 个可见字符），没有 trajectory_id。每条轨迹一个目录，
+目录名为名称的 SHA-256 前 32 位，所以任意名称都是安全路径，`mkdir` 本身就是原子的唯一性检查：
+start_trajectory 遇到同名轨迹（含不完整的）直接报错，不扫描目录、不影响实时性。要重录请先 delete_trajectory。
+没有采到任何点的失败录制会自动清除，不占用名称。清单（manifest）含 `recorded_at`（带时区的 ISO 录制时间）、
+`created_at_ms`、时长、点数、状态和结束原因。早期以随机 id 命名的目录无法按名称寻址，不再列出也不能回放。
 
-- **时间轴**：首次进入拖拽前不产生轨迹点。之后模式 6 与模式 5 的反馈都按实际关节角和控制器时间戳采集，
-  停顿的真实时长保留在同一条时间轴上，不复制旧点、不重置时间、不拼接分段。
-- **上限**：等待首次拖拽与录制各受 `max_recording_s` 约束；录制时长从首次拖拽起算，包含停顿，
-  再次进入拖拽不会重置；最多 10000 点。达到上限即停止采集，按 stop_record 相同流程等待按拖拽键退出并保存，`end_reason=limit_reached`。
-- **录制中允许的状态**：模式 6；或模式 5 且已使能、无运行/点动/队列/暂停标志。模式 5 下仍在减速滑行时继续采集，
-  不视为结束。模式 7/8/9/10/11（11 为点动 JOG）等其他模式即使标志干净也以不完整结束。保护检查（报警、碰撞、皮肤、下使能、
-  抱闸松开、型号）先于模式判断。
-- **现场实测过渡态**（CR3A 拖拽键，30004）：
-  - 进入拖拽时控制器先报约 24 ms 的模式 0（已使能、drag_status=1、无报警），再进入模式 6。
-    仅当模式 0 带 drag_status=1、已使能、无保护、持续不超过 100 ms 且随后进入模式 6 时接受，
-    期间按实际角度采集并计为一次进入拖拽；否则以不完整结束。
-  - 退出拖拽后第一包模式 5 可能仍报 running_status=1。仅在最近一次拖拽后 100 ms 内、且无点动/队列/暂停标志时容忍；
-    更久或伴随其他标志仍视为运动并中断。停稳确认仍要求连续两包干净的模式 5。
-  - 模式 6 但 drag_status=0 视为“控制器拖拽状态不一致”并中断（现场在拖拽中途收到 StopDrag 后出现：
-    关节仍可拖动并带阻尼，拖拽键无法退出），需在机械臂或示教器上恢复后再 stop_motion。
-- **stop_record 确认**：先停止采集；驱动**从不发送 StopDrag**，仍在拖拽时等待操作者按拖拽键退出，
-  等待上限为 `teach.drag_exit_timeout_s`（默认 60 秒，驱动停止时缩短为 enable_timeout）。只使用请求之后
-  收到的新反馈，要求连续两包满足：模式 5、已使能、drag_status=false、无运行/点动/队列/暂停、
-  六轴 |qd| ≤ 0.1°/s、无报警/碰撞/皮肤/抱闸松开。超时、断线或保护状态时返回失败，数据标为不完整，不宣称成功；
-  仍在拖拽时错误信息提示按拖拽键退出。
+### 录制：驱动进入拖拽，点击 stop 退出
+
+流程：start_trajectory（StartDrag）→ 操作者拖动机械臂 → stop_trajectory（StopDrag）→ 确认停稳并保存。
+
+- **进入**：校验后先订阅反馈，再发送 StartDrag（要求机械臂静止、已使能、模式 5、无报警），然后等待首个拖拽包
+  （模式 0 或 6）。`teach.drag_start_timeout_s`（默认 5 秒）内未进入拖拽，则中止、清除该录制并报错。
+  StartDrag 被拒绝不再发其他命令；结果不明（超时）会按下面的退出规则确认并退出拖拽。
+- **操作者意外结束拖拽**（按机械臂拖拽键）：模式 5 持续 ≥ 24 ms 即视为已退出拖拽，录制自动停止，
+  状态为 `recorded`，`end_reason=drag_exited` 并带 `note`（“the arm left drag; recording stopped automatically and is usable”），
+  可直接回放；驱动不再发送 StopDrag，确认停稳后释放机械臂。该事件不产生 ACP 完成通知，用 stop_trajectory 或
+  list_trajectories 取得状态。
+- **StopDrag 守卫**：StopDrag 只在请求之后收到的新反馈显示 `drag_status` 时发送，且只发一次。反馈过期/断线时不发送，
+  待反馈恢复后再判断；模式 6 但 drag_status=0（控制器拖拽状态不一致）也不发送。现场曾在按钮拖拽中途收到 StopDrag
+  后卡在带阻尼的模式 6，这些守卫用于避免再次触发。
+- **上限**：录制时长从首个拖拽包起算，最多 `max_recording_s`（默认 500 秒）和 10000 点；达到上限后停止采集，
+  发送 StopDrag 并按 stop_trajectory 的流程确认和保存，`end_reason=limit_reached`。
+- **录制中允许的状态**：模式 6（进入时可短暂为模式 0）；模式 5 仅在刚退出拖拽的判定窗口内允许。
+  模式 7/8/9/10/11 等其他模式、保护状态（报警、碰撞、皮肤、下使能、抱闸松开、型号）以不完整结束。
+- **现场实测过渡态**（CR3A，30004）：进入拖拽时控制器先报约 24 ms 的模式 0（已使能、drag_status=1），再进入模式 6；
+  退出拖拽后第一包模式 5 可能仍报 running_status=1，仅在最近一次拖拽后 100 ms 内且无点动/队列/暂停标志时容忍。
+- **stop_trajectory 确认**：先停止采集，再按 StopDrag 守卫退出拖拽，只使用请求之后收到的新反馈，
+  要求连续两包满足：模式 5、已使能、drag_status=false、无运行/点动/队列/暂停、六轴 |qd| ≤ 0.1°/s、无保护状态。
+  等待上限为 `teach.drag_exit_timeout_s`（默认 10 秒，驱动停止时缩短为 enable_timeout）。超时、断线、StopDrag 被拒绝
+  或保护状态时返回失败，数据标为不完整，机械臂继续被占用，可再次 stop_motion/stop_trajectory 重试；
+  仍在拖拽时错误信息提示按机械臂拖拽键退出。
 - **异常**：报警、碰撞、皮肤、下使能、抱闸松开、非法模式、运行/点动、断线/过期/溢出/时间戳缺口、坐标系变化、
-  stop_motion、驱动停止/重启，均标为不完整并保留原始数据、轨迹点和明确原因；不自动清错、使能、StopDrag 或 Continue。
-  退出拖拽只能由操作者按拖拽键完成，未经新反馈确认不报告成功。中断标记不可撤销，后续的 stop_record 不会清除；
-  退出确认期间收到的 stop_motion 或驱动停止，会在最终保存前同步核对，结果仍为不完整。
-- **占用**：等待、拖拽和停顿期间 teach 一直占用机械臂，joint_move 不能插入运动。退出无法确认时继续占用，
-  直到后续 stop_motion/stop_record 确认停稳；成功后才释放。旧任务不会释放新任务的占用。
-- **ACP**：start_record 完成仅表示“已准备，等待首次拖拽”；进入/退出拖拽不发送完成通知；
-  stop_record 在退出确认和保存后才完成。只有采样完整、至少 2 点、退出已确认且保存成功才为 `recorded`。
-  `end_reason` 为 `stop_record`、`limit_reached` 或 `interrupted`。
-- start_record 前机械臂不能已处于拖拽，否则拒绝且不发送任何命令。从未进入拖拽就结束会标为不完整。
+  stop_motion、驱动停止/重启，均标为不完整并保留原始数据、轨迹点和明确原因；不自动清错、使能或 Continue。
+  中断标记不可撤销，后续的 stop_trajectory 不会清除；退出确认期间收到的 stop_motion 或驱动停止，会在最终保存前同步核对。
+- **占用**：start_trajectory 完成后到录制结束，teach 一直占用机械臂，joint_move 不能插入运动。退出无法确认时继续占用，
+  直到后续 stop_motion/stop_trajectory 确认停稳；成功后才释放。旧任务不会释放新任务的占用。
+- **ACP**：start_trajectory 完成表示机械臂已进入拖拽、正在录制；stop_trajectory 在退出确认和保存后才完成。
+  只有采样完整、至少 2 点、退出已确认且保存成功才为 `recorded`。
+  `end_reason` 为 `stop_trajectory`、`drag_exited`、`limit_reached` 或 `interrupted`。
+- 机械臂已处于拖拽、运行或暂停时 start_trajectory 被拒绝，且不发送任何命令。
 
 采集从共享 30004 接收线程进入独立有界缓冲，不经过网页、ROS 发布或 joints 的 30 Hz 定时器。
 原始数据逐包落盘（含模式）；按控制器时间戳线性重采样为 50 ms 一点，最多 10000 点、约 500 秒。
@@ -236,7 +243,8 @@ play 时由驱动通过 Dashboard 连接逐点发送 `ServoJ(J1..J6,t=0.020,ahea
   继续时沿路径 0.5 秒加速，不清错、不 Enable、不设置皮肤（沿用暂停前的配置）。
 - **停止**：stop_motion（任一卡片）、驱动停止都会取消流并发送 Stop；取消检查与 ServoJ 发送在同一命令锁内，
   Stop 之后不会再有目标发出。暂停减速过程中也可以直接停止。
-- **到起点**：go_to_start 仍是控制器队列中的 MovJ，其暂停/继续使用控制器 Pause/Continue（模式 10）。
+- **到起点**：go_to_start 与 play 的到起点阶段都是控制器队列中的 MovJ，暂停/继续使用控制器 Pause/Continue（模式 10）；
+  play 在该阶段被暂停后，resume 先 Continue 并确认到位，随后接着做回放准备和 ServoJ 流。到位核验以新反馈为准，未到位不开始流。
 - 通信中断不重发 ServoJ/MovJ/Continue；错误后尝试一次 Stop，无法确认停止则保留错误状态和占用。
 
 现场实测（CR3A，经 Jetson 有线连接）：50 Hz ServoJ 发送间隔 19.97–20.03 ms，ACK 往返 p50 5.5 ms、最大 13.5 ms；
@@ -247,8 +255,11 @@ J6 0→+3°→0 的跟随滞后约 92 ms，去滞后后 RMS 误差 0.027°，过
 | 配置/变量 | 作用 |
 |---|---|
 | data_dir / DOBOT_TEACH_DATA_DIR | 本地持久化录制目录；部署默认 /work/data/dobot-teach |
+| drag_start_timeout_s | StartDrag 后等待机械臂进入拖拽的上限，默认 5 秒，最大 60 |
+| drag_exit_timeout_s | StopDrag/操作者退出后等待模式 5 停稳的上限，默认 10 秒（原 60），最大 600 |
+| max_recording_s / max_gap_ms | 录制时长上限（≤500）/ 允许的反馈间隔（≤50） |
 
-早期版本录制目录中遗留的 `native.csv` 不再使用，delete_record 时一并删除。不自动记录/回放 DO，也不改变工具负载设置。
+早期版本录制目录中遗留的 `native.csv` 不再使用，delete_trajectory 时一并删除。不自动记录/回放 DO，也不改变工具负载设置。
 
 本次新增代码仅使用标准库，requirements.txt 与 SDK pin 不变。
 本地测试覆盖真实回环 TCP 的官方 SDK、1440 字节反馈、MCP HTTP、ACP、录制与 ServoJ 回放/暂停/继续/停止模拟；
