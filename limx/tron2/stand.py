@@ -9,36 +9,34 @@ from pathlib import Path
 from vendor import MoveError
 
 
-# Operator-confirmed folded preparation envelope for this unit/firmware.
-# Matching only: never use these bounds as motion targets; wheel angles excluded.
-STARTUP_PROFILES = {'WF_TRON2A_379': {'name': 'operator_observed_startup_prepare',
-                   'accid': 'WF_TRON2A_379',
-                   'mode': 'wheel_foot',
-                   'sw_version': 'robot-tron2-r-2.4.6.20260901211405',
-                   'status': 'UNKNOW',
-                   'working_mode': 'developer_mode',
-                   'folded_statuses': ['UNKNOW', 'SIT', 'DAMPING'],
-                   'stationary_dq_limit_rad_s': 0.1,
-                   'pose_indices': [0, 1, 2, 3, 5, 6, 7, 8],
-                   'pose_ranges': {'0': [0.8303999185562134, 2.8027998924255373],
-                                   '1': [-0.4602999210357666, 0.18639988899230958],
-                                   '2': [-0.21049959659576417, 0.4176002264022827],
-                                   '3': [-2.8215851306915285, -2.4212852001190184],
-                                   '5': [0.83868567943573, 2.8041851043701174],
-                                   '6': [-0.16579992771148683, 0.46100027561187745],
-                                   '7': [-0.3756851673126221, 0.17731471061706544],
-                                   '8': [-2.8210854053497316, -2.4201851367950438]}}}
+# Model-level preparation envelope, not a per-unit motion target or factory limit.
+# Only knee folding matters here; hip axes and cumulative wheel positions vary.
+STARTUP_PROFILES = {mode: {
+    'name': 'automatically_observed_startup_prepare', 'mode': mode,
+    'status': 'UNKNOW', 'working_mode': 'developer_mode',
+    'folded_statuses': ['UNKNOW', 'SIT', 'DAMPING'],
+    'stationary_dq_limit_rad_s': .1, 'pose_indices': [3, 8],
+    'pose_ranges': {'3': [-2.95, -2.0], '8': [-2.95, -2.0]}}
+    for mode in ('wheel_foot', 'sole_foot')}
 
 
 def startup_match(reader):
-    """Match the operator-recorded folded pose; never rename vendor UNKNOW to READY."""
+    """Match a broad folded pose and bind startup identity to actual connection feedback."""
     try:
         path = os.environ.get('TRON2_STARTUP_PROFILE')
-        profile = json.loads(Path(path).read_text()) if path else STARTUP_PROFILES.get(reader.serial)
-        if profile is None:
-            return {'matched': False, 'reason': 'profile_not_configured'}
         status, joints = reader.sample('robot_status'), reader.sample('joint_state')
         data, feedback = status.get('data') or {}, joints.get('data') or {}
+        profile = json.loads(Path(path).read_text()) if path else getattr(reader, '_startup_calibration', None)
+        capture = profile is None
+        if capture:
+            template = STARTUP_PROFILES.get(reader.configuration.get('mode'))
+            if template is None:
+                return {'matched': False, 'reason': 'unsupported_configuration'}
+            firmware = data.get('sw_version')
+            if not isinstance(firmware, str) or not firmware or not reader.serial:
+                return {'matched': False, 'reason': 'identity_pending'}
+            profile = {**template, 'accid': reader.serial, 'sw_version': firmware}
+
         if not status.get('available') or not joints.get('available'):
             return {'matched': False, 'reason': 'stale_feedback'}
         if reader.serial != profile['accid'] or reader.configuration.get('mode') != profile['mode']:
@@ -61,7 +59,12 @@ def startup_match(reader):
         ranges = profile['pose_ranges']
         if any(not ranges[str(i)][0] <= q[i] <= ranges[str(i)][1] for i in profile['pose_indices']):
             return {'matched': False, 'reason': 'different_folded_pose'}
-        return {'matched': True, 'state': profile['name'], 'vendor_status':data['status'],
+        if capture:
+            reader._startup_calibration = {**profile, 'reference_q': list(q),
+                'source': 'current_connection_feedback', 'reference_is_command': False}
+        return {'matched': True, 'state': profile['name'],
+                'source': 'explicit_profile' if path else 'current_connection_feedback',
+                'accid': profile['accid'], 'sw_version': profile['sw_version'], 'vendor_status':data['status'],
                 'vendor_ready_verified': False, 'permission': 'one_official_stand_request'}
     except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError):
         return {'matched': False, 'reason': 'profile_unavailable'}

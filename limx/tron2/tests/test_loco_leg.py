@@ -139,13 +139,12 @@ class LowerControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(owner.state, 'completed')
         r.ws.send_json.assert_not_called()
 
-    def test_unknown_startup_requires_an_external_profile(self):
+    def test_unknown_startup_supports_automatic_and_explicit_profiles(self):
         r, _ = robot('UNKNOW')
         owner = Stand(r, AsyncMock())
         with patch.dict(os.environ, {'TRON2_STARTUP_PROFILE': ''}):
-            self.assertFalse(startup_match(r)['matched'])
-            with self.assertRaises(MoveError):
-                owner.dispatch()
+            self.assertTrue(startup_match(r)['matched'])
+            self.assertEqual(r._startup_calibration['accid'], r.serial)
         r.ws.send_json.assert_not_called()
         profile = {'name': 'synthetic_test', 'accid': r.serial, 'mode': 'wheel_foot',
             'sw_version': 'TEST_FIRMWARE', 'working_mode': 'developer_mode',
@@ -334,12 +333,12 @@ class CardLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BuiltinStartupProfileTests(unittest.TestCase):
-    def test_builtin_profile_needs_no_external_file_and_keeps_unit_and_pose_checks(self):
+    def test_automatic_profile_uses_current_identity_and_broad_folded_knees(self):
         from stand import STARTUP_PROFILES, startup_match
         r, status = robot('UNKNOW')
         r.serial = 'WF_TRON2A_379'
-        profile = STARTUP_PROFILES[r.serial]
-        status['sw_version'] = profile['sw_version']
+        profile = STARTUP_PROFILES['wheel_foot']
+        status['sw_version'] = 'robot-tron2-r-2.7.16-test'
         original_sample = r.sample
         q = [sum(profile['pose_ranges'][str(i)])/2 if i in profile['pose_indices'] else 0. for i in range(10)]
         def read(name):
@@ -348,6 +347,12 @@ class BuiltinStartupProfileTests(unittest.TestCase):
             return sample
         r.sample = read
         with patch.dict(os.environ, {'TRON2_STARTUP_PROFILE': ''}):
+            self.assertTrue(startup_match(r)['matched'])
+            self.assertEqual(r._startup_calibration['sw_version'], status['sw_version'])
+            r.serial = 'WF_TRON2A_OTHER'
+            r._startup_calibration = None  # A new connection / different unit.
+            status['sw_version'] = 'robot-tron2-r-2.7.17-test'
+            q[0], q[1], q[5], q[6] = .4, .6, 2.8, -.6
             self.assertTrue(startup_match(r)['matched'])
             q[3] = 0.
             self.assertFalse(startup_match(r)['matched'])

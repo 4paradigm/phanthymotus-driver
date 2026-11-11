@@ -248,7 +248,7 @@ sudo docker exec embodied-limx-tron2 /bin/bash -c 'source /opt/ros/humble/setup.
 - loco_servo_arm：将标准control/joint流接到输入口，motus.control/1、joint_position、18维目标，采用官方tron2_env启用头部的DEFAULT_LAYOUT_WITH_HEAD：索引0～6左臂(rad)、7左夹爪(0～1)、8～14右臂(rad)、15右夹爪(0～1)、16头部pitch(rad)、17头部yaw(rad)。消息包含seq、stamp_ms、obs_stamp_ms、ttl_ms、source、priority、mode、dof、values。时间戳为Unix毫秒。建议30Hz，最大50Hz；Driver从实测姿态插值，目标300Hz发送官方ServoJ。应用速度上限0.5rad/s、加速度1.5rad/s²，不是电机额定极限或硬实时保证。夹爪0表示闭合、1表示全开，按官方实现乘100并取整，独立发送request_set_limx_2fclaw_cmd（双侧速度100、夹持力50，无量纲）；ServoJ仍只发送16个关节角。夹爪输入应用步长与速度上限2归一化开口/秒；目标仅在变化时发送，最多跟随声明的expected_hz频率，等待ACK不阻塞关节输出；ACK不代表到位。原单侧gripper卡片的0～94开口限制保持原样，本流式接口按官方0～100协议执行。
 - 伺服生命周期start及已启动时info返回state=ready，stop返回state=idle；暂停状态由paused布尔字段表示，内部运行标志保持独立。公开config动作接收dry_run布尔参数，与configSchema一致；切换后暂停，需显式resume。伺服start仅订阅；pause清空目标并暂停，resume接受新目标，stop释放订阅。dry_run=true只校验、不发电机指令；切换空跑设置后需resume。200ms断流、目标过期停止后续输出。ServoJ无成功ACK，提交数不表示到位。双臂/头部/夹爪显式动作优先并暂停整路流，不自动回零。没有增加确认弹窗或持久保护文件。
 
-通用下肢入口使用厂家SIT/DAMPING/STAND/WALK状态。stand.py内置此前由使用者确认的WF_TRON2A_379准备姿态范围，仅匹配对应序列号、固件、开发模式及静止关节反馈。该标定仅用于识别UNKNOW折叠准备姿态，不作为运动目标，不表示厂家已上报READY；轮子累计角不参与匹配。其他设备不会套用本机标定。
+通用下肢入口使用厂家SIT/DAMPING/STAND/WALK状态。启动或重连后从实际反馈绑定当前机型、序列号与固件版本，不限定某台设备或固定版本。UNKNOW准备姿态采用机型级宽松折叠范围：膝关节索引3、8均在[-2.95,-2.0]rad，不限制髋关节和轮累计角；范围是应用判据而非厂家机械限位。有效且静止反馈首次匹配时记录本连接准备姿态，仅用于识别，不作运动目标；断线清除，下次连接重新采集。不会将任意开机姿态或摔倒状态自动标为准备。
 
 接口依据：[官方SDK指南](https://www.limxdynamics.com/zh/documents/847884267345285120) §3.6.4、§3.8；模型来源见resource/SOURCE.md。Core与Perception无需修改，无新增运行依赖。
 
@@ -269,7 +269,7 @@ PYTHONPATH=.:limx/tron2:limx/tron2/tests python3 -m unittest test_battery test_j
 自动识别的ACCID按机器人连接保存：断线时清除自动学习的身份与构型，重连后依据新notify_robot_info重新识别，避免机器人重启换装后Driver仍拒收WF状态。显式配置的serial锁保持不变，同一连接中不接受身份变化；不重放断线前动作。
 
 
-准备姿态默认从stand.py内置标定读取，无需在Orin上另外放置startup_profile.json或设置环境变量。显式TRON2_STARTUP_PROFILE仍可覆盖内置值以兼容既有部署。
+准备姿态使用stand.py内置机型级宽松规则并读取当前连接参数，无需设备专用标定文件。显式TRON2_STARTUP_PROFILE仍可覆盖规则以兼容既有部署。
 
 ### 电池扩展、持续移动与下肢显示坐标
 

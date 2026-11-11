@@ -110,6 +110,7 @@ def motion_readiness(data):
 class RobotReader:
     def __init__(self, settings):
         self.settings = settings
+        self._startup_calibration = None
         self.configuration = {'state': 'pending', 'mode': 'unknown',
                               'fixed_for_process': True, 'enforces_card_restrictions': False}
         self.connected = False
@@ -164,6 +165,7 @@ class RobotReader:
                 pass
 
     def disconnect(self, reason):
+        self._startup_calibration = None
         if self.walk is not None:self.walk.disconnect()
         if self.sit_down is not None:
             self.sit_down.disconnect()
