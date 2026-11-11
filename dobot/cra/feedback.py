@@ -12,6 +12,7 @@ import dataclasses
 import ipaddress
 import math
 import os
+import queue
 import threading
 import time
 
@@ -28,7 +29,7 @@ SDK_COMMIT = "55ec1ec82201aaf2e6d54aa47b6272bbaa14c815"
 ROBOT_MODES = {
     0: "unknown", 1: "initializing", 2: "brake_open", 3: "power_off",
     4: "disabled", 5: "enabled_idle", 6: "backdrive", 7: "running",
-    8: "single_move", 9: "error", 10: "paused", 11: "collision",
+    8: "single_move", 9: "error", 10: "paused", 11: "jog",
 }
 
 
@@ -119,7 +120,7 @@ def decode_packet(packet):
             raise ValueError("non-finite number in feedback")
 
     check_finite(state)
-    # SDK 2.0.0 collapses BrakeStatus to bool and labels mode 11 as JOG.
+    # SDK 2.0.0 collapses BrakeStatus to bool; mode 11 is JOG (official RobotMode).
     # Keep its code unmodified; correct semantics here against V4.6.6 docs.
     state["robot_mode"] = int(raw["RobotMode"])
     state["robot_type"] = int(raw["CRRobotType"]) & 0xFF
@@ -132,6 +133,32 @@ def decode_packet(packet):
     state["safety_state"] = int(raw["SafetyState"]) & 0xFF
     state["safe_state"] = int(raw["SafeState"]) & 0xFF
     return state
+
+
+class FeedbackSubscription:
+    """Bounded recording tap; neither disk IO nor resampling runs on receive."""
+
+    def __init__(self, client, capacity):
+        self.client = client
+        self.queue = queue.Queue(capacity)
+        self.error = None
+
+    def put(self, item):
+        if self.error is not None:
+            return
+        try:
+            self.queue.put_nowait(item)
+        except queue.Full:
+            self.error = "recording feedback buffer overflow"
+
+    def read(self, timeout=0.1):
+        if self.error is not None:
+            raise RuntimeError(self.error)
+        return self.queue.get(timeout=timeout)
+
+    def close(self):
+        with self.client._lock:
+            self.client._subscriptions.discard(self)
 
 
 class FeedbackClient:
@@ -161,6 +188,20 @@ class FeedbackClient:
         self._packets = 0
         self._invalid_packets = 0
         self._discarded_bytes = 0
+        self._subscriptions = set()
+
+    def subscribe(self, capacity=2048):
+        if type(capacity) is not int or capacity < 1:
+            raise ValueError("recording buffer capacity must be a positive integer")
+        subscription = FeedbackSubscription(self, capacity)
+        with self._lock:
+            self._subscriptions.add(subscription)
+        return subscription
+
+    def _recording_error(self, reason):
+        with self._lock:
+            for subscription in self._subscriptions:
+                subscription.error = reason
 
     @property
     def receive_timeout(self):
@@ -207,6 +248,7 @@ class FeedbackClient:
 
     def stop(self):
         with self._lifecycle:
+            self._recording_error("feedback stopped during recording")
             self._stop.set()
             with self._lock:
                 connection = self._connection
@@ -258,12 +300,16 @@ class FeedbackClient:
                             self._packets += 1
                             self._error = None
                             self._cleanup_error = None
+                            for subscription in self._subscriptions:
+                                subscription.put({"data": state, "packet": self._packets,
+                                                  "received_at": last_valid})
                     with self._lock:
                         self._discarded_bytes += stream.discarded_bytes
                     stream.discarded_bytes = 0
                     if self._clock() - last_valid > self.stale_timeout:
                         raise TimeoutError("no valid feedback within stale_timeout_s")
             except Exception as exc:
+                self._recording_error(f"feedback lost during recording: {exc}")
                 with self._lock:
                     if not self._stop.is_set():
                         self._error = str(exc)

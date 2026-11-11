@@ -1,5 +1,5 @@
 mcp_port: 15746
-name: "Dobot CRA 关节读取与运动"
+name: "Dobot CRA 关节读取、运动与示教"
 ros_namespace: dobot_cra
 # Configure through DOBOT_CONTROLLER_IP or the joints card. No robot is
 # contacted until an address is supplied.
@@ -19,6 +19,15 @@ joint_move:
   enable_timeout_s: 5
   motion_timeout_s: 300
   target_tolerance_deg: 0.5
+teach:
+  data_dir: data/dobot-teach
+  max_recording_s: 500
+  max_gap_ms: 50
+  # start_trajectory sends StartDrag; wait this long for the arm to report drag.
+  drag_start_timeout_s: 5
+  # stop_trajectory/stop_motion send StopDrag only while feedback shows drag; wait
+  # this long for the arm to report rest in mode 5 (otherwise press the arm's drag button).
+  drag_exit_timeout_s: 10
 ros:
   robot_domain_id: 42
   core_domain_id: 42
