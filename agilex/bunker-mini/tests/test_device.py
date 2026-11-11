@@ -48,9 +48,6 @@ def _bare_device():
         _battery_topic="/bunker_mini/state/battery",
         _remote_controller_topic="/bunker_mini/state/remote_controller",
         _odom_topic="/bunker_mini/state/odom",
-        _odom_field_topics={
-            name: f"/bunker_mini/state/odom/{name}"
-            for name in ("vx", "steering_angle_deg", "left_wheel_mm", "right_wheel_mm")},
     )
     device.config = {}
     device.can = FakeCAN()
@@ -174,13 +171,11 @@ def test_base_drive_accepts_configured_velocity_limits():
     assert result["vyaw_deg_s"] == 60
 
 
-def test_sensor_cards_use_familiar_names_and_flat_odometry_ports():
+def test_sensor_cards_expose_one_navi_compatible_odometry_port():
     cards = {card["name"]: card for card in _bare_device().get_tools()}
     assert set(cards) == {"motor_state", "battery", "remote_controller", "odom", "base_drive"}
     odom_ports = cards["odom"]["topic_out"]
-    assert len(odom_ports) == 5
-    assert [port["topic"].rsplit("/", 1)[-1] for port in odom_ports[1:]] == [
-        "vx", "steering_angle_deg", "left_wheel_mm", "right_wheel_mm"]
+    assert odom_ports == [{"topic": "/bunker_mini/state/odom", "format": "state/odom"}]
 
 
 def test_motor_state_fields_are_flat_and_freshness_aware():
@@ -196,7 +191,9 @@ def test_motor_state_fields_are_flat_and_freshness_aware():
     state = BunkerMiniDevice._motor_state(snapshot)
     assert state["vehicle_state"] == "normal"
     assert state["control_mode"] == "can"
-    assert state["remote_lost"] and state["emergency_stop"]
+    assert "remote_lost" in state["active_faults"]
+    assert "emergency_stop" in state["active_faults"]
+    assert "remote_lost" not in state
     assert state["motor_2_speed_rpm"] == 100
     assert state["motor_3_speed_rpm"] is None
 
@@ -238,7 +235,7 @@ def test_publish_loop_drops_stale_remote_and_keeps_odom_receive_timestamp():
     published_remote = []
     published_odom = []
     device.bridge.publish_remote_controller = published_remote.append
-    device.bridge.publish_odom = lambda sample, fields: published_odom.append((sample, fields))
+    device.bridge.publish_odom = published_odom.append
 
     class OnePublish:
         calls = 0
@@ -250,8 +247,8 @@ def test_publish_loop_drops_stale_remote_and_keeps_odom_receive_timestamp():
     device._publish_loop()
 
     assert published_remote == []
-    assert published_odom[0][0]["stamp_ms"] == 1_800_000_000_123
-    assert published_odom[0][0]["twist"][0] == 0.15
+    assert published_odom[0]["stamp_ms"] == 1_800_000_000_123
+    assert published_odom[0]["twist"][0] == 0.15
 
 
 def test_actuator_start_and_stop_follow_lifecycle_contract():
@@ -302,16 +299,19 @@ def test_dds_bridge_binds_forwards_and_closes_entities():
         bridge = BunkerDDSBridge(ros, "bunker")
         bridge.publish_battery({"voltage_v": 51.0})
         bridge.publish_remote_controller({"swa": 2})
-        bridge.publish_odom({"twist": [0.1, None, None, None, None, None]},
-                            {"vx": 0.1, "steering_angle_deg": 2.0,
-                             "left_wheel_mm": 10, "right_wheel_mm": 11})
+        bridge.publish_odom({"twist": [0.1, None, None, None, None, None]})
         bridge._robot_state_sub.callback(types.SimpleNamespace(data='{"ok":true}'))
         bridge.close()
     assert ("/bunker/state/battery", '{"voltage_v":51.0}') in events
     assert ("/bunker/state/remote_controller", '{"swa":2}') in events
     assert ("/bunker/state/odom", '{"twist":[0.1,null,null,null,null,null]}') in events
-    assert ("/bunker/state/odom/vx", "0.1") in events
-    assert ("/bunker/state/odom/right_wheel_mm", "11") in events
+    assert not any(event[0].startswith("/bunker/state/odom/") for event in events)
     assert ("/bunker/state/motor_state", '{"ok":true}') in events
     assert ("destroy_node", "bunker_mini_core_bridge") in events
     assert ("destroy_node", "bunker_mini_robot_bridge") in events
+
+
+def test_battery_fallback_only_reports_available_measurements():
+    state = BunkerMiniDevice._battery_state({
+        "system_state": {"battery_voltage_v": 48.2}, "system_state_age_ms": 20})
+    assert state == {"voltage_v": 48.2, "source": "chassis_voltage", "feedback_age_ms": 20}

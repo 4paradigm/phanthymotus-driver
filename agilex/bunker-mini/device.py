@@ -108,16 +108,13 @@ class BunkerMiniDevice:
                 stamp_ms, twist = rows[-1]
                 interface = build_interface(provides=["vx"], rate_hz=10,
                                             pose_drift="none")
-                sample = build_sample(stamp_ms=stamp_ms,
-                    twist=twist, frame="body", pose=None)
                 wheel = snapshot.get("wheel_odometry_raw") or {}
                 motion_state = snapshot.get("motion_state") or {}
-                self.bridge.publish_odom(
-                    {"odom_interface": interface, **sample},
-                    {"vx": twist[0],
-                     "steering_angle_deg": motion_state.get("steering_angle_deg"),
-                     "left_wheel_mm": wheel.get("left_wheel_mm"),
-                     "right_wheel_mm": wheel.get("right_wheel_mm")})
+                sample = build_sample(stamp_ms=stamp_ms,
+                    twist=twist, frame="body", pose=None,
+                    vendor={"steering_angle_deg": motion_state.get("steering_angle_deg"),
+                            **wheel})
+                self.bridge.publish_odom({"odom_interface": interface, **sample})
 
     @staticmethod
     def _motor_state(snapshot: dict) -> dict:
@@ -136,12 +133,12 @@ class BunkerMiniDevice:
             "control_mode": control_modes.get(system.get("control_mode"), "unknown") if system_fresh else "unknown",
             "error_flags": system.get("error_flags") if system_fresh else None,
             "system_counter": system.get("counter") if system_fresh else None,
-            "battery_undervoltage_fault": None if error_flags is None else bool(error_flags & 0x01),
-            "battery_undervoltage_warning": None if error_flags is None else bool(error_flags & 0x02),
-            "remote_lost": None if error_flags is None else bool(error_flags & 0x04),
-            "motor_2_communication_fault": None if error_flags is None else bool(error_flags & 0x10),
-            "motor_3_communication_fault": None if error_flags is None else bool(error_flags & 0x20),
-            "emergency_stop": None if error_flags is None else bool(error_flags & 0x80),
+            "active_faults": None if error_flags is None else [
+                name for name, mask in (("battery_undervoltage_fault", 0x01),
+                    ("battery_undervoltage_warning", 0x02), ("remote_lost", 0x04),
+                    ("motor_2_communication_fault", 0x10),
+                    ("motor_3_communication_fault", 0x20), ("emergency_stop", 0x80))
+                if error_flags & mask],
             "linear_velocity_m_s": motion.get("linear_velocity_m_s") if motion_fresh else None,
             "steering_angle_deg": motion.get("steering_angle_deg") if motion_fresh else None,
             "system_state_age_ms": snapshot.get("system_state_age_ms"),
@@ -157,11 +154,14 @@ class BunkerMiniDevice:
                 value = motor.get(field)
                 out[f"motor_{motor_id}_{field}"] = value if fresh else None
             flags = motor.get("status_flags", 0) if fresh else 0
+            faults = []
             for name, mask in (("voltage_low", 0x01), ("motor_overtemperature", 0x02),
                                ("overcurrent", 0x04), ("driver_overtemperature", 0x08),
                                ("sensor_fault", 0x10), ("driver_error", 0x20),
                                ("motor_disabled", 0x40)):
-                out[f"motor_{motor_id}_{name}"] = bool(flags & mask) if fresh else None
+                if flags & mask:
+                    faults.append(name)
+            out[f"motor_{motor_id}_active_faults"] = faults if fresh else None
             out[f"motor_{motor_id}_state_age_ms"] = snapshot.get("motor_state_age_ms", {}).get(motor_id)
         return out
 
@@ -174,10 +174,9 @@ class BunkerMiniDevice:
             system_age = snapshot.get("system_state_age_ms")
             if system_age is None or system_age > 500:
                 return None
-            return {"soc_percent": None, "soh_percent": None,
-                    "voltage_v": system.get("battery_voltage_v"),
-                    "current_a": None, "temperature_c": None,
-                    "feedback_age_ms": system_age}
+            return {"voltage_v": system.get("battery_voltage_v"),
+                    "source": "chassis_voltage", "feedback_age_ms": system_age}
+
         alarms = snapshot.get("battery_alarm") or {}
         alarm_fresh = snapshot.get("battery_alarm_age_ms") is not None and \
             snapshot["battery_alarm_age_ms"] <= 1500
@@ -185,7 +184,7 @@ class BunkerMiniDevice:
         alarm2 = alarms.get("alarm_status_2", 0)
         warning1 = alarms.get("warning_status_1", 0)
         warning2 = alarms.get("warning_status_2", 0)
-        out = {**battery, "feedback_age_ms": age,
+        out = {**battery, "source": "bms", "feedback_age_ms": age,
                "alarm_feedback_age_ms": snapshot.get("battery_alarm_age_ms")}
         for prefix, status1, status2 in (("alarm", alarm1, alarm2),
                                           ("warning", warning1, warning2)):
@@ -195,7 +194,7 @@ class BunkerMiniDevice:
             out[f"{prefix}_undertemperature"] = bool(status1 & 0x10) if alarm_fresh else None
             out[f"{prefix}_discharge_overcurrent"] = bool(status1 & 0x80) if alarm_fresh else None
             out[f"{prefix}_charge_overcurrent"] = bool(status2 & 0x01) if alarm_fresh else None
-        return out
+        return {key: value for key, value in out.items() if value is not None}
 
     @staticmethod
     def _remote_controller_state(snapshot: dict) -> dict | None:
@@ -279,9 +278,7 @@ class BunkerMiniDevice:
             },
             "x-resource": "base",
         }
-        odom_topics = [{"topic": self.bridge._odom_topic, "format": "data/json"}]
-        odom_topics.extend({"topic": topic, "format": "data/json"}
-                           for topic in self.bridge._odom_field_topics.values())
+        odom_topics = [{"topic": self.bridge._odom_topic, "format": "state/odom"}]
         return [
             tool("motor_state", "sensor", "Bunker Mini chassis feedback, motor telemetry and faults",
                  topic_out=[{"topic": self.bridge._state_topic, "format": "data/json"}]),

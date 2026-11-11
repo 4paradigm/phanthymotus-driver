@@ -48,14 +48,17 @@ the module.
 The CAN decoder follows the Bunker Mini 2.0 protocol tables. `motor_state`
 combines chassis feedback (`0x211`), measured linear speed and steering angle
 (`0x221`), and both motor high/low telemetry frames (`0x252`-`0x253`,
-`0x262`-`0x263`) into flat fields. `battery` publishes BMS SOC, SOH, voltage,
+`0x262`-`0x263`) into flat fields, with raw fault flags and lists of active faults instead of
+individual false-valued flags. `battery` publishes BMS SOC, SOH, voltage,
 current, temperature and alarm/warning flags (`0x361`-`0x362`), with chassis
-voltage as a fallback. `remote_controller` exposes switch positions, stick
+voltage as a fallback. The `source` field distinguishes BMS data from chassis
+voltage; unavailable battery measurements are omitted. `remote_controller` exposes switch positions, stick
 values and frame counter (`0x241`). No IMU frame appears in the Bunker Mini
 interfaces you provided, so this driver does not advertise an `imu` card.
 
-`odom` publishes the standard `motus.odom/1` format and separate scalar ports
-for measured `vx`, steering angle and each wheel counter (`0x311`). The manual
+`odom` publishes a single `state/odom` output in standard `motus.odom/1`
+format, compatible with ActuCore navi. Steering angle and wheel counters
+(`0x311`) are included in the same message under `vendor`. The manual
 defines wheel counters in millimeters; they are not integrated into pose. The
 motion feedback does not contain yaw rate, so `wz` remains `null` rather than
 being estimated from undocumented geometry.
