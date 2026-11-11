@@ -89,6 +89,12 @@ laser:
   view_range_m: 6.0
   # The frame both lidars are merged into. Their mounting poses are read from /tf_static.
   base_frame: base_link
+  # Returns closer than this to base_link's origin are the robot's own body (the front lidar
+  # sees its chassis at 7 cm) and are dropped, and counted in `self_filtered_beams`. It is a
+  # circle, so it also hides real obstacles nearer than this in the corners and at the sides:
+  # tune it against the top-down view. 0 turns it off. Not applied to a lidar whose frame has
+  # no transform to base_link, since the body's position is not known there.
+  self_filter_radius_m: 0.35
 
 # One switch per card; driver.yaml's card list is kept in step with it by hand and by
 # tests/test_unixai_panther.py.

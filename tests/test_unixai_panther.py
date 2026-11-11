@@ -578,12 +578,41 @@ def test_estop_passes_vendor_text_through_and_never_maps_unknown_strings_to_safe
     assert missing["found"] is False and missing["stale"] is True
 
 
-def test_health_payload_reports_worst_level_and_per_status_age(payloads):
-    state = _diag_state(payloads, diagnostics(status("b", level=b"\x01", message="warm"), status("a")))
+def test_health_payload_is_compact_and_lists_only_what_is_wrong(payloads):
+    state = _diag_state(payloads, diagnostics(
+        status("b", level=b"\x01", message="warm"), status("a"),
+        status("lifecycle_manager_navigation: Nav2 Health", level=b"\x02", message="Nav2 is inactive")))
     result = strict(payloads.health_payload(state, 3_000, 5_000))
-    assert [s["name"] for s in result["statuses"]] == ["a", "b"], "sorted: the robot's order changes per message"
-    assert result["worst_level"] == 1 and result["worst_level_name"] == "warn"
-    assert result["statuses"][0]["age_ms"] == 2_000 and result["statuses"][0]["stale"] is False
+    assert set(result) == {"count", "worst_level", "worst_level_name", "problems"}
+    assert result["count"] == 3 and result["worst_level"] == 2 and result["worst_level_name"] == "error"
+    assert result["problems"] == ["b: warm", "lifecycle_manager_navigation: Nav2 Health: Nav2 is inactive"], \
+        "sorted by name (the robot's order changes per message); the ok entry 'a' is not listed"
+    assert strict(payloads.health_payload({}, 3_000, 5_000))["problems"] == []
+
+
+def test_a_diagnostic_that_looks_fine_but_has_stopped_updating_is_a_problem(payloads):
+    """Entries are kept by name, so a dead publisher's last 'ok' would otherwise look healthy for ever."""
+    state = _diag_state(payloads, diagnostics(status("camera: Temperatures"), status("CAN bus")))
+    state["CAN bus"]["received_ms"] = 3_000                 # refreshed; the camera entry is 6 s old
+    result = payloads.health_payload(state, 7_000, 5_000)
+    assert result["problems"] == ["camera: Temperatures: 超过 5 秒没有更新"]
+    assert result["worst_level"] == 0, "stale is reported in `problems`, it is not invented as a level"
+    state["CAN bus"]["entry"] = {**state["CAN bus"]["entry"], "level": 1, "message": "slow"}
+    assert payloads.health_payload(state, 9_000, 5_000)["problems"] == [
+        "CAN bus: slow（且超过 5 秒没有更新）", "camera: Temperatures: 超过 5 秒没有更新"]
+
+
+def test_display_helpers_keep_only_the_informative_fields(payloads):
+    shown = payloads.battery_display(payloads.battery_payload(battery(0.97)))
+    assert shown == {"percent": 97.0, "voltage_v": 50.02, "current_a": -2.2, "temperature_c": 29.0,
+                     "status": "discharging"}
+    full = payloads.estop_payload(_diag_state(payloads, normal_diagnostics()), 1_500, 3_000)
+    assert set(payloads.estop_display(full)) == {"found", "level", "message", "stop_button_status",
+                                                 "age_ms", "stale"}
+    assert payloads.estop_display(payloads.estop_payload({}, 1_000, 3_000)) == {
+        "found": False, "stale": True, "age_ms": None, "message": "no emergency-stop diagnostic has been received"}
+    assert payloads.joint_display(payloads.single_joint(joint_state(["joint_lf"], [0.02], [0.0], [-32.7]))) == {
+        "position": 0.02, "effort": -32.7}
 
 
 def test_laser_keeps_the_nearest_return_in_each_bin(payloads):
@@ -754,20 +783,37 @@ def test_robot_state_merges_grippers_and_lift_with_their_age(hub, sink, clock):
 
 def test_robot_state_carries_battery_diagnostics_estop_and_controllers_in_blocks(hub, sink, clock):
     hub.on_battery(battery(0.99))
-    hub.on_diagnostics(normal_diagnostics())
+    hub.on_diagnostics(diagnostics(
+        status("diagnostic_broadcaster: CAN bus", message="CAN bus OK", can0_state="ERROR-ACTIVE"),
+        status("diagnostic_broadcaster: Emergency stop", message="急停状态正常", stop_button_status="正常"),
+        status("lifecycle_manager_navigation: Nav2 Health", level=b"\x02", message="Nav2 is inactive")))
     hub.on_controllers({"lifting_controller": "active", "head_forward_position_controller": "active"})
     clock.advance(0.6)
     hub.tick()
     state = _state(sink)
     strict(state)
-    assert state["battery"]["percent"] == 99.0 and state["battery"]["fresh"] is True
-    assert state["diagnostics"]["available"] and state["diagnostics"]["count"] == 3
-    assert [s["name"] for s in state["diagnostics"]["statuses"]] == sorted(
-        s["name"] for s in state["diagnostics"]["statuses"]), "the robot's order changes per message"
-    assert state["estop"]["found"] and state["estop"]["stop_button_status"] == "正常"
-    assert state["controllers"]["states"]["lifting_controller"] == "active"
     assert set(state) == {"stamp_ms", "ready_for_motion", "not_ready_reasons", "battery", "diagnostics",
                           "estop", "grippers", "lift", "controllers"}
+    assert set(state["battery"]) == {"percent", "voltage_v", "current_a", "temperature_c", "status",
+                                     "age_ms", "fresh"}
+    assert state["battery"]["percent"] == 99.0 and state["battery"]["fresh"] is True
+    assert set(state["diagnostics"]) == {"count", "worst_level", "worst_level_name", "problems",
+                                         "age_ms", "fresh"}
+    assert state["diagnostics"]["count"] == 3 and state["diagnostics"]["fresh"] is True
+    assert state["diagnostics"]["problems"] == ["lifecycle_manager_navigation: Nav2 Health: Nav2 is inactive"], \
+        "an error elsewhere on the robot (Nav2 is not running) is named, not buried"
+    assert set(state["estop"]) == {"found", "level", "message", "stop_button_status", "age_ms", "stale"}
+    assert state["estop"]["found"] and state["estop"]["stop_button_status"] == "正常"
+    assert state["controllers"]["states"]["lifting_controller"] == "active"
+
+
+def test_the_trimmed_view_does_not_trim_what_the_motion_gate_reads(hub, clock):
+    """The gate reads the hub's full estop payload; only the card's view was shortened."""
+    hub.on_joint_state(joint_state(URDF_JOINTS, [0.0] * 18))
+    hub.on_diagnostics(diagnostics(status("diagnostic_broadcaster: Emergency stop", level=b"\x02",
+                                          message="anything", stop_button_status="whatever")))
+    ready, reasons = hub.motion_ready()
+    assert not ready and "level is 2" in reasons[0]
 
 
 def test_robot_state_says_so_when_nothing_has_arrived_instead_of_looking_healthy(hub, sink, clock):
@@ -775,7 +821,7 @@ def test_robot_state_says_so_when_nothing_has_arrived_instead_of_looking_healthy
     hub.tick()
     state = _state(sink)
     assert state["battery"] is None and state["lift"] is None and state["controllers"] is None
-    assert state["diagnostics"] == {"available": False, "statuses": []}
+    assert state["diagnostics"] is None, "no diagnostics yet is null, like every other block, not an empty list"
     assert state["estop"]["found"] is False and state["estop"]["stale"] is True
     assert state["ready_for_motion"] is False
 
@@ -2265,8 +2311,85 @@ def test_stopping_a_card_never_stops_the_shared_host_service(host_camera, config
     before = len(run.calls)
     camera.stop("color")
     camera.stop("depth")
+    assert len(run.calls) == before and not any("stop" in t[:2] for t in run.tails()), \
+        "other programs on the robot may be using the camera; only the container stopping ends it"
+
+
+def test_stopping_the_container_stops_the_unit_this_driver_manages_once_and_without_blocking(
+        host_camera, config, clock, capsys):
+    run = FakeRun(host_camera)
+    camera = _camera(host_camera, config, clock, run)
+    camera.start("color")
+    camera.start("depth")
+    before = len(run.calls)
     camera.close()
-    assert len(run.calls) == before and not any("stop" in t[:2] for t in run.tails())
+    camera.close()                                           # shutdown reaches it from two places
+    stops = [t for t in run.tails()[before:]]
+    assert stops == [["systemctl", "stop", "--no-block", "panther_orbbec.service"]], \
+        "one request, not waiting for the camera to exit (the grace period may be needed for an arm)"
+    assert all(call[:len(run.prefix)] == run.prefix for call in run.calls[before:])
+    assert "asked systemd to stop panther_orbbec.service" in capsys.readouterr().out
+
+
+def test_the_unit_is_created_with_a_bounded_stop_timeout(host_camera, config, clock):
+    run = FakeRun(host_camera)
+    _camera(host_camera, config, clock, run).start("color")
+    create = next(t for t in run.tails() if t[0] == "systemd-run")
+    assert "--property=TimeoutStopSec=15s" in create, "systemd's default would wait 90 s for a stuck camera"
+
+
+def test_stopping_the_container_leaves_a_camera_someone_else_is_publishing_alone(host_camera, config, clock):
+    run = FakeRun(host_camera)
+    camera = _camera(host_camera, config, clock, run, {TOPICS["color"]: 1})
+    camera.start("color")
+    camera.close()
+    assert run.calls == [], "nothing was started here, so nothing is stopped here"
+
+
+def test_stopping_a_container_that_never_started_a_camera_stops_nothing(host_camera, config, clock):
+    run = FakeRun(host_camera)
+    _camera(host_camera, config, clock, run).close()
+    assert run.calls == []
+
+
+def test_a_unit_found_running_under_this_drivers_name_is_stopped_too(host_camera, config, clock):
+    """E.g. left by an earlier container that was killed: the name is this driver's own."""
+    run = FakeRun(host_camera, active="active")
+    camera = _camera(host_camera, config, clock, run)
+    camera.start("depth")
+    camera.close()
+    assert run.tails()[-1] == ["systemctl", "stop", "--no-block", "panther_orbbec.service"]
+
+
+def test_a_failed_stop_is_logged_with_the_manual_command_and_never_raised(host_camera, config, clock, capsys):
+    run = FakeRun(host_camera)
+    camera = _camera(host_camera, config, clock, run)
+    camera.start("color")
+    run.raises = TimeoutError("nsenter hung")
+    camera.close()                                           # must not raise: shutdown has to finish
+    out = capsys.readouterr().out
+    assert "could not stop panther_orbbec.service: TimeoutError" in out
+    assert "sudo systemctl stop panther_orbbec.service" in out
+
+
+def test_the_watchdog_cannot_restart_the_unit_after_the_container_has_begun_to_stop(
+        host_camera, config, clock):
+    run = FakeRun(host_camera)
+    camera = _camera(host_camera, config, clock, run)
+    camera.start("color")
+    camera.close()
+    calls = len(run.calls)
+    clock.advance(100)                                       # long past any stall limit
+    assert camera.check() is False and len(run.calls) == calls
+
+
+def test_plugin_stop_closes_the_camera_after_the_motion_and_before_the_node(device, hub):
+    order = []
+    plugin = device.PantherPlugin(
+        hub, nodes=NS(close=lambda: order.append("nodes")), sink=NS(close=lambda: order.append("bridge")),
+        motion=NS(stop_all=lambda: order.append("motion")), camera=NS(close=lambda: order.append("camera")))
+    plugin.stop()
+    assert order.index("motion") < order.index("camera") < order.index("nodes") < order.index("bridge")
 
 
 def test_the_watchdog_restarts_a_stalled_unit_a_bounded_number_of_times(host_camera, config, clock, capsys):
@@ -2356,3 +2479,125 @@ def test_merging_keeps_the_nearest_return_where_two_lidars_overlap(payloads):
     assert merged["nearest_m"] == pytest.approx(1.0, abs=1e-3) and merged["beams"] == 720 and merged["bins"] == 360
     empty = strict(payloads.merge_scans([], "base_link", 360))
     assert set(empty["ranges"]) == {None} and empty["nearest_m"] is None and empty["valid_ratio"] == 0.0
+
+
+# ── the lidar sees the robot's own body ──────────────────────────────────────
+
+def _own_body_scan(frame="link_front_radar"):
+    """A lidar whose beams 0..9 hit something 7 cm away (its own chassis), and one wall at 2 m."""
+    # range_min is below 7 cm on purpose: a return under range_min is already discarded as invalid,
+    # before any filtering, so it would prove nothing about the self-filter.
+    msg = scan(n=360, fill=INF, header=header(frame_id=frame), angle_min=-3.14159,
+               angle_increment=2 * 3.14159 / 360, range_min=0.05)
+    for index in range(10):
+        msg.ranges[index] = 0.07
+    msg.ranges[180] = 2.0
+    return msg
+
+
+FRONT_AT_NOSE = ((1.0, 0.0, 0.0), (0, 1.0, 0.0), (0.0, 0.0, 1.0)), [0.3, 0.0, 0.1]
+
+
+def test_points_within_the_radius_of_base_link_are_dropped_and_counted(payloads):
+    msg = _own_body_scan()
+    # The lidar sits 0.3 m ahead of base_link, so its own chassis at 7 cm is 0.23-0.37 m from the
+    # origin; the part of it inside the radius goes, and the wall stays.
+    kept = strict(payloads.merge_scans([(msg, FRONT_AT_NOSE)], "base_link", 360, 0.35))
+    unfiltered = strict(payloads.merge_scans([(msg, FRONT_AT_NOSE)], "base_link", 360, 0.0))
+    assert kept["self_filter_radius_m"] == 0.35 and unfiltered["self_filter_radius_m"] == 0.0
+    assert kept["self_filtered_beams"] > 0 and unfiltered["self_filtered_beams"] == 0
+    assert kept["nearest_m"] > unfiltered["nearest_m"], "the chassis no longer is the nearest obstacle"
+    assert kept["nearest_m"] == pytest.approx(2.3, abs=0.02), "the wall 2 m ahead of a lidar that is 0.3 m ahead of base_link"
+    assert all(v >= 0.35 for v in kept["ranges"] if v is not None), "nothing inside the radius survives"
+
+
+def test_a_point_just_outside_the_radius_is_kept(payloads):
+    msg = scan(n=360, fill=INF, angle_min=-3.14159, angle_increment=2 * 3.14159 / 360)
+    msg.ranges[180], msg.ranges[90] = 0.36, 0.34              # at the origin, 0.36 m and 0.34 m away
+    identity = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)), [0.0, 0.0, 0.0]
+    result = payloads.merge_scans([(msg, identity)], "base_link", 360, 0.35)
+    assert result["nearest_m"] == pytest.approx(0.36, abs=1e-3)
+    assert result["self_filtered_beams"] == 1
+
+
+def test_a_radius_of_zero_filters_nothing(payloads):
+    identity = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)), [0.0, 0.0, 0.0]
+    result = payloads.merge_scans([(_own_body_scan(), identity)], "base_link", 360, 0.0)
+    assert result["self_filtered_beams"] == 0 and result["nearest_m"] == pytest.approx(0.07, abs=1e-3)
+
+
+def test_a_scan_not_moved_into_base_link_is_never_filtered(payloads):
+    """Without a transform the body's position is unknown, so 0.07 m might be a real obstacle."""
+    result = payloads.merge_scans([(_own_body_scan(), None)], "link_front_radar", 360, 0.35)
+    assert result["self_filtered_beams"] == 0 and result["nearest_m"] == pytest.approx(0.07, abs=1e-3)
+
+
+def test_the_hub_filters_the_chassis_out_of_the_merged_scan_using_the_configured_radius(hub, sink):
+    hub.on_tf_static(_tf(("base_link", "link_front_radar", (0.3, 0.0, 0.1), (0, 0, 0, 1))))
+    hub.on_laser("front", _own_body_scan())
+    merged = sink.last("/panther/laser_scan")
+    assert merged["self_filter_radius_m"] == 0.35 and merged["self_filtered_beams"] > 0
+    assert merged["nearest_m"] > 0.35, "a 7 cm 'obstacle' that is the robot itself is not reported"
+    assert hub.card_info("laser_scan")["scan"]["self_filtered_beams"] == merged["self_filtered_beams"]
+
+
+def test_the_hub_says_when_it_could_not_filter_because_there_is_no_transform(hub, sink):
+    hub.on_laser("front", _own_body_scan())
+    merged = sink.last("/panther/laser_scan")
+    assert merged["transformed"] is False and merged["self_filtered_beams"] == 0
+    assert "own body is not filtered" in merged["sources"]["front"]["note"].replace("robot's ", "")
+
+
+def test_the_filter_radius_is_configurable_and_zero_turns_it_off(device, config, sink, clock):
+    assert config["laser"]["self_filter_radius_m"] == 0.35
+    config["laser"]["self_filter_radius_m"] = 0.0
+    off = device.Hub(config, "panther", sink, clock=lambda: clock.wall, monotonic=lambda: clock.mono)
+    off.on_tf_static(_tf(("base_link", "link_front_radar", (0.3, 0.0, 0.1), (0, 0, 0, 1))))
+    off.on_laser("front", _own_body_scan())
+    assert sink.last("/panther/laser_scan")["self_filtered_beams"] == 0
+
+def test_a_restart_already_decided_on_cannot_follow_the_stop_and_bring_the_camera_back(
+        host_camera, config, clock):
+    """The race: the watchdog has read 'stalled' and is about to restart when close() runs.
+
+    The previous guard sat where the state is read, so it could not help here; the restart
+    must be re-checked after close() has begun, under the same lock close() stops the unit with.
+    """
+    run = FakeRun(host_camera)
+    camera = _camera(host_camera, config, clock, run)
+    camera.start("color")
+    clock.advance(31)                                        # first-frame grace is over: stalled
+    original = camera._frame_age
+    camera._frame_age = lambda kind: (camera.close(), original(kind))[1]   # close() lands mid-check
+    assert camera.check() is False, "the restart that was decided on is withdrawn"
+    restarts = [t for t in run.tails() if t[:2] == ["systemctl", "restart"]]
+    stops = [t for t in run.tails() if t[:2] == ["systemctl", "stop"]]
+    assert restarts == [] and len(stops) == 1, "the unit is stopped and stays stopped"
+    assert camera.info("color")["watchdog_restarts"] == 0
+
+
+def test_the_restart_and_the_final_stop_never_run_at_the_same_time(host_camera, config, clock):
+    import threading
+
+    run, inside, overlap = FakeRun(host_camera), [], []
+    original = run.__call__
+
+    def slow(command, check, capture_output, text, timeout):
+        tail = list(command)[len(run.prefix):]
+        if tail[:2] in (["systemctl", "restart"], ["systemctl", "stop"]):
+            inside.append(tail[1])
+            if len(inside) > 1:
+                overlap.append(list(inside))
+            threading.Event().wait(0.05)
+            inside.remove(tail[1])
+        return original(command, check, capture_output, text, timeout)
+
+    camera = host_camera.HostCamera(config["camera"]["host"], TOPICS, lambda t: 0, lambda kind: None,
+                                    run=slow, sleep=clock.advance, monotonic=lambda: clock.mono, watchdog=False)
+    camera.start("color")
+    clock.advance(31)
+    watchdog = threading.Thread(target=camera.check)
+    watchdog.start()
+    camera.close()
+    watchdog.join(5)
+    assert overlap == [], "two systemctl calls on the unit overlapped"

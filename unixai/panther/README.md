@@ -25,18 +25,58 @@ review found gaps (a `stop` for every actuator, completion reporting for the lon
 | `camera_color` | `image/jpeg` | 10 Hz | `/camera/color/image_raw` |
 | `camera_depth` | `image/depth-zlib` | 5 Hz | `/camera/depth/image_raw` (resampled to 640x480 uint16 mm) |
 
-`robot_state` is one low-rate card in blocks, each with its own `age_ms` and `fresh`:
-`battery`, `diagnostics` (sorted by name: the robot's order changes per message), `estop`,
-`grippers.left/right`, `lift`, `controllers` (polled once a second from
-`/controller_manager/list_controllers`, read-only), plus `ready_for_motion` and why not.
+`robot_state` is one low-rate card in blocks. Each block except `diagnostics` shows how old it is
+(`age_ms`, `fresh`); the card is a reading view, trimmed of what is constant, always empty or
+duplicated on this robot (the motion gate reads the full data, not this view):
+
+| Block | Shows |
+|---|---|
+| `battery` | `percent`, `voltage_v`, `current_a`, `temperature_c`, `status` |
+| `diagnostics` | `count`, `worst_level`, `worst_level_name`, `problems`, `age_ms`, `fresh` |
+| `estop` | `found`, `level`, `message`, `stop_button_status`, `age_ms`, `stale` |
+| `grippers.left/right`, `lift` | `position`, `effort` |
+| `controllers` | every controller's state, polled once a second from `/controller_manager/list_controllers` (read-only) |
+
+plus `ready_for_motion` and why not. `diagnostics.problems` lists, sorted by name, every entry
+whose level is not 0 as `"name: message"`, and every entry that reads ok but has not been updated
+for 5 s (`"name: 超过 5 秒没有更新"`): entries are kept by name, so a publisher that died would
+otherwise leave its last "ok" on the card for ever. On the test robot `worst_level` is `error`
+because of `lifecycle_manager_navigation: Nav2 Health: Nav2 is inactive`: the robot has the Nav2
+nodes but the navigation lifecycle is not active. That is the robot's own report; it has nothing
+to do with the sensors or the motion gate, and the card stays `error` for as long as Nav2 is off.
+`diagnostics` is `null` until the first message arrives.
 
 `laser_scan` puts both lidars in one scan of 360 bins round `base_link`, nearest return per bin.
 The vendor URDF has no frames for the individual lidars, so their mounting poses are read from the
-robot's latched `/tf_static`. A lidar that is stale, has never reported, or has no known transform
-is left out and the reason is in `sources`; if *no* lidar has a transform yet, the first one is
-shown in its own frame and `transformed` is `false`. Ranges are measured from `base_link`'s origin,
-not from either lidar. The card does not use `/scan` (the vendor's merged scan): it has no
-publisher on this robot, and PR #520 reports otherwise, so confirm with `ros2 topic hz /scan`.
+robot's latched `/tf_static` (confirmed there: the lidars are `link_front_radar` and
+`link_back_radar`, not the `lidar_front_link`/`lidar_rear_link` the vendor SDK document names). A
+lidar that is stale, has never reported, or has no known transform is left out and the reason is
+in `sources`; if *no* lidar has a transform yet, the first one is shown in its own frame and
+`transformed` is `false`. Ranges are measured from `base_link`'s origin, not from either lidar.
+The card does not use `/scan` (the vendor's merged scan): `dual_lidar_merger` publishes it only
+when it gets both lidars (an inference, not confirmed), and the rear one is silent, see below.
+
+Returns closer than `laser.self_filter_radius_m` (0.35 m) to `base_link` are the robot's own body
+and are dropped; how many is in `self_filtered_beams`, and `nearest_m` is measured after that. It
+is a circle, so it also hides a real obstacle nearer than that at the corners and sides, and only
+a lidar with a known transform is filtered (without one the body's position is unknown). **0.35 is
+a guess, made without the lidars' real mounting poses: tune it against the top-down view on the
+robot**, and set it to 0 to turn it off. What is known: the merged scan on the robot reported a
+`nearest_m` of 0.073 *after* the transform to `base_link`, so something is 7 cm from
+`base_link`'s origin. Read where the front lidar sits (`ros2 run tf2_ros tf2_echo base_link
+link_front_radar`) and what is at that spot before trusting any radius: a radius around the
+origin only removes the body if the body is near the origin.
+
+**The rear lidar currently sends nothing, and the cause is the robot's configuration, not this
+driver.** The vendor's `bluesea_node` for it is running and publishing on
+`/lidar_rear/scan`, but `rear_lidar.yaml` points it at
+`/dev/ttyUSB_RAIDAR_REAR`, which does not exist: the udev rules in
+`/etc/udev/rules.d/99-usb-serial.rules` create only `ttyUSB_RAIDAR_FRONT` (for `ttyACM0`,
+USB interface `if00` of the `1a86:55d2` dual-serial chip), so the process never opens a serial
+port. `ttyACM1` (`if02` of the same chip) is a candidate but is **not confirmed** to be the rear
+lidar. Until the vendor confirms and fixes the rule, `laser_scan` shows the front lidar only and
+says so in `sources.rear`. Both lidar nodes are also called `bluesea_node`, which makes ROS warn
+about duplicate node names.
 
 ### Motion (all `actuator`, all refused unless the commissioning switch is on)
 
@@ -95,13 +135,22 @@ commissioning switch or the robot's readiness; those are reported next to it as
   ready", which is conservative: it can refuse a move it need not have.
 - **Starting a camera card starts the robot's Orbbec driver** if nothing else is publishing the
   camera topics: a transient host unit `panther_orbbec.service` running the vendor's
-  `gemini2.launch.py` (`host_camera.py`). Both camera cards share it and stopping a card never
-  stops it, because other programs on the robot may use the camera. A watchdog restarts it at most
-  twice if frames stall. If the topics already have a publisher, the driver leaves it alone. This
-  is why the container is `privileged` with `pid: host`; nothing else uses either. If the camera
-  cannot be started, the card still starts and says why in `camera_runtime.start_error`.
-- **Camera cards and the lidar top-down view do no work until the card is started.** The lidar
-  distance JSON, like every other sensor card, publishes continuously.
+  `gemini2.launch.py` (`host_camera.py`). Both camera cards share it. Stopping a *card* never stops
+  it, because other programs on the robot may use the camera; **stopping the container does**
+  (once, `systemctl stop --no-block`, so it does not eat the stop grace period), but only a unit
+  this driver started or found under its own name. A camera something else was already publishing
+  is never touched, and a container that is killed rather than stopped leaves the unit running
+  for the next start to reuse. A watchdog restarts it at most twice if frames stall, and cannot
+  restart it once the container has begun to stop. If the topics already have a publisher, the
+  driver leaves it alone. This is why the container is `privileged` with `pid: host`; nothing else
+  uses either. If the camera cannot be started, the card still starts and says why in
+  `camera_runtime.start_error`. Tried on the robot: starting `camera_color` created the unit and
+  frames reached the canvas (colour about 3 fps, depth about 4 fps, top-down view about 4 fps).
+- **The camera cards and the lidar top-down view show nothing until the project is running and the
+  card has been started** (the canvas's own start, not just the container being up). The first
+  test on the robot looked like a broken driver for exactly this reason: `info` said `state: idle`.
+  Everything else publishes from the moment the container is up, which is why those cards had
+  data and these three did not.
 - **The lift is not drawn in the skeleton.** The vendor URDF declares `body_joint` as `fixed`
   (and limits it to 0.6 m, while the robot reports 0.61), so `robot_state` carries the lift as a
   number and `joints` does not move it. Gripper and lift values are unconverted: which end of the
@@ -181,17 +230,29 @@ turn motion on only for step 11, and only after everything before it is right.
    `/panther_driver`. With motion cards enabled that node also has the command publishers and
    controller clients; nothing is published on them while the gate is closed
    (`ros2 topic echo /cmd_vel_teleop` stays silent).
-5. **Canvas, sensors**: drag out `joints`, `imu`, `odom`, `robot_state`, `laser_scan`. `joints`
+5. **Canvas, sensors**: start the project, then drag out `joints`, `imu`, `odom`, `robot_state`,
+   `laser_scan`. `joints`
    follows the arms when the operator moves the robot with the vendor's tools (this driver
    commands nothing); `robot_state` shows a battery percentage (not `1`), `estop` `正常` with a
    small `age_ms`, grippers, lift, and `controllers` filled; `ready_for_motion` is true.
+   `diagnostics.problems` names whatever is wrong on the robot (here the Nav2 lifecycle).
 6. **Lidar**: `ros2 topic echo /tf_static --once | grep -B2 -A8 -i radar` names the two lidar
-   frames; `laser_scan` should say `transformed: true` and use both in `sources`. Record whether
-   `/lidar_rear/scan` publishes and whether `/scan` has a publisher (`ros2 topic hz /scan`).
-7. **Cameras**: start `camera_color`. `docker logs` and `camera_runtime` show whether it started
-   `panther_orbbec.service` (`systemctl status panther_orbbec`) or found a publisher already.
-   Check the picture, then `camera_depth`. Stop both cards: `systemctl is-active
-   panther_orbbec` must still be `active`. Record the encoding and size in each card's `info`.
+   frames (`link_front_radar`, `link_back_radar` here); `laser_scan` should say `transformed: true`
+   and show the front lidar `used` in `sources`. The rear lidar is expected to say `no data
+   received` until the vendor fixes its serial port (see above). Start the card and check the
+   top-down view: `nearest_m` should be a real obstacle, not the robot's body, and
+   `self_filtered_beams` should be greater than 0. If part of the body is still drawn, raise
+   `laser.self_filter_radius_m`; if a real obstacle at the corner disappears, lower it.
+7. **Cameras**: before starting any camera card, `systemctl is-active panther_orbbec` should be
+   `inactive` (or `could not be found`), and nothing should be publishing
+   `/camera/color/image_raw`. Start `camera_color`: `docker logs` and `camera_runtime` show it started
+   `panther_orbbec.service`, and the picture appears. Then `camera_depth`. Stop both cards:
+   `systemctl is-active panther_orbbec` must still be `active`. Record the encoding and size in
+   each card's `info`. Then stop the container (`... --down`): `systemctl is-active panther_orbbec`
+   must become `inactive` within a few seconds, and the log says `asked systemd to stop`. Repeat
+   with the camera started by hand first (`ros2 launch orbbec_camera gemini2.launch.py`): the
+   card must reuse it, `camera_runtime.host_service_managed` must be `false`, and stopping the
+   container must leave it running.
 8. **Odometry**: at rest `vx`, `vy`, `wz` are 0.0 (not `null`). While the operator drives the base
    slowly with the vendor's own teleoperation (clear floor, emergency stop in reach), they must
    change. Do not push the 100 kg base by hand.
@@ -212,10 +273,13 @@ turn motion on only for step 11, and only after everything before it is right.
     while pressed; it is the one value this driver has never seen.
 
 Stop at any time with `sudo bash /opt/phanthy-motus/run-pr-image.sh --down`. That sends the stop
-described above first. It does not stop `panther_orbbec.service`; do that with
-`sudo systemctl stop panther_orbbec` if you started it only for this test.
+described above first, then stops `panther_orbbec.service` if this driver started it. A camera
+that something else started is left running. If the container was killed instead, stop the unit
+by hand: `sudo systemctl stop panther_orbbec`.
 
 Open questions for the vendor (UniX AI): the gripper range and the lift unit; the head axis
 naming and the head controller's joint order; what `/diagnostics` shows while the emergency stop is
-pressed; whether `/lidar_rear/scan` and `/scan` have a publisher; the lidars' frame names; the
-Gemini 2 camera's profile and intrinsics.
+pressed; why the rear lidar's `ttyUSB_RAIDAR_REAR` does not exist (and whether `ttyACM1` is the rear
+lidar), and whether `/scan` will then appear; the lidar frame names in the SDK document, which
+differ from the robot's; the duplicate `bluesea_node` name; the Gemini 2 camera's profile and
+intrinsics.

@@ -235,18 +235,50 @@ def is_estop_entry(entry: dict) -> bool:
 
 
 def health_payload(entries: dict, now_ms: int, stale_after_ms: int) -> dict:
-    """`entries` maps status name to `{"entry": ..., "received_ms": ...}`."""
-    statuses, worst = [], 0
+    """Compact diagnostics summary: how many, the worst level, and only what is wrong.
+
+    `entries` maps status name to `{"entry": ..., "received_ms": ...}`. The full per-status
+    dump was most of what the card showed and none of it was readable; `problems` lists, sorted
+    by name, every entry whose level is not 0 as `"name: message"`, and every entry that *looks*
+    fine but has not been updated within `stale_after_ms`. The second kind matters because
+    entries are kept by name: when one publisher dies, its last "ok" would otherwise sit there
+    looking healthy for ever.
+    """
+    problems, worst = [], 0
+    limit_s = int(round(stale_after_ms / 1000))
     for name in sorted(entries):
         record = entries[name]
-        age = max(0, now_ms - record["received_ms"])
-        item = dict(record["entry"])
-        item["age_ms"] = age
-        item["stale"] = age > stale_after_ms
-        statuses.append(item)
-        worst = max(worst, item["level"])
-    return {"worst_level": worst, "worst_level_name": DIAGNOSTIC_LEVELS.get(worst, f"code_{worst}"),
-            "count": len(statuses), "statuses": statuses, "stamp_ms": now_ms}
+        entry = record["entry"]
+        stale = max(0, now_ms - record["received_ms"]) > stale_after_ms
+        worst = max(worst, entry["level"])
+        if entry["level"] != 0:
+            suffix = f"（且超过 {limit_s} 秒没有更新）" if stale else ""
+            problems.append(f"{name}: {entry['message']}{suffix}")
+        elif stale:
+            problems.append(f"{name}: 超过 {limit_s} 秒没有更新")
+    return {"count": len(entries), "worst_level": worst,
+            "worst_level_name": DIAGNOSTIC_LEVELS.get(worst, f"code_{worst}"), "problems": problems}
+
+
+def estop_display(payload: dict) -> dict:
+    """The part of `estop_payload` worth showing on the card. The motion gate reads the full one."""
+    keys = ("found", "level", "message", "stop_button_status", "age_ms", "stale")
+    return {key: payload[key] for key in keys if key in payload}
+
+
+def battery_display(payload: dict) -> dict:
+    """The battery fields that carry information on this robot.
+
+    Left out: charge, capacity and design capacity (always NaN here), present/health/technology
+    (always true/good/unknown) and the raw 0..1 ratio (`percent` is the same number).
+    """
+    keys = ("percent", "voltage_v", "current_a", "temperature_c", "status")
+    return {key: payload[key] for key in keys}
+
+
+def joint_display(record: dict) -> dict:
+    """A gripper or the lift as shown: position and effort. Velocity is a constant 0 or NaN."""
+    return {"position": record["position"], "effort": record["effort"]}
 
 
 def estop_payload(entries: dict, now_ms: int, stale_after_ms: int) -> dict:
@@ -416,7 +448,8 @@ class StaticTf:
         return len(self._edges)
 
 
-def merge_scans(parts: list, target_frame: str, max_points: int = 360) -> dict:
+def merge_scans(parts: list, target_frame: str, max_points: int = 360,
+                self_filter_radius_m: float = 0.0) -> dict:
     """One polar scan around `target_frame` from several lidars, keeping the nearest return per bin.
 
     `parts` is `[(msg, transform)]`, where `transform` is `StaticTf.lookup`'s result or None for
@@ -424,11 +457,20 @@ def merge_scans(parts: list, target_frame: str, max_points: int = 360) -> dict:
     target frame, and put back into one of `max_points` bins round the robot; where two lidars
     see the same direction the nearer return wins, as in the single-lidar pooling. Ranges are
     therefore measured from the target frame's origin, not from either lidar.
+
+    A lidar on a robot sees the robot: the front lidar here returns its own chassis at 7 cm,
+    which would be the "nearest obstacle" for ever. Points that land within
+    `self_filter_radius_m` of the target frame's origin are dropped, and counted in
+    `self_filtered_beams` so that nothing disappears silently. Only points that were actually
+    moved into the target frame are filtered (`transform` is not None): a scan still in its own
+    lidar's frame says nothing about where the chassis is. A circle is not the robot's outline
+    -- it also hides real obstacles in the corners and sides that are nearer than the radius.
     """
     bins = max(8, int(max_points))
     step = 2.0 * math.pi / bins
     merged = [None] * bins
-    beams, range_mins, range_maxs = 0, [], []
+    beams, filtered, range_mins, range_maxs = 0, 0, [], []
+    radius = max(0.0, float(self_filter_radius_m or 0.0))
     for msg, transform in parts:
         ranges = list(getattr(msg, "ranges", []))
         beams += len(ranges)
@@ -451,6 +493,9 @@ def merge_scans(parts: list, target_frame: str, max_points: int = 360) -> dict:
                 (r, t) = transform
                 x, y = r[0][0] * x + r[0][1] * y + t[0], r[1][0] * x + r[1][1] * y + t[1]
             distance = math.hypot(x, y)
+            if transform is not None and distance < radius:
+                filtered += 1
+                continue
             slot = int(round((math.atan2(y, x) + math.pi) / step)) % bins
             if merged[slot] is None or distance < merged[slot]:
                 merged[slot] = distance
@@ -462,6 +507,7 @@ def merge_scans(parts: list, target_frame: str, max_points: int = 360) -> dict:
         "range_min": round(min(range_mins), 3) if range_mins else None,
         "range_max": round(max(range_maxs), 3) if range_maxs and math.isfinite(max(range_maxs)) else None,
         "beams": beams, "bins": bins, "beams_per_bin": None,
+        "self_filter_radius_m": radius, "self_filtered_beams": filtered,
         "valid_ratio": round(valid / bins, 3), "nearest_m": min((v for v in out if v is not None), default=None),
         "ranges": out, "stamp_ms": None,
     }

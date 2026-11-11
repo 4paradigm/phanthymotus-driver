@@ -4,8 +4,11 @@ The Panther's own bring-up does not run the Orbbec driver, so without this the c
 show nothing until someone logs in and launches it by hand. Ported from the Panther driver
 proposed in PR #520: the first `camera_color` or `camera_depth` start creates a transient
 systemd unit on the *host* (through `nsenter` into PID 1's namespaces) that runs the vendor's
-`gemini2.launch.py`; both cards share it, and stopping a card does not stop it, because other
-programs on the robot may be using the same camera.
+`gemini2.launch.py`; both cards share it, and stopping a *card* does not stop it, because other
+programs on the robot may be using the same camera. Stopping the *container* does (`close()`),
+but only a unit this driver started or found under its own name: a camera some other process was
+already publishing is never touched. A unit left behind by a killed container (SIGKILL, crash)
+is reused by the next start.
 
 This needs `privileged: true` and `pid: host` (deploy/service.yml). It is the only thing in the
 driver that acts on the host, so it is deliberately small: fixed commands, no caller-supplied
@@ -44,11 +47,13 @@ class HostCamera:
         self._mono = monotonic
         self._lock = threading.RLock()
         self._source_lock = threading.Lock()
+        self._unit_lock = threading.Lock()                  # a restart and the final stop never interleave
         self._active: set = set()
         self._armed_at = 0.0
         self._managed = False
         self._restarts = 0
         self._last_error = None
+        self._closing = False
         self._closed = threading.Event()
         self._thread = None
         if watchdog:
@@ -96,11 +101,36 @@ class HostCamera:
         return result
 
     def close(self) -> None:
-        self._closed.set()
+        """Container shutdown: stop the camera unit this driver started, once.
+
+        Only a unit this driver manages is stopped (`_managed`): if another process was already
+        publishing the camera topics the driver never started anything and leaves them alone,
+        and a run in which no camera card was ever started stops nothing. `--no-block` returns as
+        soon as systemd has the request, so a camera that is slow to exit cannot eat the
+        container's `stop_grace_period`, which a moving arm may need. A failure is logged and
+        never raised: shutdown must finish either way.
+
+        The watchdog is told to stand down first and is joined before the stop, so it cannot
+        restart the unit it has just been asked to stop. Calling this twice stops once.
+        """
         with self._lock:
+            if self._closing:
+                return
+            self._closing = True
             self._active.clear()
+            managed = self._managed
+        self._closed.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        if not managed:
+            return
+        try:
+            with self._unit_lock:
+                self._host(["systemctl", "stop", "--no-block", self.UNIT], timeout=10.0, check=False)
+            print(f"[panther] asked systemd to stop {self.UNIT}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[panther] could not stop {self.UNIT}: {type(exc).__name__}: {str(exc)[:160]}; "
+                  f"stop it with `sudo systemctl stop {self.UNIT}`", flush=True)
 
     # ── host side ────────────────────────────────────────────────────────────
 
@@ -134,6 +164,8 @@ class HostCamera:
         if again.returncode != 0:
             self._host(["systemd-run", f"--unit={self.UNIT}", "--collect",
                         "--property=Restart=on-failure", "--property=RestartSec=2s",
+                        # If the camera process ignores SIGTERM, systemd's default is to wait 90 s.
+                        "--property=TimeoutStopSec=15s",
                         f"--uid={self._cfg.get('user', 'unix_ai')}",
                         f"--setenv=HOME=/home/{self._cfg.get('user', 'unix_ai')}",
                         "/bin/bash", "-lc", self._launch_script()], timeout=15.0)
@@ -155,6 +187,8 @@ class HostCamera:
         stall = float(self._cfg.get("frame_stall_s", 15.0))
         limit = int(self._cfg.get("max_watchdog_restarts", 2))
         with self._lock:
+            if self._closing:
+                return False
             active, managed, armed_at, restarts = set(self._active), self._managed, self._armed_at, self._restarts
         if not active or not managed or not armed_at or restarts >= limit:
             return False
@@ -169,7 +203,15 @@ class HostCamera:
                 stalled.append(kind)
         if not stalled:
             return False
-        self._host(["systemctl", "restart", self.UNIT], timeout=30.0)
+        # The state above was read a moment ago. `close()` may have begun since, and a restart
+        # issued after its stop would bring the camera back for good. So the decision is taken
+        # again, under the same lock `close()` takes to stop the unit: whichever gets it first,
+        # the other sees the result.
+        with self._unit_lock:
+            with self._lock:
+                if self._closing:
+                    return False
+            self._host(["systemctl", "restart", self.UNIT], timeout=30.0)
         with self._lock:
             self._restarts += 1
             self._armed_at = self._mono()

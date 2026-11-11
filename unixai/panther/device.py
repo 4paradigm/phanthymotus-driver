@@ -29,9 +29,10 @@ from host_camera import HostCamera
 from panther_bridge import CoreBridge, DEFAULT_PROFILE, safe_text
 from panther_motion import MOTION_CARDS, Motion, motion_tools
 from panther_payloads import (
-    DEPTH_FORMAT, DEPTH_OUTPUT_SIZE, StaticTf, UnsupportedImage, battery_payload, diagnostic_entries,
-    encode_color_jpeg, encode_depth_zlib, estop_payload, health_payload, imu_payload,
-    joint_state_payload, laser_topdown_jpeg, merge_scans, odom_reading, single_joint,
+    DEPTH_FORMAT, DEPTH_OUTPUT_SIZE, StaticTf, UnsupportedImage, battery_display, battery_payload,
+    diagnostic_entries, encode_color_jpeg, encode_depth_zlib, estop_display, estop_payload,
+    health_payload, imu_payload, joint_display, joint_state_payload, laser_topdown_jpeg, merge_scans,
+    odom_reading, single_joint,
 )
 
 URDF_PATH = Path(__file__).with_name("resource") / "panther.urdf"
@@ -66,7 +67,7 @@ NO_DATA_HINTS = {
                     "（`journalctl -u panther_orbbec`），或相机是否被别的程序占用",
     "camera_depth": "启动后仍未收到深度图：检查机器人本机的 panther_orbbec.service"
                     "（`journalctl -u panther_orbbec`），或相机是否被别的程序占用",
-    "laser_scan": "没有收到任何雷达数据：前后雷达话题都没有发布者",
+    "laser_scan": "没有收到任何雷达数据：前后雷达话题都没有收到数据",
 }
 
 
@@ -126,6 +127,7 @@ class Hub:
         self._laser_points = int(laser.get("max_points", 360))
         self._view_range = float(laser.get("view_range_m", 6.0))
         self._base_frame = str(laser.get("base_frame", "base_link"))
+        self._self_filter_radius = float(laser.get("self_filter_radius_m", 0.0))
 
         base = f"/{namespace}/" if namespace else "/"
         self.topics = {
@@ -378,30 +380,35 @@ class Hub:
                 "fresh": age is not None and age <= self._stale[limit_key]}
 
     def _state_payload(self) -> dict:
+        """What the robot_state card shows. Trimmed for reading: the full readings stay in the
+        hub (the motion gate and `lift_position` use those), only this view drops fields that
+        are constant, always empty or duplicated on this robot."""
         now_ms = self._now_ms()
         with self._lock:
             latest, controllers = dict(self._latest), self._controllers
             diag, diag_seen = dict(self._diag), self._diag_seen
         battery = latest.get("battery")
-        diagnostics = {"available": False, "statuses": []}
+        diagnostics = None
         if diag:
-            diagnostics = {"available": True, **health_payload(
-                diag, now_ms, int(self._stale["diagnostics"] * 1000))}
-            diagnostics["age_ms"] = int(round((self._mono() - diag_seen) * 1000))
+            age = self._mono() - diag_seen
+            diagnostics = {**health_payload(diag, now_ms, int(self._stale["diagnostics"] * 1000)),
+                           "age_ms": int(round(age * 1000)), "fresh": age <= self._stale["diagnostics"]}
         ready, reasons = self.motion_ready()
         grippers = {}
         for side in ("left", "right"):
             record = latest.get(f"gripper_{side}")
-            grippers[side] = self._aged(record[0], record[1], "grippers") if record else None
+            grippers[side] = (self._aged(record[0], joint_display(record[1]), "grippers")
+                              if record else None)
         lift = latest.get("lift")
         return {
             "stamp_ms": now_ms,
             "ready_for_motion": ready, "not_ready_reasons": reasons,
-            "battery": self._aged(battery[0], battery[1], "battery") if battery else None,
+            "battery": (self._aged(battery[0], battery_display(battery[1]), "battery")
+                        if battery else None),
             "diagnostics": diagnostics,
-            "estop": estop_payload(diag, now_ms, int(self._stale["estop"] * 1000)),
+            "estop": estop_display(estop_payload(diag, now_ms, int(self._stale["estop"] * 1000))),
             "grippers": grippers,
-            "lift": self._aged(lift[0], lift[1], "lift") if lift else None,
+            "lift": self._aged(lift[0], joint_display(lift[1]), "lift") if lift else None,
             "controllers": (self._aged(controllers[0], {"states": dict(sorted(controllers[1].items()))},
                                        "controllers") if controllers else None),
         }
@@ -528,11 +535,12 @@ class Hub:
         else:
             side, msg, frame, _ = usable[0]
             parts, target, transformed = [(msg, None)], frame, False
-            sources[side]["note"] = f"no /tf_static transform to {self._base_frame} yet; drawn in its own frame"
+            sources[side]["note"] = (f"no /tf_static transform to {self._base_frame} yet; drawn in its "
+                                     "own frame, so the robot's own body is not filtered out")
         used = {u[0] for u in (placed or usable[:1])}
         for side in used:
             sources[side]["used"] = True
-        scan = merge_scans(parts, target, self._laser_points)
+        scan = merge_scans(parts, target, self._laser_points, self._self_filter_radius)
         scan.update(sources=sources, transformed=transformed, stamp_ms=self._now_ms())
         with self._lock:
             self._last_scan = scan
@@ -658,6 +666,7 @@ class Hub:
             if scan:
                 result["scan"] = {k: scan[k] for k in ("frame_id", "beams", "bins", "valid_ratio",
                                                        "nearest_m", "range_min", "range_max",
+                                                       "self_filter_radius_m", "self_filtered_beams",
                                                        "transformed", "sources")}
         if card == "robot_state":
             ready, reasons = self.motion_ready()
