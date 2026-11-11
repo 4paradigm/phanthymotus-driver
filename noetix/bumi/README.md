@@ -562,6 +562,12 @@ motion preserves the original blocking video path, and negotiation failure
 retries video on the same pipeline. No quaternion or camera-to-body mount is
 invented. Hardware motion/callback acceptance remains pending.
 
+### Capture-time body-camera TF
+
+`camera_rgbd` appends an optional `state/extrinsic` output at `/{namespace}/camera/rgbd/body_mount` after the existing color, depth and IMU ports. Both camera declarations carry the same `vendor.body_mount`; Perception discovers this topic automatically, so no card matrix is required. The existing camera ROS node queries `base_link <- {namespace}_depth_optical` at the original mapped depth capture nanoseconds and publishes `motus.camera_mount/1` JSON before the matching images. `CAMERA_BODY_FRAME` overrides only the body frame name. Dynamic joint transforms are looked up for every capture.
+
+`body_mount_status` exposes the selected frames and availability independently of RGB-D readiness. Missing TF packages, frames, capture-time transforms or publisher failures preserve video, RGB-D and IMU. The driver never substitutes SDK internal extrinsics, a URDF guess, identity or latest TF. The node remains in its existing ROS domain 42; installed TF domain, real optical calibration chain, timing and accuracy still require hardware acceptance. Bumi already includes `tf2_ros` through its existing RTAB-Map dependency; the build import guard now checks its Buffer and TransformListener APIs. No image was built or deployed for this change. Main odometry stays camera referenced; available evidence supports only a separately named derived body pose.
+
 ### Generic RGB-D short-term compensation
 
 Perception's generic `rgbd_odometry` card supports the instance settings

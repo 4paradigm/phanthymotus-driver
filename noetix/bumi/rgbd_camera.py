@@ -7,6 +7,7 @@ mapped once, never replaced by publication time. This is a camera optical frame,
 from array import array
 from copy import deepcopy
 import math
+import os
 import time
 import uuid
 import zlib
@@ -79,6 +80,15 @@ class RgbdCameraPublisher:
         self.last_error = None
         self.last_emit = None
         self.min_interval_s = min_interval_s
+        from common.camera_mount import BodyMountSource
+        self.body_mount = BodyMountSource(node, self.root,
+            body_frame=os.environ.get('CAMERA_BODY_FRAME', 'base_link'),
+            camera_frame=lambda: self.frame_id,
+            clock_id=lambda: self.clock_id + '/' + str(self.clocks[0].domain))
+        self.mount_error = None
+        self._reported_mount = None
+        self.report(dict(ready=False, camera_info=[], error='awaiting calibrated capture',
+                         body_mount_status=self.body_mount.status()))
 
     def motion_stamp(self, source_ms, domain):
         # Reuse the image clock's established offset; motion must never fit its
@@ -93,9 +103,13 @@ class RgbdCameraPublisher:
             raise ValueError('stale or future motion capture time')
         return stamp
 
+    def close(self):
+        self.body_mount.close()
+
     def unavailable(self, error):
         if self.ready or self.last_error is None:
-            self.report(dict(ready=False, camera_info=[], error=str(error)[:300]))
+            self.report(dict(ready=False, camera_info=[], error=str(error)[:300],
+                             body_mount_status=self.body_mount.status()))
         self.ready = False
         self.last_error = str(error)
 
@@ -148,12 +162,27 @@ class RgbdCameraPublisher:
             msg.header.frame_id = self.frame_id
             msg.format, msg.data = fmt, array('B', payload)
             messages.append((kind, msg))
+        try:
+            self.body_mount.publish(stamps[1])
+            self.mount_error = None
+        except Exception as error:
+            self.mount_error = str(error)
         for kind, msg in messages:
             self.pubs[kind].publish(msg)
         self.last_emit = now
         self.last_error = None
-        if not self.ready:
+        mount_status = self.body_mount.status()
+        mount = self.body_mount.declaration()
+        if self.mount_error:
+            mount_status = dict(mount_status, status='unavailable', reason=self.mount_error)
+            mount = dict(mount, status='unavailable', reason=self.mount_error)
+        if not self.ready or mount != self._reported_mount:
             self.ready = True
-            self.report(dict(ready=True, error=None, camera_info=camera_declarations(
+            declarations = camera_declarations(
                 self.root, g, self.frame_id, self.clock_id + '/' + domains[0],
-                domains[0], self.clocks[0].offset)))
+                domains[0], self.clocks[0].offset)
+            for declaration in declarations:
+                declaration['vendor']['body_mount'] = deepcopy(mount)
+            self.report(dict(ready=True, error=None, camera_info=declarations,
+                             body_mount_status=mount_status))
+            self._reported_mount = deepcopy(mount)

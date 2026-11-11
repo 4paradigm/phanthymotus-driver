@@ -2706,6 +2706,10 @@ def _camera_subprocess(namespace: str):
     except Exception as e:
         print(f"[camera_subprocess] error: {e}", flush=True)
     finally:
+        if rgbd_inputs is not None:
+            close = getattr(rgbd_inputs, 'close', None)
+            if close is not None:
+                close()
         pipeline.stop()
 
 
@@ -2795,10 +2799,12 @@ class CameraPlugin:
         return {"state": "running" if status["ready"] else "unavailable",
                 "sourceReady": status["ready"], "camera_info": status["camera_info"],
                 "imu_status": imu_status,
+                "body_mount_status": status.get("body_mount_status", dict(status="unavailable", reason="waiting for body mount source")),
                 **({"error": status["error"]} if status.get("error") else {}),
                 "topic_out": [{"topic": root + "/color", "format": "image/jpeg"},
                               {"topic": root + "/depth", "format": "image/depth-zlib"},
-                              {"topic": root + "/imu", "format": "sensor/imu", "optional": True}]}
+                              {"topic": root + "/imu", "format": "sensor/imu", "optional": True},
+                              {"topic": root + "/body_mount", "format": "state/extrinsic", "optional": True}]}
 
     def _camera_info(self, tool_name: str, topic: str, fmt: str) -> list:
         """This port's optics — `motus.camera/1`, see `camera_specs.py`.
@@ -2846,7 +2852,8 @@ class CameraPlugin:
              "inputSchema": {"type": "object", "properties": {}},
              "topic_out": self._rgbd_info()["topic_out"],
              "camera_info": self._rgbd_info()["camera_info"],
-             "imu_status": self._rgbd_info()["imu_status"]},
+             "imu_status": self._rgbd_info()["imu_status"],
+             "body_mount_status": self._rgbd_info()["body_mount_status"]},
         ]
 
     def start(self) -> None:

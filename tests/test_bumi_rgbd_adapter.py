@@ -46,6 +46,7 @@ def source(monkeypatch):
     notices = []
     monkeypatch.setitem(sys.modules, 'pyrealsense2', NS(
         stream=NS(depth='depth'), align=lambda target: NS(process=lambda frames: frames)))
+    monkeypatch.setitem(sys.modules, 'common.camera_mount', NS(BodyMountSource=lambda *args, **kwargs: Mount()))
     publisher = rgbd.RgbdCameraPublisher(node, 'robot', pipeline, object(), report=notices.append)
     monkeypatch.setattr(rgbd.time, 'time_ns', lambda: 10_000_000_000)
     return publisher, messages, notices
@@ -195,7 +196,8 @@ def test_camera_rgbd_card_returns_both_declarations_on_start_and_info(monkeypatc
         assert result['camera_info'] == declarations
         assert result['topic_out'] == [{'topic': '/robot/camera/rgbd/color', 'format': 'image/jpeg'},
                                        {'topic': '/robot/camera/rgbd/depth', 'format': 'image/depth-zlib'},
-                                       {'topic': '/robot/camera/rgbd/imu', 'format': 'sensor/imu', 'optional': True}]
+                                       {'topic': '/robot/camera/rgbd/imu', 'format': 'sensor/imu', 'optional': True},
+                                       {'topic': '/robot/camera/rgbd/body_mount', 'format': 'state/extrinsic', 'optional': True}]
     plugin._proc = NS(poll=lambda: 1)
     assert plugin.dispatch('info', {'_tool_name': 'camera_rgbd'})['sourceReady'] is False
     plugin._proc = NS(poll=lambda: None)
@@ -257,3 +259,134 @@ def test_first_source_start_waits_for_core_camera_metadata(monkeypatch):
     plugin._rgbd_info=lambda:next(statuses)
     plugin.is_running=lambda:True
     assert plugin.dispatch('start',{'_tool_name':'camera_rgbd'})['camera_info']
+
+
+class Mount:
+    def __init__(self):
+        self.calls = []
+        self.error = False
+    def publish(self, stamp):
+        self.calls.append(('publish', stamp))
+        if self.error: raise RuntimeError('TF lookup failed')
+        return True
+    def declaration(self):
+        return dict(schema='motus.camera_mount/1', topic='/robot/camera/rgbd/body_mount',
+                    parent_frame='base_link', child_frame='robot_depth_optical', status='available',
+                    source='tf', version='capture_tf_v1', epoch='test-epoch', mode='dynamic',
+                    length_unit='m', transform_direction='body_from_camera',
+                    reason=None, accuracy_validated=False)
+    def status(self): return dict(status='available', parent_frame='base_link')
+    def close(self): self.calls.append(('close',))
+
+
+def test_bumi_mount_precedes_images_at_depth_capture_time_and_updates_status(source):
+    publisher, messages, notices = source
+    mount = Mount()
+    publisher.body_mount = mount
+    original = mount.publish
+    def publish(stamp):
+        assert not any(messages.values())
+        return original(stamp)
+    mount.publish = publish
+    publisher.publish(frames())
+    assert mount.calls == [('publish', 10_010_000_000)]
+    a, b = notices[-1]['camera_info']
+    assert a['vendor']['body_mount'] == b['vendor']['body_mount'] == mount.declaration()
+    assert notices[-1]['body_mount_status'] == mount.status()
+    publisher.close()
+    assert mount.calls[-1] == ('close',)
+
+
+def test_bumi_mount_failure_preserves_rgbd_and_reports_unavailable(source):
+    publisher, messages, notices = source
+    publisher.body_mount = Mount()
+    publisher.body_mount.error = True
+    publisher.publish(frames())
+    assert len(messages['/robot/camera/rgbd/color']) == 1
+    assert len(messages['/robot/camera/rgbd/depth']) == 1
+    assert notices[-1]['ready'] is True
+    assert notices[-1]['body_mount_status']['status'] == 'unavailable'
+    assert 'TF lookup failed' in notices[-1]['body_mount_status']['reason']
+    assert notices[-1]['camera_info'][0]['vendor']['body_mount']['status'] == 'unavailable'
+
+
+@pytest.mark.parametrize('override,expected', [(None, 'base_link'), ('body', 'body')])
+def test_bumi_mount_constructor_uses_existing_node_optical_frame_and_mapped_clock(monkeypatch, override, expected):
+    if override is None: monkeypatch.delenv('CAMERA_BODY_FRAME', raising=False)
+    else: monkeypatch.setenv('CAMERA_BODY_FRAME', override)
+    monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(CompressedImage=NS))
+    monkeypatch.setitem(sys.modules, 'pyrealsense2', NS(stream=NS(depth='depth'), align=lambda _: NS()))
+    calls = []
+    monkeypatch.setitem(sys.modules, 'common.camera_mount', NS(
+        BodyMountSource=lambda node, root, **kwargs: calls.append((node, root, kwargs)) or Mount()))
+    node = NS(create_publisher=lambda *args: NS())
+    pipeline = NS(get_active_profile=lambda: NS(get_device=lambda: NS(
+        first_depth_sensor=lambda: NS(get_depth_scale=lambda: .001))))
+    publisher = rgbd.RgbdCameraPublisher(node, 'robot', pipeline, object())
+    actual_node, root, args = calls[0]
+    assert actual_node is node and root == '/robot/camera/rgbd'
+    assert args['body_frame'] == expected
+    assert args['camera_frame']() == 'robot_depth_optical'
+    publisher.clocks[0].domain = 'hardware_clock'
+    assert args['clock_id']() == publisher.clock_id + '/hardware_clock'
+
+
+def actual_mount(monkeypatch, path, parent, child, clock, events):
+    """Load the shipped provider, substituting only unavailable ROS transport."""
+    import json
+    import sys
+    spec = importlib.util.spec_from_file_location('tested_camera_mount', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    class Buffer:
+        def __init__(self): self.missing = False
+        def lookup_transform(self, target, source, capture):
+            events.append(('lookup', target, source, capture.nanoseconds))
+            if self.missing: raise LookupError(f'{target} <- {source} missing at capture')
+            return NS(header=NS(frame_id=target, stamp=NS(
+                          sec=capture.nanoseconds // 10**9, nanosec=capture.nanoseconds % 10**9)), child_frame_id=source,
+                      transform=NS(translation=NS(x=.2, y=-.1, z=.3),
+                                   rotation=NS(x=0., y=0., z=0., w=1.)))
+    class Listener:
+        def __init__(self, *args): pass
+        def unregister(self): events.append(('unregister',))
+    monkeypatch.setitem(sys.modules, 'std_msgs.msg', NS(String=lambda **kwargs: NS(**kwargs)))
+    monkeypatch.setitem(sys.modules, 'rclpy.qos', NS(qos_profile_sensor_data=object()))
+    monkeypatch.setitem(sys.modules, 'rclpy.time', NS(Time=lambda **kwargs: NS(**kwargs)))
+    monkeypatch.setitem(sys.modules, 'rclpy.clock', NS(ClockType=NS(ROS_TIME='ros')))
+    monkeypatch.setitem(sys.modules, 'tf2_ros', NS(Buffer=Buffer, TransformListener=Listener))
+    node = NS(create_publisher=lambda cls, topic, qos: NS(
+                  publish=lambda message: events.append(('packet', json.loads(message.data)))),
+              destroy_publisher=lambda _: events.append(('destroy_publisher',)))
+    return module.BodyMountSource(node, '/robot/camera/rgbd', body_frame=parent,
+                                  camera_frame=child, clock_id=clock)
+
+
+def test_bumi_real_provider_uses_mapped_depth_time_and_missing_tf_keeps_pairs(source, monkeypatch):
+    publisher, messages, notices = source
+    events = []
+    mount = actual_mount(monkeypatch, ROOT / 'common/camera_mount.py', 'base_link',
+                         publisher.frame_id, lambda: publisher.clock_id + '/' + publisher.clocks[0].domain, events)
+    publisher.body_mount = mount
+    publisher.publish(frames())
+    assert events[0] == ('lookup', 'base_link', 'robot_depth_optical', 10_010_000_000)
+    assert events[1][1]['status'] == 'available'
+    assert events[1][1]['matrix'][0][3] == .2
+    assert events[1][1]['clock_id'] == publisher.clock_id + '/hardware_clock'
+    assert notices[-1]['camera_info'][0]['vendor']['body_mount'] == mount.declaration()
+    mount.buffer.missing = True
+    publisher.publish(frames(ms=1030.))
+    assert events[-1][1]['stamp_ns'] == 10_040_000_000
+    assert events[-1][1]['status'] == 'unavailable'
+    assert len(messages['/robot/camera/rgbd/depth']) == 2
+    assert notices[-1]['ready'] is True
+    assert notices[-1]['body_mount_status']['status'] == 'unavailable'
+    publisher.close()
+    assert events[-2:] == [('unregister',), ('destroy_publisher',)]
+
+
+def test_bumi_mount_diagnostic_exists_before_first_valid_rgbd_capture(source):
+    publisher, _, notices = source
+    assert notices[-1]['ready'] is False
+    assert notices[-1]['camera_info'] == []
+    assert notices[-1]['body_mount_status'] == publisher.body_mount.status()
