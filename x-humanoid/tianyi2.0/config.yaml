@@ -56,7 +56,7 @@ plugins:
   wrist_cameras:
     enabled: true
     left_serial: "261922273335"    # D405 SDK Serial Number, NOT ASIC Serial Number
-    right_serial: ""   # D405 SDK Serial Number, NOT ASIC Serial Number
+    right_serial: "262122270344"   # D405 SDK Serial Number, NOT ASIC Serial Number
     jpeg_quality: 85
   asr:
     enabled: true
