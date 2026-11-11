@@ -312,6 +312,13 @@ def run_concurrently(fn_a, fn_b):
 # ---------------------------------------------------------------------------
 
 class ToolInventoryTests(unittest.TestCase):
+    def test_driver_and_relay_use_robot_discovery_servers(self):
+        service = (DEVICE_DIR / "deploy" / "service.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            "ROS_DISCOVERY_SERVER=10.42.10.10:11811;10.42.10.12:11811",
+            service,
+        )
+
     def test_relay_start_failure_is_fatal_when_cameras_use_host_relay(self):
         dockerfile = (DEVICE_DIR / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("if ! /work/agibot/A3/jazzy_relay.sh start; then", dockerfile)
