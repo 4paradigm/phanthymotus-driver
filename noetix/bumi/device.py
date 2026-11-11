@@ -2462,6 +2462,19 @@ def _camera_subprocess(namespace: str):
             except Exception as _e:
                 print(f"[camera_subprocess] raw enable control unavailable: {_e}", flush=True)
 
+    # Generic Perception card inputs share the already-open capture pipeline.
+    # Its calibration/clock failures must leave the display media path running.
+    rgbd_inputs = None
+    def report_rgbd(status):
+        import json
+        print("[camera_subprocess] RGBD " + json.dumps(status, allow_nan=False), flush=True)
+    try:
+        from rgbd_camera import RgbdCameraPublisher
+        rgbd_inputs = RgbdCameraPublisher(node, namespace, pipeline, _QOS,
+                                        report=report_rgbd, min_interval_s=.1)
+    except Exception as exc:
+        report_rgbd(dict(ready=False, camera_info=[], error=str(exc)))
+
     frame_count = 0
     t_start = _time.monotonic()
     try:
@@ -2510,6 +2523,12 @@ def _camera_subprocess(namespace: str):
                         detail = ' '.join(str(_e).split())[:300]
                         print(f"[camera_subprocess] raw RGB-D publish failed "
                               f"(failure #{raw_publish_failures}): {detail}", flush=True)
+
+            if rgbd_inputs is not None:
+                try:
+                    rgbd_inputs.publish(source_frames)
+                except Exception as exc:
+                    rgbd_inputs.unavailable(exc)
 
             frame_count += 1
             # Log every 300 frames (~15s at 20fps)
@@ -2596,6 +2615,20 @@ class CameraPlugin:
         # fallback — the declaration has to be answerable before the camera runs.
         self._intrinsics: dict = {}
         self._intrinsics_lock = threading.Lock()
+        self._rgbd_status = dict(ready=False, camera_info=[], error="awaiting calibrated capture")
+
+    def _rgbd_info(self):
+        from copy import deepcopy
+        with self._intrinsics_lock:
+            status = deepcopy(self._rgbd_status)
+        if status["ready"] and not self.is_running():
+            status = dict(ready=False, camera_info=[], error="camera capture process unavailable")
+        root = f"/{self._namespace}/camera/rgbd"
+        return {"state": "running" if status["ready"] else "unavailable",
+                "sourceReady": status["ready"], "camera_info": status["camera_info"],
+                "error": status.get("error"),
+                "topic_out": [{"topic": root + "/color", "format": "image/jpeg"},
+                              {"topic": root + "/depth", "format": "image/depth-zlib"}]}
 
     def _camera_info(self, tool_name: str, topic: str, fmt: str) -> list:
         """This port's optics — `motus.camera/1`, see `camera_specs.py`.
@@ -2636,10 +2669,17 @@ class CameraPlugin:
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}],
             },
+            {"name": "camera_rgbd", "type": "sensor", "multiInstance": False,
+             "description": "Bumi calibrated registered RGB-D inputs for Perception odometry; camera optical frame, capture-mapped time.",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": self._rgbd_info()["topic_out"],
+             "camera_info": self._rgbd_info()["camera_info"]},
         ]
 
     def start(self) -> None:
         import sys
+        with self._intrinsics_lock:
+            self._rgbd_status = dict(ready=False, camera_info=[], error="awaiting calibrated capture")
         env = dict(os.environ)
         self._proc = subprocess.Popen(
             [sys.executable, "-c",
@@ -2658,18 +2698,31 @@ class CameraPlugin:
                 # but the line itself is what somebody debugging a wrong field
                 # of view will grep for in `docker logs`.
                 print(text, flush=True)
+                marker = "[camera_subprocess] RGBD "
+                if marker in text:
+                    try:
+                        status = json.loads(text.split(marker, 1)[1])
+                        if isinstance(status, dict) and type(status.get("ready")) is bool:
+                            with self._intrinsics_lock:
+                                self._rgbd_status = status
+                    except (ValueError, TypeError):
+                        pass
                 payload = parse_intrinsics_line(text)
                 if payload:
                     with self._intrinsics_lock:
                         self._intrinsics = payload
                     print("[camera] adopted RealSense intrinsics for "
                           + ", ".join(sorted(payload)), flush=True)
+            with self._intrinsics_lock:
+                self._rgbd_status = dict(ready=False, camera_info=[], error="camera capture process exited")
         threading.Thread(target=_fwd, daemon=True).start()
 
     def stop(self) -> None:
         if self._proc:
             self._proc.terminate()
             self._proc = None
+        with self._intrinsics_lock:
+            self._rgbd_status = dict(ready=False, camera_info=[], error="camera stopped")
 
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
@@ -2678,6 +2731,8 @@ class CameraPlugin:
         return self._frame_node.wait_for_frame(after_sequence, timeout_s)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if args.get("_tool_name") == "camera_rgbd":
+            return self._rgbd_info()
         if action == "start":
             return {"state": "running"}
         if action == "stop":

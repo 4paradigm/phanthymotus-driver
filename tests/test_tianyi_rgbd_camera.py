@@ -61,3 +61,11 @@ def test_output_preserves_optical_frame_and_declares_matching_intrinsics():
     assert declarations[0]['vendor']['frame_id']=='optical'
     assert declarations[1]['vendor']['depth_unit']=='mm'
     assert declarations[1]['vendor']['depth_source']=='measured'
+
+
+def test_healthy_source_info_is_not_flagged_as_an_mcp_error():
+    import threading
+    source=object.__new__(m.RgbdCameraPlugin)
+    source.lock=threading.RLock();source.root='/test';source.geometry=None
+    source.running=True;source.registered=True;source.count=2;source.error=None
+    assert 'error' not in source.dispatch('info',{})

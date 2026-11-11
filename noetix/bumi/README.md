@@ -500,3 +500,25 @@ media cards and motion cards keep running.
 
 The output contract, quality states, assumed body-axis calibration, validation
 status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
+
+### Generic Perception RGB-D input
+
+When the camera plugin is enabled it also exposes the `camera_rgbd` sensor card.
+Connect both `/bumi/camera/rgbd/color` (`image/jpeg`) and
+`/bumi/camera/rgbd/depth` (`image/depth-zlib`) to Perception's RGB-D odometry
+card; the namespace follows the bundle configuration. Its `info` and `start`
+responses include both `camera_info` declarations and `sourceReady`.
+
+This branch shares the existing RealSense pipeline. It aligns color into the
+native depth optical frame, then rectifies both images on the same 640x480 rays.
+Depth is measured little-endian uint16 millimetres using the SDK depth scale.
+The original display camera/depth streams remain available.
+
+The output headers preserve separate source capture times through the existing
+clock mapping. A hardware clock uses one fixed arrival-derived offset; its
+source domain and offset are disclosed and `clock_mapping_verified` is false.
+No publication-time fallback is emitted on these computation topics. Unsupported
+nonzero inverse/modified Brown distortion, invalid calibration/scale, capture
+clock discontinuity or excessive skew makes the source unavailable with an
+error; it does not stop the display streams. No body mount is assumed, and
+neither physical accuracy nor hardware performance has been validated.

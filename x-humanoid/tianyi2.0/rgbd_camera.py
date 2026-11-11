@@ -254,4 +254,5 @@ class RgbdCameraPlugin:
         with self.lock:
             return {'state': 'running' if self.running else 'idle', 'topic_out': self._outputs(),
                     'camera_info': self._declarations(), 'frames_forwarded': self.count,
-                    'registered_source': self.registered, 'error': self.error}
+                    'registered_source': self.registered,
+                    **({'error': self.error} if self.error else {})}

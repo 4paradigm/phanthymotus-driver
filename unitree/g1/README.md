@@ -89,6 +89,14 @@ python3 unitree/g1/main.py eth0
 - `servo` 和 `servo_eef` 默认关闭。启用前核对关节布局、夹爪和腰部配置，并阅读对应模块说明。驱动没有统一的多控制器仲裁，不要让多个控制源同时控制同一组关节。
 - SDK 请求成功与实测动作完成是不同状态。检查返回结果和本体反馈；软件检查不能替代物理动作验收。
 
+## RGB-D 里程计计算输入
+
+`camera_rgbd` 复用 `camera` 已有 RealSense 采集进程，输出 `/{namespace}/camera/rgbd/color`（JPEG）和 `/{namespace}/camera/rgbd/depth`（640×480、小端 uint16 毫米 zlib）。同时连接这两个端口到通用 RGB-D 里程计卡。已有 `camera_rgb`、`camera_depth` 显示流保持原样。
+
+SDK 先把彩色图配准到深度光学平面，再用实测深度内参对两个图应用同一校正映射；输出声明共享 `camera_depth_optical_frame`、K 和零畸变。深度单位按 SDK 实际 `depth_scale` 换算，保留每张图自己的采集时间。仅接受 SDK `global_time`，不使用接收时间拟合偏移。两帧最大时间差 20 ms，重复、过期或未来时间会拒绝输出。
+
+`info` 仅在有效采集后返回 `motus.camera/1` 声明；缺少标定、时钟或数据失效时返回 `state=unavailable`、原因和空 `camera_info`。支持无畸变、标准 Brown，以及系数全零的 inverse/modified Brown 深度内参；其他模型明确不可用。当前仅完成离线验证，未执行实机验收。
+
 ## 开发与验证入口
 
 - [仓库构建流程](../../CONTRIBUTING.md#building-docker-images)：业务镜像构建与发布入口。
