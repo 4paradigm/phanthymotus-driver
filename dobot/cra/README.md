@@ -176,9 +176,9 @@ TLS 保持校验；停止在反馈或证书配置异常时仍可下发，但不�
 |---|---|---|
 | `speed` | `0.25x` `0.5x` `1x`（默认） `1.5x` `2x` | 回放速度档位，1x 为录制原速；不再使用百分比或任意倍率，也没有加速度倍率 |
 | `approach_speed` | `slow`（默认） `normal` `fast` | 运动到起点/回起点的 MovJ 速度档位，对应速度和加速度均为 10 / 25 / 50 |
-| `pause_at_start` | 布尔，默认 false | 到达并核验起点后停住，占用保持，以 cancelled、`reason=paused_at_start` 通知（与 pause 一致），resume 开始回放，stop_motion 放弃 |
-| `return_to_start` | 布尔，默认 false | 回放结束后运动回起点并核验；回起点失败时 play 以 error 结束并说明“回放已完成但回起点失败” |
-| `detect_collision` | 布尔，默认 **true** | 仅控制安全皮肤：true 开启并将四个区域设为 low，false 关闭；不影响本体碰撞等级 |
+| `pause_at_start` | 下拉 true/false，默认 false | 到达并核验起点后停住，占用保持，以 cancelled、`reason=paused_at_start` 通知（与 pause 一致），resume 开始回放，stop_motion 放弃 |
+| `return_to_start` | 下拉 true/false，默认 false | 回放结束后运动回起点并核验；回起点失败时 play 以 error 结束并说明“回放已完成但回起点失败” |
+| `detect_collision` | 下拉 true/false，默认 **true** | 仅控制安全皮肤：true 开启并将四个区域设为 low，false 关闭；不影响本体碰撞等级 |
 
 除列表查询外，业务 action 都需要手动填写 `confirm_move=true`；该字段不设默认值或枚举。
 

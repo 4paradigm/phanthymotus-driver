@@ -453,8 +453,10 @@ def test_card_contract_keeps_sensor_and_confirmation_conventions():
     assert properties["speed"]["enum"] == ["0.25x", "0.5x", "1x", "1.5x", "2x"] and properties["speed"]["default"] == "1x"
     assert properties["approach_speed"]["enum"] == ["slow", "normal", "fast"]
     assert properties["approach_speed"]["default"] == "slow"
-    assert properties["detect_collision"]["default"] is True
-    assert properties["pause_at_start"]["default"] is False and properties["return_to_start"]["default"] is False
+    assert properties["detect_collision"]["default"] == "true"
+    assert all(properties[k]["type"] == "string" and properties[k]["enum"] == ["true", "false"]
+               for k in ("detect_collision", "pause_at_start", "return_to_start"))
+    assert properties["pause_at_start"]["default"] == "false" and properties["return_to_start"]["default"] == "false"
     assert not {"velocity", "acceleration", "speed_multiplier"} & set(properties)
     assert not any("record" in action for action in actions)
     assert "trajectory_id" not in schema["properties"]
