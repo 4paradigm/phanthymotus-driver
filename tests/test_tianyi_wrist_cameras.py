@@ -136,27 +136,29 @@ def test_wrist_cards_are_listed_in_marketplace():
             assert declared[f"camera_wrist_{side}_{channel}"] == "sensor"
 
 
+class CaptureProcess:
+    def __init__(self, *, target, args, **kwargs):
+        self.args = args
+        self.alive = False
+
+    def start(self):
+        self.alive = True
+
+    def is_alive(self):
+        return self.alive
+
+    def join(self, timeout):
+        self.alive = False
+
+    def close(self):
+        pass
+
+
+
 @pytest.mark.parametrize("final_channel", ["rgb", "depth"])
 def test_rapid_channel_switches_preserve_final_selection(monkeypatch, final_channel):
     # Stub only the camera process; exercise real start/stop and shared memory.
     # The capture process is deliberately not consuming during the burst.
-    class CaptureProcess:
-        def __init__(self, *, target, args, **kwargs):
-            self.args = args
-            self.alive = False
-
-        def start(self):
-            self.alive = True
-
-        def is_alive(self):
-            return self.alive
-
-        def join(self, timeout):
-            self.alive = False
-
-        def close(self):
-            pass
-
     s = session()
     monkeypatch.setattr(s._ctx, "Process", CaptureProcess)
     assert s.start("rgb")["state"] == "loading"
@@ -267,3 +269,37 @@ def test_worker_exit_during_loading_reports_error():
     info = s.info("rgb")
     assert info["state"] == "error"
     assert info["error"] == "D405 capture worker exited"
+
+
+def test_bundle_starts_all_wrist_previews_without_project_start(monkeypatch):
+    import ast
+    from common import lifecycle
+
+    tree = ast.parse((SOURCE.parent / "main.py").read_text())
+    bundle_class = next(node for node in tree.body
+                        if isinstance(node, ast.ClassDef) and node.name == "TianyiDeviceBundle")
+    scope = {"DualDomainROS2": object, "os": wrist.os, "_lifecycle": lifecycle}
+    exec(compile(ast.Module(body=[bundle_class], type_ignores=[]), "main.py", "exec"), scope)
+    monkeypatch.setitem(sys.modules, "wrist_cameras", wrist)
+    monkeypatch.setattr(session()._ctx, "Process", CaptureProcess)
+    config = yaml.safe_load((SOURCE.parent / "config.yaml").read_text())
+    bundle = scope["TianyiDeviceBundle"](
+        {"plugins": {"wrist_cameras": config["plugins"]["wrist_cameras"]}},
+        "test_robot", None, None)
+    try:
+        bundle.start_all()  # Driver boot path, before any canvas action:start.
+        cards = bundle._plugins
+        assert len(cards) == 4
+        assert all(card in bundle._started_plugins for card in cards)
+        sessions = {card._session for card in cards}
+        assert len(sessions) == 2
+        assert all(s._proc.is_alive() and s._channels.value == 3 for s in sessions)
+        assert bundle.dispatch("camera_wrist_left_rgb", {"action": "stop"})["state"] == "idle"
+        left = next(s for s in sessions if s.side == "left")
+        assert left._proc.is_alive() and left._channels.value == 2
+        bundle.stop_all()
+        assert all(s._proc is None for s in sessions)
+        assert bundle.dispatch("camera_wrist_left_rgb", {"action": "start"})["state"] == "loading"
+        assert left._proc.is_alive() and left._channels.value == 1
+    finally:
+        bundle.stop_all()

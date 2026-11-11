@@ -360,7 +360,7 @@ class TianyiDeviceBundle:
                 for channel in ("rgb", "depth"):
                     plugin = WristCameraPlugin(sessions[side], channel)
                     self._plugins.append(plugin)
-                    print(f"[bundle] {plugin.get_tool()['name']} loaded (lazy)")
+                    print(f"[bundle] {plugin.get_tool()['name']} loaded (auto)")
 
         for config_name, class_name in (("imu", "ImuPlugin"),
                                         ("camera_depth", "DepthCameraPlugin"),
@@ -507,6 +507,7 @@ class TianyiDeviceBundle:
     _ALWAYS_START = {
         'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin',
         'ExtMicPlugin', 'CameraSnapshotPlugin', 'ControlledSpatialPlugin',
+        'WristCameraPlugin',
     }
 
     def start_all(self) -> None:
