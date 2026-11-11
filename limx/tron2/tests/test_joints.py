@@ -157,12 +157,56 @@ class ReconnectionIdentityTests(unittest.TestCase):
 
 
 class DisplayFrameTests(unittest.TestCase):
-    def test_lower_models_have_upright_display_frame_without_changing_motor_axes(self):
+    def test_startup_shins_are_horizontal_and_live_joint_values_unchanged(self):
+        from skeleton import lower_leg_segments, _axis_rotation, _multiply, _dot
+        references = [
+            [2.6029,-.2599,.2821,-2.6215,.48,2.579,.2611,.0374,-2.6208,-.61],
+            [1.1,-.1,.17,-2.6,0.,1.15,.12,-.15,-2.59,0.]]
         for mode in ('wheel_foot', 'sole_foot'):
-            root = ET.fromstring(model({'mode': mode})['urdf'])
-            joint = root.find("joint[@name='display_world_Joint']")
-            self.assertEqual(joint.find('parent').get('link'), 'display_world')
-            self.assertEqual(joint.find('child').get('link'), 'base_Link')
-            pitch = float(joint.find('origin').get('rpy').split()[1])
-            self.assertAlmostEqual(-math.sin(pitch), 1.)  # native +X -> display +Z
-            self.assertEqual(len([j for j in root.findall('joint') if j.get('type') != 'fixed']), 10)
+            for q in references:
+                profile={'mode': mode, 'display_reference_q': q}
+                rendered=model(profile);root=ET.fromstring(rendered['urdf'])
+                origin=root.find("joint[@name='display_world_Joint']/origin")
+                roll,pitch,yaw=map(float,origin.get('rpy').split())
+                rotation=((1.,0.,0.),(0.,1.,0.),(0.,0.,1.))
+                for axis,angle in (((0,0,1),yaw),((0,1,0),pitch),((1,0,0),roll)):
+                    rotation=_multiply(rotation,_axis_rotation(axis,angle))
+                for knee,foot in lower_leg_segments(rendered['urdf'],mode,q):
+                    self.assertAlmostEqual(_dot(rotation[2],tuple(foot[i]-knee[i] for i in range(3))),0.,places=8)
+                # Changing live q never recalculates the startup display frame.
+                serial='WF_TRON2A_TEST' if mode=='wheel_foot' else 'SF_TRON2A_TEST'
+                raw=sample(serial,10);raw['data']['q']=list(q)
+                packet=joints_stream(raw,profile)
+                self.assertEqual([j['q'] for j in packet['joints']],q)
+                raw['data']['q']=[0.]*10
+                joints_stream(raw,profile)
+                self.assertEqual(model(profile)['model_revision'],rendered['model_revision'])
+                self.assertEqual(len([j for j in root.findall('joint') if j.get('type')!='fixed']),10)
+
+    def test_unidentified_reference_does_not_use_head_up_rotation(self):
+        root=ET.fromstring(model({'mode':'wheel_foot'})['urdf'])
+        self.assertEqual(root.find("joint[@name='display_world_Joint']/origin").get('rpy'),'0 0 0')
+
+class StartupModelIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_request_captures_preparation_once_then_keeps_original_live_output(self):
+        from device import Adapter
+        from vendor import RobotReader
+        from state import joint_state
+        import time
+        settings={'serial':'','enabled_cards':['joints'],'stale_after_seconds':5,
+                  'poll_interval_seconds':.5,'response_timeout_seconds':.2}
+        reader=RobotReader(settings)
+        reader.accept_info({'accid':'WF_TRON2A_TEST','data':{'sw_version':'test-version',
+            'status':'SIT','imu':'OK','motor':'OK','working_mode':'developer_mode',
+            'working_mode_valid':True,'collision_enable':True,'collision_enable_valid':True,
+            'compliant_enable':False,'compliant_enable_valid':True}})
+        q=[2.6,0.,0.,-2.6,0.,2.6,0.,0.,-2.6,0.]
+        reader.joints=joint_state({'result':'success','timestamp':1.,'q':q,'dq':[0.]*10,'tau':[0.]*10,'names':[]})
+        reader.joints_at=time.monotonic();reader.joints_received=time.time()
+        adapter=Adapter(lambda *args:None,settings,reader=reader)
+        first=await adapter.execute_tool('model',{})
+        self.assertEqual(reader._startup_calibration['reference_q'],q)
+        reader.info['status']='WALK';reader.joints['q']=[0.]*10
+        second=await adapter.execute_tool('model',{})
+        self.assertEqual(first,second)
+        self.assertEqual([j['q'] for j in joints_stream(reader.sample('joint_state'),adapter.skeleton_configuration())['joints']],[0.]*10)

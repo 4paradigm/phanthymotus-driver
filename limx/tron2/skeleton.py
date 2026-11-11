@@ -2,6 +2,7 @@
 from pathlib import Path
 import math
 import hashlib
+import xml.etree.ElementTree as ET
 from functools import lru_cache
 
 from reset import ARM_NAMES
@@ -39,6 +40,86 @@ def model_content(path):
     return urdf, hashlib.sha256(urdf.encode('utf-8')).hexdigest()
 
 
+def _dot(a, b):
+    return sum(x*y for x,y in zip(a,b))
+
+
+def _cross(a, b):
+    return (a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0])
+
+
+def _unit(v):
+    length = math.sqrt(_dot(v,v))
+    if length < 1e-9:
+        raise ValueError('Degenerate shin display reference')
+    return tuple(x/length for x in v)
+
+
+def _multiply(a, b):
+    return tuple(tuple(sum(a[i][k]*b[k][j] for k in range(3)) for j in range(3)) for i in range(3))
+
+
+def _axis_rotation(axis, angle):
+    x,y,z = _unit(axis); c,s = math.cos(angle),math.sin(angle); v=1-c
+    return ((c+x*x*v,x*y*v-z*s,x*z*v+y*s),
+            (y*x*v+z*s,c+y*y*v,y*z*v-x*s),
+            (z*x*v-y*s,z*y*v+x*s,c+z*z*v))
+
+
+def lower_leg_segments(urdf, mode, q):
+    """Native-base FK: knee origin -> wheel/ankle origin, no display transform."""
+    if mode not in ('wheel_foot','sole_foot') or len(q)!=10 or any(
+            isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v) for v in q):
+        raise ValueError('Expected 10 finite native joint positions')
+    root=ET.fromstring(urdf); joints={j.get('name'):j for j in root.findall('joint')}
+    segments=[]
+    for side,offset in (('L',0),('R',5)):
+        rotation=((1.,0.,0.),(0.,1.,0.),(0.,0.,1.)); point=(0.,0.,0.); knee=None
+        names=[prefix+'_'+side+'_Joint' for prefix in LEG_PREFIXES+['wheel' if mode=='wheel_foot' else 'ankle_pitch']]
+        for index,name in enumerate(names):
+            joint=joints[name]; origin=joint.find('origin')
+            xyz=tuple(map(float,origin.get('xyz','0 0 0').split()))
+            point=tuple(point[i]+_dot(rotation[i],xyz) for i in range(3))
+            roll,pitch,yaw=map(float,origin.get('rpy','0 0 0').split())
+            for axis,angle in (((0,0,1),yaw),((0,1,0),pitch),((1,0,0),roll)):
+                rotation=_multiply(rotation,_axis_rotation(axis,angle))
+            if index==3:knee=point
+            axis=tuple(map(float,joint.find('axis').get('xyz').split()))
+            rotation=_multiply(rotation,_axis_rotation(axis,q[offset+index]))
+        segments.append((knee,point))
+    return segments
+
+
+@lru_cache(maxsize=16)
+def shin_aligned_model(path, mode, reference):
+    """One fixed display frame per startup reference; never rewrite live q/IMU."""
+    urdf,_=model_content(path); segments=lower_leg_segments(urdf,mode,reference)
+    vectors=[tuple(foot[i]-knee[i] for i in range(3)) for knee,foot in segments]
+    total=tuple(vectors[0][i]+vectors[1][i] for i in range(3))
+    forward=_unit(total if _dot(total,total)>1e-12 else vectors[0])
+    above=tuple(-(segments[0][1][i]+segments[1][1][i])/2 for i in range(3))
+    normal=_cross(*vectors)
+    if math.sqrt(_dot(normal,normal))<1e-7:
+        normal=tuple(above[i]-forward[i]*_dot(above,forward) for i in range(3))
+        if _dot(normal,normal)<1e-12:
+            axis=min(((1.,0.,0.),(0.,1.,0.),(0.,0.,1.)),key=lambda a:abs(_dot(a,forward)))
+            normal=tuple(axis[i]-forward[i]*_dot(axis,forward) for i in range(3))
+    up=_unit(normal)
+    if _dot(up,above)<0:up=tuple(-x for x in up)
+    lateral=_unit(_cross(up,forward)); forward=_cross(lateral,up)
+    rotation=(forward,lateral,up)
+    pitch=math.asin(max(-1.,min(1.,-rotation[2][0])))
+    if abs(math.cos(pitch))>1e-8:
+        roll=math.atan2(rotation[2][1],rotation[2][2]);yaw=math.atan2(rotation[1][0],rotation[0][0])
+    else:
+        roll=0.;yaw=math.atan2(-rotation[0][1],rotation[1][1])
+    root=ET.fromstring(urdf)
+    origin=root.find("joint[@name='display_world_Joint']/origin")
+    origin.set('rpy',' '.join(format(v,'.16g') for v in (roll,pitch,yaw)))
+    ET.indent(root,space='  '); text=ET.tostring(root,encoding='unicode')
+    return text,hashlib.sha256(text.encode()).hexdigest()
+
+
 def model(profile=None):
     mode = selected_mode(profile)
     if mode not in MODELS:
@@ -49,6 +130,9 @@ def model(profile=None):
                 'available': False, 'configuration': mode, 'model_id': None}
     model_id, path, _, _ = MODELS[mode]
     urdf, revision = model_content(path)
+    reference = (profile or {}).get('display_reference_q')
+    if mode in ('wheel_foot','sole_foot') and reference is not None:
+        urdf, revision = shin_aligned_model(path,mode,tuple(reference))
     return {'urdf': urdf, 'model_revision': revision, 'available': True,
             'configuration': mode, 'model_id': model_id}
 

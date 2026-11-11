@@ -171,7 +171,7 @@ class Adapter:
 
     def _loco_tool(self):
         return {'name':'loco_leg','type':'actuator','multiInstance':False,
-            'description':'TRON2下肢运动：stand_up完整起立，sit_down停止并坐下，move定时移动，stop_move停止移动并保持站立。仅支持下肢构型；轮足无横移。vx范围-3～3 m/s（正前负后），vyaw约±85.943669 deg/s（正左负右），默认均为0；duration为-1持续移动、0停止，或0.1～60秒，默认2秒。计时结束另发约1秒零速度，不保证精确距离或转角。',
+            'description':'TRON2下肢运动：stand_up完整起立，sit_down停止并坐下，move定时移动，stop_move停止移动并保持站立。仅支持下肢构型；轮足无横移。vx范围-3～3 m/s（正前负后），vyaw约±85.943669 deg/s（正左负右），默认均为0；duration为-1持续移动、0停止，或0.1～60秒，默认2秒。计时结束另发约1秒零速度，vyaw×duration不是目标转角，不保证精确距离或实际转角。',
             'inputSchema':{'type':'object','additionalProperties':False,
                 'properties':{'action':{'type':'string','enum':['stand_up','sit_down','move','stop_move','start','stop','info'],'description':'选择要执行的动作'},
                     'vx':{'type':'number','minimum':-3,'maximum':3,'default':0,'title':'vx','description':'前后速度，单位m/s，范围-3～3，默认0；正值前进、负值后退、0不前后移动。'},
@@ -239,6 +239,14 @@ class Adapter:
             # Cover the short interval before main's one-shot task records it.
             from state import configuration
             return configuration(self.reader.serial)
+        if profile.get('mode') in ('wheel_foot','sole_foot'):
+            calibration = getattr(self.reader, '_startup_calibration', None)
+            if calibration is None and getattr(self.reader, 'connected', False):
+                from stand import startup_match
+                startup_match(self.reader)
+                calibration = getattr(self.reader, '_startup_calibration', None)
+            if calibration and calibration.get('accid') == self.reader.serial:
+                return {**profile, 'display_reference_q': list(calibration['reference_q'])}
         return profile
 
     def snapshot(self):
@@ -472,9 +480,14 @@ class Adapter:
         return await asyncio.shield(self._lower_stop_task)
 
     async def execute_tool(self, name, args, *, follow_guard=None):
-        if name == 'model' and self.reader.configuration.get('state') == 'pending':
+        if name == 'model':
             deadline = time.monotonic() + self.settings['response_timeout_seconds']
-            while self.skeleton_configuration().get('state') == 'pending' and time.monotonic() < deadline:
+            while time.monotonic() < deadline:
+                profile = self.skeleton_configuration()
+                if profile.get('state') != 'pending' and (
+                        profile.get('mode') not in ('wheel_foot','sole_foot') or
+                        profile.get('display_reference_q') is not None or not getattr(self.reader, 'connected', False)):
+                    break
                 await asyncio.sleep(.05)
         data = self.call(name, args)
         if name == 'loco_leg':

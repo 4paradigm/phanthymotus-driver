@@ -4,7 +4,7 @@
   <joint name="display_world_Joint" type="fixed">
     <parent link="display_world" />
     <child link="base_Link" />
-    <origin xyz="0 0 0" rpy="0 -1.5707963267948966 0" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
   </joint>
   <link name="base_Link">
     </link>

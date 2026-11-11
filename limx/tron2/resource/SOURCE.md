@@ -30,4 +30,5 @@ The [official manual](https://www.limxdynamics.com/zh/documents/8446484868414873
 
 The renderer draws kinematic connectors, not meshes, so each wheel has four `display_wheel_*` fixed spoke endpoints (nominal display radius75mm); each sole has two `display_sole_*` fixed endpoints (nominal toe130mm, heel70mm, offset40mm below ankle). These are original schematic drawing dimensions, not calibrated wheel/foot CAD, collision dimensions or measured contact points. They follow the corresponding real wheel/ankle transforms but do not add actuated joints or synthetic feedback. There are still exactly10 real joints for each lower-limb model. Footed SF is covered by model/contract tests and remains unverified on this physical robot.
 
-下肢显示变换：新增display_world固定根节点，绕Y轴旋转-π/2，使厂家模型+X朝显示+Z；原base_Link、电机关节轴、限位与实时q不变。此为本Driver的显示约定，不是厂家新增关节或IMU估计。
+
+下肢显示变换：display_world固定根节点的旋转由本连接首次有效准备姿态reference_q与厂家URDF正运动学计算，使两侧膝到轮轴/踝的下腿段平行显示地面；不使用头部朝上规则。该旋转随后保持固定，原base_Link、电机关节轴、限位与实时q不变。不是厂家新增电机、IMU数据或实测重力方向。

@@ -1,10 +1,13 @@
 """Timed wheel-foot twist commands (SDK 3.8.3), no files or pose changes."""
 import asyncio
 import math
+import logging
 import time
 import uuid
 from stand import Stand
 from vendor import MoveError
+
+LOG = logging.getLogger('tron2')
 
 DIRECTIONS = {'forward':(.2,0.,0.), 'backward':(-.2,0.,0.),
               'turn_left':(0.,0.,.3), 'turn_right':(0.,0.,-.3)}
@@ -41,6 +44,8 @@ class Walk:
         self.reader,self.report=reader,report
         self.state,self.result,self.task='idle',None,None
         self.error=None;self.stop_requested=False
+        self.first_nonzero_at=self.first_zero_at=None
+        self.nonzero_frames=self.zero_frames=0
         reader.walk=self
 
     def info(self):
@@ -95,11 +100,15 @@ class Walk:
         if self.reader.move_pending or self.reader.head_pending or self.reader._pose_servo is not None:
             raise MoveError('其他运动请求正在执行',False)
         self.state,self.result,self.error,self.stop_requested='accepted',None,None,False
+        self.first_nonzero_at=self.first_zero_at=None
+        self.nonzero_frames=self.zero_frames=0
         action_id=str(uuid.uuid4())
         self.task=asyncio.create_task(self._run(action_id,action,seconds,velocity))
+        LOG.info('Walk accepted action_id=%s duration=%s vyaw_deg_s=%s vendor_z=%s',
+                 action_id,seconds,math.degrees(velocity[2]),velocity[2])
         result = {'status':'accepted','action_id':action_id,'motion_sent':False,
                 'direction':action,'time_seconds':seconds,'vx':velocity[0],'vy':velocity[1],
-                'vyaw':math.degrees(velocity[2]),'duration':seconds}
+                'vyaw':math.degrees(velocity[2]),'duration':seconds,'vendor_z_command':velocity[2]}
         if seconds == -1:
             # A continuous stream has no finite ACP completion deadline.
             result.pop('action_id')
@@ -122,10 +131,17 @@ class Walk:
         self.state='stopped'
         return {'state':'stopped','ret':0,'motion_sent':sent,'physical_stop_verified':False}
 
-    async def _send(self,velocity):
+    async def _send(self,velocity,timeout=.5):
+        attempted_at=time.monotonic()
         await asyncio.wait_for(self.reader.ws.send_json({'title':'request_twist',
             'accid':self.reader.serial,'guid':str(uuid.uuid4()),'timestamp':int(time.time()*1000),
-            'data':dict(zip(('x','y','z'),velocity))}),.5)
+            'data':dict(zip(('x','y','z'),velocity))}),timeout)
+        if any(velocity):
+            self.nonzero_frames+=1
+            if self.first_nonzero_at is None:self.first_nonzero_at=attempted_at
+        else:
+            self.zero_frames+=1
+            if self.first_zero_at is None:self.first_zero_at=attempted_at
 
     async def _zero(self,ws):
         if self.reader.ws is not ws or ws.closed or not self.reader.connected:
@@ -152,7 +168,9 @@ class Walk:
                 self._ready()
                 if self.reader.ws is not ws:raise MoveError('连接已变化，未继续移动',sent)
                 sent=None  # Attempted send may have reached the robot even if it times out.
-                await self._send(velocity);sent=True
+                remaining=deadline-time.monotonic()
+                if remaining<=0:break
+                await self._send(velocity,timeout=min(.5,remaining));sent=True
                 next_frame=max(next_frame+self.PERIOD,time.monotonic())
                 await asyncio.sleep(max(0,min(next_frame,deadline)-time.monotonic()))
             if self.error:raise MoveError(self.error,sent)
@@ -173,9 +191,15 @@ class Walk:
         stopped=self.stop_requested
         self.result={'direction':action,'vx':velocity[0],'vy':velocity[1],'vyaw':math.degrees(velocity[2]),'duration':seconds,'time_seconds':seconds,'motion_sent':sent,
             'zero_velocity_sent':zero_sent,'physical_stop_verified':False,
+            'commanded_vyaw_rad_s':velocity[2], 'nonzero_frames':self.nonzero_frames,
+            'zero_velocity_frames':self.zero_frames,
+            'command_stream_seconds':None if self.first_nonzero_at is None or self.first_zero_at is None else self.first_zero_at-self.first_nonzero_at,
+            'angle_control':False,
             'automatic_retry':False,'stopped_early':stopped,
             'completion':'timed_command_stream_finished_and_zero_velocity_sent'}
         if failure:self.result['error']=failure
+        LOG.info('Walk ended action_id=%s command_stream_seconds=%s nonzero_frames=%s zero_frames=%s failure=%s',
+                 action_id,self.result['command_stream_seconds'],self.nonzero_frames,self.zero_frames,failure)
         self.state='reporting'
         delivered=True if seconds == -1 else await self.report('walk',action_id,'error' if failure or stopped else 'completed',self.result)
         self.state='unconfirmed' if failure or not delivered else ('stopped' if stopped else 'completed')

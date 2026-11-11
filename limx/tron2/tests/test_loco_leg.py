@@ -249,6 +249,22 @@ class WalkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.ws.send_json.call_args.args[0]['data'], {'x':0.,'y':0.,'z':0.})
         report.assert_not_awaited()
 
+    async def test_45_degrees_per_second_is_one_radian_conversion_and_zero_after_2_seconds(self):
+        w,r,report,_=self.make();packets=[]
+        async def capture(packet):packets.append((time.monotonic(),packet))
+        r.ws.send_json.side_effect=capture
+        w.dispatch_velocity(0.,0.,45.,2.)
+        await asyncio.wait_for(w.task,4)
+        moving=[(at,p) for at,p in packets if p['data']['z']!=0]
+        zeros=[(at,p) for at,p in packets if p['data']['z']==0]
+        self.assertGreater(len(moving),50)
+        self.assertTrue(all(abs(p['data']['z']-math.pi/4)<1e-12 for _,p in moving))
+        first_zero=zeros[0][0]
+        self.assertTrue(all(at<first_zero for at,_ in moving))
+        self.assertLess(abs(first_zero-moving[0][0]-2.),.08)
+        self.assertAlmostEqual(w.result['commanded_vyaw_rad_s'],math.pi/4)
+        self.assertFalse(w.result['angle_control'])
+
     async def test_invalid_time_and_direction(self):
         for value in (True,None,'2',0,-2,61,math.nan,math.inf,10**400):
             with self.subTest(value=value),self.assertRaises(ValueError):duration(value)

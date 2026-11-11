@@ -277,4 +277,13 @@ PYTHONPATH=.:limx/tron2:limx/tron2/tests python3 -m unittest test_battery test_j
 
 move.duration=-1持续发送最新设定速度，直到stop_move、生命周期stop、断连或模式异常；0停车，0.1～60定时。持续模式立即返回continuous=true，不创建等待150秒完成的ACP任务；不自动重试，停止后尝试零速度收尾。无限时长不意味着允许断线后自动恢复移动。
 
-下肢URDF增加display_world固定显示坐标，绕Y轴旋转-90度，使本体前端/顶部标记朝显示+Z。官方base_Link与各电机关节坐标和q值保持原样。该固定视图用于准备跪姿的直观显示，不是IMU测得的地面姿态，不动态跟踪本体倾斜；上肢模型不变。刷新Dashboard重新加载model才能更新已缓存的显示坐标。
+
+### 准备姿态显示旋转与偏航传输诊断
+
+不再按本体前端/头部朝上固定旋转。首次获得本连接的有效准备姿态后，使用其reference_q和官方URDF正运动学，计算左右膝关节到轮轴（SF为踝关节）的下腿方向，将两段下腿所在平面作为显示水平面。本体位于足端上方用来消除上下翻转歧义；不是用头部决定旋转。仅在启动准备姿态计算一次，后续固定该显示坐标，站立和行走继续输出原有原始q/dq/tau，不随下腿运动重新校正；不伪造IMU。尚无有效准备姿态时不套用旧的头部朝上旋转。Dashboard需刷新重新加载model；这不是测得的真实重力方向。
+
+vyaw输入按deg/s换算一次为rad/s值后填入request_twist.data.z；45对应0.785398。35Hz帧维持速度，不是累加转角。duration仅限制发指令的时间，不构成90度等角度闭环；官方SDK当前轮足z注释的单位与“旋转角速度”文字不一致，真实角速度标度仍需实测/厂家确认，不盲目乘补偿系数。
+
+定时模式最后一帧的发送等待不超过剩余时长；结果附commanded_vyaw_rad_s、nonzero_frames、zero_velocity_frames、command_stream_seconds及angle_control=false，用于区分发送超时、停止延迟与物理响应。command_stream_seconds是本地非零到首个零速度的组包时段，不是测得的运动时间或转角。不自动重发失败动作。
+
+偏航排查：accepted返回vendor_z_command，Driver每次动作仅记录一条带action_id的开始日志和结束时序日志，用于识别画布/LLM多次调用；日志不是实际转角测量。当前设备2.4.6固件下45°/s、2秒约150°的反馈尚未由真实角速度/姿态数据复核，未据此写入0.6等统一补偿，未进行真机转向测试。
