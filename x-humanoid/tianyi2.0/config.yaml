@@ -50,6 +50,14 @@ plugins:
     # Head camera height above the floor. The point-cloud renderer uses Y=0
     # as its grid plane, so raise the gravity-levelled cloud by this amount.
     floor_offset_m: 1.50
+  # Shared SDK session per physical wrist; four sensor cards registered.
+  # Do NOT swap ASIC Serial Number (lsusb) with RealSense SDK Serial Number.
+  # Fill these two values only after visually confirming physical left/right.
+  wrist_cameras:
+    enabled: true
+    left_serial: ""    # D405 SDK Serial Number, NOT ASIC Serial Number
+    right_serial: ""   # D405 SDK Serial Number, NOT ASIC Serial Number
+    jpeg_quality: 85
   asr:
     enabled: true
   nav_state:
