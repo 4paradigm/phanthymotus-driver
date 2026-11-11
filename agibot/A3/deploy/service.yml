@@ -27,6 +27,9 @@ agibot-a3:
     # {robot-subnet IP, 127.0.0.1} before any participant is created — see
     # main.py _select_profile. Domain 42 is set in code by DualDomainROS2 too;
     # a container-wide ROS_DOMAIN_ID would only govern stray processes.
+    # A3 discovery is provided by the HDU and MDU; both the driver and its
+    # host-namespace Jazzy relay inherit this FastDDS Discovery Server list.
+    - ROS_DISCOVERY_SERVER=10.42.10.10:11811;10.42.10.12:11811
     # The Jazzy relay is started in the host mount namespace by the container
     # and publishes converted media back to robot domain 232. The A3 process
     # then forwards those small samples to domain 42 through its child bridge.
