@@ -1,0 +1,15 @@
+id: teleopit-driver
+name: Teleopit 动作仿真
+category: driver
+hardware_provider: generic
+hardware_model: teleopit-g1-29-simulation
+image_name: teleopit-simulation
+port: 15719
+mcp_url: http://localhost:15719/mcp
+description: "Teleopit 0.5.0：BVH/PICO 全身输入、G1 29DoF MuJoCo 仿真、关节状态和画面预览；不含真机输出"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: teleopit_sim, type: actuator }
+  - { name: teleopit_state, type: sensor }
+  - { name: teleopit_preview, type: sensor }

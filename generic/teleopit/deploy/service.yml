@@ -1,0 +1,20 @@
+teleopit-simulation:
+  image: __IMAGE__
+  container_name: embodied-teleopit-simulation
+  network_mode: host
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /opt/phanthy-motus/teleopit-runtime:/opt/teleopit-runtime
+  environment:
+    - AGENT_CORE_URL=https://localhost:15678
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - MUJOCO_GL=osmesa
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: 10m
+      max-file: "3"
+  restart: unless-stopped
