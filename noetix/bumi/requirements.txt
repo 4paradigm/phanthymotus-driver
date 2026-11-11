@@ -3,3 +3,4 @@ netifaces
 numpy
 opencv-python-headless
 pyrealsense2
+cryptography>=46

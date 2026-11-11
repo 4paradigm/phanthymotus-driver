@@ -99,7 +99,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11
+    pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11 'cryptography>=46'
 
 # The bundle image must be able to start the estimator child and this card's
 # Python imports; fail the build here rather than on a robot. Docker's default
@@ -154,6 +154,8 @@ COPY visual_odometry_probe.py /work/visual_odometry_probe.py
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
+COPY sound_facing.py sound_facing_card.py sound_facing_authority.py /work/
+RUN PYTHONDONTWRITEBYTECODE=1 python3 -c 'from sound_facing import SoundFacing; from sound_facing_card import SoundFacingPlugin; from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey'
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
