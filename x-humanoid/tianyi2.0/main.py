@@ -336,6 +336,32 @@ class TianyiDeviceBundle:
                 plugins_cfg["camera_snapshot"], namespace, ros2))
             print("[bundle] CameraSnapshotPlugin loaded")
 
+        # Four independent sensor cards; only two physical D405 pipeline owners.
+        # Serial numbers must be explicitly tied to left/right on the robot.
+        wrist_cfg = plugins_cfg.get("wrist_cameras", {})
+        if wrist_cfg.get("enabled", False):
+            from wrist_cameras import WristCameraSession, WristCameraPlugin
+            serials = {
+                "left": str(wrist_cfg.get("left_serial") or "").strip(),
+                "right": str(wrist_cfg.get("right_serial") or "").strip(),
+            }
+            sessions = {
+                side: WristCameraSession(
+                    namespace, side, serial,
+                    jpeg_quality=wrist_cfg.get("jpeg_quality", 85))
+                for side, serial in serials.items()
+            }
+            if serials["left"] and serials["left"] == serials["right"]:
+                for session in sessions.values():
+                    session.blocked_reason = (
+                        "Left/right D405 serials are identical; specify distinct "
+                        "verified RealSense SDK Serial Numbers")
+            for side in ("left", "right"):
+                for channel in ("rgb", "depth"):
+                    plugin = WristCameraPlugin(sessions[side], channel)
+                    self._plugins.append(plugin)
+                    print(f"[bundle] {plugin.get_tool()['name']} loaded (lazy)")
+
         for config_name, class_name in (("imu", "ImuPlugin"),
                                         ("camera_depth", "DepthCameraPlugin"),
                                         ("camera_pointcloud", "PointCloudPlugin")):
