@@ -132,6 +132,9 @@ class FakeIO:
         self.arm_results = []                # outcomes poll_arm_result hands out, in order
         self.fail_on = set()
         self.switch_fail_after = None        # the Nth controller switch (1-based) and later raise
+        # Which of the configured base topics the robot would have subscribers on.
+        self.subscribers = {"/cmd_vel": 1}
+        self.twist_topic = None
 
     def _do(self, name, *args):
         if name in self.fail_on:
@@ -140,6 +143,17 @@ class FakeIO:
 
     def named(self, name):
         return [c[1:] for c in self.calls if c[0] == name]
+
+    def twist_candidates(self, candidates):
+        return {topic: self.subscribers.get(topic, 0) for topic in candidates}
+
+    def select_twist_topic(self, candidates):
+        counts = self.twist_candidates(candidates)
+        for topic in candidates:
+            if counts.get(topic):
+                self.twist_topic = topic
+                return topic, counts
+        return None, counts
 
     def list_controllers(self):
         return dict(self.controllers)
@@ -1169,6 +1183,7 @@ class _FakeRos:
 
         self.nodes, self.subscriptions, self.timers, self.groups = [], [], [], []
         self.publishers, self.published, self.clients, self.action_clients = {}, {}, {}, {}
+        self.subscribers = {"/cmd_vel": 1}
         fake = self
 
         class Publisher:
@@ -1218,6 +1233,9 @@ class _FakeRos:
 
             def count_publishers(self, topic):
                 return 0
+
+            def count_subscribers(self, topic):
+                return fake.subscribers.get(topic, 0)
 
         class ActionClient:
             def __init__(self, node, action_type, name):
@@ -1333,9 +1351,10 @@ def test_a_sensor_only_configuration_adds_no_publisher_client_or_action_to_the_r
 def test_motion_io_creates_exactly_the_command_endpoints_and_nothing_else(device, config, hub, monkeypatch):
     fake = _FakeRos(monkeypatch)
     device.PantherNodes(config, fake.ros2, hub)
-    assert set(fake.publishers) == {"/cmd_vel_teleop", "/head_forward_position_controller/commands",
+    assert set(fake.publishers) == {"/head_forward_position_controller/commands",
                                     "/lifting_controller/commands", "/left_gripper/gripper_command",
-                                    "/right_gripper/gripper_command"}
+                                    "/right_gripper/gripper_command"}, \
+        "the drive publisher waits for a move to pick its topic"
     assert set(fake.clients) == {"/controller_manager/list_controllers", "/controller_manager/switch_controller"}
     assert set(fake.action_clients) == {
         "/left_arm_joint_trajectory_position_controller/follow_joint_trajectory",
@@ -1345,8 +1364,11 @@ def test_motion_io_creates_exactly_the_command_endpoints_and_nothing_else(device
 def test_motion_io_sends_the_messages_the_controllers_expect(device, config, hub, monkeypatch):
     fake = _FakeRos(monkeypatch)
     io = device.PantherNodes(config, fake.ros2, hub).motion_io
+    assert io.publish_twist(0.1, -0.1, 0.2) is None and fake.published == {}, "no topic chosen yet"
+    topic, counts = io.select_twist_topic(["/cmd_vel", "/cmd_vel_teleop"])
+    assert topic == "/cmd_vel" and counts == {"/cmd_vel": 1, "/cmd_vel_teleop": 0}
     io.publish_twist(0.1, -0.1, 0.2)
-    twist = fake.published["/cmd_vel_teleop"][-1]
+    twist = fake.published["/cmd_vel"][-1]
     assert (twist.linear.x, twist.linear.y, twist.angular.z) == (0.1, -0.1, 0.2)
     io.publish_head([0.1, -0.2])
     assert fake.published["/head_forward_position_controller/commands"][-1].data == [0.1, -0.2]
@@ -1621,24 +1643,27 @@ def motion_module(device):
 ARM_LIMITS = {name: (-1.0, 1.0) for name in [f"joint_la{i}" for i in range(8)]}
 
 
-def test_a_joint_target_must_be_finite_inside_the_limits_and_a_bounded_step(contracts):
+def test_a_joint_target_is_checked_for_finiteness_and_range_only(contracts):
+    """There is no per-command step limit: inside the range a joint goes straight to the target."""
     current = {name: 0.0 for name in contracts.LEFT_ARM_JOINTS}
     names = contracts.LEFT_ARM_JOINTS
-    assert contracts.validate_joint_target(names, [0.1] * 8, ARM_LIMITS, current, 0.35) == [0.1] * 8
+    assert contracts.validate_joint_target(names, [0.1] * 8, ARM_LIMITS, current) == [0.1] * 8
+    assert contracts.validate_joint_target(names, [0.9] * 8, ARM_LIMITS, current) == [0.9] * 8, \
+        "a 0.9 rad move from 0 is one command, not two"
     with pytest.raises(ValueError, match="exactly 8"):
-        contracts.validate_joint_target(names, [0.1] * 7, ARM_LIMITS, current, 0.35)
+        contracts.validate_joint_target(names, [0.1] * 7, ARM_LIMITS, current)
     with pytest.raises(ValueError, match="must be finite"):
-        contracts.validate_joint_target(names, [NAN] + [0.0] * 7, ARM_LIMITS, current, 0.35)
+        contracts.validate_joint_target(names, [NAN] + [0.0] * 7, ARM_LIMITS, current)
     with pytest.raises(ValueError, match="must be a number"):
-        contracts.validate_joint_target(names, [True] + [0.0] * 7, ARM_LIMITS, current, 0.35)
+        contracts.validate_joint_target(names, [True] + [0.0] * 7, ARM_LIMITS, current)
     with pytest.raises(ValueError, match=r"outside its range -1.0 ~ 1.0 rad \(URDF limit\)"):
-        contracts.validate_joint_target(names, [1.5] + [0.0] * 7, ARM_LIMITS, current, 5.0)
-    with pytest.raises(ValueError, match=r"at most 0.3500 rad \(allowed now: -0.3500 ~ 0.3500\)"):
-        contracts.validate_joint_target(names, [0.5] + [0.0] * 7, ARM_LIMITS, current, 0.35)
+        contracts.validate_joint_target(names, [1.5] + [0.0] * 7, ARM_LIMITS, current)
     with pytest.raises(ValueError, match="no joint limits known for: joint_la7"):
-        contracts.validate_joint_target(names, [0.0] * 8, {k: v for k, v in ARM_LIMITS.items() if k != "joint_la7"}, current, 0.35)
+        contracts.validate_joint_target(names, [0.0] * 8, {k: v for k, v in ARM_LIMITS.items() if k != "joint_la7"}, current)
     with pytest.raises(ValueError, match="fresh joint state is missing"):
-        contracts.validate_joint_target(names, [0.0] * 8, ARM_LIMITS, {}, 0.35)
+        contracts.validate_joint_target(names, [0.0] * 8, ARM_LIMITS, {})
+    with pytest.raises(ValueError, match="must be finite"):
+        contracts.validate_joint_target(names, [0.0] * 8, ARM_LIMITS, {**current, "joint_la0": NAN})
 
 
 def test_switch_requests_are_filled_for_both_generations_of_the_interface(contracts):
@@ -1674,9 +1699,9 @@ LEFT_TARGET = [0.1, -0.1, 0.1, 0.1, -0.1, 0.1, 0.1, 0.1]
 RIGHT_TARGET = [-0.1, -0.1, -0.1, 0.1, -0.1, 0.1, 0.1, 0.1]
 LEFT_BOXES = {f"la{i}": value for i, value in enumerate(LEFT_TARGET)}
 RIGHT_BOXES = {f"ra{i}": value for i, value in enumerate(RIGHT_TARGET)}
-ARM = {**LEFT_BOXES, "duration_s": 3.0}
-RIGHT_ARM = {**RIGHT_BOXES, "duration_s": 3.0}
-BOTH_ARMS = {**LEFT_BOXES, **RIGHT_BOXES, "duration_s": 3.0}
+ARM = {**LEFT_BOXES}
+RIGHT_ARM = {**RIGHT_BOXES}
+BOTH_ARMS = {**LEFT_BOXES, **RIGHT_BOXES}
 
 
 def test_start_is_ready_while_the_robot_is_not_ready_and_says_why(motion, hub, io):
@@ -1728,6 +1753,34 @@ def test_a_drive_runs_for_its_duration_then_zeroes_and_reports_completion(motion
     assert (action_id, status, tool) == (result["action_id"], "completed", "base_drive")
 
 
+def test_the_base_picks_the_configured_topic_that_the_robot_subscribes_to(motion, hub, io, config):
+    open_gate(hub)
+    io.subscribers = {"/cmd_vel": 0, "/cmd_vel_teleop": 2}
+    result = motion.dispatch("base_drive", "move", DRIVE)
+    assert result["topic"] == "/cmd_vel_teleop" and result["subscribers"]["/cmd_vel_teleop"] == 2
+    assert io.twist_topic == "/cmd_vel_teleop"
+    io.calls.clear()
+    io.subscribers = {"/cmd_vel": 1, "/cmd_vel_teleop": 2}
+    assert motion.dispatch("base_drive", "move", DRIVE)["topic"] == "/cmd_vel", \
+        "the vendor-documented controller topic wins when both have subscribers"
+
+
+def test_the_base_refuses_rather_than_publishing_where_nobody_listens(motion, hub, io, config):
+    open_gate(hub)
+    io.subscribers = {}
+    result = motion.dispatch("base_drive", "move", DRIVE)
+    assert result["state"] == "error" and "no robot node subscribes" in result["message"]
+    assert "/cmd_vel" in result["message"] and "/cmd_vel_teleop" in result["message"]
+    assert io.named("twist") == [], "nothing was sent"
+
+
+def test_base_info_shows_the_subscriber_count_of_each_candidate(motion, hub, io):
+    open_gate(hub)
+    io.subscribers = {"/cmd_vel": 1, "/cmd_vel_teleop": 0}
+    info = motion.dispatch("base_drive", "info", {})
+    assert info["cmd_topics"] == {"/cmd_vel": 1, "/cmd_vel_teleop": 0}
+
+
 def test_a_drive_that_breaks_the_caps_or_needs_a_dead_controller_never_publishes(motion, hub, io):
     open_gate(hub)
     assert "linear speed" in motion.dispatch("base_drive", "move", {**DRIVE, "linear_x": 0.5})["message"]
@@ -1736,16 +1789,18 @@ def test_a_drive_that_breaks_the_caps_or_needs_a_dead_controller_never_publishes
     assert io.named("twist") == []
 
 
-def test_stopping_a_drive_zeroes_at_once_and_the_worker_reports_cancelled(motion, hub, io, completions):
+def test_stopping_a_drive_zeroes_at_once_and_the_worker_reports_cancelled(motion, hub, io, completions, clock):
     open_gate(hub)
-    original = io.publish_twist
+    original_sleep = motion._sleep
+    state = {"stopped": False}
 
-    def hooked(vx, vy, wz):
-        original(vx, vy, wz)
-        if vx and len(io.named("twist")) == 3:
+    def hooked_sleep(seconds):
+        if not state["stopped"] and len(io.named("twist")) == 3:
+            state["stopped"] = True
             assert motion.stop("base_drive")["state"] == "idle"     # as if another request arrived
+        original_sleep(seconds)
 
-    io.publish_twist = hooked
+    motion._sleep = hooked_sleep
     motion.dispatch("base_drive", "move", {**DRIVE, "duration_s": 3.0})
     sent = io.named("twist")
     assert sum(1 for c in sent if c[0]) == 3, "no further motion command after stop"
@@ -1762,16 +1817,16 @@ def test_a_failing_publish_zeroes_and_reports_error(motion, hub, io, completions
 
 def test_a_new_drive_supersedes_the_old_one(motion, hub, io, completions):
     open_gate(hub)
-    original = io.publish_twist
+    original_sleep = motion._sleep
     state = {"nested": False}
 
-    def hooked(vx, vy, wz):
-        original(vx, vy, wz)
-        if vx and not state["nested"] and len(io.named("twist")) == 2:
+    def hooked_sleep(seconds):
+        if not state["nested"] and len(io.named("twist")) == 2:
             state["nested"] = True
             motion.dispatch("base_drive", "move", {**DRIVE, "linear_x": -0.1, "duration_s": 0.2})
+        original_sleep(seconds)
 
-    io.publish_twist = hooked
+    motion._sleep = hooked_sleep
     motion.dispatch("base_drive", "move", {**DRIVE, "duration_s": 2.0})
     assert [c[1] for c in completions].count("cancelled") == 1 and [c[1] for c in completions].count("completed") == 1
 
@@ -1798,7 +1853,7 @@ def test_an_arm_move_switches_controllers_sends_the_goal_and_restores_them(motio
     assert result["controllers_activated"] == [LEFT_P2P] and result["controllers_deactivated"] == [FORWARD]
     assert [c[0] for c in io.calls] == ["switch", "goal", "switch"]
     assert io.calls[0] == ("switch", (LEFT_P2P,), (FORWARD,)), "only the arm being moved, not both"
-    assert io.calls[1] == ("goal", "left", tuple(LEFT_TARGET), 3.0)
+    assert io.calls[1] == ("goal", "left", tuple(LEFT_TARGET), 2.0), "the shortest allowed duration"
     assert io.calls[2] == ("switch", (FORWARD,), (LEFT_P2P,)), "the exact inverse"
     assert io.controllers == before, "every controller is in the state it was in before the move"
     (action_id, status, detail, tool), = completions
@@ -2974,7 +3029,7 @@ def _boxes(tools):
 
 def test_every_number_box_shows_its_range_in_the_title_and_the_description(motion_module, config, BUNDLED_LIMITS):
     boxes = list(_boxes(_tools(motion_module, config, BUNDLED_LIMITS)))
-    assert len(boxes) == 4 + 17 + 1 + 1 + 2, [f for _, f, _ in boxes]
+    assert len(boxes) == 4 + 16 + 1 + 1 + 2, [f for _, f, _ in boxes]
     for name, field, spec in boxes:
         low, high = spec["minimum"], spec["maximum"]
         shown = f"{low:g} ~ {high:g}"
@@ -2994,12 +3049,38 @@ def test_the_arm_and_head_boxes_show_the_urdf_limits_of_their_own_joint(motion_m
     assert props["arm_control"]["ra7"]["title"] == "右臂 ra7（rad，-1.57 ~ 1.57）"
 
 
-def test_the_step_limit_is_stated_wherever_it_applies(motion_module, config, BUNDLED_LIMITS):
+def test_no_step_limit_is_stated_or_implied_anywhere(motion_module, config, BUNDLED_LIMITS):
+    """The operator asked for one command to reach any value inside the range."""
     props = {n: t["inputSchema"]["properties"] for n, t in _tools(motion_module, config, BUNDLED_LIMITS).items()}
     for field in [f"la{i}" for i in range(8)] + [f"ra{i}" for i in range(8)]:
-        assert "相差不超过 0.35 rad" in props["arm_control"][field]["description"]
-    assert "相差不超过 0.35 rad" in props["head"]["head0_rad"]["description"]
-    assert "相差不超过 0.1" in props["lifting"]["position"]["description"]
+        assert "相差不超过" not in props["arm_control"][field]["description"]
+    assert "相差不超过" not in props["head"]["head0_rad"]["description"]
+    assert "相差不超过" not in props["lifting"]["position"]["description"]
+    assert "max_target_delta" not in json.dumps(config)
+    assert "duration_s" not in props["arm_control"], "the arm's duration is derived, not asked for"
+
+
+def test_a_full_range_arm_move_is_one_command(motion, hub, io):
+    open_gate(hub)
+    low, high = -1.046, 0.697                      # la0's whole URDF range
+    assert motion.dispatch("arm_control", "move", {"la0": high})["state"] == "moving"
+    assert motion.dispatch("arm_control", "move", {"la0": low})["state"] == "moving"
+    assert len(io.named("goal")) == 2
+
+
+def test_a_full_range_head_move_is_one_command(motion, hub, io):
+    positions = [0.0] * len(URDF_JOINTS)
+    positions[URDF_JOINTS.index("joint_head1")] = -1.57
+    open_gate(hub, positions)
+    assert motion.dispatch("head", "look", {"head1_rad": 1.57})["state"] == "commanded"
+    assert io.named("head") == [((0.0, 1.57),)]
+
+
+def test_a_full_range_lift_move_is_one_command(motion, hub, io):
+    open_gate(hub)
+    hub.on_lift(joint_state(["body_joint"], [0.61]))
+    assert motion.dispatch("lifting", None, {"position": 0.0})["state"] == "commanded"
+    assert io.named("lift") == [(0.0,)]
 
 
 @pytest.mark.parametrize("card, action, field, other", [
@@ -3067,14 +3148,6 @@ def test_the_lift_box_accepts_its_shown_limits_and_refuses_beyond(motion_module,
     assert "0 ~ 0.65" in motion.dispatch("lifting", None, {"position": -1e-6})["message"]
 
 
-def test_a_step_refusal_says_what_would_be_allowed_now(motion, hub, io):
-    open_gate(hub)
-    result = motion.dispatch("arm_control", "move", {"la3": 0.5})
-    assert "allowed now: -0.3500 ~ 0.3500" in result["message"]
-    result = motion.dispatch("lifting", None, {"position": 0.3})
-    assert "allowed now: 0.510 ~ 0.650" in result["message"]
-
-
 def test_the_displayed_ranges_follow_the_config_caps(motion_module, config, BUNDLED_LIMITS):
     config["plugins"]["base_drive"]["max_linear_mps"] = 0.05
     config["plugins"]["lifting"]["max_position"] = 0.62
@@ -3122,7 +3195,7 @@ def test_only_the_arms_with_a_filled_box_move(motion, hub, io):
 
 def test_an_arm_move_with_every_box_empty_is_refused_and_sends_nothing(motion, hub, io):
     open_gate(hub)
-    for args in ({}, {"duration_s": 3}, {f"la{i}": None for i in range(8)}, {"la0": "", "ra3": "  "}):
+    for args in ({}, {f"la{i}": None for i in range(8)}, {"la0": "", "ra3": "  "}):
         result = motion.dispatch("arm_control", "move", args)
         assert result["state"] == "error" and "fill in at least one joint" in result["message"], args
     assert io.calls == []
@@ -3138,18 +3211,21 @@ def test_the_canvas_may_send_a_number_as_text_but_never_words(motion, hub, io):
 
 def test_the_arm_refuses_with_nothing_sent_when_a_value_is_wrong(motion, hub, io):
     open_gate(hub)
-    for args, text in (({"la0": 0.5}, "allowed now"), ({"la0": 9.0}, "outside its range"),
-                       ({"la0": 0.1, "duration_s": 99}, "duration_s must be within 1 ~ 20"),
-                       ({"la0": 0.1, "duration_s": 0.5}, "duration_s must be within 1 ~ 20"),
+    for args, text in (({"la0": 9.0}, "outside its range"),
                        ({"la0": 0.1, "ra0": 9.0}, "outside its range")):
         result = motion.dispatch("arm_control", "move", args)
         assert result["state"] == "error" and text in result["message"], (args, result)
     assert io.calls == [], "nothing switched and nothing sent, including the valid left arm of the last case"
 
 
-def test_the_arm_duration_defaults_to_six_seconds(motion, hub, io):
+def test_the_arm_duration_follows_the_distance_and_the_configured_speed(motion, hub, io, config):
     open_gate(hub)
-    assert motion.dispatch("arm_control", "move", {"la0": 0.1})["duration_s"] == 6.0
+    near = motion.dispatch("arm_control", "move", {"la0": 0.1})["duration_s"]
+    assert near == config["plugins"]["arm_control"]["min_duration_s"], "short moves take the minimum"
+    far = motion.dispatch("arm_control", "move", {"la1": 0.785})["duration_s"]   # a 0.785 rad move
+    assert far == pytest.approx(0.785 / config["plugins"]["arm_control"]["speed_rad_s"], rel=1e-2)
+    assert far > near
+    assert far <= config["plugins"]["arm_control"]["max_duration_s"]
 
 
 # ── arm and head: home ─────────────────────────────────────────────────────────────────────────
@@ -3299,11 +3375,19 @@ def test_gripper_defaults_to_both_hands(motion, hub, io):
 
 
 def test_gripper_open_is_zero_and_close_is_one(motion, hub, io):
-    """0 = open, 1 = closed: confirmed by the operator on the robot; the vendor gave no answer."""
+    """0 = open, 1 = closed: confirmed by the operator on the robot; the vendor SDK says the opposite."""
     open_gate(hub)
     motion.dispatch("gripper", "open", {"side": "left"})
-    motion.dispatch("gripper", "close", {"side": "right", "mode": "centric"})
-    assert io.named("gripper") == [("left", "parallel", 0.0), ("right", "centric", 1.0)]
+    motion.dispatch("gripper", "close", {"side": "right"})
+    assert io.named("gripper") == [("left", "parallel", 0.0), ("right", "parallel", 1.0)]
+
+
+def test_gripper_always_sends_parallel_and_has_no_mode_choice(motion, hub, io, motion_module, config, BUNDLED_LIMITS):
+    schema = _tools(motion_module, config, BUNDLED_LIMITS)["gripper"]["inputSchema"]
+    assert "mode" not in schema["properties"], "the three modes were indistinguishable on the robot"
+    open_gate(hub)
+    motion.dispatch("gripper", "set", {"side": "left", "position": 0.4, "mode": "centric"})
+    assert io.named("gripper") == [("left", "parallel", 0.4)], "an old canvas value cannot change the mode"
 
 
 def test_gripper_open_and_close_ignore_a_leftover_position(motion, hub, io):
@@ -3316,8 +3400,7 @@ def test_gripper_open_and_close_ignore_a_leftover_position(motion, hub, io):
 def test_gripper_refuses_what_it_cannot_send(motion, hub, io):
     open_gate(hub)
     for args, text in (({"position": 1.5}, "0 ~ 1"), ({"position": NAN}, "finite"), ({}, "position is required"),
-                       ({"side": "middle", "position": 0.5}, "left, right or both"),
-                       ({"mode": "claw", "position": 0.5}, "mode must be")):
+                       ({"side": "middle", "position": 0.5}, "left, right or both")):
         result = motion.dispatch("gripper", "set", args)
         assert result["state"] == "error" and text in result["message"], args
     assert io.calls == []
@@ -3374,7 +3457,6 @@ def test_the_readme_range_table_matches_the_ranges_the_cards_show(motion_module,
     for card, field, row in (("base_drive", "linear_x", "| `linear_x`, `linear_y` |"),
                              ("base_drive", "angular_z", "| `angular_z` |"),
                              ("base_drive", "duration_s", "| `duration_s` (base) |"),
-                             ("arm_control", "duration_s", "| `duration_s` (arm) |"),
                              ("gripper", "position", "| `position` (gripper) |"),
                              ("lifting", "position", "| `position` (lift) |"),
                              ("head", "head0_rad", "| `head0_rad` |"),
@@ -3384,3 +3466,57 @@ def test_the_readme_range_table_matches_the_ranges_the_cards_show(motion_module,
     for field in ("la0", "ra7"):
         assert f"`{field}` {shown('arm_control', field)}" in readme, field
     assert "左臂 la0（rad，-1.046 ~ 0.697）" in readme, "the README quotes a real box title"
+
+# ── review: a stop must not be followed by a motion publish ──────────────────────────────────
+
+def test_a_stop_landing_between_the_generation_check_and_the_publish_is_not_overtaken(motion, hub, io, completions):
+    """Review finding: the worker checked the generation, released the lock, then published. A stop that
+    landed in that gap sent its zeros, and the worker's nonzero twist went out after them.
+
+    Deterministic: the stop is run from inside the check itself, i.e. in exactly that gap."""
+    open_gate(hub)
+    original = motion._superseded
+    landed = []
+
+    def check_then_stop_lands(generation):
+        answer = original(generation)
+        if not landed and io.named("twist"):              # after the first twist, a stop arrives here
+            landed.append(True)
+            motion.stop("base_drive")
+        return answer
+
+    motion._superseded = check_then_stop_lands
+    motion.dispatch("base_drive", "move", {**DRIVE, "duration_s": 3.0})
+    sent = io.named("twist")
+    last_motion = max(i for i, c in enumerate(sent) if c != (0.0, 0.0, 0.0))
+    first_stop_zero = next(i for i, c in enumerate(sent) if i > 0 and c == (0.0, 0.0, 0.0))
+    assert last_motion < first_stop_zero, f"a motion twist went out after the stop's zeros: {sent}"
+    assert completions[-1][1] == "cancelled"
+
+
+def test_no_motion_publish_can_follow_a_stop_on_real_threads(device, config, hub, io, motion_module):
+    """Many real interleavings: after stop() has returned, no nonzero twist may be published."""
+    import threading
+    import time
+
+    open_gate(hub)
+    for attempt in range(40):
+        io.calls.clear()
+        motion = motion_module.Motion(config, io, hub, notify=lambda *a: None, sleep=lambda s: time.sleep(0.0005))
+        stopped, late = threading.Event(), []
+        original = io.publish_twist
+
+        def twist(vx, vy, wz, _o=original):
+            if stopped.is_set() and (vx, vy, wz) != (0.0, 0.0, 0.0):
+                late.append((vx, vy, wz))
+            _o(vx, vy, wz)
+
+        io.publish_twist = twist
+        motion.dispatch("base_drive", "move", {**DRIVE, "duration_s": 3.0})
+        time.sleep(0.0003 * (attempt % 7))
+        motion.stop("base_drive")
+        stopped.set()
+        time.sleep(0.01)
+        motion.stop("base_drive")
+        io.publish_twist = original
+        assert late == [], f"attempt {attempt}: motion published after stop returned: {late}"

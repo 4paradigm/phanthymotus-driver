@@ -48,7 +48,10 @@ ARM_P2P_CONTROLLERS = {"left": "left_arm_joint_trajectory_position_controller",
 HEAD_CONTROLLER = "head_forward_position_controller"
 LIFT_CONTROLLER = "lifting_controller"
 GRIPPER_CONTROLLER = "{side}_unix_gripper3_controller"
-GRIPPER_MODES = ("2-finger", "parallel", "centric")
+# The robot has one two-finger parallel gripper per arm. The `mode` field exists in the vendor
+# message, but only `parallel` is shown in the vendor SDK and the operator could see no difference
+# between the three on the robot, so the driver sends this one and offers no choice.
+GRIPPER_PARALLEL = "parallel"
 
 MOTION_CARDS = ("base_drive", "arm_control", "gripper", "lifting", "head")
 
@@ -164,8 +167,9 @@ def motion_tools(config: dict, limits: dict) -> list:
         lin, ang, longest = cap["max_linear_mps"], cap["max_angular_radps"], cap["max_duration_s"]
         tools.append({
             "name": "base_drive", "type": "actuator", "multiInstance": False,
-            "description": f"Panther 全向底盘定时运动（/cmd_vel_teleop）。按给定速度走 duration_s 秒后自动停车；"
-                           f"stop 立即停车。速度上限 {_fmt(lin)} m/s、{_fmt(ang)} rad/s，单次最长 {_fmt(longest)} 秒",
+            "description": f"Panther 全向底盘定时运动。按给定速度走 duration_s 秒后自动停车；stop 立即停车。"
+                           f"速度上限 {_fmt(lin)} m/s、{_fmt(ang)} rad/s，单次最长 {_fmt(longest)} 秒。"
+                           "发车前选一个有订阅者的话题（/cmd_vel 优先），结果里给出用的是哪一个",
             "inputSchema": schema(
                 {"linear_x": _number("前后速度", "m/s", -lin, lin, "正为前进，留空为 0", 0.0),
                  "linear_y": _number("左右速度", "m/s", -lin, lin, "正为向左，留空为 0", 0.0),
@@ -177,65 +181,63 @@ def motion_tools(config: dict, limits: dict) -> list:
                 "base", {"actions": ["move"], "timeout": int(longest) + 10})})
     if on("arm_control"):
         cap = plugins["arm_control"]
-        step, longest = cap["max_target_delta_rad"], cap["max_duration_s"]
+        longest = cap["max_duration_s"]
+        speed = _fmt(cap["speed_rad_s"])
         joints = {}
         for field, joint in ARM_FIELDS.items():
             low, high = limits.get(joint, (-math.pi, math.pi))
             side = "左臂" if field.startswith("la") else "右臂"
-            joints[field] = _number(f"{side} {field}", "rad", low, high,
-                                    f"与当前位置相差不超过 {_fmt(step)} rad；留空则保持当前位置")
+            joints[field] = _number(f"{side} {field}", "rad", low, high, "留空则保持当前位置")
         tools.append({
             "name": "arm_control", "type": "actuator", "multiInstance": False,
             "description": "Panther 双臂关节运动（FollowJointTrajectory）。move：只填要动的关节（la0~la7 左臂，ra0~ra7 右臂），"
-                           f"留空的保持当前位置；每个关节一次最多动 {_fmt(step)} rad。home：所选手臂全部关节回到 0 rad，"
-                           "不受单次步长限制，时间按平均速度不超过 "
+                           "留空的保持当前位置，填了就在 URDF 限位内直接到位；运动时间不用填，按最远关节约 "
+                           f"{speed} rad/s 自动计算（1 ~ {_fmt(longest)} 秒）。home：所选手臂全部关节回到 0 rad，"
+                           "时间按平均速度不超过 "
                            f"{_fmt(cap['home_speed_rad_s'])} rad/s 自动拉长。运动期间临时切换控制器，结束或 stop 后恢复",
             "inputSchema": schema(
                 {**joints,
-                 "duration_s": _number("运动时间", "秒", 1.0, longest, "move 用这么长时间到达目标", 6.0),
                  "side": _choice("回零的手臂", [("both", "双臂"), ("left", "左臂"), ("right", "右臂")], "both")},
                 _actions([("move", "移动关节"), ("home", "回零（0 rad）"), ("stop", "停止")], "move"),
-                {"move": ([*ARM_FIELDS, "duration_s"], "把填写的关节移动到目标角度，留空的关节保持不动"),
+                {"move": ([*ARM_FIELDS], "把填写的关节移动到目标角度，留空的关节保持不动"),
                  "home": (["side"], "所选手臂全部关节回到 0 rad"),
                  "stop": ([], "取消正在进行的运动并恢复控制器")},
                 ["arm_l", "arm_r"], {"actions": ["move", "home"], "timeout": int(longest) + 15})})
     if on("gripper"):
         tools.append({
             "name": "gripper", "type": "actuator", "multiInstance": False,
-            "description": "Panther 左右夹爪。position 0 = 张开，1 = 闭合（操作员实测确认，厂商未给出）；"
-                           "open/close 分别发 0 和 1。单次指令，下发后由机器人控制器执行；stop 仅保证本驱动不再下发",
+            "description": "Panther 左右夹爪。position 0 = 张开，1 = 闭合（操作员实测确认，厂商 SDK 写的是相反的）；"
+                           "open/close 分别发 0 和 1。硬件是两指平行夹爪，驱动固定以 parallel 模式下发"
+                           "（另两种模式在实机上没有可辨差别，不再作为选项）。单次指令，下发后由机器人控制器执行；"
+                           "stop 仅保证本驱动不再下发",
             "inputSchema": schema(
                 {"side": _choice("夹爪", [("both", "双手"), ("left", "左手"), ("right", "右手")], "both"),
-                 "mode": _choice("夹持模式", [("parallel", "平行"), ("2-finger", "两指"), ("centric", "中心")], "parallel"),
                  "position": _number("夹爪位置", "0=张开，1=闭合", 0.0, 1.0, "")},
                 _actions([("set", "设置位置"), ("open", "张开"), ("close", "闭合")], "set"),
-                {"set": (["side", "mode", "position"], "把夹爪移动到 position（0=张开，1=闭合）"),
-                 "open": (["side", "mode"], "张开（position 0）"),
-                 "close": (["side", "mode"], "闭合（position 1）")},
+                {"set": (["side", "position"], "把夹爪移动到 position（0=张开，1=闭合）"),
+                 "open": (["side"], "张开（position 0）"),
+                 "close": (["side"], "闭合（position 1）")},
                 ["hand_l", "hand_r"], hooks=False)})
     if on("lifting"):
         cap = plugins["lifting"]
         tools.append({
             "name": "lifting", "type": "actuator", "multiInstance": False,
             "description": f"Panther 升降位置指令（单位未经厂商确认，读数约 0.61）。范围 0 ~ {_fmt(cap['max_position'])}，"
-                           f"且与当前读数相差不超过 {_fmt(cap['max_target_delta'])}；stop 仅保证本驱动不再下发",
+                           "范围内直接到位；stop 仅保证本驱动不再下发",
             "inputSchema": schema(
-                {"position": _number("升降位置", "单位未确认", 0.0, cap["max_position"],
-                                     f"与当前读数相差不超过 {_fmt(cap['max_target_delta'])}")},
+                {"position": _number("升降位置", "单位未确认", 0.0, cap["max_position"], "")},
                 resource="waist", hooks=False)})
     if on("head"):
         cap = plugins.get("head") or {}
-        step = cap.get("max_target_delta_rad", 0.35)
         boxes = {}
         for field, joint, axis in (("head0_rad", "joint_head0", "俯仰（绕 y 轴）"),
                                    ("head1_rad", "joint_head1", "水平转动（绕 z 轴）")):
             low, high = limits.get(joint, (-math.pi, math.pi))
-            boxes[field] = _number(f"头部 {field[:5]} {axis}", "rad", low, high,
-                                   f"与当前位置相差不超过 {_fmt(step)} rad；留空则保持当前位置")
+            boxes[field] = _number(f"头部 {field[:5]} {axis}", "rad", low, high, "留空则保持当前位置")
         tools.append({
             "name": "head", "type": "actuator", "multiInstance": False,
             "description": "Panther 头部两个关节。按 URDF：joint_head0 绕 y（俯仰），joint_head1 绕 z（水平转动）。"
-                           f"look 每次最多动 {_fmt(step)} rad；home 回到 0 rad，按平均速度不超过 "
+                           "look 在限位内直接到位；home 回到 0 rad，按平均速度不超过 "
                            f"{_fmt(cap.get('home_speed_rad_s', 0.35))} rad/s 逐步移动，stop 可中途停下",
             "inputSchema": schema(
                 boxes,
@@ -342,6 +344,11 @@ class Motion:
             result["controllers_error"] = f"{type(exc).__name__}: {exc}"
         if card == "arm_control":
             result["busy"] = self._arm_running
+        if card == "base_drive":
+            try:
+                result["cmd_topics"] = self._io.twist_candidates(self._drive_candidates())
+            except Exception as exc:  # noqa: BLE001
+                result["cmd_topics_error"] = f"{type(exc).__name__}: {exc}"
         return result
 
     def stop_all(self) -> None:
@@ -367,16 +374,24 @@ class Motion:
 
     # ── base_drive ───────────────────────────────────────────────────────────
 
-    def _zero(self, repetitions: int, period: float) -> None:
-        for _ in range(max(1, repetitions)):
-            self._io.publish_twist(0.0, 0.0, 0.0)
-            self._sleep(period)
+    def _drive_candidates(self) -> list:
+        cap = self._plugins.get("base_drive") or {}
+        configured = cap.get("cmd_topics") or ([cap["topic"]] if cap.get("topic") else ["/cmd_vel"])
+        return [str(topic) for topic in configured]
 
     def _stop_drive(self) -> dict:
+        """Supersede any drive and send zero velocity, as one step under `_drive_lock`.
+
+        The worker publishes only while holding the same lock, after re-checking the generation
+        (`_publish_if_current`). So once this has the lock, no motion twist can be in flight, and
+        once it returns, the worker sees the new generation before it could publish again: the
+        zeros below are the last word. (Previously the check and the publish were separate, and a
+        motion twist could follow these zeros.)"""
         cap = self._plugins.get("base_drive") or {}
         with self._drive_lock:
             self._drive_generation += 1
-        self._zero(int(cap.get("stop_repetitions", 5)), 0.0)
+            for _ in range(max(1, int(cap.get("stop_repetitions", 5)))):
+                self._io.publish_twist(0.0, 0.0, 0.0)
         return {"state": "idle"}
 
     def drive(self, args: dict) -> dict:
@@ -393,6 +408,11 @@ class Motion:
         vx, vy, wz, duration = validate_drive(args, cap)
         self._gate()
         self._require_active(DRIVE_CONTROLLER)
+        candidates = self._drive_candidates()
+        topic, counts = self._io.select_twist_topic(candidates)
+        if topic is None:
+            raise RuntimeError("no robot node subscribes to any of " + ", ".join(candidates)
+                               + f" (subscribers: {counts}); the base would not move")
         with self._drive_lock:
             self._drive_generation += 1
             generation = self._drive_generation
@@ -400,11 +420,21 @@ class Motion:
         self._spawn(lambda: self._drive_worker(generation, vx, vy, wz, duration, action_id, cap),
                     "panther-drive")
         return {"state": "moving", "action_id": action_id, "linear_x": vx, "linear_y": vy,
-                "angular_z": wz, "duration_s": duration, "auto_stop": True}
+                "angular_z": wz, "duration_s": duration, "auto_stop": True,
+                "topic": topic, "subscribers": counts}
 
     def _superseded(self, generation: int) -> bool:
         with self._drive_lock:
             return generation != self._drive_generation
+
+    def _publish_if_current(self, generation: int, vx: float, vy: float, wz: float) -> bool:
+        """Publish only if this drive is still the current one, deciding and publishing under one
+        lock so a stop cannot fall between the two. False means it was superseded and nothing was sent."""
+        with self._drive_lock:
+            if generation != self._drive_generation:
+                return False
+            self._io.publish_twist(vx, vy, wz)
+            return True
 
     def _drive_worker(self, generation, vx, vy, wz, duration, action_id, cap) -> None:
         period = 1.0 / float(cap["publish_rate_hz"])
@@ -413,17 +443,15 @@ class Motion:
         try:
             deadline = self._mono() + duration
             while self._mono() < deadline:
-                if self._superseded(generation):
+                if self._superseded(generation) or not self._publish_if_current(generation, vx, vy, wz):
                     status = "cancelled"
                     break
-                self._io.publish_twist(vx, vy, wz)
                 self._sleep(period)
             if status == "completed":
                 for _ in range(repetitions):
-                    if self._superseded(generation):
+                    if not self._publish_if_current(generation, 0.0, 0.0, 0.0):
                         status = "cancelled"
                         break
-                    self._io.publish_twist(0.0, 0.0, 0.0)
                     self._sleep(period)
         except Exception as exc:  # noqa: BLE001
             status, result = "error", {"message": f"{type(exc).__name__}: {exc}"}
@@ -491,12 +519,7 @@ class Motion:
                 given[joint] = value
         if not given:
             raise ValueError("fill in at least one joint (la0~la7 for the left arm, ra0~ra7 for the right)")
-        duration = optional_number(args.get("duration_s"), "duration_s")
-        duration = 6.0 if duration is None else duration
-        if not 1.0 <= duration <= float(cap["max_duration_s"]):
-            raise ValueError(f"duration_s must be within 1 ~ {float(cap['max_duration_s']):g} s")
-        step = float(cap["max_target_delta_rad"])
-        targets = {}
+        targets, furthest = {}, 0.0
         for arm_side, names in (("left", LEFT_ARM_JOINTS), ("right", RIGHT_ARM_JOINTS)):
             if not any(name in given for name in names):
                 continue
@@ -504,8 +527,14 @@ class Motion:
             if unseen:
                 raise RuntimeError("fresh joint state is missing: " + ", ".join(unseen))
             positions = [given.get(name, float(current[name])) for name in names]
-            targets[arm_side] = (names, validate_joint_target(names, positions, limits, current, step))
-        return targets, duration
+            targets[arm_side] = (names, validate_joint_target(names, positions, limits, current))
+            furthest = max([furthest] + [abs(p - float(current[n])) for n, p in zip(names, positions)])
+        # The operator should not have to guess a duration: it follows from how far the furthest
+        # joint has to go and the configured traversal speed, then is bounded.
+        duration = furthest / float(cap["speed_rad_s"])
+        duration = min(float(cap["max_duration_s"]),
+                       max(float(cap.get("min_duration_s", 1.0)), duration))
+        return targets, round(duration, 3)
 
     def _arm_home_targets(self, args: dict, cap: dict, current: dict, limits: dict) -> tuple:
         """Every joint of the chosen arms to its home position (0 rad unless config.yaml's
@@ -521,7 +550,7 @@ class Motion:
             if side not in (arm_side, "both"):
                 continue
             positions = [finite_number(pose.get(name, 0.0), f"home_pose.{name}") for name in names]
-            targets[arm_side] = (names, validate_joint_target(names, positions, limits, current, None))
+            targets[arm_side] = (names, validate_joint_target(names, positions, limits, current))
             furthest = max([furthest] + [abs(p - float(current[n])) for n, p in zip(names, positions)])
         duration = max(float(cap.get("home_min_duration_s", 2.0)), furthest / speed)
         if duration > float(cap["max_duration_s"]):
@@ -653,16 +682,13 @@ class Motion:
             position = 0.0 if action == "open" else 1.0       # 0 = open, 1 = closed, confirmed by the operator
         if not 0.0 <= position <= 1.0:
             raise ValueError("position must be within 0 ~ 1 (0 = open, 1 = closed)")
-        mode = args.get("mode") or "parallel"
-        if mode not in GRIPPER_MODES:
-            raise ValueError("mode must be one of " + ", ".join(GRIPPER_MODES))
         self._gate()
         sides = ["left", "right"] if side == "both" else [side]
         for each in sides:                                   # both checked before either is sent
             self._require_active(GRIPPER_CONTROLLER.format(side=each))
         for each in sides:
-            self._io.publish_gripper(each, mode, position)
-        return {"state": "commanded", "side": side, "mode": mode, "position": position}
+            self._io.publish_gripper(each, GRIPPER_PARALLEL, position)
+        return {"state": "commanded", "side": side, "position": position}
 
     def lifting(self, args: dict) -> dict:
         action = args.get("action", "info")
@@ -684,12 +710,6 @@ class Motion:
         current = self._state.lift_position()
         if current is None:
             raise RuntimeError("a fresh lift reading is required before commanding it")
-        step = float(cap["max_target_delta"])
-        if abs(position - current) > step:
-            raise ValueError(f"position is {abs(position - current):.3f} from the current reading "
-                             f"{current:.3f}; one command may move it at most {step} "
-                             f"(allowed now: {max(0.0, current - step):.3f} ~ "
-                             f"{min(float(cap['max_position']), current + step):.3f})")
         self._require_active(LIFT_CONTROLLER)
         self._io.publish_lift(position)
         return {"state": "commanded", "position": position, "previous_reading": current}
@@ -718,8 +738,7 @@ class Motion:
             if all(value is None for value in given.values()):
                 raise ValueError("fill in head0_rad, head1_rad or both")
             target = [float(current[joint]) if given[joint] is None else given[joint] for joint in HEAD_JOINTS]
-            step = float(cap.get("max_target_delta_rad", 0.35))
-            validated = validate_joint_target(HEAD_JOINTS, target, limits, current, step)
+            validated = validate_joint_target(HEAD_JOINTS, target, limits, current)
             self._require_active(HEAD_CONTROLLER)
             with self._head_lock:
                 self._head_generation += 1                   # a look supersedes a home in progress
@@ -727,7 +746,7 @@ class Motion:
             return {"state": "commanded", "head0_rad": validated[0], "head1_rad": validated[1]}
         pose = cap.get("home_pose") or {}
         target = [finite_number(pose.get(joint, 0.0), f"home_pose.{joint}") for joint in HEAD_JOINTS]
-        validated = validate_joint_target(HEAD_JOINTS, target, limits, current, None)
+        validated = validate_joint_target(HEAD_JOINTS, target, limits, current)
         self._require_active(HEAD_CONTROLLER)
         start = [float(current[joint]) for joint in HEAD_JOINTS]
         with self._head_lock:

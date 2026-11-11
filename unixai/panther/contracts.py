@@ -69,12 +69,8 @@ def parse_joint_limits(urdf: str) -> dict:
     return limits
 
 
-def validate_joint_target(joint_names, positions, limits: dict, current: dict,
-                          max_delta_rad: float | None) -> list:
-    """A target for `joint_names`: finite, inside the URDF limits, and a bounded step from now.
-
-    `max_delta_rad=None` checks the limits only (a preset such as `home`, which is slowed down by
-    its duration instead)."""
+def validate_joint_target(joint_names, positions, limits: dict, current: dict) -> list:
+    """A finite target inside the URDF limits, with finite current joint readings."""
     target = finite_vector(positions, "positions", len(joint_names))
     missing = [name for name in joint_names if name not in limits]
     if missing:
@@ -82,19 +78,11 @@ def validate_joint_target(joint_names, positions, limits: dict, current: dict,
     unseen = [name for name in joint_names if name not in current]
     if unseen:
         raise ValueError("fresh joint state is missing: " + ", ".join(unseen))
-    step = None if max_delta_rad is None else finite_number(max_delta_rad, "max_delta_rad")
-    if step is not None and step <= 0:
-        raise ValueError("max_delta_rad must be positive")
     for name, value in zip(joint_names, target):
+        finite_number(current[name], f"current.{name}")
         lower, upper = limits[name]
         if not lower <= value <= upper:
             raise ValueError(f"{name} target {value} is outside its range {lower} ~ {upper} rad (URDF limit)")
-        delta = abs(value - float(current[name]))
-        if step is not None and delta > step:
-            raise ValueError(f"{name} target is {delta:.4f} rad from its current position "
-                             f"{float(current[name]):.4f}; one command may move it at most {step:.4f} rad "
-                             f"(allowed now: {max(lower, float(current[name]) - step):.4f} ~ "
-                             f"{min(upper, float(current[name]) + step):.4f})")
     return target
 
 

@@ -738,15 +738,17 @@ class RosMotionIO:
     def __init__(self, node, config: dict, reliable_qos):
         from control_msgs.action import FollowJointTrajectory
         from controller_manager_msgs.srv import ListControllers, SwitchController
-        from geometry_msgs.msg import Twist
         from rclpy.action import ActionClient
         from sensor_msgs.msg import JointState
         from std_msgs.msg import Float64MultiArray
 
         self._node = node
         self._results: dict = {}
-        drive_topic = ((config.get("plugins") or {}).get("base_drive") or {}).get("topic", "/cmd_vel_teleop")
-        self._twist = node.create_publisher(Twist, drive_topic, reliable_qos)
+        # The drive publisher is created when a move picks its topic: the robot's graph decides
+        # which of the configured names is really listened to (see `select_twist_topic`).
+        self._twist = None
+        self._twist_topic = None
+        self._reliable_qos = reliable_qos
         self._head = node.create_publisher(Float64MultiArray, self.HEAD_TOPIC, reliable_qos)
         self._lift = node.create_publisher(JointState, self.LIFT_TOPIC, reliable_qos)
         self._gripper_pub = None
@@ -809,8 +811,37 @@ class RosMotionIO:
         if not self._wait(self._switch.call_async(request), 7.0).ok:
             raise RuntimeError("the controller manager rejected the controller switch")
 
-    def publish_twist(self, vx: float, vy: float, wz: float) -> None:
+    def twist_candidates(self, candidates: list) -> dict:
+        """How many robot nodes subscribe to each candidate topic, right now."""
+        return {topic: int(self._node.count_subscribers(topic)) for topic in candidates}
+
+    def select_twist_topic(self, candidates: list) -> tuple:
+        """`(topic, counts)`: the first candidate with a subscriber, creating its publisher.
+
+        Nothing here assumes which name the robot listens on: the vendor SDK documents `/cmd_vel`,
+        a teleoperation node may own `/cmd_vel_teleop`, and on a robot the configured name has to
+        have a subscriber or the base does not move at all. Returns `(None, counts)` when none
+        does, and the caller refuses rather than publishing into the void.
+        """
         from geometry_msgs.msg import Twist
+
+        counts = self.twist_candidates(candidates)
+        for topic in candidates:
+            if counts.get(topic):
+                if self._twist is None or self._twist_topic != topic:
+                    self._twist = self._node.create_publisher(Twist, topic, self._reliable_qos)
+                    self._twist_topic = topic
+                    print(f"[panther] base_drive publishing on {topic} "
+                          f"({counts[topic]} subscriber(s); all: {counts})", flush=True)
+                return topic, counts
+        return None, counts
+
+    def publish_twist(self, vx: float, vy: float, wz: float) -> None:
+        """Publish on the topic `select_twist_topic` chose. Before any move chose one there is no
+        publisher, so this sends nothing (and a stop has nothing to stop)."""
+        from geometry_msgs.msg import Twist
+        if self._twist is None:
+            return
         message = Twist()
         message.linear.x, message.linear.y, message.angular.z = vx, vy, wz
         self._twist.publish(message)

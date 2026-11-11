@@ -81,9 +81,9 @@ commands to whatever it is.
 
 | Card | Choices (`action`) | Boxes | Does | Completion |
 |---|---|---|---|---|
-| `base_drive` | `move` (default), `stop` | `linear_x`, `linear_y`, `angular_z`, `duration_s` | `/cmd_vel_teleop` at 20 Hz for `duration_s`, then zero velocity five times | `action_id` now, completion posted when it ends |
-| `arm_control` | `move` (default), `home`, `stop` | `la0`-`la7`, `ra0`-`ra7`, `duration_s`; `side` for `home` | `FollowJointTrajectory`, one or both arms | `action_id` now, completion posted when it ends |
-| `gripper` | `set` (default), `open`, `close` | `side` (`both` default, `left`, `right`), `mode`, `position` | one `unix_msgs/GripperCommand` per hand | none: no feedback defines it |
+| `base_drive` | `move` (default), `stop` | `linear_x`, `linear_y`, `angular_z`, `duration_s` | 20 Hz on the first configured topic the robot subscribes to (`/cmd_vel`, else `/cmd_vel_teleop`) for `duration_s`, then zero velocity five times | `action_id` now, completion posted when it ends |
+| `arm_control` | `move` (default), `home`, `stop` | `la0`-`la7`, `ra0`-`ra7`; `side` for `home` | `FollowJointTrajectory`, one or both arms; the duration is derived, not asked for | `action_id` now, completion posted when it ends |
+| `gripper` | `set` (default), `open`, `close` | `side` (`both` default, `left`, `right`), `position` | one `unix_msgs/GripperCommand` per hand, always in `parallel` mode | none: no feedback defines it |
 | `lifting` | **no `action` box**: its one motion | `position` | one `JointState` on `/lifting_controller/commands` | none |
 | `head` | `look` (default), `home`, `stop` | `head0_rad`, `head1_rad` | `look`: one `Float64MultiArray` `[head0, head1]`; `home`: small steps to 0 | `home`: `action_id`, completion |
 
@@ -94,20 +94,23 @@ default (`lifting` is always called that way).
 **Every number box shows the range it accepts**, in its title (`左臂 la0（rad，-1.046 ~ 0.697）`)
 and in its description, and the same numbers are the schema's `minimum`/`maximum` and what the
 driver enforces: the tests try every box on its shown boundary (accepted) and just past it
-(refused). A refusal quotes the range, and for a step limit, what would be allowed from where the
-joint is now (`allowed now: -0.35 ~ 0.35`). The ranges:
+(refused). A refusal quotes the range. There is **no per-command step limit**: any value inside
+the range is one command. The ranges:
 
 | Box | Range | Plus |
 |---|---|---|
 | `linear_x`, `linear_y` | -0.2 ~ 0.2 m/s | empty = 0 |
 | `angular_z` | -0.3 ~ 0.3 rad/s | empty = 0 |
 | `duration_s` (base) | 0.1 ~ 3 s | empty = 1 s |
-| `la0`-`la7`, `ra0`-`ra7` | each joint's URDF limit (e.g. `la0` -1.046 ~ 0.697, `ra7` -1.57 ~ 1.57) | at most 0.35 rad from where the joint is now; **empty = that joint stays where it is** |
-| `duration_s` (arm) | 1 ~ 20 s | empty = 6 s |
-| `position` (gripper) | 0 ~ 1 | **0 = open, 1 = closed** (operator-confirmed; the vendor did not say) |
-| `position` (lift) | 0 ~ 0.65 (unit not confirmed by the vendor; reads about 0.61) | at most 0.10 from the current reading |
-| `head0_rad` | -0.348 ~ 1.5 rad (pitch, about y) | at most 0.35 rad from now; empty = stays |
-| `head1_rad` | -1.57 ~ 1.57 rad (turn, about z) | at most 0.35 rad from now; empty = stays |
+| `la0`-`la7`, `ra0`-`ra7` | each joint's URDF limit (e.g. `la0` -1.046 ~ 0.697, `ra7` -1.57 ~ 1.57) | **empty = that joint stays where it is**; a filled one goes straight there |
+| `position` (gripper) | 0 ~ 1 | **0 = open, 1 = closed** (operator-confirmed; the vendor SDK says the opposite) |
+| `position` (lift) | 0 ~ 0.65 (unit not confirmed by the vendor; reads about 0.61) | - |
+| `head0_rad` | -0.348 ~ 1.5 rad (pitch, about y) | empty = stays |
+| `head1_rad` | -1.57 ~ 1.57 rad (turn, about z) | empty = stays |
+
+The arm's `duration_s` box is gone: the duration is computed from the furthest joint's distance at
+`arm_control.speed_rad_s` (0.35 rad/s), between `min_duration_s` (2 s) and `max_duration_s` (20 s),
+and returned in the result.
 
 The arm and head ranges shown come from the driver's bundled URDF; commands are checked against
 the robot's live `/robot_description` once it arrives. If the two differ, the driver logs a
@@ -118,7 +121,7 @@ then show slightly wrong ranges: the robot's limits still win.
 
 - `arm_control` `home`: every joint of the chosen arms (`side`, default both) to 0 rad, the pose
   the operator confirmed is safe on this robot (2026-11-11). `config.yaml`'s `home_pose` can change
-  any joint's value. It is **not** held to the 0.35 rad step; instead its duration is stretched so
+  any joint's value. Its duration is stretched so
   the furthest joint moves at no more than 0.35 rad/s on average (at least 2 s, refused if over 20 s).
   The trajectory controller interpolates, so the peak speed is somewhat higher than the average.
   Nothing checks for self-collision: the URDF limits are the only bound.
@@ -126,6 +129,25 @@ then show slightly wrong ranges: the robot's limits still win.
   forward controller would otherwise jump at its own top speed). `stop` halts it where it is, and
   a `look` supersedes it.
 - `gripper` `open` / `close`: `position` 0 / 1; a leftover number in the `position` box is ignored.
+- `gripper` has no `mode` choice: the arm is a two-finger parallel gripper and the operator could
+  see no difference between `parallel`, `2-finger` and `centric` on the robot, so the driver always
+  sends `parallel`. A `mode` sent by an old canvas is ignored.
+
+### If the base does not move
+
+`move` reports `topic` and `subscribers`, and `info` reports `cmd_topics` with a subscriber count
+for each configured name. Read them first:
+
+- `topic: null` / an error "no robot node subscribes to any of ..." means neither name has a
+  subscriber and nothing was published. Find the one that does with
+  `ros2 topic info /cmd_vel -v` and `ros2 topic info /cmd_vel_teleop -v` and put it first in
+  `base_drive.cmd_topics`.
+- A `topic` with subscribers but no motion can be the robot's own mode: the vendor's teleoperation
+  node may accept `/cmd_vel_teleop` only while it owns the base, and `movebase3_drive_controller`
+  may need its own mode. `ros2 control list_controllers` and the vendor's teleoperation app are the
+  next things to check. Do not add a service call to this driver before confirming which one.
+- **`completed` for `base_drive` means the commands were published for the requested duration; it
+  does not mean the base moved.** Nothing in the robot feeds a measured twist back for that.
 
 ### What every command needs
 
@@ -139,8 +161,9 @@ Checked in `panther_motion.py` before anything is sent; a refusal says which one
 - every value inside the range its box shows (above).
 
 These are conditions, not switches: they clear by themselves when the robot is fine. **Without a
-confirmation step, a value that is inside its range but simply wrong is executed.** The step and
-speed limits bound how far one wrong command can move the robot; nothing else does.
+confirmation step, and without a step limit, a value that is inside its range but simply wrong is
+executed in full.** What bounds it is the speed and duration of the command, not its distance: one
+arm command can cross a joint's whole range.
 
 **Interrupts**: `base_drive`, `arm_control` and `head` declare `x-hooks` `on_interrupt_motion` and
 `on_interrupt_all` -> `stop`, so Agent Core's emergency and full interrupts stop the base, the arms
@@ -148,8 +171,10 @@ and a head `home` directly. `gripper` and `lifting` have nothing in flight to st
 
 What `stop` does, honestly:
 
-- `base_drive`: bumps a generation counter so the worker stops publishing, and publishes zero
-  velocity five times.
+- `base_drive`: bumps a generation counter and publishes zero velocity five times, both under the
+  same lock the worker publishes under, and the worker re-checks the generation while holding it.
+  So the zeros are the last word: a motion twist cannot follow them (a review finding; tested with a
+  deterministic interleaving and on real threads).
 - `arm_control`: cancels the trajectory goal and switches the controllers back, then returns. The
   call reports `stopping` instead of `idle` if that takes over 10 s. A stop is honoured at every
   stage of a move, not only while it is running: the worker looks for it before switching
@@ -220,24 +245,25 @@ readiness; that is reported next to it as `ready_for_motion`, `not_ready_reasons
   data and these three did not.
 - **The lift is not drawn in the skeleton.** The vendor URDF declares `body_joint` as `fixed`
   (and limits it to 0.6 m, while the robot reports 0.61), so `robot_state` carries the lift as a
-  number and `joints` does not move it. The lift's unit is the vendor's to confirm, which is why
-  the lift command is step-limited from the live reading rather than trusted as an absolute
-  position. Which end of the gripper range is open (0) was confirmed by the operator, not the vendor.
+  number and `joints` does not move it. The lift's unit is the vendor's to confirm, and a command
+  now goes straight to any value inside 0 ~ 0.65. Which end of the gripper range is open (0) was
+  confirmed by the operator, not the vendor (whose SDK says the opposite).
 - **`joints` leaves out anything not in the URDF** and any joint whose position is not a finite
   number, rather than sending `null`.
 - **The head axes disagree between the vendor SDK document and the URDF** (the SDK says
   `joint_head0` is pan, the URDF makes it pitch about y, and `joint_head1` yaw about z). `head`
   therefore takes `head0_rad` and `head1_rad` by joint name rather than pan/tilt. It publishes
-  `[head0, head1]`, assuming that is `head_forward_position_controller`'s joint order; the step
-  limit from the live joint state would show a swapped order as a refused or small move, but
-  confirm it with `ros2 param get /head_forward_position_controller joints` before using `head`.
+  `[head0, head1]`, assuming that is `head_forward_position_controller`'s joint order. A swapped
+  order would show as the head turning about the wrong axis, so confirm it with
+  `ros2 param get /head_forward_position_controller joints` before using `head`.
 
 ## How it connects
 
 ```
 robot, domain 0, CycloneDDS, bound to 127.0.0.1      this container (network_mode: host)
   /joint_states, /odom, /diagnostics, ...   ------>  main process: rclpy subscriptions
-  /cmd_vel_teleop, controllers, actions     <------  Motion (when the robot's state allows it)
+  /cmd_vel or /cmd_vel_teleop, controllers, <------  Motion (when the robot's state allows it)
+  actions
                                                       cards: throttle, clean, encode
                                                            |  bounded queues, newest sample wins
                                                            v
@@ -281,22 +307,21 @@ Tests: `python3 -m pytest tests/test_unixai_panther.py` (no ROS or robot needed)
 
 ## Acceptance on the robot
 
-Done by a person at the robot, with the Master present. Do **sensors first, with motion off**;
-turn motion on only for step 11, and only after everything before it is right.
+Done by a person at the robot, with the Master present. Do **sensors first**; the motion checks
+are step 11, and only after everything before it is right.
 
 1. **Deploy** the image the review bot prints. On this robot the script is
    `/opt/phanthy-motus/run-pr-image.sh`. Expect the container `embodied-unixai-panther` to be
    `Started`.
 2. **Log**: `docker logs --tail 80 embodied-unixai-panther` shows `subscribed to:` and
-   `motion cards enabled (commands are still refused ...)`, then `[dds-bridge] lane=state child
+   `motion cards enabled`, then `[dds-bridge] lane=state child
    pid=` and `first sample published` lines. A line containing `no data from the robot's DDS`
    means the Cyclone configuration is not matching.
 3. **Isolation**: `sudo ss -lunp | grep -i python` - the container's UDP sockets bind `127.0.0.1`
    only, never `192.168.100.2` or the Wi-Fi address.
 4. **The robot's graph**: before and after deployment `ros2 node list` differs only by
    `/panther_driver`. With motion cards enabled that node also has the command publishers and
-   controller clients; nothing is published on them while the gate is closed
-   (`ros2 topic echo /cmd_vel_teleop` stays silent).
+   controller clients; a move is what publishes on them.
 5. **Canvas, sensors**: start the project, then drag out `joints`, `imu`, `odom`, `robot_state`,
    `laser_scan`. `joints`
    follows the arms when the operator moves the robot with the vendor's tools (this driver
@@ -332,9 +357,10 @@ turn motion on only for step 11, and only after everything before it is right.
    slowly with the vendor's own teleoperation (clear floor, emergency stop in reach), they must
    change. Do not push the 100 kg base by hand.
 9. **The cards show their ranges**: open each motion card. Every number box's title shows a range
-   (`左臂 la0（rad，-1.046 ~ 0.697）` and so on); `lifting` has no `操作` choice, only `position`. If
-   the canvas shows no execute button for `lifting`, report it: the fallback is one line (an
-   `action` with a single choice).
+   (`左臂 la0（rad，-1.046 ~ 0.697）` and so on); `lifting` has no `操作` choice, only `position`; the
+   gripper has no `mode`. If the canvas shows no execute button for `lifting`, report it: the
+   fallback is one line (an `action` with a single choice). Also open `base_drive`'s `info`:
+   `cmd_topics` must show at least one topic with a subscriber.
 10. **Confirm the facts the head and lift rely on**:
     `ros2 param get /head_forward_position_controller joints`; the lift's unit and range with the
     vendor; `ros2 control list_controllers` against the names in `panther_motion.py`.

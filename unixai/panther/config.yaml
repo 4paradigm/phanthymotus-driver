@@ -115,7 +115,12 @@ plugins:
   # box shows (built from these numbers and the URDF limits, so the two cannot disagree).
   base_drive:
     enabled: true
-    topic: /cmd_vel_teleop
+    # Tried in this order; the first that any robot node subscribes to is used, and the choice is
+    # logged. The vendor SDK documents /cmd_vel; /cmd_vel_teleop is the vendor teleoperation node's
+    # topic. Do not "just pick one": on this robot the configured name decides whether the base moves.
+    cmd_topics:
+      - /cmd_vel
+      - /cmd_vel_teleop
     max_linear_mps: 0.20
     max_angular_radps: 0.30
     max_duration_s: 3.0
@@ -124,9 +129,9 @@ plugins:
   arm_control:
     enabled: true
     max_duration_s: 20.0
-    # Largest change of any single joint in one `move`, from where it is now.
-    max_target_delta_rad: 0.35
-    # `home` is not held to the step above. It sends every joint of the chosen arms to home_pose
+    speed_rad_s: 0.35
+    min_duration_s: 2.0
+    # `home` sends every joint of the chosen arms to home_pose
     # (0 rad for any joint not listed; the operator confirmed the all-zero pose is safe on this
     # robot, 2026-11-11; the vendor did not) and stretches the duration so that the furthest joint
     # moves at no more than this average speed. The trajectory controller interpolates, so its peak
@@ -140,10 +145,8 @@ plugins:
     enabled: true
     # Units are not confirmed by the vendor; the reading was 0.61 with the URDF limit at 0.6.
     max_position: 0.65
-    max_target_delta: 0.10
   head:
     enabled: true
-    max_target_delta_rad: 0.35
     # `home` sends both head joints to home_pose (0 rad if not listed) in small steps: the head's
     # forward-position controller goes to whatever it is sent at its own top speed, so the speed
     # limit is applied by sending a step every 1/home_publish_rate_hz seconds.
