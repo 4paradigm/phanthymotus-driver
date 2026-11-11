@@ -2812,3 +2812,254 @@ def test_the_dockerfile_copies_the_switch_module_the_device_imports():
     dockerfile = (DRIVER / "Dockerfile").read_text(encoding="utf-8")
     copied = re.search(r"COPY (main\.py[^\n]*) /work/unixai/panther/", dockerfile).group(1).split()
     assert "motion_switch.py" in copied and (DRIVER / "motion_switch.py").is_file()
+
+# ── arm stop racing a worker that has not started yet ───────────────────────────────────────
+
+class DeferredSpawn:
+    """Holds the worker back, as a busy machine can: the move has been accepted, the thread has not run."""
+
+    def __init__(self):
+        self.pending = []
+
+    def __call__(self, target, name):
+        self.pending.append(target)
+
+    def run_all(self):
+        pending, self.pending = self.pending, []
+        for target in pending:
+            target()
+
+
+@pytest.fixture
+def deferred_motion(device, config, hub, io, completions, clock, motion_module):
+    config["safety"]["commissioning_motion_enabled"] = True
+    spawn = DeferredSpawn()
+    instance = motion_module.Motion(config, io, hub, spawn=spawn, notify=lambda *a: completions.append(a),
+                                    sleep=clock.advance, monotonic=lambda: clock.mono)
+    instance.spawn = spawn
+    return instance
+
+
+def test_a_stop_before_the_worker_begins_means_no_controller_switch_and_no_goal(
+        deferred_motion, hub, io, completions):
+    """Review finding: the worker used to switch controllers and send every goal before it first
+    looked at the cancel flag, so a stop issued right after a move could be followed by motion."""
+    open_gate(hub)
+    started = deferred_motion.dispatch("arm_control", "move", ARM)
+    assert started["state"] == "moving" and io.calls == [], "accepted, but nothing has happened yet"
+
+    stopped = deferred_motion.dispatch("arm_control", "stop", {})
+    assert stopped["state"] == "idle"
+    deferred_motion.spawn.run_all()                          # the thread finally gets to run
+
+    assert io.named("switch") == [] and io.named("goal") == [], "stopped before it began: nothing was sent"
+    assert completions[-1][1] == "cancelled" and completions[-1][3] == "arm_control"
+    assert deferred_motion.dispatch("arm_control", "info", {})["busy"] is False
+
+
+def test_a_stop_between_two_arms_goals_sends_no_further_goal_and_restores(deferred_motion, hub, io, completions):
+    open_gate(hub)
+    original = io.send_arm_goal
+
+    def stop_after_the_first_goal(side, names, positions, duration):
+        handle = original(side, names, positions, duration)
+        if side == "left":
+            deferred_motion._arm_cancel.set()                # a stop lands between the two sends
+        return handle
+
+    io.send_arm_goal = stop_after_the_first_goal
+    deferred_motion.dispatch("arm_control", "move", {"side": "both", "left_positions": LEFT_TARGET,
+                                                     "right_positions": RIGHT_TARGET, "duration_s": 3.0,
+                                                     "confirm_motion": True})
+    deferred_motion.spawn.run_all()
+    assert [c[1] for c in io.calls if c[0] == "goal"] == ["left"], "the right arm's goal was never sent"
+    assert io.named("cancel") == [("handle-left",)], "the goal that was sent is cancelled"
+    assert io.controllers[FORWARD] == "active" and completions[-1][1] == "cancelled", "controllers restored"
+
+
+def test_a_stop_during_the_controller_switch_cancels_before_any_goal(deferred_motion, hub, io, completions):
+    open_gate(hub)
+    original = io.switch_controllers
+
+    def stop_during_switch(activate, deactivate):
+        original(activate, deactivate)
+        deferred_motion._arm_cancel.set()
+
+    io.switch_controllers = stop_during_switch
+    deferred_motion.dispatch("arm_control", "move", ARM)
+    deferred_motion.spawn.run_all()
+    assert io.named("goal") == [], "no goal after the stop"
+    assert io.controllers[FORWARD] == "active" and io.controllers[LEFT_P2P] == "inactive", "switched back"
+    assert completions[-1][1] == "cancelled"
+
+
+def test_a_stop_with_nothing_running_leaves_no_trace_that_could_cancel_the_next_move(
+        deferred_motion, hub, io, completions):
+    """The flag must not be set by a stop that found nothing to stop."""
+    open_gate(hub)
+    assert deferred_motion.dispatch("arm_control", "stop", {})["state"] == "idle"
+    assert not deferred_motion._arm_cancel.is_set(), "an idle stop must not leave the cancel flag set"
+    deferred_motion.dispatch("arm_control", "move", ARM)
+    deferred_motion.spawn.run_all()
+    assert [c[0] for c in io.calls] == ["switch", "goal", "switch"] and completions[-1][1] == "completed"
+
+
+def test_a_new_move_starts_clean_even_if_the_previous_one_was_cancelled(deferred_motion, hub, io, completions):
+    """The flag a stop sets must not outlive the move it cancelled."""
+    open_gate(hub)
+    deferred_motion.dispatch("arm_control", "move", ARM)
+    deferred_motion.dispatch("arm_control", "stop", {})
+    deferred_motion.spawn.run_all()
+    assert completions[-1][1] == "cancelled" and deferred_motion._arm_cancel.is_set(), \
+        "precondition: the cancelled move left the flag set"
+    io.calls.clear()
+    deferred_motion.dispatch("arm_control", "move", ARM)
+    assert not deferred_motion._arm_cancel.is_set(), "accepting a new move clears the old stop"
+    deferred_motion.spawn.run_all()
+    assert [c[0] for c in io.calls] == ["switch", "goal", "switch"] and completions[-1][1] == "completed", \
+        "a stale cancel flag must not silently cancel a fresh move"
+
+def test_two_stops_and_a_move_in_any_order_never_leave_the_arm_busy(deferred_motion, hub, io):
+    open_gate(hub)
+    deferred_motion.dispatch("arm_control", "move", ARM)
+    deferred_motion.dispatch("arm_control", "stop", {})
+    deferred_motion.dispatch("arm_control", "stop", {})
+    deferred_motion.spawn.run_all()
+    assert deferred_motion.dispatch("arm_control", "info", {})["busy"] is False
+    again = deferred_motion.dispatch("arm_control", "move", ARM)
+    assert again["state"] == "moving", "a new move is accepted after a cancelled one"
+
+
+def test_a_controller_restore_failure_is_logged_escaped_and_capped(deferred_motion, hub, io, completions, capsys):
+    open_gate(hub)
+    io.switch_fail_after = 1
+    original = io.switch_controllers
+
+    def hostile(activate, deactivate):
+        try:
+            original(activate, deactivate)
+        except RuntimeError:
+            raise RuntimeError("bad\x1b[31m\nINJECTED line " + "x" * 600)
+
+    io.switch_controllers = hostile
+    deferred_motion.dispatch("arm_control", "move", ARM)
+    deferred_motion.spawn.run_all()
+    out = capsys.readouterr().out
+    warning = next(line for line in out.splitlines() if "could not restore the arm controllers" in line)
+    assert "\x1b" not in out and "INJECTED" in warning and "\\x1b" in warning, "controls are escaped, on one line"
+    assert not any(line.startswith("INJECTED") for line in out.splitlines()), "no forged second record"
+    assert len(warning) < 400, "capped, not 600+ characters"
+    assert len(completions[-1][2]["restore_error"]) < 400
+
+def _race_once(motion_module, config, hub, io, delay):
+    """One real-thread move-vs-stop interleaving. Returns (events, violations)."""
+    import threading
+    import time
+
+    events, guard = [], threading.Lock()
+
+    def note(what):
+        with guard:
+            events.append(what)
+
+    io.calls.clear()
+    io.controllers.update({FORWARD: "active", LEFT_P2P: "inactive", RIGHT_P2P: "inactive"})
+    originals = (io.send_arm_goal, io.switch_controllers, io.cancel_arm_goal)
+
+    def goal(*args):
+        note("GOAL")
+        return originals[0](*args)
+
+    def switch(activate, deactivate):
+        note(f"switch +{len(activate)}/-{len(deactivate)}")
+        return originals[1](activate, deactivate)
+
+    def cancel(handle):
+        note("cancel-goal")
+        return originals[2](handle)
+
+    io.send_arm_goal, io.switch_controllers, io.cancel_arm_goal = goal, switch, cancel
+    try:
+        motion = motion_module.Motion(config, io, hub, notify=lambda *a: note(f"completion:{a[1]}"),
+                                      sleep=lambda s: None)
+        mover = threading.Thread(target=lambda: motion.dispatch("arm_control", "move", ARM))
+        mover.start()
+        if delay:
+            time.sleep(delay)
+        result = motion.dispatch("arm_control", "stop", {})
+        note(f"STOP-RETURNED:{result['state']}")
+        mover.join(5)
+        end = time.time() + 5
+        while motion.dispatch("arm_control", "info", {})["busy"] and time.time() < end:
+            time.sleep(0.001)
+    finally:
+        io.send_arm_goal, io.switch_controllers, io.cancel_arm_goal = originals
+
+    violations = []
+    if any(e == "STOP-RETURNED:idle" for e in events):
+        after = events[events.index("STOP-RETURNED:idle") + 1:]
+        # After stop() has said idle the robot must be settled: nothing issued but the clean-up.
+        if any(e == "GOAL" or e.startswith("switch +") for e in after):
+            violations.append("motion issued after stop returned idle")
+    if any(e == "GOAL" for e in events) and "cancel-goal" not in events and "completion:completed" not in events:
+        violations.append("a goal was sent and neither cancelled nor completed")
+    if io.controllers != {**io.controllers, FORWARD: "active", LEFT_P2P: "inactive", RIGHT_P2P: "inactive"}:
+        violations.append("controllers not restored")
+    if motion.dispatch("arm_control", "info", {})["busy"]:
+        violations.append("still busy")
+    return events, violations
+
+
+def test_a_move_and_a_stop_racing_on_real_threads_leave_the_robot_settled(
+        device, config, hub, io, motion_module):
+    """The invariants that must hold in EVERY interleaving of a move and a stop on real threads:
+
+    * once stop() has returned `idle`, nothing new is issued (no further switch-on, no goal);
+    * a goal that was sent is cancelled or completed, never left running;
+    * the controllers are back as they were, and the arm is not left busy.
+    """
+    config["safety"]["commissioning_motion_enabled"] = True
+    open_gate(hub)
+    bad = []
+    for attempt in range(80):
+        events, violations = _race_once(motion_module, config, hub, io, delay=0.0004 * (attempt % 6))
+        if violations:
+            bad.append((attempt, violations, events))
+    assert bad == [], "\n".join(f"#{a} {v} {e}" for a, v, e in bad[:3])
+
+def test_a_stop_that_lands_while_the_move_is_still_being_checked_cancels_it(
+        device, config, hub, io, completions, clock, motion_module):
+    """The window the stress test found: stop() arrives after move() began but before it was marked
+    as running. It used to answer 'idle' and then the whole move ran."""
+    config["safety"]["commissioning_motion_enabled"] = True
+    open_gate(hub)
+    motion = motion_module.Motion(config, io, hub, spawn=lambda t, n: t(),
+                                  notify=lambda *a: completions.append(a), sleep=clock.advance,
+                                  monotonic=lambda: clock.mono)
+    original = io.list_controllers
+    landed = []
+
+    def stop_lands_during_validation():
+        landed.append(motion.dispatch("arm_control", "stop", {}))     # the stop arrives mid-check
+        return original()
+
+    io.list_controllers = stop_lands_during_validation
+    result = motion.dispatch("arm_control", "move", ARM)
+    assert landed == [{"state": "idle"}]
+    assert result["state"] == "error" and "stopped while this move was being checked" in result["message"]
+    assert io.calls == [] and completions == [], "nothing was switched, sent or reported"
+    io.list_controllers = original
+    assert motion.dispatch("arm_control", "move", ARM)["state"] == "moving", "and a later move is fine"
+
+
+def test_a_stop_before_a_move_began_does_not_cancel_it(device, config, hub, io, completions, clock, motion_module):
+    """Only a stop that arrives *during* a move's checking cancels it; an earlier one is history."""
+    config["safety"]["commissioning_motion_enabled"] = True
+    open_gate(hub)
+    motion = motion_module.Motion(config, io, hub, spawn=lambda t, n: t(),
+                                  notify=lambda *a: completions.append(a), sleep=clock.advance,
+                                  monotonic=lambda: clock.mono)
+    motion.dispatch("arm_control", "stop", {})
+    motion.dispatch("arm_control", "stop", {})
+    assert motion.dispatch("arm_control", "move", ARM)["state"] == "moving"
+    assert completions[-1][1] == "completed"

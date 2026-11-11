@@ -33,6 +33,7 @@ from contracts import (
     HEAD_JOINTS, LEFT_ARM_JOINTS, RIGHT_ARM_JOINTS, finite_number, finite_vector,
     require_confirmation, validate_drive, validate_joint_target,
 )
+from panther_bridge import safe_text
 
 DRIVE_CONTROLLER = "movebase3_drive_controller"
 ARM_FORWARD_CONTROLLER = "dual_arm_forward_position_controller"
@@ -204,6 +205,12 @@ class Motion:
         self._arm_cancel = threading.Event()
         self._arm_done = threading.Event()
         self._arm_done.set()
+        self._arm_began = False                              # has the worker of the current move run yet?
+        # Bumped by every stop. A move remembers the value it started with and refuses to go on if it
+        # has changed: that is how a stop that arrives while the move is still being checked (before
+        # it is marked as running) still cancels it, instead of being answered "idle" and then
+        # followed by the whole move.
+        self._arm_stop_generation = 0
         self._stopped: set = set()
 
     # ── gate ─────────────────────────────────────────────────────────────────
@@ -368,6 +375,8 @@ class Motion:
             return self.info("arm_control")
         if action != "move":
             raise ValueError(f"unsupported arm_control action: {action}")
+        with self._arm_lock:
+            started_at = self._arm_stop_generation
         require_confirmation(args)
         cap = self._plugins["arm_control"]
         duration = finite_number(args.get("duration_s", 6.0), "duration_s")
@@ -396,9 +405,13 @@ class Motion:
                 raise RuntimeError(f"controller {name} does not exist on this robot")
         plan = self._switch_plan(states, requested)
         with self._arm_lock:
+            if self._arm_stop_generation != started_at:
+                raise RuntimeError("arm_control was stopped while this move was being checked; "
+                                   "nothing was sent, send it again if it is still wanted")
             if self._arm_running:
                 raise RuntimeError("arm_control is already moving; send stop first")
             self._arm_running = True
+            self._arm_began = False
             self._arm_cancel.clear()
             self._arm_done.clear()
         action_id = f"panther_arm_{uuid4().hex[:8]}"
@@ -428,13 +441,26 @@ class Motion:
 
     def _arm_worker(self, action_id: str, targets: dict, duration: float, plan: tuple) -> None:
         status, result, handles, switched = "completed", {}, {}, False
+        with self._arm_lock:
+            self._arm_began = True
         try:
-            self._switch_arm(plan, restore=False)
-            switched = True
-            for arm_side, (names, positions) in targets.items():
-                handles[arm_side] = self._io.send_arm_goal(arm_side, list(names), positions, duration)
+            # A stop can land at any moment after the move was accepted, including before this
+            # thread has run at all (a busy machine, a slow start). It only sets a flag, so the
+            # flag is looked at before every step that does something to the robot: switching
+            # controllers, and each trajectory goal. Checking it only in the polling loop below
+            # let a stop that came right after a move be followed by the whole move.
+            if self._arm_cancel.is_set():
+                status = "cancelled"
+            else:
+                self._switch_arm(plan, restore=False)
+                switched = True
+                for arm_side, (names, positions) in targets.items():
+                    if self._arm_cancel.is_set():
+                        status = "cancelled"
+                        break
+                    handles[arm_side] = self._io.send_arm_goal(arm_side, list(names), positions, duration)
             deadline = self._mono() + duration + 5.0
-            pending = dict(handles)
+            pending = dict(handles) if status == "completed" else {}
             while pending:
                 if self._arm_cancel.is_set():
                     status = "cancelled"
@@ -451,7 +477,7 @@ class Motion:
                         raise RuntimeError(f"{arm_side} trajectory failed: {outcome.get('error_string')}")
         except Exception as exc:  # noqa: BLE001
             status = "error"
-            result["message"] = f"{type(exc).__name__}: {exc}"
+            result["message"] = f"{type(exc).__name__}: {safe_text(exc, 160)}"
         finally:
             if status != "completed":
                 for handle in handles.values():
@@ -466,18 +492,31 @@ class Motion:
                 except Exception as exc:  # noqa: BLE001
                     result["controllers_restored"] = False
                     status = "error"
-                    result["restore_error"] = f"{type(exc).__name__}: {exc}"
+                    result["restore_error"] = f"{type(exc).__name__}: {safe_text(exc, 160)}"
                     print("[panther] WARNING: could not restore the arm controllers after a "
-                          f"move: {exc}. Check `ros2 control list_controllers`.", flush=True)
+                          f"move: {safe_text(exc, 160)}. Check `ros2 control list_controllers`.", flush=True)
             with self._arm_lock:
                 self._arm_running = False
             self._arm_done.set()
         self._notify(action_id, status, result, "arm_control")
 
     def _stop_arm(self) -> dict:
-        if not self._arm_running:
-            return {"state": "idle"}
-        self._arm_cancel.set()
+        # Under the same lock `arm()` takes to mark a move as running, so a stop and a start are
+        # never interleaved half way: either the move is already marked (and the flag set here is
+        # the one its worker will see) or nothing is running and there is nothing to cancel.
+        # Setting the flag with nothing running would cancel the *next* move, so it is not set.
+        with self._arm_lock:
+            self._arm_stop_generation += 1                   # cancels a move that is still being checked
+            if not self._arm_running:
+                return {"state": "idle"}
+            self._arm_cancel.set()
+            began = self._arm_began
+        if not began:
+            # The worker has not run. Nothing has been switched or sent, and when it does run it
+            # sees the flag first and does nothing, so there is nothing to wait for. (Waiting
+            # here would just sit out the timeout and then report "stopping" about a robot that
+            # is not moving.)
+            return {"state": "idle", "stopped_by": "stop", "note": "cancelled before it began"}
         finished = self._arm_done.wait(timeout=10.0)
         return {"state": "idle" if finished else "stopping", "stopped_by": "stop"}
 

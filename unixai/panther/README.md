@@ -134,7 +134,15 @@ What `stop` does, honestly:
 - `base_drive`: bumps a generation counter so the worker stops publishing, and publishes zero
   velocity five times.
 - `arm_control`: cancels the trajectory goal and switches the controllers back, then returns. The
-  call reports `stopping` instead of `idle` if that takes over 10 s.
+  call reports `stopping` instead of `idle` if that takes over 10 s. A stop is honoured at every
+  stage of a move, not only while it is running: the worker looks for it before switching
+  controllers and before each trajectory goal, so a stop that arrives before the worker thread has
+  even started means nothing is switched or sent; and a stop that lands while the move is still
+  being checked makes `move` answer `error` ("stopped while this move was being checked", nothing
+  sent) instead of being answered `idle` and then followed by the whole move. The price is that
+  such a `move` has to be sent again. A stop with nothing running changes nothing and does not
+  affect the next move. This is tested on real threads as well as step by step: after `stop`
+  returns `idle`, nothing new is issued and the controllers are as they were.
 - `gripper`, `lifting`, `head` are one position command each. Once it is published the robot's
   controller owns the motion, and this driver has no halt to call (the vendor's halt/disable
   services are deliberately not used). `stop` there promises only that **nothing more is sent**.
