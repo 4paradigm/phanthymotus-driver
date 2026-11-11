@@ -2,7 +2,7 @@
 
 Phanthy Motus driver bundle for the UniX AI **Panther** dual-arm wheeled robot (ROS 2 Humble,
 robot name `mh3`): sensor cards that show the robot's state, and five motion cards that can move
-it. **Motion is off by default** (`safety.commissioning_motion_enabled: false` in `config.yaml`):
+it. **Motion is off by default** (`safety.commissioning_motion_enabled: false` in `config.yaml`, and no operator file on the robot, see "Turning motion on" below):
 the motion cards are listed and answer `info`, and every command is refused until an operator
 turns the switch on at the robot.
 
@@ -21,7 +21,7 @@ review found gaps (a `stop` for every actuator, completion reporting for the lon
 | `imu` | `data/json` | 10 Hz | `/imu_sensor_broadcaster/imu` |
 | `odom` | `state/odom` (`motus.odom/1`) | 10 Hz | `/odom` (mean of the window; `vx`, `vy`, `wz` only; no pose) |
 | `robot_state` | `data/json` | 2 Hz, and at once on a diagnostics change | battery, `/diagnostics`, grippers, lift, `list_controllers` (below) |
-| `laser_scan` | `data/json` + `image/jpeg` | 5 Hz / 1 Hz | `/lidar_front/scan` + `/lidar_rear/scan`, merged round `base_link` |
+| `laser_scan` | `data/json` + `image/jpeg` | 5 Hz / 1 Hz | `/lidar_front/scan` + `/lidar_rear/scan` (silent here: no rear lidar), round `base_link` |
 | `camera_color` | `image/jpeg` | 10 Hz | `/camera/color/image_raw` |
 | `camera_depth` | `image/depth-zlib` | 5 Hz | `/camera/depth/image_raw` (resampled to 640x480 uint16 mm) |
 
@@ -46,38 +46,36 @@ nodes but the navigation lifecycle is not active. That is the robot's own report
 to do with the sensors or the motion gate, and the card stays `error` for as long as Nav2 is off.
 `diagnostics` is `null` until the first message arrives.
 
-`laser_scan` puts both lidars in one scan of 360 bins round `base_link`, nearest return per bin.
-The vendor URDF has no frames for the individual lidars, so their mounting poses are read from the
-robot's latched `/tf_static` (confirmed there: the lidars are `link_front_radar` and
-`link_back_radar`, not the `lidar_front_link`/`lidar_rear_link` the vendor SDK document names). A
-lidar that is stale, has never reported, or has no known transform is left out and the reason is
-in `sources`; if *no* lidar has a transform yet, the first one is shown in its own frame and
-`transformed` is `false`. Ranges are measured from `base_link`'s origin, not from either lidar.
-The card does not use `/scan` (the vendor's merged scan): `dual_lidar_merger` publishes it only
-when it gets both lidars (an inference, not confirmed), and the rear one is silent, see below.
+`laser_scan` is one scan of 360 bins round `base_link`, nearest return per bin. The driver can
+merge a front and a rear lidar, but **this robot has one lidar, at the front**: the rear half of
+the scan is blocked by the central column, so the rear topic never carries data and that is
+normal (see below). The vendor URDF has no frame for the lidar, so its mounting pose is read from
+the robot's latched `/tf_static`. Measured on the robot: `link_front_radar` is at (0.226, 0, 0.266)
+from `base_link` with no rotation (the names `lidar_front_link` / `lidar_rear_link` in the vendor
+SDK document are not the robot's). A lidar that is stale, has never reported, or has no known
+transform is left out and the reason is in `sources`; if *no* lidar has a transform yet, the first
+one is shown in its own frame and `transformed` is `false`. Ranges are measured from
+`base_link`'s origin, not from the lidar. The card does not use `/scan` (the vendor's merged
+scan): it needs both lidars, so it is not published on a robot with one.
 
 Returns closer than `laser.self_filter_radius_m` (0.35 m) to `base_link` are the robot's own body
-and are dropped; how many is in `self_filtered_beams`, and `nearest_m` is measured after that. It
-is a circle, so it also hides a real obstacle nearer than that at the corners and sides, and only
-a lidar with a known transform is filtered (without one the body's position is unknown). **0.35 is
-a guess, made without the lidars' real mounting poses: tune it against the top-down view on the
-robot**, and set it to 0 to turn it off. What is known: the merged scan on the robot reported a
-`nearest_m` of 0.073 *after* the transform to `base_link`, so something is 7 cm from
-`base_link`'s origin. Read where the front lidar sits (`ros2 run tf2_ros tf2_echo base_link
-link_front_radar`) and what is at that spot before trusting any radius: a radius around the
-origin only removes the body if the body is near the origin.
+and are dropped; how many is in `self_filtered_beams`, and `nearest_m` is measured after that.
+Why 0.35: the unfiltered `nearest_m` was 0.073, the lidar looking back at the central column,
+which a photo of the robot shows standing near the middle of the base. A lidar 0.226 m ahead of
+`base_link` seeing it 0.30 m away puts it 0.074 m from `base_link`'s origin, which matches. The
+filter is a circle, so it also hides a real obstacle nearer than 0.35 m at the corners and the
+sides (the base is not round), and only a lidar with a known transform is filtered. The radius is
+an estimate from one photo and one number: **tune it against the top-down view**, and set it to 0
+to turn the filter off.
 
-**The rear lidar currently sends nothing, and the cause is the robot's configuration, not this
-driver.** The vendor's `bluesea_node` for it is running and publishing on
-`/lidar_rear/scan`, but `rear_lidar.yaml` points it at
-`/dev/ttyUSB_RAIDAR_REAR`, which does not exist: the udev rules in
-`/etc/udev/rules.d/99-usb-serial.rules` create only `ttyUSB_RAIDAR_FRONT` (for `ttyACM0`,
-USB interface `if00` of the `1a86:55d2` dual-serial chip), so the process never opens a serial
-port. `ttyACM1` (`if02` of the same chip) is a candidate but is **not confirmed** to be the rear
-lidar. Until the vendor confirms and fixes the rule, `laser_scan` shows the front lidar only and
-says so in `sources.rear`. Both lidar nodes are also called `bluesea_node`, which makes ROS warn
-about duplicate node names.
-
+**Why there is no rear lidar data.** The vendor software starts a `bluesea_node` for a rear lidar
+(`rear_lidar.yaml`, port `/dev/ttyUSB_RAIDAR_REAR`) on every robot, but this one has no rear lidar, so
+that port does not exist, the process never opens a serial device and the topic stays silent. Both
+nodes are called `bluesea_node`, which makes ROS warn about duplicate node names. An earlier
+version of this README blamed a missing udev rule for the rear lidar; that was wrong, from reading
+the vendor's config on a robot that does not have the hardware. **Do not create the missing device
+link** (for example by pointing it at `ttyACM1`): that is not a lidar, and the rear node would send
+commands to whatever it is.
 ### Motion (all `actuator`, all refused unless the commissioning switch is on)
 
 | Card | Actions | Does | Completion |
@@ -90,7 +88,7 @@ about duplicate node names.
 
 Every command needs all of these, checked in `panther_motion.py` before anything is sent:
 
-- `safety.commissioning_motion_enabled: true` in `config.yaml`;
+- the operator's commissioning file on the robot says `commissioning_motion_enabled: true` (see "Turning motion on" below);
 - `confirm_motion: true` in the call;
 - fresh `/joint_states` (under 1 s) and a fresh, **normal** emergency-stop diagnostic (the
   diagnostic's standard `level` is 0 and it is under 3 s old; the vendor's text is never
@@ -100,6 +98,37 @@ Every command needs all of these, checked in `panther_motion.py` before anything
   (live `/robot_description` if received, otherwise the bundled copy) and at most 0.35 rad from
   where the joint is now; the lift at most 0.10 from its reading and below 0.65.
 
+### Turning motion on (and off)
+
+The image cannot ship with motion on, and an edit made inside the container is lost with the
+container, so the switch is a small file **on the robot**, mounted read-only by
+`deploy/service.yml`:
+
+```
+sudo mkdir -p /opt/phanthy-motus/data/panther
+echo 'commissioning_motion_enabled: true' | sudo tee /opt/phanthy-motus/data/panther/commissioning.yaml
+docker restart embodied-unixai-panther          # or redeploy from the console; the file persists
+docker logs embodied-unixai-panther 2>&1 | grep "motion "     # -> "motion ENABLED: ... sets commissioning_motion_enabled: true"
+```
+
+To turn it off: `sudo rm /opt/phanthy-motus/data/panther/commissioning.yaml` (or write `false`) and
+restart. Do both with the operator at the robot.
+
+What makes this safe to leave lying around:
+
+- **Anything but the YAML boolean `true` is off.** A missing file, an unreadable one, a directory
+  where the file should be, invalid YAML, `"true"` in quotes, `1`, `yes`, a typo in the key: all
+  leave motion refused, and the log line and every motion card's `info` (`note`) say why. A mistake
+  can only keep motion off, never turn it on.
+- **Only this one key is read from the file.** The speed, duration, step and lift limits stay in
+  `config.yaml`; a file that could also raise those would let one careless edit lift every limit at
+  once. To change a limit, change `config.yaml` and the image.
+- **It is read once, at start-up.** Turning motion on or off needs a restart, which also ends
+  anything in flight. There is no way to flip it from the canvas.
+- The directory, not the file, is mounted (Docker would turn a missing bind-mounted file into an
+  empty *directory*). `PANTHER_COMMISSIONING_DIR` moves the host directory and
+  `PANTHER_COMMISSIONING_FILE` the path inside the container, for a robot that keeps its data
+  elsewhere.
 What `stop` does, honestly:
 
 - `base_drive`: bumps a generation counter so the worker stops publishing, and publishes zero
@@ -236,11 +265,10 @@ turn motion on only for step 11, and only after everything before it is right.
    commands nothing); `robot_state` shows a battery percentage (not `1`), `estop` `正常` with a
    small `age_ms`, grippers, lift, and `controllers` filled; `ready_for_motion` is true.
    `diagnostics.problems` names whatever is wrong on the robot (here the Nav2 lifecycle).
-6. **Lidar**: `ros2 topic echo /tf_static --once | grep -B2 -A8 -i radar` names the two lidar
-   frames (`link_front_radar`, `link_back_radar` here); `laser_scan` should say `transformed: true`
-   and show the front lidar `used` in `sources`. The rear lidar is expected to say `no data
-   received` until the vendor fixes its serial port (see above). Start the card and check the
-   top-down view: `nearest_m` should be a real obstacle, not the robot's body, and
+6. **Lidar**: `ros2 run tf2_ros tf2_echo base_link link_front_radar` should print (0.226, 0, 0.266),
+   the pose the card reads from `/tf_static`; `laser_scan` should say `transformed: true` and show
+   the front lidar `used` in `sources`. The rear lidar is expected to say `no data received`:
+   this robot has no rear lidar (see above). Start the card and check the top-down view: `nearest_m` should be a real obstacle, not the robot's body, and
    `self_filtered_beams` should be greater than 0. If part of the body is still drawn, raise
    `laser.self_filter_radius_m`; if a real obstacle at the corner disappears, lower it.
 7. **Cameras**: before starting any camera card, `systemctl is-active panther_orbbec` should be
@@ -263,7 +291,7 @@ turn motion on only for step 11, and only after everything before it is right.
     `ros2 param get /head_forward_position_controller joints`; the lift's unit and range with the
     vendor; `ros2 control list_controllers` against the names in `panther_motion.py`.
 11. **Motion**, only with the operator beside the robot, the area clear and the emergency stop in
-    reach: set `commissioning_motion_enabled: true`, restart, then try in this order and stop at
+    reach: turn motion on as described in "Turning motion on", restart, then try in this order and stop at
     the first surprise: `base_drive` 0.05 m/s for 1 s; `base_drive` `stop` during a 3 s move;
     `head` 0.1 rad; `lifting` 0.02 from its reading; `gripper` small step; `arm_control` 0.05 rad
     on one joint. After each arm move check `ros2 control list_controllers` shows the original
@@ -279,7 +307,7 @@ by hand: `sudo systemctl stop panther_orbbec`.
 
 Open questions for the vendor (UniX AI): the gripper range and the lift unit; the head axis
 naming and the head controller's joint order; what `/diagnostics` shows while the emergency stop is
-pressed; why the rear lidar's `ttyUSB_RAIDAR_REAR` does not exist (and whether `ttyACM1` is the rear
-lidar), and whether `/scan` will then appear; the lidar frame names in the SDK document, which
-differ from the robot's; the duplicate `bluesea_node` name; the Gemini 2 camera's profile and
-intrinsics.
+pressed; why the vendor software starts a rear-lidar `bluesea_node` on a robot that has no rear
+lidar (it publishes a topic that never has data, and shares the name `bluesea_node` with the front
+one); the lidar frame names in the SDK document, which differ from the robot's; the Gemini 2
+camera's profile and intrinsics.

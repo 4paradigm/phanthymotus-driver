@@ -10,7 +10,8 @@ objects. `panther_motion.Motion` holds the motion rules, also ROS-free. `Panther
 thin rclpy layer that feeds the first and carries out the second (`RosMotionIO`).
 `PantherPlugin` is the MCP surface.
 
-Motion is off unless `safety.commissioning_motion_enabled` is true in config.yaml: the cards are
+Motion is off unless the operator turns it on (see motion_switch.py: a small file on the host, read
+at start-up, where only the boolean `true` counts): the cards are
 listed and answer `info`, and every motion command is refused.
 """
 from __future__ import annotations
@@ -26,6 +27,7 @@ from common.odom import build_interface, build_sample, mean_twist, resolve_stamp
 from common.vendor_runtime import tool
 from contracts import parse_joint_limits, populate_switch_request
 from host_camera import HostCamera
+from motion_switch import apply_motion_switch
 from panther_bridge import CoreBridge, DEFAULT_PROFILE, safe_text
 from panther_motion import MOTION_CARDS, Motion, motion_tools
 from panther_payloads import (
@@ -56,8 +58,9 @@ DESCRIPTIONS = {
     "robot_state": "Panther 低频状态汇总，约 2Hz：电池（电量/电压/电流/温度）、硬件诊断（CAN、电机等）、"
                    "急停诊断（厂商原文原样透传，附数据年龄和是否过期，stale 为 true 时不代表安全）、"
                    "左右夹爪与升降的原始读数、ros2_control 控制器状态、是否允许运动。每一块各带自己的 age_ms",
-    "laser_scan": "Panther 前后激光雷达合并为一圈：以 base_link 为中心的最近障碍物距离 JSON，约 5Hz；"
-                  "启动后另发 1Hz 俯视图。雷达安装位姿取自机器人的 /tf_static",
+    "laser_scan": "Panther 激光雷达：以 base_link 为中心的最近障碍物距离 JSON，约 5Hz；启动后另发 1Hz 俯视图。"
+                  "雷达安装位姿取自机器人的 /tf_static。驱动支持前后两个雷达并合成一圈，"
+                  "但这台机器人只装了一个前雷达，后半圈被中间的立柱挡住，没有数据是正常的",
     "camera_color": "Panther 头部 RGB 相机（奥比中光 Gemini 2）彩色图像。启动卡片时在机器人本机拉起相机驱动",
     "camera_depth": "Panther 头部 RGB-D 相机深度图（640x480 uint16 毫米，zlib）。启动卡片时在机器人本机拉起相机驱动",
 }
@@ -67,7 +70,7 @@ NO_DATA_HINTS = {
                     "（`journalctl -u panther_orbbec`），或相机是否被别的程序占用",
     "camera_depth": "启动后仍未收到深度图：检查机器人本机的 panther_orbbec.service"
                     "（`journalctl -u panther_orbbec`），或相机是否被别的程序占用",
-    "laser_scan": "没有收到任何雷达数据：前后雷达话题都没有收到数据",
+    "laser_scan": "没有收到任何雷达数据：前雷达话题没有数据（这台机器人只有前雷达；后雷达话题没有数据是正常的）",
 }
 
 
@@ -1013,6 +1016,12 @@ class PantherPlugin:
 
 
 def build_plugins(config, namespace=None, ros2=None):
+    # The operator's motion switch is decided once, here, before anything reads it: Motion and the
+    # log line below then agree. See motion_switch.py for why only one key can come from the file.
+    apply_motion_switch(config)
+    safety = config["safety"]
+    print(f"[panther] motion {'ENABLED' if safety['commissioning_motion_enabled'] else 'disabled'}: "
+          f"{safety['motion_switch_source']}", flush=True)
     bridge_config = config.get("core_bridge", {})
     bridge = CoreBridge(bridge_config.get("profile", DEFAULT_PROFILE),
                         int(bridge_config.get("domain", 42)))

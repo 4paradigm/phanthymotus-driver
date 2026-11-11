@@ -388,7 +388,7 @@ class StaticTf:
     """The robot's fixed frame tree from `/tf_static`, enough to place a lidar in `base_link`.
 
     The vendor URDF has one lidar frame (`base_laser_link`) and none for the individual
-    lidars, so where the front and rear lidars sit can only be read from the robot itself.
+    lidars, so where a lidar sits can only be read from the robot itself.
     Full 3-D composition (rotation matrix and translation) is used rather than a planar
     shortcut so that a lidar mounted tilted or upside down is still placed correctly; only the
     resulting x and y are used, because a scan is a plane.

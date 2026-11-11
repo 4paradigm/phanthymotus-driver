@@ -2601,3 +2601,214 @@ def test_the_restart_and_the_final_stop_never_run_at_the_same_time(host_camera, 
     camera.close()
     watchdog.join(5)
     assert overlap == [], "two systemctl calls on the unit overlapped"
+
+# ── the operator's motion switch: a supported, persistent way to turn motion on ─────────────
+
+@pytest.fixture(scope="module")
+def motion_switch(device):
+    return importlib.import_module("motion_switch")
+
+
+def _file(text=None, error=None):
+    """An `open` that serves `text`, or raises `error`; records the path it was asked for."""
+    asked = []
+
+    def opener(path, encoding=None):
+        import io
+
+        asked.append(path)
+        if error is not None:
+            raise error
+        return io.StringIO(text)
+
+    opener.asked = asked
+    return opener
+
+
+def test_a_robot_with_no_operator_file_keeps_motion_off(motion_switch, config):
+    enabled, source = motion_switch.resolve_motion_switch(
+        config, environ={}, open_file=_file(error=FileNotFoundError()))
+    assert enabled is False and "no operator file" in source and "off" in source
+
+
+def test_only_the_boolean_true_turns_motion_on(motion_switch, config):
+    def decide(text):
+        return motion_switch.resolve_motion_switch(config, environ={}, open_file=_file(text))[0]
+
+    assert decide("commissioning_motion_enabled: true\n") is True
+    for not_true in ("commissioning_motion_enabled: false", 'commissioning_motion_enabled: "true"',
+                     "commissioning_motion_enabled: 1", "commissioning_motion_enabled: yes_please",
+                     "commissioning_motion_enabled: [true]", "commissioning_motion_enabled:",
+                     "commissioning_motion_enabled: 'True'", "commissioning_motion_enabled: on1"):
+        assert decide(not_true) is False, not_true
+
+
+def test_anything_unreadable_or_malformed_leaves_motion_off_and_says_why(motion_switch, config):
+    for text, error, fragment in (
+            ("", None, "no `commissioning_motion_enabled` key"),                 # empty file
+            ("just a sentence", None, "no `commissioning_motion_enabled` key"),   # a scalar, not a mapping
+            ("- true\n- true", None, "no `commissioning_motion_enabled` key"),   # a list
+            ("a: [unclosed", None, "not valid YAML"),
+            (None, PermissionError(), "cannot read"),
+            (None, IsADirectoryError(), "cannot read"),                          # Docker's empty directory
+            ("enabled: true", None, "no `commissioning_motion_enabled` key")):   # the wrong key
+        enabled, source = motion_switch.resolve_motion_switch(
+            config, environ={}, open_file=_file(text, error))
+        assert enabled is False and fragment in source, (text, error, source)
+
+
+def test_an_unreadable_file_is_never_read_as_on_even_if_the_images_own_value_is_on(motion_switch, config):
+    """Only a *missing* file falls back to the image's value. A file that is there but cannot be
+    read (permissions, Docker's empty directory) is a mistake, and a mistake must mean off.
+
+    This needs the image's value to be on to mean anything: with it off, 'fall back' and 'off'
+    give the same answer and the difference cannot be seen.
+    """
+    config["safety"]["commissioning_motion_enabled"] = True
+    missing = motion_switch.resolve_motion_switch(config, environ={}, open_file=_file(error=FileNotFoundError()))
+    assert missing[0] is True, "no operator file at all: the image's own setting applies, as documented"
+    for error in (PermissionError(), IsADirectoryError(), OSError("I/O error")):
+        enabled, source = motion_switch.resolve_motion_switch(config, environ={}, open_file=_file(error=error))
+        assert enabled is False and "motion stays off" in source, error
+
+def test_the_file_can_switch_on_and_off_and_explains_itself(motion_switch, config):
+    on = motion_switch.resolve_motion_switch(
+        config, environ={}, open_file=_file("commissioning_motion_enabled: true"))
+    off = motion_switch.resolve_motion_switch(
+        config, environ={}, open_file=_file("commissioning_motion_enabled: false"))
+    assert on[0] is True and "sets commissioning_motion_enabled: true" in on[1]
+    assert off[0] is False and "sets commissioning_motion_enabled: false" in off[1]
+
+
+def test_the_file_decides_even_against_the_images_own_setting(motion_switch, config):
+    """An operator who writes `false` must not be overridden by something else turning it on."""
+    config["safety"]["commissioning_motion_enabled"] = True
+    enabled, _ = motion_switch.resolve_motion_switch(
+        config, environ={}, open_file=_file("commissioning_motion_enabled: false"))
+    assert enabled is False
+    # ...but a corrupt file is never read as "on", even if the image's own value is on.
+    enabled, _ = motion_switch.resolve_motion_switch(
+        config, environ={}, open_file=_file("a: [unclosed"))
+    assert enabled is False
+
+
+def test_only_the_one_switch_can_come_from_the_file_never_the_caps(motion_switch, config):
+    """The reason it is a separate file: one edit must not be able to raise every limit at once."""
+    before = {k: dict(v) if isinstance(v, dict) else v for k, v in config["plugins"].items()}
+    hostile = ("commissioning_motion_enabled: true\n"
+               "plugins:\n  base_drive: {max_linear_mps: 99}\n  lifting: {max_position: 99}\n"
+               "safety: {max_target_delta_rad: 99}\n")
+    motion_switch.apply_motion_switch(config, environ={}, open_file=_file(hostile))
+    assert config["safety"]["commissioning_motion_enabled"] is True
+    assert config["plugins"] == before, "no cap was touched"
+    assert set(config["safety"]) == {"commissioning_motion_enabled", "motion_switch_source"}
+
+
+def test_the_path_can_be_overridden_for_a_robot_that_keeps_it_elsewhere(motion_switch, config):
+    opener = _file("commissioning_motion_enabled: true")
+    motion_switch.resolve_motion_switch(config, environ={"PANTHER_COMMISSIONING_FILE": "/elsewhere/c.yaml"},
+                                        open_file=opener)
+    assert opener.asked == ["/elsewhere/c.yaml"]
+    opener = _file("commissioning_motion_enabled: true")
+    motion_switch.resolve_motion_switch(config, environ={}, open_file=opener)
+    assert opener.asked == [motion_switch.DEFAULT_PATH]
+
+
+def test_the_shipped_default_is_off_and_the_switch_is_decided_before_anything_uses_it(device, config, monkeypatch):
+    """build_plugins applies the switch first, so Motion and the log line agree on one answer."""
+    import io
+
+    assert config["safety"]["commissioning_motion_enabled"] is False
+    seen = {}
+    monkeypatch.setattr(device, "CoreBridge", lambda *a, **k: NS())
+    monkeypatch.setattr(device, "BridgeSink", lambda bridge: NS())
+    monkeypatch.setattr(device, "PantherNodes", lambda cfg, ros2, hub: seen.setdefault(
+        "config_at_nodes", dict(cfg["safety"])) and NS(motion_io=None, node=NS(count_publishers=lambda t: 0)))
+    monkeypatch.setattr(device, "HostCamera", lambda *a, **k: NS())
+    monkeypatch.setenv("PANTHER_COMMISSIONING_FILE", "/does/not/exist/commissioning.yaml")
+    device.build_plugins(config, "panther", NS())
+    assert seen["config_at_nodes"]["commissioning_motion_enabled"] is False
+    assert "no operator file" in seen["config_at_nodes"]["motion_switch_source"]
+
+
+def test_the_log_line_says_whether_motion_is_enabled_and_why(device, config, monkeypatch, capsys):
+    import tempfile
+
+    monkeypatch.setattr(device, "CoreBridge", lambda *a, **k: NS())
+    monkeypatch.setattr(device, "BridgeSink", lambda bridge: NS())
+    monkeypatch.setattr(device, "PantherNodes", lambda cfg, ros2, hub: NS(
+        motion_io=None, node=NS(count_publishers=lambda t: 0)))
+    monkeypatch.setattr(device, "HostCamera", lambda *a, **k: NS())
+    with tempfile.TemporaryDirectory() as directory:
+        target = Path(directory) / "commissioning.yaml"
+        monkeypatch.setenv("PANTHER_COMMISSIONING_FILE", str(target))
+        device.build_plugins(config, "panther", NS())
+        assert "motion disabled: no operator file" in capsys.readouterr().out
+        target.write_text("commissioning_motion_enabled: true\n", encoding="utf-8")
+        device.build_plugins(config, "panther", NS())
+        assert "motion ENABLED" in capsys.readouterr().out
+
+
+def test_the_operators_switch_reaches_the_motion_gate(device, config, hub, io, motion_module, monkeypatch):
+    """End to end through the real file: written true, a command passes the gate; absent, it is refused."""
+    import tempfile
+
+    open_gate(hub)
+    with tempfile.TemporaryDirectory() as directory:
+        target = Path(directory) / "commissioning.yaml"
+        monkeypatch.setenv("PANTHER_COMMISSIONING_FILE", str(target))
+        args = {"head0_rad": 0.1, "head1_rad": 0.1, "confirm_motion": True}
+
+        refused = importlib.import_module("motion_switch").apply_motion_switch(dict(config))
+        motion = motion_module.Motion(refused, io, hub, spawn=lambda t, n: t(), notify=lambda *a: None)
+        assert motion.dispatch("head", "look", args)["state"] == "error" and io.calls == []
+
+        target.write_text("commissioning_motion_enabled: true\n", encoding="utf-8")
+        allowed = importlib.import_module("motion_switch").apply_motion_switch(dict(config))
+        motion = motion_module.Motion(allowed, io, hub, spawn=lambda t, n: t(), notify=lambda *a: None)
+        assert motion.dispatch("head", "look", args)["state"] == "commanded"
+        assert io.named("head") == [((0.1, 0.1),)]
+
+
+# ── deploy/service.yml and the code must agree on where the switch lives ─────────────────────
+
+def _volumes():
+    service = yaml.safe_load((DRIVER / "deploy" / "service.yml").read_text(encoding="utf-8"))
+    (_, body), = service.items()
+    return body["volumes"]
+
+
+def _split_mount(mount):
+    """`${VAR:-default}:target:mode` -> (default, target, mode). The `:-` inside `${}` is not a separator."""
+    match = re.fullmatch(r"\$\{PANTHER_COMMISSIONING_DIR:-([^}]+)\}:([^:]+):([^:]+)", mount)
+    assert match, f"unexpected shape: {mount!r}"
+    return match.groups()
+
+
+def test_service_yml_mounts_the_operators_directory_read_only_where_the_code_looks(motion_switch):
+    """A path that is off by one character would leave every operator's file unread, silently."""
+    (mount,) = [v for v in _volumes() if "PANTHER_COMMISSIONING_DIR" in v]
+    host_default, target, mode = _split_mount(mount)
+    assert target == str(Path(motion_switch.DEFAULT_PATH).parent).replace("\\", "/")
+    assert mode == "ro", "the driver only reads the switch"
+    assert host_default == target, "host and container paths match, so the documented command works"
+    assert Path(motion_switch.DEFAULT_PATH).name == "commissioning.yaml"
+
+def test_service_yml_mounts_a_directory_not_a_file(motion_switch):
+    """Docker turns a missing bind-mounted *file* into an empty directory; that must not be the design."""
+    (mount,) = [v for v in _volumes() if "PANTHER_COMMISSIONING_DIR" in v]
+    assert not _split_mount(mount)[1].endswith((".yaml", ".yml"))
+
+
+def test_the_image_does_not_contain_a_commissioning_file_that_could_enable_motion():
+    """The default has to be a refusal: nothing shipped may switch motion on."""
+    shipped = [p for p in DRIVER.rglob("commissioning*")]
+    assert shipped == [], shipped
+    dockerfile = (DRIVER / "Dockerfile").read_text(encoding="utf-8")
+    assert "commissioning" not in dockerfile
+
+
+def test_the_dockerfile_copies_the_switch_module_the_device_imports():
+    dockerfile = (DRIVER / "Dockerfile").read_text(encoding="utf-8")
+    copied = re.search(r"COPY (main\.py[^\n]*) /work/unixai/panther/", dockerfile).group(1).split()
+    assert "motion_switch.py" in copied and (DRIVER / "motion_switch.py").is_file()
