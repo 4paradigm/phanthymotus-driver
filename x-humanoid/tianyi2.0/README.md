@@ -17,6 +17,69 @@ to send media through Feishu or Telegram. Use `image_name` (without `.jpg`)
 for photos and `video_name` (without `.mp4`) for videos. To delete media, pass
 Use `delete` with the complete filename in `name`, including `.jpg` or `.mp4`.
 
+## D405 wrist RGB-D cards (two cameras, four sensors)
+
+Tianyi has two USB3 Intel RealSense **D405** cameras, one on each wrist.
+The four sensor cards are **independent** in Agent Core:
+
+| Card | Output topic | Format |
+| --- | --- | --- |
+| `camera_wrist_left_rgb` | `/<namespace>/camera/wrist/left/rgb` | `image/jpeg` |
+| `camera_wrist_left_depth` | `/<namespace>/camera/wrist/left/depth` | `image/depth-zlib` |
+| `camera_wrist_right_rgb` | `/<namespace>/camera/wrist/right/rgb` | `image/jpeg` |
+| `camera_wrist_right_depth` | `/<namespace>/camera/wrist/right/depth` | `image/depth-zlib` |
+
+Each D405 is owned by **one** `pyrealsense2` process; the RGB and depth
+cards for that wrist share its RGB8/Z16 640x480 at 15 FPS pipeline.
+Activating one does not activate the other card's output. Stopping one
+channel preserves the other; stopping both releases the USB device.
+The workers publish directly to domain 42 under the loopback-only
+`/opt/phanthy-motus/dds-local.xml` FastDDS profile; they do not join the
+vendor domain-0 participant or modify head Orbbec services.
+
+### Required left/right binding
+
+The robot's `rs-enumerate-devices` reported two **SDK Serial Number** values:
+`261922273335` and `262122270344`. These are *not* the ASIC serials
+`261043072850` and `261043072635` visible under `/dev/v4l/by-id`.
+The physical side corresponding to each SDK serial has not yet been verified.
+
+**Never guess left/right by USB video index or enumeration order.**
+Confirm the placement from labels, cables, or a safe preview, then set
+`plugins.wrist_cameras.left_serial` and `right_serial` in `config.yaml`.
+Deployment overrides are also supported without rebuilding the image:
+
+```yaml
+environment:
+  - TIANYI_WRIST_LEFT_SERIAL=<verified-left-SDK-serial>
+  - TIANYI_WRIST_RIGHT_SERIAL=<verified-right-SDK-serial>
+```
+
+Blank or duplicate bindings fail closed on start, but do not block other
+robot cards. Starting a wrist card with no SDK installed, a missing device,
+or missing loopback DDS profile reports an error; do not install
+`pyrealsense2` on the host solely for this bundle. The driver image pins
+the CPython 3.10 Linux ARM64 wheel `pyrealsense2==2.56.5.9235`.
+
+### Wire format and timestamp semantics
+
+Both outputs publish `sensor_msgs/msg/CompressedImage` with BEST_EFFORT
+QoS. RGB `format=jpeg` is encoded from SDK RGB8. Depth
+`format="16UC1; compressedDepth zlib"` is headerless zlib over 640x480
+little-endian unsigned millimetres. The worker **reads** the device-reported
+`get_depth_scale()`, clamps unrepresentable values to zero, and never assumes
+the raw Z16 units are millimetres. RGB and depth are **not aligned** by this
+card. Use the actual calibration in each card's `info().camera_info` when
+available; absent SDK intrinsics are explicitly unknown.
+
+`CompressedImage.header.stamp` is the host ROS clock at publication, not
+the SDK hardware timestamp. The latter is included as
+`info().sdk_timestamp_ms` for debugging; no hardware-to-ROS clock
+synchronization guarantee is claimed. These display streams are not a
+substitute for time-synchronized raw RGB-D input in VIO/grasping.
+
+Neither the worker processes nor these four cards initiate robot motion.
+
 ## Raw arm joint card
 
 `arm` directly commands seven joints per selected arm in this canonical order:
