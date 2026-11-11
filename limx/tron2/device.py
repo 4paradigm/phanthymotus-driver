@@ -29,7 +29,7 @@ TOPICS = {name: '/limx_tron2/' + name for name in
 # Existing skeleton topics remain public; all JSON sensors use this map.
 SENSOR_TOPICS = {'joints':'/limx_tron2/state/joints','battery':'/limx_tron2/state/battery',**TOPICS}
 DESCRIPTIONS = {
-    'battery':'TRON2电池状态（只读，1Hz）：soc为剩余电量0～100%；current为厂家原始有符号电流读数，单位、正负约定及固定上下限尚未确认；cycle为非负整数充电循环计数。null表示暂无有效数据，不是0。',
+    'battery':'TRON2电池状态（只读，1Hz）：输出剩余电量soc（0～100%）、电池电流current（mA，保留厂家原始有符号读数）和充电循环次数cycle（非负整数）。字段为null表示暂无有效数据。',
     'joints':'TRON2当前构型骨架：按厂家ACCID自动识别上肢DACH（16关节）或下肢WF/SF（10关节），发布官方关节名及q/dq/tau；使用平台原生sensor/skeleton与独立model模型资源，不伪造IMU姿态。',
     'camera': 'TRON2 头部RGB实时画面；start连接厂家MJPEG并发布JPEG图像，stop释放连接；限10fps，不录像、不控制头部，接收时间不是测量时间（只读）',
     'camera_left': 'TRON2 左腕RGB实时画面；厂家left校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',

@@ -89,13 +89,14 @@ def load_settings():
 
 
 async def identify_configuration(reader):
-    """Wait for actual vendor feedback, then classify once for this process."""
+    """Wait for the first vendor feedback; reader owns later reconnection identity."""
     from state import configuration
     if reader.configuration['state'] != 'pending':
         return
     while reader.info_at is None:
         await asyncio.sleep(.05)
-    reader.configuration = configuration(reader.serial)
+    if reader.configuration.get('state') == 'pending':
+        reader.configuration = configuration(reader.serial)
     logging.getLogger('tron2').info('Startup configuration: %s (%s)',
         reader.configuration['mode'], reader.configuration['state'])
 

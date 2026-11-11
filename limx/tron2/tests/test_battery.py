@@ -44,7 +44,7 @@ def sample(serial,count):
 class NativeContractTests(unittest.IsolatedAsyncioTestCase):
     def test_battery_notes_explain_ranges_and_unknown_units(self):
         text=next(t for t in adapter().tools() if t['name']=='battery')['description']
-        for phrase in ('0～100%','有符号','尚未确认','非负整数','null'):self.assertIn(phrase,text)
+        for phrase in ('0～100%','有符号','mA','非负整数','null'):self.assertIn(phrase,text)
 
 class StateInputTests(unittest.IsolatedAsyncioTestCase):
     def reader(self):

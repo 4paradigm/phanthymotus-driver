@@ -318,3 +318,25 @@ class CardLifecycleTests(unittest.IsolatedAsyncioTestCase):
         a.enabled.remove('loco_leg')
         with self.assertRaises(ValueError):
             await a.execute_tool('loco_leg', {'action': 'stop'})
+
+
+class BuiltinStartupProfileTests(unittest.TestCase):
+    def test_builtin_profile_needs_no_external_file_and_keeps_unit_and_pose_checks(self):
+        from stand import STARTUP_PROFILES, startup_match
+        r, status = robot('UNKNOW')
+        r.serial = 'WF_TRON2A_379'
+        profile = STARTUP_PROFILES[r.serial]
+        status['sw_version'] = profile['sw_version']
+        original_sample = r.sample
+        q = [sum(profile['pose_ranges'][str(i)])/2 if i in profile['pose_indices'] else 0. for i in range(10)]
+        def read(name):
+            sample = original_sample(name)
+            if name == 'joint_state': sample['data']['q'] = list(q)
+            return sample
+        r.sample = read
+        with patch.dict(os.environ, {'TRON2_STARTUP_PROFILE': ''}):
+            self.assertTrue(startup_match(r)['matched'])
+            q[3] = 0.
+            self.assertFalse(startup_match(r)['matched'])
+            r.serial = 'WF_TRON2A_OTHER'
+            self.assertFalse(startup_match(r)['matched'])

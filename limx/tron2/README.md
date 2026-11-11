@@ -24,7 +24,7 @@
 
 传感器通过Motus本机ROS2总线发布JSON：joints声明sensor/skeleton，旧joint_state入口保留兼容。默认每0.5秒查询关节并发布缓存，实际频率受厂家响应影响。robot_status不再作为卡片或ROS2 topic公开，但通知中的连接、固件、模式等仍供内部运动校验；值不变不表示这些信息没有用途。
 
-`battery`直接复用厂家状态通知：soc为0～100%的电量，current为厂家原始有符号电流（单位及正负约定未确认），cycle为非负充电循环数。缺失、断线、过期值不伪装成0。旧joint_state话题仍兼容，默认使用joints；骨架流只含joints数组，模型由独立model资源提供，不伪造IMU姿态。
+`battery`直接复用厂家状态通知：soc为0～100%的电量，current为厂家原始有符号电流（按设备使用方提供的单位标注为mA，正负约定未确认），cycle为非负充电循环数。缺失、断线、过期值不伪装成0。旧joint_state话题仍兼容，默认使用joints；骨架流只含joints数组，模型由独立model资源提供，不伪造IMU姿态。
 
 ## 人物头部视觉跟随
 
@@ -248,7 +248,7 @@ sudo docker exec embodied-limx-tron2 /bin/bash -c 'source /opt/ros/humble/setup.
 - loco_servo_arm：将标准control/joint流接到输入口，motus.control/1、joint_position、18维目标，采用官方tron2_env启用头部的DEFAULT_LAYOUT_WITH_HEAD：索引0～6左臂(rad)、7左夹爪(0～1)、8～14右臂(rad)、15右夹爪(0～1)、16头部pitch(rad)、17头部yaw(rad)。消息包含seq、stamp_ms、obs_stamp_ms、ttl_ms、source、priority、mode、dof、values。时间戳为Unix毫秒。建议30Hz，最大50Hz；Driver从实测姿态插值，目标300Hz发送官方ServoJ。应用速度上限0.5rad/s、加速度1.5rad/s²，不是电机额定极限或硬实时保证。夹爪0表示闭合、1表示全开，按官方实现乘100并取整，独立发送request_set_limx_2fclaw_cmd（双侧速度100、夹持力50，无量纲）；ServoJ仍只发送16个关节角。夹爪输入应用步长与速度上限2归一化开口/秒；目标仅在变化时发送，最多跟随声明的expected_hz频率，等待ACK不阻塞关节输出；ACK不代表到位。原单侧gripper卡片的0～94开口限制保持原样，本流式接口按官方0～100协议执行。
 - 伺服生命周期start及已启动时info返回state=ready，stop返回state=idle；暂停状态由paused布尔字段表示，内部运行标志保持独立。公开config动作接收dry_run布尔参数，与configSchema一致；切换后暂停，需显式resume。伺服start仅订阅；pause清空目标并暂停，resume接受新目标，stop释放订阅。dry_run=true只校验、不发电机指令；切换空跑设置后需resume。200ms断流、目标过期停止后续输出。ServoJ无成功ACK，提交数不表示到位。双臂/头部/夹爪显式动作优先并暂停整路流，不自动回零。没有增加确认弹窗或持久保护文件。
 
-通用下肢入口使用厂家SIT/DAMPING/STAND/WALK状态。现场固件若把已确认的折叠状态报告为UNKNOW，可通过TRON2_STARTUP_PROFILE指定本地标定文件；未配置时拒绝猜测。文件包含accid、mode、sw_version、working_mode、status、folded_statuses、stationary_dq_limit_rad_s、pose_indices、pose_ranges、name；仅用于匹配，不作为关节目标。真机序列号与观察数据不随驱动分发。
+通用下肢入口使用厂家SIT/DAMPING/STAND/WALK状态。stand.py内置此前由使用者确认的WF_TRON2A_379准备姿态范围，仅匹配对应序列号、固件、开发模式及静止关节反馈。该标定仅用于识别UNKNOW折叠准备姿态，不作为运动目标，不表示厂家已上报READY；轮子累计角不参与匹配。其他设备不会套用本机标定。
 
 接口依据：[官方SDK指南](https://www.limxdynamics.com/zh/documents/847884267345285120) §3.6.4、§3.8；模型来源见resource/SOURCE.md。Core与Perception无需修改，无新增运行依赖。
 
@@ -265,3 +265,8 @@ PYTHONPATH=.:limx/tron2:limx/tron2/tests python3 -m unittest test_battery test_j
 下肢生命周期stop会取消并等待起立、坐下和行走任务；行走沿原有路径尝试零速度收尾。停止期间拒绝新下肢动作，退出时先完成同一收尾再断连接。任务结束不等同物理停稳，已提交厂家动作无法撤销，未确认结果保留为unconfirmed，不自动重发。
 
 18维输入布局依据：[官方layout.py](https://github.com/limxdynamics/tron2_env/blob/main/src/tron2_env/layout.py)、[官方夹爪归一化适配](https://github.com/limxdynamics/tron2_env/blob/main/src/tron2_env/end_effector/gripper.py)、[官方WebSocket默认参数](https://github.com/limxdynamics/tron2_env/blob/main/src/tron2_env/transport/websocket.py)。本卡片声明的gripper_l/gripper_r分组与其他Motus混合关节卡片一致。旧16维上游须更新dof、values与布局，不能简单在尾部追加夹爪值；不猜测18维数据的排列。暂停、断流、过期或关闭会清空关节与夹爪目标并等待两个输出任务退出；已受理的夹爪运动不能通过停止发包撤销。
+
+自动识别的ACCID按机器人连接保存：断线时清除自动学习的身份与构型，重连后依据新notify_robot_info重新识别，避免机器人重启换装后Driver仍拒收WF状态。显式配置的serial锁保持不变，同一连接中不接受身份变化；不重放断线前动作。
+
+
+准备姿态默认从stand.py内置标定读取，无需在Orin上另外放置startup_profile.json或设置环境变量。显式TRON2_STARTUP_PROFILE仍可覆盖内置值以兼容既有部署。

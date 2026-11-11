@@ -9,13 +9,34 @@ from pathlib import Path
 from vendor import MoveError
 
 
+# Operator-confirmed folded preparation envelope for this unit/firmware.
+# Matching only: never use these bounds as motion targets; wheel angles excluded.
+STARTUP_PROFILES = {'WF_TRON2A_379': {'name': 'operator_observed_startup_prepare',
+                   'accid': 'WF_TRON2A_379',
+                   'mode': 'wheel_foot',
+                   'sw_version': 'robot-tron2-r-2.4.6.20260901211405',
+                   'status': 'UNKNOW',
+                   'working_mode': 'developer_mode',
+                   'folded_statuses': ['UNKNOW', 'SIT', 'DAMPING'],
+                   'stationary_dq_limit_rad_s': 0.1,
+                   'pose_indices': [0, 1, 2, 3, 5, 6, 7, 8],
+                   'pose_ranges': {'0': [0.8303999185562134, 2.8027998924255373],
+                                   '1': [-0.4602999210357666, 0.18639988899230958],
+                                   '2': [-0.21049959659576417, 0.4176002264022827],
+                                   '3': [-2.8215851306915285, -2.4212852001190184],
+                                   '5': [0.83868567943573, 2.8041851043701174],
+                                   '6': [-0.16579992771148683, 0.46100027561187745],
+                                   '7': [-0.3756851673126221, 0.17731471061706544],
+                                   '8': [-2.8210854053497316, -2.4201851367950438]}}}
+
+
 def startup_match(reader):
     """Match the operator-recorded folded pose; never rename vendor UNKNOW to READY."""
     try:
         path = os.environ.get('TRON2_STARTUP_PROFILE')
-        if not path:
+        profile = json.loads(Path(path).read_text()) if path else STARTUP_PROFILES.get(reader.serial)
+        if profile is None:
             return {'matched': False, 'reason': 'profile_not_configured'}
-        profile = json.loads(Path(path).read_text())
         status, joints = reader.sample('robot_status'), reader.sample('joint_state')
         data, feedback = status.get('data') or {}, joints.get('data') or {}
         if not status.get('available') or not joints.get('available'):

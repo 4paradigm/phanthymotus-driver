@@ -90,7 +90,7 @@ class StateInputTests(unittest.IsolatedAsyncioTestCase):
             'working_mode': 'developer_mode', 'working_mode_valid': True,
             'collision_enable': True, 'collision_enable_valid': True,
             'compliant_enable': False, 'compliant_enable_valid': True, **updates}}
-    async def test_identification_waits_for_feedback_and_is_fixed_for_process(self):
+    async def test_identification_waits_for_feedback_and_is_fixed_for_connection(self):
         from main import identify_configuration
         r = self.reader()
         task = asyncio.create_task(identify_configuration(r))
@@ -99,10 +99,11 @@ class StateInputTests(unittest.IsolatedAsyncioTestCase):
         r.accept_info(self.status('WF_TRON2A_TEST'))
         await asyncio.wait_for(task, .2)
         self.assertEqual(r.configuration['mode'], 'wheel_foot')
-        original = dict(r.configuration)
         r.disconnect('test')
+        self.assertEqual(r.configuration['state'], 'pending')
+        r.accept_info(self.status('DACH_TRON2A_TEST'))
         await identify_configuration(r)
-        self.assertEqual(r.configuration, original)
+        self.assertEqual(r.configuration['mode'], 'upper_limb')
         self.assertEqual(configuration('UNKNOWN_TRON2A_TEST')['mode'], 'unknown')
         self.assertFalse(configuration('SF_TRON2A_TEST')['field_verified'])
     def test_new_joint_name_keeps_follow_compatible_and_battery_optional(self):
@@ -124,3 +125,32 @@ class StateInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(health['ready'])
         self.assertFalse(health['samples']['battery']['available'])
         self.assertEqual(pose(health)['q'], q)
+
+
+class ReconnectionIdentityTests(unittest.TestCase):
+    def test_auto_identity_relearns_after_disconnect_and_battery_is_preserved(self):
+        from vendor import RobotReader
+        r = RobotReader({'serial': '', 'stale_after_seconds': 5})
+        def notify(accid):
+            return {'accid': accid, 'title': 'notify_robot_info', 'data': {
+                'battery': '94', 'bms_current': '-1740', 'bms_current_valid': True,
+                'bms_charging_cycle': '32', 'imu': 'OK', 'motor': 'OK'}}
+        r.accept_info(notify('DACH_TRON2A_TEST'))
+        self.assertEqual(r.configuration['mode'], 'upper_limb')
+        with self.assertRaises(ValueError):
+            r.accept_info(notify('WF_TRON2A_TEST'))
+        r.disconnect('robot reboot')
+        self.assertIsNone(r.serial)
+        self.assertEqual(r.configuration['state'], 'pending')
+        r.accept_info(notify('WF_TRON2A_TEST'))
+        self.assertEqual(r.configuration['mode'], 'wheel_foot')
+        self.assertEqual(battery_stream(r.sample('battery_state')), {'soc': 94, 'current': -1740, 'cycle': 32})
+        self.assertEqual(model(r.configuration)['model_id'], 'WF_TRON2A')
+        self.assertEqual(len(joints_stream(sample(r.serial, 10), r.configuration)['joints']), 10)
+
+    def test_explicit_identity_lock_survives_disconnect(self):
+        from vendor import RobotReader
+        r = RobotReader({'serial': 'DACH_TRON2A_TEST', 'stale_after_seconds': 5})
+        r.disconnect('test')
+        with self.assertRaises(ValueError):
+            r.accept_info({'accid': 'WF_TRON2A_TEST', 'data': {}})

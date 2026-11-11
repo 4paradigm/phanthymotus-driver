@@ -189,6 +189,12 @@ class RobotReader:
         self.info_received = self.joints_received = None
         self.last_round_trip = None
         self.last_error = reason
+        if not self.settings['serial']:
+            # Auto-discovered identity belongs to this connection, not Docker's
+            # lifetime. A robot reboot may change DACH to WF while Driver stays up.
+            self.serial = None
+            self.configuration = {'state': 'pending', 'mode': 'unknown',
+                                  'fixed_for_process': False, 'enforces_card_restrictions': False}
 
     def accept_info(self, body):
         data = body.get('data')
@@ -202,6 +208,11 @@ class RobotReader:
         # Validate only published fields; do not expose unrelated vendor payloads.
         select_fields(data, STATUS_FIELDS)
         self.serial = serial
+        if self.configuration.get('state') == 'pending':
+            from state import configuration
+            self.configuration = configuration(serial)
+            self.configuration['fixed_for_process'] = False
+            self.configuration['fixed_for_connection'] = True
         self.info, self.info_at, self.info_received = data, time.monotonic(), time.time()
         self.connected, self.last_error = True, None
 
