@@ -16,11 +16,17 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         alsa-utils \
         libasound2-dev \
         sshpass \
-        openssh-client && \
+        openssh-client \\
+        libusb-1.0-0 && \\
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml numpy opencv-python-headless phonemizer pyalsaaudio sounddevice
+
+# Official RealSense Linux ARM64 / CPython 3.10 wheel. Do not build the
+# native SDK from source in this image; camera SDK runs in isolated workers.
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --only-binary=:all: \\
+    pyrealsense2==2.56.5.9235
 
 # Build tianyi ROS2 message packages (bodyctrl_msgs + lyre_msgs)
 COPY msgs/ /tianyi_ws/src/
@@ -39,7 +45,7 @@ ENV LD_LIBRARY_PATH=/tianyi_ws/install/bodyctrl_msgs/lib:/tianyi_ws/install/lyre
 
 COPY resource/ /work/resource/
 COPY common/ /work/common/
-COPY main.py device.py servo.py joints_bridge.py light.py nav_client.py ext_devices.py audio_sender.py config.yaml driver.yaml controlled_spatial.py controlled_spatial_map.py socket_bridge.py bridge_integration.py bridged_publisher.py /work/
+COPY main.py device.py wrist_cameras.py servo.py joints_bridge.py light.py nav_client.py ext_devices.py audio_sender.py config.yaml driver.yaml controlled_spatial.py controlled_spatial_map.py socket_bridge.py bridge_integration.py bridged_publisher.py /work/
 COPY dds-local.xml /opt/phanthy-motus/
 COPY deploy/     /deploy/
 RUN mkdir -p /opt/phanthy-motus/data/maps
