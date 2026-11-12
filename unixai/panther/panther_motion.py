@@ -319,6 +319,10 @@ class Motion:
             return handler(payload)
         except (ValueError, RuntimeError, TimeoutError) as exc:
             return {"state": "error", "message": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            # Anything else is a defect here rather than a refusal; it is still returned as an
+            # error result, named, instead of escaping into the bundle.
+            return {"state": "error", "message": f"{type(exc).__name__}: {safe_text(exc, 200)}"}
 
     def start(self, card: str) -> dict:
         """The lifecycle marker: the card is up and answering. It says nothing about whether a
@@ -355,19 +359,36 @@ class Motion:
                 result["cmd_topics_error"] = f"{type(exc).__name__}: {exc}"
         return result
 
-    def stop_all(self) -> None:
+    def stop_all(self) -> bool:
+        """Container shutdown. False if an arm move may still be cancelling or restoring.
+
+        The caller destroys the ROS node right after this, and the arm worker needs that node to
+        cancel its goals and switch the controllers back. A card `stop` waits 10 s, but cancelling
+        while a controller switch is in progress, then restoring, can take longer, so here the
+        wait is `arm_control.shutdown_wait_s` (inside deploy/service.yml's `stop_grace_period`).
+        If even that runs out, it says so plainly: the arm's controllers may be left switched."""
+        clean = True
+        wait_s = float((self._plugins.get("arm_control") or {}).get("shutdown_wait_s", 20.0))
         for card in ("base_drive", "arm_control", "head"):
             try:
-                self.stop(card)
+                result = self.stop(card, wait_s=wait_s)
             except Exception as exc:  # noqa: BLE001
+                clean = False
                 print(f"[panther] stopping {card} failed: {type(exc).__name__}: {exc}", flush=True)
+                continue
+            if card == "arm_control" and result.get("state") == "stopping":
+                clean = False
+                print(f"[panther] WARNING: the arm move had not finished cancelling and restoring its "
+                      f"controllers {wait_s:g}s into shutdown; the ROS node is being closed anyway. "
+                      "Check `ros2 control list_controllers` before the next move.", flush=True)
+        return clean
 
-    def stop(self, card: str) -> dict:
+    def stop(self, card: str, wait_s: float = 10.0) -> dict:
         self._stopped.add(card)
         if card == "base_drive":
             return self._stop_drive()
         if card == "arm_control":
-            return self._stop_arm()
+            return self._stop_arm(wait_s)
         if card == "head":
             with self._head_lock:
                 self._head_generation += 1                   # a home in progress stops where it is
@@ -643,7 +664,7 @@ class Motion:
             self._arm_done.set()
         self._notify(action_id, status, result, "arm_control")
 
-    def _stop_arm(self) -> dict:
+    def _stop_arm(self, wait_s: float = 10.0) -> dict:
         # Under the same lock `arm()` takes to mark a move as running, so a stop and a start are
         # never interleaved half way: either the move is already marked (and the flag set here is
         # the one its worker will see) or nothing is running and there is nothing to cancel.
@@ -660,7 +681,7 @@ class Motion:
             # here would just sit out the timeout and then report "stopping" about a robot that
             # is not moving.)
             return {"state": "idle", "stopped_by": "stop", "note": "cancelled before it began"}
-        finished = self._arm_done.wait(timeout=10.0)
+        finished = self._arm_done.wait(timeout=wait_s)
         return {"state": "idle" if finished else "stopping", "stopped_by": "stop"}
 
     # ── gripper, lifting, head: one position command each ────────────────────

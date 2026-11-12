@@ -33,11 +33,14 @@ times, so a camera that is simply broken is not restarted forever.
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 import threading
 import time
 
 KINDS = ("color", "depth")
+_SAFE_PATH = re.compile(r"/[A-Za-z0-9._/-]+")
+_SAFE_USER = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 
 _ADVICE = ("this container could not enter the host's namespaces. It needs `pid: host` and "
            "`cap_add: [SYS_ADMIN]` in deploy/service.yml, and the host's seccomp/AppArmor profile "
@@ -179,9 +182,26 @@ class HostCamera:
             raise NsenterDenied(refused)
         return result
 
-    def _launch_script(self) -> str:
-        workspace = self._cfg.get("workspace", "/home/unix_ai/orbbec_ws")
-        profile = self._cfg.get("cyclonedds_profile", "/home/unix_ai/config/cyclonedds.xml")
+    def _host_settings(self) -> tuple:
+        """`(user, workspace, profile)` from config, checked before anything runs on the host.
+
+        They end up in a `bash -lc` script and in `systemd-run` arguments executed as the host's
+        user through nsenter, and the config file can be swapped (CONFIG_PATH), so shell or option
+        syntax in them would run on the host. Only plain absolute paths and a plain user name are
+        accepted; anything else is refused with the key named, and the values are quoted anyway."""
+        user = str(self._cfg.get("user", "unix_ai"))
+        workspace = str(self._cfg.get("workspace", "/home/unix_ai/orbbec_ws"))
+        profile = str(self._cfg.get("cyclonedds_profile", "/home/unix_ai/config/cyclonedds.xml"))
+        if not _SAFE_USER.fullmatch(user):
+            raise ValueError(f"camera.host.user must be a plain user name, not {user!r}")
+        for key, value in (("workspace", workspace), ("cyclonedds_profile", profile)):
+            if not _SAFE_PATH.fullmatch(value) or ".." in value.split("/"):
+                raise ValueError(f"camera.host.{key} must be a plain absolute path "
+                                 f"(letters, digits, '._-/'), not {value!r}")
+        return user, workspace, profile
+
+    def _launch_script(self, workspace: str, profile: str) -> str:
+        workspace, profile = shlex.quote(workspace), shlex.quote(profile)
         # The camera node must sit on the same loopback-only Cyclone graph as the robot's own
         # nodes, or this driver (and the robot) would not see its topics.
         return (f"cd {workspace} && . install/setup.bash && "
@@ -194,6 +214,7 @@ class HostCamera:
         # launch would fight it for the USB device, so this card just waits on that stream.
         if any(self._publishers(topic) for topic in self._topics.values()):
             return
+        user, workspace, profile = self._host_settings()
         active = self._host(["systemctl", "is-active", self.UNIT], timeout=5.0, check=False)
         if active.stdout.strip() == "active":
             # It already runs. This process did not create it -- it may be left over from a killed
@@ -211,9 +232,9 @@ class HostCamera:
                         "--property=Restart=on-failure", "--property=RestartSec=2s",
                         # If the camera process ignores SIGTERM, systemd's default is to wait 90 s.
                         "--property=TimeoutStopSec=15s",
-                        f"--uid={self._cfg.get('user', 'unix_ai')}",
-                        f"--setenv=HOME=/home/{self._cfg.get('user', 'unix_ai')}",
-                        "/bin/bash", "-lc", self._launch_script()], timeout=15.0)
+                        f"--uid={user}",
+                        f"--setenv=HOME=/home/{user}",
+                        "/bin/bash", "-lc", self._launch_script(workspace, profile)], timeout=15.0)
         with self._lock:
             self._managed = True
 

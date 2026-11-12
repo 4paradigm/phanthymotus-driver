@@ -199,8 +199,11 @@ duration). Afterwards it applies the exact inverse, so every controller ends as 
 trajectory controller someone else already had active stays active, and the other arm's trajectory
 controller is never touched. If nothing needs changing no switch request is sent. If putting it
 back fails, the completion status is `error`, it says `controllers_restored: false`, and the log
-says to check `ros2 control list_controllers`. A SIGTERM mid-move cancels and restores first
-(`stop_grace_period: 30s`).
+says to check `ros2 control list_controllers`. A SIGTERM mid-move cancels and restores first: the
+container stop waits up to `arm_control.shutdown_wait_s` (20 s, longer than a card `stop`'s 10 s,
+inside `stop_grace_period: 30s`) for the worker to finish before the ROS node it needs is closed.
+If that runs out, the log says the controllers may be left switched and to check
+`ros2 control list_controllers` before the next move.
 
 `start` on a motion card always answers `state: "ready"` (the card is up), whatever the robot's
 readiness; that is reported next to it as `ready_for_motion`, `not_ready_reasons` and
@@ -240,7 +243,9 @@ readiness; that is reported next to it as `ready_for_motion`, `not_ready_reasons
   this change. If it fails, the card says so in `camera_runtime.start_error`, quoting nsenter's own
   message and what to check, rather than looking like a unit that does not exist.
   If the camera cannot be started, the card still starts and says why in
-  `camera_runtime.start_error`.
+  `camera_runtime.start_error`. `camera.host.workspace` and `cyclonedds_profile` must be plain
+  absolute paths and `user` a plain user name: they reach a shell on the host as that user, and the
+  config file can be swapped, so any other value is refused before a host command is run.
 - **The camera cards and the lidar top-down view show nothing until the project is running and the
   card has been started** (the canvas's own start, not just the container being up). The first
   test on the robot looked like a broken driver for exactly this reason: `info` said `state: idle`.

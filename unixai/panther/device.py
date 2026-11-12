@@ -1018,6 +1018,9 @@ class PantherPlugin:
 
     def stop(self) -> None:
         # Stop anything moving first, then release the hardware, then the ROS node and bridge.
+        # `stop_all` waits for a running arm move to cancel and restore its controllers, which
+        # needs the node, so the node is closed only after it returns; if the wait ran out it has
+        # already logged that the controllers may be left switched.
         if self._motion is not None:
             self._motion.stop_all()
         if self._camera is not None:

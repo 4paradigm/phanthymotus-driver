@@ -139,6 +139,11 @@ plugins:
     home_speed_rad_s: 0.35
     home_min_duration_s: 2.0
     home_pose: {}
+    # On container stop, how long to wait for a running move to cancel its goals and restore the
+    # controllers before the ROS node it needs is closed. Cancelling during a controller switch
+    # and then restoring can take well over the 10 s a card `stop` waits. Keep it under
+    # deploy/service.yml's stop_grace_period (30 s), leaving time for the camera and the bridge.
+    shutdown_wait_s: 20.0
   gripper:
     enabled: true
   lifting:

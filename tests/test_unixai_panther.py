@@ -2225,6 +2225,36 @@ def test_a_camera_that_cannot_be_started_is_reported_not_raised(host_camera, con
     assert "camera source could not be started" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("key, value", [
+    ("workspace", "/home/unix_ai/ws; touch /tmp/pwned"),
+    ("workspace", "/home/unix_ai/$(id)"),
+    ("workspace", "relative/ws"),
+    ("workspace", "/home/unix_ai/../../root"),
+    ("cyclonedds_profile", "/home/unix_ai/c.xml`id`"),
+    ("cyclonedds_profile", "/home/unix_ai/c x.xml"),
+    ("user", "unix_ai --property=ExecStartPre=/bin/sh"),
+    ("user", "root;id"),
+])
+def test_host_settings_that_could_inject_into_the_host_command_are_refused(host_camera, config, clock, key, value):
+    """These go into `bash -lc` and `systemd-run` run as the host user through nsenter, and
+    CONFIG_PATH can point at another config file: nothing is run on the host for such a value."""
+    settings = {**config["camera"]["host"], key: value}
+    run = FakeRun(host_camera)
+    camera = host_camera.HostCamera(settings, TOPICS, lambda topic: 0, lambda kind: None, run=run,
+                                    sleep=clock.advance, monotonic=lambda: clock.mono, watchdog=False)
+    info = camera.start("color")
+    assert run.calls == [], "refused before any host command"
+    assert f"camera.host.{key}" in info["start_error"] and info["host_service_managed"] is False
+
+
+def test_the_default_host_settings_are_accepted_and_quoted(host_camera, config, clock):
+    run = FakeRun(host_camera)
+    _camera(host_camera, config, clock, run).start("color")
+    create = run.tails()[-1]
+    assert create[0] == "systemd-run" and "--uid=unix_ai" in create and "--setenv=HOME=/home/unix_ai" in create
+    assert create[-1].startswith("cd /home/unix_ai/orbbec_ws && ")
+
+
 def test_stopping_a_card_never_stops_the_shared_host_service(host_camera, config, clock):
     run = FakeRun(host_camera)
     camera = _camera(host_camera, config, clock, run)
@@ -3375,12 +3405,52 @@ def test_head_look_with_one_box_keeps_the_other_joint(motion, hub, io):
 
 
 def test_stop_all_stops_the_drive_the_arm_and_a_head_home(motion, hub, io, capsys):
-    motion.stop_all()
+    assert motion.stop_all() is True
     assert io.named("twist") == [(0.0, 0.0, 0.0)] * 5
     io.fail_on = {"twist"}
-    motion.stop_all()
+    assert motion.stop_all() is False, "a failed stop is reported, not hidden"
     assert "stopping base_drive failed" in capsys.readouterr().out
     assert motion._head_generation == 2, "the head was told to stop both times"
+
+
+class _ArmDone:
+    """Stands in for the arm worker's done event, recording how long shutdown waited for it."""
+
+    def __init__(self, finishes):
+        self.finishes, self.waited = finishes, []
+
+    def wait(self, timeout):
+        self.waited.append(timeout)
+        return self.finishes
+
+
+def _running_arm(motion, finishes):
+    motion._arm_running, motion._arm_began = True, True
+    motion._arm_done = _ArmDone(finishes)
+    return motion._arm_done
+
+
+def test_shutdown_waits_longer_than_a_card_stop_for_the_arm_to_cancel_and_restore(motion, capsys):
+    """The node the worker needs to cancel and restore is closed right after stop_all returns,
+    so it waits the configured shutdown time (not a card stop's 10 s) and says if that ran out."""
+    done = _running_arm(motion, finishes=True)
+    assert motion.stop_all() is True and done.waited == [20.0]
+    done = _running_arm(motion, finishes=False)
+    assert motion.stop_all() is False and done.waited == [20.0]
+    out = capsys.readouterr().out
+    assert "had not finished cancelling and restoring" in out and "list_controllers" in out
+
+
+def test_a_card_stop_still_waits_ten_seconds(motion):
+    done = _running_arm(motion, finishes=True)
+    assert motion.dispatch("arm_control", "stop", {})["state"] == "idle" and done.waited == [10.0]
+
+
+def test_an_unexpected_handler_exception_is_returned_as_an_error_not_raised(motion, hub, io):
+    open_gate(hub)
+    io.list_controllers = lambda: (_ for _ in ()).throw(KeyError("controller"))
+    result = motion.dispatch("lifting", None, {"position": 0.6})
+    assert result["state"] == "error" and result["message"].startswith("KeyError")
 
 
 # ── gripper ─────────────────────────────────────────────────────────────────────────────────────
