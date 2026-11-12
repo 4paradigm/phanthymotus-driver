@@ -110,8 +110,8 @@ Saving a valid instance configuration starts its preview without **Start
 Intelligent Control**. Instance bindings and requested preview states are saved
 atomically under `/opt/phanthy-motus/data/wrist-camera.json` (the mounted data
 directory), so an active preview can be restored after a driver restart.
-Identical configuration replays neither restart capture nor rearm an instance
-that was intentionally stopped. `start(instance_id)` explicitly resumes it.
+Saving or replaying the same configuration keeps healthy capture running and
+resumes a stopped preview without **Start Intelligent Control**.
 Removing a card or stopping its project sends `stop(instance_id)` and disables
 its preview. Driver shutdown closes all capture resources while retaining the
 saved requested state. Do not run two Tianyi driver services against one state

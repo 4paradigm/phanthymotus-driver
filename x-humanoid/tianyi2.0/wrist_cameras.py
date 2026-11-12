@@ -586,17 +586,15 @@ class WristCameraPlugin:
                     device_id = (old.get('device_id', 'auto')
                                  if selection == 'auto' and old.get('selection') == 'auto' else selection)
                     cfg = {'side': values['side'], 'device_id': device_id, 'selection': selection,
-                           'fps': str(values.get('fps', 'auto')), 'resolution': values.get('resolution', 'auto')}
-                    unchanged = all(old.get(k) == v for k, v in cfg.items())
-                    cfg['enabled'] = old.get('enabled', True) if unchanged else True
+                           'fps': str(values.get('fps', 'auto')), 'resolution': values.get('resolution', 'auto'),
+                           'enabled': True}
                     # Detach only when physical device/settings change. A side
                     # relabel updates routes, keeping acquisition and topics.
                     if old and any(old.get(k) != cfg[k] for k in ('device_id', 'fps', 'resolution')):
                         self._release(instance_id)
                     self._configs[instance_id] = cfg
                     self._save()
-                    if cfg['enabled']:
-                        self._activate(instance_id)
+                    self._activate(instance_id)
                     return self._info(instance_id)
                 if action == 'start':
                     if instance_id not in self._configs:

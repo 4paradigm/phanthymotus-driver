@@ -106,15 +106,16 @@ def test_shared_device_has_one_owner_and_stopping_one_keeps_other(plugin):
     assert session.closed
 
 
-def test_config_replay_does_not_reopen_capture_or_rearm_stopped_card(plugin):
+def test_config_replay_keeps_healthy_capture_and_resumes_stopped_preview(plugin):
     configure(plugin)
     original, = Session.created
     configure(plugin)
     assert Session.created == [original]
     plugin.dispatch('stop', {'instance_id': 'card-a'})
-    assert configure(plugin)['state'] == 'idle'
-    assert Session.created == [original]
-    plugin.dispatch('start', {'instance_id': 'card-a'})
+    assert plugin.dispatch('info', {'instance_id': 'card-a'})['state'] == 'idle'
+    assert configure(plugin)['state'] == 'running'
+    assert plugin.dispatch('info', {'instance_id': 'card-a'})['state'] == 'running'
+    assert json.loads(Path(plugin._state_file).read_text())['card-a']['enabled'] is True
     assert len(Session.created) == 2
 
 
@@ -207,6 +208,21 @@ def test_persistence_restores_bindings_preview_and_intentional_stop(plugin, monk
         restored._refresh()
         assert restored.dispatch('info', {'instance_id': 'card-a'})['state'] == 'running'
         assert restored.dispatch('info', {'instance_id': 'card-b'})['state'] == 'idle'
+    finally:
+        restored.stop()
+
+
+def test_saving_restored_disabled_config_starts_preview_without_start(plugin):
+    configure(plugin)
+    plugin.dispatch('stop', {'instance_id': 'card-a'})
+    plugin.stop()
+    restored = wrist.WristCameraPlugin({'state_file': plugin._state_file}, 'robot')
+    try:
+        restored._refresh()
+        assert restored.dispatch('info', {'instance_id': 'card-a'})['state'] == 'idle'
+        assert configure(restored)['state'] == 'running'
+        assert restored.dispatch('info', {'instance_id': 'card-a'})['state'] == 'running'
+        assert json.loads(Path(restored._state_file).read_text())['card-a']['enabled'] is True
     finally:
         restored.stop()
 
