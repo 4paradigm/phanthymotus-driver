@@ -19,4 +19,3 @@ cards:
   - { name: camera_left, type: sensor }
   - { name: camera_right, type: sensor }
   - { name: hp_printer, type: actuator }
-
