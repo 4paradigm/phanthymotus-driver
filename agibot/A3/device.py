@@ -136,21 +136,6 @@ def _acp_notify(action_id: str, status: str, result: dict, tool: str = ""):
 # Vendor constants (AimDK v3.2 dev guide §7 — values taken verbatim from the docs)
 # ---------------------------------------------------------------------------
 
-# MotionControlActionService/SetAction actions. GetAvailableActions returns the live list;
-# these are the four the docs enumerate explicitly (GET_UP example + the FSM basics).
-MC_ACTIONS = {
-    "damping": ("MotionControlAction_DAMPING", "DAMPING"),
-    "get_up": ("MotionControlAction_GET_UP", "GET_UP"),
-    "lie_down": ("MotionControlAction_LIE_DOWN", "LIE_DOWN"),
-    "passive": ("MotionControlAction_PASSIVE", "PASSIVE"),
-    # GetUp is an asynchronous recovery action on A3.  Once its balance
-    # sequence finishes, firmware exposes MOTION/PD_STAND as separate mode
-    # transitions; without this explicit second step the robot can remain in
-    # GET_UP (or PASSIVE) and correctly reject every actuator command.
-    "motion": ("MotionControlAction_MOTION", "MOTION"),
-    "pd_stand": ("MotionControlAction_PD_STAND", "PD_STAND"),
-}
-
 # motion_play duration ceiling — must stay consistent with the 600 s x-completion
 # timeout declared in MotionPlayPlugin.get_tool.
 MOTION_PLAY_MAX_DURATION_MS = 600_000
@@ -723,7 +708,8 @@ class A3Nodes:
         self._media_received = {}
         self._stream_errors = {}
         self.clock = getattr(self.robot, 'get_clock', lambda: _FakeClock())()
-        self._pb_topic = ''
+        self._wrapper_seq = {}
+        self._wrapper_lock = threading.Lock()
         self._jazzy_relay = os.environ.get("A3_JAZZY_RELAY") == "1"
         if self._jazzy_relay:
             _ensure_relay_defaults()
@@ -1284,21 +1270,24 @@ class A3Nodes:
                     "prebuilt (ros2_plugin_proto_aarch64) to publish wrapper commands")
         return self._wrapper_msg_type
 
-    def _make_wrapper(self, proto_dict: dict, ros2=None):
+    def _make_wrapper(self, topic: str, proto_dict: dict):
         """Serialize a protobuf payload dict into a RosMsgWrapper message.
 
-        With the a3_aimdk wheel installed the payload dict is encoded to real
-        protobuf bytes via the documented per-topic message types; without the
-        wheel the JSON dict is carried directly (sufficient for tests/dev, and
-        the on-robot image ships the wheel so production always takes the pb path).
+        Mirrors what AimRT's ros2 channel backend itself publishes (observed on
+        the robot): ``serialization_type="pb"``, ``context`` as flat key/value
+        pairs (``aimrt-pub_ts``/``aimrt-pub_seq``/``aimrt-serialization_type``)
+        and ``data`` as protobuf bytes.  The Humble binding of ``byte[]`` only
+        accepts a sequence of 1-byte ``bytes`` objects.
         """
-        wrapper = self._wrapper_type(ros2)()
+        payload = self._encode_pb(topic, proto_dict)
+        wrapper = self._wrapper_type(None)()
+        seq = self._wrapper_seq.get(topic, 0) + 1
+        self._wrapper_seq[topic] = seq
         wrapper.serialization_type = "pb"
-        wrapper.data = self._encode_pb(proto_dict)
-        message_type = self._PB_TOPIC_MESSAGES.get(self._pb_topic, "")
-        message_class = (self._pb or {}).get("commands", {}).get(message_type)
-        if message_class is not None and hasattr(wrapper, "context"):
-            wrapper.context = [message_class.DESCRIPTOR.full_name]
+        wrapper.context = ["aimrt-pub_ts", str(time.time_ns()),
+                           "aimrt-pub_seq", str(seq),
+                           "aimrt-serialization_type", "pb"]
+        wrapper.data = [bytes([b]) for b in payload]
         return wrapper
 
     _PB_TOPIC_MESSAGES = {
@@ -1307,24 +1296,16 @@ class A3Nodes:
         "/skill/pilot/face/play/pb_3Aaimdk_2Eprotocol_2EHFAEmoction": "HFAEmoction",
     }
 
-    def _encode_pb(self, proto_dict):
-        if self._pb is None:
-            return json.dumps(proto_dict, ensure_ascii=False).encode()
-        message_type = self._PB_TOPIC_MESSAGES.get(self._pb_topic, "")
-        cls = self._pb.get("commands", {}).get(message_type) if message_type else None
+    def _encode_pb(self, topic, proto_dict):
+        """Encode to real protobuf bytes; never fall back to JSON on the wire
+        (the robot-side subscriber is told ``pb`` and would mis-parse it)."""
+        message_type = self._PB_TOPIC_MESSAGES.get(topic, "")
+        cls = (self._pb or {}).get("commands", {}).get(message_type) if message_type else None
         if cls is None:
-            return json.dumps(proto_dict, ensure_ascii=False).encode()
+            raise RuntimeError(f"no protobuf type for {topic!r} (a3_aimdk wheel missing?)")
         message = cls()
-        try:
-            # LocomotionVelocityChannel is a real channel envelope; its command
-            # fields live under ``data`` in the v3.2 schema.  The public card
-            # keeps the concise velocity arguments, so add the envelope here.
-            if message.DESCRIPTOR.full_name.endswith("MotionControlLocomotionVelocityChannel"):
-                proto_dict = {"data": proto_dict}
-            _fill_protobuf(message, proto_dict)
-            return message.SerializeToString()
-        except Exception:
-            return json.dumps(proto_dict, ensure_ascii=False).encode()
+        _fill_protobuf(message, proto_dict)
+        return message.SerializeToString()
 
     def publish_wrapper(self, pub_attr, payload):
         """Fill + publish a RosMsgWrapper command onto a robot-domain topic."""
@@ -1333,10 +1314,10 @@ class A3Nodes:
             raise RuntimeError(
                 f"{pub_attr} unavailable: ros2_plugin_proto not importable "
                 "(install the AimDK dev-kit prebuilt to publish wrapper commands)")
-        self._pb_topic = getattr(publisher, "topic_name", "") or getattr(publisher, "topic", "")
-        wrapper = self._make_wrapper(payload)
+        topic = getattr(publisher, "topic_name", "") or getattr(publisher, "topic", "")
+        with self._wrapper_lock:
+            wrapper = self._make_wrapper(topic, payload)
         publisher.publish(wrapper)
-        self._pb_topic = ""
 
     def publish_joint_command(self, pub_attr, positions, duration_ms=None, frame_id=""):
         """Publish a JointState command frame, repeating at 100 Hz for duration_ms.
@@ -1725,16 +1706,43 @@ class A3Rpc:
 
     # -- MDU :56322 MotionControlAction/MotionService --------------------------------
 
-    def set_action(self, action: str, ext_action: str) -> dict:
+    def set_action(self, command: dict) -> dict:
+        """SetAction exactly as the vendor mc_action_cli.py does: ``command`` is
+        the entry returned by GetAvailableActions/GetNextActions, sent verbatim.
+        Returns CommonResponse; a ``state`` other than SUCCESS is a rejection."""
         payload = {"header": create_header(),
-                   "command": {"action": action, "ext_action": ext_action}}
-        return self._unit(self.mdu_port, 56322).call("MotionControlActionService", "SetAction", payload)
+                   "command": {k: v for k, v in command.items() if not str(k).startswith("_")}}
+        response = self._unit(self.mdu_port, 56322).call("MotionControlActionService", "SetAction", payload)
+        state = response.get("state")
+        if state is not None and str(state) not in ("1", "CommonState_SUCCESS"):
+            raise RpcError(f"MotionControlActionService/SetAction 拒绝请求: state={state!r} "
+                           f"msg={(response.get('header') or {}).get('msg', '')!r}")
+        return response
 
     def get_action(self) -> dict:
-        return self._unit(self.mdu_port, 56322).call("MotionControlActionService", "GetAction", {})
+        return self._unit(self.mdu_port, 56322).call("MotionControlActionService", "GetAction")
 
-    def get_available_actions(self) -> dict:
-        return self._unit(self.mdu_port, 56322).call("MotionControlActionService", "GetAvailableActions")
+    def get_next_actions(self) -> dict:
+        return self._unit(self.mdu_port, 56322).call("MotionControlActionService", "GetNextActions")
+
+    def get_velocity_limit(self) -> dict:
+        return self._unit(self.mdu_port, 56322).call("MotionControlMotionService", "GetVelocityLimitValue")
+
+    # -- MDU :52893 SkillPilotService (MDU gateway routes SkillPilotService.* here) ---
+
+    def postural_transition(self, kind: str) -> dict:
+        """PosturalTransition, the stand/lie-down entry the remote and App use.
+
+        skillpilot keeps its own posture state (Core Initial = lying, Idle =
+        standing) and only updates it in this flow; it then drives MC itself
+        (GetUp: [PD_STAND →] GET_UP → MOTION, LieDown: LIE_DOWN → PASSIVE).
+        ``kind``: GetUp / LieDown. Request per the descriptor embedded in
+        libaimdk_protocol_skill_pilot_service_type_support.so: field 1 ``header``
+        is a ResponseHeader (left empty), the request header goes in
+        ``req_header``. Returns SkillCommandResponse; rejection = header.code≠0.
+        """
+        payload = {"type": f"PosturalTransitionType_{kind}", "req_header": create_header()}
+        return self._unit(self.mdu_port, 52893).call("SkillPilotService", "PosturalTransition", payload)
 
     def arm_compliance(self, method: str) -> dict:
         # EnableArmCompliance / DisableArmCompliance / CheckArmCompliance all take {}
@@ -2267,167 +2275,166 @@ class ModelPlugin:
         return {"urdf": self.nodes.urdf_text()}
 
 
-# mc_mode fixed FSM (dev guide §7.1.2 + GetUp example flow). Current state → the
-# SetAction commands allowed from it. The live source of truth is still
-# GetAvailableActions (cross-checked at dispatch time); this map is the fixed
-# doc-level skeleton that lets the driver reject impossible transitions with a
-# suggestion instead of a failed RPC.
-#   DAMPING / PASSIVE / LIE_DOWN / (unknown resting states) → only GET_UP
-#   MOTION (standing after get_up) → DAMPING / LIE_DOWN / PASSIVE
-MC_STATE_TRANSITIONS = {
-    "MOTION": ("damping", "lie_down", "passive", "get_up"),
-    "DAMPING": ("get_up",),
-    "PASSIVE": ("get_up",),
-    "LIE_DOWN": ("get_up",),
-    "GET_UP": ("motion", "pd_stand"),
-    "PD_STAND": ("motion",),
-    # IDLE/UNKNOWN and any unmapped state: mc_mode still consults the runtime list;
-    # actuator cards use _motion_gate below and fail closed when state is unknown.
-}
-MC_TRANSITION_SUGGESTIONS = {
-    "damping": "damping 用于关节卸力/跌倒保护，切换前确保机器人周围有足够空间；如当前未站立请先 get_up",
-    "lie_down": "lie_down 仅可从 MOTION 站立状态进入；如需起身请先 get_up",
-    "passive": "passive 拖动示教仅可从 MOTION 站立状态进入；退出示教请执行 get_up",
-}
+# ---------------------------------------------------------------------------
+# Motion-control state (MDU :56322 MotionControlActionService)
+# ---------------------------------------------------------------------------
+# The firmware's GetNextActions is the only source of truth for which posture
+# switch is allowed right now — the vendor mc_action_cli.py enables an entry
+# only when it is listed there and sends that entry verbatim to SetAction.  The
+# driver therefore keeps no transition table of its own.
+
+_MC_ACTION_PREFIX = "MotionControlAction_"
+_MC_STATUS_PREFIX = "MotionControlActionStatus_"
+# Postures the firmware holds once entered: status RUNNING is their steady state.
+# GET_UP / LIE_DOWN are one-shot sequences reporting stages *_POSCTRL_ING →
+# *_FORCECTRL_ING → *_FINISHED (or GET_UP_INITIAL_RESET_FAILED); names taken
+# from the MDU motion_control binary, GET_UP_FINISHED also observed live.
+_MC_STEADY = {"MOTION", "PD_STAND", "DAMPING", "PASSIVE"}
+# Firmware action graph (action_manager/default.yaml, no indirect transitions):
+# lying postures only lead to PASSIVE (zero torque), and PASSIVE → PD_STAND → GET_UP.
+_MC_LYING = {"LIE_DOWN", "PACKAGE_LIE_DOWN"}
 
 
-def _mc_allowed_actions(state: str):
-    state = (state or "").strip().upper()
-    if not state or state == "UNKNOWN":
-        return tuple(MC_ACTIONS)
-    # MOTION also accepts GET_UP as a no-op re-stand; resting states reject it too
-    if state == "MOTION":
-        return MC_STATE_TRANSITIONS["MOTION"]
-    # IDLE and any unmapped state behave like a resting state: only get_up
-    return MC_STATE_TRANSITIONS.get(state, ("get_up",))
+def _mc_down(info: dict) -> bool:
+    """On the ground: lie-down finished, or the zero-torque PASSIVE skillpilot ends it in."""
+    return _mc_settled(info, "PASSIVE") or any(_mc_settled(info, name) for name in _MC_LYING)
 
 
-def _mc_current_state(rpc):
-    """GetAction → normalized current state string ('' when unparseable).
-
-    Shared by McModePlugin and the MOTION-gate on loco/arm commands (5th PR
-    review): the exact response field name is not in the dev guide, so probe
-    action/state/current_action at the top level and under "data", plus
-    command.action. Actuator callers treat an empty result as UNKNOWN and fail
-    closed; mc_mode itself can still query the runtime action list to recover.
-    """
-    response = rpc.get_action()
-    # AimDK 3.2 returns the live state under `info.current_action`; older
-    # firmware used `data.state`/`action`. Search all known envelopes so the
-    # safety gate never treats PASSIVE as an unknown permissive state.
-    containers = [response, response.get("info") or {}, response.get("data") or {}]
-    for container in containers:
-        if isinstance(container, dict):
-            for key in ("action", "state", "current_action"):
-                value = container.get(key)
-                if isinstance(value, str) and value:
-                    return value.upper().replace("MOTIONCONTROLACTION_", "")
-            command = container.get("command")
-            if isinstance(command, dict):
-                value = command.get("action")
-                if isinstance(value, str) and value:
-                    return value.upper().replace("MOTIONCONTROLACTION_", "")
-    return ""
+def _mc_name(value) -> str:
+    return _strip_prefix(str(value or ""), _MC_ACTION_PREFIX).upper()
 
 
-def _mc_suggestion(state: str, requested: str) -> str:
-    state = (state or "").strip().upper() or "UNKNOWN"
-    allowed = _mc_allowed_actions(state)
-    if requested in allowed:
-        return ""
-    if "get_up" in allowed:
-        return f"当前状态 {state} 仅允许 {list(allowed)}；建议先执行 get_up 恢复站立后再切换"
-    return f"当前状态 {state} 仅允许 {list(allowed)}；建议先经 get_up 恢复站立（MOTION）后再进入 {requested}"
+def _mc_info(rpc) -> dict:
+    """GetAction → {action, status, stage} with enum prefixes stripped."""
+    info = rpc.get_action().get("info") or {}
+    stage = info.get("stage")
+    return {"action": _mc_name(info.get("current_action")) or "UNKNOWN",
+            "status": _strip_prefix(str(info.get("status") or ""), _MC_STATUS_PREFIX).upper() or "UNKNOWN",
+            "stage": str(stage.get("description") or "") if isinstance(stage, dict) else ""}
+
+
+def _mc_settled(info: dict, target: str) -> bool:
+    if info["action"] != target or info["status"] == "PREPARE":
+        return False
+    if target in _MC_STEADY:
+        return True
+    # Exact stage match: a stale "LIE_DOWN_FINISHED" must not count for GET_UP.
+    return info["status"] == "DONE" or info["stage"] == f"ActionStage::{target}_FINISHED"
+
+
+def _mc_failed(info: dict) -> bool:
+    """Current action's own stage reports failure (e.g. GET_UP_INITIAL_RESET_FAILED)."""
+    stage = info["stage"]
+    return stage.startswith(f"ActionStage::{info['action']}_") and stage.endswith("_FAILED")
+
+
+def _mc_next(rpc) -> dict:
+    """GetNextActions → {short action name: command entry to send verbatim}."""
+    out = {}
+    for item in rpc.get_next_actions().get("commands") or ():
+        if isinstance(item, dict) and item.get("action"):
+            out[_mc_name(item["action"])] = item
+    return out
+
+
+def _rejected(code: str, reason: str, suggestion: str = "", **extra) -> dict:
+    """Uniform actuator rejection: nothing was sent to the robot."""
+    out = {"state": "rejected", "code": code, "reason": reason}
+    if suggestion:
+        out["suggestion"] = suggestion
+    out.update(extra)
+    return out
+
+
+def _notify_async(action_id, status, result, tool_name):
+    """ACP POST off the caller's thread (it may block up to 5 s)."""
+    threading.Thread(target=_acp_notify, args=(action_id, status, result, tool_name),
+                     daemon=True, name=f"a3_acp_{action_id}").start()
 
 
 def _motion_gate(rpc, card: str):
-    """Return a structured rejection for actuators that require MOTION mode."""
+    """Structured rejection for actuators that only act in MOTION, else None."""
     try:
-        current = _mc_current_state(rpc)
-    except Exception:
-        current = "UNKNOWN"
-    if current != "MOTION":
-        if current in {"GET_UP", "LIE_DOWN", "DAMPING"}:
-            suggestion = (f"{card} 当前处于 {current} 过渡状态；请先执行 mc_mode get_up，"
-                          "再等待 mc_mode get_state 返回 MOTION（机器人站稳）后重试")
-        else:
-            suggestion = (f"{card} 仅在 MOTION 站立状态生效；请先执行 mc_mode get_up，"
-                          "并等待状态变为 MOTION 后重试")
-        return {"state": "rejected", "current": current or "UNKNOWN",
-                "suggestion": suggestion}
+        info = _mc_info(rpc)
+    except Exception as exc:
+        return _rejected("NOT_READY", f"无法读取运动控制状态: {exc}",
+                         "检查 MDU 连接后重试", current="UNKNOWN")
+    if info["action"] != "MOTION" or info["status"] == "PREPARE":
+        return _rejected("NOT_READY",
+                         f"{card} 需要 MOTION 状态，当前 {info['action']}/{info['status']}",
+                         "先调用 mc_mode stand，等待其完成后重试", current=info["action"])
     return None
 
 
-def _mc_runtime_names(commands):
-    """Normalize AimDK GetAvailableActions entries to action-name strings."""
-    names = set()
-    for item in commands or ():
-        values = []
-        if isinstance(item, dict):
-            # Firmware revisions have returned either the fully qualified
-            # action, the short ext_action, or both.
-            values.extend(item.get(key) for key in ("action", "ext_action", "name"))
-        else:
-            values.append(item)
-        for value in values:
-            if isinstance(value, str) and value:
-                normalized = value.upper().strip()
-                if "MOTIONCONTROLACTION_" in normalized:
-                    normalized = normalized.split("MOTIONCONTROLACTION_", 1)[1]
-                names.add(normalized)
-    return names
+class _McAbort(Exception):
+    def __init__(self, code, reason, info=None):
+        super().__init__(reason)
+        self.code, self.reason, self.info = code, reason, info
 
 
 class McModePlugin:
-    """mc_mode 卡片：运动控制状态机查询 + 模式切换（原 mc_state 状态卡并入）。
+    """mc_mode 卡片：整机姿态切换。
 
-    对应 MDU MotionControlActionService：SetAction 切换 GetUp/LieDown/Damping/
-    Passive/MOTION/PD_STAND（异步，返回 PENDING，结果经 get_state 轮询 GetAction 确认）；
-    get_state / available 合并自原 mc_state 卡（GetAction / GetAvailableActions）。
-
-    固定状态机（开发文档 §7.1.2 + GetUp 示例流程）：DAMPING/PASSIVE/LIE_DOWN/
-    IDLE 等非站立态只能 get_up；MOTION（站立）可 damping/lie_down/passive。
-    切换请求先与该固定迁移表核对，再与运行时 GetAvailableActions 交叉校验，
-    不合法迁移直接拒绝并返回建议（不发起 RPC）。
+    - stand / lie_down 只走 MDU skillpilot 的 SkillPilotService/PosturalTransition，
+      与遥控器、App 同一入口。skillpilot 自己记录姿态（Core Initial=躺、Idle=站），
+      只在这条链路里更新；绕过它直接调 MC 会让记录失真，之后遥控器的躺下/接管
+      都会被它以“状态异常”拒绝，所以本卡不直接对 MC 发姿态切换。skillpilot 再按
+      厂商序列驱动 MC：起立 [PD_STAND →] GET_UP → MOTION，躺下 LIE_DOWN → PASSIVE。
+    - 多秒级整机动作，走 ACP，按 GetAction 轮询确认到位后才回报 completed；
+      进行中拒绝新的切换（中途打断起身/躺下会摔），不绑定 interrupt hook；
+      切换前先让 loco 减速停稳。
+    - damping 立即卸力，必须显式 confirm=true（固件急停语义，不经 skillpilot）。
     """
 
+    STAND_TIMEOUT_S = 40.0
+    LIE_DOWN_TIMEOUT_S = 40.0
+    DAMPING_TIMEOUT_S = 5.0
+    COMPLETION_TIMEOUT_S = 60.0
+    POLL_S = 0.25
+    STATE_FAILS = 8          # consecutive GetAction failures (~2 s) before giving up
+    # skillpilot accepted but MC never left the start posture → its skill did not run.
+    START_GRACE_S = 5.0
+    # After MOTION, skillpilot's GetUp skill keeps polling until the robot stops
+    # stepping (is_walking=false, ~4 s in its log) before switching Core to Idle;
+    # other skillpilot requests in that window are rejected, so hold completion.
+    STAND_SETTLE_S = 5.0
+    RESOURCES = ["base", "leg", "arm_l", "arm_r", "hand_l", "hand_r", "waist", "head"]
+
     ACTIONS = {
-        name: ([], desc)
-        for name, desc in (
-            ("get_state", "查询当前运动控制动作状态（GetAction，异步切换结果确认）"),
-            ("available", "查询当前可用动作列表（GetAvailableActions）"),
-            ("damping", "进入 Damping 阻尼模式（关节卸力，用于软急停/跌倒保护）"),
-            ("get_up", "执行 GetUp 起身动作，从坐/躺恢复到站立平衡（MOTION）"),
-            ("lie_down", "执行 LieDown 坐/躺下动作（仅 MOTION 站立态可进入）"),
-            ("passive", "进入 Passive 拖动示教模式（仅 MOTION 站立态可进入）"),
-            ("motion", "GetUp 完成后切入 MOTION 运行态（执行动作卡前必须完成）"),
-            ("pd_stand", "GetUp 完成后进入 PD_STAND 稳定站立态"),
-        )
+        "get_state": ([], "查询当前姿态、切换状态，以及 stand/lie_down/damping 此刻是否可执行"),
+        "stand": ([], "起立到可控站立态 MOTION（经 skillpilot，与遥控器同链路："
+                      "[PD_STAND →] GET_UP → MOTION）；完成后 ACP 回报，已在 MOTION 时直接返回 done"),
+        "lie_down": ([], "从站立态躺下（经 skillpilot：LIE_DOWN → PASSIVE 零力矩），完成后 ACP 回报；"
+                         "已躺下时直接返回 done"),
+        "damping": (["confirm"], "进入阻尼模式（关节立即卸力，机器人会倒下）；必须 confirm=true，"
+                                 "仅用于人工确认的紧急场景"),
     }
 
-    def __init__(self, nodes):
+    def __init__(self, nodes, loco=None):
         self.nodes = nodes
+        self.loco = loco
+        self._lock = threading.Lock()
+        self._active = None      # (action_id, action) of the posture switch in flight
+        self._closed = False
 
     def get_tool(self):
-        # Deliberately NO x-resource (g1 switch_mode precedent): a posture transition
-        # (get_up/lie_down/damping) moves the whole body, and nothing else should run
-        # during one — undeclared means exclusive against everything, which is exactly
-        # right here. Aborting a controlled get_up/lie_down partway is how a robot
-        # falls over.
-        return tool("mc_mode", "actuator", "运动控制状态机查询与模式切换（SetAction：get_up/lie_down/damping/passive；"
-                                          "get_state/available 查询当前动作与可用动作；get_up 完成后还需 motion/PD_STAND 进入可控的 MOTION，"
-                                          "非法迁移返回建议）",
-                    action_schema(self.ACTIONS, {}))
+        schema = action_schema(self.ACTIONS, {
+            "confirm": {"type": "boolean", "default": False,
+                        "description": "damping 专用：必须为 true 才会执行"},
+        })
+        schema["x-resource"] = list(self.RESOURCES)
+        schema["x-completion"] = {"actions": ["stand", "lie_down"],
+                                  "timeout": self.COMPLETION_TIMEOUT_S}
+        return tool("mc_mode", "actuator",
+                    "整机姿态：stand 起立到可控站立态 MOTION（其他运动卡的前提），lie_down 躺下，"
+                    "两者与遥控器同走 skillpilot；damping 紧急卸力（需 confirm）；get_state 查看当前姿态与可执行动作",
+                    schema)
 
     def start(self):
-        pass
+        self._closed = False
 
     def stop(self):
-        pass
-
-    def _current_state(self):
-        """GetAction → normalized current state string ('' when unparseable)."""
-        return _mc_current_state(self.nodes.rpc)
+        self._closed = True
 
     def dispatch(self, action, args):
         if action == "start":
@@ -2435,225 +2442,469 @@ class McModePlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "ready"}
+            return {"state": "busy" if self._active else "ready"}
         if action == "get_state":
-            return jsonable(self.nodes.rpc.get_action())
-        if action == "available":
-            response = self.nodes.rpc.get_available_actions()
-            return {"commands": response.get("commands", [])}
-        if action not in MC_ACTIONS:
+            return self._get_state()
+        if action not in ("stand", "lie_down", "damping"):
             raise ValueError(f"mc_mode: unknown action {action!r}")
-        # 1) fixed doc-level FSM check — reject with a suggestion, no RPC
-        current = self._current_state()
-        normalized = current.upper().replace("MOTIONCONTROLACTION_", "")
-        suggestion = _mc_suggestion(normalized, action)
-        if suggestion:
-            return {"state": "rejected", "current": normalized or "UNKNOWN",
-                    "requested": action, "suggestion": suggestion,
-                    "allowed": list(_mc_allowed_actions(normalized))}
-        # 2) runtime cross-check — GetAvailableActions is the live source of truth
-        service_action, short = MC_ACTIONS[action]
-        runtime = self.nodes.rpc.get_available_actions()
-        commands = runtime.get("commands") or []
-        runtime_names = _mc_runtime_names(commands)
-        if runtime_names and short not in runtime_names:
-            return {"state": "rejected", "current": normalized, "requested": action,
-                    "suggestion": f"运行时可用动作列表不含 {service_action}（当前可用 {commands}）；"
-                                  f"请先满足前置状态（通常为 get_up 站立）",
-                    "available": commands}
-        response = self.nodes.rpc.set_action(service_action, "")
-        return {"requested": short, "current": normalized, "response": response}
+        rpc = self.nodes.rpc
+        with self._lock:
+            if self._active is not None:
+                return _rejected("BUSY", f"姿态切换 {self._active[1]} 进行中",
+                                 "等待其完成后再试", action_id=self._active[0])
+            try:
+                info, nxt = _mc_info(rpc), _mc_next(rpc)
+            except Exception as exc:
+                return _rejected("NOT_READY", f"无法读取运动控制状态: {exc}", "检查 MDU 连接后重试")
+            if info["status"] == "PREPARE":
+                return _rejected("NOT_READY", f"运动控制正在切换（{info['action']}/PREPARE）",
+                                 "稍后重试", current=info["action"])
+            if action == "damping":
+                return self._damping(args, info, nxt)
+            plan = self._plan(action, info, nxt)
+            if "call" not in plan:         # rejected / already done
+                return plan
+            action_id = f"mc_{action}_{uuid4().hex[:8]}"
+            self._active = (action_id, action)
+        if self.loco is not None:
+            self.loco.halt("superseded_by_mc_mode", wait=True)
+        if plan["call"]:
+            rejection = self._request_skillpilot(action, info)
+            if rejection is not None:
+                with self._lock:
+                    self._active = None
+                return rejection
+        threading.Thread(target=self._run, args=(action_id, action, info["action"], plan),
+                         daemon=True, name=f"a3_{action_id}").start()
+        return {"state": "accepted", "action_id": action_id, "from": info["action"]}
+
+    # -- planning ---------------------------------------------------------------
+
+    def _plan(self, action, info, nxt):
+        """Return {"call", "targets", "allowed"} or a reply dict (rejected / already done).
+
+        ``call`` False = skillpilot's skill is already running (started by the
+        remote/App), only track it. ``allowed`` = MC actions its sequence passes.
+        """
+        current = info["action"]
+        allowed = sorted(nxt)
+        if _mc_failed(info):
+            return _rejected("ROBOT_FAILED", f"固件报告 {current} 失败（{info['stage']}）",
+                             "人工检查机器人姿态与周围环境后再操作", current=current, stage=info["stage"])
+        if action == "stand":
+            if _mc_settled(info, "MOTION"):
+                return {"state": "done", "current": "MOTION", "changed": False}
+            if current in _MC_LYING and not _mc_settled(info, current):
+                return _rejected("NOT_READY", f"{current} 尚未完成（{info['stage'] or info['status']}）",
+                                 "等待躺下完成后再 stand", current=current)
+            if current not in ("GET_UP", "PD_STAND", "PASSIVE", "DAMPING") and current not in _MC_LYING:
+                return _rejected("NOT_ALLOWED", f"当前 {current} 下不支持起立（可切换: {allowed}）",
+                                 "确认机器人处于躺下/零力矩/阻尼姿态；AVATAR 等模式请先由厂商 App 退出",
+                                 current=current, next_actions=allowed)
+            return {"call": current != "GET_UP", "targets": ("MOTION",),
+                    "allowed": {current, "PASSIVE", "PD_STAND", "GET_UP", "MOTION"}}
+        # lie_down
+        if _mc_down(info):
+            return {"state": "done", "current": current, "changed": False}
+        if current != "LIE_DOWN" and "LIE_DOWN" not in nxt:
+            return _rejected("NOT_ALLOWED", f"当前 {current} 下固件不允许躺下（可切换: {allowed}）",
+                             "先 mc_mode stand 到 MOTION 再躺下", current=current, next_actions=allowed)
+        return {"call": current != "LIE_DOWN", "targets": ("PASSIVE",),
+                "allowed": {current, "LIE_DOWN", "PASSIVE"}}
+
+    def _request_skillpilot(self, action, info):
+        """Send PosturalTransition; a rejection dict if skillpilot refused, else None."""
+        kind = "GetUp" if action == "stand" else "LieDown"
+        try:
+            self.nodes.rpc.postural_transition(kind)
+        except RpcError as exc:
+            return _rejected("SKILLPILOT_REJECTED", str(exc),
+                             "skillpilot 拒绝了姿态切换（如正在行走、被其他功能占用）；稍后重试，"
+                             "或用遥控器/App 确认同样的操作是否可行", current=info["action"])
+        except Exception as exc:
+            return _rejected("SKILLPILOT_ERROR", f"调用 skillpilot PosturalTransition 失败: {exc}",
+                             "检查 MDU skillpilot（:52893）是否在运行", current=info["action"])
+        return None
+
+    def _damping(self, args, info, nxt):
+        if args.get("confirm") is not True:
+            return _rejected("CONFIRM_REQUIRED", "damping 会让关节立即卸力、机器人倒下",
+                             "确认安全后以 confirm=true 重新调用")
+        if _mc_settled(info, "DAMPING"):
+            return {"state": "done", "current": "DAMPING", "changed": False}
+        command = nxt.get("DAMPING")
+        if command is None:
+            return _rejected("NOT_ALLOWED", f"当前 {info['action']} 下固件不允许 DAMPING",
+                             current=info["action"], next_actions=sorted(nxt))
+        if self.loco is not None:
+            self.loco.halt("superseded_by_damping", wait=False)
+        try:
+            self.nodes.rpc.set_action(command)
+        except RpcError as exc:
+            return _rejected("ROBOT_REJECTED", str(exc), current=info["action"])
+        deadline = time.monotonic() + self.DAMPING_TIMEOUT_S
+        last = info
+        while time.monotonic() < deadline:
+            try:
+                last = _mc_info(self.nodes.rpc)
+            except Exception:
+                pass
+            if _mc_settled(last, "DAMPING"):
+                return {"state": "done", "current": "DAMPING", "changed": True}
+            time.sleep(self.POLL_S)
+        return _rejected("TIMEOUT", "已发送 DAMPING，但未在时限内确认进入", current=last["action"])
+
+    # -- worker -----------------------------------------------------------------
+
+    def _run(self, action_id, action, start_action, plan):
+        timeout = self.STAND_TIMEOUT_S if action == "stand" else self.LIE_DOWN_TIMEOUT_S
+        deadline = time.monotonic() + timeout
+        status, result = "error", {}
+        try:
+            info = self._wait(plan["targets"], plan["allowed"], deadline,
+                              start=start_action if plan["call"] else None)
+            if action == "stand":
+                info = self._hold(info, self.STAND_SETTLE_S)
+            status, result = "completed", {"current": info["action"]}
+        except _McAbort as exc:
+            status = "cancelled" if exc.code == "CANCELLED" else "error"
+            result = {"code": exc.code, "reason": exc.reason,
+                      "current": (exc.info or {}).get("action", "UNKNOWN")}
+        except Exception as exc:
+            result = {"code": "STATE_UNAVAILABLE", "reason": str(exc)}
+        finally:
+            with self._lock:
+                if self._active and self._active[0] == action_id:
+                    self._active = None
+        _acp_notify(action_id, status, result, "mc_mode")
+
+    def _hold(self, info, seconds):
+        """Keep watching for ``seconds`` that the posture stays put."""
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if self._closed:
+                raise _McAbort("CANCELLED", "驱动停止，不再跟踪本次切换", info)
+            time.sleep(self.POLL_S)
+            try:
+                latest = _mc_info(self.nodes.rpc)
+            except Exception:
+                continue
+            if latest["action"] != info["action"]:
+                raise _McAbort("INTERRUPTED", f"到位后状态变为 {latest['action']}", latest)
+        return info
+
+    def _wait(self, targets, allowed, deadline, start=None):
+        """Poll GetAction until a target settles; ``start`` arms the did-it-begin check."""
+        last, fails = None, 0
+        begun_by = time.monotonic() + self.START_GRACE_S if start else None
+        while time.monotonic() < deadline:
+            if self._closed:
+                raise _McAbort("CANCELLED", "驱动停止，不再跟踪本次切换", last)
+            try:
+                info = _mc_info(self.nodes.rpc)
+                fails = 0
+            except Exception as exc:
+                fails += 1
+                if fails >= self.STATE_FAILS:
+                    raise _McAbort("STATE_UNAVAILABLE", f"连续读取 GetAction 失败: {exc}", last)
+                time.sleep(self.POLL_S)
+                continue
+            last = info
+            if any(_mc_settled(info, target) for target in targets):
+                return info
+            if _mc_failed(info):
+                raise _McAbort("ROBOT_FAILED", f"固件报告 {info['action']} 失败（{info['stage']}）", info)
+            if info["stage"].startswith("ActionStage::FALL_PROTECT"):
+                raise _McAbort("INTERRUPTED", f"切换过程中触发跌倒保护（{info['stage']}）", info)
+            if info["action"] not in allowed:
+                raise _McAbort("INTERRUPTED", f"切换过程中状态变为 {info['action']}", info)
+            if begun_by is not None:
+                if info["action"] != start:
+                    begun_by = None
+                elif time.monotonic() > begun_by:
+                    raise _McAbort("NOT_STARTED", f"skillpilot 已受理，但 {self.START_GRACE_S:.0f} 秒内"
+                                                  f"运动控制仍停在 {start}", info)
+            time.sleep(self.POLL_S)
+        raise _McAbort("TIMEOUT", f"等待 {'/'.join(targets)} 到位超时", last)
+
+    def _get_state(self):
+        try:
+            info, nxt = _mc_info(self.nodes.rpc), _mc_next(self.nodes.rpc)
+        except Exception as exc:
+            return _rejected("NOT_READY", f"无法读取运动控制状态: {exc}", "检查 MDU 连接后重试")
+        current = info["action"]
+        switching = info["status"] == "PREPARE" or _mc_failed(info)
+        down = _mc_down(info)
+        stand_ok = (not switching and not _mc_settled(info, "MOTION")
+                    and (down or current in ("PD_STAND", "DAMPING", "GET_UP")))
+        return {"current": current, "status": info["status"], "stage": info["stage"],
+                "ready_for_motion": _mc_settled(info, "MOTION"),
+                "lying": down,
+                "busy": self._active[1] if self._active else None,
+                "can": {"stand": stand_ok,
+                        "lie_down": not switching and not down and "LIE_DOWN" in nxt,
+                        "damping": not switching and "DAMPING" in nxt},
+                "next_actions": sorted(nxt)}
 
 
 class LocoPlugin:
-    """loco 卡片：腿式底盘行走控制（命名对齐 noetix/bumi 的腿式 `loco`，与
-    tianyi2.0/q5_bundle 轮式的 chassis_raw/base_drive 区分 —— A3 是双足人形）。
+    """loco 卡片：双足行走速度控制。
 
-    对应 /motion/control/locomotion_velocity 话题（RosMsgWrapper + LocomotionVelocity
-    消息）。forward/lateral 为归一化比例（对应最大 1.0 m/s），angular 对外用角度制
-    deg/s（底层归一化，1.0 = 1 rad/s = 57.3 deg/s）。注意事项（开发文档 §7.3）：
-      - 仅当运动控制处于 MOTION 状态时指令才生效；
-      - 指令需以一定频率持续下发，停止行走时下发全零速度；
-      - 大幅速度变化请分步过渡，避免急停/急转引起姿态失稳。
+    链路与厂商 T_LocomotionVelocity.py 一致：完整 MotionControlLocomotionVelocityChannel
+    （header + data），control_source=SAFE，mode=NAVIGATION(20)，20 Hz 持续下发，
+    停止时下发零速；ROS 侧经 AimRT ros2 后端的 RosMsgWrapper 话题送达 MDU。
 
-    长时间动作（走一个 duration）声明 ACP：驱动以 ~20 Hz 持续下发速度帧直到
-    duration 结束，随后自动下发零速并回报 completed（q5_bundle base_drive 的
-    duration worker 同款）；duration=-1 表示持续运动直到 stop，由 stop 以
-    cancelled 结算。
+    - 一次 walk = 一个 ACP 任务，duration 必填（≤60 s）。到时减速到零后回报 completed。
+    - 新 walk 直接接管：旧任务 cancelled(superseded)，速度平滑过渡，不先停下。
+    - stop / interrupt hook：减速到零后结束，旧任务 cancelled。
+    - 速度按 ACCEL/DECEL 斜坡变化（厂商要求大幅变化分步过渡）。
+    - 行走中 2 Hz 监视 GetAction，离开 MOTION 或连续读不到状态即减速停下并报 error。
     """
 
-    # 20 Hz 重发满足“持续下发”要求（间隙 50 ms ≪ 官方示例的 100 ms）；停行走
-    # 时零速帧连发 5 帧确保停稳。
-    _PUBLISH_INTERVAL_S = 0.05
-    _STOP_FRAMES = 5
-    # duration 上界与 x-completion 超时一致（60 s；-1 持续模式同样受此兜底）。
+    RATE_HZ = 20.0
+    STOP_FRAMES = 5
     MAX_DURATION_S = 60.0
-    COMPLETION_TIMEOUT_S = 60.0
+    COMPLETION_TIMEOUT_S = 75.0
+    LOCO_MODE = "MotionControl_LocomotionMode_NAVIGATION"   # vendor sample sends 20
+    # Card limits; intersected with the firmware's GetVelocityLimitValue.
+    CARD_LIMITS = {"forward": (-0.3, 0.6), "lateral": (-0.3, 0.3), "angular": (-45.0, 45.0)}
+    ACCEL = {"forward": 0.5, "lateral": 0.5, "angular": 90.0}    # per second, speeding up
+    DECEL = {"forward": 1.0, "lateral": 1.0, "angular": 180.0}   # per second, slowing down
+    MONITOR_S = 0.5
+    MONITOR_FAILS = 3
+    AXES = ("forward", "lateral", "angular")
 
     def __init__(self, nodes):
         self.nodes = nodes
-        self._move_action_id = None
-        # ThreadingHTTPServer serves MCP calls concurrently — the check-then-set
-        # on _move_action_id (settle prior / arm new) must be atomic
-        # (MotionPlayPlugin._play_lock 同款).
-        self._move_lock = threading.Lock()
+        self._lock = threading.Lock()
+        self._task = None          # {"id", "target", "deadline", "ending": None | (status, result)}
+        self._velocity = dict.fromkeys(self.AXES, 0.0)
+        self._thread = None
+        self._fault = None         # set by the MOTION monitor
+        self._seq = 0
+        self._limits = None
 
     def get_tool(self):
+        lim = self.CARD_LIMITS
         schema = action_schema(
             {"walk": (["forward", "lateral", "angular", "duration"],
-                      "按速度走行 duration 秒后自动停止（ACP 回报完成）；duration=-1 持续运动直到 stop"),
-             "stop_move": ([], "立即下发零速并结算进行中的行走"),
-             "stop": ([], "stop_move 的兼容别名")},
+                      "按给定速度行走 duration 秒，到时自动减速停下并 ACP 回报；新的 walk 会直接接管当前行走"),
+             "stop": ([], "减速停下并结束当前行走"),
+             "status": ([], "查询当前行走任务、目标速度与实际下发速度")},
             {
-                "forward": {"type": "number", "description": "前进速度比例 [-1,1]，正为前进，负为后退", "default": 0.0},
-                "lateral": {"type": "number", "description": "横移速度比例 [-1,1]，正为左移", "default": 0.0},
-                "angular": {"type": "number",
-                            "description": "旋转速度 (deg/s)，限速 ±57.3 deg/s（= 1 rad/s），正为逆时针",
-                            "minimum": -57.3, "maximum": 57.3, "default": 0.0},
-                "duration": {"type": "number",
-                             "description": "行走持续时间 (秒)，范围 (0, 60]；-1 表示持续运动直到 stop",
-                             "anyOf": [{"const": -1.0, "title": "持续运动（需 stop）"},
-                                       {"minimum": 0.1, "maximum": 60.0}],
-                             "default": -1.0},
+                "forward": {"type": "number", "default": 0.0, "minimum": lim["forward"][0],
+                            "maximum": lim["forward"][1], "description": "前进速度 m/s，负为后退"},
+                "lateral": {"type": "number", "default": 0.0, "minimum": lim["lateral"][0],
+                            "maximum": lim["lateral"][1], "description": "横移速度 m/s，正为左移"},
+                "angular": {"type": "number", "default": 0.0, "minimum": lim["angular"][0],
+                            "maximum": lim["angular"][1], "description": "转向速度 deg/s，正为逆时针（左转）"},
+                "duration": {"type": "number", "exclusiveMinimum": 0, "maximum": self.MAX_DURATION_S,
+                             "description": "行走时长（秒），必填"},
             },
         )
-        # 底盘行走 —— 与 controlled_spatial/auto_charging 同一通道（都驱动底盘）。
-        schema["x-resource"] = "base"
+        schema["x-resource"] = ["base", "leg"]
         schema["x-completion"] = {"actions": ["walk"], "timeout": self.COMPLETION_TIMEOUT_S}
-        return tool("loco", "actuator", "腿式底盘行走：forward/lateral ∈ [-1,1] 速度比例，angular 为 deg/s"
-                                 "（限速 ±57.3），持续 duration 秒后自动停止；仅 MOTION 模式下生效",
-                    schema)
+        schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop"},
+                             "on_interrupt_all": {"action": "stop"}}
+        return tool("loco", "actuator",
+                    "双足行走：forward/lateral 为 m/s，angular 为 deg/s，走 duration 秒后自动停下；"
+                    "需先 mc_mode stand 进入 MOTION", schema)
 
     def start(self):
         pass
 
     def stop(self):
-        with self._move_lock:
-            prior = self._settle_active("cancelled", {"reason": "plugin_stopped"})
-        if prior is not None:
-            self._halt_motion()
+        self.halt("plugin_stopped", wait=True)
 
     def dispatch(self, action, args):
         if action == "start":
             return {"state": "ready"}
         if action == "info":
-            return {"state": "walking" if self._move_action_id else "idle"}
-        if action in ("stop_move", "stop", "cancel"):
-            return self._stop_walk()
+            return {"state": "walking" if self._task else "idle"}
+        if action == "stop":
+            stopped = self.halt("cancelled_by_request", wait=False)
+            return {"state": "idle", "stopping": stopped}
+        if action == "status":
+            return self._status()
         if action != "walk":
             raise ValueError(f"loco: unknown action {action!r}")
-        forward = _clamp(args.get("forward", 0.0), -1.0, 1.0, "forward")
-        lateral = _clamp(args.get("lateral", 0.0), -1.0, 1.0, "lateral")
-        angular = _clamp(args.get("angular", 0.0), -57.3, 57.3, "angular")
-        duration = args.get("duration", -1.0)
+        return self._walk(args)
+
+    # -- public helpers for other cards ----------------------------------------
+
+    def halt(self, reason, wait=False):
+        """Ramp to zero and end the current walk (cancelled). Returns its action_id."""
+        with self._lock:
+            task = self._task
+            if task is not None and task["ending"] is None:
+                task["target"] = dict.fromkeys(self.AXES, 0.0)
+                task["ending"] = ("cancelled", {"reason": reason})
+            thread = self._thread
+        if wait and thread is not None:
+            thread.join(timeout=3.0)
+        return task["id"] if task else None
+
+    # -- walk -------------------------------------------------------------------
+
+    def _walk(self, args):
         try:
-            duration = float(duration)
+            target = {axis: float(args.get(axis, 0.0) or 0.0) for axis in self.AXES}
+            duration = float(args["duration"])
+        except KeyError:
+            return _rejected("INVALID_ARG", "duration 必填", f"取值 (0, {self.MAX_DURATION_S:g}] 秒")
         except (TypeError, ValueError):
-            raise ValueError("loco: duration must be a number")
-        if duration != -1.0 and not 0.0 < duration <= self.MAX_DURATION_S:
-            raise ValueError(f"loco: duration must be in (0, {self.MAX_DURATION_S:g}] or -1 for continuous")
-        if forward == 0.0 and lateral == 0.0 and angular == 0.0:
-            raise ValueError("loco: all velocities are zero — use stop to halt")
+            return _rejected("INVALID_ARG", "forward/lateral/angular/duration 必须是数字")
+        if not 0.0 < duration <= self.MAX_DURATION_S:
+            return _rejected("INVALID_ARG", f"duration={duration:g} 超出 (0, {self.MAX_DURATION_S:g}]")
+        limits = self._effective_limits()
+        for axis in self.AXES:
+            low, high = limits[axis]
+            if not low <= target[axis] <= high:
+                return _rejected("INVALID_ARG", f"{axis}={target[axis]:g} 超出 [{low:g}, {high:g}]",
+                                 limits={k: list(v) for k, v in limits.items()})
+        if not any(target.values()):
+            return _rejected("INVALID_ARG", "三个速度都为 0", "停止请用 stop")
         rejected = _motion_gate(self.nodes.rpc, "loco")
         if rejected:
             return rejected
-        # 新指令顶替旧指令：先结算旧的等待线程（发零速 + cancelled 回报），再武装新的。
-        # 整个转移（结算 → 武装）在同一把锁内完成：两个并发 walk 不会都观察到
-        # “无活动动作”而向机器人下发重叠指令（10th PR review）。
-        with self._move_lock:
-            self._settle_active("cancelled", {"reason": "replaced_by_new_command"})
-            return self._arm_completion(forward, lateral, angular, duration)
+        action_id = f"loco_walk_{uuid4().hex[:8]}"
+        with self._lock:
+            old = self._task
+            self._task = {"id": action_id, "target": target, "duration": duration,
+                          "deadline": time.monotonic() + duration, "ending": None}
+            self._fault = None
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._stream, daemon=True,
+                                                name="a3_loco_stream")
+                self._thread.start()
+        if old is not None:
+            status, result = old["ending"] or ("cancelled", {"reason": "superseded", "by": action_id})
+            _notify_async(old["id"], status, result, "loco")
+        return {"state": "accepted", "action_id": action_id, "target": target,
+                "duration": duration, "superseded": old["id"] if old else None}
 
-    # -- 内部 ------------------------------------------------------------------
+    def _effective_limits(self):
+        if self._limits is None:
+            limits = dict(self.CARD_LIMITS)
+            try:
+                v = self.nodes.rpc.get_velocity_limit().get("vel_limit_value") or {}
+                fw = {"forward": (v["forward_velocity_limit_min"], v["forward_velocity_limit_max"]),
+                      "lateral": (v["lateral_velocity_limit_min"], v["lateral_velocity_limit_max"]),
+                      "angular": (math.degrees(v["angular_velocity_limit_min"]),
+                                  math.degrees(v["angular_velocity_limit_max"]))}
+                limits = {axis: (max(limits[axis][0], fw[axis][0]), min(limits[axis][1], fw[axis][1]))
+                          for axis in self.AXES}
+                self._limits = limits     # cache only a firmware-confirmed result
+            except Exception:
+                pass
+            return limits
+        return self._limits
 
-    def _velocity_payload(self, forward, lateral, angular_degps):
+    # -- streaming --------------------------------------------------------------
+
+    def _frame(self, velocity):
+        now = time.time()
+        self._seq += 1
         return {
-            "mode": "MotionControl_LocomotionMode_DEFAULT",
-            "forward_velocity": forward,
-            "lateral_velocity": lateral,
-            # LocomotionVelocity.angular 为归一化比例（1.0 = 1 rad/s）。
-            "angular_velocity": math.radians(angular_degps),
+            "header": {"seq": self._seq,
+                       "timestamp": {"seconds": int(now), "nanos": int((now % 1.0) * 1e9),
+                                     "ms_since_epoch": int(now * 1000)},
+                       "frame_id": "phanthymotus_a3",
+                       "control_source": "ControlSource_SAFE",
+                       "uuid": ""},
+            "data": {"mode": self.LOCO_MODE,
+                     "forward_velocity": velocity["forward"],
+                     "lateral_velocity": velocity["lateral"],
+                     "angular_velocity": math.radians(velocity["angular"])},
         }
 
-    def _publish(self, payload):
-        self.nodes.publish_wrapper("locomotion_pub", payload)
+    def _ramp(self, target, dt):
+        for axis in self.AXES:
+            cur, goal = self._velocity[axis], target[axis]
+            speeding_up = abs(goal) > abs(cur) and goal * cur >= 0
+            step = (self.ACCEL if speeding_up else self.DECEL)[axis] * dt
+            self._velocity[axis] = goal if abs(goal - cur) <= step else cur + math.copysign(step, goal - cur)
 
-    def _settle_active(self, status, detail):
-        """结算挂起的 ACP 等待线程（若有）。调用方必须持有 _move_lock：先清 id
-        再发零速/回报，杜绝迟到回报。返回被结算的 action_id（None 表示无挂起），
-        供调用方决定是否补发物理停障（零速帧在锁外重发有丢失风险）——本方法
-        自己也会发一次零速，调用方锁外的重发仅是加固。"""
-        action_id, self._move_action_id = self._move_action_id, None
-        if action_id is not None:
-            try:
-                self._publish(self._velocity_payload(0.0, 0.0, 0.0))
-            except Exception:
-                pass  # 结算回报优先于停障帧；调用方在锁外重试
-            _acp_notify(action_id, status, detail, "loco")
-        return action_id
-
-    def _halt_motion(self):
-        """锁外连发零速帧确保停稳（发布通道瞬时故障时尽力而为）。"""
-        for _ in range(self._STOP_FRAMES):
-            try:
-                self._publish(self._velocity_payload(0.0, 0.0, 0.0))
-            except Exception:
-                return
-            time.sleep(self._PUBLISH_INTERVAL_S)
-
-    def _stop_walk(self):
-        with self._move_lock:
-            prior = self._settle_active("cancelled", {"reason": "cancelled_by_request"})
-            had_active = prior is not None
-        if prior is not None:
-            self._halt_motion()
-        return {"state": "idle", "was_walking": had_active}
-
-    def _arm_completion(self, forward, lateral, angular, duration):
-        # 调用方须持有 _move_lock（dispatch 在锁内完成结算→武装的整段转移，
-        # 10th PR review）：并发 walk 不会重叠下发，也不会互相顶掉对方的 id。
-        action_id = f"loco_walk_{uuid4().hex[:8]}"
-        self._move_action_id = action_id
-        threading.Thread(target=self._walk_worker,
-                         args=(action_id, forward, lateral, angular, duration),
-                         daemon=True, name=f"a3_loco_{action_id}").start()
-        return {"state": "walking", "action_id": action_id,
-                "forward": forward, "lateral": lateral, "angular_degps": angular,
-                "duration": duration, "stops_automatically": duration != -1.0,
-                "cancel_action": "stop_move" if duration == -1.0 else None}
-
-    def _walk_worker(self, action_id, forward, lateral, angular, duration):
-        """持续下发速度帧直到 duration 结束（或被新指令/stop 顶替），然后停并回报。"""
-        payload = self._velocity_payload(forward, lateral, angular)
-        self._publish(payload)
-        deadline = time.monotonic() + (duration if duration > 0 else self.COMPLETION_TIMEOUT_S)
-        while time.monotonic() < deadline:
-            time.sleep(self._PUBLISH_INTERVAL_S)
-            with self._move_lock:
-                if self._move_action_id != action_id:   # superseded / stopped
+    def _stream(self):
+        """20 Hz publisher: ramps toward the active task's target, settles tasks,
+        and exits after STOP_FRAMES zero frames with no task left."""
+        dt = 1.0 / self.RATE_HZ
+        monitor_stop = threading.Event()
+        threading.Thread(target=self._monitor, args=(monitor_stop,), daemon=True,
+                         name="a3_loco_monitor").start()
+        zero_frames = 0
+        next_tick = time.monotonic()
+        try:
+            while True:
+                settle = None
+                with self._lock:
+                    task = self._task
+                    if task is not None and task["ending"] is None:
+                        if self._fault is not None:
+                            task["ending"] = ("error", dict(self._fault))
+                            task["target"] = dict.fromkeys(self.AXES, 0.0)
+                        elif time.monotonic() >= task["deadline"]:
+                            task["ending"] = ("completed", {"duration": task["duration"],
+                                                            "target": dict(task["target"])})
+                            task["target"] = dict.fromkeys(self.AXES, 0.0)
+                    target = task["target"] if task is not None else dict.fromkeys(self.AXES, 0.0)
+                    self._ramp(target, dt)
+                    velocity = dict(self._velocity)
+                    stopped = not any(velocity.values())
+                    if task is not None and task["ending"] is not None and stopped:
+                        settle, self._task, task = task, None, None
+                    if task is None and stopped:
+                        zero_frames += 1
+                        if zero_frames > self.STOP_FRAMES:
+                            self._thread = None
+                            break
+                    else:
+                        zero_frames = 0
+                if settle is not None:
+                    _notify_async(settle["id"], *settle["ending"], "loco")
+                try:
+                    self.nodes.publish_wrapper("locomotion_pub", self._frame(velocity))
+                except Exception as exc:
+                    self._abort_publish(exc)
                     return
+                next_tick += dt
+                time.sleep(max(0.0, next_tick - time.monotonic()))
+        finally:
+            monitor_stop.set()
+
+    def _abort_publish(self, exc):
+        """Publishing broke: nothing more can reach the robot, so end the task as error."""
+        with self._lock:
+            task, self._task, self._thread = self._task, None, None
+            self._velocity = dict.fromkeys(self.AXES, 0.0)
+        print(f"[loco] publish failed: {exc}", flush=True)
+        if task is not None:
+            _notify_async(task["id"], "error", {"code": "PUBLISH_FAILED", "reason": str(exc)}, "loco")
+
+    def _monitor(self, stop_event):
+        fails = 0
+        while not stop_event.wait(self.MONITOR_S):
             try:
-                self._publish(payload)
-            except Exception as exc:                # 发布通道挂了：立即停下并报错
-                with self._move_lock:
-                    self._settle_active("error", {"error": f"publish failed: {exc}"})
-                return
-        # 正常到点：原子地清 id 并认领终态（与 stop/顶替路径互斥，杜绝双回报）。
-        with self._move_lock:
-            if self._move_action_id != action_id:
-                return
-            self._move_action_id = None
-        # 连发零速帧、回报 completed（锁外：纯输出，无状态竞争）。
-        for _ in range(self._STOP_FRAMES):
-            try:
-                self._publish(self._velocity_payload(0.0, 0.0, 0.0))
-            except Exception:
-                break
-            time.sleep(self._PUBLISH_INTERVAL_S)
-        _acp_notify(action_id, "completed",
-                    {"forward": forward, "lateral": lateral, "angular_degps": angular,
-                     "duration": duration, "stopped_automatically": True},
-                    "loco")
+                info = _mc_info(self.nodes.rpc)
+                fails = 0
+            except Exception as exc:
+                fails += 1
+                if fails >= self.MONITOR_FAILS:
+                    self._fault = {"code": "STATE_UNAVAILABLE", "reason": f"GetAction 连续失败: {exc}"}
+                continue
+            if info["action"] != "MOTION":
+                self._fault = {"code": "LEFT_MOTION",
+                               "reason": f"行走中运动控制状态变为 {info['action']}/{info['status']}"}
+
+    def _status(self):
+        with self._lock:
+            task = self._task
+            velocity = dict(self._velocity)
+        if task is None:
+            return {"state": "stopping" if any(velocity.values()) else "idle", "velocity": velocity}
+        return {"state": "stopping" if task["ending"] else "walking", "action_id": task["id"],
+                "target": dict(task["target"]), "velocity": velocity,
+                "remaining_s": max(0.0, round(task["deadline"] - time.monotonic(), 2))}
 
 
 class ArmControlPlugin:
@@ -2704,7 +2955,7 @@ class ArmControlPlugin:
         return tool("arm_control", "actuator", "下发双臂 14 关节位置指令 + 手臂柔顺控制"
                                               "（话题 /motion/control/arm_joint_command 需 100Hz 连续下发、间隔 ≤30ms；"
                                               "velocity/effort 固定 0；柔顺 Enable/Disable/CheckArmCompliance RPC；"
-                                              "先经 mc_mode get_up 站立并停止 motion_player）",
+                                              "先经 mc_mode stand 站立并停止 motion_player）",
                     schema)
 
     def start(self):
@@ -3954,7 +4205,7 @@ class ControlledSpatialPlugin:
         StartNormalRelocalization / StopNormalRelocalization；
       - 地图数据查询（Get2DWholeMap）：含分辨率/原点/占用栅格，并支持物理坐标 →
         像素坐标换算（合并自原 map_get 处理卡）。
-    前置条件（开发文档 §7.9）：MC 处于 MOTION 模式（mc_mode get_up）且已完成
+    前置条件（开发文档 §7.9）：MC 处于 MOTION 模式（mc_mode stand）且已完成
     重定位，导航与重定位需工作在相同 map_id 上；到点精度最大约 0.4 米。
     """
 
@@ -4032,7 +4283,7 @@ class ControlledSpatialPlugin:
         # 只为 navigate 动作声明契约的处理一致。
         return tool("controlled_spatial", "actuator",
                     "建图/导航/重定位一体化控制（ADU MappingService/PncService/SLAMRelocalizationService RPC；"
-                    "config 门控模块，默认关闭；导航前置：mc_mode get_up + start_relocalization 且 map_id 一致；"
+                    "config 门控模块，默认关闭；导航前置：mc_mode stand + start_relocalization 且 map_id 一致；"
                     "task_id 传 0 自动分配，控制/查询动作可缺省复用最近任务 id；"
                     "导航为异步：返回 action_id，轮询 ActionGetState 到点后回报 ACP 完成事件）",
                     schema)
@@ -4617,14 +4868,15 @@ def build_plugins(config, namespace, ros2):
         plugins["battery"] = BatteryPlugin(nodes)
     if enabled("estop"):
         plugins["estop"] = EstopPlugin(nodes)
-    if enabled("mc_mode"):
-        plugins["mc_mode"] = McModePlugin(nodes)
     # loco/waist_control/face_play publish RosMsgWrapper commands and are withheld
     # (not just broken at dispatch) when ros2_plugin_proto is absent — degraded
     # startup must expose no half-working command tools (5th PR review).
     wrapper_cmds = nodes.wrapper_available
     if enabled("loco") and wrapper_cmds:
         plugins["loco"] = LocoPlugin(nodes)
+    if enabled("mc_mode"):
+        # mc_mode brings loco to a stop before any posture switch.
+        plugins["mc_mode"] = McModePlugin(nodes, loco=plugins.get("loco"))
     if enabled("arm_control"):
         plugins["arm_control"] = ArmControlPlugin(nodes)
     if enabled("hand_control"):
