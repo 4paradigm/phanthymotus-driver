@@ -41,6 +41,7 @@ def test_shared_bumi_callback_publishes_motion_while_rgbd_failure_keeps_video(ca
         def __init__(self,*args,**kwargs):
             self.clocks=[NS(offset=offset,domain='hardware_clock')]
             self.clock_id='shared_rgbd'
+        def set_enabled(self,cards):pass
         def motion_stamp(self,ms,domain):
             assert domain=='hardware_clock'
             return int(ms*1e6)+self.clocks[0].offset
@@ -80,5 +81,41 @@ def test_shared_bumi_callback_publishes_motion_while_rgbd_failure_keeps_video(ca
     assert packet['clock_mapping']['offset_ns']==offset
     assert packet['clock_mapping']['verified'] is False
     assert len(state.published['/robot/camera/color'])==1
-    assert len(state.published['/robot/camera/depth'])==1
+    assert not state.published.get('/robot/camera/depth')
     assert state.rgbd_error=='RGB-D test failure' and state.stopped
+
+
+def test_imu_card_keeps_body_json_and_reports_camera_disabled(monkeypatch):
+    device=fixture._load_device(monkeypatch)
+    state=device.StatePlugin.__new__(device.StatePlugin)
+    state._namespace='robot'
+    state._camera_plugin=None
+    state._node=NS(_imu_enabled=True)
+    state._node.set_imu_enabled=lambda enabled:setattr(state._node,'_imu_enabled',enabled)
+    ports=next(t['topic_out'] for t in state.get_tools() if t['name']=='imu')
+    assert ports==[
+        {'topic':'/robot/state/imu','format':'data/json'},
+        {'name':'camera_imu','topic':'/robot/camera/rgbd/imu','format':'sensor/imu','optional':True}]
+    result=state.dispatch('info',{'_tool_name':'imu'})
+    assert result['imu_status']['state']=='unavailable'
+    assert 'disabled' in result['imu_status']['reason']
+    assert result['state']=='running'
+    assert state.dispatch('stop',{'_tool_name':'imu'})['state']=='idle'
+    assert state._node._imu_enabled is False
+    assert state.dispatch('start',{'_tool_name':'imu'})['state']=='running'
+
+
+def test_imu_card_only_controls_camera_motion_lease(monkeypatch):
+    device=fixture._load_device(monkeypatch)
+    state=device.StatePlugin.__new__(device.StatePlugin)
+    state._namespace='robot'
+    state._node=NS(_imu_enabled=True)
+    state._node.set_imu_enabled=lambda enabled:setattr(state._node,'_imu_enabled',enabled)
+    calls=[]
+    state._camera_plugin=NS(start_card=lambda name:calls.append(('start',name)),
+        stop_card=lambda name:calls.append(('stop',name)),
+        camera_imu_info=lambda:dict(imu_status=dict(state='unavailable',reason='motion unsupported')))
+    for action in ('stop','start','info'):
+        response=state.dispatch(action,{'_tool_name':'imu'})
+        assert response['imu_status']['reason']=='motion unsupported'
+    assert calls==[('stop','imu'),('start','imu')]

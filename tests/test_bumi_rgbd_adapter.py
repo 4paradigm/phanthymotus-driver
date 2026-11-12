@@ -61,7 +61,7 @@ def test_source_scales_measured_depth_and_keeps_distinct_capture_headers(source)
     pair = frames()
     publisher.publish(pair)
     color = messages['/robot/camera/rgbd/color'][0]
-    depth = messages['/robot/camera/rgbd/depth'][0]
+    depth = messages['/robot/camera/depth'][0]
     assert stamp(color) == 10_000_000_000
     assert stamp(depth) == 10_010_000_000
     assert color.header.frame_id == depth.header.frame_id == 'robot_depth_optical'
@@ -158,6 +158,7 @@ def test_capture_owner_feeds_generic_source_and_keeps_display_on_source_failure(
     class BrokenSource:
         def __init__(self, node, namespace, pipeline, qos, **kwargs):
             calls.append(('init', namespace, pipeline))
+        def set_enabled(self, cards): pass
         def publish(self, source):
             calls.append(('pair', source))
             raise ValueError('test unsupported calibration')
@@ -169,42 +170,37 @@ def test_capture_owner_feeds_generic_source_and_keeps_display_on_source_failure(
     device._camera_subprocess('robot')
     assert [c[0] for c in calls] == ['init', 'pair', 'unavailable']
     assert len(state.published['/robot/camera/color']) == 1
-    assert len(state.published['/robot/camera/depth']) == 1
+    assert not state.published.get('/robot/camera/depth')
     assert len(state.streams) == 2  # one existing pipeline, two physical streams
     assert state.stopped
 
 
-def test_camera_rgbd_card_returns_both_declarations_on_start_and_info(monkeypatch):
+def test_original_depth_card_returns_live_declaration_only(monkeypatch):
     device = _capture_fixture._load_device(monkeypatch)
-    monkeypatch.syspath_prepend(str(ROOT / 'noetix/bumi'))
     plugin = device.CameraPlugin.__new__(device.CameraPlugin)
+    plugin._activations = dict(camera=0, depth=0, imu=0)
+    plugin._stop_generations = dict(camera=0, depth=0, imu=0)
+    plugin._control_condition = __import__('threading').Condition()
+    plugin._control_generation = plugin._acked_generation = 0
     import threading
     plugin._namespace = 'robot'
-    plugin._color_topic = '/robot/camera/color'
-    plugin._depth_topic = '/robot/camera/depth'
+    plugin._color_topic, plugin._depth_topic = '/robot/camera/color', '/robot/camera/depth'
     plugin._intrinsics_lock = threading.Lock()
     plugin._intrinsics = {}
+    plugin._cards = {'camera', 'depth'}
     plugin._proc = NS(poll=lambda: None)
-    geometry = dict(K=[600., 0., 320., 0., 601., 240., 0., 0., 1.])
-    declarations = rgbd.camera_declarations('/robot/camera/rgbd', geometry,
-                                           'robot_depth_optical', 'test_clock', 'global_time', 0)
-    plugin._rgbd_status = dict(ready=True, camera_info=declarations, error=None)
-    for action in ('start', 'info'):
-        result = plugin.dispatch(action, {'_tool_name': 'camera_rgbd'})
-        assert result['sourceReady'] is True
-        assert 'error' not in result  # MCP treats even error=None as a failed tool call.
-        assert result['camera_info'] == declarations
-        assert result['topic_out'] == [{'topic': '/robot/camera/rgbd/color', 'format': 'image/jpeg'},
-                                       {'topic': '/robot/camera/rgbd/depth', 'format': 'image/depth-zlib'},
-                                       {'topic': '/robot/camera/rgbd/imu', 'format': 'sensor/imu', 'optional': True},
-                                       {'topic': '/robot/camera/rgbd/body_mount', 'format': 'state/extrinsic', 'optional': True}]
+    declarations = rgbd.camera_declarations('/robot/camera/rgbd',
+        dict(K=[600., 0., 320., 0., 601., 240., 0., 0., 1.]),
+        'robot_depth_optical', 'test_clock', 'global_time', 0)
+    plugin._rgbd_status = dict(ready=True, camera_info=declarations, error=None, activations=dict(plugin._activations))
+    result = plugin.dispatch('info', {'_tool_name': 'depth'})
+    assert result['sourceReady'] is True and 'error' not in result
+    assert result['camera_info'] == [declarations[1]]
+    assert result['topic_out'] == [{'topic': '/robot/camera/depth', 'format': 'image/depth-zlib'}]
+    rgb_info = plugin.dispatch('info', {'_tool_name': 'camera'})['camera_info']
+    assert declarations[0] in rgb_info
     plugin._proc = NS(poll=lambda: 1)
-    assert plugin.dispatch('info', {'_tool_name': 'camera_rgbd'})['sourceReady'] is False
-    plugin._proc = NS(poll=lambda: None)
-    plugin._rgbd_status = dict(ready=False, camera_info=[], error='unsupported calibration')
-    result = plugin.dispatch('info', {'_tool_name': 'camera_rgbd'})
-    assert result['sourceReady'] is False and result['camera_info'] == []
-    assert result['error'] == 'unsupported calibration'
+    assert plugin.dispatch('info', {'_tool_name': 'depth'})['camera_info'] == []
 
 
 def test_rectified_pair_samples_registered_color_and_depth_together(source):
@@ -218,7 +214,7 @@ def test_rectified_pair_samples_registered_color_and_depth_together(source):
     depth_pixels[:] = np.arange(640, dtype='<u2')[None, :]
     publisher.publish(pair)
     rectified = cv2.imdecode(np.frombuffer(messages['/robot/camera/rgbd/color'][0].data, np.uint8), cv2.IMREAD_COLOR)
-    depth = np.frombuffer(zlib.decompress(messages['/robot/camera/rgbd/depth'][0].data), '<u2').reshape(480, 640)
+    depth = np.frombuffer(zlib.decompress(messages['/robot/camera/depth'][0].data), '<u2').reshape(480, 640)
     assert int(rectified[240, 620, 0]) == pytest.approx(200, abs=3)
     assert depth[240, 620] == 1270  # nearest source column 635, SDK scale 2 mm
     assert depth[240, 639] == 0     # source ray falls beyond the sensor image
@@ -231,6 +227,7 @@ def test_capture_failure_after_recovery_clears_source_readiness(capture, monkeyp
     class IntermittentSource:
         def __init__(self, *args, **kwargs):
             self.count = 0
+        def set_enabled(self, cards): pass
         def publish(self, *args):
             self.count += 1
             if self.count in (1, 3):
@@ -249,16 +246,9 @@ def test_native_depth_geometry_controls_the_computation_pair(source):
         intrinsics=intrinsics(fx=610., fy=611.)))
     publisher.publish(pair)
     assert notices[-1]['camera_info'][0]['K'] == [610., 0., 320., 0., 611., 240., 0., 0., 1.]
-    assert messages['/robot/camera/rgbd/depth'][0].header.frame_id == 'robot_depth_optical'
+    assert messages['/robot/camera/depth'][0].header.frame_id == 'robot_depth_optical'
 
 
-def test_first_source_start_waits_for_core_camera_metadata(monkeypatch):
-    device=_capture_fixture._load_device(monkeypatch)
-    plugin=device.CameraPlugin.__new__(device.CameraPlugin)
-    statuses=iter([dict(sourceReady=False,camera_info=[]),dict(sourceReady=True,camera_info=[{'schema':'motus.camera/1'}])])
-    plugin._rgbd_info=lambda:next(statuses)
-    plugin.is_running=lambda:True
-    assert plugin.dispatch('start',{'_tool_name':'camera_rgbd'})['camera_info']
 
 
 class Mount:
@@ -303,7 +293,7 @@ def test_bumi_mount_failure_preserves_rgbd_and_reports_unavailable(source):
     publisher.body_mount.error = True
     publisher.publish(frames())
     assert len(messages['/robot/camera/rgbd/color']) == 1
-    assert len(messages['/robot/camera/rgbd/depth']) == 1
+    assert len(messages['/robot/camera/depth']) == 1
     assert notices[-1]['ready'] is True
     assert notices[-1]['body_mount_status']['status'] == 'unavailable'
     assert 'TF lookup failed' in notices[-1]['body_mount_status']['reason']
@@ -378,7 +368,7 @@ def test_bumi_real_provider_uses_mapped_depth_time_and_missing_tf_keeps_pairs(so
     publisher.publish(frames(ms=1030.))
     assert events[-1][1]['stamp_ns'] == 10_040_000_000
     assert events[-1][1]['status'] == 'unavailable'
-    assert len(messages['/robot/camera/rgbd/depth']) == 2
+    assert len(messages['/robot/camera/depth']) == 2
     assert notices[-1]['ready'] is True
     assert notices[-1]['body_mount_status']['status'] == 'unavailable'
     publisher.close()
@@ -390,3 +380,183 @@ def test_bumi_mount_diagnostic_exists_before_first_valid_rgbd_capture(source):
     assert notices[-1]['ready'] is False
     assert notices[-1]['camera_info'] == []
     assert notices[-1]['body_mount_status'] == publisher.body_mount.status()
+
+
+def test_shared_depth_uses_original_topic_with_no_duplicate_encoder(source):
+    publisher, messages, notices = source
+    publisher.publish(frames())
+    assert '/robot/camera/rgbd/depth' not in messages
+    assert len(messages['/robot/camera/depth']) == 1
+    declarations = {d['topic']: d for d in notices[-1]['camera_info']}
+    assert set(declarations) == {'/robot/camera/rgbd/color', '/robot/camera/depth'}
+    rgb, depth = declarations.values()
+    assert rgb['K'] == depth['K']
+    assert rgb['id'] == depth['id']
+    assert rgb['vendor']['clock_id'] == depth['vendor']['clock_id']
+
+
+def test_stopped_card_suppresses_only_its_images_and_restart_uses_next_capture(source):
+    publisher, messages, notices = source
+    publisher.set_enabled({'camera', 'depth'})
+    publisher.publish(frames())
+    publisher.set_enabled({'depth'})
+    publisher.publish(frames(ms=1010.))
+    assert len(messages['/robot/camera/rgbd/color']) == 1
+    assert len(messages['/robot/camera/depth']) == 2
+    publisher.set_enabled({'camera'})
+    publisher.publish(frames(ms=1020.))
+    assert len(messages['/robot/camera/rgbd/color']) == 2
+    assert len(messages['/robot/camera/depth']) == 2
+    publisher.set_enabled({'camera', 'depth'})
+    publisher.publish(frames(ms=1030.))
+    assert stamp(messages['/robot/camera/depth'][-1]) == 10_040_000_000
+
+
+
+def test_original_cards_register_calibrated_ports_and_independent_lifecycle(monkeypatch):
+    device = _capture_fixture._load_device(monkeypatch)
+    elapsed = [0.]
+    monkeypatch.setattr(device.time, 'monotonic', lambda: elapsed[0])
+    monkeypatch.setattr(device.time, 'sleep', lambda seconds: elapsed.__setitem__(0, elapsed[0]+seconds))
+    import threading
+    plugin = device.CameraPlugin.__new__(device.CameraPlugin)
+    plugin._activations = dict(camera=0, depth=0, imu=0)
+    plugin._stop_generations = dict(camera=0, depth=0, imu=0)
+    plugin._control_condition = __import__('threading').Condition()
+    plugin._control_generation = plugin._acked_generation = 0
+    plugin._namespace = 'robot'
+    plugin._color_topic, plugin._depth_topic = '/robot/camera/color', '/robot/camera/depth'
+    plugin._intrinsics_lock = threading.Lock()
+    plugin._intrinsics = {}
+    plugin._cards = set()
+    plugin._lifecycle_lock = threading.RLock()
+    plugin._proc = None
+    plugin._rgbd_status = dict(ready=False, camera_info=[], error='waiting')
+    events = []
+    plugin._publish_cards = lambda: events.append(set(plugin._cards))
+    def launch():
+        events.append('spawn')
+        plugin._proc = NS(poll=lambda: None, terminate=lambda: events.append('terminate'), wait=lambda **kw: None)
+    plugin._start_process = launch
+    tools = {t['name']: t for t in plugin.get_tools()}
+    assert set(tools) == {'camera', 'depth'}
+    assert len(tools['camera']['topic_out']) == 2
+    assert tools['depth']['topic_out'] == [{'topic': '/robot/camera/depth', 'format': 'image/depth-zlib'}]
+    plugin.dispatch('start', {'_tool_name': 'depth'})
+    plugin.dispatch('start', {'_tool_name': 'depth'})
+    plugin.dispatch('start', {'_tool_name': 'camera'})
+    plugin.dispatch('stop', {'_tool_name': 'depth'})
+    assert plugin.is_running() and plugin._cards == {'camera'}
+    assert events.count('spawn') == 1 and 'terminate' not in events
+    assert plugin.dispatch('info', {'_tool_name': 'depth'})['camera_info'] == []
+    plugin.dispatch('stop', {'_tool_name': 'camera'})
+    assert not plugin.is_running() and events.count('terminate') == 1
+    plugin.dispatch('start', {'_tool_name': 'depth'})
+    assert events.count('spawn') == 2
+    assert plugin.dispatch('info', {'_tool_name': 'depth'})['camera_info'] == []
+    plugin.stop()
+    assert not plugin.is_running()
+
+
+def test_concurrent_card_starts_share_one_process(monkeypatch):
+    device = _capture_fixture._load_device(monkeypatch)
+    import threading
+    import time
+    plugin = device.CameraPlugin.__new__(device.CameraPlugin)
+    plugin._activations = dict(camera=0, depth=0, imu=0)
+    plugin._stop_generations = dict(camera=0, depth=0, imu=0)
+    plugin._control_condition = __import__('threading').Condition()
+    plugin._control_generation = plugin._acked_generation = 0
+    plugin._cards = set()
+    plugin._lifecycle_lock = threading.RLock()
+    plugin._proc = None
+    plugin._intrinsics_lock = threading.Lock()
+    plugin._lifecycle_lock = threading.RLock()
+    plugin._publish_cards = lambda: None
+    launches = []
+    def launch():
+        launches.append(1)
+        time.sleep(.03)
+        plugin._proc = NS(poll=lambda: None)
+    plugin._start_process = launch
+    threads = [threading.Thread(target=plugin.start_card, args=(name,)) for name in ('camera', 'depth')]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    assert launches == [1]
+    assert plugin._cards == {'camera', 'depth'}
+
+
+def cold_camera(monkeypatch):
+    import threading
+    device = _capture_fixture._load_device(monkeypatch)
+    plugin = device.CameraPlugin.__new__(device.CameraPlugin)
+    plugin._activations = dict(camera=0, depth=0, imu=0)
+    plugin._stop_generations = dict(camera=0, depth=0, imu=0)
+    plugin._control_condition = __import__('threading').Condition()
+    plugin._control_generation = plugin._acked_generation = 0
+    plugin._namespace = 'robot'
+    plugin._color_topic, plugin._depth_topic = '/robot/camera/color', '/robot/camera/depth'
+    plugin._intrinsics_lock = threading.Lock()
+    plugin._lifecycle_lock = threading.RLock()
+    plugin._intrinsics, plugin._cards, plugin._proc = {}, set(), None
+    plugin._rgbd_status = dict(ready=False, camera_info=[], error='awaiting calibrated capture')
+    plugin._publish_cards = lambda: None
+    plugin._start_process = lambda: setattr(plugin, '_proc', NS(poll=lambda: None))
+    return device, plugin
+
+
+@pytest.mark.parametrize('name,topic', [('camera', '/robot/camera/rgbd/color'), ('depth', '/robot/camera/depth')])
+def test_cold_card_start_waits_for_asynchronous_calibrated_metadata(monkeypatch, name, topic):
+    import threading
+    device, plugin = cold_camera(monkeypatch)
+    declarations = rgbd.camera_declarations('/robot/camera/rgbd',
+        dict(K=[600., 0., 320., 0., 601., 240., 0., 0., 1.]),
+        'robot_depth_optical', 'fresh-clock', 'hardware_clock', 9_000_000_000)
+    def ready():
+        with plugin._intrinsics_lock:
+            plugin._rgbd_status = dict(ready=True, camera_info=declarations, error=None, activations=dict(plugin._activations))
+    timer = threading.Timer(.03, ready)
+    launch = plugin._start_process
+    def launch_then_capture():
+        launch()
+        timer.start()
+    plugin._start_process = launch_then_capture
+    try:
+        response = plugin.dispatch('start', {'_tool_name': name})
+    finally:
+        timer.join()
+    assert response['sourceReady'] is True
+    assert next(d for d in response['camera_info'] if d['topic'] == topic)['vendor']['clock_id'] == 'fresh-clock'
+
+
+def test_cold_card_start_wait_has_a_ten_second_bound(monkeypatch):
+    device, plugin = cold_camera(monkeypatch)
+    elapsed = [0.]
+    monkeypatch.setattr(device.time, 'monotonic', lambda: elapsed[0])
+    monkeypatch.setattr(device.time, 'sleep', lambda seconds: elapsed.__setitem__(0, elapsed[0]+seconds))
+    response = plugin.dispatch('start', {'_tool_name': 'depth'})
+    assert 10. <= elapsed[0] < 10.1
+    assert response['sourceReady'] is False and response['camera_info'] == []
+
+
+@pytest.mark.parametrize('dead', [False, True])
+def test_cold_card_start_returns_early_for_dead_source_or_terminal_calibration(monkeypatch, dead):
+    device, plugin = cold_camera(monkeypatch)
+    def launch():
+        plugin._proc = NS(poll=lambda: 1 if dead else None)
+        plugin._rgbd_status = dict(ready=False, camera_info=[], error='invalid SDK depth scale', retryable=False)
+    plugin._start_process = launch
+    sleeps = []
+    monkeypatch.setattr(device.time, 'sleep', sleeps.append)
+    response = plugin.dispatch('start', {'_tool_name': 'depth'})
+    assert not sleeps
+    assert response['sourceReady'] is False and response['camera_info'] == []
+
+
+def test_permanent_failure_after_transient_capture_updates_startup_availability(source):
+    publisher, _, notices = source
+    publisher.unavailable(ValueError('incomplete source RGB-D frameset'))
+    assert notices[-1]['retryable'] is True
+    publisher.unavailable(ValueError('unsupported source distortion: ftheta'))
+    assert notices[-1]['retryable'] is False
+    assert 'ftheta' in notices[-1]['error']

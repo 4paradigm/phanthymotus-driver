@@ -183,13 +183,18 @@ calibration ID. Other installations without a verified mount must retain
 `assumed: true`, publish `calibrated=false`, and provide a measured transform
 before SLAM mapping.
 
-The depth port's existing `motus.camera/1` declaration includes a
-`vendor.slam_geometry` hint naming the measured cloud frame and ROS timestamp
-mapping; this hint deliberately does not assert a verified clock relationship.
-The unified Perception SLAM card derives frame/clock names from actual tracking
-odometry and native PointCloud2 messages when Core main supplies only topic
-paths. It accepts a verified producer mount, or an explicit 4x4 manual matrix
-on the card. No Bumi-only platform robot preset is required.
+The public depth port now carries the normalized native-depth optical grid,
+with its actual `motus.camera/1` calibration and capture clock. It no longer
+advertises the old color-aligned `vendor.slam_geometry` hint or its old depth
+provenance sidecar. Use registered RGB plus this shared depth with generic
+Perception RGB-D odometry, and the same depth with metric Point Cloud. Their
+camera-reference poses/clouds use the existing runtime identical-frame SLAM
+route; no verified independent-clock/provenance protocol is implied.
+
+The private legacy RTAB-Map raw branch remains aligned to color. Its existing
+body-from-color mount does not automatically describe the new public depth
+optical frame. Do not reuse that matrix for public native-depth pointclouds;
+combining those references requires a separately valid transform.
 
 
 The cross-robot field definitions and clock/extrinsic trust requirements live
@@ -201,20 +206,34 @@ automatically. A missing or unverified upstream mount still requires a
 compatible, manually configured `child_from_cloud` matrix.
 
 
-## Depth fallback safety
+## Shared public depth safety
 
-The single `image/depth-zlib` port remains a 640×480, little-endian uint16
-millimetre stream. Both the capture-time publisher and its resilience fallback
-must honor that contract. Before enabling depth publication, the subprocess
-requires a finite SDK `depth_scale` strictly within `(0, 0.1)` meters per
-sensor unit. The fallback additionally checks the aligned frame's reported
-width and height and requires exactly `640 * 480 * 2` raw bytes; truncated,
-odd-length, oversized, or differently negotiated frames are never compressed
-under the declared dimensions. An invalid scale or fallback payload disables
-the depth output for the remainder of the camera subprocess lifetime, while
-color/JPEG media production continues. A timestamp mapping failure alone
-continues to use the previously documented arrival-stamp/empty-frame fallback.
+The original `depth` card is the sole `image/depth-zlib` source at
+`/<namespace>/camera/depth`. It reuses `rgbd_camera.RgbdCameraPublisher`:
+640×480 rectified native-depth optical geometry, measured little-endian uint16
+millimetres, zero invalid. Its matched RGB is the `camera` card's additional
+`registered_rgb` port at `/<namespace>/camera/rgbd/color`. Public depth is no
+longer in the original display color grid. There is no `/camera/rgbd/depth`
+publisher, duplicate depth encoder, arrival-stamp fallback or legacy
+align-to-color fallback on the public depth topic.
 
-The checks are in `device._validate_depth_scale` and
-`device._depth_millimetre_bytes` and have ROS-free negative cases in
-`tests/bumi_visual_odometry/test_bundle_hook.py`.
+The producer requires finite SDK depth scale strictly within `(0, 0.1)` metres
+per unit, supported measured intrinsics/distortion, exact uint16 source shape,
+and valid monotonic capture clock mapping with the existing skew/drift bounds.
+Invalid input pauses shared depth and removes its ready declaration; native
+color display may continue. Missing optional motion or body-camera TF does not
+disable valid depth. Bumi's arrival-derived hardware-clock mapping remains
+explicitly unverified; this is not hardware timing or navigation acceptance.
+
+The optional bundle-local RTAB-Map raw branch still uses its own color-grid
+inputs and existing metadata. It does not publish public compressed depth.
+Generic Perception VO and Point Cloud consume the public pair's real matching
+camera_info directly. The body IMU port remains data/json; use the clearly
+named optional camera_imu port for calibrated RealSense motion.
+
+Tests in `tests/test_bumi_rgbd_adapter.py`, `tests/test_bumi_camera_imu.py` and
+`tests/bumi_visual_odometry/test_bundle_hook.py` exercise scale, geometry,
+capture headers, missing optional inputs, independent card controls and one
+capture owner. Migration requires rewiring the retired `camera_rgbd` card to
+the original camera/depth/imu cards. Hardware/USB throughput, motion timing,
+TF installation and physical accuracy remain untested offline.

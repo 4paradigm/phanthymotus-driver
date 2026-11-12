@@ -51,13 +51,13 @@ def camera_declarations(root, geometry, frame_id, clock_id, source_clock, offset
                       clock_mapping='fixed_arrival_offset' if source_clock == 'hardware_clock' else 'device_wall',
                       clock_mapping_verified=False))
     color = dict(deepcopy(common), topic=root + '/color', format='image/jpeg')
-    depth = dict(deepcopy(common), topic=root + '/depth', format='image/depth-zlib')
+    depth = dict(deepcopy(common), topic=root.removesuffix('/rgbd') + '/depth', format='image/depth-zlib')
     depth['vendor'].update(depth_unit='mm', depth_source='measured')
     return [color, depth]
 
 
 class RgbdCameraPublisher:
-    """One optional computation branch; never opens a camera or commands motion."""
+    """Sole normalized depth producer, sharing the existing capture owner."""
 
     def __init__(self, node, namespace, pipeline, qos, *, report=lambda status: None,
                  min_interval_s=0.):
@@ -67,12 +67,14 @@ class RgbdCameraPublisher:
         self.frame_id = f'{namespace}_depth_optical'
         self.clock_id = 'realsense_capture/' + uuid.uuid4().hex
         self.scale = pipeline.get_active_profile().get_device().first_depth_sensor().get_depth_scale()
-        if not isinstance(self.scale, (int, float)) or not math.isfinite(self.scale) or not 0 < self.scale < .1:
+        if type(self.scale) not in (int, float) or not math.isfinite(self.scale) or not 0 < self.scale < .1:
             raise ValueError('invalid SDK depth scale')
         import pyrealsense2 as rs
         self.align_to_depth = rs.align(rs.stream.depth)
-        self.pubs = {kind: node.create_publisher(CompressedImage, self.root + '/' + kind, qos)
-                     for kind in ('color', 'depth')}
+        self.pubs = {kind: node.create_publisher(CompressedImage, topic, qos)
+                     for kind, topic in (('color', self.root + '/color'),
+                                         ('depth', f'/{namespace}/camera/depth'))}
+        self.enabled = {'camera', 'depth', 'imu'}
         self.clocks = [ClockMap(), ClockMap()]
         self.geometry = self.signature = None
         self.report = report
@@ -89,6 +91,13 @@ class RgbdCameraPublisher:
         self._reported_mount = None
         self.report(dict(ready=False, camera_info=[], error='awaiting calibrated capture',
                          body_mount_status=self.body_mount.status()))
+
+    def set_enabled(self, cards, *, restarted=False):
+        cards = set(cards)
+        if cards != self.enabled or restarted:
+            self.enabled = cards
+            self.last_emit = None
+            self.ready = False
 
     def motion_stamp(self, source_ms, domain):
         # Reuse the image clock's established offset; motion must never fit its
@@ -107,8 +116,13 @@ class RgbdCameraPublisher:
         self.body_mount.close()
 
     def unavailable(self, error):
-        if self.ready or self.last_error is None:
+        if self.ready or str(error) != self.last_error:
+            # These failures cannot be repaired by another frame from the
+            # negotiated source. Do not hold a startup request for ten seconds.
+            terminal = ('intrinsics', 'distortion', '640x480', 'calibration changed',
+                        'pixel geometry', 'clock reset or domain changed')
             self.report(dict(ready=False, camera_info=[], error=str(error)[:300],
+                             retryable=not any(reason in str(error) for reason in terminal),
                              body_mount_status=self.body_mount.status()))
         self.ready = False
         self.last_error = str(error)
@@ -168,7 +182,8 @@ class RgbdCameraPublisher:
         except Exception as error:
             self.mount_error = str(error)
         for kind, msg in messages:
-            self.pubs[kind].publish(msg)
+            if ('camera' if kind == 'color' else 'depth') in self.enabled:
+                self.pubs[kind].publish(msg)
         self.last_emit = now
         self.last_error = None
         mount_status = self.body_mount.status()

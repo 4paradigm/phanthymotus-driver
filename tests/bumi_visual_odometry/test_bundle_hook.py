@@ -6,9 +6,13 @@ hardware, codec, ROS and child-process boundaries are replaced here.
 """
 from array import array
 import importlib.util
+import json
 import sys
 import threading
 import zlib
+import time
+import numpy as np
+import cv2
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -44,6 +48,15 @@ def capture(monkeypatch):
     class Frame:
         def __init__(self, data):
             self.data = data
+            self.profile = NS(as_video_stream_profile=lambda: NS(intrinsics=NS(
+                width=state.depth_dims[0], height=state.depth_dims[1], fx=600., fy=601.,
+                ppx=320., ppy=240., model='none', coeffs=[0.] * 5)))
+
+        def get_timestamp(self):
+            return 1000. + state.iterations * 30.
+
+        def get_frame_timestamp_domain(self):
+            return 'hardware_clock'
 
         def get_data(self):
             return self.data
@@ -55,13 +68,21 @@ def capture(monkeypatch):
             return state.depth_dims[1]
 
     class Frames:
+        def __init__(self):
+            self.source_ms = 1000. + state.iterations * 30.
         def get_color_frame(self):
-            assert state.aligned
-            return Frame(raw.color)
+            frame = Frame(np.full((480, 640, 3), 20, np.uint8))
+            frame.get_timestamp = lambda: self.source_ms
+            return frame
 
         def get_depth_frame(self):
-            assert state.aligned
-            return Frame(getattr(state, 'raw_depth_override', raw.depth))
+            payload = getattr(state, 'raw_depth_override', raw.depth)
+            pixels = np.frombuffer(payload, '<u2')
+            if pixels.size == 640 * 480:
+                pixels = pixels.reshape(state.depth_dims[1], state.depth_dims[0])
+            frame = Frame(pixels)
+            frame.get_timestamp = lambda: self.source_ms
+            return frame
 
     class Pipeline:
         def start(self, config):
@@ -89,6 +110,9 @@ def capture(monkeypatch):
                 raise RuntimeError('test loop finished')
             return Frames()
 
+        def poll_for_frames(self):
+            return None
+
         def stop(self):
             state.stopped = True
 
@@ -105,10 +129,12 @@ def capture(monkeypatch):
         config=lambda: NS(enable_stream=lambda *args: state.streams.append(args)),
         stream=NS(color='color', depth='depth'),
         format=NS(bgr8='bgr8', z16='z16'), align=align))
-    monkeypatch.setitem(sys.modules, 'numpy', NS(asanyarray=lambda data: Pixels(data)))
+    monkeypatch.setitem(sys.modules, 'numpy', np)
     monkeypatch.setitem(sys.modules, 'turbojpeg', None)
     monkeypatch.setitem(sys.modules, 'cv2', NS(
-        IMWRITE_JPEG_QUALITY=1,
+        IMWRITE_JPEG_QUALITY=1, CV_32FC1=cv2.CV_32FC1,
+        INTER_LINEAR=cv2.INTER_LINEAR, INTER_NEAREST=cv2.INTER_NEAREST,
+        initUndistortRectifyMap=cv2.initUndistortRectifyMap, remap=cv2.remap,
         imencode=lambda *args: (True, NS(tobytes=lambda: b'JPEG'))))
 
     import common.logsafe
@@ -116,13 +142,22 @@ def capture(monkeypatch):
 
     class Message:
         def __init__(self):
-            self.header = NS(stamp=None)
+            self.header = NS(stamp=NS(sec=0, nanosec=0), frame_id='')
             self.data = b''
             self.format = ''
 
     class Bool:
         def __init__(self, data=False):
             self.data = data
+            self.profile = NS(as_video_stream_profile=lambda: NS(intrinsics=NS(
+                width=state.depth_dims[0], height=state.depth_dims[1], fx=600., fy=601.,
+                ppx=320., ppy=240., model='none', coeffs=[0.] * 5)))
+
+        def get_timestamp(self):
+            return 1000. + state.iterations * 30.
+
+        def get_frame_timestamp_domain(self):
+            return 'hardware_clock'
 
     messages = sys.modules['sensor_msgs.msg']
     monkeypatch.setattr(messages, 'CompressedImage', Message)
@@ -140,7 +175,12 @@ def capture(monkeypatch):
 
         def create_publisher(self, cls, topic, qos):
             state.published[topic] = []
-            return NS(publish=state.published[topic].append)
+            def publish(message):
+                hook = getattr(state, 'on_publish', None)
+                if hook:
+                    hook(topic, message)
+                state.published[topic].append(message)
+            return NS(publish=publish)
 
         def create_subscription(self, cls, topic, callback, qos):
             self.subscriptions[topic] = callback
@@ -163,209 +203,62 @@ def capture(monkeypatch):
             hook(node)
 
     rclpy.spin_once = spin_once
+    from noetix.bumi import rgbd_camera
+    monkeypatch.setitem(sys.modules, 'rgbd_camera', rgbd_camera)
+    monkeypatch.setattr(time, 'monotonic', lambda: 100. + state.iterations)
+    monkeypatch.setattr(time, 'time_ns', lambda: 10_000_000_000 + state.iterations * 30_000_000)
     return device, state
 
 
-def test_capture_timed_depth_runs_without_visual_odometry(capture, monkeypatch):
+def test_original_depth_is_normalized_capture_mapped_and_owned_once(capture, monkeypatch):
     device, state = capture
     monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
-    seen = []
-
-    class Mapper:
-        def __init__(self, scale):
-            assert scale == .001
-
-    class CaptureTimed:
-        def __init__(self, publisher, namespace, mapper, *, metadata_publisher=None):
-            seen.append(('init', namespace, publisher is not None))
-
-        def publish(self, source, aligned, *, fallback_stamp_ns=None):
-            seen.append(('publish', source, aligned, fallback_stamp_ns))
-
-    monkeypatch.setitem(sys.modules, 'visual_inputs',
-                        NS(CaptureTimeMapper=Mapper, CaptureTimedDepthPublisher=CaptureTimed))
+    state.depth_scale = .002
     device._camera_subprocess('robot')
-    assert [x[0] for x in seen] == ['init', 'publish']
-    # The media loop hands the arrival stamp to the publisher as the honest
-    # fallback, so a clock-mapping failure never drops a depth frame.
-    assert seen[1][3] == 1_000_000_002
-    assert state.published['/robot/camera/color']
-    # One publisher on the original topic; no second depth topic is created,
-    # and the fake publisher owns publication so the legacy path does not run.
-    assert '/robot/camera/depth_metric' not in state.published
-    assert state.published['/robot/camera/depth'] == []
+    depth = state.published['/robot/camera/depth'][0]
+    assert depth.header.frame_id == 'robot_depth_optical'
+    assert depth.header.stamp.sec * 10**9 + depth.header.stamp.nanosec == 10_030_000_000
+    assert isinstance(depth.data, array) and depth.data.typecode == 'B'
+    assert zlib.decompress(depth.data) == b'\x02\x00\x04\x00' + bytes(640 * 480 * 2 - 4)
+    assert '/robot/camera/rgbd/depth' not in state.published
+    assert state.alignment == ['depth']
+    assert state.stopped
 
 
-def test_depth_stream_and_vo_use_same_time_mapper(capture, monkeypatch):
+def test_invalid_capture_never_falls_back_to_legacy_depth(capture, monkeypatch):
     device, state = capture
-    monkeypatch.setenv('BUMI_VISUAL_ODOMETRY', '1')
     state.frame_limit = 2
-    seen = []
-
-    class Mapper:
-        def __init__(self, scale):
-            pass
-
-    class CaptureTimed:
-        def __init__(self, publisher, namespace, mapper, *, metadata_publisher=None):
-            self.time_mapper = mapper
-            seen.append(mapper)
-
-        def publish(self, source, aligned, *, fallback_stamp_ns=None):
-            seen.append(self.time_mapper)
-
-    class Raw:
-        enabled = True
-
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def publish(self, source, aligned):
-            seen.append(self.time_mapper)
-
-    monkeypatch.setitem(sys.modules, 'visual_inputs', NS(
-        CaptureTimeMapper=Mapper, CaptureTimedDepthPublisher=CaptureTimed,
-        RawCameraPublisher=Raw))
-    device._camera_subprocess('robot')
-    # One constructor plus one publish each from the depth output and the two
-    # raw-branch frames: every one of them sees the single shared mapper.
-    assert len(seen) == 5 and all(item is seen[0] for item in seen)
-
-
-def test_capture_timed_depth_failure_falls_back_to_legacy_publish(capture, monkeypatch):
-    device, state = capture
-    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
-    state.frame_limit = 2
-
-    class Mapper:
-        def __init__(self, scale):
-            pass
-
-    class CaptureTimed:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def publish(self, source, aligned, *, fallback_stamp_ns=None):
-            raise ValueError('invalid capture timestamp')
-
-    monkeypatch.setitem(sys.modules, 'visual_inputs',
-                        NS(CaptureTimeMapper=Mapper, CaptureTimedDepthPublisher=CaptureTimed))
+    class Broken:
+        def __init__(self, *a, **kw): pass
+        def set_enabled(self, cards): pass
+        def publish(self, frames): raise ValueError('invalid capture timestamp')
+        def unavailable(self, error): pass
+    monkeypatch.setitem(sys.modules, 'rgbd_camera', NS(RgbdCameraPublisher=Broken))
     device._camera_subprocess('robot')
     assert len(state.published['/robot/camera/color']) == 2
-    assert len(state.published['/robot/camera/depth']) == 2
-    # The fallback is the legacy contract byte-for-byte: navi keeps decoding.
-    assert zlib.decompress(state.published['/robot/camera/depth'][0].data) == b'\x01\x00\x02\x00' + bytes(640 * 480 * 2 - 4)
+    assert not state.published.get('/robot/camera/depth')
+    assert '/robot/camera/depth/metadata' not in state.published
 
 
-def test_depth_fallback_applies_the_sdk_scale_when_the_publisher_fails(
-        capture, monkeypatch):
-    """The fallback publishes the declared millimetre payload, not raw units.
-
-    On a camera whose SDK depth scale is not 1 mm, publishing the raw Z16
-    values under the depth card's `depth_unit=mm` declaration would make every
-    range/point-cloud decision systematically wrong on the error path. The
-    fallback therefore applies the same scale and quantization as the normal
-    path.
-    """
-    device, state = capture
-    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
-    state.depth_scale = .002
-
-    class Mapper:
-        def __init__(self, scale):
-            assert scale == .002
-
-    class CaptureTimed:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def publish(self, source, aligned, *, fallback_stamp_ns=None):
-            raise ValueError('invalid capture timestamp')
-
-    monkeypatch.setitem(sys.modules, 'visual_inputs',
-                        NS(CaptureTimeMapper=Mapper, CaptureTimedDepthPublisher=CaptureTimed))
-    device._camera_subprocess('robot')
-    published = state.published['/robot/camera/depth']
-    assert len(published) == 1
-    assert published[0].format == '16UC1; compressedDepth zlib'
-    # raw z16 values 1, 2 -> 2 mm, 4 mm at a 0.002 depth scale.
-    assert zlib.decompress(published[0].data) == b'\x02\x00\x04\x00' + bytes(640 * 480 * 2 - 4)
-
-
-def test_depth_fallback_applies_the_sdk_scale_without_the_capture_time_module(
-        capture, monkeypatch):
-    device, state = capture
-    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
-    state.depth_scale = .002
-    monkeypatch.setitem(sys.modules, 'visual_inputs', None)
-    device._camera_subprocess('robot')
-    assert state.published['/robot/camera/color']
-    published = state.published['/robot/camera/depth']
-    assert len(published) == 1
-    assert zlib.decompress(published[0].data) == b'\x02\x00\x04\x00' + bytes(640 * 480 * 2 - 4)
-
-
-def test_depth_stream_is_disabled_when_the_sdk_scale_is_unavailable(
-        capture, monkeypatch, capsys):
-    device, state = capture
-    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
-    state.scale_error = RuntimeError('no depth sensor')
-    device._camera_subprocess('robot')
-    # Media production continues; a depth stream with unknown units is not
-    # published under the millimetre declaration.
-    assert state.published['/robot/camera/color']
-    assert state.published['/robot/camera/depth'] == []
-    assert 'SDK depth scale unavailable; depth stream disabled' in capsys.readouterr().out
-
-
-def test_depth_card_declares_one_capture_timed_output(capture, monkeypatch):
+def test_depth_card_waits_for_real_normalized_camera_info(capture, monkeypatch):
     device, _ = capture
-    monkeypatch.syspath_prepend(str(BUMI))
     card = device.CameraPlugin.__new__(device.CameraPlugin)
+    card._activations = dict(camera=0, depth=0, imu=0)
+    card._stop_generations = dict(camera=0, depth=0, imu=0)
     card._namespace = 'robot'
     card._color_topic, card._depth_topic = '/robot/camera/color', '/robot/camera/depth'
     card._intrinsics_lock = threading.Lock()
     card._rgbd_status = dict(ready=False, camera_info=[], error='awaiting calibrated capture')
     card._proc = None
-    card._intrinsics = {'depth': {'width': 640, 'height': 480, 'fx': 600., 'fy': 601.,
-                                   'ppx': 320., 'ppy': 240., 'model': 'none', 'coeffs': [0.] * 5}}
+    card._cards = set()
+    card._lifecycle_lock = threading.RLock()
+    card._intrinsics = {}
     tool = next(x for x in card.get_tools() if x['name'] == 'depth')
     result = card.dispatch('info', {'_tool_name': 'depth'})
-    # Exactly one depth output: the original topic, enriched rather than duplicated.
     assert tool['topic_out'] == result['topic_out'] == [
         {'topic': '/robot/camera/depth', 'format': 'image/depth-zlib'}]
-    metadata = result['input_metadata']
-    assert len(metadata) == 1
-    assert metadata[0]['topic'] == '/robot/camera/depth'
-    assert metadata[0]['frame_metadata_topic'] == '/robot/camera/depth/metadata'
-    assert metadata[0]['stamp_source'] == 'measurement'
-    assert metadata[0]['clock']['verified'] is False
-    infos = {entry['topic']: entry for entry in result['camera_info']}
-    assert set(infos) == {'/robot/camera/depth'}
-    info = infos['/robot/camera/depth']
-    assert info['K'][0] == 600.
-    assert info['source'] == 'derived-from-K'
-    assert info['distortion_model'] == 'pinhole'
-    vendor = info['vendor']
-    assert vendor['depth_unit'] == 'mm'
-    assert vendor['depth_source'] == 'measured'
-    assert vendor['timestamp_semantics'] == 'source_capture_mapped'
-    assert vendor['clock_mapping'] == 'shared_camera_mapper'
+    assert result['camera_info'] == [] and result['sourceReady'] is False
 
-
-def test_media_uses_byte_buffers_without_changing_encoded_payloads(capture, monkeypatch):
-    device, state = capture
-    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
-    device._camera_subprocess('robot')
-
-    color = state.published['/robot/camera/color'][0]
-    depth = state.published['/robot/camera/depth'][0]
-    assert isinstance(color.data, array) and color.data.typecode == 'B'
-    assert isinstance(depth.data, array) and depth.data.typecode == 'B'
-    assert bytes(color.data) == b'JPEG'
-    assert color.format == 'jpeg'
-    assert zlib.decompress(depth.data) == b'\x01\x00\x02\x00' + bytes(640 * 480 * 2 - 4)
-    assert depth.format == '16UC1; compressedDepth zlib'
 
 
 def test_raw_branch_reuses_the_same_frameset_as_the_media_publishers(
@@ -603,8 +496,8 @@ def test_invalid_sdk_depth_scale_disables_depth_but_keeps_color(
     monkeypatch.setitem(sys.modules, 'visual_inputs', None)
     device._camera_subprocess('robot')
     assert state.published['/robot/camera/color']
-    assert state.published['/robot/camera/depth'] == []
-    assert 'depth stream disabled' in capsys.readouterr().out
+    assert not state.published.get('/robot/camera/depth')
+    assert 'invalid SDK depth scale' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(('dimensions', 'payload'), [
@@ -614,7 +507,7 @@ def test_invalid_sdk_depth_scale_disables_depth_but_keeps_color(
     ((640, 480), b'\x01'),
     ((640, 480), b'\x01\x00' + bytes(640 * 480 * 2)),
 ])
-def test_fallback_rejects_wrong_dimensions_and_raw_buffer_sizes(
+def test_normalized_source_rejects_wrong_dimensions_and_raw_buffer_sizes(
         capture, monkeypatch, dimensions, payload, capsys):
     device, state = capture
     monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
@@ -624,18 +517,30 @@ def test_fallback_rejects_wrong_dimensions_and_raw_buffer_sizes(
     state.frame_limit = 2
     device._camera_subprocess('robot')
     assert len(state.published['/robot/camera/color']) == 2
-    assert state.published['/robot/camera/depth'] == []
+    assert not state.published.get('/robot/camera/depth')
     output = capsys.readouterr().out
-    assert output.count('depth payload contract invalid; depth stream disabled') == 1
+    assert not state.published['/robot/camera/depth']
 
 
-def test_fallback_encoder_validates_scale_shape_even_without_numpy(capture):
-    device, _ = capture
-    raw = b'\x01\x00' + bytes(640 * 480 * 2 - 2)
-    assert device._depth_millimetre_bytes(raw, 0.001, width=640, height=480) == raw
-    with pytest.raises(ValueError, match='uint16'):
-        device._depth_millimetre_bytes(raw[:-1], 0.001, width=640, height=480)
-    with pytest.raises(ValueError, match='640x480'):
-        device._depth_millimetre_bytes(raw, 0.001, width=320, height=960)
-    with pytest.raises(ValueError, match='SDK depth scale'):
-        device._depth_millimetre_bytes(raw, float('nan'), width=640, height=480)
+
+def test_card_controls_stop_depth_without_stopping_color_or_owner(capture, monkeypatch):
+    device, state = capture
+    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
+    state.frame_limit = 4
+    def on_spin(node):
+        callback = node.subscriptions['/robot/camera/cards_enabled']
+        if state.iterations == 1:
+            callback(NS(data=json.dumps(dict(generation=1, enabled=['camera'], activations=dict(camera=0, depth=0, imu=0)))))
+        elif state.iterations == 2:
+            callback(NS(data=json.dumps(dict(generation=2, enabled=['camera','depth'], activations=dict(camera=0, depth=1, imu=0)))))
+        elif state.iterations == 3:
+            callback(NS(data=json.dumps(dict(generation=3, enabled=['depth'], activations=dict(camera=0, depth=1, imu=0)))))
+    state.on_spin = on_spin
+    device._camera_subprocess('robot')
+    assert len(state.published['/robot/camera/color']) == 3
+    assert len(state.published['/robot/camera/rgbd/color']) == 3
+    depth = state.published['/robot/camera/depth']
+    assert len(depth) == 3
+    assert [m.header.stamp.nanosec for m in depth] == [30_000_000, 90_000_000, 120_000_000]
+    assert '/robot/camera/rgbd/depth' not in state.published
+    assert state.stopped

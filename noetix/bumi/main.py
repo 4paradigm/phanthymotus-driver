@@ -122,6 +122,7 @@ class BumiDeviceBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
+        state_plugin = None
         loco_plugin = None
         # The camera subprocess reads this env var; set it before any plugin can
         # start that subprocess, so the raw RGB-D branch is published only when
@@ -179,6 +180,8 @@ class BumiDeviceBundle:
             from device import CameraPlugin
             camera_plugin = CameraPlugin(plugins_cfg["camera"], namespace, executor)
             self._plugins.append(camera_plugin)
+            if state_plugin is not None:
+                state_plugin._camera_plugin = camera_plugin
             print("[bundle] CameraPlugin loaded")
 
         if plugins_cfg.get("visual_odometry", {}).get("enabled", False):

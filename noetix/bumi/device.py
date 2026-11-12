@@ -223,7 +223,17 @@ class _BumiStateNode(Node):
         self._joints_pub  = self.create_publisher(String, self._joints_topic,  _LOW_LAT_QOS)
 
         self._running = False
+        self._imu_enabled = True
+        self._imu_lock = threading.RLock()
         self._thread: threading.Thread | None = None
+
+    def set_imu_enabled(self, enabled):
+        if not self._imu_lock.acquire(timeout=5.):
+            raise TimeoutError('body IMU change was not confirmed within five seconds')
+        try:
+            self._imu_enabled = enabled
+        finally:
+            self._imu_lock.release()
 
     def start_polling(self):
         self._running = True
@@ -243,24 +253,25 @@ class _BumiStateNode(Node):
                 now = time.monotonic()
 
                 # IMU: 20 Hz
-                if now - last_imu_time >= self._IMU_INTERVAL:
-                    last_imu_time = now
-                    imu = self._high_ctrl.get_imu_data()
-                    # Timestamp the reading, not the consumer callback: the
-                    # visual card uses this to reject delayed/replayed samples.
-                    imu_data = {
-                        "stamp_ns":     int(self.get_clock().now().nanoseconds),
-                        # The SDK exposes no hardware capture timestamp; this
-                        # is read-completion time, treated conservatively by
-                        # the visual card's 500 ms freshness window.
-                        "timestamp_source": "read_completion",
-                        "quaternion":    [imu.ori[i] for i in range(4)],
-                        "angular_vel":   [imu.angular_vel[i] for i in range(3)],
-                        "linear_acc":    [imu.linear_acc[i] for i in range(3)],
-                    }
-                    msg = String()
-                    msg.data = json.dumps(imu_data)
-                    self._imu_pub.publish(msg)
+                with self._imu_lock:
+                    if self._imu_enabled and now - last_imu_time >= self._IMU_INTERVAL:
+                        last_imu_time = now
+                        imu = self._high_ctrl.get_imu_data()
+                        # Timestamp the reading, not the consumer callback: the
+                        # visual card uses this to reject delayed/replayed samples.
+                        imu_data = {
+                            "stamp_ns":     int(self.get_clock().now().nanoseconds),
+                            # The SDK exposes no hardware capture timestamp; this
+                            # is read-completion time, treated conservatively by
+                            # the visual card's 500 ms freshness window.
+                            "timestamp_source": "read_completion",
+                            "quaternion":    [imu.ori[i] for i in range(4)],
+                            "angular_vel":   [imu.angular_vel[i] for i in range(3)],
+                            "linear_acc":    [imu.linear_acc[i] for i in range(3)],
+                        }
+                        msg = String()
+                        msg.data = json.dumps(imu_data)
+                        self._imu_pub.publish(msg)
 
                 # Joints: 10 Hz
                 if now - last_joints_time >= self._JOINTS_INTERVAL:
@@ -315,6 +326,7 @@ class StatePlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor, high_ctrl):
         self._namespace = namespace
         self._high_ctrl = high_ctrl
+        self._camera_plugin = None
         self._node = _BumiStateNode(namespace, high_ctrl)
         executor.add_node(self._node)
 
@@ -327,7 +339,8 @@ class StatePlugin:
                 "multiInstance": False,
                 "description": f"Bumi IMU — quaternion, angular velocity, linear acceleration. Publishes at 20Hz to /{ns}/state/imu",
                 "inputSchema": {"type": "object", "properties": {}},
-                "topic_out": [{"topic": f"/{ns}/state/imu", "format": "data/json"}],
+                "topic_out": [{"topic": f"/{ns}/state/imu", "format": "data/json"},
+                              {"name": "camera_imu", "topic": f"/{ns}/camera/rgbd/imu", "format": "sensor/imu", "optional": True}],
             },
             {
                 "name": "battery",
@@ -355,12 +368,36 @@ class StatePlugin:
         ]
 
     def start(self) -> None:
+        self._node.set_imu_enabled(True)
         self._node.start_polling()
+        if self._camera_plugin is not None:
+            self._camera_plugin.start_card("imu")
 
     def stop(self) -> None:
+        self._node.set_imu_enabled(False)
         self._node.stop_polling()
+        if self._camera_plugin is not None:
+            self._camera_plugin.stop_card("imu")
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if args.get('_tool_name') == 'imu' and action in ('start', 'stop', 'info'):
+            if action != 'info':
+                try:
+                    self._node.set_imu_enabled(action == 'start')
+                    if self._camera_plugin is not None:
+                        if action == 'start':
+                            self._camera_plugin.start_card('imu')
+                        else:
+                            self._camera_plugin.stop_card('imu')
+                except (RuntimeError, TimeoutError) as error:
+                    return dict(state='error', sourceRequestDisabled=not self._node._imu_enabled, error=str(error))
+            camera = (self._camera_plugin.camera_imu_info() if self._camera_plugin is not None else
+                      dict(imu_status=dict(state='unavailable', reason='camera plugin disabled')))
+            return dict(state='stopping' if camera.get('state') == 'stopping' else
+                        ('running' if self._node._imu_enabled else 'idle'),
+                        sourceRequestDisabled=not self._node._imu_enabled,
+                        topic_out=next(t['topic_out'] for t in self.get_tools() if t['name'] == 'imu'),
+                        imu_status=camera['imu_status'])
         if action == "start":
             return {"state": "running"}
         if action == "stop":
@@ -2304,58 +2341,6 @@ class SpeakerPlugin:
 
 # ── CameraPlugin (sensor, subprocess) ────────────────────────────────────────
 
-def _validate_depth_scale(depth_scale):
-    """Fail closed if RealSense did not provide a usable meters-per-unit scale."""
-    if isinstance(depth_scale, bool) or not isinstance(depth_scale, (int, float)):
-        raise ValueError('SDK depth scale must be finite and within (0, 0.1) m/unit')
-    try:
-        value = float(depth_scale)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError('SDK depth scale must be finite and within (0, 0.1) m/unit') from exc
-    if not math.isfinite(value) or not 0.0 < value < 0.1:
-        raise ValueError('SDK depth scale must be finite and within (0, 0.1) m/unit')
-    return value
-
-
-def _depth_millimetre_bytes(raw, depth_scale, *, width=None, height=None):
-    """Encode exactly one 640x480 aligned Z16 frame as uint16 millimetres.
-
-    Every fallback must enforce the same wire contract as the normal
-    CaptureTimedDepthPublisher; failing to establish the dimensions or unit
-    is an error, not permission to publish an arbitrary byte buffer.
-    """
-    scale = _validate_depth_scale(depth_scale)
-    if (type(width) is not int or type(height) is not int
-            or (width, height) != (640, 480)):
-        raise ValueError('compressed depth requires a 640x480 pixel grid')
-    data = bytes(raw)
-    if len(data) != width * height * 2:
-        raise ValueError('compressed depth requires exactly 640x480 uint16 pixels')
-    # No conversion is necessary for the standard 1 mm sensor scale.
-    if scale == .001:
-        return data
-    try:
-        import numpy as np
-        pixels = np.frombuffer(data, dtype='<u2')
-        millimetres = np.rint(pixels.astype(np.float64) * (scale * 1000.))
-        millimetres[(millimetres < 1) | (millimetres > 65535) | ~np.isfinite(millimetres)] = 0
-        return np.ascontiguousarray(millimetres.astype('<u2')).tobytes()
-    except (ImportError, AttributeError):
-        # A deliberately supported fallback when optional numerical modules
-        # are missing; scale and buffer geometry were already validated.
-        pass
-    out = bytearray(len(data))
-    factor = scale * 1000.
-    for index in range(0, len(data), 2):
-        value = data[index] | (data[index + 1] << 8)
-        millimetres = int(round(value * factor))
-        if not 1 <= millimetres <= 65535:
-            millimetres = 0
-        out[index] = millimetres & 0xFF
-        out[index + 1] = millimetres >> 8
-    return bytes(out)
-
-
 def _camera_subprocess(namespace: str):
     """Camera subprocess — captures Realsense D435i color+depth, publishes to ROS2."""
     # Match the Q5 camera worker's child-process logging protection.
@@ -2371,7 +2356,6 @@ def _camera_subprocess(namespace: str):
     from rclpy.node import Node as _Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
     from sensor_msgs.msg import CompressedImage as _CompressedImage
-    from sensor_msgs.msg import Image as _SensorImage
     from std_msgs.msg import String as _String
     from common.realsense_imu import MotionSource, CaptureQueue, motion_profiles, start_optional_motion
 
@@ -2409,9 +2393,6 @@ def _camera_subprocess(namespace: str):
     color_topic = f"/{namespace}/camera/color"
     depth_topic = f"/{namespace}/camera/depth"
     color_pub = node.create_publisher(_CompressedImage, color_topic, _QOS)
-    depth_pub = node.create_publisher(_CompressedImage, depth_topic, _QOS)
-    # Sidecar is deliberately independent of the original depth media topic.
-    depth_metadata_pub = node.create_publisher(_String, depth_topic + '/metadata', _QOS)
 
     pipeline = rs.pipeline()
     config = rs.config()
@@ -2419,11 +2400,62 @@ def _camera_subprocess(namespace: str):
     config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
 
     rgbd_inputs = None
+    control_lock = threading.RLock()
+    control = json.loads(os.environ.get('BUMI_CAMERA_CARDS', json.dumps(dict(
+        generation=0, enabled=['camera', 'depth', 'imu'],
+        activations=dict(camera=0, depth=0, imu=0)))))
+    enabled_cards = set(control['enabled'])
+    capture_epoch = (control['generation'], False)
+    ack_pub = node.create_publisher(_String, f'/{namespace}/camera/cards_applied', _CONTROL_QOS)
+    def acknowledge_control():
+        message = _String()
+        message.data = json.dumps(control)
+        ack_pub.publish(message)
+    def cards_enabled(msg):
+        nonlocal enabled_cards, control, capture_epoch
+        packet = json.loads(msg.data)
+        # Applied only at the capture-loop boundary. The callback lock also
+        # places the ACK after every prior SDK motion publication has returned.
+        with control_lock:
+            if packet['generation'] <= control['generation']:
+                acknowledge_control()
+                return
+            capture_epoch = (packet['generation'], True)
+            try:
+                new_cards = set(packet['enabled'])
+                restarted = {name for name in new_cards
+                             if packet['activations'][name] != control['activations'][name]}
+                enabled_cards = new_cards
+                if 'imu' in restarted and imu.configured:
+                    try:
+                        imu.configure(active)  # fresh epoch, no held accel
+                    except Exception as exc:
+                        imu.unavailable(exc)
+                if restarted & {'camera', 'depth'}:
+                    if isinstance(capture, CaptureQueue):
+                        import queue
+                        try:
+                            capture.frames.get_nowait()
+                        except queue.Empty:
+                            pass
+                    else:
+                        # Flush SDK video queued before an activation as well.
+                        while pipeline.poll_for_frames():
+                            pass
+                control = packet
+                if rgbd_inputs is not None:
+                    rgbd_inputs.set_enabled(enabled_cards, restarted=bool(restarted))
+                acknowledge_control()
+            finally:
+                capture_epoch = (control['generation'], False)
+    node.create_subscription(_String, f'/{namespace}/camera/cards_enabled',
+                             cards_enabled, _CONTROL_QOS)
     imu_pub = node.create_publisher(_String, f'/{namespace}/camera/rgbd/imu', _QOS)
     def publish_imu(packet):
         msg = _String()
         msg.data = json.dumps(packet, allow_nan=False)
-        imu_pub.publish(msg)
+        if 'imu' in enabled_cards:
+            imu_pub.publish(msg)
     def map_motion(source_ms, domain):
         if rgbd_inputs is None:
             raise ValueError('RGB-D capture clock mapping unavailable')
@@ -2435,6 +2467,16 @@ def _camera_subprocess(namespace: str):
                        map_motion, publish_imu,
                        clock_id=lambda: rgbd_inputs.clock_id + '/' + rgbd_inputs.clocks[0].domain)
     capture = CaptureQueue(imu)
+    def on_capture(frame):
+        # Snapshot the epoch and applying flag together before any preemption.
+        observed_epoch = capture_epoch
+        if observed_epoch[1]:
+            return
+        with control_lock:
+            # An SDK callback already waiting at the boundary belongs to the
+            # prior generation and cannot refill the freshly cleared queue.
+            if observed_epoch == capture_epoch:
+                capture(frame)
     try:
         try:
             device = config.resolve(rs.pipeline_wrapper(pipeline)).get_device()
@@ -2445,7 +2487,7 @@ def _camera_subprocess(namespace: str):
             active = pipeline.start(config)
             capture = pipeline
         else:
-            active, imu_error = start_optional_motion(rs, pipeline, config, device, capture)
+            active, imu_error = start_optional_motion(rs, pipeline, config, device, on_capture)
             if imu_error:
                 imu.unavailable(imu_error)
             else:
@@ -2458,16 +2500,10 @@ def _camera_subprocess(namespace: str):
         pipeline.stop()
         return
 
-    # VOP detects objects in the RGB image, while navi samples the depth map at
-    # those RGB pixel coordinates.  D435i color and depth come from different
-    # lenses, so equal resolutions alone do not make their pixels correspond.
-    # Register every depth frame onto the color optical plane before publishing
-    # it; the resulting depth image consequently uses the color intrinsics and
-    # camera identity declared by camera_specs.py.
-    align_to_color = rs.align(rs.stream.color)
-
-    print(f"[camera_subprocess] publishing color→{color_topic} "
-          f"depth-aligned-to-color→{depth_topic}", flush=True)
+    # Native color remains the display/photo input. Only the optional legacy
+    # RTAB-Map raw branch uses the color grid; public depth never does.
+    align_to_color = rs.align(rs.stream.color) if os.environ.get("BUMI_VISUAL_ODOMETRY") == "1" else None
+    print(f"[camera_subprocess] publishing color→{color_topic} normalized depth→{depth_topic}", flush=True)
 
     # **The camera knows its own optics; say so out loud.** navi's avoidance
     # corridor is metric, so every frame it converts its half-width back into a
@@ -2494,46 +2530,13 @@ def _camera_subprocess(namespace: str):
                 "model": str(_intr.model).rsplit(".", 1)[-1],
                 "coeffs": list(_intr.coeffs),
             }
-        # rs.align projects the depth samples onto the color image plane.  Its
-        # output grid therefore has the color profile's geometry, not the raw
-        # depth sensor's geometry.  Keep the latter in the diagnostic payload
-        # under depth_sensor, but advertise the actual published output here.
-        _streams["depth"] = dict(_streams["color"])
+        _streams["depth"] = dict(_streams["depth_sensor"])
         print("[camera_subprocess] INTRINSICS " + _json.dumps(_streams), flush=True)
     except Exception as _e:
         # Not fatal: the cards fall back to the datasheet-derived declaration in
         # `camera_specs.SPECS` and say `source` accordingly. Losing the camera
         # over a failed introspection call would be the worse trade.
         print(f"[camera_subprocess] intrinsics unavailable: {_e}", flush=True)
-
-    # Capture-timed depth is the depth card's one output. It shares this
-    # pipeline and the clock mapping with the optional VO raw branch; a fault
-    # here must never take media production down. The fallback publishes only
-    # a validated 640x480 scaled-millimetre frame with an arrival stamp; an
-    # invalid scale or raw buffer disables the depth output rather than
-    # changing the advertised geometry or unit.
-    depth_stream = None
-    shared_time_mapper = None
-    depth_scale = None
-    try:
-        depth_scale = _validate_depth_scale(
-            pipeline.get_active_profile().get_device().first_depth_sensor().get_depth_scale())
-    except Exception as _e:                            # noqa: BLE001
-        # Without the SDK scale the fallback cannot honour the declared uint16
-        # millimetre payload; disable the depth stream rather than publish
-        # mislabelled units.
-        print(f"[camera_subprocess] SDK depth scale unavailable; "
-              f"depth stream disabled: {_e}", flush=True)
-    if depth_scale is not None:
-        try:
-            from visual_inputs import CaptureTimeMapper, CaptureTimedDepthPublisher
-            shared_time_mapper = CaptureTimeMapper(depth_scale)
-            depth_stream = CaptureTimedDepthPublisher(
-                depth_pub, namespace, shared_time_mapper,
-                metadata_publisher=depth_metadata_pub)
-        except Exception as _e:
-            print(f"[camera_subprocess] capture-timed depth unavailable, "
-                  f"using the scaled fallback publish: {_e}", flush=True)
 
     raw_inputs = None
     raw_publish_failures = 0
@@ -2559,8 +2562,6 @@ def _camera_subprocess(namespace: str):
             raw_inputs = RawCameraPublisher(
                 node, namespace, pipeline, _QOS,
                 min_interval_s=(1.0/raw_rate_hz if raw_rate_hz > 0 else 0.0))
-            if shared_time_mapper is not None:
-                raw_inputs.time_mapper = shared_time_mapper
         except Exception as _e:
             print(f"[camera_subprocess] raw RGB-D branch unavailable: {_e}", flush=True)
         if raw_inputs is not None:
@@ -2578,25 +2579,25 @@ def _camera_subprocess(namespace: str):
             except Exception as _e:
                 print(f"[camera_subprocess] raw enable control unavailable: {_e}", flush=True)
 
-    # Generic Perception card inputs share the already-open capture pipeline.
-    # Its calibration/clock failures must leave the display media path running.
+    # The original depth card owns this normalized producer. Invalid geometry,
+    # units or capture time pauses shared depth; color display remains available.
     def report_rgbd(status):
         import json
-        status = dict(status, imu_status=imu.status())
+        status = dict(status, imu_status=dict(imu.status(), activation=control['activations']['imu']),
+                      activations=dict(control['activations']))
         print("[camera_subprocess] RGBD " + json.dumps(status, allow_nan=False), flush=True)
     try:
         from rgbd_camera import RgbdCameraPublisher
         rgbd_inputs = RgbdCameraPublisher(node, namespace, pipeline, _QOS,
-                                        report=report_rgbd, min_interval_s=.1)
+                                        report=report_rgbd, min_interval_s=0.)
+        rgbd_inputs.set_enabled(enabled_cards)
     except Exception as exc:
-        report_rgbd(dict(ready=False, camera_info=[], error=str(exc)))
+        report_rgbd(dict(ready=False, camera_info=[], error=str(exc), retryable=False))
 
     frame_count = 0
     last_imu_report = 0.
     t_start = _time.monotonic()
-    capture_time_failures = 0
-    depth_publish_failures = 0
-    depth_encode_failures = 0
+    acknowledge_control()
     try:
         while True:
             # The camera node owns the raw_enabled subscription. This is a
@@ -2607,10 +2608,11 @@ def _camera_subprocess(namespace: str):
             source_frames = capture.wait_for_frames(timeout_ms=1000)
             t_wait = _time.monotonic() - t0
 
-            frames = align_to_color.process(source_frames)
+            frames = align_to_color.process(source_frames) if align_to_color is not None else source_frames
 
-            color_frame = frames.get_color_frame()
-            if color_frame:
+            color_frame = source_frames.get_color_frame()
+            t_enc = 0.
+            if color_frame and "camera" in enabled_cards:
                 color_image = _np.asanyarray(color_frame.get_data())
                 t1 = _time.monotonic()
                 jpeg_bytes = encode_jpeg(color_image)
@@ -2620,59 +2622,6 @@ def _camera_subprocess(namespace: str):
                 msg.format = "jpeg"
                 msg.data = array('B', jpeg_bytes)
                 color_pub.publish(msg)
-
-            depth_frame = frames.get_depth_frame()
-            if depth_frame and depth_scale is not None:
-                published = False
-                if depth_stream is not None:
-                    try:
-                        mapped = depth_stream.publish(
-                            source_frames, frames,
-                            fallback_stamp_ns=node.get_clock().now().nanoseconds)
-                        published = True
-                        if not mapped:
-                            capture_time_failures += 1
-                            if capture_time_failures == 1 or capture_time_failures % 100 == 0:
-                                print(f"[camera_subprocess] depth capture time unavailable, "
-                                      f"arrival stamp used (failure #{capture_time_failures})",
-                                      flush=True)
-                    except Exception as _e:
-                        # A bug in the capture-time path must cost the mapping,
-                        # not the depth frame: fall back to scaled millimetres
-                        # with the arrival stamp below.
-                        depth_publish_failures += 1
-                        if depth_publish_failures == 1 or depth_publish_failures % 100 == 0:
-                            print(f"[camera_subprocess] capture-timed depth failed, "
-                                  f"scaled fallback used (failure #{depth_publish_failures}): "
-                                  f"{' '.join(str(_e).split())[:300]}", flush=True)
-                if not published:
-                    try:
-                        payload = _depth_millimetre_bytes(
-                            depth_frame.get_data(), depth_scale,
-                            width=depth_frame.get_width(), height=depth_frame.get_height())
-                    except ValueError as _e:
-                        # Wrong negotiated dimensions, odd/truncated buffers or
-                        # invalid SDK units break the advertised depth contract.
-                        # Do not keep publishing under that declaration, even
-                        # if the capture-time helper has already failed.
-                        depth_scale = None
-                        depth_encode_failures += 1
-                        print(f"[camera_subprocess] depth payload contract invalid; "
-                              f"depth stream disabled: {' '.join(str(_e).split())[:300]}",
-                              flush=True)
-                    except Exception as _e:
-                        depth_encode_failures += 1
-                        if depth_encode_failures == 1 or depth_encode_failures % 100 == 0:
-                            print(f"[camera_subprocess] depth payload encode failed, frame "
-                                  f"not published (failure #{depth_encode_failures}): "
-                                  f"{' '.join(str(_e).split())[:300]}", flush=True)
-                    else:
-                        import zlib as _zlib
-                        msg = _CompressedImage()
-                        msg.header.stamp = node.get_clock().now().to_msg()
-                        msg.format = "16UC1; compressedDepth zlib"
-                        msg.data = array('B', _zlib.compress(payload, 1))
-                        depth_pub.publish(msg)
 
             if raw_inputs is not None and getattr(raw_inputs, 'enabled', True):
                 try:
@@ -2693,7 +2642,7 @@ def _camera_subprocess(namespace: str):
                     rgbd_inputs.unavailable(exc)
 
             if _time.monotonic() - last_imu_report >= .2:
-                print('[camera_subprocess] IMU ' + json.dumps(imu.status(), allow_nan=False), flush=True)
+                print('[camera_subprocess] IMU ' + json.dumps(dict(imu.status(), activation=control['activations']['imu']), allow_nan=False), flush=True)
                 last_imu_report = _time.monotonic()
             frame_count += 1
             # Log every 300 frames (~15s at 20fps)
@@ -2778,33 +2727,100 @@ class CameraPlugin:
         self._proc: subprocess.Popen | None = None
         self._frame_node = _CameraFrameNode(self._color_topic)
         executor.add_node(self._frame_node)
-        # What the RealSense reported about itself, keyed by stream name. Filled
-        # in by the stdout forwarder below once the pipeline negotiates a
-        # profile; empty until then, which is why `camera_specs` also carries a
-        # fallback — the declaration has to be answerable before the camera runs.
-        self._intrinsics: dict = {}
+        self._cards = set()
+        self._lifecycle_lock = threading.RLock()
+        self._control_condition = threading.Condition()
+        self._control_generation = 0
+        self._activations = dict(camera=0, depth=0, imu=0)
+        self._stop_generations = dict(camera=0, depth=0, imu=0)
+        self._acked_generation = -1
+        self._control_packet = None
+        self._intrinsics = {}
         self._intrinsics_lock = threading.Lock()
         self._rgbd_status = dict(ready=False, camera_info=[], error="awaiting calibrated capture")
+        qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                         history=HistoryPolicy.KEEP_LAST, depth=1,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self._cards_pub = self._frame_node.create_publisher(
+            String, f"/{namespace}/camera/cards_enabled", qos)
+        self._frame_node.create_subscription(
+            String, f"/{namespace}/camera/cards_applied", self._cards_applied, qos)
+
+    def _publish_cards(self):
+        self._control_generation += 1
+        self._control_packet = dict(generation=self._control_generation,
+                                    enabled=sorted(self._cards), activations=dict(self._activations))
+        msg = String()
+        msg.data = json.dumps(self._control_packet)
+        self._cards_pub.publish(msg)
+
+    def _cards_applied(self, message):
+        packet = json.loads(message.data)
+        with self._control_condition:
+            if packet == self._control_packet:
+                self._acked_generation = packet['generation']
+                self._control_condition.notify_all()
+
+    def _wait_for_cards_applied(self, generation, timeout_s=5.):
+        deadline = time.monotonic() + timeout_s
+        with self._control_condition:
+            while self._acked_generation < generation:
+                if not self.is_running():
+                    raise RuntimeError('camera source exited before card stop was confirmed')
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('camera card stop was not confirmed within five seconds')
+                self._control_condition.wait(min(.05, remaining))
 
     def _rgbd_info(self):
         from copy import deepcopy
         with self._intrinsics_lock:
             status = deepcopy(self._rgbd_status)
-        if status["ready"] and not self.is_running():
+        if not self.is_running():
             status = dict(ready=False, camera_info=[], error="camera capture process unavailable")
-        root = f"/{self._namespace}/camera/rgbd"
         imu_status = status.get('imu_status', dict(state='unavailable', reason='waiting for camera motion'))
-        if not self.is_running() or not -50_000_000 <= time.time_ns() - imu_status.get('last_capture_ns', 0) <= 500_000_000:
-            imu_status.update(state='unavailable', reason=imu_status.get('reason') or 'motion capture stale')
+        if ('imu' not in self._cards or not self.is_running() or
+                imu_status.get('activation') != self._activations['imu'] or
+                not -50_000_000 <= time.time_ns() - imu_status.get('last_capture_ns', 0) <= 500_000_000):
+            imu_status.update(state='unavailable', reason=imu_status.get('reason') or 'camera motion stopped or stale')
         return {"state": "running" if status["ready"] else "unavailable",
                 "sourceReady": status["ready"], "camera_info": status["camera_info"],
+                "retryable": status.get("retryable", True),
+                "activations": status.get("activations", {}),
                 "imu_status": imu_status,
                 "body_mount_status": status.get("body_mount_status", dict(status="unavailable", reason="waiting for body mount source")),
-                **({"error": status["error"]} if status.get("error") else {}),
-                "topic_out": [{"topic": root + "/color", "format": "image/jpeg"},
-                              {"topic": root + "/depth", "format": "image/depth-zlib"},
-                              {"topic": root + "/imu", "format": "sensor/imu", "optional": True},
-                              {"topic": root + "/body_mount", "format": "state/extrinsic", "optional": True}]}
+                **({"error": status["error"]} if status.get("error") else {})}
+
+    def _stop_pending(self, name):
+        generation = self._stop_generations[name]
+        return (generation > 0 and name not in self._cards and self.is_running()
+                and generation > self._acked_generation)
+
+    def camera_imu_info(self):
+        pending = self._stop_pending('imu')
+        return dict(topic_out=[{"name": "camera_imu", "topic": f"/{self._namespace}/camera/rgbd/imu",
+                                "format": "sensor/imu", "optional": True}],
+                    state='stopping' if pending else ('running' if 'imu' in self._cards and self.is_running() else 'idle'),
+                    sourceRequestDisabled='imu' not in self._cards,
+                    imu_status=self._rgbd_info()['imu_status'])
+
+    def _card_info(self, name):
+        status = self._rgbd_info()
+        running = name in self._cards and self.is_running()
+        if status['activations'].get(name) != self._activations[name]:
+            status.update(sourceReady=False, camera_info=[])
+        if name == 'camera':
+            topics = [{"topic": self._color_topic, "format": "image/jpeg"},
+                      {"name": "registered_rgb", "topic": f"/{self._namespace}/camera/rgbd/color", "format": "image/jpeg"}]
+            info = self._camera_info('camera', self._color_topic, 'image/jpeg')
+            if running:
+                info += [d for d in status['camera_info'] if d['topic'] == topics[1]['topic']]
+        else:
+            topics = [{"topic": self._depth_topic, "format": "image/depth-zlib"}]
+            info = [d for d in status['camera_info'] if d['topic'] == self._depth_topic] if running else []
+        return dict(status, state='stopping' if self._stop_pending(name) else ('running' if running else 'idle'),
+                    sourceRequestDisabled=name not in self._cards,
+                    sourceReady=running and status['sourceReady'], topic_out=topics, camera_info=info)
 
     def _camera_info(self, tool_name: str, topic: str, fmt: str) -> list:
         """This port's optics — `motus.camera/1`, see `camera_specs.py`.
@@ -2828,39 +2844,50 @@ class CameraPlugin:
             return []
 
     def get_tools(self) -> list:
-        return [
-            {
-                "name": "camera",
-                "type": "sensor",
-                "multiInstance": False,
-                "description": f"Bumi Realsense D435i color camera — 640x480 JPEG @ 30fps. Publishes to {self._color_topic}",
-                "inputSchema": {"type": "object", "properties": {}},
-                "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}],
-            },
-            {
-                "name": "depth",
-                "type": "sensor",
-                "multiInstance": False,
-                "description": (f"Bumi Realsense D435i depth registered to the RGB image — "
-                                f"640x480 zlib-compressed Z16 @ 30fps, uint16 millimetres "
-                                f"with mapped capture time. Publishes to {self._depth_topic}"),
-                "inputSchema": {"type": "object", "properties": {}},
-                "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}],
-            },
-            {"name": "camera_rgbd", "type": "sensor", "multiInstance": False,
-             "description": "Bumi calibrated registered RGB-D inputs for Perception odometry; camera optical frame, capture-mapped time.",
-             "inputSchema": {"type": "object", "properties": {}},
-             "topic_out": self._rgbd_info()["topic_out"],
-             "camera_info": self._rgbd_info()["camera_info"],
-             "imu_status": self._rgbd_info()["imu_status"],
-             "body_mount_status": self._rgbd_info()["body_mount_status"]},
-        ]
+        return [dict(name=name, type="sensor", multiInstance=False,
+                     description=description,
+                     inputSchema={"type": "object", "properties": {}},
+                     **{k: v for k, v in self._card_info(name).items()
+                        if k in ('topic_out', 'camera_info', 'body_mount_status')})
+                for name, description in (
+                    ('camera', 'Bumi color display and paired registered RGB in the native depth optical frame.'),
+                    ('depth', 'Bumi sole calibrated 640x480 uint16 millimetre depth, with mapped capture time.'))]
 
     def start(self) -> None:
+        # Bundle startup historically enables both media cards.
+        self.start_card('camera')
+        self.start_card('depth')
+
+    def start_card(self, name):
+        with self._lifecycle_lock:
+            if name in self._cards and self.is_running():
+                return
+            self._cards.add(name)
+            self._activations[name] += 1
+            with self._intrinsics_lock:
+                self._rgbd_status = dict(ready=False, camera_info=[], error="awaiting fresh calibrated capture")
+            self._publish_cards()
+            if not self.is_running():
+                self._stop_generations = dict(camera=0, depth=0, imu=0)
+                self._start_process()
+
+
+    def stop_card(self, name):
+        with self._lifecycle_lock:
+            self._cards.discard(name)
+            self._publish_cards()
+            self._stop_generations[name] = self._control_generation
+            if not self._cards:
+                self.stop()
+            else:
+                self._wait_for_cards_applied(self._control_generation)
+
+
+    def _start_process(self) -> None:
         import sys
         with self._intrinsics_lock:
             self._rgbd_status = dict(ready=False, camera_info=[], error="awaiting calibrated capture")
-        env = dict(os.environ)
+        env = dict(os.environ, BUMI_CAMERA_CARDS=json.dumps(self._control_packet))
         self._proc = subprocess.Popen(
             [sys.executable, "-c",
              # Protect import-time output as well as the child entry point.
@@ -2869,10 +2896,13 @@ class CameraPlugin:
              f"from device import _camera_subprocess; _camera_subprocess({self._namespace!r})"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
         )
+        proc = self._proc
         def _fwd():
             from camera_specs import parse_intrinsics_line
 
-            for line in self._proc.stdout:
+            for line in proc.stdout:
+                if self._proc is not proc:
+                    return
                 text = line.decode(errors='replace').rstrip()
                 # Printed either way: the declaration is what the cards serve,
                 # but the line itself is what somebody debugging a wrong field
@@ -2903,15 +2933,26 @@ class CameraPlugin:
                     print("[camera] adopted RealSense intrinsics for "
                           + ", ".join(sorted(payload)), flush=True)
             with self._intrinsics_lock:
-                self._rgbd_status = dict(ready=False, camera_info=[], error="camera capture process exited")
+                if self._proc is proc:
+                    self._rgbd_status = dict(ready=False, camera_info=[], error="camera capture process exited")
         threading.Thread(target=_fwd, daemon=True).start()
 
     def stop(self) -> None:
-        if self._proc:
-            self._proc.terminate()
-            self._proc = None
-        with self._intrinsics_lock:
-            self._rgbd_status = dict(ready=False, camera_info=[], error="camera stopped")
+        with self._lifecycle_lock:
+            self._cards.clear()
+            self._publish_cards()
+            proc, self._proc = self._proc, None
+            if proc is not None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5.)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            with self._intrinsics_lock:
+                self._intrinsics = {}
+                self._rgbd_status = dict(ready=False, camera_info=[], error="camera stopped")
+
 
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
@@ -2920,36 +2961,33 @@ class CameraPlugin:
         return self._frame_node.wait_for_frame(after_sequence, timeout_s)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if args.get("_tool_name") == "camera_rgbd":
-            status = self._rgbd_info()
-            if action == "start":
-                deadline = time.monotonic() + 10.
-                while not status.get("camera_info") and self.is_running() and time.monotonic() < deadline:
-                    time.sleep(.05)
-                    status = self._rgbd_info()
-            return status
-        if action == "start":
-            return {"state": "running"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            tool_name = args.get('_tool_name', '')
-            topic_map = {
-                "camera": (self._color_topic, "image/jpeg"),
-                "depth": (self._depth_topic, "image/depth-zlib"),
-            }
-            if tool_name in topic_map:
-                topic, fmt = topic_map[tool_name]
-                payload = {"state": "running",
-                           "topic_out": [{"topic": topic, "format": fmt}],
-                           "camera_info": self._camera_info(tool_name, topic, fmt)}
-                if tool_name == "depth":
-                    from camera_specs import depth_slam_source_declaration
-                    payload["input_metadata"] = [
-                        depth_slam_source_declaration(topic, self._namespace)]
-                return payload
-            return {"state": "running"}
-        return None
+        name = args.get('_tool_name')
+        if name not in ('camera', 'depth'):
+            return None
+        if action == 'start':
+            self.start_card(name)
+            # Core snapshots declarations from start. Native display FOV alone
+            # is not evidence that the registered computation input is ready.
+            topic = (f'/{self._namespace}/camera/rgbd/color' if name == 'camera'
+                     else self._depth_topic)
+            deadline = time.monotonic() + 10.
+            while True:
+                status = self._card_info(name)
+                if status['sourceReady'] and any(d['topic'] == topic for d in status['camera_info']):
+                    return status
+                remaining = deadline - time.monotonic()
+                if (remaining <= 0 or not self.is_running() or name not in self._cards
+                        or not status['retryable']):
+                    return status
+                time.sleep(min(.05, remaining))
+        elif action == 'stop':
+            try:
+                self.stop_card(name)
+            except (RuntimeError, TimeoutError) as error:
+                return dict(state='error', sourceReady=False, sourceRequestDisabled=True, error=str(error))
+        elif action != 'info':
+            return None
+        return self._card_info(name)
 
 
 # ── Higher-level Bumi cards ──────────────────────────────────────────────────

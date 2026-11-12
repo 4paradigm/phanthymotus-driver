@@ -185,49 +185,38 @@ sudo systemctl start noetix-video-capture.service
 
 ## `camera` / `depth` 声明自己的镜头参数（`motus.camera/1`）
 
-两张卡片的 `info()` 各带一份 `camera_info`。消费者按**自己绑的那个话题**去查，
-不是按位置、也不是按上游卡片名。`depth` 在发布前通过
-`rs.align(rs.stream.color)` 重投影到 RGB 像素网格，因此它与 `camera`
-声明同一个 `id` 和同一组 RGB 内参。这是 VOP 的 RGB 检测框能直接查
-深度像素的前提；仅仅让两路都是 640×480 并不够。
+原有三张卡片共享同一个 RealSense 采集进程：
 
-为什么需要它：深度图里没有任何几何信息 —— 640×480 个数字，每个是一段距离，没有
-一处说明镜头有多宽。而据此做的决策是米制的（"我 0.4 m 宽的肩膀过不过得去"），所以
-某处必须把像素列换算成横向偏移，那一步用的就是水平半视场角。这个数填错**不会报错**：
-它让机器人拒绝过门，而深度图同时报告前方通畅 —— r1_sz 上这个症状被当成跟踪问题查过
-两次。
+- `camera` 保留 `/<namespace>/camera/color` 展示/拍照输出，追加名为
+  `registered_rgb` 的 `/<namespace>/camera/rgbd/color`（`image/jpeg`）。
+- `depth` **只有原来的一个输出** `/<namespace>/camera/depth`
+  （`image/depth-zlib`，ROS `CompressedImage`），供展示、VO 和 Point Cloud 共用。
+- `imu` 保留身体 `/<namespace>/state/imu`（`data/json`），追加明确命名的
+  `camera_imu`：`/<namespace>/camera/rgbd/imu`（`sensor/imu`，可选）。
+  两者来源、坐标和格式不同，不得互相替代。
 
-**参数优先取运行时内参。** 相机子进程在 `pipeline.start()` 之后从 RealSense 拿到
-真实的 `fx/ppx/畸变系数`，打印一行 `[camera_subprocess] INTRINSICS {...}`，父进程
-那个本来就有的 stdout 转发线程认这个前缀并存下来（这一行也照常留在 `docker logs`
-里）。声明里于是带 `K`，`source` 是 `derived-from-K`。
+深度复用已经验证的计算几何：将颜色对齐到原生深度光学坐标，再把颜色和深度一起校正到
+640×480 针孔射线。**深度展示视角因此改变，不再对齐到原始展示 RGB。** 按像素取深度的
+检测/VO 应使用 `registered_rgb`。`camera` 的 `camera_info` 包含展示 RGB 和已就绪的配对
+RGB；`depth` 仅声明实际深度话题。配对两路的 `K`、相机 `id`、光学帧和时钟身份一致，
+只声明真实采集验证后的参数；等待相机或参数无效时深度 `camera_info=[]`、`sourceReady=false`。
+原始展示 RGB 仍允许 `camera_specs.py` 的显式手册 FOV 兜底，该值不用于计算深度。
 
-**手册数只是兜底，而且彩色那路不能直接用手册的数。** D435i 的 RGB 传感器是 16:9，
-驱动开的是 640×480（4:3）—— 这一档保垂直裁水平，所以真实水平视场比手册上的 69.4°
-窄三成左右。`camera_specs.py` 因此按宽高比换算过一次，并把 `source` 写成 `manual`
-而不是 `vendor-spec`：那是一个在 Intel 写下的数之外多走了一步算术的值。对齐后的
-深度输出也使用这个 RGB 兜底值，而不是原始深度镜头的 87°。
+深度保留 30 Hz 采集发布配置、队列深度 1、BEST_EFFORT；每帧仅编码/发布一次深度。
+`format="16UC1; compressedDepth zlib"`，载荷是 zlib 压缩的 640×480 小端 uint16 毫米，
+按真实 SDK `depth_scale` 四舍五入；0 为无效，超出 65535 mm 置 0。
+没有 `/<namespace>/camera/rgbd/depth` 发布者。每路 header 保留各自采集时刻，深度帧为
+`<namespace>_depth_optical`。硬件时钟仅使用一次到达偏移估计，声明保留
+`clock_mapping=fixed_arrival_offset`、`clock_mapping_verified=false` 和真实偏移/域；
+不声称曝光同步、精确硬件时间或导航/身体坐标精度。无效内参、尺寸、单位、时钟跳变或过大
+时差会暂停共享深度（展示也暂停）；绝不在相同话题回退到另一种几何或到达时间戳。
 
-相机没起来时走兜底 —— 声明必须在不串流时也答得出来，这是消费者能在 `start` 时就
-降级（而不是一帧一帧地发现问题）的前提。
-
-Depth 卡片只有一个输出 `/<namespace>/camera/depth`（`image/depth-zlib`，ROS
-`CompressedImage`，640×480 小端 uint16 毫米深度，30 Hz 每帧发布，不看订阅者）。
-它既是画布/navi 的展示流，也是需要几何计算的消费者的输入 —— 不再另开第二路：
-header 携带对齐后深度帧的采集时间映射和 `frame_id`，`format="16UC1; compressedDepth
-zlib"`，载荷为 zlib 压缩的 640×480 小端 uint16；按 SDK `depth_scale` 换算并四舍五入
-到毫米，0 表示无效，四舍五入后超出 65535 mm 的值置 0。`camera_info.vendor` 声明
-`depth_unit=mm`、`depth_source=measured`、`timestamp_semantics=source_capture_mapped`
-和 `clock_mapping=shared_camera_mapper`，并使用对齐后的 RGB 像素网格运行时内参。
-运行时内参缺失或畸变尚不能按针孔模型处理时，声明仍是 `manual`，不应把兜底 FOV
-当作已标定几何（严格的几何消费者应拒绝）。深度输出不依赖 VO 卡片的启停；同一帧的
-VO 原始输入和这一路深度共享时间映射。设备硬件时钟使用到达时刻估计一次偏移，该映射
-是近似值，不代表精确曝光同步。时间映射失败时该帧仍会发布，但使用发布时刻的 stamp
-和空 `frame_id`：展示/navi 照常解码，要求采集时刻的消费者应跳过它，绝不把发布
-时刻当作测量时刻。采集时刻发布路径本身出错而回退到兜底发布时，时间戳同样是发布
-时刻，但载荷仍按 SDK `depth_scale` 换算到毫米 —— 任何发布路径都不允许把原始
-传感器单位挂上 `depth_unit=mm` 的声明；SDK 深度比例读取失败时宁可不发深度流，
-也不发单位不成立的帧。
+Bundle 启动仍自动启动原有卡片。单张卡片 start/stop 独立控制本卡片的所有输出，重复
+start 不会再开相机；停一张不影响其他活动卡片。相机可为其他卡片保持采集，重启卡片只
+使用新帧；全部停止或 bundle 关闭会释放进程。可选相机 IMU/身体 TF 缺失不影响有效深度。
+停止会等待采集进程确认此前的发布已结束；最多等待 5 秒，超时明确返回错误。
+请求停用但尚未确认时 `info.state=stopping`，不会提前声称 `idle`；确认或源退出后才显示已停止。
+控制代次与每卡启用代次防止快速停启合并后重放旧视频或 IMU 数据。
 
 镜头换了必须重来一遍：`phanthymotus/actucore/tools/measure_fov.py`。
 
@@ -530,16 +519,23 @@ and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
 
 ### Generic Perception RGB-D input
 
-When the camera plugin is enabled it also exposes the `camera_rgbd` sensor card.
-Connect both `/bumi/camera/rgbd/color` (`image/jpeg`) and
-`/bumi/camera/rgbd/depth` (`image/depth-zlib`) to Perception's RGB-D odometry
-card; the namespace follows the bundle configuration. Its `info` and `start`
-responses include both `camera_info` declarations and `sourceReady`.
+The separate `camera_rgbd` card is retired. Move existing canvas wires to the
+original cards: `camera.registered_rgb` (`/bumi/camera/rgbd/color`) and the single
+`depth` output (`/bumi/camera/depth`). Use that same depth output for display,
+Perception VO and Point Cloud. Select the `imu.camera_imu` output only when
+camera IMU assistance is requested; the original body JSON port is unchanged.
+The namespace follows bundle configuration. The original `camera` and `depth`
+`info`/`start` responses carry their actual `camera_info` declarations and
+`sourceReady`; an explicit camera/depth start waits up to ten seconds for
+fresh calibrated metadata, returning early if its owner exits or reports a
+permanent calibration failure. Native display FOV alone never completes that
+wait. Depth does not advertise a manual geometry fallback. Optional camera IMU
+availability remains separate and does not block calibrated images.
 
-This branch shares the existing RealSense pipeline. It aligns color into the
-native depth optical frame, then rectifies both images on the same 640x480 rays.
-Depth is measured little-endian uint16 millimetres using the SDK depth scale.
-The original display camera/depth streams remain available.
+One existing RealSense pipeline aligns color into the native depth optical
+frame and rectifies both images on the same 640x480 rays. The original display
+color remains available; its pixels differ from the registered pair. Depth
+normalization and compression happen once on the original depth topic.
 
 The output headers preserve separate source capture times through the existing
 clock mapping. A hardware clock uses one fixed arrival-derived offset; its
@@ -547,7 +543,7 @@ source domain and offset are disclosed and `clock_mapping_verified` is false.
 No publication-time fallback is emitted on these computation topics. Unsupported
 nonzero inverse/modified Brown distortion, invalid calibration/scale, capture
 clock discontinuity or excessive skew makes the source unavailable with an
-error; it does not stop the display streams. No body mount is assumed, and
+error; the shared depth display pauses too, while native color remains available. No body mount is assumed, and
 neither physical accuracy nor hardware performance has been validated.
 
 The same owner optionally publishes `/bumi/camera/rgbd/imu` (`sensor/imu`), a
@@ -564,7 +560,7 @@ invented. Hardware motion/callback acceptance remains pending.
 
 ### Capture-time body-camera TF
 
-`camera_rgbd` appends an optional `state/extrinsic` output at `/{namespace}/camera/rgbd/body_mount` after the existing color, depth and IMU ports. Both camera declarations carry the same `vendor.body_mount`; Perception discovers this topic automatically, so no card matrix is required. The existing camera ROS node queries `base_link <- {namespace}_depth_optical` at the original mapped depth capture nanoseconds and publishes `motus.camera_mount/1` JSON before the matching images. `CAMERA_BODY_FRAME` overrides only the body frame name. Dynamic joint transforms are looked up for every capture.
+The paired RGB/depth declarations advertise the `/{namespace}/camera/rgbd/body_mount` sidecar automatically, without adding a second output to the depth card. Both camera declarations carry the same `vendor.body_mount`; Perception discovers this topic automatically, so no card matrix is required. The existing camera ROS node queries `base_link <- {namespace}_depth_optical` at the original mapped depth capture nanoseconds and publishes `motus.camera_mount/1` JSON before the matching images. `CAMERA_BODY_FRAME` overrides only the body frame name. Dynamic joint transforms are looked up for every capture.
 
 `body_mount_status` exposes the selected frames and availability independently of RGB-D readiness. Missing TF packages, frames, capture-time transforms or publisher failures preserve video, RGB-D and IMU. The driver never substitutes SDK internal extrinsics, a URDF guess, identity or latest TF. The node remains in its existing ROS domain 42; installed TF domain, real optical calibration chain, timing and accuracy still require hardware acceptance. Bumi already includes `tf2_ros` through its existing RTAB-Map dependency; the build import guard now checks its Buffer and TransformListener APIs. No image was built or deployed for this change. Main odometry stays camera referenced; available evidence supports only a separately named derived body pose.
 
@@ -637,3 +633,12 @@ and stop/start of the visual card. Compare the fused and raw VO/leg positions
 against measured ground truth, verify topic QoS and latency, and inspect
 `slip_residual_m`, `visual_age_s` and covariance. Do not enable
 automatic motion control as part of this experiment.
+
+### Shared-depth RGB pixel consumers
+
+Consumers that combine RGB pixel coordinates with the shared depth must use
+`/<ns>/camera/rgbd/color` (the registered RGB port), not the unchanged display
+RGB. This also applies to VOP/Measure connections. If Measure overlays an RGB
+image, set its existing `camera_topic` to that registered RGB topic; its default
+`/camera/color` or `/camera/rgb` guess refers to the native display image.
+No camera-to-body matrix or guessed calibration is introduced by this wiring.
