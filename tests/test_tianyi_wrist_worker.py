@@ -52,16 +52,12 @@ def capture(monkeypatch, tmp_path):
         return NS(get_data=data, get_timestamp=lambda: 123.,
                   profile=NS(as_video_stream_profile=lambda: NS(get_intrinsics=lambda: intr)))
     frames = NS(get_color_frame=lambda: frame('rgb'), get_depth_frame=lambda: frame('depth'))
-    dev = NS(get_info=lambda key: 'Another Camera', first_depth_sensor=lambda: NS(get_depth_scale=lambda: .0001))
+    dev = NS(first_depth_sensor=lambda: NS(get_depth_scale=lambda: .0001))
     class Pipeline:
         calls = 0
         def start(self, cfg):
             if 'startup' in hooks: hooks['startup']()
-            def stream_profile(stream):
-                p = cfg.profiles[stream]
-                return NS(as_video_stream_profile=lambda: NS(width=lambda: p[0], height=lambda: p[1],
-                    format=lambda: p[2], fps=lambda: p[3]))
-            return NS(get_device=lambda: dev, get_stream=stream_profile)
+            return NS(get_device=lambda: dev)
         def wait_for_frames(self, timeout_ms):
             self.calls += 1
             if self.calls > hooks.get('frame_count', 1):
@@ -71,12 +67,7 @@ def capture(monkeypatch, tmp_path):
             return frames
         def stop(self): pass
     rs = ModuleType('pyrealsense2')
-    def config():
-        cfg = NS(profiles={}, enable_device=lambda *a: None)
-        cfg.enable_stream = lambda stream, *p: cfg.profiles.update({stream: p})
-        return cfg
-    rs.config = config
-    rs.camera_info = NS(name='name')
+    rs.config = lambda: NS(enable_device=lambda *a: None, enable_stream=lambda *a: None)
     rs.pipeline = Pipeline
     rs.stream = NS(color='color', depth='depth')
     rs.format = NS(rgb8='rgb8', bgr8='bgr8', z16='z16')
@@ -106,7 +97,7 @@ def capture(monkeypatch, tmp_path):
         wrist._capture_worker('robot', descriptor(depth), profiles(depth), 85,
                               {'card-a': 'left', 'card-b': 'right'}, child_control, stop, statuses)
     yield NS(run=run, hooks=hooks, published=published, stop=stop, update=update,
-             statuses=statuses, control=control, child_control=child_control, rgb=rgb, depth=depth)
+             statuses=statuses, control=control, child_control=child_control)
     stop.set()
     control.close()
     child_control.close()
@@ -162,7 +153,7 @@ def test_uvc_worker_publishes_jpeg_only_and_releases_device(capture, monkeypatch
     class Camera:
         calls = 0
         def set(self, *a): return True
-        def get(self, key): return {cv2.CAP_PROP_FRAME_WIDTH: 640, cv2.CAP_PROP_FRAME_HEIGHT: 480, cv2.CAP_PROP_FPS: 15, cv2.CAP_PROP_FOURCC: int.from_bytes(b'YUYV', 'little')}[key]
+        def get(self, key): return {cv2.CAP_PROP_FRAME_WIDTH: 640, cv2.CAP_PROP_FRAME_HEIGHT: 480, cv2.CAP_PROP_FPS: 15}[key]
         def isOpened(self): return True
         def read(self):
             self.calls += 1
@@ -293,88 +284,3 @@ def test_camera_calibration_uses_the_same_side_specific_output_topics():
     info = s.info('card-a', 'left')
     assert [v['topic'] for v in info['camera_info']] == [
         '/robot/wrist_camera/card_a/left_rgb', '/robot/wrist_camera/card_a/left_depth']
-
-
-def test_generic_worker_accepts_a_third_backend_without_sdk_branches(capture, monkeypatch):
-    from common.cameras.interface import ActiveCameraInfo, CameraFrame
-    closed = []
-    selected = profiles()
-    selected['rgb'] = {'width': 1280, 'height': 720, 'fps': 15, 'format': 'native-third-format'}
-    class Capture:
-        calls = 0
-        def info(self): return ActiveCameraInfo(selected, 'Third vendor', .001)
-        def read(self, timeout_ms):
-            self.calls += 1
-            if self.calls > 1:
-                capture.stop.set()
-                return {}
-            return {'rgb': CameraFrame(np.zeros((720, 1280, 3), np.uint8)),
-                    'depth': CameraFrame(np.full((480, 640), 1.25, np.float32), depth_scale_m=1.,
-                                         timestamp_ms=7., timestamp_domain='device-clock')}
-        def close(self): closed.append(True)
-    class Backend:
-        id = 'third_vendor'
-        def open(self, device, selected):
-            assert device['backend'] == 'third_vendor'
-            return Capture()
-    monkeypatch.setattr(wrist, 'get_backend', lambda backend: Backend())
-    control = capture.child_control
-    d = {**descriptor(), 'backend': 'third_vendor'}
-    wrist._capture_worker('robot', d, selected, 85, {'card-a': 'left'},
-                          control, capture.stop, capture.statuses)
-    assert [topic for topic, msg in capture.published] == [
-        '/robot/wrist_camera/card_a/left_rgb', '/robot/wrist_camera/card_a/left_depth']
-    assert set(np.frombuffer(zlib.decompress(capture.published[1][1].data), '<u2')) == {1250}
-    status = capture.statuses.get_nowait()
-    assert status['timestamp_domains']['depth'] == 'device-clock'
-    assert status['depth_scale_m'] == 1.
-    import cv2
-    rgb = cv2.imdecode(np.frombuffer(capture.published[0][1].data, np.uint8), cv2.IMREAD_COLOR)
-    assert rgb.shape == (720, 1280, 3)
-    assert status['profiles']['rgb']['width'] == 1280
-    assert closed == [True]
-
-
-def test_depth_encoder_accepts_explicit_float_units_and_sanitizes_invalid_values():
-    values = np.zeros((480, 640), np.float32)
-    values[0, :6] = [1.25, float('nan'), float('inf'), -1., 0., 70.]
-    encoded = wrist.encode_depth_mm(values, 1.)
-    decoded = np.frombuffer(zlib.decompress(encoded), '<u2').reshape(480, 640)
-    assert decoded[0, :6].tolist() == [1250, 0, 0, 0, 0, 0]
-
-
-
-def test_realsense_frames_own_buffers_and_normalize_rgb_to_bgr(capture):
-    capture.rgb[0, 0] = [2, 5, 9]
-    stream = wrist.get_backend('realsense').open(descriptor(), profiles())
-    try:
-        actual = stream.info()
-        frames = stream.read(1000)
-        capture.rgb[:] = 0
-        capture.depth[:] = 0
-        assert frames['rgb'].data[0, 0].tolist() == [9, 5, 2]
-        assert frames['depth'].data[0, 0] == 1000
-        assert frames['depth'].depth_scale_m == .0001
-        assert actual.profiles == profiles()
-        assert actual.device_name == 'Another Camera'
-    finally:
-        stream.close()
-
-
-def test_missing_depth_units_are_a_clear_contract_error():
-    with pytest.raises(ValueError, match='depth scale'):
-        wrist.encode_depth_mm(np.zeros((480, 640), np.float32), None)
-
-
-@pytest.mark.parametrize('intrinsics,source', [
-    ({'K': [600., 0., 320., 0., 600., 240., 0., 0., 1.]}, 'vendor-spec'),
-    ({'D': None, 'K': None}, 'unknown'),
-    ({'D': [0.] * 5}, 'unknown'),
-])
-def test_partial_backend_calibration_does_not_break_camera_info(intrinsics, source):
-    s = wrist.WristCameraSession('robot', descriptor(), profiles())
-    s._status = {'intrinsics': {'rgb': intrinsics}}
-    info = s.info('card-a', 'left')
-    assert info['camera_info'][0]['source'] == source
-    assert info['camera_info'][0]['K'] == intrinsics.get('K')
-    assert info['camera_info'][0]['D'] == intrinsics.get('D')

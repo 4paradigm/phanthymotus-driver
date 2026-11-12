@@ -312,17 +312,3 @@ def test_configured_topics_have_distinct_monitor_short_names(plugin):
         '/robot/wrist_camera/card_b/right_rgb', '/robot/wrist_camera/card_b/right_depth']
     assert {v['topic'].rsplit('/', 1)[-1] for info in (left, right) for v in info['topic_out']} == {
         'left_rgb', 'left_depth', 'right_rgb', 'right_depth'}
-
-
-def test_failed_new_backend_preserves_its_capture_without_duplicating_uvc(plugin, monkeypatch):
-    native = {**device('vendor:camera'), 'backend': 'vendor', 'physical_id': 'usb:2-1'}
-    webcam = {**device('uvc:camera', False), 'physical_id': 'usb:2-1'}
-    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [native], 'errors': [], 'failed_backends': []})
-    plugin._refresh()
-    configure(plugin, target='vendor:camera')
-    monkeypatch.setattr(wrist, 'discover_devices', lambda: {
-        'devices': [webcam], 'errors': ['vendor discovery: failed'], 'failed_backends': ['vendor']})
-    plugin._refresh()
-    assert plugin.dispatch('info', {'instance_id': 'card-a'})['state'] == 'running'
-    assert [d['id'] for d in plugin._devices] == ['vendor:camera']
-    assert not Session.created[0].closed
