@@ -548,10 +548,14 @@ class WristCameraPlugin:
                   'device_id': cfg['device_id'] if cfg else None}
         if cfg and cfg['enabled']:
             device_id = self._bindings.get(instance_id)
-            if device_id in self._sessions:
+            if instance_id in self._errors:
+                # An old live route is not evidence that a requested side or
+                # profile transition succeeded. Keep the failure visible.
+                result.update(state='error', error=self._errors[instance_id])
+            elif device_id in self._sessions:
                 result.update(self._sessions[device_id].info(instance_id, cfg['side']))
             else:
-                result.update(state='error', error=self._errors.get(instance_id, 'Waiting for selected camera'))
+                result.update(state='error', error='Waiting for selected camera')
         result.update(instance_id=instance_id, available_devices=self._devices,
                       discovery_errors=self._discovery_errors, topic_in=[],
                       topic_out=[{'topic': camera_topic(self._namespace, instance_id, c, cfg['side'] if cfg else None),

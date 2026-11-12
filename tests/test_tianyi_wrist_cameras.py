@@ -312,3 +312,40 @@ def test_configured_topics_have_distinct_monitor_short_names(plugin):
         '/robot/wrist_camera/card_b/right_rgb', '/robot/wrist_camera/card_b/right_depth']
     assert {v['topic'].rsplit('/', 1)[-1] for info in (left, right) for v in info['topic_out']} == {
         'left_rgb', 'left_depth', 'right_rgb', 'right_depth'}
+
+
+def test_failed_side_transition_does_not_report_new_topic_as_running(plugin):
+    configure(plugin)
+    session, = Session.created
+    # Discovery now offers a different auto profile while the shared owner is
+    # still publishing its original mode. Relabeling must surface the conflict.
+    changed = device()
+    changed['profiles']['rgb'][0]['fps'] = 30
+    changed['profiles']['depth'][0]['fps'] = 30
+    plugin._devices = [changed]
+    result = configure(plugin, side='right')
+    assert result['state'] == 'error' and 'settings' in result['error']
+    assert session.routes == {'card-a': 'left'}
+    info = plugin.dispatch('info', {'instance_id': 'card-a'})
+    assert info['state'] == 'error'
+    assert info['error'] == result['error']
+    assert not session.closed
+
+
+@pytest.mark.parametrize('message', ['configuration storage full', ''])
+def test_failed_side_save_is_visible_until_a_successful_config(plugin, monkeypatch, message):
+    configure(plugin)
+    session, = Session.created
+    def fail_save():
+        raise OSError(message)
+    with monkeypatch.context() as m:
+        m.setattr(plugin, '_save', fail_save)
+        result = configure(plugin, side='right')
+        assert result['state'] == 'error'
+        assert session.routes == {'card-a': 'left'}
+        info = plugin.dispatch('info', {'instance_id': 'card-a'})
+        assert info['state'] == 'error'
+        assert info['error'] == message
+    assert configure(plugin, side='right')['state'] == 'running'
+    assert session.routes == {'card-a': 'right'}
+    assert len(Session.created) == 1
