@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 import sys
 import threading
+from collections import deque
 from types import SimpleNamespace as NS
 
 import numpy as np
@@ -32,6 +33,7 @@ class Publisher:
 class Node:
     def __init__(self, *args, **kwargs):
         self.subscriptions = {}
+        self.subscription_qos = {}
         self.publishers = {}
         self.now_ns = NOW
     def create_publisher(self, msg_type, topic, qos):
@@ -39,6 +41,7 @@ class Node:
         return self.publishers[topic]
     def create_subscription(self, msg_type, topic, callback, qos):
         self.subscriptions[topic] = callback
+        self.subscription_qos[topic] = qos
         return callback
     def create_client(self, *args): return NS(service_is_ready=lambda: False)
     def create_timer(self, *args): pass
@@ -64,7 +67,8 @@ class Buffer:
 @pytest.fixture
 def source(monkeypatch, request):
     monkeypatch.setitem(sys.modules, 'rclpy.node', NS(Node=Node))
-    monkeypatch.setitem(sys.modules, 'rclpy.qos', NS(qos_profile_sensor_data=object()))
+    monkeypatch.setitem(sys.modules, 'rclpy.qos', NS(qos_profile_sensor_data=NS(depth=5),
+        QoSProfile=lambda **kw: NS(**kw), ReliabilityPolicy=NS(BEST_EFFORT='best_effort')))
     monkeypatch.setitem(sys.modules, 'rclpy.time', NS(Time=NS(from_msg=lambda s: NS(nanoseconds=s.sec*10**9+s.nanosec))))
     monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(Image=object, CameraInfo=object, CompressedImage=object, Imu=object))
     monkeypatch.setitem(sys.modules, 'std_msgs.msg', NS(String=lambda **kw: NS(**kw)))
@@ -138,6 +142,27 @@ def test_reuses_vendor_streams_and_existing_subnode_for_tf_without_new_camera_ow
     assert '/ob_camera_head/gyro/sample' in source.sub_node.subscriptions
     assert '/ob_camera_head/accel/sample' in source.sub_node.subscriptions
     assert source.imu_listener.node is source.sub_node
+
+
+def test_motion_capture_intervals_survive_a_200ms_callback_backlog(source):
+    # DDS keeps only the newest `depth` samples while the shared source executor
+    # is occupied. Exercise the real pairing/publisher after that ingress boundary.
+    feed(source, gyro=motion(xyz=(0., 0., 0.)))
+    queues = {}
+    for kind, frame in [('gyro', 'gyro_optical'), ('accel', 'accel_frame')]:
+        topic = '/ob_camera_head/' + kind + '/sample'
+        qos = source.sub_node.subscription_qos[topic]
+        queue = deque(maxlen=qos.depth)
+        for i in range(1, 21):
+            queue.append(motion(NOW+i*10_000_000, frame, (0., 0., 0.) if kind == 'gyro' else (0., 0., 9.81)))
+        queues[kind] = topic, queue
+    source.sub_node.now_ns = NOW+200_000_000
+    while any(queue for _, queue in queues.values()):
+        for topic, queue in queues.values():
+            if queue: source.sub_node.subscriptions[topic](queue.popleft())
+    stamps = [p['stamp_ns'] for p in packets(source)]
+    assert stamps == [NOW+i*10_000_000 for i in range(21)]
+    assert max(b-a for a, b in zip(stamps, stamps[1:])) == 10_000_000
 
 
 def test_motion_callback_executor_persists_across_card_restart(source):

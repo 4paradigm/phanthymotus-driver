@@ -298,14 +298,17 @@ class RgbdCameraPlugin:
         try:
             from sensor_msgs.msg import Imu
             from std_msgs.msg import String
-            from rclpy.qos import qos_profile_sensor_data
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
             from tf2_ros import Buffer, TransformListener
             self.imu_buffer = Buffer()
             self.imu_listener = TransformListener(self.imu_buffer, self.sub_node)
             self.imu_pub = self.pub_node.create_publisher(String, self.root + '/imu', qos_profile_sensor_data)
+            # Preserve 100 Hz capture intervals across transient image/TF work
+            # on this executor. Processing still rejects captures over 500 ms old.
+            motion_qos = QoSProfile(depth=100, reliability=ReliabilityPolicy.BEST_EFFORT)
             for kind in ('gyro', 'accel'):
                 self.sub_node.create_subscription(Imu, '/ob_camera_head/' + kind + '/sample',
-                    lambda msg, k=kind: self._imu(k, msg), qos_profile_sensor_data)
+                    lambda msg, k=kind: self._imu(k, msg), motion_qos)
             self.imu_attached = True
         except Exception as error:
             self.imu_reason = 'camera motion unavailable: ' + str(error)

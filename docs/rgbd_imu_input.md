@@ -53,6 +53,13 @@ mapping offset and explicitly keeps approximate mapping unverified. Missing
 motion streams, unavailable TF or invalid clocks withdraw only IMU availability;
 video and RGB-D remain usable. `imu_status` is reported separately.
 
+Tianyi buffers up to 100 raw gyro and acceleration captures per subscription
+using best-effort delivery, so transient image/TF callback work does not discard
+all but the latest five samples. Capture timestamps and the 500 ms source-age
+limit remain unchanged: buffering preserves short intervals, not stale data or
+invented samples. This addresses an offline-reproduced callback-backlog failure;
+on-device continuity with this queue change still requires verification.
+
 The default IMU-assisted mode estimates relative attitude from gravity and gyro;
 it provides no absolute heading or inertial translation. Optional short-term
 compensation uses the full calibrated extrinsics and has its own bounded fusion
