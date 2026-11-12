@@ -12,8 +12,8 @@ ros:
 
 # 访客贴打印卡片：请求前台电脑上的桥接服务，由它去范式+ 查访客、用 USB 打印机打印。
 # 桥接地址和令牌在画布卡片配置里填（会自动下发），这里只放默认值。
-visitor_badge:
+hp_printer:
   enabled: true
   bridge_url: ""        # 例如 http://192.168.1.20:8765
   timeout_s: 8          # 单次请求超时
-  print_wait_s: 20      # print 默认等打印完成的最长时间
+

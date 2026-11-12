@@ -18,4 +18,5 @@ cards:
   - { name: system_controls, type: actuator }
   - { name: camera_left, type: sensor }
   - { name: camera_right, type: sensor }
-  - { name: visitor_badge, type: actuator }
+  - { name: hp_printer, type: actuator }
+

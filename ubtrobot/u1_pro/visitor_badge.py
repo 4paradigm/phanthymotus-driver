@@ -1,9 +1,9 @@
-"""U1 Pro 访客贴打印卡片（visitor_badge）。
+"""U1 Pro 访客贴打印卡片（hp_printer）。
 
 卡片本身不碰打印机，也不直接登录范式+：它只向前台电脑上的「桥接服务」发 HTTP
 请求，由桥接服务去范式+ 查访客、调用前台电脑上的 USB 打印机打印访客贴。
 
-    机器人 skill → visitor_badge 卡片 ──HTTP──> 前台电脑桥接服务 → 范式+ / USB 打印机
+    机器人 skill → hp_printer 卡片 ──HTTP──> 前台电脑桥接服务 → 范式+ / USB 打印机
 
 桥接服务要实现的接口见 README.md「桥接服务接口约定」。
 """
@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import re
 import threading
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,10 +20,7 @@ from typing import Any
 
 from common.vendor_runtime import action_schema, tool
 
-TOOL_NAME = "visitor_badge"
-
-# 打印任务的终态；其余（queued / printing）视为进行中。
-DONE_STATES = {"done", "failed", "canceled"}
+TOOL_NAME = "hp_printer"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
@@ -86,20 +82,19 @@ def _safe_json(raw: bytes) -> Any:
         return {}
 
 
-def _visitor(item: dict) -> dict:
-    """只保留 skill 需要的字段，避免把访客系统的整条记录（手机号、证件号）交给模型。"""
+def _visit(item: dict) -> dict:
+    """只保留桥接协议允许交给 skill 的字段。"""
     return {
-        "visitor_id": str(item.get("id", "")),
-        "name": str(item.get("name", "")),
-        "company": str(item.get("company", "")),
+        "ticket": str(item.get("ticket", "")),
+        "tail": str(item.get("tail", ""))[-4:],
         "host": str(item.get("host", "")),
-        "visit_time": str(item.get("visit_time", "")),
-        "phone_tail": str(item.get("phone_tail", ""))[-4:],
-        "printed": bool(item.get("printed", False)),
+        "time": str(item.get("time", "")),
+        "reason": str(item.get("reason", "")),
+        "status": str(item.get("status", "")),
     }
 
 
-class VisitorBadgePlugin:
+class HPPrinterPlugin:
     PREFIX = TOOL_NAME
 
     def __init__(self, plugin_config: dict | None = None):
@@ -109,9 +104,7 @@ class VisitorBadgePlugin:
             "bridge_url": str(plugin_config.get("bridge_url", "") or ""),
             "token": str(plugin_config.get("token", "") or ""),
             "timeout_s": float(plugin_config.get("timeout_s", 8)),
-            "print_wait_s": float(plugin_config.get("print_wait_s", 20)),
         }
-        self._poll_interval_s = float(plugin_config.get("poll_interval_s", 1.0))
 
     # ── 卡片定义 ──────────────────────────────────────────────────────────
     def get_tool(self) -> dict:
@@ -119,28 +112,27 @@ class VisitorBadgePlugin:
             "start": ([], "启动卡片"),
             "stop": ([], "停止卡片"),
             "info": ([], "查看卡片配置是否完整"),
-            "config": (["bridge_url", "token", "timeout_s", "print_wait_s"], "保存桥接服务配置（平台在 start 前自动调用）"),
-            "check": ([], "检查前台电脑桥接服务、范式+ 登录状态和打印机是否就绪"),
-            "find": (["keyword"], "在范式+ 里查今天的访客预约，keyword 填访客姓名或手机后四位；返回候选列表和 visitor_id"),
-            "print": (["visitor_id", "reprint", "wait"], "按 find 返回的 visitor_id 打印访客贴；默认等打印完成再返回"),
-            "job": (["job_id"], "查询一次打印任务的结果"),
+            "config": (["bridge_url", "token", "timeout_s"], "保存桥接服务配置（平台在 start 前自动调用）"),
+            "find": (["name", "host"], "按访客姓名查询今天的预约；同名时可用被访人 host 缩小范围，返回短期 ticket"),
+            "print": (["ticket", "request_id"], "使用 find 返回的短期 ticket 打印访客贴；request_id 用于防止重复打印"),
         }
         properties = {
-            "keyword": {"type": "string", "description": "访客姓名或手机后四位"},
-            "visitor_id": {"type": "string", "description": "find 返回的 visitor_id，不能自己编"},
-            "reprint": {"type": "boolean", "description": "访客今天已经打过访客贴时是否再打一张，默认 false", "default": False},
-            "wait": {"type": "boolean", "description": "是否等打印完成再返回，默认 true", "default": True},
-            "job_id": {"type": "string", "description": "print 返回的 job_id"},
+            "name": {"type": "string", "description": "访客姓名"},
+            "host": {"type": "string", "description": "被访人姓名；同名访客时用于缩小范围"},
+            "ticket": {"type": "string", "description": "find 返回的短期票据，不能自己编，也不能改写"},
+            "request_id": {
+                "type": "string",
+                "description": "本次打印的唯一编号；同一次请求重试时必须复用",
+            },
             "bridge_url": {"type": "string"},
             "token": {"type": "string"},
             "timeout_s": {"type": "number"},
-            "print_wait_s": {"type": "number"},
         }
         definition = tool(
             TOOL_NAME,
             "actuator",
             "访客贴打印：通过前台电脑上的桥接服务查询范式+ 里的访客预约，并用前台的打印机打印访客贴。"
-            "先 find 找到访客并和访客确认身份，再用返回的 visitor_id 调用 print；不要按猜测的名字打印。",
+            "先 find 找到访客并和访客确认身份，再用返回的短期 ticket 调用 print；不要按猜测的名字打印。",
             action_schema(actions, properties),
         )
         definition["configSchema"] = {
@@ -158,13 +150,8 @@ class VisitorBadgePlugin:
                     "type": "number", "title": "请求超时（秒）", "scope": "shared",
                     "minimum": 2, "maximum": 30, "default": 8, "advanced": True,
                 },
-                "print_wait_s": {
-                    "type": "number", "title": "等待打印完成（秒）", "scope": "shared",
-                    "minimum": 0, "maximum": 60, "default": 20, "advanced": True,
-                    "description": "print 默认等打印结果；超过这个时间返回 printing，之后用 job 查询",
-                },
             },
-            "required": ["bridge_url"],
+            "required": ["bridge_url", "token"],
         }
         return definition
 
@@ -185,7 +172,7 @@ class VisitorBadgePlugin:
             return {"state": "ready", "configured": self._configured(), "bridge_url": self._cfg["bridge_url"]}
         if action == "config":
             return self._config(args)
-        handlers = {"check": self._check, "find": self._find, "print": self._print, "job": self._job}
+        handlers = {"find": self._find, "print": self._print}
         handler = handlers.get(action)
         if handler is None:
             return {"status": "error", "code": "bad_action", "error": f"不支持的动作：{action}"}
@@ -194,11 +181,11 @@ class VisitorBadgePlugin:
         try:
             return handler(args)
         except BridgeError as exc:
-            print(f"[visitor_badge] {action} failed: {exc.code}", flush=True)
+            print(f"[hp_printer] {action} failed: {exc.code}", flush=True)
             return {"status": "error", "code": exc.code, "error": str(exc)}
 
     def _configured(self) -> bool:
-        return bool(self._cfg["bridge_url"])
+        return bool(self._cfg["bridge_url"] and self._cfg["token"])
 
     def _client(self) -> BridgeClient:
         with self._lock:
@@ -217,7 +204,7 @@ class VisitorBadgePlugin:
             update["bridge_url"] = url
         if "token" in args:
             update["token"] = str(args["token"] or "")
-        for key, low, high in (("timeout_s", 2, 30), ("print_wait_s", 0, 60)):
+        for key, low, high in (("timeout_s", 2, 30),):
             if key in args and args[key] not in (None, ""):
                 try:
                     update[key] = min(high, max(low, float(args[key])))
@@ -225,84 +212,47 @@ class VisitorBadgePlugin:
                     return {"status": "error", "adapter_ok": False, "error": f"{key} 要填数字"}
         with self._lock:
             self._cfg.update(update)
-            configured = bool(self._cfg["bridge_url"])
+            configured = bool(self._cfg["bridge_url"] and self._cfg["token"])
         return {"status": "ok", "adapter_ok": configured, "configured": configured}
 
     # ── 动作 ──────────────────────────────────────────────────────────────
-    def _check(self, _args: dict) -> dict:
-        health = self._client().request("GET", "/health")
-        printer = health.get("printer") or {}
-        visitor_system = health.get("visitor_system") or {}
-        problems = []
-        if not printer.get("ready", False):
-            problems.append(f"打印机未就绪：{printer.get('message') or '请检查前台打印机电源、纸和连线'}")
-        if not visitor_system.get("ready", False):
-            problems.append(f"范式+ 未就绪：{visitor_system.get('message') or '请在前台电脑上重新登录范式+'}")
-        return {
-            "status": "ok" if not problems else "not_ready",
-            "printer": {"ready": bool(printer.get("ready")), "name": str(printer.get("name", ""))},
-            "visitor_system": {"ready": bool(visitor_system.get("ready"))},
-            "problems": problems,
-        }
-
     def _find(self, args: dict) -> dict:
-        keyword = str(args.get("keyword", "")).strip()
-        if not keyword:
-            return {"status": "error", "code": "bad_args", "error": "find 需要 keyword（访客姓名或手机后四位）"}
-        if len(keyword) > 32:
-            return {"status": "error", "code": "bad_args", "error": "keyword 太长"}
-        payload = self._client().request("GET", "/visitors", query={"keyword": keyword})
-        visitors = [_visitor(v) for v in payload.get("visitors") or [] if isinstance(v, dict)]
-        visitors = [v for v in visitors if v["visitor_id"]]
-        if not visitors:
-            return {"status": "not_found", "keyword": keyword, "visitors": [],
+        name = str(args.get("name", "")).strip()
+        host = str(args.get("host", "")).strip()
+        if not name:
+            return {"status": "error", "code": "bad_args", "error": "find 需要访客姓名 name"}
+        if len(name) > 32 or len(host) > 64:
+            return {"status": "error", "code": "bad_args", "error": "姓名或被访人信息太长"}
+        body = {"name": name}
+        if host:
+            body["host"] = host
+        payload = self._client().request("POST", "/find_visit", body=body)
+        visits = [_visit(v) for v in payload.get("visits") or [] if isinstance(v, dict)]
+        visits = [v for v in visits if v["ticket"]]
+        if not visits:
+            return {"status": "not_found", "name": name, "visits": [],
                     "hint": "范式+ 里今天没有这个访客的预约，不能打印访客贴，请联系被访人或前台同事"}
-        return {"status": "found" if len(visitors) == 1 else "multiple", "keyword": keyword, "visitors": visitors}
+        return {"status": "found" if len(visits) == 1 else "multiple", "name": name, "visits": visits}
 
     def _print(self, args: dict) -> dict:
-        visitor_id = str(args.get("visitor_id", "")).strip()
-        if not _ID_RE.match(visitor_id):
-            return {"status": "error", "code": "bad_args", "error": "print 需要 find 返回的 visitor_id"}
-        body = {"visitor_id": visitor_id, "reprint": bool(args.get("reprint", False))}
-        payload = self._client().request("POST", "/print", body=body)
-        status = str(payload.get("status", ""))
-        if status == "already_printed":
-            return {"status": "already_printed", "visitor_id": visitor_id,
-                    "hint": "这位访客今天已经打过访客贴；确实要再打一张时加 reprint=true"}
-        job_id = str(payload.get("job_id", ""))
-        if not job_id:
-            raise BridgeError(str(payload.get("error") or "桥接服务没有返回打印任务编号"), "bad_response")
-        job = {"job_id": job_id, "status": status or "queued"}
-        wait = args.get("wait", True)
-        if wait in (False, "false", 0) or self._cfg["print_wait_s"] <= 0:
-            return self._job_result(job, visitor_id)
-        deadline = time.monotonic() + self._cfg["print_wait_s"]
-        while job["status"] not in DONE_STATES and time.monotonic() < deadline:
-            time.sleep(self._poll_interval_s)
-            job = self._fetch_job(job_id)
-        return self._job_result(job, visitor_id)
+        ticket = str(args.get("ticket", "")).strip()
+        if not ticket or len(ticket) > 512:
+            return {"status": "error", "code": "bad_args", "error": "print 需要 find 返回的短期 ticket"}
+        request_id = str(args.get("request_id", "")).strip()
+        if not _ID_RE.match(request_id):
+            return {"status": "error", "code": "bad_args",
+                    "error": "print 需要唯一的 request_id；同一次请求重试时必须复用"}
+        payload = self._client().request(
+            "POST", "/print_tag", body={"ticket": ticket, "request_id": request_id}
+        )
+        if payload.get("ok") is True:
+            return {"status": "printed", "request_id": request_id,
+                    "say": "访客贴打好了，在前台打印机上"}
+        return {
+            "status": "failed",
+            "code": str(payload.get("code") or "print_failed"),
+            "error": str(payload.get("error") or "打印失败，请前台同事检查打印机"),
+            "request_id": request_id,
+        }
 
-    def _job(self, args: dict) -> dict:
-        job_id = str(args.get("job_id", "")).strip()
-        if not _ID_RE.match(job_id):
-            return {"status": "error", "code": "bad_args", "error": "job 需要 print 返回的 job_id"}
-        return self._job_result(self._fetch_job(job_id))
-
-    def _fetch_job(self, job_id: str) -> dict:
-        payload = self._client().request("GET", f"/jobs/{urllib.parse.quote(job_id, safe='')}")
-        return {"job_id": job_id, "status": str(payload.get("status", "")), "error": str(payload.get("error", "") or "")}
-
-    @staticmethod
-    def _job_result(job: dict, visitor_id: str | None = None) -> dict:
-        state = job.get("status", "")
-        result = {"job_id": job["job_id"]}
-        if visitor_id:
-            result["visitor_id"] = visitor_id
-        if state == "done":
-            result.update(status="printed", say="访客贴打好了，在前台打印机上")
-        elif state in ("failed", "canceled"):
-            result.update(status="failed", error=job.get("error") or "打印失败，请前台同事检查打印机")
-        else:
-            result.update(status="printing", hint="还在打印，稍后用 job 查询结果")
-        return result
 
