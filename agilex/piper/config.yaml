@@ -25,6 +25,19 @@ intent_control:
   # Default closed. Acceptance binds adapter serial, firmware, source/config hashes
   # and an operator-reviewed evidence record. Never enable from SDK support alone.
   point_to_point_acceptance: null
+table_clearance:
+  enabled: false
+  verified: false
+  calibration_id: ""
+  can_interface: ""
+  base_frame: ""
+  plane_base_mm: null
+  body_vertices_mm: []
+  left_finger_vertices_mm: []
+  right_finger_vertices_mm: []
+  opening_axis: null
+  opening_range_mm: null
+  uncertainty_mm: null
 mode:
   # Exact versions returned by this SDK, NOT a version range. Keep empty until
   # MotionCtrl_1 enter/stop/exit has been witnessed on this robot without homing,
