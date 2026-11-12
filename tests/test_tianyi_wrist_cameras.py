@@ -1,346 +1,271 @@
-"""ROS-/SDK-free contract tests for Tianyi's four D405 wrist cards."""
+"""Instance contracts, resource sharing, preview and reconnect without ROS/USB."""
+import ast
 import importlib.util
+import json
 from pathlib import Path
 import sys
-import zlib
+from types import SimpleNamespace as NS
 
 import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-SOURCE = ROOT / "x-humanoid" / "tianyi2.0" / "wrist_cameras.py"
-SPEC = importlib.util.spec_from_file_location("tianyi_wrist_cameras", SOURCE)
+sys.path[:0] = [str(ROOT), str(ROOT / 'x-humanoid/tianyi2.0')]
+SPEC = importlib.util.spec_from_file_location('wrist_cameras', ROOT / 'x-humanoid/tianyi2.0/wrist_cameras.py')
 wrist = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = wrist
 SPEC.loader.exec_module(wrist)
 
 
-def session(side="left", serial="261922273335"):
-    return wrist.WristCameraSession("test_robot", side, serial)
+def device(id='realsense:abc', depth=True):
+    return {'id': id, 'name': 'USB RGB-D' if depth else 'USB Webcam',
+            'backend': 'realsense' if depth else 'uvc', 'serial': id.split(':')[-1],
+            'path': '/dev/v4l/by-id/webcam', 'capabilities': {'rgb': True, 'depth': depth},
+            'profiles': {'rgb': [{'width': 640, 'height': 480, 'fps': 15, 'format': 'rgb8'}],
+                         'depth': [{'width': 640, 'height': 480, 'fps': 15, 'format': 'z16'}] if depth else []}}
 
 
-def test_four_cards_have_independent_names_topics_and_formats():
-    cards = [wrist.WristCameraPlugin(session(side), modality).get_tool()
-             for side in ("left", "right") for modality in ("rgb", "depth")]
-    assert {card["name"] for card in cards} == {
-        "camera_wrist_left_rgb", "camera_wrist_left_depth",
-        "camera_wrist_right_rgb", "camera_wrist_right_depth",
-    }
-    assert len({card["topic_out"][0]["topic"] for card in cards}) == 4
-    for card in cards:
-        assert card["type"] == "sensor"
-        modality = card["name"].rsplit("_", 1)[-1]
-        assert card["topic_out"][0]["format"] == wrist.FORMATS[modality]
+class Session:
+    created = []
 
+    def __init__(self, namespace, device, profiles, jpeg_quality=85):
+        self.device, self.profiles = device, profiles
+        self.routes, self.closed, self.failed = {}, False, False
+        self.created.append(self)
 
-def test_unbound_serial_registers_cards_but_cannot_open_camera():
-    left = session(serial="")
-    info = left.info("rgb")
-    assert info["state"] == "unconfigured"
-    assert info["serial"] is None
-    assert info["camera_info"][0]["K"] is None
-    assert info["camera_info"][0]["source"] == "unknown"
-    with pytest.raises(RuntimeError, match="RealSense SDK Serial Number"):
-        left.start("rgb")
-    assert left._proc is None
+    def add(self, instance_id, side):
+        self.routes[instance_id] = side
 
-
-def test_default_bindings_match_confirmed_physical_wrists():
-    cfg = yaml.safe_load((SOURCE.parent / "config.yaml").read_text())
-    bindings = cfg["plugins"]["wrist_cameras"]
-    assert bindings["left_serial"] == "261922273335"
-    assert bindings["right_serial"] == "262122270344"
-
-
-def test_bad_or_duplicate_binding_fails_closed_without_usb():
-    s = session(serial="not-a-sdk-serial")
-    with pytest.raises(RuntimeError, match="12-digit"):
-        s.start("depth")
-    s = session()
-    s.blocked_reason = "left and right must bind different devices"
-    with pytest.raises(RuntimeError, match="different devices"):
-        s.start("rgb")
-
-
-def test_stopped_card_does_not_report_old_frame_as_fresh():
-    s = session()
-    s._status = {"last_frame": {"rgb": 1e20}, "frames": {"rgb": 99}}
-    info = s.info("rgb")
-    assert info["state"] == "idle"
-    assert info["fresh"] is False
-
-
-def test_depth_output_is_zlib_of_scaled_little_endian_millimetres():
-    np = pytest.importorskip("numpy")
-    data = np.zeros((480, 640), dtype=np.uint16)
-    data[0, 0] = 1000
-    data[0, 1] = 500
-    mm = np.frombuffer(zlib.decompress(wrist.encode_depth_mm(data, 0.0001)),
-                       dtype="<u2").reshape(480, 640)
-    assert mm[0, 0] == 100  # 1000 SDK units at 0.1 mm/unit
-    assert mm[0, 1] == 50
-    assert mm[1, 0] == 0
-    assert mm.shape == (480, 640)
-
-
-def test_depth_never_wraps_out_of_range_values():
-    np = pytest.importorskip("numpy")
-    data = np.zeros((480, 640), dtype=np.uint16)
-    data[0, 0] = 1000
-    result = np.frombuffer(zlib.decompress(wrist.encode_depth_mm(data, 1.0)),
-                           dtype="<u2")
-    assert result[0] == 0
-
-
-@pytest.mark.parametrize("bad_scale", [0, -1, float("nan"), float("inf")])
-def test_bad_depth_scale_is_rejected(bad_scale):
-    np = pytest.importorskip("numpy")
-    data = np.zeros((480, 640), dtype=np.uint16)
-    with pytest.raises(ValueError):
-        wrist.encode_depth_mm(data, bad_scale)
-
-
-def test_depth_shape_is_verified_not_resized_and_guessed():
-    np = pytest.importorskip("numpy")
-    with pytest.raises(ValueError):
-        wrist.encode_depth_mm(np.zeros((424, 240), dtype=np.uint16), 0.001)
-
-
-def test_sdk_calibration_is_reported_with_provenance():
-    s = session()
-    s._status = {"intrinsics": {"depth": {
-        "K": [600., 0., 320., 0., 600., 240., 0., 0., 1.],
-        "D": [0., 0., 0., 0., 0.],
-        "sdk_distortion": "distortion.brown_conrady",
-    }}}
-    info = s.info("depth")
-    assert info["camera_info"][0]["source"] == "vendor-spec"
-    assert info["camera_info"][0]["K"][0] == 600.
-    assert info["camera_info"][0]["vendor"]["sdk_distortion"] == "distortion.brown_conrady"
-    assert info["depth_aligned_to_rgb"] is False
-
-
-def test_worker_is_separate_process_and_not_opened_during_construction():
-    s = session()
-    assert s._proc is None
-    assert s._wanted == set()
-    assert s.info("rgb")["state"] == "idle"
-    assert s.info("depth")["state"] == "idle"
-
-
-def test_wrist_cards_are_listed_in_marketplace():
-    manifest = yaml.safe_load((SOURCE.parent / "driver.yaml").read_text())
-    declared = {card["name"]: card["type"] for card in manifest["cards"]}
-    for side in ("left", "right"):
-        for channel in ("rgb", "depth"):
-            assert declared[f"camera_wrist_{side}_{channel}"] == "sensor"
-
-
-class CaptureProcess:
-    def __init__(self, *, target, args, **kwargs):
-        self.args = args
-        self.alive = False
-
-    def start(self):
-        self.alive = True
-
-    def is_alive(self):
-        return self.alive
-
-    def join(self, timeout):
-        self.alive = False
+    def remove(self, instance_id):
+        self.routes.pop(instance_id, None)
 
     def close(self):
-        pass
+        self.closed = True
+
+    def healthy(self):
+        return not self.closed and not self.failed
+
+    def info(self, instance_id, side):
+        return {'state': 'running', 'error': None, 'side': side,
+                'streams': {'rgb': {'state': 'running'},
+                            'depth': {'state': 'running' if self.device['capabilities']['depth'] else 'unavailable'}}}
 
 
+@pytest.fixture
+def plugin(monkeypatch, tmp_path):
+    Session.created = []
+    monkeypatch.setattr(wrist, 'WristCameraSession', Session)
+    p = wrist.WristCameraPlugin({'state_file': str(tmp_path / 'wrist.json')}, 'robot')
+    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [device(), device('realsense:def')], 'errors': []})
+    p._refresh()
+    yield p
+    p.stop()
 
-@pytest.mark.parametrize("final_channel", ["rgb", "depth"])
-def test_rapid_channel_switches_preserve_final_selection(monkeypatch, final_channel):
-    # Stub only the camera process; exercise real start/stop and shared memory.
-    # The capture process is deliberately not consuming during the burst.
-    s = session()
-    monkeypatch.setattr(s._ctx, "Process", CaptureProcess)
-    assert s.start("rgb")["state"] == "loading"
-    worker = s._proc
-    selection = worker.args[4]
+
+def configure(p, id='card-a', side='left', target='realsense:abc', **settings):
+    return p.dispatch('config', {'instance_id': id, 'side': side, 'device_id': target, **settings})
+
+
+def test_one_repeatable_tool_has_two_ordered_outputs_and_only_instance_fields(plugin):
+    tool, = plugin.get_tools()
+    assert (tool['name'], tool['type'], tool['multiInstance']) == ('wrist_camera', 'sensor', True)
+    assert [p['format'] for p in tool['topic_out']] == ['image/jpeg', 'image/depth-zlib']
+    props = tool['configSchema']['properties']
+    assert set(props) == {'side', 'device_id', 'fps', 'resolution'}
+    assert all(v['scope'] == 'instance' for v in props.values())
+    assert {v['const'] for v in props['device_id']['oneOf']} == {'auto', 'realsense:abc', 'realsense:def'}
+
+
+def test_info_derives_both_topics_before_config_without_starting_a_camera(plugin):
+    info = plugin.dispatch('info', {'instance_id': 'card-a'})
+    assert info['state'] == 'unconfigured'
+    assert [v['topic'] for v in info['topic_out']] == ['/robot/wrist_camera/card_a/rgb', '/robot/wrist_camera/card_a/depth']
+    assert not Session.created
+
+
+def test_two_devices_start_previews_on_config_and_stop_independently(plugin):
+    assert configure(plugin)['state'] == 'running'
+    configure(plugin, 'card-b', 'right', 'realsense:def')
+    assert len(Session.created) == 2
+    first, second = Session.created
+    plugin.dispatch('stop', {'instance_id': 'card-a'})
+    assert first.closed and not second.closed
+    assert plugin.dispatch('info', {'instance_id': 'card-b'})['state'] == 'running'
+    plugin.dispatch('start', {'instance_id': 'card-a'})
+    assert len(Session.created) == 3
+
+
+def test_shared_device_has_one_owner_and_stopping_one_keeps_other(plugin):
+    configure(plugin)
+    configure(plugin, 'card-b', 'right')
+    session, = Session.created
+    assert session.routes == {'card-a': 'left', 'card-b': 'right'}
+    plugin.dispatch('stop', {'instance_id': 'card-a'})
+    assert not session.closed and session.routes == {'card-b': 'right'}
+    plugin.dispatch('stop', {'instance_id': 'card-b'})
+    assert session.closed
+
+
+def test_config_replay_does_not_reopen_capture_or_rearm_stopped_card(plugin):
+    configure(plugin)
+    original, = Session.created
+    configure(plugin)
+    assert Session.created == [original]
+    plugin.dispatch('stop', {'instance_id': 'card-a'})
+    assert configure(plugin)['state'] == 'idle'
+    assert Session.created == [original]
+    plugin.dispatch('start', {'instance_id': 'card-a'})
+    assert len(Session.created) == 2
+
+
+def test_side_change_preserves_topics_and_shared_capture(plugin):
+    before = configure(plugin)
+    configure(plugin, 'card-b', 'right')
+    after = configure(plugin, side='right')
+    assert after['side'] == 'right'
+    assert before['topic_out'] == after['topic_out']
+    assert len(Session.created) == 1
+
+
+def test_swap_devices_while_stopped_preserves_instance_topics(plugin):
+    first = configure(plugin)
+    second = configure(plugin, 'card-b', 'right', 'realsense:def')
+    plugin.dispatch('stop', {})
+    assert configure(plugin, target='realsense:def')['topic_out'] == first['topic_out']
+    assert configure(plugin, 'card-b', 'right')['topic_out'] == second['topic_out']
+
+
+def test_auto_refuses_ambiguous_cameras_and_pins_single_device(plugin, monkeypatch):
+    result = configure(plugin, target='auto')
+    assert result['state'] == 'error' and 'multiple' in result['error'].lower()
+    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [device()], 'errors': []})
+    plugin._refresh()
+    result = plugin.dispatch('start', {'instance_id': 'card-a'})
+    assert result['device_id'] == 'realsense:abc'
+    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [device('realsense:def')], 'errors': []})
+    plugin._refresh()
+    result = plugin.dispatch('info', {'instance_id': 'card-a'})
+    assert result['device_id'] == 'realsense:abc' and result['state'] == 'error'
+    assert len(Session.created) == 1
+
+
+def test_hotplug_reconnects_only_requested_instances_and_refreshes_options(plugin, monkeypatch):
+    configure(plugin)
+    configure(plugin, 'card-b', 'right', 'realsense:def')
+    plugin.dispatch('stop', {'instance_id': 'card-b'})
+    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [], 'errors': []})
+    plugin._refresh()
+    assert Session.created[0].closed
+    assert plugin.dispatch('info', {'instance_id': 'card-a'})['state'] == 'error'
+    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [device(), device('realsense:def')], 'errors': []})
+    plugin._refresh()
+    assert len(Session.created) == 3
+    assert plugin.dispatch('info', {'instance_id': 'card-a'})['state'] == 'running'
+    assert plugin.dispatch('info', {'instance_id': 'card-b'})['state'] == 'idle'
+
+
+def test_failed_worker_restarts_but_info_is_read_only(plugin):
+    configure(plugin)
+    Session.created[0].failed = True
+    plugin.dispatch('info', {'instance_id': 'card-a'})
+    assert len(Session.created) == 1
+    plugin._refresh()
+    assert len(Session.created) == 2 and Session.created[0].closed
+
+
+def test_uvc_preserves_two_ports_and_reports_unavailable_depth(plugin, monkeypatch):
+    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [device('uvc:webcam', False)], 'errors': []})
+    plugin._refresh()
+    result = configure(plugin, target='uvc:webcam')
+    assert result['state'] == 'running'
+    assert result['streams']['depth']['state'] == 'unavailable'
+    assert len(result['topic_out']) == 2
+
+
+def test_settings_conflict_on_shared_device_leaves_existing_instance_running(plugin):
+    configure(plugin)
+    other = device()
+    other['profiles']['rgb'].append({'width': 640, 'height': 480, 'fps': 30, 'format': 'rgb8'})
+    other['profiles']['depth'].append({'width': 640, 'height': 480, 'fps': 30, 'format': 'z16'})
+    plugin._devices = [other]
+    result = configure(plugin, 'card-b', fps='30')
+    assert result['state'] == 'error' and 'settings' in result['error'].lower()
+    assert plugin.dispatch('info', {'instance_id': 'card-a'})['state'] == 'running'
+    assert len(Session.created) == 1
+
+
+def test_persistence_restores_bindings_preview_and_intentional_stop(plugin, monkeypatch):
+    configure(plugin)
+    configure(plugin, 'card-b', 'right', 'realsense:def')
+    plugin.dispatch('stop', {'instance_id': 'card-b'})
+    state = json.loads(Path(plugin._state_file).read_text())
+    assert state['card-a']['device_id'] == 'realsense:abc'
+    plugin.stop()
+    restored = wrist.WristCameraPlugin({'state_file': plugin._state_file}, 'robot')
     try:
-        for _ in range(100):
-            s.start("depth")
-            s.stop("depth")
-        if final_channel == "depth":
-            s.start("depth")
-            s.stop("rgb")
-        assert s._proc is worker
-        # Bit 0 is RGB; bit 1 is depth. Read the worker's view, not _wanted.
-        assert selection.value == (1 if final_channel == "rgb" else 2)
+        restored._refresh()
+        assert restored.dispatch('info', {'instance_id': 'card-a'})['state'] == 'running'
+        assert restored.dispatch('info', {'instance_id': 'card-b'})['state'] == 'idle'
     finally:
-        s.stop("rgb")
-        s.stop("depth")
+        restored.stop()
 
 
-def test_capture_worker_protects_python_logs_before_initialization(monkeypatch, capfd):
-    import queue
-    import threading
-    from common import logsafe
-
-    # Restore pytest's streams after the real logsafe.install() replaces them.
-    monkeypatch.setattr(sys, "stdout", sys.stdout)
-    monkeypatch.setattr(sys, "stderr", sys.stderr)
-    monkeypatch.setattr(logsafe, "_installed", False)
-
-    def missing_profile(path):
-        print("worker\x00\x1b[31m diagnostic\x1b[0m")
-        return False
-
-    monkeypatch.setattr(wrist.os.path, "isfile", missing_profile)
-    for name in ("ROS_DOMAIN_ID", "RMW_IMPLEMENTATION", "FASTRTPS_DEFAULT_PROFILES_FILE",
-                 "RCUTILS_COLORIZED_OUTPUT"):
-        monkeypatch.setenv(name, wrist.os.environ.get(name, ""))
-    status = queue.Queue()
-    wrist._capture_worker("test_robot", "left", "261922273335", 85,
-                          session()._ctx.Value("B", 1), threading.Event(), status)
-    assert "Missing loopback-only DDS profile" in status.get_nowait()["error"]
-    assert capfd.readouterr().out == "worker diagnostic\n"
+@pytest.mark.parametrize('args', [{}, {'instance_id': '../bad', 'side': 'left'},
+                                  {'instance_id': 'a', 'side': 'up'},
+                                  {'instance_id': 'a', 'side': 'left', 'rotation': 180}])
+def test_invalid_config_never_opens_device(plugin, args):
+    assert plugin.dispatch('config', args)['state'] == 'error'
+    assert not Session.created
 
 
-@pytest.mark.parametrize("now,last_frame,expected", [
-    (100.1, None, "loading"),
-    (100.2, 100.15, "running"),
-    (112.0, None, "error"),
-])
-def test_first_frame_wait_settles_to_running_or_timeout(monkeypatch, now, last_frame, expected):
-    from types import SimpleNamespace
-
-    s = session()
-    s._proc = SimpleNamespace(is_alive=lambda: True)
-    s._wanted = {"rgb"}
-    s._requested_at = {"rgb": 100.0}
-    if last_frame is not None:
-        s._status = {"last_frame": {"rgb": last_frame}}
-    monkeypatch.setattr(wrist.time, "monotonic", lambda: now)
-    info = s.info("rgb")
-    assert info["state"] == expected
-    if expected == "loading":
-        assert info["error"] is None
-        assert info["message"]
-    elif expected == "running":
-        assert info["fresh"] is True
-        assert info["error"] is None
-    else:
-        assert info["error"] == "D405 not supplying fresh frames"
+def test_bundle_registers_one_card_and_boot_does_not_choose_devices(plugin, monkeypatch):
+    source = ROOT / 'x-humanoid/tianyi2.0'
+    tree = ast.parse((source / 'main.py').read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'TianyiDeviceBundle')
+    scope = {'DualDomainROS2': object, 'os': wrist.os}
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), 'main.py', 'exec'), scope)
+    monkeypatch.setattr(wrist.WristCameraPlugin, 'start', lambda self: None)
+    cfg = yaml.safe_load((source / 'config.yaml').read_text())
+    bundle = scope['TianyiDeviceBundle']({'plugins': {'wrist_camera': cfg['plugins']['wrist_camera']}}, 'robot', None, None)
+    assert [t['name'] for t in bundle.get_all_tools()] == ['wrist_camera']
+    manifest = yaml.safe_load((source / 'driver.yaml').read_text())
+    names = [v['name'] for v in manifest['cards']]
+    assert names.count('wrist_camera') == 1
+    assert not any(n.startswith('camera_wrist_') for n in names)
+    assert not Session.created
 
 
-def test_capture_failure_is_not_hidden_by_loading():
-    from types import SimpleNamespace
-
-    s = session()
-    s._proc = SimpleNamespace(is_alive=lambda: True)
-    s._wanted = {"depth"}
-    s._requested_at = {"depth": wrist.time.monotonic()}
-    s._status = {"error": "D405 device is busy"}
-    info = s.info("depth")
-    assert info["state"] == "error"
-    assert info["error"] == "D405 device is busy"
+def test_auto_config_replay_keeps_pinned_device_when_another_camera_appears(plugin, monkeypatch):
+    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [device()], 'errors': []})
+    plugin._refresh()
+    assert configure(plugin, target='auto')['device_id'] == 'realsense:abc'
+    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [device(), device('realsense:def')], 'errors': []})
+    plugin._refresh()
+    result = configure(plugin, target='auto')
+    assert result['state'] == 'running' and result['device_id'] == 'realsense:abc'
+    assert len(Session.created) == 1
 
 
-def test_loading_transitions_when_worker_reports_first_frame(monkeypatch):
-    from types import SimpleNamespace
-
-    s = session()
-    s._proc = SimpleNamespace(is_alive=lambda: True)
-    s._wanted = {"depth"}
-    s._requested_at = {"depth": 100.0}
-    monkeypatch.setattr(wrist.time, "monotonic", lambda: 101.0)
-    assert s.info("depth")["state"] == "loading"
-    s._status = {"last_frame": {"depth": 100.9}, "frames": {"depth": 1}}
-    info = s.info("depth")
-    assert info["state"] == "running"
-    assert info["fresh"] is True
-    assert info["frames_published"] == 1
+def test_failed_discovery_does_not_remove_a_healthy_capture(plugin, monkeypatch):
+    configure(plugin)
+    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [], 'errors': ['Camera discovery timed out']})
+    plugin._refresh()
+    assert plugin.dispatch('info', {'instance_id': 'card-a'})['state'] == 'running'
+    assert not Session.created[0].closed
 
 
-def test_worker_exit_during_loading_reports_error():
-    from types import SimpleNamespace
-
-    s = session()
-    s._proc = SimpleNamespace(is_alive=lambda: False)
-    s._wanted = {"rgb"}
-    s._requested_at = {"rgb": wrist.time.monotonic()}
-    info = s.info("rgb")
-    assert info["state"] == "error"
-    assert info["error"] == "D405 capture worker exited"
+def test_instance_ids_that_normalize_to_same_topic_are_rejected(plugin):
+    configure(plugin, 'card-a')
+    result = configure(plugin, 'card_a')
+    assert result['state'] == 'error' and 'conflicts' in result['error']
+    assert len(Session.created) == 1
 
 
-def test_bundle_starts_all_wrist_previews_without_project_start(monkeypatch):
-    import ast
-    from common import lifecycle
-
-    tree = ast.parse((SOURCE.parent / "main.py").read_text())
-    bundle_class = next(node for node in tree.body
-                        if isinstance(node, ast.ClassDef) and node.name == "TianyiDeviceBundle")
-    scope = {"DualDomainROS2": object, "os": wrist.os, "_lifecycle": lifecycle}
-    exec(compile(ast.Module(body=[bundle_class], type_ignores=[]), "main.py", "exec"), scope)
-    monkeypatch.setitem(sys.modules, "wrist_cameras", wrist)
-    monkeypatch.setattr(session()._ctx, "Process", CaptureProcess)
-    config = yaml.safe_load((SOURCE.parent / "config.yaml").read_text())
-    bundle = scope["TianyiDeviceBundle"](
-        {"plugins": {"wrist_cameras": config["plugins"]["wrist_cameras"]}},
-        "test_robot", None, None)
-    try:
-        bundle.start_all()  # Driver boot path, before any canvas action:start.
-        cards = bundle._plugins
-        assert len(cards) == 4
-        assert all(card in bundle._started_plugins for card in cards)
-        sessions = {card._session for card in cards}
-        assert len(sessions) == 2
-        assert all(s._proc.is_alive() and s._channels.value == 3 for s in sessions)
-        assert bundle.dispatch("camera_wrist_left_rgb", {"action": "stop"})["state"] == "idle"
-        left = next(s for s in sessions if s.side == "left")
-        assert left._proc.is_alive() and left._channels.value == 2
-        bundle.stop_all()
-        assert all(s._proc is None for s in sessions)
-        assert bundle.dispatch("camera_wrist_left_rgb", {"action": "start"})["state"] == "loading"
-        assert left._proc.is_alive() and left._channels.value == 1
-    finally:
-        bundle.stop_all()
-
-
-def test_plugins_are_discoverable_by_the_wrist_prefix():
-    assert wrist.WristCameraPlugin.PREFIX == "camera_wrist"
-    cards = [wrist.WristCameraPlugin(session(side), channel)
-             for side in ("left", "right") for channel in ("rgb", "depth")]
-    discovered = {card.get_tool()["name"] for card in cards
-                  if card.PREFIX == "camera_wrist"}
-    assert discovered == {"camera_wrist_left_rgb", "camera_wrist_left_depth",
-                          "camera_wrist_right_rgb", "camera_wrist_right_depth"}
-
-
-@pytest.mark.parametrize("stalled,healthy", [("rgb", "depth"), ("depth", "rgb")])
-def test_missing_channel_times_out_while_sibling_keeps_publishing(monkeypatch, stalled, healthy):
-    import queue
-    from types import SimpleNamespace
-
-    s = session()
-    s._proc = SimpleNamespace(is_alive=lambda: True)
-    s._wanted = {"rgb", "depth"}
-    s._requested_at = {"rgb": 100.0, "depth": 100.0}
-    s._queue = queue.Queue()
-    clock = [100.0]
-    monkeypatch.setattr(wrist.time, "monotonic", lambda: clock[0])
-    # Replay worker reports: the pipeline is alive and one stream never stops.
-    for seconds in range(1, 14):
-        clock[0] = 100.0 + seconds
-        s._queue.put({"error": None, "last_frame": {healthy: clock[0]},
-                      "frames": {healthy: seconds}})
-        active = s.info(healthy)
-        missing = s.info(stalled)
-        assert active["state"] == "running"
-        assert active["fresh"] is True
-        assert active["error"] is None
-        if seconds < 12:
-            assert missing["state"] == "loading"
-        else:
-            assert missing["state"] == "error"
-            assert missing["error"] == "D405 not supplying fresh frames"
-            assert missing["fresh"] is False
+def test_discovery_timeout_still_recovers_failed_capture_using_pinned_descriptor(plugin, monkeypatch):
+    configure(plugin)
+    Session.created[0].failed = True
+    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [], 'errors': ['Camera discovery timed out']})
+    plugin._refresh()
+    assert Session.created[0].closed
+    assert len(Session.created) == 2
+    assert plugin.dispatch('info', {'instance_id': 'card-a'})['device_id'] == 'realsense:abc'

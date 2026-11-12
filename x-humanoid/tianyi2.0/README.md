@@ -17,106 +17,130 @@ to send media through Feishu or Telegram. Use `image_name` (without `.jpg`)
 for photos and `video_name` (without `.mp4`) for videos. To delete media, pass
 Use `delete` with the complete filename in `name`, including `.jpg` or `.mp4`.
 
-## D405 wrist RGB-D cards (two cameras, four sensors)
+## Wrist camera card (`wrist_camera`, multiple instances)
 
-Tianyi has two USB3 Intel RealSense **D405** cameras, one on each wrist.
-The four sensor cards are **independent** in Agent Core:
+Add `wrist_camera` to the canvas once per desired view. Each instance exposes
+**RGB first, Depth second**; each output can be connected independently:
 
-| Card | Output topic | Format |
+| Port | Output topic | Format |
 | --- | --- | --- |
-| `camera_wrist_left_rgb` | `/<namespace>/camera/wrist/left/rgb` | `image/jpeg` |
-| `camera_wrist_left_depth` | `/<namespace>/camera/wrist/left/depth` | `image/depth-zlib` |
-| `camera_wrist_right_rgb` | `/<namespace>/camera/wrist/right/rgb` | `image/jpeg` |
-| `camera_wrist_right_depth` | `/<namespace>/camera/wrist/right/depth` | `image/depth-zlib` |
+| RGB | `/<namespace>/wrist_camera/<instance_id>/rgb` | `image/jpeg` |
+| Depth | `/<namespace>/wrist_camera/<instance_id>/depth` | `image/depth-zlib` |
 
-Each D405 is owned by **one** `pyrealsense2` process; the RGB and depth
-cards for that wrist share its RGB8/Z16 640x480 at 15 FPS pipeline.
-Activating one does not activate the other card's output. Stopping one
-channel preserves the other; stopping both releases the USB device.
-Selection is checked again after frame acquisition and encoding. Stop waits for
-an already executing publish to complete before returning; it does not retract
-DDS messages already queued in transport or in a subscriber. If a crashed or
-unresponsive native publisher holds the selection lock for over one second,
-the session closes that worker and reports an error instead of hanging stop.
-A later start allocates a fresh worker and selection lock.
-All four wrist streams start automatically when the driver service starts,
-matching the always-on preview behavior of the G1 and Bumi camera drivers.
-Dragging a wrist card onto the canvas subscribes to the existing stream; no
-**Start Intelligent Control** action is needed for the initial preview.
-Stopping a card or the project still stops its output; starting the project
-again reopens stopped streams. Each wrist continues to use one shared process.
-A wrist card reports `loading` while waiting for fresh frames, `running` once
-they arrive, and `error` on worker failure or a 12-second first-frame timeout.
-Agent Core polls `info` while a card is `loading`. Readiness and timeout are
-checked independently per requested channel: ongoing RGB frames cannot hide
-a missing depth stream, and a missing channel does not stop its healthy sibling.
+Hyphens in a canvas instance ID become underscores in ROS topic names.
+Conflicting normalized instance IDs are rejected. Topics belong to the card,
+so changing its device or left/right label does not invalidate its connections.
+The four former `camera_wrist_{left,right}_{rgb,depth}` cards are replaced by
+this tool. Existing canvases using those names must replace the old cards,
+select their devices, and reconnect RGB/depth to the corresponding ports.
 
-The workers publish directly to domain 42 under the loopback-only
-`/opt/phanthy-motus/dds-local.xml` FastDDS profile; they do not join the
-vendor domain-0 participant or modify head Orbbec services.
+### Select a device and wrist side
 
-### Required left/right binding
+Use the card's instance settings (the same mechanism as `ext_mic`):
 
-The robot's `rs-enumerate-devices` reported two **SDK Serial Number** values:
-`261922273335` and `262122270344`. These are *not* the ASIC serials
-`261043072850` and `261043072635` visible under `/dev/v4l/by-id`.
-The physical mapping has been confirmed on this robot: **left `261922273335`**,
-**right `262122270344`**. These are the defaults in `config.yaml`; other robots
-must supply their own verified bindings.
+| Setting | Values | Meaning |
+| --- | --- | --- |
+| `side` | `left`, `right` | Physical wrist label; required, never inferred |
+| `device_id` | detected device or `auto` | Stable physical device identity |
+| `fps` | `auto`, `15`, `30` | A supported native frame rate |
+| `resolution` | `auto` or `WIDTHxHEIGHT` | A supported native resolution |
 
-**Never guess left/right by USB video index or enumeration order.**
-For a different robot, confirm placement from labels, cables, or a safe preview, then set
-`plugins.wrist_cameras.left_serial` and `right_serial` in `config.yaml`.
-Deployment overrides are also supported without rebuilding the image:
+Confirm physical placement from a label, cable, or preview. If cameras are
+installed on the opposite wrists, change the device selection or side labels.
+No image rotation, flip, mirror, resizing, or depth-to-colour alignment is
+performed. The card does not establish a wrist extrinsic calibration.
 
-```yaml
-environment:
-  - TIANYI_WRIST_LEFT_SERIAL=<verified-left-SDK-serial>
-  - TIANYI_WRIST_RIGHT_SERIAL=<verified-right-SDK-serial>
-```
+`auto` binds only when exactly one RGB-capable device is available. The resolved
+identity is saved; subsequent configuration replays and hotplug events never
+switch it to another camera. With multiple devices, select the intended camera.
+RealSense identities use the SDK serial (without assuming a serial length or a
+D405 model name). UVC uses `/dev/v4l/by-id` when available, otherwise its USB bus
+path: cameras without unique serials should be rechecked if moved to another
+USB port. Renumberable `/dev/videoN` indices are not saved as identities.
 
-Blank or duplicate bindings fail closed on start, but do not block other
-robot cards. Starting a wrist card with no SDK installed, a missing device,
-or missing loopback DDS profile reports an error; do not install
-`pyrealsense2` on the host solely for this bundle. The driver image pins
-the CPython 3.10 Linux ARM64 wheel `pyrealsense2==2.56.5.9235`.
-All Python dependencies are declared in `requirements.txt` and installed from
-that file during the image build (`--only-binary=pyrealsense2` avoids a native
-SDK source build). For a matching Linux environment, the same dependency path is
-`pip3 install --only-binary=pyrealsense2 -r requirements.txt`.
+### Discovery and supported streams
 
-The SDK is required for direct D405 acquisition; it increases image size.
-The pinned ARM64 CPython 3.10 wheel is 4,338,854 bytes to download and
-13,796,155 bytes unpacked (about 4.14 / 13.16 MiB), before image compression
-and pip metadata. These are package sizes, not a measured image-size delta.
-`libusb-1.0-0` is required by this exact ARM64 wheel: its ELF `DT_NEEDED`
-entries include `libusb-1.0.so.0`. The default `ros-base:latest` checked on
-2026-11-11 (digest `sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f`)
-has neither the package nor the library: `dpkg-query -W libusb-1.0-0` fails,
-and `ctypes.CDLL("libusb-1.0.so.0")` reports a missing shared object. The Tianyi
-runtime resolves it to `/lib/aarch64-linux-gnu/libusb-1.0.so.0` via `ldd`
-(package `2:1.0.25-1ubuntu2`). Keep the explicit runtime dependency; apt reuses
-it if a custom base already supplies it. No SDK source tree, compiler build
-artifacts, or pip cache are added by this dependency installation.
+Discovery runs in an isolated process and refreshes periodically (three seconds
+between scans, with an eight-second scan deadline). Updated device choices are
+advertised through `tools/list`; reopen the settings after Agent Core refreshes
+the driver definition. `info` also reports `available_devices` and
+`discovery_errors`. Querying `info` does not start or restart capture.
 
-### Wire format and timestamp semantics
+- RealSense: enumerate native RGB8/BGR8 and Z16 profiles using the installed
+  `pyrealsense2` SDK, without a camera-model whitelist. This is not a guarantee
+  that every RealSense model/firmware works with the pinned SDK.
+- Standard USB/UVC: enumerate capture formats with `v4l2-ctl` and capture through
+  OpenCV/V4L2. Metadata nodes and duplicate interfaces on one USB bus are
+  excluded. UVC provides **RGB only**; the depth port remains in position 1 and
+  reports `streams.depth.state: unavailable`. No synthetic depth is generated.
+- SDK-owned RealSense/Orbbec nodes are excluded from generic UVC capture to
+  avoid duplicate devices, IR/depth mistaken for colour, or stealing the head
+  camera. Other vendors' RGB-D SDKs are not implemented by this change.
 
-Both outputs publish `sensor_msgs/msg/CompressedImage` with BEST_EFFORT
-QoS. RGB `format=jpeg` is encoded from SDK RGB8. Depth
-`format="16UC1; compressedDepth zlib"` is headerless zlib over 640x480
-little-endian unsigned millimetres. The worker **reads** the device-reported
-`get_depth_scale()`, clamps unrepresentable values to zero, and never assumes
-the raw Z16 units are millimetres. RGB and depth are **not aligned** by this
-card. Use the actual calibration in each card's `info().camera_info` when
-available; absent SDK intrinsics are explicitly unknown.
+The container must see the camera's USB devices; the existing privileged
+`/dev:/dev` mount supplies this. Cameras attached to another compute board need
+capture/transport on that board and are not discovered by local enumeration.
 
-`CompressedImage.header.stamp` is the host ROS clock at publication, not
-the SDK hardware timestamp. The latter is included as
-`info().sdk_timestamp_ms` for debugging; no hardware-to-ROS clock
-synchronization guarantee is claimed. These display streams are not a
-substitute for time-synchronized raw RGB-D input in VIO/grasping.
+`auto` prefers 15 FPS and native 640x480 where supported, then selects a common
+native frame rate and available RGB profile. Explicit unsupported requests fail
+with a clear error. **Native depth must be 640x480**, because the current Core
+`image/depth-zlib` decoder assumes that size. Other native depth sizes are
+reported as unsupported, not resized. Depth is the SDK Z16 data converted using
+its actual depth scale to little-endian uint16 **millimetres**, then zlib
+compressed; zero means invalid, and out-of-range values do not wrap.
 
-Neither the worker processes nor these four cards initiate robot motion.
+### Preview, sharing, stop and reconnect
+
+Saving a valid instance configuration starts its preview without **Start
+Intelligent Control**. Instance bindings and requested preview states are saved
+atomically under `/opt/phanthy-motus/data/wrist-camera.json` (the mounted data
+directory), so an active preview can be restored after a driver restart.
+Identical configuration replays neither restart capture nor rearm an instance
+that was intentionally stopped. `start(instance_id)` explicitly resumes it.
+Removing a card or stopping its project sends `stop(instance_id)` and disables
+its preview. Driver shutdown closes all capture resources while retaining the
+saved requested state. Do not run two Tianyi driver services against one state
+file or the same cameras.
+
+Instances bound to the same physical camera share **one** capture process and
+one native stream configuration, with separate topic pairs. Their `side`
+labels may differ. Conflicting frame-rate/resolution requests report an error;
+stop other users before changing shared capture settings. Stopping one instance
+removes only its publication routes; stopping the last releases the device.
+
+Route updates are acknowledged after any in-flight publication completes.
+After a successful stop returns, that instance receives no new publications;
+DDS messages already queued in transport/subscribers cannot be retracted. An
+unresponsive worker is closed after a bounded route-update timeout, and the
+remaining requested instances are restarted by the monitor. A native SDK crash
+cannot terminate the body-controller process.
+
+A requested instance reports `loading` until fresh frames arrive, `running`
+when all supported channels are fresh, and `error` on capture failure or a
+12-second first-frame timeout. `streams` reports per-channel freshness/errors;
+a healthy RGB stream cannot hide a missing required depth stream. After the
+startup grace, a living worker with no fresh supported stream is restarted,
+including native startup/read hangs. A fresh sibling stream is preserved. A selected
+camera's disappearance stops its session and reports an error; reinserting the
+same device retries only instances that remain enabled. Discovery failure alone
+does not tear down a healthy capture. Capture requires the loopback-only
+`/opt/phanthy-motus/dds-local.xml` profile and publishes on domain 42, without
+changing the vendor's domain-0 participant or head-camera services.
+
+RGB/depth remain **unaligned**. ROS timestamps use the host clock, with raw SDK
+timestamps reported separately when available; no hardware synchronization is
+claimed. Actual per-stream SDK intrinsics are exposed through `camera_info`;
+uncalibrated UVC optics remain unknown.
+
+### Runtime dependencies
+
+The image installs `v4l-utils` for UVC capability discovery and pins the prebuilt
+Linux ARM64 / CPython 3.10 wheel `pyrealsense2==2.56.5.9235`; no SDK source build
+or pip cache is included. All Python dependencies remain in `requirements.txt`.
+The wheel is 4,338,854 bytes downloaded / 13,796,155 bytes unpacked (about
+4.14 / 13.16 MiB); these are package sizes, not a measured image-size delta.
+`libusb-1.0-0` remains an explicit runtime dependency because that wheel declares
+`libusb-1.0.so.0` in ELF `DT_NEEDED` and the checked base image did not supply it.
 
 ## Raw arm joint card
 

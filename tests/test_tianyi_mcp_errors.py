@@ -30,7 +30,7 @@ def call_tool():
         try:
             conn.request("POST", "/mcp", json.dumps({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": {"name": "camera_wrist_left_rgb", "arguments": {"action": "start"}},
+                "params": {"name": "wrist_camera", "arguments": {"action": "start"}},
             }), {"Content-Type": "application/json"})
             response = conn.getresponse()
             assert response.status == 200
