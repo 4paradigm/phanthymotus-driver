@@ -214,6 +214,12 @@ def load_driver_yaml_cards():
     return {card["name"]: card["type"] for card in manifest["cards"]}
 
 
+#: Default GetVelocityLimitValue answer: wider than loco's card limits, so the card's apply.
+FIRMWARE_VEL_LIMITS = {"forward_velocity_limit_min": -1.0, "forward_velocity_limit_max": 1.0,
+                       "lateral_velocity_limit_min": -0.5, "lateral_velocity_limit_max": 0.5,
+                       "angular_velocity_limit_min": -1.0, "angular_velocity_limit_max": 1.0}
+
+
 class RecordingTransport:
     """In-memory stand-in for `requests.post`: records (url, body) pairs and answers
     every call with a configurable per-service response (default: ok header)."""
@@ -233,6 +239,8 @@ class RecordingTransport:
                 return response
         if service.startswith("MotionControlActionService/GetAction"):
             return {"info": {"current_action": "MotionControlAction_MOTION"}}
+        if service.startswith("MotionControlMotionService/GetVelocityLimitValue"):
+            return {"vel_limit_value": dict(FIRMWARE_VEL_LIMITS)}
         return {"header": {"code": "0"}}
 
     def calls_to(self, service, method):
@@ -826,10 +834,8 @@ class RpcDispatchTests(unittest.TestCase):
         mc_mode.POLL_S = 0.005
         mc_mode.STAND_SETTLE_S = 0.02
         captured = self._capture_notifications()
-        with patch.object(mc_mode.loco, "halt") as halt:
-            result = mc_mode.dispatch("stand", {})
+        result = mc_mode.dispatch("stand", {})
         self.assertEqual(result["state"], "accepted")
-        halt.assert_called_once_with("superseded_by_mc_mode", wait=True)
         (url, body), = self.transport.calls_to("SkillPilotService", "PosturalTransition")
         self.assertIn("10.42.10.12:52893", url)
         self.assertEqual(body["type"], "PosturalTransitionType_GetUp")
@@ -837,9 +843,13 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertEqual(self.transport.calls_to("MotionControlActionService", "SetAction"), [])
         self.assertEqual(mc_mode.dispatch("lie_down", {})["code"], "BUSY")
         self._set_mc_state("MOTION")
+        # Walks stay refused until the stand has settled, even once MC reports MOTION.
+        self.assertEqual(find_plugin(self.plugins, "loco").dispatch(
+            "walk", {"forward": 0.1, "duration": 1})["code"], "BUSY")
         self._wait_until(lambda: len(captured) == 1)
         self.assertEqual(captured[0], (result["action_id"], "completed",
                                        {"current": "MOTION"}, "mc_mode"))
+        self.assertIsNone(find_plugin(self.plugins, "loco")._blocked)
 
     def test_mc_mode_lie_down_tracks_until_passive(self):
         self._set_mc_state("MOTION")
@@ -924,6 +934,156 @@ class RpcDispatchTests(unittest.TestCase):
     def test_mc_mode_unknown_action_raises(self):
         with self.assertRaises(ValueError):
             find_plugin(self.plugins, "mc_mode").dispatch("moonwalk", {})
+
+    def _lie_down_ready(self):
+        self._set_mc_state("MOTION")
+        self.transport.responses["MotionControlActionService/GetNextActions"] = {
+            "commands": [{"action": "MotionControlAction_LIE_DOWN"}]}
+        mc_mode = find_plugin(self.plugins, "mc_mode")
+        mc_mode.POLL_S = 0.005
+        return mc_mode, find_plugin(self.plugins, "loco")
+
+    def test_mc_mode_serializes_with_walk_that_races_the_block(self):
+        # A walk landing between mc_mode's own lock and the loco block (the
+        # window where the old halt(wait=True) could be overtaken) must be
+        # stopped before skillpilot is called, and later walks are refused.
+        mc_mode, loco = self._lie_down_ready()
+        captured = self._capture_notifications()
+        real_block = loco.block
+        racing = []
+
+        def block_after_racing_walk(reason):
+            racing.append(loco.dispatch("walk", {"forward": 0.3, "duration": 30}))
+            return real_block(reason)
+
+        at_call = []
+
+        def postural_transition(kind):
+            with loco._lock:
+                at_call.append((loco._thread, loco._task, dict(loco._velocity)))
+            at_call.append(loco.dispatch("walk", {"forward": 0.1, "duration": 1}))
+            return {"header": {"code": "0"}}
+
+        with patch.object(loco, "block", side_effect=block_after_racing_walk), \
+                patch.object(self.nodes.rpc, "postural_transition", side_effect=postural_transition):
+            result = mc_mode.dispatch("lie_down", {})
+        self.assertEqual(result["state"], "accepted")
+        self.assertEqual(racing[0]["state"], "accepted")
+        self.assertEqual(at_call[0], (None, None, dict.fromkeys(loco.AXES, 0.0)))
+        self.assertEqual(at_call[1]["code"], "BUSY")
+        self.assertEqual(self._loco_payloads()[-1]["data"]["forward_velocity"], 0.0)
+        self._wait_until(lambda: len(captured) == 1)
+        self.assertEqual(captured[0][0:2], (racing[0]["action_id"], "cancelled"))
+        self._set_mc_state("PASSIVE")
+        self._wait_until(lambda: len(captured) == 2)
+        self.assertEqual(captured[1][0:2], (result["action_id"], "completed"))
+        self.assertIsNone(loco._blocked)
+
+    def test_mc_mode_concurrent_walk_and_lie_down_never_overlap(self):
+        self._capture_notifications()
+        for _ in range(5):
+            mc_mode, loco = self._lie_down_ready()
+            self.transport.calls.clear()
+            moving = []
+
+            def postural_transition(kind):
+                with loco._lock:
+                    moving.append(loco._thread is not None or any(loco._velocity.values()))
+                return {"header": {"code": "0"}}
+
+            with patch.object(self.nodes.rpc, "postural_transition", side_effect=postural_transition):
+                lie, walk = run_concurrently(
+                    lambda: mc_mode.dispatch("lie_down", {}),
+                    lambda: loco.dispatch("walk", {"forward": 0.3, "duration": 30}))
+            self.assertEqual(lie["state"], "accepted")
+            self.assertIn(walk["state"], ("accepted", "rejected"))
+            if walk["state"] == "rejected":
+                self.assertEqual(walk["code"], "BUSY")
+            self.assertEqual(moving, [False])
+            self._set_mc_state("PASSIVE")
+            self._wait_until(lambda: mc_mode._active is None)
+
+    def test_mc_mode_aborts_when_walk_cannot_be_stopped(self):
+        mc_mode, loco = self._lie_down_ready()
+        loco.BLOCK_STOP_TIMEOUT_S = 0.05
+        loco.dispatch("walk", {"forward": 0.6, "duration": 30})
+        self._wait_until(lambda: loco._velocity["forward"] > 0.2)
+        result = mc_mode.dispatch("lie_down", {})
+        self.assertEqual(result["code"], "LOCO_NOT_STOPPED")
+        self.assertEqual(self.transport.calls_to("SkillPilotService", "PosturalTransition"), [])
+        self.assertIsNone(mc_mode._active)
+        self.assertIsNone(loco._blocked)
+
+    def test_mc_mode_aborts_when_stop_frame_cannot_be_published(self):
+        mc_mode, loco = self._lie_down_ready()
+        captured = self._capture_notifications()
+        walk = loco.dispatch("walk", {"forward": 0.1, "duration": 30})
+        self._wait_until(lambda: loco._velocity["forward"] > 0.0)
+        real_publish = self.nodes.publish_wrapper
+
+        def publish(name, payload):
+            if not payload["data"]["forward_velocity"]:
+                raise RuntimeError("link down")
+            return real_publish(name, payload)
+
+        with patch.object(self.nodes, "publish_wrapper", side_effect=publish):
+            result = mc_mode.dispatch("lie_down", {})
+        self.assertEqual(result["code"], "LOCO_NOT_STOPPED")
+        self.assertEqual(self.transport.calls_to("SkillPilotService", "PosturalTransition"), [])
+        self._wait_until(lambda: len(captured) == 1)
+        self.assertEqual(captured[0][0:2], (walk["action_id"], "error"))
+        self.assertEqual(captured[0][2]["code"], "PUBLISH_FAILED")
+
+    def test_mc_mode_stand_fails_when_feedback_lost_while_settling(self):
+        self._set_mc_state("PASSIVE")
+        mc_mode = find_plugin(self.plugins, "mc_mode")
+        mc_mode.POLL_S = 0.005
+        mc_mode.STATE_FAILS = 3
+        mc_mode.STAND_SETTLE_S = 0.5
+        captured = self._capture_notifications()
+        reached = threading.Event()
+        responses = self.transport.responses
+
+        def handler(url, service):
+            if service.startswith("MotionControlActionService/GetAction"):
+                if reached.is_set():
+                    raise ConnectionError("MDU unreachable")
+                info = responses["MotionControlActionService/GetAction"]["info"]
+                if info["current_action"].endswith("_MOTION"):
+                    reached.set()
+                return responses["MotionControlActionService/GetAction"]
+            return {"header": {"code": "0"}}
+
+        self.transport.handler = handler
+        result = mc_mode.dispatch("stand", {})
+        self._set_mc_state("MOTION")
+        self._wait_until(lambda: len(captured) == 1)
+        self.assertEqual(captured[0][0:2], (result["action_id"], "error"))
+        self.assertEqual(captured[0][2]["code"], "STATE_UNAVAILABLE")
+
+    def test_mc_mode_settle_ends_on_a_fresh_reading(self):
+        # A failed read at the end of the settle window must not count as settled.
+        mc_mode = find_plugin(self.plugins, "mc_mode")
+        mc_mode.POLL_S = 0.005
+        mc_mode.STATE_FAILS = 50
+        outage = threading.Event()
+        outage.set()
+
+        def handler(url, service):
+            if outage.is_set():
+                raise ConnectionError("MDU unreachable")
+            return {"info": {"current_action": "MotionControlAction_MOTION"}}
+
+        self.transport.handler = handler
+        done = []
+        thread = threading.Thread(target=lambda: done.append(
+            mc_mode._hold({"action": "MOTION"}, 0.01)))
+        thread.start()
+        time.sleep(0.1)
+        self.assertEqual(done, [])
+        outage.clear()
+        thread.join(timeout=3)
+        self.assertEqual(done, [{"action": "MOTION"}])
 
     # -- MOTION-state gate on loco walk / arm send (dev guide §7.3 prerequisite) --
 
@@ -1106,6 +1266,91 @@ class RpcDispatchTests(unittest.TestCase):
             self._wait_until(lambda: len(captured) == 1)
         self.assertEqual(captured[0][0:2], (result["action_id"], "error"))
         self.assertEqual(captured[0][2]["code"], "PUBLISH_FAILED")
+
+    def test_loco_hung_state_reads_stop_walk_by_elapsed_time(self):
+        loco = find_plugin(self.plugins, "loco")
+        loco.MONITOR_S = 0.01
+        loco.MONITOR_STALE_S = 0.2
+        captured = self._capture_notifications()
+        timeouts = []
+        release = threading.Event()
+        self.addCleanup(release.set)
+        original = self.nodes.rpc.transport
+
+        def transport(url, payload, timeout):
+            if url.endswith("/GetAction") and hung:
+                timeouts.append(timeout)
+                release.wait(10)           # a GetAction that never answers in time
+            return original(url, payload, timeout)
+
+        hung = False
+        with patch.object(self.nodes.rpc, "transport", transport):
+            result = loco.dispatch("walk", {"forward": 0.1, "duration": 30})
+            hung = True
+            started = time.monotonic()
+            self._wait_until(lambda: len(captured) == 1)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(captured[0][0:2], (result["action_id"], "error"))
+        self.assertEqual(captured[0][2]["code"], "STATE_UNAVAILABLE")
+        self.assertEqual(timeouts[0], loco.MONITOR_RPC_TIMEOUT_S)
+        self.assertEqual(self._loco_payloads()[-1]["data"]["forward_velocity"], 0.0)
+
+    def test_loco_failed_stop_frame_reports_publish_failure_not_completion(self):
+        loco = find_plugin(self.plugins, "loco")
+        captured = self._capture_notifications()
+        real_publish = self.nodes.publish_wrapper
+
+        def publish(name, payload):
+            if payload["data"]["forward_velocity"] == 0.0:
+                raise RuntimeError("link down")
+            return real_publish(name, payload)
+
+        with patch.object(self.nodes, "publish_wrapper", side_effect=publish):
+            result = loco.dispatch("walk", {"forward": 0.1, "duration": 0.2})
+            self._wait_until(lambda: len(captured) == 1)
+            time.sleep(0.05)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0][0:2], (result["action_id"], "error"))
+        self.assertEqual(captured[0][2]["code"], "PUBLISH_FAILED")
+        self.assertIsNone(loco._thread)
+
+    def test_loco_rejects_walk_when_firmware_limits_unusable(self):
+        loco = find_plugin(self.plugins, "loco")
+        bad = dict(FIRMWARE_VEL_LIMITS)
+        cases = {
+            "rpc_rejected": {"header": {"code": "1", "msg": "busy"}},
+            "missing": {"header": {"code": "0"}},
+            "empty": {"vel_limit_value": {}},
+            "non_numeric": {"vel_limit_value": dict(bad, forward_velocity_limit_max="fast")},
+            "bool": {"vel_limit_value": dict(bad, lateral_velocity_limit_max=True)},
+            "nan": {"vel_limit_value": dict(bad, angular_velocity_limit_max=float("nan"))},
+            "inverted": {"vel_limit_value": dict(bad, forward_velocity_limit_min=0.5,
+                                                 forward_velocity_limit_max=0.2)},
+            "excludes_zero": {"vel_limit_value": dict(bad, lateral_velocity_limit_min=0.1)},
+        }
+        for name, response in cases.items():
+            with self.subTest(name):
+                self.transport.responses["MotionControlMotionService/GetVelocityLimitValue"] = response
+                result = loco.dispatch("walk", {"forward": 0.1, "duration": 1})
+                self.assertEqual(result["code"], "NOT_READY")
+                self.assertIsNone(loco._limits)
+        self.assertEqual(self.nodes.locomotion_pub.published, [])
+        # A later valid reading is accepted and cached.
+        self.transport.responses["MotionControlMotionService/GetVelocityLimitValue"] = {
+            "vel_limit_value": dict(FIRMWARE_VEL_LIMITS)}
+        self.assertEqual(loco.dispatch("walk", {"forward": 0.1, "duration": 1})["state"], "accepted")
+        self.assertEqual(loco._limits["forward"], (-0.3, 0.6))
+        loco.stop()
+
+    def test_loco_omitted_firmware_limit_field_means_zero(self):
+        # proto3 JSON drops zero-valued fields: no forward min = no reversing.
+        limits = dict(FIRMWARE_VEL_LIMITS)
+        del limits["forward_velocity_limit_min"]
+        self.transport.responses["MotionControlMotionService/GetVelocityLimitValue"] = {
+            "vel_limit_value": limits}
+        loco = find_plugin(self.plugins, "loco")
+        self.assertEqual(loco.dispatch("walk", {"forward": -0.1, "duration": 1})["code"], "INVALID_ARG")
+        self.assertEqual(loco._limits["forward"], (0.0, 0.6))
 
     def test_waist_control_publishes_wrapper(self):
         waist = find_plugin(self.plugins, "waist_control")

@@ -1701,8 +1701,8 @@ class A3Rpc:
         self.timeout = timeout
         self.transport = transport
 
-    def _unit(self, host, port):
-        return RpcClient(f"{host}:{port}", self.timeout, self.transport)
+    def _unit(self, host, port, timeout=None):
+        return RpcClient(f"{host}:{port}", timeout or self.timeout, self.transport)
 
     # -- MDU :56322 MotionControlAction/MotionService --------------------------------
 
@@ -1719,8 +1719,8 @@ class A3Rpc:
                            f"msg={(response.get('header') or {}).get('msg', '')!r}")
         return response
 
-    def get_action(self) -> dict:
-        return self._unit(self.mdu_port, 56322).call("MotionControlActionService", "GetAction")
+    def get_action(self, timeout=None) -> dict:
+        return self._unit(self.mdu_port, 56322, timeout).call("MotionControlActionService", "GetAction")
 
     def get_next_actions(self) -> dict:
         return self._unit(self.mdu_port, 56322).call("MotionControlActionService", "GetNextActions")
@@ -2304,9 +2304,9 @@ def _mc_name(value) -> str:
     return _strip_prefix(str(value or ""), _MC_ACTION_PREFIX).upper()
 
 
-def _mc_info(rpc) -> dict:
+def _mc_info(rpc, timeout=None) -> dict:
     """GetAction → {action, status, stage} with enum prefixes stripped."""
-    info = rpc.get_action().get("info") or {}
+    info = (rpc.get_action(timeout) if timeout else rpc.get_action()).get("info") or {}
     stage = info.get("stage")
     return {"action": _mc_name(info.get("current_action")) or "UNKNOWN",
             "status": _strip_prefix(str(info.get("status") or ""), _MC_STATUS_PREFIX).upper() or "UNKNOWN",
@@ -2382,7 +2382,8 @@ class McModePlugin:
       厂商序列驱动 MC：起立 [PD_STAND →] GET_UP → MOTION，躺下 LIE_DOWN → PASSIVE。
     - 多秒级整机动作，走 ACP，按 GetAction 轮询确认到位后才回报 completed；
       进行中拒绝新的切换（中途打断起身/躺下会摔），不绑定 interrupt hook；
-      切换前先让 loco 减速停稳。
+      切换期间 loco 拒绝 walk，切换前先让 loco 减速并确认零速帧已送达、推流已停，
+      停不稳则不发切换。
     - damping 立即卸力，必须显式 confirm=true（固件急停语义，不经 skillpilot）。
     """
 
@@ -2466,17 +2467,28 @@ class McModePlugin:
                 return plan
             action_id = f"mc_{action}_{uuid4().hex[:8]}"
             self._active = (action_id, action)
-        if self.loco is not None:
-            self.loco.halt("superseded_by_mc_mode", wait=True)
+        # Block new walks first, then require the stream to be fully stopped (zero
+        # frames delivered, publisher exited) before skillpilot moves the legs.
+        if self.loco is not None and not self.loco.block(f"mc_mode {action}"):
+            self._release(action_id)
+            return _rejected("LOCO_NOT_STOPPED", "行走未能确认停稳（零速帧未送达或停止超时），未发送姿态切换",
+                             "用 loco status 确认已停下后重试", current=info["action"])
         if plan["call"]:
             rejection = self._request_skillpilot(action, info)
             if rejection is not None:
-                with self._lock:
-                    self._active = None
+                self._release(action_id)
                 return rejection
         threading.Thread(target=self._run, args=(action_id, action, info["action"], plan),
                          daemon=True, name=f"a3_{action_id}").start()
         return {"state": "accepted", "action_id": action_id, "from": info["action"]}
+
+    def _release(self, action_id):
+        """End the posture switch ``action_id``: clear the BUSY slot and let loco walk again."""
+        with self._lock:
+            if self._active and self._active[0] == action_id:
+                self._active = None
+        if self.loco is not None:
+            self.loco.unblock()
 
     # -- planning ---------------------------------------------------------------
 
@@ -2573,21 +2585,28 @@ class McModePlugin:
         except Exception as exc:
             result = {"code": "STATE_UNAVAILABLE", "reason": str(exc)}
         finally:
-            with self._lock:
-                if self._active and self._active[0] == action_id:
-                    self._active = None
+            self._release(action_id)
         _acp_notify(action_id, status, result, "mc_mode")
 
     def _hold(self, info, seconds):
-        """Keep watching for ``seconds`` that the posture stays put."""
+        """Keep watching for ``seconds`` that the posture stays put.
+
+        Only fresh readings count: the hold ends on a successful GetAction, and
+        STATE_FAILS consecutive failures abort instead of reporting settled.
+        """
         end = time.monotonic() + seconds
-        while time.monotonic() < end:
+        fails = 0
+        while time.monotonic() < end or fails:
             if self._closed:
                 raise _McAbort("CANCELLED", "驱动停止，不再跟踪本次切换", info)
             time.sleep(self.POLL_S)
             try:
                 latest = _mc_info(self.nodes.rpc)
-            except Exception:
+                fails = 0
+            except Exception as exc:
+                fails += 1
+                if fails >= self.STATE_FAILS:
+                    raise _McAbort("STATE_UNAVAILABLE", f"确认站稳期间连续读取 GetAction 失败: {exc}", info)
                 continue
             if latest["action"] != info["action"]:
                 raise _McAbort("INTERRUPTED", f"到位后状态变为 {latest['action']}", latest)
@@ -2658,7 +2677,10 @@ class LocoPlugin:
     - 新 walk 直接接管：旧任务 cancelled(superseded)，速度平滑过渡，不先停下。
     - stop / interrupt hook：减速到零后结束，旧任务 cancelled。
     - 速度按 ACCEL/DECEL 斜坡变化（厂商要求大幅变化分步过渡）。
-    - 行走中 2 Hz 监视 GetAction，离开 MOTION 或连续读不到状态即减速停下并报 error。
+    - 行走中 2 Hz 监视 GetAction，离开 MOTION 或超过 MONITOR_STALE_S 未读到状态即减速停下并报 error。
+    - 任务在零速帧发出成功后才结算；零速帧发不出去报 PUBLISH_FAILED。
+    - 固件速度限制读不到或不合法时拒绝 walk（不退回卡片默认限制）。
+    - mc_mode 姿态切换期间（block）拒绝 walk。
     """
 
     RATE_HZ = 20.0
@@ -2671,7 +2693,9 @@ class LocoPlugin:
     ACCEL = {"forward": 0.5, "lateral": 0.5, "angular": 90.0}    # per second, speeding up
     DECEL = {"forward": 1.0, "lateral": 1.0, "angular": 180.0}   # per second, slowing down
     MONITOR_S = 0.5
-    MONITOR_FAILS = 3
+    MONITOR_RPC_TIMEOUT_S = 0.4   # per GetAction; the client default (5 s) would mask an outage
+    MONITOR_STALE_S = 1.5         # wall-clock since the last good reading, checked every frame
+    BLOCK_STOP_TIMEOUT_S = 3.0
     AXES = ("forward", "lateral", "angular")
 
     def __init__(self, nodes):
@@ -2681,6 +2705,9 @@ class LocoPlugin:
         self._velocity = dict.fromkeys(self.AXES, 0.0)
         self._thread = None
         self._fault = None         # set by the MOTION monitor
+        self._state_at = 0.0       # monotonic time of the last good GetAction
+        self._publish_error = None # why the current/last stream died, None if it stopped cleanly
+        self._blocked = None       # reason walks are refused (mc_mode transition)
         self._seq = 0
         self._limits = None
 
@@ -2744,7 +2771,36 @@ class LocoPlugin:
             thread.join(timeout=3.0)
         return task["id"] if task else None
 
+    def block(self, reason) -> bool:
+        """Refuse new walks (BUSY) until unblock(), and stop the current stream.
+
+        True once the stream that was running has exited after delivering its
+        zero frames (or none was running); False if it is still running after
+        BLOCK_STOP_TIMEOUT_S or died on a publish error. The block stays either way.
+        """
+        with self._lock:
+            self._blocked = reason
+            running = self._thread is not None
+        if not running:
+            return True
+        self.halt(reason)
+        deadline = time.monotonic() + self.BLOCK_STOP_TIMEOUT_S
+        while True:
+            with self._lock:
+                if self._thread is None:
+                    return self._publish_error is None
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+
+    def unblock(self):
+        with self._lock:
+            self._blocked = None
+
     # -- walk -------------------------------------------------------------------
+
+    def _busy(self):
+        return _rejected("BUSY", f"{self._blocked} 进行中，暂不接受行走", "等待姿态切换完成后重试")
 
     def _walk(self, args):
         try:
@@ -2756,7 +2812,13 @@ class LocoPlugin:
             return _rejected("INVALID_ARG", "forward/lateral/angular/duration 必须是数字")
         if not 0.0 < duration <= self.MAX_DURATION_S:
             return _rejected("INVALID_ARG", f"duration={duration:g} 超出 (0, {self.MAX_DURATION_S:g}]")
-        limits = self._effective_limits()
+        if self._blocked is not None:
+            return self._busy()
+        try:
+            limits = self._effective_limits()
+        except Exception as exc:
+            return _rejected("NOT_READY", f"无法获取固件速度限制: {exc}",
+                             "检查 MDU 连接与 MotionControlMotionService/GetVelocityLimitValue 后重试")
         for axis in self.AXES:
             low, high = limits[axis]
             if not low <= target[axis] <= high:
@@ -2769,11 +2831,17 @@ class LocoPlugin:
             return rejected
         action_id = f"loco_walk_{uuid4().hex[:8]}"
         with self._lock:
+            # Re-checked under the lock block() takes: a walk either lands before
+            # the block (and is halted by it) or is refused here.
+            if self._blocked is not None:
+                return self._busy()
             old = self._task
             self._task = {"id": action_id, "target": target, "duration": duration,
                           "deadline": time.monotonic() + duration, "ending": None}
             self._fault = None
             if self._thread is None:
+                self._state_at = time.monotonic()    # the MOTION gate just read it
+                self._publish_error = None
                 self._thread = threading.Thread(target=self._stream, daemon=True,
                                                 name="a3_loco_stream")
                 self._thread.start()
@@ -2784,21 +2852,32 @@ class LocoPlugin:
                 "duration": duration, "superseded": old["id"] if old else None}
 
     def _effective_limits(self):
-        if self._limits is None:
-            limits = dict(self.CARD_LIMITS)
-            try:
-                v = self.nodes.rpc.get_velocity_limit().get("vel_limit_value") or {}
-                fw = {"forward": (v["forward_velocity_limit_min"], v["forward_velocity_limit_max"]),
-                      "lateral": (v["lateral_velocity_limit_min"], v["lateral_velocity_limit_max"]),
-                      "angular": (math.degrees(v["angular_velocity_limit_min"]),
-                                  math.degrees(v["angular_velocity_limit_max"]))}
-                limits = {axis: (max(limits[axis][0], fw[axis][0]), min(limits[axis][1], fw[axis][1]))
-                          for axis in self.AXES}
-                self._limits = limits     # cache only a firmware-confirmed result
-            except Exception:
-                pass
-            return limits
-        return self._limits
+        """Card limits ∩ firmware GetVelocityLimitValue (angular converted rad/s → deg/s).
+
+        Fails closed: raises if the firmware limits are unreadable or malformed
+        (non-numeric, min > max, a range excluding 0, or empty); only a valid
+        reading is cached. A missing field is 0 (proto3 JSON omits zero values).
+        """
+        if self._limits is not None:
+            return self._limits
+        v = self.nodes.rpc.get_velocity_limit().get("vel_limit_value")
+        if not isinstance(v, dict) or not v:
+            raise ValueError(f"响应缺少 vel_limit_value: {v!r}")
+        limits = {}
+        for axis, scale in (("forward", None), ("lateral", None), ("angular", math.degrees)):
+            pair = []
+            for end in ("min", "max"):
+                value = v.get(f"{axis}_velocity_limit_{end}", 0.0)
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise ValueError(f"{axis}_velocity_limit_{end}={value!r} 不是有效数字")
+                pair.append(scale(value) if scale else float(value))
+            low, high = pair
+            if not low <= 0.0 <= high:
+                raise ValueError(f"{axis} 固件限制 [{low:g}, {high:g}] 不合法（需 min ≤ 0 ≤ max）")
+            card = self.CARD_LIMITS[axis]
+            limits[axis] = (max(card[0], low), min(card[1], high))
+        self._limits = limits
+        return limits
 
     # -- streaming --------------------------------------------------------------
 
@@ -2826,8 +2905,9 @@ class LocoPlugin:
             self._velocity[axis] = goal if abs(goal - cur) <= step else cur + math.copysign(step, goal - cur)
 
     def _stream(self):
-        """20 Hz publisher: ramps toward the active task's target, settles tasks,
-        and exits after STOP_FRAMES zero frames with no task left."""
+        """20 Hz publisher: ramps toward the active task's target, settles a task
+        only after its zero frame was published, and exits after STOP_FRAMES
+        zero frames with no task left."""
         dt = 1.0 / self.RATE_HZ
         monitor_stop = threading.Event()
         threading.Thread(target=self._monitor, args=(monitor_stop,), daemon=True,
@@ -2836,12 +2916,16 @@ class LocoPlugin:
         next_tick = time.monotonic()
         try:
             while True:
-                settle = None
                 with self._lock:
                     task = self._task
                     if task is not None and task["ending"] is None:
-                        if self._fault is not None:
-                            task["ending"] = ("error", dict(self._fault))
+                        fault = self._fault
+                        stale = time.monotonic() - self._state_at
+                        if fault is None and stale >= self.MONITOR_STALE_S:
+                            fault = {"code": "STATE_UNAVAILABLE",
+                                     "reason": f"{stale:.1f} 秒未读到 GetAction"}
+                        if fault is not None:
+                            task["ending"] = ("error", dict(fault))
                             task["target"] = dict.fromkeys(self.AXES, 0.0)
                         elif time.monotonic() >= task["deadline"]:
                             task["ending"] = ("completed", {"duration": task["duration"],
@@ -2851,22 +2935,22 @@ class LocoPlugin:
                     self._ramp(target, dt)
                     velocity = dict(self._velocity)
                     stopped = not any(velocity.values())
-                    if task is not None and task["ending"] is not None and stopped:
-                        settle, self._task, task = task, None, None
-                    if task is None and stopped:
-                        zero_frames += 1
-                        if zero_frames > self.STOP_FRAMES:
-                            self._thread = None
-                            break
-                    else:
-                        zero_frames = 0
-                if settle is not None:
-                    _notify_async(settle["id"], *settle["ending"], "loco")
+                    if task is None and stopped and zero_frames >= self.STOP_FRAMES:
+                        self._thread = None
+                        break
                 try:
                     self.nodes.publish_wrapper("locomotion_pub", self._frame(velocity))
                 except Exception as exc:
                     self._abort_publish(exc)
                     return
+                settle = None
+                with self._lock:
+                    # A walk that superseded ``task`` meanwhile has already reported it.
+                    if stopped and task is not None and task["ending"] is not None and self._task is task:
+                        settle, self._task = task, None
+                    zero_frames = zero_frames + 1 if stopped and self._task is None else 0
+                if settle is not None:
+                    _notify_async(settle["id"], *settle["ending"], "loco")
                 next_tick += dt
                 time.sleep(max(0.0, next_tick - time.monotonic()))
         finally:
@@ -2877,21 +2961,20 @@ class LocoPlugin:
         with self._lock:
             task, self._task, self._thread = self._task, None, None
             self._velocity = dict.fromkeys(self.AXES, 0.0)
+            self._publish_error = str(exc)
         print(f"[loco] publish failed: {exc}", flush=True)
         if task is not None:
             _notify_async(task["id"], "error", {"code": "PUBLISH_FAILED", "reason": str(exc)}, "loco")
 
     def _monitor(self, stop_event):
-        fails = 0
+        """Refresh ``_state_at`` on every good GetAction; the stream judges staleness."""
         while not stop_event.wait(self.MONITOR_S):
             try:
-                info = _mc_info(self.nodes.rpc)
-                fails = 0
-            except Exception as exc:
-                fails += 1
-                if fails >= self.MONITOR_FAILS:
-                    self._fault = {"code": "STATE_UNAVAILABLE", "reason": f"GetAction 连续失败: {exc}"}
+                info = _mc_info(self.nodes.rpc, timeout=self.MONITOR_RPC_TIMEOUT_S)
+            except Exception:
                 continue
+            with self._lock:
+                self._state_at = time.monotonic()
             if info["action"] != "MOTION":
                 self._fault = {"code": "LEFT_MOTION",
                                "reason": f"行走中运动控制状态变为 {info['action']}/{info['status']}"}
