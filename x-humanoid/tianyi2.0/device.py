@@ -3739,6 +3739,7 @@ class ArmGesturePlugin:
         self._pub_node = Node("tianyi2_arm_gesture_pub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._pub_node)
         self._publisher = None
+        self._clap_config = plugin_config.get("clap", {})
         self._sequence = _ActionSequence("ArmGesturePlugin")
         self._feedback_condition = threading.Condition()
         self._arm_status = {}
@@ -3751,7 +3752,7 @@ class ArmGesturePlugin:
         return {
             "name": "arm_gesture",
             "type": "actuator",
-            "description": "天轶2.0 手臂语义动作 — 敬礼、欢迎、举手、握手、击掌和回正",
+            "description": "天轶2.0 手臂语义动作 — 敬礼、欢迎、举手、握手、击掌、鼓掌三次和回正",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3759,10 +3760,10 @@ class ArmGesturePlugin:
                         "type": "string",
                         "enum": [
                             "salute", "welcome", "raise", "shake_hands",
-                            "high_five", "reset", "cancel",
+                            "high_five", "clap", "reset", "cancel",
                         ],
                         "default": "welcome",
-                        "description": "手臂动作，可选[salute, welcome, raise, shake_hands, high_five, reset, cancel]",
+                        "description": "手臂动作，可选[salute, welcome, raise, shake_hands, high_five, clap, reset, cancel]",
                     },
                     "side": {
                         "type": "string", "enum": ["left", "right", "both"],
@@ -3787,8 +3788,8 @@ class ArmGesturePlugin:
                 },
                 "required": ["action"],
                 "x-completion": {
-                    "actions": ["salute", "welcome", "shake_hands"],
-                    "timeout": 30,
+                    "actions": ["salute", "welcome", "shake_hands", "clap"],
+                    "timeout": 120,
                 },
                 # Both arms: the gestures are static per schema and some are
                 # two-handed, so claiming one side could let them overlap on shared
@@ -3800,6 +3801,7 @@ class ArmGesturePlugin:
                     "raise": {"params": ["side", "speed"], "description": "将手臂高举到头部上方后回正"},
                     "shake_hands": {"params": ["side", "cycles", "speed"], "description": "向前伸手并轻柔上下摆动，做出握手动作"},
                     "high_five": {"params": ["side", "speed"], "description": "将手掌伸到身体前方并保持在肩部附近，做出击掌等待姿势"},
+                    "clap": {"params": [], "description": "双臂鼓掌三次，手掌不接触；需先完成实机姿态标定"},
                     "reset": {"params": ["side", "speed"], "description": "取消序列并回到中性姿态"},
                     "cancel": {"params": [], "description": "取消尚未发送的后续动作帧"},
                 },
@@ -3834,6 +3836,8 @@ class ArmGesturePlugin:
             }
         if action == "cancel":
             return {"state": "cancelled", "cancelled": self._sequence.cancel()}
+        if action == "clap":
+            return self._dispatch_clap(args)
         if action == "salute":
             # The salute card exposes a dedicated left/right-only selector.
             # Keep accepting the old `side` argument for direct MCP callers.
@@ -3961,6 +3965,98 @@ class ArmGesturePlugin:
         if action_id:
             result["action_id"] = action_id
         return result
+
+    def _dispatch_clap(self, args: dict) -> dict:
+        # Only an explicitly calibrated trajectory is allowed to move hardware.
+        # The URDF does not contain hand collision geometry, so joint limits by
+        # themselves cannot establish a safe clearance between hands.
+        if args.get("side", "both") != "both":
+            return self._error_result("clap_requires_both_arms", "clap requires both arms")
+        if "cycles" in args and args["cycles"] != 3:
+            return self._error_result("clap_requires_three_cycles", "clap always has three cycles")
+        cfg = self._clap_config
+        if not isinstance(cfg, dict) or cfg.get("calibrated") is not True:
+            return self._error_result("clap_not_calibrated", "clap poses require collision and robot calibration")
+        import math
+        poses = []
+        for key in ("prepare", "open", "close"):
+            pose = cfg.get(key)
+            if (not isinstance(pose, (list, tuple)) or len(pose) != 7
+                    or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                           or not math.isfinite(v) for v in pose)):
+                return self._error_result("clap_invalid_pose", "invalid calibrated clap pose", pose=key)
+            violations = self._pose_violations("both", pose)
+            if violations:
+                return self._error_result("arm_pose_out_of_range", "clap pose exceeds joint limits", pose=key, violations=violations)
+            poses.append(list(pose))
+        prepare, opened, closed = poses
+        if opened == closed:
+            return self._error_result("clap_invalid_pose", "open and close poses must differ")
+        # Stop issuing frames from any previous gesture before checking entry.
+        # Cancellation does not stop an already-issued controller target.
+        self._sequence.cancel()
+        check = self._preflight("both")
+        if check is not None:
+            return check
+        # Require the calibrated entry point: timing from a fictitious neutral
+        # starting pose could otherwise sweep through an unvalidated path.
+        _, current = self._feedback_snapshot("both")
+        targets = self._target_positions("both", self._NEUTRAL)
+        if any(abs(current[i] - targets[i]) > self._TARGET_TOLERANCE_RAD for i in targets):
+            return self._error_result("clap_requires_neutral", "return both arms to neutral before clap")
+        frames = [prepare, opened] + [p for _ in range(3) for p in (closed, opened)] + [prepare, self._NEUTRAL]
+        speed = 0.3
+        from uuid import uuid4
+        action_id = f"arm_gesture_clap_{uuid4().hex[:8]}"
+        outcome = {"state": "completed"}
+
+        def worker(cancel_event):
+            try:
+                for frame in frames:
+                    if cancel_event.is_set():
+                        return
+                    check = self._preflight("both")
+                    if check is not None:
+                        outcome.update(state="error", detail=check)
+                        return
+                    seq, baseline = self._feedback_snapshot("both")
+                    result = self._publish_pose("both", frame, speed)
+                    if "error" in result:
+                        outcome.update(state="error", detail=result)
+                        return
+                    result = self._wait_for_clap_target(frame, seq, baseline, cancel_event, speed)
+                    if result is not None:
+                        if not cancel_event.is_set():
+                            outcome.update(state="error", detail=result)
+                        return
+            except Exception as exc:
+                outcome.update(state="error", detail={"error": str(exc)})
+
+        def on_done(cancelled):
+            status = "cancelled" if cancelled else outcome["state"]
+            _acp_notify(action_id, status, {"gesture": "clap", "side": "both", "cycles": 3, **({"detail": outcome["detail"]} if "detail" in outcome else {})}, "arm_gesture")
+
+        self._sequence.start(worker, on_done=on_done)
+        return {"state": "running", "gesture": "clap", "side": "both", "cycles": 3, "speed": speed, "action_id": action_id}
+
+    def _wait_for_clap_target(self, pose, baseline_seq, baseline, cancel_event, speed):
+        targets = self._target_positions("both", pose)
+        max_delta = max(abs(targets[i] - baseline[i]) for i in targets)
+        deadline = time.monotonic() + max(3.0, max_delta / speed * 2 + 2.0)
+        while not cancel_event.is_set():
+            check = self._preflight("both")
+            if check is not None:
+                return check
+            with self._feedback_condition:
+                if self._arm_status_seq > baseline_seq and all(
+                        abs(self._arm_status[i]["pos"] - target) <= self._TARGET_TOLERANCE_RAD
+                        for i, target in targets.items()):
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return self._error_result("clap_target_timeout", "both arms did not reach the clap target")
+                self._feedback_condition.wait(min(0.1, remaining))
+        return self._error_result("clap_cancelled", "clap cancelled")
 
     def _on_arm_status(self, msg):
         now = time.monotonic()
