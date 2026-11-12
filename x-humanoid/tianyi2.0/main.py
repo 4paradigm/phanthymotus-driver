@@ -316,6 +316,12 @@ class TianyiDeviceBundle:
         self._cfg = cfg
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
+        rgbd_source = None
+        if any(plugins_cfg.get(name, {}).get("enabled", False) for name in ("camera", "camera_depth", "imu")):
+            from rgbd_camera import RgbdCameraPlugin, RgbdInputCard
+            rgbd_source = RgbdCameraPlugin(
+                {"imu_enabled": plugins_cfg.get("imu", {}).get("enabled", False),
+                 "hz": plugins_cfg.get("camera_depth", {}).get("hz", 8)}, namespace, ros2, managed=True)
 
         if plugins_cfg.get("state", {}).get("enabled", False):
             from device import StatePlugin
@@ -327,13 +333,13 @@ class TianyiDeviceBundle:
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
-            self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
+            self._plugins.append(RgbdInputCard(rgbd_source, 'color',
+                CameraPlugin(plugins_cfg["camera"], namespace, ros2)))
             print("[bundle] CameraPlugin loaded")
 
-        if plugins_cfg.get("camera_rgbd", {}).get("enabled", False):
-            from rgbd_camera import RgbdCameraPlugin
-            self._plugins.append(RgbdCameraPlugin(plugins_cfg["camera_rgbd"], namespace, ros2))
-            print("[bundle] RgbdCameraPlugin loaded")
+        if plugins_cfg.get("camera_depth", {}).get("enabled", False):
+            self._plugins.append(RgbdInputCard(rgbd_source, 'depth'))
+            print("[bundle] shared calibrated depth loaded")
 
         if plugins_cfg.get("camera_snapshot", {}).get("enabled", False):
             from device import CameraSnapshotPlugin
@@ -342,13 +348,13 @@ class TianyiDeviceBundle:
             print("[bundle] CameraSnapshotPlugin loaded")
 
         for config_name, class_name in (("imu", "ImuPlugin"),
-                                        ("camera_depth", "DepthCameraPlugin"),
                                         ("camera_pointcloud", "PointCloudPlugin")):
             if plugins_cfg.get(config_name, {}).get("enabled", False):
-                from device import ImuPlugin, DepthCameraPlugin, PointCloudPlugin
-                plugin_class = {"ImuPlugin": ImuPlugin, "DepthCameraPlugin": DepthCameraPlugin,
+                from device import ImuPlugin, PointCloudPlugin
+                plugin_class = {"ImuPlugin": ImuPlugin,
                                 "PointCloudPlugin": PointCloudPlugin}[class_name]
-                self._plugins.append(plugin_class(plugins_cfg[config_name], namespace, ros2))
+                plugin = plugin_class(plugins_cfg[config_name], namespace, ros2)
+                self._plugins.append(RgbdInputCard(rgbd_source, 'imu', plugin) if config_name == 'imu' else plugin)
                 print(f"[bundle] {class_name} loaded")
 
         if plugins_cfg.get("asr", {}).get("enabled", False):

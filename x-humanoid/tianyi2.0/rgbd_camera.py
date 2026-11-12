@@ -1,4 +1,4 @@
-"""Calibrated RGB-D computation outputs, separate from dashboard camera crops.
+"""One calibrated depth stream shared by original sensor cards and consumers.
 
 The vendor must already express depth in the color optical reference frame.
 Different intrinsics still require reprojection: sampling color along the depth
@@ -59,7 +59,7 @@ def make_geometry(color, depth, *, registered):
                 depth_y=(depth.k[4]*y + depth.k[5]).astype(np.float32))
 
 
-def camera_declarations(root, geometry, clock):
+def camera_declarations(root, geometry, clock, *, depth_topic=None):
     common = dict(schema='motus.camera/1', id=root + '/rectified',
                   width=640, height=480, K=geometry['K'].ravel().tolist(), D=[0.] * 5,
                   distortion_model='pinhole', source='derived-from-K',
@@ -68,7 +68,7 @@ def camera_declarations(root, geometry, clock):
                               registration_source='orbbec_hw_registered_common_optical_rays',
                               timestamp_semantics='source_capture_mapped'))
     color = dict(deepcopy(common), topic=root + '/color', format='image/jpeg')
-    depth = dict(deepcopy(common), topic=root + '/depth', format='image/depth-zlib')
+    depth = dict(deepcopy(common), topic=depth_topic or root + '/depth', format='image/depth-zlib')
     depth['vendor'].update(depth_unit='mm', depth_source='measured')
     return [color, depth]
 
@@ -93,9 +93,13 @@ class _MountNode:
 
 
 class RgbdCameraPlugin:
-    def __init__(self, config, namespace, ros2):
+    def __init__(self, config, namespace, ros2, *, managed=False):
         from rclpy.node import Node
         self.root = '/' + namespace + '/camera/rgbd'
+        self.managed, self.clients = managed, {}
+        self.client_epochs = {}
+        self.lifecycle_lock = threading.RLock()
+        self.frame_interval_ns = round(1_000_000_000 / max(1., min(float(config.get('hz', 10)), 15.)))
         self.clock = 'orbbec_head_global_ros_header'
         self.sub_node = Node('tianyi_rgbd_source', context=ros2.ctx_tianyi)
         self.pub_node = Node('tianyi_rgbd_output', context=ros2.ctx_core)
@@ -156,6 +160,41 @@ class RgbdCameraPlugin:
         self._camera_shutdown.set()
         self._camera_executor.wake()
 
+    @property
+    def depth_topic(self):
+        return self.root.rsplit('/camera/rgbd', 1)[0] + '/camera/head/depth'
+
+    def acquire(self, kind):
+        with self.lifecycle_lock:
+            with self.lock:
+                if kind in self.clients and self.running:
+                    return
+                self.clients[kind] = self.sub_node.get_clock().now().nanoseconds
+                self.client_epochs[kind] = uuid.uuid4().hex
+                if kind == 'imu':
+                    self.imu_epoch = uuid.uuid4().hex
+                    self.imu_last_stamp = 0
+                    for samples in self.imu_samples.values():
+                        samples.clear()
+            try:
+                self.start()
+            except Exception:
+                with self.lock:
+                    self.clients.pop(kind, None)
+                raise
+
+    def release(self, kind):
+        with self.lifecycle_lock:
+            with self.lock:
+                self.clients.pop(kind, None)
+                last = not self.clients
+            if last:
+                self.stop()
+
+    def _publishes(self, kind, stamp, epochs=None):
+        return not self.managed or (kind in self.clients and stamp >= self.clients[kind] and
+            (epochs is None or epochs.get(kind) == self.client_epochs[kind]))
+
     def get_tool(self):
         return {'name': 'camera_rgbd', 'type': 'sensor',
                 'description': '天轶配准 RGB-D 计算输入（原始采集时间、共同光学平面）',
@@ -164,12 +203,13 @@ class RgbdCameraPlugin:
 
     def _outputs(self):
         return [{'topic': self.root + '/color', 'format': 'image/jpeg'},
-                {'topic': self.root + '/depth', 'format': 'image/depth-zlib'},
+                {'topic': self.depth_topic, 'format': 'image/depth-zlib'},
                 {'topic': self.root + '/imu', 'format': 'sensor/imu'},
                 {'topic': self.root + '/body_mount', 'format': 'state/extrinsic'}]
 
     def _declarations(self):
-        declarations = camera_declarations(self.root, self.geometry, self.clock) if self.geometry is not None else []
+        declarations = camera_declarations(self.root, self.geometry, self.clock,
+            depth_topic=self.depth_topic) if self.geometry is not None else []
         if getattr(self, 'body_mount', None) is not None:
             for entry in declarations:
                 entry['vendor']['body_mount'] = self.body_mount.declaration()
@@ -191,7 +231,7 @@ class RgbdCameraPlugin:
                 return
             if not self.attached:
                 self.color_pub = self.pub_node.create_publisher(CompressedImage, self.root + '/color', qos_profile_sensor_data)
-                self.depth_pub = self.pub_node.create_publisher(CompressedImage, self.root + '/depth', qos_profile_sensor_data)
+                self.depth_pub = self.pub_node.create_publisher(CompressedImage, self.depth_topic, qos_profile_sensor_data)
                 for kind in ('color', 'depth'):
                     self.sub_node.create_subscription(CameraInfo, '/ob_camera_head/' + kind + '/camera_info',
                         lambda m, k=kind: self._info(k, m), qos_profile_sensor_data)
@@ -205,6 +245,7 @@ class RgbdCameraPlugin:
             self.geometry = None
             self.signature = None
             self.last_emit = 0
+            self.count = 0
             self.future = None
             self.error = None
             self.imu_epoch = uuid.uuid4().hex
@@ -278,6 +319,8 @@ class RgbdCameraPlugin:
                 if self.geometry is None:
                     raise ValueError('waiting for RGB-D camera optical calibration')
                 stamp = _stamp(msg)
+                if not self._publishes('imu', stamp):
+                    return
                 now = self.sub_node.get_clock().now().nanoseconds
                 if stamp <= 0 or not -50_000_000 <= now-stamp <= 500_000_000:
                     raise ValueError('stale, future or invalid camera motion capture stamp')
@@ -326,7 +369,8 @@ class RgbdCameraPlugin:
                                       camera_from_accel_translation=accel_translation, translation_source='tf')
                         self.imu_translation_reason = None
                     from std_msgs.msg import String
-                    self.imu_pub.publish(String(data=json.dumps(packet, allow_nan=False)))
+                    if self._publishes('imu', gyro_stamp):
+                        self.imu_pub.publish(String(data=json.dumps(packet, allow_nan=False)))
                     self.imu_last_stamp = gyro_stamp
                     self.imu_reason = None
             except Exception as error:
@@ -385,16 +429,18 @@ class RgbdCameraPlugin:
                 if (msg.header.frame_id != self.geometry['frame_id'] or
                         msg.width != self.infos[kind].width or msg.height != self.infos[kind].height):
                     raise ValueError('source image geometry differs from calibration')
+                if self.managed and not self.clients.keys() & {'color', 'depth'}:
+                    return
                 self.frames[kind].append(msg)
                 color, depth = self.frames['color'], self.frames['depth']
                 while color and depth:
                     delta = _stamp(color[0]) - _stamp(depth[0])
                     if abs(delta) <= 20_000_000:
                         pair = color.popleft(), depth.popleft()
-                        if _stamp(pair[1]) - self.last_emit >= 100_000_000:
+                        if _stamp(pair[1]) - self.last_emit >= self.frame_interval_ns:
                             if self.pending.full():
                                 self.pending.get_nowait()
-                            self.pending.put_nowait(pair)
+                            self.pending.put_nowait(pair + (dict(self.client_epochs),) if self.managed else pair)
                             self.last_emit = _stamp(pair[1])
                         break
                     (color if delta < 0 else depth).popleft()
@@ -408,7 +454,9 @@ class RgbdCameraPlugin:
         from sensor_msgs.msg import CompressedImage
         while not self.stop_event.is_set():
             try:
-                color, depth = self.pending.get(timeout=.1)
+                item = self.pending.get(timeout=.1)
+                color, depth = item[:2]
+                epochs = item[2] if len(item) == 3 else None
             except queue.Empty:
                 continue
             try:
@@ -435,9 +483,15 @@ class RgbdCameraPlugin:
                 with self.lock:
                     if not self.running or self.stop_event.is_set():
                         continue
+                    publish_color = self._publishes('color', _stamp(color), epochs)
+                    publish_depth = self._publishes('depth', _stamp(depth), epochs)
+                    if not (publish_color or publish_depth):
+                        continue
                     self.body_mount.publish(_stamp(depth))
-                    self.color_pub.publish(out_color)
-                    self.depth_pub.publish(out_depth)
+                    if publish_color:
+                        self.color_pub.publish(out_color)
+                    if publish_depth:
+                        self.depth_pub.publish(out_depth)
                     self.count += 1
             except Exception as error:
                 with self.lock:
@@ -481,3 +535,84 @@ class RgbdCameraPlugin:
                     'imu_status': self._imu_status(),
                     'body_mount_status': self._body_mount_status(),
                     **({'error': self.error} if self.error else {})}
+
+
+class RgbdInputCard:
+    """Original sensor card, with one shared calibrated camera owner."""
+    def __init__(self, source, kind, display=None):
+        self.source, self.kind, self.display = source, kind, display
+        self.running = False
+        self.lock = threading.RLock()
+
+    def get_tool(self):
+        if self.display is not None:
+            tool = deepcopy(self.display.get_tool())
+        else:
+            tool = dict(name='camera_depth', type='sensor', inputSchema={'type': 'object', 'properties': {}},
+                        description='天轶配准毫米深度，显示、里程计和 Point Cloud 共用', topic_out=[])
+        port = next(p for p in self.source._outputs() if p['format'] ==
+                    {'color': 'image/jpeg', 'depth': 'image/depth-zlib', 'imu': 'sensor/imu'}[self.kind])
+        port = dict(port, description='相机 IMU（里程计输入）' if self.kind == 'imu' else '配准相机数据')
+        if self.kind == 'imu':
+            port['name'] = 'camera_imu'
+        elif self.kind == 'color':
+            port['name'] = 'registered_rgb'
+        tool['topic_out'].append(port)
+        with self.source.lock:
+            tool['camera_info'] = [d for d in self.source._declarations() if d['topic'] == port['topic']]
+            tool['imu_status'] = self.source._imu_status()
+            tool['body_mount_status'] = self.source._body_mount_status()
+        return tool
+
+    def start(self):
+        with self.lock:
+            if self.running:
+                return
+            if self.display is not None:
+                self.display.start()
+            try:
+                self.source.acquire(self.kind)
+            except Exception:
+                if self.display is not None:
+                    self.display.stop()
+                raise
+            self.running = True
+
+    def stop(self):
+        with self.lock:
+            if not self.running:
+                return
+            self.source.release(self.kind)
+            if self.display is not None:
+                self.display.stop()
+            self.running = False
+
+    def dispatch(self, action, args):
+        if action == 'start':
+            self.start()
+            deadline = time.monotonic() + 10.
+            while time.monotonic() < deadline:
+                with self.source.lock:
+                    ready = (self.source._imu_status()['state'] == 'available' if self.kind == 'imu' else
+                             self.source.registered and self.source.geometry is not None
+                             and self.source.count > 0 and not self.source.error)
+                    if ready or not self.source.running:
+                        break
+                time.sleep(.05)
+        elif action == 'stop':
+            self.stop()
+        elif action != 'info' and self.display is not None:
+            return self.display.dispatch(action, args)
+        tool = self.get_tool()
+        with self.source.lock:
+            ready = (self.source.running and self.source.registered and self.source.geometry is not None
+                     and self.source.count > 0 and not self.source.error)
+            state = 'running' if self.running and self.source.running else 'idle'
+            if self.kind == 'depth' and self.running and not ready:
+                state = 'unavailable'
+            return dict(state=state,
+                        topic_out=tool['topic_out'], camera_info=tool['camera_info'],
+                        imu_status=tool['imu_status'], body_mount_status=tool['body_mount_status'],
+                        **({'reason': self.source.error or 'waiting for calibrated source captures'}
+                           if self.kind == 'depth' and self.running and not ready else {}),
+                        **({'error': self.source.error} if self.source.error else {}))

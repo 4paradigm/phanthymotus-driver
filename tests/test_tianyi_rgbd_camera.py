@@ -102,11 +102,13 @@ def test_frame_sampling_uses_capture_intervals_despite_callback_jitter(monkeypat
     from collections import deque
     import queue, threading
     source = object.__new__(m.RgbdCameraPlugin)
+    source.managed = False
     source.lock = threading.RLock(); source.running = source.registered = True
     source.infos = {'color': info(), 'depth': info()}
     source.signature = source.geometry = None
     source.frames = {'color': deque(maxlen=3), 'depth': deque(maxlen=3)}
     source.pending = queue.Queue(maxsize=1); source.last_emit = 0.
+    source.frame_interval_ns = 100_000_000
     source.stop_event = threading.Event(); source.error = None
     monkeypatch.setattr(m.time, 'monotonic', lambda: 1000.)
     sampled = []

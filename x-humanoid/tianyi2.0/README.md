@@ -232,25 +232,38 @@ health check restarts it.
 
 ## RGB-D input for generic visual odometry
 
-`camera_rgbd` exposes paired `image/jpeg` and 640×480 millimetre
-`image/depth-zlib` computation ports, separate from the existing display cards.
-It waits up to ten seconds for the vendor registration/time parameters,
+The existing `camera_head`, `camera_depth` and `imu` cards share one private
+calibrated source. The standalone `camera_rgbd` card is retired. Original
+`camera_head` display output stays unchanged and appends registered RGB on
+`/<ns>/camera/rgbd/color`. The sole `camera_depth` output stays on
+`/<ns>/camera/head/depth`: display, RGB-D odometry and Point Cloud all subscribe
+to the same 640×480 little-endian uint16 millimetre depth, zlib-compressed in
+`CompressedImage`; zero pixels are invalid. The old independent display depth
+crop/encoder and `/camera/rgbd/depth` publisher are removed. Geometry follows
+the calibrated computation path, so the displayed field of view may change.
+
+Each image card waits up to ten seconds for registration/time parameters,
 calibration and first pair before source startup returns. Color is sampled
 using its distortion and intrinsics onto the registered depth optical rays;
-both ports declare the resulting common pinhole K and retain source headers.
-Connect these ports to Perception's `rgbd_odometry` card. Its camera-frame
-`state/odom` and PR519's native PointCloud2 can feed the SLAM card; do not use
-the visualization cloud or invent a camera-to-body mount.
+both cards declare the common pinhole K on their actual output topics and
+retain source headers. Connect registered RGB and the original depth output
+to Perception's `rgbd_odometry`. The same depth output feeds Point Cloud with
+`metric_cloud=true`; its `sensor/pointcloud2` and the odometry's `state/odom`
+feed SLAM in the common camera frame. Existing display pointcloud packets are
+not metric SLAM inputs. This uses the existing runtime identical-frame route,
+not a new verified independent-clock/provenance protocol.
 
-The optional third `sensor/imu` port publishes `motus.imu/1` JSON through
+The existing `imu` card keeps its display output and appends the named optional
+`camera_imu` port (`sensor/imu`) on `/<ns>/camera/rgbd/imu`. It publishes
+`motus.imu/1` JSON through
 `std_msgs/String`, using the existing `/ob_camera_head/{gyro,accel}/sample`
 streams. Each raw vector keeps its actual source frame and capture timestamp;
 separate timestamped TF rotations express both source frames in the RGB-D
 camera optical frame. It reuses the RGB-D global header clock gate and pairs
 motion captures within 20 ms. Missing streams, TF, calibration or fresh captures
 withhold only IMU; `info.imu_status` explains availability independently of
-RGB-D readiness. `camera_rgbd.imu_enabled: false` disables these subscriptions
-on startup. No camera or vendor service is started for motion, and no body/head
+RGB-D readiness. Disabling `plugins.imu.enabled` removes the card and its
+computation subscriptions. No camera or vendor service is started for motion, and no body/head
 mount or native orientation is assumed. Consumer attitude assistance remains
 off until its `imu_assisted` option is enabled. A source restart or capture
 interruption over 500 ms creates a new motion epoch.
@@ -266,14 +279,14 @@ With IMU enabled, the camera input node runs on its own single-threaded
 executor in the existing vendor ROS context. It remains alive across source
 stop/start so stopped subscriptions discard old input; context shutdown stops
 the executor. Callback failure makes the source unavailable and requires a
-Driver restart. IMU-disabled sources retain the shared executor. RGB-D
-sampling uses depth capture time with a 100 ms minimum interval; arrival
-jitter does not change that sampling clock. This is a rate limit, not an
-exact 10 Hz delivery guarantee. Compressed payloads use ROS byte arrays to
+Driver restart. IMU-disabled sources retain the shared executor. Sampling uses
+depth capture time and the original `plugins.camera_depth.hz` limit (default
+8 Hz); arrival jitter does not change that sampling clock. This is a rate
+limit, not an exact delivery guarantee. Compressed payloads use ROS byte arrays to
 avoid Python's per-byte message setter validation without changing encoding.
 
-The optional fourth `state/extrinsic` port publishes `motus.camera_mount/1`
-JSON on `camera/rgbd/body_mount`. Both RGB-D `camera_info.vendor.body_mount`
+The internal sidecar publishes `motus.camera_mount/1` JSON on
+`camera/rgbd/body_mount`. Both RGB-D `camera_info.vendor.body_mount`
 entries declare this topic automatically, so the generic consumer needs no
 manual body matrix or extra input wire. Each packet queries TF from the actual
 rectified optical frame into `base_link` at the original depth capture
@@ -282,6 +295,20 @@ can select another body frame name; it does not supply a transform. The
 `matrix` field is a 4×4 body-from-camera transform with translations in metres.
 Head motion is supported by querying every capture rather than freezing a
 startup transform. A source restart creates a new body-mount epoch.
+
+Each card's start is idempotent; stopping it suppresses only its own outputs.
+The last user stops the shared worker, while persistent ROS subscriptions
+discard stopped input. Capture and per-card queue epochs prevent buffered
+frames from crossing a restart. IMU restart requires fresh gyro and accel.
+Depth geometry/clock failure stops shared depth rather than falling back to
+display-only pixels or arrival timestamps. Optional IMU/body-TF failure is
+reported separately and does not stop valid image pairs.
+
+Canvas migration: replace old `camera_rgbd` connections with `camera_head`'s
+registered RGB, the single original `camera_depth` port and optional `imu`'s
+`camera_imu` port. Existing depth display links keep their topic and format.
+This redistribution has offline regression/consumer checks only; earlier
+hardware IMU results do not validate this new card lifecycle or performance.
 
 Missing TF, invalid frames/timestamps or unavailable `tf2_ros` produce an
 explicit unavailable packet without a held matrix; images and IMU continue.
@@ -318,3 +345,12 @@ not measured robot accuracy. Source clock/mount identity must remain fixed.
 See the [2026-11-12 IMU validation](patches/validation-20261112.md) for
 the 600-second static IMU continuity result and remaining visual continuity
 and motion-accuracy limits.
+
+### Shared-depth RGB pixel consumers
+
+Consumers that combine RGB pixel coordinates with the shared depth must use
+`/<ns>/camera/rgbd/color` (the registered RGB port), not the unchanged display
+RGB. This also applies to VOP/Measure connections. If Measure overlays an RGB
+image, set its existing `camera_topic` to that registered RGB topic; its default
+`/camera/color` or `/camera/rgb` guess refers to the native display image.
+No camera-to-body matrix or guessed calibration is introduced by this wiring.

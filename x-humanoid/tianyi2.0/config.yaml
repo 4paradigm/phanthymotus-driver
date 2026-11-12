@@ -29,9 +29,6 @@ plugins:
     enabled: true
   camera:
     enabled: true
-  camera_rgbd:
-    enabled: true
-    imu_enabled: true  # Optional existing Orbbec motion subscriptions; consumer assistance stays off by default.
   camera_snapshot:
     enabled: true
     output_dir: "/opt/phanthy-motus/data/images"
@@ -45,8 +42,8 @@ plugins:
     enabled: true
   camera_depth:
     enabled: true
-    # Raw 640x480 Z16 is 614 KiB/frame. Keep the dashboard stream below the
-    # browser/DDS forwarding budget and always display the newest frame.
+    # The sole calibrated depth output serves display, VO and Point Cloud.
+    # Limit the shared stream by capture time and keep only the newest pair.
     hz: 8
   camera_pointcloud:
     enabled: true

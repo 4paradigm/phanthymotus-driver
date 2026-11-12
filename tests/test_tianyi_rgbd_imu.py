@@ -403,3 +403,19 @@ def test_restart_does_not_reuse_old_tf_translation_or_acceleration(source):
     assert 'camera_from_accel_translation' not in resumed
     assert source.dispatch('info', {})['imu_status']['state'] == 'available'
     assert source.dispatch('info', {})['imu_status']['fusion']['state'] == 'unavailable'
+
+
+def test_managed_imu_restart_drops_late_pre_restart_accel(source):
+    source.managed = True
+    source.acquire('color')
+    source.acquire('imu')
+    feed(source, accel=motion(NOW, 'accel_frame'))
+    source.release('imu')
+    source.sub_node.now_ns = NOW+10_000_000
+    source.acquire('imu')
+    source._imu('accel', motion(NOW+1_000_000, 'accel_frame'))
+    source._imu('gyro', motion(NOW+11_000_000))
+    assert len(packets(source)) == 1
+    source._imu('accel', motion(NOW+12_000_000, 'accel_frame'))
+    assert len(packets(source)) == 2
+    assert packets(source)[-1]['accel_stamp_ns'] == NOW+12_000_000

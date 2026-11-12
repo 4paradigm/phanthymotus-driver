@@ -1694,6 +1694,8 @@ class ImuPlugin(_JsonSensor):
             "reason": "waiting_for_upstream_imu",
         }
         self._subscriptions = []  # Keep rclpy subscriptions alive for the plugin lifetime.
+        self._pub_thread = None
+        self._publish_lock = threading.RLock()
         self._camera_acceleration = None
         self._camera_acceleration_timestamp_ms = None
         self._camera_angular_velocity = None
@@ -1720,13 +1722,20 @@ class ImuPlugin(_JsonSensor):
         are emitted.
         """
         from sensor_msgs.msg import Imu as RosImu
+        if self._running:
+            return
+        if self._pub_thread is not None:
+            self._pub_thread.join(timeout=1)
+            if self._pub_thread.is_alive():
+                raise RuntimeError('IMU display worker did not stop')
         self._running = True
-        self._subscriptions = [
-            self._sub_node.create_subscription(
-                RosImu, "/ob_camera_head/accel/sample", self._on_camera_accel, _LOW_LAT_QOS),
-            self._sub_node.create_subscription(
-                RosImu, "/ob_camera_head/gyro/sample", self._on_camera_gyro, _LOW_LAT_QOS),
-        ]
+        if not self._subscriptions:
+            self._subscriptions = [
+                self._sub_node.create_subscription(
+                    RosImu, "/ob_camera_head/accel/sample", self._on_camera_accel, _LOW_LAT_QOS),
+                self._sub_node.create_subscription(
+                    RosImu, "/ob_camera_head/gyro/sample", self._on_camera_gyro, _LOW_LAT_QOS),
+            ]
         # Match StatePlugin/force_sensor behaviour: publish a snapshot even
         # while the vendor IMU stream is unavailable, so Agent Core renders a
         # useful card state instead of an empty panel.
@@ -1735,42 +1744,49 @@ class ImuPlugin(_JsonSensor):
         print("[ImuPlugin] subscribed: /ob_camera_head/accel/sample, /ob_camera_head/gyro/sample")
 
     def stop(self):
-        self._running = False
+        with self._publish_lock:
+            self._running = False
+        if self._pub_thread is not None:
+            self._pub_thread.join(timeout=1)
 
     def _publish_camera_imu(self):
         """Publish only the samples actually received from the camera."""
-        if not self._running:
-            return
-        timestamps = [ts for ts in (
-            self._camera_acceleration_timestamp_ms,
-            self._camera_angular_velocity_timestamp_ms,
-        ) if ts is not None]
-        if not timestamps:
-            return
-        payload = {"available": True, "timestamp_ms": max(timestamps)}
-        if self._camera_acceleration is not None:
-            payload["linear_acceleration"] = self._camera_acceleration
-        if self._camera_angular_velocity is not None:
-            payload["angular_velocity"] = self._camera_angular_velocity
-        self._latest = payload
+        with self._publish_lock:
+            if not self._running:
+                return
+            timestamps = [ts for ts in (
+                self._camera_acceleration_timestamp_ms,
+                self._camera_angular_velocity_timestamp_ms,
+            ) if ts is not None]
+            if not timestamps:
+                return
+            payload = {"available": True, "timestamp_ms": max(timestamps)}
+            if self._camera_acceleration is not None:
+                payload["linear_acceleration"] = self._camera_acceleration
+            if self._camera_angular_velocity is not None:
+                payload["angular_velocity"] = self._camera_angular_velocity
+            self._latest = payload
 
-        # The dashboard only needs the latest state.  Bound transport to 30 Hz
-        # so a high-rate IMU cannot congest the domain-42 bridge.
-        now = time.monotonic()
-        if now - self._last_pub < 1.0 / 30.0:
-            return
-        self._last_pub = now
-        out = String()
-        out.data = json.dumps(self._latest)
-        self._pub.publish(out)
+            # The dashboard only needs the latest state.  Bound transport to 30 Hz
+            # so a high-rate IMU cannot congest the domain-42 bridge.
+            now = time.monotonic()
+            if now - self._last_pub < 1.0 / 30.0:
+                return
+            self._last_pub = now
+            out = String()
+            out.data = json.dumps(self._latest)
+            self._pub.publish(out)
 
     def _publish_snapshot_loop(self):
         while self._running:
-            snapshot = dict(self._latest)
-            snapshot["timestamp_ms"] = int(time.time() * 1000)
-            out = String()
-            out.data = json.dumps(snapshot)
-            self._pub.publish(out)
+            with self._publish_lock:
+                if not self._running:
+                    break
+                snapshot = dict(self._latest)
+                snapshot["timestamp_ms"] = int(time.time() * 1000)
+                out = String()
+                out.data = json.dumps(snapshot)
+                self._pub.publish(out)
             time.sleep(0.5)
 
     def _on_camera_accel(self, msg):
@@ -1802,102 +1818,6 @@ class ImuPlugin(_JsonSensor):
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": self._format}]}
         return {"state": "running" if self._running else "idle"}
-
-
-class DepthCameraPlugin:
-    """Bridge only the newest Orbbec Z16 frame to Agent Core."""
-    def __init__(self, plugin_config, namespace, ros2):
-        self._running = False; self._topic = f"/{namespace}/camera/head/depth"
-        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 8)), 15.0))
-        self._last_published_at = 0.0
-        self._forwarded_frames = 0
-        self._latest_image = None
-        self._latest_image_lock = threading.Lock()
-        self._subscription = None
-        self._publish_timer = None
-        self._sub_node = Node("tianyi2_depth_sub", context=ros2.ctx_tianyi)
-        self._pub_node = Node("tianyi2_depth_pub", context=ros2.ctx_core)
-        ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
-    def get_tool(self):
-        return {"name": "camera_depth", "type": "sensor", "description": "天轶2.0 Orbbec 头部深度图（zlib 压缩 16UC1）",
-                "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-zlib"}]}
-    def start(self):
-        from sensor_msgs.msg import Image
-        import cv2
-        import numpy as np
-        self._cv2, self._np = cv2, np
-        latest_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
-                                history=HistoryPolicy.KEEP_LAST, depth=1,
-                                durability=DurabilityPolicy.VOLATILE)
-        ingress_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
-                                 history=HistoryPolicy.KEEP_LAST, depth=1,
-                                 durability=DurabilityPolicy.VOLATILE)
-        self._running = True
-        from sensor_msgs.msg import CompressedImage as _CI
-        self._pub = self._pub_node.create_publisher(_CI, self._topic, latest_qos)
-        self._subscription = self._sub_node.create_subscription(
-            Image, "/ob_camera_head/depth/image_raw", self._on_image, ingress_qos)
-        self._publish_timer = self._pub_node.create_timer(1.0 / 30.0, self._publish_latest)
-        print(f"[DepthCameraPlugin] forwarding newest Z16 frame at <= {self._max_hz:g} Hz")
-    def stop(self):
-        self._running = False
-        with self._latest_image_lock:
-            self._latest_image = None
-    def _on_image(self, msg):
-        if not self._running or msg.encoding not in ("16UC1", "mono16"): return
-        with self._latest_image_lock:
-            self._latest_image = msg
-
-    def _publish_latest(self):
-        if not self._running:
-            return
-        with self._latest_image_lock:
-            if time.monotonic() - self._last_published_at < 1.0 / self._max_hz:
-                return
-            msg, self._latest_image = self._latest_image, None
-        if msg is None:
-            return
-        dashboard = self._to_dashboard_depth(msg)
-        if dashboard is None:
-            return
-        # zlib 压缩，不发原始 z16：640x480 的原始帧是 ~614 KB，DDS 序列化在 ARM64 上会打满 CPU，压缩后 ~10-15 KB。转换与 agibot/A3 的 _to_zlib 同形。
-        import zlib as _zlib
-        from sensor_msgs.msg import CompressedImage
-        out = CompressedImage()
-        out.header = msg.header
-        out.format = "16UC1; compressedDepth zlib"
-        # `_to_dashboard_depth` has already produced exactly 640x480 uint16 mm,
-        # which is what the format fixes; it also rejects big-endian input, so
-        # nothing here relied on z16's is_bigendian field.
-        out.data = _zlib.compress(dashboard.astype("<u2", copy=False).tobytes(), 1)
-        self._pub.publish(out)
-        self._last_published_at = time.monotonic()
-        self._forwarded_frames += 1
-
-    def _to_dashboard_depth(self, msg):
-        if msg.encoding not in ("16UC1", "mono16") or msg.is_bigendian:
-            return None
-        width, height, step = int(msg.width), int(msg.height), int(msg.step)
-        if width <= 0 or height <= 0 or step < width * 2:
-            return None
-        raw = self._np.frombuffer(msg.data, dtype=self._np.uint8)
-        needed = height * step
-        if raw.size < needed:
-            return None
-        depth = raw[:needed].reshape(height, step)[:, :width * 2].view(self._np.uint16).reshape(height, width)
-        if width == 640 and height == 480:
-            return depth
-        if width * 3 > height * 4:
-            crop_width = height * 4 // 3
-            left = (width - crop_width) // 2
-            depth = depth[:, left:left + crop_width]
-        elif width * 3 < height * 4:
-            crop_height = width * 3 // 4
-            top = (height - crop_height) // 2
-            depth = depth[top:top + crop_height, :]
-        return self._cv2.resize(depth, (640, 480), interpolation=self._cv2.INTER_NEAREST)
-    def dispatch(self, action, args):
-        return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-zlib"}]}
 
 
 class PointCloudPlugin:

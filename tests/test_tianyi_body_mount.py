@@ -80,7 +80,7 @@ def emit(source, stamp=STAMP):
     depth = NS(header=deepcopy(header), encoding='16UC1', is_bigendian=False, width=640, height=480, step=1280,
                data=np.ones((480, 640), '<u2').tobytes())
     source.stop_event.clear()
-    source.pending.put((color, depth))
+    source.pending.put((color, depth, dict(source.client_epochs)) if source.managed else (color, depth))
     source._work()
 
 
