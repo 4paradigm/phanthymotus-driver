@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """RealMan RM75-6F-V entry point using the shared Driver runtime."""
 
+# Deploy Approval V153 fresh-lifecycle acceptance; no runtime behavior change.
+
 from common.vendor_runtime import run_driver
 from device import build_plugins
 
