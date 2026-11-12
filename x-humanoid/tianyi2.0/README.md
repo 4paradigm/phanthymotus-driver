@@ -126,7 +126,7 @@ result, and protocol-level `isError: true`.
 | Tool type | `actuator` |
 | Robot-side output | `/arm/cmd_pos` |
 | Message type | `bodyctrl_msgs/msg/CmdSetMotorPosition` |
-| Actions | `salute`, `welcome`, `raise`, `shake_hands`, `high_five`, `reset`, `stop` |
+| Actions | `salute`, `welcome`, `raise`, `shake_hands`, `high_five`, `clap`, `reset`, `cancel` |
 
 The right-arm poses are mirrored from the left-arm definitions and remain
 inside the checked-in URDF limits. The preset poses still require low-speed,
@@ -206,3 +206,35 @@ light indicates Ready before running arm actions.
 | `high_five` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
 | `reset` | right arm, speed 0.5rad/s | side left/right/both, speed 0.2–1.5rad/s |
 | `stop` | no parameters | no parameters |
+
+### Clap calibration
+
+`arm_gesture(action="clap")` executes both arms for exactly three close/open
+cycles, then returns via the preparation pose to neutral. It runs at 0.3 rad/s,
+requires both arms initially at neutral, and waits for fresh feedback at every
+frame. Cancellation prevents later frames but does not stop an already issued
+motor command. Do not run another arm controller concurrently.
+
+The action is disabled until a qualified operator verifies the entire trajectory
+and enables robot-specific calibration in `config.yaml`. The repository URDF
+does not define palm/finger collision geometry, so it cannot prove clearance.
+Measure the actual robot and hand shape; account for tracking error, stopping
+distance and all swept paths, including neutral-to-prepare and return. Verify
+slowly in a clear area with an emergency stop available. `prepare`, `open`, and
+`close` are seven left-arm joint angles in degrees (pitch, roll, yaw, elbow
+pitch, wrist yaw, pitch, roll); the right arm is mirrored. The closest pose
+must leave a verified gap even with uncertainty. For example the structure is:
+
+```yaml
+arm_gesture:
+  enabled: true
+  clap:
+    calibrated: false # set true only after verification on this robot
+    prepare: [0, 0, 0, 0, 0, 0, 0] # replace with verified values
+    open: [0, 0, 0, 0, 0, 0, 0]    # replace with verified values
+    close: [0, 0, 0, 0, 0, 0, 0]   # replace with verified values
+```
+
+The placeholder values are not a valid trajectory and must not be used. The
+card does not command finger positions; calibration must match the actual hand
+shape. `calibrated` defaults to false when omitted.
