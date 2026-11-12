@@ -73,7 +73,9 @@ def test_one_repeatable_tool_has_two_ordered_outputs_and_only_instance_fields(pl
     props = tool['configSchema']['properties']
     assert set(props) == {'side', 'device_id', 'fps', 'resolution'}
     assert all(v['scope'] == 'instance' for v in props.values())
-    assert {v['const'] for v in props['device_id']['oneOf']} == {'auto', 'realsense:abc', 'realsense:def'}
+    assert {v['const'] for v in props['device_id']['oneOf']} == {'realsense:abc', 'realsense:def'}
+    assert 'device_id' in tool['configSchema']['required']
+    assert 'default' not in props['device_id']
 
 
 def test_info_derives_both_topics_before_config_without_starting_a_camera(plugin):
@@ -150,13 +152,20 @@ def test_swap_devices_while_stopped_preserves_instance_topics(plugin):
     assert configure(plugin, 'card-b', 'right')['topic_out'] == second['topic_out']
 
 
-def test_auto_refuses_ambiguous_cameras_and_pins_single_device(plugin, monkeypatch):
-    result = configure(plugin, target='auto')
-    assert result['state'] == 'error' and 'multiple' in result['error'].lower()
+@pytest.mark.parametrize('target', ['auto', None, ''])
+def test_device_must_be_selected_even_with_only_one_camera(plugin, monkeypatch, target):
     monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [device()], 'errors': []})
     plugin._refresh()
-    result = plugin.dispatch('start', {'instance_id': 'card-a'})
-    assert result['device_id'] == 'realsense:abc'
+    args = {'instance_id': 'card-a', 'side': 'left'}
+    if target is not None:
+        args['device_id'] = target
+    result = plugin.dispatch('config', args)
+    assert result['state'] == 'error' and 'select' in result['error'].lower()
+    assert not Session.created
+
+
+def test_explicit_device_binding_never_switches_to_another_camera(plugin, monkeypatch):
+    configure(plugin)
     monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [device('realsense:def')], 'errors': []})
     plugin._refresh()
     result = plugin.dispatch('info', {'instance_id': 'card-a'})
@@ -242,6 +251,8 @@ def test_saving_restored_disabled_config_starts_preview_without_start(plugin):
 
 @pytest.mark.parametrize('args', [{}, {'instance_id': '../bad', 'side': 'left'},
                                   {'instance_id': 'a', 'side': 'up'},
+                                  {'instance_id': 'a', 'side': 'left'},
+                                  {'instance_id': 'a', 'side': 'left', 'device_id': ''},
                                   {'instance_id': 'a', 'side': 'left', 'rotation': 180}])
 def test_invalid_config_never_opens_device(plugin, args):
     assert plugin.dispatch('config', args)['state'] == 'error'
@@ -265,15 +276,26 @@ def test_bundle_registers_one_card_and_boot_does_not_choose_devices(plugin, monk
     assert not Session.created
 
 
-def test_auto_config_replay_keeps_pinned_device_when_another_camera_appears(plugin, monkeypatch):
-    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [device()], 'errors': []})
-    plugin._refresh()
-    assert configure(plugin, target='auto')['device_id'] == 'realsense:abc'
-    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [device(), device('realsense:def')], 'errors': []})
-    plugin._refresh()
-    result = configure(plugin, target='auto')
-    assert result['state'] == 'running' and result['device_id'] == 'realsense:abc'
-    assert len(Session.created) == 1
+def test_legacy_auto_restore_preserves_resolved_devices_and_later_instances(plugin):
+    saved = {
+        'old-auto': {'side': 'left', 'device_id': 'auto', 'selection': 'auto',
+                     'fps': 'auto', 'resolution': 'auto', 'enabled': True},
+        'resolved': {'side': 'left', 'device_id': 'realsense:abc', 'selection': 'auto',
+                     'fps': 'auto', 'resolution': 'auto', 'enabled': True},
+        'explicit': {'side': 'right', 'device_id': 'realsense:def',
+                     'fps': 'auto', 'resolution': 'auto', 'enabled': True},
+    }
+    Path(plugin._state_file).write_text(json.dumps(saved))
+    restored = wrist.WristCameraPlugin({'state_file': plugin._state_file}, 'robot')
+    try:
+        restored._refresh()
+        assert restored.dispatch('info', {'instance_id': 'old-auto'})['state'] == 'unconfigured'
+        assert restored.dispatch('info', {'instance_id': 'resolved'})['state'] == 'running'
+        assert restored.dispatch('info', {'instance_id': 'explicit'})['state'] == 'running'
+        options = restored.get_tools()[0]['configSchema']['properties']['device_id']['oneOf']
+        assert {v['const'] for v in options} == {'realsense:abc', 'realsense:def'}
+    finally:
+        restored.stop()
 
 
 def test_failed_discovery_does_not_remove_a_healthy_capture(plugin, monkeypatch):

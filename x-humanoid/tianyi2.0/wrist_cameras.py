@@ -376,6 +376,10 @@ class WristCameraPlugin:
         try:
             saved = json.loads(Path(self._state_file).read_text())
             for key, value in saved.items():
+                if value.get('device_id') == 'auto':
+                    log.warning('Wrist camera %s needs an explicit camera device selection', key)
+                    continue
+                value = {k: v for k, v in value.items() if k != 'selection'}
                 self._validate(key, value)
                 self._configs[key] = {**value, 'enabled': bool(value.get('enabled', False))}
         except FileNotFoundError:
@@ -394,9 +398,9 @@ class WristCameraPlugin:
             raise ValueError('fps must be auto, 15 or 30')
         if not re.fullmatch(r'auto|[1-9]\d*x[1-9]\d*', str(values.get('resolution', 'auto'))):
             raise ValueError('resolution must be auto or a native WIDTHxHEIGHT')
-        if not isinstance(values.get('device_id', 'auto'), str) or not values.get('device_id', 'auto'):
+        if not isinstance(values.get('device_id'), str) or values['device_id'] in ('', 'auto'):
             raise ValueError('Select a camera device')
-        if set(values) - {'side', 'device_id', 'fps', 'resolution', 'enabled', 'selection'}:
+        if set(values) - {'side', 'device_id', 'fps', 'resolution', 'enabled'}:
             raise ValueError('Unknown wrist camera configuration field')
 
     def _save(self):
@@ -411,8 +415,7 @@ class WristCameraPlugin:
 
     def get_tools(self):
         with self._lock:
-            options = [{'const': 'auto', 'title': 'Auto (only when one camera is available)'}]
-            options += [{'const': d['id'], 'title': f"{d['name']} · {d['id']} · " +
+            options = [{'const': d['id'], 'title': f"{d['name']} · {d['id']} · " +
                          ('RGB + Depth' if d['capabilities']['depth'] else 'RGB only')}
                         for d in self._devices]
             present = {v['const'] for v in options}
@@ -442,9 +445,10 @@ class WristCameraPlugin:
                 'description': 'Wrist camera: select a USB device and left/right wrist. RGB and native depth; RGB-only cameras have no depth.',
                 'inputSchema': {'type': 'object', 'properties': {
                     'action': {'type': 'string', 'enum': ['start', 'stop', 'info']}}, 'required': ['action']},
-                'configSchema': {'type': 'object', 'required': ['side'], 'properties': {
+                'configSchema': {'type': 'object', 'required': ['side', 'device_id'], 'properties': {
                     'side': {'type': 'string', 'title': 'Wrist side', 'enum': ['left', 'right'], 'scope': 'instance'},
-                    'device_id': {'type': 'string', 'title': 'Camera device', 'oneOf': options, 'scope': 'instance', 'default': 'auto'},
+                    'device_id': {'type': 'string', 'title': 'Camera device', 'scope': 'instance',
+                                  'oneOf': options or [{'const': '', 'title': 'No cameras available'}]},
                     'fps': {'type': 'string', 'title': 'Native frame rate', 'enum': ['auto', '15', '30'], 'default': 'auto', 'scope': 'instance'},
                     'resolution': {'type': 'string', 'title': 'RGB resolution', 'oneOf': resolution_options,
                                    'default': 'auto', 'scope': 'instance',
@@ -520,12 +524,6 @@ class WristCameraPlugin:
     def _activate(self, instance_id):
         cfg = self._configs[instance_id]
         device_id = cfg['device_id']
-        if device_id == 'auto':
-            available = [d for d in self._devices if d['capabilities']['rgb']]
-            if len(available) != 1:
-                raise ValueError('Multiple cameras available; select a device' if available else 'No camera available')
-            device_id = cfg['device_id'] = available[0]['id']
-            self._save()
         device = next((d for d in self._devices if d['id'] == device_id), None)
         if device is None:
             raise ValueError(f'Selected camera disconnected or unsupported: {device_id}')
@@ -584,12 +582,7 @@ class WristCameraPlugin:
                     values = {k: v for k, v in args.items() if k not in ('instance_id', 'action', '_tool_name')}
                     self._validate(instance_id, values)
                     old = self._configs.get(instance_id, {})
-                    selection = values.get('device_id', 'auto')
-                    # Core replays the saved 'auto' before every start. Keep
-                    # its resolved identity even when a second camera appears.
-                    device_id = (old.get('device_id', 'auto')
-                                 if selection == 'auto' and old.get('selection') == 'auto' else selection)
-                    cfg = {'side': values['side'], 'device_id': device_id, 'selection': selection,
+                    cfg = {'side': values['side'], 'device_id': values['device_id'],
                            'fps': str(values.get('fps', 'auto')), 'resolution': values.get('resolution', 'auto'),
                            'enabled': True}
                     # Detach only when physical device/settings change. A side

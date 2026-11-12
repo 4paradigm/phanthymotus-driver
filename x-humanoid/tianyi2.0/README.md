@@ -47,7 +47,7 @@ An unconfigured newly dropped card must be bound before it can supply data:
 | Setting | Values | Meaning |
 | --- | --- | --- |
 | `side` | `left`, `right` | Physical wrist label; required, never inferred |
-| `device_id` | detected device or `auto` | Stable physical device identity |
+| `device_id` | selected device | Stable physical device identity; required |
 | `fps` | `auto`, `15`, `30` | A supported native frame rate |
 | `resolution` | `auto` or a discovered size | Native RGB resolution; depth stays 640x480 |
 
@@ -56,9 +56,10 @@ installed on the opposite wrists, change the device selection or side labels.
 No image rotation, flip, mirror, resizing, or depth-to-colour alignment is
 performed. The card does not establish a wrist extrinsic calibration.
 
-`auto` binds only when exactly one RGB-capable device is available. The resolved
-identity is saved; subsequent configuration replays and hotplug events never
-switch it to another camera. With multiple devices, select the intended camera.
+Select the intended camera explicitly, even when only one device is connected.
+Device selection has no `auto` mode. Saved physical identities are preserved;
+unresolved legacy `auto` configurations require selecting a camera again.
+Configuration replays and hotplug events never switch to another camera.
 RealSense identities use the SDK serial (without assuming a serial length or a
 D405 model name). UVC uses `/dev/v4l/by-id` when available, otherwise its USB bus
 path: cameras without unique serials should be rechecked if moved to another
