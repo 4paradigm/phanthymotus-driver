@@ -23,10 +23,13 @@ DDS_PROFILE = '/opt/phanthy-motus/dds-local.xml'
 log = logging.getLogger(__name__)
 
 
-def camera_topic(namespace, instance_id, channel):
+def camera_topic(namespace, instance_id, channel, side=None):
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,127}', instance_id) or channel not in CHANNELS:
         raise ValueError('Invalid camera instance_id or channel')
-    return f"/{namespace.strip('/')}/wrist_camera/{instance_id.replace('-', '_')}/{channel}"
+    if side not in (None, 'left', 'right'):
+        raise ValueError('Invalid wrist side')
+    suffix = f'{side}_{channel}' if side else channel
+    return f"/{namespace.strip('/')}/wrist_camera/{instance_id.replace('-', '_')}/{suffix}"
 
 
 def encode_depth_mm(depth, scale_m):
@@ -180,17 +183,17 @@ def _capture_worker(namespace, device, profiles, quality, routes, control, stop_
                     if stop_event.is_set():
                         break
                     for instance_id, side in routes.items():
-                        key = (instance_id, channel)
+                        key = (instance_id, side, channel)
                         if key not in pubs:
                             pubs[key] = node.create_publisher(CompressedImage,
-                                camera_topic(namespace, instance_id, channel), qos_profile_sensor_data)
+                                camera_topic(namespace, instance_id, channel, side), qos_profile_sensor_data)
                         msg = CompressedImage()
                         msg.header.stamp = node.get_clock().now().to_msg()
                         msg.header.frame_id = f"{namespace}_wrist_{instance_id.replace('-', '_')}_{side}_{channel}_optical_frame"
                         msg.format, msg.data = fmt, payload
                         pubs[key].publish(msg)
                     for key in list(pubs):
-                        if key[0] not in routes:
+                        if routes.get(key[0]) != key[1]:
                             node.destroy_publisher(pubs.pop(key))
                 status['last_frame'][channel] = time.monotonic()
                 status['frames'][channel] = status['frames'].get(channel, 0) + 1
@@ -346,7 +349,7 @@ class WristCameraSession:
                     'last_frame_age_s': None if last is None else max(0., now - last),
                     'sdk_timestamp_ms': self._status.get('sdk_timestamp_ms', {}).get(channel)}
                 intr = self._status.get('intrinsics', {}).get(channel)
-                calibration.append(build(topic=camera_topic(self.namespace, instance_id, channel),
+                calibration.append(build(topic=camera_topic(self.namespace, instance_id, channel, side),
                     id=f"{self.device['backend']}/{self.device['name']}/{channel}", format=FORMATS[channel],
                     width=p['width'], height=p['height'], K=intr['K'] if intr else None,
                     D=intr['D'] if intr else None, distortion_model='unknown',
@@ -417,6 +420,24 @@ class WristCameraPlugin:
                 if cfg['device_id'] not in present:
                     options.append({'const': cfg['device_id'], 'title': f"Disconnected: {cfg['device_id']}"})
                     present.add(cfg['device_id'])
+            resolutions = {}
+            for device in self._devices:
+                sizes = {(p['width'], p['height']) for p in device['profiles'].get('rgb', [])}
+                for width, height in sorted(sizes):
+                    value = f'{width}x{height}'
+                    try:
+                        select_profiles(device, resolution=value)
+                    except ValueError:
+                        continue  # No compatible native depth profile/frame rate.
+                    resolutions.setdefault(value, set()).add(device['name'])
+            resolution_options = [{'const': 'auto', 'title': 'Auto (native RGB resolution)'}]
+            resolution_options += [{'const': value, 'title': value + ' · ' + ' / '.join(sorted(names))}
+                                   for value, names in resolutions.items()]
+            for cfg in self._configs.values():
+                value = cfg['resolution']
+                if value != 'auto' and value not in resolutions:
+                    resolution_options.append({'const': value, 'title': f'{value} (currently unavailable)'})
+                    resolutions[value] = set()
             return [{'name': self.PREFIX, 'type': 'sensor', 'multiInstance': True,
                 'description': 'Wrist camera: select a USB device and left/right wrist. RGB and native depth; RGB-only cameras have no depth.',
                 'inputSchema': {'type': 'object', 'properties': {
@@ -425,8 +446,9 @@ class WristCameraPlugin:
                     'side': {'type': 'string', 'title': 'Wrist side', 'enum': ['left', 'right'], 'scope': 'instance'},
                     'device_id': {'type': 'string', 'title': 'Camera device', 'oneOf': options, 'scope': 'instance', 'default': 'auto'},
                     'fps': {'type': 'string', 'title': 'Native frame rate', 'enum': ['auto', '15', '30'], 'default': 'auto', 'scope': 'instance'},
-                    'resolution': {'type': 'string', 'title': 'Native resolution', 'default': 'auto', 'scope': 'instance',
-                                   'description': 'auto or WIDTHxHEIGHT; native depth requires 640x480'}}},
+                    'resolution': {'type': 'string', 'title': 'RGB resolution', 'oneOf': resolution_options,
+                                   'default': 'auto', 'scope': 'instance',
+                                   'description': 'Native RGB sizes across detected cameras; selected device/FPS is validated on save. Depth stays 640x480.'}}},
                 'topic_in': [], 'topic_out': [{'format': FORMATS[c], 'desc': c.upper()} for c in CHANNELS]}]
 
     def start(self):
@@ -532,7 +554,7 @@ class WristCameraPlugin:
                 result.update(state='error', error=self._errors.get(instance_id, 'Waiting for selected camera'))
         result.update(instance_id=instance_id, available_devices=self._devices,
                       discovery_errors=self._discovery_errors, topic_in=[],
-                      topic_out=[{'topic': camera_topic(self._namespace, instance_id, c),
+                      topic_out=[{'topic': camera_topic(self._namespace, instance_id, c, cfg['side'] if cfg else None),
                                   'format': FORMATS[c], 'desc': c.upper()} for c in CHANNELS] if instance_id else [])
         return result
 

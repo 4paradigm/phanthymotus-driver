@@ -118,3 +118,9 @@ def test_uvc_identity_and_interface_survive_video_node_renumbering(monkeypatch, 
     after, = m.uvc_devices([str(nodes[2]), str(nodes[0])], str(linkdir))
     assert before['id'] == after['id'] == 'uvc:usb-camera'
     assert before['path'] == after['path'] == str(first)
+
+
+def test_rgb_resolution_can_change_while_native_depth_remains_640_by_480():
+    d = {'profiles': {'rgb': [profile(), profile(1280, 720)], 'depth': [profile(format='z16')]}}
+    selected = module().select_profiles(d, 'auto', '1280x720')
+    assert selected == {'rgb': profile(1280, 720), 'depth': profile(format='z16')}

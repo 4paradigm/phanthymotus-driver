@@ -60,7 +60,7 @@ def capture(monkeypatch, tmp_path):
             return NS(get_device=lambda: dev)
         def wait_for_frames(self, timeout_ms):
             self.calls += 1
-            if self.calls > 1:
+            if self.calls > hooks.get('frame_count', 1):
                 stop.set()
                 return NS(get_color_frame=lambda: None, get_depth_frame=lambda: None)
             if 'wait' in hooks: hooks['wait']()
@@ -105,10 +105,10 @@ def capture(monkeypatch, tmp_path):
 
 def test_rgbd_worker_fans_out_real_depth_units_without_model_check(capture):
     capture.run()
-    assert [t for t, m in capture.published] == ['/robot/wrist_camera/card_a/rgb', '/robot/wrist_camera/card_b/rgb',
-                                               '/robot/wrist_camera/card_a/depth', '/robot/wrist_camera/card_b/depth']
+    assert [t for t, m in capture.published] == ['/robot/wrist_camera/card_a/left_rgb', '/robot/wrist_camera/card_b/right_rgb',
+                                               '/robot/wrist_camera/card_a/left_depth', '/robot/wrist_camera/card_b/right_depth']
     for topic, msg in capture.published:
-        if topic.endswith('/depth'):
+        if topic.endswith('_depth'):
             raw = np.frombuffer(zlib.decompress(msg.data), '<u2')
             assert len(raw) == 640 * 480 and set(raw) == {100}
     status = capture.statuses.get_nowait()
@@ -123,13 +123,13 @@ def test_route_change_during_capture_prevents_removed_instance_publication(captu
     else:
         capture.hooks[phase] = lambda: capture.update({'card-b': 'right'})
     capture.run()
-    assert [t for t, m in capture.published] == ['/robot/wrist_camera/card_b/rgb', '/robot/wrist_camera/card_b/depth']
+    assert [t for t, m in capture.published] == ['/robot/wrist_camera/card_b/right_rgb', '/robot/wrist_camera/card_b/right_depth']
 
 
 def test_route_ack_waits_for_inflight_publish(capture):
     entered, release, done = threading.Event(), threading.Event(), threading.Event()
     def publish(topic):
-        if topic.endswith('card_a/rgb'):
+        if topic.endswith('card_a/left_rgb'):
             entered.set()
             assert release.wait(3)
     capture.hooks['publish'] = publish
@@ -165,7 +165,7 @@ def test_uvc_worker_publishes_jpeg_only_and_releases_device(capture, monkeypatch
     monkeypatch.setattr(cv2, 'VideoCapture', lambda *a: Camera())
     capture.run(depth=False)
     assert len(capture.published) == 2
-    assert all(t.endswith('/rgb') for t, m in capture.published)
+    assert all(t.endswith('_rgb') for t, m in capture.published)
     assert released == [True]
 
 
@@ -260,3 +260,27 @@ def test_health_recovers_a_stalled_pipeline_without_interrupting_a_fresh_sibling
     s._status = {'last_frame': last_frames}
     monkeypatch.setattr(wrist.time, 'monotonic', lambda: 112.)
     assert s.healthy() is expected
+
+
+
+def test_side_relabel_replaces_existing_publishers_between_frames(capture):
+    capture.hooks['frame_count'] = 2
+    calls = []
+    def wait():
+        calls.append(True)
+        if len(calls) == 2:
+            capture.update({'card-a': 'right', 'card-b': 'right'})
+    capture.hooks['wait'] = wait
+    capture.run()
+    topics = [topic for topic, msg in capture.published]
+    assert topics[:4] == ['/robot/wrist_camera/card_a/left_rgb', '/robot/wrist_camera/card_b/right_rgb',
+                          '/robot/wrist_camera/card_a/left_depth', '/robot/wrist_camera/card_b/right_depth']
+    assert topics[4:] == ['/robot/wrist_camera/card_a/right_rgb', '/robot/wrist_camera/card_b/right_rgb',
+                          '/robot/wrist_camera/card_a/right_depth', '/robot/wrist_camera/card_b/right_depth']
+
+
+def test_camera_calibration_uses_the_same_side_specific_output_topics():
+    s = wrist.WristCameraSession('robot', descriptor(), profiles())
+    info = s.info('card-a', 'left')
+    assert [v['topic'] for v in info['camera_info']] == [
+        '/robot/wrist_camera/card_a/left_rgb', '/robot/wrist_camera/card_a/left_depth']

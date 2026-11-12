@@ -24,26 +24,32 @@ Add `wrist_camera` to the canvas once per desired view. Each instance exposes
 
 | Port | Output topic | Format |
 | --- | --- | --- |
-| RGB | `/<namespace>/wrist_camera/<instance_id>/rgb` | `image/jpeg` |
-| Depth | `/<namespace>/wrist_camera/<instance_id>/depth` | `image/depth-zlib` |
+| RGB | `/<namespace>/wrist_camera/<instance_id>/<side>_rgb` | `image/jpeg` |
+| Depth | `/<namespace>/wrist_camera/<instance_id>/<side>_depth` | `image/depth-zlib` |
 
 Hyphens in a canvas instance ID become underscores in ROS topic names.
-Conflicting normalized instance IDs are rejected. Topics belong to the card,
-so changing its device or left/right label does not invalidate its connections.
+Conflicting normalized instance IDs are rejected. The final topic segment is
+`left_rgb`, `left_depth`, `right_rgb` or `right_depth`, so existing Core monitor
+panels distinguish wrist sides without frontend changes. Changing the device
+keeps the topic; changing the wrist side changes its suffix. After first binding,
+changing side, or upgrading from the previous `/rgb` and `/depth` suffixes, refresh
+the canvas/monitor to resolve the current instance topics and connections.
 The four former `camera_wrist_{left,right}_{rgb,depth}` cards are replaced by
 this tool. Existing canvases using those names must replace the old cards,
 select their devices, and reconnect RGB/depth to the corresponding ports.
 
 ### Select a device and wrist side
 
-Use the card's instance settings (the same mechanism as `ext_mic`):
+Use the card's instance settings (the same mechanism as `ext_mic`). This
+change does not relocate settings to the resource sidebar or modify Agent Core.
+An unconfigured newly dropped card must be bound before it can supply data:
 
 | Setting | Values | Meaning |
 | --- | --- | --- |
 | `side` | `left`, `right` | Physical wrist label; required, never inferred |
 | `device_id` | detected device or `auto` | Stable physical device identity |
 | `fps` | `auto`, `15`, `30` | A supported native frame rate |
-| `resolution` | `auto` or `WIDTHxHEIGHT` | A supported native resolution |
+| `resolution` | `auto` or a discovered size | Native RGB resolution; depth stays 640x480 |
 
 Confirm physical placement from a label, cable, or preview. If cameras are
 installed on the opposite wrists, change the device selection or side labels.
@@ -81,9 +87,18 @@ The container must see the camera's USB devices; the existing privileged
 `/dev:/dev` mount supplies this. Cameras attached to another compute board need
 capture/transport on that board and are not discovered by local enumeration.
 
+The RGB resolution dropdown is built from the discovered native profiles, with
+device names in the labels. It lists the union of usable sizes across devices;
+existing Core does not dynamically filter it when the device field changes.
+Reopen settings after the tool definition refreshes to see hotplug changes.
+The driver validates the chosen device and frame rate when applying settings,
+and retains saved offline sizes labelled as currently unavailable. Sizes that
+cannot pair with native 640x480 depth at any common frame rate are excluded.
+
 `auto` prefers 15 FPS and native 640x480 where supported, then selects a common
-native frame rate and available RGB profile. Explicit unsupported requests fail
-with a clear error. **Native depth must be 640x480**, because the current Core
+native frame rate and available RGB profile. Explicit RGB size selection does
+not resize or change native depth: RGB may be 1280x720 while depth stays 640x480.
+Unsupported requests fail with a clear error. **Native depth must be 640x480**, because the current Core
 `image/depth-zlib` decoder assumes that size. Other native depth sizes are
 reported as unsupported, not resized. Depth is the SDK Z16 data converted using
 its actual depth scale to little-endian uint16 **millimetres**, then zlib

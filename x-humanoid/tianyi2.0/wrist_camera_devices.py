@@ -20,9 +20,8 @@ def select_profiles(device, fps='auto', resolution='auto'):
         if not choices['depth']:
             raise ValueError('Depth requires a native 640x480 stream')
     if resolution != 'auto':
-        for channel in choices:
-            choices[channel] = [p for p in choices[channel]
-                                if f"{p['width']}x{p['height']}" == resolution]
+        choices['rgb'] = [p for p in choices['rgb']
+                          if f"{p['width']}x{p['height']}" == resolution]
     if any(not values for values in choices.values()):
         raise ValueError(f'Unsupported native resolution: {resolution}')
     rates = set.intersection(*({p['fps'] for p in values} for values in choices.values()))

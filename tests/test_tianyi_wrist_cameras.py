@@ -118,12 +118,13 @@ def test_config_replay_does_not_reopen_capture_or_rearm_stopped_card(plugin):
     assert len(Session.created) == 2
 
 
-def test_side_change_preserves_topics_and_shared_capture(plugin):
+def test_side_change_relabels_topics_without_restarting_shared_capture(plugin):
     before = configure(plugin)
     configure(plugin, 'card-b', 'right')
     after = configure(plugin, side='right')
     assert after['side'] == 'right'
-    assert before['topic_out'] == after['topic_out']
+    assert before['topic_out'] != after['topic_out']
+    assert [v['topic'].rsplit('/', 1)[-1] for v in after['topic_out']] == ['right_rgb', 'right_depth']
     assert len(Session.created) == 1
 
 
@@ -269,3 +270,45 @@ def test_discovery_timeout_still_recovers_failed_capture_using_pinned_descriptor
     assert Session.created[0].closed
     assert len(Session.created) == 2
     assert plugin.dispatch('info', {'instance_id': 'card-a'})['device_id'] == 'realsense:abc'
+
+
+def test_resolution_dropdown_lists_usable_native_rgb_sizes_and_device_labels(plugin, monkeypatch):
+    rgbd = device()
+    rgbd['profiles']['rgb'] += [
+        {'width': 1280, 'height': 720, 'fps': 15, 'format': 'rgb8'},
+        {'width': 1920, 'height': 1080, 'fps': 30, 'format': 'rgb8'},
+    ]
+    webcam = device('uvc:webcam', False)
+    webcam['profiles']['rgb'] = [{'width': 800, 'height': 600, 'fps': 30, 'format': 'MJPG'}]
+    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [rgbd, webcam], 'errors': []})
+    plugin._refresh()
+    props = plugin.get_tools()[0]['configSchema']['properties']
+    options = {v['const']: v['title'] for v in props['resolution']['oneOf']}
+    assert set(options) == {'auto', '640x480', '1280x720', '800x600'}
+    assert 'USB RGB-D' in options['1280x720']
+    assert 'USB Webcam' in options['800x600']
+    assert props['resolution']['scope'] == 'instance'
+
+
+def test_resolution_dropdown_retains_saved_offline_value(plugin, monkeypatch):
+    webcam = device('uvc:webcam', False)
+    webcam['profiles']['rgb'] = [{'width': 800, 'height': 600, 'fps': 15, 'format': 'MJPG'}]
+    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [webcam], 'errors': []})
+    plugin._refresh()
+    configure(plugin, target='uvc:webcam', resolution='800x600')
+    monkeypatch.setattr(wrist, 'discover_devices', lambda: {'devices': [], 'errors': []})
+    plugin._refresh()
+    options = plugin.get_tools()[0]['configSchema']['properties']['resolution']['oneOf']
+    assert {v['const'] for v in options} == {'auto', '800x600'}
+    assert 'unavailable' in next(v['title'] for v in options if v['const'] == '800x600').lower()
+
+
+def test_configured_topics_have_distinct_monitor_short_names(plugin):
+    left = configure(plugin)
+    right = configure(plugin, 'card-b', 'right', 'realsense:def')
+    assert [v['topic'] for v in left['topic_out']] == [
+        '/robot/wrist_camera/card_a/left_rgb', '/robot/wrist_camera/card_a/left_depth']
+    assert [v['topic'] for v in right['topic_out']] == [
+        '/robot/wrist_camera/card_b/right_rgb', '/robot/wrist_camera/card_b/right_depth']
+    assert {v['topic'].rsplit('/', 1)[-1] for info in (left, right) for v in info['topic_out']} == {
+        'left_rgb', 'left_depth', 'right_rgb', 'right_depth'}
