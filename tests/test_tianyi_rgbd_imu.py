@@ -138,6 +138,34 @@ def test_tf_failure_recovers_without_restarting_rgbd(source):
     assert source.dispatch('info', {})['imu_status']['state'] == 'available'
 
 
+def test_missing_accel_capture_does_not_block_later_matching_pairs(source):
+    source._imu('accel', motion(NOW-50_000_000, 'accel_frame'))
+    source._imu('gyro', motion(NOW-25_000_000))
+    assert packets(source) == []
+    # The older accel remains nearest to the unmatched gyro even after a
+    # newer accel arrives; that hole must not pin the entire gyro queue.
+    source._imu('accel', motion(NOW+5_000_000, 'accel_frame'))
+    source._imu('gyro', motion(NOW+5_000_000))
+    assert [p['stamp_ns'] for p in packets(source)] == [NOW+5_000_000]
+    assert source.dispatch('info', {})['imu_status']['state'] == 'available'
+
+
+def test_waits_for_matching_accel_when_only_older_samples_exist(source):
+    source._imu('accel', motion(NOW-50_000_000, 'accel_frame'))
+    source._imu('gyro', motion(NOW-25_000_000))
+    assert packets(source) == []
+    source._imu('accel', motion(NOW-24_000_000, 'accel_frame'))
+    assert [p['stamp_ns'] for p in packets(source)] == [NOW-25_000_000]
+
+
+def test_matching_discards_accel_history_older_than_the_nearest_preceding_sample(source):
+    for offset in range(-400, 1):
+        source._imu('accel', motion(NOW+offset*1_000_000, 'accel_frame'))
+    source._imu('gyro', motion())
+    assert len(packets(source)) == 1
+    assert len(source.imu_samples['accel']) == 1
+
+
 @pytest.mark.parametrize('gyro_stamp,accel_stamp', [
     (NOW, NOW-20_000_001), (NOW-500_000_001, NOW-500_000_001),
     (NOW+50_000_001, NOW+50_000_001), (0, 0),

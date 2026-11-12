@@ -255,11 +255,13 @@ class RgbdCameraPlugin:
                 while gyro_samples and accel_samples:
                     gyro = gyro_samples[0]
                     gyro_stamp = _stamp(gyro)
+                    while len(accel_samples) > 1 and _stamp(accel_samples[1]) <= gyro_stamp:
+                        accel_samples.popleft()
                     accel = min(accel_samples, key=lambda sample: abs(_stamp(sample)-gyro_stamp))
                     accel_stamp = _stamp(accel)
                     if abs(gyro_stamp-accel_stamp) > 20_000_000:
                         self.imu_reason = 'camera gyro/accel capture skew exceeds 20ms'
-                        if accel_stamp > gyro_stamp:
+                        if _stamp(accel_samples[-1]) > gyro_stamp:
                             gyro_samples.popleft()
                             continue
                         break

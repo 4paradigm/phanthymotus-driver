@@ -255,6 +255,13 @@ mount or native orientation is assumed. Consumer attitude assistance remains
 off until its `imu_assisted` option is enabled. A source restart or capture
 interruption over 500 ms creates a new motion epoch.
 
+Tianyi hosts running Orbbec ROS 2.5.4 need the separate camera-service
+[capture-clock patch](patches/README.md) for independent gyro/accel timestamps
+to honor `time_domain=global`. A Motus driver image update alone does not fix
+that host service. Samples still pass the unchanged 500 ms freshness and
+20 ms pairing checks. Superseded accel history is pruned, and
+missing captures cannot pin subsequent valid gyro/accel pairs.
+
 The optional fourth `state/extrinsic` port publishes `motus.camera_mount/1`
 JSON on `camera/rgbd/body_mount`. Both RGB-D `camera_info.vendor.body_mount`
 entries declare this topic automatically, so the generic consumer needs no
@@ -298,5 +305,5 @@ depth geometry. Inertial/depth predictions are explicitly non-mapping; SLAM
 pauses during coasting/recovery. The hard visual correction timeout is1s
 and modeled position sigma limit0.10m; these are software/model thresholds,
 not measured robot accuracy. Source clock/mount identity must remain fixed.
-Only code/offline tests have been completed; hardware verification and
-deployment remain pending explicit user instruction.
+See the [2026-11-12 IMU validation](patches/validation-20261112.md) for
+on-device clock results and remaining pipeline continuity failures.
