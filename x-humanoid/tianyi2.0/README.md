@@ -112,6 +112,9 @@ atomically under `/opt/phanthy-motus/data/wrist-camera.json` (the mounted data
 directory), so an active preview can be restored after a driver restart.
 Saving or replaying the same configuration keeps healthy capture running and
 resumes a stopped preview without **Start Intelligent Control**.
+Global `info()` advertises enabled instances' topics for Core's periodic
+discovery and monitor registration. Allow the next driver heartbeat (up to
+30 seconds) after saving a new instance for monitoring to discover its streams.
 Removing a card or stopping its project sends `stop(instance_id)` and disables
 its preview. Driver shutdown closes all capture resources while retaining the
 saved requested state. Do not run two Tianyi driver services against one state

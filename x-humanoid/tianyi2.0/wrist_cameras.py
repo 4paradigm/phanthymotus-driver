@@ -560,6 +560,10 @@ class WristCameraPlugin:
                       discovery_errors=self._discovery_errors, topic_in=[],
                       topic_out=[{'topic': camera_topic(self._namespace, instance_id, c, cfg['side'] if cfg else None),
                                   'format': FORMATS[c], 'desc': c.upper()} for c in CHANNELS] if instance_id else [])
+        if not instance_id:
+            # Core heartbeats discover topics without a canvas instance_id.
+            result['topic_out'] = [port for key, saved in self._configs.items() if saved['enabled']
+                                   for port in self._info(key)['topic_out']]
         return result
 
     def dispatch(self, action, args):

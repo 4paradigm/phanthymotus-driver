@@ -83,6 +83,19 @@ def test_info_derives_both_topics_before_config_without_starting_a_camera(plugin
     assert not Session.created
 
 
+def test_global_info_advertises_enabled_instance_topics_for_discovery(plugin):
+    assert plugin.dispatch('info', {})['topic_out'] == []
+    configure(plugin)
+    configure(plugin, 'card-b', 'right', 'realsense:def')
+    assert [p['topic'] for p in plugin.dispatch('info', {})['topic_out']] == [
+        '/robot/wrist_camera/card_a/left_rgb', '/robot/wrist_camera/card_a/left_depth',
+        '/robot/wrist_camera/card_b/right_rgb', '/robot/wrist_camera/card_b/right_depth']
+    plugin.dispatch('stop', {'instance_id': 'card-a'})
+    assert [p['topic'] for p in plugin.dispatch('info', {})['topic_out']] == [
+        '/robot/wrist_camera/card_b/right_rgb', '/robot/wrist_camera/card_b/right_depth']
+    assert all('topic' not in p for p in plugin.get_tools()[0]['topic_out'])
+
+
 def test_two_devices_start_previews_on_config_and_stop_independently(plugin):
     assert configure(plugin)['state'] == 'running'
     configure(plugin, 'card-b', 'right', 'realsense:def')
