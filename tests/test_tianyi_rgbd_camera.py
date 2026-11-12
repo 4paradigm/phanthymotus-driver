@@ -96,3 +96,23 @@ def test_recovered_vendor_parameters_clear_obsolete_error(monkeypatch):
     source.future=NS(done=lambda:True,result=lambda:NS(values=[NS(bool_value=True),NS(string_value='global'),NS(bool_value=True)]))
     source._parameters()
     assert source.registered and source.error is None
+
+
+def test_frame_sampling_uses_capture_intervals_despite_callback_jitter(monkeypatch):
+    from collections import deque
+    import queue, threading
+    source = object.__new__(m.RgbdCameraPlugin)
+    source.lock = threading.RLock(); source.running = source.registered = True
+    source.infos = {'color': info(), 'depth': info()}
+    source.signature = source.geometry = None
+    source.frames = {'color': deque(maxlen=3), 'depth': deque(maxlen=3)}
+    source.pending = queue.Queue(maxsize=1); source.last_emit = 0.
+    source.stop_event = threading.Event(); source.error = None
+    monkeypatch.setattr(m.time, 'monotonic', lambda: 1000.)
+    sampled = []
+    for stamp in [1_000_000_000, 1_050_000_000, 1_100_000_000, 1_200_000_000]:
+        msg = NS(width=640, height=480, header=NS(frame_id='optical',
+                 stamp=NS(sec=stamp//10**9, nanosec=stamp%10**9)))
+        source._image('color', msg); source._image('depth', msg)
+        if not source.pending.empty(): sampled.append(m._stamp(source.pending.get_nowait()[1]))
+    assert sampled == [1_000_000_000, 1_100_000_000, 1_200_000_000]

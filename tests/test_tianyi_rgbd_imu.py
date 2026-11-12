@@ -4,6 +4,7 @@ import json
 import math
 from pathlib import Path
 import sys
+import threading
 from types import SimpleNamespace as NS
 
 import numpy as np
@@ -69,7 +70,21 @@ def source(monkeypatch, request):
     monkeypatch.setitem(sys.modules, 'std_msgs.msg', NS(String=lambda **kw: NS(**kw)))
     monkeypatch.setitem(sys.modules, 'rcl_interfaces.srv', NS(GetParameters=object))
     monkeypatch.setitem(sys.modules, 'tf2_ros', NS(Buffer=Buffer, TransformListener=lambda b, n: NS(buffer=b, node=n)))
-    ros = NS(ctx_tianyi=object(), ctx_core=object(), executor_tianyi=NS(add_node=lambda n: None),
+    callbacks = []; closed = [False]
+    context = NS(on_shutdown=callbacks.append, ok=lambda: not closed[0])
+    class Executor:
+        def __init__(self, context):
+            self.context = context; self.nodes = []; self.stopped = threading.Event(); self.error = None
+        def add_node(self, node): self.nodes.append(node)
+        def spin_once(self, timeout_sec):
+            self.stopped.wait(timeout_sec)
+            if self.error: raise RuntimeError(self.error)
+        def wake(self): self.stopped.set()
+        def shutdown(self, **kw): self.stopped.set()
+    monkeypatch.setitem(sys.modules, 'rclpy.executors', NS(SingleThreadedExecutor=Executor,
+        ExternalShutdownException=type('ExternalShutdownException', (Exception,), {}),
+        ShutdownException=type('ShutdownException', (Exception,), {})))
+    ros = NS(ctx_tianyi=context, ctx_core=object(), executor_tianyi=NS(add_node=lambda n: None),
              executor_core=NS(add_node=lambda n: None))
     plugin = m.RgbdCameraPlugin(getattr(request, 'param', {}), 'test', ros)
     plugin._work = lambda: None
@@ -79,6 +94,11 @@ def source(monkeypatch, request):
     plugin.count = 1
     yield plugin
     plugin.stop()
+    closed[0] = True
+    for callback in callbacks: callback()
+    if plugin._camera_executor is not None:
+        plugin._camera_spin.join(timeout=1)
+        assert not plugin._camera_spin.is_alive()
 
 
 def feed(source, gyro=None, accel=None):
@@ -118,6 +138,47 @@ def test_reuses_vendor_streams_and_existing_subnode_for_tf_without_new_camera_ow
     assert '/ob_camera_head/gyro/sample' in source.sub_node.subscriptions
     assert '/ob_camera_head/accel/sample' in source.sub_node.subscriptions
     assert source.imu_listener.node is source.sub_node
+
+
+def test_motion_callback_executor_persists_across_card_restart(source):
+    executor, worker = source._camera_executor, source._camera_spin
+    assert executor.nodes == [source.sub_node] and worker.is_alive()
+    source.stop()
+    assert worker.is_alive()  # stopped subscriptions continue discarding old data
+    source.start()
+    assert source._camera_spin is worker and worker.is_alive()
+
+
+def test_motion_callback_failure_marks_source_unavailable(source):
+    source._camera_executor.error = 'callback failed'
+    source._camera_executor.stopped.set()
+    source._camera_spin.join(timeout=1)
+    assert not source.running and source.stop_event.is_set()
+    assert 'callback failed' in source.error
+    with pytest.raises(RuntimeError, match='callback failed'):
+        source.start()
+    assert not source.running and 'callback failed' in source.error
+
+
+def test_callback_failure_blocks_restart_before_executor_cleanup(source):
+    lock, errors = source.lock, []
+    class Lock:
+        attempted = False
+        def __enter__(self): lock.acquire()
+        def __exit__(self, *args):
+            lock.release()
+            if source.error and not self.attempted:
+                self.attempted = True
+                try:
+                    source.start()
+                except RuntimeError as error:
+                    errors.append(str(error))
+    source.lock = Lock()
+    source._camera_executor.error = 'callback failed'
+    source._camera_executor.stopped.set()
+    source._camera_spin.join(timeout=1)
+    assert errors == ['camera callbacks: callback failed']
+    assert not source.running and source.stop_event.is_set()
 
 
 @pytest.mark.parametrize('frame', ['', 'unknown_body_frame'])
@@ -266,6 +327,12 @@ def test_source_capture_interruption_changes_epoch_on_resume(source):
     feed(source, motion(NOW+600_000_000), motion(NOW+600_000_000, 'accel_frame'))
     assert len(packets(source)) == 2
     assert packets(source)[1]['epoch'] != epoch
+
+
+def test_restart_resets_capture_sampling_epoch(source):
+    source.last_emit = NOW
+    source.stop(); source.start()
+    assert source.last_emit == 0
 
 
 def test_long_interruption_cannot_be_hidden_by_reusing_stale_acceleration(source):

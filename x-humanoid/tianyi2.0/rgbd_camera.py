@@ -5,6 +5,7 @@ Different intrinsics still require reprojection: sampling color along the depth
 rays also removes its distortion. The resulting two 640x480 images share K.
 """
 from collections import deque
+from array import array
 from copy import deepcopy
 import json
 import os
@@ -98,7 +99,6 @@ class RgbdCameraPlugin:
         self.clock = 'orbbec_head_global_ros_header'
         self.sub_node = Node('tianyi_rgbd_source', context=ros2.ctx_tianyi)
         self.pub_node = Node('tianyi_rgbd_output', context=ros2.ctx_core)
-        ros2.executor_tianyi.add_node(self.sub_node)
         ros2.executor_core.add_node(self.pub_node)
         self.lock = threading.RLock()
         self.running = self.registered = self.attached = False
@@ -108,7 +108,7 @@ class RgbdCameraPlugin:
         self.pending = queue.Queue(maxsize=1)
         self.worker = None
         self.stop_event = threading.Event()
-        self.last_emit = 0.
+        self.last_emit = 0
         self.count = 0
         self.error = None
         self.future = None
@@ -120,6 +120,41 @@ class RgbdCameraPlugin:
         self.imu_last_stamp = 0
         self.imu_translation_reason = 'waiting for camera motion TF translation'
         self.body_mount = None
+        self._camera_executor = None
+        if self.imu_enabled:
+            from rclpy.executors import SingleThreadedExecutor
+            self._camera_context = ros2.ctx_tianyi
+            self._camera_executor = SingleThreadedExecutor(context=self._camera_context)
+            self._camera_shutdown = threading.Event()
+            self._camera_executor.add_node(self.sub_node)
+            self._camera_spin = threading.Thread(target=self._spin_camera, name='tianyi_rgbd_ros', daemon=True)
+            self._camera_spin.start()
+            self._camera_context.on_shutdown(self._shutdown_camera)
+        else:
+            ros2.executor_tianyi.add_node(self.sub_node)
+
+    def _spin_camera(self):
+        from rclpy.executors import ExternalShutdownException, ShutdownException
+        try:
+            while not self._camera_shutdown.is_set():
+                self._camera_executor.spin_once(timeout_sec=.05)
+        except (ExternalShutdownException, ShutdownException):
+            pass
+        except Exception as error:
+            if not self._camera_shutdown.is_set():
+                with self.lock:
+                    self._camera_shutdown.set()
+                    self.error = 'camera callbacks: ' + str(error)
+                    self.running = False
+                    self.stop_event.set()
+        finally:
+            self._camera_shutdown.set()
+            self._camera_executor.shutdown(timeout_sec=5)
+
+    def _shutdown_camera(self):
+        # Context shutdown may hold its lock; let the spin thread clean up.
+        self._camera_shutdown.set()
+        self._camera_executor.wake()
 
     def get_tool(self):
         return {'name': 'camera_rgbd', 'type': 'sensor',
@@ -150,6 +185,8 @@ class RgbdCameraPlugin:
         from rclpy.qos import qos_profile_sensor_data
         from rcl_interfaces.srv import GetParameters
         with self.lock:
+            if self._camera_executor is not None and self._camera_shutdown.is_set():
+                raise RuntimeError(self.error or 'camera callback executor stopped; restart the driver')
             if self.running:
                 return
             if not self.attached:
@@ -167,6 +204,7 @@ class RgbdCameraPlugin:
             self.registered = False
             self.geometry = None
             self.signature = None
+            self.last_emit = 0
             self.future = None
             self.error = None
             self.imu_epoch = uuid.uuid4().hex
@@ -353,11 +391,11 @@ class RgbdCameraPlugin:
                     delta = _stamp(color[0]) - _stamp(depth[0])
                     if abs(delta) <= 20_000_000:
                         pair = color.popleft(), depth.popleft()
-                        if time.monotonic() - self.last_emit >= .1:
+                        if _stamp(pair[1]) - self.last_emit >= 100_000_000:
                             if self.pending.full():
                                 self.pending.get_nowait()
                             self.pending.put_nowait(pair)
-                            self.last_emit = time.monotonic()
+                            self.last_emit = _stamp(pair[1])
                         break
                     (color if delta < 0 else depth).popleft()
             except (ValueError, TypeError) as error:
@@ -391,9 +429,9 @@ class RgbdCameraPlugin:
                     raise ValueError('RGB-D color encoding failed')
                 out_color, out_depth = CompressedImage(), CompressedImage()
                 out_color.header, out_depth.header = deepcopy(color.header), deepcopy(depth.header)
-                out_color.format, out_color.data = 'jpeg', jpg.tobytes()
+                out_color.format, out_color.data = 'jpeg', array('B', jpg.tobytes())
                 out_depth.format = '16UC1; compressedDepth zlib'
-                out_depth.data = zlib.compress(metric.astype('<u2', copy=False).tobytes(), 1)
+                out_depth.data = array('B', zlib.compress(metric.astype('<u2', copy=False).tobytes(), 1))
                 with self.lock:
                     if not self.running or self.stop_event.is_set():
                         continue

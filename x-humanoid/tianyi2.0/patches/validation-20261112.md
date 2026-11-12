@@ -1,8 +1,9 @@
 # Tianyi IMU validation — 2026-11-12
 
-Status: the vendor capture-clock mismatch is fixed on the tested host. IMU
-packets and camera-internal TF calibration are available, but sustained
-end-to-end IMU-assisted tracking is **not yet accepted**.
+Status: the vendor capture-clock mismatch is fixed on the tested host. A
+600-second static F2F/ESKF run with depth assistance enabled maintained active
+IMU without terminal loss. Intermittent coasting/recovering remains; motion
+accuracy, geometric recovery and uninterrupted SLAM are **not yet accepted**.
 
 ## Evidence
 
@@ -35,7 +36,7 @@ The test camera profile is native 640×480 RGB/depth at 30 Hz and 100 Hz IMU;
 change. This reduces raw image/pointcloud resolution. Intrinsics are refreshed
 from CameraInfo rather than copied from the older 1280×720 profile.
 
-## End-to-end limits
+## Earlier end-to-end limits
 
 Tests used isolated PR519 source and PR371 consumer instances with the existing
 native RTAB-Map runtime. Business Driver/Perception containers were not
@@ -53,16 +54,80 @@ visual processing owns estimator state, retain processing-time freshness and
 overflow retirement, and refresh visual-correction timing during recovery.
 Their offline tests pass; they do not establish a hardware acceptance result.
 
-The dependent test processes were stopped and their data saved before the user
-replaces the Driver container. Camera-service overlay remains active. Continue
-static continuity checks against the replacement container before enabling the
-full ESKF/depth route for mapping.
+These dependent test processes were stopped and their data saved before the
+user replaced the Driver container. The camera-service overlay remains active.
+
+## Static retest after Driver replacement
+
+The business Driver was `release.261112.5f0b926`, without this PR's RGB-D
+plugin. PR519 source ran as a separate process in that container; PR371 ran
+in an isolated consumer container with the existing RTAB-Map runtime mounted.
+The business Driver/Perception images and original Driver entry point were
+not replaced. No robot or head motion was commanded.
+
+Two delay sources were isolated:
+
+- The older diagnostic saved a growing, indented history in the estimator's
+  Python process. A controlled 8.33 MB history write took 567–915 ms, pushing
+  IMU consumption age to 629 ms and retiring an otherwise working attitude
+  run after 66 seconds. Bounded telemetry ran for 180 seconds with active IMU.
+  The final test saves bounded summaries during measurement and full history
+  only after shutdown. One intermediate diagnostic GC-hook deadlock was also
+  discarded; it is not production or acceptance evidence.
+- Humble's generated compressed-image setter validates Python `bytes`
+  element by element. On-device construction/assignment of a 204,800-byte
+  payload took 33.56 ms median with `bytes`, versus 0.026 ms with
+  `array('B', ...)`, including array construction. The test verified equal
+  payload/metadata, serialized messages and deserialized payloads. Driver
+  JPEG/zlib and consumer depth PNG now use typed byte buffers. IMU-enabled
+  input/consumer nodes use owned single-threaded executors in their existing
+  contexts, reducing callback contention. Source sampling uses capture time
+  rather than callback arrival time. No new dependencies were installed.
+
+The final F2F optical-flow run enabled `imu_assisted`,
+`short_term_compensation` and `depth_geometry` for **600.027 seconds**:
+
+| Measurement | Result |
+| --- | ---: |
+| Consumed IMU captures | 59,920 |
+| IMU consumption age: median / p95 / maximum | 29.90 / 64.34 / 265.96 ms |
+| Maximum consumed IMU capture interval | 30.03 ms |
+| Native reports / native lost reports | 5,821 / 0 |
+| Tracking poses | 5,075 |
+| Output packets: initializing / tracking / coasting / recovering | 71 / 5,075 / 402 / 2,088 |
+| Native diagnostic capture age: median / p95 / maximum | 130.79 / 186.53 / 285.78 ms |
+| Depth capture interval: median / p95 / maximum | 100.12 / 133.49 / 233.61 ms |
+
+Medians/p95 use the final bounded 4,096-sample window; counts and maxima
+cover the run. Output states publish at different cadences, so their packet
+counts are not percentages of time. The final state was tracking with active
+IMU; no IMU retirement or terminal loss occurred. This is a static continuity
+result, not an arbitrary-duration guarantee. The unchanged 250 ms visual
+liveness check still caused short coasting/recovery intervals, so mapping
+could not admit every native pose. All visual frames remained usable and
+depth registration was never attempted; enabling geometry did not test its
+recovery path. `base_link` TF remains unavailable.
+
+The tested source SHA-256 was
+`cb5ce9f4e69fd53c9409bdc6150b5772b65d93a6643bf7ff69d3b87c414c68cc`;
+consumer runtime SHA-256 was
+`954412a7761d106dd3d6a8d6523f570e4fcef4153be96b373674a6bf4111edfa`.
+The later fail-closed source restart guard and atomic callback-failure state
+update were verified offline; those failure-path changes were not loaded in
+the 600-second run. Normal processing code is unchanged from that run.
+Evidence is retained as `tianyi-imu-stability-evidence-20261112.tgz`, containing
+run summaries, traces, native logs, code hashes and consumer exit status 0.
+
+The isolated source/raw probe stopped gracefully within 3.5 seconds. Their
+processes were absent afterward, and the exited test consumer was removed.
+Business containers and the camera service stayed running. G1/Bumi hardware
+acceptance remains pending; their Driver PRs were not changed in this retest.
 
 ## Offline checks
 
-- Tianyi, shared mount and control scope: 235 passed.
-- Generic RGB-D scope: 165 passed.
-- Full Perception suite: 2963 passed, 46 skipped in the test environment.
+- Tianyi, shared mount and control scope: 241 passed.
+- Generic RGB-D scope: 169 passed.
+- Full Perception suite: 2967 passed, 46 skipped in the test environment.
   `AGENT_CORE_URL=https://127.0.0.1:9` isolates optional completion callbacks
   from live HTTPS services. No audio implementation was changed.
 - Vendor library built successfully on the matching Jetson/Humble host.

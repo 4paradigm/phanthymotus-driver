@@ -262,6 +262,16 @@ that host service. Samples still pass the unchanged 500 ms freshness and
 20 ms pairing checks. Superseded accel history is pruned, and
 missing captures cannot pin subsequent valid gyro/accel pairs.
 
+With IMU enabled, the camera input node runs on its own single-threaded
+executor in the existing vendor ROS context. It remains alive across source
+stop/start so stopped subscriptions discard old input; context shutdown stops
+the executor. Callback failure makes the source unavailable and requires a
+Driver restart. IMU-disabled sources retain the shared executor. RGB-D
+sampling uses depth capture time with a 100 ms minimum interval; arrival
+jitter does not change that sampling clock. This is a rate limit, not an
+exact 10 Hz delivery guarantee. Compressed payloads use ROS byte arrays to
+avoid Python's per-byte message setter validation without changing encoding.
+
 The optional fourth `state/extrinsic` port publishes `motus.camera_mount/1`
 JSON on `camera/rgbd/body_mount`. Both RGB-D `camera_info.vendor.body_mount`
 entries declare this topic automatically, so the generic consumer needs no
@@ -306,4 +316,5 @@ pauses during coasting/recovery. The hard visual correction timeout is1s
 and modeled position sigma limit0.10m; these are software/model thresholds,
 not measured robot accuracy. Source clock/mount identity must remain fixed.
 See the [2026-11-12 IMU validation](patches/validation-20261112.md) for
-on-device clock results and remaining pipeline continuity failures.
+the 600-second static IMU continuity result and remaining visual continuity
+and motion-accuracy limits.

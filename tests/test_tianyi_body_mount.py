@@ -105,6 +105,20 @@ def test_fourth_port_declarations_actual_capture_tf_and_cross_domain_output(sour
     assert source.dispatch('info', {})['body_mount_status']['status'] == 'available'
 
 
+def test_rgbd_payloads_use_ros_uint8_buffers_and_preserve_pixels(source):
+    from array import array
+    import cv2, zlib
+    emit(source)
+    color, depth = [msg for topic, msg in source.events if topic.endswith(('/color', '/depth'))]
+    assert isinstance(color.data, array) and color.data.typecode == 'B'
+    assert isinstance(depth.data, array) and depth.data.typecode == 'B'
+    image = cv2.imdecode(np.frombuffer(color.data, np.uint8), cv2.IMREAD_COLOR)
+    assert image.shape == (480, 640, 3) and not image.any()
+    metric = np.frombuffer(zlib.decompress(depth.data), '<u2').reshape(480, 640)
+    assert metric[240, 320] == 1
+    assert np.count_nonzero(metric) > metric.size*.99
+
+
 def test_missing_tf_emits_no_held_body_matrix_and_images_continue(source):
     emit(source)
     source.body_mount.buffer.fail = True
