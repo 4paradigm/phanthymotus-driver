@@ -57,8 +57,20 @@ Tianyi buffers up to 100 raw gyro and acceleration captures per subscription
 using best-effort delivery, so transient image/TF callback work does not discard
 all but the latest five samples. Capture timestamps and the 500 ms source-age
 limit remain unchanged: buffering preserves short intervals, not stale data or
-invented samples. This addresses an offline-reproduced callback-backlog failure;
-on-device continuity with this queue change still requires verification.
+invented samples. Queueing alone did not prevent sustained backlog in the full
+driver. Motion subscriptions and their TF listener therefore use a dedicated
+IMU-only node/executor and lock; image callbacks stay on the existing vendor
+executor. Image publication cannot hold the IMU lock. Stop/restart still
+serialize IMU publication, and capture age is checked again after TF processing.
+
+A private-namespace diagnostic source plus the production consumer completed
+35 s of attitude-assisted F2F with 217 distinct tracking captures and no restart.
+This is a bounded diagnostic result, not acceptance of the deployed full driver
+or robot motion. The same trial with short-term compensation and depth geometry
+enabled repeatedly exceeded the modeled 0.10 m position uncertainty limit.
+Use `imu_assisted=true`, `short_term_compensation=false`, `depth_geometry=false`
+for the currently verified attitude-only path; the optional fusion mode remains
+separate acceptance work. No timestamp, covariance or uncertainty gate was relaxed.
 
 The default IMU-assisted mode estimates relative attitude from gravity and gyro;
 it provides no absolute heading or inertial translation. Optional short-term

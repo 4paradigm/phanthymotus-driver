@@ -115,6 +115,66 @@ def packets(source):
     return [] if publisher is None else [json.loads(msg.data) for msg in publisher.messages]
 
 
+def test_image_publication_lock_cannot_block_motion_ingress(source):
+    done = threading.Event()
+    def receive():
+        feed(source)
+        done.set()
+    worker = threading.Thread(target=receive)
+    with source.lock:
+        worker.start()
+        independent = done.wait(timeout=.2)
+    worker.join(timeout=1)
+    assert independent, 'image work held the IMU callback until its captures aged'
+    assert len(packets(source)) == 1
+
+
+def test_motion_ingress_and_tf_have_no_image_callbacks_on_their_executor(source):
+    assert source.imu_node is not source.sub_node
+    assert source._camera_executor.nodes == [source.imu_node]
+    assert source.imu_listener.node is source.imu_node
+    assert set(source.imu_node.subscriptions) == {
+        '/ob_camera_head/gyro/sample', '/ob_camera_head/accel/sample'}
+    assert not any('/sample' in topic for topic in source.sub_node.subscriptions)
+
+
+def test_slow_tf_work_cannot_publish_a_packet_past_capture_age_limit(source):
+    lookup = source.imu_buffer.lookup_transform
+    def delayed(*args):
+        transform = lookup(*args)
+        source.sub_node.now_ns += 275_000_000
+        return transform
+    source.imu_buffer.lookup_transform = delayed
+    feed(source)
+    assert packets(source) == []
+    assert 'stale' in source._imu_status()['reason']
+
+
+def test_imu_release_waits_for_publication_then_rejects_late_motion(source):
+    source.managed = True
+    source.acquire('color'); source.acquire('imu')
+    entered, release, stopped = threading.Event(), threading.Event(), threading.Event()
+    publisher = source.pub_node.publishers['/test/camera/rgbd/imu']
+    publish = publisher.publish
+    def blocked(message):
+        entered.set()
+        assert release.wait(timeout=2)
+        publish(message)
+    publisher.publish = blocked
+    receiver = threading.Thread(target=lambda: feed(source, accel=motion(NOW, 'accel_frame')))
+    receiver.start()
+    assert entered.wait(timeout=1)
+    def stop():
+        source.release('imu'); stopped.set()
+    stopper = threading.Thread(target=stop); stopper.start()
+    waiting = not stopped.wait(timeout=.05)
+    release.set(); receiver.join(timeout=1); stopper.join(timeout=1)
+    assert waiting and stopped.is_set() and source.running
+    assert len(packets(source)) == 1
+    feed(source, gyro=motion(NOW+1_000_000))
+    assert len(packets(source)) == 1
+
+
 def test_third_port_emits_capture_clock_raw_vectors_and_separate_90_degree_rotations(source):
     feed(source)
     assert source.get_tool()['topic_out'][2] == {'topic': '/test/camera/rgbd/imu', 'format': 'sensor/imu'}
@@ -138,10 +198,10 @@ def test_third_port_emits_capture_clock_raw_vectors_and_separate_90_degree_rotat
     assert source.dispatch('info', {})['imu_status']['state'] == 'available'
 
 
-def test_reuses_vendor_streams_and_existing_subnode_for_tf_without_new_camera_owner(source):
-    assert '/ob_camera_head/gyro/sample' in source.sub_node.subscriptions
-    assert '/ob_camera_head/accel/sample' in source.sub_node.subscriptions
-    assert source.imu_listener.node is source.sub_node
+def test_reuses_vendor_streams_on_dedicated_imu_node_without_new_camera_owner(source):
+    assert '/ob_camera_head/gyro/sample' in source.imu_node.subscriptions
+    assert '/ob_camera_head/accel/sample' in source.imu_node.subscriptions
+    assert source.imu_listener.node is source.imu_node
 
 
 def test_motion_capture_intervals_survive_a_200ms_callback_backlog(source):
@@ -151,7 +211,7 @@ def test_motion_capture_intervals_survive_a_200ms_callback_backlog(source):
     queues = {}
     for kind, frame in [('gyro', 'gyro_optical'), ('accel', 'accel_frame')]:
         topic = '/ob_camera_head/' + kind + '/sample'
-        qos = source.sub_node.subscription_qos[topic]
+        qos = source.imu_node.subscription_qos[topic]
         queue = deque(maxlen=qos.depth)
         for i in range(1, 21):
             queue.append(motion(NOW+i*10_000_000, frame, (0., 0., 0.) if kind == 'gyro' else (0., 0., 9.81)))
@@ -159,7 +219,7 @@ def test_motion_capture_intervals_survive_a_200ms_callback_backlog(source):
     source.sub_node.now_ns = NOW+200_000_000
     while any(queue for _, queue in queues.values()):
         for topic, queue in queues.values():
-            if queue: source.sub_node.subscriptions[topic](queue.popleft())
+            if queue: source.imu_node.subscriptions[topic](queue.popleft())
     stamps = [p['stamp_ns'] for p in packets(source)]
     assert stamps == [NOW+i*10_000_000 for i in range(21)]
     assert max(b-a for a, b in zip(stamps, stamps[1:])) == 10_000_000
@@ -167,7 +227,7 @@ def test_motion_capture_intervals_survive_a_200ms_callback_backlog(source):
 
 def test_motion_callback_executor_persists_across_card_restart(source):
     executor, worker = source._camera_executor, source._camera_spin
-    assert executor.nodes == [source.sub_node] and worker.is_alive()
+    assert executor.nodes == [source.imu_node] and worker.is_alive()
     source.stop()
     assert worker.is_alive()  # stopped subscriptions continue discarding old data
     source.start()
@@ -324,6 +384,7 @@ def test_disabled_source_keeps_rgbd_ready_with_declared_optional_port(source):
 
 @pytest.mark.parametrize('source', [{'imu_enabled': False}], indirect=True)
 def test_disabled_config_never_attaches_motion_or_tf_subscriptions(source):
+    assert source.imu_node is None
     assert '/ob_camera_head/gyro/sample' not in source.sub_node.subscriptions
     assert '/ob_camera_head/accel/sample' not in source.sub_node.subscriptions
     assert not hasattr(source, 'imu_listener')

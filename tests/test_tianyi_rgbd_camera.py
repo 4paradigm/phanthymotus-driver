@@ -70,7 +70,7 @@ def test_output_preserves_optical_frame_and_declares_matching_intrinsics():
 def test_healthy_source_info_is_not_flagged_as_an_mcp_error():
     import threading
     source=object.__new__(m.RgbdCameraPlugin)
-    source.lock=threading.RLock();source.root='/test';source.geometry=None
+    source.lock=threading.RLock();source.imu_lock=threading.RLock();source.root='/test';source.geometry=None
     source.running=True;source.registered=True;source.count=2;source.error=None
     assert 'error' not in source.dispatch('info',{})
 
@@ -78,7 +78,7 @@ def test_healthy_source_info_is_not_flagged_as_an_mcp_error():
 def test_first_source_start_waits_for_calibration_before_core_snapshots_info():
     import threading,time
     source=object.__new__(m.RgbdCameraPlugin)
-    source.lock=threading.RLock();source.root='/test';source.clock='capture-clock'
+    source.lock=threading.RLock();source.imu_lock=threading.RLock();source.root='/test';source.clock='capture-clock'
     source.running=True;source.registered=False;source.count=0;source.error=None;source.geometry=None
     source.start=lambda:None
     geometry=m.make_geometry(info(),info(),registered=True)
