@@ -46,20 +46,43 @@ def make_geometry(color, depth, *, registered):
     k[0, 2] -= left * 640 / crop_w
     k[1, 2] -= top * 480 / crop_h
     u, v = np.meshgrid(np.arange(640), np.arange(480))
-    x, y = (u - k[0, 2]) / k[0, 0], (v - k[1, 2]) / k[1, 1]
-    r2 = x*x + y*y
-    k1, k2, p1, p2, k3, k4, k5, k6 = distortion
-    radial = (1 + k1*r2 + k2*r2**2 + k3*r2**3) / (1 + k4*r2 + k5*r2**2 + k6*r2**3)
-    xd = x*radial + 2*p1*x*y + p2*(r2 + 2*x*x)
-    yd = y*radial + p1*(r2 + 2*y*y) + 2*p2*x*y
-    return dict(K=k, frame_id=depth.header.frame_id,
-                color_x=(color.k[0]*xd + color.k[2]).astype(np.float32),
-                color_y=(color.k[4]*yd + color.k[5]).astype(np.float32),
-                depth_x=(depth.k[0]*x + depth.k[2]).astype(np.float32),
-                depth_y=(depth.k[4]*y + depth.k[5]).astype(np.float32))
+    def project(matrix):
+        x, y = (u - matrix[0, 2]) / matrix[0, 0], (v - matrix[1, 2]) / matrix[1, 1]
+        r2 = x*x + y*y
+        k1, k2, p1, p2, k3, k4, k5, k6 = distortion
+        radial = (1 + k1*r2 + k2*r2**2 + k3*r2**3) / (1 + k4*r2 + k5*r2**2 + k6*r2**3)
+        xd = x*radial + 2*p1*x*y + p2*(r2 + 2*x*x)
+        yd = y*radial + p1*(r2 + 2*y*y) + 2*p2*x*y
+        maps = dict(color_x=(color.k[0]*xd + color.k[2]).astype(np.float32),
+                    color_y=(color.k[4]*yd + color.k[5]).astype(np.float32),
+                    depth_x=(depth.k[0]*x + depth.k[2]).astype(np.float32),
+                    depth_y=(depth.k[4]*y + depth.k[5]).astype(np.float32))
+        valid = np.ones((480, 640), dtype=bool)
+        for kind, camera in (('color', color), ('depth', depth)):
+            mx, my = maps[kind+'_x'], maps[kind+'_y']
+            valid &= (np.isfinite(mx) & np.isfinite(my) & (mx >= 0) & (mx <= camera.width-1)
+                      & (my >= 0) & (my <= camera.height-1))
+        return maps, valid
+
+    maps, valid = project(k)
+    if not valid.all():
+        # Keep a centered 4:3 window fully inside both measured image fields.
+        # A one-pixel margin protects interpolation between the sampled rays.
+        radius = np.maximum(np.abs(u-320.)/320., np.abs(v-240.)/240.)
+        extent = float(radius[~valid].min()) - 1./240.
+        if extent <= 0:
+            raise ValueError('RGB-D has no usable common central field of view')
+        zoom = 1./extent
+        k[:2] *= zoom
+        k[0, 2] += 320.*(1.-zoom)
+        k[1, 2] += 240.*(1.-zoom)
+        maps, valid = project(k)
+        if not valid.all():
+            raise ValueError('RGB-D common field cannot be rectified without missing image rays')
+    return dict(K=k, frame_id=depth.header.frame_id, **maps)
 
 
-def camera_declarations(root, geometry, clock, *, depth_topic=None):
+def camera_declarations(root, geometry, clock, *, color_topic=None, depth_topic=None):
     common = dict(schema='motus.camera/1', id=root + '/rectified',
                   width=640, height=480, K=geometry['K'].ravel().tolist(), D=[0.] * 5,
                   distortion_model='pinhole', source='derived-from-K',
@@ -67,7 +90,7 @@ def camera_declarations(root, geometry, clock, *, depth_topic=None):
                               registration='registered_rectified',
                               registration_source='orbbec_hw_registered_common_optical_rays',
                               timestamp_semantics='source_capture_mapped'))
-    color = dict(deepcopy(common), topic=root + '/color', format='image/jpeg')
+    color = dict(deepcopy(common), topic=color_topic or root + '/color', format='image/jpeg')
     depth = dict(deepcopy(common), topic=depth_topic or root + '/depth', format='image/depth-zlib')
     depth['vendor'].update(depth_unit='mm', depth_source='measured')
     return [color, depth]
@@ -161,6 +184,10 @@ class RgbdCameraPlugin:
         self._camera_executor.wake()
 
     @property
+    def color_topic(self):
+        return self.root.rsplit('/camera/rgbd', 1)[0] + '/camera/head'
+
+    @property
     def depth_topic(self):
         return self.root.rsplit('/camera/rgbd', 1)[0] + '/camera/head/depth'
 
@@ -202,14 +229,14 @@ class RgbdCameraPlugin:
                 'topic_out': self._outputs(), 'camera_info': self._declarations()}
 
     def _outputs(self):
-        return [{'topic': self.root + '/color', 'format': 'image/jpeg'},
+        return [{'topic': self.color_topic, 'format': 'image/jpeg'},
                 {'topic': self.depth_topic, 'format': 'image/depth-zlib'},
                 {'topic': self.root + '/imu', 'format': 'sensor/imu'},
                 {'topic': self.root + '/body_mount', 'format': 'state/extrinsic'}]
 
     def _declarations(self):
         declarations = camera_declarations(self.root, self.geometry, self.clock,
-            depth_topic=self.depth_topic) if self.geometry is not None else []
+            color_topic=self.color_topic, depth_topic=self.depth_topic) if self.geometry is not None else []
         if getattr(self, 'body_mount', None) is not None:
             for entry in declarations:
                 entry['vendor']['body_mount'] = self.body_mount.declaration()
@@ -230,7 +257,7 @@ class RgbdCameraPlugin:
             if self.running:
                 return
             if not self.attached:
-                self.color_pub = self.pub_node.create_publisher(CompressedImage, self.root + '/color', qos_profile_sensor_data)
+                self.color_pub = self.pub_node.create_publisher(CompressedImage, self.color_topic, qos_profile_sensor_data)
                 self.depth_pub = self.pub_node.create_publisher(CompressedImage, self.depth_topic, qos_profile_sensor_data)
                 for kind in ('color', 'depth'):
                     self.sub_node.create_subscription(CameraInfo, '/ob_camera_head/' + kind + '/camera_info',
@@ -469,9 +496,6 @@ class RgbdCameraPlugin:
                 g = self.geometry
                 rectified = cv2.remap(rgb, g['color_x'], g['color_y'], cv2.INTER_LINEAR)
                 metric = cv2.remap(z16, g['depth_x'], g['depth_y'], cv2.INTER_NEAREST)
-                visible = ((g['color_x'] >= 0) & (g['color_x'] < color.width-1) &
-                           (g['color_y'] >= 0) & (g['color_y'] < color.height-1))
-                metric[~visible] = 0
                 ok, jpg = cv2.imencode('.jpg', rectified, [cv2.IMWRITE_JPEG_QUALITY, 90])
                 if not ok:
                     raise ValueError('RGB-D color encoding failed')
@@ -555,9 +579,10 @@ class RgbdInputCard:
         port = dict(port, description='相机 IMU（里程计输入）' if self.kind == 'imu' else '配准相机数据')
         if self.kind == 'imu':
             port['name'] = 'camera_imu'
-        elif self.kind == 'color':
-            port['name'] = 'registered_rgb'
-        tool['topic_out'].append(port)
+        if self.kind == 'color':
+            tool['topic_out'] = [port]
+        else:
+            tool['topic_out'].append(port)
         with self.source.lock:
             tool['camera_info'] = [d for d in self.source._declarations() if d['topic'] == port['topic']]
             tool['imu_status'] = self.source._imu_status()
@@ -608,11 +633,11 @@ class RgbdInputCard:
             ready = (self.source.running and self.source.registered and self.source.geometry is not None
                      and self.source.count > 0 and not self.source.error)
             state = 'running' if self.running and self.source.running else 'idle'
-            if self.kind == 'depth' and self.running and not ready:
+            if self.kind in ('color', 'depth') and self.running and not ready:
                 state = 'unavailable'
             return dict(state=state,
                         topic_out=tool['topic_out'], camera_info=tool['camera_info'],
                         imu_status=tool['imu_status'], body_mount_status=tool['body_mount_status'],
                         **({'reason': self.source.error or 'waiting for calibrated source captures'}
-                           if self.kind == 'depth' and self.running and not ready else {}),
+                           if self.kind in ('color', 'depth') and self.running and not ready else {}),
                         **({'error': self.source.error} if self.source.error else {}))

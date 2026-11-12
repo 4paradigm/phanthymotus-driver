@@ -93,7 +93,7 @@ def test_fourth_port_declarations_actual_capture_tf_and_cross_domain_output(sour
     assert mount['parent_frame'] == 'base_link' and mount['child_frame'] == 'head_optical'
     assert mount['status'] == 'unavailable'
     emit(source)
-    assert [topic.rsplit('/', 1)[-1] for topic, _ in source.events] == ['body_mount', 'color', 'depth']
+    assert [topic for topic, _ in source.events] == [source.root+'/body_mount', '/test/camera/head', source.depth_topic]
     packet = json.loads(source.events[0][1].data)
     assert packet['stamp_ns'] == STAMP and packet['clock_id'] == source.clock
     assert packet['matrix'][0][3] == .2
@@ -109,7 +109,7 @@ def test_rgbd_payloads_use_ros_uint8_buffers_and_preserve_pixels(source):
     from array import array
     import cv2, zlib
     emit(source)
-    color, depth = [msg for topic, msg in source.events if topic.endswith(('/color', '/depth'))]
+    color, depth = [msg for topic, msg in source.events if topic in (source.color_topic, source.depth_topic)]
     assert isinstance(color.data, array) and color.data.typecode == 'B'
     assert isinstance(depth.data, array) and depth.data.typecode == 'B'
     image = cv2.imdecode(np.frombuffer(color.data, np.uint8), cv2.IMREAD_COLOR)
@@ -117,6 +117,35 @@ def test_rgbd_payloads_use_ros_uint8_buffers_and_preserve_pixels(source):
     metric = np.frombuffer(zlib.decompress(depth.data), '<u2').reshape(480, 640)
     assert metric[240, 320] == 1
     assert np.count_nonzero(metric) > metric.size*.99
+
+
+@pytest.mark.parametrize('focal', [400, 520])
+def test_encoded_common_view_has_no_padding_and_keeps_measured_depth_holes(source, focal):
+    import cv2, zlib
+    from test_tianyi_rgbd_camera import info
+    source.geometry = m.make_geometry(info(focal, frame='head_optical'),
+                                      info(frame='head_optical'), registered=True)
+    header = NS(frame_id='head_optical', stamp=NS(sec=STAMP//10**9, nanosec=STAMP%10**9))
+    measured = np.full((480, 640), 1250, '<u2')
+    measured[220:260, 300:340] = 0
+    color = NS(header=deepcopy(header), encoding='bgr8', width=640, height=480, step=1920,
+               data=np.full((480, 640, 3), 200, np.uint8).tobytes())
+    depth = NS(header=deepcopy(header), encoding='16UC1', is_bigendian=False,
+               width=640, height=480, step=1280, data=measured.tobytes())
+    source.pending.put((color, depth))
+    source._work()
+    assert source.error is None
+    rgb, metric = [msg for topic, msg in source.events if topic in (source.color_topic, source.depth_topic)]
+    image = cv2.imdecode(np.frombuffer(rgb.data, np.uint8), cv2.IMREAD_COLOR)
+    metric_image = np.frombuffer(zlib.decompress(metric.data), '<u2').reshape(480, 640)
+    assert image.min() >= 199
+    assert metric_image[240, 320] == 0
+    assert np.all(metric_image[[0, -1]] == 1250)
+    assert np.all(metric_image[:, [0, -1]] == 1250)
+    assert set(np.unique(metric_image)) == {0, 1250}
+    assert m._stamp(rgb) == m._stamp(metric) == STAMP
+    rgb_info, depth_info = source._declarations()
+    assert rgb_info['K'] == depth_info['K'] == source.geometry['K'].ravel().tolist()
 
 
 def test_missing_tf_emits_no_held_body_matrix_and_images_continue(source):
@@ -165,7 +194,7 @@ def test_mount_publisher_runtime_failure_preserves_images(source):
     def fail(message): raise RuntimeError('mount output transport failed')
     source.body_mount.publisher.publish = fail
     emit(source)
-    assert [topic.rsplit('/', 1)[-1] for topic, _ in source.events] == ['color', 'depth']
+    assert [topic for topic, _ in source.events] == [source.color_topic, source.depth_topic]
     assert source.count == 1 and source.running and source.error is None
     assert source.dispatch('info', {})['body_mount_status']['status'] == 'unavailable'
 

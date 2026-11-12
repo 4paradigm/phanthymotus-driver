@@ -334,7 +334,7 @@ class TianyiDeviceBundle:
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
             self._plugins.append(RgbdInputCard(rgbd_source, 'color',
-                CameraPlugin(plugins_cfg["camera"], namespace, ros2)))
+                CameraPlugin(plugins_cfg["camera"], namespace, ros2, monitor_only=True)))
             print("[bundle] CameraPlugin loaded")
 
         if plugins_cfg.get("camera_depth", {}).get("enabled", False):

@@ -233,14 +233,20 @@ health check restarts it.
 ## RGB-D input for generic visual odometry
 
 The existing `camera_head`, `camera_depth` and `imu` cards share one private
-calibrated source. The standalone `camera_rgbd` card is retired. Original
-`camera_head` display output stays unchanged and appends registered RGB on
-`/<ns>/camera/rgbd/color`. The sole `camera_depth` output stays on
+calibrated source. The standalone `camera_rgbd` card is retired. The sole
+`camera_head` output on `/<ns>/camera/head` now carries calibrated RGB for both
+display and computation; the added `/camera/rgbd/color` output is removed.
+The sole `camera_depth` output stays on
 `/<ns>/camera/head/depth`: display, RGB-D odometry and Point Cloud all subscribe
 to the same 640×480 little-endian uint16 millimetre depth, zlib-compressed in
 `CompressedImage`; zero pixels are invalid. The old independent display depth
 crop/encoder and `/camera/rgbd/depth` publisher are removed. Geometry follows
-the calibrated computation path, so the displayed field of view may change.
+the calibrated computation path. Both images use a common valid centered 4:3
+field with updated K, cropping rays outside either lens instead of adding black
+padding or stretching RGB alone. The field of view may narrow. Both streams
+follow `plugins.camera_depth.hz` (default 8 Hz), including the RGB display.
+The original RGB service/watchdog remains active without a second JPEG publisher
+or encoder. `vision_capture` still captures the original raw photo/video stream.
 
 Each image card waits up to ten seconds for registration/time parameters,
 calibration and first pair before source startup returns. Color is sampled
@@ -305,8 +311,10 @@ display-only pixels or arrival timestamps. Optional IMU/body-TF failure is
 reported separately and does not stop valid image pairs.
 
 Canvas migration: replace old `camera_rgbd` connections with `camera_head`'s
-registered RGB, the single original `camera_depth` port and optional `imu`'s
-`camera_imu` port. Existing depth display links keep their topic and format.
+single original RGB port, the single original `camera_depth` port and optional
+`imu`'s `camera_imu` port. Reconnect any `/camera/rgbd/color` links to
+`/<ns>/camera/head`; restart consumers to refresh their calibration. Existing
+original RGB/depth display links keep their topics and formats.
 This redistribution has offline regression/consumer checks only; earlier
 hardware IMU results do not validate this new card lifecycle or performance.
 
@@ -349,8 +357,8 @@ and motion-accuracy limits.
 ### Shared-depth RGB pixel consumers
 
 Consumers that combine RGB pixel coordinates with the shared depth must use
-`/<ns>/camera/rgbd/color` (the registered RGB port), not the unchanged display
-RGB. This also applies to VOP/Measure connections. If Measure overlays an RGB
-image, set its existing `camera_topic` to that registered RGB topic; its default
-`/camera/color` or `/camera/rgb` guess refers to the native display image.
+`/<ns>/camera/head`, the shared calibrated RGB output. This also applies to
+VOP/Measure connections. If Measure overlays an RGB image, set its existing
+`camera_topic` to that topic rather than relying on its `/camera/color` or
+`/camera/rgb` default guesses.
 No camera-to-body matrix or guessed calibration is introduced by this wiring.

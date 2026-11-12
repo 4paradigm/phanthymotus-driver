@@ -17,23 +17,27 @@ def info(focal=400, distortion=None, frame='optical', width=640, height=480):
 
 def test_registered_lenses_with_different_intrinsics_are_reprojected_not_relabeled():
     result=m.make_geometry(info(800),info(400),registered=True)
-    assert result['color_x'][240,400]==pytest.approx(480.)
+    assert 800 <= result['K'][0,0] <= 820
+    ray=80/result['K'][0,0]
+    assert result['color_x'][240,400]==pytest.approx(320+800*ray)
     assert result['color_y'][240,400]==pytest.approx(240.)
-    assert result['depth_x'][240,400]==pytest.approx(400.)
-    np.testing.assert_allclose(result['K'],[[400,0,320],[0,400,240],[0,0,1]])
+    assert result['depth_x'][240,400]==pytest.approx(320+400*ray)
+    assert result['K'][0,0]==result['K'][1,1]
 
 
 def test_color_distortion_is_applied_when_sampling_rectified_rgb():
     result=m.make_geometry(info(400,[.1,0,0,0,0]),info(400),registered=True)
-    # x=.2, r²=.04 -> distorted pixel 400*(.2*1.004)+320.
-    assert result['color_x'][240,400]==pytest.approx(400.32,abs=1e-4)
+    x=80/result['K'][0,0]
+    assert result['color_x'][240,400]==pytest.approx(400*x*(1+.1*x*x)+320,abs=1e-4)
+    assert result['color_x'][240,400] > result['depth_x'][240,400]
 
 
 def test_crop_scales_intrinsics_using_actual_depth_optical_geometry():
     color=info(689.25,width=1280,height=720)
     depth=info(619.2,width=1280,height=720)
     result=m.make_geometry(color,depth,registered=True)
-    assert result['K'][0,0]==pytest.approx(412.8)
+    # The narrower RGB vertical field limits the common 4:3 viewport.
+    assert 689.25*480/720 <= result['K'][0,0] <= 689.25*480/720*1.02
     assert result['K'][0,2]==pytest.approx(320.)
     assert result['color_x'].shape==(480,640)
     assert result['depth_x'][240,320]==pytest.approx(640.)
@@ -118,3 +122,34 @@ def test_frame_sampling_uses_capture_intervals_despite_callback_jitter(monkeypat
         source._image('color', msg); source._image('depth', msg)
         if not source.pending.empty(): sampled.append(m._stamp(source.pending.get_nowait()[1]))
     assert sampled == [1_000_000_000, 1_100_000_000, 1_200_000_000]
+
+
+@pytest.mark.parametrize('focal,distortion,offset', [
+    (520., [0.]*5, (0., 0.)),
+    (800., [.1, -.02, .001, -.001, 0.], (7., -5.)),
+    (340., [-.08, .01, 0., 0., 0.], (-9., 4.)),
+])
+def test_common_field_has_no_remap_black_padding_and_preserves_ray_calibration(focal, distortion, offset):
+    import cv2
+    color, depth = info(focal, distortion), info(400.)
+    color.k[2] += offset[0]; color.k[5] += offset[1]
+    g = m.make_geometry(color, depth, registered=True)
+    image = np.full((480, 640, 3), 200, np.uint8)
+    rgb = cv2.remap(image, g['color_x'], g['color_y'], cv2.INTER_LINEAR)
+    assert rgb.min() >= 199  # every output ray has real color, including its border
+    measured = cv2.remap(np.full((480,640), 1250, np.uint16),
+                         g['depth_x'], g['depth_y'], cv2.INTER_NEAREST)
+    assert np.all(measured == 1250)
+    u, v = np.meshgrid(np.arange(640), np.arange(480))
+    x, y = (u-g['K'][0,2])/g['K'][0,0], (v-g['K'][1,2])/g['K'][1,1]
+    np.testing.assert_allclose(g['depth_x'], depth.k[0]*x+depth.k[2], atol=1e-4)
+    np.testing.assert_allclose(g['depth_y'], depth.k[4]*y+depth.k[5], atol=1e-4)
+    declarations = m.camera_declarations('/test', g, 'capture')
+    assert declarations[0]['K'] == declarations[1]['K'] == g['K'].ravel().tolist()
+
+
+def test_common_field_does_not_claim_disjoint_lenses_are_registered():
+    color, depth = info(520.), info(400.)
+    color.k[2] = 2000.
+    with pytest.raises(ValueError, match='common'):
+        m.make_geometry(color, depth, registered=True)

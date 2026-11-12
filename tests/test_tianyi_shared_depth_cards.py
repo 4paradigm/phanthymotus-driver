@@ -3,6 +3,7 @@ import ast
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace as NS
+import pytest
 
 from test_tianyi_body_mount import source, emit, STAMP, m
 
@@ -36,8 +37,10 @@ def test_original_three_cards_distribute_ports_without_new_depth_port(source):
     tools = [card.get_tool() for card in (rgb, depth, imu)]
     assert [t['name'] for t in tools] == ['camera_head', 'camera_depth', 'imu']
     assert [p['topic'] for p in tools[1]['topic_out']] == ['/test/camera/head/depth']
-    assert [p['format'] for p in tools[0]['topic_out']] == ['image/jpeg', 'image/jpeg']
-    assert tools[0]['topic_out'][1]['name'] == 'registered_rgb'
+    assert tools[0]['topic_out'] == [dict(topic='/test/camera/head', format='image/jpeg',
+                                        description='配准相机数据')]
+    assert tools[0]['camera_info'][0]['topic'] == '/test/camera/head'
+    assert '/test/camera/rgbd/color' not in source.pub_node.publishers
     assert [p['format'] for p in tools[2]['topic_out']] == ['data/json', 'sensor/imu']
     assert tools[0]['camera_info'][0]['K'] == tools[1]['camera_info'][0]['K']
     assert tools[0]['camera_info'][0]['id'] == tools[1]['camera_info'][0]['id']
@@ -81,6 +84,7 @@ def test_bundle_registers_existing_cards_and_private_source_only():
     bundle = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'TianyiDeviceBundle')
     init = ast.unparse(next(n for n in bundle.body if isinstance(n, ast.FunctionDef) and n.name == '__init__'))
     assert 'RgbdInputCard' in init
+    assert 'monitor_only=True' in init
     assert 'self._plugins.append(RgbdCameraPlugin(' not in init
     assert 'name: camera_rgbd' not in (root/'x-humanoid/tianyi2.0/driver.yaml').read_text()
 
@@ -185,13 +189,14 @@ def test_queued_frame_cannot_cross_depth_restart_even_with_tolerated_clock_skew(
     assert not any(t == '/test/camera/head/depth' for t, _ in source.events)
 
 
-def test_depth_info_reports_unavailable_until_real_calibration_and_capture(source):
-    depth = m.RgbdInputCard(source, 'depth')
-    depth.running = True
+@pytest.mark.parametrize('kind', ['color', 'depth'])
+def test_image_info_reports_unavailable_until_real_calibration_and_capture(source, kind):
+    card = m.RgbdInputCard(source, kind)
+    card.running = True
     source.geometry = None
     source.registered = False
     source.count = 0
-    status = depth.dispatch('info', {})
+    status = card.dispatch('info', {})
     assert status['state'] == 'unavailable'
     assert status['camera_info'] == []
     assert status['reason']

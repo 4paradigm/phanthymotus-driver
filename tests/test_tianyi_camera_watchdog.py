@@ -45,6 +45,7 @@ CameraPlugin = load_camera_class()
 
 def make_plugin(*, grace=0.3, stall=0.3, poll=0.02):
     p = CameraPlugin.__new__(CameraPlugin)
+    p._monitor_only = False
     p._running = False
     p._latest_frame = None
     p._frame_lock = threading.Lock()
@@ -60,6 +61,44 @@ def make_plugin(*, grace=0.3, stall=0.3, poll=0.02):
     p.restarts = []
     p._restart_orbbec_service = lambda: (p.restarts.append(time.time()), None)[1]
     return p
+
+
+def test_monitor_only_keeps_service_watchdog_without_second_rgb_publisher(monkeypatch):
+    import sys
+    from types import SimpleNamespace as NS
+    subscriptions, publishers, ensures = [], [], []
+    class Node:
+        def __init__(self, *args, **kwargs): pass
+        def create_subscription(self, *args):
+            subscriptions.append(args)
+            return object()
+        def create_publisher(self, *args):
+            publishers.append(args)
+            return object()
+    monkeypatch.setitem(CameraPlugin.__init__.__globals__, 'Node', Node)
+    monkeypatch.setitem(CameraPlugin.start.__globals__, '_RELIABLE_QOS', object())
+    monkeypatch.setitem(CameraPlugin.start.__globals__, '_LOW_LAT_QOS', object())
+    monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(Image=object, CompressedImage=object))
+    monkeypatch.setattr(CameraPlugin, '_ensure_orbbec_service', staticmethod(lambda: ensures.append(True)))
+    ros = NS(ctx_tianyi=None, ctx_core=None, executor_tianyi=NS(add_node=lambda n: None),
+             executor_core=NS(add_node=lambda n: None))
+    p = CameraPlugin({}, 'test', ros, monitor_only=True)
+    try:
+        p.start(); p.start()
+        assert publishers == [] and p._encode_thread is None
+        assert len(subscriptions) == 1 and ensures == [True]
+        assert p._watchdog_thread.is_alive()
+        subscriptions[0][2](object())
+        assert p._last_frame_at > 0 and p._latest_frame is None
+        p.stop(); p._watchdog_thread.join(timeout=2)
+        assert not p._watchdog_thread.is_alive()
+        p.start()
+        assert len(subscriptions) == 1 and ensures == [True, True]
+        assert publishers == [] and p._encode_thread is None
+    finally:
+        p.stop()
+        if p._watchdog_thread is not None:
+            p._watchdog_thread.join(timeout=2)
 
 
 def arm(p):

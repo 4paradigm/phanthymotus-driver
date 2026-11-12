@@ -946,8 +946,9 @@ class StatePlugin:
 class CameraPlugin:
     """Orbbec 头部 RGB 相机 — 独立编码线程避免阻塞executor"""
 
-    def __init__(self, plugin_config: dict, namespace: str, ros2):
+    def __init__(self, plugin_config: dict, namespace: str, ros2, *, monitor_only=False):
         self._ns = namespace
+        self._monitor_only = monitor_only
         self._ros2 = ros2
         self._topic = f"/{namespace}/camera/head"
         self._running = False
@@ -974,8 +975,9 @@ class CameraPlugin:
         self._sub_node = Node("tianyi2_camera_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
-        self._pub_node = Node("tianyi2_camera_pub", context=ros2.ctx_core)
-        ros2.executor_core.add_node(self._pub_node)
+        if not self._monitor_only:
+            self._pub_node = Node("tianyi2_camera_pub", context=ros2.ctx_core)
+            ros2.executor_core.add_node(self._pub_node)
 
     def get_tool(self) -> dict:
         return {
@@ -1039,7 +1041,7 @@ class CameraPlugin:
                 self._latest_frame = None  # never publish a frame from before the stop
 
             # Publish JPEG as CompressedImage
-            if self._pub is None:
+            if not self._monitor_only and self._pub is None:
                 self._pub = self._pub_node.create_publisher(CompressedImage, self._topic, _LOW_LAT_QOS)
 
             # Subscribe - callback just grabs the frame, doesn't encode
@@ -1054,7 +1056,9 @@ class CameraPlugin:
             self._watchdog_gave_up = False
 
             # Separate encoding thread - avoids blocking executor
-            if previous is not None and previous.is_alive():
+            if self._monitor_only:
+                pass  # The shared calibrated producer owns JPEG publication.
+            elif previous is not None and previous.is_alive():
                 # Refused to exit within the grace period. It observes the flag
                 # we just re-armed and resumes, so don't stack a second one.
                 print("[CameraPlugin] WARNING: previous encode thread still running, reusing it")
@@ -1069,7 +1073,8 @@ class CameraPlugin:
                     name="tianyi2-camera-watchdog")
                 self._watchdog_thread.start()
 
-            print("[CameraPlugin] subscription + encode thread created", flush=True)
+            print("[CameraPlugin] camera monitor armed" if self._monitor_only else
+                  "[CameraPlugin] subscription + encode thread created", flush=True)
 
     @staticmethod
     def _ensure_orbbec_service():
@@ -1165,6 +1170,8 @@ class CameraPlugin:
             return
         # 看门狗的唯一存活信号。放在锁外、只写一个 float —— 这是 30fps 的路径。
         self._last_frame_at = time.time()
+        if self._monitor_only:
+            return
         with self._frame_lock:
             self._latest_frame = msg
 
