@@ -138,7 +138,7 @@ def load_camera_class(relative, name):
 
 def test_g1_motion_uses_same_global_capture_conversion_and_refuses_hardware_clock():
     cls=load_camera_class('unitree/g1/rgbd_camera.py','RgbdSource')
-    source=cls(None,None)
+    source=cls('/g1/camera/rgbd',None)
     import time
     now=time.time_ns()
     stamp=now/1e6
@@ -188,11 +188,11 @@ def test_g1_motion_callback_preserves_partial_video_display_frames():
     owner=next(n for n in ast.walk(tree) if isinstance(n,ast.ClassDef) and n.name=='_RealSenseNode')
     method=next(n for n in owner.body if isinstance(n,ast.FunctionDef) and n.name=='_on_frame')
     import time
-    scope={'queue':queue,'time':time,'np':np,'RS_DIST_INTERVAL':.1}
+    scope={'queue':queue,'time':time,'np':np,'RS_DIST_INTERVAL':.1,'card_epochs':None}
     exec(compile(ast.Module(body=[method],type_ignores=[]),'g1_callback','exec'),scope)
     errors=[]
     node=NS(_imu=NS(on_frame=lambda frame:None),_rgbd_configured=False,
-            _color_q=queue.Queue(maxsize=1),_depth_q=queue.Queue(maxsize=1),
+            _color_q=queue.Queue(maxsize=1),
             _last_dist_time=time.monotonic(),_last_ts=0.,
             get_clock=lambda:NS(now=lambda:NS(to_msg=lambda:None)),
             get_logger=lambda:NS(error=errors.append))

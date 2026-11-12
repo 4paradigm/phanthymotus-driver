@@ -345,7 +345,7 @@ class InputTests(unittest.TestCase):
 class PluginTests(unittest.TestCase):
     def make_plugin(self):
         return load_plugin()({}, "g1", object(), types.SimpleNamespace(
-            is_running=lambda: True, _color_topic="/g1/camera/rgb"))
+            is_running=lambda: True, ensure_rgb_output=lambda: None, _color_topic="/g1/camera/rgb"))
 
     def test_default_and_canvas_audio_parameter(self):
         p = self.make_plugin()
@@ -487,7 +487,7 @@ class EncodingTests(unittest.TestCase):
     def test_original_photo_and_silent_recording_still_work(self):
         p = load_plugin()({}, "g1", object(), None)
         p._output_dir = self.directory
-        p._camera = object()
+        p._camera = types.SimpleNamespace(is_running=lambda: True, ensure_rgb_output=lambda: None)
         p._frame = lambda *args: ({"data": self.jpeg.read_bytes(),
                                   "received_monotonic": time.monotonic()}, 1)
         photo = p._capture_photo()

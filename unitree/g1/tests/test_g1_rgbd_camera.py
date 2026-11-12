@@ -117,23 +117,13 @@ def test_g1_unsupported_distortion_and_invalid_calibration_are_unavailable():
         source.configure(profile)
 
 
-def test_g1_rgbd_card_is_registered_in_existing_single_capture_owner():
-    tree = ast.parse((ROOT/'device.py').read_text())
-    plugin = next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='RealSensePlugin')
-    method = next(n for n in plugin.body if isinstance(n,ast.FunctionDef) and n.name=='get_tools')
-    assert '_rgbd_tool' in ast.unparse(method)
-    assert 'camera_rgbd' in (ROOT/'driver.yaml').read_text()
-    assert 'COPY rgbd_camera.py' in (ROOT/'Dockerfile').read_text()
-
-
-def test_g1_rgbd_info_dispatch_uses_live_status_and_preserves_display_ports():
-    tree = ast.parse((ROOT/'device.py').read_text())
-    plugin_ast = next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='RealSensePlugin')
-    namespace = {}
-    exec(compile(ast.Module(body=[plugin_ast],type_ignores=[]),str(ROOT/'device.py'),'exec'),namespace)
-    plugin = namespace['RealSensePlugin'].__new__(namespace['RealSensePlugin'])
-    plugin._rgbd_info = lambda: {'state':'unavailable','reason':'SDK global capture clock unavailable'}
-    assert plugin.dispatch('info', {'_tool_name':'camera_rgbd'})['reason'] == 'SDK global capture clock unavailable'
+def test_g1_source_declares_the_original_shared_depth_topic():
+    source, _, _ = configured()
+    source.encode(Frames(), 1700000000130000000)
+    assert source.info()['topic_out'] == [
+        {'topic': '/g1/camera/rgbd/color', 'format': 'image/jpeg'},
+        {'topic': '/g1/camera/depth', 'format': 'image/depth-zlib'}]
+    assert source.info()['camera_info'][1]['topic'] == '/g1/camera/depth'
 
 
 def test_g1_parent_reports_sdk_failure_and_withdraws_stale_geometry():
@@ -162,19 +152,6 @@ def test_g1_zero_coefficient_depth_models_are_pinhole(model):
     source, _, _ = configured(model)
     source.encode(Frames(), 1700000000130000000)
     assert source.info()['state'] == 'ready'
-
-
-def test_first_rgbd_start_waits_for_source_metadata():
-    import time
-    tree=ast.parse((ROOT/'device.py').read_text())
-    node=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='RealSensePlugin')
-    namespace={'time':time}
-    exec(compile(ast.Module(body=[node],type_ignores=[]),str(ROOT/'device.py'),'exec'),namespace)
-    plugin=namespace['RealSensePlugin'].__new__(namespace['RealSensePlugin'])
-    statuses=iter([{'state':'unavailable','camera_info':[]}, {'state':'ready','camera_info':[{'schema':'motus.camera/1'}]}])
-    plugin._rgbd_info=lambda:next(statuses)
-    plugin.is_running=lambda:True
-    assert plugin.dispatch('start',{'_tool_name':'camera_rgbd'})['camera_info']
 
 
 def test_single_capture_profile_feeds_display_calibration_and_computational_source(monkeypatch):
@@ -208,7 +185,7 @@ def test_single_capture_profile_feeds_display_calibration_and_computational_sour
                  RS_COLOR_W=1920, RS_COLOR_H=1080, RS_COLOR_FPS=15)
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(ROOT/'device.py'), 'exec'), scope)
     node = NS(_pipeline=None, _worker_stop=NS(clear=lambda: None),
-              _depth_loop=lambda: None, _color_loop=lambda: None, _rgbd_loop=lambda: None,
+              _color_loop=lambda: None, _rgbd_loop=lambda: None,
               _on_frame=lambda frame: None, _rgbd_configured=False,
               _imu=NS(configure=lambda active: calls.append(('imu', active))),
               _rgbd=NS(configure=lambda active: calls.append(('rgbd', active))),
@@ -285,9 +262,12 @@ def test_g1_existing_ros_capture_owner_constructs_mount_with_optical_clock(monke
     init = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == '__init__')
     init.name = 'initialize'
     calls = []
+    topics = []
     class Node:
         def __init__(self, *args): pass
-        def create_publisher(self, *args): return NS()
+        def create_publisher(self, cls, topic, qos):
+            topics.append(topic)
+            return NS()
         def get_logger(self): return NS(info=lambda _: None)
     class Owner(Node):
         def _publish_imu(self, packet): pass
@@ -307,6 +287,9 @@ def test_g1_existing_ros_capture_owner_constructs_mount_with_optical_clock(monke
     assert calls == [(node, '/g1/camera/rgbd', dict(body_frame=expected,
                       camera_frame='camera_depth_optical_frame', clock_id='realsense_sdk_global_time_unix'))]
     assert node._rgbd.body_mount.declaration()['parent_frame'] == 'pelvis'
+    assert topics.count('/depth') == 1
+    assert '/g1/camera/rgbd/depth' not in topics
+    assert node._rgbd.depth_topic == '/depth'
 
 
 def actual_mount(monkeypatch, path, parent, child, clock, events):

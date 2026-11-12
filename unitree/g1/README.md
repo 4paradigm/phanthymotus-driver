@@ -95,11 +95,19 @@ python3 unitree/g1/main.py eth0
 
 ## RGB-D 里程计计算输入
 
-`camera_rgbd` 复用 `camera` 已有 RealSense 采集进程，输出 `/{namespace}/camera/rgbd/color`（JPEG）和 `/{namespace}/camera/rgbd/depth`（640×480、小端 uint16 毫米 zlib）。同时连接这两个端口到通用 RGB-D 里程计卡。已有 `camera_rgb`、`camera_depth` 显示流保持原样。
+计算输入使用已有 `camera_rgb`、`camera_depth` 和 `imu` 三张卡，移除独立 `camera_rgbd` 卡：
+
+- `camera_rgb` 保留原显示端口 `/{namespace}/camera/rgb`（1920×1080 JPEG），追加配准后的 `/{namespace}/camera/rgbd/color`（640×480 JPEG）计算端口；两个端口分别声明自己的真实 `camera_info`。
+- `camera_depth` 仍只有原端口 `/{namespace}/camera/depth`，同时供显示、通用 RGB-D 里程计和 Point Cloud 使用。其内容现在统一为校正后的 640×480、小端 uint16 轴向毫米 zlib，零值无效；不再另发 `/camera/rgbd/depth`，也不再编码原始 Z16 为显示深度。
+- `imu` 保留 `/{namespace}/state/imu` 的机体 `data/json`，追加明确命名的 `camera_imu` 可选 `sensor/imu` 端口；两者不能替代。
+
+迁移旧画布时，把 `camera_rgbd` 的 RGB 线移到 `camera_rgb` 的第二个端口，深度线移到 `camera_depth` 的唯一端口，可选运动线移到 `imu` 的 `camera_imu`。Point Cloud 与里程计必须连接同一深度端口，配准 RGB 与深度的声明共享真实 K、帧、时钟和来源标识。SLAM 使用里程计和带来源信息的实测 metric pointcloud；机体导航精度仍未验收。
+
+相机仅有一个 RealSense 采集进程。驱动启动采集不会自动激活所有卡片输出；分别启动需要的卡片，重复启动不重建采集进程。RGB/深度卡启动最多等待 10 秒取得本轮有效采集的计算标定；明确标定配置错误或采集退出会提前结束，短暂缺帧或采集时钟尚未就绪会继续等待，不把空声明当作计算就绪。停止一张卡只暂停该卡的图像或 IMU 输出，其他已启动卡继续工作；停止 IMU 卡同时暂停机体及相机 IMU 的公开输出，低状态接收、内部姿态缓存和电池、关节、主板遥测继续；重启会拒绝前一轮排队图像或旧运动样本。`vision_capture` 拍照或录像请求会按需启用现有 `camera_rgb` 显示输出，无需手动先启卡或等待计算标定；不会启用深度、距离或相机 IMU，也不会读取停卡前的旧缓存图像。整个 bundle 关闭时释放共享相机和缓存订阅。
 
 SDK 先把彩色图配准到深度光学平面，再用实测深度内参对两个图应用同一校正映射；输出声明共享 `camera_depth_optical_frame`、K 和零畸变。深度单位按 SDK 实际 `depth_scale` 换算，保留每张图自己的采集时间。仅接受 SDK `global_time`，不使用接收时间拟合偏移。两帧最大时间差 20 ms，重复、过期或未来时间会拒绝输出。
 
-`info` 仅在有效采集后返回 `motus.camera/1` 声明；缺少标定、时钟或数据失效时返回 `state=unavailable`、原因和空 `camera_info`。支持无畸变、标准 Brown，以及系数全零的 inverse/modified Brown 深度内参；其他模型明确不可用。当前仅完成离线验证，未执行实机验收。
+共享深度及配准 RGB 的 `info` 仅在有效采集后返回 `motus.camera/1` 声明；缺少标定、时钟或数据失效时，已启动深度卡返回 `state=unavailable`、原因和空 `camera_info`，共享显示深度也暂停，不回退到未校正图像或接收时间。原显示 RGB 仍使用独立的显示标定及接收时间声明，不能当作配准计算输入。支持无畸变、标准 Brown，以及系数全零的 inverse/modified Brown 深度内参；其他模型明确不可用。当前仅完成离线验证，未执行实机验收。
 
 相机实际支持 gyro 和 accel 时，同一采集管线还输出可选 `/{namespace}/camera/rgbd/imu`（`sensor/imu`，ROS `std_msgs/String` JSON，`motus.imu/1`）。仅在通用卡启用 IMU 辅助时连接此端口。原始角速度和加速度保留各自 SDK 坐标轴，随包携带实际 motion→depth 工厂旋转（SDK 列优先数组正确转换为行优先矩阵）、采集代次和与 RGB-D 完全一致的全局时钟标识；不提供虚构的姿态或机体安装关系。`imu_status` 独立报告可用性。驱动按实际 SDK motion profiles 探测，不假定 D435 含 IMU；不支持或 motion 启动失败会保留视频/RGB-D，后者使用同一管线重试视频配置。未执行相机硬件验证。
 
@@ -114,7 +122,7 @@ SDK 先把彩色图配准到深度光学平面，再用实测深度内参对两�
 
 ### 采集时刻机体与相机外参
 
-`camera_rgbd` 在原有 RGB、深度、IMU 三个端口后追加可选 `state/extrinsic` 端口 `/{namespace}/camera/rgbd/body_mount`。通用卡通过两个 `camera_info.vendor.body_mount` 自动发现该话题，无需手填矩阵。驱动使用相机现有 ROS 节点的 TF 缓冲区，按原始深度采集纳秒时间查询 `pelvis <- camera_depth_optical_frame`，并先于匹配图像发布 `motus.camera_mount/1` JSON。`CAMERA_BODY_FRAME` 只覆盖机体帧名，不能提供矩阵。活动腰关节导致的变换逐帧更新，不作为重新标定。
+配准 RGB 和共享深度的 `camera_info.vendor.body_mount` 自动声明可选 `state/extrinsic` 旁路话题 `/{namespace}/camera/rgbd/body_mount`，无需增加深度端口或手填矩阵。至少一张对应图像卡激活时，旁路才随有效图像采集发布。驱动使用相机现有 ROS 节点的 TF 缓冲区，按原始深度采集纳秒时间查询 `pelvis <- camera_depth_optical_frame`，并先于匹配图像发布 `motus.camera_mount/1` JSON。`CAMERA_BODY_FRAME` 只覆盖机体帧名，不能提供矩阵。活动腰关节导致的变换逐帧更新，不作为重新标定。
 
 `body_mount_status` 独立报告所选帧和 TF 可用性；缺少 TF 包、帧、该采集时刻的变换或发布失败时，视频、RGB-D、IMU 继续工作，不回退到 SDK 内部外参、URDF 猜测、恒等矩阵或最新 TF。ROS 节点仍使用现有域 42；没有验证实机 TF 是否在同一域中、是否含真实光学标定链或是否具备足够精度。容器增加标准 `tf2_ros` 依赖和构建时导入检查，本次未构建镜像或部署。主里程计仍以相机光学帧为参考；可用外参只支持另行标注的派生机体位姿。
 
@@ -137,3 +145,12 @@ and modeled position sigma limit0.10m; these are software/model thresholds,
 not measured robot accuracy. Source clock/mount identity must remain fixed.
 Only code/offline tests have been completed; hardware verification and
 deployment remain pending explicit user instruction.
+
+### Shared-depth RGB pixel consumers
+
+Consumers that combine RGB pixel coordinates with the shared depth must use
+`/<ns>/camera/rgbd/color` (the registered RGB port), not the unchanged display
+RGB. This also applies to VOP/Measure connections. If Measure overlays an RGB
+image, set its existing `camera_topic` to that registered RGB topic; its default
+`/camera/color` or `/camera/rgb` guess refers to the native display image.
+No camera-to-body matrix or guessed calibration is introduced by this wiring.

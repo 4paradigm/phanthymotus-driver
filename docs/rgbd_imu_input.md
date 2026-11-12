@@ -1,11 +1,14 @@
 # Camera IMU input for RGB-D assistance
 
-The optional third `camera_rgbd` output is `sensor/imu` on
-`std_msgs/msg/String`. This preserves the existing JSON format family; native
+The existing IMU card appends an optional, explicitly named `camera_imu`
+output (`sensor/imu` on `std_msgs/msg/String`). Its original display output
+retains its source: G1/Bumi body IMU is not replaced by camera IMU. Native
 `sensor_msgs/msg/Imu` is used only inside Perception's estimator session.
-Connect color and depth normally; connect this third output and set the
-Perception card's instance `imu_assisted=true` to request assistance. Default
-RGB-D operation does not require motion hardware.
+The original RGB card supplies registered color; the original depth card's
+single millimetre-depth output is shared by display, RGB-D odometry and
+Point Cloud. The standalone `camera_rgbd` card is retired. Connect the camera
+motion output and set `imu_assisted=true` on the Perception card to request
+assistance. Default RGB-D operation does not require motion hardware.
 
 Each JSON object has `schema: "motus.imu/1"` and the following fields:
 

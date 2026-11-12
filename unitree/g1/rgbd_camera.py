@@ -1,7 +1,7 @@
-"""G1 computation-only RGB-D from the existing RealSense capture owner.
+"""G1 shared calibrated RGB-D from the existing RealSense capture owner.
 
 SDK alignment supplies color in depth optical coordinates. The same inverse
-rectification map then samples both streams; display topics are untouched.
+rectification map then samples both streams for the shared depth topic.
 Only SDK global-time timestamps are accepted, never callback receipt times.
 """
 from copy import deepcopy
@@ -14,8 +14,9 @@ import numpy as np
 
 
 class RgbdSource:
-    def __init__(self, root, rs, *, body_mount=None):
+    def __init__(self, root, rs, *, body_mount=None, depth_topic=None):
         self.root, self.rs = root, rs
+        self.depth_topic = depth_topic or root.removesuffix('/rgbd') + '/depth'
         self.body_mount = body_mount
         self.mount_error = None
         self.geometry = None
@@ -66,7 +67,7 @@ class RgbdSource:
             raise ValueError('stale or future motion capture time')
         return stamp
 
-    def encode(self, frames, now_ns):
+    def encode(self, frames, now_ns, *, publish_mount=True):
         self.reason = 'waiting for valid capture'
         if self.geometry is None:
             raise ValueError('SDK calibration unavailable')
@@ -102,16 +103,20 @@ class RgbdSource:
         self.previous = stamps
         self.last_capture_ns = min(stamps)
         self.reason = None
-        if self.body_mount is not None:
-            try:
-                self.body_mount.publish(stamps[1])
-                self.mount_error = None
-            except Exception as error:
-                self.mount_error = str(error)
+        if publish_mount:
+            self.publish_mount(stamps[1])
         frame = 'camera_depth_optical_frame'
         return (dict(data=jpeg.tobytes(), stamp_ns=stamps[0], frame_id=frame, format='jpeg'),
                 dict(data=zlib.compress(mm.astype('<u2').tobytes(), 1), stamp_ns=stamps[1],
                      frame_id=frame, format='16UC1; compressedDepth zlib'))
+
+    def publish_mount(self, stamp_ns):
+        if self.body_mount is not None:
+            try:
+                self.body_mount.publish(stamp_ns)
+                self.mount_error = None
+            except Exception as error:
+                self.mount_error = str(error)
 
     def close(self):
         if self.body_mount is not None:
@@ -126,7 +131,7 @@ class RgbdSource:
             if mount is not None:
                 mount = dict(mount, status='unavailable', reason=self.mount_error)
         outputs = [dict(topic=self.root + '/color', format='image/jpeg'),
-                   dict(topic=self.root + '/depth', format='image/depth-zlib')]
+                   dict(topic=self.depth_topic, format='image/depth-zlib')]
         declarations = []
         if self.reason is None:
             common = dict(schema='motus.camera/1', id=self.root + '/rectified', width=640, height=480,

@@ -2217,6 +2217,8 @@ class _LowStateNode(Node):
         self._last_battery: dict = {}
         self._last_posture: dict = {}
         self._lock = threading.Lock()
+        self._imu_publish_lock = threading.RLock()
+        self._imu_enabled = True
         self._low_state = low_state
         self._last_lowstate_sample = None
         self._state_samples = 0
@@ -2265,7 +2267,9 @@ class _LowStateNode(Node):
 
         imu_out = String()
         imu_out.data = json.dumps(imu_data)
-        self._imu_pub.publish(imu_out)
+        with self._imu_publish_lock:
+            if self._imu_enabled:
+                self._imu_pub.publish(imu_out)
 
         # One 20 Hz timer; every second new sample publishes joints at 10 Hz.
         self._state_samples += 1
@@ -2388,6 +2392,7 @@ class StatePlugin:
     PREFIX = "state"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, *, low_state):
+        self._camera = None
         self._imu_topic       = f"/{namespace}/state/imu"
         self._battery_topic   = f"/{namespace}/state/battery"
         self._joints_topic    = f"/{namespace}/state/joints"
@@ -2420,13 +2425,17 @@ class StatePlugin:
         }
 
     def _imu_tool(self) -> dict:
+        camera = getattr(self, '_camera', None)
         return {
             "name": "imu",
             "type": "sensor",
             "multiInstance": False,
-            "description": f"G1 IMU sensor — quaternion, gyroscope, accelerometer, rpy, temperature. Publishes to {self._imu_topic}",
+            "description": f"G1 body IMU at {self._imu_topic}; optional camera_imu is a separate camera motion source.",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._imu_topic, "format": "data/json"}],
+            "topic_out": [{"topic": self._imu_topic, "format": "data/json"}] +
+                         ([camera.camera_imu_port()] if camera is not None else []),
+            "imu_status": (camera._rgbd_info()['imu_status'] if camera is not None else
+                           dict(state='unavailable', reason='camera plugin disabled')),
         }
 
     def _battery_tool(self) -> dict:
@@ -2475,6 +2484,19 @@ class StatePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if args.get('_tool_name') == 'imu':
+            camera = getattr(self, '_camera', None)
+            if action in ('info', 'start', 'stop', 'imu'):
+                # Share the publish lock so stop waits for an in-flight body
+                # packet, while low-state caching and sibling telemetry continue.
+                with self._node._imu_publish_lock:
+                    if action in ('start', 'stop'):
+                        self._node._imu_enabled = action == 'start'
+                        if camera is not None:
+                            camera.dispatch(action, {'_tool_name': 'imu'})
+                    state = 'running' if self._node._imu_enabled else 'idle'
+                tool = self._imu_tool()
+                return dict(state=state, topic_out=tool['topic_out'], imu_status=tool['imu_status'])
         if action == "posture":
             posture = self._node.get_posture()
             if not posture:
@@ -4157,15 +4179,16 @@ class _CameraFrameNode(Node):
                 "data": data,
                 "received_monotonic": time.monotonic(),
                 "frame_sequence": self._sequence,
+                "stamp_ns": msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec,
             }
             self._condition.notify_all()
 
-    def wait_for_frame(self, after_sequence=None, timeout_s=5.0):
+    def wait_for_frame(self, after_sequence=None, timeout_s=5.0, *, min_stamp_ns=0):
         deadline = time.monotonic() + max(0.0, timeout_s)
         with self._condition:
             while True:
                 frame = self._latest
-                if frame is not None and (
+                if frame is not None and frame['stamp_ns'] >= min_stamp_ns and (
                         after_sequence is None or self._sequence > after_sequence):
                     return dict(frame), self._sequence
                 remaining = deadline - time.monotonic()
@@ -4178,6 +4201,9 @@ class RealSensePlugin:
     PREFIX = "camera"
 
     def __init__(self, plugin_config: dict, namespace: str, executor):
+        import multiprocessing as mp
+        self._card_epochs = mp.get_context('spawn').Array('q', [0, 0, 0, 0])
+        self._lifecycle_lock = threading.RLock()
         self._namespace   = namespace
         self._color_topic = f"/{namespace}/camera/rgb"
         self._depth_topic = f"/{namespace}/camera/depth"
@@ -4194,14 +4220,14 @@ class RealSensePlugin:
         self._ensure_frame_node()
 
     def _camera_info(self, tool_name, topic, fmt):
-        """Declare the *negotiated* RGB/depth intrinsics, never a guessed K."""
+        """Declare the original display RGB profile, never a guessed K."""
         from camera_specs import declare
         with self._intrinsics_lock:
             profiles = {name: dict(value) for name, value in self._intrinsics.items()}
         return declare(tool_name, topic, fmt, profiles)
 
     def _adopt_intrinsics(self, payload, process=None):
-        """Single validated calibration source shared by card info and pointcloud."""
+        """Adopt negotiated profiles for the original display RGB declaration."""
         from camera_specs import validated_profiles
         profiles = validated_profiles(payload)
         with self._intrinsics_lock:
@@ -4242,7 +4268,7 @@ class RealSensePlugin:
         self._frame_node = node
 
     def get_tools(self) -> list:
-        return [self._color_tool(), self._depth_tool(), self._dist_tool(), self._rgbd_tool()]
+        return [self._color_tool(), self._depth_tool(), self._dist_tool()]
 
     def _rgbd_info(self):
         status_queue = self._rgbd_status_queue
@@ -4258,7 +4284,7 @@ class RealSensePlugin:
             status['reason'] = status.get('reason') or 'waiting for live calibrated RGB-D capture'
         root = f"/{self._namespace}/camera/rgbd"
         status['topic_out'] = [{'topic': root + '/color', 'format': 'image/jpeg'},
-                               {'topic': root + '/depth', 'format': 'image/depth-zlib'},
+                               {'topic': f'/{self._namespace}/camera/depth', 'format': 'image/depth-zlib'},
                                {'topic': root + '/imu', 'format': 'sensor/imu', 'optional': True},
                                {'topic': root + '/body_mount', 'format': 'state/extrinsic', 'optional': True}]
         status.setdefault('body_mount_status', dict(status='unavailable', reason='waiting for body mount source'))
@@ -4267,13 +4293,9 @@ class RealSensePlugin:
             imu.update(state='unavailable', reason=imu.get('reason') or 'motion capture stale')
         return status
 
-    def _rgbd_tool(self):
-        info = self._rgbd_info()
-        return {'name': 'camera_rgbd', 'type': 'sensor', 'multiInstance': False,
-                'description': 'Calibrated registered 640x480 RealSense RGB-D for computation; shares the camera capture process.',
-                'inputSchema': {'type': 'object', 'properties': {}},
-                'topic_out': info['topic_out'], 'camera_info': info.get('camera_info', []),
-                'imu_status': info['imu_status'], 'body_mount_status': info['body_mount_status']}
+    def camera_imu_port(self):
+        return dict(topic=f'/{self._namespace}/camera/rgbd/imu', format='sensor/imu',
+                    name='camera_imu', optional=True)
 
     def _color_tool(self) -> dict:
         return {
@@ -4282,8 +4304,12 @@ class RealSensePlugin:
             "multiInstance": False,
             "description": f"RealSense color camera — {RS_COLOR_W}x{RS_COLOR_H} JPEG @ {RS_COLOR_FPS}fps. Publishes CompressedImage to {self._color_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}],
-            "camera_info": self._camera_info("camera_rgb", self._color_topic, "image/jpeg"),
+            "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"},
+                          {"topic": f"/{self._namespace}/camera/rgbd/color", "format": "image/jpeg"}],
+            "camera_info": self._camera_info("camera_rgb", self._color_topic, "image/jpeg") +
+                           [entry for entry in self._rgbd_info().get('camera_info', [])
+                            if entry['format'] == 'image/jpeg'],
+            "body_mount_status": self._rgbd_info()['body_mount_status'],
         }
 
     def _depth_tool(self) -> dict:
@@ -4294,8 +4320,9 @@ class RealSensePlugin:
             "description": f"RealSense depth camera — {RS_DEPTH_W}x{RS_DEPTH_H} 16UC1 zlib (mm) @ {RS_DEPTH_FPS}fps. Publishes to {self._depth_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}],
-            "camera_info": self._camera_info("camera_depth", self._depth_topic,
-                                             "image/depth-zlib"),
+            "camera_info": [entry for entry in self._rgbd_info().get('camera_info', [])
+                            if entry['topic'] == self._depth_topic],
+            "body_mount_status": self._rgbd_info()['body_mount_status'],
         }
 
     def _dist_tool(self) -> dict:
@@ -4309,11 +4336,20 @@ class RealSensePlugin:
         }
 
     def start(self) -> None:
+        with self._lifecycle_lock:
+            self._start_owner()
+
+    def _start_owner(self):
         import multiprocessing as mp
         # A stopped plugin may be started again in the same driver process.
         self._ensure_frame_node()
         if self._proc is not None and self._proc.is_alive():
             return
+        with self._card_epochs.get_lock():
+            restarted_ns = time.time_ns()
+            for index, epoch in enumerate(self._card_epochs):
+                if epoch:
+                    self._card_epochs[index] = restarted_ns
         ctx = mp.get_context("spawn")
         receiver, sender = ctx.Pipe(duplex=False)
         with self._intrinsics_lock:
@@ -4321,7 +4357,7 @@ class RealSensePlugin:
         self._rgbd_status = None
         self._rgbd_status_queue = ctx.Queue(maxsize=2)
         process = ctx.Process(
-            target=run_realsense_process, args=(self._namespace, sender, self._rgbd_status_queue),
+            target=run_realsense_process, args=(self._namespace, sender, self._rgbd_status_queue, self._card_epochs),
             name="realsense", daemon=True,
         )
         try:
@@ -4340,6 +4376,12 @@ class RealSensePlugin:
         print(f"[bundle] RealSense capture forked → pid={process.pid}")
 
     def stop(self) -> None:
+        with self._lifecycle_lock:
+            self._stop_owner()
+
+    def _stop_owner(self):
+        with self._card_epochs.get_lock():
+            self._card_epochs[:] = [0, 0, 0, 0]
         process = self._proc
         self._proc = None
         if process is not None and process.is_alive():
@@ -4383,38 +4425,72 @@ class RealSensePlugin:
 
     def wait_for_color_frame(self, after_sequence=None, timeout_s=5.0):
         node = self._frame_node
-        if node is None:
+        epoch = self._card_epochs[0]
+        if node is None or not epoch:
             return None, 0
-        return node.wait_for_frame(after_sequence, timeout_s)
+        frame, sequence = node.wait_for_frame(after_sequence, timeout_s, min_stamp_ns=epoch)
+        if self._card_epochs[0] != epoch:
+            return None, sequence
+        return frame, sequence
+
+    def _start_card(self, index):
+        with self._lifecycle_lock:
+            self.start()  # Acquisition never activates sibling card outputs.
+            with self._card_epochs.get_lock():
+                if not self._card_epochs[index]:
+                    self._card_epochs[index] = time.time_ns()
+
+    def ensure_rgb_output(self):
+        """Enable display RGB for media without waiting for RGB-D calibration."""
+        self._start_card(0)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if args.get("_tool_name") == "camera_rgbd" and action in ("info", "start", "camera_rgbd"):
-            status = self._rgbd_info()
-            if action == "start":
-                deadline = time.monotonic() + 10.
-                while not status.get("camera_info") and self.is_running() and time.monotonic() < deadline:
-                    time.sleep(.05)
-                    status = self._rgbd_info()
-            return status
-        if action == "start":
-            return {"state": "running"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            tool_name = args.get('_tool_name', '')
-            if tool_name == 'camera_depth':
-                tool = self._depth_tool()
-            elif tool_name == 'camera_distance':
-                tool = self._dist_tool()
-            else:
-                tool = self._color_tool()
-            return {"state": "running", "topic_out": tool["topic_out"],
-                    **({"camera_info": tool["camera_info"]}
-                       if "camera_info" in tool else {})}
-        return None
+        name = args.get('_tool_name', 'camera_rgb')
+        indices = {'camera_rgb': 0, 'camera_depth': 1, 'camera_distance': 2, 'imu': 3}
+        if name not in indices:
+            return None
+        index = indices[name]
+        if action == 'start':
+            self._start_card(index)
+        elif action == 'stop':
+            # The child holds this same lock through publication: no output can
+            # escape after stop returns, even if encoding was already in flight.
+            with self._lifecycle_lock, self._card_epochs.get_lock():
+                self._card_epochs[index] = 0
+        elif action not in ('info', name):
+            return None
+        if action == 'start' and name in ('camera_rgb', 'camera_depth'):
+            epoch = self._card_epochs[index]
+            topic = (f'/{self._namespace}/camera/rgbd/color'
+                     if name == 'camera_rgb' else self._depth_topic)
+            deadline = time.monotonic() + 10.
+            while self._card_epochs[index] == epoch:
+                status = self._rgbd_info()
+                if (status.get('last_capture_ns', 0) >= epoch and
+                        any(entry['topic'] == topic for entry in status.get('camera_info', []))):
+                    break
+                if not self.is_running() or status.get('configuration_error'):
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(.05)
+        active = bool(self._card_epochs[index])
+        if name == 'imu':
+            return dict(state='running' if active else 'idle',
+                        topic_out=[self.camera_imu_port()], imu_status=self._rgbd_info()['imu_status'])
+        tool = {'camera_rgb': self._color_tool, 'camera_depth': self._depth_tool,
+                'camera_distance': self._dist_tool}[name]()
+        status = self._rgbd_info()
+        state = 'running' if active else 'idle'
+        if active and (name == 'camera_depth' or name == 'camera_rgb' and action == 'start'):
+            state = status['state']
+        return dict(state=state,
+                    topic_out=tool['topic_out'],
+                    **{key: tool[key] for key in ('camera_info', 'body_mount_status') if key in tool},
+                    **({'reason': status.get('reason')} if active and name in ('camera_rgb', 'camera_depth') else {}))
 
 
-def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_queue=None) -> None:
+def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_queue=None, card_epochs=None) -> None:
     """RealSense subprocess entry — independent GIL for full 1080p@15fps throughput.
 
     All heavy imports (cv2, numpy, pyrealsense2, sensor_msgs) happen here
@@ -4456,11 +4532,10 @@ def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_q
             self._dist_pub  = self.create_publisher(_String, dist_topic, _QOS)
 
             self._pipeline = None
+            self._capture_profile = None
+            self._imu_card_epoch = 0
             self._last_ts        = 0.0
             self._last_dist_time = 0.0
-
-            self._depth_q = queue.Queue(maxsize=1)
-            self._depth_worker = None
 
             self._color_q = queue.Queue(maxsize=1)
             self._color_worker = None
@@ -4470,16 +4545,17 @@ def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_q
             body_mount = BodyMountSource(self, root,
                 body_frame=os.environ.get('CAMERA_BODY_FRAME', 'pelvis'),
                 camera_frame='camera_depth_optical_frame', clock_id='realsense_sdk_global_time_unix')
-            self._rgbd = RgbdSource(root, rs, body_mount=body_mount)
+            self._rgbd = RgbdSource(root, rs, body_mount=body_mount, depth_topic=depth_topic)
             self._imu_pub = self.create_publisher(_String, root + '/imu', _QOS)
             self._imu = MotionSource(root + '/imu', 'camera_depth_optical_frame', rs,
                                      self._rgbd.motion_stamp, self._publish_imu,
                                      clock_id=lambda: 'realsense_sdk_global_time_unix')
-            self._rgbd_pubs = [self.create_publisher(CompressedImage, root + suffix, _QOS)
-                               for suffix in ('/color', '/depth')]
+            self._rgbd_pubs = [self.create_publisher(CompressedImage, root + '/color', _QOS),
+                               self._depth_pub]
             self._rgbd_q = queue.Queue(maxsize=1)
             self._rgbd_worker = None
             self._rgbd_configured = False
+            self._rgbd_configuration_error = None
             self._publish_rgbd_status()
 
             self.get_logger().info(
@@ -4503,13 +4579,11 @@ def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_q
             config.enable_stream(rs.stream.color, RS_COLOR_W, RS_COLOR_H, rs.format.bgr8, RS_COLOR_FPS)
 
             self._worker_stop.clear()
-            self._depth_worker = threading.Thread(target=self._depth_loop, name="rs_depth", daemon=True)
-            self._depth_worker.start()
             self._color_worker = threading.Thread(target=self._color_loop, name="rs_color", daemon=True)
             self._color_worker.start()
 
             # Request SDK mapping of hardware capture time to the system epoch.
-            # A sensor that cannot do this keeps display working; RGB-D stays gated.
+            # Unverified capture clocks gate shared depth and registered RGB.
             for sensor in devs[0].query_sensors():
                 try:
                     if sensor.supports(rs.option.global_time_enabled):
@@ -4525,17 +4599,19 @@ def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_q
                 except Exception as exc:
                     self._imu.unavailable(exc)
             self._pipeline = pipeline
+            self._capture_profile = profile
             try:
                 self._rgbd.configure(profile)
+                self._rgbd_configuration_error = None
                 self._rgbd_configured = True
                 self._rgbd_worker = threading.Thread(target=self._rgbd_loop, name="rs_rgbd", daemon=True)
                 self._rgbd_worker.start()
             except Exception as exc:
                 self._rgbd.reason = str(exc)
+                self._rgbd_configuration_error = str(exc)
                 self._publish_rgbd_status()
-            # G1 publishes raw UNALIGNED depth, so the depth K must come from
-            # the negotiated depth stream (not the RGB stream, unlike Bumi).
-            # This is calibration, not evidence of capture-time synchronization.
+            # The original display RGB keeps its independently negotiated K.
+            # Shared depth declarations come only from the rectified encoder.
             try:
                 from camera_specs import active_stream_profiles
                 profiles = active_stream_profiles(profile, rs)
@@ -4550,6 +4626,7 @@ def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_q
             self.get_logger().info(f"RealSense capture started — device {serial}")
 
         def stop_capture(self):
+            self._capture_profile = None
             if self._pipeline is not None:
                 try:
                     self._pipeline.stop()
@@ -4560,24 +4637,33 @@ def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_q
             if self._rgbd_worker is not None:
                 self._rgbd_worker.join(timeout=2.0)
                 self._rgbd_worker = None
-            if self._depth_worker is not None:
-                self._depth_worker.join(timeout=2.0)
-                self._depth_worker = None
             if self._color_worker is not None:
                 self._color_worker.join(timeout=2.0)
                 self._color_worker = None
             self.get_logger().info("RealSense capture stopped")
 
+        def _publish_for(self, card, message, capture_ns, publisher, *, acquired_ns=None):
+            index = {'camera_rgb': 0, 'camera_depth': 1, 'camera_distance': 2, 'imu': 3}[card]
+            if card_epochs is None:
+                return False
+            with card_epochs.get_lock():
+                epoch = card_epochs[index]
+                if not epoch or capture_ns < epoch or (acquired_ns is not None and acquired_ns < epoch):
+                    return False
+                publisher.publish(message)
+                return True
+
         def _publish_imu(self, packet):
             msg = _String()
             msg.data = json.dumps(packet, allow_nan=False)
-            self._imu_pub.publish(msg)
+            self._publish_for('imu', msg, min(packet['stamp_ns'], packet['accel_stamp_ns']), self._imu_pub)
 
         def _publish_rgbd_status(self):
             if rgbd_status_queue is None:
                 return
             status = self._rgbd.info()
             status['imu_status'] = self._imu.status()
+            status['configuration_error'] = self._rgbd_configuration_error
             try:
                 rgbd_status_queue.put_nowait(status)
             except queue.Full:
@@ -4590,48 +4676,31 @@ def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_q
         def _rgbd_loop(self):
             while not self._worker_stop.is_set():
                 try:
-                    frames = self._rgbd_q.get(timeout=0.5)
+                    frames, acquired_ns = self._rgbd_q.get(timeout=0.5)
                 except queue.Empty:
                     continue
                 try:
-                    pair = self._rgbd.encode(frames, time.time_ns())
-                    for pub, payload in zip(self._rgbd_pubs, pair):
-                        msg = CompressedImage()
-                        msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(payload['stamp_ns'], 1_000_000_000)
-                        msg.header.frame_id = payload['frame_id']
-                        msg.format, msg.data = payload['format'], payload['data']
-                        pub.publish(msg)
+                    pair = self._rgbd.encode(frames, time.time_ns(), publish_mount=False)
+                    # Publish capture-time sidecars before the matching pair,
+                    # under the same stop/restart lock as all card outputs.
+                    with card_epochs.get_lock():
+                        if any(epoch and min(acquired_ns, payload['stamp_ns']) >= epoch
+                               for epoch, payload in zip(card_epochs[:2], pair)):
+                            self._rgbd.publish_mount(pair[1]['stamp_ns'])
+                        for card, pub, payload in zip(('camera_rgb', 'camera_depth'), self._rgbd_pubs, pair):
+                            msg = CompressedImage()
+                            msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(payload['stamp_ns'], 1_000_000_000)
+                            msg.header.frame_id = payload['frame_id']
+                            msg.format, msg.data = payload['format'], payload['data']
+                            self._publish_for(card, msg, payload['stamp_ns'], pub, acquired_ns=acquired_ns)
                 except Exception as exc:
                     self._rgbd.reason = str(exc)
                 self._publish_rgbd_status()
 
-        def _depth_loop(self):
-            while not self._worker_stop.is_set():
-                try:
-                    depth_np, stamp = self._depth_q.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-                try:
-                    # zlib 压缩，不发原始 z16：640x480 的原始帧是 ~614 KB，DDS 序列化在 ARM64 上会打满 CPU，压缩后 ~10-15 KB。转换与 agibot/A3 的 _to_zlib 同形。
-                    import zlib as _zlib
-                    from sensor_msgs.msg import CompressedImage as _CI
-                    msg = _CI()
-                    msg.header.stamp = stamp
-                    msg.header.frame_id = "camera_depth_optical_frame"
-                    msg.format = "16UC1; compressedDepth zlib"
-                    # The size is the format's contract (640x480 little-endian
-                    # uint16 mm), not a field on the wire — the RealSense is
-                    # configured at exactly that, see RS_DEPTH_W/RS_DEPTH_H.
-                    msg.data = _zlib.compress(
-                        depth_np.astype("<u2", copy=False).tobytes(), 1)
-                    self._depth_pub.publish(msg)
-                except Exception as e:
-                    self.get_logger().error(f"[realsense] depth publish error: {e}")
-
         def _color_loop(self):
             while not self._worker_stop.is_set():
                 try:
-                    color_np, stamp = self._color_q.get(timeout=0.5)
+                    color_np, stamp, captured_ns = self._color_q.get(timeout=0.5)
                 except queue.Empty:
                     continue
                 try:
@@ -4642,13 +4711,25 @@ def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_q
                         cmsg.header.frame_id = "camera_color_optical_frame"
                         cmsg.format = "jpeg"
                         cmsg.data = jpg.tobytes()
-                        self._color_pub.publish(cmsg)
+                        self._publish_for('camera_rgb', cmsg, captured_ns, self._color_pub)
                 except Exception as e:
                     self.get_logger().error(f"[realsense] color publish error: {e}")
 
         def _on_frame(self, frame):
-            self._imu.on_frame(frame)
             try:
+                if card_epochs is not None:
+                    with card_epochs.get_lock():
+                        epoch = card_epochs[3]
+                        if epoch and self._capture_profile is not None:
+                            if self._imu_card_epoch != epoch:
+                                # A card restart needs a new gyro/accel pair and
+                                # epoch even when the shared video owner stays up.
+                                try:
+                                    self._imu.configure(self._capture_profile)
+                                except Exception as exc:
+                                    self._imu.unavailable(exc)
+                                self._imu_card_epoch = epoch
+                            self._imu.on_frame(frame)
                 if not frame.is_frameset():
                     return
                 fs = frame.as_frameset()
@@ -4656,12 +4737,13 @@ def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_q
                 depth_frame = fs.get_depth_frame()
                 if not color_frame and not depth_frame:
                     return
+                acquired_ns = time.time_ns()
                 if self._rgbd_configured and color_frame and depth_frame:
                     try:
                         self._rgbd_q.get_nowait()
                     except queue.Empty:
                         pass
-                    self._rgbd_q.put_nowait(fs)
+                    self._rgbd_q.put_nowait((fs, acquired_ns))
                 stamp = self.get_clock().now().to_msg()
 
                 if color_frame:
@@ -4670,7 +4752,7 @@ def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_q
                         self._color_q.get_nowait()
                     except queue.Empty:
                         pass
-                    self._color_q.put((color_np, stamp))
+                    self._color_q.put_nowait((color_np, stamp, acquired_ns))
 
                 dist = 0.0
                 if depth_frame:
@@ -4678,12 +4760,6 @@ def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_q
                         depth_frame.get_width() // 2,
                         depth_frame.get_height() // 2,
                     )
-                    depth_np = np.array(depth_frame.get_data())
-                    try:
-                        self._depth_q.get_nowait()
-                    except queue.Empty:
-                        pass
-                    self._depth_q.put((depth_np, stamp))
 
                 now = time.monotonic()
                 if now - self._last_dist_time >= RS_DIST_INTERVAL:
@@ -4692,7 +4768,7 @@ def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_q
                     self._last_ts = now
                     out = _String()
                     out.data = json.dumps({"distance_m": round(dist, 3), "fps": round(fps, 1)})
-                    self._dist_pub.publish(out)
+                    self._publish_for('camera_distance', out, acquired_ns, self._dist_pub)
                 else:
                     self._last_ts = now
             except Exception as e:
@@ -4885,6 +4961,9 @@ class VisionCapturePlugin:
             return self._precondition_error()
         path = None
         try:
+            if not self._camera_ready():
+                raise RuntimeError("G1 camera_rgb worker is unavailable")
+            self._camera.ensure_rgb_output()
             frame, _ = self._frame()
             directory = self._output_dir / "photos"
             directory.mkdir(parents=True, exist_ok=True)
@@ -5073,6 +5152,7 @@ class VisionCapturePlugin:
                 return {"ok": False, "code": "RECORD_IN_PROGRESS",
                         "message": "A video recording is already in progress",
                         "action_id": self._active_recording["action_id"]}
+            self._camera.ensure_rgb_output()
             action_id = f"vision_capture_record_video_{uuid4().hex}"
             active = {
                 "action_id": action_id, "state": "recording",

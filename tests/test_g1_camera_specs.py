@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 import sys
 import threading
+import queue
+import time
 
 import pytest
 
@@ -182,7 +184,7 @@ def _plugin_instance():
             pass
 
     namespace = dict(
-        threading=threading,
+        threading=threading, queue=queue, time=time,
         _CameraFrameNode=FrameCache,
         RS_COLOR_W=1920, RS_COLOR_H=1080, RS_COLOR_FPS=15,
         RS_DEPTH_W=640, RS_DEPTH_H=480, RS_DEPTH_FPS=15,
@@ -194,7 +196,7 @@ def _plugin_instance():
 def test_g1_card_info_and_tool_list_share_the_child_calibration():
     plugin = _plugin_instance()
     before = {t["name"]: t for t in plugin.get_tools()}
-    assert before["camera_depth"]["camera_info"][0]["K"] is None
+    assert before["camera_depth"]["camera_info"] == []
     assert before["camera_rgb"]["camera_info"][0]["K"] is None
 
     plugin._adopt_intrinsics(profiles())
@@ -203,7 +205,7 @@ def test_g1_card_info_and_tool_list_share_the_child_calibration():
     rgb_info = plugin.dispatch("info", {"_tool_name": "camera_rgb"})
     assert tools["camera_depth"]["camera_info"] == depth_info["camera_info"]
     assert tools["camera_rgb"]["camera_info"] == rgb_info["camera_info"]
-    assert depth_info["camera_info"][0]["K"][0] == 420.1
+    assert depth_info["camera_info"] == []  # Raw SDK K cannot describe shared rectified depth.
     assert rgb_info["camera_info"][0]["K"][0] == 1020.1
     assert tools["camera_depth"]["topic_out"] == [
         {"topic": "/ubuntu/camera/depth", "format": "image/depth-zlib"}]
@@ -212,18 +214,18 @@ def test_g1_card_info_and_tool_list_share_the_child_calibration():
 
     # Stop invalidates any previous camera calibration before a restart.
     plugin.stop()
-    assert plugin.dispatch("info", {"_tool_name": "camera_depth"})["camera_info"][0]["K"] is None
+    assert plugin.dispatch("info", {"_tool_name": "camera_depth"})["camera_info"] == []
 
 
 def test_old_child_calibration_is_not_allowed_to_replace_new_process():
     plugin = _plugin_instance()
-    old = object()
-    live = object()
+    old = NS(is_alive=lambda: True)
+    live = NS(is_alive=lambda: True)
     plugin._proc = live
     plugin._adopt_intrinsics(profiles(), old)
-    assert plugin.dispatch("info", {"_tool_name": "camera_depth"})["camera_info"][0]["K"] is None
+    assert plugin.dispatch("info", {"_tool_name": "camera_rgb"})["camera_info"][0]["K"] is None
     plugin._adopt_intrinsics(profiles(), live)
-    assert plugin.dispatch("info", {"_tool_name": "camera_depth"})["camera_info"][0]["K"] is not None
+    assert plugin.dispatch("info", {"_tool_name": "camera_rgb"})["camera_info"][0]["K"] is not None
     plugin._proc = None
 
 
@@ -248,5 +250,5 @@ def test_pipe_listener_transfers_profiles_to_parent():
     reader = Reader()
     plugin._receive_intrinsics(reader, proc)
     assert reader.closed is True
-    assert plugin.dispatch("info", {"_tool_name": "camera_depth"})["camera_info"][0]["K"][0] == 420.1
+    assert plugin.dispatch("info", {"_tool_name": "camera_rgb"})["camera_info"][0]["K"][0] == 1020.1
     plugin._proc = None
