@@ -66,8 +66,10 @@ USB port. Renumberable `/dev/videoN` indices are not saved as identities.
 
 ### Discovery and supported streams
 
-Discovery runs in an isolated process and refreshes periodically (three seconds
-between scans, with an eight-second scan deadline). Updated device choices are
+Discovery runs concurrently in one isolated process per backend and refreshes
+periodically (three seconds between scans, with an eight-second scan deadline).
+Missing SDKs, SDK crashes and timeouts are reported per backend; results from
+healthy backends are retained. Updated device choices are
 advertised through `tools/list`; reopen the settings after Agent Core refreshes
 the driver definition. `info` also reports `available_devices` and
 `discovery_errors`. Querying `info` does not start or restart capture.
@@ -146,6 +148,65 @@ RGB/depth remain **unaligned**. ROS timestamps use the host clock, with raw SDK
 timestamps reported separately when available; no hardware synchronization is
 claimed. Actual per-stream SDK intrinsics are exposed through `camera_info`;
 uncalibrated UVC optics remain unknown.
+
+### Adding a camera backend without changing Agent Core
+
+The shared acquisition contract is in `common/cameras/interface.py`; backend
+modules live under `common/cameras/backends/`. The registry discovers public
+modules automatically, without a central brand switch or imports of native
+SDKs in the body-controller process. Existing adapters are `realsense.py` and
+`uvc.py`; `wrist_camera_devices.py` retains compatibility imports for callers.
+
+To add a backend, create `common/cameras/backends/<backend_id>.py` exporting a
+`BACKEND` object whose `id` equals the module filename. Implement:
+
+| Interface | Contract |
+| --- | --- |
+| `BACKEND.discover()` | JSON-compatible device descriptors with stable `id`, `backend`, `name`, capabilities and native profiles |
+| `BACKEND.open(device, requested_mode)` | Open the requested native streams and return a capture object; reject unsupported requests |
+| `capture.info()` | `ActiveCameraInfo` containing actual native profiles, device name and known depth scale; unknown FPS/native format stays null |
+| `capture.read(timeout_ms)` | A channel-to-`CameraFrame` dictionary, or null for an ordinary timeout |
+| `capture.close()` | Release resources; repeat calls are safe |
+
+Descriptors retain the existing profile fields `width`, `height`, `fps` and
+`format` (a backend-native serializable format name). Device identities must
+stay stable across reboots, not follow `/dev/videoN` numbering. Where known,
+provide `physical_id` (for USB sysfs paths use `physical_usb_id`) so the registry
+can exclude a generic UVC alias of the same SDK-owned device. Never guess this
+identity from a camera name; exclude externally owned/head-camera devices from
+backend discovery. Descriptor identities, capabilities and native profile types
+are validated inside each discovery child; malformed adapters cannot break the
+shared device list. A failed backend preserves its cached descriptors and active
+capture, while still allowing ordinary capture-health recovery.
+
+`CameraFrame.data` is an owned/encoding-lifetime-safe NumPy array: RGB is HWC
+uint8 **BGR**; depth is HW uint16 or float32 with an explicit positive
+`depth_scale_m` in metres per unit. Borrowed SDK buffers must be copied or kept
+alive through encoding. Unknown calibration fields remain null; K-only calibration does not require
+inventing distortion coefficients. Known intrinsics describe
+the actual output geometry. Optional `timestamp_ms` and `timestamp_domain`
+retain the source clock; the common publisher continues to use the host ROS
+clock and does not claim clock synchronization. Invalid/nonfinite depths and
+values not representable as uint16 millimetres are published as zero.
+
+SDK imports and initialization belong inside `discover`/`open`, not at module
+import time. New adapters do not publish ROS topics, encode JPEG/zlib, interpret
+left/right, or implement card lifecycles: the shared worker/session handles
+those. Native read calls should honor the timeout where possible; the process
+watchdog remains the fallback for SDK calls that hang. The worker still requires
+the loopback DDS profile and preserves acknowledged stop/publication ordering.
+
+The existing image copies `common/`, so new backend modules are included on
+rebuild. Add required SDK wheels/system libraries to the driver's image build
+and dependency declarations; they are not automatically installed at runtime.
+Adding a backend still requires rebuilding the image and hardware verification.
+No other SDK backends are supplied by this refactor. Agent Core and its current
+640x480 depth-format/config-refresh limitations remain unchanged.
+
+Run the backend contracts and wrist suites, then test the actual device's
+startup, frame dimensions/units/calibration, independent shared-instance stops,
+SDK failures and unplug/replug. The common tests also exercise a third backend
+without modifying the shared capture loop or Agent Core.
 
 ### Runtime dependencies
 

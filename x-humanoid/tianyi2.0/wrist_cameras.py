@@ -12,7 +12,7 @@ import threading
 import time
 import zlib
 
-from wrist_camera_devices import discover_devices, select_profiles
+from common.cameras.registry import deduplicate_devices, discover_devices, get_backend, select_profiles
 
 WIDTH, HEIGHT, FPS = 640, 480, 15
 STARTUP_SECONDS, STALE_SECONDS = 12.0, 5.0
@@ -35,19 +35,12 @@ def camera_topic(namespace, instance_id, channel, side=None):
 def encode_depth_mm(depth, scale_m):
     """Headerless little-endian uint16 millimetres, without resizing or wrapping."""
     import numpy as np
-    if (depth.shape != (HEIGHT, WIDTH) or depth.dtype != np.uint16
-            or not np.isfinite(scale_m) or scale_m <= 0):
-        raise ValueError('Invalid Z16 layout or depth scale')
+    if (depth.shape != (HEIGHT, WIDTH) or depth.dtype not in (np.uint16, np.float32)
+            or scale_m is None or not np.isfinite(scale_m) or scale_m <= 0):
+        raise ValueError('Invalid depth layout or explicit depth scale')
     mm = np.rint(depth.astype(np.float64) * float(scale_m) * 1000.)
-    mm[(mm < 1) | (mm > 65535)] = 0
+    mm[~np.isfinite(mm) | (mm < 1) | (mm > 65535)] = 0
     return zlib.compress(mm.astype('<u2').tobytes(), 1)
-
-
-def _frame_intrinsics(frame):
-    intr = frame.profile.as_video_stream_profile().get_intrinsics()
-    return {'width': int(intr.width), 'height': int(intr.height),
-            'K': [float(intr.fx), 0., float(intr.ppx), 0., float(intr.fy), float(intr.ppy), 0., 0., 1.],
-            'D': [float(v) for v in intr.coeffs], 'sdk_distortion': str(intr.model)}
 
 
 def _report(status_queue, status):
@@ -74,11 +67,11 @@ def _capture_worker(namespace, device, profiles, quality, routes, control, stop_
                       RMW_IMPLEMENTATION='rmw_fastrtps_cpp', FASTRTPS_DEFAULT_PROFILES_FILE=DDS_PROFILE)
     route_lock = threading.Lock()
     routes = dict(routes)
-    pipe = cap = node = None
-    started = ros_started = False
+    capture = node = None
+    ros_started = False
     pubs = {}
     status = {'error': None, 'last_frame': {}, 'frames': {}, 'intrinsics': {},
-              'sdk_timestamp_ms': {}, 'depth_scale_m': None, 'device_name': device['name']}
+              'sdk_timestamp_ms': {}, 'timestamp_domains': {}, 'depth_scale_m': None, 'device_name': device['name']}
 
     def listen():
         # Starts before SDK initialization, so adding a second card during
@@ -105,80 +98,46 @@ def _capture_worker(namespace, device, profiles, quality, routes, control, stop_
         from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import CompressedImage
 
-        if device['backend'] == 'realsense':
-            import pyrealsense2 as rs
-            config = rs.config()
-            config.enable_device(device['serial'])
-            for channel, p in profiles.items():
-                config.enable_stream(rs.stream.color if channel == 'rgb' else rs.stream.depth,
-                                     p['width'], p['height'], getattr(rs.format, p['format']), p['fps'])
-            pipe = rs.pipeline()
-            active = pipe.start(config)
-            started = True
-            if 'depth' in profiles:
-                scale = float(active.get_device().first_depth_sensor().get_depth_scale())
-                if not np.isfinite(scale) or scale <= 0:
-                    raise RuntimeError('Camera returned invalid depth scale')
-                status['depth_scale_m'] = scale
-        else:
-            p = profiles['rgb']
-            cap = cv2.VideoCapture(device['path'], cv2.CAP_V4L2)
-            if not cap.isOpened():
-                raise RuntimeError('USB camera could not be opened')
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*p['format']))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, p['width'])
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, p['height'])
-            cap.set(cv2.CAP_PROP_FPS, p['fps'])
-            actual = (round(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), round(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-            if actual != (p['width'], p['height']):
-                raise RuntimeError(f'USB camera did not accept native resolution: {actual}')
-            actual_fps = cap.get(cv2.CAP_PROP_FPS)
-            if actual_fps > 0 and abs(actual_fps - p['fps']) > .5:
-                raise RuntimeError(f'USB camera did not accept frame rate: {actual_fps}')
+        capture = get_backend(device['backend']).open(device, profiles)
+        active = capture.info()
+        profiles = active.profiles
+        status.update(profiles=profiles, device_name=active.device_name,
+                      depth_scale_m=active.depth_scale_m)
 
         rclpy.init(domain_id=42)
         ros_started = True
         node = rclpy.create_node(f'tianyi_wrist_capture_{os.getpid()}')
         last_report, last_input = 0., time.monotonic()
         while not stop_event.is_set():
-            if pipe is not None:
-                try:
-                    frames = pipe.wait_for_frames(timeout_ms=1000)
-                except RuntimeError:
-                    if time.monotonic() - last_input >= STARTUP_SECONDS:
-                        raise RuntimeError('No camera frames received within timeout')
-                    continue
-                last_input = time.monotonic()
-                inputs = {'rgb': frames.get_color_frame()}
-                if 'depth' in profiles:
-                    inputs['depth'] = frames.get_depth_frame()
-            else:
-                ok, raw = cap.read()
-                if not ok:
-                    raise RuntimeError('USB camera read failed or device disconnected')
-                inputs = {'rgb': raw}
-            for channel, frame in inputs.items():
-                if stop_event.is_set() or frame is None or (pipe is not None and not frame):
-                    continue
-                if pipe is not None:
-                    if channel not in status['intrinsics']:
-                        status['intrinsics'][channel] = _frame_intrinsics(frame)
-                    raw = np.asanyarray(frame.get_data())
-                    status['sdk_timestamp_ms'][channel] = float(frame.get_timestamp())
-                else:
-                    raw = frame
+            frames = capture.read(timeout_ms=1000)
+            if not frames:
+                if time.monotonic() - last_input >= STARTUP_SECONDS:
+                    raise RuntimeError('No camera frames received within timeout')
+                continue
+            last_input = time.monotonic()
+            for channel, frame in frames.items():
+                if stop_event.is_set():
+                    break
+                if channel not in profiles:
+                    raise RuntimeError(f'Backend returned an unconfigured {channel} stream')
+                raw = frame.data
+                if frame.intrinsics is not None:
+                    status['intrinsics'][channel] = frame.intrinsics
+                if frame.timestamp_ms is not None:
+                    status['sdk_timestamp_ms'][channel] = frame.timestamp_ms
+                status['timestamp_domains'][channel] = frame.timestamp_domain
                 p = profiles[channel]
                 shape = (p['height'], p['width'], 3) if channel == 'rgb' else (p['height'], p['width'])
-                if raw.shape != shape or raw.dtype != (np.uint8 if channel == 'rgb' else np.uint16):
+                if raw.shape != shape or raw.dtype not in ((np.uint8,) if channel == 'rgb' else (np.uint16, np.float32)):
                     raise RuntimeError(f'Unexpected {channel} frame layout')
                 if channel == 'rgb':
-                    bgr = cv2.cvtColor(raw, cv2.COLOR_RGB2BGR) if pipe is not None and p['format'] == 'rgb8' else raw
-                    ok, encoded = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                    ok, encoded = cv2.imencode('.jpg', raw, [cv2.IMWRITE_JPEG_QUALITY, quality])
                     if not ok:
                         raise RuntimeError('Camera JPEG encoding failed')
                     payload, fmt = encoded.tobytes(), 'jpeg'
                 else:
-                    payload, fmt = encode_depth_mm(raw, scale), '16UC1; compressedDepth zlib'
+                    status['depth_scale_m'] = frame.depth_scale_m
+                    payload, fmt = encode_depth_mm(raw, frame.depth_scale_m), '16UC1; compressedDepth zlib'
                 with route_lock:
                     if stop_event.is_set():
                         break
@@ -207,13 +166,11 @@ def _capture_worker(namespace, device, profiles, quality, routes, control, stop_
     finally:
         stop_event.set()
         listener.join(timeout=.2)
-        if started:
+        if capture is not None:
             try:
-                pipe.stop()
+                capture.close()
             except Exception:
                 pass
-        if cap is not None:
-            cap.release()
         if node is not None:
             try:
                 node.destroy_node()
@@ -330,7 +287,7 @@ class WristCameraSession:
             requested = self._requested_at.get(instance_id, now)
             streams, calibration = {}, []
             for channel in CHANNELS:
-                p = self.profiles.get(channel)
+                p = self._status.get('profiles', self.profiles).get(channel)
                 if p is None:
                     streams[channel] = {'state': 'unavailable', 'error': None,
                                         'message': 'This device has no native depth stream'}
@@ -347,14 +304,15 @@ class WristCameraSession:
                     'width': p['width'], 'height': p['height'], 'fps': p['fps'],
                     'frames_published': self._status.get('frames', {}).get(channel, 0),
                     'last_frame_age_s': None if last is None else max(0., now - last),
-                    'sdk_timestamp_ms': self._status.get('sdk_timestamp_ms', {}).get(channel)}
+                    'sdk_timestamp_ms': self._status.get('sdk_timestamp_ms', {}).get(channel),
+                    'timestamp_domain': self._status.get('timestamp_domains', {}).get(channel, 'unknown')}
                 intr = self._status.get('intrinsics', {}).get(channel)
                 calibration.append(build(topic=camera_topic(self.namespace, instance_id, channel, side),
                     id=f"{self.device['backend']}/{self.device['name']}/{channel}", format=FORMATS[channel],
-                    width=p['width'], height=p['height'], K=intr['K'] if intr else None,
-                    D=intr['D'] if intr else None, distortion_model='unknown',
-                    source='vendor-spec' if intr else 'unknown', pipeline=[self.device['backend']],
-                    vendor={'sdk_distortion': intr['sdk_distortion']} if intr else {}))
+                    width=p['width'], height=p['height'], K=intr.get('K') if intr else None,
+                    D=intr.get('D') if intr else None, distortion_model='unknown',
+                    source=intr.get('source', 'vendor-spec') if intr and intr.get('K') is not None else 'unknown', pipeline=[self.device['backend']],
+                    vendor={'sdk_distortion': intr.get('sdk_distortion')} if intr else {}))
             errors = [v['error'] for v in streams.values() if v.get('error')]
             state = 'error' if errors else 'loading' if any(v['state'] == 'loading' for v in streams.values()) else 'running'
             return {'state': state, 'error': '; '.join(errors) or None, 'side': side, 'streams': streams,
@@ -484,16 +442,16 @@ class WristCameraPlugin:
                 return
             self._discovery_errors = result['errors']
             # An SDK scan failure is not proof that a running device vanished.
-            failed_backends = {'realsense' for error in result['errors'] if error.startswith('RealSense discovery:')}
-            if any(error.startswith('UVC discovery') for error in result['errors']):
-                failed_backends.add('uvc')
+            failed_backends = set(result.get('failed_backends', []))
+            failed_backends.update(d['backend'] for d in self._devices
+                if any(error.lower().startswith(f"{d['backend']} discovery") for error in result['errors']))
             if result['errors'] and not result['devices'] and not failed_backends:
                 # Preserve cached identities on an inconclusive scan, but still
                 # service crashed/stalled captures below.
                 devices = self._devices
             else:
                 devices = result['devices'] + [d for d in self._devices if d['backend'] in failed_backends]
-            self._devices = list({d['id']: d for d in devices}.values())
+            self._devices = deduplicate_devices(devices)
             present = {d['id'] for d in self._devices}
             for device_id in list(self._sessions):
                 session = self._sessions[device_id]

@@ -48,7 +48,7 @@ def test_requested_unsupported_profile_is_not_silently_replaced():
 
 
 def test_realsense_enumerates_rgbd_profiles_without_d405_whitelist():
-    m = module()
+    m = importlib.import_module('common.cameras.backends.realsense')
     class Profile:
         def __init__(self, stream, format):
             self.stream, self.fmt = stream, format
@@ -67,7 +67,7 @@ def test_realsense_enumerates_rgbd_profiles_without_d405_whitelist():
 
 
 def test_v4l2_groups_interfaces_skips_metadata_and_vendor_owned_cameras(monkeypatch, tmp_path):
-    m = module()
+    m = importlib.import_module('common.cameras.backends.uvc')
     nodes = [str(tmp_path / f'video{i}') for i in range(4)]
     for p in nodes: Path(p).touch()
     linkdir = tmp_path / 'by-id'
@@ -91,7 +91,7 @@ def test_v4l2_groups_interfaces_skips_metadata_and_vendor_owned_cameras(monkeypa
 
 
 def test_v4l2_does_not_claim_head_orbbec_camera(monkeypatch, tmp_path):
-    m = module()
+    m = importlib.import_module('common.cameras.backends.uvc')
     p = tmp_path / 'video0'
     p.touch()
     monkeypatch.setattr(m.subprocess, 'check_output', lambda *a, **k: 'Card type : Orbbec Gemini\nDevice Caps : 0x1\nVideo Capture\n')
@@ -99,7 +99,7 @@ def test_v4l2_does_not_claim_head_orbbec_camera(monkeypatch, tmp_path):
 
 
 def test_uvc_identity_and_interface_survive_video_node_renumbering(monkeypatch, tmp_path):
-    m = module()
+    m = importlib.import_module('common.cameras.backends.uvc')
     linkdir = tmp_path / 'by-id'
     linkdir.mkdir()
     first, second = linkdir / 'usb-camera-video-index0', linkdir / 'usb-camera-video-index1'
