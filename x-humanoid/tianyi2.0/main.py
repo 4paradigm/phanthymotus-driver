@@ -175,7 +175,7 @@ def _ensure_remote_auto_self_check(cfg: dict) -> None:
 
 
 def _probe_remote_mics(cfg: dict) -> list[dict]:
-    """SSH probe remote hosts for audio devices, deploy & start audio_sender, return device list."""
+    """Probe each configured remote mic host; see ext_devices.probe_remote_host."""
     ext_mic_cfg = cfg.get("plugins", {}).get("ext_mic", {})
     if not ext_mic_cfg.get("enabled", False):
         return []
@@ -185,132 +185,17 @@ def _probe_remote_mics(cfg: dict) -> list[dict]:
         ssh_host = src.get("ssh_host")
         if not ssh_host:
             continue
-        ssh_user = src.get("ssh_user", "ubuntu")
-        ssh_pass = src.get("ssh_password", "")
-        port = src.get("port", 9800)
-        sender_path = src.get("sender_path", "/home/ubuntu/audio_sender.py")
-
-        def _ssh(cmd: str, timeout: int = 10, _host=ssh_host, _user=ssh_user, _pass=ssh_pass):
-            return subprocess.run(
-                ["sshpass", "-p", _pass, "ssh",
-                 "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=3",
-                 f"{_user}@{_host}", cmd],
-                capture_output=True, text=True, timeout=timeout)
-
-        # Step 1: Probe remote audio devices
-        try:
-            result = _ssh("arecord -l 2>&1")
-            devices = _parse_arecord_output(result.stdout)
-        except Exception as e:
-            print(f"[ext_mic/probe] {ssh_host}: SSH probe failed: {e}")
-            continue
-
-        if not devices:
-            print(f"[ext_mic/probe] {ssh_host}: no capture devices found")
-            continue
-
-        # Step 1.5: Probe hw params for each device
-        for dev in devices:
-            try:
-                hw_result = _ssh(
-                    f"arecord -D hw:{dev['card']},{dev['device']} --dump-hw-params -d 1 /dev/null 2>&1")
-                hw_info = _parse_hw_params(hw_result.stdout + hw_result.stderr)
-                dev.update(hw_info)
-            except Exception:
-                dev.setdefault("format", "S16_LE")
-                dev.setdefault("rate", 16000)
-                dev.setdefault("channels", 1)
-
-        # Step 2: Deploy audio_sender.py if missing
-        try:
-            check = _ssh(f"test -f {sender_path} && echo EXISTS")
-            if "EXISTS" not in (check.stdout or ""):
-                local_src = str(Path(__file__).parent / "audio_sender.py")
-                subprocess.run(
-                    ["sshpass", "-p", ssh_pass, "scp",
-                     "-o", "StrictHostKeyChecking=no",
-                     local_src, f"{ssh_user}@{ssh_host}:{sender_path}"],
-                    check=True, timeout=15)
-                print(f"[ext_mic/probe] {ssh_host}: deployed audio_sender.py")
-        except Exception as e:
-            print(f"[ext_mic/probe] {ssh_host}: deploy failed: {e}")
-
-        # Step 3: Verify audio_sender is healthy (not just alive) via TCP data probe
-        primary_card = devices[0]["card"]
-        healthy = False
-        try:
-            probe_cmd = (
-                f"python3 -c \""
-                f"import socket,sys;"
-                f"s=socket.socket();"
-                f"s.settimeout(3);"
-                f"s.connect(('127.0.0.1',{port}));"
-                f"d=s.recv(1024);"
-                f"s.close();"
-                f"sys.exit(0 if len(d)>0 else 1)\""
-            )
-            check = _ssh(probe_cmd, timeout=10)
-            healthy = (check.returncode == 0)
-        except Exception:
-            pass
-
-        if not healthy:
-            # Kill existing (might be zombie) + restart
-            try:
-                _ssh("pkill -9 -f audio_sender.py 2>/dev/null")
-            except Exception:
-                pass
-            time.sleep(3)  # wait for ALSA device release
-            # Deploy audio_sender.py if missing
-            try:
-                check = _ssh(f"test -f {sender_path} && echo EXISTS")
-                if "EXISTS" not in (check.stdout or ""):
-                    local_src = str(Path(__file__).parent / "audio_sender.py")
-                    subprocess.run(
-                        ["sshpass", "-p", ssh_pass, "scp",
-                         "-o", "StrictHostKeyChecking=no",
-                         local_src, f"{ssh_user}@{ssh_host}:{sender_path}"],
-                        check=True, timeout=15)
-                    print(f"[ext_mic/probe] {ssh_host}: deployed audio_sender.py")
-            except Exception as e:
-                print(f"[ext_mic/probe] {ssh_host}: deploy failed: {e}")
-            # Start fresh
-            _ssh(f"nohup python3 {sender_path} --port {port} --card {primary_card} "
-                 f"> /tmp/audio_sender.log 2>&1 &")
-            time.sleep(2)
-            verify = _ssh("pgrep -f audio_sender.py")
-            if verify.returncode == 0 and verify.stdout.strip():
-                pid = verify.stdout.strip().splitlines()[0]
-                print(f"[ext_mic/probe] {ssh_host}: restarted audio_sender (pid={pid}, card={primary_card}, port={port})")
-            else:
-                print(f"[ext_mic/probe] {ssh_host}: WARNING: audio_sender did not start")
-        else:
-            check = _ssh("pgrep -f audio_sender.py")
-            pid = check.stdout.strip().splitlines()[0] if check.stdout.strip() else "?"
-            print(f"[ext_mic/probe] {ssh_host}: audio_sender healthy (pid={pid})")
-
-        # Step 4: Build device list entries (name includes format info)
-        for dev in devices:
-            fmt_desc = f"{dev.get('format', '?')}/{dev.get('rate', '?')}Hz/{dev.get('channels', '?')}ch"
-            results.append({
-                "index": f"tcp://{ssh_host}:{port}/pcm16k",
-                "alsa_id": f"tcp://{ssh_host}:{port}/pcm16k",
-                "name": f"{dev['name']} ({fmt_desc}) @ {ssh_host}",
-                "network": True,
-                "_ssh_host": ssh_host,
-                "_ssh_user": ssh_user,
-                "_ssh_pass": ssh_pass,
-                "_ssh_card": str(dev["card"]),
-                "_ssh_script": sender_path,
-                "_port": port,
-            })
-
-        print(f"[ext_mic/probe] {ssh_host}: found {len(devices)} device(s)")
-
+        results += probe_remote_host(
+            ssh_host,
+            src.get("ssh_user", "ubuntu"),
+            src.get("ssh_password", ""),
+            port=src.get("port", DEFAULT_SENDER_PORT),
+            script=src.get("sender_path", DEFAULT_SENDER_PATH),
+        )
     return results
 
 
-from ext_devices import _parse_arecord_output, _parse_hw_params
+from ext_devices import DEFAULT_SENDER_PATH, DEFAULT_SENDER_PORT, probe_remote_host
 
 
 def _resolve_namespace(cfg: dict) -> str:

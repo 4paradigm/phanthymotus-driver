@@ -56,20 +56,31 @@ from common.control.sink import Verdict  # noqa: E402
 class FakeClient:
     """Stands in for RpcProxy. Records instead of moving."""
 
-    def __init__(self, fsm=loco_servo.STANDING_FSM, fsm_code=0):
+    def __init__(self, fsm=loco_servo.STANDING_FSM, fsm_code=0, stop_ret=0):
         self.moves = []
+        self.durations = []
         self.stops = 0
         self.fsm_reads = 0
         self._fsm = fsm
         self._fsm_code = fsm_code
+        self._stop_ret = stop_ret
 
-    def Move(self, vx, vy, vyaw, _flag=True):
+    def SetVelocity(self, vx, vy, vyaw, duration=1.0):
         self.moves.append((vx, vy, vyaw))
+        self.durations.append(duration)
         return 0
+
+    def Move(self, vx, vy, vyaw, continous_move=False):
+        # In the H2 LocoClient R1 loads, `continous_move=True` is a ten-day
+        # duration. The card must never reach for it; see COMMAND_LEASE_S.
+        raise AssertionError("loco_servo called Move(); it must use SetVelocity "
+                             "with a bounded duration")
 
     def StopMove(self):
         self.stops += 1
-        return 0
+        if isinstance(self._stop_ret, Exception):
+            raise self._stop_ret
+        return self._stop_ret
 
     def GetFsmId(self):
         self.fsm_reads += 1
@@ -197,6 +208,45 @@ def test_hold_commands_a_stop_rather_than_doing_nothing():
     card = _card(client)
     card._hold()
     assert client.stops == 1
+
+
+def test_every_velocity_carries_a_bounded_duration():
+    """`Move(..., True)` on R1's H2 LocoClient sends `duration=864000` — ten
+    days. Then StopMove is the only thing that ever ends a motion, and a stop
+    lost to an RPC timeout or a dead driver leaves the robot walking. A short
+    duration renewed by every command makes the controller the backstop."""
+    client = FakeClient()
+    card = _card(client)
+    _sink(card).submit(_command([0.2, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    assert client.durations == [loco_servo.COMMAND_LEASE_S]
+    # Past the watchdog, or a live stream would stutter between commands; and
+    # short — seconds, not the SDK's "continuous".
+    assert loco_servo.WATCHDOG_MS / 1000 < loco_servo.COMMAND_LEASE_S <= 2.0
+
+
+@pytest.mark.parametrize("stop_ret", [3104, None, RuntimeError("rpc gone")])
+def test_a_stop_the_robot_did_not_confirm_is_visible(stop_ret):
+    """The return code used to be discarded, so a lost stop looked exactly like
+    a delivered one. It must survive the stream recovering, which resets
+    `sdk_errors` — hence a counter of its own."""
+    client = FakeClient(stop_ret=stop_ret)
+    card = _card(client)
+    card._hold()
+    info = card._info()
+    assert info["stop_failures"] == 1
+    assert info["last_stop_ret"] == (stop_ret if isinstance(stop_ret, int) else None)
+
+    client._stop_ret = 0
+    _sink(card).submit(_command([0.2, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    card._hold()
+    assert card._info()["stop_failures"] == 1, "a later good stop does not erase it"
+    assert card._info()["last_stop_ret"] == 0
+
+
+def test_a_confirmed_stop_is_not_a_failure():
+    card = _card(FakeClient())
+    card._hold()
+    assert card._info()["stop_failures"] == 0
 
 
 def test_dry_run_reaches_neither_move_nor_stop():
