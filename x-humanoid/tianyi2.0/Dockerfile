@@ -6,6 +6,7 @@ ARG TARGETARCH
 
 WORKDIR /work
 
+# The ARM64 RealSense wheel links libusb-1.0.so.0; ros-base does not supply it.
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
@@ -15,14 +16,17 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         curl \
         espeak-ng \
         alsa-utils \
+        v4l-utils \
         libasound2-dev \
         sshpass \
-        openssh-client && \
+        openssh-client \
+        libusb-1.0-0 && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml numpy opencv-python-headless phonemizer pyalsaaudio sounddevice \
-    deflate==0.9.0
+COPY requirements.txt /work/requirements.txt
+# Use the prebuilt RealSense wheel; never compile the native SDK in this image.
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --only-binary=pyrealsense2 \
+    -r /work/requirements.txt
 
 # Build tianyi ROS2 message packages (bodyctrl_msgs + lyre_msgs)
 COPY msgs/ /tianyi_ws/src/
@@ -51,7 +55,7 @@ RUN sh /tmp/tianyi-loco-sdk-src/build_sdk.sh "${TARGETARCH:-$(uname -m)}" && \
 
 COPY resource/ /work/resource/
 COPY common/ /work/common/
-COPY main.py device.py servo.py joints_bridge.py light.py nav_client.py loco_state.py loco_servo.py loco_servo_process.py slamtec_velocity.py ext_devices.py audio_sender.py config.yaml driver.yaml controlled_spatial.py controlled_spatial_map.py socket_bridge.py bridge_integration.py bridged_publisher.py /work/
+COPY main.py device.py wrist_cameras.py wrist_camera_devices.py servo.py joints_bridge.py light.py nav_client.py loco_state.py loco_servo.py loco_servo_process.py slamtec_velocity.py ext_devices.py audio_sender.py config.yaml driver.yaml controlled_spatial.py controlled_spatial_map.py socket_bridge.py bridge_integration.py bridged_publisher.py /work/
 COPY dds-local.xml /opt/phanthy-motus/
 COPY deploy/     /deploy/
 RUN mkdir -p /opt/phanthy-motus/data/maps

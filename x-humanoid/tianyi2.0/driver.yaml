@@ -6,7 +6,7 @@ hardware_model: "tianyi2.0"
 image_name: tianyi2
 port: 15707
 mcp_url: "http://localhost:15707/mcp"
-description: "天轶2.0 Pro — 35DOF 人形机器人 (轮式底盘 + 双臂 + 灵巧手 + 头部 + 导航)"
+description: "天轶2.0 Pro — 35DOF 人形机器人 (轮式底盘 + 双臂 + 灵巧手 + 头部 + 导航 + 腕部 USB RGB/深度相机)"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
@@ -21,6 +21,7 @@ cards:
   - { name: force_sensor,       type: sensor }
   - { name: model,              type: resource }
   - { name: camera_head,        type: sensor }
+  - { name: wrist_camera,       type: sensor }
   - { name: imu,                type: sensor }
   - { name: camera_depth,       type: sensor }
   - { name: camera_pointcloud,  type: sensor }
