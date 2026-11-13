@@ -45,7 +45,8 @@ std::string quoted(const std::string& value) {
   return out.str();
 }
 
-void write_array(std::ostream& out, const char* name, const fr3::Joints& values) {
+template <size_t N>
+void write_array(std::ostream& out, const char* name, const std::array<double, N>& values) {
   out << '"' << name << "\":[";
   for (std::size_t i = 0; i < values.size(); ++i) {
     if (i != 0) out << ',';
@@ -135,6 +136,8 @@ class RobotLock {
 struct Sample {
   fr3::Joints q{}, q_d{}, dq{}, tau{};
   int mode = 0;
+  std::array<double, 16> O_T_EE{};
+  std::array<double, 16> F_T_EE{};
 };
 
 // Single SDK producer, single stdout consumer. A full queue drops telemetry;
@@ -194,7 +197,7 @@ class Session {
   void sample(const franka::RobotState& state) {
     const auto now = Clock::now();
     if (now < next_sample_) return;
-    samples_.push({state.q, state.q_d, state.dq, state.tau_J, static_cast<int>(state.robot_mode)});
+    samples_.push({state.q, state.q_d, state.dq, state.tau_J, static_cast<int>(state.robot_mode), state.O_T_EE, state.F_T_EE});
     next_sample_ = now + std::chrono::microseconds(33333);
   }
 
@@ -225,6 +228,10 @@ class Session {
           write_array(std::cout, "q_d", current.q_d); std::cout << ',';
           write_array(std::cout, "dq", current.dq); std::cout << ',';
           write_array(std::cout, "tau_J", current.tau);
+          std::cout << ',';
+          write_array(std::cout, "O_T_EE", current.O_T_EE);
+          std::cout << ',';
+          write_array(std::cout, "F_T_EE", current.F_T_EE);
           std::cout << ",\"robot_mode\":" << current.mode
                     << ",\"capabilities\":[\"joint_position\"],";
           write_realtime(std::cout, rt_);
@@ -363,7 +370,7 @@ class Session {
         if (!stationary(initial)) throw std::runtime_error("Robot must be idle and stationary before motion");
         // A start based on desired positions avoids the discontinuity caused by
         // commanding a measured position that differs from the SDK's q_d.
-        fr3::Trajectory trajectory(initial.q_d, command);
+        fr3::PathTrajectory trajectory(initial.q_d, command);
         double elapsed = 0.0;
         bool first = true;
         event("motion", command.id, "running", "", &command.target);
@@ -417,7 +424,10 @@ class Session {
         settled = stationary(state);
         if (settled && (cancelled_ || *error <= command.tolerance)) break;
         if (static_cast<bool>(state.current_errors)) {
-          failure = "Robot reports motion errors; inspect Desk before retrying";
+          std::ostringstream details;
+          details << state.current_errors;
+          const std::string errors = "Robot motion errors: " + details.str();
+          failure = failure.empty() ? errors : failure + "; " + errors;
           break;
         }
       } while (Clock::now() < deadline);

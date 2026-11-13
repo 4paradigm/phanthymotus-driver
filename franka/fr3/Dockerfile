@@ -109,6 +109,7 @@ ARG PYPI_MIRROR=https://pypi.org/simple/
 RUN python3 -m pip install --no-cache-dir --only-binary=:all: -i ${PYPI_MIRROR} \
     numpy==1.23.5 opencv-python-headless==4.11.0.86 pyrealsense2==2.56.5.9235
 COPY resource/ /work/franka/fr3/resource/
+COPY pick_place/ /work/franka/fr3/pick_place/
 COPY deploy/ /deploy/
 
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp \

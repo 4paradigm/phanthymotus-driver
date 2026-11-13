@@ -7,6 +7,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
+#include <memory>
 
 namespace fr3 {
 using Joints = std::array<double, 7>;
@@ -24,6 +26,7 @@ struct Command {
   double tolerance = 0.0;
   double timeout = 0.0;
   Joints target{};
+  std::vector<Joints> path;
 };
 
 inline bool valid_id(const std::string& id) {
@@ -54,11 +57,22 @@ inline Command parse_command(const std::string& line) {
       throw std::invalid_argument("Invalid command ID");
     }
   }
-  if (command.action == "MOVE") {
+  if (command.action == "MOVE" || command.action == "PATH") {
     if (!(input >> command.speed >> command.tolerance >> command.timeout)) {
       throw std::invalid_argument("MOVE requires speed, tolerance and timeout");
     }
-    for (auto& q : command.target) {
+    if (command.action == "PATH") {
+      int count = 0;
+      if (!(input >> count) || count < 2 || count > 21)
+        throw std::invalid_argument("PATH requires 2 to 21 control points");
+      command.path.resize(count);
+      for (auto& point : command.path) {
+        for (auto& q : point)
+          if (!(input >> q)) throw std::invalid_argument("Incomplete PATH control point");
+        validate_joints(point);
+      }
+      command.target = command.path.back();
+    } else for (auto& q : command.target) {
       if (!(input >> q)) throw std::invalid_argument("MOVE requires seven joint angles in radians");
     }
     if (!std::isfinite(command.speed) || command.speed < kMinSpeed || command.speed > kMaxSpeed)
@@ -66,8 +80,8 @@ inline Command parse_command(const std::string& line) {
     if (!std::isfinite(command.tolerance) || command.tolerance <= 0 ||
         command.tolerance > 0.017453292519943295)
       throw std::invalid_argument("Tolerance must be positive and at most one degree (in radians)");
-    if (!std::isfinite(command.timeout) || command.timeout < 1 || command.timeout > 120)
-      throw std::invalid_argument("Timeout must be 1 to 120 seconds");
+    if (!std::isfinite(command.timeout) || command.timeout < 1 || command.timeout > 600)
+      throw std::invalid_argument("Timeout must be 1 to 600 seconds");
     validate_joints(command.target);
   } else if (command.action != "STOP" && command.action != "QUIT") {
     throw std::invalid_argument("Unknown command");
@@ -106,6 +120,60 @@ class Trajectory {
  private:
   Joints start_, goal_;
   double duration_;
+};
+
+// Uniform cubic B-spline. Repeated end points give zero start/end velocity
+// and acceleration. The curve stays in each four-point convex hull.
+class PathTrajectory {
+ public:
+  PathTrajectory(const Joints& start, const Command& command) {
+    if (command.path.empty()) {
+      single_ = true;
+      single_path_ = std::make_unique<Trajectory>(start, command);
+      return;
+    }
+    for (std::size_t j = 0; j < 7; ++j)
+      if (std::abs(start[j]-command.path.front()[j]) > 0.001)
+        throw std::invalid_argument("PATH start differs from desired robot position");
+    points_.push_back(command.path.front());
+    points_.push_back(command.path.front());
+    points_.insert(points_.end(), command.path.begin(), command.path.end());
+    points_.push_back(command.path.back());
+    points_.push_back(command.path.back());
+    double velocity = 0, acceleration = 0, jerk = 0;
+    for (std::size_t i = 1; i < points_.size(); ++i)
+      for (std::size_t j = 0; j < 7; ++j) {
+        velocity = std::max(velocity, std::abs(points_[i][j]-points_[i-1][j]));
+        if (i >= 2) acceleration = std::max(acceleration,
+          std::abs(points_[i][j]-2*points_[i-1][j]+points_[i-2][j]));
+        if (i >= 3) jerk = std::max(jerk,
+          std::abs(points_[i][j]-3*points_[i-1][j]+3*points_[i-2][j]-points_[i-3][j]));
+      }
+    interval_ = std::max({.05, velocity/command.speed,
+                         std::sqrt(acceleration/.15), std::cbrt(jerk/.5)});
+    duration_ = interval_*(points_.size()-3);
+    if (duration_+2 > command.timeout)
+      throw std::invalid_argument("PATH exceeds timeout at the selected speed");
+  }
+  Joints at(double elapsed) const noexcept {
+    if (single_) return single_path_->at(elapsed);
+    if (elapsed >= duration_) return points_.back();
+    const double scaled = std::max(0.0, elapsed)/interval_;
+    const auto i = static_cast<std::size_t>(scaled);
+    const double u = scaled-i;
+    const double weights[4] = {std::pow(1-u,3)/6, (3*u*u*u-6*u*u+4)/6,
+                               (-3*u*u*u+3*u*u+3*u+1)/6, u*u*u/6};
+    Joints result{};
+    for (std::size_t j=0;j<7;++j)
+      for (std::size_t k=0;k<4;++k) result[j]+=weights[k]*points_[i+k][j];
+    return result;
+  }
+  double duration() const noexcept { return single_ ? single_path_->duration() : duration_; }
+ private:
+  bool single_ = false;
+  std::unique_ptr<Trajectory> single_path_;
+  std::vector<Joints> points_;
+  double interval_ = 0, duration_ = 0;
 };
 
 inline double max_error(const Joints& actual, const Joints& target) {

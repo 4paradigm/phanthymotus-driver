@@ -71,5 +71,37 @@ int main() {
   invalid.target[0] = fr3::kUpper[0];
   rejects([&] { fr3::validate_joints(invalid.target); });
   require(fr3::max_error(start, command.target) == 0.5, "Measured completion error is wrong");
+  auto continuous = command;
+  continuous.path = {start, start, command.target, command.target};
+  continuous.timeout = 600;
+  const fr3::PathTrajectory smooth(start, continuous);
+  require(fr3::max_error(smooth.at(0), start) < 1e-12, "PATH start jumped");
+  require(fr3::max_error(smooth.at(smooth.duration()), command.target) < 1e-12, "PATH end missed");
+  const double dt = smooth.duration()/50000;
+  previous = smooth.at(0);
+  previous_velocity = {};
+  previous_acceleration = {};
+  for (int n=1; n<=50000; ++n) {
+    const auto q = smooth.at(n*dt);
+    fr3::validate_joints(q);
+    for (std::size_t j=0;j<7;++j) {
+      const double v = (q[j]-previous[j])/dt;
+      const double a = (v-previous_velocity[j])/dt;
+      const double jerk = (a-previous_acceleration[j])/dt;
+      require(std::abs(v) <= continuous.speed+1e-6, "PATH velocity exceeded");
+      require(std::abs(a) <= .15001, "PATH acceleration exceeded");
+      require(std::abs(jerk) <= .501, "PATH jerk exceeded");
+      previous_velocity[j]=v;
+      previous_acceleration[j]=a;
+    }
+    previous=q;
+  }
+  auto wrong_start=start;
+  wrong_start[0]+=.01;
+  rejects([&] { fr3::PathTrajectory bad(wrong_start, continuous); });
+  require(fr3::parse_command("PATH p .02 .001 600 2 0 0 0 -1 0 1 0 .1 0 0 -1 0 1 0").path.size()==2,
+          "PATH wire format failed");
+  rejects([&] { fr3::parse_command("PATH p .02 .001 600 22"); });
+  rejects([&] { fr3::parse_command("PATH p .02 .001 600 2 0"); });
   std::cout << "FR3 command validation and trajectory bounds passed\n";
 }
