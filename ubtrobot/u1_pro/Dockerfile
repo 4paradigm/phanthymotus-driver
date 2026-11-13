@@ -34,7 +34,14 @@ RUN pip3 install --no-cache-dir -i "${PYPI_MIRROR}" -r /tmp/u1-requirements.txt 
 WORKDIR /work
 COPY --from=interface-builder /u1_ws/install /u1_ws/install
 COPY common/ /work/common/
-COPY main.py device.py visitor_badge.py config.yaml driver.yaml /work/
+COPY main.py device.py config.yaml driver.yaml /work/
+COPY visitor_badge.py /work/visitor_badge.py
+# Fail the image build instead of publishing a stale/cached U1 Pro bundle that
+# advertises hp_printer in driver.yaml but does not contain its runtime plugin.
+RUN test -s /work/visitor_badge.py && \
+    grep -q "HPPrinterPlugin" /work/device.py && \
+    grep -q "hp_printer" /work/config.yaml && \
+    grep -q "hp_printer" /work/driver.yaml
 COPY deploy/ /deploy/
 
 ENV ROS_DOMAIN_ID=42
