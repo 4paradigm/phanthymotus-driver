@@ -277,6 +277,15 @@ class RGBDCaptureTests(unittest.TestCase):
 
         pipeline = types.SimpleNamespace(
             start=mock.Mock(), stop=mock.Mock(), wait_for_frames=wait_for_frames)
+        def stream_profile(kind):
+            height, width = rgb_shape[:2] if kind == "color" else (480, 640)
+            intr = types.SimpleNamespace(width=width, height=height, fx=600., fy=600.,
+                ppx=width/2, ppy=height/2, model="distortion.none", coeffs=[0.]*5)
+            return types.SimpleNamespace(
+                as_video_stream_profile=lambda: types.SimpleNamespace(get_intrinsics=lambda: intr),
+                get_extrinsics_to=lambda _: types.SimpleNamespace(
+                    rotation=[1.,0.,0.,0.,1.,0.,0.,0.,1.], translation=[0.,0.,0.]))
+        pipeline.start.return_value = types.SimpleNamespace(get_stream=stream_profile)
         depth_sensor = types.SimpleNamespace(get_depth_scale=lambda: 0.001)
 
         class Device:

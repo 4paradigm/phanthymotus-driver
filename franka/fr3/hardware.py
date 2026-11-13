@@ -175,13 +175,31 @@ class RobotSession:
         for name, value, low, high in (
                 ("speed_rad_s", speed_rad_s, math.radians(0.1), math.radians(10)),
                 ("tolerance_rad", tolerance_rad, 0.0, math.radians(1)),
-                ("timeout_s", timeout_s, 1.0, 120.0)):
+                ("timeout_s", timeout_s, 1.0, 600.0)):
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value < low or value > high
                     or (name == "tolerance_rad" and value == 0)):
                 raise ValueError(f"{name} is outside its permitted range")
         fields = (speed_rad_s, tolerance_rad, timeout_s, *target)
         return self._submit_motion(owner, target, "MOVE", fields, timeout_s)
+
+    def move_path(self, owner, points, speed_rad_s=math.radians(2),
+                  tolerance_rad=math.radians(.1), timeout_s=600):
+        """Submit one continuous, bounded cubic spline; never queue or replay it."""
+        points = [_joints(point, "path point") for point in points]
+        if not 2 <= len(points) <= 21:
+            raise ValueError("Path requires 2 to 21 control points")
+        for point in points:
+            if any(not low+JOINT_MARGIN <= q <= high-JOINT_MARGIN
+                   for q,low,high in zip(point,JOINT_LOWER,JOINT_UPPER)):
+                raise ValueError("Path point is outside FR3 joint limits")
+        if (not math.isfinite(speed_rad_s) or not math.radians(.1) <= speed_rad_s <= math.radians(5)
+                or not math.isfinite(tolerance_rad) or not 0 < tolerance_rad <= math.radians(1)
+                or not math.isfinite(timeout_s) or not 1 <= timeout_s <= 600):
+            raise ValueError("Invalid continuous path speed, tolerance or timeout")
+        fields = (speed_rad_s,tolerance_rad,timeout_s,len(points),
+                  *(v for point in points for v in point))
+        return self._submit_motion(owner, points[-1], "PATH", fields, timeout_s)
 
     def _submit_motion(self, owner, target, verb, fields, timeout_s, *, validate=None, stop=False):
         """Atomically validate ownership/state and submit one non-replayed command."""
@@ -350,6 +368,13 @@ class RobotSession:
         if isinstance(mode, bool) or not isinstance(mode, int) or not 0 <= mode <= 6:
             raise ValueError("Reader robot_mode must be a libfranka RobotMode value")
         sample.update(robot_mode=mode, timestamp_ms=int(time.time() * 1000))
+        for name in ("O_T_EE", "F_T_EE"):
+            if name in record:
+                pose = record[name]
+                if (not isinstance(pose, list) or len(pose) != 16 or
+                        any(type(v) not in (int, float) or not math.isfinite(v) for v in pose)):
+                    raise ValueError(f"Reader {name} must contain sixteen finite numbers")
+                sample[name] = list(pose)
         with self._lock:
             if self._stop.is_set() or self._connection_broken:
                 return False
