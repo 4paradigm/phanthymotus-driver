@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import io
 import json
+import math
 import os
 import struct
 import threading
@@ -250,6 +251,7 @@ class U1CardContractTests(unittest.TestCase):
         text = service.read_text()
         self.assertIn("/tmp/robo/ipc:/tmp/robo/ipc", text)
         self.assertIn("/dev/shm:/dev/shm", text)
+        self.assertIn("U1_PRO_MIC_GAIN_DB=${U1_PRO_MIC_GAIN_DB:-18.0}", text)
 
     def test_stream_topics_match_robot_contract(self):
         self.assertEqual(SPEAKER_TOPIC, "/sys/device/audio_out/raw")
@@ -265,6 +267,68 @@ class U1CardContractTests(unittest.TestCase):
         normalized = device._normalize_pcm16k(message, payload)
         self.assertEqual(len(normalized), 8)
         self.assertEqual(struct.unpack("<4h", normalized), (0, 333, 666, 1000))
+
+    def test_mic_leveler_makes_speech_prominent_and_suppresses_noise(self):
+        import device
+
+        leveler = device._AdaptiveSpeechLeveler(18.0)
+        noise = struct.pack("<512h", *([35, -35] * 256))
+        for _ in range(60):
+            quiet_output = leveler.process(noise)
+
+        speech_samples = [
+            round(1200 * math.sin(2 * math.pi * 440 * index / 16000))
+            for index in range(512)
+        ]
+        speech = struct.pack("<512h", *speech_samples)
+        for _ in range(4):
+            speech_output = leveler.process(speech)
+
+        def rms(payload):
+            values = struct.unpack("<512h", payload)
+            return math.sqrt(sum(value * value for value in values) / len(values))
+
+        self.assertGreater(rms(speech_output), rms(speech) * 2.0)
+        self.assertGreater(rms(speech_output), rms(quiet_output) * 50.0)
+        self.assertTrue(leveler.status()["speech_active"])
+
+        for _ in range(20):
+            quiet_output = leveler.process(noise)
+        self.assertFalse(leveler.status()["speech_active"])
+        self.assertLess(leveler.status()["applied_gain_db"], -15.0)
+
+    def test_mic_leveler_limits_loud_speech_without_integer_wraparound(self):
+        import device
+
+        leveler = device._AdaptiveSpeechLeveler(24.0)
+        noise = struct.pack("<512h", *([20, -20] * 256))
+        for _ in range(60):
+            leveler.process(noise)
+        loud = struct.pack("<512h", *([30000, -30000] * 256))
+        output = struct.unpack("<512h", leveler.process(loud))
+        self.assertLessEqual(max(output), round(32767 * 0.95))
+        self.assertGreaterEqual(min(output), -round(32767 * 0.95))
+        self.assertGreater(max(output), 0)
+        self.assertLess(min(output), 0)
+
+    def test_mic_gain_config_is_bounded_and_env_overrides_yaml(self):
+        import device
+
+        with mock.patch.dict(device.os.environ, {}, clear=True):
+            self.assertEqual(device._resolve_mic_gain_db(
+                {"audio": {"mic_gain_db": 6}}), 6.0)
+            self.assertEqual(device._resolve_mic_gain_db(
+                {"audio": None}), device.MIC_GAIN_DB_DEFAULT)
+        with mock.patch.dict(
+                device.os.environ, {"U1_PRO_MIC_GAIN_DB": "12"}, clear=True):
+            self.assertEqual(device._resolve_mic_gain_db(
+                {"audio": {"mic_gain_db": 6}}), 12.0)
+        with mock.patch.dict(
+                device.os.environ, {"U1_PRO_MIC_GAIN_DB": "99"}, clear=True):
+            self.assertEqual(device._resolve_mic_gain_db({}), device.MIC_GAIN_DB_MAX)
+        with mock.patch.dict(
+                device.os.environ, {"U1_PRO_MIC_GAIN_DB": "nan"}, clear=True):
+            self.assertEqual(device._resolve_mic_gain_db({}), device.MIC_GAIN_DB_DEFAULT)
 
     def test_u1_cyclonedds_config_matches_official_sdk_runtime(self):
         config = Path(__file__).with_name("config.yaml").read_text(encoding="utf-8")
@@ -328,6 +392,38 @@ class U1CardContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "device busy"):
             nodes.set_mic_enabled(True)
         self.assertFalse(nodes._mic_forwarding)
+
+    def test_mic_open_timeout_can_use_new_raw_frames_without_claiming_sdk_open(self):
+        import device
+        nodes = object.__new__(device.U1Nodes)
+        nodes._mic_source_lock = threading.Lock()
+        nodes._mic_source = None
+        nodes._mic_stream_open = False
+        nodes._mic_reader = None
+        nodes._mic_stream = {}
+        nodes._mic_source_timer = None
+        nodes._mic_forwarding = False
+        nodes._mic_frames = 42
+        nodes._mic_frame_event = threading.Event()
+        nodes._mic_frame_event.set()  # Previous session must not prove readiness.
+        nodes.trigger_call = mock.Mock(side_effect=TimeoutError('service timeout: open_stream'))
+        result = nodes.set_mic_enabled(True)
+        self.assertEqual(result['state'], 'waiting_for_audio')
+        self.assertFalse(nodes._mic_frame_event.is_set())
+        self.assertFalse(nodes.wait_for_mic_frame(.001))
+        self.assertFalse(nodes._mic_stream_open)
+        self.assertEqual(nodes._mic_source, 'topic')
+        self.assertTrue(nodes._mic_forwarding)
+        nodes._mic_publisher = FakePublisher()
+        nodes.AudioChunk = FakeAudioChunk
+        nodes._audio_header = lambda: types.SimpleNamespace(stamp=types.SimpleNamespace(sec=0,nanosec=0))
+        nodes._mic_topic_callback(types.SimpleNamespace(data=[1,2,3,4], sample_rate=16000,
+                                                       channels=1, sample_format='S16LE'))
+        self.assertTrue(nodes.wait_for_mic_frame(.01))
+        self.assertEqual(len(nodes._mic_publisher.messages), 1)
+        nodes.set_mic_enabled(False)
+        self.assertFalse(nodes._mic_forwarding)
+        nodes.trigger_call.assert_called_once_with('audio_open')
 
     def test_mic_uses_device_topic_when_sdk_ring_is_empty(self):
         import device
@@ -491,7 +587,7 @@ class U1CardContractTests(unittest.TestCase):
 
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
-            "lifecycle", "mic", "speaker", "tts", "expression", "head", "system_controls",
+            "lifecycle", "mic", "speaker", "tts", "expression", "head", "system_controls", "sound_direction",
             "camera_left", "camera_right",
         ])
         self.assertEqual(len(prefixes), len(set(prefixes)))
@@ -1048,8 +1144,13 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         publisher = FakePublisher()
+        payload = struct.pack("<hh", 1000, -1000)
+        expected = struct.pack("<hh", 2000, -2000)
+        leveler = mock.Mock()
+        leveler.process.return_value = expected
         nodes = types.SimpleNamespace(
             _mic_forwarding=True,
+            _mic_leveler=leveler,
             _mic_frames=0,
             _mic_frame_event=threading.Event(),
             AudioChunk=FakeAudioChunk,
@@ -1057,12 +1158,39 @@ class U1CardContractTests(unittest.TestCase):
             _audio_header=lambda: types.SimpleNamespace(
                 stamp=types.SimpleNamespace(sec=0, nanosec=0), frame_id=""),
         )
-        device.U1Nodes._publish_mic_frame(nodes, b"\x01\x02\x03\x04", {}, 1_000_000_002)
+        device.U1Nodes._publish_mic_frame(nodes, payload, {}, 1_000_000_002)
         self.assertEqual(len(publisher.messages), 1)
         self.assertEqual(publisher.messages[0].format, "audio/pcm-16k")
-        self.assertEqual(publisher.messages[0].data, [1, 2, 3, 4])
+        self.assertEqual(publisher.messages[0].data, list(expected))
+        leveler.process.assert_called_once_with(payload)
         self.assertEqual(publisher.messages[0].header.stamp.sec, 1)
         self.assertEqual(publisher.messages[0].header.stamp.nanosec, 2)
+
+    def test_mic_applies_gain_to_topic_fallback_payload(self):
+        import device
+
+        publisher = FakePublisher()
+        expected = struct.pack("<hh", 2000, -2000)
+        leveler = mock.Mock()
+        leveler.process.return_value = expected
+        nodes = types.SimpleNamespace(
+            _mic_forwarding=True,
+            _mic_leveler=leveler,
+            _mic_frames=0,
+            _mic_frame_event=threading.Event(),
+            AudioChunk=FakeAudioChunk,
+            _mic_publisher=publisher,
+            _audio_header=lambda: types.SimpleNamespace(
+                stamp=types.SimpleNamespace(sec=0, nanosec=0), frame_id=""),
+        )
+        device.U1Nodes._publish_topic_mic_frame(
+            nodes, struct.pack("<hh", 1000, -1000))
+        self.assertEqual(len(publisher.messages), 1)
+        self.assertEqual(
+            publisher.messages[0].data,
+            list(expected),
+        )
+        leveler.process.assert_called_once_with(struct.pack("<hh", 1000, -1000))
 
     def test_mic_sources_are_mutually_exclusive(self):
         import device

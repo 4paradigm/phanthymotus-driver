@@ -1,0 +1,1 @@
+{"plugin_package_name":"audio_algo_interfaces","plugin_class":"voice_doa::DoaPlugin","plugin_config":{"model_path":"/opt/walker/voice_models/share/voice_models/models/doa/uw/doa2_uworld.onnx","nfft":512,"hop_length":256,"debug_mode":false}}
