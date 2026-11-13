@@ -500,3 +500,10 @@ media cards and motion cards keep running.
 
 The output contract, quality states, assumed body-axis calibration, validation
 status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
+
+## Environment sound monitoring
+
+The read-only `audio_environment` processor uses the existing microphone stream
+to report relative signal levels and sustained noise transitions. See
+[AUDIO_ENVIRONMENT.md](AUDIO_ENVIRONMENT.md) for canvas wiring, calibration,
+measurement limitations and acceptance steps.
