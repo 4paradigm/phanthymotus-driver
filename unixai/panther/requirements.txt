@@ -1,0 +1,7 @@
+# numpy is held below 2 on purpose: the ROS 2 Humble message extensions (rosidl_generator_py)
+# are compiled against NumPy 1.x, and importing sensor_msgs under NumPy 2 fails with
+# "module compiled using NumPy 1.x cannot be run in NumPy 2". OpenCV 4.10 is the newest line
+# that still accepts numpy 1.26.
+PyYAML==6.0.2
+numpy==1.26.4
+opencv-python-headless==4.10.0.84

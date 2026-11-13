@@ -1,0 +1,42 @@
+unixai-panther:
+  image: __IMAGE__
+  container_name: embodied-unixai-panther
+  network_mode: host
+  # The first camera card started creates a transient systemd unit on the robot to run the
+  # Orbbec driver (host_camera.py, through `nsenter -t 1`). That needs two things, and only
+  # these: to see the host's PID 1 (pid: host) and CAP_SYS_ADMIN, which setns(2) requires to join
+  # another process's mount, PID, network, IPC and UTS namespaces (CAP_SYS_CHROOT, also needed for
+  # the mount one, is in Docker's default set). `privileged: true` would add every other
+  # capability, every host device and no seccomp/AppArmor confinement, none of which is used, so
+  # a compromise of this host-networked container would own the host instead of being limited to
+  # this one operation. Nothing else in the driver uses either setting.
+  #
+  # Whether SYS_ADMIN alone is enough on a given robot depends on its seccomp/AppArmor profile and
+  # on nsenter being allowed to read /proc/1/ns/*, which the manual page does not settle, so it is
+  # checked on the robot (README, Acceptance step 7). If the camera cannot be started the card
+  # says so, quoting nsenter's own message and what to check. If a robot does need something more,
+  # find out which capability or profile rule it is and add that one; do not go back to `privileged`.
+  pid: host
+  cap_add:
+    - SYS_ADMIN
+  volumes:
+    # The fleet's loopback-only FastDDS profile, used by the domain-42 bridge processes.
+    # Without it the container cannot reach Agent Core at all (see README_dev "DDS isolation").
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+  environment:
+    - PYTHONUNBUFFERED=1
+    - RCUTILS_COLORIZED_OUTPUT=0
+    # The robot side is CycloneDDS on domain 0, set in config.yaml (ros.cyclonedds_uri) so it
+    # matches the robot's own ~/config/cyclonedds.xml. Domain 42 is Agent Core's.
+    - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    - ROS_DOMAIN_ID=42
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - AGENT_CORE_URL=https://localhost:15678
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always
+  # Time for a running arm move to be cancelled and its controllers restored on SIGTERM.
+  stop_grace_period: 30s

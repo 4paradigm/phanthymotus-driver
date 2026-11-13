@@ -1,0 +1,160 @@
+mcp_port: 15747
+ros_namespace: "panther"
+name: "UniX AI Panther"
+
+# Robot side: the Panther's own nodes run ROS 2 Humble on CycloneDDS, domain 0, bound to
+# 127.0.0.1 (its ~/config/cyclonedds.xml). This process must be configured identically or it
+# will see the topic list and receive nothing -- so it is set here, in one place, rather than
+# left to whatever the container environment happens to carry. Agent Core (domain 42,
+# FastDDS) is reached only through the child processes in panther_bridge.py, hence null.
+ros:
+  robot_domain_id: 0
+  core_domain_id: null
+  robot_interface: lo
+  cyclonedds_uri: "<CycloneDDS xmlns=\"https://cdds.io/config\"><Domain id=\"any\"><General><Interfaces><NetworkInterface address=\"127.0.0.1\" multicast=\"true\"/></Interfaces><AllowMulticast>spdp</AllowMulticast><DontRoute>true</DontRoute></General><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
+
+core_bridge:
+  domain: 42
+  # The fleet's loopback-only FastDDS profile, mounted by deploy/service.yml.
+  profile: /opt/phanthy-motus/dds-local.xml
+
+# Robot topics. Names confirmed with `ros2 topic list -t` on a Panther (2026-11-10).
+# /imu and /scan exist but have no publisher on this robot; the broadcaster topics and the
+# per-lidar scans are the live ones. /tf_static and /robot_description are latched.
+topics:
+  joints: /joint_states
+  battery: /battery_state_broadcaster/battery_state
+  imu: /imu_sensor_broadcaster/imu
+  odom: /odom
+  gripper_left: /left_gripper/joint_states
+  gripper_right: /right_gripper/joint_states
+  lift: /lifting_controller/joint_states
+  diagnostics: /diagnostics
+  laser_front: /lidar_front/scan
+  laser_rear: /lidar_rear/scan
+  tf_static: /tf_static
+  robot_description: /robot_description
+  camera_color: /camera/color/image_raw
+  camera_depth: /camera/depth/image_raw
+
+# Publish rates to Agent Core. The robot publishes 50-100 Hz; averaging (odom) or
+# nearest-return pooling (lidar) is done before the rate is cut, not instead of it.
+rates_hz:
+  joints: 10
+  imu: 10
+  odom: 10
+  robot_state: 2
+  laser_scan: 5
+  laser_view: 1
+  camera_color: 10
+  camera_depth: 5
+
+# How old a reading may be before a card (or a robot_state block) reports it as stale.
+stale_after_s:
+  joints: 1.0
+  imu: 1.0
+  odom: 1.0
+  robot_state: 5.0
+  laser_scan: 1.5
+  camera: 2.0
+  battery: 5.0
+  diagnostics: 5.0
+  estop: 3.0
+  grippers: 1.0
+  lift: 1.0
+  controllers: 3.0
+
+camera:
+  jpeg_quality: 80
+  max_width: 640
+  # The first camera card started creates a transient unit on the robot (through nsenter, which
+  # needs pid: host and the SYS_ADMIN capability, not privileged) that runs the vendor's
+  # gemini2.launch.py. See host_camera.py and deploy/service.yml.
+  host:
+    user: unix_ai
+    workspace: /home/unix_ai/orbbec_ws
+    cyclonedds_profile: /home/unix_ai/config/cyclonedds.xml
+    start_wait_s: 5.0
+    first_frame_grace_s: 30.0
+    frame_stall_s: 15.0
+    max_watchdog_restarts: 2
+
+laser:
+  max_points: 360
+  view_range_m: 6.0
+  # The frame the lidars are merged into. Their mounting poses are read from /tf_static.
+  # This robot has ONE lidar, at the front (link_front_radar, 0.226 m ahead of base_link); the
+  # rear half of the scan is blocked by the central column. The vendor software still publishes a
+  # rear-lidar topic that never carries data, and the card treats that as "no rear lidar".
+  base_frame: base_link
+  # Returns closer than this to base_link's origin are the robot's own body and are dropped, and
+  # counted in `self_filtered_beams`. The nearest return on this robot was 0.073 m from base_link:
+  # the lidar looking back at the central column, which stands about 0.07 m from base_link's
+  # origin (0.30 m behind a lidar mounted 0.226 m ahead of it), well inside this radius. It is a
+  # circle, so it also hides real obstacles nearer than this in the corners and at the sides:
+  # tune it against the top-down view. 0 turns it off. Not applied to a lidar whose frame has
+  # no transform to base_link, since the body's position is not known there.
+  self_filter_radius_m: 0.35
+
+# One switch per card; driver.yaml's card list is kept in step with it by hand and by
+# tests/test_unixai_panther.py.
+plugins:
+  model: {enabled: true}
+  joints: {enabled: true}
+  imu: {enabled: true}
+  odom: {enabled: true}
+  robot_state: {enabled: true}
+  laser_scan: {enabled: true}
+  camera_color: {enabled: true}
+  camera_depth: {enabled: true}
+
+  # Motion caps. Deliberately below what the hardware allows; raise only with the operator present.
+  # There is no confirmation field and no motion switch: with intelligent control on, a call moves
+  # the robot. Every command still needs fresh /joint_states, a fresh emergency-stop diagnostic at
+  # level 0 and the matching ros2_control controller active, and every value inside the range its
+  # box shows (built from these numbers and the URDF limits, so the two cannot disagree).
+  base_drive:
+    enabled: true
+    # Tried in this order; the first that any robot node subscribes to is used, and the choice is
+    # logged. The vendor SDK documents /cmd_vel; /cmd_vel_teleop is the vendor teleoperation node's
+    # topic. Do not "just pick one": on this robot the configured name decides whether the base moves.
+    cmd_topics:
+      - /cmd_vel
+      - /cmd_vel_teleop
+    max_linear_mps: 0.20
+    max_angular_radps: 0.30
+    max_duration_s: 3.0
+    publish_rate_hz: 20.0
+    stop_repetitions: 5
+  arm_control:
+    enabled: true
+    max_duration_s: 20.0
+    speed_rad_s: 0.35
+    min_duration_s: 2.0
+    # `home` sends every joint of the chosen arms to home_pose
+    # (0 rad for any joint not listed; the operator confirmed the all-zero pose is safe on this
+    # robot, 2026-11-11; the vendor did not) and stretches the duration so that the furthest joint
+    # moves at no more than this average speed. The trajectory controller interpolates, so its peak
+    # speed is somewhat higher than the average. Nothing here checks for self-collision.
+    home_speed_rad_s: 0.35
+    home_min_duration_s: 2.0
+    home_pose: {}
+    # On container stop, how long to wait for a running move to cancel its goals and restore the
+    # controllers before the ROS node it needs is closed. Cancelling during a controller switch
+    # and then restoring can take well over the 10 s a card `stop` waits. Keep it under
+    # deploy/service.yml's stop_grace_period (30 s), leaving time for the camera and the bridge.
+    shutdown_wait_s: 20.0
+  gripper:
+    enabled: true
+  lifting:
+    enabled: true
+    # Units are not confirmed by the vendor; the reading was 0.61 with the URDF limit at 0.6.
+    max_position: 0.65
+  head:
+    enabled: true
+    # `home` sends both head joints to home_pose (0 rad if not listed) in small steps: the head's
+    # forward-position controller goes to whatever it is sent at its own top speed, so the speed
+    # limit is applied by sending a step every 1/home_publish_rate_hz seconds.
+    home_speed_rad_s: 0.35
+    home_publish_rate_hz: 20.0
+    home_pose: {}
