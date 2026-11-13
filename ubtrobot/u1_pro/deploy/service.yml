@@ -12,6 +12,8 @@ ubtrobot-u1-pro:
     - /tmp/robo/ipc:/tmp/robo/ipc
     - /dev/shm:/dev/shm
   environment:
+    # Explicit metric attribution; no host /proc or thermal mounts are added.
+    - U1_PRO_HEALTH_CONTAINER=1
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     - U1_PRO_AUTH_FILE=/run/ubtrobot-u1-pro-auth/robo_auth.json
