@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,9 @@ class FakeLocoPlugin:
 
     def is_moving(self):
         return False
+
+    def reserve_walking_mode(self):
+        return nullcontext()
 
     def get_tools(self):
         return [{"name": "loco", "type": "actuator"}]
@@ -169,4 +173,33 @@ def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
 
     assert [tool["name"] for tool in bundle.get_all_tools()] == [
         "loco", "loco_servo", "speaker"]
+
+
+@pytest.mark.parametrize("model", ["lower_body", "whole_body"])
+def test_walking_mode_dispatch_accepts_a_request_without_action(bundle_module, model, monkeypatch):
+    bundle = bundle_module.BumiDeviceBundle(
+        {"plugins": {"loco": {"enabled": True}, "walking_mode": {"enabled": True}}},
+        "bumi_test", object(), FakeHighCtrl(), None)
+    bundle.start_all()
+    loco, switcher = bundle._plugins
+    assert switcher._loco is loco
+    monkeypatch.setattr(switcher, "_switch", lambda requested: {
+        "state": "test_dispatch", "requested_walking_model": requested})
+    assert [tool["name"] for tool in bundle.get_all_tools()] == [
+        "loco", "walking_mode"]
+    result = bundle.dispatch("walking_mode", {"walking_model": model})
+    assert result["state"] == "test_dispatch"
+    assert result["requested_walking_model"] == model
+    bundle.stop_all()
+
+
+@pytest.mark.parametrize(
+    ("enabled", "high_ctrl", "loco"), [
+        (False, FakeHighCtrl(), True), (True, None, True), (True, FakeHighCtrl(), False)])
+def test_walking_mode_skipped_when_disabled_or_dependencies_missing(
+        bundle_module, enabled, high_ctrl, loco):
+    bundle = bundle_module.BumiDeviceBundle(
+        {"plugins": {"loco": {"enabled": loco}, "walking_mode": {"enabled": enabled}}},
+        "bumi_test", object(), high_ctrl, None)
+    assert "walking_mode" not in [tool["name"] for tool in bundle.get_all_tools()]
 
