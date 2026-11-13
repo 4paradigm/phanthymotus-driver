@@ -96,6 +96,15 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+  # 前后对比：同一机位两张 RGB 图的确定性差分 + 三联图。
+  # 只做几何/像素比较，不做语义识别；真机拍照复用 camera 卡。
+  image_diff:
+    enabled: true
+    output_dir: /opt/phanthy-motus/data/image_diff
+    # compare_files 只接受这个目录下的绝对路径，避免读任意文件。
+    source_root: /opt/phanthy-motus/data
+    retention_days: 7
+    frame_timeout_s: 5.0
   lidar:
     enabled: true
   slam:
