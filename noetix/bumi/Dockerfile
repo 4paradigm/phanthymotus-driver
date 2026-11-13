@@ -23,6 +23,12 @@ WORKDIR /work
 # unavailable on ordinary networks and on the Bumi host. Replace it with the
 # public HTTPS mirror before the first apt invocation; packages remain signed
 # and subject to apt's normal verification.
+#
+# Do not add packages casually here.  On a non-arm64 build host this layer runs
+# under qemu-user, and qemu 8.1.1-9.2.0 segfaults in libc-bin's ldconfig
+# trigger (Ubuntu bug 2072564), which fails the whole build with exit 100.
+# The Morse card therefore uses the ffmpeg flite source installed here instead
+# of espeak-ng.
 RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
         -exec sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_MIRROR}|g" {} + && \
     apt-get update && \
@@ -154,6 +160,7 @@ COPY visual_odometry_probe.py /work/visual_odometry_probe.py
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
+COPY Morse.py /work/Morse.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
