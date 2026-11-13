@@ -198,6 +198,12 @@ class BumiDeviceBundle:
             self._plugins.append(motion_state_plugin)
             print("[bundle] MotionStatePlugin loaded")
 
+        if plugins_cfg.get("region_presence", {}).get("enabled", False):
+            from common.region_presence_card import RegionPresencePlugin
+            self._plugins.append(RegionPresencePlugin(
+                plugins_cfg["region_presence"], namespace, executor, camera_plugin, plugins_cfg.get("image_quality")))
+            print("[bundle] RegionPresencePlugin loaded (bind one VOP objects input on the canvas)")
+
         if plugins_cfg.get("vision_capture", {}).get("enabled", False):
             from device import VisionCapturePlugin
             self._plugins.append(VisionCapturePlugin(

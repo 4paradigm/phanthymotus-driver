@@ -38,6 +38,20 @@ plugins:
     min_wz_moving_rads: 0.25    # 归一化边界 0.30 × 0.83
   mic:
     enabled: true
+  region_presence:
+    dwell_alert_s: 0
+    capacity_limit: 0
+    enabled: true
+    target_name: person
+    min_confidence: 0.5
+    x_min: -1.0
+    x_max: 1.0
+    y_min: -1.0
+    y_max: 1.0
+    enter_hold_s: 0.6
+    leave_hold_s: 1.5
+    stale_after_s: 3.0
+
   sound_direction:
     enabled: true
   speaker:
