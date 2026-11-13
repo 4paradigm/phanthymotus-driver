@@ -7,6 +7,21 @@ import numpy as np
 import pytest
 
 from deep_robotics.s10_pro import undistortion as u
+from deep_robotics.s10_pro.media_workers import _rtsp_command
+
+
+@pytest.mark.parametrize('command', [
+    _rtsp_command('rtsp://camera/front'),
+    u.raw_command('rtsp://camera/front'),
+    u.remap_command('rtsp://camera/front', 'x.pgm', 'y.pgm', (1024, 576)),
+])
+def test_camera_thread_limit_applies_to_output_encoder(command):
+    # Input-side -threads affects decoding and does not remove MJPEG buffering.
+    last_input = max(i for i, value in enumerate(command) if value == '-i')
+    output_options = command[last_input + 2:-1]
+    assert '-threads' in output_options
+    assert output_options[output_options.index('-threads') + 1] == '1'
+    assert '-threads' not in command[:last_input + 2]
 
 
 @pytest.fixture
