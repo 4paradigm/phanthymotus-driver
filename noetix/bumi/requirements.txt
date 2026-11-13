@@ -3,4 +3,4 @@ netifaces
 numpy
 opencv-python-headless
 pyrealsense2
-cryptography>=46
+-r requirements.sound-facing.lock

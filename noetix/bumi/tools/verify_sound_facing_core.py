@@ -78,17 +78,21 @@ class SyntheticSource:
                 "calibrated_directions": ["front", "right"] if self.healthy else []}
 
 
-async def verify(core_root: Path, output: Path):
+async def verify(core_root: Path, output: Path, transport="ros2", browser_python=None, chromium=None, three_dir=None):
     sys.dont_write_bytecode = True
     if not (core_root / "src/start.py").is_file():
         raise ValueError("--core must identify an existing agent-core directory")
-    if os.environ.get("ROS_DOMAIN_ID") in (None, "0", "42"):
-        raise ValueError("An isolated ROS_DOMAIN_ID is required")
-    if os.environ.get("RMW_IMPLEMENTATION") != "rmw_fastrtps_cpp":
-        raise ValueError("Use rmw_fastrtps_cpp and the loopback-only fixture")
-    profile = Path(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"]).read_text()
-    if "127.0.0.1" not in profile or "<useBuiltinTransports>false" not in profile:
-        raise ValueError("Loopback whitelist and disabled built-in transports are required")
+    if transport == "inprocess":
+        from sound_facing_inprocess_bus import install
+        install()
+    else:
+        if os.environ.get("ROS_DOMAIN_ID") in (None, "0", "42"):
+            raise ValueError("An isolated ROS_DOMAIN_ID is required")
+        if os.environ.get("RMW_IMPLEMENTATION") != "rmw_fastrtps_cpp":
+            raise ValueError("Use rmw_fastrtps_cpp and the loopback-only fixture")
+        profile = Path(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"]).read_text()
+        if "127.0.0.1" not in profile or "<useBuiltinTransports>false" not in profile:
+            raise ValueError("Loopback whitelist and disabled built-in transports are required")
     output.mkdir(parents=True, exist_ok=False)
     runtime = output / "runtime"
     runtime.mkdir()
@@ -127,6 +131,10 @@ async def verify(core_root: Path, output: Path):
     spec.loader.exec_module(bundle_module)
     device._get_control_cmd = lambda name: name  # fake SDK enum, no SDK import
     plant, source = FakeController(), SyntheticSource()
+    capture_wall_ns = time.time_ns
+    if transport == "inprocess":
+        anchor_wall, anchor_mono = time.time_ns(), time.monotonic_ns()
+        capture_wall_ns = lambda: anchor_wall + time.monotonic_ns() - anchor_mono
     sys.path.insert(0, str(core_root / "src"))
     import config
     config.main["core"] = {"configured": True, "auto_start": False, "main_loop_enable": False}
@@ -137,6 +145,7 @@ async def verify(core_root: Path, output: Path):
                                                    "auto_narration": False, "max_rounds": 2}}
     shutil.copytree(core_root / "resource/memory", runtime / "resource/memory", dirs_exist_ok=True)
     import start
+    start._register_core_mcp(silent=True)  # normal local metadata only; no lifespan/host services
     import auth
     import client
     import mcp_client
@@ -158,6 +167,8 @@ async def verify(core_root: Path, output: Path):
                              lambda msg: states.append(json.loads(msg.data)), 1)
     loco = device.LocoPlugin({}, namespace, executor, plant)
     card = SoundFacingPlugin({}, namespace, executor, loco, source_plugin=source)
+    if transport == "inprocess":
+        card._engine._wall = capture_wall_ns
     bundle = bundle_module.BumiDeviceBundle({"plugins": {}}, namespace, executor, None, None)
     bundle._plugins = [loco, card]
     bundle_module._bundle = bundle
@@ -168,7 +179,7 @@ async def verify(core_root: Path, output: Path):
 
     def publish():
         while not halt.wait(0.25):
-            end = time.time_ns() // 1000
+            end = capture_wall_ns() // 1000
             angle = source.angle
             payload = {"state": "no_event"} if angle is None else {
                 "state": "fresh", "angle_deg": angle, "angle_convention": CONVENTION,
@@ -255,9 +266,9 @@ async def verify(core_root: Path, output: Path):
             editor = secrets.token_hex(8)
             assert (await http.post("/api/canvas/claim-edit", json={"session_id": editor})).status_code == 200
             layout = {"session_id": editor, "cards": [
-                {"id": "core", "mcpId": "agentcore", "toolName": "decision_core"},
-                {"id": "facing", "mcpId": mid, "toolName": "bumi_sound_facing"}],
-                "execConnections": [{"fromCardId": "core", "toCardId": "facing",
+                {"id": "core", "mcpId": "agentcore", "toolName": "decision_core", "x":100, "y":100},
+                {"id": "facing", "mcpId": mid, "toolName": "bumi_sound_facing", "x":550, "y":250}],
+                "execConnections": [{"id":"test-executor-link", "fromCardId": "core", "toCardId": "facing",
                                       "toMcpId": mid, "toToolName": "bumi_sound_facing"}]}
             agent = Event()
             agent._desktop_tools = DesktopTools()
@@ -322,7 +333,7 @@ async def verify(core_root: Path, output: Path):
                 await wait(lambda: card._engine.state == "settling")
                 await wait(lambda: card._engine.state in ("observing", "paused"))
             assert card._engine.turns == 3 and not mcp_client.get_pending_actions()
-            passed("real_ros_continuous_three_turns_no_orphan_acp")
+            passed("continuous_three_turns_no_orphan_acp")
             await agent_turn("disable_follow")
             await wait(lambda: not card._engine.reserved)
             before = len(plant.commands)
@@ -400,6 +411,17 @@ async def verify(core_root: Path, output: Path):
             assert not stopped["running"] and not stopped["enabled"]
             assert card._node is None and not card._worker.is_alive()
             passed("real_core_stop_cleans_resources")
+            if browser_python:
+                if not chromium:
+                    raise ValueError("--chromium is required with --browser-python")
+                process = await asyncio.create_subprocess_exec(str(browser_python),
+                    str(BUMI / "tools/verify_sound_facing_canvas.py"), "--base", base,
+                    "--token-file", str(env_file), "--output", str(output/"browser"),
+                    "--chromium", str(chromium), *(["--three-dir", str(three_dir)] if three_dir else []))
+                if await asyncio.wait_for(process.wait(), 35):
+                    raise AssertionError("Canvas browser inspection failed; inspect browser/failure.txt")
+                assert not card._engine.session_id
+                passed("native_canvas_card_schema_and_readonly_details")
             observations.append({"state_messages": len(states), "fake_velocity_commands": len(plant.commands),
                                  "completed_facing_turns": card._engine.turns})
     finally:
@@ -422,10 +444,17 @@ async def verify(core_root: Path, output: Path):
             bridge_thread.join(2)
             assert not bridge_thread.is_alive()
         mcp_client.stop_sse()
+    revision = subprocess.run(["git", "-C", str(core_root), "rev-parse", "HEAD"],
+                              text=True, capture_output=True, check=False)
+    snapshot = core_root.parent / "SOURCE.json"
+    core_head = revision.stdout.strip() if revision.returncode == 0 else (
+        json.loads(snapshot.read_text()).get("head") if snapshot.exists() else None)
     receipt = {"cases_passed": len(cases), "cases": cases, "observations": observations,
-               "core_head": subprocess.check_output(["git", "-C", str(core_root), "rev-parse", "HEAD"], text=True).strip(),
+               "core_head": core_head,
                "core_app": "unmodified start.app HTTP/API and Agent dispatcher",
-               "core_bootstrap": "lifespan off; actual ROS bridge started; service, Docker, network and peer bootstrap not run",
+               "transport": transport, "real_dds_verified": transport == "ros2", "capture_clock": "synthetic-monotonic-derived epoch" if transport == "inprocess" else "host realtime",
+               "core_bootstrap": "lifespan off; actual ros2_bridge Python using " + transport + "; production service/Docker/peer bootstrap not run",
+               "core_source_sha256": {str(p.relative_to(core_root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in [core_root/"src"/name for name in ("start.py", "mcp_client.py", "auth.py", "api/acp.py", "api/canvas.py", "event/llm.py")] if p.exists()},
                "llm": "scripted responses; actual Event._one_turn and access checks",
                "controller": "FakeController; vendor imports forbidden", "hardware_motion": False,
                "authorization": "real Ed25519 verification; synthetic test operator, not a real human ceremony",
@@ -440,8 +469,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--core", required=True, type=Path, help="Disposable agent-core source directory")
     parser.add_argument("--output", required=True, type=Path, help="New task-owned directory")
+    parser.add_argument("--transport", choices=["ros2", "inprocess"], default="ros2", help="inprocess is simulated ROS transport only; Core HTTP/ACP remains real")
+    parser.add_argument("--browser-python", type=Path)
+    parser.add_argument("--chromium", type=Path)
+    parser.add_argument("--three-dir", type=Path)
     args = parser.parse_args()
-    asyncio.run(verify(args.core.resolve(), args.output.resolve()))
+    asyncio.run(verify(args.core.resolve(), args.output.resolve(), args.transport, args.browser_python, args.chromium, args.three_dir))
 
 
 if __name__ == "__main__":

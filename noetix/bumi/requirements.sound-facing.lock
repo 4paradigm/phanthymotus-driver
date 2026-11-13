@@ -1,0 +1,6 @@
+# New authorization runtime, resolved and exercised with CPython 3.10.
+# ARM64 wheels were resolved separately; a wheel check is not a full image build.
+cryptography==50.0.2
+cffi==2.1.1
+pycparser==3.11
+typing_extensions==4.16.0

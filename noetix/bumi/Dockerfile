@@ -98,8 +98,9 @@ RUN apt-get update && \
         librealsense2-utils || true && \
     rm -rf /var/lib/apt/lists/*
 
+COPY requirements.sound-facing.lock /work/requirements.sound-facing.lock
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11 'cryptography>=46'
+    pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11 -r /work/requirements.sound-facing.lock
 
 # The bundle image must be able to start the estimator child and this card's
 # Python imports; fail the build here rather than on a robot. Docker's default

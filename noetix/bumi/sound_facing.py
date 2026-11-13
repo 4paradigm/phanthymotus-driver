@@ -22,7 +22,7 @@ PARAMETER_BOUNDS = {
     "stable_windows": (3, 20), "stable_span_s": (0.2, 5), "max_age_s": (0.1, 2),
     "max_window_s": (0.05, 2), "max_gap_s": (0.1, 2), "stream_timeout_s": (0.3, 5),
     "settle_s": (0.5, 5), "reversal_hold_s": (1, 10),
-    "turn_timeout_s": (1, 80), "session_timeout_s": (1, 60),
+    "turn_timeout_s": (1, 80), "session_timeout_s": (1, 30),
 }
 
 
@@ -150,6 +150,11 @@ class SourceHealthProbe:
         with self.lock:
             self.version += 1
             self.result = None
+            # Retire and wake this query immediately. The external callback
+            # may remain blocked, but no caller needs to wait for it after
+            # revocation; its generation check still refuses late results.
+            if self._query is not None:
+                self._query["done"].set()
 
     def read(self):
         if self.callback is None:
