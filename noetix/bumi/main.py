@@ -123,6 +123,10 @@ class BumiDeviceBundle:
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
         loco_plugin = None
+        if plugins_cfg.get("zone_presence", {}).get("enabled", False):
+            from zone_presence_card import ZonePresencePlugin
+            self._plugins.append(ZonePresencePlugin(
+                plugins_cfg["zone_presence"], namespace, executor))
         # The camera subprocess reads this env var; set it before any plugin can
         # start that subprocess, so the raw RGB-D branch is published only when
         # the visual odometry card is enabled.
