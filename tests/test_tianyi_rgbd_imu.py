@@ -374,6 +374,7 @@ def test_disabled_source_keeps_rgbd_ready_with_declared_optional_port(source):
     source.start()
     source.registered = True
     source.geometry = {'frame_id': 'color_optical', 'K': np.eye(3)}
+    source.count = 1  # RGB-D has already emitted; only motion is disabled.
     feed(source)
     assert packets(source) == []
     result = source.dispatch('info', {})
@@ -399,6 +400,7 @@ def test_missing_tf2_dependency_withholds_motion_without_failing_rgbd_start(sour
     source.start()
     source.registered = True
     source.geometry = {'frame_id': 'color_optical', 'K': np.eye(3)}
+    source.count = 1  # RGB-D has already emitted; only motion TF is missing.
     result = source.dispatch('info', {})
     assert result['state'] == 'running' and result['camera_info']
     assert 'error' not in result

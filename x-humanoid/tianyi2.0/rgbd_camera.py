@@ -140,6 +140,8 @@ class RgbdCameraPlugin:
         self.count = 0
         self.error = None
         self.future = None
+        self.parameter_stage = 'service'
+        self.parameter_values = {}
         self.imu_enabled = config.get('imu_enabled', True)
         self.imu_attached = False
         self.imu_reason = 'waiting for camera motion samples and TF'
@@ -228,7 +230,8 @@ class RgbdCameraPlugin:
         return {'name': 'camera_rgbd', 'type': 'sensor',
                 'description': '天轶配准 RGB-D 计算输入（原始采集时间、共同光学平面）',
                 'inputSchema': {'type': 'object', 'properties': {}},
-                'topic_out': self._outputs(), 'camera_info': self._declarations()}
+                'topic_out': self._outputs(), 'camera_info': self._declarations(),
+                'source_status': self._source_status()}
 
     def _outputs(self):
         return [{'topic': self.color_topic, 'format': 'image/jpeg'},
@@ -248,6 +251,37 @@ class RgbdCameraPlugin:
         if getattr(self, 'body_mount', None) is not None:
             return self.body_mount.status()
         return dict(status='unavailable', reason='body mount source not started', accuracy_validated=False)
+
+    def _source_status(self):
+        """Bounded current-start evidence; no image payloads or source messages."""
+        with self.lock:
+            parameters = dict(stage='validated' if self.registered else
+                              getattr(self, 'parameter_stage', 'service'),
+                              **getattr(self, 'parameter_values', {}))
+            infos = {kind: kind in getattr(self, 'infos', {}) for kind in ('color', 'depth')}
+            if not self.running:
+                stage, reason = 'stopped', self.error or 'RGB-D source stopped'
+            elif not self.registered:
+                stage = 'parameter_' + parameters['stage']
+                reason = self.error or {
+                    'service': 'waiting for /ob_camera_head/ob_camera_head/get_parameters service',
+                    'request': 'waiting to request source registration and global capture clock parameters',
+                    'response': 'waiting for source registration and global capture clock parameter response',
+                    'validation': 'waiting for valid registered depth and source global capture clock parameters',
+                }[parameters['stage']]
+            elif self.geometry is None:
+                missing = [kind for kind, received in infos.items() if not received]
+                stage = 'camera_info' if missing else 'rectified_geometry'
+                reason = self.error or ('waiting for ' + ' and '.join(missing) + ' CameraInfo' if missing else
+                                       'waiting for source images to validate rectified RGB-D geometry')
+            elif not self.count or self.error:
+                stage, reason = 'first_calibrated_output', self.error or 'waiting for first calibrated RGB-D output'
+            else:
+                stage, reason = 'ready', None
+            return dict(state='available' if stage == 'ready' else 'unavailable', stage=stage,
+                        **({'reason': reason[:256]} if reason else {}), parameters=parameters,
+                        camera_info=infos, rectified_geometry_ready=self.geometry is not None,
+                        first_calibrated_output=self.count > 0)
 
     def start(self):
         from sensor_msgs.msg import Image, CameraInfo, CompressedImage
@@ -273,9 +307,12 @@ class RgbdCameraPlugin:
             self.registered = False
             self.geometry = None
             self.signature = None
+            self.infos.clear()
             self.last_emit = 0
             self.count = 0
             self.future = None
+            self.parameter_stage = 'service'
+            self.parameter_values = {}
             self.error = None
             self.imu_epoch = uuid.uuid4().hex
             self.imu_last_stamp = 0
@@ -435,22 +472,35 @@ class RgbdCameraPlugin:
                 return
             if self.future is None:
                 if self.client.service_is_ready():
+                    self.parameter_stage = 'request'
                     request = GetParameters.Request()
                     request.names = ['depth_registration', 'time_domain', 'enable_sync_host_time']
-                    self.future = self.client.call_async(request)
+                    try:
+                        self.future = self.client.call_async(request)
+                        self.parameter_stage = 'response'
+                        self.error = None
+                    except Exception as error:
+                        self.error = ('source parameter request failed: ' + str(error))[:256]
+                else:
+                    self.parameter_stage = 'service'
+                    self.error = None
             elif self.future.done():
                 try:
                     values = self.future.result().values
+                    self.parameter_values = dict(depth_registration=values[0].bool_value,
+                        time_domain=values[1].string_value[:64], enable_sync_host_time=values[2].bool_value)
+                    self.parameter_stage = 'validation'
                     self.registered = (values[0].bool_value and values[1].string_value == 'global' and values[2].bool_value)
                     self.error = (None if self.registered else
                                   'Orbbec requires registered depth and source global capture time')
                 except Exception as error:
-                    self.error = str(error)
+                    self.error = ('source parameter response failed: ' + str(error))[:256]
                 self.future = None
 
     def _info(self, kind, msg):
         with self.lock:
-            self.infos[kind] = msg
+            if self.running:
+                self.infos[kind] = msg
 
     def _image(self, kind, msg):
         with self.lock:
@@ -565,12 +615,18 @@ class RgbdCameraPlugin:
         elif action == 'stop':
             self.stop()
         with self.lock:
-            return {'state': 'running' if self.running else 'idle', 'topic_out': self._outputs(),
+            status = self._source_status()
+            startup_error = ('RGB-D startup incomplete: ' + status['reason']
+                             if action == 'start' and status['state'] != 'available' else None)
+            state = ('running' if status['state'] == 'available' else 'unavailable') if self.running else 'idle'
+            return {'state': 'error' if startup_error else state,
+                    'source_status': status, **({'reason': status['reason']} if 'reason' in status else {}),
+                    'topic_out': self._outputs(),
                     'camera_info': self._declarations(), 'frames_forwarded': self.count,
                     'registered_source': self.registered,
                     'imu_status': self._imu_status(),
                     'body_mount_status': self._body_mount_status(),
-                    **({'error': self.error} if self.error else {})}
+                    **({'error': startup_error or self.error} if startup_error or self.error else {})}
 
 
 class RgbdInputCard:
@@ -599,6 +655,7 @@ class RgbdInputCard:
             tool['camera_info'] = [d for d in self.source._declarations() if d['topic'] == port['topic']]
             tool['imu_status'] = self.source._imu_status()
             tool['body_mount_status'] = self.source._body_mount_status()
+            tool['source_status'] = self.source._source_status()
         return tool
 
     def start(self):
@@ -640,16 +697,21 @@ class RgbdInputCard:
             self.stop()
         elif action != 'info' and self.display is not None:
             return self.display.dispatch(action, args)
-        tool = self.get_tool()
         with self.source.lock:
+            tool = self.get_tool()
             ready = (self.source.running and self.source.registered and self.source.geometry is not None
                      and self.source.count > 0 and not self.source.error)
             state = 'running' if self.running and self.source.running else 'idle'
+            startup_error = None
             if self.kind in ('color', 'depth') and self.running and not ready:
-                state = 'unavailable'
+                state = 'error' if action == 'start' else 'unavailable'
+                if action == 'start':
+                    startup_error = 'RGB-D startup incomplete: ' + tool['source_status']['reason']
             return dict(state=state,
                         topic_out=tool['topic_out'], camera_info=tool['camera_info'],
+                        source_status=tool['source_status'],
                         imu_status=tool['imu_status'], body_mount_status=tool['body_mount_status'],
-                        **({'reason': self.source.error or 'waiting for calibrated source captures'}
+                        **({'reason': tool['source_status']['reason']}
                            if self.kind in ('color', 'depth') and self.running and not ready else {}),
-                        **({'error': self.source.error} if self.source.error else {}))
+                        **({'error': startup_error or self.source.error}
+                           if startup_error or self.source.error else {}))

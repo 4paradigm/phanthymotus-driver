@@ -259,6 +259,18 @@ feed SLAM in the common camera frame. Existing display pointcloud packets are
 not metric SLAM inputs. This uses the existing runtime identical-frame route,
 not a new verified independent-clock/provenance protocol.
 
+A color/depth start that reaches this deadline returns `state=error` and the
+current waiting reason, so Core reports a source startup failure. Subsequent
+`info` stays `unavailable` until the source checks pass. Card `info`/`get_tool`
+and the private source expose a bounded
+`source_status`: parameter-service discovery, request/response or registration
+and global-clock validation; receipt of color/depth `CameraInfo`; rectified
+geometry; and the first calibrated output. `reason` names the current wait or
+validation failure. Only scalar flags and parameter values are included, with
+no source image payloads or history. Full source restarts require new
+`CameraInfo` messages; prior-start calibration is discarded. A pending parameter
+response is reported as waiting and is not automatically cancelled or retried.
+
 The existing `imu` card keeps its display output and appends the named optional
 `camera_imu` port (`sensor/imu`) on `/<ns>/camera/rgbd/imu`. It publishes
 `motus.imu/1` JSON through
