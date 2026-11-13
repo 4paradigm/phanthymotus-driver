@@ -231,3 +231,23 @@ def test_raw_publisher_starts_disabled_until_the_card_latches_enable(raw_ros):
     raw_publisher.enabled = True
     raw_publisher.publish(frames(), frames())
     assert len(messages['/robot/odometry_input/rgb']) == 1
+
+def test_first_clockmap_failure_logs_exact_residual_once(raw_ros, monkeypatch, capsys):
+    raw_publisher, messages = publisher(raw_ros)
+    monkeypatch.setattr(visual_inputs.time, 'time_ns', lambda: 10_000_000_000)
+    pair = frames(ms=10000)
+    rgb, depth = pair.get_color_frame(), pair.get_depth_frame()
+    rgb.get_frame_timestamp_domain = depth.get_frame_timestamp_domain = lambda: 'global_time'
+    depth.get_timestamp = lambda: 11221.412
+    for n in range(2):
+        rgb.get_timestamp = lambda: 10000 + n
+        depth.get_timestamp = lambda: 11221.412 + n
+        with pytest.raises(ValueError, match='camera clock mapping drift or transport delay'):
+            raw_publisher.publish(pair, pair)
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1 and lines[0].startswith('[raw_rgbd] clock_residual ')
+    record = json.loads(lines[0].split('clock_residual ', 1)[1])
+    assert record['epoch'] == raw_publisher.epoch and record['stream'] == 'depth'
+    assert record['residual_ns'] == record['received_wall_ns'] - record['mapped_ns']
+    assert record['offset_ns'] == 0 and record['residual_ns'] == -1_221_412_000
+    assert not any(messages.values())
