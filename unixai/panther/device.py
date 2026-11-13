@@ -7,6 +7,7 @@ is forwarded into Agent Core's DDS domain.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -122,6 +123,14 @@ class PantherDevice:
         self._urdf = ""
         self._joint_limits: dict[str, tuple[float, float]] = {}
         self._joint_indices: dict[str, int] = {}
+        # Rendering stays on one internally consistent model/index snapshot.
+        # A live snapshot is activated when the model resource is read, so the
+        # streamed joint indices never switch before the matching URDF has been
+        # delivered to the renderer.
+        self._render_urdf = self._model_urdf
+        self._render_joint_indices = dict(self._model_joint_indices)
+        self._render_source = "bundled verified model"
+        self._render_model_sha256 = hashlib.sha256(self._render_urdf.encode()).hexdigest()
         self._odom_window: list[list] = []
         self._odom_vendor_ms = None
         self._odom_vendor_meta: dict = {}
@@ -409,7 +418,10 @@ class PantherDevice:
         self._publish_limited("robot_state", self.robot_state(), 2.0, force=force)
 
     def _joints_payload(self, msg, received) -> dict:
-        joint_indices = self._model_joint_indices
+        with self._lock:
+            joint_indices = dict(self._render_joint_indices)
+            model_source = self._render_source
+            model_sha256 = self._render_model_sha256
         joints = []
         dropped = 0
         for index, name in enumerate(msg.name):
@@ -440,6 +452,8 @@ class PantherDevice:
             "age_ms": age_ms(received),
             "format": "sensor/skeleton",
             "source_topic": "/joint_states",
+            "model_source": model_source,
+            "model_sha256": model_sha256,
             "joint_count": len(joints),
             "dropped": dropped,
             "joints": joints,
@@ -565,14 +579,28 @@ class PantherDevice:
             return self.robot_state()
         if card == "model":
             with self._lock:
+                if self._urdf:
+                    self._render_urdf = self._urdf
+                    self._render_joint_indices = dict(self._joint_indices)
+                    self._render_source = "live /robot_description"
+                    self._render_model_sha256 = hashlib.sha256(
+                        self._render_urdf.encode()
+                    ).hexdigest()
+                render_urdf = self._render_urdf
+                render_source = self._render_source
+                render_sha256 = self._render_model_sha256
+                render_joint_count = len(self._render_joint_indices)
                 live_limits = dict(self._joint_limits)
+                live_available = bool(self._urdf)
             different = sorted(
                 name for name in set(self._model_joint_limits) | set(live_limits)
                 if self._model_joint_limits.get(name) != live_limits.get(name)
             ) if live_limits else []
-            return {"model": "UniX AI Panther", "urdf": self._model_urdf,
-                    "available": True, "source": "bundled verified model",
-                    "live_robot_description_available": bool(live_limits),
+            return {"model": "UniX AI Panther", "urdf": render_urdf,
+                    "available": True, "source": render_source,
+                    "model_sha256": render_sha256,
+                    "render_joint_count": render_joint_count,
+                    "live_robot_description_available": live_available,
                     "live_limit_differences": different}
         if card == "odom":
             sample, received = self._get("odom_sample")

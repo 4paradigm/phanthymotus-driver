@@ -18,9 +18,12 @@ required for discovery.
   merged `laser_scan`, lazy `camera_color`, and lazy `camera_depth`.
 - Actuators: `base_drive`, `arm_control`, `gripper`, `lifting`, and `head`.
 
-`model` uses the bundled, stripped Panther URDF so the skeleton is available
-before the robot publishes anything. Live `/robot_description` remains the
-authoritative source for motion limits, and differences are reported. `joints`,
+`model` falls back to the bundled, stripped Panther URDF before the robot
+publishes anything. Once a live `/robot_description` is available, reading the
+model resource atomically switches both the returned URDF and the `joints`
+rendering indices to that same live snapshot. The response includes its source
+and SHA-256 digest so a renderer can identify the active morphology. Live
+`/robot_description` also remains authoritative for motion limits. `joints`,
 `imu`, `odom`, `robot_state`, and `laser_scan` are rate limited before crossing
 the per-card domain-42 bridge.
 
@@ -31,11 +34,33 @@ consumes only `/scan`, whose publisher on Panther is the existing
 `dual_lidar_merger`; this driver performs no second lidar fusion, but pools each
 angular bin to its nearest valid return and reports scan quality.
 
-The first camera card started on the canvas creates/starts the host transient
-unit `panther_orbbec.service` through `nsenter + systemd-run`, using the vendor
-workspace and launch command documented for Panther. RGB and depth share that
-source process. Stopping a card disarms only its forwarding path, and a bounded
-watchdog can restart the host unit after a measured frame stall.
+The first camera card started on the canvas reuses an already-active host
+`panther_orbbec.service` without taking ownership. Otherwise it creates a
+uniquely named host transient unit through `nsenter + systemd-run`, using the
+vendor workspace and launch command documented for Panther. Only that unique
+unit may be stopped or watchdog-restarted by this driver; a loaded but inactive
+host unit is left untouched. RGB and depth share the source process. Malformed
+frame diagnostics are bounded and sampled at the first failure and every 100th
+failure rather than logged once per frame.
+
+## Container dependencies
+
+Runtime Python and ROS dependencies are installed only through apt; there is no
+second pip requirements layer. This avoids duplicate NumPy/OpenCV binaries and
+keeps their ABI aligned with ROS Humble. The non-obvious packages are retained
+for these concrete runtime paths:
+
+| Package | Runtime reason | Image impact policy |
+|---|---|---|
+| `ros-humble-nav-msgs` | `nav_msgs/msg/Odometry` on `/odom` | Required even though the navigation card was removed |
+| `ros-humble-rmw-cyclonedds-cpp` | Robot-facing domain 0 process | Required |
+| `ros-humble-rmw-fastrtps-cpp` | Agent Core domain 42 bridge process | Required |
+| `python3-numpy`, `python3-opencv` | RGB/depth conversion and laser rendering | Apt-only; no duplicate pip wheels |
+| `util-linux` | `nsenter` into the host namespaces for the lazy camera source | Required |
+| `systemd` | `systemctl`/`systemd-run` clients for the owned host transient unit | Required; the driver does not run systemd in the container |
+
+For a base-image update, measure package-layer changes with `docker history`
+instead of recording a size that becomes stale with the moving base image.
 
 Every physical-motion action requires `confirm_motion: true`. Arm and head
 commands also require a live `/robot_description`; missing limits cause a hard

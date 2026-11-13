@@ -10,6 +10,7 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
+import uuid
 import zlib
 
 
@@ -31,8 +32,10 @@ class PantherCameraRuntime:
         self._frames = {"rgb": None, "depth": None}
         self._last_frame_at = {"rgb": 0.0, "depth": 0.0}
         self._last_publish_at = {"rgb": 0.0, "depth": 0.0}
+        self._frame_failures = {"rgb": 0, "depth": 0}
         self._armed_at = 0.0
-        self._managed_service = False
+        self._source_unit = None
+        self._managed_unit = None
         self._watchdog_restarts = 0
         self._closed = False
 
@@ -54,14 +57,15 @@ class PantherCameraRuntime:
         with self._lock:
             active = kind in self._active
             last = self._last_frame_at[kind]
-            managed = self._managed_service
+            source_unit = self._source_unit
+            managed_unit = self._managed_unit
         return {
             "state": "running" if active else "idle",
             "source_topic": source,
             "publisher_count": self._node.count_publishers(source),
             "last_frame_age_ms": None if not last else int((time.monotonic() - last) * 1000),
-            "host_service": self.HOST_UNIT,
-            "host_service_managed": managed,
+            "host_service": source_unit,
+            "host_service_managed": managed_unit is not None,
         }
 
     def start(self, kind: str) -> dict:
@@ -101,13 +105,14 @@ class PantherCameraRuntime:
             self._closed = True
             self._active.clear()
             self._frames = {"rgb": None, "depth": None}
-            managed = self._managed_service
+            managed_unit = self._managed_unit
+            self._managed_unit = None
         for thread in (self._rgb_thread, self._depth_thread, self._watchdog_thread):
             thread.join(timeout=2.0)
-        if managed:
+        if managed_unit:
             try:
-                self._run_host(["systemctl", "stop", self.HOST_UNIT], timeout=15.0)
-                print(f"[camera] stopped managed host unit {self.HOST_UNIT}", flush=True)
+                self._run_host(["systemctl", "stop", managed_unit], timeout=15.0)
+                print(f"[camera] stopped managed host unit {managed_unit}", flush=True)
             except Exception as exc:
                 print(f"[camera] failed to stop managed host unit: {exc}", flush=True)
 
@@ -134,37 +139,50 @@ class PantherCameraRuntime:
         if active.stdout.strip() == "active":
             # It belonged to the host or another process before this driver.
             # Use it, but never stop or watchdog-restart something we do not own.
+            with self._lock:
+                self._source_unit = self.HOST_UNIT
             return
 
-        # A failed/inactive transient unit may still be loaded. Starting it is
-        # cheaper and safer than attempting to create a duplicate unit name.
-        existing = self._run_host(
-            ["systemctl", "start", self.HOST_UNIT], timeout=15.0, check=False
+        # Never start or claim a loaded-but-inactive host unit. Create a unique
+        # transient unit instead, and only stop/restart that exact owned unit.
+        managed_unit = f"panther-orbbec-motus-{uuid.uuid4().hex[:12]}.service"
+        launch = (
+            "cd /home/unix_ai/orbbec_ws && "
+            ". install/setup.bash && "
+            "export ROS_DOMAIN_ID=0 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && "
+            "exec ros2 launch orbbec_camera gemini2.launch.py"
         )
-        if existing.returncode != 0:
-            launch = (
-                "cd /home/unix_ai/orbbec_ws && "
-                ". install/setup.bash && "
-                "export ROS_DOMAIN_ID=0 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && "
-                "exec ros2 launch orbbec_camera gemini2.launch.py"
-            )
-            self._run_host(
-                [
-                    "systemd-run",
-                    f"--unit={self.HOST_UNIT}",
-                    "--collect",
-                    "--property=Restart=on-failure",
-                    "--property=RestartSec=2s",
-                    "--uid=unix_ai",
-                    "--setenv=HOME=/home/unix_ai",
-                    "/bin/bash",
-                    "-lc",
-                    launch,
-                ],
-                timeout=15.0,
-            )
+        self._run_host(
+            [
+                "systemd-run",
+                f"--unit={managed_unit}",
+                "--collect",
+                "--property=Restart=on-failure",
+                "--property=RestartSec=2s",
+                "--uid=unix_ai",
+                "--setenv=HOME=/home/unix_ai",
+                "/bin/bash",
+                "-lc",
+                launch,
+            ],
+            timeout=15.0,
+        )
         with self._lock:
-            self._managed_service = True
+            self._source_unit = managed_unit
+            self._managed_unit = managed_unit
+
+    @staticmethod
+    def _bounded_error(exc: Exception, limit: int = 240) -> str:
+        escaped = str(exc).encode("unicode_escape", "backslashreplace").decode("ascii")
+        return escaped if len(escaped) <= limit else escaped[:limit] + "..."
+
+    def _log_frame_failure(self, kind: str, card: str, exc: Exception) -> None:
+        with self._lock:
+            self._frame_failures[kind] += 1
+            count = self._frame_failures[kind]
+        if count == 1 or count % 100 == 0:
+            detail = self._bounded_error(exc)
+            print(f"[{card}] dropped frame #{count}: {detail}", flush=True)
 
     def _on_rgb(self, msg) -> None:
         with self._lock:
@@ -243,7 +261,7 @@ class PantherCameraRuntime:
                 payload.update({"message_format": "jpeg", "data": encoded.tobytes()})
                 self._bridge.publish("camera_color", payload)
             except Exception as exc:
-                print(f"[camera_color] dropped frame: {exc}", flush=True)
+                self._log_frame_failure("rgb", "camera_color", exc)
 
     def _depth_loop(self) -> None:
         import cv2
@@ -293,7 +311,7 @@ class PantherCameraRuntime:
                 )
                 self._bridge.publish("camera_depth", payload)
             except Exception as exc:
-                print(f"[camera_depth] dropped frame: {exc}", flush=True)
+                self._log_frame_failure("depth", "camera_depth", exc)
 
     def _watchdog_loop(self) -> None:
         first_frame_grace = float(self._config.get("first_frame_grace_s", 30.0))
@@ -303,11 +321,11 @@ class PantherCameraRuntime:
             time.sleep(1.0)
             with self._lock:
                 active = set(self._active)
-                managed = self._managed_service
+                managed_unit = self._managed_unit
                 armed_at = self._armed_at
                 last = dict(self._last_frame_at)
                 restarts = self._watchdog_restarts
-            if not active or not managed or not armed_at:
+            if not active or not managed_unit or not armed_at:
                 continue
             unhealthy = []
             now = time.monotonic()
@@ -319,12 +337,12 @@ class PantherCameraRuntime:
             if not unhealthy or restarts >= maximum:
                 continue
             try:
-                self._run_host(["systemctl", "restart", self.HOST_UNIT], timeout=30.0)
+                self._run_host(["systemctl", "restart", managed_unit], timeout=30.0)
                 with self._lock:
                     self._watchdog_restarts += 1
                     self._armed_at = time.monotonic()
                     for kind in self._active:
                         self._last_frame_at[kind] = 0.0
-                print(f"[camera] restarted {self.HOST_UNIT}; stalled={unhealthy}", flush=True)
+                print(f"[camera] restarted {managed_unit}; stalled={unhealthy}", flush=True)
             except Exception as exc:
                 print(f"[camera] watchdog restart failed: {exc}", flush=True)

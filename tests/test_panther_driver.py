@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import math
 import re
 import sys
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = ROOT / "unixai" / "panther"
@@ -25,6 +29,7 @@ def _load(name):
 contracts = _load("contracts")
 core_bridge = _load("core_bridge")
 plugins = _load("plugins")
+camera = _load("camera")
 
 
 class PantherDriverTest(unittest.TestCase):
@@ -148,6 +153,14 @@ class PantherDriverTest(unittest.TestCase):
         </joint></robot>"""
         self.assertEqual(contracts.parse_joint_limits(urdf), {"joint_la0": (-1.0, 2.0)})
 
+    def test_render_model_and_joint_indices_share_one_snapshot(self):
+        device = (DRIVER / "device.py").read_text()
+        self.assertIn("self._render_urdf = self._urdf", device)
+        self.assertIn("self._render_joint_indices = dict(self._joint_indices)", device)
+        self.assertIn("joint_indices = dict(self._render_joint_indices)", device)
+        self.assertIn('"model_sha256": model_sha256', device)
+        self.assertIn('"source": render_source', device)
+
     def test_skeleton_indices_follow_kinematic_urdf_order(self):
         urdf = """<robot name='p'>
           <joint name='fixed_base' type='fixed'><parent link='a'/><child link='b'/></joint>
@@ -245,6 +258,74 @@ class PantherDriverTest(unittest.TestCase):
         self.assertEqual(device.calls, [])
         plugin.dispatch("start", {})
         self.assertEqual(device.calls, [("rgb", "start")])
+
+    def test_camera_only_manages_its_unique_transient_unit(self):
+        runtime = object.__new__(camera.PantherCameraRuntime)
+        runtime._node = SimpleNamespace(count_publishers=lambda _topic: 0)
+        runtime._lock = threading.RLock()
+        runtime._source_unit = None
+        runtime._managed_unit = None
+        calls = []
+
+        def run_host(command, timeout=15.0, check=True):
+            calls.append((command, timeout, check))
+            if command[:2] == ["systemctl", "is-active"]:
+                return SimpleNamespace(stdout="inactive\n", returncode=3)
+            return SimpleNamespace(stdout="", returncode=0)
+
+        runtime._run_host = run_host
+        runtime._ensure_source()
+        commands = [call[0] for call in calls]
+        self.assertFalse(any(command[:2] == ["systemctl", "start"] for command in commands))
+        launch = next(command for command in commands if command[0] == "systemd-run")
+        unit = next(value.split("=", 1)[1] for value in launch if value.startswith("--unit="))
+        self.assertRegex(unit, r"^panther-orbbec-motus-[0-9a-f]{12}\.service$")
+        self.assertEqual(runtime._managed_unit, unit)
+        self.assertEqual(runtime._source_unit, unit)
+
+        external = object.__new__(camera.PantherCameraRuntime)
+        external._node = SimpleNamespace(count_publishers=lambda _topic: 0)
+        external._lock = threading.RLock()
+        external._source_unit = None
+        external._managed_unit = None
+        external_calls = []
+
+        def active_host(command, timeout=15.0, check=True):
+            external_calls.append((command, timeout, check))
+            return SimpleNamespace(stdout="active\n", returncode=0)
+
+        external._run_host = active_host
+        external._ensure_source()
+        self.assertEqual(len(external_calls), 1)
+        self.assertEqual(external._source_unit, camera.PantherCameraRuntime.HOST_UNIT)
+        self.assertIsNone(external._managed_unit)
+
+    def test_camera_frame_failures_are_bounded_and_sampled(self):
+        runtime = object.__new__(camera.PantherCameraRuntime)
+        runtime._lock = threading.RLock()
+        runtime._frame_failures = {"rgb": 0, "depth": 0}
+        output = io.StringIO()
+        noisy = ValueError("bad\nlayout " + "x" * 400)
+        with contextlib.redirect_stdout(output):
+            for _ in range(200):
+                runtime._log_frame_failure("rgb", "camera_color", noisy)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertIn("#1:", lines[0])
+        self.assertIn("#100:", lines[1])
+        self.assertIn("#200:", lines[2])
+        self.assertTrue(all(len(line) < 300 for line in lines))
+
+    def test_container_dependency_contract_is_apt_only_and_explained(self):
+        dockerfile = (DRIVER / "Dockerfile").read_text()
+        readme = (DRIVER / "README.md").read_text()
+        self.assertFalse((DRIVER / "requirements.txt").exists())
+        self.assertIn("ros-humble-nav-msgs", dockerfile)
+        self.assertRegex(dockerfile, r"(?m)^\s+systemd\s*\\$")
+        self.assertIn("nav_msgs/msg/Odometry", readme)
+        self.assertIn("systemctl`/`systemd-run` clients", readme)
+        self.assertIn("dependencies are installed only through apt", readme)
+        self.assertIn("second pip requirements layer", readme)
 
     def test_canvas_registration_identity_remains_backward_compatible(self):
         config = (DRIVER / "config.yaml").read_text()

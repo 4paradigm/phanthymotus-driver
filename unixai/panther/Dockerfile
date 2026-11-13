@@ -34,6 +34,13 @@ RUN . /etc/os-release && \
       ros-humble-trajectory-msgs && \
     rm -rf /var/lib/apt/lists/*
 
+# Runtime dependencies deliberately come from Ubuntu/ROS apt packages. This
+# avoids duplicate pip NumPy/OpenCV wheels and keeps their ABI aligned with ROS.
+# nav-msgs is required for the /odom Odometry subscription; removing the
+# navigation card did not remove that message dependency. util-linux supplies
+# nsenter; systemd supplies the systemctl/systemd-run clients used to manage the
+# owned transient camera unit after entering the host namespaces.
+
 COPY --from=interface-builder /panther_ws/install /panther_ws/install
 WORKDIR /work
 COPY common/ /work/common/

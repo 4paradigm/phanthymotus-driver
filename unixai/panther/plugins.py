@@ -49,7 +49,7 @@ class JointsPlugin(SensorPlugin):
     def get_tools(self):
         return [super().get_tool(), {
             "name": "model", "type": "resource", "multiInstance": False,
-            "description": "Panther live URDF from /robot_description",
+            "description": "Panther live URDF from /robot_description, with bundled fallback",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         }]
 
