@@ -26,6 +26,6 @@ unixai-panther:
       max-size: "10m"
       max-file: "3"
   # Allow camera workers and the isolated Agent Core bridge to stop cleanly.
-  stop_grace_period: 15s
+  stop_grace_period: 30s
   restart: always
 

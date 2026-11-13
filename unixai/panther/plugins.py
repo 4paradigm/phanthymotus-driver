@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from common.camera_info import build as build_camera_info
 
 def _sensor_schema():
     return {
@@ -76,6 +77,10 @@ class ActuatorPlugin:
     def stop(self):
         if self.name == "base_drive":
             self.device.cancel_drive()
+        elif self.name == "arm_control":
+            self.device.arm({"action": "stop"})
+        elif self.name == "head":
+            self.device.head({"action": "stop"})
 
     def dispatch(self, action, args):
         payload = dict(args); payload["action"] = action
@@ -92,13 +97,26 @@ class CameraPlugin:
         self.description = description
 
     def get_tool(self):
+        topic = self.device.topics[self.name]
+        depth = self.kind == "depth"
         return {
             "name": self.name,
             "type": "sensor",
             "multiInstance": False,
             "description": self.description,
             "inputSchema": _sensor_schema(),
-            "topic_out": [self.device.topics[self.name]],
+            "topic_out": [topic],
+            "camera_info": [build_camera_info(
+                topic=topic["topic"],
+                id=f"unixai/panther/{self.name}",
+                format=topic["format"],
+                width=640 if depth else None,
+                height=480 if depth else None,
+                source="unknown",
+                pipeline=[f"unixai/panther/{self.kind}"]
+                         + (["unixai/panther/depth-crop-resize"] if depth else []),
+                vendor={"camera": "Orbbec Gemini 2 RGB-D", "transport": "ros2"},
+            )],
         }
 
     def start(self):
@@ -116,7 +134,8 @@ class CameraPlugin:
         return result
 
 
-def _action_schema(actions, properties, required_by_action=None, resource=None):
+def _action_schema(actions, properties, required_by_action=None, resource=None,
+                   completion=None, interruptible=False):
     schema = {
         "type": "object",
         "properties": {
@@ -130,6 +149,10 @@ def _action_schema(actions, properties, required_by_action=None, resource=None):
         schema["x-action-params"] = required_by_action
     if resource:
         schema["x-resource"] = resource
+    if completion:
+        schema["x-completion"] = completion
+    if interruptible:
+        schema["x-hooks"] = {"on_interrupt_motion": "stop", "on_interrupt_all": "stop"}
     return schema
 
 
@@ -153,7 +176,7 @@ def build_plugins(config, namespace, device):
     if on("laser_scan"):
         plugins.append(SensorPlugin(
             device, "laser_scan", "Panther merged dual-lidar scan from /scan",
-            ["laser_scan"],
+            ["laser_scan", "laser_view"],
         ))
     if on("camera_rgb"):
         plugins.append(CameraPlugin(
@@ -168,43 +191,58 @@ def build_plugins(config, namespace, device):
     if on("base_drive"):
         cfg = enabled["base_drive"]
         schema = _action_schema(
-            ["start", "info", "move", "cancel"],
+            ["start", "info", "move", "stop", "cancel"],
             {
                 "linear_x": {"type": "number", "minimum": -cfg["max_linear_mps"], "maximum": cfg["max_linear_mps"]},
                 "linear_y": {"type": "number", "minimum": -cfg["max_linear_mps"], "maximum": cfg["max_linear_mps"]},
-                "angular_z": {"type": "number", "minimum": -cfg["max_angular_radps"], "maximum": cfg["max_angular_radps"]},
+                "angular_z_deg_s": {"type": "number", "minimum": -cfg["max_angular_deg_s"], "maximum": cfg["max_angular_deg_s"],
+                                    "description": "Horizontal turn rate in degrees per second"},
                 "duration_s": {"type": "number", "minimum": 0.1, "maximum": cfg["max_duration_s"]},
                 "confirm_motion": confirm,
             },
-            {"move": {"params": ["linear_x", "linear_y", "angular_z", "duration_s", "confirm_motion"]},
-             "cancel": {"params": []}, "start": {"params": []}, "info": {"params": []}},
+            {"move": {"params": ["linear_x", "linear_y", "angular_z_deg_s", "duration_s", "confirm_motion"]},
+             "stop": {"params": []}, "cancel": {"params": []},
+             "start": {"params": []}, "info": {"params": []}},
             "base",
+            {"actions": ["move"], "timeout": cfg["max_duration_s"] + 10},
+            True,
         )
         plugins.append(ActuatorPlugin(device, "base_drive", "Finite-duration omnidirectional drive through /cmd_vel_teleop", schema, device.drive))
     if on("arm_control"):
+        joint_fields = {
+            **{f"la{i}_deg": {"type": "number", "description": f"Left arm joint la{i} target in degrees; omitted joints hold their current positions"}
+               for i in range(8)},
+            **{f"ra{i}_deg": {"type": "number", "description": f"Right arm joint ra{i} target in degrees; omitted joints hold their current positions"}
+               for i in range(8)},
+        }
         schema = _action_schema(
-            ["start", "info", "move"],
+            ["start", "info", "move", "home", "stop"],
             {
                 "side": {"type": "string", "enum": ["left", "right", "both"]},
-                "positions": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8},
-                "left_positions": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8},
-                "right_positions": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8},
+                **joint_fields,
+                "positions_deg": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8},
+                "left_positions_deg": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8},
+                "right_positions_deg": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8},
                 "duration_s": {"type": "number", "minimum": 1.0, "maximum": enabled["arm_control"]["max_duration_s"]},
                 "confirm_motion": confirm,
             },
-            {"move": {"params": ["side", "positions", "left_positions", "right_positions", "duration_s", "confirm_motion"]},
-             "start": {"params": []}, "info": {"params": []}},
+            {"move": {"params": ["side", *joint_fields, "duration_s", "confirm_motion"]},
+             "home": {"params": ["side", "confirm_motion"]},
+             "stop": {"params": []}, "start": {"params": []}, "info": {"params": []}},
             ["arm_l", "arm_r"],
+            {"actions": ["move", "home"], "timeout": enabled["arm_control"]["max_duration_s"] + 15},
+            True,
         )
         plugins.append(ActuatorPlugin(device, "arm_control", "Safe P2P arm control with verified controller switching", schema, device.arm))
     if on("gripper"):
         schema = _action_schema(
-            ["start", "info", "set"],
-            {"side": {"type": "string", "enum": ["left", "right"]},
-             "mode": {"type": "string", "enum": ["parallel", "2-finger", "centric"], "default": "parallel"},
+            ["start", "info", "set", "open", "close"],
+            {"side": {"type": "string", "enum": ["left", "right", "both"], "default": "both"},
              "position": {"type": "number", "minimum": 0.0, "maximum": 1.0},
              "confirm_motion": confirm},
-            {"set": {"params": ["side", "mode", "position", "confirm_motion"]},
+            {"set": {"params": ["side", "position", "confirm_motion"]},
+             "open": {"params": ["side", "confirm_motion"]},
+             "close": {"params": ["side", "confirm_motion"]},
              "start": {"params": []}, "info": {"params": []}}, ["hand_l", "hand_r"])
         plugins.append(ActuatorPlugin(device, "gripper", "Left/right Panther gripper position control", schema, device.gripper))
     if on("lifting"):
@@ -217,10 +255,14 @@ def build_plugins(config, namespace, device):
         plugins.append(ActuatorPlugin(device, "lifting", "Panther lifting position control", schema, device.lifting))
     if on("head"):
         schema = _action_schema(
-            ["start", "info", "look"],
-            {"pan_rad": {"type": "number"}, "tilt_rad": {"type": "number"}, "confirm_motion": confirm},
-            {"look": {"params": ["pan_rad", "tilt_rad", "confirm_motion"]},
-             "start": {"params": []}, "info": {"params": []}}, "head")
+            ["start", "info", "look", "home", "stop"],
+            {"yaw_deg": {"type": "number", "description": "Horizontal head angle in degrees"},
+             "pitch_deg": {"type": "number", "description": "Head pitch angle in degrees"},
+             "confirm_motion": confirm},
+            {"look": {"params": ["yaw_deg", "pitch_deg", "confirm_motion"]},
+             "home": {"params": ["confirm_motion"]}, "stop": {"params": []},
+             "start": {"params": []}, "info": {"params": []}}, "head",
+            {"actions": ["home"], "timeout": 30}, True)
         plugins.append(ActuatorPlugin(device, "head", "Panther head pan/tilt control using live URDF limits", schema, device.head))
     return plugins
 

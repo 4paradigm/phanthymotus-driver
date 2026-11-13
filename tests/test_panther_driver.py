@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import math
 import re
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = ROOT / "unixai" / "panther"
+sys.path.insert(0, str(ROOT))
 
 
 def _load(name):
@@ -22,6 +26,86 @@ plugins = _load("plugins")
 
 
 class PantherDriverTest(unittest.TestCase):
+    def test_control_cards_keep_safety_gates_and_add_lifecycle(self):
+        class FakeDevice:
+            topics = {
+                name: {"topic": f"/test/{name}", "format": "data/json"}
+                for name in ("joints", "robot_state", "imu", "odom", "laser_scan",
+                             "camera_rgb", "camera_depth")
+            }
+
+            def __getattr__(self, _name):
+                return lambda *_args, **_kwargs: None
+
+        config = {"plugins": {
+            "base_drive": {"enabled": True, "max_linear_mps": 0.5,
+                           "max_angular_deg_s": 45.0, "max_duration_s": 10.0},
+            "arm_control": {"enabled": True, "max_duration_s": 20.0},
+            "gripper": {"enabled": True},
+            "lifting": {"enabled": True, "max_position_m": 0.8},
+            "head": {"enabled": True},
+        }}
+        tools = {plugin.name: plugin.get_tool()
+                 for plugin in plugins.build_plugins(config, "test", FakeDevice())}
+        base = tools["base_drive"]["inputSchema"]
+        self.assertEqual(base["properties"]["confirm_motion"]["const"], True)
+        self.assertEqual(base["x-completion"]["actions"], ["move"])
+        self.assertEqual(base["x-hooks"]["on_interrupt_motion"], "stop")
+        self.assertEqual(base["properties"]["angular_z_deg_s"]["maximum"], 45.0)
+        self.assertEqual(base["properties"]["duration_s"]["maximum"], 10.0)
+        arm = tools["arm_control"]["inputSchema"]
+        self.assertTrue({"move", "home", "stop"} <= set(arm["properties"]["action"]["enum"]))
+        self.assertTrue({"la0_deg", "la7_deg", "ra0_deg", "ra7_deg"} <= set(arm["properties"]))
+        self.assertEqual(arm["properties"]["confirm_motion"]["const"], True)
+        gripper = tools["gripper"]["inputSchema"]
+        self.assertEqual(gripper["properties"]["side"]["enum"], ["left", "right", "both"])
+        self.assertTrue({"set", "open", "close"} <= set(gripper["properties"]["action"]["enum"]))
+        self.assertNotIn("mode", gripper["properties"])
+        head = tools["head"]["inputSchema"]
+        self.assertTrue({"look", "home", "stop"} <= set(head["properties"]["action"]["enum"]))
+        self.assertTrue({"yaw_deg", "pitch_deg"} <= set(head["properties"]))
+        exposed = json.dumps(tools, ensure_ascii=False)
+        self.assertIsNone(re.search(r"[一-鿿]", exposed))
+        self.assertNotRegex(exposed, r'"(?:head[01]|la[0-7]|ra[0-7])_rad"')
+
+    def test_head_channels_follow_physical_robot_mapping(self):
+        current = {"joint_head0": 0.0, "joint_head1": 0.0}
+        target = contracts.head_target_from_degrees(
+            {"yaw_deg": 30.0, "pitch_deg": -10.0}, current
+        )
+        self.assertAlmostEqual(target[0], math.radians(30.0))
+        self.assertAlmostEqual(target[1], math.radians(-10.0))
+        self.assertEqual(contracts.HEAD_YAW_JOINT, "joint_head0")
+        self.assertEqual(contracts.HEAD_PITCH_JOINT, "joint_head1")
+
+    def test_arm_degree_inputs_convert_at_the_ros_boundary(self):
+        converted = contracts.degrees_vector_to_radians(
+            [0.0, 30.0, -45.0, 90.0, 10.0, -10.0, 15.0, -15.0],
+            "positions_deg", 8,
+        )
+        self.assertAlmostEqual(converted[1], math.radians(30.0))
+        self.assertAlmostEqual(converted[2], math.radians(-45.0))
+        self.assertAlmostEqual(converted[3], math.radians(90.0))
+
+    def test_bundled_model_and_standardized_streams_are_packaged(self):
+        model = DRIVER / "resource" / "panther.urdf"
+        self.assertTrue(model.exists())
+        self.assertIn("joint_la0", model.read_text())
+        dockerfile = (DRIVER / "Dockerfile").read_text()
+        self.assertIn("COPY resource/panther.urdf /work/resource/panther.urdf", dockerfile)
+        device = (DRIVER / "device.py").read_text()
+        self.assertIn("build_sample", device)
+        self.assertIn("mean_twist", device)
+        self.assertIn('"orientation_xyzw"', device)
+        self.assertIn('"not_ready_reasons"', device)
+
+    def test_bridge_uses_independent_latest_only_lanes(self):
+        source = (DRIVER / "core_bridge.py").read_text()
+        self.assertIn("maxsize=1", source)
+        self.assertIn("target=_run_lane", source)
+        self.assertIn('name=f"panther_core_{card}"', source)
+        self.assertIn('"restarts"', source)
+
     def test_live_urdf_limits_are_authoritative(self):
         urdf = """<robot name='p'><joint name='joint_la0' type='revolute'>
           <limit lower='-1.0' upper='2.0' effort='1' velocity='1'/>
@@ -52,16 +136,19 @@ class PantherDriverTest(unittest.TestCase):
             )
 
     def test_drive_requires_explicit_motion_confirmation(self):
-        config = {"max_linear_mps": 0.2, "max_angular_radps": 0.3, "max_duration_s": 3.0}
+        config = {"max_linear_mps": 0.5, "max_angular_deg_s": 45.0, "max_duration_s": 10.0}
         with self.assertRaisesRegex(ValueError, "confirm_motion"):
             contracts.validate_drive({"linear_x": 0.1, "duration_s": 1.0}, config)
 
     def test_drive_caps_and_finite_duration(self):
-        config = {"max_linear_mps": 0.2, "max_angular_radps": 0.3, "max_duration_s": 3.0}
-        self.assertEqual(contracts.validate_drive(
-            {"linear_x": 0.1, "linear_y": -0.1, "angular_z": 0.2,
-             "duration_s": 1.0, "confirm_motion": True}, config
-        ), (0.1, -0.1, 0.2, 1.0))
+        config = {"max_linear_mps": 0.5, "max_angular_deg_s": 45.0, "max_duration_s": 10.0}
+        command = contracts.validate_drive(
+            {"linear_x": 0.5, "linear_y": -0.5, "angular_z_deg_s": 45.0,
+             "duration_s": 10.0, "confirm_motion": True}, config
+        )
+        self.assertEqual(command[:2], (0.5, -0.5))
+        self.assertAlmostEqual(command[2], math.radians(45.0))
+        self.assertEqual(command[3], 10.0)
         with self.assertRaisesRegex(ValueError, "duration_s"):
             contracts.validate_drive(
                 {"linear_x": 0.0, "duration_s": -1, "confirm_motion": True}, config
@@ -81,6 +168,7 @@ class PantherDriverTest(unittest.TestCase):
         topics = core_bridge.output_topics("test")
         self.assertEqual(topics["robot_state"]["format"], "data/json")
         self.assertEqual(topics["laser_scan"]["topic"], "/test/panther/laser_scan")
+        self.assertEqual(topics["laser_view"]["format"], "image/jpeg")
         self.assertEqual(topics["camera_rgb"]["format"], "image/jpeg")
         self.assertEqual(topics["camera_depth"]["format"], "image/depth-zlib")
         self.assertFalse({"laser_front", "laser_rear", "laser_fused"} & set(topics))
@@ -116,6 +204,7 @@ class PantherDriverTest(unittest.TestCase):
 
         device = FakeDevice()
         plugin = plugins.CameraPlugin(device, "camera_rgb", "rgb", "test")
+        self.assertEqual(plugin.get_tool()["camera_info"][0]["schema"], "motus.camera/1")
         plugin.start()
         self.assertEqual(device.calls, [])
         plugin.dispatch("start", {})
@@ -146,7 +235,7 @@ class PantherDriverTest(unittest.TestCase):
         )
         self.assertIn("CYCLONEDDS_URI=file:///etc/cyclonedds/panther.xml", service)
         self.assertIn("network_mode: host", service)
-        self.assertIn("stop_grace_period: 15s", service)
+        self.assertIn("stop_grace_period: 30s", service)
 
     def test_dockerfile_builds_observed_gripper_interface(self):
         dockerfile = (DRIVER / "Dockerfile").read_text()

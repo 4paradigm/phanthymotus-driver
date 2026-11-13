@@ -101,8 +101,15 @@ class PantherCameraRuntime:
             self._closed = True
             self._active.clear()
             self._frames = {"rgb": None, "depth": None}
+            managed = self._managed_service
         for thread in (self._rgb_thread, self._depth_thread, self._watchdog_thread):
             thread.join(timeout=2.0)
+        if managed:
+            try:
+                self._run_host(["systemctl", "stop", self.HOST_UNIT], timeout=15.0)
+                print(f"[camera] stopped managed host unit {self.HOST_UNIT}", flush=True)
+            except Exception as exc:
+                print(f"[camera] failed to stop managed host unit: {exc}", flush=True)
 
     def _run_host(self, command, timeout: float = 15.0, check: bool = True):
         return subprocess.run(
@@ -125,8 +132,8 @@ class PantherCameraRuntime:
             ["systemctl", "is-active", self.HOST_UNIT], timeout=5.0, check=False
         )
         if active.stdout.strip() == "active":
-            with self._lock:
-                self._managed_service = True
+            # It belonged to the host or another process before this driver.
+            # Use it, but never stop or watchdog-restart something we do not own.
             return
 
         # A failed/inactive transient unit may still be loaded. Starting it is
@@ -202,6 +209,7 @@ class PantherCameraRuntime:
 
         hz = max(1.0, min(float(self._config.get("rgb_hz", 10.0)), 20.0))
         quality = max(20, min(int(self._config.get("jpeg_quality", 70)), 95))
+        max_width = max(160, int(self._config.get("max_width", 640)))
         channels = {"rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4, "mono8": 1}
         while not self._closed:
             message = self._take_latest("rgb", hz)
@@ -225,6 +233,9 @@ class PantherCameraRuntime:
                     image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
                 elif encoding == "bgra8":
                     image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+                if width > max_width:
+                    output_height = max(1, round(height * max_width / width))
+                    image = cv2.resize(image, (max_width, output_height), interpolation=cv2.INTER_AREA)
                 ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
                 if not ok:
                     raise ValueError("JPEG encoder rejected frame")
@@ -245,16 +256,24 @@ class PantherCameraRuntime:
                 time.sleep(0.01)
                 continue
             try:
-                if str(message.encoding) not in ("16UC1", "mono16") or message.is_bigendian:
+                encoding = str(message.encoding)
+                if encoding not in ("16UC1", "mono16", "32FC1"):
                     raise ValueError(f"unsupported depth encoding: {message.encoding}")
+                item_size = 4 if encoding == "32FC1" else 2
                 width, height, step = int(message.width), int(message.height), int(message.step)
-                if width <= 0 or height <= 0 or step < width * 2:
+                if width <= 0 or height <= 0 or step < width * item_size:
                     raise ValueError("invalid depth layout")
                 raw = np.frombuffer(message.data, dtype=np.uint8)
                 if raw.size < height * step:
                     raise ValueError("truncated depth image")
-                depth = raw[: height * step].reshape(height, step)[:, : width * 2]
-                depth = depth.view("<u2").reshape(height, width)
+                depth = raw[: height * step].reshape(height, step)[:, : width * item_size]
+                byte_order = ">" if message.is_bigendian else "<"
+                if encoding == "32FC1":
+                    metres = depth.copy().view(byte_order + "f4").reshape(height, width).astype(np.float64)
+                    metres[~np.isfinite(metres) | (metres < 0)] = 0.0
+                    depth = np.clip(np.rint(metres * 1000.0), 0, 65535).astype("<u2")
+                else:
+                    depth = depth.copy().view(byte_order + "u2").reshape(height, width).astype("<u2")
                 if width * 3 > height * 4:
                     crop_width = height * 4 // 3
                     left = (width - crop_width) // 2

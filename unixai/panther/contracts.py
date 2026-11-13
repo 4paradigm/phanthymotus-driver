@@ -10,7 +10,12 @@ from typing import Optional
 
 LEFT_ARM_JOINTS = tuple(f"joint_la{i}" for i in range(8))
 RIGHT_ARM_JOINTS = tuple(f"joint_ra{i}" for i in range(8))
-HEAD_JOINTS = ("joint_head0", "joint_head1")
+# Verified on the physical Panther: the forward-position controller's first
+# channel turns the head horizontally and the second channel controls pitch.
+# This intentionally overrides the semantic axes suggested by the vendor URDF.
+HEAD_YAW_JOINT = "joint_head0"
+HEAD_PITCH_JOINT = "joint_head1"
+HEAD_JOINTS = (HEAD_YAW_JOINT, HEAD_PITCH_JOINT)
 
 
 def finite_number(value, field: str) -> float:
@@ -26,6 +31,26 @@ def finite_vector(value, field: str, length: int) -> list[float]:
     if not isinstance(value, (list, tuple)) or len(value) != length:
         raise ValueError(f"{field} must contain exactly {length} numbers")
     return [finite_number(item, f"{field}[{index}]") for index, item in enumerate(value)]
+
+
+def degrees_to_radians(value, field: str) -> float:
+    return math.radians(finite_number(value, field))
+
+
+def degrees_vector_to_radians(value, field: str, length: int) -> list[float]:
+    return [math.radians(item) for item in finite_vector(value, field, length)]
+
+
+def head_target_from_degrees(args: dict, current: dict[str, float]) -> list[float]:
+    """Map user-facing yaw/pitch degrees to the two verified controller channels."""
+    yaw = args.get("yaw_deg")
+    pitch = args.get("pitch_deg")
+    if yaw is None and pitch is None:
+        raise ValueError("at least one of yaw_deg/pitch_deg is required")
+    return [
+        current.get(HEAD_YAW_JOINT) if yaw is None else degrees_to_radians(yaw, "yaw_deg"),
+        current.get(HEAD_PITCH_JOINT) if pitch is None else degrees_to_radians(pitch, "pitch_deg"),
+    ]
 
 
 def require_confirmation(args: dict) -> None:
@@ -97,12 +122,15 @@ def validate_joint_target(
     for name, value in zip(joint_names, target):
         lower, upper = limits[name]
         if not lower <= value <= upper:
-            raise ValueError(f"{name} target {value} is outside URDF limit [{lower}, {upper}]")
+            raise ValueError(
+                f"{name} target {math.degrees(value):.2f} deg is outside URDF limit "
+                f"[{math.degrees(lower):.2f}, {math.degrees(upper):.2f}] deg"
+            )
         delta = abs(value - float(current[name]))
         if delta > max_delta:
             raise ValueError(
-                f"{name} target delta {delta:.4f} rad exceeds commissioning gate "
-                f"{max_delta:.4f} rad"
+                f"{name} target delta {math.degrees(delta):.2f} deg exceeds commissioning gate "
+                f"{math.degrees(max_delta):.2f} deg"
             )
     return target
 
@@ -111,18 +139,20 @@ def validate_drive(args: dict, config: dict) -> tuple[float, float, float, float
     require_confirmation(args)
     vx = finite_number(args.get("linear_x", 0.0), "linear_x")
     vy = finite_number(args.get("linear_y", 0.0), "linear_y")
-    wz = finite_number(args.get("angular_z", 0.0), "angular_z")
+    wz_deg_s = finite_number(args.get("angular_z_deg_s", 0.0), "angular_z_deg_s")
     duration = finite_number(args.get("duration_s", 1.0), "duration_s")
     max_linear = finite_number(config["max_linear_mps"], "max_linear_mps")
-    max_angular = finite_number(config["max_angular_radps"], "max_angular_radps")
+    max_angular_deg_s = finite_number(config["max_angular_deg_s"], "max_angular_deg_s")
     max_duration = finite_number(config["max_duration_s"], "max_duration_s")
     if abs(vx) > max_linear or abs(vy) > max_linear:
         raise ValueError(f"linear velocity exceeds configured commissioning cap {max_linear} m/s")
-    if abs(wz) > max_angular:
-        raise ValueError(f"angular velocity exceeds configured commissioning cap {max_angular} rad/s")
+    if abs(wz_deg_s) > max_angular_deg_s:
+        raise ValueError(
+            f"angular velocity exceeds configured commissioning cap {max_angular_deg_s} deg/s"
+        )
     if not 0.1 <= duration <= max_duration:
         raise ValueError(f"duration_s must be in [0.1, {max_duration}]")
-    return vx, vy, wz, duration
+    return vx, vy, math.radians(wz_deg_s), duration
 
 
 def fresh(received_monotonic: Optional[float], max_age_s: float = 2.0) -> bool:

@@ -38,6 +38,7 @@ COPY --from=interface-builder /panther_ws/install /panther_ws/install
 WORKDIR /work
 COPY common/ /work/common/
 COPY main.py device.py plugins.py contracts.py core_bridge.py camera.py config.yaml driver.yaml /work/
+COPY resource/panther.urdf /work/resource/panther.urdf
 COPY entrypoint.sh /work/entrypoint.sh
 COPY deploy/ /deploy/
 RUN chmod 0755 /work/entrypoint.sh
