@@ -607,6 +607,11 @@ class LocoServoPlugin:
                            on_watchdog=self._hold, on_abort=self._hold)
         # Register before starting, so a concurrent stop can find and cancel it.
         with self._lock:
+            # Observation admission may have reserved the chassis since the
+            # preflight above. Commit under this lock only after rechecking.
+            conflict = self._chassis_conflict()
+            if conflict:
+                return {"state": "error", "message": conflict}
             if self._running:
                 return {"state": "error",
                         "message": f"已经在运行（{self._input_topic}）"}

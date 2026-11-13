@@ -273,12 +273,15 @@ def test_loco_relative_move_tool_schema_contract(monkeypatch):
     tool = [t for t in plugin.get_tools() if t['name'] == 'loco_relative_move'][0]
     assert tool['type'] == 'actuator' and tool['multiInstance'] is False
     props = tool['inputSchema']['properties']
-    assert set(props['action']['enum']) == {'rotate', 'move', 'stop_move', 'status'}
+    expected_actions = {'rotate', 'move', 'stop_move', 'status', 'observation_begin',
+                        'observation_rotate', 'observation_status', 'observation_end'}
+    assert set(props['action']['enum']) == expected_actions
     assert 'distance_m' not in props and 'direction' not in props
     assert props['angle_deg']['minimum'] == -360 and props['angle_deg']['maximum'] == 360
-    assert tool['inputSchema']['x-hooks'] == {'on_interrupt_motion': {'action': 'stop_move'}}
-    assert tool['inputSchema']['x-completion'] == {'actions': ['rotate', 'move'], 'timeout': 120}
-    assert set(tool['inputSchema']['x-action-params']) == {'rotate', 'move', 'stop_move', 'status'}
+    assert tool['inputSchema']['x-hooks'] == {'on_interrupt_motion': {'action': 'stop_move'},
+                                             'on_interrupt_all': {'action': 'stop_move'}}
+    assert tool['inputSchema']['x-completion'] == {'actions': ['rotate', 'move', 'observation_rotate'], 'timeout': 120}
+    assert set(tool['inputSchema']['x-action-params']) == expected_actions
     assert tool['inputSchema']['x-action-params']['rotate']['params'] == ['angle_deg']
     assert tool['inputSchema']['x-action-params']['move']['params'] == ['x_m', 'y_m']
 
@@ -1280,13 +1283,14 @@ def test_status_reflects_last_rotate_result(monkeypatch):
         'status', {'_tool_name': 'loco_relative_move'}
     ) == {"state": "idle", "last_result": None}         # 初始：无前次结果
 
-    idle_plugin.dispatch(
+    accepted = idle_plugin.dispatch(
         'rotate', {'_tool_name': 'loco_relative_move', 'angle_deg': 60})
     result = wait_rotate(idle_plugin)
     assert result['state'] == 'done'
     assert idle_plugin.dispatch(
         'status', {'_tool_name': 'loco_relative_move'}
-    ) == {"state": "idle", "last_result": result}       # 与前次 rotate 完全一致
+    ) == {"state": "idle", "last_result": result,
+          "last_action_id": accepted['action_id']}       # 终态与原 action_id 关联
 
     # dispatch 立即返回 action_id（150° / gain=1 转不完），进行中 status 报 running。
     run_plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl(gain_deg_per_tick=1.0))

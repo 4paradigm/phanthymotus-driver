@@ -6,6 +6,15 @@ plugins:
     enabled: true
   loco:
     enabled: true
+    # Observation sessions use fixed driver-side limits in observation_safety.py:
+    # one turn <=10 deg, at most 3 turns, absolute total <=30 deg. They never
+    # inherit loco_servo.dry_run; only observation_rotate may move in a session.
+  traffic_police_gesture:
+    enabled: true
+    # Configure only after on-site teaching/verification. No fallback gestures.
+    stop_recording_id: null
+    go_recording_id: null
+    playback_timeout_s: 60
   # 底盘的流式控制卡片（motus.control/1 的 twist）。和上面的 loco 是同一个身体的
   # 两条路径：loco 是调用形态，一次 tools/call 一个动作；这张是数据面，订阅一路
   # control/velocity 指令流，给 actucore 的 navi 这类策略用。两者显式仲裁 ——
@@ -50,6 +59,15 @@ plugins:
     #   systemctl disable --now noetix-video-capture.service
     # Set false only when official App video transfer must retain the camera.
     disable_vendor_capture_service: true
+  # Registered at bundle boot; subscribes only after Card start supplies VOP input.
+  # Reuses existing Camera/VOP data. No model or camera process is started here.
+  traffic_light:
+    enabled: true
+    cache_size: 64
+    max_age_s: 1.0
+    max_tracks: 32
+    track_ttl_s: 1.0
+    min_detection_confidence: 0.3
   # 只读 RGB-D 视觉里程计（RTAB-Map rgbd_odometry，在 bundle 进程内运行）。
   # 内置 IMU 只辅助旋转初值；无惯性位移积分/EKF，不参与运动控制；
   # 停止本卡片只回收它自己的估计子进程和私有话题，不影响相机/媒体/动作卡。

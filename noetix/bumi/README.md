@@ -2,6 +2,10 @@
 
 The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
 
+智能交警 V1.0 的 `traffic_light` 由本 Bumi bundle 暴露，唯一实现位于 `common/traffic_light/`，随现有 common COPY进入标准Driver镜像；不依赖相邻主仓库源码。默认注册为多实例processor，只有Card start收到VOP输入绑定后才订阅已有RGB/objects，不启动Camera或VOP。发布与隔离测试见 [P1-1接入说明](../../docs/BUMI_TRAFFIC_LIGHT_P1_1.md)，观察会话和Skill见 [总说明](../../docs/BUMI_SMART_TRAFFIC_POLICE_V1.md)。主机侧 P1-1～P1-4 及 P2-2 Driver 部分已完成；P2-1 为 Agent Core 平台已知问题，不在本 Driver PR 中修改。当前尚未完成新镜像部署和真机验收。
+
+Bumi 专用 `traffic_police_gesture` 复用现有示教播放和身体动作互斥，只提供停车/放行手势。业务调用为 `stop(execute=true)`、`go(execute=true)`；不带 execute 的生命周期 stop 只取消，停车手势与底盘 `stop_move` 含义不同。两个 recording ID 在 `plugins.traffic_police_gesture` 中默认 null；SDK没有物理完成事件，须现场观察并用 cancel 核验退出。配置、ACP及测试见 [交警手势说明](../../docs/BUMI_TRAFFIC_POLICE_GESTURE_V1.md)。
+
 ## `mic` and `sound_direction`
 
 `mic` publishes mono PCM `AudioChunk` messages on `/<namespace>/mic/audio`.

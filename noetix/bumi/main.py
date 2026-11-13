@@ -143,8 +143,11 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("loco", {}).get("enabled", False) and high_ctrl is not None:
             from device import LocoPlugin
+            loco_config = dict(plugins_cfg["loco"])
+            if "traffic_police_gesture" in plugins_cfg:
+                loco_config["traffic_police_gesture"] = plugins_cfg["traffic_police_gesture"]
             loco_plugin = LocoPlugin(
-                plugins_cfg["loco"], namespace, executor, high_ctrl)
+                loco_config, namespace, executor, high_ctrl)
             self._plugins.append(loco_plugin)
             print("[bundle] LocoPlugin loaded")
 
@@ -180,6 +183,14 @@ class BumiDeviceBundle:
             camera_plugin = CameraPlugin(plugins_cfg["camera"], namespace, executor)
             self._plugins.append(camera_plugin)
             print("[bundle] CameraPlugin loaded")
+
+        # A ROS processor, independent of the camera/controller SDK availability.
+        # Bundle boot does not subscribe; Core supplies the VOP binding at Card start.
+        if plugins_cfg.get("traffic_light", {}).get("enabled", False):
+            from common.traffic_light import TrafficLightPlugin
+            self._plugins.append(TrafficLightPlugin(
+                plugins_cfg["traffic_light"], namespace, executor))
+            print("[bundle] TrafficLightPlugin loaded")
 
         if plugins_cfg.get("visual_odometry", {}).get("enabled", False):
             if camera_plugin is None:
@@ -223,8 +234,24 @@ class BumiDeviceBundle:
 
     def stop_all(self) -> None:
         # Stop media consumers before tearing down the camera producer.
-        for p in reversed(self._plugins):
-            p.stop()
+        errors = []
+        for i, p in reversed(list(enumerate(self._plugins))):
+            try:
+                result = p.stop()
+                if result is False:
+                    raise RuntimeError("returned False")
+                if isinstance(result, dict) and (result.get("state") == "error" or result.get("ok") is False):
+                    raise RuntimeError(result.get("error") or result.get("message")
+                                       or "returned an unsuccessful stop result")
+            except Exception as exc:
+                detail = f"Plugin {i} ({type(p).__name__}) stop() FAILED: {type(exc).__name__}: {exc}"
+                print(f"[bundle] {detail}", flush=True)
+                errors.append((detail, exc))
+        if errors:
+            # Python 3.10 has no ExceptionGroup. Keep every failure in the
+            # summary and the first original exception as the cause.
+            raise RuntimeError(f"[bundle] {len(errors)}/{len(self._plugins)} plugins failed to stop: "
+                               + "; ".join(detail for detail, _ in errors)) from errors[0][1]
         print("[bundle] All plugins stopped")
 
     def get_all_tools(self) -> list:
@@ -495,8 +522,10 @@ def main():
 
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
-        _bundle.stop_all()
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        try:
+            _bundle.stop_all()
+        finally:
+            threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
@@ -504,9 +533,13 @@ def main():
     try:
         server.serve_forever()
     finally:
-        _bundle.stop_all()
-        executor.shutdown()
-        rclpy.shutdown()
+        try:
+            _bundle.stop_all()
+        finally:
+            try:
+                executor.shutdown()
+            finally:
+                rclpy.shutdown()
 
 
 if __name__ == "__main__":
