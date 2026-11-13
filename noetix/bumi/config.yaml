@@ -93,3 +93,8 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+
+  joint_activity_stats:
+    enabled: true
+    window_s: 10
+    publish_hz: 1
