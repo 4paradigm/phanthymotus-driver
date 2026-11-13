@@ -140,6 +140,19 @@ class S10LocoServoPlugin:
         profile = os.environ.get("S10_CORE_FASTDDS_PROFILE", "/tmp/s10-pro-core-fastdds.xml")
         with self._lock:
             if self._running: return {"state": "error", "message": "loco_servo 已在运行"}
+            if not requested_dry_run:
+                try:
+                    # Match loco.move: navigation mode, then navigation-flat gait,
+                    # before a subscriber can deliver any velocity command.
+                    for message_type, command, items in (
+                        (0x00100002, 0x00500002, {"Mode": 1}),
+                        (0x00100001, 0x00300002, {"GaitParam": 0x3002}),
+                    ):
+                        result = self.native.send(message_type, command, items)
+                        if isinstance(result, dict) and result.get("ErrorCode", 0) not in (0, "0"):
+                            raise RuntimeError(f"native command rejected: {result['ErrorCode']}")
+                except Exception as exc:
+                    return {"state": "error", "message": f"启动导航模式失败: {exc}"}
             self._dry_run = requested_dry_run
             self._sink = ControlSink(self._descriptor, self._apply, on_watchdog=self._hold, on_abort=self._hold)
             self._topic, self._running, self._paused = topic, True, False

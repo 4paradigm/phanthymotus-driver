@@ -90,6 +90,11 @@ subscribes on Core domain 42 through a loopback-only bridge process. A frontend
 `start` action arms real velocity input by default; this action is the operator
 confirmation, so no separate `dry_run=false` or `confirm=true` arguments are
 needed. Set `dry_run=true` explicitly for validation without native movement.
+Live startup sends navigation mode (`Mode=1`) and navigation-flat gait
+(`GaitParam=0x3002`) before subscribing to velocity input, matching `loco.move`.
+If either send fails, startup returns an error without arming the stream.
+Dry-run startup skips both commands. A successful send is not confirmation
+that the physical mode transition has completed; the standing-state gate still applies.
 Real motion still requires `S10_MOTION_ENABLED=1` in the deployment environment;
 the supplied service fragment enables that deployment permission by default.
 Set `S10_MOTION_ENABLED=0` to revoke it. The servo stops on its watchdog. The speed limits

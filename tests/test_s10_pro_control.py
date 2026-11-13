@@ -1763,6 +1763,64 @@ def test_loco_servo_refuses_to_start_while_navigation_owns_base(monkeypatch):
     assert "navigation" in result["message"]
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_loco_servo_start_enters_navigation_before_subscribing(monkeypatch, dry_run):
+    monkeypatch.syspath_prepend(str(DRIVER))
+    monkeypatch.setenv("S10_MOTION_ENABLED", "1")
+    from loco_servo import S10LocoServoPlugin
+
+    native = FakeNative({})
+    expected = [] if dry_run else [
+        ((0x00100002, 0x00500002, {"Mode": 1}), {}),
+        ((0x00100001, 0x00300002, {"GaitParam": 0x3002}), {}),
+    ]
+
+    def subscribe(*_args):
+        assert native.calls == expected
+        return SimpleNamespace(stop=lambda: None)
+
+    monkeypatch.setattr("loco_servo.CoreSubscriber", subscribe)
+    plugin = S10LocoServoPlugin(native, ros2=object())
+    monkeypatch.setattr(plugin, "_read_loop", lambda: None)
+    try:
+        result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": dry_run})
+        assert result["state"] == "ready"
+        assert native.calls == expected
+        assert plugin.dispatch("start", {"input_topic": "/policy/velocity"})["state"] == "error"
+        assert native.calls == expected
+    finally:
+        plugin.stop()
+
+
+@pytest.mark.parametrize("failed_command", [0x00500002, 0x00300002])
+@pytest.mark.parametrize("failure", ["exception", "rejected"])
+def test_loco_servo_navigation_setup_failure_does_not_arm(monkeypatch, failed_command, failure):
+    monkeypatch.syspath_prepend(str(DRIVER))
+    monkeypatch.setenv("S10_MOTION_ENABLED", "1")
+    from loco_servo import S10LocoServoPlugin
+
+    class Native(FakeNative):
+        def send(self, message_type, command, items):
+            super().send(message_type, command, items)
+            if command == failed_command:
+                if failure == "exception":
+                    raise OSError("connection lost")
+                return {"ErrorCode": 1}
+            return {"state": "sent"}
+
+    native = Native({})
+    plugin = S10LocoServoPlugin(native, ros2=object())
+    monkeypatch.setattr("loco_servo.CoreSubscriber",
+                        lambda *_args: pytest.fail("must not subscribe after setup failure"))
+    result = plugin.dispatch("start", {"input_topic": "/policy/velocity"})
+    assert result["state"] == "error"
+    assert "导航" in result["message"]
+    assert plugin.dispatch("info", {})["state"] == "idle"
+    assert plugin._sink is None
+    assert plugin._subscriber is None
+    assert len(native.calls) == (1 if failed_command == 0x00500002 else 2)
+
+
 def test_loco_servo_start_arms_without_separate_confirmation_arguments(monkeypatch):
     monkeypatch.syspath_prepend(str(DRIVER))
     monkeypatch.setenv("S10_MOTION_ENABLED", "1")
@@ -1947,6 +2005,7 @@ def test_loco_servo_core_stream_validates_messages_and_watchdog_holds(monkeypatc
     try:
         plugin.dispatch("config", {"dry_run": False, "confirm": True})
         assert plugin.dispatch("start", {"input_topic": "/policy/velocity"})["state"] == "ready"
+        native.calls.clear()  # Count velocity/watchdog sends after navigation setup.
 
         subscriber.payloads.append(command([0.2, 0.1, 0.0, 0.0, 0.0, -0.2]))
         wait_for(lambda: len(native.calls) == 1)
