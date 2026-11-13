@@ -368,6 +368,20 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 `footprint` 的出错方向是单边的（以为自己更宽只是多减速，以为更窄就是把肩膀送进
 门框），所以默认值刻意偏宽；死区不是，所以它宁可声明成估计值也不写零。
 
+## `loco` movement commands
+
+`loco.move` accepts unitless commands in `[-1, 1]` on each axis. Positive `vx`
+moves forward, negative moves backward. Positive `vy` moves left, negative
+moves right. Positive `vyaw` turns left, negative turns right. A zero axis is
+neutral. The driver rejects invalid commands before pausing another movement.
+With `duration=0`, a move ends on `stop_move` or after the five-second watchdog.
+
+Ground speed depends on the robot, walking mode, direction, and surface. The
+calibration above records a forward and lateral full-scale measurement and
+their deadbands on one robot. It does not define speed tiers. To label presets
+with measured speeds, measure the four translation directions separately on
+the target firmware and walking mode using commands within `[-1, 1]`.
+
 ## Direct action cards
 
 The former `switch_mode` tool is split into three user-facing cards. Internal
