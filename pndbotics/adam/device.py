@@ -7,6 +7,7 @@ Plugins:
   PosturePlugin / MotionPlugin / TrackingMotionPlugin — focused RL execution cards
   ArmPlugin    — DDS rt/lowcmd upper body control
   HandPlugin   — DDS rt/handcmd finger control and hand-state query
+  LivoxLidarPlugin — container-local MID-360 ROS driver and point-cloud card
   ModelPlugin  — URDF resource for 3D visualization
 """
 
@@ -5047,6 +5048,15 @@ class AdamDeviceBundle:
             camera_plugin = ZedCameraPlugin(
                 plugins_cfg.get("camera", {}), namespace, executor)
             self._plugins.append(camera_plugin)
+
+        # The MID-360 is connected directly to Adam's Jetson.  Its official
+        # ROS driver runs inside this container and the plugin converts the
+        # resulting PointCloud2 stream into the dashboard point-cloud wire
+        # format.  Keep it independent from the ZED camera point cloud.
+        if plugins_cfg.get("lidar", {}).get("enabled", False) and self._ros2_enabled:
+            from lidar import LivoxLidarPlugin
+            self._plugins.append(LivoxLidarPlugin(
+                plugins_cfg.get("lidar", {}), namespace, executor))
 
         # Capture is intentionally a separate card, while sharing the single
         # locally attached ZED SDK instance owned by ``camera_plugin``.

@@ -72,6 +72,30 @@ plugins:
         x: 0.0
         y: 1.8
         z: 0.0
+  lidar:
+    enabled: true
+    # Verified on Adam's robot-facing eno1 network. The Livox ROS driver runs
+    # inside this host-networked container and binds the matching 56xxx ports.
+    host_ip: "192.168.1.50"
+    lidar_ip: "192.168.1.173"
+    source_topic: "/livox/lidar"
+    frame_id: "livox_frame"
+    publish_freq_hz: 10.0
+    # Keep Jetson conversion and DDS latency bounded. Raise only after checking
+    # lidar_cloud diagnostics and end-to-end card latency on the robot.
+    max_points: 10000
+    # Zero means no range clipping. Mount values express the lidar frame in
+    # Adam's x-forward/y-left/z-up base convention.
+    max_distance_m: 0
+    restart_delay_s: 3.0
+    mount_rotation_deg:
+      roll: 0.0
+      pitch: 0.0
+      yaw: 0.0
+    mount_translation_m:
+      x: 0.0
+      y: 0.0
+      z: 0.0
   vision_capture:
     enabled: true
     # The host data mount makes captures survive container replacement.
