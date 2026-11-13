@@ -11,7 +11,7 @@ signing key on a separate trusted operator workstation. Missing key configuratio
 fails closed. Agent must not have administrative access to replace the Driver
 or its public key; deployment isolation remains an explicit acceptance gate.
 See [interface and limitations](SOUND_FACING.md),
-[review notes](SOUND_FACING_REVIEW.md), and the
+[review notes](SOUND_FACING_REVIEW.md), [current test evidence](SOUND_FACING_TESTING.md), and the
 [staged hardware acceptance plan](SOUND_FACING_HARDWARE_ACCEPTANCE.md).
 
 The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.

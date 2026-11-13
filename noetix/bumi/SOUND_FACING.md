@@ -8,7 +8,7 @@ Agent 和 Canvas 仅能在独立操作员签名授权内通过现有 MCP 路径�
 
 ## 输入契约
 
-核对 Driver 基线 `814b3ca953d33eba0aca9a61dcefa773f5da483b` 及官方 main `79e3740ec02f7156e66f563b106b671a851f8d43`（2026-11-11）。现行 `direction_card.py` 发布 `/<namespace>/sound_direction`，ROS 类型 `std_msgs/msg/String`，Canvas format 为 `sensor/sound-direction`。以源码为准，不能只按 #376 初始 PR 描述假设使用 typed message。
+核对 Driver 基线 `814b3ca953d33eba0aca9a61dcefa773f5da483b` 及官方 main `18211f9902549ce931867a3622cbb96d4c79183b`（2026-11-13）。现行 `direction_card.py` 发布 `/<namespace>/sound_direction`，ROS 类型 `std_msgs/msg/String`，Canvas format 为 `sensor/sound-direction`。以源码为准，不能只按 #376 初始 PR 描述假设使用 typed message。
 
 合成示例：
 
@@ -32,11 +32,11 @@ SDK 时间戳须具有 Unix 微秒形状，否则窗口置零并被拒绝。SDK 
 
 ## 独立操作员授权
 
-官方 Core `2b00f1db2f81b80c27a5249a54301acfeb19d068` 的 ACP 是完成回执；Canvas 编辑占用、工具连线和普通访问 token 不提供本 Card 所需的独立限时运动许可。不复用可被 Agent 读取的 Core peer 私钥，也不新增匿名授权 API。
+官方 Core `541d53461818f220a56f902e5c7093be61e155d8` 的 ACP 是完成回执；Canvas 编辑占用、工具连线和普通访问 token 不提供本 Card 所需的独立限时运动许可。不复用可被 Agent 读取的 Core peer 私钥，也不新增匿名授权 API。
 
 本 Card 使用 `cryptography` 的 Ed25519 验证；**私钥只保存在受信任操作员的独立工作站，不能放入机器人、Driver、Core、Agent 可读文件或 Solution**。Driver 只持有启动时固定的公钥。配置环境变量 `BUMI_SOUND_FACING_OPERATOR_PUBLIC_KEY` 为已审查的公钥 PEM 文件路径，并使用只读文件挂载；MCP 参数及 config 都不能指定、替换或动态重载此公钥。缺失、不可用、可由其他账户写入的公钥文件，以及私钥/非 Ed25519 文件均拒绝。
 
-部署必须保证 Agent 不能修改 Driver 代码、公钥、进程、容器或宿主资源。官方默认 Core 提供 Bash 并挂载 Docker socket；若把这类管理员能力交给 Agent，它可以改写验证器，Driver 内的签名校验无法保护已被改写的执行进程。操作员已确认当前尚未限制这些管理权限；这一边界仍为 PR 前阻塞。普通 MCP 参数伪造测试不等于验证了管理员权限隔离。
+部署必须保证 Agent 不能修改 Driver 代码、公钥、进程、容器或宿主资源。官方默认 Core 提供 Bash 并挂载 Docker socket；若把这类管理员能力交给 Agent，它可以改写验证器，Driver 内的签名校验无法保护已被改写的执行进程。本次离线任务未检查或修改生产管理权限；正式物理启用前必须由独立操作员核实这一边界。普通 MCP 参数伪造测试不等于验证了管理员权限隔离。
 
 操作员流程（只在受信任工作站执行签名工具）：
 
@@ -68,7 +68,7 @@ Core 断连或 Agent 不再续期时，短会话到期停止；声源断流另�
 | `stop` | 撤销会话、有界收尾，回收自身订阅、timer、publisher、node 和监督线程 |
 | `config` | 原子校验参数；实际变更结束会话，收尾未完成时拒绝应用；相同配置不启用、不续期 |
 
-会话默认 30 s，可配置 1–60 s。需要持续追踪的调用方应在到期前（例如每 10 s）明确续期；Card、传感器消息和状态轮询均不自动续期。失去管理、断流、源/模式/控制权异常、动作失败或时钟跳变会撤销会话，必须再次明确 enable。ID 是进程内关联值，不是身份凭据。旧 ID 不能续期新会话，重启不恢复 ID。
+会话默认 30 s，可配置 1–30 s。需要持续追踪的调用方应在到期前（例如每 10 s）明确续期；Card、传感器消息和状态轮询均不自动续期。失去管理、断流、源/模式/控制权异常、动作失败或时钟跳变会撤销会话，必须再次明确 enable。ID 是进程内关联值，不是身份凭据。旧 ID 不能续期新会话，重启不恢复 ID。
 
 标准 Driver MCP arguments 示例（会导致运动，仅用于经批准的现场阶段）：
 
@@ -136,7 +136,7 @@ YAML 与 MCP config 共用相同 schema、默认值及范围；release < deadzon
 | settle_s | 0.8 | 0.5–5 s，连续安静等待 |
 | reversal_hold_s | 2 | 1–10 s，反向等待 |
 | turn_timeout_s | 80 | 1–80 s，上层等待预算，原 Driver 超时另行保留 |
-| session_timeout_s | 30 | 1–60 s，必须显式续期的会话期限 |
+| session_timeout_s | 30 | 1–30 s，必须显式续期的会话期限 |
 
 墙钟相对单调钟跳变超过 250 ms 撤销会话，避免跨时钟使用旧方向。使用 mono-before/wall/mono-after 区间采样，记录 clock_diagnostics；采样自身超过 250 ms 单独报 capture_clock_sampling_delayed 并撤销，阈值没有放宽。本轮独立 WSL 探针记录到实时钟前跳约 2.27 s、同时单调钟只前进约 0.01 s；这不是声源采集时间与接收时间混用，也不能通过修改宿主时钟配置或忽略跳变来消除测试失败。恢复后仍需新签名，不自动恢复运动。
 
@@ -151,3 +151,11 @@ YAML 与 MCP config 共用相同 schema、默认值及范围；release < deadzon
 SDK IMU getter 没有源采样时间，SDK 写零成功也不能证明实际停止。因此 last_result 的 physical_stop_confirmed 和输出 physical_motion_verified 始终 false。卡住的厂商调用仍需要现场物理停止手段；不能用进程重启掩盖未确认停车。
 
 复现、真实 Core 软件集成范围、已知基线问题与构建步骤见 [审查记录](SOUND_FACING_REVIEW.md)。分阶段物理验收见 [验收文档](SOUND_FACING_HARDWARE_ACCEPTANCE.md)。
+
+## 授权故障诊断与当前离线结论
+
+`enable_follow` 的 `operator_authorization_unavailable` 表示启动时没有可用受信公钥，属于安全拒绝。先读取 info 的 `authorization.available/error`：`operator_public_key_unconfigured` 是未设置环境变量；`operator_public_key_unavailable` 表示文件不可读、所有权/权限/文件类型或 Ed25519 内容不合格。不要用 MCP 参数绕过，也不要把私钥放进 Driver。由可信操作员核实公钥文件与启动配置后，重新启动自己的批准实例；公钥不会动态重载。
+
+有公钥但未签名时返回 `operator_authorization_required`。先 prepare，再在独立工作站签名，再 authorize，最后显式 enable。旧签名、错设备/进程/session、重复使用和过期签名均拒绝；停止或配置变化后需要新的 challenge。Core 的 ACP 仅回传完成状态，不能代替这个签名许可。
+
+本次真实 Core API/认证/MCP/Agent/ACP 与原生 Canvas 展示 21 场景通过；总线和控制器为显式模拟，不是 ROS/DDS 或真机结论。当前结果、ARM64 外部条件和遗留风险以 SOUND_FACING_TESTING.md / SOUND_FACING_REVIEW.md 为准，不沿用历史镜像验收数字。
