@@ -96,8 +96,12 @@ class UnifiedTests(unittest.TestCase):
         import yaml
         from pathlib import Path
         definition = yaml.safe_load((Path(__file__).resolve().parents[1] / 'agilex/piper/driver.yaml').read_text())
-        self.assertEqual({(card['name'], card['type']) for card in definition['cards']},
+        catalog = {(card['name'], card['type']) for card in definition['cards']}
+        self.assertEqual(catalog - {('piper_table_clearance', 'sensor')},
                          {(tool['name'], tool['type']) for tool in self.bundle.get_all_tools()})
+        optional = DriverBundle(build_plugins({**self.config, 'table_clearance': {'enabled': True}},
+                                              'piper_arm1', None))
+        self.assertEqual(catalog, {(tool['name'], tool['type']) for tool in optional.get_all_tools()})
 
     def test_start_status_and_default_selection_are_passive(self):
         self.call('start')
