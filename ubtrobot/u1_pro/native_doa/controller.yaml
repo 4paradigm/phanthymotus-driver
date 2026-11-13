@@ -1,0 +1,37 @@
+controller:
+  runtime:
+    default_profile: direction_only
+    max_concurrent_pipelines: 0
+    shared_blackboard_keys: [device_profile]
+    default_tick: {fast_tick_threshold_ms: 1, idle_backoff_base_ms: 5, idle_backoff_max_ms: 50, max_burst_steps: 64, burst_budget_ms: 80, burst_step_sleep_ms: 2}
+    inter_pipeline_defaults: {max_depth: 32, on_full: drop_oldest}
+    inter_pipeline_channels:
+      audio_after_aec:
+        type: stream
+        from: input
+        max_depth: 32
+        on_full: drop_oldest
+        consumers:
+          - {pipeline: direction, pull_mode: single, max_batch: 1}
+trees:
+  plugin_types: [audio]
+  profiles:
+    direction_only:
+      exclusive: false
+      primary_pipeline: input
+      execution_policy: CONTINUOUS_MONITOR
+      pipelines:
+        input:
+          xml_path: /run/u1-doa/input.xml
+          load_policy: LAZY_POLICY
+          enabled_by_default: true
+          depends_on: []
+          thread: {policy: NORMAL, priority: 0, cpu_affinity: []}
+          tick: {target_period_ms: 0, idle_backoff_base_ms: 2, idle_backoff_max_ms: 20, max_burst_steps: 500, burst_budget_ms: 2000, burst_step_sleep_ms: 2}
+        direction:
+          xml_path: /run/u1-doa/direction.xml
+          load_policy: LAZY_POLICY
+          enabled_by_default: true
+          depends_on: [input]
+          thread: {policy: NORMAL, priority: 0, cpu_affinity: []}
+          tick: {target_period_ms: 0, idle_backoff_base_ms: 5, idle_backoff_max_ms: 50, max_burst_steps: 500, burst_budget_ms: 1000, burst_step_sleep_ms: 2}
