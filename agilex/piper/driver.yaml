@@ -6,7 +6,7 @@ hardware_model: piper
 image_name: agilex-piper
 port: 15741
 mcp_url: "http://localhost:15741/mcp"
-description: "PiPER Arm control, independent read-only Joints and On camera sensor cards."
+description: "PiPER Arm control, independent read-only Joints and On camera sensor cards, plus an optional calibrated gripper-to-table clearance sensor."
 build_context_extras:
   - ../../common
 cards:
