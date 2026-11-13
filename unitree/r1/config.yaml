@@ -37,6 +37,15 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  vision_capture:
+    enabled: true
+    # Host mount: a container recreation must not delete what the operator shot.
+    output_dir: /opt/phanthy-motus/data/r1/captures
+    # Output rate, not source rate. The camera keeps publishing at its own fps.
+    fps: 10
+    max_duration_s: 30
+    # Evidence older than this is pruned on start. 0 disables pruning.
+    retention_days: 7
   ext_mic:
     enabled: true
   ext_camera:

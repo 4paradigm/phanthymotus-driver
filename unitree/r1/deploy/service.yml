@@ -7,6 +7,8 @@ unitree-r1:
   privileged: true
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    # Captures must outlive the container: every deploy recreates it.
+    - /opt/phanthy-motus/data/r1:/opt/phanthy-motus/data/r1
     - /dev:/dev
   environment:
     - ROS_DOMAIN_ID=42
