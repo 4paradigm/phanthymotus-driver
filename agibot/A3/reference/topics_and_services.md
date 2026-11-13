@@ -32,9 +32,11 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 
 | Service@unit:port | Method | Driver tool | Notes |
 |---|---|---|---|
-| MotionControlActionService@MDU:56322 | SetAction | `mc_mode` | `command.action` = `MotionControlAction_{DAMPING,GET_UP,LIE_DOWN,PASSIVE}`; fixed FSM enforced first (non-standing states only accept get_up, MOTION accepts damping/lie_down/passive), illegal transitions rejected with a suggestion, then cross-checked against runtime GetAvailableActions |
-| MotionControlActionService@MDU:56322 | GetAction | `mc_mode` (`get_state`) | |
-| MotionControlActionService@MDU:56322 | GetAvailableActions | `mc_mode` (`available`) | |
+| SkillPilotService@MDU:52893 | PosturalTransition | `mc_mode` (`stand` / `lie_down`) | `type=PosturalTransitionType_GetUp/LieDown`, request header in `req_header`; same entry as the remote/App, keeping SkillPilot posture state synchronized; ACP completes after GetAction confirms MOTION / PASSIVE (stand also waits for settling) |
+| MotionControlActionService@MDU:56322 | SetAction | `mc_mode` (`damping`) | requires explicit `confirm=true`; sends the DAMPING command returned by GetNextActions, including its parameters |
+| MotionControlActionService@MDU:56322 | GetAction | `mc_mode` (`get_state`) / motion gates | reads `info.current_action`, `info.status`, `info.stage.description`; motion commands require MOTION and reject PREPARE |
+| MotionControlActionService@MDU:56322 | GetNextActions | `mc_mode` | live allowed command entries; `get_state` reports which posture actions are currently available |
+| MotionControlMotionService@MDU:56322 | GetVelocityLimitValue | `loco` | firmware limits intersect the card limits; firmware angular rad/s converted to card deg/s |
 | MotionControlMotionService@MDU:56322 | Enable/Disable/CheckArmCompliance | `arm_control` (`compliance_enable`/`compliance_disable`/`compliance_check`) | all take `{}` |
 | MotionCommandService@MDU:56444 | SendMotionCommand | `motion_play` | `motion_id` is the motion file's **absolute path**; `cmd_end` auto-returns to initial pose |
 | TTSService@HDU:59301 | PlayTTS | `tts` | `text` ≤1024 bytes, `priority_level` `INTERACTION_L6` |
@@ -63,7 +65,7 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 
 | Topic | Message | Driver tool | Notes |
 |---|---|---|---|
-| `/motion/control/locomotion_velocity` | RosMsgWrapper (pb `LocomotionVelocity`) | `loco` | forward/lateral normalized −1..1, angular deg/s (±57.3 = 1 rad/s); MOTION mode only; duration-bounded with ACP |
+| `/motion/control/locomotion_velocity/pb_3Aaimdk_2Eprotocol_2EMotionControlLocomotionVelocityChannel` | RosMsgWrapper (pb `MotionControlLocomotionVelocityChannel`) | `loco` | full header + data, SAFE control source, NAVIGATION mode, 20 Hz; forward −0.3..0.6 m/s, lateral ±0.3 m/s, angular ±45 deg/s (rad/s on wire), further bounded by firmware; required duration (0,60] s; ramps to zero before ACP completion; stop/supersede cancel the prior task |
 | `/motion/control/move_waist` | RosMsgWrapper (pb `MoveWaist`) | `waist_control` | waist_pitch/waist_yaw rad, waist_height m |
 | `/skill/pilot/face/play/pb_3Aaimdk_2Eprotocol_2EHFAEmoction` | RosMsgWrapper (pb `HFAEmoction`) | `face_play` | e_path/e_id/repeat/priority(440)/is_stop |
 | `/motion/control/arm_joint_command` | sensor_msgs/JointState | `arm_control` (`send`) | 100 Hz ≤30 ms gap, velocity/effort = 0, ≤4 rad/s |
@@ -87,8 +89,8 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 
 ## Documented but not wired
 
-- Body posture / head-pose "attention" HTTP APIs beyond the four SetAction modes
-  (GetAvailableActions returns the authoritative live list at runtime).
+- Body posture / head-pose "attention" HTTP APIs beyond stand, lie_down and
+  confirmed damping (GetNextActions supplies the live MC command list).
 - H265 CompressedVideo foxglove streams for every camera — the raw
   `sensor_msgs/Image` mirrors are preferred, re-encoded to JPEG (RGB) and
   zlib uint16 (depth) on the fly (H265 decode support is inconsistent on the
