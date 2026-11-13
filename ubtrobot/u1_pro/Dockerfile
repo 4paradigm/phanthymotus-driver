@@ -27,14 +27,14 @@ RUN test -s /usr/share/keyrings/ros2-archive-keyring.gpg || \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros2-archive-keyring.gpg] ${ROS_APT_MIRROR} ${UBUNTU_CODENAME} main" \
         > /etc/apt/sources.list.d/ros2.list && \
     apt-get update && apt-get install -y --no-install-recommends \
-    python3-pip python3-pil pulseaudio-utils ros-humble-rmw-cyclonedds-cpp && rm -rf /var/lib/apt/lists/*
+    python3-pip python3-pil pulseaudio-utils util-linux ros-humble-rmw-cyclonedds-cpp && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt /tmp/u1-requirements.txt
 RUN pip3 install --no-cache-dir -i "${PYPI_MIRROR}" -r /tmp/u1-requirements.txt && rm /tmp/u1-requirements.txt
 
 WORKDIR /work
 COPY --from=interface-builder /u1_ws/install /u1_ws/install
 COPY common/ /work/common/
-COPY main.py device.py config.yaml driver.yaml /work/
+COPY main.py device.py native_idle_actions.py expression_idle.py config.yaml driver.yaml /work/
 COPY deploy/ /deploy/
 
 ENV ROS_DOMAIN_ID=42
