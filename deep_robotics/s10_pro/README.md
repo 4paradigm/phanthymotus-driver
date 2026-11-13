@@ -56,7 +56,7 @@ PCM over SSH and does not use the Jetson's unrelated local sound card.
 `model` returns a mesh-free kinematic URDF used by the joint renderer. It has
 the 16 actuated joints and limits, but deliberately no STL dependency. A fixed
 arrow marks mechanical +X/front. The source joint order and angle mapping live
-in `s10_skeleton.py`.
+in `device.py`.
 The skeleton represents posture and does not track global translation.
 
 Battery values retain the vendor message units: voltage is 10 mV and current
