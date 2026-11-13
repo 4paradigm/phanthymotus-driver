@@ -90,6 +90,43 @@ def test_failed_encoding_cannot_mark_metadata_ready(camera, monkeypatch):
     assert result[0]["state"] == "error"
 
 
+def test_dropped_bridge_publish_cannot_mark_metadata_ready(camera, monkeypatch):
+    thread, result = begin_start(camera)
+    monkeypatch.setattr(camera._pub, "publish", lambda message: False)
+    camera.feed()
+    assert wait_until(lambda: bool(camera.plugin._last_encode_error))
+    info = camera.plugin.dispatch("info", {})
+    assert not info["ready"]
+    assert info["camera_info"][0]["width"] is None
+    assert not camera._pub.published
+    thread.join(1)
+    assert not thread.is_alive() and result[0]["state"] == "error"
+
+
+@pytest.mark.parametrize("publish_result", [None, True])
+def test_bridge_recovery_waits_for_a_successful_output(camera, monkeypatch, publish_result):
+    thread, result = begin_start(camera)
+    original_publish = camera._pub.publish
+    monkeypatch.setattr(camera._pub, "publish", lambda message: False)
+    camera.feed(_raw_frame(12, 8))
+    assert wait_until(lambda: bool(camera.plugin._last_encode_error))
+    assert not camera.plugin.dispatch("info", {})["ready"]
+    assert thread.is_alive()
+
+    def publish(message):
+        original_publish(message)
+        return publish_result
+
+    monkeypatch.setattr(camera._pub, "publish", publish)
+    camera.feed(_raw_frame(18, 10))
+    thread.join(1)
+    assert not thread.is_alive()
+    info, = result
+    assert info["ready"] and info["last_encode_error"] == ""
+    assert (info["camera_info"][0]["width"], info["camera_info"][0]["height"]) == (18, 10)
+    assert len(camera._pub.published) == 1
+
+
 def test_cancelled_starter_does_not_disarm_a_new_session(camera, monkeypatch):
     original = camera.plugin._wait_for_first_frame
     cancelled, release = threading.Event(), threading.Event()

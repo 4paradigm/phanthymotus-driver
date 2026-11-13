@@ -423,6 +423,54 @@ def test_slow_warning_does_not_flag_intentionally_low_rate_topics(
     assert "SLOW" not in capsys.readouterr().out
 
 
+def test_slow_publish_logs_first_event_then_samples_until_recovery(monkeypatch, capsys):
+    server = _server_module()
+    monkeypatch.setattr(server, "Node", _ServerNode)
+    clock = types.SimpleNamespace(now=100.0, duration=0.125)
+    monkeypatch.setattr(server.time, "monotonic", lambda: clock.now)
+    handler = server.TopicHandler(
+        "/nvidia_desktop/state/odom", "std_msgs/msg/FakeMsg",
+        object(), _Executor())
+
+    def publish(payload):
+        handler.node.published.append(payload)
+        clock.now += clock.duration
+
+    handler.pub.publish = publish
+    for at, expected_logs in ((100.0, 1), (100.5, 0), (104.9, 0), (105.0, 1)):
+        clock.now = at
+        handler.publish(b"slow")
+        assert capsys.readouterr().out.count("SLOW") == expected_logs
+    clock.now, clock.duration = 105.2, 0.0
+    handler.publish(b"recovered")
+    assert "SLOW" not in capsys.readouterr().out
+    clock.now, clock.duration = 105.3, 0.125
+    handler.publish(b"slow-again")
+    assert capsys.readouterr().out.count("SLOW") == 1
+    assert handler.node.published == [b"slow"] * 4 + [b"recovered", b"slow-again"]
+    assert handler.msg_count == 6 and handler.max_publish_ms == 125.0
+
+
+def test_depth_receive_gap_warnings_are_throttled_per_topic(monkeypatch, capsys):
+    server = _server_module()
+    monkeypatch.setattr(server, "Node", _ServerNode)
+    clock = types.SimpleNamespace(now=100.0)
+    monkeypatch.setattr(server.time, "monotonic", lambda: clock.now)
+    handlers = [server.TopicHandler(
+        f"/{host}/camera/head/depth/visual_depth", "std_msgs/msg/FakeMsg",
+        object(), _Executor()) for host in ("one", "two")]
+    for handler in handlers:
+        handler._last_receive_ts = 99.0
+        handler.publish(b"depth")
+        assert capsys.readouterr().out.count("SLOW") == 1
+    for at, expected_logs in ((101.0, 0), (104.5, 0), (105.0, 1)):
+        clock.now = at
+        for handler in handlers:
+            handler.publish(b"depth")
+            assert capsys.readouterr().out.count("SLOW") == expected_logs
+    assert all(handler.msg_count == 4 for handler in handlers)
+
+
 def test_exact_reader_reassembles_split_header_and_large_payload():
     server = _server_module()
     left, right = socket.socketpair()

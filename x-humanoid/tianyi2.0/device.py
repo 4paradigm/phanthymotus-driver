@@ -1268,9 +1268,12 @@ else:
                     previous_size = self._frame_size
                     if previous_size is not None and size != previous_size:
                         raise ValueError("RGB resolution changed; restart camera and downstream cards")
-                self._pub.publish(out)
+                published = self._pub.publish(out)
                 with self._frame_ready:
                     if not self._running or generation != self._frame_generation:
+                        continue
+                    if published is False:
+                        self._last_encode_error = "RGB bridge publish failed"
                         continue
                     self._frame_size = size
                     self._frame_id = str(getattr(getattr(msg, "header", None), "frame_id", ""))

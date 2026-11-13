@@ -41,6 +41,7 @@ from rosidl_runtime_py.utilities import get_message
 # rather than count-based so a 16 kHz audio topic costs the same number of log
 # lines as a 10 Hz one; see the comment in TopicHandler.publish.
 PROGRESS_INTERVAL_S = 300.0
+SLOW_LOG_INTERVAL_S = 5.0
 MAX_METADATA_BYTES = 64 * 1024
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
@@ -134,6 +135,8 @@ class TopicHandler:
         # Starts at 0 so the very first message always prints; after that the
         # interval governs.
         self._last_progress_ts = 0.0
+        self._slow_active = False
+        self._last_slow_log_ts = 0.0
 
         # Create publisher on domain 42
         self.node = Node(
@@ -175,16 +178,21 @@ class TopicHandler:
             if ("camera" in self.topic or "imu" in self.topic) and self.msg_count <= 5:
                 print(f"[socket-bridge] {self.topic}: msg #{self.msg_count}, serialized={len(serialized_msg)} bytes, raw_cdr=true", flush=True)
 
-            if publish_ms >= 100.0 or (
+            slow = publish_ms >= 100.0 or (
                     self.is_hardware_depth and
                     self.last_receive_gap_ms is not None
-                    and self.last_receive_gap_ms >= 400.0):
+                    and self.last_receive_gap_ms >= 400.0)
+            now = time.monotonic()
+            if slow and (not self._slow_active
+                         or now - self._last_slow_log_ts >= SLOW_LOG_INTERVAL_S):
+                self._last_slow_log_ts = now
                 print(
                     f"[socket-bridge] SLOW {self.topic}: "
                     f"rx_gap_ms={self.last_receive_gap_ms!r} "
                     f"dds_publish_ms={publish_ms:.1f} bytes={len(serialized_msg)}",
                     flush=True,
                 )
+            self._slow_active = slow
 
             # Progress on a clock, not on a message count.
             #
