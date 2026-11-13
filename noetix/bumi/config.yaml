@@ -42,6 +42,12 @@ plugins:
     enabled: true
   speaker:
     enabled: true
+  # 时钟与提醒：本地时间/星期查询、时间差与倒计时、一次性/每日/每周提醒。
+  # 到期提醒以 JSON 事件发布到 /<namespace>/clock/reminder；提醒保存在
+  # /opt/phanthy-motus/data/bumi/reminders.json，驱动重启后仍然有效。
+  clock:
+    enabled: true
+    # store_path: /opt/phanthy-motus/data/bumi/reminders.json  # 默认即此路径
   camera:
     enabled: true
     # Bumi supports either official App video transfer or Phanthy's direct
