@@ -2,6 +2,7 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
+ARG ROS_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu
 
 WORKDIR /work
 
@@ -19,6 +20,17 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         ffmpeg \
         v4l-utils && \
     rm -rf /var/lib/apt/lists/*
+
+# Capture-time body-camera lookup needs only the standard ROS TF transport.
+# Shared base images retain the signed key but may omit the ROS apt source.
+RUN test -s /usr/share/keyrings/ros2-archive-keyring.gpg || \
+        { echo "ERROR: base image is missing the ROS archive key"; exit 1; } && \
+    . /etc/os-release && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros2-archive-keyring.gpg] ${ROS_APT_MIRROR} ${UBUNTU_CODENAME} main" \
+        > /etc/apt/sources.list.d/ros2.list && \
+    apt-get update && apt-get install -y --no-install-recommends ros-humble-tf2-ros && \
+    rm -rf /var/lib/apt/lists/*
+RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && python3 -c "from tf2_ros import Buffer, TransformListener"'
 
 # Build CycloneDDS 0.10.5 from source
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
@@ -51,6 +63,8 @@ COPY resource/       /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+COPY camera_specs.py /work/camera_specs.py
+COPY rgbd_camera.py /work/rgbd_camera.py
 COPY led_control.py /work/led_control.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py
@@ -63,6 +77,9 @@ COPY scan_context.py /work/scan_context.py
 COPY controlled_spatial.py /work/controlled_spatial.py
 COPY controlled_spatial_map.py /work/controlled_spatial_map.py
 COPY pointcloud_utils.py /work/pointcloud_utils.py
+COPY slam_odometry.py /work/slam_odometry.py
+COPY sport_odometry.py /work/sport_odometry.py
+COPY slam_capture_probe.py /work/slam_capture_probe.py
 COPY av_recording.py /work/av_recording.py
 COPY servo.py /work/servo.py
 COPY arm_sdk.py /work/arm_sdk.py

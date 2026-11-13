@@ -13,6 +13,17 @@ plugins:
     enabled: true
   loco:
     enabled: true
+    # RTAB-Map SLAM pose input is derived from rt/odommodestate,
+    # not the original Unitree slam_mapping service. Native ~500 Hz is
+    # rate-limited to ~20 Hz on /slam/odom; /loco/state stays ~10 Hz.
+    # G1 source stamp=(0,0): keep raw values and callback receipt times for
+    # diagnostics only; never claim tracking or rewrite the measurement time.
+    # Source SportModeState has no frame_id; both labels must be verified
+    # on the robot and configured together before publishing a candidate pose.
+    # This is an example only, not a calibrated default:
+    # slam_regular_odometry:
+    #   frame_id: odom
+    #   child_frame_id: imu_in_torso
   loco_relative_move:
     enabled: true
     # Closed-loop speed caps; requires only the loco_state publisher.
@@ -98,6 +109,13 @@ plugins:
     max_duration_s: 30
   lidar:
     enabled: true
+    # Tested G1 mounting transform comes from resource/g1_model.urdf:
+    # torso_link -> mid360_link, calibrated: true (operator-confirmed).
+    # If real DDS frame labels differ, map them to URDF links ONLY after
+    # confirming the alias against this installed robot. Never guess:
+    # slam_urdf_frame_aliases:
+    #   source_imu: imu_in_torso
+    #   livox_native: mid360_link
   slam:
     enabled: false
     map_dir: /opt/phanthy-motus/data/maps

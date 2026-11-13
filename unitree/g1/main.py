@@ -92,6 +92,7 @@ class G1DeviceBundle:
             from low_state import LowStateSource
             self._low_state = LowStateSource()
         camera_plugin = None
+        loco_state = None  # Optional mapping-frame evidence for the lidar URDF mount.
 
         if plugins_cfg.get("mic", {}).get("enabled", False):
             from device import MicPlugin
@@ -243,6 +244,9 @@ class G1DeviceBundle:
             from device import RealSensePlugin
             camera_plugin = RealSensePlugin(plugins_cfg["camera"], namespace, executor)
             self._plugins.append(camera_plugin)
+            for plugin in self._plugins:
+                if getattr(plugin, 'PREFIX', '') == 'state':
+                    plugin._camera = camera_plugin
             print("[bundle] RealSensePlugin loaded")
 
         if plugins_cfg.get("vision_capture", {}).get("enabled", False):
@@ -253,7 +257,10 @@ class G1DeviceBundle:
 
         if plugins_cfg.get("lidar", {}).get("enabled", False):
             from device import LidarPlugin
-            self._plugins.append(LidarPlugin(plugins_cfg["lidar"], namespace, executor))
+            self._plugins.append(LidarPlugin(
+                plugins_cfg["lidar"], namespace, executor,
+                pose_frame_provider=(loco_state.node.get_regular_child_frame
+                                     if loco_state is not None else None)))
             print("[bundle] LidarPlugin loaded")
 
         if plugins_cfg.get("slam", {}).get("enabled", False):
