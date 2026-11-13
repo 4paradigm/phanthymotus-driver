@@ -26,6 +26,7 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 from typing import Any
@@ -129,7 +130,9 @@ def _get_default_cmd():
     return _get_control_cmd("DEFAULT")
 
 _WORKMODE_NAMES = {
-    0: "enabled", 1: "ready", 2: "walking", 5: "dance",
+    # App status definitions and the 2026-11-11 hardware log agree on 2/3.
+    # These are feedback codes, not ControlCmd values (RUN is command 4).
+    0: "enabled", 1: "ready", 2: "walking", 3: "whole_body_walking", 5: "dance",
     8: "greet", 9: "shake", 10: "cheer", 11: "start_teach",
     12: "end_teach", 14: "save_teach_1", 23: "play_teach",
     26: "protection", 27: "fall_to_stand", 28: "stand_to_fall",
@@ -438,6 +441,19 @@ class LocoPlugin:
         thread = self._move_thread
         return bool((thread is not None and thread.is_alive())
                     or self._rotate_state["state"] == "running" or self._body_action)
+
+    @contextmanager
+    def reserve_walking_mode(self):
+        """Exclude moves, rotations, body actions and servo resume atomically."""
+        with self._rotate_lock:
+            if self.is_moving():
+                raise RuntimeError("底盘已有动作，请停止移动或等待动作结束后再切换模式。")
+            self._body_action = "walking_mode"
+        try:
+            yield
+        finally:
+            with self._rotate_lock:
+                self._body_action = None
 
     def publish_velocity(self, x: float, y: float, z: float) -> None:
         """One normalised velocity command, through this plugin's rate limiter.
@@ -2702,15 +2718,6 @@ class CameraPlugin:
 # These cards intentionally live in device.py with the base device plugins so
 # the Bumi bundle has a single implementation module.
 
-
-_WORKMODE_NAMES = {
-    0: "enabled", 1: "ready", 2: "walking", 5: "dance",
-    8: "greet", 9: "shake", 10: "cheer", 11: "start_teach",
-    12: "end_teach", 14: "save_teach_1", 23: "play_teach",
-    26: "protection", 27: "fall_to_stand", 28: "stand_to_fall",
-    29: "save_teach_2", 30: "disabled", 31: "dance1", 32: "dance2",
-    33: "tear",
-}
 
 _MOTOR_ERROR_NAMES = {
     0x02: "overcurrent",

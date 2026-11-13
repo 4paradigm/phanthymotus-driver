@@ -18,6 +18,8 @@ cards:
   - { name: joints,            type: sensor }
   - { name: model,             type: resource }
   - { name: loco,              type: actuator }
+  # Experimental App TCP backend, disabled pending on-site switch acceptance.
+  - { name: walking_mode,      type: actuator }
   - { name: loco_relative_move,       type: actuator }
   - { name: loco_servo,        type: actuator }
   - { name: stand_up_lie_prone, type: actuator }

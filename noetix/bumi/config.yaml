@@ -6,6 +6,17 @@ plugins:
     enabled: true
   loco:
     enabled: true
+  # Experimental App TCP backend; status query verified, switching awaits
+  # on-site acceptance. Requires loco for shared chassis arbitration.
+  walking_mode:
+    enabled: false
+    # Empty: passively discover perception_ip from this SDK motion board.
+    # An explicit app_host can be set when UDP discovery is unavailable.
+    app_host: ""
+    discovery_source_ip: "192.168.55.102"
+    discovery_timeout_s: 3.0
+    query_timeout_s: 1.0
+    verify_timeout_s: 4.0
   # 底盘的流式控制卡片（motus.control/1 的 twist）。和上面的 loco 是同一个身体的
   # 两条路径：loco 是调用形态，一次 tools/call 一个动作；这张是数据面，订阅一路
   # control/velocity 指令流，给 actucore 的 navi 这类策略用。两者显式仲裁 ——

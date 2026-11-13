@@ -368,6 +368,125 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 `footprint` 的出错方向是单边的（以为自己更宽只是多减速，以为更窄就是把肩膀送进
 门框），所以默认值刻意偏宽；死区不是，所以它宁可声明成估计值也不写零。
 
+## `walking_mode` 行走模式切换（待现场验收）
+
+本分支提供独立 actuator 卡片 `walking_mode`。参数区只有必填的
+`walking_model` 下拉框，选项为 `lower_body`（仅腿部行走）与
+`whole_body`（全身行走），不再显示 `action` 下拉框。无 `action` 字段的
+MCP 请求由 bundle 按工具名分发，例如：
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"walking_mode","arguments":{"walking_model":"lower_body"}}}
+```
+
+**已实现 App TCP 后端，默认关闭，真实双向切换仍待现场验收。**
+`config.yaml` 的 `plugins.walking_mode.enabled` 为 `false`，需要同时启用 `loco`。
+构造、启动、查询和停止均不建立 App 连接或发送 SDK 命令；执行时才连接。
+当前 SDK 没有已核验的步态选择入口，因此本卡复用官方 App 的 TCP 命令，
+SDK 只用于读取现有控制器的反馈，不实例化另一个 `HighController`。
+
+执行时先预留 `loco` 的底盘，已有移动、转向或身体动作则拒绝切换；
+处于使能、准备、保护等非行走模式时同样拒绝，不会自动使能或起身。
+App 与 SDK 必须先报告一致的 2/3 模式；已处于目标模式则直接返回，不重发命令。
+实际切换前暂停 `loco_servo`，检查全部 21 个关节速度均低于 `0.15 rad/s`，
+并再次检查模式未变化。仅发送一次 `walk` 或 `run`，随后连续两次确认 App 与
+SDK 的反馈均为目标代码才返回 `state=completed`、`mode_verified=true`。
+这表示模式切换获确认，不代表真实行走行为已验收。
+超时、保护或断连不会自动重试、回退或恢复流式移动；发送中断时会保留
+`command_may_have_been_sent`，避免误报指令肯定未到达。
+
+默认在 UDP 9090 被动接收 `discovery_source_ip` 指定的运动板广播，
+取其 `perception_ip` 连接 TCP 8888；不发送扫描报文，也不把实验机器 IP 写进代码。
+UDP 不可用时可在部署配置中指定 `app_host`。部署前须验证驱动容器能访问该地址；
+本次 Windows 端查询已成功，随后机器人断连，容器内连通性尚未确认。
+现有 `loco` / `loco_servo` 的移动门槛仍为状态 2；状态 3 下通过 SDK 发速度的行为
+尚未验收，本次没有放宽这些运动限制。
+
+2026-11-11 核对了本仓库附带的 SDK 3.1.0 头文件、Python 绑定和示例，
+并对照了厂家的公开文档与当前 SDK 源码：
+
+- [厂家 HighController 文档](https://web.noetixrobotics.com/docs/#3-highcontroller常用接口及参数表)
+  仅声明 `WALK` 为走路模式，`RUN` 为当前不可用的预留命令，`index` 为示教索引。
+- [厂家 HighController 头文件](https://github.com/Noetix-Robotics/noetix_sdk_bumi/blob/main/include/highcontroller.h)
+  公开 `publish_cmd` 和状态订阅，没有分别设置两种行走模式的接口。
+- [厂家 ControlCmd 定义](https://github.com/Noetix-Robotics/noetix_sdk_bumi/blob/main/include/common.h)
+  与本仓库的枚举一样，未列出 lower-body / whole-body 选择项。
+
+这些资料不能确定两种模式对应的 DDS 调用，也不能证明目标固件没有该能力。
+本卡没有向 SDK 发送 `WALK` / `RUN`，也没有用 `WALK` 的 `index=0/1`
+选择步态。2026-11-13 的分支基线为官方 driver 主分支
+`18211f9902549ce931867a3622cbb96d4c79183b`。
+
+2026-11-11 用户提供了 NOETIX Run 连接实机后的控制页照片，明确显示独立的
+“行走”和“全身行走”入口。因此，App 入口存在已获确认，当前缺口是它们与 SDK
+命令的准确对应关系，不能据公开文档未列出就判断机器人不支持。
+
+进一步只读检查了[厂家下载页](https://app-api.noetixrobotics.com/)提供的
+`noetix-installer-3.1.2.apk`（SHA-256：
+`dc3f035c6bf7a2a99d73dd3fcb41be461673f890f24d256352e9b9440c3eee17`）。
+其中有 `walk_mode_*`、`bumi_run_*` 图标资源，以及 `walkMode`、`runMode`、
+`RobotCommandSender` 等内部名称。继续解析包内 Flutter 3.6.1 的 AOT 快照后，
+已核对两种命令对象的初始化和序列化逻辑：
+
+| 选择需求 | App Wi-Fi JSON | App 蓝牙 JSON |
+| --- | --- | --- |
+| `lower_body`，App 的“行走” | `{"cmd":"walk"}` | `{"cmd":18,"data":[1]}` |
+| `whole_body`，Bumi 的“全身行走”使用内部 run 分支 | `{"cmd":"run"}` | `{"cmd":18,"data":[2]}` |
+
+定位依据为 `WifiCommand.walkMode`（`0x604138`）、`WifiCommand.runMode`
+（`0x626fc8`）、`BleCommand.walkMode`（`0x6040d0`）、`BleCommand.runMode`
+（`0x626f60`），以及两者的 `toJson` 和 `ControlRobotController.updateModeList`
+（`0x626a50`）；显示名称由 `ModeType.title`（`0x61d52c`）区分机型。
+这些是上述特定安装包的代码地址，不是稳定协议版本号。
+
+关键限制是：同一 App 的 `BumiRobotStatusType` 将 `walk` 的状态值定义为 2，
+将 `run` 的状态值定义为 3，并在后者附带“DDS无法触发”的说明。
+因此，App 的 `cmd="run"` 不能直接视为 DDS SDK 的 `ControlCmd.RUN`（枚举值 4）。
+这些静态结果证明 App 的编码方法，不能把它们直接塞入 DDS。
+
+继续检查同一 APK 的 `classes3.dex`，`WifiService.connect` 使用设备发现消息中的
+`perception_ip:8888`；`MessageContent.parse` 与 `ProtocolUtils.buildPacket`
+将 UTF-8 JSON 封为：8 字节 magic `be ba fe ca ef be ad de`、4 字节正文长度、
+4 字节消息类型（JSON 为 0）、正文、4 字节重复正文长度；整数均为小端。
+`get_status` 是查询命令，响应为 `{"cmd":"status","data":{"status":2}}`。
+上述方法在该 DEX 中的 code offset 分别为 `0x345974`、`0x348228`、`0x346924`；
+这些偏移仅用于定位该安装包。
+
+现场只读监听收到运动板 `192.168.55.102` 的 UDP 广播，其中包含网络地址。
+在 Windows 端使用上述封包发送一次 `get_status`，已收到合法的
+`status=2` 响应，连接随后关闭；没有发送 `walk` 或 `run`。这验证了查询协议，
+尚未验证命令会切换当前实机或多客户端之间的控制权处理。
+
+2026-11-11 用户提供了在 App 中反复手动切换时的实机 `motion_state` 日志，
+并确认期间一直在主动往返点击。20:50:22—20:50:33 共 23 条记录，
+状态码 2 出现 13 次，状态码 3 出现 10 次，共有 10 次双向变化，
+最后回到 2；所有记录均为 `fresh=true`、`protection=false`。
+例如 20:50:22 为 2、20:50:23 进入 3、20:50:24 返回 2。
+结合 App 的状态定义，该实机的“行走”与“全身行走”可分别通过反馈码 2、3
+区分。驱动保留 2 的既有名称 `walking`，为 3 补上 `whole_body_walking`，
+避免显示 `unknown`。这次观察没有验证 SDK 切换命令，也不能把反馈码 3
+当作 `publish_cmd` 的 action；SDK 命令枚举 3 实际为 `CHEER`。
+
+厂家 SDK 当前提交 `20750fda734da0ef4c2fe28226b0d506a1f32273` 的 x86 静态库中，
+`publish_cmd` 直接把枚举写入 DDS action，只在保存与播放示教时写入 index；
+因此给 `WALK` 设置不同的 index 无法用该接口选步态。本分支没有向实机发送
+切换命令；上述切换由用户在 App 中手动完成。
+
+下一步待连接恢复后，先只读验证容器内访问及状态一致性，再由现场操作者确认
+机器人静止站立、暂停其他控制来源后，验收 `2 → 3 → 2` 的命令与反馈。
+同时核对固件/App 版本、并发客户端控制权及断连行为，再决定是否默认启用。
+目前不能将本卡声明为已通过实机切换测试或可发布的切换能力。
+
+离线验证（仓库根目录）：
+
+```powershell
+python -X utf8 -m pytest tests/test_bumi_walking_mode.py tests/test_bumi_walking_mode_client.py tests/test_bumi_motion_state.py tests/test_bumi_bundle.py tests/test_bumi_loco_servo.py -q
+```
+
+上述测试检查下拉框 schema、无 action 的 bundle 分发、启用依赖、底盘预留、
+静止检查、双路反馈、断连/超时/保护处理、TCP 分帧，以及真实 `motion_state`
+读取逻辑对 2/3 模式、保护模式和未知代码的区分；不证明真实模式切换。
+
 ## Direct action cards
 
 The former `switch_mode` tool is split into three user-facing cards. Internal
