@@ -213,11 +213,14 @@ def test_parent_waiting_for_info_does_not_block_child_command_execution(process_
 def test_zero_pause_resume_and_handover_keep_confirmed_stop_semantics(process_setup):
     card = process_setup.create()
     send(card, command())
-    wait_info(card, lambda item: item["counts"]["accepted"] == 1)
+    moving = wait_info(card, lambda item: item["counts"]["accepted"] == 1)
     send(card, command(2, [0] * 6))
     info = wait_info(card, lambda item: item["counts"]["accepted"] == 2)
-    assert info["output"] == [0] * 6 and stats(info)["confirmed_stops"] == 1
+    assert info["output"] == [0] * 6
+    assert stats(info)["confirmed_stops"] == 0
+    assert info["backend"]["action_id"] == moving["backend"]["action_id"] != 0
     assert card.dispatch("pause", {})["state"] == "paused"
+    assert stats(card.dispatch("info", {}))["confirmed_stops"] == 1
     send(card, command(3))
     assert card.dispatch("resume", {})["state"] == "running"
     time.sleep(0.02)
@@ -227,6 +230,8 @@ def test_zero_pause_resume_and_handover_keep_confirmed_stop_semantics(process_se
     wait_info(card, lambda item: item["counts"]["accepted"] == 3)
     assert card.pause_for_explicit_command("nav.move_to") is True
     before = card.dispatch("info", {})
+    assert before["output"] == [0] * 6
+    assert stats(before)["confirmed_stops"] == 2
     send(card, command(5, [0] * 6))
     time.sleep(0.04)
     after = card.dispatch("info", {})

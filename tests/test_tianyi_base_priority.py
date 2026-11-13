@@ -81,6 +81,10 @@ def test_priority_survives_watchdog_zero_and_queries_but_stop_releases_it(setup,
         send(servo, command(setup))
         setup.clock.advance(0.31)
         servo._tick()
+        assert any(servo._last_output)
+        assert servo.reserves_chassis()
+        setup.clock.advance(0.20)
+        servo._tick()
         assert servo._last_output == [0] * 6
         assert servo.reserves_chassis()
         before = list(servo._backend.messages)
