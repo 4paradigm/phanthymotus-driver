@@ -100,3 +100,77 @@ def test_two_identical_orientations_do_not_divide_by_zero():
     result, limited = rotation.slerp_limit(IDENTITY, IDENTITY, 0.0)
     assert limited is False
     assert result == IDENTITY
+
+
+# ── 欧拉角 → 四元数 ──────────────────────────────────────────────────────────
+#
+# 存在的理由是厂商 SDK 报的位姿是欧拉角，而 `eef_pose` 要四元数。这里钉住的是
+# **合成顺序**：三种顺序都给出一串看着合理的浮点数，接错了不报错 —— 末端姿态偏掉
+# 一个固定的旋转，而残差、限位、单位范数全部正常。
+
+def _euler_to_matrix_zyx(rx, ry, rz):
+    """`realman/rm75_6f_v/device.py:_euler_to_matrix` 的同一份实现，R = Rz·Ry·Rx。
+
+    刻意抄过来而不是 import：那个函数在驱动里收的是**度**并且参与笛卡尔工作空间
+    校验，而这里要比的是约定本身。两处一旦漂开，下面那条测试就会红。
+    """
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+    return [
+        [cy * cz, cz * sx * sy - cx * sz, cx * cz * sy + sx * sz],
+        [cy * sz, cx * cz + sx * sy * sz, -cz * sx + cx * sy * sz],
+        [-sy, cy * sx, cx * cy],
+    ]
+
+
+def _quat_to_matrix(q):
+    x, y, z, w = q
+    return [
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ]
+
+
+def test_rpy_to_quat_uses_the_same_zyx_convention_as_the_rm75_driver():
+    """同一台机器人上两处换算必须同序，否则各自漂走而两处都「看着对」。"""
+    import random
+
+    generator = random.Random(7)
+    for _ in range(500):
+        angles = [generator.uniform(-math.pi, math.pi) for _ in range(3)]
+        expected = _euler_to_matrix_zyx(*angles)
+        actual = _quat_to_matrix(rotation.rpy_to_quat(*angles))
+        for row_expected, row_actual in zip(expected, actual):
+            assert row_actual == pytest.approx(row_expected, abs=1e-12)
+
+
+def test_rpy_to_quat_returns_a_unit_quaternion():
+    """单位范数是 sink 用来抓住「这四个数根本不是一个旋转」的那道检查。"""
+    import random
+
+    generator = random.Random(11)
+    for _ in range(200):
+        angles = [generator.uniform(-math.pi, math.pi) for _ in range(3)]
+        quaternion = rotation.rpy_to_quat(*angles)
+        assert rotation.is_unit(quaternion)
+        assert rotation.norm(quaternion) == pytest.approx(1.0, abs=1e-12)
+
+
+def test_zero_rotation_is_identity_in_xyzw_order():
+    """顺序接反是静默的：(0,0,0,1) 是单位元，(1,0,0,0) 是绕 x 的半圈。"""
+    assert rotation.rpy_to_quat(0.0, 0.0, 0.0) == pytest.approx(IDENTITY)
+
+
+@pytest.mark.parametrize("axis,index", [(0, 0), (1, 1), (2, 2)])
+def test_a_quarter_turn_about_one_axis_lands_on_that_axis(axis, index):
+    angles = [0.0, 0.0, 0.0]
+    angles[axis] = math.pi / 2
+    quaternion = rotation.rpy_to_quat(*angles)
+    half = math.sqrt(0.5)
+    assert quaternion[index] == pytest.approx(half)
+    assert quaternion[3] == pytest.approx(half)
+    for other in range(3):
+        if other != index:
+            assert quaternion[other] == pytest.approx(0.0)

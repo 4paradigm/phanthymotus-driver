@@ -37,6 +37,42 @@ cartesian:
   # 真机竖直位姿上报欧拉角 (0,0,0) 而夹爪竖直伸出（TCP z≈1112 = 240.5+650+222.5）。
   # 仅当控制器已把工具坐标系设为夹爪 TCP 时才设为 222.5；否则保持 0（法兰即 TCP）。
   tool_length_mm: 222.5
+servo:
+  # 连续关节控制（motus.control/1）。call-shaped 的 joint_control/gripper 是另一
+  # 条路，两者靠共享的运动门互斥 —— servo 跑着的时候那两张卡会被响亮地拒掉。
+  expected_hz: 30
+  # 夹爪是不是动作空间的第 8 维。true 时启动会**问机器人**夹爪在不在（在线 +
+  # 使能），探不到就拒绝启动而不是悄悄降成 7 维 —— 降级会让带夹爪的模型协商
+  # 通过然后那一维去向虚空。没装夹爪的机器要显式设成 false。
+  gripper: true
+  # 闭合度的死区。夹爪是控制器后面的串行设备，不是一个 30 Hz 的关节，把指令流
+  # 里每一个浮点噪声都发下去只会占满那条链路。0.02 ≈ SDK 1~1000 行程的 20 counts。
+  gripper_deadband: 0.02
+  # 夹爪指令的限频。手臂仍按 expected_hz 走，只有夹爪这一维被降到这个速率。
+  gripper_max_hz: 10
+  # 看门狗/abort 时松不松夹爪。默认**不松**：松开会把手里的东西扔到下面的任何
+  # 东西上，而驱动无从判断「扔掉」和「继续握着一个没人在决定的东西」哪个更糟。
+  release_gripper_on_watchdog: false
+  # 本体状态（state/joint，含 eef 当前末端位姿）的发布频率。VLA 的
+  # max_obs_age_ms 是 300，所以 10 Hz 很宽裕；再快没有收益而每拍是两次 SDK 往返。
+  state_hz: 10
+  # 六维力的采样频率。和控制回路同阶、不跟着 state 走 —— 10 Hz 的碰撞检测意味着
+  # 撞上之后手臂还能再走 100 ms。
+  force_hz: 30
+  # 六维力阈值 → ControlSink 链条第 7 步（超限立即 ABORTED 并**锁存**，只有
+  # servo 的 reset action 能清）。读的是 zero_force_data（系统外受力，已做重力/
+  # 负载补偿），不是 force_data（原始读数，含工具自重）。
+  #
+  # **这两个数是猜的，没有在真机上验证过。** 厂商标称额定力 200 N、额定力矩
+  # 8 Nm，这里刻意取得偏松：偏紧会让手臂不断 abort，而那正是一道保护被人关掉的
+  # 典型路径。第一次上真机要按 README 的流程收紧。
+  #
+  # 写成 false 可以整个关掉，写成 6 元列表 [Fx Fy Fz Mx My Mz] 可以逐轴指定。
+  # 传感器没标零（zero_force_data 六轴全零）时这道保护不会被启用，原因会出现在
+  # servo 的 info() 里 —— 一道假的保护比没有保护更糟，因为 descriptor 会宣称它存在。
+  force_torque:
+    force_n: 50
+    torque_nm: 5
 ros:
   robot_domain_id: 42
   core_domain_id: 42

@@ -37,7 +37,9 @@ sys.modules["device"] = device
 spec = importlib.util.spec_from_file_location("realman_rm75_servo", driver / "servo.py")
 servo = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(servo)
-assert servo.build_descriptor()["joint_names"] == device.JOINT_NAMES
+# 这条断言的意思是「servo.py 拿到的是同一份 device 模块全局」，不是「这张卡有
+# 几维」—— 所以只比手臂那一段，夹爪那一维由 test_rm75_servo.py 管。
+assert servo.build_descriptor()["joint_names"][:len(device.JOINT_NAMES)] == device.JOINT_NAMES
 # Later normal driver imports must reuse the same SDK class and module globals.
 sys.path.insert(0, str(driver))
 import device as normal_device
@@ -84,6 +86,13 @@ class SDKOwnershipTests(unittest.TestCase):
         self.robot.rm_set_arm_slow_stop.return_value = 0
         self.robot.rm_set_gripper_position.return_value = 0
         self.robot.rm_get_joint_degree.return_value = (0, [0] * 7)
+        # servo 的 `start` 会探测硬件（夹爪在不在、六维力读数可不可信）。这里
+        # 答「一切正常」，因为这个类测的是所有权交接，不是探测本身。
+        self.robot.rm_get_gripper_state.return_value = (
+            0, {"status": 1, "enable_state": 1, "actpos": 1000, "mode": 1})
+        self.robot.rm_get_force_data.return_value = (
+            0, {"force_data": [0.0] * 6,
+                "zero_force_data": [0.1, 0.0, 0.2, 0.0, 0.0, 0.0]})
         self.client._robot = self.robot
         self.client._handle = types.SimpleNamespace(id=1)
         self.owner = self.client.exclusive_client()
