@@ -6,7 +6,7 @@ hardware_model: "r1"
 image_name: r1
 port: 15702
 mcp_url: "http://localhost:15702/mcp"
-description: "Unitree R1-EDU — 麦克风 + TTS + LED + 运动控制 + 双目摄像头 + 状态感知"
+description: "Unitree R1-EDU — 麦克风 + TTS + LED + 运动控制 + 双目摄像头 + 状态感知；可选姿态检查需单独安装模型后端"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.

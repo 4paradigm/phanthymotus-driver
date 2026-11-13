@@ -62,6 +62,9 @@ COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+COPY pose_check.py /work/pose_check.py
+COPY pose_estimator.py /work/pose_estimator.py
+COPY pose_plugin.py /work/pose_plugin.py
 # Sibling of device.py — the camera cards' motus.camera/1 declaration lives here
 # rather than in device.py so it can be tested without rclpy. Missing it makes
 # every camera tool fail on the first info().

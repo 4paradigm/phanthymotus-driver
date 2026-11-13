@@ -18,6 +18,8 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         alsa-utils \
         v4l-utils \
         libasound2-dev \
+        libegl1 \
+        libgles2 \
         sshpass \
         openssh-client \
         libusb-1.0-0 && \
