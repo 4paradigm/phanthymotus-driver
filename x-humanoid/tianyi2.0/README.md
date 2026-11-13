@@ -17,6 +17,150 @@ to send media through Feishu or Telegram. Use `image_name` (without `.jpg`)
 for photos and `video_name` (without `.mp4`) for videos. To delete media, pass
 Use `delete` with the complete filename in `name`, including `.jpg` or `.mp4`.
 
+## Wrist camera card (`wrist_camera`, multiple instances)
+
+Add `wrist_camera` to the canvas once per desired view. Each instance exposes
+**RGB first, Depth second**; each output can be connected independently:
+
+| Port | Output topic | Format |
+| --- | --- | --- |
+| RGB | `/<namespace>/wrist_camera/<instance_id>/<side>_rgb` | `image/jpeg` |
+| Depth | `/<namespace>/wrist_camera/<instance_id>/<side>_depth` | `image/depth-zlib` |
+
+Hyphens in a canvas instance ID become underscores in ROS topic names.
+Conflicting normalized instance IDs are rejected. The final topic segment is
+`left_rgb`, `left_depth`, `right_rgb` or `right_depth`, so existing Core monitor
+panels distinguish wrist sides without frontend changes. Changing the device
+keeps the topic; changing the wrist side changes its suffix. After first binding,
+changing side, or upgrading from the previous `/rgb` and `/depth` suffixes, refresh
+the canvas/monitor to resolve the current instance topics and connections.
+The four former `camera_wrist_{left,right}_{rgb,depth}` cards are replaced by
+this tool. Existing canvases using those names must replace the old cards,
+select their devices, and reconnect RGB/depth to the corresponding ports.
+
+### Select a device and wrist side
+
+Use the card's instance settings (the same mechanism as `ext_mic`). This
+change does not relocate settings to the resource sidebar or modify Agent Core.
+An unconfigured newly dropped card must be bound before it can supply data:
+
+| Setting | Values | Meaning |
+| --- | --- | --- |
+| `side` | `left`, `right` | Physical wrist label; required, never inferred |
+| `device_id` | selected device | Stable physical device identity; required |
+| `fps` | `auto`, `15`, `30` | A supported native frame rate |
+| `resolution` | `auto` or a discovered size | Native RGB resolution; depth stays 640x480 |
+
+Confirm physical placement from a label, cable, or preview. If cameras are
+installed on the opposite wrists, change the device selection or side labels.
+No image rotation, flip, mirror, resizing, or depth-to-colour alignment is
+performed. The card does not establish a wrist extrinsic calibration.
+
+Select the intended camera explicitly, even when only one device is connected.
+Device selection has no `auto` mode. Saved physical identities are preserved;
+unresolved legacy `auto` configurations require selecting a camera again.
+Configuration replays and hotplug events never switch to another camera.
+RealSense identities use the SDK serial (without assuming a serial length or a
+D405 model name). UVC uses `/dev/v4l/by-id` when available, otherwise its USB bus
+path: cameras without unique serials should be rechecked if moved to another
+USB port. Renumberable `/dev/videoN` indices are not saved as identities.
+
+### Discovery and supported streams
+
+Discovery runs in an isolated process and refreshes periodically (three seconds
+between scans, with an eight-second scan deadline). Updated device choices are
+advertised through `tools/list`; reopen the settings after Agent Core refreshes
+the driver definition. `info` also reports `available_devices` and
+`discovery_errors`. Querying `info` does not start or restart capture.
+
+- RealSense: enumerate native RGB8/BGR8 and Z16 profiles using the installed
+  `pyrealsense2` SDK, without a camera-model whitelist. This is not a guarantee
+  that every RealSense model/firmware works with the pinned SDK.
+- Standard USB/UVC: enumerate capture formats with `v4l2-ctl` and capture through
+  OpenCV/V4L2. Metadata nodes and duplicate interfaces on one USB bus are
+  excluded. UVC provides **RGB only**; the depth port remains in position 1 and
+  reports `streams.depth.state: unavailable`. No synthetic depth is generated.
+- SDK-owned RealSense/Orbbec nodes are excluded from generic UVC capture to
+  avoid duplicate devices, IR/depth mistaken for colour, or stealing the head
+  camera. Other vendors' RGB-D SDKs are not implemented by this change.
+
+The container must see the camera's USB devices; the existing privileged
+`/dev:/dev` mount supplies this. Cameras attached to another compute board need
+capture/transport on that board and are not discovered by local enumeration.
+
+The RGB resolution dropdown is built from the discovered native profiles, with
+device names in the labels. It lists the union of usable sizes across devices;
+existing Core does not dynamically filter it when the device field changes.
+Reopen settings after the tool definition refreshes to see hotplug changes.
+The driver validates the chosen device and frame rate when applying settings,
+and retains saved offline sizes labelled as currently unavailable. Sizes that
+cannot pair with native 640x480 depth at any common frame rate are excluded.
+
+`auto` prefers 15 FPS and native 640x480 where supported, then selects a common
+native frame rate and available RGB profile. Explicit RGB size selection does
+not resize or change native depth: RGB may be 1280x720 while depth stays 640x480.
+Unsupported requests fail with a clear error. **Native depth must be 640x480**, because the current Core
+`image/depth-zlib` decoder assumes that size. Other native depth sizes are
+reported as unsupported, not resized. Depth is the SDK Z16 data converted using
+its actual depth scale to little-endian uint16 **millimetres**, then zlib
+compressed; zero means invalid, and out-of-range values do not wrap.
+
+### Preview, sharing, stop and reconnect
+
+Saving a valid instance configuration starts its preview without **Start
+Intelligent Control**. Instance bindings and requested preview states are saved
+atomically under `/opt/phanthy-motus/data/wrist-camera.json` (the mounted data
+directory), so an active preview can be restored after a driver restart.
+Saving or replaying the same configuration keeps healthy capture running and
+resumes a stopped preview without **Start Intelligent Control**.
+Global `info()` advertises enabled instances' topics for Core's periodic
+discovery and monitor registration. Allow the next driver heartbeat (up to
+30 seconds) after saving a new instance for monitoring to discover its streams.
+Removing a card or stopping its project sends `stop(instance_id)` and disables
+its preview. Driver shutdown closes all capture resources while retaining the
+saved requested state. Do not run two Tianyi driver services against one state
+file or the same cameras.
+
+Instances bound to the same physical camera share **one** capture process and
+one native stream configuration, with separate topic pairs. Their `side`
+labels may differ. Conflicting frame-rate/resolution requests report an error;
+stop other users before changing shared capture settings. Stopping one instance
+removes only its publication routes; stopping the last releases the device.
+
+Route updates are acknowledged after any in-flight publication completes.
+After a successful stop returns, that instance receives no new publications;
+DDS messages already queued in transport/subscribers cannot be retracted. An
+unresponsive worker is closed after a bounded route-update timeout, and the
+remaining requested instances are restarted by the monitor. A native SDK crash
+cannot terminate the body-controller process.
+
+A requested instance reports `loading` until fresh frames arrive, `running`
+when all supported channels are fresh, and `error` on capture failure or a
+12-second first-frame timeout. `streams` reports per-channel freshness/errors;
+a healthy RGB stream cannot hide a missing required depth stream. After the
+startup grace, a living worker with no fresh supported stream is restarted,
+including native startup/read hangs. A fresh sibling stream is preserved. A selected
+camera's disappearance stops its session and reports an error; reinserting the
+same device retries only instances that remain enabled. Discovery failure alone
+does not tear down a healthy capture. Capture requires the loopback-only
+`/opt/phanthy-motus/dds-local.xml` profile and publishes on domain 42, without
+changing the vendor's domain-0 participant or head-camera services.
+
+RGB/depth remain **unaligned**. ROS timestamps use the host clock, with raw SDK
+timestamps reported separately when available; no hardware synchronization is
+claimed. Actual per-stream SDK intrinsics are exposed through `camera_info`;
+uncalibrated UVC optics remain unknown.
+
+### Runtime dependencies
+
+The image installs `v4l-utils` for UVC capability discovery and pins the prebuilt
+Linux ARM64 / CPython 3.10 wheel `pyrealsense2==2.56.5.9235`; no SDK source build
+or pip cache is included. All Python dependencies remain in `requirements.txt`.
+The wheel is 4,338,854 bytes downloaded / 13,796,155 bytes unpacked (about
+4.14 / 13.16 MiB); these are package sizes, not a measured image-size delta.
+`libusb-1.0-0` remains an explicit runtime dependency because that wheel declares
+`libusb-1.0.so.0` in ELF `DT_NEEDED` and the checked base image did not supply it.
+
 ## Raw arm joint card
 
 `arm` directly commands seven joints per selected arm in this canonical order:

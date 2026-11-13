@@ -50,6 +50,11 @@ plugins:
     # Head camera height above the floor. The point-cloud renderer uses Y=0
     # as its grid plane, so raise the gravity-levelled cloud by this amount.
     floor_offset_m: 1.50
+  # Devices and left/right bindings are selected per canvas instance.
+  wrist_camera:
+    enabled: true
+    jpeg_quality: 85
+    state_file: /opt/phanthy-motus/data/wrist-camera.json
   asr:
     enabled: true
   nav_state:

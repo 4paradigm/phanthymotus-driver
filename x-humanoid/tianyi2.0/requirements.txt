@@ -2,3 +2,7 @@ pyyaml
 numpy
 opencv-python-headless
 phonemizer
+pyalsaaudio
+sounddevice
+# Prebuilt SDK wheel (including Linux ARM64 / CPython 3.10).
+pyrealsense2==2.56.5.9235

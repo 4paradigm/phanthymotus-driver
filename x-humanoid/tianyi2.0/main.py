@@ -336,6 +336,12 @@ class TianyiDeviceBundle:
                 plugins_cfg["camera_snapshot"], namespace, ros2))
             print("[bundle] CameraSnapshotPlugin loaded")
 
+        wrist_cfg = plugins_cfg.get("wrist_camera", {})
+        if wrist_cfg.get("enabled", False):
+            from wrist_cameras import WristCameraPlugin
+            self._plugins.append(WristCameraPlugin(wrist_cfg, namespace))
+            print("[bundle] WristCameraPlugin loaded (multi-instance)")
+
         for config_name, class_name in (("imu", "ImuPlugin"),
                                         ("camera_depth", "DepthCameraPlugin"),
                                         ("camera_pointcloud", "PointCloudPlugin")):
@@ -481,6 +487,7 @@ class TianyiDeviceBundle:
     _ALWAYS_START = {
         'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin',
         'ExtMicPlugin', 'CameraSnapshotPlugin', 'ControlledSpatialPlugin',
+        'WristCameraPlugin',
     }
 
     def start_all(self) -> None:
@@ -739,7 +746,7 @@ def make_handler():
                         }
                         if (isinstance(result, dict)
                                 and (result.get("state") == "error"
-                                     or "error" in result)):
+                                     or result.get("error"))):
                             tool_result["isError"] = True
                         ok(tool_result)
                 else:
