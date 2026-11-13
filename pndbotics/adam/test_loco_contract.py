@@ -68,6 +68,54 @@ class _Grpc:
 
 
 class LocoContractTests(unittest.TestCase):
+    def test_grpc_response_materializes_repeated_state_fields(self):
+        import importlib.util
+
+        grpc_stub = types.ModuleType("grpc")
+        grpc_stub.insecure_channel = lambda *args, **kwargs: None
+        grpc_stub.RpcError = Exception
+        grpc_stub.StatusCode = types.SimpleNamespace()
+        original_grpc = sys.modules.get("grpc")
+        original_pb2 = sys.modules.get("robot_control_pb2")
+        original_pb2_grpc = sys.modules.get("robot_control_pb2_grpc")
+        try:
+            sys.modules["grpc"] = grpc_stub
+            sys.modules["robot_control_pb2"] = types.ModuleType("robot_control_pb2")
+            sys.modules["robot_control_pb2_grpc"] = types.ModuleType("robot_control_pb2_grpc")
+            spec = importlib.util.spec_from_file_location(
+                "grpc_client_under_test", Path(__file__).with_name("grpc_client.py"))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            class _Repeated:
+                def __iter__(self):
+                    return iter(("STOP", "STAND_WALK"))
+
+            response = types.SimpleNamespace(
+                success=True,
+                message="",
+                switchable_states=_Repeated(),
+                available_actions=_Repeated(),
+            )
+            result = module.AdamGrpcClient._response(response, (
+                "switchable_states", "available_actions"))
+        finally:
+            if original_grpc is None:
+                sys.modules.pop("grpc", None)
+            else:
+                sys.modules["grpc"] = original_grpc
+            if original_pb2 is None:
+                sys.modules.pop("robot_control_pb2", None)
+            else:
+                sys.modules["robot_control_pb2"] = original_pb2
+            if original_pb2_grpc is None:
+                sys.modules.pop("robot_control_pb2_grpc", None)
+            else:
+                sys.modules["robot_control_pb2_grpc"] = original_pb2_grpc
+
+        self.assertEqual(["STOP", "STAND_WALK"], result["switchable_states"])
+        self.assertEqual(["STOP", "STAND_WALK"], result["available_actions"])
+
     def test_loco_hides_mode_and_automatically_enters_walking_state(self):
         grpc = _Grpc()
         plugin = RlLocoPlugin({}, "adam", None, grpc)
