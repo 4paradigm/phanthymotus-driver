@@ -117,6 +117,9 @@ class _MountNode:
 
 class RgbdCameraPlugin:
     def __init__(self, config, namespace, ros2, *, managed=False):
+        import rclpy
+        from rclpy.context import Context
+        from rclpy.executors import SingleThreadedExecutor
         from rclpy.node import Node
         self.root = '/' + namespace + '/camera/rgbd'
         self.managed, self.clients = managed, {}
@@ -124,7 +127,12 @@ class RgbdCameraPlugin:
         self.lifecycle_lock = threading.RLock()
         self.frame_interval_ns = round(1_000_000_000 / max(1., min(float(config.get('hz', 10)), 15.)))
         self.clock = 'orbbec_head_global_ros_header'
-        self.sub_node = Node('tianyi_rgbd_source', context=ros2.ctx_tianyi)
+        # A separate participant prevents body traffic from starving camera
+        # receive queues. It uses the same vendor profile and robot domain 0.
+        self._body_context = ros2.ctx_tianyi
+        self._source_context = Context()
+        rclpy.init(context=self._source_context, domain_id=0)
+        self.sub_node = Node('tianyi_rgbd_source', context=self._source_context)
         self.pub_node = Node('tianyi_rgbd_output', context=ros2.ctx_core)
         ros2.executor_core.add_node(self.pub_node)
         self.lock = threading.RLock()
@@ -138,6 +146,9 @@ class RgbdCameraPlugin:
         self.stop_event = threading.Event()
         self.last_emit = 0
         self.count = 0
+        self.image_streams = {kind: dict(received=0, last_capture_ns=None, last_arrival_ns=None)
+                              for kind in ('color', 'depth')}
+        self.last_publish_ns = None
         self.error = None
         self.future = None
         self.parameter_stage = 'service'
@@ -148,14 +159,23 @@ class RgbdCameraPlugin:
         self.imu_samples = {kind: deque(maxlen=512) for kind in ('gyro', 'accel')}
         self.imu_epoch = None
         self.imu_last_stamp = 0
+        self.imu_publication_attempts = self.imu_max_capture_gap_ns = 0
         self.imu_translation_reason = 'waiting for camera motion TF translation'
         self.body_mount = None
         self._camera_executor = None
         self.imu_node = None
-        ros2.executor_tianyi.add_node(self.sub_node)
+        self._source_executor = SingleThreadedExecutor(context=self._source_context)
+        self._source_shutdown = threading.Event()
+        self._source_executor.add_node(self.sub_node)
+        self._source_context.on_shutdown(self._shutdown_source)
+        self._body_context.on_shutdown(self._source_context.try_shutdown)
+        self._source_spin = threading.Thread(target=self._spin_source, name='tianyi_rgbd_images', daemon=True)
+        self._source_spin.start()
         if self.imu_enabled:
-            from rclpy.executors import SingleThreadedExecutor
-            self._camera_context = ros2.ctx_tianyi
+            # Large image fragments must not queue ahead of camera motion.
+            self._camera_context = Context()
+            rclpy.init(context=self._camera_context, domain_id=0)
+            self._source_context.on_shutdown(self._camera_context.try_shutdown)
             self.imu_node = Node('tianyi_rgbd_imu_source', context=self._camera_context)
             self._camera_executor = SingleThreadedExecutor(context=self._camera_context)
             self._camera_shutdown = threading.Event()
@@ -163,6 +183,28 @@ class RgbdCameraPlugin:
             self._camera_spin = threading.Thread(target=self._spin_camera, name='tianyi_rgbd_ros', daemon=True)
             self._camera_spin.start()
             self._camera_context.on_shutdown(self._shutdown_camera)
+
+    def _spin_source(self):
+        from rclpy.executors import ExternalShutdownException, ShutdownException
+        try:
+            while not self._source_shutdown.is_set():
+                self._source_executor.spin_once(timeout_sec=.05)
+        except (ExternalShutdownException, ShutdownException):
+            pass
+        except Exception as error:
+            if not self._source_shutdown.is_set():
+                with self.lock, self.imu_lock:
+                    self._source_shutdown.set()
+                    self.error = 'camera source callbacks: ' + str(error)
+                    self.running = False
+                    self.stop_event.set()
+        finally:
+            self._source_shutdown.set()
+            self._source_executor.shutdown(timeout_sec=5)
+
+    def _shutdown_source(self):
+        self._source_shutdown.set()
+        self._source_executor.wake()
 
     def _spin_camera(self):
         from rclpy.executors import ExternalShutdownException, ShutdownException
@@ -281,13 +323,18 @@ class RgbdCameraPlugin:
             return dict(state='available' if stage == 'ready' else 'unavailable', stage=stage,
                         **({'reason': reason[:256]} if reason else {}), parameters=parameters,
                         camera_info=infos, rectified_geometry_ready=self.geometry is not None,
-                        first_calibrated_output=self.count > 0)
+                        first_calibrated_output=self.count > 0,
+                        streams=dict({kind: dict(value) for kind, value in getattr(self, 'image_streams', {}).items()},
+                                     paired_capture_ns=getattr(self, 'last_emit', 0), forwarded=self.count,
+                                     last_publish_ns=getattr(self, 'last_publish_ns', None)))
 
     def start(self):
         from sensor_msgs.msg import Image, CameraInfo, CompressedImage
         from rclpy.qos import qos_profile_sensor_data
         from rcl_interfaces.srv import GetParameters
         with self.lock, self.imu_lock:
+            if self._source_shutdown.is_set():
+                raise RuntimeError(self.error or 'camera source callback executor stopped; restart the driver')
             if self._camera_executor is not None and self._camera_shutdown.is_set():
                 raise RuntimeError(self.error or 'camera callback executor stopped; restart the driver')
             if self.running:
@@ -310,12 +357,16 @@ class RgbdCameraPlugin:
             self.infos.clear()
             self.last_emit = 0
             self.count = 0
+            self.image_streams = {kind: dict(received=0, last_capture_ns=None, last_arrival_ns=None)
+                                  for kind in ('color', 'depth')}
+            self.last_publish_ns = None
             self.future = None
             self.parameter_stage = 'service'
             self.parameter_values = {}
             self.error = None
             self.imu_epoch = uuid.uuid4().hex
             self.imu_last_stamp = 0
+            self.imu_publication_attempts = self.imu_max_capture_gap_ns = 0
             self.imu_translation_reason = 'waiting for camera motion TF translation'
             for samples in self.imu_samples.values():
                 samples.clear()
@@ -342,9 +393,10 @@ class RgbdCameraPlugin:
             self.imu_buffer = Buffer()
             self.imu_listener = TransformListener(self.imu_buffer, self.imu_node)
             self.imu_pub = self.pub_node.create_publisher(String, self.root + '/imu', qos_profile_sensor_data)
-            # Preserve 100 Hz capture intervals across transient image/TF work
-            # on this executor. Processing still rejects captures over 500 ms old.
-            motion_qos = QoSProfile(depth=100, reliability=ReliabilityPolicy.BEST_EFFORT)
+            # Keep 200 ms of 100 Hz history across short callback stalls. Deeper
+            # queues accumulate stale captures under mixed sensor load instead
+            # of catching up. Admission still rejects captures over 500 ms old.
+            motion_qos = QoSProfile(depth=20, reliability=ReliabilityPolicy.BEST_EFFORT)
             for kind in ('gyro', 'accel'):
                 self.imu_node.create_subscription(Imu, '/ob_camera_head/' + kind + '/sample',
                     lambda msg, k=kind: self._imu(k, msg), motion_qos)
@@ -445,6 +497,9 @@ class RgbdCameraPlugin:
                     from std_msgs.msg import String
                     if self._publishes('imu', gyro_stamp):
                         self.imu_pub.publish(String(data=json.dumps(packet, allow_nan=False)))
+                        self.imu_publication_attempts += 1
+                        if self.imu_last_stamp:
+                            self.imu_max_capture_gap_ns = max(self.imu_max_capture_gap_ns, gyro_stamp-self.imu_last_stamp)
                     self.imu_last_stamp = gyro_stamp
                     self.imu_reason = None
             except Exception as error:
@@ -462,6 +517,8 @@ class RgbdCameraPlugin:
                 reason = 'camera motion source stale'
             translation_reason = getattr(self, 'imu_translation_reason', 'waiting for camera motion TF translation')
             return dict(state='unavailable' if reason else 'available', **({'reason': reason} if reason else {}),
+                        publication_attempts=getattr(self, 'imu_publication_attempts', 0),
+                        max_capture_gap_ns=getattr(self, 'imu_max_capture_gap_ns', 0),
                         fusion=dict(state='unavailable' if translation_reason else 'available',
                                     **({'reason': translation_reason} if translation_reason else {})))
 
@@ -504,7 +561,11 @@ class RgbdCameraPlugin:
 
     def _image(self, kind, msg):
         with self.lock:
-            if not self.running or not self.registered or set(self.infos) != {'color', 'depth'}:
+            if not self.running:
+                return
+            stream = self.image_streams[kind]
+            stream.update(received=stream['received']+1, last_capture_ns=_stamp(msg), last_arrival_ns=time.time_ns())
+            if not self.registered or set(self.infos) != {'color', 'depth'}:
                 return
             try:
                 signature = tuple((tuple(self.infos[k].k), tuple(self.infos[k].d), self.infos[k].width,
@@ -579,6 +640,7 @@ class RgbdCameraPlugin:
                     if publish_depth:
                         self.depth_pub.publish(out_depth)
                     self.count += 1
+                    self.last_publish_ns = time.time_ns()
             except Exception as error:
                 with self.lock, self.imu_lock:
                     self.error = str(error)

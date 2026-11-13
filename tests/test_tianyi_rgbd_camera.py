@@ -112,6 +112,8 @@ def test_frame_sampling_uses_capture_intervals_despite_callback_jitter(monkeypat
     source.signature = source.geometry = None
     source.frames = {'color': deque(maxlen=3), 'depth': deque(maxlen=3)}
     source.pending = queue.Queue(maxsize=1); source.last_emit = 0.
+    source.image_streams = {kind: dict(received=0, last_capture_ns=None, last_arrival_ns=None)
+                            for kind in ('color', 'depth')}
     source.frame_interval_ns = 100_000_000
     source.stop_event = threading.Event(); source.error = None
     monkeypatch.setattr(m.time, 'monotonic', lambda: 1000.)

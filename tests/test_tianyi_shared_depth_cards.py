@@ -147,7 +147,7 @@ def test_original_imu_display_restart_joins_snapshot_and_reuses_subscriptions(mo
 
 def test_shared_depth_retains_original_configured_rate(source):
     from test_tianyi_rgbd_camera import info
-    ros = NS(ctx_tianyi=None, ctx_core=None, executor_tianyi=NS(add_node=lambda n: None),
+    ros = NS(ctx_tianyi=source._body_context, ctx_core=None, executor_tianyi=NS(add_node=lambda n: None),
              executor_core=NS(add_node=lambda n: None))
     shared = m.RgbdCameraPlugin({'imu_enabled': False, 'hz': 8}, 'rate', ros)
     shared.running = shared.registered = True
@@ -162,6 +162,8 @@ def test_shared_depth_retains_original_configured_rate(source):
         assert sampled == [1_000_000_000, 1_125_000_000, 1_250_000_000]
     finally:
         shared.stop()
+        shared._source_context.try_shutdown()
+        shared._source_spin.join(timeout=1)
 
 
 def test_queued_frame_cannot_cross_depth_restart_even_with_tolerated_clock_skew(source):

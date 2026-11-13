@@ -21,6 +21,7 @@ STAMP = 12_345_678_901
 
 @pytest.fixture
 def source(monkeypatch):
+    from test_tianyi_rgbd_imu import CameraContext, CallbackExecutor
     events = []
     class Node:
         def __init__(self, *args, context=None):
@@ -49,6 +50,11 @@ def source(monkeypatch):
     class Image:
         def __init__(self): self.header = NS()
     monkeypatch.setitem(sys.modules, 'rclpy.node', NS(Node=Node))
+    monkeypatch.setitem(sys.modules, 'rclpy', NS(init=lambda **kw: None))
+    monkeypatch.setitem(sys.modules, 'rclpy.context', NS(Context=CameraContext))
+    monkeypatch.setitem(sys.modules, 'rclpy.executors', NS(SingleThreadedExecutor=CallbackExecutor,
+        ExternalShutdownException=type('ExternalShutdownException', (Exception,), {}),
+        ShutdownException=type('ShutdownException', (Exception,), {})))
     monkeypatch.setitem(sys.modules, 'rclpy.time', NS(Time=lambda **kw: NS(**kw)))
     monkeypatch.setitem(sys.modules, 'rclpy.clock', NS(ClockType=NS(ROS_TIME='ros')))
     monkeypatch.setitem(sys.modules, 'rclpy.qos', NS(qos_profile_sensor_data=object()))
@@ -56,7 +62,8 @@ def source(monkeypatch):
     monkeypatch.setitem(sys.modules, 'std_msgs.msg', NS(String=lambda **kw: NS(**kw)))
     monkeypatch.setitem(sys.modules, 'rcl_interfaces.srv', NS(GetParameters=object))
     monkeypatch.setitem(sys.modules, 'tf2_ros', NS(Buffer=Buffer, TransformListener=Listener))
-    ros = NS(ctx_tianyi='robot-domain', ctx_core='output-domain', executor_tianyi=NS(add_node=lambda n: None),
+    context = CameraContext()
+    ros = NS(ctx_tianyi=context, ctx_core='output-domain', executor_tianyi=NS(add_node=lambda n: None),
              executor_core=NS(add_node=lambda n: None))
     plugin = m.RgbdCameraPlugin({'imu_enabled': False}, 'test', ros)
     worker = plugin._work
@@ -71,6 +78,9 @@ def source(monkeypatch):
     plugin.events = events
     yield plugin
     plugin.stop()
+    context.try_shutdown()
+    plugin._source_spin.join(timeout=1)
+    assert not plugin._source_spin.is_alive()
 
 
 def emit(source, stamp=STAMP):
@@ -98,7 +108,7 @@ def test_fourth_port_declarations_actual_capture_tf_and_cross_domain_output(sour
     assert packet['stamp_ns'] == STAMP and packet['clock_id'] == source.clock
     assert packet['matrix'][0][3] == .2
     assert source.body_mount.buffer.calls == [('base_link', 'head_optical', STAMP)]
-    assert source.body_mount.listener.context == 'robot-domain'
+    assert source.body_mount.listener.context is source.sub_node.context
     assert source.root+'/body_mount' in source.pub_node.publishers
     assert source.root+'/body_mount' not in source.sub_node.publishers
     assert m._stamp(source.events[-1][1]) == STAMP

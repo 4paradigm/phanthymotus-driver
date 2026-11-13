@@ -81,6 +81,23 @@ def test_parameter_service_rediscovery_does_not_repeat_old_validation_error(sour
     assert 'get_parameters' in status['reason']
 
 
+def test_stream_diagnostics_distinguish_received_paired_and_forwarded_captures(source):
+    source.registered = False
+    stamp = 12_345_678_901
+    image = NS(header=NS(stamp=NS(sec=12, nanosec=345_678_901)))
+    source._image('color', image)
+    streams = source.dispatch('info', {})['source_status']['streams']
+    assert streams['color']['received'] == 1
+    assert streams['color']['last_capture_ns'] == stamp
+    assert streams['depth']['received'] == 0
+    assert streams['paired_capture_ns'] == 0
+    assert streams['forwarded'] == 0 and streams['last_publish_ns'] is None
+    source.registered = True
+    emit(source)
+    streams = source.dispatch('info', {})['source_status']['streams']
+    assert streams['forwarded'] == 1 and streams['last_publish_ns'] > 0
+
+
 @pytest.mark.parametrize('received,missing', [('color', 'depth'), ('depth', 'color')])
 def test_missing_camera_info_is_named_and_geometry_wait_is_distinct(source, received, missing):
     waiting(source)
@@ -121,7 +138,7 @@ def test_full_restart_discards_previous_camera_info_and_stopped_callbacks(source
     source.worker.join()
     assert source.infos == {}
     source.registered = True
-    image = NS(width=640, height=480, header=NS(frame_id='head_optical'))
+    image = NS(width=640, height=480, header=NS(frame_id='head_optical', stamp=NS(sec=0, nanosec=0)))
     source._image('color', image)
     assert source.geometry is None
     status = source.dispatch('info', {})['source_status']

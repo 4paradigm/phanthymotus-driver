@@ -270,6 +270,14 @@ validation failure. Only scalar flags and parameter values are included, with
 no source image payloads or history. Full source restarts require new
 `CameraInfo` messages; prior-start calibration is discarded. A pending parameter
 response is reported as waiting and is not automatically cancelled or retried.
+`source_status.streams` reports per-start color/depth receive counts and last
+capture/arrival times, the latest paired capture, forwarded-pair count and last
+publication time. These bounded counters distinguish missing callbacks,
+unmatched captures and stalled output without including image payloads.
+`imu_status.publication_attempts` counts local publish calls that returned
+successfully; `max_capture_gap_ns` tracks their largest capture interval. These
+do not certify downstream delivery or cover an ongoing interruption before its
+next publication. Inspect consumer capture/arrival times to locate delivery gaps.
 
 The existing `imu` card keeps its display output and appends the named optional
 `camera_imu` port (`sensor/imu`) on `/<ns>/camera/rgbd/imu`. It publishes

@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import math
+import queue
 from pathlib import Path
 import sys
 import threading
@@ -32,6 +33,7 @@ class Publisher:
 
 class Node:
     def __init__(self, *args, **kwargs):
+        self.context = kwargs.get('context')
         self.subscriptions = {}
         self.subscription_qos = {}
         self.publishers = {}
@@ -64,6 +66,30 @@ class Buffer:
         return NS(transform=transform)
 
 
+class CallbackExecutor:
+    def __init__(self, context):
+        self.context = context; self.nodes = []; self.stopped = threading.Event(); self.error = None
+        self.jobs = queue.Queue()
+    def add_node(self, node): self.nodes.append(node)
+    def spin_once(self, timeout_sec):
+        if self.error: raise RuntimeError(self.error)
+        try: job = self.jobs.get(timeout=timeout_sec)
+        except queue.Empty: return
+        if job is not None: job()
+    def wake(self): self.stopped.set(); self.jobs.put(None)
+    def shutdown(self, **kw): self.wake()
+
+
+class CameraContext:
+    def __init__(self): self.callbacks = []; self.closed = False
+    def on_shutdown(self, callback): self.callbacks.append(callback)
+    def ok(self): return not self.closed
+    def try_shutdown(self):
+        if not self.closed:
+            self.closed = True
+            for callback in self.callbacks: callback()
+
+
 @pytest.fixture
 def source(monkeypatch, request):
     monkeypatch.setitem(sys.modules, 'rclpy.node', NS(Node=Node))
@@ -74,18 +100,10 @@ def source(monkeypatch, request):
     monkeypatch.setitem(sys.modules, 'std_msgs.msg', NS(String=lambda **kw: NS(**kw)))
     monkeypatch.setitem(sys.modules, 'rcl_interfaces.srv', NS(GetParameters=object))
     monkeypatch.setitem(sys.modules, 'tf2_ros', NS(Buffer=Buffer, TransformListener=lambda b, n: NS(buffer=b, node=n)))
-    callbacks = []; closed = [False]
-    context = NS(on_shutdown=callbacks.append, ok=lambda: not closed[0])
-    class Executor:
-        def __init__(self, context):
-            self.context = context; self.nodes = []; self.stopped = threading.Event(); self.error = None
-        def add_node(self, node): self.nodes.append(node)
-        def spin_once(self, timeout_sec):
-            self.stopped.wait(timeout_sec)
-            if self.error: raise RuntimeError(self.error)
-        def wake(self): self.stopped.set()
-        def shutdown(self, **kw): self.stopped.set()
-    monkeypatch.setitem(sys.modules, 'rclpy.executors', NS(SingleThreadedExecutor=Executor,
+    context = CameraContext()
+    monkeypatch.setitem(sys.modules, 'rclpy', NS(init=lambda **kw: None))
+    monkeypatch.setitem(sys.modules, 'rclpy.context', NS(Context=CameraContext))
+    monkeypatch.setitem(sys.modules, 'rclpy.executors', NS(SingleThreadedExecutor=CallbackExecutor,
         ExternalShutdownException=type('ExternalShutdownException', (Exception,), {}),
         ShutdownException=type('ShutdownException', (Exception,), {})))
     ros = NS(ctx_tianyi=context, ctx_core=object(), executor_tianyi=NS(add_node=lambda n: None),
@@ -98,8 +116,10 @@ def source(monkeypatch, request):
     plugin.count = 1
     yield plugin
     plugin.stop()
-    closed[0] = True
-    for callback in callbacks: callback()
+    context.try_shutdown()
+    if hasattr(plugin, '_source_spin'):
+        plugin._source_spin.join(timeout=1)
+        assert not plugin._source_spin.is_alive()
     if plugin._camera_executor is not None:
         plugin._camera_spin.join(timeout=1)
         assert not plugin._camera_spin.is_alive()
@@ -138,6 +158,20 @@ def test_motion_ingress_and_tf_have_no_image_callbacks_on_their_executor(source)
     assert not any('/sample' in topic for topic in source.sub_node.subscriptions)
 
 
+def test_camera_callbacks_run_without_body_executor_and_keep_imu_separate(source):
+    delivered = threading.Event()
+    source._source_executor.jobs.put(delivered.set)
+    assert delivered.wait(timeout=.2)
+    assert source._source_executor.nodes == [source.sub_node]
+    assert source._source_executor is not source._camera_executor
+    assert source._camera_executor.nodes == [source.imu_node]
+    assert source._source_executor.context is not source._camera_executor.context
+    assert source._source_context is not source._body_context
+    worker = source._source_spin
+    source.stop(); source.start()
+    assert source._source_spin is worker and worker.is_alive()
+
+
 def test_slow_tf_work_cannot_publish_a_packet_past_capture_age_limit(source):
     lookup = source.imu_buffer.lookup_transform
     def delayed(*args):
@@ -148,6 +182,17 @@ def test_slow_tf_work_cannot_publish_a_packet_past_capture_age_limit(source):
     feed(source)
     assert packets(source) == []
     assert 'stale' in source._imu_status()['reason']
+
+
+def test_motion_publication_diagnostics_preserve_and_report_real_capture_gaps(source):
+    feed(source)
+    source.sub_node.now_ns = NOW+120_000_000
+    feed(source, gyro=motion(NOW+120_000_000), accel=motion(NOW+120_000_000, 'accel_frame'))
+    status = source._imu_status()
+    assert status['publication_attempts'] == 2
+    assert status['max_capture_gap_ns'] == 120_000_000
+    feed(source, gyro=motion(NOW+100_000_000), accel=motion(NOW+120_000_000, 'accel_frame'))
+    assert source._imu_status()['publication_attempts'] == 2
 
 
 def test_imu_release_waits_for_publication_then_rejects_late_motion(source):
@@ -225,6 +270,45 @@ def test_motion_capture_intervals_survive_a_200ms_callback_backlog(source):
     assert max(b-a for a, b in zip(stamps, stamps[1:])) == 10_000_000
 
 
+def test_overloaded_motion_ingress_keeps_recent_history_instead_of_half_second_latency(source):
+    queues = {}
+    for kind, frame in [('gyro', 'gyro_optical'), ('accel', 'accel_frame')]:
+        topic = '/ob_camera_head/' + kind + '/sample'
+        queue = deque(maxlen=source.imu_node.subscription_qos[topic].depth)
+        for i in range(100):
+            queue.append(motion(NOW-(99-i)*10_000_000, frame,
+                                (0., 0., 0.) if kind == 'gyro' else (0., 0., 9.81)))
+        queues[kind] = topic, queue
+    while any(queue for _, queue in queues.values()):
+        for topic, queue in queues.values():
+            if queue:
+                source.imu_node.subscriptions[topic](queue.popleft())
+    stamps = [p['stamp_ns'] for p in packets(source)]
+    assert stamps and stamps[-1] == NOW
+    assert NOW-stamps[0] <= 200_000_000
+    assert max(b-a for a, b in zip(stamps, stamps[1:])) == 10_000_000
+
+
+def test_backlog_beyond_retained_history_exposes_the_real_capture_gap(source):
+    feed(source, gyro=motion(xyz=(0., 0., 0.)))
+    queues = {}
+    for kind, frame in [('gyro', 'gyro_optical'), ('accel', 'accel_frame')]:
+        topic = '/ob_camera_head/' + kind + '/sample'
+        queue = deque(maxlen=source.imu_node.subscription_qos[topic].depth)
+        for i in range(1, 32):
+            queue.append(motion(NOW+i*10_000_000, frame,
+                                (0., 0., 0.) if kind == 'gyro' else (0., 0., 9.81)))
+        queues[kind] = topic, queue
+    source.sub_node.now_ns = NOW+310_000_000
+    while any(queue for _, queue in queues.values()):
+        for topic, queue in queues.values():
+            if queue:
+                source.imu_node.subscriptions[topic](queue.popleft())
+    stamps = [p['stamp_ns'] for p in packets(source)]
+    assert stamps[:2] == [NOW, NOW+120_000_000]
+    assert stamps[-1] == NOW+310_000_000
+
+
 def test_motion_callback_executor_persists_across_card_restart(source):
     executor, worker = source._camera_executor, source._camera_spin
     assert executor.nodes == [source.imu_node] and worker.is_alive()
@@ -245,7 +329,10 @@ def test_motion_callback_failure_marks_source_unavailable(source):
     assert not source.running and 'callback failed' in source.error
 
 
-def test_callback_failure_blocks_restart_before_executor_cleanup(source):
+@pytest.mark.parametrize('executor,worker,message', [
+    ('_camera_executor', '_camera_spin', 'camera callbacks: callback failed'),
+    ('_source_executor', '_source_spin', 'camera source callbacks: callback failed')])
+def test_callback_failure_blocks_restart_before_executor_cleanup(source, executor, worker, message):
     lock, errors = source.lock, []
     class Lock:
         attempted = False
@@ -259,10 +346,10 @@ def test_callback_failure_blocks_restart_before_executor_cleanup(source):
                 except RuntimeError as error:
                     errors.append(str(error))
     source.lock = Lock()
-    source._camera_executor.error = 'callback failed'
-    source._camera_executor.stopped.set()
-    source._camera_spin.join(timeout=1)
-    assert errors == ['camera callbacks: callback failed']
+    getattr(source, executor).error = 'callback failed'
+    getattr(source, executor).stopped.set()
+    getattr(source, worker).join(timeout=1)
+    assert errors == [message]
     assert not source.running and source.stop_event.is_set()
 
 

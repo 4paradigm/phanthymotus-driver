@@ -53,14 +53,25 @@ mapping offset and explicitly keeps approximate mapping unverified. Missing
 motion streams, unavailable TF or invalid clocks withdraw only IMU availability;
 video and RGB-D remain usable. `imu_status` is reported separately.
 
-Tianyi buffers up to 100 raw gyro and acceleration captures per subscription
-using best-effort delivery, so transient image/TF callback work does not discard
-all but the latest five samples. Capture timestamps and the 500 ms source-age
-limit remain unchanged: buffering preserves short intervals, not stale data or
-invented samples. Queueing alone did not prevent sustained backlog in the full
-driver. Motion subscriptions and their TF listener therefore use a dedicated
-IMU-only node/executor and lock; image callbacks stay on the existing vendor
-executor. Image publication cannot hold the IMU lock. Stop/restart still
+Tianyi buffers up to 20 raw gyro and acceleration captures per subscription
+using best-effort delivery, retaining 200 ms of 100 Hz history. The previous
+100-capture queue accumulated roughly 500 ms of latency under mixed sensor
+load. Capture timestamps and the 500 ms source-age limit remain unchanged.
+Stalls longer than the retained history can drop captures; the real gap remains
+visible, and the consumer's 100 ms gap check can require a new segment. Motion
+subscriptions and their TF listener use a dedicated IMU-only node/executor
+and lock. Camera and IMU inputs each have an independent robot-domain-0 DDS
+participant, separate from body-state traffic and from each other; camera
+images, calibration and parameter callbacks have their own executor. The
+vendor profile is retained.
+The driver body-domain executor runs callbacks serially: in the same mixed-load
+diagnostic, the default multithreaded executor (including a two-worker limit)
+backlogged motion captures to about 200 ms, while serial body callbacks reduced
+their median age to 11–13 ms. Camera and motion executors remain independent;
+the domain-42 executor is unchanged. Callback exceptions are logged and do not
+terminate the body receive loop. Heavy body callbacks can still delay body
+feedback and require workload-specific validation.
+Image publication cannot hold the IMU lock. Stop/restart still
 serialize IMU publication, and capture age is checked again after TF processing.
 
 A private-namespace diagnostic source plus the production consumer completed

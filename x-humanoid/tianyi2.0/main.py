@@ -272,7 +272,9 @@ class DualDomainROS2:
         # Domain 0: the tianyi body controller, on 192.168.41.x.
         self.ctx_tianyi = Context()
         rclpy.init(context=self.ctx_tianyi, domain_id=0)
-        self.executor_tianyi = rclpy.executors.MultiThreadedExecutor(context=self.ctx_tianyi)
+        # The multithreaded body executor starves Python camera/IMU workers
+        # under mixed sensor load; serial callbacks avoid its GIL contention.
+        self.executor_tianyi = rclpy.executors.SingleThreadedExecutor(context=self.ctx_tianyi)
 
         # Domain 42: Agent Core, on this same host. `/remote_control/message` carries
         # *commands* and DDS has no addressing, so every ROS_DOMAIN_ID=42 subscriber on
@@ -288,11 +290,12 @@ class DualDomainROS2:
     def start_spin(self):
         """Start spinning both executors in background threads."""
         def _spin(executor, name):
-            try:
-                while rclpy.ok(context=executor.context):
+            while rclpy.ok(context=executor.context):
+                try:
                     executor.spin_once(timeout_sec=0.1)
-            except Exception:
-                pass
+                except Exception as error:
+                    if rclpy.ok(context=executor.context):
+                        print(f"[ros2] {name} callback failed: {error}", flush=True)
             print(f"[ros2] {name} spin exited")
 
         t1 = threading.Thread(target=_spin, args=(self.executor_tianyi, "domain0"), daemon=True)
