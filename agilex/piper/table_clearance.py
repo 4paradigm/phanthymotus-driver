@@ -9,7 +9,10 @@ from agilex.piper.user_motion import rotation
 from agilex.piper.monitor import _RosPublisher
 
 def finite(v):
-    return type(v) in (int, float) and math.isfinite(v)
+    try:
+        return type(v) in (int, float) and math.isfinite(v)
+    except OverflowError:
+        return False
 
 
 def vector(v, n):
@@ -61,7 +64,10 @@ def clearance_settings(config):
         if not isinstance(vertices, list) or not 4 <= len(vertices) <= 256:
             raise ValueError(f'{key} 必须含 4–256 个凸包顶点')
         points = np.array([vector(v, 3) for v in vertices])
-        if np.linalg.matrix_rank(points[1:] - points[0]) != 3:
+        # Scale before subtraction/SVD: finite inputs can otherwise overflow.
+        scale = float(np.max(np.abs(points)))
+        normalized = points / scale if scale else points
+        if np.linalg.matrix_rank(normalized[1:] - normalized[0]) != 3:
             raise ValueError(f'{key} 顶点必须描述三维几何')
     return cfg
 
@@ -86,19 +92,28 @@ def table_distance(snapshot, cfg, now):
     if not finite(width) or not cfg['opening_range_mm'][0] <= width <= cfg['opening_range_mm'][1]:
         return dict(bad, reason='opening_outside_calibrated_range')
     position, rpy = vector(pose.get('position_mm'), 3), vector(pose.get('orientation_deg'), 3)
-    axis = np.array(cfg['opening_axis']) * width / 2
-    # Finger vertices are measured at ZERO opening. Positive/negative local
-    # translation must be physically verified for the installed finger pair.
-    local = np.concatenate([np.array(cfg['body_vertices_mm']),
-        np.array(cfg['left_finger_vertices_mm']) + axis,
-        np.array(cfg['right_finger_vertices_mm']) - axis])
-    points = local @ np.array(rotation(rpy)).T + position
-    plane = np.array(cfg['plane_base_mm'])
-    distances = points @ plane[:3] + plane[3]
-    index = int(np.argmin(distances))
-    distance = float(distances[index])
+    try:
+        with np.errstate(over='raise', invalid='raise', divide='raise'):
+            axis = np.array(cfg['opening_axis']) * width / 2
+            # Finger vertices are measured at ZERO opening. Positive/negative
+            # translation must be physically verified for this finger pair.
+            local = np.concatenate([np.array(cfg['body_vertices_mm']),
+                np.array(cfg['left_finger_vertices_mm']) + axis,
+                np.array(cfg['right_finger_vertices_mm']) - axis])
+            points = local @ np.array(rotation(rpy)).T + position
+            plane = np.array(cfg['plane_base_mm'])
+            distances = points @ plane[:3] + plane[3]
+            if not all(np.isfinite(a).all() for a in (axis, local, points, distances)):
+                raise FloatingPointError('nonfinite_geometry')
+            index = int(np.argmin(distances))
+            distance = float(distances[index])
+            conservative = distance - cfg['uncertainty_mm']
+            if not math.isfinite(conservative):
+                raise FloatingPointError('nonfinite_geometry')
+    except (FloatingPointError, OverflowError):
+        return dict(bad, reason='nonfinite_geometry')
     return dict(state='ok', reason=None, clearance_mm=distance,
-        conservative_clearance_mm=distance - cfg['uncertainty_mm'],
+        conservative_clearance_mm=conservative,
         lowest_point_base_mm=points[index].tolist(), feedback_time=min(stamps),
         opening_mm=width, unit='mm', quantity='signed_plane_normal_distance',
         calibration_id=cfg['calibration_id'], base_frame=cfg['base_frame'],

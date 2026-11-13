@@ -2,6 +2,7 @@
 from copy import deepcopy
 from itertools import product
 from types import SimpleNamespace as NS
+import json
 import pytest
 from agilex.piper.table_clearance import (TableClearance, add_table_clearance,
     clearance_settings, table_distance)
@@ -132,3 +133,73 @@ def test_passive_bundle_registration_and_rejected_control_parameters():
         with pytest.raises(ValueError):
             bundle.dispatch('piper_table_clearance', {'action':'start', **args})
     assert bundle.dispatch('piper_table_clearance', {'action':'stop'})['result']['state'] == 'idle'
+
+
+def test_verified_build_plugins_reads_sdk_pose_and_opening_without_commands(tmp_path):
+    from agilex.piper.device import build_plugins
+    from agilex.piper.unified_control import UnifiedControlPlugin
+    from common.vendor_runtime import DriverBundle
+    from test_piper_intent import IntentDriver
+
+    plugins = build_plugins({'data_dir': str(tmp_path), 'can_interface': 'can0',
+        'table_clearance': calibrated()}, 'arm1', None)
+    runtime, background = plugins[:2]
+    background.auto_connect = False
+    def forbid_connection(*args, **kwargs):
+        pytest.fail('The measurement must not establish a hardware connection')
+    runtime.factory = forbid_connection
+    # Model an already connected shared receiver, using the existing recording SDK.
+    driver = runtime.driver = IntentDriver()
+    sdk = driver.arm
+    sdk.pose = (0, 0, 100000, 0, 0, 0)
+    sdk.width = 20.
+    card, bundle = plugins[-1], DriverBundle(plugins)
+    try:
+        assert card.read_snapshot.__self__ is runtime
+        assert card.read_snapshot.__func__ is UnifiedControlPlugin.read_monitor_snapshot
+        bundle.dispatch('piper_table_clearance', {'action': 'start'})
+        card.tick(card.generation)
+        result = card.info()['result']
+        assert result['state'] == 'ok'
+        assert result['clearance_mm'] == pytest.approx(99.)
+        assert result['opening_mm'] == 20.
+        json.dumps(result, allow_nan=False)
+
+        sdk.pose = (0, 0, 100000, 90000, 0, 0)
+        sdk.width = 40.
+        card.tick(card.generation)
+        assert card.info()['result']['clearance_mm'] == pytest.approx(79.)
+        sdk.pose_frozen = True
+        card.tick(card.generation)
+        assert card.info()['result']['state'] == 'unavailable'
+        assert card.info()['result']['clearance_mm'] is None
+        sdk.pose_frozen = False
+        card.tick(card.generation)
+        assert card.info()['result']['state'] == 'ok'
+        # Reads, Start and Stop must not enable, move or query firmware.
+        assert sdk.calls == []
+    finally:
+        card.stop()
+        assert sdk.calls == []
+        runtime.driver = None
+        bundle.stop_all()
+
+
+@pytest.mark.parametrize('stage', ['vertices', 'plane', 'pose'])
+def test_finite_inputs_overflow_is_unavailable_and_json_safe(stage):
+    s, cfg = snapshot(), calibrated()
+    if stage == 'vertices':
+        cfg = calibrated(body_vertices_mm=[[x * 1.7e308, y * 1.7e308, z * 1.7e308]
+            for x, y, z in product([-1., 1.], repeat=3)])
+        s['end_pose']['position_mm'] = [1.7e308] * 3
+    elif stage == 'plane':
+        cfg = calibrated(plane_base_mm=[0, 0, 1, 1.7e308])
+        s['end_pose']['position_mm'][2] = 1.7e308
+    else:
+        cfg = calibrated(plane_base_mm=[.6, 0, .8, 0])
+        s['end_pose']['position_mm'] = [1.7e308] * 3
+    result = table_distance(s, cfg, 100.)
+    assert result['state'] == 'unavailable'
+    assert result['reason'] == 'nonfinite_geometry'
+    assert result['clearance_mm'] is result['lowest_point_base_mm'] is None
+    json.dumps(result, allow_nan=False)

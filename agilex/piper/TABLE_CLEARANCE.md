@@ -78,3 +78,24 @@ python3 scripts/check_service_yml.py agilex/piper
 模拟反馈与离线测试不能代替物理标定和真机验收。复用已有 numpy/ROS 依赖，不添加包或设备权限。
 
 2026-11-12：上述测试在 WSL Ubuntu 中实测 **97 passed**，service 检查 **1 checked, 0 failed, 0 known gap(s)**；`git diff --check` 通过。
+
+## 官方接口来源与本卡新增计算
+
+本卡没有调用官方的“夹爪离桌距离”接口，也不把末端 Z 直接当作离桌距离。
+数据复用现有 runtime，从项目固定版本 SDK 取得：
+
+- [GetArmEndPoseMsgs](https://github.com/agilexrobotics/piper_sdk/blob/8d4dc29bd6e753066dedee235c008e90ecb2ab4a/piper_sdk/interface/piper_interface_v2.py#L1003-L1023)：末端位置/欧拉角及时间戳，原始单位为 0.001 mm 和 0.001 度。
+- [GetArmGripperMsgs](https://github.com/agilexrobotics/piper_sdk/blob/8d4dc29bd6e753066dedee235c008e90ecb2ab4a/piper_sdk/interface/piper_interface_v2.py#L1078-L1106)：夹爪行程及时间戳，原始行程单位为 0.001 mm。
+
+现有驱动将单位转换成 mm/deg。本卡新增的是依据桌面平面、夹爪凸包、姿态和开度计算有符号法向间隙。
+桌面和安装工具的标定仍必须现场完成，官方反馈接口不保证本卡模型的实际测量精度。
+
+## 2026-11-13 审查修订验证
+
+- `build_plugins()` 创建 verified=true 的真实卡片，绑定现有记录式模拟 SDK；没有替换 read_monitor_snapshot 或手工注入最终 snapshot。
+- 验证实际绑定 UnifiedControlPlugin.read_monitor_snapshot；检查初始距离、姿态/开度变化、姿态过期失效和恢复，全程无 SDK 控制指令。
+- 对有限输入运算溢出增加防护；返回 unavailable/nonfinite_geometry 并清空距离，结果通过严格 JSON 序列化检查。几何非共面验证在缩放后计算，避免极大坐标差导致 SVD 溢出。
+- WSL Ubuntu 测量、统一控制和部署回归合计 **101 passed**；service 检查 **1 checked, 0 failed, 0 known gap(s)**；git diff --check 通过。
+- requirements.txt 已有 numpy==1.26.4；Dockerfile 的 sed 仅删去 piper-sdk 源地址行，其余依赖仍通过 pip 安装。本次不改 requirements 或依赖安装层。
+- 原 PR 的 Dockerfile COPY 仅打包该 Python 源码，driver.yaml 用于声明可选卡片；会增加少量源码字节，不声称镜像体积完全不变，也未测量实际镜像大小。
+- 本轮没有构建镜像、部署或真机测距验收。
