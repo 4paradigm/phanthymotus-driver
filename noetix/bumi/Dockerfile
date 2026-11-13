@@ -105,7 +105,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 # Python imports; fail the build here rather than on a robot. Docker's default
 # shell is /bin/sh (dash), where `source` does not exist — use bash explicitly
 # like the rest of this Dockerfile.
-RUN /bin/bash -c "source /opt/ros/humble/setup.bash && python3 -c 'import rclpy, cv2, numpy, message_filters; from rtabmap_msgs.msg import OdomInfo; from nav_msgs.msg import Odometry; from geometry_msgs.msg import TransformStamped; from tf2_ros import StaticTransformBroadcaster' && test -x /opt/ros/humble/lib/rtabmap_odom/rgbd_odometry"
+RUN /bin/bash -c "source /opt/ros/humble/setup.bash && python3 -c 'import rclpy, cv2, numpy, message_filters; from rtabmap_msgs.msg import OdomInfo; from nav_msgs.msg import Odometry; from geometry_msgs.msg import TransformStamped; from tf2_ros import StaticTransformBroadcaster; from tf2_ros import Buffer, TransformListener' && test -x /opt/ros/humble/lib/rtabmap_odom/rgbd_odometry"
 
 # Noetix Bumi SDK — copy source and download pre-built libs from COS
 COPY noetix_sdk_bumi/ /work/noetix_sdk_bumi/
@@ -146,7 +146,10 @@ COPY device.py /work/device.py
 COPY loco_servo.py /work/loco_servo.py
 COPY imu_distance_control.py /work/imu_distance_control.py
 COPY leg_odometry.py /work/leg_odometry.py
+COPY odometry_fusion.py /work/odometry_fusion.py
+COPY fused_odometry.py /work/fused_odometry.py
 COPY camera_specs.py /work/camera_specs.py
+COPY rgbd_camera.py /work/rgbd_camera.py
 COPY visual_inputs.py /work/visual_inputs.py
 COPY visual_odometry.py /work/visual_odometry.py
 COPY visual_odometry_contract.py /work/visual_odometry_contract.py

@@ -168,6 +168,27 @@ def test_aligned_depth_adopts_the_published_depth_outputs_rgb_intrinsics():
     assert info.id == "noetix/bumi/camera_color"
 
 
+def test_depth_declaration_carries_the_capture_time_and_unit_contract():
+    """The single depth output is also the computational input.
+
+    These vendor flags are what a point-cloud consumer checks before treating
+    the stream as metric; they belong to the depth output itself, not to a
+    second topic. The datasheet fallback stays `manual`, which a strict consumer
+    is expected to refuse until the runtime intrinsics arrive.
+    """
+    fallback = parse(camera_specs.declare("depth", DEPTH_TOPIC, "image/depth-zlib")[0])
+    runtime = parse(camera_specs.declare(
+        "depth", DEPTH_TOPIC, "image/depth-zlib",
+        {"depth": _color_intrinsics()["color"]})[0])
+    for info in (fallback, runtime):
+        assert info.vendor["depth_unit"] == "mm"
+        assert info.vendor["depth_source"] == "measured"
+        assert info.vendor["timestamp_semantics"] == "source_capture_mapped"
+        assert info.vendor["clock_mapping"] == "shared_camera_mapper"
+    assert fallback.source == "manual"
+    assert runtime.source == "derived-from-K"
+
+
 def test_rectified_coefficients_are_declared_pinhole():
     """All-zero distortion is the rectified case, which is what a consumer's
     pinhole assumption actually needs to know."""
@@ -258,3 +279,19 @@ def test_a_full_angle_in_the_half_angle_field_is_refused():
         build(topic=COLOR_TOPIC, id="x", half_fov_rad=math.radians(102.0),
               source="measured")
     assert "half" in str(excinfo.value)
+
+
+def test_depth_capture_metadata_remains_unverified_and_matches_qualified_source():
+    from noetix.bumi.camera_specs import depth_slam_source_declaration
+    d = depth_slam_source_declaration('/robot/camera/depth', 'robot')
+    assert d['topic'] == '/robot/camera/depth'
+    assert d['format'] == 'image/depth-zlib'
+    assert d['frame_id'] == 'robot_rgb_optical'
+    assert d['source_id'] == 'noetix/bumi/camera_color'
+    assert d['frame_metadata_topic'] == '/robot/camera/depth/metadata'
+    assert d['clock_id'] == 'ros'
+    assert d['stamp_source'] == 'measurement'
+    assert d['length_unit'] == 'mm'
+    assert d['clock']['verified'] is False
+    assert d['clock']['uncertainty_ns'] is None
+    assert 'extrinsic' not in d, 'camera must not claim VO calibration'

@@ -40,12 +40,12 @@ def test_card_and_plugin_config_are_in_sync():
     plugin = config['plugins']['visual_odometry']
     assert plugin['enabled'] is True
     assert plugin['max_rate_hz'] == 10
-    # Permanent level-forward body-axis convention: the observed optical axes
-    # must map to robot x=forward, y=left, z=up without a manual config step.
+    # Verified Bumi installation: the optical axes map to the robot body axes
+    # without a second manual SLAM-card configuration step.
     cal = plugin['calibration']
-    assert cal['calibration_id'] == 'assumed-level-forward-optical-to-body'
+    assert cal['calibration_id'] == 'verified-bumi-level-forward-optical-to-body-v1'
     assert cal['fixed_mount'] is True
-    assert cal['assumed'] is True
+    assert cal['assumed'] is False
     assert cal['camera_to_body']['quaternion'] == [-0.5, 0.5, -0.5, 0.5]
     assert cal['camera_to_body']['translation'] == [0.0, 0.0, 0.0]
     # The tool name lives in code; keep the driver card pointing at it.
@@ -78,6 +78,20 @@ def test_estimator_module_has_no_fusion_path():
         assert forbidden not in text
     assert (BUMI/'visual_odometry_contract.py').exists()
     assert not (ROOT/'common/visual_odometry.py').exists()
+
+
+def test_visual_odometry_keeps_both_declared_output_ports():
+    """The legacy status summary port must not be removed in place.
+
+    `motus.odom/1`'s additive rule is to publish alongside an existing output,
+    not to convert it; saved canvas layouts reference topic_out ports by index
+    and direct ROS subscribers use the status topic. This guard exists because
+    the PR once deleted the status publisher while calling the change additive.
+    """
+    text = (BUMI/'visual_odometry.py').read_text()
+    assert "STATUS_TOPIC = '/bumi_visual_odometry/status'" in text
+    assert "'topic_out': [{'topic': self._node.status_topic, 'format': 'data/json'}," in text
+    assert "{'topic': self.status_topic, 'format': 'data/json'" in text
 
 
 def test_the_feature_does_not_ship_a_second_driver_or_planning_docs():

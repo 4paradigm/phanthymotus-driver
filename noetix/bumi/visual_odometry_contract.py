@@ -9,9 +9,9 @@ agree with it" and nothing more.
 ``motus.odom/1`` stays unchanged. Everything visual-specific lives in ``vendor``:
 segment, diagnostic counters, input ages and the frame the pose is expressed in.
 The pose is in the camera optical frame unless a mount is configured. The
-shipped config uses an explicitly assumed level-forward mount to report robot
-body axes (``pose_reference=body_axes``); only a measured ``camera_to_body`` is
-reported as ``body`` with a measured reference point.
+shipped Bumi config uses an operator-verified level-forward optical-to-body
+mount (``pose_reference=body``); unverified installations keep
+``assumed=true`` and report ``pose_reference=body_axes`` instead.
 """
 from __future__ import annotations
 import math
@@ -213,6 +213,10 @@ def make_sample(health, now_ns, estimate, pose_reference='rgb_optical'):
     """
     quality = health.status(now_ns)
     valid = quality['status'] == 'tracking' and estimate is not None
+    if valid:
+        # Diagnostics may advance past a rejected pose; keep the accepted
+        # pose's capture time so consumers never fuse a frozen pose again.
+        quality['visual_stamp_ns'] = estimate['stamp_ns']
     return build_sample(
         stamp_ms=(estimate['stamp_ns'] if valid else now_ns)//1_000_000,
         twist=[None]*6,
@@ -223,5 +227,51 @@ def make_sample(health, now_ns, estimate, pose_reference='rgb_optical'):
         vendor={**quality, 'source': 'rtabmap_rgbd_odometry',
                 'pose_reference': pose_reference,
                 'accuracy_validated': False,
+                'motus_slam': {'status': quality['status'],
+                               'segment_id': quality['segment_id'],
+                               'stamp_source': 'measurement' if valid else 'unknown',
+                               'clock_id': 'ros'},
                 'twist_source': None,
                 'published_ns': now_ns, **deepcopy(health.details)})
+
+
+def slam_input_declaration(topic, sample, *, fallback_child, pose_reference, extrinsic):
+    """Static producer evidence for this VO output, not a tracking assertion.
+
+    On startup the estimator may not yet have returned a pose. The child frame
+    is still the local estimator's configured base frame; a later tracking
+    sample must agree with it. Neither an arrival-offset clock nor an assumed
+    mount becomes verified by inclusion in info().
+    """
+    vendor = sample.get('vendor') if isinstance(sample, dict) else None
+    vendor = vendor if isinstance(vendor, dict) else {}
+    quality = vendor.get('motus_slam')
+    quality = quality if isinstance(quality, dict) else {}
+    pose = sample.get('pose') if isinstance(sample, dict) else None
+    pose = pose if isinstance(pose, dict) else {}
+    out = {
+        'schema': 'motus.slam_input/1',
+        'topic': topic,
+        'format': 'state/odom',
+        'kind': 'pose',
+        'source_id': quality.get('source_id') or 'unknown',
+        'clock_id': quality.get('clock_id') or 'unknown',
+        'stamp_source': quality.get('stamp_source') or 'unknown',
+        'length_unit': 'm',
+        'reference_point': pose_reference,
+        'pose_reference': pose_reference,
+        # A VO relocalization changes its {segment_id}_odom/base frames. The
+        # consumer uses this identity for segment-safe frame templating, never
+        # to alter the measured camera mount or fabricate a continuous pose.
+        'segment_id': quality.get('segment_id'),
+        'frame_id': pose.get('frame_id'),
+        'child_frame_id': pose.get('child_frame_id') or fallback_child,
+        'clock': {
+            'mapping': quality.get('clock_mapping') or 'unknown',
+            'verified': quality.get('clock_verified') is True,
+            'uncertainty_ns': None,
+        },
+    }
+    if extrinsic is not None:
+        out['extrinsic'] = deepcopy(extrinsic)
+    return out

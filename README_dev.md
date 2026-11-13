@@ -2072,6 +2072,34 @@ SLAM). That field is what decides whether a consumer may accumulate it.
 Payload is JSON in a `std_msgs/String` on a `state/odom` port, like every other
 state card.
 
+### SLAM pose capability (additive profile)
+
+The existing protocol also carries velocity-only samples; they are not a SLAM
+pose. A source that supports the `motus_slam/1` pose profile advertises
+`odom_interface.slam_pose = {"available": true, "profile": "motus_slam/1"}`.
+An unavailable capability or missing declaration must not be inferred from
+`pose_drift` or from velocity axes. Existing ports and vendor fields stay intact.
+
+For a tracking sample, `pose.position` is three finite coordinates in meters,
+`pose.quaternion` is a normalized `[x,y,z,w]`, and pose `frame_id` and
+`child_frame_id` describe `T_odom_child`. Covariance is 36 finite row-major
+entries or null when unknown. `stamp_ms` is the estimate's measurement time,
+not receipt or publication time. `vendor.motus_slam` contains `status`,
+`segment_id`, `stamp_source` (`measurement` for a valid pose), and `clock_id`.
+Statuses are tracking, degraded, lost, initializing or unknown; loss recovery
+or a coordinate reset starts a new segment. Consumers must separately verify
+clock synchronization with the cloud, freshness, extrinsics and calibration.
+A clock name alone does not prove synchronization. Do not synthesize a pose
+from velocity or substitute zero for unknown covariance.
+
+**Cross-robot spatial SLAM extension:** the normative
+[Spatial SLAM Input Contract](docs/spatial_slam_input.md) specifies
+`motus.slam_input/1`, `motus.slam_frame/1`, native PointCloud2 wire
+types, coordinate transforms, time proofs, input declaration fields, and
+Core-main fallback behavior. Use the ROS-free
+`common/spatial_slam.py` validators in driver tests; publishing a bare
+`state/odom` or display `sensor/pointcloud` packet is not enough.
+
 ### Implementing it in a new driver
 
 1. Build the declaration once, at construction, and return it from `info()`:

@@ -32,12 +32,14 @@ try:  # imported as part of the noetix.bumi namespace in tests
     from .visual_odometry_contract import (CameraCalibration, Health, MAX_INPUT_AGE_NS,
                                            MAX_POSITION_SIGMA_M, MAX_SKEW_NS,
                                            MAX_TRANSPORT_NS, MAX_VISUAL_AGE_NS,
-                                           finite, make_sample, quat_matrix)
+                                           finite, make_sample, quat_matrix,
+                                           slam_input_declaration)
 except ImportError:  # imported as a top-level /work module inside the bundle image
     from visual_odometry_contract import (CameraCalibration, Health, MAX_INPUT_AGE_NS,
                                           MAX_POSITION_SIGMA_M, MAX_SKEW_NS,
                                           MAX_TRANSPORT_NS, MAX_VISUAL_AGE_NS,
-                                          finite, make_sample, quat_matrix)
+                                          finite, make_sample, quat_matrix,
+                                          slam_input_declaration)
 
 PACKAGE = 'rtabmap_odom'
 EXECUTABLE = 'rgbd_odometry'
@@ -99,6 +101,14 @@ def parameters(segment, frame_id, imu_assisted=False):
                 wait_imu_to_init=imu_assisted, subscribe_rgbd=True,
                 qos=2, qos_camera_info=2, topic_queue_size=5, sync_queue_size=5,
                 **{'Odom/ResetCountdown': '0'})
+    # Turn-tracking experiment: more features, wider search, earlier keyframes,
+    # and a larger local feature map. Leave RGB-D / IMU rates unchanged.
+    config.update({
+        'Vis/MaxFeatures': '1500',
+        'Vis/CorGuessWinSize': '60',
+        'Odom/KeyFrameThr': '0.5',
+        'OdomF2M/MaxSize': '3000',
+    })
     if imu_assisted:
         config['Odom/GuessSmoothingDelay'] = '0'  # orientation only, no acceleration prediction
     return config
@@ -247,7 +257,14 @@ class VisualOdometryNode:
         self.output = f'/{namespace}'+OUTPUT_TOPIC
         self.status_topic = f'/{namespace}'+STATUS_TOPIC
         self.publisher = self.node.create_publisher(String, self.output, self.qos)
-        self.status_publisher = self.node.create_publisher(String, self.status_topic, self.qos)
+        # The concise status summary stays its own output. It predates this
+        # card's SLAM metadata and is a canvas port and ROS topic that saved
+        # layouts and direct subscribers already use; dropping it while
+        # claiming the change is additive would silently break both. The full
+        # motus.odom/1 sample and the summary are published from the same
+        # sample, so their status/reason can never disagree.
+        self.status_publisher = self.node.create_publisher(
+            String, self.status_topic, self.qos)
         # The raw RGB-D producer lives in the camera subprocess. This private
         # control topic is the lifecycle signal: stop disables the shared
         # branch, start re-enables it, matching what sensor-card stop means.
@@ -350,16 +367,93 @@ class VisualOdometryNode:
         # assumed axis mapping for a measured reference point.
         return 'body_axes' if self.calibration.assumed else 'body'
 
-    def publish(self):
+    def slam_extrinsic(self):
+        """Describe and validate the installed mount, without assuming calibration.
+
+        In the public odometry message this is producer evidence, not a second
+        ROS topic or an extra canvas port. A generic consumer may use a
+        calibrated mount automatically, but must require an operator-supplied
+        matrix when the installed mount is only an axis assumption.
+        """
+        if self.calibration is None or not self.frame_id:
+            return None
+        mount = self.calibration.data['camera_to_body']
+        rotation = quat_matrix(mount['quaternion'])
+        translation = [float(v) for v in mount['translation']]
+        matrix = [[*rotation[i], translation[i]] for i in range(3)]
+        matrix.append([0., 0., 0., 1.])
+        # Validate the same shape expected from every robot's upstream source.
+        # This does not elevate an assumed axis mapping into calibrated evidence.
+        from common.spatial_slam import validate_mount
+        return validate_mount({
+            'mode': 'static',
+            'parent_frame': self.base_frame(),
+            'child_frame': self.frame_id,
+            'matrix': matrix,
+            'source': 'bumi_axis_assumption' if self.calibration.assumed else 'measured_mount',
+            'version': self.calibration.id,
+            'calibrated': not self.calibration.assumed,
+            'pose_reference': self.pose_reference(),
+        }, parent_frame=self.base_frame(), child_frame=self.frame_id)
+
+    def publish(self, *, emit=True):
+        # A preflight info() query must not emit a synthetic sensor sample or
+        # consume the first-pose displacement origin. Normal calls still
+        # preserve the legacy publish/summary side effects.
         sample = make_sample(self.health, self.now(), self.estimate, self.pose_reference())
+        quality = sample['vendor']
+        slam = quality['motus_slam']
+        # Odom and depth derive from the same RealSense capture-time mapper,
+        # which uses an arrival-offset approximation for hardware timestamps.
+        # Do not label this a verified independent-clock relation.
+        slam['source_id'] = 'noetix/bumi/camera_color'
+        slam['clock_mapping'] = 'shared_camera_mapper'
+        slam['clock_verified'] = False
+        mount = self.slam_extrinsic()
+        if mount is not None:
+            slam['extrinsic'] = mount
         if not self.active:
-            sample['vendor'].update(status='initializing', reason='visual odometry stopped')
+            quality.update(status='initializing', reason='visual odometry stopped')
+            # Keep the additive SLAM metadata coherent with the legacy status:
+            # the stopped sample must not say initializing in one field and
+            # lost in the other.
+            quality['motus_slam']['status'] = 'initializing'
             sample['pose'] = None
-        self.publisher.publish(self.String(data=json.dumps(sample, allow_nan=False)))
-        self.publish_status(sample)
+        if emit:
+            displacement = self._segment_displacement(sample)
+        else:
+            position = (sample.get('pose') or {}).get('position')
+            origin = self.summary_origin
+            displacement = (math.sqrt(sum((a-b)**2 for a, b in zip(position, origin)))
+                            if position is not None and origin is not None else None)
+        quality.update(turn_angle_deg=self.turn_angle_deg,
+                       displacement_m=displacement)
+        if emit:
+            self.publisher.publish(self.String(data=json.dumps(sample, allow_nan=False)))
+            self.publish_status(sample)
         return sample
 
+    def _segment_displacement(self, sample):
+        """Straight-line distance from the first tracking pose of this segment.
+
+        Idempotent: the origin is set on the first valid pose and the same
+        value is reused by the full sample and the status summary, so the two
+        outputs cannot report different displacements for one publish.
+        """
+        position = sample['pose']['position'] if sample['pose'] is not None else None
+        if position is None:
+            return None
+        if self.summary_origin is None:
+            self.summary_origin = list(position)
+        return math.sqrt(sum((a-b)**2 for a, b in zip(position, self.summary_origin)))
+
     def publish_status(self, sample):
+        """Publish the legacy ``data/json`` status summary.
+
+        Kept as a second canvas/ROS output alongside the full sample. Same
+        200 ms same-state throttle as before: tracking is a 20 Hz heartbeat of
+        the same values, while a state transition is published immediately.
+        """
         quality = sample['vendor']
         state = (quality['status'], quality['reason'])
         now = time.monotonic_ns()
@@ -367,16 +461,12 @@ class VisualOdometryNode:
                 and state == self.last_summary_state):
             return
         position = sample['pose']['position'] if sample['pose'] is not None else None
-        distance = None
-        if position is not None:
-            if self.summary_origin is None:
-                self.summary_origin = list(position)
-            distance = math.sqrt(sum((a-b)**2 for a, b in zip(position, self.summary_origin)))
         stamp = quality['visual_stamp_ns']
         summary = dict(status=quality['status'],
                        turn_angle_deg=(round(self.turn_angle_deg, 1)
                                        if self.turn_angle_deg is not None else None),
-                       displacement_m=round(distance, 3) if distance is not None else None,
+                       displacement_m=(round(self._segment_displacement(sample), 3)
+                                       if position is not None else None),
                        position_m=[round(v, 3) for v in position] if position is not None else None,
                        pose_reference=quality['pose_reference'],
                        age_ms=round((quality['published_ns']-stamp)/1e6, 1)
@@ -385,9 +475,9 @@ class VisualOdometryNode:
         self.status_publisher.publish(self.String(data=json.dumps(summary, allow_nan=False)))
         self.last_summary_ns, self.last_summary_state = now, state
 
-    def info(self):
+    def info(self, *, read_only=False):
         from common.odom import build_interface
-        sample = self.publish()
+        sample = self.publish(emit=not read_only)
         return dict(state='running' if self.active else 'idle',
                     topic_out=[{'topic': self.status_topic, 'format': 'data/json',
                                 'message_type': 'std_msgs/msg/String'},
@@ -395,16 +485,26 @@ class VisualOdometryNode:
                                 'message_type': 'std_msgs/msg/String'}],
                     odom_topic=self.output,
                     sample=sample,
+                    input_metadata=[slam_input_declaration(
+                        self.output, sample, fallback_child=self.base_frame(),
+                        pose_reference=self.pose_reference(),
+                        extrinsic=self.slam_extrinsic())],
                     # The existing canvas details dialog renders info.description.
-                    description=('Read-only RGB-D visual odometry. Full odometry: '+self.output+
+                    description=('Read-only RGB-D visual odometry. Canvas status: '+self.status_topic+
+                                 '; full odometry: '+self.output+
                                  '\nDisplacement is from the first tracking pose after reset, '
                                  'not accumulated path length.\nDiagnostics:\n'+
                                  json.dumps(sample, indent=2, allow_nan=False)),
-                    odom_interface=build_interface(provides=[], rate_hz=20,
-                                                   pose_drift='unbounded'),
+                    odom_interface={**build_interface(provides=[], rate_hz=20,
+                                                      pose_drift='unbounded'),
+                                    'slam_pose': {'available': True,
+                                                  'profile': 'motus_slam/1'}},
                     quality=sample['vendor'],
                     namespace=self.namespace,
                     pose_reference=self.pose_reference(),
+                    slam_geometry={'extrinsic': self.slam_extrinsic(),
+                                   'clock_mapping': 'shared_camera_mapper',
+                                   'clock_verified': False},
                     segment_id=self.segment,
                     calibration_id=self.calibration.id if self.calibration else None)
 
@@ -948,7 +1048,8 @@ class VisualOdometryPlugin:
                             + ('body IMU rotation assistance; no inertial translation/EKF, '
                                if self._node.imu_assisted else 'no IMU/EKF/fusion, ')+
                             'not in the motion path. '
-                            f'Canvas status: {self._node.status_topic}; full odometry: {self._node.output}'),
+                            f'Canvas status: {self._node.status_topic}; '
+                            f'full odometry: {self._node.output}'),
             'inputSchema': {
                 'type': 'object',
                 'properties': {
@@ -983,7 +1084,7 @@ class VisualOdometryPlugin:
             if action == 'config':
                 return node.configure(args)
             if action in ('info', 'rgbd_visual_odometry'):
-                # The bundle dispatcher passes the bare tool name when a client
-                # calls the card without an explicit action; keep that as info.
-                return node.info()
+                # Preserve the historical info() behavior for existing callers;
+                # preflight can explicitly request a side-effect-free snapshot.
+                return node.info(read_only=args.get('read_only') is True)
             return None  # unknown actions must be rejected, not reported as success

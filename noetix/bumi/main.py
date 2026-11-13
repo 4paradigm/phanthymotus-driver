@@ -122,6 +122,7 @@ class BumiDeviceBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
+        state_plugin = None
         loco_plugin = None
         # The camera subprocess reads this env var; set it before any plugin can
         # start that subprocess, so the raw RGB-D branch is published only when
@@ -179,6 +180,8 @@ class BumiDeviceBundle:
             from device import CameraPlugin
             camera_plugin = CameraPlugin(plugins_cfg["camera"], namespace, executor)
             self._plugins.append(camera_plugin)
+            if state_plugin is not None:
+                state_plugin._camera_plugin = camera_plugin
             print("[bundle] CameraPlugin loaded")
 
         if plugins_cfg.get("visual_odometry", {}).get("enabled", False):
@@ -190,6 +193,18 @@ class BumiDeviceBundle:
                     plugins_cfg["visual_odometry"], namespace, executor,
                     high_ctrl=high_ctrl))
                 print("[bundle] VisualOdometryPlugin loaded")
+
+        # Opt-in fused leg+IMU+RGB-D estimate. Keep the original VO output
+        # and card intact; this experimental planar sensor never controls motion.
+        if plugins_cfg.get("fused_odometry", {}).get("enabled", False):
+            if (high_ctrl is None or camera_plugin is None or
+                    not plugins_cfg.get("visual_odometry", {}).get("enabled", False)):
+                print("[bundle] FusedOdometryPlugin needs HighController, camera, and visual_odometry; skipped")
+            else:
+                from fused_odometry import FusedOdometryPlugin
+                self._plugins.append(FusedOdometryPlugin(
+                    plugins_cfg["fused_odometry"], namespace, executor, high_ctrl))
+                print("[bundle] FusedOdometryPlugin loaded")
 
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
             from device import MotionStatePlugin
