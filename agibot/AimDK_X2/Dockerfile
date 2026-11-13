@@ -16,6 +16,7 @@ WORKDIR /work
 COPY common/ /work/common/
 COPY main.py device.py config.yaml driver.yaml /work/agibot/AimDK_X2/
 COPY resource/ /work/agibot/AimDK_X2/resource/
+COPY deploy/service.yml /deploy/service.yml
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 PYTHONUNBUFFERED=1 PYTHONPATH=/work
 EXPOSE 15717
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /aimdk_x2_ws/install/setup.bash && python3 /work/agibot/AimDK_X2/main.py"]
