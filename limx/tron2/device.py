@@ -2,14 +2,19 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 
 import aiohttp
 from aiohttp import web
 from vendor import MoveError, RobotReader, validate_movej, reject_constant, motion_readiness
+from walk import Walk, form_number
+from sit_down import SitDown
+from stand import Stand
 from reset import ResetPose
-from skeleton import skeleton_stream, model
+from skeleton import skeleton_stream, joints_stream, model
+from state import battery_stream
 from completion import ArmCompletion, MotionPeers, ACP_TIMEOUT
 from pose import Pose, tool as pose_tool, arguments as pose_arguments
 from head import HeadCompletion, tool as head_tool, arguments as head_arguments, card_degrees, COORDINATE_CONVENTION
@@ -17,16 +22,20 @@ from camera import CameraStream, CAMERA_SOURCES
 from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments, normalize_arguments, GRIPPER_SIDES, combined_tool, combined_arguments
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.15.1'
+VERSION = '0.25.0'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
           ('joint_state',)}
+# Existing skeleton topics remain public; all JSON sensors use this map.
+SENSOR_TOPICS = {'joints':'/limx_tron2/state/joints','battery':'/limx_tron2/state/battery',**TOPICS}
 DESCRIPTIONS = {
+    'battery':'TRON2电池状态（只读，1Hz）：soc为剩余电量0～100%（首项）；current为有符号电流mA；cycle为非负整数充电循环数。bms_voltage为厂家原始电压读数；bms_current_valid为电流有效标志；bms_current_updated_at为厂家电流更新时间原值；bms_temp1～bms_temp5为5路温度采样原值（未确认倍率，不换算为摄氏度）。其他bms_字段按固件原名输出；不推测未公开字段语义。null表示暂无有效数据。',
+    'joints':'TRON2当前构型骨架：按厂家ACCID自动识别上肢DACH（16关节）或下肢WF/SF（10关节），发布官方关节名及q/dq/tau；使用平台原生sensor/skeleton与独立model模型资源；下肢接入厂家真实IMU四元数imu_quat（w,x,y,z），无有效姿态时省略。',
     'camera': 'TRON2 头部RGB实时画面；start连接厂家MJPEG并发布JPEG图像，stop释放连接；限10fps，不录像、不控制头部，接收时间不是测量时间（只读）',
     'camera_left': 'TRON2 左腕RGB实时画面；厂家left校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',
     'camera_right': 'TRON2 右腕RGB实时画面；厂家right校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',
-    'joint_state': 'TRON2 双臂与头部16关节实时骨架，左右夹爪轮廓随手腕运动；夹爪默认为固定闭合示意，未接入开合反馈；原始rad/deg及速度力矩可通过info查看',
+    'joint_state': '旧版骨架话题兼容入口；使用当前构型关节与官方URDF模型，推荐joints卡片。',
     'arm_control': 'TRON2 双臂控制：move自定义14项rad目标，reset自然垂下；响应含action_id，连续实时反馈确认到位后通知Core完成；reset自动验证自然垂下复位，两个动作均通过ACP报告完成',
 }
 
@@ -46,12 +55,18 @@ class Adapter:
         self.publish = publish
         self.settings = settings
         self.enabled = settings['enabled_cards']
-        if set(self.enabled) - (set(TOPICS) | set(CAMERA_SOURCES) | ({'arm_control', 'move_head', 'gripper', 'pose', 'head_visual_follow'} | set(GRIPPER_SIDES))):
+        if set(self.enabled) - (set(SENSOR_TOPICS) | set(CAMERA_SOURCES) | ({'loco_servo_arm', 'loco_leg', 'arm_control', 'move_head', 'gripper', 'pose', 'head_visual_follow'} | set(GRIPPER_SIDES))):
             raise ValueError('Unknown TRON2 card in configuration')
-        if 'head_visual_follow' in self.enabled and not {'joint_state','camera','move_head'} <= set(self.enabled):
+        if 'head_visual_follow' in self.enabled and (not {'camera','move_head'} <= set(self.enabled) or not {'joint_state','joints'} & set(self.enabled)):
             raise ValueError('头部跟随需要joint_state、camera和move_head')
+        self._lower_stopping = False
+        self._lower_closed = False
+        self._lower_stop_task = None
         self.follow_runtime = None
         self.reader = reader or RobotReader(settings)
+        self.stand = Stand(self.reader, self._report_lower_completion)
+        self.sit_down = SitDown(self.reader, self._report_lower_completion)
+        self.walk = Walk(self.reader, self._report_walk_completion)
         self.registered_id = None
         self.core_ssl = True
         self.session = session
@@ -74,6 +89,16 @@ class Adapter:
                                           publish, session, topic=source[0])
                         for name, source in CAMERA_SOURCES.items()}
         self.camera = self.cameras['camera']
+        from arm_servo import ArmServoPlugin
+        self.arm_servo = ArmServoPlugin(self, settings.get('loco_servo_arm', {}))
+
+    async def _report_lower_completion(self, tool, action_id, status, result):
+        # Core associates each instance with the unique action_id returned to it.
+        public_tool='loco_leg' if 'loco_leg' in self.enabled else (tool)
+        return await self._report_completion(public_tool,action_id,status,{**result,'action':({'stand':'stand_up','sit_down':'sit_down'}.get(tool,tool) if public_tool=='loco_leg' else tool)})
+
+    async def _report_walk_completion(self,tool,action_id,status,result):
+        return await self._report_completion('loco_leg' if 'loco_leg' in self.enabled else tool,action_id,status,result)
 
     async def report_completion(self, action_id, status, result):
         return await self._report_completion(result.get('motion_tool','arm_control'), action_id, status, result)
@@ -145,8 +170,28 @@ class Adapter:
             },
         }
 
+    def _loco_tool(self):
+        return {'name':'loco_leg','type':'actuator','multiInstance':False,
+            'description':'TRON2下肢运动：stand_up完整起立，sit_down停止并坐下，move定时移动，stop_move停止移动并保持站立。仅支持下肢构型；轮足无横移。vx范围-3～3 m/s（正前负后），vyaw约±90 deg/s（正左负右），默认均为0；duration为-1持续移动、0停止，或0.1～60秒，默认2秒。计时结束另发约1秒零速度，vyaw×duration不是目标转角，不保证精确距离或实际转角。',
+            'inputSchema':{'type':'object','additionalProperties':False,
+                'properties':{'action':{'type':'string','enum':['stand_up','sit_down','move','stop_move','start','stop','info'],'description':'选择要执行的动作'},
+                    'vx':{'type':'number','minimum':-3,'maximum':3,'default':0,'title':'vx','description':'前后速度，单位m/s，范围-3～3，默认0；正值前进、负值后退、0不前后移动。'},
+                    'vyaw':{'type':'number','minimum':-90,'maximum':90,'default':0,'title':'vyaw','description':'转向角速度，单位deg/s，范围约-90～90，默认0；正值左转、负值右转、0不转向。按现场标定z=vyaw/60换算，90deg/s对应厂家z=1.5；不是目标转角。'},
+                    'duration':{'type':'number','minimum':-1,'maximum':60,'anyOf':[{'const':-1},{'const':0},{'minimum':.1,'maximum':60}],'default':2,'title':'duration','description':'运动时间，单位秒；-1持续移动直到stop_move或生命周期stop；0停止，0.1～60定时，默认2。停止后另发约1秒零速度。'},
+                    **metadata_properties()},'required':['action'],
+                'x-resource':['lower_body'],'x-completion':{'actions':['stand_up','sit_down','move'],'timeout':150},
+                'x-action-params':{'stand_up':{'params':[],'description':'从启动/准备姿态完整起立并保持站立，厂家状态WALK表示完成；无速度和时间参数，不命令前进或转向。'},
+                    'sit_down':{'params':[],'description':'停止移动并折叠坐回启动姿态；厂家状态SIT或DAMPING表示完成，无速度和时间参数。'},
+                    'move':{'params':['vx','vyaw','duration'],'description':'轮足定时移动：vx为-3～3 m/s（正前负后），vyaw约±90 deg/s（正左负右），默认0；duration为-1持续移动、0停止或0.1～60秒，默认2秒。需要先起立进入WALK，结束后发送零速度，无横移。'},
+                    'stop_move':{'params':[],'description':'请求零速度停止移动，保持站立，不执行坐下。'}}}}
+
+
     def tools(self):
         tools = []
+        if 'loco_servo_arm' in self.enabled:
+            tools.append(self.arm_servo.get_tool())
+        if 'loco_leg' in self.enabled:
+            tools.append(self._loco_tool())
         if 'arm_control' in self.enabled:
             tools.append(self._arm_control_tool())
         if 'pose' in self.enabled:
@@ -169,7 +214,7 @@ class Adapter:
                                    **metadata_properties()}},
                 'topic_out': [{'topic': CAMERA_SOURCES[name][0], 'format': 'image/jpeg'}]})
         for name in self.enabled:
-            if name in ({'arm_control', 'move_head', 'gripper', 'pose', 'head_visual_follow'} | set(GRIPPER_SIDES)) or name in CAMERA_SOURCES:
+            if name in ({'loco_servo_arm', 'loco_leg', 'arm_control', 'move_head', 'gripper', 'pose', 'head_visual_follow'} | set(GRIPPER_SIDES)) or name in CAMERA_SOURCES:
                 continue
             tools.append({'name': name, 'type': 'sensor', 'multiInstance': False,
                 'description': DESCRIPTIONS[name],
@@ -177,10 +222,11 @@ class Adapter:
                     'properties': {'action': {'type': 'string', 'enum': ['info', 'start', 'stop']},
                                    **metadata_properties()},
                     'required': ['action']},
-                'topic_out': [{'topic': TOPICS[name], 'format': 'sensor/skeleton' if name == 'joint_state' else 'data/json'}]})
-        if 'joint_state' in self.enabled:
+                'topic_out': [{'topic': SENSOR_TOPICS[name],
+                               'format': 'sensor/skeleton' if name in ('joint_state', 'joints') else 'data/json'}]})
+        if {'joint_state','joints'} & set(self.enabled):
             tools.append({'name': 'model', 'type': 'resource', 'multiInstance': False,
-                'description': 'TRON2 DACH dual-arm/head URDF with fixed gripper outlines for the skeleton renderer',
+                'description': 'TRON2 URDF selected from the reported startup configuration: DACH dual arms/head, WF wheel-foot, SF sole-foot',
                 'inputSchema': {'type': 'object', 'additionalProperties': False,
                     'properties': metadata_properties()}})
         if 'head_visual_follow' in self.enabled:
@@ -188,13 +234,57 @@ class Adapter:
             tools.append(follow_tool())
         return tools
 
+    def _skeleton_display(self):
+        """Return (state, reference_q) for the lower-limb display frame.
+
+        The frame is captured once after startup and once after a completed
+        sit_down, then held. A stand_up request switches to the live native
+        frame. Live joint samples never recalculate an existing frame.
+        """
+        if self.reader.configuration.get('mode') not in ('wheel_foot', 'sole_foot'):
+            return None, None
+        frame = getattr(self.reader, '_skeleton_display_frame', None)
+        if frame is None:
+            frame = {'state': 'captured', 'reference_q': None,
+                     'after': 0., 'source': 'startup'}
+            self.reader._skeleton_display_frame = frame
+        if frame.get('state') != 'captured':
+            return 'live', None
+        if frame.get('reference_q') is not None:
+            return 'captured', list(frame['reference_q'])
+        sample = self.reader.sample('joint_state')
+        data = sample.get('data') if sample.get('available') else None
+        q = (data or {}).get('q')
+        if (sample.get('received_at') or 0) <= frame.get('after', 0.) \
+                or not isinstance(q, list) or len(q) != 10 or any(
+                    isinstance(v, bool) or not isinstance(v, (int, float))
+                    or not math.isfinite(v) for v in q):
+            return 'pending', None
+        frame['reference_q'] = list(q)
+        return 'captured', list(q)
+
+    def skeleton_configuration(self):
+        profile = self.reader.configuration
+        if profile.get('state') == 'pending' and self.reader.info_at is not None:
+            # Cover the short interval before main's one-shot task records it.
+            from state import configuration
+            return configuration(self.reader.serial)
+        if profile.get('mode') in ('wheel_foot','sole_foot'):
+            state, reference = self._skeleton_display()
+            return {**profile, 'display_frame': state,
+                    'display_reference_q': reference}
+        return profile
+
     def snapshot(self):
-        return {name: self.reader.sample(name) for name in self.enabled if name in TOPICS}
+        return {name: self.reader.sample({'battery':'battery_state','joints':'joint_state'}.get(name,name)) for name in self.enabled if name in SENSOR_TOPICS}
 
     def call(self, name, args):
         allowed = {'action', 'instance_id', '_trace_id'}
+        if name == 'loco_servo_arm':
+            allowed |= {'input_topic', 'input_topics', 'dry_run'}
         if name == 'head_visual_follow':
             allowed |= {'input_topic','input_topics','non_follow_action','speed'}
+        if name == 'loco_leg':allowed |= {'vx','vy','vyaw','duration'}
         if name == 'arm_control':
             allowed |= {'joint', 'time'}
         if name == 'pose':
@@ -214,14 +304,32 @@ class Adapter:
             if not isinstance(value, str) or len(value) > 128 or any(
                     ord(c) < 32 or ord(c) == 127 for c in value):
                 raise ValueError('Invalid Core metadata: ' + key)
+        if name == 'loco_servo_arm' and name in self.enabled:
+            if args.get('action', 'info') not in ('info', 'start', 'stop', 'pause', 'resume', 'config'):
+                raise ValueError('Unsupported loco_servo_arm action')
+            return {'status': 'validated', 'motion_sent': False}
+        if name=='loco_leg' and name in self.enabled:
+            action=args.get('action','info')
+            if action=='stand_down':action='sit_down'  # Legacy saved canvas alias only.
+            if action in ('info','start','stop'):
+                result=self.walk.info()
+                return {**result,'state':'ready' if action=='start' else 'idle' if action=='stop' else result['state'],'motion_sent':False}
+            if action not in ('stand_up','sit_down','move','stop_move'):raise ValueError('Unsupported locomotion action')
+            if action=='move':
+                value=form_number(args.get('duration'),'duration',2)
+                if isinstance(value,bool) or not isinstance(value,(int,float)) or not (value == -1 or 0<=value<=60):raise ValueError('duration must be -1, 0 or 0.1 to 60 seconds')
+                if value not in (-1, 0) and value<.1:raise ValueError('duration must be -1, 0 or 0.1 to 60 seconds')
+                if form_number(args.get('vy'),'vy',0)!=0:raise ValueError('Lateral travel is not supported; remove the legacy vy field or set it to 0')
+                return {'status':'validated','duration':value,**{k:form_number(args.get(k),k,0) for k in ('vx','vyaw')}}
+            return {'status':'validated'}
         if name == 'head_visual_follow':
             if name not in self.enabled:
                 raise ValueError('Unknown tool')
             return {'status':'validated','motion_sent':False}
-        if name == 'model' and 'joint_state' in self.enabled:
+        if name == 'model' and {'joint_state','joints'} & set(self.enabled):
             if 'action' in args:
                 raise ValueError('Model has no action')
-            return model()
+            return {'urdf':model(self.skeleton_configuration())['urdf']}
         if name == 'pose' and name in self.enabled:
             if args.get('action') in ('info','start','stop'):
                 # Some dashboards retain declared form values on lifecycle calls.
@@ -252,7 +360,7 @@ class Adapter:
             side,action,values=combined_arguments(args)
             return {'action':action,'side':side,'arguments':values,'motion_sent':False,'status':'validated'}
         action = args.get('action', 'move' if name == 'move_head' else
-                          'info' if name in TOPICS or name in CAMERA_SOURCES else None)
+                          'info' if name in SENSOR_TOPICS or name in CAMERA_SOURCES else None)
         if not isinstance(action, str):
             raise ValueError('An action string is required')
         if name not in self.enabled:
@@ -334,20 +442,105 @@ class Adapter:
         if action not in ('info', 'start', 'stop'):
             raise ValueError('Unsupported sensor action')
         result = {'state': 'idle' if action == 'stop' else 'running', 'read_only': True,
-                  'always_on': True, 'topic_out': [{'topic': TOPICS[name], 'format': 'sensor/skeleton' if name == 'joint_state' else 'data/json'}]}
+                  'always_on': True, 'topic_out': [{'topic': SENSOR_TOPICS[name],
+                               'format': 'sensor/skeleton' if name in ('joint_state', 'joints') else 'data/json'}]}
         if action == 'info':
             result['sample'] = self.snapshot()[name]
         return result
 
+
     async def publish_loop(self):
+        next_battery = 0.0
         while True:
             for name, data in self.snapshot().items():
-                data = skeleton_stream(data)
-                self.publish(TOPICS[name], data)
+                if name=='joints':
+                    data=joints_stream(data,self.skeleton_configuration())
+                elif name=='joint_state':
+                    data=skeleton_stream(data,self.skeleton_configuration())
+                elif name == 'battery':
+                    now = time.monotonic()
+                    if now < next_battery:
+                        continue
+                    next_battery = now + 1.0
+                    data = battery_stream(data)
+                self.publish(SENSOR_TOPICS[name], data)
             await asyncio.sleep(self.settings['poll_interval_seconds'])
 
+    async def _finish_lower_tasks(self):
+        owners = (self.stand, self.sit_down, self.walk)
+        active = [o for o in owners if o.task is not None and not o.task.done()]
+        for owner in active:
+            if owner is not self.walk:
+                owner._transition_stop_requested = True
+        self.walk.stop()
+        tasks = [o.task for o in active]
+        for task in tasks:
+            task.cancel()
+        try:
+            if tasks:
+                # Let Walk send its bounded zero-velocity cleanup before joining.
+                _, pending = await asyncio.wait(tasks, timeout=6)
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            for owner in active:
+                if owner.state not in ('completed', 'stopped', 'unconfirmed'):
+                    owner.pending = None
+                    owner.state = 'unconfirmed'
+                    owner.result = {'error': 'Lifecycle stop', 'motion_sent': getattr(owner, 'motion_sent', False),
+                                    'physical_stop_verified': False}
+            return {'state': 'idle', 'physical_stop_verified': False,
+                    'motion_sent': any(bool((o.result or {}).get('zero_velocity_sent')) for o in active),
+                    'owners': {name: owner.state for name, owner in
+                               zip(('stand', 'sit_down', 'walk'), owners)},
+                    'message': 'Driver任务已结束；厂家已接收的动作不可撤销，物理姿态未确认'}
+        finally:
+            if not self._lower_closed:
+                self._lower_stopping = False
+
+    async def close_lower(self, shutting_down=False):
+        self._lower_closed = self._lower_closed or shutting_down
+        self._lower_stopping = True
+        if self._lower_stop_task is None or self._lower_stop_task.done():
+            self._lower_stop_task = asyncio.create_task(self._finish_lower_tasks())
+        return await asyncio.shield(self._lower_stop_task)
+
     async def execute_tool(self, name, args, *, follow_guard=None):
+        if name == 'model':
+            deadline = time.monotonic() + self.settings['response_timeout_seconds']
+            while time.monotonic() < deadline:
+                profile = self.skeleton_configuration()
+                if profile.get('state') != 'pending' and (
+                        profile.get('mode') not in ('wheel_foot','sole_foot') or
+                        profile.get('display_frame') in ('captured','live') or
+                        not getattr(self.reader, 'connected', False)):
+                    break
+                await asyncio.sleep(.05)
         data = self.call(name, args)
+        if name == 'loco_leg':
+            if args.get('action') == 'stop':
+                return await self.close_lower()
+            if self._lower_stopping and args.get('action') != 'info':
+                raise ValueError('下肢任务正在停止，暂不接受新动作')
+        if name == 'loco_servo_arm' and name in self.enabled:
+            return await self.arm_servo.call(args)
+        # Explicit commands outrank the stream. Await its in-flight send and
+        # release writer ownership before admitting another motor owner.
+        if getattr(self, 'arm_servo', None) is not None and (
+                name == 'pose' and data.get('status') == 'validated' or
+                name == 'arm_control' and data.get('action') in ('move', 'reset') or
+                name == 'move_head' and data.get('action') == 'move' or
+                (name == 'gripper' or name in GRIPPER_SIDES) and data.get('action') in ('open', 'close', 'recover') or
+                name == 'head_visual_follow' and (args.get('action', 'follow') == 'follow' or
+                    args.get('action') == 'not_follow' and args.get('non_follow_action') == 'reset')):
+            await self.arm_servo.preempt()
+        if name=='loco_leg':
+            action=args.get('action','info')
+            if action=='stand_down':action='sit_down'
+            if action=='stand_up':return self.stand.dispatch()
+            if action=='sit_down':return self.sit_down.dispatch()
+            if action=='stop_move' or (action=='move' and data['duration']==0):return await self.walk.stop_move()
+            if action=='move':return self.walk.dispatch_velocity(data['vx'],0.0,data['vyaw'],data['duration'])
         if name == 'head_visual_follow':
             if self.follow_runtime is None:
                 raise ValueError('头部跟随尚未初始化')
@@ -416,7 +609,7 @@ class Adapter:
                     error = False
                 except (ValueError, TypeError) as exc:
                     data, error = {'error': str(exc)[:240],
-                        'read_only': params.get('name') not in self.enabled or params.get('name') not in ({'arm_control', 'move_head', 'gripper', 'pose', 'head_visual_follow'} | set(GRIPPER_SIDES)) or
+                        'read_only': params.get('name') not in self.enabled or params.get('name') not in ({'loco_servo_arm', 'loco_leg', 'arm_control', 'move_head', 'gripper', 'pose', 'head_visual_follow'} | set(GRIPPER_SIDES)) or
                             params.get('name') in GRIPPER_SIDES and params.get('arguments', {}).get('action') not in MOTION_ACTIONS,
                         'motion_sent': getattr(exc, 'motion_sent', False)}, True
                     if params.get('name') == 'gripper' and 'gripper' in self.enabled:
@@ -443,17 +636,22 @@ class Adapter:
 
     def health_data(self):
         samples = self.snapshot()
-        ready = self.reader.connected and bool(samples) and all(s['available'] for s in samples.values())
+        # An optional battery field must not regress existing joint readiness.
+        required = {k: v for k, v in samples.items() if k in ('joint_state', 'joints')} or samples
+        ready = self.reader.connected and bool(required) and all(s['available'] for s in required.values())
         cameras = {name: stream.info() for name, stream in self.cameras.items() if name in self.enabled}
         if not samples and cameras:
             ready = all(info['available'] for info in cameras.values())
-        return {'version': VERSION, 'read_only': not set(self.enabled) & ({'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES)), 'ready': ready,
+        return {'walk':self.walk.info(), 'sit_down':self.sit_down.info(), 'stand': self.stand.info(), 'version': VERSION, 'read_only': not set(self.enabled) & ({'loco_servo_arm', 'loco_leg', 'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES)), 'ready': ready,
+            'loco_servo_arm': self.arm_servo.info(),
             'arm_motion': self.motion.summary(),
             'head_motion': self.head.summary(),
             'pose_motion': self.pose.motion_summary(),
             'grippers': {name: owner.info() for name, owner in self.grippers.items() if name in self.enabled or 'gripper' in self.enabled},
             'camera': self.camera.info() if 'camera' in self.enabled else None,
             'cameras': cameras,
+            'configuration': dict(self.reader.configuration),
+            'imu_subscription': getattr(self.reader, 'imu_subscription', None),
             'robot_connected': self.reader.connected, 'registered_mcp_id': self.registered_id,
             'last_connection_error': self.reader.last_error,
             'round_trip_seconds': self.reader.last_round_trip, 'samples': samples}

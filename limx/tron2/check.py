@@ -7,7 +7,7 @@ import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
 from device import VERSION
-CARDS = {'joint_state'}
+CARDS = {'joints'}
 from camera import CAMERA_SOURCES
 
 
@@ -106,7 +106,7 @@ def run_check(timeout=20, camera=False):
                 schema.get('x-resource')!=['arm_l','arm_r','head']:
             raise ValueError('Pose schema or shared physical resources differ')
     names = {tool['name'] for tool in tools}
-    expected = {**dict.fromkeys(CARDS | set(CAMERA_SOURCES), 'sensor'), 'arm_control': 'actuator', 'pose': 'actuator', 'move_head': 'actuator', 'gripper': 'actuator', 'model': 'resource', 'head_visual_follow':'actuator'}
+    expected = {**dict.fromkeys(CARDS | {'battery'} | set(CAMERA_SOURCES), 'sensor'), 'loco_servo_arm':'actuator', 'loco_leg':'actuator', 'arm_control': 'actuator', 'pose': 'actuator', 'move_head': 'actuator', 'gripper': 'actuator', 'model': 'resource', 'head_visual_follow':'actuator'}
     if not CARDS <= names or names - set(expected) or any(tool['type'] != expected[tool['name']] for tool in tools):
         raise ValueError('Expected skeleton sensor, optional camera/arm_control and model resource')
     camera_tools = {tool['name']: tool for tool in tools if tool['name'] in CAMERA_SOURCES}
@@ -121,18 +121,24 @@ def run_check(timeout=20, camera=False):
         raise ValueError('Skeleton model resource is missing')
     model_reply = rpc('tools/call', {'name': 'model', 'arguments': {}})
     model_data = json.loads(model_reply['content'][0]['text'])
-    from skeleton import JOINT_NAMES
+    from skeleton import MODELS
     import xml.etree.ElementTree as ET
     model_names = {joint.get('name') for joint in ET.fromstring(model_data['urdf']).findall('joint')}
-    if model_reply.get('isError') or not set(JOINT_NAMES) <= model_names:
+    mode = health.get('configuration', {}).get('mode')
+    if mode not in MODELS:
+        raise ValueError('Robot configuration is not identified')
+    expected_names = MODELS[mode][2]
+    moving = {joint.get('name') for joint in ET.fromstring(model_data['urdf']).findall('joint')
+              if joint.get('type') != 'fixed'}
+    if model_reply.get('isError') or moving != set(expected_names):
         raise ValueError('Skeleton joint names do not match model')
     display_joints = [joint for joint in ET.fromstring(model_data['urdf']).findall('joint')
                       if joint.get('name', '').startswith('display_hand_gripper_')]
-    if len(display_joints) != 8 or any(joint.get('type') != 'fixed' for joint in display_joints):
+    if mode == 'upper_limb' and (len(display_joints) != 8 or any(joint.get('type') != 'fixed' for joint in display_joints)):
         raise ValueError('Fixed left/right gripper display outlines are missing')
-    joint_tool = next(tool for tool in tools if tool['name'] == 'joint_state')
-    if joint_tool['topic_out'][0]['format'] != 'sensor/skeleton':
-        raise ValueError('Joint card must use skeleton format')
+    joint_tool = next(tool for tool in tools if tool['name'] == 'joints')
+    if joint_tool['topic_out'] != [{'topic': '/limx_tron2/state/joints', 'format': 'sensor/skeleton'}]:
+        raise ValueError('Joint card must use the native sensor/skeleton protocol')
     arm_tool = next((tool for tool in tools if tool['name'] == 'arm_control'), None)
     if arm_tool and (arm_tool['inputSchema'].get('x-completion') != {
             'actions': ['move', 'reset'], 'timeout': 120}
@@ -156,7 +162,7 @@ def run_check(timeout=20, camera=False):
             if result.get('isError'):
                 raise ValueError('Sensor lifecycle failed: ' + name)
     motion_readiness = None
-    for name in names & {'arm_control', 'move_head', 'gripper', 'pose'}:
+    for name in (names & {'arm_control', 'move_head', 'gripper', 'pose'}) if mode == 'upper_limb' else ():
         for action in ('info', 'start', 'stop'):
             reply = rpc('tools/call', {'name': name, 'arguments': {'action': action,
                 '_trace_id': 'readonly-check-trace', 'instance_id': 'readonly-check'}})
@@ -173,20 +179,24 @@ def run_check(timeout=20, camera=False):
     for name in CARDS:
         if not before[name]['available'] or not after[name]['available']:
             raise ValueError('Sensor unavailable: ' + name)
-    joint = after['joint_state']
-    if joint['received_at'] <= before['joint_state']['received_at']:
+    joint = after['joints']
+    if joint['received_at'] <= before['joints']['received_at']:
         raise ValueError('Joint response receipt did not update')
     values = joint['data']
     from skeleton import skeleton_stream
-    skeleton_data = skeleton_stream(joint)
-    if not skeleton_data['status']['available'] or len(skeleton_data['joints']) != 16:
+    skeleton_data = skeleton_stream(joint, {'mode': mode})
+    if not skeleton_data['status']['available'] or len(skeleton_data['joints']) != len(expected_names):
         raise ValueError('Unsupported skeleton joint layout or names')
-    print('PASS: skeleton/model with fixed gripper outlines and move/reset with ACP completion; motion not tested; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
+    print('PASS: configuration-matched skeleton/model; motion not tested; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
+    print('Skeleton configuration:', mode)
     print('Arm motion readiness:', motion_readiness)
     print('Joint count:', values['joint_count'])
     print('Joint labels:', values['name_source'])
     print('First joint positions (degrees):', values['positions_deg'][:3])
-    print('Left/right elbow feedback (degrees):', values['positions_deg'][3], values['positions_deg'][10])
+    if mode == 'upper_limb':
+        print('Left/right elbow feedback (degrees):', values['positions_deg'][3], values['positions_deg'][10])
+    else:
+        print('Left/right knee feedback (degrees):', values['positions_deg'][3], values['positions_deg'][8])
     if camera:
         if not camera_tools:
             raise ValueError('Camera card is not enabled')

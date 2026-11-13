@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from urllib.parse import urlparse
 
 import aiohttp
-from state import joint_state, select_fields, STATUS_FIELDS
+from state import joint_state, select_fields, STATUS_FIELDS, battery_state
 
 HEAD_API_PORT = 8888  # Read-only vendor UI endpoint, on the same robot host.
 POSE_JOINT_POLL_SECONDS = .1
@@ -110,14 +110,24 @@ def motion_readiness(data):
 class RobotReader:
     def __init__(self, settings):
         self.settings = settings
+        self._startup_calibration = None
+        self._skeleton_display_frame = None
+        self.configuration = {'state': 'pending', 'mode': 'unknown',
+                              'fixed_for_process': True, 'enforces_card_restrictions': False}
         self.connected = False
         self.serial = settings['serial'] or None
+        self.imu = None
+        self.imu_at = None
+        self.imu_subscription = None
         self.info = self.joints = None
         self.info_at = self.joints_at = None
         self.info_received = self.joints_received = None
         self.last_error = None
         self.last_round_trip = None
         self.ws = None
+        self.walk = None
+        self.sit_down = None
+        self.stand = None
         self.move_pending = None
         self.head_pending = None
         self.gripper_pending = {}
@@ -159,6 +169,13 @@ class RobotReader:
                 pass
 
     def disconnect(self, reason):
+        self._startup_calibration = None
+        self._skeleton_display_frame = None
+        if self.walk is not None:self.walk.disconnect()
+        if self.sit_down is not None:
+            self.sit_down.disconnect()
+        if self.stand is not None:
+            self.stand.disconnect()
         if self._pose_servo is not None:
             self._pose_servo['error'] = 'Robot disconnected during ServoJ'
         self.connected = False
@@ -174,11 +191,20 @@ class RobotReader:
             future = self.head_pending[1]
             if not future.done():
                 future.set_exception(MoveError('Head connection lost; result unknown, do not retry', None))
+        self.imu = None
+        self.imu_at = None
+        self.imu_subscription = None
         self.info = self.joints = None
         self.info_at = self.joints_at = None
         self.info_received = self.joints_received = None
         self.last_round_trip = None
         self.last_error = reason
+        if not self.settings['serial']:
+            # Auto-discovered identity belongs to this connection, not Docker's
+            # lifetime. A robot reboot may change DACH to WF while Driver stays up.
+            self.serial = None
+            self.configuration = {'state': 'pending', 'mode': 'unknown',
+                                  'fixed_for_process': False, 'enforces_card_restrictions': False}
 
     def accept_info(self, body):
         data = body.get('data')
@@ -192,8 +218,41 @@ class RobotReader:
         # Validate only published fields; do not expose unrelated vendor payloads.
         select_fields(data, STATUS_FIELDS)
         self.serial = serial
+        if self.configuration.get('state') == 'pending':
+            from state import configuration
+            self.configuration = configuration(serial)
+            self.configuration['fixed_for_process'] = False
+            self.configuration['fixed_for_connection'] = True
         self.info, self.info_at, self.info_received = data, time.monotonic(), time.time()
         self.connected, self.last_error = True, None
+
+    def accept_imu(self, body):
+        """Official notify_imu: native base orientation, quaternion w,x,y,z."""
+        if body.get('accid') != self.serial:
+            return
+        data = body.get('data')
+        q = data.get('quat') if isinstance(data, dict) else None
+        if not isinstance(q, list) or len(q) != 4 or any(
+                isinstance(v, bool) or not isinstance(v, (int, float)) or
+                not math.isfinite(v) for v in q):
+            self.imu = self.imu_at = None
+            return
+        norm = math.hypot(*q)
+        if not .5 <= norm <= 1.5:
+            self.imu = self.imu_at = None
+            return
+        self.imu = [v/norm for v in q]
+        self.imu_at = time.monotonic()
+
+    async def enable_imu(self, ws):
+        # Sensor subscription only, no locomotion/mode commands. Once per WS.
+        if self.configuration.get('mode') not in ('wheel_foot', 'sole_foot'):
+            return
+        guid = str(uuid.uuid4())
+        self.imu_subscription = {'guid': guid, 'state': 'requested'}
+        await ws.send_json({'title': 'request_enable_imu', 'accid': self.serial,
+                           'guid': guid, 'timestamp': int(time.time()*1000),
+                           'data': {'enable': True}})
 
     async def receive(self, ws, deadline):
         remaining = deadline - time.monotonic()
@@ -233,6 +292,16 @@ class RobotReader:
                 future.set_result(body.get('data'))
             elif not future.done() and body.get('title') == 'notify_invalid_request':
                 future.set_result({'result': 'fail_invalid_cmd'})
+        if self.walk is not None:self.walk.receive(body)
+        if self.sit_down is not None:
+            self.sit_down.receive(body)
+        if self.stand is not None:
+            self.stand.receive(body)
+        if body.get('title') == 'notify_imu':
+            self.accept_imu(body)
+        if body.get('title') == 'response_enable_imu' and self.imu_subscription and \
+                body.get('guid') == self.imu_subscription['guid'] and body.get('accid') == self.serial:
+            self.imu_subscription['state'] = 'enabled' if (body.get('data') or {}).get('result') == 'success' else 'rejected'
         if body.get('title') == 'notify_robot_info':
             self.accept_info(body)
         return body
@@ -404,6 +473,49 @@ class RobotReader:
         except (OSError,aiohttp.ClientError,asyncio.TimeoutError) as exc:
             raise MoveError('ServoJ socket submission uncertain; no retry',None,'trajectory_send_unknown') from exc
 
+    async def send_arm_servoj(self, q, token):
+        """General 16-axis stream writer; pose retains its separate zero-head rule."""
+        if token is not self._pose_servo or token.get('error'):
+            raise MoveError((token or {}).get('error') or 'ServoJ owner changed', False)
+        if not isinstance(q, list) or len(q) != 16:
+            raise MoveError('ServoJ requires 16 native joint radians', False)
+        validate_movej(q[:14], .1)
+        for value, (low, high) in zip(q[14:], HEAD_RAD_LIMITS):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not low <= value <= high:
+                raise MoveError('ServoJ head target outside vendor limit', False)
+        if self.configuration.get('mode') != 'upper_limb' or not self.connected or self.ws is not token['ws'] or self.serial != token['serial'] or self.ws.closed:
+            raise MoveError('ServoJ configuration or connection changed', False)
+        status = self.sample('robot_status')
+        if not status['available'] or not motion_readiness(status['data'])['ready'] or status['data'].get('motor') != 'OK':
+            raise MoveError('ServoJ robot status not ready', False)
+        try:
+            await asyncio.wait_for(self.ws.send_json({'title': 'request_servoj', 'accid': self.serial,
+                'guid': str(uuid.uuid4()), 'timestamp': int(time.time() * 1000),
+                'data': {'q': q, 'filter_ratio': 1.0}}), .02)
+        except (OSError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise MoveError('ServoJ submission uncertain; no retry', None) from exc
+
+    async def send_arm_grippers(self, openings, token):
+        """Official paired normalized openings, owned by loco_servo_arm.
+
+        ServoJ remains 16D. Match tron2_env's opening*100, speed=100,
+        force=50 defaults; the legacy single-side card retains its own limits.
+        """
+        if token is not self._pose_servo or token.get('error'):
+            raise MoveError('Gripper stream owner changed', False)
+        if self.configuration.get('mode') != 'upper_limb' or not self.connected or self.ws is not token['ws'] or self.serial != token['serial'] or self.ws.closed:
+            raise MoveError('Gripper stream configuration or connection changed', False)
+        if not isinstance(openings, (tuple, list)) or len(openings) != 2 or any(
+                isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 1 for v in openings):
+            raise MoveError('Paired grippers require two normalized openings in [0, 1]', False)
+        status = self.sample('robot_status')
+        if not status['available'] or not motion_readiness(status['data'])['ready'] or status['data'].get('motor') != 'OK':
+            raise MoveError('Gripper stream robot status not ready', False)
+        data = {}
+        for side, opening in zip(('left', 'right'), openings):
+            data.update({side + '_opening': int(opening * 100), side + '_speed': 100, side + '_force': 50})
+        return await self._gripper_request('request_set_limx_2fclaw_cmd', data, True)
+
     async def _gripper_request(self, title, data, motion):
         if (motion is True and title != 'request_set_limx_2fclaw_cmd') or \
                 (motion is False and (title != 'request_get_limx_2fclaw_state' or data != {})) or type(motion) is not bool:
@@ -456,7 +568,7 @@ class RobotReader:
         return await self._gripper_request('request_set_limx_2fclaw_cmd', data, True)
 
     def sample(self, name):
-        if name not in ('joint_state', 'robot_status'):
+        if name not in ('joint_state', 'robot_status', 'battery_state'):
             raise ValueError('Unknown sensor')
         info_card = name != 'joint_state'
         at = self.info_at if info_card else self.joints_at
@@ -469,11 +581,18 @@ class RobotReader:
         data = None
         if available:
             if name == 'joint_state':
-                data = self.joints
+                data = dict(self.joints)
+                if self.imu is not None and self.imu_at is not None and \
+                        time.monotonic()-self.imu_at <= min(1., self.settings['stale_after_seconds']):
+                    data['imu_quat'] = list(self.imu)
             elif name == 'robot_status':
                 data = select_fields(self.info, STATUS_FIELDS)
-            else:
-                raise ValueError('Unknown sensor')
+            elif name == 'battery_state':
+                try:
+                    data = battery_state(self.info)
+                except ValueError:
+                    available = False
+                    status = 'invalid_battery'
         return {'schema_version': 1, 'accid': self.serial, 'read_only': True, 'connected': self.connected,
                 'available': available, 'sample_status': status,
                 'received_at': received, 'reception_age_seconds': age,
@@ -489,6 +608,7 @@ class RobotReader:
                     deadline = time.monotonic() + self.settings['response_timeout_seconds']
                     while not self.connected:
                         await self.receive(ws, deadline)
+                    await self.enable_imu(ws)
                     while True:
                         started = time.monotonic()
                         await self.read_joints(ws)

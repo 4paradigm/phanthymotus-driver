@@ -7,7 +7,10 @@ robot:
   response_timeout_seconds: 5
   stale_after_seconds: 5
 plugins:
-  joint_state: {enabled: true}
+  loco_servo_arm: {enabled: true, expected_hz: 30, dry_run: false}
+  loco_leg: {enabled: true}
+  battery: {enabled: true}
+  joints: {enabled: true}
   arm_control: {enabled: true}
   pose: {enabled: true}
   move_head: {enabled: true}

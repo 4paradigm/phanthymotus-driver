@@ -205,7 +205,7 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
              patch('completion.ARRIVAL_GRACE',.5),patch('completion.STABILITY_SECONDS',.05):
             path=Path(temp)/'home.json'
             path.write_text(json.dumps({'schema':'tron2-arms-reset-pose-v1','scope':'arms_only',
-                'unit':'rad','joint_names':ARM_NAMES,'accid':'TEST_TRON2A','firmware':'TEST_FW',
+                'unit':'rad','joint_names':ARM_NAMES,'accid':'DACH_TRON2A_TEST','firmware':'TEST_FW',
                 'target_q':[.1]*14,'head_policy':'unchanged','gripper_policy':'unchanged'}))
             raw=path.read_bytes()
             async with aiohttp.ClientSession(trust_env=False) as session:
