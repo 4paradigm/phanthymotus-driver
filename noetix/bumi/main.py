@@ -204,6 +204,12 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        if plugins_cfg.get("patrol_baseline", {}).get("enabled", False):
+            from patrol_baseline import PatrolBaselinePlugin
+            self._plugins.append(PatrolBaselinePlugin(
+                plugins_cfg["patrol_baseline"], namespace, executor))
+            print("[bundle] PatrolBaselinePlugin loaded")
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):
