@@ -448,6 +448,97 @@ ros2 topic hz /<robot_namespace>/motion/state
 docker logs -f embodied-noetix-bumi
 ```
 
+## Human-shape detection card (`person_detect`)
+
+A sensor card that detects full-body people in the camera view and publishes the
+nearest one. It never commands the chassis; a later follow/approach card can
+consume the target.
+
+Detection uses OpenCV's default HOG + linear SVM people detector
+(`HOGDescriptor.getDefaultPeopleDetector()`), which ships with the OpenCV package
+already in the image — no model download, no runtime network. The image is
+downscaled to 480 px wide for speed on the Bumi ARM board and the boxes are
+mapped back to the full-resolution frame before depth sampling.
+
+A detection is kept only when:
+
+- HOG weight ≥ `min_weight` (default 0.50);
+- box aspect (height/width) 1.4–4.5 and height ≥ 110 px (full-body shape);
+- an aligned depth sample exists between 0.5 and 8 m;
+- depth median absolute deviation inside the box ≤ `depth_mad_m` (default
+  0.80 m), which rejects a box that mixes a person with far background.
+
+Overlapping HOG boxes are merged with IoU NMS, the nearest valid person is
+tracked, and a target becomes `fresh` only after `confirm_frames` consecutive
+frames; distance and bearing are smoothed. Output on `/<ns>/person/target`:
+
+```json
+{"state": "fresh", "person": {"distance_m": 3.42, "bearing_deg": -4.0,
+ "bbox": [240, 90, 120, 330], "weight": 1.12, "confidence": 0.56,
+ "confirmed_frames": 2}, "count": 1}
+```
+
+`bearing_deg` uses the robot frame: front 0, left positive. `candidate` means a
+person was detected but not yet confirmed; `no_target` means nothing passed the
+HOG/depth rules; `stale` means colour or depth stopped arriving.
+
+With `publish_debug: true` the card also publishes `/<ns>/person/debug`
+(`image/jpeg`) with every HOG box drawn; the confirmed target is green, other
+candidates yellow. This is the fastest way to see whether HOG is finding the
+person or the box is being rejected by depth/aspect.
+
+### Configuration (`config.yaml`)
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `detect_hz` | `3` | Detection rate (HOG is heavier on ARM) |
+| `min_weight` | `0.50` | HOG score threshold |
+| `confirm_frames` | `2` | Consecutive hits before `fresh` |
+| `depth_mad_m` | `0.80` | Max depth spread inside the box |
+| `publish_debug` | `true` | Publish the annotated JPEG |
+
+`requirements.txt` pins `opencv-python-headless<5`: some OpenCV 5 wheels ship
+without `HOGDescriptor`, while the 4.x builds include the default people
+detector this card relies on.
+
+Safety: the card only reads camera frames and does not move the robot.
+Detection expects a person standing or walking, fully visible and roughly 2.5–6 m
+away. Sitting, lying, heavily occluded or half-out-of-frame people, and
+backlit silhouettes can be missed; HOG is a classic full-body detector, not a
+pose estimator. The debug topic shows whether a box exists before it is dropped
+by the depth/aspect filters.
+
+Tests: `python -m pytest noetix/bumi/tests/test_person_detect.py -q`
+
+## Person contour display card (`person_contour`)
+
+Shows the live camera view with every detected person outlined in green. It
+subscribes to the camera colour/depth pair and to `person_detect`'s target JSON
+(which now also carries a `people` list of all current detections, not just the
+nearest one). For each person box it keeps the depth band within
+`depth_tolerance_m` of that person's distance, cleans the mask with open/close,
+finds the external contour and draws it on the colour frame. When depth is
+missing or too noisy it falls back to a green rectangle, so the operator still
+sees which person is tracked.
+
+Output: `/<ns>/person/contour` (`image/jpeg`) at `display_hz` (default 10 Hz).
+On the canvas, connect `person_detect`'s target output (purple port) to this
+card's input; the annotated camera image is then available as the card's image
+output. It is display-only: no chassis command and no second person detector.
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `display_hz` | `10` | Annotated frame rate |
+| `depth_tolerance_m` | `0.40` | Depth band treated as the same person |
+| `line_width` | `2` | Green contour thickness |
+| `jpeg_quality` | `80` | Output JPEG quality |
+
+If the person is close to a wall or the depth is too noisy, the green outline
+may follow the depth blob rather than the exact body edge; the fallback box
+keeps the tracked person visible. The camera card must be running.
+
+Tests: `python -m pytest noetix/bumi/tests/test_person_contour.py -q`
+
 ## Read-only RGB-D visual odometry card (`rgbd_visual_odometry`)
 
 Single container: the estimator runs inside this bundle, not in a sidecar.

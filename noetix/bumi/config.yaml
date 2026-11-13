@@ -36,6 +36,21 @@ plugins:
     min_wz_rads: 0.33           # 归一化边界 0.40 × 0.83
     # 已经在走的时候的偏航死区。
     min_wz_moving_rads: 0.25    # 归一化边界 0.30 × 0.83
+  # 人形检测：HOG 全身行人检测，发布最近一人的距离/方位；可输出带框调试图。
+  person_detect:
+    enabled: true
+    detect_hz: 3               # HOG 在 ARM 上较慢，3 Hz 起步
+    min_weight: 0.50           # HOG 置信度下限
+    confirm_frames: 2          # 连续命中多少帧才发布 fresh
+    depth_mad_m: 0.80          # 框内深度离散度上限
+    publish_debug: true        # 发布 /<ns>/person/debug JPEG
+  # 人形轮廓显示：摄像头画面 + 绿色人形轮廓，供仪表盘查看。
+  person_contour:
+    enabled: true
+    display_hz: 10
+    depth_tolerance_m: 0.40    # 人物前后多深范围内的像素算作同一个人
+    line_width: 2
+    jpeg_quality: 80
   mic:
     enabled: true
   sound_direction:

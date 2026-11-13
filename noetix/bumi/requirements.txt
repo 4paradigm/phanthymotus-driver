@@ -1,5 +1,5 @@
 pyyaml
 netifaces
 numpy
-opencv-python-headless
+opencv-python-headless<5
 pyrealsense2
