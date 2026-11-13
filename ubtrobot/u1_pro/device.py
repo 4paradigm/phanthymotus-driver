@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from common.vendor_runtime import action_schema, jsonable, tool
+from visitor_badge import HPPrinterPlugin
 
 
 SERVICE_TIMEOUT = 10.0
@@ -2123,4 +2124,10 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
                HeadPlugin(audio, motion_catalog, catalog_available),
                SystemControlsPlugin(nodes),
                camera_left, camera_right]
+    # 访客贴打印只走局域网 HTTP，不依赖 SDK；config.yaml 里 hp_printer.enabled=false 可关掉。
+    # 兼容已经下发过的旧 visitor_badge 配置，便于平滑升级。
+    badge_cfg = config.get("hp_printer") or config.get("visitor_badge") or {}
+    if badge_cfg.get("enabled", True):
+        plugins.append(HPPrinterPlugin(badge_cfg))
     return plugins
+

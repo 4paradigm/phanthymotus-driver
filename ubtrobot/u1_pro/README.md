@@ -13,6 +13,46 @@
 - `system_controls`：统一控制 `wakeup`、`wakeup_followup` 和 `visual_behavior` 三个固件行为开关。
 - `camera_left`、`camera_right`：打开 SDK video stream，并分别订阅 domain `2` 的 `/sensor/camera/left_eye/color/raw`、`/sensor/camera/right_eye/color/raw`，转换后输出 JPEG。SDK 共享内存视频流没有选择左右眼的参数；只有元数据明确标记了对应眼睛时，才会将环形缓冲帧作为该眼的备用输入，避免把一幅画面伪装成左右两路。
 
+- `hp_printer`：访客贴打印，画布中归在 `ACTUATOR`。访客贴在范式+ 上生成，打印机用 USB 接在前台电脑上，所以卡片不直接连打印机，而是向前台电脑上的桥接服务发 HTTP 请求：`skill → hp_printer → 前台电脑桥接服务 → 范式+ / USB 打印机`。不依赖 SDK，见下文“访客贴打印”。
+
+## 访客贴打印（`hp_printer`）
+
+### 动作
+
+| action | 参数 | 返回 |
+|---|---|---|
+| `find` | `name`：访客姓名；`host`：被访人（可选） | `status=found/multiple/not_found`，`visits[]`：短期 `ticket`、手机尾号、被访人、来访时间、事由和状态 |
+| `print` | `ticket`（必须来自 `find`）、`request_id`（必填；重试时必须复用） | `status=printed/failed` 和本次 `request_id` |
+
+出错时统一返回 `status=error`、`code` 和可以直接转述的中文 `error`，例如 `unreachable`（前台电脑没开或网络不通）、`unauthorized`（令牌不对）、`printer_not_ready`、`visitor_not_found`。
+
+安全约束：桥接服务把真实 `visitId` 留在前台电脑上，只向卡片发短期 `ticket`。卡片不会按名字直接打印；范式+ 里查不到当天预约的访客打不出访客贴。`request_id` 用于防止同一请求被重复执行。查询结果只包含手机尾号、被访人、时间、事由和状态，不转发证件号、完整手机号等字段。
+
+### 配置
+
+画布上卡片的配置项：`bridge_url`（必填，例如 `http://192.168.1.20:8765`，前台电脑要设固定 IP）、`token`（必填，和桥接服务一致）、`timeout_s`。`config.yaml` 的 `hp_printer.enabled: false` 可以关掉这张卡。
+
+### 桥接服务接口约定
+
+前台电脑上的桥接服务只向机器人开放下面两个接口。请求都带 `Authorization: Bearer <token>`，返回 JSON；出错时可返回非 2xx 状态码，响应体为 `{"error": "中文说明", "code": "..."}`。
+
+| 接口 | 请求 | 响应 |
+|---|---|---|
+| `POST /find_visit` | `{"name": "王磊", "host": "张三"}`；只查当天预约，`host` 可省略 | `{"count": 1, "visits": [{"ticket", "tail", "host", "time", "reason", "status"}]}` |
+| `POST /print_tag` | `{"ticket": "...", "request_id": "..."}` | `{"ok": true}` 或 `{"ok": false, "error": "...", "code": "..."}` |
+
+`ticket` 由桥接服务生成，短时间有效，并在桥接服务内部对应真实 `visitId`。同一 `request_id` 必须返回第一次处理的结果，不得再次改变访客状态或重复打印。
+
+[`visitor_badge_mock_bridge.py`](visitor_badge_mock_bridge.py) 是这套接口的模拟实现，不连范式+ 和打印机，用于在真机上联调卡片：
+
+```bash
+python3 ubtrobot/u1_pro/visitor_badge_mock_bridge.py --port 8765 --token test-token
+```
+
+然后把卡片的 `bridge_url` 配成 `http://<运行它的电脑IP>:8765`，`token` 配成 `test-token`。示例访客为王磊、李娜（两位同名）。模拟服务会验证短期票据、重复请求和重复打印，但不会连接真实范式+或打印机。
+
+真实桥接服务仍需补齐范式+ 的 `/visitInfo/page/query` 请求与响应字段、打印页面地址、打印前后状态值，以及前台打印机的操作系统配置。没有确认这些信息前，不应调用非幂等的 `updateVisitorStatus`，也不应把模拟服务当成生产打印服务。
+
 ## 启动与行为控制
 
 启动时先检查/完成 SDK 授权，然后依次关闭并读取确认 `wakeup`、`wakeup_followup` 和 `visual_behavior`。任一关闭请求失败或读回状态不符，驱动启动失败，不会注册卡片。需要使用时，可通过 `system_controls` 单独或批量重新开启。
@@ -31,3 +71,4 @@
 PYTHONPATH=ubtrobot/u1_pro python3 -m unittest discover -s ubtrobot/u1_pro -p 'test_*.py' -v
 python3 scripts/check_service_yml.py ubtrobot/u1_pro
 ```
+

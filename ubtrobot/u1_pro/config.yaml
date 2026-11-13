@@ -9,3 +9,11 @@ ros:
   # The Adapter's vendor graph uses localhost; device streams use domain 2.
   robot_interface: "lo"
   cyclonedds_uri: "<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='lo'/></Interfaces><AllowMulticast>false</AllowMulticast></General><Discovery><MaxAutoParticipantIndex>200</MaxAutoParticipantIndex></Discovery><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
+
+# 访客贴打印卡片：请求前台电脑上的桥接服务，由它去范式+ 查访客、用 USB 打印机打印。
+# 桥接地址和令牌在画布卡片配置里填（会自动下发），这里只放默认值。
+hp_printer:
+  enabled: true
+  bridge_url: ""        # 例如 http://192.168.1.20:8765
+  timeout_s: 8          # 单次请求超时
+
