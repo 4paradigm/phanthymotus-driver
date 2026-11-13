@@ -496,22 +496,22 @@ class LocoPlugin:
                     },
                     "vx": {
                         "type": "number",
-                        "description": "Forward velocity [-1, 1] (>0 forward)",
+                        "description": "Unitless forward/backward command [-1, 1]. Positive is forward, negative is backward, zero is neutral.",
                         "minimum": -1, "maximum": 1,
                     },
                     "vy": {
                         "type": "number",
-                        "description": "Lateral velocity [-1, 1] (>0 left)",
+                        "description": "Unitless lateral command [-1, 1]. Positive is left, negative is right, zero is neutral.",
                         "minimum": -1, "maximum": 1,
                     },
                     "vyaw": {
                         "type": "number",
-                        "description": "Turning velocity [-1, 1] (>0 left turn)",
+                        "description": "Unitless turn command [-1, 1]. Positive turns left, negative turns right, zero is neutral.",
                         "minimum": -1, "maximum": 1,
                     },
                     "duration": {
                         "type": "number",
-                        "description": "Duration in seconds (0 = continuous until stop_move)",
+                        "description": "Duration in seconds. Zero runs until stop_move or the 5-second watchdog.",
                         "minimum": 0,
                     },
                 },
@@ -705,7 +705,21 @@ class LocoPlugin:
 
         handler = None
         if tool_name == "loco" and action == "move":
-            handler = lambda: self._do_move(args)
+            # An invalid request must not pause the servo or interrupt a
+            # valid move. Parse before entering the motion arbitration path.
+            try:
+                velocity = {}
+                for axis in ("vx", "vy", "vyaw"):
+                    value = _finite_number(args.get(axis, 0), axis)
+                    if not -1.0 <= value <= 1.0:
+                        raise ValueError(f"{axis} must be between -1 and 1")
+                    velocity[axis] = value
+                duration = _finite_number(args.get("duration", 0), "duration")
+                if duration < 0:
+                    raise ValueError("duration must be non-negative")
+            except (ValueError, OverflowError) as exc:
+                return {"state": "error", "command_sent": False, "error": str(exc)}
+            handler = lambda: self._do_move(**velocity, duration=duration)
         elif tool_name == "loco_relative_move" and action == "rotate":
             return self._do_rotate(args)
         elif tool_name == "loco_relative_move" and action == "move":
@@ -766,7 +780,7 @@ class LocoPlugin:
             self._high_ctrl.publish_cmd(x, y, z, action_cmd, index)
             self._last_cmd_time = time.monotonic()
 
-    def _do_move(self, args: dict) -> dict:
+    def _do_move(self, vx: float, vy: float, vyaw: float, duration: float) -> dict:
         # Reserve move startup until its worker exists, so rotate cannot
         # enter between the busy check and launching the move thread.
         with self._rotate_lock:
@@ -780,9 +794,9 @@ class LocoPlugin:
                         "wait for it to finish or call stop_move first"
                     ),
                 }
-            return self._do_move_impl(args)
+            return self._do_move_impl(vx, vy, vyaw, duration)
 
-    def _do_move_impl(self, args: dict) -> dict:
+    def _do_move_impl(self, vx: float, vy: float, vyaw: float, duration: float) -> dict:
         # Check if in walking mode
         mode = int(self._high_ctrl.get_mode())
         if mode == 26:
@@ -796,11 +810,6 @@ class LocoPlugin:
                     "Use switch_mode switch=walk first."
                 ),
             }
-
-        vx = float(args.get("vx", 0))
-        vy = float(args.get("vy", 0))
-        vyaw = float(args.get("vyaw", 0))
-        duration = float(args.get("duration", 0))
 
         # Stop any existing move thread
         self._move_stop_event.set()
