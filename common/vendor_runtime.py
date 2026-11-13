@@ -299,10 +299,11 @@ def start_registration(port: int, config: dict, driver_id: str) -> None:
     import urllib.request
 
     url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    advertise_host = os.environ.get("MCP_ADVERTISE_HOST", "localhost")
     payload = json.dumps({
         "id": driver_id,
         "name": config.get("name", driver_id),
-        "url": f"http://localhost:{port}/mcp",
+        "url": f"http://{advertise_host}:{port}/mcp",
         "transport": "http",
         "category": "driver",
     }).encode()
@@ -311,11 +312,19 @@ def start_registration(port: int, config: dict, driver_id: str) -> None:
     context.verify_mode = ssl.CERT_NONE
 
     def loop():
+        announced = False
         while True:
             try:
                 request = urllib.request.Request(f"{url}/api/mcp", data=payload, headers={"Content-Type": "application/json"}, method="POST")
                 with urllib.request.urlopen(request, timeout=3, context=context):
                     pass
+                if not announced:
+                    print(
+                        f"[register] registered {config.get('name', driver_id)} "
+                        f"at http://{advertise_host}:{port}/mcp",
+                        flush=True,
+                    )
+                    announced = True
                 time.sleep(30)
             except Exception as exc:
                 print(f"[register] failed: {exc}; retrying in 5s", flush=True)

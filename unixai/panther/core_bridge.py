@@ -17,7 +17,7 @@ TOPIC_SUFFIXES = {
     "odom": ("odom", "state/odom"),
     "laser_scan": ("laser_scan", "data/json"),
     "laser_view": ("laser_scan/view", "image/jpeg"),
-    "camera_rgb": ("camera/rgb", "image/jpeg"),
+    "camera_color": ("camera/rgb", "image/jpeg"),
     "camera_depth": ("camera/depth", "image/depth-zlib"),
 }
 

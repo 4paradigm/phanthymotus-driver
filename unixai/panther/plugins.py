@@ -178,9 +178,9 @@ def build_plugins(config, namespace, device):
             device, "laser_scan", "Panther merged dual-lidar scan from /scan",
             ["laser_scan", "laser_view"],
         ))
-    if on("camera_rgb"):
+    if on("camera_color"):
         plugins.append(CameraPlugin(
-            device, "camera_rgb", "rgb", "Panther Gemini 2 RGB stream (lazy host-service start)"
+            device, "camera_color", "rgb", "Panther Gemini 2 RGB stream (lazy host-service start)"
         ))
     if on("camera_depth"):
         plugins.append(CameraPlugin(

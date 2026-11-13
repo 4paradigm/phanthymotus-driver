@@ -15,7 +15,7 @@ required for discovery.
 ## Implemented cards
 
 - Sensors: `joints`/`model`, consolidated `robot_state`, `imu`, `odom`,
-  merged `laser_scan`, lazy `camera_rgb`, and lazy `camera_depth`.
+  merged `laser_scan`, lazy `camera_color`, and lazy `camera_depth`.
 - Actuators: `base_drive`, `arm_control`, `gripper`, `lifting`, and `head`.
 
 `model` uses the bundled, stripped Panther URDF so the skeleton is available

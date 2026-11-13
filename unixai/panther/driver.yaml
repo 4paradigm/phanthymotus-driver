@@ -1,5 +1,5 @@
 id: unixai-panther-driver
-name: UniX AI Panther Bundle
+name: UniX AI Panther Driver
 category: driver
 hardware_provider: unixai
 hardware_model: panther
@@ -16,7 +16,7 @@ cards:
   - {name: imu, type: sensor}
   - {name: odom, type: sensor}
   - {name: laser_scan, type: sensor}
-  - {name: camera_rgb, type: sensor}
+  - {name: camera_color, type: sensor}
   - {name: camera_depth, type: sensor}
   - {name: base_drive, type: actuator}
   - {name: arm_control, type: actuator}

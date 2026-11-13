@@ -12,6 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DRIVER = ROOT / "unixai" / "panther"
 sys.path.insert(0, str(ROOT))
 
+from common.vendor_runtime import DriverBundle
+
 
 def _load(name):
     spec = importlib.util.spec_from_file_location(name, DRIVER / f"{name}.py")
@@ -26,12 +28,46 @@ plugins = _load("plugins")
 
 
 class PantherDriverTest(unittest.TestCase):
+    def test_agent_core_can_discover_all_cards_over_mcp(self):
+        card_names = ("joints", "robot_state", "imu", "odom", "laser_scan",
+                      "camera_color", "camera_depth")
+
+        class FakeDevice:
+            topics = {
+                name: {"topic": f"/test/{name}",
+                       "format": "image/jpeg" if name == "camera_color" else
+                                 "image/depth-zlib" if name == "camera_depth" else
+                                 "data/json"}
+                for name in (*card_names, "laser_view")
+            }
+
+            def __getattr__(self, _name):
+                return lambda *_args, **_kwargs: None
+
+        config = {"plugins": {
+            **{name: {"enabled": True} for name in card_names},
+            "base_drive": {"enabled": True, "max_linear_mps": 0.5,
+                           "max_angular_deg_s": 45.0, "max_duration_s": 10.0},
+            "arm_control": {"enabled": True, "max_duration_s": 20.0},
+            "gripper": {"enabled": True},
+            "lifting": {"enabled": True, "max_position_m": 0.8},
+            "head": {"enabled": True},
+        }}
+        bundle = DriverBundle(plugins.build_plugins(config, "test", FakeDevice()))
+        tools = bundle.get_all_tools()
+        json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"tools": tools}},
+                   allow_nan=False)
+        discovered = {tool["name"] for tool in tools}
+        expected = {*card_names, "model", "base_drive", "arm_control",
+                    "gripper", "lifting", "head"}
+        self.assertEqual(discovered, expected)
+
     def test_control_cards_keep_safety_gates_and_add_lifecycle(self):
         class FakeDevice:
             topics = {
                 name: {"topic": f"/test/{name}", "format": "data/json"}
                 for name in ("joints", "robot_state", "imu", "odom", "laser_scan",
-                             "camera_rgb", "camera_depth")
+                             "camera_color", "camera_depth")
             }
 
             def __getattr__(self, _name):
@@ -158,7 +194,7 @@ class PantherDriverTest(unittest.TestCase):
         driver_text = (DRIVER / "driver.yaml").read_text()
         cards = set(re.findall(r"name:\s*([a-z_]+)", driver_text))
         expected = {"joints", "model", "robot_state", "imu", "odom", "laser_scan",
-                    "camera_rgb", "camera_depth", "base_drive", "arm_control",
+                    "camera_color", "camera_depth", "base_drive", "arm_control",
                     "gripper", "lifting", "head"}
         self.assertTrue(expected <= cards)
         self.assertFalse({"robot_status", "battery", "gripper_state", "lifting_state",
@@ -169,7 +205,7 @@ class PantherDriverTest(unittest.TestCase):
         self.assertEqual(topics["robot_state"]["format"], "data/json")
         self.assertEqual(topics["laser_scan"]["topic"], "/test/panther/laser_scan")
         self.assertEqual(topics["laser_view"]["format"], "image/jpeg")
-        self.assertEqual(topics["camera_rgb"]["format"], "image/jpeg")
+        self.assertEqual(topics["camera_color"]["format"], "image/jpeg")
         self.assertEqual(topics["camera_depth"]["format"], "image/depth-zlib")
         self.assertFalse({"laser_front", "laser_rear", "laser_fused"} & set(topics))
 
@@ -193,7 +229,7 @@ class PantherDriverTest(unittest.TestCase):
         self.assertIn("privileged: true", service)
 
         class FakeDevice:
-            topics = {"camera_rgb": {"topic": "/test/rgb", "format": "image/jpeg"}}
+            topics = {"camera_color": {"topic": "/test/rgb", "format": "image/jpeg"}}
 
             def __init__(self):
                 self.calls = []
@@ -203,12 +239,24 @@ class PantherDriverTest(unittest.TestCase):
                 return {"state": "running"}
 
         device = FakeDevice()
-        plugin = plugins.CameraPlugin(device, "camera_rgb", "rgb", "test")
+        plugin = plugins.CameraPlugin(device, "camera_color", "rgb", "test")
         self.assertEqual(plugin.get_tool()["camera_info"][0]["schema"], "motus.camera/1")
         plugin.start()
         self.assertEqual(device.calls, [])
         plugin.dispatch("start", {})
         self.assertEqual(device.calls, [("rgb", "start")])
+
+    def test_canvas_registration_identity_remains_backward_compatible(self):
+        config = (DRIVER / "config.yaml").read_text()
+        manifest = (DRIVER / "driver.yaml").read_text()
+        main = (DRIVER / "main.py").read_text()
+        self.assertIn('name: "UniX AI Panther"', config)
+        self.assertIn("name: UniX AI Panther Driver", manifest)
+        self.assertIn("camera_color", config)
+        self.assertIn("camera_color", manifest)
+        self.assertNotIn("camera_rgb", manifest)
+        self.assertIn('"unixai-panther-device-bundle"', main)
+        self.assertLess(main.index("ThreadingHTTPServer("), main.index("start_registration("))
 
     def test_action_resources_follow_agent_core_conventions(self):
         plugins = (DRIVER / "plugins.py").read_text()

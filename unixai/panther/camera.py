@@ -241,9 +241,9 @@ class PantherCameraRuntime:
                     raise ValueError("JPEG encoder rejected frame")
                 payload = self._header_payload(message)
                 payload.update({"message_format": "jpeg", "data": encoded.tobytes()})
-                self._bridge.publish("camera_rgb", payload)
+                self._bridge.publish("camera_color", payload)
             except Exception as exc:
-                print(f"[camera_rgb] dropped frame: {exc}", flush=True)
+                print(f"[camera_color] dropped frame: {exc}", flush=True)
 
     def _depth_loop(self) -> None:
         import cv2

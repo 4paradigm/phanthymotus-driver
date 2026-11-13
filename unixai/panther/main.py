@@ -38,11 +38,19 @@ def main() -> None:
     device.start()
     bundle = DriverBundle(build_plugins(config, namespace, device))
     bundle.start_all()
-    start_registration(port, config, "unixai-panther-driver")
 
     server = ThreadingHTTPServer(
-        ("", port), make_handler(lambda: bundle, "unixai-panther", "unixai-panther-driver")
+        ("", port),
+        make_handler(
+            lambda: bundle,
+            "unixai-panther-device-bundle",
+            "unixai-panther-driver",
+        ),
     )
+    # Bind the MCP socket before advertising it. Agent Core immediately calls
+    # initialize/tools/list when a driver registers; advertising first creates
+    # a race that leaves a persisted offline entry and no cards on the canvas.
+    start_registration(port, config, "unixai-panther-driver")
     stopping = threading.Event()
 
     def shutdown(signum, _frame):

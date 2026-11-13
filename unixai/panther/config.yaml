@@ -1,4 +1,4 @@
-name: "UniX AI Panther Bundle"
+name: "UniX AI Panther"
 mcp_port: 15792
 ros_namespace: "unixai_panther"
 
@@ -28,7 +28,7 @@ plugins:
     depth_hz: 8.0
     jpeg_quality: 70
     max_width: 640
-  camera_rgb: {enabled: true}
+  camera_color: {enabled: true}
   camera_depth: {enabled: true}
 
   base_drive:
