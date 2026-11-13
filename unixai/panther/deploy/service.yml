@@ -1,0 +1,31 @@
+unixai-panther:
+  image: __IMAGE__
+  container_name: embodied-unixai-panther
+  network_mode: host
+  pid: host
+  privileged: true
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    # Panther's host ROS graph is intentionally confined to loopback. With
+    # network_mode: host the container shares that loopback, but it must load
+    # the same CycloneDDS profile or it selects another interface and forms a
+    # separate domain-0 graph.
+    - /home/unix_ai/config/cyclonedds.xml:/etc/cyclonedds/panther.xml:ro
+  environment:
+    - PANTHER_ROS_DOMAIN_ID=0
+    - AGENT_CORE_ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    - CYCLONEDDS_URI=file:///etc/cyclonedds/panther.xml
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - PYTHONUNBUFFERED=1
+    - RCUTILS_COLORIZED_OUTPUT=0
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  # Allow camera workers and the isolated Agent Core bridge to stop cleanly.
+  stop_grace_period: 30s
+  restart: always
+
