@@ -1,0 +1,187 @@
+diff --git a/bumi_sim.py b/bumi_sim.py
+--- a/bumi_sim.py
++++ b/bumi_sim.py
+@@ -27,6 +27,7 @@
+ from greeting_policy import angular_center
+ from simulation_scene import MAX_VISITORS, PRESETS, REFERENCE_BOX_XY, validate_positions
+ from verify_yolo import PersonDetector
++import detaforce_gazebo
+
+
+ TOOL = "bumi_gazebo"
+@@ -637,7 +638,11 @@
+             self.save()
+
+     def run_action(self, action, arguments):
+-        if action == "run_greeting":
++        if action != "rps_motion" and self.model is not None:
++            self.model.observer_override = None
++        if action == "rps_motion":
++            detaforce_gazebo.run_motion(self, arguments)
++        elif action == "run_greeting":
+             self.observe_targets()
+             if len(self.targets) < 2:
+                 raise RuntimeError("The scripted demo requires two people")
+@@ -796,6 +801,11 @@
+             return self.status()
+
+     def check_session(self, arguments, action):
++        if action == "rps_motion":
++            if (self.skill_session or {}).get("state") in ("armed", "running"):
++                raise ValueError("Stop the greeting Skill before playing DetaForce actions")
++            self.skill_session = None
++            return
+         if action in ("reset", "configure_scene") and not arguments.get("session_id"):
+             if action == "configure_scene" and (self.skill_session or {}).get("state") in ("armed", "running"):
+                 raise ValueError("Stop the Skill before editing the visitor layout")
+@@ -853,6 +863,8 @@
+         path = urlsplit(self.path).path
+         if path == "/":
+             self.send_body(200, (self.simulator.directory/"simulation.html").read_bytes(), "text/html; charset=utf-8")
++        elif path == "/detaforce":
++            self.send_body(200, (self.simulator.directory/"detaforce.html").read_bytes(), "text/html; charset=utf-8")
+         elif path == "/status":
+             self.send_body(200, json.dumps(self.simulator.status(), ensure_ascii=False).encode(), "application/json")
+         elif path == "/skill/status":
+@@ -898,6 +910,11 @@
+         try:
+             size = int(self.headers.get("Content-Length", "0"))
+             path = urlsplit(self.path).path
++            if path == "/detaforce/play" and 0 < size < 1000:
++                arguments = json.loads(self.rfile.read(size))
++                result = detaforce_gazebo.call(self.simulator, arguments, invite_speech=True)
++                self.send_body(200, json.dumps(result, ensure_ascii=False).encode(), "application/json")
++                return
+             if path == "/scene" and 0 < size < 32000:
+                 scene = json.loads(self.rfile.read(size))
+                 if not isinstance(scene, dict):
+@@ -925,14 +942,17 @@
+                 result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
+                           "serverInfo": {"name": "bumi-gazebo-simulator", "version": "0.4.1"}}
+             elif method == "tools/list":
+-                result = {"tools": [SPEC, LOCO_SPEC]}
++                result = {"tools": [SPEC, LOCO_SPEC, detaforce_gazebo.SPEC]}
+             elif method == "tools/call":
+                 parameters = request.get("params", {})
+                 name = parameters.get("name")
+-                if name not in (TOOL, LOCO_TOOL):
++                if name not in (TOOL, LOCO_TOOL, detaforce_gazebo.TOOL):
+                     raise ValueError("Unknown simulation tool")
+                 arguments = parameters.get("arguments", {})
+-                data = self.simulator.call_loco(arguments) if name == LOCO_TOOL else self.simulator.call(arguments)
++                if name == detaforce_gazebo.TOOL:
++                    data = detaforce_gazebo.call(self.simulator, arguments)
++                else:
++                    data = self.simulator.call_loco(arguments) if name == LOCO_TOOL else self.simulator.call(arguments)
+                 result = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
+                           "isError": False}
+             elif method == "ping":
+diff --git a/bumi_model.py b/bumi_model.py
+--- a/bumi_model.py
++++ b/bumi_model.py
+@@ -159,6 +159,8 @@
+         return self.forward(base_pose, joints, height_offset)["waist_yaw_link"] @ transform((0.15, 0, 0.25))
+
+     def observer_frame(self, visitor_hands=None):
++        if getattr(self, "observer_override", None) is not None:
++            return self.observer_override.copy()
+         if not visitor_hands:
+             return transform((-2, -4, 2.3), (0, .258, .852))
+         visitor = next(iter(visitor_hands))
+diff --git a/local_speech.py b/local_speech.py
+--- a/local_speech.py
++++ b/local_speech.py
+@@ -34,16 +34,17 @@
+
+
+ class LocalSpeech:
+-    def __init__(self, directory):
++    def __init__(self, directory, *, phrases=PHRASES):
+         self.directory = Path(directory)
++        self.phrases = tuple(phrases)
+         self.voice_path = self.directory/"assets/speech/zh_CN-huayan-medium.onnx"
+         self.cache = self.directory/"audio"
+         self.voice = None
+         self.lock = threading.Lock()
+
+     def prepare(self, text):
+-        if text not in PHRASES:
+-            raise ValueError("Only the configured greeting phrases are supported")
++        if text not in self.phrases:
++            raise ValueError("Only the configured preview phrases are supported")
+         with self.lock:
+             config = self.voice_path.with_suffix(".onnx.json")
+             if not self.voice_path.is_file() or not config.is_file():
+diff --git a/simulation.html b/simulation.html
+--- a/simulation.html
++++ b/simulation.html
+@@ -15,6 +15,7 @@
+ @media(max-width:950px){main{grid-template-columns:1fr}}
+ </style>
+ <h1>Bumi · Gazebo 本地仿真</h1>
++<p><a href="/detaforce" style="color:#a8e0d0">打开 DetaForce 猜拳基础动作试播 →</a></p>
+ <p>站立人物 · 双向握手 · 同步 RGB-D 与 YOLO · Gazebo 位姿反馈<br>人物保持站立，握手时双方伸手、手部对齐并同步摆动。行走采用参数化步态，接触力与平衡待验证。中文语音由 Ubuntu 经 WSLg 播放。</p>
+ <div><button onclick="startSkill()">启动 Skill 问候</button><button onclick="call('stop')">停止</button><button onclick="call('reset')">复位场景</button><button onclick="call('speak',{text:'哥你又帅了，跟我一样！'})">语音试播</button><button onclick="call('move',{vx:.45,vy:0,vyaw:0,duration:3},'bumi_loco_sim')">行走试播</button></div>
+ <p>单人只握手；双人先选最左侧；三人以上优先选最近者，再面向其余人群中间说“你们也一样！”。</p>
+diff --git a/test_bumi_sim.py b/test_bumi_sim.py
+--- a/test_bumi_sim.py
++++ b/test_bumi_sim.py
+@@ -17,6 +17,8 @@
+ from local_speech import LocalSpeech, PHRASES
+ from skill_bridge import SkillBridge
+ from sim_locomotion import command, integrate, gait_pose
++from detaforce_gazebo import call as rps_call
++from detaforce_motion import INVITE_TEXT
+
+
+ class GeometryTests(unittest.TestCase):
+@@ -257,6 +259,49 @@
+         self.sim.close()
+         self.temporary.cleanup()
+
++    def test_rps_refuses_active_greeting_without_cancelling_it(self):
++        self.sim.skill_session = {"session_id": "existing", "state": "running"}
++        with self.assertRaises(ValueError):
++            rps_call(self.sim, {"action": "mouse"})
++        self.assertIsNone(self.sim.worker)
++        self.assertEqual(self.sim.skill_session["state"], "running")
++        self.assertFalse(self.sim.cancel.is_set())
++
++    def test_rps_stop_does_not_cancel_another_tool(self):
++        self.sim.report["action"] = "speak"
++        self.assertFalse(rps_call(self.sim, {"action": "stop_action"})["command_sent"])
++        self.assertFalse(self.sim.cancel.is_set())
++
++    def test_rps_busy_cancel_and_finished_greeting_handoff(self):
++        self.sim.skill_session = {"session_id": "finished", "state": "completed"}
++        entered = threading.Event()
++        def run(*_):
++            entered.set()
++            self.sim.cancel.wait(2)
++            self.sim.check_cancel()
++        self.sim.run_action = run
++        result = rps_call(self.sim, {"action": "countdown"})
++        self.assertEqual(result["state"], "running")
++        self.assertTrue(entered.wait(1))
++        self.assertIsNone(self.sim.skill_session)
++        with self.assertRaises(ValueError):
++            rps_call(self.sim, {"action": "mouse"})
++        rps_call(self.sim, {"action": "stop_action"})
++        self.sim.worker.join(2)
++        self.assertEqual(self.sim.status()["state"], "cancelled")
++
++    def test_rps_arguments_are_validated_before_starting_worker(self):
++        for args in ({}, {"action": "unknown"}, {"action": "mouse", "recording_id": 1}):
++            with self.subTest(args=args), self.assertRaises(ValueError):
++                rps_call(self.sim, args)
++        self.assertIsNone(self.sim.worker)
++
++    def test_invitation_speech_whitelist_does_not_expand_greeting_speech(self):
++        with self.assertRaises(ValueError):
++            LocalSpeech(self.temporary.name).prepare(INVITE_TEXT)
++        with self.assertRaises(ValueError):
++            LocalSpeech(self.temporary.name, phrases=(INVITE_TEXT,)).prepare(PHRASES[0])
++
+     def test_invalid_action_arguments_are_rejected_before_scheduling(self):
+         for arguments in [{}, {"action": "robot_handshake"}, {"action": "approach", "target_id": True},
+                           {"action": "rotate", "angle_deg": float("nan")},

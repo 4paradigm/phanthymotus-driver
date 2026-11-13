@@ -104,6 +104,17 @@ def _config(*, loco=True, loco_servo=True, servo_config=None):
     }
 
 
+def test_detaforce_card_can_register_with_no_hardware_and_never_moves(bundle_module):
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["detaforce_rps"] = {"enabled": True, "hardware_enabled": False}
+    bundle = bundle_module.BumiDeviceBundle(config, "bumi_test", object(), None, None)
+    assert [t["name"] for t in bundle.get_all_tools()] == ["detaforce_rps"]
+    bundle.start_all()
+    assert bundle.dispatch("detaforce_rps", {"action": "invite_one"})["command_sent"] is False
+    assert bundle.dispatch("detaforce_rps", {"action": "info"})["hardware_enabled"] is False
+    bundle.stop_all()
+
+
 def test_enabled_loco_servo_registers_and_reuses_loco(bundle_module):
     high_ctrl = FakeHighCtrl()
     executor = object()
