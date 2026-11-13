@@ -1,0 +1,1 @@
+# No pip dependencies: ROS Humble base provides PyYAML, rclpy and std_msgs.
