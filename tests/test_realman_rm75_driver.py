@@ -116,6 +116,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         # block is discarded, and the same class ends up as two objects.
         from servo import RM75ServoPlugin
         from pick_place import PickPlacePlugin
+        from waypoint import WaypointPlugin
 
         calls = []
 
@@ -131,7 +132,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
             )
         self.assertEqual(
             [device.RM75SDKClient, device.RM75Plugin, device.GripperPlugin,
-             RM75ServoPlugin, device.CartesianPlugin, PickPlacePlugin, FakeCamera],
+             RM75ServoPlugin, device.CartesianPlugin, PickPlacePlugin, WaypointPlugin, FakeCamera],
             [type(plugin) for plugin in enabled],
         )
         self.assertIs(enabled[0], enabled[1].client._client)
@@ -140,11 +141,13 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         # the same arm is a second thing able to move it.
         self.assertIs(enabled[1].client, enabled[3].client)
         self.assertIs(enabled[1].client, enabled[4].client)
+        self.assertIs(enabled[1].client, enabled[6].client)
+        self.assertIs(enabled[1]._motion_lock, enabled[6]._motion_lock)
         self.assertEqual(({"enabled": True}, "rm75", ros2.executor_core), calls[0])
         disabled = device.build_plugins({}, "rm75", ros2)
         self.assertEqual(
             [device.RM75SDKClient, device.RM75Plugin, device.GripperPlugin,
-             RM75ServoPlugin, device.CartesianPlugin, PickPlacePlugin],
+             RM75ServoPlugin, device.CartesianPlugin, PickPlacePlugin, WaypointPlugin],
             [type(plugin) for plugin in disabled],
         )
 
