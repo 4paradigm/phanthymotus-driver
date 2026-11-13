@@ -4,5 +4,6 @@ opencv-python-headless
 phonemizer
 pyalsaaudio
 sounddevice
+deflate==0.9.0
 # Prebuilt SDK wheel (including Linux ARM64 / CPython 3.10).
 pyrealsense2==2.56.5.9235

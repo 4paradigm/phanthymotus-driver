@@ -14,6 +14,7 @@ wrong place. `parse_descriptor` therefore rejects rather than defaults.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 
 SCHEMA = "motus.control/1"
 
@@ -27,6 +28,8 @@ MODES = (
     "eef_pose",          # absolute end-effector pose(s), see EEF_POSE_STRIDE
     "twist",             # body twist (vx, vy, vz, wx, wy, wz)
 )
+
+RESPONSE_SOURCES = ("measured", "vendor-spec", "estimate")
 
 # ── `eef_pose` 的布局 ───────────────────────────────────────────────────────
 #
@@ -133,6 +136,16 @@ class Descriptor:
     # missing protection is visible instead of assumed. See sink.ControlSink.
     force_torque: tuple[float, ...] | None = None
     groups: tuple[Group, ...] = ()
+    # Opt-in for velocity streams: an explicitly zero axis must stop without
+    # being turned back into motion by the per-step slew clamp.
+    zero_immediate: bool = False
+    # Optional measured closed-loop response.  This belongs to the driver,
+    # beside limits and deadbands: a planner may consume it, but must never
+    # invent a robot-specific copy.  Keys name descriptor axes (for example
+    # ``wz``); each model contains gain, command-to-observation delay,
+    # settling time in seconds, and where those numbers came from.  Consumers
+    # can therefore distinguish a measurement from a vendor claim or estimate.
+    response: dict = field(default_factory=dict)
     raw: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -203,6 +216,76 @@ def _number_list(raw, *, dof: int, where: str) -> tuple[float, ...]:
     return tuple(out)
 
 
+def _parse_response(raw, *, joint_names: tuple[str, ...]) -> dict:
+    """Validate optional per-axis response measurements.
+
+    Response data is deliberately descriptive, not a control setting.  It is
+    measured by (or configured on) the hardware driver and read by a policy.
+    Requiring a complete model prevents a half-filled declaration from
+    silently acquiring planner-specific defaults.  Provenance is part of the
+    contract: an estimate must not masquerade as a measurement.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise DescriptorError("descriptor.response must be an object")
+    cleaned = {}
+    number_fields = ("gain", "delay_s", "settling_s")
+    fields = (*number_fields, "source")
+    for axis, model in raw.items():
+        if axis not in joint_names:
+            raise DescriptorError(
+                f"descriptor.response axis {axis!r} is not in joint_names"
+            )
+        if not isinstance(model, dict):
+            raise DescriptorError(f"descriptor.response.{axis} must be an object")
+        missing = [name for name in fields if name not in model]
+        unknown = [name for name in model if name not in fields]
+        if missing:
+            raise DescriptorError(
+                f"descriptor.response.{axis} is missing {', '.join(missing)}"
+            )
+        if unknown:
+            raise DescriptorError(
+                f"descriptor.response.{axis} has unknown fields {', '.join(unknown)}"
+            )
+        values = {}
+        for name in number_fields:
+            value = model[name]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise DescriptorError(
+                    f"descriptor.response.{axis}.{name} must be a finite number"
+                )
+            try:
+                value = float(value)
+            except (OverflowError, ValueError):
+                raise DescriptorError(
+                    f"descriptor.response.{axis}.{name} must be a finite number"
+                ) from None
+            if not math.isfinite(value):
+                raise DescriptorError(
+                    f"descriptor.response.{axis}.{name} must be a finite number"
+                )
+            if name == "gain" and value <= 0:
+                raise DescriptorError(
+                    f"descriptor.response.{axis}.gain must be positive"
+                )
+            if name != "gain" and value < 0:
+                raise DescriptorError(
+                    f"descriptor.response.{axis}.{name} must be non-negative"
+                )
+            values[name] = value
+        source = model["source"]
+        if source not in RESPONSE_SOURCES:
+            raise DescriptorError(
+                f"descriptor.response.{axis}.source must be one of "
+                + ", ".join(RESPONSE_SOURCES)
+            )
+        values["source"] = source
+        cleaned[axis] = values
+    return cleaned
+
+
 def parse_descriptor(raw: dict) -> Descriptor:
     """Validate a driver's declaration, or raise `DescriptorError` naming the field."""
     if not isinstance(raw, dict):
@@ -263,6 +346,12 @@ def parse_descriptor(raw: dict) -> Descriptor:
         if any(d <= 0 for d in max_delta):
             raise DescriptorError("descriptor.limits.max_delta_per_step must be positive")
 
+    zero_immediate = limits.get("zero_immediate", False)
+    if not isinstance(zero_immediate, bool):
+        raise DescriptorError("descriptor.limits.zero_immediate must be boolean")
+    if zero_immediate and mode != "twist":
+        raise DescriptorError("descriptor.limits.zero_immediate is only supported for twist")
+
     rate = _require(raw, "rate", "")
     if not isinstance(rate, dict):
         raise DescriptorError("descriptor.rate must be an object")
@@ -310,6 +399,23 @@ def parse_descriptor(raw: dict) -> Descriptor:
         raise DescriptorError("descriptor.end_effector must be an object or absent")
 
     groups = _parse_groups(raw.get("groups"), dof=dof, default_mode=mode)
+    if zero_immediate and any(group.mode != "twist" for group in groups):
+        raise DescriptorError("descriptor.limits.zero_immediate requires twist-only groups")
+    response = _parse_response(raw.get("response"), joint_names=tuple(joint_names))
+    for axis in response:
+        indices = [index for index, name in enumerate(joint_names) if name == axis]
+        if len(indices) != 1:
+            raise DescriptorError(
+                f"descriptor.response axis {axis!r} is ambiguous in joint_names"
+            )
+        index = indices[0]
+        group = next(group for group in groups
+                     if group.offset <= index < group.offset + group.count)
+        if group.mode != "twist":
+            raise DescriptorError(
+                f"descriptor.response axis {axis!r} belongs to non-twist "
+                f"group {group.name!r}"
+            )
 
     return Descriptor(
         mode=mode,
@@ -328,6 +434,8 @@ def parse_descriptor(raw: dict) -> Descriptor:
         end_effector=end_effector,
         force_torque=force_torque,
         groups=groups,
+        zero_immediate=zero_immediate,
+        response=response,
         raw=dict(raw),
     )
 
