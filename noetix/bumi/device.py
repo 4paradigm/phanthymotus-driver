@@ -413,10 +413,16 @@ class LocoPlugin:
         # Set by LocoServoPlugin at construction. `loco` is built first, so the
         # link cannot be a constructor argument in this direction.
         self._servo = None
+        # Set by WaistSwayPlugin wiring in main.py, same deferred direction.
+        self._sway = None
 
     def attach_servo(self, servo) -> None:
         """Let the streaming chassis card be paused before we drive it ourselves."""
         self._servo = servo
+
+    def attach_sway(self, sway) -> None:
+        """Let the waist sway card be told before body actions change workmode."""
+        self._sway = sway
 
     def _distance_full_scale(self):
         """Measured normalised-command-to-m/s calibration from the servo card.
@@ -466,6 +472,51 @@ class LocoPlugin:
         if self._servo is None:
             return False
         return bool(self._servo.pause_for_explicit_command(reason))
+
+    def _notify_sway_dispatch(self, tool_name: str, action: str) -> dict | None:
+        """Tell the waist sway card what is about to claim the robot.
+
+        Body tools (posture, presets, teaching) change `workmode` and need the
+        waist itself: the sway card releases and switches itself off, the same
+        "an explicit instruction outranks a background stream" rule the servo
+        preemption follows. Chassis tools keep walking — the sway keeps
+        streaming (its own documented experiment). `loco.move`'s chassis-active
+        marking lives in `_do_move_impl`, stamped only once the move is
+        actually accepted: a refused move never moves, and a label it stamped
+        would have no worker to clear it. Returns the sway card's preemption
+        report for body tools (None when no sway was active, and always None
+        for chassis tools), so the caller can say so in its own result —
+        including a release that did not actually finish.
+        """
+        if self._sway is None:
+            return None
+        if tool_name in ("stand_up_lie_prone", "semantic_action", "action_recording"):
+            return self._sway.disable_for_body_action(f"{tool_name}.{action}")
+        if action in ("stop_move", "stop"):
+            self._sway.notify_chassis_idle(f"{tool_name}.{action}")
+        return None
+
+    def _release_sway_chassis_label(self) -> None:
+        """A loco.move worker ended; the sway's idle tracking self-check may
+        resume. Ownership matches the activation: only the thread that is
+        still THE move thread clears the label, so a straggler finally (the
+        replacement's join timed out, its zero publish ran late) cannot clear
+        a label the newer loco.move already owns."""
+        sway = self._sway
+        if sway is not None and self._move_thread is threading.current_thread():
+            sway.notify_chassis_idle("loco.move")
+
+    def prepare_walk_mode(self, requester: str) -> dict:
+        """Reach workmode 2 through the documented mode edges, for a sibling card.
+
+        `waist_sway` calls this after dropping its low-level joint stream, so
+        the next high-level action finds the robot in walking mode instead of
+        whatever mode the low-level takeover left behind. Same machinery as
+        the public actions use (`_prepare_workmode`), including its
+        move/rotate cancellation semantics — a caller releasing the waist
+        mid-rotation wants that rotation stopped, same as a preset action.
+        """
+        return self._prepare_workmode(2, requester)
 
     def _set_servo_velocity_owner(self, owned: bool) -> None:
         """Transfer the shared velocity publisher after/before loco.move."""
@@ -699,6 +750,9 @@ class LocoPlugin:
             # log connecting the two.
             self._preempt_servo("loco.stop")
             self._stop_move()
+            if self._sway is not None:
+                # Chassis idle: a sway parked in waiting/suspended may re-engage.
+                self._sway.notify_chassis_idle("loco.stop")
             return {"state": "idle"}
 
         tool_name = args.pop('_tool_name', '')
@@ -739,12 +793,23 @@ class LocoPlugin:
                 self._rotate_stop_event.set()
         try:
             preempted = self._preempt_servo(f"{tool_name}.{action}")
+            # Same pre-touch rule as the servo preemption: the sway card learns
+            # about the body action before any mode edge runs, so its release
+            # and restore finish before this action's own preparation starts.
+            sway_report = self._notify_sway_dispatch(tool_name, action)
             if body_action and not self._wait_for_rotate_idle():
                 return {"state": "error", "command_sent": False,
                         "error": "rotation has not stopped; competing action was not sent"}
             result = handler()
             if preempted and isinstance(result, dict):
                 result["preempted_loco_servo"] = True
+            if sway_report and isinstance(result, dict):
+                result["preempted_waist_sway"] = True
+                if sway_report.get("release") != "ok":
+                    # The preemption flag alone would claim the waist is free;
+                    # a stuck 500 Hz stream says otherwise and belongs in the
+                    # result the operator reads.
+                    result["waist_release"] = "failed"
             return result
         finally:
             if body_action:
@@ -812,6 +877,26 @@ class LocoPlugin:
         # The servo keeps refreshing zero until this point.  From here until
         # this move's final zero, this loop is the sole velocity publisher.
         self._set_servo_velocity_owner(True)
+        # Chassis-active for the sway card is stamped here — past the mode
+        # checks and busy guards, right before the worker starts — and the
+        # worker's finally clears it (natural end, watchdog, failure, or
+        # replacement). A refused move never stamps, so no path can leak the
+        # label and permanently suppress the sway's idle tracking self-check.
+        if self._sway is not None:
+            self._sway.notify_chassis_active("loco.move")
+
+        def _end_move_stream():
+            # Both move workers end through this one epilogue — natural end,
+            # watchdog, stop, replacement, or an SDK publisher raise — so the
+            # final zero, the velocity-ownership handback and the sway chassis
+            # label release can never drift apart between the timed and
+            # continuous variants again (a review round caught exactly that
+            # drift: the continuous finally had lost the label release).
+            try:
+                self._publish_cmd(0, 0, 0, default_cmd, 0)
+            finally:
+                self._set_servo_velocity_owner(False)
+                self._release_sway_chassis_label()
 
         if duration > 0:
             # Timed move
@@ -822,12 +907,7 @@ class LocoPlugin:
                         self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
                         time.sleep(0.02)  # 50 Hz
                 finally:
-                    # Stop before returning zero refresh to the paused servo,
-                    # including if the SDK publisher itself raises.
-                    try:
-                        self._publish_cmd(0, 0, 0, default_cmd, 0)
-                    finally:
-                        self._set_servo_velocity_owner(False)
+                    _end_move_stream()
 
             self._move_thread = threading.Thread(target=_move_timed, daemon=True, name="bumi_move")
             self._move_thread.start()
@@ -841,10 +921,7 @@ class LocoPlugin:
                         self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
                         time.sleep(0.02)
                 finally:
-                    try:
-                        self._publish_cmd(0, 0, 0, default_cmd, 0)
-                    finally:
-                        self._set_servo_velocity_owner(False)
+                    _end_move_stream()
 
             self._move_thread = threading.Thread(target=_move_continuous, daemon=True, name="bumi_move")
             self._move_thread.start()
@@ -936,6 +1013,8 @@ class LocoPlugin:
                 # Rotation is already reserved, so servo start/resume sees
                 # a busy chassis before this publisher takes ownership.
                 self._preempt_servo(f"loco_relative_move.{action}")
+                if self._sway is not None:
+                    self._sway.notify_chassis_active(f"loco_relative_move.{action}")
                 owns_velocity = True
             result = self._do_rotate_impl(args) if action == "rotate" else self._do_target_impl(args)
             result["action"] = action
@@ -951,6 +1030,8 @@ class LocoPlugin:
         finally:
             if owns_velocity:
                 self._set_servo_velocity_owner(False)
+                if self._sway is not None:
+                    self._sway.notify_chassis_idle(f"loco_relative_move.{action}")
             with self._rotate_lock:
                 claimed = self._active_action_id == action_id
                 if claimed:

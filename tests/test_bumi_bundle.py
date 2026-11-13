@@ -25,17 +25,46 @@ class FakeLocoPlugin:
         self.executor = executor
         self.high_ctrl = high_ctrl
         self.servo = None
+        self.sway = None
         self.started = False
         self.stopped = False
 
     def attach_servo(self, servo):
         self.servo = servo
 
+    def attach_sway(self, sway):
+        self.sway = sway
+
     def is_moving(self):
         return False
 
     def get_tools(self):
         return [{"name": "loco", "type": "actuator"}]
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+    def dispatch(self, action, _args):
+        return {"state": action}
+
+
+class FakeWaistSwayPlugin:
+    def __init__(self, plugin_config, namespace, executor, high_ctrl,
+                 loco_plugin=None):
+        self.plugin_config = plugin_config
+        self.namespace = namespace
+        self.executor = executor
+        self.high_ctrl = high_ctrl
+        self.loco = loco_plugin
+        self.started = False
+        self.stopped = False
+        self.stop_order = None
+
+    def get_tool(self):
+        return {"name": "waist_sway", "type": "actuator"}
 
     def start(self):
         self.started = True
@@ -74,6 +103,10 @@ def bundle_module(monkeypatch):
     fake_device.LocoPlugin = FakeLocoPlugin
     fake_device.SpeakerPlugin = FakeSpeakerPlugin
     monkeypatch.setitem(sys.modules, "device", fake_device)
+
+    fake_waist_sway = types.ModuleType("waist_sway")
+    fake_waist_sway.WaistSwayPlugin = FakeWaistSwayPlugin
+    monkeypatch.setitem(sys.modules, "waist_sway", fake_waist_sway)
     monkeypatch.syspath_prepend(str(BUMI))
     previous_loco_servo = sys.modules.pop("loco_servo", None)
 
@@ -92,7 +125,7 @@ def bundle_module(monkeypatch):
         sys.modules["loco_servo"] = previous_loco_servo
 
 
-def _config(*, loco=True, loco_servo=True, servo_config=None):
+def _config(*, loco=True, loco_servo=True, servo_config=None, waist_sway=False):
     return {
         "plugins": {
             "loco": {"enabled": loco},
@@ -100,6 +133,7 @@ def _config(*, loco=True, loco_servo=True, servo_config=None):
                 "enabled": loco_servo,
                 **(servo_config or {}),
             },
+            "waist_sway": {"enabled": waist_sway},
         }
     }
 
@@ -169,4 +203,55 @@ def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
 
     assert [tool["name"] for tool in bundle.get_all_tools()] == [
         "loco", "loco_servo", "speaker"]
+
+
+def test_waist_sway_registers_and_attaches_to_both_chassis_paths(bundle_module):
+    bundle = bundle_module.BumiDeviceBundle(
+        _config(waist_sway=True), "bumi_test", object(), FakeHighCtrl(), None)
+    loco, servo, sway = bundle._plugins
+
+    assert isinstance(sway, FakeWaistSwayPlugin)
+    assert sway.loco is loco
+    assert loco.sway is sway
+    assert servo._sway is sway
+    assert [tool["name"] for tool in bundle.get_all_tools()] == [
+        "loco", "loco_servo", "waist_sway"]
+    assert bundle.dispatch("waist_sway", {"action": "info"}) == {"state": "info"}
+
+
+def test_waist_sway_is_skipped_when_disabled_or_controller_missing(bundle_module):
+    bundle = bundle_module.BumiDeviceBundle(
+        _config(waist_sway=False), "bumi_test", object(), FakeHighCtrl(), None)
+    assert [tool["name"] for tool in bundle.get_all_tools()] == [
+        "loco", "loco_servo"]
+
+
+def test_stop_all_releases_the_waist_before_the_chassis_cards(bundle_module):
+    stopped = []
+
+    class RecordingSway(FakeWaistSwayPlugin):
+        def stop(self):
+            stopped.append("waist_sway")
+            super().stop()
+
+    import waist_sway as fake_waist_sway_module
+    previous_cls = fake_waist_sway_module.WaistSwayPlugin
+    fake_waist_sway_module.WaistSwayPlugin = RecordingSway
+    try:
+        bundle = bundle_module.BumiDeviceBundle(
+            _config(waist_sway=True), "bumi_test", object(), FakeHighCtrl(), None)
+        loco, _servo, _sway = bundle._plugins
+
+        original_loco_stop = loco.stop
+
+        def recording_loco_stop():
+            stopped.append("loco")
+            original_loco_stop()
+
+        loco.stop = recording_loco_stop
+        bundle.stop_all()
+    finally:
+        fake_waist_sway_module.WaistSwayPlugin = previous_cls
+
+    assert stopped == ["waist_sway", "loco"]
 

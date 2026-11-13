@@ -6,7 +6,7 @@ hardware_model: "bumi"
 image_name: noetix-bumi
 port: 15704
 mcp_url: "http://localhost:15704/mcp"
-description: "Noetix Bumi-EDU — 麦克风、独立声源方向、扬声器、摄像头、整机运动遥测、照片与视频采集、移动、IMU 闭环目标转角、起身收纳、预设动作、动作示教与只读 RGB-D 视觉里程计"
+description: "Noetix Bumi-EDU — 麦克风、独立声源方向、扬声器、摄像头、整机运动遥测、照片与视频采集、移动、IMU 闭环目标转角、起身收纳、预设动作、动作示教、只读 RGB-D 视觉里程计，以及实验性腰部巡视摆动（SDK 低层 21 关节站立保持+腰部正弦，可与行走并发；confirm 运行时校验）"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
@@ -20,6 +20,7 @@ cards:
   - { name: loco,              type: actuator }
   - { name: loco_relative_move,       type: actuator }
   - { name: loco_servo,        type: actuator }
+  - { name: waist_sway,        type: actuator }
   - { name: stand_up_lie_prone, type: actuator }
   - { name: semantic_action,   type: actuator }
   - { name: action_recording,  type: actuator }

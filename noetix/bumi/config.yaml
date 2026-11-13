@@ -36,6 +36,15 @@ plugins:
     min_wz_rads: 0.33           # 归一化边界 0.40 × 0.83
     # 已经在走的时候的偏航死区。
     min_wz_moving_rads: 0.25    # 归一化边界 0.30 × 0.83
+  # 腰部巡视摆动卡：开始后站立/行走期间腰部 yaw 持续小幅来回转动。
+  # 与 loco 同为调用式卡片——没有部署期参数，幅度/快慢/时长在画布上调
+  # start 动作时给出（duration_s / amplitude_deg / speed 两档）。
+  # 走 SDK 低层 set_joint + 官方站立角表；semantic_action / action_recording /
+  # stand_up_lie_prone 或保护、摔倒模式会自动停止并释放腰部。
+  # 固件对高层行走与低层关节流并存的仲裁未知（详见卡片描述），首次真机
+  # 小幅度、慢档、有人看护、App 急停就绪。
+  waist_sway:
+    enabled: true
   mic:
     enabled: true
   sound_direction:
