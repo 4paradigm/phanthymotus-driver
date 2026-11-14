@@ -1117,10 +1117,13 @@ VOP/Measure connections. If Measure overlays an RGB image, set its existing
 `/camera/rgb` default guesses.
 No camera-to-body matrix or guessed calibration is introduced by this wiring.
 
-### Opt-in estimated capture-time body chain
+### Enabled estimated capture-time body chain
 
 `plugins.camera_depth.estimated_body_tf: true` enables the estimated mount
-certificate gate for the shared camera source. It defaults to false. Run
+certificate gate for the shared camera source. Tianyi's PR519 configuration
+now enables this gate by default; it does not automatically launch the separate
+read-only companion. Missing/invalid capture evidence reports body mount as
+unavailable while RGB-D and IMU remain usable. Run
 `python3 /work/estimated_body_tf.py` in the driver container after sourcing
 ROS and `/tianyi_ws/install/setup.bash`, with the vendor DDS profile and
 `PYTHONPATH=/work`. Authenticate the read-only motion-board clock probe with
