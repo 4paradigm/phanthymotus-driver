@@ -45,7 +45,7 @@ def test_clock_requires_multiple_bounded_observations():
     stamp, mapping = clock.map(1050, EPOCH + 1_060_000_000, 1_060_000_000)
     assert stamp == EPOCH + 1_051_000_000
     assert mapping['verified'] is True
-    assert mapping['uncertainty_ns'] <= 10_000_000
+    assert mapping['uncertainty_ns'] == 50_000_000
 
 
 def test_clock_does_not_use_receive_time_or_change_mapping_within_segment():
@@ -77,7 +77,7 @@ def test_clock_rejects_untrustworthy_time(change):
 
 def test_integrates_every_increment_and_uses_source_stamp_and_body_frame():
     m = module(); odom = m.IncrementalOdometry(ready_clock(m))
-    samples = odom.feed([delta(1040), delta(1050, yaw=math.pi/2), delta(1060, x=1)],
+    samples = odom.feed([delta(1040), delta(1050, yaw=math.pi/2), delta(1060, x=1), delta(1070)],
                         EPOCH+1_070_000_000, 1_070_000_000)
     last = samples[-1]
     assert last['pose']['position'] == pytest.approx([0, 1, 0], abs=1e-12)
@@ -106,8 +106,8 @@ def test_bad_batch_never_leaves_partial_integration(bad):
 def test_new_session_does_not_join_old_path():
     m = module()
     a = m.IncrementalOdometry(ready_clock(m)); b = m.IncrementalOdometry(ready_clock(m))
-    old = a.feed([delta(1040), delta(1050, x=1)], EPOCH+1_060_000_000, 1_060_000_000)[-1]
-    new = b.feed([delta(1050, x=9)], EPOCH+1_060_000_000, 1_060_000_000)[-1]
+    old = a.feed([delta(1040), delta(1050, x=1), delta(1060)], EPOCH+1_060_000_000, 1_060_000_000)[-1]
+    new = b.feed([delta(1050, x=9), delta(1060)], EPOCH+1_060_000_000, 1_060_000_000)[-1]
     assert new['pose']['position'] == [0, 0, 0]
     assert old['vendor']['motus_slam']['segment_id'] != new['vendor']['motus_slam']['segment_id']
     assert old['pose']['frame_id'] != new['pose']['frame_id']
@@ -162,7 +162,7 @@ def test_worker_integrates_batches_then_publishes_lost_on_disconnect(monkeypatch
             calls[0] += 1
             if calls[0] > 1: raise ConnectionError('disconnected')
             stamp=(time.time_ns()-EPOCH)//1_000_000
-            return [delta(stamp-20),delta(stamp-10,x=.1),delta(stamp,x=.2)]
+            return [delta(stamp-30),delta(stamp-20,x=.1),delta(stamp-10,x=.2),delta(stamp)]
     monkeypatch.setattr(m, 'DiagnosticClient', Client)
     source=m.OdometrySource('http://robot:1448',20,published.append)
     source.start()
@@ -320,10 +320,10 @@ def test_publish_deadline_does_not_skip_frames_due_to_read_latency_jitter(monkey
 
 def test_uncertain_clock_interval_is_not_evidence_of_clock_drift():
     m=module(); clock=ready_clock(m)
-    # The frozen offset remains inside this interval. It is too wide to
-    # refresh the 5 ms verification budget, but does not prove clock drift.
+    # This interval overlaps the 25 ms verification budget but is not
+    # contained by it; it cannot prove either validity or excessive drift.
     with pytest.raises(m.ClockObservationRejected):
-        clock.observe(1100, EPOCH+1_100_000_000, EPOCH+1_106_000_000, 1_100_000_000)
+        clock.observe(1100, EPOCH+1_120_000_000, EPOCH+1_126_000_000, 1_120_000_000)
     assert clock._observed==1_040_000_000
     clock.observe(1150, EPOCH+1_150_000_000, EPOCH+1_152_000_000, 1_150_000_000)
     assert clock.offset==EPOCH+1_000_000
@@ -332,7 +332,7 @@ def test_uncertain_clock_interval_is_not_evidence_of_clock_drift():
 def test_clock_interval_proving_drift_is_fatal():
     m=module(); clock=ready_clock(m)
     with pytest.raises(ValueError, match='drift') as error:
-        clock.observe(1110, EPOCH+1_100_000_000, EPOCH+1_102_000_000, 1_100_000_000)
+        clock.observe(1140, EPOCH+1_100_000_000, EPOCH+1_102_000_000, 1_100_000_000)
     assert not isinstance(error.value,m.ClockObservationRejected)
 
 
@@ -360,3 +360,46 @@ def test_rejected_clock_probe_retries_on_next_drain_without_extending_expiry(mon
     source._run()
     assert 0 < observed[6]-observed[5] <= .1
     assert all(s['pose'] is not None for s in published)
+
+
+def test_equal_stamps_across_reads_preserve_all_increments_without_duplicate_output():
+    m=module(); odom=m.IncrementalOdometry(ready_clock(m))
+    first=odom.feed([delta(1040),delta(1050,x=1,yaw=math.pi/2)],
+                    EPOCH+1_060_000_000,1_060_000_000)
+    assert [s['vendor']['source_stamp_ms'] for s in first]==[1040]
+    second=odom.feed([delta(1050,x=2),delta(1060)],EPOCH+1_070_000_000,1_070_000_000)
+    assert len(second)==1
+    assert second[0]['pose']['position']==pytest.approx([1,2,0])
+    assert second[0]['vendor']['source_stamp_ms']==1050
+    assert second[0]['vendor']['motus_slam']['source_events_in_group']==2
+    assert second[0]['twist'][:2]==pytest.approx([100,200])
+    assert second[0]['vendor']['motus_slam']['measurement']['mapping']['uncertainty_ns']==50_000_000
+    assert odom.feed([],EPOCH+1_080_000_000,1_080_000_000)==[]
+
+
+def test_fifty_ms_budget_accepts_observed_offset_change_but_rejects_excess():
+    m=module(); clock=ready_clock(m)
+    clock.observe(1100,EPOCH+1_110_000_000,EPOCH+1_113_000_000,1_110_000_000)
+    assert clock.map(1100,EPOCH+1_114_000_000,1_114_000_000)[1]['uncertainty_ns']==50_000_000
+    with pytest.raises(ValueError,match='drift'):
+        clock.observe(1150,EPOCH+1_210_000_000,EPOCH+1_213_000_000,1_210_000_000)
+
+
+def test_pending_group_is_revalidated_before_emitting_after_a_delayed_read():
+    m=module(); odom=m.IncrementalOdometry(ready_clock(m))
+    odom.feed([delta(1040),delta(1050,x=1)],EPOCH+1_060_000_000,1_060_000_000)
+    with pytest.raises(ValueError,match='stale'):
+        odom.feed([delta(1150)],EPOCH+1_310_000_000,1_310_000_000)
+    assert odom.status()['status']=='lost'
+    assert odom._pose==(0.,0.,0.)
+
+
+def test_identical_nonzero_events_are_composed_and_closed_groups_cannot_be_replayed():
+    m=module(); odom=m.IncrementalOdometry(ready_clock(m))
+    samples=odom.feed([delta(1040),delta(1050,x=.1),delta(1050,x=.1),delta(1060)],
+                      EPOCH+1_070_000_000,1_070_000_000)
+    assert samples[-1]['pose']['position']==pytest.approx([.2,0,0])
+    assert samples[-1]['vendor']['motus_slam']['source_events_in_group']==2
+    with pytest.raises(ValueError,match='reorder'):
+        odom.feed([delta(1050,x=.1)],EPOCH+1_080_000_000,1_080_000_000)
+    assert odom.status()['status']=='lost'

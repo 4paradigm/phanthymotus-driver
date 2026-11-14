@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 TOPIC = 'base/deadreckon_with_gyro_yaw'
 CLOCK_ID = 'host_realtime'
-UNCERTAINTY_NS = 10_000_000
+UNCERTAINTY_NS = 50_000_000
 MAX_AGE_NS = 250_000_000
 
 
@@ -86,13 +86,15 @@ class ClockMapping:
 class IncrementalOdometry:
     """Compose body-frame planar displacement increments in acquisition order.
 
-    The first event establishes the origin; its pre-subscription displacement
-    is deliberately discarded. An invalid batch retires the entire segment.
+    The first timestamp group establishes the origin; its pre-subscription
+    displacement is discarded. Equal-stamped increments retain delivery order.
+    An invalid batch retires the entire segment.
     """
     def __init__(self, clock):
         self.clock = clock
         self.segment = uuid.uuid4().hex
         self._last = None
+        self._pending = []
         self._pose = (0., 0., 0.)
         self._state = 'waiting'
         self._reason = 'waiting for source increments'
@@ -103,6 +105,7 @@ class IncrementalOdometry:
 
     def lost(self, reason):
         self._state, self._reason = 'lost', str(reason)
+        self._pending = []
         return {'schema': 'motus.odom/1', 'stamp_ms': None, 'frame': 'body',
                 'units': {'linear': 'm/s', 'angular': 'rad/s', 'length': 'm'},
                 'twist': [None] * 6, 'pose': None,
@@ -115,7 +118,10 @@ class IncrementalOdometry:
                 raise ValueError('lost segment requires a new subscription')
             if not isinstance(messages, list):
                 raise ValueError('diagnostic batch must be a list')
-            parsed, previous = [], self._last
+            if self._pending:
+                self.clock.map(self._pending[0][0], now_ns, monotonic_ns)
+            parsed = list(self._pending)
+            previous = parsed[-1][0] if parsed else self._last
             for message in messages:
                 stamp = message['timestamp']
                 payload = message['payload']
@@ -126,24 +132,41 @@ class IncrementalOdometry:
                 if any(isinstance(v, bool) or not isinstance(v, (int, float)) or
                        not math.isfinite(v) for v in (dx, dy, dyaw)):
                     raise ValueError('invalid displacement increment')
-                if previous is not None and not 0 < stamp - previous <= 100:
-                    raise ValueError('source increment duplicate, reorder or gap')
+                if previous is not None and not 0 <= stamp - previous <= 100:
+                    raise ValueError('source increment reorder or gap')
                 mapped, mapping = self.clock.map(stamp, now_ns, monotonic_ns)
                 parsed.append((stamp, mapped, mapping, dx, dy, dyaw))
                 previous = stamp
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             self.lost(str(exc))
             raise ValueError(str(exc)) from exc
+        groups = []
+        for event in parsed:
+            if not groups or groups[-1][0][0] != event[0]:
+                groups.append([])
+            groups[-1].append(event)
+        # Hold the newest timestamp until a later source event closes its group.
+        # This also handles equal timestamps split across TCP reads. exact_once
+        # subscription order is preserved; no increment is deduplicated.
+        self._pending = groups.pop() if groups else []
         samples = []
-        for stamp, mapped, mapping, dx, dy, dyaw in parsed:
+        for group in groups:
+            stamp, mapped, mapping = group[0][:3]
             x, y, yaw = self._pose
             twist = [None] * 6
             if self._last is not None:
                 dt = (stamp - self._last) / 1000.
-                x += math.cos(yaw) * dx - math.sin(yaw) * dy
-                y += math.sin(yaw) * dx + math.cos(yaw) * dy
-                yaw = math.atan2(math.sin(yaw + dyaw), math.cos(yaw + dyaw))
-                twist = [dx / dt, dy / dt, None, None, None, dyaw / dt]
+                origin_x, origin_y, origin_yaw = x, y, yaw
+                total_yaw = 0.
+                for _, _, _, dx, dy, dyaw in group:
+                    x += math.cos(yaw) * dx - math.sin(yaw) * dy
+                    y += math.sin(yaw) * dx + math.cos(yaw) * dy
+                    yaw = math.atan2(math.sin(yaw + dyaw), math.cos(yaw + dyaw))
+                    total_yaw += dyaw
+                dx, dy = x - origin_x, y - origin_y
+                vx = (math.cos(origin_yaw)*dx + math.sin(origin_yaw)*dy) / dt
+                vy = (-math.sin(origin_yaw)*dx + math.cos(origin_yaw)*dy) / dt
+                twist = [vx, vy, None, None, None, total_yaw / dt]
             self._last, self._pose = stamp, (x, y, yaw)
             self._state, self._reason = 'tracking', ''
             frame = self.segment + '_odom'
@@ -164,6 +187,9 @@ class IncrementalOdometry:
                                        'motus_slam': {**self.status(), 'stamp_source': 'measurement',
                                                       'clock_id': CLOCK_ID, 'planar': True,
                                                       'pose_reference': 'chassis_odometry',
+                                                      'synchronization': 'bounded_software',
+                                                      'timestamp_semantics': 'diagnostic_event_group',
+                                                      'source_events_in_group': len(group),
                                                       'measurement': measurement}}})
         return samples
 

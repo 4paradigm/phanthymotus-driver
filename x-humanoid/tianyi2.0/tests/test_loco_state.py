@@ -595,3 +595,9 @@ def test_diagnostic_publish_keeps_source_pose_time_and_quality():
     assert out["stamp_ms"] == 1234
     assert out["pose"] is None
     assert out["vendor"]["motus_slam"]["status"] == "lost"
+
+
+def test_info_declares_approved_software_clock_budget():
+    info=plugin().dispatch('info', {})['slam_odometry']
+    assert info['synchronization']=='bounded_software'
+    assert info['clock_mapping_budget_ms']==50

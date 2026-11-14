@@ -18,7 +18,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from std_msgs.msg import String
 
 from common.odom import build_interface, build_sample, mean_twist, resolve_stamp_ms
-from loco_odometry import OdometrySource, CLOCK_ID
+from loco_odometry import OdometrySource, CLOCK_ID, UNCERTAINTY_NS
 
 
 class _LocoStateClient:
@@ -469,7 +469,9 @@ class LocoStatePlugin:
             return {"state": state,
                     "topic_out": self.get_tool()["topic_out"],
                     "odom_interface": copy.deepcopy(self._odom_interface),
-                    "slam_odometry": {**self._odometry.info(), "clock_id": CLOCK_ID},
+                    "slam_odometry": {**self._odometry.info(), "clock_id": CLOCK_ID,
+                                      "synchronization": "bounded_software",
+                                      "clock_mapping_budget_ms": UNCERTAINTY_NS // 1_000_000},
                     "available": latest["available"], "samples": samples,
                     "sampling": {"pose_speed_hz": self._hz,
                                  "imu_hz": self._imu_hz,

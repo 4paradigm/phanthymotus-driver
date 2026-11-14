@@ -115,9 +115,9 @@ The standard port uses a separate read-only TCP subscription on port 1445 to
 `plugins.loco_state.hz`. The diagnostic queue is drained at least 20 Hz even
 when publication is slower. Planar integration treats XY as body-frame increments;
 this convention still requires a measured moving-robot acceptance test. The
-first increment establishes a fresh origin. Pose position is `[x, y, 0]`,
-quaternion is XYZW, and covariance is null. `twist` is the latest increment
-divided by its source interval, with unmeasured axes null; it is distinct from
+first timestamp group establishes a fresh origin. Pose position is `[x, y, 0]`,
+quaternion is XYZW, and covariance is null. `twist` is the group displacement
+divided by its distinct-source-time interval, with unmeasured axes null; it is distinct from
 the REST velocity retained under `vendor`.
 
 The diagnostic event's uptime timestamp is mapped to host realtime using five
@@ -128,7 +128,7 @@ two seconds without an accepted clock probe invalidates it. An interval proving
 the mapping is outside its budget invalidates the segment immediately.
 Each sample retains the original
 source milliseconds and the mapping in `vendor.motus_slam.measurement`;
-`stamp_ms` is mapped source time, never TCP receipt time. The declared 10 ms
+`stamp_ms` is mapped source time, never TCP receipt time. The user-selected 50 ms
 uncertainty is a software clock-mapping budget, not a bound on sensor acquisition
 latency or hardware synchronization. REST pose and speed receive times remain
 separate telemetry and are never used as a SLAM fallback.
@@ -136,7 +136,8 @@ separate telemetry and are never used as a SLAM fallback.
 `info().odom_interface` declares `slam_pose = {"available": true,
 "profile": "motus_slam/1"}`, `provides = ["vx", "vy", "wz"]`,
 `pose_drift = "unbounded"` and `timing.stamp_source = "robot"`.
-`info().slam_odometry` reports the current tracking/lost state and reason.
+`info().slam_odometry` reports the current tracking/lost state and reason,
+`synchronization = "bounded_software"` and `clock_mapping_budget_ms = 50`.
 The message uses the existing `motus.odom/1` JSON format, not ROS
 `nav_msgs/Odometry`. `pose.frame_id` identifies a unique odometry segment and
 `child_frame_id` is `base_link`; `frame = "body"` describes the twist.
@@ -146,16 +147,27 @@ Connect `state/odom` to the SLAM card's odometry input. The pose includes the
 The point cloud must independently have a verified clock relationship and a
 measured transform to the chassis reference; this adapter does not invent a
 camera mount transform or mark the native cloud's unknown timing as verified.
-Timestamp rollback, duplicate/reordered increments, gaps over 100 ms, data older
+Timestamp rollback, reordered increments, gaps over 100 ms, data older
 than 250 ms, disconnects, or failed clock checks publish `lost` with null pose
 and twist. Recovery creates a new segment and origin, preventing interpolation
-across a reset. Loaded on-robot probes have triggered these loss states;
-continuous production mapping still needs acceptance under the full sensor load.
+across a reset. A stationary ten-minute native-cloud load probe in 50 ms
+software mode completed without loss or segment resets. Moving-robot mapping
+and production deployment still require acceptance; the observed publication
+interval reached 200 ms, independently of the clock-mapping budget.
 The diagnostic source has emitted distinct events with identical millisecond
 timestamps, including different IMU payloads. These are source event timestamps,
-not proven unique hardware acquisition times. Duplicate increment stamps remain
-a loss condition: silently deduplicating or inventing intermediate timestamps
-could discard motion or falsely claim strict synchronization.
+not proven unique hardware acquisition times. In bounded software mode, equal
+source timestamps form a group; every increment is composed in subscription
+order, including equal timestamps split across reads. The newest group is held
+until a later timestamp closes it, then one final pose is emitted with the
+original group timestamp. No intermediate timestamps are invented and identical
+increments are not deduplicated. This adds one group of buffering and relies on
+the requested `exact_once` subscription delivering ordered increment records;
+the SDK does not expose a per-message sequence to independently detect replay.
+`vendor.motus_slam` includes `timestamp_semantics = "diagnostic_event_group"`
+and `source_events_in_group`. The 50 ms clock-mapping budget does not bound
+hardware acquisition latency or this buffering delay. Reconnect still starts a
+new trajectory segment.
 
 `displacement` is calculated from the first valid odometry pose during this
 driver instance. It contains `origin`, XYZ `translation` in the odom frame,
