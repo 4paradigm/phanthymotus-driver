@@ -125,6 +125,35 @@ def test_subscriptions_are_bridged_unconditionally():
         assert bp.should_bridge_subscription(topic)
 
 
+def test_outbound_publish_reports_when_bridge_is_unavailable(sock_dir, monkeypatch):
+    monkeypatch.setattr(bp.BridgedPublisher, "SOCKET_DIR", str(sock_dir))
+    publisher = bp.BridgedPublisher(
+        node=types.SimpleNamespace(), msg_type=FakeMsg, topic="/depth",
+        qos=QOS.QoSProfile())
+    assert publisher.publish(b"frame") is False
+
+
+def test_outbound_publish_reports_an_accepted_frame():
+    writes = []
+    publisher = object.__new__(bp.BridgedPublisher)
+    publisher._connected = True
+    publisher._socket = types.SimpleNamespace(sendall=writes.append)
+    publisher._send_lock = threading.Lock()
+    publisher._connect_lock = threading.Lock()
+    publisher._msg_count = 0
+    publisher.topic = "/depth"
+    assert publisher.publish(b"frame") is True
+    assert b"frame" in writes
+
+
+def test_integer_qos_shorthand_is_normalized_for_bridge_metadata():
+    """Several legacy cards pass create_publisher(..., 10), not QoSProfile."""
+    assert bp._qos_metadata(10) == {
+        "reliability": "best_effort",
+        "depth": 10,
+    }
+
+
 # ── the protocol ─────────────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -139,6 +168,7 @@ def sock_dir():
 @pytest.fixture
 def bridge(sock_dir, monkeypatch):
     """A real Unix socket standing in for socket_bridge.py."""
+    monkeypatch.setattr(bp.BridgedPublisher, "SOCKET_DIR", str(sock_dir))
     monkeypatch.setattr(bp.BridgedSubscription, "SOCKET_DIR", str(sock_dir))
     monkeypatch.setattr(bp.BridgedSubscription, "RETRY_S", 0.01)
     path = sock_dir / bp.BridgedSubscription.MAIN_SOCKET
@@ -190,6 +220,24 @@ def test_the_metadata_frame_says_inbound_and_carries_the_qos(bridge):
     assert metadata["msg_type"] == "std_msgs/msg/FakeMsg"
     assert metadata["qos"] == {"reliability": "best_effort", "depth": 1}
     subscription.destroy()
+
+
+def test_outbound_metadata_preserves_the_requested_queue_depth(bridge):
+    """camera_depth's depth=1 must survive the cross-domain hop."""
+    state, thread = bridge
+    publisher = bp.BridgedPublisher(
+        node=types.SimpleNamespace(), msg_type=FakeMsg,
+        topic="/nvidia_desktop/camera/head/depth/visual_depth",
+        qos=QOS.QoSProfile(
+            reliability=QOS.ReliabilityPolicy.BEST_EFFORT, depth=1),
+    )
+    thread.join(timeout=5)
+
+    assert state["metadata"]["qos"] == {
+        "reliability": "best_effort",
+        "depth": 1,
+    }
+    publisher.destroy()
 
 
 def test_a_forwarded_message_reaches_the_callback(bridge):
@@ -287,6 +335,172 @@ def _server_module():
                          ("yaml", yaml_mod)):
         sys.modules.setdefault(name, module)
     return importlib.import_module("socket_bridge")
+
+
+class _ServerNode:
+    """Small Node surface for exercising the outbound bridge handler."""
+
+    published = None
+
+    def __init__(self, *args, **kwargs):
+        self.created_qos = None
+
+    def create_publisher(self, msg_class, topic, qos):
+        self.created_qos = qos
+        messages = []
+        self.published = messages
+        return types.SimpleNamespace(publish=messages.append)
+
+
+class _Executor:
+    def add_node(self, node):
+        self.node = node
+
+
+def test_hardware_depth_is_raw_relayed_with_depth_one_qos(monkeypatch):
+    server = _server_module()
+    monkeypatch.setattr(server, "Node", _ServerNode)
+    monkeypatch.setattr(
+        server, "QoSProfile", lambda **kwargs: types.SimpleNamespace(**kwargs))
+    payload = bytes(range(256)) * 1200
+    handler = server.TopicHandler(
+        "/nvidia_desktop/camera/head/depth/visual_depth",
+        "std_msgs/msg/FakeMsg", object(), _Executor(),
+        {"reliability": "best_effort", "depth": 1},
+    )
+
+    handler.publish(payload)
+
+    assert handler.node.published == [payload]
+    assert handler.node.published[0] is payload
+    assert handler.node.created_qos.depth == 1
+    assert handler.msg_count == 1
+    assert handler.max_publish_ms >= 0
+
+
+def test_other_outbound_topics_keep_the_historical_queue_depth(monkeypatch):
+    server = _server_module()
+    monkeypatch.setattr(server, "Node", _ServerNode)
+    handler = server.TopicHandler(
+        "/nvidia_desktop/state/odom", "std_msgs/msg/FakeMsg",
+        object(), _Executor(), {"depth": 1},
+    )
+    assert handler.node.created_qos is server.BEST_EFFORT_QOS
+
+
+def test_publish_error_does_not_log_raw_cdr_bytes(monkeypatch, capsys):
+    server = _server_module()
+    monkeypatch.setattr(server, "Node", _ServerNode)
+    handler = server.TopicHandler(
+        "/nvidia_desktop/state/odom", "std_msgs/msg/FakeMsg",
+        object(), _Executor(), {"depth": 1},
+    )
+    payload = b"raw-cdr-content-must-not-be-logged"
+
+    def fail_publish(_):
+        raise ValueError("publish failed")
+
+    handler.pub = types.SimpleNamespace(publish=fail_publish)
+    handler.publish(payload)
+    output = capsys.readouterr()
+    assert "serialized length" in output.out
+    assert payload.decode() not in output.out + output.err
+    assert "first 100 bytes" not in output.out
+
+
+def test_slow_warning_does_not_flag_intentionally_low_rate_topics(
+        monkeypatch, capsys):
+    server = _server_module()
+    monkeypatch.setattr(server, "Node", _ServerNode)
+    handler = server.TopicHandler(
+        "/nvidia_desktop/state/battery", "std_msgs/msg/FakeMsg",
+        object(), _Executor(), {"depth": 1},
+    )
+    handler._last_receive_ts = server.time.monotonic() - 1.0
+
+    handler.publish(b"battery")
+
+    assert "SLOW" not in capsys.readouterr().out
+
+
+def test_slow_publish_logs_first_event_then_samples_until_recovery(monkeypatch, capsys):
+    server = _server_module()
+    monkeypatch.setattr(server, "Node", _ServerNode)
+    clock = types.SimpleNamespace(now=100.0, duration=0.125)
+    monkeypatch.setattr(server.time, "monotonic", lambda: clock.now)
+    handler = server.TopicHandler(
+        "/nvidia_desktop/state/odom", "std_msgs/msg/FakeMsg",
+        object(), _Executor())
+
+    def publish(payload):
+        handler.node.published.append(payload)
+        clock.now += clock.duration
+
+    handler.pub.publish = publish
+    for at, expected_logs in ((100.0, 1), (100.5, 0), (104.9, 0), (105.0, 1)):
+        clock.now = at
+        handler.publish(b"slow")
+        assert capsys.readouterr().out.count("SLOW") == expected_logs
+    clock.now, clock.duration = 105.2, 0.0
+    handler.publish(b"recovered")
+    assert "SLOW" not in capsys.readouterr().out
+    clock.now, clock.duration = 105.3, 0.125
+    handler.publish(b"slow-again")
+    assert capsys.readouterr().out.count("SLOW") == 1
+    assert handler.node.published == [b"slow"] * 4 + [b"recovered", b"slow-again"]
+    assert handler.msg_count == 6 and handler.max_publish_ms == 125.0
+
+
+def test_depth_receive_gap_warnings_are_throttled_per_topic(monkeypatch, capsys):
+    server = _server_module()
+    monkeypatch.setattr(server, "Node", _ServerNode)
+    clock = types.SimpleNamespace(now=100.0)
+    monkeypatch.setattr(server.time, "monotonic", lambda: clock.now)
+    handlers = [server.TopicHandler(
+        f"/{host}/camera/head/depth/visual_depth", "std_msgs/msg/FakeMsg",
+        object(), _Executor()) for host in ("one", "two")]
+    for handler in handlers:
+        handler._last_receive_ts = 99.0
+        handler.publish(b"depth")
+        assert capsys.readouterr().out.count("SLOW") == 1
+    for at, expected_logs in ((101.0, 0), (104.5, 0), (105.0, 1)):
+        clock.now = at
+        for handler in handlers:
+            handler.publish(b"depth")
+            assert capsys.readouterr().out.count("SLOW") == expected_logs
+    assert all(handler.msg_count == 4 for handler in handlers)
+
+
+def test_exact_reader_reassembles_split_header_and_large_payload():
+    server = _server_module()
+    left, right = socket.socketpair()
+    payload = bytes(range(256)) * 1200
+
+    def write_in_fragments():
+        framed = struct.pack("<I", len(payload)) + payload
+        for offset in range(0, len(framed), 997):
+            left.sendall(framed[offset:offset + 997])
+        left.close()
+
+    writer = threading.Thread(target=write_in_fragments, daemon=True)
+    writer.start()
+    header = server._recv_exact(right, 4)
+    assert struct.unpack("<I", header)[0] == len(payload)
+    assert server._recv_exact(right, len(payload)) == payload
+    writer.join(timeout=5)
+    right.close()
+
+
+def test_fastdds_async_mode_is_selected_before_participant_creation(
+        monkeypatch):
+    server = _server_module()
+    monkeypatch.setenv("RMW_FASTRTPS_USE_QOS_FROM_XML", "1")
+    monkeypatch.setenv("RMW_FASTRTPS_PUBLICATION_MODE", "SYNCHRONOUS")
+
+    server._configure_fastdds_publication()
+
+    assert os.environ["RMW_FASTRTPS_PUBLICATION_MODE"] == "ASYNCHRONOUS"
+    assert "RMW_FASTRTPS_USE_QOS_FROM_XML" not in os.environ
 
 
 def test_the_server_can_serialize_what_it_forwards():
