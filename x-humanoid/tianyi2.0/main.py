@@ -272,7 +272,9 @@ class DualDomainROS2:
         # Domain 0: the tianyi body controller, on 192.168.41.x.
         self.ctx_tianyi = Context()
         rclpy.init(context=self.ctx_tianyi, domain_id=0)
-        self.executor_tianyi = rclpy.executors.MultiThreadedExecutor(context=self.ctx_tianyi)
+        # The multithreaded body executor starves Python camera/IMU workers
+        # under mixed sensor load; serial callbacks avoid its GIL contention.
+        self.executor_tianyi = rclpy.executors.SingleThreadedExecutor(context=self.ctx_tianyi)
 
         # Domain 42: Agent Core, on this same host. `/remote_control/message` carries
         # *commands* and DDS has no addressing, so every ROS_DOMAIN_ID=42 subscriber on
@@ -288,11 +290,12 @@ class DualDomainROS2:
     def start_spin(self):
         """Start spinning both executors in background threads."""
         def _spin(executor, name):
-            try:
-                while rclpy.ok(context=executor.context):
+            while rclpy.ok(context=executor.context):
+                try:
                     executor.spin_once(timeout_sec=0.1)
-            except Exception:
-                pass
+                except Exception as error:
+                    if rclpy.ok(context=executor.context):
+                        print(f"[ros2] {name} callback failed: {error}", flush=True)
             print(f"[ros2] {name} spin exited")
 
         t1 = threading.Thread(target=_spin, args=(self.executor_tianyi, "domain0"), daemon=True)
@@ -316,6 +319,12 @@ class TianyiDeviceBundle:
         self._cfg = cfg
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
+        rgbd_source = None
+        if any(plugins_cfg.get(name, {}).get("enabled", False) for name in ("camera", "camera_depth", "imu")):
+            from rgbd_camera import RgbdCameraPlugin, RgbdInputCard
+            rgbd_source = RgbdCameraPlugin(
+                {"imu_enabled": plugins_cfg.get("imu", {}).get("enabled", False),
+                 "hz": plugins_cfg.get("camera_depth", {}).get("hz", 8)}, namespace, ros2, managed=True)
 
         if plugins_cfg.get("state", {}).get("enabled", False):
             from device import StatePlugin
@@ -327,8 +336,13 @@ class TianyiDeviceBundle:
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
-            self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
+            self._plugins.append(RgbdInputCard(rgbd_source, 'color',
+                CameraPlugin(plugins_cfg["camera"], namespace, ros2, monitor_only=True)))
             print("[bundle] CameraPlugin loaded")
+
+        if plugins_cfg.get("camera_depth", {}).get("enabled", False):
+            self._plugins.append(RgbdInputCard(rgbd_source, 'depth'))
+            print("[bundle] shared calibrated depth loaded")
 
         if plugins_cfg.get("camera_snapshot", {}).get("enabled", False):
             from device import CameraSnapshotPlugin
@@ -343,13 +357,13 @@ class TianyiDeviceBundle:
             print("[bundle] WristCameraPlugin loaded (multi-instance)")
 
         for config_name, class_name in (("imu", "ImuPlugin"),
-                                        ("camera_depth", "DepthCameraPlugin"),
                                         ("camera_pointcloud", "PointCloudPlugin")):
             if plugins_cfg.get(config_name, {}).get("enabled", False):
-                from device import ImuPlugin, DepthCameraPlugin, PointCloudPlugin
-                plugin_class = {"ImuPlugin": ImuPlugin, "DepthCameraPlugin": DepthCameraPlugin,
+                from device import ImuPlugin, PointCloudPlugin
+                plugin_class = {"ImuPlugin": ImuPlugin,
                                 "PointCloudPlugin": PointCloudPlugin}[class_name]
-                self._plugins.append(plugin_class(plugins_cfg[config_name], namespace, ros2))
+                plugin = plugin_class(plugins_cfg[config_name], namespace, ros2)
+                self._plugins.append(RgbdInputCard(rgbd_source, 'imu', plugin) if config_name == 'imu' else plugin)
                 print(f"[bundle] {class_name} loaded")
 
         if plugins_cfg.get("asr", {}).get("enabled", False):

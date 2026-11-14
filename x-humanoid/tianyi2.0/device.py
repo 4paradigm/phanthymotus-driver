@@ -946,8 +946,9 @@ class StatePlugin:
 class CameraPlugin:
     """Orbbec 头部 RGB 相机 — 独立编码线程避免阻塞executor"""
 
-    def __init__(self, plugin_config: dict, namespace: str, ros2):
+    def __init__(self, plugin_config: dict, namespace: str, ros2, *, monitor_only=False):
         self._ns = namespace
+        self._monitor_only = monitor_only
         self._ros2 = ros2
         self._topic = f"/{namespace}/camera/head"
         self._running = False
@@ -979,8 +980,9 @@ class CameraPlugin:
         self._sub_node = Node("tianyi2_camera_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
-        self._pub_node = Node("tianyi2_camera_pub", context=ros2.ctx_core)
-        ros2.executor_core.add_node(self._pub_node)
+        if not self._monitor_only:
+            self._pub_node = Node("tianyi2_camera_pub", context=ros2.ctx_core)
+            ros2.executor_core.add_node(self._pub_node)
 
     def get_tool(self) -> dict:
         return {
@@ -1048,7 +1050,7 @@ class CameraPlugin:
                 self._last_encode_error = ""
 
             # Publish JPEG as CompressedImage
-            if self._pub is None:
+            if not self._monitor_only and self._pub is None:
                 self._pub = self._pub_node.create_publisher(CompressedImage, self._topic, _LOW_LAT_QOS)
 
             # Subscribe - callback just grabs the frame, doesn't encode
@@ -1063,7 +1065,9 @@ class CameraPlugin:
             self._watchdog_gave_up = False
 
             # Separate encoding thread - avoids blocking executor
-            if previous is not None and previous.is_alive():
+            if self._monitor_only:
+                pass  # The shared calibrated producer owns JPEG publication.
+            elif previous is not None and previous.is_alive():
                 # Refused to exit within the grace period. It observes the flag
                 # we just re-armed and resumes, so don't stack a second one.
                 print("[CameraPlugin] WARNING: previous encode thread still running, reusing it")
@@ -1078,7 +1082,8 @@ class CameraPlugin:
                     name="tianyi2-camera-watchdog")
                 self._watchdog_thread.start()
 
-            print("[CameraPlugin] subscription + encode thread created", flush=True)
+            print("[CameraPlugin] camera monitor armed" if self._monitor_only else
+                  "[CameraPlugin] subscription + encode thread created", flush=True)
 
     @staticmethod
     def _ensure_orbbec_service():
@@ -1224,6 +1229,8 @@ else:
             return
         # 看门狗的唯一存活信号。放在锁外、只写一个 float —— 这是 30fps 的路径。
         self._last_frame_at = time.time()
+        if self._monitor_only:
+            return
         with self._frame_lock:
             if self._running:
                 self._latest_frame = (msg, getattr(self, "_frame_generation", 0))
@@ -1834,6 +1841,8 @@ class ImuPlugin(_JsonSensor):
             "reason": "waiting_for_upstream_imu",
         }
         self._subscriptions = []  # Keep rclpy subscriptions alive for the plugin lifetime.
+        self._pub_thread = None
+        self._publish_lock = threading.RLock()
         self._camera_acceleration = None
         self._camera_acceleration_timestamp_ms = None
         self._camera_angular_velocity = None
@@ -1860,13 +1869,20 @@ class ImuPlugin(_JsonSensor):
         are emitted.
         """
         from sensor_msgs.msg import Imu as RosImu
+        if self._running:
+            return
+        if self._pub_thread is not None:
+            self._pub_thread.join(timeout=1)
+            if self._pub_thread.is_alive():
+                raise RuntimeError('IMU display worker did not stop')
         self._running = True
-        self._subscriptions = [
-            self._sub_node.create_subscription(
-                RosImu, "/ob_camera_head/accel/sample", self._on_camera_accel, _LOW_LAT_QOS),
-            self._sub_node.create_subscription(
-                RosImu, "/ob_camera_head/gyro/sample", self._on_camera_gyro, _LOW_LAT_QOS),
-        ]
+        if not self._subscriptions:
+            self._subscriptions = [
+                self._sub_node.create_subscription(
+                    RosImu, "/ob_camera_head/accel/sample", self._on_camera_accel, _LOW_LAT_QOS),
+                self._sub_node.create_subscription(
+                    RosImu, "/ob_camera_head/gyro/sample", self._on_camera_gyro, _LOW_LAT_QOS),
+            ]
         # Match StatePlugin/force_sensor behaviour: publish a snapshot even
         # while the vendor IMU stream is unavailable, so Agent Core renders a
         # useful card state instead of an empty panel.
@@ -1875,42 +1891,49 @@ class ImuPlugin(_JsonSensor):
         print("[ImuPlugin] subscribed: /ob_camera_head/accel/sample, /ob_camera_head/gyro/sample")
 
     def stop(self):
-        self._running = False
+        with self._publish_lock:
+            self._running = False
+        if self._pub_thread is not None:
+            self._pub_thread.join(timeout=1)
 
     def _publish_camera_imu(self):
         """Publish only the samples actually received from the camera."""
-        if not self._running:
-            return
-        timestamps = [ts for ts in (
-            self._camera_acceleration_timestamp_ms,
-            self._camera_angular_velocity_timestamp_ms,
-        ) if ts is not None]
-        if not timestamps:
-            return
-        payload = {"available": True, "timestamp_ms": max(timestamps)}
-        if self._camera_acceleration is not None:
-            payload["linear_acceleration"] = self._camera_acceleration
-        if self._camera_angular_velocity is not None:
-            payload["angular_velocity"] = self._camera_angular_velocity
-        self._latest = payload
+        with self._publish_lock:
+            if not self._running:
+                return
+            timestamps = [ts for ts in (
+                self._camera_acceleration_timestamp_ms,
+                self._camera_angular_velocity_timestamp_ms,
+            ) if ts is not None]
+            if not timestamps:
+                return
+            payload = {"available": True, "timestamp_ms": max(timestamps)}
+            if self._camera_acceleration is not None:
+                payload["linear_acceleration"] = self._camera_acceleration
+            if self._camera_angular_velocity is not None:
+                payload["angular_velocity"] = self._camera_angular_velocity
+            self._latest = payload
 
-        # The dashboard only needs the latest state.  Bound transport to 30 Hz
-        # so a high-rate IMU cannot congest the domain-42 bridge.
-        now = time.monotonic()
-        if now - self._last_pub < 1.0 / 30.0:
-            return
-        self._last_pub = now
-        out = String()
-        out.data = json.dumps(self._latest)
-        self._pub.publish(out)
+            # The dashboard only needs the latest state.  Bound transport to 30 Hz
+            # so a high-rate IMU cannot congest the domain-42 bridge.
+            now = time.monotonic()
+            if now - self._last_pub < 1.0 / 30.0:
+                return
+            self._last_pub = now
+            out = String()
+            out.data = json.dumps(self._latest)
+            self._pub.publish(out)
 
     def _publish_snapshot_loop(self):
         while self._running:
-            snapshot = dict(self._latest)
-            snapshot["timestamp_ms"] = int(time.time() * 1000)
-            out = String()
-            out.data = json.dumps(snapshot)
-            self._pub.publish(out)
+            with self._publish_lock:
+                if not self._running:
+                    break
+                snapshot = dict(self._latest)
+                snapshot["timestamp_ms"] = int(time.time() * 1000)
+                out = String()
+                out.data = json.dumps(snapshot)
+                self._pub.publish(out)
             time.sleep(0.5)
 
     def _on_camera_accel(self, msg):
@@ -2313,23 +2336,71 @@ class PointCloudPlugin:
     _format = "sensor/pointcloud"
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/points"; self._last = 0.0; self._intrinsics = None
+        # A separate native topic keeps the original Orbbec frame and bytes.
+        # The display output continues to use gravity leveling and floor shift.
+        self._native_topic = f"/{namespace}/camera/head/points_native"
+        self._native_metadata_topic = self._native_topic + "/metadata"
+        self._native_last = 0.0
+        self._native_hz = max(0.2, min(float(plugin_config.get("native_hz", 2.0)), 5.0))
+        self._native_max_bytes = max(1024, min(int(plugin_config.get("native_max_bytes", 12_000_000)), 20_000_000))
+        self._native_generation = uuid4().hex
+        self._native_evidence = None
+        self._native_error = None
+        self._native_forwarded = 0
+        self._native_pub = self._native_metadata_pub = None
+        self._subscriptions_registered = False
         self._floor_offset_m = max(-3.0, min(float(plugin_config.get("floor_offset_m", 1.50)), 3.0))
         self._gravity_world = None; self._gravity_lock = threading.Lock()
         self._sub_node = Node("tianyi2_points_sub", context=ros2.ctx_tianyi); self._pub_node = Node("tianyi2_points_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
+    def _outputs(self):
+        return [{"topic": self._topic, "format": self._format},
+                {"topic": self._native_topic, "format": "sensor/pointcloud2"}]
+
+    def _native_info(self):
+        from slam_pointcloud import input_declaration
+        return {
+            "topic_out": self._outputs(),
+            "input_metadata": [input_declaration(
+                self._native_topic, self._native_metadata_topic, self._native_evidence)],
+            "native_status": {
+                "frames_forwarded": self._native_forwarded,
+                "source_header": self._native_evidence,
+                "error": self._native_error,
+                "clock_verified": False,
+                "extrinsic_verified": False,
+                "note": "Orbbec header clock semantics and dynamic head mount are unverified",
+            },
+        }
+
     def get_tool(self):
-        return {"name": "camera_pointcloud", "type": "sensor", "description": "天轶2.0 Orbbec 头部彩色点云（限频、限点）", "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": self._format}]}
+        return {"name": "camera_pointcloud", "type": "sensor",
+                "description": "天轶2.0 Orbbec display cloud and bounded raw PointCloud2 (unverified for SLAM)",
+                "inputSchema": {"type": "object", "properties": {}}, **self._native_info()}
+
     def start(self):
         from sensor_msgs.msg import PointCloud2, Image, CameraInfo, Imu
         from std_msgs.msg import UInt8MultiArray
-        self._running = True; self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
+        self._running = True
+        if self._subscriptions_registered:
+            return
+        latest = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                            history=HistoryPolicy.KEEP_LAST, depth=1,
+                            durability=DurabilityPolicy.VOLATILE)
+        self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
+        self._native_pub = self._pub_node.create_publisher(PointCloud2, self._native_topic, latest)
+        self._native_metadata_pub = self._pub_node.create_publisher(String, self._native_metadata_topic, latest)
         self._sub_node.create_subscription(PointCloud2, "/ob_camera_head/depth/points", self._on_cloud, _LOW_LAT_QOS)
         # Gemini 336 currently has its depth image enabled even when the vendor
-        # point-cloud stream is disabled.  This fallback keeps the card live.
+        # point-cloud stream is disabled. The display fallback remains unchanged;
+        # it is NOT silently promoted to the native PointCloud2 output.
         self._sub_node.create_subscription(CameraInfo, "/ob_camera_head/depth/camera_info", self._on_info, _RELIABLE_QOS)
         self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_depth, _LOW_LAT_QOS)
         self._sub_node.create_subscription(Imu, "/ob_camera_head/accel/sample", self._on_accel, _LOW_LAT_QOS)
-    def stop(self): self._running = False
+        self._subscriptions_registered = True
+
+    def stop(self):
+        self._running = False
     def _on_accel(self, msg):
         """Estimate display-frame up from the camera's stationary IMU vector."""
         # Optical raw coordinates are (right, down, forward); the renderer's
@@ -2377,8 +2448,36 @@ class PointCloudPlugin:
         wy += floor_offset_m
         # Invert the renderer map above to pack the leveled world point.
         return -wz, wx, -wy
+    def _forward_native(self, msg):
+        """Cross Domain 0 -> 42 while preserving the original PointCloud2.
+
+        Both topics use bounded BEST_EFFORT queues. Any missed sidecar is
+        discarded by the strict consumer, not paired with another frame.
+        """
+        if time.monotonic() - self._native_last < 1.0 / self._native_hz:
+            return
+        from slam_pointcloud import native_cloud_evidence, frame_declaration
+        try:
+            evidence = native_cloud_evidence(msg, max_bytes=self._native_max_bytes)
+            # The original msg carries the vendor's frame/fields/stamp/data.
+            # Neither display transform nor receive-time restamp is applied.
+            self._native_pub.publish(msg)
+            sidecar = String(data=json.dumps(
+                frame_declaration(evidence, self._native_generation),
+                allow_nan=False))
+            self._native_metadata_pub.publish(sidecar)
+        except (ValueError, TypeError, AttributeError, OverflowError, RuntimeError) as error:
+            self._native_error = str(error)
+            return
+        self._native_last = time.monotonic()
+        self._native_forwarded += 1
+        self._native_evidence = evidence
+        self._native_error = None
+
     def _on_cloud(self, msg):
-        if not self._running or time.monotonic() - self._last < 0.5: return
+        if not self._running: return
+        self._forward_native(msg)
+        if time.monotonic() - self._last < 0.5: return
         fields = {f.name: f.offset for f in msg.fields}
         if not all(k in fields for k in ("x", "y", "z")): return
         self._last = time.monotonic(); raw = bytes(msg.data); count = min(msg.width * msg.height, 10000); gravity = self._gravity_snapshot()
@@ -2411,7 +2510,19 @@ class PointCloudPlugin:
         if not count: return
         from std_msgs.msg import UInt8MultiArray
         out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)
-    def dispatch(self, action, args): return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": self._format}]}
+    def dispatch(self, action, args):
+        if action == 'start':
+            # Bundle dispatcher only calls start() on first activation.
+            # A previously stopped sensor must re-arm on later start actions.
+            if not self._running:
+                self.start()
+        elif action == 'stop':
+            self.stop()
+        elif action == 'info':
+            return {'state': 'running' if self._running else 'idle',
+                    **self._native_info()}
+        return {'state': 'running' if self._running else 'idle',
+                'topic_out': self._outputs()}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

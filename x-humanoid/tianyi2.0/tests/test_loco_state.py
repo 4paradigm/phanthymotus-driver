@@ -14,10 +14,12 @@ import threading
 import time
 import types
 import unittest
+import pytest
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parents[1]))
+sys.path.insert(0, str(ROOT))
 from common.odom import axis, is_fresh, parse_interface
 from common import lifecycle
 
@@ -103,6 +105,26 @@ class Client:
 
     def get_total_odometry(self, *, timeout):
         return self._read("length", {"length": 123.4}, timeout)
+
+
+@pytest.fixture(autouse=True)
+def diagnostic_transport(monkeypatch):
+    # Keep the real worker, clock mapping, integration and publication. Only
+    # replace the unavailable physical chassis transport at its boundary.
+    class Diagnostic:
+        def __init__(self, url): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def observe(self, clock):
+            before = time.time_ns()
+            mono = time.monotonic_ns()
+            clock.observe(before // 1_000_000, before, before + 1_000_000, mono)
+        def subscribe(self): pass
+        def read(self):
+            stamp = time.time_ns() // 1_000_000
+            return [{"timestamp": stamp, "payload": {
+                "positionDifference": {"x": 0., "y": 0.}, "angularDifference": 0.}}]
+    monkeypatch.setitem(STATE.OdometrySource._run.__globals__, 'DiagnosticClient', Diagnostic)
 
 
 def plugin(client=None):
@@ -281,7 +303,7 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(("vx", "vy", "wz"), interface.provides)
         self.assertEqual("unbounded", interface.pose_drift)
         self.assertEqual(20, interface.rate_hz)
-        self.assertEqual({"stamp_source": "received"}, interface.timing)
+        self.assertEqual({"stamp_source": "robot"}, interface.timing)
         self.assertNotIn("max_measurement_delay_ms", interface.timing)
         self.assertTrue(interface.usable_for_control)
         self.assertFalse(info["available"])
@@ -307,17 +329,18 @@ class PluginTests(unittest.TestCase):
             state.start()
             self.assertIs(worker, state._thread)
             wait_for(lambda: len(state._odom_pub.messages) >= 1)
-            raw, odom = state._pub.messages[0], state._odom_pub.messages[0]
-            self.assertEqual(raw, {key: value for key, value in odom["vendor"].items()
-                                   if key in raw})
-            self.assertEqual(raw["position"], list(odom["pose"]["position"].values()))
+            raw, odom = state._pub.messages[-1], state._odom_pub.messages[-1]
+            self.assertEqual("tracking", odom["vendor"]["motus_slam"]["status"])
+            self.assertEqual([0., 0., 0.], odom["pose"]["position"])
             self.assertEqual(0, raw["displacement"]["distance"])
             client.failed = True
-            wait_for(lambda: state._odom_pub.messages[-1]["twist"] == [None] * 6)
+            wait_for(lambda: not state._pub.messages[-1]["available"])
+            # REST telemetry failure must not replace diagnostic odometry.
+            self.assertEqual("tracking", state._odom_pub.messages[-1]["vendor"]["motus_slam"]["status"])
             self.assertEqual("error", state.dispatch("info", {})["state"])
             self.assertIsNone(state._pub.messages[-1]["position"])
             client.failed = False
-            wait_for(lambda: state._odom_pub.messages[-1]["twist"][0] == 0.3)
+            wait_for(lambda: state._pub.messages[-1]["velocity"][0] == 0.3)
             count = len(state._odom_pub.messages)
             self.assertEqual({"state": "idle"}, state.dispatch("stop", {}))
             self.assertTrue(worker.is_alive())
@@ -541,3 +564,40 @@ class ClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_slam_capability_is_declared_on_existing_odom_port():
+    state = plugin()
+    interface = state.dispatch("info", {})["odom_interface"]
+    assert interface.get("slam_pose") == {"available": True, "profile": "motus_slam/1"}
+    assert interface["timing"]["stamp_source"] == "robot"
+
+
+def test_rest_poll_cannot_publish_a_pose_to_slam():
+    state = plugin()
+    original = state._pub.publish
+    def one_poll(message):
+        original(message)
+        state._stop_event.set()
+    state._pub.publish = one_poll
+    state._poll_loop()
+    assert state._pub.messages[0]["available"]
+    assert state._odom_pub.messages == []
+
+
+def test_diagnostic_publish_keeps_source_pose_time_and_quality():
+    state = plugin()
+    sample = {"schema": "motus.odom/1", "stamp_ms": 1234, "pose": None,
+              "twist": [None]*6, "vendor": {"motus_slam": {"status": "lost"}}}
+    assert hasattr(state, "_publish_odometry"), "diagnostic publication is not connected"
+    state._publish_odometry(sample)
+    out = state._odom_pub.messages[-1]
+    assert out["stamp_ms"] == 1234
+    assert out["pose"] is None
+    assert out["vendor"]["motus_slam"]["status"] == "lost"
+
+
+def test_info_declares_approved_software_clock_budget():
+    info=plugin().dispatch('info', {})['slam_odometry']
+    assert info['synchronization']=='bounded_software'
+    assert info['clock_mapping_budget_ms']==50
