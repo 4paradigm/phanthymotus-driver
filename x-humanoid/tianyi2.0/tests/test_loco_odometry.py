@@ -284,3 +284,79 @@ def test_persistently_rejected_clock_probes_eventually_publish_loss(monkeypatch)
     assert len({s['vendor']['motus_slam']['segment_id'] for s in tracked})==1
     assert published[-1]['pose'] is None
     assert published[-1]['vendor']['motus_slam']['reason']=='clock observation expired'
+
+
+def test_publish_deadline_does_not_skip_frames_due_to_read_latency_jitter(monkeypatch):
+    import types
+    m = module(); now = [1000.]; reads = []; published = []
+    monkeypatch.setattr(m, 'time', types.SimpleNamespace(
+        monotonic=lambda: now[0], monotonic_ns=lambda: int(now[0]*1e9),
+        time_ns=lambda: EPOCH+int(now[0]*1e9)))
+    class Stop:
+        def is_set(self): return now[0] >= 1002.
+        def wait(self, seconds):
+            now[0] += seconds
+            return self.is_set()
+    class Client:
+        def __init__(self, url): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def observe(self, clock):
+            ns=int(now[0]*1e9)
+            clock.observe(ns//1_000_000, EPOCH+ns, EPOCH+ns+1_000_000, ns)
+        def subscribe(self): pass
+        def read(self):
+            now[0] += .003 if len(reads)%2==0 else .001
+            reads.append(now[0])
+            return [delta(int(now[0]*1000))]
+    monkeypatch.setattr(m, 'DiagnosticClient', Client)
+    source=m.OdometrySource('http://robot:1448',20,published.append)
+    source._stop=Stop()
+    source._run()
+    assert len(reads)>=35
+    assert len(published)>=len(reads)-2
+    assert all(s['pose'] is not None for s in published)
+
+
+def test_uncertain_clock_interval_is_not_evidence_of_clock_drift():
+    m=module(); clock=ready_clock(m)
+    # The frozen offset remains inside this interval. It is too wide to
+    # refresh the 5 ms verification budget, but does not prove clock drift.
+    with pytest.raises(m.ClockObservationRejected):
+        clock.observe(1100, EPOCH+1_100_000_000, EPOCH+1_106_000_000, 1_100_000_000)
+    assert clock._observed==1_040_000_000
+    clock.observe(1150, EPOCH+1_150_000_000, EPOCH+1_152_000_000, 1_150_000_000)
+    assert clock.offset==EPOCH+1_000_000
+
+
+def test_clock_interval_proving_drift_is_fatal():
+    m=module(); clock=ready_clock(m)
+    with pytest.raises(ValueError, match='drift') as error:
+        clock.observe(1110, EPOCH+1_100_000_000, EPOCH+1_102_000_000, 1_100_000_000)
+    assert not isinstance(error.value,m.ClockObservationRejected)
+
+
+def test_rejected_clock_probe_retries_on_next_drain_without_extending_expiry(monkeypatch):
+    import types
+    m=module(); now=[1000.]; observed=[]; published=[]
+    monkeypatch.setattr(m,'time',types.SimpleNamespace(
+        monotonic=lambda:now[0],monotonic_ns=lambda:int(now[0]*1e9),
+        time_ns=lambda:EPOCH+int(now[0]*1e9)))
+    class Stop:
+        def is_set(self): return now[0]>=1002.
+        def wait(self,seconds): now[0]+=seconds; return self.is_set()
+    class Client:
+        def __init__(self,url): pass
+        def __enter__(self): return self
+        def __exit__(self,*args): pass
+        def subscribe(self): pass
+        def observe(self,clock):
+            observed.append(now[0]);ns=int(now[0]*1e9)
+            clock.observe(ns//1_000_000,EPOCH+ns,
+                          EPOCH+ns+(20_000_000 if len(observed)==6 else 1_000_000),ns)
+        def read(self): return [delta(int(now[0]*1000))]
+    monkeypatch.setattr(m,'DiagnosticClient',Client)
+    source=m.OdometrySource('http://robot:1448',20,published.append);source._stop=Stop()
+    source._run()
+    assert 0 < observed[6]-observed[5] <= .1
+    assert all(s['pose'] is not None for s in published)

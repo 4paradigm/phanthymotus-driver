@@ -122,8 +122,10 @@ the REST velocity retained under `vendor`.
 
 The diagnostic event's uptime timestamp is mapped to host realtime using five
 bounded `/api/platform/v1/timestamp` request intervals. The offset is fixed
-within a segment and checked every 0.5 seconds. High-latency probes do not
-refresh the mapping; two seconds without an accepted clock probe invalidates it.
+within a segment and checked every 0.5 seconds. High-latency or inconclusive
+probes do not refresh the mapping and are retried on the next diagnostic drain;
+two seconds without an accepted clock probe invalidates it. An interval proving
+the mapping is outside its budget invalidates the segment immediately.
 Each sample retains the original
 source milliseconds and the mapping in `vendor.motus_slam.measurement`;
 `stamp_ms` is mapped source time, never TCP receipt time. The declared 10 ms
@@ -149,6 +151,11 @@ than 250 ms, disconnects, or failed clock checks publish `lost` with null pose
 and twist. Recovery creates a new segment and origin, preventing interpolation
 across a reset. Loaded on-robot probes have triggered these loss states;
 continuous production mapping still needs acceptance under the full sensor load.
+The diagnostic source has emitted distinct events with identical millisecond
+timestamps, including different IMU payloads. These are source event timestamps,
+not proven unique hardware acquisition times. Duplicate increment stamps remain
+a loss condition: silently deduplicating or inventing intermediate timestamps
+could discard motion or falsely claim strict synchronization.
 
 `displacement` is calculated from the first valid odometry pose during this
 driver instance. It contains `origin`, XYZ `translation` in the odom frame,

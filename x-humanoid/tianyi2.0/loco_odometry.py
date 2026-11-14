@@ -59,8 +59,12 @@ class ClockMapping:
             self._count += 1
             if self._count >= 5:
                 self.offset = (low + high) // 2
-        elif max(abs(self.offset - low), abs(self.offset - high)) > UNCERTAINTY_NS // 2:
+        elif low > self.offset + UNCERTAINTY_NS // 2 or high < self.offset - UNCERTAINTY_NS // 2:
             raise ValueError('clock mapping drift exceeds segment budget')
+        elif max(abs(self.offset - low), abs(self.offset - high)) > UNCERTAINTY_NS // 2:
+            # A broad interval overlapping the budget proves neither validity
+            # nor drift. Discard it without refreshing the last verified time.
+            raise ClockObservationRejected('clock observation cannot verify segment budget')
         self._device, self._observed = device_ms, monotonic_ns
         self._wall_minus_mono = wall_minus_mono
 
@@ -310,15 +314,21 @@ class OdometrySource:
                             try:
                                 client.observe(clock)
                             except ClockObservationRejected:
-                                pass  # No freshness update: map() still expires after 2 s.
-                            observed = time.monotonic()
+                                # Retry at the next drain instead of repeatedly
+                                # colliding with a periodic sensor callback.
+                                # ClockMapping freshness is still unchanged.
+                                pass
+                            else:
+                                observed = time.monotonic()
                         samples = integrator.feed(client.read(), time.time_ns(), time.monotonic_ns())
                         if samples:
                             # Integrate ALL deltas, publish the newest source time at card Hz.
                             received = time.monotonic()
                             if received >= next_publish:
                                 self._emit(samples[-1])
-                                next_publish = received + self._period
+                                next_publish += self._period
+                                if next_publish <= received:
+                                    next_publish = received + self._period
                         elif time.monotonic() - received > MAX_AGE_NS / 1e9:
                             raise ValueError('source increments stopped')
                         self._stop.wait(max(0., min(.05, self._period) - (time.monotonic() - started)))
