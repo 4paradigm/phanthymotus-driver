@@ -65,7 +65,7 @@ verify the wire payload, not distance accuracy or navigation safety on hardware.
 ## Locomotion state card
 
 `loco_state` starts with the driver and publishes JSON on
-`/{namespace}/loco/state` and the same poll as `motus.odom/1` on
+`/{namespace}/loco/state` and source-timestamped `motus.odom/1` on
 `/{namespace}/state/odom` (format `state/odom`). Its input schema is an empty
 object. The namespace comes from `ros_namespace` or the hostname.
 `nav_state` remains available with its existing map-localized pose output.
@@ -107,42 +107,48 @@ to null and reports `errors.length`, while valid pose and twist remain usable.
 request. HTTP latency can lower a lane's actual rate, but slow IMU or mileage
 requests cannot block pose/speed publication. MCP `stop` returns the canvas
 lifecycle marker `{"state": "idle"}` while leaving this always-active observer
-running, matching R1; driver shutdown stops both workers and their connections.
+running, matching R1; driver shutdown stops all telemetry and diagnostic workers and their connections.
 
-The standard output uses `common.odom` from the official driver repository:
-`twist = [vx, vy, null, null, null, omega]`, `frame = "body"`, SI units,
-and a host receive timestamp for the speed response. Partial speed responses
-retain each valid axis, including measured zero. Invalid or absent axes are
-null. There is one speed observation per publish, with no faster stream being
-discarded. The IMU boot-relative timestamp is never used as `stamp_ms`.
+The standard port uses a separate read-only TCP subscription on port 1445 to
+`base/deadreckon_with_gyro_yaw`. It integrates every diagnostic displacement
+(metres) and yaw increment (radians), then publishes the latest source sample at
+`plugins.loco_state.hz`. The diagnostic queue is drained at least 20 Hz even
+when publication is slower. Planar integration treats XY as body-frame increments;
+this convention still requires a measured moving-robot acceptance test. The
+first increment establishes a fresh origin. Pose position is `[x, y, 0]`,
+quaternion is XYZW, and covariance is null. `twist` is the latest increment
+divided by its source interval, with unmeasured axes null; it is distinct from
+the REST velocity retained under `vendor`.
 
-`info()` includes a validated `odom_interface` with `provides = ["vx", "vy", "wz"]`,
-the fast target rate, and `pose_drift = "unbounded"`: the source is uncorrected
-wheel odometry, not map localization. Its optional timing declaration is
-`{"stamp_source": "received"}` because the REST replies do not carry a usable
-measurement clock. It deliberately omits `max_measurement_delay_ms`: the HTTP
-timeout is a failure bound, not a measured sensor delay. Standard `pose` now
-contains measured position and an orientation quaternion derived from the same
-endpoint's roll/pitch/yaw:
+The diagnostic event's uptime timestamp is mapped to host realtime using five
+bounded `/api/platform/v1/timestamp` request intervals. The offset is fixed
+within a segment and checked every 0.5 seconds. High-latency probes do not
+refresh the mapping; two seconds without an accepted clock probe invalidates it.
+Each sample retains the original
+source milliseconds and the mapping in `vendor.motus_slam.measurement`;
+`stamp_ms` is mapped source time, never TCP receipt time. The declared 10 ms
+uncertainty is a software clock-mapping budget, not a bound on sensor acquisition
+latency or hardware synchronization. REST pose and speed receive times remain
+separate telemetry and are never used as a SLAM fallback.
 
-```json
-{
-  "stamp_ms": 1792052530000,
-  "frame_id": "odom",
-  "child_frame_id": "base_link",
-  "position": {"x": 1.2, "y": -2.0, "z": 0.1},
-  "orientation": {"x": 0.0, "y": 0.0, "z": 0.70710678, "w": 0.70710678}
-}
-```
+`info().odom_interface` declares `slam_pose = {"available": true,
+"profile": "motus_slam/1"}`, `provides = ["vx", "vy", "wz"]`,
+`pose_drift = "unbounded"` and `timing.stamp_source = "robot"`.
+`info().slam_odometry` reports the current tracking/lost state and reason.
+The message uses the existing `motus.odom/1` JSON format, not ROS
+`nav_msgs/Odometry`. `pose.frame_id` identifies a unique odometry segment and
+`child_frame_id` is `base_link`; `frame = "body"` describes the twist.
 
-This is the `pose` member of the existing JSON `motus.odom/1` message, not a
-ROS `nav_msgs/Odometry` message. Its frame is explicit: standard `frame = body`
-still describes the twist, whereas `pose.frame_id = odom` describes position.
-Quaternion components are named to avoid XYZW/WXYZ ambiguity. `pose.stamp_ms`
-is the host receive time of the pose reply; the message's top-level stamp is
-the independently received speed reply. Missing or malformed position or RPY
-produces `pose = null`, never a fabricated identity pose. No pose covariance,
-ground contact, or unmeasured velocity axes are invented.
+Connect `state/odom` to the SLAM card's odometry input. The pose includes the
+`motus_slam/1` quality metadata and source-time mapping accepted by its decoder.
+The point cloud must independently have a verified clock relationship and a
+measured transform to the chassis reference; this adapter does not invent a
+camera mount transform or mark the native cloud's unknown timing as verified.
+Timestamp rollback, duplicate/reordered increments, gaps over 100 ms, data older
+than 250 ms, disconnects, or failed clock checks publish `lost` with null pose
+and twist. Recovery creates a new segment and origin, preventing interpolation
+across a reset. Loaded on-robot probes have triggered these loss states;
+continuous production mapping still needs acceptance under the full sensor load.
 
 `displacement` is calculated from the first valid odometry pose during this
 driver instance. It contains `origin`, XYZ `translation` in the odom frame,
