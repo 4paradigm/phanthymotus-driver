@@ -97,7 +97,7 @@ def test_recovered_vendor_parameters_clear_obsolete_error(monkeypatch):
     monkeypatch.setitem(sys.modules,'rcl_interfaces.srv',NS(GetParameters=object))
     source=object.__new__(m.RgbdCameraPlugin)
     source.lock=threading.RLock();source.running=True;source.registered=False;source.error='old parameter failure'
-    source.future=NS(done=lambda:True,result=lambda:NS(values=[NS(bool_value=True),NS(string_value='global'),NS(bool_value=True)]))
+    source.future=NS(done=lambda:True,result=lambda:NS(values=[NS(bool_value=True),NS(string_value='global'),NS(bool_value=True),NS(string_value='COLOR')]))
     source._parameters()
     assert source.registered and source.error is None
 

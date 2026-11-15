@@ -60,19 +60,38 @@ def test_parameter_request_failure_is_bounded_diagnostic_and_can_retry(source, m
 def test_rejected_parameter_values_identify_registration_and_global_clock_gates(source):
     waiting(source)
     source.future = NS(done=lambda: True, result=lambda: NS(values=[
-        NS(bool_value=False), NS(string_value='device'), NS(bool_value=False)]))
+        NS(bool_value=False), NS(string_value='device'), NS(bool_value=False),
+        NS(string_value='COLOR')]))
     source._parameters()
     status = source.dispatch('info', {})['source_status']
     assert status['stage'] == 'parameter_validation'
     assert status['parameters'] == dict(stage='validation', depth_registration=False,
-                                         time_domain='device', enable_sync_host_time=False)
+                                         time_domain='device', enable_sync_host_time=False,
+                                         align_target_stream='COLOR')
     assert not status['first_calibrated_output']
+
+
+def test_global_capture_mode_allows_host_sync_disabled_but_requires_d2c(source):
+    source.registered = False
+    source.future = NS(done=lambda: True, result=lambda: NS(values=[
+        NS(bool_value=True), NS(string_value='global'), NS(bool_value=False),
+        NS(string_value='COLOR')]))
+    source._parameters()
+    assert source.registered and source.error is None
+    source.registered = False
+    source.future = NS(done=lambda: True, result=lambda: NS(values=[
+        NS(bool_value=True), NS(string_value='global'), NS(bool_value=True),
+        NS(string_value='DEPTH')]))
+    source._parameters()
+    assert not source.registered
+    assert 'depth-to-color' in source.error
 
 
 def test_parameter_service_rediscovery_does_not_repeat_old_validation_error(source):
     waiting(source)
     source.future = NS(done=lambda: True, result=lambda: NS(values=[
-        NS(bool_value=False), NS(string_value='device'), NS(bool_value=False)]))
+        NS(bool_value=False), NS(string_value='device'), NS(bool_value=False),
+        NS(string_value='COLOR')]))
     source._parameters()
     assert source.error
     source._parameters()  # The fixture service is unavailable on the next query.
