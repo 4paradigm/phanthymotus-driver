@@ -99,7 +99,7 @@ def camera_declarations(root, geometry, clock, *, color_topic=None, depth_topic=
                               registration='registered_rectified',
                               registration_source='orbbec_depth_registration_to_color',
                               registration_accuracy_validated=False,
-                              timestamp_semantics='source_capture_unverified_host_relation'))
+                              timestamp_semantics='source_capture_mapped'))
     color = dict(deepcopy(common), topic=color_topic or root + '/color', format='image/jpeg')
     depth = dict(deepcopy(common), topic=depth_topic or root + '/depth', format='image/depth-zlib')
     depth['vendor'].update(depth_unit='mm', depth_source='measured')
