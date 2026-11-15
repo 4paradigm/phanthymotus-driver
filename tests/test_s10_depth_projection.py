@@ -211,3 +211,59 @@ def test_pixel_boundary_rounding_handles_half_pixel_edges(projection):
     assert depths[240 * 640] == 1000
     assert depths[240 * 640 + 639] == 1000
     assert sum(value != 0 for value in depths) == 2
+
+def _hole_packet(points):
+    from array import array
+    data = array('H', [0]) * (640 * 480)
+    for x, y, millimetres in points:
+        data[y * 640 + x] = millimetres
+    return zlib.compress(data.tobytes())
+
+
+def _hole_map(packet):
+    return struct.unpack('<307200H', zlib.decompress(packet))
+
+
+def test_hole_fill_short_bracketed_surface_interpolates_without_changing_measurements(projection):
+    packet = _hole_packet([(318, 240, 2000), (323, 240, 2100),
+                           (320, 238, 2050), (320, 242, 2050)])
+    filled, stats = projection.fill_depth_holes(packet)
+    raw, result = _hole_map(packet), _hole_map(filled)
+    assert result[240 * 640 + 318] == raw[240 * 640 + 318] == 2000
+    assert result[240 * 640 + 323] == raw[240 * 640 + 323] == 2100
+    assert result[240 * 640 + 319] > 0
+    assert result[239 * 640 + 320] > 0
+    assert raw[240 * 640 + 319] == 0
+    assert result[240 * 640 + 310] == 0
+    assert stats["filled_pixels"] >= 5
+
+
+def test_hole_fill_preserves_occlusions_large_gaps_and_unseen_regions(projection):
+    packet = _hole_packet([(310, 240, 1000), (330, 240, 1000),
+                           (300, 250, 1000), (303, 250, 2000),
+                           (320, 260, 2000)])
+    filled, stats = projection.fill_depth_holes(packet)
+    result = _hole_map(filled)
+    assert result[240 * 640 + 320] == 0   # Unobserved gap is too wide
+    assert result[250 * 640 + 301] == 0   # Sharp depth discontinuity
+    assert result[260 * 640 + 321] == 0   # No extrapolation
+    assert stats["filled_pixels"] == 0
+
+
+def test_hole_fill_rejects_disagreeing_orthogonal_estimates(projection):
+    packet = _hole_packet([(319, 240, 1000), (321, 240, 1000),
+                           (320, 239, 1050), (320, 241, 1050)])
+    filled, stats = projection.fill_depth_holes(packet)
+    result = _hole_map(filled)
+    assert result[240 * 640 + 320] == 0
+    assert stats == {"filled_pixels": 0, "fill_conflicts": 1}
+    assert result[240 * 640 + 319] == 1000
+
+
+def test_hole_fill_empty_and_invalid_packets(projection):
+    packet = _hole_packet([])
+    output, stats = projection.fill_depth_holes(packet)
+    assert output == packet or _hole_map(output) == _hole_map(packet)
+    assert stats == {"filled_pixels": 0, "fill_conflicts": 0}
+    with pytest.raises((zlib.error, ValueError)):
+        projection.fill_depth_holes(zlib.compress(b"too short"))

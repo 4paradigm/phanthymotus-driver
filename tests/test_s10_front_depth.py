@@ -627,7 +627,9 @@ def test_catalogue_and_runtime_advertise_exactly_one_new_card(monkeypatch, tmp_p
 def test_card_wire_contract_geometry_and_time_provenance(rig):
     card = rig.plugin.get_tool()
     assert card["name"] == "camera_front__depth" and card["type"] == "sensor"
-    assert card["topic_out"] == [{"topic": "/robot/camera_front/depth", "format": "image/depth-zlib"}]
+    assert [entry["topic"] for entry in card["topic_out"]] == [
+        "/robot/camera_front/depth", "/robot/camera_front/depth_filled"]
+    assert all(entry["format"] == "image/depth-zlib" for entry in card["topic_out"])
     assert not card.get("topic_in")
     assert set(card["inputSchema"]["x-action-params"]) == {"start", "stop", "info", "config"}
     info = card["camera_info"][0]
@@ -854,10 +856,15 @@ def test_real_worker_reports_bad_layout_then_projects_and_closes():
         assert ready.wait(5), "worker did not return depth"
         context, packet, stats = received[0]
         assert context["stamp"] == (10, 123) and "cloud" not in context
-        raw = zlib.decompress(packet)
+        assert isinstance(packet, tuple) and len(packet) == 2
+        raw = zlib.decompress(packet[0])
+        assert len(zlib.decompress(packet[1])) == 640 * 480 * 2
         assert len(raw) == 640 * 480 * 2
         assert struct.unpack_from("<H", raw, (240 * 640 + 320) * 2)[0] == 2000
-        assert stats == {"source_points": 1, "sample_points": 1, "valid_pixels": 1}
+        assert stats["source_points"] == 1
+        assert stats["sample_points"] == 1 and stats["valid_pixels"] == 1
+        assert stats["filled_pixels"] == 0 and stats["fill_conflicts"] == 0
+        assert stats["measured_coverage"] <= stats["filled_coverage"]
     finally:
         worker.close()
     assert not worker.is_alive()
@@ -962,3 +969,45 @@ def test_output_config_does_not_add_dependencies_or_drop_encoder_latency_fix():
     from deep_robotics.s10_pro.media_workers import _rtsp_command
     cmd = _rtsp_command("rtsp://camera")
     assert cmd[cmd.index("-threads") + 1] == "1"
+
+def test_filled_stream_uses_same_stamp_but_separate_topic_and_provenance(rig):
+    from deep_robotics.s10_pro.depth_projection import project_depth, fill_depth_holes
+    configure(rig)
+    assert rig.plugin.dispatch("start", {})["state"] == "running"
+    message = cloud()
+    message.width, message.row_step = 2, 24
+    message.data = struct.pack("<ffffff", 0, 0, 2, .025, 0, 2)
+    rig.subscriptions[0].callback(message)
+    job = rig.plugin._worker.jobs[0]
+    raw, stats = project_depth(job["cloud"], job["K"], job["transform"])
+    filled, more = fill_depth_holes(raw)
+    stats.update(more)
+    rig.plugin._receive_result(job, (raw, filled), stats)
+    assert len(rig.publications) == 2
+    measured, estimate = rig.publications
+    assert measured.data == raw and estimate.data == filled
+    assert measured.header.stamp.sec == estimate.header.stamp.sec == 10
+    assert measured.header.stamp.nanosec == estimate.header.stamp.nanosec == 123
+    assert measured.header.frame_id == estimate.header.frame_id
+    assert zlib.decompress(measured.data) != zlib.decompress(estimate.data)
+    assert rig.plugin.dispatch("info", {})["stats"]["filled_pixels"] > 0
+    raw_info, filled_info = rig.plugin.dispatch("info", {})["camera_info"]
+    assert raw_info["topic"] == "/robot/camera_front/depth"
+    assert filled_info["topic"] == "/robot/camera_front/depth_filled"
+    assert raw_info["vendor"]["hole_filling"] is False
+    assert filled_info["vendor"]["hole_filling"] is True
+    assert filled_info["vendor"]["depth_aligned_to_rgb"] is False
+    assert filled_info["vendor"]["interpolated_pixels_are_measured"] is False
+
+
+def test_stopped_depth_card_cannot_publish_late_filled_result(rig):
+    from deep_robotics.s10_pro.depth_projection import project_depth, fill_depth_holes
+    configure(rig)
+    rig.plugin.dispatch("start", {})
+    rig.subscriptions[0].callback(cloud())
+    job = rig.plugin._worker.jobs[0]
+    raw, stats = project_depth(job["cloud"], job["K"], job["transform"])
+    filled, _ = fill_depth_holes(raw)
+    rig.plugin.dispatch("stop", {})
+    rig.plugin._receive_result(job, (raw, filled), stats)
+    assert rig.publications == []

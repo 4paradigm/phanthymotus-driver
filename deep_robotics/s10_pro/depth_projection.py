@@ -1,8 +1,9 @@
 """Bounded, ROS-free projection of original cloud XYZ into optical-Z depth.
 
 The zlib payload is always 640x480, little-endian uint16 millimetres, with
-zero marking unobserved pixels. No display-axis corrections, interpolation,
-per-point timing, RGB synchronization, or motion compensation are applied.
+zero marking unobserved pixels. The original stream never interpolates.
+A separate, bounded hole-filled stream is explicitly marked as estimated;
+no RGB synchronization or motion compensation is assumed.
 """
 from array import array
 from collections.abc import Mapping
@@ -197,4 +198,84 @@ def project_depth(cloud, K, camera_optical_from_cloud, *, min_depth_m=0.1,
         output.byteswap()
     return zlib.compress(output.tobytes(), level=1), {
         'source_points': total, 'sample_points': sampled, 'valid_pixels': valid_pixels,
+    }
+
+# Only short, locally supported holes are filled. Synthetic depth is not a
+# sensor measurement and must never count as measured obstacle coverage.
+HOLE_FILL_MAX_GAP_PX = 8
+HOLE_FILL_MAX_JUMP_MM = 150
+HOLE_FILL_RELATIVE_JUMP = 0.06
+
+
+def fill_depth_holes(packet):
+    """Return (filled image/depth-zlib, stats); never alter an observed pixel.
+
+    Horizontal and vertical 1-D gaps must be bounded by ORIGINAL observations.
+    Bridging depth discontinuities or extrapolating from a single return can
+    manufacture free space or erase thin obstacles, so neither is permitted.
+    Conflicting horizontal/vertical predictions are invalidated, not averaged.
+    """
+    raw = zlib.decompress(packet)
+    if len(raw) != WIDTH * HEIGHT * 2:
+        raise ValueError("depth packet is not 640x480 uint16")
+    source = array('H')
+    source.frombytes(raw)
+    if sys.byteorder != 'little':
+        source.byteswap()
+    filled = array('H', source)
+    # 0: original or unknown; 1: synthetic; 2: rejected synthetic conflict
+    flags = bytearray(WIDTH * HEIGHT)
+    conflicts = 0
+
+    def bridge(start, end, stride):
+        nonlocal conflicts
+        gap = (end - start) // stride - 1
+        if gap <= 0 or gap > HOLE_FILL_MAX_GAP_PX:
+            return
+        first, last = source[start], source[end]
+        if abs(first - last) > min(
+                HOLE_FILL_MAX_JUMP_MM,
+                HOLE_FILL_RELATIVE_JUMP * min(first, last)):
+            return
+        for step in range(1, gap + 1):
+            index = start + stride * step
+            estimate = (first * (gap + 1 - step) + last * step
+                        + (gap + 1) // 2) // (gap + 1)
+            if flags[index] == 0:
+                filled[index] = estimate
+                flags[index] = 1
+            elif flags[index] == 1:
+                if abs(filled[index] - estimate) > min(
+                        60, 0.02 * min(filled[index], estimate)):
+                    filled[index] = 0
+                    flags[index] = 2
+                    conflicts += 1
+                else:
+                    filled[index] = (filled[index] + estimate + 1) // 2
+
+    # Source pixels, not pixels filled in the preceding pass, supply every
+    # anchor. The interpolation can never recursively grow into unseen space.
+    for row in range(HEIGHT):
+        previous = None
+        for col in range(WIDTH):
+            index = row * WIDTH + col
+            if source[index]:
+                if previous is not None:
+                    bridge(previous, index, 1)
+                previous = index
+    for col in range(WIDTH):
+        previous = None
+        for row in range(HEIGHT):
+            index = row * WIDTH + col
+            if source[index]:
+                if previous is not None:
+                    bridge(previous, index, WIDTH)
+                previous = index
+
+    synthetic = flags.count(1)
+    if sys.byteorder != 'little':
+        filled.byteswap()
+    return zlib.compress(filled.tobytes(), level=1), {
+        'filled_pixels': synthetic,
+        'fill_conflicts': conflicts,
     }
