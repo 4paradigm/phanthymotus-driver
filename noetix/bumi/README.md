@@ -1,6 +1,6 @@
 # Noetix Bumi driver
 
-The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
+The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the object-locator card lives in `object_locator_card.py` (shared logic in `object_locator_core.py`); the other cards remain in `device.py`.
 
 ## `mic` and `sound_direction`
 
@@ -367,6 +367,108 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 
 `footprint` 的出错方向是单边的（以为自己更宽只是多减速，以为更窄就是把肩膀送进
 门框），所以默认值刻意偏宽；死区不是，所以它宁可声明成估计值也不写零。
+
+## `object_locator` 卡片：读取记忆回答“我的xxx在哪”
+
+这个拷贝只保留位置记忆流水线的第三张卡：读取 `object_memory` 写下的记忆，回答
+自然语言问题，并给出带目标标记的截图证据。
+
+记忆有两个来源，按顺序选择：
+
+1. **实时记忆**：订阅 `object_memory/state`，30 秒内的最新 memory 优先；
+2. **文件回退**：没有实时 memory 时读取 `<storage_dir>/memory.json`。
+
+两种用法：
+
+- **单独使用**：只要有一份 `memory.json`（或接上 memory 状态话题），就能
+  `ask`、`list`、`last`、`info`，不依赖相机、检测器或记忆卡。
+- **与完整流水线组合**：`scene_graph` → `object_memory` → 本卡；本卡只读记忆，
+  发布 `object_locator/answer` 和 `object_locator/evidence`。
+
+本卡不采集、不修改记忆、不读相机。
+
+### 动作
+
+| action | 说明 |
+|---|---|
+| `ask` | 问“我的xxx在哪？”，返回位置、关系、时间、证据 |
+| `list` | 列出记忆中的物品（标签、时间、距离、证据） |
+| `last` | 返回最近一次问答结果 |
+| `info` | 记忆来源、数量、存储路径、最近答案 |
+| `start` | 检查 ROS 和记忆输入是否就绪 |
+
+示例：
+
+```json
+{"tool": "object_locator", "action": "ask", "question": "我的钥匙在哪？"}
+{"tool": "object_locator", "action": "list"}
+```
+
+`ask` 返回（节选）：
+
+```json
+{
+  "state": "found",
+  "label": "keys",
+  "answer": "你的钥匙在杯子的左边（距机器人约 0.82 米）。上次看到：2026-11-16 03:30:12",
+  "position": {"forward": 0.8, "left": 0.2, "up": -0.1},
+  "distance_m": 0.82,
+  "relations": [{"relation": "left_of", "target": "cup"}],
+  "last_seen": "2026-11-16 03:30:12",
+  "evidence_path": "/opt/phanthy-motus/data/memory_palace/evidence/queries/query_....jpg",
+  "evidence_topic": "/<ns>/object_locator/evidence",
+  "memory_source": "topic",
+  "memory_count": 2
+}
+```
+
+找不到时返回 `not_found` 和 `candidates`；有多个相近标签时返回 `ambiguous`，
+不会猜一个。
+
+### 接线
+
+```text
+object_memory/state ──► object_locator ──► object_locator/answer
+memory.json ─────────►                 └──► object_locator/evidence
+```
+
+完整流水线里，`scene_graph` 负责采集、`object_memory` 负责持久化，本卡只负责
+检索和回答；三张卡共享 `storage_dir` 和记忆格式。
+
+### 证据
+
+`ask` 从记忆里取出目标所在场景和原始证据 JPEG，在目标中心画红色圆圈/准星，
+保存到 `<storage_dir>/evidence/queries/` 并发布到
+`/<ns>/object_locator/evidence`。VOP 只给中心点、不给检测框，所以图上是圆圈，
+不是矩形框。
+
+### 与基本卡片的关系
+
+| 基本卡片 | 本卡片怎么用 |
+|---|---|
+| `camera` / `depth` / `vision_capture` | 完全不直接使用；只读记忆文件/话题 |
+| `visual_odometry` | 不使用；回答是记忆中的相对位置，不是世界坐标 |
+| `scene_graph` / `object_memory`（前两张卡） | 唯一数据来源；字段和路径保持一致 |
+
+### 配置
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `storage_dir` | `/opt/phanthy-motus/data/memory_palace` | 记忆与证据目录（与第二张卡共用） |
+| `memory_topic` | `/<namespace>/object_memory/state` | 实时记忆输入（可选） |
+
+### 限制
+
+- 没有记忆时 `ask` 返回 `not_found`，不会伪造位置；
+- 记忆是“上次看到时”的相对位置，不是全局地图；
+- 不做采集、不修改记忆；记忆写入仍是第二张卡的工作；
+- 证据图只标中心点，不是检测框。
+
+测试：
+
+```bash
+python -m pytest noetix/bumi/tests/test_object_locator.py noetix/bumi/tests/test_object_locator_card.py -q
+```
 
 ## Direct action cards
 

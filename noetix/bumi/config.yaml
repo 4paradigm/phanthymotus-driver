@@ -93,3 +93,12 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+  # 物品位置查询：读取 object_memory 的实时记忆或共享 memory.json。
+  # 单独使用：ask/list/last/info 直接检索已有记忆。
+  # 与完整流水线组合：优先订阅 object_memory/state，回退读取同一份记忆文件；
+  # 只读记忆，不采集、不改记忆、不读相机。
+  object_locator:
+    enabled: true
+    storage_dir: /opt/phanthy-motus/data/memory_palace
+    # 留空使用 /<namespace>/object_memory/state
+    memory_topic: ""
