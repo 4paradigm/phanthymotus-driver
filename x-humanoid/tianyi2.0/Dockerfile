@@ -6,6 +6,7 @@ ARG TARGETARCH
 
 WORKDIR /work
 
+# Tianyi-only TF2 listeners require ros-humble-tf2-ros, growing this image only.
 # The ARM64 RealSense wheel links libusb-1.0.so.0; ros-base does not supply it.
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \

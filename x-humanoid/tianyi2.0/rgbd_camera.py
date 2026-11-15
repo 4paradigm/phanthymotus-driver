@@ -17,7 +17,6 @@ import uuid
 import numpy as np
 
 from common.camera_mount import BodyMountSource
-from common.capture_clock import host_clock_reference
 
 
 def depth_compressor():
@@ -98,8 +97,9 @@ def camera_declarations(root, geometry, clock, *, color_topic=None, depth_topic=
                   distortion_model='pinhole', source='derived-from-K',
                   vendor=dict(frame_id=geometry['frame_id'], clock_id=clock,
                               registration='registered_rectified',
-                              registration_source='orbbec_hw_registered_common_optical_rays',
-                              timestamp_semantics='source_capture_mapped'))
+                              registration_source='orbbec_depth_registration_to_color',
+                              registration_accuracy_validated=False,
+                              timestamp_semantics='source_capture_unverified_host_relation'))
     color = dict(deepcopy(common), topic=color_topic or root + '/color', format='image/jpeg')
     depth = dict(deepcopy(common), topic=depth_topic or root + '/depth', format='image/depth-zlib')
     depth['vendor'].update(depth_unit='mm', depth_source='measured')
@@ -276,7 +276,8 @@ class RgbdCameraPlugin:
 
     @property
     def color_topic(self):
-        return self.root.rsplit('/camera/rgbd', 1)[0] + '/camera/head'
+        # The original display /camera/head stays independent.
+        return self.root + '/color'
 
     @property
     def depth_topic(self):
@@ -329,14 +330,10 @@ class RgbdCameraPlugin:
     def _declarations(self):
         declarations = camera_declarations(self.root, self.geometry, self.clock,
             color_topic=self.color_topic, depth_topic=self.depth_topic) if self.geometry is not None else []
-        if self.registered:
-            # The verified global source mode maps exposure timestamps to the
-            # host realtime clock; retain the original headers and source ID.
-            # No SDK mapping uncertainty bound is asserted here.
-            reference = host_clock_reference()
-            if reference is not None:
-                for entry in declarations:
-                    entry['vendor']['clock_reference'] = deepcopy(reference)
+        # Orbbec global time is a source setting, not a measured relation
+        # to chassis host realtime. Never assert a common clock by name.
+        for entry in declarations:
+            entry['vendor']['host_clock_relation'] = 'unverified'
         if getattr(self, 'body_mount', None) is not None:
             for entry in declarations:
                 entry['vendor']['body_mount'] = self.body_mount.declaration()
@@ -589,7 +586,8 @@ class RgbdCameraPlugin:
                 if self.client.service_is_ready():
                     self.parameter_stage = 'request'
                     request = GetParameters.Request()
-                    request.names = ['depth_registration', 'time_domain', 'enable_sync_host_time']
+                    request.names = ['depth_registration', 'time_domain', 'enable_sync_host_time',
+                                      'align_target_stream']
                     try:
                         self.future = self.client.call_async(request)
                         self.parameter_stage = 'response'
@@ -603,11 +601,15 @@ class RgbdCameraPlugin:
                 try:
                     values = self.future.result().values
                     self.parameter_values = dict(depth_registration=values[0].bool_value,
-                        time_domain=values[1].string_value[:64], enable_sync_host_time=values[2].bool_value)
+                        time_domain=values[1].string_value[:64], enable_sync_host_time=values[2].bool_value,
+                        align_target_stream=values[3].string_value[:64])
                     self.parameter_stage = 'validation'
-                    self.registered = (values[0].bool_value and values[1].string_value == 'global' and values[2].bool_value)
+                    # Orbbec global mode does not require enable_sync_host_time.
+                    # Only D2C alignment supports the declared common optical rays.
+                    self.registered = (values[0].bool_value and values[1].string_value == 'global'
+                                       and values[3].string_value.upper() == 'COLOR')
                     self.error = (None if self.registered else
-                                  'Orbbec requires registered depth and source global capture time')
+                                  'Orbbec requires depth-to-color registration and source global capture time')
                 except Exception as error:
                     self.error = ('source parameter response failed: ' + str(error))[:256]
                 self.future = None
@@ -773,12 +775,14 @@ class RgbdInputCard:
         port = dict(port, description='相机 IMU（里程计输入）' if self.kind == 'imu' else '配准相机数据')
         if self.kind == 'imu':
             port['name'] = 'camera_imu'
-        if self.kind == 'color':
+        if self.kind == 'color' and self.display is None:
             tool['topic_out'] = [port]
         else:
+            # Preserve existing display/Navi ports, adding paired VO/SLAM data.
             tool['topic_out'].append(port)
         with self.source.lock:
-            tool['camera_info'] = [d for d in self.source._declarations() if d['topic'] == port['topic']]
+            tool['camera_info'] = list(tool.get('camera_info') or []) + [
+                d for d in self.source._declarations() if d['topic'] == port['topic']]
             tool['imu_status'] = self.source._imu_status()
             tool['body_mount_status'] = self.source._body_mount_status()
             tool['source_status'] = self.source._source_status()
@@ -811,7 +815,7 @@ class RgbdInputCard:
         if action == 'start':
             self.start()
             deadline = time.monotonic() + 10.
-            while time.monotonic() < deadline:
+            while (self.display is None or self.kind == 'imu') and time.monotonic() < deadline:
                 with self.source.lock:
                     ready = (self.source._imu_status()['state'] == 'available' if self.kind == 'imu' else
                              self.source.registered and self.source.geometry is not None
@@ -829,7 +833,7 @@ class RgbdInputCard:
                      and self.source.count > 0 and not self.source.error)
             state = 'running' if self.running and self.source.running else 'idle'
             startup_error = None
-            if self.kind in ('color', 'depth') and self.running and not ready:
+            if self.kind in ('color', 'depth') and self.display is None and self.running and not ready:
                 state = 'error' if action == 'start' else 'unavailable'
                 if action == 'start':
                     startup_error = 'RGB-D startup incomplete: ' + tool['source_status']['reason']

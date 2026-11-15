@@ -343,12 +343,15 @@ class TianyiDeviceBundle:
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
             self._plugins.append(RgbdInputCard(rgbd_source, 'color',
-                CameraPlugin(plugins_cfg["camera"], namespace, ros2, monitor_only=True)))
+                CameraPlugin(plugins_cfg["camera"], namespace, ros2, monitor_only=False)))
             print("[bundle] CameraPlugin loaded")
 
         if plugins_cfg.get("camera_depth", {}).get("enabled", False):
-            self._plugins.append(RgbdInputCard(rgbd_source, 'depth'))
-            print("[bundle] shared calibrated depth loaded")
+            from device import DepthCameraPlugin
+            # Legacy navigation depth must stay independent of RGB-D pairing.
+            self._plugins.append(RgbdInputCard(rgbd_source, 'depth',
+                DepthCameraPlugin(plugins_cfg["camera_depth"], namespace, ros2)))
+            print("[bundle] legacy navigation depth and calibrated RGB-D loaded")
 
         if plugins_cfg.get("camera_snapshot", {}).get("enabled", False):
             from device import CameraSnapshotPlugin

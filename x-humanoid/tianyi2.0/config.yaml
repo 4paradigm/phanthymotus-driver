@@ -42,10 +42,9 @@ plugins:
     enabled: true
   camera_depth:
     enabled: true
-    # Estimated capture-time mount is enabled for Tianyi; the separate read-only
-    # companion must be running. Missing/invalid evidence leaves body mount
-    # unavailable without blocking RGB-D or IMU.
-    estimated_body_tf: true
+    # Estimated body TF needs a separately installed companion and checked mount.
+    # Explicit opt-in only; native TF remains available by default.
+    estimated_body_tf: false
     # The sole calibrated depth output serves display, VO and Point Cloud.
     # Limit the shared stream by capture time and keep only the newest pair.
     hz: 8
