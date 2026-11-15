@@ -204,6 +204,13 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        if plugins_cfg.get("object_memory", {}).get("enabled", False):
+            # 记忆：订阅 scene_graph 的产出并持久化，不直接读相机。
+            from object_memory_card import ObjectMemoryPlugin
+            self._plugins.append(ObjectMemoryPlugin(
+                plugins_cfg["object_memory"], namespace, executor))
+            print("[bundle] ObjectMemoryPlugin loaded")
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):

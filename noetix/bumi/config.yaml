@@ -93,3 +93,13 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+  # 物品位置记忆：订阅 scene_graph 的场景图和标注截图并持久化。
+  # 单独使用：remember/list/get/forget/info 管理记忆。
+  # 与完整流水线组合：发布完整 memory 到 object_memory/state，并写
+  # memory.json 供 object_locator 读取；不读相机、不跑检测、不做问答。
+  object_memory:
+    enabled: true
+    storage_dir: /opt/phanthy-motus/data/memory_palace
+    # 留空使用 /<namespace>/scene_graph/state 与 /<namespace>/scene_graph/evidence
+    scene_topic: ""
+    evidence_topic: ""
