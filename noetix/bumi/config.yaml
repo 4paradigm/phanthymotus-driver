@@ -6,10 +6,10 @@ plugins:
     enabled: true
   loco:
     enabled: true
-  # Experimental App TCP backend; status query verified, switching awaits
-  # on-site acceptance. Requires loco for shared chassis arbitration.
+  # Register the card by default; switching still awaits on-site acceptance.
+  # Requires loco for shared chassis arbitration. Startup sends no switch.
   walking_mode:
-    enabled: false
+    enabled: true
     # Empty: passively discover perception_ip from this SDK motion board.
     # An explicit app_host can be set when UDP discovery is unavailable.
     app_host: ""

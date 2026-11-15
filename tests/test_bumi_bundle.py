@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -173,6 +174,35 @@ def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
 
     assert [tool["name"] for tool in bundle.get_all_tools()] == [
         "loco", "loco_servo", "speaker"]
+
+
+def test_packaged_defaults_advertise_walking_mode_without_contacting_robot(
+        bundle_module, monkeypatch):
+    """A fresh image exposes the card without issuing a motion command."""
+    import walking_mode
+
+    def unexpected_access(*_args, **_kwargs):
+        raise AssertionError("registering a card must not contact the robot")
+
+    class ControllerTripwire:
+        def __getattr__(self, _name):
+            raise AssertionError("registering a card must not access the SDK")
+
+    monkeypatch.setattr(walking_mode, "discover_host", unexpected_access)
+    monkeypatch.setattr(walking_mode, "WalkingModeClient", unexpected_access)
+    default = yaml.safe_load((BUMI / "config.yaml").read_text(encoding="utf-8"))
+    plugins = default["plugins"]
+    config = {"plugins": {name: plugins[name] for name in ("loco", "walking_mode")}}
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), ControllerTripwire(), None)
+
+    bundle.start_all()
+    tools = {tool["name"]: tool for tool in bundle.get_all_tools()}
+    schema = tools["walking_mode"]["inputSchema"]
+    assert schema["required"] == ["walking_model"]
+    assert schema["properties"]["walking_model"]["enum"] == ["lower_body", "whole_body"]
+    assert bundle.dispatch("walking_mode", {"action": "info"})["command_sent"] is False
+    bundle.stop_all()
 
 
 @pytest.mark.parametrize("model", ["lower_body", "whole_body"])

@@ -1,7 +1,8 @@
 """Bumi walking-mode selection through the official App's TCP protocol.
 
 The SDK is used only for feedback. Its RUN command remains unverified and is
-never sent. The card stays disabled by default pending an on-site switch test.
+never sent. The card is visible by default; mode switching awaits hardware
+acceptance and is never triggered by registration or startup.
 """
 
 from __future__ import annotations
