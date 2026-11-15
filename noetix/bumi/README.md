@@ -1,6 +1,6 @@
 # Noetix Bumi driver
 
-The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
+The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the scene-graph/annotated-screenshot card lives in `scene_graph_card.py` (shared scene logic in `scene_graph_core.py`); the other cards remain in `device.py`.
 
 ## `mic` and `sound_direction`
 
@@ -367,6 +367,122 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 
 `footprint` 的出错方向是单边的（以为自己更宽只是多减速，以为更窄就是把肩膀送进
 门框），所以默认值刻意偏宽；死区不是，所以它宁可声明成估计值也不写零。
+
+## `scene_graph` 卡片：场景图 + 标注截图
+
+这个拷贝只保留位置记忆流水线的第一张卡：消费 VOP 开放词表检测和 Bumi RGB/深度，
+输出**一张完整场景图**和**一张标注截图**。
+
+两种用法：
+
+- **单独使用**：`snapshot` 直接返回完整场景图、物体列表、空间关系、场景 JSON
+  路径和截图路径；`last` 取回最近一次（重启后也能取）。
+- **与完整流水线组合**：同时发布 `scene_graph/state`（完整场景图 JSON）和
+  `scene_graph/evidence`（标注 JPEG），`object_memory` / `object_locator`
+  可以直接接这两路话题，不需要改代码。
+
+### 单独使用
+
+```json
+{"tool": "scene_graph", "action": "snapshot"}
+{"tool": "scene_graph", "action": "last"}
+```
+
+`snapshot` 返回（节选）：
+
+```json
+{
+  "state": "captured",
+  "scene_id": "3f2a...",
+  "count": 2,
+  "labels": ["keys", "cup"],
+  "objects": [{"label": "keys", "distance_m": 0.82, "pixel": [301, 244]}],
+  "edges": [{"source": "obj1", "relation": "left_of", "target": "obj2"}],
+  "scene": {"id": "3f2a...", "nodes": [], "edges": []},
+  "scene_path": "/opt/phanthy-motus/data/scene_graph/scenes/scene_3f2a....json",
+  "evidence_path": "/opt/phanthy-motus/data/scene_graph/evidence/scene_3f2a....jpg",
+  "scene_topic": "/<ns>/scene_graph/state",
+  "evidence_topic": "/<ns>/scene_graph/evidence"
+}
+```
+
+`snapshot` 可选 `label`：在截图里高亮这个标签（不填则所有物体绿色圆圈）。
+
+```json
+{"tool": "scene_graph", "action": "snapshot", "label": "keys"}
+```
+
+### 输出完整性
+
+场景 JSON（`scene` 字段 / `scene_graph/state` 话题 / `scenes/*.json`）包含：
+
+- `id`、`captured_at`、`captured_at_text`、`width`、`height`、`depth_available`；
+- `intrinsics`（`fx/fy/ppx/ppy`，来自基本 camera 卡的运行时 K）和 `depth_scale`；
+- `source`（RGB/深度/VOP 话题名）；
+- `nodes`：`label`、`label_key`、`confidence`、`position`（VOP 归一化）、
+  `pixel`、`distance_m`、`robot`（前/左/上，米）；
+- `edges`：左右/前后/上下/附近关系；
+- `scene_path`、`evidence_path`。
+
+因此下游可以直接构图、查询、存记忆；单独使用时也能拿到完整图和截图文件。
+
+### 与基本卡片的关系
+
+| 基本卡片 | 本卡片怎么用 |
+|---|---|
+| `camera` / `depth` | 只订阅它们的 `topic_out`，不打开第二路 RealSense；启动时读取 `camera` 卡声明的 RGB/深度话题和运行时内参，只有相机卡不可用时才回退到默认值 |
+| `vision_capture` | 仍是唯一的照片/视频采集卡；`scene_graph.snapshot` 只生成场景图和证据 JPEG，不保存媒体，不替代 `capture_photo`/`record_video` |
+| `visual_odometry` | 与场景图并行、互不占用；本卡片不做世界坐标地图 |
+| VOP（平台感知卡） | 开放词表检测由 VOP 提供；本卡片不训练、不内置检测模型 |
+
+### 动作与话题
+
+| action | 说明 |
+|---|---|
+| `snapshot` | 抓取当前 VOP + 相机帧；返回完整场景图和截图路径，发布 state/evidence |
+| `last` | 返回最近一次场景图和截图路径（从 `latest.json` 恢复） |
+| `start` | 检查 ROS 输入和存储目录 |
+| `info` | 输入话题、数据新鲜度、存储路径、最近场景 |
+
+| 方向 | 话题 |
+|---|---|
+| 输入 | `camera/color`、`camera/depth`、`<rgb>/objects` |
+| 输出 | `/<ns>/scene_graph/state`（data/json）、`/<ns>/scene_graph/evidence`（image/jpeg） |
+
+### 存储
+
+默认 `/opt/phanthy-motus/data/scene_graph/`：
+
+```text
+scenes/scene_<id>.json   # 完整场景图
+evidence/scene_<id>.jpg  # 标注截图
+latest.json              # 最近一次指针，供 last 重启后恢复
+```
+
+### 配置
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `storage_dir` | `/opt/phanthy-motus/data/scene_graph` | 场景图/截图/最新指针目录 |
+| `rgb_topic` | 跟随 `camera` 卡 `topic_out`；回退 `/<namespace>/camera/color` | RGB 输入 |
+| `depth_topic` | 跟随 `depth` 卡 `topic_out`；回退 `/<namespace>/camera/depth` | 深度输入（可选） |
+| `objects_topic` | `<rgb_topic>/objects` | VOP 输出 |
+| `depth_scale` | `0.001` | Z16 原始单位 → 米 |
+
+不需要新增系统包或 Python 依赖：`numpy`/`opencv-python-headless` 已在镜像里。
+
+### 限制
+
+- 没有 VOP 输入时 `snapshot` 返回 `detector_unavailable`，不会伪造位置；
+- VOP 只给中心点、不给检测框，所以截图上是目标圆圈/准星，不是矩形框；
+- 深度缺失时仍输出场景图和 2D 关系，但没有 `distance_m` / `robot`；
+- Bumi 没有全局定位；这里只记录“看到时相对机器人/其他物体”的位置。
+
+测试：
+
+```bash
+python -m pytest noetix/bumi/tests/test_scene_graph.py noetix/bumi/tests/test_scene_graph_card.py -q
+```
 
 ## Direct action cards
 

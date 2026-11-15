@@ -93,3 +93,17 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+  # 场景图与标注截图：消费 VOP 开放词表检测 + Bumi RGB/深度。
+  # 单独使用：snapshot 返回完整场景图和截图路径，last 取回最近一次。
+  # 与完整流水线组合：发布 scene_graph/state 与 scene_graph/evidence 给
+  # object_memory / object_locator 使用。
+  scene_graph:
+    enabled: true
+    storage_dir: /opt/phanthy-motus/data/scene_graph
+    # 留空使用 camera 卡声明的 RGB/深度话题，回退到 /<namespace>/camera/*
+    rgb_topic: ""
+    depth_topic: ""
+    # 留空使用 <rgb_topic>/objects（VOP 输出）
+    objects_topic: ""
+    # D435i 的 Z16 单位换算；默认 1 mm
+    depth_scale: 0.001
