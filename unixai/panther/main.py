@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import signal
 import threading
+import time
 from http.server import ThreadingHTTPServer
 
 from common import logsafe
@@ -33,7 +34,22 @@ def main() -> None:
     rclpy.init(domain_id=body_domain)
     executor = rclpy.executors.MultiThreadedExecutor(num_threads=6)
     device = PantherDevice(config, namespace, executor)
-    spin_thread = threading.Thread(target=executor.spin, daemon=True, name="panther_ros")
+    def spin_ros() -> None:
+        failures = 0
+        while rclpy.ok():
+            try:
+                executor.spin_once(timeout_sec=0.1)
+            except Exception as exc:
+                failures += 1
+                if failures == 1 or failures % 100 == 0:
+                    print(
+                        f"[ros] executor callback failed #{failures}: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                time.sleep(0.01)
+
+    spin_thread = threading.Thread(target=spin_ros, daemon=True, name="panther_ros")
     spin_thread.start()
     device.start()
     bundle = DriverBundle(build_plugins(config, namespace, device))

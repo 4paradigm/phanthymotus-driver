@@ -135,6 +135,26 @@ class PantherDriverTest(unittest.TestCase):
         self.assertAlmostEqual(converted[2], math.radians(-45.0))
         self.assertAlmostEqual(converted[3], math.radians(90.0))
 
+    def test_ros_byte_fields_decode_by_value(self):
+        self.assertEqual(contracts.byte_value(b"\x02", "level"), 2)
+        self.assertEqual(contracts.byte_value(bytearray([3]), "level"), 3)
+        self.assertEqual(contracts.byte_value(1, "level"), 1)
+        with self.assertRaisesRegex(ValueError, "exactly one byte"):
+            contracts.byte_value(b"12", "level")
+
+    def test_sensor_start_rejects_missing_or_stale_device_data(self):
+        class FakeDevice:
+            topics = {"imu": {"topic": "/test/imu", "format": "data/json"}}
+
+            @staticmethod
+            def sensor_info(_name):
+                return {"available": False, "fresh": False, "source_topic": "/imu"}
+
+        plugin = plugins.SensorPlugin(FakeDevice(), "imu", "test", ["imu"])
+        with self.assertRaisesRegex(RuntimeError, "no fresh data received from /imu"):
+            plugin.dispatch("start", {})
+        self.assertEqual(plugin.dispatch("info", {})["state"], "unavailable")
+
     def test_bundled_model_and_standardized_streams_are_packaged(self):
         model = DRIVER / "resource" / "panther.urdf"
         self.assertTrue(model.exists())
@@ -266,10 +286,14 @@ class PantherDriverTest(unittest.TestCase):
         plugin.dispatch("start", {})
         self.assertEqual(device.calls, [("rgb", "start")])
 
-    def test_camera_only_manages_its_unique_transient_unit(self):
+    def test_camera_uses_one_fixed_transient_unit_and_dds_profile(self):
         runtime = object.__new__(camera.PantherCameraRuntime)
         runtime._node = SimpleNamespace(count_publishers=lambda _topic: 0)
         runtime._lock = threading.RLock()
+        runtime._config = {
+            "workspace": "/home/unix_ai/orbbec_ws",
+            "cyclonedds_profile": "/home/unix_ai/config/cyclonedds.xml",
+        }
         runtime._source_unit = None
         runtime._managed_unit = None
         calls = []
@@ -278,21 +302,25 @@ class PantherDriverTest(unittest.TestCase):
             calls.append((command, timeout, check))
             if command[:2] == ["systemctl", "is-active"]:
                 return SimpleNamespace(stdout="inactive\n", returncode=3)
-            return SimpleNamespace(stdout="", returncode=0)
+            if command[:2] == ["systemctl", "cat"]:
+                return SimpleNamespace(stdout="", stderr="", returncode=1)
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
 
         runtime._run_host = run_host
         runtime._ensure_source()
         commands = [call[0] for call in calls]
-        self.assertFalse(any(command[:2] == ["systemctl", "start"] for command in commands))
         launch = next(command for command in commands if command[0] == "systemd-run")
         unit = next(value.split("=", 1)[1] for value in launch if value.startswith("--unit="))
-        self.assertRegex(unit, r"^panther-orbbec-motus-[0-9a-f]{12}\.service$")
+        self.assertEqual(unit, camera.PantherCameraRuntime.HOST_UNIT)
+        launch_script = launch[-1]
+        self.assertIn("CYCLONEDDS_URI=file:///home/unix_ai/config/cyclonedds.xml", launch_script)
         self.assertEqual(runtime._managed_unit, unit)
         self.assertEqual(runtime._source_unit, unit)
 
         external = object.__new__(camera.PantherCameraRuntime)
         external._node = SimpleNamespace(count_publishers=lambda _topic: 0)
         external._lock = threading.RLock()
+        external._config = {}
         external._source_unit = None
         external._managed_unit = None
         external_calls = []
@@ -306,6 +334,22 @@ class PantherDriverTest(unittest.TestCase):
         self.assertEqual(len(external_calls), 1)
         self.assertEqual(external._source_unit, camera.PantherCameraRuntime.HOST_UNIT)
         self.assertIsNone(external._managed_unit)
+
+    def test_camera_start_requires_a_real_first_frame(self):
+        runtime = object.__new__(camera.PantherCameraRuntime)
+        runtime._node = SimpleNamespace(count_publishers=lambda _topic: 1)
+        runtime._config = {"startup_timeout_s": 0.01, "first_frame_grace_s": 0.01}
+        runtime._active = set()
+        runtime._lock = threading.RLock()
+        runtime._source_lock = threading.Lock()
+        runtime._frames = {"rgb": None, "depth": None}
+        runtime._last_frame_at = {"rgb": 0.0, "depth": 0.0}
+        runtime._armed_at = 0.0
+        runtime._watchdog_restarts = 0
+        runtime._ensure_source = lambda: None
+        with self.assertRaisesRegex(RuntimeError, "no frame was received"):
+            runtime.start("rgb")
+        self.assertNotIn("rgb", runtime._active)
 
     def test_camera_frame_failures_are_bounded_and_sampled(self):
         runtime = object.__new__(camera.PantherCameraRuntime)
@@ -372,6 +416,17 @@ class PantherDriverTest(unittest.TestCase):
         self.assertIn("CYCLONEDDS_URI=file:///etc/cyclonedds/panther.xml", service)
         self.assertIn("network_mode: host", service)
         self.assertIn("stop_grace_period: 30s", service)
+
+    def test_verified_sdk_limits_and_topics_are_configured(self):
+        config = (DRIVER / "config.yaml").read_text()
+        main = (DRIVER / "main.py").read_text()
+        self.assertIn('cmd_topics: ["/cmd_vel", "/cmd_vel_teleop"]', config)
+        self.assertIn("min_position_m: 0.0", config)
+        self.assertIn("max_position_m: 0.8", config)
+        self.assertIn("yaw_min_deg: -90.0", config)
+        self.assertIn("pitch_min_deg: -86.0", config)
+        self.assertIn("home_pose_deg: {yaw_deg: 0.0, pitch_deg: 0.0}", config)
+        self.assertIn("executor.spin_once", main)
 
     def test_dockerfile_builds_observed_gripper_interface(self):
         dockerfile = (DRIVER / "Dockerfile").read_text()

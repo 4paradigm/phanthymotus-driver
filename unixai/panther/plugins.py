@@ -40,8 +40,18 @@ class SensorPlugin:
         del args
         if action == "stop":
             return {"state": "idle"}
+        if action == "start" and self.name == "robot_state":
+            # robot_state includes controller readiness. Query it now instead
+            # of reporting failure merely because the background poll has not
+            # completed its first cycle yet.
+            self.device.controller_states()
         data = self.device.sensor_info(self.name)
-        return {"state": "running", "data": data,
+        if action == "start" and (not data.get("available") or not data.get("fresh")):
+            source = data.get("source_topic") or data.get("source") or self.name
+            detail = data.get("last_callback_error")
+            suffix = f"; last callback error: {detail}" if detail else ""
+            raise RuntimeError(f"no fresh data received from {source}{suffix}")
+        return {"state": "running" if data.get("fresh") else "unavailable", "data": data,
                 "topic_out": [self.device.topics[card] for card in self.topic_cards]}
 
 
@@ -210,7 +220,7 @@ def build_plugins(config, namespace, device):
             {"actions": ["move"], "timeout": cfg["max_duration_s"] + 10},
             True,
         )
-        plugins.append(ActuatorPlugin(device, "base_drive", "Finite-duration omnidirectional drive through /cmd_vel_teleop", schema, device.drive))
+        plugins.append(ActuatorPlugin(device, "base_drive", "Finite-duration omnidirectional Panther base drive", schema, device.drive))
     if on("arm_control"):
         joint_fields = {
             **{f"la{i}_deg": {"type": "number", "description": f"Left arm joint la{i} target in degrees; omitted joints hold their current positions"}
@@ -251,7 +261,7 @@ def build_plugins(config, namespace, device):
     if on("lifting"):
         schema = _action_schema(
             ["start", "info", "set_position"],
-            {"position_m": {"type": "number", "minimum": 0.0, "maximum": enabled["lifting"]["max_position_m"]},
+            {"position_m": {"type": "number", "minimum": enabled["lifting"].get("min_position_m", 0.0), "maximum": enabled["lifting"]["max_position_m"]},
              "confirm_motion": confirm},
             {"set_position": {"params": ["position_m", "confirm_motion"]},
              "start": {"params": []}, "info": {"params": []}}, "waist")
@@ -259,8 +269,12 @@ def build_plugins(config, namespace, device):
     if on("head"):
         schema = _action_schema(
             ["start", "info", "look", "home", "stop"],
-            {"yaw_deg": {"type": "number", "description": "Horizontal head angle in degrees"},
-             "pitch_deg": {"type": "number", "description": "Head pitch angle in degrees"},
+            {"yaw_deg": {"type": "number", "minimum": enabled["head"].get("yaw_min_deg", -90.0),
+                         "maximum": enabled["head"].get("yaw_max_deg", 90.0),
+                         "description": "Horizontal head angle in degrees"},
+             "pitch_deg": {"type": "number", "minimum": enabled["head"].get("pitch_min_deg", -86.0),
+                           "maximum": enabled["head"].get("pitch_max_deg", 20.0),
+                           "description": "Head pitch angle in degrees"},
              "confirm_motion": confirm},
             {"look": {"params": ["yaw_deg", "pitch_deg", "confirm_motion"]},
              "home": {"params": ["confirm_motion"]}, "stop": {"params": []},

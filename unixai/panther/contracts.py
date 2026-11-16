@@ -33,6 +33,28 @@ def finite_vector(value, field: str, length: int) -> list[float]:
     return [finite_number(item, f"{field}[{index}]") for index, item in enumerate(value)]
 
 
+def byte_value(value, field: str = "byte") -> int:
+    """Return a ROS ``byte`` as an integer.
+
+    ROS 2 Humble exposes ``diagnostic_msgs/DiagnosticStatus.level`` as a
+    one-byte ``bytes`` value on Panther, rather than as a Python integer.
+    ``int(b"\x02")`` tries to parse ASCII digits and raises, so bytes must be
+    decoded by value instead.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        if len(value) != 1:
+            raise ValueError(f"{field} must contain exactly one byte")
+        return value[0]
+    if isinstance(value, str):
+        if len(value) != 1:
+            raise ValueError(f"{field} must contain exactly one character")
+        return ord(value)
+    number = int(value)
+    if not 0 <= number <= 255:
+        raise ValueError(f"{field} must be in [0, 255]")
+    return number
+
+
 def degrees_to_radians(value, field: str) -> float:
     return math.radians(finite_number(value, field))
 
@@ -105,7 +127,7 @@ def validate_joint_target(
     positions,
     limits: dict[str, tuple[float, float]],
     current: dict[str, float],
-    max_delta_rad: float,
+    max_delta_rad: Optional[float],
 ) -> list[float]:
     target = finite_vector(positions, "positions", len(joint_names))
     missing_limits = [name for name in joint_names if name not in limits]
@@ -116,9 +138,11 @@ def validate_joint_target(
     missing_state = [name for name in joint_names if name not in current]
     if missing_state:
         raise ValueError("fresh joint state is missing: " + ", ".join(missing_state))
-    max_delta = finite_number(max_delta_rad, "max_delta_rad")
-    if max_delta <= 0:
-        raise ValueError("max_delta_rad must be positive")
+    max_delta = None
+    if max_delta_rad is not None:
+        max_delta = finite_number(max_delta_rad, "max_delta_rad")
+        if max_delta <= 0:
+            raise ValueError("max_delta_rad must be positive")
     for name, value in zip(joint_names, target):
         lower, upper = limits[name]
         if not lower <= value <= upper:
@@ -127,7 +151,7 @@ def validate_joint_target(
                 f"[{math.degrees(lower):.2f}, {math.degrees(upper):.2f}] deg"
             )
         delta = abs(value - float(current[name]))
-        if delta > max_delta:
+        if max_delta is not None and delta > max_delta:
             raise ValueError(
                 f"{name} target delta {math.degrees(delta):.2f} deg exceeds commissioning gate "
                 f"{math.degrees(max_delta):.2f} deg"

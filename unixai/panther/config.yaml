@@ -20,6 +20,8 @@ plugins:
   laser_scan: {enabled: true}
 
   camera:
+    workspace: "/home/unix_ai/orbbec_ws"
+    cyclonedds_profile: "/home/unix_ai/config/cyclonedds.xml"
     startup_timeout_s: 30.0
     first_frame_grace_s: 30.0
     frame_stall_s: 15.0
@@ -34,7 +36,8 @@ plugins:
   base_drive:
     enabled: true
     # Operator-approved working caps; ROS receives angular velocity in radians/s.
-    topic: "/cmd_vel_teleop"
+    # Prefer the SDK topic; retain the deployed teleop topic as a fallback.
+    cmd_topics: ["/cmd_vel", "/cmd_vel_teleop"]
     max_linear_mps: 0.50
     max_angular_deg_s: 45.0
     max_duration_s: 10.0
@@ -47,19 +50,42 @@ plugins:
     speed_deg_s: 20.0
     # Additional commissioning gate; URDF hard limits are always enforced too.
     max_target_delta_deg: 20.0
-    # Deliberately unset until the operator approves a collision-safe pose.
-    home_pose_deg: null
-  gripper: {enabled: true}
+    # PR 521's verified home pose; canvas values remain degrees.
+    home_pose_deg:
+      joint_la0: 0.0
+      joint_la1: 0.0
+      joint_la2: 0.0
+      joint_la3: 0.0
+      joint_la4: 0.0
+      joint_la5: 0.0
+      joint_la6: 0.0
+      joint_la7: 0.0
+      joint_ra0: 0.0
+      joint_ra1: 0.0
+      joint_ra2: 0.0
+      joint_ra3: 0.0
+      joint_ra4: 0.0
+      joint_ra5: 0.0
+      joint_ra6: 0.0
+      joint_ra7: 0.0
+  gripper:
+    enabled: true
+    open_position: 0.0
+    closed_position: 1.0
   lifting:
     enabled: true
+    min_position_m: 0.0
     max_position_m: 0.8
   head:
     enabled: true
+    yaw_min_deg: -90.0
+    yaw_max_deg: 90.0
+    pitch_min_deg: -86.0
+    pitch_max_deg: 20.0
     home_speed_deg_s: 20.0
     home_publish_rate_hz: 20.0
-    # Deliberately unset until a collision-safe pose is approved.
     # Runtime-verified channel order: yaw -> joint_head0, pitch -> joint_head1.
-    home_pose_deg: null
+    home_pose_deg: {yaw_deg: 0.0, pitch_deg: 0.0}
 
   # Continuous 50 Hz arm servo remains disabled until watchdog/hold behavior
   # has been measured on Panther hardware.

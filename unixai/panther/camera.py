@@ -8,9 +8,9 @@ only disarms its forwarding path so other host consumers are not interrupted.
 from __future__ import annotations
 
 import subprocess
+import shlex
 import threading
 import time
-import uuid
 import zlib
 
 
@@ -59,10 +59,17 @@ class PantherCameraRuntime:
             last = self._last_frame_at[kind]
             source_unit = self._source_unit
             managed_unit = self._managed_unit
+        frame_fresh = bool(
+            last
+            and time.monotonic() - last < float(self._config.get("frame_stall_s", 15.0))
+        )
+        publishers = self._node.count_publishers(source)
         return {
-            "state": "running" if active else "idle",
+            "state": "running" if active and frame_fresh else "unavailable" if active else "idle",
+            "available": publishers > 0 and last > 0,
+            "fresh": frame_fresh,
             "source_topic": source,
-            "publisher_count": self._node.count_publishers(source),
+            "publisher_count": publishers,
             "last_frame_age_ms": None if not last else int((time.monotonic() - last) * 1000),
             "host_service": source_unit,
             "host_service_managed": managed_unit is not None,
@@ -71,28 +78,50 @@ class PantherCameraRuntime:
     def start(self, kind: str) -> dict:
         if kind not in ("rgb", "depth"):
             raise ValueError("camera kind must be rgb or depth")
-        with self._lock:
-            already_active = kind in self._active
-        if already_active:
-            return self.info(kind)
-
-        with self._source_lock:
-            self._ensure_source()
-        deadline = time.monotonic() + float(self._config.get("startup_timeout_s", 30.0))
         required = self.COLOR_TOPIC if kind == "rgb" else self.DEPTH_TOPIC
-        while time.monotonic() < deadline and self._node.count_publishers(required) < 1:
-            time.sleep(0.2)
-        if self._node.count_publishers(required) < 1:
-            raise RuntimeError(f"Orbbec started but no publisher appeared on {required}")
-
         with self._lock:
+            last = self._last_frame_at[kind]
+            already_ready = (
+                kind in self._active
+                and last > 0
+                and time.monotonic() - last < float(self._config.get("frame_stall_s", 15.0))
+            )
+            if already_ready:
+                return self.info(kind)
             if not self._active:
-                self._armed_at = time.monotonic()
                 self._watchdog_restarts = 0
+            # The watchdog's first-frame grace starts when this stream is
+            # armed, including when the sibling RGB/depth stream is already on.
+            self._armed_at = time.monotonic()
             self._active.add(kind)
             self._frames[kind] = None
             self._last_frame_at[kind] = 0.0
-        return self.info(kind)
+        try:
+            with self._source_lock:
+                self._ensure_source()
+            publisher_deadline = time.monotonic() + float(
+                self._config.get("startup_timeout_s", 30.0)
+            )
+            while time.monotonic() < publisher_deadline and self._node.count_publishers(required) < 1:
+                time.sleep(0.2)
+            if self._node.count_publishers(required) < 1:
+                raise RuntimeError(f"no publisher appeared on {required}")
+
+            frame_deadline = time.monotonic() + float(
+                self._config.get("first_frame_grace_s", 30.0)
+            )
+            while time.monotonic() < frame_deadline:
+                with self._lock:
+                    if self._last_frame_at[kind] > 0:
+                        return self.info(kind)
+                time.sleep(0.05)
+            raise RuntimeError(f"publisher appeared but no frame was received on {required}")
+        except Exception:
+            with self._lock:
+                self._active.discard(kind)
+                self._frames[kind] = None
+                self._last_frame_at[kind] = 0.0
+            raise
 
     def stop(self, kind: str) -> dict:
         with self._lock:
@@ -111,7 +140,7 @@ class PantherCameraRuntime:
             thread.join(timeout=2.0)
         if managed_unit:
             try:
-                self._run_host(["systemctl", "stop", managed_unit], timeout=15.0)
+                self._run_host(["systemctl", "stop", "--no-block", managed_unit], timeout=15.0)
                 print(f"[camera] stopped managed host unit {managed_unit}", flush=True)
             except Exception as exc:
                 print(f"[camera] failed to stop managed host unit: {exc}", flush=True)
@@ -133,9 +162,7 @@ class PantherCameraRuntime:
         if self._node.count_publishers(self.COLOR_TOPIC) or self._node.count_publishers(self.DEPTH_TOPIC):
             return
 
-        active = self._run_host(
-            ["systemctl", "is-active", self.HOST_UNIT], timeout=5.0, check=False
-        )
+        active = self._run_host(["systemctl", "is-active", self.HOST_UNIT], timeout=5.0, check=False)
         if active.stdout.strip() == "active":
             # It belonged to the host or another process before this driver.
             # Use it, but never stop or watchdog-restart something we do not own.
@@ -143,19 +170,42 @@ class PantherCameraRuntime:
                 self._source_unit = self.HOST_UNIT
             return
 
-        # Never start or claim a loaded-but-inactive host unit. Create a unique
-        # transient unit instead, and only stop/restart that exact owned unit.
-        managed_unit = f"panther-orbbec-motus-{uuid.uuid4().hex[:12]}.service"
+        # If the host already defines the fixed unit, start it but do not claim
+        # ownership. This matches PR 521 and avoids duplicate Orbbec processes.
+        defined = self._run_host(["systemctl", "cat", self.HOST_UNIT], timeout=5.0, check=False)
+        if defined.returncode == 0:
+            started = self._run_host(["systemctl", "start", self.HOST_UNIT], timeout=30.0, check=False)
+            if started.returncode != 0:
+                detail = (started.stderr or started.stdout or "unknown systemd error").strip()
+                raise RuntimeError(f"failed to start {self.HOST_UNIT}: {detail}")
+            with self._lock:
+                self._source_unit = self.HOST_UNIT
+            return
+
+        workspace = str(self._config.get("workspace", "/home/unix_ai/orbbec_ws"))
+        profile = str(
+            self._config.get("cyclonedds_profile", "/home/unix_ai/config/cyclonedds.xml")
+        )
+        for flag, path, label in (("-d", workspace, "Orbbec workspace"),
+                                  ("-f", profile, "CycloneDDS profile")):
+            checked = self._run_host(["test", flag, path], timeout=5.0, check=False)
+            if checked.returncode != 0:
+                raise RuntimeError(f"{label} is missing on the host: {path}")
+
+        # Create one stable transient unit. A fixed name makes ownership and
+        # process state observable, and prevents repeated starts from creating
+        # multiple camera drivers.
         launch = (
-            "cd /home/unix_ai/orbbec_ws && "
+            f"cd {shlex.quote(workspace)} && "
             ". install/setup.bash && "
-            "export ROS_DOMAIN_ID=0 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && "
+            "export ROS_DOMAIN_ID=0 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp "
+            f"CYCLONEDDS_URI={shlex.quote('file://' + profile)} && "
             "exec ros2 launch orbbec_camera gemini2.launch.py"
         )
         self._run_host(
             [
                 "systemd-run",
-                f"--unit={managed_unit}",
+                f"--unit={self.HOST_UNIT}",
                 "--collect",
                 "--property=Restart=on-failure",
                 "--property=RestartSec=2s",
@@ -168,8 +218,8 @@ class PantherCameraRuntime:
             timeout=15.0,
         )
         with self._lock:
-            self._source_unit = managed_unit
-            self._managed_unit = managed_unit
+            self._source_unit = self.HOST_UNIT
+            self._managed_unit = self.HOST_UNIT
 
     @staticmethod
     def _bounded_error(exc: Exception, limit: int = 240) -> str:

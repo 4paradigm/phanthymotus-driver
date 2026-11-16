@@ -23,6 +23,7 @@ from contracts import (
     LEFT_ARM_JOINTS,
     RIGHT_ARM_JOINTS,
     age_ms,
+    byte_value,
     degrees_vector_to_radians,
     finite_number,
     fresh,
@@ -87,6 +88,8 @@ def _message_dict(value):
         return value
     if isinstance(value, float):
         return json_float(value)
+    if isinstance(value, (bytes, bytearray)):
+        return list(value)
     if isinstance(value, (list, tuple)):
         return [_message_dict(item) for item in value]
     fields = getattr(value, "get_fields_and_field_types", None)
@@ -117,6 +120,7 @@ class PantherDevice:
         self._lock = threading.RLock()
         self._cache: dict[str, tuple[object, float]] = {}
         self._last_card_publish: dict[str, float] = {}
+        self._callback_errors: dict[str, dict] = {}
         self._model_urdf = MODEL_PATH.read_text(encoding="utf-8")
         self._model_joint_indices = parse_joint_indices(self._model_urdf)
         self._model_joint_limits = parse_joint_limits(self._model_urdf)
@@ -137,6 +141,9 @@ class PantherDevice:
         self._drive_lock = threading.Lock()
         self._drive_generation = 0
         self._drive_action_id = None
+        self._drive_topic = None
+        self._drive_pub = None
+        self._controller_query_lock = threading.Lock()
         self._arm_lock = threading.RLock()
         self._arm_active = None
         self._head_lock = threading.RLock()
@@ -165,50 +172,58 @@ class PantherDevice:
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
 
-        self._node.create_subscription(JointState, "/joint_states", self._on_joints, sensor_qos)
+        def guarded(card, callback):
+            return lambda *args: self._safe_callback(card, callback, *args)
+
+        self._node.create_subscription(
+            JointState, "/joint_states", guarded("joints", self._on_joints), sensor_qos
+        )
         self._node.create_subscription(
             BatteryState,
             "/battery_state_broadcaster/battery_state",
-            self._on_battery,
+            guarded("robot_state", self._on_battery),
             sensor_qos,
         )
         self._node.create_subscription(
             Imu,
             "/imu_sensor_broadcaster/imu",
-            lambda msg: self._store_and_publish("imu", msg, self._imu_payload),
+            guarded("imu", lambda msg: self._store_and_publish("imu", msg, self._imu_payload)),
             sensor_qos,
         )
-        self._node.create_subscription(Odometry, "/odom", self._on_odom, sensor_qos)
-        self._node.create_timer(0.1, self._publish_odom_window)
+        self._node.create_subscription(Odometry, "/odom", guarded("odom", self._on_odom), sensor_qos)
+        self._node.create_timer(0.1, guarded("odom", self._publish_odom_window))
         self._node.create_subscription(
-            DiagnosticArray, "/diagnostics", self._on_diagnostics, sensor_qos
+            DiagnosticArray, "/diagnostics", guarded("robot_state", self._on_diagnostics), sensor_qos
         )
         self._node.create_subscription(
-            DiagnosticArray, "/hardware_states", self._on_hardware_states, sensor_qos
+            DiagnosticArray, "/hardware_states", guarded("robot_state", self._on_hardware_states), sensor_qos
         )
         self._node.create_subscription(
-            DiagnosticStatus, "/hardware_events", self._on_hardware_event, reliable_qos
+            DiagnosticStatus, "/hardware_events", guarded("robot_state", self._on_hardware_event), reliable_qos
         )
         self._node.create_subscription(
-            JointState, "/left_gripper/joint_states", lambda msg: self._on_gripper("left", msg), sensor_qos
+            JointState, "/left_gripper/joint_states",
+            guarded("robot_state", lambda msg: self._on_gripper("left", msg)), sensor_qos
         )
         self._node.create_subscription(
-            JointState, "/right_gripper/joint_states", lambda msg: self._on_gripper("right", msg), sensor_qos
+            JointState, "/right_gripper/joint_states",
+            guarded("robot_state", lambda msg: self._on_gripper("right", msg)), sensor_qos
         )
         self._node.create_subscription(
             JointState,
             "/lifting_controller/joint_states",
-            self._on_lifting,
+            guarded("robot_state", self._on_lifting),
             sensor_qos,
         )
-        self._node.create_subscription(String, "/robot_description", self._on_robot_description, latched_qos)
         self._node.create_subscription(
-            LaserScan, "/scan", self._on_laser, sensor_qos,
+            String, "/robot_description", guarded("model", self._on_robot_description), latched_qos
+        )
+        self._node.create_subscription(
+            LaserScan, "/scan", guarded("laser_scan", self._on_laser), sensor_qos,
         )
 
-        self._drive_pub = self._node.create_publisher(
-            Twist, str(config["plugins"]["base_drive"]["topic"]), reliable_qos
-        )
+        self._twist_type = Twist
+        self._drive_qos = reliable_qos
         self._head_pub = self._node.create_publisher(
             Float64MultiArray, "/head_forward_position_controller/commands", reliable_qos
         )
@@ -241,7 +256,7 @@ class PantherDevice:
             ),
         }
         self._controller_poll_future = None
-        self._node.create_timer(1.0, self._poll_controllers)
+        self._node.create_timer(1.0, guarded("robot_state", self._poll_controllers))
         self._camera = PantherCameraRuntime(
             self._node, self._bridge, config.get("plugins", {}).get("camera", {}), sensor_qos
         )
@@ -277,6 +292,35 @@ class PantherDevice:
     def _get(self, key: str):
         with self._lock:
             return self._cache.get(key, (None, None))
+
+    def _safe_callback(self, card: str, callback, *args) -> None:
+        """Keep one malformed ROS message from stopping every Panther card."""
+        try:
+            callback(*args)
+        except Exception as exc:
+            now = int(time.time() * 1000)
+            with self._lock:
+                record = self._callback_errors.setdefault(
+                    card, {"count": 0, "last_error": None, "last_error_at_ms": None}
+                )
+                record["count"] += 1
+                record["last_error"] = f"{type(exc).__name__}: {exc}"
+                record["last_error_at_ms"] = now
+                count = record["count"]
+            if count == 1 or count % 100 == 0:
+                print(
+                    f"[{card}] ROS callback failed #{count}: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+    def _callback_health(self, card: str) -> dict:
+        with self._lock:
+            record = dict(self._callback_errors.get(card, {}))
+        return {
+            "callback_errors": int(record.get("count", 0)),
+            "last_callback_error": record.get("last_error"),
+            "last_callback_error_at_ms": record.get("last_error_at_ms"),
+        }
 
     def _store_and_publish(self, card: str, msg, builder) -> None:
         received = self._put(card, msg)
@@ -474,7 +518,7 @@ class PantherDevice:
             "voltage_v": json_float(msg.voltage),
             "current_a": json_float(msg.current),
             "temperature_c": json_float(msg.temperature),
-            "power_supply_status": int(msg.power_supply_status),
+            "power_supply_status": byte_value(msg.power_supply_status, "power_supply_status"),
             "present": bool(msg.present),
         }
 
@@ -564,15 +608,13 @@ class PantherDevice:
         }
 
     def _lifting_limits(self):
-        """Prefer the live limit for the joint reported by the lift controller."""
-        configured_max = float(self._cfg["plugins"]["lifting"]["max_position_m"])
+        """Return the SDK limits; Panther's bundled lift joint is fixed in URDF."""
+        configured = self._cfg["plugins"]["lifting"]
+        configured_min = float(configured.get("min_position_m", 0.0))
+        configured_max = float(configured["max_position_m"])
         feedback, _ = self._get("lifting")
         joint_name = next((name for name in getattr(feedback, "name", []) if name), None)
-        live_limit = self._joint_limits.get(joint_name) if joint_name else None
-        if live_limit is None:
-            return 0.0, configured_max, "configured safety limit", joint_name
-        lower, upper = live_limit
-        return max(0.0, lower), min(configured_max, upper), "live URDF capped by config", joint_name
+        return configured_min, configured_max, "Panther SDK configured limit", joint_name
 
     def sensor_info(self, card: str) -> dict:
         if card == "robot_state":
@@ -601,7 +643,8 @@ class PantherDevice:
                     "model_sha256": render_sha256,
                     "render_joint_count": render_joint_count,
                     "live_robot_description_available": live_available,
-                    "live_limit_differences": different}
+                    "live_limit_differences": different,
+                    **self._callback_health("model")}
         if card == "odom":
             sample, received = self._get("odom_sample")
             return {
@@ -613,16 +656,19 @@ class PantherDevice:
                     provides=["vx", "vy", "wz"], frame="body", rate_hz=10.0,
                     pose_drift="none",
                 ),
+                **self._callback_health("odom"),
             }
         msg, received = self._get(card)
         if msg is None:
-            return {"available": False, "fresh": False, "source": card}
+            return {"available": False, "fresh": False, "source": card,
+                    **self._callback_health(card)}
         builders = {
             "joints": self._joints_payload,
             "imu": self._imu_payload,
             "laser_scan": self._laser_payload,
         }
-        return {"available": True, **builders[card](msg, received)}
+        return {"available": True, **builders[card](msg, received),
+                **self._callback_health(card)}
 
     def robot_state(self) -> dict:
         diagnostics, diag_at = self._get("diagnostics")
@@ -639,17 +685,31 @@ class PantherDevice:
             reasons.append("no fresh /joint_states")
         if not fresh(hardware_at, 5.0):
             reasons.append("no fresh /hardware_states")
+        if not fresh(controllers_at, 3.0):
+            reasons.append("no fresh controller_manager response")
         diagnostic_summary = None
         if diagnostics is not None:
             statuses = list(getattr(diagnostics, "status", ()))
-            problems = [f"{item.name}: {item.message}" for item in statuses if int(item.level) != 0]
-            worst = max((int(item.level) for item in statuses), default=0)
+            levels = [(item, byte_value(item.level, f"diagnostics[{index}].level"))
+                      for index, item in enumerate(statuses)]
+            problems = [f"{item.name}: {item.message}" for item, level in levels if level != 0]
+            worst = max((level for _item, level in levels), default=0)
             diagnostic_summary = {
                 "count": len(statuses), "worst_level": worst,
                 "problems": sorted(problems),
             }
+        state_available = any(
+            item is not None for item in (diagnostics, hardware, joints, battery, lifting)
+        )
+        newest = max((stamp for stamp in (diag_at, hardware_at, joints_at, battery_at, lifting_at)
+                      if stamp is not None), default=None)
+        available = state_available and controllers is not None
+        state_fresh = fresh(newest, 5.0)
         return {
             "timestamp_ms": int(time.time() * 1000),
+            "available": available,
+            "fresh": state_fresh and fresh(controllers_at, 3.0),
+            "age_ms": age_ms(newest),
             "ready_for_motion": not reasons,
             "not_ready_reasons": reasons,
             "joint_state": {"available": joints is not None, "fresh": fresh(joints_at), "age_ms": age_ms(joints_at)},
@@ -663,6 +723,7 @@ class PantherDevice:
                 "fresh": fresh(controllers_at, 3.0),
                 "age_ms": age_ms(controllers_at),
                 "states": controllers or {},
+                "last_error": self._get("controller_error")[0],
             },
             "diagnostics": {"available": diagnostics is not None, "fresh": fresh(diag_at, 5.0),
                             "age_ms": age_ms(diag_at), "summary": diagnostic_summary},
@@ -671,7 +732,15 @@ class PantherDevice:
             "last_hardware_event": {"available": event is not None, "age_ms": age_ms(event_at),
                                     "data": _message_dict(event)},
             "estop": {"reported": False, "message": "No ROS emergency-stop state was identified"},
+            **self._callback_health("robot_state"),
         }
+
+    def lifting_state(self) -> dict:
+        message, received = self._get("lifting")
+        if message is None:
+            return {"available": False, "fresh": False, "age_ms": None,
+                    "source_topic": "/lifting_controller/joint_states"}
+        return {"available": True, **self._lifting_payload(message, received)}
 
     def gripper_state(self) -> dict:
         out = {"timestamp_ms": int(time.time() * 1000), "source_topics": {}}
@@ -720,42 +789,107 @@ class PantherDevice:
                 result = done.result()
                 states = {entry.name: entry.state for entry in result.controller}
                 self._put("controllers", states)
+                self._put("controller_error", None)
                 self._publish_robot_state()
             except Exception as exc:
+                self._put("controller_error", f"{type(exc).__name__}: {exc}")
                 print(f"[robot_state] controller poll failed: {exc}", flush=True)
 
         future.add_done_callback(completed)
 
-    def controller_states(self) -> dict[str, str]:
+    def controller_states(self, max_cache_age_s: float = 2.0) -> dict[str, str]:
         from controller_manager_msgs.srv import ListControllers
-        if not self._list_controllers.wait_for_service(timeout_sec=2.0):
-            raise RuntimeError("/controller_manager/list_controllers is unavailable")
-        result = self._wait_future(self._list_controllers.call_async(ListControllers.Request()), 3.0)
-        states = {entry.name: entry.state for entry in result.controller}
-        self._put("controllers", states)
-        return states
+        cached, received = self._get("controllers")
+        if cached is not None and fresh(received, max_cache_age_s):
+            return dict(cached)
+        # Canvas starts cards concurrently. Serialize the fallback query so one
+        # controller-manager response populates the cache for every card.
+        with self._controller_query_lock:
+            cached, received = self._get("controllers")
+            if cached is not None and fresh(received, max_cache_age_s):
+                return dict(cached)
+            if not self._list_controllers.wait_for_service(timeout_sec=2.0):
+                raise RuntimeError("/controller_manager/list_controllers is unavailable")
+            result = self._wait_future(
+                self._list_controllers.call_async(ListControllers.Request()), 3.0
+            )
+            states = {entry.name: entry.state for entry in result.controller}
+            self._put("controllers", states)
+            self._put("controller_error", None)
+            return states
+
+    @staticmethod
+    def _require_states(states: dict[str, str], expected: dict[str, str]) -> None:
+        failures = [f"{name}={states.get(name)!r}, expected {state!r}"
+                    for name, state in expected.items() if states.get(name) != state]
+        if failures:
+            raise RuntimeError("controller readiness failed: " + "; ".join(failures))
+
+    @staticmethod
+    def _require_controllers(states: dict[str, str], names) -> None:
+        missing = [name for name in names if name not in states]
+        if missing:
+            raise RuntimeError("controllers not reported by controller_manager: " + ", ".join(missing))
 
     def _require_controller(self, name: str, state: str = "active") -> None:
         actual = self.controller_states().get(name)
         if actual != state:
             raise RuntimeError(f"controller {name} is {actual!r}, expected {state!r}")
 
+    def _drive_candidates(self) -> list[str]:
+        config = self._cfg["plugins"]["base_drive"]
+        candidates = config.get("cmd_topics") or [config.get("topic", "/cmd_vel")]
+        return [str(topic) for topic in candidates if topic]
+
+    def _drive_topic_status(self) -> dict[str, int]:
+        return {topic: int(self._node.count_subscribers(topic))
+                for topic in self._drive_candidates()}
+
+    def _select_drive_topic(self, timeout_s: float = 3.0):
+        deadline = time.monotonic() + timeout_s
+        counts = self._drive_topic_status()
+        selected = next((topic for topic in self._drive_candidates() if counts.get(topic, 0) > 0), None)
+        while selected is None and time.monotonic() < deadline:
+            time.sleep(0.1)
+            counts = self._drive_topic_status()
+            selected = next(
+                (topic for topic in self._drive_candidates() if counts.get(topic, 0) > 0),
+                None,
+            )
+        if selected is None:
+            raise RuntimeError(f"no Panther base command topic has subscribers: {counts}")
+        with self._drive_lock:
+            if self._drive_pub is None or self._drive_topic != selected:
+                self._drive_pub = self._node.create_publisher(
+                    self._twist_type, selected, self._drive_qos
+                )
+                self._drive_topic = selected
+        return selected, counts
+
+    def _publish_drive(self, message) -> None:
+        publisher = self._drive_pub
+        if publisher is not None:
+            publisher.publish(message)
+
     def drive(self, args: dict) -> dict:
         from geometry_msgs.msg import Twist
         action = args.get("action", "move")
         if action in ("cancel", "stop"):
             stopped = self.cancel_drive("cancelled_by_request")
-            return {"state": "idle", "topic": self._cfg["plugins"]["base_drive"]["topic"],
+            return {"state": "idle", "topic": self._drive_topic,
                     "action_id": stopped}
         if action in ("start", "info"):
             states = self.controller_states()
-            return {"state": "ready" if states.get("movebase3_drive_controller") == "active" else "unavailable",
-                    "controllers": states, "topic": self._cfg["plugins"]["base_drive"]["topic"],
+            self._require_states(states, {"movebase3_drive_controller": "active"})
+            topic, subscribers = self._select_drive_topic()
+            return {"state": "ready", "controllers": states, "topic": topic,
+                    "cmd_topics": subscribers,
                     "commissioning_motion_enabled": self._cfg.get("safety", {}).get("commissioning_motion_enabled") is True}
         if action != "move":
             raise ValueError(f"unsupported base_drive action: {action}")
         self._ensure_motion_ready()
         self._require_controller("movebase3_drive_controller")
+        topic, subscribers = self._select_drive_topic()
         cfg = self._cfg["plugins"]["base_drive"]
         vx, vy, wz, duration = validate_drive(args, cfg)
         wz_deg_s = math.degrees(wz)
@@ -777,13 +911,13 @@ class PantherDevice:
                         if generation != self._drive_generation:
                             return
                         msg = Twist(); msg.linear.x = vx; msg.linear.y = vy; msg.angular.z = wz
-                        self._drive_pub.publish(msg)
+                        self._publish_drive(msg)
                     time.sleep(period)
                 for _ in range(repetitions):
                     with self._drive_lock:
                         if generation != self._drive_generation:
                             return
-                        self._drive_pub.publish(Twist())
+                        self._publish_drive(Twist())
                     time.sleep(period)
                 with self._drive_lock:
                     if generation != self._drive_generation or self._drive_action_id != action_id:
@@ -803,7 +937,8 @@ class PantherDevice:
         threading.Thread(target=run, daemon=True, name="panther_drive").start()
         return {"state": "queued", "action_id": action_id,
                 "linear_x": vx, "linear_y": vy, "angular_z_deg_s": wz_deg_s,
-                "duration_s": duration, "topic": cfg["topic"], "auto_stop": True}
+                "duration_s": duration, "topic": topic, "cmd_topics": subscribers,
+                "auto_stop": True}
 
     def cancel_drive(self, reason: str = "cancelled"):
         from geometry_msgs.msg import Twist
@@ -813,7 +948,7 @@ class PantherDevice:
             self._drive_generation += 1
             repetitions = int(self._cfg["plugins"]["base_drive"].get("stop_repetitions", 3))
             for _ in range(max(1, repetitions)):
-                self._drive_pub.publish(Twist())
+                self._publish_drive(Twist())
         if action_id:
             _notify_completion(action_id, "cancelled", {"reason": reason}, "base_drive")
         return action_id
@@ -837,8 +972,18 @@ class PantherDevice:
                 active = ({key: self._arm_active[key] for key in
                            ("action_id", "action", "side", "duration_s")}
                           if self._arm_active else None)
+            states = self.controller_states()
+            self._require_controllers(states, (
+                "dual_arm_forward_position_controller",
+                "left_arm_joint_trajectory_position_controller",
+                "right_arm_joint_trajectory_position_controller",
+            ))
+            if not fresh(self._get("joints")[1]):
+                raise RuntimeError("fresh /joint_states is required for arm_control")
+            if not self._joint_limits:
+                raise RuntimeError("live /robot_description limits are required for arm_control")
             return {"state": "moving" if active else "ready", "active": active,
-                    "controllers": self.controller_states(),
+                    "controllers": states,
                     "joint_state_fresh": fresh(self._get("joints")[1]),
                     "limits_loaded": bool(self._joint_limits),
                     "commissioning_motion_enabled": self._cfg.get("safety", {}).get("commissioning_motion_enabled") is True}
@@ -884,7 +1029,11 @@ class PantherDevice:
                 if not updates:
                     raise ValueError(f"at least one {prefix}0_deg..{prefix}7_deg target is required")
                 values = [updates.get(name, current.get(name)) for name in names]
-            return validate_joint_target(names, values, self._joint_limits, current, max_delta)
+            # PR 521's known-good home path allows the configured home pose to
+            # cross the ordinary per-command commissioning step gate. Hard
+            # URDF limits, duration and speed limits still apply.
+            step_limit = None if action == "home" else max_delta
+            return validate_joint_target(names, values, self._joint_limits, current, step_limit)
 
         if side in ("left", "both"):
             targets["left"] = target_for("left", LEFT_ARM_JOINTS)
@@ -1017,7 +1166,16 @@ class PantherDevice:
         from unix_msgs.msg import GripperCommand
         action = args.get("action", "set")
         if action in ("start", "info"):
-            return {"state": "ready", "feedback": self.gripper_state()}
+            states = self.controller_states()
+            self._require_states(states, {
+                "left_unix_gripper3_controller": "active",
+                "right_unix_gripper3_controller": "active",
+            })
+            feedback = self.gripper_state()
+            stale = [side for side in ("left", "right") if not feedback[side]["fresh"]]
+            if stale:
+                raise RuntimeError("fresh gripper feedback is required for: " + ", ".join(stale))
+            return {"state": "ready", "feedback": feedback, "controllers": states}
         if action not in ("set", "open", "close"):
             raise ValueError(f"unsupported gripper action: {action}")
         require_confirmation(args)
@@ -1031,8 +1189,10 @@ class PantherDevice:
                        if states.get(name) != "active"]
         if unavailable:
             raise RuntimeError("inactive gripper controllers: " + ", ".join(unavailable))
-        position = 0.0 if action == "open" else 1.0 if action == "close" else finite_number(
-            args.get("position"), "position")
+        cfg = self._cfg["plugins"].get("gripper", {})
+        position = (float(cfg.get("open_position", 0.0)) if action == "open" else
+                    float(cfg.get("closed_position", 1.0)) if action == "close" else
+                    finite_number(args.get("position"), "position"))
         if not 0.0 <= position <= 1.0:
             raise ValueError("position must be in [0, 1]")
         mode = "parallel"
@@ -1047,8 +1207,13 @@ class PantherDevice:
         from sensor_msgs.msg import JointState
         action = args.get("action", "set_position")
         if action in ("start", "info"):
+            states = self.controller_states()
+            self._require_states(states, {"lifting_controller": "active"})
+            feedback = self.lifting_state()
+            if not feedback["fresh"]:
+                raise RuntimeError("fresh /lifting_controller/joint_states is required")
             minimum, maximum, limit_source, joint_name = self._lifting_limits()
-            return {"state": "ready", "feedback": self.robot_state()["lifting"],
+            return {"state": "ready", "feedback": feedback, "controllers": states,
                     "limits_m": [minimum, maximum], "limit_source": limit_source,
                     "joint_name": joint_name}
         if action != "set_position":
@@ -1062,7 +1227,10 @@ class PantherDevice:
             raise RuntimeError("lifting limits are invalid; refusing motion")
         if not minimum <= position <= maximum:
             raise ValueError(f"position_m must be in [{minimum}, {maximum}]")
-        message = JointState(); message.name = [""]; message.position = [position]
+        message = JointState()
+        message.header.stamp = self._node.get_clock().now().to_msg()
+        message.name = [""]; message.position = [position]
+        message.velocity = []; message.effort = []
         self._lifting_pub.publish(message)
         return {"state": "commanded", "position_m": position,
                 "limits_m": [minimum, maximum], "limit_source": limit_source,
@@ -1075,8 +1243,16 @@ class PantherDevice:
             with self._head_lock:
                 active = ({"action_id": self._head_active["action_id"]}
                           if self._head_active else None)
+            states = self.controller_states()
+            self._require_states(states, {"head_forward_position_controller": "active"})
+            joint_msg, received = self._get("joints")
+            if joint_msg is None or not fresh(received):
+                raise RuntimeError("fresh /joint_states is required for head")
+            missing = [name for name in HEAD_JOINTS if name not in self._joint_limits]
+            if missing:
+                raise RuntimeError("live URDF limits are required for: " + ", ".join(missing))
             return {"state": "moving" if active else "ready", "active": active,
-                    "limits_loaded": all(name in self._joint_limits for name in HEAD_JOINTS)}
+                    "limits_loaded": True, "controllers": states}
         if action in ("stop", "cancel"):
             return self._stop_head("cancelled_by_request", wait_s=5.0)
         if action not in ("look", "home"):
@@ -1099,6 +1275,15 @@ class PantherDevice:
                       math.radians(finite_number(home["pitch_deg"], "home_pose_deg.pitch_deg"))]
         else:
             target = head_target_from_degrees(args, current)
+        yaw_min = float(cfg.get("yaw_min_deg", -90.0))
+        yaw_max = float(cfg.get("yaw_max_deg", 90.0))
+        pitch_min = float(cfg.get("pitch_min_deg", -86.0))
+        pitch_max = float(cfg.get("pitch_max_deg", 20.0))
+        target_deg = [math.degrees(value) if value is not None else None for value in target]
+        if target_deg[0] is not None and not yaw_min <= target_deg[0] <= yaw_max:
+            raise ValueError(f"yaw_deg must be in [{yaw_min}, {yaw_max}]")
+        if target_deg[1] is not None and not pitch_min <= target_deg[1] <= pitch_max:
+            raise ValueError(f"pitch_deg must be in [{pitch_min}, {pitch_max}]")
         missing = [name for name in HEAD_JOINTS if name not in self._joint_limits]
         if missing:
             raise RuntimeError("live URDF limits are required for: " + ", ".join(missing))
