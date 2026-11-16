@@ -6,61 +6,35 @@ exposes the capabilities as MCP tools.
 
 ## Hardware depth for visual navigation
 
-`camera_depth` forwards the newest Orbbec frame from
-`/ob_camera_head/depth/image_raw` on domain 0 to
-`/{namespace}/camera/head/depth/visual_depth` on domain 42. The `/visual_depth`
-suffix lets older Navi versions identify depth before ROS topic discovery;
-it does not mean a monocular model is involved. Following upstream driver
-PR #419, its output is `image/depth-zlib` on `sensor_msgs/CompressedImage`,
-with `format = "16UC1; compressedDepth zlib"`. The payload is a plain zlib
-stream containing exactly 640x480 little-endian uint16 millimetres; zero
-remains invalid depth. Compression preserves every original depth value and the
-source header. This replaces the previous raw `image/depth-z16` output and
-requires a consumer/bridge that supports `image/depth-zlib`.
+`camera_head` and `camera_depth` share one calibrated RGB-D source. The sole
+hardware depth output is `/{namespace}/camera/head/depth` on domain 42,
+with format `image/depth-zlib` on `sensor_msgs/CompressedImage`. Its payload
+is zlib-compressed 640x480 little-endian uint16 millimetres; zero is invalid
+depth. Consumers must support `image/depth-zlib`.
 
-The default rate is 15Hz (previously 8Hz), configurable with
-`plugins.camera_depth.hz` up to 30Hz. The source camera and available CPU/network
-still determine the actual rate. Both source and output retain only the newest
-frame; a frame waiting locally for 500ms is discarded. A single ROS timer
-has been replaced by one latest-only worker: the ROS callback only swaps the
-pending frame, while crop, zlib compression, and the synchronous bridge write
-run outside both executors. The worker never replays old frames or catches up
-in a burst. Compression uses libdeflate level 1 (still a standard zlib stream)
-instead of CPython's stock encoder on ARM. The compressed bytes are assigned
-to the ROS `uint8[]` using `array('B')`, which uses Humble's bulk buffer setter
-instead of validating every byte in Python. This preserves the exact compressed
-payload, source header and decoded depth pixels. `info` reports the
-active compression backend, target/average Hz,
-coalesced/stale/error counts, worker health, payload size, and
-transform/compress/message-pack/bridge/total processing and interval timings so
-compression and ROS message packing can be measured separately on the robot.
-The existing 500ms local stale-frame checks still apply.
+Both RGB and depth follow `plugins.camera_depth.hz` (default 8 Hz). The source
+keeps the newest paired frames and limits publication by capture time; the
+source camera and available CPU/network determine the actual rate. The shared
+source rectifies RGB and depth into a common valid centered 4:3 field with
+updated pinhole intrinsics. It preserves capture timing and requires the
+camera's global time mode. See [RGB-D input for generic visual odometry](#rgb-d-input-for-generic-visual-odometry)
+for calibration, startup diagnostics and input contracts.
 
 On the canvas, connect head RGB to `vop`, `vop` to `navi`, `camera_depth` to
 `navi`'s depth input, `loco_state` to its odometry input, and `navi` to
-`loco_servo`. Disconnect the `visual_depth` depth input when selecting hardware
-depth. After redeploying, refresh the card's port metadata and reconnect the
-depth wire to the new `/depth/visual_depth` topic with `image/depth-zlib`.
-No `lidar_depth` or `visual_depth` processing card is needed in this path.
+`loco_servo`. After redeploying, refresh the cards' port metadata and reconnect
+any old `/camera/head/depth/visual_depth` binding to
+`/{namespace}/camera/head/depth` with `image/depth-zlib`. The old suffixed topic
+has no publisher. No `lidar_depth` or `visual_depth` processing card is needed
+for this hardware-depth path. Restart the connected camera/VOP/Navi chain so
+its startup snapshots use the current dimensions and calibration.
 
-`camera_head.info.camera_info` now declares the actual RGB dimensions after the
-first successfully published JPEG, preserving the source header. The camera
-start call waits up to 10 seconds for this frame before reporting success, so
-downstream VOP/Navi can snapshot the correct dimensions for bounding boxes.
-Unknown intrinsics and field of view remain null. After redeploying, restart
-the connected camera/VOP/Navi chain to refresh those startup snapshots.
-`camera_depth.info.source_geometry` reports the source frame size, frame ID and
-crop; `registration_to_color` remains `unknown` until verified on hardware.
-Host camera setup now preserves existing vendor launch arguments while changing
-only the three point-cloud/IMU enable flags.
-
-This conversion does not register raw depth to RGB or change the existing
-centre-crop/nearest-neighbour resize to 640x480. RGB/depth correspondence,
-camera intrinsics, and the vendor's millimetre scale still require hardware
-verification. Keep the servo paused while checking reported target distance
-against lens-to-target tape measurements at 1, 1.5, and 2 metres, both centrally
-and off-centre, before testing approach/stop behaviour. The software tests
-verify the wire payload, not distance accuracy or navigation safety on hardware.
+The image cards report their calibrated geometry through `camera_info` and
+wait for calibration and the first paired output before reporting startup
+success. Software calibration and payload tests do not establish physical
+distance accuracy. Keep the servo paused while checking reported target
+distance against lens-to-target tape measurements at 1, 1.5, and 2 metres,
+both centrally and off-centre, before testing approach/stop behaviour.
 
 ## Locomotion state card
 
