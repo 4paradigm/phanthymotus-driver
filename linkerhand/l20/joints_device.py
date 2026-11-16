@@ -246,6 +246,10 @@ class _JointsStream:
 
     def start(self) -> None:
         if self.running():
+            if self._stop_event.is_set():
+                # The thread is only finishing its last query and then exits;
+                # returning here would report a worker that is about to end.
+                raise RuntimeError("关节采集上一次停止尚未完成；请稍后重试")
             return
         self._stop_event.clear()
         self._setup_publishers()
@@ -419,6 +423,8 @@ class JointsPlugin:
         # instance -> (owned (side, channel) targets, shared both-hands skeleton topic or None)
         self._owners: dict[str, tuple[tuple[tuple[str, str], ...], str | None]] = {}
         self._streams: dict[tuple[str, str], _JointsStream] = {}
+        # instance -> targets it gave up whose worker has not stopped yet; its next stop retries them
+        self._leftovers: dict[str, set[tuple[str, str]]] = {}
         self._used_targets: set[tuple[str, str]] = set()
 
     # ── topics & definitions ──────────────────────────────────────────
@@ -536,6 +542,7 @@ class JointsPlugin:
                     logger.warning("Joints stream %s/%s did not stop: %s", stream.side, stream.channel, exc)
             self._streams.clear()
             self._owners.clear()
+            self._leftovers.clear()
             self._close_unshared_controllers()
 
     def _close_unshared_controllers(self) -> None:
@@ -623,24 +630,50 @@ class JointsPlugin:
                         pass
                 raise
             self._owners[instance_id] = owner
+            # A target started here belongs to this card again, not to the card
+            # that gave it up.
+            for leftover in self._leftovers.values():
+                leftover.difference_update(targets)
             with self._lock:
                 self._bindings[instance_id] = side
                 # Both modes: an ID-only info/config later resolves the same interface.
                 self._channels[instance_id] = channel
+            # Retry what an earlier stop or switch left behind, with the old targets.
+            given_up = self._leftovers.pop(instance_id, set())
             if current is not None:
-                for target in current[0]:
-                    if target not in targets:
-                        self._release_target(target)
-            self._sync_dual_topics()
+                given_up |= set(current[0])
+            try:
+                self._release_targets(instance_id, sorted(t for t in given_up if t not in targets))
+            finally:
+                self._sync_dual_topics()
 
     def _release_target(self, target: tuple[str, str]) -> None:
-        if any(target in targets for targets, _ in self._owners.values()):
+        if any(target in targets for targets, _ in self._owners.values()) or \
+                any(target in left for left in self._leftovers.values()):
             return
         stream = self._streams.get(target)
         if stream is not None:
             stream.stop()
             self._streams.pop(target, None)
         self._close_if_unused(target)
+
+    def _release_targets(self, instance_id: str, targets) -> None:
+        """Release targets a card gave up; one whose worker does not stop stays the card's.
+
+        A worker still blocked in a query keeps belonging to its card, so the
+        card's next stop reaches it instead of leaving it orphaned. Targets
+        already released are not claimed back: another card may own them by
+        the time of the retry.
+        """
+        error = None
+        for target in targets:
+            try:
+                self._release_target(target)
+            except Exception as exc:
+                self._leftovers.setdefault(instance_id, set()).add(target)
+                error = error or exc
+        if error is not None:
+            raise error
 
     def _sync_dual_topics(self) -> None:
         for target, stream in self._streams.items():
@@ -649,16 +682,12 @@ class JointsPlugin:
     def _stop_instance(self, instance_id: str) -> None:
         with self._lifecycle_lock:
             owner = self._owners.pop(instance_id, None)
-            if owner is None:
+            owned = owner[0] if owner is not None else ()
+            targets = [*owned, *sorted(self._leftovers.pop(instance_id, set()) - set(owned))]
+            if not targets:
                 return
             try:
-                for target in owner[0]:
-                    self._release_target(target)
-            except Exception:
-                # A worker still blocked in a query keeps its card's ownership,
-                # so a retried stop reaches it instead of leaving it orphaned.
-                self._owners[instance_id] = owner
-                raise
+                self._release_targets(instance_id, targets)
             finally:
                 self._sync_dual_topics()
 

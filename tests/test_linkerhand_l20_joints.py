@@ -878,17 +878,90 @@ def test_stop_that_times_out_keeps_the_card_owning_its_worker(ros_runtime):
     try:
         plugin.dispatch("start", {"instance_id": "A", "bound_side": "left"})
         assert client.entered.wait(3)
+        worker = plugin._streams[("left", "can0")]
         # Blocked longer than the join timeout: the stop fails...
         with pytest.raises(RuntimeError):
             plugin.dispatch("stop", {"instance_id": "A"})
         # ...but the card still owns the worker, so retrying reaches it.
-        assert "A" in plugin._owners and ("left", "can0") in plugin._streams
+        assert plugin._streams[("left", "can0")] is worker and worker.running()
         client.release.set()
         plugin.dispatch("stop", {"instance_id": "A"})
-        assert plugin._owners == {} and plugin._streams == {}
+        assert plugin._owners == {} and plugin._streams == {} and not worker.running()
         assert [p for t, p in published if t == json_topic and p["state"] == "idle"]
     finally:
         client.release.set()
+        plugin.stop()
+
+
+def test_target_switch_that_cannot_stop_the_old_worker_keeps_it_reachable(ros_runtime):
+    ros2, _, _ = ros_runtime
+    blocked = BlockingClient()
+    plugin, _ = make_plugin({("left", "can0"): blocked}, ros2=ros2,
+                            config={"query_timeout_s": 0.02})
+    try:
+        plugin.dispatch("start", {"instance_id": "A", "bound_side": "left"})
+        assert blocked.entered.wait(3)
+        abandoned = plugin._streams[("left", "can0")]
+        # The switch cannot stop the left worker, so it reports the failure...
+        with pytest.raises(RuntimeError):
+            plugin.dispatch("config", {"instance_id": "A", "bound_side": "right"})
+        # ...and the worker it could not stop stays reachable: a stop of the same
+        # card still ends it instead of leaving an ownerless thread behind.
+        blocked.release.set()
+        plugin.dispatch("stop", {"instance_id": "A"})
+        assert plugin._owners == {} and plugin._streams == {}
+        assert not abandoned.running()
+    finally:
+        blocked.release.set()
+        plugin.stop()
+
+
+def test_partially_completed_dual_stop_leaves_the_stopped_hand_to_the_next_card(ros_runtime):
+    ros2, _, _ = ros_runtime
+    blocked = BlockingClient()
+    plugin, _ = make_plugin({("right", "can0"): blocked}, ros2=ros2,
+                            config={"query_timeout_s": 0.02})
+    try:
+        plugin.dispatch("start", {"instance_id": "B", "bound_side": "both"})
+        assert blocked.entered.wait(3)
+        with pytest.raises(RuntimeError):
+            plugin.dispatch("stop", {"instance_id": "B"})
+        # The left hand did stop, so B no longer owes anything for it.
+        assert set(plugin._streams) == {("right", "can0")}
+        # Another card takes the freed hand and stops it: that stop must work.
+        plugin.dispatch("start", {"instance_id": "C", "bound_side": "left"})
+        plugin.dispatch("stop", {"instance_id": "C"})
+        assert set(plugin._streams) == {("right", "can0")}
+        blocked.release.set()
+        plugin.dispatch("stop", {"instance_id": "B"})
+        assert plugin._owners == {} and plugin._streams == {}
+    finally:
+        blocked.release.set()
+        plugin.stop()
+
+
+def test_start_while_a_hand_is_still_stopping_does_not_take_it_over(ros_runtime):
+    ros2, _, _ = ros_runtime
+    blocked = BlockingClient()
+    plugin, _ = make_plugin({("left", "can0"): blocked}, ros2=ros2,
+                            config={"query_timeout_s": 0.02})
+    try:
+        plugin.dispatch("start", {"instance_id": "A", "bound_side": "left"})
+        assert blocked.entered.wait(3)
+        with pytest.raises(RuntimeError):
+            plugin.dispatch("stop", {"instance_id": "A"})
+        # The worker is still shutting down: a second card must not treat it as
+        # its own running stream.
+        with pytest.raises(RuntimeError):
+            plugin.dispatch("start", {"instance_id": "B", "bound_side": "left"})
+        assert "B" not in plugin._owners and "B" not in plugin._channels
+        blocked.release.set()
+        plugin.dispatch("stop", {"instance_id": "A"})
+        plugin.dispatch("start", {"instance_id": "B", "bound_side": "left"})
+        assert plugin._owners["B"][0] == (("left", "can0"),)
+        assert plugin._streams[("left", "can0")].running()
+    finally:
+        blocked.release.set()
         plugin.stop()
 
 
