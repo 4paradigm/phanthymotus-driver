@@ -675,6 +675,8 @@ class RgbdCameraPlugin:
                 out_color.format, out_color.data = 'jpeg', array('B', jpg.tobytes())
                 out_depth.format = '16UC1; compressedDepth zlib'
                 out_depth.data = array('B', zlib.compress(metric.astype('<u2', copy=False).tobytes(), 1))
+                # Do not hold the image lock while its executor delivers TF.
+                self.body_mount.wait_for_capture(max(_stamp(color), _stamp(depth)))
                 with self.lock:
                     if not self.running or self.stop_event.is_set():
                         continue

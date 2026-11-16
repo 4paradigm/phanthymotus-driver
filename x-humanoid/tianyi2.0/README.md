@@ -1074,6 +1074,12 @@ hardware IMU results do not validate this new card lifecycle or performance.
 
 Missing TF, invalid frames/timestamps or unavailable `tf2_ros` produce an
 explicit unavailable packet without a held matrix; images and IMU continue.
+Before publication, the image worker gives native TF a 50 ms delivery wait
+for the latest capture in the pair, outside the camera lock so the shared
+executor can deliver TF. It then performs the original exact-time lookup for
+each published capture and rechecks stop/client epochs. This delivery wait
+does not relax synchronization accuracy or permit latest/held transforms;
+the optional capture-certificate path retains its existing admission checks.
 `info.body_mount_status` reports this independently of camera readiness. TF
 availability is not physical calibration: `accuracy_validated` stays false,
 and the local visualization URDF does not establish the installed optical

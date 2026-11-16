@@ -256,3 +256,48 @@ def test_clock_reference_only_declared_after_global_source_confirmation(source, 
     assert values[0]['vendor']['clock_id'] == source.clock
     source.registered = False
     assert 'clock_reference' not in source._declarations()[0]['vendor']
+
+
+def test_wait_for_capture_tf_does_not_block_camera_executor(source, monkeypatch):
+    import threading
+    monkeypatch.setitem(sys.modules, 'rclpy.duration', NS(Duration=lambda **kw: NS(**kw)))
+    source.body_mount.buffer.fail = True
+    waits = []
+    def available(target, child, stamp, timeout):
+        # TF delivery shares the image executor; an image callback must be able
+        # to acquire the camera lock while the worker waits for the transform.
+        def callback():
+            with source.lock:
+                source.body_mount.buffer.fail = False
+        worker = threading.Thread(target=callback)
+        worker.start(); worker.join(timeout=.2)
+        assert not worker.is_alive()
+        waits.append((target, child, stamp.nanoseconds, timeout.seconds))
+        return True
+    source.body_mount.buffer.can_transform = available
+    emit(source)
+    assert waits == [('base_link', 'head_optical', STAMP, .05)]
+    packets = [json.loads(msg.data) for topic, msg in source.events if topic.endswith('/body_mount')]
+    assert packets[-1]['status'] == 'available'
+    assert packets[-1]['stamp_ns'] == STAMP
+
+
+def test_stop_during_tf_wait_does_not_publish_images(source, monkeypatch):
+    monkeypatch.setitem(sys.modules, 'rclpy.duration', NS(Duration=lambda **kw: NS(**kw)))
+    def stop(*args, **kwargs):
+        source.stop_event.set()
+        return False
+    source.body_mount.buffer.can_transform = stop
+    emit(source)
+    assert not source.events
+
+
+def test_tf_wait_timeout_keeps_images_but_never_reuses_transform(source, monkeypatch):
+    monkeypatch.setitem(sys.modules, 'rclpy.duration', NS(Duration=lambda **kw: NS(**kw)))
+    source.body_mount.buffer.can_transform = lambda *args, **kwargs: False
+    source.body_mount.buffer.fail = True
+    emit(source)
+    packets = [json.loads(msg.data) for topic, msg in source.events if topic.endswith('/body_mount')]
+    assert packets[-1]['status'] == 'unavailable'
+    assert 'matrix' not in packets[-1]
+    assert any(topic.endswith('/depth') for topic, msg in source.events)
