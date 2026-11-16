@@ -30,7 +30,7 @@
 
 ### 配置
 
-画布上卡片的配置项：`bridge_url`（必填，例如 `http://192.168.1.20:8765`，前台电脑要设固定 IP）、`token`（必填，和桥接服务一致）、`timeout_s`。`config.yaml` 的 `hp_printer.enabled: false` 可以关掉这张卡。
+画布上卡片的配置项：`bridge_url`（必填，例如 `http://192.168.1.20:8765`，前台电脑要设固定 IP）、`token`（必填，和桥接服务一致）、`timeout_s`（查询超时，默认 8 秒）和 `print_timeout_s`（打印超时，默认 60 秒）。真实打印需要网页定位访客、调起打印并复查状态，因此打印使用单独的较长超时。`config.yaml` 的 `hp_printer.enabled: false` 可以关掉这张卡。
 
 ### 桥接服务接口约定
 

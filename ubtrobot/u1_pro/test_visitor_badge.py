@@ -52,7 +52,16 @@ class VisitorBadgeTest(unittest.TestCase):
         props = definition["configSchema"]["properties"]
         self.assertEqual(props["token"]["format"], "password")
         self.assertTrue(props["bridge_url"]["x-sensitive"])
+        self.assertEqual(props["timeout_s"]["default"], 8)
+        self.assertEqual(props["print_timeout_s"]["default"], 60)
         self.assertEqual(definition["configSchema"]["required"], ["bridge_url", "token"])
+
+    def test_print_timeout_defaults_to_60_seconds_and_is_clamped(self):
+        self.assertEqual(self.card._cfg["print_timeout_s"], 60)
+        self.card.dispatch("config", {"print_timeout_s": 999})
+        self.assertEqual(self.card._cfg["print_timeout_s"], 120)
+        self.card.dispatch("config", {"print_timeout_s": 3})
+        self.assertEqual(self.card._cfg["print_timeout_s"], 10)
 
     def test_lifecycle_and_configuration(self):
         self.assertEqual(self.call("start")["state"], "ready")

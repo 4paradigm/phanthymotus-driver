@@ -41,7 +41,15 @@ class BridgeClient:
         self.token = token
         self.timeout_s = timeout_s
 
-    def request(self, method: str, path: str, *, query: dict | None = None, body: dict | None = None) -> dict:
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: dict | None = None,
+        body: dict | None = None,
+        timeout_s: float | None = None,
+    ) -> dict:
         url = self.base_url + path
         if query:
             url += "?" + urllib.parse.urlencode({k: v for k, v in query.items() if v not in (None, "")})
@@ -53,7 +61,9 @@ class BridgeClient:
             headers["Authorization"] = f"Bearer {self.token}"
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+            with urllib.request.urlopen(
+                req, timeout=self.timeout_s if timeout_s is None else timeout_s
+            ) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
             payload = _safe_json(exc.read())
@@ -104,6 +114,7 @@ class HPPrinterPlugin:
             "bridge_url": str(plugin_config.get("bridge_url", "") or ""),
             "token": str(plugin_config.get("token", "") or ""),
             "timeout_s": float(plugin_config.get("timeout_s", 8)),
+            "print_timeout_s": float(plugin_config.get("print_timeout_s", 60)),
         }
 
     # ── 卡片定义 ──────────────────────────────────────────────────────────
@@ -112,7 +123,7 @@ class HPPrinterPlugin:
             "start": ([], "启动卡片"),
             "stop": ([], "停止卡片"),
             "info": ([], "查看卡片配置是否完整"),
-            "config": (["bridge_url", "token", "timeout_s"], "保存桥接服务配置（平台在 start 前自动调用）"),
+            "config": (["bridge_url", "token", "timeout_s", "print_timeout_s"], "保存桥接服务配置（平台在 start 前自动调用）"),
             "find": (["name", "host"], "按访客姓名查询今天的预约；同名时可用被访人 host 缩小范围，返回短期 ticket"),
             "print": (["ticket", "request_id"], "使用 find 返回的短期 ticket 打印访客贴；request_id 用于防止重复打印"),
         }
@@ -127,6 +138,7 @@ class HPPrinterPlugin:
             "bridge_url": {"type": "string"},
             "token": {"type": "string"},
             "timeout_s": {"type": "number"},
+            "print_timeout_s": {"type": "number"},
         }
         definition = tool(
             TOOL_NAME,
@@ -147,8 +159,13 @@ class HPPrinterPlugin:
                     "description": "和桥接服务里设置的令牌一致，防止局域网里别人随便打印",
                 },
                 "timeout_s": {
-                    "type": "number", "title": "请求超时（秒）", "scope": "shared",
+                    "type": "number", "title": "查询超时（秒）", "scope": "shared",
                     "minimum": 2, "maximum": 30, "default": 8, "advanced": True,
+                },
+                "print_timeout_s": {
+                    "type": "number", "title": "打印超时（秒）", "scope": "shared",
+                    "minimum": 10, "maximum": 120, "default": 60, "advanced": True,
+                    "description": "等待前台网页完成定位、打印并确认状态的最长时间",
                 },
             },
             "required": ["bridge_url", "token"],
@@ -204,7 +221,7 @@ class HPPrinterPlugin:
             update["bridge_url"] = url
         if "token" in args:
             update["token"] = str(args["token"] or "")
-        for key, low, high in (("timeout_s", 2, 30),):
+        for key, low, high in (("timeout_s", 2, 30), ("print_timeout_s", 10, 120)):
             if key in args and args[key] not in (None, ""):
                 try:
                     update[key] = min(high, max(low, float(args[key])))
@@ -242,8 +259,13 @@ class HPPrinterPlugin:
         if not _ID_RE.match(request_id):
             return {"status": "error", "code": "bad_args",
                     "error": "print 需要唯一的 request_id；同一次请求重试时必须复用"}
+        with self._lock:
+            print_timeout_s = self._cfg["print_timeout_s"]
         payload = self._client().request(
-            "POST", "/print_tag", body={"ticket": ticket, "request_id": request_id}
+            "POST",
+            "/print_tag",
+            body={"ticket": ticket, "request_id": request_id},
+            timeout_s=print_timeout_s,
         )
         if payload.get("ok") is True:
             return {"status": "printed", "request_id": request_id,
