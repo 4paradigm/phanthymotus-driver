@@ -101,3 +101,45 @@ def test_restart_loads_saved_url_without_go_live():
 
 def test_unknown_action_is_safe():
     assert card().dispatch("unknown", {})["error_code"] == "UNKNOWN_ACTION"
+
+def test_canvas_stop_start_recreates_audio_subscription(monkeypatch):
+    import live_stream.card as module
+
+    class Node:
+        def __init__(self):
+            self.destroyed = False
+
+        def destroy_node(self):
+            self.destroyed = True
+
+    class Executor:
+        def __init__(self):
+            self.removed = []
+
+        def remove_node(self, node):
+            self.removed.append(node)
+
+    executor = Executor()
+    nodes = []
+
+    def connect_audio(_executor, _namespace, _audio):
+        node = Node()
+        nodes.append(node)
+        return node
+
+    monkeypatch.setattr(module, "attach_audio_subscription", connect_audio)
+    worker = Worker()
+    subject = LiveStreamPlugin({}, "bumi", executor, None,
+                               store=Store(), worker=worker)
+    assert subject.dispatch("start", {})["state"] == "ready"
+    assert len(nodes) == 1
+    assert subject.dispatch("end_live", {})["state"] == "idle"
+    assert not nodes[0].destroyed
+    assert subject.dispatch("stop", {})["state"] == "idle"
+    assert nodes[0].destroyed
+    assert executor.removed == nodes[:1]
+    assert subject.dispatch("start", {})["state"] == "ready"
+    assert len(nodes) == 2
+    assert not nodes[1].destroyed
+    subject.stop()
+    assert nodes[1].destroyed

@@ -11,6 +11,8 @@ import subprocess
 import threading
 import time
 
+from .transport import FLVFramer, RTMPPublisher, RTMPTransportError
+
 
 class AudioBuffer:
     FORMATS = frozenset(("pcm_16k_16bit_mono", "audio/pcm-16k"))
@@ -51,6 +53,10 @@ ERROR_MESSAGES = {
     "RTMP_PROCESS_EXITED": "推流异常结束，请刷新虎牙地址并检查机器人网络",
     "VIDEO_PIPE_FAILED": "实时画面中断，请检查 Bumi 摄像头",
     "AUDIO_PIPE_FAILED": "实时声音中断，请检查 Bumi 麦克风",
+    "LIBRTMP_UNAVAILABLE": "机器人缺少 librtmp1 运行库",
+    "RTMP_CONNECT_FAILED": "虎牙服务器连接失败，请检查网络和推流地址",
+    "RTMP_PUBLISH_REJECTED": "虎牙拒绝推流，请更新推流地址",
+    "RTMP_WRITE_FAILED": "向虎牙上传直播数据失败",
 }
 
 
@@ -58,12 +64,14 @@ class LiveStreamWorker:
     """Thread-safe explicit start/stop; never auto-live on driver startup."""
 
     def __init__(self, camera, audio: AudioBuffer, fps: int = 15,
-                 bitrate_kbps: int = 1200, popen=subprocess.Popen):
+                 bitrate_kbps: int = 1200, popen=subprocess.Popen,
+                 publisher_factory=RTMPPublisher):
         self.camera = camera
         self.audio = audio
         self.fps = max(1, min(15, int(fps)))
         self.bitrate_kbps = max(300, min(2400, int(bitrate_kbps)))
         self._popen = popen
+        self._publisher_factory = publisher_factory
         self._lock = threading.RLock()
         self._cancel = threading.Event()
         self._thread = None
@@ -73,6 +81,7 @@ class LiveStreamWorker:
         self._start_time = 0.0
         self._frames = 0
         self._chunks = 0
+        self._published_records = 0
 
     def info(self) -> dict:
         with self._lock:
@@ -85,6 +94,7 @@ class LiveStreamWorker:
                 "video_frames": self._frames,
                 "audio_chunks": self._chunks,
                 "audio_dropped": self.audio.dropped,
+                "published_records": self._published_records,
             }
 
     def start(self, url: str) -> dict:
@@ -101,6 +111,7 @@ class LiveStreamWorker:
             self._cancel = threading.Event()
             self._error = ""
             self._frames = self._chunks = 0
+            self._published_records = 0
             self._start_time = time.monotonic()
             self._status = "starting"
             self._thread = threading.Thread(
@@ -149,7 +160,11 @@ class LiveStreamWorker:
         writers = []
         failure: queue.Queue[str] = queue.Queue()
         error_code = ""
+        publisher = None
         try:
+            # RTMP credentials are only passed to the in-process library.
+            publisher = self._publisher_factory(url)
+            publisher.connect()
             audio_r, audio_fd = os.pipe()
             cmd = [
                 "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
@@ -162,16 +177,17 @@ class LiveStreamWorker:
                 "-pix_fmt", "yuv420p", "-b:v", f"{self.bitrate_kbps}k",
                 "-g", str(self.fps * 2),
                 "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
-                "-f", "flv", url,
+                "-f", "flv", "pipe:1",
             ]
             try:
                 proc = self._popen(cmd, stdin=subprocess.PIPE,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    pass_fds=(audio_r,), bufsize=0)
             finally:
                 os.close(audio_r)
             os.set_blocking(proc.stdin.fileno(), False)
             os.set_blocking(audio_fd, False)
+            os.set_blocking(proc.stdout.fileno(), False)
             with self._lock:
                 self._process = proc
 
@@ -215,16 +231,29 @@ class LiveStreamWorker:
                 writers.append(thread)
                 thread.start()
 
-            while not cancel.wait(0.2):
-                if proc.poll() is not None:
+            framer = FLVFramer()
+            while not cancel.is_set():
+                if select.select([proc.stdout.fileno()], [], [], 0.2)[0]:
+                    payload = os.read(proc.stdout.fileno(), 65536)
+                    if payload:
+                        for record in framer.feed(payload):
+                            publisher.send(record)
+                            with self._lock:
+                                self._published_records += 1
+                    elif proc.poll() is not None:
+                        error_code = "RTMP_PROCESS_EXITED"
+                        break
+                elif proc.poll() is not None:
                     error_code = "RTMP_PROCESS_EXITED"
-                    cancel.set()
                     break
                 with self._lock:
-                    if self._status == "starting" and self._frames and self._chunks:
+                    if (self._status == "starting" and self._frames
+                            and self._chunks and self._published_records):
                         self._status = "streaming"
             if not failure.empty():
                 error_code = failure.get_nowait()
+        except RTMPTransportError as exc:
+            error_code = str(exc)
         except (OSError, RuntimeError, ValueError):
             error_code = "ENCODER_START_FAILED"
         finally:
@@ -239,11 +268,20 @@ class LiveStreamWorker:
                         proc.wait(timeout=2)
                 if proc.stdin:
                     proc.stdin.close()
+                if proc.stdout:
+                    proc.stdout.close()
             if audio_fd is not None:
                 os.close(audio_fd)
             for writer in writers:
                 if writer.is_alive():
                     writer.join(timeout=2)
+            if not failure.empty():
+                error_code = failure.get_nowait()
+            if publisher is not None:
+                try:
+                    publisher.close()
+                except OSError:
+                    pass
             with self._lock:
                 self._process = None
                 if self._status != "idle":

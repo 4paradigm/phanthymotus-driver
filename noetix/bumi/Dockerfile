@@ -30,6 +30,7 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
         python3-pip \
         python3-dev \
         ffmpeg \
+        librtmp1 \
         cmake \
         build-essential \
         curl \

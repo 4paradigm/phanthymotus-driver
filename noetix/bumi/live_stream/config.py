@@ -1,7 +1,8 @@
-"""Huya-only URL validation and restricted local credential persistence."""
+"""Huya-only URL validation and protected, atomic local credential storage."""
 from __future__ import annotations
 
 import os
+import secrets
 import stat
 import tempfile
 from pathlib import Path
@@ -33,42 +34,98 @@ def validate_huya_url(value: object) -> str:
 
 
 class HuyaCredentialStore:
-    """Never exposes the saved credential in card status or logs."""
+    """Private atomic storage; no symlink traversal for the credential filename.
+
+    Linux: hold a verified 0700 directory FD and perform file operations relative
+    to that FD, so path replacement cannot redirect a privileged write.
+    Windows is supported for local tests only, not as a production secret store.
+    """
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
 
-    def read(self) -> str | None:
-        try:
-            fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        except (OSError, ValueError):
-            return None
+    def _open_directory(self, *, create: bool) -> int:
+        if create:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             meta = os.fstat(fd)
-            if (not stat.S_ISREG(meta.st_mode) or meta.st_size > MAX_URL + 16
-                    or (os.name != "nt" and meta.st_mode & 0o077)):
+            if (not stat.S_ISDIR(meta.st_mode) or meta.st_uid != os.geteuid()
+                    or meta.st_mode & 0o077):
+                raise OSError("credential directory must be owner-only (0700)")
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    def read(self) -> str | None:
+        if os.name == "nt":
+            try:
+                if self.path.is_symlink():
+                    return None
+                return validate_huya_url(self.path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeError):
                 return None
-            return validate_huya_url(os.read(fd, MAX_URL + 16).decode("utf-8"))
+        try:
+            directory = self._open_directory(create=False)
+        except OSError:
+            return None
+        try:
+            fd = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                meta = os.fstat(fd)
+                if not stat.S_ISREG(meta.st_mode) or meta.st_size > MAX_URL + 16 or meta.st_mode & 0o077:
+                    return None
+                return validate_huya_url(os.read(fd, MAX_URL + 16).decode("utf-8"))
+            finally:
+                os.close(fd)
         except (OSError, UnicodeError, ValueError):
             return None
         finally:
-            os.close(fd)
+            os.close(directory)
 
     def save(self, raw: object) -> None:
         url = validate_huya_url(raw)
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if self.path.is_symlink():
-            raise OSError("credential path is a symlink")
-        temp: str | None = None
+        if os.name == "nt":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.path.is_symlink():
+                raise OSError("credential path is a symlink")
+            temp: str | None = None
+            try:
+                fd, temp = tempfile.mkstemp(prefix=".huya-", dir=self.path.parent)
+                with os.fdopen(fd, "w", encoding="utf-8") as output:
+                    output.write(url)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temp, self.path)
+            finally:
+                if temp and os.path.exists(temp):
+                    os.unlink(temp)
+            return
+
+        directory = self._open_directory(create=True)
+        name = ".huya-" + secrets.token_hex(12)
         try:
-            fd, temp = tempfile.mkstemp(prefix=".huya-", dir=self.path.parent)
-            with os.fdopen(fd, "w", encoding="utf-8") as output:
-                if hasattr(os, "fchmod"):
-                    os.fchmod(output.fileno(), 0o600)
-                output.write(url)
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temp, self.path)
+            try:
+                entry = os.stat(self.path.name, dir_fd=directory, follow_symlinks=False)
+                if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
+                    raise OSError("credential target must be a regular file")
+            except FileNotFoundError:
+                pass
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=directory)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as output:
+                    output.write(url)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(name, self.path.name,
+                           src_dir_fd=directory, dst_dir_fd=directory)
+                os.fsync(directory)
+            finally:
+                try:
+                    os.unlink(name, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
         finally:
-            if temp and os.path.exists(temp):
-                os.unlink(temp)
+            os.close(directory)

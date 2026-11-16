@@ -17,7 +17,7 @@
 - **仅支持虎牙**：官方 direct.huya.com 下的 RTMP(S) huyalive 地址，其他 URL 会被拒绝。
 - 视频：复用现有 CameraPlugin 的 JPEG 帧缓存，640×480 / 15 FPS / H.264。不会再次打开 RealSense。
 - 音频：订阅现有 ROS2 MicPlugin AudioChunk，16 kHz PCM → AAC 44.1 kHz。
-- 推流：由 Bumi Driver 容器内现有 FFmpeg 发送。**数据面不经过 Agent Core 或 LLM**。
+- 推流：由 Bumi Driver 容器中的 FFmpeg 编码为 FLV（经匿名管道输出），再由本进程的 `librtmp1` 将 FLV 推送至虎牙。**数据面不经过 Agent Core 或 LLM**，且完整推流 URL 不会出现在 FFmpeg 子进程命令行中。
 - 开播只由 go_live 触发。断网或 FFmpeg 退出则报告 error，不擅自恢复公开直播。
 - info 的 streaming 只说明编码进程正在处理音视频，**实际直播间播放仍要从观众端确认**。
 
@@ -38,14 +38,14 @@
 ### 凭证与权限
 
 - Card 配置中完整 URL 标为 password + x-sensitive，防止输入时明文展示及打包分享 Solution 时直接导出。
-- Driver 的持久化副本放在 /opt/phanthy-motus/data/live_stream/huya-rtmp-url，Linux 文件模式 0600；源代码、config.yaml、返回状态和 Docker 日志都不包含完整 URL。
-- **已知安全边界：** Agent Core 画布配置数据库仍可能含明文，FFmpeg 进程参数可能被本机管理员查看；不是端到端加密的凭证库。必须限制管理员访问，禁止向非管理员公开 Card 的开播工具。
+- Driver 的持久化副本放在 /opt/phanthy-motus/data/live_stream/huya-rtmp-url，Linux 文件模式 0600；其父目录必须由运行用户拥有且权限为 0700，否则拒绝保存。使用目录文件描述符进行原子更新，拒绝符号链接。源代码、config.yaml、返回状态和 Docker 日志都不应包含完整 URL。
+- **已知安全边界：** Agent Core 画布配置数据库仍可能含明文，RTMP URL 仍在 Driver 进程内存中；通过 `librtmp1` 的进程内 API 连接，不再把密钥传给 FFmpeg 子进程 argv，但同机高权限进程仍可能读取内存。生产环境必须限制管理员访问，禁止非管理员控制开播。
 - 设备端音视频直推虎牙不会关闭 Camera、Depth、Mic Card。运行时要记录 CPU、掉帧、音画偏差并完成真机持续推流验收。
 
 ### 本地回归
 
 从 Driver 仓库根目录运行：
 
-    python -m pytest noetix/bumi/live_stream/tests -q
+    python -X utf8 -m pytest noetix/bumi/live_stream/tests -q
 
 Windows 上可指定一个自己有权限的 --basetemp 路径。音视频双 pipe 推流需要在 Linux ARM64 容器中真机验证。

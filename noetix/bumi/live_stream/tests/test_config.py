@@ -55,3 +55,34 @@ def test_symlink_not_overwritten(tmp_path):
     with pytest.raises(OSError):
         HuyaCredentialStore(link).save(URL)
     assert target.read_text() == "not a credential"
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux directory-fd security only")
+def test_linux_rejects_world_readable_credential_directory(tmp_path):
+    parent = tmp_path / "credentials"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o755)
+    store = HuyaCredentialStore(parent / "url")
+    with pytest.raises(OSError, match="owner-only"):
+        store.save(URL)
+    assert store.read() is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux directory-fd security only")
+def test_linux_rejects_symlink_parent(tmp_path):
+    actual = tmp_path / "actual"
+    actual.mkdir(mode=0o700)
+    symlink = tmp_path / "shortcut"
+    symlink.symlink_to(actual, target_is_directory=True)
+    with pytest.raises(OSError):
+        HuyaCredentialStore(symlink / "url").save(URL)
+    assert not (actual / "url").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux directory-fd security only")
+def test_linux_atomic_replacement_retains_private_mode(tmp_path):
+    store = HuyaCredentialStore(tmp_path / "private" / "url")
+    store.save(URL)
+    store.save(URL.replace("seq=12345", "seq=67890"))
+    assert store.read().endswith("seq=67890&type=simple")
+    assert (store.path.stat().st_mode & 0o077) == 0
+    assert sorted(p.name for p in store.path.parent.iterdir()) == ["url"]

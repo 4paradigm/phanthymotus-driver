@@ -96,23 +96,30 @@ class LiveStreamPlugin:
         }
 
     def start(self) -> dict:
-        if self._node is None and self._executor is not None:
-            self._node = attach_audio_subscription(
-                self._executor, self._namespace, self._audio)
-        return {"state": "ready"}
+        with self._lock:
+            if self._node is None and self._executor is not None:
+                self._node = attach_audio_subscription(
+                    self._executor, self._namespace, self._audio)
+            return {"state": "ready"}
 
     def stop(self) -> dict:
-        result = self._worker.stop()
-        if self._node is not None:
-            self._executor.remove_node(self._node)
-            self._node.destroy_node()
-            self._node = None
-        return result
+        with self._lock:
+            result = self._worker.stop()
+            if result.get("state") == "stopping":
+                return result
+            if self._node is not None:
+                self._executor.remove_node(self._node)
+                self._node.destroy_node()
+                self._node = None
+            self._audio.clear()
+            return result
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
-            return {"state": "ready", "configured": bool(self._url)}
-        if action in ("stop", "end_live"):
+            return {**self.start(), "configured": bool(self._url)}
+        if action == "stop":
+            return self.stop()
+        if action == "end_live":
             return self._worker.stop()
         if action == "info":
             return {"platform": "huya", "configured": bool(self._url),
