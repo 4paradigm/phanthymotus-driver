@@ -146,3 +146,42 @@ roslaunch rosbridge_server rosbridge_websocket.launch address:=127.0.0.1 port:=9
 根据以上实测，驱动已将 `loco_state` 数据读取与全身机型探测解耦：
 只要连接正常、里程计 frame/数据有效且新鲜即可输出；机型探测失败或切换 raw SHM 来源不再清空独立的底盘里程计。
 运动指令仍要求正确机型、控制模式及使能状态；连接断开/代次变化仍清除全部旧测量。
+
+## 追加：相机、音频与导航能力核查
+
+2026-11-16 15:54–15:56（+08:00）再次只读查询 ROS 图，并短时订阅状态及图像帧计数。
+未发送导航目标、取消、建图、定位初始化、相机开关、音频录制或播放命令。
+
+| 能力 | 当时实测 | 当前驱动覆盖 |
+| --- | --- | --- |
+| 相机 | 两路 `/camera_{1,2}/color/image_raw/compressed` 为 `sensor_msgs/CompressedImage`，有对应发布节点；两路 `open_state=false`，3s 内均0帧 | 尚无相机卡；不能宣称可用图像流 |
+| 麦克风 | ROS 图未发现 audio / micphone / speaker 相关话题 | 尚无 `mic` 卡；不能从声卡存在推断可采集 |
+| 扬声器 | `/play_music`、`/stop_music`、`/speech_synthesis` 服务均不存在；ALSA 仅列出 Jetson APE/HDA | 尚无 `speaker` 卡；未验证实际音频设备及格式 |
+| 地图 | `/map` 为 `nav_msgs/OccupancyGrid`，收到1092×1135、分辨率约0.05m、map frame 的地图 | 尚无地图卡 |
+| 定位 | `/move_base/amcl_pose` 有 `geometry_msgs/PoseWithCovarianceStamped` 实测反馈，frame=map | 尚未适配空间位置流 |
+| 导航 | `/move_base/status` 为 `GoalStatusArray`，收到1项 PENDING；`/move_base_simple/goal` 有 `/lqr_path_track` 订阅 | 尚无 `controlled_spatial`，未发送目标验证 |
+
+真机导航服务类型：
+
+- `/move_base/base_move` → `leju_mobile_base_msgs/BaseMove`
+- `/move_base/move_to_target` → `leju_mobile_base_msgs/MoveToTarget`
+- `/move_base/dispatch_move` → `leju_mobile_base_msgs/DispatchMove`
+- `/move_base/check_arrived` → `leju_mobile_base_msgs/CheckArrived`
+- `/get_jmap_lists` → `jaten_msgs/MapLists`
+- `/jmap_operate` → `jaten_msgs/MapOpt`
+- `/save_map` → `cartographer_ros_msgs/SaveMap`
+- `/start_localization` → `leju_mobile_base_msgs/StartLocalization`
+
+SDK 示例中的 `/load_map`、`/get_all_maps`、`/get_current_map`、`/navigate_to_task_point`
+服务均不在该次服务注册表中；`/move_base/cancel` 也不在话题类型表中。
+这说明底盘确有导航相关栈，但不能直接把 SDK 示例等同于该机接口。
+`/navigation_control` 当时仅见 `/joy_node` 订阅，没有发布者；本次未据名称推测其暂停语义。
+
+后续 `controlled_spatial` 应沿用其他驱动的 `navigate_to_pose`、`navigate_to_tag`、
+`list_maps`、`load_map` 等实际可支持动作，并与 `loco` 共用 `base` 资源、接入 ACP。
+在开放导航动作前，必须取得当前底盘自定义服务的请求/响应定义及取消协议，核实目标ID关联、
+失败状态、停止确认和控制仲裁；不能直接使用 SDK 的“status_list 首项”判定本次导航完成，
+也不能只发零速便假定导航规划器不会继续发送速度。建图和地图管理只声明已经适配的能力。
+
+当前配置仍只注册 `loco/arm/leg/waist/head/switch_mode/state/joints/imu/loco_state/model`，
+本次核查没有添加相机、`mic`、`speaker` 或 `controlled_spatial` 的占位卡。

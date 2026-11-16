@@ -10,6 +10,7 @@ import types
 import unittest
 import urllib.request
 from pathlib import Path
+from email.message import Message
 from unittest.mock import patch
 
 import yaml
@@ -22,11 +23,63 @@ with patch.dict(sys.modules, {"common": types.SimpleNamespace(logsafe=types.Simp
 
 
 class McpTests(unittest.TestCase):
+    def http_request(self, headers=(), peer='127.0.0.1', method='POST'):
+        # Exercise BaseHTTPRequestHandler's real HTTP parser and response writer.
+        body = json.dumps(self.rpc()).encode()
+        lines = [f'{method} /mcp HTTP/1.1', f'Content-Length: {len(body)}']
+        lines += [f'{name}: {value}' for name, value in headers]
+        wire = '\r\n'.join(lines).encode() + b'\r\n\r\n' + body
+        class Connection:
+            def __init__(self):
+                self.output = bytearray()
+            def makefile(self, *args):
+                return io.BytesIO(wire)
+            def sendall(self, data):
+                self.output.extend(data)
+        connection = Connection()
+        main._handler()(connection, (peer, 12345), types.SimpleNamespace(server_port=15747))
+        response = bytes(connection.output)
+        head, content = response.split(b'\r\n\r\n', 1)
+        return int(head.split(b' ')[1]), head, json.loads(content)
+
+    def test_http_rejects_browser_remote_and_rebinding_requests_before_dispatch(self):
+        cases = [
+            ([('Host', 'localhost:15747'), ('Origin', 'https://attacker.example')], '127.0.0.1', 'POST'),
+            ([('Host', 'localhost:15747'), ('Origin', 'null')], '127.0.0.1', 'POST'),
+            ([('Host', 'localhost:15747'), ('Origin', '')], '127.0.0.1', 'POST'),
+            ([('Host', 'attacker.example:15747')], '127.0.0.1', 'POST'),
+            ([('Host', 'localhost:15747'), ('Host', 'attacker.example')], '127.0.0.1', 'POST'),
+            ([], '127.0.0.1', 'POST'),
+            ([('Host', 'localhost:15747')], '192.168.1.50', 'POST'),
+            ([('Host', '127.0.0.1:15747'), ('Origin', 'https://attacker.example')], '127.0.0.1', 'OPTIONS'),
+        ]
+        bundle = types.SimpleNamespace(dispatch=lambda *a: self.fail('rejected HTTP request dispatched motion'))
+        with patch.object(main, '_bundle', bundle):
+            for headers, peer, method in cases:
+                with self.subTest(headers=headers, peer=peer, method=method):
+                    status, head, _ = self.http_request(headers, peer, method)
+                    self.assertEqual(status, 403)
+                    self.assertNotIn(b'Access-Control-Allow-Origin', head)
+
+    def test_http_accepts_loopback_core_request_without_browser_origin(self):
+        calls = []
+        with patch.object(main, '_bundle', types.SimpleNamespace(dispatch=lambda *a: calls.append(a) or {'state': 'ready'})):
+            for host in ('localhost:15747', '127.0.0.1:15747'):
+                status, head, response = self.http_request([('Host', host)])
+                self.assertEqual(status, 200)
+                self.assertNotIn(b'Access-Control-Allow-Origin', head)
+                self.assertFalse(response['result'].get('isError', False))
+        self.assertEqual(calls, [('loco', {}), ('loco', {})])
+
     def request(self, value, path="/mcp"):
         body = value if isinstance(value, bytes) else json.dumps(value).encode()
         handler = main._handler().__new__(main._handler())
         handler.path, handler.rfile = path, io.BytesIO(body)
-        handler.headers = {"Content-Length": str(len(body))}
+        handler.headers = Message()
+        handler.headers['Content-Length'] = str(len(body))
+        handler.headers['Host'] = 'localhost:15747'
+        handler.client_address = ('127.0.0.1', 12345)
+        handler.server = types.SimpleNamespace(server_port=15747)
         replies = []
         handler._reply = lambda status, payload: replies.append((status, payload))
         handler.do_POST()
@@ -74,6 +127,10 @@ class McpTests(unittest.TestCase):
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_mcp_binds_loopback_only(self):
+        with patch.object(main, 'ThreadingHTTPServer') as server:
+            main._mcp_server(15747)
+        self.assertEqual(server.call_args[0][0], ('127.0.0.1', 15747))
     def test_registration_sends_standard_identity_and_transport(self):
         stopped, requests = threading.Event(), []
         def receive(request, **kwargs):

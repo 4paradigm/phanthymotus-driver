@@ -4,6 +4,7 @@ from common import logsafe
 logsafe.install()
 
 import json
+import ipaddress
 import os
 import re
 import signal
@@ -17,6 +18,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent
 PROFILE = Path("/opt/phanthy-motus/dds-local.xml")
 DRIVER_ID = "lejurobot-kuavo5-w-driver"
+MCP_HOST = "127.0.0.1"
 _bundle = None
 
 
@@ -75,6 +77,20 @@ def _register(config, stopped):
 
 def _handler():
     class Handler(BaseHTTPRequestHandler):
+        def _local_request(self):
+            # Agent Core is a server-side, loopback caller; browsers call Core.
+            try:
+                local = ipaddress.ip_address(self.client_address[0]).is_loopback
+            except ValueError:
+                local = False
+            hosts = self.headers.get_all('Host', [])
+            allowed = {f'localhost:{self.server.server_port}', f'127.0.0.1:{self.server.server_port}'}
+            if (not local or self.headers.get_all('Origin', []) or len(hosts) != 1
+                    or hosts[0].lower() not in allowed):
+                self._error(-32600, 'MCP requires a loopback server-side request', status=403)
+                return False
+            return True
+
         def log_message(self, fmt, *args):
             safe = (fmt % args).encode("unicode_escape").decode("ascii")[:200]
             print(f"[mcp] {safe}", flush=True)
@@ -84,7 +100,6 @@ def _handler():
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(body)
 
@@ -93,6 +108,8 @@ def _handler():
                                  "error": {"code": code, "message": message}})
 
         def do_POST(self):
+            if not self._local_request():
+                return
             if self.path.split("?", 1)[0] != "/mcp":
                 self._error(-32601, "Not found", status=404)
                 return
@@ -142,13 +159,13 @@ def _handler():
             self._reply(200, {"jsonrpc": "2.0", "id": rid, "result": result})
 
         def do_OPTIONS(self):
-            self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            if self._local_request():
+                self._error(-32600, 'Browser access is not supported; use Agent Core', status=403)
     return Handler
+
+
+def _mcp_server(port):
+    return ThreadingHTTPServer((MCP_HOST, port), _handler())
 
 
 def main():
@@ -169,7 +186,7 @@ def main():
     server, ros2_thread = None, None
     try:
         _bundle = KuavoBundle(config, namespace, ros1, node)
-        server = ThreadingHTTPServer(("", int(config.get("mcp_port", 15747))), _handler())
+        server = _mcp_server(int(config.get("mcp_port", 15747)))
         ros2_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True, name="ros2-domain-42")
         ros2_thread.start()
         ros1.start()

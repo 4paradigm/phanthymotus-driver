@@ -1,6 +1,6 @@
 # Kuavo 5-W SDK / 源码核查与适配决策
 
-核查日期：2026-11-16。这里区分“已核实的公开源码”和“机器人现场实际版本”；尚未连接真机读取后者。
+核查日期：2026-11-16。这里区分“已核实的公开源码”和“机器人现场实际版本”；现场只读检查另见 `ROBOT_INSPECTION.md`，尚未确认运行中全身控制器对应的源码版本。
 
 ## 1. 源码在哪里
 
@@ -140,9 +140,16 @@ SDK 数据类的“world”文字描述不能覆盖控制器中的实际变换�
 - 底盘新命令与旧命令共享 busy 通道。避免原先“先取消旧 ACP，再验证新指令”，也避免 cmd_vel 优先级窗口覆盖新位置目标。
 - 每个物理执行卡继续保留 ACP、资源声明和 interrupt hook，动作分组补齐 required 参数。
 - 系统 `start`/`stop` 仅返回生命周期标记，不调用全身暂停；在途动作仍由 bundle/ACP 管理，停止由 `stop_move`/interrupt 显式执行。
-- 暂停/恢复/模式切换使用共用2s的服务与反馈预算；前台控制锁等待上限0.25s，争用时返回 busy，生命周期不等待该锁。
+- 暂停/恢复/模式切换使用共用2s的服务与反馈预算；普通前台控制锁等待上限0.25s，生命周期不等待该锁。停止不走 busy 拒绝路径，令牌使旧恢复/模式切换失效；网络响应在锁外等待，旧请求在停止之后不能继续发送或解除本地阻塞。
 - `motion_enabled` 默认 true（未配置亦然），运动、恢复及切换模式仍接受原有运行时检查；显式设为 false 时可只读运行，保留暂停/停止能力。
 - 注册补齐 id/transport；rosbridge 错误日志只输出有界转义字段；移除本地未使用的 ROS2 geometry_msgs 依赖。
+- MCP 只绑定127.0.0.1，校验对端/Host，拒绝所有 Origin 和浏览器预检；动作、服务和暂停错误均在源头限长并转义日志。
+- 官方 `humanoidController_wheel_wbc.cpp` 通过 `advertise(..., true)` 发布 latched `/enable_control_state`，只在初始化、暂停受理和恢复到 IDLE 时发布。不能按普通周期话题直接加2s消息超时。
+  驱动独立线程读取 `/rosapi/publishers` 并重复同 id 订阅，核实来源及 latch 重新投递，续期3s状态通路验证；失败立即失效，过期 True/False 不走运动或暂停/恢复快捷路径。这个检查不等价于硬件心跳或物理停止确认。
+  另核对 rosbridge 官方 ROS1 实现：[rosapi_node](https://github.com/RobotWebTools/rosbridge_suite/blob/ros1/rosapi/scripts/rosapi_node)、
+  [subscribe capability](https://github.com/RobotWebTools/rosbridge_suite/blob/ros1/rosbridge_library/src/rosbridge_library/capabilities/subscribe.py)、
+  [MultiSubscriber](https://github.com/RobotWebTools/rosbridge_suite/blob/ros1/rosbridge_library/src/rosbridge_library/internal/subscribers.py)。
+  重复订阅会调用 `add_callback` 重新投递 latch；现场版本不支持时驱动拒绝运动并报告验证错误，不伪造刷新时间。
 
 ## 7. 仍需真机确认
 

@@ -111,6 +111,10 @@ class RosbridgeClient:
 
     def call_service(self, service: str, service_type: str, args: dict,
                      timeout: float = 5.0) -> dict:
+        return self.wait_service(self.start_service(service, service_type, args), timeout)
+
+    def start_service(self, service: str, service_type: str, args: dict):
+        """Send atomically, then let the caller wait WITHOUT a motion lock."""
         # ROS 1 resolves service types server-side; protocol call_service has no type field.
         request_id = f"kuavo_{uuid4().hex}"
         event, result = threading.Event(), {}
@@ -121,10 +125,28 @@ class RosbridgeClient:
                 self._services[request_id] = (event, result)
                 self._send({"op": "call_service", "id": request_id,
                             "service": service, "args": args})
-            if not event.wait(timeout):
-                raise TimeoutError(f"ROS service timed out (not retried): {service}")
+            return request_id, event, result, service
+        except Exception:
+            with self._lock:
+                self._services.pop(request_id, None)
+            raise
+
+    def wait_service(self, pending, timeout: float, cancelled=None) -> dict:
+        request_id, event, result, service = pending
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                if cancelled is not None and cancelled.is_set():
+                    raise InterruptedError('control request superseded by stop')
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"ROS service timed out (not retried): {service}")
+                if event.wait(min(0.02, remaining)):
+                    break
+            if cancelled is not None and cancelled.is_set():
+                raise InterruptedError('control request superseded by stop')
             if result.get("result") is not True:
-                raise RuntimeError(f"ROS service failed: {service}: {result.get('values')}")
+                raise RuntimeError(f"ROS service failed: {service}: {_log_text(result.get('values'))}")
             values = result.get("values")
             if not isinstance(values, dict):
                 raise RuntimeError(f"Invalid service values: {service}")

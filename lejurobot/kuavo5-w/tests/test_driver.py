@@ -27,6 +27,8 @@ class FakeRos1:
         self.published, self.services, self.subscriptions, self.advertised = [], [], {}, []
         self.connection, self.motion_ready = (True, 1), True
         self.service_accepts, self.confirm = True, True
+        self.latched, self.sent_services, self.publisher_checks = {}, [], []
+        self.enable_publishers, self.replay_enable = ['/wheel_controller'], True
         self.params = {'robot_type': 1, 'robot_version': 400062, 'armRealDof': 14,
                        'headRealDof': 2, 'legRealDof': 4, 'waistRealDof': 0,
                        'use_shm_communication': False,
@@ -49,6 +51,9 @@ class FakeRos1:
         self.published.append((topic, message_type, message))
 
     def call_service(self, service, service_type, args, timeout):
+        if service == '/rosapi/publishers':
+            self.publisher_checks.append((service, service_type, args, timeout))
+            return {'publishers': self.enable_publishers}
         self.services.append((service, service_type, args, timeout))
         if not self.connection[0]:
             raise ConnectionError("disconnected")
@@ -59,10 +64,25 @@ class FakeRos1:
                 self.emit("/mobile_manipulator/lb_mpc_control_mode", args["control_mode"])
         return {"success": self.service_accepts, "result": self.service_accepts, "message": "test service"}
 
+    def start_service(self, service, service_type, args):
+        self.sent_services.append((service, service_type, args))
+        return service, service_type, args
+
+    def wait_service(self, pending, timeout, cancelled=None):
+        if cancelled is not None and cancelled.is_set():
+            raise InterruptedError('control request superseded by stop')
+        response = self.call_service(*pending, timeout)
+        if cancelled is not None and cancelled.is_set():
+            raise InterruptedError('control request superseded by stop')
+        return response
+
     def subscribe(self, topic, message_type, callback):
         self.subscriptions[topic] = (message_type, callback)
+        if topic == '/enable_control_state' and self.replay_enable and topic in self.latched:
+            callback({'data': self.latched[topic]})
 
     def emit(self, topic, value):
+        self.latched[topic] = value
         self.subscriptions[topic][1]({"data": value})
 
     def raw(self, q=None, **overrides):
@@ -114,6 +134,7 @@ class DriverContractTests(unittest.TestCase):
         self.ros.raw()
         self.ros.emit("/enable_control_state", True)
         self.ros.emit("/mobile_manipulator/lb_mpc_control_mode", 3)
+        self.bundle.state.verify_enable()
 
     def tearDown(self):
         self.bundle.close()
@@ -231,11 +252,12 @@ class DriverContractTests(unittest.TestCase):
             with self.subTest(action=action):
                 self.ros.confirm = False
                 self.ros.emit('/enable_control_state', action != 'resume')
-                clock = [100.]
+                started = time.monotonic()
+                clock = [started]
                 def sleep(seconds):
                     clock[0] += seconds
                 def delayed_service(*args):
-                    self.assertEqual(args[-1], driver.CONTROL_TIMEOUT_S)
+                    self.assertAlmostEqual(args[-1], driver.CONTROL_TIMEOUT_S)
                     clock[0] += 1.5  # Consumes the same budget as the following wait.
                     return {'success': True, 'result': True}
                 fake_time = types.SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)
@@ -243,7 +265,7 @@ class DriverContractTests(unittest.TestCase):
                     result = self.call('switch_mode', action, mode=3)
                 self.assertEqual(result['state'], 'error')
                 self.assertIn('not confirmed', result['error'])
-                self.assertAlmostEqual(clock[0] - 100., driver.CONTROL_TIMEOUT_S)
+                self.assertAlmostEqual(clock[0] - started, driver.CONTROL_TIMEOUT_S)
         self.ros.confirm = True
 
     def test_control_confirmation_rejects_feedback_from_reconnected_service_session(self):
@@ -255,6 +277,197 @@ class DriverContractTests(unittest.TestCase):
             result = self.call('switch_mode', 'set_mode', mode=3)
         self.assertEqual(result['state'], 'error')
         self.assertIn('connection changed', result['error'])
+
+    def test_stops_preempt_blocked_resume_and_mode_service_without_waiting(self):
+        for transition, card, stop_action in [('resume', 'loco', 'stop_move'),
+                                               ('set_mode', 'switch_mode', 'pause')]:
+            with self.subTest(transition=transition):
+                self.ros.emit('/enable_control_state', transition != 'resume')
+                self.bundle.state.verify_enable()
+                entered, release = threading.Event(), threading.Event()
+                results = []
+                original = self.ros.wait_service
+                def blocked(pending, timeout, cancelled=None):
+                    if (pending[0] == '/mobile_manipulator_mpc_control'
+                            or (pending[0] == '/enable_control' and pending[2]['data'])):
+                        entered.set()
+                        release.wait(2)
+                    return original(pending, timeout, cancelled)
+                with patch.object(self.ros, 'wait_service', side_effect=blocked):
+                    worker = threading.Thread(target=lambda: results.append(
+                        self.call('switch_mode', transition, mode=3)))
+                    worker.start()
+                    try:
+                        self.assertTrue(entered.wait(1))
+                        before = len(self.ros.published)
+                        stopped = self.call(card, stop_action)
+                        self.assertEqual(stopped['state'], 'paused')
+                        self.assertTrue(worker.is_alive())  # Old service is STILL blocked.
+                        self.assertFalse(release.is_set())
+                        self.assertEqual(self.ros.sent_services[-1][0::2], ('/enable_control', {'data': False}))
+                        self.assertEqual(len(self.ros.published) - before, 2)
+                        self.assertEqual(self.ros.published[-2][2]['linear']['x'], 0.)
+                        self.assertEqual(self.ros.published[-1][2]['joint_data'], [0., 0.])
+                        # Even a late True notification cannot release the local stop.
+                        self.ros.emit('/enable_control_state', True)
+                    finally:
+                        release.set()
+                        worker.join(1)
+                self.assertFalse(worker.is_alive())
+                self.assertIn('superseded', results[0]['error'])
+                self.assertTrue(self.bundle.state.motion_blocked)
+                self.assertEqual(self.call('loco', 'move', duration=.1)['state'], 'error')
+
+    def test_stop_before_resume_send_prevents_the_old_command_from_being_sent(self):
+        self.ros.emit('/enable_control_state', False)
+        self.bundle.state.verify_enable()
+        entered, release = threading.Event(), threading.Event()
+        results = []
+        original = self.bundle.confirm_control
+        def delay(token, *args, **kwargs):
+            if token['action'] == 'resume':
+                entered.set()
+                release.wait(2)
+            return original(token, *args, **kwargs)
+        with patch.object(self.bundle, 'confirm_control', side_effect=delay):
+            worker = threading.Thread(target=lambda: results.append(self.call('switch_mode', 'resume')))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(self.call('switch_mode', 'pause')['state'], 'paused')
+                self.assertTrue(worker.is_alive())
+            finally:
+                release.set()
+                worker.join(1)
+        self.assertIn('superseded', results[0]['error'])
+        self.assertEqual([r[2] for r in self.ros.sent_services], [{'data': False}])
+        self.assertTrue(self.bundle.state.motion_blocked)
+
+    def test_stop_preempts_service_wait_and_cancels_other_actions_exactly_once(self):
+        # A pause service can itself be waiting while ACP actions are cancelled.
+        action = self.call('loco', 'move', duration=1)
+        entered, release = threading.Event(), threading.Event()
+        results = []
+        original = self.ros.wait_service
+        first = [True]
+        def blocked(pending, timeout, cancelled=None):
+            if first[0]:
+                first[0] = False
+                entered.set()
+                release.wait(2)
+            return original(pending, timeout, cancelled)
+        with patch.object(self.ros, 'wait_service', side_effect=blocked):
+            worker = threading.Thread(target=lambda: results.append(self.call('switch_mode', 'pause')))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(self.call('loco', 'stop_move')['state'], 'paused')
+                self.assertTrue(worker.is_alive())
+                self.assertTrue(wait_until(lambda: bool(self.callbacks)))
+                self.assertEqual([c[:3] for c in self.callbacks], [(action['action_id'], 'loco', 'cancelled')])
+            finally:
+                release.set()
+                worker.join(1)
+        self.assertIn('superseded', results[0]['error'])
+
+    def test_stale_enable_never_allows_motion_resume_or_mode_shortcuts(self):
+        self.bundle.state._enable_verified_at = time.monotonic() - 3600
+        self.bundle.state._seen['control_enabled'] = time.monotonic() - 3600
+        for card, args in [('loco', dict(action='move', duration=.1)),
+                           ('switch_mode', dict(action='resume')),
+                           ('switch_mode', dict(action='set_mode', mode=3))]:
+            self.assertIn('verification is missing or stale', self.bundle.dispatch(card, args)['error'])
+        self.assertEqual(self.ros.published, [])
+        self.assertEqual(self.ros.services, [])
+
+    def test_stale_false_does_not_skip_pause_confirmation(self):
+        self.ros.emit('/enable_control_state', False)
+        self.bundle.state._seen['control_enabled'] = time.monotonic() - 3600
+        self.bundle.state._enable_verified_at = time.monotonic() - 3600
+        result = self.call('switch_mode', 'pause')
+        self.assertEqual(result['state'], 'paused')
+        self.assertEqual(self.ros.services[-1][:3], ('/enable_control', 'std_srvs/SetBool', {'data': False}))
+
+    def test_latched_enable_can_be_revalidated_without_enabling_the_robot(self):
+        self.bundle.state._seen['control_enabled'] = time.monotonic() - 3600
+        self.bundle.state._enable_verified_at = time.monotonic() - 3600
+        self.bundle.state.verify_enable()
+        self.assertIs(self.bundle.state.confirmed_enable(), True)
+        self.assertTrue(self.bundle.state.snapshot()['enable_verification']['valid'])
+        self.assertEqual(self.ros.publisher_checks[-1][2], {'topic': '/enable_control_state'})
+        self.assertEqual(self.ros.services, [])
+        self.assertEqual(self.ros.published, [])
+
+    def test_enable_probe_requires_one_publisher_and_actual_redelivery(self):
+        for publishers in ([], ['/one', '/two'], None):
+            self.ros.enable_publishers = publishers
+            self.bundle.state.verify_enable()
+            with self.assertRaises(RuntimeError):
+                self.bundle.state.confirmed_enable()
+        self.ros.enable_publishers = ['/wheel_controller']
+        self.ros.replay_enable = False
+        self.bundle.state.verify_enable()
+        self.assertIn('no control-enable latched delivery', self.bundle.state.snapshot()['enable_verification']['error'])
+        with self.assertRaises(RuntimeError):
+            self.bundle.state.confirmed_enable()
+
+    def test_enable_probe_runs_off_callback_and_discards_a_reconnected_session(self):
+        entered, release = threading.Event(), threading.Event()
+        original = self.ros.call_service
+        def blocked(*args):
+            if args[0] == '/rosapi/publishers':
+                entered.set()
+                release.wait(2)
+            return original(*args)
+        with patch.object(self.ros, 'call_service', side_effect=blocked):
+            self.bundle.state._enable_tick()
+            try:
+                self.assertTrue(entered.wait(1))
+                first_thread = self.bundle.state._enable_probe_thread
+                self.bundle.state._enable_tick()
+                self.assertIs(self.bundle.state._enable_probe_thread, first_thread)
+                self.ros.connection = (True, 2)
+                self.assertFalse(self.bundle.state.snapshot()['enable_verification']['valid'])
+            finally:
+                release.set()
+                self.bundle.state._enable_probe_thread.join(1)
+        self.assertFalse(self.bundle.state.snapshot()['enable_verification']['valid'])
+
+    def test_recent_enable_message_cannot_hide_an_expired_verification_lease(self):
+        self.bundle.state._enable_verified_at = time.monotonic() - driver.ENABLE_LEASE_S - 1
+        self.ros.emit('/enable_control_state', True)
+        self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 3)
+        self.assertIn('verification is missing or stale', self.call('loco', 'move', duration=.1)['error'])
+        self.assertEqual(self.ros.published, [])
+
+    def test_enable_verification_loss_aborts_inflight_action(self):
+        action = self.call('loco', 'move', duration=1)
+        self.ros.enable_publishers = []
+        self.bundle.state.verify_enable()
+        self.assertTrue(wait_until(lambda: bool(self.callbacks)))
+        self.assertEqual(self.callbacks[0][:3], (action['action_id'], 'loco', 'error'))
+        self.assertIn('control-enable', self.callbacks[0][3]['reason'])
+        self.assertTrue(self.bundle.state.motion_blocked)
+
+    def test_action_and_service_errors_are_bounded_single_line_logs(self):
+        hostile = '\x00\x1b[31m\n' + 'x' * 100_000
+        with patch('builtins.print') as log:
+            result = self.call('arm', hostile)
+        self.assertEqual(result['state'], 'error')
+        for call in log.call_args_list:
+            line = call[0][0]
+            self.assertLess(len(line), 500)
+            self.assertFalse(any(c in line for c in ('\n', '\x00', '\x1b')))
+        self.ros.service_accepts = False
+        with patch.object(self.ros, 'call_service', return_value={'success': False, 'message': hostile}), patch('builtins.print') as log:
+            result = self.call('switch_mode', 'pause')
+        self.assertEqual(result['state'], 'error')
+        self.assertLessEqual(len(result['error']), 200)
+        self.assertTrue(log.called)
+        for call in log.call_args_list:
+            line = call[0][0]
+            self.assertLess(len(line), 500)
+            self.assertFalse(any(c in line for c in ('\n', '\x00', '\x1b')))
 
     def test_cartesian_arm_mode_four_completes_without_joint_measurements(self):
         self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 4)
@@ -503,6 +716,7 @@ class MotionConfigurationTests(unittest.TestCase):
             ros.raw()
             ros.emit('/enable_control_state', True)
             ros.emit('/mobile_manipulator/lb_mpc_control_mode', 3)
+            bundle.state.verify_enable()
             cases = [
                 ('loco', dict(action='move', duration=.1)),
                 ('loco', dict(action='move_relative', x=0, y=0, yaw=0)),

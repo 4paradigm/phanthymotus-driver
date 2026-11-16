@@ -29,6 +29,15 @@ REACH = {
 MODES = {0: "NoControl", 1: "ArmOnly", 2: "BaseOnly", 3: "BaseArm", 4: "ArmEeOnly"}
 CONTROL_TIMEOUT_S = 2.0  # One total budget for service acceptance AND state confirmation.
 DISPATCH_LOCK_TIMEOUT_S = 0.25
+ENABLE_LEASE_S = 3.0
+ENABLE_PROBE_INTERVAL_S = 1.0
+ENABLE_TOPIC = '/enable_control_state'
+
+
+def _safe_log(value, limit=200):
+    if not isinstance(value, str):
+        return f'<{type(value).__name__}>'
+    return value[:limit].encode('unicode_escape').decode('ascii')[:limit]
 
 
 def _acp_complete(action_id: str, tool: str, status: str, result: dict) -> None:
@@ -45,7 +54,7 @@ def _acp_complete(action_id: str, tool: str, status: str, result: dict) -> None:
             with urllib.request.urlopen(request, timeout=3, context=context):
                 return
         except Exception as exc:
-            print(f"[ACP] {action_id} attempt {attempt + 1} failed: {exc}", flush=True)
+            print(f"[ACP] {_safe_log(action_id)} attempt {attempt + 1} failed: {_safe_log(str(exc))}", flush=True)
             if attempt < 2:
                 time.sleep(0.2)
 
@@ -67,6 +76,13 @@ class RobotState:
         self._running = False
         self.motion_blocked = False
         self.motion_enabled = motion_enabled
+        self._enable_verified_at = None
+        self._enable_check_error = 'waiting_for_enable_check'
+        self._enable_publishers = []
+        self._enable_probe_thread = None
+        self._enable_probe_lock = threading.Lock()
+        self._enable_probe_after = 0
+        self._closed = threading.Event()
         ros1.subscribe("/mobile_manipulator/lb_mpc_control_mode", "std_msgs/Int8",
                        lambda msg: self._update("mpc_mode", msg.get("data")))
         ros1.subscribe("/enable_control_state", "std_msgs/Bool",
@@ -78,6 +94,7 @@ class RobotState:
         ros1.subscribe("/humanoid_wheel/eePoses", "std_msgs/Float64MultiArray",
                        lambda msg: self._update("ee_world_poses", msg.get("data")))
         self._timer = node.create_timer(0.2, self._publish)
+        self._enable_timer = node.create_timer(0.2, self._enable_tick)
 
     def _sync_session(self) -> tuple[bool, int]:
         connected, generation = self.ros1.connection
@@ -87,6 +104,9 @@ class RobotState:
                 self._seen.clear()
                 self._wall.clear()
                 self._generation = generation
+                self._enable_verified_at = None
+                self._enable_check_error = 'connection_changed'
+                self._enable_publishers = []
         return connected, generation
 
     def _update(self, key: str, value) -> None:
@@ -129,6 +149,11 @@ class RobotState:
                     "mode_feedback_fresh": mode_fresh,
                     "motion_blocked": self.motion_blocked, "fields": fields,
                     "motion_enabled": self.motion_enabled,
+                    "enable_verification": {
+                        'valid': self._enable_trusted(now), 'error': self._enable_check_error,
+                        'age_s': None if self._enable_verified_at is None else max(0, now - self._enable_verified_at),
+                        'publishers': list(self._enable_publishers), 'lease_s': ENABLE_LEASE_S,
+                        'method': 'rosapi_publishers_and_latched_redelivery'},
                     "robot_discovery": self.sensors.health(),
                     "ee_pose_layout": "left[x,y,z,yaw,pitch,roll],right[x,y,z,yaw,pitch,roll]",
                     "ee_pose_units": "m,rad", "reach_time_units": "s",
@@ -141,7 +166,7 @@ class RobotState:
             raise ConnectionError("ROS 1 bridge disconnected; no commands were queued")
         if not self.ros1.motion_ready:
             raise RuntimeError("ROS 1 publisher connections are warming up; retry after 1s")
-        enabled, _ = self.read("control_enabled")
+        enabled = self.confirmed_enable()
         mode, seen = self.read("mpc_mode")
         if self.motion_blocked or enabled is not True:
             raise RuntimeError("control is paused/unknown; confirm switch_mode.resume first")
@@ -153,6 +178,78 @@ class RobotState:
     def require_motion_enabled(self):
         if not self.motion_enabled:
             raise RuntimeError("motion is disabled by configuration; set motion_enabled: true and restart the driver")
+
+    def _enable_trusted(self, now):
+        seen = self._seen.get('control_enabled')
+        return (self._enable_verified_at is not None and seen is not None
+                and now - self._enable_verified_at <= ENABLE_LEASE_S
+                and now - seen <= ENABLE_LEASE_S)
+
+    def confirmed_enable(self):
+        connected, _ = self._sync_session()
+        with self._lock:
+            if not connected or not self._enable_trusted(time.monotonic()):
+                raise RuntimeError('control-enable verification is missing or stale; wait for read-only probe')
+            return self._values.get('control_enabled')
+
+    def _enable_tick(self):
+        if self._closed.is_set() or time.monotonic() < self._enable_probe_after:
+            return
+        if not self._enable_probe_lock.acquire(blocking=False):
+            return
+        def probe():
+            try:
+                self.verify_enable()
+            finally:
+                self._enable_probe_after = time.monotonic() + ENABLE_PROBE_INTERVAL_S
+                self._enable_probe_lock.release()
+        self._enable_probe_thread = threading.Thread(target=probe, daemon=True, name='enable-check')
+        self._enable_probe_thread.start()
+
+    def verify_enable(self):
+        """Read-only probe: a registered source AND a new latched delivery.
+
+        Bool has no producer stamp and is event-driven, so age alone is not a
+        producer heartbeat. Re-subscribe with the SAME id (no unsubscribe gap).
+        Official rosbridge replays the publisher's latch on repeated subscribe.
+        """
+        connected, generation = self._sync_session()
+        try:
+            if not connected:
+                raise ConnectionError('ROS bridge disconnected')
+            response = self.ros1.call_service('/rosapi/publishers', 'rosapi/Publishers',
+                                              {'topic': ENABLE_TOPIC}, 0.5)
+            publishers = response.get('publishers')
+            if (not isinstance(publishers, list) or len(publishers) != 1
+                    or not isinstance(publishers[0], str) or not publishers[0]):
+                raise RuntimeError('expected exactly one control-enable publisher')
+            issued = time.monotonic()
+            self.ros1.subscribe(ENABLE_TOPIC, 'std_msgs/Bool',
+                               lambda msg: self._update('control_enabled', msg.get('data')))
+            deadline = time.monotonic() + 0.5
+            while not self._closed.is_set() and time.monotonic() < deadline:
+                if self.ros1.connection != (True, generation):
+                    raise ConnectionError('connection changed during enable verification')
+                with self._lock:
+                    seen = self._seen.get('control_enabled')
+                    if (self._generation == generation and seen is not None and seen >= issued):
+                        self._enable_verified_at = time.monotonic()
+                        self._enable_publishers = publishers
+                        self._enable_check_error = None
+                        return
+                self._closed.wait(0.01)
+            raise TimeoutError('no control-enable latched delivery after read-only probe')
+        except Exception as exc:
+            with self._lock:
+                if self._generation == generation:
+                    self._enable_verified_at = None
+                    self._enable_publishers = []
+                    self._enable_check_error = _safe_log(str(exc))
+
+    def close(self):
+        self._closed.set()
+        if self._enable_probe_thread is not None:
+            self._enable_probe_thread.join(timeout=1.1)
 
     def _publish(self) -> None:
         if self._running:
@@ -210,7 +307,7 @@ class ActionTracker:
                     return
                 _acp_complete(*item)
             except Exception as exc:
-                print(f"[ACP] callback worker failed: {exc}", flush=True)
+                print(f"[ACP] callback worker failed: {_safe_log(str(exc))}", flush=True)
             finally:
                 self._callbacks.task_done()
 
@@ -321,17 +418,21 @@ class _KuavoPlugin:
             if action == "info":
                 return {"state": "ready" if self.ros1.connection[0] else "disconnected",
                         "motion_enabled": self.state.motion_enabled}
+            # Control services wait outside the motion lock. Stops never take
+            # the ordinary request's timed-lock/busy path.
+            if action == 'stop_move':
+                return self.bundle.pause('stopped_by_request')
+            if self.PREFIX == 'switch_mode':
+                return self._dispatch(action, args)
             if not self.tracker.lock.acquire(timeout=DISPATCH_LOCK_TIMEOUT_S):
                 raise RuntimeError("control transition is busy; query state before retrying")
             try:
-                if action == "stop_move":
-                    return self.bundle.pause("stopped_by_request")
                 return self._dispatch(action, args)
             finally:
                 self.tracker.lock.release()
         except Exception as exc:
-            print(f"[{self.PREFIX}] {action}: {type(exc).__name__}: {exc}", flush=True)
-            return {"state": "error", "error": str(exc)}
+            print(f"[{self.PREFIX}] {_safe_log(action)}: {type(exc).__name__}: {_safe_log(str(exc))}", flush=True)
+            return {"state": "error", "error": _safe_log(str(exc))}
 
     def _async_reach(self, key, publish, allowed_modes=None, joint_target=None):
         modes = allowed_modes or self.ALLOWED_MODES
@@ -388,9 +489,7 @@ class _KuavoPlugin:
                                 "measured_convergence": joint_target is not None})
                             return
                 except Exception as exc:
-                    with self.tracker.lock:
-                        if self.tracker.current(self.CHANNEL, aid):
-                            self.bundle.pause(str(exc), status="error")
+                    self.bundle.pause(_safe_log(str(exc)), status="error", expected=(self.CHANNEL, aid))
                     return
         threading.Thread(target=worker, daemon=True, name=f"acp-{self.PREFIX}").start()
         return {"state": "executing", "action_id": aid,
@@ -438,9 +537,7 @@ class _KuavoPlugin:
                                 "stop_delay_s": stop_delay, "measured_convergence": False})
                             return
             except Exception as exc:
-                with self.tracker.lock:
-                    if self.tracker.current(self.CHANNEL, aid):
-                        self.bundle.pause(str(exc), status="error")
+                self.bundle.pause(_safe_log(str(exc)), status="error", expected=(self.CHANNEL, aid))
         threading.Thread(target=worker, daemon=True, name=f"velocity-{self.PREFIX}").start()
         return {"state": "executing", "action_id": aid, "duration_s": duration,
                 "completion_basis": "command_duration_and_vendor_watchdog"}
@@ -610,19 +707,10 @@ class ControlPlugin(_KuavoPlugin):
         if action == "resume":
             return self.bundle.resume()
         if action == "set_mode":
-            self.state.require_motion_enabled()
-            self.bundle.sensors.require_profile()
-            if self.tracker._active:
-                raise RuntimeError("motion is active; pause and await completion before changing MPC mode")
             mode = args.get("mode")
             if isinstance(mode, bool) or not isinstance(mode, int) or mode not in MODES:
                 raise ValueError("mode must be an integer from 0 to 4")
-            if not self.ros1.connection[0] or self.state.read("control_enabled")[0] is not True:
-                raise RuntimeError("connect and resume control before changing mode")
-            self.bundle.confirm_control("/mobile_manipulator_mpc_control",
-                "kuavo_msgs/changeTorsoCtrlMode", {"control_mode": mode}, "result", "mpc_mode", mode)
-            return {"state": "completed", "mode": mode, "mode_name": MODES[mode],
-                    "completion_basis": "mpc_mode_feedback"}
+            return self.bundle.set_mode(mode)
         raise ValueError(f"unknown action: {action}")
 
 
@@ -647,6 +735,7 @@ class KuavoBundle:
         self.state = RobotState(ros1, ros2_node, namespace, self.sensors, motion_enabled)
         self.tracker = ActionTracker()
         self._closing = False
+        self._transition = None
         self.plugins = [LocoPlugin(self), ArmPlugin(self), LowerBodyPlugin(self),
                         LowerBodyPlugin(self, "waist"), HeadPlugin(self), ControlPlugin(self)]
         self._enabled = {name for name, cfg in config.get("plugins", {}).items()
@@ -661,20 +750,65 @@ class KuavoBundle:
     def zero_head(self):
         self.ros1.publish("/cmd_head_vel", "kuavo_msgs/robotHeadMotionData", {"joint_data": [0.0, 0.0]})
 
-    def confirm_control(self, service, service_type, args, accepted_key, key, expected):
-        issued = time.monotonic()
-        generation = self.ros1.connection[1]
-        response = self.ros1.call_service(service, service_type, args, CONTROL_TIMEOUT_S)
-        if response.get(accepted_key) is not True:
-            raise RuntimeError(response.get("message") or "control request rejected")
-        remaining = max(0.0, issued + CONTROL_TIMEOUT_S - time.monotonic())
-        self.wait_state(key, expected, issued, timeout=remaining, generation=generation)
+    def _new_transition(self, action):
+        # Caller holds tracker.lock. A stop may supersede any older transition.
+        if self._transition is not None:
+            self._transition['cancelled'].set()
+        token = {'action': action, 'cancelled': threading.Event(),
+                 'generation': self.ros1.connection[1]}
+        self._transition = token
+        return token
 
-    def wait_state(self, key, expected, issued, timeout=CONTROL_TIMEOUT_S, generation=None):
+    def _check_transition(self, token):
+        if self._transition is not token or token['cancelled'].is_set():
+            raise InterruptedError('control request superseded by stop')
+        if self.ros1.connection != (True, token['generation']):
+            raise ConnectionError('connection changed while confirming control state')
+
+    def _begin_control(self, action):
+        if not self.tracker.lock.acquire(timeout=DISPATCH_LOCK_TIMEOUT_S):
+            raise RuntimeError('control transition is busy; query state before retrying')
+        try:
+            self.state.require_motion_enabled()
+            self.sensors.require_profile()
+            if self._closing or self._transition is not None or self.tracker._active:
+                raise RuntimeError('motion/control is busy; stop and await confirmation before retrying')
+            enabled = self.state.confirmed_enable()
+            if action == 'set_mode' and enabled is not True:
+                raise RuntimeError('connect and resume control before changing mode')
+            was_blocked = self.state.motion_blocked
+            self.state.motion_blocked = True
+            return self._new_transition(action), enabled, was_blocked
+        finally:
+            self.tracker.lock.release()
+
+    def _end_control(self, token):
+        with self.tracker.lock:
+            if self._transition is token:
+                self._transition = None
+
+    def confirm_control(self, token, service, service_type, args, accepted_key, key, expected):
+        # Serialize only validation + SEND, never the remote response wait.
+        # Thus a stop packet cannot be followed by an older resume/mode SEND.
+        with self.tracker.lock:
+            self._check_transition(token)
+            issued = time.monotonic()
+            pending = self.ros1.start_service(service, service_type, args)
+        remaining = max(0.0, issued + CONTROL_TIMEOUT_S - time.monotonic())
+        response = self.ros1.wait_service(pending, remaining, token['cancelled'])
+        if response.get(accepted_key) is not True:
+            raise RuntimeError(_safe_log(response.get('message', 'control request rejected')))
+        remaining = max(0.0, issued + CONTROL_TIMEOUT_S - time.monotonic())
+        self.wait_state(key, expected, issued, timeout=remaining, generation=token['generation'], token=token)
+
+    def wait_state(self, key, expected, issued, timeout=CONTROL_TIMEOUT_S, generation=None, token=None):
         if generation is None:
             generation = self.ros1.connection[1]
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if token is not None:
+                with self.tracker.lock:
+                    self._check_transition(token)
             connected, current = self.ros1.connection
             if not connected or generation != current:
                 raise ConnectionError("connection changed while confirming control state")
@@ -684,45 +818,73 @@ class KuavoBundle:
             time.sleep(min(0.02, max(0, deadline - time.monotonic())))
         raise TimeoutError(f"request accepted but fresh {key}={expected} not confirmed; read state before retry")
 
-    def pause(self, reason, status="cancelled"):
-        # Caller holds tracker.lock. No HTTP ACP callback runs in this critical path.
+    def pause(self, reason, status="cancelled", expected=None):
         with self.tracker.lock:
+            if expected is not None and not self.tracker.current(*expected):
+                return {'state': 'idle'}  # An old worker cannot cancel a newer action.
+            interrupted = self._transition is not None
+            token = self._new_transition('pause')
             self.state.motion_blocked = True
             errors = []
             for stop in (lambda: self.twist("/cmd_vel"), self.zero_head):
                 try:
                     stop()
                 except Exception as exc:
-                    errors.append(str(exc))
+                    errors.append(_safe_log(str(exc)))
             self.tracker.cancel_all(reason, status)
+        try:
             try:
-                enabled, _ = self.state.read("control_enabled")
-                if enabled is False and self.ros1.connection[0]:
+                enabled = self.state.confirmed_enable()
+            except RuntimeError:
+                enabled = None
+            # Even a fresh pre-resume False cannot bypass a superseding pause.
+            if enabled is False and not interrupted:
+                with self.tracker.lock:
+                    self._check_transition(token)
                     return {"state": "paused", "control_enabled": False,
                             "completion_basis": "enable_control_state", "scope": "whole_body"}
-                self.confirm_control("/enable_control", "std_srvs/SetBool", {"data": False},
-                                     "success", "control_enabled", False)
+            self.confirm_control(token, "/enable_control", "std_srvs/SetBool", {"data": False},
+                                 "success", "control_enabled", False)
+            with self.tracker.lock:
+                self._check_transition(token)
                 return {"state": "paused", "control_enabled": False,
                         "completion_basis": "enable_control_state", "scope": "whole_body"}
-            except Exception as exc:
-                errors.append(str(exc))
-                print(f"[pause] physical stop unconfirmed: {'; '.join(errors)}", flush=True)
-                return {"state": "error", "error": "; ".join(errors),
-                        "physical_stop_confirmed": False, "motion_blocked": True}
+        except Exception as exc:
+            errors.append(_safe_log(str(exc)))
+            error = _safe_log('; '.join(errors))
+            print(f"[pause] physical stop unconfirmed: {error}", flush=True)
+            return {"state": "error", "error": error,
+                    "physical_stop_confirmed": False, "motion_blocked": True}
+        finally:
+            self._end_control(token)
 
     def resume(self):
-        self.state.require_motion_enabled()
-        self.sensors.require_profile()
-        self.state.motion_blocked = True
-        if self.tracker._active:
-            raise RuntimeError("cannot resume during an active motion")
-        enabled, _ = self.state.read("control_enabled")
-        if enabled is not True:
-            self.confirm_control("/enable_control", "std_srvs/SetBool", {"data": True},
-                                 "success", "control_enabled", True)
-        self.state.motion_blocked = False
-        return {"state": "ready", "control_enabled": True,
-                "completion_basis": "enable_control_state", "new_motion_command_required": True}
+        token, enabled, _ = self._begin_control('resume')
+        try:
+            if enabled is not True:
+                self.confirm_control(token, "/enable_control", "std_srvs/SetBool", {"data": True},
+                                     "success", "control_enabled", True)
+            with self.tracker.lock:
+                self._check_transition(token)
+                self.state.motion_blocked = False
+                return {"state": "ready", "control_enabled": True,
+                        "completion_basis": "enable_control_state", "new_motion_command_required": True}
+        finally:
+            self._end_control(token)
+
+    def set_mode(self, mode):
+        token, _, was_blocked = self._begin_control('set_mode')
+        try:
+            self.confirm_control(token, '/mobile_manipulator_mpc_control',
+                                 'kuavo_msgs/changeTorsoCtrlMode', {'control_mode': mode},
+                                 'result', 'mpc_mode', mode)
+            with self.tracker.lock:
+                self._check_transition(token)
+                self.state.motion_blocked = was_blocked
+                return {'state': 'completed', 'mode': mode, 'mode_name': MODES[mode],
+                        'completion_basis': 'mpc_mode_feedback'}
+        finally:
+            self._end_control(token)
 
     def get_all_tools(self):
         tools = [p.get_tool() for p in self.plugins if p.PREFIX in self._enabled]
@@ -750,10 +912,13 @@ class KuavoBundle:
             if self._closing:
                 return
             self._closing = True
-            if self.tracker._active:
-                result = self.pause("driver_shutdown")
-                if result.get("error"):
-                    print(f"[shutdown] {result}", flush=True)
+            needs_pause = bool(self.tracker._active) or self._transition is not None
+        if needs_pause:
+            result = self.pause("driver_shutdown")
+            if result.get("error"):
+                print(f"[shutdown] {_safe_log(result.get('error'))}", flush=True)
+        self.state.close()
+        with self.tracker.lock:
             self.state._running = False
             self.sensors.close()
         self.tracker.close()

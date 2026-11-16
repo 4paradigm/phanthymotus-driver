@@ -27,6 +27,9 @@ ROS1 没有 DDS domain。本驱动负责 ROS1 → ROS2 消息转换，Agent Core
 ROS2 / Agent Core 与驱动容器需要在同一 Linux 主机；机器人 ROS1 可以在本机或另一台可达主机。
 容器内提供 ROS2 Humble，机器人宿主机无需额外安装 ROS2，也不需要构建 ROS2 版 `kuavo_msgs`。
 ROS1 自定义消息的加载由机器人侧 rosbridge 完成。
+MCP 仅监听 `127.0.0.1:15747`，只接受本机无 `Origin` 的服务端请求，并校验 `Host` 为该端口的
+`localhost`/`127.0.0.1`；浏览器预检、任意浏览器来源及外部客户端均被拒绝，不返回通配 CORS。
+页面通过 Agent Core 调用驱动，不直接访问运动端口。这是同机进程信任边界，不是本机进程之间的身份鉴权。
 
 ## 机器人侧准备
 
@@ -52,6 +55,7 @@ rostopic type /mobile_manipulator/lb_mpc_control_mode  # std_msgs/Int8
 rostopic type /enable_control_state                  # std_msgs/Bool
 rosservice type /mobile_manipulator_mpc_control      # kuavo_msgs/changeTorsoCtrlMode
 rosservice type /rosapi/get_param                    # rosapi/GetParam
+rosservice type /rosapi/publishers                   # rosapi/Publishers，只读使能来源检查
 rosparam get /robot_type                             # 1 = wheel-arm
 rosparam get /use_shm_communication                   # 决定传感器话题；缺省 false
 rostopic type /sensors_data_raw                      # kuavo_msgs/sensorsData；SHM 模式加 _shm
@@ -91,6 +95,10 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 业务参数通过 `x-action-params` 分组并声明动作各自的 required；`dispatch()` 返回普通 dict，HTTP 层只包装一次 MCP content。
 `config.yaml` 的 `plugins.<card>.enabled` 决定卡片是否暴露。
 
+当前尚未实现相机、`mic`、`speaker`、`controlled_spatial` 卡片。
+真机已发现地图/定位/导航接口，但与通用 SDK 示例存在协议差异；相机关闭且音频接口未就绪。
+接口快照、可行性及导航取消/ACP 适配前提见 `ROBOT_INSPECTION.md` 的能力核查记录。
+
 参数单位与约束：
 
 - 底盘速度：本体系 `vx/vy` 为 m/s，`vyaw` 为 rad/s。驱动限制分别为 ±0.3、±0.3、±0.5，`duration` 必填，范围 0.1–10s。
@@ -121,6 +129,10 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 暂停、恢复和模式切换共用最多2s的服务受理+状态确认预算，而不是分别等待5s和2s；
 前台发令争用控制锁最多等待0.25s，未取得锁时明确返回 busy。反馈超时返回错误，要求查询状态后再决定，
 不自动重试或改为后台继续等待，确认期间重连也不能以新会话反馈证明旧请求成功。
+其中限时锁只适用于普通请求：控制服务采用“锁内验证并发送、锁外等待响应/状态”。
+`stop_move`/`switch_mode.pause` 不走0.25s busy 拒绝路径，会优先阻止运动、发送零速、取消 ACP，
+并使此前恢复/模式切换的令牌失效，再发全身暂停请求。旧请求尚未发送时不会继续发送，
+已发送请求的迟到结果也不能解除本地运动阻塞。停止确认仍受网络和厂商服务是否受理的限制。
 所有执行卡声明 `on_interrupt_motion` hook。
 
 位姿/关节运动订阅相应的 `/lb_*_reach_time`（`std_msgs/Float32`），只使用指令发送后收到的反馈。
@@ -146,11 +158,26 @@ ACP 同样标记为时长/控制器超时推断。WebSocket发送成功仅代表
 服务 `success=true` 只表示受理，暂停/恢复以 `/enable_control_state` 确认；保护窗口或重复请求被拒会返回错误。
 暂停确认失败时返回 `physical_stop_confirmed: false`，并继续阻止本驱动发运动命令。
 
-发布、取消和暂停使用同一把锁，ACP HTTP 回调在独立队列中执行，不阻塞零速发送。
-断线、模式反馈超过2s未更新、控制暂停或连接代次变化都会终止在途动作并尝试软件暂停。
+发布、取消和控制请求发送使用同一把短时锁；服务/反馈等待以及 ACP HTTP 回调不持有该锁。
+断线、模式反馈超过2s未更新、使能验证失效、控制暂停或连接代次变化都会终止在途动作并尝试软件暂停。
 **断网时软件指令不能保证停止真机**，物理安全仍需机器人原有控制器和现场急停保障。
 回调失败有日志和有限重试，驱动退出有有限的回调排空时间。
 重连仅恢复发布器/订阅，清除旧反馈，绝不重放运动命令或重试超时服务。
+
+### 使能状态的只读确认
+
+固定版本官方控制器将 `/enable_control_state` 作为 latched Bool，在初始化及状态变化时发布，
+不是周期心跳。驱动不因“正常状态长期不变”直接判为失效，也不会重复发送 enable=true 来刷新状态。
+独立线程在每次检查结束约1s后再次检查：通过 `/rosapi/publishers` 确认恰好一个来源，
+再使用同一 rosbridge subscription id 重订阅，请求重新投递 latched 状态，不取消原有订阅。
+发布者查询和重新投递分别最多等待0.5s；只有实际收到检查开始后的状态投递才续期3s验证租约。
+查询失败、来源缺失/冲突或未重新投递时立即使租约失效；没有新消息也不会自动给旧缓存续期。
+
+运动及恢复/模式切换要求有效租约和租约期内接收的使能状态；过期的 True 不能作为已启用依据，
+过期的 False 不能跳过暂停请求。恢复时验证未知则拒绝请求，等待只读检查，不擅自调用启用服务。
+`state.info.feedback.enable_verification` 提供有效性、年龄、来源及错误。
+ROS 图查询和 latch 重新投递是状态通路检查，不是带生产者时间戳的硬件心跳，也不证明物理静止；
+ROS master 缓存、具体 rosbridge 版本和真机控制器行为仍需现场核实。
 
 ## 状态转发与能力边界
 
@@ -235,10 +262,10 @@ curl -s http://localhost:15747/mcp -H 'Content-Type: application/json' \
 
 真机仍需验证：
 
-1. ROS1 上述类型/服务正确，rosbridge/rosapi 能加载厂商消息和参数，模式持续50Hz更新，软件控制状态可接收。
+1. ROS1 上述类型/服务正确，rosbridge/rosapi 能加载厂商消息和参数，模式持续50Hz更新；确认使能 latched 重投递和发布者查询可用，验证发布者消失/探测超时后阻止运动。
 2. 分别 start 传感卡，确认 domain42 收到 control/joints/imu/odom，字段、URDF名称、方向和 frame 正确，外部网络不接收该 DDS 数据。
 3. 在现场有人监督且接口就绪时，分别以小幅度验证底盘、双臂、下肢、躯干和头部的方向与单位；检查每个动作的 ACP 成功/取消/错误。
-4. 验证软件暂停、过渡窗口拒绝、恢复后需重新发目标、rosbridge 断线后不重放指令，以及多个执行卡共享通道的仲裁。
+4. 验证软件暂停、过渡窗口拒绝、恢复后需重新发目标、rosbridge 断线后不重放指令，以及多个执行卡共享通道的仲裁；在恢复/切换模式等待时触发停止，确认停止不因 busy 被丢弃，旧请求不能重新放开运动。
 5. 检查关节 ACP 在实测到位后才成功；卡住、数据中断或误差超限不能成功。测量位姿 reach-time 估计的偏差，评估进一步闭环。
 
 离线测试不能替代容器构建、DDS 互通和真机运动验证。

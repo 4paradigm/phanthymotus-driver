@@ -149,6 +149,46 @@ class RosbridgeClientTests(unittest.TestCase):
         self.assertFalse(self.client.connection[0])
         self.assertTrue(self.sock.closed)
 
+    def test_service_wait_can_be_superseded_without_replaying_command(self):
+        pending = self.client.start_service('/enable_control', 'std_srvs/SetBool', {'data': True})
+        cancelled, errors = threading.Event(), []
+        def wait():
+            try:
+                self.client.wait_service(pending, 2, cancelled)
+            except Exception as exc:
+                errors.append(exc)
+        worker = threading.Thread(target=wait)
+        worker.start()
+        cancelled.set()
+        worker.join(.5)
+        self.assertFalse(worker.is_alive())
+        self.assertIsInstance(errors[0], InterruptedError)
+        self.assertEqual(len(self.sock.sent), 1)
+        self.assertFalse(self.client._services)
+        self.packet({'op': 'service_response', 'id': pending[0], 'result': True,
+                     'values': {'success': True}})
+        self.assertFalse(self.client._services)
+
+    def test_pause_service_can_send_and_complete_while_older_service_is_pending(self):
+        old = self.client.start_service('/enable_control', 'std_srvs/SetBool', {'data': True})
+        pause = self.client.start_service('/enable_control', 'std_srvs/SetBool', {'data': False})
+        self.assertEqual([p['args']['data'] for p in self.sock.sent], [True, False])
+        self.packet({'op': 'service_response', 'id': pause[0], 'result': True, 'values': {'success': True}})
+        self.assertEqual(self.client.wait_service(pause, .1), {'success': True})
+        self.assertIn(old[0], self.client._services)
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaises(InterruptedError):
+            self.client.wait_service(old, .1, cancelled)
+        self.assertFalse(self.client._services)
+
+    def test_repeated_subscribe_uses_same_id_for_readonly_latch_refresh(self):
+        self.client.subscribe('/enable_control_state', 'std_msgs/Bool', lambda msg: None)
+        self.client.subscribe('/enable_control_state', 'std_msgs/Bool', lambda msg: None)
+        self.assertEqual([p['op'] for p in self.sock.sent], ['subscribe', 'subscribe'])
+        self.assertEqual(self.sock.sent[0]['id'], self.sock.sent[1]['id'])
+        self.assertEqual(len(self.client._subscriptions), 1)
+
     def test_remote_protocol_logs_escape_and_bound_selected_fields(self):
         payload = '\x00\x1b[31m\n' + 'x' * 100_000
         with patch('builtins.print') as log:
