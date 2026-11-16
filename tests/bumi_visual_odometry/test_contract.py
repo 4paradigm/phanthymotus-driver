@@ -21,6 +21,21 @@ def calibration():
                 camera_to_body=dict(translation=[0.4, 0, 0.2], quaternion=[0, 0, 0, 1]))
 
 
+def test_shipped_mount_does_not_claim_a_measured_body_origin():
+    from pathlib import Path
+    import yaml
+    from noetix.bumi.visual_odometry import VisualOdometryNode
+    config = yaml.safe_load((Path(__file__).resolve().parents[2] /
+                             'noetix/bumi/config.yaml').read_text())
+    node = object.__new__(VisualOdometryNode)
+    node.calibration = CameraCalibration(config['plugins']['visual_odometry']['calibration'])
+    node.namespace, node.segment, node.frame_id = 'robot', 'segment', 'robot_rgb_optical'
+    assert node.pose_reference() == 'body_axes'
+    mount = node.slam_extrinsic()
+    assert mount['calibrated'] is False
+    assert mount['source'] == 'bumi_axis_assumption'
+
+
 def test_finite_rejects_nan_and_wrong_size():
     assert finite([1, 2, 3], 3) == [1., 2., 3.]
     for bad in ([1, 2], [1, 2, float('nan')], 'abc'):

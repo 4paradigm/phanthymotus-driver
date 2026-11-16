@@ -53,8 +53,8 @@ plugins:
   # 只读 RGB-D 视觉里程计（RTAB-Map rgbd_odometry，在 bundle 进程内运行）。
   # 内置 IMU 只辅助旋转初值；无惯性位移积分/EKF，不参与运动控制；
   # 停止本卡片只回收它自己的估计子进程和私有话题，不影响相机/媒体/动作卡。
-  # 默认使用已由 Bumi 操作人员验证的相机光学坐标系到机体轴变换；
-  # vendor.pose_reference=body，供上游里程计向通用 SLAM 提供已确认外参。
+  # 默认只约定相机光学坐标系到机体轴的方向；零平移不代表已测量机身原点。
+  # vendor.pose_reference=body_axes，数值外参仍可供通用 SLAM 使用。
   visual_odometry:
     # 默认开启只读视觉里程计；原始 RGB-D 分支限频见下方。
     enabled: true
@@ -69,13 +69,12 @@ plugins:
     # the extra DDS/CPU load instead of duplicating every 30 Hz camera frame.
     # Invalid values fall back to 10 Hz; the camera-side upper bound is 30 Hz.
     max_rate_hz: 10
-    # Operator-verified Bumi level-forward optical-to-body mount:
-    # robot x forward, y left, z up, with the body reference at the camera origin.
-    # Recalibrate before reusing this preset if the camera installation changes.
+    # Level-forward optical-to-body axis convention, referenced at the camera
+    # origin. Supply a measured installation transform before declaring a body origin.
     calibration:
-      calibration_id: verified-bumi-level-forward-optical-to-body-v1
+      calibration_id: assumed-level-forward-optical-to-body
       fixed_mount: true
-      assumed: false
+      assumed: true
       camera_to_body:
         translation: [0.0, 0.0, 0.0]
         quaternion: [-0.5, 0.5, -0.5, 0.5]

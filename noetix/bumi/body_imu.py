@@ -15,8 +15,6 @@ class BodyImuSource:
         self.setup_reason = None
         try:
             calibration = CameraCalibration(mount)
-            if calibration.assumed:
-                raise ValueError('verified fixed camera/body rotation required')
             self.calibration_id = calibration.id
             body_from_camera = quat_matrix(calibration.data['camera_to_body']['quaternion'])
             self.rotation = [list(row) for row in zip(*body_from_camera)]

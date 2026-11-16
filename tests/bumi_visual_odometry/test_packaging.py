@@ -40,12 +40,11 @@ def test_card_and_plugin_config_are_in_sync():
     plugin = config['plugins']['visual_odometry']
     assert plugin['enabled'] is True
     assert plugin['max_rate_hz'] == 10
-    # Verified Bumi installation: the optical axes map to the robot body axes
-    # without a second manual SLAM-card configuration step.
+    # The default aligns axes without claiming a measured body origin.
     cal = plugin['calibration']
-    assert cal['calibration_id'] == 'verified-bumi-level-forward-optical-to-body-v1'
+    assert cal['calibration_id'] == 'assumed-level-forward-optical-to-body'
     assert cal['fixed_mount'] is True
-    assert cal['assumed'] is False
+    assert cal['assumed'] is True
     assert cal['camera_to_body']['quaternion'] == [-0.5, 0.5, -0.5, 0.5]
     assert cal['camera_to_body']['translation'] == [0.0, 0.0, 0.0]
     # The tool name lives in code; keep the driver card pointing at it.

@@ -510,9 +510,10 @@ the status topic. The full sample includes `vendor.turn_angle_deg` (body yaw
 relative to the first IMU sample of the current segment, wrapped to -180..180
 degrees) and `vendor.displacement_m` (distance from the first tracking pose in
 the segment). No loco card is wired to either output. The shipped config applies
-the operator-verified level-forward optical-to-body mount so `position` uses
-robot body axes (x forward, y left, z up; `pose_reference: body`). The preset
-keeps the reference origin at the camera and must be reverified if moved. The card defaults to `initializing` and publishes no pose
+the level-forward optical-to-body axis convention so `position` uses
+robot body axes (x forward, y left, z up; `pose_reference: body_axes`). The preset
+keeps the reference origin at the camera and declares `calibrated: false`;
+zero translation is not a measured body origin. The card defaults to `initializing` and publishes no pose
 until the estimator is tracking; a fault ends that segment and recovery starts a
 fresh one automatically. Stopping the card reaps its estimator and private
 topics and disables the shared raw RGB-D branch through

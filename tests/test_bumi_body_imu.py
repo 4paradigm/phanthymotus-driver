@@ -59,12 +59,22 @@ def test_invalid_body_reading_does_not_become_a_fresh_measurement(change):
     assert imu.status(1_010_000_000)['state'] == 'unavailable'
 
 
-@pytest.mark.parametrize('mount', [None, dict(MOUNT, fixed_mount=False), dict(MOUNT, assumed=True)])
-def test_missing_or_unverified_mount_never_publishes_identity(mount):
+@pytest.mark.parametrize('mount', [None, dict(MOUNT, fixed_mount=False)])
+def test_missing_or_nonfixed_mount_never_publishes_identity(mount):
     imu = source(mount)
     with pytest.raises(ValueError):
         imu.accept(reading(), 1_010_000_000)
     assert imu.status(1_010_000_000)['state'] == 'unavailable'
+
+
+def test_assumed_mount_keeps_numeric_body_rotation_without_measured_translation():
+    imu = source(dict(MOUNT, assumed=True))
+    packet = imu.accept(reading(), 1_010_000_000)
+    assert packet['camera_from_gyro'] == packet['camera_from_accel'] == [
+        [0., -1., 0.], [0., 0., -1.], [1., 0., 0.]]
+    assert packet['rotation_source'] == 'configured_fixed_mount'
+    assert 'camera_from_accel_translation' not in packet
+    assert imu.status(1_010_000_000)['state'] == 'ready'
 
 
 def test_cached_sdk_values_do_not_refresh_freshness_and_restart_has_new_epoch():
