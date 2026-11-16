@@ -1,9 +1,9 @@
 """L20-10 joint feedback: calibrated angles and the dual-hand skeleton model.
 
 Raw 0..255 positions are measured. Angles come from the vendor's per-joint
-calibration tables for the G20 model (resource/g20_*_G20.json), which also
-assign every URDF joint to a motor. That G20 is the L20-10 has not been
-confirmed by the vendor; every output carries ANGLE_SOURCE so consumers can tell.
+calibration tables for the L20-10 (files named g20, resource/g20_*_G20.json),
+which also assign every URDF joint to a motor. The vendor confirmed these files
+for the L20-10; every output carries ANGLE_SOURCE so consumers can tell.
 """
 
 from __future__ import annotations
