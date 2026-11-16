@@ -906,6 +906,64 @@ def test_driver_does_not_start_acquisition_on_boot():
     assert plugin._streams == {} and clients == {}
 
 
+def test_shared_controller_is_only_trusted_when_the_hand_answers(monkeypatch):
+    """A registry entry alone is not evidence the hand is still plugged in."""
+    registry = {}
+    monkeypatch.setattr(hand_device, "GLOBAL_CONTROLLERS", registry)
+    monkeypatch.setattr(joints_device, "GLOBAL_CONTROLLERS", registry)
+
+    class Controller:
+        def __init__(self, alive):
+            self.alive = alive
+            self.asked = 0
+
+        def get(self):
+            def probe(timeout):
+                self.asked += 1
+                return self.alive
+            return SimpleNamespace(probe_positions=probe)
+
+    plugin, _, _ = make_plugin(channels=("can1",), hands={("right", "can1")})
+    plugin._probe = lambda side, channel: pytest.fail(
+        "an existing controller must be queried, not probed with a second client")
+
+    dead = Controller(False)
+    registry[("right", "can1")] = dead
+    assert plugin._match("a", "right") is None
+    assert dead.asked == 1 and "a" not in plugin._claims
+
+    alive = Controller(True)
+    registry[("right", "can1")] = alive
+    assert plugin._match("b", "right") == ("right", "can1")
+    assert alive.asked == 1 and plugin._claims["b"] == ("right", "can1")
+
+
+def test_start_reads_bound_side_from_nested_instance_config():
+    """Some platform paths send the gear settings as arguments.config."""
+    plugin, _, _ = make_plugin(hands={("left", "can0")})
+    try:
+        info = plugin.dispatch("start", {"instance_id": "a", "config": {"bound_side": "left"}})
+        assert info["state"] == "running" and info["bound_side"] == "left"
+        assert plugin._claims["a"] == ("left", "can0")
+    finally:
+        plugin.stop()
+
+
+def test_colliding_topic_slugs_are_rejected(ros_runtime):
+    ros2, _, _ = ros_runtime
+    plugin, _, _ = make_plugin(ros2=ros2, hands={("left", "can0")})
+    try:
+        plugin.dispatch("start", {"instance_id": "left-card-a", "bound_side": "left"})
+        with pytest.raises(ValueError, match="后缀冲突"):
+            plugin.dispatch("start", {"instance_id": "left_card_a", "bound_side": "left"})
+        assert len(plugin._streams) == 1
+        # The same suffix on the other side is fine: the topics differ by side.
+        plugin.dispatch("start", {"instance_id": "left_card_a", "bound_side": "right"})
+        assert len(plugin._streams) == 2
+    finally:
+        plugin.stop()
+
+
 # ── integration with the other cards ───────────────────────────────────
 
 def test_schema_exposes_only_the_side_and_no_rate_or_channel():

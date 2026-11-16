@@ -140,7 +140,7 @@ Core 可先发送共享 `poll_hz`，再发送实例 `bound_side/can_channel`。�
 
 一张卡片对应一只手：在齿轮里选择左手或右手（`bound_side`），驱动在该侧**自动匹配**一个空闲的 CAN 接口和手，不需要手工选 CAN 口。驱动启动时不自动采集，只有卡片 `start` 后才开始。
 
-**匹配规则**：枚举本机 socketcan 接口，跳过没有载波的接口（本板 `can0` 是未接线的 mttcan），用一次只读位置查询确认该接口上该侧的手是否应答。一张手同一时刻只归一张 `joints` 卡（不共享），同侧多张卡按接口名顺序分配。找不到空闲手时卡片不会启动失败，而是进入 `waiting` 状态：
+**匹配规则**：枚举本机 socketcan 接口，跳过没有载波的接口（本板 `can0` 是未接线的 mttcan），用一次只读位置查询确认该接口上该侧的手是否应答；对已有 hand/tactile 控制器的 `(side, channel)`，改用该控制器自己的客户端探测一次，确认手仍在应答后才认领（注册表里有条目不等于手还在，可能已经拔掉）。一张手同一时刻只归一张 `joints` 卡（不共享），同侧多张卡按接口名顺序分配。找不到空闲手时卡片不会启动失败，而是进入 `waiting` 状态：
 
 - JSON 按 1 Hz 发布 `state=waiting`、`valid=false`，`reason` 说明"没有空闲的左手：can1 已被其他卡片占用"或"未在 can1 上找到左手"；
 - 不发布骨架帧，骨架画布保持静态；
@@ -151,7 +151,7 @@ Core 可先发送共享 `poll_hz`，再发送实例 `bound_side/can_channel`。�
 
 **频率**：固定 30 Hz（每轮一次新的五帧位置查询，上一轮结束才开始下一轮），不提供频率设置；`measured_hz` 报告最近成功轮次的实测值。与同一只手的触觉矩阵同时工作时手的应答会变慢，实测可能低于 30 Hz（2026-11-13 实测：单独 29.9 Hz，触觉同跑 21.8 Hz）。
 
-**话题**：每张卡一个独立话题，后缀来自卡片实例 ID（去掉非字母数字、取前 16 位，缺省 `card`）；删卡重建后后缀会变。`topic_out` 以 `info` 为准，JSON 排在骨架之前。
+**话题**：每张卡一个独立话题，后缀来自卡片实例 ID（去掉非字母数字、取前 16 位，缺省 `card`）；删卡重建后后缀会变。`topic_out` 以 `info` 为准，JSON 排在骨架之前。不同实例 ID 归一化后若同侧得到相同后缀（如 `left-card-a` 与 `left_card_a`），第二张卡启动会报错要求删除重建，避免两路数据混到同一 topic。
 
 | 输出 | 话题 | 格式 | 发布条件 |
 | --- | --- | --- | --- |
@@ -168,7 +168,7 @@ JSON 主要字段：`valid`、`state`、`reason`、`error_details`、`side`、`c
 
 **骨架模型**：Core 取模型时会带上骨架面板的 topic（Core PR #399 的 `model` 工具 `topic` 参数）。骨架关节名统一带 `{side}_hand_` 前缀（例如 `right_hand_ring_mcp_pitch`，link 名仍是 `{side}_...`），因为 Core 渲染器按关节名里是否含 `hand` 决定手部样式：含 `hand` 的关节骨骼细（0.004）、关节球小（0.006），否则会按机器人级骨骼（0.008）和更大的球（0.012）绘制；不加前缀时无名指、小拇指会明显偏粗。驱动按话题里的 `/hand/left|right/` 返回**单手 URDF**：只有该手、居中、4 倍放大、掌心朝向 Core 的默认相机；没带 topic 时退回原来的双手 URDF，旧 Core 不会出现"左卡画右手"的错图。模型来源、许可和指尖/被动关节规则不变：骨架中的 16 个主动关节限制在 URDF 限位内（`clamped_to_model=true` 时 JSON 的 `angle_rad` 仍保留查表值）；5 个远端关节按标定表由父关节 raw 推算（`source=derived_calibration`）；每根手指末端另加固定指尖点 `{side}_{finger}_tip`，Core 只把骨骼画到关节点。模型来源与许可见 `resource/SOURCE.md` 和 `resource/LICENSE`。
 
-**旧卡片兼容**：之前保存的 `bound_side=both`、`can_channel`、`left_can_channel`、`right_can_channel`、`poll_hz` 一律忽略；卡片进 `unset` 状态（`topic_out=[]`），在齿轮里重新选左手或右手即可，不需要删卡重建。
+`start` 同时接受 `arguments.config` 里保存的实例设置（部分平台路径这样传，顶层参数优先）。**旧卡片兼容**：之前保存的 `bound_side=both`、`can_channel`、`left_can_channel`、`right_can_channel`、`poll_hz` 一律忽略；卡片进 `unset` 状态（`topic_out=[]`），在齿轮里重新选左手或右手即可，不需要删卡重建。
 
 | `plugins.joints` 配置 | 默认值 | 含义 |
 | --- | --- | --- |

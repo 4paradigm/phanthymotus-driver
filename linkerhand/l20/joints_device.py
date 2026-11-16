@@ -614,12 +614,22 @@ class JointsPlugin:
         except OSError:
             return True
 
-    def _target_in_use(self, target: tuple[str, str]) -> bool:
-        """True when a controller or worker already talks to this hand."""
-        if target in GLOBAL_CONTROLLERS:
-            return True
-        return any(stream.channel is not None and (stream.side, stream.channel) == target
-                   for stream in self._streams.values())
+    def _controller_responds(self, side: str, channel: str) -> bool:
+        """Ask an existing shared controller whether its hand still answers.
+
+        The registry entry alone is not evidence: an actuator may have opened a
+        controller for a hand that was unplugged afterwards. Query through that
+        controller's own client (its position-query lock is shared with the
+        actuator), so a second client never reads the same replies.
+        """
+        ctrl = GLOBAL_CONTROLLERS.get((side, channel))
+        if ctrl is None:
+            return False
+        try:
+            return bool(ctrl.get().probe_positions(PROBE_TIMEOUT_S))
+        except Exception as exc:
+            logger.debug("Shared controller %s/%s did not answer: %s", side, channel, exc)
+            return False
 
     def _probe(self, side: str, channel: str) -> bool:
         """One short position query: does a hand of this side answer here?
@@ -662,9 +672,14 @@ class JointsPlugin:
                 target = (side, channel)
                 if target in taken or not self._channel_usable(channel):
                     continue
-                if self._target_in_use(target) or self._probe(side, channel):
-                    self._claims[instance_id] = target
-                    return target
+                ctrl = GLOBAL_CONTROLLERS.get(target)
+                if ctrl is not None:
+                    if not self._controller_responds(side, channel):
+                        continue
+                elif not self._probe(side, channel):
+                    continue
+                self._claims[instance_id] = target
+                return target
             return None
 
     def _match_reason(self, side: str) -> str:
@@ -677,6 +692,37 @@ class JointsPlugin:
         return f"未在 {where} 上找到{label}"
 
     # ── instance ownership ────────────────────────────────────────────
+
+    @staticmethod
+    def _flatten_instance_config(args: dict) -> dict:
+        """Accept the card's saved instance config both top-level and nested.
+
+        Some platform paths send the saved gear settings as
+        `arguments.config = {bound_side: ...}`; the canvas start path sends
+        them as a separate `config` call. Top-level values win.
+        """
+        nested = args.get("config")
+        if not isinstance(nested, dict):
+            return args
+        merged = dict(nested)
+        merged.update(args)
+        return merged
+
+    def _reject_topic_collision(self, instance_id: str, side: str) -> None:
+        """Two instances that normalize to the same suffix and side would clash.
+
+        Distinct card IDs such as `left-card-a` and `left_card_a` both become
+        `leftcarda`, so their JSON and skeleton topics would be identical while
+        each card owns its own hand. Refuse the second card instead of letting
+        two producers interleave frames on one topic.
+        """
+        slug = _slug(instance_id)
+        for other, stream in self._streams.items():
+            if other != instance_id and stream.side == side and _slug(other) == slug:
+                raise ValueError(
+                    f"topic 后缀冲突：卡片 {other} 与 {instance_id} 都归一化为 “{slug}”；"
+                    f"请删除其中一张卡片后重新添加"
+                )
 
     def _sideless(self, args: dict, instance_id: str) -> str | None:
         """Side chosen by the request or remembered for this instance."""
@@ -700,6 +746,7 @@ class JointsPlugin:
                 # A side change, or a worker that already ended without being
                 # released: stop it and start clean instead of overwriting it.
                 self._stop_stream(instance_id)
+            self._reject_topic_collision(instance_id, side)
             target = self._match(instance_id, side)
             stream = _JointsStream(self, instance_id, side, None if target is None else target[1])
             self._streams[instance_id] = stream
@@ -832,6 +879,7 @@ class JointsPlugin:
         if args.get("_tool_name") == self.MODEL_TOOL:
             return model(args.get("topic"))
 
+        args = self._flatten_instance_config(args)
         instance_id = str(args.get("instance_id", ""))
         side = self._sideless(args, instance_id)
 
