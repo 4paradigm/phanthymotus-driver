@@ -7,6 +7,8 @@ import sys
 import threading
 import unittest
 from pathlib import Path
+from subprocess import CompletedProcess
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1]))
@@ -56,6 +58,8 @@ class VisitorBadgeTest(unittest.TestCase):
         self.assertTrue(props["bridge_url"]["x-sensitive"])
         self.assertEqual(props["timeout_s"]["default"], 8)
         self.assertEqual(props["print_timeout_s"]["default"], 60)
+        self.assertFalse(props["remote_start_enabled"]["default"])
+        self.assertEqual(props["remote_start_port"]["default"], 22)
         self.assertEqual(definition["configSchema"]["required"], ["bridge_url", "token"])
 
     def test_print_timeout_defaults_to_60_seconds_and_is_clamped(self):
@@ -152,6 +156,25 @@ class VisitorBadgeTest(unittest.TestCase):
         self.server = None
         result = self.call("find", name="王磊")
         self.assertEqual(result["code"], "unreachable")
+
+    def test_remote_start_runs_ssh_before_query_when_bridge_is_down(self):
+        self.card._cfg.update({
+            "remote_start_enabled": True,
+            "remote_start_user": "4paradigm",
+            "remote_start_port": 22,
+            "remote_start_key_path": "/run/test-key",
+        })
+        with patch.object(self.card, "_bridge_is_healthy", side_effect=[False, True]), patch(
+            "visitor_badge.os.path.isfile", return_value=True
+        ), patch(
+            "visitor_badge.subprocess.run",
+            return_value=CompletedProcess([], 0, stdout="STARTED", stderr=""),
+        ) as run, patch("visitor_badge.time.sleep"):
+            result = self.call("find", name="王磊")
+        self.assertEqual(result["status"], "found")
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "ssh")
+        self.assertIn("4paradigm@127.0.0.1", command)
 
     def test_unknown_action(self):
         self.assertEqual(self.call("explode")["code"], "bad_action")

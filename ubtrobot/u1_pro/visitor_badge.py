@@ -11,8 +11,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -50,6 +53,7 @@ class BridgeClient:
         query: dict | None = None,
         body: dict | None = None,
         timeout_s: float | None = None,
+        retry_refused: bool = True,
     ) -> dict:
         url = self.base_url + path
         if query:
@@ -60,26 +64,36 @@ class BridgeClient:
             headers["Content-Type"] = "application/json"
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(
-                req, timeout=self.timeout_s if timeout_s is None else timeout_s
-            ) as resp:
-                raw = resp.read()
-        except urllib.error.HTTPError as exc:
-            payload = _safe_json(exc.read())
-            if exc.code in (401, 403):
-                raise BridgeError("桥接服务拒绝了请求：令牌不对，请检查卡片配置里的访问令牌", "unauthorized")
-            if exc.code == 404 and not payload:
-                raise BridgeError("桥接服务没有这个接口，请确认前台电脑上运行的是访客贴桥接服务", "not_found")
-            message = str(payload.get("error") or f"桥接服务返回 HTTP {exc.code}")
-            raise BridgeError(message, str(payload.get("code") or f"http_{exc.code}"))
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            reason = getattr(exc, "reason", exc)
-            raise BridgeError(
-                f"连不上前台电脑的桥接服务（{self.base_url}）：{reason}。请确认前台电脑开着、桥接服务在运行、网络通",
-                "unreachable",
-            )
+        raw = b""
+        for attempt in range(2):
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(
+                    req, timeout=self.timeout_s if timeout_s is None else timeout_s
+                ) as resp:
+                    raw = resp.read()
+                break
+            except urllib.error.HTTPError as exc:
+                payload = _safe_json(exc.read())
+                if exc.code in (401, 403):
+                    raise BridgeError("桥接服务拒绝了请求：令牌不对，请检查卡片配置里的访问令牌", "unauthorized")
+                if exc.code == 404 and not payload:
+                    raise BridgeError("桥接服务没有这个接口，请确认前台电脑上运行的是访客贴桥接服务", "not_found")
+                message = str(payload.get("error") or f"桥接服务返回 HTTP {exc.code}")
+                raise BridgeError(message, str(payload.get("code") or f"http_{exc.code}"))
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                reason = getattr(exc, "reason", exc)
+                refused = getattr(reason, "errno", None) in (111, 10061) or "refused" in str(reason).lower()
+                if attempt == 0 and refused and retry_refused:
+                    # The Windows watchdog may be starting the bridge. A
+                    # refused connection is known not to have reached the
+                    # server, so this single retry cannot duplicate a print.
+                    time.sleep(8)
+                    continue
+                raise BridgeError(
+                    f"连不上前台电脑的桥接服务（{self.base_url}）：{reason}。请确认前台电脑开着、桥接服务在运行、网络通",
+                    "unreachable",
+                )
         payload = _safe_json(raw)
         if not isinstance(payload, dict):
             raise BridgeError("桥接服务返回的不是 JSON 对象", "bad_response")
@@ -116,6 +130,15 @@ class QLPrinterPlugin:
             "token": str(plugin_config.get("token", "") or ""),
             "timeout_s": float(plugin_config.get("timeout_s", 8)),
             "print_timeout_s": float(plugin_config.get("print_timeout_s", 60)),
+            "remote_start_enabled": bool(plugin_config.get("remote_start_enabled", False)),
+            "remote_start_user": str(plugin_config.get("remote_start_user", "4paradigm") or "4paradigm"),
+            "remote_start_port": int(plugin_config.get("remote_start_port", 22)),
+            "remote_start_key_path": str(
+                plugin_config.get(
+                    "remote_start_key_path",
+                    "/run/ubtrobot-u1-pro-auth/frontdesk_bridge_ed25519",
+                )
+            ),
         }
         self._direct_request_ids: dict[tuple[str, str, str, str], str] = {}
 
@@ -125,7 +148,7 @@ class QLPrinterPlugin:
             "start": ([], "启动卡片"),
             "stop": ([], "停止卡片"),
             "info": ([], "查看卡片配置是否完整"),
-            "config": (["bridge_url", "token", "timeout_s", "print_timeout_s"], "保存桥接服务配置（平台在 start 前自动调用）"),
+            "config": (["bridge_url", "token", "timeout_s", "print_timeout_s", "remote_start_enabled", "remote_start_user", "remote_start_port", "remote_start_key_path"], "保存桥接服务配置（平台在 start 前自动调用）"),
             "find": (["name", "host"], "按访客姓名查询今天的预约；同名时可用被访人 host 缩小范围，返回短期 ticket"),
             "print": (["name", "host"], "按访客姓名和被访人查询唯一的未入场预约并打印；ticket 和防重复编号由卡片内部处理"),
         }
@@ -141,6 +164,10 @@ class QLPrinterPlugin:
             "token": {"type": "string"},
             "timeout_s": {"type": "number"},
             "print_timeout_s": {"type": "number"},
+            "remote_start_enabled": {"type": "boolean"},
+            "remote_start_user": {"type": "string"},
+            "remote_start_port": {"type": "integer"},
+            "remote_start_key_path": {"type": "string"},
         }
         definition = tool(
             TOOL_NAME,
@@ -168,6 +195,23 @@ class QLPrinterPlugin:
                     "type": "number", "title": "打印超时（秒）", "scope": "shared",
                     "minimum": 10, "maximum": 120, "default": 60, "advanced": True,
                     "description": "等待前台网页完成定位、打印并确认状态的最长时间",
+                },
+                "remote_start_enabled": {
+                    "type": "boolean", "title": "机器人远程启动桥接", "scope": "shared",
+                    "default": False, "advanced": True,
+                    "description": "桥接未运行时，通过受限 SSH 密钥触发前台 Windows 启动任务",
+                },
+                "remote_start_user": {
+                    "type": "string", "title": "前台 SSH 用户", "scope": "shared",
+                    "default": "4paradigm", "advanced": True,
+                },
+                "remote_start_port": {
+                    "type": "integer", "title": "前台 SSH 端口", "scope": "shared",
+                    "minimum": 1, "maximum": 65535, "default": 22, "advanced": True,
+                },
+                "remote_start_key_path": {
+                    "type": "string", "title": "机器人 SSH 私钥路径", "scope": "shared",
+                    "default": "/run/ubtrobot-u1-pro-auth/frontdesk_bridge_ed25519", "advanced": True,
                 },
             },
             "required": ["bridge_url", "token"],
@@ -223,6 +267,17 @@ class QLPrinterPlugin:
             update["bridge_url"] = url
         if "token" in args:
             update["token"] = str(args["token"] or "")
+        if "remote_start_enabled" in args:
+            update["remote_start_enabled"] = bool(args["remote_start_enabled"])
+        if "remote_start_user" in args:
+            update["remote_start_user"] = str(args["remote_start_user"] or "").strip()
+        if "remote_start_key_path" in args:
+            update["remote_start_key_path"] = str(args["remote_start_key_path"] or "").strip()
+        if "remote_start_port" in args and args["remote_start_port"] not in (None, ""):
+            try:
+                update["remote_start_port"] = min(65535, max(1, int(args["remote_start_port"])))
+            except (TypeError, ValueError):
+                return {"status": "error", "adapter_ok": False, "error": "remote_start_port 要填整数"}
         for key, low, high in (("timeout_s", 2, 30), ("print_timeout_s", 10, 120)):
             if key in args and args[key] not in (None, ""):
                 try:
@@ -235,6 +290,56 @@ class QLPrinterPlugin:
         return {"status": "ok", "adapter_ok": configured, "configured": configured}
 
     # ── 动作 ──────────────────────────────────────────────────────────────
+    def _bridge_is_healthy(self) -> bool:
+        try:
+            payload = BridgeClient(self._cfg["bridge_url"], self._cfg["token"], 2).request(
+                "GET", "/health", timeout_s=2, retry_refused=False
+            )
+            return payload.get("state") == "running"
+        except BridgeError:
+            return False
+
+    def _ensure_remote_bridge(self) -> dict | None:
+        with self._lock:
+            cfg = dict(self._cfg)
+        if self._bridge_is_healthy() or not cfg["remote_start_enabled"]:
+            return None
+
+        parsed = urllib.parse.urlparse(cfg["bridge_url"])
+        host = parsed.hostname or ""
+        user = cfg["remote_start_user"]
+        key_path = cfg["remote_start_key_path"]
+        if not host or not user or not key_path or not os.path.isfile(key_path):
+            return {
+                "status": "error", "code": "remote_start_not_configured",
+                "error": "桥接未运行，且机器人远程启动配置或 SSH 私钥不完整",
+            }
+
+        known_hosts = "/opt/phanthy-motus/data/frontdesk_bridge_known_hosts"
+        command = [
+            "ssh", "-F", "/dev/null", "-i", key_path,
+            "-p", str(cfg["remote_start_port"]),
+            "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", f"UserKnownHostsFile={known_hosts}",
+            f"{user}@{host}", "start-bridge",
+        ]
+        try:
+            completed = subprocess.run(
+                command, capture_output=True, text=True, timeout=10, check=False
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"status": "error", "code": "remote_start_failed", "error": f"机器人无法远程启动前台桥接：{exc}"}
+        if completed.returncode != 0:
+            detail = " ".join((completed.stderr or completed.stdout or "SSH 启动失败").split())[:240]
+            return {"status": "error", "code": "remote_start_failed", "error": f"机器人远程启动前台桥接失败：{detail}"}
+
+        for _ in range(15):
+            time.sleep(1)
+            if self._bridge_is_healthy():
+                return None
+        return {"status": "error", "code": "remote_start_timeout", "error": "已通知前台电脑启动桥接，但 15 秒内未恢复"}
+
     def _find(self, args: dict) -> dict:
         name = str(args.get("name", "")).strip()
         host = str(args.get("host", "")).strip()
@@ -242,6 +347,9 @@ class QLPrinterPlugin:
             return {"status": "error", "code": "bad_args", "error": "find 需要访客姓名 name"}
         if len(name) > 32 or len(host) > 64:
             return {"status": "error", "code": "bad_args", "error": "姓名或被访人信息太长"}
+        recovery = self._ensure_remote_bridge()
+        if recovery is not None:
+            return recovery
         body = {"name": name}
         if host:
             body["host"] = host

@@ -32,6 +32,8 @@
 
 画布上卡片的配置项：`bridge_url`（必填，例如 `http://192.168.1.20:8765`，前台电脑要设固定 IP）、`token`（必填，和桥接服务一致）、`timeout_s`（查询超时，默认 8 秒）和 `print_timeout_s`（打印超时，默认 60 秒）。真实打印需要网页定位访客、调起打印并复查状态，因此打印使用单独的较长超时。`config.yaml` 的 `QL_printer.enabled: false` 可以关掉这张卡。
 
+无人值守前台可启用 `remote_start_enabled`。执行 `find` 或 `print` 前，卡片先检查桥接健康状态；桥接未运行时，使用挂载在机器人密钥目录中的专用 SSH 私钥连接前台 Windows，触发受限的桥接监护计划任务，健康检查恢复后再继续查询和打印。该 SSH 公钥在 Windows 端必须用 forced-command 限制为只能启动桥接，不能获得任意终端。相关高级配置包括 `remote_start_user`、`remote_start_port` 和 `remote_start_key_path`；容器镜像包含 `openssh-client`，默认私钥路径为 `/run/ubtrobot-u1-pro-auth/frontdesk_bridge_ed25519`。
+
 ### 桥接服务接口约定
 
 前台电脑上的桥接服务只向机器人开放下面两个接口。请求都带 `Authorization: Bearer <token>`，返回 JSON；出错时可返回非 2xx 状态码，响应体为 `{"error": "中文说明", "code": "..."}`。
