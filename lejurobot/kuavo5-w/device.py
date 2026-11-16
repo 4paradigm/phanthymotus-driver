@@ -767,8 +767,9 @@ class KuavoBundle:
             ros1.advertise(topic, message_type)
         self.sensors = KuavoSensors(config.get('sensors', {}), namespace, ros1, ros2_node)
         self.sensors.robot_serial = config.get('robot_serial')
-        self.peripherals = Peripherals(ros1, ros2_node, namespace, media_factory=media_factory)
         self.startup_checks = StartupChecks(config.get('host_runtime', {}).get('enabled', True))
+        self.peripherals = Peripherals(ros1, ros2_node, namespace, media_factory=media_factory,
+            camera_ensure=self.startup_checks.ensure_camera if self.startup_checks.enabled else None)
         self._auto_start = config.get('sensors', {}).get('auto_start',
             ['joints', 'imu', 'loco_state', *PERIPHERAL_CARDS])
         self.state = RobotState(ros1, ros2_node, namespace, self.sensors, motion_enabled)

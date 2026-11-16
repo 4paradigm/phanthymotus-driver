@@ -7,15 +7,28 @@ import math
 import struct
 import threading
 import time
+import zlib
 
 from std_msgs.msg import String, UInt8MultiArray
 from sensor_msgs.msg import CompressedImage
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
-CARDS = ('battery', 'laser_scan', 'camera_left', 'camera_right', 'camera_head')
+CARDS = ('battery', 'laser_scan', 'camera_left', 'camera_right', 'camera_head', 'camera_depth')
 CAMERAS = {'camera_left': ('/camera_1/color/image_raw/compressed', '/camera_left/set_camera_enabled'),
            'camera_right': ('/camera_2/color/image_raw/compressed', '/camera_right/set_camera_enabled'),
-           'camera_head': ('/camera_head/color/image_raw/compressed', None)}
+           'camera_head': ('/camera_head/color/image_raw/compressed', None),
+           'camera_depth': ('/camera_head/depth/image_raw/compressed_zlib', None)}
+DEPTH_FORMAT = 'image/depth-zlib'
+DEPTH_BYTES = 640 * 480 * 2
+
+
+def validate_depth(payload):
+    # Bound decompression even for untrusted rosbridge packets; reject appended
+    # streams, trailing bytes and raw/PNG/RVL data with a misleading format tag.
+    decoder = zlib.decompressobj()
+    raw = decoder.decompress(payload, DEPTH_BYTES + 1)
+    if (len(raw) != DEPTH_BYTES or not decoder.eof or decoder.unconsumed_tail or decoder.unused_data):
+        raise ValueError('invalid 640x480 uint16 depth stream')
 
 
 def latest_qos():
@@ -74,10 +87,11 @@ def battery_sample(message, now_ms):
 
 
 class Peripherals:
-    def __init__(self, ros1, node, namespace, media_factory=None):
+    def __init__(self, ros1, node, namespace, media_factory=None, camera_ensure=None):
         self.ros1, self.node = ros1, node
         self._lock = threading.RLock()
         self._closed = False
+        self._camera_ensure = camera_ensure
         self._generation = None
         self._running, self._data, self._seen = set(), {}, {}
         self._images, self._last_image_publish = {}, {}
@@ -180,25 +194,39 @@ class Peripherals:
             try:
                 data = message['data']
                 if not isinstance(data, str) or len(data) > 1_500_000:
-                    raise ValueError('oversized/non-base64 JPEG')
-                jpeg = base64.b64decode(data, validate=True)
-                if not jpeg.startswith(b'\xff\xd8') or not jpeg.endswith(b'\xff\xd9'):
+                    raise ValueError('oversized/non-base64 image')
+                payload = base64.b64decode(data, validate=True)
+                if card == 'camera_depth':
+                    if message.get('format') != DEPTH_FORMAT:
+                        raise ValueError('unexpected depth format')
+                    validate_depth(payload)
+                elif not payload.startswith(b'\xff\xd8') or not payload.endswith(b'\xff\xd9'):
                     raise ValueError('not a complete JPEG')
-                self._images[card] = (jpeg, image_header(message))
-                self._data[card] = {'valid': True, 'bytes': len(jpeg), 'encoding': 'jpeg',
+                self._images[card] = (payload, image_header(message))
+                self._data[card] = {'valid': True, 'bytes': len(payload),
+                                    'encoding': '16UC1-zlib' if card == 'camera_depth' else 'jpeg',
                                     'source_topic': CAMERAS[card][0]}
+                if card == 'camera_depth':
+                    self._data[card].update(width=640, height=480, unit='mm', invalid_value=0, aligned_to_rgb=False)
                 self._seen[card] = time.monotonic()
                 self._image_stats[card]['received'] += 1
                 self._wake[card].set()
-            except (KeyError, ValueError, TypeError):
+            except (KeyError, ValueError, TypeError, zlib.error):
                 self._data.pop(card, None)
                 self._images.pop(card, None)
 
     def _enable_camera(self, card, generation):
         try:
-            result = self.ros1.call_service(CAMERAS[card][1], 'std_srvs/SetBool', {'data': True}, timeout=2)
-            if result.get('success') is not True:
-                raise RuntimeError('camera service did not accept enable')
+            with self._lock:
+                if self._closed or card not in self._running:
+                    return
+            service = CAMERAS[card][1]
+            if service:
+                result = self.ros1.call_service(service, 'std_srvs/SetBool', {'data': True}, timeout=2)
+                if result.get('success') is not True:
+                    raise RuntimeError('camera service did not accept enable')
+            elif self._camera_ensure:
+                self._camera_ensure(card)
             with self._lock:
                 if generation == self._media[card].connection[1]:
                     self._camera_error.pop(card, None)
@@ -232,10 +260,12 @@ class Peripherals:
             'laser_scan': '二维雷达点云图 + 原始测距（laser 坐标系，z=0；不是额外3D雷达）',
             'camera_left': '底盘左路 RGB JPEG，独立接收/发布线程，自动开启',
             'camera_right': '底盘右路 RGB JPEG，独立接收/发布线程，自动开启',
-            'camera_head': 'Orbbec Gemini 335L 头部 RGB JPEG，独立接收/发布线程'}
+            'camera_head': 'Orbbec Gemini 335L 头部 RGB JPEG，独立接收/发布线程',
+            'camera_depth': 'Orbbec 头部原生深度图，640×480 uint16 毫米，zlib无损压缩；0无效，未对齐RGB'}
         tools = []
         for card in CARDS:
-            outputs = [{'topic': self.topics[card], 'format': 'image/jpeg' if card in CAMERAS else 'data/json'}]
+            outputs = [{'topic': self.topics[card], 'format': DEPTH_FORMAT if card == 'camera_depth'
+                        else 'image/jpeg' if card in CAMERAS else 'data/json'}]
             if card == 'laser_scan':
                 outputs.insert(0, {'topic': self._points_topic, 'format': 'sensor/pointcloud',
                                    'desc': '原始 laser 平面点云，z=0m'})
@@ -250,6 +280,8 @@ class Peripherals:
                 self._running.add(card)
                 if card in CAMERAS:
                     self._subscribe_camera(card)
+                    self._retry_at[card] = 0
+                    self._ensure_camera_if_needed(card, self.snapshot(card))
             elif action == 'stop':
                 self._running.discard(card)
                 if card in CAMERAS:
@@ -277,13 +309,7 @@ class Peripherals:
                         self._data.pop(card, None)
                         self._seen.pop(card, None)
                         self._subscribe_camera(card)
-                    if (CAMERAS[card][1] and not value['valid'] and card not in self._enabling
-                            and time.monotonic() >= self._retry_at.get(card, 0)):
-                        self._enabling.add(card)
-                        # Rebind callback to the current WebSocket generation.
-                        generation = client.connection[1]
-                        self._subscribe_camera(card)
-                        threading.Thread(target=self._enable_camera, args=(card, generation), daemon=True).start()
+                    self._ensure_camera_if_needed(card, value)
                     if not self._workers:
                         self._publish_image(card)
                 else:
@@ -303,6 +329,14 @@ class Peripherals:
                                            + b''.join(struct.pack('<ffff', *p) for p in points))
                         self._points_pub.publish(cloud)
 
+    def _ensure_camera_if_needed(self, card, value):
+        can_enable = CAMERAS[card][1] or (self._camera_ensure and card in ('camera_head', 'camera_depth'))
+        if (can_enable and not value['valid'] and card not in self._enabling
+                and time.monotonic() >= self._retry_at.get(card, 0)):
+            self._enabling.add(card)
+            generation = self._media[card].connection[1]
+            threading.Thread(target=self._enable_camera, args=(card, generation), daemon=True).start()
+
     def _subscribe_camera(self, card):
         client = self._media[card]
         generation = client.connection[1]
@@ -321,7 +355,8 @@ class Peripherals:
         msg = self._image_type()
         # Generated ROS2 uint8 setters validate bytes element-by-element under
         # __debug__. A typed array takes their native fast path (no Python loop).
-        msg.format, msg.data = 'jpeg', array('B', jpeg)
+        msg.format = DEPTH_FORMAT if card == 'camera_depth' else 'jpeg'
+        msg.data = array('B', jpeg)
         msg.header.frame_id = header['frame_id']
         msg.header.stamp.sec, msg.header.stamp.nanosec = header['sec'], header['nanosec']
         self._image_pubs[card].publish(msg)  # No shared lock held during DDS serialization.

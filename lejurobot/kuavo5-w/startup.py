@@ -30,6 +30,17 @@ class StartupChecks:
                 self.status = {'state': 'unavailable', 'error': 'Install host/install.py once on the ROS1 host; no controller auto-start'}
             self._closed.wait(5)
 
+    def ensure_camera(self, card):
+        # Called by a sensor start/recovery worker, never by the ROS receiver or
+        # globally for inactive camera cards. No arbitrary service/unit names.
+        scope = {'camera_head': 'head', 'camera_depth': 'depth'}[card]
+        request = urllib.request.Request(f'http://127.0.0.1:15748/ensure/{scope}', data=b'{}',
+                                         headers={'Content-Type': 'application/json'})
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=4) as response:
+            result = json.loads(response.read(4096))
+        if result.get('requested') is not True:
+            raise RuntimeError('head camera host services unavailable; run host/install.py once')
+
     def close(self):
         self._closed.set()
         if self._thread:

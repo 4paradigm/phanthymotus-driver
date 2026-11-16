@@ -78,16 +78,18 @@ sudo python3 host/install.py --user leju_kuavo \
 ```
 
 安装器准备现场配置（保留已有值，仅补充缺失的外设插件），安装固定用途 systemd 服务。
-驱动启动后每5秒通过 `127.0.0.1:15748/ensure` 请求确保 rosbridge、只读电池转发器及已安装的头部 RGB 服务运行；
+驱动启动后每5秒通过 `127.0.0.1:15748/ensure` 请求确保 rosbridge、只读电池转发器运行；
 它们异常退出由 systemd 重启。`switch_mode.get_current_mode` 的 `feedback.host_runtime` 报告检查状态。
 容器不需要宿主机 sudo、SSH 密码、Docker socket 或特权权限。
-助手仅能启动 rosbridge、电池 relay 及已安装的固定头部 RGB 服务，不接受命令或 unit 参数；仅监听 loopback，拒绝浏览器 Origin 和非本机 Host。
+头部 RGB/深度卡在 `start` 缺帧时分别请求 `/ensure/head`、`/ensure/depth`，确保固定相机和相应 relay 服务运行。
+助手仅能启动 rosbridge、电池 relay 及已安装的固定头部 RGB/深度服务，不接受命令或 unit 参数；仅监听 loopback，拒绝浏览器 Origin 和非本机 Host。
 ROS消息解码以普通用户运行，固定启动助手独立运行。旧版 rosbridge 忽略 address 参数时，通过进程内 wrapper
 明确指定 loopback 绑定，并在进程内为 ROS1 订阅启用 TCP_NODELAY、2MB 接收缓冲；不修改系统 ROS 包。
 保留全部 odom 接收样本，不通过 queue_size=1 在输入端丢弃测量。
 
-默认自动启动 `joints/imu/loco_state/battery/laser_scan/camera_left/camera_right/camera_head` 的输出。
-相机缺帧时调用对应 `set_camera_enabled(true)`，间隔至少5秒重试；不会启动 WBC、MPC 或使能机器人运动。
+默认自动启动 `joints/imu/loco_state/battery/laser_scan/camera_left/camera_right/camera_head/camera_depth` 的输出。
+卡片 `start` 先检查是否有新鲜图像；缺帧时异步请求启动，左右相机调用对应 `set_camera_enabled(true)`，头部卡请求上述宿主机服务。
+运行期间缺帧每5秒重试，已有新鲜帧不重复开启；未运行的头部卡不由全局检查器启动。不会启动 WBC、MPC 或使能机器人运动。
 `sensors.auto_start` 可缩小列表，`plugins.<name>.enabled: false` 可禁用卡片。
 远程 rosbridge 部署可设置 `host_runtime.enabled: false`，由远端自行管理其 ROS1 服务。
 首次缺少宿主机配置导致 bind 挂载失败时，容器代码尚未运行，仍需一次安装/初始化；无法靠容器内自检绕过。
@@ -100,18 +102,21 @@ ROS消息解码以普通用户运行，固定启动助手独立运行。旧版 r
 | `laser_scan` | 首路 `sensor/pointcloud` 原生二进制点云，次路原始 `/scan` JSON；保留全部有效点，laser 坐标、z=0，不推测底盘 TF |
 | `camera_left` | 左路 `/camera_1/color/image_raw/compressed`，原生 ROS2 `CompressedImage` / `image/jpeg` |
 | `camera_right` | 右路 `/camera_2/color/image_raw/compressed`，同上；保留源时间戳，空 frame_id 保持为空 |
-| `camera_head` | 头部 Orbbec Gemini335L，640×480 RGB JPEG；宿主机已有 Orbbec ROS1 驱动和 OpenCV/numpy 时安装 color-only 转发 |
+| `camera_head` | 头部 Orbbec Gemini335L，640×480 RGB JPEG；宿主机已有 Orbbec ROS1 驱动和 OpenCV/numpy 时安装转发 |
+| `camera_depth` | 头部原生640×480 uint16毫米深度，`image/depth-zlib` 无损压缩；0为无效距离，未对齐RGB |
 | `imu` | 优先独立 `/imu`，全身 raw 为备用；不再要求全身控制器存在才能读取 IMU |
 
 电池转发器校验现场三种已核实 topic/type/MD5 组合，动态加载发布者提供的有界定义，输出标准 String。
-三路相机分别使用独立 WebSocket 接收器和发布线程，目标上限10Hz；只保留最新 JPEG，DDS BEST_EFFORT/depth1。
+四路图像分别使用独立 WebSocket 接收器和发布线程，目标上限10Hz；只保留最新帧，DDS BEST_EFFORT/depth1。
 底盘 JPEG 不重新编码；头部通过宿主机已有 OpenCV/numpy 编码，未增加驱动镜像依赖。
 现场旧版 ROS1 缺少 compressed_image_transport 插件，`host/head_jpeg.py` 保留原始 header、处理行填充，
-以 latest-only 方式将头部原始 RGB 转 JPEG。不会开启深度投射器、深度激光或更改全身控制器。
+以 latest-only 方式将头部原始 RGB 转 JPEG。按现场授权，头部共用RGBD进程开启深度及深度激光，RGB/深度均为640×480@15Hz源流。
+`host/head_depth.py` 保留原始header，将已由厂商驱动换算为毫米的16UC1图像转换为小端无损zlib；不使用PNG/RVL compressedDepth格式，不增加镜像依赖。
+RGB和深度卡共享物理相机进程，启动任一头部卡可能同时打开两路源流；只有处于运行状态的卡输出DDS数据。
 WebSocket 使用 CPython 严格 UTF-8 解码和 JSON 校验，避免纯 Python 逐字节校验造成积压，不放宽非法编码检查。
 安装器自动检测 `/home/<user>/kuavo_data_pilot` 或指定 `--head-workspace`，仅在找到已构建 Orbbec 驱动时安装固定头部服务。
 底盘源时间戳为0，无法据此测得端到端延迟；卡片 info 中 publish_delay_ms 仅是驱动接收至 DDS 发布耗时。
-传感卡 stop 停止该卡输出，相机 stop 不关闭底盘其他进程共享的物理图像流。
+传感卡 stop 停止该卡输出，相机 stop 不关闭其他卡或进程共享的物理图像流。
 现场 USB 音频说明要求 EB03_LJ 声卡，上位机未枚举到该卡；Pulse source 仅为播放 monitor，不是麦克风。
 ALSA PCM 可写不证明真实扬声器出声，因此不注册虚假可用的 `mic/speaker`。接线/供电尚未确认。
 已发现 Livox MID360 配置和 SDK，但专用网口无物理 carrier，未见第二雷达有效发布者；当前点云只来自底盘二维雷达。
@@ -353,6 +358,7 @@ ROS master 缓存、具体 rosbridge 版本和真机控制器行为仍需现场�
 | `battery` | `/<namespace>/state/battery` | 扁平 main_/chassis_/small_ 标量字段，单位写在键名中；保留不同状态码，不将0V或缺失数据当作有效测量 |
 | `laser_scan` | `/<namespace>/state/laser_scan/points` | 首路 `sensor/pointcloud`：UInt8MultiArray 中 `<u32 step=16><u32 N><float32 x,y,z,intensity × N>`；z/intensity=0 |
 | `laser_scan` | `/<namespace>/state/laser_scan` | 原始 angle/range 元数据及测距 JSON；无效测距 null |
+| `camera_depth` | `/<namespace>/state/camera_depth` | CompressedImage，format=`image/depth-zlib`；zlib解压后640×480小端uint16毫米深度，0无效，保留采集header |
 
 前端默认使用 topic_out 首路，因此雷达首路改为可视化点云，loco_state 首路改为位置/姿态展示。
 旧画布保存的卡名/输出可能需刷新驱动或重新添加卡片，驱动兼容旧配置 camera_rgb/camera_rgb_right 的开启设置。
@@ -433,7 +439,9 @@ curl -s http://localhost:15747/mcp -H 'Content-Type: application/json' \
 离线测试不能替代容器构建、DDS 互通和真机运动验证。
 
 
-2026-11-16 最新现场验收：Agent Core 内连续30秒收到左右相机各300帧、头部299帧，
-三路JPEG解码正确；头部采集至Agent DDS回调平均约90ms（非浏览器端到端时延）。
-IMU、位置展示和标准odom各300帧且全部有效，电池/雷达点云各150帧，点云末帧3158点。
-全身 joints/joint_state 仍因无真实发布者明确 invalid。190项离线测试、Python编译和部署片段检查通过。
+2026-11-16 最新现场验收：Agent Core内连续30秒收到深度300帧、左右相机各300帧、头部RGB299帧，全部格式有效。
+头部深度640×480 uint16毫米，保留原始采集时间，采集至DDS回调最大257.5ms；未测试浏览器最终渲染或端到端时延。
+IMU301帧、位置展示和标准odom各300帧且全部有效，电池/雷达点云各150帧，点云末帧3201点。
+停止深度卡与relay后，基础检查不会启动闲置深度；重新start卡能自动恢复服务与有效数据。
+全身joints/joint_state仍因无真实发布者明确invalid。199项离线测试、Python编译和部署片段检查通过。
+详细检查记录见 ROBOT_INSPECTION.md 文末。

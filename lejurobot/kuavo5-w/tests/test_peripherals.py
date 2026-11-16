@@ -9,6 +9,7 @@ from pathlib import Path
 import time
 import types
 import unittest
+import zlib
 from unittest.mock import patch
 
 from test_driver import driver, FakeRos1, FakeNode, ROOT, peripherals_module, wait_until
@@ -101,17 +102,22 @@ class PeripheryTests(unittest.TestCase):
         callback({'data': base64.b64encode(b'\xff\xd8x\xff\xd9').decode()})
         self.periphery.tick()
         self.assertFalse(self.periphery.snapshot('camera_left')['valid'])
-        self.assertEqual(self.ros.services, [])
+        self.assertTrue(all(call[:3] == ('/camera_left/set_camera_enabled',
+                            'std_srvs/SetBool', {'data': True}) for call in self.ros.services))
 
     def test_camera_reconnect_rebinds_and_only_invokes_camera_enable(self):
-        self.periphery.dispatch('camera_left', 'start')
+        with patch.object(peripherals_module.threading, 'Thread') as thread:
+            self.periphery.dispatch('camera_left', 'start')
+            initial = thread.call_args
+        initial.kwargs['target'](*initial.kwargs['args'])
         self.ros.connection = (True, 2)
         with patch.object(peripherals_module.threading, 'Thread') as thread:
             self.periphery.tick()
             target = thread.call_args.kwargs['target']
             args = thread.call_args.kwargs['args']
         target(*args)
-        self.assertEqual(self.ros.services[0][:3],
+        self.assertEqual(len(self.ros.services), 2)
+        self.assertEqual(self.ros.services[-1][:3],
             ('/camera_left/set_camera_enabled', 'std_srvs/SetBool', {'data': True}))
         self.assertEqual(self.ros.published, [])
 
@@ -150,6 +156,59 @@ class PeripheryTests(unittest.TestCase):
         self.periphery.tick()
         self.assertIn('/camera_head/color/image_raw/compressed', self.ros.subscriptions)
         self.assertEqual(self.ros.services, [])
+
+    def test_depth_publishes_native_lossless_format_with_provenance(self):
+        self.periphery.dispatch('camera_depth', 'start')
+        raw = struct.pack('<HH', 0, 1500) * (640*480//2)
+        compressed = zlib.compress(raw, 1)
+        self.periphery._on_image('camera_depth', {'format': 'image/depth-zlib',
+            'data': base64.b64encode(compressed).decode(),
+            'header': {'frame_id': 'camera_head_depth_optical_frame', 'stamp': {'secs': 12, 'nsecs': 34}}}, 1)
+        self.periphery.tick()
+        msg = self.periphery._image_pubs['camera_depth'].messages[-1]
+        self.assertEqual(msg.format, 'image/depth-zlib')
+        self.assertEqual(zlib.decompress(bytes(msg.data)), raw)
+        self.assertEqual(msg.header.frame_id, 'camera_head_depth_optical_frame')
+        self.assertEqual(msg.header.stamp.sec, 12)
+        self.assertEqual(next(t for t in self.periphery.tools() if t['name']=='camera_depth')['topic_out'][0]['format'], 'image/depth-zlib')
+        self.assertEqual(self.periphery.snapshot('camera_depth')['unit'], 'mm')
+
+    def test_start_with_fresh_depth_does_not_request_hardware_again(self):
+        with patch.object(peripherals_module.threading, 'Thread'):
+            self.periphery.dispatch('camera_depth', 'start')
+        raw = b'\x00\x00' * (640 * 480)
+        self.periphery._on_image('camera_depth', {'format': 'image/depth-zlib',
+            'data': base64.b64encode(zlib.compress(raw)).decode()}, 1)
+        self.periphery._enabling.clear()
+        self.periphery._camera_ensure = lambda card: self.fail('fresh source was enabled again')
+        with patch.object(peripherals_module.threading, 'Thread') as worker:
+            self.periphery.dispatch('camera_depth', 'start')
+            worker.assert_not_called()
+
+    def test_depth_decoder_rejects_bad_size_trailing_data_and_expansion_bombs(self):
+        self.periphery.dispatch('camera_depth', 'start')
+        valid = zlib.compress(bytes(640*480*2), 1)
+        for data in (b'not zlib', valid[:-1], valid+b'trailing', valid+valid,
+                     zlib.compress(bytes(640*480*2+1)), zlib.compress(bytes(640*480*8)), zlib.compress(b'short')):
+            self.periphery._on_image('camera_depth', {'format': 'image/depth-zlib',
+                'data': base64.b64encode(data).decode()}, 1)
+            self.assertFalse(self.periphery.snapshot('camera_depth')['valid'])
+
+    def test_head_services_are_requested_on_start_and_not_for_idle_cards(self):
+        called = []
+        p = Peripherals(self.ros, FakeNode(), 'test', camera_ensure=called.append)
+        try:
+            p.tick()
+            self.assertEqual(called, [])
+            p.dispatch('camera_depth', 'start')
+            self.assertTrue(wait_until(lambda: called == ['camera_depth']))
+            p.dispatch('camera_depth', 'stop')
+            p._retry_at.clear()
+            p.tick()
+            self.assertEqual(called, ['camera_depth'])
+            self.assertEqual(self.ros.published, [])
+        finally:
+            p.close()
 
     def test_cameras_use_independent_clients_and_publish_latest_without_blocking_each_other(self):
         clients = []
@@ -200,8 +259,8 @@ class HostManagerTests(unittest.TestCase):
         cls.module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.module)
 
-    def request(self, host='127.0.0.1:15748', origin=None, body=b'{}', peer='127.0.0.1'):
-        head = [f'POST /ensure HTTP/1.1', f'Host: {host}', 'Content-Type: application/json', f'Content-Length: {len(body)}']
+    def request(self, host='127.0.0.1:15748', origin=None, body=b'{}', peer='127.0.0.1', path='/ensure'):
+        head = [f'POST {path} HTTP/1.1', f'Host: {host}', 'Content-Type: application/json', f'Content-Length: {len(body)}']
         if origin:
             head.append('Origin: ' + origin)
         wire = '\r\n'.join(head).encode() + b'\r\n\r\n' + body
@@ -233,14 +292,31 @@ class HostManagerTests(unittest.TestCase):
         with patch.object(self.module.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
             with patch.object(self.module.socket, 'create_connection'):
                 self.assertTrue(self.module.ensure_services()['requested'])
-        self.assertEqual(run.call_args.args[0], ['systemctl', 'start', '--no-block',
+        self.assertEqual(run.call_args_list[0].args[0], ['systemctl', 'start', '--no-block',
                          'kuavo5w-rosbridge.service', 'kuavo5w-battery-relay.service'])
 
     def test_manager_can_only_add_fixed_installed_head_camera_unit(self):
         with patch.object(self.module.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
             with patch.object(self.module.socket, 'create_connection'), patch.object(self.module.Path, 'is_file', return_value=True):
-                self.module.ensure_services()
-        self.assertEqual(run.call_args.args[0][-2:], ['kuavo5w-head-camera.service', 'kuavo5w-head-jpeg-relay.service'])
+                self.module.ensure_services('head')
+        self.assertEqual(run.call_args_list[0].args[0][-2:], ['kuavo5w-head-camera.service', 'kuavo5w-head-jpeg-relay.service'])
+
+    def test_depth_scope_uses_only_its_fixed_services_and_rejects_arbitrary_paths(self):
+        with patch.object(self.module.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+            with patch.object(self.module.socket, 'create_connection'), patch.object(self.module.Path, 'is_file', return_value=True):
+                self.module.ensure_services('depth')
+        self.assertEqual(run.call_args_list[0].args[0], ['systemctl', 'start', '--no-block',
+            'kuavo5w-rosbridge.service', 'kuavo5w-head-camera.service', 'kuavo5w-head-depth-relay.service'])
+        with patch.object(self.module, 'ensure_services', return_value={'requested': True}) as ensure:
+            self.assertEqual(self.request(path='/ensure/depth'), 200)
+            ensure.assert_called_once_with('depth')
+            self.assertEqual(self.request(path='/ensure/enable_control'), 403)
+
+    def test_missing_camera_installation_does_not_start_partial_services(self):
+        with patch.object(self.module.Path, 'is_file', return_value=False), patch.object(self.module.subprocess, 'run') as run:
+            result = self.module.ensure_services('depth')
+            self.assertFalse(result['requested'])
+            run.assert_not_called()
 
     def test_bridge_tcp_latency_fix_keeps_all_odometry_samples_and_is_process_local(self):
         spec = importlib.util.spec_from_file_location('kuavo_loopback', ROOT / 'host/rosbridge_loopback.py')

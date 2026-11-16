@@ -27,7 +27,7 @@ class _McpRequestLog:
     """One bounded sampler shared by all HTTP connections/worker threads."""
     TOOLS = frozenset(('loco', 'arm', 'leg', 'waist', 'head', 'switch_mode',
                        'joints', 'imu', 'loco_state', 'model',
-                       'battery', 'laser_scan', 'camera_left', 'camera_right', 'camera_head'))
+                       'battery', 'laser_scan', 'camera_left', 'camera_right', 'camera_head', 'camera_depth'))
     STATES = frozenset(('ready', 'idle', 'running', 'executing', 'paused',
                         'completed', 'error', 'rejected', 'disconnected'))
 

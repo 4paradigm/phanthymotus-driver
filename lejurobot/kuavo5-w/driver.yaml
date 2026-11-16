@@ -25,3 +25,4 @@ cards:
   - { name: camera_left, type: sensor }
   - { name: camera_right, type: sensor }
   - { name: camera_head, type: sensor }
+  - { name: camera_depth, type: sensor }

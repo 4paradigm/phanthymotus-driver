@@ -263,8 +263,7 @@ host helper 的首次安装仍需现场管理员执行一次，详见 README。
   操作人员暂不能确认音频和第二雷达接线/供电；因此不添加虚假可用的 mic/speaker 卡。
 
 现场使用本地覆盖镜像 `kuavo5w:local-sensor-ui-261116`，没有发布或冒用原release标签。
-头部启动与JPEG relay已纳入一次安装后由驱动启动助手确保运行的固定服务。
-
+头部启动与JPEG relay已纳入一次安装后由驱动启动助手确保运行的固定服务；后续按卡启动行为见下节。
 
 ### 最终低延迟桥接与 DDS 验收
 
@@ -283,3 +282,28 @@ host helper 的首次安装仍需现场管理员执行一次，详见 README。
 - 最终本地候选镜像为eb5f51302b7b，736988544字节；对比已发布release的736836914字节，增加151630字节。
   本次复用现场release依赖；仍不代表生产Dockerfile相对ros-base的完整增量。
   重建并重新创建容器后再次核对15张卡、三组双流声明及三路相机info均正确；头部camera/JPEG relay、runtime manager、rosbridge服务均active。
+
+
+## 追加：头部深度与卡片按需恢复（2026-11-16）
+
+本节更新上节color-only配置。经授权开启头部深度及深度激光，仅操作传感服务，未启动WBC/MPC、使能电机或发运动指令。
+
+- Orbbec Gemini335L以RGB+深度640×480@15Hz运行，深度未对齐RGB，关闭TF及厂商点云发布。
+  原生深度为16UC1、step1280、frame=`camera_head_depth_optical_frame`，单位毫米；单帧269528个非零像素，有效距离1390–5544mm。
+- 增加 `camera_depth`，宿主机stdlib relay以latest-only 10Hz无损zlib压缩毫米uint16数据；DDS CompressedImage.format=`image/depth-zlib`，
+  符合当前Agent Core深度渲染契约。每帧校验解压后614400字节，保留真实采集时间；未测试浏览器最终渲染与端到端时延。
+- Agent Core容器domain42连续30秒：深度300帧、左右RGB各300帧、头部RGB299帧，全部格式有效。
+  深度末帧267192个非零像素、最小1387mm、中位2894mm、最大11695mm；采集到DDS回调最大257.5ms，RGB头部最大200.52ms。
+  测得最大距离随场景和深度噪声变化，不代表标称量程或精度。
+  IMU301帧、odom/loco_state各300帧、电池/点云各150帧均有效，点云末帧3201点。
+- 卡片start若有新鲜图像不再请求开启；缺帧时左右相机调用原有SetBool，头部RGB/深度分别请求固定 `/ensure/head`、`/ensure/depth`。
+  请求异步执行，运行中缺帧至少间隔5秒重试；后台基础检查只确保rosbridge和电池relay，不启动闲置头部卡。
+  共用RGBD进程，stop不关闭其他卡依赖的物理流。
+- 真机恢复回归：停止深度卡和深度relay，等待6秒，relay仍inactive；重新start深度卡后relay恢复active且深度feedback.valid=true。
+- 第二雷达复查：lidarcon carrier仍为0，ROS无活跃Livox或scan_2发布者。已有MID360配置目标192.168.1.191、主机192.168.1.102，
+  仍需现场确认接线/供电和实际硬件；没有把已有二维派生云或深度图冒称三维雷达。
+- 用户反馈点云不显示时，DDS本身有有效点；Agent日志出现同名topic旧String与新UInt8MultiArray订阅类型冲突。
+  重启Agent一次后日志确认正确pointcloud订阅建立。尚未直接观察浏览器最终渲染；升级改变topic类型时须清理旧订阅状态。
+- 本地候选镜像 `kuavo5w:local-depth-261116`（9f530d375e0e），736995734字节，相对既有release736836914字节增加158820字节，
+  本轮未安装依赖；该代码覆盖层差值不代表生产Dockerfile对ros-base的完整增量。
+- 最终199项离线测试、Python编译、部署checker、diff检查通过；重建后四路图像、雷达、loco_state卡均running且valid，宿主机helper/头部相机/深度relay均active。

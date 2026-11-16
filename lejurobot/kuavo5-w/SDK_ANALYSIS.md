@@ -185,3 +185,13 @@ DDS42/loopback 的跨容器接收，以及软件暂停和断网时控制器行�
 - 未见可用USB EB03音频设备，Livox网口无物理链路；不从已安装SDK、配置或话题名推断硬件在线。
 
 具体源流、模型缺失原因、设备检查和集成验证以 ROBOT_INSPECTION.md 文末记录为准。
+
+## 9. 头部深度与按卡启动（2026-11-16）
+
+- 依据现场已安装 OrbbecSDK_ROS1 的 `ob_camera_node.cpp` / `ros_setup.cpp`：深度发布前已乘 `getValueScale()`，输出为16UC1毫米。
+  原生640×480@15Hz实机验证通过；启用深度激光，关闭RGB对齐、TF及厂商点云发布。
+- Agent Core现有 `image/depth-zlib` 渲染契约固定640×480小端uint16毫米；`camera_depth` 使用标准CompressedImage承载，format同名，保留采集header。
+  宿主机stdlib relay仅剥除行填充/处理字节序并zlib无损压缩；0仍表示无效。驱动有界解压验证，不把JPEG/PNG/RVL当深度。
+- 头部RGB/深度卡start缺帧时通过固定loopback路径请求对应systemd服务；仅启用中的卡缺帧会重试。
+  全局检查只确保桥接和电池服务，stop只停止卡输出，避免关闭共用RGBD源进程。
+- 当前laser_scan是二维测距的z=0投影。MID360配置与SDK不能证明硬件在线；专用网口carrier=0、无Livox发布者，不能提供真实三维雷达流。

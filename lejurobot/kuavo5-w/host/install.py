@@ -35,8 +35,10 @@ def main():
         parser.error('Missing workspace devel/setup.bash')
     root = Path('/opt/phanthy-motus/kuavo5w-host')
     root.mkdir(parents=True, exist_ok=True)
+    launch = root / 'head_camera.launch'
+    head_launch_changed = launch.is_file() and launch.read_bytes() != (Path(__file__).parent / launch.name).read_bytes()
     for name in ('rosbridge_loopback.py', 'rosbridge.launch', 'battery_relay.py', 'runtime_manager.py',
-                 'head_camera.launch', 'head_jpeg.py'):
+                 'head_camera.launch', 'head_jpeg.py', 'head_depth.py'):
         shutil.copyfile(Path(__file__).parent / name, root / name)
         (root / name).chmod(0o644)
     config = Path('/opt/phanthy-motus/drivers/lejurobot-kuavo5-w/config.yaml')
@@ -52,16 +54,19 @@ def main():
             parser.error('Existing operator config is not a mapping')
         defaults = yaml.safe_load((Path(__file__).parents[1] / 'config.yaml').read_text())
         plugins = operator.setdefault('plugins', defaults['plugins'].copy())
+        depth_new = 'camera_depth' not in plugins
         aliases = {'camera_rgb': 'camera_left', 'camera_rgb_right': 'camera_right'}
         for old, new in aliases.items():
             if old in plugins:
                 plugins.setdefault(new, plugins.pop(old))
         plugins.pop('state', None)
-        for name in ('battery', 'laser_scan', 'camera_left', 'camera_right', 'camera_head'):
+        for name in ('battery', 'laser_scan', 'camera_left', 'camera_right', 'camera_head', 'camera_depth'):
             plugins.setdefault(name, defaults['plugins'][name])
         sensors = operator.setdefault('sensors', {})
         if 'auto_start' in sensors:
             sensors['auto_start'] = [aliases.get(name, name) for name in sensors['auto_start'] if name != 'state']
+            if depth_new and plugins['camera_depth'].get('enabled', True) and 'camera_depth' not in sensors['auto_start']:
+                sensors['auto_start'].append('camera_depth')
         with tempfile.NamedTemporaryFile(mode='w', dir=config.parent, delete=False) as stream:
             yaml.safe_dump(operator, stream, sort_keys=False)
             staged = Path(stream.name)
@@ -80,6 +85,7 @@ def main():
             head = candidate / 'devel/setup.bash'
             commands['kuavo5w-head-camera'] = f'roslaunch --wait {root}/head_camera.launch'
             commands['kuavo5w-head-jpeg-relay'] = f'python3 {root}/head_jpeg.py'
+            commands['kuavo5w-head-depth-relay'] = f'python3 {root}/head_depth.py'
             break
     if args.head_workspace and head is None:
         parser.error('Head workspace must contain built OrbbecSDK_ROS1 gemini_330_series.launch')
@@ -117,7 +123,13 @@ WantedBy=multi-user.target
 ''')
     subprocess.run(['systemctl', 'daemon-reload'], check=True)
     subprocess.run(['systemctl', 'enable', '--now', 'kuavo5w-runtime-manager.service'], check=True)
-    print('Host helper installed. Driver startup ensures rosbridge, battery telemetry and installed optional head camera.')
+    # enable --now leaves an existing helper process running with old routes.
+    subprocess.run(['systemctl', 'restart', 'kuavo5w-runtime-manager.service'], check=True)
+    if head is not None and head_launch_changed:
+        # Reload a running RGB-only pipeline on upgrade; inactive cameras remain
+        # inactive until a card requests them. Never touch robot controllers.
+        subprocess.run(['systemctl', 'try-restart', 'kuavo5w-head-camera.service'], check=True)
+    print('Host helper installed. Driver startup ensures rosbridge/battery; camera card start ensures installed RGB/depth services.')
 
 
 if __name__ == '__main__':
