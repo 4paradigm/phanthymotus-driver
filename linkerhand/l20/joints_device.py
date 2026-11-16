@@ -638,11 +638,16 @@ class JointsPlugin:
                         created.append(target)
                     stream.start()
             except Exception:
-                for target in created:
-                    try:
-                        self._streams.pop(target).stop()
-                    except Exception:
-                        pass
+                try:
+                    # Same rule as a normal stop: a stream that does not stop
+                    # stays in _streams and becomes this card's leftover, so the
+                    # card's next start or stop still reaches it. Popping it
+                    # here would leave a live worker, its publisher and its CAN
+                    # client with no owner at all.
+                    self._release_targets(instance_id, created)
+                except Exception as exc:
+                    logger.warning("Joints start failed and %s did not stop: %s",
+                                   self._describe(sorted(self._leftovers.get(instance_id, ()))), exc)
                 raise
             self._owners[instance_id] = owner
             # A target started here belongs to this card again, not to the card

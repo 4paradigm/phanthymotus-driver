@@ -994,6 +994,48 @@ def test_driver_stop_keeps_a_worker_it_cannot_stop_and_its_can_client(ros_runtim
         plugin.stop()
 
 
+def test_failed_second_hand_start_keeps_a_first_hand_it_cannot_stop_reachable(ros_runtime, monkeypatch):
+    ros2, _, _ = ros_runtime
+    blocked = BlockingClient()
+    ctrl = mock.Mock(get=mock.Mock(return_value=blocked))
+    monkeypatch.setattr(hand_device, "GLOBAL_CONTROLLERS", {("left", "can0"): ctrl})
+    import joints_device
+    monkeypatch.setattr(joints_device, "GLOBAL_CONTROLLERS", hand_device.GLOBAL_CONTROLLERS)
+    original_start = joints_device._JointsStream.start
+
+    def start(stream):
+        if stream.side == "right":
+            # The left worker is already inside a query that outlasts the join.
+            assert blocked.entered.wait(3)
+            raise RuntimeError("right hand start failed")
+        original_start(stream)
+
+    monkeypatch.setattr(joints_device._JointsStream, "start", start)
+    hand = SimpleNamespace(hand_config={}, config=GLOBAL_CONFIG, _lock=threading.RLock(), _controllers={})
+    plugin = JointsPlugin(hand, {"poll_hz": 30, "query_timeout_s": 0.02}, global_config=GLOBAL_CONFIG, ros2=ros2)
+    try:
+        with pytest.raises(RuntimeError, match="right hand start failed"):
+            plugin.dispatch("start", {"instance_id": "B", "bound_side": "both"})
+        # The rollback could not stop the left worker: it stays registered and
+        # its CAN client stays open instead of becoming an ownerless thread.
+        worker = plugin._streams.get(("left", "can0"))
+        assert worker is not None and worker.running()
+        assert ("right", "can0") not in plugin._streams and "B" not in plugin._owners
+        ctrl.close.assert_not_called()
+        # Another card cannot put a second worker on the same hand meanwhile.
+        with pytest.raises(RuntimeError):
+            plugin.dispatch("start", {"instance_id": "C", "bound_side": "left"})
+        assert plugin._streams[("left", "can0")] is worker
+        blocked.release.set()
+        # The failed card's stop still reaches the worker once the query returns.
+        plugin.dispatch("stop", {"instance_id": "B"})
+        assert plugin._streams == {} and not worker.running()
+        ctrl.close.assert_called_once()
+    finally:
+        blocked.release.set()
+        plugin.stop()
+
+
 def test_unknown_action_is_left_to_the_mcp_handler_as_an_error():
     plugin, clients = make_plugin()
     assert plugin.dispatch("calibrate", {"instance_id": "A", "bound_side": "left"}) is None
