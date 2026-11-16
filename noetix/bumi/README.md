@@ -187,8 +187,8 @@ sudo systemctl start noetix-video-capture.service
 
 原有三张卡片共享同一个 RealSense 采集进程：
 
-- `camera` 保留 `/<namespace>/camera/color` 展示/拍照输出，追加名为
-  `registered_rgb` 的 `/<namespace>/camera/rgbd/color`（`image/jpeg`）。
+- `camera` **只有原来的一个输出** `/<namespace>/camera/color`（`image/jpeg`），
+  展示、拍照、录像和计算共用已配准校正的 RGB。
 - `depth` **只有原来的一个输出** `/<namespace>/camera/depth`
   （`image/depth-zlib`，ROS `CompressedImage`），供展示、VO 和 Point Cloud 共用。
 - `imu` 保留身体 `/<namespace>/state/imu`（`data/json`），追加明确命名的
@@ -196,20 +196,21 @@ sudo systemctl start noetix-video-capture.service
   两者来源、坐标和格式不同，不得互相替代。
 
 深度复用已经验证的计算几何：将颜色对齐到原生深度光学坐标，再把颜色和深度一起校正到
-640×480 针孔射线。**深度展示视角因此改变，不再对齐到原始展示 RGB。** 按像素取深度的
-检测/VO 应使用 `registered_rgb`。`camera` 的 `camera_info` 包含展示 RGB 和已就绪的配对
-RGB；`depth` 仅声明实际深度话题。配对两路的 `K`、相机 `id`、光学帧和时钟身份一致，
-只声明真实采集验证后的参数；等待相机或参数无效时深度 `camera_info=[]`、`sourceReady=false`。
-原始展示 RGB 仍允许 `camera_specs.py` 的显式手册 FOV 兜底，该值不用于计算深度。
+640×480 针孔射线。**RGB 展示、照片和录像的视角随之改为校正后的原生深度镜头平面，
+颜色未覆盖的边缘可能为空白。** 按像素取深度的检测/VO 使用同一个 `camera/color` 输出。
+`camera` 和 `depth` 各自仅声明实际输出话题；配对两路的 `K`、相机 `id`、光学帧和时钟身份一致。
+只声明真实采集验证后的参数；等待相机或参数无效时两张卡均为 `camera_info=[]`、
+`sourceReady=false`，不回退到原生 RGB 或手册 FOV。
 
-深度保留 30 Hz 采集发布配置、队列深度 1、BEST_EFFORT；每帧仅编码/发布一次深度。
+RGB 和深度保留 30 Hz 采集发布配置、队列深度 1、BEST_EFFORT；每帧各仅编码/发布一次。
 `format="16UC1; compressedDepth zlib"`，载荷是 zlib 压缩的 640×480 小端 uint16 毫米，
 按真实 SDK `depth_scale` 四舍五入；0 为无效，超出 65535 mm 置 0。
-没有 `/<namespace>/camera/rgbd/depth` 发布者。每路 header 保留各自采集时刻，深度帧为
+没有 `/<namespace>/camera/rgbd/color` 或 `/<namespace>/camera/rgbd/depth` 发布者。
+每路 header 保留各自采集时刻，两路光学帧均为
 `<namespace>_depth_optical`。硬件时钟仅使用一次到达偏移估计，声明保留
 `clock_mapping=fixed_arrival_offset`、`clock_mapping_verified=false` 和真实偏移/域；
 不声称曝光同步、精确硬件时间或导航/身体坐标精度。无效内参、尺寸、单位、时钟跳变或过大
-时差会暂停共享深度（展示也暂停）；绝不在相同话题回退到另一种几何或到达时间戳。
+时差会暂停共享 RGB 和深度（展示、拍照和录像也受影响）；绝不在相同话题回退到另一种几何或到达时间戳。
 
 Bundle 启动仍自动启动原有卡片。单张卡片 start/stop 独立控制本卡片的所有输出，重复
 start 不会再开相机；停一张不影响其他活动卡片。相机可为其他卡片保持采集，重启卡片只
@@ -520,7 +521,7 @@ and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
 ### Generic Perception RGB-D input
 
 The separate `camera_rgbd` card is retired. Move existing canvas wires to the
-original cards: `camera.registered_rgb` (`/bumi/camera/rgbd/color`) and the single
+original cards: the single `camera` output (`/bumi/camera/color`) and the single
 `depth` output (`/bumi/camera/depth`). Use that same depth output for display,
 Perception VO and Point Cloud. Select the `imu.camera_imu` output only when
 camera IMU assistance is requested; the original body JSON port is unchanged.
@@ -528,8 +529,10 @@ The namespace follows bundle configuration. The original `camera` and `depth`
 `info`/`start` responses carry their actual `camera_info` declarations and
 `sourceReady`; an explicit camera/depth start waits up to ten seconds for
 fresh calibrated metadata, returning early if its owner exits or reports a
-permanent calibration failure. Native display FOV alone never completes that
-wait. Depth does not advertise a manual geometry fallback. Optional camera IMU
+permanent calibration failure. Neither image advertises a manual geometry
+fallback. Existing `camera.registered_rgb` connections must be moved to the
+remaining `camera` output; update saved topic selectors from `/camera/rgbd/color`
+to `/camera/color` with the configured namespace. Optional camera IMU
 availability remains separate and does not block calibrated images.
 
 One existing RealSense pipeline aligns color into the native depth optical
@@ -637,22 +640,21 @@ automatic motion control as part of this experiment.
 ### Shared-depth RGB pixel consumers
 
 Consumers that combine RGB pixel coordinates with the shared depth must use
-`/<ns>/camera/rgbd/color` (the registered RGB port), not the unchanged display
-RGB. This also applies to VOP/Measure connections. If Measure overlays an RGB
-image, set its existing `camera_topic` to that registered RGB topic; its default
-`/camera/color` or `/camera/rgb` guess refers to the native display image.
+`/<ns>/camera/color`, the camera card's single registered RGB output. This also
+applies to VOP/Measure connections. If Measure overlays an RGB image, set its
+existing `camera_topic` to that namespaced topic. Migrate any saved
+`/<ns>/camera/rgbd/color` selector to `/<ns>/camera/color`.
 No camera-to-body matrix or guessed calibration is introduced by this wiring.
 
 ### Camera-reference SLAM with generic Perception
 
-Connect `/<ns>/camera/rgbd/color` and `/<ns>/camera/depth` to the generic
+Connect `/<ns>/camera/color` and `/<ns>/camera/depth` to the generic
 `rgbd_odometry` card. Also connect the depth port to `pointcloud`, then connect
 the metric cloud and generic RGB-D odometry outputs to `pointcloud_slam`.
 Both outputs refer to the same depth optical frame; no camera-to-body matrix
 is needed for this route. The resulting pose describes the camera, not the
-robot body. The native display RGB and gyro-only chassis odometry cannot
-replace these inputs. Camera IMU assistance is optional and requires the
-camera IMU port with its SDK calibration and shared capture clock.
+robot body. Gyro-only chassis odometry cannot replace the RGB-D pose input.
+Camera IMU assistance is optional and requires the camera IMU port with its SDK calibration and shared capture clock.
 
 The declarations retain source identity, capture epoch and mapping evidence.
 Hardware time uses one fixed arrival-fitted offset shared by RGB, depth and

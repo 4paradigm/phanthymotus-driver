@@ -60,7 +60,7 @@ def test_source_scales_measured_depth_and_keeps_distinct_capture_headers(source)
     publisher, messages, notices = source
     pair = frames()
     publisher.publish(pair)
-    color = messages['/robot/camera/rgbd/color'][0]
+    color = messages['/robot/camera/color'][0]
     depth = messages['/robot/camera/depth'][0]
     assert stamp(color) == 10_000_000_000
     assert stamp(depth) == 10_010_000_000
@@ -76,7 +76,7 @@ def test_source_scales_measured_depth_and_keeps_distinct_capture_headers(source)
     # Subsequent captures advance by source time, not variable processing delay.
     later = frames(ms=1030.)
     publisher.publish(later)
-    assert stamp(messages['/robot/camera/rgbd/color'][1]) == 10_030_000_000
+    assert stamp(messages['/robot/camera/color'][1]) == 10_030_000_000
 
 
 @pytest.mark.parametrize('has_mount', [False, True])
@@ -105,7 +105,7 @@ def test_source_declarations_are_accepted_by_generic_perception_contract(source,
         from perception.plugins.pointcloud_slam_config import infer_geometry
         depth = next(d for d in declarations if d['format'] == 'image/depth-zlib')
         cloud = inherit(depth, topic='/cloud', fmt='pointcloud2', stage='pointcloud')[0]
-        capture_ns = stamp(messages['/robot/camera/rgbd/color'][0])
+        capture_ns = stamp(messages['/robot/camera/color'][0])
         pose = dict(frame_id='run1_odom', child_frame_id=accepted['frame_id'],
                     position=[0., 0., 0.], quaternion=[0., 0., 0., 1.], covariance=None)
         sample = module.make_sample('tracking', capture_ns, 'run1', accepted['clock_id'], pose)
@@ -171,7 +171,7 @@ _spec.loader.exec_module(_capture_fixture)
 capture = _capture_fixture.capture
 
 
-def test_capture_owner_feeds_generic_source_and_keeps_display_on_source_failure(capture, monkeypatch):
+def test_capture_owner_does_not_publish_native_color_on_calibrated_source_failure(capture, monkeypatch):
     device, state = capture
     calls = []
     class BrokenSource:
@@ -188,7 +188,7 @@ def test_capture_owner_feeds_generic_source_and_keeps_display_on_source_failure(
     monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
     device._camera_subprocess('robot')
     assert [c[0] for c in calls] == ['init', 'pair', 'unavailable']
-    assert len(state.published['/robot/camera/color']) == 1
+    assert not state.published.get('/robot/camera/color')
     assert not state.published.get('/robot/camera/depth')
     assert len(state.streams) == 2  # one existing pipeline, two physical streams
     assert state.stopped
@@ -217,8 +217,9 @@ def test_original_depth_card_returns_live_declaration_only(monkeypatch):
     assert result['camera_info'] == [declarations[1]]
     assert result['topic_out'] == [{'topic': '/robot/camera/depth', 'format': 'image/depth-zlib'}]
     rgb_info = plugin.dispatch('info', {'_tool_name': 'camera'})['camera_info']
-    assert declarations[0] in rgb_info
+    assert rgb_info == [declarations[0]]
     plugin._proc = NS(poll=lambda: 1)
+    assert plugin.dispatch('info', {'_tool_name': 'camera'})['camera_info'] == []
     assert plugin.dispatch('info', {'_tool_name': 'depth'})['camera_info'] == []
 
 
@@ -232,7 +233,7 @@ def test_rectified_pair_samples_registered_color_and_depth_together(source):
     depth_pixels = pair.get_depth_frame().get_data()
     depth_pixels[:] = np.arange(640, dtype='<u2')[None, :]
     publisher.publish(pair)
-    rectified = cv2.imdecode(np.frombuffer(messages['/robot/camera/rgbd/color'][0].data, np.uint8), cv2.IMREAD_COLOR)
+    rectified = cv2.imdecode(np.frombuffer(messages['/robot/camera/color'][0].data, np.uint8), cv2.IMREAD_COLOR)
     depth = np.frombuffer(zlib.decompress(messages['/robot/camera/depth'][0].data), '<u2').reshape(480, 640)
     assert int(rectified[240, 620, 0]) == pytest.approx(200, abs=3)
     assert depth[240, 620] == 1270  # nearest source column 635, SDK scale 2 mm
@@ -311,7 +312,7 @@ def test_bumi_mount_failure_preserves_rgbd_and_reports_unavailable(source):
     publisher.body_mount = Mount()
     publisher.body_mount.error = True
     publisher.publish(frames())
-    assert len(messages['/robot/camera/rgbd/color']) == 1
+    assert len(messages['/robot/camera/color']) == 1
     assert len(messages['/robot/camera/depth']) == 1
     assert notices[-1]['ready'] is True
     assert notices[-1]['body_mount_status']['status'] == 'unavailable'
@@ -392,7 +393,7 @@ def test_bumi_mount_matches_native_pair_time_without_rewriting_headers(
     pair.get_depth_frame().get_timestamp = lambda: depth_ms
     try:
         publisher.publish(pair)
-        assert stamp(messages['/robot/camera/rgbd/color'][0]) == color_ns
+        assert stamp(messages['/robot/camera/color'][0]) == color_ns
         assert stamp(messages['/robot/camera/depth'][0]) == depth_ns
         packet = next(event[1] for event in events if event[0] == 'packet')
         assert packet['status'] == 'available'
@@ -432,7 +433,7 @@ def test_bumi_capture_mount_produces_body_pose_with_real_pr371_consumer(
         declarations = notices[-1]['camera_info']
         accepted = validate_inputs({d['topic']: d for d in declarations},
                                    [d['topic'] for d in declarations])
-        selected = native_capture_stamp(messages['/robot/camera/rgbd/color'][0],
+        selected = native_capture_stamp(messages['/robot/camera/color'][0],
                                         messages['/robot/camera/depth'][0])
         pose = dict(frame_id='run1_odom', child_frame_id=accepted['frame_id'],
                     position=[0., 0., 0.], quaternion=[0., 0., 0., 1.], covariance=None)
@@ -487,7 +488,7 @@ def test_shared_depth_uses_original_topic_with_no_duplicate_encoder(source):
     assert '/robot/camera/rgbd/depth' not in messages
     assert len(messages['/robot/camera/depth']) == 1
     declarations = {d['topic']: d for d in notices[-1]['camera_info']}
-    assert set(declarations) == {'/robot/camera/rgbd/color', '/robot/camera/depth'}
+    assert set(declarations) == {'/robot/camera/color', '/robot/camera/depth'}
     rgb, depth = declarations.values()
     assert rgb['K'] == depth['K']
     assert rgb['id'] == depth['id']
@@ -500,11 +501,11 @@ def test_stopped_card_suppresses_only_its_images_and_restart_uses_next_capture(s
     publisher.publish(frames())
     publisher.set_enabled({'depth'})
     publisher.publish(frames(ms=1010.))
-    assert len(messages['/robot/camera/rgbd/color']) == 1
+    assert len(messages['/robot/camera/color']) == 1
     assert len(messages['/robot/camera/depth']) == 2
     publisher.set_enabled({'camera'})
     publisher.publish(frames(ms=1020.))
-    assert len(messages['/robot/camera/rgbd/color']) == 2
+    assert len(messages['/robot/camera/color']) == 2
     assert len(messages['/robot/camera/depth']) == 2
     publisher.set_enabled({'camera', 'depth'})
     publisher.publish(frames(ms=1030.))
@@ -539,7 +540,8 @@ def test_original_cards_register_calibrated_ports_and_independent_lifecycle(monk
     plugin._start_process = launch
     tools = {t['name']: t for t in plugin.get_tools()}
     assert set(tools) == {'camera', 'depth'}
-    assert len(tools['camera']['topic_out']) == 2
+    assert tools['camera']['topic_out'] == [{'topic': '/robot/camera/color', 'format': 'image/jpeg'}]
+    assert tools['camera']['camera_info'] == []
     assert tools['depth']['topic_out'] == [{'topic': '/robot/camera/depth', 'format': 'image/depth-zlib'}]
     plugin.dispatch('start', {'_tool_name': 'depth'})
     plugin.dispatch('start', {'_tool_name': 'depth'})
@@ -604,7 +606,7 @@ def cold_camera(monkeypatch):
     return device, plugin
 
 
-@pytest.mark.parametrize('name,topic', [('camera', '/robot/camera/rgbd/color'), ('depth', '/robot/camera/depth')])
+@pytest.mark.parametrize('name,topic', [('camera', '/robot/camera/color'), ('depth', '/robot/camera/depth')])
 def test_cold_card_start_waits_for_asynchronous_calibrated_metadata(monkeypatch, name, topic):
     import threading
     device, plugin = cold_camera(monkeypatch)
@@ -628,18 +630,20 @@ def test_cold_card_start_waits_for_asynchronous_calibrated_metadata(monkeypatch,
     assert next(d for d in response['camera_info'] if d['topic'] == topic)['vendor']['clock_id'] == 'fresh-clock'
 
 
-def test_cold_card_start_wait_has_a_ten_second_bound(monkeypatch):
+@pytest.mark.parametrize('name', ['camera', 'depth'])
+def test_cold_card_start_wait_has_a_ten_second_bound(monkeypatch, name):
     device, plugin = cold_camera(monkeypatch)
     elapsed = [0.]
     monkeypatch.setattr(device.time, 'monotonic', lambda: elapsed[0])
     monkeypatch.setattr(device.time, 'sleep', lambda seconds: elapsed.__setitem__(0, elapsed[0]+seconds))
-    response = plugin.dispatch('start', {'_tool_name': 'depth'})
+    response = plugin.dispatch('start', {'_tool_name': name})
     assert 10. <= elapsed[0] < 10.1
     assert response['sourceReady'] is False and response['camera_info'] == []
 
 
+@pytest.mark.parametrize('name', ['camera', 'depth'])
 @pytest.mark.parametrize('dead', [False, True])
-def test_cold_card_start_returns_early_for_dead_source_or_terminal_calibration(monkeypatch, dead):
+def test_cold_card_start_returns_early_for_dead_source_or_terminal_calibration(monkeypatch, dead, name):
     device, plugin = cold_camera(monkeypatch)
     def launch():
         plugin._proc = NS(poll=lambda: 1 if dead else None)
@@ -647,7 +651,7 @@ def test_cold_card_start_returns_early_for_dead_source_or_terminal_calibration(m
     plugin._start_process = launch
     sleeps = []
     monkeypatch.setattr(device.time, 'sleep', sleeps.append)
-    response = plugin.dispatch('start', {'_tool_name': 'depth'})
+    response = plugin.dispatch('start', {'_tool_name': name})
     assert not sleeps
     assert response['sourceReady'] is False and response['camera_info'] == []
 

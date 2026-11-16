@@ -53,14 +53,14 @@ def camera_declarations(root, geometry, frame_id, clock_id, source_clock, offset
                       clock_mapping_verified=False, clock_mapping_uncertainty_ns=None))
     if source_epoch is not None:
         common['vendor']['source_epoch'] = source_epoch
-    color = dict(deepcopy(common), topic=root + '/color', format='image/jpeg')
+    color = dict(deepcopy(common), topic=root.removesuffix('/rgbd') + '/color', format='image/jpeg')
     depth = dict(deepcopy(common), topic=root.removesuffix('/rgbd') + '/depth', format='image/depth-zlib')
     depth['vendor'].update(depth_unit='mm', depth_source='measured')
     return [color, depth]
 
 
 class RgbdCameraPublisher:
-    """Sole normalized depth producer, sharing the existing capture owner."""
+    """Sole normalized RGB-D producer for display, capture and computation."""
 
     def __init__(self, node, namespace, pipeline, qos, *, report=lambda status: None,
                  min_interval_s=0.):
@@ -75,7 +75,7 @@ class RgbdCameraPublisher:
         import pyrealsense2 as rs
         self.align_to_depth = rs.align(rs.stream.depth)
         self.pubs = {kind: node.create_publisher(CompressedImage, topic, qos)
-                     for kind, topic in (('color', self.root + '/color'),
+                     for kind, topic in (('color', f'/{namespace}/camera/color'),
                                          ('depth', f'/{namespace}/camera/depth'))}
         self.enabled = {'camera', 'depth', 'imu'}
         self.clocks = [ClockMap(), ClockMap()]

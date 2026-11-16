@@ -35,7 +35,8 @@ def capture(monkeypatch):
     device = _load_device(monkeypatch)
     state = NS(iterations=0, frame_limit=1, published={}, stopped=False,
                aligned=False, streams=[], alignment=[], spin_calls=0,
-               depth_scale=.001, scale_error=None, depth_dims=(640, 480))
+               depth_scale=.001, scale_error=None, depth_dims=(640, 480),
+               publisher_topics=[], jpeg_encodes=0)
     raw = NS(color=b'BGR', depth=b'\x01\x00\x02\x00' + bytes(640 * 480 * 2 - 4))
 
     class Pixels:
@@ -131,11 +132,15 @@ def capture(monkeypatch):
         format=NS(bgr8='bgr8', z16='z16'), align=align))
     monkeypatch.setitem(sys.modules, 'numpy', np)
     monkeypatch.setitem(sys.modules, 'turbojpeg', None)
+    def encode_jpeg(*args):
+        state.jpeg_encodes += 1
+        return True, NS(tobytes=lambda: b'JPEG')
+
     monkeypatch.setitem(sys.modules, 'cv2', NS(
         IMWRITE_JPEG_QUALITY=1, CV_32FC1=cv2.CV_32FC1,
         INTER_LINEAR=cv2.INTER_LINEAR, INTER_NEAREST=cv2.INTER_NEAREST,
         initUndistortRectifyMap=cv2.initUndistortRectifyMap, remap=cv2.remap,
-        imencode=lambda *args: (True, NS(tobytes=lambda: b'JPEG'))))
+        imencode=encode_jpeg))
 
     import common.logsafe
     monkeypatch.setattr(common.logsafe, 'install', lambda **kwargs: None)
@@ -174,6 +179,7 @@ def capture(monkeypatch):
             self.subscriptions = {}
 
         def create_publisher(self, cls, topic, qos):
+            state.publisher_topics.append(topic)
             state.published[topic] = []
             def publish(message):
                 hook = getattr(state, 'on_publish', None)
@@ -225,7 +231,7 @@ def test_original_depth_is_normalized_capture_mapped_and_owned_once(capture, mon
     assert state.stopped
 
 
-def test_invalid_capture_never_falls_back_to_legacy_depth(capture, monkeypatch):
+def test_invalid_capture_never_falls_back_to_native_public_images(capture, monkeypatch):
     device, state = capture
     state.frame_limit = 2
     class Broken:
@@ -235,7 +241,7 @@ def test_invalid_capture_never_falls_back_to_legacy_depth(capture, monkeypatch):
         def unavailable(self, error): pass
     monkeypatch.setitem(sys.modules, 'rgbd_camera', NS(RgbdCameraPublisher=Broken))
     device._camera_subprocess('robot')
-    assert len(state.published['/robot/camera/color']) == 2
+    assert not state.published.get('/robot/camera/color')
     assert not state.published.get('/robot/camera/depth')
     assert '/robot/camera/depth/metadata' not in state.published
 
@@ -488,14 +494,14 @@ def test_invalid_raw_rate_falls_back_to_the_documented_default(capture, monkeypa
 @pytest.mark.parametrize('scale', [0.0, -0.001, 0.1, 1.0,
                                    float('nan'), float('inf'),
                                    -float('inf'), True, None])
-def test_invalid_sdk_depth_scale_disables_depth_but_keeps_color(
+def test_invalid_sdk_depth_scale_disables_both_public_images(
         capture, monkeypatch, capsys, scale):
     device, state = capture
     monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
     state.depth_scale = scale
     monkeypatch.setitem(sys.modules, 'visual_inputs', None)
     device._camera_subprocess('robot')
-    assert state.published['/robot/camera/color']
+    assert not state.published.get('/robot/camera/color')
     assert not state.published.get('/robot/camera/depth')
     assert 'invalid SDK depth scale' in capsys.readouterr().out
 
@@ -516,7 +522,7 @@ def test_normalized_source_rejects_wrong_dimensions_and_raw_buffer_sizes(
     state.raw_depth_override = payload
     state.frame_limit = 2
     device._camera_subprocess('robot')
-    assert len(state.published['/robot/camera/color']) == 2
+    assert not state.published.get('/robot/camera/color')
     assert not state.published.get('/robot/camera/depth')
     output = capsys.readouterr().out
     assert not state.published['/robot/camera/depth']
@@ -538,9 +544,30 @@ def test_card_controls_stop_depth_without_stopping_color_or_owner(capture, monke
     state.on_spin = on_spin
     device._camera_subprocess('robot')
     assert len(state.published['/robot/camera/color']) == 3
-    assert len(state.published['/robot/camera/rgbd/color']) == 3
+    assert '/robot/camera/rgbd/color' not in state.publisher_topics
     depth = state.published['/robot/camera/depth']
     assert len(depth) == 3
     assert [m.header.stamp.nanosec for m in depth] == [30_000_000, 90_000_000, 120_000_000]
     assert '/robot/camera/rgbd/depth' not in state.published
     assert state.stopped
+
+
+def test_color_display_and_capture_share_one_calibrated_publisher_and_encoder(capture, monkeypatch):
+    device, state = capture
+    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
+    state.frame_limit = 2
+    device._camera_subprocess('robot')
+    assert state.publisher_topics.count('/robot/camera/color') == 1
+    assert '/robot/camera/rgbd/color' not in state.publisher_topics
+    assert state.jpeg_encodes == 2
+    color = state.published['/robot/camera/color']
+    assert len(color) == 2
+    assert [m.header.frame_id for m in color] == ['robot_depth_optical'] * 2
+    assert [m.header.stamp.sec * 10**9 + m.header.stamp.nanosec for m in color] == [
+        10_030_000_000, 10_060_000_000]
+    cache = device._CameraFrameNode('/robot/camera/color')
+    cache._on_frame(color[-1])
+    saved, _ = cache.wait_for_frame(timeout_s=0)
+    assert saved['topic'] == '/robot/camera/color'
+    assert saved['data'] == bytes(color[-1].data)
+    assert saved['ros_timestamp'] == {'sec': 10, 'nanosec': 60_000_000}

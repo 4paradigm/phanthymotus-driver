@@ -2348,14 +2348,11 @@ def _camera_subprocess(namespace: str):
     from common import logsafe
     logsafe.install(check_fd=False)
 
-    from array import array
     import time as _time
-    import numpy as _np
 
     import rclpy as _rclpy
     from rclpy.node import Node as _Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-    from sensor_msgs.msg import CompressedImage as _CompressedImage
     from std_msgs.msg import String as _String
     from common.realsense_imu import MotionSource, CaptureQueue, motion_profiles, start_optional_motion
 
@@ -2373,26 +2370,11 @@ def _camera_subprocess(namespace: str):
     )
 
     import pyrealsense2 as rs
-    import cv2
-
-    # Try turbojpeg for faster encoding, fallback to cv2
-    try:
-        from turbojpeg import TurboJPEG, TJPF_BGR
-        _tj = TurboJPEG()
-        def encode_jpeg(bgr_image):
-            return _tj.encode(bgr_image, pixel_format=TJPF_BGR, quality=80)
-        print("[camera_subprocess] using TurboJPEG encoder", flush=True)
-    except Exception:
-        def encode_jpeg(bgr_image):
-            _, buf = cv2.imencode('.jpg', bgr_image, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            return buf.tobytes()
-        print("[camera_subprocess] using cv2 JPEG encoder", flush=True)
 
     _rclpy.init()
     node = _Node("bumi_camera_sub")
     color_topic = f"/{namespace}/camera/color"
     depth_topic = f"/{namespace}/camera/depth"
-    color_pub = node.create_publisher(_CompressedImage, color_topic, _QOS)
 
     pipeline = rs.pipeline()
     config = rs.config()
@@ -2500,8 +2482,8 @@ def _camera_subprocess(namespace: str):
         pipeline.stop()
         return
 
-    # Native color remains the display/photo input. Only the optional legacy
-    # RTAB-Map raw branch uses the color grid; public depth never does.
+    # Only the optional legacy RTAB-Map raw branch uses the color grid.
+    # Public color and depth share the rectified native-depth optical frame.
     align_to_color = rs.align(rs.stream.color) if os.environ.get("BUMI_VISUAL_ODOMETRY") == "1" else None
     print(f"[camera_subprocess] publishing color→{color_topic} normalized depth→{depth_topic}", flush=True)
 
@@ -2533,9 +2515,8 @@ def _camera_subprocess(namespace: str):
         _streams["depth"] = dict(_streams["depth_sensor"])
         print("[camera_subprocess] INTRINSICS " + _json.dumps(_streams), flush=True)
     except Exception as _e:
-        # Not fatal: the cards fall back to the datasheet-derived declaration in
-        # `camera_specs.SPECS` and say `source` accordingly. Losing the camera
-        # over a failed introspection call would be the worse trade.
+        # Diagnostic only: the normalized producer validates its own measured
+        # geometry before publishing either public image or its declaration.
         print(f"[camera_subprocess] intrinsics unavailable: {_e}", flush=True)
 
     raw_inputs = None
@@ -2579,8 +2560,8 @@ def _camera_subprocess(namespace: str):
             except Exception as _e:
                 print(f"[camera_subprocess] raw enable control unavailable: {_e}", flush=True)
 
-    # The original depth card owns this normalized producer. Invalid geometry,
-    # units or capture time pauses shared depth; color display remains available.
+    # The original camera/depth cards share this normalized producer. Invalid
+    # geometry, units or capture time pauses both public image streams.
     def report_rgbd(status):
         import json
         status = dict(status, imu_status=dict(imu.status(), activation=control['activations']['imu']),
@@ -2610,19 +2591,6 @@ def _camera_subprocess(namespace: str):
 
             frames = align_to_color.process(source_frames) if align_to_color is not None else source_frames
 
-            color_frame = source_frames.get_color_frame()
-            t_enc = 0.
-            if color_frame and "camera" in enabled_cards:
-                color_image = _np.asanyarray(color_frame.get_data())
-                t1 = _time.monotonic()
-                jpeg_bytes = encode_jpeg(color_image)
-                t_enc = _time.monotonic() - t1
-                msg = _CompressedImage()
-                msg.header.stamp = node.get_clock().now().to_msg()
-                msg.format = "jpeg"
-                msg.data = array('B', jpeg_bytes)
-                color_pub.publish(msg)
-
             if raw_inputs is not None and getattr(raw_inputs, 'enabled', True):
                 try:
                     raw_inputs.publish(source_frames, frames)
@@ -2649,7 +2617,7 @@ def _camera_subprocess(namespace: str):
             if frame_count % 300 == 0:
                 elapsed = _time.monotonic() - t_start
                 fps = frame_count / elapsed
-                print(f"[camera_subprocess] {frame_count} frames, {fps:.1f} fps, last: wait={t_wait*1000:.1f}ms enc={t_enc*1000:.1f}ms", flush=True)
+                print(f"[camera_subprocess] {frame_count} frames, {fps:.1f} fps, last: wait={t_wait*1000:.1f}ms", flush=True)
 
             _time.sleep(0.001)  # yield CPU
     except Exception as e:
@@ -2735,7 +2703,6 @@ class CameraPlugin:
         self._stop_generations = dict(camera=0, depth=0, imu=0)
         self._acked_generation = -1
         self._control_packet = None
-        self._intrinsics = {}
         self._intrinsics_lock = threading.Lock()
         self._rgbd_status = dict(ready=False, camera_info=[], error="awaiting calibrated capture")
         qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
@@ -2809,39 +2776,13 @@ class CameraPlugin:
         running = name in self._cards and self.is_running()
         if status['activations'].get(name) != self._activations[name]:
             status.update(sourceReady=False, camera_info=[])
-        if name == 'camera':
-            topics = [{"topic": self._color_topic, "format": "image/jpeg"},
-                      {"name": "registered_rgb", "topic": f"/{self._namespace}/camera/rgbd/color", "format": "image/jpeg"}]
-            info = self._camera_info('camera', self._color_topic, 'image/jpeg')
-            if running:
-                info += [d for d in status['camera_info'] if d['topic'] == topics[1]['topic']]
-        else:
-            topics = [{"topic": self._depth_topic, "format": "image/depth-zlib"}]
-            info = [d for d in status['camera_info'] if d['topic'] == self._depth_topic] if running else []
+        topic, fmt = ((self._color_topic, 'image/jpeg') if name == 'camera' else
+                      (self._depth_topic, 'image/depth-zlib'))
+        topics = [{"topic": topic, "format": fmt}]
+        info = [d for d in status['camera_info'] if d['topic'] == topic] if running else []
         return dict(status, state='stopping' if self._stop_pending(name) else ('running' if running else 'idle'),
                     sourceRequestDisabled=name not in self._cards,
                     sourceReady=running and status['sourceReady'], topic_out=topics, camera_info=info)
-
-    def _camera_info(self, tool_name: str, topic: str, fmt: str) -> list:
-        """This port's optics — `motus.camera/1`, see `camera_specs.py`.
-
-        The numbers live in a module that does not import rclpy, so they can be
-        asserted on a laptop. A field of view that is wrong by a factor of 1.6
-        does not raise anything; it makes the robot refuse doorways while the
-        depth map reports clear ahead.
-        """
-        from camera_specs import declare
-
-        with self._intrinsics_lock:
-            intrinsics = dict(self._intrinsics)
-        try:
-            return declare(tool_name, topic, fmt, intrinsics)
-        except Exception as exc:                              # noqa: BLE001
-            # A declaration this driver cannot build is a bug in this driver,
-            # and it must not take the camera's `info()` down with it — the
-            # consumer's own fallback is conservative and says so.
-            print(f"[camera] camera_info for {tool_name} failed: {exc}", flush=True)
-            return []
 
     def get_tools(self) -> list:
         return [dict(name=name, type="sensor", multiInstance=False,
@@ -2850,7 +2791,7 @@ class CameraPlugin:
                      **{k: v for k, v in self._card_info(name).items()
                         if k in ('topic_out', 'camera_info', 'body_mount_status')})
                 for name, description in (
-                    ('camera', 'Bumi color display and paired registered RGB in the native depth optical frame.'),
+                    ('camera', 'Bumi sole calibrated RGB for display, capture and computation in the native depth optical frame.'),
                     ('depth', 'Bumi sole calibrated 640x480 uint16 millimetre depth, with mapped capture time.'))]
 
     def start(self) -> None:
@@ -2898,8 +2839,6 @@ class CameraPlugin:
         )
         proc = self._proc
         def _fwd():
-            from camera_specs import parse_intrinsics_line
-
             for line in proc.stdout:
                 if self._proc is not proc:
                     return
@@ -2926,12 +2865,6 @@ class CameraPlugin:
                                 self._rgbd_status = status
                     except (ValueError, TypeError):
                         pass
-                payload = parse_intrinsics_line(text)
-                if payload:
-                    with self._intrinsics_lock:
-                        self._intrinsics = payload
-                    print("[camera] adopted RealSense intrinsics for "
-                          + ", ".join(sorted(payload)), flush=True)
             with self._intrinsics_lock:
                 if self._proc is proc:
                     self._rgbd_status = dict(ready=False, camera_info=[], error="camera capture process exited")
@@ -2950,7 +2883,6 @@ class CameraPlugin:
                     proc.kill()
                     proc.wait()
             with self._intrinsics_lock:
-                self._intrinsics = {}
                 self._rgbd_status = dict(ready=False, camera_info=[], error="camera stopped")
 
 
@@ -2966,10 +2898,9 @@ class CameraPlugin:
             return None
         if action == 'start':
             self.start_card(name)
-            # Core snapshots declarations from start. Native display FOV alone
-            # is not evidence that the registered computation input is ready.
-            topic = (f'/{self._namespace}/camera/rgbd/color' if name == 'camera'
-                     else self._depth_topic)
+            # Core snapshots declarations from start; wait for this activation's
+            # calibrated shared image stream.
+            topic = self._color_topic if name == 'camera' else self._depth_topic
             deadline = time.monotonic() + 10.
             while True:
                 status = self._card_info(name)

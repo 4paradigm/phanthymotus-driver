@@ -211,18 +211,19 @@ compatible, manually configured `child_from_cloud` matrix.
 The original `depth` card is the sole `image/depth-zlib` source at
 `/<namespace>/camera/depth`. It reuses `rgbd_camera.RgbdCameraPublisher`:
 640×480 rectified native-depth optical geometry, measured little-endian uint16
-millimetres, zero invalid. Its matched RGB is the `camera` card's additional
-`registered_rgb` port at `/<namespace>/camera/rgbd/color`. Public depth is no
-longer in the original display color grid. There is no `/camera/rgbd/depth`
-publisher, duplicate depth encoder, arrival-stamp fallback or legacy
-align-to-color fallback on the public depth topic.
+millimetres, zero invalid. Its matched RGB is the `camera` card's sole output
+at `/<namespace>/camera/color`; display, photos, videos and generic VO all use
+that registered rectified depth-lens view, including any unobserved color
+borders. There is no `/camera/rgbd/color` or `/camera/rgbd/depth` publisher,
+duplicate JPEG/depth encoder, arrival-stamp fallback or legacy align-to-color
+fallback on the public image topics.
 
 The producer requires finite SDK depth scale strictly within `(0, 0.1)` metres
 per unit, supported measured intrinsics/distortion, exact uint16 source shape,
 and valid monotonic capture clock mapping with the existing skew/drift bounds.
-Invalid input pauses shared depth and removes its ready declaration; native
-color display may continue. Missing optional motion or body-camera TF does not
-disable valid depth. Bumi's arrival-derived hardware-clock mapping remains
+Invalid input pauses both public images and removes their ready declarations;
+native RGB is not published as a fallback. Missing optional motion or
+body-camera TF does not disable valid images. Bumi's arrival-derived hardware-clock mapping remains
 explicitly unverified; this is not hardware timing or navigation acceptance.
 
 The optional bundle-local RTAB-Map raw branch still uses its own color-grid
@@ -235,5 +236,7 @@ Tests in `tests/test_bumi_rgbd_adapter.py`, `tests/test_bumi_camera_imu.py` and
 `tests/bumi_visual_odometry/test_bundle_hook.py` exercise scale, geometry,
 capture headers, missing optional inputs, independent card controls and one
 capture owner. Migration requires rewiring the retired `camera_rgbd` card to
-the original camera/depth/imu cards. Hardware/USB throughput, motion timing,
-TF installation and physical accuracy remain untested offline.
+the original camera/depth/imu cards. Existing `camera.registered_rgb` wires and
+`/<namespace>/camera/rgbd/color` topic selectors must move to the single
+`camera` output at `/<namespace>/camera/color`. Hardware/USB throughput,
+motion timing, TF installation and physical accuracy remain untested offline.

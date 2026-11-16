@@ -13,7 +13,7 @@ spec.loader.exec_module(fixture)
 capture=fixture.capture
 
 
-def test_shared_bumi_callback_publishes_motion_while_rgbd_failure_keeps_video(capture, monkeypatch):
+def test_shared_bumi_callback_keeps_motion_while_invalid_rgbd_pauses_images(capture, monkeypatch):
     device,state=capture
     sdk=sys.modules['pyrealsense2']
     sdk.stream.gyro,sdk.stream.accel='gyro','accel'
@@ -80,7 +80,7 @@ def test_shared_bumi_callback_publishes_motion_while_rgbd_failure_keeps_video(ca
     assert packet['stamp_ns']==1_000_000_000+offset
     assert packet['clock_mapping']['offset_ns']==offset
     assert packet['clock_mapping']['verified'] is False
-    assert len(state.published['/robot/camera/color'])==1
+    assert not state.published.get('/robot/camera/color')
     assert not state.published.get('/robot/camera/depth')
     assert state.rgbd_error=='RGB-D test failure' and state.stopped
 
