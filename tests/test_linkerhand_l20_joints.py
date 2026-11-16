@@ -371,6 +371,8 @@ def test_topic_selects_the_model_side_and_falls_back_to_both_hands():
     assert side_from_topic("/nvidia_desktop/hand/right/joints_ab12_skeleton") == "right"
     assert side_from_topic("/nvidia_desktop/hand/both/left_can_x/right_can_y/joints_skeleton") is None
     assert side_from_topic("") is None and side_from_topic(None) is None
+    assert side_from_topic({"topic": "/hand/left/x"}) is None
+    assert ET.fromstring(model({"topic": "/hand/left/x"})["urdf"]).get("name") == "linkerhand_l20_dual_skeleton"
     assert ET.fromstring(model("/x/hand/left/y")["urdf"]).get("name") == "linkerhand_l20_left_skeleton"
     assert ET.fromstring(model("/x/hand/right/y")["urdf"]).get("name") == "linkerhand_l20_right_skeleton"
     assert ET.fromstring(model("/x/hand/both/y")["urdf"]).get("name") == "linkerhand_l20_dual_skeleton"
@@ -511,6 +513,19 @@ def test_real_client_sends_only_position_queries(bus_type):
     assert result["valid"] is True
     assert (raw["thumb_pitch"], raw["thumb_yaw"], raw["thumb_roll"], raw["thumb_tip"]) == (10, 60, 110, 120)
     assert (raw["pinky_pitch"], raw["pinky_yaw"], raw["pinky_tip"]) == (50, 100, 160)
+
+
+def test_default_client_still_requests_device_metadata():
+    """Only the read-only joints path opts out; the hand card's clients keep UID/version."""
+    bus = MockCanBus(can_id=0x27)
+    client = L20CanClient("can0", "right", can_id=0x27, recv_timeout_s=0.05,
+                          bus_factory=lambda *_: bus)
+    try:
+        time.sleep(0.02)
+    finally:
+        client.close()
+    sent = [list(m.data) for m in bus.sent_messages]
+    assert [0xC0, 0] in sent and [0xC1, 0] in sent and [0xC2, 0] in sent
 
 
 def test_joints_never_requests_device_metadata(monkeypatch):

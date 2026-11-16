@@ -640,7 +640,8 @@ class JointsPlugin:
         controller's own client (its position-query lock is shared with the
         actuator), so a second client never reads the same replies.
         """
-        ctrl = GLOBAL_CONTROLLERS.get((side, channel))
+        with GLOBAL_BUS_LOCK:
+            ctrl = GLOBAL_CONTROLLERS.get((side, channel))
         if ctrl is None:
             return False
         try:

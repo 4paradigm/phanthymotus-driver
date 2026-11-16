@@ -267,7 +267,9 @@ _SIDE_IN_TOPIC = re.compile(r"/hand/(left|right)(?:/|$)")
 
 def side_from_topic(topic: str | None) -> str | None:
     """Hand side named by a joints topic, or None when the topic carries none."""
-    match = _SIDE_IN_TOPIC.search(topic or "")
+    if not isinstance(topic, str):
+        return None
+    match = _SIDE_IN_TOPIC.search(topic)
     return match.group(1) if match else None
 
 
