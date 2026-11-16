@@ -1,4 +1,12 @@
-"""L20-10 joint feedback: calibrated angles and the dual-hand skeleton model.
+"""L20-10 joint feedback: calibrated angles and the skeleton model.
+
+One driver serves one model per request. A panel asks for the model with its
+own topic, so the card's hand can be drawn alone; without a topic the old
+dual-hand URDF is kept as a fallback for callers that cannot send one.
+
+Hand joints are named `{side}_hand_...` (links keep `{side}_...`): Core's
+renderer picks hand styling from the joint name containing "hand", so this is
+what makes every finger use the thin bone and small joint sphere.
 
 Raw 0..255 positions are measured. Angles come from the vendor's per-joint
 calibration tables for the L20-10 (files named g20, resource/g20_*_G20.json),
@@ -10,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import xml.etree.ElementTree as ET
 from functools import lru_cache
 from pathlib import Path
@@ -19,7 +28,7 @@ from can_client import CHINESE_JOINT_NAMES_16, JOINT_NAMES_16
 MODEL_DIR = Path(__file__).with_name("resource")
 MODEL_FILES = {"left": "linkerhand_g20_left.urdf", "right": "linkerhand_g20_right.urdf"}
 CALIBRATION_FILES = {"left": "g20_left_G20.json", "right": "g20_right_G20.json"}
-# Core fetches one model per driver, so both hands share one URDF side by side.
+# Fallback URDF (no topic): both hands side by side, as before.
 ANCHOR_X = {"left": -0.45, "right": 0.45}
 # Both vendor hands have the palm towards +x, so a plain shift shows them facing
 # the same way. Turning each hand -90 deg about z puts both palms towards Core's
@@ -155,7 +164,7 @@ def skeleton_joints(side: str, raw: dict[str, int]) -> list[dict]:
             source, label = "measured", JOINT_LABELS[driver_name]
         q = min(joint["upper"], max(joint["lower"], value))
         entries.append({
-            "idx": offset + index, "name": f"{side}_{name}", "q": q, "q_deg": math.degrees(q),
+            "idx": offset + index, "name": f"{side}_hand_{name}", "q": q, "q_deg": math.degrees(q),
             "group": SIDE_LABELS[side], "label": label, "source": source,
             "clamped_to_model": q != value,
         })
@@ -185,7 +194,8 @@ def _single_axis_origins(xyz: list[float], rpy: list[float]) -> list[tuple[list[
 
 def _side_elements(side: str) -> list[ET.Element]:
     source = _vendor_root(side)
-    prefix = f"{side}_"
+    prefix = f"{side}_"          # links
+    joint_prefix = f"{side}_hand_"  # joints: Core reads "hand" for hand styling
     elements: list[ET.Element] = []
     for link in source.findall("link"):
         # Kinematics only: the renderer draws joint connectors, not meshes.
@@ -200,14 +210,14 @@ def _side_elements(side: str) -> list[ET.Element]:
         for step, (step_xyz, step_rpy) in enumerate(steps[:-1]):
             helper = f"{prefix}{name}_rpy{step}"
             elements.append(ET.Element("link", {"name": helper}))
-            fixed = ET.Element("joint", {"name": helper + "_fixed", "type": "fixed"})
+            fixed = ET.Element("joint", {"name": f"{joint_prefix}{name}_rpy{step}_fixed", "type": "fixed"})
             ET.SubElement(fixed, "origin", {"xyz": _fmt(step_xyz), "rpy": _fmt(step_rpy)})
             ET.SubElement(fixed, "parent", {"link": parent})
             ET.SubElement(fixed, "child", {"link": helper})
             elements.append(fixed)
             parent = helper
         step_xyz, step_rpy = steps[-1]
-        copy = ET.Element("joint", {"name": prefix + name, "type": joint.get("type")})
+        copy = ET.Element("joint", {"name": joint_prefix + name, "type": joint.get("type")})
         ET.SubElement(copy, "origin", {"xyz": _fmt(step_xyz), "rpy": _fmt(step_rpy)})
         ET.SubElement(copy, "parent", {"link": parent})
         ET.SubElement(copy, "child", {"link": prefix + joint.find("child").get("link")})
@@ -216,12 +226,12 @@ def _side_elements(side: str) -> list[ET.Element]:
                 ET.SubElement(copy, tag, dict(joint.find(tag).attrib))
         mimic = joint.find("mimic")
         if mimic is not None:
-            ET.SubElement(copy, "mimic", {**mimic.attrib, "joint": prefix + mimic.get("joint")})
+            ET.SubElement(copy, "mimic", {**mimic.attrib, "joint": joint_prefix + mimic.get("joint")})
         elements.append(copy)
     for finger, (distal, xyz) in FINGERTIPS.items():
         tip = f"{prefix}{finger}_tip"
         elements.append(ET.Element("link", {"name": tip}))
-        fixed = ET.Element("joint", {"name": tip + "_fixed", "type": "fixed"})
+        fixed = ET.Element("joint", {"name": f"{joint_prefix}{finger}_tip_fixed", "type": "fixed"})
         ET.SubElement(fixed, "origin", {"xyz": _fmt(v * DISPLAY_SCALE for v in xyz), "rpy": "0 0 0"})
         ET.SubElement(fixed, "parent", {"link": prefix + distal})
         ET.SubElement(fixed, "child", {"link": tip})
@@ -250,5 +260,35 @@ def dual_urdf() -> str:
     return ET.tostring(robot, encoding="unicode")
 
 
-def model() -> dict:
-    return {"urdf": dual_urdf()}
+# A skeleton panel's topic carries the hand side it belongs to, e.g.
+# /nvidia_desktop/hand/left/joints_ab12cd34_skeleton.
+_SIDE_IN_TOPIC = re.compile(r"/hand/(left|right)(?:/|$)")
+
+
+def side_from_topic(topic: str | None) -> str | None:
+    """Hand side named by a joints topic, or None when the topic carries none."""
+    match = _SIDE_IN_TOPIC.search(topic or "")
+    return match.group(1) if match else None
+
+
+@lru_cache(maxsize=None)
+def single_urdf(side: str) -> str:
+    """One hand only, centered where Core's fixed camera looks.
+
+    Joint names keep the `{side}_` prefix, so skeleton frames (which use the
+    same prefixed names) still address them.
+    """
+    robot = ET.Element("robot", {"name": f"linkerhand_l20_{side}_skeleton"})
+    ET.SubElement(robot, "link", {"name": f"{side}_base"})
+    robot.extend(_side_elements(side))
+    anchor = ET.SubElement(robot, "joint", {"name": f"{side}_anchor", "type": "fixed"})
+    ET.SubElement(anchor, "origin", {"xyz": _fmt([0.0, 0.0, 0.0]), "rpy": _fmt([0.0, 0.0, ANCHOR_YAW[side]])})
+    ET.SubElement(anchor, "parent", {"link": f"{side}_base"})
+    ET.SubElement(anchor, "child", {"link": f"{side}_{_root_link(_vendor_root(side))}"})
+    return ET.tostring(robot, encoding="unicode")
+
+
+def model(topic: str | None = None) -> dict:
+    """Single-hand URDF for the topic's side; dual-hand fallback without one."""
+    side = side_from_topic(topic)
+    return {"urdf": single_urdf(side) if side else dual_urdf()}

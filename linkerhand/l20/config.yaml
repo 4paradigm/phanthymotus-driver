@@ -109,9 +109,9 @@ plugins:
 
   joints:
     enabled: true
-    # Target rate; each round is one fresh five-frame position query, so the
-    # actual rate is reported as measured_hz and can be lower.
-    poll_hz: 10.0
+    # The rate is fixed at 30 Hz in code (no user setting). Each round is one
+    # fresh five-frame position query; measured_hz reports what was achieved.
+    # The CAN interface is matched automatically; there is no interface setting.
     # Wait for all five position replies; a missing reply makes the round invalid.
     query_timeout_s: 0.2
     # info/get_state treat a cached round older than this as not current.

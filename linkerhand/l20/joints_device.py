@@ -1,16 +1,22 @@
 """LinkerHand L20 joint feedback card (joints).
 
-One fresh position query per round feeds two outputs for the same sample:
-  /{namespace}/hand/{side}/joints           data/json        (every round, valid or not)
-  /{namespace}/hand/{side}/joints_skeleton  sensor/skeleton  (valid rounds only)
+One card reads one hand. Every round is one fresh five-frame position query that
+feeds two outputs with the same sequence:
 
-A card in both-hands mode (bound_side=both) owns one worker per hand, each on
-its own CAN interface. Both workers also publish their skeleton frames to one
-shared topic, so Core draws the two hands in a single view:
-  /{namespace}/hand/both[/left_can_<hex>][/right_can_<hex>]/joints_skeleton
+  /{namespace}/hand/{side}/joints_{card}           data/json        (every round)
+  /{namespace}/hand/{side}/joints_{card}_skeleton  sensor/skeleton  (valid rounds only)
+
+Each card has its own topic suffix (the card's instance id), so two cards on the
+same driver never share an output. The CAN interface is matched automatically:
+the card claims a free hand of its side among the hands that answer on the local
+socketcan interfaces. When no free hand exists the card keeps running in the
+`waiting` state: it publishes an invalid JSON frame once per second, publishes no
+skeleton frame, and re-probes every couple of seconds so a hand plugged in later
+is picked up.
 
 The card only sends position-query frames: no motion, torque, calibration or
-fault clearing. The dual-hand URDF is served by the `model` resource tool.
+fault clearing. The `model` tool serves a single-hand URDF to a panel that asks
+with its topic; without a topic it serves the legacy dual-hand URDF.
 """
 
 from __future__ import annotations
@@ -24,16 +30,31 @@ import re
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from common.vendor_runtime import action_schema, tool
-from can_client import JOINT_NAMES_16, LEFT_HAND_CAN_ID, RIGHT_HAND_CAN_ID
-from hand_device import GLOBAL_BUS_LOCK, GLOBAL_CONTROLLERS, get_shared_controller
-from joints_model import (ANGLE_SOURCE, JOINT_LABELS, RESERVED_VECTOR_INDEXES, URDF_JOINT,
+from can_client import JOINT_NAMES_16, L20CanClient, LEFT_HAND_CAN_ID, RIGHT_HAND_CAN_ID
+from hand_device import (GLOBAL_BUS_LOCK, GLOBAL_CONTROLLERS, _discover_can_channels,
+                         get_shared_controller)
+from joints_model import (ANGLE_SOURCE, JOINT_LABELS, RESERVED_VECTOR_INDEXES, SIDE_LABELS, URDF_JOINT,
                           VECTOR_INDEX, model, raw_to_angle, skeleton_joints)
 
 
 logger = logging.getLogger("linkerhand.joints")
+
+# Fixed acquisition rate: the card exposes no rate setting.
+POLL_HZ = 30.0
+# A card without a free hand keeps its JSON output alive at this rate.
+WAITING_PUBLISH_INTERVAL_S = 1.0
+# How often a waiting card looks for a hand that appeared since the last look.
+MATCH_RETRY_INTERVAL_S = 2.0
+# One probe query waits this long for the hand's position replies.
+PROBE_TIMEOUT_S = 0.12
+# Results of probes are reused this long, so several waiting cards starting at
+# once do not send the same query burst.
+PROBE_CACHE_S = 1.5
+PRESENT_TTL_S = 3.0
 
 
 def _number(value, name, lower, upper):
@@ -42,18 +63,53 @@ def _number(value, name, lower, upper):
     return float(value)
 
 
-def _valid_channel(channel) -> bool:
-    return isinstance(channel, str) and re.fullmatch(r"[A-Za-z0-9_.:-]+", channel) is not None
+def _slug(instance_id: str) -> str:
+    """Topic suffix for one card instance; stable across restarts."""
+    return re.sub(r"[^0-9a-z]", "", str(instance_id).lower())[:16] or "card"
+
+
+def _blank_sample(side: str, channel: str | None, sequence: int, state: str, reason: str,
+                  can_id: str | None) -> dict[str, Any]:
+    return {
+        "state": state, "valid": False,
+        "reason": reason,
+        "error_details": None,
+        "side": side, "bound_side": side, "can_channel": channel,
+        "can_id": can_id,
+        "sequence": sequence,
+        # No new measurement happened, so no measurement time and no rate.
+        "timestamp": None,
+        "published_at": time.time(),
+        "source": "can_position_query",
+        "query_elapsed_s": None,
+        "measured_hz": None,
+        "joint_count": len(JOINT_NAMES_16),
+        "raw_unit": "protocol 0-255",
+        "angle_unit": "rad",
+        "angle_source": ANGLE_SOURCE,
+        "reserved_vector_indexes": list(RESERVED_VECTOR_INDEXES),
+        "joints": [{
+            "name": name, "label": JOINT_LABELS[name], "vector_index": VECTOR_INDEX[name],
+            "model_joint": f"{side}_hand_{URDF_JOINT[name]}",
+            "raw": None, "angle_rad": None, "angle_deg": None,
+        } for name in JOINT_NAMES_16],
+    }
 
 
 class _JointsStream:
-    """Background acquisition and publishing for one physical hand."""
+    """Background acquisition and publishing for one card (one physical hand).
 
-    def __init__(self, plugin: "JointsPlugin", side: str, channel: str):
+    `channel` is None while the card waits for a free hand. The same worker then
+    publishes invalid frames periodically and asks the plugin for a hand; when
+    one is claimed it continues at the fixed rate without being recreated.
+    """
+
+    def __init__(self, plugin: "JointsPlugin", instance_id: str, side: str, channel: str | None):
         self.plugin = plugin
+        self.instance_id = instance_id
         self.side = side
         self.channel = channel
-        self.json_topic, self.skeleton_topic = plugin.topics(side, channel)
+        self.json_topic, self.skeleton_topic = plugin.topics(side, instance_id)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -61,14 +117,11 @@ class _JointsStream:
         self._json_pub = None
         self._skeleton_pub = None
         self._qos = None
-        # Shared both-hands skeleton topics wanted by owning cards -> publishers.
-        self.dual_topics: set[str] = set()
-        self._dual_pubs: dict[str, Any] = {}
-        self._pub_lock = threading.Lock()
         self._last_publisher_attempt = 0.0
         self._success_times: collections.deque[float] = collections.deque(maxlen=20)
         self.sequence = 0
         self.latest: dict[str, Any] = {}
+        self.waiting_reason = ""
         self.published_json = 0
         self.published_skeleton = 0
         self.last_publish_time = None
@@ -78,6 +131,7 @@ class _JointsStream:
 
     def read(self) -> dict[str, Any]:
         """One fresh position query, converted into the data/json payload."""
+        assert self.channel is not None
         plugin = self.plugin
         started = time.monotonic()
         raw20 = None
@@ -108,7 +162,7 @@ class _JointsStream:
             angle = raw_to_angle(self.side, name, raw) if raw is not None else None
             joints.append({
                 "name": name, "label": JOINT_LABELS[name], "vector_index": VECTOR_INDEX[name],
-                "model_joint": f"{self.side}_{URDF_JOINT[name]}",
+                "model_joint": f"{self.side}_hand_{URDF_JOINT[name]}",
                 "raw": raw, "angle_rad": angle,
                 "angle_deg": math.degrees(angle) if angle is not None else None,
             })
@@ -170,13 +224,12 @@ class _JointsStream:
                 depth=1,
                 durability=DurabilityPolicy.VOLATILE,
             )
-            node = Node(f"hand_joints_{self.side}_{uuid.uuid4().hex[:8]}", context=ros2.ctx_core)
+            node = Node(f"hand_joints_{self.side}_{_slug(self.instance_id)}_{uuid.uuid4().hex[:8]}",
+                        context=ros2.ctx_core)
             json_pub = node.create_publisher(String, self.json_topic, qos)
             skeleton_pub = node.create_publisher(String, self.skeleton_topic, qos)
             ros2.executor_core.add_node(node)
-            with self._pub_lock:
-                self._node, self._json_pub, self._skeleton_pub, self._qos = node, json_pub, skeleton_pub, qos
-                self._sync_dual_publishers()
+            self._node, self._json_pub, self._skeleton_pub, self._qos = node, json_pub, skeleton_pub, qos
             self.publish_error = None
             print(f"[joints] ROS2 publishers ready: {self.json_topic}, {self.skeleton_topic}", flush=True)
             return True
@@ -191,32 +244,9 @@ class _JointsStream:
             logger.warning("Failed to setup ROS2 joints publishers: %s", exc)
             return False
 
-    def set_dual_topics(self, topics: set[str]) -> None:
-        with self._pub_lock:
-            self.dual_topics = set(topics)
-            self._sync_dual_publishers()
-
-    def _sync_dual_publishers(self) -> None:
-        """Called with _pub_lock held; publishers follow dual_topics."""
-        for topic in list(self._dual_pubs):
-            if topic not in self.dual_topics:
-                pub = self._dual_pubs.pop(topic)
-                try:
-                    self._node.destroy_publisher(pub)
-                except Exception:
-                    pass
-        if self._node is None:
-            return
-        from std_msgs.msg import String
-        for topic in sorted(self.dual_topics - set(self._dual_pubs)):
-            self._dual_pubs[topic] = self._node.create_publisher(String, topic, self._qos)
-            print(f"[joints] ROS2 both-hands skeleton publisher ready: {topic}", flush=True)
-
     def _teardown_publishers(self) -> None:
-        with self._pub_lock:
-            node, self._node = self._node, None
-            self._json_pub = self._skeleton_pub = None
-            self._dual_pubs.clear()
+        node, self._node = self._node, None
+        self._json_pub = self._skeleton_pub = None
         ros2 = self.plugin._ros2
         if node is None or ros2 is None:
             return
@@ -234,8 +264,8 @@ class _JointsStream:
 
     def subscriber_count(self) -> int:
         try:
-            pubs = (self._json_pub, self._skeleton_pub, *self._dual_pubs.values())
-            return sum(pub.get_subscription_count() for pub in pubs if pub is not None)
+            return sum(pub.get_subscription_count()
+                       for pub in (self._json_pub, self._skeleton_pub) if pub is not None)
         except Exception:
             return 0
 
@@ -243,6 +273,10 @@ class _JointsStream:
 
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def set_channel(self, channel: str) -> None:
+        with self._lock:
+            self.channel = channel
 
     def start(self) -> None:
         if self.running():
@@ -254,7 +288,7 @@ class _JointsStream:
         self._stop_event.clear()
         self._setup_publishers()
         self._thread = threading.Thread(target=self._loop, daemon=True,
-                                        name=f"joints_{self.side}_{self.channel}")
+                                        name=f"joints_{self.side}_{_slug(self.instance_id)}")
         try:
             self._thread.start()
         except Exception:
@@ -284,43 +318,23 @@ class _JointsStream:
         with self._lock:
             self.sequence += 1
             sequence = self.sequence
-        return self.blank_sample("idle", "关节采集已停止；本帧不含实测值", sequence)
+        return _blank_sample(self.side, self.channel, sequence, "idle",
+                             "关节采集已停止；本帧不含实测值", self._can_id())
 
     def waiting_sample(self) -> dict[str, Any]:
-        """Complete invalid sample for a running stream whose first round has not ended."""
+        """Invalid frame for a running card that has not claimed a hand yet."""
         with self._lock:
+            self.sequence += 1
             sequence = self.sequence
-        return self.blank_sample("waiting", "关节采集已启动，第一轮位置查询尚未完成", sequence)
+        reason = self.waiting_reason or self.plugin._match_reason(self.side)
+        return _blank_sample(self.side, self.channel, sequence, "waiting", reason, self._can_id())
 
-    def blank_sample(self, state: str, reason: str, sequence: int) -> dict[str, Any]:
-        return {
-            "state": state, "valid": False,
-            "reason": reason,
-            "error_details": None,
-            "side": self.side, "bound_side": self.side, "can_channel": self.channel,
-            "can_id": hex(self.plugin.can_id(self.side)),
-            "sequence": sequence,
-            # No new measurement happened, so no measurement time and no rate.
-            "timestamp": None,
-            "published_at": time.time(),
-            "source": "can_position_query",
-            "query_elapsed_s": None,
-            "measured_hz": None,
-            "joint_count": len(JOINT_NAMES_16),
-            "raw_unit": "protocol 0-255",
-            "angle_unit": "rad",
-            "angle_source": ANGLE_SOURCE,
-            "reserved_vector_indexes": list(RESERVED_VECTOR_INDEXES),
-            "joints": [{
-                "name": name, "label": JOINT_LABELS[name], "vector_index": VECTOR_INDEX[name],
-                "model_joint": f"{self.side}_{URDF_JOINT[name]}",
-                "raw": None, "angle_rad": None, "angle_deg": None,
-            } for name in JOINT_NAMES_16],
-        }
+    def _can_id(self) -> str:
+        return hex(self.plugin.can_id(self.side))
 
     def _publish_stopped(self) -> None:
-        # Invalid, so _publish sends no skeleton frame and no shared both-hands
-        # frame: the renderer would otherwise keep drawing an old pose as live.
+        # Invalid, so _publish sends no skeleton frame: the renderer would
+        # otherwise keep drawing an old pose as live.
         if self._json_pub is None:
             return
         try:
@@ -344,18 +358,38 @@ class _JointsStream:
             msg.data = json.dumps(self.skeleton(sample), ensure_ascii=False, allow_nan=False)
             self._skeleton_pub.publish(msg)
             self.published_skeleton += 1
-            with self._pub_lock:
-                # Frames carry only this hand's joints; the renderer keeps the
-                # other hand's last pose from its own worker's frames.
-                for pub in self._dual_pubs.values():
-                    pub.publish(msg)
         self.last_publish_time = time.time()
         self.publish_error = None
 
     def _loop(self) -> None:
         consecutive_errors = 0
+        next_wait_publish = 0.0
+        next_match = 0.0
         while not self._stop_event.is_set():
             loop_start = time.monotonic()
+            if self.channel is None:
+                # Waiting for a free hand: keep the JSON output alive and look
+                # for a hand that appeared since the last look.
+                now = time.monotonic()
+                if now >= next_match:
+                    next_match = now + MATCH_RETRY_INTERVAL_S
+                    target = self.plugin._match(self.instance_id, self.side)
+                    if target is not None:
+                        self.set_channel(target[1])
+                        continue
+                    self.waiting_reason = self.plugin._match_reason(self.side)
+                if self._json_pub is None and now - self._last_publisher_attempt >= 2.0:
+                    self._setup_publishers()
+                if self._json_pub is not None and now >= next_wait_publish:
+                    next_wait_publish = now + WAITING_PUBLISH_INTERVAL_S
+                    try:
+                        self._publish(self.waiting_sample())
+                    except Exception as exc:
+                        self.publish_error = str(exc)
+                        logger.warning("Joints waiting frame failed: %s", exc)
+                        self._teardown_publishers()
+                self._stop_event.wait(0.05)
+                continue
             # Sequential rounds: the next query starts only after this one ends.
             sample = self.read()
             with self._lock:
@@ -379,7 +413,7 @@ class _JointsStream:
                     logger.warning("Joints publish failed: %s", exc)
                     self._teardown_publishers()
             elapsed = time.monotonic() - loop_start
-            self._stop_event.wait(timeout=max(0.002, 1.0 / self.plugin.poll_hz - elapsed))
+            self._stop_event.wait(timeout=max(0.002, 1.0 / POLL_HZ - elapsed))
 
 
 class JointsPlugin:
@@ -403,70 +437,53 @@ class JointsPlugin:
         self.namespace = (namespace or "").strip("/")
 
         self.default_side = str(self.global_config.get("side", "left"))
-        self.default_channel = str(self.global_config.get("can_channel", "can0"))
         if self.default_side not in ("left", "right"):
             raise ValueError("side 必须是 left 或 right")
-        if not _valid_channel(self.default_channel):
-            raise ValueError("can_channel 必须是有效的 CAN 接口名称")
         self.left_can_id = int(self.global_config.get("left_can_id", LEFT_HAND_CAN_ID))
         self.right_can_id = int(self.global_config.get("right_can_id", RIGHT_HAND_CAN_ID))
+        self.baudrate = int(self.global_config.get("baudrate", 1_000_000))
 
-        self.poll_hz = _number(self.config.get("poll_hz", 10.0), "poll_hz", 1, 30)
         self.query_timeout_s = _number(self.config.get("query_timeout_s", 0.2), "query_timeout_s", 0.02, 2)
         self.stale_after_s = _number(self.config.get("stale_after_s", 1.0), "stale_after_s", 0.05, 30)
 
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
-        self._bindings: dict[str, str] = {}
-        self._channels: dict[str, str] = {}
-        self._hand_channels: dict[str, dict[str, str]] = {}  # both mode: instance -> side -> channel
-        # instance -> (owned (side, channel) targets, shared both-hands skeleton topic or None)
-        self._owners: dict[str, tuple[tuple[tuple[str, str], ...], str | None]] = {}
-        self._streams: dict[tuple[str, str], _JointsStream] = {}
-        # instance -> targets it gave up whose worker has not stopped yet; its next stop retries them
-        self._leftovers: dict[str, set[tuple[str, str]]] = {}
+        self._bindings: dict[str, str | None] = {}
+        # instance -> the (side, channel) hand it owns; released only when its
+        # worker actually stopped, so a stuck worker keeps its hand.
+        self._claims: dict[str, tuple[str, str]] = {}
+        self._streams: dict[str, _JointsStream] = {}
+        # instance -> claim whose worker did not stop; its next stop retries it.
+        self._leftovers: dict[str, tuple[str, str] | None] = {}
         self._used_targets: set[tuple[str, str]] = set()
+        self._probe_cache: dict[tuple[str, str], float] = {}
+        self._present_cache: dict[tuple[str, str], float] = {}
 
     # ── topics & definitions ──────────────────────────────────────────
 
     def can_id(self, side: str) -> int:
         return self.right_can_id if side == "right" else self.left_can_id
 
-    def _adapter(self, channel: str) -> str:
-        # Same adapter suffix rule as hand_tactile: can0 paths stay short.
-        return "" if channel == self.default_channel else "_can_" + channel.encode().hex()
-
-    def topics(self, side: str, channel: str) -> tuple[str, str]:
-        adapter = self._adapter(channel).replace("_can_", "/can_", 1)
-        base = f"/{self.namespace}/hand/{side}{adapter}/joints".replace("//", "/")
+    def topics(self, side: str, instance_id: str) -> tuple[str, str]:
+        base = f"/{self.namespace}/hand/{side}/joints_{_slug(instance_id)}".replace("//", "/")
         return base, base + "_skeleton"
 
-    def dual_topic(self, left_channel: str, right_channel: str) -> str:
-        suffix = "".join(f"/{side}{self._adapter(channel)}" for side, channel in
-                         (("left", left_channel), ("right", right_channel)) if self._adapter(channel))
-        return f"/{self.namespace}/hand/both{suffix}/joints_skeleton".replace("//", "/")
-
-    def topic_out(self, side: str | None = None, channel: str | None = None,
-                  targets: tuple[tuple[str, str], ...] | None = None) -> list[dict]:
-        side = side or self.default_side
-        if side == "both":
-            (_, left_channel), (_, right_channel) = targets
-            # Each hand keeps its own JSON; one shared skeleton draws both hands.
-            return [{"topic": self.topics(s, c)[0], "format": "data/json"} for s, c in targets] + \
-                [{"topic": self.dual_topic(left_channel, right_channel), "format": "sensor/skeleton"}]
-        json_topic, skeleton_topic = self.topics(side, channel or self.default_channel)
-        # data/json first: Core's detail view opens the first output, and its
-        # skeleton view cannot load a driver model yet.
+    def topic_out(self, instance_id: str, side: str | None = None) -> list[dict]:
+        side = side or self._bindings.get(instance_id)
+        if side not in ("left", "right"):
+            return []
+        json_topic, skeleton_topic = self.topics(side, instance_id)
+        # data/json first: Core's detail view opens the first output.
         return [{"topic": json_topic, "format": "data/json"},
                 {"topic": skeleton_topic, "format": "sensor/skeleton"}]
 
     def get_tools(self) -> list[dict]:
         schema = action_schema(
             {
-                "info": ([], "获取关节卡片信息、当前绑定、实测刷新率及 topic_out"),
+                "info": ([], "获取关节卡片信息、当前绑定的手、实测刷新率及 topic_out"),
                 "start": ([], "启动关节位置后台连续采集，同时输出 JSON 与骨架"),
                 "stop": ([], "停止本卡片的关节数据流"),
-                "config": ([], "按提供的字段更新实例左右手／CAN 接口或共享采集频率"),
+                "config": ([], "按提供的字段更新实例选择的左右手"),
             },
             {},
         )
@@ -475,7 +492,9 @@ class JointsPlugin:
             "sensor",
             "LinkerHand L20 16 主动关节实测位置流：原始值、按厂家 L20-10 标定表换算的角度与实时骨架",
             schema,
-            topic_out=self.topic_out(),
+            # Per-instance topics depend on the instance id, so the card asks
+            # the driver (info) instead of using a static default.
+            topic_out=[],
         )
         definition["title"] = "L20 关节状态"
         definition["multiInstance"] = True
@@ -484,37 +503,11 @@ class JointsPlugin:
             "properties": {
                 "bound_side": {
                     "type": "string",
-                    "enum": ["left", "right", "both"],
+                    "enum": ["left", "right"],
                     "default": self.default_side,
                     "scope": "instance",
-                    "title": "采集左右手",
-                    "description": "left／right 只读一只手；both 为双手模式，一张卡片同时读两只手，骨架画在同一个窗口。",
-                },
-                "can_channel": {
-                    "type": "string",
-                    "default": self.default_channel,
-                    "scope": "instance",
-                    "title": "高级：CAN 接口",
-                    "description": "与控制卡片使用同一个接口，例如 can0 或 can1。不是 CAN ID。双手模式下是两只手的默认接口。",
-                },
-                "left_can_channel": {
-                    "type": "string",
-                    "scope": "instance",
-                    "title": "双手模式：左手 CAN 接口",
-                    "description": "仅双手模式使用；留空则沿用上面的 CAN 接口。",
-                },
-                "right_can_channel": {
-                    "type": "string",
-                    "scope": "instance",
-                    "title": "双手模式：右手 CAN 接口",
-                    "description": "仅双手模式使用；留空则沿用上面的 CAN 接口。",
-                },
-                "poll_hz": {
-                    "type": "number",
-                    "default": self.poll_hz,
-                    "minimum": 1.0,
-                    "maximum": 30.0,
-                    "title": "目标采集频率（共享，实测值见 measured_hz）",
+                    "title": "选择左手或右手",
+                    "description": "一张卡片读一只手；CAN 接口自动匹配，不需要手选。",
                 },
             },
         }
@@ -522,8 +515,16 @@ class JointsPlugin:
             "name": self.MODEL_TOOL,
             "type": "resource",
             "multiInstance": False,
-            "description": "LinkerHand L20 左右手运动学 URDF（厂家模型，供骨架显示）",
-            "inputSchema": {"type": "object", "properties": {}},
+            "description": "LinkerHand L20 单手运动学 URDF（厂家模型，供骨架显示）；带 topic 时按话题里的手侧返回",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "骨架面板所属话题；驱动按 /hand/left|right/ 选择单手模型，缺省返回双手模型。",
+                    },
+                },
+            },
         }
         return [definition, model_tool]
 
@@ -535,30 +536,24 @@ class JointsPlugin:
 
     def stop(self) -> None:
         with self._lifecycle_lock:
-            stuck = set()
-            for target, stream in list(self._streams.items()):
+            stuck = []
+            for instance_id, stream in list(self._streams.items()):
+                target = self._claims.get(instance_id)
                 try:
                     stream.stop()
                 except Exception as exc:
-                    stuck.add(target)
-                    logger.warning("Joints stream %s/%s did not stop: %s", stream.side, stream.channel, exc)
-                else:
-                    self._streams.pop(target, None)
-            # A worker still blocked in a query stays with the cards that read
-            # it, so a card's stop or a second driver stop can still end it;
-            # its CAN client stays open (_close_if_unused skips live streams).
-            for instance_id, (targets, _) in list(self._owners.items()):
-                del self._owners[instance_id]
-                if stuck.intersection(targets):
-                    self._leftovers.setdefault(instance_id, set()).update(stuck.intersection(targets))
-            for instance_id in list(self._leftovers):
-                self._leftovers[instance_id] &= stuck
-                if not self._leftovers[instance_id]:
-                    del self._leftovers[instance_id]
-            self._sync_dual_topics()
+                    stuck.append(instance_id)
+                    self._leftovers[instance_id] = target
+                    logger.warning("Joints stream %s did not stop: %s", instance_id, exc)
+                    continue
+                self._streams.pop(instance_id, None)
+                self._claims.pop(instance_id, None)
+                self._leftovers.pop(instance_id, None)
+                if target is not None:
+                    self._close_if_unused(target)
             self._close_unshared_controllers()
             if stuck:
-                raise RuntimeError(f"关节采集未能停止：{self._describe(sorted(stuck))}；保留线程，可再次停止")
+                raise RuntimeError(f"关节采集未能停止：{', '.join(sorted(stuck))}；保留线程，可再次停止")
 
     def _close_unshared_controllers(self) -> None:
         """Close CAN clients opened only for this card; others belong to the hand card."""
@@ -573,7 +568,10 @@ class JointsPlugin:
         that lock means no other card is holding the client being closed, and a
         later get() simply reopens it.
         """
-        if target not in self._used_targets or target in self._streams:
+        if any(stream.channel is not None and (stream.side, stream.channel) == target
+               for stream in self._streams.values()):
+            return
+        if target not in self._used_targets:
             return
         hand_lock = getattr(self.hand, "_lock", None) or contextlib.nullcontext()
         with hand_lock, GLOBAL_BUS_LOCK:
@@ -592,131 +590,155 @@ class JointsPlugin:
         self._used_targets.add((side, channel))
         return ctrl
 
-    # ── instance ownership ────────────────────────────────────────────
+    # ── CAN matching ──────────────────────────────────────────────────
 
-    def _resolve_target(self, args: dict) -> tuple[str, str, tuple[tuple[str, str], ...]]:
-        """(bound_side, can_channel, owned targets); both mode owns one target per hand."""
-        instance_id = str(args.get("instance_id", ""))
-        with self._lock:
-            side = args.get("bound_side") or self._bindings.get(instance_id) or self.default_side
-            channel = args.get("can_channel") or self._channels.get(instance_id) or self.default_channel
-            stored = self._hand_channels.get(instance_id, {})
-            # A per-hand field sent empty falls back to can_channel, not to an older value.
-            hand_channels = {hand: (args[f"{hand}_can_channel"] if f"{hand}_can_channel" in args
-                                    else stored.get(hand)) or channel for hand in ("left", "right")}
-        if side not in ("left", "right", "both"):
-            raise ValueError("bound_side 必须是 left、right 或 both")
-        for value in (channel, *hand_channels.values()):
-            if not _valid_channel(value):
-                raise ValueError("can_channel 必须是有效的 CAN 接口名称")
-        if side == "both":
-            return side, channel, (("left", hand_channels["left"]), ("right", hand_channels["right"]))
-        return side, channel, ((side, channel),)
+    def _channels(self) -> list[str]:
+        return _discover_can_channels()
 
     @staticmethod
-    def _describe(targets) -> str:
-        return " + ".join(f"{side}/{channel}" for side, channel in targets)
+    def _channel_usable(channel: str) -> bool:
+        """Skip an adapter that reports no bus (a CAN transceiver with nothing on it).
 
-    def _select(self, instance_id: str, side: str, channel: str, targets: tuple[tuple[str, str], ...]) -> None:
-        """One worker per physical hand; cards on the same hand share it."""
-        with self._lifecycle_lock:
-            dual = self.dual_topic(targets[0][1], targets[1][1]) if side == "both" else None
-            owner = (targets, dual)
-            current = self._owners.get(instance_id)
-            if not instance_id and current is not None and current != owner:
-                raise ValueError(
-                    f"默认关节流为单实例（当前已绑定 {self._describe(current[0])}）；"
-                    f"启动或切换不同目标 ({self._describe(targets)}) 必须指定非空 instance_id"
-                )
-            created = []
-            try:
-                for target in targets:
-                    stream = self._streams.get(target)
-                    if stream is None:
-                        stream = _JointsStream(self, *target)
-                        self._streams[target] = stream
-                        created.append(target)
-                    stream.start()
-            except Exception:
-                try:
-                    # Same rule as a normal stop: a stream that does not stop
-                    # stays in _streams and becomes this card's leftover, so the
-                    # card's next start or stop still reaches it. Popping it
-                    # here would leave a live worker, its publisher and its CAN
-                    # client with no owner at all.
-                    self._release_targets(instance_id, created)
-                except Exception as exc:
-                    logger.warning("Joints start failed and %s did not stop: %s",
-                                   self._describe(sorted(self._leftovers.get(instance_id, ()))), exc)
-                raise
-            self._owners[instance_id] = owner
-            # A target started here belongs to this card again, not to the card
-            # that gave it up.
-            for leftover in self._leftovers.values():
-                leftover.difference_update(targets)
-            with self._lock:
-                self._bindings[instance_id] = side
-                # Both modes: an ID-only info/config later resolves the same interface.
-                self._channels[instance_id] = channel
-            # Retry what an earlier stop or switch left behind, with the old targets.
-            given_up = self._leftovers.pop(instance_id, set())
-            if current is not None:
-                given_up |= set(current[0])
-            try:
-                self._release_targets(instance_id, sorted(t for t in given_up if t not in targets))
-            finally:
-                self._sync_dual_topics()
-
-    def _release_target(self, target: tuple[str, str]) -> None:
-        if any(target in targets for targets, _ in self._owners.values()) or \
-                any(target in left for left in self._leftovers.values()):
-            return
-        stream = self._streams.get(target)
-        if stream is not None:
-            stream.stop()
-            self._streams.pop(target, None)
-        self._close_if_unused(target)
-
-    def _release_targets(self, instance_id: str, targets) -> None:
-        """Release targets a card gave up; one whose worker does not stop stays the card's.
-
-        A worker still blocked in a query keeps belonging to its card, so the
-        card's next stop reaches it instead of leaving it orphaned. Targets
-        already released are not claimed back: another card may own them by
-        the time of the retry.
+        can0 on this board is an unwired mttcan controller: it is up but has no
+        carrier, and probing it every retry would only add timeouts. Boards that
+        do wire it report carrier 1 once the hand answers.
         """
-        error = None
-        for target in targets:
-            try:
-                self._release_target(target)
-            except Exception as exc:
-                self._leftovers.setdefault(instance_id, set()).add(target)
-                error = error or exc
-        if error is not None:
-            raise error
+        try:
+            return Path(f"/sys/class/net/{channel}/carrier").read_text().strip() == "1"
+        except OSError:
+            return True
 
-    def _sync_dual_topics(self) -> None:
-        for target, stream in self._streams.items():
-            stream.set_dual_topics({dual for targets, dual in self._owners.values() if dual and target in targets})
+    def _target_in_use(self, target: tuple[str, str]) -> bool:
+        """True when a controller or worker already talks to this hand."""
+        if target in GLOBAL_CONTROLLERS:
+            return True
+        return any(stream.channel is not None and (stream.side, stream.channel) == target
+                   for stream in self._streams.values())
+
+    def _probe(self, side: str, channel: str) -> bool:
+        """One short position query: does a hand of this side answer here?
+
+        Never called for a (side, channel) that has a live controller or worker:
+        two clients on one hand would read each other's replies.
+        """
+        target = (side, channel)
+        now = time.monotonic()
+        if self._present_cache.get(target, 0.0) > now - PRESENT_TTL_S:
+            return True
+        last = self._probe_cache.get(target)
+        if last is not None and now - last < PROBE_CACHE_S:
+            return False
+        self._probe_cache[target] = now
+        client = None
+        try:
+            client = L20CanClient(channel, side, baudrate=self.baudrate, can_id=self.can_id(side),
+                                  recv_timeout_s=PROBE_TIMEOUT_S + 0.08)
+            time.sleep(0.02)
+            alive = bool(client.probe_positions(PROBE_TIMEOUT_S))
+        except Exception as exc:
+            logger.debug("Probe %s/%s failed: %s", side, channel, exc)
+            alive = False
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        if alive:
+            self._present_cache[target] = time.monotonic()
+        return alive
+
+    def _match(self, instance_id: str, side: str) -> tuple[str, str] | None:
+        """Claim a free hand of this side, or None; caller holds no lock."""
+        with self._lifecycle_lock:
+            taken = {target for owner, target in self._claims.items() if owner != instance_id}
+            for channel in self._channels():
+                target = (side, channel)
+                if target in taken or not self._channel_usable(channel):
+                    continue
+                if self._target_in_use(target) or self._probe(side, channel):
+                    self._claims[instance_id] = target
+                    return target
+            return None
+
+    def _match_reason(self, side: str) -> str:
+        label = SIDE_LABELS.get(side, side)
+        channels = [channel for channel in self._channels() if self._channel_usable(channel)]
+        taken = sorted(channel for owner_side, channel in self._claims.values() if owner_side == side)
+        if taken:
+            return f"没有空闲的{label}：{', '.join(taken)} 已被其他卡片占用"
+        where = "、".join(channels) if channels else "任何 CAN 接口"
+        return f"未在 {where} 上找到{label}"
+
+    # ── instance ownership ────────────────────────────────────────────
+
+    def _sideless(self, args: dict, instance_id: str) -> str | None:
+        """Side chosen by the request or remembered for this instance."""
+        if "bound_side" in args:
+            value = args.get("bound_side")
+            return value if value in ("left", "right") else None
+        with self._lock:
+            return self._bindings.get(instance_id)
+
+    def _select(self, instance_id: str, side: str) -> None:
+        """Make this card read `side`, claiming a free hand or waiting for one."""
+        with self._lifecycle_lock:
+            stream = self._streams.get(instance_id)
+            if stream is not None:
+                if stream.running() and stream.side == side:
+                    if stream.channel is None:
+                        target = self._match(instance_id, side)
+                        if target is not None:
+                            stream.set_channel(target[1])
+                    return
+                # A side change, or a worker that already ended without being
+                # released: stop it and start clean instead of overwriting it.
+                self._stop_stream(instance_id)
+            target = self._match(instance_id, side)
+            stream = _JointsStream(self, instance_id, side, None if target is None else target[1])
+            self._streams[instance_id] = stream
+            try:
+                stream.start()
+            except Exception:
+                self._streams.pop(instance_id, None)
+                self._claims.pop(instance_id, None)
+                raise
+
+    def _stop_stream(self, instance_id: str) -> None:
+        """Stop one card's worker; a worker that does not stop keeps its claim."""
+        with self._lifecycle_lock:
+            stream = self._streams.get(instance_id)
+            if stream is None:
+                self._claims.pop(instance_id, None)
+                self._leftovers.pop(instance_id, None)
+                return
+            target = self._claims.get(instance_id)
+            try:
+                stream.stop()
+            except Exception:
+                self._leftovers[instance_id] = target
+                raise
+            self._streams.pop(instance_id, None)
+            self._claims.pop(instance_id, None)
+            self._leftovers.pop(instance_id, None)
+            if target is not None:
+                self._close_if_unused(target)
 
     def _stop_instance(self, instance_id: str) -> None:
         with self._lifecycle_lock:
-            owner = self._owners.pop(instance_id, None)
-            owned = owner[0] if owner is not None else ()
-            targets = [*owned, *sorted(self._leftovers.pop(instance_id, set()) - set(owned))]
-            if not targets:
-                return
-            try:
-                self._release_targets(instance_id, targets)
-            finally:
-                self._sync_dual_topics()
+            self._stop_stream(instance_id)
 
     # ── MCP dispatcher ────────────────────────────────────────────────
 
     def _sample_view(self, sample: dict[str, Any]) -> dict[str, Any]:
         """Cached sample with its age; too old means not usable as current."""
         if not sample:
-            return {"sample_state": "waiting", "sample_valid": False, "sample_age_s": None}
+            return {"sample_state": "waiting", "sample_valid": False, "sample_age_s": None,
+                    "measured_hz": None}
+        if sample.get("state") == "waiting":
+            return {"sample_state": "waiting", "sample_valid": False, "sample_age_s": None,
+                    "sample_sequence": sample.get("sequence"), "sample_reason": sample.get("reason"),
+                    "measured_hz": None}
         age = max(0.0, time.time() - sample["published_at"])
         valid = sample["valid"] and age <= self.stale_after_s
         return {
@@ -726,17 +748,37 @@ class JointsPlugin:
             "measured_hz": sample["measured_hz"],
         }
 
-    def _hand_info(self, side: str, channel: str) -> dict:
+    def _info(self, instance_id: str) -> dict:
         with self._lifecycle_lock:
-            stream = self._streams.get((side, channel))
+            side = self._bindings.get(instance_id)
+            stream = self._streams.get(instance_id)
+            claim = self._claims.get(instance_id)
+            leftover = self._leftovers.get(instance_id)
+        if side not in ("left", "right"):
+            return {
+                "state": "unset", "instance_id": instance_id, "bound_side": None,
+                "can_channel": None, "can_id": None, "topic_out": [],
+                "poll_hz": POLL_HZ, "query_timeout_s": self.query_timeout_s,
+                "angle_source": ANGLE_SOURCE,
+                "publisher_ready": False, "subscriber_count": 0,
+                "published_json_frames": 0, "published_skeleton_frames": 0,
+                "last_publish_time": None, "publish_error": None,
+                "sample_state": "unset", "sample_valid": False, "sample_age_s": None,
+                "measured_hz": None, "reason": "请选择左手或右手",
+            }
         latest = dict(stream.latest) if stream is not None else {}
+        view = self._sample_view(latest)
+        channel = claim[1] if claim is not None else (stream.channel if stream is not None else None)
+        running = stream is not None and stream.running()
+        state = "running" if running and channel is not None else "waiting" if running else "idle"
         return {
-            "state": "running" if stream is not None and stream.running() else "idle",
+            "state": state,
+            "instance_id": instance_id,
             "bound_side": side,
             "can_channel": channel,
             "can_id": hex(self.can_id(side)),
-            "topic_out": self.topic_out(side, channel),
-            "poll_hz": self.poll_hz,
+            "topic_out": self.topic_out(instance_id, side),
+            "poll_hz": POLL_HZ,
             "query_timeout_s": self.query_timeout_s,
             "angle_source": ANGLE_SOURCE,
             "publisher_ready": stream is not None and stream.publisher_ready(),
@@ -745,106 +787,89 @@ class JointsPlugin:
             "published_skeleton_frames": stream.published_skeleton if stream is not None else 0,
             "last_publish_time": stream.last_publish_time if stream is not None else None,
             "publish_error": stream.publish_error if stream is not None else None,
-            **self._sample_view(latest),
+            "waiting_reason": stream.waiting_reason if state == "waiting" and stream is not None else None,
+            "leftover_claim": leftover[1] if leftover else None,
+            "measured_hz": latest.get("measured_hz"),
+            **view,
         }
 
-    def _hand_state(self, side: str, channel: str) -> dict:
+    def _get_state(self, instance_id: str) -> dict:
+        """Latest measured frame; never queries CAN while the card is idle."""
         with self._lifecycle_lock:
-            stream = self._streams.get((side, channel))
-        if stream is not None and stream.running():
-            # Reuse the stream's rounds instead of adding a second query.
-            latest = dict(stream.latest)
+            side = self._bindings.get(instance_id)
+            stream = self._streams.get(instance_id)
+            claim = self._claims.get(instance_id)
+        if side not in ("left", "right"):
+            return {"state": "unset", "valid": False, "reason": "请选择左手或右手",
+                    "topic_out": [], "sample_state": "unset", "sample_valid": False}
+        channel = claim[1] if claim is not None else None
+        if stream is None or not stream.running():
+            return {**_blank_sample(side, channel, 0, "idle", "关节采集未启动；本帧不含实测值",
+                                    hex(self.can_id(side))),
+                    "sample_state": "idle", "sample_valid": False, "sample_age_s": None,
+                    "topic_out": self.topic_out(instance_id, side)}
+        latest = dict(stream.latest)
+        view = self._sample_view(latest)
+        if not latest:
+            # First round still running: report waiting without bumping the
+            # published sequence from inside an info call.
+            latest = _blank_sample(side, channel, stream.sequence, "waiting",
+                                   "关节采集已启动，第一轮位置查询尚未完成",
+                                   hex(self.can_id(side)))
             view = self._sample_view(latest)
-            if not latest:
-                latest = stream.waiting_sample()
-            elif not view["sample_valid"]:
-                latest.update(valid=False, state="error",
-                              reason=latest["reason"] or f"最近一帧已超过 {self.stale_after_s}s，不作为当前值")
-        else:
-            with self._lifecycle_lock:
-                latest = _JointsStream(self, side, channel).read()
-                # A one-off read must not leave the CAN client open behind it.
-                self._close_if_unused((side, channel))
-            view = self._sample_view(latest)
-        return {**latest, **view, "topic_out": self.topic_out(side, channel)}
+        elif not view["sample_valid"] and view["sample_state"] != "waiting":
+            latest.update(valid=False, state="error",
+                          reason=latest["reason"] or f"最近一帧已超过 {self.stale_after_s}s，不作为当前值")
+        return {**latest, **view, "topic_out": self.topic_out(instance_id, side)}
 
-    def _target_fields(self, side: str, channel: str, targets) -> dict:
-        fields = {"bound_side": side, "can_channel": channel}
-        if side == "both":
-            fields.update({f"{hand}_can_channel": ch for hand, ch in targets})
-        fields["topic_out"] = self.topic_out(side, channel, targets)
-        return fields
-
-    def _both(self, per_hand: dict[str, dict], key: str) -> str:
-        """Worst per-hand state, so one dead hand is never hidden by the other."""
-        states = [hand[key] for hand in per_hand.values()]
-        for state in ("error", "stale", "waiting"):
-            if state in states:
-                return state
-        return states[0]
-
-    def _remember_hand_channels(self, instance_id: str, args: dict) -> None:
-        # Stored as sent: an empty value keeps following can_channel.
-        for hand in ("left", "right"):
-            if f"{hand}_can_channel" in args:
-                self._hand_channels.setdefault(instance_id, {})[hand] = args[f"{hand}_can_channel"]
-
-    def dispatch(self, action: str, args: dict) -> dict:
+    def dispatch(self, action: str, args: dict) -> dict | None:
         if args.get("_tool_name") == self.MODEL_TOOL:
-            return model()
+            return model(args.get("topic"))
 
         instance_id = str(args.get("instance_id", ""))
-        side, channel, targets = self._resolve_target(args)
-        hand_keys = ("left_can_channel", "right_can_channel")
+        side = self._sideless(args, instance_id)
 
         if action == "config":
-            rate = _number(args.get("poll_hz", self.poll_hz), "poll_hz", 1, 30)
             with self._lock:
-                # Core sends shared settings first; they must not create a binding.
                 if "bound_side" in args:
                     self._bindings[instance_id] = side
-                if "can_channel" in args:
-                    self._channels[instance_id] = channel
-                self._remember_hand_channels(instance_id, args)
-                self.poll_hz = rate
+            # Legacy per-card fields (can_channel, left/right_can_channel,
+            # poll_hz) are ignored: the interface is matched, the rate is fixed.
             with self._lifecycle_lock:
-                if instance_id in self._owners and any(
-                        key in args for key in ("bound_side", "can_channel", *hand_keys)):
-                    self._select(instance_id, side, channel, targets)
-            return {"state": "configured", **self._target_fields(side, channel, targets), "poll_hz": self.poll_hz}
+                stream = self._streams.get(instance_id)
+                if stream is not None:
+                    if side in ("left", "right"):
+                        self._select(instance_id, side)
+                    else:
+                        self._stop_stream(instance_id)
+                elif side in ("left", "right"):
+                    self._bindings[instance_id] = side
+            return {"state": "configured", "instance_id": instance_id,
+                    "bound_side": side,
+                    "can_channel": self._claims.get(instance_id, (None, None))[1],
+                    "topic_out": self.topic_out(instance_id, side),
+                    "poll_hz": POLL_HZ}
 
         if action == "info":
-            if side != "both":
-                return self._hand_info(side, channel)
-            hands = {hand: self._hand_info(hand, ch) for hand, ch in targets}
-            return {
-                **self._target_fields(side, channel, targets),
-                "state": "running" if all(h["state"] == "running" for h in hands.values()) else "idle",
-                "poll_hz": self.poll_hz,
-                "query_timeout_s": self.query_timeout_s,
-                "angle_source": ANGLE_SOURCE,
-                "publisher_ready": all(h["publisher_ready"] for h in hands.values()),
-                "sample_state": self._both(hands, "sample_state"),
-                "sample_valid": all(h["sample_valid"] for h in hands.values()),
-                "hands": hands,
-            }
+            return self._info(instance_id)
 
         if action == "start":
             with self._lock:
-                self._remember_hand_channels(instance_id, args)
-            self._select(instance_id, side, channel, targets)
-            return self.dispatch("info", args)
+                self._bindings[instance_id] = side
+            if side in ("left", "right"):
+                self._select(instance_id, side)
+            else:
+                self._stop_instance(instance_id)
+            return self._info(instance_id)
 
         if action == "stop":
             self._stop_instance(instance_id)
-            return {"state": "idle", **self._target_fields(side, channel, targets)}
+            result = self._info(instance_id)
+            result["state"] = "idle"
+            return result
 
         if action == "get_state":
-            if side != "both":
-                return {"action": "get_state", **self._hand_state(side, channel)}
-            hands = {hand: self._hand_state(hand, ch) for hand, ch in targets}
-            return {"action": "get_state", **self._target_fields(side, channel, targets),
-                    "valid": all(h["valid"] for h in hands.values()), "hands": hands}
+            return self._get_state(instance_id)
 
         # Plugin contract (README_dev.md): None, which the MCP handler reports
         # as an error instead of wrapping it as a successful result.

@@ -22,11 +22,13 @@ sys.path.insert(0, str(ROOT / "tests"))
 from common.vendor_runtime import DriverBundle
 from can_client import JOINT_NAMES_16, L20CanClient, PositionQueryTimeout, vector20_to_named16
 import hand_device
+import joints_device
 from hand_device import build_plugins
-from joints_device import JointsPlugin
+from joints_device import POLL_HZ, JointsPlugin, _JointsStream
 import joints_model
 from joints_model import (ANCHOR_X, ANCHOR_YAW, CALIBRATION_FILES, DISPLAY_SCALE, MODEL_DIR, RESERVED_VECTOR_INDEXES,
-                          URDF_JOINT, VECTOR_INDEX, dual_urdf, raw_to_angle, side_joints, skeleton_joints)
+                          URDF_JOINT, VECTOR_INDEX, dual_urdf, model, raw_to_angle, side_from_topic, side_joints,
+                          single_urdf, skeleton_joints)
 from test_linkerhand_l20 import MockCanBus
 
 
@@ -113,14 +115,14 @@ def test_skeleton_clamps_to_model_limits_and_marks_passive_joints_as_derived():
     entries = {e["name"]: e for e in skeleton_joints("right", raw)}
     assert len(entries) == 21
     limits = {j["name"]: j for j in side_joints("right")}
-    pitch = entries["right_index_mcp_pitch"]
+    pitch = entries["right_hand_index_mcp_pitch"]
     assert pitch["q"] == limits["index_mcp_pitch"]["upper"] and pitch["clamped_to_model"] is True
     assert pitch["source"] == "measured" and pitch["group"] == "右手"
     vendor = _vendor_calibration("right")
     derived = [e for e in entries.values() if e["source"] == "derived_calibration"]
     assert len(derived) == 5
     for entry in derived:
-        name = entry["name"].removeprefix("right_")
+        name = entry["name"].removeprefix("right_hand_")
         joint = limits[name]
         expected = min(joint["upper"], max(joint["lower"], vendor[name]["angle_rad"][128]))
         assert entry["q"] == pytest.approx(expected)
@@ -199,7 +201,7 @@ def test_split_dual_model_under_core_rotation_order_matches_vendor_kinematics(si
     vendor = joints_model._vendor_root(side)
     dual = ET.fromstring(dual_urdf())
     q = _sample_q(side)
-    both = {f"{s}_{name}": value for s in ("left", "right") for name, value in _sample_q(s).items()}
+    both = {f"{s}_hand_{name}": value for s in ("left", "right") for name, value in _sample_q(s).items()}
     expected = _forward(vendor, _rpy_fixed_axis, q, scale=DISPLAY_SCALE)
     actual = _forward(dual, _rpy_intrinsic_xyz, both)
     turn = _rot((0, 0, 1), ANCHOR_YAW[side])
@@ -217,7 +219,7 @@ def test_split_dual_model_under_core_rotation_order_matches_vendor_kinematics(si
 def _link_gap(side, raw20, link_a, link_b):
     """Distance in mm on the real hand between two link origins of one hand for a raw vector."""
     raw = {name: raw20[index] for name, index in VECTOR_INDEX.items()}
-    q = {f"{s}_{j['name']}": 0.0 for s in ("left", "right") for j in side_joints(s)}
+    q = {f"{s}_hand_{j['name']}": 0.0 for s in ("left", "right") for j in side_joints(s)}
     q.update({entry["name"]: entry["q"] for entry in skeleton_joints(side, raw)})
     poses = _forward(ET.fromstring(dual_urdf()), _rpy_intrinsic_xyz, q)
     return math.dist(poses[f"{side}_{link_a}"][0], poses[f"{side}_{link_b}"][0]) * 1000 / DISPLAY_SCALE
@@ -250,8 +252,8 @@ def test_every_finger_ends_in_a_drawn_tip_beyond_its_last_joint(side):
     joints = {j.get("name"): j for j in dual.findall("joint")}
     parents = {j.find("parent").get("link") for j in joints.values()}
     for finger in ("thumb", "index", "middle", "ring", "pinky"):
-        last = joints[f"{side}_{finger}_ip" if finger == "thumb" else f"{side}_{finger}_dip"]
-        tip = joints[f"{side}_{finger}_tip_fixed"]
+        last = joints[f"{side}_hand_{finger}_ip" if finger == "thumb" else f"{side}_hand_{finger}_dip"]
+        tip = joints[f"{side}_hand_{finger}_tip_fixed"]
         assert tip.get("type") == "fixed"
         assert tip.find("parent").get("link") == last.find("child").get("link")
         assert tip.find("child").get("link") == f"{side}_{finger}_tip" and f"{side}_{finger}_tip" not in parents
@@ -275,7 +277,7 @@ def test_right_thumb_moves_like_the_real_hand(joint, reference):
 
 def _display_positions(raw20=None):
     """Positions of every link in the dual model as Core places them (both hands)."""
-    q = {f"{s}_{j['name']}": 0.0 for s in ("left", "right") for j in side_joints(s)}
+    q = {f"{s}_hand_{j['name']}": 0.0 for s in ("left", "right") for j in side_joints(s)}
     if raw20 is not None:
         raw = {name: raw20[index] for name, index in VECTOR_INDEX.items()}
         for side in ("left", "right"):
@@ -309,7 +311,7 @@ def test_straight_finger_tip_continues_the_last_bone(side, finger, last, previou
     # User, 2026-11-13: tips looked bent outward when the finger was straight.
     pos = _display_positions()
     links = {j.get("name"): j.find("child").get("link") for j in ET.fromstring(dual_urdf()).findall("joint")}
-    a, b = pos[links[f"{side}_{previous}"]], pos[links[f"{side}_{last}"]]
+    a, b = pos[links[f"{side}_hand_{previous}"]], pos[links[f"{side}_hand_{last}"]]
     tip = pos[f"{side}_{finger}_tip"]
     bone = [y - x for x, y in zip(a, b)]
     end = [y - x for x, y in zip(b, tip)]
@@ -334,10 +336,10 @@ def test_left_ok_sign_closes_thumb_tip_on_index_tip():
 def test_dual_model_keeps_joint_names_types_limits_and_has_one_root():
     dual = ET.fromstring(dual_urdf())
     revolute = {j.get("name"): j for j in dual.findall("joint") if j.get("type") == "revolute"}
-    assert set(revolute) == {f"{side}_{j['name']}" for side in ("left", "right") for j in side_joints(side)}
+    assert set(revolute) == {f"{side}_hand_{j['name']}" for side in ("left", "right") for j in side_joints(side)}
     for side in ("left", "right"):
         for joint in side_joints(side):
-            limit = revolute[f"{side}_{joint['name']}"].find("limit")
+            limit = revolute[f"{side}_hand_{joint['name']}"].find("limit")
             assert float(limit.get("lower")) == joint["lower"] and float(limit.get("upper")) == joint["upper"]
     children = {j.find("child").get("link") for j in dual.findall("joint")}
     roots = [l.get("name") for l in dual.findall("link") if l.get("name") not in children]
@@ -346,46 +348,46 @@ def test_dual_model_keeps_joint_names_types_limits_and_has_one_root():
     assert dual.find(".//mesh") is None and dual.find(".//visual") is None
 
 
-def test_model_resource_is_served_through_driver_bundle():
+# ── model: one hand per panel ──────────────────────────────────────────
+
+def test_single_model_has_one_root_and_only_that_hand():
+    for side in ("left", "right"):
+        robot = ET.fromstring(single_urdf(side))
+        assert robot.get("name") == f"linkerhand_l20_{side}_skeleton"
+        revolute = {j.get("name") for j in robot.findall("joint") if j.get("type") == "revolute"}
+        assert revolute == {f"{side}_hand_{j['name']}" for j in side_joints(side)}
+        children = {j.find("child").get("link") for j in robot.findall("joint")}
+        roots = [l.get("name") for l in robot.findall("link") if l.get("name") not in children]
+        assert roots == [f"{side}_base"]
+        other = "right_" if side == "left" else "left_"
+        assert all(not l.get("name").startswith(other) for l in robot.findall("link"))
+        origin = robot.find(f"joint[@name='{side}_anchor']/origin")
+        assert origin.get("xyz") == "0.0 0.0 0.0"
+        assert robot.find(".//mesh") is None and robot.find(".//visual") is None
+
+
+def test_topic_selects_the_model_side_and_falls_back_to_both_hands():
+    assert side_from_topic("/nvidia_desktop/hand/left/joints_ab12_skeleton") == "left"
+    assert side_from_topic("/nvidia_desktop/hand/right/joints_ab12_skeleton") == "right"
+    assert side_from_topic("/nvidia_desktop/hand/both/left_can_x/right_can_y/joints_skeleton") is None
+    assert side_from_topic("") is None and side_from_topic(None) is None
+    assert ET.fromstring(model("/x/hand/left/y")["urdf"]).get("name") == "linkerhand_l20_left_skeleton"
+    assert ET.fromstring(model("/x/hand/right/y")["urdf"]).get("name") == "linkerhand_l20_right_skeleton"
+    assert ET.fromstring(model("/x/hand/both/y")["urdf"]).get("name") == "linkerhand_l20_dual_skeleton"
+    assert ET.fromstring(model()["urdf"]).get("name") == "linkerhand_l20_dual_skeleton"
+
+
+def test_model_resource_serves_the_topic_side_through_driver_bundle():
     plugin = JointsPlugin(None, {}, global_config=GLOBAL_CONFIG)
     bundle = DriverBundle([plugin])
     tools = {t["name"]: t for t in bundle.get_all_tools()}
     assert tools["model"]["type"] == "resource" and tools["joints"]["type"] == "sensor"
-    result = bundle.dispatch("model", {})
-    assert set(result) == {"urdf"}
-    assert ET.fromstring(result["urdf"]).get("name") == "linkerhand_l20_dual_skeleton"
-
-
-def test_topic_out_lists_json_first_then_skeleton():
-    plugin = JointsPlugin(None, {}, global_config=GLOBAL_CONFIG, namespace="robot1")
-    assert plugin.topic_out("right", "can0") == [
-        {"topic": "/robot1/hand/right/joints", "format": "data/json"},
-        {"topic": "/robot1/hand/right/joints_skeleton", "format": "sensor/skeleton"},
-    ]
-    other = plugin.topic_out("right", "can1")[0]["topic"]
-    assert other == "/robot1/hand/right/can_" + b"can1".hex() + "/joints"
-
-
-def test_both_hands_topic_out_has_each_json_and_one_shared_skeleton():
-    plugin = JointsPlugin(None, {}, global_config=GLOBAL_CONFIG, namespace="robot1")
-    can1 = "can_" + b"can1".hex()
-    assert plugin.topic_out("both", "can0", (("left", "can0"), ("right", "can1"))) == [
-        {"topic": "/robot1/hand/left/joints", "format": "data/json"},
-        {"topic": f"/robot1/hand/right/{can1}/joints", "format": "data/json"},
-        {"topic": f"/robot1/hand/both/right_{can1}/joints_skeleton", "format": "sensor/skeleton"},
-    ]
-    assert plugin.dual_topic("can0", "can0") == "/robot1/hand/both/joints_skeleton"
-    # Different hand pairs never share a skeleton topic (Core rejects shared outputs).
-    assert len({plugin.dual_topic(l, r) for l in ("can0", "can1") for r in ("can0", "can1")}) == 4
-    # Single-hand cards keep per-side skeleton topics, so a left and a right card do not clash.
-    assert plugin.topic_out("left")[1]["topic"] != plugin.topic_out("right")[1]["topic"]
-
-
-def test_schema_offers_both_hands_mode_with_a_can_interface_per_hand():
-    props = JointsPlugin(None, {}, global_config=GLOBAL_CONFIG).get_tools()[0]["configSchema"]["properties"]
-    assert props["bound_side"]["enum"] == ["left", "right", "both"]
-    for key in ("left_can_channel", "right_can_channel"):
-        assert props[key]["scope"] == "instance" and "default" not in props[key]
+    topic_prop = tools["model"]["inputSchema"]["properties"]["topic"]
+    assert topic_prop["type"] == "string"
+    left = ET.fromstring(bundle.dispatch("model", {"topic": "/hand/left/joints_a_skeleton"})["urdf"])
+    assert left.get("name") == "linkerhand_l20_left_skeleton"
+    dual = ET.fromstring(bundle.dispatch("model", {})["urdf"])
+    assert dual.get("name") == "linkerhand_l20_dual_skeleton"
 
 
 # ── acquisition ────────────────────────────────────────────────────────
@@ -405,9 +407,15 @@ class FakeClient:
         return list(self.vector)
 
 
-def make_plugin(clients=None, config=None, ros2=None):
+def make_plugin(clients=None, config=None, ros2=None, channels=("can0",), hands=None):
+    """A plugin whose CAN world is injected: no sysfs, no socketcan."""
     clients = clients if clients is not None else {}
-    plugin = JointsPlugin(None, {"poll_hz": 30, **(config or {})}, global_config=GLOBAL_CONFIG, ros2=ros2)
+    hands = set(hands) if hands is not None else {
+        (side, channel) for side in ("left", "right") for channel in channels}
+    plugin = JointsPlugin(None, dict(config or {}), global_config=GLOBAL_CONFIG, ros2=ros2)
+    plugin._channels = lambda: list(channels)
+    plugin._channel_usable = lambda channel: True
+    plugin._probe = lambda side, channel: (side, channel) in hands
 
     def get_controller(side, channel):
         client = clients.setdefault((side, channel), FakeClient())
@@ -415,13 +423,17 @@ def make_plugin(clients=None, config=None, ros2=None):
         return SimpleNamespace(get=lambda: client)
 
     plugin._get_controller = get_controller
-    return plugin, clients
+    return plugin, clients, hands
 
 
-def test_get_state_reports_raw_and_unverified_angles_for_sixteen_joints():
-    plugin, clients = make_plugin()
-    result = plugin.dispatch("get_state", {"bound_side": "right"})
-    assert result["valid"] is True and result["state"] == "ok" and result["sample_valid"] is True
+def one_round(plugin, side="right", channel="can0"):
+    return _JointsStream(plugin, "probe", side, channel).read()
+
+
+def test_one_round_reports_raw_and_looked_up_angles_for_sixteen_joints():
+    plugin, clients, _ = make_plugin()
+    result = one_round(plugin)
+    assert result["state"] == "ok" and result["valid"] is True
     assert result["side"] == "right" and result["can_id"] == "0x27"
     assert result["joint_count"] == 16 and len(result["joints"]) == 16
     assert result["angle_unit"] == "rad" and result["angle_source"] == "vendor_g20_calibration_table_adjusted"
@@ -431,7 +443,7 @@ def test_get_state_reports_raw_and_unverified_angles_for_sixteen_joints():
     for joint in result["joints"]:
         assert joint["raw"] == vector[joint["vector_index"]]
         assert joint["angle_rad"] == pytest.approx(raw_to_angle("right", joint["name"], joint["raw"]))
-        assert joint["model_joint"] == "right_" + URDF_JOINT[joint["name"]]
+        assert joint["model_joint"] == "right_hand_" + URDF_JOINT[joint["name"]]
     assert clients[("right", "can0")].timeouts == [plugin.query_timeout_s]
 
 
@@ -441,7 +453,7 @@ def test_get_state_reports_raw_and_unverified_angles_for_sixteen_joints():
     "out_of_range",
 ])
 def test_failed_or_partial_rounds_are_invalid_without_values_or_timestamp(failure):
-    plugin, clients = make_plugin()
+    plugin, clients, _ = make_plugin()
     client = clients.setdefault(("left", "can0"), FakeClient())
     if failure == "short":
         client.vector = client.vector[:16]
@@ -449,19 +461,19 @@ def test_failed_or_partial_rounds_are_invalid_without_values_or_timestamp(failur
         client.vector[VECTOR_INDEX["ring_tip"]] = 256
     else:
         client.error = failure
-    result = plugin.dispatch("get_state", {"bound_side": "left"})
-    assert result["valid"] is False and result["state"] == "error" and result["sample_valid"] is False
-    assert result["timestamp"] is None and result["reason"]
+    result = one_round(plugin, "left")
+    assert result["valid"] is False and result["state"] == "error" and result["reason"]
+    assert result["timestamp"] is None
     assert all(j["raw"] is None and j["angle_rad"] is None for j in result["joints"])
     if isinstance(failure, PositionQueryTimeout):
         assert result["error_details"] == {"missing_frames": ["0x45"]}
 
 
 def test_reserved_slot_contents_are_ignored():
-    plugin, clients = make_plugin()
+    plugin, clients, _ = make_plugin()
     client = clients.setdefault(("left", "can0"), FakeClient())
     client.vector[11:15] = [-1, 999, 0, 0]
-    assert plugin.dispatch("get_state", {"bound_side": "left"})["valid"] is True
+    assert one_round(plugin, "left")["valid"] is True
 
 
 class PartialBus(MockCanBus):
@@ -480,9 +492,9 @@ def test_real_client_sends_only_position_queries(bus_type):
     bus = bus_type(can_id=0x27)
     bus.sim_pitch, bus.sim_yaw, bus.sim_roll, bus.sim_tip = [10, 20, 30, 40, 50], [60, 70, 80, 90, 100], [110, 0, 0, 0, 0], [120, 130, 140, 150, 160]
     client = L20CanClient("can0", "right", can_id=0x27, recv_timeout_s=0.05, bus_factory=lambda *_: bus)
-    plugin, _ = make_plugin({("right", "can0"): client}, config={"query_timeout_s": 0.1})
+    plugin, _, _ = make_plugin({("right", "can0"): client}, config={"query_timeout_s": 0.1})
     try:
-        result = plugin.dispatch("get_state", {"bound_side": "right"})
+        result = one_round(plugin)
     finally:
         client.close()
     sent = [list(m.data) for m in bus.sent_messages]
@@ -499,6 +511,118 @@ def test_real_client_sends_only_position_queries(bus_type):
     assert result["valid"] is True
     assert (raw["thumb_pitch"], raw["thumb_yaw"], raw["thumb_roll"], raw["thumb_tip"]) == (10, 60, 110, 120)
     assert (raw["pinky_pitch"], raw["pinky_yaw"], raw["pinky_tip"]) == (50, 100, 160)
+
+
+# ── topics, matching, waiting ──────────────────────────────────────────
+
+def test_topics_are_per_instance_and_keep_the_side():
+    plugin, _, _ = make_plugin()
+    assert plugin.topic_out("a") == []
+    plugin.dispatch("config", {"instance_id": "card-1", "bound_side": "left"})
+    assert plugin.topic_out("card-1") == [
+        {"topic": "/hand/left/joints_card1", "format": "data/json"},
+        {"topic": "/hand/left/joints_card1_skeleton", "format": "sensor/skeleton"},
+    ]
+    plugin.dispatch("config", {"instance_id": "card-2", "bound_side": "left"})
+    assert plugin.topic_out("card-1")[0]["topic"] != plugin.topic_out("card-2")[0]["topic"]
+    # A different namespace is honoured.
+    ns = JointsPlugin(None, {}, global_config=GLOBAL_CONFIG, namespace="robot1")
+    ns.dispatch("config", {"instance_id": "x", "bound_side": "right"})
+    assert ns.topic_out("x")[0]["topic"] == "/robot1/hand/right/joints_x"
+
+
+def test_no_side_selected_reports_unset_without_topic_or_can():
+    plugin, clients, _ = make_plugin()
+    assert plugin.dispatch("start", {"instance_id": "a"})["state"] == "unset"
+    assert plugin._streams == {} and clients == {}
+    assert plugin.dispatch("config", {"instance_id": "a", "bound_side": "both"})["bound_side"] is None
+    assert plugin._bindings["a"] is None
+    assert plugin.topic_out("a") == []
+
+
+def test_start_claims_a_free_hand():
+    plugin, clients, _ = make_plugin(channels=("can0", "can1"), hands={("left", "can1")})
+    info = plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
+    assert info["state"] == "running" and info["can_channel"] == "can1"
+    assert plugin._claims["a"] == ("left", "can1")
+    wait_for(lambda: clients[("left", "can1")].calls > 0)
+
+
+def test_waiting_card_publishes_invalid_json_and_no_skeleton(ros_runtime, monkeypatch):
+    ros2, published, _ = ros_runtime
+    monkeypatch.setattr(joints_device, "WAITING_PUBLISH_INTERVAL_S", 0.02)
+    plugin, _, _ = make_plugin(ros2=ros2, hands=set())
+    try:
+        plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
+        wait_for(lambda: any(t == "/hand/left/joints_a" and p["state"] == "waiting" for t, p in published))
+        info = plugin.dispatch("info", {"instance_id": "a"})
+    finally:
+        plugin.stop()
+    assert info["state"] == "waiting" and info["can_channel"] is None
+    assert info["measured_hz"] is None
+    frame = next(p for t, p in published if t == "/hand/left/joints_a")
+    assert frame["valid"] is False and frame["joints"][0]["raw"] is None and frame["timestamp"] is None
+    assert not any(t.endswith("_skeleton") for t, _ in published)
+
+
+def test_waiting_card_takes_a_hand_that_appears_later(ros_runtime, monkeypatch):
+    ros2, _, _ = ros_runtime
+    monkeypatch.setattr(joints_device, "MATCH_RETRY_INTERVAL_S", 0.05)
+    plugin, clients, hands = make_plugin(ros2=ros2, hands=set())
+    try:
+        plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
+        assert plugin.dispatch("info", {"instance_id": "a"})["state"] == "waiting"
+        hands.add(("left", "can0"))
+        wait_for(lambda: plugin.dispatch("info", {"instance_id": "a"})["state"] == "running")
+        assert plugin._claims["a"] == ("left", "can0")
+        wait_for(lambda: clients[("left", "can0")].calls > 0)
+    finally:
+        plugin.stop()
+
+
+def test_second_card_of_the_same_side_waits_and_takes_over_after_stop(ros_runtime, monkeypatch):
+    ros2, _, _ = ros_runtime
+    monkeypatch.setattr(joints_device, "MATCH_RETRY_INTERVAL_S", 0.05)
+    plugin, clients, _ = make_plugin(ros2=ros2, hands={("left", "can0")})
+    try:
+        plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
+        wait_for(lambda: plugin.dispatch("info", {"instance_id": "a"})["state"] == "running")
+        plugin.dispatch("start", {"instance_id": "b", "bound_side": "left"})
+        assert plugin.dispatch("info", {"instance_id": "b"})["state"] == "waiting"
+        assert plugin._claims == {"a": ("left", "can0")}
+        plugin.dispatch("stop", {"instance_id": "a"})
+        wait_for(lambda: plugin.dispatch("info", {"instance_id": "b"})["state"] == "running")
+        assert plugin._claims == {"b": ("left", "can0")}
+        wait_for(lambda: clients[("left", "can0")].calls > 0)
+    finally:
+        plugin.stop()
+
+
+def test_left_and_right_cards_can_share_one_bus(ros_runtime):
+    ros2, _, _ = ros_runtime
+    plugin, clients, _ = make_plugin(ros2=ros2, channels=("can1",),
+                                     hands={("left", "can1"), ("right", "can1")})
+    try:
+        plugin.dispatch("start", {"instance_id": "L", "bound_side": "left"})
+        plugin.dispatch("start", {"instance_id": "R", "bound_side": "right"})
+        assert plugin.dispatch("info", {"instance_id": "L"})["state"] == "running"
+        assert plugin.dispatch("info", {"instance_id": "R"})["state"] == "running"
+        assert plugin._claims == {"L": ("left", "can1"), "R": ("right", "can1")}
+        assert plugin.topic_out("L")[0]["topic"] == "/hand/left/joints_l"
+        assert plugin.topic_out("R")[0]["topic"] == "/hand/right/joints_r"
+        wait_for(lambda: clients[("left", "can1")].calls > 0 and clients[("right", "can1")].calls > 0)
+    finally:
+        plugin.stop()
+
+
+def test_waiting_reason_names_the_occupied_channel():
+    plugin, _, _ = make_plugin(hands={("left", "can0")})
+    plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
+    for instance in ("b", "c"):
+        plugin.dispatch("start", {"instance_id": instance, "bound_side": "left"})
+    assert "已被其他卡片占用" in plugin._match_reason("left")
+    assert "未在" in plugin._match_reason("right")
+    plugin.stop()
 
 
 # ── streaming ──────────────────────────────────────────────────────────
@@ -555,14 +679,14 @@ def wait_for(predicate, timeout=3.0):
 
 def test_one_round_feeds_both_outputs_with_the_same_sequence(ros_runtime):
     ros2, published, _ = ros_runtime
-    plugin, _ = make_plugin(ros2=ros2)
+    plugin, _, _ = make_plugin(ros2=ros2)
     try:
         plugin.dispatch("start", {"instance_id": "a", "bound_side": "right"})
         wait_for(lambda: sum(1 for t, _ in published if t.endswith("_skeleton")) >= 2)
     finally:
         plugin.stop()
-    json_frames = {p["sequence"]: p for t, p in published if t == "/hand/right/joints"}
-    skeleton_frames = [p for t, p in published if t == "/hand/right/joints_skeleton"]
+    json_frames = {p["sequence"]: p for t, p in published if t == "/hand/right/joints_a"}
+    skeleton_frames = [p for t, p in published if t == "/hand/right/joints_a_skeleton"]
     for frame in skeleton_frames:
         sample = json_frames[frame["status"]["sequence"]]
         assert frame["status"]["timestamp"] == sample["timestamp"] and frame["status"]["valid"] is True
@@ -570,7 +694,7 @@ def test_one_round_feeds_both_outputs_with_the_same_sequence(ros_runtime):
         for joint in sample["joints"]:
             entry = by_name[joint["model_joint"]]
             assert entry["source"] == "measured"
-            limits = next(j for j in side_joints("right") if f"right_{j['name']}" == joint["model_joint"])
+            limits = next(j for j in side_joints("right") if f"right_hand_{j['name']}" == joint["model_joint"])
             assert entry["q"] == pytest.approx(min(limits["upper"], max(limits["lower"], joint["angle_rad"])))
 
 
@@ -578,143 +702,127 @@ def test_invalid_rounds_publish_json_but_no_skeleton(ros_runtime):
     ros2, published, _ = ros_runtime
     client = FakeClient()
     client.error = PositionQueryTimeout("位置回复超时", {})
-    plugin, _ = make_plugin({("left", "can0"): client}, ros2=ros2)
+    plugin, _, _ = make_plugin({("left", "can0"): client}, ros2=ros2)
     try:
         plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
         wait_for(lambda: len(published) >= 3)
         info = plugin.dispatch("info", {"instance_id": "a"})
     finally:
         plugin.stop()
-    assert all(t == "/hand/left/joints" and p["valid"] is False for t, p in published)
+    assert all(t == "/hand/left/joints_a" and p["valid"] is False for t, p in published)
     assert info["published_skeleton_frames"] == 0 and info["sample_state"] == "error"
 
 
 def test_stop_sends_one_final_invalid_frame_and_no_skeleton(ros_runtime):
     ros2, published, _ = ros_runtime
-    plugin, _ = make_plugin(ros2=ros2)
+    plugin, _, _ = make_plugin(ros2=ros2)
     try:
         plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
-        wait_for(lambda: sum(1 for t, _ in published if t == "/hand/left/joints") >= 2)
+        wait_for(lambda: sum(1 for t, _ in published if t == "/hand/left/joints_a") >= 2)
         published.clear()
         plugin.dispatch("stop", {"instance_id": "a"})
     finally:
         plugin.stop()
-    frames = [p for t, p in published if t == "/hand/left/joints"]
-    # The worker may finish one more round before the stop joins it.
+    frames = [p for t, p in published if t == "/hand/left/joints_a"]
     assert [f for f in frames if f["state"] == "idle"], published
     final = frames[-1]
     assert final["state"] == "idle" and final["valid"] is False and final["reason"]
     assert sum(1 for f in frames if f["state"] == "idle") == 1
     assert final["timestamp"] is None and final["measured_hz"] is None
-    assert final["query_elapsed_s"] is None
-    assert final["joint_count"] == 16
+    assert final["query_elapsed_s"] is None and final["joint_count"] == 16
     assert all(j["raw"] is None and j["angle_rad"] is None and j["angle_deg"] is None
                for j in final["joints"])
-    # A stopped stream must not leave the renderer a frame with a pose in it.
     assert not [p for t, p in published if t.endswith("_skeleton") and p["status"]["valid"] is False]
+
+
+def test_fixed_rate_is_thirty_hz(ros_runtime):
+    assert POLL_HZ == 30.0
+    ros2, published, _ = ros_runtime
+    plugin, _, _ = make_plugin(ros2=ros2)
+    try:
+        plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
+        start = time.monotonic()
+        wait_for(lambda: sum(1 for t, _ in published if t == "/hand/left/joints_a") >= 6, timeout=2.0)
+        elapsed = time.monotonic() - start
+        count = sum(1 for t, _ in published if t == "/hand/left/joints_a")
+        assert count / elapsed >= 15, (count, elapsed)
+        assert plugin.dispatch("info", {"instance_id": "a"})["poll_hz"] == 30.0
+    finally:
+        plugin.stop()
 
 
 def test_stale_running_sample_is_not_reported_as_current(ros_runtime):
     ros2, _, _ = ros_runtime
-    plugin, _ = make_plugin(ros2=ros2, config={"stale_after_s": 0.05})
+    plugin, _, _ = make_plugin(ros2=ros2, config={"stale_after_s": 0.05})
+    stream = None
     try:
         plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
-        stream = plugin._streams[("left", "can0")]
+        stream = plugin._streams["a"]
         wait_for(lambda: stream.latest.get("valid"))
-        stream._stop_event.set()  # Freeze the worker; the cached frame ages.
+        stream._stop_event.set()
         wait_for(lambda: not stream.running())
         stream._thread = SimpleNamespace(is_alive=lambda: True)
         time.sleep(0.1)
         result = plugin.dispatch("get_state", {"instance_id": "a"})
     finally:
-        stream._thread = None
+        if stream is not None:
+            stream._thread = None
         plugin.stop()
     assert result["valid"] is False and result["sample_state"] == "stale" and result["reason"]
 
 
-def test_left_and_right_instances_are_isolated(ros_runtime):
-    ros2, published, _ = ros_runtime
-    left, right = FakeClient(), FakeClient([255] * 20)
-    plugin, _ = make_plugin({("left", "can0"): left, ("right", "can1"): right}, ros2=ros2)
-    try:
-        plugin.dispatch("config", {"instance_id": "L", "bound_side": "left"})
-        plugin.dispatch("config", {"instance_id": "R", "bound_side": "right", "can_channel": "can1"})
-        plugin.dispatch("start", {"instance_id": "L"})
-        plugin.dispatch("start", {"instance_id": "R"})
-        assert set(plugin._streams) == {("left", "can0"), ("right", "can1")}
-        wait_for(lambda: {t for t, _ in published} >= {"/hand/left/joints", "/hand/right/can_" + b"can1".hex() + "/joints"})
-        plugin.dispatch("stop", {"instance_id": "L"})
-        assert set(plugin._streams) == {("right", "can1")}
-        assert plugin._streams[("right", "can1")].running()
-    finally:
-        plugin.stop()
-    for topic, payload in published:
-        if payload.get("state") == "idle":  # stop notice, no measurement
-            continue
-        side = "left" if "/left/" in topic else "right"
-        assert (payload.get("side") or payload["status"]["side"]) == side
-        if not topic.endswith("_skeleton"):
-            expected = (left if side == "left" else right).vector
-            assert [j["raw"] for j in payload["joints"]] == [expected[VECTOR_INDEX[n]] for n in JOINT_NAMES_16]
-        else:
-            assert all(e["name"].startswith(side + "_") for e in payload["joints"])
+# ── lifecycle ──────────────────────────────────────────────────────────
 
-
-def test_switching_side_moves_the_stream_and_releases_the_old_one(ros_runtime):
+def test_switching_side_stops_the_old_stream_and_moves_the_claim(ros_runtime):
     ros2, published, _ = ros_runtime
-    plugin, _ = make_plugin(ros2=ros2)
+    plugin, _, _ = make_plugin(ros2=ros2, hands={("left", "can0"), ("right", "can0")})
     try:
         plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
-        old = plugin._streams[("left", "can0")]
+        wait_for(lambda: plugin.dispatch("info", {"instance_id": "a"})["state"] == "running")
+        old = plugin._streams["a"]
         plugin.dispatch("config", {"instance_id": "a", "bound_side": "right"})
-        assert set(plugin._streams) == {("right", "can0")} and not old.running()
+        assert not old.running()
+        assert plugin._claims["a"] == ("right", "can0")
         published.clear()
-        wait_for(lambda: len(published) >= 2)
+        wait_for(lambda: any("/hand/right/" in t for t, _ in published))
         assert all("/hand/right/" in t for t, _ in published)
     finally:
         plugin.stop()
 
 
-def test_cards_on_the_same_hand_share_one_worker(ros_runtime):
-    ros2, _, _ = ros_runtime
-    plugin, clients = make_plugin(ros2=ros2)
-    try:
-        plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
-        plugin.dispatch("start", {"instance_id": "b", "bound_side": "left"})
-        assert len(plugin._streams) == 1
-        plugin.dispatch("stop", {"instance_id": "a"})
-        assert plugin._streams[("left", "can0")].running()
-        plugin.dispatch("stop", {"instance_id": "b"})
-        assert plugin._streams == {}
-    finally:
-        plugin.stop()
+def test_config_ignores_legacy_channel_and_rate_fields():
+    plugin, _, _ = make_plugin()
+    result = plugin.dispatch("config", {
+        "instance_id": "a", "bound_side": "left",
+        "can_channel": "can9", "left_can_channel": "can8", "poll_hz": 5,
+    })
+    assert result["state"] == "configured" and result["bound_side"] == "left"
+    assert not hasattr(plugin, "poll_hz")
+    plugin.dispatch("start", {"instance_id": "a"})
+    assert plugin._claims["a"] == ("left", "can0")
+    plugin.stop()
 
 
-def test_anonymous_card_cannot_silently_switch_target(ros_runtime):
-    ros2, _, _ = ros_runtime
-    plugin, _ = make_plugin(ros2=ros2)
-    try:
-        plugin.dispatch("start", {"bound_side": "left"})
-        with pytest.raises(ValueError):
-            plugin.dispatch("start", {"bound_side": "right"})
-    finally:
-        plugin.stop()
+def test_config_with_a_removed_side_stops_the_stream():
+    plugin, _, _ = make_plugin()
+    plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
+    assert plugin._streams
+    plugin.dispatch("config", {"instance_id": "a", "bound_side": "both"})
+    assert plugin._streams == {} and plugin._claims == {}
+    assert plugin.dispatch("info", {"instance_id": "a"})["state"] == "unset"
 
 
-def test_shared_config_does_not_bind_a_side():
-    plugin, _ = make_plugin()
-    result = plugin.dispatch("config", {"instance_id": "a", "poll_hz": 5})
-    assert result["state"] == "configured" and plugin.poll_hz == 5
-    assert "a" not in plugin._bindings and plugin._streams == {}
-    with pytest.raises(ValueError):
-        plugin.dispatch("config", {"instance_id": "a", "bound_side": "neither"})
-    with pytest.raises(ValueError):
-        plugin.dispatch("config", {"instance_id": "a", "poll_hz": 0})
+def test_get_state_does_not_query_can_before_the_card_starts():
+    plugin, clients, _ = make_plugin()
+    plugin.dispatch("config", {"instance_id": "a", "bound_side": "left"})
+    result = plugin.dispatch("get_state", {"instance_id": "a"})
+    assert result["state"] == "idle" and result["valid"] is False and result["topic_out"]
+    assert clients == {}
 
 
 def test_repeated_start_stop_and_config_replay_do_not_accumulate_workers(ros_runtime):
     ros2, _, nodes = ros_runtime
-    plugin, _ = make_plugin(ros2=ros2)
+    plugin, _, _ = make_plugin(ros2=ros2)
     try:
         for _ in range(3):
             plugin.dispatch("config", {"instance_id": "a", "bound_side": "left"})
@@ -722,328 +830,77 @@ def test_repeated_start_stop_and_config_replay_do_not_accumulate_workers(ros_run
             plugin.dispatch("start", {"instance_id": "a"})
             plugin.dispatch("config", {"instance_id": "a", "bound_side": "left"})
             assert len(plugin._streams) == 1
-            stream = plugin._streams[("left", "can0")]
             assert sum(1 for n in nodes if not n.destroyed) == 1
             assert plugin.dispatch("stop", {"instance_id": "a"})["state"] == "idle"
             assert plugin.dispatch("stop", {"instance_id": "a"})["state"] == "idle"
-            assert not stream.running() and plugin._streams == {}
+            assert plugin._streams == {} and plugin._claims == {}
             assert all(n.destroyed for n in nodes)
     finally:
         plugin.stop()
 
 
-BOTH_DUAL = "/hand/both/right_can_" + b"can1".hex() + "/joints_skeleton"
-
-
-def test_both_hands_card_reads_each_hand_on_its_own_interface_into_one_skeleton(ros_runtime):
-    ros2, published, _ = ros_runtime
-    left, right = FakeClient(), FakeClient([255] * 20)
-    plugin, clients = make_plugin({("left", "can0"): left, ("right", "can1"): right}, ros2=ros2)
-    try:
-        plugin.dispatch("config", {"instance_id": "B", "bound_side": "both", "can_channel": "can0",
-                                   "left_can_channel": "", "right_can_channel": "can1"})
-        info = plugin.dispatch("start", {"instance_id": "B"})
-        assert set(plugin._streams) == {("left", "can0"), ("right", "can1")}
-        assert info["bound_side"] == "both" and info["state"] == "running"
-        assert (info["left_can_channel"], info["right_can_channel"]) == ("can0", "can1")
-        assert [o["topic"] for o in info["topic_out"]][-1] == BOTH_DUAL
-        wait_for(lambda: {p["status"]["side"] for t, p in published if t == BOTH_DUAL} == {"left", "right"})
-        state = plugin.dispatch("get_state", {"instance_id": "B"})
-        assert state["valid"] is True and set(state["hands"]) == {"left", "right"}
-    finally:
-        plugin.stop()
-    assert set(clients) == {("left", "can0"), ("right", "can1")}
-    for topic, payload in published:
-        if topic == BOTH_DUAL:
-            side = payload["status"]["side"]
-            assert payload["status"]["can_channel"] == ("can0" if side == "left" else "can1")
-            assert all(e["name"].startswith(side + "_") for e in payload["joints"])
-
-
-def test_both_hands_card_keeps_one_failing_hand_out_of_the_skeleton(ros_runtime):
-    ros2, published, _ = ros_runtime
-    right = FakeClient()
-    right.error = PositionQueryTimeout("位置回复超时", {})
-    plugin, _ = make_plugin({("right", "can1"): right}, ros2=ros2)
-    args = {"instance_id": "B", "bound_side": "both", "can_channel": "can1"}
-    try:
-        plugin.dispatch("start", args)
-        wait_for(lambda: sum(1 for t, _ in published if t == "/hand/both/left_can_" + b"can1".hex()
-                             + "/right_can_" + b"can1".hex() + "/joints_skeleton") >= 2)
-        wait_for(lambda: any(t.startswith("/hand/right/") for t, _ in published))
-        info = plugin.dispatch("info", args)
-    finally:
-        plugin.stop()
-    skeleton_sides = {p["status"]["side"] for t, p in published if t.startswith("/hand/both/")}
-    assert skeleton_sides == {"left"}
-    assert info["sample_state"] == "error" and info["sample_valid"] is False
-    assert info["hands"]["left"]["sample_state"] == "ok"
-
-
-def test_both_hands_card_shares_workers_with_single_hand_cards_and_releases_its_own(ros_runtime):
-    ros2, published, nodes = ros_runtime
-    plugin, _ = make_plugin(ros2=ros2)
-    try:
-        plugin.dispatch("start", {"instance_id": "L", "bound_side": "left"})
-        plugin.dispatch("start", {"instance_id": "B", "bound_side": "both"})
-        assert set(plugin._streams) == {("left", "can0"), ("right", "can0")}
-        left = plugin._streams[("left", "can0")]
-        assert set(left._dual_pubs) == {"/hand/both/joints_skeleton"}
-        plugin.dispatch("stop", {"instance_id": "B"})
-        assert set(plugin._streams) == {("left", "can0")} and left.running()
-        assert left._dual_pubs == {} and left.dual_topics == set()
-        published.clear()
-        wait_for(lambda: any(t == "/hand/left/joints_skeleton" for t, _ in published))
-        assert not any(t.startswith("/hand/both/") for t, _ in published)
-        # Switching a both-hands card to one side releases the other hand.
-        plugin.dispatch("start", {"instance_id": "B", "bound_side": "both"})
-        plugin.dispatch("config", {"instance_id": "B", "bound_side": "right"})
-        assert set(plugin._streams) == {("left", "can0"), ("right", "can0")}
-        assert left._dual_pubs == {} and plugin._streams[("right", "can0")]._dual_pubs == {}
-        plugin.dispatch("stop", {"instance_id": "L"})
-        plugin.dispatch("stop", {"instance_id": "B"})
-        assert plugin._streams == {} and all(n.destroyed for n in nodes)
-    finally:
-        plugin.stop()
-
-
-def test_both_hands_card_follows_per_hand_interface_changes(ros_runtime):
-    ros2, _, _ = ros_runtime
-    plugin, _ = make_plugin(ros2=ros2)
-    try:
-        plugin.dispatch("start", {"instance_id": "B", "bound_side": "both"})
-        plugin.dispatch("config", {"instance_id": "B", "right_can_channel": "can1"})
-        assert set(plugin._streams) == {("left", "can0"), ("right", "can1")}
-        plugin.dispatch("config", {"instance_id": "B", "right_can_channel": ""})
-        assert set(plugin._streams) == {("left", "can0"), ("right", "can0")}
-        with pytest.raises(ValueError):
-            plugin.dispatch("config", {"instance_id": "B", "left_can_channel": "bad name"})
-    finally:
-        plugin.stop()
-
-
-def test_both_hands_card_started_directly_keeps_its_interface(ros_runtime):
-    ros2, _, _ = ros_runtime
-    plugin, _ = make_plugin(ros2=ros2)
-    try:
-        plugin.dispatch("start", {"instance_id": "B", "bound_side": "both", "can_channel": "can1"})
-        info = plugin.dispatch("info", {"instance_id": "B"})
-        assert (info["can_channel"], info["left_can_channel"], info["right_can_channel"]) == ("can1",) * 3
-        assert info["topic_out"][-1]["topic"] == plugin.dual_topic("can1", "can1")
-        # A partial config moves only the hand it names.
-        plugin.dispatch("config", {"instance_id": "B", "right_can_channel": "can2"})
-        assert set(plugin._streams) == {("left", "can1"), ("right", "can2")}
-    finally:
-        plugin.stop()
-
-
 class BlockingClient(FakeClient):
-    """Position query that does not return until released."""
-
     def __init__(self):
         super().__init__()
-        self.entered = threading.Event()
+        self.enter = threading.Event()
         self.release = threading.Event()
 
     def get_positions_vector(self, timeout_s=None):
-        self.entered.set()
+        self.calls += 1
+        self.enter.set()
         self.release.wait(10)
         return super().get_positions_vector(timeout_s)
 
 
-def test_both_hands_state_before_a_hand_finishes_its_first_round_is_waiting(ros_runtime):
-    ros2, _, _ = ros_runtime
-    left = BlockingClient()
-    plugin, _ = make_plugin({("left", "can0"): left}, ros2=ros2)
-    try:
-        plugin.dispatch("start", {"instance_id": "B", "bound_side": "both"})
-        assert left.entered.wait(3)
-        wait_for(lambda: plugin._streams[("right", "can0")].latest.get("valid"))
-        state = plugin.dispatch("get_state", {"instance_id": "B"})
-    finally:
-        left.release.set()
-        plugin.stop()
-    assert state["valid"] is False and state["hands"]["right"]["valid"] is True
-    waiting = state["hands"]["left"]
-    assert waiting["valid"] is False and waiting["state"] == "waiting" and waiting["reason"]
-    assert waiting["sample_state"] == "waiting" and waiting["timestamp"] is None
-    assert all(j["raw"] is None for j in waiting["joints"])
-
-
 def test_stop_that_times_out_keeps_the_card_owning_its_worker(ros_runtime):
-    ros2, published, _ = ros_runtime
-    client = BlockingClient()
-    plugin, _ = make_plugin({("left", "can0"): client}, ros2=ros2, config={"query_timeout_s": 0.02})
-    json_topic = plugin.topics("left", "can0")[0]
+    ros2, _, _ = ros_runtime
+    plugin, clients, _ = make_plugin(ros2=ros2, config={"query_timeout_s": 0.02})
+    client = clients[("left", "can0")] = BlockingClient()
     try:
-        plugin.dispatch("start", {"instance_id": "A", "bound_side": "left"})
-        assert client.entered.wait(3)
-        worker = plugin._streams[("left", "can0")]
-        # Blocked longer than the join timeout: the stop fails...
+        plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
+        wait_for(lambda: client.enter.is_set())
         with pytest.raises(RuntimeError):
-            plugin.dispatch("stop", {"instance_id": "A"})
-        # ...but the card still owns the worker, so retrying reaches it.
-        assert plugin._streams[("left", "can0")] is worker and worker.running()
+            plugin.dispatch("stop", {"instance_id": "a"})
+        assert "a" in plugin._streams and plugin._claims["a"] == ("left", "can0")
         client.release.set()
-        plugin.dispatch("stop", {"instance_id": "A"})
-        assert plugin._owners == {} and plugin._streams == {} and not worker.running()
-        assert [p for t, p in published if t == json_topic and p["state"] == "idle"]
+        wait_for(lambda: not plugin._streams["a"].running())
+        plugin.dispatch("stop", {"instance_id": "a"})
+        assert plugin._streams == {} and plugin._claims == {}
     finally:
         client.release.set()
         plugin.stop()
 
 
-def test_target_switch_that_cannot_stop_the_old_worker_keeps_it_reachable(ros_runtime):
+def test_driver_stop_keeps_a_worker_it_cannot_stop_and_its_can_client(ros_runtime):
     ros2, _, _ = ros_runtime
-    blocked = BlockingClient()
-    plugin, _ = make_plugin({("left", "can0"): blocked}, ros2=ros2,
-                            config={"query_timeout_s": 0.02})
+    plugin, clients, _ = make_plugin(ros2=ros2, config={"query_timeout_s": 0.02})
+    client = clients[("left", "can0")] = BlockingClient()
     try:
-        plugin.dispatch("start", {"instance_id": "A", "bound_side": "left"})
-        assert blocked.entered.wait(3)
-        abandoned = plugin._streams[("left", "can0")]
-        # The switch cannot stop the left worker, so it reports the failure...
-        with pytest.raises(RuntimeError):
-            plugin.dispatch("config", {"instance_id": "A", "bound_side": "right"})
-        # ...and the worker it could not stop stays reachable: a stop of the same
-        # card still ends it instead of leaving an ownerless thread behind.
-        blocked.release.set()
-        plugin.dispatch("stop", {"instance_id": "A"})
-        assert plugin._owners == {} and plugin._streams == {}
-        assert not abandoned.running()
-    finally:
-        blocked.release.set()
-        plugin.stop()
-
-
-def test_partially_completed_dual_stop_leaves_the_stopped_hand_to_the_next_card(ros_runtime):
-    ros2, _, _ = ros_runtime
-    blocked = BlockingClient()
-    plugin, _ = make_plugin({("right", "can0"): blocked}, ros2=ros2,
-                            config={"query_timeout_s": 0.02})
-    try:
-        plugin.dispatch("start", {"instance_id": "B", "bound_side": "both"})
-        assert blocked.entered.wait(3)
-        with pytest.raises(RuntimeError):
-            plugin.dispatch("stop", {"instance_id": "B"})
-        # The left hand did stop, so B no longer owes anything for it.
-        assert set(plugin._streams) == {("right", "can0")}
-        # Another card takes the freed hand and stops it: that stop must work.
-        plugin.dispatch("start", {"instance_id": "C", "bound_side": "left"})
-        plugin.dispatch("stop", {"instance_id": "C"})
-        assert set(plugin._streams) == {("right", "can0")}
-        blocked.release.set()
-        plugin.dispatch("stop", {"instance_id": "B"})
-        assert plugin._owners == {} and plugin._streams == {}
-    finally:
-        blocked.release.set()
-        plugin.stop()
-
-
-def test_start_while_a_hand_is_still_stopping_does_not_take_it_over(ros_runtime):
-    ros2, _, _ = ros_runtime
-    blocked = BlockingClient()
-    plugin, _ = make_plugin({("left", "can0"): blocked}, ros2=ros2,
-                            config={"query_timeout_s": 0.02})
-    try:
-        plugin.dispatch("start", {"instance_id": "A", "bound_side": "left"})
-        assert blocked.entered.wait(3)
-        with pytest.raises(RuntimeError):
-            plugin.dispatch("stop", {"instance_id": "A"})
-        # The worker is still shutting down: a second card must not treat it as
-        # its own running stream.
-        with pytest.raises(RuntimeError):
-            plugin.dispatch("start", {"instance_id": "B", "bound_side": "left"})
-        assert "B" not in plugin._owners and "B" not in plugin._channels
-        blocked.release.set()
-        plugin.dispatch("stop", {"instance_id": "A"})
-        plugin.dispatch("start", {"instance_id": "B", "bound_side": "left"})
-        assert plugin._owners["B"][0] == (("left", "can0"),)
-        assert plugin._streams[("left", "can0")].running()
-    finally:
-        blocked.release.set()
-        plugin.stop()
-
-
-def test_driver_stop_keeps_a_worker_it_cannot_stop_and_its_can_client(ros_runtime, monkeypatch):
-    ros2, _, _ = ros_runtime
-    blocked = BlockingClient()
-    ctrl = mock.Mock(get=mock.Mock(return_value=blocked))
-    monkeypatch.setattr(hand_device, "GLOBAL_CONTROLLERS", {("left", "can0"): ctrl})
-    import joints_device
-    monkeypatch.setattr(joints_device, "GLOBAL_CONTROLLERS", hand_device.GLOBAL_CONTROLLERS)
-    hand = SimpleNamespace(hand_config={}, config=GLOBAL_CONFIG, _lock=threading.RLock(), _controllers={})
-    plugin = JointsPlugin(hand, {"poll_hz": 30, "query_timeout_s": 0.02}, global_config=GLOBAL_CONFIG, ros2=ros2)
-    try:
-        plugin.dispatch("start", {"instance_id": "A", "bound_side": "left"})
-        assert blocked.entered.wait(3)
-        worker = plugin._streams[("left", "can0")]
-        # The worker is blocked beyond the join timeout: the driver stop says so...
+        plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
+        wait_for(lambda: client.enter.is_set())
         with pytest.raises(RuntimeError):
             plugin.stop()
-        # ...keeps the worker reachable and does not close the client under it.
-        assert plugin._streams.get(("left", "can0")) is worker and worker.running()
-        ctrl.close.assert_not_called()
-        blocked.release.set()
-        # The card's own stop still reaches it once the query returns.
-        plugin.dispatch("stop", {"instance_id": "A"})
-        assert plugin._streams == {} and not worker.running()
-        ctrl.close.assert_called_once()
-    finally:
-        blocked.release.set()
+        assert "a" in plugin._streams and plugin._claims["a"] == ("left", "can0")
+        client.release.set()
+        wait_for(lambda: not plugin._streams["a"].running())
         plugin.stop()
-
-
-def test_failed_second_hand_start_keeps_a_first_hand_it_cannot_stop_reachable(ros_runtime, monkeypatch):
-    ros2, _, _ = ros_runtime
-    blocked = BlockingClient()
-    ctrl = mock.Mock(get=mock.Mock(return_value=blocked))
-    monkeypatch.setattr(hand_device, "GLOBAL_CONTROLLERS", {("left", "can0"): ctrl})
-    import joints_device
-    monkeypatch.setattr(joints_device, "GLOBAL_CONTROLLERS", hand_device.GLOBAL_CONTROLLERS)
-    original_start = joints_device._JointsStream.start
-
-    def start(stream):
-        if stream.side == "right":
-            # The left worker is already inside a query that outlasts the join.
-            assert blocked.entered.wait(3)
-            raise RuntimeError("right hand start failed")
-        original_start(stream)
-
-    monkeypatch.setattr(joints_device._JointsStream, "start", start)
-    hand = SimpleNamespace(hand_config={}, config=GLOBAL_CONFIG, _lock=threading.RLock(), _controllers={})
-    plugin = JointsPlugin(hand, {"poll_hz": 30, "query_timeout_s": 0.02}, global_config=GLOBAL_CONFIG, ros2=ros2)
-    try:
-        with pytest.raises(RuntimeError, match="right hand start failed"):
-            plugin.dispatch("start", {"instance_id": "B", "bound_side": "both"})
-        # The rollback could not stop the left worker: it stays registered and
-        # its CAN client stays open instead of becoming an ownerless thread.
-        worker = plugin._streams.get(("left", "can0"))
-        assert worker is not None and worker.running()
-        assert ("right", "can0") not in plugin._streams and "B" not in plugin._owners
-        ctrl.close.assert_not_called()
-        # Another card cannot put a second worker on the same hand meanwhile.
-        with pytest.raises(RuntimeError):
-            plugin.dispatch("start", {"instance_id": "C", "bound_side": "left"})
-        assert plugin._streams[("left", "can0")] is worker
-        blocked.release.set()
-        # The failed card's stop still reaches the worker once the query returns.
-        plugin.dispatch("stop", {"instance_id": "B"})
-        assert plugin._streams == {} and not worker.running()
-        ctrl.close.assert_called_once()
+        assert plugin._streams == {} and plugin._claims == {}
     finally:
-        blocked.release.set()
-        plugin.stop()
+        client.release.set()
+        try:
+            plugin.stop()
+        except RuntimeError:
+            pass
 
 
 def test_unknown_action_is_left_to_the_mcp_handler_as_an_error():
-    plugin, clients = make_plugin()
+    plugin, clients, _ = make_plugin()
     assert plugin.dispatch("calibrate", {"instance_id": "A", "bound_side": "left"}) is None
     assert clients == {}
 
 
 def test_driver_does_not_start_acquisition_on_boot():
-    plugin, clients = make_plugin()
+    plugin, clients, _ = make_plugin()
     plugin.start()
     time.sleep(0.05)
     assert plugin._streams == {} and clients == {}
@@ -1051,12 +908,24 @@ def test_driver_does_not_start_acquisition_on_boot():
 
 # ── integration with the other cards ───────────────────────────────────
 
-def test_shipped_config_registers_joints_after_existing_cards():
+def test_schema_exposes_only_the_side_and_no_rate_or_channel():
+    plugin = JointsPlugin(None, {}, global_config=GLOBAL_CONFIG)
+    definition = plugin.get_tools()[0]
+    props = definition["configSchema"]["properties"]
+    assert set(props) == {"bound_side"}
+    assert props["bound_side"]["enum"] == ["left", "right"]
+    assert not definition.get("topic_out")
+
+
+def test_shipped_config_has_no_rate_setting_and_registers_joints_last():
     config = yaml.safe_load((DRIVER / "config.yaml").read_text())
+    joints_config = config["plugins"]["joints"]
+    assert "poll_hz" not in joints_config
     plugins = build_plugins(config, "", None)
     assert [p.PREFIX for p in plugins] == ["hand", "hand_gesture", "hand_grasp", "hand_tactile", "joints"]
     joints = plugins[-1]
-    assert joints.hand is plugins[0] and joints.poll_hz == config["plugins"]["joints"]["poll_hz"]
+    assert joints.query_timeout_s == joints_config["query_timeout_s"]
+    assert JOINT_NAMES_16 and POLL_HZ == 30.0
 
 
 def test_disabled_joints_section_registers_nothing():
@@ -1081,47 +950,3 @@ def test_plugin_stop_closes_only_controllers_the_hand_card_does_not_own(monkeypa
     own.close.assert_called_once()
     owned.release_torque.assert_not_called()
     own.release_torque.assert_not_called()
-
-
-def test_last_card_to_release_a_hand_closes_the_can_client_it_opened(ros_runtime, monkeypatch):
-    ros2, _, _ = ros_runtime
-    clients = {}
-
-    def controller(target):
-        client = clients[target] = FakeClient()
-        return mock.Mock(get=mock.Mock(return_value=client))
-
-    left, right, other = controller(("left", "can0")), controller(("right", "can0")), controller(("left", "can1"))
-    monkeypatch.setattr(hand_device, "GLOBAL_CONTROLLERS",
-                        {("left", "can0"): left, ("right", "can0"): right, ("left", "can1"): other})
-    import joints_device
-    monkeypatch.setattr(joints_device, "GLOBAL_CONTROLLERS", hand_device.GLOBAL_CONTROLLERS)
-    # The hand card already uses the right hand for its own actions.
-    hand = SimpleNamespace(hand_config={}, config=GLOBAL_CONFIG, _lock=threading.RLock(),
-                           _controllers={("right", "can0"): right})
-    plugin = JointsPlugin(hand, {"poll_hz": 30}, global_config=GLOBAL_CONFIG, ros2=ros2)
-    try:
-        plugin.dispatch("start", {"instance_id": "A", "bound_side": "left"})
-        plugin.dispatch("start", {"instance_id": "B", "bound_side": "left"})
-        wait_for(lambda: clients[("left", "can0")].calls)
-        plugin.dispatch("stop", {"instance_id": "A"})
-        left.close.assert_not_called()  # B still reads this hand
-        plugin.dispatch("stop", {"instance_id": "B"})
-        left.close.assert_called_once()
-        # Moving a card to another interface closes the client it left behind.
-        plugin.dispatch("start", {"instance_id": "A", "bound_side": "left", "can_channel": "can1"})
-        plugin.dispatch("config", {"instance_id": "A", "can_channel": "can0"})
-        other.close.assert_called_once()
-        plugin.dispatch("stop", {"instance_id": "A"})
-        assert left.close.call_count == 2
-        # A one-off read on an idle hand does not leave its client open either.
-        assert plugin.dispatch("get_state", {"instance_id": "C", "bound_side": "left"})["valid"] is True
-        assert left.close.call_count == 3
-        # A hand the hand card uses is never closed by this card.
-        plugin.dispatch("start", {"instance_id": "R", "bound_side": "right"})
-        plugin.dispatch("stop", {"instance_id": "R"})
-        plugin.dispatch("get_state", {"instance_id": "R"})
-    finally:
-        plugin.stop()
-    right.close.assert_not_called()
-    assert plugin._used_targets == set()

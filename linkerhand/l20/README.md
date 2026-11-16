@@ -8,7 +8,7 @@
 | `hand_gesture` | `actuator` | 预置手势、0–9 数字及已调试的拇指避碰路径 |
 | `hand_grasp` | `actuator` | 自适应接触停止抓取、释放和状态读取 |
 | `hand_tactile` | `sensor` | 按卡片选择采集左右手触觉，发布供 Core 渲染的实时触觉数据 |
-| `joints` | `sensor` | 按卡片选择左手、右手或双手（各自 CAN 接口），持续读取 16 主动关节实测位置，同时输出 JSON 与实时骨架 |
+| `joints` | `sensor` | 每张卡片选择左手或右手，CAN 接口自动匹配，持续读取 16 主动关节实测位置，同时输出 JSON 与该手的实时骨架 |
 
 另有 `model`（`resource`）向 Core 提供左右手骨架 URDF，不是画布卡片。
 
@@ -134,51 +134,49 @@ Core 的触觉渲染器用五指 12×6 阵列和指尖压力绘制热力图，�
 
 Core 可先发送共享 `poll_hz`，再发送实例 `bound_side/can_channel`。单独设置频率不要求左右手，也不覆盖实例选择；显式传入的 `bound_side` 必须是 `left/right`。启动采集后，通过 WebSocket 持续接收触觉 JSON；`sequence` 和 `timestamp` 用于判断是否在更新。停止采集后，网页可能保留最后一帧，它不代表仍在更新。
 
-### 2.5 `joints`：关节状态与实时骨架
+### 2.5 `joints`：单手关节状态与实时骨架
 
 类型为 `sensor`，只发送位置查询帧 `0x41..0x45`，不发送运动、扭矩、清错或校准指令，不要求运动确认。
 
-使用方法与 `hand_tactile` 相同：在齿轮中选择 `BOUND_SIDE` 和“高级：CAN 接口”（与控制卡片使用的接口一致，例如 `can1`），保存后开启智能控制。`BOUND_SIDE` 可选：
+一张卡片对应一只手：在齿轮里选择左手或右手（`bound_side`），驱动在该侧**自动匹配**一个空闲的 CAN 接口和手，不需要手工选 CAN 口。驱动启动时不自动采集，只有卡片 `start` 后才开始。
 
-- `left` / `right`：单手模式，本卡片只读一只手，骨架窗口只有这只手在动；
-- `both`：双手模式，一张卡片同时读两只手，两只手画在同一个骨架窗口。左右手的 CAN 接口分别由“双手模式：左手 CAN 接口”“双手模式：右手 CAN 接口”设置，留空则沿用“高级：CAN 接口”。
+**匹配规则**：枚举本机 socketcan 接口，跳过没有载波的接口（本板 `can0` 是未接线的 mttcan），用一次只读位置查询确认该接口上该侧的手是否应答。一张手同一时刻只归一张 `joints` 卡（不共享），同侧多张卡按接口名顺序分配。找不到空闲手时卡片不会启动失败，而是进入 `waiting` 状态：
 
-同一只手（同侧、同接口）的多张卡片共用一个采集线程，双手卡片与单手卡片也共用。驱动启动时不自动采集，只有卡片 `start` 后才开始。
+- JSON 按 1 Hz 发布 `state=waiting`、`valid=false`，`reason` 说明"没有空闲的左手：can1 已被其他卡片占用"或"未在 can1 上找到左手"；
+- 不发布骨架帧，骨架画布保持静态；
+- 每 2 s 重新探测一次（只探没有被其他卡片占用的手），插上对应的手后自动认领并切到 30 Hz；
+- 卡片 `stop` 后释放占位，等待中的其他卡片在下一次探测时接手；worker 停不掉时保留占位，避免另一张卡在旧线程还在查询时抢走同一只手。
 
-每轮采集执行一次新的位置查询，同一结果同时生成 JSON 与骨架输出，`sequence` 相同：
+**容量**：L20 的 CAN ID 由手侧固定（左 `0x28`、右 `0x27`），所以一条总线最多一只左手 + 一只右手；N 条总线最多 N 左 + N 右。本板目前只有 `can1` 一条可用总线，"两只左手"需要第二条总线（或引出 `can0`），当前硬件无法真机验证。
 
-| 模式 | 输出 | 话题（默认 CAN 接口） | 格式 | 发布条件 |
-| --- | --- | --- | --- | --- |
-| 单手 | 关节 JSON | `/{namespace}/hand/{side}/joints` | `data/json` | 每轮发布，失败时 `valid=false` |
-| 单手 | 骨架 | `/{namespace}/hand/{side}/joints_skeleton` | `sensor/skeleton` | 只在本轮有效时发布 |
-| 双手 | 左手 JSON、右手 JSON | 同单手 JSON，各一路 | `data/json` | 同上，两只手各自判断 |
-| 双手 | 骨架（两只手共用） | `/{namespace}/hand/both/joints_skeleton` | `sensor/skeleton` | 某只手本轮有效时发布该手的一帧 |
+**频率**：固定 30 Hz（每轮一次新的五帧位置查询，上一轮结束才开始下一轮），不提供频率设置；`measured_hz` 报告最近成功轮次的实测值。与同一只手的触觉矩阵同时工作时手的应答会变慢，实测可能低于 30 Hz（2026-11-13 实测：单独 29.9 Hz，触觉同跑 21.8 Hz）。
 
-非默认 CAN 接口时沿用触觉卡片的规则：JSON 与单手骨架在路径中加入 `/can_<接口名十六进制>`，双手骨架加入 `/left_can_<十六进制>`、`/right_can_<十六进制>`（只加非默认接口的那只手），以 `info.topic_out` 为准。双手骨架的每帧只含一只手（`left_*` 或 `right_*`）的关节，Core 只更新帧中出现的关节，因此两只手在同一窗口中各自更新；某只手失效时，该手停在最后一帧，另一只手照常更新。Core 不允许两张卡片发布同一 topic，所以双手骨架只能由双手卡片输出，不能用两张单手卡片拼成一个窗口。JSON 排在骨架之前，“查看数据流”默认打开第一路 JSON。
+**话题**：每张卡一个独立话题，后缀来自卡片实例 ID（去掉非字母数字、取前 16 位，缺省 `card`）；删卡重建后后缀会变。`topic_out` 以 `info` 为准，JSON 排在骨架之前。
 
-双手模式的 `info` 在顶层给出 `bound_side=both`、`left_can_channel`、`right_can_channel`、`topic_out`、`sample_state`（取两只手中较差的状态）、`sample_valid`（两只手都有效才为 `true`），每只手的详细信息在 `hands.left` / `hands.right`；`get_state` 同样按手放在 `hands` 中。
+| 输出 | 话题 | 格式 | 发布条件 |
+| --- | --- | --- | --- |
+| 关节 JSON | `/{namespace}/hand/{side}/joints_{card}` | `data/json` | 每轮发布，失败或等待时 `valid=false` |
+| 骨架 | `/{namespace}/hand/{side}/joints_{card}_skeleton` | `sensor/skeleton` | 只在本轮有效时发布 |
 
-JSON 主要字段：`valid`、`state`、`reason`、`error_details`、`side`、`can_channel`、`can_id`、`sequence`、`timestamp`（收到本轮完整回复的时间，失败时为 `null`）、`published_at`、`source=can_position_query`、`query_elapsed_s`、`measured_hz`（最近成功轮次的实测频率）、`joint_count=16`、`raw_unit`、`angle_unit=rad`、`angle_source`、`reserved_vector_indexes=[11,12,13,14]` 和 `joints`。`joints` 每项包含 `name`、`label`、`vector_index`、`model_joint`、`raw`（0..255 实测原始值）、`angle_rad`、`angle_deg`。四个保留槽位不作为关节输出。
+同一驱动的两张卡 topic 不同，因此各占一个骨架画布。`info` 的 `state` 可能是 `unset`（还没选左右手，`topic_out=[]`）、`waiting`（已选侧别但没匹配到手，`can_channel=null`，`waiting_reason` 给出原因）、`running` 或 `idle`。`get_state` 在采集运行时返回最近一轮；未运行时直接返回 `state=idle`、`valid=false`，不再单独查询 CAN。
+
+JSON 主要字段：`valid`、`state`、`reason`、`error_details`、`side`、`can_channel`（等待时为 `null`）、`can_id`、`sequence`、`timestamp`（收到本轮完整回复的时间，失败时为 `null`）、`published_at`、`source=can_position_query`、`query_elapsed_s`、`measured_hz`（最近成功轮次的实测频率）、`joint_count=16`、`raw_unit`、`angle_unit=rad`、`angle_source`、`reserved_vector_indexes=[11,12,13,14]` 和 `joints`。`joints` 每项包含 `name`、`label`、`vector_index`、`model_joint`、`raw`（0..255 实测原始值）、`angle_rad`、`angle_deg`。四个保留槽位不作为关节输出。
 
 **角度来源**：`angle_source=vendor_g20_calibration_table_adjusted`。角度按厂家官网为本型号提供的标定文件（`resource/g20_{left,right}_G20.json`）逐关节查表：每个 URDF 关节有对应电机（`motor_index`，即驱动 20 项向量下标）和 256 项 raw→弧度表，`model_joint` 也按这份对应关系给出。注意驱动命名的 `thumb_yaw`（下标 5）驱动 URDF 的 `thumb_cmc_roll`，`thumb_roll`（下标 10）驱动 `thumb_cmc_yaw`。标定来自厂家参考机（序列号 `G20_*_001`），厂家答复无需逐台重新标定。厂家 SDK（[linkerbot-hand-legacy-cpp-sdk](https://github.com/linker-bot/linkerbot-hand-legacy-cpp-sdk) 的 README）明确写着 `L20_10`、`L20_11` 别名 `G20`，而普通 `L20` 是另一款手。本机型号为 **L20-10**，厂家提供的这套文件名带 `g20`，就是 L20-10 的模型与标定；厂家已确认（2026-11-16）它适用于 L20-10。唯一的调整：左手四指侧摆（`{index,middle,ring,pinky}_mcp_roll`）的表取反使用。厂家左手文件里这四张表与右手同号，而左右 URDF 的侧摆轴相同，照原表 V 手势在左手骨架上会并拢（真机，2026-11-13）；调整见 `joints_model.NEGATED_TABLES`。离线核对中，左右手模型都能复现 OK、V 预设手势；右手拇指 pitch、yaw、tip 的方向与真机一致；`thumb_roll` 已在左右手真机上逐一核对（0 与 255，2026-11-16）。`raw` 始终是实测值，可独立使用。
 
-超时、部分回复或数值异常时，JSON 发布 `valid=false`、`raw/angle` 为 `null` 及原因，不用旧位置补齐；骨架不发布新帧。**卡片停止时补发一帧停止通知**（`state=idle`、`valid=false`、`reason=关节采集已停止；本帧不含实测值`，`timestamp`、`query_elapsed_s`、`measured_hz` 为 `null`，各关节 `raw/angle` 为 `null`），否则界面会一直按最后一帧的 `ok/valid=true` 展示；停止通知也不发骨架帧，因为渲染器没有失效状态，会继续停在最后一帧。判断是否实时以 JSON 的 `valid`、`sequence` 与 `timestamp` 为准。`get_state`（无界面按钮）在采集运行时返回最近一轮结果，超过 `stale_after_s` 的数据标为无效；未运行时执行一次查询。
+超时、部分回复或数值异常时，JSON 发布 `valid=false`、`raw/angle` 为 `null` 及原因，不用旧位置补齐；骨架不发布新帧。**卡片停止时补发一帧停止通知**（`state=idle`、`valid=false`、`reason=关节采集已停止；本帧不含实测值`，`timestamp`、`query_elapsed_s`、`measured_hz` 为 `null`，各关节 `raw/angle` 为 `null`），否则界面会一直按最后一帧的 `ok/valid=true` 展示；停止通知也不发骨架帧，因为渲染器没有失效状态，会继续停在最后一帧。判断是否实时以 JSON 的 `valid`、`sequence` 与 `timestamp` 为准。
 
-骨架模型来自同一下载中的 L20-10（文件名 `linkerhand_g20_*`）左右手 URDF（来源、许可（Apache-2.0，见 `resource/LICENSE`）和未包含的网格见 `resource/SOURCE.md`）。Core 每个驱动只请求一个模型，因此驱动把左右手合并为一个仅含运动学的双手模型，左右并排并按 4 倍放大以适配 Core 的相机；每路骨架帧只驱动本侧关节。骨架中：
+**骨架模型**：Core 取模型时会带上骨架面板的 topic（Core PR #399 的 `model` 工具 `topic` 参数）。骨架关节名统一带 `{side}_hand_` 前缀（例如 `right_hand_ring_mcp_pitch`，link 名仍是 `{side}_...`），因为 Core 渲染器按关节名里是否含 `hand` 决定手部样式：含 `hand` 的关节骨骼细（0.004）、关节球小（0.006），否则会按机器人级骨骼（0.008）和更大的球（0.012）绘制；不加前缀时无名指、小拇指会明显偏粗。驱动按话题里的 `/hand/left|right/` 返回**单手 URDF**：只有该手、居中、4 倍放大、掌心朝向 Core 的默认相机；没带 topic 时退回原来的双手 URDF，旧 Core 不会出现"左卡画右手"的错图。模型来源、许可和指尖/被动关节规则不变：骨架中的 16 个主动关节限制在 URDF 限位内（`clamped_to_model=true` 时 JSON 的 `angle_rad` 仍保留查表值）；5 个远端关节按标定表由父关节 raw 推算（`source=derived_calibration`）；每根手指末端另加固定指尖点 `{side}_{finger}_tip`，Core 只把骨骼画到关节点。模型来源与许可见 `resource/SOURCE.md` 和 `resource/LICENSE`。
 
-- 16 个主动关节的角度限制在 URDF 限位内，被限制时 `clamped_to_model=true`（部分标定表略超出限位，JSON 中的 `angle_rad` 保留查表值）；
-- 5 个远端关节是被动关节，按标定文件中它们自己的表由父关节电机的 raw 推算，`source=derived_calibration`，不是独立测量；
-- Core 只把骨骼画到关节点为止，因此每根手指末端另加一个固定的指尖点（`{side}_{finger}_tip`），否则显示出的“指尖”其实是最后一个指节。指尖点沿上一节骨骼的方向延长到厂商 STL 网格末端，手指伸直时画成一条直线（若取网格最远点，指尖会向手背方向弯出）。指尖点在手指中线上而不在指腹，OK 手势时拇指尖与食指尖在模型中仍相距约 23–28 mm。
-- 两只手按镜像摆放：每只手绕竖直轴转 -90°，手心朝向 Core 的默认相机，拇指朝外（左手在左、右手在右，相当于看自己双手的手心）。厂家左右 URDF 的掌心都朝 +x，只平移会显示成同一朝向。
-
-当前 Core 的已知限制：详情面板请求模型时不带驱动 ID，骨架视图会回退为人形模型（Core PR #354 修复，未合并）；Dashboard 骨架视图按驱动 ID 请求模型，应加载本驱动模型（以实际部署验证为准）。Core 按内旋 XYZ 解释 URDF `rpy`，驱动已将拇指的多轴旋转拆成单轴固定关节，使两种解释结果一致。
+**旧卡片兼容**：之前保存的 `bound_side=both`、`can_channel`、`left_can_channel`、`right_can_channel`、`poll_hz` 一律忽略；卡片进 `unset` 状态（`topic_out=[]`），在齿轮里重新选左手或右手即可，不需要删卡重建。
 
 | `plugins.joints` 配置 | 默认值 | 含义 |
 | --- | --- | --- |
 | `enabled` | `true` | 注册 `joints` 卡片和 `model` 资源 |
-| `poll_hz` | `10.0` | 期望采集频率（1–30），上一轮结束才开始下一轮，实际频率见 `measured_hz` |
 | `query_timeout_s` | `0.2` | 单轮等待新位置回复的时限 |
 | `stale_after_s` | `1.0` | `info/get_state` 判断最近一帧过期的时长 |
+
+当前 Core 的已知限制：详情面板请求模型时仍固定使用占位 ID，骨架视图会回退为人形模型（既有问题，未修）；Dashboard 画布会带上 topic，按上面的规则加载单手模型。Core 按内旋 XYZ 解释 URDF `rpy`，驱动已将拇指的多轴旋转拆成单轴固定关节，使两种解释结果一致。
 
 卡片不把自己打开的 CAN 连接登记到 `hand` 卡片，驱动退出时不会因本卡片对任何手下发卸力；只关闭仅由本卡片打开的连接。
 
