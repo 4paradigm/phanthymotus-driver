@@ -168,10 +168,10 @@ adjustments default to zero. Positive X/Y follow image right/down along the
 table, and positive Z moves deeper along the downward tool axis.
 Set `observation_joints_deg` to seven
 measured FR3 angles in degrees; RealMan's default angles are invalid for FR3.
-Supply `speed_deg_s` explicitly on each transfer action (0.1–5 degrees/s),
-without a default. Transfer and return use that same requested joint speed limit.
-The 5 degrees/s limit is the current driver commissioning cap, not a percentage
-reference or the FR3 hardware maximum. No speed-percentage setting is exposed.
+Configure `speed_deg_s` (default 5, minimum 0.1 degrees/s) and
+`speed_mm_s` (default 20, range 0.1–100 mm/s) once on the card. Transfer
+actions use the stored speeds. Native PATH timing applies libfranka’s position-dependent joint speed limits
+and preserves the driver’s acceleration and jerk bounds.
 
 Call `observe` with `confirm_motion=true`; it uses a fixed 2 degrees/s observation speed without a speed input. If already within 0.2 degrees of
 all observation joints, no motion command is sent. Otherwise the card sends
@@ -215,10 +215,7 @@ not a contact-based six-axis TCP calibration. Insufficient depth or an
 unreachable path returns an error without sending motion commands.
 
 Action inputs follow RealMan coordinates/displacements, optional `rotation_deg`,
-and `confirm_motion=true`, with FR3-specific required speed inputs: `speed_deg_s` and `speed_mm_s`.
-Supply `speed_deg_s` (0.1–5 degrees/s) for arm paths and `speed_mm_s` (0.1–100 mm/s)
-on each transfer for Hand opening/closing; there is no default or native Hand
-percentage-speed interface. `force_n` (30–70 N) is persistent configuration and
+and `confirm_motion=true`. `force_n` (30–70 N) is persistent configuration and
 must be set explicitly without an implicit default. RealMan raw force registers and fixed descent distances are not used;
 FR3 retains depth-based grasp-height planning. Fresh `is_grasped` confirmation is required
 before lifting. `info` reports progress; `cancel` stops pending commands without
@@ -233,7 +230,7 @@ Use `grab_by` to grab, move by actual table millimetres and place:
 ```json
 {"action":"grab_by","start_point_x":-0.33,"start_point_y":0.32,
  "delta_x":30,"delta_y":0,"rotation_deg":0,
- "speed_deg_s":5,"speed_mm_s":20,"confirm_motion":true}
+ "confirm_motion":true}
 ```
 
 `delta_x` is positive toward image right; `delta_y` is positive toward image

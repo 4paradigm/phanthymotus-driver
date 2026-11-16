@@ -9,6 +9,7 @@ from uuid import uuid4
 import numpy as np
 from common.vendor_runtime import action_schema, tool
 from hardware import JOINT_LOWER, JOINT_UPPER, JOINT_MARGIN
+from .execution import SPEED_CONFIG
 from .inputs import ObservationInputs
 
 log = logging.getLogger(__name__)
@@ -59,7 +60,8 @@ class PickPlacePlugin:
                            observation_joints_deg=profile.get('observation_joints_deg', ''),
                            x_compensation_mm=0, y_compensation_mm=0, z_compensation_mm=0,
                            observe_after_transfer=profile.get('observe_after_transfer', False),
-                           force_n=profile.get('force_n'))
+                           force_n=profile.get('force_n'),
+                           **{key: spec[2] for key, spec in SPEED_CONFIG.items()})
         self.arm_configs = {self.arm: dict(self.config)}
         if callback is None:
             from device import JointControlPlugin
@@ -72,14 +74,10 @@ class PickPlacePlugin:
     def get_tools(self):
         schema = action_schema({
             'observe': (['confirm_motion'], 'Move to the configured observation pose, settle and retain one synchronized RGB-D/VOP photograph. Uses a fixed 2 deg/s observation speed. Opens the unloaded hand to its maximum permitted width. Wait for ACP completion.'),
-            'grab_to': (['start_point_x','start_point_y','target_point_x','target_point_y','rotation_deg','speed_deg_s','speed_mm_s','confirm_motion'], 'Pick and place at normalized coordinates in the same observation photo, release and return to observation.'),
-            'grab_by': (['start_point_x','start_point_y','delta_x','delta_y','rotation_deg','speed_deg_s','speed_mm_s','confirm_motion'], 'Pick and translate along the observation image right/down directions in actual table millimetres, release and return to observation.'),
+            'grab_to': (['start_point_x','start_point_y','target_point_x','target_point_y','rotation_deg','confirm_motion'], 'Pick and place at normalized coordinates in the same observation photo, release and return to observation.'),
+            'grab_by': (['start_point_x','start_point_y','delta_x','delta_y','rotation_deg','confirm_motion'], 'Pick and translate along the observation image right/down directions in actual table millimetres, release and return to observation.'),
             'cancel': ([], 'Cancel observation and stop only this card\'s active motion. Never opens the gripper.'),
         }, {'confirm_motion': {'type': 'boolean', 'const': True},
-            'speed_deg_s': {'type': 'number', 'minimum': .1, 'maximum': 5,
-                'description': 'Required arm joint speed limit in degrees per second, including the return path.'},
-            'speed_mm_s': {'type': 'number', 'minimum': .1, 'maximum': 100,
-                'description': 'Required Franka Hand opening and closing speed in mm/s.'},
             'start_point_x': {'type': 'number', 'minimum': -1, 'maximum': 1},
             'start_point_y': {'type': 'number', 'minimum': -1, 'maximum': 1},
             'target_point_x': {'type':'number','minimum':-1,'maximum':1},
@@ -101,7 +99,7 @@ class PickPlacePlugin:
             'Returns running/action_id followed by ACP completion or failure. Successful transfers release and return to observation. '
             'observe_after_transfer optionally captures a new observation after returning. Check transfer_completed, return_completed, '
             'recovery_required and observation_required before starting another task. '
-            'Rotation defaults to zero; only request extra rotation when needed. Force is read from configuration; observe uses 2 deg/s; supply arm speed_deg_s and hand speed_mm_s on each transfer. FR3 force is in newtons, not a RealMan raw register value.',
+            'Rotation defaults to zero; only request extra rotation when needed. Force is read from configuration; observe uses 2 deg/s; transfer speeds are read from configuration. FR3 force is in newtons, not a RealMan raw register value.',
             schema, topic_in=[dict(format=fmt, desc=desc, **({'topic': self.inputs.topics[i]} if self.inputs.topics else {}))
                               for i, fmt, desc in ((1, 'image/depth-zlib', 'Depth image'),
                                   (0, 'image/jpeg', 'RGB image'), (2, 'data/json', 'VOP objects'))])
@@ -122,6 +120,10 @@ class PickPlacePlugin:
                     ('x', 'Additional offset in mm. Positive toward image right along the table.'),
                     ('y', 'Additional offset in mm. Positive toward image down along the table.'),
                     ('z', 'Additional depth in mm. Positive downward along the tool axis.'))},
+            **{name: {'type': 'number', 'minimum': low,
+                      **({'maximum': high} if math.isfinite(high) else {}),
+                      'default': default, 'title': title}
+               for name, (low, high, default, title) in SPEED_CONFIG.items()},
             'force_n': {'type': 'number', 'minimum': 30, 'maximum': 70,
                 'description': 'Required Franka Hand grasp force in newtons; configure explicitly before transferring.'},
             'observe_after_transfer': {'type': 'boolean', 'default': False,
@@ -168,7 +170,6 @@ class PickPlacePlugin:
             if action == 'config':
                 updates = {k: v for k, v in args.items() if k not in ('_tool_name', 'instance_id')}
                 # Ignore the removed persistent hand-speed field from older saved canvases.
-                updates.pop('speed_mm_s', None)
                 updates.pop('speed_percent', None)
                 legacy_depth = updates.pop('depth_compensation_mm', None)
                 poses = {arm: updates.pop(f'{arm}_observation_joints_deg', None)
@@ -184,7 +185,8 @@ class PickPlacePlugin:
                     defaults = dict(arm=label, observation_joints_deg=profile.get('observation_joints_deg', ''),
                                     x_compensation_mm=0, y_compensation_mm=0, z_compensation_mm=0,
                                     observe_after_transfer=profile.get('observe_after_transfer', False),
-                                    force_n=profile.get('force_n', self.config['force_n']))
+                                    force_n=profile.get('force_n', self.config['force_n']),
+                                    **{key: self.config[key] for key in SPEED_CONFIG})
                     saved = self.arm_configs.get(arm, defaults)
                     if poses[arm] is not None:
                         updates['observation_joints_deg'] = poses[arm]
@@ -213,7 +215,7 @@ class PickPlacePlugin:
                         raise ValueError('Selected arm hand-eye identity does not match its robot and camera')
                     if type(cfg['observe_after_transfer']) is not bool:
                         raise ValueError('observe_after_transfer must be a boolean')
-                    for name, low, high in (('force_n', 30, 70), *((f'{axis}_compensation_mm', -50, 50) for axis in 'xyz')):
+                    for name, low, high in (('force_n', 30, 70), *((name, spec[0], spec[1]) for name, spec in SPEED_CONFIG.items()), *((f'{axis}_compensation_mm', -50, 50) for axis in 'xyz')):
                         value = cfg[name]
                         if name == 'force_n' and value is None: continue
                         if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
@@ -251,7 +253,7 @@ class PickPlacePlugin:
                 from .execution import parameters
                 from .transfer import parameters as transfer_parameters
                 try:
-                    options = parameters(self.config, args)
+                    options = parameters(self.config)
                     transfer = transfer_parameters(action,args)
                 except (ValueError, OverflowError) as exc:
                     return dict(state='error',message=str(exc))
@@ -324,7 +326,7 @@ class PickPlacePlugin:
                     if time.monotonic() >= deadline:
                         raise TimeoutError('Hand connection timed out')
                 from .execution import PickExecution
-                executor = PickExecution(active, session, hand, {'speed_mm_s': 20})
+                executor = PickExecution(active, session, hand, {'speed_mm_s': active['config']['speed_mm_s']})
                 state = executor.fresh(hand)
                 if state['is_grasped']:
                     raise RuntimeError('Hand reports a held object; release it before observing')
@@ -334,7 +336,7 @@ class PickPlacePlugin:
                 if abs(state['width'] - opening) > .001:
                     active['stage'] = 'observe_open'
                     command = hand.command(active['owner'], 'set_position',
-                                           width_m=opening, speed_m_s=.02, timeout_s=15)
+                                           width_m=opening, speed_m_s=active['config']['speed_mm_s']/1000, timeout_s=15)
                     try:
                         executor.wait(hand, command, 17, 'hand_command_id')
                         if abs(executor.fresh(hand)['width'] - opening) > .001:

@@ -7,20 +7,21 @@ import numpy as np
 from hardware import JOINT_LOWER, JOINT_UPPER
 
 
-def arm_speed(args):
-    speed = args.get('speed_deg_s')
-    if type(speed) not in (int, float) or not math.isfinite(speed) or not .1 <= speed <= 5:
-        raise ValueError('speed_deg_s must be supplied on the action in [0.1, 5] deg/s')
-    return speed
+SPEED_CONFIG = {
+    'speed_deg_s': (.1, math.inf, 5, 'Arm joint speed limit (deg/s)'),
+    'speed_mm_s': (.1, 100, 20, 'Gripper opening and closing speed (mm/s)'),
+}
 
 
-def parameters(config, args):
-    values = dict(speed_deg_s=arm_speed(args))
-    for name, low, high in (('speed_mm_s', .1, 100), ('force_n', 30, 70)):
-        value = args.get(name) if name == 'speed_mm_s' else config.get(name)
+def parameters(config):
+    values = {}
+    limits = [(name, low, high, default)
+              for name, (low, high, default, _) in SPEED_CONFIG.items()]
+    for name, low, high, default in [*limits, ('force_n', 30, 70, None)]:
+        value = config.get(name, default)
         if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
-            location = 'supplied on the action' if name == 'speed_mm_s' else 'configured'
-            raise ValueError(f'{name} must be {location} in [{low}, {high}]')
+            raise ValueError(f'{name} must be finite and at least {low}' if math.isinf(high)
+                             else f'{name} must be configured in [{low}, {high}]')
         values[name] = value
     return values
 

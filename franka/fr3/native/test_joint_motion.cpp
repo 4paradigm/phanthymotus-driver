@@ -96,6 +96,23 @@ int main() {
     }
     previous=q;
   }
+  auto faster = continuous;
+  faster.speed = .4;
+  const auto positive = [](const fr3::Joints&) {
+    fr3::Joints limits;
+    limits.fill(.01);
+    return limits;
+  };
+  const auto negative = [](const fr3::Joints&) {
+    fr3::Joints limits;
+    limits.fill(-.01);
+    return limits;
+  };
+  const fr3::PathTrajectory unrestricted(start, faster);
+  const fr3::PathTrajectory limited(start, faster, positive, negative);
+  require(limited.duration() > unrestricted.duration(), "Directional limits must slow PATH");
+  faster.timeout = unrestricted.duration()+2.1;
+  rejects([&] { fr3::PathTrajectory bad(start, faster, positive, negative); });
   auto wrong_start=start;
   wrong_start[0]+=.01;
   rejects([&] { fr3::PathTrajectory bad(wrong_start, continuous); });

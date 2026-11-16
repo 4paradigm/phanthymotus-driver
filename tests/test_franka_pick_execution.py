@@ -13,7 +13,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT/'franka/fr3')]
 from franka.fr3.pick_place import PickPlacePlugin
-from franka.fr3.pick_place.execution import PickExecution, parameters, arm_speed
+from franka.fr3.pick_place.execution import PickExecution
 from franka.fr3.pick_place import planning, scene, transfer
 
 
@@ -89,7 +89,7 @@ class PickExecutionTests(unittest.TestCase):
             Manager(self.arm),None,None,gripper_manager=Manager(self.hand),
             callback=lambda *args:self.completions.append(args))
         self.plugin.observation = {'metadata':{'O_T_EE':np.eye(4).flatten(order='F').tolist()}}
-        self.args = dict(start_point_x=0,start_point_y=0,speed_deg_s=2,speed_mm_s=20,
+        self.args = dict(start_point_x=0,start_point_y=0,
                          confirm_motion=True,delta_x=30,delta_y=0)
 
     def run_card(self, action='grab_by', releases=1, transfer_error=None, observation_required=None):

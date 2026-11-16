@@ -1,3 +1,4 @@
+#include <franka/rate_limiting.h>
 // One connection per robot: idle state reads and joint control never overlap.
 // stdin: MOVE id speed_rad_s tolerance_rad timeout_s q1..q7 | STOP id | QUIT
 // stdout: newline-delimited state JSON and asynchronous motion/stop events.
@@ -370,7 +371,8 @@ class Session {
         if (!stationary(initial)) throw std::runtime_error("Robot must be idle and stationary before motion");
         // A start based on desired positions avoids the discontinuity caused by
         // commanding a measured position that differs from the SDK's q_d.
-        fr3::PathTrajectory trajectory(initial.q_d, command);
+        fr3::PathTrajectory trajectory(initial.q_d, command,
+            franka::computeUpperLimitsJointVelocity, franka::computeLowerLimitsJointVelocity);
         double elapsed = 0.0;
         bool first = true;
         event("motion", command.id, "running", "", &command.target);

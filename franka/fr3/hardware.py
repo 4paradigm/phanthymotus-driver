@@ -193,7 +193,7 @@ class RobotSession:
             if any(not low+JOINT_MARGIN <= q <= high-JOINT_MARGIN
                    for q,low,high in zip(point,JOINT_LOWER,JOINT_UPPER)):
                 raise ValueError("Path point is outside FR3 joint limits")
-        if (not math.isfinite(speed_rad_s) or not math.radians(.1) <= speed_rad_s <= math.radians(5)
+        if (not math.isfinite(speed_rad_s) or not speed_rad_s >= math.radians(.1)
                 or not math.isfinite(tolerance_rad) or not 0 < tolerance_rad <= math.radians(1)
                 or not math.isfinite(timeout_s) or not 1 <= timeout_s <= 600):
             raise ValueError("Invalid continuous path speed, tolerance or timeout")

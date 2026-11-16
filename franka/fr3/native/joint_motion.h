@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <functional>
 
 namespace fr3 {
 using Joints = std::array<double, 7>;
@@ -75,8 +76,8 @@ inline Command parse_command(const std::string& line) {
     } else for (auto& q : command.target) {
       if (!(input >> q)) throw std::invalid_argument("MOVE requires seven joint angles in radians");
     }
-    if (!std::isfinite(command.speed) || command.speed < kMinSpeed || command.speed > kMaxSpeed)
-      throw std::invalid_argument("Speed must be 0.1 to 10 degrees/s (expressed in rad/s)");
+    if (!std::isfinite(command.speed) || command.speed < kMinSpeed || (command.path.empty() && command.speed > kMaxSpeed))
+      throw std::invalid_argument("Invalid joint speed (MOVE: 0.1–10 deg/s; PATH: at least 0.1 deg/s)");
     if (!std::isfinite(command.tolerance) || command.tolerance <= 0 ||
         command.tolerance > 0.017453292519943295)
       throw std::invalid_argument("Tolerance must be positive and at most one degree (in radians)");
@@ -126,7 +127,9 @@ class Trajectory {
 // and acceleration. The curve stays in each four-point convex hull.
 class PathTrajectory {
  public:
-  PathTrajectory(const Joints& start, const Command& command) {
+  using VelocityLimits = std::function<Joints(const Joints&)>;
+  PathTrajectory(const Joints& start, const Command& command,
+                 VelocityLimits upper = {}, VelocityLimits lower = {}) {
     if (command.path.empty()) {
       single_ = true;
       single_path_ = std::make_unique<Trajectory>(start, command);
@@ -151,6 +154,29 @@ class PathTrajectory {
       }
     interval_ = std::max({.05, velocity/command.speed,
                          std::sqrt(acceleration/.15), std::cbrt(jerk/.5)});
+    if (upper && lower) {
+      for (std::size_t i = 0; i + 3 < points_.size(); ++i) {
+        Joints lo{}, hi{};
+        for (std::size_t j = 0; j < 7; ++j) {
+          auto bounds = {points_[i][j], points_[i+1][j], points_[i+2][j], points_[i+3][j]};
+          lo[j] = std::min(bounds);
+          hi[j] = std::max(bounds);
+        }
+        // Spline positions lie in the control-point hull. The directional
+        // velocity limit is tightest on the hull edge nearest the joint limit.
+        const auto positive = upper(hi);
+        const auto negative = lower(lo);
+        for (std::size_t k = i; k < i + 3; ++k)
+          for (std::size_t j = 0; j < 7; ++j) {
+            const double step = points_[k+1][j] - points_[k][j];
+            if (step == 0) continue;
+            const double limit = step > 0 ? positive[j] : -negative[j];
+            if (!std::isfinite(limit) || limit <= 0)
+              throw std::invalid_argument("PATH reaches a joint position with no velocity allowance");
+            interval_ = std::max(interval_, std::abs(step) / limit);
+          }
+      }
+    }
     duration_ = interval_*(points_.size()-3);
     if (duration_+2 > command.timeout)
       throw std::invalid_argument("PATH exceeds timeout at the selected speed");
