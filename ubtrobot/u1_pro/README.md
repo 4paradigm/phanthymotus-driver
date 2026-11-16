@@ -13,9 +13,9 @@
 - `system_controls`：统一控制 `wakeup`、`wakeup_followup` 和 `visual_behavior` 三个固件行为开关。
 - `camera_left`、`camera_right`：打开 SDK video stream，并分别订阅 domain `2` 的 `/sensor/camera/left_eye/color/raw`、`/sensor/camera/right_eye/color/raw`，转换后输出 JPEG。SDK 共享内存视频流没有选择左右眼的参数；只有元数据明确标记了对应眼睛时，才会将环形缓冲帧作为该眼的备用输入，避免把一幅画面伪装成左右两路。
 
-- `hp_printer`：访客贴打印，画布中归在 `ACTUATOR`。访客贴在范式+ 上生成，打印机用 USB 接在前台电脑上，所以卡片不直接连打印机，而是向前台电脑上的桥接服务发 HTTP 请求：`skill → hp_printer → 前台电脑桥接服务 → 范式+ / USB 打印机`。不依赖 SDK，见下文“访客贴打印”。
+- `QL_printer`：访客贴打印，画布中归在 `ACTUATOR`。访客贴在范式+ 上生成，打印机用 USB 接在前台电脑上，所以卡片不直接连打印机，而是向前台电脑上的桥接服务发 HTTP 请求：`skill → QL_printer → 前台电脑桥接服务 → 范式+ / USB 打印机`。不依赖 SDK，见下文“访客贴打印”。
 
-## 访客贴打印（`hp_printer`）
+## 访客贴打印（`QL_printer`）
 
 ### 动作
 
@@ -30,7 +30,7 @@
 
 ### 配置
 
-画布上卡片的配置项：`bridge_url`（必填，例如 `http://192.168.1.20:8765`，前台电脑要设固定 IP）、`token`（必填，和桥接服务一致）、`timeout_s`（查询超时，默认 8 秒）和 `print_timeout_s`（打印超时，默认 60 秒）。真实打印需要网页定位访客、调起打印并复查状态，因此打印使用单独的较长超时。`config.yaml` 的 `hp_printer.enabled: false` 可以关掉这张卡。
+画布上卡片的配置项：`bridge_url`（必填，例如 `http://192.168.1.20:8765`，前台电脑要设固定 IP）、`token`（必填，和桥接服务一致）、`timeout_s`（查询超时，默认 8 秒）和 `print_timeout_s`（打印超时，默认 60 秒）。真实打印需要网页定位访客、调起打印并复查状态，因此打印使用单独的较长超时。`config.yaml` 的 `QL_printer.enabled: false` 可以关掉这张卡。
 
 ### 桥接服务接口约定
 

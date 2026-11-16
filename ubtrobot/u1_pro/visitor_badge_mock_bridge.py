@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""访客贴桥接服务模拟版，用于联调 hp_printer 卡片。
+"""访客贴桥接服务模拟版，用于联调 QL_printer 卡片。
 
 它遵循生产桥接协议，但不连接范式+或 USB 打印机：
     POST /find_visit {"name": "...", "host": "..."}

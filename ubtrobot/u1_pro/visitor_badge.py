@@ -1,9 +1,9 @@
-"""U1 Pro 访客贴打印卡片（hp_printer）。
+"""U1 Pro 访客贴打印卡片（QL_printer）。
 
 卡片本身不碰打印机，也不直接登录范式+：它只向前台电脑上的「桥接服务」发 HTTP
 请求，由桥接服务去范式+ 查访客、调用前台电脑上的 USB 打印机打印访客贴。
 
-    机器人 skill → hp_printer 卡片 ──HTTP──> 前台电脑桥接服务 → 范式+ / USB 打印机
+    机器人 skill → QL_printer 卡片 ──HTTP──> 前台电脑桥接服务 → 范式+ / USB 打印机
 
 桥接服务要实现的接口见 README.md「桥接服务接口约定」。
 """
@@ -21,7 +21,7 @@ from typing import Any
 
 from common.vendor_runtime import action_schema, tool
 
-TOOL_NAME = "hp_printer"
+TOOL_NAME = "QL_printer"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
@@ -105,7 +105,7 @@ def _visit(item: dict) -> dict:
     }
 
 
-class HPPrinterPlugin:
+class QLPrinterPlugin:
     PREFIX = TOOL_NAME
 
     def __init__(self, plugin_config: dict | None = None):
@@ -200,7 +200,7 @@ class HPPrinterPlugin:
         try:
             return handler(args)
         except BridgeError as exc:
-            print(f"[hp_printer] {action} failed: {exc.code}", flush=True)
+            print(f"[QL_printer] {action} failed: {exc.code}", flush=True)
             return {"status": "error", "code": exc.code, "error": str(exc)}
 
     def _configured(self) -> bool:
@@ -320,5 +320,9 @@ class HPPrinterPlugin:
         if args.get("ticket") or args.get("request_id"):
             return self._print_ticket(args)
         return self._find_and_print(args)
+
+
+# Keep the Python class alias so older local imports do not break during rollout.
+HPPrinterPlugin = QLPrinterPlugin
 
 

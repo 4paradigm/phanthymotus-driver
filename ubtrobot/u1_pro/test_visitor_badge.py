@@ -1,4 +1,4 @@
-"""hp_printer 卡片与安全桥接协议的契约测试。"""
+"""QL_printer 卡片与安全桥接协议的契约测试。"""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1]))
 sys.path.insert(0, str(HERE))
 
-from visitor_badge import HPPrinterPlugin  # noqa: E402
+from visitor_badge import QLPrinterPlugin  # noqa: E402
 from visitor_badge_mock_bridge import MockBridge  # noqa: E402
 
 TOKEN = "test-token"
@@ -24,7 +24,7 @@ class VisitorBadgeTest(unittest.TestCase):
         self.server = self.bridge.serve("127.0.0.1", 0)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        self.card = HPPrinterPlugin({})
+        self.card = QLPrinterPlugin({})
         cfg = self.card.dispatch("config", {"bridge_url": self.url, "token": TOKEN})
         self.assertTrue(cfg["adapter_ok"])
 
@@ -34,7 +34,7 @@ class VisitorBadgeTest(unittest.TestCase):
             self.server.server_close()
 
     def call(self, action, **args):
-        result = self.card.dispatch(action, dict(args, _tool_name="hp_printer"))
+        result = self.card.dispatch(action, dict(args, _tool_name="QL_printer"))
         json.dumps(result, ensure_ascii=False)
         return result
 
@@ -45,7 +45,7 @@ class VisitorBadgeTest(unittest.TestCase):
 
     def test_tool_definition_uses_ticket_protocol(self):
         definition = self.card.get_tool()
-        self.assertEqual(definition["name"], "hp_printer")
+        self.assertEqual(definition["name"], "QL_printer")
         self.assertEqual(definition["type"], "actuator")
         actions = definition["inputSchema"]["properties"]["action"]["enum"]
         self.assertEqual(set(actions), {"start", "stop", "info", "config", "find", "print"})
@@ -69,7 +69,7 @@ class VisitorBadgeTest(unittest.TestCase):
         self.assertEqual(self.call("start")["state"], "ready")
         self.assertTrue(self.call("info")["configured"])
         self.assertEqual(self.call("stop")["state"], "idle")
-        card = HPPrinterPlugin({})
+        card = QLPrinterPlugin({})
         self.assertEqual(card.dispatch("find", {"name": "王磊"})["code"], "not_configured")
 
     def test_config_rejects_bad_url_without_losing_old_value(self):
