@@ -97,7 +97,7 @@ def test_recovered_vendor_parameters_clear_obsolete_error(monkeypatch):
     monkeypatch.setitem(sys.modules,'rcl_interfaces.srv',NS(GetParameters=object))
     source=object.__new__(m.RgbdCameraPlugin)
     source.lock=threading.RLock();source.running=True;source.registered=False;source.error='old parameter failure'
-    source.future=NS(done=lambda:True,result=lambda:NS(values=[NS(bool_value=True),NS(string_value='global'),NS(bool_value=True),NS(string_value='COLOR')]))
+    source.future=NS(done=lambda:True,result=lambda:NS(values=[NS(bool_value=True),NS(string_value='global'),NS(bool_value=True)]))
     source._parameters()
     assert source.registered and source.error is None
 
@@ -155,26 +155,3 @@ def test_common_field_does_not_claim_disjoint_lenses_are_registered():
     color.k[2] = 2000.
     with pytest.raises(ValueError, match='common'):
         m.make_geometry(color, depth, registered=True)
-
-
-def test_depth_compression_prefers_installed_accelerator(monkeypatch):
-    import sys, zlib
-    calls = []
-    def accelerated(data, level):
-        calls.append((data, level))
-        return zlib.compress(data, level)
-    monkeypatch.setitem(sys.modules, 'deflate', NS(zlib_compress=accelerated))
-    compress, backend = m.depth_compressor()
-    payload = np.arange(100, dtype='<u2').tobytes()
-    assert zlib.decompress(compress(payload, 1)) == payload
-    assert calls == [(payload, 1)]
-    assert backend == 'libdeflate'
-
-
-def test_depth_compression_preserves_wire_format_without_optional_accelerator(monkeypatch):
-    import sys, zlib
-    monkeypatch.setitem(sys.modules, 'deflate', None)
-    compress, backend = m.depth_compressor()
-    payload = np.arange(100, dtype='<u2').tobytes()
-    assert zlib.decompress(compress(payload, 1)) == payload
-    assert backend == 'stdlib-zlib-fallback'

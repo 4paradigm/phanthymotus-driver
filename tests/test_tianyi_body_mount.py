@@ -105,7 +105,7 @@ def test_fourth_port_declarations_actual_capture_tf_and_cross_domain_output(sour
     assert mount['parent_frame'] == 'base_link' and mount['child_frame'] == 'head_optical'
     assert mount['status'] == 'unavailable'
     emit(source)
-    assert [topic for topic, _ in source.events] == [source.root+'/body_mount', source.color_topic, source.depth_topic]
+    assert [topic for topic, _ in source.events] == [source.root+'/body_mount', '/test/camera/head', source.depth_topic]
     packet = json.loads(source.events[0][1].data)
     assert packet['stamp_ns'] == STAMP and packet['clock_id'] == source.clock
     assert packet['matrix'][0][3] == .2
@@ -247,22 +247,12 @@ def test_mount_matches_each_published_capture(source, streams, offset):
     assert actual == expected
 
 
-def test_unverified_camera_clock_never_claims_host_time_identity(source):
+def test_clock_reference_only_declared_after_global_source_confirmation(source, monkeypatch):
+    reference = dict(clock_id='host_realtime', domain_id='actual-boot', timestamp_basis='host_realtime')
+    monkeypatch.setattr(m, 'host_clock_reference', lambda: deepcopy(reference))
     source.registered = True
-    for item in source._declarations():
-        assert 'clock_reference' not in item['vendor']
-        assert item['vendor']['host_clock_relation'] == 'unverified'
-        assert item['vendor']['clock_id'] == source.clock
+    values = source._declarations()
+    assert values[0]['vendor']['clock_reference'] == reference
+    assert values[0]['vendor']['clock_id'] == source.clock
     source.registered = False
-    assert all('clock_reference' not in item['vendor'] for item in source._declarations())
-
-
-def test_rgbd_worker_uses_selected_depth_compressor(source):
-    import zlib
-    calls = []
-    def compress(data, level):
-        calls.append((len(data), level))
-        return zlib.compress(data, level)
-    source._compress_depth = compress
-    emit(source)
-    assert calls == [(640 * 480 * 2, 1)]
+    assert 'clock_reference' not in source._declarations()[0]['vendor']

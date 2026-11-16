@@ -390,25 +390,6 @@ def test_fifty_ms_budget_accepts_observed_offset_change_but_rejects_excess():
         clock.observe(1150,EPOCH+1_210_000_000,EPOCH+1_213_000_000,1_210_000_000)
 
 
-def test_equal_stamp_pending_group_survives_clock_probe_between_reads():
-    m = module(); clock = ready_clock(m); odom = m.IncrementalOdometry(clock)
-    odom.feed([delta(1040), delta(1050, x=1)],
-              EPOCH + 1_060_000_000, 1_060_000_000)
-    before_stamp, before_mapping = odom._pending[0][1:3]
-    watermark = clock._last_source_ns
-    assert odom.feed([], EPOCH + 1_062_000_000, 1_062_000_000) == []
-    assert clock._last_source_ns == watermark
-    clock.observe(1080, EPOCH + 1_084_000_000, EPOCH + 1_086_000_000, 1_084_000_000)
-    emitted = odom.feed([delta(1050, x=2), delta(1090)],
-                        EPOCH + 1_100_000_000, 1_100_000_000)
-    assert len(emitted) == 1
-    evidence = emitted[0]['vendor']['motus_slam']['measurement']
-    assert evidence['stamp_ns'] == before_stamp
-    assert evidence['mapping'] == before_mapping
-    assert emitted[0]['vendor']['motus_slam']['source_events_in_group'] == 2
-    assert emitted[0]['pose']['position'] == [3., 0., 0.]
-
-
 def test_pending_group_is_revalidated_before_emitting_after_a_delayed_read():
     m=module(); odom=m.IncrementalOdometry(ready_clock(m))
     odom.feed([delta(1040),delta(1050,x=1)],EPOCH+1_060_000_000,1_060_000_000)

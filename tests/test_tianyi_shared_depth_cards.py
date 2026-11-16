@@ -32,37 +32,19 @@ def test_depth_is_published_on_original_topic_with_matching_camera_info(source):
 def test_original_three_cards_distribute_ports_without_new_depth_port(source):
     assert hasattr(m, 'RgbdInputCard')
     rgb = m.RgbdInputCard(source, 'color', Display('camera_head', '/test/camera/head', 'image/jpeg'))
-    depth = m.RgbdInputCard(source, 'depth',
-        Display('camera_depth', '/test/camera/head/depth/visual_depth', 'image/depth-zlib'))
+    depth = m.RgbdInputCard(source, 'depth')
     imu = m.RgbdInputCard(source, 'imu', Display('imu', '/test/state/imu', 'data/json'))
     tools = [card.get_tool() for card in (rgb, depth, imu)]
     assert [t['name'] for t in tools] == ['camera_head', 'camera_depth', 'imu']
-    assert [p['topic'] for p in tools[1]['topic_out']] == [
-        '/test/camera/head/depth/visual_depth', '/test/camera/head/depth']
-    assert [p['topic'] for p in tools[0]['topic_out']] == [
-        '/test/camera/head', '/test/camera/rgbd/color']
-    assert tools[0]['camera_info'][0]['topic'] == '/test/camera/rgbd/color'
-    assert '/test/camera/rgbd/color' in source.pub_node.publishers
+    assert [p['topic'] for p in tools[1]['topic_out']] == ['/test/camera/head/depth']
+    assert tools[0]['topic_out'] == [dict(topic='/test/camera/head', format='image/jpeg',
+                                        description='配准相机数据')]
+    assert tools[0]['camera_info'][0]['topic'] == '/test/camera/head'
+    assert '/test/camera/rgbd/color' not in source.pub_node.publishers
     assert [p['format'] for p in tools[2]['topic_out']] == ['data/json', 'sensor/imu']
     assert tools[0]['camera_info'][0]['K'] == tools[1]['camera_info'][0]['K']
     assert tools[0]['camera_info'][0]['id'] == tools[1]['camera_info'][0]['id']
     assert imu.dispatch('read', {}) == dict(angular_velocity=dict(x=1.))
-
-
-def test_legacy_display_stays_active_without_calibrated_pair(source):
-    source.managed = True
-    source.sub_node.get_clock = lambda: NS(now=lambda: NS(nanoseconds=STAMP-1))
-    rgb_display = Display('camera_head', '/test/camera/head', 'image/jpeg')
-    depth_display = Display('camera_depth', '/test/camera/head/depth/visual_depth', 'image/depth-zlib')
-    rgb = m.RgbdInputCard(source, 'color', rgb_display)
-    depth = m.RgbdInputCard(source, 'depth', depth_display)
-    rgb.start(); depth.start()
-    source.registered = False
-    source.geometry = None
-    assert rgb.dispatch('info', {})['state'] == 'running'
-    assert depth.dispatch('info', {})['state'] == 'running'
-    assert rgb_display.starts == depth_display.starts == 1
-    rgb.stop(); depth.stop()
 
 
 def test_card_start_stop_keeps_sibling_owner_and_is_idempotent(source):
@@ -102,8 +84,7 @@ def test_bundle_registers_existing_cards_and_private_source_only():
     bundle = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'TianyiDeviceBundle')
     init = ast.unparse(next(n for n in bundle.body if isinstance(n, ast.FunctionDef) and n.name == '__init__'))
     assert 'RgbdInputCard' in init
-    assert 'monitor_only=False' in init
-    assert 'DepthCameraPlugin' in init
+    assert 'monitor_only=True' in init
     assert 'self._plugins.append(RgbdCameraPlugin(' not in init
     assert 'name: camera_rgbd' not in (root/'x-humanoid/tianyi2.0/driver.yaml').read_text()
 

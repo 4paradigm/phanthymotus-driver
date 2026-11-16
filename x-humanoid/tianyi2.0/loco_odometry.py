@@ -93,7 +93,7 @@ class ClockMapping:
                 return start + (target-start)*elapsed//duration
         raise ValueError('source measurement predates clock mapping history')
 
-    def map(self, source_ms, now_ns, monotonic_ns, *, track=True):
+    def map(self, source_ms, now_ns, monotonic_ns):
         if self.offset is None or self._observed is None:
             raise ValueError('clock is not synchronized')
         if monotonic_ns - self._observed > 2_000_000_000 or monotonic_ns < self._observed:
@@ -105,8 +105,7 @@ class ClockMapping:
         stamp = source_ns + offset
         if stamp > now_ns + UNCERTAINTY_NS or now_ns - stamp > MAX_AGE_NS:
             raise ValueError('source measurement is future or stale')
-        if track:
-            self._last_source_ns = max(self._last_source_ns, source_ns)
+        self._last_source_ns = max(self._last_source_ns, source_ns)
         return stamp, {'method': 'chassis_clock_request_interval_slew', 'version': '2',
                        'offset_ns': offset, 'uncertainty_ns': UNCERTAINTY_NS,
                        'verified': True}
@@ -149,8 +148,7 @@ class IncrementalOdometry:
             if not isinstance(messages, list):
                 raise ValueError('diagnostic batch must be a list')
             if self._pending:
-                # A freshness-only check must not mutate the time watermark.
-                self.clock.map(self._pending[0][0], now_ns, monotonic_ns, track=False)
+                self.clock.map(self._pending[0][0], now_ns, monotonic_ns)
             parsed = list(self._pending)
             previous = parsed[-1][0] if parsed else self._last
             for message in messages:

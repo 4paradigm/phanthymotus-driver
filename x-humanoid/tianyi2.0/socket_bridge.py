@@ -62,7 +62,7 @@ BEST_EFFORT_QOS = QoSProfile(
 
 
 def _is_hardware_depth(topic: str) -> bool:
-    return topic.endswith(("/camera/head/depth/visual_depth", "/camera/head/depth"))
+    return topic.endswith("/camera/head/depth/visual_depth")
 
 
 def _outbound_qos(topic: str, requested=None) -> QoSProfile:
