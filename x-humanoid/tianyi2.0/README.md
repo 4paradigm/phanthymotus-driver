@@ -1160,3 +1160,19 @@ when the driver restarts; boot startup also requires the user's service manager
 to be enabled at boot. To roll back, disable the user service, set
 `estimated_body_tf: false`, and restart the driver. The hardware camera must
 remain in global time mode throughout.
+
+
+### Capture helper packaging
+
+`common/camera_mount.py` contains the capture-time TF validation/publication
+shared by the Tianyi camera paths; it requires the consumer to supply NumPy,
+already present in this image. `common/capture_clock.py` is a stdlib-only helper
+for host clock/boot identity. Both are small Python sources copied with `common/`;
+they add source bytes but no new packages to other drivers. The Tianyi-only
+`ros-humble-tf2-ros` dependency supports `rgbd_camera.py` and
+`estimated_body_tf.py`; its image growth is limited to this driver, with
+`--no-install-recommends` and apt-list cleanup retained.
+
+The standalone estimated-TF companion installs `common.logsafe` before loading
+NumPy or ROS, just as the bundle entry point does. Importing its helpers leaves
+the caller's output streams unchanged.

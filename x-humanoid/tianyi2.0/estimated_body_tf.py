@@ -1,4 +1,23 @@
 """Opt-in estimated body TF. Read-only feedback; never claims measured calibration."""
+# This companion is a fresh process; it cannot inherit the bundle's wrappers.
+# Resolve both the nested checkout and the flattened /work image layout before
+# importing NumPy/ROS or starting any worker. Importing estimator helpers must
+# not replace the caller's streams.
+if __name__ == '__main__':
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    for _source_root in _Path(__file__).resolve().parents:
+        if (_source_root / 'common' / 'logsafe.py').is_file():
+            if str(_source_root) not in _sys.path:
+                _sys.path.insert(0, str(_source_root))
+            break
+    try:
+        from common import logsafe as _logsafe
+        _logsafe.install()
+    except ImportError as _exc:
+        _sys.stderr.write(f'[estimated-body-tf] logsafe unavailable ({_exc}); stdout unprotected\n')
+
 import bisect
 import uuid
 from collections import deque

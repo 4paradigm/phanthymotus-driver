@@ -7,6 +7,7 @@ ARG TARGETARCH
 WORKDIR /work
 
 # The ARM64 RealSense wheel links libusb-1.0.so.0; ros-base does not supply it.
+# Tianyi RGB-D mounts and estimated_body_tf use tf2_ros; keep this dependency local.
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \

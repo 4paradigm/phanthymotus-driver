@@ -1,4 +1,7 @@
-"""Optional capture-time TF evidence; never a camera owner or calibration claim."""
+"""Optional capture-time TF evidence; never a camera owner or calibration claim.
+
+Consumers must provide NumPy (already declared by the Tianyi image).
+"""
 import json
 import uuid
 
