@@ -204,7 +204,10 @@ class RgbdCameraPublisher:
             msg.format, msg.data = fmt, array('B', payload)
             messages.append((kind, msg))
         try:
-            self.body_mount.publish(stamps[1])
+            # Match pinned RTAB-Map/PR371: later double-seconds value wins;
+            # ties select depth, retaining that original integer capture stamp.
+            mount_stamp = stamps[0] if float(stamps[0])/1e9 > float(stamps[1])/1e9 else stamps[1]
+            self.body_mount.publish(mount_stamp)
             self.mount_error = None
         except Exception as error:
             self.mount_error = str(error)

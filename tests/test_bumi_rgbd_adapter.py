@@ -371,6 +371,86 @@ def actual_mount(monkeypatch, path, parent, child, clock, events):
                                   camera_frame=child, clock_id=clock)
 
 
+@pytest.mark.parametrize('color_ms,depth_ms,now_ns,color_ns,depth_ns,mount_ns', [
+    (1010., 1000., 10_000_000_000, 10_000_000_000, 9_990_000_000, 10_000_000_000),
+    (1000., 1010., 10_000_000_000, 10_000_000_000, 10_010_000_000, 10_010_000_000),
+    (1000., 1000., 10_000_000_000, 10_000_000_000, 10_000_000_000, 10_000_000_000),
+    # Native double-seconds comparison ties despite color being 1 ns later.
+    (1000.000002, 1000.000001, 1_794_654_700_000_000_002,
+     1_794_654_700_000_000_002, 1_794_654_700_000_000_001, 1_794_654_700_000_000_001),
+], ids=['color-later', 'depth-later', 'equal', 'double-seconds-tie'])
+def test_bumi_mount_matches_native_pair_time_without_rewriting_headers(
+        source, monkeypatch, color_ms, depth_ms, now_ns, color_ns, depth_ns, mount_ns):
+    publisher, messages, _ = source
+    events = []
+    publisher.body_mount = actual_mount(monkeypatch, ROOT / 'common/camera_mount.py',
+        'base_link', publisher.frame_id,
+        lambda: publisher.clock_id + '/' + publisher.clocks[0].domain, events)
+    monkeypatch.setattr(rgbd.time, 'time_ns', lambda: now_ns)
+    pair = frames()
+    pair.get_color_frame().get_timestamp = lambda: color_ms
+    pair.get_depth_frame().get_timestamp = lambda: depth_ms
+    try:
+        publisher.publish(pair)
+        assert stamp(messages['/robot/camera/rgbd/color'][0]) == color_ns
+        assert stamp(messages['/robot/camera/depth'][0]) == depth_ns
+        packet = next(event[1] for event in events if event[0] == 'packet')
+        assert packet['status'] == 'available'
+        assert packet['stamp_ns'] == mount_ns
+        assert packet['matrix'][0][3] == .2
+    finally:
+        publisher.close()
+
+
+@pytest.mark.parametrize('color_ms,depth_ms,now_ns', [
+    (1010., 1000., 10_000_000_000),
+    (1000., 1010., 10_000_000_000),
+    (1000., 1000., 10_000_000_000),
+    (1000.000002, 1000.000001, 1_794_654_700_000_000_002),
+], ids=['color-later', 'depth-later', 'equal', 'double-seconds-tie'])
+def test_bumi_capture_mount_produces_body_pose_with_real_pr371_consumer(
+        source, monkeypatch, color_ms, depth_ms, now_ns):
+    consumer_root = ROOT.parent / 'pr371-current-review'
+    if not (consumer_root / 'perception/plugins/rgbd_odometry_runtime.py').exists():
+        pytest.skip('independent Perception checkout is not present')
+    monkeypatch.syspath_prepend(str(consumer_root))
+    monkeypatch.syspath_prepend(str(consumer_root / 'perception'))
+    from perception.plugins.rgbd_odometry_contract import validate_inputs, make_sample
+    from perception.plugins.rgbd_odometry_runtime import native_capture_stamp
+    from perception.plugins.rgbd_body_mount import CaptureMounts
+    publisher, messages, notices = source
+    events = []
+    publisher.body_mount = actual_mount(monkeypatch, ROOT / 'common/camera_mount.py',
+        'base_link', publisher.frame_id,
+        lambda: publisher.clock_id + '/' + publisher.clocks[0].domain, events)
+    monkeypatch.setattr(rgbd.time, 'time_ns', lambda: now_ns)
+    pair = frames()
+    pair.get_color_frame().get_timestamp = lambda: color_ms
+    pair.get_depth_frame().get_timestamp = lambda: depth_ms
+    try:
+        publisher.publish(pair)
+        declarations = notices[-1]['camera_info']
+        accepted = validate_inputs({d['topic']: d for d in declarations},
+                                   [d['topic'] for d in declarations])
+        selected = native_capture_stamp(messages['/robot/camera/rgbd/color'][0],
+                                        messages['/robot/camera/depth'][0])
+        pose = dict(frame_id='run1_odom', child_frame_id=accepted['frame_id'],
+                    position=[0., 0., 0.], quaternion=[0., 0., 0., 1.], covariance=None)
+        sample = make_sample('tracking', selected, 'run1', accepted['clock_id'], pose)
+        packet = next(event[1] for event in events if event[0] == 'packet')
+        mounts = CaptureMounts(accepted['body_mount'], accepted['frame_id'], accepted['clock_id'])
+        mounts.observe(packet, selected)
+        mounts.attach(sample, selected)
+        body = sample['vendor']['body_pose']
+        assert body is not None
+        assert body['stamp_ns'] == selected
+        assert body['child_frame_id'] == 'base_link'
+        assert body['position'] == pytest.approx([-.2, .1, -.3])
+        assert sample['pose']['child_frame_id'] == 'robot_depth_optical'
+    finally:
+        publisher.close()
+
+
 def test_bumi_real_provider_uses_mapped_depth_time_and_missing_tf_keeps_pairs(source, monkeypatch):
     publisher, messages, notices = source
     events = []
