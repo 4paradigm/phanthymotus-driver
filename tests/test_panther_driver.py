@@ -91,7 +91,6 @@ class PantherDriverTest(unittest.TestCase):
         base = tools["base_drive"]["inputSchema"]
         self.assertEqual(base["properties"]["confirm_motion"]["const"], True)
         self.assertEqual(base["x-completion"]["actions"], ["move"])
-        self.assertEqual(base["x-hooks"]["on_interrupt_motion"], "stop")
         self.assertEqual(base["properties"]["angular_z_deg_s"]["maximum"], 45.0)
         self.assertEqual(base["properties"]["duration_s"]["maximum"], 10.0)
         arm = tools["arm_control"]["inputSchema"]
@@ -105,6 +104,14 @@ class PantherDriverTest(unittest.TestCase):
         head = tools["head"]["inputSchema"]
         self.assertTrue({"look", "home", "stop"} <= set(head["properties"]["action"]["enum"]))
         self.assertTrue({"yaw_deg", "pitch_deg"} <= set(head["properties"]))
+        expected_hooks = {
+            "on_interrupt_motion": {"action": "stop"},
+            "on_interrupt_all": {"action": "stop"},
+        }
+        for tool_name in ("base_drive", "arm_control", "head"):
+            self.assertEqual(tools[tool_name]["inputSchema"]["x-hooks"], expected_hooks)
+        self.assertNotIn("x-hooks", tools["gripper"]["inputSchema"])
+        self.assertNotIn("x-hooks", tools["lifting"]["inputSchema"])
         exposed = json.dumps(tools, ensure_ascii=False)
         self.assertIsNone(re.search(r"[一-鿿]", exposed))
         self.assertNotRegex(exposed, r'"(?:head[01]|la[0-7]|ra[0-7])_rad"')

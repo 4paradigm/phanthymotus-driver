@@ -152,7 +152,10 @@ def _action_schema(actions, properties, required_by_action=None, resource=None,
     if completion:
         schema["x-completion"] = completion
     if interruptible:
-        schema["x-hooks"] = {"on_interrupt_motion": "stop", "on_interrupt_all": "stop"}
+        schema["x-hooks"] = {
+            "on_interrupt_motion": {"action": "stop"},
+            "on_interrupt_all": {"action": "stop"},
+        }
     return schema
 
 
