@@ -192,8 +192,8 @@ sudo systemctl start noetix-video-capture.service
 - `depth` **只有原来的一个输出** `/<namespace>/camera/depth`
   （`image/depth-zlib`，ROS `CompressedImage`），供展示、VO 和 Point Cloud 共用。
 - `imu` 保留身体 `/<namespace>/state/imu`（`data/json`），追加明确命名的
-  `camera_imu`：`/<namespace>/camera/rgbd/imu`（`sensor/imu`，可选）。
-  两者来源、坐标和格式不同，不得互相替代。
+  `body_imu`：`/<namespace>/state/imu_calibrated`（`sensor/imu`，可选）。
+  两者均来自机身 IMU；计算输出携带固定旋转标定及读取时间语义，不采集相机 IMU。
 
 RGB 保留原彩色相机视场，深度通过真实 SDK 标定投影到彩色像素，再一起校正到
 640×480 针孔射线。SDK 配准保留的是原深度相机 Z，发布前按实际旋转、平移和采样射线
@@ -527,8 +527,8 @@ and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
 The separate `camera_rgbd` card is retired. Move existing canvas wires to the
 original cards: the single `camera` output (`/bumi/camera/color`) and the single
 `depth` output (`/bumi/camera/depth`). Use that same depth output for display,
-Perception VO and Point Cloud. Select the `imu.camera_imu` output only when
-camera IMU assistance is requested; the original body JSON port is unchanged.
+Perception VO and Point Cloud. Select `imu.body_imu` for calibrated body-IMU
+rotation assistance; the original body JSON port is unchanged.
 The namespace follows bundle configuration. The original `camera` and `depth`
 `info`/`start` responses carry their actual `camera_info` declarations and
 `sourceReady`; an explicit camera/depth start waits up to ten seconds for
@@ -558,17 +558,32 @@ clock discontinuity or excessive skew makes the source unavailable with an
 error; the shared depth display pauses too, while native color remains available. No body mount is assumed, and
 neither physical accuracy nor hardware performance has been validated.
 
-The same owner optionally publishes `/bumi/camera/rgbd/imu` (`sensor/imu`), a
-`motus.imu/1` JSON packet over ROS `std_msgs/String`. Connect it only when IMU
-assistance is enabled on the receiving card. It carries raw SDK gyro/accel,
-factory motion-to-color rotations/translations, capture-generation identity and exactly the
-RGB-D clock ID and fixed offset. The approximate mapping is marked unverified.
-`imu_status` reports motion availability separately. Motion profiles are
-actually discovered; no device model is assumed to include an IMU. Supported
-motion uses a bounded video queue on the existing pipeline callback; unsupported
-motion preserves the original blocking video path, and negotiation failure
-retries video on the same pipeline. No quaternion or camera-to-body mount is
-invented. Hardware motion/callback acceptance remains pending.
+The IMU card keeps its body JSON display output `/NS/state/imu` and exposes
+`/NS/state/imu_calibrated` (`sensor/imu`) as its optional computation output.
+Both originate from the HighController body IMU; the camera pipeline requests
+only color and depth, never RealSense gyro/accel. Replace saved connections to
+the former `/NS/camera/rgbd/imu` output with this body output.
+
+The existing verified, rigid camera-to-body rotation in
+`plugins.visual_odometry.calibration` is inverted to describe body sensor axes
+in the RGB optical frame. Raw angular velocity and acceleration remain in body
+axes and the generic consumer applies the declared rotation once. Missing or
+assumed calibration makes this output unavailable. The preset's camera-origin
+zero translation is not an accelerometer lever-arm measurement, so no IMU
+translation is declared.
+
+Packets use `motus.imu/1` over `std_msgs/String`, with a body source identity,
+activation epoch and explicit `stamp_source: read_completion`. The SDK does not
+expose a hardware sample timestamp. Its ROS wall-clock reading time is used
+unchanged on the RGB-D mapped wall timeline, with an unverified
+`host_wall_read_completion` mapping; it is never presented as synchronized
+hardware capture. Repeated identical SDK values do not refresh freshness.
+`imu_status` reports body input freshness separately from card activation.
+This requires the matching Perception read-time attitude support. Connect the
+body computation output with `short_term_compensation`, `depth_geometry`, and
+`inertial_association` disabled: this source supports rotation assistance only,
+not inertial translation/ESKF. Static hardware and moving accuracy acceptance
+of this adapter remain pending.
 
 ### Capture-time body-camera TF
 
@@ -580,12 +595,12 @@ The paired RGB/depth declarations advertise the `/{namespace}/camera/rgbd/body_m
 
 Perception's generic `rgbd_odometry` card supports the instance settings
 `imu_assisted=true`, `short_term_compensation=true`, `depth_geometry=true`.
-Connect the same RGB-D pair and optional camera IMU port. The driver reports
-full factory/TF sensor-origin translations in `motus.imu/1`; inspect
-`imu_status.fusion` for calibration availability. Rotation-only or unsupported
-motion sources still support the existing video/attitude modes but cannot
-provide translational compensation. No extra SDK owner or robot-specific
-fusion algorithm is added.
+For sources with measured capture timing and full factory/TF sensor-origin
+translations in `motus.imu/1`, inspect `imu_status.fusion` before enabling these
+settings. Bumi's body IMU adapter deliberately reports fusion unavailable:
+its reading timestamps and rotation-only mount support the attitude mode,
+with all three compensation settings disabled. No extra SDK owner or
+robot-specific fusion algorithm is added.
 
 Keep the camera still for at least0.5s of visual/IMU initialization. The
 consumer estimates camera pose using ESKF and conditionally uses observable

@@ -19,6 +19,7 @@ capture = _fixture.capture
 def parent_control(device):
     parent = device.CameraPlugin.__new__(device.CameraPlugin)
     parent._namespace = 'robot'
+    parent._body_imu_calibration = None
     parent._color_topic, parent._depth_topic = '/robot/camera/color', '/robot/camera/depth'
     parent._intrinsics = {}
     parent._rgbd_status = dict(ready=False, camera_info=[], error='awaiting calibrated capture')
@@ -103,171 +104,51 @@ def test_parent_control_records_restart_even_when_transport_coalesces(monkeypatc
 
 
 
-@pytest.mark.parametrize('callback_boundary', ['during_ack', 'after_applying_check', 'snapshot_during_ack'])
-def test_coalesced_restart_flushes_queued_video_and_old_accel_after_motion_publish(capture, monkeypatch, callback_boundary):
-    import common.realsense_imu as motion_module
-    device, state = capture
-    sdk = sys.modules['pyrealsense2']
-    sdk.stream.gyro, sdk.stream.accel = 'gyro', 'accel'
-    sdk.format.motion_xyz32f = 'xyz'
-    sdk.camera_info = NS(serial_number='serial')
-    profiles = {kind: NS(stream_type=lambda kind=kind: kind, format=lambda: 'xyz', fps=lambda: 100,
-        stream_index=lambda: 0, unique_id=lambda kind=kind: kind,
-        get_extrinsics_to=lambda depth: NS(rotation=[1,0,0,0,1,0,0,0,1], translation=[.01,.02,.03]))
-        for kind in ('gyro', 'accel', 'depth', 'color')}
-    active = NS(get_stream=profiles.__getitem__, get_device=lambda: NS(
-        query_sensors=lambda: [NS(get_stream_profiles=lambda: list(profiles.values()))],
-        get_info=lambda kind: 'actual-test-serial'))
-    sdk.pipeline_wrapper = lambda pipeline: pipeline
-    sdk.config = lambda: NS(enable_stream=lambda *args: state.streams.append(args),
-        disable_stream=lambda kind: None, resolve=lambda pipeline: active)
-    pipeline_type = sdk.pipeline
-    original_wait = pipeline_type.wait_for_frames
-    def start(pipeline, config, callback):
-        state.pipeline, state.callback = pipeline, callback
-        return active
-    monkeypatch.setattr(pipeline_type, 'start', start)
-    class CaptureQueue(motion_module.CaptureQueue):
-        def __init__(self, motion):
-            super().__init__(motion)
-            state.capture = self
-    monkeypatch.setattr(motion_module, 'CaptureQueue', CaptureQueue)
-    def motion(kind, ms):
-        return NS(is_motion_frame=lambda: True, is_frameset=lambda: False,
-            as_motion_frame=lambda: NS(profile=profiles[kind], get_timestamp=lambda: ms,
-                get_frame_timestamp_domain=lambda: 'hardware_clock',
-                get_motion_data=lambda: NS(x=0., y=9.81 if kind == 'accel' else 0., z=0.)))
-    class Composite:
-        def __init__(self, frames, motion_frames=()):
-            self.frames, self.motion_frames = frames, motion_frames
-        def is_motion_frame(self): return False
-        def is_frameset(self): return True
-        def as_frameset(self): return self
-        def __iter__(self): return iter(self.motion_frames)
-        def get_color_frame(self): return self.frames.get_color_frame()
-        def get_depth_frame(self): return self.frames.get_depth_frame()
-    restart = dict(generation=2, enabled=['camera', 'depth', 'imu'],
-        activations=dict(camera=0, depth=1, imu=1))
-    interleaving = []
-    workers = []
-    waiting_callbacks = []
-    paused_callback = threading.Event()
-    resume_callback = threading.Event()
-    replay_state = []
-    callback_errors = []
-    def pause_after_applying_check(frame):
-        import dis
-        # Pause the actual nested production callback at either side of its
-        # applying guard, and resume only after the restart ACK has completed.
-        instructions = list(dis.get_instructions(state.callback))
-        for instruction in instructions:
-            if instruction.starts_line is not None:
-                guard_line = instruction.starts_line
-            if instruction.opname.startswith('POP_JUMP'):
-                jump = instruction
-                break
-        def trace(python_frame, event, arg):
-            if python_frame.f_code is state.callback.__code__:
-                python_frame.f_trace_opcodes = True
-                at_boundary = (event in ('line', 'opcode') and python_frame.f_lasti == jump.argval)
-                if callback_boundary == 'snapshot_during_ack':
-                    at_boundary = event == 'line' and python_frame.f_lineno == guard_line
-                if at_boundary:
-                    paused_callback.set()
-                    if not resume_callback.wait(2.):
-                        raise TimeoutError('offline scheduler did not resume old SDK callback')
-            return trace
-        try:
-            sys.settrace(trace)
-            state.callback(frame)
-        except BaseException as error:
-            callback_errors.append(error)
-        finally:
-            sys.settrace(None)
-    def apply_restart():
-        state.node.subscriptions['/robot/camera/cards_enabled'](NS(data=json.dumps(restart)))
-    def publish(topic, message):
-        if (callback_boundary in ('during_ack', 'snapshot_during_ack') and topic == '/robot/camera/cards_applied'
-                and json.loads(message.data)['generation'] == 2
-                and not waiting_callbacks):
-            # SDK callbacks arriving while ACK publication holds the boundary
-            # must not refill the freshly reset IMU/video state afterward.
-            def delayed_callback():
-                state.callback(motion('accel', 1060.))
-                state.callback(Composite(state.stale_frames))
-            if callback_boundary == 'snapshot_during_ack':
-                old_frame = Composite(state.stale_frames, [motion('accel', 1060.)])
-                callback = threading.Thread(target=pause_after_applying_check, args=(old_frame,))
-            else:
-                callback = threading.Thread(target=delayed_callback)
-            waiting_callbacks.append(callback)
-            callback.start()
-            if callback_boundary == 'snapshot_during_ack':
-                assert paused_callback.wait(1.), 'old SDK callback did not reach applying guard'
-            else:
-                callback.join(.02)
-        if topic == '/robot/camera/rgbd/imu' and not workers:
-            before = len(state.published.get('/robot/camera/cards_applied', []))
-            worker = threading.Thread(target=apply_restart)
+def test_body_imu_stop_ack_waits_for_publish_and_restart_rejects_queued_reads(capture, monkeypatch):
+    from test_bumi_body_imu import MOUNT, reading
+    device,state=capture
+    monkeypatch.setenv('BUMI_BODY_IMU_MOUNT',json.dumps(MOUNT))
+    state.frame_limit=3
+    workers=[]
+    blocked=[]
+    def control(node,generation,enabled,activation):
+        node.subscriptions['/robot/camera/cards_enabled'](NS(data=json.dumps(dict(
+            generation=generation, enabled=enabled,
+            activations=dict(camera=0,depth=0,imu=activation)))))
+    def publish(topic,message):
+        if topic=='/robot/state/imu_calibrated' and not workers:
+            previous=len(state.published['/robot/camera/cards_applied'])
+            worker=threading.Thread(target=lambda:control(state.node,1,['camera','depth'],0))
             workers.append(worker)
             worker.start()
             worker.join(.02)
-            interleaving.append(len(state.published.get('/robot/camera/cards_applied', [])) == before)
-    state.on_publish = publish
-    state.frame_limit = 3
-    epochs = []
+            blocked.append(len(state.published['/robot/camera/cards_applied'])==previous)
+    state.on_publish=publish
     def spin(node):
-        if state.iterations == 0:
-            state.callback(Composite(original_wait(state.pipeline, 1000)))
-        elif state.iterations == 1:
-            state.callback(motion('accel', 1060.))
-            state.stale_frames = original_wait(state.pipeline, 1000)
-            state.callback(Composite(state.stale_frames))  # stale queued frame
-            epochs.append(state.capture.motion.epoch)
-            if callback_boundary == 'after_applying_check':
-                old_frame = Composite(state.stale_frames, [motion('accel', 1060.)])
-                callback = threading.Thread(target=pause_after_applying_check, args=(old_frame,))
-                waiting_callbacks.append(callback)
-                callback.start()
-                assert paused_callback.wait(1.), 'old SDK callback did not reach production guard boundary'
-            state.callback(motion('gyro', 1060.))  # control races with its publish
+        if state.iterations==1:
+            body=node.subscriptions['/robot/state/imu']
+            body(NS(data=json.dumps(reading(10_030_000_000))))
             workers[0].join(1.)
-            resume_callback.set()
-            for callback in waiting_callbacks:
-                callback.join(1.)
             assert not workers[0].is_alive()
-            replay_state.append((
-                json.loads(state.published['/robot/camera/cards_applied'][-1].data)['generation'] == 2,
-                state.capture.frames.empty(), state.capture.motion.accel is None))
-            assert state.capture.frames.empty(), 'pre-restart frameset survived coalesced control'
-            assert state.capture.motion.accel is None, 'pre-restart accel survived coalesced control'
-            epochs.append(state.capture.motion.epoch)
-            state.callback(motion('gyro', 1070.))
-            assert len(state.published['/robot/camera/rgbd/imu']) == 1
-            state.callback(motion('accel', 1090.))
-            state.callback(motion('gyro', 1090.))
-            state.callback(Composite(original_wait(state.pipeline, 1000)))
-        else:
-            old_packet = dict(generation=1, enabled=[], activations=dict(camera=0,depth=0,imu=0))
-            node.subscriptions['/robot/camera/cards_enabled'](NS(data=json.dumps(old_packet)))
-            assert json.loads(state.published['/robot/camera/cards_applied'][-1].data)['generation'] == 2
-            raise RuntimeError('test loop finished')
-    state.on_spin = spin
-    try:
-        device._camera_subprocess('robot')
-    finally:
-        resume_callback.set()
-        for callback in waiting_callbacks:
-            callback.join(1.)
-    assert not callback_errors
-    assert replay_state == [(True, True, True)], 'old callback refilled video/accel after restart ACK'
-    assert interleaving == [True], 'ACK preceded completion of prior motion publish'
-    assert len(epochs) == 2 and epochs[0] != epochs[1]
-    packets = [json.loads(message.data) for message in state.published['/robot/camera/rgbd/imu']]
-    assert len(packets) == 2 and packets[0]['epoch'] != packets[1]['epoch']
-    assert packets[1]['accel_stamp_ns'] == packets[1]['stamp_ns'] == 10_090_000_000
-    depth = state.published['/robot/camera/depth']
-    assert [m.header.stamp.nanosec for m in depth] == [30_000_000, 90_000_000]
+            assert json.loads(state.published['/robot/camera/cards_applied'][-1].data)['generation']==1
+            body(NS(data=json.dumps(reading(10_035_000_000))))
+            assert len(state.published['/robot/state/imu_calibrated'])==1
+            control(node,2,['camera','depth','imu'],1)
+            body(NS(data=json.dumps(reading(10_030_000_000))))  # queued before activation
+            assert len(state.published['/robot/state/imu_calibrated'])==1
+            body(NS(data=json.dumps(reading(10_040_000_000))))
+            assert len(state.published['/robot/state/imu_calibrated'])==1  # cached SDK values
+            body(NS(data=json.dumps(reading(10_045_000_000,angular_vel=[1.,2.,3.1]))))
+            control(node,1,[],0)  # delayed control cannot retire this activation
+            assert json.loads(state.published['/robot/camera/cards_applied'][-1].data)['generation']==2
+    state.on_spin=spin
+    device._camera_subprocess('robot')
+    packets=[json.loads(m.data) for m in state.published['/robot/state/imu_calibrated']]
+    assert blocked==[True]
+    assert len(packets)==2 and packets[0]['epoch']!=packets[1]['epoch']
+    assert packets[1]['stamp_ns']==10_045_000_000
+    assert len(state.published['/robot/camera/color'])==3
+    assert len(state.published['/robot/camera/depth'])==3
 
 
 @pytest.mark.parametrize('dead', [False, True])

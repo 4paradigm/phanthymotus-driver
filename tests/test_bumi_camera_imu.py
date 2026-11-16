@@ -13,79 +13,32 @@ spec.loader.exec_module(fixture)
 capture=fixture.capture
 
 
-def test_shared_bumi_callback_keeps_motion_while_invalid_rgbd_pauses_images(capture, monkeypatch):
+def test_capture_uses_body_imu_without_discovering_or_enabling_camera_motion(capture, monkeypatch):
+    from test_bumi_body_imu import MOUNT, reading
     device,state=capture
     sdk=sys.modules['pyrealsense2']
-    sdk.stream.gyro,sdk.stream.accel='gyro','accel'
-    sdk.format.motion_xyz32f='xyz'
-    sdk.camera_info=NS(serial_number='serial')
-    profiles={kind:NS(stream_type=lambda kind=kind:kind,format=lambda:'xyz',fps=lambda:100,
-                       stream_index=lambda:0,unique_id=lambda kind=kind:kind,
-                       get_extrinsics_to=lambda depth, kind=kind:NS(rotation=[1,0,0,0,1,0,0,0,1],
-                           translation=[.012, -.034, .056] if kind=='gyro' else [-.078, .09, -.011]))
-              for kind in ('gyro','accel','depth','color')}
-    camera=NS(query_sensors=lambda:[NS(get_stream_profiles=lambda:list(profiles.values()))],
-              get_info=lambda kind:'camera123')
-    active=NS(get_stream=profiles.__getitem__,get_device=lambda:camera)
-    sdk.pipeline_wrapper=lambda pipeline:pipeline
-    sdk.config=lambda:NS(enable_stream=lambda *args:state.streams.append(args),
-                         disable_stream=lambda kind:None,resolve=lambda pipeline:active)
-    pipeline_type=sdk.pipeline
-    original_wait=pipeline_type.wait_for_frames
-    def start(pipeline,config,callback):
-        state.pipeline,state.callback=pipeline,callback
-        return active
-    monkeypatch.setattr(pipeline_type,'start',start)
-    offset=time.time_ns()-1_000_000_000
-    class Rgbd:
-        def __init__(self,*args,**kwargs):
-            self.clocks=[NS(offset=offset,domain='hardware_clock')]
-            self.clock_id='shared_rgbd'
-        def set_enabled(self,cards):pass
-        def motion_stamp(self,ms,domain):
-            assert domain=='hardware_clock'
-            return int(ms*1e6)+self.clocks[0].offset
-        def publish(self,frames):raise ValueError('RGB-D test failure')
-        def unavailable(self,error):state.rgbd_error=str(error)
-    monkeypatch.setitem(sys.modules,'rgbd_camera',NS(RgbdCameraPublisher=Rgbd))
-    def motion(kind):
-        return NS(is_motion_frame=lambda:True,as_motion_frame=lambda:NS(
-            profile=profiles[kind],get_timestamp=lambda:1000.,
-            get_frame_timestamp_domain=lambda:'hardware_clock',
-            get_motion_data=lambda:NS(x=0.,y=9.81 if kind=='accel' else 0.,z=0.)),
-            is_frameset=lambda:False)
-    class Composite:
-        def __init__(self,frames):self.frames=frames
-        def is_motion_frame(self):return False
-        def is_frameset(self):return True
-        def as_frameset(self):return self
-        def __iter__(self):return iter(())
-        def get_color_frame(self):return self.frames.get_color_frame()
-        def get_depth_frame(self):return self.frames.get_depth_frame()
+    probes=[]
+    sdk.pipeline_wrapper=lambda pipeline:probes.append(pipeline)
+    monkeypatch.setenv('BUMI_BODY_IMU_MOUNT',json.dumps(MOUNT))
+    state.frame_limit=2
     def spin(node):
-        state.aligned=True
-        frames=original_wait(state.pipeline,1000)
-        state.callback(motion('accel'))
-        state.callback(motion('gyro'))
-        state.callback(Composite(frames))
+        if state.iterations==1:
+            node.subscriptions['/robot/state/imu'](NS(data=json.dumps(reading(10_030_000_000))))
     state.on_spin=spin
-    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY',raising=False)
     device._camera_subprocess('robot')
-    packet=json.loads(state.published['/robot/camera/rgbd/imu'][0].data)
-    assert packet['clock_id']=='shared_rgbd/hardware_clock'
+    packet=json.loads(state.published['/robot/state/imu_calibrated'][0].data)
+    assert packet['source_id']=='noetix/robot/body_imu'
+    assert packet['stamp_source']=='read_completion'
     assert packet['camera_frame_id']=='robot_rgb_optical'
-    assert packet['camera_from_gyro_translation']==[.012, -.034, .056]
-    assert packet['camera_from_accel_translation']==[-.078, .09, -.011]
-    assert packet['translation_source']=='sdk_factory_extrinsics'
-    assert packet['stamp_ns']==1_000_000_000+offset
-    assert packet['clock_mapping']['offset_ns']==offset
-    assert packet['clock_mapping']['verified'] is False
-    assert not state.published.get('/robot/camera/color')
-    assert not state.published.get('/robot/camera/depth')
-    assert state.rgbd_error=='RGB-D test failure' and state.stopped
+    assert packet['clock_id'].endswith('/hardware_clock')
+    assert packet['angular_velocity']==[1.,2.,3.]
+    assert probes==[]
+    assert {args[0] for args in state.streams}=={'color','depth'}
+    assert '/robot/camera/rgbd/imu' not in state.publisher_topics
+    assert state.published['/robot/camera/color'] and state.published['/robot/camera/depth']
 
 
-def test_imu_card_keeps_body_json_and_reports_camera_disabled(monkeypatch):
+def test_imu_card_keeps_body_json_and_reports_adapter_disabled(monkeypatch):
     device=fixture._load_device(monkeypatch)
     state=device.StatePlugin.__new__(device.StatePlugin)
     state._namespace='robot'
@@ -95,7 +48,7 @@ def test_imu_card_keeps_body_json_and_reports_camera_disabled(monkeypatch):
     ports=next(t['topic_out'] for t in state.get_tools() if t['name']=='imu')
     assert ports==[
         {'topic':'/robot/state/imu','format':'data/json'},
-        {'name':'camera_imu','topic':'/robot/camera/rgbd/imu','format':'sensor/imu','optional':True}]
+        {'name':'body_imu','topic':'/robot/state/imu_calibrated','format':'sensor/imu','optional':True}]
     result=state.dispatch('info',{'_tool_name':'imu'})
     assert result['imu_status']['state']=='unavailable'
     assert 'disabled' in result['imu_status']['reason']
@@ -105,7 +58,7 @@ def test_imu_card_keeps_body_json_and_reports_camera_disabled(monkeypatch):
     assert state.dispatch('start',{'_tool_name':'imu'})['state']=='running'
 
 
-def test_imu_card_only_controls_camera_motion_lease(monkeypatch):
+def test_imu_card_only_controls_body_adapter_lease(monkeypatch):
     device=fixture._load_device(monkeypatch)
     state=device.StatePlugin.__new__(device.StatePlugin)
     state._namespace='robot'
@@ -114,8 +67,8 @@ def test_imu_card_only_controls_camera_motion_lease(monkeypatch):
     calls=[]
     state._camera_plugin=NS(start_card=lambda name:calls.append(('start',name)),
         stop_card=lambda name:calls.append(('stop',name)),
-        camera_imu_info=lambda:dict(imu_status=dict(state='unavailable',reason='motion unsupported')))
+        body_imu_info=lambda:dict(imu_status=dict(state='unavailable',reason='body adapter unavailable')))
     for action in ('stop','start','info'):
         response=state.dispatch(action,{'_tool_name':'imu'})
-        assert response['imu_status']['reason']=='motion unsupported'
+        assert response['imu_status']['reason']=='body adapter unavailable'
     assert calls==[('stop','imu'),('start','imu')]

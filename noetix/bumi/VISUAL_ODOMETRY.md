@@ -226,15 +226,21 @@ and valid monotonic capture clock mapping with the existing skew/drift bounds.
 Nonzero distortion is rejected rather than silently ignored by optimized SDK
 alignment. The original RGB field is retained.
 Invalid input pauses both public images and removes their ready declarations;
-native RGB is not published as a fallback. Missing optional motion or
+native RGB is not published as a fallback. Missing optional body IMU or
 body-camera TF does not disable valid images. Bumi's arrival-derived hardware-clock mapping remains
 explicitly unverified; this is not hardware timing or navigation acceptance.
 
 The optional bundle-local RTAB-Map raw branch still uses its own color-grid
 inputs and existing metadata. It does not publish public compressed depth.
 Generic Perception VO and Point Cloud consume the public pair's real matching
-camera_info directly. The body IMU port remains data/json; use the clearly
-named optional camera_imu port for calibrated RealSense motion.
+camera_info directly. The original body IMU display port remains data/json;
+use `imu.body_imu` (`/NS/state/imu_calibrated`, `sensor/imu`) for computation.
+It uses HighController body gyro/acceleration and the verified fixed mounting
+rotation, with explicit unverified SDK read-completion timestamps. No RealSense
+motion streams are requested. This supports attitude-only assistance; leave
+short-term compensation, depth geometry and inertial association disabled.
+Matching Perception read-time attitude support is required. The camera-origin
+mount preset is not a physical IMU translation calibration.
 
 Tests in `tests/test_bumi_rgbd_adapter.py`, `tests/test_bumi_camera_imu.py` and
 `tests/bumi_visual_odometry/test_bundle_hook.py` exercise scale, geometry,

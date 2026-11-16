@@ -340,7 +340,7 @@ class StatePlugin:
                 "description": f"Bumi IMU — quaternion, angular velocity, linear acceleration. Publishes at 20Hz to /{ns}/state/imu",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": f"/{ns}/state/imu", "format": "data/json"},
-                              {"name": "camera_imu", "topic": f"/{ns}/camera/rgbd/imu", "format": "sensor/imu", "optional": True}],
+                              {"name": "body_imu", "topic": f"/{ns}/state/imu_calibrated", "format": "sensor/imu", "optional": True}],
             },
             {
                 "name": "battery",
@@ -391,7 +391,7 @@ class StatePlugin:
                             self._camera_plugin.stop_card('imu')
                 except (RuntimeError, TimeoutError) as error:
                     return dict(state='error', sourceRequestDisabled=not self._node._imu_enabled, error=str(error))
-            camera = (self._camera_plugin.camera_imu_info() if self._camera_plugin is not None else
+            camera = (self._camera_plugin.body_imu_info() if self._camera_plugin is not None else
                       dict(imu_status=dict(state='unavailable', reason='camera plugin disabled')))
             return dict(state='stopping' if camera.get('state') == 'stopping' else
                         ('running' if self._node._imu_enabled else 'idle'),
@@ -2354,7 +2354,7 @@ def _camera_subprocess(namespace: str):
     from rclpy.node import Node as _Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
     from std_msgs.msg import String as _String
-    from common.realsense_imu import MotionSource, CaptureQueue, motion_profiles, start_optional_motion
+    from body_imu import BodyImuSource
 
     _QOS = QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -2387,96 +2387,63 @@ def _camera_subprocess(namespace: str):
         generation=0, enabled=['camera', 'depth', 'imu'],
         activations=dict(camera=0, depth=0, imu=0)))))
     enabled_cards = set(control['enabled'])
-    capture_epoch = (control['generation'], False)
     ack_pub = node.create_publisher(_String, f'/{namespace}/camera/cards_applied', _CONTROL_QOS)
     def acknowledge_control():
         message = _String()
         message.data = json.dumps(control)
         ack_pub.publish(message)
     def cards_enabled(msg):
-        nonlocal enabled_cards, control, capture_epoch
+        nonlocal enabled_cards, control
         packet = json.loads(msg.data)
         # Applied only at the capture-loop boundary. The callback lock also
-        # places the ACK after every prior SDK motion publication has returned.
+        # places the ACK after every prior body IMU publication has returned.
         with control_lock:
             if packet['generation'] <= control['generation']:
                 acknowledge_control()
                 return
-            capture_epoch = (packet['generation'], True)
-            try:
-                new_cards = set(packet['enabled'])
-                restarted = {name for name in new_cards
-                             if packet['activations'][name] != control['activations'][name]}
-                enabled_cards = new_cards
-                if 'imu' in restarted and imu.configured:
-                    try:
-                        imu.configure(active, camera_stream=rs.stream.color)  # fresh epoch, no held accel
-                    except Exception as exc:
-                        imu.unavailable(exc)
-                if restarted & {'camera', 'depth'}:
-                    if isinstance(capture, CaptureQueue):
-                        import queue
-                        try:
-                            capture.frames.get_nowait()
-                        except queue.Empty:
-                            pass
-                    else:
-                        # Flush SDK video queued before an activation as well.
-                        while pipeline.poll_for_frames():
-                            pass
-                control = packet
-                if rgbd_inputs is not None:
-                    rgbd_inputs.set_enabled(enabled_cards, restarted=bool(restarted))
-                acknowledge_control()
-            finally:
-                capture_epoch = (control['generation'], False)
+            new_cards = set(packet['enabled'])
+            restarted = {name for name in new_cards
+                         if packet['activations'][name] != control['activations'][name]}
+            enabled_cards = new_cards
+            if 'imu' in restarted:
+                imu.reset(after_ns=_time.time_ns())
+            if restarted & {'camera', 'depth'}:
+                while pipeline.poll_for_frames():
+                    pass
+            control = packet
+            if rgbd_inputs is not None:
+                rgbd_inputs.set_enabled(enabled_cards, restarted=bool(restarted))
+            acknowledge_control()
     node.create_subscription(_String, f'/{namespace}/camera/cards_enabled',
                              cards_enabled, _CONTROL_QOS)
-    imu_pub = node.create_publisher(_String, f'/{namespace}/camera/rgbd/imu', _QOS)
+    imu_pub = node.create_publisher(_String, f'/{namespace}/state/imu_calibrated', _QOS)
     def publish_imu(packet):
         msg = _String()
         msg.data = json.dumps(packet, allow_nan=False)
         if 'imu' in enabled_cards:
             imu_pub.publish(msg)
-    def map_motion(source_ms, domain):
-        if rgbd_inputs is None:
-            raise ValueError('RGB-D capture clock mapping unavailable')
-        stamp = rgbd_inputs.motion_stamp(source_ms, domain)
-        imu.clock_mapping = dict(method='fixed_arrival_offset' if domain == 'hardware_clock' else 'device_wall',
-                                 source_clock=domain, offset_ns=rgbd_inputs.clocks[0].offset, verified=False)
-        return stamp
-    imu = MotionSource(f'/{namespace}/camera/rgbd/imu', f'{namespace}_rgb_optical', rs,
-                       map_motion, publish_imu,
-                       clock_id=lambda: rgbd_inputs.clock_id + '/' + rgbd_inputs.clocks[0].domain)
-    capture = CaptureQueue(imu)
-    def on_capture(frame):
-        # Snapshot the epoch and applying flag together before any preemption.
-        observed_epoch = capture_epoch
-        if observed_epoch[1]:
-            return
+    def body_reference():
+        if rgbd_inputs is None or rgbd_inputs.clocks[0].offset is None:
+            raise ValueError('waiting for RGB-D wall-clock mapping')
+        if rgbd_inputs._clock_error:
+            raise ValueError(rgbd_inputs._clock_error)
+        return rgbd_inputs.frame_id, rgbd_inputs.clock_id + '/' + rgbd_inputs.clocks[0].domain
+    imu = BodyImuSource(namespace, json.loads(os.environ.get('BUMI_BODY_IMU_MOUNT', 'null')),
+                        body_reference)
+    def body_reading(message):
         with control_lock:
-            # An SDK callback already waiting at the boundary belongs to the
-            # prior generation and cannot refill the freshly cleared queue.
-            if observed_epoch == capture_epoch:
-                capture(frame)
+            if 'imu' not in enabled_cards:
+                return
+            try:
+                packet = imu.accept(json.loads(message.data), _time.time_ns())
+                if packet is not None:
+                    publish_imu(packet)
+            except (ValueError, TypeError) as error:
+                imu.unavailable(error)
+    node.create_subscription(_String, f'/{namespace}/state/imu', body_reading, _QOS)
     try:
-        try:
-            device = config.resolve(rs.pipeline_wrapper(pipeline)).get_device()
-            if not motion_profiles(rs, device):
-                raise ValueError('camera motion streams unsupported')
-        except Exception as exc:
-            imu.unavailable('motion discovery failed: ' + str(exc))
-            active = pipeline.start(config)
-            capture = pipeline
-        else:
-            active, imu_error = start_optional_motion(rs, pipeline, config, device, on_capture)
-            if imu_error:
-                imu.unavailable(imu_error)
-            else:
-                try:
-                    imu.configure(active, camera_stream=rs.stream.color)
-                except Exception as exc:
-                    imu.unavailable(exc)
+        pipeline.start(config)
+        capture = pipeline
     except Exception as e:
         print(f"[camera_subprocess] Realsense pipeline start failed: {e}", flush=True)
         pipeline.stop()
@@ -2564,7 +2531,7 @@ def _camera_subprocess(namespace: str):
     # geometry, units or capture time pauses both public image streams.
     def report_rgbd(status):
         import json
-        status = dict(status, imu_status=dict(imu.status(), activation=control['activations']['imu']),
+        status = dict(status, imu_status=dict(imu.status(_time.time_ns()), activation=control['activations']['imu']),
                       activations=dict(control['activations']))
         print("[camera_subprocess] RGBD " + json.dumps(status, allow_nan=False), flush=True)
     try:
@@ -2610,7 +2577,7 @@ def _camera_subprocess(namespace: str):
                     rgbd_inputs.unavailable(exc)
 
             if _time.monotonic() - last_imu_report >= .2:
-                print('[camera_subprocess] IMU ' + json.dumps(dict(imu.status(), activation=control['activations']['imu']), allow_nan=False), flush=True)
+                print('[camera_subprocess] IMU ' + json.dumps(dict(imu.status(_time.time_ns()), activation=control['activations']['imu']), allow_nan=False), flush=True)
                 last_imu_report = _time.monotonic()
             frame_count += 1
             # Log every 300 frames (~15s at 20fps)
@@ -2690,6 +2657,7 @@ class CameraPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor):
         self._namespace = namespace
+        self._body_imu_calibration = plugin_config.get('body_imu_calibration')
         self._color_topic = f"/{namespace}/camera/color"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._proc: subprocess.Popen | None = None
@@ -2763,9 +2731,9 @@ class CameraPlugin:
         return (generation > 0 and name not in self._cards and self.is_running()
                 and generation > self._acked_generation)
 
-    def camera_imu_info(self):
+    def body_imu_info(self):
         pending = self._stop_pending('imu')
-        return dict(topic_out=[{"name": "camera_imu", "topic": f"/{self._namespace}/camera/rgbd/imu",
+        return dict(topic_out=[{"name": "body_imu", "topic": f"/{self._namespace}/state/imu_calibrated",
                                 "format": "sensor/imu", "optional": True}],
                     state='stopping' if pending else ('running' if 'imu' in self._cards and self.is_running() else 'idle'),
                     sourceRequestDisabled='imu' not in self._cards,
@@ -2828,7 +2796,8 @@ class CameraPlugin:
         import sys
         with self._intrinsics_lock:
             self._rgbd_status = dict(ready=False, camera_info=[], error="awaiting calibrated capture")
-        env = dict(os.environ, BUMI_CAMERA_CARDS=json.dumps(self._control_packet))
+        env = dict(os.environ, BUMI_CAMERA_CARDS=json.dumps(self._control_packet),
+                   BUMI_BODY_IMU_MOUNT=json.dumps(self._body_imu_calibration))
         self._proc = subprocess.Popen(
             [sys.executable, "-c",
              # Protect import-time output as well as the child entry point.

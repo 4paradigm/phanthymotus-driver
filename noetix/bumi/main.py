@@ -178,7 +178,9 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
-            camera_plugin = CameraPlugin(plugins_cfg["camera"], namespace, executor)
+            camera_config = dict(plugins_cfg["camera"], body_imu_calibration=
+                                 plugins_cfg.get("visual_odometry", {}).get("calibration"))
+            camera_plugin = CameraPlugin(camera_config, namespace, executor)
             self._plugins.append(camera_plugin)
             if state_plugin is not None:
                 state_plugin._camera_plugin = camera_plugin
