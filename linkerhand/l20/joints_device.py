@@ -456,6 +456,10 @@ class JointsPlugin:
         # instance -> claim whose worker did not stop; its next stop retries it.
         self._leftovers: dict[str, tuple[str, str] | None] = {}
         self._used_targets: set[tuple[str, str]] = set()
+        # Targets whose controller this plugin created. A controller that was
+        # already in the global registry belongs to another consumer (hand,
+        # gesture, grasp, tactile) and must not be closed here.
+        self._created_targets: set[tuple[str, str]] = set()
         self._probe_cache: dict[tuple[str, str], float] = {}
         self._present_cache: dict[tuple[str, str], float] = {}
 
@@ -478,6 +482,10 @@ class JointsPlugin:
                 {"topic": skeleton_topic, "format": "sensor/skeleton"}]
 
     def get_tools(self) -> list[dict]:
+        # `action_schema` drives the card's action list. `get_state` is an
+        # API-only action (same as hand_tactile's) and `instance_id` is injected
+        # by the platform, so neither is declared here; the side lives in
+        # configSchema and is sent as a separate config call or nested config.
         schema = action_schema(
             {
                 "info": ([], "获取关节卡片信息、当前绑定的手、实测刷新率及 topic_out"),
@@ -576,24 +584,33 @@ class JointsPlugin:
         hand_lock = getattr(self.hand, "_lock", None) or contextlib.nullcontext()
         with hand_lock, GLOBAL_BUS_LOCK:
             self._used_targets.discard(target)
+            # Only a controller this plugin created is ours to close. One that
+            # was already registered belongs to another consumer (hand,
+            # gesture, grasp, tactile) and may still be in use; closing it or
+            # dropping its registry entry would split that hand's replies.
+            if target not in self._created_targets:
+                return
+            self._created_targets.discard(target)
             if target in (getattr(self.hand, "_controllers", None) or ()):
                 return
             ctrl = GLOBAL_CONTROLLERS.get(target)
             if ctrl is not None:
                 ctrl.close()
                 # A closed controller must not keep making the hand look
-                # occupied: the next card has to probe the hand again. Left in
-                # the registry, the stale entry makes _match() claim a hand that
-                # may already be unplugged (PR #546 review).
+                # occupied: the next card has to probe the hand again.
                 if GLOBAL_CONTROLLERS.get(target) is ctrl:
                     del GLOBAL_CONTROLLERS[target]
 
     def _get_controller(self, side: str, channel: str):
         # Not registered on the hand card: its shutdown releases torque on every
         # hand it knows, which a read-only card must not cause.
+        target = (side, channel)
+        existed = target in GLOBAL_CONTROLLERS
         ctrl = get_shared_controller(self.hand_config, side, channel,
                                      can_id=self.can_id(side), bus_lock=GLOBAL_BUS_LOCK)
-        self._used_targets.add((side, channel))
+        self._used_targets.add(target)
+        if not existed:
+            self._created_targets.add(target)
         return ctrl
 
     # ── CAN matching ──────────────────────────────────────────────────

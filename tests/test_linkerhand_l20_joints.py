@@ -992,7 +992,7 @@ def test_disabled_joints_section_registers_nothing():
     assert "joints" not in [p.PREFIX for p in build_plugins(config, "", None)]
 
 
-def test_a_stopped_card_removes_its_controller_from_the_shared_registry(monkeypatch):
+def test_a_stopped_card_closes_and_removes_only_the_controller_it_created(monkeypatch):
     """A closed controller must not keep a hand looking occupied (PR #546 review)."""
     registry = {}
 
@@ -1003,15 +1003,18 @@ def test_a_stopped_card_removes_its_controller_from_the_shared_registry(monkeypa
         def close(self):
             self.closed = True
 
-    controller = Controller()
+    created = Controller()
     monkeypatch.setattr(hand_device, "GLOBAL_CONTROLLERS", registry)
     monkeypatch.setattr(joints_device, "GLOBAL_CONTROLLERS", registry)
+    monkeypatch.setattr(joints_device, "get_shared_controller",
+                        lambda config, side, channel, **kw: registry.setdefault((side, channel), created))
     plugin = JointsPlugin(None, {}, global_config=GLOBAL_CONFIG)
-    plugin._used_targets.add(("right", "can1"))
-    registry[("right", "can1")] = controller
+    plugin._get_controller("right", "can1")
+    assert plugin._created_targets == {("right", "can1")}
+    assert registry == {("right", "can1"): created}
 
     plugin._close_if_unused(("right", "can1"))
-    assert controller.closed and registry == {}
+    assert created.closed and registry == {}
 
     # The next card must probe the hand again instead of trusting a stale entry.
     probed = []
@@ -1027,11 +1030,40 @@ def test_a_stopped_card_removes_its_controller_from_the_shared_registry(monkeypa
         plugin.stop()
 
 
+def test_a_controller_created_by_another_plugin_is_never_closed(monkeypatch):
+    """joints must not close a hand/tactile/gesture/grasp consumer's controller."""
+    registry = {}
+
+    class Controller:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    shared = Controller()
+    registry[("right", "can1")] = shared
+    monkeypatch.setattr(hand_device, "GLOBAL_CONTROLLERS", registry)
+    monkeypatch.setattr(joints_device, "GLOBAL_CONTROLLERS", registry)
+    plugin = JointsPlugin(None, {}, global_config=GLOBAL_CONFIG)
+    plugin._used_targets.add(("right", "can1"))
+
+    plugin._close_if_unused(("right", "can1"))
+    assert shared.closed is False
+    assert registry == {("right", "can1"): shared}
+    assert plugin._used_targets == set()
+
+
 def test_plugin_stop_closes_only_controllers_the_hand_card_does_not_own(monkeypatch):
     owned, own = mock.Mock(), mock.Mock()
-    monkeypatch.setattr(hand_device, "GLOBAL_CONTROLLERS", {("left", "can0"): owned, ("right", "can1"): own})
+    registry = {("left", "can0"): owned}
+    monkeypatch.setattr(hand_device, "GLOBAL_CONTROLLERS", registry)
     import joints_device
-    monkeypatch.setattr(joints_device, "GLOBAL_CONTROLLERS", hand_device.GLOBAL_CONTROLLERS)
+    monkeypatch.setattr(joints_device, "GLOBAL_CONTROLLERS", registry)
+    # The right controller does not exist yet, so this plugin creates it; the
+    # left one belongs to the hand card and must not be touched.
+    monkeypatch.setattr(joints_device, "get_shared_controller",
+                        lambda config, side, channel, **kw: registry.setdefault((side, channel), own))
     hand = SimpleNamespace(hand_config={}, config=GLOBAL_CONFIG, _controllers={("left", "can0"): owned})
     plugin = JointsPlugin(hand, {}, global_config=GLOBAL_CONFIG)
     assert plugin._get_controller("left", "can0") is owned

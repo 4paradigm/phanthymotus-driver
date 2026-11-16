@@ -158,7 +158,7 @@ Core 可先发送共享 `poll_hz`，再发送实例 `bound_side/can_channel`。�
 | 关节 JSON | `/{namespace}/hand/{side}/joints_{card}` | `data/json` | 每轮发布，失败或等待时 `valid=false` |
 | 骨架 | `/{namespace}/hand/{side}/joints_{card}_skeleton` | `sensor/skeleton` | 只在本轮有效时发布 |
 
-同一驱动的两张卡 topic 不同，因此各占一个骨架画布。`info` 的 `state` 可能是 `unset`（还没选左右手，`topic_out=[]`）、`waiting`（已选侧别但没匹配到手，`can_channel=null`，`waiting_reason` 给出原因）、`running` 或 `idle`。`get_state` 在采集运行时返回最近一轮；未运行时直接返回 `state=idle`、`valid=false`，不再单独查询 CAN。
+同一驱动的两张卡 topic 不同，因此各占一个骨架画布。`info` 的 `state` 可能是 `unset`（还没选左右手，`topic_out=[]`）、`waiting`（已选侧别但没匹配到手，`can_channel=null`，`waiting_reason` 给出原因）、`running` 或 `idle`。`get_state` 是 API 专用动作（不在卡片动作列表里，同 `hand_tactile`），采集运行时返回最近一轮；未运行时直接返回 `state=idle`、`valid=false`，不再单独查询 CAN。
 
 JSON 主要字段：`valid`、`state`、`reason`、`error_details`、`side`、`can_channel`（等待时为 `null`）、`can_id`、`sequence`、`timestamp`（收到本轮完整回复的时间，失败时为 `null`）、`published_at`、`source=can_position_query`、`query_elapsed_s`、`measured_hz`（最近成功轮次的实测频率）、`joint_count=16`、`raw_unit`、`angle_unit=rad`、`angle_source`、`reserved_vector_indexes=[11,12,13,14]` 和 `joints`。`joints` 每项包含 `name`、`label`、`vector_index`、`model_joint`、`raw`（0..255 实测原始值）、`angle_rad`、`angle_deg`。四个保留槽位不作为关节输出。
 
