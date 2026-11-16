@@ -2,8 +2,11 @@
 import importlib
 import json
 import math
+from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace as NS
+
+import yaml
 
 
 def test_plugin_outputs_and_does_not_copy_old_segment_frame(monkeypatch):
@@ -58,7 +61,11 @@ def test_plugin_outputs_and_does_not_copy_old_segment_frame(monkeypatch):
 
     from noetix.bumi import fused_odometry
     importlib.reload(fused_odometry)
-    plugin = fused_odometry.FusedOdometryPlugin({},'robot', NS(add_node=lambda node: None),object())
+    config = yaml.safe_load((Path(__file__).resolve().parents[2]/'noetix/bumi/config.yaml').read_text())
+    config['plugins']['fused_odometry']['enabled'] = True
+    assert config['plugins']['visual_odometry']['calibration']['assumed'] is True
+    plugin = fused_odometry.FusedOdometryPlugin(config['plugins']['fused_odometry'],
+                                               'robot', NS(add_node=lambda node: None),object())
     assert plugin.topic.endswith('/bumi_fused_odometry/state/odom')
     assert plugin.visual_topic.endswith('/bumi_visual_odometry/state/odom')
     assert plugin.node.sub_qos == 'best_effort'
@@ -66,6 +73,16 @@ def test_plugin_outputs_and_does_not_copy_old_segment_frame(monkeypatch):
     plugin.active=True
     for i in range(20):
         plugin.filter.predict(1_000_000_000+i*25_000_000,0,(.002,0),True)
+    plugin._on_visual(Msg(json.dumps(dict(schema='motus.odom/1',vendor={
+        'status':'tracking','pose_reference':'body_axes','segment_id':'s1',
+        'visual_stamp_ns':1_400_000_000,'visual_diagnostic':{'inliers':35}},pose={
+        'position':[11.,0,0],'quaternion':[0,0,0,1],'covariance':[0.]*36}))))
+    assert plugin.filter.last_visual_stamp is None
+    detail = plugin.dispatch('info', {})['estimate']['vendor']
+    assert detail['visual_result'] == 'body_reference_unavailable'
+    assert 'body_axes' in detail['last_error']
+    plugin._publish()
+    assert 'body_axes' in json.loads(plugin.node.pubs[plugin.status_topic][-1].data)['reason']
     for t,x in [(1_400_000_000,11.0),(1_425_000_000,11.012)]:
         visual = dict(schema='motus.odom/1',vendor={
             'status':'tracking','pose_reference':'body','segment_id':'s1',
@@ -75,6 +92,7 @@ def test_plugin_outputs_and_does_not_copy_old_segment_frame(monkeypatch):
         plugin._on_visual(Msg(json.dumps(visual)))
     plugin._publish()
     payload=json.loads(plugin.node.pubs[plugin.topic][-1].data)
+    assert payload['vendor']['last_error'] is None
     assert payload['vendor']['status']=='tracking'
     assert payload['vendor']['planar_only'] is True
     assert payload['pose']['frame_id']=='bumi_fused_odom'

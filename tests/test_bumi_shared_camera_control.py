@@ -36,6 +36,35 @@ def parent_control(device):
     return parent
 
 
+def test_parent_consumes_all_imu_status_but_logs_transitions_and_sparse_samples(monkeypatch,capsys):
+    device = _fixture._load_device(monkeypatch)
+    parent = parent_control(device)
+    finished,release = threading.Event(),threading.Event()
+    workers=[]
+    real_thread=threading.Thread
+    def lines():
+        for i in range(1,104):
+            state='unavailable' if i in (101,102) else 'ready'
+            packet=dict(state=state,reason=None if state=='ready' else 'stale',
+                        source='body_imu',activation=1,last_capture_ns=i)
+            yield ('[camera_subprocess] IMU '+json.dumps(packet)+'\n').encode()
+        finished.set()
+        release.wait(2)
+    proc=NS(stdout=lines(),poll=lambda:None)
+    monkeypatch.setattr(device.subprocess,'Popen',lambda *a,**kw:proc)
+    def thread(*args,**kwargs):
+        worker=real_thread(*args,**kwargs);workers.append(worker);return worker
+    monkeypatch.setattr(device.threading,'Thread',thread)
+    try:
+        parent._start_process()
+        assert finished.wait(1)
+        assert parent._rgbd_status['imu_status']['last_capture_ns']==103
+        assert capsys.readouterr().out.count('[camera_subprocess] IMU ')==4
+    finally:
+        release.set()
+        for worker in workers:worker.join(timeout=2)
+
+
 def test_stop_waits_for_child_ack_after_inflight_depth_publish(capture, monkeypatch):
     device, state = capture
     parent = parent_control(device)

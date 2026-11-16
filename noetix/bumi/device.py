@@ -2808,14 +2808,11 @@ class CameraPlugin:
         )
         proc = self._proc
         def _fwd():
+            imu_reports, last_imu_state = 0, None
             for line in proc.stdout:
                 if self._proc is not proc:
                     return
                 text = line.decode(errors='replace').rstrip()
-                # Printed either way: the declaration is what the cards serve,
-                # but the line itself is what somebody debugging a wrong field
-                # of view will grep for in `docker logs`.
-                print(text, flush=True)
                 imu_marker = "[camera_subprocess] IMU "
                 if imu_marker in text:
                     try:
@@ -2823,8 +2820,17 @@ class CameraPlugin:
                         if isinstance(imu_status, dict):
                             with self._intrinsics_lock:
                                 self._rgbd_status['imu_status'] = imu_status
+                            imu_reports += 1
+                            state = {k: imu_status.get(k) for k in
+                                     ('state', 'reason', 'source', 'activation', 'fusion')}
+                            if state != last_imu_state or imu_reports % 100 == 0:
+                                print(text, flush=True)
+                            last_imu_state = state
+                            continue
                     except (ValueError, TypeError):
                         pass
+                # Image declarations and other diagnostics retain their logs.
+                print(text, flush=True)
                 marker = "[camera_subprocess] RGBD "
                 if marker in text:
                     try:

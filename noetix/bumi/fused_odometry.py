@@ -150,7 +150,13 @@ class FusedOdometryPlugin:
             vendor = raw.get('vendor') or {}
             pose = raw.get('pose')
             # Do not use a frozen pose or uncalibrated optical frame as body.
-            if vendor.get('status') != 'tracking' or not pose or vendor.get('pose_reference') != 'body':
+            if vendor.get('status') != 'tracking' or not pose:
+                return
+            if vendor.get('pose_reference') != 'body':
+                with self.lock:
+                    self.last_visual_result = 'body_reference_unavailable'
+                    self.last_error = ('visual correction needs a body-reference pose; received '
+                                       + str(vendor.get('pose_reference')))
                 return
             diag = vendor.get('visual_diagnostic') or {}
             stamp_ns = vendor.get('visual_stamp_ns')
@@ -172,6 +178,7 @@ class FusedOdometryPlugin:
                     stamp_ns=stamp_ns, segment=segment,
                     position=pose['position'], quaternion=pose['quaternion'],
                     covariance=pose['covariance'], inliers=int(diag.get('inliers', 0)))
+                self.last_error = None
         except (ValueError, TypeError, KeyError, OverflowError) as exc:
             with self.lock:
                 self.last_visual_result = 'invalid_visual_sample'

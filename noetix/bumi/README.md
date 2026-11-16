@@ -622,6 +622,14 @@ commands. Enable **both** `plugins.visual_odometry.enabled: true` and
 `plugins.fused_odometry.enabled: true` in `config.yaml`, then deploy the Bumi
 driver image. A live HighController connection is required.
 
+With the shipped `assumed: true` mount, VO reports `body_axes` at the camera
+origin. This planar body-origin filter does not apply those visual corrections:
+it continues leg/IMU prediction, reports `visual_result=body_reference_unavailable`,
+and explains the received reference in status `reason` and odometry `last_error`.
+Supply an actual body-reference pose to enable its visual corrections. A later
+usable body pose clears the error. This reference requirement belongs to the
+legacy planar filter; generic PR371 keeps its numeric-format input policy.
+
 * 40 Hz SDK joint and body-IMU reads drive the existing stance-foot kinematic
   estimator (with cautious, direction-dependent slip scales). This estimator
   has no vendor hardware timestamps and is not intrinsically slip-free.
