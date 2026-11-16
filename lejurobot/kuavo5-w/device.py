@@ -75,6 +75,7 @@ class RobotState:
         self._generation = -1
         self._running = False
         self.motion_blocked = False
+        self.remote_resume_unresolved = False
         self.motion_enabled = motion_enabled
         self._enable_verified_at = None
         self._enable_check_error = 'waiting_for_enable_check'
@@ -149,6 +150,7 @@ class RobotState:
                     "mode_feedback_fresh": mode_fresh,
                     "motion_blocked": self.motion_blocked, "fields": fields,
                     "motion_enabled": self.motion_enabled,
+                    "remote_resume_unresolved": self.remote_resume_unresolved,
                     "enable_verification": {
                         'valid': self._enable_trusted(now), 'error': self._enable_check_error,
                         'age_s': None if self._enable_verified_at is None else max(0, now - self._enable_verified_at),
@@ -186,11 +188,14 @@ class RobotState:
                 and now - seen <= ENABLE_LEASE_S)
 
     def confirmed_enable(self):
+        return self.confirmed_enable_sample()[0]
+
+    def confirmed_enable_sample(self):
         connected, _ = self._sync_session()
         with self._lock:
             if not connected or not self._enable_trusted(time.monotonic()):
                 raise RuntimeError('control-enable verification is missing or stale; wait for read-only probe')
-            return self._values.get('control_enabled')
+            return self._values.get('control_enabled'), self._seen['control_enabled']
 
     def _enable_tick(self):
         if self._closed.is_set() or time.monotonic() < self._enable_probe_after:
@@ -744,6 +749,7 @@ class KuavoBundle:
         self.tracker = ActionTracker()
         self._closing = False
         self._transition = None
+        self._remote_resume = None
         self.plugins = [LocoPlugin(self), ArmPlugin(self), LowerBodyPlugin(self),
                         LowerBodyPlugin(self, "waist"), HeadPlugin(self), ControlPlugin(self)]
         self._enabled = {name for name, cfg in config.get("plugins", {}).items()
@@ -779,6 +785,8 @@ class KuavoBundle:
         try:
             self.state.require_motion_enabled()
             self.sensors.require_profile()
+            if self._resume_unresolved():
+                raise RuntimeError('remote resume is unresolved; motion remains blocked; request pause after resolution')
             if self._closing or self._transition is not None or self.tracker._active:
                 raise RuntimeError('motion/control is busy; stop and await confirmation before retrying')
             enabled = self.state.confirmed_enable()
@@ -795,19 +803,63 @@ class KuavoBundle:
             if self._transition is token:
                 self._transition = None
 
+    def _resume_unresolved(self):
+        """Caller holds tracker.lock. Local timeout cannot cancel ROS execution.
+
+        Only an explicit rejection, or acceptance plus fresh terminal True,
+        settles our resume. A disconnected/replaced session cannot settle it.
+        Subsequent pause requests still send zero/disable immediately, but may
+        not claim success while this hazard remains. No automatic enable/retry.
+        """
+        request = self._remote_resume
+        if request is None:
+            return False
+        if self.ros1.connection != (True, request['generation']) or request['pending'] is None:
+            return True
+        response = self.ros1.service_result(request['pending'])
+        if response is None:
+            return True
+        settled = response.get('success') is False
+        if response.get('success') is True:
+            try:
+                enabled, seen = self.state.confirmed_enable_sample()
+                settled = enabled is True and seen >= request['issued']
+            except RuntimeError:
+                pass
+        if settled and self.ros1.connection == (True, request['generation']):
+            self._remote_resume = None
+            self.state.remote_resume_unresolved = False
+            return False
+        return True
+
     def confirm_control(self, token, service, service_type, args, accepted_key, key, expected):
         # Serialize only validation + SEND, never the remote response wait.
         # Thus a stop packet cannot be followed by an older resume/mode SEND.
         with self.tracker.lock:
             self._check_transition(token)
             issued = time.monotonic()
+            enabling = service == '/enable_control' and args.get('data') is True
+            if enabling:
+                # Mark before SEND: even a send exception can mean partial delivery.
+                self._remote_resume = {'pending': None, 'issued': issued,
+                                       'generation': token['generation']}
+                self.state.remote_resume_unresolved = True
             pending = self.ros1.start_service(service, service_type, args)
+            if enabling:
+                self._remote_resume['pending'] = pending
+                self.ros1.retain_service(pending)
         remaining = max(0.0, issued + CONTROL_TIMEOUT_S - time.monotonic())
         response = self.ros1.wait_service(pending, remaining, token['cancelled'])
         if response.get(accepted_key) is not True:
+            if enabling:
+                with self.tracker.lock:
+                    self._resume_unresolved()
             raise RuntimeError(_safe_log(response.get('message', 'control request rejected')))
         remaining = max(0.0, issued + CONTROL_TIMEOUT_S - time.monotonic())
         self.wait_state(key, expected, issued, timeout=remaining, generation=token['generation'], token=token)
+        if enabling:
+            with self.tracker.lock:
+                self._resume_unresolved()
 
     def wait_state(self, key, expected, issued, timeout=CONTROL_TIMEOUT_S, generation=None, token=None):
         if generation is None:
@@ -831,6 +883,7 @@ class KuavoBundle:
             if expected is not None and not self.tracker.current(*expected):
                 return {'state': 'idle'}  # An old worker cannot cancel a newer action.
             interrupted = self._transition is not None
+            unresolved = self._resume_unresolved()
             token = self._new_transition('pause')
             self.state.motion_blocked = True
             errors = []
@@ -846,7 +899,7 @@ class KuavoBundle:
             except RuntimeError:
                 enabled = None
             # Even a fresh pre-resume False cannot bypass a superseding pause.
-            if enabled is False and not interrupted:
+            if enabled is False and not interrupted and not unresolved:
                 with self.tracker.lock:
                     self._check_transition(token)
                     return {"state": "paused", "control_enabled": False,
@@ -855,6 +908,11 @@ class KuavoBundle:
                                  "success", "control_enabled", False)
             with self.tracker.lock:
                 self._check_transition(token)
+                # If an old resume was outstanding when disable was sent,
+                # even its resolution now is too late to order THIS disable.
+                # A later explicit pause must send disable after resolution.
+                if unresolved or self._resume_unresolved():
+                    raise RuntimeError('remote resume is unresolved; pause cannot be confirmed')
                 return {"state": "paused", "control_enabled": False,
                         "completion_basis": "enable_control_state", "scope": "whole_body"}
         except Exception as exc:
@@ -862,7 +920,8 @@ class KuavoBundle:
             error = _safe_log('; '.join(errors))
             print(f"[pause] physical stop unconfirmed: {error}", flush=True)
             return {"state": "error", "error": error,
-                    "physical_stop_confirmed": False, "motion_blocked": True}
+                    "physical_stop_confirmed": False, "motion_blocked": True,
+                    "remote_resume_unresolved": self.state.remote_resume_unresolved}
         finally:
             self._end_control(token)
 
@@ -874,6 +933,8 @@ class KuavoBundle:
                                      "success", "control_enabled", True)
             with self.tracker.lock:
                 self._check_transition(token)
+                if self._resume_unresolved():
+                    raise RuntimeError('remote resume terminal state is not confirmed')
                 self.state.motion_blocked = False
                 return {"state": "ready", "control_enabled": True,
                         "completion_basis": "enable_control_state", "new_motion_command_required": True}
@@ -920,7 +981,7 @@ class KuavoBundle:
             if self._closing:
                 return
             self._closing = True
-            needs_pause = bool(self.tracker._active) or self._transition is not None
+            needs_pause = bool(self.tracker._active) or self._transition is not None or self._remote_resume is not None
         if needs_pause:
             result = self.pause("driver_shutdown")
             if result.get("error"):

@@ -134,7 +134,7 @@ SDK 数据类的“world”文字描述不能覆盖控制器中的实际变换�
 - 新增同其他驱动一致的 `joints`、`imu`、`loco_state`，以及 resource `model`；保留 `state` 诊断。
 - rosapi 参数读取在独立线程，不阻塞负责接收 service_response 的 WebSocket 线程。
 - 启动/重连重新探测；机型/自由度未知或不匹配时拒绝运动。断线清除测量与模型，活动传感卡持续发布 invalid。
-- 关节动作必须先有0.5s内实测 q；发送后必须收到新 reach-time，等待预计时长，再检测目标误差≤0.035rad，连续新测量覆盖≥0.2s。
+- 关节动作必须先验证运行时模型的关节映射/名称，并有0.5s内实测 q；在途模型失效也会终止动作。发送后必须收到新 reach-time，等待预计时长，再检测目标误差≤0.035rad，连续新测量覆盖≥0.2s。
   预计结束后5s内未收敛、实测丢失、连接/模式异常都结束为 error 并尝试软件暂停。
 - 底盘/笛卡尔目标保留 reach-time 估计；速度保留时长+控制器 watchdog 推断，均不冒充实测收敛。
 - 底盘新命令与旧命令共享 busy 通道。避免原先“先取消旧 ACP，再验证新指令”，也避免 cmd_vel 优先级窗口覆盖新位置目标。
@@ -144,6 +144,8 @@ SDK 数据类的“world”文字描述不能覆盖控制器中的实际变换�
 - `motion_enabled` 默认 true（未配置亦然），运动、恢复及切换模式仍接受原有运行时检查；显式设为 false 时可只读运行，保留暂停/停止能力。
 - 注册补齐 id/transport；rosbridge 错误日志只输出有界转义字段；移除本地未使用的 ROS2 geometry_msgs 依赖。
 - MCP 只绑定127.0.0.1，校验对端/Host，拒绝所有 Origin 和浏览器预检；动作、服务和暂停错误均在源头限长并转义日志。
+- 本地取消不撤销 ROS 服务执行。恢复请求的独立未决记录在超时/抢占后继续存在；仅同会话明确拒绝，或受理成功加有效 True 终态，才能结清。停止发送时仍有未决恢复，就不确认该次暂停；结清后需显式再次暂停，确保最终 disable 有序。断线/部分发送不能作为结清依据，也不提供重启清除不确定性的保证。
+- ROS 消息回调按话题输出首次异常、每5s采样和一次恢复日志；无直接硬件访问，移除 privileged 及未使用的可写 data 挂载，不增加依赖。
 - 官方 `humanoidController_wheel_wbc.cpp` 通过 `advertise(..., true)` 发布 latched `/enable_control_state`，只在初始化、暂停受理和恢复到 IDLE 时发布。不能按普通周期话题直接加2s消息超时。
   驱动独立线程读取 `/rosapi/publishers` 并重复同 id 订阅，核实来源及 latch 重新投递，续期3s状态通路验证；失败立即失效，过期 True/False 不走运动或暂停/恢复快捷路径。这个检查不等价于硬件心跳或物理停止确认。
   另核对 rosbridge 官方 ROS1 实现：[rosapi_node](https://github.com/RobotWebTools/rosbridge_suite/blob/ros1/rosapi/scripts/rosapi_node)、

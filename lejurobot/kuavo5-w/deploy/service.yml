@@ -4,10 +4,8 @@ lejurobot-kuavo5-w:
   network_mode: host
   ipc: host
   pid: host
-  privileged: true
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
-    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp

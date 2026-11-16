@@ -29,6 +29,7 @@ class FakeRos1:
         self.service_accepts, self.confirm = True, True
         self.latched, self.sent_services, self.publisher_checks = {}, [], []
         self.enable_publishers, self.replay_enable = ['/wheel_controller'], True
+        self.service_results = {}
         self.params = {'robot_type': 1, 'robot_version': 400062, 'armRealDof': 14,
                        'headRealDof': 2, 'legRealDof': 4, 'waistRealDof': 0,
                        'use_shm_communication': False,
@@ -72,9 +73,16 @@ class FakeRos1:
         if cancelled is not None and cancelled.is_set():
             raise InterruptedError('control request superseded by stop')
         response = self.call_service(*pending, timeout)
+        self.service_results[id(pending)] = response
         if cancelled is not None and cancelled.is_set():
             raise InterruptedError('control request superseded by stop')
         return response
+
+    def retain_service(self, pending):
+        pass
+
+    def service_result(self, pending):
+        return self.service_results.get(id(pending))
 
     def subscribe(self, topic, message_type, callback):
         self.subscriptions[topic] = (message_type, callback)
@@ -248,7 +256,7 @@ class DriverContractTests(unittest.TestCase):
             thread.join(1)
 
     def test_control_transitions_share_one_service_and_feedback_deadline(self):
-        for action in ('pause', 'resume', 'set_mode'):
+        for action in ('pause', 'set_mode', 'resume'):
             with self.subTest(action=action):
                 self.ros.confirm = False
                 self.ros.emit('/enable_control_state', action != 'resume')
@@ -301,7 +309,10 @@ class DriverContractTests(unittest.TestCase):
                         self.assertTrue(entered.wait(1))
                         before = len(self.ros.published)
                         stopped = self.call(card, stop_action)
-                        self.assertEqual(stopped['state'], 'paused')
+                        self.assertEqual(stopped['state'], 'error' if transition == 'resume' else 'paused')
+                        if transition == 'resume':
+                            self.assertFalse(stopped['physical_stop_confirmed'])
+                            self.assertTrue(stopped['remote_resume_unresolved'])
                         self.assertTrue(worker.is_alive())  # Old service is STILL blocked.
                         self.assertFalse(release.is_set())
                         self.assertEqual(self.ros.sent_services[-1][0::2], ('/enable_control', {'data': False}))
@@ -317,6 +328,98 @@ class DriverContractTests(unittest.TestCase):
                 self.assertIn('superseded', results[0]['error'])
                 self.assertTrue(self.bundle.state.motion_blocked)
                 self.assertEqual(self.call('loco', 'move', duration=.1)['state'], 'error')
+                if transition == 'resume':
+                    pending = self.bundle._remote_resume['pending']
+                    self.ros.service_results[id(pending)] = {'success': False}
+                    self.assertEqual(self.call('switch_mode', 'pause')['state'], 'paused')
+
+    def _timeout_remote_resume(self):
+        self.ros.emit('/enable_control_state', False)
+        self.bundle.state.verify_enable()
+        with patch.object(self.ros, 'wait_service', side_effect=TimeoutError('remote request unresolved')):
+            self.assertEqual(self.call('switch_mode', 'resume')['state'], 'error')
+        self.assertIsNone(self.bundle._transition)
+        self.assertTrue(self.bundle.state.snapshot()['remote_resume_unresolved'])
+        return self.bundle._remote_resume['pending']
+
+    def test_late_resume_after_disable_feedback_never_confirms_that_pause(self):
+        pending = self._timeout_remote_resume()
+        original = self.bundle.confirm_control
+        def disable_then_late_enable(token, *args, **kwargs):
+            original(token, *args, **kwargs)
+            # Older enable finishes AFTER the new disable was confirmed.
+            self.ros.service_results[id(pending)] = {'success': True}
+            self.ros.emit('/enable_control_state', True)
+        with patch.object(self.bundle, 'confirm_control', side_effect=disable_then_late_enable):
+            stopped = self.call('switch_mode', 'pause')
+        self.assertEqual(stopped['state'], 'error')
+        self.assertFalse(stopped['physical_stop_confirmed'])
+        self.assertTrue(self.bundle.state.confirmed_enable())
+        self.assertTrue(self.bundle.state.motion_blocked)
+        # Explicitly pausing again sends disable AFTER the old resume is settled.
+        self.assertEqual(self.call('switch_mode', 'pause')['state'], 'paused')
+        self.assertFalse(self.bundle.state.confirmed_enable())
+        self.assertFalse(self.bundle.state.snapshot()['remote_resume_unresolved'])
+        self.assertEqual([s[2]['data'] for s in self.ros.sent_services], [True, False, False])
+
+    def test_resume_acceptance_without_terminal_true_does_not_settle_hazard(self):
+        pending = self._timeout_remote_resume()
+        self.ros.service_results[id(pending)] = {'success': True}
+        self.assertEqual(self.call('switch_mode', 'pause')['state'], 'error')
+        self.assertFalse(self.bundle.state.confirmed_enable())
+        count = len(self.ros.sent_services)
+        for action in ('resume', 'set_mode'):
+            self.assertIn('remote resume is unresolved', self.call('switch_mode', action, mode=3)['error'])
+        self.assertEqual(len(self.ros.sent_services), count)
+        self.assertTrue(self.bundle.state.remote_resume_unresolved)
+
+    def test_explicit_resume_rejection_allows_confirmed_pause(self):
+        pending = self._timeout_remote_resume()
+        self.ros.service_results[id(pending)] = {'success': False}
+        self.assertEqual(self.call('switch_mode', 'pause')['state'], 'paused')
+        self.assertFalse(self.bundle.state.remote_resume_unresolved)
+        self.assertTrue(self.bundle.state.motion_blocked)
+
+    def test_precommand_true_cannot_settle_unresolved_resume(self):
+        pending = self._timeout_remote_resume()
+        self.ros.service_results[id(pending)] = {'success': True}
+        with self.bundle.state._lock:
+            self.bundle.state._values['control_enabled'] = True
+            self.bundle.state._seen['control_enabled'] = self.bundle._remote_resume['issued'] - .01
+        stopped = self.call('switch_mode', 'pause')
+        self.assertEqual(stopped['state'], 'error')
+        self.assertFalse(stopped['physical_stop_confirmed'])
+        self.assertTrue(self.bundle.state.remote_resume_unresolved)
+
+    def test_reconnect_cannot_clear_unresolved_remote_resume(self):
+        pending = self._timeout_remote_resume()
+        self.ros.service_results[id(pending)] = {'success': True}
+        self.ros.connection = (True, 2)
+        self.bundle.sensors.discover()
+        self.ros.raw()
+        self.ros.emit('/enable_control_state', True)
+        self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 3)
+        self.bundle.state.verify_enable()
+        self.assertEqual(self.call('switch_mode', 'pause')['state'], 'error')
+        self.assertTrue(self.bundle.state.remote_resume_unresolved)
+        self.assertIn('unresolved', self.call('switch_mode', 'resume')['error'])
+
+    def test_resume_send_failure_cannot_be_mistaken_for_remote_cancellation(self):
+        self.ros.emit('/enable_control_state', False)
+        self.bundle.state.verify_enable()
+        with patch.object(self.ros, 'start_service', side_effect=ConnectionError('partial send')):
+            self.assertEqual(self.call('switch_mode', 'resume')['state'], 'error')
+        stopped = self.call('switch_mode', 'pause')
+        self.assertEqual(stopped['state'], 'error')
+        self.assertFalse(stopped['physical_stop_confirmed'])
+        self.assertTrue(stopped['remote_resume_unresolved'])
+
+    def test_normal_resume_settles_remote_hazard_before_unblocking(self):
+        self.ros.emit('/enable_control_state', False)
+        self.bundle.state.verify_enable()
+        self.assertEqual(self.call('switch_mode', 'resume')['state'], 'ready')
+        self.assertFalse(self.bundle.state.remote_resume_unresolved)
+        self.assertFalse(self.bundle.state.motion_blocked)
 
     def test_stop_before_resume_send_prevents_the_old_command_from_being_sent(self):
         self.ros.emit('/enable_control_state', False)
@@ -584,6 +687,42 @@ class DriverContractTests(unittest.TestCase):
         result = self.call('arm', 'move_joints', positions=[0.] * 14)
         self.assertIn('stale', result['error'])
         self.assertEqual(self.ros.published, [])
+
+    def test_joint_commands_require_matching_runtime_model(self):
+        model = self.ros.params['humanoid_description']
+        for description in (None, model.replace(JOINT_NAMES[0], 'unexpected_joint')):
+            for card, count in (('arm', 14), ('leg', 4)):
+                with self.subTest(model='missing' if description is None else 'mismatched', card=card):
+                    self.ros.params['humanoid_description'] = description
+                    self.bundle.sensors.discover()
+                    self.ros.raw()
+                    self.assertFalse(self.bundle.sensors.snapshot('joints')['valid'])
+                    result = self.call(card, 'move_joints', positions=[0.] * count)
+                    self.assertIn('runtime joint model is not validated', result['error'])
+                    self.assertEqual(self.ros.published, [])
+                    self.assertEqual(self.callbacks, [])
+
+    def test_runtime_model_loss_aborts_joint_action_without_completing(self):
+        for mismatch in (False, True):
+            with self.subTest(mismatch=mismatch):
+                model = self.ros.params['humanoid_description']
+                action = self.call('arm', 'move_joints', positions=[0.] * 14)
+                self.assertEqual(action['state'], 'executing')
+                self.ros.emit('/lb_arm_joint_reach_time', 0.)
+                self.ros.params['humanoid_description'] = (
+                    model.replace(JOINT_NAMES[0], 'unexpected_joint') if mismatch else None)
+                self.bundle.sensors.discover()
+                self.ros.raw()
+                self.assertTrue(wait_until(lambda: any(c[0] == action['action_id'] for c in self.callbacks)))
+                outcome = [c for c in self.callbacks if c[0] == action['action_id']]
+                self.assertEqual(len(outcome), 1)
+                self.assertEqual(outcome[0][2], 'error')
+                self.assertIn('runtime joint model', outcome[0][3]['reason'])
+                self.assertTrue(self.bundle.state.motion_blocked)
+                self.ros.params['humanoid_description'] = model
+                self.bundle.sensors.discover()
+                self.ros.raw()
+                self.assertEqual(self.call('switch_mode', 'resume')['state'], 'ready')
 
     def test_reach_time_alone_cannot_complete_unconverged_joints(self):
         result = self.call('leg', 'move_joints', positions=[20.] * 4)

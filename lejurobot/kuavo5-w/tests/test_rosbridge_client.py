@@ -189,6 +189,88 @@ class RosbridgeClientTests(unittest.TestCase):
         self.assertEqual(self.sock.sent[0]['id'], self.sock.sent[1]['id'])
         self.assertEqual(len(self.client._subscriptions), 1)
 
+    def test_retained_resume_response_remains_observable_after_timeout(self):
+        pending = self.client.start_service('/enable_control', 'std_srvs/SetBool', {'data': True})
+        self.client.retain_service(pending)
+        with self.assertRaises(TimeoutError):
+            self.client.wait_service(pending, 0.)
+        self.assertIsNone(self.client.service_result(pending))
+        self.assertEqual(len(self.client._services), 1)
+        self.packet({'op': 'service_response', 'id': pending[0], 'result': True,
+                     'values': {'success': True}})
+        self.assertEqual(self.client.service_result(pending), {'success': True})
+        self.assertFalse(self.client._services)
+        self.assertFalse(self.client._retained_services)
+        self.assertEqual(len(self.sock.sent), 1)  # Retention never resends enable.
+
+    def test_retained_cancelled_resume_can_later_be_explicitly_rejected(self):
+        pending = self.client.start_service('/enable_control', 'std_srvs/SetBool', {'data': True})
+        self.client.retain_service(pending)
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaises(InterruptedError):
+            self.client.wait_service(pending, .1, cancelled)
+        self.assertIsNone(self.client.service_result(pending))
+        self.packet({'op': 'service_response', 'id': pending[0], 'result': True,
+                     'values': {'success': False}})
+        self.assertEqual(self.client.service_result(pending), {'success': False})
+        self.assertFalse(self.client._retained_services)
+
+    def test_retained_transport_failure_is_not_controller_rejection(self):
+        pending = self.client.start_service('/enable_control', 'std_srvs/SetBool', {'data': True})
+        self.client.retain_service(pending)
+        self.client._on_close(self.sock, None, None)
+        self.assertIsNone(self.client.service_result(pending))
+        self.assertFalse(self.client._services)
+        self.assertFalse(self.client._retained_services)
+
+    def test_response_before_retention_does_not_leave_orphan_id(self):
+        pending = self.client.start_service('/enable_control', 'std_srvs/SetBool', {'data': True})
+        self.packet({'op': 'service_response', 'id': pending[0], 'result': True,
+                     'values': {'success': False}})
+        self.client.retain_service(pending)
+        self.assertFalse(self.client._retained_services)
+        self.assertEqual(self.client.service_result(pending), {'success': False})
+
+    def test_callback_failures_are_sampled_and_recovery_is_logged_once(self):
+        failures = [True]
+        def callback(_msg):
+            if failures[0]:
+                raise ValueError('malformed\nframe')
+        self.client.subscribe('/audit', 'std_msgs/String', callback)
+        clock = [0.]
+        with patch.object(module, 'time', types.SimpleNamespace(monotonic=lambda: clock[0])), patch('builtins.print') as log:
+            for _ in range(100):
+                self.packet({'op': 'publish', 'topic': '/audit', 'msg': {}})
+            self.assertEqual(log.call_count, 1)
+            clock[0] = 5.
+            self.packet({'op': 'publish', 'topic': '/audit', 'msg': {}})
+            self.assertEqual(log.call_count, 2)
+            self.assertIn('count=101', log.call_args[0][0])
+            self.assertIn('malformed\\nframe', log.call_args[0][0])
+            failures[0] = False
+            for _ in range(2):
+                self.packet({'op': 'publish', 'topic': '/audit', 'msg': {}})
+            self.assertEqual(log.call_count, 3)
+            self.assertIn('recovered topic=/audit after 101 failures', log.call_args[0][0])
+            failures[0] = True
+            self.packet({'op': 'publish', 'topic': '/audit', 'msg': {}})
+            self.assertEqual(log.call_count, 4)
+            self.assertIn('count=1:', log.call_args[0][0])
+
+    def test_callback_failure_sampling_is_per_topic_and_cleared_on_unsubscribe(self):
+        def bad(_msg):
+            raise TypeError('bad frame')
+        for topic in ('/one', '/two'):
+            self.client.subscribe(topic, 'std_msgs/String', bad)
+        with patch('builtins.print') as log:
+            for topic in ('/one', '/two', '/one', '/two'):
+                self.packet({'op': 'publish', 'topic': topic, 'msg': {}})
+        self.assertEqual(log.call_count, 2)
+        self.client.unsubscribe('/one')
+        self.assertNotIn('/one', self.client._callback_failures)
+        self.assertIn('/two', self.client._callback_failures)
+
     def test_remote_protocol_logs_escape_and_bound_selected_fields(self):
         payload = '\x00\x1b[31m\n' + 'x' * 100_000
         with patch('builtins.print') as log:

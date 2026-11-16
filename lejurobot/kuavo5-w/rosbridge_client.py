@@ -28,6 +28,8 @@ class RosbridgeClient:
         self._subscriptions = {}
         self._publishers = {}
         self._services = {}
+        self._retained_services = set()
+        self._callback_failures = {}
         self._thread = threading.Thread(target=self._run, daemon=True, name="rosbridge")
 
     @property
@@ -63,6 +65,7 @@ class RosbridgeClient:
             result.update({"result": False, "values": message})
             event.set()
         self._services.clear()
+        self._retained_services.clear()
 
     def close(self) -> None:
         self._closed.set()
@@ -87,6 +90,7 @@ class RosbridgeClient:
     def unsubscribe(self, topic: str) -> None:
         with self._lock:
             self._subscriptions.pop(topic, None)
+            self._callback_failures.pop(topic, None)
             if self._connected.is_set():
                 self._send({"op": "unsubscribe", "id": f"sub:{topic}", "topic": topic})
 
@@ -153,7 +157,27 @@ class RosbridgeClient:
             return values
         finally:
             with self._lock:
-                self._services.pop(request_id, None)
+                if request_id not in self._retained_services:
+                    self._services.pop(request_id, None)
+
+    def retain_service(self, pending):
+        """Keep one hazardous control response observable after local cancellation.
+
+        The bundle admits at most one unresolved resume. No command is retried;
+        the entry is removed on response/disconnect, while its handle survives.
+        """
+        with self._lock:
+            if pending[0] in self._services:
+                self._retained_services.add(pending[0])
+
+    def service_result(self, pending):
+        """Return a controller response only; transport loss is not rejection."""
+        with self._lock:
+            _, event, result, _ = pending
+            values = result.get('values')
+            if event.is_set() and result.get('result') is True and isinstance(values, dict):
+                return dict(values)
+            return None
 
     def _send(self, value: dict) -> None:
         if self._ws is None:
@@ -170,6 +194,7 @@ class RosbridgeClient:
                 ws.close()
                 return
             self._generation += 1
+            self._callback_failures.clear()
             # Establish ROS 1 publishers before accepting one-shot commands. ROS 1
             # TCPROS negotiation is asynchronous; this 1s grace matches vendor examples.
             # It is not a delivery acknowledgement and must be validated on the robot.
@@ -206,6 +231,7 @@ class RosbridgeClient:
             op = packet.get("op")
             if op == "service_response":
                 pending = self._services.pop(packet.get("id"), None)
+                self._retained_services.discard(packet.get('id'))
                 if pending:
                     pending[1].update(packet)
                     pending[0].set()
@@ -220,10 +246,24 @@ class RosbridgeClient:
                 return
             entry = self._subscriptions.get(packet.get("topic")) if op == "publish" else None
         if entry and isinstance(packet.get("msg"), dict):
+            topic = packet['topic']
             try:
                 entry[1](packet["msg"])
             except Exception as exc:
-                print(f"[rosbridge] callback failed: {type(exc).__name__}: {_log_text(str(exc))}", flush=True)
+                with self._lock:
+                    failure = self._callback_failures.setdefault(topic, {'count': 0, 'logged_at': None})
+                    failure['count'] += 1
+                    now = time.monotonic()
+                    if failure['logged_at'] is None or now - failure['logged_at'] >= 5.0:
+                        failure['logged_at'] = now
+                        print(f"[rosbridge] callback failed topic={_log_text(topic)} count={failure['count']}: "
+                              f"{type(exc).__name__}: {_log_text(str(exc))}", flush=True)
+            else:
+                with self._lock:
+                    failure = self._callback_failures.pop(topic, None)
+                    if failure:
+                        print(f"[rosbridge] callback recovered topic={_log_text(topic)} "
+                              f"after {failure['count']} failures", flush=True)
 
     def _run(self) -> None:
         while not self._closed.is_set():

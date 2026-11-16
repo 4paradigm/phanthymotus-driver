@@ -283,6 +283,8 @@ class KuavoSensors:
     def joint_positions(self):
         self.require_profile()
         with self._lock:
+            if not self._names or self._model_error is not None:
+                raise RuntimeError('runtime joint model is not validated')
             seen = self._seen.get('joints', 0)
             if time.monotonic() - seen > 0.5 or 'joints' not in self._data:
                 raise RuntimeError('measured joint feedback is missing or stale')

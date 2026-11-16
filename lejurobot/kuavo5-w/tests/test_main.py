@@ -180,6 +180,9 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(meta["port"], config["mcp_port"])
         self.assertEqual(meta["mcp_url"], f"http://localhost:{config['mcp_port']}/mcp")
         self.assertEqual(compose["network_mode"], "host")
+        self.assertFalse(compose.get('privileged', False))
+        self.assertEqual(compose['volumes'], [
+            '/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro'])
         self.assertIn("ROS_DOMAIN_ID=42", compose["environment"])
         # build.sh flattens driver contents and copies extras under basename.
         for line in (ROOT / "Dockerfile").read_text().splitlines():
