@@ -89,7 +89,7 @@ remove **only** that drop-in, run `systemctl daemon-reload`, then restart
 `orbbec_head.service`. Do not remove unrelated drop-ins.
 
 Check independent gyro/accel freshness, monotonic capture stamps, RGB-D output,
-and `camera_rgbd.info.imu_status` after switching. Then connect the IMU port
+and `imu.info.imu_status` after switching. Then connect the IMU port
 alongside the RGB-D pair and enable `rgbd_odometry.imu_assisted`. Camera IMU
 extrinsics come from the camera's internal TF; absent body/head TF remains a
 separate limitation and must not be filled with an identity transform.

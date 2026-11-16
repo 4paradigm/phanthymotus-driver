@@ -116,6 +116,12 @@ class _MountNode:
         return self.output.destroy_publisher(publisher)
 
 
+def _fresh_images(*images):
+    now = time.time_ns()
+    return all(0 < _stamp(image) and -50_000_000 <= now - _stamp(image) <= 500_000_000
+               for image in images)
+
+
 class RgbdCameraPlugin:
     def __init__(self, config, namespace, ros2, *, managed=False):
         import rclpy
@@ -277,6 +283,9 @@ class RgbdCameraPlugin:
             with self.lock, self.imu_lock:
                 if kind in self.clients and self.running:
                     return
+            if not self.running:
+                self.stop()
+            with self.lock, self.imu_lock:
                 self.clients[kind] = self.sub_node.get_clock().now().nanoseconds
                 self.client_epochs[kind] = uuid.uuid4().hex
                 if kind == 'imu':
@@ -613,6 +622,8 @@ class RgbdCameraPlugin:
                 return
             stream = self.image_streams[kind]
             stream.update(received=stream['received']+1, last_capture_ns=_stamp(msg), last_arrival_ns=time.time_ns())
+            if not _fresh_images(msg):
+                return
             if not self.registered or set(self.infos) != {'color', 'depth'}:
                 return
             try:
@@ -658,6 +669,8 @@ class RgbdCameraPlugin:
             except queue.Empty:
                 continue
             try:
+                if not _fresh_images(color, depth):
+                    continue
                 if color.encoding not in ('rgb8', 'bgr8') or depth.encoding != '16UC1' or depth.is_bigendian:
                     raise ValueError('unsupported source RGB-D encoding')
                 rgb = np.frombuffer(color.data, np.uint8).reshape(color.height, color.step)[:, :color.width*3].reshape(color.height, color.width, 3)
@@ -679,6 +692,8 @@ class RgbdCameraPlugin:
                 self.body_mount.wait_for_capture(max(_stamp(color), _stamp(depth)))
                 with self.lock:
                     if not self.running or self.stop_event.is_set():
+                        continue
+                    if not _fresh_images(color, depth):
                         continue
                     publish_color = self._publishes('color', _stamp(color), epochs)
                     publish_depth = self._publishes('depth', _stamp(depth), epochs)
@@ -779,6 +794,7 @@ class RgbdInputCard:
     def start(self):
         with self.lock:
             if self.running:
+                self.source.acquire(self.kind)
                 return
             if self.display is not None:
                 self.display.start()

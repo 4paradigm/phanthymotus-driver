@@ -117,6 +117,7 @@ def test_frame_sampling_uses_capture_intervals_despite_callback_jitter(monkeypat
     source.frame_interval_ns = 100_000_000
     source.stop_event = threading.Event(); source.error = None
     monkeypatch.setattr(m.time, 'monotonic', lambda: 1000.)
+    monkeypatch.setattr(m.time, 'time_ns', lambda: 1_200_000_000)
     sampled = []
     for stamp in [1_000_000_000, 1_050_000_000, 1_100_000_000, 1_200_000_000]:
         msg = NS(width=640, height=480, header=NS(frame_id='optical',
@@ -124,6 +125,33 @@ def test_frame_sampling_uses_capture_intervals_despite_callback_jitter(monkeypat
         source._image('color', msg); source._image('depth', msg)
         if not source.pending.empty(): sampled.append(m._stamp(source.pending.get_nowait()[1]))
     assert sampled == [1_000_000_000, 1_100_000_000, 1_200_000_000]
+
+
+@pytest.mark.parametrize('age,accepted', [
+    (-50_000_001, False), (-50_000_000, True), (500_000_000, True),
+    (500_000_001, False), (2_000_000_000, False),
+])
+@pytest.mark.parametrize('kind', ['color', 'depth'])
+def test_image_ingress_rejects_invalid_capture_age_before_pairing(monkeypatch, age, accepted, kind):
+    import queue, threading
+    from collections import deque
+    source = m.RgbdCameraPlugin.__new__(m.RgbdCameraPlugin)
+    source.lock = threading.RLock(); source.running = source.registered = True
+    source.managed = False; source.infos = {'color': info(), 'depth': info()}
+    source.geometry = None; source.signature = None
+    source.frames = {'color': deque(maxlen=3), 'depth': deque(maxlen=3)}
+    source.pending = queue.Queue(maxsize=1); source.last_emit = 0
+    source.image_streams = {stream: dict(received=0, last_capture_ns=None, last_arrival_ns=None)
+                            for stream in ('color', 'depth')}
+    source.frame_interval_ns = 100_000_000
+    now = 2_000_000_000
+    monkeypatch.setattr(m.time, 'time_ns', lambda: now)
+    stamp = now-age
+    msg = NS(width=640, height=480, header=NS(frame_id='optical',
+             stamp=NS(sec=stamp//10**9, nanosec=stamp%10**9)))
+    source._image(kind, msg)
+    assert bool(source.frames[kind]) is accepted
+    assert source.image_streams[kind]['received'] == 1
 
 
 @pytest.mark.parametrize('focal,distortion,offset', [

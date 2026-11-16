@@ -22,6 +22,7 @@ STAMP = 12_345_678_901
 @pytest.fixture
 def source(monkeypatch):
     from test_tianyi_rgbd_imu import CameraContext, CallbackExecutor
+    monkeypatch.setattr(m.time, "time_ns", lambda: STAMP + 100_000_000)
     events = []
     class Node:
         def __init__(self, *args, context=None):
@@ -315,3 +316,87 @@ def test_tf_arriving_after_50ms_retains_exact_capture_stamp(source, monkeypatch)
     packets = [json.loads(msg.data) for topic, msg in source.events if topic.endswith('/body_mount')]
     assert packets[-1]['status'] == 'available'
     assert packets[-1]['stamp_ns'] == STAMP
+
+
+@pytest.mark.parametrize('age', [500_000_001, -50_000_001])
+def test_worker_discards_capture_that_expires_during_tf_wait(source, monkeypatch, age):
+    # Finish one queue item, then stop the worker without publishing an image.
+    original_get = source.pending.get
+    def get(*args, **kwargs):
+        if source.pending.empty():
+            source.stop_event.set()
+            raise queue.Empty
+        return original_get(*args, **kwargs)
+    monkeypatch.setattr(source.pending, 'get', get)
+    monkeypatch.setattr(source.body_mount, 'wait_for_capture',
+                        lambda stamp: monkeypatch.setattr(m.time, 'time_ns', lambda: STAMP + age))
+    emit(source)
+    assert source.events == []
+    assert source.error is None and source.running
+
+
+def test_active_sibling_cards_can_restart_failed_source(source):
+    source.managed = True
+    source.sub_node.get_clock = lambda: NS(now=lambda: NS(nanoseconds=STAMP))
+    cards = [m.RgbdInputCard(source, kind) for kind in ('color', 'depth', 'imu')]
+    for card in cards:
+        card.start()
+    source.running = False
+    source.stop_event.set()
+    source.error = 'encoding failed'
+    cards[1].start()
+    assert source.running and source.error is None
+    assert set(source.clients) == {'color', 'depth', 'imu'}
+    for card in cards:
+        card.stop()
+
+
+@pytest.mark.parametrize('age', [500_000_001, -50_000_001])
+def test_worker_discards_pair_that_expires_in_pending_queue(source, monkeypatch, age):
+    original_get = source.pending.get
+    def get(*args, **kwargs):
+        if source.pending.empty():
+            source.stop_event.set()
+            raise queue.Empty
+        item = original_get(*args, **kwargs)
+        monkeypatch.setattr(m.time, 'time_ns', lambda: STAMP + age)
+        # Expired work must be dropped before encoding can fault the source.
+        item[0].encoding = 'unsupported'
+        return item
+    monkeypatch.setattr(source.pending, 'get', get)
+    emit(source)
+    assert source.events == []
+    assert source.error is None and source.running
+
+
+def test_card_restart_after_encoding_fault_restores_sibling_outputs(source, monkeypatch):
+    import cv2
+    source.managed = True
+    source.sub_node.get_clock = lambda: NS(now=lambda: NS(nanoseconds=STAMP-1))
+    cards = [m.RgbdInputCard(source, kind) for kind in ('color', 'depth', 'imu')]
+    for card in cards:
+        card.start()
+    geometry = source.geometry
+    listener = source.body_mount.listener
+    with monkeypatch.context() as patch:
+        patch.setattr(cv2, 'imencode', lambda *args: (False, None))
+        emit(source)
+    assert not source.running and source.error == 'RGB-D color encoding failed'
+    source.pending.put(('previous start', 'previous start'))
+    source.frames['color'].append('previous start')
+    # Keep the restarted worker deterministic while exercising its lifecycle.
+    worker = source._work
+    source._work = lambda: None
+    cards[1].start()
+    source.worker.join()
+    source._work = worker
+    assert listener.closed and source.body_mount.listener is not listener
+    assert source.pending.empty() and not any(source.frames.values())
+    assert source.geometry is None and not source.registered and source.count == 0
+    source.geometry, source.registered = geometry, True
+    emit(source, STAMP+1)
+    assert [topic for topic, _ in source.events] == [source.root+'/body_mount', source.color_topic, source.depth_topic]
+    assert source.running and source.error is None and source.count == 1
+    assert set(source.clients) == {'color', 'depth', 'imu'}
+    for card in cards:
+        card.stop()

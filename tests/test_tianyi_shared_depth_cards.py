@@ -145,8 +145,9 @@ def test_original_imu_display_restart_joins_snapshot_and_reuses_subscriptions(mo
         display.stop()
 
 
-def test_shared_depth_retains_original_configured_rate(source):
+def test_shared_depth_retains_original_configured_rate(source, monkeypatch):
     from test_tianyi_rgbd_camera import info
+    monkeypatch.setattr(m.time, 'time_ns', lambda: 1_250_000_000)
     ros = NS(ctx_tianyi=source._body_context, ctx_core=None, executor_tianyi=NS(add_node=lambda n: None),
              executor_core=NS(add_node=lambda n: None))
     shared = m.RgbdCameraPlugin({'imu_enabled': False, 'hz': 8}, 'rate', ros)
