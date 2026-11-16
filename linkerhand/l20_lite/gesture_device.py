@@ -421,6 +421,9 @@ class GesturePlugin:
             raise RuntimeError(f"{side} hand is not connected")
         active = {"action": action, "action_id": f"hand_gesture_{action}_{uuid4().hex}",
                   "instance_id": instance_id, "side": side, "port": port, "options": options}
+        return self.hand.start_card_motion(self._start_motion, active)
+
+    def _start_motion(self, active):
         with self._lock:
             if self._delivery_failed:
                 raise RuntimeError("ACP completion delivery failed; inspect Core and restart driver")

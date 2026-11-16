@@ -513,7 +513,13 @@ def build_plugins(config: dict, _namespace: str, _ros2) -> list:
     gesture_config = config.get("plugins", {}).get("hand_gesture", {})
     if gesture_config.get("enabled", False):
         from gesture_device import GesturePlugin
-        plugins.append(GesturePlugin(hand, gesture_config))
+        hand._gesture = GesturePlugin(hand, gesture_config)
+        plugins.append(hand._gesture)
+    teach_config = config.get("plugins", {}).get("hand_teach", {})
+    if teach_config.get("enabled", False):
+        from teach_device import TeachPlugin
+
+        plugins.append(TeachPlugin(hand, teach_config))
     return plugins
 
 
@@ -529,12 +535,34 @@ class MultiHandPlugin:
         # Serial discovery and motion never overlap. Two cards may be queued,
         # but no second controller may open/probe a moving RS-485 port.
         self._bus_lock = threading.RLock()
+        self._motion_admission = threading.Lock()
+        self._live_teach = False
+        self._gesture = None
         self._bindings: dict[str, str] = {}
         self._controllers: dict[str, HandPlugin] = {}
         self._stopped_instances: set[str] = set()
         self._legacy_owner: str | None = None
         self._legacy = HandPlugin(L20LiteConnection(config), hand_config,
                                   motion_lock=self._bus_lock)
+
+    def reserve_live_teach(self):
+        with self._motion_admission:
+            with self._lock:
+                hand_active = any(controller._active is not None
+                                  for controller in [self._legacy, *self._controllers.values()])
+            if self._live_teach or hand_active or (self._gesture is not None and self._gesture._active is not None):
+                raise RuntimeError("L20 Lite 正在执行其他动作，无法启动实时遥操")
+            self._live_teach = True
+
+    def release_live_teach(self):
+        with self._motion_admission:
+            self._live_teach = False
+
+    def start_card_motion(self, start, *args):
+        with self._motion_admission:
+            if self._live_teach:
+                raise RuntimeError("L20 Lite 正在实时遥操，请先停止录制")
+            return start(*args)
 
     def get_tool(self) -> dict:
         definition = self._legacy.get_tool()
@@ -703,6 +731,8 @@ class MultiHandPlugin:
                         result = self._legacy.dispatch(action, args)
                         self._legacy_owner = None
                         return result
+            if action in MOTION_ACTIONS:
+                return self.start_card_motion(self._legacy.dispatch, action, args)
             return self._legacy.dispatch(action, args)
 
         if action not in ("info", "get_state", "start", "stop", *MOTION_ACTIONS):
@@ -740,4 +770,6 @@ class MultiHandPlugin:
             result.update(bound_side=side, detected_sides=list(found),
                           detected_count=len(found), state="connected")
             return result
+        if action in MOTION_ACTIONS:
+            return self.start_card_motion(controller.dispatch, action, args)
         return controller.dispatch(action, args)
