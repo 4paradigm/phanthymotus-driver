@@ -105,7 +105,7 @@ class MockBridge:
                             "host": visitor["host"],
                             "time": visitor["time"],
                             "reason": visitor["reason"],
-                            "status": "已打印" if visitor["id"] in bridge.printed else "待打印",
+                            "status": "已入场" if visitor["id"] in bridge.printed else "未入场",
                         })
                 self.reply(200, {"count": len(visits), "visits": visits})
 

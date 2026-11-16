@@ -16,6 +16,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any
 
 from common.vendor_runtime import action_schema, tool
@@ -116,6 +117,7 @@ class HPPrinterPlugin:
             "timeout_s": float(plugin_config.get("timeout_s", 8)),
             "print_timeout_s": float(plugin_config.get("print_timeout_s", 60)),
         }
+        self._direct_request_ids: dict[tuple[str, str, str, str], str] = {}
 
     # ── 卡片定义 ──────────────────────────────────────────────────────────
     def get_tool(self) -> dict:
@@ -125,6 +127,7 @@ class HPPrinterPlugin:
             "info": ([], "查看卡片配置是否完整"),
             "config": (["bridge_url", "token", "timeout_s", "print_timeout_s"], "保存桥接服务配置（平台在 start 前自动调用）"),
             "find": (["name", "host"], "按访客姓名查询今天的预约；同名时可用被访人 host 缩小范围，返回短期 ticket"),
+            "find_and_print": (["name", "host"], "按访客姓名和被访人查询唯一的未入场预约并直接打印；多条或状态不符时拒绝打印"),
             "print": (["ticket", "request_id"], "使用 find 返回的短期 ticket 打印访客贴；request_id 用于防止重复打印"),
         }
         properties = {
@@ -189,7 +192,7 @@ class HPPrinterPlugin:
             return {"state": "ready", "configured": self._configured(), "bridge_url": self._cfg["bridge_url"]}
         if action == "config":
             return self._config(args)
-        handlers = {"find": self._find, "print": self._print}
+        handlers = {"find": self._find, "find_and_print": self._find_and_print, "print": self._print}
         handler = handlers.get(action)
         if handler is None:
             return {"status": "error", "code": "bad_action", "error": f"不支持的动作：{action}"}
@@ -276,5 +279,40 @@ class HPPrinterPlugin:
             "error": str(payload.get("error") or "打印失败，请前台同事检查打印机"),
             "request_id": request_id,
         }
+
+    def _find_and_print(self, args: dict) -> dict:
+        found = self._find(args)
+        status = found.get("status")
+        if status == "not_found" or status == "error":
+            return found
+        if status != "found" or len(found.get("visits") or []) != 1:
+            return {
+                "status": "error",
+                "code": "visitor_ambiguous",
+                "error": "查到多条匹配预约，不能直接打印；请先用 find 核对手机号尾号和到访时间",
+            }
+
+        visit = found["visits"][0]
+        if visit.get("status") not in ("未入场", "待打印"):
+            return {
+                "status": "failed",
+                "code": "status_not_printable",
+                "error": f"访客当前状态为“{visit.get('status') or '未知'}”，不能打印访客贴",
+            }
+
+        key = (
+            str(found.get("name", "")),
+            str(visit.get("host", "")),
+            str(visit.get("tail", "")),
+            str(visit.get("time", "")),
+        )
+        with self._lock:
+            request_id = self._direct_request_ids.get(key)
+            if not request_id:
+                request_id = f"direct-{uuid.uuid4().hex}"
+                if len(self._direct_request_ids) >= 64:
+                    self._direct_request_ids.pop(next(iter(self._direct_request_ids)))
+                self._direct_request_ids[key] = request_id
+        return self._print({"ticket": visit["ticket"], "request_id": request_id})
 
 
