@@ -623,9 +623,9 @@ class L20CanClient:
                 if context is not None:
                     context['send_elapsed_s'] = time.monotonic() - send_started
 
-    def get_positions_vector(self) -> list[int]:
+    def get_positions_vector(self, timeout_s: float | None = None) -> list[int]:
         """Read fresh feedback for every finger; never return old cached positions."""
-        return self._query_positions(self._recv_timeout_s)
+        return self._query_positions(self._recv_timeout_s if timeout_s is None else timeout_s)
 
     def _query_positions(self, timeout_s: float) -> list[int]:
         started = time.monotonic()

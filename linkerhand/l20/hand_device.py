@@ -832,4 +832,9 @@ def build_plugins(config: dict, _namespace: str, _ros2) -> list:
         from tactile_device import TactilePlugin
         plugins.append(TactilePlugin(hand_plugin, tactile_config, global_config=config, ros2=_ros2, namespace=_namespace))
 
+    joints_config = config.get("plugins", {}).get("joints")
+    if joints_config and joints_config.get("enabled", True):
+        from joints_device import JointsPlugin
+        plugins.append(JointsPlugin(hand_plugin, joints_config, global_config=config, ros2=_ros2, namespace=_namespace))
+
     return plugins

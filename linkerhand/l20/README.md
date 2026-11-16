@@ -1,4 +1,4 @@
-# LinkerHand L20 USB-CAN 驱动与四张卡片
+# LinkerHand L20 USB-CAN 驱动与五张卡片
 
 本目录适配第四范式 Agent Core / PhanthyMotus，当前开发和实测设备为 **L20-10**：16 个主动关节、USB-CAN、五指指尖触觉反馈。L20 Lite（又称 L10）的 RS-485/Modbus 驱动位于相邻的 `l20_lite` 目录。
 
@@ -8,6 +8,9 @@
 | `hand_gesture` | `actuator` | 预置手势、0–9 数字及已调试的拇指避碰路径 |
 | `hand_grasp` | `actuator` | 自适应接触停止抓取、释放和状态读取 |
 | `hand_tactile` | `sensor` | 按卡片选择采集左右手触觉，发布供 Core 渲染的实时触觉数据 |
+| `joints` | `sensor` | 按卡片选择左手、右手或双手（各自 CAN 接口），持续读取 16 主动关节实测位置，同时输出 JSON 与实时骨架 |
+
+另有 `model`（`resource`）向 Core 提供左右手骨架 URDF，不是画布卡片。
 
 `hand_grasp` 使用指尖触觉阵列峰值停止进给，不进行恒压调节，也不判断物体是否抓稳。当前触觉读数没有力值标定关系，原始值不能直接换算为牛顿。
 
@@ -131,6 +134,54 @@ Core 的触觉渲染器用五指 12×6 阵列和指尖压力绘制热力图，�
 
 Core 可先发送共享 `poll_hz`，再发送实例 `bound_side/can_channel`。单独设置频率不要求左右手，也不覆盖实例选择；显式传入的 `bound_side` 必须是 `left/right`。启动采集后，通过 WebSocket 持续接收触觉 JSON；`sequence` 和 `timestamp` 用于判断是否在更新。停止采集后，网页可能保留最后一帧，它不代表仍在更新。
 
+### 2.5 `joints`：关节状态与实时骨架
+
+类型为 `sensor`，只发送位置查询帧 `0x41..0x45`，不发送运动、扭矩、清错或校准指令，不要求运动确认。
+
+使用方法与 `hand_tactile` 相同：在齿轮中选择 `BOUND_SIDE` 和“高级：CAN 接口”（与控制卡片使用的接口一致，例如 `can1`），保存后开启智能控制。`BOUND_SIDE` 可选：
+
+- `left` / `right`：单手模式，本卡片只读一只手，骨架窗口只有这只手在动；
+- `both`：双手模式，一张卡片同时读两只手，两只手画在同一个骨架窗口。左右手的 CAN 接口分别由“双手模式：左手 CAN 接口”“双手模式：右手 CAN 接口”设置，留空则沿用“高级：CAN 接口”。
+
+同一只手（同侧、同接口）的多张卡片共用一个采集线程，双手卡片与单手卡片也共用。驱动启动时不自动采集，只有卡片 `start` 后才开始。
+
+每轮采集执行一次新的位置查询，同一结果同时生成 JSON 与骨架输出，`sequence` 相同：
+
+| 模式 | 输出 | 话题（默认 CAN 接口） | 格式 | 发布条件 |
+| --- | --- | --- | --- | --- |
+| 单手 | 关节 JSON | `/{namespace}/hand/{side}/joints` | `data/json` | 每轮发布，失败时 `valid=false` |
+| 单手 | 骨架 | `/{namespace}/hand/{side}/joints_skeleton` | `sensor/skeleton` | 只在本轮有效时发布 |
+| 双手 | 左手 JSON、右手 JSON | 同单手 JSON，各一路 | `data/json` | 同上，两只手各自判断 |
+| 双手 | 骨架（两只手共用） | `/{namespace}/hand/both/joints_skeleton` | `sensor/skeleton` | 某只手本轮有效时发布该手的一帧 |
+
+非默认 CAN 接口时沿用触觉卡片的规则：JSON 与单手骨架在路径中加入 `/can_<接口名十六进制>`，双手骨架加入 `/left_can_<十六进制>`、`/right_can_<十六进制>`（只加非默认接口的那只手），以 `info.topic_out` 为准。双手骨架的每帧只含一只手（`left_*` 或 `right_*`）的关节，Core 只更新帧中出现的关节，因此两只手在同一窗口中各自更新；某只手失效时，该手停在最后一帧，另一只手照常更新。Core 不允许两张卡片发布同一 topic，所以双手骨架只能由双手卡片输出，不能用两张单手卡片拼成一个窗口。JSON 排在骨架之前，“查看数据流”默认打开第一路 JSON。
+
+双手模式的 `info` 在顶层给出 `bound_side=both`、`left_can_channel`、`right_can_channel`、`topic_out`、`sample_state`（取两只手中较差的状态）、`sample_valid`（两只手都有效才为 `true`），每只手的详细信息在 `hands.left` / `hands.right`；`get_state` 同样按手放在 `hands` 中。
+
+JSON 主要字段：`valid`、`state`、`reason`、`error_details`、`side`、`can_channel`、`can_id`、`sequence`、`timestamp`（收到本轮完整回复的时间，失败时为 `null`）、`published_at`、`source=can_position_query`、`query_elapsed_s`、`measured_hz`（最近成功轮次的实测频率）、`joint_count=16`、`raw_unit`、`angle_unit=rad`、`angle_source`、`reserved_vector_indexes=[11,12,13,14]` 和 `joints`。`joints` 每项包含 `name`、`label`、`vector_index`、`model_joint`、`raw`（0..255 实测原始值）、`angle_rad`、`angle_deg`。四个保留槽位不作为关节输出。
+
+**角度来源**：`angle_source=vendor_g20_calibration_table_adjusted`。角度按厂家官网提供的 G20 标定文件（`resource/g20_{left,right}_G20.json`）逐关节查表：每个 URDF 关节有对应电机（`motor_index`，即驱动 20 项向量下标）和 256 项 raw→弧度表，`model_joint` 也按这份对应关系给出。注意驱动命名的 `thumb_yaw`（下标 5）驱动 URDF 的 `thumb_cmc_roll`，`thumb_roll`（下标 10）驱动 `thumb_cmc_yaw`。标定来自厂家参考机（序列号 `G20_*_001`），不是当前这只手。厂家 SDK（[linkerbot-hand-legacy-cpp-sdk](https://github.com/linker-bot/linkerbot-hand-legacy-cpp-sdk) 的 README）明确写着 `L20_10`、`L20_11` 别名 `G20`，而普通 `L20` 是另一款手，所以本驱动使用 G20 的模型与标定；厂家已确认（2026-11-16）这份模型文件适用于 L20-10。标定参考机是否适用于每一台手（是否需要逐台标定）未确认。唯一的调整：左手四指侧摆（`{index,middle,ring,pinky}_mcp_roll`）的表取反使用。厂家左手文件里这四张表与右手同号，而左右 URDF 的侧摆轴相同，照原表 V 手势在左手骨架上会并拢（真机，2026-11-13）；调整见 `joints_model.NEGATED_TABLES`。离线核对中，左右手模型都能复现 OK、V 预设手势；右手另与真机上观察到的四个拇指方向中的三个一致（`thumb_roll` 待画面确认）。`raw` 始终是实测值，可独立使用。
+
+超时、部分回复或数值异常时，JSON 发布 `valid=false`、`raw/angle` 为 `null` 及原因，不用旧位置补齐；骨架不发布新帧。**卡片停止时补发一帧停止通知**（`state=idle`、`valid=false`、`reason=关节采集已停止；本帧不含实测值`，`timestamp`、`query_elapsed_s`、`measured_hz` 为 `null`，各关节 `raw/angle` 为 `null`），否则界面会一直按最后一帧的 `ok/valid=true` 展示；停止通知也不发骨架帧，因为渲染器没有失效状态，会继续停在最后一帧。判断是否实时以 JSON 的 `valid`、`sequence` 与 `timestamp` 为准。`get_state`（无界面按钮）在采集运行时返回最近一轮结果，超过 `stale_after_s` 的数据标为无效；未运行时执行一次查询。
+
+骨架模型来自同一下载中的 G20 左右手 URDF（来源、许可（Apache-2.0，见 `resource/LICENSE`）和未包含的网格见 `resource/SOURCE.md`）。Core 每个驱动只请求一个模型，因此驱动把左右手合并为一个仅含运动学的双手模型，左右并排并按 4 倍放大以适配 Core 的相机；每路骨架帧只驱动本侧关节。骨架中：
+
+- 16 个主动关节的角度限制在 URDF 限位内，被限制时 `clamped_to_model=true`（部分标定表略超出限位，JSON 中的 `angle_rad` 保留查表值）；
+- 5 个远端关节是被动关节，按标定文件中它们自己的表由父关节电机的 raw 推算，`source=derived_calibration`，不是独立测量；
+- Core 只把骨骼画到关节点为止，因此每根手指末端另加一个固定的指尖点（`{side}_{finger}_tip`），否则显示出的“指尖”其实是最后一个指节。指尖点沿上一节骨骼的方向延长到厂商 STL 网格末端，手指伸直时画成一条直线（若取网格最远点，指尖会向手背方向弯出）。指尖点在手指中线上而不在指腹，OK 手势时拇指尖与食指尖在模型中仍相距约 23–28 mm。
+- 两只手按镜像摆放：每只手绕竖直轴转 -90°，手心朝向 Core 的默认相机，拇指朝外（左手在左、右手在右，相当于看自己双手的手心）。厂家左右 URDF 的掌心都朝 +x，只平移会显示成同一朝向。
+
+当前 Core 的已知限制：详情面板请求模型时不带驱动 ID，骨架视图会回退为人形模型（Core PR #354 修复，未合并）；Dashboard 骨架视图按驱动 ID 请求模型，应加载本驱动模型（以实际部署验证为准）。Core 按内旋 XYZ 解释 URDF `rpy`，驱动已将拇指的多轴旋转拆成单轴固定关节，使两种解释结果一致。
+
+| `plugins.joints` 配置 | 默认值 | 含义 |
+| --- | --- | --- |
+| `enabled` | `true` | 注册 `joints` 卡片和 `model` 资源 |
+| `poll_hz` | `10.0` | 期望采集频率（1–30），上一轮结束才开始下一轮，实际频率见 `measured_hz` |
+| `query_timeout_s` | `0.2` | 单轮等待新位置回复的时限 |
+| `stale_after_s` | `1.0` | `info/get_state` 判断最近一帧过期的时长 |
+
+卡片不把自己打开的 CAN 连接登记到 `hand` 卡片，驱动退出时不会因本卡片对任何手下发卸力；只关闭仅由本卡片打开的连接。
+
 ## 3. 验证
 
 在仓库根目录运行离线回归，不连接真实 CAN，也不驱动设备：
@@ -145,7 +196,8 @@ python3 -m pytest \
   tests/test_linkerhand_l20_tactile.py \
   tests/test_linkerhand_l20_tactile_query.py \
   tests/test_linkerhand_l20_configuration.py \
-  tests/test_linkerhand_l20_explicit_gesture.py -q
+  tests/test_linkerhand_l20_explicit_gesture.py \
+  tests/test_linkerhand_l20_joints.py -q
 python3 -m pytest 'tests/test_dockerfile_copies.py::test_every_copied_path_exists[linkerhand/l20/Dockerfile]' 'tests/test_dockerfile_copies.py::test_every_imported_sibling_is_copied[linkerhand/l20/Dockerfile]' -q
 python3 scripts/check_service_yml.py linkerhand/l20
 ```
@@ -173,7 +225,7 @@ PYTHONPATH=. python3 linkerhand/l20/hardware_smoke.py --tactile-matrix
 
 2026-10-30 验证：以上固定组合完成 `linux/arm64` 镜像构建，镜像内核对依赖版本后，离线回归为 1001 项通过、1 项跳过（旧协议不适用的五指位置回复用例）。新增 ACP 回归使用实际工作线程入口，覆盖有／无卡片 ID 时完成通知失败、终态查询及同一物理目标后续运动被拒绝；不连接真实 CAN。
 
-`Dockerfile` 包含四张卡片的 Python 模块。完整构建时需把仓库 `common/` 加入构建上下文；`driver.yaml` 已通过 `build_context_extras` 声明该目录，并列出三张 actuator 和一张 sensor。以下命令在仓库根目录构建本地 ARM64 镜像，不推送镜像仓库：
+`Dockerfile` 包含五张卡片的 Python 模块及 `resource/` 模型文件。完整构建时需把仓库 `common/` 加入构建上下文；`driver.yaml` 已通过 `build_context_extras` 声明该目录，并列出三张 actuator、两张 sensor 和 `model` 资源。以下命令在仓库根目录构建本地 ARM64 镜像，不推送镜像仓库：
 
 ```bash
 l20_build_context=$(mktemp -d /tmp/linkerhand-l20-build.XXXXXX)
@@ -189,12 +241,16 @@ docker cp linkerhand/l20/tactile_device.py embodied-linkerhand-l20:/work/tactile
 docker cp linkerhand/l20/hand_device.py embodied-linkerhand-l20:/work/hand_device.py
 docker cp linkerhand/l20/gesture_device.py embodied-linkerhand-l20:/work/gesture_device.py
 docker cp linkerhand/l20/adaptive_grasp_device.py embodied-linkerhand-l20:/work/adaptive_grasp_device.py
+docker cp linkerhand/l20/joints_device.py embodied-linkerhand-l20:/work/joints_device.py
+docker cp linkerhand/l20/joints_model.py embodied-linkerhand-l20:/work/joints_model.py
+docker cp linkerhand/l20/can_client.py embodied-linkerhand-l20:/work/can_client.py
+docker cp linkerhand/l20/resource/. embodied-linkerhand-l20:/work/resource/
 docker cp linkerhand/l20/config.yaml embodied-linkerhand-l20:/work/config.yaml
 docker restart embodied-linkerhand-l20
 docker logs --since 1m --tail 60 embodied-linkerhand-l20
 ```
 
-底层通信模块等文件也有变更时应一并复制。`docker cp` 修改容器可写层，不更新原镜像；以后删除并重建容器，应使用包含最新文件的 ARM64 镜像。重启会清空内存中的运行任务和抓握模式，不保留执行器绑定；刷新页面后应看到四张卡片，执行器按动作区选择左右手，`hand_grasp` 提供 `adaptive_grasp`、`release`、`get_state` 三个公开动作。
+底层通信模块等文件也有变更时应一并复制。`docker cp` 修改容器可写层，不更新原镜像；以后删除并重建容器，应使用包含最新文件的 ARM64 镜像。重启会清空内存中的运行任务和抓握模式，不保留执行器绑定；刷新页面后应看到五张卡片，执行器按动作区选择左右手，`hand_grasp` 提供 `adaptive_grasp`、`release`、`get_state` 三个公开动作。
 
 ## 5. 执行目标、共享 CAN 与停止行为
 
@@ -206,7 +262,7 @@ docker logs --since 1m --tail 60 embodied-linkerhand-l20
 
 删除卡片不会留下执行器绑定记录，但也不能代替主动停止或释放。旧画布的执行请求可能不传 `instance_id`，而删除请求仅携带卡片 ID，此时无法可靠关联此前的匿名任务。驱动不会猜测设备或停止另一张卡片的任务：请先在 `hand/hand_gesture` 中选择对应侧执行 `stop`，抓握则先在 `hand_grasp` 中选择对应侧执行 `release`，确认完成后再删除卡片。能够关联到带 ID 原请求的停止调用只处理对应任务。
 
-四张卡片的 `stop` 正常返回均使用平台规定的 `state=idle`。这是卡片生命周期标记，不能单独用来确认电机已经卸力：执行器返回的 `target_resolved`、`torque_released`、`cancel_requested` 等字段说明是否匹配任务、是否下发卸力或请求取消，具体字段以对应卡片返回为准。手势取消的最终结果继续通过原动作的 ACP 通知报告。触觉停止仅移除本卡片的采集使用关系，其他卡片使用的采集流继续运行。
+各卡片的 `stop` 正常返回均使用平台规定的 `state=idle`。这是卡片生命周期标记，不能单独用来确认电机已经卸力：执行器返回的 `target_resolved`、`torque_released`、`cancel_requested` 等字段说明是否匹配任务、是否下发卸力或请求取消，具体字段以对应卡片返回为准。手势取消的最终结果继续通过原动作的 ACP 通知报告。触觉与关节卡片停止仅移除本卡片的采集使用关系，其他卡片使用的采集流继续运行。
 
 当前平台的通用运动中断钩子不会继承原请求的左右手参数，因此三张执行器不再声明无目标的 `on_interrupt_motion` 钩子。平台通用中断不能替代上述显式停止／释放流程。执行器的普通执行不依赖平台额外传入卡片 ID，驱动部署无需修改 Agent Core 文件；触觉卡片仍使用平台已有的传感器实例机制管理采集线程。
 
