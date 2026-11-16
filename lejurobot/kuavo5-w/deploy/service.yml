@@ -1,0 +1,23 @@
+lejurobot-kuavo5-w:
+  image: __IMAGE__
+  container_name: embodied-lejurobot-kuavo5-w
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - PYTHONUNBUFFERED=1
+    - ROSBRIDGE_URL=${KUAVO_ROSBRIDGE_URL:-ws://127.0.0.1:9090}
+    - AGENT_CORE_URL=https://localhost:15678
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always

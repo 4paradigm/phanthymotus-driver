@@ -1,0 +1,23 @@
+mcp_port: 15747
+name: "Leju Kuavo 5-W Driver"
+ros_namespace: ""
+# Start rosbridge_server on the ROS Noetic host and point this URL at it.
+rosbridge_url: "ws://127.0.0.1:9090"
+sensors:
+  # Only admit body-frame odometry; extend after verifying the robot's TF tree.
+  odom_body_frames: [base_link, base_footprint]
+  # SDK permits N*m or current. Set N*m only after verifying robot hardware output.
+  # Until then normalized tau is null; vendor.joint_torque preserves the raw values.
+  joint_torque_unit: null
+plugins:
+  loco: {enabled: true}
+  arm: {enabled: true}
+  leg: {enabled: true}
+  waist: {enabled: true}
+  head: {enabled: true}
+  switch_mode: {enabled: true}
+  state: {enabled: true}
+  joints: {enabled: true}
+  imu: {enabled: true}
+  loco_state: {enabled: true}
+  model: {enabled: true}
