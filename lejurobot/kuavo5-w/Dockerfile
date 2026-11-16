@@ -10,6 +10,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /work/requirements.txt
 WORKDIR /work
 COPY common/ /work/common/
 COPY main.py device.py rosbridge_client.py kuavo_sensors.py config.yaml driver.yaml /work/
+COPY resource/ /work/resource/
 COPY deploy/ /deploy/
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_DOMAIN_ID=42

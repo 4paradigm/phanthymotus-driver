@@ -106,6 +106,7 @@ class DeploymentTests(unittest.TestCase):
                     candidate = ROOT.parents[1] / "common" if source == "common/" else ROOT / source
                     self.assertTrue(candidate.exists(), f"COPY source missing: {source}")
         self.assertIn("COPY deploy/ /deploy/", (ROOT / "Dockerfile").read_text())
+        self.assertIn("COPY resource/ /work/resource/", (ROOT / "Dockerfile").read_text())
         self.assertEqual({c["name"] for c in meta["cards"]}, set(config["plugins"]))
 
     def test_namespace_valid_first_character(self):

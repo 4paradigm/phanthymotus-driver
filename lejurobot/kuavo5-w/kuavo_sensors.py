@@ -9,6 +9,7 @@ from collections import deque
 import copy
 import json
 import math
+from pathlib import Path
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -88,6 +89,7 @@ class KuavoSensors:
         self._profile = None
         self._urdf, self._names = None, None
         self._model_error = 'waiting_for_discovery'
+        self._model_path = Path(__file__).resolve().parent / 'resource' / 'kuavo5w_model.urdf'
         self._discovery_error = 'waiting_for_discovery'
         self._discovering = False
         self._retry_at = 0
@@ -145,6 +147,8 @@ class KuavoSensors:
             try:
                 urdf = self.ros1.get_param('/humanoid_description')
                 names = model_names(urdf)
+                if names != model_names(self._model_path.read_text(encoding='utf-8')):
+                    raise ValueError('runtime joint names differ from resource/kuavo5w_model.urdf; update the reference model')
                 model_error = None
             except Exception as exc:
                 urdf, names, model_error = None, None, str(exc)
@@ -191,7 +195,10 @@ class KuavoSensors:
         self._session()
         with self._lock:
             return {'profile': copy.deepcopy(self._profile), 'sensor_topic': self._raw_topic,
-                    'discovery_error': self._discovery_error, 'model_error': self._model_error}
+                    'discovery_error': self._discovery_error, 'model_error': self._model_error,
+                    'skeleton_model': {'source': 'resource/kuavo5w_model.urdf',
+                                       'reference_version': '400062',
+                                       'runtime_joint_names_verified': self._names is not None}}
 
     def _on_raw(self, message, source, generation):
         if not self._session()[0]:
@@ -329,7 +336,8 @@ class KuavoSensors:
                   'topic_out': [{'topic': self._topics[name],
                                  'format': {'joints': 'sensor/skeleton', 'loco_state': 'state/odom'}.get(name, 'data/json')}]}
                  for name, description in descriptions.items()]
-        tools.append({'name': 'model', 'type': 'resource', 'description': '机器人实际 humanoid_description URDF',
+        tools.append({'name': 'model', 'type': 'resource',
+                      'description': 'Kuavo 5-W 本地参考 URDF 骨架模型；无需机器人在线，实测姿态由 joints 单独提供',
                       'inputSchema': {'type': 'object', 'properties': {}}})
         return tools
 
@@ -337,7 +345,12 @@ class KuavoSensors:
         self._session()
         with self._lock:
             if card == 'model':
-                return {'urdf': self._urdf} if self._urdf else {'state': 'error', 'error': self._model_error}
+                try:
+                    urdf = self._model_path.read_text(encoding='utf-8')
+                    model_names(urdf)
+                    return {'urdf': urdf}
+                except (OSError, ValueError, ET.ParseError) as exc:
+                    return {'state': 'error', 'error': f'local skeleton URDF unavailable: {exc}'}
             if action == 'start':
                 self._running.add(card)
             elif action == 'stop':

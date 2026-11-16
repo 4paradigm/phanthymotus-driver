@@ -18,7 +18,8 @@ std = types.ModuleType("std_msgs.msg")
 std.String = type("String", (), {})
 with patch.dict(sys.modules, {"std_msgs": types.ModuleType("std_msgs"), "std_msgs.msg": std}):
     spec.loader.exec_module(driver)
-    from kuavo_sensors import LINK_ORDER
+    from kuavo_sensors import LINK_ORDER, model_names
+    JOINT_NAMES = model_names((ROOT / 'resource' / 'kuavo5w_model.urdf').read_text())
 
 
 class FakeRos1:
@@ -30,7 +31,7 @@ class FakeRos1:
                        'headRealDof': 2, 'legRealDof': 4, 'waistRealDof': 0,
                        'use_shm_communication': False,
                        'humanoid_description': '<robot name="fixture">' + ''.join(
-                           f'<joint name="j{i}" type="revolute"><child link="{link}"/></joint>'
+                           f'<joint name="{JOINT_NAMES[i]}" type="revolute"><child link="{link}"/></joint>'
                            for i, link in enumerate(LINK_ORDER)) + '</robot>'}
 
     def get_param(self, name, default=None):

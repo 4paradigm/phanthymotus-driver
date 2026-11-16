@@ -24,7 +24,7 @@ SDK 在机器人控制仓库内，不必另找一个名为 SDK 的独立仓库�
 | `src/kuavo_msgs/msg/{sensorsData,jointData,imuData}.msg` | 原始实测数据定义 | 映射 q/dq/ddq/tau 和 IMU |
 | `src/humanoid-control/humanoid_controllers/src/ControlDataManager.cpp` | 控制器实际消费的传感器与 odom | 复核加速度/力矩字段和本体速度 |
 | `src/humanoid-control/humanoid_controllers/src/humanoidController_wheel_wbc.cpp` | 轮臂自由度参数、观测与 FK | 复核下肢4、双臂14、头2及实测关节顺序 |
-| `src/kuavo_assets/models/biped_s400062/urdf/biped_s400062.urdf` | 5-W 模型参考 | 核对 child-link；部署时仍读取真机模型 |
+| `src/kuavo_assets/models/biped_s400062/urdf/biped_s400062.urdf` | 5-W 模型参考 | 精简后随驱动打包显示；真机模型用于实测关节名称校验 |
 | `docs/4开发接口/Kuavo 5-W 接口使用文档.md` | 5-W 特定控制接口/单位/优先级 | 执行卡的主要依据 |
 
 可重现入口：[固定提交源码树](https://github.com/LejuRobotics/kuavo-ros-opensource/tree/d9c036e19fce5689fcfa8c596ee89b2045bebb32)。
@@ -107,7 +107,14 @@ zhead_1_link, zhead_2_link
 参考 400062 URDF 对应 `knee_joint/leg_joint/waist_pitch_joint/waist_yaw_joint`、`zarm_*_joint`、`zhead_*_joint`。
 参考模型还包含轮子和手指；raw 这20个关节不包含它们，驱动不伪造其测量值。
 SDK 通用 `joint_names()` 的轮臂分支仅列下肢，部分模型目录的 controller_joint_names 配置仍带双足名称，均不直接照搬。
-URDF 不匹配/缺失时 `model` 返回明确错误，`joints` 输出 invalid + 空数组；不会伪造骨架名称。
+静态骨架遵循 G1、天轶 2.0 的目录及接口约定：`model` 读取本地
+`resource/kuavo5w_model.urdf`，断线和控制器未启动均可读取，不依赖真机参数。
+模型由上述固定提交的 400062 URDF 精简而来，保留全部连杆名称和关节定义，去除 visual/collision/inertial；
+前端只绘制骨架，不需要网格。来源、校验和及许可证见 `resource/README.md` 与 `resource/LICENSE.leju`。
+它是未完成现场几何/标定确认的参考模型，不能用作运动控制依据。
+真机 URDF 缺失或20个受测关节名称与本地模型不一致时，`joints` 输出 invalid + 空数组，
+诊断记录 `model_error`；静态模型仍可用，参考姿态不当作实测零角度。
+本地文件本身缺失或解析失败时，`model` 才返回本地资源错误。
 没有将 IMU 四元数直接套到轮式底盘根节点：其安装 frame 未在现场核实。
 
 ## 5. 里程计

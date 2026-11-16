@@ -4,9 +4,10 @@ import math
 import threading
 import time
 import unittest
+import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
-from test_driver import driver, FakeNode, FakeRos1, LINK_ORDER
+from test_driver import driver, FakeNode, FakeRos1, LINK_ORDER, JOINT_NAMES, ROOT
 
 
 class SensorTests(unittest.TestCase):
@@ -26,11 +27,12 @@ class SensorTests(unittest.TestCase):
             'twist': {'twist': {'linear': dict(x=vx, y=vy, z=0.),
                                 'angular': dict(x=0., y=0., z=wz)}}})
 
-    def test_discovers_wheel_profile_and_real_model(self):
+    def test_discovers_wheel_profile_and_local_model(self):
         self.hub.require_profile()
         self.assertEqual(self.hub.health()['profile']['robot_type'], 1)
-        self.assertEqual(self.hub._names, [f'j{i}' for i in range(20)])
-        self.assertEqual(self.hub.dispatch('model', 'read'), {'urdf': self.ros.params['humanoid_description']})
+        self.assertEqual(self.hub._names, JOINT_NAMES)
+        self.assertEqual(self.hub.dispatch('model', 'read'), {'urdf': self.hub._model_path.read_text()})
+        self.assertTrue(self.hub.health()['skeleton_model']['runtime_joint_names_verified'])
         self.assertEqual(self.ros.services, [])
         self.assertEqual(self.ros.published, [])
 
@@ -39,7 +41,7 @@ class SensorTests(unittest.TestCase):
         data = self.hub.snapshot('joints')
         self.assertTrue(data['valid'])
         joint = data['joints'][7]
-        self.assertEqual(joint, dict(idx=7, name='j7', q=7, dq=1., ddq=2., tau=None))
+        self.assertEqual(joint, dict(idx=7, name=JOINT_NAMES[7], q=7, dq=1., ddq=2., tau=None))
         self.assertEqual(data['units']['q'], 'rad')
         self.assertIsNone(data['units']['tau'])
         self.assertEqual(data['vendor']['joint_torque'], [3.] * 20)
@@ -93,7 +95,7 @@ class SensorTests(unittest.TestCase):
         self.assertFalse(self.hub.snapshot('imu')['valid'])
         with self.assertRaises(RuntimeError):
             self.hub.require_profile()
-        self.assertIn('error', self.hub.dispatch('model', 'read'))
+        self.assertIn('urdf', self.hub.dispatch('model', 'read'))
 
     def test_sensor_lifecycle_and_disconnected_publication(self):
         self.hub.tick()
@@ -131,7 +133,8 @@ class SensorTests(unittest.TestCase):
         self.hub.discover()
         with self.assertRaises(RuntimeError):
             self.hub.require_profile()
-        self.assertIn('error', self.hub.dispatch('model', 'read'))
+        self.assertIn('urdf', self.hub.dispatch('model', 'read'))
+        self.assertFalse(self.hub.health()['skeleton_model']['runtime_joint_names_verified'])
         self.assertFalse(self.hub.snapshot('imu')['valid'])
 
     def test_model_recovery_requires_new_correctly_named_measurement(self):
@@ -142,7 +145,7 @@ class SensorTests(unittest.TestCase):
         self.hub.discover()
         self.assertFalse(self.hub.snapshot('joints')['valid'])
         self.ros.raw()
-        self.assertEqual(self.hub.snapshot('joints')['joints'][0]['name'], 'j0')
+        self.assertEqual(self.hub.snapshot('joints')['joints'][0]['name'], JOINT_NAMES[0])
 
     def test_wrong_robot_or_dof_never_enables_motion(self):
         for key, value in [('robot_type', 2), ('armRealDof', 8), ('legRealDof', 12), ('headRealDof', True)]:
@@ -156,21 +159,88 @@ class SensorTests(unittest.TestCase):
             finally:
                 hub.close()
 
-    def test_missing_urdf_never_invents_skeleton_or_model(self):
+    def test_missing_runtime_urdf_preserves_model_without_inventing_measurements(self):
         del self.ros.params['humanoid_description']
         self.hub.discover()
         self.ros.raw()
         self.assertFalse(self.hub.snapshot('joints')['valid'])
         self.assertEqual(self.hub.snapshot('joints')['joints'], [])
-        self.assertIn('error', self.hub.dispatch('model', 'read'))
+        self.assertIn('urdf', self.hub.dispatch('model', 'read'))
+        self.assertIsNotNone(self.hub.health()['model_error'])
         self.assertTrue(self.hub.snapshot('imu')['valid'])
 
-    def test_biped_or_unsafe_xml_not_accepted_as_model(self):
+    def test_biped_or_unsafe_runtime_xml_never_validates_measured_joints(self):
         for urdf in ('<robot name="biped"/>', '<!DOCTYPE robot><robot/>',
                      self.ros.params['humanoid_description'].replace('zhead_2_link', 'other')):
             self.ros.params['humanoid_description'] = urdf
             self.hub.discover()
-            self.assertIn('error', self.hub.dispatch('model', 'read'))
+            self.ros.raw()
+            self.assertIsNone(self.hub._names)
+            self.assertFalse(self.hub.snapshot('joints')['valid'])
+            self.assertIn('urdf', self.hub.dispatch('model', 'read'))
+
+    def test_local_model_available_before_discovery_and_without_ros_parameters(self):
+        ros = FakeRos1()
+        ros.connection = (False, 1)
+        ros.params.clear()
+        hub = driver.KuavoSensors({}, 'test', ros, FakeNode())
+        try:
+            model = hub.dispatch('model', 'read')
+            self.assertEqual(model, {'urdf': hub._model_path.read_text()})
+            self.assertFalse(hub.snapshot('joints')['valid'])
+            self.assertEqual(hub.snapshot('joints')['joints'], [])
+            hub.discover()
+            self.assertEqual(hub.dispatch('model', 'read'), model)
+            self.assertEqual(ros.services, [])
+            self.assertEqual(ros.published, [])
+        finally:
+            hub.close()
+
+    def test_local_model_read_errors_are_explicit(self):
+        with patch.object(type(self.hub._model_path), 'read_text', side_effect=FileNotFoundError('missing')):
+            self.assertIn('local skeleton URDF unavailable', self.hub.dispatch('model', 'read')['error'])
+        for xml in ('<robot>', '<robot/>', '<!DOCTYPE robot><robot/>'):
+            with patch.object(type(self.hub._model_path), 'read_text', return_value=xml):
+                self.assertIn('error', self.hub.dispatch('model', 'read'))
+
+    def test_runtime_joint_names_must_match_displayed_model(self):
+        self.ros.raw()
+        self.ros.params['humanoid_description'] = self.ros.params['humanoid_description'].replace(
+            f'name="{JOINT_NAMES[0]}"', 'name="different_knee"')
+        self.hub.discover()
+        self.ros.raw()
+        self.assertIn('runtime joint names differ', self.hub.health()['model_error'])
+        self.assertEqual(self.hub.snapshot('joints')['joints'], [])
+        self.assertFalse(self.hub.snapshot('joints')['valid'])
+        self.assertIn('urdf', self.hub.dispatch('model', 'read'))
+
+    def test_packaged_skeleton_is_one_connected_tree_without_mesh_dependencies(self):
+        root = ET.fromstring((ROOT / 'resource' / 'kuavo5w_model.urdf').read_text())
+        links, joints = root.findall('link'), root.findall('joint')
+        names = {link.get('name') for link in links}
+        self.assertEqual(len(names), len(links))
+        self.assertEqual(len(joints), len(links) - 1)
+        self.assertEqual(len({joint.get('name') for joint in joints}), len(joints))
+        children, adjacency = set(), {name: [] for name in names}
+        for joint in joints:
+            parent, child = joint.find('parent').get('link'), joint.find('child').get('link')
+            self.assertIn(parent, names)
+            self.assertIn(child, names)
+            self.assertNotIn(child, children)
+            children.add(child)
+            adjacency[parent].append(child)
+        self.assertEqual(names - children, {'base_link'})
+        visited, pending = set(), ['base_link']
+        while pending:
+            link = pending.pop()
+            self.assertNotIn(link, visited)
+            visited.add(link)
+            pending.extend(adjacency[link])
+        self.assertEqual(visited, names)
+        self.assertTrue(set(LINK_ORDER) <= names)
+        self.assertTrue(set(JOINT_NAMES) <= {joint.get('name') for joint in joints})
+        for tag in ('mesh', 'visual', 'collision', 'inertial'):
+            self.assertEqual(root.findall('.//' + tag), [])
 
     def test_odom_averages_window_null_axes_and_reports_provenance(self):
         self.odom(1., 2., 3.)

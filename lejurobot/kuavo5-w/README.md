@@ -80,7 +80,7 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 | `joints` | 系统 `start`、`stop`、`info` | `/sensors_data_raw[_shm]` 实测 q/dq/ddq/tau；`sensor/skeleton` |
 | `imu` | 系统 `start`、`stop`、`info` | 同一原始消息的 IMU；`data/json` |
 | `loco_state` | 系统 `start`、`stop`、`info` | `/odom` 本体系 vx/vy/wz；`state/odom`、`motus.odom/1` |
-| `model` | resource 读取 | 真机 `/humanoid_description` URDF |
+| `model` | resource 读取 | 本地 `resource/kuavo5w_model.urdf` 参考骨架；离线可读 |
 
 sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 resource。
 业务参数通过 `x-action-params` 分组并声明动作各自的 required；`dispatch()` 返回普通 dict，HTTP 层只包装一次 MCP content。
@@ -155,8 +155,14 @@ reach-time 以及实测双手世界系末端位姿（左6 + 右6，各为 `[x,y,
 | `imu` | `/<namespace>/state/imu` | quaternion 明确 wxyz、gyroscope rad/s、accelerometer/free_acceleration m/s²；不猜安装 frame |
 | `loco_state` | `/<namespace>/state/odom` | motus.odom/1，本体系 vx/vy/wz 窗口均值；其他轴 null，原始 pose/twist/header 位于 vendor |
 
-0.5s无测量或数据不合法会输出 `valid:false`；缺失力矩/速度不补零。骨架模型缺失或不匹配时输出空关节数组和错误，
-不伪造 joint name，也不把参考模型误作真机模型。原始20关节不含底盘轮角/手指；这些不属于本卡的实测能力。
+0.5s无测量或数据不合法会输出 `valid:false`；缺失力矩/速度不补零。
+`model` 与 G1、天轶 2.0 一样读取驱动 `resource/` 下的 URDF，前端无需 STL 即可显示静态骨架，
+不依赖机器人在线或控制器启动。模型来源、固定版本和许可证见 [resource/README.md](resource/README.md)。
+该文件是 400062 参考模型，尚未核实与现场硬件修订及标定完全一致，不能用作控制模型。
+实时更新仍要求实测 q；真机 `/humanoid_description` 缺失，或其20个受测关节名称与本地模型不一致时，
+`joints` 输出 invalid、空关节数组和原因，静态 `model` 仍可读取。`state.info` 中的
+`robot_discovery.model_error` 表示运行时模型校验错误，`skeleton_model` 记录本地来源与名称校验状态。
+参考姿态不代表测得的 q=0。原始20关节不含底盘轮角/手指；这些不属于本卡的实测能力。
 
 SDK 对 effort 单位同时允许 N·m 或 A，因此默认 tau=null、单位未知，保留 `vendor.joint_torque`。
 只有在真机核实所有输出为关节端 N·m 后才配置 `sensors.joint_torque_unit: N*m`，届时才输出标准 tau。
