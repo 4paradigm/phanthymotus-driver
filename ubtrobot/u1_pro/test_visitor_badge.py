@@ -48,7 +48,9 @@ class VisitorBadgeTest(unittest.TestCase):
         self.assertEqual(definition["name"], "hp_printer")
         self.assertEqual(definition["type"], "actuator")
         actions = definition["inputSchema"]["properties"]["action"]["enum"]
-        self.assertEqual(set(actions), {"start", "stop", "info", "config", "find", "find_and_print", "print"})
+        self.assertEqual(set(actions), {"start", "stop", "info", "config", "find", "print"})
+        schema_text = json.dumps(definition["inputSchema"], ensure_ascii=False)
+        self.assertIn('"print"', schema_text)
         props = definition["configSchema"]["properties"]
         self.assertEqual(props["token"]["format"], "password")
         self.assertTrue(props["bridge_url"]["x-sensitive"])
@@ -96,17 +98,17 @@ class VisitorBadgeTest(unittest.TestCase):
         self.assertEqual(self.bridge.print_log, ["V1001"])
 
     def test_find_and_print_hides_ticket_and_generates_request_id(self):
-        result = self.call("find_and_print", name="王磊", host="张三")
+        result = self.call("print", name="王磊", host="张三")
         self.assertEqual(result["status"], "printed")
         self.assertTrue(result["request_id"].startswith("direct-"))
         self.assertEqual(self.bridge.print_log, ["V1001"])
 
     def test_find_and_print_rejects_ambiguous_or_completed_visit(self):
-        ambiguous = self.call("find_and_print", name="李娜", host="")
+        ambiguous = self.call("print", name="李娜", host="")
         self.assertEqual(ambiguous["code"], "visitor_ambiguous")
-        first = self.call("find_and_print", name="王磊", host="张三")
+        first = self.call("print", name="王磊", host="张三")
         self.assertEqual(first["status"], "printed")
-        second = self.call("find_and_print", name="王磊", host="张三")
+        second = self.call("print", name="王磊", host="张三")
         self.assertEqual(second["code"], "status_not_printable")
         self.assertEqual(self.bridge.print_log, ["V1001"])
 
