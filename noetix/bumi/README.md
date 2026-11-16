@@ -218,7 +218,7 @@ RGB 和深度保留 30 Hz 采集发布配置、队列深度 1、BEST_EFFORT；�
 
 Bundle 启动仍自动启动原有卡片。单张卡片 start/stop 独立控制本卡片的所有输出，重复
 start 不会再开相机；停一张不影响其他活动卡片。相机可为其他卡片保持采集，重启卡片只
-使用新帧；全部停止或 bundle 关闭会释放进程。可选相机 IMU/身体 TF 缺失不影响有效深度。
+使用新帧；全部停止或 bundle 关闭会释放进程。可选机身 IMU/身体 TF 缺失不影响有效深度。
 停止会等待采集进程确认此前的发布已结束；最多等待 5 秒，超时明确返回错误。
 请求停用但尚未确认时 `info.state=stopping`，不会提前声称 `idle`；确认或源退出后才显示已停止。
 控制代次与每卡启用代次防止快速停启合并后重放旧视频或 IMU 数据。
@@ -528,7 +528,7 @@ and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
 The separate `camera_rgbd` card is retired. Move existing canvas wires to the
 original cards: the single `camera` output (`/bumi/camera/color`) and the single
 `depth` output (`/bumi/camera/depth`). Use that same depth output for display,
-Perception VO and Point Cloud. Select `imu.body_imu` for calibrated body-IMU
+Perception VO and Point Cloud. Select `imu.body_imu` for body-IMU
 rotation assistance; the original body JSON port is unchanged.
 The namespace follows bundle configuration. The original `camera` and `depth`
 `info`/`start` responses carry their actual `camera_info` declarations and
@@ -537,7 +537,7 @@ fresh calibrated metadata, returning early if its owner exits or reports a
 permanent calibration failure. Neither image advertises a manual geometry
 fallback. Existing `camera.registered_rgb` connections must be moved to the
 remaining `camera` output; update saved topic selectors from `/camera/rgbd/color`
-to `/camera/color` with the configured namespace. Optional camera IMU
+to `/camera/color` with the configured namespace. Optional body IMU
 availability remains separate and does not block calibrated images.
 
 One existing RealSense pipeline preserves the native RGB field and aligns
@@ -565,12 +565,12 @@ Both originate from the HighController body IMU; the camera pipeline requests
 only color and depth, never RealSense gyro/accel. Replace saved connections to
 the former `/NS/camera/rgbd/imu` output with this body output.
 
-The existing verified, rigid camera-to-body rotation in
+The configured fixed camera-to-body rotation in
 `plugins.visual_odometry.calibration` is inverted to describe body sensor axes
 in the RGB optical frame. Raw angular velocity and acceleration remain in body
-axes and the generic consumer applies the declared rotation once. Missing or
-assumed calibration makes this output unavailable. The preset's camera-origin
-zero translation is not an accelerometer lever-arm measurement, so no IMU
+axes and the generic consumer applies the declared rotation once. A usable
+numeric fixed rotation is required; an `assumed` label does not block it.
+The preset's camera-origin zero translation is not an accelerometer lever-arm measurement, so no IMU
 translation is declared.
 
 Packets use `motus.imu/1` over `std_msgs/String`, with a body source identity,
@@ -681,17 +681,19 @@ the metric cloud and generic RGB-D odometry outputs to `pointcloud_slam`.
 Both outputs refer to the same color optical frame; no camera-to-body matrix
 is needed for this route. The resulting pose describes the camera, not the
 robot body. Gyro-only chassis odometry cannot replace the RGB-D pose input.
-Camera IMU assistance is optional and requires the camera IMU port with its SDK calibration and shared capture clock.
+Body IMU assistance is optional; connect `imu.body_imu`, which supplies the
+configured numeric rotation and explicit read-completion timestamps.
 
 The declarations retain source identity, capture epoch and mapping evidence.
-Hardware time uses one fixed arrival-fitted offset shared by RGB, depth and
-camera IMU; its accuracy is unknown and it is explicitly unverified. It is
+RGB/depth hardware time uses a fixed arrival-fitted offset; body IMU uses
+host read-completion time. The image mapping has unknown accuracy and is
+explicitly unverified. It is
 not proof of synchronization with independent chassis or host clocks.
-Invalid capture times and inconsistent declarations are rejected. A failed
+The image producer rejects invalid capture times and inconsistent declarations. A failed
 pair does not partially update either clock; a source clock reset/domain
 change invalidates the epoch and requires restarting the camera source.
-Toggling a card does not authorize reuse of the old mapping. Existing skew,
-freshness and fusion limits are unchanged. Hardware stability and motion
+Toggling a card does not authorize reuse of the old mapping. These are producer
+checks; PR371 uses format-only input admission. Hardware stability and motion
 accuracy still require validation on Bumi.
 
 ### RGB field migration
@@ -700,6 +702,6 @@ The single public topic names and port order are unchanged. The optical referenc
 is now `<namespace>_rgb_optical` rather than `<namespace>_depth_optical`; RGB-D VO,
 Point Cloud and SLAM must restart with the new live declarations after updating
 the driver. Start a new mapping session rather than joining old depth-frame
-poses to color-frame clouds. Saved maps keep their original coordinates. Camera
-IMU factory extrinsics and the optional body-TF lookup target the color optical
-frame; the legacy bundle-local VO raw branch is unchanged.
+poses to color-frame clouds. Saved maps keep their original coordinates.
+The configured body-IMU rotation and optional body-TF lookup target the color
+optical frame; the legacy bundle-local VO raw branch is unchanged.

@@ -89,7 +89,9 @@ def test_plugin_outputs_and_does_not_copy_old_segment_frame(monkeypatch):
     assert declaration['unfused_axes'] == ['z', 'roll', 'pitch']
     assert declaration['stamp_source'] == 'receive'
     assert declaration['clock']['verified'] is False
-    plugin.stop()
+    assert plugin.dispatch('stop', {}) == {'state': 'idle'}
+    assert plugin.active is False and plugin.stop_event.is_set()
+    assert plugin.dispatch('info', {})['state'] == 'idle'
     plugin._publish()
     stopped=json.loads(plugin.node.pubs[plugin.topic][-1].data)
     assert stopped['pose'] is None

@@ -96,7 +96,7 @@ class FusedOdometryPlugin:
             self.thread = None
         if thread is not None and thread.is_alive():
             thread.join(timeout=1.0)
-        return {'state': 'stopped'}
+        return {'state': 'idle'}
 
     def _sample_loop(self):
         while not self.stop_event.wait(.025):

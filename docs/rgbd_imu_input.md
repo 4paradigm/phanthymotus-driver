@@ -1,62 +1,69 @@
-# Camera IMU input for RGB-D assistance
+# IMU input for RGB-D assistance
 
-The existing IMU card appends an optional, explicitly named `camera_imu`
-output (`sensor/imu` on `std_msgs/msg/String`). Its original display output
-retains its source: G1/Bumi body IMU is not replaced by camera IMU. Native
-`sensor_msgs/msg/Imu` is used only inside Perception's estimator session.
-The original RGB card supplies registered color; the original depth card's
-single millimetre-depth output is shared by display, RGB-D odometry and
-Point Cloud. The standalone `camera_rgbd` card is retired. Connect the camera
-motion output and set `imu_assisted=true` on the Perception card to request
-assistance. Default RGB-D operation does not require motion hardware.
+Connect the optional `sensor/imu` output (`std_msgs/msg/String`, `motus.imu/1`)
+to Perception RGB-D odometry and enable the intended assistance mode. The
+existing IMU display output keeps its own topic and format. RGB-D does not
+require motion hardware.
 
-Each JSON object has `schema: "motus.imu/1"` and the following fields:
+PR371 uses [numeric-format admission](https://github.com/Nidhogg2002/phanthymotus/blob/feat/pointcloud-slam-offline-eval/perception/docs/rgbd-imu.md).
+Source names, capture/read/receipt labels, calibration descriptions, clock/frame
+names and verification flags describe the data; they are not consumer gates.
+A timestamp labelled `read_completion` participates in the full calculation.
+Providers own actual time alignment, units, axes and installation geometry.
+
+## Numeric packet and physical conventions
 
 | Fields | Meaning |
 | --- | --- |
-| `source_id`, `epoch` | Physical motion-source identity and capture generation |
-| `stamp_ns`, `accel_stamp_ns` | Gyro and acceleration capture times in the RGB-D clock; never publication/receipt stamps |
-| `stamp_source` | `measurement` |
-| `clock_id`, `camera_frame_id` | Exact values from the two RGB-D camera declarations |
-| `gyro_frame_id`, `accel_frame_id` | Actual raw motion axes |
-| `camera_from_gyro`, `camera_from_accel` | Nested row-major proper 3×3 rotations, mapping each raw vector to camera axes |
-| `rotation_source` | `sdk_factory_extrinsics` or `tf` |
-| `camera_from_gyro_translation`, `camera_from_accel_translation` (optional) | xyz metres: each raw sensor origin expressed in the target camera optical coordinates |
-| `translation_source` (optional) | `sdk_factory_extrinsics` or `tf`; present with the calibrated translation pair |
-| `angular_velocity`, `linear_acceleration` | Raw xyz arrays in their own source frames |
-| `units` | `{"angular_velocity":"rad/s","linear_acceleration":"m/s^2"}` |
-| `clock_mapping` (optional) | Source mapping provenance, without claiming unverified relationships as verified |
+| `schema` | `motus.imu/1` wire layout |
+| `stamp_ns`, `accel_stamp_ns` | Integer nanosecond times used in numeric association |
+| `angular_velocity`, `linear_acceleration` | Finite raw xyz arrays; rad/s and m/s² conventions |
+| `camera_from_gyro`, `camera_from_accel` | Finite numeric 3×3 rotations expressing the raw axes in camera optical axes |
+| `camera_from_gyro_translation`, `camera_from_accel_translation` | Finite xyz metres required by full fusion; each sensor origin expressed in camera coordinates |
+| `source_id`, `epoch`, frame/clock IDs | Source and coordinate diagnostics |
+| `stamp_source`, `rotation_source`, `translation_source`, `calibration_id`, `clock_mapping` | Provenance, including whether times represent capture or reading |
 
-For either sensor, the full extrinsics map a source-frame point as
-`p_camera = camera_from_sensor @ p_sensor + camera_from_sensor_translation`.
-The translation is the sensor origin in the camera frame, with no inversion or
-lever-arm sign change. RealSense reads `get_extrinsics_to(depth).translation`;
-Tianyi reads the translation and rotation from the same source-time TF lookup.
-Only finite xyz translation pairs are published as calibrated. Missing or
-invalid translation omits both translation fields and `translation_source`,
-keeps attitude-only packets and video available, and reports
-`imu_status.fusion.state="unavailable"` with a reason. This nested status reports
-calibration capability; the parent IMU status still reports live capture health.
-The short-term fusion consumer requires calibrated translations and must reject
-an absent pair; a missing lever arm is never replaced by zeros.
+Use column vectors: `p_camera = camera_from_sensor @ p_sensor + translation`.
+Provide proper physical rotations and actual sensor origins. Raw vectors are
+not pre-rotated; the consumer applies the stated rotations once. Missing
+translation vectors permit attitude assistance but do not supply the numeric
+packet needed by full fusion. Do not fabricate zero lever arms.
 
-Raw vectors are not pre-rotated; Perception applies the stated rotations once.
-It requires gyro/acceleration capture skew ≤20 ms, gyro update gaps ≤100 ms,
-source age ≤500 ms, and future skew ≤50 ms. Epoch, clock, axes or calibration
-changes must not silently continue an existing estimator segment.
+## Bumi — body IMU
 
-Tianyi uses vendor Orbbec motion topics and TF at each individual capture time.
-G1/Bumi discover supported RealSense motion profiles and share the existing
-camera owner; SDK column-major extrinsics are converted to this row-major
-contract. G1 requires global capture time; Bumi reuses the RGB-D branch's exact
-mapping offset and explicitly keeps approximate mapping unverified. Missing
-motion streams, unavailable TF or invalid clocks withdraw only IMU availability;
-video and RGB-D remain usable. `imu_status` is reported separately.
+Bumi uses HighController body IMU readings from `/NS/state/imu`, not RealSense
+motion streams. Its display output remains `/NS/state/imu` (`data/json`); the
+named `body_imu` computation port is `/NS/state/imu_calibrated` (`sensor/imu`).
+The shared camera owner requests only color and depth. No camera-IMU helper,
+second SDK owner or RealSense motion profile is used.
 
-The default IMU-assisted mode estimates relative attitude from gravity and gyro;
-it provides no absolute heading or inertial translation. Optional short-term
-compensation uses the full calibrated extrinsics and has its own bounded fusion
-policy; source calibration availability alone does not establish valid motion
-tracking or certified covariance.
-Software/offline acceptance does not establish real-device timing, calibration
-or estimator quality; hardware testing remains a separate acceptance step.
+`BodyImuSource` preserves body angular velocity and acceleration, inverts the
+configured fixed camera-to-body rotation, and declares
+`rotation_source=configured_fixed_mount`. The preset is an axis convention,
+not a measured body/IMU origin. Its `assumed` label does not block the numeric
+rotation. Both sensor translations are omitted because their lever arms have
+not been supplied; `imu_status.fusion` reports that missing numeric capability.
+
+The SDK supplies no acquisition timestamp. Packets carry the host reading time
+unchanged with `stamp_source=read_completion` and an unverified
+`host_wall_read_completion` mapping. This is usable numeric time, not evidence
+of hardware synchronization. Identical cached SDK values do not refresh a
+measurement. Connect `imu.body_imu` for attitude assistance; full fusion needs
+the two real translation vectors as well.
+
+## Tianyi and G1 — separate adapters
+
+Tianyi PR519 uses the existing Orbbec gyro/acceleration topics. Its named
+`camera_imu` port is `/NS/camera/rgbd/imu`; source-time TF supplies sensor
+rotations and, when available, translations relative to the camera. Missing
+translation preserves attitude packets while reporting full fusion unavailable.
+The camera service's global-clock patch and producer-side timing checks are
+documented with that driver. They are not additional PR371 admission rules.
+
+G1's RealSense adapter is maintained separately in PR499. Its factory motion
+extrinsics and capture-clock policy are specific to that source; they do not
+describe Bumi. Bumi does not use a RealSense motion helper.
+
+Format acceptance and factory/TF availability do not establish motion accuracy.
+Software tests and historical static runs do not validate current deployments,
+walking/turning performance or map accuracy.

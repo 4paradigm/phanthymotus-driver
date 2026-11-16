@@ -235,7 +235,7 @@ inputs and existing metadata. It does not publish public compressed depth.
 Generic Perception VO and Point Cloud consume the public pair's real matching
 camera_info directly. The original body IMU display port remains data/json;
 use `imu.body_imu` (`/NS/state/imu_calibrated`, `sensor/imu`) for computation.
-It uses HighController body gyro/acceleration and the verified fixed mounting
+It uses HighController body gyro/acceleration and the configured fixed mounting
 rotation, with explicit unverified SDK read-completion timestamps. No RealSense
 motion streams are requested. The consumer accepts read/receipt timestamps for every selected mode. This
 adapter currently omits the two translation vectors needed by full fusion;
