@@ -9,6 +9,13 @@ from uuid import uuid4
 import websocket
 
 
+def _log_text(value, limit=200):
+    # Slice before escaping: never format a complete untrusted packet or string.
+    if not isinstance(value, str):
+        return f"<{type(value).__name__}>"
+    return value[:limit].encode("unicode_escape").decode("ascii")[:limit]
+
+
 class RosbridgeClient:
     def __init__(self, url: str):
         self.url = url
@@ -150,7 +157,7 @@ class RosbridgeClient:
                 self._send_advertisement(topic, message_type)
             for topic, (message_type, _) in self._subscriptions.items():
                 self._send_subscription(topic, message_type)
-        print(f"[rosbridge] connected: {self.url}", flush=True)
+        print(f"[rosbridge] connected: {_log_text(self.url)}", flush=True)
 
     def _on_close(self, ws, _status, _message) -> None:
         with self._lock:
@@ -162,7 +169,7 @@ class RosbridgeClient:
         with self._lock:
             if ws is self._ws:
                 self._disconnect(str(error))
-        print(f"[rosbridge] connection error: {error}", flush=True)
+        print(f"[rosbridge] connection error: {_log_text(str(error))}", flush=True)
 
     def _on_message(self, ws, raw: str) -> None:
         try:
@@ -183,9 +190,10 @@ class RosbridgeClient:
                 return
             if op == "status":
                 if packet.get("level") == "error":
-                    print(f"[rosbridge] protocol error: {packet}", flush=True)
+                    message = _log_text(packet.get("msg", "ROS protocol error"))
+                    print(f"[rosbridge] protocol error id={_log_text(packet.get('id'))}: {message}", flush=True)
                     # A rejected command cannot be treated as successful motion.
-                    self._disconnect(str(packet.get("msg", "ROS protocol error")))
+                    self._disconnect(message)
                     ws.close()
                 return
             entry = self._subscriptions.get(packet.get("topic")) if op == "publish" else None
@@ -193,7 +201,7 @@ class RosbridgeClient:
             try:
                 entry[1](packet["msg"])
             except Exception as exc:
-                print(f"[rosbridge] callback failed: {type(exc).__name__}: {exc}", flush=True)
+                print(f"[rosbridge] callback failed: {type(exc).__name__}: {_log_text(str(exc))}", flush=True)
 
     def _run(self) -> None:
         while not self._closed.is_set():

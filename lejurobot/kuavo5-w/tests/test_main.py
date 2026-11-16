@@ -5,8 +5,10 @@ import os
 import shlex
 import sys
 import tempfile
+import threading
 import types
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -72,6 +74,28 @@ class McpTests(unittest.TestCase):
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_registration_sends_standard_identity_and_transport(self):
+        stopped, requests = threading.Event(), []
+        def receive(request, **kwargs):
+            requests.append(request)
+            stopped.set()
+            return io.BytesIO(b'{}')
+        with patch.object(urllib.request, 'urlopen', side_effect=receive), patch.dict(os.environ, {'AGENT_CORE_URL': 'https://localhost:15678'}):
+            thread = main._register({'name': 'Kuavo test', 'mcp_port': 15747}, stopped)
+            try:
+                thread.join(1)
+                self.assertFalse(thread.is_alive())
+            finally:
+                stopped.set()
+                thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].full_url, 'https://localhost:15678/api/mcp')
+        self.assertEqual(json.loads(requests[0].data), {
+            'id': 'lejurobot-kuavo5-w-driver', 'name': 'Kuavo test',
+            'url': 'http://localhost:15747/mcp', 'transport': 'http', 'category': 'driver'})
+        self.assertEqual(main.DRIVER_ID, yaml.safe_load((ROOT / 'driver.yaml').read_text())['id'])
+
     def test_dds_fails_closed_for_missing_or_directory_profile(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
             with patch.object(main, "PROFILE", Path(directory)):
@@ -94,6 +118,7 @@ class DeploymentTests(unittest.TestCase):
     def test_metadata_config_compose_and_flat_build_context(self):
         meta = yaml.safe_load((ROOT / "driver.yaml").read_text())
         config = yaml.safe_load((ROOT / "config.yaml").read_text())
+        self.assertIs(config['motion_enabled'], False)
         compose = next(iter(yaml.safe_load((ROOT / "deploy/service.yml").read_text()).values()))
         self.assertEqual(meta["port"], config["mcp_port"])
         self.assertEqual(meta["mcp_url"], f"http://localhost:{config['mcp_port']}/mcp")
@@ -107,6 +132,7 @@ class DeploymentTests(unittest.TestCase):
                     self.assertTrue(candidate.exists(), f"COPY source missing: {source}")
         self.assertIn("COPY deploy/ /deploy/", (ROOT / "Dockerfile").read_text())
         self.assertIn("COPY resource/ /work/resource/", (ROOT / "Dockerfile").read_text())
+        self.assertNotIn('ros-humble-geometry-msgs', (ROOT / 'Dockerfile').read_text())
         self.assertEqual({c["name"] for c in meta["cards"]}, set(config["plugins"]))
 
     def test_namespace_valid_first_character(self):

@@ -16,6 +16,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent
 PROFILE = Path("/opt/phanthy-motus/dds-local.xml")
+DRIVER_ID = "lejurobot-kuavo5-w-driver"
 _bundle = None
 
 
@@ -51,8 +52,9 @@ def _register(config, stopped):
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
     url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
-    payload = json.dumps({"name": config.get("name", "Leju Kuavo 5-W Driver"),
-        "url": f"http://localhost:{int(config.get('mcp_port', 15747))}/mcp", "category": "driver"}).encode()
+    payload = json.dumps({"id": DRIVER_ID, "name": config.get("name", "Leju Kuavo 5-W Driver"),
+        "url": f"http://localhost:{int(config.get('mcp_port', 15747))}/mcp",
+        "transport": "http", "category": "driver"}).encode()
 
     def loop():
         while not stopped.is_set():

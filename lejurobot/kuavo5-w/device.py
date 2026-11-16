@@ -27,6 +27,8 @@ REACH = {
     "arm_ee_reach_time": "/lb_arm_ee_reach_time",
 }
 MODES = {0: "NoControl", 1: "ArmOnly", 2: "BaseOnly", 3: "BaseArm", 4: "ArmEeOnly"}
+CONTROL_TIMEOUT_S = 2.0  # One total budget for service acceptance AND state confirmation.
+DISPATCH_LOCK_TIMEOUT_S = 0.25
 
 
 def _acp_complete(action_id: str, tool: str, status: str, result: dict) -> None:
@@ -52,7 +54,7 @@ class RobotState:
     """Internal feedback stays subscribed even when the state card is stopped."""
     PREFIX = "state"
 
-    def __init__(self, ros1, node, namespace: str, sensors):
+    def __init__(self, ros1, node, namespace: str, sensors, motion_enabled=False):
         self.ros1 = ros1
         self.sensors = sensors
         self._topic = f"/{namespace}/state/control"
@@ -64,6 +66,7 @@ class RobotState:
         self._generation = -1
         self._running = False
         self.motion_blocked = False
+        self.motion_enabled = motion_enabled
         ros1.subscribe("/mobile_manipulator/lb_mpc_control_mode", "std_msgs/Int8",
                        lambda msg: self._update("mpc_mode", msg.get("data")))
         ros1.subscribe("/enable_control_state", "std_msgs/Bool",
@@ -125,12 +128,14 @@ class RobotState:
             return {"connected": connected, "connection_generation": generation,
                     "mode_feedback_fresh": mode_fresh,
                     "motion_blocked": self.motion_blocked, "fields": fields,
+                    "motion_enabled": self.motion_enabled,
                     "robot_discovery": self.sensors.health(),
                     "ee_pose_layout": "left[x,y,z,yaw,pitch,roll],right[x,y,z,yaw,pitch,roll]",
                     "ee_pose_units": "m,rad", "reach_time_units": "s",
                     "completion_basis": "per_action_see_acp_result"}
 
     def require_motion(self, allowed_modes=None) -> None:
+        self.require_motion_enabled()
         self.sensors.require_profile()
         if not self._sync_session()[0]:
             raise ConnectionError("ROS 1 bridge disconnected; no commands were queued")
@@ -144,6 +149,10 @@ class RobotState:
             raise RuntimeError("MPC mode is missing, stale or NoControl")
         if allowed_modes and mode not in allowed_modes:
             raise RuntimeError(f"current MPC mode {mode} does not support this action; set_mode explicitly")
+
+    def require_motion_enabled(self):
+        if not self.motion_enabled:
+            raise RuntimeError("motion is disabled; set motion_enabled: true only for supervised hardware commissioning")
 
     def _publish(self) -> None:
         if self._running:
@@ -299,21 +308,27 @@ class _KuavoPlugin:
         pass  # ROS runtime belongs to the bundle, not an individual actuator card.
 
     def stop(self):
-        return self.bundle.pause("stopped_by_request")
+        pass  # Lifecycle marker; active actions remain owned by the bundle/ACP.
 
     def dispatch(self, action, args):
         try:
-            with self.tracker.lock:
-                if action in ("start", "info"):
-                    if action == "start":
-                        self.start()
-                    return {"state": "ready" if self.ros1.connection[0] else "disconnected"}
-                if action in ("stop", "stop_move"):
-                    result = self.stop()
-                    if action == "stop" and not result.get("error"):
-                        result["state"] = "idle"
-                    return result
+            if action == "start":
+                self.start()
+                return {"state": "ready"}
+            if action == "stop":
+                self.stop()
+                return {"state": "idle"}
+            if action == "info":
+                return {"state": "ready" if self.ros1.connection[0] else "disconnected",
+                        "motion_enabled": self.state.motion_enabled}
+            if not self.tracker.lock.acquire(timeout=DISPATCH_LOCK_TIMEOUT_S):
+                raise RuntimeError("control transition is busy; query state before retrying")
+            try:
+                if action == "stop_move":
+                    return self.bundle.pause("stopped_by_request")
                 return self._dispatch(action, args)
+            finally:
+                self.tracker.lock.release()
         except Exception as exc:
             print(f"[{self.PREFIX}] {action}: {type(exc).__name__}: {exc}", flush=True)
             return {"state": "error", "error": str(exc)}
@@ -509,7 +524,7 @@ class ArmPlugin(_KuavoPlugin):
                     "hand_poses": {"header": {"seq": 0, "stamp": {"secs": 0, "nsecs": 0}, "frame_id": ""}, **poses},
                     "frame": 1 if args["frame"] == "world" else 2,
                     "use_custom_ik_param": False, "joint_angles_as_q0": False,
-                    "ik_param": {}}), (1, 3, 4))
+                    "ik_param": {}}), allowed_modes=(1, 3, 4))
         raise ValueError(f"unknown action: {action}")
 
 
@@ -595,6 +610,7 @@ class ControlPlugin(_KuavoPlugin):
         if action == "resume":
             return self.bundle.resume()
         if action == "set_mode":
+            self.state.require_motion_enabled()
             self.bundle.sensors.require_profile()
             if self.tracker._active:
                 raise RuntimeError("motion is active; pause and await completion before changing MPC mode")
@@ -603,12 +619,8 @@ class ControlPlugin(_KuavoPlugin):
                 raise ValueError("mode must be an integer from 0 to 4")
             if not self.ros1.connection[0] or self.state.read("control_enabled")[0] is not True:
                 raise RuntimeError("connect and resume control before changing mode")
-            issued = time.monotonic()
-            response = self.ros1.call_service("/mobile_manipulator_mpc_control",
-                "kuavo_msgs/changeTorsoCtrlMode", {"control_mode": mode}, 5)
-            if response.get("result") is not True:
-                raise RuntimeError(response.get("message") or "mode change rejected")
-            self.bundle.wait_state("mpc_mode", mode, issued)
+            self.bundle.confirm_control("/mobile_manipulator_mpc_control",
+                "kuavo_msgs/changeTorsoCtrlMode", {"control_mode": mode}, "result", "mpc_mode", mode)
             return {"state": "completed", "mode": mode, "mode_name": MODES[mode],
                     "completion_basis": "mpc_mode_feedback"}
         raise ValueError(f"unknown action: {action}")
@@ -616,6 +628,9 @@ class ControlPlugin(_KuavoPlugin):
 
 class KuavoBundle:
     def __init__(self, config, namespace, ros1, ros2_node):
+        motion_enabled = config.get("motion_enabled", False)
+        if type(motion_enabled) is not bool:
+            raise ValueError("motion_enabled must be a YAML boolean")
         self.ros1, self.namespace = ros1, namespace
         for topic, message_type in (
             ("/cmd_vel", "geometry_msgs/Twist"),
@@ -629,7 +644,7 @@ class KuavoBundle:
         ):
             ros1.advertise(topic, message_type)
         self.sensors = KuavoSensors(config.get('sensors', {}), namespace, ros1, ros2_node)
-        self.state = RobotState(ros1, ros2_node, namespace, self.sensors)
+        self.state = RobotState(ros1, ros2_node, namespace, self.sensors, motion_enabled)
         self.tracker = ActionTracker()
         self._closing = False
         self.plugins = [LocoPlugin(self), ArmPlugin(self), LowerBodyPlugin(self),
@@ -646,8 +661,18 @@ class KuavoBundle:
     def zero_head(self):
         self.ros1.publish("/cmd_head_vel", "kuavo_msgs/robotHeadMotionData", {"joint_data": [0.0, 0.0]})
 
-    def wait_state(self, key, expected, issued, timeout=2.0):
+    def confirm_control(self, service, service_type, args, accepted_key, key, expected):
+        issued = time.monotonic()
         generation = self.ros1.connection[1]
+        response = self.ros1.call_service(service, service_type, args, CONTROL_TIMEOUT_S)
+        if response.get(accepted_key) is not True:
+            raise RuntimeError(response.get("message") or "control request rejected")
+        remaining = max(0.0, issued + CONTROL_TIMEOUT_S - time.monotonic())
+        self.wait_state(key, expected, issued, timeout=remaining, generation=generation)
+
+    def wait_state(self, key, expected, issued, timeout=CONTROL_TIMEOUT_S, generation=None):
+        if generation is None:
+            generation = self.ros1.connection[1]
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             connected, current = self.ros1.connection
@@ -656,7 +681,7 @@ class KuavoBundle:
             value, seen = self.state.read(key)
             if seen >= issued and value == expected:
                 return
-            time.sleep(0.02)
+            time.sleep(min(0.02, max(0, deadline - time.monotonic())))
         raise TimeoutError(f"request accepted but fresh {key}={expected} not confirmed; read state before retry")
 
     def pause(self, reason, status="cancelled"):
@@ -675,11 +700,8 @@ class KuavoBundle:
                 if enabled is False and self.ros1.connection[0]:
                     return {"state": "paused", "control_enabled": False,
                             "completion_basis": "enable_control_state", "scope": "whole_body"}
-                issued = time.monotonic()
-                response = self.ros1.call_service("/enable_control", "std_srvs/SetBool", {"data": False}, 5)
-                if response.get("success") is not True:
-                    raise RuntimeError(response.get("message") or "pause rejected")
-                self.wait_state("control_enabled", False, issued)
+                self.confirm_control("/enable_control", "std_srvs/SetBool", {"data": False},
+                                     "success", "control_enabled", False)
                 return {"state": "paused", "control_enabled": False,
                         "completion_basis": "enable_control_state", "scope": "whole_body"}
             except Exception as exc:
@@ -689,17 +711,15 @@ class KuavoBundle:
                         "physical_stop_confirmed": False, "motion_blocked": True}
 
     def resume(self):
+        self.state.require_motion_enabled()
         self.sensors.require_profile()
         self.state.motion_blocked = True
         if self.tracker._active:
             raise RuntimeError("cannot resume during an active motion")
         enabled, _ = self.state.read("control_enabled")
         if enabled is not True:
-            issued = time.monotonic()
-            response = self.ros1.call_service("/enable_control", "std_srvs/SetBool", {"data": True}, 5)
-            if response.get("success") is not True:
-                raise RuntimeError(response.get("message") or "resume rejected")
-            self.wait_state("control_enabled", True, issued)
+            self.confirm_control("/enable_control", "std_srvs/SetBool", {"data": True},
+                                 "success", "control_enabled", True)
         self.state.motion_blocked = False
         return {"state": "ready", "control_enabled": True,
                 "completion_basis": "enable_control_state", "new_motion_command_required": True}

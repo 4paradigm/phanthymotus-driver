@@ -109,7 +109,7 @@ class DriverContractTests(unittest.TestCase):
         self.callback_patch = patch.object(driver, "_acp_complete", side_effect=lambda *a: self.callbacks.append(a))
         self.callback_patch.start()
         self.ros, self.node = FakeRos1(), FakeNode()
-        self.bundle = driver.KuavoBundle({}, "test_robot", self.ros, self.node)
+        self.bundle = driver.KuavoBundle({"motion_enabled": True}, "test_robot", self.ros, self.node)
         self.bundle.sensors.discover()
         self.ros.raw()
         self.ros.emit("/enable_control_state", True)
@@ -170,7 +170,104 @@ class DriverContractTests(unittest.TestCase):
         self.bundle.state._publish()
         self.assertFalse(json.loads(self.node.publisher.messages[-1].data)['connected'])
         self.assertFalse(self.call("state", "info")["feedback"]["connected"])
-        self.assertEqual(self.call("loco", "start")["state"], "disconnected")
+        self.assertEqual(self.call("loco", "start")["state"], "ready")  # Lifecycle only.
+        self.assertEqual(self.call("loco", "info")["state"], "disconnected")
+
+    def test_actuator_lifecycle_never_waits_for_control_lock_or_calls_hardware(self):
+        entered, release = threading.Event(), threading.Event()
+        def hold_lock():
+            with self.bundle.tracker.lock:
+                entered.set()
+                release.wait(2)
+        thread = threading.Thread(target=hold_lock)
+        thread.start()
+        self.assertTrue(entered.wait(1))
+        try:
+            with patch.object(self.bundle, 'pause', side_effect=AssertionError('lifecycle must not pause')):
+                for plugin in self.bundle.plugins:
+                    self.assertEqual(self.call(plugin.PREFIX, 'start'), {'state': 'ready'})
+                    self.assertEqual(self.call(plugin.PREFIX, 'stop'), {'state': 'idle'})
+            self.assertTrue(thread.is_alive())
+            self.assertEqual(self.ros.services, [])
+            self.assertEqual(self.ros.published, [])
+        finally:
+            release.set()
+            thread.join(1)
+
+    def test_lifecycle_stop_keeps_active_action_tracked_until_explicit_interrupt(self):
+        action = self.call('arm', 'set_pose', frame='world', left_position=[0, .4, 0],
+                           right_position=[0, -.4, 0], left_quaternion=[0, 0, 0, 1],
+                           right_quaternion=[0, 0, 0, 1])
+        before = len(self.ros.published)
+        self.assertEqual(self.call('arm', 'stop'), {'state': 'idle'})
+        self.assertTrue(self.bundle.tracker.current('arms', action['action_id']))
+        self.assertEqual(len(self.ros.published), before)
+        self.assertEqual(self.ros.services, [])
+        self.assertEqual(self.call('arm', 'stop_move')['state'], 'paused')
+        self.assertTrue(wait_until(lambda: self.callbacks))
+        self.assertEqual([c[:3] for c in self.callbacks], [(action['action_id'], 'arm', 'cancelled')])
+
+    def test_control_lock_contention_returns_busy_instead_of_waiting_unbounded(self):
+        entered, release = threading.Event(), threading.Event()
+        def hold_lock():
+            with self.bundle.tracker.lock:
+                entered.set()
+                release.wait(2)
+        thread = threading.Thread(target=hold_lock)
+        thread.start()
+        self.assertTrue(entered.wait(1))
+        try:
+            result = self.call('switch_mode', 'set_mode', mode=3)
+            self.assertIn('busy', result['error'])
+            self.assertTrue(thread.is_alive())
+            self.assertEqual(self.ros.services, [])
+        finally:
+            release.set()
+            thread.join(1)
+
+    def test_control_transitions_share_one_service_and_feedback_deadline(self):
+        for action in ('pause', 'resume', 'set_mode'):
+            with self.subTest(action=action):
+                self.ros.confirm = False
+                self.ros.emit('/enable_control_state', action != 'resume')
+                clock = [100.]
+                def sleep(seconds):
+                    clock[0] += seconds
+                def delayed_service(*args):
+                    self.assertEqual(args[-1], driver.CONTROL_TIMEOUT_S)
+                    clock[0] += 1.5  # Consumes the same budget as the following wait.
+                    return {'success': True, 'result': True}
+                fake_time = types.SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)
+                with patch.object(driver, 'time', fake_time), patch.object(self.ros, 'call_service', side_effect=delayed_service):
+                    result = self.call('switch_mode', action, mode=3)
+                self.assertEqual(result['state'], 'error')
+                self.assertIn('not confirmed', result['error'])
+                self.assertAlmostEqual(clock[0] - 100., driver.CONTROL_TIMEOUT_S)
+        self.ros.confirm = True
+
+    def test_control_confirmation_rejects_feedback_from_reconnected_service_session(self):
+        original = self.ros.call_service
+        def reconnect(*args):
+            self.ros.connection = (True, 2)
+            return original(*args)
+        with patch.object(self.ros, 'call_service', side_effect=reconnect):
+            result = self.call('switch_mode', 'set_mode', mode=3)
+        self.assertEqual(result['state'], 'error')
+        self.assertIn('connection changed', result['error'])
+
+    def test_cartesian_arm_mode_four_completes_without_joint_measurements(self):
+        self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 4)
+        self.bundle.sensors._data.pop('joints', None)
+        result = self.call('arm', 'set_pose', frame='local', left_position=[0, .4, 0],
+                           right_position=[0, -.4, 0], left_quaternion=[0, 0, 0, 1],
+                           right_quaternion=[0, 0, 0, 1])
+        self.assertIn('action_id', result)
+        self.assertEqual(self.ros.published[-1][2]['frame'], 2)
+        self.ros.emit('/lb_arm_ee_reach_time', 0)
+        self.assertTrue(wait_until(lambda: self.callbacks))
+        self.assertEqual(self.callbacks[0][:3], (result['action_id'], 'arm', 'completed'))
+        self.assertFalse(self.callbacks[0][3]['measured_convergence'])
+        self.assertEqual(self.ros.services, [])
 
     def test_motion_requires_enabled_fresh_supported_mode_and_warmup(self):
         for setup in (
@@ -233,6 +330,10 @@ class DriverContractTests(unittest.TestCase):
         self.assertFalse(msg["use_custom_ik_param"])
         self.ros.emit("/lb_arm_ee_reach_time", 0)
         self.assertTrue(wait_until(lambda: self.callbacks))
+        self.assertEqual(self.callbacks[0][:3], (result['action_id'], 'arm', 'completed'))
+        self.assertEqual(self.callbacks[0][3]['completion_basis'], 'vendor_reach_time_estimate')
+        self.assertFalse(self.callbacks[0][3]['measured_convergence'])
+        self.assertEqual(self.ros.services, [])
 
     def test_loco_velocity_acp_waits_for_vendor_stop_window(self):
         result = self.call("loco", "move", vx=0.1, duration=0.1)
@@ -390,6 +491,47 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(self.call("loco", "move", duration=1)["state"], "error")
         # close is idempotent, including the callback worker.
         self.assertTrue(self.bundle._closing)
+
+
+class CommissioningGateTests(unittest.TestCase):
+    def test_default_configuration_blocks_motion_and_enable_but_preserves_reads_and_pause(self):
+        ros = FakeRos1()
+        bundle = driver.KuavoBundle({}, 'test', ros, FakeNode())
+        try:
+            bundle.sensors.discover()
+            ros.raw()
+            ros.emit('/enable_control_state', True)
+            ros.emit('/mobile_manipulator/lb_mpc_control_mode', 3)
+            cases = [
+                ('loco', dict(action='move', duration=.1)),
+                ('loco', dict(action='move_relative', x=0, y=0, yaw=0)),
+                ('loco', dict(action='move_to', x=0, y=0, yaw=0)),
+                ('arm', dict(action='move_joints', positions=[0.] * 14)),
+                ('arm', dict(action='set_pose', frame='world', left_position=[0, .4, 0],
+                             right_position=[0, -.4, 0], left_quaternion=[0, 0, 0, 1],
+                             right_quaternion=[0, 0, 0, 1])),
+                ('leg', dict(action='move_joints', positions=[0.] * 4)),
+                ('waist', dict(action='set_pose', x=0, z=.8, pitch=0, yaw=0)),
+                ('head', dict(action='move', duration=.1)),
+                ('switch_mode', dict(action='resume')),
+                ('switch_mode', dict(action='set_mode', mode=3)),
+            ]
+            for name, args in cases:
+                with self.subTest(card=name, action=args['action']):
+                    self.assertIn('motion is disabled', bundle.dispatch(name, args)['error'])
+            self.assertEqual(ros.published, [])
+            self.assertEqual(ros.services, [])
+            self.assertFalse(bundle.dispatch('state', {'action': 'info'})['feedback']['motion_enabled'])
+            self.assertTrue(bundle.sensors.snapshot('joints')['valid'])
+            self.assertIn('urdf', bundle.dispatch('model', {}))
+            self.assertEqual(bundle.dispatch('switch_mode', {'action': 'pause'})['state'], 'paused')
+            self.assertFalse(ros.services[-1][2]['data'])
+        finally:
+            bundle.close()
+
+    def test_motion_flag_rejects_ambiguous_string_configuration(self):
+        with self.assertRaisesRegex(ValueError, 'YAML boolean'):
+            driver.KuavoBundle({'motion_enabled': 'false'}, 'test', FakeRos1(), FakeNode())
 
 
 if __name__ == "__main__":

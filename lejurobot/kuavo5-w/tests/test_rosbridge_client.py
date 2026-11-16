@@ -149,6 +149,27 @@ class RosbridgeClientTests(unittest.TestCase):
         self.assertFalse(self.client.connection[0])
         self.assertTrue(self.sock.closed)
 
+    def test_remote_protocol_logs_escape_and_bound_selected_fields(self):
+        payload = '\x00\x1b[31m\n' + 'x' * 100_000
+        with patch('builtins.print') as log:
+            self.packet({'op': 'status', 'level': 'error', 'id': payload,
+                         'msg': payload, 'irrelevant': 'not logged'})
+        line = log.call_args[0][0]
+        self.assertLess(len(line), 450)
+        self.assertNotIn('not logged', line)
+        self.assertNotIn('\x00', line)
+        self.assertNotIn('\x1b', line)
+        self.assertNotIn('\n', line)
+        self.assertIn('\\x00', line)
+        self.assertFalse(self.client.connection[0])
+        self.assertTrue(self.sock.closed)
+
+    def test_remote_log_fields_do_not_format_nested_objects(self):
+        with patch('builtins.print') as log:
+            self.packet({'op': 'status', 'level': 'error',
+                         'id': {'nested': 'x' * 100_000}, 'msg': ['x' * 100_000]})
+        self.assertIn('id=<dict>: <list>', log.call_args[0][0])
+
     def test_closed_client_rejects_late_open(self):
         self.client.close()
         self.client._on_open(self.sock)

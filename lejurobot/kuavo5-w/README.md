@@ -61,6 +61,10 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 ```
 
 本驱动不会自动启动机器人控制器、启用控制、切换 MPC 模式或开启 quick mode。
+默认 `motion_enabled: false`，允许读取状态、传感器和本地模型，但拒绝运动、恢复控制及模式切换。
+软件暂停和 `stop_move` 仍可调用。现场核实接口、单位及停止语义后，仅在有人监督的联调环境中，
+将实际加载的配置文件设置为 `motion_enabled: true` 并重启驱动；配置必须是 YAML 布尔值，不能写字符串。
+`state.info.feedback.motion_enabled` 与执行卡 `info.motion_enabled` 可确认当前配置。
 机器人必须处于允许运动的状态，且收到本次 WebSocket 连接内的控制状态和新鲜模式反馈后才接受运动指令。
 启动和重连后，独立线程经 rosapi 探测机型、robot_version、自由度、SHM 参数及 `/humanoid_description`。
 必须确认 wheel-arm=1、下肢4、双臂14、头2后才能运动；探测失败时可通过 `state.info.feedback.robot_discovery` 查原因。
@@ -113,6 +117,9 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 `leg` 与 `waist` 共享资源和驱动内部通道。同通道在途动作收到新命令会返回 busy，调用方应等待完成或显式停止。
 底盘速度/位姿也共享 busy 通道，避免位置指令被尚未过期的速度指令覆盖，或无效新参数误取消旧 ACP。
 `switch_mode` 不指定局部资源，采用 Agent Core 的全局互斥；其短状态转换按指南同步等待反馈。
+暂停、恢复和模式切换共用最多2s的服务受理+状态确认预算，而不是分别等待5s和2s；
+前台发令争用控制锁最多等待0.25s，未取得锁时明确返回 busy。反馈超时返回错误，要求查询状态后再决定，
+不自动重试或改为后台继续等待，确认期间重连也不能以新会话反馈证明旧请求成功。
 所有执行卡声明 `on_interrupt_motion` hook。
 
 位姿/关节运动订阅相应的 `/lb_*_reach_time`（`std_msgs/Float32`），只使用指令发送后收到的反馈。
@@ -127,7 +134,12 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 ACP 同样标记为时长/控制器超时推断。WebSocket发送成功仅代表写入连接，不代表 ROS 控制器确认执行。
 发布器在连接时预先建立，并等待1s连接准备窗口；一次性指令仍以 reach-time 反馈检查接收情况。
 
-`stop_move` 和执行卡系统 `stop` 都会发底盘/头部零速度并请求 `/enable_control=false` **全身软件暂停**，
+执行卡系统 `start`/`stop` 是立即返回 `ready`/`idle` 的生命周期标记，不访问机器人或等待控制锁。
+`info` 和 `state` 另行报告实际连接状态；生命周期 `ready` 不表示已连接或允许运动。
+已接受的动作仍由驱动运行时和 ACP 跟踪，不因生命周期标记而丢失；需要停止运动时必须调用
+`stop_move`、`switch_mode.pause` 或触发执行卡的中断 hook。驱动退出时会清理在途动作。
+
+`stop_move` 和中断操作会发底盘/头部零速度并请求 `/enable_control=false` **全身软件暂停**，
 以避免位置目标在零速度命令退出后继续执行；它们会影响其他部位并取消所有在途 ACP。
 之后需显式 `switch_mode.resume`，再发送新的运动目标。
 服务 `success=true` 只表示受理，暂停/恢复以 `/enable_control_state` 确认；保护窗口或重复请求被拒会返回错误。
@@ -179,6 +191,11 @@ SDK 对 effort 单位同时允许 N·m 或 A，因此默认 tau=null、单位未
 
 仓库 `build.sh` 会将驱动目录内容作为构建上下文，并将 `driver.yaml` 的 `../../common` 复制为 `common/`。
 Dockerfile 已按此布局配置，并将部署片段放入镜像 `/deploy/service.yml`。
+基础镜像已提供 `python3-pip`；Dockerfile 仅在缺失时安装 ROS2 FastDDS RMW 和 `std_msgs`，
+分别用于选定的 DDS participant 和 `String` 状态发布。不安装本地 ROS2 `geometry_msgs`：
+厂商 ROS1 `Twist` 是 rosbridge JSON 消息，由机器人侧解析。
+Python 依赖仅为配置解析用 PyYAML 和连接 rosbridge 用 websocket-client，不安装完整厂商 SDK。
+这些是运行所需的依赖；实际基础镜像是否已提供及最终镜像增量仍需容器构建核实，不能用离线测试替代。
 本地仅构建、不推送的示例（从仓库根目录运行）：
 
 ```sh
@@ -192,6 +209,8 @@ docker build --platform linux/arm64 -t lejurobot-kuavo5-w:dev "$BUILD_CTX"
 远程 ROS1 可通过部署环境 `KUAVO_ROSBRIDGE_URL=ws://<robot-ip>:9090` 覆盖。
 直接启动 Python 时使用 `ROSBRIDGE_URL`；`CONFIG_PATH` 可指定配置文件，`ros_namespace` 默认使用规范化后的 hostname。
 MCP 端口15747，Agent Core回调默认 `https://localhost:15678`，可通过 `AGENT_CORE_URL` 覆盖。
+注册请求携带与 `driver.yaml` 一致的 id、名称、URL、`transport: http` 和 `category: driver`。
+当前 Core 的注册匹配仍以 URL/名称为准，不依赖请求 id；显式字段与共享注册工具保持一致。
 本驱动使用局部 topic 命名空间，不修改其他驱动或 Agent Core 的 DDS domain。
 
 ## 检查与真机验收
@@ -217,7 +236,7 @@ curl -s http://localhost:15747/mcp -H 'Content-Type: application/json' \
 
 1. ROS1 上述类型/服务正确，rosbridge/rosapi 能加载厂商消息和参数，模式持续50Hz更新，软件控制状态可接收。
 2. 分别 start 传感卡，确认 domain42 收到 control/joints/imu/odom，字段、URDF名称、方向和 frame 正确，外部网络不接收该 DDS 数据。
-3. 在现场安全条件下，分别以小幅度验证底盘、双臂、下肢、躯干和头部的方向与单位；检查每个动作的 ACP 成功/取消/错误。
+3. 仅在现场有人监督且接口就绪时显式开启 `motion_enabled`，分别以小幅度验证底盘、双臂、下肢、躯干和头部的方向与单位；检查每个动作的 ACP 成功/取消/错误。
 4. 验证软件暂停、过渡窗口拒绝、恢复后需重新发目标、rosbridge 断线后不重放指令，以及多个执行卡共享通道的仲裁。
 5. 检查关节 ACP 在实测到位后才成功；卡住、数据中断或误差超限不能成功。测量位姿 reach-time 估计的偏差，评估进一步闭环。
 
