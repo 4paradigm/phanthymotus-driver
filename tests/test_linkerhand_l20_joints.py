@@ -965,6 +965,41 @@ def test_start_while_a_hand_is_still_stopping_does_not_take_it_over(ros_runtime)
         plugin.stop()
 
 
+def test_driver_stop_keeps_a_worker_it_cannot_stop_and_its_can_client(ros_runtime, monkeypatch):
+    ros2, _, _ = ros_runtime
+    blocked = BlockingClient()
+    ctrl = mock.Mock(get=mock.Mock(return_value=blocked))
+    monkeypatch.setattr(hand_device, "GLOBAL_CONTROLLERS", {("left", "can0"): ctrl})
+    import joints_device
+    monkeypatch.setattr(joints_device, "GLOBAL_CONTROLLERS", hand_device.GLOBAL_CONTROLLERS)
+    hand = SimpleNamespace(hand_config={}, config=GLOBAL_CONFIG, _lock=threading.RLock(), _controllers={})
+    plugin = JointsPlugin(hand, {"poll_hz": 30, "query_timeout_s": 0.02}, global_config=GLOBAL_CONFIG, ros2=ros2)
+    try:
+        plugin.dispatch("start", {"instance_id": "A", "bound_side": "left"})
+        assert blocked.entered.wait(3)
+        worker = plugin._streams[("left", "can0")]
+        # The worker is blocked beyond the join timeout: the driver stop says so...
+        with pytest.raises(RuntimeError):
+            plugin.stop()
+        # ...keeps the worker reachable and does not close the client under it.
+        assert plugin._streams.get(("left", "can0")) is worker and worker.running()
+        ctrl.close.assert_not_called()
+        blocked.release.set()
+        # The card's own stop still reaches it once the query returns.
+        plugin.dispatch("stop", {"instance_id": "A"})
+        assert plugin._streams == {} and not worker.running()
+        ctrl.close.assert_called_once()
+    finally:
+        blocked.release.set()
+        plugin.stop()
+
+
+def test_unknown_action_is_left_to_the_mcp_handler_as_an_error():
+    plugin, clients = make_plugin()
+    assert plugin.dispatch("calibrate", {"instance_id": "A", "bound_side": "left"}) is None
+    assert clients == {}
+
+
 def test_driver_does_not_start_acquisition_on_boot():
     plugin, clients = make_plugin()
     plugin.start()

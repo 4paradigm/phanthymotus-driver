@@ -535,15 +535,30 @@ class JointsPlugin:
 
     def stop(self) -> None:
         with self._lifecycle_lock:
-            for stream in list(self._streams.values()):
+            stuck = set()
+            for target, stream in list(self._streams.items()):
                 try:
                     stream.stop()
                 except Exception as exc:
+                    stuck.add(target)
                     logger.warning("Joints stream %s/%s did not stop: %s", stream.side, stream.channel, exc)
-            self._streams.clear()
-            self._owners.clear()
-            self._leftovers.clear()
+                else:
+                    self._streams.pop(target, None)
+            # A worker still blocked in a query stays with the cards that read
+            # it, so a card's stop or a second driver stop can still end it;
+            # its CAN client stays open (_close_if_unused skips live streams).
+            for instance_id, (targets, _) in list(self._owners.items()):
+                del self._owners[instance_id]
+                if stuck.intersection(targets):
+                    self._leftovers.setdefault(instance_id, set()).update(stuck.intersection(targets))
+            for instance_id in list(self._leftovers):
+                self._leftovers[instance_id] &= stuck
+                if not self._leftovers[instance_id]:
+                    del self._leftovers[instance_id]
+            self._sync_dual_topics()
             self._close_unshared_controllers()
+            if stuck:
+                raise RuntimeError(f"关节采集未能停止：{self._describe(sorted(stuck))}；保留线程，可再次停止")
 
     def _close_unshared_controllers(self) -> None:
         """Close CAN clients opened only for this card; others belong to the hand card."""
@@ -826,4 +841,6 @@ class JointsPlugin:
             return {"action": "get_state", **self._target_fields(side, channel, targets),
                     "valid": all(h["valid"] for h in hands.values()), "hands": hands}
 
-        return {"state": "error", "message": f"Unknown action: {action}"}
+        # Plugin contract (README_dev.md): None, which the MCP handler reports
+        # as an error instead of wrapping it as a successful result.
+        return None
