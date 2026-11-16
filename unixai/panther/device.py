@@ -180,7 +180,7 @@ class PantherDevice:
         self._node.create_subscription(
             BatteryState,
             "/battery_state_broadcaster/battery_state",
-            guarded("robot_state", self._on_battery),
+            guarded("battery", self._on_battery),
             sensor_qos,
         )
         self._node.create_subscription(
@@ -263,6 +263,13 @@ class PantherDevice:
     @property
     def topics(self):
         return self._topics
+
+    def schema_joint_limits_deg(self) -> dict[str, tuple[float, float]]:
+        """Expose bundled limits for registration-time UI hints only."""
+        return {
+            name: (math.degrees(lower), math.degrees(upper))
+            for name, (lower, upper) in self._model_joint_limits.items()
+        }
 
     def start(self) -> None:
         self._bridge.start()
@@ -375,8 +382,12 @@ class PantherDevice:
         self._publish_robot_state(force=True)
 
     def _on_battery(self, msg) -> None:
-        self._put("battery", msg)
-        self._publish_robot_state()
+        received = self._put("battery", msg)
+        self._publish_limited(
+            "battery",
+            {"available": True, **self._battery_payload(msg, received)},
+            2.0,
+        )
 
     def _on_gripper(self, side: str, msg) -> None:
         self._put(f"gripper_{side}", msg)
@@ -663,6 +674,7 @@ class PantherDevice:
                     **self._callback_health(card)}
         builders = {
             "joints": self._joints_payload,
+            "battery": self._battery_payload,
             "imu": self._imu_payload,
             "laser_scan": self._laser_payload,
         }
@@ -674,8 +686,6 @@ class PantherDevice:
         hardware, hardware_at = self._get("hardware_states")
         event, event_at = self._get("hardware_event")
         joints, joints_at = self._get("joints")
-        battery, battery_at = self._get("battery")
-        lifting, lifting_at = self._get("lifting")
         controllers, controllers_at = self._get("controllers")
         reasons = []
         if not fresh(joints_at):
@@ -695,10 +705,8 @@ class PantherDevice:
                 "count": len(statuses), "worst_level": worst,
                 "problems": sorted(problems),
             }
-        state_available = any(
-            item is not None for item in (diagnostics, hardware, joints, battery, lifting)
-        )
-        newest = max((stamp for stamp in (diag_at, hardware_at, joints_at, battery_at, lifting_at)
+        state_available = any(item is not None for item in (diagnostics, hardware, joints))
+        newest = max((stamp for stamp in (diag_at, hardware_at, joints_at)
                       if stamp is not None), default=None)
         available = state_available and controllers is not None
         state_fresh = fresh(newest, 5.0)
@@ -710,11 +718,6 @@ class PantherDevice:
             "ready_for_motion": not reasons,
             "not_ready_reasons": reasons,
             "joint_state": {"available": joints is not None, "fresh": fresh(joints_at), "age_ms": age_ms(joints_at)},
-            "battery": ({"available": False, "fresh": False}
-                        if battery is None else {"available": True, **self._battery_payload(battery, battery_at)}),
-            "grippers": self.gripper_state(),
-            "lifting": ({"available": False, "fresh": False}
-                        if lifting is None else {"available": True, **self._lifting_payload(lifting, lifting_at)}),
             "controllers": {
                 "available": controllers is not None,
                 "fresh": fresh(controllers_at, 3.0),
@@ -725,9 +728,12 @@ class PantherDevice:
             "diagnostics": {"available": diagnostics is not None, "fresh": fresh(diag_at, 5.0),
                             "age_ms": age_ms(diag_at), "summary": diagnostic_summary},
             "hardware_states": {"available": hardware is not None, "fresh": fresh(hardware_at, 5.0),
-                                "age_ms": age_ms(hardware_at), "data": _message_dict(hardware)},
+                                "age_ms": age_ms(hardware_at)},
             "last_hardware_event": {"available": event is not None, "age_ms": age_ms(event_at),
-                                    "data": _message_dict(event)},
+                                    "name": getattr(event, "name", None),
+                                    "level": (byte_value(event.level, "hardware_event.level")
+                                              if event is not None else None),
+                                    "message": getattr(event, "message", None)},
             "estop": {"reported": False, "message": "No ROS emergency-stop state was identified"},
             **self._callback_health("robot_state"),
         }
@@ -1214,11 +1220,14 @@ class PantherDevice:
             return {"state": "ready", "feedback": feedback, "controllers": states,
                     "limits_m": [minimum, maximum], "limit_source": limit_source,
                     "joint_name": joint_name}
-        if action != "set_position":
+        if action not in ("set_position", "home"):
             raise ValueError(f"unsupported lifting action: {action}")
         self._ensure_motion_ready()
         self._require_controller("lifting_controller")
-        position = finite_number(args.get("position_m"), "position_m")
+        configured = self._cfg["plugins"].get("lifting", {})
+        position = (finite_number(configured.get("home_position_m", 0.6), "home_position_m")
+                    if action == "home" else
+                    finite_number(args.get("position_m"), "position_m"))
         minimum, maximum, limit_source, joint_name = self._lifting_limits()
         if maximum < minimum:
             raise RuntimeError("lifting limits are invalid; refusing motion")
@@ -1229,16 +1238,16 @@ class PantherDevice:
         message.name = [""]; message.position = [position]
         message.velocity = []; message.effort = []
         self._lifting_pub.publish(message)
-        return {"state": "commanded", "position_m": position,
+        return {"state": "commanded", "action": action, "position_m": position,
                 "limits_m": [minimum, maximum], "limit_source": limit_source,
                 "joint_name": joint_name}
 
     def head(self, args: dict) -> dict:
-        from std_msgs.msg import Float64MultiArray
         action = args.get("action", "look")
         if action in ("start", "info"):
             with self._head_lock:
-                active = ({"action_id": self._head_active["action_id"]}
+                active = ({key: self._head_active[key] for key in
+                           ("action_id", "action", "speed", "speed_deg_s")}
                           if self._head_active else None)
             states = self.controller_states()
             self._require_states(states, {"head_forward_position_controller": "active"})
@@ -1292,33 +1301,45 @@ class PantherDevice:
                     f"{name} target {math.degrees(value):.2f} deg is outside URDF limit "
                     f"[{math.degrees(lower):.2f}, {math.degrees(upper):.2f}] deg"
                 )
+        speed_name = "low" if action == "home" else str(args.get("speed", "high"))
+        if speed_name not in ("low", "high"):
+            raise ValueError("speed must be low or high")
+        speed_deg_s = finite_number(cfg.get(f"{speed_name}_speed_deg_s"),
+                                    f"{speed_name}_speed_deg_s")
+        if speed_deg_s <= 0:
+            raise ValueError(f"{speed_name}_speed_deg_s must be positive")
+        publish_rate_hz = finite_number(cfg.get("publish_rate_hz", 20.0),
+                                        "publish_rate_hz")
+        if publish_rate_hz <= 0:
+            raise ValueError("publish_rate_hz must be positive")
+
         self._stop_head("replaced_by_new_command", wait_s=5.0)
-        if action == "look":
-            message = Float64MultiArray(); message.data = target
-            self._head_pub.publish(message)
-            return {"state": "commanded", "yaw_deg": math.degrees(target[0]),
-                    "pitch_deg": math.degrees(target[1])}
 
         action_id = str(args.get("action_id") or f"panther_head_{uuid4().hex[:12]}")
-        active = {"action_id": action_id, "stop": threading.Event(), "thread": None}
+        active = {"action_id": action_id, "action": action, "speed": speed_name,
+                  "speed_deg_s": speed_deg_s, "publish_rate_hz": publish_rate_hz,
+                  "stop": threading.Event(), "thread": None}
         with self._head_lock:
             self._head_active = active
-            thread = threading.Thread(target=self._run_head_home,
+            thread = threading.Thread(target=self._run_head_motion,
                                       args=(active, [float(current[name]) for name in HEAD_JOINTS], target),
-                                      daemon=True, name="panther_head_home")
+                                      daemon=True, name=f"panther_head_{action}")
             active["thread"] = thread
             thread.start()
         return {"state": "queued", "action_id": action_id,
+                "action": action, "speed": speed_name, "speed_deg_s": speed_deg_s,
                 "yaw_deg": math.degrees(target[0]), "pitch_deg": math.degrees(target[1])}
 
-    def _run_head_home(self, active: dict, start: list[float], target: list[float]) -> None:
+    def _run_head_motion(self, active: dict, start: list[float], target: list[float]) -> None:
         from std_msgs.msg import Float64MultiArray
-        cfg = self._cfg["plugins"].get("head", {})
-        rate = float(cfg.get("home_publish_rate_hz", 20.0))
-        speed = math.radians(float(cfg.get("home_speed_deg_s", 20.0)))
-        steps = max(1, int(max(abs(b - a) for a, b in zip(start, target)) / speed * rate))
+        rate = active["publish_rate_hz"]
+        speed = math.radians(active["speed_deg_s"])
+        distance = max(abs(b - a) for a, b in zip(start, target))
+        steps = max(1, math.ceil(distance / speed * rate))
         status = "completed"
-        result = {"yaw_deg": math.degrees(target[0]), "pitch_deg": math.degrees(target[1])}
+        result = {"action": active["action"], "speed": active["speed"],
+                  "speed_deg_s": active["speed_deg_s"],
+                  "yaw_deg": math.degrees(target[0]), "pitch_deg": math.degrees(target[1])}
         try:
             for index in range(1, steps + 1):
                 if active["stop"].wait(1.0 / rate):

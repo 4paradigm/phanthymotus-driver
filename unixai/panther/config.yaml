@@ -10,6 +10,7 @@ ros:
 plugins:
   joints: {enabled: true}
   robot_state: {enabled: true}
+  battery: {enabled: true}
   imu: {enabled: true}
   odom: {enabled: true}
   laser_scan: {enabled: true}
@@ -71,14 +72,16 @@ plugins:
     enabled: true
     min_position_m: 0.0
     max_position_m: 0.8
+    home_position_m: 0.6
   head:
     enabled: true
     yaw_min_deg: -90.0
     yaw_max_deg: 90.0
     pitch_min_deg: -86.0
     pitch_max_deg: 20.0
-    home_speed_deg_s: 20.0
-    home_publish_rate_hz: 20.0
+    high_speed_deg_s: 20.0
+    low_speed_deg_s: 10.0
+    publish_rate_hz: 20.0
     # Runtime-verified channel order: yaw -> joint_head0, pitch -> joint_head1.
     home_pose_deg: {yaw_deg: 0.0, pitch_deg: 0.0}
 

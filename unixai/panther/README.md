@@ -14,7 +14,7 @@ required for discovery.
 
 ## Implemented cards
 
-- Sensors: `joints`/`model`, consolidated `robot_state`, `imu`, `odom`,
+- Sensors: `joints`/`model`, compact `robot_state`, `battery`, `imu`, `odom`,
   merged `laser_scan`, lazy `camera_color`, and lazy `camera_depth`.
 - Actuators: `base_drive`, `arm_control`, `gripper`, `lifting`, and `head`.
 
@@ -24,12 +24,12 @@ model resource atomically switches both the returned URDF and the `joints`
 rendering indices to that same live snapshot. The response includes its source
 and SHA-256 digest so a renderer can identify the active morphology. Live
 `/robot_description` also remains authoritative for motion limits. `joints`,
-`imu`, `odom`, `robot_state`, and `laser_scan` are rate limited before crossing
+`imu`, `odom`, `robot_state`, `battery`, and `laser_scan` are rate limited before crossing
 the per-card domain-42 bridge.
 
-`robot_state` combines the low-rate battery, compact diagnostics, hardware
-events, controller states, gripper feedback, lifting feedback, and explicit
-`not_ready_reasons`. High-rate or typed streams remain separate. `laser_scan`
+`robot_state` contains compact readiness, controller, diagnostic, and hardware
+summaries. Battery measurements use the separate `battery` card; gripper and
+lifting feedback are available from their actuator cards. `laser_scan`
 consumes only `/scan`, whose publisher on Panther is the existing
 `dual_lidar_merger`; this driver performs no second lidar fusion, but pools each
 angular bin to its nearest valid return and reports scan quality.

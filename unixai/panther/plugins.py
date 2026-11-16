@@ -180,7 +180,8 @@ def build_plugins(config, namespace, device):
     if on("joints"):
         plugins.append(JointsPlugin(device, "joints", "Panther live URDF skeleton and joint state", ["joints"]))
     for name, description in (
-        ("robot_state", "Panther low-rate health, battery, controllers, grippers and lifting state"),
+        ("robot_state", "Panther motion readiness, controller, diagnostic and hardware summary"),
+        ("battery", "Panther battery percentage, voltage, current, temperature and power status"),
         ("imu", "Panther IMU state"),
         ("odom", "Panther wheel odometry"),
     ):
@@ -205,40 +206,65 @@ def build_plugins(config, namespace, device):
         schema = _action_schema(
             ["start", "info", "move", "stop", "cancel"],
             {
-                "linear_x": {"type": "number", "minimum": -cfg["max_linear_mps"], "maximum": cfg["max_linear_mps"]},
-                "linear_y": {"type": "number", "minimum": -cfg["max_linear_mps"], "maximum": cfg["max_linear_mps"]},
+                "linear_x": {"type": "number", "minimum": -cfg["max_linear_mps"], "maximum": cfg["max_linear_mps"],
+                             "description": f"[-{cfg['max_linear_mps']:g}, {cfg['max_linear_mps']:g}] m/s; +forward, -backward"},
+                "linear_y": {"type": "number", "minimum": -cfg["max_linear_mps"], "maximum": cfg["max_linear_mps"],
+                             "description": f"[-{cfg['max_linear_mps']:g}, {cfg['max_linear_mps']:g}] m/s; +left, -right"},
                 "angular_z_deg_s": {"type": "number", "minimum": -cfg["max_angular_deg_s"], "maximum": cfg["max_angular_deg_s"],
-                                    "description": "Horizontal turn rate in degrees per second"},
-                "duration_s": {"type": "number", "minimum": 0.1, "maximum": cfg["max_duration_s"]},
+                                    "description": f"[-{cfg['max_angular_deg_s']:g}, {cfg['max_angular_deg_s']:g}] deg/s; +turn left, -turn right"},
+                "duration_s": {"type": "number", "minimum": 0.1, "maximum": cfg["max_duration_s"],
+                               "description": f"[0.1, {cfg['max_duration_s']:g}] s; auto-stops when elapsed"},
             },
-            {"move": {"params": ["linear_x", "linear_y", "angular_z_deg_s", "duration_s"]},
-             "stop": {"params": []}, "cancel": {"params": []},
-             "start": {"params": []}, "info": {"params": []}},
+            {"move": {"params": ["linear_x", "linear_y", "angular_z_deg_s", "duration_s"],
+                      "description": "Move with bounded velocity for a finite duration"},
+             "stop": {"params": [], "description": "Stop immediately"},
+             "cancel": {"params": [], "description": "Cancel the active move and stop"},
+             "start": {"params": [], "description": "Check controller readiness"},
+             "info": {"params": [], "description": "Read controller readiness"}},
             "base",
             {"actions": ["move"], "timeout": cfg["max_duration_s"] + 10},
             True,
         )
         plugins.append(ActuatorPlugin(device, "base_drive", "Finite-duration omnidirectional Panther base drive", schema, device.drive))
     if on("arm_control"):
+        joint_limits = device.schema_joint_limits_deg() or {}
+
+        def joint_field(name: str, label: str) -> dict:
+            lower, upper = joint_limits.get(name, (None, None))
+            prefix = (f"[{lower:.1f}, {upper:.1f}] deg; "
+                      if lower is not None and upper is not None else "Live URDF range; ")
+            max_delta = enabled["arm_control"].get("max_target_delta_deg", 20.0)
+            field = {"type": "number", "description": prefix + label + f"; max {max_delta:g} deg change per command"}
+            if lower is not None and upper is not None:
+                field.update(minimum=lower, maximum=upper)
+            return field
+
         joint_fields = {
-            **{f"la{i}_deg": {"type": "number", "description": f"Left arm joint la{i} target in degrees; omitted joints hold their current positions"}
+            **{f"la{i}_deg": joint_field(f"joint_la{i}", f"left arm joint la{i}")
                for i in range(8)},
-            **{f"ra{i}_deg": {"type": "number", "description": f"Right arm joint ra{i} target in degrees; omitted joints hold their current positions"}
+            **{f"ra{i}_deg": joint_field(f"joint_ra{i}", f"right arm joint ra{i}")
                for i in range(8)},
         }
         schema = _action_schema(
             ["start", "info", "move", "home", "stop"],
             {
-                "side": {"type": "string", "enum": ["left", "right", "both"]},
+                "side": {"type": "string", "enum": ["left", "right", "both"],
+                         "description": "left, right, or both arms"},
                 **joint_fields,
-                "positions_deg": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8},
-                "left_positions_deg": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8},
-                "right_positions_deg": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8},
-                "duration_s": {"type": "number", "minimum": 1.0, "maximum": enabled["arm_control"]["max_duration_s"]},
+                "positions_deg": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8,
+                                  "description": "8 joint targets in deg; selected arm; live URDF limits"},
+                "left_positions_deg": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8,
+                                       "description": "8 left-arm targets in deg; live URDF limits"},
+                "right_positions_deg": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8,
+                                        "description": "8 right-arm targets in deg; live URDF limits"},
+                "duration_s": {"type": "number", "minimum": 1.0, "maximum": enabled["arm_control"]["max_duration_s"],
+                               "description": f"[1, {enabled['arm_control']['max_duration_s']:g}] s"},
             },
-            {"move": {"params": ["side", *joint_fields, "duration_s"]},
-             "home": {"params": ["side"]},
-             "stop": {"params": []}, "start": {"params": []}, "info": {"params": []}},
+            {"move": {"params": ["side", *joint_fields, "duration_s"], "description": "Move selected arm joints"},
+             "home": {"params": ["side"], "description": "Move selected arms to the verified home pose"},
+             "stop": {"params": [], "description": "Cancel the active arm motion"},
+             "start": {"params": [], "description": "Check controller and feedback readiness"},
+             "info": {"params": [], "description": "Read controller and feedback readiness"}},
             ["arm_l", "arm_r"],
             {"actions": ["move", "home"], "timeout": enabled["arm_control"]["max_duration_s"] + 15},
             True,
@@ -247,35 +273,45 @@ def build_plugins(config, namespace, device):
     if on("gripper"):
         schema = _action_schema(
             ["start", "info", "set", "open", "close", "stop"],
-            {"side": {"type": "string", "enum": ["left", "right", "both"], "default": "both"},
-             "position": {"type": "number", "minimum": 0.0, "maximum": 1.0}},
-            {"set": {"params": ["side", "position"]},
-             "open": {"params": ["side"]},
-             "close": {"params": ["side"]},
-             "stop": {"params": []},
-             "start": {"params": []}, "info": {"params": []}}, ["hand_l", "hand_r"])
+            {"side": {"type": "string", "enum": ["left", "right", "both"], "default": "both",
+                      "description": "left, right, or both grippers"},
+             "position": {"type": "number", "minimum": 0.0, "maximum": 1.0,
+                          "description": "[0, 1]; 0=open, 1=closed"}},
+            {"set": {"params": ["side", "position"], "description": "Set normalized gripper position"},
+             "open": {"params": ["side"], "description": "Open selected grippers"},
+             "close": {"params": ["side"], "description": "Close selected grippers"},
+             "stop": {"params": [], "description": "End the card lifecycle"},
+             "start": {"params": [], "description": "Check controller and feedback readiness"},
+             "info": {"params": [], "description": "Read controller and feedback readiness"}}, ["hand_l", "hand_r"])
         plugins.append(ActuatorPlugin(device, "gripper", "Left/right Panther gripper position control", schema, device.gripper))
     if on("lifting"):
         schema = _action_schema(
-            ["start", "info", "set_position", "stop"],
-            {"position_m": {"type": "number", "minimum": enabled["lifting"].get("min_position_m", 0.0), "maximum": enabled["lifting"]["max_position_m"]}},
-            {"set_position": {"params": ["position_m"]},
-             "stop": {"params": []},
-             "start": {"params": []}, "info": {"params": []}}, "waist")
+            ["start", "info", "set_position", "home", "stop"],
+            {"position_m": {"type": "number", "minimum": enabled["lifting"].get("min_position_m", 0.0), "maximum": enabled["lifting"]["max_position_m"],
+                            "description": f"[{enabled['lifting'].get('min_position_m', 0.0):g}, {enabled['lifting']['max_position_m']:g}] m"}},
+            {"set_position": {"params": ["position_m"], "description": "Set lifting height"},
+             "home": {"params": [], "description": f"Move to {enabled['lifting'].get('home_position_m', 0.6):g} m home height"},
+             "stop": {"params": [], "description": "End the card lifecycle"},
+             "start": {"params": [], "description": "Check controller and feedback readiness"},
+             "info": {"params": [], "description": "Read controller and feedback readiness"}}, "waist")
         plugins.append(ActuatorPlugin(device, "lifting", "Panther lifting position control", schema, device.lifting))
     if on("head"):
         schema = _action_schema(
             ["start", "info", "look", "home", "stop"],
             {"yaw_deg": {"type": "number", "minimum": enabled["head"].get("yaw_min_deg", -90.0),
                          "maximum": enabled["head"].get("yaw_max_deg", 90.0),
-                         "description": "Horizontal head angle in degrees"},
+                         "description": f"[{enabled['head'].get('yaw_min_deg', -90.0):g}, {enabled['head'].get('yaw_max_deg', 90.0):g}] deg; +left, -right"},
              "pitch_deg": {"type": "number", "minimum": enabled["head"].get("pitch_min_deg", -86.0),
                            "maximum": enabled["head"].get("pitch_max_deg", 20.0),
-                           "description": "Head pitch angle in degrees"}},
-            {"look": {"params": ["yaw_deg", "pitch_deg"]},
-             "home": {"params": []}, "stop": {"params": []},
-             "start": {"params": []}, "info": {"params": []}}, "head",
-            {"actions": ["home"], "timeout": 30}, True)
+                           "description": f"[{enabled['head'].get('pitch_min_deg', -86.0):g}, {enabled['head'].get('pitch_max_deg', 20.0):g}] deg; +down, -up"},
+             "speed": {"type": "string", "enum": ["low", "high"], "default": "high",
+                       "description": f"low={enabled['head'].get('low_speed_deg_s', 10.0):g} deg/s; high={enabled['head'].get('high_speed_deg_s', 20.0):g} deg/s"}},
+            {"look": {"params": ["yaw_deg", "pitch_deg", "speed"], "description": "Move smoothly to a pan/tilt target"},
+             "home": {"params": [], "description": "Return home at low speed"},
+             "stop": {"params": [], "description": "Cancel the active head motion"},
+             "start": {"params": [], "description": "Check controller and feedback readiness"},
+             "info": {"params": [], "description": "Read controller and feedback readiness"}}, "head",
+            {"actions": ["look", "home"], "timeout": 30}, True)
         plugins.append(ActuatorPlugin(device, "head", "Panther head pan/tilt control using live URDF limits", schema, device.head))
     return plugins
 

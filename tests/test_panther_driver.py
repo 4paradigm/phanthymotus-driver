@@ -34,7 +34,7 @@ camera = _load("camera")
 
 class PantherDriverTest(unittest.TestCase):
     def test_agent_core_can_discover_all_cards_over_mcp(self):
-        card_names = ("joints", "robot_state", "imu", "odom", "laser_scan",
+        card_names = ("joints", "robot_state", "battery", "imu", "odom", "laser_scan",
                       "camera_color", "camera_depth")
 
         class FakeDevice:
@@ -55,8 +55,8 @@ class PantherDriverTest(unittest.TestCase):
                            "max_angular_deg_s": 45.0, "max_duration_s": 10.0},
             "arm_control": {"enabled": True, "max_duration_s": 20.0},
             "gripper": {"enabled": True},
-            "lifting": {"enabled": True, "max_position_m": 0.8},
-            "head": {"enabled": True},
+            "lifting": {"enabled": True, "max_position_m": 0.8, "home_position_m": 0.6},
+            "head": {"enabled": True, "low_speed_deg_s": 10.0, "high_speed_deg_s": 20.0},
         }}
         bundle = DriverBundle(plugins.build_plugins(config, "test", FakeDevice()))
         tools = bundle.get_all_tools()
@@ -71,7 +71,7 @@ class PantherDriverTest(unittest.TestCase):
         class FakeDevice:
             topics = {
                 name: {"topic": f"/test/{name}", "format": "data/json"}
-                for name in ("joints", "robot_state", "imu", "odom", "laser_scan",
+                for name in ("joints", "robot_state", "battery", "imu", "odom", "laser_scan",
                              "camera_color", "camera_depth")
             }
 
@@ -81,10 +81,12 @@ class PantherDriverTest(unittest.TestCase):
         config = {"plugins": {
             "base_drive": {"enabled": True, "max_linear_mps": 0.5,
                            "max_angular_deg_s": 45.0, "max_duration_s": 10.0},
-            "arm_control": {"enabled": True, "max_duration_s": 20.0},
+            "arm_control": {"enabled": True, "max_duration_s": 20.0,
+                            "max_target_delta_deg": 20.0},
             "gripper": {"enabled": True},
-            "lifting": {"enabled": True, "max_position_m": 0.8},
-            "head": {"enabled": True},
+            "lifting": {"enabled": True, "max_position_m": 0.8, "home_position_m": 0.6},
+            "head": {"enabled": True, "low_speed_deg_s": 10.0,
+                     "high_speed_deg_s": 20.0},
         }}
         tools = {plugin.name: plugin.get_tool()
                  for plugin in plugins.build_plugins(config, "test", FakeDevice())}
@@ -93,6 +95,8 @@ class PantherDriverTest(unittest.TestCase):
         self.assertEqual(base["x-completion"]["actions"], ["move"])
         self.assertEqual(base["properties"]["angular_z_deg_s"]["maximum"], 45.0)
         self.assertEqual(base["properties"]["duration_s"]["maximum"], 10.0)
+        self.assertIn("+forward", base["properties"]["linear_x"]["description"])
+        self.assertIn("+left", base["properties"]["linear_y"]["description"])
         arm = tools["arm_control"]["inputSchema"]
         self.assertTrue({"move", "home", "stop"} <= set(arm["properties"]["action"]["enum"]))
         self.assertTrue({"la0_deg", "la7_deg", "ra0_deg", "ra7_deg"} <= set(arm["properties"]))
@@ -100,14 +104,19 @@ class PantherDriverTest(unittest.TestCase):
         gripper = tools["gripper"]["inputSchema"]
         self.assertEqual(gripper["properties"]["side"]["enum"], ["left", "right", "both"])
         self.assertTrue({"set", "open", "close", "stop"} <= set(gripper["properties"]["action"]["enum"]))
-        self.assertEqual(gripper["x-action-params"]["stop"], {"params": []})
+        self.assertEqual(gripper["x-action-params"]["stop"]["params"], [])
         self.assertNotIn("mode", gripper["properties"])
         lifting = tools["lifting"]["inputSchema"]
-        self.assertIn("stop", lifting["properties"]["action"]["enum"])
-        self.assertEqual(lifting["x-action-params"]["stop"], {"params": []})
+        self.assertTrue({"home", "stop"} <= set(lifting["properties"]["action"]["enum"]))
+        self.assertIn("0.6 m", lifting["x-action-params"]["home"]["description"])
+        self.assertEqual(lifting["x-action-params"]["stop"]["params"], [])
         head = tools["head"]["inputSchema"]
         self.assertTrue({"look", "home", "stop"} <= set(head["properties"]["action"]["enum"]))
         self.assertTrue({"yaw_deg", "pitch_deg"} <= set(head["properties"]))
+        self.assertEqual(head["properties"]["speed"]["enum"], ["low", "high"])
+        self.assertEqual(head["properties"]["speed"]["default"], "high")
+        self.assertEqual(head["x-action-params"]["home"]["params"], [])
+        self.assertEqual(set(head["x-completion"]["actions"]), {"look", "home"})
         expected_hooks = {
             "on_interrupt_motion": {"action": "stop"},
             "on_interrupt_all": {"action": "stop"},
@@ -126,6 +135,24 @@ class PantherDriverTest(unittest.TestCase):
             device.count("single position command: nothing is in flight in this driver"),
             2,
         )
+
+    def test_state_and_battery_are_separate_streams(self):
+        device = (DRIVER / "device.py").read_text()
+        robot_state = device.split("    def robot_state(self)", 1)[1].split(
+            "    def lifting_state(self)", 1
+        )[0]
+        self.assertNotIn('"battery"', robot_state)
+        self.assertIn('self._publish_limited(\n            "battery"', device)
+
+    def test_lifting_home_and_head_speed_profiles_are_configured(self):
+        config = (DRIVER / "config.yaml").read_text()
+        device = (DRIVER / "device.py").read_text()
+        self.assertIn("home_position_m: 0.6", config)
+        self.assertIn("high_speed_deg_s: 20.0", config)
+        self.assertIn("low_speed_deg_s: 10.0", config)
+        self.assertIn('if action == "home" else', device)
+        self.assertIn('speed_name = "low" if action == "home"', device)
+        self.assertIn("math.ceil(distance / speed * rate)", device)
 
     def test_head_channels_follow_physical_robot_mapping(self):
         current = {"joint_head0": 0.0, "joint_head1": 0.0}
@@ -239,16 +266,17 @@ class PantherDriverTest(unittest.TestCase):
     def test_manifest_lists_expected_cards(self):
         driver_text = (DRIVER / "driver.yaml").read_text()
         cards = set(re.findall(r"name:\s*([a-z_]+)", driver_text))
-        expected = {"joints", "model", "robot_state", "imu", "odom", "laser_scan",
+        expected = {"joints", "model", "robot_state", "battery", "imu", "odom", "laser_scan",
                     "camera_color", "camera_depth", "base_drive", "arm_control",
                     "gripper", "lifting", "head"}
         self.assertTrue(expected <= cards)
-        self.assertFalse({"robot_status", "battery", "gripper_state", "lifting_state",
+        self.assertFalse({"robot_status", "gripper_state", "lifting_state",
                           "ultrasonic", "nav", "servo"} & cards)
 
     def test_bridge_exposes_consolidated_state_merged_lidar_and_typed_media(self):
         topics = core_bridge.output_topics("test")
         self.assertEqual(topics["robot_state"]["format"], "data/json")
+        self.assertEqual(topics["battery"]["topic"], "/test/panther/battery")
         self.assertEqual(topics["laser_scan"]["topic"], "/test/panther/laser_scan")
         self.assertEqual(topics["laser_view"]["format"], "image/jpeg")
         self.assertEqual(topics["camera_color"]["format"], "image/jpeg")

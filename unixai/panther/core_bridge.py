@@ -13,6 +13,7 @@ import threading
 TOPIC_SUFFIXES = {
     "joints": ("joints", "sensor/skeleton"),
     "robot_state": ("robot_state", "data/json"),
+    "battery": ("battery", "data/json"),
     "imu": ("imu", "data/json"),
     "odom": ("odom", "state/odom"),
     "laser_scan": ("laser_scan", "data/json"),
