@@ -3,13 +3,15 @@ import importlib.util
 import io
 import json
 import math
+import struct
+import threading
 from pathlib import Path
 import time
 import types
 import unittest
 from unittest.mock import patch
 
-from test_driver import driver, FakeRos1, FakeNode, ROOT, peripherals_module
+from test_driver import driver, FakeRos1, FakeNode, ROOT, peripherals_module, wait_until
 Peripherals, battery_sample = peripherals_module.Peripherals, peripherals_module.battery_sample
 
 
@@ -28,11 +30,12 @@ class PeripheryTests(unittest.TestCase):
                    ('/battery', 4), ('/jaten_behavior_manager/out/leju/battery', 2))}
         sample = battery_sample({'sources': sources}, now)
         self.assertTrue(sample['valid'])
-        self.assertEqual(sample['soc'], 96.5)
-        self.assertIsNone(sample['voltage'])
-        self.assertEqual(sample['current'], -3.2)
-        self.assertEqual(sample['sources']['/battery']['status'], 4)
-        self.assertEqual(sample['sources']['/jaten_behavior_manager/out/leju/battery']['status'], 2)
+        self.assertEqual(sample['main_soc_percent'], 96.5)
+        self.assertIsNone(sample['main_voltage_v'])
+        self.assertEqual(sample['main_current_a'], -3.2)
+        self.assertEqual(sample['main_status_code'], 4)
+        self.assertEqual(sample['chassis_status_code'], 2)
+        self.assertTrue(all(not isinstance(value, (dict, list)) for value in sample.values()))
 
     def test_stale_battery_aggregate_cannot_refresh_old_source(self):
         now = int(time.time() * 1000)
@@ -47,7 +50,7 @@ class PeripheryTests(unittest.TestCase):
         result = battery_sample({'sources': {'/battery': {'received_ms': now, 'values':
                                 {'percentage': 90., 'voltage': math.nan, 'health': math.inf}}}}, now)
         json.dumps(result, allow_nan=False)
-        self.assertIsNone(result['voltage'])
+        self.assertIsNone(result['main_voltage_v'])
 
     def test_laser_null_ranges_and_points_use_actual_laser_frame(self):
         self.periphery.dispatch('laser_scan', 'start')
@@ -58,38 +61,50 @@ class PeripheryTests(unittest.TestCase):
         raw = json.loads(self.periphery._pubs['laser_scan'].messages[-1].data)
         self.assertEqual(raw['frame_id'], 'laser')
         self.assertEqual(raw['ranges'], [1., 2., None, None, None])
-        points = json.loads(self.periphery._points_pub.messages[-1].data)
+        payload = self.periphery._points_pub.messages[-1].data
+        step, count = struct.unpack_from('<II', payload)
+        self.assertEqual(step, 16)
+        points = [struct.unpack_from('<ffff', payload, 8+i*step) for i in range(count)]
         self.assertEqual(len(points), 2)
-        self.assertAlmostEqual(points[0]['x'], 1.)
-        self.assertAlmostEqual(points[1]['y'], 2.)
+        self.assertAlmostEqual(points[0][0], 1.)
+        self.assertAlmostEqual(points[1][1], 2.)
 
     def test_bad_laser_invalidates_previous_measurement(self):
         self.periphery._on_scan({'ranges': [1.]})
         self.assertFalse(self.periphery.snapshot('laser_scan')['valid'])
 
+    def test_pointcloud_is_first_output_and_has_native_binary_envelope(self):
+        tool = next(t for t in self.periphery.tools() if t['name'] == 'laser_scan')
+        self.assertEqual([t['format'] for t in tool['topic_out']], ['sensor/pointcloud', 'data/json'])
+        self.periphery.dispatch('laser_scan', 'start')
+        self.periphery.tick()
+        self.assertEqual(struct.unpack('<II', self.periphery._points_pub.messages[-1].data), (16, 0))
+        qos = peripherals_module.latest_qos()
+        self.assertEqual((qos.depth, qos.reliability), (1, 'best_effort'))
+
     def test_camera_publishes_native_compressed_image_once_per_received_frame(self):
-        self.periphery.dispatch('camera_rgb', 'start')
+        self.periphery.dispatch('camera_left', 'start')
         payload = {'data': base64.b64encode(b'\xff\xd8test\xff\xd9').decode(), 'header': {'frame_id': 'camera'}}
         self.ros.subscriptions['/camera_1/color/image_raw/compressed'][1](payload)
         self.periphery.tick()
         self.periphery.tick()
-        messages = self.periphery._image_pubs['camera_rgb'].messages
+        messages = self.periphery._image_pubs['camera_left'].messages
         self.assertEqual(len(messages), 1)
-        self.assertEqual(messages[0].data, b'\xff\xd8test\xff\xd9')
+        self.assertEqual(bytes(messages[0].data), b'\xff\xd8test\xff\xd9')
         self.assertEqual(messages[0].format, 'jpeg')
         self.assertEqual(messages[0].header.frame_id, 'camera')
 
     def test_camera_stop_drops_late_frames_without_disabling_shared_hardware(self):
-        self.periphery.dispatch('camera_rgb', 'start')
+        self.periphery.dispatch('camera_left', 'start')
         callback = self.ros.subscriptions['/camera_1/color/image_raw/compressed'][1]
-        self.periphery.dispatch('camera_rgb', 'stop')
+        self.periphery.dispatch('camera_left', 'stop')
         callback({'data': base64.b64encode(b'\xff\xd8x\xff\xd9').decode()})
         self.periphery.tick()
-        self.assertFalse(self.periphery.snapshot('camera_rgb')['valid'])
+        self.assertFalse(self.periphery.snapshot('camera_left')['valid'])
         self.assertEqual(self.ros.services, [])
 
     def test_camera_reconnect_rebinds_and_only_invokes_camera_enable(self):
-        self.periphery.dispatch('camera_rgb', 'start')
+        self.periphery.dispatch('camera_left', 'start')
         self.ros.connection = (True, 2)
         with patch.object(peripherals_module.threading, 'Thread') as thread:
             self.periphery.tick()
@@ -101,22 +116,22 @@ class PeripheryTests(unittest.TestCase):
         self.assertEqual(self.ros.published, [])
 
     def test_invalid_or_oversized_camera_payload_never_publishes(self):
-        self.periphery.dispatch('camera_rgb', 'start')
+        self.periphery.dispatch('camera_left', 'start')
         for value in ('invalid-base64', 'x' * 1_500_001, base64.b64encode(b'notjpeg').decode()):
-            self.periphery._on_image('camera_rgb', {'data': value}, 1)
-            self.assertFalse(self.periphery.snapshot('camera_rgb')['valid'])
+            self.periphery._on_image('camera_left', {'data': value}, 1)
+            self.assertFalse(self.periphery.snapshot('camera_left')['valid'])
 
     def test_camera_preserves_source_timestamp_and_rejects_bad_header(self):
-        self.periphery.dispatch('camera_rgb', 'start')
+        self.periphery.dispatch('camera_left', 'start')
         payload = {'data': base64.b64encode(b'\xff\xd8test\xff\xd9').decode(),
                    'header': {'frame_id': '', 'stamp': {'secs': 123, 'nsecs': 456}}}
-        self.periphery._on_image('camera_rgb', payload, 1)
+        self.periphery._on_image('camera_left', payload, 1)
         self.periphery.tick()
-        stamp = self.periphery._image_pubs['camera_rgb'].messages[-1].header.stamp
+        stamp = self.periphery._image_pubs['camera_left'].messages[-1].header.stamp
         self.assertEqual((stamp.sec, stamp.nanosec), (123, 456))
         payload['header'] = []
-        self.periphery._on_image('camera_rgb', payload, 1)
-        self.assertFalse(self.periphery.snapshot('camera_rgb')['valid'])
+        self.periphery._on_image('camera_left', payload, 1)
+        self.assertFalse(self.periphery.snapshot('camera_left')['valid'])
 
     def test_background_start_cannot_start_actuator_cards(self):
         bundle = driver.KuavoBundle({'sensors': {'auto_start': ['arm', 'loco', 'switch_mode', 'battery', 'imu']}},
@@ -129,6 +144,53 @@ class PeripheryTests(unittest.TestCase):
             self.assertEqual(self.ros.published, [])
         finally:
             bundle.close()
+
+    def test_head_camera_reads_jpeg_without_chassis_enable_service(self):
+        self.periphery.dispatch('camera_head', 'start')
+        self.periphery.tick()
+        self.assertIn('/camera_head/color/image_raw/compressed', self.ros.subscriptions)
+        self.assertEqual(self.ros.services, [])
+
+    def test_cameras_use_independent_clients_and_publish_latest_without_blocking_each_other(self):
+        clients = []
+        class Client(FakeRos1):
+            def start(self):
+                self.started = True
+            def close(self):
+                self.closed = True
+        def factory():
+            client = Client()
+            clients.append(client)
+            return client
+        p = Peripherals(self.ros, FakeNode(), 'test', media_factory=factory)
+        entered, release = threading.Event(), threading.Event()
+        left = p._image_pubs['camera_left']
+        publish = left.publish
+        def blocked(msg):
+            entered.set()
+            release.wait(2)
+            publish(msg)
+        left.publish = blocked
+        payload = lambda data: {'data': base64.b64encode(b'\xff\xd8'+data+b'\xff\xd9').decode()}
+        try:
+            p.start()
+            for card in ('camera_left', 'camera_right'):
+                p.dispatch(card, 'start')
+            p._on_image('camera_left', payload(b'first'), 1)
+            self.assertTrue(entered.wait(1))
+            for i in range(10):
+                p._on_image('camera_left', payload(str(i).encode()), 1)
+            p._on_image('camera_right', payload(b'right'), 1)
+            self.assertTrue(wait_until(lambda: len(p._image_pubs['camera_right'].messages) == 1))
+            self.assertNotIn('/camera_1/color/image_raw/compressed', self.ros.subscriptions)
+            self.assertTrue(all(c.started for c in clients))
+            release.set()
+            self.assertTrue(wait_until(lambda: len(left.messages) == 2))
+            self.assertEqual(bytes(left.messages[-1].data), b'\xff\xd89\xff\xd9')
+        finally:
+            release.set()
+            p.close()
+        self.assertTrue(all(c.closed for c in clients))
 
 
 class HostManagerTests(unittest.TestCase):
@@ -173,6 +235,29 @@ class HostManagerTests(unittest.TestCase):
                 self.assertTrue(self.module.ensure_services()['requested'])
         self.assertEqual(run.call_args.args[0], ['systemctl', 'start', '--no-block',
                          'kuavo5w-rosbridge.service', 'kuavo5w-battery-relay.service'])
+
+    def test_manager_can_only_add_fixed_installed_head_camera_unit(self):
+        with patch.object(self.module.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+            with patch.object(self.module.socket, 'create_connection'), patch.object(self.module.Path, 'is_file', return_value=True):
+                self.module.ensure_services()
+        self.assertEqual(run.call_args.args[0][-2:], ['kuavo5w-head-camera.service', 'kuavo5w-head-jpeg-relay.service'])
+
+    def test_bridge_tcp_latency_fix_keeps_all_odometry_samples_and_is_process_local(self):
+        spec = importlib.util.spec_from_file_location('kuavo_loopback', ROOT / 'host/rosbridge_loopback.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        calls = []
+        original = lambda *args, **kwargs: calls.append((args, kwargs))
+        rospy = types.SimpleNamespace(Subscriber=original)
+        subscribers = types.SimpleNamespace(Subscriber=original)
+        module.configure_subscribers(rospy, subscribers)
+        subscribers.Subscriber('/odom', 'nav_msgs/Odometry', 'callback')
+        self.assertIs(rospy.Subscriber, original)
+        self.assertEqual(calls, [(('/odom', 'nav_msgs/Odometry', 'callback'),
+                                 {'tcp_nodelay': True, 'buff_size': 2_000_000})])
+        self.assertNotIn('queue_size', calls[0][1])
+        module._listen = lambda *args, **kwargs: kwargs
+        self.assertEqual(module.listen_loopback(None, interface='0.0.0.0'), {'interface': '127.0.0.1'})
 
 
 if __name__ == '__main__':

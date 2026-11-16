@@ -328,7 +328,17 @@ class SensorTests(unittest.TestCase):
         self.assertEqual(sample['vendor']['samples'], 2)
         self.assertEqual(sample['vendor']['stamp_source'], 'received')
         self.assertEqual(self.hub.dispatch('loco_state', 'info')['odom_interface']['provides'], ['vx', 'vy', 'wz'])
-        self.assertEqual(next(t for t in self.hub.tools() if t['name'] == 'loco_state')['topic_out'][0]['format'], 'state/odom')
+        self.assertEqual(next(t for t in self.hub.tools() if t['name'] == 'loco_state')['topic_out'][1]['format'], 'state/odom')
+
+    def test_odometry_is_not_decimated_before_window_averaging(self):
+        ros = FakeRos1()
+        with patch.object(ros, 'subscribe', wraps=ros.subscribe) as subscribe:
+            hub = driver.KuavoSensors({}, 'test', ros, FakeNode())
+        try:
+            call = next(c for c in subscribe.call_args_list if c.args[0] == '/odom')
+            self.assertEqual(call.kwargs.get('throttle_ms', 0), 0)
+        finally:
+            hub.close()
 
     def test_odom_reading_does_not_require_whole_body_controller(self):
         self.hub._profile = None
@@ -398,6 +408,69 @@ class SensorTests(unittest.TestCase):
             self.hub._thread.join(1)
         self.assertIsNone(self.hub._profile)
         self.assertFalse(self.hub._thread.is_alive())
+
+    def test_joints_exposes_skeleton_and_independent_raw_stream(self):
+        tool = next(t for t in self.hub.tools() if t['name'] == 'joints')
+        self.assertEqual([p['format'] for p in tool['topic_out']], ['sensor/skeleton', 'data/json'])
+        self.hub._profile = self.hub._names = None
+        self.ros.raw([.1] * 20, sensor_time={'secs': 0, 'nsecs': 0})
+        raw = self.hub.joint_raw_snapshot()
+        self.assertTrue(raw['valid'])
+        self.assertFalse(raw['model_mapping_verified'])
+        self.assertEqual(raw['joint_q'], [.1] * 20)
+        self.assertEqual(raw['joint_vd'], [2.] * 20)
+        self.assertEqual(raw['joint_torque'], [3.] * 20)
+        self.assertFalse(self.hub.snapshot('joints')['valid'])
+        with self.assertRaises(RuntimeError):
+            self.hub.joint_positions()
+
+    def test_raw_joint_diagnostics_are_bounded_and_cleared_on_reconnect(self):
+        self.ros.raw([.1] * 20)
+        self.assertTrue(self.hub.joint_raw_snapshot()['valid'])
+        self.ros.connection = (True, 2)
+        self.assertFalse(self.hub.joint_raw_snapshot()['valid'])
+        self.hub._on_joint_raw({'joint_data': {'joint_q': [0.] * 257}}, '/sensors_data_raw')
+        self.assertFalse(self.hub.joint_raw_snapshot()['valid'])
+
+    def test_joint_raw_data_is_published_without_runtime_model(self):
+        self.hub._profile = self.hub._names = None
+        self.hub.dispatch('joints', 'start')
+        self.ros.raw([.2] * 20)
+        self.hub.tick()
+        self.assertEqual(json.loads(self.hub._joint_state_pub.messages[-1].data)['joint_q'], [.2] * 20)
+        self.assertEqual(json.loads(self.hub._pubs['joints'].messages[-1].data)['joints'], [])
+
+    def test_loco_display_separates_map_pose_from_navigation_odometry(self):
+        self.odom()
+        self.hub._on_localization({'header': {'frame_id': 'map'}, 'pose': {'pose': {
+            'position': dict(x=4., y=-2., z=0.),
+            'orientation': dict(w=math.sqrt(.5), x=0., y=0., z=math.sqrt(.5))}}})
+        display = self.hub.loco_display()
+        self.assertTrue(display['localization_valid'])
+        self.assertAlmostEqual(display['yaw_deg'], 90.)
+        self.assertEqual((display['x_m'], display['y_m'], display['frame_id']), (4., -2., 'map'))
+        self.assertEqual((display['vx_m_s'], display['vy_m_s'], display['wz_rad_s']), (1., 2., 3.))
+        self.assertIsNone(self.hub.snapshot('loco_state')['pose'])
+        tool = next(t for t in self.hub.tools() if t['name'] == 'loco_state')
+        self.assertEqual([p['format'] for p in tool['topic_out']], ['data/json', 'state/odom'])
+
+    def test_loco_display_falls_back_to_explicit_odom_frame_and_expires(self):
+        self.ros.subscriptions['/odom'][1]({'header': {'frame_id': 'odom'}, 'child_frame_id': 'base_link',
+            'pose': {'pose': {'position': dict(x=1., y=2., z=0.), 'orientation': dict(w=1., x=0., y=0., z=0.)}},
+            'twist': {'twist': {'linear': dict(x=0., y=0., z=0.), 'angular': dict(x=0., y=0., z=0.)}}})
+        display = self.hub.loco_display()
+        self.assertEqual((display['frame_id'], display['pose_source']), ('odom', '/odom'))
+        self.assertFalse(display['localization_valid'])
+        self.hub._seen['loco_state'] -= 1
+        self.assertFalse(self.hub.loco_display()['valid'])
+
+    def test_loco_display_publication_keeps_velocity_after_odom_window_consumption(self):
+        self.hub.dispatch('loco_state', 'start')
+        self.odom()
+        self.hub.tick()
+        display = json.loads(self.hub._loco_pub.messages[-1].data)
+        self.assertEqual(display['vx_m_s'], 1.)
+        self.assertIsNone(display.get('x_m'))  # No orientation in fixture: no invented pose.
 
 
 if __name__ == '__main__':

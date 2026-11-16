@@ -18,12 +18,19 @@ spec = importlib.util.spec_from_file_location("kuavo_device", ROOT / "device.py"
 driver = importlib.util.module_from_spec(spec)
 std = types.ModuleType("std_msgs.msg")
 std.String = type("String", (), {})
+std.UInt8MultiArray = type('UInt8MultiArray', (), {})
+qos = types.ModuleType('rclpy.qos')
+qos.QoSProfile = lambda **kwargs: types.SimpleNamespace(**kwargs)
+qos.ReliabilityPolicy = types.SimpleNamespace(BEST_EFFORT='best_effort')
+qos.HistoryPolicy = types.SimpleNamespace(KEEP_LAST='keep_last')
+qos.DurabilityPolicy = types.SimpleNamespace(VOLATILE='volatile')
 sensor_msg = types.ModuleType('sensor_msgs.msg')
 class FakeCompressedImage:
     def __init__(self):
         self.header = types.SimpleNamespace(frame_id='', stamp=types.SimpleNamespace(sec=0, nanosec=0))
 sensor_msg.CompressedImage = FakeCompressedImage
 with patch.dict(sys.modules, {"std_msgs": types.ModuleType("std_msgs"), "std_msgs.msg": std,
+                              'rclpy': types.ModuleType('rclpy'), 'rclpy.qos': qos,
                               'sensor_msgs': types.ModuleType('sensor_msgs'), 'sensor_msgs.msg': sensor_msg}):
     spec.loader.exec_module(driver)
     from kuavo_sensors import LINK_ORDER, model_names
@@ -171,6 +178,8 @@ class DriverContractTests(unittest.TestCase):
         self.callback_patch.stop()
 
     def call(self, card, action, **args):
+        if card == 'state':  # Internal safety state remains tested, no public card.
+            return self.bundle.state.dispatch(action, args)
         return self.bundle.dispatch(card, {"action": action, **args})
 
     def test_metadata_and_schema_actions_agree(self):
@@ -193,6 +202,13 @@ class DriverContractTests(unittest.TestCase):
                 self.assertNotIn("x-resource", schema)  # Whole-body exclusion.
         self.assertEqual(tools["leg"]["inputSchema"]["x-resource"], tools["waist"]["inputSchema"]["x-resource"])
 
+    def test_control_query_preserves_diagnostics_without_public_state_card(self):
+        self.bundle.startup_checks.status = {'state': 'ready'}
+        result = self.call('switch_mode', 'get_current_mode')
+        self.assertEqual(result['feedback']['host_runtime'], {'state': 'ready'})
+        self.assertIn('robot_discovery', result['feedback'])
+        self.assertNotIn('state', {tool['name'] for tool in self.bundle.get_all_tools()})
+
     def test_state_start_stop_and_ros2_forwarding(self):
         self.bundle.state._publish()
         self.assertEqual(self.node.publisher.messages, [])
@@ -207,7 +223,8 @@ class DriverContractTests(unittest.TestCase):
         self.bundle.state._publish()
         self.assertEqual(before, len(self.node.publisher.messages))
         self.assertEqual(self.call("state", "start")["state"], "running")
-        self.assertIn("topic_out", self.bundle.dispatch("state", {"action": "info"}))
+        self.assertIsNone(self.bundle.dispatch("state", {"action": "info"}))
+        self.assertNotIn('state', {tool['name'] for tool in self.bundle.get_all_tools()})
 
     def test_reconnection_invalidates_old_feedback_even_if_disconnect_missed(self):
         self.ros.connection = (True, 2)
@@ -1263,7 +1280,7 @@ class MotionConfigurationTests(unittest.TestCase):
                     self.assertIn('motion is disabled', bundle.dispatch(name, args)['error'])
             self.assertEqual(ros.published, [])
             self.assertEqual(ros.services, [])
-            self.assertFalse(bundle.dispatch('state', {'action': 'info'})['feedback']['motion_enabled'])
+            self.assertFalse(bundle.state.snapshot()['motion_enabled'])
             self.assertTrue(bundle.sensors.snapshot('joints')['valid'])
             self.assertIn('urdf', bundle.dispatch('model', {}))
             self.assertEqual(bundle.dispatch('switch_mode', {'action': 'pause'})['state'], 'paused')

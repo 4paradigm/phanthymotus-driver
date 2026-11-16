@@ -224,6 +224,11 @@ class RosbridgeClient:
 
     def _on_message(self, ws, raw: str) -> None:
         try:
+            # Use CPython's strict decoder instead of websocket-client's slow
+            # pure-Python per-byte validator. Never accept replacement characters
+            # for malformed UTF-8 (json.loads(bytes) also accepts UTF-16/32).
+            if isinstance(raw, bytes):
+                raw = raw.decode('utf-8', errors='strict')
             packet = json.loads(raw)
         except (TypeError, ValueError):
             return
@@ -279,7 +284,7 @@ class RosbridgeClient:
                     return
                 self._ws = app
             try:
-                app.run_forever(ping_interval=10, ping_timeout=5)
+                app.run_forever(ping_interval=10, ping_timeout=5, skip_utf8_validation=True)
             except Exception as exc:
                 self._on_error(app, exc)
             finally:

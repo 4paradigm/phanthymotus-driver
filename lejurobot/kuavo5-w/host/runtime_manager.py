@@ -4,6 +4,7 @@ import json
 import socket
 import subprocess
 import threading
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 15748
@@ -13,7 +14,11 @@ _lock = threading.Lock()
 
 def ensure_services():
     with _lock:
-        result = subprocess.run(['systemctl', 'start', '--no-block', *SERVICES],
+        units = list(SERVICES)
+        for unit in ('kuavo5w-head-camera.service', 'kuavo5w-head-jpeg-relay.service'):
+            if Path('/etc/systemd/system/' + unit).is_file():
+                units.append(unit)
+        result = subprocess.run(['systemctl', 'start', '--no-block', *units],
                                 capture_output=True, timeout=3)
         try:
             with socket.create_connection(('127.0.0.1', 9090), timeout=.5):

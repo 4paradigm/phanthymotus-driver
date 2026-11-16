@@ -1,7 +1,7 @@
 # 真机上位机只读检查记录
 
-检查日期：2026-11-16；末次状态检查时间为机器人主机时区 `2026-11-16T14:16:05+08:00` 附近。
-这是当时的运行快照，后续节点、参数和端口可能改变。本文不记录登录密码。
+检查日期：2026-11-16；最初状态检查时间为机器人主机时区 `2026-11-16T14:16:05+08:00` 附近。
+前文为分阶段历史快照，后续节点、参数和端口可能改变；当前结果以文末最近的追加记录为准。本文不记录登录密码。
 
 ## 主机及 ROS 拓扑
 
@@ -227,3 +227,59 @@ host helper 的首次安装仍需现场管理员执行一次，详见 README。
   这是复用已有依赖的代码覆盖层对比，不是生产 Dockerfile 对 ros-base 的完整体积增量；后者仍待构建验证。
 - 本地173项离线测试、Python编译及 service.yml检查通过。实际运动、控制停止、完整关节模型、
   mic物理采集及speaker实际出声仍未验收。
+
+
+## 追加：传感卡输出整理与头部设备（2026-11-16）
+
+本节更新前文旧卡名和设备状态。仅操作传感服务、传感卡生命周期及驱动测试容器，未启动/使能 WBC、MPC 或发运动目标。
+
+- `joints` 现在声明骨架姿态、原始 `joint_state` 两路。原始数组读取不依赖模型校验，但不能用于绕过动作校验。
+  `/sensors_data_raw` 仍无全身反馈发布者，运行时全身参数/URDF仍缺失，因此两路明确 invalid；不使用底盘轮速冒充20关节。
+  `KUA5W0710701302138` 仍只是操作人员提供的机身标识，400062参考模型未完成硬件几何核验。
+- `loco_state` 两路分别为扁平位置/姿态/速度展示，以及 actucore navi 的 `motus.odom/1`。
+  真实 `/move_base/amcl_pose` 提供 map 定位，采样约 x=4.008m、y=−2.205m、yaw=−88.41°；
+  odom 保持 body-frame 测量规范，不将 map 位姿混入标准里程计。
+- 已移除公开 `state` 卡，内部安全检查保留；诊断改从 `switch_mode.get_current_mode` 查询。
+- 电池按 main_/chassis_/small_ 展开为标量字段；不同状态码保留，主电池0V仍输出 null。
+- `laser_scan` 首路为与其他驱动一致的原生 UInt8MultiArray `sensor/pointcloud`，次路保留测距 JSON。
+  全部有效测距投影到 laser 平面的 z=0 点，不再限制为约一半点数；这不是额外3D雷达数据。
+- 左右卡改名 `camera_left` / `camera_right`，增加 `camera_head`。三路使用独立 WebSocket 接收和 latest-only 发布线程，
+  DDS BEST_EFFORT/depth1，发布时不持全局外设锁；底盘JPEG不重编码。
+- 头部 USB 设备实际为 Orbbec Gemini335L，存在 `/dev/video0..7` 和已经构建的 OrbbecSDK_ROS1。
+  以 color-only 640×480@15 启动；关闭深度、深度激光、TF发布，不改全身控制器。
+  因现场缺 compressed_image_transport，使用已有 OpenCV/numpy 的普通用户 relay 以10Hz编码 JPEG，保留真实 header。
+- 三路 DDS JPEG 均在 Agent Core 容器接收，经宿主机 OpenCV 解码成功：左右1024×1280×3，头部480×640×3。
+  底盘源时间戳仍是0、frame_id为空；头部为 camera_head_color_optical_frame，有系统采集时间。
+- 修正相机性能瓶颈：现场 websocket-client 纯 Python UTF-8 校验450KB约194ms/帧，DDS发布330KB约0.084ms/帧。
+  使用 CPython strict UTF-8 解码替代逐字节校验，非法编码及 JSON 仍拒绝；驱动 CPU 从约101%降至约11–16%，
+  驱动接收至DDS发布 info 样本约0.4–0.6ms。该数字不等于浏览器端到端时延；剩余桥接批量延迟的最终修复见下方。
+- 直接 ROS1 10秒对照：odom589帧、IMU1000帧、左/右JPEG179/180帧、头部原始150帧、头部JPEG100帧。
+  头部原始/压缩源平均采集年龄约5/38ms。数据源在工作，不可将桥接后丢帧归咎于硬件无图像。
+- 第二雷达：已安装 Livox SDK，MID360配置指向192.168.1.191、host192.168.1.102；lidarcon administratively UP，
+  但物理 carrier=0、NO-CARRIER，ping不通，未发现活跃 Livox/scan_2 发布者。其他滤波/Cartographer点云为同一2D雷达派生，不能当作第二台雷达。
+- 音频更正：本机 audio/README_audio_setup.md 指的是 **USB EB03_LJ / ShengZhi_EB03_LJ**，不是蓝牙音箱。
+  当前上位机 ALSA 仅Jetson APE/HDA，Pulse唯一source是播放monitor，没有枚举到USB EB03采集设备。
+  对下位机使用现有凭据的一次SSH检查被拒，不能据此判断整台机器人绝对没有音频硬件。
+  操作人员暂不能确认音频和第二雷达接线/供电；因此不添加虚假可用的 mic/speaker 卡。
+
+现场使用本地覆盖镜像 `kuavo5w:local-sensor-ui-261116`，没有发布或冒用原release标签。
+头部启动与JPEG relay已纳入一次安装后由驱动启动助手确保运行的固定服务。
+
+
+### 最终低延迟桥接与 DDS 验收
+
+- 独立客户端对照确认旧bridge的TCPROS接收会聚批：10秒126帧、最大接收间隔约0.568s、平均采集年龄436ms。
+  进程内为rospy订阅设置tcp_nodelay=True、buff_size=2,000,000后，10秒585帧，最大间隔约0.066s，
+  无超过100ms的间隔，平均采集年龄2.9ms；不设置queue_size丢弃输入测量，不修改系统ROS包。
+  已纳入host/rosbridge_loopback.py，重启持续有效。
+- 最终连续30秒Agent Core DDS实测：左右相机各300帧、头部299帧；IMU/odom/loco_state各300帧且全有效；
+  电池和二进制点云各150帧。点云末帧3158个有效点，三路JPEG再次成功解码。
+- 头部原始采集时间至Agent DDS回调平均90.3ms、最小16.4ms、最大159.1ms；未测浏览器绘制/网络传输延迟。
+  底盘源stamp为0，不能伪造左右端到端时延。标准odom末帧窗口6个样本、stamp_skew_ms=5，未再见空窗口。
+- 全身joints/joint_state各300个明确invalid输出，原因仍是机器人控制器参数/全身反馈源缺失；没有补造姿态。
+- 190项离线测试通过，含双流、模型边界、独立图像线程/最新帧覆盖、点云二进制、扁平电池、
+  严格UTF-8解码、TCPROS订阅设置及头部JPEG行填充/格式检查；Python编译与service.yml检查通过。
+
+- 最终本地候选镜像为eb5f51302b7b，736988544字节；对比已发布release的736836914字节，增加151630字节。
+  本次复用现场release依赖；仍不代表生产Dockerfile相对ros-base的完整增量。
+  重建并重新创建容器后再次核对15张卡、三组双流声明及三路相机info均正确；头部camera/JPEG relay、runtime manager、rosbridge服务均active。

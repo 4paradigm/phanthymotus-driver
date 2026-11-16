@@ -85,6 +85,28 @@ class RosbridgeClientTests(unittest.TestCase):
         self.packet({"op": "publish", "topic": "/state", "msg": []})
         self.assertEqual(received, [{"data": True}])
 
+    def test_native_utf8_decode_accepts_text_and_rejects_malformed_or_utf16(self):
+        received = []
+        self.client.subscribe('/state', 'std_msgs/String', received.append)
+        packet = json.dumps({'op': 'publish', 'topic': '/state', 'msg': {'data': '实测'}}, ensure_ascii=False)
+        self.client._on_message(self.sock, packet.encode('utf-8'))
+        self.client._on_message(self.sock, packet.encode('utf-16'))
+        self.client._on_message(self.sock, packet.encode('utf-8').replace('实测'.encode(), b'\xff'))
+        self.assertEqual(received, [{'data': '实测'}])
+
+    def test_transport_uses_native_decoder_without_slow_python_utf8_loop(self):
+        calls = []
+        client = self.client
+        class App:
+            def __init__(self, *args, **kwargs):
+                pass
+            def run_forever(self, **kwargs):
+                calls.append(kwargs)
+                client._closed.set()
+        with patch.object(module.websocket, 'WebSocketApp', App):
+            client._run()
+        self.assertEqual(calls, [{'ping_interval': 10, 'ping_timeout': 5, 'skip_utf8_validation': True}])
+
     def test_actual_protocol_result_unblocks_service(self):
         thread, results, errors = self.call_async()
         request = self.sock.sent[0]

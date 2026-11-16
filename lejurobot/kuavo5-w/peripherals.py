@@ -1,17 +1,26 @@
 """Verified chassis peripherals, independent of the whole-body controller."""
 import base64
+from array import array
 import copy
 import json
 import math
+import struct
 import threading
 import time
 
-from std_msgs.msg import String
+from std_msgs.msg import String, UInt8MultiArray
 from sensor_msgs.msg import CompressedImage
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
-CARDS = ('battery', 'laser_scan', 'camera_rgb', 'camera_rgb_right')
-CAMERAS = {'camera_rgb': ('/camera_1/color/image_raw/compressed', '/camera_left/set_camera_enabled'),
-           'camera_rgb_right': ('/camera_2/color/image_raw/compressed', '/camera_right/set_camera_enabled')}
+CARDS = ('battery', 'laser_scan', 'camera_left', 'camera_right', 'camera_head')
+CAMERAS = {'camera_left': ('/camera_1/color/image_raw/compressed', '/camera_left/set_camera_enabled'),
+           'camera_right': ('/camera_2/color/image_raw/compressed', '/camera_right/set_camera_enabled'),
+           'camera_head': ('/camera_head/color/image_raw/compressed', None)}
+
+
+def latest_qos():
+    return QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST,
+                      depth=1, durability=DurabilityPolicy.VOLATILE)
 
 
 def number(value):
@@ -33,8 +42,16 @@ def image_header(message):
 
 
 def battery_sample(message, now_ms):
-    sources = {}
-    for topic, entry in message.get('sources', {}).items():
+    result = {}
+    mapping = {'/battery': 'main', '/jaten_behavior_manager/out/leju/battery': 'chassis',
+               '/jaten_behavior_manager/out/leju/small_battery': 'small'}
+    fields = {'percentage': 'soc_percent', 'voltage': 'voltage_v', 'current': 'current_a',
+              'temperature': 'temperature_c', 'health': 'health_percent', 'status': 'status_code',
+              'time_remaining': 'time_remaining_vendor'}
+    result = {f'{prefix}_{label}': None for prefix in mapping.values() for label in fields.values()}
+    result.update({f'{prefix}_battery_door_di': None for prefix in mapping.values()})
+    for topic, prefix in mapping.items():
+        entry = message.get('sources', {}).get(topic)
         if not isinstance(entry, dict) or not number(entry.get('received_ms')):
             continue
         if not 0 <= now_ms - entry['received_ms'] <= 5000:
@@ -45,21 +62,19 @@ def battery_sample(message, now_ms):
         pct = raw.get('percentage')
         if not number(pct) or not 0 <= pct <= 100:
             continue
-        values = {key: value if number(value) else None for key, value in raw.items()
-                  if key in ('voltage', 'current', 'temperature', 'health', 'status', 'time_remaining')}
-        if values.get('voltage') is not None and values['voltage'] <= 0:
-            values['voltage'] = None
-        safe_raw = {key: value if number(value) or isinstance(value, bool) else None
-                    for key, value in raw.items() if key in ('percentage', 'battery_door_di', *values)}
-        sources[topic] = {'soc': pct, **values, 'received_ms': entry['received_ms'], 'vendor': safe_raw}
-    primary = sources.get('/battery')
-    return {'valid': primary is not None, **(primary or {}), 'sources': sources,
-            'units': {'soc': '%', 'voltage': 'V', 'current': 'A', 'temperature': 'degC'},
-            'reason': None if primary else 'main_battery_missing_or_stale'}
+        for key, label in fields.items():
+            value = raw.get(key)
+            if not number(value) or (key == 'voltage' and value <= 0):
+                value = None
+            result[f'{prefix}_{label}'] = value
+        if isinstance(raw.get('battery_door_di'), bool):
+            result[f'{prefix}_battery_door_di'] = raw['battery_door_di']
+    primary = result['main_soc_percent'] is not None
+    return {**result, 'valid': primary, 'reason': None if primary else 'main_battery_missing_or_stale'}
 
 
 class Peripherals:
-    def __init__(self, ros1, node, namespace):
+    def __init__(self, ros1, node, namespace, media_factory=None):
         self.ros1, self.node = ros1, node
         self._lock = threading.RLock()
         self._closed = False
@@ -67,15 +82,45 @@ class Peripherals:
         self._running, self._data, self._seen = set(), {}, {}
         self._images, self._last_image_publish = {}, {}
         self._enabling, self._retry_at, self._camera_error = set(), {}, {}
+        # Each camera owns a WebSocket receiver and a latest-frame publisher.
+        # Image JSON/base64 and DDS work cannot block control/odom replies.
+        self._media = {card: media_factory() if media_factory else ros1 for card in CAMERAS}
+        self._owns_media = media_factory is not None
+        self._media_generations = {}
+        self._workers = []
+        self._wake = {card: threading.Event() for card in CAMERAS}
+        self._stop = threading.Event()
+        self._image_stats = {card: {'received': 0, 'published': 0, 'publish_delay_ms': None} for card in CAMERAS}
         self.topics = {card: f'/{namespace}/state/{card}' for card in CARDS}
         self._pubs = {card: node.create_publisher(String, self.topics[card], 10) for card in ('battery', 'laser_scan')}
         self._points_topic = f'/{namespace}/state/laser_scan/points'
-        self._points_pub = node.create_publisher(String, self._points_topic, 10)
+        self._points_pub = node.create_publisher(UInt8MultiArray, self._points_topic, latest_qos())
         self._image_type = CompressedImage
-        self._image_pubs = {card: node.create_publisher(CompressedImage, self.topics[card], 2) for card in CAMERAS}
+        self._image_pubs = {card: node.create_publisher(CompressedImage, self.topics[card], latest_qos()) for card in CAMERAS}
         ros1.subscribe('/motus/kuavo5w/battery', 'std_msgs/String', self._on_battery)
         ros1.subscribe('/scan', 'sensor_msgs/LaserScan', self._on_scan, throttle_ms=200)
         self._timer = node.create_timer(.2, self.tick)
+
+    def start(self):
+        if self._workers:
+            return
+        if self._owns_media:
+            for client in self._media.values():
+                client.start()
+        for card in CAMERAS:
+            worker = threading.Thread(target=self._image_loop, args=(card,), daemon=True, name=f'{card}-publish')
+            self._workers.append(worker)
+            worker.start()
+
+    def _image_loop(self, card):
+        while not self._stop.is_set():
+            self._wake[card].wait(.5)
+            self._wake[card].clear()
+            try:
+                self._publish_image(card)
+            except Exception as exc:
+                with self._lock:
+                    self._camera_error[card] = type(exc).__name__
 
     def _session(self):
         connected, generation = self.ros1.connection
@@ -129,7 +174,8 @@ class Peripherals:
 
     def _on_image(self, card, message, generation):
         with self._lock:
-            if not self._session() or generation != self._generation or card not in self._running:
+            if (not self._media[card].connection[0] or generation != self._media[card].connection[1]
+                    or card not in self._running or self._closed):
                 return
             try:
                 data = message['data']
@@ -142,6 +188,8 @@ class Peripherals:
                 self._data[card] = {'valid': True, 'bytes': len(jpeg), 'encoding': 'jpeg',
                                     'source_topic': CAMERAS[card][0]}
                 self._seen[card] = time.monotonic()
+                self._image_stats[card]['received'] += 1
+                self._wake[card].set()
             except (KeyError, ValueError, TypeError):
                 self._data.pop(card, None)
                 self._images.pop(card, None)
@@ -152,7 +200,7 @@ class Peripherals:
             if result.get('success') is not True:
                 raise RuntimeError('camera service did not accept enable')
             with self._lock:
-                if generation == self._generation:
+                if generation == self._media[card].connection[1]:
                     self._camera_error.pop(card, None)
         except Exception as exc:
             with self._lock:
@@ -167,25 +215,30 @@ class Peripherals:
             return self._snapshot(card)
 
     def _snapshot(self, card):
-        connected = self._session()
+        connected = self._media[card].connection[0] if card in CAMERAS else self._session()
         age = time.monotonic() - self._seen.get(card, -1e9)
-        valid = connected and age <= (5 if card == 'battery' else 1) and card in self._data
-        if valid and card == 'battery':
-            return {**battery_sample(self._data[card], int(time.time() * 1000)), 'connected': True}
+        valid = (connected and age <= (5 if card == 'battery' else 1) and card in self._data
+                 and (card not in CAMERAS or self._media_generations.get(card) == self._media[card].connection))
+        if card == 'battery':
+            return {**battery_sample(self._data[card] if valid else {'sources': {}}, int(time.time() * 1000)),
+                    'connected': connected}
         return {**(copy.deepcopy(self._data.get(card, {})) if valid else {}),
+                **(self._image_stats[card] if card in CAMERAS else {}),
                 'valid': valid, 'connected': connected,
                 'reason': None if valid else self._camera_error.get(card, 'missing_or_stale_measurement')}
 
     def tools(self):
         descriptions = {'battery': '实测电池 SOC/电压/电流/温度；保留三路来源及冲突，0V 不冒充实测电压',
-            'laser_scan': '二维雷达测距及俯视点集（laser 原始坐标系，不冒充底盘 TF）',
-            'camera_rgb': 'camera_1 左路 RGB JPEG，start 自动开启相机，不控制机器人运动',
-            'camera_rgb_right': 'camera_2 右路 RGB JPEG，start 自动开启相机'}
+            'laser_scan': '二维雷达点云图 + 原始测距（laser 坐标系，z=0；不是额外3D雷达）',
+            'camera_left': '底盘左路 RGB JPEG，独立接收/发布线程，自动开启',
+            'camera_right': '底盘右路 RGB JPEG，独立接收/发布线程，自动开启',
+            'camera_head': 'Orbbec Gemini 335L 头部 RGB JPEG，独立接收/发布线程'}
         tools = []
         for card in CARDS:
             outputs = [{'topic': self.topics[card], 'format': 'image/jpeg' if card in CAMERAS else 'data/json'}]
             if card == 'laser_scan':
-                outputs.append({'topic': self._points_topic, 'format': 'sensor/lidar'})
+                outputs.insert(0, {'topic': self._points_topic, 'format': 'sensor/pointcloud',
+                                   'desc': '原始 laser 平面点云，z=0m'})
             tools.append({'name': card, 'type': 'sensor', 'multiInstance': False, 'description': descriptions[card],
                           'inputSchema': {'type': 'object', 'properties': {}}, 'topic_out': outputs})
         return tools
@@ -196,13 +249,11 @@ class Peripherals:
             if action == 'start':
                 self._running.add(card)
                 if card in CAMERAS:
-                    generation = self._generation
-                    self.ros1.subscribe(CAMERAS[card][0], 'sensor_msgs/CompressedImage',
-                        lambda msg, c=card, g=generation: self._on_image(c, msg, g), throttle_ms=200)
+                    self._subscribe_camera(card)
             elif action == 'stop':
                 self._running.discard(card)
                 if card in CAMERAS:
-                    self.ros1.unsubscribe(CAMERAS[card][0])
+                    self._media[card].unsubscribe(CAMERAS[card][0])
                     self._data.pop(card, None)
                     self._images.pop(card, None)
                 # Physical streams are shared by the chassis: do not disable them.
@@ -220,23 +271,21 @@ class Peripherals:
             for card in self._running:
                 value = self.snapshot(card)
                 if card in CAMERAS:
-                    if not value['valid'] and card not in self._enabling and time.monotonic() >= self._retry_at.get(card, 0):
+                    client = self._media[card]
+                    if self._media_generations.get(card) != client.connection:
+                        self._images.pop(card, None)
+                        self._data.pop(card, None)
+                        self._seen.pop(card, None)
+                        self._subscribe_camera(card)
+                    if (CAMERAS[card][1] and not value['valid'] and card not in self._enabling
+                            and time.monotonic() >= self._retry_at.get(card, 0)):
                         self._enabling.add(card)
                         # Rebind callback to the current WebSocket generation.
-                        generation = self._generation
-                        self.ros1.subscribe(CAMERAS[card][0], 'sensor_msgs/CompressedImage',
-                            lambda msg, c=card, g=generation: self._on_image(c, msg, g), throttle_ms=200)
+                        generation = client.connection[1]
+                        self._subscribe_camera(card)
                         threading.Thread(target=self._enable_camera, args=(card, generation), daemon=True).start()
-                    seen = self._seen.get(card)
-                    if value['valid'] and seen != self._last_image_publish.get(card):
-                        jpeg, header = self._images[card]
-                        msg = self._image_type()
-                        msg.format, msg.data = 'jpeg', jpeg
-                        msg.header.frame_id = header.get('frame_id', '')
-                        msg.header.stamp.sec = header['sec']
-                        msg.header.stamp.nanosec = header['nanosec']
-                        self._image_pubs[card].publish(msg)
-                        self._last_image_publish[card] = seen
+                    if not self._workers:
+                        self._publish_image(card)
                 else:
                     msg = String()
                     msg.data = json.dumps(value, allow_nan=False, separators=(',', ':'))
@@ -244,19 +293,52 @@ class Peripherals:
                     if card == 'laser_scan':
                         points = []
                         if value['valid']:
-                            step = max(1, (len(value['ranges']) + 1999) // 2000)
-                            for i in range(0, len(value['ranges']), step):
+                            for i in range(len(value['ranges'])):
                                 distance = value['ranges'][i]
                                 if distance is not None:
                                     angle = value['angle_min'] + i * value['angle_increment']
-                                    points.append({'x': distance * math.cos(angle), 'y': distance * math.sin(angle)})
-                        cloud = String()
-                        cloud.data = json.dumps(points, allow_nan=False, separators=(',', ':'))
+                                    points.append((distance * math.cos(angle), distance * math.sin(angle), 0., 0.))
+                        cloud = UInt8MultiArray()
+                        cloud.data = array('B', struct.pack('<II', 16, len(points))
+                                           + b''.join(struct.pack('<ffff', *p) for p in points))
                         self._points_pub.publish(cloud)
+
+    def _subscribe_camera(self, card):
+        client = self._media[card]
+        generation = client.connection[1]
+        self._media_generations[card] = client.connection
+        client.subscribe(CAMERAS[card][0], 'sensor_msgs/CompressedImage',
+            lambda msg, c=card, g=generation: self._on_image(c, msg, g), throttle_ms=100)
+
+    def _publish_image(self, card):
+        with self._lock:
+            seen = self._seen.get(card)
+            if (self._closed or card not in self._running or not self.snapshot(card)['valid']
+                    or seen == self._last_image_publish.get(card)):
+                return
+            jpeg, header = self._images[card]
+            self._last_image_publish[card] = seen
+        msg = self._image_type()
+        # Generated ROS2 uint8 setters validate bytes element-by-element under
+        # __debug__. A typed array takes their native fast path (no Python loop).
+        msg.format, msg.data = 'jpeg', array('B', jpeg)
+        msg.header.frame_id = header['frame_id']
+        msg.header.stamp.sec, msg.header.stamp.nanosec = header['sec'], header['nanosec']
+        self._image_pubs[card].publish(msg)  # No shared lock held during DDS serialization.
+        with self._lock:
+            self._image_stats[card]['published'] += 1
+            self._image_stats[card]['publish_delay_ms'] = round((time.monotonic() - seen) * 1000, 2)
 
     def close(self):
         with self._lock:
             self._closed = True
+            self._stop.set()
             for card in CAMERAS:
-                self.ros1.unsubscribe(CAMERAS[card][0])
+                self._media[card].unsubscribe(CAMERAS[card][0])
+                self._wake[card].set()
             self._running.clear()
+        if self._owns_media:
+            for client in self._media.values():
+                client.close()
+        for worker in self._workers:
+            worker.join(timeout=2)

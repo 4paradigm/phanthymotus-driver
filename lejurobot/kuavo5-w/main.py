@@ -26,8 +26,8 @@ _bundle = None
 class _McpRequestLog:
     """One bounded sampler shared by all HTTP connections/worker threads."""
     TOOLS = frozenset(('loco', 'arm', 'leg', 'waist', 'head', 'switch_mode',
-                       'state', 'joints', 'imu', 'loco_state', 'model',
-                       'battery', 'laser_scan', 'camera_rgb', 'camera_rgb_right'))
+                       'joints', 'imu', 'loco_state', 'model',
+                       'battery', 'laser_scan', 'camera_left', 'camera_right', 'camera_head'))
     STATES = frozenset(('ready', 'idle', 'running', 'executing', 'paused',
                         'completed', 'error', 'rejected', 'disconnected'))
 
@@ -239,7 +239,8 @@ def main():
     node = Node("kuavo5w_driver")
     server, ros2_thread = None, None
     try:
-        _bundle = KuavoBundle(config, namespace, ros1, node)
+        _bundle = KuavoBundle(config, namespace, ros1, node,
+                              media_factory=lambda: RosbridgeClient(_rosbridge_url(config)))
         server = _mcp_server(int(config.get("mcp_port", 15747)))
         ros2_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True, name="ros2-domain-42")
         ros2_thread.start()

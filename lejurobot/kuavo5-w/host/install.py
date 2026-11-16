@@ -22,11 +22,12 @@ def main():
     parser.add_argument('--workspace', required=True)
     parser.add_argument('--master', required=True)
     parser.add_argument('--ros-ip', required=True)
+    parser.add_argument('--head-workspace', help='Optional installed Orbbec ROS1 workspace; auto-detect known local workspace if absent')
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('Run on the ROS1 host as root (sudo)')
     if not all(re.fullmatch(r'[a-zA-Z0-9_./:@-]+', value)
-               for value in (args.user, args.workspace, args.master, args.ros_ip)):
+               for value in (args.user, args.workspace, args.master, args.ros_ip, args.head_workspace or 'none')):
         parser.error('Unsupported shell/systemd characters in arguments')
     user = pwd.getpwnam(args.user)
     setup = Path(args.workspace) / 'devel/setup.bash'
@@ -34,7 +35,8 @@ def main():
         parser.error('Missing workspace devel/setup.bash')
     root = Path('/opt/phanthy-motus/kuavo5w-host')
     root.mkdir(parents=True, exist_ok=True)
-    for name in ('rosbridge_loopback.py', 'rosbridge.launch', 'battery_relay.py', 'runtime_manager.py'):
+    for name in ('rosbridge_loopback.py', 'rosbridge.launch', 'battery_relay.py', 'runtime_manager.py',
+                 'head_camera.launch', 'head_jpeg.py'):
         shutil.copyfile(Path(__file__).parent / name, root / name)
         (root / name).chmod(0o644)
     config = Path('/opt/phanthy-motus/drivers/lejurobot-kuavo5-w/config.yaml')
@@ -50,8 +52,16 @@ def main():
             parser.error('Existing operator config is not a mapping')
         defaults = yaml.safe_load((Path(__file__).parents[1] / 'config.yaml').read_text())
         plugins = operator.setdefault('plugins', defaults['plugins'].copy())
-        for name in ('battery', 'laser_scan', 'camera_rgb', 'camera_rgb_right'):
+        aliases = {'camera_rgb': 'camera_left', 'camera_rgb_right': 'camera_right'}
+        for old, new in aliases.items():
+            if old in plugins:
+                plugins.setdefault(new, plugins.pop(old))
+        plugins.pop('state', None)
+        for name in ('battery', 'laser_scan', 'camera_left', 'camera_right', 'camera_head'):
             plugins.setdefault(name, defaults['plugins'][name])
+        sensors = operator.setdefault('sensors', {})
+        if 'auto_start' in sensors:
+            sensors['auto_start'] = [aliases.get(name, name) for name in sensors['auto_start'] if name != 'state']
         with tempfile.NamedTemporaryFile(mode='w', dir=config.parent, delete=False) as stream:
             yaml.safe_dump(operator, stream, sort_keys=False)
             staged = Path(stream.name)
@@ -61,6 +71,18 @@ def main():
         'kuavo5w-rosbridge': f'roslaunch --wait {root}/rosbridge.launch',
         'kuavo5w-battery-relay': f'python3 {root}/battery_relay.py',
     }
+    head = None
+    candidates = [Path(args.head_workspace)] if args.head_workspace else [
+        Path(user.pw_dir) / 'kuavo_data_pilot', Path(args.workspace)]
+    for candidate in candidates:
+        if ((candidate / 'devel/setup.bash').is_file()
+                and (candidate / 'src/OrbbecSDK_ROS1/launch/gemini_330_series.launch').is_file()):
+            head = candidate / 'devel/setup.bash'
+            commands['kuavo5w-head-camera'] = f'roslaunch --wait {root}/head_camera.launch'
+            commands['kuavo5w-head-jpeg-relay'] = f'python3 {root}/head_jpeg.py'
+            break
+    if args.head_workspace and head is None:
+        parser.error('Head workspace must contain built OrbbecSDK_ROS1 gemini_330_series.launch')
     for name, command in commands.items():
         unit = f'''[Unit]
 Description=Kuavo 5-W {name}
@@ -71,7 +93,7 @@ User={args.user}
 WorkingDirectory={user.pw_dir}
 Environment=ROS_MASTER_URI={args.master}
 Environment=ROS_IP={args.ros_ip}
-ExecStart=/bin/bash -c 'source /opt/ros/noetic/setup.bash && source {setup} && exec {command}'
+ExecStart=/bin/bash -c 'source /opt/ros/noetic/setup.bash && source {head if name.startswith("kuavo5w-head-") else setup} && exec {command}'
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=10
@@ -95,7 +117,7 @@ WantedBy=multi-user.target
 ''')
     subprocess.run(['systemctl', 'daemon-reload'], check=True)
     subprocess.run(['systemctl', 'enable', '--now', 'kuavo5w-runtime-manager.service'], check=True)
-    print('Host helper installed. Driver startup can now ensure rosbridge and battery telemetry.')
+    print('Host helper installed. Driver startup ensures rosbridge, battery telemetry and installed optional head camera.')
 
 
 if __name__ == '__main__':

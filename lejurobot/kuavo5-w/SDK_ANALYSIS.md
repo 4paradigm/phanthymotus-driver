@@ -140,7 +140,7 @@ SDK 数据类的“world”文字描述不能覆盖控制器中的实际变换�
 
 ## 6. 卡片与 ACP 修改
 
-- 新增同其他驱动一致的 `joints`、`imu`、`loco_state`，以及 resource `model`；保留 `state` 诊断。
+- 新增同其他驱动一致的 `joints`、`imu`、`loco_state`，以及 resource `model`；控制诊断现从 `switch_mode.get_current_mode` 获取，不再暴露 `state` 卡。
 - rosapi 参数读取在独立线程，不阻塞负责接收 service_response 的 WebSocket 线程。
 - 启动/重连重新探测；机型/自由度未知或不匹配时拒绝运动。断线清除测量与模型，活动传感卡持续发布 invalid。
 - 关节动作必须先验证运行时模型的关节映射/名称，并有0.5s内实测 q；在途模型失效也会终止动作。发送后必须收到新 reach-time，等待预计时长，再检测目标误差≤0.035rad，连续新测量覆盖≥0.2s。
@@ -173,3 +173,15 @@ SDK 数据类的“world”文字描述不能覆盖控制器中的实际变换�
 实际控制仓库版本、参数与 URDF、rosbridge/rosapi 自定义消息可见性、odom 的 child frame、消息时延、实测收敛阈值、
 DDS42/loopback 的跨容器接收，以及软件暂停和断网时控制器行为都需要真机验收。
 公开 SDK 中的相机、手爪、语音、双足步态等能力不等于该台5-W已安装并开放；本轮不虚构这些卡。
+
+
+## 8. 现场传感适配更新（2026-11-16）
+
+- joints 双流：模型绑定的 skeleton 与不依赖模型的原始 joint_state；诊断数组绝不绕过关节控制的模型、时间和限位校验。
+- loco_state 双流：map/odom 位姿展示与独立 body-frame motus.odom/1；地图定位使用实际 `/move_base/amcl_pose`，未实现导航执行卡。
+- 电池字段全部展开，点云使用现有前端 `sensor/pointcloud` 二进制布局，并保留原始 LaserScan JSON。
+- 左右 JPEG 分别命名 camera_left/camera_right；头部为实测 Orbbec Gemini335L，使用现场已有ROS1驱动和宿主机JPEG relay，未引入厂商完整SDK到镜像。
+- 每相机独立接收/发布线程和有界latest-only缓存；WebSocket取消纯Python编码扫描，改用严格本地UTF-8解码，避免图像处理占满GIL；仍保持连接代次检查。
+- 未见可用USB EB03音频设备，Livox网口无物理链路；不从已安装SDK、配置或话题名推断硬件在线。
+
+具体源流、模型缺失原因、设备检查和集成验证以 ROBOT_INSPECTION.md 文末记录为准。

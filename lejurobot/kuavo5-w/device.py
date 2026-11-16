@@ -734,7 +734,8 @@ class ControlPlugin(_KuavoPlugin):
 
     def _dispatch(self, action, args):
         if action == "get_current_mode":
-            return {"state": "ready", "feedback": self.state.snapshot()}
+            return {"state": "ready", "feedback": {
+                **self.state.snapshot(), "host_runtime": dict(self.bundle.startup_checks.status)}}
         if action == "pause":
             return self.bundle.pause("software_pause")
         if action == "resume":
@@ -748,7 +749,7 @@ class ControlPlugin(_KuavoPlugin):
 
 
 class KuavoBundle:
-    def __init__(self, config, namespace, ros1, ros2_node):
+    def __init__(self, config, namespace, ros1, ros2_node, media_factory=None):
         motion_enabled = config.get("motion_enabled", True)
         if type(motion_enabled) is not bool:
             raise ValueError("motion_enabled must be a YAML boolean")
@@ -766,10 +767,10 @@ class KuavoBundle:
             ros1.advertise(topic, message_type)
         self.sensors = KuavoSensors(config.get('sensors', {}), namespace, ros1, ros2_node)
         self.sensors.robot_serial = config.get('robot_serial')
-        self.peripherals = Peripherals(ros1, ros2_node, namespace)
+        self.peripherals = Peripherals(ros1, ros2_node, namespace, media_factory=media_factory)
         self.startup_checks = StartupChecks(config.get('host_runtime', {}).get('enabled', True))
         self._auto_start = config.get('sensors', {}).get('auto_start',
-            ['state', 'joints', 'imu', 'loco_state', *PERIPHERAL_CARDS])
+            ['joints', 'imu', 'loco_state', *PERIPHERAL_CARDS])
         self.state = RobotState(ros1, ros2_node, namespace, self.sensors, motion_enabled)
         self.tracker = ActionTracker()
         self._closing = False
@@ -779,7 +780,10 @@ class KuavoBundle:
                         LowerBodyPlugin(self, "waist"), HeadPlugin(self), ControlPlugin(self)]
         self._enabled = {name for name, cfg in config.get("plugins", {}).items()
                          if cfg.get("enabled", True)} if "plugins" in config else {
-                             "loco", "arm", "leg", "waist", "head", "switch_mode", "state", *SENSOR_CARDS, *PERIPHERAL_CARDS}
+                             "loco", "arm", "leg", "waist", "head", "switch_mode", *SENSOR_CARDS, *PERIPHERAL_CARDS}
+        aliases = {'camera_rgb': 'camera_left', 'camera_rgb_right': 'camera_right'}
+        self._enabled = {aliases.get(name, name) for name in self._enabled if name != 'state'}
+        self._auto_start = [aliases.get(name, name) for name in self._auto_start if name != 'state']
 
     def twist(self, topic, x=0.0, y=0.0, z=0.0, pitch=0.0, yaw=0.0):
         self.ros1.publish(topic, "geometry_msgs/Twist", {
@@ -989,12 +993,12 @@ class KuavoBundle:
     def get_all_tools(self):
         tools = [p.get_tool() for p in self.plugins if p.PREFIX in self._enabled]
         return (tools + [t for t in self.sensors.tools() if t['name'] in self._enabled]
-                + [t for t in self.peripherals.tools() if t['name'] in self._enabled]
-                + ([self.state.get_tool()] if "state" in self._enabled else []))
+                + [t for t in self.peripherals.tools() if t['name'] in self._enabled])
 
     def start_background(self):
         self.startup_checks.start()
-        allowed = {'state', 'joints', 'imu', 'loco_state', *PERIPHERAL_CARDS}
+        self.peripherals.start()
+        allowed = {'joints', 'imu', 'loco_state', *PERIPHERAL_CARDS}
         for name in self._auto_start:
             if name in allowed and name in self._enabled:
                 self.dispatch(name, {'action': 'start'})
@@ -1006,11 +1010,6 @@ class KuavoBundle:
             return None
         if self._closing:
             return {"state": "error", "error": "driver is shutting down"}
-        if name == "state":
-            result = self.state.dispatch(action, args)
-            if 'feedback' in result:
-                result['feedback']['host_runtime'] = dict(self.startup_checks.status)
-            return result
         if name in PERIPHERAL_CARDS:
             return self.peripherals.dispatch(name, action)
         if name in SENSOR_CARDS:

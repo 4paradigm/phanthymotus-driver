@@ -16,7 +16,7 @@ Kuavo ROS1 Noetic 控制器
 rosbridge_server（机器人侧，WebSocket :9090）
   ↕ rosbridge v2 JSON 协议
 本驱动（ROS2 Humble 容器，MCP :15747/mcp）
-  → ROS2 std_msgs/String / sensor_msgs/CompressedImage，domain 42，FastDDS loopback profile
+  → ROS2 String / UInt8MultiArray / CompressedImage，domain 42，FastDDS loopback profile
 Agent Core（同一主机，https://localhost:15678）
 ```
 
@@ -78,14 +78,15 @@ sudo python3 host/install.py --user leju_kuavo \
 ```
 
 安装器准备现场配置（保留已有值，仅补充缺失的外设插件），安装固定用途 systemd 服务。
-驱动启动后每5秒通过 `127.0.0.1:15748/ensure` 请求确保 rosbridge 和只读电池转发器运行；
-它们异常退出由 systemd 重启。`state.info` 的 `feedback.host_runtime` 报告检查状态。
+驱动启动后每5秒通过 `127.0.0.1:15748/ensure` 请求确保 rosbridge、只读电池转发器及已安装的头部 RGB 服务运行；
+它们异常退出由 systemd 重启。`switch_mode.get_current_mode` 的 `feedback.host_runtime` 报告检查状态。
 容器不需要宿主机 sudo、SSH 密码、Docker socket 或特权权限。
-助手仅能启动这两个固定服务，不接受命令或 unit 参数；仅监听 loopback，拒绝浏览器 Origin 和非本机 Host。
+助手仅能启动 rosbridge、电池 relay 及已安装的固定头部 RGB 服务，不接受命令或 unit 参数；仅监听 loopback，拒绝浏览器 Origin 和非本机 Host。
 ROS消息解码以普通用户运行，固定启动助手独立运行。旧版 rosbridge 忽略 address 参数时，通过进程内 wrapper
-明确指定 loopback 绑定，不修改系统 ROS 包。
+明确指定 loopback 绑定，并在进程内为 ROS1 订阅启用 TCP_NODELAY、2MB 接收缓冲；不修改系统 ROS 包。
+保留全部 odom 接收样本，不通过 queue_size=1 在输入端丢弃测量。
 
-默认自动启动 `state/joints/imu/loco_state/battery/laser_scan/camera_rgb/camera_rgb_right` 的输出。
+默认自动启动 `joints/imu/loco_state/battery/laser_scan/camera_left/camera_right/camera_head` 的输出。
 相机缺帧时调用对应 `set_camera_enabled(true)`，间隔至少5秒重试；不会启动 WBC、MPC 或使能机器人运动。
 `sensors.auto_start` 可缩小列表，`plugins.<name>.enabled: false` 可禁用卡片。
 远程 rosbridge 部署可设置 `host_runtime.enabled: false`，由远端自行管理其 ROS1 服务。
@@ -96,15 +97,24 @@ ROS消息解码以普通用户运行，固定启动助手独立运行。旧版 r
 | 卡片 | 数据与启动行为 |
 | --- | --- |
 | `battery` | `/battery` 主电池的 SOC(%)、电流(A)、温度(°C)；保留另两路厂商来源及不同 status，不把主电池0V当成有效电压 |
-| `laser_scan` | `/scan` 测距 JSON 和 `sensor/lidar` 的二维 `{x,y}` 点集；使用 laser 原始坐标，不推测底盘 TF |
-| `camera_rgb` | 左路 `/camera_1/color/image_raw/compressed`，原生 ROS2 `CompressedImage` / `image/jpeg` |
-| `camera_rgb_right` | 右路 `/camera_2/color/image_raw/compressed`，同上；保留源时间戳，空 frame_id 保持为空 |
+| `laser_scan` | 首路 `sensor/pointcloud` 原生二进制点云，次路原始 `/scan` JSON；保留全部有效点，laser 坐标、z=0，不推测底盘 TF |
+| `camera_left` | 左路 `/camera_1/color/image_raw/compressed`，原生 ROS2 `CompressedImage` / `image/jpeg` |
+| `camera_right` | 右路 `/camera_2/color/image_raw/compressed`，同上；保留源时间戳，空 frame_id 保持为空 |
+| `camera_head` | 头部 Orbbec Gemini335L，640×480 RGB JPEG；宿主机已有 Orbbec ROS1 驱动和 OpenCV/numpy 时安装 color-only 转发 |
 | `imu` | 优先独立 `/imu`，全身 raw 为备用；不再要求全身控制器存在才能读取 IMU |
 
 电池转发器校验现场三种已核实 topic/type/MD5 组合，动态加载发布者提供的有界定义，输出标准 String。
-相机经 rosbridge 限流到5Hz，只保留最新 JPEG；无重新编码及额外图像处理依赖。
+三路相机分别使用独立 WebSocket 接收器和发布线程，目标上限10Hz；只保留最新 JPEG，DDS BEST_EFFORT/depth1。
+底盘 JPEG 不重新编码；头部通过宿主机已有 OpenCV/numpy 编码，未增加驱动镜像依赖。
+现场旧版 ROS1 缺少 compressed_image_transport 插件，`host/head_jpeg.py` 保留原始 header、处理行填充，
+以 latest-only 方式将头部原始 RGB 转 JPEG。不会开启深度投射器、深度激光或更改全身控制器。
+WebSocket 使用 CPython 严格 UTF-8 解码和 JSON 校验，避免纯 Python 逐字节校验造成积压，不放宽非法编码检查。
+安装器自动检测 `/home/<user>/kuavo_data_pilot` 或指定 `--head-workspace`，仅在找到已构建 Orbbec 驱动时安装固定头部服务。
+底盘源时间戳为0，无法据此测得端到端延迟；卡片 info 中 publish_delay_ms 仅是驱动接收至 DDS 发布耗时。
 传感卡 stop 停止该卡输出，相机 stop 不关闭底盘其他进程共享的物理图像流。
-麦克风目前无可用采集来源，扬声器仅验证 PCM 接口可写，尚未确认物理出声，因此不注册虚假可用的 `mic/speaker`。
+现场 USB 音频说明要求 EB03_LJ 声卡，上位机未枚举到该卡；Pulse source 仅为播放 monitor，不是麦克风。
+ALSA PCM 可写不证明真实扬声器出声，因此不注册虚假可用的 `mic/speaker`。接线/供电尚未确认。
+已发现 Livox MID360 配置和 SDK，但专用网口无物理 carrier，未见第二雷达有效发布者；当前点云只来自底盘二维雷达。
 
 `KUA5W0710701302138` 是操作人员提供的机身标识，可在现场配置 `robot_serial` 中记录；
 没有证据可把它等同于控制器 `robot_version`。当前资源 URDF 是400062参考骨架，几何尺寸未对该台实机核验。
@@ -153,10 +163,10 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 开启仅表示允许驱动处理请求，不会自动使能机器人、切换模式或发起运动，原有运行时检查仍然生效。
 如需只读运行，可在实际加载的配置文件中设置 `motion_enabled: false` 并重启驱动；此时拒绝运动、
 恢复控制及模式切换，仍允许状态/传感器/模型读取、软件暂停和 `stop_move`。该字段必须是 YAML 布尔值。
-`state.info.feedback.motion_enabled` 与执行卡 `info.motion_enabled` 可确认当前配置。
+`switch_mode.get_current_mode.feedback.motion_enabled` 与执行卡 `info.motion_enabled` 可确认当前配置。
 机器人必须处于允许运动的状态，且收到本次 WebSocket 连接内的控制状态和新鲜模式反馈后才接受运动指令。
 启动和重连后，独立线程经 rosapi 探测机型、robot_version、自由度、SHM 参数及 `/humanoid_description`。
-必须确认 wheel-arm=1、下肢4、双臂14、头2后才能运动；探测失败时可通过 `state.info.feedback.robot_discovery` 查原因。
+必须确认 wheel-arm=1、下肢4、双臂14、头2后才能运动；探测失败时可通过 `switch_mode.get_current_mode.feedback.robot_discovery` 查原因。
 参数缺失不回退到 SDK 的双足默认配置。后台探测在每轮结束约1s后重新读取完整身份参数和 URDF；
 成功读取的身份有效期为3s，从该轮读取开始计时，慢查询不会在完成时伪造新租约。
 查询失败、身份过期或模型/限位绑定变化会拒绝/终止相关动作，不依赖 WebSocket 重连；
@@ -174,18 +184,17 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 | `waist` | `set_pose`、`stop_move` | `/cmd_lb_torso_pose` |
 | `head` | `move`、`stop_move` | `/cmd_head_vel` |
 | `switch_mode` | `pause`、`resume`、`set_mode`、`get_current_mode` | `/enable_control`、`/mobile_manipulator_mpc_control` 及状态话题 |
-| `state` | 系统 `start`、`stop`、`info` | MPC 模式、软件控制状态、reach-time、`/humanoid_wheel/eePoses` |
-| `joints` | 系统 `start`、`stop`、`info` | `/sensors_data_raw[_shm]` 实测 q/dq/ddq/tau；`sensor/skeleton` |
+| `joints` | 系统 `start`、`stop`、`info` | 两路：`sensor/skeleton` 骨架姿态 + `data/json` 原始 joint_state |
 | `imu` | 系统 `start`、`stop`、`info` | 同一原始消息的 IMU；`data/json` |
-| `loco_state` | 系统 `start`、`stop`、`info` | `/odom` 本体系 vx/vy/wz；`state/odom`、`motus.odom/1` |
+| `loco_state` | 系统 `start`、`stop`、`info` | 两路：map/odom 位置、角度、速度 JSON + 独立 `state/odom` / `motus.odom/1` |
 | `model` | resource 读取 | 本地 `resource/kuavo5w_model.urdf` 参考骨架；离线可读 |
 
 sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 resource。
 业务参数通过 `x-action-params` 分组并声明动作各自的 required；`dispatch()` 返回普通 dict，HTTP 层只包装一次 MCP content。
 `config.yaml` 的 `plugins.<card>.enabled` 决定卡片是否暴露。
 
-当前尚未实现相机、`mic`、`speaker`、`controlled_spatial` 卡片。
-真机已发现地图/定位/导航接口，但与通用 SDK 示例存在协议差异；相机关闭且音频接口未就绪。
+三路相机、电池、二维雷达点云已适配；尚未提供 `mic`、`speaker`、`controlled_spatial` 卡片。
+真机已发现地图/定位/导航接口，但导航取消及目标归属仍需核实；音频设备未就绪。
 接口快照、可行性及导航取消/ACP 适配前提见 `ROBOT_INSPECTION.md` 的能力核查记录。
 
 参数单位与约束：
@@ -229,7 +238,7 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 ```
 
 不要对 `rosparam get` 的 YAML 输出计算指纹。配置需重启加载；可用性及核验记录引用在
-`state.info.feedback.robot_discovery.joint_limits` 查看。运行时模型指纹或配置身份不匹配时不允许关节动作。
+`switch_mode.get_current_mode.feedback.robot_discovery.joint_limits` 查看。运行时模型指纹或配置身份不匹配时不允许关节动作。
 
 模式：0=NoControl（被动）、1=ArmOnly、2=BaseOnly、3=BaseArm、4=ArmEeOnly。
 底盘要求模式2/3；双臂关节要求1/3；末端允许1/3/4。下肢、躯干和头部要求非0模式。
@@ -257,7 +266,7 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 即使旧恢复在该次 disable 等待期间才结清，该次停止仍不确认；调用方须在结清后显式再次暂停，
 使最终 disable 发送在旧恢复终态之后。不会自动重试控制服务或自动重新启用。
 
-`state.info.feedback.remote_resume_unresolved` 暴露该状态；未结清时拒绝新恢复/模式切换。
+`switch_mode.get_current_mode.feedback.remote_resume_unresolved` 暴露该状态；未结清时拒绝新恢复/模式切换。
 只保留至多一个未决恢复的响应句柄，超时/本地取消后仍能收到迟到响应；传输断开不是控制器拒绝，
 重连和新会话 False 不会消除旧请求的不确定性。无法取得旧请求终态或发生部分发送/断线时，
 需现场核实并处置控制器状态；重启驱动本身不证明远端请求已取消。
@@ -291,7 +300,7 @@ ACP 同样标记为时长/控制器超时推断。WebSocket发送成功仅代表
 必须现场核实并处置控制器遗留目标后再重启恢复，重启驱动本身不能证明旧目标已取消。
 
 执行卡系统 `start`/`stop` 是立即返回 `ready`/`idle` 的生命周期标记，不访问机器人或等待控制锁。
-`info` 和 `state` 另行报告实际连接状态；生命周期 `ready` 不表示已连接或允许运动。
+`info` 和 `switch_mode.get_current_mode` 另行报告实际连接状态；生命周期 `ready` 不表示已连接或允许运动。
 已接受的动作仍由驱动运行时和 ACP 跟踪，不因生命周期标记而丢失；需要停止运动时必须调用
 `stop_move`、`switch_mode.pause` 或触发执行卡的中断 hook。驱动退出时会清理在途动作。
 
@@ -322,32 +331,38 @@ MCP 请求日志在所有 HTTP 连接间共享采样器，重复成功/失败请
 
 运动及恢复/模式切换要求有效租约和租约期内接收的使能状态；过期的 True 不能作为已启用依据，
 过期的 False 不能跳过暂停请求。恢复时验证未知则拒绝请求，等待只读检查，不擅自调用启用服务。
-`state.info.feedback.enable_verification` 提供有效性、年龄、来源及错误。
+`switch_mode.get_current_mode.feedback.enable_verification` 提供有效性、年龄、来源及错误。
 ROS 图查询和 latch 重新投递是状态通路检查，不是带生产者时间戳的硬件心跳，也不证明物理静止；
 ROS master 缓存、具体 rosbridge 版本和真机控制器行为仍需现场核实。
 
-## 状态转发与能力边界
+## 传感输出与能力边界
 
-`state.start` 后以5Hz发布 `/<namespace>/state/control`，类型 `std_msgs/String`，格式 `data/json`。
-`state.info` 随时返回相同快照。内容包含连接代次、模式反馈新鲜度、软件控制状态、各字段接收时间/年龄、
-reach-time 以及实测双手世界系末端位姿（左6 + 右6，各为 `[x,y,z,yaw,pitch,roll]`，米/弧度）。
-断线/重连会清除上一连接的数值；停止状态卡输出不会停止用于运动检查的内部反馈订阅。
-即使断线，已启动的状态/传感卡仍发布明确 disconnected/invalid 消息，避免保留“已连接”的旧显示。
+已移除公开 `state` 卡；控制安全检查的内部反馈订阅仍保留。
+诊断通过 `switch_mode.get_current_mode.feedback` 获取，包括连接、控制反馈、robot_discovery 和 host_runtime，
+不再发布原来无助于传感展示的 control 流。
 
-新增传感卡均按10Hz输出 `std_msgs/String` 到 Agent Core 的 domain42：
+`joints/imu/loco_state` 按10Hz输出，battery/laser_scan按5Hz输出：
 
 | 卡片 | 输出话题 | 内容 |
 | --- | --- | --- |
-| `joints` | `/<namespace>/state/joints` | 下肢4+左臂7+右臂7+头2，q rad、dq rad/s、ddq rad/s²；名称从实际 URDF 的已核实 child-link 顺序映射；原始 effort 保留在 vendor |
-| `imu` | `/<namespace>/state/imu` | quaternion 明确 wxyz、gyroscope rad/s、accelerometer/free_acceleration m/s²；不猜安装 frame |
-| `loco_state` | `/<namespace>/state/odom` | motus.odom/1，本体系 vx/vy/wz 窗口均值；其他轴 null，原始 pose/twist/header 位于 vendor |
+| `joints` | `/<namespace>/state/joints` | 经运行时模型校验的20关节 `sensor/skeleton` 姿态；缺失实测时 invalid |
+| `joints` | `/<namespace>/state/joint_state` | 原始 joint_q/joint_v/joint_vd/joint_torque、来源和采集时间；独立于骨架模型，供诊断，不用于绕过控制校验 |
+| `imu` | `/<namespace>/state/imu` | 实测 wxyz quaternion、rpy、角速度和加速度；不猜安装 frame |
+| `loco_state` | `/<namespace>/state/loco_state` | 扁平 x/y/z、roll/pitch/yaw、yaw_deg 和速度；优先新鲜 `/move_base/amcl_pose` map 定位，缺失时明确回退到 odom frame |
+| `loco_state` | `/<namespace>/state/odom` | 独立 `motus.odom/1` 本体系 vx/vy/wz 窗口均值；未知轴 null，不将 map 位姿混入标准 odom |
+| `battery` | `/<namespace>/state/battery` | 扁平 main_/chassis_/small_ 标量字段，单位写在键名中；保留不同状态码，不将0V或缺失数据当作有效测量 |
+| `laser_scan` | `/<namespace>/state/laser_scan/points` | 首路 `sensor/pointcloud`：UInt8MultiArray 中 `<u32 step=16><u32 N><float32 x,y,z,intensity × N>`；z/intensity=0 |
+| `laser_scan` | `/<namespace>/state/laser_scan` | 原始 angle/range 元数据及测距 JSON；无效测距 null |
+
+前端默认使用 topic_out 首路，因此雷达首路改为可视化点云，loco_state 首路改为位置/姿态展示。
+旧画布保存的卡名/输出可能需刷新驱动或重新添加卡片，驱动兼容旧配置 camera_rgb/camera_rgb_right 的开启设置。
 
 0.5s无测量或数据不合法会输出 `valid:false`；缺失力矩/速度不补零。
 `model` 与 G1、天轶 2.0 一样读取驱动 `resource/` 下的 URDF，前端无需 STL 即可显示静态骨架，
 不依赖机器人在线或控制器启动。模型来源、固定版本和许可证见 [resource/README.md](resource/README.md)。
 该文件是 400062 参考模型，尚未核实与现场硬件修订及标定完全一致，不能用作控制模型。
 实时更新仍要求实测 q；真机 `/humanoid_description` 缺失，或其20个受测关节名称与本地模型不一致时，
-`joints` 输出 invalid、空关节数组和原因，静态 `model` 仍可读取。`state.info` 中的
+`joints` 输出 invalid、空关节数组和原因，静态 `model` 仍可读取。`switch_mode.get_current_mode.feedback` 中的
 `robot_discovery.model_error` 表示运行时模型校验错误，`skeleton_model` 记录本地来源与名称校验状态。
 参考姿态不代表测得的 q=0。原始20关节不含底盘轮角/手指；这些不属于本卡的实测能力。
 
@@ -404,15 +419,21 @@ MCP 探测示例（只查询状态）：
 curl -s http://localhost:15747/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 curl -s http://localhost:15747/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"state","arguments":{"action":"info"}}}'
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"switch_mode","arguments":{"action":"get_current_mode"}}}'
 ```
 
 真机仍需验证：
 
 1. ROS1 上述类型/服务正确，rosbridge/rosapi 能加载厂商消息和参数，模式持续50Hz更新；确认使能 latched 重投递和发布者查询可用，验证发布者消失/探测超时后阻止运动。
-2. 分别 start 传感卡，确认 domain42 收到 control/joints/imu/odom，字段、URDF名称、方向和 frame 正确，外部网络不接收该 DDS 数据。
+2. 分别 start 传感卡，确认 domain42 收到 joints/joint_state/imu/loco_state/odom 及外设数据，字段、URDF名称、方向和 frame 正确，外部网络不接收该 DDS 数据。
 3. 在现场有人监督且接口就绪时，分别以小幅度验证底盘、双臂、下肢、躯干和头部的方向与单位；检查每个动作的 ACP 成功/取消/错误。
 4. 验证软件暂停、过渡窗口拒绝、恢复后需重新发目标、rosbridge 断线后不重放指令，以及多个执行卡共享通道的仲裁；在恢复/切换模式等待时触发停止，确认停止不因 busy 被丢弃，旧请求不能重新放开运动。
 5. 检查关节 ACP 在实测到位后才成功；卡住、数据中断或误差超限不能成功。测量位姿 reach-time 估计的偏差，评估进一步闭环。
 
 离线测试不能替代容器构建、DDS 互通和真机运动验证。
+
+
+2026-11-16 最新现场验收：Agent Core 内连续30秒收到左右相机各300帧、头部299帧，
+三路JPEG解码正确；头部采集至Agent DDS回调平均约90ms（非浏览器端到端时延）。
+IMU、位置展示和标准odom各300帧且全部有效，电池/雷达点云各150帧，点云末帧3158点。
+全身 joints/joint_state 仍因无真实发布者明确 invalid。190项离线测试、Python编译和部署片段检查通过。

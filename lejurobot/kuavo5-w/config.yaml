@@ -6,14 +6,15 @@ robot_serial: null
 # Set false to disable motion, resume and mode changes while preserving reads/stop.
 motion_enabled: true
 # One-time host/install.py provisions a loopback helper; startup then ensures
-# only rosbridge + read-only battery relay. Never starts/enables WBC or MPC.
+# rosbridge, read-only battery relay and installed RGB-only head camera helpers.
+# Never starts/enables WBC or MPC.
 host_runtime:
   enabled: true
 # Start rosbridge_server on the ROS Noetic host and point this URL at it.
 rosbridge_url: "ws://127.0.0.1:9090"
 sensors:
   imu_topic: /imu
-  auto_start: [state, joints, imu, loco_state, battery, laser_scan, camera_rgb, camera_rgb_right]
+  auto_start: [joints, imu, loco_state, battery, laser_scan, camera_left, camera_right, camera_head]
   # Only admit body-frame odometry; extend after verifying the robot's TF tree.
   odom_body_frames: [base_link, base_footprint]
   # SDK permits N*m or current. Set N*m only after verifying robot hardware output.
@@ -30,12 +31,12 @@ plugins:
   waist: {enabled: true}
   head: {enabled: true}
   switch_mode: {enabled: true}
-  state: {enabled: true}
   joints: {enabled: true}
   imu: {enabled: true}
   loco_state: {enabled: true}
   model: {enabled: true}
   battery: {enabled: true}
   laser_scan: {enabled: true}
-  camera_rgb: {enabled: true}
-  camera_rgb_right: {enabled: true}
+  camera_left: {enabled: true}
+  camera_right: {enabled: true}
+  camera_head: {enabled: true}

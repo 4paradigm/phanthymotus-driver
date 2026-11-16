@@ -110,6 +110,8 @@ class KuavoSensors:
         self._seen = {}
         self._errors = {}
         self._odom_window = deque(maxlen=2048)
+        self._display_pose = {}
+        self._pose_seen = None
         self._running = set()
         self._body_frames = set(config.get('odom_body_frames', ['base_link', 'base_footprint']))
         self._torque_unit = config.get('joint_torque_unit')
@@ -122,7 +124,20 @@ class KuavoSensors:
                         'loco_state': f'/{namespace}/state/odom'}
         self._pubs = {key: node.create_publisher(String, topic, 10)
                       for key, topic in self._topics.items()}
+        self._joint_state_topic = f'/{namespace}/state/joint_state'
+        self._joint_state_pub = node.create_publisher(String, self._joint_state_topic, 1)
+        self._joint_raw = None
+        self._joint_raw_seen = None
+        self._loco_topic = f'/{namespace}/state/loco_state'
+        self._loco_pub = node.create_publisher(String, self._loco_topic, 1)
+        # Average all received odometry within each 10 Hz output window. Do not
+        # decimate at rosbridge: it both aliases data and creates empty windows.
         ros1.subscribe('/odom', 'nav_msgs/Odometry', self._on_odom)
+        ros1.subscribe('/move_base/amcl_pose', 'geometry_msgs/PoseWithCovarianceStamped', self._on_localization)
+        # Read-only diagnostics do not depend on the full controller being up.
+        for topic in ('/sensors_data_raw', '/sensors_data_raw_shm'):
+            ros1.subscribe(topic, 'kuavo_msgs/sensorsData',
+                           lambda msg, source=topic: self._on_joint_raw(msg, source), throttle_ms=100)
         ros1.subscribe(self._imu_topic, 'sensor_msgs/Imu', self._on_standard_imu)
         self._timer = node.create_timer(0.1, self.tick)
 
@@ -139,6 +154,9 @@ class KuavoSensors:
                 self._seen.clear()
                 self._errors.clear()
                 self._odom_window.clear()
+                self._display_pose.clear()
+                self._pose_seen = self._joint_raw_seen = None
+                self._joint_raw = None
                 self._generation = generation
                 self._discovery_error = 'disconnected' if not connected else 'waiting_for_discovery'
                 self._model_error = self._discovery_error
@@ -341,6 +359,9 @@ class KuavoSensors:
     def _on_raw(self, message, source, generation):
         if not self._session()[0]:
             return
+        if generation != self._generation:
+            return
+        self._on_joint_raw(message, source)
         with self._lock:
             if (self._profile is None or source != self._raw_topic or
                     generation != self._generation):
@@ -371,6 +392,93 @@ class KuavoSensors:
                 self._data.pop('imu', None)
                 self._seen.pop('imu', None)
                 self._errors['imu'] = str(exc)
+
+    def _on_joint_raw(self, message, source):
+        """Expose actual arrays even before model verification; never for control."""
+        if not self._session()[0]:
+            return
+        with self._lock:
+            try:
+                raw = message['joint_data']
+                if not isinstance(raw, dict):
+                    raise ValueError('missing joint_data')
+                values = {}
+                for key in ('joint_q', 'joint_v', 'joint_vd', 'joint_torque'):
+                    array = raw.get(key)
+                    if array is not None:
+                        if not isinstance(array, list) or not 1 <= len(array) <= 256 or not all(map(finite, array)):
+                            raise ValueError('invalid raw joint array')
+                        values[key] = list(array)
+                if 'joint_q' not in values:
+                    raise ValueError('missing joint_q')
+                self._joint_raw = {'source_topic': source, 'sensor_time': json_safe(message.get('sensor_time')),
+                    **values, 'joint_count': len(values['joint_q']), 'q_unit': 'rad', 'v_unit': 'rad/s',
+                    'vd_unit': 'rad/s^2', 'torque_unit': self._torque_unit,
+                    'model_mapping_verified': self._names is not None and self._identity_fresh()}
+                self._joint_raw_seen = time.monotonic()
+            except (KeyError, TypeError, ValueError, AttributeError):
+                self._joint_raw = self._joint_raw_seen = None
+
+    def joint_raw_snapshot(self):
+        self._session()
+        with self._lock:
+            valid = (self.ros1.connection[0] and self._joint_raw_seen is not None
+                     and time.monotonic() - self._joint_raw_seen <= .5)
+            empty = dict.fromkeys(('joint_q', 'joint_v', 'joint_vd', 'joint_torque', 'sensor_time'))
+            return {**empty, **(copy.deepcopy(self._joint_raw) if valid else {'joint_count': 0}), 'valid': bool(valid),
+                    'reason': None if valid else 'missing_or_stale_full_body_joint_data'}
+
+    @staticmethod
+    def _pose_fields(pose, frame, source):
+        position = xyz(pose['position'])
+        w, x, y, z = xyz(pose['orientation'], ('w', 'x', 'y', 'z'))
+        if not isinstance(frame, str) or not frame or len(frame) > 256 or abs(w*w+x*x+y*y+z*z-1) > .1:
+            raise ValueError('invalid pose/frame')
+        roll = math.atan2(2*(w*x+y*z), 1-2*(x*x+y*y))
+        pitch = math.asin(max(-1., min(1., 2*(w*y-z*x))))
+        yaw = math.atan2(2*(w*z+x*y), 1-2*(y*y+z*z))
+        return dict(zip(('x_m', 'y_m', 'z_m'), position), frame_id=frame, pose_source=source,
+                    roll_rad=roll, pitch_rad=pitch, yaw_rad=yaw, yaw_deg=math.degrees(yaw))
+
+    def _on_localization(self, message):
+        if not self._session()[0]:
+            return
+        with self._lock:
+            try:
+                self._display_pose = self._pose_fields(message['pose']['pose'], message['header']['frame_id'],
+                                                       '/move_base/amcl_pose')
+                self._pose_seen = time.monotonic()
+            except (KeyError, TypeError, ValueError, AttributeError):
+                self._display_pose, self._pose_seen = {}, None
+
+    def loco_display(self):
+        """Display map localization separately from body-frame navigation odom."""
+        self._session()
+        with self._lock:
+            now = time.monotonic()
+            localized = self._pose_seen is not None and now - self._pose_seen <= 3
+            result = dict(self._display_pose) if localized else {}
+            raw = self._data.get('loco_state', {})
+            odom_valid = now - self._seen.get('loco_state', -1e9) <= .5
+            if not localized and odom_valid:
+                try:
+                    vendor = raw['vendor']
+                    result = self._pose_fields(vendor['pose']['pose'], vendor['header']['frame_id'], '/odom')
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    pass
+            values = [None] * 6
+            if odom_valid:
+                twist = raw['vendor']['twist']['twist']
+                values[0], values[1], values[5] = twist['linear']['x'], twist['linear']['y'], twist['angular']['z']
+            empty = dict.fromkeys(('x_m', 'y_m', 'z_m', 'roll_rad', 'pitch_rad', 'yaw_rad', 'yaw_deg',
+                                  'frame_id', 'pose_source'))
+            return {**empty, **result, 'pose_valid': bool(result), 'localization_valid': localized,
+                    'pose_age_ms': round((now-self._pose_seen)*1000) if localized else
+                                   round((now-self._seen['loco_state'])*1000) if result else None,
+                    'velocity_frame': raw.get('vendor', {}).get('child_frame_id') if odom_valid else None,
+                    'velocity_valid': odom_valid, 'vx_m_s': values[0], 'vy_m_s': values[1], 'wz_rad_s': values[5],
+                    'valid': bool(result) or odom_valid,
+                    'reason': None if result or odom_valid else 'missing_or_stale_pose_and_odometry'}
 
     def _on_standard_imu(self, message):
         if not self._session()[0]:
@@ -482,16 +590,31 @@ class KuavoSensors:
                 message = String()
                 message.data = json.dumps(payload, separators=(',', ':'), allow_nan=False)
                 self._pubs[card].publish(message)
+                if card == 'joints':
+                    raw = String()
+                    raw.data = json.dumps(self.joint_raw_snapshot(), allow_nan=False, separators=(',', ':'))
+                    self._joint_state_pub.publish(raw)
+                elif card == 'loco_state':
+                    display = String()
+                    display.data = json.dumps(self.loco_display(), allow_nan=False, separators=(',', ':'))
+                    self._loco_pub.publish(display)
 
     def tools(self):
         descriptions = {'joints': '全身控制器实测20关节；控制器未启动时 invalid，参考骨架不冒充实际姿态',
                         'imu': '独立 /imu 实测姿态/角速度/加速度，不依赖全身控制器；不将其套到骨架根节点',
-                        'loco_state': '实测底盘本体系 vx/vy/wz，motus.odom/1；未测轴为 null'}
+                        'loco_state': '位置/姿态/速度展示 + 独立 actucore navi motus.odom/1 里程计；区分 map 定位与 odom'}
         tools = [{'name': name, 'type': 'sensor', 'multiInstance': False,
                   'description': description, 'inputSchema': {'type': 'object', 'properties': {}},
                   'topic_out': [{'topic': self._topics[name],
                                  'format': {'joints': 'sensor/skeleton', 'loco_state': 'state/odom'}.get(name, 'data/json')}]}
                  for name, description in descriptions.items()]
+        for tool in tools:
+            if tool['name'] == 'joints':
+                tool['topic_out'].append({'topic': self._joint_state_topic, 'format': 'data/json',
+                                          'desc': 'joint_state 原始关节数组，不依赖显示模型校验'})
+            elif tool['name'] == 'loco_state':
+                tool['topic_out'].insert(0, {'topic': self._loco_topic, 'format': 'data/json',
+                                            'desc': '位置、角度和速度；frame与来源明确标注'})
         tools.append({'name': 'model', 'type': 'resource',
                       'description': 'Kuavo 5-W 本地参考 URDF 骨架模型；无需机器人在线，实测姿态由 joints 单独提供',
                       'inputSchema': {'type': 'object', 'properties': {}}})
@@ -514,7 +637,7 @@ class KuavoSensors:
             elif action != 'info':
                 return {'state': 'error', 'error': f'unknown action: {action}'}
             result = {'state': 'running' if card in self._running else 'idle',
-                      'feedback': self.snapshot(card)}
+                      'feedback': self.loco_display() if card == 'loco_state' else self.snapshot(card)}
             if card == 'joints':
                 result['skeleton_model'] = self.health()['skeleton_model']
             if card in self._running:
