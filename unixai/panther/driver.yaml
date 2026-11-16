@@ -1,5 +1,5 @@
 id: unixai-panther-driver
-name: UniX AI Panther Driver
+name: UniX AI Panther Bundle
 category: driver
 hardware_provider: unixai
 hardware_model: panther

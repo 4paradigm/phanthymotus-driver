@@ -327,16 +327,16 @@ class PantherDriverTest(unittest.TestCase):
         self.assertIn("dependencies are installed only through apt", readme)
         self.assertIn("second pip requirements layer", readme)
 
-    def test_canvas_registration_identity_remains_backward_compatible(self):
+    def test_canvas_registration_identity_matches_known_good_release(self):
         config = (DRIVER / "config.yaml").read_text()
         manifest = (DRIVER / "driver.yaml").read_text()
         main = (DRIVER / "main.py").read_text()
-        self.assertIn('name: "UniX AI Panther"', config)
-        self.assertIn("name: UniX AI Panther Driver", manifest)
+        self.assertIn('name: "UniX AI Panther Bundle"', config)
+        self.assertIn("name: UniX AI Panther Bundle", manifest)
         self.assertIn("camera_color", config)
         self.assertIn("camera_color", manifest)
         self.assertNotIn("camera_rgb", manifest)
-        self.assertIn('"unixai-panther-device-bundle"', main)
+        self.assertIn('"unixai-panther"', main)
         self.assertLess(main.index("ThreadingHTTPServer("), main.index("start_registration("))
 
     def test_action_resources_follow_agent_core_conventions(self):

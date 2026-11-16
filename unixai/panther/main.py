@@ -43,7 +43,7 @@ def main() -> None:
         ("", port),
         make_handler(
             lambda: bundle,
-            "unixai-panther-device-bundle",
+            "unixai-panther",
             "unixai-panther-driver",
         ),
     )
