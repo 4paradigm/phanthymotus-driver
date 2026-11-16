@@ -17,8 +17,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import String
 
-from common.odom import build_interface, build_sample, mean_twist, resolve_stamp_ms
-from loco_odometry import OdometrySource, CLOCK_ID, UNCERTAINTY_NS
+from common.odom import build_interface, build_sample, is_fresh, mean_twist, resolve_stamp_ms
+from loco_odometry import OdometrySource, CLOCK_ID, MAX_AGE_NS, UNCERTAINTY_NS
 
 
 class _LocoStateClient:
@@ -310,7 +310,7 @@ class LocoStatePlugin:
         self._odom_topic = f"/{namespace}/state/odom"
         self._odom_interface = build_interface(
             provides=["vx", "vy", "wz"], rate_hz=self._hz,
-            pose_drift="unbounded", timing={"stamp_source": "robot"})
+            pose_drift="unbounded", timing={"stamp_source": "received"})
         self._odom_interface["slam_pose"] = {"available": True, "profile": "motus_slam/1"}
         self._node = Node("tianyi2_loco_state_pub", context=ros2.ctx_core)
         ros2.executor_core.add_node(self._node)
@@ -331,6 +331,8 @@ class LocoStatePlugin:
         }
         self._slow_timestamps = {}
         self._latest = locomotion_snapshot({}, {})
+        self._slam_sample = {"stamp_ms": None, "pose": None, "vendor": {"motus_slam": {
+            "status": "waiting", "stamp_source": "unknown", "reason": "source not started"}}}
         self._displacement = _DisplacementTracker()
         self._samples = 0
         self._odometry = OdometrySource(base_url, self._hz, self._publish_odometry)
@@ -430,17 +432,35 @@ class LocoStatePlugin:
             with self._lock:
                 self._latest = snapshot
                 self._samples += 1
+                self._publish_odom_locked()
             out = String()
             out.data = json.dumps(snapshot, allow_nan=False)
             self._pub.publish(out)
             self._stop_event.wait(max(0, 1 / self._hz - (time.monotonic() - started)))
 
     def _publish_odometry(self, sample):
-        # Preserve REST telemetry under vendor, never substitute it for a lost
-        # diagnostic pose or stamp the pose with HTTP arrival time.
         with self._lock:
-            latest = copy.deepcopy(self._latest)
-        sample = {**sample, "vendor": {**latest, **sample["vendor"]}}
+            self._slam_sample = copy.deepcopy(sample)
+            self._publish_odom_locked()
+
+    def _publish_odom_locked(self):
+        # Control feedback retains its REST receive time even while diagnostic
+        # timing is lost. Pose has its own diagnostic measurement time; neither
+        # REST pose nor receive time can substitute for it.
+        sample = odometry_sample(self._latest)
+        sample["stamp_ms"] = self._latest["sample_timestamps_ms"].get("speed")
+        if not is_fresh(sample, int(time.time() * 1000), MAX_AGE_NS // 1_000_000):
+            sample["twist"] = [None] * 6
+            sample["vendor"]["samples"] = 0
+        sample["pose"] = copy.deepcopy(self._slam_sample["pose"])
+        if sample["pose"] is not None:
+            sample["pose"]["stamp_ms"] = self._slam_sample["stamp_ms"]
+        quality = copy.deepcopy(self._slam_sample["vendor"]["motus_slam"])
+        if sample["pose"] is not None:
+            # Preserve precise source time and make old top-level-only SLAM
+            # decoders reject a packet whose twist and pose times differ.
+            quality["stamp_ns"] = quality["measurement"]["stamp_ns"]
+        sample["vendor"]["motus_slam"] = quality
         message = String()
         message.data = json.dumps(sample, allow_nan=False)
         self._odom_pub.publish(message)

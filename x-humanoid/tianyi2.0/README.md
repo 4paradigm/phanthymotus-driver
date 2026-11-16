@@ -83,16 +83,25 @@ requests cannot block pose/speed publication. MCP `stop` returns the canvas
 lifecycle marker `{"state": "idle"}` while leaving this always-active observer
 running, matching R1; driver shutdown stops all telemetry and diagnostic workers and their connections.
 
-The standard port uses a separate read-only TCP subscription on port 1445 to
-`base/deadreckon_with_gyro_yaw`. It integrates every diagnostic displacement
+The same standard port publishes REST measured body `twist` at every fast poll,
+with top-level `stamp_ms` equal to that speed reply's receive time. The declared
+`timing.stamp_source` is `received`; acquisition latency remains unknown and no
+`max_measurement_delay_ms` is claimed. Diagnostic callbacks retain that original
+REST stamp and clear cached twist after 250 ms or a future timestamp; a failed
+REST reading produces null axes. Diagnostic timing loss does not erase healthy
+REST motion feedback. No second odometry port is added.
+
+A separate read-only TCP connection on port 1445 subscribes to
+`base/deadreckon_with_gyro_yaw` and integrates every diagnostic displacement
 (metres) and yaw increment (radians), then publishes the latest source sample at
 `plugins.loco_state.hz`. The diagnostic queue is drained at least 20 Hz even
 when publication is slower. Planar integration treats XY as body-frame increments;
 this convention still requires a measured moving-robot acceptance test. The
 first timestamp group establishes a fresh origin. Pose position is `[x, y, 0]`,
-quaternion is XYZW, and covariance is null. `twist` is the group displacement
-divided by its distinct-source-time interval, with unmeasured axes null; it is distinct from
-the REST velocity retained under `vendor`.
+quaternion is XYZW, and covariance is null. The diagnostic integration remains
+independent of the REST feedback: `pose.stamp_ms` is mapped diagnostic source
+time, and `vendor.motus_slam.stamp_ns` preserves its exact nanoseconds. REST
+pose is telemetry only and never replaces this pose.
 
 The diagnostic event's uptime timestamp is mapped to host realtime using five
 bounded `/api/platform/v1/timestamp` request intervals. The offset is checked
@@ -116,25 +125,28 @@ the actual integer `offset_ns` for each capture. The arithmetic remains
 `source_ms * 1e6 + offset_ns == stamp_ns`; the declared bound stays 50 ms, and
 accepted probe intervals must remain inside the existing 25 ms verification
 envelope. Invalid probes do not alter the ramp or refresh its two-second TTL.
-Perception's explicit input-contract path currently treats any mapping-dictionary
-change as requiring a new segment; it needs a separate compatibility update
-before this producer can be used on that path. The implicit frame-based path
-accepts changing per-capture offsets. This driver change does not modify or
-certify Perception, and has not been deployed over an active mapping session.
+The companion Perception PR #371/#395 `continuous_pose_clock` implementation
+accepts verified v2 chassis slews in the same segment only when every mapping
+field except `offset_ns` is unchanged and the offset change stays within 1% of
+elapsed source time. Changed clock identity, evidence or mapping version still
+requires a new segment. Use a Perception revision containing that implementation
+and the independent `pose.stamp_ms` decoder change described below; an older
+revision is not compatible. No fixed-offset rollback is required. This change
+has not been deployed over an active mapping session.
 `info().slam_odometry.timing` separates request/header/body time, total probe
 time, increment-read time and publication time. `last_loss` preserves the
 pre-failure timings across recovery. This instrumentation is not an accuracy
 claim or permission to reuse an expired clock mapping.
 Each sample retains the original
 source milliseconds and the mapping in `vendor.motus_slam.measurement`;
-`stamp_ms` is mapped source time, never TCP receipt time. The user-selected 50 ms
+`pose.stamp_ms` is mapped source time, never TCP or HTTP receipt time. The user-selected 50 ms
 uncertainty is a software clock-mapping budget, not a bound on sensor acquisition
 latency or hardware synchronization. REST pose and speed receive times remain
-separate telemetry and are never used as a SLAM fallback.
+separate observations and are never used as a SLAM pose fallback.
 
 `info().odom_interface` declares `slam_pose = {"available": true,
 "profile": "motus_slam/1"}`, `provides = ["vx", "vy", "wz"]`,
-`pose_drift = "unbounded"` and `timing.stamp_source = "robot"`.
+`pose_drift = "unbounded"` and `timing.stamp_source = "received"` for control feedback.
 `info().slam_odometry` reports the current tracking/lost state and reason,
 `synchronization = "bounded_software"` and `clock_mapping_budget_ms = 50`.
 The message uses the existing `motus.odom/1` JSON format, not ROS
@@ -143,12 +155,21 @@ The message uses the existing `motus.odom/1` JSON format, not ROS
 
 Connect `state/odom` to the SLAM card's odometry input. The pose includes the
 `motus_slam/1` quality metadata and source-time mapping accepted by its decoder.
+Deploy the companion Perception PR #371/#395 decoder/validator revision with
+this driver: it reads explicit `pose.stamp_ms`, falling back to top-level
+`stamp_ms` only for legacy packets without an independent pose timestamp. It
+checks exact `quality.stamp_ns` and diagnostic measurement evidence against the
+pose time. Older decoders reject a split-time packet through their existing
+precise-time mismatch check, rather than treating REST receipt as pose time.
+Repeated REST updates retain the same pose timestamp and do not refresh the
+SLAM consumer's diagnostic ingress age.
 The point cloud must independently have a verified clock relationship and a
 measured transform to the chassis reference; this adapter does not invent a
 camera mount transform or mark the native cloud's unknown timing as verified.
 Timestamp rollback, reordered increments, gaps over 100 ms, data older
 than 250 ms, disconnects, or failed clock checks publish `lost` with null pose
-and twist. Recovery creates a new segment and origin, preventing interpolation
+and strict `vendor.motus_slam` loss metadata; independently healthy REST twist
+remains available for control. Recovery creates a new segment and origin, preventing interpolation
 across a reset. A stationary ten-minute native-cloud load probe in 50 ms
 software mode completed without loss or segment resets. Moving-robot mapping
 and production deployment still require acceptance; the observed publication

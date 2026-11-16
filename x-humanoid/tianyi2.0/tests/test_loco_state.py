@@ -303,7 +303,7 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(("vx", "vy", "wz"), interface.provides)
         self.assertEqual("unbounded", interface.pose_drift)
         self.assertEqual(20, interface.rate_hz)
-        self.assertEqual({"stamp_source": "robot"}, interface.timing)
+        self.assertEqual({"stamp_source": "received"}, interface.timing)
         self.assertNotIn("max_measurement_delay_ms", interface.timing)
         self.assertTrue(interface.usable_for_control)
         self.assertFalse(info["available"])
@@ -329,6 +329,7 @@ class PluginTests(unittest.TestCase):
             state.start()
             self.assertIs(worker, state._thread)
             wait_for(lambda: len(state._odom_pub.messages) >= 1)
+            wait_for(lambda: state._odom_pub.messages[-1]["vendor"]["motus_slam"]["status"] == "tracking")
             raw, odom = state._pub.messages[-1], state._odom_pub.messages[-1]
             self.assertEqual("tracking", odom["vendor"]["motus_slam"]["status"])
             self.assertEqual([0., 0., 0.], odom["pose"]["position"])
@@ -570,34 +571,136 @@ def test_slam_capability_is_declared_on_existing_odom_port():
     state = plugin()
     interface = state.dispatch("info", {})["odom_interface"]
     assert interface.get("slam_pose") == {"available": True, "profile": "motus_slam/1"}
-    assert interface["timing"]["stamp_source"] == "robot"
+    assert interface["timing"]["stamp_source"] == "received"
 
 
-def test_rest_poll_cannot_publish_a_pose_to_slam():
+def test_rest_poll_publishes_control_feedback_without_diagnostic_source():
     state = plugin()
     original = state._pub.publish
     def one_poll(message):
         original(message)
         state._stop_event.set()
     state._pub.publish = one_poll
-    state._poll_loop()
-    assert state._pub.messages[0]["available"]
-    assert state._odom_pub.messages == []
-
-
-def test_diagnostic_publish_keeps_source_pose_time_and_quality():
-    state = plugin()
-    sample = {"schema": "motus.odom/1", "stamp_ms": 1234, "pose": None,
-              "twist": [None]*6, "vendor": {"motus_slam": {"status": "lost"}}}
-    assert hasattr(state, "_publish_odometry"), "diagnostic publication is not connected"
-    state._publish_odometry(sample)
+    with patch.object(STATE.time, "time", return_value=1_792_052_530.020):
+        state._poll_loop()
     out = state._odom_pub.messages[-1]
-    assert out["stamp_ms"] == 1234
+    assert out["stamp_ms"] == 1_792_052_530_020
+    assert out["twist"] == [0.3, 0, None, None, None, -0.4]
+    assert out["vendor"]["stamp_source"] == "received"
     assert out["pose"] is None
-    assert out["vendor"]["motus_slam"]["status"] == "lost"
+    assert out["vendor"]["motus_slam"]["status"] == "waiting"
+
+
+def diagnostic_sample(status="tracking"):
+    return {"schema": "motus.odom/1",
+            "stamp_ms": 1_792_052_530_000 if status == "tracking" else None,
+            "frame": "body", "units": {"length": "m"},
+            "pose": {"frame_id": "segment_odom", "child_frame_id": "base_link",
+                     "position": [0., 0., 0.], "quaternion": [0., 0., 0., 1.],
+                     "covariance": None} if status == "tracking" else None,
+            "twist": [0.1, 0., None, None, None, 0.2],
+            "vendor": {"stamp_source": "robot", "source_stamp_ms": 1234, "motus_slam": {
+                "status": status, "stamp_source": "measurement" if status == "tracking" else "unknown",
+                "segment_id": "segment", "clock_id": "clock", "measurement": {
+                    "stamp_ns": 1_792_052_530_000_000_000}}}}
+
+
+def test_diagnostic_pose_keeps_its_own_time_separate_from_rest_feedback():
+    state = plugin()
+    state._latest = snapshot()
+    source = diagnostic_sample()
+    with patch.object(STATE.time, "time", return_value=1_792_052_530.020):
+        state._publish_odometry(source)
+    out = state._odom_pub.messages[-1]
+    assert out["stamp_ms"] == 1_792_052_530_010
+    assert out["twist"] == [0.3, 0, None, None, None, -0.4]
+    assert out["pose"]["stamp_ms"] == 1_792_052_530_000
+    assert out["vendor"]["motus_slam"] == {**source["vendor"]["motus_slam"],
+        "stamp_ns": 1_792_052_530_000_000_000}
+    assert "source_stamp_ms" not in out["vendor"]
+    assert out["vendor"]["stamp_source"] == "received"
+    assert "stamp_ms" not in source["pose"]
+
+
+def test_diagnostic_loss_keeps_healthy_rest_motion_and_clears_pose():
+    state = plugin()
+    state._latest = snapshot()
+    with patch.object(STATE.time, "time", return_value=1_792_052_530.020):
+        state._publish_odometry(diagnostic_sample())
+        state._publish_odometry(diagnostic_sample("lost"))
+        # A later REST poll must retain the loss rather than resurrecting pose.
+        original = state._pub.publish
+        def one_poll(message):
+            original(message)
+            state._stop_event.set()
+        state._pub.publish = one_poll
+        state._poll_loop()
+    for out in state._odom_pub.messages[-2:]:
+        assert out["twist"] == [0.3, 0, None, None, None, -0.4]
+        assert out["vendor"]["stamp_source"] == "received"
+        assert out["pose"] is None
+        assert out["vendor"]["motus_slam"]["status"] == "lost"
+        assert out["vendor"]["motus_slam"]["stamp_source"] == "unknown"
+
+
+@pytest.mark.parametrize("now", [1_792_052_530.261, 1_792_052_530.009])
+def test_diagnostic_callback_cannot_refresh_stale_or_future_rest_speed(now):
+    state = plugin()
+    state._latest = snapshot()
+    with patch.object(STATE.time, "time", return_value=now):
+        state._publish_odometry(diagnostic_sample("lost"))
+    out = state._odom_pub.messages[-1]
+    assert out["stamp_ms"] == 1_792_052_530_010
+    assert out["twist"] == [None] * 6
+    assert out["vendor"]["samples"] == 0
+    assert out["pose"] is None
+
+
+def test_current_rest_failure_does_not_reuse_previous_speed():
+    state = plugin()
+    with patch.object(STATE.time, "time", return_value=1_792_052_530.020):
+        state._latest = snapshot()
+        state._publish_odometry(diagnostic_sample())
+        state._latest = snapshot(speed={"error": "offline"})
+        state._publish_odometry(diagnostic_sample())
+    out = state._odom_pub.messages[-1]
+    assert out["twist"] == [None] * 6
+    assert out["pose"]["stamp_ms"] == 1_792_052_530_000
+    assert out["vendor"]["motus_slam"]["status"] == "tracking"
 
 
 def test_info_declares_approved_software_clock_budget():
     info=plugin().dispatch('info', {})['slam_odometry']
     assert info['synchronization']=='bounded_software'
     assert info['clock_mapping_budget_ms']==50
+
+
+def test_rest_poll_finishing_after_diagnostic_loss_cannot_resurrect_pose():
+    entered, release = threading.Event(), threading.Event()
+    class SlowSpeed(Client):
+        def get_speed(self, *, timeout):
+            entered.set()
+            assert release.wait(1)
+            return super().get_speed(timeout=timeout)
+    state = plugin(SlowSpeed())
+    state._latest = snapshot()
+    original = state._pub.publish
+    def one_poll(message):
+        original(message)
+        state._stop_event.set()
+    state._pub.publish = one_poll
+    with patch.object(STATE.time, "time", return_value=1_792_052_530.020):
+        state._publish_odometry(diagnostic_sample())
+        worker = threading.Thread(target=state._poll_loop)
+        worker.start()
+        try:
+            assert entered.wait(1)
+            state._publish_odometry(diagnostic_sample("lost"))
+        finally:
+            release.set()
+            worker.join(1)
+    assert not worker.is_alive()
+    for out in state._odom_pub.messages[1:]:
+        assert out["pose"] is None
+        assert out["vendor"]["motus_slam"]["status"] == "lost"
+        assert out["twist"] == [0.3, 0, None, None, None, -0.4]
