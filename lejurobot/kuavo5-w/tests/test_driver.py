@@ -109,7 +109,7 @@ class DriverContractTests(unittest.TestCase):
         self.callback_patch = patch.object(driver, "_acp_complete", side_effect=lambda *a: self.callbacks.append(a))
         self.callback_patch.start()
         self.ros, self.node = FakeRos1(), FakeNode()
-        self.bundle = driver.KuavoBundle({"motion_enabled": True}, "test_robot", self.ros, self.node)
+        self.bundle = driver.KuavoBundle({}, "test_robot", self.ros, self.node)
         self.bundle.sensors.discover()
         self.ros.raw()
         self.ros.emit("/enable_control_state", True)
@@ -124,6 +124,7 @@ class DriverContractTests(unittest.TestCase):
 
     def test_metadata_and_schema_actions_agree(self):
         import yaml
+        self.assertTrue(self.bundle.state.snapshot()['motion_enabled'])
         tools = {tool["name"]: tool for tool in self.bundle.get_all_tools()}
         metadata = yaml.safe_load((ROOT / "driver.yaml").read_text())
         self.assertEqual(set(tools), {c["name"] for c in metadata["cards"]})
@@ -493,10 +494,10 @@ class DriverContractTests(unittest.TestCase):
         self.assertTrue(self.bundle._closing)
 
 
-class CommissioningGateTests(unittest.TestCase):
-    def test_default_configuration_blocks_motion_and_enable_but_preserves_reads_and_pause(self):
+class MotionConfigurationTests(unittest.TestCase):
+    def test_explicit_disable_blocks_motion_and_enable_but_preserves_reads_and_pause(self):
         ros = FakeRos1()
-        bundle = driver.KuavoBundle({}, 'test', ros, FakeNode())
+        bundle = driver.KuavoBundle({'motion_enabled': False}, 'test', ros, FakeNode())
         try:
             bundle.sensors.discover()
             ros.raw()

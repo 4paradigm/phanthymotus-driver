@@ -118,7 +118,7 @@ class DeploymentTests(unittest.TestCase):
     def test_metadata_config_compose_and_flat_build_context(self):
         meta = yaml.safe_load((ROOT / "driver.yaml").read_text())
         config = yaml.safe_load((ROOT / "config.yaml").read_text())
-        self.assertIs(config['motion_enabled'], False)
+        self.assertIs(config['motion_enabled'], True)
         compose = next(iter(yaml.safe_load((ROOT / "deploy/service.yml").read_text()).values()))
         self.assertEqual(meta["port"], config["mcp_port"])
         self.assertEqual(meta["mcp_url"], f"http://localhost:{config['mcp_port']}/mcp")

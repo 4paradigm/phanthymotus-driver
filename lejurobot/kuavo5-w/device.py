@@ -54,7 +54,7 @@ class RobotState:
     """Internal feedback stays subscribed even when the state card is stopped."""
     PREFIX = "state"
 
-    def __init__(self, ros1, node, namespace: str, sensors, motion_enabled=False):
+    def __init__(self, ros1, node, namespace: str, sensors, motion_enabled=True):
         self.ros1 = ros1
         self.sensors = sensors
         self._topic = f"/{namespace}/state/control"
@@ -152,7 +152,7 @@ class RobotState:
 
     def require_motion_enabled(self):
         if not self.motion_enabled:
-            raise RuntimeError("motion is disabled; set motion_enabled: true only for supervised hardware commissioning")
+            raise RuntimeError("motion is disabled by configuration; set motion_enabled: true and restart the driver")
 
     def _publish(self) -> None:
         if self._running:
@@ -628,7 +628,7 @@ class ControlPlugin(_KuavoPlugin):
 
 class KuavoBundle:
     def __init__(self, config, namespace, ros1, ros2_node):
-        motion_enabled = config.get("motion_enabled", False)
+        motion_enabled = config.get("motion_enabled", True)
         if type(motion_enabled) is not bool:
             raise ValueError("motion_enabled must be a YAML boolean")
         self.ros1, self.namespace = ros1, namespace

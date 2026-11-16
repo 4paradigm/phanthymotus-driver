@@ -1,8 +1,8 @@
 mcp_port: 15747
 name: "Leju Kuavo 5-W Driver"
 ros_namespace: ""
-# Read-only by default. Enable explicitly for supervised hardware commissioning.
-motion_enabled: false
+# Set false to disable motion, resume and mode changes while preserving reads/stop.
+motion_enabled: true
 # Start rosbridge_server on the ROS Noetic host and point this URL at it.
 rosbridge_url: "ws://127.0.0.1:9090"
 sensors:

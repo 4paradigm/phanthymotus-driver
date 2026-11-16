@@ -61,9 +61,10 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 ```
 
 本驱动不会自动启动机器人控制器、启用控制、切换 MPC 模式或开启 quick mode。
-默认 `motion_enabled: false`，允许读取状态、传感器和本地模型，但拒绝运动、恢复控制及模式切换。
-软件暂停和 `stop_move` 仍可调用。现场核实接口、单位及停止语义后，仅在有人监督的联调环境中，
-将实际加载的配置文件设置为 `motion_enabled: true` 并重启驱动；配置必须是 YAML 布尔值，不能写字符串。
+`motion_enabled` 默认 `true`，未配置该字段时也默认开启，无需额外修改配置即可调用运动接口。
+开启仅表示允许驱动处理请求，不会自动使能机器人、切换模式或发起运动，原有运行时检查仍然生效。
+如需只读运行，可在实际加载的配置文件中设置 `motion_enabled: false` 并重启驱动；此时拒绝运动、
+恢复控制及模式切换，仍允许状态/传感器/模型读取、软件暂停和 `stop_move`。该字段必须是 YAML 布尔值。
 `state.info.feedback.motion_enabled` 与执行卡 `info.motion_enabled` 可确认当前配置。
 机器人必须处于允许运动的状态，且收到本次 WebSocket 连接内的控制状态和新鲜模式反馈后才接受运动指令。
 启动和重连后，独立线程经 rosapi 探测机型、robot_version、自由度、SHM 参数及 `/humanoid_description`。
@@ -236,7 +237,7 @@ curl -s http://localhost:15747/mcp -H 'Content-Type: application/json' \
 
 1. ROS1 上述类型/服务正确，rosbridge/rosapi 能加载厂商消息和参数，模式持续50Hz更新，软件控制状态可接收。
 2. 分别 start 传感卡，确认 domain42 收到 control/joints/imu/odom，字段、URDF名称、方向和 frame 正确，外部网络不接收该 DDS 数据。
-3. 仅在现场有人监督且接口就绪时显式开启 `motion_enabled`，分别以小幅度验证底盘、双臂、下肢、躯干和头部的方向与单位；检查每个动作的 ACP 成功/取消/错误。
+3. 在现场有人监督且接口就绪时，分别以小幅度验证底盘、双臂、下肢、躯干和头部的方向与单位；检查每个动作的 ACP 成功/取消/错误。
 4. 验证软件暂停、过渡窗口拒绝、恢复后需重新发目标、rosbridge 断线后不重放指令，以及多个执行卡共享通道的仲裁。
 5. 检查关节 ACP 在实测到位后才成功；卡住、数据中断或误差超限不能成功。测量位姿 reach-time 估计的偏差，评估进一步闭环。
 

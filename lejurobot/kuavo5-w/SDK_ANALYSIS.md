@@ -141,7 +141,7 @@ SDK 数据类的“world”文字描述不能覆盖控制器中的实际变换�
 - 每个物理执行卡继续保留 ACP、资源声明和 interrupt hook，动作分组补齐 required 参数。
 - 系统 `start`/`stop` 仅返回生命周期标记，不调用全身暂停；在途动作仍由 bundle/ACP 管理，停止由 `stop_move`/interrupt 显式执行。
 - 暂停/恢复/模式切换使用共用2s的服务与反馈预算；前台控制锁等待上限0.25s，争用时返回 busy，生命周期不等待该锁。
-- 默认 `motion_enabled: false`，遥测和骨架可读；有人监督的硬件联调需显式开启，运动、恢复及切换模式仍接受原有运行时检查。
+- `motion_enabled` 默认 true（未配置亦然），运动、恢复及切换模式仍接受原有运行时检查；显式设为 false 时可只读运行，保留暂停/停止能力。
 - 注册补齐 id/transport；rosbridge 错误日志只输出有界转义字段；移除本地未使用的 ROS2 geometry_msgs 依赖。
 
 ## 7. 仍需真机确认
