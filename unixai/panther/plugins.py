@@ -200,7 +200,6 @@ def build_plugins(config, namespace, device):
             device, "camera_depth", "depth", "Panther Gemini 2 depth stream (zlib 16UC1)"
         ))
 
-    confirm = {"type": "boolean", "const": True, "description": "Explicitly confirm physical motion"}
     if on("base_drive"):
         cfg = enabled["base_drive"]
         schema = _action_schema(
@@ -211,9 +210,8 @@ def build_plugins(config, namespace, device):
                 "angular_z_deg_s": {"type": "number", "minimum": -cfg["max_angular_deg_s"], "maximum": cfg["max_angular_deg_s"],
                                     "description": "Horizontal turn rate in degrees per second"},
                 "duration_s": {"type": "number", "minimum": 0.1, "maximum": cfg["max_duration_s"]},
-                "confirm_motion": confirm,
             },
-            {"move": {"params": ["linear_x", "linear_y", "angular_z_deg_s", "duration_s", "confirm_motion"]},
+            {"move": {"params": ["linear_x", "linear_y", "angular_z_deg_s", "duration_s"]},
              "stop": {"params": []}, "cancel": {"params": []},
              "start": {"params": []}, "info": {"params": []}},
             "base",
@@ -237,10 +235,9 @@ def build_plugins(config, namespace, device):
                 "left_positions_deg": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8},
                 "right_positions_deg": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8},
                 "duration_s": {"type": "number", "minimum": 1.0, "maximum": enabled["arm_control"]["max_duration_s"]},
-                "confirm_motion": confirm,
             },
-            {"move": {"params": ["side", *joint_fields, "duration_s", "confirm_motion"]},
-             "home": {"params": ["side", "confirm_motion"]},
+            {"move": {"params": ["side", *joint_fields, "duration_s"]},
+             "home": {"params": ["side"]},
              "stop": {"params": []}, "start": {"params": []}, "info": {"params": []}},
             ["arm_l", "arm_r"],
             {"actions": ["move", "home"], "timeout": enabled["arm_control"]["max_duration_s"] + 15},
@@ -249,21 +246,21 @@ def build_plugins(config, namespace, device):
         plugins.append(ActuatorPlugin(device, "arm_control", "Safe P2P arm control with verified controller switching", schema, device.arm))
     if on("gripper"):
         schema = _action_schema(
-            ["start", "info", "set", "open", "close"],
+            ["start", "info", "set", "open", "close", "stop"],
             {"side": {"type": "string", "enum": ["left", "right", "both"], "default": "both"},
-             "position": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-             "confirm_motion": confirm},
-            {"set": {"params": ["side", "position", "confirm_motion"]},
-             "open": {"params": ["side", "confirm_motion"]},
-             "close": {"params": ["side", "confirm_motion"]},
+             "position": {"type": "number", "minimum": 0.0, "maximum": 1.0}},
+            {"set": {"params": ["side", "position"]},
+             "open": {"params": ["side"]},
+             "close": {"params": ["side"]},
+             "stop": {"params": []},
              "start": {"params": []}, "info": {"params": []}}, ["hand_l", "hand_r"])
         plugins.append(ActuatorPlugin(device, "gripper", "Left/right Panther gripper position control", schema, device.gripper))
     if on("lifting"):
         schema = _action_schema(
-            ["start", "info", "set_position"],
-            {"position_m": {"type": "number", "minimum": enabled["lifting"].get("min_position_m", 0.0), "maximum": enabled["lifting"]["max_position_m"]},
-             "confirm_motion": confirm},
-            {"set_position": {"params": ["position_m", "confirm_motion"]},
+            ["start", "info", "set_position", "stop"],
+            {"position_m": {"type": "number", "minimum": enabled["lifting"].get("min_position_m", 0.0), "maximum": enabled["lifting"]["max_position_m"]}},
+            {"set_position": {"params": ["position_m"]},
+             "stop": {"params": []},
              "start": {"params": []}, "info": {"params": []}}, "waist")
         plugins.append(ActuatorPlugin(device, "lifting", "Panther lifting position control", schema, device.lifting))
     if on("head"):
@@ -274,10 +271,9 @@ def build_plugins(config, namespace, device):
                          "description": "Horizontal head angle in degrees"},
              "pitch_deg": {"type": "number", "minimum": enabled["head"].get("pitch_min_deg", -86.0),
                            "maximum": enabled["head"].get("pitch_max_deg", 20.0),
-                           "description": "Head pitch angle in degrees"},
-             "confirm_motion": confirm},
-            {"look": {"params": ["yaw_deg", "pitch_deg", "confirm_motion"]},
-             "home": {"params": ["confirm_motion"]}, "stop": {"params": []},
+                           "description": "Head pitch angle in degrees"}},
+            {"look": {"params": ["yaw_deg", "pitch_deg"]},
+             "home": {"params": []}, "stop": {"params": []},
              "start": {"params": []}, "info": {"params": []}}, "head",
             {"actions": ["home"], "timeout": 30}, True)
         plugins.append(ActuatorPlugin(device, "head", "Panther head pan/tilt control using live URDF limits", schema, device.head))

@@ -7,11 +7,6 @@ ros:
   core_domain_id: 42
   robot_rmw: "rmw_cyclonedds_cpp"
 
-safety:
-  # Keep all physical movement blocked until commissioning caps are approved
-  # for this Panther and this workspace. Sensor cards and info calls still run.
-  commissioning_motion_enabled: false
-
 plugins:
   joints: {enabled: true}
   robot_state: {enabled: true}

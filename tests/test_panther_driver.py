@@ -67,7 +67,7 @@ class PantherDriverTest(unittest.TestCase):
                     "gripper", "lifting", "head"}
         self.assertEqual(discovered, expected)
 
-    def test_control_cards_keep_safety_gates_and_add_lifecycle(self):
+    def test_control_cards_use_runtime_safety_checks_and_lifecycle(self):
         class FakeDevice:
             topics = {
                 name: {"topic": f"/test/{name}", "format": "data/json"}
@@ -89,18 +89,22 @@ class PantherDriverTest(unittest.TestCase):
         tools = {plugin.name: plugin.get_tool()
                  for plugin in plugins.build_plugins(config, "test", FakeDevice())}
         base = tools["base_drive"]["inputSchema"]
-        self.assertEqual(base["properties"]["confirm_motion"]["const"], True)
+        self.assertNotIn("confirm_motion", base["properties"])
         self.assertEqual(base["x-completion"]["actions"], ["move"])
         self.assertEqual(base["properties"]["angular_z_deg_s"]["maximum"], 45.0)
         self.assertEqual(base["properties"]["duration_s"]["maximum"], 10.0)
         arm = tools["arm_control"]["inputSchema"]
         self.assertTrue({"move", "home", "stop"} <= set(arm["properties"]["action"]["enum"]))
         self.assertTrue({"la0_deg", "la7_deg", "ra0_deg", "ra7_deg"} <= set(arm["properties"]))
-        self.assertEqual(arm["properties"]["confirm_motion"]["const"], True)
+        self.assertNotIn("confirm_motion", arm["properties"])
         gripper = tools["gripper"]["inputSchema"]
         self.assertEqual(gripper["properties"]["side"]["enum"], ["left", "right", "both"])
-        self.assertTrue({"set", "open", "close"} <= set(gripper["properties"]["action"]["enum"]))
+        self.assertTrue({"set", "open", "close", "stop"} <= set(gripper["properties"]["action"]["enum"]))
+        self.assertEqual(gripper["x-action-params"]["stop"], {"params": []})
         self.assertNotIn("mode", gripper["properties"])
+        lifting = tools["lifting"]["inputSchema"]
+        self.assertIn("stop", lifting["properties"]["action"]["enum"])
+        self.assertEqual(lifting["x-action-params"]["stop"], {"params": []})
         head = tools["head"]["inputSchema"]
         self.assertTrue({"look", "home", "stop"} <= set(head["properties"]["action"]["enum"]))
         self.assertTrue({"yaw_deg", "pitch_deg"} <= set(head["properties"]))
@@ -115,6 +119,13 @@ class PantherDriverTest(unittest.TestCase):
         exposed = json.dumps(tools, ensure_ascii=False)
         self.assertIsNone(re.search(r"[一-鿿]", exposed))
         self.assertNotRegex(exposed, r'"(?:head[01]|la[0-7]|ra[0-7])_rad"')
+
+    def test_one_shot_actuators_accept_canvas_stop_without_motion_confirmation(self):
+        device = (DRIVER / "device.py").read_text()
+        self.assertEqual(
+            device.count("single position command: nothing is in flight in this driver"),
+            2,
+        )
 
     def test_head_channels_follow_physical_robot_mapping(self):
         current = {"joint_head0": 0.0, "joint_head1": 0.0}
@@ -211,23 +222,18 @@ class PantherDriverTest(unittest.TestCase):
                 ("joint_la0",), [0.8], {"joint_la0": (-1.0, 1.0)}, {"joint_la0": 0.0}, 0.35
             )
 
-    def test_drive_requires_explicit_motion_confirmation(self):
-        config = {"max_linear_mps": 0.5, "max_angular_deg_s": 45.0, "max_duration_s": 10.0}
-        with self.assertRaisesRegex(ValueError, "confirm_motion"):
-            contracts.validate_drive({"linear_x": 0.1, "duration_s": 1.0}, config)
-
     def test_drive_caps_and_finite_duration(self):
         config = {"max_linear_mps": 0.5, "max_angular_deg_s": 45.0, "max_duration_s": 10.0}
         command = contracts.validate_drive(
             {"linear_x": 0.5, "linear_y": -0.5, "angular_z_deg_s": 45.0,
-             "duration_s": 10.0, "confirm_motion": True}, config
+             "duration_s": 10.0}, config
         )
         self.assertEqual(command[:2], (0.5, -0.5))
         self.assertAlmostEqual(command[2], math.radians(45.0))
         self.assertEqual(command[3], 10.0)
         with self.assertRaisesRegex(ValueError, "duration_s"):
             contracts.validate_drive(
-                {"linear_x": 0.0, "duration_s": -1, "confirm_motion": True}, config
+                {"linear_x": 0.0, "duration_s": -1}, config
             )
 
     def test_manifest_lists_expected_cards(self):
@@ -398,12 +404,12 @@ class PantherDriverTest(unittest.TestCase):
         self.assertNotIn('"dual_arms"', plugins)
         self.assertNotIn('"grippers"', plugins)
 
-    def test_deployment_contract_and_motion_gate_are_explicit(self):
+    def test_deployment_contract_is_explicit(self):
         config = (DRIVER / "config.yaml").read_text()
         manifest = (DRIVER / "driver.yaml").read_text()
         service = (DRIVER / "deploy" / "service.yml").read_text()
         dockerfile = (DRIVER / "Dockerfile").read_text()
-        self.assertIn("commissioning_motion_enabled: false", config)
+        self.assertNotIn("commissioning_motion_enabled", config)
         for text in (config, manifest, dockerfile):
             self.assertIn("15792", text)
         self.assertIn("AGENT_CORE_ROS_DOMAIN_ID=42", service)

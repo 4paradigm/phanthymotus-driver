@@ -32,7 +32,6 @@ from contracts import (
     parse_joint_indices,
     parse_joint_limits,
     populate_switch_request,
-    require_confirmation,
     validate_drive,
     validate_joint_target,
 )
@@ -679,8 +678,6 @@ class PantherDevice:
         lifting, lifting_at = self._get("lifting")
         controllers, controllers_at = self._get("controllers")
         reasons = []
-        if self._cfg.get("safety", {}).get("commissioning_motion_enabled") is not True:
-            reasons.append("commissioning motion is disabled")
         if not fresh(joints_at):
             reasons.append("no fresh /joint_states")
         if not fresh(hardware_at, 5.0):
@@ -756,11 +753,6 @@ class PantherDevice:
         return out
 
     def _ensure_motion_ready(self) -> None:
-        if self._cfg.get("safety", {}).get("commissioning_motion_enabled") is not True:
-            raise RuntimeError(
-                "motion is disabled by safety.commissioning_motion_enabled; "
-                "confirm commissioning limits before enabling it"
-            )
         status = self.robot_state()
         if not status["ready_for_motion"]:
             raise RuntimeError("motion rejected: fresh joint and hardware state are required")
@@ -883,8 +875,7 @@ class PantherDevice:
             self._require_states(states, {"movebase3_drive_controller": "active"})
             topic, subscribers = self._select_drive_topic()
             return {"state": "ready", "controllers": states, "topic": topic,
-                    "cmd_topics": subscribers,
-                    "commissioning_motion_enabled": self._cfg.get("safety", {}).get("commissioning_motion_enabled") is True}
+                    "cmd_topics": subscribers}
         if action != "move":
             raise ValueError(f"unsupported base_drive action: {action}")
         self._ensure_motion_ready()
@@ -985,13 +976,11 @@ class PantherDevice:
             return {"state": "moving" if active else "ready", "active": active,
                     "controllers": states,
                     "joint_state_fresh": fresh(self._get("joints")[1]),
-                    "limits_loaded": bool(self._joint_limits),
-                    "commissioning_motion_enabled": self._cfg.get("safety", {}).get("commissioning_motion_enabled") is True}
+                    "limits_loaded": bool(self._joint_limits)}
         if action in ("stop", "cancel"):
             return self._stop_arm("cancelled_by_request", wait_s=10.0)
         if action not in ("move", "home"):
             raise ValueError(f"unsupported arm_control action: {action}")
-        require_confirmation(args)
         self._ensure_motion_ready()
         cfg = self._cfg["plugins"]["arm_control"]
         max_duration = float(cfg["max_duration_s"])
@@ -1165,6 +1154,11 @@ class PantherDevice:
         from sensor_msgs.msg import JointState
         from unix_msgs.msg import GripperCommand
         action = args.get("action", "set")
+        if action == "stop":
+            return {
+                "state": "idle",
+                "note": "single position command: nothing is in flight in this driver, and no further command will be sent",
+            }
         if action in ("start", "info"):
             states = self.controller_states()
             self._require_states(states, {
@@ -1178,7 +1172,6 @@ class PantherDevice:
             return {"state": "ready", "feedback": feedback, "controllers": states}
         if action not in ("set", "open", "close"):
             raise ValueError(f"unsupported gripper action: {action}")
-        require_confirmation(args)
         self._ensure_motion_ready()
         side = args.get("side", "both")
         if side not in ("left", "right", "both"):
@@ -1206,6 +1199,11 @@ class PantherDevice:
     def lifting(self, args: dict) -> dict:
         from sensor_msgs.msg import JointState
         action = args.get("action", "set_position")
+        if action == "stop":
+            return {
+                "state": "idle",
+                "note": "single position command: nothing is in flight in this driver, and no further command will be sent",
+            }
         if action in ("start", "info"):
             states = self.controller_states()
             self._require_states(states, {"lifting_controller": "active"})
@@ -1218,7 +1216,6 @@ class PantherDevice:
                     "joint_name": joint_name}
         if action != "set_position":
             raise ValueError(f"unsupported lifting action: {action}")
-        require_confirmation(args)
         self._ensure_motion_ready()
         self._require_controller("lifting_controller")
         position = finite_number(args.get("position_m"), "position_m")
@@ -1257,7 +1254,6 @@ class PantherDevice:
             return self._stop_head("cancelled_by_request", wait_s=5.0)
         if action not in ("look", "home"):
             raise ValueError(f"unsupported head action: {action}")
-        require_confirmation(args)
         self._ensure_motion_ready()
         self._require_controller("head_forward_position_controller")
         joint_msg, received = self._get("joints")

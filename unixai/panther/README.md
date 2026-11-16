@@ -62,9 +62,12 @@ for these concrete runtime paths:
 For a base-image update, measure package-layer changes with `docker history`
 instead of recording a size that becomes stale with the moving base image.
 
-Every physical-motion action requires `confirm_motion: true`. Arm and head
-commands also require a live `/robot_description`; missing limits cause a hard
-rejection rather than a guessed fallback. Base and arm movements are
+Physical-motion actions use the same direct-call model as the Tianyi action
+cards: they do not add a separate confirmation parameter or a global software
+enable switch. Commands are still rejected unless live robot/controller state
+and configured limits pass their card-specific checks. Arm and head commands
+also require a live `/robot_description`; missing limits cause a hard rejection
+rather than a guessed fallback. Base and arm movements are
 asynchronous, return `action_id`, report completion, and can be stopped. Arm
 controller state is restored to its pre-command snapshot. Base movement is
 finite-duration and publishes repeated zero commands when it ends or is
@@ -76,11 +79,6 @@ use radians, so conversion happens only at the robot boundary. The head mapping
 follows physical-robot testing rather than the vendor URDF axis labels:
 `yaw_deg` controls the first head channel (`joint_head0`) and `pitch_deg`
 controls the second (`joint_head1`).
-
-Physical movement is additionally blocked by
-`safety.commissioning_motion_enabled: false`. Do not enable it until the
-commissioning velocity, duration and arm-delta caps have been approved on the
-target robot.
 
 ## Deliberately deferred
 
