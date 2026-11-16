@@ -62,10 +62,14 @@ for these concrete runtime paths:
 For a base-image update, measure package-layer changes with `docker history`
 instead of recording a size that becomes stale with the moving base image.
 
-Physical-motion actions use the same direct-call model as the Tianyi action
-cards: they do not add a separate confirmation parameter or a global software
-enable switch. Commands are still rejected unless live robot/controller state
-and configured limits pass their card-specific checks. Arm and head commands
+Every physical-motion action requires `confirm_motion: true`: base `move`, arm
+`move`/`home`, gripper `set`/`open`/`close`, lifting `set_position`/`home`, and
+head `look`/`home`. The requirement is declared in each MCP schema and enforced
+again at the first runtime boundary, before any controller query, ROS publisher,
+or robot-state access. Lifecycle-only actions (`start`, `info`, `stop`, and
+`cancel`) do not require confirmation. Commands are also rejected unless live
+robot/controller state and configured limits pass their card-specific checks.
+Arm and head commands
 also require a live `/robot_description`; missing limits cause a hard rejection
 rather than a guessed fallback. Base and arm movements are
 asynchronous, return `action_id`, report completion, and can be stopped. Arm

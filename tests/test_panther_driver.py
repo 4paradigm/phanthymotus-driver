@@ -94,7 +94,8 @@ class PantherDriverTest(unittest.TestCase):
         tools = {plugin.name: plugin.get_tool()
                  for plugin in plugins.build_plugins(config, "test", FakeDevice())}
         base = tools["base_drive"]["inputSchema"]
-        self.assertNotIn("confirm_motion", base["properties"])
+        self.assertIs(base["properties"]["confirm_motion"]["const"], True)
+        self.assertIn("confirm_motion", base["x-action-params"]["move"]["params"])
         self.assertEqual(base["x-completion"]["actions"], ["move"])
         self.assertEqual(base["properties"]["angular_z_deg_s"]["maximum"], 45.0)
         self.assertEqual(base["properties"]["duration_s"]["maximum"], 10.0)
@@ -103,7 +104,7 @@ class PantherDriverTest(unittest.TestCase):
         arm = tools["arm_control"]["inputSchema"]
         self.assertTrue({"move", "home", "stop"} <= set(arm["properties"]["action"]["enum"]))
         self.assertTrue({"la0_deg", "la7_deg", "ra0_deg", "ra7_deg"} <= set(arm["properties"]))
-        self.assertNotIn("confirm_motion", arm["properties"])
+        self.assertIs(arm["properties"]["confirm_motion"]["const"], True)
         gripper = tools["gripper"]["inputSchema"]
         self.assertEqual(gripper["properties"]["side"]["enum"], ["left", "right", "both"])
         self.assertTrue({"set", "open", "close", "stop"} <= set(gripper["properties"]["action"]["enum"]))
@@ -118,7 +119,7 @@ class PantherDriverTest(unittest.TestCase):
         self.assertTrue({"yaw_deg", "pitch_deg"} <= set(head["properties"]))
         self.assertEqual(head["properties"]["speed"]["enum"], ["low", "high"])
         self.assertEqual(head["properties"]["speed"]["default"], "high")
-        self.assertEqual(head["x-action-params"]["home"]["params"], [])
+        self.assertEqual(head["x-action-params"]["home"]["params"], ["confirm_motion"])
         self.assertEqual(set(head["x-completion"]["actions"]), {"look", "home"})
         expected_hooks = {
             "on_interrupt_motion": {"action": "stop"},
@@ -128,6 +129,25 @@ class PantherDriverTest(unittest.TestCase):
             self.assertEqual(tools[tool_name]["inputSchema"]["x-hooks"], expected_hooks)
         self.assertNotIn("x-hooks", tools["gripper"]["inputSchema"])
         self.assertNotIn("x-hooks", tools["lifting"]["inputSchema"])
+        confirmed = {
+            "base_drive": {"move"},
+            "arm_control": {"move", "home"},
+            "gripper": {"set", "open", "close"},
+            "lifting": {"set_position", "home"},
+            "head": {"look", "home"},
+        }
+        for tool_name, actions in confirmed.items():
+            schema = tools[tool_name]["inputSchema"]
+            self.assertIs(schema["properties"]["confirm_motion"]["const"], True)
+            self.assertEqual(
+                set(schema["allOf"][0]["if"]["properties"]["action"]["enum"]),
+                actions,
+            )
+            self.assertEqual(schema["allOf"][0]["then"]["required"], ["confirm_motion"])
+            for action in actions:
+                self.assertIn("confirm_motion", schema["x-action-params"][action]["params"])
+            for action in set(schema["properties"]["action"]["enum"]) - actions:
+                self.assertNotIn("confirm_motion", schema["x-action-params"][action]["params"])
         exposed = json.dumps(tools, ensure_ascii=False)
         self.assertIsNone(re.search(r"[一-鿿]", exposed))
         self.assertNotRegex(exposed, r'"(?:head[01]|la[0-7]|ra[0-7])_rad"')
@@ -138,6 +158,24 @@ class PantherDriverTest(unittest.TestCase):
             device.count("single position command: nothing is in flight in this driver"),
             2,
         )
+
+    def test_runtime_rejects_unconfirmed_motion_before_ros_or_state_access(self):
+        device = object.__new__(device_module.PantherDevice)
+        calls = (
+            (device.drive, {"action": "move"}),
+            (device.arm, {"action": "home"}),
+            (device.gripper, {"action": "open"}),
+            (device.lifting, {"action": "home"}),
+            (device.head, {"action": "home"}),
+        )
+        for method, payload in calls:
+            for confirmation in (None, False):
+                args = dict(payload)
+                if confirmation is not None:
+                    args["confirm_motion"] = confirmation
+                with self.subTest(method=method.__name__, confirmation=confirmation):
+                    with self.assertRaisesRegex(ValueError, "confirm_motion=true"):
+                        method(args)
 
     def test_state_and_battery_are_separate_streams(self):
         device = (DRIVER / "device.py").read_text()
@@ -256,15 +294,24 @@ class PantherDriverTest(unittest.TestCase):
         config = {"max_linear_mps": 0.5, "max_angular_deg_s": 45.0, "max_duration_s": 10.0}
         command = contracts.validate_drive(
             {"linear_x": 0.5, "linear_y": -0.5, "angular_z_deg_s": 45.0,
-             "duration_s": 10.0}, config
+             "duration_s": 10.0, "confirm_motion": True}, config
         )
         self.assertEqual(command[:2], (0.5, -0.5))
         self.assertAlmostEqual(command[2], math.radians(45.0))
         self.assertEqual(command[3], 10.0)
         with self.assertRaisesRegex(ValueError, "duration_s"):
             contracts.validate_drive(
-                {"linear_x": 0.0, "duration_s": -1}, config
+                {"linear_x": 0.0, "duration_s": -1, "confirm_motion": True}, config
             )
+
+    def test_drive_validation_rejects_missing_or_false_confirmation(self):
+        config = {"max_linear_mps": 0.5, "max_angular_deg_s": 45.0,
+                  "max_duration_s": 10.0}
+        for args in ({"linear_x": 0.1},
+                     {"linear_x": 0.1, "confirm_motion": False}):
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(ValueError, "confirm_motion=true"):
+                    contracts.validate_drive(args, config)
 
     def test_drive_stop_waits_for_match_then_republishes_zero(self):
         class FakePublisher:
@@ -457,6 +504,23 @@ class PantherDriverTest(unittest.TestCase):
         self.assertIn("#100:", lines[1])
         self.assertIn("#200:", lines[2])
         self.assertTrue(all(len(line) < 300 for line in lines))
+
+    def test_laser_render_failures_are_bounded_and_sampled(self):
+        device = object.__new__(device_module.PantherDevice)
+        device._lock = threading.RLock()
+        device._laser_render_failures = 0
+        output = io.StringIO()
+        noisy = ValueError("bad\nlayout " + "x" * 400)
+        with contextlib.redirect_stdout(output):
+            for _ in range(200):
+                device._log_laser_render_failure(noisy)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertIn("#1:", lines[0])
+        self.assertIn("#100:", lines[1])
+        self.assertIn("#200:", lines[2])
+        self.assertTrue(all(len(line) < 320 for line in lines))
+        self.assertIn("laser_view_attempt", (DRIVER / "device.py").read_text())
 
     def test_container_dependency_contract_is_apt_only_and_explained(self):
         dockerfile = (DRIVER / "Dockerfile").read_text()

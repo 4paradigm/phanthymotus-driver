@@ -75,6 +75,11 @@ def head_target_from_degrees(args: dict, current: dict[str, float]) -> list[floa
     ]
 
 
+def require_confirmation(args: dict) -> None:
+    if args.get("confirm_motion") is not True:
+        raise ValueError("confirm_motion=true is required before sending a physical-motion command")
+
+
 def parse_joint_limits(urdf: str) -> dict[str, tuple[float, float]]:
     """Read authoritative revolute/prismatic limits from the live URDF."""
     if not isinstance(urdf, str) or not urdf.strip():
@@ -155,6 +160,7 @@ def validate_joint_target(
 
 
 def validate_drive(args: dict, config: dict) -> tuple[float, float, float, float]:
+    require_confirmation(args)
     vx = finite_number(args.get("linear_x", 0.0), "linear_x")
     vy = finite_number(args.get("linear_y", 0.0), "linear_y")
     wz_deg_s = finite_number(args.get("angular_z_deg_s", 0.0), "angular_z_deg_s")

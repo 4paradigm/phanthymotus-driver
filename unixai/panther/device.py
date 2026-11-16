@@ -32,6 +32,7 @@ from contracts import (
     parse_joint_indices,
     parse_joint_limits,
     populate_switch_request,
+    require_confirmation,
     validate_drive,
     validate_joint_target,
 )
@@ -120,6 +121,7 @@ class PantherDevice:
         self._cache: dict[str, tuple[object, float]] = {}
         self._last_card_publish: dict[str, float] = {}
         self._callback_errors: dict[str, dict] = {}
+        self._laser_render_failures = 0
         self._model_urdf = MODEL_PATH.read_text(encoding="utf-8")
         self._model_joint_indices = parse_joint_indices(self._model_urdf)
         self._model_joint_limits = parse_joint_limits(self._model_urdf)
@@ -424,8 +426,12 @@ class PantherDevice:
         self._publish_limited("laser_scan", payload, 5.0)
         now = time.monotonic()
         with self._lock:
-            previous = self._last_card_publish.get("laser_view", 0.0)
+            # Track attempts separately from successful publishes. Otherwise a
+            # persistent encoder failure retries at the full lidar rate.
+            previous = self._last_card_publish.get("laser_view_attempt", 0.0)
             due = now - previous >= 1.0
+            if due:
+                self._last_card_publish["laser_view_attempt"] = now
         if not due:
             return
         try:
@@ -452,7 +458,16 @@ class PantherDevice:
                     "frame_id": payload.get("frame_id", ""),
                 }, 1.0)
         except Exception as exc:
-            print(f"[laser_scan] top-down view failed: {exc}", flush=True)
+            self._log_laser_render_failure(exc)
+
+    def _log_laser_render_failure(self, exc: Exception) -> None:
+        with self._lock:
+            self._laser_render_failures += 1
+            count = self._laser_render_failures
+        if count != 1 and count % 100:
+            return
+        detail = " ".join(f"{type(exc).__name__}: {exc}".split())[:240]
+        print(f"[laser_scan] top-down view failure #{count}: {detail}", flush=True)
 
     def _publish_odom_window(self) -> None:
         with self._lock:
@@ -951,7 +966,6 @@ class PantherDevice:
             return
 
     def drive(self, args: dict) -> dict:
-        from geometry_msgs.msg import Twist
         action = args.get("action", "move")
         if action in ("cancel", "stop"):
             return self.cancel_drive("cancelled_by_request", force=True)
@@ -963,6 +977,8 @@ class PantherDevice:
                     "cmd_topics": subscribers}
         if action != "move":
             raise ValueError(f"unsupported base_drive action: {action}")
+        require_confirmation(args)
+        from geometry_msgs.msg import Twist
         self._ensure_motion_ready()
         self._require_controller("movebase3_drive_controller")
         topic, subscribers = self._select_drive_topic()
@@ -1109,6 +1125,7 @@ class PantherDevice:
             return self._stop_arm("cancelled_by_request", wait_s=10.0)
         if action not in ("move", "home"):
             raise ValueError(f"unsupported arm_control action: {action}")
+        require_confirmation(args)
         self._ensure_motion_ready()
         cfg = self._cfg["plugins"]["arm_control"]
         max_duration = float(cfg["max_duration_s"])
@@ -1278,8 +1295,6 @@ class PantherDevice:
                 "stopped": True, "reason": reason, "action_id": action_id}
 
     def gripper(self, args: dict) -> dict:
-        from sensor_msgs.msg import JointState
-        from unix_msgs.msg import GripperCommand
         action = args.get("action", "set")
         if action == "stop":
             return {
@@ -1299,6 +1314,9 @@ class PantherDevice:
             return {"state": "ready", "feedback": feedback, "controllers": states}
         if action not in ("set", "open", "close"):
             raise ValueError(f"unsupported gripper action: {action}")
+        require_confirmation(args)
+        from sensor_msgs.msg import JointState
+        from unix_msgs.msg import GripperCommand
         self._ensure_motion_ready()
         side = args.get("side", "both")
         if side not in ("left", "right", "both"):
@@ -1324,7 +1342,6 @@ class PantherDevice:
         return {"state": "commanded", "side": side, "mode": mode, "position": position}
 
     def lifting(self, args: dict) -> dict:
-        from sensor_msgs.msg import JointState
         action = args.get("action", "set_position")
         if action == "stop":
             return {
@@ -1343,6 +1360,8 @@ class PantherDevice:
                     "joint_name": joint_name}
         if action not in ("set_position", "home"):
             raise ValueError(f"unsupported lifting action: {action}")
+        require_confirmation(args)
+        from sensor_msgs.msg import JointState
         self._ensure_motion_ready()
         self._require_controller("lifting_controller")
         configured = self._cfg["plugins"].get("lifting", {})
@@ -1384,6 +1403,7 @@ class PantherDevice:
             return self._stop_head("cancelled_by_request", wait_s=5.0)
         if action not in ("look", "home"):
             raise ValueError(f"unsupported head action: {action}")
+        require_confirmation(args)
         self._ensure_motion_ready()
         self._require_controller("head_forward_position_controller")
         joint_msg, received = self._get("joints")
