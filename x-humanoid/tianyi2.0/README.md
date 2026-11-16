@@ -1207,3 +1207,19 @@ Current PR371 accepts source/read/receipt integer timestamps and descriptive
 metadata under its [format-only policy](https://github.com/Nidhogg2002/phanthymotus/blob/feat/pointcloud-slam-offline-eval/perception/docs/spatial-inputs.md).
 Older capture-identity and freshness requirements described in historical
 validation notes are not current consumer admission requirements.
+
+### Companion stop and source timing
+
+The estimated-TF clock reader accumulates bounded pipe chunks while polling
+its stop event; a partial SSH response cannot block `readline()` during close.
+The worker's existing cleanup terminates and waits for its child. Tests use a
+real local child returning a partial line and verify both worker and child exit.
+ROS initialization installs its default signal handlers, and the existing
+`finally` block closes the clock worker before destroying the ROS node.
+
+`Restart=always` does not restart a unit explicitly stopped with `systemctl stop`
+or `disable --now`; see [systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#Restart=).
+The source-time chassis mapper checks age against read completion, so a delayed
+read increases age and cannot refresh an old source increment. RGB-D's positive
+capture-interval condition also skips regressed/repeated depth capture times;
+the tests cover both behaviors without adding new admission restrictions.

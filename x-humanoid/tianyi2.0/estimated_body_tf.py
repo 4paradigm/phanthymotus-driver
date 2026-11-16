@@ -186,10 +186,19 @@ class MotionClock:
                     process.stdin.flush()
                     deadline = time.monotonic()+(5. if first else .5)
                     first = False
-                    while not select.select([process.stdout], [], [], .1)[0]:
+                    response = b''
+                    while b'\n' not in response:
                         if self.stop_event.is_set() or time.monotonic() > deadline:
                             raise RuntimeError('motion clock response timeout')
-                    remote = int(process.stdout.readline())
+                        if not select.select([process.stdout], [], [], .1)[0]:
+                            continue
+                        chunk = os.read(process.stdout.fileno(), 64)
+                        if not chunk:
+                            raise RuntimeError('motion clock connection closed')
+                        response += chunk
+                        if len(response) > 64:
+                            raise ValueError('motion clock response is too long')
+                    remote = int(response)
                     after, elapsed = time.time_ns(), time.monotonic_ns()-mono
                     try:
                         self.estimator.calibrate(before, remote, after, elapsed)

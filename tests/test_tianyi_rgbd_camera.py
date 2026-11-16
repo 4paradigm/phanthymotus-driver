@@ -119,7 +119,8 @@ def test_frame_sampling_uses_capture_intervals_despite_callback_jitter(monkeypat
     monkeypatch.setattr(m.time, 'monotonic', lambda: 1000.)
     monkeypatch.setattr(m.time, 'time_ns', lambda: 1_200_000_000)
     sampled = []
-    for stamp in [1_000_000_000, 1_050_000_000, 1_100_000_000, 1_200_000_000]:
+    for stamp in [1_000_000_000, 1_050_000_000, 1_100_000_000, 1_090_000_000,
+                  1_100_000_000, 1_150_000_000, 1_200_000_000]:
         msg = NS(width=640, height=480, header=NS(frame_id='optical',
                  stamp=NS(sec=stamp//10**9, nanosec=stamp%10**9)))
         source._image('color', msg); source._image('depth', msg)

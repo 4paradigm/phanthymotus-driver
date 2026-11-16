@@ -117,6 +117,37 @@ def test_clock_transport_sends_complete_lines(monkeypatch,estimator):
         assert e.clock is not None, clock.reason
     finally:clock.close()
 
+
+def test_clock_close_reaps_child_that_returns_a_partial_line(monkeypatch,estimator):
+    import select,subprocess,sys,threading
+    e,_=estimator
+    popen,wait_readable=subprocess.Popen,select.select
+    children=[];readable=threading.Event()
+    def local_server(command,**kwargs):
+        child=popen([sys.executable,'-u','-c',
+            "import sys; sys.stdin.readline(); sys.stdout.write('123'); sys.stdout.flush(); sys.stdin.read()"],**kwargs)
+        children.append(child)
+        return child
+    def observe_readable(*args):
+        result=wait_readable(*args)
+        if result[0]:readable.set()
+        return result
+    monkeypatch.setattr(m.subprocess,'Popen',local_server)
+    monkeypatch.setattr(m.select,'select',observe_readable)
+    clock=m.MotionClock(e);clock.worker.start()
+    try:
+        assert readable.wait(2), 'local clock child did not return its partial line'
+        clock.close()
+        assert not clock.worker.is_alive()
+        assert children[0].poll() is not None
+    finally:
+        clock.stop_event.set()
+        for child in children:
+            if child.poll() is None:child.kill()
+            child.wait(timeout=2)
+        clock.worker.join(timeout=2)
+
+
 def test_no_certificate_never_uses_interpolated_tf(estimator):
     e,_=estimator
     evidence=m.CaptureEvidence(e.config,wall_ns=lambda:10_000_000_000,mono_ns=lambda:0)

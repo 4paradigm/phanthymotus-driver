@@ -62,6 +62,13 @@ def test_clock_does_not_use_receive_time_and_preserves_already_mapped_captures()
     assert clock.map(1160, EPOCH + 1_170_000_000, 1_170_000_000)[1]['offset_ns'] > mapping['offset_ns']
 
 
+def test_read_completion_delay_makes_an_old_increment_stale():
+    m = module(); clock = ready_clock(m)
+    assert clock.map(1050, EPOCH+1_060_000_000, 1_060_000_000)[0] == EPOCH+1_051_000_000
+    with pytest.raises(ValueError, match='stale'):
+        clock.map(1050, EPOCH+1_302_000_000, 1_302_000_000)
+
+
 @pytest.mark.parametrize('change', ['wide_rtt', 'wall_jump', 'device_reset', 'expired', 'future', 'old'])
 def test_clock_rejects_untrustworthy_time(change):
     m = module(); clock = ready_clock(m)
