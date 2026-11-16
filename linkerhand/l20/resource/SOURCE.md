@@ -30,6 +30,6 @@ Core requests one `model` per driver without instance or side information, so `j
 
 Each side has 21 revolute joints: 16 driven by measured feedback and 5 passive distal joints from their calibration table (`source: derived_calibration`, not measurements). Several tables run slightly past the URDF limits (up to 0.22 rad for the right `thumb_ip`); skeleton values are clamped to the limits and flagged `clamped_to_model`, while the JSON output keeps the table angle.
 
-## Open items
+## Verification
 
-- The calibration records belong to reference units (`*_001`), not to the connected hands; whether per-unit calibration is needed has not been asked. Offline, both models reproduce the OK and V presets, and the right model matches three of the four thumb directions observed on the real right hand (2026-11-12; `thumb_roll` not checked separately). On hardware (2026-11-13) the V preset displayed correctly on both hands after negating the left four-finger `mcp_roll` tables (`NEGATED_TABLES` in `joints_model.py`).
+- The calibration records belong to reference units (`*_001`); the vendor stated that per-unit recalibration is not needed. Offline, both models reproduce the OK and V presets. On hardware the right thumb pitch, yaw and tip directions match the model (2026-11-12), and `thumb_roll` at raw 0 and 255 matches on both hands (2026-11-16). On hardware (2026-11-13) the V preset displayed correctly on both hands after negating the left four-finger `mcp_roll` tables (`NEGATED_TABLES` in `joints_model.py`).
