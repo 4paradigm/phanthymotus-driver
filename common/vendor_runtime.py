@@ -293,13 +293,17 @@ def make_handler(bundle_getter: Callable[[], DriverBundle], server_name: str, dr
     return Handler
 
 
-def start_registration(port: int, config: dict, driver_id: str) -> None:
+def start_registration(
+    port: int,
+    config: dict,
+    driver_id: str,
+    advertise_host: str = "localhost",
+) -> None:
     import ssl
     import time
     import urllib.request
 
     url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-    advertise_host = os.environ.get("MCP_ADVERTISE_HOST", "localhost")
     payload = json.dumps({
         "id": driver_id,
         "name": config.get("name", driver_id),

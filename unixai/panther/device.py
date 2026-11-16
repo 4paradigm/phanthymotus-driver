@@ -142,6 +142,8 @@ class PantherDevice:
         self._drive_action_id = None
         self._drive_topic = None
         self._drive_pub = None
+        self._drive_stop_request = None
+        self._drive_stop_thread = None
         self._controller_query_lock = threading.Lock()
         self._arm_lock = threading.RLock()
         self._arm_active = None
@@ -277,8 +279,11 @@ class PantherDevice:
     def close(self) -> None:
         if self._closed:
             return
+        base_cfg = self._cfg.get("plugins", {}).get("base_drive", {})
+        stop_wait = (float(base_cfg.get("stop_match_timeout_s", 3.0))
+                     + float(base_cfg.get("stop_publish_duration_s", 1.0)))
+        self.cancel_drive("driver_shutdown", force=True, wait_s=stop_wait)
         self._closed = True
-        self.cancel_drive()
         self._stop_arm("driver_shutdown", wait_s=20.0)
         self._stop_head("driver_shutdown", wait_s=5.0)
         self._camera.close()
@@ -862,20 +867,94 @@ class PantherDevice:
                     self._twist_type, selected, self._drive_qos
                 )
                 self._drive_topic = selected
-        return selected, counts
+            publisher = self._drive_pub
+        match_deadline = time.monotonic() + timeout_s
+        while not self._drive_publisher_matched(publisher) and time.monotonic() < match_deadline:
+            time.sleep(0.05)
+        if not self._drive_publisher_matched(publisher):
+            raise RuntimeError(f"Panther base publisher did not match a subscriber on {selected}")
+        return selected, self._drive_topic_status()
 
-    def _publish_drive(self, message) -> None:
-        publisher = self._drive_pub
-        if publisher is not None:
-            publisher.publish(message)
+    @staticmethod
+    def _drive_publisher_matched(publisher) -> bool:
+        try:
+            return publisher is not None and publisher.get_subscription_count() > 0
+        except Exception:
+            return False
+
+    def _wait_for_pending_drive_stop(self, timeout_s: float) -> dict | None:
+        with self._drive_lock:
+            request = self._drive_stop_request
+        if request is None:
+            return None
+        request["event"].wait(max(0.0, timeout_s))
+        if request["result"] is not None:
+            return dict(request["result"])
+        return {"state": "stop_unconfirmed", "stop_confirmed": False,
+                "topic": self._drive_topic, "reason": request["reason"],
+                "action_id": request["action_id"],
+                "last_error": request.get("last_error"),
+                "message": "waiting for a matched subscriber before sending zero velocity"}
+
+    def _drive_stop_worker(self, request: dict) -> None:
+        from geometry_msgs.msg import Twist
+        cfg = self._cfg["plugins"]["base_drive"]
+        rate = max(1.0, float(cfg.get("publish_rate_hz", 20.0)))
+        duration = max(0.1, float(cfg.get("stop_publish_duration_s", 1.0)))
+        repetitions = max(1, int(cfg.get("stop_repetitions", 5)))
+        period = 1.0 / rate
+        sent = 0
+        while not self._closed:
+            with self._drive_lock:
+                if self._drive_stop_request is not request:
+                    return
+                publisher = self._drive_pub
+                topic = self._drive_topic
+            if not self._drive_publisher_matched(publisher):
+                time.sleep(0.05)
+                continue
+            deadline = time.monotonic() + duration
+            sent = 0
+            while time.monotonic() < deadline or sent < repetitions:
+                with self._drive_lock:
+                    if self._drive_stop_request is not request:
+                        return
+                if not self._drive_publisher_matched(publisher):
+                    sent = 0
+                    break
+                try:
+                    publisher.publish(Twist())
+                except Exception as exc:
+                    request["last_error"] = f"{type(exc).__name__}: {exc}"
+                    sent = 0
+                    break
+                sent += 1
+                time.sleep(period)
+            if sent < repetitions:
+                continue
+            result = {"state": "idle", "stop_confirmed": True, "topic": topic,
+                      "zero_commands_sent": sent, "reason": request["reason"],
+                      "action_id": request["action_id"]}
+            with self._drive_lock:
+                if self._drive_stop_request is not request:
+                    return
+                request["result"] = result
+                self._drive_stop_request = None
+                request["event"].set()
+            action_id = request["action_id"]
+            if action_id:
+                status = request["completion_status"]
+                completion = dict(request.get("completion_result") or {})
+                completion.update({"reason": request["reason"], "stop_confirmed": True,
+                                   "zero_commands_sent": sent})
+                _notify_completion(action_id, status, completion, "base_drive")
+            return
 
     def drive(self, args: dict) -> dict:
         from geometry_msgs.msg import Twist
         action = args.get("action", "move")
         if action in ("cancel", "stop"):
-            stopped = self.cancel_drive("cancelled_by_request")
-            return {"state": "idle", "topic": self._drive_topic,
-                    "action_id": stopped}
+            return self.cancel_drive("cancelled_by_request", force=True)
         if action in ("start", "info"):
             states = self.controller_states()
             self._require_states(states, {"movebase3_drive_controller": "active"})
@@ -891,8 +970,11 @@ class PantherDevice:
         vx, vy, wz, duration = validate_drive(args, cfg)
         wz_deg_s = math.degrees(wz)
         rate = float(cfg["publish_rate_hz"])
-        repetitions = int(cfg["stop_repetitions"])
-        self.cancel_drive("replaced_by_new_command")
+        replaced = self.cancel_drive("replaced_by_new_command")
+        if replaced.get("state") not in ("idle", "no_active_motion"):
+            raise RuntimeError(
+                "previous base stop is not confirmed; refusing a new velocity command"
+            )
         action_id = str(args.get("action_id") or f"panther_base_{uuid4().hex[:12]}")
         with self._drive_lock:
             self._drive_generation += 1
@@ -907,29 +989,31 @@ class PantherDevice:
                     with self._drive_lock:
                         if generation != self._drive_generation:
                             return
+                        publisher = self._drive_pub
+                        if not self._drive_publisher_matched(publisher):
+                            subscriber_lost = True
+                        else:
+                            subscriber_lost = False
                         msg = Twist(); msg.linear.x = vx; msg.linear.y = vy; msg.angular.z = wz
-                        self._publish_drive(msg)
-                    time.sleep(period)
-                for _ in range(repetitions):
-                    with self._drive_lock:
-                        if generation != self._drive_generation:
-                            return
-                        self._publish_drive(Twist())
-                    time.sleep(period)
-                with self._drive_lock:
-                    if generation != self._drive_generation or self._drive_action_id != action_id:
+                        if not subscriber_lost:
+                            publisher.publish(msg)
+                    if subscriber_lost:
+                        self.cancel_drive(
+                            "subscriber_lost", completion_status="error",
+                            completion_result={"error": "base command subscriber disappeared"},
+                        )
                         return
-                    self._drive_action_id = None
-                _notify_completion(action_id, "completed", {
+                    time.sleep(period)
+                self.cancel_drive("duration_expired", completion_status="completed",
+                                  completion_result={
                     "linear_x": vx, "linear_y": vy, "angular_z_deg_s": wz_deg_s,
                     "duration_s": duration, "stopped_automatically": True,
-                }, "base_drive")
+                })
             except Exception as exc:
-                with self._drive_lock:
-                    if self._drive_action_id == action_id:
-                        self._drive_action_id = None
-                _notify_completion(action_id, "error",
-                                   {"error": f"{type(exc).__name__}: {exc}"}, "base_drive")
+                self.cancel_drive(
+                    "motion_error", completion_status="error",
+                    completion_result={"error": f"{type(exc).__name__}: {exc}"},
+                )
 
         threading.Thread(target=run, daemon=True, name="panther_drive").start()
         return {"state": "queued", "action_id": action_id,
@@ -937,18 +1021,56 @@ class PantherDevice:
                 "duration_s": duration, "topic": topic, "cmd_topics": subscribers,
                 "auto_stop": True}
 
-    def cancel_drive(self, reason: str = "cancelled"):
-        from geometry_msgs.msg import Twist
+    def cancel_drive(self, reason: str = "cancelled", *, force: bool = False,
+                     completion_status: str = "cancelled",
+                     completion_result: dict | None = None,
+                     wait_s: float | None = None) -> dict:
+        cfg = self._cfg["plugins"]["base_drive"]
+        default_wait = (float(cfg.get("stop_match_timeout_s", 3.0))
+                        + float(cfg.get("stop_publish_duration_s", 1.0)))
+        pending = self._wait_for_pending_drive_stop(default_wait if wait_s is None else wait_s)
+        if pending is not None:
+            return pending
         with self._drive_lock:
             action_id = self._drive_action_id
+            publisher = self._drive_pub
+            if action_id is None and not force:
+                return {"state": "no_active_motion", "stop_confirmed": True,
+                        "topic": self._drive_topic, "action_id": None}
+            if publisher is None:
+                return {"state": "idle" if action_id is None else "stop_unconfirmed",
+                        "stop_confirmed": action_id is None, "topic": self._drive_topic,
+                        "reason": reason, "action_id": action_id}
             self._drive_action_id = None
             self._drive_generation += 1
-            repetitions = int(self._cfg["plugins"]["base_drive"].get("stop_repetitions", 3))
-            for _ in range(max(1, repetitions)):
-                self._publish_drive(Twist())
-        if action_id:
-            _notify_completion(action_id, "cancelled", {"reason": reason}, "base_drive")
-        return action_id
+            previous = self._drive_stop_request
+            if previous is not None:
+                previous["event"].set()
+            request = {
+                "action_id": action_id,
+                "reason": reason,
+                "completion_status": completion_status,
+                "completion_result": completion_result or {},
+                "event": threading.Event(),
+                "result": None,
+                "last_error": None,
+            }
+            self._drive_stop_request = request
+            thread = threading.Thread(
+                target=self._drive_stop_worker, args=(request,), daemon=True,
+                name="panther_drive_stop",
+            )
+            self._drive_stop_thread = thread
+            thread.start()
+        timeout = default_wait if wait_s is None else max(0.0, wait_s)
+        request["event"].wait(timeout)
+        if request["result"] is not None:
+            return dict(request["result"])
+        return {"state": "stop_unconfirmed", "stop_confirmed": False,
+                "topic": self._drive_topic, "reason": reason,
+                "action_id": action_id,
+                "last_error": request.get("last_error"),
+                "message": "waiting for a matched subscriber before sending zero velocity"}
 
     def _switch_controllers_exact(self, activate: list[str], deactivate: list[str]) -> None:
         from controller_manager_msgs.srv import SwitchController
@@ -1024,11 +1146,10 @@ class PantherDevice:
                 if not updates:
                     raise ValueError(f"at least one {prefix}0_deg..{prefix}7_deg target is required")
                 values = [updates.get(name, current.get(name)) for name in names]
-            # PR 521's known-good home path allows the configured home pose to
-            # cross the ordinary per-command commissioning step gate. Hard
-            # URDF limits, duration and speed limits still apply.
-            step_limit = None if action == "home" else max_delta
-            return validate_joint_target(names, values, self._joint_limits, current, step_limit)
+            # Home is subject to the same per-command delta gate as every
+            # other arm target until the candidate pose is independently
+            # commissioned on hardware.
+            return validate_joint_target(names, values, self._joint_limits, current, max_delta)
 
         if side in ("left", "both"):
             targets["left"] = target_for("left", LEFT_ARM_JOINTS)

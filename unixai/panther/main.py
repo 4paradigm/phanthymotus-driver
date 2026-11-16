@@ -66,7 +66,12 @@ def main() -> None:
     # Bind the MCP socket before advertising it. Agent Core immediately calls
     # initialize/tools/list when a driver registers; advertising first creates
     # a race that leaves a persisted offline entry and no cards on the canvas.
-    start_registration(port, config, "unixai-panther-driver")
+    start_registration(
+        port,
+        config,
+        "unixai-panther-driver",
+        advertise_host=os.environ.get("PANTHER_MCP_ADVERTISE_HOST", "localhost"),
+    )
     stopping = threading.Event()
 
     def shutdown(signum, _frame):

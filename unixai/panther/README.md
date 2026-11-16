@@ -70,9 +70,18 @@ also require a live `/robot_description`; missing limits cause a hard rejection
 rather than a guessed fallback. Base and arm movements are
 asynchronous, return `action_id`, report completion, and can be stopped. Arm
 controller state is restored to its pre-command snapshot. Base movement is
-finite-duration and publishes repeated zero commands when it ends or is
-cancelled. Arm/head `home` remains unavailable until a verified pose is placed
-in `config.yaml`.
+finite-duration. A stop remains pending until its publisher has a matched DDS
+subscriber, then publishes zero velocity for the configured stop interval;
+subscriber loss is never reported as a confirmed stop. Arm `home` retains the
+same per-command delta limit as ordinary moves because its all-zero candidate
+pose has not been independently commissioned. Head `home` uses its configured
+low-speed profile.
+
+Panther explicitly advertises `localhost` by default through
+`PANTHER_MCP_ADVERTISE_HOST`, matching its host-network Agent Core deployment.
+Set that variable to a host address reachable by Agent Core when the two run on
+different machines. This Panther-specific setting does not change the shared
+registration default used by other drivers.
 
 Motion-card angles are exposed in degrees. The ROS messages and live URDF still
 use radians, so conversion happens only at the robot boundary. The head mapping

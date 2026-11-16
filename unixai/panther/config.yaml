@@ -39,6 +39,8 @@ plugins:
     max_duration_s: 10.0
     publish_rate_hz: 20.0
     stop_repetitions: 5
+    stop_publish_duration_s: 1.0
+    stop_match_timeout_s: 3.0
   arm_control:
     enabled: true
     max_duration_s: 20.0
@@ -46,7 +48,8 @@ plugins:
     speed_deg_s: 20.0
     # Additional commissioning gate; URDF hard limits are always enforced too.
     max_target_delta_deg: 20.0
-    # PR 521's verified home pose; canvas values remain degrees.
+    # PR 521-compatible candidate pose; the ordinary per-command delta gate
+    # remains mandatory until this target is independently hardware-verified.
     home_pose_deg:
       joint_la0: 0.0
       joint_la1: 0.0

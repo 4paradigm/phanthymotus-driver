@@ -9,12 +9,14 @@ import re
 import sys
 import threading
 import unittest
+from unittest.mock import patch
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = ROOT / "unixai" / "panther"
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(DRIVER))
 
 from common.vendor_runtime import DriverBundle
 
@@ -30,6 +32,7 @@ contracts = _load("contracts")
 core_bridge = _load("core_bridge")
 plugins = _load("plugins")
 camera = _load("camera")
+device_module = _load("device")
 
 
 class PantherDriverTest(unittest.TestCase):
@@ -263,6 +266,60 @@ class PantherDriverTest(unittest.TestCase):
                 {"linear_x": 0.0, "duration_s": -1}, config
             )
 
+    def test_drive_stop_waits_for_match_then_republishes_zero(self):
+        class FakePublisher:
+            def __init__(self):
+                self.matched = False
+                self.messages = []
+
+            def get_subscription_count(self):
+                return int(self.matched)
+
+            def publish(self, message):
+                self.messages.append(message)
+
+        geometry = ModuleType("geometry_msgs")
+        geometry_msg = ModuleType("geometry_msgs.msg")
+        geometry_msg.Twist = type("Twist", (), {})
+        geometry.msg = geometry_msg
+        publisher = FakePublisher()
+        device = device_module.PantherDevice.__new__(device_module.PantherDevice)
+        device._cfg = {"plugins": {"base_drive": {
+            "publish_rate_hz": 100.0,
+            "stop_repetitions": 2,
+            "stop_publish_duration_s": 0.05,
+            "stop_match_timeout_s": 0.05,
+        }}}
+        device._drive_lock = threading.Lock()
+        device._drive_action_id = "move-1"
+        device._drive_generation = 1
+        device._drive_pub = publisher
+        device._drive_topic = "/cmd_vel"
+        device._drive_stop_request = None
+        device._drive_stop_thread = None
+        device._closed = False
+        with patch.dict(sys.modules, {
+            "geometry_msgs": geometry,
+            "geometry_msgs.msg": geometry_msg,
+        }), patch.object(device_module, "_notify_completion"):
+            result = device.cancel_drive(wait_s=0.02)
+            self.assertEqual(result["state"], "stop_unconfirmed")
+            self.assertFalse(result["stop_confirmed"])
+            self.assertEqual(publisher.messages, [])
+            publisher.matched = True
+            confirmed = device._wait_for_pending_drive_stop(1.0)
+        device._closed = True
+        self.assertTrue(confirmed["stop_confirmed"])
+        self.assertGreaterEqual(len(publisher.messages), 2)
+
+    def test_arm_home_keeps_the_per_command_delta_gate(self):
+        source = (DRIVER / "device.py").read_text()
+        arm = source.split("    def arm(self, args: dict)", 1)[1].split(
+            "    def _run_arm", 1
+        )[0]
+        self.assertNotIn('step_limit = None if action == "home"', arm)
+        self.assertIn("current, max_delta)", arm)
+
     def test_manifest_lists_expected_cards(self):
         driver_text = (DRIVER / "driver.yaml").read_text()
         cards = set(re.findall(r"name:\s*([a-z_]+)", driver_text))
@@ -422,7 +479,13 @@ class PantherDriverTest(unittest.TestCase):
         self.assertIn("camera_color", manifest)
         self.assertNotIn("camera_rgb", manifest)
         self.assertIn('"unixai-panther"', main)
+        self.assertIn('"PANTHER_MCP_ADVERTISE_HOST"', main)
         self.assertLess(main.index("ThreadingHTTPServer("), main.index("start_registration("))
+
+    def test_panther_advertise_host_does_not_change_other_drivers(self):
+        runtime = (ROOT / "common" / "vendor_runtime.py").read_text()
+        self.assertIn('advertise_host: str = "localhost"', runtime)
+        self.assertNotIn('os.environ.get("MCP_ADVERTISE_HOST"', runtime)
 
     def test_action_resources_follow_agent_core_conventions(self):
         plugins = (DRIVER / "plugins.py").read_text()
@@ -441,6 +504,10 @@ class PantherDriverTest(unittest.TestCase):
         for text in (config, manifest, dockerfile):
             self.assertIn("15792", text)
         self.assertIn("AGENT_CORE_ROS_DOMAIN_ID=42", service)
+        self.assertIn(
+            "PANTHER_MCP_ADVERTISE_HOST=${PANTHER_MCP_ADVERTISE_HOST:-localhost}",
+            service,
+        )
         self.assertIn("PANTHER_ROS_DOMAIN_ID=0", service)
         self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
         self.assertIn(
