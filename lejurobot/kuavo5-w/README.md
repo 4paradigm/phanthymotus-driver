@@ -78,7 +78,10 @@ roslaunch rosbridge_server rosbridge_websocket.launch address:=127.0.0.1 port:=9
 ```
 
 上述地址适用于驱动与机器人 ROS1 在同一主机。远程连接时，将 `address` 设置为机器人可达的网卡地址，
-并将驱动的 `ROSBRIDGE_URL` 设置为对应 WebSocket URL；该接口能够发布运动命令，应仅在受控机器人网络上开放。
+并将宿主机操作配置的 `rosbridge_url` 设置为对应 WebSocket URL；需要覆盖配置时，在 Compose 执行环境或
+其 `.env` 中显式设置 `KUAVO_ROSBRIDGE_URL`。未设置或为空时使用配置值，不强制 localhost。
+直接运行源码可用非空的 `ROSBRIDGE_URL` 覆盖配置；两者都未配置时才默认 `ws://127.0.0.1:9090`。
+该接口能够发布运动命令，应仅在受控机器人网络上开放。
 ROS master、多机 ROS 的 `ROS_MASTER_URI` / `ROS_IP` 应在启动 rosbridge 的 ROS1 环境中正确配置。
 
 启动前可检查：
@@ -106,7 +109,12 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 机器人必须处于允许运动的状态，且收到本次 WebSocket 连接内的控制状态和新鲜模式反馈后才接受运动指令。
 启动和重连后，独立线程经 rosapi 探测机型、robot_version、自由度、SHM 参数及 `/humanoid_description`。
 必须确认 wheel-arm=1、下肢4、双臂14、头2后才能运动；探测失败时可通过 `state.info.feedback.robot_discovery` 查原因。
-参数缺失不回退到 SDK 的双足默认配置。机器人控制器/模型配置更改后应重新连接驱动。
+参数缺失不回退到 SDK 的双足默认配置。后台探测在每轮结束约1s后重新读取完整身份参数和 URDF；
+成功读取的身份有效期为3s，从该轮读取开始计时，慢查询不会在完成时伪造新租约。
+查询失败、身份过期或模型/限位绑定变化会拒绝/终止相关动作，不依赖 WebSocket 重连；
+相同来源和连接代次不重复订阅原始传感器。状态在 `robot_discovery.identity_verification` 查看。
+轮询不是参数变更通知或原子快照，仍存在检测窗口；必须在机器人停止且无在途动作时修改控制器参数，
+不支持边运动边更换模型或标定。现场还需确认 rosapi 查询时延满足3s有效期。
 
 ## 卡片与官方接口
 
@@ -211,8 +219,13 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 反馈须在3s内到达，估计值接受0–110s；ACP fallback timeout 为125s。
 双臂/下肢 `move_joints` 发令前要求运行时 `/humanoid_description` 通过关节映射/名称校验，
 并有0.5s内实测关节位置、匹配的现场限位记录且目标在限位内；模型/限位缺失、不匹配或在途验证失效均拒绝/终止关节动作。
+关节实测还要求 `sensor_time` 是合法、非零的 ROS 采集时间，机器人与驱动系统时钟必须同步；
+接收时采集年龄最多0.5s，仅容忍最多0.05s的未来时钟误差。缺失、零值、过旧或明显未来的时间戳不用于关节测量，
+不以回调时间或递增 header.seq 替代采集证据。相同/倒序采集时间不更新数据或新鲜度；重复投递最终过期。
 指令后收到新 reach-time，并等过预计时长后，
-还要求实测目标关节误差≤0.035rad，连续新测量覆盖≥0.2s，再返回 `measured_convergence: true`。
+还要求实测目标关节误差≤0.035rad，不同的指令后采集帧按原始纳秒时间跨度覆盖≥0.2s，
+再返回 `measured_convergence: true`。回调重放、接收间隔及容忍的时钟误差均不能推进采集跨度。
+若现场 `sensor_time` 使用启动相对时间或模拟时钟，当前驱动会拒绝关节控制；需先核实并适配真实时钟来源，不能关闭新鲜度检查绕过。
 预计结束后5s内未收敛、实测丢失/异常会返回 ACP error 并尝试全身软件暂停。
 底盘和躯干/双手笛卡尔动作的完成时间仍依据**官方到达时间估计**，明确标记 `measured_convergence: false`。
 这些反馈没有命令 ID，因此需要保证本驱动独占所用命令话题及 `/enable_control`；

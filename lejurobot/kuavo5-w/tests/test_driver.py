@@ -21,6 +21,7 @@ std.String = type("String", (), {})
 with patch.dict(sys.modules, {"std_msgs": types.ModuleType("std_msgs"), "std_msgs.msg": std}):
     spec.loader.exec_module(driver)
     from kuavo_sensors import LINK_ORDER, model_names
+    import kuavo_sensors as sensors_module
     JOINT_NAMES = model_names((ROOT / 'resource' / 'kuavo5w_model.urdf').read_text())
 
 
@@ -96,7 +97,8 @@ class FakeRos1:
         self.subscriptions[topic][1]({"data": value})
 
     def raw(self, q=None, **overrides):
-        msg = {'sensor_time': {'secs': 0, 'nsecs': 0},
+        capture_ns = time.time_ns()
+        msg = {'sensor_time': {'secs': capture_ns // 1_000_000_000, 'nsecs': capture_ns % 1_000_000_000},
                'joint_data': {'joint_q': q if q is not None else [0.] * 20,
                               'joint_v': [1.] * 20, 'joint_vd': [2.] * 20, 'joint_torque': [3.] * 20},
                'imu_data': {'quat': dict(x=0., y=0., z=0., w=1.),
@@ -764,7 +766,7 @@ class DriverContractTests(unittest.TestCase):
 
     def test_urdf_fingerprint_change_invalidates_joint_limits_even_with_same_names(self):
         self.ros.params['humanoid_description'] += '\n'
-        self.bundle.sensors.discover()
+        self._refresh_identity_via_timer()
         self.ros.raw()
         self.assertTrue(self.bundle.sensors.snapshot('joints')['valid'])
         for card, size in (('arm', 14), ('leg', 4)):
@@ -774,12 +776,62 @@ class DriverContractTests(unittest.TestCase):
     def test_limit_identity_change_aborts_inflight_joint_action(self):
         action = self.call('arm', 'move_joints', positions=[0.] * 14)
         self.ros.params['humanoid_description'] += '\n'
-        self.bundle.sensors.discover()
+        self._refresh_identity_via_timer()
         self.ros.raw()
         self.assertTrue(wait_until(lambda: bool(self.callbacks)))
         self.assertEqual(self.callbacks[0][:3], (action['action_id'], 'arm', 'error'))
         self.assertIn('fingerprint', self.callbacks[0][3]['reason'])
         self.assertTrue(self.bundle.state.motion_blocked)
+
+    def _refresh_identity_via_timer(self):
+        hub = self.bundle.sensors
+        hub._retry_at = time.monotonic() - 1  # Make the scheduled refresh due.
+        previous = hub._thread
+        hub.tick()
+        self.assertIsNot(hub._thread, previous)
+        hub._thread.join(1)
+        self.assertFalse(hub._thread.is_alive())
+
+    def test_periodic_robot_version_change_rejects_arm_and_leg_targets(self):
+        self.ros.params['robot_version'] += 1
+        self._refresh_identity_via_timer()
+        self.ros.raw()
+        for card, size in (('arm', 14), ('leg', 4)):
+            self.assertIn('robot_version does not match',
+                          self.call(card, 'move_joints', positions=[0.] * size)['error'])
+        self.assertEqual(self.ros.published, [])
+
+    def test_periodic_missing_urdf_aborts_inflight_joint_action(self):
+        action = self.call('leg', 'move_joints', positions=[0.] * 4)
+        del self.ros.params['humanoid_description']
+        self._refresh_identity_via_timer()
+        self.assertTrue(wait_until(lambda: bool(self.callbacks)))
+        self.assertEqual(self.callbacks[0][:3], (action['action_id'], 'leg', 'error'))
+        self.assertTrue(self.bundle.state.motion_blocked)
+
+    def test_stalled_periodic_identity_refresh_expires_and_aborts_motion(self):
+        action = self.call('arm', 'move_joints', positions=[0.] * 14)
+        hub = self.bundle.sensors
+        entered, release = threading.Event(), threading.Event()
+        original = self.ros.get_param
+        def blocked(*args, **kwargs):
+            entered.set()
+            release.wait(2)
+            return original(*args, **kwargs)
+        with patch.object(self.ros, 'get_param', side_effect=blocked):
+            hub._retry_at = 0
+            hub.tick()
+            try:
+                self.assertTrue(entered.wait(1))
+                # Simulate lease age while the normal timer's read is blocked.
+                hub._identity_checked_at -= sensors_module.IDENTITY_LEASE_S + 1
+                self.assertTrue(wait_until(lambda: bool(self.callbacks)))
+                self.assertEqual(self.callbacks[0][:3], (action['action_id'], 'arm', 'error'))
+                self.assertIn('identity verification is stale', self.callbacks[0][3]['reason'])
+                self.assertTrue(self.bundle.state.motion_blocked)
+            finally:
+                release.set()
+                hub._thread.join(1)
 
     def test_invalid_joint_target_does_not_cancel_another_active_channel(self):
         action = self.call('leg', 'move_joints', positions=[0.] * 4)
@@ -877,7 +929,7 @@ class DriverContractTests(unittest.TestCase):
                 elapsed, measured_elapsed, degrees = entry
                 clock[0] = started + elapsed
                 current[0] = ([math.radians(degrees)] * 4 + [0.] * 16,
-                              started + measured_elapsed)
+                              started + measured_elapsed, int(measured_elapsed * 1e9))
                 return False
 
             with patch.object(cancelled, 'wait', side_effect=poll), patch.object(
@@ -916,6 +968,72 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(len(self.callbacks), 1)
         self.assertEqual(self.callbacks[0][:3], (result['action_id'], 'leg', 'completed'))
         self.assertTrue(self.callbacks[0][3]['measured_convergence'])
+
+    def _run_stamped_joint_trace(self, samples):
+        """Exercise actual ROS callbacks + motion worker, with separate clocks.
+
+        Samples are (receipt elapsed, sensor capture elapsed, leg degrees).
+        Header seq changes even when the sensor capture itself is replayed.
+        """
+        started, wall = time.monotonic(), time.time() + .001
+        clock = [started]
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock[0],
+                                          time=lambda: wall + clock[0] - started)
+        with patch.object(driver, 'time', fake_time), patch.object(sensors_module, 'time', fake_time):
+            with patch.object(driver.threading, 'Thread') as thread:
+                result = self.call('leg', 'move_joints', positions=[10.] * 4)
+            self.assertEqual(result['state'], 'executing')
+            worker = thread.call_args.kwargs['target']
+            cancelled = self.bundle.tracker._active['lower_body'][2]
+            clock[0] = started + .001
+            self.ros.emit('/lb_leg_joint_reach_time', 0.)
+            entries = iter(enumerate(samples))
+            def poll(_timeout):
+                entry = next(entries, None)
+                if entry is None:
+                    return True
+                seq, (received, captured, degrees) = entry
+                clock[0] = started + received
+                ns = int((wall + captured) * 1e9)
+                self.ros.raw([math.radians(degrees)] * 4 + [0.] * 16,
+                             sensor_time={'secs': ns // 1_000_000_000, 'nsecs': ns % 1_000_000_000},
+                             header={'seq': seq})
+                return False
+            with patch.object(cancelled, 'wait', side_effect=poll):
+                worker()
+        self.bundle.tracker._callbacks.join()
+        return result
+
+    def test_replayed_stamped_sensor_frame_cannot_complete_joints(self):
+        result = self._run_stamped_joint_trace([
+            (.02, .02, 10.), (.10, .02, 10.), (.24, .02, 10.), (.32, .02, 10.)])
+        self.assertEqual(self.callbacks, [])
+        self.assertTrue(self.bundle.tracker.current('lower_body', result['action_id']))
+
+    def test_replayed_stamped_sensor_frame_eventually_expires_and_pauses(self):
+        result = self._run_stamped_joint_trace([
+            (.02, .02, 10.), (.30, .02, 10.), (.60, .02, 10.)])
+        self.assertEqual([c[:3] for c in self.callbacks], [(result['action_id'], 'leg', 'error')])
+        self.assertTrue(self.bundle.state.motion_blocked)
+
+    def test_fresh_capture_timestamps_can_complete_joints(self):
+        result = self._run_stamped_joint_trace([
+            (.02, .02, 10.), (.13, .13, 10.), (.25, .25, 10.)])
+        self.assertEqual([c[:3] for c in self.callbacks], [(result['action_id'], 'leg', 'completed')])
+
+    def test_capture_span_not_receipt_span_controls_convergence(self):
+        result = self._run_stamped_joint_trace([(.02, .02, 10.), (.30, .10, 10.)])
+        self.assertEqual(self.callbacks, [])
+        self.assertTrue(self.bundle.tracker.current('lower_body', result['action_id']))
+
+    def test_future_clock_tolerance_cannot_inflate_capture_convergence_span(self):
+        result = self._run_stamped_joint_trace([(.02, .06, 10.), (.23, .23, 10.)])
+        self.assertEqual(self.callbacks, [])  # 0.21s receipt span, only 0.17s capture span.
+        self.assertTrue(self.bundle.tracker.current('lower_body', result['action_id']))
+
+    def test_delayed_precommand_capture_cannot_start_convergence(self):
+        self._run_stamped_joint_trace([(.02, -.01, 10.), (.24, -.01, 10.), (.30, .30, 10.)])
+        self.assertEqual(self.callbacks, [])
 
     def test_stop_blocks_old_velocity_thread_and_cancels_acp_once(self):
         result = self.call("loco", "move", vx=0.1, duration=1)

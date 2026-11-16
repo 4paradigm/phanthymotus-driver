@@ -61,6 +61,11 @@ def _load_config():
         return yaml.safe_load(stream) or {}
 
 
+def _rosbridge_url(config):
+    # Compose passes empty when no explicit KUAVO_ROSBRIDGE_URL is set.
+    return os.environ.get('ROSBRIDGE_URL') or config.get('rosbridge_url', 'ws://127.0.0.1:9090')
+
+
 def _namespace(config):
     value = config.get("ros_namespace", "").strip() or socket.gethostname()
     value = re.sub(r"[^a-zA-Z0-9_]", "_", value)
@@ -227,7 +232,7 @@ def main():
 
     config = _load_config()
     namespace = _namespace(config)
-    ros1 = RosbridgeClient(os.environ.get("ROSBRIDGE_URL", config.get("rosbridge_url", "ws://127.0.0.1:9090")))
+    ros1 = RosbridgeClient(_rosbridge_url(config))
     stopped = threading.Event()
     rclpy.init(args=None, domain_id=42)
     node = Node("kuavo5w_driver")

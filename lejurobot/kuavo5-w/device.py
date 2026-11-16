@@ -472,8 +472,8 @@ class _KuavoPlugin:
 
         def worker():
             deadline, duration, seen_at = time.monotonic() + 3, None, 0
-            converged_since = None
-            last_measured_at = None
+            converged_since_ns = None
+            last_capture_ns = None
             while not cancelled.wait(0.02):
                 try:
                     with self.tracker.lock:
@@ -495,23 +495,23 @@ class _KuavoPlugin:
                         if duration is not None and time.monotonic() >= seen_at + duration:
                             if joint_target is not None:
                                 offset, target = joint_target
-                                q, measured_at = measured
+                                q, measured_at, capture_ns = measured
                                 if time.monotonic() >= seen_at + duration + 5:
                                     raise TimeoutError('measured joint target did not converge within 5s of reach-time estimate')
                                 # Polling a cached sample is not a new observation.
                                 # Keep freshness/deadline checks active while waiting.
-                                if measured_at < issued or (last_measured_at is not None
-                                                            and measured_at <= last_measured_at):
+                                if measured_at < issued or (last_capture_ns is not None
+                                                            and capture_ns <= last_capture_ns):
                                     continue
-                                last_measured_at = measured_at
+                                last_capture_ns = capture_ns
                                 close = all(abs(a - b) <= 0.035
                                             for a, b in zip(q[offset:offset + len(target)], target))
                                 if close:
-                                    if converged_since is None:
-                                        converged_since = measured_at
+                                    if converged_since_ns is None:
+                                        converged_since_ns = capture_ns
                                 else:
-                                    converged_since = None
-                                if converged_since is None or measured_at - converged_since < 0.2:
+                                    converged_since_ns = None
+                                if converged_since_ns is None or capture_ns - converged_since_ns < 200_000_000:
                                     continue
                             self.tracker.finish(self.CHANNEL, aid, self.PREFIX, "completed", {
                                 "completion_basis": "measured_joint_convergence" if joint_target is not None else "vendor_reach_time_estimate",

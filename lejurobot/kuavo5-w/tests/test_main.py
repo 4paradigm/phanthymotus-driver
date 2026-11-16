@@ -287,6 +287,23 @@ class DeploymentTests(unittest.TestCase):
                 with self.assertRaises(yaml.YAMLError):
                     main._load_config()
 
+    def test_deployment_without_url_override_uses_operator_config(self):
+        compose = next(iter(yaml.safe_load((ROOT / 'deploy/service.yml').read_text()).values()))
+        self.assertIn('ROSBRIDGE_URL=${KUAVO_ROSBRIDGE_URL:-}', compose['environment'])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'config.yaml'
+            path.write_text('rosbridge_url: ws://192.0.2.10:9090\n')
+            with patch.dict(os.environ, {'CONFIG_PATH': str(path), 'ROSBRIDGE_URL': ''}):
+                self.assertEqual(main._rosbridge_url(main._load_config()), 'ws://192.0.2.10:9090')
+                os.environ['ROSBRIDGE_URL'] = 'ws://192.0.2.20:9090'
+                self.assertEqual(main._rosbridge_url(main._load_config()), 'ws://192.0.2.20:9090')
+
+    def test_url_defaults_when_neither_env_nor_config_specifies_one(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(main._rosbridge_url({}), 'ws://127.0.0.1:9090')
+            self.assertEqual(main._rosbridge_url({'rosbridge_url': 'ws://192.0.2.10:9090'}),
+                             'ws://192.0.2.10:9090')
+
     def test_namespace_valid_first_character(self):
         self.assertEqual(main._namespace({"ros_namespace": "123robot-a"}), "robot_123robot_a")
 

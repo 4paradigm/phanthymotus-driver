@@ -3,11 +3,12 @@ import json
 import math
 import threading
 import time
+import types
 import unittest
 import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
-from test_driver import driver, FakeNode, FakeRos1, LINK_ORDER, JOINT_NAMES, ROOT
+from test_driver import driver, FakeNode, FakeRos1, LINK_ORDER, JOINT_NAMES, ROOT, sensors_module
 
 
 class SensorTests(unittest.TestCase):
@@ -86,6 +87,55 @@ class SensorTests(unittest.TestCase):
     def test_bad_imu_quaternion_rejected(self):
         self.ros.raw(imu_data={'quat': dict(w=0, x=0, y=0, z=0)})
         self.assertFalse(self.hub.snapshot('imu')['valid'])
+
+    def test_joint_capture_timestamp_must_be_valid_and_recent(self):
+        now = int(time.time())
+        for capture in (None, {}, {'secs': 0, 'nsecs': 0}, {'secs': True, 'nsecs': 0},
+                        {'secs': now, 'nsecs': 1_000_000_000}, {'secs': now - 2, 'nsecs': 0},
+                        {'secs': now + 2, 'nsecs': 0}):
+            with self.subTest(capture=capture):
+                self.ros.raw(sensor_time=capture)
+                self.assertFalse(self.hub.snapshot('joints')['valid'])
+                with self.assertRaises(RuntimeError):
+                    self.hub.joint_positions()
+                self.assertTrue(self.hub.snapshot('imu')['valid'])
+
+    def test_reordered_capture_does_not_replace_newer_joint_sample(self):
+        ns = time.time_ns()
+        captured = lambda value: {'secs': value // 1_000_000_000, 'nsecs': value % 1_000_000_000}
+        self.ros.raw([1.] * 20, sensor_time=captured(ns))
+        seen, measured = self.hub._seen['joints'], self.hub.joint_positions()
+        self.ros.raw([9.] * 20, sensor_time=captured(ns - 1_000_000))
+        self.assertEqual(self.hub._seen['joints'], seen)
+        self.assertEqual(self.hub.joint_positions(), measured)
+
+    def test_periodic_identity_refresh_keeps_raw_subscription_and_fresh_sample(self):
+        self.ros.raw()
+        callback = self.ros.subscriptions['/sensors_data_raw'][1]
+        with patch.object(self.ros, 'subscribe', wraps=self.ros.subscribe) as subscribe:
+            self.hub._retry_at = 0
+            self.hub.tick()
+            self.hub._thread.join(1)
+        self.assertFalse(self.hub._thread.is_alive())
+        self.assertEqual(subscribe.call_count, 0)
+        self.assertIs(self.ros.subscriptions['/sensors_data_raw'][1], callback)
+        self.assertTrue(self.hub.snapshot('joints')['valid'])
+
+    def test_slow_parameter_round_does_not_grant_a_new_identity_lease_at_completion(self):
+        clock = [time.monotonic()]
+        original = self.ros.get_param
+        def slow(*args, **kwargs):
+            clock[0] += 1.
+            return original(*args, **kwargs)
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock[0])
+        with patch.object(sensors_module, 'time', fake_time), patch.object(self.ros, 'get_param', side_effect=slow):
+            self.hub._retry_at = 0
+            self.hub.tick()
+            self.hub._thread.join(1)
+            self.assertFalse(self.hub._thread.is_alive())
+            self.assertFalse(self.hub.health()['identity_verification']['valid'])
+            with self.assertRaisesRegex(RuntimeError, 'identity verification is stale'):
+                self.hub.require_profile()
 
     def test_stale_or_reconnected_measurements_are_not_zeros(self):
         self.ros.raw()

@@ -20,7 +20,7 @@ lejurobot-kuavo5-w:
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONUNBUFFERED=1
     - CONFIG_PATH=/config/kuavo5-w.yaml
-    - ROSBRIDGE_URL=${KUAVO_ROSBRIDGE_URL:-ws://127.0.0.1:9090}
+    - ROSBRIDGE_URL=${KUAVO_ROSBRIDGE_URL:-}
     - AGENT_CORE_URL=https://localhost:15678
   logging:
     driver: local

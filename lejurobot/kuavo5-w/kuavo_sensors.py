@@ -23,6 +23,10 @@ LINK_ORDER = (['knee_link', 'leg_link', 'waist_link', 'waist_yaw_link'] +
               [f'zarm_{side}{i}_link' for side in ('l', 'r') for i in range(1, 8)] +
               ['zhead_1_link', 'zhead_2_link'])
 SENSOR_CARDS = ('joints', 'imu', 'loco_state', 'model')
+IDENTITY_REFRESH_S = 1.0
+IDENTITY_LEASE_S = 3.0
+JOINT_MAX_AGE_S = 0.5
+JOINT_FUTURE_TOLERANCE_S = 0.05
 
 
 def finite(value):
@@ -90,6 +94,9 @@ class KuavoSensors:
         self._profile = None
         self._urdf, self._names = None, None
         self._model_sha256 = None
+        self._identity_checked_at = None
+        self._joint_capture_ns = None
+        self._joint_captured_at = None
         self._joint_limit_config = copy.deepcopy(config.get('joint_limits'))
         self._model_error = 'waiting_for_discovery'
         self._model_path = Path(__file__).resolve().parent / 'resource' / 'kuavo5w_model.urdf'
@@ -98,6 +105,7 @@ class KuavoSensors:
         self._retry_at = 0
         self._thread = None
         self._raw_topic = None
+        self._raw_generation = None
         self._data = {}
         self._seen = {}
         self._errors = {}
@@ -121,6 +129,8 @@ class KuavoSensors:
             if not connected or generation != self._generation:
                 self._profile = self._urdf = self._names = None
                 self._model_sha256 = None
+                self._identity_checked_at = None
+                self._joint_capture_ns = self._joint_captured_at = None
                 self._data.clear()
                 self._seen.clear()
                 self._errors.clear()
@@ -135,6 +145,7 @@ class KuavoSensors:
         connected, generation = self._session()
         if not connected:
             return
+        checked_at = time.monotonic()
         try:
             params = {name: self.ros1.get_param('/' + name) for name in (
                 'robot_type', 'robot_version', 'armRealDof', 'headRealDof',
@@ -165,21 +176,27 @@ class KuavoSensors:
                         self._data.pop(card, None)
                         self._seen.pop(card, None)
                         self._errors.pop(card, None)
-                if self._names != names:
+                model_sha256 = hashlib.sha256(urdf.encode('utf-8')).hexdigest() if urdf else None
+                if self._names != names or self._model_sha256 != model_sha256 or self._profile != params:
                     self._data.pop('joints', None)
                     self._seen.pop('joints', None)
-                self.ros1.subscribe(topic, 'kuavo_msgs/sensorsData',
-                    lambda msg, source=topic, session=generation: self._on_raw(msg, source, session))
+                if self._raw_topic != topic or self._raw_generation != generation:
+                    self.ros1.subscribe(topic, 'kuavo_msgs/sensorsData',
+                        lambda msg, source=topic, session=generation: self._on_raw(msg, source, session))
                 self._raw_topic = topic
+                self._raw_generation = generation
                 self._profile = params
                 self._urdf, self._names, self._model_error = urdf, names, model_error
-                self._model_sha256 = hashlib.sha256(urdf.encode('utf-8')).hexdigest() if urdf else None
+                self._model_sha256 = model_sha256
+                # Lease starts before parameter reads, not when slow reads finish.
+                self._identity_checked_at = checked_at
                 self._discovery_error = None
         except Exception as exc:
             with self._lock:
                 if self.ros1.connection == (True, generation):
                     self._profile = self._urdf = self._names = None
                     self._model_sha256 = None
+                    self._identity_checked_at = None
                     for card in ('joints', 'imu'):
                         self._data.pop(card, None)
                         self._seen.pop(card, None)
@@ -189,13 +206,19 @@ class KuavoSensors:
         finally:
             with self._lock:
                 self._discovering = False
-                self._retry_at = time.monotonic() + 5
+                self._retry_at = time.monotonic() + IDENTITY_REFRESH_S
+
+    def _identity_fresh(self):
+        return (self._identity_checked_at is not None
+                and 0 <= time.monotonic() - self._identity_checked_at <= IDENTITY_LEASE_S)
 
     def require_profile(self):
         connected, _ = self._session()
         with self._lock:
             if not connected or self._profile is None:
                 raise RuntimeError(f'robot discovery is not ready: {self._discovery_error}')
+            if not self._identity_fresh():
+                raise RuntimeError('runtime robot identity verification is stale')
 
     def health(self):
         self._session()
@@ -208,6 +231,9 @@ class KuavoSensors:
                 except (RuntimeError, ValueError, TypeError):
                     limits[card] = {'available': False}
             return {'profile': copy.deepcopy(self._profile), 'sensor_topic': self._raw_topic,
+                    'identity_verification': {'valid': self._identity_fresh(),
+                        'age_s': None if self._identity_checked_at is None else
+                                 max(0, time.monotonic() - self._identity_checked_at)},
                     'joint_limits': limits,
                     'discovery_error': self._discovery_error, 'model_error': self._model_error,
                     'skeleton_model': {'source': 'resource/kuavo5w_model.urdf',
@@ -223,6 +249,8 @@ class KuavoSensors:
             raise RuntimeError(f'hardware-verified joint limits are not configured for {card}')
         if self._profile is None or not self._names or self._model_error is not None:
             raise RuntimeError('runtime joint model is not validated')
+        if not self._identity_fresh():
+            raise RuntimeError('runtime robot identity verification is stale')
         record = policy.get('verification')
         if not isinstance(record, str) or not record.strip() or len(record) > 512:
             raise ValueError('joint limits require a commissioning verification record')
@@ -243,15 +271,58 @@ class KuavoSensors:
         return [(math.radians(a), math.radians(b)) for a, b in zip(low, high)]
 
     def validate_joint_target(self, card, target):
-        measured = self.joint_positions()  # The same model/freshness gate as convergence.
         with self._lock:
+            # Read measurement and model/limit binding under one coherent lock.
             bounds = self._joint_bounds(card)
+            measured = self.joint_positions()
             if len(target) != len(bounds):
                 raise ValueError('joint target size does not match limits')
             for i, (value, (low, high)) in enumerate(zip(target, bounds)):
                 if not finite(value) or not low <= value <= high:
                     raise ValueError(f'{card} joint target {i} is outside hardware-verified limits')
             return measured
+
+    def _store_joints(self, message, meta):
+        # sensor_time is the vendor capture time. Receipt time/header sequence
+        # cannot turn a retransmitted capture into independent evidence.
+        capture = message.get('sensor_time')
+        if not isinstance(capture, dict):
+            raise ValueError('joint sensor_time is missing')
+        secs, nsecs = capture.get('secs'), capture.get('nsecs')
+        if (type(secs) is not int or type(nsecs) is not int or secs < 0
+                or not 0 <= nsecs < 1_000_000_000 or secs + nsecs == 0):
+            raise ValueError('joint sensor_time is invalid')
+        capture_ns = secs * 1_000_000_000 + nsecs
+        now, wall = time.monotonic(), time.time()
+        age = wall - capture_ns / 1e9
+        if not -JOINT_FUTURE_TOLERANCE_S <= age <= JOINT_MAX_AGE_S:
+            raise ValueError('joint capture is stale or clocks are not synchronized')
+        if self._joint_capture_ns is not None and capture_ns <= self._joint_capture_ns:
+            return  # No data/freshness update for repeated or reordered captures.
+        raw = message['joint_data']
+        q = vector(raw.get('joint_q'), 20)
+        arrays = {}
+        for key, source in (('dq', 'joint_v'), ('ddq', 'joint_vd'), ('tau', 'joint_torque')):
+            try:
+                arrays[key] = vector(raw.get(source), 20)
+            except ValueError:
+                arrays[key] = [None] * 20
+        # SDK effort may be N*m OR Amperes; retain raw values without guessing.
+        raw_effort = arrays['tau']
+        if self._torque_unit is None:
+            arrays['tau'] = [None] * 20
+        joints = [{'idx': i, 'name': self._names[i] if self._names else None, 'q': v,
+                   **{key: values[i] for key, values in arrays.items()}} for i, v in enumerate(q)]
+        self._data['joints'] = {**meta, 'joints': joints,
+            'vendor': {**meta['vendor'], 'sensor_time': dict(capture), 'joint_torque': raw_effort,
+                       'joint_torque_unit': self._torque_unit},
+            'units': {'q': 'rad', 'dq': 'rad/s', 'ddq': 'rad/s^2', 'tau': self._torque_unit}}
+        self._joint_capture_ns = capture_ns
+        # Map capture into the monotonic clock used by command issue/deadlines.
+        # Never put a slightly future-dated capture after its own receipt.
+        self._joint_captured_at = now - max(0, age)
+        self._seen['joints'] = now
+        self._errors.pop('joints', None)
 
     def _on_raw(self, message, source, generation):
         if not self._session()[0]:
@@ -263,28 +334,7 @@ class KuavoSensors:
             stamp_ms, provenance = stamp(message)
             meta = {'stamp_ms': stamp_ms, 'vendor': {'topic': self._raw_topic, **provenance}}
             try:
-                raw = message['joint_data']
-                q = vector(raw.get('joint_q'), 20)
-                # Missing optional measurements stay null, never fabricated zeros.
-                arrays = {}
-                for key, source in (('dq', 'joint_v'), ('ddq', 'joint_vd'), ('tau', 'joint_torque')):
-                    try:
-                        arrays[key] = vector(raw.get(source), 20)
-                    except ValueError:
-                        arrays[key] = [None] * 20
-                # The SDK data class permits N*m OR Amperes. Preserve raw effort,
-                # but do not label a possible current as physical joint torque.
-                raw_effort = arrays['tau']
-                if self._torque_unit is None:
-                    arrays['tau'] = [None] * 20
-                joints = [{'idx': i, 'name': self._names[i] if self._names else None, 'q': v,
-                           **{key: values[i] for key, values in arrays.items()}} for i, v in enumerate(q)]
-                self._data['joints'] = {**meta, 'joints': joints,
-                    'vendor': {**meta['vendor'], 'joint_torque': raw_effort,
-                               'joint_torque_unit': self._torque_unit},
-                    'units': {'q': 'rad', 'dq': 'rad/s', 'ddq': 'rad/s^2', 'tau': self._torque_unit}}
-                self._seen['joints'] = time.monotonic()
-                self._errors.pop('joints', None)
+                self._store_joints(message, meta)
             except (KeyError, TypeError, ValueError, AttributeError) as exc:
                 self._data.pop('joints', None)
                 self._seen.pop('joints', None)
@@ -339,9 +389,12 @@ class KuavoSensors:
             if not self._names or self._model_error is not None:
                 raise RuntimeError('runtime joint model is not validated')
             seen = self._seen.get('joints', 0)
-            if time.monotonic() - seen > 0.5 or 'joints' not in self._data:
+            if (time.monotonic() - seen > JOINT_MAX_AGE_S or 'joints' not in self._data
+                    or self._joint_captured_at is None
+                    or time.monotonic() - self._joint_captured_at > JOINT_MAX_AGE_S):
                 raise RuntimeError('measured joint feedback is missing or stale')
-            return [j['q'] for j in self._data['joints']['joints']], seen
+            return ([j['q'] for j in self._data['joints']['joints']],
+                    self._joint_captured_at, self._joint_capture_ns)
 
     def snapshot(self, card):
         connected, generation = self._session()
@@ -353,6 +406,9 @@ class KuavoSensors:
                  self._discovery_error or 'missing_or_stale_measurement'))
             if card == 'joints' and not self._names:
                 valid, reason = False, self._model_error
+            if card == 'joints' and (not self._identity_fresh() or self._joint_captured_at is None
+                                    or now - self._joint_captured_at > JOINT_MAX_AGE_S):
+                valid, reason = False, reason or 'stale_capture_or_runtime_identity'
             payload = copy.deepcopy(self._data[card]) if valid else {}
             if card == 'loco_state':
                 window = [v for at, v in self._odom_window if now - at <= 0.5] if valid else []
@@ -370,7 +426,7 @@ class KuavoSensors:
         with self._lock:
             if self._closed.is_set():
                 return
-            if connected and (self._profile is None or self._names is None) and not self._discovering and time.monotonic() >= self._retry_at:
+            if connected and not self._discovering and time.monotonic() >= self._retry_at:
                 self._discovering = True
                 self._thread = threading.Thread(target=self.discover, daemon=True, name='kuavo-discovery')
                 self._thread.start()
