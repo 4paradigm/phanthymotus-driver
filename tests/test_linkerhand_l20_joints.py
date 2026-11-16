@@ -934,6 +934,41 @@ def test_disabled_joints_section_registers_nothing():
     assert "joints" not in [p.PREFIX for p in build_plugins(config, "", None)]
 
 
+def test_a_stopped_card_removes_its_controller_from_the_shared_registry(monkeypatch):
+    """A closed controller must not keep a hand looking occupied (PR #546 review)."""
+    registry = {}
+
+    class Controller:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    controller = Controller()
+    monkeypatch.setattr(hand_device, "GLOBAL_CONTROLLERS", registry)
+    monkeypatch.setattr(joints_device, "GLOBAL_CONTROLLERS", registry)
+    plugin = JointsPlugin(None, {}, global_config=GLOBAL_CONFIG)
+    plugin._used_targets.add(("right", "can1"))
+    registry[("right", "can1")] = controller
+
+    plugin._close_if_unused(("right", "can1"))
+    assert controller.closed and registry == {}
+
+    # The next card must probe the hand again instead of trusting a stale entry.
+    probed = []
+    plugin._channels = lambda: ["can1"]
+    plugin._channel_usable = lambda channel: True
+    plugin._probe = lambda side, channel: probed.append((side, channel)) or True
+    plugin._get_controller = lambda side, channel: SimpleNamespace(get=lambda: FakeClient())
+    plugin.dispatch("start", {"instance_id": "next", "bound_side": "right"})
+    try:
+        assert probed == [("right", "can1")]
+        assert plugin._claims["next"] == ("right", "can1")
+    finally:
+        plugin.stop()
+
+
 def test_plugin_stop_closes_only_controllers_the_hand_card_does_not_own(monkeypatch):
     owned, own = mock.Mock(), mock.Mock()
     monkeypatch.setattr(hand_device, "GLOBAL_CONTROLLERS", {("left", "can0"): owned, ("right", "can1"): own})

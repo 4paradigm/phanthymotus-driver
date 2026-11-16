@@ -581,6 +581,12 @@ class JointsPlugin:
             ctrl = GLOBAL_CONTROLLERS.get(target)
             if ctrl is not None:
                 ctrl.close()
+                # A closed controller must not keep making the hand look
+                # occupied: the next card has to probe the hand again. Left in
+                # the registry, the stale entry makes _match() claim a hand that
+                # may already be unplugged (PR #546 review).
+                if GLOBAL_CONTROLLERS.get(target) is ctrl:
+                    del GLOBAL_CONTROLLERS[target]
 
     def _get_controller(self, side: str, channel: str):
         # Not registered on the hand card: its shutdown releases torque on every
