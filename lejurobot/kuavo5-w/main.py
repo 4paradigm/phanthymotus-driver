@@ -10,6 +10,7 @@ import re
 import signal
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -20,6 +21,39 @@ PROFILE = Path("/opt/phanthy-motus/dds-local.xml")
 DRIVER_ID = "lejurobot-kuavo5-w-driver"
 MCP_HOST = "127.0.0.1"
 _bundle = None
+
+
+class _McpRequestLog:
+    """One bounded sampler shared by all HTTP connections/worker threads."""
+    TOOLS = frozenset(('loco', 'arm', 'leg', 'waist', 'head', 'switch_mode',
+                       'state', 'joints', 'imu', 'loco_state', 'model'))
+    STATES = frozenset(('ready', 'idle', 'running', 'executing', 'paused',
+                        'completed', 'error', 'rejected', 'disconnected'))
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._buckets = {}
+        self._states = {}
+
+    def emit(self, message, error=False, event=None):
+        outcome = 'error' if error else 'ok'
+        with self._lock:
+            now = time.monotonic()
+            bucket = self._buckets.setdefault(outcome, {'at': None, 'suppressed': 0})
+            transition = False
+            if (event and isinstance(event[0], str) and isinstance(event[1], str)
+                    and event[0] in self.TOOLS and event[1] in self.STATES):
+                transition = self._states.get(event[0]) != event[1]
+                self._states[event[0]] = event[1]
+            if transition or bucket['at'] is None or now - bucket['at'] >= 5.:
+                detail = f' tool={event[0]} state={event[1]}' if transition else ''
+                print(f"[mcp] outcome={outcome}{detail} {message} suppressed={bucket['suppressed']}", flush=True)
+                bucket.update(at=now, suppressed=0)
+            else:
+                bucket['suppressed'] += 1
+
+
+_request_log = _McpRequestLog()
 
 
 def _load_config():
@@ -92,11 +126,21 @@ def _handler():
             return True
 
         def log_message(self, fmt, *args):
-            safe = (fmt % args).encode("unicode_escape").decode("ascii")[:200]
-            print(f"[mcp] {safe}", flush=True)
+            safe = (fmt % args)[:200].encode("unicode_escape").decode("ascii")[:200]
+            error = getattr(self, '_rpc_failed', False) or getattr(self, '_http_status', 0) >= 400
+            _request_log.emit(safe, error, getattr(self, '_tool_event', None))
+
+        def log_request(self, code='-', size='-'):
+            self._http_status = int(code) if str(code).isdigit() else 0
+            super().log_request(code, size)
+
+        def log_error(self, fmt, *args):
+            self._rpc_failed = True
+            self.log_message(fmt, *args)
 
         def _reply(self, status, payload):
             body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode()
+            self._rpc_failed = 'error' in payload or payload.get('result', {}).get('isError', False)
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -153,6 +197,10 @@ def _handler():
                 result = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}]}
                 if value.get("error") or value.get("state") in ("error", "rejected"):
                     result["isError"] = True
+                # Polling is sampled; actual card state changes are distinct
+                # diagnostic events. Never key sampler storage by user input.
+                if params.get('arguments', {}).get('action', 'start') not in ('info', 'get_current_mode'):
+                    self._tool_event = (params['name'], value.get('state'))
             else:
                 self._error(-32601, f"Method not found: {method}", rid)
                 return

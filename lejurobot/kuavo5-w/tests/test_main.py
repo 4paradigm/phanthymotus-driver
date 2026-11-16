@@ -23,6 +23,11 @@ with patch.dict(sys.modules, {"common": types.SimpleNamespace(logsafe=types.Simp
 
 
 class McpTests(unittest.TestCase):
+    def setUp(self):
+        self.log_patch = patch.object(main, '_request_log', main._McpRequestLog())
+        self.log_patch.start()
+        self.addCleanup(self.log_patch.stop)
+
     def http_request(self, headers=(), peer='127.0.0.1', method='POST'):
         # Exercise BaseHTTPRequestHandler's real HTTP parser and response writer.
         body = json.dumps(self.rpc()).encode()
@@ -70,6 +75,67 @@ class McpTests(unittest.TestCase):
                 self.assertNotIn(b'Access-Control-Allow-Origin', head)
                 self.assertFalse(response['result'].get('isError', False))
         self.assertEqual(calls, [('loco', {}), ('loco', {})])
+
+    def test_successful_poll_logs_are_sampled_across_http_connections(self):
+        rpc = self.rpc('state', {'action': 'info'})
+        clock = [0.]
+        with patch.object(self, 'rpc', return_value=rpc), patch.object(main, 'time', types.SimpleNamespace(monotonic=lambda: clock[0])), patch.object(
+                main, '_bundle', types.SimpleNamespace(dispatch=lambda *args: {'state': 'running'})), patch('builtins.print') as log:
+            for _ in range(100):
+                self.assertEqual(self.http_request([('Host', 'localhost:15747')])[0], 200)
+            self.assertEqual(log.call_count, 1)
+            clock[0] = 5.
+            self.http_request([('Host', 'localhost:15747')])
+            self.assertEqual(log.call_count, 2)
+            self.assertIn('suppressed=99', log.call_args[0][0])
+
+    def test_http_200_tool_errors_are_not_classified_as_successful_polls(self):
+        rpc = self.rpc('state', {'action': 'info'})
+        values = iter([{'state': 'running'}, {'state': 'error', 'error': 'test failure'}])
+        with patch.object(self, 'rpc', return_value=rpc), patch.object(main, '_bundle',
+                types.SimpleNamespace(dispatch=lambda *args: next(values))), patch('builtins.print') as log:
+            self.http_request([('Host', 'localhost:15747')])
+            status, _, response = self.http_request([('Host', 'localhost:15747')])
+        self.assertEqual(status, 200)
+        self.assertTrue(response['result']['isError'])
+        self.assertEqual(log.call_count, 2)
+        self.assertIn('outcome=error', log.call_args[0][0])
+
+    def test_meaningful_card_state_transitions_are_logged_separately(self):
+        states = iter(['ready', 'ready', 'executing', 'executing', 'paused', 'paused'])
+        with patch.object(main, '_bundle', types.SimpleNamespace(dispatch=lambda *args: {'state': next(states)})), patch('builtins.print') as log:
+            for _ in range(6):
+                self.http_request([('Host', 'localhost:15747')])
+        self.assertEqual(log.call_count, 3)
+        for call, state in zip(log.call_args_list, ('ready', 'executing', 'paused')):
+            self.assertIn(f'tool=loco state={state}', call[0][0])
+
+    def test_request_log_sampler_is_shared_and_bounded_under_concurrency(self):
+        logger = main._McpRequestLog()
+        def emit():
+            for _ in range(100):
+                logger.emit('success')
+        with patch.object(main, 'time', types.SimpleNamespace(monotonic=lambda: 0.)), patch('builtins.print') as log:
+            threads = [threading.Thread(target=emit) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(1)
+                self.assertFalse(thread.is_alive())
+        self.assertEqual(log.call_count, 1)
+        self.assertEqual(logger._buckets['ok']['suppressed'], 799)
+        self.assertEqual(len(logger._buckets), 1)
+
+    def test_sampled_request_logs_still_escape_and_cap_untrusted_lines(self):
+        handler_type = main._handler()
+        handler = handler_type.__new__(handler_type)
+        with patch('builtins.print') as log:
+            handler.log_message('%s', '\n\x00\x1b' + 'x' * 10000)
+        line = log.call_args[0][0]
+        self.assertNotIn('\n', line)
+        self.assertNotIn('\x00', line)
+        self.assertNotIn('\x1b', line)
+        self.assertLess(len(line), 300)
 
     def request(self, value, path="/mcp"):
         body = value if isinstance(value, bytes) else json.dumps(value).encode()
@@ -176,6 +242,7 @@ class DeploymentTests(unittest.TestCase):
         meta = yaml.safe_load((ROOT / "driver.yaml").read_text())
         config = yaml.safe_load((ROOT / "config.yaml").read_text())
         self.assertIs(config['motion_enabled'], True)
+        self.assertIsNone(config['sensors']['joint_limits'])
         compose = next(iter(yaml.safe_load((ROOT / "deploy/service.yml").read_text()).values()))
         self.assertEqual(meta["port"], config["mcp_port"])
         self.assertEqual(meta["mcp_url"], f"http://localhost:{config['mcp_port']}/mcp")

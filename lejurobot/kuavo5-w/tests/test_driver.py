@@ -1,4 +1,6 @@
 import importlib.util
+import hashlib
+import copy
 import json
 import math
 import sys
@@ -131,13 +133,24 @@ def wait_until(predicate, timeout=1):
     return bool(predicate())
 
 
+def fixture_joint_limits(ros):
+    """Synthetic bounds for offline tests, NOT limits for a real robot."""
+    return {'verification': 'OFFLINE TEST FIXTURE ONLY; NOT HARDWARE LIMITS',
+            'robot_version': ros.params['robot_version'],
+            'runtime_urdf_sha256': hashlib.sha256(ros.params['humanoid_description'].encode()).hexdigest(),
+            **{card: {'joint_names': JOINT_NAMES[offset:offset + size],
+                      'lower_deg': [-90.] * size, 'upper_deg': [90.] * size}
+               for card, offset, size in (('arm', 4, 14), ('leg', 0, 4))}}
+
+
 class DriverContractTests(unittest.TestCase):
     def setUp(self):
         self.callbacks = []
         self.callback_patch = patch.object(driver, "_acp_complete", side_effect=lambda *a: self.callbacks.append(a))
         self.callback_patch.start()
         self.ros, self.node = FakeRos1(), FakeNode()
-        self.bundle = driver.KuavoBundle({}, "test_robot", self.ros, self.node)
+        self.bundle = driver.KuavoBundle({'sensors': {'joint_limits': fixture_joint_limits(self.ros)}},
+                                         "test_robot", self.ros, self.node)
         self.bundle.sensors.discover()
         self.ros.raw()
         self.ros.emit("/enable_control_state", True)
@@ -688,6 +701,94 @@ class DriverContractTests(unittest.TestCase):
         self.assertIn('stale', result['error'])
         self.assertEqual(self.ros.published, [])
 
+    def test_missing_joint_limits_only_disables_joint_target_actions(self):
+        self.bundle.sensors._joint_limit_config = None
+        for card, size in (('arm', 14), ('leg', 4)):
+            result = self.call(card, 'move_joints', positions=[0.] * size)
+            self.assertIn('hardware-verified joint limits are not configured', result['error'])
+        self.assertEqual(self.ros.published, [])
+        self.assertEqual(self.callbacks, [])
+        self.assertEqual(self.bundle.sensors.health()['joint_limits'],
+                         {'arm': {'available': False}, 'leg': {'available': False}})
+        self.assertTrue(self.bundle.state.motion_enabled)
+        self.assertEqual(self.call('loco', 'move', duration=.1)['state'], 'executing')
+
+    def test_extreme_arm_and_leg_targets_are_rejected_before_publication(self):
+        for card, size in (('arm', 14), ('leg', 4)):
+            for value in (-10000., 10000., -90.01, 90.01):
+                with self.subTest(card=card, value=value):
+                    result = self.call(card, 'move_joints', positions=[value] * size)
+                    self.assertIn('outside hardware-verified limits', result['error'])
+                    self.assertEqual(self.ros.published, [])
+                    self.assertFalse(self.bundle.tracker._active)
+        self.assertEqual(self.callbacks, [])
+        self.assertFalse(self.bundle.state.motion_send_uncertain)
+
+    def test_joint_limit_boundaries_are_inclusive(self):
+        for card, size in (('arm', 14), ('leg', 4)):
+            for value in (-90., 90.):
+                with self.subTest(card=card, value=value):
+                    self.assertEqual(self.call(card, 'move_joints', positions=[value] * size)['state'], 'executing')
+                    self.assertEqual(self.ros.published[-1][2]['position'], [value] * size)
+                    self.assertEqual(self.call(card, 'stop_move')['state'], 'paused')
+                    self.assertEqual(self.call('switch_mode', 'resume')['state'], 'ready')
+
+    def test_joint_limit_records_must_match_runtime_and_be_well_formed(self):
+        original = fixture_joint_limits(self.ros)
+        invalid = []
+        for field, value in (('verification', ''), ('robot_version', 1),
+                             ('runtime_urdf_sha256', 'wrong fingerprint')):
+            policy = copy.deepcopy(original)
+            policy[field] = value
+            invalid.append(policy)
+        for card, size in (('arm', 14), ('leg', 4)):
+            for field, value in (('joint_names', list(reversed(original[card]['joint_names']))),
+                                 ('lower_deg', [False] * size), ('lower_deg', [math.nan] * size),
+                                 ('upper_deg', [math.inf] * size), ('upper_deg', [0.] * (size - 1)),
+                                 ('lower_deg', [100.] * size)):
+                policy = copy.deepcopy(original)
+                policy[card][field] = value
+                invalid.append(policy)
+        for policy in invalid:
+            self.bundle.sensors._joint_limit_config = policy
+            card = 'leg' if policy['leg'] != original['leg'] else 'arm'
+            size = 4 if card == 'leg' else 14
+            with self.subTest(card=card, policy=policy):
+                self.assertEqual(self.call(card, 'move_joints', positions=[0.] * size)['state'], 'error')
+                self.assertEqual(self.ros.published, [])
+
+    def test_joint_limits_can_be_commissioned_for_one_card_only(self):
+        del self.bundle.sensors._joint_limit_config['leg']
+        self.assertIn('not configured for leg', self.call('leg', 'move_joints', positions=[0.] * 4)['error'])
+        self.assertEqual(self.call('arm', 'move_joints', positions=[0.] * 14)['state'], 'executing')
+
+    def test_urdf_fingerprint_change_invalidates_joint_limits_even_with_same_names(self):
+        self.ros.params['humanoid_description'] += '\n'
+        self.bundle.sensors.discover()
+        self.ros.raw()
+        self.assertTrue(self.bundle.sensors.snapshot('joints')['valid'])
+        for card, size in (('arm', 14), ('leg', 4)):
+            self.assertIn('fingerprint does not match', self.call(card, 'move_joints', positions=[0.] * size)['error'])
+        self.assertEqual(self.ros.published, [])
+
+    def test_limit_identity_change_aborts_inflight_joint_action(self):
+        action = self.call('arm', 'move_joints', positions=[0.] * 14)
+        self.ros.params['humanoid_description'] += '\n'
+        self.bundle.sensors.discover()
+        self.ros.raw()
+        self.assertTrue(wait_until(lambda: bool(self.callbacks)))
+        self.assertEqual(self.callbacks[0][:3], (action['action_id'], 'arm', 'error'))
+        self.assertIn('fingerprint', self.callbacks[0][3]['reason'])
+        self.assertTrue(self.bundle.state.motion_blocked)
+
+    def test_invalid_joint_target_does_not_cancel_another_active_channel(self):
+        action = self.call('leg', 'move_joints', positions=[0.] * 4)
+        result = self.call('arm', 'move_joints', positions=[10000.] * 14)
+        self.assertEqual(result['state'], 'error')
+        self.assertTrue(self.bundle.tracker.current('lower_body', action['action_id']))
+        self.assertEqual(self.callbacks, [])
+        self.assertEqual(len(self.ros.published), 1)
+
     def test_joint_commands_require_matching_runtime_model(self):
         model = self.ros.params['humanoid_description']
         for description in (None, model.replace(JOINT_NAMES[0], 'unexpected_joint')):
@@ -826,6 +927,100 @@ class DriverContractTests(unittest.TestCase):
         self.assertTrue(wait_until(lambda: self.callbacks))
         self.assertEqual([c[:3] for c in self.callbacks], [(result["action_id"], "loco", "cancelled")])
         self.assertEqual(self.call("loco", "move", duration=0.1)["state"], "error")
+
+    def _partial_initial_send(self, card, action, topic, **args):
+        original = self.ros.publish
+        failed = [False]
+        def publish(name, message_type, message):
+            original(name, message_type, message)
+            if name == topic and not failed[0]:
+                failed[0] = True
+                raise OSError('send failed after simulated delivery')
+        with patch.object(self.ros, 'publish', side_effect=publish):
+            result = self.call(card, action, **args)
+        self.assertEqual(result['state'], 'error')
+        self.assertEqual(result['command_delivery'], 'uncertain')
+        self.assertFalse(result['physical_stop_confirmed'])
+        self.assertTrue(self.bundle.state.motion_blocked)
+        self.assertTrue(self.bundle.state.snapshot()['motion_send_uncertain'])
+        self.assertFalse(self.bundle.tracker._active)
+        self.assertEqual(self.ros.sent_services[-1][2], {'data': False})
+        self.assertTrue(wait_until(lambda: bool(self.callbacks)))
+        self.assertEqual([c[:3] for c in self.callbacks], [(result['action_id'], card, 'error')])
+        # A False feedback/accepted pause is not proof the old target was cancelled.
+        self.assertFalse(self.bundle.state.confirmed_enable())
+        self.assertIn('delivery is uncertain', self.call('switch_mode', 'resume')['error'])
+        self.assertEqual(self.call('loco', 'move', duration=.1)['state'], 'error')
+        count = len(self.ros.sent_services)
+        self.bundle.close()
+        self.assertEqual(len(self.ros.sent_services), count + 1)
+        self.assertEqual(self.ros.sent_services[-1][2], {'data': False})
+        self.assertEqual(len(self.callbacks), 1)
+
+    def test_partial_initial_position_send_fails_closed_and_shutdown_retries_stop(self):
+        self._partial_initial_send('loco', 'move_relative', '/cmd_pose', x=.01, y=0., yaw=0.)
+
+    def test_partial_initial_velocity_send_fails_closed(self):
+        self._partial_initial_send('loco', 'move', '/cmd_vel', vx=.01, duration=.2)
+
+    def test_partial_initial_joint_send_fails_closed(self):
+        self._partial_initial_send('arm', 'move_joints', '/kuavo_arm_traj', positions=[0.] * 14)
+
+    def test_initial_send_disconnect_remains_uncertain_after_reconnect(self):
+        def disconnect(*_args):
+            self.ros.connection = (False, 1)
+            raise ConnectionError('delivery unknown')
+        with patch.object(self.ros, 'publish', side_effect=disconnect):
+            result = self.call('loco', 'move', duration=.2)
+        self.assertEqual(result['command_delivery'], 'uncertain')
+        self.assertFalse(result['physical_stop_confirmed'])
+        self.ros.connection = (True, 2)
+        self.bundle.sensors.discover()
+        self.ros.raw()
+        self.ros.emit('/enable_control_state', True)
+        self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 3)
+        self.bundle.state.verify_enable()
+        self.assertIn('delivery is uncertain', self.call('switch_mode', 'resume')['error'])
+        self.assertTrue(self.bundle.state.motion_blocked)
+
+    def test_initial_send_failure_pause_wait_does_not_hold_publication_lock(self):
+        original_publish, original_wait = self.ros.publish, self.ros.wait_service
+        entered, release = threading.Event(), threading.Event()
+        first_publish, first_wait, result = [True], [True], []
+        def publish(*args):
+            original_publish(*args)
+            if first_publish[0]:
+                first_publish[0] = False
+                raise OSError('delivery unknown')
+        def wait(pending, timeout, cancelled=None):
+            if first_wait[0]:
+                first_wait[0] = False
+                entered.set()
+                release.wait(2)
+            return original_wait(pending, timeout, cancelled)
+        with patch.object(self.ros, 'publish', side_effect=publish), patch.object(self.ros, 'wait_service', side_effect=wait):
+            worker = threading.Thread(target=lambda: result.append(self.call('loco', 'move', duration=.2)))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                stopped = self.call('head', 'stop_move')
+                self.assertTrue(worker.is_alive())
+                self.assertNotIn('busy', stopped['error'])
+                self.assertFalse(stopped['physical_stop_confirmed'])
+                self.assertEqual([s[2] for s in self.ros.sent_services], [{'data': False}, {'data': False}])
+            finally:
+                release.set()
+                worker.join(1)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result[0]['command_delivery'], 'uncertain')
+        self.assertTrue(wait_until(lambda: bool(self.callbacks)))
+        self.assertEqual(len(self.callbacks), 1)
+
+    def test_input_validation_failure_does_not_mark_delivery_uncertain(self):
+        self.assertEqual(self.call('loco', 'move', duration=-1)['state'], 'error')
+        self.assertFalse(self.bundle.state.motion_send_uncertain)
+        self.assertFalse(self.bundle.state.motion_blocked)
+        self.assertEqual(self.ros.sent_services, [])
 
     def test_pause_service_acceptance_without_feedback_not_success(self):
         self.ros.confirm = False

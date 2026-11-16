@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections import deque
 import copy
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -88,6 +89,8 @@ class KuavoSensors:
         self._generation = -1
         self._profile = None
         self._urdf, self._names = None, None
+        self._model_sha256 = None
+        self._joint_limit_config = copy.deepcopy(config.get('joint_limits'))
         self._model_error = 'waiting_for_discovery'
         self._model_path = Path(__file__).resolve().parent / 'resource' / 'kuavo5w_model.urdf'
         self._discovery_error = 'waiting_for_discovery'
@@ -117,6 +120,7 @@ class KuavoSensors:
         with self._lock:
             if not connected or generation != self._generation:
                 self._profile = self._urdf = self._names = None
+                self._model_sha256 = None
                 self._data.clear()
                 self._seen.clear()
                 self._errors.clear()
@@ -169,11 +173,13 @@ class KuavoSensors:
                 self._raw_topic = topic
                 self._profile = params
                 self._urdf, self._names, self._model_error = urdf, names, model_error
+                self._model_sha256 = hashlib.sha256(urdf.encode('utf-8')).hexdigest() if urdf else None
                 self._discovery_error = None
         except Exception as exc:
             with self._lock:
                 if self.ros1.connection == (True, generation):
                     self._profile = self._urdf = self._names = None
+                    self._model_sha256 = None
                     for card in ('joints', 'imu'):
                         self._data.pop(card, None)
                         self._seen.pop(card, None)
@@ -194,11 +200,58 @@ class KuavoSensors:
     def health(self):
         self._session()
         with self._lock:
+            limits = {}
+            for card in ('arm', 'leg'):
+                try:
+                    self._joint_bounds(card)
+                    limits[card] = {'available': True, 'verification': self._joint_limit_config['verification']}
+                except (RuntimeError, ValueError, TypeError):
+                    limits[card] = {'available': False}
             return {'profile': copy.deepcopy(self._profile), 'sensor_topic': self._raw_topic,
+                    'joint_limits': limits,
                     'discovery_error': self._discovery_error, 'model_error': self._model_error,
                     'skeleton_model': {'source': 'resource/kuavo5w_model.urdf',
                                        'reference_version': '400062',
                                        'runtime_joint_names_verified': self._names is not None}}
+
+    def _joint_bounds(self, card):
+        """Caller holds _lock. Configuration is an operator commissioning record,
+        never inferred from the display URDF or from joint-name agreement alone.
+        """
+        policy = self._joint_limit_config
+        if not isinstance(policy, dict) or not isinstance(policy.get(card), dict):
+            raise RuntimeError(f'hardware-verified joint limits are not configured for {card}')
+        if self._profile is None or not self._names or self._model_error is not None:
+            raise RuntimeError('runtime joint model is not validated')
+        record = policy.get('verification')
+        if not isinstance(record, str) or not record.strip() or len(record) > 512:
+            raise ValueError('joint limits require a commissioning verification record')
+        version = policy.get('robot_version')
+        if (type(version) not in (int, str) or type(version) is not type(self._profile['robot_version'])
+                or version != self._profile['robot_version'] or not version
+                or (isinstance(version, str) and not version.strip())):
+            raise ValueError('joint limits robot_version does not match the runtime robot')
+        if policy.get('runtime_urdf_sha256') != self._model_sha256:
+            raise ValueError('joint limits runtime URDF fingerprint does not match')
+        offset, size = (4, 14) if card == 'arm' else (0, 4)
+        entry = policy[card]
+        if entry.get('joint_names') != self._names[offset:offset + size]:
+            raise ValueError(f'{card} joint limit names/order do not match the runtime model')
+        low, high = vector(entry.get('lower_deg'), size), vector(entry.get('upper_deg'), size)
+        if any(a >= b for a, b in zip(low, high)):
+            raise ValueError('joint limits require finite lower_deg < upper_deg')
+        return [(math.radians(a), math.radians(b)) for a, b in zip(low, high)]
+
+    def validate_joint_target(self, card, target):
+        measured = self.joint_positions()  # The same model/freshness gate as convergence.
+        with self._lock:
+            bounds = self._joint_bounds(card)
+            if len(target) != len(bounds):
+                raise ValueError('joint target size does not match limits')
+            for i, (value, (low, high)) in enumerate(zip(target, bounds)):
+                if not finite(value) or not low <= value <= high:
+                    raise ValueError(f'{card} joint target {i} is outside hardware-verified limits')
+            return measured
 
     def _on_raw(self, message, source, generation):
         if not self._session()[0]:

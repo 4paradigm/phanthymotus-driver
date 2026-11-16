@@ -67,7 +67,7 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 ```
 
 本驱动不会自动启动机器人控制器、启用控制、切换 MPC 模式或开启 quick mode。
-`motion_enabled` 默认 `true`，未配置该字段时也默认开启，无需额外修改配置即可调用运动接口。
+`motion_enabled` 默认 `true`，未配置该字段时也默认开启；双臂/下肢关节动作还必须配置现场核验的限位，见下节。
 开启仅表示允许驱动处理请求，不会自动使能机器人、切换模式或发起运动，原有运行时检查仍然生效。
 如需只读运行，可在实际加载的配置文件中设置 `motion_enabled: false` 并重启驱动；此时拒绝运动、
 恢复控制及模式切换，仍允许状态/传感器/模型读取、软件暂停和 `stop_move`。该字段必须是 YAML 布尔值。
@@ -114,7 +114,35 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
   机器人角度限位由官方控制器执行。暂未暴露缺乏到达反馈的头部一次性增量指令。
 
 上述速度和时长上限属于**驱动策略**，不代表厂家最大能力或完整的工作空间、关节限位及碰撞保护。
-末端、下肢和躯干目标需由调用方根据机器人实际安全工作空间设置。
+末端和躯干目标仍需由调用方根据机器人实际安全工作空间设置；关节限位检查不等同于碰撞保护。
+
+### 关节限位配置
+
+随包的 `sensors.joint_limits: null` 表示尚未提供硬件核验记录，因此 `arm.move_joints` 和
+`leg.move_joints` 会在发布前拒绝，其他动作仍遵循各自的运行时检查。不会从显示用参考 URDF 推断可信控制限位，
+也不会把越界目标截断后发送。必须由现场负责人核验实际硬件、标定和控制器配置，再填写以下记录：
+
+| `sensors.joint_limits` 字段 | 要求 |
+| --- | --- |
+| `verification` | 非空、最多512字符的现场核验记录引用，记录应能追溯机器人硬件及标定 |
+| `robot_version` | 与运行时参数的值及类型完全一致 |
+| `runtime_urdf_sha256` | 运行时 `/humanoid_description` 原始字符串按 UTF-8 编码的 SHA-256 |
+| `arm.joint_names` | 原始20关节顺序的 `[4:18]`，左臂7 + 右臂7，名称/顺序完全一致 |
+| `arm.lower_deg` / `arm.upper_deg` | 各14个经现场核验的有限角度值，单位度，逐项 lower < upper |
+| `leg.joint_names` | 原始20关节顺序的 `[0:4]`，名称/顺序完全一致 |
+| `leg.lower_deg` / `leg.upper_deg` | 各4个经现场核验的有限角度值，单位度，逐项 lower < upper |
+
+可只配置 `arm` 或 `leg`，未配置的卡片关节动作继续拒绝。上下界允许取等值；不接受布尔值、NaN 或 Inf。
+`verification` 是操作人员对核验记录的声明，驱动只能校验格式和运行时绑定，不能自动证明限位经过硬件验证。
+URDF 名称匹配或文件含有限位也不构成该证明，本说明不提供未经核验的限位数值。
+在机器人已 source 正确 ROS 环境后，可只读获取原始参数指纹：
+
+```sh
+python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoid_description').encode('utf-8')).hexdigest())"
+```
+
+不要对 `rosparam get` 的 YAML 输出计算指纹。配置需重启加载；可用性及核验记录引用在
+`state.info.feedback.robot_discovery.joint_limits` 查看。运行时模型指纹或配置身份不匹配时不允许关节动作。
 
 模式：0=NoControl（被动）、1=ArmOnly、2=BaseOnly、3=BaseArm、4=ArmEeOnly。
 底盘要求模式2/3；双臂关节要求1/3；末端允许1/3/4。下肢、躯干和头部要求非0模式。
@@ -151,7 +179,7 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 位姿/关节运动订阅相应的 `/lb_*_reach_time`（`std_msgs/Float32`），只使用指令发送后收到的反馈。
 反馈须在3s内到达，估计值接受0–110s；ACP fallback timeout 为125s。
 双臂/下肢 `move_joints` 发令前要求运行时 `/humanoid_description` 通过关节映射/名称校验，
-并有0.5s内实测关节位置；模型缺失、不匹配或在途验证失效均拒绝/终止关节动作。
+并有0.5s内实测关节位置、匹配的现场限位记录且目标在限位内；模型/限位缺失、不匹配或在途验证失效均拒绝/终止关节动作。
 指令后收到新 reach-time，并等过预计时长后，
 还要求实测目标关节误差≤0.035rad，连续新测量覆盖≥0.2s，再返回 `measured_convergence: true`。
 预计结束后5s内未收敛、实测丢失/异常会返回 ACP error 并尝试全身软件暂停。
@@ -162,6 +190,13 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 速度动作以20Hz发送，时长到达后归零，底盘额外等待文档规定的1s停止窗口，头部等待0.3s。
 ACP 同样标记为时长/控制器超时推断。WebSocket发送成功仅代表写入连接，不代表 ROS 控制器确认执行。
 发布器在连接时预先建立，并等待1s连接准备窗口；一次性指令仍以 reach-time 反馈检查接收情况。
+
+首次运动发送抛异常也可能已部分或完整送达控制器。驱动在释放发令锁之前设置
+`motion_blocked` 和 `motion_send_uncertain`，随后在锁外等待全身暂停，取消在途 ACP 并以 error 结束一次。
+请求返回原 `action_id`、`command_delivery: uncertain` 和 `physical_stop_confirmed: false`，
+不会因错误返回就遗忘可能已执行的目标。暂停仍发送零速和 disable，但即使收到 False 也不宣称停止已确认。
+该不确定性在进程内锁存，重连不会清除，拒绝新运动、恢复和模式切换；退出时仍尝试暂停。
+必须现场核实并处置控制器遗留目标后再重启恢复，重启驱动本身不能证明旧目标已取消。
 
 执行卡系统 `start`/`stop` 是立即返回 `ready`/`idle` 的生命周期标记，不访问机器人或等待控制锁。
 `info` 和 `state` 另行报告实际连接状态；生命周期 `ready` 不表示已连接或允许运动。
@@ -180,6 +215,8 @@ ACP 同样标记为时长/控制器超时推断。WebSocket发送成功仅代表
 回调失败有日志和有限重试，驱动退出有有限的回调排空时间。
 ROS 消息处理异常按话题记录首次失败，持续异常每5s采样并累计失败数，恢复时记录一次恢复；
 日志字段继续限长并转义，不会为每个异常帧打印一行。ACP HTTP 回调保持有限重试策略。
+MCP 请求日志在所有 HTTP 连接间共享采样器，重复成功/失败请求分别每5s汇总抑制数；
+实际卡片状态变化单独记录，`info`/模式查询轮询不产生状态变化日志。HTTP 200 中的 MCP 工具错误仍归为失败。
 重连仅恢复发布器/订阅，清除旧反馈，绝不重放运动命令或重试超时服务。
 
 ### 使能状态的只读确认

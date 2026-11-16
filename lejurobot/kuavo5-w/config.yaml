@@ -11,6 +11,10 @@ sensors:
   # SDK permits N*m or current. Set N*m only after verifying robot hardware output.
   # Until then normalized tau is null; vendor.joint_torque preserves the raw values.
   joint_torque_unit: null
+  # No hardware-verified limits have been supplied. Only arm/leg move_joints
+  # are unavailable until a matching commissioning record is configured.
+  # Never copy the display URDF limits as verified control limits. See README.
+  joint_limits: null
 plugins:
   loco: {enabled: true}
   arm: {enabled: true}

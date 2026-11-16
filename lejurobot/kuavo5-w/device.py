@@ -76,6 +76,7 @@ class RobotState:
         self._running = False
         self.motion_blocked = False
         self.remote_resume_unresolved = False
+        self.motion_send_uncertain = False
         self.motion_enabled = motion_enabled
         self._enable_verified_at = None
         self._enable_check_error = 'waiting_for_enable_check'
@@ -151,6 +152,7 @@ class RobotState:
                     "motion_blocked": self.motion_blocked, "fields": fields,
                     "motion_enabled": self.motion_enabled,
                     "remote_resume_unresolved": self.remote_resume_unresolved,
+                    "motion_send_uncertain": self.motion_send_uncertain,
                     "enable_verification": {
                         'valid': self._enable_trusted(now), 'error': self._enable_check_error,
                         'age_s': None if self._enable_verified_at is None else max(0, now - self._enable_verified_at),
@@ -382,6 +384,12 @@ def _array_schema(size, description):
             "maxItems": size, "description": description}
 
 
+class _UncertainMotionSend(RuntimeError):
+    def __init__(self, channel, action_id, reason):
+        super().__init__(_safe_log(reason))
+        self.channel, self.action_id = channel, action_id
+
+
 class _KuavoPlugin:
     ALLOWED_MODES = None
 
@@ -435,6 +443,13 @@ class _KuavoPlugin:
                 return self._dispatch(action, args)
             finally:
                 self.tracker.lock.release()
+        except _UncertainMotionSend as exc:
+            # dispatch's finally has released the publication lock. Never
+            # hold that outer lock while waiting for a pause service response.
+            stopped = self.bundle.pause(str(exc), status='error', expected=(exc.channel, exc.action_id))
+            return {'state': 'error', 'error': str(exc), 'action_id': exc.action_id,
+                    'command_delivery': 'uncertain', 'physical_stop_confirmed': False,
+                    'motion_blocked': True, 'pause': stopped}
         except Exception as exc:
             print(f"[{self.PREFIX}] {_safe_log(action)}: {type(exc).__name__}: {_safe_log(str(exc))}", flush=True)
             return {"state": "error", "error": _safe_log(str(exc))}
@@ -443,7 +458,7 @@ class _KuavoPlugin:
         modes = allowed_modes or self.ALLOWED_MODES
         self.state.require_motion(modes)
         if joint_target is not None:
-            self.bundle.sensors.joint_positions()  # Reject before publishing if feedback is unavailable.
+            self.bundle.sensors.validate_joint_target(self.PREFIX, joint_target[1])
         tracked = self.tracker.begin(self.CHANNEL, self.PREFIX)
         aid, cancelled = tracked
         generation = self.ros1.connection[1]
@@ -451,8 +466,9 @@ class _KuavoPlugin:
         try:
             publish()
         except Exception as exc:
-            self.tracker.finish(self.CHANNEL, aid, self.PREFIX, "error", {"error": str(exc)})
-            raise
+            self.state.motion_blocked = True
+            self.state.motion_send_uncertain = True
+            raise _UncertainMotionSend(self.CHANNEL, aid, str(exc)) from exc
 
         def worker():
             deadline, duration, seen_at = time.monotonic() + 3, None, 0
@@ -466,7 +482,8 @@ class _KuavoPlugin:
                         self.state.require_motion(modes)
                         if self.ros1.connection[1] != generation:
                             raise ConnectionError("connection changed during motion")
-                        measured = self.bundle.sensors.joint_positions() if joint_target is not None else None
+                        measured = (self.bundle.sensors.validate_joint_target(self.PREFIX, joint_target[1])
+                                    if joint_target is not None else None)
                         if duration is None:
                             value, seen = self.state.read(key)
                             if seen >= issued and value is not None:
@@ -516,8 +533,9 @@ class _KuavoPlugin:
         try:
             send()  # Fail synchronously if the first command cannot be sent.
         except Exception as exc:
-            self.tracker.finish(self.CHANNEL, aid, self.PREFIX, "error", {"error": str(exc)})
-            raise
+            self.state.motion_blocked = True
+            self.state.motion_send_uncertain = True
+            raise _UncertainMotionSend(self.CHANNEL, aid, str(exc)) from exc
         deadline = time.monotonic() + duration
 
         def worker():
@@ -603,7 +621,7 @@ class ArmPlugin(_KuavoPlugin):
             "right_position": _array_schema(3, "右手 xyz 米"),
             "left_quaternion": _array_schema(4, "左手单位四元数 xyzw"),
             "right_quaternion": _array_schema(4, "右手单位四元数 xyzw"),
-        }, {"move_joints": (["positions"], "设置双臂14关节角度"),
+        }, {"move_joints": (["positions"], "设置双臂14关节角度，需配置现场核验的关节限位"),
             "set_pose": (["frame", "left_position", "left_quaternion", "right_position", "right_quaternion"], "同时设置双手完整末端位姿"),
             "stop_move": ([], "请求全身软件暂停")}, ["arm_l", "arm_r"], ("move_joints", "set_pose"),
             required={"move_joints": ["positions"], "set_pose": ["frame", "left_position", "left_quaternion", "right_position", "right_quaternion"]})
@@ -649,7 +667,7 @@ class LowerBodyPlugin(_KuavoPlugin):
         if self.PREFIX == "leg":
             return self.schema("Kuavo 5-W 下肢4关节目标，度；与 waist 共享控制通道。", {
                 "positions": _array_schema(4, "四个下肢关节目标角度，度")}, {
-                "move_joints": (["positions"], "设置四个下肢关节角度"),
+                "move_joints": (["positions"], "设置四个下肢关节角度，需配置现场核验的关节限位"),
                 "stop_move": ([], "请求全身软件暂停")}, "lower_body", ("move_joints",),
                 required={"move_joints": ["positions"]})
         return self.schema("Kuavo 5-W 躯干相对底盘位姿；仅支持 x/z/pitch/yaw，四个值均必填。", {
@@ -785,6 +803,8 @@ class KuavoBundle:
         try:
             self.state.require_motion_enabled()
             self.sensors.require_profile()
+            if self.state.motion_send_uncertain:
+                raise RuntimeError('motion command delivery is uncertain; verify controller recovery before further control')
             if self._resume_unresolved():
                 raise RuntimeError('remote resume is unresolved; motion remains blocked; request pause after resolution')
             if self._closing or self._transition is not None or self.tracker._active:
@@ -884,6 +904,7 @@ class KuavoBundle:
                 return {'state': 'idle'}  # An old worker cannot cancel a newer action.
             interrupted = self._transition is not None
             unresolved = self._resume_unresolved()
+            uncertain_motion = self.state.motion_send_uncertain
             token = self._new_transition('pause')
             self.state.motion_blocked = True
             errors = []
@@ -899,7 +920,7 @@ class KuavoBundle:
             except RuntimeError:
                 enabled = None
             # Even a fresh pre-resume False cannot bypass a superseding pause.
-            if enabled is False and not interrupted and not unresolved:
+            if enabled is False and not interrupted and not unresolved and not uncertain_motion:
                 with self.tracker.lock:
                     self._check_transition(token)
                     return {"state": "paused", "control_enabled": False,
@@ -913,6 +934,8 @@ class KuavoBundle:
                 # A later explicit pause must send disable after resolution.
                 if unresolved or self._resume_unresolved():
                     raise RuntimeError('remote resume is unresolved; pause cannot be confirmed')
+                if uncertain_motion:
+                    raise RuntimeError('motion command delivery is uncertain; controller reconciliation is required')
                 return {"state": "paused", "control_enabled": False,
                         "completion_basis": "enable_control_state", "scope": "whole_body"}
         except Exception as exc:
@@ -921,7 +944,8 @@ class KuavoBundle:
             print(f"[pause] physical stop unconfirmed: {error}", flush=True)
             return {"state": "error", "error": error,
                     "physical_stop_confirmed": False, "motion_blocked": True,
-                    "remote_resume_unresolved": self.state.remote_resume_unresolved}
+                    "remote_resume_unresolved": self.state.remote_resume_unresolved,
+                    "motion_send_uncertain": self.state.motion_send_uncertain}
         finally:
             self._end_control(token)
 
@@ -981,7 +1005,8 @@ class KuavoBundle:
             if self._closing:
                 return
             self._closing = True
-            needs_pause = bool(self.tracker._active) or self._transition is not None or self._remote_resume is not None
+            needs_pause = (bool(self.tracker._active) or self._transition is not None
+                           or self._remote_resume is not None or self.state.motion_send_uncertain)
         if needs_pause:
             result = self.pause("driver_shutdown")
             if result.get("error"):
