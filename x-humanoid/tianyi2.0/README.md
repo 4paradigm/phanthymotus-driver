@@ -1074,7 +1074,7 @@ hardware IMU results do not validate this new card lifecycle or performance.
 
 Missing TF, invalid frames/timestamps or unavailable `tf2_ros` produce an
 explicit unavailable packet without a held matrix; images and IMU continue.
-Before publication, the image worker gives native TF a 50 ms delivery wait
+Before publication, the image worker gives native TF a bounded 150 ms delivery wait
 for the latest capture in the pair, outside the camera lock so the shared
 executor can deliver TF. It then performs the original exact-time lookup for
 each published capture and rechecks stop/client epochs. This delivery wait
@@ -1182,3 +1182,11 @@ they add source bytes but no new packages to other drivers. The Tianyi-only
 The standalone estimated-TF companion installs `common.logsafe` before loading
 NumPy or ROS, just as the bundle entry point does. Importing its helpers leaves
 the caller's output streams unchanged.
+
+The shared capture-TF delivery wait is bounded at 150 ms. It does not change the
+50 ms synchronization-error contract, timestamps, or exact lookup semantics.
+No robot names, mounting angles or frames are embedded in this helper. Missing
+transforms still produce explicit unavailable packets. The change adds Python
+source only and no shared binary dependencies. Offline coverage includes delayed
+TF, stop during the wait, timeout without held-transform reuse, and repeated
+start/stop before a first camera frame.

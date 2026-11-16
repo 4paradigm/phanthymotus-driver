@@ -187,3 +187,17 @@ def test_card_start_succeeds_only_after_real_calibrated_output(source, monkeypat
     assert result['state'] == 'running'
     assert result['camera_info'] and 'error' not in result
     assert result['source_status']['first_calibrated_output']
+
+
+def test_repeated_start_stop_before_first_frame_joins_worker(source):
+    source.stop()
+    for _ in range(3):
+        source.start()
+        worker = source.worker
+        assert worker is not None and worker.is_alive()
+        assert source.count == 0
+        source.stop()
+        assert not worker.is_alive()
+        assert not source.running
+        assert source.pending.empty()
+    source.stop()

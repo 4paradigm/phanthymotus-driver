@@ -276,7 +276,7 @@ def test_wait_for_capture_tf_does_not_block_camera_executor(source, monkeypatch)
         return True
     source.body_mount.buffer.can_transform = available
     emit(source)
-    assert waits == [('base_link', 'head_optical', STAMP, .05)]
+    assert waits == [('base_link', 'head_optical', STAMP, .15)]
     packets = [json.loads(msg.data) for topic, msg in source.events if topic.endswith('/body_mount')]
     assert packets[-1]['status'] == 'available'
     assert packets[-1]['stamp_ns'] == STAMP
@@ -301,3 +301,17 @@ def test_tf_wait_timeout_keeps_images_but_never_reuses_transform(source, monkeyp
     assert packets[-1]['status'] == 'unavailable'
     assert 'matrix' not in packets[-1]
     assert any(topic.endswith('/depth') for topic, msg in source.events)
+
+
+def test_tf_arriving_after_50ms_retains_exact_capture_stamp(source, monkeypatch):
+    monkeypatch.setitem(sys.modules, 'rclpy.duration', NS(Duration=lambda **kw: NS(**kw)))
+    source.body_mount.buffer.fail = True
+    def delayed(target, child, stamp, timeout):
+        if timeout.seconds >= .12:
+            source.body_mount.buffer.fail = False
+        return not source.body_mount.buffer.fail
+    source.body_mount.buffer.can_transform = delayed
+    emit(source)
+    packets = [json.loads(msg.data) for topic, msg in source.events if topic.endswith('/body_mount')]
+    assert packets[-1]['status'] == 'available'
+    assert packets[-1]['stamp_ns'] == STAMP
