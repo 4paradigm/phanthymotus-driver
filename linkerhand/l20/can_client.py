@@ -281,6 +281,7 @@ class L20CanClient:
         recv_timeout_s: float = 1.0,
         bus_factory=None,
         legacy_l20_mode: bool = False,
+        request_metadata: bool = True,
     ):
         if side not in ("left", "right"):
             raise ValueError("side must be 'left' or 'right'")
@@ -357,11 +358,13 @@ class L20CanClient:
         )
         self._recv_thread.start()
 
-        # Request device info and initial status
-        try:
-            self.request_device_info()
-        except Exception:
-            pass
+        # Request device info and initial status. A read-only consumer (the
+        # joints card) opts out so its traffic stays limited to 0x41..0x45.
+        if request_metadata:
+            try:
+                self.request_device_info()
+            except Exception:
+                pass
 
     # ──────────────────────────────────────────────────────────────────
     # CAN Bus Setup & Helpers

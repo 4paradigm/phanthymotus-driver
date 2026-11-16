@@ -491,19 +491,19 @@ class PartialBus(MockCanBus):
 def test_real_client_sends_only_position_queries(bus_type):
     bus = bus_type(can_id=0x27)
     bus.sim_pitch, bus.sim_yaw, bus.sim_roll, bus.sim_tip = [10, 20, 30, 40, 50], [60, 70, 80, 90, 100], [110, 0, 0, 0, 0], [120, 130, 140, 150, 160]
-    client = L20CanClient("can0", "right", can_id=0x27, recv_timeout_s=0.05, bus_factory=lambda *_: bus)
+    client = L20CanClient("can0", "right", can_id=0x27, recv_timeout_s=0.05,
+                          bus_factory=lambda *_: bus, request_metadata=False)
     plugin, _, _ = make_plugin({("right", "can0"): client}, config={"query_timeout_s": 0.1})
     try:
         result = one_round(plugin)
     finally:
         client.close()
     sent = [list(m.data) for m in bus.sent_messages]
-    # Opening a client queries UID / hardware / software version (read-only);
-    # everything else must be an empty-payload position request.
-    version_queries = [[0xC0, 0], [0xC1, 0], [0xC2, 0]]
-    queries = [frame for frame in sent if frame not in version_queries]
-    assert sorted({frame[0] for frame in queries}) == [0x41, 0x42, 0x43, 0x44, 0x45]
-    assert all(len(frame) == 1 for frame in queries)
+    # Read-only path: no UID/hardware/software metadata, only empty position
+    # requests 0x41..0x45 (PR #546 review).
+    assert sent
+    assert sorted({frame[0] for frame in sent}) == [0x41, 0x42, 0x43, 0x44, 0x45]
+    assert all(len(frame) == 1 for frame in sent)
     if bus_type is PartialBus:
         assert result["valid"] is False and result["timestamp"] is None
         return
@@ -511,6 +511,34 @@ def test_real_client_sends_only_position_queries(bus_type):
     assert result["valid"] is True
     assert (raw["thumb_pitch"], raw["thumb_yaw"], raw["thumb_roll"], raw["thumb_tip"]) == (10, 60, 110, 120)
     assert (raw["pinky_pitch"], raw["pinky_yaw"], raw["pinky_tip"]) == (50, 100, 160)
+
+
+def test_joints_never_requests_device_metadata(monkeypatch):
+    """The read-only card must not send 0xC0..0xC2 UID/version queries."""
+    captured = {}
+
+    def fake_get_shared(config, side, channel, **kwargs):
+        captured["controller"] = kwargs
+        return SimpleNamespace(get=lambda: FakeClient())
+
+    monkeypatch.setattr(joints_device, "get_shared_controller", fake_get_shared)
+    plugin = JointsPlugin(None, {}, global_config=GLOBAL_CONFIG)
+    plugin._get_controller("right", "can1")
+    assert captured["controller"]["request_metadata"] is False
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            captured["probe"] = kwargs
+
+        def probe_positions(self, timeout):
+            return False
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(joints_device, "L20CanClient", Client)
+    plugin._probe("right", "can1")
+    assert captured["probe"]["request_metadata"] is False
 
 
 # ── topics, matching, waiting ──────────────────────────────────────────

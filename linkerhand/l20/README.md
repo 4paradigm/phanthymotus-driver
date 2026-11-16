@@ -178,7 +178,7 @@ JSON 主要字段：`valid`、`state`、`reason`、`error_details`、`side`、`c
 
 当前 Core 的已知限制：详情面板请求模型时仍固定使用占位 ID，骨架视图会回退为人形模型（既有问题，未修）；Dashboard 画布会带上 topic，按上面的规则加载单手模型。Core 按内旋 XYZ 解释 URDF `rpy`，驱动已将拇指的多轴旋转拆成单轴固定关节，使两种解释结果一致。
 
-卡片不把自己打开的 CAN 连接登记到 `hand` 卡片，驱动退出时不会因本卡片对任何手下发卸力；只关闭仅由本卡片打开的连接。
+卡片不把自己打开的 CAN 连接登记到 `hand` 卡片，驱动退出时不会因本卡片对任何手下发卸力；只关闭**本插件自己创建**的连接，`GLOBAL_CONTROLLERS` 里已有的 hand/gesture/grasp/tactile 控制器不会被关闭或删除。本卡创建的 CAN 客户端带 `request_metadata=False`，不发送 0xC0–0xC2 设备信息查询，总线上只有 0x41–0x45 位置查询。
 
 ## 3. 验证
 

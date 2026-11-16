@@ -607,7 +607,8 @@ class JointsPlugin:
         target = (side, channel)
         existed = target in GLOBAL_CONTROLLERS
         ctrl = get_shared_controller(self.hand_config, side, channel,
-                                     can_id=self.can_id(side), bus_lock=GLOBAL_BUS_LOCK)
+                                     can_id=self.can_id(side), bus_lock=GLOBAL_BUS_LOCK,
+                                     request_metadata=False)
         self._used_targets.add(target)
         if not existed:
             self._created_targets.add(target)
@@ -665,7 +666,7 @@ class JointsPlugin:
         client = None
         try:
             client = L20CanClient(channel, side, baudrate=self.baudrate, can_id=self.can_id(side),
-                                  recv_timeout_s=PROBE_TIMEOUT_S + 0.08)
+                                  recv_timeout_s=PROBE_TIMEOUT_S + 0.08, request_metadata=False)
             time.sleep(0.02)
             alive = bool(client.probe_positions(PROBE_TIMEOUT_S))
         except Exception as exc:
