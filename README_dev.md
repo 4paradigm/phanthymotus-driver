@@ -578,6 +578,7 @@ source is `*/*/driver.yaml`, and this is a snapshot of it:
 | Booster K1 | 15705 | | PNDbotics Adam | 15722 |
 | BrainCo Revo2 | 15706 | | Chasing Qianjiao P200 Pro | 15739 |
 | LinkerHand L20 Lite | 15733 | | | |
+| Dobot CRA | 15746 | | | |
 | X-humanoid Tianyi 2.0 | 15707 | | RoboEra Q5 | 15793 |
 | EngineAI T800 | 15708 | | | |
 | Unitree AS2W | 15709 | | **Simulator (generic)** | **15711** |
@@ -1093,6 +1094,40 @@ def _acp_callback(self, action_id: str, status: str, result: dict):
 **Important**: Use `import os as _os` inside the callback function — nested functions and threads may not see module-level `os` in some contexts.
 
 Call this from your worker thread when the action finishes. `AGENT_CORE_URL` env var is set in all driver containers.
+
+**Do not turn on hostname verification for this call.** Agent Core's certificate is
+self-signed with `-subj /CN=phanthy-motus` and carries **no subjectAltName**. Since
+Python 3.7, hostname checking reads SAN only, so `ssl.create_default_context(cafile=...)`
+against `https://localhost:15678` fails every time with
+`CERTIFICATE_VERIFY_FAILED: Hostname mismatch, certificate is not valid for 'localhost'`.
+Mounting `/opt/phanthy-motus/data/certs/cert.pem` as the CA does not help — the chain is
+fine, the hostname is not. Two working options:
+
+- the snippet above (`check_hostname = False`, `CERT_NONE`). The endpoint only accepts
+  loopback callers anyway (`auth.py`), so the driver must run with `network_mode: host`;
+- or, to keep pinning the certificate: keep `cafile` and set only `ctx.check_hostname = False`
+  (leave `verify_mode` at `CERT_REQUIRED`) — the chain is still verified, and against a
+  self-signed certificate that *is* the pin.
+
+The same applies to anything else the driver POSTs to Agent Core (`/api/event`, ...).
+
+This failure is **silent from the outside**: the web activity stream shows nothing, and the
+barrier quietly waits out `x-completion.timeout` before the next action dispatches — so a
+wrong callback looks like "the robot hesitates for two minutes", not like an error. Two rules
+follow:
+
+- **Log every failed callback** with its `action_id` (`print(..., file=sys.stderr)` or
+  `log.warning`), after retries if you retry. Storing the error only in the card's state
+  makes it invisible in `docker logs`.
+- **Verify on a machine, not only in tests.** Unit tests inject a fake callback and never
+  meet the real certificate. Trigger one action on a rig and check that Agent Core's
+  `docker logs` shows `POST /api/acp/complete ... 200`.
+
+How a completion appears in the dashboard: there is no dedicated `acp_complete` row. The
+completion enters Agent Core's event bus and, when it starts a main-agent turn, shows up in
+the activity stream as a `trigger` row whose text is
+`{"type": "action_complete", "action_id": ..., "status": ...}`. With the agent loop switched
+off, the barrier is still released but no row appears — check `docker logs` instead.
 
 #### 4. No SSE endpoint needed
 
@@ -1680,6 +1715,57 @@ correct until a robot accelerates like it was kicked.
 `max_velocity` is optional in `parse_descriptor`, so omitting it is the correct
 action, not a workaround.
 
+`max_delta_per_step` is a bound on the change in **one accepted command**;
+`ControlSink` does not multiply it by elapsed time. To configure a nominal
+acceleration in SI units, declare `acceleration / expected_hz` per active axis
+(e.g. 0.3 m/s² at 10 Hz becomes a 0.03 m/s step). This matches the nominal
+cadence, not a strict wall-clock acceleration guarantee under a different frame
+rate. Keep this limit in the descriptor and let the shared sink clamp it; do
+not implement another ramp inside the driver's SDK callback.
+
+A velocity base may explicitly declare `limits.zero_immediate: true` to treat
+an exact zero on any twist axis as an immediate stop on that axis, bypassing
+only the step clamp. This opt-in is valid only for `twist`; other modes and
+omitted/false declarations keep the ordinary clamp. Freshness, ordering,
+arbitration and all other checks still apply to zero commands.
+
+### `response` — optional, driver-owned closed-loop response
+
+Limits say what a robot accepts; response says what its measured motion does
+after an accepted command. A planner may use that distinction to choose a
+stable gain, but the numbers belong in the driver descriptor rather than in a
+robot-name table in the planner:
+
+```python
+"response": {
+    "wz": {
+        "gain": measured_steady_wz / commanded_wz,
+        "delay_s": measured_onset_delay_s,
+        "settling_s": measured_settling_s,
+        "source": "measured",
+    },
+},
+```
+
+The block and each axis are optional and currently apply only to a `twist`
+descriptor. An axis key must occur in `joint_names`; `gain` must be positive,
+delay/settling non-negative, and all three numbers finite. `source` is required
+when an axis is declared and is one of `measured`, `vendor-spec`, or
+`estimate`. Do not copy a value from another robot of the same model and label
+it measured. If no traceable value exists, omit the response block and let the
+consumer use its documented fallback. Response metadata is descriptive: it is
+not a card configuration knob and does not change `ControlSink` checks or the
+driver's SDK command.
+
+When an external stop has changed the actual velocity, call
+`ControlSink.rebase(actual_values)` to synchronize its step baseline. This does
+not count as a command or renew the watchdog, and does not clear source,
+sequence or priority state. Seed a zero baseline before the first frame if
+startup must also be step-limited. For compatible live limit changes, use
+`reconfigure(descriptor)` to preserve admission and arbitration state rather
+than calling `reset()`.
+
+
 **Give an unactuatable axis `lower == upper == 0`, do not omit it.** A ground
 base has no `vz`, `wx` or `wy`, and the vector is six wide regardless. Pinning
 them to zero makes the sink **reject** a policy that puts anything there;
@@ -2012,8 +2098,17 @@ existing `info()` path carries it with no changes.
 # info()
 {"odom_interface": {"schema": "motus.odom/1", "frame": "body",
                     "provides": ["vx", "vy", "wz"],
-                    "rate_hz": 10, "pose_drift": "unbounded"}}
+                    "rate_hz": 10, "pose_drift": "unbounded",
+                    "timing": {"stamp_source": "received"}}}
 ```
+
+`timing` is optional, so declarations produced before it existed remain valid.
+When present, `stamp_source` is required: `robot` means the sample carries a
+usable robot measurement clock; `received` means the host stamped the received
+sample. `max_measurement_delay_ms` may be added only when that delay has a
+defensible upper bound. Do not substitute a socket/HTTP timeout: a timeout is
+how long a failed request may block, not how old a successful measurement is.
+An unknown delay is represented by omitting the field.
 
 ```python
 # one message on the topic
@@ -2047,6 +2142,7 @@ state card.
    self._odom_interface = build_interface(
        provides=["vx", "vy", "wz"],      # ONLY the axes you actually measure
        rate_hz=10, pose_drift="unbounded",
+       timing={"stamp_source": "received"},  # REST reply has no robot stamp
    )
    ```
 
@@ -2212,6 +2308,8 @@ cannot push a stalled robot over navi's "below 20% of commanded" stuck threshold
       publishing one reading out of every N
 - [ ] vendor-specific fields are under `vendor`, not at the top level
 - [ ] `pose_drift` is honest; `unbounded` unless there is a correction source
+- [ ] `timing.stamp_source` states `robot` or `received` when known; unknown
+      measurement delay is omitted rather than copied from an I/O timeout
 - [ ] a unit test calls `parse_interface()` on your declaration
 
 ## Camera Parameters (`camera_info`)

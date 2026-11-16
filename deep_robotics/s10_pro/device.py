@@ -19,12 +19,33 @@ from basic_server import BasicServerClient, _protocol_int
 from common.vendor_runtime import action_schema, tool
 from domain_bridge import CoreBridge
 from media_workers import MediaWorkers, encode_pointcloud
+from undistortion import CameraUndistortion
+from loco_servo import S10LocoServoPlugin
+from spatial import S10ControlledSpatialPlugin
+from common.odom import build_interface, build_sample
+from common.camera_info import build as build_camera_info
 
 CAMERA_LANES = ("camera_rear", "camera_left", "camera_front", "camera_right")
+CAMERA_MOUNTS = {
+    # DeepRobotics S10 Hardware Development Manual v1.0.2, sections 1.6/1.9.
+    # The vendor table gives millimetres and no camera orientation.
+    "camera_front": (0.27065, 0.0, 0.04673),
+    "camera_rear": (-0.27065, 0.0, 0.04670),
+    "camera_left": (0.0, 0.06480, 0.05990),
+    "camera_right": (0.0, -0.06480, 0.05990),
+}
+CAMERA_INTRINSICS_RANGE = {
+    # Vendor values are acceptance ranges for the original calibration and
+    # are not a calibration for the 1024x576 RTSP/cropped output.
+    "fx": [579.0, 639.0], "fy": [579.0, 639.0],
+    "cx": [750.0, 850.0], "cy": [550.0, 650.0],
+    "distortion_abs_max": 10.0,
+    "source": "vendor-spec",
+    "note": "Range only; K/D remain null until per-camera calibration at the published resolution.",
+}
 LIDAR_LANES = ("lidar_cloud", "lidar_map")
-LIDAR_SOURCE_STALE_SECONDS = 3.0
-DIRECT_LIDAR_SOURCES = frozenset({"/DEPTH_POINTS", "/local_scans", "/LIDAR/POINTS"})
-MEDIA_MAX_AGE_S = 0.75
+PREFERRED_LIDAR_SOURCE = "/ALIGNED_POINTS"
+LIDAR_SOURCE_STALE_SECONDS = 0.5
 
 
 def _mark_dangerous(result, actions):
@@ -35,6 +56,17 @@ def _mark_dangerous(result, actions):
     for action in actions:
         schema["x-action-params"][action]["params"].append("confirm")
     return result
+
+
+def _plaintext_start_error(native):
+    ensure = getattr(native, "ensure_plaintext_transport", None)
+    if ensure is None:
+        return None
+    try:
+        ensure()
+    except Exception as exc:
+        return {"state": "error", "message": str(exc)}
+    return None
 
 
 def _confirmation_error(action, args):
@@ -92,7 +124,7 @@ class S10Nodes:
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
         from drdds.msg import BatteryData, JointsData, MotionInfo
-        from sensor_msgs.msg import CompressedImage, Image, Imu, PointCloud2
+        from sensor_msgs.msg import CompressedImage, Imu, PointCloud2
         from std_msgs.msg import String
 
         self.json = json
@@ -107,37 +139,16 @@ class S10Nodes:
             "joints": {"topic": base + "joints", "format": "sensor/skeleton"},
             "joint_state": {"topic": base + "joint_state", "format": "data/json"},
             "loco_state": {"topic": base + "loco_state", "format": "data/json"},
+            "odom": {"topic": base + "state/odom", "format": "state/odom"},
             "battery": {"topic": base + "battery", "format": "data/json"},
             "lidar_cloud": {"topic": base + "lidar_cloud", "format": "sensor/pointcloud"},
             "lidar_map": {"topic": base + "lidar_map", "format": "sensor/pointcloud"},
         }
-        # The Pro camera service numbers its physical inputs tail, left, head,
-        # right. Subscribe to USB names and semantic aliases alike.
-        camera_topics = dict(config.get("camera_topics", {
-            "camera_rear": ["/camera/rear/image_raw", "/camera/rear/image_raw/compressed",
-                         "/camera/rear/color/image_raw", "/camera/rear/color/image_raw/compressed",
-                         "/camera_back/image_raw", "/camera_0/image_raw",
-                         "/usb_camera_1/image_raw", "/usb_camera_1/image_raw/compressed",
-                         "/DEPTH_IMAGE"],
-            "camera_left": ["/camera/left/image_raw", "/camera/left/image_raw/compressed",
-                         "/camera/left/color/image_raw", "/camera/left/color/image_raw/compressed",
-                         "/camera_left/image_raw", "/camera_1/image_raw",
-                         "/usb_camera_2/image_raw", "/usb_camera_2/image_raw/compressed",
-                         ],
-            "camera_front": ["/camera/front/image_raw", "/camera/front/image_raw/compressed",
-                         "/camera/front/color/image_raw", "/camera/front/color/image_raw/compressed",
-                         "/camera_front/image_raw", "/camera_2/image_raw",
-                         ],
-            "camera_right": ["/camera/right/image_raw", "/camera/right/image_raw/compressed",
-                         "/camera/right/color/image_raw", "/camera/right/color/image_raw/compressed",
-                         "/camera_right/image_raw", "/camera_3/image_raw",
-                         "/usb_camera_1/image_raw_2", "/usb_camera_1/image_raw_2/compressed",
-                         ],
-        }))
-        for lane in CAMERA_LANES:
-            camera_topics.setdefault(lane, [])
+        self._rtsp_sources = dict(config.get("camera_rtsp", {}))
+        if set(self._rtsp_sources) != set(CAMERA_LANES):
+            raise ValueError("camera_rtsp must define front, rear, left, and right camera lanes")
         self.topics.update({key: {"topic": base + key, "format": "image/jpeg"}
-                            for key in camera_topics})
+                            for key in CAMERA_LANES})
         self.publishers = {
             key: self.bridge.create_publisher(key, spec["topic"], String)
             for key, spec in self.topics.items() if key not in LIDAR_LANES
@@ -151,18 +162,15 @@ class S10Nodes:
         self.lidar_publisher = self.lidar_publishers["lidar_cloud"]
         from sensor_msgs.msg import CompressedImage
         self.camera_publishers = {
-            key: self.bridge.create_publisher(key, self.topics[key]["topic"], CompressedImage)
-            for key in camera_topics
+            lane: self.bridge.create_publisher(lane, self.topics[lane]["topic"], CompressedImage)
+            for lane in CAMERA_LANES
         }
         self.media_workers = None
+        self.camera_undistortion = CameraUndistortion(CAMERA_LANES)
         if config.get("media_workers", False):
             self.media_workers = MediaWorkers(self._handle_media_result)
-            for key, configured_topics in camera_topics.items():
-                source_topics = [configured_topics] if isinstance(configured_topics, str) else configured_topics
-                if source_topics and all(topic.endswith("/compressed") for topic in source_topics):
-                    self.media_workers.add_compressed_camera(key)
-                else:
-                    self.media_workers.add_camera(key)
+            self.media_workers.camera_undistortion = self.camera_undistortion
+            self.camera_undistortion.on_change = self.media_workers.restart_rtsp_camera
             for lane in LIDAR_LANES:
                 self.media_workers.add_lidar(lane)
         topics = config.get("topics", {})
@@ -172,14 +180,11 @@ class S10Nodes:
                                 reliability=ReliabilityPolicy.BEST_EFFORT,
                                 durability=DurabilityPolicy.VOLATILE)
         self._sensor_qos = stream_qos
-        # The node's default callback group is mutually exclusive. Give each
-        # media lane its own group so slow point-cloud ingress cannot block
-        # camera callbacks, while aliases within one camera remain serialized.
+        # Keep the lidar lanes independent from sensor callbacks.
         self._media_callback_groups = {
-            lane: MutuallyExclusiveCallbackGroup() for lane in (*CAMERA_LANES, *LIDAR_LANES)
+            lane: MutuallyExclusiveCallbackGroup() for lane in LIDAR_LANES
         }
         self._stream_lock = threading.Lock()
-        self._camera_source_lock = threading.Lock()
         self._stream_stats = {
             name: {"received": 0, "published": 0, "dropped": 0,
                    "last_received": None, "last_published": None,
@@ -190,6 +195,7 @@ class S10Nodes:
         self._motion_lock = threading.Lock()
         self.motion_sequence = 0
         self.motion_state = None
+        self.motion_received_at = None
         self.gait_state = None
         self._source_topics = {
             "imu": topics.get("imu", "/IMU"),
@@ -197,10 +203,11 @@ class S10Nodes:
             "joint_state": topics.get("joints", "/JOINTS_DATA_10HZ"),
             "battery": topics.get("battery", "/BATTERY_DATA"),
             "loco_state": topics.get("motion_info", "/MOTION_INFO"),
+            "odom": topics.get("motion_info", "/MOTION_INFO"),
             "lidar_cloud": topics.get("lidar_cloud", topics.get("lidar", "/DEPTH_POINTS")),
             "lidar_map": topics.get("lidar_map", "/ACCUMULATED_POINTS_MAP"),
         }
-        self._source_topics.update({key: value for key, value in camera_topics.items()})
+        self._source_topics.update(self._rtsp_sources)
         self.robot.create_subscription(Imu, topics.get("imu", "/IMU"), self._forward_imu, stream_qos)
         self.robot.create_subscription(JointsData, topics.get("joints", "/JOINTS_DATA_10HZ"), self._forward_joints, stream_qos)
         self.robot.create_subscription(BatteryData, topics.get("battery", "/BATTERY_DATA"), self._forward_battery, stream_qos)
@@ -215,39 +222,12 @@ class S10Nodes:
         self._lidar_source_last_seen = {}
         self._lidar_topic_stats = {}
         self._lidar_source_lock = threading.Lock()
-        self._configured_camera_lanes = {
-            topic: key for key, values in camera_topics.items()
-            for topic in ([values] if isinstance(values, str) else values)
-        }
-        # Reserve lane assignments while scanning the ROS graph, but only let
-        # a lane's first callback claim its active source. This avoids assigning
-        # several newly discovered image topics to one lane before any frame arrives.
-        self._camera_topic_lanes = {}
         self._lidar_callback_groups = {}
         self._media_topic_subscriptions = set()
         self._media_topic_types = {}
         self._media_subscription_handles = {}
-        self._discovered_media = set()
         self._media_subscriptions = []
-        self._camera_lane_sources = {}
         self._scan_media_topics()
-        # Keep configured aliases as a compatibility fallback when a ROS graph
-        # implementation does not report publishers until after discovery.
-        for topic, key in self._configured_camera_lanes.items():
-            if topic in self._media_topic_subscriptions:
-                continue
-            msg_type = CompressedImage if topic.endswith("/compressed") else Image
-            callback = lambda msg, camera=key, source=topic: self._forward_camera_alias(
-                camera, source, msg)
-            handle = self.robot.create_subscription(
-                msg_type, topic, callback, self._sensor_qos,
-                callback_group=self._media_callback_groups[key])
-            self._media_subscriptions.append(handle)
-            self._media_topic_subscriptions.add(topic)
-            self._media_topic_types[topic] = msg_type
-            self._media_subscription_handles[topic] = handle
-            if not self._source_topics.get(key):
-                self._source_topics[key] = topic
         for topic in self._lidar_topics:
             self._subscribe_lidar_candidate(topic, PointCloud2)
         if self._lidar_map_topic not in self._media_topic_subscriptions:
@@ -258,76 +238,29 @@ class S10Nodes:
             self._media_topic_subscriptions.add(self._lidar_map_topic)
             self._media_topic_types[self._lidar_map_topic] = PointCloud2
             self._media_subscription_handles[self._lidar_map_topic] = handle
-        camera_subscriptions = sum(
-            1 for topic in self._media_topic_subscriptions
-            if topic in self._configured_camera_lanes or
-            topic in self._camera_topic_lanes
-        )
-        lidar_subscriptions = sum(
-            1 for topic in self._media_topic_subscriptions
-            if topic not in self._configured_camera_lanes and
-            topic not in self._camera_topic_lanes
-        )
-        print(f"[ros2] media subscriptions ready: camera_topics={camera_subscriptions} "
-              f"lidar_topics={lidar_subscriptions} lanes=6", flush=True)
+        print(f"[ros2] media subscriptions ready: lidar_topics={len(self._media_topic_subscriptions)} "
+              "camera_transport=rtsp", flush=True)
         if hasattr(self.robot, "create_timer"):
             self._media_discovery_timer = self.robot.create_timer(2.0, self._scan_media_topics)
+        if self.media_workers is None:
+            raise ValueError("media_workers must be enabled for RTSP camera streams")
+        for lane, url in self._rtsp_sources.items():
+            self.media_workers.add_rtsp_camera(lane, url)
+            print(f"[rtsp] pulling {lane} from {url}", flush=True)
 
     def _scan_media_topics(self):
-        """Discover actual image and point-cloud endpoints as robot nodes start."""
+        """Discover PointCloud2 inputs as robot nodes start; cameras use RTSP."""
         try:
             discovered = self.robot.get_topic_names_and_types()
         except (AttributeError, RuntimeError):
             return
-        from sensor_msgs.msg import CompressedImage, Image, PointCloud2
+        from sensor_msgs.msg import PointCloud2
         for topic, type_names in discovered:
             types = set(type_names)
             if "sensor_msgs/msg/PointCloud2" in types:
                 # Probe every PointCloud2 source, but keep the configured map
                 # lane separate and publish only the selected cloud candidate.
                 self._subscribe_lidar_candidate(topic, PointCloud2, discovered=True)
-                continue
-            msg_type = (CompressedImage if "sensor_msgs/msg/CompressedImage" in types else
-                        Image if "sensor_msgs/msg/Image" in types else None)
-            if msg_type is None:
-                continue
-            # Do not require a publisher at discovery time. The S10 camera
-            # process can register its topic before DDS endpoints become
-            # visible; creating the subscription now lets late publishers
-            # connect instead of leaving the card permanently without a lane.
-            # Do not let unrelated depth imagery (for example /DEPTH_IMAGE)
-            # claim a directional camera card before the four RGB sources.
-            if topic not in self._configured_camera_lanes and self._camera_key_for_topic(topic) is None:
-                continue
-            key = self._assign_camera_lane(topic)
-            if key is None:
-                print(f"[ros2] ignoring extra camera topic (four lanes are occupied): {topic}", flush=True)
-                continue
-            if topic in self._media_topic_subscriptions:
-                if self._media_topic_types.get(topic) is msg_type:
-                    continue
-                old_handle = self._media_subscription_handles.get(topic)
-                if old_handle is not None and hasattr(self.robot, "destroy_subscription"):
-                    self.robot.destroy_subscription(old_handle)
-                self._media_subscriptions = [handle for handle in self._media_subscriptions
-                                             if handle is not old_handle]
-                self._media_topic_subscriptions.discard(topic)
-            identity = (topic, key)
-            if identity in self._discovered_media:
-                continue
-            self._discovered_media.add(identity)
-            callback = lambda msg, camera=key, source=topic: self._forward_camera_alias(
-                camera, source, msg)
-            handle = self.robot.create_subscription(
-                msg_type, topic, callback, self._sensor_qos,
-                callback_group=self._media_callback_groups[key])
-            self._media_subscriptions.append(handle)
-            self._media_topic_subscriptions.add(topic)
-            self._media_topic_types[topic] = msg_type
-            self._media_subscription_handles[topic] = handle
-            if not self._source_topics.get(key):
-                self._source_topics[key] = topic
-            print(f"[ros2] discovered {key} subscription: {topic} ({msg_type.__name__})", flush=True)
 
     def _subscribe_lidar_candidate(self, topic, message_type, discovered=False):
         from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
@@ -350,88 +283,6 @@ class S10Nodes:
         if discovered:
             print(f"[ros2] discovered lidar_cloud candidate: {topic}", flush=True)
 
-    def _forward_camera_alias(self, key, topic, msg):
-        """Use the first active configured alias for each physical camera lane."""
-        from sensor_msgs.msg import CompressedImage
-
-        stale_handles = []
-        with self._camera_source_lock:
-            source = self._camera_lane_sources.get(key)
-            if source is not None and source != topic:
-                # The S10 node exposes raw and compressed aliases for the same
-                # USB camera. Prefer the raw Image topic: it avoids the
-                # vendor's compressed-topic cache, which can contain old
-                # frames. A compressed alias may only be used as fallback
-                # when no raw source has produced a frame.
-                if not (not topic.endswith("/compressed") and source.endswith("/compressed")):
-                    return
-                old_handle = self._media_subscription_handles.get(source)
-                if old_handle is not None:
-                    stale_handles.append(old_handle)
-                    if hasattr(self.robot, "destroy_subscription"):
-                        self.robot.destroy_subscription(old_handle)
-                    self._media_subscriptions = [handle for handle in self._media_subscriptions
-                                                 if handle is not old_handle]
-                    self._media_topic_subscriptions.discard(source)
-                    self._media_subscription_handles.pop(source, None)
-            self._camera_lane_sources[key] = topic
-            self._camera_topic_lanes[topic] = key
-            self._source_topics[key] = topic
-        self._record_stream(key, "received")
-        if isinstance(msg, CompressedImage):
-            self._forward_compressed_camera(key, msg, already_received=True)
-        else:
-            self._forward_camera(key, msg, already_received=True)
-
-    def _assign_camera_lane(self, topic):
-        key = self._configured_camera_lanes.get(topic) or self._camera_topic_lanes.get(topic)
-        if key is None:
-            key = self._camera_key_for_topic(topic)
-        # Unknown USB inputs are not safe to assign by discovery order: doing
-        # so can expose the left camera as front/right. Only use explicitly
-        # mapped USB topics; semantic camera names may still use the fallback.
-        if key is None and topic.lower().startswith("/usb_camera_"):
-            return None
-        if key is None:
-            reserved = set(self._camera_topic_lanes.values())
-            key = next((lane for lane in CAMERA_LANES if lane not in reserved), None)
-        if key is not None:
-            self._camera_topic_lanes[topic] = key
-        return key
-
-    @staticmethod
-    def _camera_key_for_topic(topic):
-        name = topic.lower()
-        import re
-        # usb_cam_multi_node uses one base topic and numbered suffixes.  Do
-        # this before the generic camera_N rule, which otherwise interprets
-        # the service's ``camera_1`` prefix as the lane for every image.
-        usb = re.search(r"/usb_camera_(\d+)/image_raw(?:_(\d+))?(?:/|$)", name)
-        if usb:
-            camera_number, suffix = usb.groups()
-            if suffix is not None:
-                return None
-            return {"1": "camera_rear", "2": "camera_left",
-                    "3": "camera_front", "4": "camera_right"}.get(camera_number)
-        # Do not let the generic camera_N matcher reinterpret aliases such as
-        # /usb_camera_2/image_raw as a physical front camera. Only the vendor
-        # image_raw suffix mapping above is trusted.
-        if name.startswith("/usb_camera_"):
-            return None
-        tokens = set(filter(None, re.split(r"[^a-z0-9]+", name)))
-        numbered = re.search(r"(?:^|[/_])camera[_-]?(\d+)(?:$|[/_])", name)
-        if numbered:
-            index = int(numbered.group(1))
-            if 0 <= index < 4:
-                return CAMERA_LANES[index]
-        for directions, key in ((("rear", "back", "backward"), "camera_rear"),
-                                (("left",), "camera_left"),
-                                (("front", "forward"), "camera_front"),
-                                (("right",), "camera_right")):
-            if tokens.intersection(directions):
-                return key
-        return None
-
     def _record_stream(self, key, stage):
         now = time.time()
         monotonic_now = time.monotonic()
@@ -448,7 +299,7 @@ class S10Nodes:
                     stats[f"_{stage}_rate_count"] = stats[stage]
                     stats[f"_{stage}_rate_time"] = monotonic_now
             first = stats[stage] == 1
-            report_rate = (key in {"camera_left", "camera_rear", *LIDAR_LANES} and
+            report_rate = (key in {*CAMERA_LANES, *LIDAR_LANES} and
                            monotonic_now - stats.get("last_rate_log", monotonic_now) >= 10.0)
             if report_rate:
                 stats["last_rate_log"] = monotonic_now
@@ -470,23 +321,29 @@ class S10Nodes:
         with self._stream_lock:
             result = {key: dict(value) for key, value in self._stream_stats.items()}
         for key, spec in self.topics.items():
-            try:
-                source = self._source_topics[key]
-                if key == "lidar_cloud":
-                    source = self._lidar_topics
-                sources = [source] if isinstance(source, str) else list(source)
-                result[key]["robot_publishers"] = sum(
-                    self.robot.count_publishers(topic) for topic in sources)
-            except (AttributeError, RuntimeError, TypeError, ValueError):
+            if key.startswith("camera_"):
                 result[key]["robot_publishers"] = None
+            else:
+                try:
+                    source = self._source_topics[key]
+                    if key == "lidar_cloud":
+                        source = self._lidar_topics
+                    sources = [source] if isinstance(source, str) else list(source)
+                    result[key]["robot_publishers"] = sum(
+                        self.robot.count_publishers(topic) for topic in sources)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    result[key]["robot_publishers"] = None
             lane = self.bridge.stats(key)
             result[key]["bridge_enqueued"] = lane["enqueued"]
             result[key]["bridge_dropped"] = lane["dropped"]
             result[key]["bridge_alive"] = lane["alive"]
             result[key]["bridge_errors"] = lane.get("errors", 0)
             result[key]["bridge_last_error"] = lane.get("last_error")
-            if self.media_workers is not None and (key.startswith("camera_") or key in LIDAR_LANES):
-                result[key]["worker_alive"] = self.media_workers.is_alive(key)
+            if self.media_workers is not None:
+                if key in LIDAR_LANES:
+                    result[key]["worker_alive"] = self.media_workers.is_alive(key)
+                elif key.startswith("camera_"):
+                    result[key]["worker_alive"] = self.media_workers.rtsp_alive(key)
             if key == "lidar_cloud":
                 with self._lidar_source_lock:
                     result[key]["active_source"] = self._active_lidar_source
@@ -505,10 +362,9 @@ class S10Nodes:
                 result[key]["source"] = self._lidar_map_topic
                 result[key]["source_publishers"] = self._count_publishers(self._lidar_map_topic)
             elif key.startswith("camera_"):
-                result[key]["active_source"] = self._camera_lane_sources.get(key)
+                result[key]["active_source"] = self._rtsp_sources.get(key)
                 source = result[key]["active_source"]
-                result[key]["source_publishers"] = (
-                    self._count_publishers(source) if source else None)
+                result[key]["source_publishers"] = None
         return result
 
     def _count_publishers(self, topic):
@@ -617,138 +473,39 @@ class S10Nodes:
         with self._motion_lock:
             self.motion_sequence += 1
             self.motion_state = motion.get("state") if isinstance(motion, dict) else None
+            self.motion_received_at = time.monotonic()
             self.gait_state = gait.get("gait") if isinstance(gait, dict) else None
         self._publish_json("loco_state", data)
-
-    @staticmethod
-    def _jpeg_from_ros_image(msg):
-        from io import BytesIO
-        from PIL import Image as PillowImage
-
-        encoding = str(msg.encoding).lower()
-        mode, raw_mode = {
-            "rgb8": ("RGB", "RGB"), "bgr8": ("RGB", "BGR"),
-            "rgba8": ("RGBA", "RGBA"), "bgra8": ("RGBA", "BGRA"),
-            "mono8": ("L", "L"), "8uc1": ("L", "L"),
-        }.get(encoding, (None, None))
-        if mode is None:
+        motion_info = data.get("motion_info", data) if isinstance(data, dict) else {}
+        def number(*names):
+            for name in names:
+                value = motion_info.get(name) if isinstance(motion_info, dict) else None
+                if value is not None:
+                    try:
+                            number = float(value)
+                            return number if math.isfinite(number) else None
+                    except (TypeError, ValueError):
+                        return None
             return None
-        try:
-            image = PillowImage.frombytes(mode, (int(msg.width), int(msg.height)),
-                                          bytes(msg.data), "raw", raw_mode, int(msg.step), 1)
-            if image.mode == "RGBA":
-                image = image.convert("RGB")
-            stream = BytesIO()
-            image.save(stream, format="JPEG", quality=85, optimize=False)
-            return stream.getvalue()
-        except (ValueError, OSError):
-            return None
-
-    @staticmethod
-    def _fresh_header(header):
-        """Reject DDS samples that were already stale before this callback."""
-        if header is None or not hasattr(header, "stamp"):
-            return True
-        stamp = header.stamp
-        seconds = float(getattr(stamp, "sec", 0)) + float(getattr(stamp, "nanosec", 0)) / 1e9
-        if seconds <= 0:
-            return True
-        age = time.time() - seconds
-        return -0.25 <= age <= MEDIA_MAX_AGE_S
-
-    def _forward_camera(self, key, msg, already_received=False):
-        # S10 camera timestamps come from the AOS clock and are not guaranteed
-        # to share the container wall clock. Do not discard valid frames based
-        # on that clock skew; the worker/bridge latest-only queues provide the
-        # latency bound without blacking out the camera.
-        if not already_received:
-            self._record_stream(key, "received")
-        # The S10 camera node declares MJPEG as sensor_msgs/Image. For a valid
-        # JPEG payload, publish directly from the callback: sending it through
-        # a worker only adds an IPC hop and a frame of latency. Raw/NV12 frames
-        # still use the isolated encoder worker below.
-        payload = msg.data
-        if str(msg.encoding).lower() in {"jpeg", "jpg", "mjpeg"} and \
-                len(payload) >= 4 and payload[0] == 0xff and payload[1] == 0xd8 and \
-                payload[-2] == 0xff and payload[-1] == 0xd9:
-            from sensor_msgs.msg import CompressedImage
-            output = CompressedImage()
-            output.header = msg.header
-            output.format = "jpeg"
-            output.data = payload
-            self.camera_publishers[key].publish(output)
-            self._record_stream(key, "published")
-            return
-        if self.media_workers is not None:
-            header = (msg.header.frame_id, msg.header.stamp.sec, msg.header.stamp.nanosec)
-            submitted = self.media_workers.submit(
-                key, (header, msg.width, msg.height, msg.step, msg.encoding, bytes(msg.data)))
-            if not submitted:
-                self._record_stream(key, "dropped")
-            return
-        packet = self._jpeg_from_ros_image(msg)
-        if packet is None:
-            self._record_stream(key, "dropped")
-            return
-        from sensor_msgs.msg import CompressedImage
-        output = CompressedImage()
-        output.header = msg.header
-        output.format = "jpeg"
-        output.data = packet
-        self.camera_publishers[key].publish(output)
-        self._record_stream(key, "published")
-
-    def _forward_compressed_camera(self, key, msg, already_received=False):
-        # The vendor declares MJPEG as sensor_msgs/Image. Its timestamp may be
-        # from a different clock domain, so freshness is diagnostic-only here.
-        if not already_received:
-            self._record_stream(key, "received")
-        payload = bytes(msg.data)
-        if payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9"):
-            from sensor_msgs.msg import CompressedImage
-            output = CompressedImage()
-            output.header = msg.header
-            output.format = "jpeg"
-            output.data = payload
-            self.camera_publishers[key].publish(output)
-            self._record_stream(key, "published")
-            return
-        if self.media_workers is not None:
-            header = (msg.header.frame_id, msg.header.stamp.sec, msg.header.stamp.nanosec)
-            submitted = self.media_workers.submit(key, (header, bytes(msg.data)))
-            if not submitted:
-                self._record_stream(key, "dropped")
-            return
-        from io import BytesIO
-        from PIL import Image as PillowImage
-        from sensor_msgs.msg import CompressedImage
-
-        try:
-            image = PillowImage.open(BytesIO(bytes(msg.data))).convert("RGB")
-            stream = BytesIO()
-            image.save(stream, format="JPEG", quality=85, optimize=False)
-            packet = stream.getvalue()
-        except (OSError, ValueError):
-            self._record_stream(key, "dropped")
-            return
-        output = CompressedImage()
-        output.header = msg.header
-        output.format = "jpeg"
-        output.data = packet
-        self.camera_publishers[key].publish(output)
-        self._record_stream(key, "published")
+        twist = [number("vel_x", "VelX"), number("vel_y", "VelY"), None,
+                 None, None, number("vel_yaw", "VelYaw")]
+        stamp = values.get("header", {}).get("stamp") if isinstance(values, dict) else None
+        vendor_ms = None
+        if isinstance(stamp, dict):
+            sec, nanosec = stamp.get("sec"), stamp.get("nanosec")
+            if (type(sec) is int and type(nanosec) is int
+                    and 0 <= nanosec < 1_000_000_000):
+                vendor_ms = sec * 1000 + nanosec // 1_000_000
+        from common.odom import resolve_stamp_ms
+        stamp_ms, stamp_provenance = resolve_stamp_ms(
+            vendor_ms=vendor_ms, received_ms=int(time.time() * 1000))
+        self._publish_json("odom", build_sample(
+            stamp_ms=stamp_ms, twist=twist,
+            vendor={"motion_state": motion, "gait_state": gait, **stamp_provenance}))
 
     def _forward_lidar(self, source, msg=None):
         if msg is None:
             msg, source = source, None
-        if not self._fresh_header(getattr(msg, "header", None)):
-            if source is not None:
-                with self._lidar_source_lock:
-                    stats = self._lidar_topic_stats.setdefault(
-                        source, {"received": 0, "stale_dropped": 0, "last_seen": None})
-                    stats["stale_dropped"] += 1
-            self._record_stream("lidar_cloud", "dropped")
-            return
         if source is not None:
             if source not in self._lidar_topics:
                 return
@@ -763,9 +520,7 @@ class S10Nodes:
                     self._active_lidar_source = source
                 elif source != self._active_lidar_source:
                     active_seen = self._lidar_source_last_seen.get(self._active_lidar_source, 0.0)
-                    active_is_direct = self._active_lidar_source in DIRECT_LIDAR_SOURCES
-                    candidate_is_direct = source in DIRECT_LIDAR_SOURCES
-                    if ((candidate_is_direct and not active_is_direct) or
+                    if (source == PREFERRED_LIDAR_SOURCE or
                             now - active_seen >= LIDAR_SOURCE_STALE_SECONDS):
                         self._active_lidar_source = source
                 selected = source == self._active_lidar_source
@@ -782,9 +537,6 @@ class S10Nodes:
         self._forward_lidar_packet("lidar_map", msg)
 
     def _forward_lidar_packet(self, lane, msg):
-        if not self._fresh_header(getattr(msg, "header", None)):
-            self._record_stream(lane, "dropped")
-            return
         self._record_stream(lane, "received")
         if self.media_workers is not None:
             fields = [(field.name, field.offset, field.datatype, field.count)
@@ -823,9 +575,17 @@ class S10Nodes:
         else:
             from sensor_msgs.msg import CompressedImage
             output = CompressedImage()
-            output.header.frame_id = header[0]
-            output.header.stamp.sec = header[1]
-            output.header.stamp.nanosec = header[2]
+            if header is None:
+                import time as wall_time
+                stamp = wall_time.time()
+                output.header.frame_id = lane
+                output.header.stamp.sec = int(stamp)
+                output.header.stamp.nanosec = int((stamp % 1) * 1e9)
+                self._record_stream(lane, "received")
+            else:
+                output.header.frame_id = header[0]
+                output.header.stamp.sec = header[1]
+                output.header.stamp.nanosec = header[2]
             output.format = "jpeg"
             output.data = packet
             self.camera_publishers[lane].publish(output)
@@ -856,8 +616,8 @@ JOINT_NAMES = (
     "hl_hipx_joint", "hl_hipy_joint", "hl_knee_joint", "hl_wheel_joint",
     "hr_hipx_joint", "hr_hipy_joint", "hr_knee_joint", "hr_wheel_joint",
 )
-URDF_PATH = Path(__file__).with_name("resource") / "S10.urdf"
-MAX_LIDAR_RENDER_POINTS = 2000
+URDF_PATH = Path(__file__).with_name("resource") / "S10_kinematic.urdf"
+MAX_LIDAR_RENDER_POINTS = 10000
 JOINT_DIRECTIONS = (1, 1, -1, 1, 1, -1, 1, -1,
                     -1, 1, -1, 1, -1, -1, 1, -1)
 JOINT_OFFSETS_DEG = (-35, -145, 156, 0, 35, -145, 156, 0,
@@ -1043,28 +803,65 @@ class S10ModelPlugin:
             return {"state": "ready"}
         if action == "model":
             return {"urdf": URDF_PATH.read_text(encoding="utf-8")}
-        return {"state": "ready"}
+        return None
 
 
 class S10StatePlugin:
-    def __init__(self, native, nodes=None): self.native, self.nodes = native, nodes
+    def __init__(self, native, nodes=None):
+        self.native, self.nodes = native, nodes
+        self.camera_undistortion = getattr(nodes, "camera_undistortion", None)
+        if self.camera_undistortion is None:
+            self.camera_undistortion = CameraUndistortion(CAMERA_LANES)
+
+    def _camera_info(self, name):
+        optics = self.camera_undistortion.declaration(name)
+        details = optics.pop("undistortion", {})
+        return build_camera_info(
+            topic=self.nodes.topics[name]["topic"], id=f"deeprobotics/s10_pro/{name}",
+            format="image/jpeg", width=640, height=360,
+            vendor={"transport": "rtsp", "undistortion": details,
+                    "mounting": {"frame_id": "body", "position_m": list(CAMERA_MOUNTS[name]),
+                                 "orientation_xyzw": None, "source": "vendor-spec",
+                                 "intrinsics_range": CAMERA_INTRINSICS_RANGE,
+                                 "coordinate_convention": {"x": "forward", "y": "left", "z": "up",
+                                     "origin": "body geometric center shown in section 1.6"},
+                                 "reference": "DeepRobotics S10 Hardware Development Manual v1.0.2, sections 1.6 and 1.9",
+                                 "stream": {"width": 640, "height": 360, "fps_max": 15,
+                                     "codec": "mjpeg", "source": "driver_output",
+                                     "source_resolution": {"width": 1024, "height": 576, "fps": 30},
+                                     "source_codec": "h264"}}}, **optics)
     def get_tools(self):
         cards = {
             "imu": "山猫 S10 IMU 加速度和角速度（由原生运控状态报告提供，10Hz）",
             "joints": "山猫 S10 16 个轮足关节角度（原生协议 10Hz）",
             "joint_state": "山猫 S10 轮足关节位置、速度、力矩和温度（原生协议 10Hz）",
             "loco_state": "山猫 S10 运动状态、步态、模式和速度（原生协议 10Hz）",
+            "odom": "山猫 S10 本体速度里程计（未提供位姿，机体坐标系）",
             "battery": "山猫 S10 电池电量、电压、温度和充电状态",
             "lidar_cloud": "山猫 S10 原始实时激光雷达点云",
             "lidar_map": "山猫 S10 累积/定位点云地图",
         }
         topics = self.nodes.topics if self.nodes else {}
         for camera in (key for key in topics if key.startswith("camera_")):
-            cards[camera] = f"山猫 S10 机载相机 {camera.removeprefix('camera_')} 图像流；不推断物理方位"
+            cards[camera] = f"山猫 S10 机载相机 {camera.removeprefix('camera_')} 图像流"
         definitions = []
         for name, description in cards.items():
             outputs = [topics[name]] if name in topics else None
-            definitions.append(tool(name, "sensor", description, topic_out=outputs))
+            definition = tool(name, "sensor", description, topic_out=outputs)
+            if name in CAMERA_MOUNTS and outputs:
+                definition["camera_info"] = [self._camera_info(name)]
+                definition["inputSchema"] = action_schema({
+                    "start": ([], "开始相机图像流"), "stop": ([], "停止卡片"),
+                    "info": ([], "相机参数和去畸变状态"),
+                    "config": (["undistort"], "修改本相机去畸变设置；修改后重启下游视觉卡"),
+                }, {"undistort": {"type": "boolean",
+                                  "description": "广角畸变校正：true 开启，false 关闭"}})
+                settings = self.camera_undistortion.settings(name)
+                definition["configSchema"] = {"type": "object", "properties": {
+                    "undistort": {"type": "boolean", "title": "广角畸变校正", "scope": "instance",
+                                  "default": settings["undistort"]},
+                }}
+            definitions.append(definition)
         return definitions
 
     def _topic_result(self, name, state):
@@ -1079,6 +876,19 @@ class S10StatePlugin:
         self.native.close()
     def dispatch(self, action, args):
         name = args.get("_tool_name", "")
+        if name in CAMERA_MOUNTS and action == "config":
+            try:
+                values = dict(args.get("config") or {})
+                values.update({k: args[k] for k in ("undistort", "calibration") if k in args})
+                changed = self.camera_undistortion.configure(name, values)
+            except (ValueError, TypeError) as exc:
+                return {"state": "error", "message": str(exc)}
+            result = self._topic_result(name, "configured")
+            result.update(config=self.camera_undistortion.settings(name), changed=changed,
+                          undistortion=self.camera_undistortion.status(name))
+            if self.nodes:
+                result["camera_info"] = [self._camera_info(name)]
+            return result
         if action == "start":
             self.native.start()
             return self._topic_result(name, "running")
@@ -1086,7 +896,17 @@ class S10StatePlugin:
             # The TCP client is shared by every S10 card and is closed only
             # when the driver bundle itself shuts down.
             return self._topic_result(name, "idle")
-        if action == "info": return self._topic_result(name, "ready")
+        if action == "info":
+            result = self._topic_result(name, "ready")
+            if name in CAMERA_MOUNTS and self.nodes:
+                result["camera_info"] = [self._camera_info(name)]
+                result["undistortion"] = self.camera_undistortion.status(name)
+                result["config"] = self.camera_undistortion.settings(name)
+            if name == "loco_state":
+                result["odom_interface"] = build_interface(
+                    provides=["vx", "vy", "wz"], frame="body", rate_hz=10,
+                    pose_drift="none")
+            return result
         reports = self.native.snapshot()["reports"]
         keys = {"imu": "1048577:15728640", "joints": "1048577:15728640",
                 "joint_state": "1048577:15728640", "loco_state": "1048577:15728640",
@@ -1138,6 +958,7 @@ class S10MotionPlugin:
     def __init__(self, native, nodes=None):
         self.native = native
         self.nodes = nodes
+        self._servo = None
         self._condition = threading.Condition()
         self._active = None
         self._transition_lock = threading.Lock()
@@ -1147,6 +968,13 @@ class S10MotionPlugin:
 
     def _acp_callback(self, action_id, status, result):
         _notify_acp_async(action_id, status, result, "loco")
+
+    def attach_servo(self, plugin):
+        self._servo = plugin
+
+    def is_moving(self):
+        with self._condition:
+            return self._active is not None
 
     def _finish(self, active, status, result):
         if active and active.get("action_id"):
@@ -1168,6 +996,38 @@ class S10MotionPlugin:
                 except (TypeError, ValueError):
                     return basic[field], id(report)
         return None, None
+
+    def standing_problem(self, max_age_s=1.0):
+        """Return why the robot is not known to be freshly standing."""
+        state = received_at = None
+        if self.nodes is not None:
+            with self.nodes._motion_lock:
+                state = self.nodes.motion_state
+                received_at = self.nodes.motion_received_at
+        else:
+            snapshot = self.native.snapshot()
+            reports = snapshot.get("reports", {})
+            received = snapshot.get("report_received_at", {})
+            for key, report in reports.items():
+                body = report.get("PatrolDevice", {}) if isinstance(report, dict) else {}
+                items = body.get("Items", {}) if isinstance(body, dict) else {}
+                basic = items.get("BasicStatus", {}) if isinstance(items, dict) else {}
+                if "MotionState" in basic:
+                    state = basic["MotionState"]
+                    received_at = received.get(key)
+                    break
+        if state is None or received_at is None:
+            return "没有可用的 MotionState，拒绝速度命令"
+        age = time.monotonic() - received_at
+        if age < 0 or age > max_age_s:
+            return f"MotionState 已过期（{max(0.0, age):.2f}s），拒绝速度命令"
+        try:
+            state = int(state)
+        except (TypeError, ValueError):
+            return "MotionState 无效，拒绝速度命令"
+        if state not in {1, 17}:
+            return f"机器人当前 MotionState={state}，不是站立状态，拒绝速度命令"
+        return ""
 
     def _finish_transition(self, action_id, status, result):
         with self._transition_lock:
@@ -1235,6 +1095,8 @@ class S10MotionPlugin:
         schema = result["inputSchema"]
         schema["x-completion"] = {"actions": ["move", "manual_control", "stand_up", "stand_down",
                                                "damp", "gait"], "timeout": 65}
+        schema["x-resource"] = "base"
+        _mark_dangerous(result, ("damp", "gait", "mode"))
         return result
     def start(self):
         with self._condition:
@@ -1304,7 +1166,16 @@ class S10MotionPlugin:
                         exc = RuntimeError(f"{exc}; zero command failed: {stop_exc}")
                     self._finish(command, "error", {"state": "error", "message": str(exc)})
     def dispatch(self, action, args):
+        if action in {"damp", "gait", "mode"}:
+            error = _confirmation_error(action, args)
+            if error:
+                return error
+        if self._servo is not None and action not in {"start", "info"}:
+            self._servo.pause_for_explicit_command(action)
         if action == "start":
+            error = _plaintext_start_error(self.native)
+            if error:
+                return error
             self.start()
             return {"state": "ready"}
         if action == "stop":
@@ -1350,9 +1221,7 @@ class S10MotionPlugin:
             if not -1 <= duration <= 60: raise ValueError("duration must be within [-1, 60]")
             if duration == 0:
                 self._stop_stream(send_both=True)
-                action_id = f"s10_{action}_{uuid4().hex}"
-                self._finish({"action_id": action_id}, "completed", {"state": "stopped", "reason": "zero_duration"})
-                return {"state": "stopped", "sent_zero_to": ["axis", "velocity"], "action_id": action_id}
+                return {"state": "stopped", "sent_zero_to": ["axis", "velocity"]}
             self._stop_stream()
             if action == "move":
                 self.native.send(0x00100002, 0x00500002, {"Mode": MODES["navigation"]})
@@ -1369,13 +1238,14 @@ class S10MotionPlugin:
             return {**sent, "state": "streaming", "frequency_hz": 10,
                     "duration": 60 if duration == -1 else duration, "auto_stop": True,
                     "action_id": action_id}
-        raise ValueError(f"unsupported S10 loco action: {action}")
+        return None
 
 
 class S10NavigationPlugin:
-    CONFIRM_ACTIONS = {"goal", "localize"}
+    CONFIRM_ACTIONS = {"goal", "route", "localize"}
     ACTIONS = {
         "goal": (["x", "y", "z", "yaw_degrees", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous"], "前往设备当前已加载地图中的目标点；不负责建图；航向角使用角度制"),
+        "route": (["waypoints", "gait", "speed", "reverse", "avoid_obstacles", "autonomous"], "按顺序执行多个地图目标点；各点使用米和度；不负责建图"),
         "cancel": ([], "取消当前导航任务"), "status": ([], "查询导航任务状态"),
         "localize": (["x", "y", "z", "yaw_degrees"], "按地图坐标初始化/重置定位；航向角使用角度制"),
         "pose": ([], "查询机器人地图坐标和姿态"),
@@ -1383,8 +1253,16 @@ class S10NavigationPlugin:
     }
     def __init__(self, native):
         self.native = native
+        self._servo = None
         self._goal_lock = threading.Lock()
         self._active_goal = None
+
+    def attach_servo(self, plugin):
+        self._servo = plugin
+
+    def is_moving(self):
+        with self._goal_lock:
+            return self._active_goal is not None
 
     def get_tool(self):
         result = tool("navigation", "actuator", "山猫 S10 Pro 地图导航：使用设备当前已加载的地图和定位，不提供建图；目标导航和定位初始化需要显式 confirm=true。角度输入/输出均为度。", action_schema(self.ACTIONS, {
@@ -1393,11 +1271,18 @@ class S10NavigationPlugin:
             "gait": {"type": "string", "enum": ["navigation_flat", "navigation_stairs"], "default": "navigation_flat"},
             "speed": {"type": "integer", "enum": [0, 1, 2], "default": 0}, "reverse": {"type": "boolean", "default": False},
             "avoid_obstacles": {"type": "boolean", "default": True}, "autonomous": {"type": "boolean", "default": False},
+            "waypoints": {"type": "array", "minItems": 1, "maxItems": 64,
+                          "items": {"type": "object", "required": ["x", "y", "yaw_degrees"],
+                                    "properties": {"x": {"type": "number"}, "y": {"type": "number"},
+                                                   "z": {"type": "number", "default": 0},
+                                                   "yaw_degrees": {"type": "number"},
+                                                   "point_type": {"type": "integer", "enum": [0, 1, 2, 3, 4], "default": 1}}}},
             "confirm": {"type": "boolean", "description": "Required true for goal navigation and localization changes."},
         }))
         _mark_dangerous(result, self.CONFIRM_ACTIONS)
         timeout = max(10, math.ceil(float(self.native.config.get("navigation_task_timeout", 180))) + 10)
-        result["inputSchema"]["x-completion"] = {"actions": ["goal"], "timeout": timeout}
+        result["inputSchema"]["x-completion"] = {"actions": ["goal", "route"], "timeout": timeout}
+        result["inputSchema"]["x-resource"] = ["base", "map"]
         return result
 
     def _acp_callback(self, action_id, status, result):
@@ -1423,16 +1308,21 @@ class S10NavigationPlugin:
             value = int(raw_code, 16 if raw_code.startswith("0x") else 10)
         except (TypeError, ValueError):
             return str(code)
-        return None if value == 0 else value
+        return None if value in {0, 0x2300, 0x2302} else value
 
-    def _run_goal(self, action_id, item, timeout):
+    def _run_goal(self, action_id, items, timeout):
         try:
-            response = self.native.request(0x00100003, 0x00100002, {"Item": [item]}, response_timeout=timeout)
+            deadline = time.monotonic() + timeout
+            response = self.native.request(0x00100003, 0x00100002, {"Item": items}, response_timeout=timeout)
             error = self._response_error(response)
             if error is not None:
                 self._finish_goal(action_id, "error", {"state": "error", "error_code": error, "response": response})
                 return
-            deadline = time.monotonic() + timeout
+            terminal = self._navigation_terminal(response)
+            if terminal is not None:
+                state, detail = terminal
+                self._finish_goal(action_id, state, {"state": state, "response": response, **detail})
+                return
             while time.monotonic() < deadline:
                 status = self.native.request(0x00100003, 0x00100001)
                 terminal = self._navigation_terminal(status)
@@ -1454,17 +1344,33 @@ class S10NavigationPlugin:
         items = body.get("Items", body) if isinstance(body, dict) else {}
         if not isinstance(items, dict):
             return None
-        raw = next((items.get(key) for key in
-                    ("NavigationState", "NavState", "TaskState", "Status", "State")
-                    if items.get(key) is not None), None)
+        nav_status = items.get("NavStatus", {})
+        nav_status = nav_status if isinstance(nav_status, dict) else {}
+        error_code = nav_status.get("ErrorCode", items.get("ErrorCode"))
+        if error_code is not None:
+            try:
+                raw_error = str(error_code).strip().lower()
+                code = int(raw_error, 16 if raw_error.startswith("0x") else 10)
+            except (TypeError, ValueError):
+                code = None
+            if code == 0x2300:
+                return "completed", {}
+            if code == 0x2302:
+                return "cancelled", {"reason": "navigation_cancelled"}
+            if code not in (None, 0):
+                return "error", {"message": "navigation task failed", "error_code": code}
+        raw = next((value for value in (
+                    nav_status.get("Status"), items.get("NavigationState"),
+                    items.get("NavState"), items.get("TaskState"),
+                    items.get("Status"), items.get("State")) if value is not None), None)
         if raw is None:
             return None
         value = str(raw).strip().lower()
-        if value in {"completed", "complete", "success", "succeeded", "3", "4"}:
+        if value in {"completed", "complete", "success", "succeeded", "4"}:
             return "completed", {}
-        if value in {"cancelled", "canceled", "cancel", "5"}:
+        if value in {"cancelled", "canceled", "cancel"}:
             return "cancelled", {"reason": "navigation_cancelled"}
-        if value in {"failed", "failure", "error", "aborted", "6", "7"}:
+        if value in {"failed", "failure", "error", "aborted"}:
             return "error", {"message": "navigation task failed", "status": raw}
         return None
 
@@ -1492,7 +1398,8 @@ class S10NavigationPlugin:
             error = _confirmation_error(action, args)
             if error:
                 return error
-        if action == "start": return {"state": "ready"}
+        if action == "start":
+            return _plaintext_start_error(self.native) or {"state": "ready"}
         if action == "stop":
             self.stop()
             return {"state": "idle"}
@@ -1515,21 +1422,38 @@ class S10NavigationPlugin:
             return response
         if action == "perception_status": return self.native.request(0x00100003, 0x00110001)
         if action == "localize":
+            if self._servo is not None:
+                self._servo.pause_for_explicit_command(action)
             return self.native.request(0x00100003, 0x00200002, {"PosX": args["x"], "PosY": args["y"], "PosZ": args.get("z", 0), "Yaw": math.radians(float(args["yaw_degrees"]))})
-        if action == "goal":
-            item = {"Value": 0, "MapID": 0, "PosX": args["x"], "PosY": args["y"], "PosZ": args.get("z", 0),
-                    "AngleYaw": math.radians(float(args["yaw_degrees"])), "PointInfo": int(args.get("point_type", 1)),
+        if action in {"goal", "route"}:
+            points = [args] if action == "goal" else args.get("waypoints")
+            if not isinstance(points, list) or not points or len(points) > 64:
+                return {"ok": False, "code": "INVALID_ARGUMENT", "error": "route requires 1 to 64 waypoints"}
+            items = []
+            for point in points:
+                if not isinstance(point, dict) or not all(key in point for key in ("x", "y", "yaw_degrees")):
+                    return {"ok": False, "code": "INVALID_ARGUMENT", "error": "each waypoint requires x, y, and yaw_degrees"}
+                xyz_yaw = [point["x"], point["y"], point.get("z", 0), point["yaw_degrees"]]
+                if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                       for v in xyz_yaw):
+                    return {"ok": False, "code": "INVALID_ARGUMENT", "error": "waypoint coordinates and yaw must be finite numbers"}
+                items.append({"Value": len(items), "MapID": 0,
+                    "PosX": float(point["x"]), "PosY": float(point["y"]), "PosZ": float(point.get("z", 0)),
+                    "AngleYaw": math.radians(float(point["yaw_degrees"])),
+                    "PointInfo": int(point.get("point_type", args.get("point_type", 1))),
                     "Gait": GAITS[args.get("gait", "navigation_flat")], "Speed": int(args.get("speed", 0)),
                     "Manner": int(bool(args.get("reverse", False))), "ObsMode": 0 if args.get("avoid_obstacles", True) else 1,
-                    "NavMode": int(bool(args.get("autonomous", False))), "Terrain": 0, "Posture": 0, "Waypoints": {}}
+                    "NavMode": int(bool(args.get("autonomous", False))), "Terrain": 0, "Posture": 0, "Waypoints": {}})
             timeout = float(self.native.config.get("navigation_task_timeout", 180))
             action_id = f"s10_navigation_{uuid4().hex}"
+            if self._servo is not None:
+                self._servo.pause_for_explicit_command(action)
             with self._goal_lock:
                 if self._active_goal is not None:
                     return {"ok": False, "code": "ACTION_IN_PROGRESS", "action_id": self._active_goal,
                             "error": "navigation goal already active; cancel it before sending another goal"}
                 self._active_goal = action_id
-            worker = threading.Thread(target=self._run_goal, args=(action_id, item, timeout),
+            worker = threading.Thread(target=self._run_goal, args=(action_id, items, timeout),
                                       daemon=True, name="s10-navigation-goal")
             try:
                 worker.start()
@@ -1538,9 +1462,9 @@ class S10NavigationPlugin:
                     if self._active_goal == action_id:
                         self._active_goal = None
                 return {"ok": False, "code": "WORKER_START_FAILED", "error": str(exc)}
-            return {"state": "accepted", "action": "goal", "action_id": action_id,
-                    "task_timeout": timeout}
-        raise ValueError(f"unsupported S10 navigation action: {action}")
+            return {"state": "accepted", "action": action, "waypoint_count": len(items),
+                    "action_id": action_id, "task_timeout": timeout}
+        return None
 
 
 LIGHT_COLORS = {"黑色": 0, "白色": 1, "绿色": 2, "蓝色": 3}
@@ -1580,6 +1504,7 @@ class S10SingleLightPlugin:
                           "cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
                                              "description": "该灯呼吸或闪烁周期（秒）"},
                       }))
+        result["inputSchema"]["x-resource"] = f"{self.side}_light"
         return result
 
     def start(self):
@@ -1590,13 +1515,13 @@ class S10SingleLightPlugin:
 
     def dispatch(self, action, args):
         if action == "start":
-            return {"state": "ready"}
+            return _plaintext_start_error(self.native) or {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready"}
         if action not in self.ACTIONS:
-            raise ValueError(f"unsupported S10 {self.side} light action: {action}")
+            return None
         effect_code = LIGHT_ACTION_EFFECTS[action][1]
         led = {"Type": effect_code}
         color = args.get("color", "白色")
@@ -1625,6 +1550,7 @@ class S10ChargePlugin:
             {"start_charging": ([], "开始自主充电"), "stop_charging": ([], "停止自主充电")}, {
                 "confirm": {"type": "boolean", "description": "Required true to start autonomous charging."},
             }))
+        result["inputSchema"]["x-resource"] = "base"
         return _mark_dangerous(result, self.CONFIRM_ACTIONS)
     def start(self): pass
     def stop(self): pass
@@ -1633,21 +1559,33 @@ class S10ChargePlugin:
             error = _confirmation_error(action, args)
             if error:
                 return error
-        if action == "start": return {"state": "ready"}
+        if action == "start":
+            return _plaintext_start_error(self.native) or {"state": "ready"}
         if action == "stop": return {"state": "idle"}
         if action == "info": return {"state": "ready"}
         if action == "start_charging": return self.native.request(0x00100004, 0x00100002, {"Charge": 1})
         if action == "stop_charging": return self.native.request(0x00100004, 0x00100002, {"Charge": 0})
-        raise ValueError(f"unsupported S10 charging action: {action}")
+        return None
 
 
 def build_plugins(config, namespace=None, ros2=None):
     native = BasicServerClient(config)
     nodes = S10Nodes(config, namespace or "", ros2) if ros2 is not None else None
-    plugins = [S10ModelPlugin(), S10StatePlugin(native, nodes), S10MotionPlugin(native, nodes),
+    motion = S10MotionPlugin(native, nodes)
+    servo = S10LocoServoPlugin(native, ros2, motion)
+    motion.attach_servo(servo)
+    navigation = (S10NavigationPlugin(native)
+                  if str(config.get("model_variant", "standard")).lower() == "pro" else None)
+    if navigation is not None:
+        navigation.attach_servo(servo)
+        servo.attach_navigation(navigation)
+    plugins = [S10ModelPlugin(), S10StatePlugin(native, nodes), motion,
+               servo,
                S10SingleLightPlugin(native, "head"),
                S10SingleLightPlugin(native, "tail"),
                S10ChargePlugin(native)]
     if str(config.get("model_variant", "standard")).lower() == "pro":
-        plugins.append(S10NavigationPlugin(native))
+        from audio import S10MicPlugin, S10SpeakerPlugin
+        plugins.extend([S10ControlledSpatialPlugin(config, navigation),
+                        S10MicPlugin(config, namespace or "", nodes), S10SpeakerPlugin(config)])
     return plugins

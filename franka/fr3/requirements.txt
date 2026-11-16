@@ -2,3 +2,7 @@
 # The native reader is built separately against the pinned libfranka release.
 PyYAML>=5.4.1,<7
 aiohttp>=3.8,<4
+
+numpy==1.23.5
+opencv-python-headless==4.11.0.86
+pyrealsense2==2.56.5.9235; platform_system == "Linux"

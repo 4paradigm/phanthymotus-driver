@@ -1,0 +1,34 @@
+mcp_port: 15746
+name: "Dobot CRA 关节读取、运动与示教"
+ros_namespace: dobot_cra
+# Configure through DOBOT_CONTROLLER_IP or the joints card. No robot is
+# contacted until an address is supplied.
+controller_ip: ""
+feedback_port: 30004
+model_name: ""
+publish_hz: 30
+# Lower bounds: both effective timeouts allow at least three feedback periods.
+# Selecting 30006 automatically raises each to at least 3 seconds.
+stale_timeout_s: 2
+connect_timeout_s: 2
+receive_timeout_s: 1
+reconnect_delay_s: 1
+joint_move:
+  connect_timeout_s: 2
+  receive_timeout_s: 2
+  enable_timeout_s: 5
+  motion_timeout_s: 300
+  target_tolerance_deg: 0.5
+teach:
+  data_dir: data/dobot-teach
+  max_recording_s: 500
+  max_gap_ms: 50
+  # start_trajectory sends StartDrag; wait this long for the arm to report drag.
+  drag_start_timeout_s: 5
+  # stop_trajectory/stop_motion send StopDrag only while feedback shows drag; wait
+  # this long for the arm to report rest in mode 5 (otherwise press the arm's drag button).
+  drag_exit_timeout_s: 10
+ros:
+  robot_domain_id: 42
+  core_domain_id: 42
+  robot_interface: eno1

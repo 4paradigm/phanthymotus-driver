@@ -1,0 +1,4 @@
+numpy==1.26.4
+requests==2.32.5
+PyYAML==6.0.3
+dobot_sdk @ https://codeload.github.com/Dobot-Arm/TCP-IP-Python-V4/zip/55ec1ec82201aaf2e6d54aa47b6272bbaa14c815#sha256=b7bccfc2b6970441f3a73e7f2252a1d15a7225e23bdf4606973457a9789903b1
