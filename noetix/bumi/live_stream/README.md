@@ -37,7 +37,7 @@
 
 ### 凭证与权限
 
-- Card 配置中完整 URL 标为 password + x-sensitive，防止输入时明文展示及打包分享 Solution 时直接导出。
+- Card 配置中完整 URL 标为 password + x-sensitive，防止输入时明文展示及打包分享 Solution 时直接导出。**密钥仅作为 configSchema 配置字段**：齿轮保存后由 Agent Core 的 `/api/canvas/tool-config` 以内部 `action=config` 调用应用，并在设备重新连接/启动时重放；`config` 不列入 `x-action-params`，因为 Agent Core 会把该列表中的每个动作都作为 LLM 可调用工具公开。LLM 只能调用不含密钥的 `go_live` / `end_live` / `info` 等动作。
 - Driver 的持久化副本放在 /opt/phanthy-motus/data/live_stream/huya-rtmp-url，Linux 文件模式 0600；其父目录必须由运行用户拥有且权限为 0700，否则拒绝保存。使用目录文件描述符进行原子更新，拒绝符号链接。源代码、config.yaml、返回状态和 Docker 日志都不应包含完整 URL。
 - **已知安全边界：** Agent Core 画布配置数据库仍可能含明文，RTMP URL 仍在 Driver 进程内存中；通过 `librtmp1` 的进程内 API 连接，不再把密钥传给 FFmpeg 子进程 argv，但同机高权限进程仍可能读取内存。生产环境必须限制管理员访问，禁止非管理员控制开播。
 - 设备端音视频直推虎牙不会关闭 Camera、Depth、Mic Card。运行时要记录 CPU、掉帧、音画偏差并完成真机持续推流验收。

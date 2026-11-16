@@ -84,13 +84,17 @@ class LiveStreamPlugin:
                     },
                 },
                 "required": ["action"],
+                # Agent Core creates an LLM tool for EVERY x-action-params entry.
+                # Keep config internal: the Canvas gear persists configSchema
+                # values via /api/canvas/tool-config, which dispatches config
+                # directly with rtmp_url (and replays it on start/reconnect).
+                # Exposing config here would leak an RTMP credential to the LLM.
                 "x-action-params": {
                     "start": {"params": [], "description": "初始化 Card，不开播"},
                     "stop": {"params": [], "description": "画布停止时关闭直播"},
                     "info": {"params": [], "description": "查询直播连接状态"},
                     "go_live": {"params": [], "description": "公开开播：推送 Bumi 摄像头和麦克风"},
                     "end_live": {"params": [], "description": "结束虎牙直播"},
-                    "config": {"params": [], "description": "应用卡片齿轮中的推流地址"},
                 },
             },
         }

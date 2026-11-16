@@ -64,6 +64,52 @@ def test_card_is_huya_only_actuator_and_user_facing():
     assert "end_live" in schema["inputSchema"]["x-action-params"]
 
 
+def test_canvas_gear_config_reaches_driver_but_never_becomes_llm_tool():
+    """Mirror Agent Core's configSchema -> saved tool-config -> tools/call contract.
+
+    Agent Core's _to_openai_schema turns EVERY x-action-params entry into an
+    LLM-callable tool; Canvas config is sent separately by apply_tool_config.
+    """
+    store, worker = Store(), Worker()
+    subject = card(store, worker)
+    tool = subject.get_tool()
+    input_schema = tool["inputSchema"]
+    config_schema = tool["configSchema"]
+    params = input_schema["x-action-params"]
+
+    # Keep config action dispatchable by Agent Core's private config transport,
+    # but never advertise it as a callable LLM action.
+    assert "config" in input_schema["properties"]["action"]["enum"]
+    assert "config" not in params
+    assert "rtmp_url" not in input_schema["properties"]
+    assert all("rtmp_url" not in action.get("params", []) for action in params.values())
+    assert set(params) == {"start", "stop", "info", "go_live", "end_live"}
+
+    gear = config_schema["properties"]["rtmp_url"]
+    assert config_schema["required"] == ["rtmp_url"]
+    assert gear["scope"] == "instance"
+    assert gear["x-sensitive"] and gear["format"] == "password"
+
+    # Canvas stores the instance-scoped value, and Agent Core replays the
+    # saved config directly to the MCP action before the card is started.
+    saved_config = {key: URL for key in config_schema["required"]}
+    args = {"instance_id": "card-1", **saved_config}
+    configured = subject.dispatch("config", args)
+    assert configured["ok"] is True
+    assert store.saves == 1 and store.value == URL
+    assert URL not in str(configured)
+    assert URL not in str(subject.dispatch("info", {}))
+    assert worker.calls == []  # Config does not start a public live broadcast.
+
+    # Agent Core restores the same saved settings when the driver restarts.
+    restored_worker = Worker()
+    restored = card(store, restored_worker)
+    assert restored.dispatch("start", {})["configured"] is True
+    assert restored_worker.calls == []
+    assert restored.dispatch("go_live", {})["state"] == "starting"
+    assert restored_worker.received_url == URL
+
+
 def test_start_is_lifecycle_only_not_public_broadcast():
     worker = Worker()
     subject = card(worker=worker)
