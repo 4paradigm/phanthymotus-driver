@@ -237,9 +237,9 @@ camera_info directly. The original body IMU display port remains data/json;
 use `imu.body_imu` (`/NS/state/imu_calibrated`, `sensor/imu`) for computation.
 It uses HighController body gyro/acceleration and the verified fixed mounting
 rotation, with explicit unverified SDK read-completion timestamps. No RealSense
-motion streams are requested. This supports attitude-only assistance; leave
-short-term compensation, depth geometry and inertial association disabled.
-Matching Perception read-time attitude support is required. The camera-origin
+motion streams are requested. The consumer accepts read/receipt timestamps for every selected mode. This
+adapter currently omits the two translation vectors needed by full fusion;
+use attitude mode until those numeric fields are supplied. The camera-origin
 mount preset is not a physical IMU translation calibration.
 
 Tests in `tests/test_bumi_rgbd_adapter.py`, `tests/test_bumi_camera_imu.py` and

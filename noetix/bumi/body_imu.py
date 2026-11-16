@@ -76,5 +76,4 @@ class BodyImuSource:
         return dict(state='ready' if live else 'unavailable', source='body_imu',
                     reason=self.reason if self.reason else (None if live else 'body IMU reading stale'),
                     last_capture_ns=self.last_capture_ns, stamp_source='read_completion',
-                    fusion=dict(state='unavailable', reason='body IMU supplies read-time attitude only; '
-                                'capture timing and accelerometer translation are uncalibrated'))
+                    fusion=dict(state='unavailable', reason='full IMU translation vectors are not supplied'))

@@ -579,10 +579,11 @@ unchanged on the RGB-D mapped wall timeline, with an unverified
 `host_wall_read_completion` mapping; it is never presented as synchronized
 hardware capture. Repeated identical SDK values do not refresh freshness.
 `imu_status` reports body input freshness separately from card activation.
-This requires the matching Perception read-time attitude support. Connect the
-body computation output with `short_term_compensation`, `depth_geometry`, and
-`inertial_association` disabled: this source supports rotation assistance only,
-not inertial translation/ESKF. Static hardware and moving accuracy acceptance
+Perception accepts the numeric `motus.imu/1` format for any timestamp-source
+label, including full fusion. This adapter currently omits both numeric IMU
+translation vectors, so use its attitude path with `short_term_compensation`,
+`depth_geometry`, and `inertial_association` disabled until those fields are
+supplied. The limitation is the incomplete full-fusion format, not read time. Static hardware and moving accuracy acceptance
 of this adapter remain pending.
 
 ### Capture-time body-camera TF
@@ -595,11 +596,12 @@ The paired RGB/depth declarations advertise the `/{namespace}/camera/rgbd/body_m
 
 Perception's generic `rgbd_odometry` card supports the instance settings
 `imu_assisted=true`, `short_term_compensation=true`, `depth_geometry=true`.
-For sources with measured capture timing and full factory/TF sensor-origin
-translations in `motus.imu/1`, inspect `imu_status.fusion` before enabling these
-settings. Bumi's body IMU adapter deliberately reports fusion unavailable:
-its reading timestamps and rotation-only mount support the attitude mode,
-with all three compensation settings disabled. No extra SDK owner or
+Full fusion requires both numeric sensor-origin translation vectors in
+`motus.imu/1`. Time/source/calibration labels do not restrict Perception modes.
+Bumi's current adapter reports fusion unavailable because it omits these
+translation fields; use attitude mode with all three compensation options off.
+The generic [IMU data standard](https://github.com/Nidhogg2002/phanthymotus/blob/feat/pointcloud-slam-offline-eval/perception/docs/rgbd-imu.md)
+documents units, axes, origins and time alignment as producer responsibilities. No extra SDK owner or
 robot-specific fusion algorithm is added.
 
 Keep the camera still for at least0.5s of visual/IMU initialization. The
@@ -607,7 +609,7 @@ consumer estimates camera pose using ESKF and conditionally uses observable
 depth geometry. Inertial/depth predictions are explicitly non-mapping; SLAM
 pauses during coasting/recovery. The hard visual correction timeout is1s
 and modeled position sigma limit0.10m; these are software/model thresholds,
-not measured robot accuracy. Source clock/mount identity must remain fixed.
+not measured robot accuracy. The producer is responsible for consistent clock and mount values.
 Only code/offline tests have been completed; hardware verification and
 deployment remain pending explicit user instruction.
 
