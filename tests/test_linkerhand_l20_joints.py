@@ -3,6 +3,7 @@
 import json
 import math
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -821,6 +822,76 @@ def test_both_hands_card_follows_per_hand_interface_changes(ros_runtime):
         plugin.stop()
 
 
+def test_both_hands_card_started_directly_keeps_its_interface(ros_runtime):
+    ros2, _, _ = ros_runtime
+    plugin, _ = make_plugin(ros2=ros2)
+    try:
+        plugin.dispatch("start", {"instance_id": "B", "bound_side": "both", "can_channel": "can1"})
+        info = plugin.dispatch("info", {"instance_id": "B"})
+        assert (info["can_channel"], info["left_can_channel"], info["right_can_channel"]) == ("can1",) * 3
+        assert info["topic_out"][-1]["topic"] == plugin.dual_topic("can1", "can1")
+        # A partial config moves only the hand it names.
+        plugin.dispatch("config", {"instance_id": "B", "right_can_channel": "can2"})
+        assert set(plugin._streams) == {("left", "can1"), ("right", "can2")}
+    finally:
+        plugin.stop()
+
+
+class BlockingClient(FakeClient):
+    """Position query that does not return until released."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def get_positions_vector(self, timeout_s=None):
+        self.entered.set()
+        self.release.wait(10)
+        return super().get_positions_vector(timeout_s)
+
+
+def test_both_hands_state_before_a_hand_finishes_its_first_round_is_waiting(ros_runtime):
+    ros2, _, _ = ros_runtime
+    left = BlockingClient()
+    plugin, _ = make_plugin({("left", "can0"): left}, ros2=ros2)
+    try:
+        plugin.dispatch("start", {"instance_id": "B", "bound_side": "both"})
+        assert left.entered.wait(3)
+        wait_for(lambda: plugin._streams[("right", "can0")].latest.get("valid"))
+        state = plugin.dispatch("get_state", {"instance_id": "B"})
+    finally:
+        left.release.set()
+        plugin.stop()
+    assert state["valid"] is False and state["hands"]["right"]["valid"] is True
+    waiting = state["hands"]["left"]
+    assert waiting["valid"] is False and waiting["state"] == "waiting" and waiting["reason"]
+    assert waiting["sample_state"] == "waiting" and waiting["timestamp"] is None
+    assert all(j["raw"] is None for j in waiting["joints"])
+
+
+def test_stop_that_times_out_keeps_the_card_owning_its_worker(ros_runtime):
+    ros2, published, _ = ros_runtime
+    client = BlockingClient()
+    plugin, _ = make_plugin({("left", "can0"): client}, ros2=ros2, config={"query_timeout_s": 0.02})
+    json_topic = plugin.topics("left", "can0")[0]
+    try:
+        plugin.dispatch("start", {"instance_id": "A", "bound_side": "left"})
+        assert client.entered.wait(3)
+        # Blocked longer than the join timeout: the stop fails...
+        with pytest.raises(RuntimeError):
+            plugin.dispatch("stop", {"instance_id": "A"})
+        # ...but the card still owns the worker, so retrying reaches it.
+        assert "A" in plugin._owners and ("left", "can0") in plugin._streams
+        client.release.set()
+        plugin.dispatch("stop", {"instance_id": "A"})
+        assert plugin._owners == {} and plugin._streams == {}
+        assert [p for t, p in published if t == json_topic and p["state"] == "idle"]
+    finally:
+        client.release.set()
+        plugin.stop()
+
+
 def test_driver_does_not_start_acquisition_on_boot():
     plugin, clients = make_plugin()
     plugin.start()
@@ -860,3 +931,47 @@ def test_plugin_stop_closes_only_controllers_the_hand_card_does_not_own(monkeypa
     own.close.assert_called_once()
     owned.release_torque.assert_not_called()
     own.release_torque.assert_not_called()
+
+
+def test_last_card_to_release_a_hand_closes_the_can_client_it_opened(ros_runtime, monkeypatch):
+    ros2, _, _ = ros_runtime
+    clients = {}
+
+    def controller(target):
+        client = clients[target] = FakeClient()
+        return mock.Mock(get=mock.Mock(return_value=client))
+
+    left, right, other = controller(("left", "can0")), controller(("right", "can0")), controller(("left", "can1"))
+    monkeypatch.setattr(hand_device, "GLOBAL_CONTROLLERS",
+                        {("left", "can0"): left, ("right", "can0"): right, ("left", "can1"): other})
+    import joints_device
+    monkeypatch.setattr(joints_device, "GLOBAL_CONTROLLERS", hand_device.GLOBAL_CONTROLLERS)
+    # The hand card already uses the right hand for its own actions.
+    hand = SimpleNamespace(hand_config={}, config=GLOBAL_CONFIG, _lock=threading.RLock(),
+                           _controllers={("right", "can0"): right})
+    plugin = JointsPlugin(hand, {"poll_hz": 30}, global_config=GLOBAL_CONFIG, ros2=ros2)
+    try:
+        plugin.dispatch("start", {"instance_id": "A", "bound_side": "left"})
+        plugin.dispatch("start", {"instance_id": "B", "bound_side": "left"})
+        wait_for(lambda: clients[("left", "can0")].calls)
+        plugin.dispatch("stop", {"instance_id": "A"})
+        left.close.assert_not_called()  # B still reads this hand
+        plugin.dispatch("stop", {"instance_id": "B"})
+        left.close.assert_called_once()
+        # Moving a card to another interface closes the client it left behind.
+        plugin.dispatch("start", {"instance_id": "A", "bound_side": "left", "can_channel": "can1"})
+        plugin.dispatch("config", {"instance_id": "A", "can_channel": "can0"})
+        other.close.assert_called_once()
+        plugin.dispatch("stop", {"instance_id": "A"})
+        assert left.close.call_count == 2
+        # A one-off read on an idle hand does not leave its client open either.
+        assert plugin.dispatch("get_state", {"instance_id": "C", "bound_side": "left"})["valid"] is True
+        assert left.close.call_count == 3
+        # A hand the hand card uses is never closed by this card.
+        plugin.dispatch("start", {"instance_id": "R", "bound_side": "right"})
+        plugin.dispatch("stop", {"instance_id": "R"})
+        plugin.dispatch("get_state", {"instance_id": "R"})
+    finally:
+        plugin.stop()
+    right.close.assert_not_called()
+    assert plugin._used_targets == set()

@@ -16,6 +16,7 @@ fault clearing. The dual-hand URDF is served by the `model` resource tool.
 from __future__ import annotations
 
 import collections
+import contextlib
 import json
 import logging
 import math
@@ -279,9 +280,18 @@ class _JointsStream:
         with self._lock:
             self.sequence += 1
             sequence = self.sequence
+        return self.blank_sample("idle", "关节采集已停止；本帧不含实测值", sequence)
+
+    def waiting_sample(self) -> dict[str, Any]:
+        """Complete invalid sample for a running stream whose first round has not ended."""
+        with self._lock:
+            sequence = self.sequence
+        return self.blank_sample("waiting", "关节采集已启动，第一轮位置查询尚未完成", sequence)
+
+    def blank_sample(self, state: str, reason: str, sequence: int) -> dict[str, Any]:
         return {
-            "state": "idle", "valid": False,
-            "reason": "关节采集已停止；本帧不含实测值",
+            "state": state, "valid": False,
+            "reason": reason,
             "error_details": None,
             "side": self.side, "bound_side": self.side, "can_channel": self.channel,
             "can_id": hex(self.plugin.can_id(self.side)),
@@ -457,7 +467,7 @@ class JointsPlugin:
         definition = tool(
             self.PREFIX,
             "sensor",
-            "LinkerHand L20 16 主动关节实测位置流：原始值、厂家表换算角度（未经 L20-10 验证）与实时骨架",
+            "LinkerHand L20 16 主动关节实测位置流：原始值、按厂家 L20-10 标定表换算的角度与实时骨架",
             schema,
             topic_out=self.topic_out(),
         )
@@ -530,13 +540,27 @@ class JointsPlugin:
 
     def _close_unshared_controllers(self) -> None:
         """Close CAN clients opened only for this card; others belong to the hand card."""
-        shared = set(getattr(self.hand, "_controllers", None) or ())
-        with GLOBAL_BUS_LOCK:
-            for target in self._used_targets - shared:
-                ctrl = GLOBAL_CONTROLLERS.get(target)
-                if ctrl is not None:
-                    ctrl.close()
-        self._used_targets.clear()
+        for target in list(self._used_targets):
+            self._close_if_unused(target)
+
+    def _close_if_unused(self, target: tuple[str, str]) -> None:
+        """Close the CAN client of a hand no worker of this card reads any more.
+
+        Every other card reaches the shared controller through the hand card,
+        which registers it under its lock before calling get(); checking under
+        that lock means no other card is holding the client being closed, and a
+        later get() simply reopens it.
+        """
+        if target not in self._used_targets or target in self._streams:
+            return
+        hand_lock = getattr(self.hand, "_lock", None) or contextlib.nullcontext()
+        with hand_lock, GLOBAL_BUS_LOCK:
+            self._used_targets.discard(target)
+            if target in (getattr(self.hand, "_controllers", None) or ()):
+                return
+            ctrl = GLOBAL_CONTROLLERS.get(target)
+            if ctrl is not None:
+                ctrl.close()
 
     def _get_controller(self, side: str, channel: str):
         # Not registered on the hand card: its shutdown releases torque on every
@@ -571,7 +595,7 @@ class JointsPlugin:
     def _describe(targets) -> str:
         return " + ".join(f"{side}/{channel}" for side, channel in targets)
 
-    def _select(self, instance_id: str, side: str, targets: tuple[tuple[str, str], ...]) -> None:
+    def _select(self, instance_id: str, side: str, channel: str, targets: tuple[tuple[str, str], ...]) -> None:
         """One worker per physical hand; cards on the same hand share it."""
         with self._lifecycle_lock:
             dual = self.dual_topic(targets[0][1], targets[1][1]) if side == "both" else None
@@ -601,8 +625,8 @@ class JointsPlugin:
             self._owners[instance_id] = owner
             with self._lock:
                 self._bindings[instance_id] = side
-                if side != "both":
-                    self._channels[instance_id] = targets[0][1]
+                # Both modes: an ID-only info/config later resolves the same interface.
+                self._channels[instance_id] = channel
             if current is not None:
                 for target in current[0]:
                     if target not in targets:
@@ -616,6 +640,7 @@ class JointsPlugin:
         if stream is not None:
             stream.stop()
             self._streams.pop(target, None)
+        self._close_if_unused(target)
 
     def _sync_dual_topics(self) -> None:
         for target, stream in self._streams.items():
@@ -624,9 +649,17 @@ class JointsPlugin:
     def _stop_instance(self, instance_id: str) -> None:
         with self._lifecycle_lock:
             owner = self._owners.pop(instance_id, None)
-            if owner is not None:
+            if owner is None:
+                return
+            try:
                 for target in owner[0]:
                     self._release_target(target)
+            except Exception:
+                # A worker still blocked in a query keeps its card's ownership,
+                # so a retried stop reaches it instead of leaving it orphaned.
+                self._owners[instance_id] = owner
+                raise
+            finally:
                 self._sync_dual_topics()
 
     # ── MCP dispatcher ────────────────────────────────────────────────
@@ -673,11 +706,16 @@ class JointsPlugin:
             # Reuse the stream's rounds instead of adding a second query.
             latest = dict(stream.latest)
             view = self._sample_view(latest)
-            if latest and not view["sample_valid"]:
+            if not latest:
+                latest = stream.waiting_sample()
+            elif not view["sample_valid"]:
                 latest.update(valid=False, state="error",
                               reason=latest["reason"] or f"最近一帧已超过 {self.stale_after_s}s，不作为当前值")
         else:
-            latest = _JointsStream(self, side, channel).read()
+            with self._lifecycle_lock:
+                latest = _JointsStream(self, side, channel).read()
+                # A one-off read must not leave the CAN client open behind it.
+                self._close_if_unused((side, channel))
             view = self._sample_view(latest)
         return {**latest, **view, "topic_out": self.topic_out(side, channel)}
 
@@ -723,7 +761,7 @@ class JointsPlugin:
             with self._lifecycle_lock:
                 if instance_id in self._owners and any(
                         key in args for key in ("bound_side", "can_channel", *hand_keys)):
-                    self._select(instance_id, side, targets)
+                    self._select(instance_id, side, channel, targets)
             return {"state": "configured", **self._target_fields(side, channel, targets), "poll_hz": self.poll_hz}
 
         if action == "info":
@@ -745,7 +783,7 @@ class JointsPlugin:
         if action == "start":
             with self._lock:
                 self._remember_hand_channels(instance_id, args)
-            self._select(instance_id, side, targets)
+            self._select(instance_id, side, channel, targets)
             return self.dispatch("info", args)
 
         if action == "stop":
