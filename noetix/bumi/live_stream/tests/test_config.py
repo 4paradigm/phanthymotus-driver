@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from live_stream_config import HuyaCredentialStore, validate_huya_url
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from live_stream.config import HuyaCredentialStore, validate_huya_url
 
 URL = ("rtmp://tx.direct.huya.com/huyalive/111-222-A-333"
        "?seq=12345&type=simple")

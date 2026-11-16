@@ -2,7 +2,7 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from live_stream import LiveStreamPlugin
 
 URL = "rtmp://tx.direct.huya.com/huyalive/secret?seq=123&type=simple"

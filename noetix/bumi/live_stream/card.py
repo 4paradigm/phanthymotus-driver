@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import threading
 
-from live_stream_config import HuyaCredentialStore, validate_huya_url
-from live_stream_worker import AudioBuffer, LiveStreamWorker
+from .config import HuyaCredentialStore, validate_huya_url
+from .worker import AudioBuffer, LiveStreamWorker
 
 
 def attach_audio_subscription(executor, namespace: str, audio: AudioBuffer):

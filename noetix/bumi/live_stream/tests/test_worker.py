@@ -3,8 +3,8 @@ import threading
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from live_stream_worker import AudioBuffer, LiveStreamWorker
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from live_stream.worker import AudioBuffer, LiveStreamWorker
 
 
 class Camera:
