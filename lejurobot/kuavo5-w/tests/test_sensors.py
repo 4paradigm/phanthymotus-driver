@@ -69,6 +69,30 @@ class SensorTests(unittest.TestCase):
         self.assertEqual(sample['units']['gyroscope'], 'rad/s')
         self.assertIsNone(sample['frame_id'])
 
+    def test_standard_imu_operates_without_controller_profile(self):
+        self.hub._profile = None
+        self.hub._on_standard_imu({'header': {'frame_id': 'imu_link'},
+            'orientation': dict(w=1., x=0., y=0., z=0.),
+            'orientation_covariance': [0.] * 9,
+            'angular_velocity': dict(x=1., y=2., z=3.),
+            'linear_acceleration': dict(x=0., y=0., z=9.81)})
+        sample = self.hub.snapshot('imu')
+        self.assertTrue(sample['valid'])
+        self.assertEqual(sample['vendor']['topic'], '/imu')
+        self.assertEqual(sample['quaternion'], [1., 0., 0., 0.])
+        self.assertEqual(sample['rpy'], [0., 0., 0.])
+        self.assertIsNone(sample['free_acceleration'])
+        self.ros.params.clear()
+        self.hub.discover()
+        self.assertTrue(self.hub.snapshot('imu')['valid'])
+        self.assertTrue(self.hub.dispatch('joints', 'info')['skeleton_model']['reference_only'])
+
+    def test_missing_controller_parameters_report_not_ready_not_wrong_hardware(self):
+        self.ros.params.clear()
+        self.hub.discover()
+        self.assertIn('controller_not_ready', self.hub.health()['discovery_error'])
+        self.assertTrue(self.hub.health()['skeleton_model']['reference_only'])
+
     def test_missing_optional_torque_not_replaced_by_acceleration(self):
         self.ros.raw(joint_data={'joint_q': [0.] * 20, 'joint_vd': [9.] * 20})
         j = self.hub.snapshot('joints')['joints'][0]

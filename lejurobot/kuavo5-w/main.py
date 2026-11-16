@@ -26,7 +26,8 @@ _bundle = None
 class _McpRequestLog:
     """One bounded sampler shared by all HTTP connections/worker threads."""
     TOOLS = frozenset(('loco', 'arm', 'leg', 'waist', 'head', 'switch_mode',
-                       'state', 'joints', 'imu', 'loco_state', 'model'))
+                       'state', 'joints', 'imu', 'loco_state', 'model',
+                       'battery', 'laser_scan', 'camera_rgb', 'camera_rgb_right'))
     STATES = frozenset(('ready', 'idle', 'running', 'executing', 'paused',
                         'completed', 'error', 'rejected', 'disconnected'))
 
@@ -243,6 +244,7 @@ def main():
         ros2_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True, name="ros2-domain-42")
         ros2_thread.start()
         ros1.start()
+        _bundle.start_background()
         _register(config, stopped)
         print(f"[bundle] MCP :{server.server_port}/mcp namespace={namespace} ROS1={ros1.url} ROS2=42", flush=True)
 

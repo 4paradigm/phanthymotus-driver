@@ -26,6 +26,7 @@ class RosbridgeClient:
         self._generation = 0
         self._ready_at = float("inf")
         self._subscriptions = {}
+        self._subscription_rates = {}
         self._publishers = {}
         self._services = {}
         self._retained_services = set()
@@ -77,19 +78,22 @@ class RosbridgeClient:
         if self._thread.is_alive():
             self._thread.join(timeout=2)
 
-    def subscribe(self, topic: str, message_type: str, callback) -> None:
+    def subscribe(self, topic: str, message_type: str, callback, throttle_ms=0) -> None:
         with self._lock:
             self._subscriptions[topic] = (message_type, callback)
+            self._subscription_rates[topic] = throttle_ms
             if self._connected.is_set():
                 self._send_subscription(topic, message_type)
 
     def _send_subscription(self, topic: str, message_type: str) -> None:
         self._send({"op": "subscribe", "id": f"sub:{topic}", "topic": topic,
-                    "type": message_type, "queue_length": 1, "throttle_rate": 0})
+                    "type": message_type, "queue_length": 1,
+                    "throttle_rate": self._subscription_rates.get(topic, 0)})
 
     def unsubscribe(self, topic: str) -> None:
         with self._lock:
             self._subscriptions.pop(topic, None)
+            self._subscription_rates.pop(topic, None)
             self._callback_failures.pop(topic, None)
             if self._connected.is_set():
                 self._send({"op": "unsubscribe", "id": f"sub:{topic}", "topic": topic})

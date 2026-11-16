@@ -1,0 +1,16 @@
+<launch>
+  <node name="rosbridge_websocket" pkg="rosbridge_server" type="rosbridge_websocket"
+        launch-prefix="/usr/bin/python3 /opt/phanthy-motus/kuavo5w-host/rosbridge_loopback.py"
+        output="screen" required="true">
+    <param name="address" value="127.0.0.1" />
+    <param name="port" value="9090" type="int" />
+    <param name="topics_glob" value="[*]" />
+    <param name="services_glob" value="[*]" />
+    <param name="params_glob" value="[*]" />
+  </node>
+  <node name="rosapi" pkg="rosapi" type="rosapi_node" output="screen" required="true">
+    <param name="topics_glob" value="[*]" />
+    <param name="services_glob" value="[*]" />
+    <param name="params_glob" value="[*]" />
+  </node>
+</launch>

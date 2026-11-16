@@ -17,6 +17,8 @@ from uuid import uuid4
 
 from std_msgs.msg import String
 from kuavo_sensors import KuavoSensors, SENSOR_CARDS
+from peripherals import Peripherals, CARDS as PERIPHERAL_CARDS
+from startup import StartupChecks
 
 
 REACH = {
@@ -763,6 +765,11 @@ class KuavoBundle:
         ):
             ros1.advertise(topic, message_type)
         self.sensors = KuavoSensors(config.get('sensors', {}), namespace, ros1, ros2_node)
+        self.sensors.robot_serial = config.get('robot_serial')
+        self.peripherals = Peripherals(ros1, ros2_node, namespace)
+        self.startup_checks = StartupChecks(config.get('host_runtime', {}).get('enabled', True))
+        self._auto_start = config.get('sensors', {}).get('auto_start',
+            ['state', 'joints', 'imu', 'loco_state', *PERIPHERAL_CARDS])
         self.state = RobotState(ros1, ros2_node, namespace, self.sensors, motion_enabled)
         self.tracker = ActionTracker()
         self._closing = False
@@ -772,7 +779,7 @@ class KuavoBundle:
                         LowerBodyPlugin(self, "waist"), HeadPlugin(self), ControlPlugin(self)]
         self._enabled = {name for name, cfg in config.get("plugins", {}).items()
                          if cfg.get("enabled", True)} if "plugins" in config else {
-                             "loco", "arm", "leg", "waist", "head", "switch_mode", "state", *SENSOR_CARDS}
+                             "loco", "arm", "leg", "waist", "head", "switch_mode", "state", *SENSOR_CARDS, *PERIPHERAL_CARDS}
 
     def twist(self, topic, x=0.0, y=0.0, z=0.0, pitch=0.0, yaw=0.0):
         self.ros1.publish(topic, "geometry_msgs/Twist", {
@@ -982,7 +989,15 @@ class KuavoBundle:
     def get_all_tools(self):
         tools = [p.get_tool() for p in self.plugins if p.PREFIX in self._enabled]
         return (tools + [t for t in self.sensors.tools() if t['name'] in self._enabled]
+                + [t for t in self.peripherals.tools() if t['name'] in self._enabled]
                 + ([self.state.get_tool()] if "state" in self._enabled else []))
+
+    def start_background(self):
+        self.startup_checks.start()
+        allowed = {'state', 'joints', 'imu', 'loco_state', *PERIPHERAL_CARDS}
+        for name in self._auto_start:
+            if name in allowed and name in self._enabled:
+                self.dispatch(name, {'action': 'start'})
 
     def dispatch(self, name, args):
         args = dict(args)
@@ -992,7 +1007,12 @@ class KuavoBundle:
         if self._closing:
             return {"state": "error", "error": "driver is shutting down"}
         if name == "state":
-            return self.state.dispatch(action, args)
+            result = self.state.dispatch(action, args)
+            if 'feedback' in result:
+                result['feedback']['host_runtime'] = dict(self.startup_checks.status)
+            return result
+        if name in PERIPHERAL_CARDS:
+            return self.peripherals.dispatch(name, action)
         if name in SENSOR_CARDS:
             return self.sensors.dispatch(name, action)
         for plugin in self.plugins:
@@ -1012,6 +1032,8 @@ class KuavoBundle:
             if result.get("error"):
                 print(f"[shutdown] {_safe_log(result.get('error'))}", flush=True)
         self.state.close()
+        self.startup_checks.close()
+        self.peripherals.close()
         with self.tracker.lock:
             self.state._running = False
             self.sensors.close()

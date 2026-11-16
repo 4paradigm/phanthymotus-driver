@@ -21,3 +21,7 @@ cards:
   - { name: imu, type: sensor }
   - { name: loco_state, type: sensor }
   - { name: model, type: resource }
+  - { name: battery, type: sensor }
+  - { name: laser_scan, type: sensor }
+  - { name: camera_rgb, type: sensor }
+  - { name: camera_rgb_right, type: sensor }

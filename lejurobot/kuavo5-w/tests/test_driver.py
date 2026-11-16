@@ -18,10 +18,17 @@ spec = importlib.util.spec_from_file_location("kuavo_device", ROOT / "device.py"
 driver = importlib.util.module_from_spec(spec)
 std = types.ModuleType("std_msgs.msg")
 std.String = type("String", (), {})
-with patch.dict(sys.modules, {"std_msgs": types.ModuleType("std_msgs"), "std_msgs.msg": std}):
+sensor_msg = types.ModuleType('sensor_msgs.msg')
+class FakeCompressedImage:
+    def __init__(self):
+        self.header = types.SimpleNamespace(frame_id='', stamp=types.SimpleNamespace(sec=0, nanosec=0))
+sensor_msg.CompressedImage = FakeCompressedImage
+with patch.dict(sys.modules, {"std_msgs": types.ModuleType("std_msgs"), "std_msgs.msg": std,
+                              'sensor_msgs': types.ModuleType('sensor_msgs'), 'sensor_msgs.msg': sensor_msg}):
     spec.loader.exec_module(driver)
     from kuavo_sensors import LINK_ORDER, model_names
     import kuavo_sensors as sensors_module
+    import peripherals as peripherals_module
     JOINT_NAMES = model_names((ROOT / 'resource' / 'kuavo5w_model.urdf').read_text())
 
 
@@ -87,7 +94,7 @@ class FakeRos1:
     def service_result(self, pending):
         return self.service_results.get(id(pending))
 
-    def subscribe(self, topic, message_type, callback):
+    def subscribe(self, topic, message_type, callback, throttle_ms=0):
         self.subscriptions[topic] = (message_type, callback)
         if topic == '/enable_control_state' and self.replay_enable and topic in self.latched:
             callback({'data': self.latched[topic]})

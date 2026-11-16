@@ -117,6 +117,15 @@ SDK 通用 `joint_names()` 的轮臂分支仅列下肢，部分模型目录的 c
 本地文件本身缺失或解析失败时，`model` 才返回本地资源错误。
 没有将 IMU 四元数直接套到轮式底盘根节点：其安装 frame 未在现场核实。
 
+现场补充：独立标准 `/imu` 已有100Hz左右数据，因此优先读取该流，保留原始 frame，不依赖全身 raw。
+当前机身标识 `KUA5W0710701302138` 由操作人员提供，不能据此选择400062几何或确认控制器版本。
+全身 `/humanoid_description` 仍缺失；底盘的 `/robot_description` 不能替代全身模型。
+
+外设适配以现场注册类型和实际数据为准：左右相机开启服务为 `std_srvs/SetBool`，压缩图像透传为
+ROS2 `sensor_msgs/CompressedImage`；`/scan` 为标准 LaserScan。三路电池为底盘自定义消息，
+缺少本地类时由普通用户 ROS1 relay 按已核验 type/MD5 解码，转标准 String。上述做法不安装完整 SDK，
+镜像可能需要补充缺失的 ROS2 sensor_msgs；不因 SDK 具有音频示例就注册尚未验证的mic/speaker卡。
+
 ## 5. 里程计
 
 `ControlDataManager::odomCallback` 取 `/odom.twist.twist` 的 x/y/wz，

@@ -185,3 +185,45 @@ SDK 示例中的 `/load_map`、`/get_all_maps`、`/get_current_map`、`/navigate
 
 当前配置仍只注册 `loco/arm/leg/waist/head/switch_mode/state/joints/imu/loco_state/model`，
 本次核查没有添加相机、`mic`、`speaker` 或 `controlled_spatial` 的占位卡。
+
+## 追加：现场授权开启外设与启动集成（2026-11-16）
+
+以下结果更新上文的相机关闭状态；未启动全身控制器或发送运动指令。
+
+- 两个 `set_camera_enabled` 服务实际为 `std_srvs/SetBool`，调用 true 均返回成功。开启后左右路压缩图像
+  在约3秒内各收到53帧，最新帧约108/97KB，JPEG，源 frame_id 为空，不臆造光学坐标系。
+- `/scan` 在3秒内收到45帧，每帧3701测距，最新约3226个有限值，范围0.05–50m，frame=laser。
+- 独立 `/imu` 在3秒内约310帧，frame=imu_link；驱动现优先使用该流，不依赖缺失的全身控制器参数。
+- `/battery` 为 `leju_mobile_base_msgs/Battery`，MD5 `194127313f3eab30becb94a79e4c5562`；
+  实测 SOC96.5%、电流−3.2A、温度约24.67°C、voltage=0、status=4。
+  `/jaten_behavior_manager/out/leju/battery` 的 SOC相同但 status=2，保留两者原值。
+  small_battery 约44.99V/100%，不能挪用作主电池电压。
+  两个 jaten 流的类型为 `jaten_msgs/leju_battery`，MD5 `29a3d6075735cfbefd0218e8a3a12e0d`。
+- 本地缺少上述厂商消息 Python 类，新增普通用户只读 relay，校验 type/MD5 后动态解码，转标准 String。
+- 音频仅见 Jetson APE/HDA；PulseAudio 唯一 source 是播放 monitor，不是麦克风。
+  蓝牙设备列表为空，脚本寻找的 EB03_LJ 未连接。hw:0,0 的1秒录制4秒后超时；100ms数字静音播放返回0，
+  只能证明 PCM 可写，不能证明真实扬声器出声。因此暂不添加 mic/speaker 卡。
+- 操作人员提供标识 `KUA5W0710701302138`。没有找到它与控制器版本的映射；
+  `/humanoid_description`、全身关节流仍缺失，`/robot_description` 只有底盘模型。
+  仓库400062参考模型不能宣称已验证适用于此台实机。
+
+已实现 `battery/laser_scan/camera_rgb/camera_rgb_right`，开机自动启动传感输出并按需开启相机。
+安装固定 loopback 助手后，驱动启动可以确保 rosbridge 和电池 relay 运行；不会启动/使能 WBC/MPC。
+host helper 的首次安装仍需现场管理员执行一次，详见 README。
+
+### 集成验收结果
+
+- 上位机已安装助手，9090 和15748均只监听127.0.0.1。主动停止 bridge/relay 后，运行中的驱动约1秒内
+  自动重新请求启动两者；随后 ROS1连接及传感输出恢复。未触碰全身运动控制器。
+- 候选镜像 `kuavo5w:local-peripherals-261116` 已在现场运行，Compose 通过同目录
+  `local-peripherals.yml` 显式覆盖镜像，不冒用已发布 release 标签。该本地标签只存在于现场 Docker。
+- Agent Core 容器内以 domain42 订阅8秒，收到 IMU80、odom81、电池41、雷达40、雷达点集40帧，
+  左/右相机34/36帧。有效雷达输出3701测距，俯视点集约1577点；电池当时约94.83%。
+- 最终候选版本的两路 DDS JPEG 均可用 OpenCV 解码为1024×1280×3。源图像时间戳为0、frame_id为空，
+  原样保留，不能据此宣称相机时间同步或 TF 已核验。
+- `joints.info` 返回空实测数组及 `controller_not_ready`，并明确参考模型未核验、现场配置标识为
+  `KUA5W0710701302138`；这不是硬件读取的型号证明。
+- 候选覆盖镜像736972192字节，所用已发布 release 736836914字节，增量135278字节。
+  这是复用已有依赖的代码覆盖层对比，不是生产 Dockerfile 对 ros-base 的完整体积增量；后者仍待构建验证。
+- 本地173项离线测试、Python编译及 service.yml检查通过。实际运动、控制停止、完整关节模型、
+  mic物理采集及speaker实际出声仍未验收。

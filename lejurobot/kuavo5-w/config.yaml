@@ -1,11 +1,19 @@
 mcp_port: 15747
 name: "Leju Kuavo 5-W Driver"
 ros_namespace: ""
+# Optional operator-provided serial; not a robot_version or URDF selector.
+robot_serial: null
 # Set false to disable motion, resume and mode changes while preserving reads/stop.
 motion_enabled: true
+# One-time host/install.py provisions a loopback helper; startup then ensures
+# only rosbridge + read-only battery relay. Never starts/enables WBC or MPC.
+host_runtime:
+  enabled: true
 # Start rosbridge_server on the ROS Noetic host and point this URL at it.
 rosbridge_url: "ws://127.0.0.1:9090"
 sensors:
+  imu_topic: /imu
+  auto_start: [state, joints, imu, loco_state, battery, laser_scan, camera_rgb, camera_rgb_right]
   # Only admit body-frame odometry; extend after verifying the robot's TF tree.
   odom_body_frames: [base_link, base_footprint]
   # SDK permits N*m or current. Set N*m only after verifying robot hardware output.
@@ -27,3 +35,7 @@ plugins:
   imu: {enabled: true}
   loco_state: {enabled: true}
   model: {enabled: true}
+  battery: {enabled: true}
+  laser_scan: {enabled: true}
+  camera_rgb: {enabled: true}
+  camera_rgb_right: {enabled: true}

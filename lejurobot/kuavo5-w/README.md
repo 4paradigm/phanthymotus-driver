@@ -16,7 +16,7 @@ Kuavo ROS1 Noetic 控制器
 rosbridge_server（机器人侧，WebSocket :9090）
   ↕ rosbridge v2 JSON 协议
 本驱动（ROS2 Humble 容器，MCP :15747/mcp）
-  → ROS2 std_msgs/String，domain 42，FastDDS loopback profile
+  → ROS2 std_msgs/String / sensor_msgs/CompressedImage，domain 42，FastDDS loopback profile
 Agent Core（同一主机，https://localhost:15678）
 ```
 
@@ -58,15 +58,63 @@ Dashboard 重部署也复用此路径，不会用镜像默认文件覆盖现场�
 直接运行源码时，未设置 `CONFIG_PATH` 仍读取同目录的 `config.yaml`；显式设置的路径打不开或 YAML 无法解析时
 启动失败，不回退到包内默认配置。配置和硬件核验记录由操作人员管理，不应提交到仓库。
 
-镜像依赖会有体积成本：FastDDS RMW / std_msgs 仅在基础镜像未提供时安装；`requirements.txt`
+镜像依赖会有体积成本：FastDDS RMW / std_msgs / sensor_msgs 仅在基础镜像未提供时安装；`requirements.txt`
 声明 PyYAML（配置解析）及 websocket-client（rosbridge）。构建时先实际尝试 `import yaml`，已可用就不再
 通过 pip 安装 PyYAML，否则按 requirements 补齐；websocket-client 仍由 requirements 管理，最后检查两者均可导入。
 平台 `deploy/ros-base/Dockerfile` 未直接声明 PyYAML，其上游 ROS 镜像是否提供不能仅凭该文件确定。
-当前未完成实际镜像构建，不能承诺零增长或给出体积增量，需首次可用构建时对比相同基础镜像 digest。
+尚未对生产 Dockerfile 与 ros-base 完成全量构建体积对比，不能承诺零增长。
+现场增量候选镜像基于已有 release 构建，只验证当前依赖可复用，不代表生产基础镜像无需安装缺失包。
 
 ## 机器人侧准备
 
-`/opt/ros/noetic` 的存在不代表已安装 rosbridge。先在机器人侧准备包：
+### 一次安装，后续驱动启动自动检查
+
+在 ROS1 上位机安装 `ros-noetic-rosbridge-server` 后，从本目录执行一次（参数使用现场 ROS 网络）：
+
+```sh
+sudo python3 host/install.py --user leju_kuavo \
+  --workspace /home/leju_kuavo/kuavo_ros_application \
+  --master http://192.168.26.1:11311 --ros-ip 192.168.26.12
+```
+
+安装器准备现场配置（保留已有值，仅补充缺失的外设插件），安装固定用途 systemd 服务。
+驱动启动后每5秒通过 `127.0.0.1:15748/ensure` 请求确保 rosbridge 和只读电池转发器运行；
+它们异常退出由 systemd 重启。`state.info` 的 `feedback.host_runtime` 报告检查状态。
+容器不需要宿主机 sudo、SSH 密码、Docker socket 或特权权限。
+助手仅能启动这两个固定服务，不接受命令或 unit 参数；仅监听 loopback，拒绝浏览器 Origin 和非本机 Host。
+ROS消息解码以普通用户运行，固定启动助手独立运行。旧版 rosbridge 忽略 address 参数时，通过进程内 wrapper
+明确指定 loopback 绑定，不修改系统 ROS 包。
+
+默认自动启动 `state/joints/imu/loco_state/battery/laser_scan/camera_rgb/camera_rgb_right` 的输出。
+相机缺帧时调用对应 `set_camera_enabled(true)`，间隔至少5秒重试；不会启动 WBC、MPC 或使能机器人运动。
+`sensors.auto_start` 可缩小列表，`plugins.<name>.enabled: false` 可禁用卡片。
+远程 rosbridge 部署可设置 `host_runtime.enabled: false`，由远端自行管理其 ROS1 服务。
+首次缺少宿主机配置导致 bind 挂载失败时，容器代码尚未运行，仍需一次安装/初始化；无法靠容器内自检绕过。
+
+### 外设卡与现场型号
+
+| 卡片 | 数据与启动行为 |
+| --- | --- |
+| `battery` | `/battery` 主电池的 SOC(%)、电流(A)、温度(°C)；保留另两路厂商来源及不同 status，不把主电池0V当成有效电压 |
+| `laser_scan` | `/scan` 测距 JSON 和 `sensor/lidar` 的二维 `{x,y}` 点集；使用 laser 原始坐标，不推测底盘 TF |
+| `camera_rgb` | 左路 `/camera_1/color/image_raw/compressed`，原生 ROS2 `CompressedImage` / `image/jpeg` |
+| `camera_rgb_right` | 右路 `/camera_2/color/image_raw/compressed`，同上；保留源时间戳，空 frame_id 保持为空 |
+| `imu` | 优先独立 `/imu`，全身 raw 为备用；不再要求全身控制器存在才能读取 IMU |
+
+电池转发器校验现场三种已核实 topic/type/MD5 组合，动态加载发布者提供的有界定义，输出标准 String。
+相机经 rosbridge 限流到5Hz，只保留最新 JPEG；无重新编码及额外图像处理依赖。
+传感卡 stop 停止该卡输出，相机 stop 不关闭底盘其他进程共享的物理图像流。
+麦克风目前无可用采集来源，扬声器仅验证 PCM 接口可写，尚未确认物理出声，因此不注册虚假可用的 `mic/speaker`。
+
+`KUA5W0710701302138` 是操作人员提供的机身标识，可在现场配置 `robot_serial` 中记录；
+没有证据可把它等同于控制器 `robot_version`。当前资源 URDF 是400062参考骨架，几何尺寸未对该台实机核验。
+`joints.info.skeleton_model` 明示 `reference_only` / `hardware_geometry_verified`；缺少全身 `/humanoid_description`
+或实测关节流时不伪造姿态。现场 `/robot_description` 是底盘模型，不能替代全身 URDF。
+必须取得匹配的全身模型、关节顺序及现场核验限位后才能验证关节控制。
+
+### 手动安装与排查
+
+`/opt/ros/noetic` 的存在不代表已安装 rosbridge。未使用上面的安装器时，可手动准备包并排查：
 
 ```sh
 sudo apt-get update
@@ -318,8 +366,8 @@ SDK 对 effort 单位同时允许 N·m 或 A，因此默认 tau=null、单位未
 
 仓库 `build.sh` 会将驱动目录内容作为构建上下文，并将 `driver.yaml` 的 `../../common` 复制为 `common/`。
 Dockerfile 已按此布局配置，并将部署片段放入镜像 `/deploy/service.yml`。
-基础镜像已提供 `python3-pip`；Dockerfile 仅在缺失时安装 ROS2 FastDDS RMW 和 `std_msgs`，
-分别用于选定的 DDS participant 和 `String` 状态发布。不安装本地 ROS2 `geometry_msgs`：
+基础镜像已提供 `python3-pip`；Dockerfile 仅在缺失时安装 ROS2 FastDDS RMW、`std_msgs` 和 `sensor_msgs`，
+用于选定的 DDS participant、`String` 状态和原生压缩图像发布。不安装本地 ROS2 `geometry_msgs`：
 厂商 ROS1 `Twist` 是 rosbridge JSON 消息，由机器人侧解析。
 Python 依赖仅为配置解析用 PyYAML 和连接 rosbridge 用 websocket-client，不安装完整厂商 SDK。
 这些是运行所需的依赖；实际基础镜像是否已提供及最终镜像增量仍需容器构建核实，不能用离线测试替代。

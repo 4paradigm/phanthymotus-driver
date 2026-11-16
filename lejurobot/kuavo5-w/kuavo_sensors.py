@@ -113,6 +113,8 @@ class KuavoSensors:
         self._running = set()
         self._body_frames = set(config.get('odom_body_frames', ['base_link', 'base_footprint']))
         self._torque_unit = config.get('joint_torque_unit')
+        self._imu_topic = config.get('imu_topic', '/imu')
+        self._standard_imu_at = None
         if self._torque_unit not in (None, 'N*m'):
             raise ValueError('joint_torque_unit must be null or hardware-verified N*m')
         self._topics = {'joints': f'/{namespace}/state/joints',
@@ -121,6 +123,7 @@ class KuavoSensors:
         self._pubs = {key: node.create_publisher(String, topic, 10)
                       for key, topic in self._topics.items()}
         ros1.subscribe('/odom', 'nav_msgs/Odometry', self._on_odom)
+        ros1.subscribe(self._imu_topic, 'sensor_msgs/Imu', self._on_standard_imu)
         self._timer = node.create_timer(0.1, self.tick)
 
     def _session(self):
@@ -130,6 +133,7 @@ class KuavoSensors:
                 self._profile = self._urdf = self._names = None
                 self._model_sha256 = None
                 self._identity_checked_at = None
+                self._standard_imu_at = None
                 self._joint_capture_ns = self._joint_captured_at = None
                 self._data.clear()
                 self._seen.clear()
@@ -151,6 +155,9 @@ class KuavoSensors:
                 'robot_type', 'robot_version', 'armRealDof', 'headRealDof',
                 'legRealDof', 'waistRealDof')}
             params['use_shm_communication'] = self.ros1.get_param('/use_shm_communication', False)
+            missing = [key for key, value in params.items() if value is None]
+            if missing:
+                raise ValueError('controller_not_ready: missing ROS parameters ' + ', '.join(missing))
             counts = [params[k] for k in ('armRealDof', 'headRealDof', 'legRealDof', 'waistRealDof')]
             if (type(params['robot_type']) is not int or params['robot_type'] != 1 or
                     any(type(v) is not int or v < 0 for v in counts) or
@@ -173,6 +180,8 @@ class KuavoSensors:
                 if self._raw_topic and self._raw_topic != topic:
                     self.ros1.unsubscribe(self._raw_topic)
                     for card in ('joints', 'imu'):
+                        if card == 'imu' and self._standard_imu_at is not None:
+                            continue
                         self._data.pop(card, None)
                         self._seen.pop(card, None)
                         self._errors.pop(card, None)
@@ -198,6 +207,8 @@ class KuavoSensors:
                     self._model_sha256 = None
                     self._identity_checked_at = None
                     for card in ('joints', 'imu'):
+                        if card == 'imu' and self._standard_imu_at is not None:
+                            continue
                         self._data.pop(card, None)
                         self._seen.pop(card, None)
                         self._errors.pop(card, None)
@@ -238,6 +249,9 @@ class KuavoSensors:
                     'discovery_error': self._discovery_error, 'model_error': self._model_error,
                     'skeleton_model': {'source': 'resource/kuavo5w_model.urdf',
                                        'reference_version': '400062',
+                                       'reference_only': True, 'hardware_geometry_verified': False,
+                                       'configured_robot_serial': getattr(self, 'robot_serial', None),
+                                       'serial_source': 'operator_config_not_hardware_verification',
                                        'runtime_joint_names_verified': self._names is not None}}
 
     def _joint_bounds(self, card):
@@ -340,6 +354,8 @@ class KuavoSensors:
                 self._seen.pop('joints', None)
                 self._errors['joints'] = str(exc)
             try:
+                if self._standard_imu_at is not None and time.monotonic() - self._standard_imu_at <= .5:
+                    return  # Independent IMU takes precedence over controller raw IMU.
                 imu = message['imu_data']
                 quat = xyz(imu['quat'], ('w', 'x', 'y', 'z'))
                 if abs(math.sqrt(sum(v*v for v in quat)) - 1) > 0.05:
@@ -350,6 +366,35 @@ class KuavoSensors:
                     'frame_id': message.get('header', {}).get('frame_id') or None,
                     'units': {'gyroscope': 'rad/s', 'accelerometer': 'm/s^2', 'free_acceleration': 'm/s^2'}}
                 self._seen['imu'] = time.monotonic()
+                self._errors.pop('imu', None)
+            except (KeyError, TypeError, ValueError, AttributeError) as exc:
+                self._data.pop('imu', None)
+                self._seen.pop('imu', None)
+                self._errors['imu'] = str(exc)
+
+    def _on_standard_imu(self, message):
+        if not self._session()[0]:
+            return
+        with self._lock:
+            try:
+                quat = xyz(message['orientation'], ('w', 'x', 'y', 'z'))
+                if abs(math.sqrt(sum(v*v for v in quat)) - 1) > .05:
+                    raise ValueError('invalid independent IMU quaternion')
+                covariance = message.get('orientation_covariance', [])
+                orientation = None if covariance and covariance[0] == -1 else quat
+                stamp_ms, provenance = stamp(message)
+                w, x, y, z = quat
+                rpy = [math.atan2(2*(w*x+y*z), 1-2*(x*x+y*y)),
+                       math.asin(max(-1., min(1., 2*(w*y-z*x)))),
+                       math.atan2(2*(w*z+x*y), 1-2*(y*y+z*z))] if orientation else None
+                self._data['imu'] = {'stamp_ms': stamp_ms, 'quaternion': orientation,
+                    'quaternion_order': 'wxyz', 'rpy': rpy,
+                    'gyroscope': xyz(message['angular_velocity']),
+                    'accelerometer': xyz(message['linear_acceleration']),
+                    'free_acceleration': None, 'frame_id': message.get('header', {}).get('frame_id'),
+                    'units': {'gyroscope': 'rad/s', 'accelerometer': 'm/s^2', 'rpy': 'rad'},
+                    'vendor': {'topic': self._imu_topic, **provenance}}
+                self._standard_imu_at = self._seen['imu'] = time.monotonic()
                 self._errors.pop('imu', None)
             except (KeyError, TypeError, ValueError, AttributeError) as exc:
                 self._data.pop('imu', None)
@@ -439,8 +484,8 @@ class KuavoSensors:
                 self._pubs[card].publish(message)
 
     def tools(self):
-        descriptions = {'joints': '实测下肢4+双臂14+头部2关节，URDF 精确名称；无轮速/手指伪造值',
-                        'imu': '实测 IMU 四元数、角速度、加速度、去重力加速度',
+        descriptions = {'joints': '全身控制器实测20关节；控制器未启动时 invalid，参考骨架不冒充实际姿态',
+                        'imu': '独立 /imu 实测姿态/角速度/加速度，不依赖全身控制器；不将其套到骨架根节点',
                         'loco_state': '实测底盘本体系 vx/vy/wz，motus.odom/1；未测轴为 null'}
         tools = [{'name': name, 'type': 'sensor', 'multiInstance': False,
                   'description': description, 'inputSchema': {'type': 'object', 'properties': {}},
@@ -470,6 +515,8 @@ class KuavoSensors:
                 return {'state': 'error', 'error': f'unknown action: {action}'}
             result = {'state': 'running' if card in self._running else 'idle',
                       'feedback': self.snapshot(card)}
+            if card == 'joints':
+                result['skeleton_model'] = self.health()['skeleton_model']
             if card in self._running:
                 result['topic_out'] = next(t['topic_out'] for t in self.tools() if t['name'] == card)
             if card == 'loco_state':
