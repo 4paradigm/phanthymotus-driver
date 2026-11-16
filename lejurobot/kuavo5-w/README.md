@@ -23,7 +23,7 @@ Agent Core（同一主机，https://localhost:15678）
 ROS1 没有 DDS domain。本驱动负责 ROS1 → ROS2 消息转换，Agent Core 侧固定为 domain **42**。
 `deploy/service.yml` 使用 host 网络，并挂载、选择 `/opt/phanthy-motus/dds-local.xml`，与本机 Agent Core 的隔离传输保持一致。
 本驱动只通过 WebSocket/DDS 接口访问机器人，不直接访问设备，不申请 `privileged`，
-也不挂载可写 data 目录；当前唯一文件挂载为只读 DDS profile。
+也不挂载可写 data 目录；仅挂载只读 DDS profile 与操作人员配置文件。
 启动前检查该 profile 是文件；缺失、误挂成目录或 RMW 配置冲突时拒绝创建 ROS2 participant。
 
 ROS2 / Agent Core 与驱动容器需要在同一 Linux 主机；机器人 ROS1 可以在本机或另一台可达主机。
@@ -32,6 +32,37 @@ ROS1 自定义消息的加载由机器人侧 rosbridge 完成。
 MCP 仅监听 `127.0.0.1:15747`，只接受本机无 `Origin` 的服务端请求，并校验 `Host` 为该端口的
 `localhost`/`127.0.0.1`；浏览器预检、任意浏览器来源及外部客户端均被拒绝，不返回通配 CORS。
 页面通过 Agent Core 调用驱动，不直接访问运动端口。这是同机进程信任边界，不是本机进程之间的身份鉴权。
+
+### 容器部署配置
+
+Dashboard 将镜像内的 `deploy/service.yml` 合并到宿主机 Compose，保留其中的配置挂载和环境变量。
+部署片段把宿主机 `/opt/phanthy-motus/drivers/lejurobot-kuavo5-w/config.yaml` **只读**挂到
+`/config/kuavo5-w.yaml`，并设置 `CONFIG_PATH` 指向它。操作人员在首次 Dashboard 部署前准备该文件：
+
+```sh
+# 在驱动仓库根目录执行，目标是运行 Agent Core / 驱动容器的 Linux 主机。
+# 首次初始化使用；已有现场配置时不要覆盖。
+sudo install -d -m 0755 /opt/phanthy-motus/drivers/lejurobot-kuavo5-w
+sudo test ! -e /opt/phanthy-motus/drivers/lejurobot-kuavo5-w/config.yaml && \
+  sudo install -m 0644 lejurobot/kuavo5-w/config.yaml /opt/phanthy-motus/drivers/lejurobot-kuavo5-w/config.yaml
+```
+
+没有源码的部署主机也可先从所选驱动镜像的停止容器中用 `docker cp` 提取 `/work/config.yaml`，
+再安装到同一宿主机路径；不需要启动控制程序或重建镜像。挂载要求 Docker Compose 支持
+`bind.create_host_path: false`；文件缺失时部署失败，不自动创建同名目录。
+文件应是完整配置，保留默认的 `sensors.joint_limits: null`，现场核验后再填写下节记录。
+修改宿主机文件后需重新创建驱动容器以重新加载并更新文件挂载，例如在宿主机 Compose 目录执行
+`docker compose up -d --force-recreate lejurobot-kuavo5-w`；重新创建会中断当前驱动，应在机器人受控停止后进行。
+Dashboard 重部署也复用此路径，不会用镜像默认文件覆盖现场配置。该路径不提供 Dashboard 在线编辑功能。
+
+直接运行源码时，未设置 `CONFIG_PATH` 仍读取同目录的 `config.yaml`；显式设置的路径打不开或 YAML 无法解析时
+启动失败，不回退到包内默认配置。配置和硬件核验记录由操作人员管理，不应提交到仓库。
+
+镜像依赖会有体积成本：FastDDS RMW / std_msgs 仅在基础镜像未提供时安装；`requirements.txt`
+声明 PyYAML（配置解析）及 websocket-client（rosbridge）。构建时先实际尝试 `import yaml`，已可用就不再
+通过 pip 安装 PyYAML，否则按 requirements 补齐；websocket-client 仍由 requirements 管理，最后检查两者均可导入。
+平台 `deploy/ros-base/Dockerfile` 未直接声明 PyYAML，其上游 ROS 镜像是否提供不能仅凭该文件确定。
+当前未完成实际镜像构建，不能承诺零增长或给出体积增量，需首次可用构建时对比相同基础镜像 digest。
 
 ## 机器人侧准备
 

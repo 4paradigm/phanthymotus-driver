@@ -249,7 +249,11 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(compose["network_mode"], "host")
         self.assertFalse(compose.get('privileged', False))
         self.assertEqual(compose['volumes'], [
-            '/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro'])
+            '/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro',
+            {'type': 'bind', 'source': '/opt/phanthy-motus/drivers/lejurobot-kuavo5-w/config.yaml',
+             'target': '/config/kuavo5-w.yaml', 'read_only': True,
+             'bind': {'create_host_path': False}}])
+        self.assertIn('CONFIG_PATH=/config/kuavo5-w.yaml', compose['environment'])
         self.assertIn("ROS_DOMAIN_ID=42", compose["environment"])
         # build.sh flattens driver contents and copies extras under basename.
         for line in (ROOT / "Dockerfile").read_text().splitlines():
@@ -261,6 +265,27 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("COPY resource/ /work/resource/", (ROOT / "Dockerfile").read_text())
         self.assertNotIn('ros-humble-geometry-msgs', (ROOT / 'Dockerfile').read_text())
         self.assertEqual({c["name"] for c in meta["cards"]}, set(config["plugins"]))
+
+    def test_operator_config_loads_complete_commissioning_record(self):
+        config = yaml.safe_load((ROOT / 'config.yaml').read_text())
+        # Loader round-trip only; not a valid or hardware-verified motion policy.
+        config['sensors']['joint_limits'] = {'verification': 'OFFLINE LOADER TEST ONLY'}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'operator.yaml'
+            path.write_text(yaml.safe_dump(config))
+            with patch.dict(os.environ, {'CONFIG_PATH': str(path)}):
+                self.assertEqual(main._load_config(), config)
+        self.assertIsNone(yaml.safe_load((ROOT / 'config.yaml').read_text())['sensors']['joint_limits'])
+
+    def test_explicit_operator_config_missing_or_invalid_never_falls_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'operator.yaml'
+            with patch.dict(os.environ, {'CONFIG_PATH': str(path)}):
+                with self.assertRaises(FileNotFoundError):
+                    main._load_config()
+                path.write_text('sensors: [')
+                with self.assertRaises(yaml.YAMLError):
+                    main._load_config()
 
     def test_namespace_valid_first_character(self):
         self.assertEqual(main._namespace({"ros_namespace": "123robot-a"}), "robot_123robot_a")

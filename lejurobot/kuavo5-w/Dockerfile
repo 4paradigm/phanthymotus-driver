@@ -15,7 +15,18 @@ RUN set -eu; missing=""; \
         rm -rf /var/lib/apt/lists/*; \
     fi
 COPY requirements.txt /work/requirements.txt
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /work/requirements.txt
+# ROS base revisions may already provide distro PyYAML without pip metadata.
+# Reuse an importable copy rather than layering a redundant pip installation.
+# Keep all dependency declarations (including websocket-client) in requirements.
+RUN set -eu; \
+    if python3 -c 'import yaml'; then \
+        grep -v '^pyyaml$' /work/requirements.txt > /tmp/kuavo-requirements.txt; \
+    else \
+        cp /work/requirements.txt /tmp/kuavo-requirements.txt; \
+    fi; \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/kuavo-requirements.txt; \
+    rm /tmp/kuavo-requirements.txt; \
+    python3 -c 'import yaml, websocket'
 WORKDIR /work
 COPY common/ /work/common/
 COPY main.py device.py rosbridge_client.py kuavo_sensors.py config.yaml driver.yaml /work/

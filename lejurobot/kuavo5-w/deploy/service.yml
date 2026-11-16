@@ -6,11 +6,20 @@ lejurobot-kuavo5-w:
   pid: host
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    # Seed this complete config from the packaged default before dashboard deploy.
+    # Fail if missing; never create a directory or fall back to another config.
+    - type: bind
+      source: /opt/phanthy-motus/drivers/lejurobot-kuavo5-w/config.yaml
+      target: /config/kuavo5-w.yaml
+      read_only: true
+      bind:
+        create_host_path: false
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONUNBUFFERED=1
+    - CONFIG_PATH=/config/kuavo5-w.yaml
     - ROSBRIDGE_URL=${KUAVO_ROSBRIDGE_URL:-ws://127.0.0.1:9090}
     - AGENT_CORE_URL=https://localhost:15678
   logging:
