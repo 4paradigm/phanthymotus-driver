@@ -609,6 +609,74 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(self.callbacks[0][:3], (result['action_id'], 'leg', 'completed'))
         self.assertTrue(self.callbacks[0][3]['measured_convergence'])
 
+    def _run_joint_measurement_trace(self, samples):
+        """Run the real motion worker with independent poll/sample timestamps.
+
+        Each entry is (poll elapsed, measurement elapsed, measured leg degrees).
+        Stop polling at the end so a non-completing action can be inspected.
+        """
+        started = time.monotonic()
+        clock = [started]
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock[0], time=time.time)
+        with patch.object(driver, 'time', fake_time):
+            with patch.object(driver.threading, 'Thread') as thread:
+                result = self.call('leg', 'move_joints', positions=[10.] * 4)
+            self.assertEqual(result['state'], 'executing')
+            thread.assert_called_once()
+            worker = thread.call_args.kwargs['target']
+            cancelled = self.bundle.tracker._active['lower_body'][2]
+            clock[0] += 0.001
+            self.ros.emit('/lb_leg_joint_reach_time', 0.)
+            entries = iter(samples)
+            current = [None]
+
+            def poll(_timeout):
+                entry = next(entries, None)
+                if entry is None:
+                    return True
+                elapsed, measured_elapsed, degrees = entry
+                clock[0] = started + elapsed
+                current[0] = ([math.radians(degrees)] * 4 + [0.] * 16,
+                              started + measured_elapsed)
+                return False
+
+            with patch.object(cancelled, 'wait', side_effect=poll), patch.object(
+                    self.bundle.sensors, 'joint_positions', side_effect=lambda: current[0]) as positions:
+                worker()
+            # A premature completion would consume fewer trace entries.
+            self.assertEqual(positions.call_count, len(samples))
+        self.bundle.tracker._callbacks.join()
+        return result
+
+    def test_cached_joint_sample_does_not_accumulate_convergence(self):
+        result = self._run_joint_measurement_trace([
+            (0.02, 0.02, 10.), (0.10, 0.02, 10.),
+            (0.24, 0.02, 10.), (0.32, 0.02, 10.),
+        ])
+        self.assertEqual(self.callbacks, [])
+        self.assertTrue(self.bundle.tracker.current('lower_body', result['action_id']))
+
+    def test_precommand_joint_sample_does_not_start_convergence(self):
+        self._run_joint_measurement_trace([
+            (0.02, -0.01, 10.), (0.24, -0.01, 10.), (0.30, 0.30, 10.),
+        ])
+        self.assertEqual(self.callbacks, [])
+
+    def test_distinct_joint_samples_must_span_convergence_window(self):
+        self._run_joint_measurement_trace([
+            (0.02, 0.02, 10.), (0.17, 0.17, 10.), (0.32, 0.17, 10.),
+        ])
+        self.assertEqual(self.callbacks, [])
+
+    def test_out_of_tolerance_joint_sample_restarts_convergence(self):
+        result = self._run_joint_measurement_trace([
+            (0.02, 0.02, 10.), (0.18, 0.18, 0.), (0.24, 0.24, 10.),
+            (0.30, 0.30, 10.), (0.46, 0.46, 10.),
+        ])
+        self.assertEqual(len(self.callbacks), 1)
+        self.assertEqual(self.callbacks[0][:3], (result['action_id'], 'leg', 'completed'))
+        self.assertTrue(self.callbacks[0][3]['measured_convergence'])
+
     def test_stop_blocks_old_velocity_thread_and_cancels_acp_once(self):
         result = self.call("loco", "move", vx=0.1, duration=1)
         stopped = self.call("loco", "stop_move")
