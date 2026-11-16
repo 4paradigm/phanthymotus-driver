@@ -114,7 +114,7 @@ def test_coalesced_restart_flushes_queued_video_and_old_accel_after_motion_publi
     profiles = {kind: NS(stream_type=lambda kind=kind: kind, format=lambda: 'xyz', fps=lambda: 100,
         stream_index=lambda: 0, unique_id=lambda kind=kind: kind,
         get_extrinsics_to=lambda depth: NS(rotation=[1,0,0,0,1,0,0,0,1], translation=[.01,.02,.03]))
-        for kind in ('gyro', 'accel', 'depth')}
+        for kind in ('gyro', 'accel', 'depth', 'color')}
     active = NS(get_stream=profiles.__getitem__, get_device=lambda: NS(
         query_sensors=lambda: [NS(get_stream_profiles=lambda: list(profiles.values()))],
         get_info=lambda kind: 'actual-test-serial'))

@@ -183,7 +183,7 @@ calibration ID. Other installations without a verified mount must retain
 `assumed: true`, publish `calibrated=false`, and provide a measured transform
 before SLAM mapping.
 
-The public depth port now carries the normalized native-depth optical grid,
+The public depth port now carries the normalized native-color optical grid,
 with its actual `motus.camera/1` calibration and capture clock. It no longer
 advertises the old color-aligned `vendor.slam_geometry` hint or its old depth
 provenance sidecar. Use registered RGB plus this shared depth with generic
@@ -191,10 +191,10 @@ Perception RGB-D odometry, and the same depth with metric Point Cloud. Their
 camera-reference poses/clouds use the existing runtime identical-frame SLAM
 route; no verified independent-clock/provenance protocol is implied.
 
-The private legacy RTAB-Map raw branch remains aligned to color. Its existing
-body-from-color mount does not automatically describe the new public depth
-optical frame. Do not reuse that matrix for public native-depth pointclouds;
-combining those references requires a separately valid transform.
+The private legacy RTAB-Map raw branch remains aligned to color with its
+existing contract. The public pair uses corrected color-camera Z and measured
+rectified color intrinsics; consume its own declarations rather than raw-branch
+pixel metadata. This does not create or verify a physical camera-to-body mount.
 
 
 The cross-robot field definitions and clock/extrinsic trust requirements live
@@ -210,17 +210,21 @@ compatible, manually configured `child_from_cloud` matrix.
 
 The original `depth` card is the sole `image/depth-zlib` source at
 `/<namespace>/camera/depth`. It reuses `rgbd_camera.RgbdCameraPublisher`:
-640×480 rectified native-depth optical geometry, measured little-endian uint16
+640×480 rectified native-color optical geometry, measured little-endian uint16
 millimetres, zero invalid. Its matched RGB is the `camera` card's sole output
 at `/<namespace>/camera/color`; display, photos, videos and generic VO all use
-that registered rectified depth-lens view, including any unobserved color
-borders. There is no `/camera/rgbd/color` or `/camera/rgbd/depth` publisher,
-duplicate JPEG/depth encoder, arrival-stamp fallback or legacy align-to-color
+the original RGB field, rectified on valid color rays. SDK depth-to-color
+alignment retains source depth-camera Z: actual SDK rotation/translation and
+the sampled color ray convert this to color-camera Z. RGB stays visible at
+depth holes and outside the original depth-to-color overlap. There is no `/camera/rgbd/color` or `/camera/rgbd/depth` publisher,
+duplicate JPEG/depth encoder, arrival-stamp fallback or uncorrected aligned-depth
 fallback on the public image topics.
 
 The producer requires finite SDK depth scale strictly within `(0, 0.1)` metres
-per unit, supported measured intrinsics/distortion, exact uint16 source shape,
+per unit, measured pinhole intrinsics with zero source distortion, exact uint16 source shape,
 and valid monotonic capture clock mapping with the existing skew/drift bounds.
+Nonzero distortion is rejected rather than silently ignored by optimized SDK
+alignment. The original RGB field is retained.
 Invalid input pauses both public images and removes their ready declarations;
 native RGB is not published as a fallback. Missing optional motion or
 body-camera TF does not disable valid images. Bumi's arrival-derived hardware-clock mapping remains

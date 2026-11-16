@@ -23,7 +23,7 @@ def test_shared_bumi_callback_keeps_motion_while_invalid_rgbd_pauses_images(capt
                        stream_index=lambda:0,unique_id=lambda kind=kind:kind,
                        get_extrinsics_to=lambda depth, kind=kind:NS(rotation=[1,0,0,0,1,0,0,0,1],
                            translation=[.012, -.034, .056] if kind=='gyro' else [-.078, .09, -.011]))
-              for kind in ('gyro','accel','depth')}
+              for kind in ('gyro','accel','depth','color')}
     camera=NS(query_sensors=lambda:[NS(get_stream_profiles=lambda:list(profiles.values()))],
               get_info=lambda kind:'camera123')
     active=NS(get_stream=profiles.__getitem__,get_device=lambda:camera)
@@ -73,7 +73,7 @@ def test_shared_bumi_callback_keeps_motion_while_invalid_rgbd_pauses_images(capt
     device._camera_subprocess('robot')
     packet=json.loads(state.published['/robot/camera/rgbd/imu'][0].data)
     assert packet['clock_id']=='shared_rgbd/hardware_clock'
-    assert packet['camera_frame_id']=='robot_depth_optical'
+    assert packet['camera_frame_id']=='robot_rgb_optical'
     assert packet['camera_from_gyro_translation']==[.012, -.034, .056]
     assert packet['camera_from_accel_translation']==[-.078, .09, -.011]
     assert packet['translation_source']=='sdk_factory_extrinsics'

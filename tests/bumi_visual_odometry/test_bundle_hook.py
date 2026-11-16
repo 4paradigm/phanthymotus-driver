@@ -51,7 +51,8 @@ def capture(monkeypatch):
             self.data = data
             self.profile = NS(as_video_stream_profile=lambda: NS(intrinsics=NS(
                 width=state.depth_dims[0], height=state.depth_dims[1], fx=600., fy=601.,
-                ppx=320., ppy=240., model='none', coeffs=[0.] * 5)))
+                ppx=320., ppy=240., model='none', coeffs=[0.] * 5)),
+                get_extrinsics_to=lambda target:NS(rotation=[1.,0.,0.,0.,1.,0.,0.,0.,1.], translation=[0.,0.,0.]))
 
         def get_timestamp(self):
             return 1000. + state.iterations * 30.
@@ -222,12 +223,12 @@ def test_original_depth_is_normalized_capture_mapped_and_owned_once(capture, mon
     state.depth_scale = .002
     device._camera_subprocess('robot')
     depth = state.published['/robot/camera/depth'][0]
-    assert depth.header.frame_id == 'robot_depth_optical'
+    assert depth.header.frame_id == 'robot_rgb_optical'
     assert depth.header.stamp.sec * 10**9 + depth.header.stamp.nanosec == 10_030_000_000
     assert isinstance(depth.data, array) and depth.data.typecode == 'B'
     assert zlib.decompress(depth.data) == b'\x02\x00\x04\x00' + bytes(640 * 480 * 2 - 4)
     assert '/robot/camera/rgbd/depth' not in state.published
-    assert state.alignment == ['depth']
+    assert state.alignment == ['color']
     assert state.stopped
 
 
@@ -562,7 +563,7 @@ def test_color_display_and_capture_share_one_calibrated_publisher_and_encoder(ca
     assert state.jpeg_encodes == 2
     color = state.published['/robot/camera/color']
     assert len(color) == 2
-    assert [m.header.frame_id for m in color] == ['robot_depth_optical'] * 2
+    assert [m.header.frame_id for m in color] == ['robot_rgb_optical'] * 2
     assert [m.header.stamp.sec * 10**9 + m.header.stamp.nanosec for m in color] == [
         10_030_000_000, 10_060_000_000]
     cache = device._CameraFrameNode('/robot/camera/color')

@@ -1,7 +1,8 @@
 """Generic Perception inputs from the existing Bumi RealSense capture owner.
 
-rs.align samples color into the native depth lens, preserving depth axial Z.
-Both images are then sampled on common rectified rays. Source capture times are
+rs.align samples depth into the native color lens. Source depth-camera axial Z
+is converted to color-camera Z on the sampled color rays using SDK extrinsics.
+Both images are sampled on common rectified rays. Source capture times are
 mapped once, never replaced by publication time. This is a camera optical frame, with no assumed body mount.
 """
 from array import array
@@ -23,21 +24,48 @@ except ImportError:
 def make_geometry(intr):
     import cv2
     if (intr.width, intr.height) != (640, 480):
-        raise ValueError('RGB-D requires 640x480 depth intrinsics')
+        raise ValueError('RGB-D requires 640x480 color intrinsics')
     k = np.array([[intr.fx, 0., intr.ppx], [0., intr.fy, intr.ppy], [0., 0., 1.]])
     if not np.isfinite(k).all() or intr.fx <= 0 or intr.fy <= 0:
         raise ValueError('invalid RGB-D intrinsics')
     d = np.asarray(intr.coeffs, dtype=float)
     model = str(intr.model).rsplit('.', 1)[-1]
     if d.shape != (5,) or not np.isfinite(d).all():
-        raise ValueError('invalid depth distortion coefficients')
-    # OpenCV's forward Brown model cannot represent RealSense inverse Brown.
-    # The D435i's zero-coefficient inverse model is exactly a pinhole.
+        raise ValueError('invalid color distortion coefficients')
+    # Optimized SDK alignment does not implement every nonzero Brown model.
+    # The D435i's measured zero-coefficient profiles are exact pinholes.
     if (model not in ('none', 'brown_conrady', 'modified_brown_conrady', 'inverse_brown_conrady') or
-            (np.any(d != 0) and model != 'brown_conrady')):
+            np.any(d != 0)):
         raise ValueError('unsupported source distortion: ' + model)
     x, y = cv2.initUndistortRectifyMap(k, d, np.eye(3), k, (640, 480), cv2.CV_32FC1)
-    return dict(K=k.ravel().tolist(), map_x=x, map_y=y)
+    return dict(K=k.ravel().tolist(), map_x=np.clip(x, 0, 639), map_y=np.clip(y, 0, 479))
+
+
+def color_depth_geometry(intr, extrinsics):
+    """Recover color Z from the original depth Z retained by SDK alignment."""
+    rotation = np.asarray(extrinsics.rotation, dtype=float)
+    translation = np.asarray(extrinsics.translation, dtype=float)
+    if rotation.size != 9 or translation.shape != (3,):
+        raise ValueError('invalid RGB-D depth-to-color calibration shape')
+    rotation = rotation.reshape(3, 3, order='F')  # SDK column-major R_COLOR_DEPTH
+    if (not np.isfinite(rotation).all() or not np.isfinite(translation).all() or
+            not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6, rtol=0) or
+            not np.isclose(np.linalg.det(rotation), 1., atol=1e-6, rtol=0)):
+        raise ValueError('invalid RGB-D depth-to-color calibration')
+    geometry = make_geometry(intr)
+    # Match nearest-neighbour depth resampling: use its source color-pixel ray.
+    pixels = np.stack((np.rint(geometry['map_x']), np.rint(geometry['map_y'])), axis=-1)
+    rays = pixels.astype(np.float64)
+    rays[:, :, 0] = (rays[:, :, 0]-intr.ppx)/intr.fx
+    rays[:, :, 1] = (rays[:, :, 1]-intr.ppy)/intr.fy
+    row = rotation.T[2]
+    denominator = row[0]*rays[:, :, 0] + row[1]*rays[:, :, 1] + row[2]
+    if not np.isfinite(denominator).all() or np.any(denominator <= 0):
+        raise ValueError('RGB-D depth-to-color calibration has invalid optical rays')
+    # Z_DEPTH = (R_DEPTH_COLOR * ray_COLOR).z * Z_COLOR + t_DEPTH_COLOR.z.
+    geometry.update(depth_z_scale=1./denominator,
+                    depth_z_offset=(rotation.T @ translation)[2]/denominator)
+    return geometry
 
 
 def camera_declarations(root, geometry, frame_id, clock_id, source_clock, offset_ns, *, source_epoch=None):
@@ -46,7 +74,7 @@ def camera_declarations(root, geometry, frame_id, clock_id, source_clock, offset
                   source='derived-from-K', vendor=dict(
                       frame_id=frame_id, clock_id=clock_id, source_id=root, pose_reference='camera_optical',
                       registration='registered_rectified',
-                      registration_source='realsense_align_color_to_depth_then_rectify',
+                      registration_source='realsense_align_depth_to_color_then_rectify_color_z',
                       timestamp_semantics='source_capture_mapped',
                       source_clock=source_clock, mapping_offset_ns=offset_ns,
                       clock_mapping='fixed_arrival_offset' if source_clock == 'hardware_clock' else 'device_wall',
@@ -67,13 +95,13 @@ class RgbdCameraPublisher:
         from sensor_msgs.msg import CompressedImage
         self.Message = CompressedImage
         self.root = f'/{namespace}/camera/rgbd'
-        self.frame_id = f'{namespace}_depth_optical'
+        self.frame_id = f'{namespace}_rgb_optical'
         self.clock_id = 'realsense_capture/' + uuid.uuid4().hex
         self.scale = pipeline.get_active_profile().get_device().first_depth_sensor().get_depth_scale()
         if type(self.scale) not in (int, float) or not math.isfinite(self.scale) or not 0 < self.scale < .1:
             raise ValueError('invalid SDK depth scale')
         import pyrealsense2 as rs
-        self.align_to_depth = rs.align(rs.stream.depth)
+        self.align_to_color = rs.align(rs.stream.color)
         self.pubs = {kind: node.create_publisher(CompressedImage, topic, qos)
                      for kind, topic in (('color', f'/{namespace}/camera/color'),
                                          ('depth', f'/{namespace}/camera/depth'))}
@@ -154,7 +182,7 @@ class RgbdCameraPublisher:
         if self.ready or str(error) != self.last_error:
             # These failures cannot be repaired by another frame from the
             # negotiated source. Do not hold a startup request for ten seconds.
-            terminal = ('intrinsics', 'distortion', '640x480', 'calibration changed',
+            terminal = ('intrinsics', 'distortion', '640x480', 'calibration',
                         'pixel geometry', 'clock reset or domain changed')
             self.report(dict(ready=False, camera_info=[], error=str(error)[:300],
                              retryable=not any(reason in str(error) for reason in terminal),
@@ -168,17 +196,28 @@ class RgbdCameraPublisher:
         if self.last_emit is not None and now - self.last_emit < self.min_interval_s:
             return
         sources = [source_frames.get_color_frame(), source_frames.get_depth_frame()]
-        aligned_frames = self.align_to_depth.process(source_frames)
+        if not all(sources):
+            raise ValueError('incomplete source RGB-D frameset')
+        intr = sources[0].profile.as_video_stream_profile().intrinsics
+        depth_intr = sources[1].profile.as_video_stream_profile().intrinsics
+        # SSE/NEON SDK paths can silently ignore nonzero Brown coefficients.
+        if any(np.any(np.asarray(i.coeffs) != 0) for i in (intr, depth_intr)):
+            raise ValueError('unsupported source distortion for SDK depth-to-color alignment')
+        aligned_frames = self.align_to_color.process(source_frames)
         color, depth = aligned_frames.get_color_frame(), aligned_frames.get_depth_frame()
         if not all((*sources, color, depth)):
             raise ValueError('incomplete source RGB-D frameset')
-        intr = depth.profile.as_video_stream_profile().intrinsics
-        signature = (intr.width, intr.height, intr.fx, intr.fy, intr.ppx, intr.ppy,
-                     str(intr.model), tuple(intr.coeffs))
+        try:
+            extrinsics = sources[1].profile.get_extrinsics_to(sources[0].profile)
+        except Exception as error:
+            raise ValueError('RGB-D depth-to-color calibration unavailable') from error
+        signature = tuple((i.width, i.height, i.fx, i.fy, i.ppx, i.ppy,
+                           str(i.model), tuple(i.coeffs)) for i in (intr, depth_intr)) + (
+                               tuple(extrinsics.rotation), tuple(extrinsics.translation))
         if self.signature != signature:
             if self.signature is not None:
                 raise ValueError('RGB-D calibration changed; restart camera')
-            self.geometry = make_geometry(intr)
+            self.geometry = color_depth_geometry(intr, extrinsics)
             self.signature = signature
         rgb, z16 = np.asanyarray(color.get_data()), np.asanyarray(depth.get_data())
         if rgb.shape != (480, 640, 3) or z16.shape != (480, 640) or z16.dtype.kind != 'u' or z16.dtype.itemsize != 2:
@@ -189,8 +228,9 @@ class RgbdCameraPublisher:
         g = self.geometry
         rectified = cv2.remap(rgb, g['map_x'], g['map_y'], cv2.INTER_LINEAR)
         measured = cv2.remap(z16, g['map_x'], g['map_y'], cv2.INTER_NEAREST)
-        metric = np.rint(measured.astype(np.float64) * (self.scale * 1000.))
-        metric[(metric < 1) | (metric > 65535)] = 0
+        metric = np.rint((measured.astype(np.float64) * self.scale * g['depth_z_scale'] +
+                         g['depth_z_offset']) * 1000.)
+        metric[(measured == 0) | (metric < 1) | (metric > 65535)] = 0
         ok, jpeg = cv2.imencode('.jpg', rectified, [cv2.IMWRITE_JPEG_QUALITY, 90])
         if not ok:
             raise ValueError('RGB-D JPEG encoding failed')

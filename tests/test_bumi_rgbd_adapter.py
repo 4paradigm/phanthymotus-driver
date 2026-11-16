@@ -24,7 +24,9 @@ def frame(ms, pixels, intr=None, domain='hardware_clock'):
     return NS(get_timestamp=lambda: ms, get_frame_number=lambda: int(ms),
               get_frame_timestamp_domain=lambda: 'timestamp_domain.' + domain,
               get_data=lambda: pixels,
-              profile=NS(as_video_stream_profile=lambda: NS(intrinsics=intr or intrinsics())))
+              profile=NS(as_video_stream_profile=lambda: NS(intrinsics=intr or intrinsics()),
+                         get_extrinsics_to=lambda target:NS(
+                             rotation=[1.,0.,0.,0.,1.,0.,0.,0.,1.], translation=[0.,0.,0.])))
 
 
 def frames(ms=1000., intr=None, domain='hardware_clock'):
@@ -45,7 +47,7 @@ def source(monkeypatch):
         first_depth_sensor=lambda: NS(get_depth_scale=lambda: .002))))
     notices = []
     monkeypatch.setitem(sys.modules, 'pyrealsense2', NS(
-        stream=NS(depth='depth'), align=lambda target: NS(process=lambda frames: frames)))
+        stream=NS(depth='depth', color='color'), align=lambda target: NS(process=lambda frames: frames)))
     monkeypatch.setitem(sys.modules, 'common.camera_mount', NS(BodyMountSource=lambda *args, **kwargs: Mount()))
     publisher = rgbd.RgbdCameraPublisher(node, 'robot', pipeline, object(), report=notices.append)
     monkeypatch.setattr(rgbd.time, 'time_ns', lambda: 10_000_000_000)
@@ -64,7 +66,7 @@ def test_source_scales_measured_depth_and_keeps_distinct_capture_headers(source)
     depth = messages['/robot/camera/depth'][0]
     assert stamp(color) == 10_000_000_000
     assert stamp(depth) == 10_010_000_000
-    assert color.header.frame_id == depth.header.frame_id == 'robot_depth_optical'
+    assert color.header.frame_id == depth.header.frame_id == 'robot_rgb_optical'
     decoded = np.frombuffer(zlib.decompress(depth.data), '<u2').reshape(480, 640)
     assert decoded[240, 320] == 1000
     assert notices[-1]['ready'] is True
@@ -119,17 +121,14 @@ def test_source_declarations_are_accepted_by_generic_perception_contract(source,
         assert sample['vendor']['motus_slam']['stamp_ns'] == capture_ns
     finally:
         sys.path[:] = old_path
-    assert accepted['frame_id'] == 'robot_depth_optical'
+    assert accepted['frame_id'] == 'robot_rgb_optical'
     assert accepted['K'].tolist() == [[600., 0., 320.], [0., 601., 240.], [0., 0., 1.]]
     assert all(d['vendor']['clock_mapping_verified'] is False for d in declarations)
 
 
-def test_distorted_color_and_registered_depth_use_the_same_rectified_rays():
-    geometry = rgbd.make_geometry(intrinsics(model='brown_conrady', coeffs=[.2, 0., 0., 0., 0.]))
-    # At x=.5, y=0 the original distorted image has x=.525.
-    assert geometry['map_x'][240, 620] == pytest.approx(635., abs=.001)
-    assert geometry['map_y'][240, 620] == pytest.approx(240.)
-    assert geometry['K'] == [600., 0., 320., 0., 601., 240., 0., 0., 1.]
+def test_nonzero_brown_is_not_advertised_as_supported_sdk_registration():
+    with pytest.raises(ValueError, match='distortion'):
+        rgbd.make_geometry(intrinsics(model='brown_conrady', coeffs=[.2, 0., 0., 0., 0.]))
 
 
 @pytest.mark.parametrize('change,reason', [
@@ -210,7 +209,7 @@ def test_original_depth_card_returns_live_declaration_only(monkeypatch):
     plugin._proc = NS(poll=lambda: None)
     declarations = rgbd.camera_declarations('/robot/camera/rgbd',
         dict(K=[600., 0., 320., 0., 601., 240., 0., 0., 1.]),
-        'robot_depth_optical', 'test_clock', 'global_time', 0)
+        'robot_rgb_optical', 'test_clock', 'global_time', 0)
     plugin._rgbd_status = dict(ready=True, camera_info=declarations, error=None, activations=dict(plugin._activations))
     result = plugin.dispatch('info', {'_tool_name': 'depth'})
     assert result['sourceReady'] is True and 'error' not in result
@@ -226,18 +225,18 @@ def test_original_depth_card_returns_live_declaration_only(monkeypatch):
 def test_rectified_pair_samples_registered_color_and_depth_together(source):
     import cv2
     publisher, messages, _ = source
-    pair = frames(intr=intrinsics(model='brown_conrady', coeffs=[.2, 0., 0., 0., 0.]))
+    pair = frames()
     color_pixels = pair.get_color_frame().get_data()
     color_pixels[:] = 0
-    color_pixels[:, 630:] = 200
+    color_pixels[:, 600:] = 200
     depth_pixels = pair.get_depth_frame().get_data()
     depth_pixels[:] = np.arange(640, dtype='<u2')[None, :]
     publisher.publish(pair)
     rectified = cv2.imdecode(np.frombuffer(messages['/robot/camera/color'][0].data, np.uint8), cv2.IMREAD_COLOR)
     depth = np.frombuffer(zlib.decompress(messages['/robot/camera/depth'][0].data), '<u2').reshape(480, 640)
     assert int(rectified[240, 620, 0]) == pytest.approx(200, abs=3)
-    assert depth[240, 620] == 1270  # nearest source column 635, SDK scale 2 mm
-    assert depth[240, 639] == 0     # source ray falls beyond the sensor image
+    assert depth[240, 620] == 1240  # original source column 620, SDK scale 2 mm
+    assert depth[240, 639] == 1278  # right edge samples a valid native-color ray
 
 
 def test_capture_failure_after_recovery_clears_source_readiness(capture, monkeypatch):
@@ -259,14 +258,14 @@ def test_capture_failure_after_recovery_clears_source_readiness(capture, monkeyp
     assert calls == ['invalid capture', 'invalid capture']
 
 
-def test_native_depth_geometry_controls_the_computation_pair(source):
+def test_native_color_geometry_controls_the_computation_pair(source):
     publisher, messages, notices = source
     pair = frames()
-    pair.get_depth_frame().profile = NS(as_video_stream_profile=lambda: NS(
+    pair.get_color_frame().profile = NS(as_video_stream_profile=lambda: NS(
         intrinsics=intrinsics(fx=610., fy=611.)))
     publisher.publish(pair)
     assert notices[-1]['camera_info'][0]['K'] == [610., 0., 320., 0., 611., 240., 0., 0., 1.]
-    assert messages['/robot/camera/depth'][0].header.frame_id == 'robot_depth_optical'
+    assert messages['/robot/camera/depth'][0].header.frame_id == 'robot_rgb_optical'
 
 
 
@@ -281,7 +280,7 @@ class Mount:
         return True
     def declaration(self):
         return dict(schema='motus.camera_mount/1', topic='/robot/camera/rgbd/body_mount',
-                    parent_frame='base_link', child_frame='robot_depth_optical', status='available',
+                    parent_frame='base_link', child_frame='robot_rgb_optical', status='available',
                     source='tf', version='capture_tf_v1', epoch='test-epoch', mode='dynamic',
                     length_unit='m', transform_direction='body_from_camera',
                     reason=None, accuracy_validated=False)
@@ -325,7 +324,7 @@ def test_bumi_mount_constructor_uses_existing_node_optical_frame_and_mapped_cloc
     if override is None: monkeypatch.delenv('CAMERA_BODY_FRAME', raising=False)
     else: monkeypatch.setenv('CAMERA_BODY_FRAME', override)
     monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(CompressedImage=NS))
-    monkeypatch.setitem(sys.modules, 'pyrealsense2', NS(stream=NS(depth='depth'), align=lambda _: NS()))
+    monkeypatch.setitem(sys.modules, 'pyrealsense2', NS(stream=NS(depth='depth', color='color'), align=lambda _: NS()))
     calls = []
     monkeypatch.setitem(sys.modules, 'common.camera_mount', NS(
         BodyMountSource=lambda node, root, **kwargs: calls.append((node, root, kwargs)) or Mount()))
@@ -336,7 +335,7 @@ def test_bumi_mount_constructor_uses_existing_node_optical_frame_and_mapped_cloc
     actual_node, root, args = calls[0]
     assert actual_node is node and root == '/robot/camera/rgbd'
     assert args['body_frame'] == expected
-    assert args['camera_frame']() == 'robot_depth_optical'
+    assert args['camera_frame']() == 'robot_rgb_optical'
     publisher.clocks[0].domain = 'hardware_clock'
     assert args['clock_id']() == publisher.clock_id + '/hardware_clock'
 
@@ -447,7 +446,7 @@ def test_bumi_capture_mount_produces_body_pose_with_real_pr371_consumer(
         assert body['stamp_ns'] == selected
         assert body['child_frame_id'] == 'base_link'
         assert body['position'] == pytest.approx([-.2, .1, -.3])
-        assert sample['pose']['child_frame_id'] == 'robot_depth_optical'
+        assert sample['pose']['child_frame_id'] == 'robot_rgb_optical'
     finally:
         publisher.close()
 
@@ -459,7 +458,7 @@ def test_bumi_real_provider_uses_mapped_depth_time_and_missing_tf_keeps_pairs(so
                          publisher.frame_id, lambda: publisher.clock_id + '/' + publisher.clocks[0].domain, events)
     publisher.body_mount = mount
     publisher.publish(frames())
-    assert events[0] == ('lookup', 'base_link', 'robot_depth_optical', 10_010_000_000)
+    assert events[0] == ('lookup', 'base_link', 'robot_rgb_optical', 10_010_000_000)
     assert events[1][1]['status'] == 'available'
     assert events[1][1]['matrix'][0][3] == .2
     assert events[1][1]['clock_id'] == publisher.clock_id + '/hardware_clock'
@@ -612,7 +611,7 @@ def test_cold_card_start_waits_for_asynchronous_calibrated_metadata(monkeypatch,
     device, plugin = cold_camera(monkeypatch)
     declarations = rgbd.camera_declarations('/robot/camera/rgbd',
         dict(K=[600., 0., 320., 0., 601., 240., 0., 0., 1.]),
-        'robot_depth_optical', 'fresh-clock', 'hardware_clock', 9_000_000_000)
+        'robot_rgb_optical', 'fresh-clock', 'hardware_clock', 9_000_000_000)
     def ready():
         with plugin._intrinsics_lock:
             plugin._rgbd_status = dict(ready=True, camera_info=declarations, error=None, activations=dict(plugin._activations))

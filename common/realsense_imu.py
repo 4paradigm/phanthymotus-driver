@@ -54,7 +54,7 @@ def factory_rotation(profile, depth_profile, *, extrinsics=None):
     values = list(extrinsics.rotation)
     if len(values) != 9 or not all(math.isfinite(v) for v in values):
         raise ValueError('invalid factory motion rotation')
-    # rs2_extrinsics.rotation is column-major, R_DEPTH_MOTION.
+    # rs2_extrinsics.rotation is column-major, R_CAMERA_MOTION.
     r = [[float(values[3*j+i]) for j in range(3)] for i in range(3)]
     if any(abs(sum(r[k][i]*r[k][j] for k in range(3)) - (i == j)) > 1e-4
            for i in range(3) for j in range(3)):
@@ -78,7 +78,7 @@ class MotionSource:
         self.translations = {}
         self.translation_reason = 'waiting for factory motion translation'
 
-    def configure(self, active):
+    def configure(self, active, *, camera_stream=None):
         with self.lock:
             self.configured = False
             self.translations = {}
@@ -89,9 +89,9 @@ class MotionSource:
             self.reason = 'waiting for paired motion captures'
             self.epoch = uuid.uuid4().hex
             profiles = {kind: active.get_stream(kind) for kind in (self.rs.stream.gyro, self.rs.stream.accel)}
-            depth = active.get_stream(self.rs.stream.depth)
-            extrinsics = {kind: p.get_extrinsics_to(depth) for kind, p in profiles.items()}
-            self.rotations = {kind: factory_rotation(p, depth, extrinsics=extrinsics[kind])
+            camera = active.get_stream(self.rs.stream.depth if camera_stream is None else camera_stream)
+            extrinsics = {kind: p.get_extrinsics_to(camera) for kind, p in profiles.items()}
+            self.rotations = {kind: factory_rotation(p, camera, extrinsics=extrinsics[kind])
                               for kind, p in profiles.items()}
             try:
                 translations = {kind: list(value.translation) for kind, value in extrinsics.items()}

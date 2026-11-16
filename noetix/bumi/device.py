@@ -2410,7 +2410,7 @@ def _camera_subprocess(namespace: str):
                 enabled_cards = new_cards
                 if 'imu' in restarted and imu.configured:
                     try:
-                        imu.configure(active)  # fresh epoch, no held accel
+                        imu.configure(active, camera_stream=rs.stream.color)  # fresh epoch, no held accel
                     except Exception as exc:
                         imu.unavailable(exc)
                 if restarted & {'camera', 'depth'}:
@@ -2445,7 +2445,7 @@ def _camera_subprocess(namespace: str):
         imu.clock_mapping = dict(method='fixed_arrival_offset' if domain == 'hardware_clock' else 'device_wall',
                                  source_clock=domain, offset_ns=rgbd_inputs.clocks[0].offset, verified=False)
         return stamp
-    imu = MotionSource(f'/{namespace}/camera/rgbd/imu', f'{namespace}_depth_optical', rs,
+    imu = MotionSource(f'/{namespace}/camera/rgbd/imu', f'{namespace}_rgb_optical', rs,
                        map_motion, publish_imu,
                        clock_id=lambda: rgbd_inputs.clock_id + '/' + rgbd_inputs.clocks[0].domain)
     capture = CaptureQueue(imu)
@@ -2474,7 +2474,7 @@ def _camera_subprocess(namespace: str):
                 imu.unavailable(imu_error)
             else:
                 try:
-                    imu.configure(active)
+                    imu.configure(active, camera_stream=rs.stream.color)
                 except Exception as exc:
                     imu.unavailable(exc)
     except Exception as e:
@@ -2483,7 +2483,7 @@ def _camera_subprocess(namespace: str):
         return
 
     # Only the optional legacy RTAB-Map raw branch uses the color grid.
-    # Public color and depth share the rectified native-depth optical frame.
+    # Public color and depth share the rectified native-color optical frame.
     align_to_color = rs.align(rs.stream.color) if os.environ.get("BUMI_VISUAL_ODOMETRY") == "1" else None
     print(f"[camera_subprocess] publishing color→{color_topic} normalized depth→{depth_topic}", flush=True)
 
@@ -2791,7 +2791,7 @@ class CameraPlugin:
                      **{k: v for k, v in self._card_info(name).items()
                         if k in ('topic_out', 'camera_info', 'body_mount_status')})
                 for name, description in (
-                    ('camera', 'Bumi sole calibrated RGB for display, capture and computation in the native depth optical frame.'),
+                    ('camera', 'Bumi sole calibrated RGB for display, capture and computation in the native color optical frame.'),
                     ('depth', 'Bumi sole calibrated 640x480 uint16 millimetre depth, with mapped capture time.'))]
 
     def start(self) -> None:

@@ -195,19 +195,23 @@ sudo systemctl start noetix-video-capture.service
   `camera_imu`：`/<namespace>/camera/rgbd/imu`（`sensor/imu`，可选）。
   两者来源、坐标和格式不同，不得互相替代。
 
-深度复用已经验证的计算几何：将颜色对齐到原生深度光学坐标，再把颜色和深度一起校正到
-640×480 针孔射线。**RGB 展示、照片和录像的视角随之改为校正后的原生深度镜头平面，
-颜色未覆盖的边缘可能为空白。** 按像素取深度的检测/VO 使用同一个 `camera/color` 输出。
+RGB 保留原彩色相机视场，深度通过真实 SDK 标定投影到彩色像素，再一起校正到
+640×480 针孔射线。SDK 配准保留的是原深度相机 Z，发布前按实际旋转、平移和采样射线
+换算为彩色相机光学 Z；不把原 Z 简单改名。RGB 不再依赖深度有效区域，因此视场边缘和
+深度空洞不会被配准填黑；不裁切原 RGB 视场。
+当前 SDK 配准路径要求两路真实畸变系数为零（该设备读到的标定满足此条件）；非零畸变明确拒绝，
+避免优化版 SDK 忽略畸变后仍宣称已配准。
+按像素取深度的检测/VO 使用同一个 `camera/color` 输出。
 `camera` 和 `depth` 各自仅声明实际输出话题；配对两路的 `K`、相机 `id`、光学帧和时钟身份一致。
 只声明真实采集验证后的参数；等待相机或参数无效时两张卡均为 `camera_info=[]`、
 `sourceReady=false`，不回退到原生 RGB 或手册 FOV。
 
 RGB 和深度保留 30 Hz 采集发布配置、队列深度 1、BEST_EFFORT；每帧各仅编码/发布一次。
 `format="16UC1; compressedDepth zlib"`，载荷是 zlib 压缩的 640×480 小端 uint16 毫米，
-按真实 SDK `depth_scale` 四舍五入；0 为无效，超出 65535 mm 置 0。
+先用真实 SDK `depth_scale` 和 depth-to-color 外参换算光学 Z，再四舍五入；0 为无效，超出 65535 mm 置 0。
 没有 `/<namespace>/camera/rgbd/color` 或 `/<namespace>/camera/rgbd/depth` 发布者。
 每路 header 保留各自采集时刻，两路光学帧均为
-`<namespace>_depth_optical`。硬件时钟仅使用一次到达偏移估计，声明保留
+`<namespace>_rgb_optical`。硬件时钟仅使用一次到达偏移估计，声明保留
 `clock_mapping=fixed_arrival_offset`、`clock_mapping_verified=false` 和真实偏移/域；
 不声称曝光同步、精确硬件时间或导航/身体坐标精度。无效内参、尺寸、单位、时钟跳变或过大
 时差会暂停共享 RGB 和深度（展示、拍照和录像也受影响）；绝不在相同话题回退到另一种几何或到达时间戳。
@@ -535,16 +539,21 @@ remaining `camera` output; update saved topic selectors from `/camera/rgbd/color
 to `/camera/color` with the configured namespace. Optional camera IMU
 availability remains separate and does not block calibrated images.
 
-One existing RealSense pipeline aligns color into the native depth optical
-frame and rectifies both images on the same 640x480 rays. The original display
-color remains available; its pixels differ from the registered pair. Depth
-normalization and compression happen once on the original depth topic.
+One existing RealSense pipeline preserves the native RGB field and aligns
+measured depth into its grid. Both outputs use the same rectified 640x480 color
+rays. SDK alignment retains depth-camera Z, so the producer converts it to
+color-camera Z with the actual depth-to-color rotation/translation before
+millimetre normalization. Invalid source depth stays zero without blacking out
+RGB. The SDK route requires measured zero-distortion source profiles; nonzero
+coefficients are explicitly rejected because optimized SDK paths may ignore
+unsupported distortion models. No native RGB field is cropped.
+Depth normalization and compression happen once on the original depth topic.
 
 The output headers preserve separate source capture times through the existing
 clock mapping. A hardware clock uses one fixed arrival-derived offset; its
 source domain and offset are disclosed and `clock_mapping_verified` is false.
-No publication-time fallback is emitted on these computation topics. Unsupported
-nonzero inverse/modified Brown distortion, invalid calibration/scale, capture
+No publication-time fallback is emitted on these computation topics. Nonzero
+source distortion, invalid calibration/scale, capture
 clock discontinuity or excessive skew makes the source unavailable with an
 error; the shared depth display pauses too, while native color remains available. No body mount is assumed, and
 neither physical accuracy nor hardware performance has been validated.
@@ -552,7 +561,7 @@ neither physical accuracy nor hardware performance has been validated.
 The same owner optionally publishes `/bumi/camera/rgbd/imu` (`sensor/imu`), a
 `motus.imu/1` JSON packet over ROS `std_msgs/String`. Connect it only when IMU
 assistance is enabled on the receiving card. It carries raw SDK gyro/accel,
-factory motion-to-depth rotations, capture-generation identity and exactly the
+factory motion-to-color rotations/translations, capture-generation identity and exactly the
 RGB-D clock ID and fixed offset. The approximate mapping is marked unverified.
 `imu_status` reports motion availability separately. Motion profiles are
 actually discovered; no device model is assumed to include an IMU. Supported
@@ -563,7 +572,7 @@ invented. Hardware motion/callback acceptance remains pending.
 
 ### Capture-time body-camera TF
 
-The paired RGB/depth declarations advertise the `/{namespace}/camera/rgbd/body_mount` sidecar automatically, without adding a second output to the depth card. Both camera declarations carry the same `vendor.body_mount`; Perception discovers this topic automatically, so no card matrix is required. The existing camera ROS node queries `base_link <- {namespace}_depth_optical` at the original mapped capture timestamp selected by pinned RTAB-Map and Perception PR371: the later image in double-precision seconds, depth on a tie, retaining the selected integer nanoseconds. It publishes `motus.camera_mount/1` JSON before the matching images without rewriting either image header. `CAMERA_BODY_FRAME` overrides only the body frame name. Dynamic joint transforms are looked up for every capture.
+The paired RGB/depth declarations advertise the `/{namespace}/camera/rgbd/body_mount` sidecar automatically, without adding a second output to the depth card. Both camera declarations carry the same `vendor.body_mount`; Perception discovers this topic automatically, so no card matrix is required. The existing camera ROS node queries `base_link <- {namespace}_rgb_optical` at the original mapped capture timestamp selected by pinned RTAB-Map and Perception PR371: the later image in double-precision seconds, depth on a tie, retaining the selected integer nanoseconds. It publishes `motus.camera_mount/1` JSON before the matching images without rewriting either image header. `CAMERA_BODY_FRAME` overrides only the body frame name. Dynamic joint transforms are looked up for every capture.
 
 `body_mount_status` exposes the selected frames and availability independently of RGB-D readiness. Missing TF packages, frames, capture-time transforms or publisher failures preserve video, RGB-D and IMU. The driver never substitutes SDK internal extrinsics, a URDF guess, identity or latest TF. The node remains in its existing ROS domain 42; installed TF domain, real optical calibration chain, timing and accuracy still require hardware acceptance. Bumi already includes `tf2_ros` through its existing RTAB-Map dependency; the build import guard now checks its Buffer and TransformListener APIs. No image was built or deployed for this change. Main odometry stays camera referenced; available evidence supports only a separately named derived body pose.
 
@@ -651,7 +660,7 @@ No camera-to-body matrix or guessed calibration is introduced by this wiring.
 Connect `/<ns>/camera/color` and `/<ns>/camera/depth` to the generic
 `rgbd_odometry` card. Also connect the depth port to `pointcloud`, then connect
 the metric cloud and generic RGB-D odometry outputs to `pointcloud_slam`.
-Both outputs refer to the same depth optical frame; no camera-to-body matrix
+Both outputs refer to the same color optical frame; no camera-to-body matrix
 is needed for this route. The resulting pose describes the camera, not the
 robot body. Gyro-only chassis odometry cannot replace the RGB-D pose input.
 Camera IMU assistance is optional and requires the camera IMU port with its SDK calibration and shared capture clock.
@@ -666,3 +675,13 @@ change invalidates the epoch and requires restarting the camera source.
 Toggling a card does not authorize reuse of the old mapping. Existing skew,
 freshness and fusion limits are unchanged. Hardware stability and motion
 accuracy still require validation on Bumi.
+
+### RGB field migration
+
+The single public topic names and port order are unchanged. The optical reference
+is now `<namespace>_rgb_optical` rather than `<namespace>_depth_optical`; RGB-D VO,
+Point Cloud and SLAM must restart with the new live declarations after updating
+the driver. Start a new mapping session rather than joining old depth-frame
+poses to color-frame clouds. Saved maps keep their original coordinates. Camera
+IMU factory extrinsics and the optional body-TF lookup target the color optical
+frame; the legacy bundle-local VO raw branch is unchanged.
