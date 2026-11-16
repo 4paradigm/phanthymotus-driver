@@ -124,3 +124,55 @@ def test_pointcloud_card_rearms_after_stop_without_remaking_subscriptions(plugin
     assert plugin.dispatch('start', {})['state'] == 'running'
     assert calls == ['start', 'stop', 'start']
     assert plugin.dispatch('info', {})['topic_out'][0]['format'] == 'sensor/pointcloud'
+
+
+@pytest.mark.parametrize('sidecar_order', ['before', 'after', 'absent'])
+def test_native_output_routes_through_core_and_maps_without_sidecar_dependency(
+        plugin_class, monkeypatch, sidecar_order):
+    import importlib.util
+    companion = BASE.parents[2] / 'pr371-current-review'
+    if not (companion / 'agent-core/src/api/slam_metadata.py').exists():
+        pytest.skip('companion PR371 checkout is not present')
+    monkeypatch.syspath_prepend(str(companion / 'perception'))
+    from plugins.pointcloud_slam_input import resolve_inputs
+    from plugins.pointcloud_slam_stream import SlamStream
+    from plugins.pointcloud_normalization import decode_cloud
+    from slam_pointcloud import native_cloud_evidence, frame_declaration
+
+    spec = importlib.util.spec_from_file_location(
+        'tianyi_companion_routing', companion / 'agent-core/src/api/slam_metadata.py')
+    routing = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(routing)
+    msg = native_cloud()
+    source = object.__new__(plugin_class)
+    source._topic, source._format = '/display', 'sensor/pointcloud'
+    source._native_topic, source._native_metadata_topic = '/native', '/metadata'
+    source._native_evidence = native_cloud_evidence(msg)
+    source._native_forwarded, source._native_error = 1, None
+    pose_declaration = dict(schema='motus.slam_input/1', topic='/odom', format='state/odom')
+    connections = [dict(fromCardId='camera', fromPortIdx='1', fromTopic='/native'),
+                   dict(fromCardId='pose', fromPortIdx='0', fromTopic='/odom')]
+    infos = dict(camera=source._native_info(), pose=dict(
+        topic_out=[dict(topic='/odom', format='state/odom')], input_metadata=[pose_declaration]))
+    selected = routing.collect_slam_inputs(connections, infos, lambda c: c['fromTopic'])
+    assert selected['input_bindings'] == {'/native': 'sensor/pointcloud2', '/odom': 'state/odom'}
+    contract = resolve_inputs(selected['input_metadata'], selected['input_bindings'])
+    accepted = []
+    stream = SlamStream(**contract['settings'], max_gap_ms=1, max_age_s=1,
+                        max_pending=4, max_cloud_points=10, input_contract=contract,
+                        on_frame=lambda *args: accepted.append(args))
+    sample = dict(schema='motus.odom/1', stamp_ms=8000,
+                  pose=dict(position=[0., 0., 0.], quaternion=[0., 0., 0., 1.]),
+                  vendor=dict(motus_slam=dict(stamp_ns=8_000_000_023)))
+    stream.odom(sample, now=100)
+    packet = frame_declaration(source._native_evidence, 'test-generation')
+    if sidecar_order == 'before':
+        stream.cloud_metadata(packet, now=100)
+    stamp, frame, points = decode_cloud(msg, max_points=10)
+    stream.cloud(stamp, frame, points, now=100)
+    assert len(accepted) == 1  # Never waits for the diagnostic sidecar.
+    if sidecar_order == 'after':
+        stream.cloud_metadata(packet, now=101)
+    assert len(accepted) == 1  # Later diagnostics do not replay the cloud.
+    assert accepted[0][0] == 8_000_000_023
+    assert accepted[0][1].tolist() == [[1., 2., 3.]]

@@ -2451,8 +2451,9 @@ class PointCloudPlugin:
     def _forward_native(self, msg):
         """Cross Domain 0 -> 42 while preserving the original PointCloud2.
 
-        Both topics use bounded BEST_EFFORT queues. Any missed sidecar is
-        discarded by the strict consumer, not paired with another frame.
+        Both topics use bounded BEST_EFFORT queues with no cross-topic ordering
+        guarantee. PR371 consumes the numeric cloud independently; this sidecar
+        supplies optional diagnostics, not an admission prerequisite.
         """
         if time.monotonic() - self._native_last < 1.0 / self._native_hz:
             return

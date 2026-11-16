@@ -40,7 +40,7 @@ def test_original_byte_layout_header_stamp_and_digest_are_preserved():
     assert sidecar['mapping']['verified'] is False
 
 
-def test_static_declaration_explicitly_cannot_admit_native_cloud_for_slam():
+def test_static_declaration_discloses_unknown_timing_without_claiming_calibration():
     claim = module.input_declaration('/tianyi/native', '/tianyi/native/metadata',
                                      {'frame_id': 'head_camera_optical'})
     assert claim['format'] == 'sensor/pointcloud2'

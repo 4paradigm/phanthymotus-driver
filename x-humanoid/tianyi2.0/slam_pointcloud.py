@@ -54,7 +54,7 @@ def native_cloud_evidence(msg, *, max_bytes=12_000_000):
 
 
 def input_declaration(topic, metadata_topic, snapshot=None):
-    """Unverified source declaration: strictly NOT admissible for SLAM."""
+    """Native wire declaration; physical alignment remains provider-owned."""
     snapshot = snapshot or {}
     return {
         'schema': 'motus.slam_input/1',

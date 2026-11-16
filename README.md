@@ -151,6 +151,26 @@ The Agent Core Web Dashboard renders live data streams based on the `format` fie
 | `state/odom` | Text / KV panel | `motus.odom/1` — what the robot reports about its own motion |
 | `control/velocity` | Text / KV panel | `motus.control/1` `twist` — a command stream **into** a driver |
 
+### Spatial computation ports
+
+PR371 adds computation formats alongside the display renderers above:
+
+| Format | ROS transport | Consumer |
+| --- | --- | --- |
+| `sensor/pointcloud2` | Native `sensor_msgs/msg/PointCloud2` | Perception `pointcloud_slam`; declared in `topic_out` and routed by Core canvas connections |
+| `sensor/imu` | `std_msgs/msg/String`, `motus.imu/1` JSON | Perception `rgbd_odometry` assistance |
+| `state/extrinsic` | JSON transform sidecar | Consumer-discovered numeric transform input |
+
+`sensor/pointcloud` uses the packed display payload; it cannot name native
+PointCloud2 bytes. Keep both ports when a driver supplies display and computation
+clouds. A computation port need not have a dedicated dashboard renderer.
+
+The companion's [spatial input standard](https://github.com/Nidhogg2002/phanthymotus/blob/feat/pointcloud-slam-offline-eval/perception/docs/spatial-inputs.md)
+defines numeric-format admission. Live static cloud/pose mapping does not depend
+on provenance sidecar arrival or delivery. BEST_EFFORT topics have no cross-topic
+ordering guarantee; sidecars provide optional diagnostics. Explicit dynamic
+mounting still needs its numeric matrix. Providers own physical alignment.
+
 ### Skeleton Rendering (`sensor/skeleton`)
 
 For robot state monitoring, declare `"format": "sensor/skeleton"` in `topic_out`. The dashboard will:

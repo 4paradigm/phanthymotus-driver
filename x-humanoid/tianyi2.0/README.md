@@ -1185,3 +1185,25 @@ transforms still produce explicit unavailable packets. The change adds Python
 source only and no shared binary dependencies. Offline coverage includes delayed
 TF, stop during the wait, timeout without held-transform reuse, and repeated
 start/stop before a first camera frame.
+
+
+### Native cloud consumer compatibility
+
+The Point Cloud card keeps its packed `sensor/pointcloud` display port and
+separately advertises native `sensor/pointcloud2` on `/NS/camera/head/points_native`.
+The latter is a computation port supported by Core and Perception PR371, not a
+second packed display stream. See the repository's spatial computation formats.
+
+`/points_native/metadata` carries diagnostic source headers and payload hashes.
+Both topics are BEST_EFFORT; no cross-topic order or delivery is promised.
+PR371's static numeric input path accepts the cloud before, after or without
+that sidecar. It does not require provenance proof or a sidecar retry protocol.
+Physical pose/cloud timing and mounting remain provider responsibilities; raw
+Orbbec output is not thereby certified to match chassis odometry. Explicit
+dynamic mounting needs an actual numeric matrix. The RGB-D camera-reference
+route uses its paired depth-derived cloud and camera pose.
+
+Current PR371 accepts source/read/receipt integer timestamps and descriptive
+metadata under its [format-only policy](https://github.com/Nidhogg2002/phanthymotus/blob/feat/pointcloud-slam-offline-eval/perception/docs/spatial-inputs.md).
+Older capture-identity and freshness requirements described in historical
+validation notes are not current consumer admission requirements.
