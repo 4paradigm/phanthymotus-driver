@@ -256,12 +256,14 @@ def test_busy_bus_does_not_block_motion(tmp_path):
 
 def test_card_matches_l20_schema_and_snapshot(monkeypatch):
     stale = time.monotonic() - 5
-    # Thumb: 5 drawn cells at/above the default Tip threshold 10, one just below,
-    # and a strong value in the undrawn tail that Tip must ignore.
+    # A value above 255 contributes to the raw mean. The tail is ignored.
     light = [0] * 96
     light[0:5] = [10, 50, 120, 200, 300]
     light[5], light[80] = 9, 255
-    rounds = [{"thumb": (light, time.monotonic())}, {"index": TimeoutError("timeout")},
+    saturated = [65535] * 72 + [0] * 24
+    sample_time = time.monotonic()
+    rounds = [{"thumb": (light, sample_time), "middle": (saturated, sample_time)},
+              {"index": TimeoutError("timeout")},
               {"thumb": (cells(1), stale)}, RuntimeError("bus gone")]
     hand = FakeHand(rounds)
     monkeypatch.setattr(modbus_device.MultiHandPlugin, "read_tactile",
@@ -285,15 +287,16 @@ def test_card_matches_l20_schema_and_snapshot(monkeypatch):
     first = call("get_state")
     assert first["state"] == "ok" and first["serial_port"] == "/dev/left"
     assert first["scalar_valid"] and first["matrix_valid"] and first["matrix_fresh"]
-    # Tip counts drawn cells >= tip_cell_threshold, so it is independent of Peak.
     assert first["model"] == "l20_lite"
-    assert first["touch_scalar"]["thumb"] == 5 and first["touch_scalar"]["index"] == 72
-    assert all(isinstance(v, int) and 0 <= v <= 72 for v in first["touch_scalar"].values())
+    assert first["touch_scalar"]["thumb"] == 10  # Raw sum 689 / 72, rounded.
+    assert first["touch_scalar"]["index"] == round(sum(cells(2)[:72]) / 72)
+    assert first["touch_scalar"]["middle"] == 255
+    assert first["touch_cells"]["middle"] == saturated
     assert first["touch_sum"]["index"] == sum(cells(2))
     # All 96 cells are published, including the 24 the 12x6 renderer omits.
     assert first["cell_count"] == 96
     assert first["touch_cells"]["thumb"] == light and first["touch_cells"]["index"] == cells(2)
-    # 16-bit cells above 255 are clipped in the drawn matrix only.
+    # The display matrix clips each cell independently of the mean.
     assert first["touch_matrix"]["index"][1] == cells(2)[6:12]  # all under 255
     assert first["touch_matrix"]["thumb"][0] == [10, 50, 120, 200, 255, 9]
     assert len(first["touch_matrix"]["thumb"]) == 12
@@ -344,8 +347,7 @@ def test_invalid_binding_is_rejected(side):
 
 
 @pytest.mark.parametrize("config", [{"poll_hz": 20}, {"contact_threshold": 0}, {"contact_threshold": 256},
-                                    {"auto_start": "yes"}, {"tip_cell_threshold": 0},
-                                    {"tip_cell_threshold": 256}])
+                                    {"auto_start": "yes"}])
 def test_invalid_config_is_rejected(config):
     with pytest.raises(ValueError):
         lite_tactile.LiteTactilePlugin(FakeHand(), config, {"side": "right"})

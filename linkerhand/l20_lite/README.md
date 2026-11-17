@@ -193,11 +193,10 @@ shared `poll_hz` settings, and the same JSON fields. The differences:
 - `serial_port` replaces `can_channel`, and there is no CAN interface setting.
 - The Lite has no separate fingertip sensor: reg 1 is a constant `0xC6`
   command echo and cells 72–95 stayed 0 while each fingertip was pressed.
-  `touch_scalar` (the card's "Tip") is therefore the number of the 72 drawn
-  cells at or above `tip_cell_threshold`, i.e. how many heat-map points are
-  clearly pressed (0–72). It filters light noise and is independent of
-  Peak, which Core computes as the strongest cell. The vendor app's "normal
-  force" (raw sum of all 96 cells) is published separately as `touch_sum`,
+  `touch_scalar` (the card's "Tip") is the average of the first 72 raw
+  pressure readings, including zeros. The mean is rounded to the nearest
+  integer and capped at 255 for the renderer. Peak is the strongest cell in
+  the display matrix. The raw sum of all 96 cells is published as `touch_sum`,
   and `model` is `l20_lite`.
 - `touch_matrix` is the first 72 cells, drawn as 12×6 row-major like the host
   app. Each cell is clipped to 255 to match the L20 0–255 matrix schema, and
@@ -222,8 +221,7 @@ shared `poll_hz` settings, and the same JSON fields. The differences:
 | `tactile_timeout_s` | `1.0` | Budget for one five-finger round, including waiting for the bus |
 | `matrix_timeout_s` | `0.25` | Compatibility only (matrix shares the scalar reply) |
 | `stale_after_s` | `1.0` | Age after which scalar/matrix readings are invalid |
-| `contact_threshold` | `8` | Tip count (1–255) at or above which contact is true |
-| `tip_cell_threshold` | `10` | Raw cell value (1–255) a heat-map point must reach to count toward Tip; idle cells read 0–3 |
+| `contact_threshold` | `8` | Average pressure (1–255) at or above which the scalar indicates contact |
 | `select_settle_s` | `0.0` | Delay between finger select and read (hidden; host app uses 0.03) |
 
 The card shares the hand cards' serial bus lock and takes it one finger at a

@@ -23,8 +23,6 @@ plugins:
     matrix_timeout_s: 0.25
     stale_after_s: 1.0
     contact_threshold: 8
-    # Tip = number of 12x6 cells at or above this raw value (idle cells read 0–3).
-    tip_cell_threshold: 10
   hand_gesture:
     enabled: true
     motion_speed: 85

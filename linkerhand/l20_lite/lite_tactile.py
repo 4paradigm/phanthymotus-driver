@@ -2,7 +2,7 @@
 
 Mirrors the L20 ``hand_tactile`` card, but reads over the USB-RS485 Modbus
 link shared with the hand card (the Lite has no CAN bus):
-1. 5-finger Tip: count of matrix cells above a threshold (vendor raw sum as touch_sum)
+1. 5-finger Tip: mean pressure across the 72 displayed cells (raw sum as touch_sum)
 2. 5-finger 12x6 tactile matrix taxel arrays (first 72 cells, row-major)
 3. All 96 raw cells per finger as ``touch_cells`` (not drawn by Core)
 4. Freshness/error metadata and contact flags (no calibrated force claims)
@@ -79,10 +79,6 @@ class LiteTactilePlugin:
         self.contact_threshold = self.config.get("contact_threshold", 8)
         if isinstance(self.contact_threshold, bool) or not isinstance(self.contact_threshold, int) or not 1 <= self.contact_threshold <= 255:
             raise ValueError("contact_threshold 必须是 1–255 之间的整数")
-        # Idle cells read 0–3; a deliberate press reaches 100+.
-        self.tip_cell_threshold = self.config.get("tip_cell_threshold", 10)
-        if isinstance(self.tip_cell_threshold, bool) or not isinstance(self.tip_cell_threshold, int) or not 1 <= self.tip_cell_threshold <= 255:
-            raise ValueError("tip_cell_threshold 必须是 1–255 之间的整数")
         self.auto_start = self.config.get("auto_start", True)
         self.matrix_enabled = self.config.get("matrix_enabled", True)
         if not isinstance(self.auto_start, bool) or not isinstance(self.matrix_enabled, bool):
@@ -277,12 +273,12 @@ class LiteTactilePlugin:
                        for name in FINGER_NAMES):
                     raise ValueError(f"本轮五指压力不是完整的 {TACTILE_CELL_COUNT} 点数据")
                 read_at = {name: results[name][1] for name in FINGER_NAMES}
-                # The Lite has no separate tip sensor (cells 72–95 stay 0 when
-                # pressed). Tip is the number of drawn cells at or above
-                # tip_cell_threshold, so it measures contact area, not Peak.
-                # The vendor app's "normal force" (raw sum) is touch_sum.
-                touch_scalar = {name: sum(v >= self.tip_cell_threshold for v in cells[name][:MATRIX_CELLS])
-                                for name in FINGER_NAMES}
+                # Average the raw 12x6 pressure cells, then round and cap
+                # the scalar for the Core renderer's 0–255 integer scale.
+                touch_scalar = {
+                    name: min(255, (sum(cells[name][:MATRIX_CELLS]) + MATRIX_CELLS // 2) // MATRIX_CELLS)
+                    for name in FINGER_NAMES
+                }
                 touch_sum = {name: sum(cells[name]) for name in FINGER_NAMES}
                 # Core draws only the 12x6 touch_matrix; keep the full reply here.
                 touch_cells = {name: list(cells[name]) for name in FINGER_NAMES}
