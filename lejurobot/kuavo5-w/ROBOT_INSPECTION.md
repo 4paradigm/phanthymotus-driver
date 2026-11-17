@@ -447,3 +447,25 @@ host helper 的首次安装仍需现场管理员执行一次，详见 README。
   开机监管服务enabled/active、complete；原轮臂roslaunch PID 254548、启动时间未改变。
 - 228项离线测试、部署checker和diff检查通过。arm/leg硬件核验限位仍未配置，
   move_joints继续拒绝；完整冷启动、真实位移/关节运动及物理停止仍待验收。
+
+## 追加：移除switch_mode并确认BaseArm初始化（2026-11-17）
+
+- 按操作人员要求彻底移除公开switch_mode插件、元数据、默认配置及日志卡名。
+  旧配置即使保留enabled=true也不会恢复注册或调用入口；旧画布中的该卡应删除。
+  五张运动执行卡继续提供stop_move及中断hook，控制诊断移入任一执行卡的info.feedback。
+- 新开机初始化路径只在收到请求之后、新鲜且严格为整数3的BaseArm反馈后才进入暂停阶段；
+  其他模式、陈旧反馈或服务受理不算完成。状态记录initial_control_mode=3。
+  厂商版本63已固定执行BaseArm，因此不另发无效的ArmOnly/BaseOnly切换请求。
+- 已将controller_boot.py更新到下位机固定安装目录，SHA-256为
+  5658a842337f4c2d5afdabb8e015dfbac83b6775d61eebde7ce072f9d7da8a20，保留旧文件备份。
+  未重启当前监管或轮臂程序，新初始化条件将在下次开机生效；当前只读接管历史的
+  initial_control_mode为null，不能伪造其曾观察到初始化帧，运动前仍读取实时模式。
+- 现场候选kuavo5w:local-basearm-261117，ID 21c1a2e9e1a5，737261437字节，
+  在上一候选上仅覆盖代码/配置/元数据，未新增依赖。仅删除现场配置中的switch_mode条目，
+  其余操作配置及只读挂载不变。
+- 实际MCP tools/list仅15张卡、无switch_mode，直接调用旧卡返回-32601 Unknown tool。
+  loco.info保留控制/机型/开机/宿主服务诊断；从暂停直接提交0.1秒零速度动作成功，
+  自动恢复并确认mode=3，随后stop_move确认False。最终无未决控制或发送不确定，20关节valid。
+- 228项离线测试及部署checker通过；移除旧UI模式参数测试，保留内部控制抢占、迟到响应、
+  停止保护测试，并新增BaseArm开机确认及旧配置不能恢复已删除卡片的回归检查。
+  本轮未做冷启动、位移或关节运动验收，硬件核验关节限位仍待配置。

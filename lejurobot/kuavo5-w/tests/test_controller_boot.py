@@ -58,6 +58,20 @@ class ControllerBootTests(unittest.TestCase):
         self.assertEqual(self.requests, ['initialize', 'pause'])
         self.assertTrue(self.sequence.status()['boot_pause_confirmed'])
         self.assertFalse(self.sequence.status()['auto_resume'])
+        self.assertEqual(self.sequence.status()['initial_control_mode'], 3)
+
+    def test_initialization_requires_observed_base_arm_before_pause(self):
+        self.sequence.tick(10, self.sample)
+        self.accept()
+        for mode in (None, False, 0, 1, 2, 4, 3.0):
+            self.sequence.tick(10.1, {**self.sample, 'is_ready': 1, 'mode': mode,
+                                     'mode_at': 10.1, 'raw_at': 10.1})
+            self.assertEqual(self.requests, ['initialize'])
+            self.assertIsNone(self.sequence.status()['initial_control_mode'])
+        self.sequence.tick(10.2, {**self.sample, 'is_ready': 1, 'mode': 3,
+                                 'mode_at': 10.2, 'raw_at': 10.2})
+        self.assertEqual(self.requests, ['initialize', 'pause'])
+        self.assertEqual(self.sequence.status()['initial_control_mode'], 3)
 
     def test_old_or_stale_mode_cannot_complete_initialization(self):
         self.sequence.tick(10, self.sample)

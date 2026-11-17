@@ -79,7 +79,7 @@ sudo python3 host/install.py --user leju_kuavo \
 
 安装器准备现场配置（保留已有值，仅补充缺失的外设插件），安装固定用途 systemd 服务。
 驱动启动后每5秒通过 `127.0.0.1:15748/ensure` 请求确保 rosbridge、只读电池转发器运行；
-它们异常退出由 systemd 重启。`switch_mode.get_current_mode` 的 `feedback.host_runtime` 报告检查状态。
+它们异常退出由 systemd 重启。`loco.info` 的 `feedback.host_runtime` 报告检查状态。
 容器不需要宿主机 sudo、SSH 密码、Docker socket 或特权权限。
 头部 RGB/深度卡在 `start` 缺帧时分别请求 `/ensure/head`、`/ensure/depth`，确保固定相机和相应 relay 服务运行。
 助手仅能启动 rosbridge、电池 relay 及已安装的固定头部 RGB/深度服务，不接受命令或 unit 参数；仅监听 loopback，拒绝浏览器 Origin 和非本机 Host。
@@ -118,14 +118,16 @@ sudo python3 host/install_controller.py \
 正常下次开机，服务等待厂商H12服务建立ROS master，确认没有已有控制器后启动
 `ROBOT_VERSION=63 roslaunch humanoid_controllers load_kuavo_real_wheel.launch joystick_type:=h12 start_way:=auto`。
 核实机型、关节、服务来源后仅调用一次 `/humanoid_controller/real_initial_start`；
-等待请求终态及之后的新鲜MPC反馈，再请求 `/enable_control(false)`，确认新收到的false后才报告complete。
+等待请求终态及之后的新鲜BaseArm反馈（mode=3），再请求 `/enable_control(false)`，确认新收到的false后才报告complete。
 初始化超时保留请求，不重发；失败不假报就绪。控制进程故障不自动重启，也不调用enable=true。
 服务自有进程退出后需要现场检查再手动处理，不能用自动重启掩盖急停或硬件故障。
 
 确认下位机服务正常后，在上位机现场配置设 `host_runtime.controller_boot_required: true`，
 驱动的运动、resume和模式切换会等待开机流程确认；pause始终允许尝试。
-`switch_mode.get_current_mode.feedback.controller_boot` 展示结果；
+`loco.info.feedback.controller_boot` 展示结果；
 `boot_pause_confirmed` 仅代表开机流程曾确认暂停，当前使能仍以独立 `control_enabled` 反馈为准。
+新启动初始化路径记录 `initial_control_mode: 3`；只读接管已暂停的外部程序时未观察到该历史帧则为null，
+不伪造初始化模式，运动前仍等待实时模式反馈。
 开机状态超过3秒未更新会阻止运动；一旦发现开机服务，本次驱动会话即使重连也保留该要求。
 兼容旧手动部署，随包配置默认false；不应在已使用开机服务的现场关闭检查绕过故障。
 
@@ -212,15 +214,15 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 ```
 
 下位机已显式安装的开机服务负责初始化后暂停；驱动容器本身不创建硬件控制进程。
-普通执行动作会按需恢复控制并选择兼容MPC模式，无需先执行 `switch_mode.resume/set_mode`。
+普通执行动作会按需恢复控制并确认兼容MPC模式，已移除对外的 `switch_mode` 卡。
 `motion_enabled` 默认 `true`，未配置该字段时也默认开启；双臂/下肢关节动作还必须配置现场核验的限位，见下节。
 该开关仅允许处理运动请求，后台检查、读取传感器、卡片start/info不会触发恢复或发运动目标；原有运行时检查仍生效。
 如需只读运行，可在实际加载的配置文件中设置 `motion_enabled: false` 并重启驱动；此时拒绝运动、
 恢复控制及模式切换，仍允许状态/传感器/模型读取、软件暂停和 `stop_move`。该字段必须是 YAML 布尔值。
-`switch_mode.get_current_mode.feedback.motion_enabled` 与执行卡 `info.motion_enabled` 可确认当前配置。
+`loco.info.feedback.motion_enabled` 与执行卡 `info.motion_enabled` 可确认当前配置。
 机器人必须处于允许运动的状态，且收到本次 WebSocket 连接内的控制状态和新鲜模式反馈后才接受运动指令。
 启动和重连后，独立线程经 rosapi 探测机型、robot_version、自由度、SHM 参数及 `/humanoid_description`。
-必须确认 wheel-arm=1、下肢4、双臂14、头2后才能运动；探测失败时可通过 `switch_mode.get_current_mode.feedback.robot_discovery` 查原因。
+必须确认 wheel-arm=1、下肢4、双臂14、头2后才能运动；探测失败时可通过 `loco.info.feedback.robot_discovery` 查原因。
 参数缺失不回退到 SDK 的双足默认配置。后台探测在每轮结束约1s后重新读取完整身份参数和 URDF；
 成功读取的身份有效期为3s，从该轮读取开始计时，慢查询不会在完成时伪造新租约。
 查询失败、身份过期或模型/限位绑定变化会拒绝/终止相关动作，不依赖 WebSocket 重连；
@@ -237,7 +239,6 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 | `leg` | `move_joints`、`stop_move` | `/lb_leg_traj` |
 | `waist` | `set_pose`、`stop_move` | `/cmd_lb_torso_pose` |
 | `head` | `move`、`stop_move` | `/cmd_head_vel` |
-| `switch_mode` | `pause`、`resume`、`set_mode`、`get_current_mode` | `/enable_control`、`/mobile_manipulator_mpc_control` 及状态话题 |
 | `joints` | 系统 `start`、`stop`、`info` | 两路：`sensor/skeleton` 骨架姿态 + `data/json` 原始 joint_state |
 | `imu` | 系统 `start`、`stop`、`info` | 同一原始消息的 IMU；`data/json` |
 | `loco_state` | 系统 `start`、`stop`、`info` | 两路：map/odom 位置、角度、速度 JSON + 独立 `state/odom` / `motus.odom/1` |
@@ -247,12 +248,11 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 业务参数通过 `x-action-params` 分组并声明动作各自的 required；`dispatch()` 返回普通 dict，HTTP 层只包装一次 MCP content。
 `config.yaml` 的 `plugins.<card>.enabled` 决定卡片是否暴露。
 
-`switch_mode` 操作全身轮臂 MPC，不是独立底盘导航模式，也不会启动控制栈。
-它保留为高级诊断及手动干预入口，不是正常操作的前置卡片：开启智能控制后直接执行loco/arm等动作即可。
-`set_mode` 的0–4选项同时显示编号和名称，兼容画布下拉框传来的精确数字字符串，
-发送给 ROS 服务时仍为整数。`resume`/`set_mode` 需要真实机型参数及控制反馈；
-`controller_not_ready` 表示这些前提缺失，不能通过填入默认参数绕过。
-`pause` 不依赖机型探测，仍会尝试零速、取消在途动作及请求暂停；若控制服务/反馈缺失，
+初始化流程等待实际BaseArm反馈（mode=3），再进入软件暂停；新的运动动作自动恢复控制。
+不提供单独的模式切换/恢复卡，底盘、手臂等执行卡的 `stop_move` 和中断 hook 仍会全身软件暂停。
+诊断通过任一执行卡的系统 `info.feedback` 读取，例如 `loco.info`；旧画布中的switch_mode卡应删除。
+`controller_not_ready` 表示控制器前提缺失，不能通过填入默认参数绕过。
+`stop_move` 不依赖机型探测，仍会尝试零速、取消在途动作及请求暂停；若控制服务/反馈缺失，
 返回 `physical_stop_confirmed: false`，不能假报暂停成功。查询返回的 `state: ready` 仅表示查询成功。
 
 左右/头部 RGB、头部深度、电池、二维雷达点云已适配；尚未提供 `mic`、`speaker`、`controlled_spatial` 卡片。
@@ -303,7 +303,7 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 ```
 
 不要对 `rosparam get` 的 YAML 输出计算指纹。配置需重启加载；可用性及核验记录引用在
-`switch_mode.get_current_mode.feedback.robot_discovery.joint_limits` 查看。运行时模型指纹或配置身份不匹配时不允许关节动作。
+`loco.info.feedback.robot_discovery.joint_limits` 查看。运行时模型指纹或配置身份不匹配时不允许关节动作。
 
 模式：0=NoControl（被动）、1=ArmOnly、2=BaseOnly、3=BaseArm、4=ArmEeOnly。
 底盘要求模式2/3；双臂关节要求1/3；末端允许1/3/4。下肢、躯干和头部要求非0模式。
@@ -311,7 +311,7 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 当前模式兼容且反馈新鲜时不重复切换；不兼容或NoControl时选择3=BaseArm，兼顾底盘和双臂。
 现场版本63的厂商实现实际固定执行并发布BaseArm：模式服务虽会接受其他编号，
 但不会改变实际运行模式。该机器正常动作直接沿用反馈中的BaseArm，不依赖切换到ArmOnly/BaseOnly；
-手动请求其他模式时仍会因缺少对应反馈而报错，不把服务受理冒充生效。
+驱动不暴露这些无效的手动模式操作，也不把服务受理冒充生效。
 恢复后也会重新核实模式；失败或被停止打断时不发送原运动目标，并尝试软件暂停。
 执行结果 `control_preparation` 报告是否恢复、是否改变模式及最终模式。
 这不是绕过检查的强制恢复：开机未确认、反馈过期、目标越界、发送不确定或旧控制请求未结清仍会拒绝。
@@ -324,14 +324,14 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 结束后 POST `${AGENT_CORE_URL}/api/acp/complete`。资源分别为 `base`、`arm_l/arm_r`、`lower_body`、`head`；
 `leg` 与 `waist` 共享资源和驱动内部通道。同通道在途动作收到新命令会返回 busy，调用方应等待完成或显式停止。
 底盘速度/位姿也共享 busy 通道，避免位置指令被尚未过期的速度指令覆盖，或无效新参数误取消旧 ACP。
-`switch_mode` 不指定局部资源，采用 Agent Core 的全局互斥；其短状态转换按指南同步等待反馈。
+全局恢复/模式准备由驱动内部仲裁，不另行暴露执行卡；其短状态转换同步等待反馈。
 同为BaseArm时不同资源可并发；若改变全局模式需要影响其他在途动作，则返回busy，不能静默重置它们。
 每个暂停、恢复或模式服务分别使用最多2s的“受理+状态确认”总预算，而不是分别等待5s和2s；
 一个动作可能依次需要恢复、等待恢复后的MPC流、切换模式，最多三段各2s准备预算，准备阶段等待不持有发布锁。
 前台发令争用控制锁最多等待0.25s，未取得锁时明确返回 busy。反馈超时返回错误，要求查询状态后再决定，
 不自动重试或改为后台继续等待，确认期间重连也不能以新会话反馈证明旧请求成功。
 其中限时锁只适用于普通请求：控制服务采用“锁内验证并发送、锁外等待响应/状态”。
-`stop_move`/`switch_mode.pause` 不走0.25s busy 拒绝路径，会优先阻止运动、发送零速、取消 ACP，
+`stop_move`/中断hook 不走0.25s busy 拒绝路径，会优先阻止运动、发送零速、取消 ACP，
 并使此前恢复/模式切换的令牌失效，再发全身暂停请求。旧请求尚未发送时不会继续发送，
 已发送请求的迟到结果也不能解除本地运动阻塞。停止确认仍受网络和厂商服务是否受理的限制。
 本地取消/超时不等于 ROS 端取消：每个已发送的恢复请求还单独保留未决记录，
@@ -341,7 +341,7 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 即使旧恢复在该次 disable 等待期间才结清，该次停止仍不确认；调用方须在结清后显式再次暂停，
 使最终 disable 发送在旧恢复终态之后。不会自动重试控制服务或自动重新启用。
 
-`switch_mode.get_current_mode.feedback.remote_resume_unresolved` 暴露该状态；未结清时拒绝新恢复/模式切换。
+`loco.info.feedback.remote_resume_unresolved` 暴露该状态；未结清时拒绝新恢复/模式切换。
 只保留至多一个未决恢复的响应句柄，超时/本地取消后仍能收到迟到响应；传输断开不是控制器拒绝，
 重连和新会话 False 不会消除旧请求的不确定性。无法取得旧请求终态或发生部分发送/断线时，
 需现场核实并处置控制器状态；重启驱动本身不证明远端请求已取消。
@@ -378,9 +378,9 @@ ACP 同样标记为时长/控制器超时推断。WebSocket发送成功仅代表
 必须现场核实并处置控制器遗留目标后再重启恢复，重启驱动本身不能证明旧目标已取消。
 
 执行卡系统 `start`/`stop` 是立即返回 `ready`/`idle` 的生命周期标记，不访问机器人或等待控制锁。
-`info` 和 `switch_mode.get_current_mode` 另行报告实际连接状态；生命周期 `ready` 不表示已连接或允许运动。
+`info` 另行报告实际连接状态和控制反馈；生命周期 `ready` 不表示已连接或允许运动。
 已接受的动作仍由驱动运行时和 ACP 跟踪，不因生命周期标记而丢失；需要停止运动时必须调用
-`stop_move`、`switch_mode.pause` 或触发执行卡的中断 hook。驱动退出时会清理在途动作。
+`stop_move` 或触发执行卡的中断 hook。驱动退出时会清理在途动作。
 
 `stop_move` 和中断操作会发底盘/头部零速度并请求 `/enable_control=false` **全身软件暂停**，
 以避免位置目标在零速度命令退出后继续执行；它们会影响其他部位并取消所有在途 ACP。
@@ -410,14 +410,14 @@ MCP 请求日志在所有 HTTP 连接间共享采样器，重复成功/失败请
 
 运动及恢复/模式切换要求有效租约和租约期内接收的使能状态；过期的 True 不能作为已启用依据，
 过期的 False 不能跳过暂停请求。恢复时验证未知则拒绝请求，等待只读检查，不擅自调用启用服务。
-`switch_mode.get_current_mode.feedback.enable_verification` 提供有效性、年龄、来源及错误。
+`loco.info.feedback.enable_verification` 提供有效性、年龄、来源及错误。
 ROS 图查询和 latch 重新投递是状态通路检查，不是带生产者时间戳的硬件心跳，也不证明物理静止；
 ROS master 缓存、具体 rosbridge 版本和真机控制器行为仍需现场核实。
 
 ## 传感输出与能力边界
 
 已移除公开 `state` 卡；控制安全检查的内部反馈订阅仍保留。
-诊断通过 `switch_mode.get_current_mode.feedback` 获取，包括连接、控制反馈、robot_discovery 和 host_runtime，
+诊断通过 `loco.info.feedback` 获取，包括连接、控制反馈、robot_discovery 和 host_runtime，
 不再发布原来无助于传感展示的 control 流。
 
 `joints/imu/loco_state` 按10Hz输出，battery/laser_scan按5Hz输出：
@@ -442,7 +442,7 @@ ROS master 缓存、具体 rosbridge 版本和真机控制器行为仍需现场�
 不依赖机器人在线或控制器启动。模型来源、固定版本和许可证见 [resource/README.md](resource/README.md)。
 该文件与现场版本63控制器使用的biped_s63一致，尚未独立核实实物尺寸及标定，不能用作控制模型。
 实时更新仍要求实测 q；真机 `/humanoid_description` 缺失，或其20个受测关节名称与本地模型不一致时，
-`joints` 输出 invalid、空关节数组和原因，静态 `model` 仍可读取。`switch_mode.get_current_mode.feedback` 中的
+`joints` 输出 invalid、空关节数组和原因，静态 `model` 仍可读取。`loco.info.feedback` 中的
 `robot_discovery.model_error` 表示运行时模型校验错误，`skeleton_model` 记录本地来源与名称校验状态。
 参考姿态不代表测得的 q=0。原始20关节不含底盘轮角/手指；这些不属于本卡的实测能力。
 
@@ -499,7 +499,7 @@ MCP 探测示例（只查询状态）：
 curl -s http://localhost:15747/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 curl -s http://localhost:15747/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"switch_mode","arguments":{"action":"get_current_mode"}}}'
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"loco","arguments":{"action":"info"}}}'
 ```
 
 真机仍需验证：

@@ -139,6 +139,8 @@ class RobotState:
                 'state': value['state'], 'boot_pause_confirmed': value['boot_pause_confirmed'],
                 'initialization_requested': value.get('initialization_requested') is True,
                 'initialization_accepted': value.get('initialization_accepted') is True,
+                'initial_control_mode': 3 if type(value.get('initial_control_mode')) is int
+                    and value['initial_control_mode'] == 3 else None,
                 'launch_ownership': value.get('launch_ownership') if value.get('launch_ownership')
                     in ('external', 'service') else None,
                 'error': _safe_log(value['error'], 100) if isinstance(value.get('error'), str) else None,
@@ -223,7 +225,7 @@ class RobotState:
         if time.monotonic() - seen > 2 or mode not in MODES or mode == 0:
             raise RuntimeError("MPC mode is missing, stale or NoControl")
         if allowed_modes and mode not in allowed_modes:
-            raise RuntimeError(f"current MPC mode {mode} does not support this action; set_mode explicitly")
+            raise RuntimeError(f"current MPC mode {mode} does not support this action; control preparation must confirm a compatible mode")
 
     def require_motion_enabled(self):
         self.require_boot_complete()
@@ -479,19 +481,19 @@ class _KuavoPlugin:
                 return {"state": "idle"}
             if action == "info":
                 return {"state": "ready" if self.ros1.connection[0] else "disconnected",
-                        "motion_enabled": self.state.motion_enabled}
+                        "motion_enabled": self.state.motion_enabled,
+                        "feedback": {**self.state.snapshot(),
+                                     "host_runtime": dict(self.bundle.startup_checks.status)}}
             # Control services wait outside the motion lock. Stops never take
             # the ordinary request's timed-lock/busy path.
             if action == 'stop_move':
                 return self.bundle.pause('stopped_by_request')
-            if self.PREFIX == 'switch_mode':
-                return self._dispatch(action, args)
             # Argument validation is local. Motion helpers reserve preparation,
             # wait for services outside the lock, then atomically recheck/send.
             return self._dispatch(action, args)
         except _UncertainMotionSend as exc:
-            # dispatch's finally has released the publication lock. Never
-            # hold that outer lock while waiting for a pause service response.
+            # start_motion has released the publication lock. Never
+            # hold it while waiting for a pause service response.
             stopped = self.bundle.pause(str(exc), status='error', expected=(exc.channel, exc.action_id))
             return {'state': 'error', 'error': str(exc), 'action_id': exc.action_id,
                     'command_delivery': 'uncertain', 'physical_stop_confirmed': False,
@@ -751,42 +753,6 @@ class HeadPlugin(_KuavoPlugin):
             self.bundle.zero_head, 0.3)
 
 
-class ControlPlugin(_KuavoPlugin):
-    PREFIX = "switch_mode"
-
-    def tool(self):
-        # No x-resource: global exclusivity is intentional for whole-body transitions.
-        return self.schema("Kuavo 5-W 高级诊断及手动暂停/模式管理；普通执行卡自动恢复并选择模式，无需先操作本卡。", {
-            "mode": {"type": "integer", "enum": list(MODES), "description": str(MODES),
-                     "oneOf": [{"const": value, "title": f"{value}: {name}"}
-                               for value, name in MODES.items()]}}, {
-            "pause": ([], "暂停全身，取消在途 ACP；不是硬件急停"),
-            "resume": ([], "恢复控制，保持冻结姿态，须重新发运动目标"),
-            "set_mode": (["mode"], "切换官方 MPC 模式；0 为被动 NoControl"),
-            "get_current_mode": ([], "读取最近控制反馈")}, stop="pause",
-            required={"set_mode": ["mode"]})
-
-    def _dispatch(self, action, args):
-        if action == "get_current_mode":
-            return {"state": "ready", "feedback": {
-                **self.state.snapshot(), "host_runtime": dict(self.bundle.startup_checks.status)}}
-        if action == "pause":
-            return self.bundle.pause("software_pause")
-        if action == "resume":
-            return self.bundle.resume()
-        if action == "set_mode":
-            mode = args.get("mode")
-            # Agent Core canvas enum <select> values arrive as strings even
-            # for integer schemas. Admit only the exact documented choices;
-            # do not truncate floats or coerce booleans into control modes.
-            if isinstance(mode, str) and mode in {str(value) for value in MODES}:
-                mode = int(mode)
-            if isinstance(mode, bool) or not isinstance(mode, int) or mode not in MODES:
-                raise ValueError("mode must be an integer from 0 to 4")
-            return self.bundle.set_mode(mode)
-        raise ValueError(f"unknown action: {action}")
-
-
 class KuavoBundle:
     def __init__(self, config, namespace, ros1, ros2_node, media_factory=None):
         motion_enabled = config.get("motion_enabled", True)
@@ -822,13 +788,13 @@ class KuavoBundle:
         self._remote_mode = None
         self._stop_epoch = 0
         self.plugins = [LocoPlugin(self), ArmPlugin(self), LowerBodyPlugin(self),
-                        LowerBodyPlugin(self, "waist"), HeadPlugin(self), ControlPlugin(self)]
+                        LowerBodyPlugin(self, "waist"), HeadPlugin(self)]
         self._enabled = {name for name, cfg in config.get("plugins", {}).items()
                          if cfg.get("enabled", True)} if "plugins" in config else {
-                             "loco", "arm", "leg", "waist", "head", "switch_mode", *SENSOR_CARDS, *PERIPHERAL_CARDS}
+                             "loco", "arm", "leg", "waist", "head", *SENSOR_CARDS, *PERIPHERAL_CARDS}
         aliases = {'camera_rgb': 'camera_left', 'camera_rgb_right': 'camera_right'}
-        self._enabled = {aliases.get(name, name) for name in self._enabled if name != 'state'}
-        self._auto_start = [aliases.get(name, name) for name in self._auto_start if name != 'state']
+        self._enabled = {aliases.get(name, name) for name in self._enabled if name not in ('state', 'switch_mode')}
+        self._auto_start = [aliases.get(name, name) for name in self._auto_start if name not in ('state', 'switch_mode')]
 
     def twist(self, topic, x=0.0, y=0.0, z=0.0, pitch=0.0, yaw=0.0):
         self.ros1.publish(topic, "geometry_msgs/Twist", {

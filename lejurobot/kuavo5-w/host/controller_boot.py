@@ -41,12 +41,14 @@ class BootSequence:
         self.initialization_requested = False
         self.initialization_accepted = False
         self.pause_confirmed = False
+        self.initial_mode = None
 
     def status(self):
         return {'state': self.state, 'error': self.error, 'robot_version': self.version,
                 'initialization_requested': self.initialization_requested,
                 'initialization_accepted': self.initialization_accepted,
                 'boot_pause_confirmed': self.pause_confirmed,
+                'initial_control_mode': self.initial_mode, 'operating_mode': 'BaseArm',
                 'launch_ownership': 'external' if self.existing else 'service',
                 'current_control_state': 'query_enable_control_state', 'auto_resume': False}
 
@@ -93,8 +95,9 @@ class BootSequence:
             mode_at = sample.get('mode_at', float('-inf'))
             if (not fresh_raw or sample.get('is_ready') != 1 or
                     mode_at < self.issued or not 0 <= now - mode_at <= 2 or
-                    type(sample.get('mode')) is not int or sample['mode'] not in range(5)):
+                    type(sample.get('mode')) is not int or sample['mode'] != 3):
                 return
+            self.initial_mode = 3  # Confirm actual BaseArm feedback, not service acceptance.
             self.issued, self.state, self.error = now, 'pausing', None
             self.pending = self.request('pause')
         elif (sample.get('enabled') is False and sample.get('enabled_at', float('-inf')) >= self.issued

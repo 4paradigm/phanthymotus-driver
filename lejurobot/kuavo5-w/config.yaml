@@ -33,7 +33,6 @@ plugins:
   leg: {enabled: true}
   waist: {enabled: true}
   head: {enabled: true}
-  switch_mode: {enabled: true}
   joints: {enabled: true}
   imu: {enabled: true}
   loco_state: {enabled: true}
