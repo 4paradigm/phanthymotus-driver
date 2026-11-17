@@ -834,14 +834,14 @@ class JointControlPlugin(FrankaPlugin):
 def build_plugins(config, namespace, ros2):
     from franka.fr3.camera import ExtCameraPlugin
     from franka.fr3.gripper import GripperPlugin
-    if os.environ.get("FRANKA_TELEOP_BACKEND") == "pnp_remote":
-        from franka.fr3.pnp_remote_teleop import PnpRemoteTeleopPlugin
-
-        return [PnpRemoteTeleopPlugin(), ExtCameraPlugin(
-            config.get("ext_camera", {}), namespace, ros2)]
     sensor = FrankaPlugin(config, namespace, ros2)
     controller = JointControlPlugin(config, namespace, ros2,
         manager=sensor._manager, discovery=sensor._discovery)
     gripper = GripperPlugin(config, namespace, ros2, discovery=sensor._discovery)
-    return [sensor, controller, gripper,
-            ExtCameraPlugin(config.get("ext_camera", {}), namespace, ros2)]
+    plugins = [sensor, controller, gripper,
+               ExtCameraPlugin(config.get("ext_camera", {}), namespace, ros2)]
+    if os.environ.get("FRANKA_TELEOP_BACKEND") == "pnp_remote":
+        from franka.fr3.pnp_remote_teleop import PnpRemoteTeleopPlugin
+
+        plugins.append(PnpRemoteTeleopPlugin())
+    return plugins
