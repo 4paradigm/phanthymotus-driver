@@ -13,6 +13,9 @@ unit=pnp-fr3-right-teleop.service
 vendor=${PNP_VENDOR_ROOT:-$HOME/frankateleop}
 conda_base=${PNP_CONDA_BASE:-$HOME/miniconda3}
 python="$conda_base/envs/polymetis/bin/python"
+export CONDA_PREFIX="$conda_base/envs/polymetis"
+export PATH="$CONDA_PREFIX/bin:$conda_base/bin:$PATH"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 state=$(systemctl show "$unit" -p ActiveState --value)
 case "$state" in inactive|failed) ;; *) echo "Stop $unit first" >&2; exit 1 ;; esac
 test -x "$python"
