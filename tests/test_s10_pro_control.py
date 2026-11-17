@@ -1737,8 +1737,8 @@ def test_loco_servo_defaults_to_dry_run_and_explicit_live_start_requires_permiss
     assert definition["inputSchema"]["x-resource"] == "base"
     assert definition["topic_in"][0]["format"] == "control/velocity"
     descriptor = build_descriptor()
-    assert descriptor["limits"]["lower"] == [-.3, -0.4, 0, 0, 0, -1.0]
-    assert descriptor["limits"]["upper"] == [.3, 0.4, 0, 0, 0, 1.0]
+    assert descriptor["limits"]["lower"] == [-.6, -0.4, 0, 0, 0, -1.0]
+    assert descriptor["limits"]["upper"] == [.6, 0.4, 0, 0, 0, 1.0]
     assert "groups" not in descriptor
     assert plugin.dispatch("info", {})["dry_run"] is True
     assert plugin.dispatch("unknown", {}) is None

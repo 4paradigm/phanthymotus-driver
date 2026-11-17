@@ -59,16 +59,16 @@ def test_default_start_and_restart_preserve_dry_run_without_native_calls(servo, 
     assert servo.native.transport_checks == 0
 
 
-@pytest.mark.parametrize('confirm', [None, False, 'true', 1])
+@pytest.mark.parametrize('confirm', [False, 'true', 1])
 @pytest.mark.parametrize('entry', ['start', 'config', 'streaming-config', 'saved-live-start'])
-def test_live_output_requires_literal_confirmation_before_any_native_setup(servo, confirm, entry):
+def test_explicit_cancel_or_invalid_confirmation_never_selects_live_control(servo, confirm, entry):
     p = servo.plugin
     if entry == 'saved-live-start':
         p = servo.module.S10LocoServoPlugin(servo.native, ros2=object(), config={'dry_run': False})
     if entry == 'streaming-config':
         assert p.dispatch('start', {'input_topic': '/policy/cmd'})['state'] == 'ready'
     before = p.dispatch('info', {})
-    args = {} if confirm is None else {'confirm': confirm}
+    args = {'confirm': confirm}
     try:
         if entry in {'start', 'saved-live-start'}:
             args['input_topic'] = '/policy/cmd'
@@ -88,7 +88,7 @@ def test_live_output_requires_literal_confirmation_before_any_native_setup(servo
 
 
 def test_speed_presets_change_forward_limit_without_scaling_yaw_or_raising_floor(servo):
-    for name, limit in [('slow', .15), ('normal', .3), ('fast', .5)]:
+    for name, limit in [('slow', .3), ('normal', .6), ('fast', 1.)]:
         assert servo.plugin.dispatch('config', {'speed_preset': name})['ok']
         info = servo.plugin.dispatch('info', {})
         assert info['speed_preset'] == name and info['vx_limit'] == limit
@@ -100,7 +100,7 @@ def test_speed_presets_change_forward_limit_without_scaling_yaw_or_raising_floor
 @pytest.mark.parametrize('settings', [
     {'speed_preset': 'turbo'}, {'linear_acceleration': 0},
     {'linear_acceleration': float('nan')}, {'angular_acceleration': True},
-    {'wz_limit': 1.01}, {'wz_limit': 0}, {'min_vx': .6},
+    {'wz_limit': 1.01}, {'wz_limit': 0}, {'min_vx': .61},
     {'rotate_only': 'false'}, {'unexpected': 1},
 ])
 def test_bad_settings_are_atomic_and_issue_no_commands(servo, settings):
@@ -133,14 +133,137 @@ def test_dry_run_counts_valid_commands_without_any_native_setup_or_velocity(serv
     assert servo.native.calls == []
 
 
-def test_confirmed_config_enables_live_output_in_an_existing_dry_run_stream(servo):
+@pytest.mark.parametrize('confirm', [None, True])
+def test_selecting_live_mode_in_a_dry_run_stream_waits_for_explicit_resume(servo, confirm):
     p = servo.plugin
     assert p.dispatch('start', {'input_topic': '/policy/cmd'})['state'] == 'ready'
-    assert p.dispatch('config', {'dry_run': False, 'confirm': True})['ok']
+    args = {'dry_run': False}
+    if confirm is not None:
+        args['confirm'] = confirm
+    assert p.dispatch('config', args)['ok']
+    info = p.dispatch('info', {})
+    assert info['state'] == 'paused' and info['dry_run'] is False
+    submit(p, command(p, [.1, 0, 0, 0, 0, 0]))
+    assert servo.native.calls == []
+    assert servo.native.transport_checks == 0
+    assert p.dispatch('resume', {})['state'] == 'running'
+    assert not any(servo.native.calls[0][2].values())
+    assert [call[2] for call in servo.native.calls[1:]] == [{'Mode': 1}, {'GaitParam': 0x3002}]
+    submit(p, command(p, [.1, 0, 0, 0, 0, 0]))
+    assert servo.native.calls[-1][2]['X'] == pytest.approx(.03)
+    assert p.dispatch('info', {})['dry_run'] is False
+
+
+@pytest.mark.parametrize('nested', [False, True])
+def test_canvas_saved_no_then_start_uses_live_mode_without_hidden_confirm(servo, nested):
+    p = servo.plugin
+    # Core restores instance config before start, without a confirm argument.
+    saved = {'dry_run': False, 'rotate_only': False, 'speed_preset': 'slow',
+             'min_vx': 0, 'linear_acceleration': .3, 'angular_acceleration': 2,
+             'wz_limit': 1}
+    body = {'config': saved} if nested else saved
+    result = p.dispatch('config', {**body, 'instance_id': 'card-test'})
+    assert result['ok'] and result['dry_run'] is False
+    assert servo.native.calls == []
+    assert p.dispatch('info', {})['state'] == 'idle'
+    for _ in range(2):
+        assert p.dispatch('start', {'input_topic': '/policy/cmd'})['state'] == 'ready'
+        assert p.dispatch('info', {})['vx_limit'] == .3
+        assert p.dispatch('info', {})['dry_run'] is False
+        submit(p, command(p, [.1, 0, 0, 0, 0, 0]))
+        assert servo.native.calls[-1][2]['X'] == pytest.approx(.03)
+        p.stop()
+
+
+def test_static_live_default_or_instance_id_alone_does_not_confirm_motion(servo):
+    p = servo.module.S10LocoServoPlugin(servo.native, ros2=object(), config={'dry_run': False})
+    try:
+        result = p.dispatch('start', {'input_topic': '/policy/cmd', 'instance_id': 'card-test'})
+        assert result['code'] == 'CONFIRM_REQUIRED'
+        assert servo.native.calls == []
+    finally:
+        p.stop()
+
+
+def test_explicit_live_start_uses_the_same_selection_as_canvas_no(servo):
+    p = servo.plugin
+    assert p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})['state'] == 'ready'
     assert [call[2] for call in servo.native.calls] == [{'Mode': 1}, {'GaitParam': 0x3002}]
     submit(p, command(p, [.1, 0, 0, 0, 0, 0]))
     assert servo.native.calls[-1][2]['X'] == pytest.approx(.03)
     assert p.dispatch('info', {})['dry_run'] is False
+
+
+@pytest.mark.parametrize('args,permission,code', [
+    ({'confirm': False}, '1', 'CONFIRM_REQUIRED'),
+    ({}, '0', 'MOTION_DISABLED'), ({}, 'true', 'INVALID_MOTION_PERMISSION'),
+])
+def test_pending_live_resume_rechecks_selection_and_deployment_permission(
+        servo, monkeypatch, args, permission, code):
+    p = servo.plugin
+    p.dispatch('start', {'input_topic': '/policy/cmd'})
+    assert p.dispatch('config', {'dry_run': False})['ok']
+    monkeypatch.setenv('S10_MOTION_ENABLED', permission)
+    result = p.dispatch('resume', args)
+    assert result['code'] == code and result['state'] == 'error'
+    assert p.dispatch('info', {})['state'] == 'paused'
+    before = len(servo.native.calls)
+    submit(p, command(p, [.1, 0, 0, 0, 0, 0]))
+    assert len(servo.native.calls) == before
+    assert all(call[1] == 0x00110002 and not any(call[2].values())
+               for call in servo.native.calls)
+    assert servo.native.transport_checks == 0
+
+
+def test_failed_live_resume_stays_paused_and_does_not_admit_velocity(servo, monkeypatch):
+    p = servo.plugin
+    p.dispatch('start', {'input_topic': '/policy/cmd'})
+    assert p.dispatch('config', {'dry_run': False})['ok']
+    send = servo.native.send
+    monkeypatch.setattr(servo.native, 'send', lambda *args: {'ErrorCode': 7})
+    try:
+        assert p.dispatch('resume', {})['state'] == 'error'
+        assert p.dispatch('info', {})['state'] == 'paused'
+        submit(p, command(p, [.1, 0, 0, 0, 0, 0]))
+        assert p.dispatch('info', {})['applied'] == 0
+    finally:
+        monkeypatch.setattr(servo.native, 'send', send)
+
+
+def test_resume_requires_acknowledged_zero_before_native_mode_setup(servo, monkeypatch):
+    p = servo.plugin
+    p.dispatch('start', {'input_topic': '/policy/cmd'})
+    assert p.dispatch('config', {'dry_run': False})['ok']
+    send, attempts = servo.native.send, []
+    def rejected(*args):
+        attempts.append(args)
+        return {'ErrorCode': 7}
+    monkeypatch.setattr(servo.native, 'send', rejected)
+    try:
+        assert p.dispatch('resume', {})['state'] == 'error'
+        info = p.dispatch('info', {})
+        assert info['state'] == 'paused' and info['stop_pending']
+        assert servo.native.transport_checks == 0
+        assert attempts and all(call[1] == 0x00110002 and not any(call[2].values())
+                                for call in attempts)
+    finally:
+        monkeypatch.setattr(servo.native, 'send', send)
+
+
+@pytest.mark.parametrize('preset,limit', [('slow', .3), ('normal', .6), ('fast', 1.)])
+@pytest.mark.parametrize('direction', [-1, 1])
+def test_s10_speed_tiers_enforce_limits_without_amplifying_small_commands(servo, preset, limit, direction):
+    p = servo.plugin
+    assert p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False,
+                               'speed_preset': preset, 'linear_acceleration': 20})['state'] == 'ready'
+    submit(p, command(p, [direction * .1, 0, 0, 0, 0, 0]))
+    assert servo.native.calls[-1][2]['X'] == pytest.approx(direction * .1)
+    submit(p, command(p, [direction * limit, 0, 0, 0, 0, 0], seq=2))
+    assert servo.native.calls[-1][2]['X'] == pytest.approx(direction * limit)
+    before = len(servo.native.calls)
+    submit(p, command(p, [direction * (limit + .01), 0, 0, 0, 0, 0], seq=3))
+    assert p.dispatch('info', {})['last_command']['verdict'] == 'REJECTED'
+    assert len(servo.native.calls) == before
 
 
 @pytest.mark.parametrize('source,priority,seq,reason', [

@@ -14,7 +14,10 @@ from domain_bridge import CoreSubscriber
 
 AXES = ["vx", "vy", "vz", "wx", "wy", "wz"]
 VX_LIMIT, VY_LIMIT, WZ_LIMIT = 1.67, 0.4, 1.0
-SPEED_PRESETS = {"slow": .15, "normal": .30, "fast": .50}
+# S10 Pro operating maximum: 2 m/s (https://www.deeprobotics.cn/products/detail/2.html).
+# Driver tiers use 15/30/50% of that maximum, below this SDK's 1.67 m/s cap.
+# These are command ceilings, not measured minimum stable chassis speeds.
+SPEED_PRESETS = {"slow": .30, "normal": .60, "fast": 1.00}
 DEFAULT_SETTINGS = {"dry_run": True, "rotate_only": False, "speed_preset": "normal",
                     "min_vx": 0., "linear_acceleration": .3,
                     "angular_acceleration": 2., "wz_limit": WZ_LIMIT}
@@ -105,6 +108,7 @@ class S10LocoServoPlugin:
         self._reader = None
         self._reader_stop = threading.Event()
         self._dry_run = self._settings["dry_run"]
+        self._live_selected = False
         self._barrier_ms = 0
         self._last_output = [0.] * 6
         self._dry_run_commands = 0
@@ -117,10 +121,10 @@ class S10LocoServoPlugin:
 
     def get_tool(self):
         properties = {
-            "dry_run": {"type": "boolean", "description": "空跑：检查、整形并计数，不切换厂家模式或发送速度。"},
+            "dry_run": {"type": "boolean", "description": "空跑：检查、整形并计数，不切换厂家模式或发送速度。选择 No 后，启动或恢复才进入实机控制；运行中切换会先暂停。"},
             "rotate_only": {"type": "boolean", "description": "只转不走：平移清零，保留转向。"},
             "speed_preset": {"type": "string", "enum": list(SPEED_PRESETS),
-                             "description": "前后速度上限：slow=0.15、normal=0.30、fast=0.50 m/s；不放大指令，不改变横移/转向上限。修改后重启 navi 读取新上限。"},
+                             "description": "山猫前后速度上限：slow=0.30、normal=0.60、fast=1.00 m/s，低于 SDK 1.67 m/s 上限；非实测最低速度，不放大指令，不改变横移/转向上限。修改后重启 navi 读取新上限。"},
             "min_vx": {"type": "number", "minimum": 0, "maximum": self._descriptor_raw["limits"]["upper"][0],
                        "description": "实测最小稳定前后速度，仅向规划器声明，不抬高执行速度；0 表示不声明。"},
             "linear_acceleration": {"type": "number", "exclusiveMinimum": 0,
@@ -135,10 +139,10 @@ class S10LocoServoPlugin:
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": ["start", "stop", "pause", "resume", "info", "config"]},
                     "input_topic": {"type": "string"}, "confirm": {"type": "boolean",
-                        "description": "实机启动或配置为非空跑时必须显式设为 true。"},
+                        "description": "可显式确认实机控制；卡片选择空跑 No 后启动/恢复也可确认。显式 false 会拒绝实机请求。"},
                     **copy.deepcopy(properties)}, "required": ["action"], "x-is-dangerous": True,
                     "x-action-params": {"start": {"params": ["input_topic", *properties, "confirm"]}, "stop": {"params": []},
-                        "pause": {"params": []}, "resume": {"params": []}, "info": {"params": []},
+                        "pause": {"params": []}, "resume": {"params": ["confirm"]}, "info": {"params": []},
                         "config": {"params": [*properties, "confirm"]}}, "x-resource": "base",
                     "x-hooks": {"on_interrupt_motion": {"action": "pause"},
                                 "on_interrupt_all": {"action": "pause"}}},
@@ -164,7 +168,7 @@ class S10LocoServoPlugin:
                 if action == "start": return self._start(args)
                 if action == "stop": return self._stop()
                 if action == "pause": return self._halt(True)
-                if action == "resume": return self._halt(False)
+                if action == "resume": return self._halt(False, args)
                 return self._configure(args)
         if action == "info":
             with self._lock:
@@ -192,9 +196,12 @@ class S10LocoServoPlugin:
                     if not valid or not enabled:
                         return {"ok": False, "code": "INVALID_MOTION_PERMISSION" if not valid else "MOTION_DISABLED",
                                 "message": "S10_MOTION_ENABLED must be 1 for real chassis control"}
-                    if args.get("confirm") is not True:
+                    if (("confirm" in args and args["confirm"] is not True)
+                            or not (args.get("confirm") is True or changes.get("dry_run") is False
+                                    or self._live_selected)):
                         return {"ok": False, "code": "CONFIRM_REQUIRED", "message": "real chassis control was not confirmed"}
                 if candidate == {**self._settings, "dry_run": self._dry_run}:
+                    self._live_selected = not candidate["dry_run"]
                     return {"ok": True, **candidate}
                 raw = build_descriptor(settings=candidate)
                 parsed = parse_descriptor(raw)
@@ -203,15 +210,19 @@ class S10LocoServoPlugin:
                         self._paused = True
                         raise RuntimeError("native stop unconfirmed; settings remain unchanged")
                     if self._running and self._dry_run and not candidate["dry_run"]:
-                        self._prepare_motion()
+                        # Saving settings must not activate an existing stream.
+                        # Only a subsequent start/resume enters native mode.
+                        self._paused = True
                 self._settings, self._dry_run = candidate, candidate["dry_run"]
+                self._live_selected = not self._dry_run
                 self._descriptor_raw, self._descriptor = raw, parsed
                 if self._running:
                     # Settings keep the twist layout fixed. The confirmed hold
                     # rebased velocity; retain admission and watchdog history.
                     self._sink.descriptor = parsed
                 self._barrier_ms = int(time.time() * 1000)
-                return {"ok": True, **candidate}
+                return {"ok": True, **candidate,
+                        "state": "paused" if self._paused else "running" if self._running else "idle"}
         except (ValueError, TypeError, RuntimeError, OSError) as exc:
             return {"ok": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
 
@@ -289,13 +300,24 @@ class S10LocoServoPlugin:
         if reader and reader is not threading.current_thread(): reader.join(timeout=1)
         return {"state": "idle"}
 
-    def _halt(self, paused):
+    def _halt(self, paused, args=None):
         with self._lock:
             if not self._running: return {"state": "idle"}
-            self._paused = bool(paused)
+            if not paused and not self._dry_run:
+                config = self._configure(args or {})
+                if not config.get("ok"):
+                    self._paused = True
+                    self._hold()
+                    return {**config, "state": "error"}
             if not self._hold():
                 self._paused = True
                 return {"state": "error", "message": "native stop unconfirmed; stream remains paused"}
+            if not paused and not self._dry_run and self._paused:
+                try:
+                    self._prepare_motion()
+                except Exception as exc:
+                    return {"state": "error", "message": f"恢复导航模式失败: {exc}"}
+            self._paused = bool(paused)
             self._barrier_ms = int(time.time() * 1000)
         return {"state": "paused" if paused else "running", "input": self._topic}
 
