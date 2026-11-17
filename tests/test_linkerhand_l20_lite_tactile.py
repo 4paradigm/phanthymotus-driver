@@ -39,6 +39,7 @@ class TactileSerial:
         self.selected = 0
         self.wrong_echo = False
         self.silent_fingers = set()
+        self.timeout = self.write_timeout = 0.5
 
     def reset_input_buffer(self):
         self.pending.clear()
@@ -115,7 +116,7 @@ def test_read_tactile_isolates_failed_finger_and_reuses_port(monkeypatch, tmp_pa
                         lambda *a, **k: L20LiteModbusClient(*a, **k, serial_factory=lambda **_: serial))
     hand = make_hand(response_timeout_s=0.05)
     discoveries = []
-    monkeypatch.setattr(hand, "_discover", lambda: discoveries.append(1) or {"right": str(port)})
+    monkeypatch.setattr(hand, "_discover", lambda **_: discoveries.append(1) or {"right": str(port)})
 
     for _ in range(2):
         used, results = hand.read_tactile("right", ["thumb", "index"], budget_s=1, settle_s=0)
@@ -252,6 +253,80 @@ def test_busy_bus_does_not_block_motion(tmp_path):
     finally:
         release.set()
         thread.join()
+
+
+def test_silent_fingers_share_round_deadline_and_restore_serial_timeouts(monkeypatch, tmp_path):
+    port = tmp_path / "ttyUSB0"
+    port.touch()
+    serial = TactileSerial()
+    serial.silent_fingers = set(range(1, 6))
+    now = 0.0
+
+    def sleep(delay):
+        nonlocal now
+        now += delay
+
+    read = serial.read
+
+    def timed_read(size):
+        if not serial.pending:
+            sleep(serial.timeout)
+        return read(size)
+
+    monkeypatch.setattr(serial, "read", timed_read)
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+    monkeypatch.setattr(time, "sleep", sleep)
+    monkeypatch.setattr(modbus_device, "L20LiteModbusClient",
+                        lambda *a, **k: L20LiteModbusClient(*a, **k, serial_factory=lambda **_: serial))
+    hand = make_hand(serial_port=str(port))
+    hand._legacy.connection.get()
+    hand._tactile_ports["right"] = str(port)
+    _, results = hand.read_tactile("right", FINGERS, budget_s=0.75, settle_s=0)
+
+    assert now == pytest.approx(0.75)
+    assert all(isinstance(results[finger], TimeoutError) for finger in FINGERS)
+    assert [frame[1] for frame in serial.sent] == [0x10, 0x04, 0x10, 0x04]
+    assert serial.timeout == serial.write_timeout == 0.5
+
+    serial.silent_fingers.clear()
+    _, results = hand.read_tactile("right", ["thumb"], budget_s=0.75, settle_s=0)
+    assert results["thumb"][0] == cells(1)
+    hand._legacy.connection.close()
+
+
+def test_tactile_discovery_does_not_probe_more_ports_after_deadline(monkeypatch, tmp_path):
+    first = tmp_path / "ttyUSB0"
+    second = tmp_path / "ttyUSB1"
+    first.touch()
+    second.touch()
+    now = 0.0
+    opened = []
+
+    class SilentSerial(TactileSerial):
+        def write(self, frame):
+            self.sent.append(frame)
+            return len(frame)
+
+        def read(self, size):
+            nonlocal now
+            now += self.timeout
+            return b""
+
+    def open_client(port, *args, **kwargs):
+        opened.append(port)
+        return L20LiteModbusClient(port, *args, **kwargs, serial_factory=SilentSerial)
+
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+    monkeypatch.setattr(modbus_device, "L20LiteModbusClient", open_client)
+    hand = make_hand(serial_port=str(first))
+    monkeypatch.setattr(hand, "_ports", lambda: [str(first), str(second)])
+
+    with pytest.raises(TimeoutError, match="触觉采集超时"):
+        hand.read_tactile("right", FINGERS, budget_s=0.2, settle_s=0)
+
+    assert now == pytest.approx(0.2)
+    assert opened == [str(first)]
+    assert "right" not in hand._tactile_retry_at
 
 
 def test_card_matches_l20_schema_and_snapshot(monkeypatch):

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from common.vendor_runtime import action_schema, tool
-from modbus_client import JOINT_COUNT, L20LiteModbusClient, _bytes
+from modbus_client import JOINT_COUNT, L20LiteModbusClient, _bytes, _remaining_time
 
 JOINT_NAMES = [
     "thumb_root", "thumb_sway", "index_root", "middle_root", "ring_root",
@@ -100,7 +100,7 @@ class L20LiteConnection:
             self._target = self._serial_port.client.for_side(target_side)
             return self._target
 
-    def detect_sides(self) -> list[str]:
+    def detect_sides(self, *, deadline: float | None = None) -> list[str]:
         """Probe only the two known slave IDs using read-only position frames."""
         with self._lock:
             client = self.get(self._client.side if self._client is not None else None)
@@ -108,10 +108,15 @@ class L20LiteConnection:
         try:
             for side in ("right", "left"):
                 try:
-                    client.probe_positions(side)
+                    client.probe_positions(side, deadline=deadline)
                 except TimeoutError:
+                    if deadline is not None:
+                        _remaining_time(deadline)
                     continue
                 found.append(side)
+        except TimeoutError:
+            # An expired poll cannot determine whether the adapter is stale.
+            raise
         except Exception:
             # A bad frame or disconnected adapter is not evidence of absence.
             self.invalidate()
@@ -638,18 +643,20 @@ class MultiHandPlugin:
                 ports.append(path)
         return ports
 
-    def _discover(self) -> dict[str, str]:
+    def _discover(self, *, deadline: float | None = None) -> dict[str, str]:
         """Read only: side -> serial path. Duplicate side is never guessed."""
         with self._bus_lock:
             found: dict[str, str] = {}
             for port in self._ports():
+                if deadline is not None:
+                    _remaining_time(deadline)
                 existing = next((controller.connection for controller in
                                  [self._legacy, *self._controllers.values()]
                                  if controller.connection._client is not None
                                  and os.path.realpath(controller.connection.port) == port), None)
                 connection = existing or self._connection(serial_port=port)
                 try:
-                    sides = connection.detect_sides()
+                    sides = connection.detect_sides(deadline=deadline)
                 except (OSError, TimeoutError):
                     sides = []
                 finally:
@@ -681,7 +688,7 @@ class MultiHandPlugin:
             return controller
 
     def _acquire_bus(self, deadline: float) -> None:
-        if not self._bus_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        if not self._bus_lock.acquire(timeout=_remaining_time(deadline)):
             raise TimeoutError("RS485 总线正被运动卡片占用")
 
     def read_tactile(self, side: str, fingers, *, budget_s: float, settle_s: float,
@@ -700,7 +707,8 @@ class MultiHandPlugin:
                 raise ValueError(missing)
             self._acquire_bus(deadline)
             try:
-                port = self._discover().get(side)
+                port = self._discover(deadline=deadline).get(side)
+                _remaining_time(deadline)
             finally:
                 self._bus_lock.release()
             if port is None:
@@ -720,7 +728,7 @@ class MultiHandPlugin:
                     results[finger] = exc
                     continue
                 try:
-                    cells = connection.get().read_fingertip(finger, settle_s)
+                    cells = connection.get().read_fingertip(finger, settle_s, deadline=deadline)
                     results[finger] = (cells, time.monotonic())
                 except (TimeoutError, ValueError, RuntimeError) as exc:
                     results[finger] = exc
@@ -730,7 +738,7 @@ class MultiHandPlugin:
                 finally:
                     self._bus_lock.release()
                 # Let a waiting motion take the bus before the next finger.
-                time.sleep(0.002)
+                time.sleep(min(0.002, max(0.0, deadline - time.monotonic())))
         except OSError:
             self._tactile_ports.pop(side, None)
             raise

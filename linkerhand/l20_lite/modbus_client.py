@@ -58,6 +58,13 @@ def _frame(payload: bytes) -> bytes:
     return payload + crc16(payload)
 
 
+def _remaining_time(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("L20 Lite 触觉采集超时")
+    return remaining
+
+
 class L20LiteModbusClient:
     def __init__(
         self,
@@ -98,34 +105,67 @@ class L20LiteModbusClient:
     def close(self) -> None:
         self._serial.close()
 
-    def _read_exact(self, size: int) -> bytes:
+    def _read_exact(self, size: int, deadline: float | None = None) -> bytes:
         data = bytearray()
         while len(data) < size:
+            if deadline is not None:
+                remaining = _remaining_time(deadline)
+                timeout = self._serial.timeout
+                if timeout is None or timeout > remaining:
+                    self._serial.timeout = remaining
             part = self._serial.read(size - len(data))
             if not part:
                 raise TimeoutError(f"Modbus timeout on {self.port}: received {len(data)}/{size} bytes")
             data.extend(part)
         return bytes(data)
 
-    def _transact(self, payload: bytes, expected_function: int) -> bytes:
+    def _transact(self, payload: bytes, expected_function: int,
+                  *, deadline: float | None = None) -> bytes:
         with self._lock:
-            # Discard a delayed reply from an earlier timed-out transaction.
-            self._serial.reset_input_buffer()
-            self._serial.write(_frame(payload))
+            if deadline is None:
+                return self._exchange(payload, expected_function)
+            timeout = self._serial.timeout
+            write_timeout = self._serial.write_timeout
+            try:
+                _remaining_time(deadline)
+                return self._exchange(payload, expected_function, deadline)
+            except OSError as exc:
+                if not isinstance(exc, TimeoutError) and time.monotonic() >= deadline:
+                    raise TimeoutError("L20 Lite 触觉采集超时") from exc
+                raise
+            finally:
+                if self._serial.timeout != timeout:
+                    self._serial.timeout = timeout
+                if self._serial.write_timeout != write_timeout:
+                    self._serial.write_timeout = write_timeout
+
+    def _exchange(self, payload: bytes, expected_function: int,
+                  deadline: float | None = None) -> bytes:
+        # Discard a delayed reply from an earlier timed-out transaction.
+        self._serial.reset_input_buffer()
+        if deadline is not None:
+            remaining = _remaining_time(deadline)
+            timeout = self._serial.write_timeout
+            if timeout is None or timeout > remaining:
+                self._serial.write_timeout = remaining
+        self._serial.write(_frame(payload))
+        if deadline is None:
             self._serial.flush()
-            header = self._read_exact(3)
-            if header[0] != self.slave_id:
-                raise ValueError(f"unexpected Modbus slave ID 0x{header[0]:02x}")
-            if header[1] == (expected_function | 0x80):
-                error_frame = header + self._read_exact(2)
-                self._validate_crc(error_frame)
-                raise RuntimeError(f"Modbus exception code 0x{header[2]:02x}")
-            if header[1] != expected_function:
-                raise ValueError(f"unexpected Modbus function 0x{header[1]:02x}")
-            remainder = header[2] + 2 if expected_function == 0x04 else 5
-            response = header + self._read_exact(remainder)
-            self._validate_crc(response)
-            return response
+        # Waiting for the reply also waits for the request to reach the
+        # device. Avoid an unbounded output drain during a timed poll.
+        header = self._read_exact(3, deadline)
+        if header[0] != self.slave_id:
+            raise ValueError(f"unexpected Modbus slave ID 0x{header[0]:02x}")
+        if header[1] == (expected_function | 0x80):
+            error_frame = header + self._read_exact(2, deadline)
+            self._validate_crc(error_frame)
+            raise RuntimeError(f"Modbus exception code 0x{header[2]:02x}")
+        if header[1] != expected_function:
+            raise ValueError(f"unexpected Modbus function 0x{header[1]:02x}")
+        remainder = header[2] + 2 if expected_function == 0x04 else 5
+        response = header + self._read_exact(remainder, deadline)
+        self._validate_crc(response)
+        return response
 
     @staticmethod
     def _validate_crc(frame: bytes) -> None:
@@ -133,9 +173,9 @@ class L20LiteModbusClient:
             raise ValueError("Modbus CRC mismatch")
 
     def _read_registers(self, address: int, count: int = JOINT_COUNT,
-                        max_value: int = 255) -> list[int]:
+                        max_value: int = 255, *, deadline: float | None = None) -> list[int]:
         payload = bytes((self.slave_id, 0x04)) + address.to_bytes(2, "big") + count.to_bytes(2, "big")
-        response = self._transact(payload, 0x04)
+        response = self._transact(payload, 0x04, deadline=deadline)
         if response[2] != count * 2:
             raise ValueError(f"expected {count * 2} register bytes, got {response[2]}")
         data = response[3:-2]
@@ -144,14 +184,15 @@ class L20LiteModbusClient:
             raise ValueError(f"register contains value outside 0..{max_value}")
         return registers
 
-    def _write_registers(self, address: int, values, *, expected: int = JOINT_COUNT) -> list[int]:
+    def _write_registers(self, address: int, values, *, expected: int = JOINT_COUNT,
+                         deadline: float | None = None) -> list[int]:
         values = _bytes(values, expected=expected)
         data = b"".join(value.to_bytes(2, "big") for value in values)
         payload = (
             bytes((self.slave_id, 0x10)) + address.to_bytes(2, "big")
             + len(values).to_bytes(2, "big") + bytes((len(data),)) + data
         )
-        response = self._transact(payload, 0x10)
+        response = self._transact(payload, 0x10, deadline=deadline)
         if response[2:6] != payload[2:6]:
             raise ValueError("Modbus write acknowledgement has wrong address or count")
         return values
@@ -159,7 +200,7 @@ class L20LiteModbusClient:
     def get_positions(self) -> list[int]:
         return self._read_registers(POSITION_REGISTER)
 
-    def probe_positions(self, side: str) -> list[int]:
+    def probe_positions(self, side: str, *, deadline: float | None = None) -> list[int]:
         """Read one known hand address without changing the client's target."""
         if side not in ("left", "right"):
             raise ValueError("side must be left or right")
@@ -167,18 +208,22 @@ class L20LiteModbusClient:
             previous_id = self.slave_id
             self.slave_id = RIGHT_HAND_ID if side == "right" else LEFT_HAND_ID
             try:
-                return self.get_positions()
+                if deadline is None:
+                    return self.get_positions()
+                return self._read_registers(POSITION_REGISTER, deadline=deadline)
             finally:
                 self.slave_id = previous_id
 
-    def read_fingertip(self, finger: str, settle_s: float = 0.03) -> list[int]:
+    def read_fingertip(self, finger: str, settle_s: float = 0.03,
+                       *, deadline: float | None = None) -> list[int]:
         """Select one fingertip and return its 96 raw tactile cells."""
         finger_id = FINGER_IDS[finger]
         with self._lock:
-            self._write_registers(TACTILE_SELECT_REGISTER, [finger_id], expected=1)
+            self._write_registers(TACTILE_SELECT_REGISTER, [finger_id], expected=1, deadline=deadline)
             if settle_s > 0:
-                time.sleep(settle_s)
-            registers = self._read_registers(TACTILE_BASE_REGISTER, TACTILE_REGISTER_COUNT, 0xFFFF)
+                time.sleep(settle_s if deadline is None else min(settle_s, _remaining_time(deadline)))
+            registers = self._read_registers(TACTILE_BASE_REGISTER, TACTILE_REGISTER_COUNT,
+                                              0xFFFF, deadline=deadline)
         if registers[0] != finger_id:
             raise ValueError(f"tactile reply is for finger {registers[0]}, expected {finger_id}")
         return registers[2:]
