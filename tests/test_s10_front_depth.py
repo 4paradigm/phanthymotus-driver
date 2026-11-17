@@ -42,11 +42,13 @@ class FakeWorker:
         return True
 
     def complete(self, index=-1):
-        from deep_robotics.s10_pro.depth_projection import project_depth
+        from deep_robotics.s10_pro.depth_projection import project_depth, fill_depth_holes
         job = self.jobs[index]
         packet, stats = project_depth(job["cloud"], job["K"], job["transform"],
                                       min_depth_m=job["min_depth_m"],
                                       max_depth_m=job["max_depth_m"])
+        packet, fill_stats = fill_depth_holes(packet)
+        stats.update(fill_stats)
         self.on_result(job, packet, stats)
 
     def close(self):
@@ -59,7 +61,7 @@ def rig(tmp_path, monkeypatch):
     from deep_robotics.s10_pro.undistortion import CameraUndistortion
     controller = CameraUndistortion(("camera_front",), config_path=tmp_path / "rgb.json",
                                    map_dir=tmp_path / "maps")
-    publications, subscriptions, destroyed = [], [], []
+    publications, subscriptions, destroyed, publishers = [], [], [], []
     timers, destroyed_timers, publisher_infos = [], [], []
 
     class CompressedImage:
@@ -97,6 +99,9 @@ def rig(tmp_path, monkeypatch):
         return handle
 
     publisher = SimpleNamespace(publish=publications.append)
+    def create_publisher(lane, topic, message_type):
+        publishers.append((lane, topic, message_type))
+        return publisher
     def create_timer(period, callback, **kwargs):
         timer = SimpleNamespace(period=period, callback=callback)
         timers.append(timer)
@@ -106,7 +111,7 @@ def rig(tmp_path, monkeypatch):
         robot=SimpleNamespace(create_subscription=subscribe, destroy_subscription=destroyed.append,
                               create_timer=create_timer, destroy_timer=destroyed_timers.append,
                               get_publishers_info_by_topic=lambda topic: list(publisher_infos)),
-        bridge=SimpleNamespace(create_publisher=lambda *args, **kw: publisher),
+        bridge=SimpleNamespace(create_publisher=create_publisher),
         camera_undistortion=controller, _sensor_qos=object())
     extrinsics_path = tmp_path / "extrinsics.json"
     monkeypatch.setenv("S10_FRONT_CAMERA_EXTRINSICS", str(extrinsics_path))
@@ -116,7 +121,7 @@ def rig(tmp_path, monkeypatch):
                            destroyed=destroyed, path=tmp_path / "depth.json",
                            extrinsics_path=extrinsics_path, timers=timers,
                            destroyed_timers=destroyed_timers, publisher_infos=publisher_infos,
-                           relays=relays)
+                           relays=relays, publishers=publishers)
 
 
 def deployment_calibration(rig, **changes):
@@ -628,11 +633,12 @@ def test_card_wire_contract_geometry_and_time_provenance(rig):
     card = rig.plugin.get_tool()
     assert card["name"] == "camera_front__depth" and card["type"] == "sensor"
     assert [entry["topic"] for entry in card["topic_out"]] == [
-        "/robot/camera_front/depth", "/robot/camera_front/depth_filled"]
+        "/robot/camera_front/depth"]
     assert all(entry["format"] == "image/depth-zlib" for entry in card["topic_out"])
     assert not card.get("topic_in")
     assert set(card["inputSchema"]["x-action-params"]) == {"start", "stop", "info", "config"}
     info = card["camera_info"][0]
+    assert len(card["camera_info"]) == 1
     assert (info["width"], info["height"]) == (640, 480)
     cal, _ = rig.controller.calibration("camera_front")
     assert info["K"][4] == pytest.approx(cal["K"][4] * 4 / 3)
@@ -641,6 +647,10 @@ def test_card_wire_contract_geometry_and_time_provenance(rig):
     vendor = info["vendor"]
     assert vendor["depth_scale_m"] == .001 and vendor["invalid_depth_value"] == 0
     assert vendor["depth_quantity"] == "optical_z" and vendor["sparse"] is True
+    assert vendor["hole_filling"] is True
+    assert vendor["depth_source"] == "estimated_interpolation"
+    assert vendor["interpolated_pixels_are_measured"] is False
+    assert not vendor.get("raw_depth_topic")
     assert vendor["depth_aligned_to_rgb"] is False
     assert vendor["timestamp_source"] == "lidar_header_unverified"
     assert vendor["temporal_synchronization"] is False
@@ -839,6 +849,8 @@ def test_real_worker_reports_bad_layout_then_projects_and_closes():
         failed.set()
 
     message = cloud()
+    message.width, message.row_step = 2, 24
+    message.data = struct.pack("<ffffff", 0, 0, 2, .1, 0, 2)
     source = {key: getattr(message, key) for key in
               ("width", "height", "point_step", "row_step", "is_bigendian", "data")}
     source["fields"] = [(f.name, f.offset, f.datatype, f.count) for f in message.fields]
@@ -856,14 +868,15 @@ def test_real_worker_reports_bad_layout_then_projects_and_closes():
         assert ready.wait(5), "worker did not return depth"
         context, packet, stats = received[0]
         assert context["stamp"] == (10, 123) and "cloud" not in context
-        assert isinstance(packet, tuple) and len(packet) == 2
-        raw = zlib.decompress(packet[0])
-        assert len(zlib.decompress(packet[1])) == 640 * 480 * 2
+        assert isinstance(packet, bytes)
+        raw = zlib.decompress(packet)
         assert len(raw) == 640 * 480 * 2
         assert struct.unpack_from("<H", raw, (240 * 640 + 320) * 2)[0] == 2000
-        assert stats["source_points"] == 1
-        assert stats["sample_points"] == 1 and stats["valid_pixels"] == 1
-        assert stats["filled_pixels"] == 0 and stats["fill_conflicts"] == 0
+        assert struct.unpack_from("<H", raw, (240 * 640 + 322) * 2)[0] == 2000
+        assert struct.unpack_from("<H", raw, (240 * 640 + 325) * 2)[0] == 2000
+        assert stats["source_points"] == 2
+        assert stats["sample_points"] == 2 and stats["valid_pixels"] == 2
+        assert stats["filled_pixels"] == 4 and stats["fill_conflicts"] == 0
         assert stats["measured_coverage"] <= stats["filled_coverage"]
     finally:
         worker.close()
@@ -970,7 +983,7 @@ def test_output_config_does_not_add_dependencies_or_drop_encoder_latency_fix():
     cmd = _rtsp_command("rtsp://camera")
     assert cmd[cmd.index("-threads") + 1] == "1"
 
-def test_filled_stream_uses_same_stamp_but_separate_topic_and_provenance(rig):
+def test_only_filled_stream_uses_original_topic_stamp_and_estimated_provenance(rig):
     from deep_robotics.s10_pro.depth_projection import project_depth, fill_depth_holes
     configure(rig)
     assert rig.plugin.dispatch("start", {})["state"] == "running"
@@ -979,25 +992,26 @@ def test_filled_stream_uses_same_stamp_but_separate_topic_and_provenance(rig):
     message.data = struct.pack("<ffffff", 0, 0, 2, .025, 0, 2)
     rig.subscriptions[0].callback(message)
     job = rig.plugin._worker.jobs[0]
-    raw, stats = project_depth(job["cloud"], job["K"], job["transform"])
-    filled, more = fill_depth_holes(raw)
-    stats.update(more)
-    rig.plugin._receive_result(job, (raw, filled), stats)
-    assert len(rig.publications) == 2
-    measured, estimate = rig.publications
-    assert measured.data == raw and estimate.data == filled
-    assert measured.header.stamp.sec == estimate.header.stamp.sec == 10
-    assert measured.header.stamp.nanosec == estimate.header.stamp.nanosec == 123
-    assert measured.header.frame_id == estimate.header.frame_id
-    assert zlib.decompress(measured.data) != zlib.decompress(estimate.data)
-    assert rig.plugin.dispatch("info", {})["stats"]["filled_pixels"] > 0
-    raw_info, filled_info = rig.plugin.dispatch("info", {})["camera_info"]
-    assert raw_info["topic"] == "/robot/camera_front/depth"
-    assert filled_info["topic"] == "/robot/camera_front/depth_filled"
-    assert raw_info["vendor"]["hole_filling"] is False
+    raw, _ = project_depth(job["cloud"], job["K"], job["transform"])
+    filled, _ = fill_depth_holes(raw)
+    rig.plugin._worker.complete()
+    assert len(rig.publications) == 1
+    estimate = rig.publications[0]
+    assert estimate.data == filled
+    assert zlib.decompress(estimate.data) != zlib.decompress(raw)
+    assert estimate.header.stamp.sec == 10
+    assert estimate.header.stamp.nanosec == 123
+    info = rig.plugin.dispatch("info", {})
+    assert info["stats"]["filled_pixels"] > 0
+    assert [entry["topic"] for entry in info["topic_out"]] == ["/robot/camera_front/depth"]
+    assert len(rig.publishers) == len(info["camera_info"]) == 1
+    assert rig.publishers[0][1] == "/robot/camera_front/depth"
+    filled_info = info["camera_info"][0]
+    assert filled_info["topic"] == "/robot/camera_front/depth"
     assert filled_info["vendor"]["hole_filling"] is True
     assert filled_info["vendor"]["depth_aligned_to_rgb"] is False
     assert filled_info["vendor"]["interpolated_pixels_are_measured"] is False
+    assert not filled_info["vendor"].get("raw_depth_topic")
 
 
 def test_stopped_depth_card_cannot_publish_late_filled_result(rig):
@@ -1009,5 +1023,5 @@ def test_stopped_depth_card_cannot_publish_late_filled_result(rig):
     raw, stats = project_depth(job["cloud"], job["K"], job["transform"])
     filled, _ = fill_depth_holes(raw)
     rig.plugin.dispatch("stop", {})
-    rig.plugin._receive_result(job, (raw, filled), stats)
+    rig.plugin._receive_result(job, filled, stats)
     assert rig.publications == []

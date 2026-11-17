@@ -10,7 +10,7 @@ charging and navigation.
 | Battery | `/BATTERY_DATA` (`drdds/msg/BatteryData`) | `soc`, `soh`, `current`, `voltage`, `cell_vol`, `temperature`, `cycle` as JSON |
 | Joints | `/JOINTS_DATA_10HZ` (`drdds/msg/JointsData`) and `/IMU` | `joints_info` JSON with joint names/angles/speeds/torques/temperatures; `joints` skeleton with 16 joints and IMU orientation |
 | Cameras | AOS RTSP streams on `10.21.33.103:8554` | Four JPEG streams on the existing `camera_front`, `camera_rear`, `camera_left`, and `camera_right` topics |
-| `camera_front__depth` | `/LIDAR/POINTS` and automatically loaded robot-specific optical extrinsics | Sparse front-view depth on `/{namespace}/camera_front/depth`, `image/depth-zlib`, 640x480 uint16 millimetres |
+| `camera_front__depth` | `/LIDAR/POINTS` and automatically loaded robot-specific optical extrinsics | One locally hole-filled front-view depth stream on `/{namespace}/camera_front/depth`, `image/depth-zlib`, 640x480 uint16 millimetres |
 | LiDAR | 22 historical/live PointCloud2 candidates; `/ACCUMULATED_POINTS_MAP` remains the map source | Split `lidar_cloud` and `lidar_map` `sensor/pointcloud` streams with bounded latest-frame workers; only one fresh cloud source is active at a time |
 | IMU | `/IMU` (`sensor_msgs/msg/Imu`) | source `header.stamp`, quaternion (w,x,y,z), angular velocity, linear acceleration, Euler angles (radians), temperature |
 | `loco_servo` | `control/velocity` (`motus.control/1`, twist) | bounded continuous velocity commands to the native S10 TCP controller; dry-run by default |
@@ -171,7 +171,9 @@ runtime for RTSP demuxing.
 The Pro bundle includes one additional sensor card, `camera_front__depth`.
 It projects the original LiDAR XYZ into the rectified front camera's optical
 view. It uses the existing front-camera calibration without pulling or decoding
-another RTSP stream. It publishes only after the card's `start` action; driver
+another RTSP stream. It fills supported short gaps and publishes only one
+output on the existing depth topic; there is no separate raw or `depth_filled`
+output. It publishes only after the card's `start` action; driver
 bundle startup only advertises the card.
 
 ### First-use configuration
@@ -299,10 +301,17 @@ error/code and `camera_info`. Metadata records `extrinsics_source` and
 The output is `sensor_msgs/CompressedImage` with
 `format="16UC1; compressedDepth zlib"`: zlib level-1 compression of a fixed
 640x480, row-major, little-endian uint16 millimetre buffer. Zero means unknown.
-At each observed pixel the closest positive camera Z wins. This is sparse
-depth: holes stay zero, and no learned filling, temporal accumulation or motion
-compensation is applied. It must not be treated as a dense image or as evidence
-that an unobserved area is clear.
+At each observed pixel the closest positive camera Z wins. The single output
+then fills horizontal/vertical gaps of at most eight pixels, bounded by original
+measurements whose depths differ by no more than both 150mm and 6% of the nearer
+depth. It preserves measured pixels, rejects conflicting estimates and never
+uses filled pixels as new anchors. Large gaps and unsupported regions stay zero.
+No learned filling, temporal accumulation or motion compensation is applied.
+The result remains sparse and must not be treated as evidence that an
+unobserved area is clear. Metadata declares `hole_filling: true`,
+`depth_source: estimated_interpolation` and `interpolated_pixels_are_measured: false`.
+`info.stats` keeps measured coverage, filled coverage, filled-pixel count and
+conflict count; the original projection exists only inside the worker.
 
 The existing depth renderer requires 640x480, while front RGB is 640x360.
 The depth declaration supplies its own K using pixel-centre scaling:

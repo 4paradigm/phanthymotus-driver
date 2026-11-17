@@ -1,8 +1,8 @@
-"""Sparse front-camera depth from an explicitly calibrated S10 LiDAR stream.
+"""Locally hole-filled front-camera depth from a calibrated S10 LiDAR stream.
 
 The output follows the existing 640x480 depth-zlib contract. It is evaluated
-at the LiDAR header time, not at an inferred RTSP exposure time. Projection
-and compression run in a bounded subprocess; robot callbacks only enqueue.
+at the LiDAR header time, not at an inferred RTSP exposure time. Projection,
+hole filling and compression run in a bounded subprocess; callbacks only enqueue.
 """
 from __future__ import annotations
 
@@ -120,7 +120,7 @@ def _project_worker(jobs, results):
             stats["measured_coverage"] = round(stats["valid_pixels"] / (640 * 480), 4)
             stats["filled_coverage"] = round(
                 (stats["valid_pixels"] + stats["filled_pixels"]) / (640 * 480), 4)
-            _put_latest(results, (context, (packet, filled_packet), stats, None))
+            _put_latest(results, (context, filled_packet, stats, None))
         except Exception as exc:
             _put_latest(results, (context, None, None, str(exc)[:300]))
 
@@ -227,7 +227,6 @@ class FrontDepthPlugin:
         self._relay_config = config
         prefix = f"/{str(namespace).strip('/')}" if namespace else ""
         self.topic = prefix + "/camera_front/depth"
-        self.filled_topic = prefix + "/camera_front/depth_filled"
         self.controller = getattr(nodes, "camera_undistortion", None)
         if self.controller is None:
             self.controller = CameraUndistortion(("camera_front",))
@@ -245,7 +244,6 @@ class FrontDepthPlugin:
         self._running = False
         self._generation = 0
         self._worker = self._subscription = self._publisher = None
-        self._filled_publisher = None
         self._watchdog = None
         self._source_state = "idle"
         self._started_at = self._last_cloud_at = self._observed_frame = None
@@ -332,7 +330,7 @@ class FrontDepthPlugin:
                              f"Invalid front-camera calibration {path}: {exc}") from exc
         return resolved, frame, source_prefix + str(path)
 
-    def _camera_info(self, *, filled=False):
+    def _camera_info(self):
         calibration, source = self.controller.calibration("camera_front")
         k = depth_intrinsics(calibration) if calibration else None
         horizontal, vertical = half_fov(k, 640, 480) if k else (None, None)
@@ -340,7 +338,7 @@ class FrontDepthPlugin:
             config = copy.deepcopy(self._active_config or self._config)
             optical_frame, extrinsics_source = self._optical_frame, self._extrinsics_source
         return build_camera_info(
-            topic=self.filled_topic if filled else self.topic,
+            topic=self.topic,
             id="deeprobotics/s10_pro/camera_front", format=FORMAT,
             width=640, height=480, distortion_model="pinhole" if k else "unknown",
             K=k, D=[0.] * 5 if k else None,
@@ -348,8 +346,7 @@ class FrontDepthPlugin:
             source="inherited" if k else "unknown",
             measured_on=calibration.get("measured_on", "") if calibration else "",
             pipeline=["deeprobotics/s10_pro/camera_front", "deeprobotics/s10_pro/undistort",
-                      "lidar_projection", "resize:640x360->640x480"]
-                     + (["bounded_hole_fill"] if filled else []),
+                      "lidar_projection", "resize:640x360->640x480", "bounded_hole_fill"],
             vendor={
                 "frame_id": optical_frame, "calibration_source": source,
                 "cloud_topic": config["cloud_topic"], "cloud_frame_id": config["cloud_frame_id"],
@@ -357,9 +354,8 @@ class FrontDepthPlugin:
                 "extrinsics_source": extrinsics_source,
                 "reprojection_verified": False,
                 "depth_unit": "mm", "depth_scale_m": .001, "invalid_depth_value": 0,
-                "depth_quantity": "optical_z", "sparse": True, "hole_filling": filled,
-                "depth_source": "estimated_interpolation" if filled else "measured_lidar",
-                "raw_depth_topic": self.topic if filled else None,
+                "depth_quantity": "optical_z", "sparse": True, "hole_filling": True,
+                "depth_source": "estimated_interpolation",
                 "interpolated_pixels_are_measured": False,
                 "registered_view": "camera_front", "depth_aligned_to_rgb": False,
                 "rgb_resolution": [640, 360],
@@ -373,9 +369,7 @@ class FrontDepthPlugin:
 
     def _topic_outputs(self):
         return [{"topic": self.topic, "format": FORMAT,
-                 "desc": "原始稀疏雷达投影，未知像素为0；可用于真实覆盖率判断"},
-                {"topic": self.filled_topic, "format": FORMAT,
-                 "desc": "保守短间隙插值；估计像素不属于真实障碍测量"}]
+                 "desc": "保守短间隙补洞后的雷达深度；估计像素非实测，剩余未知像素为0"}]
 
     def get_tool(self):
         with self._lock:
@@ -390,13 +384,13 @@ class FrontDepthPlugin:
             "rate_hz": {"type": "number", "title": "最大输出频率（Hz）", "exclusiveMinimum": 0, "maximum": 15},
         }
         schema = action_schema({
-            "start": ([], "自动加载本机标定并启动前相机稀疏深度；标定缺失时明确报错"),
+            "start": ([], "自动加载本机标定并启动前相机补洞深度；标定缺失时明确报错"),
             "stop": ([], "停止本深度流"), "info": ([], "深度参数、运行状态和时间来源"),
             "config": (list(properties), "保存深度配置；修改后重新启动本卡片"),
         }, properties)
-        card = tool(NAME, "sensor", "山猫 S10 Pro 前相机雷达深度：原始实测和独立局部补洞输出；未与 RTSP 曝光同步",
+        card = tool(NAME, "sensor", "山猫 S10 Pro 前相机雷达深度：局部补洞输出；插值像素非实测，未与 RTSP 曝光同步",
                     schema, topic_out=self._topic_outputs())
-        card["camera_info"] = [self._camera_info(), self._camera_info(filled=True)]
+        card["camera_info"] = [self._camera_info()]
         config_properties = {key: copy.deepcopy(properties[key]) for key in
                              ("min_depth_m", "max_depth_m", "rate_hz")}
         for key, prop in config_properties.items():
@@ -459,11 +453,6 @@ class FrontDepthPlugin:
             try:
                 if self._publisher is None:
                     self._publisher = self.nodes.bridge.create_publisher(NAME, self.topic, CompressedImage)
-                if self._filled_publisher is None:
-                    # Separate CoreBridge lanes: latest-only queues would otherwise
-                    # let the filled packet replace the raw packet before DDS delivery.
-                    self._filled_publisher = self.nodes.bridge.create_publisher(
-                        NAME + "_filled", self.filled_topic, CompressedImage)
                 with self._lock:
                     self._generation += 1
                     generation = self._generation
@@ -607,10 +596,6 @@ class FrontDepthPlugin:
                 self._drop(str(reason)[:300])
 
     def _receive_result(self, context, packet, stats):
-        # The processing worker returns a paired raw/filled result. A raw-only
-        # legacy test result is supported without publishing an estimated frame.
-        raw_packet, filled_packet = (packet if isinstance(packet, tuple)
-                                     else (packet, None))
         with self._lock:
             if not self._running or context["generation"] != self._generation:
                 return
@@ -627,14 +612,8 @@ class FrontDepthPlugin:
                 output = CompressedImage()
                 output.header.frame_id = self._optical_frame
                 output.header.stamp.sec, output.header.stamp.nanosec = context["stamp"]
-                output.format, output.data = ROS_FORMAT, raw_packet
+                output.format, output.data = ROS_FORMAT, packet
                 self._publisher.publish(output)
-                if filled_packet is not None:
-                    estimate = CompressedImage()
-                    estimate.header.frame_id = self._optical_frame
-                    estimate.header.stamp.sec, estimate.header.stamp.nanosec = context["stamp"]
-                    estimate.format, estimate.data = ROS_FORMAT, filled_packet
-                    self._filled_publisher.publish(estimate)
                 self._stats.update(stats)
                 self._stats["published"] += 1
                 self._stats["last_source_stamp"] = list(context["stamp"])
@@ -692,7 +671,7 @@ class FrontDepthPlugin:
                 "publisher_count": self._publisher_count, "timeout_s": SOURCE_TIMEOUT_S,
                 "last_valid_cloud_age_s": (None if self._last_cloud_at is None else
                                            max(0., time.monotonic() - self._last_cloud_at))}
-        result["camera_info"] = [self._camera_info(), self._camera_info(filled=True)]
+        result["camera_info"] = [self._camera_info()]
         return result
 
     def dispatch(self, action, args):

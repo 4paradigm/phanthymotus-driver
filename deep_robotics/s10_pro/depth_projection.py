@@ -1,8 +1,8 @@
 """Bounded, ROS-free projection of original cloud XYZ into optical-Z depth.
 
 The zlib payload is always 640x480, little-endian uint16 millimetres, with
-zero marking unobserved pixels. The original stream never interpolates.
-A separate, bounded hole-filled stream is explicitly marked as estimated;
+zero marking unobserved pixels. The projection step never interpolates.
+The bounded hole-filled output is explicitly marked as estimated;
 no RGB synchronization or motion compensation is assumed.
 """
 from array import array
