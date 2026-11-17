@@ -13,6 +13,38 @@ baudrate: 115200
 response_timeout_s: 0.5
 
 plugins:
+  glove_teleop:
+    enabled: true
+    source_mode: "direct"
+    # Override GLOVE_SERIAL_PORT with the receiver's stable path on this host.
+    # An absent glove does not prevent the existing hand cards from starting.
+    glove_port: "/dev/glove"
+    source_ip: "127.0.0.1"
+    listen_host: "127.0.0.1"
+    listen_port: 19012
+    max_hz: 15
+    # Preview until reader + Modbus release timing is accepted on this hardware.
+    preview_only: true
+    # Candidate stale-input cutoff, NOT a measured physical release bound.
+    watchdog_ms: 300
+    max_delta_per_step: 16
+    max_fraction_step: 0.05
+    # Capture a stable pose over multiple source frames, rather than one click.
+    calibration_window_ms: 300
+    calibration_stability_deg: 8
+    open_deadband: 0.10
+    # Independent tip flexion / root sway / root flexion (motors 0,1,9).
+    # Requires open, fist, thumb_sway and thumb_roll calibration before arm.
+    thumb_mapping:
+      enabled: true
+      left:
+        open: [254, 254, 254]
+        closed: [0, 0, 0]
+      right:
+        open: [254, 254, 254]
+        closed: [0, 0, 0]
+    speed: 50
+    torque: 50
   hand_gesture:
     enabled: true
     motion_speed: 85

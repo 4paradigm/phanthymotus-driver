@@ -1,5 +1,46 @@
 # LinkerHand L20 Lite USB-RS485 driver
 
+## Hex 数据手套遥操与双手骨架
+
+新增 glove_teleop 卡片，在一个 ARM64 驱动容器中直接解析接收器串口，不依赖厂商 SDK、Mono 或上位机。
+接收器可通过网页 USB 配对向导配置，也可使用 GLOVE_SERIAL_PORT；不能与 L20_SERIAL_PORT 指向同一设备。
+手套读取仅在画布启动 glove_teleop 后开始，灵巧手运动必须完成标定并显式 arm。
+新版拇指三通道模式每侧需张开、握拳、拇指侧摆和拇指根部屈曲四项标定，见下方部署说明；四指算法不变。
+没有手套时，原 hand/hand_gesture 卡片仍可使用。
+
+### 网页 USB 配对（无需填写串口路径）
+
+配套 Core 需包含 `usb-pairing.js` 网页向导；旧 Core 可调用 `usb_pairing`
+MCP 工具的同名步骤，但不会显示向导按钮。新版 Driver 注册后，刷新画布，
+在手套或灵巧手卡片点击 **USB 设备配对**：
+
+1. 退出遥操、等待动作完成，拔下接收器与灵巧手转接器 USB，保留扩展坞，点击开始。
+2. 只插一个无线接收器，点击确认。无需手套开机，不会对接收器做 Modbus 探测。
+3. 再插入一到两个已上电的灵巧手转接器，点击检测；以只读 Modbus 响应识别左右手。
+4. 核对识别出的左右手，保存并应用。重新开始预览和标定，再显式启用遥操。
+
+向导按插入顺序确定设备角色，不会验证接收器厂商协议，因此请严格遵守插入顺序，
+配对期间不要插拔其他串口设备。重复地址、未响应设备和中途拔插会阻止保存。
+配对时拒绝其他设备操作，取消保留旧配置；关闭或断网遗留的会话闲置 10 分钟后释放。
+不会改变 `GLOVE_PREVIEW_ONLY`、保存标定或自动启用运动。
+
+映射自动保存到 `/opt/phanthy-motus/data/linkerhand-l20-lite-usb.json`，
+容器重启时优先恢复，覆盖部署环境变量中的初始端口路径。路径可由
+`L20_USB_PAIRING_FILE` 覆盖，需位于持久挂载目录。
+配对后灵巧手只在已配对的路径上探测，避免访问其他串口。
+新版 service 默认 `L20_USB_PAIRING_REQUIRED=1`，首次启动在配对完成前不打开设备或自动扫描，
+避免将接收器当作灵巧手探测。已有手工端口配置或仅灵巧手部署可显式设置为 `0`，
+并按原部署文档配置设备；手套未使用时应禁用 glove_teleop 插件。
+CH340 设备没有可区分的唯一序列号时使用物理 USB 路径，因此应保持插孔与扩展坞拓扑；
+换口后重新运行向导。此功能不承诺任意换口或自动热插拔恢复。
+
+构建、端口配置、画布操作和验证范围见 [部署说明](deploy/README.md)。
+来源与许可见 [模型说明](resource/README.md)。两手模型显示映射目标，不代表灵巧手实际位置或碰撞状态。
+张开/握拳标定只保留在当前会话；默认仅骨架预览。断流阈值候选值为 300ms，超过后禁止后续运动，并在当前总线事务结束后尝试卸力；这不是实体卸力时间保证。启用运动前须按 [部署文档](deploy/README.md) 完成时序验收。
+重连不会自动重新启用运动。显式手动控制会先退出遥操，再取得总线控制权。
+
+以下为已有 hand 与 hand_gesture 的操作说明。
+
 This is the active PhanthyMotus driver for the L20 Lite connected through a
 USB-RS485 adapter. It uses Modbus RTU at 115200 baud, 8N1. The configured
 right-hand slave address is `0x27`; the left-hand address is `0x28`. The operator

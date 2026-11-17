@@ -22,6 +22,7 @@ class FakeHand:
     def __init__(self, sides=None):
         self.config = {"side": "right", "serial_port": "/dev/fake"}
         self._bus_lock = threading.RLock()
+        self._ownership_lock = threading.RLock()
         self.sides = sides or {"right": "/dev/fake"}
 
     def _discover(self):
