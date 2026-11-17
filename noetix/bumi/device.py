@@ -26,7 +26,7 @@ import subprocess
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from datetime import datetime
 from typing import Any
@@ -736,8 +736,11 @@ class LocoPlugin:
             if self._walking_mode is None:
                 return {"state": "error", "code": "walking_mode_disabled",
                         "command_sent": False, "error": "行走模式切换未启用。"}
-            return self._walking_mode.dispatch(
-                action, args, tool_name=tool_name, notify=_acp_notify)
+            # Return the final mode result to this call. An ACP callback from a
+            # manual canvas call also wakes the decision core on deployed cores.
+            result = self._walking_mode.dispatch(
+                action, {"walking_model": args.get("walking_model")})
+            return {"action": action, **result}
 
         handler = None
         if tool_name == "loco" and action == "move":
@@ -888,15 +891,15 @@ class LocoPlugin:
 
     def _stop_move(self) -> dict:
         walking_mode = getattr(self, "_walking_mode", None)
-        if walking_mode is not None:
-            walking_mode.cancel_switch()
-        self._rotate_stop_event.set()
-        self._move_stop_event.set()
-        if self._move_thread and self._move_thread.is_alive():
-            self._move_thread.join(timeout=1)
-        if self._high_ctrl is not None:
-            self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
-        self._set_servo_velocity_owner(False)
+        guard = walking_mode.cancel_and_brake() if walking_mode is not None else nullcontext()
+        with guard:
+            self._rotate_stop_event.set()
+            self._move_stop_event.set()
+            if self._move_thread and self._move_thread.is_alive():
+                self._move_thread.join(timeout=1)
+            if self._high_ctrl is not None:
+                self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
+            self._set_servo_velocity_owner(False)
         return {"state": "stopped"}
 
     def _do_rotate(self, args: dict) -> dict:

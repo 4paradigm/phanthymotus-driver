@@ -10,6 +10,7 @@ import math
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 
 from walking_mode_client import MODEL_CODES, WalkingModeClient, discover_host
 
@@ -63,9 +64,6 @@ class WalkingModePlugin:
             "if": {"properties": {"action": {"const": self.PREFIX}}},
             "then": {"required": ["walking_model"]},
         })
-        completion = schema.setdefault("x-completion", {"actions": [], "timeout": 0})
-        completion["actions"].append(self.PREFIX)
-        completion["timeout"] = max(completion["timeout"], self._completion_timeout())
 
     def _completion_timeout(self):
         return math.ceil(self._discovery_timeout + 6 * self._query_timeout
@@ -105,6 +103,13 @@ class WalkingModePlugin:
     def cancel_switch(self) -> None:
         with self._state_lock:
             self._cancel.set()
+
+    @contextmanager
+    def cancel_and_brake(self):
+        """Serialize cancellation and the chassis brake with mode writes."""
+        with self._state_lock:
+            self._cancel.set()
+            yield
 
     def stop(self) -> None:
         with self._state_lock:

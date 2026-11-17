@@ -249,9 +249,9 @@ def test_packaged_defaults_advertise_walking_mode_without_contacting_robot(
         assert schema["allOf"] == [{
             "if": {"properties": {"action": {"const": "walking_mode"}}},
             "then": {"required": ["walking_model"]}}]
-        assert "walking_mode" in schema["x-completion"]["actions"]
+        assert "walking_mode" not in schema.get("x-completion", {}).get("actions", [])
     assert tools["loco_relative_move"]["inputSchema"]["x-completion"] == {
-        "actions": ["rotate", "move", "walking_mode"], "timeout": 120}
+        "actions": ["rotate", "move"], "timeout": 120}
     assert bundle._plugins[0]._walking_mode is bundle._walking_mode
     assert bundle.dispatch("walking_mode", {"action": "info"})["command_sent"] is False
     # Existing shutdown braking is independent of declaration/startup checks.
@@ -359,7 +359,10 @@ def test_embedded_switch_owns_chassis_and_either_card_can_cancel(locomotion_bund
     monkeypatch.setattr(switcher, "_switch", delayed_switch)
     monkeypatch.setattr(sys.modules["device"], "_acp_notify", lambda *args: callbacks.append(args))
     monkeypatch.setattr(loco._high_ctrl, "publish_cmd", lambda *args: brakes.append(args))
-    result = bundle.dispatch("loco", {"action": "walking_mode", "walking_model": "whole_body"})
+    results = []
+    request = threading.Thread(target=lambda: results.append(bundle.dispatch(
+        "loco", {"action": "walking_mode", "walking_model": "whole_body"})))
+    request.start()
     try:
         assert entered.wait(timeout=2)
         assert loco.is_moving() is True
@@ -375,11 +378,140 @@ def test_embedded_switch_owns_chassis_and_either_card_can_cancel(locomotion_bund
         assert brakes == [(0, 0, 0, "DEFAULT", 0)]
     finally:
         release.set()
-        switcher._worker.join(timeout=2)
-    assert callbacks[0][0:2] == (result["action_id"], "cancelled")
-    assert callbacks[0][3] == "loco"
+        request.join(timeout=2)
+    assert not request.is_alive()
+    assert results[0]["code"] == "cancelled"
+    assert "action_id" not in results[0]
+    assert callbacks == []
     assert loco.is_moving() is False
     assert loco._rotate_state == {"state": "idle", "last_result": None}
+
+
+@pytest.mark.parametrize("tool_name", ["loco", "loco_relative_move"])
+@pytest.mark.parametrize("phase", ["preflight", "tcp_write"])
+def test_stop_move_prevents_late_mode_writes(locomotion_bundle, monkeypatch, tool_name, phase):
+    import walking_mode
+
+    bundle = locomotion_bundle
+    loco, = bundle._plugins
+    blocked, release = threading.Event(), threading.Event()
+    stopping, stopped = threading.Event(), threading.Event()
+    events, results, stop_results = [], [], []
+    state = {"mode": 2}
+
+    def joint_state():
+        if phase == "preflight":
+            blocked.set()
+            assert release.wait(timeout=3)
+        return [types.SimpleNamespace(vel=0.0) for _ in range(21)]
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def get_status(self):
+            if "tcp_write" in events:
+                assert stopped.wait(timeout=3)
+            return state["mode"]
+
+        def set_walking_model(self, model):
+            assert model == "whole_body"
+            blocked.set()
+            assert release.wait(timeout=3)
+            events.append("tcp_write")
+            state["mode"] = 3
+
+    def brake(*args):
+        assert args == (0, 0, 0, "DEFAULT", 0)
+        events.append("brake")
+
+    def stop():
+        stopping.set()
+        stop_results.append(bundle.dispatch(tool_name, {"action": "stop_move"}))
+        events.append("stop_done")
+        stopped.set()
+
+    monkeypatch.setattr(loco._high_ctrl, "get_mode", lambda: state["mode"], raising=False)
+    monkeypatch.setattr(loco._high_ctrl, "get_joint_state", joint_state, raising=False)
+    monkeypatch.setattr(loco._high_ctrl, "publish_cmd", brake)
+    monkeypatch.setattr(walking_mode, "WalkingModeClient", Client)
+    request = threading.Thread(target=lambda: results.append(bundle.dispatch(
+        "loco", {"action": "walking_mode", "walking_model": "whole_body"})))
+    stopper = threading.Thread(target=stop)
+    request.start()
+    try:
+        assert blocked.wait(timeout=3)
+        stopper.start()
+        assert stopping.wait(timeout=3)
+        if phase == "tcp_write":
+            assert not stopped.wait(timeout=0.05)
+            assert events == []
+        else:
+            assert stopped.wait(timeout=3)
+            assert events == ["brake", "stop_done"]
+    finally:
+        release.set()
+        if stopper.ident is not None:
+            stopper.join(timeout=3)
+        request.join(timeout=3)
+    assert not request.is_alive()
+    assert not stopper.is_alive()
+    assert stop_results == [{"state": "stopped"}]
+    assert results[0]["code"] == "cancelled"
+    assert results[0]["command_sent"] is (phase == "tcp_write")
+    assert events == (["tcp_write", "brake", "stop_done"] if phase == "tcp_write"
+                      else ["brake", "stop_done"])
+    assert loco.is_moving() is False
+
+
+@pytest.mark.parametrize("tool_name", ["loco", "loco_relative_move"])
+def test_mode_acceptance_waits_for_the_entire_brake(locomotion_bundle, monkeypatch, tool_name):
+    bundle = locomotion_bundle
+    loco, = bundle._plugins
+    braking, release, requesting, switched = (threading.Event() for _ in range(4))
+    events, results = [], []
+
+    def brake(*_args):
+        events.append("brake_start")
+        braking.set()
+        assert release.wait(timeout=3)
+        events.append("brake_end")
+
+    def switch(model):
+        events.append("mode_write")
+        switched.set()
+        return {"state": "completed", "walking_model": model}
+
+    def request_switch():
+        requesting.set()
+        results.append(bundle.dispatch("loco", {
+            "action": "walking_mode", "walking_model": "whole_body"}))
+
+    monkeypatch.setattr(loco._high_ctrl, "publish_cmd", brake)
+    monkeypatch.setattr(bundle._walking_mode, "_switch", switch)
+    stopper = threading.Thread(target=lambda: bundle.dispatch(tool_name, {"action": "stop_move"}))
+    request = threading.Thread(target=request_switch)
+    stopper.start()
+    try:
+        assert braking.wait(timeout=3)
+        request.start()
+        assert requesting.wait(timeout=3)
+        assert not switched.wait(timeout=0.05)
+    finally:
+        release.set()
+        stopper.join(timeout=3)
+        if request.ident is not None:
+            request.join(timeout=3)
+    assert not stopper.is_alive()
+    assert not request.is_alive()
+    assert results[0]["state"] == "completed"
+    assert events == ["brake_start", "brake_end", "mode_write"]
 
 
 def test_mcp_discovers_both_actions_and_executes_each_mode(locomotion_bundle_module, monkeypatch):
@@ -443,19 +575,21 @@ def test_mcp_discovers_both_actions_and_executes_each_mode(locomotion_bundle_mod
             assert tools[tool_name]["inputSchema"]["x-action-params"]["walking_mode"]["params"] == ["walking_model"]
             response = rpc("tools/call", {"name": tool_name, "arguments": {
                 "action": "walking_mode", "walking_model": model,
-                "vx": "unused", "angle_deg": "unused", "x_m": "unused"}})
-            accepted = json.loads(response["content"][0]["text"])
-            assert accepted["state"] == "running"
-            bundle._walking_mode._worker.join(timeout=2)
-            action_id, status, completed, tool = callbacks[-1]
-            assert (action_id, status, tool) == (accepted["action_id"], "completed", tool_name)
+                "vx": 0.8, "vy": -0.5, "vyaw": 0.4, "duration": 5,
+                "angle_deg": 90, "x_m": 0.5, "y_m": 0.2}})
+            completed = json.loads(response["content"][0]["text"])
+            assert completed["state"] == "completed"
+            assert completed["action"] == "walking_mode"
+            assert "action_id" not in completed
             assert completed["mode_verified"] is True
             assert completed["walking_model"] == model
+            assert bundle._plugins[0]._move_thread is None
+            assert bundle._plugins[0]._rotate_worker is None
+            assert callbacks == []
         assert commands == ["whole_body", "lower_body", "whole_body", "lower_body"]
-        assert len({callback[0] for callback in callbacks}) == 4
         refused = rpc("tools/call", {"name": "loco", "arguments": {"action": "walking_mode"}})
         assert json.loads(refused["content"][0]["text"])["code"] == "invalid_walking_model"
-        assert len(callbacks) == 4
+        assert callbacks == []
     finally:
         server.shutdown()
         server.server_close()
