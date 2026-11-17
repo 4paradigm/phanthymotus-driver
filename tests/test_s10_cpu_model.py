@@ -36,12 +36,14 @@ def test_cpu_model_retargets_spatial_dimensions_and_runs_without_build_tools(tmp
                                     [1, 256, 48, 48], [1, 256, 96, 96]])
     expected = tiny_model(192, 320, [[1, 2, 128, 60], [1, 128, 6, 10],
                                     [1, 256, 12, 20], [1, 256, 24, 40]])
-    path = tmp_path / 'model.onnx'
-    path.write_bytes(original)
+    path = tmp_path / 'output' / 'models' / 'model.onnx'
+    source = tmp_path / 'source.onnx'
+    source.write_bytes(original)
     monkeypatch.setattr(model, 'MODEL_PATH', path)
     monkeypatch.setattr(model, 'MODEL_SHA256', hashlib.sha256(original).hexdigest())
     monkeypatch.setattr(model, 'CPU_MODEL_SHA256', hashlib.sha256(expected).hexdigest(), raising=False)
-    model.prepare_cpu_model()
+    model.prepare_cpu_model(source)
+    assert source.read_bytes() == original
     assert path.read_bytes() == expected
     pytest.importorskip('onnxruntime')
     Image = pytest.importorskip('PIL.Image')

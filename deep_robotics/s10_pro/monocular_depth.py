@@ -1,69 +1,21 @@
 """Standalone ONNX monocular depth for the S10 front camera."""
 import hashlib
-import http.client
 import io
 from pathlib import Path
-import ssl
-import threading
-import time
-import urllib.error
-import urllib.request
 import zlib
 
 import numpy as np
 
+from deep_robotics.s10_pro.model_artifact import MODEL_SHA256
 
-MODEL_URL = 'https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-depth.onnx'
-MODEL_SHA256 = '6583ec12521a7e75eacb209db63393158c7e0e772cda9fdad8c8c0fe74af2a1e'
+
 CPU_MODEL_SHA256 = '22be352c818c7f87f63d435557714b02217873a30bd7d30487a57ce9bde0b347'
 MODEL_PATH = Path(__file__).with_name('resource') / 'models' / 'yolo26n-depth.onnx'
-DOWNLOAD_HEARTBEAT_SECONDS = 30
-DOWNLOAD_RETRY_DELAY_SECONDS = 2
 
 
-def download_model(url=None):
-    """Bake a checked artifact into the driver image; never download on start."""
-    stopped = threading.Event()
-    started = time.monotonic()
-
-    def heartbeat():
-        while not stopped.wait(DOWNLOAD_HEARTBEAT_SECONDS):
-            elapsed = int(time.monotonic() - started)
-            print(f'[s10 model] waiting for download/verification ({elapsed}s elapsed)', flush=True)
-
-    print('[s10 model] downloading yolo26n-depth.onnx; SHA-256 verification required', flush=True)
-    worker = threading.Thread(target=heartbeat, name='s10-model-download-heartbeat', daemon=True)
-    worker.start()
-    try:
-        for attempt in range(3):
-            try:
-                with urllib.request.urlopen(MODEL_URL if url is None else url, timeout=120) as response:
-                    payload = response.read(64 * 1024 * 1024 + 1)
-                break
-            except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead) as error:
-                if isinstance(error, urllib.error.HTTPError) and error.code not in (408, 429, 500, 502, 503, 504):
-                    raise
-                if isinstance(error, urllib.error.URLError) and isinstance(error.reason, ssl.SSLCertVerificationError):
-                    raise
-                if attempt == 2:
-                    raise
-                delay = DOWNLOAD_RETRY_DELAY_SECONDS * 2 ** attempt
-                print(f'[s10 model] attempt {attempt + 1}/3 failed ({type(error).__name__}); '
-                      f'retrying in {delay:g}s', flush=True)
-                time.sleep(delay)
-        if len(payload) > 64 * 1024 * 1024 or hashlib.sha256(payload).hexdigest() != MODEL_SHA256:
-            raise ValueError('monocular model download checksum mismatch')
-        MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MODEL_PATH.write_bytes(payload)
-    finally:
-        stopped.set()
-        worker.join()
-    print('[s10 model] download verified and saved', flush=True)
-
-
-def prepare_cpu_model():
+def prepare_cpu_model(source_path=None):
     """Retarget the pinned export's spatial shapes; ONNX is build-only."""
-    source = MODEL_PATH.read_bytes()
+    source = (Path(source_path) if source_path is not None else MODEL_PATH).read_bytes()
     if hashlib.sha256(source).hexdigest() != MODEL_SHA256:
         raise ValueError('monocular model source checksum mismatch')
     import onnx
@@ -90,6 +42,7 @@ def prepare_cpu_model():
     onnx.checker.check_model(prepared)
     if hashlib.sha256(prepared).hexdigest() != CPU_MODEL_SHA256:
         raise ValueError('CPU model preparation checksum mismatch')
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     MODEL_PATH.write_bytes(prepared)
     print('[s10 model] checked CPU model prepared at 320x192', flush=True)
 
@@ -149,6 +102,5 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model-url', default=MODEL_URL)
-    download_model(parser.parse_args().model_url)
-    prepare_cpu_model()
+    parser.add_argument('--source-model', required=True)
+    prepare_cpu_model(parser.parse_args().source_model)

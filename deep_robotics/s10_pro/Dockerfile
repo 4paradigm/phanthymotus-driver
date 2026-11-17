@@ -16,7 +16,7 @@ RUN . /opt/ros/humble/setup.sh && cd /s10_pro_ws && colcon build --packages-sele
 COPY depth_kernels.cpp /tmp/s10_depth_kernels.cpp
 RUN g++ -std=c++17 -O3 -shared -fPIC /tmp/s10_depth_kernels.cpp -o /tmp/_depth_kernels.so
 
-FROM ${ROS_BASE_IMAGE}
+FROM ${ROS_BASE_IMAGE} AS runtime-dependencies
 ARG UBUNTU_MIRROR
 ARG PYPI_MIRROR=https://pypi.org/simple/
 RUN set -eu; missing=""; \
@@ -35,14 +35,23 @@ COPY --from=drdds-builder /s10_pro_ws/install/ /s10_pro_ws/install/
 COPY requirements.txt /tmp/s10-pro-requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/s10-pro-requirements.txt && rm /tmp/s10-pro-requirements.txt
 WORKDIR /work
-COPY monocular_depth.py /work/deep_robotics/s10_pro/
+
+FROM runtime-dependencies AS model-source
+COPY model_artifact.py /tmp/s10_model_artifact.py
+ARG S10_DEPTH_MODEL_URL=https://api.github.com/repos/ultralytics/assets/releases/assets/471363270
+RUN python3 -S /tmp/s10_model_artifact.py --model-url "${S10_DEPTH_MODEL_URL}" --output /model/source.onnx
+
+FROM runtime-dependencies AS model-builder
+COPY monocular_depth.py model_artifact.py /work/deep_robotics/s10_pro/
 COPY requirements-build.txt /tmp/s10-pro-build-requirements.txt
-ARG S10_DEPTH_MODEL_URL=https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-depth.onnx
+COPY --from=model-source /model/source.onnx /tmp/source-model.onnx
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/s10-pro-build-requirements.txt \
-    && python3 -m deep_robotics.s10_pro.monocular_depth --model-url "${S10_DEPTH_MODEL_URL}" \
-    && pip3 uninstall -y onnx && rm /tmp/s10-pro-build-requirements.txt
+    && python3 -m deep_robotics.s10_pro.monocular_depth --source-model /tmp/source-model.onnx
+
+FROM runtime-dependencies
+COPY --from=model-builder /work/deep_robotics/s10_pro/resource/models/ /work/deep_robotics/s10_pro/resource/models/
 COPY common/ /work/common/
-COPY main.py device.py basic_server.py domain_bridge.py loco_servo.py spatial.py media_workers.py undistortion.py front_depth.py depth_projection.py depth_fusion.py cpu_kernels.py cloud_relay.py audio.py config.yaml driver.yaml /work/deep_robotics/s10_pro/
+COPY main.py device.py basic_server.py domain_bridge.py loco_servo.py spatial.py media_workers.py undistortion.py front_depth.py depth_projection.py depth_fusion.py monocular_depth.py model_artifact.py cpu_kernels.py cloud_relay.py audio.py config.yaml driver.yaml /work/deep_robotics/s10_pro/
 COPY --from=drdds-builder /tmp/_depth_kernels.so /work/deep_robotics/s10_pro/_depth_kernels.so
 RUN python3 -c 'from deep_robotics.s10_pro.cpu_kernels import AVAILABLE; assert AVAILABLE, "native depth kernels failed to load"'
 COPY resource/S10_kinematic.urdf /work/deep_robotics/s10_pro/resource/S10_kinematic.urdf
