@@ -44,6 +44,28 @@ plugins:
       8: [255, 255, 255, 0, 0, 0, 128, 128, 128, 255]
       9: [100, 81, 142, 0, 0, 0, 128, 128, 128, 172]
     left_number_poses: *number_poses
+  hand_teach:
+    enabled: true
+    # Built-in presets live in teach_presets/; recordings in data_dir (L20_TEACH_DATA_DIR overrides).
+    data_dir: /opt/phanthy-motus/data/l20-lite-teach
+    record_max_s: 60
+    record_gap_ms: 100  # A longer glove stream gap ends the take as incomplete.
+    thumb_roll_fixed: 255  # The only thumb roll confirmed safe on this hand.
+    motion_speed: 240  # Speed register while streaming.
+    playback_thumb_speed_scaling: false
+    approach_speed: 60  # To and from the start pose, as hand.motion_speed.
+    motion_torque: 60
+    thumb_speed_scaling: true
+    # Raw 0..255 units per 50 ms playback frame.
+    max_step_per_frame: 30
+    tracking_tolerance: 40  # Wait for the hand before advancing when error exceeds this.
+    stall_frames: 4
+    stall_error: 20
+    stall_ms: 100  # A frame this late pauses the trajectory clock (bus held by another card).
+    max_pause_ms: 3000  # A longer bus block aborts playback.
+    position_tolerance: 6
+    approach_timeout_s: 8.0
+    poll_interval_s: 0.1
   hand:
     enabled: true
     # Legacy unbound single-card mode: auto-select the sole hand on serial_port.

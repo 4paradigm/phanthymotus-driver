@@ -24,6 +24,9 @@ class FakeHand:
         self._bus_lock = threading.RLock()
         self.sides = sides or {"right": "/dev/fake"}
 
+    def start_card_motion(self, start, *args):
+        return start(*args)
+
     def _discover(self):
         return dict(self.sides)
 
@@ -41,7 +44,7 @@ def test_card_registered_without_changing_hand_schema():
     full = load_config(DRIVER / "config.yaml")
     plugins = build_plugins(full, "", None)
     tools = {item["name"]: item for item in DriverBundle(plugins).get_all_tools()}
-    assert "hand" in tools and "hand_gesture" in tools
+    assert set(tools) == {"hand", "hand_gesture", "hand_teach"}
     assert "ok_gesture" not in tools["hand"]["inputSchema"]["properties"]["action"]["enum"]
     schema = tools["hand_gesture"]["inputSchema"]
     assert set(ACTIONS) <= set(schema["properties"]["action"]["enum"])

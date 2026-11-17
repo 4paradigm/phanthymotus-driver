@@ -13,6 +13,12 @@ COPY main.py       /work/main.py
 COPY modbus_client.py /work/modbus_client.py
 COPY modbus_device.py /work/modbus_device.py
 COPY gesture_device.py /work/gesture_device.py
+COPY hand_trajectory.py /work/hand_trajectory.py
+COPY glove_input.py /work/glove_input.py
+COPY teach_messages.py /work/teach_messages.py
+COPY teach_device.py /work/teach_device.py
+COPY teach_recorder.py /work/teach_recorder.py
+COPY teach_presets/ /work/teach_presets/
 COPY config.yaml   /work/config.yaml
 COPY deploy/       /deploy/
 

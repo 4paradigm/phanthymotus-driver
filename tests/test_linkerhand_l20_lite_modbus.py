@@ -801,6 +801,7 @@ def test_unbound_legacy_card_still_works_but_second_unbound_card_is_rejected(mon
 def test_build_plugins_exposes_one_multi_instance_hand_tool():
     config = load_config(str(DRIVER / "main.py"))
     config["plugins"]["hand_gesture"]["enabled"] = False
+    config["plugins"]["hand_teach"]["enabled"] = False
     plugins = modbus_device.build_plugins(config, "", None)
     assert len(plugins) == 1
     tools = DriverBundle(plugins).get_all_tools()
