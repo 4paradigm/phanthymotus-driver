@@ -10,13 +10,15 @@ ros:
   robot_interface: lo
 
 motion_arm_ips:
-  left: 172.16.0.2
-  right: 172.16.0.3
+  left: 172.16.0.3
+  right: 172.16.0.2
 
 vision_pick_and_drop:
-  observation_joints_deg: "-25.4,59.4,10.8,-119.4,-65.0,233.8,44.5"
+  default_arm: left
+  observation_joints_deg: "-35.06,20.81,23.42,-144.09,114.94,132.07,-121.36"
   camera_serial: "262922070633"
   planning:
+    grasp_depth_offset_mm: -5
     handeye:
       robot_ip: 172.16.0.3
       camera_serial: "262922070633"
@@ -25,11 +27,11 @@ vision_pick_and_drop:
         - [-0.9985439292030525, -0.05366554228520978, -0.005480056839486553, 0.0071918004594705605]
         - [0.01903519174880896, -0.44558091225356466, 0.8950392796466352, -0.03602244084820442]
         - [0.0, 0.0, 0.0, 1.0]
-      accepted: false
+      accepted: true
   arm_profiles:
-    left:
+    right:
       camera_serial: "263022071451"
-      observation_joints_deg: "28.8, 46.9, -24.3, -126.2, -124.9, 129.0, 46.4"
+      observation_joints_deg: "42.22,17.33,-33.17,-143.85,-115.56,138.58,26.82"
       planning:
         grasp_depth_offset_mm: 25
         # Measured SDK frame; independent of the 25 mm grasp correction.

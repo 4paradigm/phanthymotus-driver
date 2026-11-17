@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import json
 import logging
 import math
@@ -426,6 +427,56 @@ class JointControlPlugin(FrankaPlugin):
         self._enabled = True
         self._execution_epoch = 0
         self._stopping = False
+        from franka.fr3.arm_ips import ArmIPInput
+        ros2 = kwargs.get("ros2", args[2] if len(args) > 2 else None)
+        self._endpoint_lock = threading.RLock()
+        self._arm_ip_input = ArmIPInput(ros2, self._apply_arm_ip_mapping,
+                                       name="fr3_" + self.PREFIX + "_arm_ip_input")
+        self._arm_ip_peer = None
+
+    def _arm_ip_ports(self):
+        return [{"format": "data/json", "desc": "Left/right arm controller IPs from arm_ip_sync",
+                 **({"topic": self._arm_ip_input.topic} if self._arm_ip_input.topic else {})}]
+
+    def _apply_arm_ip_mapping(self, addresses):
+        from franka.fr3.arm_ips import mapping
+        addresses = mapping(addresses)
+        if addresses == self._arm_ips:
+            return
+        if not self._endpoint_lock.acquire(blocking=False):
+            raise RuntimeError("Card is busy; retry the arm IP update")
+        try:
+            if addresses == self._arm_ips:
+                return
+            with ExitStack() as stack:
+                if not self._lock.acquire(blocking=False):
+                    raise RuntimeError("Card state is busy; retry the arm IP update")
+                stack.callback(self._lock.release)
+                plugins = [self] + ([self._arm_ip_peer] if self._arm_ip_peer is not None else [])
+                for plugin in plugins:
+                    with plugin._manager._lock:
+                        sessions = [entry[0] for entry in plugin._manager._sessions.values()]
+                    for session in sessions:
+                        if session.motion().get("status") in ("submitted", "accepted", "queued", "running", "stopping"):
+                            raise RuntimeError("An arm or gripper action is active; arm IP update rejected")
+                        if session.snapshot().get("is_grasped"):
+                            raise RuntimeError("The gripper is holding an object; arm IP update rejected")
+                instances = list(self._instances.items())
+                for key, instance in instances:
+                    if not instance.lock.acquire(blocking=False):
+                        raise RuntimeError("A robot connection is busy; retry the arm IP update")
+                    stack.callback(instance.lock.release)
+                for key, instance in instances:
+                    self._stop_instance(key, instance)
+                self._arm_ips = dict(addresses)
+                # IP-keyed instances are recreated lazily on the next action.
+                self._instances.clear()
+        finally:
+            self._endpoint_lock.release()
+
+    def stop(self):
+        self._arm_ip_input.stop()
+        super().stop()
 
     def start(self):
         # Motion connections are acquired lazily by explicit action requests.
@@ -496,6 +547,14 @@ class JointControlPlugin(FrankaPlugin):
                 self._stopping = False
 
     def dispatch(self, action, args):
+        with self._endpoint_lock:
+            result = self._dispatch_card(action, args)
+            if isinstance(result, dict):
+                result = dict(result, topic_in=self._arm_ip_ports(),
+                              motion_arm_ips=dict(self._arm_ips), arm_ip_input=self._arm_ip_input.info())
+            return result
+
+    def _dispatch_card(self, action, args):
         if args.get("_tool_name", action) != self.PREFIX:
             return None
         if action == "Stop":
@@ -507,9 +566,17 @@ class JointControlPlugin(FrankaPlugin):
                     raise RuntimeError("Driver is shutting down")
                 if action == "start":
                     self._enabled = True
+            if action == "start":
+                from franka.fr3.arm_ips import split_topics
+                topic, other = split_topics(args)
+                if other:
+                    raise ValueError("Connect only the arm_ip_sync output to this card")
+                self._arm_ip_input.start(topic)
             return {"state": "ready" if self._enabled else "idle", "topic_out": []}
         if action == "stop":
-            return self._stop_all(release=True)
+            result = self._stop_all(release=True)
+            self._arm_ip_input.stop()
+            return result
         if action == "stopmotion" and not any(args.get(k) for k in ("arm", "robot_ip")):
             return self._stop_all()
         if action == "info" and not any(args.get(k) for k in ("arm", "robot_ip")):
@@ -534,6 +601,10 @@ class JointControlPlugin(FrankaPlugin):
             self._number(args.get(speed_key), speed_key, 0.1, high)
         if action == "grasp":
             self._grasp_options(args)
+        if action in self.MOTION_ACTIONS and self._arm_ips and not self._arm_ip_input.info()["ready"]:
+            return {"state": "error", "code": "ARM_IP_INPUT_NOT_READY",
+                    "message": self._arm_ip_input.info()["error"] or
+                    "Start and connect arm_ip_sync; no valid left/right mapping has been received"}
         address = self._target_ip(args)
         key = "robot_" + address.encode("ascii").hex()
         forwarded = {k: v for k, v in args.items()
@@ -607,7 +678,8 @@ class JointControlPlugin(FrankaPlugin):
         schema["x-hooks"] = {key: {"action": "stopmotion"}
                              for key in ("on_interrupt_motion", "on_interrupt_all")}
         return [{**tool(self.PREFIX, "actuator",
-                        "Franka FR3 joint control: J1-J7 absolute targets, single-step jog and confirmed stop.", schema),
+                        "Franka FR3 joint control: J1-J7 absolute targets, single-step jog and confirmed stop. Connect arm_ip_sync to supply left/right controller IPs.", schema,
+                        topic_in=self._arm_ip_ports()),
                  "multiInstance": False}]
 
     def _info(self, instance_id, instance):
@@ -831,6 +903,7 @@ class JointControlPlugin(FrankaPlugin):
 
 
 def build_plugins(config, namespace, ros2):
+    from franka.fr3.arm_ip_sync import ArmIPSyncPlugin
     from franka.fr3.camera import ExtCameraPlugin
     from franka.fr3.gripper import GripperPlugin
     from franka.fr3.pick_place import PickPlacePlugin
@@ -838,6 +911,9 @@ def build_plugins(config, namespace, ros2):
     controller = JointControlPlugin(config, namespace, ros2,
         manager=sensor._manager, discovery=sensor._discovery)
     gripper = GripperPlugin(config, namespace, ros2, discovery=sensor._discovery)
+    controller._arm_ip_peer = gripper
+    gripper._arm_ip_peer = controller
     camera = ExtCameraPlugin(config.get("ext_camera", {}), namespace, ros2)
+    pick = PickPlacePlugin(config, sensor._manager, camera, ros2, gripper_manager=gripper._manager)
     return [sensor, controller, gripper, camera,
-            PickPlacePlugin(config, sensor._manager, camera, ros2, gripper_manager=gripper._manager)]
+            ArmIPSyncPlugin(config.get("motion_arm_ips", {}), namespace, ros2), pick]

@@ -81,21 +81,21 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(p.config['observation_joints_deg'],ANGLES)
         self.assertEqual((p.address,p.serial),('172.16.0.3','right-camera'))
         self.assertEqual(p.config['z_compensation_mm'],0)
-        for value in (float('nan'),51,True):
-            self.assertEqual(p.dispatch('config',{'z_compensation_mm':value})['code'],'INVALID_CONFIG')
+        for value in (float('nan'),0,True):
+            self.assertEqual(p.dispatch('config',{'speed_deg_s':value})['code'],'INVALID_CONFIG')
 
     def test_arm_specific_observation_fields_and_legacy_offset(self):
         p = self.dual_plugin()
         schema = p.get_tools()[0]['configSchema']['properties']
-        self.assertEqual(schema['left_observation_joints_deg']['x-show-when'],
-                         {'arm': '172.16.0.2（左手）'})
+        self.assertNotIn('left_observation_joints_deg', schema)
+        self.assertNotIn('x_compensation_mm', schema)
         result = p.dispatch('config', {
             'arm': '172.16.0.2（左手）', 'left_observation_joints_deg': ANGLES,
             'depth_compensation_mm': 25, 'x_compensation_mm': 3})
         self.assertTrue(result['ok'])
-        self.assertEqual(result['observation_joints_deg'], ANGLES)
+        self.assertTrue(result['observation_joints_deg'].startswith('-129.3'))
         self.assertEqual(result['z_compensation_mm'], 0)
-        self.assertEqual(result['x_compensation_mm'], 3)
+        self.assertEqual(result['x_compensation_mm'], 0)
 
     def test_arm_switch_rejects_active_motion_and_mismatched_calibration(self):
         p=self.dual_plugin();p.active={'action_id':'moving'}

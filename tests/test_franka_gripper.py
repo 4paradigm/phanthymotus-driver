@@ -84,7 +84,7 @@ class GripperCardTests(unittest.TestCase):
         self.assertIn("feedback", completion[2])
         self.publishers.assert_not_called()
 
-    def test_arm_selection_routes_without_a_topic_or_card_id(self):
+    def test_arm_selection_routes_from_ip_input_without_a_card_id(self):
         self.plugin._arm_ips = {"left": "172.16.0.3", "right": "172.16.0.2"}
         spec, = self.bundle.get_all_tools()
         self.assertNotIn("configSchema", spec)
@@ -93,6 +93,8 @@ class GripperCardTests(unittest.TestCase):
         self.assertEqual("ready", self.call("start", speed_mm_s=15)["state"])
         self.call("start", "hand-b", speed_mm_s=15)
         self.assertEqual([], self.sessions)
+        self.plugin._arm_ip_input.topic = "/franka/arm_ip_sync"
+        self.plugin._arm_ip_input.receive('{"left":"172.16.0.3","right":"172.16.0.2"}')
         left = self.call("set_position", instance_id="", arm="left", width_mm=20)
         right = self.call("set_position", instance_id="", arm="right", width_mm=20)
         self.assertEqual(["172.16.0.3", "172.16.0.2"], [session.address for session in self.sessions])

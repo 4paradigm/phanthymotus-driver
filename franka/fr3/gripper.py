@@ -70,7 +70,8 @@ class GripperPlugin(JointControlPlugin):
         schema["x-is-dangerous"] = True
         schema["x-hooks"] = {key: {"action": "stopmotion"}
                              for key in ("on_interrupt_motion", "on_interrupt_all")}
-        return [{**tool(self.PREFIX, "actuator", "Franka gripper: opening, grasp, homing calibration and confirmed stop.", schema),
+        return [{**tool(self.PREFIX, "actuator", "Franka gripper: opening, grasp, homing calibration and confirmed stop. Connect arm_ip_sync to supply left/right controller IPs.", schema,
+                        topic_in=self._arm_ip_ports()),
                  "multiInstance": False}]
 
     def _info(self, instance_id, instance):

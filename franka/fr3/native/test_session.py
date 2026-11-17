@@ -27,6 +27,7 @@ enum class ControllerMode { kJointImpedance };
 struct RobotState {
   std::array<double,7> q{0,-0.5,0,-1.5,0,1.5,0}, q_d=q, dq{}, tau_J{};
   RobotMode robot_mode=RobotMode::kIdle;
+  std::array<double,16> O_T_EE{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1}, F_T_EE=O_T_EE;
   bool current_errors=false;
 };
 struct JointPositions {
@@ -34,6 +35,12 @@ struct JointPositions {
   bool motion_finished=false;
   explicit JointPositions(std::array<double,7> a):q(a){}
 };
+inline std::array<double,7> computeUpperLimitsJointVelocity(const std::array<double,7>&) {
+  return {2,2,2,2,2,2,2};
+}
+inline std::array<double,7> computeLowerLimitsJointVelocity(const std::array<double,7>&) {
+  return {-2,-2,-2,-2,-2,-2,-2};
+}
 inline JointPositions MotionFinished(JointPositions q) { q.motion_finished=true; return q; }
 struct ControlException:std::runtime_error { using std::runtime_error::runtime_error; };
 inline bool hasRealtimeKernel() { return std::getenv("FR3_FAKE_RT") != nullptr; }
@@ -93,7 +100,7 @@ class Robot {
 
 class NativeSessionTest(NativeProcessCase):
     source = "read_state.cpp"
-    headers = ('control_tools.h', 'exception.h', 'robot.h', 'robot_state.h')
+    headers = ('control_tools.h', 'exception.h', 'robot.h', 'robot_state.h', 'rate_limiting.h')
     fake_sdk = FAKE_SDK
 
     def start(self, realtime=True, **options):

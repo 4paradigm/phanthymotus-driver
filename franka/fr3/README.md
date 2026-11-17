@@ -11,6 +11,7 @@ external RealSense cameras over USB. It registers with Agent Core as
 | `joint_control` | Actuator | Absolute joint targets, single-axis jog, and controlled stop |
 | `gripper` | Actuator | Franka Hand opening, grasp, calibration, and stop |
 | `ext_camera` | Sensor | RGB, depth, or left near-infrared from a selected RealSense |
+| `arm_ip_sync` | Sensor | Configured left/right controller IP stream and manual PNP refresh |
 
 ## Requirements
 
@@ -76,6 +77,23 @@ limits do not model obstacles in the workcell.
 `joint_control` and `gripper` are single-instance cards with no configuration panel.
 Select `arm` and enter speed, force and other parameters directly in each action.
 Without a workstation arm mapping, enter `robot_ip` in the action instead.
+Connect the `arm_ip_sync` sensor output (`data/json`) to each of these cards.
+Their `left`/`right` action choices and other action parameters remain unchanged.
+In dual-arm workstation mode, commands require a successfully received mapping;
+there is no silent fallback to YAML addresses when the stream has not supplied
+one. Each card subscribes independently and reports `motion_arm_ips` and
+`arm_ip_input` through `info`. A valid cached mapping does not expire when
+heartbeats pause. Manual `sync` is not required after intelligent-control restart;
+starting the connected sensor publishes its current configuration again.
+
+Changed endpoints apply immediately while idle, releasing that card's old
+connections. Updates are rejected during arm/Hand motion or while a known Hand
+session is holding an object. Repeated unchanged messages are allowed during
+motion. Invalid input blocks new motion without changing the last applied
+mapping; stop and stopmotion remain available. Card stop releases its IP
+subscriber. The legacy standalone single-controller `robot_ip` mode remains
+available when no dual-arm mapping is configured.
+
 The first execution connects and waits up to five seconds for fresh, control-ready
 feedback before submitting motion. Offline or unsafe states still reject motion.
 
@@ -134,10 +152,11 @@ Confirm fresh joint state, the three camera channels and USB reconnect,
 then verify arm and gripper motion, stop behavior, and ACP acknowledgement
 with the operator monitoring the workcell.
 
-With `motion_arm_ips` configured, each action selects the left or right arm.
-Each arm accepts one in-flight action per control type. The workstation mapping
-is stored under `motion_arm_ips.left` and `motion_arm_ips.right` in the driver
-configuration; it is not a canvas card configuration.
+With `motion_arm_ips` configured, actions select the physical left or right arm.
+The YAML values initialize the sensor defaults; connected cards use the mapping
+received from `arm_ip_sync`. Configure that sensor for another installation.
+Use each controller's C2 (Shop Floor network) IP, match the physical mounting
+side, and give the arms distinct addresses.
 
 ## Grasp limits
 
@@ -148,146 +167,91 @@ in the error before connecting to hardware. Optional `min_width_mm` and
 An omitted lower/upper bound uses target minus/plus 5 mm, bounded to 0–80 mm.
 The limits describe acceptable grasp width, not extra move commands.
 
-### Wrist vision pick and place
+## Visual pick and place
 
-`vision_pick_and_drop` supports RealMan-compatible `observe`, `grab_to`,
-`grab_by` and `cancel`, with `start`, `stop`, `info` and `config` lifecycle calls.
-Connect depth (`image/depth-zlib`), RGB (`image/jpeg`), and VOP objects
-(`data/json`) from the same wrist camera. VOP must consume that RGB topic.
+`vision_pick_and_drop` provides `observe`, `grab_to`, `grab_by`, and `cancel`.
+Select only `left` or `right`; camera assignments, observation joints, tool
+geometry and accepted hand-eye calibration are stored per physical side in
+`config.yaml`. The deployed .3/262922070633 pair is left and the
+.2/263022071451 pair is right. Endpoint changes do not recalibrate a robot.
 
-Configure `vision_pick_and_drop.camera_serial` and `motion_arm_ips.right` for
-the right arm. Store the left camera, observation pose and planning calibration
-under `vision_pick_and_drop.arm_profiles.left`, with `motion_arm_ips.left`.
-The card configuration selects `IP（左手）` or `IP（右手）`. Switching selects
-that arm's saved profile and invalidates the previous photograph; run `observe`
-again. Connected RGB/depth topics stay unchanged while their camera device is
-switched to the selected wrist. Switching during an active action is rejected.
-The left planning profile stores the commissioned 25 mm grasp-depth offset
-separately from the measured hand-eye transform. Optional per-arm X/Y/Z
-adjustments default to zero. Positive X/Y follow image right/down along the
-table, and positive Z moves deeper along the downward tool axis.
-Set `observation_joints_deg` to seven
-measured FR3 angles in degrees; RealMan's default angles are invalid for FR3.
-Configure `speed_deg_s` (default 5, minimum 0.1 degrees/s) and
-`speed_mm_s` (default 20, range 0.1–100 mm/s) once on the card. Transfer
-actions use the stored speeds. Native PATH timing applies libfranka’s position-dependent joint speed limits
-and preserves the driver’s acceleration and jerk bounds.
+Connect these inputs, in any order:
 
-Call `observe` with `confirm_motion=true`; it uses a fixed 2 degrees/s observation speed without a speed input. If already within 0.2 degrees of
-all observation joints, no motion command is sent. Otherwise the card sends
-one joint target; review the return path before using it from other poses.
-This observation-only move does not run the grasp planner. It opens the unloaded
-hand to its calibrated maximum before moving, without applying grasp force.
+| Input | Format | Contract |
+| --- | --- | --- |
+| RGB | `image/jpeg` | Selected wrist camera's `/rgb` topic |
+| Depth | `image/depth-zlib` | Same camera's `/depth` topic |
+| Objects | `data/json` | VOP must consume that RGB; output is `/rgb/objects` |
+| Arm IPs | `data/json` | `arm_ip_sync` output, ending in `/arm_ip_sync` |
 
-The card retains one private aligned RGB-D snapshot and the SDK EE pose.
-Public results contain `observation_id`, `captured_at`, dimensions, pose
-(position in metres, RPY in radians), VOP `objects`, and synchronization data.
-`position` remains image-centred normalized XY in [-1,1], not a 3D position.
-The immediate response is `running` plus `action_id`; completion, error or
-cancellation is posted to Core's `/api/acp/complete`, using the existing FR3
-loopback TLS policy. `info.last_result.callback` records delivery status.
+Configure `force_n` (30–70 N), `speed_deg_s` and `speed_mm_s` before transfer.
+Speeds are joint degrees/s and total finger-spacing mm/s, not percentages.
+`observe_after_transfer` optionally captures another observation after returning.
+Legacy saved IP-bearing arm labels migrate by physical side. Dual-arm execution requires the IP input; configured YAML defaults alone do not
+authorize motion.
 
-Input matching uses publication timestamps, not measured hardware exposure
-synchronization. RGB/depth and detection/RGB skew are bounded to 200 ms;
-only fresh data acquired after a stationary observation window is accepted.
-Do not use this commissioning stage for moving-target grasping.
+`observe` uses a fixed 2 deg/s observation speed and returns object names,
+normalized positions and confidence. Position is image-centered XY in [-1,1],
+with positive X right and positive Y down; it is not a robot-base coordinate.
+The driver retains aligned RGB-D, camera calibration and the captured SDK EE
+pose privately. Publication timestamps are bounded to 200 ms skew; they are not
+hardware exposure synchronization. Objects must remain stationary after capture.
 
-For planned FR3 grasp actions, compute the grasp target from the latest
-stationary `observe` snapshot and plan the approach and lift before moving.
-Use that saved target throughout the approach, without a close-range camera
-or depth confirmation. This assumes the object stays stationary. If the
-scene changes, acquire a new observation and replan. On hardware, use the
-gripper's `is_grasped` feedback before lifting.
+Both transfer actions automatically observe when no saved photograph is available:
 
-Grasp planning runs automatically inside `grab_to` and `grab_by`. It estimates
-the table and target from the saved RGB-D snapshot, aligns the jaws, then checks
-the approach, vertical descent, grasp/lift, transfer and return before motion.
-Configure `vision_pick_and_drop.planning.handeye` with the matching calibration.
-The 20 mm empirical grasp offset and per-arm depth correction only set the target;
-they do not define the physical finger geometry. The Hand V2 collision model uses
-the measured SDK `F_T_EE`, housing bounds and all four collision boxes per finger.
-It checks the 0–80 mm opening envelope against the table with 5 mm clearance
-along sampled pick, lift, transfer and return splines. Left-arm opening and
-standalone observation returns also check the fixed calibrated table plane.
-Recalibrate that plane if the bench or robot mounting moves. An unsafe target is
-rejected without changing the saved 25 mm left correction. This model check is
-not a contact-based six-axis TCP calibration. Insufficient depth or an
-unreachable path returns an error without sending motion commands.
+- `grab_to`: `start_point_x/y` and `target_point_x/y`, all from the same image.
+- `grab_by`: `start_point_x/y` plus `delta_x/y` in physical table millimetres,
+  aligned with image right/down. A displacement or rotation must be nonzero.
+- Both require `confirm_motion=true`; optional `rotation_deg` is [-180,180],
+  clockwise viewed from above, applied after lifting.
 
-Action inputs follow RealMan coordinates/displacements, optional `rotation_deg`,
-and `confirm_motion=true`. `force_n` (30–70 N) is persistent configuration and
-must be set explicitly without an implicit default. RealMan raw force registers and fixed descent distances are not used;
-FR3 retains depth-based grasp-height planning. Fresh `is_grasped` confirmation is required
-before lifting. `info` reports progress; `cancel` stops pending commands without
-automatically opening an already held object. Failed or uncertain grasps report
-`holding_object_possible` and `recovery_required`.
+The driver plans approach, descent, lift, transfer, placement and return before
+commanding motion. It checks joint limits, sampled paths, modeled arm clearance
+and Hand/table clearance. Environment geometry beyond those models is not
+certified. Unaccepted calibration, insufficient depth or infeasible paths reject
+transfer. The original calibration matrices are retained when an IP changes.
+The Hand's `is_grasped` feedback is checked before and during transport; it does
+not measure contact force or prove placement.
 
-For commissioning, use the matching right-arm/camera hand-eye profile in
-`vision_pick_and_drop.planning.handeye`. Start the RGB, depth and VOP inputs,
-run `observe`, select its object's normalized position, then run `grab_to` or `grab_by`.
-Use `grab_by` to grab, move by actual table millimetres and place:
+Transfers return `running` with an `action_id`; one ACP callback reports completion,
+error or cancellation. `info` retains the result, stage, mapping and input readiness.
+Check `transfer_completed`, `release_completed`, `return_completed`,
+`last_completed_stage`, `observation_required` and `recovery_required` before retrying.
+Cancellation never automatically opens a possibly held object. A failed return or
+post-transfer capture does not erase an already completed placement.
 
-```json
-{"action":"grab_by","start_point_x":-0.33,"start_point_y":0.32,
- "delta_x":30,"delta_y":0,"rotation_deg":0,
- "confirm_motion":true}
-```
+## Arm IP sensor
 
-`delta_x` is positive toward image right; `delta_y` is positive toward image
-down. The calibrated camera axes are projected onto the table plane; these
-are not pixel offsets or fixed base-frame axes. Both values are required.
-For `grab_to`, replace both deltas with `target_point_x` and `target_point_y`
-in [-1,1] from the same saved observation. The selected placement ray must
-have valid depth and intersect the fitted table. Placement assumes the same
-supporting table plane and a stationary scene.
+`arm_ip_sync` is a single-instance configuration sensor. `start` publishes
+`{"left":"172.16.0.3","right":"172.16.0.2"}` as `std_msgs/String` JSON at
+1 Hz on `/{namespace}/arm_ip_sync` (`data/json`); `stop` releases the publisher.
+The payload is an endpoint mapping, not a measurement of robot connectivity.
+`info` returns its authoritative topic, configuration and publication freshness.
 
-`rotation_deg` defaults to zero and accepts [-180,180]. It adds a rotation
-about the downward gripper axis after lifting, clockwise viewed from above;
-it does not replace automatic jaw alignment at the pick point. The complete
-pick, transfer, release retreat and observation return are planned before
-any command. The transfer is one continuous PATH through lift, optional
-rotation, translation and descent. After opening is confirmed, the arm
-retreats 150 mm then returns to the saved observation joints. Each phase
-uses a continuous spline, rather than separate stop/start joint targets.
+Configure both arm IPs and, optionally, the PNP host address. SSH defaults are
+username `pnp` and password `ros`; the password is editable, masked and sensitive,
+and never included in stream payloads or results. Provision a verified PNP host
+key in `/opt/phanthy-motus/franka-controller-access/known_hosts`, with alias
+`franka-pnp-controller`. Unknown/changed keys are rejected. Without an explicit
+PNP address, discovery uses existing neighbors on the robot interface; set
+`FRANKA_ROBOT_INTERFACE` if routing cannot identify that interface.
 
-The immediate result is `state: running` with `action_id`; a single terminal
-ACP callback reports `completed`, `error` or `cancelled`. `info.stage` gives
-progress. Successful transfer results include `observation_id`, `pick_pixel`,
-`pick_base_xy_mm`, `place_base_xy_mm`, `final_pose`, `rotation_deg`,
-`rotation_completed`, `release_completed`, `transfer_completed`, `return_completed`,
-`observe_after_transfer`, `observation`, `recovery_required` and
-`grasp_checked`. `grab_by` additionally returns `delta_x`, `delta_y` and
-`direction_reference: observation_image`; `grab_to` returns `place_pixel`.
-Base XY fields retain RealMan's format; because this FR3 is side-mounted,
-they must not be interpreted as the table's right/down axes. Feedback checks
-Hand `is_grasped` before and during transport and confirms opening before
-retreat; it does not measure actual contact force or prove object placement.
-On error/cancel the card stops pending commands and never automatically
-opens a possibly held object. `release_completed` distinguishes failures
-before and after release. Completed transfer/return flags are preserved if a
-later return or camera capture fails; do not repeat an already completed transfer.
-`last_completed_stage` identifies the last confirmed motion phase.
-`feedback_recoveries` is 0: FR3 currently aborts invalid feedback instead of
-implementing RealMan's feedback-recovery wait loop.
+`sync` is an optional manual acquisition refresh: it reads the trusted PNP host's
+existing Desk/hardware configuration in a bounded background job. It returns an
+`action_id`; ACP and `info.last_result` report its outcome. It neither commands
+motion nor directly edits another card. Successful config/sync saves the mapping
+atomically under `/opt/phanthy-motus/franka-ip-sync/binding.json`; errors retain
+the previous values. The deployment template mounts this directory and SSH trust
+data on the host so they survive container replacement.
 
-Configure `observe_after_transfer` (boolean, default false) to capture a fresh
-RGB-D/VOP observation after the planned return, under the same action ID and ACP
-completion. When disabled, `observation` is `{"skipped":true,"reason":"disabled"}`
-and `observation_required` is true. When enabled, `observation` contains the same
-public fields as `observe`, including the new `observation_id` and `objects`;
-`observation_required` is false and the snapshot is available for the next transfer.
-The outer `observation_id` still identifies the photo used for this transfer.
-Capture failure reports an error without clearing confirmed transfer/return flags.
-A planning rejection before session acquisition retains the original snapshot.
-FR3-specific hand speed/force configuration, finite timeouts, stage names and SDK
-`is_grasped` checks remain; RealMan's fixed descent and raw force settings are not
-copied to this hardware. No `/api/event` calls are used.
+Connect this output separately to `joint_control`, `gripper` and the visual card.
+Consumers apply endpoint updates while idle and reject changes during active
+motion or a known held object. They retain a valid received mapping when
+heartbeats pause: `arm_ip_input.ready` controls availability, while `fresh` is
+only a heartbeat diagnostic. New subscriptions must first receive a valid mapping.
+No manual sync is needed after intelligent-control restart; the source republishes
+its current configuration. Reobserve after changing a visual-card endpoint.
 
-Use the existing VOP data viewer for normalized target coordinates. A label
-may be ignored, but its position must point to the intended object, not another
-part of the image. The driver does not advertise a result stream; terminal
-results remain available through `info.last_result` and the ACP callback.
-Depth is read automatically from the saved RGB-D frame. A single missing
-centre pixel can use a consistent 5x5 neighbourhood; a sparse or mixed-depth
-patch is rejected with its normalized coordinate and RGB pixel in the error.
-Observation input synchronization times out after 30 seconds.
+Runtime schema defaults and `info.config` reflect sensor updates. Core owns its
+saved form; this driver does not rewrite that database. Reapplying an older form
+is an explicit configuration change and can restore older values.
