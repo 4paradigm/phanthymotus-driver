@@ -19,6 +19,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from contracts import (
+    ARM_MIRROR_SIGNS,
     HEAD_JOINTS,
     LEFT_ARM_JOINTS,
     RIGHT_ARM_JOINTS,
@@ -525,6 +526,7 @@ class PantherDevice:
             "available": True,
             "age_ms": age_ms(received),
             "format": "sensor/skeleton",
+            "position_unit": "rad",
             "source_topic": "/joint_states",
             "model_source": model_source,
             "model_sha256": model_sha256,
@@ -556,8 +558,11 @@ class PantherDevice:
     def _imu_payload(msg, received) -> dict:
         def known(covariance) -> bool:
             try:
-                return not covariance or float(covariance[0]) != -1.0
-            except (TypeError, ValueError):
+                if covariance is None or len(covariance) == 0:
+                    return True
+                first = float(covariance[0])
+                return math.isfinite(first) and first != -1.0
+            except (TypeError, ValueError, IndexError):
                 return False
 
         orientation = None
@@ -1123,13 +1128,15 @@ class PantherDevice:
                     "limits_loaded": bool(self._joint_limits)}
         if action in ("stop", "cancel"):
             return self._stop_arm("cancelled_by_request", wait_s=10.0)
-        if action not in ("move", "home"):
+        if action not in ("move", "move_separate", "home"):
             raise ValueError(f"unsupported arm_control action: {action}")
         require_confirmation(args)
         self._ensure_motion_ready()
         cfg = self._cfg["plugins"]["arm_control"]
         max_duration = float(cfg["max_duration_s"])
-        side = args.get("side", "both" if action == "home" else "left")
+        side = "both" if action == "move_separate" else args.get(
+            "side", "both" if action == "home" else "left"
+        )
         if side not in ("left", "right", "both"):
             raise ValueError("side must be left, right, or both")
         joint_msg, received = self._get("joints")
@@ -1138,6 +1145,12 @@ class PantherDevice:
         current = {name: value for name, value in zip(joint_msg.name, joint_msg.position)}
         max_delta = math.radians(float(cfg["max_target_delta_deg"]))
         targets: dict[str, list[float]] = {}
+
+        shared_updates = {
+            index: finite_number(args[f"j{index}_deg"], f"j{index}_deg")
+            for index in range(8)
+            if args.get(f"j{index}_deg") is not None
+        }
 
         def target_for(arm_side: str, names: tuple[str, ...]) -> list[float]:
             legacy_field = "positions_deg" if side == arm_side else f"{arm_side}_positions_deg"
@@ -1152,6 +1165,17 @@ class PantherDevice:
                 values = [current.get(name) if home.get(name) is None
                           else math.radians(finite_number(home[name], f"home_pose_deg.{name}"))
                           for name in names]
+            elif action == "move" and shared_updates:
+                updates = {
+                    name: math.radians(
+                        shared_updates[index]
+                        * (ARM_MIRROR_SIGNS[index]
+                           if side == "both" and arm_side == "right" else 1.0)
+                    )
+                    for index, name in enumerate(names)
+                    if index in shared_updates
+                }
+                values = [updates.get(name, current.get(name)) for name in names]
             else:
                 prefix = "la" if arm_side == "left" else "ra"
                 updates = {
@@ -1161,6 +1185,8 @@ class PantherDevice:
                     if args.get(f"{prefix}{index}_deg") is not None
                 }
                 if not updates:
+                    if action == "move":
+                        raise ValueError("at least one j0_deg..j7_deg target is required")
                     raise ValueError(f"at least one {prefix}0_deg..{prefix}7_deg target is required")
                 values = [updates.get(name, current.get(name)) for name in names]
             # Home is subject to the same per-command delta gate as every

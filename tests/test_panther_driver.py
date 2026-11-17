@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -8,6 +9,7 @@ import math
 import re
 import sys
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -102,8 +104,17 @@ class PantherDriverTest(unittest.TestCase):
         self.assertIn("+forward", base["properties"]["linear_x"]["description"])
         self.assertIn("+left", base["properties"]["linear_y"]["description"])
         arm = tools["arm_control"]["inputSchema"]
-        self.assertTrue({"move", "home", "stop"} <= set(arm["properties"]["action"]["enum"]))
-        self.assertTrue({"la0_deg", "la7_deg", "ra0_deg", "ra7_deg"} <= set(arm["properties"]))
+        self.assertTrue({"move", "move_separate", "home", "stop"} <= set(arm["properties"]["action"]["enum"]))
+        self.assertTrue({"j0_deg", "j7_deg", "la0_deg", "la7_deg", "ra0_deg", "ra7_deg"} <= set(arm["properties"]))
+        self.assertEqual(
+            arm["x-action-params"]["move"]["params"],
+            ["side", *[f"j{i}_deg" for i in range(8)], "duration_s", "confirm_motion"],
+        )
+        self.assertEqual(
+            arm["x-action-params"]["move_separate"]["params"],
+            [*[f"la{i}_deg" for i in range(8)], *[f"ra{i}_deg" for i in range(8)],
+             "duration_s", "confirm_motion"],
+        )
         self.assertIs(arm["properties"]["confirm_motion"]["const"], True)
         gripper = tools["gripper"]["inputSchema"]
         self.assertEqual(gripper["properties"]["side"]["enum"], ["left", "right", "both"])
@@ -131,7 +142,7 @@ class PantherDriverTest(unittest.TestCase):
         self.assertNotIn("x-hooks", tools["lifting"]["inputSchema"])
         confirmed = {
             "base_drive": {"move"},
-            "arm_control": {"move", "home"},
+            "arm_control": {"move", "move_separate", "home"},
             "gripper": {"set", "open", "close"},
             "lifting": {"set_position", "home"},
             "head": {"look", "home"},
@@ -214,6 +225,87 @@ class PantherDriverTest(unittest.TestCase):
         self.assertAlmostEqual(converted[2], math.radians(-45.0))
         self.assertAlmostEqual(converted[3], math.radians(90.0))
 
+    def test_vendor_urdf_arm_mirror_signs_are_applied(self):
+        left = [10.0, 20.0, 30.0, 40.0, -50.0, 60.0, 15.0, -25.0]
+        self.assertEqual(
+            contracts.mirrored_arm_degrees(left),
+            [-10.0, 20.0, -30.0, -40.0, -50.0, -60.0, -15.0, -25.0],
+        )
+
+    def test_arm_runtime_builds_mirrored_and_independent_targets(self):
+        def run(arguments):
+            device = object.__new__(device_module.PantherDevice)
+            device._cfg = {"plugins": {"arm_control": {
+                "max_duration_s": 20.0, "min_duration_s": 1.0,
+                "speed_deg_s": 20.0, "max_target_delta_deg": 20.0,
+            }}}
+            device._lock = threading.RLock()
+            device._arm_lock = threading.RLock()
+            device._arm_active = None
+            names = [*contracts.LEFT_ARM_JOINTS, *contracts.RIGHT_ARM_JOINTS]
+            device._joint_limits = dict.fromkeys(names, (-math.pi, math.pi))
+            joint_msg = SimpleNamespace(name=names, position=[0.0] * len(names))
+            device._cache = {"joints": (joint_msg, time.monotonic())}
+            device._ensure_motion_ready = lambda: None
+            captured = {}
+            completed = threading.Event()
+
+            def capture(active, targets):
+                captured.update(targets)
+                with device._arm_lock:
+                    device._arm_active = None
+                completed.set()
+
+            device._run_arm = capture
+            result = device.arm({**arguments, "confirm_motion": True, "duration_s": 1.0})
+            self.assertEqual(result["state"], "queued")
+            self.assertTrue(completed.wait(1.0))
+            return captured
+
+        mirrored = run({"action": "move", "side": "both", "j0_deg": 10.0,
+                        "j1_deg": 5.0, "j4_deg": -10.0})
+        self.assertAlmostEqual(math.degrees(mirrored["left"][0]), 10.0)
+        self.assertAlmostEqual(math.degrees(mirrored["right"][0]), -10.0)
+        self.assertAlmostEqual(math.degrees(mirrored["left"][1]), 5.0)
+        self.assertAlmostEqual(math.degrees(mirrored["right"][1]), 5.0)
+        self.assertAlmostEqual(math.degrees(mirrored["left"][4]), -10.0)
+        self.assertAlmostEqual(math.degrees(mirrored["right"][4]), -10.0)
+
+        separate = run({"action": "move_separate", "la0_deg": 6.0, "ra0_deg": 8.0})
+        self.assertAlmostEqual(math.degrees(separate["left"][0]), 6.0)
+        self.assertAlmostEqual(math.degrees(separate["right"][0]), 8.0)
+
+    def test_imu_keeps_finite_vectors_when_zero_covariance_has_no_truth_value(self):
+        class Covariance:
+            def __init__(self, values):
+                self.values = values
+
+            def __len__(self):
+                return len(self.values)
+
+            def __getitem__(self, index):
+                return self.values[index]
+
+            def __bool__(self):
+                raise ValueError("ambiguous covariance truth value")
+
+        vector = lambda x, y, z: SimpleNamespace(x=x, y=y, z=z)
+        msg = SimpleNamespace(
+            header=SimpleNamespace(frame_id="imu_link"),
+            orientation=SimpleNamespace(x=float("nan"), y=float("nan"),
+                                        z=float("nan"), w=float("nan")),
+            orientation_covariance=Covariance([0.0] * 9),
+            angular_velocity=vector(-0.004, 0.0, 0.001),
+            angular_velocity_covariance=Covariance([0.0] * 9),
+            linear_acceleration=vector(0.0, 0.04903325, 9.83606995),
+            linear_acceleration_covariance=Covariance([0.0] * 9),
+        )
+        payload = device_module.PantherDevice._imu_payload(msg, time.monotonic())
+        self.assertIsNone(payload["orientation_xyzw"])
+        self.assertIsNone(payload["euler_rpy_rad"])
+        self.assertEqual(payload["angular_velocity_rad_s"], [-0.004, 0.0, 0.001])
+        self.assertEqual(payload["linear_acceleration_m_s2"], [0.0, 0.04903325, 9.83606995])
+
     def test_ros_byte_fields_decode_by_value(self):
         self.assertEqual(contracts.byte_value(b"\x02", "level"), 2)
         self.assertEqual(contracts.byte_value(bytearray([3]), "level"), 3)
@@ -237,7 +329,14 @@ class PantherDriverTest(unittest.TestCase):
     def test_bundled_model_and_standardized_streams_are_packaged(self):
         model = DRIVER / "resource" / "panther.urdf"
         self.assertTrue(model.exists())
-        self.assertIn("joint_la0", model.read_text())
+        model_text = model.read_text()
+        self.assertIn('<robot\n  name="pmm_urdf">', model_text)
+        self.assertIn("joint_la0", model_text)
+        self.assertIn("package://pmm_urdf/meshes/", model_text)
+        self.assertEqual(
+            hashlib.sha256(model.read_bytes()).hexdigest(),
+            "abcd54d188f93c62247816b93c9998e112b1be36cd2bae582910d393c4f4902d",
+        )
         dockerfile = (DRIVER / "Dockerfile").read_text()
         self.assertIn("COPY resource/panther.urdf /work/resource/panther.urdf", dockerfile)
         device = (DRIVER / "device.py").read_text()

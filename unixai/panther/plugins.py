@@ -248,18 +248,37 @@ def build_plugins(config, namespace, device):
                 field.update(minimum=lower, maximum=upper)
             return field
 
-        joint_fields = {
+        separate_joint_fields = {
             **{f"la{i}_deg": joint_field(f"joint_la{i}", f"left arm joint la{i}")
                for i in range(8)},
             **{f"ra{i}_deg": joint_field(f"joint_ra{i}", f"right arm joint ra{i}")
                for i in range(8)},
         }
+
+        def shared_joint_field(index: int) -> dict:
+            left = joint_limits.get(f"joint_la{index}", (None, None))
+            right = joint_limits.get(f"joint_ra{index}", (None, None))
+            bounds = [value for value in (*left, *right) if value is not None]
+            max_delta = enabled["arm_control"].get("max_target_delta_deg", 20.0)
+            field = {
+                "type": "number",
+                "description": (
+                    f"arm joint {index} in deg; both mirrors the right arm from the vendor URDF; "
+                    f"max {max_delta:g} deg change per command"
+                ),
+            }
+            if len(bounds) == 4:
+                field.update(minimum=min(bounds), maximum=max(bounds))
+            return field
+
+        shared_joint_fields = {f"j{i}_deg": shared_joint_field(i) for i in range(8)}
         schema = _action_schema(
-            ["start", "info", "move", "home", "stop"],
+            ["start", "info", "move", "move_separate", "home", "stop"],
             {
-                "side": {"type": "string", "enum": ["left", "right", "both"],
-                         "description": "left, right, or both arms"},
-                **joint_fields,
+                "side": {"type": "string", "enum": ["left", "right", "both"], "default": "left",
+                         "description": "left, right, or mirrored both arms"},
+                **shared_joint_fields,
+                **separate_joint_fields,
                 "positions_deg": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8,
                                   "description": "8 joint targets in deg; selected arm; live URDF limits"},
                 "left_positions_deg": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8,
@@ -270,15 +289,18 @@ def build_plugins(config, namespace, device):
                                "description": f"[1, {enabled['arm_control']['max_duration_s']:g}] s"},
                 "confirm_motion": confirm,
             },
-            {"move": {"params": ["side", *joint_fields, "duration_s", "confirm_motion"], "description": "Move selected arm joints"},
+            {"move": {"params": ["side", *shared_joint_fields, "duration_s", "confirm_motion"],
+                      "description": "Move one arm, or both arms as a mirrored 8-axis pose"},
+             "move_separate": {"params": [*separate_joint_fields, "duration_s", "confirm_motion"],
+                               "description": "Move both arms with 16 independent joint targets"},
              "home": {"params": ["side", "confirm_motion"], "description": "Move selected arms to the candidate home pose"},
              "stop": {"params": [], "description": "Cancel the active arm motion"},
              "start": {"params": [], "description": "Check controller and feedback readiness"},
              "info": {"params": [], "description": "Read controller and feedback readiness"}},
             ["arm_l", "arm_r"],
-            {"actions": ["move", "home"], "timeout": enabled["arm_control"]["max_duration_s"] + 15},
+            {"actions": ["move", "move_separate", "home"], "timeout": enabled["arm_control"]["max_duration_s"] + 15},
             True,
-            confirmed_actions=["move", "home"],
+            confirmed_actions=["move", "move_separate", "home"],
         )
         plugins.append(ActuatorPlugin(device, "arm_control", "Safe P2P arm control with verified controller switching", schema, device.arm))
     if on("gripper"):

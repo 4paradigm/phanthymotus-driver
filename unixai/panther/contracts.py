@@ -10,6 +10,9 @@ from typing import Optional
 
 LEFT_ARM_JOINTS = tuple(f"joint_la{i}" for i in range(8))
 RIGHT_ARM_JOINTS = tuple(f"joint_ra{i}" for i in range(8))
+# Mirror across Panther's sagittal (XZ) plane.  Rotations around the vendor
+# URDF's X/Z axes reverse sign; rotations around Y retain their sign.
+ARM_MIRROR_SIGNS = (-1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0)
 # Verified on the physical Panther: the forward-position controller's first
 # channel turns the head horizontally and the second channel controls pitch.
 # This intentionally overrides the semantic axes suggested by the vendor URDF.
@@ -61,6 +64,11 @@ def degrees_to_radians(value, field: str) -> float:
 
 def degrees_vector_to_radians(value, field: str, length: int) -> list[float]:
     return [math.radians(item) for item in finite_vector(value, field, length)]
+
+
+def mirrored_arm_degrees(value, field: str = "positions_deg") -> list[float]:
+    values = finite_vector(value, field, len(ARM_MIRROR_SIGNS))
+    return [item * sign for item, sign in zip(values, ARM_MIRROR_SIGNS)]
 
 
 def head_target_from_degrees(args: dict, current: dict[str, float]) -> list[float]:

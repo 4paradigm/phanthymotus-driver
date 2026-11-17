@@ -18,7 +18,7 @@ required for discovery.
   merged `laser_scan`, lazy `camera_color`, and lazy `camera_depth`.
 - Actuators: `base_drive`, `arm_control`, `gripper`, `lifting`, and `head`.
 
-`model` falls back to the bundled, stripped Panther URDF before the robot
+`model` falls back to the bundled, verbatim vendor `pmm_urdf` model before the robot
 publishes anything. Once a live `/robot_description` is available, reading the
 model resource atomically switches both the returned URDF and the `joints`
 rendering indices to that same live snapshot. The response includes its source
@@ -92,6 +92,12 @@ use radians, so conversion happens only at the robot boundary. The head mapping
 follows physical-robot testing rather than the vendor URDF axis labels:
 `yaw_deg` controls the first head channel (`joint_head0`) and `pitch_deg`
 controls the second (`joint_head1`).
+
+`arm_control move` exposes one eight-axis pose. `side=left` and `side=right`
+apply it directly to one arm; `side=both` mirrors it across the sagittal plane
+using the vendor URDF joint axes. `move_separate` exposes the full independent
+left-eight plus right-eight target. Legacy vector arguments remain accepted by
+the runtime but are not shown in the ordinary canvas form.
 
 ## Deliberately deferred
 
