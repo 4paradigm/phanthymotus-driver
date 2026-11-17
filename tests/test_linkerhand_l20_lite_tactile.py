@@ -455,6 +455,25 @@ def test_stream_holds_last_frame_only_during_short_bus_contention(monkeypatch, m
     assert recovered["touch_scalar"]["thumb"] == 10
 
 
+@pytest.mark.parametrize(("timeout", "stream_timeout"), [(1.0, 0.3), (0.2, 0.2)])
+def test_stream_limits_poll_budget_after_discovery(monkeypatch, timeout, stream_timeout):
+    hand = FakeHand([{}, {}, OSError("adapter unplugged"), {}])
+    plugin = lite_tactile.LiteTactilePlugin(hand, {"tactile_timeout_s": timeout})
+    budgets = []
+    read_tactile = hand.read_tactile
+
+    def read(side, fingers, *, budget_s, settle_s, cancel):
+        budgets.append(budget_s)
+        if len(budgets) == 4:
+            cancel.set()
+        return read_tactile(side, fingers, budget_s=budget_s, settle_s=settle_s, cancel=cancel)
+
+    monkeypatch.setattr(hand, "read_tactile", read)
+    monkeypatch.setattr(plugin._stop_event, "wait", lambda timeout: None)
+    plugin._stream_loop()
+    assert budgets == [timeout, stream_timeout, stream_timeout, timeout]
+
+
 def test_anonymous_stop_stops_unclaimed_auto_start_stream():
     plugin = lite_tactile.LiteTactilePlugin(FakeHand(), {}, {"side": "right"})
     plugin.start()

@@ -31,6 +31,7 @@ FINGER_NAMES = list(FINGER_IDS)
 MATRIX_ROWS, MATRIX_COLS = 12, 6
 MATRIX_CELLS = MATRIX_ROWS * MATRIX_COLS
 BUS_HOLD_MAX_AGE_S = 1.5
+STREAM_ROUND_MAX_S = 0.3
 BUS_BUSY = "RS485 总线正被运动卡片占用"
 ROUND_TIMEOUT = "L20 Lite 触觉采集超时"
 
@@ -262,6 +263,7 @@ class LiteTactilePlugin:
 
     def _read_tactile_snapshot(
         self, side: str, *, cancel=None, last_frame: tuple[dict, float] | None = None,
+        budget_s: float | None = None,
     ) -> dict[str, Any]:
         # Only the stream can reuse a frame. Direct queries always read RS485.
         with self._sample_lock:
@@ -280,7 +282,8 @@ class LiteTactilePlugin:
                 if self.hand is None or not hasattr(self.hand, "read_tactile"):
                     raise RuntimeError(f"找不到 {side} 的手部控制器")
                 serial_port, results = self.hand.read_tactile(
-                    side, FINGER_NAMES, budget_s=self.tactile_timeout_s,
+                    side, FINGER_NAMES,
+                    budget_s=self.tactile_timeout_s if budget_s is None else budget_s,
                     settle_s=self.select_settle_s, cancel=cancel,
                 )
                 now = time.monotonic()
@@ -486,13 +489,17 @@ class LiteTactilePlugin:
         side = self.default_side
         consecutive_errors = 0
         last_frame = None
+        serial_port = None
 
         while not self._stop_event.is_set():
             loop_start = time.monotonic()
             try:
+                # Discovery may need a full serial timeout to rule out the absent hand.
+                budget = min(self.tactile_timeout_s, STREAM_ROUND_MAX_S) if serial_port else self.tactile_timeout_s
                 data = self._read_tactile_snapshot(
-                    side, cancel=self._stop_event, last_frame=last_frame,
+                    side, cancel=self._stop_event, last_frame=last_frame, budget_s=budget,
                 )
+                serial_port = data["serial_port"]
                 if data["state"] == "ok" and (
                     not self.matrix_enabled or all(rows is not None for rows in data["touch_matrix"].values())
                 ):
