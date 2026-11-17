@@ -129,6 +129,7 @@ class S10Nodes:
         from std_msgs.msg import String
 
         self.json = json
+        self._ros2 = ros2
         self.robot = Node("s10_pro_driver_robot", context=ros2.ctx_robot)
         ros2.executor_robot.add_node(self.robot)
         self.bridge = CoreBridge(os.environ.get("S10_CORE_FASTDDS_PROFILE", "/tmp/s10-pro-core-fastdds.xml"),
@@ -249,6 +250,9 @@ class S10Nodes:
         for lane, url in self._rtsp_sources.items():
             self.media_workers.add_rtsp_camera(lane, url)
             print(f"[rtsp] pulling {lane} from {url}", flush=True)
+
+    def robot_executor_status(self):
+        return self._ros2.s10_robot_executor.status()
 
     def _scan_media_topics(self):
         """Discover PointCloud2 inputs as robot nodes start; cameras use RTSP."""
@@ -1577,6 +1581,9 @@ class S10ChargePlugin:
 
 
 def build_plugins(config, namespace=None, ros2=None):
+    if ros2 is not None:
+        from deep_robotics.s10_pro.ros_runtime import install_robot_executor_guard
+        install_robot_executor_guard(ros2)
     native = BasicServerClient(config)
     nodes = S10Nodes(config, namespace or "", ros2) if ros2 is not None else None
     motion = S10MotionPlugin(native, nodes)

@@ -112,6 +112,7 @@ def rig(tmp_path, monkeypatch):
                               create_timer=create_timer, destroy_timer=destroyed_timers.append,
                               get_publishers_info_by_topic=lambda topic: list(publisher_infos)),
         bridge=SimpleNamespace(create_publisher=create_publisher),
+        robot_executor_status=lambda: {"state": "running", "error": None, "thread_alive": True},
         camera_undistortion=controller, _sensor_qos=object(),
         front_camera_frame=lambda: (controller.generation('camera_front'), time.monotonic(), b'front-jpeg'))
     extrinsics_path = tmp_path / "extrinsics.json"

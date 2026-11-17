@@ -447,6 +447,10 @@ class FrontDepthPlugin:
 
     def _start_capture(self):
         with self._lifecycle:
+            if self.nodes is not None:
+                executor = self.nodes.robot_executor_status()
+                if executor["state"] != "running":
+                    raise DepthError("ROS_EXECUTOR_UNAVAILABLE", executor["error"])
             with self._lock:
                 if self._running and self._worker is not None and self._worker.is_alive():
                     return
@@ -677,20 +681,28 @@ class FrontDepthPlugin:
                 self._error_code = None
 
     def _info(self):
+        executor = self.nodes.robot_executor_status() if self.nodes is not None else None
         with self._lock:
+            if (self._running and self._error_code == "ROS_EXECUTOR_UNAVAILABLE"
+                    and executor is not None and executor["state"] == "running"):
+                self._last_error = self._error_code = None
             state = "running" if self._running else "idle"
             error = self._last_error
+            code = self._error_code
             if self._running and (self._worker is None or not self._worker.is_alive()):
                 error = "depth worker is not running; restart the card"
             if self._running and not self.controller.active("camera_front"):
                 error = "camera_front undistort is disabled"
+            if self._running and executor is not None and executor["state"] != "running":
+                error, code = executor["error"], "ROS_EXECUTOR_UNAVAILABLE"
             if error:
                 state = "error"
             result = {"state": state, "config": copy.deepcopy(self._active_config or self._config),
                       "stats": copy.deepcopy(self._stats), "last_error": error,
-                      "error_code": self._error_code,
+                      "error_code": code,
                       "topic_out": self._topic_outputs()}
             result["input"] = {"state": self._source_state,
+                "executor": executor,
                 "transport": self._input_transport,
                 "relay": self._relay.status() if self._relay is not None else None,
                 "cloud_topic": result["config"]["cloud_topic"],

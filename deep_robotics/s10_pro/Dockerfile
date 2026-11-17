@@ -57,7 +57,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/s10-pro-build-requirem
 FROM runtime-dependencies
 COPY --from=model-builder /work/deep_robotics/s10_pro/resource/models/ /work/deep_robotics/s10_pro/resource/models/
 COPY common/ /work/common/
-COPY main.py device.py basic_server.py domain_bridge.py loco_servo.py spatial.py media_workers.py undistortion.py front_depth.py depth_projection.py depth_fusion.py monocular_depth.py model_artifact.py cpu_kernels.py cloud_relay.py audio.py config.yaml driver.yaml /work/deep_robotics/s10_pro/
+COPY main.py device.py basic_server.py domain_bridge.py ros_runtime.py loco_servo.py spatial.py media_workers.py undistortion.py front_depth.py depth_projection.py depth_fusion.py monocular_depth.py model_artifact.py cpu_kernels.py cloud_relay.py audio.py config.yaml driver.yaml /work/deep_robotics/s10_pro/
 COPY --from=drdds-builder /tmp/_depth_kernels.so /work/deep_robotics/s10_pro/_depth_kernels.so
 RUN python3 -c 'from deep_robotics.s10_pro.cpu_kernels import AVAILABLE; assert AVAILABLE, "native depth kernels failed to load"'
 COPY resource/S10_kinematic.urdf /work/deep_robotics/s10_pro/resource/S10_kinematic.urdf
