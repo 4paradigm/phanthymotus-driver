@@ -207,7 +207,9 @@ class S10LocoServoPlugin:
                 self._settings, self._dry_run = candidate, candidate["dry_run"]
                 self._descriptor_raw, self._descriptor = raw, parsed
                 if self._running:
-                    self._new_sink()
+                    # Settings keep the twist layout fixed. The confirmed hold
+                    # rebased velocity; retain admission and watchdog history.
+                    self._sink.descriptor = parsed
                 self._barrier_ms = int(time.time() * 1000)
                 return {"ok": True, **candidate}
         except (ValueError, TypeError, RuntimeError, OSError) as exc:

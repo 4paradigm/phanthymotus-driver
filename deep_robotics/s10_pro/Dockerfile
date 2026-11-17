@@ -16,6 +16,7 @@ COPY resource/deep-robotics-msg/ /s10_pro_ws/src/deep-robotics-msg/
 COPY resource/audio_msgs/ /s10_pro_ws/src/audio_msgs/
 RUN . /opt/ros/humble/setup.sh && cd /s10_pro_ws && colcon build --packages-select drdds audio_msgs && rm -rf build log src
 COPY depth_kernels.cpp /tmp/s10_depth_kernels.cpp
+# The pinned ROS base installs build-essential, including g++.
 RUN g++ -std=c++17 -O3 -shared -fPIC /tmp/s10_depth_kernels.cpp -o /tmp/_depth_kernels.so
 
 FROM ${ROS_BASE_IMAGE} AS runtime-dependencies

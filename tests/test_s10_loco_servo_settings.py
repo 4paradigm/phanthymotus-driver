@@ -143,6 +143,36 @@ def test_confirmed_config_enables_live_output_in_an_existing_dry_run_stream(serv
     assert p.dispatch('info', {})['dry_run'] is False
 
 
+@pytest.mark.parametrize('source,priority,seq,reason', [
+    ('lower-priority', 1, 1, 'outranked'),
+    ('controller', 50, 9, 'seq'),
+    ('controller', 50, 10, 'seq'),
+])
+def test_live_config_preserves_source_arbitration_and_sequence_history(
+        servo, monkeypatch, source, priority, seq, reason):
+    monkeypatch.setattr(servo.module.time, 'monotonic', lambda: 100.)
+    p = servo.plugin
+    assert p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False,
+                                'confirm': True})['state'] == 'ready'
+    first = {**command(p, [.1, 0, 0, 0, 0, 0], seq=10),
+             'source': 'controller', 'priority': 50}
+    submit(p, first)
+    counters = p._sink.stats()['counters']
+    assert p.dispatch('config', {'speed_preset': 'slow', 'confirm': True})['ok']
+    configured_counters = p._sink.stats()['counters']
+    assert all(value == 0 for value in servo.native.calls[-1][2].values())
+    count = len(servo.native.calls)
+    submit(p, {**command(p, [.1, 0, 0, 0, 0, 0], seq=seq),
+               'source': source, 'priority': priority})
+    last = p.dispatch('info', {})['last_command']
+    assert last['verdict'] == 'DROPPED' and reason in last['reason']
+    assert configured_counters == counters
+    assert len(servo.native.calls) == count
+    submit(p, {**command(p, [.1, 0, 0, 0, 0, 0], seq=11),
+               'source': 'controller', 'priority': 50})
+    assert servo.native.calls[-1][2]['X'] == pytest.approx(.03)
+
+
 def test_acceleration_begins_at_zero_and_zero_velocity_stops_immediately(servo):
     p = servo.plugin
     assert p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False, 'confirm': True})['state'] == 'ready'
