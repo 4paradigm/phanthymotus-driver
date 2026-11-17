@@ -78,6 +78,9 @@ class FakeRos1:
         if self.service_accepts and self.confirm:
             if service == "/enable_control":
                 self.emit("/enable_control_state", args["data"])
+                if args['data'] and '/mobile_manipulator/lb_mpc_control_mode' in self.subscriptions:
+                    self.emit('/mobile_manipulator/lb_mpc_control_mode',
+                              self.latched.get('/mobile_manipulator/lb_mpc_control_mode', 3))
             elif service == "/mobile_manipulator_mpc_control":
                 self.emit("/mobile_manipulator/lb_mpc_control_mode", args["control_mode"])
         return {"success": self.service_accepts, "result": self.service_accepts, "message": "test service"}
@@ -684,18 +687,23 @@ class DriverContractTests(unittest.TestCase):
         self.assertFalse(self.callbacks[0][3]['measured_convergence'])
         self.assertEqual(self.ros.services, [])
 
-    def test_motion_requires_enabled_fresh_supported_mode_and_warmup(self):
+    def test_motion_prepares_enable_stale_or_incompatible_mode_but_still_requires_warmup(self):
         for setup in (
             lambda: self.ros.emit("/enable_control_state", False),
             lambda: self.bundle.state._seen.update(mpc_mode=time.monotonic() - 3),
             lambda: self.ros.emit("/mobile_manipulator/lb_mpc_control_mode", 1),
-            lambda: setattr(self.ros, "motion_ready", False),
         ):
             self.ros.emit("/enable_control_state", True)
             self.ros.emit("/mobile_manipulator/lb_mpc_control_mode", 3)
             setup()
-            self.assertEqual(self.call("loco", "move", duration=0.1)["state"], "error")
-        self.assertEqual(self.ros.published, [])
+            result = self.call('loco', 'move', duration=.1)
+            self.assertEqual(result['state'], 'executing')
+            self.assertEqual(result['control_preparation']['mode'], 3)
+            self.call('loco', 'stop_move')
+        self.ros.motion_ready = False
+        boundary, calls = len(self.ros.published), len(self.ros.sent_services)
+        self.assertIn('warming up', self.call('loco', 'move', duration=.1)['error'])
+        self.assertEqual((len(self.ros.published), len(self.ros.sent_services)), (boundary, calls))
 
     def test_rejects_invalid_values_before_hardware_calls(self):
         for args in ({"vx": 1, "duration": 1}, {"vx": True, "duration": 1},
@@ -705,6 +713,204 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(self.call("waist", "set_pose", x=0)["state"], "error")
         self.assertEqual(self.ros.published, [])
         self.assertEqual(self.ros.services, [])
+
+    def test_paused_action_resumes_then_confirms_mode_before_target_publication(self):
+        self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 1)
+        self.ros.emit('/enable_control_state', False)
+        order, send, publish = [], self.ros.start_service, self.ros.publish
+        def service(name, kind, args):
+            order.append((name, args))
+            return send(name, kind, args)
+        def target(*args):
+            order.append((args[0], args[2]))
+            return publish(*args)
+        with patch.object(self.ros, 'start_service', side_effect=service), patch.object(self.ros, 'publish', side_effect=target):
+            result = self.call('loco', 'move', vx=.05, duration=.1)
+        self.assertEqual(result['state'], 'executing')
+        self.assertEqual(order[:2], [('/enable_control', {'data': True}),
+                                    ('/mobile_manipulator_mpc_control', {'control_mode': 3})])
+        self.assertEqual(order[2][0], '/cmd_vel')
+        self.assertEqual(order[2][1]['linear']['x'], .05)
+
+    def test_arm_automatically_changes_base_only_to_base_arm(self):
+        self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 2)
+        result = self.call('arm', 'move_joints', positions=[0.] * 14)
+        self.assertEqual(result['state'], 'executing')
+        self.assertEqual(result['control_preparation'], {'automatic': True, 'resumed': False,
+                                                       'mode_changed': True, 'mode': 3})
+        self.assertEqual(self.ros.sent_services[0][2], {'control_mode': 3})
+        self.assertEqual(self.ros.published[0][0], '/kuavo_arm_traj')
+
+    def test_compatible_arm_only_mode_needs_no_redundant_service(self):
+        self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 1)
+        result = self.call('arm', 'move_joints', positions=[0.] * 14)
+        self.assertEqual(result['state'], 'executing')
+        self.assertEqual(result['control_preparation']['mode'], 1)
+        self.assertEqual(self.ros.sent_services, [])
+
+    def test_all_motion_cards_prepare_after_pause_and_invalid_joint_target_never_resumes(self):
+        for card, action, args in (
+            ('arm', 'move_joints', {'positions': [0.] * 14}),
+            ('leg', 'move_joints', {'positions': [0.] * 4}),
+            ('waist', 'set_pose', {'x': 0., 'z': .8, 'pitch': 0., 'yaw': 0.}),
+            ('head', 'move', {'duration': .1}),
+            ('arm', 'set_pose', {'frame': 'local', 'left_position': [0., .4, 0.],
+                'right_position': [0., -.4, 0.], 'left_quaternion': [0., 0., 0., 1.],
+                'right_quaternion': [0., 0., 0., 1.]})):
+            with self.subTest(card=card, action=action):
+                self.call('loco', 'stop_move')
+                self.ros.raw()
+                result = self.call(card, action, **args)
+                self.assertEqual(result['state'], 'executing')
+                self.assertTrue(result['control_preparation']['resumed'])
+                self.call(card, 'stop_move')
+        self.ros.sent_services.clear()
+        self.assertIn('outside', self.call('arm', 'move_joints', positions=[10000.] * 14)['error'])
+        self.bundle.sensors._joint_limit_config = None
+        self.assertIn('not configured', self.call('arm', 'move_joints', positions=[0.] * 14)['error'])
+        self.assertEqual(self.ros.sent_services, [])
+
+    def test_failed_automatic_mode_preparation_pauses_without_sending_target(self):
+        self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 1)
+        self.ros.emit('/enable_control_state', False)
+        original = self.ros.call_service
+        def reject_mode(service, *args):
+            if service == '/mobile_manipulator_mpc_control':
+                return {'result': False, 'message': 'mode rejected'}
+            return original(service, *args)
+        with patch.object(self.ros, 'call_service', side_effect=reject_mode):
+            result = self.call('loco', 'move', vx=.2, duration=.1)
+        self.assertEqual(result['state'], 'error')
+        self.assertFalse(self.bundle.state.confirmed_enable())
+        self.assertFalse(self.bundle.tracker._active)
+        self.assertEqual([s[2] for s in self.ros.sent_services],
+                         [{'data': True}, {'control_mode': 3}, {'data': False}])
+        self.assertFalse(any(p[0] == '/cmd_vel' and p[2]['linear']['x'] for p in self.ros.published))
+
+    def test_automatic_mode_needs_post_request_feedback(self):
+        self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 1)
+        self.ros.confirm = False
+        with patch.object(driver, 'CONTROL_TIMEOUT_S', .04):
+            result = self.call('loco', 'move', vx=.2, duration=.1)
+        self.assertEqual(result['state'], 'error')
+        self.assertIn('not confirmed', result['error'])
+        self.assertFalse(self.bundle.tracker._active)
+        self.assertFalse(any(p[0] == '/cmd_vel' and p[2]['linear']['x'] for p in self.ros.published))
+
+    def test_automatic_resume_waits_for_mpc_before_any_mode_write_or_target(self):
+        self.ros.emit('/enable_control_state', False)
+        original = self.ros.call_service
+        def enable_without_mpc(service, *args):
+            if service == '/enable_control' and args[1].get('data') is True:
+                callback = self.ros.subscriptions.pop('/mobile_manipulator/lb_mpc_control_mode')
+                try:
+                    return original(service, *args)
+                finally:
+                    self.ros.subscriptions['/mobile_manipulator/lb_mpc_control_mode'] = callback
+            return original(service, *args)
+        with patch.object(self.ros, 'call_service', side_effect=enable_without_mpc), patch.object(driver, 'CONTROL_TIMEOUT_S', .04):
+            result = self.call('loco', 'move', vx=.2, duration=.1)
+        self.assertIn('resumed MPC mode feedback not confirmed', result['error'])
+        self.assertEqual([s[2] for s in self.ros.sent_services], [{'data': True}, {'data': False}])
+        self.assertFalse(any(p[0] == '/cmd_vel' and p[2]['linear']['x'] for p in self.ros.published))
+
+    def test_action_never_auto_resumes_before_boot_confirmation(self):
+        self.bundle.state._boot_update({'data': json.dumps({'state': 'initializing', 'boot_pause_confirmed': False})})
+        self.ros.emit('/enable_control_state', False)
+        self.assertIn('boot initialization/pause is not confirmed', self.call('loco', 'move', duration=.1)['error'])
+        self.assertEqual(self.ros.sent_services, [])
+
+    def test_incompatible_preparation_does_not_reconfigure_an_inflight_action(self):
+        self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 1)
+        arm = self.call('arm', 'move_joints', positions=[0.] * 14)
+        self.assertIn('another action', self.call('loco', 'move', duration=.1)['error'])
+        self.assertEqual(self.ros.sent_services, [])
+        self.assertTrue(self.bundle.tracker.current('arms', arm['action_id']))
+
+    def test_base_arm_mode_allows_independent_channels_without_reconfiguration(self):
+        self.assertEqual(self.call('arm', 'move_joints', positions=[0.] * 14)['state'], 'executing')
+        self.assertEqual(self.call('loco', 'move', duration=.1)['state'], 'executing')
+        self.assertEqual(self.ros.sent_services, [])
+
+    def test_stop_between_auto_resume_and_mode_cannot_recover_or_cancel_a_new_action(self):
+        self.ros.emit('/enable_control_state', False)
+        original = self.bundle.confirm_control
+        entered, release, results = threading.Event(), threading.Event(), []
+        first = [True]
+        def confirm(token, service, *args):
+            result = original(token, service, *args)
+            if service == '/enable_control' and args[1].get('data') is True and first[0]:
+                first[0] = False
+                entered.set()
+                release.wait(2)
+            return result
+        with patch.object(self.bundle, 'confirm_control', side_effect=confirm):
+            thread = threading.Thread(target=lambda: results.append(self.call('loco', 'move', vx=.2, duration=1)))
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(self.call('loco', 'stop_move')['state'], 'paused')
+                fresh = self.call('loco', 'move', duration=1)
+                self.assertEqual(fresh['state'], 'executing')
+                boundary = len(self.ros.sent_services)
+            finally:
+                release.set()
+                thread.join(1)
+        self.assertIn('superseded', results[0]['error'])
+        self.assertEqual(len(self.ros.sent_services), boundary)
+        self.assertTrue(self.bundle.tracker.current('base', fresh['action_id']))
+        self.assertFalse(any(p[0] == '/cmd_vel' and p[2]['linear']['x'] == .2 for p in self.ros.published))
+
+    def test_stop_during_auto_mode_wait_blocks_new_motion_until_old_write_settles(self):
+        self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 1)
+        original = self.ros.wait_service
+        entered, release, results = threading.Event(), threading.Event(), []
+        first = [True]
+        def wait(pending, timeout, cancelled=None):
+            if pending[0] == '/mobile_manipulator_mpc_control' and first[0]:
+                first[0] = False
+                entered.set()
+                release.wait(2)
+                # Emulate a remote write that executes despite local cancellation.
+                self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 3)
+                self.ros.service_results[id(pending)] = {'result': True, 'mode': 3}
+            return original(pending, timeout, cancelled)
+        with patch.object(self.ros, 'wait_service', side_effect=wait):
+            thread = threading.Thread(target=lambda: results.append(self.call('loco', 'move', vx=.2, duration=1)))
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(self.call('loco', 'stop_move')['state'], 'paused')
+                before = len(self.ros.sent_services)
+                self.assertIn('mode change is unresolved', self.call('loco', 'move', duration=1)['error'])
+                self.assertEqual(len(self.ros.sent_services), before)
+            finally:
+                release.set()
+                thread.join(1)
+        self.assertIn('superseded', results[0]['error'])
+        self.assertEqual(self.call('loco', 'move', duration=.1)['state'], 'executing')
+
+    def test_stop_during_argument_validation_cannot_be_undone_by_the_old_action(self):
+        entered, release, result = threading.Event(), threading.Event(), []
+        original = driver._number
+        def number(value, name, *args):
+            if name == 'vx':
+                entered.set()
+                release.wait(2)
+            return original(value, name, *args)
+        with patch.object(driver, '_number', side_effect=number):
+            thread = threading.Thread(target=lambda: result.append(self.call('loco', 'move', vx=.2, duration=1)))
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(self.call('loco', 'stop_move')['state'], 'paused')
+                boundary = len(self.ros.sent_services)
+            finally:
+                release.set()
+                thread.join(1)
+        self.assertIn('superseded by stop', result[0]['error'])
+        self.assertEqual(len(self.ros.sent_services), boundary)
+        self.assertFalse(any(p[0] == '/cmd_vel' and p[2]['linear']['x'] for p in self.ros.published))
 
     def test_arm_does_not_enable_quick_mode_and_requires_fresh_estimate(self):
         self.ros.emit("/lb_arm_joint_reach_time", 0)
@@ -1127,7 +1333,10 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(len(self.ros.published), boundary)
         self.assertTrue(wait_until(lambda: self.callbacks))
         self.assertEqual([c[:3] for c in self.callbacks], [(result["action_id"], "loco", "cancelled")])
-        self.assertEqual(self.call("loco", "move", duration=0.1)["state"], "error")
+        fresh = self.call('loco', 'move', duration=.1)
+        self.assertEqual(fresh['state'], 'executing')
+        self.assertNotEqual(fresh['action_id'], result['action_id'])
+        self.assertTrue(fresh['control_preparation']['resumed'])
 
     def _partial_initial_send(self, card, action, topic, **args):
         original = self.ros.publish

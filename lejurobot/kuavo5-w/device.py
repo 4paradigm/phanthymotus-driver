@@ -78,6 +78,7 @@ class RobotState:
         self._running = False
         self.motion_blocked = False
         self.remote_resume_unresolved = False
+        self.remote_mode_unresolved = False
         self.motion_send_uncertain = False
         self.motion_enabled = motion_enabled
         self._enable_verified_at = None
@@ -194,6 +195,7 @@ class RobotState:
                     "motion_blocked": self.motion_blocked, "fields": fields,
                     "motion_enabled": self.motion_enabled,
                     "remote_resume_unresolved": self.remote_resume_unresolved,
+                    "remote_mode_unresolved": self.remote_mode_unresolved,
                     "motion_send_uncertain": self.motion_send_uncertain,
                     'controller_boot': None if self._controller_boot is None else {
                         **self._controller_boot, 'age_s': max(0, now - self._controller_boot_at)},
@@ -217,7 +219,7 @@ class RobotState:
         enabled = self.confirmed_enable()
         mode, seen = self.read("mpc_mode")
         if self.motion_blocked or enabled is not True:
-            raise RuntimeError("control is paused/unknown; confirm switch_mode.resume first")
+            raise RuntimeError("control is paused/unknown; action preparation or a fresh control check is required")
         if time.monotonic() - seen > 2 or mode not in MODES or mode == 0:
             raise RuntimeError("MPC mode is missing, stale or NoControl")
         if allowed_modes and mode not in allowed_modes:
@@ -441,6 +443,7 @@ class _KuavoPlugin:
     def __init__(self, bundle):
         self.bundle = bundle
         self.ros1, self.state, self.tracker = bundle.ros1, bundle.state, bundle.tracker
+        self._request_context = threading.local()
 
     def schema(self, description, properties, actions, resource=None, async_actions=(), stop="stop_move", required=None):
         properties = {"action": {"type": "string", "enum": list(actions)}, **properties}
@@ -466,6 +469,7 @@ class _KuavoPlugin:
         pass  # Lifecycle marker; active actions remain owned by the bundle/ACP.
 
     def dispatch(self, action, args):
+        self._request_context.stop_epoch = self.bundle._stop_epoch
         try:
             if action == "start":
                 self.start()
@@ -482,12 +486,9 @@ class _KuavoPlugin:
                 return self.bundle.pause('stopped_by_request')
             if self.PREFIX == 'switch_mode':
                 return self._dispatch(action, args)
-            if not self.tracker.lock.acquire(timeout=DISPATCH_LOCK_TIMEOUT_S):
-                raise RuntimeError("control transition is busy; query state before retrying")
-            try:
-                return self._dispatch(action, args)
-            finally:
-                self.tracker.lock.release()
+            # Argument validation is local. Motion helpers reserve preparation,
+            # wait for services outside the lock, then atomically recheck/send.
+            return self._dispatch(action, args)
         except _UncertainMotionSend as exc:
             # dispatch's finally has released the publication lock. Never
             # hold that outer lock while waiting for a pause service response.
@@ -501,19 +502,11 @@ class _KuavoPlugin:
 
     def _async_reach(self, key, publish, allowed_modes=None, joint_target=None):
         modes = allowed_modes or self.ALLOWED_MODES
-        self.state.require_motion(modes)
-        if joint_target is not None:
-            self.bundle.sensors.validate_joint_target(self.PREFIX, joint_target[1])
-        tracked = self.tracker.begin(self.CHANNEL, self.PREFIX)
-        aid, cancelled = tracked
-        generation = self.ros1.connection[1]
-        issued = time.monotonic()
-        try:
-            publish()
-        except Exception as exc:
-            self.state.motion_blocked = True
-            self.state.motion_send_uncertain = True
-            raise _UncertainMotionSend(self.CHANNEL, aid, str(exc)) from exc
+        validate = (None if joint_target is None else
+            lambda: self.bundle.sensors.validate_joint_target(self.PREFIX, joint_target[1]))
+        aid, cancelled, generation, issued, preparation = self.bundle.start_motion(
+            self.CHANNEL, self.PREFIX, modes, publish, validate,
+            request_epoch=self._request_context.stop_epoch)
 
         def worker():
             deadline, duration, seen_at = time.monotonic() + 3, None, 0
@@ -568,19 +561,14 @@ class _KuavoPlugin:
                     return
         threading.Thread(target=worker, daemon=True, name=f"acp-{self.PREFIX}").start()
         return {"state": "executing", "action_id": aid,
+                'control_preparation': preparation,
                 "completion_basis": "measured_joint_convergence" if joint_target is not None else "vendor_reach_time_estimate",
                 "measured_convergence": False}
 
     def _timed_velocity(self, duration, send, zero, stop_delay):
-        self.state.require_motion(self.ALLOWED_MODES)
-        aid, cancelled = self.tracker.begin(self.CHANNEL, self.PREFIX)
-        generation = self.ros1.connection[1]
-        try:
-            send()  # Fail synchronously if the first command cannot be sent.
-        except Exception as exc:
-            self.state.motion_blocked = True
-            self.state.motion_send_uncertain = True
-            raise _UncertainMotionSend(self.CHANNEL, aid, str(exc)) from exc
+        aid, cancelled, generation, _, preparation = self.bundle.start_motion(
+            self.CHANNEL, self.PREFIX, self.ALLOWED_MODES, send,
+            request_epoch=self._request_context.stop_epoch)
         deadline = time.monotonic() + duration
 
         def worker():
@@ -616,6 +604,7 @@ class _KuavoPlugin:
                 self.bundle.pause(_safe_log(str(exc)), status="error", expected=(self.CHANNEL, aid))
         threading.Thread(target=worker, daemon=True, name=f"velocity-{self.PREFIX}").start()
         return {"state": "executing", "action_id": aid, "duration_s": duration,
+                'control_preparation': preparation,
                 "completion_basis": "command_duration_and_vendor_watchdog"}
 
 
@@ -634,7 +623,7 @@ class LocoPlugin(_KuavoPlugin):
         }, {"move": (["vx", "vy", "vyaw", "duration"], "本体速度运动，到时发零速度并等待文档的 1s 停止窗口"),
             "move_relative": (["x", "y", "yaw"], "相对当前位置的位姿目标"),
             "move_to": (["x", "y", "yaw"], "启动世界系的绝对位姿目标"),
-            "stop_move": ([], "发零速并请求全身软件暂停；恢复须显式 resume")},
+            "stop_move": ([], "发零速并请求全身软件暂停；下一次新动作自动准备控制")},
             "base", ("move", "move_relative", "move_to"),
             required={"move": ["duration"], "move_relative": ["x", "y", "yaw"], "move_to": ["x", "y", "yaw"]})
 
@@ -767,7 +756,7 @@ class ControlPlugin(_KuavoPlugin):
 
     def tool(self):
         # No x-resource: global exclusivity is intentional for whole-body transitions.
-        return self.schema("Kuavo 5-W 软件暂停/恢复及 MPC 模式切换；以状态话题确认，不把服务受理当生效。", {
+        return self.schema("Kuavo 5-W 高级诊断及手动暂停/模式管理；普通执行卡自动恢复并选择模式，无需先操作本卡。", {
             "mode": {"type": "integer", "enum": list(MODES), "description": str(MODES),
                      "oneOf": [{"const": value, "title": f"{value}: {name}"}
                                for value, name in MODES.items()]}}, {
@@ -830,6 +819,8 @@ class KuavoBundle:
         self._closing = False
         self._transition = None
         self._remote_resume = None
+        self._remote_mode = None
+        self._stop_epoch = 0
         self.plugins = [LocoPlugin(self), ArmPlugin(self), LowerBodyPlugin(self),
                         LowerBodyPlugin(self, "waist"), HeadPlugin(self), ControlPlugin(self)]
         self._enabled = {name for name, cfg in config.get("plugins", {}).items()
@@ -872,6 +863,8 @@ class KuavoBundle:
                 raise RuntimeError('motion command delivery is uncertain; verify controller recovery before further control')
             if self._resume_unresolved():
                 raise RuntimeError('remote resume is unresolved; motion remains blocked; request pause after resolution')
+            if self._mode_unresolved():
+                raise RuntimeError('remote mode change is unresolved; motion remains blocked')
             if self._closing or self._transition is not None or self.tracker._active:
                 raise RuntimeError('motion/control is busy; stop and await confirmation before retrying')
             enabled = self.state.confirmed_enable()
@@ -887,6 +880,123 @@ class KuavoBundle:
         with self.tracker.lock:
             if self._transition is token:
                 self._transition = None
+
+    def _mode_unresolved(self):
+        # The commissioned controller mutates currentMpcControlMode_ before
+        # returning its service result. Retain this response after cancellation
+        # so an older in-flight mode write cannot overtake a new preparation.
+        request = self._remote_mode
+        if request is None:
+            return False
+        if self.ros1.connection != (True, request['generation']) or request['pending'] is None:
+            return True
+        response = self.ros1.service_result(request['pending'])
+        if response is not None and type(response.get('result')) is bool:
+            self._remote_mode = None
+            self.state.remote_mode_unresolved = False
+            return False
+        return True
+
+    def _publish_motion_locked(self, channel, tool, modes, publish, validate, preparation):
+        self.state.require_motion(modes)
+        if validate is not None:
+            validate()
+        aid, cancelled = self.tracker.begin(channel, tool)
+        issued, generation = time.monotonic(), self.ros1.connection[1]
+        try:
+            publish()
+        except Exception as exc:
+            self.state.motion_blocked = True
+            self.state.motion_send_uncertain = True
+            raise _UncertainMotionSend(channel, aid, str(exc)) from exc
+        return aid, cancelled, generation, issued, preparation
+
+    def start_motion(self, channel, tool, modes, publish, validate=None, request_epoch=None):
+        """One user action owns resume -> mode -> target, interruptible at each step."""
+        if not self.tracker.lock.acquire(timeout=DISPATCH_LOCK_TIMEOUT_S):
+            raise RuntimeError('control transition is busy; query state before retrying')
+        try:
+            if request_epoch is not None and request_epoch != self._stop_epoch:
+                raise InterruptedError('motion request superseded by stop')
+            self.state.require_motion_enabled()
+            self.sensors.require_profile()
+            if self._closing or self._transition is not None:
+                raise RuntimeError('motion/control is busy; wait for preparation or stop it first')
+            if self.state.motion_send_uncertain:
+                raise RuntimeError('motion command delivery is uncertain; controller reconciliation is required')
+            if self._resume_unresolved():
+                raise RuntimeError('remote resume is unresolved; motion remains blocked')
+            if self._mode_unresolved():
+                raise RuntimeError('remote mode change is unresolved; motion remains blocked')
+            if channel in self.tracker._active:
+                raise RuntimeError(f'{channel} is busy; wait for ACP or stop it first')
+            if not self.ros1.motion_ready:
+                raise RuntimeError('ROS 1 publisher connections are warming up; retry after 1s')
+            # Never enable a robot for an invalid/unverified joint target.
+            if validate is not None:
+                validate()
+            enabled = self.state.confirmed_enable()
+            mode, seen = self.state.read('mpc_mode')
+            compatible = mode in MODES and mode != 0 and (not modes or mode in modes)
+            fresh = time.monotonic() - seen <= 2
+            preparation = {'automatic': True, 'resumed': False, 'mode_changed': False, 'mode': mode}
+            if enabled is True and not self.state.motion_blocked and compatible and fresh:
+                return self._publish_motion_locked(channel, tool, modes, publish, validate, preparation)
+            if self.tracker._active:
+                raise RuntimeError('control preparation needs an idle robot; another action is still running')
+            target_mode = mode if compatible else 3
+            token = self._new_transition('prepare_motion')
+            self.state.motion_blocked = True
+        finally:
+            self.tracker.lock.release()
+        try:
+            if enabled is not True:
+                resume_issued = time.monotonic()
+                self.confirm_control(token, '/enable_control', 'std_srvs/SetBool', {'data': True},
+                                     'success', 'control_enabled', True)
+                preparation['resumed'] = True
+                # /enable_control belongs to the hardware node; the MPC node
+                # receives enable asynchronously and rejects mode writes while
+                # disabled. Wait for its resumed stream before a mode write.
+                mode = self.wait_mode_feedback(token, resume_issued)
+                compatible = mode != 0 and (not modes or mode in modes)
+                target_mode = mode if compatible else 3
+                fresh = True
+            if not compatible or not fresh:
+                self.confirm_control(token, '/mobile_manipulator_mpc_control',
+                    'kuavo_msgs/changeTorsoCtrlMode', {'control_mode': target_mode},
+                    'result', 'mpc_mode', target_mode)
+                preparation['mode_changed'] = mode != target_mode
+            with self.tracker.lock:
+                self._check_transition(token)
+                if self._resume_unresolved() or self._mode_unresolved():
+                    raise RuntimeError('remote control preparation is unresolved')
+                self.state.confirmed_enable()
+                self.state.motion_blocked = False
+                preparation['mode'] = target_mode
+                result = self._publish_motion_locked(channel, tool, modes, publish, validate, preparation)
+                self._transition = None
+                return result
+        except _UncertainMotionSend:
+            raise  # The caller owns cancellation of this already-tracked action.
+        except Exception:
+            self.pause('automatic_control_preparation_failed', status='error', expected_transition=token)
+            raise
+        finally:
+            self._end_control(token)
+
+    def wait_mode_feedback(self, token, after):
+        deadline = time.monotonic() + CONTROL_TIMEOUT_S
+        while time.monotonic() < deadline:
+            with self.tracker.lock:
+                self._check_transition(token)
+                self.state.require_motion_enabled()
+                self.state.confirmed_enable()
+                mode, seen = self.state.read('mpc_mode')
+                if mode in MODES and seen >= after and time.monotonic() - seen <= 2:
+                    return mode
+            time.sleep(.02)
+        raise TimeoutError('resumed MPC mode feedback not confirmed; motion target was not sent')
 
     def _resume_unresolved(self):
         """Caller holds tracker.lock. Local timeout cannot cancel ROS execution.
@@ -924,17 +1034,27 @@ class KuavoBundle:
             self._check_transition(token)
             issued = time.monotonic()
             enabling = service == '/enable_control' and args.get('data') is True
+            changing_mode = service == '/mobile_manipulator_mpc_control'
             if enabling:
                 # Mark before SEND: even a send exception can mean partial delivery.
                 self._remote_resume = {'pending': None, 'issued': issued,
                                        'generation': token['generation']}
                 self.state.remote_resume_unresolved = True
+            if changing_mode:
+                self._remote_mode = {'pending': None, 'generation': token['generation']}
+                self.state.remote_mode_unresolved = True
             pending = self.ros1.start_service(service, service_type, args)
             if enabling:
                 self._remote_resume['pending'] = pending
                 self.ros1.retain_service(pending)
+            if changing_mode:
+                self._remote_mode['pending'] = pending
+                self.ros1.retain_service(pending)
         remaining = max(0.0, issued + CONTROL_TIMEOUT_S - time.monotonic())
         response = self.ros1.wait_service(pending, remaining, token['cancelled'])
+        if changing_mode:
+            with self.tracker.lock:
+                self._mode_unresolved()
         if response.get(accepted_key) is not True:
             if enabling:
                 with self.tracker.lock:
@@ -963,10 +1083,13 @@ class KuavoBundle:
             time.sleep(min(0.02, max(0, deadline - time.monotonic())))
         raise TimeoutError(f"request accepted but fresh {key}={expected} not confirmed; read state before retry")
 
-    def pause(self, reason, status="cancelled", expected=None):
+    def pause(self, reason, status="cancelled", expected=None, expected_transition=None):
         with self.tracker.lock:
+            if expected_transition is not None and self._transition is not expected_transition:
+                return {'state': 'idle'}  # An old preparation cannot pause a newer action.
             if expected is not None and not self.tracker.current(*expected):
                 return {'state': 'idle'}  # An old worker cannot cancel a newer action.
+            self._stop_epoch += 1
             interrupted = self._transition is not None
             unresolved = self._resume_unresolved()
             uncertain_motion = self.state.motion_send_uncertain
@@ -1079,7 +1202,8 @@ class KuavoBundle:
                 return
             self._closing = True
             needs_pause = (bool(self.tracker._active) or self._transition is not None
-                           or self._remote_resume is not None or self.state.motion_send_uncertain)
+                           or self._remote_resume is not None or self._remote_mode is not None
+                           or self.state.motion_send_uncertain)
         if needs_pause:
             result = self.pause("driver_shutdown")
             if result.get("error"):

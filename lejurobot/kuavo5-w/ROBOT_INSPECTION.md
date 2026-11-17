@@ -416,3 +416,34 @@ host helper 的首次安装仍需现场管理员执行一次，详见 README。
 - systemd单元校验通过，服务enabled/active。215项离线测试及部署checker通过。
   本轮未关闭或重启机器人，完整断电开机→初始化→暂停路径仍待现场首轮验收，
   不能将当前已运行程序的接管验证当作冷启动实测。
+
+## 追加：执行动作自动准备控制（2026-11-17）
+
+根据操作人员要求，正常使用不再要求先点switch_mode.resume/set_mode。
+开机仍按已授权策略初始化后暂停，仅新的运动请求会按需恢复并准备模式。
+
+- 先检查动作参数、关节限位/测量、开机确认、使能反馈及未决请求；兼容且新鲜的模式直接保留。
+  暂停时恢复控制并等待恢复后的新鲜MPC流，不兼容时请求BaseArm，再确认状态后才发运动目标。
+  读取、start/info及后台检查不恢复控制，不重放旧目标；模式变更不能覆盖其他通道在途动作。
+- stop可抢占参数检查、恢复及模式等待；旧请求不能随后恢复或暂停更新动作。
+  保留未决模式写响应，与原有未决resume/发送不确定保护共同阻止旧写入覆盖新准备。
+  服务拒绝或反馈超时不自动重试使能，准备失败尝试全身暂停。
+- 现场候选kuavo5w:local-auto-control-261117，ID d4fa860cbead，737171653字节；
+  仅在local-boot镜像覆盖device.py和rosbridge_client.py，未新增依赖，增量77069字节。
+  不代表生产Dockerfile相对于ros-base的完整增量。
+- 从control_enabled=false直接调用loco.move(vx=0,vy=0,vyaw=0,duration=0.1)，
+  未先调用resume，返回executing及automatic=true、resumed=true、mode_changed=false、mode=3。
+  随后stop_move获新False确认；暂停稳定后重复提交新的同类动作也成功，结束再次暂停。
+  这些是零速度发令/恢复通路测试，不是位移、关节运动或物理停止验收。
+- 额外核实模式发现：手动set_mode(1)获服务受理但话题仍为3，驱动正确因缺少对应反馈报错。
+  现场MobileManipulatorReferenceManager.cpp:1423–1476的模式分支已注释，
+  实际固定调用updateBaseArmControl并发布BaseArm；服务只改currentMpcControlMode_，
+  不改变此运行路径。已恢复服务存储值3并确认，正常动作沿用实际反馈3，不依赖切到1/2。
+- 紧接pause返回立即发新动作曾获厂商soft pause state 1拒绝；源码确认PAUSING/RESUMING
+  各有250帧过渡，只在稳定态受理，不排队。驱动没有重试或发目标，保持暂停；
+  稳定后显式新动作成功。False是使能关闭反馈，不额外宣称内部过渡已经结束。
+- 最终control_enabled=false、motion_blocked=true，remote_resume_unresolved、
+  remote_mode_unresolved、motion_send_uncertain均false；joints仍valid且20关节。
+  开机监管服务enabled/active、complete；原轮臂roslaunch PID 254548、启动时间未改变。
+- 228项离线测试、部署checker和diff检查通过。arm/leg硬件核验限位仍未配置，
+  move_joints继续拒绝；完整冷启动、真实位移/关节运动及物理停止仍待验收。

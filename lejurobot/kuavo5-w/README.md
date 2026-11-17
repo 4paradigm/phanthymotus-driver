@@ -211,9 +211,10 @@ rosmsg show kuavo_msgs/robotHeadMotionData
 rosmsg show kuavo_msgs/twoArmHandPoseCmd
 ```
 
-本驱动不会自动启动机器人控制器、启用控制、切换 MPC 模式或开启 quick mode。
+下位机已显式安装的开机服务负责初始化后暂停；驱动容器本身不创建硬件控制进程。
+普通执行动作会按需恢复控制并选择兼容MPC模式，无需先执行 `switch_mode.resume/set_mode`。
 `motion_enabled` 默认 `true`，未配置该字段时也默认开启；双臂/下肢关节动作还必须配置现场核验的限位，见下节。
-开启仅表示允许驱动处理请求，不会自动使能机器人、切换模式或发起运动，原有运行时检查仍然生效。
+该开关仅允许处理运动请求，后台检查、读取传感器、卡片start/info不会触发恢复或发运动目标；原有运行时检查仍生效。
 如需只读运行，可在实际加载的配置文件中设置 `motion_enabled: false` 并重启驱动；此时拒绝运动、
 恢复控制及模式切换，仍允许状态/传感器/模型读取、软件暂停和 `stop_move`。该字段必须是 YAML 布尔值。
 `switch_mode.get_current_mode.feedback.motion_enabled` 与执行卡 `info.motion_enabled` 可确认当前配置。
@@ -247,6 +248,7 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 `config.yaml` 的 `plugins.<card>.enabled` 决定卡片是否暴露。
 
 `switch_mode` 操作全身轮臂 MPC，不是独立底盘导航模式，也不会启动控制栈。
+它保留为高级诊断及手动干预入口，不是正常操作的前置卡片：开启智能控制后直接执行loco/arm等动作即可。
 `set_mode` 的0–4选项同时显示编号和名称，兼容画布下拉框传来的精确数字字符串，
 发送给 ROS 服务时仍为整数。`resume`/`set_mode` 需要真实机型参数及控制反馈；
 `controller_not_ready` 表示这些前提缺失，不能通过填入默认参数绕过。
@@ -305,7 +307,15 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 
 模式：0=NoControl（被动）、1=ArmOnly、2=BaseOnly、3=BaseArm、4=ArmEeOnly。
 底盘要求模式2/3；双臂关节要求1/3；末端允许1/3/4。下肢、躯干和头部要求非0模式。
-驱动不会根据动作隐式切换模式，也不会调用 `/enable_lb_arm_quick_mode`：该服务会绕过 MPC。
+动作参数及关节目标/限位先校验，再按需恢复并等待恢复后的新鲜MPC反馈，最后准备模式及发布目标。
+当前模式兼容且反馈新鲜时不重复切换；不兼容或NoControl时选择3=BaseArm，兼顾底盘和双臂。
+现场版本63的厂商实现实际固定执行并发布BaseArm：模式服务虽会接受其他编号，
+但不会改变实际运行模式。该机器正常动作直接沿用反馈中的BaseArm，不依赖切换到ArmOnly/BaseOnly；
+手动请求其他模式时仍会因缺少对应反馈而报错，不把服务受理冒充生效。
+恢复后也会重新核实模式；失败或被停止打断时不发送原运动目标，并尝试软件暂停。
+执行结果 `control_preparation` 报告是否恢复、是否改变模式及最终模式。
+这不是绕过检查的强制恢复：开机未确认、反馈过期、目标越界、发送不确定或旧控制请求未结清仍会拒绝。
+驱动不会调用 `/enable_lb_arm_quick_mode`，该服务会绕过MPC。
 部署时应确认其他客户端没有开启 quick mode；本驱动没有该模式的官方反馈来源，不能自动判断外部设置。
 
 ## ACP、并发和停止语义
@@ -315,7 +325,9 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 `leg` 与 `waist` 共享资源和驱动内部通道。同通道在途动作收到新命令会返回 busy，调用方应等待完成或显式停止。
 底盘速度/位姿也共享 busy 通道，避免位置指令被尚未过期的速度指令覆盖，或无效新参数误取消旧 ACP。
 `switch_mode` 不指定局部资源，采用 Agent Core 的全局互斥；其短状态转换按指南同步等待反馈。
-暂停、恢复和模式切换共用最多2s的服务受理+状态确认预算，而不是分别等待5s和2s；
+同为BaseArm时不同资源可并发；若改变全局模式需要影响其他在途动作，则返回busy，不能静默重置它们。
+每个暂停、恢复或模式服务分别使用最多2s的“受理+状态确认”总预算，而不是分别等待5s和2s；
+一个动作可能依次需要恢复、等待恢复后的MPC流、切换模式，最多三段各2s准备预算，准备阶段等待不持有发布锁。
 前台发令争用控制锁最多等待0.25s，未取得锁时明确返回 busy。反馈超时返回错误，要求查询状态后再决定，
 不自动重试或改为后台继续等待，确认期间重连也不能以新会话反馈证明旧请求成功。
 其中限时锁只适用于普通请求：控制服务采用“锁内验证并发送、锁外等待响应/状态”。
@@ -333,6 +345,9 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 只保留至多一个未决恢复的响应句柄，超时/本地取消后仍能收到迟到响应；传输断开不是控制器拒绝，
 重连和新会话 False 不会消除旧请求的不确定性。无法取得旧请求终态或发生部分发送/断线时，
 需现场核实并处置控制器状态；重启驱动本身不证明远端请求已取消。
+模式写入同样保留最多一个未决响应，`remote_mode_unresolved` 为true时不允许新动作恢复并覆盖旧写入。
+现场版本63的模式服务在修改模式后返回终态result；保留到该结果可避免旧写入在新准备之后才生效。
+模式服务终态并不代替运动前的新鲜模式话题确认。
 所有执行卡声明 `on_interrupt_motion` hook。
 
 位姿/关节运动订阅相应的 `/lb_*_reach_time`（`std_msgs/Float32`），只使用指令发送后收到的反馈。
@@ -369,7 +384,8 @@ ACP 同样标记为时长/控制器超时推断。WebSocket发送成功仅代表
 
 `stop_move` 和中断操作会发底盘/头部零速度并请求 `/enable_control=false` **全身软件暂停**，
 以避免位置目标在零速度命令退出后继续执行；它们会影响其他部位并取消所有在途 ACP。
-之后需显式 `switch_mode.resume`，再发送新的运动目标。
+停止后不重放任何旧目标；下一次显式提交的新运动动作会自动准备恢复和模式，无需单独点resume。
+停止会使尚在参数检查、等待发令锁或准备控制的旧请求失效，旧请求不能随后重新恢复或取消更新的动作。
 服务 `success=true` 只表示受理，暂停/恢复以 `/enable_control_state` 确认；保护窗口或重复请求被拒会返回错误。
 暂停确认失败时返回 `physical_stop_confirmed: false`，并继续阻止本驱动发运动命令。
 

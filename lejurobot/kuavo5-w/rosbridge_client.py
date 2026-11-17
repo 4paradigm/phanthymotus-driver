@@ -165,9 +165,9 @@ class RosbridgeClient:
                     self._services.pop(request_id, None)
 
     def retain_service(self, pending):
-        """Keep one hazardous control response observable after local cancellation.
+        """Keep a hazardous control response observable after local cancellation.
 
-        The bundle admits at most one unresolved resume. No command is retried;
+        The bundle admits at most one unresolved resume and one mode write. No command is retried;
         the entry is removed on response/disconnect, while its handle survives.
         """
         with self._lock:
