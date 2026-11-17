@@ -65,7 +65,7 @@ class RobotState:
     """Internal feedback stays subscribed even when the state card is stopped."""
     PREFIX = "state"
 
-    def __init__(self, ros1, node, namespace: str, sensors, motion_enabled=True):
+    def __init__(self, ros1, node, namespace: str, sensors, motion_enabled=True, boot_required=False):
         self.ros1 = ros1
         self.sensors = sensors
         self._topic = f"/{namespace}/state/control"
@@ -87,6 +87,9 @@ class RobotState:
         self._enable_probe_lock = threading.Lock()
         self._enable_probe_after = 0
         self._closed = threading.Event()
+        self._controller_boot = None
+        self._controller_boot_at = None
+        self._boot_required = boot_required
         ros1.subscribe("/mobile_manipulator/lb_mpc_control_mode", "std_msgs/Int8",
                        lambda msg: self._update("mpc_mode", msg.get("data")))
         ros1.subscribe("/enable_control_state", "std_msgs/Bool",
@@ -97,6 +100,7 @@ class RobotState:
         # Actual world-frame end-effector poses, NOT currentMpcTarget desired states.
         ros1.subscribe("/humanoid_wheel/eePoses", "std_msgs/Float64MultiArray",
                        lambda msg: self._update("ee_world_poses", msg.get("data")))
+        ros1.subscribe('/kuavo5w/controller_boot_state', 'std_msgs/String', self._boot_update)
         self._timer = node.create_timer(0.2, self._publish)
         self._enable_timer = node.create_timer(0.2, self._enable_tick)
 
@@ -111,7 +115,43 @@ class RobotState:
                 self._enable_verified_at = None
                 self._enable_check_error = 'connection_changed'
                 self._enable_publishers = []
+                self._controller_boot = None
+                self._controller_boot_at = None
         return connected, generation
+
+    def _boot_update(self, message):
+        self._sync_session()
+        raw = message.get('data')
+        if not isinstance(raw, str) or len(raw) > 2048:
+            return
+        try:
+            value = json.loads(raw)
+        except (ValueError, TypeError):
+            return
+        if (not isinstance(value, dict) or value.get('state') not in
+                ('waiting_hardware', 'initializing', 'pausing', 'complete', 'failed')
+                or type(value.get('boot_pause_confirmed')) is not bool):
+            return
+        with self._lock:
+            self._boot_required = True
+            self._controller_boot = {
+                'state': value['state'], 'boot_pause_confirmed': value['boot_pause_confirmed'],
+                'initialization_requested': value.get('initialization_requested') is True,
+                'initialization_accepted': value.get('initialization_accepted') is True,
+                'launch_ownership': value.get('launch_ownership') if value.get('launch_ownership')
+                    in ('external', 'service') else None,
+                'error': _safe_log(value['error'], 100) if isinstance(value.get('error'), str) else None,
+                'meaning': 'boot_result_not_current_control_state'}
+            self._controller_boot_at = time.monotonic()
+
+    def require_boot_complete(self):
+        # Optional for previously commissioned manual deployments. Once this
+        # session observes a boot owner, its gate may not be bypassed by silence.
+        with self._lock:
+            boot = self._controller_boot
+            if self._boot_required and (boot is None or boot['state'] != 'complete'
+                    or not boot['boot_pause_confirmed'] or time.monotonic() - self._controller_boot_at > 3):
+                raise RuntimeError('controller boot initialization/pause is not confirmed; inspect controller_boot')
 
     def _update(self, key: str, value) -> None:
         connected, _ = self._sync_session()
@@ -155,6 +195,8 @@ class RobotState:
                     "motion_enabled": self.motion_enabled,
                     "remote_resume_unresolved": self.remote_resume_unresolved,
                     "motion_send_uncertain": self.motion_send_uncertain,
+                    'controller_boot': None if self._controller_boot is None else {
+                        **self._controller_boot, 'age_s': max(0, now - self._controller_boot_at)},
                     "enable_verification": {
                         'valid': self._enable_trusted(now), 'error': self._enable_check_error,
                         'age_s': None if self._enable_verified_at is None else max(0, now - self._enable_verified_at),
@@ -182,6 +224,7 @@ class RobotState:
             raise RuntimeError(f"current MPC mode {mode} does not support this action; set_mode explicitly")
 
     def require_motion_enabled(self):
+        self.require_boot_complete()
         if not self.motion_enabled:
             raise RuntimeError("motion is disabled by configuration; set motion_enabled: true and restart the driver")
 
@@ -779,7 +822,10 @@ class KuavoBundle:
             camera_ensure=self.startup_checks.ensure_camera if self.startup_checks.enabled else None)
         self._auto_start = config.get('sensors', {}).get('auto_start',
             ['joints', 'imu', 'loco_state', *PERIPHERAL_CARDS])
-        self.state = RobotState(ros1, ros2_node, namespace, self.sensors, motion_enabled)
+        boot_required = config.get('host_runtime', {}).get('controller_boot_required', False)
+        if type(boot_required) is not bool:
+            raise ValueError('host_runtime.controller_boot_required must be a YAML boolean')
+        self.state = RobotState(ros1, ros2_node, namespace, self.sensors, motion_enabled, boot_required)
         self.tracker = ActionTracker()
         self._closing = False
         self._transition = None

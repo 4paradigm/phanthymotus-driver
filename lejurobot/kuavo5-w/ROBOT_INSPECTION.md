@@ -391,3 +391,28 @@ host helper 的首次安装仍需现场管理员执行一次，详见 README。
 底盘补充：`/cancel_task` 实现会杀死若干导航节点，不应作普通stop_nav；
 `/leju/cancel_dispatch_task` 的SetDispatchTask及MapOpt/MapLists定义已找到，仍需核实任务归属和停止反馈。
 底盘声卡为ALC897，另有串口设备；开机声音的实际输出通路仍未得到可听验证。
+
+## 追加：持久开机初始化后暂停（2026-11-17）
+
+操作人员明确选择长期策略：“自动启动并初始化，完成后进入软件暂停”。
+
+- 厂商已有 `ocs2_h12pro_monitor.service` 开机运行，但只维持H12/启动接口监听，未启动全身轮臂控制器。
+  新增下位机专用 `host/install_controller.py` 和 `host/controller_boot.py`，显式授权标志安装，
+  `kuavo5w-controller.service` 已启用。依赖厂商开机监听服务并等待ROS master，固定版本63/轮臂launch。
+- 每次下位机开机只启动一次并请求一次初始化；核实机型、20关节反馈和服务来源，
+  等待初始化响应及请求之后的新鲜MPC反馈，再请求enable=false并等待新False，才报告开机complete。
+  请求超时保留句柄、不重发；进程故障不自动重启、不自动resume。失败会阻止驱动运动，软件不能替代硬件急停。
+- 已有控制器时绝不启动第二套：仅观察已初始化、已暂停且测量/机型符合的程序，
+  该模式不调用初始化或暂停，不停止外部拥有的进程。现场接管成功，原roslaunch PID仍为254548。
+  新服务状态为complete、boot_pause_confirmed=true、launch_ownership=external，initialization_requested=false。
+- 现场发现初始化后厂商会撤销real_initial_start服务，因此接管路径仅要求有效的enable_control来源；
+  首次初始化路径仍要求两项服务来源都为/nodelet_manager。对此新增回归测试。
+- 上位机现场配置已设 `host_runtime.controller_boot_required: true`，新驱动订阅开机状态，
+  未确认/失败/超过3秒无更新时阻止motion、resume及模式修改，pause不受该门控限制。
+  开机complete不替代当前使能反馈；重连也不清除已发现开机监管服务的要求。
+- 现场驱动候选 `kuavo5w:local-boot-261117`，ID e7ca722ab49d，737094584字节，未安装依赖。
+  容器重建后读到开机complete、control_enabled=false、无未决resume，joints仍valid且20关节；
+  没有启动第二个轮臂控制程序。容器生命周期不重启、初始化或恢复下位机电机程序。
+- systemd单元校验通过，服务enabled/active。215项离线测试及部署checker通过。
+  本轮未关闭或重启机器人，完整断电开机→初始化→暂停路径仍待现场首轮验收，
+  不能将当前已运行程序的接管验证当作冷启动实测。

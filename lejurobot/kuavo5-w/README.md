@@ -94,12 +94,45 @@ ROS消息解码以普通用户运行，固定启动助手独立运行。旧版 r
 仅bridge和rosapi进程优先加载，不覆盖厂商工作区或系统ROS包。未传该参数时保留已有覆盖层。
 现场版本63的sensorsData含FTsensor_data，已验证用该方法恢复真实20关节数据。
 
-全身执行与这些只读助手分开启动。现场版本63经授权旁站验证使用下位机既有环境和
-`ROBOT_VERSION=63 roslaunch humanoid_controllers load_kuavo_real_wheel.launch joystick_type:=h12 start_way:=auto`，
-再由厂商 `/humanoid_controller/real_initial_start` 初始化；这些步骤会接入电机并可能调整姿态，
-不纳入卡片自动start。版本、标定、遥控器与现场就绪条件必须先核实，不能照搬到其他硬件。
-本次已验证真实20关节反馈、MPC模式、软件暂停/恢复；尚未验证位移或关节目标运动。
-arm/leg仍需要下文的硬件核验限位配置。
+### 下位机开机自动初始化并暂停
+
+全身控制栈属于下位机硬件进程，不由上位机驱动容器反复创建。现场版本63已获操作人员明确授权：
+每次下位机开机自动启动并初始化，完成后进入软件暂停。初始化会使能电机并可能调整姿态；
+版本、标定、遥控器与开机活动范围必须先核实，不能照搬到其他硬件。
+
+将 `host/controller_boot.py`、`host/install_controller.py` 放到下位机同一目录，显式安装一次：
+
+```sh
+sudo python3 host/install_controller.py \
+  --workspace /home/lab/kuavo-ros-opensource \
+  --master http://192.168.26.1:11311 --ros-ip 192.168.26.1 \
+  --confirm-auto-initialize-and-pause
+```
+
+安装器只enable `kuavo5w-controller.service`，不停止或替换当前控制器。
+如需在本次开机启用监管，可显式 `sudo systemctl start kuavo5w-controller.service`：
+发现已有控制栈时只观察，不重复启动、初始化或发暂停；仅当其版本、20关节实测、初始化标志及
+新收到的暂停反馈均符合要求才接管状态，报告 `launch_ownership: external`。
+已有控制器未就绪或未暂停时保持等待，不能抢占另一个控制者。
+
+正常下次开机，服务等待厂商H12服务建立ROS master，确认没有已有控制器后启动
+`ROBOT_VERSION=63 roslaunch humanoid_controllers load_kuavo_real_wheel.launch joystick_type:=h12 start_way:=auto`。
+核实机型、关节、服务来源后仅调用一次 `/humanoid_controller/real_initial_start`；
+等待请求终态及之后的新鲜MPC反馈，再请求 `/enable_control(false)`，确认新收到的false后才报告complete。
+初始化超时保留请求，不重发；失败不假报就绪。控制进程故障不自动重启，也不调用enable=true。
+服务自有进程退出后需要现场检查再手动处理，不能用自动重启掩盖急停或硬件故障。
+
+确认下位机服务正常后，在上位机现场配置设 `host_runtime.controller_boot_required: true`，
+驱动的运动、resume和模式切换会等待开机流程确认；pause始终允许尝试。
+`switch_mode.get_current_mode.feedback.controller_boot` 展示结果；
+`boot_pause_confirmed` 仅代表开机流程曾确认暂停，当前使能仍以独立 `control_enabled` 反馈为准。
+开机状态超过3秒未更新会阻止运动；一旦发现开机服务，本次驱动会话即使重连也保留该要求。
+兼容旧手动部署，随包配置默认false；不应在已使用开机服务的现场关闭检查绕过故障。
+
+容器重启只重连这些服务，不重新初始化或自动恢复运动。下位机开机服务和上位机安装器均须部署，
+仅有容器的restart策略不能恢复另一台机器上的电机进程。
+本次已验证真实20关节反馈、MPC模式、软件暂停/恢复及当前已暂停程序的只读接管；
+尚未进行实际关机重启，也未验证位移或关节目标运动。arm/leg仍需要下文的硬件核验限位配置。
 
 默认自动启动 `joints/imu/loco_state/battery/laser_scan/camera_left/camera_right/camera_head/camera_depth` 的输出。
 卡片 `start` 先检查是否有新鲜图像；缺帧时异步请求启动，左右相机调用对应 `set_camera_enabled(true)`，头部卡请求上述宿主机服务。

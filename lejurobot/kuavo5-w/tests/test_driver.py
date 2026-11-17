@@ -287,6 +287,36 @@ class DriverContractTests(unittest.TestCase):
                 self.assertIs(type(sent[2]['control_mode']), int)
                 self.assertEqual(sent[2]['control_mode'], mode)
 
+    def test_boot_initialization_gate_blocks_motion_resume_and_mode_but_not_pause(self):
+        for state in ('waiting_hardware', 'initializing', 'pausing', 'failed'):
+            self.bundle.state._boot_update({'data': json.dumps({'state': state, 'boot_pause_confirmed': False})})
+            for action, args in [('resume', {}), ('set_mode', {'mode': 3})]:
+                result = self.call('switch_mode', action, **args)
+                self.assertIn('boot initialization/pause is not confirmed', result['error'])
+            with self.assertRaisesRegex(RuntimeError, 'boot initialization'):
+                self.bundle.state.require_motion()
+        self.assertEqual(self.ros.sent_services, [])
+        self.assertEqual(self.call('switch_mode', 'pause')['state'], 'paused')
+
+    def test_boot_completion_is_not_a_current_enable_signal_and_stales_closed(self):
+        self.bundle.state._boot_update({'data': json.dumps({'state': 'complete', 'boot_pause_confirmed': True})})
+        self.bundle.state.require_boot_complete()
+        self.assertTrue(self.bundle.state.confirmed_enable())  # Boot report never overwrites live state.
+        self.bundle.state._controller_boot_at -= 4
+        with self.assertRaisesRegex(RuntimeError, 'boot initialization'):
+            self.bundle.state.require_boot_complete()
+        self.ros.connection = (False, 2)
+        self.bundle.state.snapshot()
+        self.ros.connection = (True, 3)
+        self.bundle.state.snapshot()
+        with self.assertRaisesRegex(RuntimeError, 'boot initialization'):
+            self.bundle.state.require_boot_complete()
+
+    def test_explicit_boot_requirement_blocks_before_first_owner_message(self):
+        self.bundle.state._boot_required = True
+        with self.assertRaisesRegex(RuntimeError, 'boot initialization'):
+            self.bundle.state.require_boot_complete()
+
     def test_mode_rejects_invalid_choices_without_sending(self):
         for mode in (None, True, False, 3.0, 3.5, -1, 5, '', '3.0', '03', ' 3', 'BaseArm', [], {}):
             with self.subTest(mode=mode):

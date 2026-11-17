@@ -10,6 +10,9 @@ motion_enabled: true
 # Never starts/enables WBC or MPC.
 host_runtime:
   enabled: true
+  # Set true after provisioning lower-host install_controller.py. Block resume
+  # and motion until that boot owner confirms initialization followed by pause.
+  controller_boot_required: false
 # Start rosbridge_server on the ROS Noetic host and point this URL at it.
 rosbridge_url: "ws://127.0.0.1:9090"
 sensors:
