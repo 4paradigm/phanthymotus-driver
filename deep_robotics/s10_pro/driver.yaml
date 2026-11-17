@@ -21,7 +21,7 @@ cards:
   - { name: camera_rear,  type: sensor }
   - { name: camera_left,  type: sensor }
   - { name: camera_front, type: sensor }
-  - { name: camera_front__depth, type: sensor }
+  - { name: camera_front_depth, type: sensor }
   - { name: camera_right, type: sensor }
   - { name: loco,        type: actuator }
   - { name: loco_servo,  type: actuator }

@@ -50,7 +50,7 @@ camera_rtsp:
 # Point-cloud packing runs in bounded worker processes; RTSP camera pulling
 # uses independent FFmpeg threads so media cannot block robot ROS callbacks.
 media_workers: true
-# Sparse metric depth in the front camera view. It starts only with the card.
+# Completed front-view depth calibrated by raw LiDAR; starts only with the card.
 # Use one raw PointCloud2 topic with metre XYZ, not the display/map stream.
 # The transform maps the exact cloud_frame_id into camera optical axes
 # (X right, Y down, Z forward). Populate it from a measured calibration.

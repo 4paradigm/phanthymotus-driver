@@ -432,6 +432,12 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     camera_output = nodes.camera_publishers["camera_rear"].messages[-1]
     assert camera_output.format == "jpeg"
     assert bytes(camera_output.data) == b"\xff\xd8jpeg\xff\xd9"
+    assert nodes.front_camera_frame() is None
+    nodes._handle_media_result('camera_front', None, b'front-jpeg')
+    generation, received, jpeg = nodes.front_camera_frame()
+    assert generation == nodes.camera_undistortion.generation('camera_front')
+    assert 0 <= time.monotonic() - received < .35
+    assert jpeg == b'front-jpeg'
 
     point_data = struct.pack("<ffffff", 1.0, 2.0, 3.0, math.nan, 5.0, 6.0)
     lidar = SimpleNamespace(

@@ -10,7 +10,7 @@ charging and navigation.
 | Battery | `/BATTERY_DATA` (`drdds/msg/BatteryData`) | `soc`, `soh`, `current`, `voltage`, `cell_vol`, `temperature`, `cycle` as JSON |
 | Joints | `/JOINTS_DATA_10HZ` (`drdds/msg/JointsData`) and `/IMU` | `joints_info` JSON with joint names/angles/speeds/torques/temperatures; `joints` skeleton with 16 joints and IMU orientation |
 | Cameras | AOS RTSP streams on `10.21.33.103:8554` | Four JPEG streams on the existing `camera_front`, `camera_rear`, `camera_left`, and `camera_right` topics |
-| `camera_front__depth` | `/LIDAR/POINTS` and automatically loaded robot-specific optical extrinsics | One locally hole-filled front-view depth stream on `/{namespace}/camera_front/depth`, `image/depth-zlib`, 640x480 uint16 millimetres |
+| `camera_front_depth` | Front RGB, `/LIDAR/POINTS` and automatically loaded robot-specific calibration | One completed front-view depth stream on `/{namespace}/camera_front/depth`, `image/depth-zlib`, 640x480 uint16 millimetres |
 | LiDAR | 22 historical/live PointCloud2 candidates; `/ACCUMULATED_POINTS_MAP` remains the map source | Split `lidar_cloud` and `lidar_map` `sensor/pointcloud` streams with bounded latest-frame workers; only one fresh cloud source is active at a time |
 | IMU | `/IMU` (`sensor_msgs/msg/Imu`) | source `header.stamp`, quaternion (w,x,y,z), angular velocity, linear acceleration, Euler angles (radians), temperature |
 | `loco_servo` | `control/velocity` (`motus.control/1`, twist) | bounded continuous velocity commands to the native S10 TCP controller; dry-run by default |
@@ -166,19 +166,23 @@ previous ROS image-topic receive path has been removed because the vendor camera
 does not publish camera images over DDS. The final image includes the `ffmpeg`
 runtime for RTSP demuxing.
 
-## Front-camera sparse depth
+## Front-camera completed depth
 
-The Pro bundle includes one additional sensor card, `camera_front__depth`.
-It projects the original LiDAR XYZ into the rectified front camera's optical
-view. It uses the existing front-camera calibration without pulling or decoding
-another RTSP stream. It fills supported short gaps and publishes only one
-output on the existing depth topic; there is no separate raw or `depth_filled`
+The Pro bundle includes one additional sensor card, `camera_front_depth`.
+It projects original LiDAR XYZ into the rectified front-camera optical view,
+fills supported short gaps and completes the remainder with a LiDAR-calibrated
+YOLO26n-depth ONNX prediction. All computation runs in the driver; no perception
+service, additional camera or visual_depth card, or user-entered topic is needed.
+It reuses the existing front RTSP capture through a single latest-JPEG cache,
+without opening a second stream. There is only one output on the existing
+depth topic; there is no separate raw, monocular or `depth_filled`
 output. It publishes only after the card's `start` action; driver
 bundle startup only advertises the card.
 
 ### First-use configuration
 
-Keep the `camera_front` card's `undistort` setting enabled.
+Front-camera rectification must remain enabled (the default); the RGB card
+does not need to be placed on the canvas.
 Start the card normally; calibration and transport fields
 are not exposed in canvas settings. The inspected robot's identity-bound
 calibration is included in the image and selected automatically. Other robots
@@ -302,16 +306,43 @@ The output is `sensor_msgs/CompressedImage` with
 `format="16UC1; compressedDepth zlib"`: zlib level-1 compression of a fixed
 640x480, row-major, little-endian uint16 millimetre buffer. Zero means unknown.
 At each observed pixel the closest positive camera Z wins. The single output
-then fills horizontal/vertical gaps of at most eight pixels, bounded by original
-measurements whose depths differ by no more than both 150mm and 6% of the nearer
-depth. It preserves measured pixels, rejects conflicting estimates and never
-uses filled pixels as new anchors. Large gaps and unsupported regions stay zero.
-No learned filling, temporal accumulation or motion compensation is applied.
-The result remains sparse and must not be treated as evidence that an
-unobserved area is clear. Metadata declares `hole_filling: true`,
-`depth_source: estimated_interpolation` and `interpolated_pixels_are_measured: false`.
-`info.stats` keeps measured coverage, filled coverage, filled-pixel count and
-conflict count; the original projection exists only inside the worker.
+then fills bounded two-dimensional patches in two fixed paths: horizontal then
+vertical, and vertical then horizontal. Each bracket has at most 16 missing
+pixels. Second-stage brackets may use first-stage segments, carrying the minimum
+and maximum of all their original measured supports; that full depth range must
+remain within both 150mm and 6% of the nearest support. An observed depth boundary
+in either path vetoes filling; predictions disagreeing by more than the smaller
+of 60mm and 2% of the nearer prediction are also rejected. Original measured
+pixels are preserved. There is no iteration or extrapolation in this local
+stage; unsupported gaps are left for monocular completion. The patch estimate is interpolation in optical Z,
+not a fitted physical surface or a guarantee of correct occlusion at unmeasured
+pixels. Sparse returns cannot establish the silhouette of every obstacle.
+The worker runs the official YOLO26n-depth ONNX model with CPU ONNX Runtime.
+Its RGB letterbox padding is removed before resizing to the depth grid. A
+robust log-affine metric correction is fitted using only original LiDAR
+pixels, followed by a 17x17 local log-residual correction. One fifth of
+reference pixels is held out of both stages: the frame is rejected if median
+relative error exceeds 25% or its 90th percentile exceeds 50%. At least 64
+training points, 16 held-out points and six occupied 80x80 spatial cells are
+required. Near returns are not classified or removed by distance alone.
+Measured and locally filled pixels take priority over model completion.
+Invalid model values and generated values outside the configured depth range
+remain zero. There is no temporal accumulation or motion compensation.
+
+The card displays the one completed map without source-region overlays.
+Internal metadata records `depth_source: lidar_monocular_fusion` and keeps
+`interpolated_pixels_are_measured: false`. The holdout check validates supported
+regions, not the accuracy of wholly unobserved areas or camera/LiDAR occlusion.
+`info.stats` separates measured coverage, local filled coverage and final
+`output_coverage`, and reports `monocular_pixels`, inference time, calibration
+coefficients, reference/holdout counts and held-out error percentiles. Raw
+projection and monocular prediction remain internal to the worker.
+
+The model is downloaded and checked at image build time, not on card start:
+`https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-depth.onnx`,
+SHA-256 `6583ec12521a7e75eacb209db63393158c7e0e772cda9fdad8c8c0fe74af2a1e`.
+Missing or mismatched model files fail explicitly. The image includes ONNX
+Runtime, Pillow and NumPy; no GPU runtime configuration is required.
 
 The existing depth renderer requires 640x480, while front RGB is 640x360.
 The depth declaration supplies its own K using pixel-centre scaling:
@@ -333,8 +364,10 @@ source scan deskew. This output alone is not synchronized RGB-D input for VO.
 Only the explicitly configured raw topic is subscribed. There is no automatic
 source switching, and the display LiDAR's coordinate changes are not reused.
 Mismatched frames, zero/invalid/repeated/backward source stamps, malformed
-clouds, and results older than one second since local receipt are rejected.
-Restart the card after a source clock reset. Projection and compression run in
+clouds, and results older than three seconds since local receipt are rejected.
+The selected front JPEG must have the same rectification generation and arrive
+within 350ms of cloud receipt. This is receipt matching, not exposure sync.
+Restart the card after a source clock reset. Projection, inference, fusion and compression run in
 one bounded worker process, with one pending input and one pending result;
 each cloud samples at most 200,000 points uniformly. Source data is limited to
 64 MiB and two million points. Effective output rate can be below `rate_hz`.

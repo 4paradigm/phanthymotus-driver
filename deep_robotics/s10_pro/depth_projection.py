@@ -200,82 +200,73 @@ def project_depth(cloud, K, camera_optical_from_cloud, *, min_depth_m=0.1,
         'source_points': total, 'sample_points': sampled, 'valid_pixels': valid_pixels,
     }
 
-# Only short, locally supported holes are filled. Synthetic depth is not a
-# sensor measurement and must never count as measured obstacle coverage.
-HOLE_FILL_MAX_GAP_PX = 8
+# Synthetic depth is not a measurement or evidence of observed free space.
+HOLE_FILL_MAX_GAP_PX = 16
 HOLE_FILL_MAX_JUMP_MM = 150
 HOLE_FILL_RELATIVE_JUMP = 0.06
 
 
 def fill_depth_holes(packet):
-    """Return (filled image/depth-zlib, stats); never alter an observed pixel.
+    """Fill bounded 2-D patches; preserve originals and reject depth boundaries.
 
-    Horizontal and vertical 1-D gaps must be bounded by ORIGINAL observations.
-    Bridging depth discontinuities or extrapolating from a single return can
-    manufacture free space or erase thin obstacles, so neither is permitted.
-    Conflicting horizontal/vertical predictions are invalidated, not averaged.
+    Two fixed paths (rows then columns, columns then rows) interpolate between
+    observations or segments bracketed by observations. Every stage carries
+    the depth range of ALL its original supports. No iterative growth,
+    extrapolation, temporal reuse or RGB alignment is assumed.
     """
+    import numpy as np
+
     raw = zlib.decompress(packet)
     if len(raw) != WIDTH * HEIGHT * 2:
         raise ValueError("depth packet is not 640x480 uint16")
-    source = array('H')
-    source.frombytes(raw)
-    if sys.byteorder != 'little':
-        source.byteswap()
-    filled = array('H', source)
-    # 0: original or unknown; 1: synthetic; 2: rejected synthetic conflict
-    flags = bytearray(WIDTH * HEIGHT)
-    conflicts = 0
+    source = np.frombuffer(raw, dtype='<u2').reshape(HEIGHT, WIDTH).astype(np.int32)
 
-    def bridge(start, end, stride):
-        nonlocal conflicts
-        gap = (end - start) // stride - 1
-        if gap <= 0 or gap > HOLE_FILL_MAX_GAP_PX:
-            return
-        first, last = source[start], source[end]
-        if abs(first - last) > min(
-                HOLE_FILL_MAX_JUMP_MM,
-                HOLE_FILL_RELATIVE_JUMP * min(first, last)):
-            return
-        for step in range(1, gap + 1):
-            index = start + stride * step
-            estimate = (first * (gap + 1 - step) + last * step
-                        + (gap + 1) // 2) // (gap + 1)
-            if flags[index] == 0:
-                filled[index] = estimate
-                flags[index] = 1
-            elif flags[index] == 1:
-                if abs(filled[index] - estimate) > min(
-                        60, 0.02 * min(filled[index], estimate)):
-                    filled[index] = 0
-                    flags[index] = 2
-                    conflicts += 1
-                else:
-                    filled[index] = (filled[index] + estimate + 1) // 2
+    def bridge(state, axis):
+        depth, low, high, rejected = (np.swapaxes(a, axis, 1) for a in state)
+        size = depth.shape[1]
+        index = np.arange(size, dtype=np.int32)[None, :]
+        known = depth != 0
+        left = np.maximum.accumulate(np.where(known, index, -1), axis=1)
+        right = np.minimum.accumulate(np.where(known, index, size)[:, ::-1], axis=1)[:, ::-1]
+        bracketed = (~known & (left >= 0) & (right < size)
+                     & (right - left - 1 <= HOLE_FILL_MAX_GAP_PX))
+        left = left.clip(0, size - 1)
+        right = right.clip(0, size - 1)
+        first = np.take_along_axis(depth, left, axis=1)
+        last = np.take_along_axis(depth, right, axis=1)
+        minimum = np.minimum(np.take_along_axis(low, left, axis=1),
+                             np.take_along_axis(low, right, axis=1))
+        maximum = np.maximum(np.take_along_axis(high, left, axis=1),
+                             np.take_along_axis(high, right, axis=1))
+        consistent = ((maximum - minimum <= HOLE_FILL_MAX_JUMP_MM)
+                      & (maximum - minimum <= HOLE_FILL_RELATIVE_JUMP * minimum))
+        valid = bracketed & consistent & ~rejected
+        # int32 also covers 65535-mm inputs and the full 640-pixel row span.
+        span = np.maximum(1, right - left)
+        estimate = (first * (right - index) + last * (index - left) + span // 2) // span
+        result = (np.where(valid, estimate, depth),
+                  np.where(valid, minimum, low), np.where(valid, maximum, high),
+                  rejected | (bracketed & ~consistent))
+        return tuple(np.swapaxes(a, axis, 1) for a in result)
 
-    # Source pixels, not pixels filled in the preceding pass, supply every
-    # anchor. The interpolation can never recursively grow into unseen space.
-    for row in range(HEIGHT):
-        previous = None
-        for col in range(WIDTH):
-            index = row * WIDTH + col
-            if source[index]:
-                if previous is not None:
-                    bridge(previous, index, 1)
-                previous = index
-    for col in range(WIDTH):
-        previous = None
-        for row in range(HEIGHT):
-            index = row * WIDTH + col
-            if source[index]:
-                if previous is not None:
-                    bridge(previous, index, WIDTH)
-                previous = index
-
-    synthetic = flags.count(1)
-    if sys.byteorder != 'little':
-        filled.byteswap()
-    return zlib.compress(filled.tobytes(), level=1), {
-        'filled_pixels': synthetic,
-        'fill_conflicts': conflicts,
+    original = (source, source, source, np.zeros(source.shape, dtype=bool))
+    horizontal = bridge(bridge(original, 1), 0)
+    vertical = bridge(bridge(original, 0), 1)
+    a, b = horizontal[0], vertical[0]
+    both = (a != 0) & (b != 0)
+    disagreement = both & (np.abs(a - b) > np.minimum(60, 0.02 * np.minimum(a, b)))
+    minimum = np.minimum(horizontal[1], vertical[1])
+    maximum = np.maximum(horizontal[2], vertical[2])
+    support_conflict = both & ((maximum - minimum > HOLE_FILL_MAX_JUMP_MM)
+                              | (maximum - minimum > HOLE_FILL_RELATIVE_JUMP * minimum))
+    # A path which crosses an observed depth boundary vetoes the other path;
+    # otherwise orthogonal filling could paint across a thin foreground return.
+    candidate = (source == 0) & ((a != 0) | (b != 0))
+    conflict = candidate & (horizontal[3] | vertical[3] | disagreement | support_conflict)
+    filled = np.where(both, (a + b + 1) // 2, np.maximum(a, b))
+    filled[conflict] = 0
+    filled[source != 0] = source[source != 0]
+    return zlib.compress(filled.astype('<u2').tobytes(), level=1), {
+        'filled_pixels': int(np.count_nonzero((source == 0) & (filled != 0))),
+        'fill_conflicts': int(np.count_nonzero(conflict)),
     }

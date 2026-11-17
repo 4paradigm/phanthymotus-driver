@@ -267,3 +267,65 @@ def test_hole_fill_empty_and_invalid_packets(projection):
     assert stats == {"filled_pixels": 0, "fill_conflicts": 0}
     with pytest.raises((zlib.error, ValueError)):
         projection.fill_depth_holes(zlib.compress(b"too short"))
+
+
+def test_hole_fill_covers_surface_interior_without_growing_outside_support(projection):
+    # Four measured corners enclose a 13x13 constant-depth patch. Independent
+    # scanline interpolation only draws its perimeter, leaving a black interior.
+    packet = _hole_packet([(310, 234, 2000), (322, 234, 2000),
+                           (310, 246, 2000), (322, 246, 2000)])
+    result, stats = decode(projection.fill_depth_holes(packet))
+    assert all(result[y * 640 + x] == 2000
+               for y in range(234, 247) for x in range(310, 323))
+    assert stats == {"filled_pixels": 165, "fill_conflicts": 0}
+    assert sum(value != 0 for value in result) == 169
+
+
+def test_hole_fill_interpolates_sloped_surface_in_two_dimensions(projection):
+    packet = _hole_packet([(310, 234, 2000), (322, 234, 2048),
+                           (310, 246, 2048), (322, 246, 2096)])
+    result, _ = decode(projection.fill_depth_holes(packet))
+    assert result[240 * 640 + 316] == 2048
+    assert result[237 * 640 + 313] == 2024
+    assert result[246 * 640 + 322] == 2096
+
+
+@pytest.mark.parametrize("corners", [
+    (2000, 2000, 3000, 3000),  # A depth boundary must not become a surface.
+    (2000, 2100, 2100, 2200),  # Each edge passes; all four originals disagree.
+    (60000, 60000, 61000, 61000),  # uint16 arithmetic must not wrap.
+])
+def test_hole_fill_checks_all_original_support_depths(projection, corners):
+    points = [(310, 234, corners[0]), (322, 234, corners[1]),
+              (310, 246, corners[2]), (322, 246, corners[3])]
+    packet = _hole_packet(points)
+    result, _ = decode(projection.fill_depth_holes(packet))
+    assert result[240 * 640 + 316] == 0
+    for x, y, value in points:
+        assert result[y * 640 + x] == value
+
+
+def test_hole_fill_retains_thin_measured_foreground_inside_surface(projection):
+    points = [(310, 234, 2000), (322, 234, 2000),
+              (310, 246, 2000), (322, 246, 2000), (316, 240, 400)]
+    result, _ = decode(projection.fill_depth_holes(_hole_packet(points)))
+    assert result[240 * 640 + 316] == 400
+    assert result[239 * 640 + 316] == 0
+    assert result[240 * 640 + 315] == 0
+
+
+def test_hole_fill_does_not_recurse_across_wide_surface_gap(projection):
+    packet = _hole_packet([(310, 230, 2000), (322, 230, 2000),
+                           (310, 250, 2000), (322, 250, 2000)])
+    result, _ = decode(projection.fill_depth_holes(packet))
+    assert result[240 * 640 + 316] == 0
+    assert result[229 * 640 + 316] == 0
+
+
+def test_hole_fill_checks_union_of_both_paths_original_supports(projection):
+    # Predictions nearly agree, but their combined original supports span
+    # 230mm: checking only the two predicted values would hide that boundary.
+    packet = _hole_packet([(304, 240, 2000), (321, 240, 2110),
+                           (320, 239, 2110), (320, 256, 2230)])
+    result, _ = decode(projection.fill_depth_holes(packet))
+    assert result[240 * 640 + 320] == 0

@@ -1,8 +1,8 @@
-"""Locally hole-filled front-camera depth from a calibrated S10 LiDAR stream.
+"""Standalone front-camera depth from calibrated LiDAR and monocular inference.
 
 The output follows the existing 640x480 depth-zlib contract. It is evaluated
 at the LiDAR header time, not at an inferred RTSP exposure time. Projection,
-hole filling and compression run in a bounded subprocess; callbacks only enqueue.
+hole filling, inference, fusion and compression run in a bounded subprocess.
 """
 from __future__ import annotations
 
@@ -25,13 +25,16 @@ from deep_robotics.s10_pro.depth_projection import (
 )
 from deep_robotics.s10_pro.undistortion import CameraUndistortion, half_fov
 from deep_robotics.s10_pro.cloud_relay import CloudRelay, read_robot_identity
+from deep_robotics.s10_pro.depth_fusion import fuse_depth
+from deep_robotics.s10_pro.monocular_depth import MonocularDepth
 
-NAME = "camera_front__depth"
+NAME = "camera_front_depth"
 FRAME = "s10_pro_camera_front_optical"
 FORMAT = "image/depth-zlib"
 ROS_FORMAT = "16UC1; compressedDepth zlib"
 MAX_DATA_BYTES = 64 * 1024 * 1024
-MAX_RESULT_AGE_S = 1.0
+MAX_RESULT_AGE_S = 3.0
+MAX_RGB_RECEIPT_AGE_S = .35
 SOURCE_TIMEOUT_S = 3.0
 CAMERA_ID = "deeprobotics/s10_pro/camera_front"
 FRONT_STREAM = "rtsp://10.21.33.103:8554/video4"
@@ -104,6 +107,7 @@ def _put_latest(target, value):
 def _project_worker(jobs, results):
     from common import logsafe
     logsafe.install(check_fd=False)
+    model = None
     while True:
         job = jobs.get()
         if job is None:
@@ -117,10 +121,19 @@ def _project_worker(jobs, results):
                 min_depth_m=job["min_depth_m"], max_depth_m=job["max_depth_m"])
             filled_packet, fill_stats = fill_depth_holes(packet)
             stats.update(fill_stats)
+            if model is None:
+                model = MonocularDepth()
+            inference_started = time.monotonic()
+            mono_packet = model.predict(job['jpeg'])
+            stats['monocular_inference_ms'] = round((time.monotonic() - inference_started) * 1000, 1)
+            fused_packet, fusion_stats = fuse_depth(packet, filled_packet, mono_packet,
+                                                  min_depth_m=job['min_depth_m'],
+                                                  max_depth_m=job['max_depth_m'])
+            stats.update(fusion_stats)
             stats["measured_coverage"] = round(stats["valid_pixels"] / (640 * 480), 4)
             stats["filled_coverage"] = round(
                 (stats["valid_pixels"] + stats["filled_pixels"]) / (640 * 480), 4)
-            _put_latest(results, (context, filled_packet, stats, None))
+            _put_latest(results, (context, fused_packet, stats, None))
         except Exception as exc:
             _put_latest(results, (context, None, None, str(exc)[:300]))
 
@@ -346,7 +359,8 @@ class FrontDepthPlugin:
             source="inherited" if k else "unknown",
             measured_on=calibration.get("measured_on", "") if calibration else "",
             pipeline=["deeprobotics/s10_pro/camera_front", "deeprobotics/s10_pro/undistort",
-                      "lidar_projection", "resize:640x360->640x480", "bounded_hole_fill"],
+                      "lidar_projection", "resize:640x360->640x480", "bounded_2d_hole_fill",
+                      "yolo26n_depth", "lidar_calibrated_completion"],
             vendor={
                 "frame_id": optical_frame, "calibration_source": source,
                 "cloud_topic": config["cloud_topic"], "cloud_frame_id": config["cloud_frame_id"],
@@ -354,8 +368,8 @@ class FrontDepthPlugin:
                 "extrinsics_source": extrinsics_source,
                 "reprojection_verified": False,
                 "depth_unit": "mm", "depth_scale_m": .001, "invalid_depth_value": 0,
-                "depth_quantity": "optical_z", "sparse": True, "hole_filling": True,
-                "depth_source": "estimated_interpolation",
+                "depth_quantity": "optical_z", "sparse": False, "hole_filling": True,
+                "depth_source": "lidar_monocular_fusion", "monocular_completion": True,
                 "interpolated_pixels_are_measured": False,
                 "registered_view": "camera_front", "depth_aligned_to_rgb": False,
                 "rgb_resolution": [640, 360],
@@ -369,7 +383,7 @@ class FrontDepthPlugin:
 
     def _topic_outputs(self):
         return [{"topic": self.topic, "format": FORMAT,
-                 "desc": "保守短间隙补洞后的雷达深度；估计像素非实测，剩余未知像素为0"}]
+                 "desc": "前相机完整深度图"}]
 
     def get_tool(self):
         with self._lock:
@@ -384,11 +398,11 @@ class FrontDepthPlugin:
             "rate_hz": {"type": "number", "title": "最大输出频率（Hz）", "exclusiveMinimum": 0, "maximum": 15},
         }
         schema = action_schema({
-            "start": ([], "自动加载本机标定并启动前相机补洞深度；标定缺失时明确报错"),
+            "start": ([], "自动加载本机标定并启动前相机融合深度；标定缺失时明确报错"),
             "stop": ([], "停止本深度流"), "info": ([], "深度参数、运行状态和时间来源"),
             "config": (list(properties), "保存深度配置；修改后重新启动本卡片"),
         }, properties)
-        card = tool(NAME, "sensor", "山猫 S10 Pro 前相机雷达深度：局部补洞输出；插值像素非实测，未与 RTSP 曝光同步",
+        card = tool(NAME, "sensor", "山猫 S10 Pro 前相机深度图：自动读取标定并融合雷达与单目深度",
                     schema, topic_out=self._topic_outputs())
         card["camera_info"] = [self._camera_info()]
         config_properties = {key: copy.deepcopy(properties[key]) for key in
@@ -575,10 +589,16 @@ class FrontDepthPlugin:
                     self._stats["throttled"] += 1
                     return
                 calibration, _ = self.controller.calibration("camera_front")
+                camera_generation = self.controller.generation('camera_front')
+                frame = self.nodes.front_camera_frame()
+                if (frame is None or frame[0] != camera_generation
+                        or frame[1] is None or abs(now - frame[1]) > MAX_RGB_RECEIPT_AGE_S):
+                    raise DepthError('FRONT_RGB_UNAVAILABLE', 'Waiting for a fresh rectified front-camera image')
                 source["data"] = bytes(view)
                 job = {
-                    "generation": generation, "camera_generation": self.controller.generation("camera_front"),
+                    "generation": generation, "camera_generation": camera_generation,
                     "stamp": (sec, nsec), "received_monotonic": now,
+                    "jpeg": frame[2], "rgb_received_monotonic": frame[1],
                     "cloud": source,
                     "K": depth_intrinsics(calibration), "transform": config["camera_optical_from_cloud"],
                     "min_depth_m": config["min_depth_m"], "max_depth_m": config["max_depth_m"],

@@ -112,7 +112,8 @@ def rig(tmp_path, monkeypatch):
                               create_timer=create_timer, destroy_timer=destroyed_timers.append,
                               get_publishers_info_by_topic=lambda topic: list(publisher_infos)),
         bridge=SimpleNamespace(create_publisher=create_publisher),
-        camera_undistortion=controller, _sensor_qos=object())
+        camera_undistortion=controller, _sensor_qos=object(),
+        front_camera_frame=lambda: (controller.generation('camera_front'), time.monotonic(), b'front-jpeg'))
     extrinsics_path = tmp_path / "extrinsics.json"
     monkeypatch.setenv("S10_FRONT_CAMERA_EXTRINSICS", str(extrinsics_path))
     plugin = depth.FrontDepthPlugin({}, "robot", nodes, config_path=tmp_path / "depth.json")
@@ -143,6 +144,25 @@ def deployment_calibration(rig, **changes):
 def test_canvas_has_no_topic_frame_or_matrix_settings(rig):
     properties = rig.plugin.get_tool()["configSchema"]["properties"]
     assert set(properties) == {"min_depth_m", "max_depth_m", "rate_hz"}
+
+
+@pytest.mark.parametrize('frame', [None, (0, 0, b'old-image'), (999, None, b'wrong-generation')])
+def test_standalone_card_rejects_missing_stale_or_wrong_generation_rgb(rig, frame):
+    configure(rig)
+    rig.plugin.dispatch('start', {})
+    rig.nodes.front_camera_frame = lambda: frame
+    rig.subscriptions[0].callback(cloud())
+    assert not rig.plugin._worker.jobs
+    assert rig.plugin.dispatch('info', {})['error_code'] == 'FRONT_RGB_UNAVAILABLE'
+
+
+def test_standalone_card_supplies_front_rgb_without_another_card(rig):
+    configure(rig)
+    rig.plugin.dispatch('start', {})
+    rig.subscriptions[0].callback(cloud())
+    assert rig.plugin._worker.jobs[0]['jpeg'] == b'front-jpeg'
+    assert rig.plugin._worker.jobs[0]['rgb_received_monotonic'] > 0
+    assert not rig.plugin.get_tool().get('topic_in')
 
 
 def test_missing_calibration_is_explicit_and_persists_in_status(rig):
@@ -623,15 +643,15 @@ def test_catalogue_and_runtime_advertise_exactly_one_new_card(monkeypatch, tmp_p
     plugins = device.build_plugins(config)
     cards = [card for p in plugins for card in
              (p.get_tools() if hasattr(p, "get_tools") else [p.get_tool()])]
-    assert sum(c["name"] == "camera_front__depth" for c in cards) == 1
+    assert sum(c["name"] == "camera_front_depth" for c in cards) == 1
     manifest = yaml.safe_load((DRIVER / "driver.yaml").read_text())
-    assert sum(c["name"] == "camera_front__depth" for c in manifest["cards"]) == 1
+    assert sum(c["name"] == "camera_front_depth" for c in manifest["cards"]) == 1
     assert any(isinstance(p, depth.FrontDepthPlugin) for p in plugins)
 
 
 def test_card_wire_contract_geometry_and_time_provenance(rig):
     card = rig.plugin.get_tool()
-    assert card["name"] == "camera_front__depth" and card["type"] == "sensor"
+    assert card["name"] == "camera_front_depth" and card["type"] == "sensor"
     assert [entry["topic"] for entry in card["topic_out"]] == [
         "/robot/camera_front/depth"]
     assert all(entry["format"] == "image/depth-zlib" for entry in card["topic_out"])
@@ -646,9 +666,9 @@ def test_card_wire_contract_geometry_and_time_provenance(rig):
     assert info["D"] == [0.] * 5 and info["distortion_model"] == "pinhole"
     vendor = info["vendor"]
     assert vendor["depth_scale_m"] == .001 and vendor["invalid_depth_value"] == 0
-    assert vendor["depth_quantity"] == "optical_z" and vendor["sparse"] is True
+    assert vendor["depth_quantity"] == "optical_z" and vendor["sparse"] is False
     assert vendor["hole_filling"] is True
-    assert vendor["depth_source"] == "estimated_interpolation"
+    assert vendor["depth_source"] == "lidar_monocular_fusion"
     assert vendor["interpolated_pixels_are_measured"] is False
     assert not vendor.get("raw_depth_topic")
     assert vendor["depth_aligned_to_rgb"] is False
@@ -695,7 +715,7 @@ def test_persist_failure_does_not_apply_new_config(rig, monkeypatch):
 def test_canvas_instance_transport_does_not_become_a_depth_setting(rig):
     from common.vendor_runtime import DriverBundle
     bundle = DriverBundle([rig.plugin])
-    result = bundle.dispatch("camera_front__depth", {
+    result = bundle.dispatch("camera_front_depth", {
         "action": "config", "instance_id": "canvas-depth-1",
         "cloud_topic": "/raw/front", "cloud_frame_id": "front_lidar",
         "camera_optical_from_cloud": json.dumps(IDENTITY),
@@ -703,7 +723,7 @@ def test_canvas_instance_transport_does_not_become_a_depth_setting(rig):
     assert result["state"] == "configured", result
     assert "instance_id" not in result["config"]
     assert "instance_id" not in json.loads(rig.path.read_text())["config"]
-    assert bundle.dispatch("camera_front__depth", {
+    assert bundle.dispatch("camera_front_depth", {
         "action": "start", "instance_id": "canvas-depth-1"})["state"] == "running"
 
 
@@ -806,7 +826,7 @@ def test_repeated_backward_and_stale_source_work_is_not_published(rig, monkeypat
     callback(cloud(sec=9))
     assert len(rig.plugin._worker.jobs) == 1
     assert rig.plugin.dispatch("info", {})["stats"]["dropped"] == 2
-    future = time.monotonic() + 2
+    future = time.monotonic() + 4
     monkeypatch.setattr(module().time, "monotonic", lambda: future)
     rig.plugin._worker.complete()
     assert not rig.publications
@@ -835,8 +855,21 @@ def test_failed_subscription_start_closes_owned_worker(rig, monkeypatch):
     assert "subscription failed" in info["last_error"]
 
 
-def test_real_worker_reports_bad_layout_then_projects_and_closes():
+def _worker_with_constant_monocular_model(jobs, results):
+    # Keep the actual spawned worker, projection and fusion. Only the external
+    # neural model is an oracle; no engine download or GPU belongs in IPC tests.
     depth = module()
+    class ConstantModel:
+        def predict(self, jpeg):
+            assert jpeg == b'front-jpeg'
+            return zlib.compress(struct.pack('<H', 2000) * (640 * 480))
+    depth.MonocularDepth = ConstantModel
+    depth._project_worker(jobs, results)
+
+
+def test_real_worker_reports_bad_layout_then_completes_depth_and_closes(monkeypatch):
+    depth = module()
+    monkeypatch.setattr(depth, '_project_worker', _worker_with_constant_monocular_model)
     received, failures = [], []
     ready, failed = threading.Event(), threading.Event()
 
@@ -849,13 +882,16 @@ def test_real_worker_reports_bad_layout_then_projects_and_closes():
         failed.set()
 
     message = cloud()
-    message.width, message.row_step = 2, 24
-    message.data = struct.pack("<ffffff", 0, 0, 2, .1, 0, 2)
+    points = [((x - 320) * .02, (y - 240) * .02, 2)
+              for y in range(60, 421, 24) for x in range(60, 581, 24)]
+    message.width, message.row_step = len(points), len(points) * 12
+    message.data = b''.join(struct.pack('<fff', *p) for p in points)
     source = {key: getattr(message, key) for key in
               ("width", "height", "point_step", "row_step", "is_bigendian", "data")}
     source["fields"] = [(f.name, f.offset, f.datatype, f.count) for f in message.fields]
     job = {"generation": 1, "camera_generation": 0, "stamp": (10, 123),
            "received_monotonic": time.monotonic(), "cloud": source,
+           "jpeg": b'front-jpeg', "rgb_received_monotonic": time.monotonic(),
            "K": [100, 0, 320, 0, 100, 240, 0, 0, 1], "transform": IDENTITY,
            "min_depth_m": .1, "max_depth_m": 50.}
     worker = depth.DepthWorker(on_result, on_error)
@@ -874,10 +910,13 @@ def test_real_worker_reports_bad_layout_then_projects_and_closes():
         assert struct.unpack_from("<H", raw, (240 * 640 + 320) * 2)[0] == 2000
         assert struct.unpack_from("<H", raw, (240 * 640 + 322) * 2)[0] == 2000
         assert struct.unpack_from("<H", raw, (240 * 640 + 325) * 2)[0] == 2000
-        assert stats["source_points"] == 2
-        assert stats["sample_points"] == 2 and stats["valid_pixels"] == 2
-        assert stats["filled_pixels"] == 4 and stats["fill_conflicts"] == 0
+        assert stats["source_points"] == len(points)
+        assert stats["sample_points"] == stats["valid_pixels"] == len(points)
+        assert stats["filled_pixels"] == 0 and stats["fill_conflicts"] == 0
         assert stats["measured_coverage"] <= stats["filled_coverage"]
+        assert stats['output_coverage'] == 1.0
+        assert stats['monocular_pixels'] == 640 * 480 - len(points)
+        assert set(struct.unpack('<307200H', raw)) == {2000}
     finally:
         worker.close()
     assert not worker.is_alive()
@@ -974,11 +1013,9 @@ def test_worker_close_releases_collector_after_partial_result(monkeypatch):
         _cleanup_faulted_worker(worker)
 
 
-def test_output_config_does_not_add_dependencies_or_drop_encoder_latency_fix():
+def test_output_config_keeps_projection_worker_and_encoder_latency_fix():
     text = (DRIVER / "Dockerfile").read_text()
     assert "front_depth.py" in text and "depth_projection.py" in text
-    requirements = (DRIVER / "requirements.txt").read_text()
-    assert requirements.strip() == "PyYAML==6.0.2"
     from deep_robotics.s10_pro.media_workers import _rtsp_command
     cmd = _rtsp_command("rtsp://camera")
     assert cmd[cmd.index("-threads") + 1] == "1"

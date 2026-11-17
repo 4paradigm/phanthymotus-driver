@@ -167,6 +167,7 @@ class S10Nodes:
             for lane in CAMERA_LANES
         }
         self.media_workers = None
+        self._front_camera_frame = None
         self.camera_undistortion = CameraUndistortion(CAMERA_LANES)
         if config.get("media_workers", False):
             self.media_workers = MediaWorkers(self._handle_media_result)
@@ -590,7 +591,13 @@ class S10Nodes:
             output.format = "jpeg"
             output.data = packet
             self.camera_publishers[lane].publish(output)
+            if lane == 'camera_front' and len(packet) <= 2 * 1024 * 1024:
+                self._front_camera_frame = (self.camera_undistortion.generation(lane),
+                                            time.monotonic(), bytes(packet))
         self._record_stream(lane, "published")
+
+    def front_camera_frame(self):
+        return self._front_camera_frame
 
     @staticmethod
     def _pointcloud_packet(msg):
