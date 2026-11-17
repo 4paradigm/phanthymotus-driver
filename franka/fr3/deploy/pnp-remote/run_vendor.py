@@ -1,4 +1,5 @@
 """Start the PNP arm scripts under the existing systemd service."""
+import json
 import os
 from pathlib import Path
 import re
@@ -46,6 +47,10 @@ def run_vendor(arm):
     env["PATH"] = os.pathsep.join((str(runtime / "vendor-bin"),
                                   str(Path(os.environ.get("PNP_CONDA_BASE", str(Path.home() / "miniconda3"))) / "bin"), env["PATH"]))
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONPATH"] = str(runtime) + os.pathsep + env.get("PYTHONPATH", "")
+    gate = runtime / f"follow-gate-{arm.side}"
+    gate.unlink(missing_ok=True)
+    env["FR3_FOLLOW_GATE"] = str(gate)
     env["FR3_ROBOT_IP"] = arm.robot_ip
     env["BASH_ENV"] = str(runtime / "vendor-follow-env.sh")
     for name in SCRIPTS:
@@ -124,7 +129,14 @@ def run_vendor(arm):
             lines = re.split(rb"[\r\n]", buffer + chunk)
             buffer = lines.pop()
             for line in lines:
-                if b"Time passed:" in line:
+                if line.startswith(b"PNP_PHASE="):
+                    phase = json.loads(line.split(b"=", 1)[1])
+                    stage = phase.pop("stage")
+                    if stage not in ("vendor_aligning", "vendor_aligned"):
+                        raise RuntimeError("Unexpected vendor alignment phase")
+                    report(stage, **phase)
+                    last_progress = now
+                elif b"Time passed:" in line:
                     # A second iteration implies the previous synchronous env.step returned.
                     if first_progress and (last_progress is None or now - last_progress >= .25):
                         report("vendor_following", script=SCRIPTS[3])
@@ -133,4 +145,5 @@ def run_vendor(arm):
                 elif line:
                     print(f"[{arm.side}] {line.decode(errors='replace')}", flush=True)
     finally:
+        gate.unlink(missing_ok=True)
         stop_vendor(children)

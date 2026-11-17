@@ -24,6 +24,13 @@ def prepare(source):
         if source.count(old) != 1:
             raise ValueError(f"Vendor run_env source has changed at {old!r}")
         source = source.replace(old, new)
+    boundary = "    save_path = None\n    start_time = time.time()"
+    if source.count(boundary) != 1:
+        raise ValueError("Vendor follow loop boundary has changed")
+    source = source.replace(boundary,
+        "    from vendor_alignment import wait_for_follow\n"
+        "    wait_for_follow(env, agent)\n"
+        "    obs = env.get_obs()\n" + boundary)
     compile(source, "right_run_env.py", "exec")
     return source
 

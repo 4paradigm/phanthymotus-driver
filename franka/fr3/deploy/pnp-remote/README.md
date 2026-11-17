@@ -1,8 +1,8 @@
 # PNP FR3 teleoperation
 
-The Orin card offers `initialize`, `follow`, `pause`, and `status`. The PNP service starts
+The Orin card offers `align`, `follow`, `pause`, and `status`. The PNP service starts
 the four installed vendor launchers for each selected side in order. The vendor initializer
-moves the arm to its configured pose and initializes the Hand during `follow`.
+moves the arm to its configured pose and initializes the Hand during `align`.
 
 On the PNP workstation, keep the vendor tree at `~/frankateleop` and its
 `polymetis` Conda environment. Run `sh install-pnp.sh` from this directory as
@@ -70,12 +70,12 @@ the destination. FCI runs locally between PNP and the Franka controllers.
 ## Initialize from the canvas
 
 Fill in the workstation IP, SSH username, initial SSH password. The installer discovers the vendor tree
-and Polymetis Conda base on the remote host. With automatic initialization enabled, loading the
-card starts an asynchronous install. `status` returns `initialization.state`
+and Polymetis Conda base on the remote host. Loading the card always starts an asynchronous install. `status` returns `initialization.state`
 and the current stage. It checks the package version, installs the image's
 support sources, configures the service and limited sudo rule, authorizes a
 restricted service key, and verifies key login. Installation never starts the
-robot service. Execute `follow` after initialization reports `ready`.
+robot service. Execute `align` after initialization reports `ready`, then wait for `aligned`
+and its ACP completion before executing `follow`.
 
 The driver keeps the private service key and known host keys in the writable
 `/var/lib/fr3-pnp` volume. Keep this volume across image replacements.
@@ -122,3 +122,19 @@ USB serial numbers are read from these paths at runtime. No machine-specific
 master serial number is embedded in the driver. The manufacturer must provide
 a consistent launcher and calibration entry for each master. Unmapped USB
 devices are reported without assigning a left/right role by enumeration order.
+
+
+## Alignment and explicit follow
+
+The vendor startup scripts run on align. The prepared run_env copy pauses before
+the continuous follow loop. It uses the same vendor env.step and impedance
+backend to converge to a frozen master target and confirm <=0.05 rad joint
+error with <=0.02 rad/s measured velocity over ten samples. The impedance
+target is held after alignment while the service stays running. The driver
+posts ACP completed for the align action only after all selected arms report
+fresh aligned status. The ACP result and any delivery failure appear in status.
+
+Follow releases that waiting session without restarting the vendor scripts.
+The current master/follower difference must remain within 0.05 rad at release.
+Moving a master before follow can require pausing and aligning again.
+Pause stops the complete service using the configured shutdown order.

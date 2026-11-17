@@ -38,7 +38,7 @@ class InitializationTests(TestCase):
         p=PnpRemoteTeleopPlugin()
         p.dispatch('config',{'ssh_password':'test-secret', 'pnp_host':'172.16.0.200'})
         with patch.object(pnp_initialize,'initialize', side_effect=RuntimeError('test-secret failed')):
-            p.dispatch('initialize',{})
+            p.dispatch('start',{})
             p._init_thread.join(3)
         self.assertNotIn('test-secret',json.dumps(p._init))
         self.assertEqual(p._init['state'],'error')
@@ -114,6 +114,33 @@ class VendorMasterTests(TestCase):
         result = self.read(self.home, self.usb)
         self.assertEqual(result["arms"], {})
         self.assertIn("configuration", result["errors"])
+
+
+class AlignmentCompletionTests(TestCase):
+    def test_options_and_automatic_initialization(self):
+        plugin = PnpRemoteTeleopPlugin()
+        definition = plugin.get_tools()[0]
+        self.assertEqual(definition["inputSchema"]["properties"]["action"]["enum"],
+                         ["align", "follow", "pause", "status"])
+        self.assertNotIn("auto_initialize", definition["configSchema"]["properties"])
+        self.assertEqual(definition["inputSchema"]["x-completion"]["actions"], ["align"])
+
+    def test_completed_alignment_posts_acp(self):
+        completed = []
+        plugin = PnpRemoteTeleopPlugin(acp_callback=lambda *args: completed.append(args))
+        plugin._acp = {"action_id": "align-test", "state": "waiting_for_motion"}
+        with patch.object(plugin, "_status", return_value={"state": "aligned", "hosts": {}}):
+            plugin._watch_alignment("align-test", threading.Event())
+        self.assertEqual(completed[0][:2], ("align-test", "completed"))
+        self.assertEqual(plugin._acp["state"], "accepted")
+
+    def test_follow_requires_confirmed_alignment(self):
+        plugin = PnpRemoteTeleopPlugin()
+        plugin._loaded = True
+        with patch.object(plugin, "_status", return_value={"state": "starting_follow"}), patch.object(plugin, "_ssh") as ssh:
+            result = plugin.dispatch("follow", {})
+        self.assertEqual(result["state"], "error")
+        ssh.assert_not_called()
 
 if __name__=='__main__':
     main()

@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import subprocess
 import threading
+import time
+import uuid
 
 from common.vendor_runtime import action_schema, tool
 
@@ -14,14 +16,18 @@ from common.vendor_runtime import action_schema, tool
 class PnpRemoteTeleopPlugin:
     PREFIX = "teleop"
 
-    def __init__(self):
+    def __init__(self, acp_callback=None):
         self._lock = threading.RLock()
         self._loaded = False
         self._init = {"state": "not_initialized"}
         self._init_thread = None
         self._password = ""
+        self._acp_callback = acp_callback or self._post_completion
+        self._acp = None
+        self._align_cancel = threading.Event()
+        self._align_thread = None
         self._settings = {"pnp_host": "", "ssh_user": "pnp", "right_slave_ip": "172.16.0.2",
-                          "left_slave_ip": "172.16.0.3", "read_vendor_slave_ips": True, "auto_initialize": True}
+                          "left_slave_ip": "172.16.0.3", "read_vendor_slave_ips": True}
         self._unit = "pnp-fr3-right-teleop.service"
         self._hosts = {"right": os.environ.get("FRANKA_PNP_SSH_HOST", "pnp@172.16.0.200")}
         left = os.environ.get("FRANKA_PNP_LEFT_SSH_HOST", "").strip()
@@ -32,12 +38,13 @@ class PnpRemoteTeleopPlugin:
 
     def get_tools(self):
         schema = action_schema({
-            "initialize": ([], "Install or update the PNP support package without starting motion."),
-            "follow": ([], "Start vendor teleoperation for connected masters. Startup moves slave arms and initializes grippers."),
+            "align": ([], "Run vendor startup, align slave arms, and complete ACP while holding the aligned pose."),
+            "follow": ([], "Enable continuous vendor following after alignment has completed."),
             "pause": ([], "Stop PNP teleoperation in reverse vendor startup order and verify shutdown."),
             "status": ([], "Read PNP service states and vendor execution stages."),
         }, {})
         schema.update({
+            "x-completion": {"actions": ["align"], "timeout": 150},
             "x-resource": "arm",
             "x-is-dangerous": True,
             "x-hooks": {
@@ -62,7 +69,7 @@ class PnpRemoteTeleopPlugin:
                 "ssh_password": {"type": "string", "title": "SSH initialization password",
                                  "format": "password", "x-sensitive": True, "writeOnly": True,
                                  "description": "Used for installation or updates; removed from driver memory after initialization."},
-                "auto_initialize": {"type": "boolean", "title": "Initialize automatically on load", "default": True},
+
             },
         }
         return [definition]
@@ -89,10 +96,9 @@ class PnpRemoteTeleopPlugin:
             raise ValueError("Invalid SSH user")
         if type(settings["read_vendor_slave_ips"]) is not bool:
             raise ValueError("read_vendor_slave_ips must be boolean")
-        if type(settings["auto_initialize"]) is not bool:
-            raise ValueError("auto_initialize must be boolean")
         changed = settings != self._settings or "ssh_password" in args
-        if changed and (self._loaded or self._init.get("state") == "initializing"):
+        if changed and (self._loaded or self._init.get("state") == "initializing" or
+                        (self._align_thread and self._align_thread.is_alive())):
             raise RuntimeError("先停止卡片，再修改初始化配置")
         self._settings = settings
         if settings["pnp_host"]:
@@ -178,11 +184,14 @@ class PnpRemoteTeleopPlugin:
                 state = "fault"
             else:
                 arms = list(execution.get("arms", {}).values())
+                aligned = [arm for arm in arms if arm.get("stage") == "vendor_aligned"]
                 following = [arm for arm in arms if arm.get("stage") == "vendor_following"]
                 if any(arm.get("stage") == "failed" for arm in arms):
                     state = "fault"
                 elif any(not arm.get("heartbeat_fresh") for arm in following):
                     state = "follow_interrupted"
+                elif aligned and len(aligned) == len(arms) and all(arm.get("heartbeat_fresh") for arm in aligned):
+                    state = "aligned"
                 elif following and len(following) == len(arms):
                     state = "following"
         if "left" in self._hosts:
@@ -215,12 +224,12 @@ class PnpRemoteTeleopPlugin:
         state = "loaded" if self._loaded else "idle"
         if active:
             for candidate in ("unreachable", "fault", "follow_interrupted", "stopping",
-                              "starting", "starting_follow", "following", "unknown"):
+                              "starting", "starting_follow", "following", "aligned", "unknown"):
                 if candidate in active:
                     state = candidate
                     break
         right = hosts.get("right", {})
-        return {"state": state, "initialization": dict(self._init),
+        return {"state": state, "acp": self._acp, "initialization": dict(self._init),
                 "slave_ips": {side: self._settings[f"{side}_slave_ip"] for side in ("right", "left")},
                 "hosts": hosts,
                 "masters": {arm: data for entry in hosts.values()
@@ -235,6 +244,52 @@ class PnpRemoteTeleopPlugin:
                 any(service.get(key) != "0" for key in ("MainPID", "ControlPID"))):
             raise RuntimeError("PNP 遥操服务停止未确认")
 
+    def _post_completion(self, action_id, status, result):
+        from franka.fr3.device import JointControlPlugin
+        return JointControlPlugin._post_completion(self, action_id, status, result)
+
+    def _watch_alignment(self, action_id, cancelled):
+        terminal = "error"
+        result = {"error": "Alignment timed out"}
+        deadline = time.monotonic() + 140
+        while time.monotonic() < deadline:
+            if cancelled.is_set():
+                terminal, result = "cancelled", {"state": "paused"}
+                break
+            try:
+                status = self._status()
+            except Exception as exc:
+                result = {"error": str(exc)}
+                break
+            if status["state"] == "aligned":
+                terminal, result = "completed", status
+                break
+            if status["state"] in ("fault", "unreachable", "follow_interrupted"):
+                result = status
+                break
+            cancelled.wait(.4)
+        if terminal != "completed":
+            _, stop_errors = self._batch(self._hosts, self._stop_host)
+            result = {**result, "stop_errors": stop_errors}
+            if stop_errors:
+                terminal = "error"
+        with self._lock:
+            if self._acp and self._acp["action_id"] == action_id:
+                self._acp = {"action_id": action_id, "state": "pending", "status": terminal}
+        error = None
+        for attempt in range(3):
+            try:
+                self._acp_callback(action_id, terminal, result)
+                error = None
+                break
+            except Exception as exc:
+                error = str(exc)[:240]
+                time.sleep(.25 * (attempt + 1))
+        with self._lock:
+            if self._acp and self._acp["action_id"] == action_id:
+                self._acp = {"action_id": action_id, "state": "failed" if error else "accepted",
+                             "status": terminal, "error": error}
+
     def dispatch(self, action, args):
         with self._lock:
             try:
@@ -243,20 +298,30 @@ class PnpRemoteTeleopPlugin:
                     return {"state": "configured", "initialization": dict(self._init)}
                 if action in ("info", "status"):
                     return self._status()
-                if action == "initialize":
-                    self._configure(args)
-                    self._initialize()
-                    return self._status()
                 if action == "start":
                     self._configure(args)
                     self._loaded = True
-                    if self._settings["auto_initialize"]:
-                        self._initialize()
+                    self._initialize()
                     return self._status()
                 if action == "follow":
                     if not self._loaded:
-                        raise RuntimeError("先启动画布项目，再执行 follow")
-                    if self._init.get("state") not in ("ready", "not_initialized"):
+                        raise RuntimeError("Start the canvas project first")
+                    status = self._status()
+                    if status["state"] == "following":
+                        return status
+                    if status["state"] != "aligned":
+                        raise RuntimeError("Execute align and wait for ACP completion before follow")
+                    _, errors = self._batch(self._hosts, lambda side: self._ssh(side, "pnp-enable-follow")
+                                            if status["hosts"][side]["state"] == "aligned" else None)
+                    if errors:
+                        return {"state": "error", "errors": errors}
+                    return self._status()
+                if action == "align":
+                    if self._align_thread and self._align_thread.is_alive():
+                        return {"state": "running", "action_id": self._acp["action_id"]}
+                    if not self._loaded:
+                        raise RuntimeError("Start the canvas project before alignment")
+                    if self._init.get("state") != "ready":
                         return {"state": self._init["state"], "initialization": dict(self._init)}
                     status = self._status()
                     hosts = status["hosts"]
@@ -274,18 +339,23 @@ class PnpRemoteTeleopPlugin:
                     active = {side for side, entry in hosts.items()
                               if entry["remote_service"].get("ActiveState") not in ("inactive", "failed")}
                     if active:
-                        if active == set(selected):
-                            return status
-                        raise RuntimeError("请先暂停当前会话，再启动新的主臂组合")
-                    commands = {side: "pnp-follow-both" if len(arms) == 2 else f"pnp-follow-{arms[0]}"
+                        raise RuntimeError("Pause the existing session before starting a new alignment")
+                    commands = {side: "pnp-align-both" if len(arms) == 2 else f"pnp-align-{arms[0]}"
                                 for side, arms in selected.items()}
                     _, errors = self._batch(selected, lambda side: self._ssh(side, commands[side]))
                     if errors:
                         _, rollback = self._batch(selected, self._stop_host)
                         return {"state": "error", "message": "PNP 遥操启动未确认",
                                 "errors": errors, "stop_errors": rollback}
-                    return self._status()
+                    action_id = "fr3_align_" + uuid.uuid4().hex
+                    self._align_cancel = threading.Event()
+                    self._acp = {"action_id": action_id, "state": "waiting_for_motion"}
+                    self._align_thread = threading.Thread(target=self._watch_alignment,
+                                                          args=(action_id, self._align_cancel), daemon=True)
+                    self._align_thread.start()
+                    return {"state": "running", "action_id": action_id}
                 if action in ("pause", "stop"):
+                    self._align_cancel.set()
                     if self._init.get("state") == "initializing":
                         if action == "stop":
                             self._loaded = False

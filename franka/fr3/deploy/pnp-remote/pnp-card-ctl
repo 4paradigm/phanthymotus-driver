@@ -17,18 +17,21 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
     if test -f "$runtime/execution.json"; then
       python3 "$runtime/execution_status.py"
     fi ;;
-  'pnp-follow-right'|'pnp-follow-left'|'pnp-follow-both')
+  'pnp-align-right'|'pnp-align-left'|'pnp-align-both')
     state=$(/usr/bin/systemctl show "$unit" -p ActiveState --value)
     if test "$state" != inactive && test "$state" != failed; then
       echo 'Stop the PNP service before starting the vendor sequence' >&2
       exit 1
     fi
     rm -f "$runtime/execution.json" "$runtime/execution-left.json" "$runtime/execution-right.json"
-    printf '%s\n' "${SSH_ORIGINAL_COMMAND#pnp-follow-}" > "$runtime/requested-arm"
+    printf '%s\n' "${SSH_ORIGINAL_COMMAND#pnp-align-}" > "$runtime/requested-arm"
     if ! sudo -n /usr/bin/systemctl start "$unit"; then
       rm -f "$runtime/requested-arm"
       exit 1
     fi ;;
+  'pnp-enable-follow')
+    test "$(/usr/bin/systemctl show "$unit" -p ActiveState --value)" = active
+    python3 "$runtime/release_follow.py" ;;
   'systemctl --user stop pnp-fr3-right-teleop.service')
     sudo -n /usr/bin/systemctl stop "$unit"
     rm -f "$runtime/execution.json" "$runtime/execution-left.json" "$runtime/execution-right.json" ;;
