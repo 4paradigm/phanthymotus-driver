@@ -94,11 +94,11 @@ plugins:
     fps: 15
     max_duration_s: 30
   # 视觉跌倒检测（YOLOv11-pose 官方权重 + 姿态几何判定，无需训练）。
-  # **默认关闭。** 它消费 camera 卡片的 RGB 流，真机跑 YOLO（CPU 较慢，先核对帧率
-  # 并确认权重已预下载）；检测到跌倒后经 fall_alarm/alarm 发布提醒语音（画布连到
-  # speaker）并在 fall_alarm/event 发布事件（画布连到监控/Agent）。
+  # 它消费 camera 卡片的 RGB 流，真机跑 YOLO（CPU 较慢，先核对帧率并确认权重已
+  # 预下载）；检测到跌倒后经 fall_alarm/alarm 发布提醒语音（画布连到 speaker）并在
+  # fall_alarm/event 发布事件（画布连到监控/Agent）。
   fall_alarm:
-    enabled: false
+    enabled: true
     # YOLOv11-pose 权重。n=nano 最快；首次运行自动从 ultralytics 下载，离线机器人
     # 请预先下载后填绝对路径。
     model_path: yolo11n-pose.pt
