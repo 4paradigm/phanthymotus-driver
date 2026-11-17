@@ -9,15 +9,6 @@ import struct
 import subprocess
 import time
 
-SERIALS = ("FTBMDRZS", "FTB57FAR")
-PROBE = """
-import json, os
-from pathlib import Path
-serials = ("FTBMDRZS", "FTB57FAR")
-devices = [Path("/dev/serial/by-id") / ("usb-FTDI_USB__-__Serial_Converter_" + s + "-if00-port0") for s in serials]
-vendor_ready = any(Path.home().glob("*/teleop/experiments/run_env.py")) or Path("/opt/frankateleop/teleop/experiments/run_env.py").is_file()
-print("PNP_PROBE=" + json.dumps({"vendor_ready": vendor_ready, "masters": [p.is_char_device() and os.access(p, os.R_OK | os.W_OK) for p in devices]}))
-"""
 
 
 def wired_interfaces():
@@ -97,7 +88,8 @@ def discover(slave_ips, user, password, progress):
             result = authenticated_command(host, "", "pnp-discover", timeout=10)
             if result.returncode and password:
                 import shlex
-                result = authenticated_command(host, password, "python3 -c " + shlex.quote(PROBE), timeout=12)
+                probe = Path("/deploy/pnp-remote/read_vendor_masters.py").read_text()
+                result = authenticated_command(host, password, "python3 -c " + shlex.quote(probe), timeout=12)
         except subprocess.TimeoutExpired:
             continue
         if result.returncode:
@@ -105,7 +97,9 @@ def discover(slave_ips, user, password, progress):
         for line in result.stdout.splitlines():
             if line.startswith("PNP_PROBE="):
                 data = json.loads(line.split("=", 1)[1])
-                if data.get("masters") == [True, True] and data.get("vendor_ready") is True:
+                arms = data.get("arms", {})
+                if (data.get("vendor_ready") is True and
+                        all(arms.get(side, {}).get("ready") for side in ("right", "left"))):
                     matches.append(peer)
     if len(matches) != 1:
         raise RuntimeError(f"Expected one wired PNP with both accessible master USB devices; found {matches}. Check credentials or set the PNP IP manually.")

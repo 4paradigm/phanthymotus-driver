@@ -22,6 +22,10 @@ with tempfile.TemporaryDirectory(prefix="fr3-card-install-") as directory:
     sys.path.insert(0, str(stage))
     from detect_paths import discover_paths
     vendor, conda = discover_paths()
+    from read_vendor_masters import read_vendor_masters
+    masters = read_vendor_masters()
+    if not masters["arms"]:
+        raise RuntimeError("Cannot resolve master roles: " + json.dumps(masters["errors"]))
     env = dict(os.environ, PNP_VENDOR_ROOT=str(vendor), PNP_CONDA_BASE=str(conda),
                PNP_INSTALL_STDIN_PASSWORD="1")
     auth = subprocess.run(["sudo", "-S", "-p", "", "-v"], input=password + "\n",

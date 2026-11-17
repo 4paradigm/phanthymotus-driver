@@ -48,8 +48,8 @@ def launch():
         request.unlink(missing_ok=True)
     if side != "both" and side not in ARMS:
         raise RuntimeError("Invalid PNP arm selection")
-    sides = tuple(ARMS) if side == "both" else (side,)
-    selected = [ARMS[name] for name in sides]
+    sides = ("right", "left") if side == "both" else (side,)
+    selected = [ARMS[name] for name in sides if name in ARMS]
     unavailable = [name for name in sides if not detected[name]["ready"]]
     for side in ARMS:
         (RUNTIME / f"execution-{side}.json").unlink(missing_ok=True)

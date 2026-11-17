@@ -70,5 +70,50 @@ class VendorIPTests(TestCase):
             self.assertEqual(result["ips"], {"right": "172.16.0.22"})
             self.assertIn("left", result["errors"])
 
+
+class VendorMasterTests(TestCase):
+    def setUp(self):
+        path = Path(__file__).resolve().parents[1] / "franka/fr3/deploy/pnp-remote/read_vendor_masters.py"
+        self.read = runpy.run_path(str(path))["read_vendor_masters"]
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.home = Path(self.directory.name)
+        self.root = self.home / "frankateleop"
+        self.usb = self.home / "usb"
+        self.usb.mkdir()
+        marker = self.root / "teleop/experiments/run_env.py"
+        marker.parent.mkdir(parents=True)
+        marker.touch()
+        self.agent = self.root / "teleop/teleop/agents/teleop_agent.py"
+        self.agent.parent.mkdir(parents=True)
+        self.ports = {}
+        for side, serial in (("right", "NEW_RIGHT_123"), ("left", "NEW_LEFT_456")):
+            name = f"usb-FTDI_USB__-__Serial_Converter_{serial}-if00-port0"
+            self.ports[side] = "/dev/serial/by-id/" + name
+            (self.usb / name).symlink_to("/dev/null")
+            script = self.root / f"{side}_franka/4_run_env.sh"
+            script.parent.mkdir(parents=True)
+            script.write_text("python3 run_env.py " + chr(92) + "\n --teleop_port=" + self.ports[side] + "\n")
+        self.agent.write_text("PORT_CONFIG_MAP = " + repr({p: None for p in self.ports.values()}))
+
+    def test_new_serials_keep_vendor_left_right_roles(self):
+        result = self.read(self.home, self.usb)
+        self.assertEqual(result["arms"]["right"]["serial"], "NEW_RIGHT_123")
+        self.assertEqual(result["arms"]["left"]["serial"], "NEW_LEFT_456")
+        self.assertTrue(all(arm["ready"] for arm in result["arms"].values()))
+
+    def test_unmapped_serial_is_not_assigned_by_order(self):
+        self.agent.write_text("PORT_CONFIG_MAP = " + repr({self.ports["right"]: None}))
+        result = self.read(self.home, self.usb)
+        self.assertNotIn("left", result["arms"])
+        self.assertIn("left", result["errors"])
+        self.assertEqual(len(result["unmatched_usb_devices"]), 1)
+
+    def test_duplicate_master_is_rejected(self):
+        (self.root / "left_franka/4_run_env.sh").write_text("python3 run_env.py --teleop_port=" + self.ports["right"])
+        result = self.read(self.home, self.usb)
+        self.assertEqual(result["arms"], {})
+        self.assertIn("configuration", result["errors"])
+
 if __name__=='__main__':
     main()

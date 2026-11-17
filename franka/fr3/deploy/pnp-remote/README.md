@@ -31,8 +31,8 @@ The card keeps per-host and per-arm status, and stops all configured services
 on pause. If an SSH start request fails, it attempts to
 stop each selected service and reports any stop that could not be confirmed.
 
-Right uses FTBMDRZS, FR3 172.16.0.2 and ports 50051, 50053, 6001. Left uses
-FTB57FAR, FR3 172.16.0.3 and ports 50052, 50054, 6002. Use the workstation SSH
+Right and left master identities come from the installed vendor side launchers.
+Right ports are 50051, 50053, 6001; left ports are 50052, 50054, 6002. Use the workstation SSH
 address for the host variables. The service unit retains its original identifier
 on both machines for compatibility with the restricted SSH command.
 
@@ -111,3 +111,14 @@ these as editable defaults. Missing or ambiguous assignments retain the current
 values and produce a warning. Disable "Read slave IPs from PNP" to apply manual
 IP edits. Updating schema defaults does not force an open canvas form to discard
 its saved values; consult the resolved slave_ips in the initialization result.
+
+
+## Master USB identities
+
+The driver enumerates /dev/serial/by-id and reads each side's teleop port from
+the manufacturer's 4_run_env.sh launcher. It checks that the port has an entry
+in the manufacturer's PORT_CONFIG_MAP before exposing it as a ready master.
+USB serial numbers are read from these paths at runtime. No machine-specific
+master serial number is embedded in the driver. The manufacturer must provide
+a consistent launcher and calibration entry for each master. Unmapped USB
+devices are reported without assigning a left/right role by enumeration order.
