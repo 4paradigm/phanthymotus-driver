@@ -417,8 +417,8 @@ def test_stream_holds_last_frame_only_during_short_bus_contention(monkeypatch, m
     partial = {name: budget for name in FINGERS[1:]}
     partial["index"] = busy
     all_timed_out = {name: budget for name in FINGERS}
-    hand = FakeHand([{}, partial, all_busy, all_timed_out, ValueError("右手未连接"),
-                     all_busy, all_busy, {"thumb": ([10] * 96, 101.6)}])
+    hand = FakeHand([{}, partial, all_timed_out, all_timed_out, ValueError("右手未连接"),
+                     all_busy, all_busy, {"thumb": ([10] * 96, 102.1)}])
     plugin = lite_tactile.LiteTactilePlugin(hand, {"matrix_enabled": matrix_enabled})
     first = plugin._read_tactile_snapshot("right")
     saved = first, now
@@ -436,19 +436,22 @@ def test_stream_holds_last_frame_only_during_short_bus_contention(monkeypatch, m
     assert not held["matrix_fresh"] and held["sequence"] == first["sequence"] + 1
     assert "RS485" in held["errors"]["scalar"]
 
-    held_again = plugin._read_tactile_snapshot("right", last_frame=saved)
+    now = 101.7
+    held_again = plugin._read_tactile_snapshot("right", last_frame=saved, continuing_contention=True)
     assert held_again["stale"] and held_again["timestamp"] == first["timestamp"]
+    assert held_again["scalar_age_s"]["thumb"] == pytest.approx(1.7)
 
-    for _ in range(2):
-        unavailable = plugin._read_tactile_snapshot("right", last_frame=saved)
-        assert unavailable["state"] == "error" and not unavailable["scalar_valid"]
+    unavailable = plugin._read_tactile_snapshot("right", last_frame=saved)
+    assert unavailable["state"] == "error" and not unavailable["scalar_valid"]
+    disconnected = plugin._read_tactile_snapshot("right", last_frame=saved, continuing_contention=True)
+    assert disconnected["state"] == "error" and not disconnected["scalar_valid"]
 
     # Direct reads never replay the stream frame.
     direct = plugin._read_tactile_snapshot("right")
     assert direct["state"] == "error" and not direct["scalar_valid"]
 
-    now = 101.6
-    expired = plugin._read_tactile_snapshot("right", last_frame=saved)
+    now = 102.1
+    expired = plugin._read_tactile_snapshot("right", last_frame=saved, continuing_contention=True)
     assert expired["state"] == "error" and not expired["scalar_valid"]
     recovered = plugin._read_tactile_snapshot("right", last_frame=saved)
     assert recovered["state"] == "ok" and not recovered.get("stale")

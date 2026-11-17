@@ -30,7 +30,7 @@ logger = logging.getLogger("linkerhand.l20_lite.tactile")
 FINGER_NAMES = list(FINGER_IDS)
 MATRIX_ROWS, MATRIX_COLS = 12, 6
 MATRIX_CELLS = MATRIX_ROWS * MATRIX_COLS
-BUS_HOLD_MAX_AGE_S = 1.5
+BUS_HOLD_MAX_AGE_S = 2.0
 STREAM_ROUND_MAX_S = 0.3
 BUS_BUSY = "RS485 总线正被运动卡片占用"
 ROUND_TIMEOUT = "L20 Lite 触觉采集超时"
@@ -263,7 +263,7 @@ class LiteTactilePlugin:
 
     def _read_tactile_snapshot(
         self, side: str, *, cancel=None, last_frame: tuple[dict, float] | None = None,
-        budget_s: float | None = None,
+        budget_s: float | None = None, continuing_contention: bool = False,
     ) -> dict[str, Any]:
         # Only the stream can reuse a frame. Direct queries always read RS485.
         with self._sample_lock:
@@ -316,8 +316,10 @@ class LiteTactilePlugin:
                 if failed:
                     errors["scalar"] = "本轮五指压力不完整：" + "；".join(
                         f"{name}: {error}" for name, error in failed.items())
-                    # A round deadline alone can also mean a missing Modbus reply.
-                    bus_busy = failed.keys() == retryable_failures and BUS_BUSY in failed.values()
+                    # A deadline alone can only extend an already confirmed hold.
+                    bus_busy = failed.keys() == retryable_failures and (
+                        BUS_BUSY in failed.values() or continuing_contention
+                    )
                 if cells:
                     scalar_time = time.time()
                     scalar_valid = True
@@ -490,6 +492,7 @@ class LiteTactilePlugin:
         consecutive_errors = 0
         last_frame = None
         serial_port = None
+        continuing_contention = False
 
         while not self._stop_event.is_set():
             loop_start = time.monotonic()
@@ -498,13 +501,15 @@ class LiteTactilePlugin:
                 budget = min(self.tactile_timeout_s, STREAM_ROUND_MAX_S) if serial_port else self.tactile_timeout_s
                 data = self._read_tactile_snapshot(
                     side, cancel=self._stop_event, last_frame=last_frame, budget_s=budget,
+                    continuing_contention=continuing_contention,
                 )
                 serial_port = data["serial_port"]
+                continuing_contention = data.get("stale", False)
                 if data["state"] == "ok" and (
                     not self.matrix_enabled or all(rows is not None for rows in data["touch_matrix"].values())
                 ):
                     last_frame = data, time.monotonic()
-                elif not data.get("stale"):
+                elif not continuing_contention:
                     last_frame = None
                 with self._lock:
                     self._latest_data = data
