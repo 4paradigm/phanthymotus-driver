@@ -6,8 +6,8 @@ plugins:
     enabled: true
   loco:
     enabled: true
-  # Register the card by default; switching still awaits on-site acceptance.
-  # Requires loco for shared chassis arbitration. Startup sends no switch.
+  # Shared walking_mode action in loco and loco_relative_move, enabled by default.
+  # Requires loco for chassis arbitration. Startup only prepares the backend.
   walking_mode:
     enabled: true
     # Empty: passively discover perception_ip from this SDK motion board.

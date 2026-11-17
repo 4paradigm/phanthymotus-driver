@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -101,7 +102,7 @@ def card(monkeypatch):
     return result
 
 
-def test_schema_replaces_action_with_the_requested_mode_dropdown(card):
+def test_legacy_schema_keeps_the_requested_mode_dropdown(card):
     tool = card.get_tool()
     assert tool["type"] == "actuator"
     assert tool["multiInstance"] is False
@@ -261,3 +262,164 @@ def test_sdk_mode_alone_cannot_confirm_success(card, monkeypatch):
     assert result["command_sent"] is True
     assert result["mode_verified"] is False
     assert card.test_client.commands == ["whole_body"]
+
+
+@pytest.mark.parametrize("tool_name", ["loco", "loco_relative_move"])
+@pytest.mark.parametrize("model", ["lower_body", "whole_body"])
+def test_async_switch_reports_completion_to_the_calling_card(card, tool_name, model):
+    card._high_ctrl.mode = 3 if model == "lower_body" else 2
+    callbacks = []
+    result = card.dispatch("walking_mode", {"walking_model": model},
+                           tool_name=tool_name, notify=lambda *args: callbacks.append(args))
+    assert result["state"] == "running"
+    card._worker.join(timeout=2)
+    assert not card._worker.is_alive()
+    assert len(callbacks) == 1
+    action_id, status, completed, calling_tool = callbacks[0]
+    assert (action_id, status, calling_tool) == (result["action_id"], "completed", tool_name)
+    assert completed["action"] == "walking_mode"
+    assert completed["walking_model"] == model
+    assert completed["mode_verified"] is True
+    assert card._loco.reserved is False
+
+
+def test_async_acceptance_reserves_chassis_and_refuses_a_second_switch(card, monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    callbacks = []
+    original = card._switch
+
+    def delayed_switch(model):
+        entered.set()
+        assert release.wait(timeout=2)
+        return original(model)
+
+    monkeypatch.setattr(card, "_switch", delayed_switch)
+    accepted = card.dispatch("walking_mode", {"walking_model": "whole_body"},
+                             tool_name="loco", notify=lambda *args: callbacks.append(args))
+    try:
+        assert accepted["state"] == "running"
+        assert card._loco.reserved is True
+        assert entered.wait(timeout=2)
+        refused = card.dispatch("walking_mode", {"walking_model": "lower_body"},
+                                tool_name="loco_relative_move", notify=callbacks.append)
+        assert refused["code"] == "busy"
+        assert "action_id" not in refused
+    finally:
+        release.set()
+        card._worker.join(timeout=2)
+    assert len(callbacks) == 1
+    assert card.test_client.commands == ["whole_body"]
+    assert card._loco.reserved is False
+
+
+def test_async_error_releases_reservation_and_allows_a_later_switch(card):
+    callbacks = []
+    card.test_client.send_error = True
+    result = card.dispatch("walking_mode", {"walking_model": "whole_body"},
+                           tool_name="loco", notify=lambda *args: callbacks.append(args))
+    card._worker.join(timeout=2)
+    assert callbacks[0][0:2] == (result["action_id"], "error")
+    assert callbacks[0][2]["command_may_have_been_sent"] is True
+    assert card._loco.reserved is False
+    card.test_client.send_error = False
+    assert card.dispatch("walking_mode", {"walking_model": "whole_body"})["state"] == "completed"
+
+
+def test_cancel_during_preflight_survives_start_and_does_not_send(card, monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    callbacks = []
+    original = card._high_ctrl.get_joint_state
+
+    def delayed_joint_state():
+        entered.set()
+        assert release.wait(timeout=2)
+        return original()
+
+    monkeypatch.setattr(card._high_ctrl, "get_joint_state", delayed_joint_state)
+    result = card.dispatch("walking_mode", {"walking_model": "whole_body"},
+                           tool_name="loco_relative_move", notify=lambda *args: callbacks.append(args))
+    try:
+        assert entered.wait(timeout=2)
+        card.cancel_switch()
+        card.start()
+    finally:
+        release.set()
+        card._worker.join(timeout=2)
+    assert callbacks[0][0:2] == (result["action_id"], "cancelled")
+    assert callbacks[0][2]["command_sent"] is False
+    assert card.test_client.commands == []
+    assert card._loco.reserved is False
+    assert card.dispatch("walking_mode", {"walking_model": "whole_body"})["state"] == "completed"
+
+
+def test_stop_joins_worker_and_reports_cancellation_after_send(card, monkeypatch):
+    sent = threading.Event()
+    original = card.test_client.get_status
+
+    def feedback_after_stop(self):
+        if self.commands:
+            sent.set()
+            assert threading.Event.wait(card._cancel, timeout=2)
+        return original(self)
+
+    monkeypatch.setattr(card.test_client, "get_status", feedback_after_stop)
+    callbacks = []
+    result = card.dispatch("walking_mode", {"walking_model": "whole_body"},
+                           tool_name="loco", notify=lambda *args: callbacks.append(args))
+    assert sent.wait(timeout=2)
+    card.stop()
+    assert not card._worker.is_alive()
+    assert callbacks[0][0:2] == (result["action_id"], "cancelled")
+    assert callbacks[0][2]["command_sent"] is True
+    assert card._loco.reserved is False
+
+
+def test_worker_start_failure_releases_chassis_without_sending(card, monkeypatch):
+    def fail_start(_thread):
+        raise RuntimeError("cannot start thread")
+
+    monkeypatch.setattr(MODULE.threading.Thread, "start", fail_start)
+    refused = card.dispatch("walking_mode", {"walking_model": "whole_body"},
+                            tool_name="loco", notify=lambda *args: pytest.fail("unexpected completion"))
+    assert refused["code"] == "worker_start_failed"
+    assert "action_id" not in refused
+    assert card.test_client.commands == []
+    assert card._loco.reserved is False
+    assert card.dispatch("walking_mode", {"walking_model": "whole_body"})["state"] == "completed"
+
+
+def test_cancel_waits_for_an_inflight_write_before_returning(card, monkeypatch):
+    writing, release = threading.Event(), threading.Event()
+    cancelling, cancelled = threading.Event(), threading.Event()
+    original = card.test_client.set_walking_model
+    callbacks = []
+
+    def delayed_write(self, model):
+        writing.set()
+        assert release.wait(timeout=2)
+        original(self, model)
+
+    def cancel():
+        cancelling.set()
+        card.cancel_switch()
+        cancelled.set()
+
+    monkeypatch.setattr(card.test_client, "set_walking_model", delayed_write)
+    card.dispatch("walking_mode", {"walking_model": "whole_body"},
+                  tool_name="loco", notify=lambda *args: callbacks.append(args))
+    stopper = threading.Thread(target=cancel)
+    try:
+        assert writing.wait(timeout=2)
+        stopper.start()
+        assert cancelling.wait(timeout=2)
+        assert not cancelled.wait(timeout=0.05)
+    finally:
+        release.set()
+        stopper.join(timeout=2)
+        card._worker.join(timeout=2)
+    assert cancelled.is_set()
+    assert card.test_client.commands == ["whole_body"]
+    assert len(callbacks) == 1
+    assert card._loco.reserved is False

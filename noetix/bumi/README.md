@@ -368,23 +368,30 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 `footprint` 的出错方向是单边的（以为自己更宽只是多减速，以为更窄就是把肩膀送进
 门框），所以默认值刻意偏宽；死区不是，所以它宁可声明成估计值也不写零。
 
-## `walking_mode` 行走模式切换（待现场验收）
+## 运动卡片中的行走模式切换
 
-本分支提供独立 actuator 卡片 `walking_mode`。参数区只有必填的
-`walking_model` 下拉框，选项为 `lower_body`（仅腿部行走）与
-`whole_body`（全身行走），不再显示 `action` 下拉框。无 `action` 字段的
-MCP 请求由 bundle 按工具名分发，例如：
+在 `loco` 或 `loco_relative_move` 的 `ACTION` 中选择 `walking_mode`，
+即可显示 `walking_model` 下拉框，选项为 `lower_body`（仅腿部行走）与
+`whole_body`（全身行走）。该字段仅属于模式切换动作。已有动作继续使用各自的
+速度、距离、角度参数和原有执行逻辑。
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"walking_mode","arguments":{"walking_model":"lower_body"}}}
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"loco","arguments":{"action":"walking_mode","walking_model":"lower_body"}}}
 ```
 
-**卡片默认启用，真实双向切换仍待现场验收。**
+同样的请求可将 `name` 改为 `loco_relative_move`。两张卡片共用一个独立的
+模式切换后端和底盘预留，受理后立即返回 `state=running`、唯一 `action_id`。
+切换完成后通过 ACP 向发起调用的卡片报告结果。切换不修改目标运动的状态、
+里程估计或打滑配置。两张卡片的 `stop_move` 均可取消待执行的模式切换并刹停。
+
+**默认配置启用两张卡片中的模式切换动作。**
 新镜像部署并启动后，只要 SDK 控制器初始化成功、`loco` 已启用且驱动在线，
-画布即可发现 `walking_mode`；默认配置中两张卡片均已启用。构造、启动、查询
-和停止均不建立 App 连接或发送 SDK 命令；执行切换时才连接。
-旧镜像和通过 `CONFIG_PATH` 指定的自定义配置不会自动更新；如需关闭本卡，
-将生效配置的 `plugins.walking_mode.enabled` 设置为 `false` 并重启驱动。
+两张卡片均可发现该动作。模式切换后端在注册、启动时只初始化本地状态，
+执行时才连接 App 接口。保留原配置项 `plugins.walking_mode.enabled`，
+设为 `false` 并重启驱动即可关闭两张卡片中的该动作。
+旧镜像及通过 `CONFIG_PATH` 指定的自定义配置沿用各自的配置。
+已保存的 skill 仍可用原工具名 `walking_mode` 及 `walking_model` 参数同步调用，
+该兼容入口沿用原协议。新工具目录统一展示两张运动卡片。
 当前 SDK 没有已核验的步态选择入口，因此本卡复用官方 App 的 TCP 命令，
 SDK 只用于读取现有控制器的反馈，不实例化另一个 `HighController`。
 
@@ -392,18 +399,15 @@ SDK 只用于读取现有控制器的反馈，不实例化另一个 `HighControl
 处于使能、准备、保护等非行走模式时同样拒绝，不会自动使能或起身。
 App 与 SDK 必须先报告一致的 2/3 模式；已处于目标模式则直接返回，不重发命令。
 实际切换前暂停 `loco_servo`，检查全部 21 个关节速度均低于 `0.15 rad/s`，
-并再次检查模式未变化。仅发送一次 `walk` 或 `run`，随后连续两次确认 App 与
-SDK 的反馈均为目标代码才返回 `state=completed`、`mode_verified=true`。
-这表示模式切换获确认，不代表真实行走行为已验收。
+并再次检查模式未变化。发送一次 `walk` 或 `run` 后，连续两次确认 App 与
+SDK 的反馈均为目标代码，ACP 完成结果包含 `state=completed`、`mode_verified=true`。
 超时、保护或断连不会自动重试、回退或恢复流式移动；发送中断时会保留
 `command_may_have_been_sent`，避免误报指令肯定未到达。
 
 默认在 UDP 9090 被动接收 `discovery_source_ip` 指定的运动板广播，
 取其 `perception_ip` 连接 TCP 8888；不发送扫描报文，也不把实验机器 IP 写进代码。
-UDP 不可用时可在部署配置中指定 `app_host`。部署前须验证驱动容器能访问该地址；
-本次 Windows 端查询已成功，随后机器人断连，容器内连通性尚未确认。
-现有 `loco` / `loco_servo` 的移动门槛仍为状态 2；状态 3 下通过 SDK 发速度的行为
-尚未验收，本次没有放宽这些运动限制。
+UDP 不可用时可在部署配置中指定 `app_host`。驱动容器需要能访问该地址。
+现有 `loco` / `loco_servo` 的速度移动继续要求状态 2。
 
 2026-11-11 核对了本仓库附带的 SDK 3.1.0 头文件、Python 绑定和示例，
 并对照了厂家的公开文档与当前 SDK 源码：
@@ -472,23 +476,24 @@ UDP 不可用时可在部署配置中指定 `app_host`。部署前须验证驱�
 
 厂家 SDK 当前提交 `20750fda734da0ef4c2fe28226b0d506a1f32273` 的 x86 静态库中，
 `publish_cmd` 直接把枚举写入 DDS action，只在保存与播放示教时写入 index；
-因此给 `WALK` 设置不同的 index 无法用该接口选步态。本分支没有向实机发送
-切换命令；上述切换由用户在 App 中手动完成。
+因此给 `WALK` 设置不同的 index 无法用该接口选步态。
+上述 2026-11-11 日志中的切换由用户在 App 中手动完成。
 
-下一步待连接恢复后，先只读验证容器内访问及状态一致性，再由现场操作者确认
-机器人静止站立、暂停其他控制来源后，验收 `2 → 3 → 2` 的命令与反馈。
-同时核对固件/App 版本、并发客户端控制权及断连行为，再确认长期发布条件。
-目前不能将本卡声明为已通过实机切换测试或可发布的切换能力。
+2026-11-17 用户确认现有独立卡片的执行效果，并提供全身行走切换成功的截图，
+结果包含 `walking_model=whole_body`、App/SDK 状态码 3、
+`command_sent=true`、`mode_verified=true`。
+本次集成复用同一套切换协议和反馈校验。两张运动卡片的新入口已进行离线验证，
+部署新镜像后的画布交互和实机切换需继续验证。
 
-离线验证（仓库根目录）：
+在仓库根目录运行离线验证。
 
 ```powershell
-python -X utf8 -m pytest tests/test_bumi_walking_mode.py tests/test_bumi_walking_mode_client.py tests/test_bumi_motion_state.py tests/test_bumi_bundle.py tests/test_bumi_loco_servo.py -q
+python -X utf8 -m pytest tests/test_bumi_walking_mode.py tests/test_bumi_walking_mode_client.py tests/test_bumi_motion_state.py tests/test_bumi_bundle.py tests/test_bumi_loco_servo.py noetix/bumi/tests/test_loco_destination.py -q
 ```
 
-上述测试检查下拉框 schema、无 action 的 bundle 分发、启用依赖、底盘预留、
-静止检查、双路反馈、断连/超时/保护处理、TCP 分帧，以及真实 `motion_state`
-读取逻辑对 2/3 模式、保护模式和未知代码的区分；不证明真实模式切换。
+上述测试覆盖两张卡片的参数分组与 MCP HTTP 调用、旧入口兼容、启用依赖、
+底盘预留、并发与取消、异步完成回报、静止检查、双路反馈、断连/超时/保护处理、
+TCP 分帧、`motion_state` 状态区分，以及原有旋转和目标移动的回归验证。
 
 ## Direct action cards
 

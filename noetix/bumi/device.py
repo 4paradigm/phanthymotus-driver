@@ -416,10 +416,15 @@ class LocoPlugin:
         # Set by LocoServoPlugin at construction. `loco` is built first, so the
         # link cannot be a constructor argument in this direction.
         self._servo = None
+        self._walking_mode = None
 
     def attach_servo(self, servo) -> None:
         """Let the streaming chassis card be paused before we drive it ourselves."""
         self._servo = servo
+
+    def attach_walking_mode(self, walking_mode) -> None:
+        """Share one mode-switch backend between both locomotion tools."""
+        self._walking_mode = walking_mode
 
     def _distance_full_scale(self):
         """Measured normalised-command-to-m/s calibration from the servo card.
@@ -489,13 +494,17 @@ class LocoPlugin:
             self._servo.set_explicit_velocity_owner(owned)
 
     def get_tools(self) -> list:
-        return [
+        tools = [
             self._loco_tool(),
             self._loco_relative_move_tool(),
             self._stand_up_lie_prone_tool(),
             self._semantic_action_tool(),
             self._action_recording_tool(),
         ]
+        if self._walking_mode is not None:
+            for tool in tools[:2]:
+                self._walking_mode.add_to_tool(tool)
+        return tools
 
     def _loco_tool(self) -> dict:
         return {
@@ -672,7 +681,8 @@ class LocoPlugin:
         }
 
     def start(self) -> None:
-        pass  # The standalone distance worker reads the SDK IMU and joint states directly.
+        if self._walking_mode is not None:
+            self._walking_mode.start()
 
     def stop(self) -> None:
         # BumiDeviceBundle.stop_all calls this during SIGTERM/redeploy. The
@@ -681,6 +691,8 @@ class LocoPlugin:
         # completes the ACP action before Agent Core is left holding a
         # pending action (mirrors VisionCapturePlugin.stop).
         self._stop_move()
+        if self._walking_mode is not None:
+            self._walking_mode.stop()
         self._wait_for_rotate_idle()
 
     def _wait_for_rotate_idle(self, timeout_s: float = 6.0) -> bool:
@@ -707,6 +719,7 @@ class LocoPlugin:
         if action == "config" and args.get('_tool_name') == 'loco_relative_move':
             return self._apply_distance_config(args)
         if action == "start":
+            self.start()
             return {"state": "ready"}
         if action == "stop":
             # The streaming card goes first. Stopping the chassis and leaving a
@@ -718,6 +731,13 @@ class LocoPlugin:
             return {"state": "idle"}
 
         tool_name = args.pop('_tool_name', '')
+
+        if action == "walking_mode" and tool_name in ("loco", "loco_relative_move"):
+            if self._walking_mode is None:
+                return {"state": "error", "code": "walking_mode_disabled",
+                        "command_sent": False, "error": "行走模式切换未启用。"}
+            return self._walking_mode.dispatch(
+                action, args, tool_name=tool_name, notify=_acp_notify)
 
         handler = None
         if tool_name == "loco" and action == "move":
@@ -867,6 +887,9 @@ class LocoPlugin:
             return {"state": "moving", "vx": vx, "vy": vy, "vyaw": vyaw, "duration": "continuous (5s watchdog)"}
 
     def _stop_move(self) -> dict:
+        walking_mode = getattr(self, "_walking_mode", None)
+        if walking_mode is not None:
+            walking_mode.cancel_switch()
         self._rotate_stop_event.set()
         self._move_stop_event.set()
         if self._move_thread and self._move_thread.is_alive():
