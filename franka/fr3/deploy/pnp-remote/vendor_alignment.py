@@ -47,7 +47,13 @@ def wait_for_follow(env, agent):
             last_report = now
         if gate.exists():
             gate.unlink()
-            if announced and master_delta <= .05:
+            latest = env.get_obs()
+            released_master = np.asarray(agent.act(latest), dtype=float)
+            released_joints = np.asarray(latest["joint_positions"], dtype=float)
+            if (released_master.shape != (8,) or released_joints.shape != (8,) or
+                    not np.isfinite(released_master).all() or not np.isfinite(released_joints).all()):
+                raise RuntimeError("Invalid feedback at follow release")
+            if announced and np.max(np.abs(released_master[:7] - released_joints[:7])) <= .05:
                 return
         command = joints.copy()
         delta = target[:7] - joints[:7]
