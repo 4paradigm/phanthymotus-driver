@@ -19,6 +19,7 @@ class PnpRemoteTeleopPlugin:
     def __init__(self, acp_callback=None):
         self._lock = threading.RLock()
         self._loaded = False
+        self._stopped = False
         self._init = {"state": "not_initialized"}
         self._init_thread = None
         self._password = ""
@@ -163,6 +164,11 @@ class PnpRemoteTeleopPlugin:
             raise RuntimeError(result.stderr.strip() or f"SSH exit {result.returncode}")
         return result.stdout
 
+    def _inactive_state(self):
+        if not self._loaded:
+            return "idle"
+        return "stop" if self._stopped else "loaded"
+
     def _host_status(self, side):
         output = self._ssh(side, "systemctl", "--user", "show", self._unit,
                            "-p", "LoadState", "-p", "ActiveState",
@@ -172,7 +178,7 @@ class PnpRemoteTeleopPlugin:
             raise RuntimeError(f"PNP 主控机缺少专用服务 {self._unit}")
         active = fields.get("ActiveState")
         states = {"active": "aligning", "activating": "aligning",
-                  "deactivating": "stopping", "inactive": "loaded" if self._loaded else "idle",
+                  "deactivating": "stopping", "inactive": self._inactive_state(),
                   "failed": "fault"}
         state = states.get(active, "unknown")
         masters = json.loads(fields.pop("Arms", "{}"))
@@ -222,8 +228,8 @@ class PnpRemoteTeleopPlugin:
         for side, error in errors.items():
             hosts[side] = {"host": self._hosts[side], "state": "unreachable", "error": error}
         states = {host["state"] for host in hosts.values()}
-        active = states - {"idle", "loaded"}
-        state = "loaded" if self._loaded else "idle"
+        active = states - {"idle", "loaded", "stop"}
+        state = self._inactive_state()
         if active:
             for candidate in ("unreachable", "fault", "follow_interrupted", "stopping",
                               "aligning", "starting_follow", "following", "aligned", "unknown"):
@@ -256,7 +262,7 @@ class PnpRemoteTeleopPlugin:
         deadline = time.monotonic() + 140
         while time.monotonic() < deadline:
             if cancelled.is_set():
-                terminal, result = "cancelled", {"state": "paused"}
+                terminal, result = "cancelled", {"state": "stop"}
                 break
             try:
                 status = self._status()
@@ -306,6 +312,7 @@ class PnpRemoteTeleopPlugin:
                 if action == "start":
                     self._configure(args)
                     self._loaded = True
+                    self._stopped = False
                     self._initialize()
                     return self._status()
                 if action == "follow":
@@ -352,6 +359,7 @@ class PnpRemoteTeleopPlugin:
                         _, rollback = self._batch(selected, self._stop_host)
                         return {"state": "error", "message": "PNP 遥操启动未确认",
                                 "errors": errors, "stop_errors": rollback}
+                    self._stopped = False
                     action_id = "fr3_align_" + uuid.uuid4().hex
                     self._align_cancel = threading.Event()
                     self._acp = {"action_id": action_id, "state": "waiting_for_motion"}
@@ -371,7 +379,8 @@ class PnpRemoteTeleopPlugin:
                                 "errors": errors}
                     if action == "stop":
                         self._loaded = False
-                    return {"state": "paused" if self._loaded else "idle"}
+                    self._stopped = action == "pause"
+                    return {"state": "stop" if self._stopped else "idle"}
             except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
                 return {"state": "error", "message": str(exc)}
         return None

@@ -21,7 +21,7 @@ FROM ros-base AS build-deps
 # Pinocchio comes from the ROS repository, whose packages support ARM64.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates openssh-client python3-yaml ros-humble-rmw-fastrtps-cpp \
+        ca-certificates python3-yaml ros-humble-rmw-fastrtps-cpp \
         ros-humble-pinocchio libpocofoundation80 libpoconet80 libfmt8 \
         libtinyxml2-9 libconsole-bridge1.0 \
     && rm -rf /var/lib/apt/lists/*

@@ -13,14 +13,14 @@ and an 8 GiB memory-lock limit.
 On PNP, install the Orin service key for the `pnp` user with SSH
 `restrict,command="/home/pnp/.local/lib/fr3-pnp/pnp-card-ctl"`. The PNP user
 needs passwordless permission for just `/usr/bin/systemctl start
-pnp-fr3-right-teleop.service` and its `stop` counterpart. Store the private key
-and verified PNP host key in the Orin SSH directory mounted by `service.yml`.
+pnp-fr3-right-teleop.service` and its `stop` counterpart. Store existing service credentials under the persistent state directory as
+`id_ed25519` and `known_hosts`, or let canvas initialization provision them.
 
-Build the base Franka image using the parent driver documentation. Create the same build context as the parent build, including `common/`.
-Build the PNP variant inside that context with
-`docker build -f deploy/pnp-remote/Dockerfile --build-arg BASE_IMAGE=franka-fr3:local --build-arg SOURCE_REVISION=<git-commit> -t franka-fr3:pnp-remote .`
-and deploy with the service template in this directory. Keep the direct-FCI
-container stopped while the PNP service controls the same arm.
+Build the standard FR3 image using the parent driver documentation and deploy
+it with `../service.yml`. The Teleop card shares the FR3 driver's registered
+MCP endpoint on port 15723 with the other FR3 cards. The standard service
+persists the PNP SSH identity and verified host keys under `/var/lib/fr3-pnp`.
+Stop any older FR3 driver container before starting this service.
 
 Set `FRANKA_PNP_SSH_HOST` to the right workstation and
 `FRANKA_PNP_LEFT_SSH_HOST` to the left workstation (for example `pnp@<left-host>`).
@@ -138,3 +138,6 @@ Follow releases that waiting session without restarting the vendor scripts.
 The current master/follower difference must remain within 0.05 rad at release.
 Moving a master before executing `Follow` can require stopping and aligning again.
 Stop shuts down the complete service using the configured shutdown order.
+
+Service logs on the PNP workstation follow the host journald settings. Review
+the site retention policy when provisioning a workstation.

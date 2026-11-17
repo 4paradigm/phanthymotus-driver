@@ -840,8 +840,7 @@ def build_plugins(config, namespace, ros2):
     gripper = GripperPlugin(config, namespace, ros2, discovery=sensor._discovery)
     plugins = [sensor, controller, gripper,
                ExtCameraPlugin(config.get("ext_camera", {}), namespace, ros2)]
-    if os.environ.get("FRANKA_TELEOP_BACKEND") == "pnp_remote":
-        from franka.fr3.pnp_remote_teleop import PnpRemoteTeleopPlugin
+    from franka.fr3.pnp_remote_teleop import PnpRemoteTeleopPlugin
 
-        plugins.append(PnpRemoteTeleopPlugin())
+    plugins.append(PnpRemoteTeleopPlugin())
     return plugins

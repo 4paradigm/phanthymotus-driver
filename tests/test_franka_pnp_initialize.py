@@ -131,7 +131,11 @@ class AlignmentCompletionTests(TestCase):
         schema = plugin.get_tools()[0]["inputSchema"]
         self.assertTrue(all(hook["action"] == "Stop" for hook in schema["x-hooks"].values()))
         with patch.object(plugin, "_stop_host") as stop_host:
-            self.assertEqual(plugin.dispatch("Stop", {}), {"state": "paused"})
+            self.assertEqual(plugin.dispatch("Stop", {}), {"state": "stop"})
+            with patch.object(plugin, "_ssh", return_value="LoadState=loaded\nActiveState=inactive\n"):
+                status = plugin.dispatch("Status", {})
+            self.assertEqual(status["state"], "stop")
+            self.assertEqual(status["hosts"]["right"]["state"], "stop")
             self.assertTrue(plugin._loaded)
             stop_host.assert_called_once_with("right")
             self.assertEqual(plugin.dispatch("stop", {}), {"state": "idle"})
@@ -141,10 +145,40 @@ class AlignmentCompletionTests(TestCase):
         completed = []
         plugin = PnpRemoteTeleopPlugin(acp_callback=lambda *args: completed.append(args))
         plugin._acp = {"action_id": "align-test", "state": "waiting_for_motion"}
-        with patch.object(plugin, "_status", return_value={"state": "aligned", "hosts": {}}):
+        with patch.object(plugin, "_ssh", return_value=self._status_output()):
             plugin._watch_alignment("align-test", threading.Event())
         self.assertEqual(completed[0][:2], ("align-test", "completed"))
         self.assertEqual(plugin._acp["state"], "accepted")
+
+    @staticmethod
+    def _status_output(left_stage="vendor_aligned", fresh=True, include_execution=True):
+        service = "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nMainPID=123\nControlPID=0\n"
+        masters = {"right": {"ready": True}, "left": {"ready": True}}
+        execution = {"stage": "vendor_starting_arms", "arms": {
+            "right": {"stage": "vendor_aligned", "heartbeat_fresh": True},
+            "left": {"stage": left_stage, "heartbeat_fresh": fresh},
+        }}
+        output = service + "Arms=" + json.dumps(masters) + "\n"
+        if include_execution:
+            output += "Execution=" + json.dumps(execution) + "\n"
+        return output
+
+    def test_status_waits_for_both_fresh_arm_snapshots(self):
+        plugin = PnpRemoteTeleopPlugin()
+        for output in (self._status_output(include_execution=False),
+                       self._status_output(left_stage="worker_starting"),
+                       self._status_output(fresh=False)):
+            with self.subTest(output=output), patch.object(plugin, "_ssh", return_value=output):
+                status = plugin._host_status("right")
+                self.assertEqual(status["state"], "aligning")
+                self.assertTrue(status["masters"]["right"]["ready"])
+
+    def test_stop_requires_confirmed_inactive_service(self):
+        plugin = PnpRemoteTeleopPlugin()
+        with patch.object(plugin, "_ssh", side_effect=["", self._status_output()]) as ssh:
+            with self.assertRaisesRegex(RuntimeError, "停止未确认"):
+                plugin._stop_host("right")
+            self.assertEqual(ssh.call_args_list[0].args[1:4], ("systemctl", "--user", "stop"))
 
     def test_follow_requires_confirmed_alignment(self):
         plugin = PnpRemoteTeleopPlugin()
