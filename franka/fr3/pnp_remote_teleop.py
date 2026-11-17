@@ -21,7 +21,7 @@ class PnpRemoteTeleopPlugin:
         self._init_thread = None
         self._password = ""
         self._settings = {"pnp_host": "", "ssh_user": "pnp", "right_slave_ip": "172.16.0.2",
-                          "left_slave_ip": "172.16.0.3", "auto_initialize": True}
+                          "left_slave_ip": "172.16.0.3", "read_vendor_slave_ips": True, "auto_initialize": True}
         self._unit = "pnp-fr3-right-teleop.service"
         self._hosts = {"right": os.environ.get("FRANKA_PNP_SSH_HOST", "pnp@172.16.0.200")}
         left = os.environ.get("FRANKA_PNP_LEFT_SSH_HOST", "").strip()
@@ -51,10 +51,13 @@ class PnpRemoteTeleopPlugin:
             "properties": {
                 "pnp_host": {"type": "string", "title": "PNP host IP (optional)", "default": "",
                              "description": "Leave empty to discover a wired PNP host with both master USB devices."},
-                "right_slave_ip": {"type": "string", "title": "Right FR3 slave IP", "default": "172.16.0.2",
-                                   "description": "FCI address of the right Franka controller."},
-                "left_slave_ip": {"type": "string", "title": "Left FR3 slave IP", "default": "172.16.0.3",
-                                  "description": "FCI address of the left Franka controller."},
+                "right_slave_ip": {"type": "string", "title": "Right FR3 slave IP", "default": self._settings["right_slave_ip"],
+                                   "description": "Current right slave IP. Disable reading vendor IPs to use this value as a manual override."},
+                "left_slave_ip": {"type": "string", "title": "Left FR3 slave IP", "default": self._settings["left_slave_ip"],
+                                  "description": "Current left slave IP. Disable reading vendor IPs to use this value as a manual override."},
+                "read_vendor_slave_ips": {"type": "boolean", "title": "Read slave IPs from PNP",
+                                          "default": True,
+                                          "description": "Read vendor left/right assignments during initialization. Keep current values if unavailable."},
                 "ssh_user": {"type": "string", "title": "SSH username", "default": "pnp"},
                 "ssh_password": {"type": "string", "title": "SSH initialization password",
                                  "format": "password", "x-sensitive": True, "writeOnly": True,
@@ -84,6 +87,8 @@ class PnpRemoteTeleopPlugin:
             raise ValueError("Left and right slave IP addresses must be different")
         if not re.fullmatch(r"[a-z_][a-z0-9_-]*", settings["ssh_user"]):
             raise ValueError("Invalid SSH user")
+        if type(settings["read_vendor_slave_ips"]) is not bool:
+            raise ValueError("read_vendor_slave_ips must be boolean")
         if type(settings["auto_initialize"]) is not bool:
             raise ValueError("auto_initialize must be boolean")
         changed = settings != self._settings or "ssh_password" in args
@@ -118,9 +123,12 @@ class PnpRemoteTeleopPlugin:
                     from franka.fr3.pnp_discovery import discover
                     address = discover(slave_ips, settings["ssh_user"], password, progress)
                     selected_host = settings["ssh_user"] + "@" + address
-                result = initialize(selected_host, password, progress, slave_ips=slave_ips)
+                result = initialize(selected_host, password, progress, slave_ips=slave_ips,
+                                    read_vendor=settings["read_vendor_slave_ips"])
                 with self._lock:
                     self._hosts["right"] = selected_host
+                    for side, address in result.get("slave_ips", {}).items():
+                        self._settings[f"{side}_slave_ip"] = address
                 result["pnp_host"] = selected_host.split("@", 1)[1]
             except Exception as exc:
                 message = str(exc).replace(password, "[redacted]") if password else str(exc)
@@ -212,7 +220,9 @@ class PnpRemoteTeleopPlugin:
                     state = candidate
                     break
         right = hosts.get("right", {})
-        return {"state": state, "initialization": dict(self._init), "hosts": hosts,
+        return {"state": state, "initialization": dict(self._init),
+                "slave_ips": {side: self._settings[f"{side}_slave_ip"] for side in ("right", "left")},
+                "hosts": hosts,
                 "masters": {arm: data for entry in hosts.values()
                             for arm, data in entry.get("masters", {}).items()},
                 "remote_service": right.get("remote_service", {}),

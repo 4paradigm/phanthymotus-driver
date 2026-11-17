@@ -102,3 +102,12 @@ Host networking, NET_RAW and NET_ADMIN are required for ARP discovery and
 per-candidate wired host routes. Configure distinct right and left slave IPs.
 The installer stores them in the PNP runtime and passes IP overrides to the
 vendor launchers. Original vendor configuration files are retained.
+
+
+During initialization, vendor right/left IP assignments are read from each
+robot_client configuration and cross-checked against its gripper configuration.
+Resolved IPs and their sources are returned in status; refreshed schemas show
+these as editable defaults. Missing or ambiguous assignments retain the current
+values and produce a warning. Disable "Read slave IPs from PNP" to apply manual
+IP edits. Updating schema defaults does not force an open canvas form to discard
+its saved values; consult the resolved slave_ips in the initialization result.

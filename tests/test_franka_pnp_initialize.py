@@ -1,4 +1,7 @@
 import json
+from pathlib import Path
+import runpy
+import tempfile
 import threading
 from unittest import TestCase, main
 from unittest.mock import patch
@@ -42,6 +45,30 @@ class InitializationTests(TestCase):
 
     def test_remote_program_compiles(self):
         compile(pnp_initialize.REMOTE,'remote-installer','exec')
+
+
+class VendorIPTests(TestCase):
+    def test_vendor_assignments_and_ambiguous_side(self):
+        path = Path(__file__).resolve().parents[1] / "franka/fr3/deploy/pnp-remote/read_vendor_ips.py"
+        read = runpy.run_path(str(path))["read_vendor_ips"]
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            root = home / "frankateleop"
+            marker = root / "right_franka/1_launch_robot.sh"
+            marker.parent.mkdir(parents=True)
+            marker.touch()
+            conf = root / "polymetis/polymetis/python/polymetis/conf"
+            for side, address in (("right", "172.16.0.22"), ("left", "172.16.0.23")):
+                for kind, name in (("robot_client", f"{side}_franka_hardware"),
+                                   ("gripper", f"{side}_franka_hand")):
+                    file = conf / kind / (name + ".yaml")
+                    file.parent.mkdir(parents=True, exist_ok=True)
+                    file.write_text(f'  robot_ip: "{address}"\n')
+            self.assertEqual(read(home)["ips"], {"right": "172.16.0.22", "left": "172.16.0.23"})
+            (conf / "gripper/left_franka_hand.yaml").write_text('robot_ip: "172.16.0.99"\n')
+            result = read(home)
+            self.assertEqual(result["ips"], {"right": "172.16.0.22"})
+            self.assertIn("left", result["errors"])
 
 if __name__=='__main__':
     main()

@@ -54,5 +54,6 @@ with tempfile.TemporaryDirectory(prefix="fr3-card-install-") as directory:
     pending_config = runtime / ".robot_ips.json"
     pending_config.write_text(json.dumps(robot_ips))
     pending_config.replace(runtime / "robot_ips.json")
+    (runtime / "vendor-root.txt").write_text(str(vendor) + "\n")
     (runtime / "package.sha256").write_text(data["version"] + "\n")
 print("PNP_INITIALIZED")

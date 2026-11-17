@@ -5,6 +5,8 @@ runtime="$HOME/.local/lib/fr3-pnp"
 exec 9>"$runtime/control.lock"
 flock -x 9
 case "${SSH_ORIGINAL_COMMAND:-}" in
+  'pnp-slave-ips')
+    python3 "$runtime/read_vendor_ips.py" ;;
   'pnp-discover')
     python3 - "$runtime" <<'DETECT'
 import json, sys

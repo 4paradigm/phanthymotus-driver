@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-FILES = ("detect_paths.py", "arm_config.py", "run_right.py", "run_vendor.py", "execution_status.py",
+FILES = ("read_vendor_ips.py", "detect_paths.py", "arm_config.py", "run_right.py", "run_vendor.py", "execution_status.py",
          "prepare_vendor_follow.py", "stop_right.sh", "vendor-follow-env.sh",
          "vendor-bin/sudo", "install-pnp.sh", "pnp-card-ctl",
          "pnp-fr3-right-teleop.service", "README.md")
@@ -51,14 +51,47 @@ def authenticated_command(host, password, command, timeout=15, payload=None):
                               input=payload, capture_output=True, text=True, env=env, timeout=timeout)
 
 
-def initialize(host, password, progress, slave_ips=None):
+def read_slave_config(host, password):
+    result = authenticated_command(host, "", "pnp-slave-ips")
+    if result.returncode and password:
+        source = Path("/deploy/pnp-remote/read_vendor_ips.py").read_text()
+        result = authenticated_command(host, password, "python3 -c " + shlex.quote(source))
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if line.startswith("PNP_SLAVE_IPS="):
+                return json.loads(line.split("=", 1)[1])
+    return {"ips": {}, "errors": {"configuration": "Could not read vendor IP configuration"}}
+
+
+def initialize(host, password, progress, slave_ips=None, read_vendor=True):
     slave_ips = slave_ips or {"right": "172.16.0.2", "left": "172.16.0.3"}
+    slave_ips = dict(slave_ips)
+    current_ips = dict(slave_ips)
+    sources = {side: "current_value" for side in slave_ips}
+    warnings = {}
+    if read_vendor:
+        progress("reading_vendor_slave_ips")
+        try:
+            vendor = read_slave_config(host, password)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            vendor = {"ips": {}, "errors": {"configuration": "Could not read vendor IP configuration"}}
+        warnings = vendor.get("errors", {})
+        for side, address in vendor.get("ips", {}).items():
+            if side in slave_ips:
+                __import__("ipaddress").IPv4Address(address)
+                slave_ips[side] = address
+                sources[side] = "pnp_vendor_configuration"
+        if len(set(slave_ips.values())) != 2:
+            slave_ips = current_ips
+            sources = {side: "fallback" for side in slave_ips}
+            warnings["configuration"] = "IP assignments conflict; keeping current values"
+    details = {"slave_ips": slave_ips, "slave_ip_sources": sources, "warnings": warnings}
     files, version = package()
     version = hashlib.sha256((version + json.dumps(slave_ips, sort_keys=True)).encode()).hexdigest()
     progress("checking_remote_version")
     check = authenticated_command(host, "", "pnp-package-version")
     if check.returncode == 0 and check.stdout.strip() == version:
-        return {"state": "ready", "updated": False, "package_version": version}
+        return {"state": "ready", "updated": False, "package_version": version, **details}
     if not password:
         raise RuntimeError("An SSH initialization password is required for installation or updates")
     key, _ = paths()
@@ -75,4 +108,4 @@ def initialize(host, password, progress, slave_ips=None):
     checked = authenticated_command(host, "", "pnp-package-version")
     if checked.returncode or checked.stdout.strip() != version:
         raise RuntimeError("PNP key access verification failed after installation")
-    return {"state": "ready", "updated": True, "package_version": version}
+    return {"state": "ready", "updated": True, "package_version": version, **details}
