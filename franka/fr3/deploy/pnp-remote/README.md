@@ -1,7 +1,7 @@
-# PNP FR3 right arm
+# PNP FR3 teleoperation
 
 The Orin card offers `follow`, `pause`, and `status`. The PNP service starts
-the four installed right-arm vendor launchers in order. The vendor initializer
+the four installed vendor launchers for each selected side in order. The vendor initializer
 moves the arm to its configured pose and initializes the Hand during `follow`.
 
 On the PNP workstation, keep the vendor tree at `~/frankateleop` and its
@@ -35,3 +35,33 @@ Right uses FTBMDRZS, FR3 172.16.0.2 and ports 50051, 50053, 6001. Left uses
 FTB57FAR, FR3 172.16.0.3 and ports 50052, 50054, 6002. Use the workstation SSH
 address for the host variables. The service unit retains its original identifier
 on both machines for compatibility with the restricted SSH command.
+
+
+## Install from the driver image
+
+All active PNP support sources are embedded under `/deploy/pnp-remote`.
+On Orin, export the package from the image:
+
+```bash
+docker run --rm --entrypoint sh IMAGE /deploy/pnp-remote/export-pnp.sh > pnp-support.tar.gz
+scp pnp-support.tar.gz USER@PNP_HOST:/tmp/
+```
+
+On the PNP host, extract into an empty directory and run `sh install-pnp.sh`.
+The installer checks the vendor runtime, renders the service for the login
+account, and installs the restricted start/stop sudo rule. Administrative
+authentication is required once. Configure the Orin public SSH key with the
+forced command described above and verify the host key before using the card.
+Set `PNP_VENDOR_ROOT` and `PNP_CONDA_BASE` for alternative installation paths.
+The vendor runtime and libfranka executables must match the PNP host CPU and
+robot system version. The export contains our support sources and requires the
+vendor runtime already installed on the PNP host.
+
+## Wired Orin to PNP connection
+
+The validated workstation uses wired 172.16.0.200/24 and Orin uses
+172.16.0.184/32. Orin's NetworkManager profile `franka-fr3` has a persistent
+host route to 172.16.0.200 on eno1. The card's default SSH destination is now
+`pnp@172.16.0.200`. Use `FRANKA_PNP_SSH_HOST` for another workstation.
+Validate its SSH host key and check `ip route get <PNP_IP>` before changing
+the destination. FCI runs locally between PNP and the Franka controllers.

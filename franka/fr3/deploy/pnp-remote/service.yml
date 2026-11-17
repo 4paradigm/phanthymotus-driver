@@ -9,6 +9,6 @@ franka-fr3:
     - /opt/phanthy-motus/data/certs/cert.pem:/opt/phanthy-motus/data/certs/cert.pem:ro
     - ${FRANKA_PNP_SSH_DIR:-/home/nvidia/.ssh/fr3-pnp}:/run/fr3-pnp-ssh:ro
   environment:
-    FRANKA_PNP_SSH_HOST: ${FRANKA_PNP_SSH_HOST:-pnp@10.110.11.233}
+    FRANKA_PNP_SSH_HOST: ${FRANKA_PNP_SSH_HOST:-pnp@172.16.0.200}
     FRANKA_PNP_LEFT_SSH_HOST: ${FRANKA_PNP_LEFT_SSH_HOST:-}
   restart: unless-stopped

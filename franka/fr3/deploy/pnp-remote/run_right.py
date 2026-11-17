@@ -14,7 +14,7 @@ from arm_config import ARMS, detect
 from execution_status import report, run_checked
 from run_vendor import run_vendor
 
-POLY = Path.home() / "frankateleop/polymetis/polymetis"
+POLY = Path(os.environ.get("PNP_VENDOR_ROOT", str(Path.home() / "frankateleop"))) / "polymetis/polymetis"
 ENV = Path(sys.executable).parent.parent
 RUNTIME = Path(__file__).parent
 

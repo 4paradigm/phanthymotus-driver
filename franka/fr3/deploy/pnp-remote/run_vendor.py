@@ -10,7 +10,7 @@ import time
 
 from execution_status import report
 
-VENDOR_ROOT = Path.home() / "frankateleop"
+VENDOR_ROOT = Path(os.environ.get("PNP_VENDOR_ROOT", str(Path.home() / "frankateleop")))
 SCRIPTS = (
     "1_launch_robot.sh", "2_launch_gripper.sh", "3_launch_node.sh", "4_run_env.sh",
 )
@@ -44,7 +44,7 @@ def run_vendor(arm):
     env["FR3_VENDOR_SERVER"] = str(build / "run_server")
     env["FR3_VENDOR_CLIENT"] = str(build / "franka_panda_client")
     env["PATH"] = os.pathsep.join((str(runtime / "vendor-bin"),
-                                  str(Path.home() / "miniconda3/bin"), env["PATH"]))
+                                  str(Path(os.environ.get("PNP_CONDA_BASE", str(Path.home() / "miniconda3"))) / "bin"), env["PATH"]))
     env["PYTHONUNBUFFERED"] = "1"
     for name in SCRIPTS:
         if not (vendor / name).is_file():

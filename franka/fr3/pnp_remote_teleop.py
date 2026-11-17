@@ -15,7 +15,7 @@ class PnpRemoteTeleopPlugin:
         self._lock = threading.RLock()
         self._loaded = False
         self._unit = "pnp-fr3-right-teleop.service"
-        self._hosts = {"right": os.environ.get("FRANKA_PNP_SSH_HOST", "pnp@10.110.11.233")}
+        self._hosts = {"right": os.environ.get("FRANKA_PNP_SSH_HOST", "pnp@172.16.0.200")}
         left = os.environ.get("FRANKA_PNP_LEFT_SSH_HOST", "").strip()
         if left:
             if left == self._hosts["right"]:
