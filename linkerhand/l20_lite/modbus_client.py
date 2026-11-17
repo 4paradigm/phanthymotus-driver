@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 import time
+from copy import copy
 
 JOINT_COUNT = 10
 RIGHT_HAND_ID = 0x27
@@ -82,6 +83,17 @@ class L20LiteModbusClient:
             port=port, baudrate=baudrate, bytesize=8, parity="N",
             stopbits=1, timeout=timeout_s, write_timeout=timeout_s,
         )
+
+    def for_side(self, side: str) -> L20LiteModbusClient:
+        """Address another hand using the same serial device and transaction lock."""
+        if side not in ("left", "right"):
+            raise ValueError("side must be left or right")
+        if side == self.side:
+            return self
+        client = copy(self)
+        client.side = side
+        client.slave_id = RIGHT_HAND_ID if side == "right" else LEFT_HAND_ID
+        return client
 
     def close(self) -> None:
         self._serial.close()

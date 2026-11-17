@@ -127,6 +127,7 @@ class LiteTactilePlugin:
         schema = action_schema(
             {
                 "info": ([], "获取触觉传感器卡片信息、当前绑定状态及 topic_out"),
+                "get_state": ([], "读取当前绑定手的一次五指触觉快照"),
                 "start": ([], "启动触觉数据后台连续采集与流式推送"),
                 "stop": ([], "停止触觉数据流推送"),
                 "config": ([], "按提供的字段更新实例左右手或共享采集频率"),

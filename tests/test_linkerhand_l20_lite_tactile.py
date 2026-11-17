@@ -134,6 +134,44 @@ def test_read_tactile_isolates_failed_finger_and_reuses_port(monkeypatch, tmp_pa
     assert len(discoveries) == 2
 
 
+def test_tactile_and_control_share_serial_across_port_aliases(monkeypatch, tmp_path):
+    port = tmp_path / "ttyUSB0"
+    port.touch()
+    alias = tmp_path / "by-path"
+    alias.symlink_to(port)
+    transports = []
+
+    def open_client(*args, **kwargs):
+        serial = TactileSerial()
+        serial.closed = False
+
+        def close():
+            serial.closed = True
+
+        serial.close = close
+        transports.append(serial)
+        return L20LiteModbusClient(*args, **kwargs, serial_factory=lambda **_: serial)
+
+    monkeypatch.setattr(modbus_device, "L20LiteModbusClient", open_client)
+    hand = make_hand(serial_port=str(alias))
+    control = hand._legacy.connection
+    motion_client = control.get("right")
+    hand._tactile_ports["left"] = str(port)
+
+    _, results = hand.read_tactile("left", ["thumb"], budget_s=1, settle_s=0)
+
+    assert results["thumb"][0] == cells(1)
+    assert len(transports) == 1
+    serial = transports[0]
+    assert all(frame[0] == 0x28 for frame in serial.sent)
+    assert not serial.closed
+    assert control.get("right") is motion_client
+    motion_client.read_fingertip("thumb", settle_s=0)
+    assert all(frame[0] == 0x27 for frame in serial.sent[-2:])
+    control.close()
+    assert serial.closed
+
+
 def test_busy_bus_does_not_block_motion(tmp_path):
     port = tmp_path / "ttyUSB0"
     port.touch()
@@ -177,7 +215,9 @@ def test_card_matches_l20_schema_and_snapshot(monkeypatch):
     assert card["type"] == "sensor" and card["multiInstance"] is True
     assert card["title"] == "L20 Lite 触觉感知"
     assert set(card["configSchema"]["properties"]) == {"bound_side", "poll_hz"}
-    assert set(card["inputSchema"]["properties"]["action"]["enum"]) >= {"info", "start", "stop", "config"}
+    schema = card["inputSchema"]
+    assert set(schema["properties"]["action"]["enum"]) >= {"info", "start", "stop", "config", "get_state"}
+    assert schema["x-action-params"]["get_state"]["params"] == []
 
     def call(action, **kwargs):
         return bundle.dispatch("hand_tactile", {"action": action, "instance_id": "a", **kwargs})
