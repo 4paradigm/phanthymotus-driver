@@ -1,7 +1,10 @@
 """Canvas interface for the dedicated arm service on the PNP workstation."""
 from concurrent.futures import ThreadPoolExecutor
+import ipaddress
 import json
+import re
 import os
+from pathlib import Path
 import subprocess
 import threading
 
@@ -14,6 +17,12 @@ class PnpRemoteTeleopPlugin:
     def __init__(self):
         self._lock = threading.RLock()
         self._loaded = False
+        self._init = {"state": "not_initialized"}
+        self._init_thread = None
+        self._password = ""
+        self._settings = {"pnp_host": "172.16.0.200", "ssh_user": "pnp",
+                          "vendor_root": "/home/pnp/frankateleop",
+                          "conda_base": "/home/pnp/miniconda3", "auto_initialize": True}
         self._unit = "pnp-fr3-right-teleop.service"
         self._hosts = {"right": os.environ.get("FRANKA_PNP_SSH_HOST", "pnp@172.16.0.200")}
         left = os.environ.get("FRANKA_PNP_LEFT_SSH_HOST", "").strip()
@@ -24,6 +33,7 @@ class PnpRemoteTeleopPlugin:
 
     def get_tools(self):
         schema = action_schema({
+            "initialize": ([], "将镜像中的 PNP 支持代码安装或更新到主控机，不启动运动。"),
             "follow": ([], "启动已连接主臂对应的 PNP 厂家遥操流程。启动过程中从臂会移到厂家预设姿态，夹爪会执行初始化。"),
             "pause": ([], "按厂家退出顺序停止 PNP 遥操服务并确认退出。"),
             "status": ([], "读取 PNP 服务状态和厂家脚本执行阶段。"),
@@ -36,7 +46,21 @@ class PnpRemoteTeleopPlugin:
                 "on_interrupt_all": {"action": "pause"},
             },
         })
-        return [tool("teleop", "actuator", "PNP 主控机遥操", schema)]
+        definition = tool("teleop", "actuator", "PNP 主控机遥操", schema)
+        definition["configSchema"] = {
+            "type": "object",
+            "properties": {
+                "pnp_host": {"type": "string", "title": "PNP 主控机 IP", "default": "172.16.0.200"},
+                "ssh_user": {"type": "string", "title": "SSH 用户名", "default": "pnp"},
+                "ssh_password": {"type": "string", "title": "SSH 初始化密码",
+                                 "format": "password", "x-sensitive": True, "writeOnly": True,
+                                 "description": "首次安装或更新时使用；初始化后清除驱动内存中的密码。"},
+                "auto_initialize": {"type": "boolean", "title": "加载时自动初始化", "default": True},
+                "vendor_root": {"type": "string", "title": "厂家代码目录", "default": "/home/pnp/frankateleop"},
+                "conda_base": {"type": "string", "title": "Conda 目录", "default": "/home/pnp/miniconda3"},
+            },
+        }
+        return [definition]
 
     def start(self):
         pass
@@ -46,11 +70,64 @@ class PnpRemoteTeleopPlugin:
         if result.get("state") == "error":
             raise RuntimeError(result["message"])
 
+    def _configure(self, args):
+        keys = set(self._settings)
+        supplied = {key: args[key] for key in keys if key in args}
+        settings = {**self._settings, **supplied}
+        ipaddress.ip_address(settings["pnp_host"])
+        if not re.fullmatch(r"[a-z_][a-z0-9_-]*", settings["ssh_user"]):
+            raise ValueError("Invalid SSH user")
+        for key in ("vendor_root", "conda_base"):
+            if not re.fullmatch(r"/[A-Za-z0-9_./-]+", settings[key]):
+                raise ValueError("Invalid PNP installation path")
+        if type(settings["auto_initialize"]) is not bool:
+            raise ValueError("auto_initialize must be boolean")
+        changed = settings != self._settings or "ssh_password" in args
+        if changed and (self._loaded or self._init.get("state") == "initializing"):
+            raise RuntimeError("先停止卡片，再修改初始化配置")
+        self._settings = settings
+        if supplied:
+            self._hosts["right"] = settings["ssh_user"] + "@" + settings["pnp_host"]
+        if "ssh_password" in args:
+            self._password = str(args["ssh_password"])
+        if changed:
+            self._init = {"state": "not_initialized"}
+
+    def _initialize(self):
+        if self._init_thread and self._init_thread.is_alive():
+            return
+        from franka.fr3.pnp_initialize import initialize
+        self._init = {"state": "initializing", "stage": "starting"}
+        password, self._password = self._password, ""
+        settings = dict(self._settings)
+        host = self._hosts["right"]
+
+        def progress(stage):
+            with self._lock:
+                self._init = {"state": "initializing", "stage": stage}
+
+        def work():
+            try:
+                result = initialize(host, password, settings["vendor_root"],
+                                    settings["conda_base"], progress)
+            except Exception as exc:
+                message = str(exc).replace(password, "[redacted]") if password else str(exc)
+                result = {"state": "error", "message": message}
+            with self._lock:
+                self._init = result
+
+        self._init_thread = threading.Thread(target=work, name="pnp-initialize", daemon=True)
+        self._init_thread.start()
+
     def _ssh(self, side, *args):
         host = self._hosts[side]
+        from franka.fr3.pnp_initialize import paths
+        key, known = paths()
+        if not key.exists():
+            key, known = Path("/run/fr3-pnp-ssh/id_ed25519"), Path("/run/fr3-pnp-ssh/known_hosts")
         result = subprocess.run(
-            ["ssh", "-i", "/run/fr3-pnp-ssh/id_ed25519", "-o", "IdentitiesOnly=yes",
-             "-o", "UserKnownHostsFile=/run/fr3-pnp-ssh/known_hosts",
+            ["ssh", "-i", str(key), "-o", "IdentitiesOnly=yes",
+             "-o", f"UserKnownHostsFile={known}",
              "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
              "-o", "ConnectTimeout=4", "-o", "ServerAliveInterval=2",
              "-o", "ServerAliveCountMax=2", "--", host, *args],
@@ -108,6 +185,8 @@ class PnpRemoteTeleopPlugin:
         return results, errors
 
     def _status(self):
+        if self._init.get("state") == "initializing":
+            return {"state": "initializing", "initialization": dict(self._init)}
         hosts, errors = self._batch(self._hosts, self._host_status)
         for side, error in errors.items():
             hosts[side] = {"host": self._hosts[side], "state": "unreachable", "error": error}
@@ -121,7 +200,7 @@ class PnpRemoteTeleopPlugin:
                     state = candidate
                     break
         right = hosts.get("right", {})
-        return {"state": state, "hosts": hosts,
+        return {"state": state, "initialization": dict(self._init), "hosts": hosts,
                 "masters": {arm: data for entry in hosts.values()
                             for arm, data in entry.get("masters", {}).items()},
                 "remote_service": right.get("remote_service", {}),
@@ -137,15 +216,26 @@ class PnpRemoteTeleopPlugin:
     def dispatch(self, action, args):
         with self._lock:
             try:
-                if action in ("config", "info", "status"):
+                if action == "config":
+                    self._configure(args)
+                    return {"state": "configured", "initialization": dict(self._init)}
+                if action in ("info", "status"):
+                    return self._status()
+                if action == "initialize":
+                    self._configure(args)
+                    self._initialize()
                     return self._status()
                 if action == "start":
-                    self._status()
+                    self._configure(args)
                     self._loaded = True
+                    if self._settings["auto_initialize"]:
+                        self._initialize()
                     return self._status()
                 if action == "follow":
                     if not self._loaded:
                         raise RuntimeError("先启动画布项目，再执行 follow")
+                    if self._init.get("state") not in ("ready", "not_initialized"):
+                        return {"state": self._init["state"], "initialization": dict(self._init)}
                     status = self._status()
                     hosts = status["hosts"]
                     unavailable = {side: entry["error"] for side, entry in hosts.items()
@@ -174,6 +264,10 @@ class PnpRemoteTeleopPlugin:
                                 "errors": errors, "stop_errors": rollback}
                     return self._status()
                 if action in ("pause", "stop"):
+                    if self._init.get("state") == "initializing":
+                        if action == "stop":
+                            self._loaded = False
+                        return {"state": "initializing", "message": "初始化安装尚在进行；此阶段未启动遥操"}
                     _, errors = self._batch(self._hosts, self._stop_host)
                     if errors:
                         return {"state": "error", "message": "部分 PNP 遥操服务停止未确认",

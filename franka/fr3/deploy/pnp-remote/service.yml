@@ -8,6 +8,7 @@ franka-fr3:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - /opt/phanthy-motus/data/certs/cert.pem:/opt/phanthy-motus/data/certs/cert.pem:ro
     - ${FRANKA_PNP_SSH_DIR:-/home/nvidia/.ssh/fr3-pnp}:/run/fr3-pnp-ssh:ro
+    - ${FRANKA_PNP_STATE_DIR:-/home/nvidia/fr3-pnp-state}:/var/lib/fr3-pnp:rw
   environment:
     FRANKA_PNP_SSH_HOST: ${FRANKA_PNP_SSH_HOST:-pnp@172.16.0.200}
     FRANKA_PNP_LEFT_SSH_HOST: ${FRANKA_PNP_LEFT_SSH_HOST:-}

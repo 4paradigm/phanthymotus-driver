@@ -5,6 +5,8 @@ runtime="$HOME/.local/lib/fr3-pnp"
 exec 9>"$runtime/control.lock"
 flock -x 9
 case "${SSH_ORIGINAL_COMMAND:-}" in
+  'pnp-package-version')
+    test -f "$runtime/package.sha256" && cat "$runtime/package.sha256" ;;
   'systemctl --user show pnp-fr3-right-teleop.service -p LoadState -p ActiveState -p SubState -p Result')
     /usr/bin/systemctl show "$unit" -p LoadState -p ActiveState -p SubState -p Result -p MainPID -p ControlPID
     python3 "$runtime/run_right.py" --detect

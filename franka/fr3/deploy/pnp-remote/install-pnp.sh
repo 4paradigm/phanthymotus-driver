@@ -2,6 +2,12 @@
 # Install the image's PNP support package on the machine attached to the masters.
 set -eu
 cd "$(dirname "$0")"
+if [ "${PNP_INSTALL_STDIN_PASSWORD:-0}" = 1 ]; then
+    IFS= read -r pnp_install_password
+    sudo() {
+        printf '%s\n' "$pnp_install_password" | command sudo -S -p '' "$@"
+    }
+fi
 runtime="$HOME/.local/lib/fr3-pnp"
 unit=pnp-fr3-right-teleop.service
 vendor=${PNP_VENDOR_ROOT:-$HOME/frankateleop}

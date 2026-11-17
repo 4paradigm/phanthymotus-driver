@@ -1,6 +1,6 @@
 # PNP FR3 teleoperation
 
-The Orin card offers `follow`, `pause`, and `status`. The PNP service starts
+The Orin card offers `initialize`, `follow`, `pause`, and `status`. The PNP service starts
 the four installed vendor launchers for each selected side in order. The vendor initializer
 moves the arm to its configured pose and initializes the Hand during `follow`.
 
@@ -65,3 +65,24 @@ host route to 172.16.0.200 on eno1. The card's default SSH destination is now
 `pnp@172.16.0.200`. Use `FRANKA_PNP_SSH_HOST` for another workstation.
 Validate its SSH host key and check `ip route get <PNP_IP>` before changing
 the destination. FCI runs locally between PNP and the Franka controllers.
+
+
+## Initialize from the canvas
+
+Fill in the workstation IP, SSH username, initial SSH password, vendor tree
+and Conda base directory. With automatic initialization enabled, loading the
+card starts an asynchronous install. `status` returns `initialization.state`
+and the current stage. It checks the package version, installs the image's
+support sources, configures the service and limited sudo rule, authorizes a
+restricted service key, and verifies key login. Installation never starts the
+robot service. Execute `follow` after initialization reports `ready`.
+
+The driver keeps the private service key and known host keys in the writable
+`/var/lib/fr3-pnp` volume. Keep this volume across image replacements.
+The first connection records the SSH host key (OpenSSH accept-new). A changed
+key is rejected and needs verification before updating the trust file.
+Passwords are marked sensitive in the card schema, excluded from returned
+configuration and logs, and cleared from driver memory after an attempt.
+Canvas-side persistence and request logging depend on the Core implementation.
+The initial login must permit SSH password authentication and sudo using the
+same password. Initialization requires the PNP vendor runtime already installed.
