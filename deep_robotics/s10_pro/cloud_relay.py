@@ -125,7 +125,10 @@ def ssh_command(config, topic):
         raise ValueError('cloud relay requires an absolute ROS topic')
     domain = int(config.get('ros', {}).get('robot_domain_id', 0))
     encoded = base64.b64encode(Path(__file__).read_bytes()).decode('ascii')
-    python = ['python3', '-u', '-c', f'exec(__import__("base64").b64decode("{encoded}"))',
+    bootstrap = (f'source=__import__("base64").b64decode("{encoded}"); '
+                 'scope={"__name__":"s10_cloud_transport"}; exec(source,scope); '
+                 'raise SystemExit(scope["remote_transport"](source,__import__("sys").argv[1:]))')
+    python = ['python3', '-u', '-c', bootstrap,
               '--topic', topic, '--domain', str(domain)]
     setup = ('set -e; source /opt/ros/jazzy/setup.bash 1>&2; '
              'export PYTHONDONTWRITEBYTECODE=1 ROS_LOCALHOST_ONLY=1; exec ' + shlex.join(python))
@@ -266,20 +269,51 @@ class CloudRelay:
             self._closed.wait(1.)
 
 
+def remote_transport(source, arguments):
+    """Forward only the reader's dedicated pipe to the private SSH channel."""
+    reader, writer = os.pipe()
+    try:
+        code = ('scope={"__name__":"s10_cloud_reader"}; '
+                f'exec({source!r},scope); raise SystemExit(scope["remote_main"]())')
+        try:
+            process = subprocess.Popen([sys.executable, '-u', '-c', code, *arguments,
+                '--output-fd', str(writer)], stdin=sys.stdin.buffer,
+                stdout=sys.stderr, stderr=sys.stderr, pass_fds=(writer,))
+        finally:
+            os.close(writer)
+        try:
+            while True:
+                chunk = os.read(reader, 65536)
+                if not chunk:
+                    return process.wait()
+                view = memoryview(chunk)
+                while view:
+                    count = os.write(sys.stdout.fileno(), view)
+                    if not count:
+                        raise BrokenPipeError('SSH cloud transport closed')
+                    view = view[count:]
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=1.)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1.)
+    finally:
+        os.close(reader)
+
+
 def remote_main():
     import argparse
-    # SSH-only entrypoint on NOS, never called in the driver container. Its
-    # stdout is a private binary transport pipe (Popen(stdout=PIPE)), not the
-    # container log. Preserve that pipe for the sole packet writer before ROS
-    # imports; Python/native diagnostics go to the separate SSH stderr stream.
-    # Do not apply logsafe to this binary stream or remove this isolation merely
-    # to follow the container-log rule: either would corrupt cloud packets.
-    output = os.fdopen(os.dup(sys.stdout.fileno()), 'wb', buffering=0)
-    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     parser = argparse.ArgumentParser()
     parser.add_argument('--topic', required=True)
     parser.add_argument('--domain', type=int, default=0)
+    parser.add_argument('--output-fd', type=int, required=True)
     args = parser.parse_args()
+    if args.output_fd <= 2:
+        parser.error('cloud protocol requires a dedicated output descriptor')
+    output = os.fdopen(args.output_fd, 'wb', buffering=0)
     import rclpy
     from sensor_msgs.msg import PointCloud2
     from rclpy.node import Node
@@ -342,4 +376,4 @@ def remote_main():
 
 
 if __name__ == '__main__':
-    raise SystemExit(remote_main())
+    raise SystemExit(remote_transport(Path(__file__).read_bytes(), sys.argv[1:]))

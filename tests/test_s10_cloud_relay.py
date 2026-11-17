@@ -4,6 +4,7 @@ import io
 import json
 import os
 import select
+import shlex
 import struct
 import subprocess
 import sys
@@ -243,12 +244,13 @@ def test_partial_response_deadline_reconnects_instead_of_waiting_forever(monkeyp
     assert all(p.poll() is not None for p in children)
 
 
-def test_remote_reader_waits_for_credit_keeps_latest_and_shuts_down_on_eof(tmp_path):
+@pytest.mark.parametrize('launch', ['file', 'ssh-bootstrap'])
+def test_remote_reader_waits_for_credit_keeps_latest_and_shuts_down_on_eof(tmp_path, launch):
     # Fake only the unavailable ROS dependency; execute the real remote entry point.
     ros = tmp_path / 'rclpy'
     ros.mkdir()
     (ros / '__init__.py').write_text('''
-import sys,time,struct
+import os,sys,time,struct
 from types import SimpleNamespace as NS
 callback=None
 sequence=0
@@ -287,6 +289,8 @@ def spin_once(node,timeout_sec):
           width=1,height=1,point_step=12,row_step=12,is_bigendian=False,is_dense=True,
           data=struct.pack('<fff',sequence,2,3)))
         print('ROS_LOG_NOISE',flush=True)
+        os.write(1, b'NATIVE_ROS_STDOUT\\n')
+        os.write(2, b'NATIVE_ROS_STDERR\\n')
         if sequence==8: print('LATEST_READY',file=sys.stderr,flush=True)
     time.sleep(.01)
 def shutdown():
@@ -308,8 +312,13 @@ class DurabilityPolicy:VOLATILE='volatile'
     (sensor / '__init__.py').write_text('')
     (sensor / 'msg.py').write_text('class PointCloud2: pass\n')
     env = {**os.environ, 'PYTHONPATH': str(tmp_path)}
-    process = subprocess.Popen([sys.executable, '-u', relay_module().__file__,
-        '--topic', '/LIDAR/POINTS'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    command = [sys.executable, '-u', relay_module().__file__, '--topic', '/LIDAR/POINTS']
+    if launch == 'ssh-bootstrap':
+        ssh_args, _ = relay_module().ssh_command({}, '/LIDAR/POINTS')
+        setup = shlex.split(ssh_args[-1])[-1]
+        command = shlex.split(setup.split('; exec ', 1)[1])
+        command[0] = sys.executable
+    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, bufsize=0, env=env)
     errors = []
     try:
@@ -331,6 +340,9 @@ class DurabilityPolicy:VOLATILE='volatile'
         assert process.wait(timeout=3) == 0
         tail = process.stderr.read()
         assert b'NODE_DESTROYED' in tail and b'ROS_SHUTDOWN' in tail
+        diagnostics = b''.join(errors) + tail
+        assert b'ROS_LOG_NOISE' in diagnostics
+        assert b'NATIVE_ROS_STDOUT' in diagnostics and b'NATIVE_ROS_STDERR' in diagnostics
     finally:
         if process.poll() is None:
             process.kill()
@@ -339,9 +351,8 @@ class DurabilityPolicy:VOLATILE='volatile'
         process.stderr.close()
 
 
-def test_remote_entrypoint_isolates_native_and_python_noise_from_binary_pipe():
-    # This is the remote SSH process, not the driver's container stdout. Exercise
-    # real descriptors and the actual entrypoint; stub only the unavailable ROS.
+def test_remote_reader_uses_explicit_protocol_fd_without_changing_standard_descriptors():
+    # Exercise real pipes; stub only the unavailable ROS dependency.
     script = r'''
 import builtins, os, sys, time
 from types import SimpleNamespace as NS
@@ -367,12 +378,51 @@ def noisy_import(name, *a, **k):
         os.write(2, b'native stderr diagnostic\n')
     return original_import(name, *a, **k)
 builtins.__import__ = noisy_import
-sys.argv = ['reader', '--topic', '/LIDAR/POINTS']
+def forbid_standard_descriptor_surgery(*args, **kwargs):
+    raise AssertionError('do not duplicate or replace standard descriptors')
+os.dup = os.dup2 = forbid_standard_descriptor_surgery
 remote_main()
 '''
-    result = subprocess.run([sys.executable, '-u', '-c', script], input=b'N\n',
-                            capture_output=True, timeout=5, check=True)
-    assert result.stdout == packet({'kind': 'idle', 'topic': '/LIDAR/POINTS'}, b'')
-    assert b'python diagnostic\n' in result.stderr
-    assert b'native stdout diagnostic\n' in result.stderr
+    reader, writer = os.pipe()
+    try:
+        result = subprocess.run([sys.executable, '-u', '-c', script,
+            '--topic', '/LIDAR/POINTS', '--output-fd', str(writer)], input=b'N\n',
+            capture_output=True, pass_fds=(writer,), timeout=5)
+        assert result.returncode == 0, result.stderr.decode()
+        os.close(writer)
+        writer = None
+        assert os.read(reader, 4096) == packet({'kind': 'idle', 'topic': '/LIDAR/POINTS'}, b'')
+    finally:
+        os.close(reader)
+        if writer is not None:
+            os.close(writer)
+    assert b'python diagnostic\n' in result.stdout
+    assert b'native stdout diagnostic\n' in result.stdout
     assert b'native stderr diagnostic\n' in result.stderr
+
+
+@pytest.mark.parametrize('exit_code', [0, 23])
+def test_transport_forwards_large_binary_data_and_preserves_child_exit_status(exit_code):
+    source = f'''
+def remote_main():
+    import argparse, os, sys
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--output-fd', type=int)
+    args = parser.parse_args()
+    print('python diagnostic', flush=True)
+    os.write(1, b'native stdout diagnostic\\n')
+    os.write(2, b'native stderr diagnostic\\n')
+    assert sys.stdin.buffer.readline() == b'N\\n'
+    with os.fdopen(args.output_fd, 'wb') as output:
+        output.write(bytes(range(256)) * 8192)
+    return {exit_code}
+'''
+    script = ('from deep_robotics.s10_pro.cloud_relay import remote_transport; '
+              f'raise SystemExit(remote_transport({source!r}, []))')
+    result = subprocess.run([sys.executable, '-u', '-c', script], input=b'N\n',
+                            capture_output=True, timeout=5)
+    assert result.returncode == exit_code
+    assert result.stdout == bytes(range(256)) * 8192
+    assert b'python diagnostic' in result.stderr
+    assert b'native stdout diagnostic' in result.stderr
+    assert b'native stderr diagnostic' in result.stderr

@@ -33,9 +33,11 @@ COPY --from=drdds-builder /s10_pro_ws/install/ /s10_pro_ws/install/
 COPY requirements.txt /tmp/s10-pro-requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/s10-pro-requirements.txt && rm /tmp/s10-pro-requirements.txt
 WORKDIR /work
+COPY monocular_depth.py /work/deep_robotics/s10_pro/
+ARG S10_DEPTH_MODEL_URL=https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-depth.onnx
+RUN python3 -m deep_robotics.s10_pro.monocular_depth --model-url "${S10_DEPTH_MODEL_URL}"
 COPY common/ /work/common/
-COPY main.py device.py basic_server.py domain_bridge.py loco_servo.py spatial.py media_workers.py undistortion.py front_depth.py depth_projection.py depth_fusion.py monocular_depth.py cloud_relay.py audio.py config.yaml driver.yaml /work/deep_robotics/s10_pro/
-RUN python3 -m deep_robotics.s10_pro.monocular_depth
+COPY main.py device.py basic_server.py domain_bridge.py loco_servo.py spatial.py media_workers.py undistortion.py front_depth.py depth_projection.py depth_fusion.py cloud_relay.py audio.py config.yaml driver.yaml /work/deep_robotics/s10_pro/
 COPY resource/S10_kinematic.urdf /work/deep_robotics/s10_pro/resource/S10_kinematic.urdf
 COPY resource/ssh_known_hosts /work/deep_robotics/s10_pro/resource/ssh_known_hosts
 COPY resource/calibration/ /work/deep_robotics/s10_pro/resource/calibration/

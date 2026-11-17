@@ -26,6 +26,9 @@ def test_model_download_heartbeats_while_blocked_and_preserves_result(
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path != '/model':
+                self.send_error(404)
+                return
             if hold_headers:
                 release.wait(30)
             self.send_response(status)
@@ -45,12 +48,12 @@ def test_model_download_heartbeats_while_blocked_and_preserves_result(
 import sys, time, traceback
 from pathlib import Path
 from deep_robotics.s10_pro import monocular_depth as model
-model.MODEL_URL = 'http://127.0.0.1:{server.server_port}/model'
+model.MODEL_URL = 'http://127.0.0.1:{server.server_port}/wrong-default'
 model.MODEL_PATH = Path({str(model_path)!r})
 model.MODEL_SHA256 = {hashlib.sha256(b'model').hexdigest()!r}
 model.DOWNLOAD_HEARTBEAT_SECONDS = .03
 try:
-    model.download_model()
+    model.download_model(url='http://127.0.0.1:{server.server_port}/model')
 except Exception:
     traceback.print_exc()
     result = 1
@@ -96,6 +99,30 @@ sys.exit(result)
 def test_missing_model_has_an_explicit_error(tmp_path):
     with pytest.raises(ValueError, match='model.*missing'):
         MonocularDepth(tmp_path / 'absent.onnx')
+
+
+def test_model_download_cli_uses_the_requested_artifact_url():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_error(503 if self.path == '/requested-model' else 404)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        result = subprocess.run([sys.executable, '-m', 'deep_robotics.s10_pro.monocular_depth',
+            '--model-url', f'http://127.0.0.1:{server.server_port}/requested-model'],
+            capture_output=True, timeout=10, cwd=Path(__file__).resolve().parents[1])
+        assert result.returncode != 0
+        assert b'HTTP Error 503' in result.stderr
+        assert b'download verified and saved' not in result.stdout
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=3)
 
 
 def test_wrong_model_checksum_is_rejected_before_runtime_loading(tmp_path):

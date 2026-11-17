@@ -16,7 +16,7 @@ MODEL_PATH = Path(__file__).with_name('resource') / 'models' / 'yolo26n-depth.on
 DOWNLOAD_HEARTBEAT_SECONDS = 30
 
 
-def download_model():
+def download_model(url=None):
     """Bake a checked artifact into the driver image; never download on start."""
     stopped = threading.Event()
     started = time.monotonic()
@@ -30,7 +30,7 @@ def download_model():
     worker = threading.Thread(target=heartbeat, name='s10-model-download-heartbeat', daemon=True)
     worker.start()
     try:
-        with urllib.request.urlopen(MODEL_URL, timeout=120) as response:
+        with urllib.request.urlopen(MODEL_URL if url is None else url, timeout=120) as response:
             payload = response.read(64 * 1024 * 1024 + 1)
         if len(payload) > 64 * 1024 * 1024 or hashlib.sha256(payload).hexdigest() != MODEL_SHA256:
             raise ValueError('monocular model download checksum mismatch')
@@ -92,4 +92,8 @@ class MonocularDepth:
 
 
 if __name__ == '__main__':
-    download_model()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model-url', default=MODEL_URL)
+    download_model(parser.parse_args().model_url)
