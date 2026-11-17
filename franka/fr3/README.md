@@ -12,6 +12,13 @@ external RealSense cameras over USB. It registers with Agent Core as
 | `gripper` | Actuator | Franka Hand opening, grasp, calibration, and stop |
 | `ext_camera` | Sensor | RGB, depth, or left near-infrared from a selected RealSense |
 
+## PNP teleoperation
+
+The PNP variant exposes `teleop` with `follow`, `pause`, and `status`.
+It starts the installed vendor scripts on the PNP workstation, including
+their startup movements. Both known USB masters may share one workstation.
+See [PNP deployment](deploy/pnp-remote/README.md).
+
 ## Requirements
 
 - ARM64 Jetson with an ARM64 ROS 2 Humble driver image and a running Agent Core.

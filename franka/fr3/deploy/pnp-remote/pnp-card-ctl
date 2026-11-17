@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+unit=pnp-fr3-right-teleop.service
+runtime="$HOME/.local/lib/fr3-pnp"
+exec 9>"$runtime/control.lock"
+flock -x 9
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  'systemctl --user show pnp-fr3-right-teleop.service -p LoadState -p ActiveState -p SubState -p Result')
+    /usr/bin/systemctl show "$unit" -p LoadState -p ActiveState -p SubState -p Result -p MainPID -p ControlPID
+    python3 "$runtime/run_right.py" --detect
+    if test -f "$runtime/execution.json"; then
+      python3 "$runtime/execution_status.py"
+    fi ;;
+  'pnp-follow-right'|'pnp-follow-left'|'pnp-follow-both')
+    state=$(/usr/bin/systemctl show "$unit" -p ActiveState --value)
+    if test "$state" != inactive && test "$state" != failed; then
+      echo 'Stop the PNP service before starting the vendor sequence' >&2
+      exit 1
+    fi
+    rm -f "$runtime/execution.json" "$runtime/execution-left.json" "$runtime/execution-right.json"
+    printf '%s\n' "${SSH_ORIGINAL_COMMAND#pnp-follow-}" > "$runtime/requested-arm"
+    if ! sudo -n /usr/bin/systemctl start "$unit"; then
+      rm -f "$runtime/requested-arm"
+      exit 1
+    fi ;;
+  'systemctl --user stop pnp-fr3-right-teleop.service')
+    sudo -n /usr/bin/systemctl stop "$unit"
+    rm -f "$runtime/execution.json" "$runtime/execution-left.json" "$runtime/execution-right.json" ;;
+  *) echo 'Only right-arm service status, start and stop are allowed' >&2; exit 1 ;;
+esac

@@ -13,5 +13,6 @@ cards:
   - { name: joint_states, type: sensor }
   - { name: model, type: resource }
   - { name: joint_control, type: actuator }
+  - { name: teleop, type: actuator }
   - { name: ext_camera, type: sensor }
   - { name: gripper, type: actuator }
