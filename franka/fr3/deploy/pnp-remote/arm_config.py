@@ -1,5 +1,7 @@
 """USB identities and ports from the installed PNP vendor configuration."""
 from dataclasses import dataclass
+import ipaddress
+import json
 import os
 from pathlib import Path
 
@@ -17,9 +19,13 @@ class Arm:
         return serial_dir / f"usb-FTDI_USB__-__Serial_Converter_{self.serial}-if00-port0"
 
 
+CONFIG = Path(__file__).with_name("robot_ips.json")
+ROBOT_IPS = json.loads(CONFIG.read_text()) if CONFIG.is_file() else {}
+for address in ROBOT_IPS.values():
+    ipaddress.IPv4Address(address)
 ARMS = {
-    "right": Arm("right", "FTBMDRZS", "172.16.0.2", 50051, 50053, 6001),
-    "left": Arm("left", "FTB57FAR", "172.16.0.3", 50052, 50054, 6002),
+    "right": Arm("right", "FTBMDRZS", ROBOT_IPS.get("right", "172.16.0.2"), 50051, 50053, 6001),
+    "left": Arm("left", "FTB57FAR", ROBOT_IPS.get("left", "172.16.0.3"), 50052, 50054, 6002),
 }
 SERIAL_DIR = Path("/dev/serial/by-id")
 

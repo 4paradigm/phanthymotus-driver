@@ -5,6 +5,16 @@ runtime="$HOME/.local/lib/fr3-pnp"
 exec 9>"$runtime/control.lock"
 flock -x 9
 case "${SSH_ORIGINAL_COMMAND:-}" in
+  'pnp-discover')
+    python3 - "$runtime" <<'DETECT'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from arm_config import detect
+arms = detect()
+print("PNP_PROBE=" + json.dumps({"vendor_ready": True, "masters": [arms[side]["ready"] for side in ("right", "left")]}))
+DETECT
+    ;;
   'pnp-package-version')
     test -f "$runtime/package.sha256" && cat "$runtime/package.sha256" ;;
   'systemctl --user show pnp-fr3-right-teleop.service -p LoadState -p ActiveState -p SubState -p Result')

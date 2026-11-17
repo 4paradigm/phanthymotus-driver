@@ -86,3 +86,19 @@ configuration and logs, and cleared from driver memory after an attempt.
 Canvas-side persistence and request logging depend on the Core implementation.
 The initial login must permit SSH password authentication and sudo using the
 same password. Initialization requires the PNP vendor runtime already installed.
+
+
+## Wired discovery and slave IP configuration
+
+Leave PNP host IP empty for automatic discovery. Orin sends ARP requests on
+active wired interfaces within the /24 networks derived from the slave IPs.
+It excludes its own addresses and both slave controllers, checks SSH, and
+verifies both known USB masters after login. A unique matching host is selected.
+Credentials are required for a new host. Discovery identifies USB connectivity;
+the masters do not stream joint telemetry over Ethernet before teleoperation.
+Multiple matches stop initialization and require an explicit PNP address.
+
+Host networking, NET_RAW and NET_ADMIN are required for ARP discovery and
+per-candidate wired host routes. Configure distinct right and left slave IPs.
+The installer stores them in the PNP runtime and passes IP overrides to the
+vendor launchers. Original vendor configuration files are retained.

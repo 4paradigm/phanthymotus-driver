@@ -2,6 +2,9 @@ franka-fr3:
   container_name: embodied-franka-fr3-pnp-remote
   image: __IMAGE__
   network_mode: host
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
   extra_hosts:
     - phanthy-motus:127.0.0.1
   volumes:

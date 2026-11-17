@@ -8,3 +8,10 @@ python3() {
         command python3 "$@"
     fi
 }
+
+launch_robot.py() {
+    command launch_robot.py "$@" "robot_client.executable_cfg.robot_ip=$FR3_ROBOT_IP"
+}
+launch_gripper.py() {
+    command launch_gripper.py "$@" "gripper.executable_cfg.robot_ip=$FR3_ROBOT_IP"
+}

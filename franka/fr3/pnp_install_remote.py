@@ -1,5 +1,5 @@
 """Receive and install the authenticated image support package."""
-import base64, hashlib, json, os
+import base64, ipaddress, json, os
 from pathlib import Path
 import subprocess, sys, tempfile
 data = json.load(sys.stdin)
@@ -46,5 +46,13 @@ with tempfile.TemporaryDirectory(prefix="fr3-card-install-") as directory:
     pending.write_text("".join(lines).rstrip("\n") + "\n" + entry)
     pending.chmod(0o600)
     pending.replace(authorized)
+    robot_ips = data["slave_ips"]
+    if set(robot_ips) != {"left", "right"} or len(set(robot_ips.values())) != 2:
+        raise ValueError("Two distinct slave IP addresses are required")
+    for address in robot_ips.values():
+        ipaddress.IPv4Address(address)
+    pending_config = runtime / ".robot_ips.json"
+    pending_config.write_text(json.dumps(robot_ips))
+    pending_config.replace(runtime / "robot_ips.json")
     (runtime / "package.sha256").write_text(data["version"] + "\n")
 print("PNP_INITIALIZED")

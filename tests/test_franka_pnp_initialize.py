@@ -15,9 +15,9 @@ class InitializationTests(TestCase):
 
     def test_start_installs_without_follow(self):
         p=PnpRemoteTeleopPlugin()
-        p.dispatch('config', {'ssh_password':'test-secret'})
+        p.dispatch('config', {'ssh_password':'test-secret', 'pnp_host':'172.16.0.200'})
         entered, release=threading.Event(),threading.Event()
-        def install(host,password,progress):
+        def install(host,password,progress,**kwargs):
             entered.set()
             release.wait(2)
             return {'state':'ready'}
@@ -33,7 +33,7 @@ class InitializationTests(TestCase):
 
     def test_failure_redacts_password(self):
         p=PnpRemoteTeleopPlugin()
-        p.dispatch('config',{'ssh_password':'test-secret'})
+        p.dispatch('config',{'ssh_password':'test-secret', 'pnp_host':'172.16.0.200'})
         with patch.object(pnp_initialize,'initialize', side_effect=RuntimeError('test-secret failed')):
             p.dispatch('initialize',{})
             p._init_thread.join(3)

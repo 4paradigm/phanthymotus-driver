@@ -20,8 +20,8 @@ class PnpRemoteTeleopPlugin:
         self._init = {"state": "not_initialized"}
         self._init_thread = None
         self._password = ""
-        self._settings = {"pnp_host": "172.16.0.200", "ssh_user": "pnp",
-                          "auto_initialize": True}
+        self._settings = {"pnp_host": "", "ssh_user": "pnp", "right_slave_ip": "172.16.0.2",
+                          "left_slave_ip": "172.16.0.3", "auto_initialize": True}
         self._unit = "pnp-fr3-right-teleop.service"
         self._hosts = {"right": os.environ.get("FRANKA_PNP_SSH_HOST", "pnp@172.16.0.200")}
         left = os.environ.get("FRANKA_PNP_LEFT_SSH_HOST", "").strip()
@@ -32,10 +32,10 @@ class PnpRemoteTeleopPlugin:
 
     def get_tools(self):
         schema = action_schema({
-            "initialize": ([], "将镜像中的 PNP 支持代码安装或更新到主控机，不启动运动。"),
-            "follow": ([], "启动已连接主臂对应的 PNP 厂家遥操流程。启动过程中从臂会移到厂家预设姿态，夹爪会执行初始化。"),
-            "pause": ([], "按厂家退出顺序停止 PNP 遥操服务并确认退出。"),
-            "status": ([], "读取 PNP 服务状态和厂家脚本执行阶段。"),
+            "initialize": ([], "Install or update the PNP support package without starting motion."),
+            "follow": ([], "Start vendor teleoperation for connected masters. Startup moves slave arms and initializes grippers."),
+            "pause": ([], "Stop PNP teleoperation in reverse vendor startup order and verify shutdown."),
+            "status": ([], "Read PNP service states and vendor execution stages."),
         }, {})
         schema.update({
             "x-resource": "arm",
@@ -45,16 +45,21 @@ class PnpRemoteTeleopPlugin:
                 "on_interrupt_all": {"action": "pause"},
             },
         })
-        definition = tool("teleop", "actuator", "PNP 主控机遥操", schema)
+        definition = tool("teleop", "actuator", "PNP master teleoperation", schema)
         definition["configSchema"] = {
             "type": "object",
             "properties": {
-                "pnp_host": {"type": "string", "title": "PNP 主控机 IP", "default": "172.16.0.200"},
-                "ssh_user": {"type": "string", "title": "SSH 用户名", "default": "pnp"},
-                "ssh_password": {"type": "string", "title": "SSH 初始化密码",
+                "pnp_host": {"type": "string", "title": "PNP host IP (optional)", "default": "",
+                             "description": "Leave empty to discover a wired PNP host with both master USB devices."},
+                "right_slave_ip": {"type": "string", "title": "Right FR3 slave IP", "default": "172.16.0.2",
+                                   "description": "FCI address of the right Franka controller."},
+                "left_slave_ip": {"type": "string", "title": "Left FR3 slave IP", "default": "172.16.0.3",
+                                  "description": "FCI address of the left Franka controller."},
+                "ssh_user": {"type": "string", "title": "SSH username", "default": "pnp"},
+                "ssh_password": {"type": "string", "title": "SSH initialization password",
                                  "format": "password", "x-sensitive": True, "writeOnly": True,
-                                 "description": "首次安装或更新时使用；初始化后清除驱动内存中的密码。"},
-                "auto_initialize": {"type": "boolean", "title": "加载时自动初始化", "default": True},
+                                 "description": "Used for installation or updates; removed from driver memory after initialization."},
+                "auto_initialize": {"type": "boolean", "title": "Initialize automatically on load", "default": True},
             },
         }
         return [definition]
@@ -71,7 +76,12 @@ class PnpRemoteTeleopPlugin:
         keys = set(self._settings)
         supplied = {key: args[key] for key in keys if key in args}
         settings = {**self._settings, **supplied}
-        ipaddress.ip_address(settings["pnp_host"])
+        if settings["pnp_host"]:
+            ipaddress.IPv4Address(settings["pnp_host"])
+        for key in ("right_slave_ip", "left_slave_ip"):
+            ipaddress.IPv4Address(settings[key])
+        if settings["right_slave_ip"] == settings["left_slave_ip"]:
+            raise ValueError("Left and right slave IP addresses must be different")
         if not re.fullmatch(r"[a-z_][a-z0-9_-]*", settings["ssh_user"]):
             raise ValueError("Invalid SSH user")
         if type(settings["auto_initialize"]) is not bool:
@@ -80,7 +90,7 @@ class PnpRemoteTeleopPlugin:
         if changed and (self._loaded or self._init.get("state") == "initializing"):
             raise RuntimeError("先停止卡片，再修改初始化配置")
         self._settings = settings
-        if supplied:
+        if settings["pnp_host"]:
             self._hosts["right"] = settings["ssh_user"] + "@" + settings["pnp_host"]
         if "ssh_password" in args:
             self._password = str(args["ssh_password"])
@@ -93,6 +103,7 @@ class PnpRemoteTeleopPlugin:
         from franka.fr3.pnp_initialize import initialize
         self._init = {"state": "initializing", "stage": "starting"}
         password, self._password = self._password, ""
+        settings = dict(self._settings)
         host = self._hosts["right"]
 
         def progress(stage):
@@ -101,7 +112,16 @@ class PnpRemoteTeleopPlugin:
 
         def work():
             try:
-                result = initialize(host, password, progress)
+                slave_ips = {"right": settings["right_slave_ip"], "left": settings["left_slave_ip"]}
+                selected_host = host
+                if not settings["pnp_host"]:
+                    from franka.fr3.pnp_discovery import discover
+                    address = discover(slave_ips, settings["ssh_user"], password, progress)
+                    selected_host = settings["ssh_user"] + "@" + address
+                result = initialize(selected_host, password, progress, slave_ips=slave_ips)
+                with self._lock:
+                    self._hosts["right"] = selected_host
+                result["pnp_host"] = selected_host.split("@", 1)[1]
             except Exception as exc:
                 message = str(exc).replace(password, "[redacted]") if password else str(exc)
                 result = {"state": "error", "message": message}

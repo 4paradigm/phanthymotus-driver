@@ -46,6 +46,8 @@ def run_vendor(arm):
     env["PATH"] = os.pathsep.join((str(runtime / "vendor-bin"),
                                   str(Path(os.environ.get("PNP_CONDA_BASE", str(Path.home() / "miniconda3"))) / "bin"), env["PATH"]))
     env["PYTHONUNBUFFERED"] = "1"
+    env["FR3_ROBOT_IP"] = arm.robot_ip
+    env["BASH_ENV"] = str(runtime / "vendor-follow-env.sh")
     for name in SCRIPTS:
         if not (vendor / name).is_file():
             raise RuntimeError(f"Missing PNP script: {name}")
