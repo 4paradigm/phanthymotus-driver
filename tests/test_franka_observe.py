@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 import sys
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -105,6 +106,30 @@ class ObserveTests(unittest.TestCase):
         p.profiles['left']['planning']['handeye']['robot_ip']='172.16.0.3'
         self.assertEqual(p.dispatch('config',{'arm':'172.16.0.2（左手）'})['code'],'INVALID_CONFIG')
         self.assertEqual(p.address,'172.16.0.3')
+
+    def test_observe_returns_immediately_and_posts_one_completion(self):
+        p = self.plugin()
+        p.enabled = True
+        p.arm_ip_input.topic = '/franka/arm_ip_sync'
+        p.arm_ip_input.receive('{"left":"172.16.0.2","right":"172.16.0.3"}')
+        entered, release = threading.Event(), threading.Event()
+        def observe(active):
+            entered.set()
+            release.wait(2)
+            return 'completed', {'objects': []}
+        with mock.patch.object(p, 'run_observation', side_effect=observe):
+            accepted = p.dispatch('observe', {'confirm_motion': True})
+            self.assertEqual(accepted['state'], 'running')
+            self.assertTrue(entered.wait(1))
+            self.assertFalse(self.completions)
+            release.set()
+            deadline = time.monotonic() + 2
+            while p.active and time.monotonic() < deadline:
+                time.sleep(.01)
+        self.assertEqual(len(self.completions), 1)
+        self.assertEqual(self.completions[0][0], accepted['action_id'])
+        self.assertEqual(p.last_result['state'], 'completed')
+        self.assertIn('observe', p.get_tools()[0]['inputSchema']['x-completion']['actions'])
 
 
 if __name__ == '__main__': unittest.main()
