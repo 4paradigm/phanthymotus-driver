@@ -2,6 +2,8 @@
 import hashlib
 import io
 from pathlib import Path
+import threading
+import time
 import urllib.request
 import zlib
 
@@ -11,16 +13,33 @@ import numpy as np
 MODEL_URL = 'https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-depth.onnx'
 MODEL_SHA256 = '6583ec12521a7e75eacb209db63393158c7e0e772cda9fdad8c8c0fe74af2a1e'
 MODEL_PATH = Path(__file__).with_name('resource') / 'models' / 'yolo26n-depth.onnx'
+DOWNLOAD_HEARTBEAT_SECONDS = 30
 
 
 def download_model():
     """Bake a checked artifact into the driver image; never download on start."""
-    with urllib.request.urlopen(MODEL_URL, timeout=120) as response:
-        payload = response.read(64 * 1024 * 1024 + 1)
-    if len(payload) > 64 * 1024 * 1024 or hashlib.sha256(payload).hexdigest() != MODEL_SHA256:
-        raise ValueError('monocular model download checksum mismatch')
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    MODEL_PATH.write_bytes(payload)
+    stopped = threading.Event()
+    started = time.monotonic()
+
+    def heartbeat():
+        while not stopped.wait(DOWNLOAD_HEARTBEAT_SECONDS):
+            elapsed = int(time.monotonic() - started)
+            print(f'[s10 model] waiting for download/verification ({elapsed}s elapsed)', flush=True)
+
+    print('[s10 model] downloading yolo26n-depth.onnx; SHA-256 verification required', flush=True)
+    worker = threading.Thread(target=heartbeat, name='s10-model-download-heartbeat', daemon=True)
+    worker.start()
+    try:
+        with urllib.request.urlopen(MODEL_URL, timeout=120) as response:
+            payload = response.read(64 * 1024 * 1024 + 1)
+        if len(payload) > 64 * 1024 * 1024 or hashlib.sha256(payload).hexdigest() != MODEL_SHA256:
+            raise ValueError('monocular model download checksum mismatch')
+        MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        MODEL_PATH.write_bytes(payload)
+    finally:
+        stopped.set()
+        worker.join()
+    print('[s10 model] download verified and saved', flush=True)
 
 
 class MonocularDepth:
