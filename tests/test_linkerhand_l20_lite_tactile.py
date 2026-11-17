@@ -172,6 +172,63 @@ def test_tactile_and_control_share_serial_across_port_aliases(monkeypatch, tmp_p
     assert serial.closed
 
 
+def test_tactile_serial_error_retires_port_until_control_releases(monkeypatch, tmp_path):
+    port = tmp_path / "ttyUSB0"
+    port.touch()
+    transports = []
+
+    def open_client(*args, **kwargs):
+        serial = TactileSerial()
+        serial.close_count = 0
+
+        def close():
+            serial.close_count += 1
+
+        serial.close = close
+        transports.append(serial)
+        return L20LiteModbusClient(*args, **kwargs, serial_factory=lambda **_: serial)
+
+    monkeypatch.setattr(modbus_device, "L20LiteModbusClient", open_client)
+    hand = make_hand(serial_port=str(port))
+    control = hand._legacy.connection
+    control_client = control.get("right")
+    gesture = hand._connection(side="right", serial_port=str(port))
+    gesture.get()
+    hand._tactile_ports["left"] = str(port)
+    old_port = transports[0]
+    original_write = old_port.write
+
+    def fail_tactile_only(frame):
+        if frame[0] == 0x28:
+            raise OSError("test tactile write failure")
+        return original_write(frame)
+
+    monkeypatch.setattr(old_port, "write", fail_tactile_only)
+    with pytest.raises(OSError, match="test tactile write failure"):
+        hand.read_tactile("left", ["thumb"], budget_s=1, settle_s=0)
+
+    assert old_port.close_count == 0
+    assert control_client.read_fingertip("thumb", settle_s=0) == cells(1)
+    waiting = hand._connection(side="left", serial_port=str(port))
+    with pytest.raises(OSError, match="waiting for existing connections"):
+        waiting.get()
+    with pytest.raises(OSError, match="waiting for existing connections"):
+        gesture.get()
+    assert old_port.close_count == 0
+    assert len(transports) == 1
+
+    replacement = control.get()
+    assert old_port.close_count == 1
+    assert len(transports) == 2
+    assert replacement is not control_client
+    gesture.close()
+    assert waiting.get("right") is replacement
+    waiting.close()
+    assert transports[1].close_count == 0
+    control.close()
+    assert transports[1].close_count == 1
+
+
 def test_busy_bus_does_not_block_motion(tmp_path):
     port = tmp_path / "ttyUSB0"
     port.touch()

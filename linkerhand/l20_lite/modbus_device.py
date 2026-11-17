@@ -51,7 +51,7 @@ class _SerialPort:
     path: str
     client: L20LiteModbusClient
     users: int = 0
-    closed: bool = False
+    retired: bool = False
 
 
 class L20LiteConnection:
@@ -72,8 +72,6 @@ class L20LiteConnection:
 
     @property
     def _client(self) -> L20LiteModbusClient | None:
-        if self._serial_port is None or self._serial_port.closed:
-            return None
         return self._target
 
     def get(self, side: str | None = None) -> L20LiteModbusClient:
@@ -81,12 +79,17 @@ class L20LiteConnection:
         if target_side not in ("left", "right"):
             raise ValueError("side must be left or right")
         with self._lock:
+            # Existing holders can finish using the port. A new request
+            # renews a retired connection after its holders release it.
+            if self._serial_port is not None and self._serial_port.retired:
+                self.close()
             if self._client is not None and self._client.side == target_side:
                 return self._client
-            if self._serial_port is None or self._serial_port.closed:
-                self.close()
+            if self._serial_port is None:
                 path = os.path.realpath(self.port)
                 shared = self._ports.get(path)
+                if shared is not None and shared.retired:
+                    raise OSError(f"RS485 port {path} is waiting for existing connections to release")
                 if shared is None:
                     client = L20LiteModbusClient(
                         self.port, target_side, baudrate=self.baudrate, timeout_s=self.timeout_s,
@@ -100,9 +103,7 @@ class L20LiteConnection:
     def detect_sides(self) -> list[str]:
         """Probe only the two known slave IDs using read-only position frames."""
         with self._lock:
-            client = self._client
-        if client is None:
-            client = self.get()
+            client = self.get(self._client.side if self._client is not None else None)
         found = []
         try:
             for side in ("right", "left"):
@@ -122,14 +123,15 @@ class L20LiteConnection:
         return found
 
     def _close_port(self, port: _SerialPort) -> None:
-        del self._ports[port.path]
-        port.closed = True
+        if self._ports.get(port.path) is port:
+            del self._ports[port.path]
         port.client.close()
 
     def invalidate(self) -> None:
         with self._lock:
-            if self._serial_port is not None and not self._serial_port.closed:
-                self._close_port(self._serial_port)
+            if self._serial_port is not None:
+                # Reserve the path until the last existing holder releases it.
+                self._serial_port.retired = True
             self.close()
 
     def close(self) -> None:
@@ -138,7 +140,7 @@ class L20LiteConnection:
             self._target = None
             if port is not None:
                 port.users -= 1
-                if port.users == 0 and not port.closed:
+                if port.users == 0:
                     self._close_port(port)
 
 
