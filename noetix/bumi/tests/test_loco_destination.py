@@ -302,9 +302,10 @@ def test_target_heading_feedback_sign_is_a_correction(monkeypatch):
     assert idc.angle_delta(origin, current) == pytest.approx(-math.radians(10.0))
 
 
-def test_target_action_schema_and_preflight(monkeypatch):
+@pytest.mark.parametrize('walking_mode', [2, 3])
+def test_target_action_schema_and_preflight(monkeypatch, walking_mode):
     module, _ = _load_device(monkeypatch)
-    plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl())
+    plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl(mode=walking_mode))
     tool = [t for t in plugin.get_tools() if t['name'] == 'loco_relative_move'][0]
     props = tool['inputSchema']['properties']
     assert 'x_m' in props and 'y_m' in props
@@ -318,18 +319,28 @@ def test_target_action_schema_and_preflight(monkeypatch):
         assert 'action_id' not in result
 
 
-def test_target_action_forwards_the_point_to_the_worker(monkeypatch):
+@pytest.mark.parametrize('walking_mode', [2, 3])
+def test_target_action_forwards_the_point_to_the_worker(monkeypatch, walking_mode):
     module, _ = _load_device(monkeypatch)
     import imu_distance_control
-    plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl())
+    fake_controller = FakeHighCtrl(mode=walking_mode)
+    plugin = _rotate_plugin(module, monkeypatch, fake_controller)
     calls = []
     def fake(*args, **kwargs):
         calls.append((args, kwargs))
+        owner = args[0]
+        assert owner._rotate_mode_error() is None
+        owner._distance_publish(0.6)
+        owner._distance_publish(0)
         return {'state': 'done', 'action': 'move'}
     monkeypatch.setattr(imu_distance_control, 'run_target', fake)
-    result = plugin._do_target_impl({'x_m': 0.3, 'y_m': 0.4})
-    assert result['state'] == 'done'
+    started = plugin.dispatch('move', {
+        '_tool_name': 'loco_relative_move', 'x_m': 0.3, 'y_m': 0.4})
+    assert started['state'] == 'running'
+    assert wait_rotate(plugin, timeout_s=2)['state'] == 'done'
     assert calls[0][0][1] == 0.3 and calls[0][0][2] == 0.4
+    assert fake_controller.cmds == [(0.6, 0, 0), (0, 0, 0)]
+    assert fake_controller.mode == walking_mode
 
 
 def test_tool_exposes_slip_config_with_the_current_defaults(monkeypatch):
@@ -497,9 +508,10 @@ def test_sigterm_during_dispatch_acceptance_still_cancels(monkeypatch):
     assert status['last_result']['state'] == 'stopped'
 
 
-def test_rotate_converges_within_tolerance_and_brakes(monkeypatch):
+@pytest.mark.parametrize('walking_mode', [2, 3])
+def test_rotate_converges_within_tolerance_and_brakes(monkeypatch, walking_mode):
     module, _ = _load_device(monkeypatch)
-    fake = FakeHighCtrl(gain_deg_per_tick=3.0)
+    fake = FakeHighCtrl(mode=walking_mode, gain_deg_per_tick=3.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
     plugin.dispatch('rotate', {'_tool_name': 'loco_relative_move', 'angle_deg': 60})
     result = wait_rotate(plugin)
@@ -620,8 +632,9 @@ def test_invalid_imu_aborts_rotate(monkeypatch, during_motion, field, value):
     assert calls[0][2] is result
 
 
+@pytest.mark.parametrize('walking_mode', [2, 3])
 @pytest.mark.parametrize('mode', [1, 26, None])
-def test_mode_loss_during_rotate_brakes_and_reports_error(monkeypatch, mode):
+def test_mode_loss_during_rotate_brakes_and_reports_error(monkeypatch, mode, walking_mode):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(gain_deg_per_tick=0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
@@ -634,7 +647,7 @@ def test_mode_loss_during_rotate_brakes_and_reports_error(monkeypatch, mode):
             if mode is None:
                 raise RuntimeError('mode feedback unavailable')
             return mode
-        return 2
+        return walking_mode
 
     monkeypatch.setattr(fake, 'get_mode', get_mode)
     plugin.dispatch('rotate', {'_tool_name': 'loco_relative_move', 'angle_deg': 60})
@@ -708,11 +721,12 @@ def test_rotate_cannot_publish_motion_after_stop_returns(monkeypatch, angle, pen
     assert all(cmd == (0, 0, 0) for cmd in fake.cmds[after_stop:])
 
 
-def test_stop_move_interrupts_running_rotate(monkeypatch):
+@pytest.mark.parametrize('walking_mode', [2, 3])
+def test_stop_move_interrupts_running_rotate(monkeypatch, walking_mode):
     # rotate 在 bumi_rotate 工作线程里跑（150° / 小 gain 转不完），主线程 30ms 后
     # 下发 stop_move：rotate 必须经 _rotate_stop_event 以 stopped 收尾，且末帧零速。
     module, _ = _load_device(monkeypatch)
-    fake = FakeHighCtrl(gain_deg_per_tick=1.0)
+    fake = FakeHighCtrl(mode=walking_mode, gain_deg_per_tick=1.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
     started = plugin.dispatch(
         'rotate', {'_tool_name': 'loco_relative_move', 'angle_deg': 150})
@@ -726,26 +740,57 @@ def test_stop_move_interrupts_running_rotate(monkeypatch):
     assert fake.cmds[-1] == (0, 0, 0)                   # 退出必零速
 
 
-def test_rotate_refuses_non_walking_and_protection_modes(monkeypatch):
-    # 模式拒绝与 _do_move 逐字一致：26 → protection；非 2 → workmode + switch_mode 指引。
-    # 两种情况都必须在发出任何指令之前就拒绝（fake.cmds 为空）。
+@pytest.mark.parametrize('mode', [0, 1, 5, 26, 30, 777])
+def test_locomotion_refuses_non_walking_and_protection_modes(monkeypatch, mode):
     module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(mode=mode)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    cases = [('loco', 'move', {'vx': 0.6, 'duration': 0.04}),
+             ('loco_relative_move', 'rotate', {'angle_deg': 60}),
+             ('loco_relative_move', 'move', {'x_m': 0.5, 'y_m': 0.0})]
+    for tool, action, args in cases:
+        result = plugin.dispatch(action, {'_tool_name': tool, **args})
+        assert result['state'] == 'error'
+        assert 'action_id' not in result
+        if mode == 26:
+            assert 'protection' in result['error']
+        else:
+            assert 'workmode' in result['error'] and 'walking_mode' in result['error']
+            assert 'lower_body' in result['error'] and 'whole_body' in result['error']
+        assert fake.cmds == []
 
-    fake_protection = FakeHighCtrl(mode=26)
-    plugin_protection = _rotate_plugin(module, monkeypatch, fake_protection)
-    result = plugin_protection.dispatch(
-        'rotate', {'_tool_name': 'loco_relative_move', 'angle_deg': 60})
-    assert result['state'] == 'error'
-    assert 'protection' in result['error']
-    assert fake_protection.cmds == []                   # 未发任何指令
 
-    fake_ready = FakeHighCtrl(mode=1)
-    plugin_ready = _rotate_plugin(module, monkeypatch, fake_ready)
-    result = plugin_ready.dispatch(
-        'rotate', {'_tool_name': 'loco_relative_move', 'angle_deg': 60})
-    assert result['state'] == 'error'
-    assert 'workmode' in result['error'] and 'switch_mode' in result['error']
-    assert fake_ready.cmds == []                        # 未发任何指令
+@pytest.mark.parametrize('walking_mode', [2, 3])
+@pytest.mark.parametrize('vx', [0.6, -0.6])
+@pytest.mark.parametrize('duration', [0.04, 0])
+def test_loco_move_accepts_both_walking_modes_and_brakes(monkeypatch, walking_mode, vx, duration):
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(mode=walking_mode)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    published = threading.Event()
+    original = fake.publish_cmd
+
+    def publish(x, y, z, command, index=0):
+        assert command == 'DEFAULT'
+        original(x, y, z, command, index)
+        if x:
+            published.set()
+
+    monkeypatch.setattr(fake, 'publish_cmd', publish)
+    try:
+        started = plugin.dispatch('move', {'_tool_name': 'loco', 'vx': vx, 'duration': duration})
+        assert started['state'] == 'moving'
+        assert published.wait(timeout=1)
+        if duration:
+            plugin._move_thread.join(timeout=1)
+        else:
+            assert plugin.dispatch('stop_move', {'_tool_name': 'loco'}) == {'state': 'stopped'}
+        assert not plugin.is_moving()
+        assert fake.cmds[0] == (vx, 0, 0)
+        assert fake.cmds[-1] == (0, 0, 0)
+        assert fake.mode == walking_mode
+    finally:
+        plugin.stop()
 
 
 def test_rotate_stops_a_running_loco_move(monkeypatch):

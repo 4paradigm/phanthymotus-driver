@@ -544,7 +544,7 @@ class LocoPlugin:
                 "x-action-params": {
                     "move": {
                         "params": ["vx", "vy", "vyaw", "duration"],
-                        "description": "Move with specified velocities. Requires walking mode.",
+                        "description": "Move with specified velocities in lower-body or whole-body walking mode.",
                     },
                     "stop_move": {
                         "params": [],
@@ -558,7 +558,7 @@ class LocoPlugin:
     def _loco_relative_move_tool(self) -> dict:
         return {
             "name": "loco_relative_move", "type": "actuator", "multiInstance": False,
-            "description": "Bumi 目标运动：按 x/y 目标点前进+转弯走过去，或按 IMU 航向原地旋转指定角度。目标移动前须保持机器人静止以标定；位置估计存在打滑与漂移，实际精度未经验证。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
+            "description": "Bumi 目标运动：按 x/y 目标点前进+转弯走过去，或按 IMU 航向原地旋转指定角度。目标移动前须保持机器人静止以标定；位置估计存在打滑与漂移，实际精度未经验证。旋转容差 ±2°。须已处于仅腿部或全身行走模式，地面平坦防滑，运动区域无人无障碍。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -822,19 +822,9 @@ class LocoPlugin:
             return self._do_move_impl(args)
 
     def _do_move_impl(self, args: dict) -> dict:
-        # Check if in walking mode
-        mode = int(self._high_ctrl.get_mode())
-        if mode == 26:
-            return {"state": "error", "error": "Robot in protection mode, cannot move"}
-        if mode != 2:
-            return {
-                "state": "error",
-                "error": (
-                    f"movement requires workmode=2 (walking); current mode is "
-                    f"{mode} ({_WORKMODE_NAMES.get(mode, 'unknown')}). "
-                    "Use switch_mode switch=walk first."
-                ),
-            }
+        mode_error = self._rotate_mode_error()
+        if mode_error is not None:
+            return mode_error
 
         vx = float(args.get("vx", 0))
         vy = float(args.get("vy", 0))
@@ -1029,16 +1019,18 @@ class LocoPlugin:
         return angle_deg, self._rotate_mode_error()
 
     def _rotate_mode_error(self) -> dict | None:
+        """Shared mode check for velocity moves, target moves and rotations."""
         mode = int(self._high_ctrl.get_mode())
         if mode == 26:
             return {"state": "error", "error": "Robot in protection mode, cannot move"}
-        if mode != 2:
+        if mode not in (2, 3):
             return {
                 "state": "error",
                 "error": (
-                    f"movement requires workmode=2 (walking); current mode is "
+                    "movement requires workmode=2 (walking) or 3 (whole_body_walking). "
+                    "Current mode is "
                     f"{mode} ({_WORKMODE_NAMES.get(mode, 'unknown')}). "
-                    "Use switch_mode switch=walk first."
+                    "Select lower_body or whole_body using action=walking_mode."
                 ),
             }
         return None

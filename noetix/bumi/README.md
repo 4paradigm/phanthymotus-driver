@@ -374,6 +374,9 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 即可显示 `walking_model` 下拉框，选项为 `lower_body`（仅腿部行走）与
 `whole_body`（全身行走）。该字段仅属于模式切换动作。已有动作继续使用各自的
 速度、距离、角度参数和原有执行逻辑。
+`loco.move` 及 `loco_relative_move` 的 `move`、`rotate` 均接受反馈状态 2、3，
+速度命令沿用 `ControlCmd.DEFAULT` 并保留所选模式。
+相对移动需要同时填写 `x_m`、`y_m`，直行时将 `y_m` 填为 0。
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"loco","arguments":{"action":"walking_mode","walking_model":"lower_body"}}}
@@ -403,14 +406,15 @@ SDK 只用于读取现有控制器的反馈，不实例化另一个 `HighControl
 App 与 SDK 必须先报告一致的 2/3 模式；已处于目标模式则直接返回，不重发命令。
 实际切换前暂停 `loco_servo`，检查全部 21 个关节速度均低于 `0.15 rad/s`，
 并再次检查模式未变化。发送一次 `walk` 或 `run` 后，连续两次确认 App 与
-SDK 的反馈均为目标代码，ACP 完成结果包含 `state=completed`、`mode_verified=true`。
+SDK 的反馈均为目标代码，校验结果包含 `state=completed`、`mode_verified=true`。
 超时、保护或断连不会自动重试、回退或恢复流式移动；发送中断时会保留
 `command_may_have_been_sent`，避免误报指令肯定未到达。
 
 默认在 UDP 9090 被动接收 `discovery_source_ip` 指定的运动板广播，
 取其 `perception_ip` 连接 TCP 8888；不发送扫描报文，也不把实验机器 IP 写进代码。
 UDP 不可用时可在部署配置中指定 `app_host`。驱动容器需要能访问该地址。
-现有 `loco` / `loco_servo` 的速度移动继续要求状态 2。
+`loco`、`loco_relative_move` 共用状态 2/3 的运动检查，保护状态及其他非行走状态会返回错误。
+`loco_servo` 的流式速度门槛为状态 2。
 
 2026-11-11 核对了本仓库附带的 SDK 3.1.0 头文件、Python 绑定和示例，
 并对照了厂家的公开文档与当前 SDK 源码：

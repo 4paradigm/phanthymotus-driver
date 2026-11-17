@@ -526,8 +526,12 @@ def test_mcp_discovers_both_actions_and_executes_each_mode(locomotion_bundle_mod
         def get_joint_state(self):
             return [types.SimpleNamespace(vel=0.0) for _ in range(21)]
 
+        def publish_cmd(self, x, y, z, command, index=0):
+            sdk_commands.append((x, y, z, command, index))
+
     controller = Controller()
     commands, callbacks = [], []
+    sdk_commands = []
 
     class Client:
         def __init__(self, host, **kwargs):
@@ -590,6 +594,24 @@ def test_mcp_discovers_both_actions_and_executes_each_mode(locomotion_bundle_mod
         refused = rpc("tools/call", {"name": "loco", "arguments": {"action": "walking_mode"}})
         assert json.loads(refused["content"][0]["text"])["code"] == "invalid_walking_model"
         assert callbacks == []
+        for tool_name, model in (("loco", "whole_body"), ("loco_relative_move", "whole_body"),
+                                 ("loco", "lower_body"), ("loco_relative_move", "lower_body")):
+            before = len(sdk_commands)
+            response = rpc("tools/call", {"name": tool_name, "arguments": {
+                "action": "walking_mode", "walking_model": model}})
+            assert json.loads(response["content"][0]["text"])["state"] == "completed"
+            assert len(sdk_commands) == before
+            mode_commands = list(commands)
+            response = rpc("tools/call", {"name": "loco", "arguments": {
+                "action": "move", "vx": 0.6, "duration": 0.04}})
+            assert json.loads(response["content"][0]["text"])["state"] == "moving"
+            bundle._plugins[0]._move_thread.join(timeout=2)
+            assert not bundle._plugins[0].is_moving()
+            assert sdk_commands[before] == (0.6, 0, 0, "DEFAULT", 0)
+            assert sdk_commands[-1] == (0, 0, 0, "DEFAULT", 0)
+            assert controller.mode == walking_mode.MODEL_CODES[model]
+            assert commands == mode_commands
+            assert callbacks == []
     finally:
         server.shutdown()
         server.server_close()
