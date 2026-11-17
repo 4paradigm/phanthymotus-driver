@@ -1,0 +1,142 @@
+{
+  "version": 1,
+  "provenance": {
+    "kind": "shared-standard-model-intrinsics",
+    "measurement_scope": "Chessboard measurements of S10 Pro CD1 (host CA9B_NO.0), not individual calibration of every robot.",
+    "method": "tools/calibrate_chessboard.py; 10x13 inner corners, 18 mm squares; standing robot; 1024x576 RTSP K scaled by 0.625 to 640x360, D unchanged.",
+    "reuse_confirmed_on": "2026-11-17",
+    "reuse_scope": "Operator confirmed target S10 Pro robots use the same front camera and lens. Shared model values retain the four original CD1 camera measurements.",
+    "reprojection_verified": false,
+    "temporal_synchronization": false
+  },
+  "cameras": {
+    "deeprobotics/s10_pro/camera_front": {
+      "id": "deeprobotics/s10_pro/camera_front",
+      "width": 640,
+      "height": 360,
+      "distortion_model": "plumb_bob",
+      "K": [
+        314.963248,
+        0,
+        336.650604,
+        0,
+        314.934089,
+        182.285271,
+        0,
+        0,
+        1
+      ],
+      "D": [
+        -0.264916006540722,
+        0.08280010720226033,
+        -0.00018047856465669117,
+        3.14558084286742e-05,
+        -0.013244463692919645
+      ],
+      "measured_on": "2026-11-07",
+      "unit": "S10 Pro CD1 (host CA9B_NO.0)",
+      "source_resolution": [
+        1024,
+        576
+      ],
+      "frames_used": 103,
+      "rms_px": 0.213
+    },
+    "deeprobotics/s10_pro/camera_rear": {
+      "id": "deeprobotics/s10_pro/camera_rear",
+      "width": 640,
+      "height": 360,
+      "distortion_model": "plumb_bob",
+      "K": [
+        312.750288,
+        0,
+        308.919092,
+        0,
+        312.683048,
+        183.364774,
+        0,
+        0,
+        1
+      ],
+      "D": [
+        -0.2622894409938081,
+        0.08153733337528488,
+        0.00012089478431258563,
+        0.00040150868161954143,
+        -0.013044993729573065
+      ],
+      "measured_on": "2026-11-08",
+      "unit": "S10 Pro CD1 (host CA9B_NO.0)",
+      "source_resolution": [
+        1024,
+        576
+      ],
+      "frames_used": 103,
+      "rms_px": 0.208
+    },
+    "deeprobotics/s10_pro/camera_left": {
+      "id": "deeprobotics/s10_pro/camera_left",
+      "width": 640,
+      "height": 360,
+      "distortion_model": "plumb_bob",
+      "K": [
+        314.208908,
+        0,
+        311.686392,
+        0,
+        314.175661,
+        192.549502,
+        0,
+        0,
+        1
+      ],
+      "D": [
+        -0.25929876926166817,
+        0.07786005715673677,
+        0.00035419731549147994,
+        0.0005598844289782525,
+        -0.011875881953120242
+      ],
+      "measured_on": "2026-11-08",
+      "unit": "S10 Pro CD1 (host CA9B_NO.0)",
+      "source_resolution": [
+        1024,
+        576
+      ],
+      "frames_used": 106,
+      "rms_px": 0.222
+    },
+    "deeprobotics/s10_pro/camera_right": {
+      "id": "deeprobotics/s10_pro/camera_right",
+      "width": 640,
+      "height": 360,
+      "distortion_model": "plumb_bob",
+      "K": [
+        314.351144,
+        0,
+        327.541354,
+        0,
+        314.28902,
+        177.870404,
+        0,
+        0,
+        1
+      ],
+      "D": [
+        -0.2617530191348165,
+        0.0801398926074851,
+        9.564678897937886e-05,
+        -0.0001381378356953391,
+        -0.012449424682861728
+      ],
+      "measured_on": "2026-11-08",
+      "unit": "S10 Pro CD1 (host CA9B_NO.0)",
+      "source_resolution": [
+        1024,
+        576
+      ],
+      "frames_used": 98,
+      "rms_px": 0.219
+    }
+  }
+}

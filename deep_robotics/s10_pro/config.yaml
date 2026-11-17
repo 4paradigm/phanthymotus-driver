@@ -89,3 +89,13 @@ controlled_spatial:
   directory: /var/opt/robot/data/maps
   tags_file: /opt/phanthy-motus/data/s10_pro/tags.json
   timeout: 30
+
+# Operational settings for the continuous velocity card; no motion at bundle startup.
+loco_servo:
+  dry_run: true
+  rotate_only: false
+  speed_preset: normal  # vx: slow=.15, normal=.30, fast=.50 m/s.
+  min_vx: 0.0  # Planner metadata only; no invented minimum-speed compensation.
+  linear_acceleration: 0.3  # m/s² nominal at 10Hz, both vx and vy.
+  angular_acceleration: 2.0  # rad/s² nominal at 10Hz.
+  wz_limit: 1.0  # rad/s, never exceeds the native operating ceiling.

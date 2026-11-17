@@ -146,6 +146,16 @@ def test_canvas_has_no_topic_frame_or_matrix_settings(rig):
     assert set(properties) == {"min_depth_m", "max_depth_m", "rate_hz"}
 
 
+def test_unavailable_packaged_intrinsics_surfaces_the_resource_reason(rig, monkeypatch):
+    configure(rig)
+    reason = 'cannot load camera intrinsics /driver/resource/calibration/s10_pro_camera_intrinsics.json'
+    monkeypatch.setattr(rig.controller, 'calibration', lambda lane: (None, reason))
+    result = rig.plugin.dispatch('start', {})
+    assert result['code'] == 'CALIBRATION_INVALID'
+    assert reason in result['message']
+    assert not rig.subscriptions
+
+
 @pytest.mark.parametrize('frame', [None, (0, 0, b'old-image'), (999, None, b'wrong-generation')])
 def test_standalone_card_rejects_missing_stale_or_wrong_generation_rgb(rig, frame):
     configure(rig)
@@ -202,7 +212,7 @@ def test_default_canvas_start_loads_directed_calibration_readonly(rig):
 
 
 def test_confirmed_robot_mounting_record_projects_front_right_and_up(rig):
-    path = DRIVER / "resource/calibration/s10_pro_cd1_inspected_20261114.json"
+    path = DRIVER / "resource/calibration/s10_pro_standard_front.json"
     plugin = module().FrontDepthPlugin({}, "robot", rig.nodes,
                                       config_path=rig.path, extrinsics_path=path)
     result = plugin.dispatch("start", {})
@@ -226,7 +236,7 @@ def test_confirmed_robot_mounting_record_projects_front_right_and_up(rig):
 
 def test_confirmed_robot_transform_maps_its_optical_centre_to_zero():
     from deep_robotics.s10_pro.depth_projection import validate_transform
-    record = json.loads((DRIVER / 'resource/calibration/s10_pro_cd1_inspected_20261114.json').read_text())
+    record = json.loads((DRIVER / 'resource/calibration/s10_pro_standard_front.json').read_text())
     matrix = validate_transform(record['camera_optical_from_cloud'])
     camera_origin = [.27065, 0, .04673, 1]
     transformed = [sum(row[i] * camera_origin[i] for i in range(4)) for row in matrix]
@@ -242,7 +252,7 @@ def automatic_plugin(rig, monkeypatch, identity):
     return plugin
 
 
-def test_empty_data_volume_automatically_loads_only_this_robots_bundled_calibration(rig, monkeypatch):
+def test_empty_data_volume_automatically_loads_standard_model_calibration(rig, monkeypatch):
     plugin = automatic_plugin(rig, monkeypatch,
         '482fc8b97c9e88f56cad0e892fc3ebfecddc47c570d078588e448d81945b6640')
     result = plugin.dispatch('start', {})
@@ -258,20 +268,57 @@ def test_empty_data_volume_automatically_loads_only_this_robots_bundled_calibrat
         plugin.stop()
 
 
-def test_unknown_robot_does_not_reuse_inspected_robots_calibration(rig, monkeypatch):
+def test_another_standard_robot_reuses_model_calibration(rig, monkeypatch):
     plugin = automatic_plugin(rig, monkeypatch, '0' * 64)
-    result = plugin.dispatch('start', {})
-    assert result['code'] == 'CALIBRATION_MISSING' and not rig.subscriptions
+    try:
+        result = plugin.dispatch('start', {})
+        assert result['state'] == 'running', result
+        assert result['config']['cloud_frame_id'] == 'lidar_link'
+        vendor = result['camera_info'][0]['vendor']
+        assert vendor['reprojection_verified'] is False
+        assert vendor['temporal_synchronization'] is False
+    finally:
+        plugin.stop()
 
 
-def test_identity_read_failure_is_explicit_and_does_not_start_cloud_reader(rig, monkeypatch):
+def test_standard_profile_does_not_require_identity_ssh(rig, monkeypatch):
     plugin = automatic_plugin(rig, monkeypatch, None)
     def unavailable(config):
         raise RuntimeError('identity unavailable')
-    monkeypatch.setattr(module(), 'read_robot_identity', unavailable)
+    monkeypatch.setattr(module(), 'read_robot_identity', unavailable, raising=False)
+    try:
+        result = plugin.dispatch('start', {})
+        assert result['state'] == 'running', result
+    finally:
+        plugin.stop()
+
+
+@pytest.mark.parametrize('contents, code', [
+    (None, 'CALIBRATION_MISSING'), ('{broken', 'CALIBRATION_INVALID'),
+    ('{}', 'CALIBRATION_INVALID')])
+def test_missing_or_invalid_standard_profile_is_explicit(rig, monkeypatch, tmp_path, contents, code):
+    directory = tmp_path / 'bundled'
+    directory.mkdir()
+    if contents is not None:
+        (directory / 's10_pro_standard_front.json').write_text(contents)
+    monkeypatch.setattr(module(), 'BUNDLED_CALIBRATIONS', directory)
+    plugin = automatic_plugin(rig, monkeypatch, '0' * 64)
     result = plugin.dispatch('start', {})
-    assert result['code'] == 'CALIBRATION_IDENTITY_UNAVAILABLE'
+    assert result['code'] == code, result
+    assert 's10_pro_standard_front.json' in result['message']
     assert not rig.subscriptions and not rig.relays
+
+
+def test_deployment_override_takes_precedence_over_standard_profile(rig, monkeypatch):
+    plugin = automatic_plugin(rig, monkeypatch, '0' * 64)
+    record = deployment_calibration(rig)
+    try:
+        result = plugin.dispatch('start', {})
+        assert result['state'] == 'running', result
+        assert result['config']['camera_optical_from_cloud'] == record['camera_optical_from_cloud']
+        assert result['camera_info'][0]['vendor']['extrinsics_source'] == 'file:' + str(rig.extrinsics_path)
+    finally:
+        plugin.stop()
 
 
 def test_explicit_missing_calibration_path_does_not_use_bundled_record(rig, monkeypatch):
@@ -289,13 +336,18 @@ def test_present_invalid_deployment_record_does_not_use_bundled_record(rig, monk
     assert not rig.subscriptions
 
 
-def test_bundled_calibration_rechecks_identity_after_stop(rig, monkeypatch):
-    plugin = automatic_plugin(rig, monkeypatch,
-        '482fc8b97c9e88f56cad0e892fc3ebfecddc47c570d078588e448d81945b6640')
+def test_standard_profile_is_reloaded_after_stop(rig, monkeypatch, tmp_path):
+    import shutil
+    directory = tmp_path / 'bundled'
+    directory.mkdir()
+    path = directory / 's10_pro_standard_front.json'
+    shutil.copy(DRIVER / 'resource/calibration/s10_pro_standard_front.json', path)
+    monkeypatch.setattr(module(), 'BUNDLED_CALIBRATIONS', directory)
+    plugin = automatic_plugin(rig, monkeypatch, '0' * 64)
     assert plugin.dispatch('start', {})['state'] == 'running'
     plugin.stop()
-    monkeypatch.setattr(module(), 'read_robot_identity', lambda config: '0' * 64)
-    assert plugin.dispatch('start', {})['code'] == 'CALIBRATION_MISSING'
+    path.write_text('{}')
+    assert plugin.dispatch('start', {})['code'] == 'CALIBRATION_INVALID'
 
 
 def test_image_copied_calibration_can_start_with_an_empty_volume(rig, monkeypatch, tmp_path):
@@ -314,6 +366,10 @@ def test_image_copied_calibration_can_start_with_an_empty_volume(rig, monkeypatc
             shutil.copytree(DRIVER / source, target, dirs_exist_ok=True)
     monkeypatch.setattr(module(), 'BUNDLED_CALIBRATIONS',
                         image_root / 'work/deep_robotics/s10_pro/resource/calibration')
+    from deep_robotics.s10_pro import undistortion
+    calibrations = undistortion._load_calibrations(
+        image_root / 'work/deep_robotics/s10_pro/resource/calibration/s10_pro_camera_intrinsics.json')
+    assert calibrations['deeprobotics/s10_pro/camera_front']['K'][0] == 314.963248
     plugin = automatic_plugin(rig, monkeypatch,
         '482fc8b97c9e88f56cad0e892fc3ebfecddc47c570d078588e448d81945b6640')
     try:

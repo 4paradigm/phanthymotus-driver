@@ -153,24 +153,6 @@ def _ssh_command(config, command):
     return ['ssh', '-o', 'BatchMode=yes', *args[1:]], None
 
 
-def read_robot_identity(config):
-    # Identify the NOS host without exposing its raw machine-id or loading ROS.
-    script = ('import hashlib,pathlib,re; '
-              'value=pathlib.Path("/etc/machine-id").read_bytes().strip(); '
-              'assert re.fullmatch(b"[0-9a-f]{32}",value); '
-              'print(hashlib.sha256(value).hexdigest())')
-    args, env = _ssh_command(config, 'exec ' + shlex.join(['python3', '-I', '-B', '-c', script]))
-    try:
-        result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                timeout=10., check=False, env=env)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError('Cannot read NOS calibration identity over existing SSH') from exc
-    value = result.stdout.strip()
-    if result.returncode != 0 or not re.fullmatch(b'[0-9a-f]{64}', value):
-        raise RuntimeError('Invalid NOS calibration identity response')
-    return value.decode('ascii')
-
-
 def _signal(process, value):
     try:
         os.killpg(process.pid, value)

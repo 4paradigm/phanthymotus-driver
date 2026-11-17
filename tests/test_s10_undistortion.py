@@ -70,7 +70,7 @@ def test_saved_calibration_from_an_earlier_build_is_ignored(tmp_path):
         'camera_front': {'undistort': True, 'calibration': {'K': [1]}}}}))
     loaded = u.CameraUndistortion(('camera_front',), config_path=path)
     assert loaded.settings('camera_front') == {'undistort': True}
-    assert loaded.calibration('camera_front')[1] == 'table:' + u.camera_id('camera_front')
+    assert loaded.calibration('camera_front')[1] == 'bundled:' + str(u.BUNDLED_INTRINSICS)
 
 
 @pytest.mark.parametrize('model,coefficients', [
@@ -103,7 +103,7 @@ def test_declaration_tracks_the_switch(controller):
     assert info['D'] == [0.] * 5
     assert info['half_fov_rad'] == pytest.approx(0.7926, abs=.001)
     assert u.PIPELINE_STAGE in info['pipeline']
-    assert controller.status(lane)['calibration_source'] == 'table:' + u.camera_id(lane)
+    assert controller.status(lane)['calibration_source'] == 'bundled:' + str(u.BUNDLED_INTRINSICS)
     controller.configure(lane, {'undistort': False})
     assert 'K' not in controller.declaration(lane)
     assert controller.declaration(lane)['undistortion']['state'] == 'raw'
@@ -221,3 +221,79 @@ def test_ffmpeg_remap_reuses_static_maps_for_multiple_frames(controller, tmp_pat
     reference = cv2.remap(frame, x.astype('float32'), y.astype('float32'), cv2.INTER_NEAREST)
     reference = cv2.resize(reference, (640, 360), interpolation=cv2.INTER_LINEAR)
     assert np.mean(abs(frames[0].astype(float) - reference)) < 3
+
+
+def _isolated_undistortion(tmp_path, contents=None):
+    import shutil
+    module_path = tmp_path / 'undistortion.py'
+    shutil.copy(u.__file__, module_path)
+    if contents is not None:
+        directory = tmp_path / 'resource' / 'calibration'
+        directory.mkdir(parents=True)
+        (directory / 's10_pro_camera_intrinsics.json').write_text(contents)
+    spec = importlib.util.spec_from_file_location('isolated_undistortion', module_path)
+    isolated = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolated)
+    return isolated
+
+
+def test_packaged_intrinsics_drive_camera_geometry(tmp_path):
+    record = json.loads(u.BUNDLED_INTRINSICS.read_text())
+    record['cameras']['deeprobotics/s10_pro/camera_front']['K'][0] = 300.0
+    isolated = _isolated_undistortion(tmp_path, json.dumps(record))
+    controller = isolated.CameraUndistortion(('camera_front',), config_path=tmp_path / 'settings.json')
+    assert controller.declaration('camera_front')['K'][0] == 300.0
+
+
+@pytest.mark.parametrize('contents', [None, '{broken', '{}', '[]',
+    '{"version":1,"cameras":{"deeprobotics/s10_pro/camera_front":{"K":[1]}}}'])
+def test_missing_or_invalid_packaged_intrinsics_fail_at_camera_use(tmp_path, contents):
+    isolated = _isolated_undistortion(tmp_path, contents)
+    assert isolated.CALIBRATIONS == {}
+    controller = isolated.CameraUndistortion(('camera_front',), config_path=tmp_path / 'settings.json')
+    assert controller.declaration('camera_front')['source'] == 'unknown'
+    assert 's10_pro_camera_intrinsics.json' in controller.status('camera_front')['error']
+    with pytest.raises(ValueError, match='s10_pro_camera_intrinsics.json'):
+        controller.rtsp_command('camera_front', 'rtsp://camera/front')
+
+
+def test_packaged_intrinsics_preserve_original_measurements():
+    expected = {
+        'deeprobotics/s10_pro/camera_front': (
+            [314.963248, 0, 336.650604, 0, 314.934089, 182.285271, 0, 0, 1],
+            [-0.264916006540722, 0.08280010720226033, -0.00018047856465669117,
+             3.14558084286742e-05, -0.013244463692919645]),
+        'deeprobotics/s10_pro/camera_rear': (
+            [312.750288, 0, 308.919092, 0, 312.683048, 183.364774, 0, 0, 1],
+            [-0.2622894409938081, 0.08153733337528488, 0.00012089478431258563,
+             0.00040150868161954143, -0.013044993729573065]),
+        'deeprobotics/s10_pro/camera_left': (
+            [314.208908, 0, 311.686392, 0, 314.175661, 192.549502, 0, 0, 1],
+            [-0.25929876926166817, 0.07786005715673677, 0.00035419731549147994,
+             0.0005598844289782525, -0.011875881953120242]),
+        'deeprobotics/s10_pro/camera_right': (
+            [314.351144, 0, 327.541354, 0, 314.28902, 177.870404, 0, 0, 1],
+            [-0.2617530191348165, 0.0801398926074851, 9.564678897937886e-05,
+             -0.0001381378356953391, -0.012449424682861728]),
+    }
+    assert set(u.CALIBRATIONS) == set(expected)
+    for ident, (k, d) in expected.items():
+        lane = ident.rsplit('/', 1)[1]
+        calibration, source = u.CameraUndistortion((lane,)).calibration(lane)
+        assert calibration['K'] == k
+        assert calibration['D'] == d
+        assert source == 'bundled:' + str(u.BUNDLED_INTRINSICS)
+
+
+@pytest.mark.parametrize('key, value', [
+    ('K', [0] * 9),
+    ('K', [10 ** 400, 0, 336.650604, 0, 314.934089, 182.285271, 0, 0, 1]),
+    ('D', [0]), ('id', 'deeprobotics/s10_pro/camera_rear')])
+def test_invalid_packaged_camera_row_reports_resource_error(tmp_path, key, value):
+    record = json.loads(u.BUNDLED_INTRINSICS.read_text())
+    record['cameras']['deeprobotics/s10_pro/camera_front'][key] = value
+    isolated = _isolated_undistortion(tmp_path, json.dumps(record))
+    controller = isolated.CameraUndistortion(('camera_front',), config_path=tmp_path / 'settings.json')
+    assert 's10_pro_camera_intrinsics.json' in controller.status('camera_front')['error']
+    with pytest.raises(ValueError, match='s10_pro_camera_intrinsics.json'):
+        controller.rtsp_command('camera_front', 'rtsp://camera/front')

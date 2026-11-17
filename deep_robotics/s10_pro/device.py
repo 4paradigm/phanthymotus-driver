@@ -1580,7 +1580,7 @@ def build_plugins(config, namespace=None, ros2=None):
     native = BasicServerClient(config)
     nodes = S10Nodes(config, namespace or "", ros2) if ros2 is not None else None
     motion = S10MotionPlugin(native, nodes)
-    servo = S10LocoServoPlugin(native, ros2, motion)
+    servo = S10LocoServoPlugin(native, ros2, motion, config=config.get("loco_servo", {}))
     motion.attach_servo(servo)
     navigation = (S10NavigationPlugin(native)
                   if str(config.get("model_variant", "standard")).lower() == "pro" else None)

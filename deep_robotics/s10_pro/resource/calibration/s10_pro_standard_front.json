@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "camera_id": "deeprobotics/s10_pro/camera_front",
+  "front_camera_stream": "rtsp://10.21.33.103:8554/video4",
+  "cloud_topic": "/LIDAR/POINTS",
+  "cloud_frame_id": "lidar_link",
+  "camera_optical_frame_id": "s10_pro_camera_front_optical",
+  "translation_unit": "m",
+  "camera_axes": "x_right_y_down_z_forward",
+  "camera_optical_from_cloud": [
+    [
+      0,
+      -1,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      -1,
+      0.04673
+    ],
+    [
+      1,
+      0,
+      0,
+      -0.27065
+    ],
+    [
+      0,
+      0,
+      0,
+      1
+    ]
+  ],
+  "provenance": {
+    "kind": "shared-standard-model-mounting",
+    "position_source": "https://support.deeprobotics.cn/docs/?lang=zh-CN#/259676014",
+    "position_section": "1.9",
+    "camera_position_in_body_m": [
+      0.27065,
+      0,
+      0.04673
+    ],
+    "camera_orientation": "Operator confirmed camera faces body +X with upright image and no relative roll, pitch or yaw.",
+    "cloud_body_relationship": "Operator confirmed lidar_link and manual body frame have coincident origins and X forward, Y left, Z up axes.",
+    "scope": "S10 Pro robots with the same front camera and lens, horizontal front-facing upright mounting, and lidar_link coincident with body origin (X forward, Y left, Z up), as confirmed by the operator on 2026-11-17. Not an individual extrinsic calibration of each robot.",
+    "confirmed_on": "2026-11-17",
+    "reprojection_verified": false,
+    "temporal_synchronization": false,
+    "original_inspection": "S10 Pro CD1 inspected on 2026-11-14; camera position from hardware manual section 1.9 and operator-confirmed mounting axes. Same transform retained for the confirmed standard mounting.",
+    "intrinsics_source": "s10_pro_camera_intrinsics.json; original CD1 chessboard measurements, shared for the operator-confirmed matching front camera and lens."
+  }
+}

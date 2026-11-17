@@ -80,31 +80,61 @@ Motion uses native S10 commands and reports long-running completion through
 `/api/acp/complete`; locomotion movement accepts `yaw_rate_deg_s` in degrees per
 second and a bounded duration. Head and tail lights are independent cards.
 When Agent Core starts an execution card (`loco`, `loco_servo`, navigation,
-charging, or a light), the driver checks AOS `robot_server` TLS state first by
+charging, or a light) for real execution, the driver checks AOS `robot_server` TLS state first by
 SSH and runs the vendor's guarded `Network.toml` procedure. If SCE confirms TLS
 is already disabled, startup proceeds without restarting the service. If the
 procedure cannot confirm plaintext or reports that the robot must be rebooted,
 the card start fails with the reason shown in the frontend; no execution command
 is sent. After a successful check, this driver uses TCP for basic_server.
+Dry-run loco_servo skips this transport handshake.
 `loco_servo` is the streaming counterpart for visual navigation policies. It
-subscribes on Core domain 42 through a loopback-only bridge process. A frontend
-`start` action arms real velocity input by default; this action is the operator
-confirmation, so no separate `dry_run=false` or `confirm=true` arguments are
-needed. Set `dry_run=true` explicitly for validation without native movement.
-Live startup sends navigation mode (`Mode=1`) and navigation-flat gait
-(`GaitParam=0x3002`) before subscribing to velocity input, matching `loco.move`.
-If either send fails, startup returns an error without arming the stream.
-Dry-run startup skips both commands. A successful send is not confirmation
-that the physical mode transition has completed; the standing-state gate still applies.
-Real motion still requires `S10_MOTION_ENABLED=1` in the deployment environment;
-the supplied service fragment enables that deployment permission by default.
-Set `S10_MOTION_ENABLED=0` to revoke it. The servo stops on its watchdog. The speed limits
-match the real-robot-tested `loco` card (`vx=1.67 m/s`, `vy=0.4 m/s`,
-`wz=1.0 rad/s`). Per-step delta limits are additional software shaping, not
-claimed as measured hardware limits. Before every velocity command, it also
-requires a fresh (at most 1 second old) standing `MotionState` (`1` or `17`)
-from `/MOTION_INFO` or the BasicServer status report. Missing, stale, or
-non-standing state causes a zero-velocity hold and the command is refused.
+subscribes on Core domain 42 through a loopback-only bridge process. The card defaults to dry run. Start/restart preserve the settings saved by the
+card; action schemas carry no stale defaults that could overwrite the gear form.
+Explicitly set `dry_run=false` to enable native output; real motion still
+requires `S10_MOTION_ENABLED=1`. Dry run validates and counts input without
+checking/changing the native transport, entering a mode/gait or writing velocity.
+For live startup, navigation mode (`Mode=1`) and navigation-flat gait
+(`GaitParam=0x3002`) are sent before subscribing, matching `loco.move`.
+A successful send is not confirmation of physical completion: the S10 standing
+feedback gate always remains required. Missing, stale (over one second) or
+non-standing `MotionState` (other than `1` or `17`) holds/refuses motion.
+
+The card gear and `config`/`start` actions expose:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `dry_run` | true | Check, shape and count commands without native output |
+| `speed_preset` | normal | Forward/backward cap: slow0.15, normal0.30, fast0.50 m/s |
+| `rotate_only` | false | Clear vx/vy at execution; preserve yaw |
+| `linear_acceleration` | 0.3 | Nominal m/s² at expected10Hz for vx/vy |
+| `angular_acceleration` | 2.0 | Nominal rad/s² at expected10Hz |
+| `wz_limit` | 1.0 | Execution yaw cap, rad/s; does not multiply commands |
+| `min_vx` | 0 | Measured minimum stable speed, planner metadata only; no forced speed floor |
+
+Presets change the declared/enforced vx operating limit, not the native ceiling
+(1.67m/s). Lateral0.4m/s and native yaw1.0rad/s bounds remain unchanged. These
+are software operating settings, not new hardware measurements. Speed presets
+never scale up a requested velocity; restart navi after changing them so it
+reads the new descriptor. No minimum stable speed is invented.
+
+Configuration changes stop old real motion before applying settings, reset the
+confirmed output baseline to zero and require newly stamped commands. Pause and
+resume also reject pre-transition commands. Acceleration is a nominal per-frame
+slew limit, not a verified physical acceleration controller; an explicit zero
+axis stops immediately, including stopping forward travel while still turning.
+The implementation of these semantics is local to S10; Tianyi and shared
+ControlSink code are unchanged. Existing 300ms receive watchdog, 500ms observation
+freshness gate, sequence/priority arbitration and base ownership checks remain.
+Runtime permission revocation disarms the stream and sends zero.
+
+A rejected/failed native zero remains `stop_pending`, even after disarming.
+The reader retries zero until the native send succeeds, without accepting new nonzero input.
+This confirms a BasicServer send, not a measured physical standstill.
+Dry-run changes and restarts cannot hide a failed stop; status remains paused and
+reports the stop error. `info` reports effective settings, the descriptor,
+accepted/dry-run/refused counters and the last command verdict/output. Settings
+persist across stop/start; canvas/deployment configuration supplies them again
+after container recreation. `loco_servo` in config.yaml contains the defaults.
 The `navigation.route` action sends a sequence of up to 64 vendor `Item` targets
 in one native task request; each point has map coordinates, yaw, and point type,
 while the route shares gait, speed, direction, obstacle, and navigation mode.
@@ -184,20 +214,30 @@ bundle startup only advertises the card.
 Front-camera rectification must remain enabled (the default); the RGB card
 does not need to be placed on the canvas.
 Start the card normally; calibration and transport fields
-are not exposed in canvas settings. The inspected robot's identity-bound
-calibration is included in the image and selected automatically. Other robots
-need their own calibration, independently of canvas projects.
+are not exposed in canvas settings. The driver image includes actively loaded
+model calibration files:
 
-At each fresh start, the driver reads
+- `resource/calibration/s10_pro_camera_intrinsics.json`: unchanged K/D and source
+  resolutions for all four cameras, with original CD1 measurement provenance.
+- `resource/calibration/s10_pro_standard_front.json`: the standard front mounting
+  transform, body/cloud and optical axes, units and input/output bindings.
+
+The user confirmed on2026-11-17 that target S10Pro robots have matching front
+cameras/lenses, horizontal front-facing upright mounting, and lidar_link
+coincident with the body origin and X-forward/Y-left/Z-up axes. Under these
+conditions the packaged values are the shared default; this is not a claim that
+every robot has been independently calibrated. No NOS machine-id lookup is
+needed to select it. An altered mounting or lens requires its own calibration.
+
+At each fresh start, the driver first reads
 `/opt/phanthy-motus/data/s10_pro/camera_front_extrinsics.json` (override with
-`S10_FRONT_CAMERA_EXTRINSICS`). This is a new deployment interface, not an
-existing factory file discovered on the robot. The driver only reads it.
-When the default path is absent and no maintenance matrix is configured, it
-reads the NOS `/etc/machine-id` SHA-256 over existing strict SSH and selects
-exactly one matching record under `resource/calibration/` in the image. No
-data-volume file is created. An explicit `S10_FRONT_CAMERA_EXTRINSICS` override
-never falls back to a bundled record, even when its path is missing. Present
-invalid deployment records also never fall back.
+`S10_FRONT_CAMERA_EXTRINSICS`), a driver deployment interface. An existing
+per-unit record has precedence. If the default path is absent and no maintenance
+matrix is configured, it reads the packaged standard front record. No data-volume
+file is created. An explicit override never falls back if missing or invalid.
+The image's intrinsics are loaded from JSON as well; missing/corrupt resources
+produce a camera error and refuse enabled rectification, rather than guessing K
+or emitting unrectified video under rectified metadata.
 The version-1 JSON object requires:
 
 | Field | Required meaning |
@@ -212,26 +252,14 @@ The version-1 JSON object requires:
 | `camera_axes` | `x_right_y_down_z_forward` |
 | `camera_optical_from_cloud` | Measured directed numeric 4x4 rigid transform |
 
-No guessed default matrix is supplied: an identity or visual estimate is not a
-calibration. Missing or unmatched records return `CALIBRATION_MISSING`;
-an unavailable NOS identity returns `CALIBRATION_IDENTITY_UNAVAILABLE`. Malformed records,
-wrong camera/stream/topic/units/axes, or invalid matrices return
-`CALIBRATION_INVALID`. Start failures remain visible in `info`. A present invalid
-record cannot silently fall back to a previous or maintenance configuration.
-Stop/start reloads the file; repeated start of a healthy session is idempotent.
-
-For the robot inspected on 2026-11-14, the operator has confirmed the missing
-body/cloud and camera-axis relationships. Its derived mounting record is
-[`resource/calibration/s10_pro_cd1_inspected_20261114.json`](resource/calibration/s10_pro_cd1_inspected_20261114.json).
-It is scoped to that robot and preserves its manual/confirmation provenance.
-The image packages this record with `robot_identity.kind=nos_machine_id_sha256`
-and the inspected NOS identity digest. IP address and hardware model do not
-select it. The digest identifies the NOS operating-system installation, not
-an immutable robot serial number; replacing/reimaging NOS requires rechecking
-the binding and calibration. It is not a model-wide fallback. Each fresh start
-rechecks identity. This loader has been verified in a temporary in-memory
-probe on the actual NOS, without writing the calibration onto the robot;
-image/cloud reprojection remains unverified.
+No identity matrix or visual estimate is used as a missing-file fallback.
+A missing standard/deployment record returns `CALIBRATION_MISSING`; wrong
+camera/stream/topic/units/axes or invalid matrices return `CALIBRATION_INVALID`.
+Start errors remain visible in `info`; a present invalid deployment record never
+falls back. Stop/start reloads the extrinsics; repeated healthy start is
+idempotent. The packaged standard transform retains the hardware-manual position
+and operator-confirmed orientation. Reprojection and exposure synchronization
+remain unverified; sharing the files does not change that status.
 
 ### Automatic point-cloud transport
 

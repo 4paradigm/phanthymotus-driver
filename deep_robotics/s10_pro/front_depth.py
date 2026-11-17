@@ -24,7 +24,7 @@ from deep_robotics.s10_pro.depth_projection import (
     depth_intrinsics, fill_depth_holes, project_depth, validate_cloud_layout, validate_transform,
 )
 from deep_robotics.s10_pro.undistortion import CameraUndistortion, half_fov
-from deep_robotics.s10_pro.cloud_relay import CloudRelay, read_robot_identity
+from deep_robotics.s10_pro.cloud_relay import CloudRelay
 from deep_robotics.s10_pro.depth_fusion import fuse_depth
 from deep_robotics.s10_pro.monocular_depth import MonocularDepth
 
@@ -281,24 +281,15 @@ class FrontDepthPlugin:
             self._error_code = "CONFIGURATION_INVALID"
 
     def _bundled_extrinsics(self):
+        path = BUNDLED_CALIBRATIONS / "s10_pro_standard_front.json"
         try:
-            identity = read_robot_identity(self._relay_config)
-        except (OSError, RuntimeError) as exc:
-            raise DepthError("CALIBRATION_IDENTITY_UNAVAILABLE",
-                "无法通过现有 SSH 确认本机标定身份，请检查 NOS 连接。") from exc
-        matches = []
-        try:
-            for path in sorted(BUNDLED_CALIBRATIONS.glob("*.json")):
-                record = json.loads(path.read_text(encoding="utf-8"))
-                if record.get("robot_identity") == {"kind": "nos_machine_id_sha256", "value": identity}:
-                    matches.append((record, path))
-        except (OSError, ValueError, AttributeError, UnicodeError) as exc:
-            raise DepthError("CALIBRATION_INVALID", "镜像内的本机标定文件无法读取。") from exc
-        if not matches:
-            raise DepthError("CALIBRATION_MISSING", "未找到与本机身份匹配的前相机标定。")
-        if len(matches) != 1:
-            raise DepthError("CALIBRATION_INVALID", "本机身份对应多个标定文件，无法确定使用哪一个。")
-        return matches[0]
+            return json.loads(path.read_text(encoding="utf-8")), path
+        except FileNotFoundError as exc:
+            raise DepthError("CALIBRATION_MISSING",
+                             f"Standard S10 Pro front-camera calibration is unavailable: {path}") from exc
+        except (OSError, ValueError, UnicodeError) as exc:
+            raise DepthError("CALIBRATION_INVALID",
+                             f"Cannot read standard S10 Pro front-camera calibration {path}: {exc}") from exc
 
     def _load_extrinsics(self, settings):
         """Read deployment data; a present invalid record never falls back."""
@@ -316,8 +307,7 @@ class FrontDepthPlugin:
             else:
                 raise DepthError("CALIBRATION_MISSING",
                     f"Front-camera extrinsics are unavailable: {self.extrinsics_path}. "
-                    "A robot-specific calibration must be provisioned by deployment; "
-                    "no mounting angle or identity transform is assumed.")
+                    "The explicitly selected deployment calibration must be available.")
         except (OSError, ValueError, UnicodeError) as exc:
             raise DepthError("CALIBRATION_INVALID",
                              f"Cannot read front-camera calibration {self.extrinsics_path}: {exc}") from exc
@@ -458,6 +448,9 @@ class FrontDepthPlugin:
                 self._optical_frame = FRAME
                 settings = copy.deepcopy(self._config)
             settings, optical_frame, extrinsics_source = self._load_extrinsics(settings)
+            calibration, reason = self.controller.calibration("camera_front")
+            if calibration is None:
+                raise DepthError("CALIBRATION_INVALID", f"Front-camera intrinsics unavailable: {reason}")
             if not self.controller.active("camera_front"):
                 raise ValueError("camera_front undistort must be enabled with valid calibration")
             if self.nodes is None:

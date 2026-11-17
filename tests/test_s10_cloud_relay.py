@@ -101,18 +101,6 @@ def test_key_auth_has_no_password_fallback_or_prompt(monkeypatch):
     assert args[0] == 'ssh' and 'BatchMode=yes' in args
 
 
-@pytest.mark.parametrize('output', ['0' * 64, 'invalid', '', '0' * 64 + '\nnoise'])
-def test_robot_identity_query_checks_real_child_response_without_ros(monkeypatch, output):
-    module = relay_module()
-    monkeypatch.setattr(module, '_ssh_command', lambda config, command:
-        ([sys.executable, '-c', 'print(' + repr(output) + ')'], None), raising=False)
-    if len(output) == 64:
-        assert module.read_robot_identity({}) == output
-    else:
-        with pytest.raises(RuntimeError, match='identity'):
-            module.read_robot_identity({})
-
-
 def wait_until(predicate, seconds=3):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
