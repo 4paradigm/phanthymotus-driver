@@ -356,8 +356,9 @@ def test_card_matches_l20_schema_and_snapshot(monkeypatch):
     assert card["title"] == "L20 Lite 触觉感知"
     assert set(card["configSchema"]["properties"]) == {"bound_side", "poll_hz"}
     schema = card["inputSchema"]
-    assert set(schema["properties"]["action"]["enum"]) >= {"info", "start", "stop", "config", "get_state"}
-    assert schema["x-action-params"]["get_state"]["params"] == []
+    actions = {"info", "start", "stop", "config"}
+    assert set(schema["properties"]["action"]["enum"]) == actions
+    assert set(schema["x-action-params"]) == actions
 
     def call(action, **kwargs):
         return bundle.dispatch("hand_tactile", {"action": action, "instance_id": "a", **kwargs})

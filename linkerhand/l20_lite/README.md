@@ -187,7 +187,7 @@ delay (100/100 reads), and dropping it raises the rate from 3.4 Hz to
 about 6.5 Hz. `select_settle_s` restores the delay if a unit needs it.
 
 The card mirrors the L20 `hand_tactile` card: same lifecycle
-(`info/start/stop/config`, `get_state`), the same instance `bound_side` and
+(`info/start/stop/config`), the same instance `bound_side` and
 shared `poll_hz` settings, and the same JSON fields. The differences:
 
 - `serial_port` replaces `can_channel`, and there is no CAN interface setting.
