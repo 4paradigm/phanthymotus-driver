@@ -603,14 +603,20 @@ class ControlledSpatialMapPlugin:
             return False
 
         def spatial_sample(indices, limit):
-            """Select a regular 2D lattice rather than a flattened stride."""
+            """Keep an actual cell per spatial block, then budget across the map."""
             if len(indices) <= limit:
                 return indices
             stride = max(1, int(math.ceil(math.sqrt(len(indices) / limit))))
             rows = indices // width
             cols = indices % width
-            sampled = indices[(rows % stride == 0) & (cols % stride == 0)]
-            return sampled[:limit]
+            # A fixed lattice can miss sparse walls/floors entirely.
+            blocks = (rows // stride) * ((width + stride - 1) // stride) + cols // stride
+            _, first = self._np.unique(blocks, return_index=True)
+            sampled = indices[first]
+            if len(sampled) > limit:
+                # Taking only the first rows leaves distant POIs without a map.
+                sampled = sampled[self._np.linspace(0, len(sampled) - 1, limit, dtype=self._np.intp)]
+            return sampled
 
         # A denser floor makes the explored area readable; features retain a
         # finer grid so walls and obstacle edges stay visible.
