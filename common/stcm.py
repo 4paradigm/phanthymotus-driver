@@ -1,4 +1,12 @@
-"""Read the explore grid from Slamtec's length-prefixed STCM layers."""
+"""Read the explore grid from Slamtec's length-prefixed STCM layers.
+
+The layout is inferred from files, not taken from a Slamtec spec: verified
+against all 16 maps saved by Tianyi 2.0's chassis (2026-11). Each holds five
+layers — the explore grid first, then virtual walls, virtual tracks, POIs and
+rectangle areas — and the four after the grid are present (421 bytes) even
+when empty, which is why counting the grid back from the end of the file is
+always wrong. A file this decoder rejects is evidence the layout differs.
+"""
 
 import math
 import struct
