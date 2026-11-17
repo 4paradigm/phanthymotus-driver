@@ -121,9 +121,9 @@ class AlignmentCompletionTests(TestCase):
         plugin = PnpRemoteTeleopPlugin()
         definition = plugin.get_tools()[0]
         self.assertEqual(definition["inputSchema"]["properties"]["action"]["enum"],
-                         ["align", "follow", "Stop", "status"])
+                         ["Align", "Follow", "Stop", "Status"])
         self.assertNotIn("auto_initialize", definition["configSchema"]["properties"])
-        self.assertEqual(definition["inputSchema"]["x-completion"]["actions"], ["align"])
+        self.assertEqual(definition["inputSchema"]["x-completion"]["actions"], ["Align"])
 
     def test_visible_stop_preserves_pause_behavior(self):
         plugin = PnpRemoteTeleopPlugin()
@@ -150,7 +150,7 @@ class AlignmentCompletionTests(TestCase):
         plugin = PnpRemoteTeleopPlugin()
         plugin._loaded = True
         with patch.object(plugin, "_status", return_value={"state": "starting_follow"}), patch.object(plugin, "_ssh") as ssh:
-            result = plugin.dispatch("follow", {})
+            result = plugin.dispatch("Follow", {})
         self.assertEqual(result["state"], "error")
         ssh.assert_not_called()
 

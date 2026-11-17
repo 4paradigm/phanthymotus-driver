@@ -38,13 +38,13 @@ class PnpRemoteTeleopPlugin:
 
     def get_tools(self):
         schema = action_schema({
-            "align": ([], "Run vendor startup, align slave arms, and complete ACP while holding the aligned pose."),
-            "follow": ([], "Enable continuous vendor following after alignment has completed."),
+            "Align": ([], "Run vendor startup, align slave arms, and complete ACP while holding the aligned pose."),
+            "Follow": ([], "Enable continuous vendor following after alignment has completed."),
             "Stop": ([], "Stop PNP teleoperation in reverse vendor startup order and verify shutdown."),
-            "status": ([], "Read PNP service states and vendor execution stages."),
+            "Status": ([], "Read PNP service states and vendor execution stages."),
         }, {})
         schema.update({
-            "x-completion": {"actions": ["align"], "timeout": 150},
+            "x-completion": {"actions": ["Align"], "timeout": 150},
             "x-resource": "arm",
             "x-is-dangerous": True,
             "x-hooks": {
@@ -294,8 +294,8 @@ class PnpRemoteTeleopPlugin:
 
     def dispatch(self, action, args):
         # Core reserves lowercase stop for the card lifecycle.
-        if action == "Stop":
-            action = "pause"
+        action = {"Align": "align", "Follow": "follow", "Stop": "pause",
+                  "Status": "status"}.get(action, action)
         with self._lock:
             try:
                 if action == "config":
