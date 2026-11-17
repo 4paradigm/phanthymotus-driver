@@ -1,4 +1,4 @@
-"""Offline STCM sampling and map-frame regressions (no ROS or chassis)."""
+"""Offline STCM layer and map-frame regressions (no ROS or chassis)."""
 
 import importlib.util
 import json
@@ -12,6 +12,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
+
+from test_stcm import SEMANTIC, container, grid_layer
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,45 +35,14 @@ class SpatialMapTests(unittest.TestCase):
         self.card._grid_roll_x_cells = 0
 
     def load_grid(self, cells, origin=(-3.0, 2.0), resolution=(0.05, 0.08)):
-        properties = {
-            "dimension_width": cells.shape[1], "dimension_height": cells.shape[0],
-            "origin_x": origin[0], "origin_y": origin[1],
-            "resolution_x": resolution[0], "resolution_y": resolution[1],
-        }
-        raw = b"STCM\0vnd.slamtec.map-layer/vnd.grid-map+binary\0"
-        for name, value in properties.items():
-            value = str(value).encode("ascii")
-            raw += name.encode("ascii") + struct.pack("<H", len(value)) + value
+        raw = container(grid_layer(cells.astype(np.uint8).tobytes(),
+                                   dimension_width=cells.shape[1], dimension_height=cells.shape[0],
+                                   origin_x=origin[0], origin_y=origin[1],
+                                   resolution_x=resolution[0], resolution_y=resolution[1]), SEMANTIC)
         path = Path(self.directory.name) / "map.stcm"
-        path.write_bytes(raw + cells.astype(np.uint8).tobytes())
+        path.write_bytes(raw)
         self.assertTrue(self.card._load_stcm_grid(str(path)))
         return self.card._grid
-
-    def test_sparse_samples_cover_the_map_instead_of_cropping_first_rows(self):
-        # Each class has 90k cells aligned with its sampling lattice. The old
-        # [:limit] retained only the first 43% of floor / 15% of feature rows.
-        for value, spacing, size, budget in ((127, 2, 600, 39000), (255, 3, 900, 13000)):
-            with self.subTest(value=value):
-                cells = np.zeros((size, size), dtype=np.uint8)
-                cells[::spacing, ::spacing] = value
-                points = self.load_grid(cells)
-                self.assertGreater(len(points), 0)
-                self.assertLessEqual(len(points), budget)
-                self.assertGreater(points[:, 1].max(), 2.0 + size * 0.08 * 0.95)
-                self.assertLess(points[:, 1].min(), 2.0 + size * 0.08 * 0.05)
-                # No invented cells: every emitted point is still at a source cell center.
-                cols = np.rint((points[:, 0] + 3.0) / 0.05 - 0.5).astype(int)
-                rows = np.rint((points[:, 1] - 2.0) / 0.08 - 0.5).astype(int)
-                np.testing.assert_array_equal(cells[rows, cols], value)
-
-    def test_sparse_cells_off_the_lattice_do_not_disappear(self):
-        for value, spacing, size in ((127, 2, 600), (255, 3, 900)):
-            with self.subTest(value=value):
-                cells = np.zeros((size, size), dtype=np.uint8)
-                cells[1::spacing, 1::spacing] = value
-                points = self.load_grid(cells)
-                self.assertGreater(len(points), 0)
-                self.assertGreater(points[:, 1].max(), 2.0 + size * 0.08 * 0.95)
 
     def test_small_asymmetric_grid_preserves_map_frame_and_cell_values(self):
         cells = np.array([[127, 0, 255], [0, 50, 127]], dtype=np.uint8)
@@ -86,12 +57,20 @@ class SpatialMapTests(unittest.TestCase):
         marker = np.asarray(self.card._tag_points([tag]))
         np.testing.assert_allclose(marker[:480, :2].mean(axis=0), points[0, :2], atol=1e-6)
 
-    def test_published_map_covers_distant_pois_without_moving_them(self):
-        cells = np.zeros((600, 600), dtype=np.uint8)
-        cells[::2, ::2] = 127
+    def test_malformed_layer_is_reported_without_publishing_partial_grid(self):
+        path = Path(self.directory.name) / "truncated.stcm"
+        path.write_bytes(container(grid_layer(), SEMANTIC)[:-1])
+        self.card._grid = np.zeros((0, 3), dtype=np.float32)
+        self.assertFalse(self.card._load_stcm_grid(str(path)))
+        self.assertIn("saved map load failed", self.card._startup_error)
+        self.assertEqual(len(self.card._grid), 0)
+
+    def test_published_map_with_trailing_layer_keeps_pois_aligned(self):
+        cells = np.zeros((20, 30), dtype=np.uint8)
+        cells[:, 8:13] = 127
         self.load_grid(cells)
-        tags = [{"name": str(row), "x": 12.025, "y": 2.0 + (row + 0.5) * 0.08,
-                 "yaw": 0.7} for row in (30, 300, 570)]
+        tags = [{"name": str(row), "x": -2.475, "y": 2.0 + (row + 0.5) * 0.08,
+                 "yaw": 0.7} for row in (2, 10, 18)]
         self.card._db = SimpleNamespace(maps=lambda: [{"name": "test", "tags": tags}])
         self.card._current_map = "test"
         self.card._pose = {"x": tags[-1]["x"], "y": tags[-1]["y"], "yaw": 0.7}
@@ -116,7 +95,7 @@ class SpatialMapTests(unittest.TestCase):
         floor = points[points[:, 2] < 0]
         for tag in tags:
             distance = np.linalg.norm(floor[:, :2] - [tag["x"], tag["y"]], axis=1)
-            self.assertLess(distance.min(), 0.3, "POI must not float beyond the cropped floor")
+            self.assertLess(distance.min(), 1e-5, "POI must stay on its original floor cell")
 
 
 if __name__ == "__main__":
