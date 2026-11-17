@@ -389,17 +389,22 @@ def test_card_matches_l20_schema_and_snapshot(monkeypatch):
     assert first["force_fields_valid"] is False and first["normal_force"]["thumb"] is None
 
     second = call("get_state")
-    assert second["state"] == "error" and not second["scalar_valid"]
-    assert "index" in second["errors"]["scalar"] and second["touch_scalar"]["thumb"] is None
-    assert second["touch_cells"]["thumb"] is None
+    assert second["state"] == "degraded" and second["scalar_valid"] and second["matrix_valid"]
+    assert "index" in second["errors"]["scalar"]
+    assert second["touch_scalar"]["thumb"] is not None and second["touch_matrix"]["thumb"] is not None
+    for field in ("touch_scalar", "touch_matrix", "touch_cells", "touch_sum", "contact_flags"):
+        assert second[field]["index"] is None
     assert second["sequence"] == first["sequence"] + 1
 
     third = call("get_state")
-    assert third["errors"]["scalar"] == "标量读数已过期" and third["touch_scalar"]["index"] is None
-    assert third["touch_cells"]["index"] is None
+    assert "thumb: 读数已过期" in third["errors"]["scalar"]
+    assert third["touch_scalar"]["thumb"] is None and third["touch_matrix"]["thumb"] is None
+    assert third["touch_cells"]["thumb"] is None and third["touch_cells"]["index"] == cells(2)
 
     fourth = call("get_state")
+    assert fourth["state"] == "error" and not fourth["scalar_valid"] and not fourth["matrix_valid"]
     assert fourth["errors"]["scalar"] == "bus gone" and fourth["serial_port"] is None
+    assert all(value is None for value in fourth["touch_matrix"].values())
 
 
 def test_anonymous_stop_stops_unclaimed_auto_start_stream():

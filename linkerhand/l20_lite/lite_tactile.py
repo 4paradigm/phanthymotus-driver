@@ -269,8 +269,8 @@ class LiteTactilePlugin:
             scalar_valid = False
             scalar_time = None
             serial_port = None
-            cells = None
-            read_at = None
+            cells = {}
+            read_at = {}
             try:
                 if self.hand is None or not hasattr(self.hand, "read_tactile"):
                     raise RuntimeError(f"找不到 {side} 的手部控制器")
@@ -278,32 +278,39 @@ class LiteTactilePlugin:
                     side, FINGER_NAMES, budget_s=self.tactile_timeout_s,
                     settle_s=self.select_settle_s, cancel=cancel,
                 )
-                failed = {name: results.get(name, "未读取") for name in FINGER_NAMES
-                          if not isinstance(results.get(name), tuple)}
+                now = time.monotonic()
+                failed = {}
+                for name in FINGER_NAMES:
+                    result = results.get(name, "未读取")
+                    if not isinstance(result, tuple):
+                        failed[name] = str(result)
+                        continue
+                    values, received_at = result
+                    if (len(values) != TACTILE_CELL_COUNT
+                            or any(type(value) is not int or not 0 <= value <= 0xFFFF for value in values)):
+                        failed[name] = f"压力数据不是完整的 {TACTILE_CELL_COUNT} 点"
+                        continue
+                    age = max(0.0, now - received_at)
+                    if age > self.stale_after_s:
+                        failed[name] = "读数已过期"
+                        continue
+                    cells[name] = values
+                    read_at[name] = received_at
+                    scalar_age[name] = age
+                    # The Core renderer expects an integer in 0–255.
+                    pressure_sum = sum(values[:MATRIX_CELLS])
+                    touch_scalar[name] = min(255, (pressure_sum + MATRIX_CELLS // 2) // MATRIX_CELLS)
+                    touch_sum[name] = sum(values)
+                    touch_cells[name] = list(values)
                 if failed:
-                    raise ValueError("本轮五指压力不完整：" + "；".join(f"{name}: {exc}" for name, exc in failed.items()))
-                cells = {name: results[name][0] for name in FINGER_NAMES}
-                if any(len(cells[name]) != TACTILE_CELL_COUNT or
-                       any(isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 0xFFFF for v in cells[name])
-                       for name in FINGER_NAMES):
-                    raise ValueError(f"本轮五指压力不是完整的 {TACTILE_CELL_COUNT} 点数据")
-                read_at = {name: results[name][1] for name in FINGER_NAMES}
-                # Average the raw 12x6 pressure cells, then round and cap
-                # the scalar for the Core renderer's 0–255 integer scale.
-                touch_scalar = {
-                    name: min(255, (sum(cells[name][:MATRIX_CELLS]) + MATRIX_CELLS // 2) // MATRIX_CELLS)
-                    for name in FINGER_NAMES
-                }
-                touch_sum = {name: sum(cells[name]) for name in FINGER_NAMES}
-                # Core draws only the 12x6 touch_matrix; keep the full reply here.
-                touch_cells = {name: list(cells[name]) for name in FINGER_NAMES}
-                scalar_age = {name: max(0.0, time.monotonic() - read_at[name]) for name in FINGER_NAMES}
-                scalar_time = time.time()
-                scalar_valid = True
+                    errors["scalar"] = "本轮五指压力不完整：" + "；".join(
+                        f"{name}: {error}" for name, error in failed.items())
+                if cells:
+                    scalar_time = time.time()
+                    scalar_valid = True
             except InterruptedError:
                 raise
             except Exception as exc:
-                cells = None
                 errors["scalar"] = str(exc)
 
             entry = self._matrix_cache.setdefault(side, {})
@@ -312,34 +319,29 @@ class LiteTactilePlugin:
             if self.matrix_enabled and serial_port is not None and due:
                 entry["requested_at"] = time.monotonic()
                 self._last_matrix_req_time = entry["requested_at"]
-                # The matrix arrives in the same register reply as the pressure.
-                if cells is not None:
-                    entry.update(matrix={name: _matrix(cells[name]) for name in FINGER_NAMES},
+                # Refresh from this round only; missing fingers cannot borrow old samples.
+                if cells:
+                    entry.update(matrix={name: _matrix(values) for name, values in cells.items()},
                                  received_at=min(read_at.values()), timestamp=time.time())
                     entry.pop("error", None)
                     matrix_fresh = True
                 else:
                     entry["error"] = errors["scalar"]
             matrix_age = max(0.0, time.monotonic() - entry["received_at"]) if "received_at" in entry else None
-            matrix_valid = self.matrix_enabled and matrix_age is not None and matrix_age <= self.stale_after_s and "error" not in entry
-            matrix = entry["matrix"] if matrix_valid else {name: None for name in FINGER_NAMES}
+            matrix_available = (self.matrix_enabled and matrix_age is not None
+                                and matrix_age <= self.stale_after_s and "error" not in entry)
+            cached_matrix = entry["matrix"] if matrix_available else {}
+            matrix = {name: cached_matrix.get(name) if name in cells else None for name in FINGER_NAMES}
+            matrix_valid = any(rows is not None for rows in matrix.values())
             if self.matrix_enabled and not matrix_valid:
-                errors["matrix"] = entry.get("error", "尚未收到完整的新阵列数据")
-            matrix_sums = {name: sum(map(sum, matrix[name])) if matrix_valid else None for name in FINGER_NAMES}
+                errors["matrix"] = entry.get("error", errors.get("scalar", "尚未收到完整的新阵列数据"))
+            matrix_sums = {name: sum(map(sum, rows)) if rows is not None else None
+                           for name, rows in matrix.items()}
             contact_flags = {
-                name: ((scalar_valid and touch_scalar[name] >= self.contact_threshold) or
-                       (matrix_valid and matrix_sums[name] > 0)) if scalar_valid or matrix_valid else None
+                name: touch_scalar[name] >= self.contact_threshold or (matrix_sums[name] or 0) > 0
+                if name in cells else None
                 for name in FINGER_NAMES
             }
-            # Five sequential finger reads take time. Scalar age is measured
-            # from each finger's own reply, rather than the publication time.
-            if scalar_time is not None and max(scalar_age.values()) > self.stale_after_s:
-                scalar_valid = False
-                errors["scalar"] = "标量读数已过期"
-                touch_scalar = {name: None for name in FINGER_NAMES}
-                touch_sum = {name: None for name in FINGER_NAMES}
-                touch_cells = {name: None for name in FINGER_NAMES}
-                contact_flags = {name: matrix_sums[name] > 0 if matrix_valid else None for name in FINGER_NAMES}
             with self._lock:
                 self._sequence += 1
                 sequence = self._sequence

@@ -208,8 +208,9 @@ shared `poll_hz` settings, and the same JSON fields. The differences:
   The field is `null` whenever the round is invalid or stale.
 - `contact_flags` follows L20: `touch_scalar >= contact_threshold` or a
   positive matrix sum.
-- A round is valid only when all five fingers answer. Otherwise
-  `state=error` and `errors.scalar` names the failed fingers.
+- A partial round keeps fresh readings from the fingers that answered and
+  reports `state=degraded`. Missing or stale fingers are `null` and listed in
+  `errors.scalar`. A round with no valid readings reports `state=error`.
 
 | `plugins.hand_tactile` | Default | Meaning |
 | --- | --- | --- |
