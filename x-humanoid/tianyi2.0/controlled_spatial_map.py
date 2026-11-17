@@ -18,6 +18,8 @@ import time
 from array import array
 from collections import deque
 
+from common.stcm import decode_stcm
+
 
 _AREA_TYPES = (
     "forbidden_area", "elevator_area", "dangerous_area", "coverage_area",
@@ -543,48 +545,16 @@ class ControlledSpatialMapPlugin:
     def _load_stcm_grid(self, path: str):
         """Decode the embedded ``explore`` layer from a Slamtec STCM file.
 
-        In the STCM version emitted by this chassis, the metadata carries the
-        grid dimensions/origin/resolution and the final width*height bytes are
-        the raw uint8 grid layer.  This avoids using the mutable chassis
-        ``/maps/explore`` endpoint as a saved map's visual source.
+        Semantic layers can follow the grid, so its payload must be located
+        by layer boundaries rather than counted backwards from the file end.
         """
         try:
             with open(path, "rb") as stream:
-                raw = stream.read()
-            if not raw.startswith(b"STCM"):
-                raise ValueError("not an STCM map")
-            metadata = raw[:min(len(raw), 65536)]
-            if b"vnd.slamtec.map-layer/vnd.grid-map+binary" not in metadata:
-                raise ValueError("STCM does not contain a grid-map layer")
-
-            def property_value(name):
-                needle = name.encode("ascii")
-                offset = metadata.find(needle)
-                if offset < 0:
-                    raise ValueError(f"missing STCM property: {name}")
-                length_offset = offset + len(needle)
-                if length_offset + 2 > len(metadata):
-                    raise ValueError(f"truncated STCM property: {name}")
-                length = struct.unpack_from("<H", metadata, length_offset)[0]
-                start = length_offset + 2
-                value = metadata[start:start + length]
-                if len(value) != length:
-                    raise ValueError(f"truncated STCM value: {name}")
-                return value.decode("ascii")
-
-            width = int(property_value("dimension_width"))
-            height = int(property_value("dimension_height"))
-            min_x = float(property_value("origin_x"))
-            min_y = float(property_value("origin_y"))
-            resolution_x = float(property_value("resolution_x"))
-            resolution_y = float(property_value("resolution_y"))
-            if width <= 0 or height <= 0 or resolution_x <= 0 or resolution_y <= 0:
-                raise ValueError("invalid STCM grid dimensions")
-            cell_count = width * height
-            if cell_count > len(raw):
-                raise ValueError("STCM grid exceeds file size")
-            cells = self._np.frombuffer(raw, dtype=self._np.uint8, count=cell_count,
-                                        offset=len(raw) - cell_count).reshape(height, width)
+                grid = decode_stcm(stream.read())
+            width, height = grid["width"], grid["height"]
+            min_x, min_y = grid["origin"]
+            resolution_x, resolution_y = grid["resolution_x"], grid["resolution_y"]
+            cells = self._np.frombuffer(grid["cells"], dtype=self._np.uint8).reshape(height, width)
             if self._grid_roll_x_cells:
                 cells = self._np.roll(cells, self._grid_roll_x_cells, axis=1)
             # flatnonzero() below returns indices in row-major order. Keep the

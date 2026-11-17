@@ -41,10 +41,11 @@ import argparse
 import base64
 import json
 import sqlite3
-import struct
 import time
 import zlib
 from pathlib import Path
+
+from common.stcm import decode_stcm
 
 FREE = 0
 OCCUPIED = 100
@@ -52,29 +53,10 @@ WALL_THRESHOLD = 127          # 严格大于此值才是墙，见模块文档
 
 
 def read_stcm(path: Path) -> dict:
-    raw = path.read_bytes()
-    if not raw.startswith(b"STCM"):
-        raise ValueError(f"{path} 不是 STCM 地图")
-    meta = raw[:min(len(raw), 65536)]
-    if b"vnd.slamtec.map-layer/vnd.grid-map+binary" not in meta:
-        raise ValueError("STCM 里没有 grid-map 层")
-
-    def prop(name: str) -> str:
-        offset = meta.find(name.encode("ascii"))
-        if offset < 0:
-            raise ValueError(f"STCM 缺少属性: {name}")
-        at = offset + len(name)
-        (length,) = struct.unpack_from("<H", meta, at)
-        return meta[at + 2:at + 2 + length].decode("ascii")
-
-    width, height = int(prop("dimension_width")), int(prop("dimension_height"))
-    resolution = float(prop("resolution_x"))
-    origin = (float(prop("origin_x")), float(prop("origin_y")))
-    count = width * height
-    if count > len(raw):
-        raise ValueError("STCM 栅格长度超出文件大小")
-    return {"width": width, "height": height, "resolution": resolution,
-            "origin": origin, "cells": raw[len(raw) - count:]}
+    grid = decode_stcm(path.read_bytes())
+    return {"width": grid["width"], "height": grid["height"],
+            "resolution": grid["resolution_x"], "origin": grid["origin"],
+            "cells": grid["cells"]}
 
 
 def downsample(stcm: dict, factor: int) -> dict:
