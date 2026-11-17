@@ -132,13 +132,21 @@ def test_live_to_dry_run_stops_then_discards_preconfiguration_commands(servo):
     assert p.dispatch('info', {})['dry_run_commands'] == 1
 
 
-def test_rotate_only_and_yaw_cap_are_applied_without_amplifying_commands(servo):
+@pytest.mark.parametrize('yaw', [-.1, .1])
+def test_rotate_only_and_yaw_cap_match_the_advertised_limits(servo, yaw):
     p = servo.plugin
     assert p.dispatch('config', {'rotate_only': True, 'wz_limit': .1})['ok']
+    limits = p.dispatch('info', {})['control_interface']['limits']
+    assert limits['lower'][5] == -.1
+    assert limits['upper'][5] == .1
     p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})
-    submit(p, command(p, [.2, .2, 0, 0, 0, .9]))
+    submit(p, command(p, [.2, .2, 0, 0, 0, yaw]))
     assert servo.native.calls[-1][2] == {'X': 0., 'Y': 0., 'Z': 0.,
-                                        'Roll': 0., 'Pitch': 0., 'Yaw': .1}
+                                        'Roll': 0., 'Pitch': 0., 'Yaw': yaw}
+    count = len(servo.native.calls)
+    submit(p, command(p, [0, 0, 0, 0, 0, 9 * yaw], seq=2))
+    assert p.dispatch('info', {})['last_command']['verdict'] == 'REJECTED'
+    assert len(servo.native.calls) == count
 
 
 def test_revoked_motion_permission_stops_and_disarms_an_active_stream(servo, monkeypatch):

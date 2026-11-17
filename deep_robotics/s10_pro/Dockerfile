@@ -1,5 +1,7 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base@sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f
 ARG UBUNTU_MIRROR=http://ports.ubuntu.com/ubuntu-ports
+# Verified source model from release.261117.bb0a602; no code is inherited.
+ARG S10_DEPTH_MODEL_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/drivers/deep-robotics/s10-pro@sha256:f608a94272a1b6b386a80d59dd7bc335389997998ba4d8dd778f86b6ef57cda3
 FROM ${ROS_BASE_IMAGE} AS drdds-builder
 ARG UBUNTU_MIRROR
 RUN set -eu; package=python3-colcon-common-extensions; \
@@ -36,9 +38,12 @@ COPY requirements.txt /tmp/s10-pro-requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/s10-pro-requirements.txt && rm /tmp/s10-pro-requirements.txt
 WORKDIR /work
 
+FROM ${S10_DEPTH_MODEL_IMAGE} AS published-model
+
 FROM runtime-dependencies AS model-source
 COPY model_artifact.py /tmp/s10_model_artifact.py
-ARG S10_DEPTH_MODEL_URL=https://api.github.com/repos/ultralytics/assets/releases/assets/471363270
+COPY --from=published-model /work/deep_robotics/s10_pro/resource/models/yolo26n-depth.onnx /tmp/published-model.onnx
+ARG S10_DEPTH_MODEL_URL=file:///tmp/published-model.onnx
 RUN python3 -S /tmp/s10_model_artifact.py --model-url "${S10_DEPTH_MODEL_URL}" --output /model/source.onnx
 
 FROM runtime-dependencies AS model-builder

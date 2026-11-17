@@ -55,8 +55,8 @@ def build_descriptor(expected_hz=10.0, settings=None):
     return {
         "control_interface": "motus.control/1", "mode": "twist", "dof": 6,
         "joint_names": AXES, "units": {"linear": "m/s", "angular": "rad/s", "time": "s"},
-        "limits": {"lower": [-vx, -VY_LIMIT, 0, 0, 0, -WZ_LIMIT],
-                   "upper": [vx, VY_LIMIT, 0, 0, 0, WZ_LIMIT],
+        "limits": {"lower": [-vx, -VY_LIMIT, 0, 0, 0, -settings["wz_limit"]],
+                   "upper": [vx, VY_LIMIT, 0, 0, 0, settings["wz_limit"]],
                    "min_magnitude": [settings["min_vx"], 0, 0, 0, 0, 0],
                    "zero_immediate": True,
                    "max_delta_per_step": [linear_step, linear_step, 1e-6, 1e-6, 1e-6, angular_step]},
@@ -128,7 +128,7 @@ class S10LocoServoPlugin:
             "angular_acceleration": {"type": "number", "exclusiveMinimum": 0,
                                      "description": "转向标称加速度（rad/s²），按10Hz换算每帧步长。"},
             "wz_limit": {"type": "number", "exclusiveMinimum": 0, "maximum": WZ_LIMIT,
-                         "description": "执行端转向限幅（rad/s）；不改变向规划器声明的厂家转向上限。"},
+                         "description": "转向速度上限（rad/s）；同步用于规划器声明和执行限幅，修改后重启 navi 读取新上限。"},
         }
         return {"name": self.PREFIX, "type": "actuator", "multiInstance": False,
                 "description": "山猫 S10 Pro 连续速度控制：速度档位、空跑及执行限制，默认空跑。",
