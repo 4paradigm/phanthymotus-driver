@@ -121,7 +121,7 @@ class AlignmentCompletionTests(TestCase):
         plugin = PnpRemoteTeleopPlugin()
         definition = plugin.get_tools()[0]
         self.assertEqual(definition["inputSchema"]["properties"]["action"]["enum"],
-                         ["align", "follow", "pause", "status"])
+                         ["align", "follow", "stop", "status"])
         self.assertNotIn("auto_initialize", definition["configSchema"]["properties"])
         self.assertEqual(definition["inputSchema"]["x-completion"]["actions"], ["align"])
 

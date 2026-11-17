@@ -1,6 +1,6 @@
 # PNP FR3 teleoperation
 
-The Orin card offers `align`, `follow`, `pause`, and `status`. The PNP service starts
+The Orin card offers `align`, `follow`, `stop`, and `status`. The PNP service starts
 the four installed vendor launchers for each selected side in order. The vendor initializer
 moves the arm to its configured pose and initializes the Hand during `align`.
 
@@ -28,7 +28,7 @@ Run the PNP installer and install the restricted Orin key on each host. Leave
 the left variable empty when both USB devices are attached to one workstation.
 In that mode the card starts the sides that are ready on that workstation.
 The card keeps per-host and per-arm status, and stops all configured services
-on pause. If an SSH start request fails, it attempts to
+on stop. If an SSH start request fails, it attempts to
 stop each selected service and reports any stop that could not be confirmed.
 
 Right and left master identities come from the installed vendor side launchers.
@@ -136,5 +136,5 @@ fresh aligned status. The ACP result and any delivery failure appear in status.
 
 Follow releases that waiting session without restarting the vendor scripts.
 The current master/follower difference must remain within 0.05 rad at release.
-Moving a master before follow can require pausing and aligning again.
-Pause stops the complete service using the configured shutdown order.
+Moving a master before follow can require stopping and aligning again.
+Stop shuts down the complete service using the configured shutdown order.

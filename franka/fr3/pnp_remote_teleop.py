@@ -40,7 +40,7 @@ class PnpRemoteTeleopPlugin:
         schema = action_schema({
             "align": ([], "Run vendor startup, align slave arms, and complete ACP while holding the aligned pose."),
             "follow": ([], "Enable continuous vendor following after alignment has completed."),
-            "pause": ([], "Stop PNP teleoperation in reverse vendor startup order and verify shutdown."),
+            "stop": ([], "Stop PNP teleoperation in reverse vendor startup order and verify shutdown."),
             "status": ([], "Read PNP service states and vendor execution stages."),
         }, {})
         schema.update({
@@ -48,8 +48,8 @@ class PnpRemoteTeleopPlugin:
             "x-resource": "arm",
             "x-is-dangerous": True,
             "x-hooks": {
-                "on_interrupt_motion": {"action": "pause"},
-                "on_interrupt_all": {"action": "pause"},
+                "on_interrupt_motion": {"action": "stop"},
+                "on_interrupt_all": {"action": "stop"},
             },
         })
         definition = tool("teleop", "actuator", "PNP master teleoperation", schema)
@@ -171,7 +171,7 @@ class PnpRemoteTeleopPlugin:
         if fields.get("LoadState") != "loaded":
             raise RuntimeError(f"PNP 主控机缺少专用服务 {self._unit}")
         active = fields.get("ActiveState")
-        states = {"active": "starting_follow", "activating": "starting",
+        states = {"active": "aligning", "activating": "aligning",
                   "deactivating": "stopping", "inactive": "loaded" if self._loaded else "idle",
                   "failed": "fault"}
         state = states.get(active, "unknown")
@@ -179,7 +179,7 @@ class PnpRemoteTeleopPlugin:
         execution = json.loads(fields.pop("Execution", "{}"))
         if active == "active":
             stage = execution.get("stage")
-            state = "starting_follow"
+            state = "aligning"
             if stage == "failed":
                 state = "fault"
             else:
@@ -194,6 +194,8 @@ class PnpRemoteTeleopPlugin:
                     state = "aligned"
                 elif following and len(following) == len(arms):
                     state = "following"
+                elif following:
+                    state = "starting_follow"
         if "left" in self._hosts:
             masters = {side: masters.get(side, {})}
         return {"host": self._hosts[side], "state": state, "remote_service": fields,
@@ -224,7 +226,7 @@ class PnpRemoteTeleopPlugin:
         state = "loaded" if self._loaded else "idle"
         if active:
             for candidate in ("unreachable", "fault", "follow_interrupted", "stopping",
-                              "starting", "starting_follow", "following", "aligned", "unknown"):
+                              "aligning", "starting_follow", "following", "aligned", "unknown"):
                 if candidate in active:
                     state = candidate
                     break
@@ -318,7 +320,7 @@ class PnpRemoteTeleopPlugin:
                     return self._status()
                 if action == "align":
                     if self._align_thread and self._align_thread.is_alive():
-                        return {"state": "running", "action_id": self._acp["action_id"]}
+                        return {"state": "aligning", "action_id": self._acp["action_id"]}
                     if not self._loaded:
                         raise RuntimeError("Start the canvas project before alignment")
                     if self._init.get("state") != "ready":
@@ -339,7 +341,7 @@ class PnpRemoteTeleopPlugin:
                     active = {side for side, entry in hosts.items()
                               if entry["remote_service"].get("ActiveState") not in ("inactive", "failed")}
                     if active:
-                        raise RuntimeError("Pause the existing session before starting a new alignment")
+                        raise RuntimeError("Stop the existing session before starting a new alignment")
                     commands = {side: "pnp-align-both" if len(arms) == 2 else f"pnp-align-{arms[0]}"
                                 for side, arms in selected.items()}
                     _, errors = self._batch(selected, lambda side: self._ssh(side, commands[side]))
@@ -353,7 +355,7 @@ class PnpRemoteTeleopPlugin:
                     self._align_thread = threading.Thread(target=self._watch_alignment,
                                                           args=(action_id, self._align_cancel), daemon=True)
                     self._align_thread.start()
-                    return {"state": "running", "action_id": action_id}
+                    return {"state": "aligning", "action_id": action_id}
                 if action in ("pause", "stop"):
                     self._align_cancel.set()
                     if self._init.get("state") == "initializing":
