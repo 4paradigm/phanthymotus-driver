@@ -407,6 +407,54 @@ def test_card_matches_l20_schema_and_snapshot(monkeypatch):
     assert all(value is None for value in fourth["touch_matrix"].values())
 
 
+@pytest.mark.parametrize("matrix_enabled", [True, False])
+def test_stream_holds_last_frame_only_during_short_bus_contention(monkeypatch, matrix_enabled):
+    now = 100.0
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+    busy = TimeoutError("RS485 总线正被运动卡片占用")
+    budget = TimeoutError("L20 Lite 触觉采集超时")
+    all_busy = {name: busy for name in FINGERS}
+    partial = {name: budget for name in FINGERS[1:]}
+    partial["index"] = busy
+    all_timed_out = {name: budget for name in FINGERS}
+    hand = FakeHand([{}, partial, all_busy, all_timed_out, ValueError("右手未连接"),
+                     all_busy, all_busy, {"thumb": ([10] * 96, 101.6)}])
+    plugin = lite_tactile.LiteTactilePlugin(hand, {"matrix_enabled": matrix_enabled})
+    first = plugin._read_tactile_snapshot("right")
+    saved = first, now
+
+    now += 1.0
+    held = plugin._read_tactile_snapshot("right", last_frame=saved)
+    assert held["state"] == "degraded" and held["stale"]
+    assert held["touch_scalar"] == first["touch_scalar"]
+    assert held["touch_matrix"] == first["touch_matrix"]
+    assert held["timestamp"] == first["timestamp"]
+    assert held["scalar_timestamp"] == first["scalar_timestamp"]
+    assert held["matrix_timestamp"] == first["matrix_timestamp"]
+    assert held["scalar_age_s"]["thumb"] == pytest.approx(1.0)
+    assert held["matrix_age_s"] == (pytest.approx(1.0) if matrix_enabled else None)
+    assert not held["matrix_fresh"] and held["sequence"] == first["sequence"] + 1
+    assert "RS485" in held["errors"]["scalar"]
+
+    held_again = plugin._read_tactile_snapshot("right", last_frame=saved)
+    assert held_again["stale"] and held_again["timestamp"] == first["timestamp"]
+
+    for _ in range(2):
+        unavailable = plugin._read_tactile_snapshot("right", last_frame=saved)
+        assert unavailable["state"] == "error" and not unavailable["scalar_valid"]
+
+    # Direct reads never replay the stream frame.
+    direct = plugin._read_tactile_snapshot("right")
+    assert direct["state"] == "error" and not direct["scalar_valid"]
+
+    now = 101.6
+    expired = plugin._read_tactile_snapshot("right", last_frame=saved)
+    assert expired["state"] == "error" and not expired["scalar_valid"]
+    recovered = plugin._read_tactile_snapshot("right", last_frame=saved)
+    assert recovered["state"] == "ok" and not recovered.get("stale")
+    assert recovered["touch_scalar"]["thumb"] == 10
+
+
 def test_anonymous_stop_stops_unclaimed_auto_start_stream():
     plugin = lite_tactile.LiteTactilePlugin(FakeHand(), {}, {"side": "right"})
     plugin.start()

@@ -30,6 +30,9 @@ logger = logging.getLogger("linkerhand.l20_lite.tactile")
 FINGER_NAMES = list(FINGER_IDS)
 MATRIX_ROWS, MATRIX_COLS = 12, 6
 MATRIX_CELLS = MATRIX_ROWS * MATRIX_COLS
+BUS_HOLD_MAX_AGE_S = 1.5
+BUS_BUSY = "RS485 总线正被运动卡片占用"
+ROUND_TIMEOUT = "L20 Lite 触觉采集超时"
 
 
 def _number(value, name, lower, upper):
@@ -257,9 +260,10 @@ class LiteTactilePlugin:
 
     # ── Data Reading ──────────────────────────────────────────────────
 
-    def _read_tactile_snapshot(self, side: str, *, cancel=None) -> dict[str, Any]:
-        # Serialize direct queries with background acquisition. Every snapshot
-        # is a fresh RS485 read, never a previous cache value.
+    def _read_tactile_snapshot(
+        self, side: str, *, cancel=None, last_frame: tuple[dict, float] | None = None,
+    ) -> dict[str, Any]:
+        # Only the stream can reuse a frame. Direct queries always read RS485.
         with self._sample_lock:
             errors = {}
             touch_scalar = {name: None for name in FINGER_NAMES}
@@ -271,6 +275,7 @@ class LiteTactilePlugin:
             serial_port = None
             cells = {}
             read_at = {}
+            bus_busy = False
             try:
                 if self.hand is None or not hasattr(self.hand, "read_tactile"):
                     raise RuntimeError(f"找不到 {side} 的手部控制器")
@@ -280,10 +285,13 @@ class LiteTactilePlugin:
                 )
                 now = time.monotonic()
                 failed = {}
+                retryable_failures = set()
                 for name in FINGER_NAMES:
                     result = results.get(name, "未读取")
                     if not isinstance(result, tuple):
                         failed[name] = str(result)
+                        if type(result) is TimeoutError and failed[name] in (BUS_BUSY, ROUND_TIMEOUT):
+                            retryable_failures.add(name)
                         continue
                     values, received_at = result
                     if (len(values) != TACTILE_CELL_COUNT
@@ -305,6 +313,8 @@ class LiteTactilePlugin:
                 if failed:
                     errors["scalar"] = "本轮五指压力不完整：" + "；".join(
                         f"{name}: {error}" for name, error in failed.items())
+                    # A round deadline alone can also mean a missing Modbus reply.
+                    bus_busy = failed.keys() == retryable_failures and BUS_BUSY in failed.values()
                 if cells:
                     scalar_time = time.time()
                     scalar_valid = True
@@ -316,7 +326,12 @@ class LiteTactilePlugin:
             entry = self._matrix_cache.setdefault(side, {})
             matrix_fresh = False
             due = time.monotonic() - entry.get("requested_at", -float("inf")) >= self.matrix_interval_s
-            if self.matrix_enabled and serial_port is not None and due:
+            # Restore the full matrix as soon as the bus is available again.
+            recovering = bool(cells) and (
+                "error" in entry
+                or (len(cells) == len(FINGER_NAMES) and len(entry.get("matrix", {})) < len(FINGER_NAMES))
+            )
+            if self.matrix_enabled and serial_port is not None and (due or recovering):
                 entry["requested_at"] = time.monotonic()
                 self._last_matrix_req_time = entry["requested_at"]
                 # Refresh from this round only; missing fingers cannot borrow old samples.
@@ -345,7 +360,7 @@ class LiteTactilePlugin:
             with self._lock:
                 self._sequence += 1
                 sequence = self._sequence
-            return {
+            data = {
                 "state": "error" if not scalar_valid else "degraded" if errors else "ok",
                 "model": "l20_lite",
                 "side": side, "bound_side": side, "serial_port": serial_port,
@@ -362,6 +377,24 @@ class LiteTactilePlugin:
                 "tangential_dir": {name: None for name in FINGER_NAMES},
                 "force_fields_valid": False,
             }
+            if bus_busy and last_frame is not None:
+                saved, saved_at = last_frame
+                if serial_port == saved["serial_port"]:
+                    elapsed = time.monotonic() - saved_at
+                    scalar_age = {name: age + elapsed for name, age in saved["scalar_age_s"].items()}
+                    matrix_age = saved["matrix_age_s"] + elapsed if saved["matrix_valid"] else None
+                    if max(max(scalar_age.values()), matrix_age or 0.0) <= BUS_HOLD_MAX_AGE_S:
+                        return {
+                            **saved,
+                            "sequence": sequence,
+                            "state": "degraded",
+                            "stale": True,
+                            "scalar_age_s": scalar_age,
+                            "matrix_age_s": matrix_age,
+                            "matrix_fresh": False,
+                            "errors": errors,
+                        }
+            return data
 
     # ── ROS 2 Publishing & Streaming Thread ──────────────────────────
 
@@ -452,11 +485,20 @@ class LiteTactilePlugin:
     def _stream_loop(self) -> None:
         side = self.default_side
         consecutive_errors = 0
+        last_frame = None
 
         while not self._stop_event.is_set():
             loop_start = time.monotonic()
             try:
-                data = self._read_tactile_snapshot(side, cancel=self._stop_event)
+                data = self._read_tactile_snapshot(
+                    side, cancel=self._stop_event, last_frame=last_frame,
+                )
+                if data["state"] == "ok" and (
+                    not self.matrix_enabled or all(rows is not None for rows in data["touch_matrix"].values())
+                ):
+                    last_frame = data, time.monotonic()
+                elif not data.get("stale"):
+                    last_frame = None
                 with self._lock:
                     self._latest_data = data
                 if self._pub is None and time.monotonic() - self._last_publisher_attempt >= 2.0:
