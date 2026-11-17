@@ -395,6 +395,27 @@ def test_card_matches_l20_schema_and_snapshot(monkeypatch):
     assert fourth["errors"]["scalar"] == "bus gone" and fourth["serial_port"] is None
 
 
+def test_anonymous_stop_stops_unclaimed_auto_start_stream():
+    plugin = lite_tactile.LiteTactilePlugin(FakeHand(), {}, {"side": "right"})
+    plugin.start()
+    worker = plugin._worker_thread
+    try:
+        assert worker is not None and worker.is_alive()
+        assert plugin.dispatch("stop", {"instance_id": "unknown"})["state"] == "idle"
+        assert worker.is_alive()
+
+        assert plugin.dispatch("stop", {})["state"] == "idle"
+        assert not worker.is_alive()
+        assert plugin.dispatch("info", {})["state"] == "idle"
+        assert plugin.dispatch("stop", {})["state"] == "idle"
+
+        assert plugin.dispatch("start", {"instance_id": "named"})["state"] == "running"
+        plugin.dispatch("stop", {})
+        assert plugin.dispatch("info", {"instance_id": "named"})["state"] == "running"
+    finally:
+        plugin.stop()
+
+
 def test_streams_are_shared_by_side_and_stop_when_last_instance_leaves():
     plugin = lite_tactile.LiteTactilePlugin(FakeHand(), {"poll_hz": 10}, {"side": "right"})
     plugin.start()  # auto_start polls the default side

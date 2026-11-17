@@ -233,12 +233,20 @@ class LiteTactilePlugin:
 
     def _stop_instance_stream(self, instance_id: str) -> None:
         with self._lifecycle_lock:
-            target = self._stream_targets.pop(instance_id, None)
-            # An unowned stop must not shut down the auto-start default stream.
-            if target is not None and target not in self._stream_targets.values():
-                stream = self._streams.pop(target, None)
+            target = self._stream_targets.get(instance_id)
+            if target is None:
+                # The lifecycle starts the default stream before any card claims it.
+                if not instance_id and self.default_side not in self._stream_targets.values():
+                    self._stop_streaming()
+                return
+            other_targets = (side for owner, side in self._stream_targets.items()
+                             if owner != instance_id)
+            if target not in other_targets:
+                stream = self._streams.get(target)
                 if stream is not None:
                     stream._stop_streaming()
+                    del self._streams[target]
+            del self._stream_targets[instance_id]
 
     # ── Data Reading ──────────────────────────────────────────────────
 
