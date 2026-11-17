@@ -21,8 +21,7 @@ class PnpRemoteTeleopPlugin:
         self._init_thread = None
         self._password = ""
         self._settings = {"pnp_host": "172.16.0.200", "ssh_user": "pnp",
-                          "vendor_root": "/home/pnp/frankateleop",
-                          "conda_base": "/home/pnp/miniconda3", "auto_initialize": True}
+                          "auto_initialize": True}
         self._unit = "pnp-fr3-right-teleop.service"
         self._hosts = {"right": os.environ.get("FRANKA_PNP_SSH_HOST", "pnp@172.16.0.200")}
         left = os.environ.get("FRANKA_PNP_LEFT_SSH_HOST", "").strip()
@@ -56,8 +55,6 @@ class PnpRemoteTeleopPlugin:
                                  "format": "password", "x-sensitive": True, "writeOnly": True,
                                  "description": "首次安装或更新时使用；初始化后清除驱动内存中的密码。"},
                 "auto_initialize": {"type": "boolean", "title": "加载时自动初始化", "default": True},
-                "vendor_root": {"type": "string", "title": "厂家代码目录", "default": "/home/pnp/frankateleop"},
-                "conda_base": {"type": "string", "title": "Conda 目录", "default": "/home/pnp/miniconda3"},
             },
         }
         return [definition]
@@ -77,9 +74,6 @@ class PnpRemoteTeleopPlugin:
         ipaddress.ip_address(settings["pnp_host"])
         if not re.fullmatch(r"[a-z_][a-z0-9_-]*", settings["ssh_user"]):
             raise ValueError("Invalid SSH user")
-        for key in ("vendor_root", "conda_base"):
-            if not re.fullmatch(r"/[A-Za-z0-9_./-]+", settings[key]):
-                raise ValueError("Invalid PNP installation path")
         if type(settings["auto_initialize"]) is not bool:
             raise ValueError("auto_initialize must be boolean")
         changed = settings != self._settings or "ssh_password" in args
@@ -99,7 +93,6 @@ class PnpRemoteTeleopPlugin:
         from franka.fr3.pnp_initialize import initialize
         self._init = {"state": "initializing", "stage": "starting"}
         password, self._password = self._password, ""
-        settings = dict(self._settings)
         host = self._hosts["right"]
 
         def progress(stage):
@@ -108,8 +101,7 @@ class PnpRemoteTeleopPlugin:
 
         def work():
             try:
-                result = initialize(host, password, settings["vendor_root"],
-                                    settings["conda_base"], progress)
+                result = initialize(host, password, progress)
             except Exception as exc:
                 message = str(exc).replace(password, "[redacted]") if password else str(exc)
                 result = {"state": "error", "message": message}

@@ -8,7 +8,6 @@ unit = "pnp-fr3-right-teleop.service"
 state = subprocess.check_output(["systemctl", "show", unit, "-p", "ActiveState", "--value"], text=True).strip()
 if state not in ("inactive", "failed"):
     raise RuntimeError("Stop the PNP teleoperation service before initialization")
-env = dict(os.environ, PNP_VENDOR_ROOT=data["vendor_root"], PNP_CONDA_BASE=data["conda_base"], PNP_INSTALL_STDIN_PASSWORD="1")
 password = data.pop("password")
 with tempfile.TemporaryDirectory(prefix="fr3-card-install-") as directory:
     stage = Path(directory)
@@ -20,6 +19,11 @@ with tempfile.TemporaryDirectory(prefix="fr3-card-install-") as directory:
             raise ValueError("Invalid package path")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(base64.b64decode(encoded))
+    sys.path.insert(0, str(stage))
+    from detect_paths import discover_paths
+    vendor, conda = discover_paths()
+    env = dict(os.environ, PNP_VENDOR_ROOT=str(vendor), PNP_CONDA_BASE=str(conda),
+               PNP_INSTALL_STDIN_PASSWORD="1")
     auth = subprocess.run(["sudo", "-S", "-p", "", "-v"], input=password + "\n",
                           text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
     if auth.returncode:

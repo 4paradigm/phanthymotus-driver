@@ -17,7 +17,7 @@ class InitializationTests(TestCase):
         p=PnpRemoteTeleopPlugin()
         p.dispatch('config', {'ssh_password':'test-secret'})
         entered, release=threading.Event(),threading.Event()
-        def install(host,password,vendor,conda,progress):
+        def install(host,password,progress):
             entered.set()
             release.wait(2)
             return {'state':'ready'}

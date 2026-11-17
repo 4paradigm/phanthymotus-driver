@@ -69,8 +69,8 @@ the destination. FCI runs locally between PNP and the Franka controllers.
 
 ## Initialize from the canvas
 
-Fill in the workstation IP, SSH username, initial SSH password, vendor tree
-and Conda base directory. With automatic initialization enabled, loading the
+Fill in the workstation IP, SSH username, initial SSH password. The installer discovers the vendor tree
+and Polymetis Conda base on the remote host. With automatic initialization enabled, loading the
 card starts an asynchronous install. `status` returns `initialization.state`
 and the current stage. It checks the package version, installs the image's
 support sources, configures the service and limited sudo rule, authorizes a
