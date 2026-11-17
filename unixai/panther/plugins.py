@@ -4,6 +4,18 @@ from __future__ import annotations
 
 from common.camera_info import build as build_camera_info
 
+
+ARM_JOINT_TITLES = (
+    "Shoulder Rotation",
+    "Shoulder Abduction",
+    "Shoulder Raise",
+    "Elbow Rotation",
+    "Elbow Flexion/Extension",
+    "Wrist 1",
+    "Wrist 2",
+    "Wrist 3",
+)
+
 def _sensor_schema():
     return {
         "type": "object",
@@ -238,20 +250,28 @@ def build_plugins(config, namespace, device):
     if on("arm_control"):
         joint_limits = device.schema_joint_limits_deg() or {}
 
-        def joint_field(name: str, label: str) -> dict:
+        def format_range(bounds: tuple[float | None, float | None]) -> str:
+            lower, upper = bounds
+            if lower is None or upper is None:
+                return "unavailable"
+            return f"[{lower:.1f}, {upper:.1f}] deg"
+
+        def joint_field(name: str, title: str) -> dict:
             lower, upper = joint_limits.get(name, (None, None))
-            prefix = (f"[{lower:.1f}, {upper:.1f}] deg; "
-                      if lower is not None and upper is not None else "Live URDF range; ")
+            prefix = (f"vendor URDF limit {format_range((lower, upper))}; "
+                      if lower is not None and upper is not None
+                      else "vendor URDF limit unavailable; ")
             max_delta = enabled["arm_control"].get("max_target_delta_deg", 20.0)
-            field = {"type": "number", "description": prefix + label + f"; max {max_delta:g} deg change per command"}
+            field = {"type": "number", "title": f"{title} (deg)",
+                     "description": prefix + title + f"; max {max_delta:g} deg change per command"}
             if lower is not None and upper is not None:
                 field.update(minimum=lower, maximum=upper)
             return field
 
         separate_joint_fields = {
-            **{f"la{i}_deg": joint_field(f"joint_la{i}", f"left arm joint la{i}")
+            **{f"la{i}_deg": joint_field(f"joint_la{i}", f"Left {ARM_JOINT_TITLES[i]}")
                for i in range(8)},
-            **{f"ra{i}_deg": joint_field(f"joint_ra{i}", f"right arm joint ra{i}")
+            **{f"ra{i}_deg": joint_field(f"joint_ra{i}", f"Right {ARM_JOINT_TITLES[i]}")
                for i in range(8)},
         }
 
@@ -262,8 +282,10 @@ def build_plugins(config, namespace, device):
             max_delta = enabled["arm_control"].get("max_target_delta_deg", 20.0)
             field = {
                 "type": "number",
+                "title": f"{ARM_JOINT_TITLES[index]} (deg)",
                 "description": (
-                    f"arm joint {index} in deg; both mirrors the right arm from the vendor URDF; "
+                    f"vendor URDF limits: left/both {format_range(left)}, "
+                    f"right {format_range(right)}; both mirrors the right arm; "
                     f"max {max_delta:g} deg change per command"
                 ),
             }

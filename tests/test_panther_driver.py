@@ -83,6 +83,16 @@ class PantherDriverTest(unittest.TestCase):
             def __getattr__(self, _name):
                 return lambda *_args, **_kwargs: None
 
+            @staticmethod
+            def schema_joint_limits_deg():
+                limits = contracts.parse_joint_limits(
+                    (DRIVER / "resource" / "panther.urdf").read_text()
+                )
+                return {
+                    name: (math.degrees(lower), math.degrees(upper))
+                    for name, (lower, upper) in limits.items()
+                }
+
         config = {"plugins": {
             "base_drive": {"enabled": True, "max_linear_mps": 0.5,
                            "max_angular_deg_s": 45.0, "max_duration_s": 10.0},
@@ -116,6 +126,20 @@ class PantherDriverTest(unittest.TestCase):
              "duration_s", "confirm_motion"],
         )
         self.assertIs(arm["properties"]["confirm_motion"]["const"], True)
+        self.assertIn(
+            "left/both [0.0, 90.0] deg, right [-90.0, 0.0] deg",
+            arm["properties"]["j2_deg"]["description"],
+        )
+        self.assertIn(
+            "vendor URDF limit [-127.8, 0.0] deg",
+            arm["properties"]["la4_deg"]["description"],
+        )
+        self.assertEqual(arm["properties"]["j4_deg"]["title"],
+                         "Elbow Flexion/Extension (deg)")
+        self.assertEqual(arm["properties"]["la0_deg"]["title"],
+                         "Left Shoulder Rotation (deg)")
+        self.assertEqual(arm["properties"]["ra7_deg"]["title"],
+                         "Right Wrist 3 (deg)")
         gripper = tools["gripper"]["inputSchema"]
         self.assertEqual(gripper["properties"]["side"]["enum"], ["left", "right", "both"])
         self.assertTrue({"set", "open", "close", "stop"} <= set(gripper["properties"]["action"]["enum"]))
@@ -188,6 +212,26 @@ class PantherDriverTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "confirm_motion=true"):
                         method(args)
 
+    def test_default_false_commissioning_gate_rejects_confirmed_physical_motion(self):
+        device = object.__new__(device_module.PantherDevice)
+        device._commissioning_motion_enabled = False
+        calls = (
+            (device.drive, {"action": "move", "confirm_motion": True}),
+            (device.arm, {"action": "home", "confirm_motion": True}),
+            (device.gripper, {"action": "open", "confirm_motion": True}),
+            (device.lifting, {"action": "home", "confirm_motion": True}),
+            (device.head, {"action": "home", "confirm_motion": True}),
+        )
+        for method, payload in calls:
+            with self.subTest(method=method.__name__), self.assertRaisesRegex(
+                RuntimeError, "commissioning_motion_enabled is false"
+            ):
+                method(payload)
+        device._commissioning_motion_enabled = True
+        device.robot_state = lambda: {"ready_for_motion": False}
+        with self.assertRaisesRegex(RuntimeError, "fresh joint and hardware state"):
+            device._ensure_motion_ready()
+
     def test_state_and_battery_are_separate_streams(self):
         device = (DRIVER / "device.py").read_text()
         robot_state = device.split("    def robot_state(self)", 1)[1].split(
@@ -243,6 +287,7 @@ class PantherDriverTest(unittest.TestCase):
             device._arm_lock = threading.RLock()
             device._arm_active = None
             names = [*contracts.LEFT_ARM_JOINTS, *contracts.RIGHT_ARM_JOINTS]
+            device._model_joint_limits = dict.fromkeys(names, (-math.pi, math.pi))
             device._joint_limits = dict.fromkeys(names, (-math.pi, math.pi))
             joint_msg = SimpleNamespace(name=names, position=[0.0] * len(names))
             device._cache = {"joints": (joint_msg, time.monotonic())}
@@ -313,6 +358,13 @@ class PantherDriverTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly one byte"):
             contracts.byte_value(b"12", "level")
 
+    def test_commissioning_boolean_is_parsed_strictly(self):
+        self.assertTrue(contracts.strict_boolean("true", "gate"))
+        self.assertFalse(contracts.strict_boolean("false", "gate"))
+        self.assertFalse(contracts.strict_boolean(False, "gate"))
+        with self.assertRaisesRegex(ValueError, "explicit boolean"):
+            contracts.strict_boolean("enabled", "gate")
+
     def test_sensor_start_rejects_missing_or_stale_device_data(self):
         class FakeDevice:
             topics = {"imu": {"topic": "/test/imu", "format": "data/json"}}
@@ -352,11 +404,56 @@ class PantherDriverTest(unittest.TestCase):
         self.assertIn('name=f"panther_core_{card}"', source)
         self.assertIn('"restarts"', source)
 
-    def test_live_urdf_limits_are_authoritative(self):
+    def test_live_urdf_limits_are_parsed(self):
         urdf = """<robot name='p'><joint name='joint_la0' type='revolute'>
           <limit lower='-1.0' upper='2.0' effort='1' velocity='1'/>
         </joint></robot>"""
         self.assertEqual(contracts.parse_joint_limits(urdf), {"joint_la0": (-1.0, 2.0)})
+
+    def test_arm_limits_are_vendor_live_intersection(self):
+        names = ("joint_la0", "joint_la1")
+        self.assertEqual(
+            contracts.intersect_joint_limits(
+                names,
+                {"joint_la0": (-1.0, 1.0), "joint_la1": (-2.0, 2.0)},
+                {"joint_la0": (-2.0, 2.0), "joint_la1": (-0.5, 0.75)},
+            ),
+            {"joint_la0": (-1.0, 1.0), "joint_la1": (-0.5, 0.75)},
+        )
+        with self.assertRaisesRegex(ValueError, "do not overlap"):
+            contracts.intersect_joint_limits(
+                ("joint_la0",), {"joint_la0": (-1.0, 0.0)},
+                {"joint_la0": (0.5, 1.0)},
+            )
+
+    def test_arm_runtime_rejects_target_outside_vendor_limit_when_live_is_wider(self):
+        device = object.__new__(device_module.PantherDevice)
+        device._cfg = {"plugins": {"arm_control": {
+            "max_duration_s": 20.0, "min_duration_s": 1.0,
+            "speed_deg_s": 20.0, "max_target_delta_deg": 180.0,
+        }}}
+        device._lock = threading.RLock()
+        device._arm_lock = threading.RLock()
+        device._arm_active = None
+        names = [*contracts.LEFT_ARM_JOINTS, *contracts.RIGHT_ARM_JOINTS]
+        device._model_joint_limits = contracts.parse_joint_limits(
+            (DRIVER / "resource" / "panther.urdf").read_text()
+        )
+        device._joint_limits = dict.fromkeys(names, (-math.pi, math.pi))
+        joint_msg = SimpleNamespace(name=names, position=[0.0] * len(names))
+        device._cache = {"joints": (joint_msg, time.monotonic())}
+        device._ensure_motion_ready = lambda: None
+        for target in (
+            {"j0_deg": 70.0},
+            {"positions_deg": [70.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+        ):
+            with self.subTest(target=target), self.assertRaisesRegex(
+                ValueError, "outside URDF limit"
+            ):
+                device.arm({
+                    "action": "move", "side": "left", **target,
+                    "duration_s": 1.0, "confirm_motion": True,
+                })
 
     def test_render_model_and_joint_indices_share_one_snapshot(self):
         device = (DRIVER / "device.py").read_text()
@@ -485,6 +582,61 @@ class PantherDriverTest(unittest.TestCase):
         self.assertEqual(topics["camera_color"]["format"], "image/jpeg")
         self.assertEqual(topics["camera_depth"]["format"], "image/depth-zlib")
         self.assertFalse({"laser_front", "laser_rear", "laser_fused"} & set(topics))
+
+    def test_lidar_callback_matches_bridge_json_and_jpeg_contracts(self):
+        class FakeImage:
+            def __setitem__(self, _key, _value):
+                pass
+
+        class FakeEncoded:
+            @staticmethod
+            def tobytes():
+                return b"\xff\xd8test-jpeg\xff\xd9"
+
+        numpy = ModuleType("numpy")
+        numpy.uint8 = object()
+        numpy.zeros = lambda *_args, **_kwargs: FakeImage()
+        cv2 = ModuleType("cv2")
+        cv2.IMWRITE_JPEG_QUALITY = 1
+        cv2.circle = lambda *_args, **_kwargs: None
+        cv2.imencode = lambda *_args, **_kwargs: (True, FakeEncoded())
+
+        device = object.__new__(device_module.PantherDevice)
+        device._lock = threading.RLock()
+        device._cache = {}
+        device._last_card_publish = {}
+        device._laser_render_failures = 0
+        device._log_laser_render_failure = (
+            lambda exc: (_ for _ in ()).throw(exc)
+        )
+        captured = {}
+        device._publish_limited = (
+            lambda card, payload, _rate, force=False: captured.setdefault(card, payload)
+        )
+        scan = SimpleNamespace(
+            header=SimpleNamespace(frame_id="laser"),
+            ranges=[1.0, float("inf"), 2.0],
+            angle_min=-1.0, angle_max=1.0, angle_increment=1.0,
+            range_min=0.1, range_max=10.0,
+        )
+        with patch.dict(sys.modules, {"cv2": cv2, "numpy": numpy}), patch.object(
+            device_module.time, "monotonic", return_value=10.0
+        ):
+            device._on_laser(scan)
+
+        scan_wire = core_bridge.encode_bridge_payload("laser_scan", captured["laser_scan"])
+        scan_json = json.loads(scan_wire["data"])
+        self.assertEqual(scan_wire["kind"], "string")
+        self.assertEqual(scan_json["source_topic"], "/scan")
+        self.assertEqual(scan_json["ranges"], [1.0, None, 2.0])
+        view_wire = core_bridge.encode_bridge_payload("laser_view", captured["laser_view"])
+        self.assertEqual(view_wire["kind"], "compressed_image")
+        self.assertEqual(view_wire["message_format"], "jpeg")
+        self.assertTrue(view_wire["data"].startswith(b"\xff\xd8"))
+        with self.assertRaisesRegex(ValueError, "not JPEG"):
+            core_bridge.encode_bridge_payload(
+                "laser_view", {"message_format": "jpeg", "data": b"not-jpeg"}
+            )
 
     def test_removed_nav_and_ultrasonic_have_no_runtime_code(self):
         plugins = (DRIVER / "plugins.py").read_text()
@@ -663,12 +815,16 @@ class PantherDriverTest(unittest.TestCase):
         manifest = (DRIVER / "driver.yaml").read_text()
         service = (DRIVER / "deploy" / "service.yml").read_text()
         dockerfile = (DRIVER / "Dockerfile").read_text()
-        self.assertNotIn("commissioning_motion_enabled", config)
+        self.assertIn("commissioning_motion_enabled: false", config)
         for text in (config, manifest, dockerfile):
             self.assertIn("15792", text)
         self.assertIn("AGENT_CORE_ROS_DOMAIN_ID=42", service)
         self.assertIn(
             "PANTHER_MCP_ADVERTISE_HOST=${PANTHER_MCP_ADVERTISE_HOST:-localhost}",
+            service,
+        )
+        self.assertIn(
+            "PANTHER_COMMISSIONING_MOTION_ENABLED=${PANTHER_COMMISSIONING_MOTION_ENABLED:-false}",
             service,
         )
         self.assertIn("PANTHER_ROS_DOMAIN_ID=0", service)

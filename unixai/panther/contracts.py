@@ -30,6 +30,19 @@ def finite_number(value, field: str) -> float:
     return value
 
 
+def strict_boolean(value, field: str) -> bool:
+    """Parse a trusted configuration boolean without truthy-string surprises."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes", "on"):
+            return True
+        if normalized in ("false", "0", "no", "off"):
+            return False
+    raise ValueError(f"{field} must be an explicit boolean")
+
+
 def finite_vector(value, field: str, length: int) -> list[float]:
     if not isinstance(value, (list, tuple)) or len(value) != length:
         raise ValueError(f"{field} must contain exactly {length} numbers")
@@ -109,6 +122,35 @@ def parse_joint_limits(urdf: str) -> dict[str, tuple[float, float]]:
         if math.isfinite(lo) and math.isfinite(hi) and lo <= hi:
             limits[name] = (lo, hi)
     return limits
+
+
+def intersect_joint_limits(
+    joint_names: tuple[str, ...],
+    vendor_limits: dict[str, tuple[float, float]],
+    live_limits: dict[str, tuple[float, float]],
+) -> dict[str, tuple[float, float]]:
+    """Return the safe overlap of bundled vendor and live robot limits.
+
+    The bundled vendor URDF is the maximum permitted envelope.  A live
+    ``/robot_description`` may narrow that envelope, but it must never widen
+    it.  Missing or contradictory limits are rejected instead of guessed.
+    """
+    for label, limits in (("vendor", vendor_limits), ("live", live_limits)):
+        missing = [name for name in joint_names if name not in limits]
+        if missing:
+            raise ValueError(
+                f"{label} URDF has no limits for: " + ", ".join(missing)
+            )
+    bounded: dict[str, tuple[float, float]] = {}
+    for name in joint_names:
+        vendor_lower, vendor_upper = vendor_limits[name]
+        live_lower, live_upper = live_limits[name]
+        lower = max(vendor_lower, live_lower)
+        upper = min(vendor_upper, live_upper)
+        if lower > upper:
+            raise ValueError(f"vendor and live URDF limits do not overlap for {name}")
+        bounded[name] = (lower, upper)
+    return bounded
 
 
 def parse_joint_indices(urdf: str) -> dict[str, int]:

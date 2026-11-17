@@ -16,6 +16,7 @@ unixai-panther:
     - PANTHER_ROS_DOMAIN_ID=0
     - AGENT_CORE_ROS_DOMAIN_ID=42
     - PANTHER_MCP_ADVERTISE_HOST=${PANTHER_MCP_ADVERTISE_HOST:-localhost}
+    - PANTHER_COMMISSIONING_MOTION_ENABLED=${PANTHER_COMMISSIONING_MOTION_ENABLED:-false}
     - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     - CYCLONEDDS_URI=file:///etc/cyclonedds/panther.xml
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml

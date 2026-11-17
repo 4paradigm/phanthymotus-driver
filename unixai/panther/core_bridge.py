@@ -31,6 +31,37 @@ def output_topics(namespace: str) -> dict[str, dict[str, str]]:
     }
 
 
+def encode_bridge_payload(card: str, payload) -> dict:
+    """Encode one card payload using the same contract as its ROS publisher."""
+    if card not in TOPIC_SUFFIXES:
+        raise ValueError(f"unknown bridge card: {card}")
+    data_format = TOPIC_SUFFIXES[card][1]
+    if data_format.startswith("image/"):
+        if not isinstance(payload, dict):
+            raise ValueError(f"{card} image payload must be an object")
+        raw = payload.get("data", b"")
+        if not isinstance(raw, (bytes, bytearray, memoryview)):
+            raise ValueError(f"{card} image data must be bytes")
+        data = bytes(raw)
+        message_format = str(payload.get("message_format", ""))
+        if data_format == "image/jpeg":
+            if message_format.lower() not in ("jpeg", "jpg"):
+                raise ValueError(f"{card} must publish jpeg message_format")
+            if not data.startswith(b"\xff\xd8"):
+                raise ValueError(f"{card} payload is not JPEG data")
+        return {
+            "kind": "compressed_image",
+            "message_format": message_format,
+            "data": data,
+            "frame_id": str(payload.get("frame_id", "")),
+            "stamp": payload.get("stamp") or {},
+        }
+    return {
+        "kind": "string",
+        "data": json.dumps(payload, ensure_ascii=False, allow_nan=False),
+    }
+
+
 def _put_latest(messages, item) -> bool:
     try:
         messages.put_nowait(item)
@@ -165,17 +196,18 @@ def _run_lane(messages, profile: str, domain: int, namespace: str, card: str) ->
             payload = messages.get()
             if payload is None:
                 break
+            wire = encode_bridge_payload(card, payload)
             if message_type is CompressedImage:
                 message = CompressedImage()
-                message.format = str(payload.get("message_format", "jpeg"))
-                message.data = payload.get("data", b"")
-                message.header.frame_id = str(payload.get("frame_id", ""))
-                stamp = payload.get("stamp") or {}
+                message.format = wire["message_format"]
+                message.data = wire["data"]
+                message.header.frame_id = wire["frame_id"]
+                stamp = wire["stamp"]
                 message.header.stamp.sec = int(stamp.get("sec", 0))
                 message.header.stamp.nanosec = int(stamp.get("nanosec", 0))
             else:
                 message = String()
-                message.data = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+                message.data = wire["data"]
             publisher.publish(message)
     finally:
         node.destroy_node()

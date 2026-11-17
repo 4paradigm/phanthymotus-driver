@@ -23,7 +23,8 @@ publishes anything. Once a live `/robot_description` is available, reading the
 model resource atomically switches both the returned URDF and the `joints`
 rendering indices to that same live snapshot. The response includes its source
 and SHA-256 digest so a renderer can identify the active morphology. Live
-`/robot_description` also remains authoritative for motion limits. `joints`,
+`/robot_description` may narrow, but never widen, the bundled vendor motion
+limits. Arm execution uses the intersection of both limit sets. `joints`,
 `imu`, `odom`, `robot_state`, `battery`, and `laser_scan` are rate limited before crossing
 the per-card domain-42 bridge.
 
@@ -62,8 +63,12 @@ for these concrete runtime paths:
 For a base-image update, measure package-layer changes with `docker history`
 instead of recording a size that becomes stale with the moving base image.
 
-Every physical-motion action requires `confirm_motion: true`: base `move`, arm
-`move`/`home`, gripper `set`/`open`/`close`, lifting `set_position`/`home`, and
+Physical motion is disabled by default. A trusted deployment must set
+`PANTHER_COMMISSIONING_MOTION_ENABLED=true` before any command can move the
+robot. This deployment-level gate is not an MCP argument and cannot be enabled
+by an action caller. After the gate is enabled, every physical-motion action
+still requires `confirm_motion: true`: base `move`, arm
+`move`/`move_separate`/`home`, gripper `set`/`open`/`close`, lifting `set_position`/`home`, and
 head `look`/`home`. The requirement is declared in each MCP schema and enforced
 again at the first runtime boundary, before any controller query, ROS publisher,
 or robot-state access. Lifecycle-only actions (`start`, `info`, `stop`, and
@@ -97,7 +102,14 @@ controls the second (`joint_head1`).
 apply it directly to one arm; `side=both` mirrors it across the sagittal plane
 using the vendor URDF joint axes. `move_separate` exposes the full independent
 left-eight plus right-eight target. Legacy vector arguments remain accepted by
-the runtime but are not shown in the ordinary canvas form.
+the runtime but are not shown in the ordinary canvas form. Each form field
+states the corresponding vendor-URDF range; shared fields show separate
+left/`both` and right ranges where they differ. Every completed target is
+checked against the vendor/live limit intersection before an action is queued.
+The canvas uses English semantic titles (`Shoulder Rotation`, `Shoulder
+Abduction`, `Shoulder Raise`, `Elbow Rotation`, `Elbow Flexion/Extension`, and
+`Wrist 1` through `Wrist 3`) while retaining the existing parameter keys for
+API compatibility.
 
 ## Deliberately deferred
 

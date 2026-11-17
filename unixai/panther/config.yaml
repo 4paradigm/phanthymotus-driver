@@ -7,6 +7,11 @@ ros:
   core_domain_id: 42
   robot_rmw: "rmw_cyclonedds_cpp"
 
+safety:
+  # Deployment-level authorization. Per-command confirm_motion is still
+  # required after this gate is explicitly enabled.
+  commissioning_motion_enabled: false
+
 plugins:
   joints: {enabled: true}
   robot_state: {enabled: true}
@@ -46,7 +51,7 @@ plugins:
     max_duration_s: 20.0
     min_duration_s: 1.0
     speed_deg_s: 20.0
-    # Additional commissioning gate; URDF hard limits are always enforced too.
+    # Per-command joint-step cap; URDF hard limits are always enforced too.
     max_target_delta_deg: 20.0
     # PR 521-compatible candidate pose; the ordinary per-command delta gate
     # remains mandatory until this target is independently hardware-verified.
