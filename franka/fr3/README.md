@@ -190,8 +190,7 @@ Speeds are joint degrees/s and total finger-spacing mm/s, not percentages.
 Legacy saved IP-bearing arm labels migrate by physical side. Dual-arm execution requires the IP input; configured YAML defaults alone do not
 authorize motion.
 
-`observe` immediately returns an `action_id`, uses a fixed 2 deg/s observation
-speed and reports its terminal result through ACP, including object names,
+`observe` uses a fixed 2 deg/s observation speed and returns object names,
 normalized positions and confidence. Position is image-centered XY in [-1,1],
 with positive X right and positive Y down; it is not a robot-base coordinate.
 The driver retains aligned RGB-D, camera calibration and the captured SDK EE

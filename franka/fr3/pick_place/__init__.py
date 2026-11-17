@@ -127,7 +127,7 @@ class PickPlacePlugin:
         })
         schema['allOf'] = [{'if': {'properties': {'action': {'enum': ['observe', 'grab_to', 'grab_by']}}},
                             'then': {'required': ['confirm_motion']}}]
-        schema.update({'x-completion': {'actions': ['observe', 'grab_to', 'grab_by'], 'timeout': 1200}, 'x-resource': 'arm',
+        schema.update({'x-completion': {'actions': ['grab_to', 'grab_by'], 'timeout': 1200}, 'x-resource': 'arm',
                        'x-is-dangerous': True,
                        'x-hooks': {'on_interrupt_motion': {'action': 'cancel'},
                                    'on_interrupt_all': {'action': 'cancel'}}})
@@ -135,7 +135,7 @@ class PickPlacePlugin:
             'FR3 wrist pick and place. Run observe, then select objects[].position in [-1,1]: X right, Y down. '
             'grab_to uses a placement point in the same photograph; grab_by uses actual table millimetres aligned with that photograph. '
             'An optional arm_ip_sync JSON input supplies both controller IPs without restarting; wait for the first valid mapping before motion. '
-            'Observe returns an action_id immediately and detections through ACP. Transfers auto-observe when needed and return an action_id for ACP. Successful transfers release and return to observation. '
+            'Observe returns detections synchronously as JSON. Transfers auto-observe when needed and return an action_id for ACP. Successful transfers release and return to observation. '
             'observe_after_transfer optionally captures a new observation after returning. Check transfer_completed, return_completed, '
             'recovery_required and observation_required before starting another task. '
             'Rotation defaults to zero; only request extra rotation when needed. Force is read from configuration; observe uses 2 deg/s; transfer speeds are read from configuration. FR3 force is in newtons, not a RealMan raw register value.',
@@ -320,27 +320,28 @@ class PickPlacePlugin:
             if not self.enabled: return dict(state='error', message='Start the three observation inputs first')
             if not self.address or not self.serial: raise ValueError('Configure the selected arm and wrist camera before observation')
             target = joint_target(self.config['observation_joints_deg'])
+            try:
+                self.inputs.prepare()
+                self.inputs.binding()
+            except (RuntimeError, ValueError) as exc:
+                return dict(state='error', code='CAMERA_NOT_READY', message=str(exc))
             active = dict(action_id='vision_pick_and_drop_observe_'+uuid4().hex, cancel=threading.Event(),
                           owner='vision_pick_and_drop_'+uuid4().hex, target=target, speed_deg_s=2., config=dict(self.config),
                           stage='checking', session=None, command_id=None)
             self.observation = None; self.active = active
-            active['action'] = 'observe'
-            threading.Thread(target=self.run_observe, args=(active,), daemon=True, name='fr3-observe').start()
-            return dict(state='running', action_id=active['action_id'])
-
-    def run_observe(self, active):
-        try:
-            self.inputs.prepare()
-            self.inputs.binding()
-            status, result = self.run_observation(active)
-        except Exception as exc:
-            status = 'cancelled' if active['cancel'].is_set() else 'error'
-            result = dict(ok=False, message=str(exc), stage=active['stage'])
+        status, result = self.run_observation(active)
         if status == 'completed':
             result = {'objects': [
                 {'name': obj['name'], 'position': [round(value, 3) for value in obj['position']],
-                 'confidence': obj['confidence']} for obj in result['objects']]}
-        self.complete(active, status, result)
+                 'confidence': obj['confidence']}
+                for obj in result['objects']
+            ]}
+        with self.lock:
+            terminal = dict(state=status, action_id=active['action_id'], result=result,
+                            observation_required=self.observation is None, action='observe')
+            self.last_result = terminal
+            self.active = None
+        return terminal
 
     def state(self, active, *, settling=False):
         if active['cancel'].is_set(): raise RuntimeError('Observation cancelled')
