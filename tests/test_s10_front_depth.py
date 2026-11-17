@@ -873,6 +873,38 @@ def test_depth_publication_preserves_front_camera_error(rig):
     assert rig.controller.status("camera_front")["error"] is None
 
 
+def test_geometry_change_at_publish_guard_records_drop_and_next_frame_recovers(rig, monkeypatch):
+    configure(rig)
+    rig.plugin.dispatch('start', {})
+    callback = rig.subscriptions[-1].callback
+    callback(cloud())
+    guard = rig.controller.publish_if_current
+
+    def change_before_publish(*args, **kwargs):
+        rig.controller.configure('camera_front', {'undistort': False})
+        rig.controller.configure('camera_front', {'undistort': True})
+        return guard(*args, **kwargs)
+
+    monkeypatch.setattr(rig.controller, 'publish_if_current', change_before_publish)
+    rig.plugin._worker.complete()
+    info = rig.plugin.dispatch('info', {})
+    assert not rig.publications
+    assert info['stats']['dropped'] == 1
+    assert info['stats']['published'] == 0
+    assert 'geometry changed' in info['last_error']
+
+    monkeypatch.setattr(rig.controller, 'publish_if_current', guard)
+    rig.controller.configure('camera_front', {'undistort': True})
+    future = time.monotonic() + .3
+    monkeypatch.setattr(module().time, 'monotonic', lambda: future)
+    callback(cloud(sec=11))
+    rig.plugin._worker.complete()
+    info = rig.plugin.dispatch('info', {})
+    assert len(rig.publications) == 1
+    assert info['stats']['published'] == 1 and info['stats']['dropped'] == 1
+    assert info['state'] == 'running' and info['last_error'] is None
+
+
 def test_repeated_backward_and_stale_source_work_is_not_published(rig, monkeypatch):
     configure(rig)
     rig.plugin.dispatch("start", {})

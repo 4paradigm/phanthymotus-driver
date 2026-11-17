@@ -629,7 +629,10 @@ class FrontDepthPlugin:
                 self._drop("depth result is stale")
                 return
 
+            published = False
+
             def publish():
+                nonlocal published
                 from sensor_msgs.msg import CompressedImage
                 output = CompressedImage()
                 output.header.frame_id = self._optical_frame
@@ -641,10 +644,13 @@ class FrontDepthPlugin:
                 self._stats["last_source_stamp"] = list(context["stamp"])
                 self._last_error = None
                 self._error_code = None
+                published = True
             # Hold both guards through enqueue so a stop/config/undistort
             # change cannot let an older generation slip into the DDS queue.
             self.controller.publish_if_current("camera_front", context["camera_generation"], publish,
                                                clear_error=False)
+            if not published:
+                self._drop("front-camera geometry changed; old depth frame discarded")
 
     def _configure(self, values):
         with self._lifecycle:

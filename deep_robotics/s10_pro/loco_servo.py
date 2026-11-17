@@ -134,9 +134,10 @@ class S10LocoServoPlugin:
                 "description": "山猫 S10 Pro 连续速度控制：速度档位、空跑及执行限制，默认空跑。",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": ["start", "stop", "pause", "resume", "info", "config"]},
-                    "input_topic": {"type": "string"}, "confirm": {"type": "boolean"},
+                    "input_topic": {"type": "string"}, "confirm": {"type": "boolean",
+                        "description": "实机启动或配置为非空跑时必须显式设为 true。"},
                     **copy.deepcopy(properties)}, "required": ["action"], "x-is-dangerous": True,
-                    "x-action-params": {"start": {"params": ["input_topic", *properties]}, "stop": {"params": []},
+                    "x-action-params": {"start": {"params": ["input_topic", *properties, "confirm"]}, "stop": {"params": []},
                         "pause": {"params": []}, "resume": {"params": []}, "info": {"params": []},
                         "config": {"params": [*properties, "confirm"]}}, "x-resource": "base",
                     "x-hooks": {"on_interrupt_motion": {"action": "pause"},
@@ -191,7 +192,7 @@ class S10LocoServoPlugin:
                     if not valid or not enabled:
                         return {"ok": False, "code": "INVALID_MOTION_PERMISSION" if not valid else "MOTION_DISABLED",
                                 "message": "S10_MOTION_ENABLED must be 1 for real chassis control"}
-                    if args.get("confirm") is False:
+                    if args.get("confirm") is not True:
                         return {"ok": False, "code": "CONFIRM_REQUIRED", "message": "real chassis control was not confirmed"}
                 if candidate == {**self._settings, "dry_run": self._dry_run}:
                     return {"ok": True, **candidate}

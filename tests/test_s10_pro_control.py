@@ -181,7 +181,7 @@ def test_actuator_start_surfaces_tls_reboot_requirement_to_frontend(monkeypatch)
     assert motion.dispatch("start", {}) == expected
     assert light.dispatch("start", {}) == expected
     monkeypatch.setenv("S10_MOTION_ENABLED", "1")
-    result = servo.dispatch("start", {"input_topic": "/control/velocity", "dry_run": False})
+    result = servo.dispatch("start", {"input_topic": "/control/velocity", "dry_run": False, "confirm": True})
     assert result["state"] == "error" and expected["message"] in result["message"]
     assert navigation.dispatch("start", {}) == expected
     assert charging.dispatch("start", {}) == expected
@@ -1747,11 +1747,11 @@ def test_loco_servo_defaults_to_dry_run_and_explicit_live_start_requires_permiss
     denied = plugin.dispatch("config", {"dry_run": False, "confirm": True})
     assert denied["code"] == "MOTION_DISABLED"
     assert plugin.dispatch("info", {})["dry_run"] is True
-    denied_start = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": False})
+    denied_start = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": False, "confirm": True})
     assert denied_start["state"] == "error"
     assert "S10_MOTION_ENABLED" in denied_start["message"]
     monkeypatch.setenv("S10_MOTION_ENABLED", "1")
-    result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": False})
+    result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": False, "confirm": True})
     assert result["state"] == "ready"
     assert plugin.dispatch("info", {})["dry_run"] is False
     plugin.stop()
@@ -1791,7 +1791,7 @@ def test_loco_servo_start_enters_navigation_before_subscribing(monkeypatch, dry_
     plugin = S10LocoServoPlugin(native, ros2=object())
     monkeypatch.setattr(plugin, "_read_loop", lambda: None)
     try:
-        result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": dry_run})
+        result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": dry_run, "confirm": True})
         assert result["state"] == "ready"
         assert native.calls == expected
         assert plugin.dispatch("start", {"input_topic": "/policy/velocity"})["state"] == "error"
@@ -1820,7 +1820,7 @@ def test_loco_servo_navigation_setup_failure_does_not_arm(monkeypatch, failed_co
     plugin = S10LocoServoPlugin(native, ros2=object())
     monkeypatch.setattr("loco_servo.CoreSubscriber",
                         lambda *_args: pytest.fail("must not subscribe after setup failure"))
-    result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": False})
+    result = plugin.dispatch("start", {"input_topic": "/policy/velocity", "dry_run": False, "confirm": True})
     assert result["state"] == "error"
     assert "导航" in result["message"]
     assert plugin.dispatch("info", {})["state"] == "idle"
@@ -1854,8 +1854,8 @@ def test_loco_servo_start_respects_explicitly_saved_live_configuration(monkeypat
         tool_schema = plugin.get_tool()["inputSchema"]
         assert "dry_run" in tool_schema["x-action-params"]["start"]["params"]
         assert "default" not in tool_schema["properties"]["dry_run"]
-        assert plugin.dispatch("config", {"dry_run": False})["ok"]
-        started = plugin.dispatch("start", {"input_topic": "/policy/velocity"})
+        assert plugin.dispatch("config", {"dry_run": False, "confirm": True})["ok"]
+        started = plugin.dispatch("start", {"input_topic": "/policy/velocity", "confirm": True})
         assert started["state"] == "ready"
         assert plugin.dispatch("info", {})["dry_run"] is False
     finally:
@@ -1954,7 +1954,7 @@ def test_loco_servo_holds_if_core_subscriber_dies(monkeypatch):
     plugin = S10LocoServoPlugin(native, ros2=object())
     try:
         assert plugin.dispatch("config", {"dry_run": False, "confirm": True})["ok"]
-        assert plugin.dispatch("start", {"input_topic": "/policy/velocity"})["state"] == "ready"
+        assert plugin.dispatch("start", {"input_topic": "/policy/velocity", "confirm": True})["state"] == "ready"
         plugin._apply([0.2, 0.0, 0.0, 0.0, 0.0, 0.1])
         assert native.calls[-1][0][2]["X"] == 0.2
 
@@ -2013,7 +2013,7 @@ def test_loco_servo_core_stream_validates_messages_and_watchdog_holds(monkeypatc
     plugin = S10LocoServoPlugin(native, ros2=object())
     try:
         plugin.dispatch("config", {"dry_run": False, "confirm": True})
-        assert plugin.dispatch("start", {"input_topic": "/policy/velocity"})["state"] == "ready"
+        assert plugin.dispatch("start", {"input_topic": "/policy/velocity", "confirm": True})["state"] == "ready"
         native.calls.clear()  # Count velocity/watchdog sends after navigation setup.
 
         subscriber.payloads.append(command([0.2, 0.1, 0.0, 0.0, 0.0, -0.2]))

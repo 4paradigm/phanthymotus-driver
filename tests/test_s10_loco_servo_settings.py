@@ -59,6 +59,34 @@ def test_default_start_and_restart_preserve_dry_run_without_native_calls(servo, 
     assert servo.native.transport_checks == 0
 
 
+@pytest.mark.parametrize('confirm', [None, False, 'true', 1])
+@pytest.mark.parametrize('entry', ['start', 'config', 'streaming-config', 'saved-live-start'])
+def test_live_output_requires_literal_confirmation_before_any_native_setup(servo, confirm, entry):
+    p = servo.plugin
+    if entry == 'saved-live-start':
+        p = servo.module.S10LocoServoPlugin(servo.native, ros2=object(), config={'dry_run': False})
+    if entry == 'streaming-config':
+        assert p.dispatch('start', {'input_topic': '/policy/cmd'})['state'] == 'ready'
+    before = p.dispatch('info', {})
+    args = {} if confirm is None else {'confirm': confirm}
+    try:
+        if entry in {'start', 'saved-live-start'}:
+            args['input_topic'] = '/policy/cmd'
+            if entry == 'start':
+                args['dry_run'] = False
+            result = p.dispatch('start', args)
+        else:
+            result = p.dispatch('config', {**args, 'config': {'dry_run': False}})
+        assert result.get('code') == 'CONFIRM_REQUIRED'
+        after = p.dispatch('info', {})
+        assert after['state'] == before['state']
+        assert after['dry_run'] == before['dry_run']
+        assert servo.native.calls == []
+        assert servo.native.transport_checks == 0
+    finally:
+        p.stop()
+
+
 def test_speed_presets_change_forward_limit_without_scaling_yaw_or_raising_floor(servo):
     for name, limit in [('slow', .15), ('normal', .3), ('fast', .5)]:
         assert servo.plugin.dispatch('config', {'speed_preset': name})['ok']
@@ -88,6 +116,8 @@ def test_bad_settings_are_atomic_and_issue_no_commands(servo, settings):
 def test_config_schema_exposes_controls_without_start_defaults(servo):
     tool = servo.plugin.get_tool()
     props = tool['configSchema']['properties']
+    for action in ['start', 'config']:
+        assert 'confirm' in tool['inputSchema']['x-action-params'][action]['params']
     for key in ['speed_preset', 'dry_run', 'rotate_only', 'min_vx',
                 'linear_acceleration', 'angular_acceleration', 'wz_limit']:
         assert key in props
@@ -103,9 +133,19 @@ def test_dry_run_counts_valid_commands_without_any_native_setup_or_velocity(serv
     assert servo.native.calls == []
 
 
+def test_confirmed_config_enables_live_output_in_an_existing_dry_run_stream(servo):
+    p = servo.plugin
+    assert p.dispatch('start', {'input_topic': '/policy/cmd'})['state'] == 'ready'
+    assert p.dispatch('config', {'dry_run': False, 'confirm': True})['ok']
+    assert [call[2] for call in servo.native.calls] == [{'Mode': 1}, {'GaitParam': 0x3002}]
+    submit(p, command(p, [.1, 0, 0, 0, 0, 0]))
+    assert servo.native.calls[-1][2]['X'] == pytest.approx(.03)
+    assert p.dispatch('info', {})['dry_run'] is False
+
+
 def test_acceleration_begins_at_zero_and_zero_velocity_stops_immediately(servo):
     p = servo.plugin
-    assert p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})['state'] == 'ready'
+    assert p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False, 'confirm': True})['state'] == 'ready'
     servo.native.calls.clear()
     submit(p, command(p, [.3, .2, 0, 0, 0, .9]))
     values = servo.native.calls[-1][2]
@@ -118,7 +158,7 @@ def test_acceleration_begins_at_zero_and_zero_velocity_stops_immediately(servo):
 
 def test_live_to_dry_run_stops_then_discards_preconfiguration_commands(servo):
     p = servo.plugin
-    p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})
+    p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False, 'confirm': True})
     previous = command(p, [.2, 0, 0, 0, 0, .2])
     submit(p, previous)
     result = p.dispatch('config', {'config': {'dry_run': True}})
@@ -139,7 +179,7 @@ def test_rotate_only_and_yaw_cap_match_the_advertised_limits(servo, yaw):
     limits = p.dispatch('info', {})['control_interface']['limits']
     assert limits['lower'][5] == -.1
     assert limits['upper'][5] == .1
-    p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})
+    p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False, 'confirm': True})
     submit(p, command(p, [.2, .2, 0, 0, 0, yaw]))
     assert servo.native.calls[-1][2] == {'X': 0., 'Y': 0., 'Z': 0.,
                                         'Roll': 0., 'Pitch': 0., 'Yaw': yaw}
@@ -151,7 +191,7 @@ def test_rotate_only_and_yaw_cap_match_the_advertised_limits(servo, yaw):
 
 def test_revoked_motion_permission_stops_and_disarms_an_active_stream(servo, monkeypatch):
     p = servo.plugin
-    p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})
+    p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False, 'confirm': True})
     submit(p, command(p, [.2, 0, 0, 0, 0, 0]))
     monkeypatch.setenv('S10_MOTION_ENABLED', '0')
     submit(p, command(p, [.2, 0, 0, 0, 0, 0], seq=2))
@@ -161,7 +201,7 @@ def test_revoked_motion_permission_stops_and_disarms_an_active_stream(servo, mon
 
 def test_enabling_dry_run_does_not_hide_a_failed_native_stop(servo, monkeypatch):
     p = servo.plugin
-    p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})
+    p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False, 'confirm': True})
     submit(p, command(p, [.2, 0, 0, 0, 0, 0]))
     send = servo.native.send
     monkeypatch.setattr(servo.native, 'send', lambda *args: {'ErrorCode': 7})
@@ -176,7 +216,7 @@ def test_enabling_dry_run_does_not_hide_a_failed_native_stop(servo, monkeypatch)
 
 def test_failed_stop_survives_disarm_and_blocks_dry_run_until_zero_is_acknowledged(servo, monkeypatch):
     p = servo.plugin
-    p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})
+    p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False, 'confirm': True})
     submit(p, command(p, [.2, 0, 0, 0, 0, 0]))
     send, attempts = servo.native.send, []
     def reject_stop(*args):
@@ -202,7 +242,7 @@ def test_failed_stop_survives_disarm_and_blocks_dry_run_until_zero_is_acknowledg
 
 def test_reader_keeps_retrying_zero_after_revocation_until_native_ack(servo, monkeypatch):
     p = servo.plugin
-    p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})
+    p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False, 'confirm': True})
     submit(p, command(p, [.2, 0, 0, 0, 0, 0]))
     send, attempts = servo.native.send, []
     retried, allow_ack, acknowledged = threading.Event(), threading.Event(), threading.Event()
