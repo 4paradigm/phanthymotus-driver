@@ -417,7 +417,6 @@ On the inspected robot, the factory raw writers advertise only SHM/loopback
 locators. Jetson therefore cannot discover them through the physical subnet,
 even in domain 0 with compatible sensor QoS. Changing Jetson subscriber QoS or
 silently choosing `/ALIGNED_POINTS` cannot fix that publishing boundary.
-See [the read-only diagnosis](docs/front-depth-diagnosis-20261114.md).
 
 ## Image and deployment
 
