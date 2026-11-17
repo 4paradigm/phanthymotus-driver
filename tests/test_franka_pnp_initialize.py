@@ -121,9 +121,21 @@ class AlignmentCompletionTests(TestCase):
         plugin = PnpRemoteTeleopPlugin()
         definition = plugin.get_tools()[0]
         self.assertEqual(definition["inputSchema"]["properties"]["action"]["enum"],
-                         ["align", "follow", "stop", "status"])
+                         ["align", "follow", "Stop", "status"])
         self.assertNotIn("auto_initialize", definition["configSchema"]["properties"])
         self.assertEqual(definition["inputSchema"]["x-completion"]["actions"], ["align"])
+
+    def test_visible_stop_preserves_pause_behavior(self):
+        plugin = PnpRemoteTeleopPlugin()
+        plugin._loaded = True
+        schema = plugin.get_tools()[0]["inputSchema"]
+        self.assertTrue(all(hook["action"] == "Stop" for hook in schema["x-hooks"].values()))
+        with patch.object(plugin, "_stop_host") as stop_host:
+            self.assertEqual(plugin.dispatch("Stop", {}), {"state": "paused"})
+            self.assertTrue(plugin._loaded)
+            stop_host.assert_called_once_with("right")
+            self.assertEqual(plugin.dispatch("stop", {}), {"state": "idle"})
+            self.assertFalse(plugin._loaded)
 
     def test_completed_alignment_posts_acp(self):
         completed = []

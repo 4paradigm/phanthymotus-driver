@@ -40,7 +40,7 @@ class PnpRemoteTeleopPlugin:
         schema = action_schema({
             "align": ([], "Run vendor startup, align slave arms, and complete ACP while holding the aligned pose."),
             "follow": ([], "Enable continuous vendor following after alignment has completed."),
-            "stop": ([], "Stop PNP teleoperation in reverse vendor startup order and verify shutdown."),
+            "Stop": ([], "Stop PNP teleoperation in reverse vendor startup order and verify shutdown."),
             "status": ([], "Read PNP service states and vendor execution stages."),
         }, {})
         schema.update({
@@ -48,8 +48,8 @@ class PnpRemoteTeleopPlugin:
             "x-resource": "arm",
             "x-is-dangerous": True,
             "x-hooks": {
-                "on_interrupt_motion": {"action": "stop"},
-                "on_interrupt_all": {"action": "stop"},
+                "on_interrupt_motion": {"action": "Stop"},
+                "on_interrupt_all": {"action": "Stop"},
             },
         })
         definition = tool("teleop", "actuator", "PNP master teleoperation", schema)
@@ -293,6 +293,9 @@ class PnpRemoteTeleopPlugin:
                              "status": terminal, "error": error}
 
     def dispatch(self, action, args):
+        # Core reserves lowercase stop for the card lifecycle.
+        if action == "Stop":
+            action = "pause"
         with self._lock:
             try:
                 if action == "config":
