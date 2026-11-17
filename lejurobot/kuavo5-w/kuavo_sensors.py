@@ -266,7 +266,7 @@ class KuavoSensors:
                     'joint_limits': limits,
                     'discovery_error': self._discovery_error, 'model_error': self._model_error,
                     'skeleton_model': {'source': 'resource/kuavo5w_model.urdf',
-                                       'reference_version': '400062',
+                                       'reference_version': '63',
                                        'reference_only': True, 'hardware_geometry_verified': False,
                                        'configured_robot_serial': getattr(self, 'robot_serial', None),
                                        'serial_source': 'operator_config_not_hardware_verification',

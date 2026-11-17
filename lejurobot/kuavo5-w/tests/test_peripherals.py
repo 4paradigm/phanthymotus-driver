@@ -5,6 +5,8 @@ import json
 import math
 import struct
 import threading
+import tempfile
+import sys
 from pathlib import Path
 import time
 import types
@@ -334,6 +336,26 @@ class HostManagerTests(unittest.TestCase):
         self.assertNotIn('queue_size', calls[0][1])
         module._listen = lambda *args, **kwargs: kwargs
         self.assertEqual(module.listen_loopback(None, interface='0.0.0.0'), {'interface': '127.0.0.1'})
+
+    def test_controller_messages_override_is_optional_and_process_local(self):
+        spec = importlib.util.spec_from_file_location('kuavo_message_overlay', ROOT / 'host/rosbridge_loopback.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        original = list(sys.path)
+        with tempfile.TemporaryDirectory() as root, patch.object(sys, 'path', original.copy()):
+            self.assertIsNone(module.configure_messages(root))
+            self.assertEqual(sys.path, original)
+            overlay = Path(root) / 'ros1_messages'
+            for part in ('msg', 'srv'):
+                package = overlay / 'kuavo_msgs' / part
+                package.mkdir(parents=True)
+                (package / '__init__.py').write_text('')
+                if part == 'msg':
+                    self.assertIsNone(module.configure_messages(root))
+            self.assertEqual(module.configure_messages(root), str(overlay))
+            self.assertEqual(sys.path, [str(overlay), *original])
+        launch = (ROOT / 'host/rosbridge.launch').read_text()
+        self.assertEqual(launch.count('launch-prefix="/usr/bin/python3 /opt/phanthy-motus/kuavo5w-host/rosbridge_loopback.py"'), 2)
 
 
 if __name__ == '__main__':

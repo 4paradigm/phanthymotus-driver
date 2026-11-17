@@ -725,7 +725,9 @@ class ControlPlugin(_KuavoPlugin):
     def tool(self):
         # No x-resource: global exclusivity is intentional for whole-body transitions.
         return self.schema("Kuavo 5-W 软件暂停/恢复及 MPC 模式切换；以状态话题确认，不把服务受理当生效。", {
-            "mode": {"type": "integer", "enum": list(MODES), "description": str(MODES)}}, {
+            "mode": {"type": "integer", "enum": list(MODES), "description": str(MODES),
+                     "oneOf": [{"const": value, "title": f"{value}: {name}"}
+                               for value, name in MODES.items()]}}, {
             "pause": ([], "暂停全身，取消在途 ACP；不是硬件急停"),
             "resume": ([], "恢复控制，保持冻结姿态，须重新发运动目标"),
             "set_mode": (["mode"], "切换官方 MPC 模式；0 为被动 NoControl"),
@@ -742,6 +744,11 @@ class ControlPlugin(_KuavoPlugin):
             return self.bundle.resume()
         if action == "set_mode":
             mode = args.get("mode")
+            # Agent Core canvas enum <select> values arrive as strings even
+            # for integer schemas. Admit only the exact documented choices;
+            # do not truncate floats or coerce booleans into control modes.
+            if isinstance(mode, str) and mode in {str(value) for value in MODES}:
+                mode = int(mode)
             if isinstance(mode, bool) or not isinstance(mode, int) or mode not in MODES:
                 raise ValueError("mode must be an integer from 0 to 4")
             return self.bundle.set_mode(mode)

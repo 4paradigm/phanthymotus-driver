@@ -8,7 +8,8 @@
     <param name="services_glob" value="[*]" />
     <param name="params_glob" value="[*]" />
   </node>
-  <node name="rosapi" pkg="rosapi" type="rosapi_node" output="screen" required="true">
+  <node name="rosapi" pkg="rosapi" type="rosapi_node" output="screen" required="true"
+        launch-prefix="/usr/bin/python3 /opt/phanthy-motus/kuavo5w-host/rosbridge_loopback.py">
     <param name="topics_glob" value="[*]" />
     <param name="services_glob" value="[*]" />
     <param name="params_glob" value="[*]" />

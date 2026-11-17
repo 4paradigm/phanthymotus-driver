@@ -307,3 +307,87 @@ host helper 的首次安装仍需现场管理员执行一次，详见 README。
 - 本地候选镜像 `kuavo5w:local-depth-261116`（9f530d375e0e），736995734字节，相对既有release736836914字节增加158820字节，
   本轮未安装依赖；该代码覆盖层差值不代表生产Dockerfile对ros-base的完整增量。
 - 最终199项离线测试、Python编译、部署checker、diff检查通过；重建后四路图像、雷达、loco_state卡均running且valid，宿主机helper/头部相机/深度relay均active。
+
+## 追加：底盘独立导航主机与开机音效（2026-11-17）
+
+本轮使用显式 SSH 密码认证成功连接上位机；未修改账号或 SSH 配置。
+下位机无线地址为 `192.168.123.210`，有线 ROS master 仍为 `192.168.26.1`。
+仅查询 ROS、读取文件、订阅状态及访问只读 HTTP 接口，未发送运动、使能、取消任务、建图或重启命令。
+
+### 音频
+
+- 用户确认重启时确实听到“待命中”。此前下位机 ALC897 Analog 的短提示音和约10秒测试音
+  虽播放进程成功退出，用户均未听到；该 ALSA/Pulse 通路不能视为已验证的机器人扬声器。
+- 上下位机均未枚举厂商脚本期望的 EB03_LJ USB 音频设备，当前 ROS 图无运行的语音合成/播放服务。
+  此结论仅限这两台主机，不能否定底盘有独立音频模块。
+- 底盘 `/jaten_behavior_manager/robot_state` 的发布者定义含 `int32 music_id`，实测为0；
+  `/jaten_behavior_manager/in/set_chassis_state` 的订阅握手定义含 `bool set_music_volume`、`int32 volume`。
+  这些字段是固定音乐/音量的线索，不是任意 PCM 上传、TTS 或播放完成接口的证明。
+- 上位机应用工作区存在 `kuavo_speech_synthesis/SpeechSynthesis` 实现，生成 PCM 后发布 `/audio_data`；
+  仍需独立播放器及真实输出设备，不能仅启动合成服务便宣称扬声器可用。
+  部分脚本缺模型时会下载模型/安装依赖，本轮没有盲目启动。
+- 上位机 `/opt/lejurobot/kuavo-wifi-announce` 目录存在，但 bin/config 为空；
+  不能因其他脚本的 shebang 指向其 venv 就判断开机语音服务已安装。
+
+### 导航
+
+- `/leju_node`、`/jaten_behavior_manager`、`/lqr_path_track`、`/jmap_server_node`、
+  `/navigation_api_node_java`、`/task_cancel_server` 实际位于独立底盘主机 `192.168.26.22`。
+- 该主机80端口为 `VAD-Lab1-MapEditor`；8888端口 `/v2/api-docs` 返回285个路径的 Swagger2定义。
+  只读验证 `GET /map/current?returnMapData=false` 和 `POST /map/list?type=pgm` 成功，
+  当前地图ID为“斗索”，MD5为 `f36b710ec42aa48f41ac60dba69c0f96`。
+  默认 `/map/list` 返回路网 `.path`，不是栅格地图；不能混用两类地图或忽略地图身份绑定打点。
+- 被动连接 `/ws/home` 收到 `pose2d`、`agvState`、`localizationStatus` 和 `taskState`。
+  `taskState` 此时是路网边/节点状态，不能直接当作本驱动导航目标的完成通知。
+- 下位机已生成 `leju_mobile_base_msgs/MoveToTarget`：x/y/theta/options → success/message/task_id；
+  `CheckArrived`：task_id/blocking/timeout → arrived/success/message/status。
+  上位机当前 rosbridge 环境缺少这些服务类；上位机和下位机都找不到 `jaten_msgs` 包。
+- `/cancel_task` 的类型是 `std_srvs/SetBool`，服务提供者是底盘的 `/task_cancel_server`；
+  尚未确认 data 的业务语义、取消作用范围及物理停止反馈。`/leju/cancel_dispatch_task` 则为
+  `jaten_msgs/SetDispatchTask`，不能与前者或标准 move_base action cancel 混同。
+- 自带地图界面使用 `StartCartoMapping`、`SaveCartoMap`、`ChangeRoadMap` 等 WebSocket 命令；
+  保存建图后还会请求 `AgvSystemRestart`，界面明确提醒车辆处于手动模式。
+  不能只把“命令已接收”当作建图完成、地图已加载或取消已生效。
+- 上位机 `hr_nav_controller/docs/4-定位导航系统API定义V2.4.pdf` 描述另一套
+  `srv_mapping`/`srv_set_task` 接口，与当前 ROS 图不同，不能据此猜测 `jmap_operate` 的请求或操作码。
+
+结论：具备实现 `controlled_spatial` 的底盘能力基础；完整卡片仍需当前底盘协议/服务定义、
+取消及目标归属核实，并与现有 `loco` 共用 base 仲裁和 ACP。尚未注册仅能接收命令而无法确认完成的占位卡。
+本轮后续已获底盘主机登录，发现 `/opt/jaten/share/jaten_msgs` 定义；尚未完成完整导航及音频调用验证。
+
+## 追加：授权全身控制启动验证（2026-11-17）
+
+操作人员明确确认旁站、供电、活动范围及急停条件后，在下位机启动厂商轮臂程序，
+没有发送位移或关节姿态目标。程序仍在 root tmux `motus-kuavo5w-commissioning` 中运行。
+
+- 实际控制器为 `ROBOT_VERSION=63`、`robot_type=1`，arm14/head2/leg4/waist0；
+  启动入口为 `humanoid_controllers/load_kuavo_real_wheel.launch joystick_type:=h12 start_way:=auto`。
+  旧 `run_real.sh` 指向其他版本，不能直接套用。经 `/humanoid_controller/real_initial_start` 请求初始化，
+  厂商日志记录 `Data ready. Controller starting complete`、`MRT node is ready` 和初始化完成。
+- CAN约486Hz，20电机enabled、0error，四个EtherCAT从站；原始关节约500Hz，MPC模式约47Hz。
+  启动日志有回零超时及MPC瞬时频率波动提示，尚未做长时间负载/实物运动验证。
+  `/humanoid_controller/real_launch_status` 仍返回 `initing`，与上述运行反馈不一致，保留为厂商状态接口待核实项。
+- 关节无反馈的第二个原因是上下位机 `kuavo_msgs/sensorsData` MD5不一致：
+  应用工作区 `35fff741b8e115992c1ac46e99c1084f`，实际控制器 `f9f437eb06511eb4cb60f115760b94e5`，
+  后者包含FTsensor_data。桥接此前被TCPROS拒绝，并非仅JSON解析失败。
+  从当前控制器复制其生成Python包到上位机固定助手的隔离覆盖层，bridge/rosapi进程优先加载；
+  未覆盖任何厂商工作区或系统ROS包。安装器新增可选 `--message-overlay` 以复现部署。
+- 实际MCP `joints.info` 为valid、20个实时q/dq/ddq，模型及发现错误均清除。
+  Agent Core容器domain42实际订阅 `/ubuntu/state/joints`、`/ubuntu/state/joint_state` 均valid、20关节。
+- 比对现场无修改的版本63模型，旧400062参考文件在底盘、肩部、头部附件及手指结构上不同。
+  显示资源改为控制器自身biped_s63，36links/35joints，20个受测关节名称一致；
+  原始文件身份、许可证及精简方法记录于resource/README.md。未独立测量实物几何，不能据此生成可信控制限位。
+- `switch_mode.set_mode` 原先拒绝前端下拉框字符串值；现在只额外接收精确字符串0–4，
+  不接受浮点、布尔或带空白值，且保留控制器就绪检查。
+  现场MCP实测 `resume` → `set_mode(mode="3")` → `pause`，均由状态反馈确认；
+  最终 `control_enabled=false`、`motion_blocked=true`、无未决resume。
+- 候选镜像 `kuavo5w:local-control-261117`，ID `e5287f1f9047`，737020259字节。
+  在现场已有release镜像上仅覆盖代码和资源，未安装依赖，不代表生产Dockerfile完整镜像增量。
+  现场compose保存在 `/home/leju_kuavo/kuavo5w-motus-candidate/compose.yml`，保留原有只读配置与DDS挂载。
+- arm/leg的硬件核验限位仍未配置，所以其move_joints继续拒绝；没有把URDF显示限位冒充硬件标定记录。
+  当前验证仅证明启动、真实关节/DDS、模式和软件暂停恢复通路，不证明运动精度、机械极限或硬件急停效果。
+- 本轮203项离线测试、部署checker及diff检查通过；未引入新的依赖或提交现场生成消息包。
+
+底盘补充：`/cancel_task` 实现会杀死若干导航节点，不应作普通stop_nav；
+`/leju/cancel_dispatch_task` 的SetDispatchTask及MapOpt/MapLists定义已找到，仍需核实任务归属和停止反馈。
+底盘声卡为ALC897，另有串口设备；开机声音的实际输出通路仍未得到可听验证。

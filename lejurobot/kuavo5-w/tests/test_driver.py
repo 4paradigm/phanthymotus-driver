@@ -276,6 +276,35 @@ class DriverContractTests(unittest.TestCase):
         self.assertTrue(wait_until(lambda: self.callbacks))
         self.assertEqual([c[:3] for c in self.callbacks], [(action['action_id'], 'arm', 'cancelled')])
 
+    def test_mode_accepts_canvas_enum_string_and_sends_integer(self):
+        for mode in driver.MODES:
+            with self.subTest(mode=mode):
+                result = self.call('switch_mode', 'set_mode', mode=str(mode))
+                self.assertEqual(result['state'], 'completed')
+                self.assertEqual(result['mode'], mode)
+                sent = self.ros.sent_services[-1]
+                self.assertEqual(sent[0], '/mobile_manipulator_mpc_control')
+                self.assertIs(type(sent[2]['control_mode']), int)
+                self.assertEqual(sent[2]['control_mode'], mode)
+
+    def test_mode_rejects_invalid_choices_without_sending(self):
+        for mode in (None, True, False, 3.0, 3.5, -1, 5, '', '3.0', '03', ' 3', 'BaseArm', [], {}):
+            with self.subTest(mode=mode):
+                result = self.call('switch_mode', 'set_mode', mode=mode)
+                self.assertIn('mode must be an integer', result['error'])
+        self.assertEqual(self.ros.sent_services, [])
+        self.assertEqual(self.ros.published, [])
+
+    def test_canvas_mode_and_resume_keep_missing_controller_gate(self):
+        self.ros.params.clear()
+        self.bundle.sensors.discover()
+        for action, args in [('set_mode', {'mode': '3'}), ('resume', {})]:
+            with self.subTest(action=action):
+                result = self.call('switch_mode', action, **args)
+                self.assertIn('controller_not_ready', result['error'])
+        self.assertEqual(self.ros.sent_services, [])
+        self.assertEqual(self.ros.published, [])
+
     def test_control_lock_contention_returns_busy_instead_of_waiting_unbounded(self):
         entered, release = threading.Event(), threading.Event()
         def hold_lock():

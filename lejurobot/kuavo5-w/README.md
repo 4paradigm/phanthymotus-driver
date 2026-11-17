@@ -87,6 +87,20 @@ ROS消息解码以普通用户运行，固定启动助手独立运行。旧版 r
 明确指定 loopback 绑定，并在进程内为 ROS1 订阅启用 TCP_NODELAY、2MB 接收缓冲；不修改系统 ROS 包。
 保留全部 odom 接收样本，不通过 queue_size=1 在输入端丢弃测量。
 
+若上下位机 `kuavo_msgs/sensorsData` 的 MD5 不同，即使存在500Hz发布者，TCPROS也会拒绝订阅。
+从实际控制器工作区复制其生成的 `kuavo_msgs` Python包（包含msg和srv）到上位机独立目录，
+安装时添加 `--message-overlay /path/to/controller-python-packages`。该目录直接包含 `kuavo_msgs/`，
+不是源码msg目录；应与当前控制器版本同步，不能用另一版本猜测字段。安装器复制到自身 `ros1_messages/`，
+仅bridge和rosapi进程优先加载，不覆盖厂商工作区或系统ROS包。未传该参数时保留已有覆盖层。
+现场版本63的sensorsData含FTsensor_data，已验证用该方法恢复真实20关节数据。
+
+全身执行与这些只读助手分开启动。现场版本63经授权旁站验证使用下位机既有环境和
+`ROBOT_VERSION=63 roslaunch humanoid_controllers load_kuavo_real_wheel.launch joystick_type:=h12 start_way:=auto`，
+再由厂商 `/humanoid_controller/real_initial_start` 初始化；这些步骤会接入电机并可能调整姿态，
+不纳入卡片自动start。版本、标定、遥控器与现场就绪条件必须先核实，不能照搬到其他硬件。
+本次已验证真实20关节反馈、MPC模式、软件暂停/恢复；尚未验证位移或关节目标运动。
+arm/leg仍需要下文的硬件核验限位配置。
+
 默认自动启动 `joints/imu/loco_state/battery/laser_scan/camera_left/camera_right/camera_head/camera_depth` 的输出。
 卡片 `start` 先检查是否有新鲜图像；缺帧时异步请求启动，左右相机调用对应 `set_camera_enabled(true)`，头部卡请求上述宿主机服务。
 运行期间缺帧每5秒重试，已有新鲜帧不重复开启；未运行的头部卡不由全局检查器启动。不会启动 WBC、MPC 或使能机器人运动。
@@ -122,7 +136,8 @@ ALSA PCM 可写不证明真实扬声器出声，因此不注册虚假可用的 `
 已发现 Livox MID360 配置和 SDK，但专用网口无物理 carrier，未见第二雷达有效发布者；当前点云只来自底盘二维雷达。
 
 `KUA5W0710701302138` 是操作人员提供的机身标识，可在现场配置 `robot_serial` 中记录；
-没有证据可把它等同于控制器 `robot_version`。当前资源 URDF 是400062参考骨架，几何尺寸未对该台实机核验。
+没有证据可把它等同于控制器 `robot_version`。当前资源URDF来自现场版本63控制器的biped_s63，
+20关节名称及文件几何已对齐；未独立测量实物尺寸或校准。
 `joints.info.skeleton_model` 明示 `reference_only` / `hardware_geometry_verified`；缺少全身 `/humanoid_description`
 或实测关节流时不伪造姿态。现场 `/robot_description` 是底盘模型，不能替代全身 URDF。
 必须取得匹配的全身模型、关节顺序及现场核验限位后才能验证关节控制。
@@ -198,8 +213,18 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 业务参数通过 `x-action-params` 分组并声明动作各自的 required；`dispatch()` 返回普通 dict，HTTP 层只包装一次 MCP content。
 `config.yaml` 的 `plugins.<card>.enabled` 决定卡片是否暴露。
 
-三路相机、电池、二维雷达点云已适配；尚未提供 `mic`、`speaker`、`controlled_spatial` 卡片。
-真机已发现地图/定位/导航接口，但导航取消及目标归属仍需核实；音频设备未就绪。
+`switch_mode` 操作全身轮臂 MPC，不是独立底盘导航模式，也不会启动控制栈。
+`set_mode` 的0–4选项同时显示编号和名称，兼容画布下拉框传来的精确数字字符串，
+发送给 ROS 服务时仍为整数。`resume`/`set_mode` 需要真实机型参数及控制反馈；
+`controller_not_ready` 表示这些前提缺失，不能通过填入默认参数绕过。
+`pause` 不依赖机型探测，仍会尝试零速、取消在途动作及请求暂停；若控制服务/反馈缺失，
+返回 `physical_stop_confirmed: false`，不能假报暂停成功。查询返回的 `state: ready` 仅表示查询成功。
+
+左右/头部 RGB、头部深度、电池、二维雷达点云已适配；尚未提供 `mic`、`speaker`、`controlled_spatial` 卡片。
+真机底盘另有导航主机 `192.168.26.22`，其 HTTP API 已验证可读当前地图和地图列表；
+任务下发、取消确认、建图保存/服务重启的完整协议仍待核实，上位机 rosbridge 也缺少对应自定义服务类型。
+用户已确认开机音效，底盘状态包含音乐编号和音量控制，但尚未找到任意 PCM/TTS 的实际播放入口；
+不能由上下位机 USB 声卡未枚举推断整机没有扬声器。
 接口快照、可行性及导航取消/ACP 适配前提见 `ROBOT_INSPECTION.md` 的能力核查记录。
 
 参数单位与约束：
@@ -366,7 +391,7 @@ ROS master 缓存、具体 rosbridge 版本和真机控制器行为仍需现场�
 0.5s无测量或数据不合法会输出 `valid:false`；缺失力矩/速度不补零。
 `model` 与 G1、天轶 2.0 一样读取驱动 `resource/` 下的 URDF，前端无需 STL 即可显示静态骨架，
 不依赖机器人在线或控制器启动。模型来源、固定版本和许可证见 [resource/README.md](resource/README.md)。
-该文件是 400062 参考模型，尚未核实与现场硬件修订及标定完全一致，不能用作控制模型。
+该文件与现场版本63控制器使用的biped_s63一致，尚未独立核实实物尺寸及标定，不能用作控制模型。
 实时更新仍要求实测 q；真机 `/humanoid_description` 缺失，或其20个受测关节名称与本地模型不一致时，
 `joints` 输出 invalid、空关节数组和原因，静态 `model` 仍可读取。`switch_mode.get_current_mode.feedback` 中的
 `robot_discovery.model_error` 表示运行时模型校验错误，`skeleton_model` 记录本地来源与名称校验状态。

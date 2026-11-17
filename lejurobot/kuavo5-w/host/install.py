@@ -22,6 +22,7 @@ def main():
     parser.add_argument('--workspace', required=True)
     parser.add_argument('--master', required=True)
     parser.add_argument('--ros-ip', required=True)
+    parser.add_argument('--message-overlay', help='Optional directory containing controller-generated kuavo_msgs Python package; isolates its ROS1 wire version to bridge/rosapi')
     parser.add_argument('--head-workspace', help='Optional installed Orbbec ROS1 workspace; auto-detect known local workspace if absent')
     args = parser.parse_args()
     if os.geteuid() != 0:
@@ -35,6 +36,12 @@ def main():
         parser.error('Missing workspace devel/setup.bash')
     root = Path('/opt/phanthy-motus/kuavo5w-host')
     root.mkdir(parents=True, exist_ok=True)
+    if args.message_overlay:
+        package = Path(args.message_overlay).resolve() / 'kuavo_msgs'
+        if not (package / 'msg/__init__.py').is_file() or not (package / 'srv/__init__.py').is_file():
+            parser.error('Message overlay must contain generated kuavo_msgs/msg and kuavo_msgs/srv packages')
+        shutil.copytree(package, root / 'ros1_messages/kuavo_msgs', dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
     launch = root / 'head_camera.launch'
     head_launch_changed = launch.is_file() and launch.read_bytes() != (Path(__file__).parent / launch.name).read_bytes()
     for name in ('rosbridge_loopback.py', 'rosbridge.launch', 'battery_relay.py', 'runtime_manager.py',
