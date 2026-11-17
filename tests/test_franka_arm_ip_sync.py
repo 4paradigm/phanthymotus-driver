@@ -70,6 +70,7 @@ class ArmIPSyncTests(unittest.TestCase):
         tool = self.plugin.get_tools()[0]
         self.assertNotIn('controller_ip', tool['inputSchema']['properties'])
         self.assertEqual(tool['configSchema']['properties']['left_ip']['default'], '172.16.0.3')
+        self.assertEqual(tool['configSchema']['properties']['controller_ip']['default'], '')
         self.assertEqual(self.plugin.dispatch('info', {})['motion_arm_ips'], self.plugin.arm_ips)
 
     def test_manual_configuration_persists_and_rejects_duplicates_atomically(self):
@@ -104,6 +105,37 @@ class ArmIPSyncTests(unittest.TestCase):
         with patch.object(m, 'load_binding', return_value=m.load_binding(self.state)):
             restarted = m.ArmIPSyncPlugin(arms, 'franka', None, callback=lambda *args: None)
         self.assertEqual(restarted.arm_ips, arms)
+
+    def test_discovery_precedes_optional_fallback(self):
+        from unittest.mock import Mock
+        arms = {'left': '172.16.0.5', 'right': '172.16.0.6'}
+        self.plugin.dispatch('config', {'controller_ip': '172.16.0.201'})
+        reader = Mock(side_effect=[ValueError('Not a PNP controller'), arms])
+        with patch.object(self.plugin, 'candidates', return_value=['172.16.0.184']), patch.object(self.plugin, 'read_controller', reader):
+            self.assertEqual(self.sync_result()['state'], 'completed')
+        self.assertEqual([c.args[0] for c in reader.call_args_list], ['172.16.0.184', '172.16.0.201'])
+        with patch.object(self.plugin, 'candidates', return_value=['172.16.0.200']), patch.object(self.plugin, 'read_controller', return_value=arms) as reader:
+            self.assertEqual(self.sync_result()['result']['controller_ip'], '172.16.0.200')
+        reader.assert_called_once_with('172.16.0.200')
+        self.assertEqual(self.plugin.configuration()['controller_ip'], '172.16.0.201')
+
+    def test_discovery_failure_still_tries_fallback_and_retains_mapping_on_failure(self):
+        self.plugin.dispatch('config', {'controller_ip': '172.16.0.201'})
+        before = (self.state / 'binding.json').read_text()
+        with patch.object(self.plugin, 'candidates', side_effect=OSError('No interface')), patch.object(self.plugin, 'read_controller', side_effect=ValueError('Unavailable')) as reader:
+            self.assertEqual(self.sync_result()['state'], 'error')
+        reader.assert_called_once_with('172.16.0.201')
+        self.assertEqual((self.state / 'binding.json').read_text(), before)
+        self.assertEqual(self.plugin.arm_ips, {'left': '172.16.0.3', 'right': '172.16.0.2'})
+
+    def test_network_discovery_probes_ethernet_ssh_without_arm_or_local_addresses(self):
+        devices = [{'ifname': 'eno1', 'flags': ['UP'], 'addr_info': [
+            {'local': '172.16.0.1', 'prefixlen': 29, 'scope': 'global'}]},
+            {'ifname': 'wlan0', 'flags': ['UP'], 'addr_info': [
+                {'local': '10.0.0.1', 'prefixlen': 24, 'scope': 'global'}]}]
+        with patch.dict(m.os.environ, {'FRANKA_ROBOT_INTERFACE': ''}), patch.object(m, 'network_json', return_value=devices), patch.object(m.socket, 'create_connection') as connect:
+            self.assertEqual(self.plugin.candidates(), ['172.16.0.4', '172.16.0.5', '172.16.0.6'])
+        self.assertEqual({c.args[0] for c in connect.call_args_list}, {('172.16.0.4', 22), ('172.16.0.5', 22), ('172.16.0.6', 22)})
 
     def test_controller_configuration_disagreement_is_rejected(self):
         def read(address, path):

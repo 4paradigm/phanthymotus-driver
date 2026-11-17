@@ -232,16 +232,22 @@ Configure both arm IPs and, optionally, the PNP host address. SSH defaults are
 username `pnp` and password `ros`; the password is editable, masked and sensitive,
 and never included in stream payloads or results. Provision a verified PNP host
 key in `/opt/phanthy-motus/franka-controller-access/known_hosts`, with alias
-`franka-pnp-controller`. Unknown/changed keys are rejected. Without an explicit
-PNP address, discovery uses existing neighbors on the robot interface; set
-`FRANKA_ROBOT_INTERFACE` if routing cannot identify that interface.
+`franka-pnp-controller`. Unknown/changed keys are rejected. The optional PNP
+address defaults to blank and is a fallback, never the first choice. `sync`
+first probes SSH on active Ethernet IPv4 subnets (up to 1024 addresses per
+subnet), then verifies the trusted host and reads its configuration. Set
+`FRANKA_ROBOT_INTERFACE` to select a specific interface. Only if discovery
+fails does it try the optional configured address. A detected address is
+reported separately from the configured fallback.
 
 `sync` is an optional manual acquisition refresh: it reads the trusted PNP host's
 existing Desk/hardware configuration in a bounded background job. It returns an
 `action_id`; ACP and `info.last_result` report its outcome. It neither commands
 motion nor directly edits another card. Successful config/sync saves the mapping
 atomically under `/opt/phanthy-motus/franka-ip-sync/binding.json`; errors retain
-the previous values. The deployment template mounts this directory and SSH trust
+the previous values, which continue to be published. Before a successful sync,
+the configured/default arm IPs are published; after success the detected arm IPs
+replace them. The deployment template mounts this directory and SSH trust
 data on the host so they survive container replacement.
 
 Connect this output separately to `joint_control`, `gripper` and the visual card.

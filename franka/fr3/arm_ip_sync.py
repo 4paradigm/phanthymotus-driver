@@ -4,6 +4,8 @@ import ipaddress
 import json
 import os
 import re
+import socket
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import subprocess
 import tempfile
@@ -65,7 +67,7 @@ class ArmIPSyncPlugin:
         self.arm_ips = mapping(saved.get("motion_arm_ips", arm_ips))
         self.username = "pnp"
         self.password = "ros"
-        self.controller_ip = saved.get("controller_ip", "")
+        self.controller_ip = saved.get("fallback_controller_ip", "")
         self.last_result = None
         self.cancel = threading.Event()
         self.deadline = float("inf")
@@ -79,14 +81,14 @@ class ArmIPSyncPlugin:
             "name": self.PREFIX, "type": "sensor", "multiInstance": False,
             "description": "Publish left/right FR3 controller IPs for connected action cards. Optional sync reads the trusted PNP host in the background; no robot motion.",
             "inputSchema": {**action_schema(
-                {"sync": ([], "Read the configured PNP controller and update the saved arm IPs."),
+                {"sync": ([], "Discover the PNP controller on the robot network, then try the optional fallback IP. Update the saved arm IPs."),
                  "info": ([], "Show active and saved bindings.")},
                 {}), "x-completion": {"actions": ["sync"], "timeout": 90}},
             "configSchema": {"type": "object", "properties": {
                 "left_ip": {"type": "string", "title": "Left arm IP", "description": "Controller IP for the physical left arm. Applied immediately when idle; changing it invalidates the saved observation.", "default": self.arm_ips["left"], "scope": "instance"},
                 "right_ip": {"type": "string", "title": "Right arm IP", "description": "Controller IP for the physical right arm. Applied immediately when idle; changing it invalidates the saved observation.", "default": self.arm_ips["right"], "scope": "instance"},
                 "controller_ip": {"type": "string", "title": "PNP controller IP", "default": self.controller_ip, "scope": "instance",
-                                  "description": "Optional PNP host IPv4 address. Leave blank to search trusted hosts on the robot network."},
+                                  "description": "Optional fallback PNP host IPv4 address. Network discovery always runs first; this address is tried only if discovery fails.",},
                 "username": {"type": "string", "title": "SSH username", "default": "pnp", "scope": "instance"},
                 "password": {"type": "string", "format": "password", "title": "SSH password", "default": "ros",
                              "scope": "instance", "x-sensitive": True,
@@ -110,19 +112,35 @@ class ArmIPSyncPlugin:
             self.frames_published += 1
             self.last_published_at = time.monotonic()
 
-    def candidates(self, manual, saved):
-        if manual:
-            return [str(ipaddress.IPv4Address(manual))]
+    def candidates(self):
         interface = os.environ.get("FRANKA_ROBOT_INTERFACE")
+        devices = network_json("addr", "show")
         if not interface:
-            route = network_json("route", "get", self.arm_ips["left"])[0]
-            if route.get("gateway"):
-                raise ValueError("Set FRANKA_ROBOT_INTERFACE or enter the controller IP")
-            interface = route["dev"]
-        neighbors = network_json("neigh", "show", "dev", interface)
-        addresses = [row["dst"] for row in neighbors if row.get("lladdr")]
-        preferred = saved.get("controller_ip")
-        return list(dict.fromkeys(([preferred] if preferred else []) + addresses))
+            devices = [d for d in devices if d["ifname"].startswith(("en", "eth")) and "UP" in d.get("flags", [])]
+        else:
+            devices = [d for d in devices if d["ifname"] == interface]
+        hosts = {}
+        for device in devices:
+            for addr in device.get("addr_info", []):
+                if addr.get("scope") != "global":
+                    continue
+                network = ipaddress.IPv4Network(f"{addr['local']}/{addr['prefixlen']}", strict=False)
+                if network.num_addresses > 1024:
+                    continue
+                for host in network.hosts():
+                    if str(host) != addr['local'] and str(host) not in self.arm_ips.values():
+                        hosts[str(host)] = addr['local']
+        def ssh_open(address):
+            if self.cancel.is_set() or time.monotonic() > self.deadline:
+                return False
+            try:
+                with socket.create_connection((address, 22), timeout=.3,
+                                              source_address=(hosts[address], 0)):
+                    return True
+            except OSError:
+                return False
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            return [address for address, found in zip(hosts, pool.map(ssh_open, hosts)) if found]
 
     def read_file(self, address, path):
         if self.cancel.is_set() or time.monotonic() > self.deadline:
@@ -187,7 +205,6 @@ class ArmIPSyncPlugin:
         binding = {**binding, "motion_arm_ips": arms}
         self._persist(binding)
         self.arm_ips = arms
-        self.controller_ip = binding.get("controller_ip", self.controller_ip)
         self.publish()
         return dict(state="completed", restart_required=False,
                     config=self.configuration(), **binding)
@@ -236,7 +253,7 @@ class ArmIPSyncPlugin:
                 password = password or "ros"
                 arms = mapping({side: args.get(side + "_ip", self.arm_ips[side])
                                 for side in ("left", "right")})
-                result = self.save(dict(controller_ip=controller, motion_arm_ips=arms))
+                result = self.save(dict(fallback_controller_ip=controller, motion_arm_ips=arms))
                 self.controller_ip, self.username, self.password = controller, username, password
                 return dict(result, ok=True, config=self.configuration())
         except (OSError, subprocess.SubprocessError, ValueError, RuntimeError, KeyError, IndexError) as exc:
@@ -247,16 +264,30 @@ class ArmIPSyncPlugin:
     def sync(self, action_id):
         status, result = "error", {"message": "No trusted PNP controller returned a valid arm mapping"}
         try:
-            for address in self.candidates(self.controller_ip, load_binding())[:16]:
+            overall_deadline = self.deadline
+            try:
+                addresses = self.candidates()[:16]
+            except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError):
+                addresses = []
+            # Reserve time for the manually configured fallback after discovery.
+            attempts = [(address, overall_deadline - 15) for address in addresses]
+            if self.controller_ip:
+                attempts.append((self.controller_ip, overall_deadline))
+            for address, phase_deadline in attempts:
                 if address in self.arm_ips.values():
                     continue
+                if self.cancel.is_set():
+                    raise RuntimeError("IP synchronization cancelled")
+                if time.monotonic() >= phase_deadline:
+                    continue
+                self.deadline = min(phase_deadline, time.monotonic() + 10)
                 try:
                     arms = self.read_controller(address)
-                except (subprocess.SubprocessError, ValueError, TypeError, KeyError, yaml.YAMLError):
+                except (subprocess.SubprocessError, ValueError, TypeError, KeyError, RuntimeError, yaml.YAMLError):
                     continue
                 if self.cancel.is_set() or time.monotonic() > self.deadline:
                     raise RuntimeError("IP synchronization cancelled or timed out")
-                result = self.save(dict(controller_ip=address, motion_arm_ips=arms))
+                result = self.save(dict(controller_ip=address, fallback_controller_ip=self.controller_ip, motion_arm_ips=arms))
                 status = "completed"
                 break
         except Exception as exc:
