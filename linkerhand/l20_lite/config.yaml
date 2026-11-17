@@ -13,6 +13,18 @@ baudrate: 115200
 response_timeout_s: 0.5
 
 plugins:
+  hand_tactile:
+    enabled: true
+    poll_hz: 10.0
+    auto_start: true
+    matrix_enabled: true
+    matrix_request_interval_s: 0.05
+    tactile_timeout_s: 1.0
+    matrix_timeout_s: 0.25
+    stale_after_s: 1.0
+    contact_threshold: 8
+    # Tip = number of 12x6 cells at or above this raw value (idle cells read 0–3).
+    tip_cell_threshold: 10
   hand_gesture:
     enabled: true
     motion_speed: 85

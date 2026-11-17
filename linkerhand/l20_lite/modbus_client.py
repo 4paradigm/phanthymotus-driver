@@ -9,6 +9,7 @@ installation inside the deployment container.
 from __future__ import annotations
 
 import threading
+import time
 
 JOINT_COUNT = 10
 RIGHT_HAND_ID = 0x27
@@ -16,6 +17,15 @@ LEFT_HAND_ID = 0x28
 POSITION_REGISTER = 0x0000
 TORQUE_REGISTER = 0x000A
 SPEED_REGISTER = 0x0014
+# Fingertip pressure, as used by the vendor's RS485 host app (L10_hand_ui):
+# write the finger number to holding register 0x0046, then read 98 input
+# registers from 0x003C. Register 0 echoes the finger, register 1 is unused
+# by the vendor app, and the remaining 96 are the raw tactile cells.
+TACTILE_SELECT_REGISTER = 0x0046
+TACTILE_BASE_REGISTER = 0x003C
+TACTILE_REGISTER_COUNT = 98
+TACTILE_CELL_COUNT = TACTILE_REGISTER_COUNT - 2
+FINGER_IDS = {"thumb": 1, "index": 2, "middle": 3, "ring": 4, "pinky": 5}
 
 
 def _bytes(values, *, expected: int = JOINT_COUNT) -> list[int]:
@@ -110,23 +120,24 @@ class L20LiteModbusClient:
         if crc16(frame[:-2]) != frame[-2:]:
             raise ValueError("Modbus CRC mismatch")
 
-    def _read_registers(self, address: int) -> list[int]:
-        payload = bytes((self.slave_id, 0x04)) + address.to_bytes(2, "big") + JOINT_COUNT.to_bytes(2, "big")
+    def _read_registers(self, address: int, count: int = JOINT_COUNT,
+                        max_value: int = 255) -> list[int]:
+        payload = bytes((self.slave_id, 0x04)) + address.to_bytes(2, "big") + count.to_bytes(2, "big")
         response = self._transact(payload, 0x04)
-        if response[2] != JOINT_COUNT * 2:
-            raise ValueError(f"expected 20 register bytes, got {response[2]}")
+        if response[2] != count * 2:
+            raise ValueError(f"expected {count * 2} register bytes, got {response[2]}")
         data = response[3:-2]
         registers = [int.from_bytes(data[i:i + 2], "big") for i in range(0, len(data), 2)]
-        if any(value > 255 for value in registers):
-            raise ValueError("joint register contains value outside 0..255")
+        if any(value > max_value for value in registers):
+            raise ValueError(f"register contains value outside 0..{max_value}")
         return registers
 
-    def _write_registers(self, address: int, values) -> list[int]:
-        values = _bytes(values)
+    def _write_registers(self, address: int, values, *, expected: int = JOINT_COUNT) -> list[int]:
+        values = _bytes(values, expected=expected)
         data = b"".join(value.to_bytes(2, "big") for value in values)
         payload = (
             bytes((self.slave_id, 0x10)) + address.to_bytes(2, "big")
-            + JOINT_COUNT.to_bytes(2, "big") + bytes((len(data),)) + data
+            + len(values).to_bytes(2, "big") + bytes((len(data),)) + data
         )
         response = self._transact(payload, 0x10)
         if response[2:6] != payload[2:6]:
@@ -147,6 +158,18 @@ class L20LiteModbusClient:
                 return self.get_positions()
             finally:
                 self.slave_id = previous_id
+
+    def read_fingertip(self, finger: str, settle_s: float = 0.03) -> list[int]:
+        """Select one fingertip and return its 96 raw tactile cells."""
+        finger_id = FINGER_IDS[finger]
+        with self._lock:
+            self._write_registers(TACTILE_SELECT_REGISTER, [finger_id], expected=1)
+            if settle_s > 0:
+                time.sleep(settle_s)
+            registers = self._read_registers(TACTILE_BASE_REGISTER, TACTILE_REGISTER_COUNT, 0xFFFF)
+        if registers[0] != finger_id:
+            raise ValueError(f"tactile reply is for finger {registers[0]}, expected {finger_id}")
+        return registers[2:]
 
     def get_speeds(self) -> list[int]:
         return self._read_registers(SPEED_REGISTER)
