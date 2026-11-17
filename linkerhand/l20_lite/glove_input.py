@@ -211,7 +211,7 @@ class GloveInput:
     def calibrate(self, library, serial_port, profile, sides=("right",)):
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
-                raise RuntimeError("请先执行 disconnect_glove 结束当前手套会话")
+                raise RuntimeError("当前手套会话仍在运行")
             self._stop.clear()
             self._state, self._error = "waiting_for_glove", None
             self._selected = tuple(sides)

@@ -18,6 +18,8 @@ import json
 import os
 import shutil
 import ssl
+import stat
+from pathlib import Path
 import threading
 import time
 import urllib.request
@@ -42,6 +44,8 @@ TRACKING_DELAY_BUDGET_S = 20.0
 DEFAULT_DATA_DIR = "/opt/phanthy-motus/data/l20-lite-teach"
 # start_trajectory waits this long for the first glove frame.
 FIRST_FRAME_S = 5.0
+# Covers the SDK's glove-data and R-calibration deadlines, plus first-frame delivery.
+GLOVE_CALIBRATION_TIMEOUT_S = 18.0
 
 
 class PlaybackPaused(Exception):
@@ -71,6 +75,7 @@ class TeachPlugin:
         self._recording_owner = ""
         self._glove = GloveInput()
         self._glove_owner = None
+        self._glove_calibrating = False
         self._glove_settings = {name: os.environ.get("L20_GLOVE_" + name.upper()) or config.get("glove_" + name)
                                 for name in ("library", "serial", "profile")}
         self.data_dir = os.environ.get("L20_TEACH_DATA_DIR") or config.get("data_dir", DEFAULT_DATA_DIR)
@@ -143,7 +148,6 @@ class TeachPlugin:
             "stop_motion": ([], "立即停止回放或过渡运动并释放全部关节力矩，也会中止录制（录制标为 incomplete）；不需要确认"),
             "calibrate_glove": ([], "保持手指自然伸直，校准卡片绑定手侧的手套"),
             "glove_status": ([], "查看本机手套校准及有效帧状态"),
-            "disconnect_glove": ([], "断开手套接收器，下次连接需重新校准"),
             "config": (["bound_side"], "配置手侧"),
         }, {
             "bound_side": {"type": "string", "enum": ["left", "right"]},
@@ -169,7 +173,7 @@ class TeachPlugin:
         ]
         schema["x-action-params"]["calibrate_glove"]["before_run"] = (
             "戴好卡片所绑定手侧的手套，手腕自然放平，五指自然伸直并拢。拇指保持伸直，轻靠食指。"
-            "摆好后点击执行，保持手势约 3 秒，再用 glove_status 确认状态为 ready。"
+            "摆好后点击执行，保持手势，等待 Activity 显示校准结果。"
         )
         schema["x-is-dangerous"] = True
         schema["x-completion"] = {"actions": list(ACTIONS), "timeout": self._completion_timeout()}
@@ -561,8 +565,8 @@ class TeachPlugin:
         if action == "glove_status":
             return {**self._glove.status(self._bindings.get(instance_id) or "right"),
                     "configured": all(self._glove_settings.values())}
-        if action in ("calibrate_glove", "disconnect_glove"):
-            return self._glove_action(action, instance_id)
+        if action == "calibrate_glove":
+            return self._calibrate_glove(instance_id)
         if action == "config":
             if not isinstance(instance_id, str) or not instance_id:
                 raise ValueError("缺少卡片实例标识 instance_id")
@@ -692,31 +696,73 @@ class TeachPlugin:
         if not instance_id and self._bindings:
             raise ValueError("缺少卡片实例标识，无法应用已配置的手侧，请刷新画布后重试")
 
-    def _glove_action(self, action, instance_id):
+    def _check_glove_receiver(self):
+        serial = self._glove_settings["serial"]
+        if not serial:
+            raise RuntimeError("驱动未配置手套接收器串口")
+        try:
+            mode = Path(serial).stat().st_mode
+        except FileNotFoundError:
+            raise RuntimeError("未检测到手套接收器，请插入接收器并检查是否接在配置的 USB 口") from None
+        if not stat.S_ISCHR(mode):
+            raise RuntimeError("配置的手套接收器串口不是设备，请检查串口配置")
+        if not os.access(serial, os.R_OK | os.W_OK):
+            raise RuntimeError("驱动没有访问手套接收器串口的权限")
+
+    def _check_glove_settings(self):
+        self._check_glove_receiver()
+        library = self._glove_settings["library"]
+        if not library or not Path(library).is_file():
+            raise RuntimeError("找不到手套 SDK 库，请检查驱动中的 SDK 路径")
+        profile = self._glove_settings["profile"]
+        if not profile or not Path(profile).is_file():
+            raise RuntimeError("找不到手套校准档案，请检查驱动中的 .hexprofile 路径")
+
+    def _calibrate_glove(self, instance_id):
         with self._lock:
             if self._recorder is not None and not self._recorder.finished.is_set():
                 raise RuntimeError("请先停止轨迹录制")
+            self._check_motion_instance(instance_id)
+            self._check_glove_settings()
             if self._glove_owner not in (None, instance_id):
                 if self._glove.status()["state"] in ("idle", "error"):
                     self._glove_owner = None
                 else:
                     raise RuntimeError("手套接收器正在由另一张卡片使用")
-            if action == "calibrate_glove":
-                self._check_motion_instance(instance_id)
-                side = self._bindings.get(instance_id) or "right"
-                settings = self._glove_settings
-                if not all(settings.values()):
-                    raise RuntimeError("请在驱动中配置手套 SDK 库、接收器串口和 .hexprofile")
-                if self._glove_owner == instance_id:
+            if self._glove_calibrating:
+                raise RuntimeError("手套正在校准，请等待本次结果")
+            side = self._bindings.get(instance_id) or "right"
+            settings = self._glove_settings
+            if self._glove_owner == instance_id:
+                self._glove.close()
+            self._glove.calibrate(settings["library"], settings["serial"], settings["profile"], (side,))
+            self._glove_owner = instance_id
+            self._glove_calibrating = True
+        try:
+            return self._wait_glove_calibration(instance_id, side)
+        finally:
+            with self._lock:
+                self._glove_calibrating = False
+
+    def _wait_glove_calibration(self, instance_id, side):
+        hand_name = "左手" if side == "left" else "右手"
+        deadline = time.monotonic() + GLOVE_CALIBRATION_TIMEOUT_S
+        while True:
+            with self._lock:
+                if self._glove_owner != instance_id:
+                    raise RuntimeError(f"{hand_name}手套校准已中止")
+                status = self._glove.status(side)
+                if status["state"] == "error":
+                    raise RuntimeError(f"{hand_name}手套校准失败：{status['error'] or '请查看驱动日志'}")
+                if status["state"] == "idle":
+                    raise RuntimeError(f"{hand_name}手套校准已中止")
+                if side in status["calibrated_sides"] and status["fresh"]:
+                    return {"message": f"{hand_name}手套校准成功，可以开始录制", "state": status["state"], "side": side}
+                if time.monotonic() >= deadline:
                     self._glove.close()
-                state = self._glove.calibrate(settings["library"], settings["serial"], settings["profile"], (side,))
-                self._glove_owner = instance_id
-                hand_name = "左手" if side == "left" else "右手"
-                return {**state, "side": side,
-                        "message": f"正在校准{hand_name}手套。请保持当前伸直手势，约 3 秒后用 glove_status 确认状态为 ready。"}
-            self._glove.close()
-            self._glove_owner = None
-            return self._glove.status()
+                    self._glove_owner = None
+                    raise RuntimeError(f"{hand_name}手套校准失败：等待有效关节数据超时")
+            time.sleep(0.05)
 
     def _request_play(self, instance_id, args):
         action = "play"
@@ -726,8 +772,10 @@ class TeachPlugin:
             side = self._bindings.get(instance_id)
         found = self.hand._discover()
         if side is None:
-            if len(found) != 1:
-                raise RuntimeError("无法自动确定手侧，请检查连接，并在卡片配置中选择左手或右手")
+            if not found:
+                raise RuntimeError("未检测到 L20 Lite 灵巧手，请检查电源和串口连接")
+            if len(found) > 1:
+                raise RuntimeError("检测到多只 L20 Lite 灵巧手，请在卡片配置中选择左手或右手")
             side = next(iter(found))
         if side != manifest["side"]:
             raise RuntimeError(f"轨迹「{manifest['name']}」的手侧是 {manifest['side']}，与当前卡片不匹配")
@@ -756,12 +804,12 @@ class TeachPlugin:
             raise
         return {"state": "running", "action_id": active["action_id"]}
 
-    def _run_live(self, recorder, instance_id):
+    def _run_live(self, recorder, instance_id, port):
         client = None
         torque_attempted = False
         period = 1 / PLAYBACK_HZ
         try:
-            # No serial access before a valid UDP frame.
+            # Wait for glove data before preparing the hand for motion.
             recorder.startup.wait()
             if recorder.stopped.is_set() or not recorder.first_frame.is_set():
                 return
@@ -769,9 +817,6 @@ class TeachPlugin:
                 if recorder.stopped.is_set():
                     return
                 side = recorder.side
-                port = self.hand._discover().get(side)
-                if port is None:
-                    raise RuntimeError(f"未连接{'左侧' if side == 'left' else '右侧'} L20 Lite 灵巧手")
                 recorder.live_port = port
                 client = self._connection(instance_id, side, port).get(side)
                 command = list(client.probe_positions(side))
@@ -896,19 +941,28 @@ class TeachPlugin:
             if self._recorder is not None and not self._recorder.finished.is_set():
                 raise RuntimeError(f"正在录制「{self._recorder.name}」，请先执行 stop_trajectory")
             side = self._bindings.get(instance_id) or "right"
-            if not all(self._glove_settings.values()):
-                raise RuntimeError("请在驱动中配置手套 SDK 库、接收器串口和 .hexprofile")
-            status = self._glove.status(side)
-            if side not in status["calibrated_sides"]:
-                raise RuntimeError("请对当前手侧重新执行 calibrate_glove，等待 glove_status 显示 ready")
+            self._check_glove_settings()
+            if self.store.find(name) is not None:
+                raise ValueError(f"轨迹「{name}」已存在，请换名或先删除原轨迹")
             self.hand.reserve_live_teach()
             try:
+                port = self.hand._discover().get(side)
+                hand_name = "左侧" if side == "left" else "右侧"
+                if port is None:
+                    raise RuntimeError(f"未检测到{hand_name} L20 Lite 灵巧手，请检查电源、串口连接及卡片手侧")
+                if self._glove_calibrating:
+                    raise RuntimeError("手套正在校准，请等待本次结果")
+                status = self._glove.status(side)
+                if side not in status["calibrated_sides"]:
+                    if status["error"] and self._glove_owner == instance_id:
+                        raise RuntimeError(f"上次手套校准失败：{status['error']}。解决后请重新执行 calibrate_glove")
+                    raise RuntimeError("当前手侧的手套尚未校准，请执行 calibrate_glove")
                 directory = self.store.create(name, hand_trajectory.recorded_at(time.time()), side=side)
                 recorder = teach_recorder.Recorder(
                     directory, name, port=None, max_s=self.record_max_s, gap_ms=self.record_gap_ms,
                     on_end=self._on_recording_end, side=side,
                     local_packet=lambda: self._glove.latest_packet(side),
-                    live_control=lambda take: self._run_live(take, instance_id),
+                    live_control=lambda take: self._run_live(take, instance_id, port),
                 )
                 try:
                     recorder.start()
@@ -942,7 +996,8 @@ class TeachPlugin:
             return result
         if result["state"] == "error" or result.get("deleted") is False or recorder.first_frame.is_set():
             raise RuntimeError(result["message"])
-        raise RuntimeError("未收到本机手套有效帧，请检查 glove_status")
+        self._check_glove_receiver()
+        raise RuntimeError("未收到所选手侧的有效手套数据，请检查手套电源、配对和追踪状态")
 
     def _stop_recording(self, instance_id, args):
         if args.get("confirm_motion") is not True:
