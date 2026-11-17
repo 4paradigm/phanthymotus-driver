@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from common.vendor_runtime import action_schema, tool
-from modbus_client import JOINT_COUNT, L20LiteModbusClient, _bytes, _remaining_time
+from modbus_client import JOINT_COUNT, L20LiteModbusClient, ModbusResponseTimeout, _bytes, _remaining_time
 
 JOINT_NAMES = [
     "thumb_root", "thumb_sway", "index_root", "middle_root", "ring_root",
@@ -744,8 +744,11 @@ class MultiHandPlugin:
             raise
         finally:
             connection.close()
-        if results and all(isinstance(value, (ValueError, RuntimeError)) for value in results.values()):
-            # Every finger answered wrongly: wrong or replugged port, rediscover.
+        if (all(isinstance(value, Exception) for value in results.values())
+                and any(isinstance(value, (ModbusResponseTimeout, ValueError, RuntimeError))
+                        for value in results.values())):
+            # No valid reply confirmed this port. An exhausted round budget
+            # or a busy bus alone says nothing about the adapter.
             self._tactile_ports.pop(side, None)
         return port, results
 

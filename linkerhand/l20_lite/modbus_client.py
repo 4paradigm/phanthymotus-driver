@@ -58,6 +58,10 @@ def _frame(payload: bytes) -> bytes:
     return payload + crc16(payload)
 
 
+class ModbusResponseTimeout(TimeoutError):
+    """The adapter did not receive a complete Modbus reply."""
+
+
 def _remaining_time(deadline: float) -> float:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -115,7 +119,9 @@ class L20LiteModbusClient:
                     self._serial.timeout = remaining
             part = self._serial.read(size - len(data))
             if not part:
-                raise TimeoutError(f"Modbus timeout on {self.port}: received {len(data)}/{size} bytes")
+                if deadline is not None:
+                    _remaining_time(deadline)
+                raise ModbusResponseTimeout(f"Modbus timeout on {self.port}: received {len(data)}/{size} bytes")
             data.extend(part)
         return bytes(data)
 

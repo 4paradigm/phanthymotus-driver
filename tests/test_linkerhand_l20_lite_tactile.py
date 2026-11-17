@@ -250,6 +250,7 @@ def test_busy_bus_does_not_block_motion(tmp_path):
         _, results = hand.read_tactile("right", FINGERS, budget_s=0.05, settle_s=0)
         assert time.monotonic() - started < 0.5
         assert all(isinstance(results[f], TimeoutError) for f in FINGERS)
+        assert hand._tactile_ports["right"] == str(port)
     finally:
         release.set()
         thread.join()
@@ -287,9 +288,14 @@ def test_silent_fingers_share_round_deadline_and_restore_serial_timeouts(monkeyp
     assert all(isinstance(results[finger], TimeoutError) for finger in FINGERS)
     assert [frame[1] for frame in serial.sent] == [0x10, 0x04, 0x10, 0x04]
     assert serial.timeout == serial.write_timeout == 0.5
+    assert "right" not in hand._tactile_ports
 
+    new_port = tmp_path / "ttyUSB1"
+    new_port.touch()
+    monkeypatch.setattr(hand, "_discover", lambda **_: {"right": str(new_port)})
     serial.silent_fingers.clear()
-    _, results = hand.read_tactile("right", ["thumb"], budget_s=0.75, settle_s=0)
+    recovered_port, results = hand.read_tactile("right", ["thumb"], budget_s=0.75, settle_s=0)
+    assert recovered_port == str(new_port)
     assert results["thumb"][0] == cells(1)
     hand._legacy.connection.close()
 
@@ -412,6 +418,38 @@ def test_anonymous_stop_stops_unclaimed_auto_start_stream():
         assert plugin.dispatch("start", {"instance_id": "named"})["state"] == "running"
         plugin.dispatch("stop", {})
         assert plugin.dispatch("info", {"instance_id": "named"})["state"] == "running"
+    finally:
+        plugin.stop()
+
+
+def test_unknown_tactile_action_is_unhandled():
+    bundle = DriverBundle([lite_tactile.LiteTactilePlugin(FakeHand(), {}, {"side": "right"})])
+    assert bundle.dispatch("hand_tactile", {"action": "unsupported"}) is None
+
+
+def test_failed_active_rebind_keeps_binding_and_stream(monkeypatch):
+    plugin = lite_tactile.LiteTactilePlugin(FakeHand(), {}, {"side": "right"})
+    try:
+        plugin.dispatch("start", {})
+        with pytest.raises(ValueError, match="instance_id"):
+            plugin.dispatch("config", {"bound_side": "left", "poll_hz": 3})
+        assert plugin.dispatch("info", {})["bound_side"] == "right"
+        assert plugin.dispatch("info", {})["poll_hz"] == 10
+
+        plugin.dispatch("start", {"instance_id": "named"})
+        start = lite_tactile.LiteTactilePlugin._start_streaming
+
+        def fail_left(stream):
+            if stream.default_side == "left":
+                raise RuntimeError("cannot start left stream")
+            start(stream)
+
+        monkeypatch.setattr(lite_tactile.LiteTactilePlugin, "_start_streaming", fail_left)
+        with pytest.raises(RuntimeError, match="cannot start left stream"):
+            plugin.dispatch("config", {"instance_id": "named", "bound_side": "left"})
+        info = plugin.dispatch("info", {"instance_id": "named"})
+        assert info["bound_side"] == "right" and info["state"] == "running"
+        assert set(plugin._streams) == {"right"}
     finally:
         plugin.stop()
 

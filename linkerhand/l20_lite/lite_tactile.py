@@ -215,20 +215,28 @@ class LiteTactilePlugin:
                         {**self.global_config, "side": side},
                         ros2=self._ros2, namespace=self.namespace,
                     )
-                self._streams[side] = stream
+            other_targets = {target for owner, target in self._stream_targets.items()
+                             if owner != instance_id}
+            old_sides = {previous, self.default_side} - other_targets - {None, side}
+            was_running = stream._running()
+            stream._start_streaming()
+            try:
+                for old_side in old_sides:
+                    old = self if old_side == self.default_side else self._streams[old_side]
+                    old._stop_streaming()
+                    self._streams.pop(old_side, None)
+            except Exception:
+                if not was_running:
+                    try:
+                        stream._stop_streaming()
+                    except Exception:
+                        self._streams[side] = stream
+                        logger.exception("Failed to stop tactile stream after unsuccessful rebind")
+                raise
+            self._streams[side] = stream
             self._stream_targets[instance_id] = side
             with self._lock:
                 self._bindings[instance_id] = side
-            if previous is not None and previous != side and previous not in self._stream_targets.values():
-                old = self._streams.pop(previous, None)
-                if old is not None:
-                    old._stop_streaming()
-            # Replace the unclaimed auto-start stream when a card selects another hand.
-            default = self.default_side
-            if side != default and default not in self._stream_targets.values():
-                self._stop_streaming()
-                self._streams.pop(default, None)
-            stream._start_streaming()
             return stream
 
     def _stop_instance_stream(self, instance_id: str) -> None:
@@ -484,29 +492,33 @@ class LiteTactilePlugin:
 
     # ── MCP Dispatcher ────────────────────────────────────────────────
 
-    def dispatch(self, action: str, args: dict) -> dict:
+    def dispatch(self, action: str, args: dict) -> dict | None:
         instance_id = str(args.get("instance_id", ""))
-        side = self._resolve_target(args)
 
         if action == "config":
             bound = args.get("bound_side")
             if "bound_side" in args and bound not in ("left", "right"):
                 raise ValueError("bound_side 必须是 left 或 right")
-            rate = _number(args.get("poll_hz", self.poll_hz), "poll_hz", 1, 10)
-            with self._lock:
-                # Core applies shared settings before instance settings. A
-                # frequency-only config must not require or replace a binding.
-                if "bound_side" in args:
-                    self._bindings[instance_id] = bound
-                self.poll_hz = rate
             with self._lifecycle_lock:
+                rate = _number(args.get("poll_hz", self.poll_hz), "poll_hz", 1, 10)
+                side = self._resolve_target(args)
+                if "bound_side" in args:
+                    if instance_id in self._stream_targets:
+                        self._select_stream(instance_id, side)
+                    else:
+                        with self._lock:
+                            self._bindings[instance_id] = side
+                # Core can apply shared settings without an instance binding.
+                self.poll_hz = rate
                 for stream in self._streams.values():
                     stream.poll_hz = rate
-                if instance_id in self._stream_targets and "bound_side" in args:
-                    self._select_stream(instance_id, side)
             return {"state": "configured", "bound_side": side, "stream_side": side,
                     "topic_out": self.topic_out(side)}
 
+        if action not in ("info", "start", "stop", "get_state"):
+            return None
+
+        side = self._resolve_target(args)
         if action == "info":
             with self._lifecycle_lock:
                 stream = self._streams.get(side)
@@ -565,5 +577,3 @@ class LiteTactilePlugin:
                 "topic_out": self.topic_out(side),
                 "sample_age_s": max(0.0, time.time() - latest["timestamp"]),
             }
-
-        return {"state": "error", "message": f"Unknown action: {action}"}
