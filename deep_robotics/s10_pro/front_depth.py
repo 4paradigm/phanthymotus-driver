@@ -27,6 +27,7 @@ from deep_robotics.s10_pro.undistortion import CameraUndistortion, half_fov
 from deep_robotics.s10_pro.cloud_relay import CloudRelay
 from deep_robotics.s10_pro.depth_fusion import fuse_depth
 from deep_robotics.s10_pro.monocular_depth import MonocularDepth
+from deep_robotics.s10_pro import cpu_kernels
 
 NAME = "camera_front_depth"
 FRAME = "s10_pro_camera_front_optical"
@@ -116,20 +117,28 @@ def _project_worker(jobs, results):
         context = {key: job[key] for key in
                    ("generation", "camera_generation", "stamp", "received_monotonic")}
         try:
+            started = time.monotonic()
             packet, stats = project_depth(
                 job["cloud"], job["K"], job["transform"],
                 min_depth_m=job["min_depth_m"], max_depth_m=job["max_depth_m"])
+            stats['projection_ms'] = round((time.monotonic() - started) * 1000, 1)
+            fill_started = time.monotonic()
             filled_packet, fill_stats = fill_depth_holes(packet)
             stats.update(fill_stats)
+            stats['hole_fill_ms'] = round((time.monotonic() - fill_started) * 1000, 1)
             if model is None:
                 model = MonocularDepth()
             inference_started = time.monotonic()
             mono_packet = model.predict(job['jpeg'])
             stats['monocular_inference_ms'] = round((time.monotonic() - inference_started) * 1000, 1)
+            fusion_started = time.monotonic()
             fused_packet, fusion_stats = fuse_depth(packet, filled_packet, mono_packet,
                                                   min_depth_m=job['min_depth_m'],
                                                   max_depth_m=job['max_depth_m'])
             stats.update(fusion_stats)
+            stats['fusion_ms'] = round((time.monotonic() - fusion_started) * 1000, 1)
+            stats['processing_ms'] = round((time.monotonic() - started) * 1000, 1)
+            stats['cpu_kernel_backend'] = 'native' if cpu_kernels.AVAILABLE else 'numpy'
             stats["measured_coverage"] = round(stats["valid_pixels"] / (640 * 480), 4)
             stats["filled_coverage"] = round(
                 (stats["valid_pixels"] + stats["filled_pixels"]) / (640 * 480), 4)

@@ -4,6 +4,8 @@ import zlib
 
 import numpy as np
 
+from deep_robotics.s10_pro import cpu_kernels
+
 
 def _decode(packet):
     raw = zlib.decompress(packet)
@@ -14,6 +16,8 @@ def _decode(packet):
 
 def _window_sum(values):
     # Fixed 17x17 neighbourhood, zero padding: opposite image edges never mix.
+    if cpu_kernels.AVAILABLE:
+        return cpu_kernels.window_sum(values)
     padded = np.pad(values, ((8, 8), (8, 8)))
     integral = np.pad(padded.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
     return (integral[17:, 17:] - integral[:-17, 17:]
@@ -57,12 +61,15 @@ def fuse_depth(raw_packet, local_packet, mono_packet, *, min_depth_m=.1, max_dep
     if np.ptp(predicted) < .05:
         a, b = 1.0, float(np.median(target - predicted))
     else:
-        design = np.column_stack((predicted, np.ones(len(predicted))))
         weights = np.ones(len(predicted))
         for _ in range(5):
-            root = np.sqrt(weights)
-            a, b = np.linalg.lstsq(design * root[:, None], target * root, rcond=None)[0]
-            residual = design @ np.array([a, b]) - target
+            # Centred two-parameter WLS avoids a LAPACK solve/thread pool per iteration.
+            total = weights.sum()
+            mean_x, mean_y = (weights * predicted).sum() / total, (weights * target).sum() / total
+            centred = predicted - mean_x
+            a = (weights * centred * (target - mean_y)).sum() / (weights * centred**2).sum()
+            b = mean_y - a * mean_x
+            residual = a * predicted + b - target
             scatter = max(.03, 1.4826 * float(np.median(np.abs(residual - np.median(residual)))))
             weights = np.minimum(1, 1.5 * scatter / np.maximum(np.abs(residual), 1e-6))
     if not (math.isfinite(a) and math.isfinite(b) and a > 0):

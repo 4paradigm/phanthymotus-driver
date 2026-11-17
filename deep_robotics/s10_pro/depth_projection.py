@@ -5,13 +5,13 @@ zero marking unobserved pixels. The projection step never interpolates.
 The bounded hole-filled output is explicitly marked as estimated;
 no RGB synchronization or motion compensation is assumed.
 """
-from array import array
 from collections.abc import Mapping
 import json
 import math
 import struct
-import sys
 import zlib
+
+from deep_robotics.s10_pro import cpu_kernels
 
 
 WIDTH = 640
@@ -153,6 +153,8 @@ def project_depth(cloud, K, camera_optical_from_cloud, *, min_depth_m=0.1,
     Z-buffer comparisons use unquantized optical Z, not radial distance.
     Positive depths quantize to nearest millimetre, clamped to 1..65535.
     """
+    import numpy as np
+
     minimum = _number(min_depth_m, 'min_depth_m')
     maximum = _number(max_depth_m, 'max_depth_m')
     if minimum < 0 or maximum <= minimum:
@@ -163,39 +165,32 @@ def project_depth(cloud, K, camera_optical_from_cloud, *, min_depth_m=0.1,
     width, total, point_step, row_step, data, fields = validate_cloud_layout(cloud)
     sampled = min(total, max_points)
     # Allocation happens only after all input/resource validation succeeds.
-    zbuffer = array('d', [0.0]) * (WIDTH * HEIGHT)
-    valid_pixels = 0
-    r0, r1, r2 = matrix[:3]
-    for n in range(sampled):
-        index = n * (total - 1) // (sampled - 1) if sampled > 1 else 0
-        row, column = divmod(index, width)
-        offset = row * row_step + column * point_step
-        x, y, z = (scalar.unpack_from(data, offset + field_offset)[0] for field_offset, scalar in fields)
-        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
-            continue
-        xc = r0[0] * x + r0[1] * y + r0[2] * z + r0[3]
-        yc = r1[0] * x + r1[1] * y + r1[2] * z + r1[3]
-        zc = r2[0] * x + r2[1] * y + r2[2] * z + r2[3]
-        if not (math.isfinite(xc) and math.isfinite(yc) and math.isfinite(zc)):
-            continue
-        if zc <= 0 or zc < minimum or zc > maximum:
-            continue
-        u, v = k[0] * (xc / zc) + k[2], k[4] * (yc / zc) + k[5]
-        if not (math.isfinite(u) and math.isfinite(v)):
-            continue
-        if not (-.5 <= u < WIDTH - .5 and -.5 <= v < HEIGHT - .5):
-            continue
-        pixel = math.floor(v + .5) * WIDTH + math.floor(u + .5)
-        previous = zbuffer[pixel]
-        if previous == 0:
-            valid_pixels += 1
-            zbuffer[pixel] = zc
-        elif zc < previous:
-            zbuffer[pixel] = zc
-    output = array('H', (0 if z == 0 else min(65535, max(1, math.floor(min(z, 65.535) * 1000 + .5)))
-                         for z in zbuffer))
-    if sys.byteorder != 'little':
-        output.byteswap()
+    zbuffer = np.full(WIDTH * HEIGHT, np.inf, dtype=np.float64)
+    if sampled:
+        indices = (np.arange(sampled, dtype=np.int64) * (total - 1) // (sampled - 1)
+                   if sampled > 1 else np.zeros(1, dtype=np.int64))
+        rows, columns = divmod(indices, width)
+        xyz = [np.ndarray((cloud['height'], width), dtype=np.dtype(scalar.format),
+                          buffer=data, offset=offset, strides=(row_step, point_step)
+                          )[rows, columns].astype(np.float64)
+               for offset, scalar in fields]
+        x, y, z = xyz
+        # Keep float64 and the scalar operation order for optical-Z and ties.
+        with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+            xc, yc, zc = [r[0] * x + r[1] * y + r[2] * z + r[3] for r in matrix[:3]]
+            valid = (np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+                     & np.isfinite(xc) & np.isfinite(yc) & np.isfinite(zc)
+                     & (zc > 0) & (zc >= minimum) & (zc <= maximum))
+            u, v = k[0] * (xc[valid] / zc[valid]) + k[2], k[4] * (yc[valid] / zc[valid]) + k[5]
+            visible = (np.isfinite(u) & np.isfinite(v) & (u >= -.5) & (u < WIDTH - .5)
+                       & (v >= -.5) & (v < HEIGHT - .5))
+            pixels = (np.floor(v[visible] + .5).astype(np.int64) * WIDTH
+                      + np.floor(u[visible] + .5).astype(np.int64))
+            np.minimum.at(zbuffer, pixels, zc[valid][visible])
+    observed = np.isfinite(zbuffer)
+    valid_pixels = int(np.count_nonzero(observed))
+    output = np.where(observed, np.clip(np.floor(np.minimum(zbuffer, 65.535) * 1000 + .5),
+                                       1, 65535), 0).astype('<u2')
     return zlib.compress(output.tobytes(), level=1), {
         'source_points': total, 'sample_points': sampled, 'valid_pixels': valid_pixels,
     }
@@ -219,6 +214,10 @@ def fill_depth_holes(packet):
     raw = zlib.decompress(packet)
     if len(raw) != WIDTH * HEIGHT * 2:
         raise ValueError("depth packet is not 640x480 uint16")
+    if cpu_kernels.AVAILABLE:
+        result, stats = cpu_kernels.fill_holes(raw, HOLE_FILL_MAX_GAP_PX,
+                                              HOLE_FILL_MAX_JUMP_MM, HOLE_FILL_RELATIVE_JUMP)
+        return zlib.compress(result, level=1), stats
     source = np.frombuffer(raw, dtype='<u2').reshape(HEIGHT, WIDTH).astype(np.int32)
 
     def bridge(state, axis):
@@ -230,23 +229,23 @@ def fill_depth_holes(packet):
         right = np.minimum.accumulate(np.where(known, index, size)[:, ::-1], axis=1)[:, ::-1]
         bracketed = (~known & (left >= 0) & (right < size)
                      & (right - left - 1 <= HOLE_FILL_MAX_GAP_PX))
-        left = left.clip(0, size - 1)
-        right = right.clip(0, size - 1)
-        first = np.take_along_axis(depth, left, axis=1)
-        last = np.take_along_axis(depth, right, axis=1)
-        minimum = np.minimum(np.take_along_axis(low, left, axis=1),
-                             np.take_along_axis(low, right, axis=1))
-        maximum = np.maximum(np.take_along_axis(high, left, axis=1),
-                             np.take_along_axis(high, right, axis=1))
+        rows, columns = np.nonzero(bracketed & ~rejected)
+        if not len(rows):
+            return state
+        left, right = left[rows, columns], right[rows, columns]
+        first, last = depth[rows, left], depth[rows, right]
+        minimum = np.minimum(low[rows, left], low[rows, right])
+        maximum = np.maximum(high[rows, left], high[rows, right])
         consistent = ((maximum - minimum <= HOLE_FILL_MAX_JUMP_MM)
                       & (maximum - minimum <= HOLE_FILL_RELATIVE_JUMP * minimum))
-        valid = bracketed & consistent & ~rejected
         # int32 also covers 65535-mm inputs and the full 640-pixel row span.
         span = np.maximum(1, right - left)
-        estimate = (first * (right - index) + last * (index - left) + span // 2) // span
-        result = (np.where(valid, estimate, depth),
-                  np.where(valid, minimum, low), np.where(valid, maximum, high),
-                  rejected | (bracketed & ~consistent))
+        estimate = (first * (right - columns) + last * (columns - left) + span // 2) // span
+        result = tuple(a.copy() for a in (depth, low, high, rejected))
+        valid_rows, valid_columns = rows[consistent], columns[consistent]
+        for target, values in zip(result[:3], (estimate, minimum, maximum)):
+            target[valid_rows, valid_columns] = values[consistent]
+        result[3][rows[~consistent], columns[~consistent]] = True
         return tuple(np.swapaxes(a, axis, 1) for a in result)
 
     original = (source, source, source, np.zeros(source.shape, dtype=bool))

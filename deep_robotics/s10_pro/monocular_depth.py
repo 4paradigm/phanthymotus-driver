@@ -15,6 +15,7 @@ import numpy as np
 
 MODEL_URL = 'https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-depth.onnx'
 MODEL_SHA256 = '6583ec12521a7e75eacb209db63393158c7e0e772cda9fdad8c8c0fe74af2a1e'
+CPU_MODEL_SHA256 = '22be352c818c7f87f63d435557714b02217873a30bd7d30487a57ce9bde0b347'
 MODEL_PATH = Path(__file__).with_name('resource') / 'models' / 'yolo26n-depth.onnx'
 DOWNLOAD_HEARTBEAT_SECONDS = 30
 DOWNLOAD_RETRY_DELAY_SECONDS = 2
@@ -60,18 +61,53 @@ def download_model(url=None):
     print('[s10 model] download verified and saved', flush=True)
 
 
+def prepare_cpu_model():
+    """Retarget the pinned export's spatial shapes; ONNX is build-only."""
+    source = MODEL_PATH.read_bytes()
+    if hashlib.sha256(source).hexdigest() != MODEL_SHA256:
+        raise ValueError('monocular model source checksum mismatch')
+    import onnx
+
+    model = onnx.load_from_string(source)
+    shapes = {
+        '/model.10/m/m.0/attn/Constant_output_0': [1, 2, 128, 60],
+        '/model.10/m/m.0/attn/Constant_3_output_0': [1, 128, 6, 10],
+        '/model.23/Concat_output_0': [1, 256, 12, 20],
+        '/model.23/Concat_1_output_0': [1, 256, 24, 40],
+    }
+    for tensor in model.graph.initializer:
+        if tensor.name in shapes:
+            tensor.CopyFrom(onnx.numpy_helper.from_array(
+                np.array(shapes[tensor.name], dtype=np.int64), tensor.name))
+    for tensor in list(model.graph.input) + list(model.graph.output):
+        tensor.type.tensor_type.shape.dim[-2].dim_value = 192
+        tensor.type.tensor_type.shape.dim[-1].dim_value = 320
+    del model.graph.value_info[:]
+    for entry in model.metadata_props:
+        if entry.key == 'imgsz':
+            entry.value = '[192, 320]'
+    prepared = model.SerializeToString()
+    onnx.checker.check_model(prepared)
+    if hashlib.sha256(prepared).hexdigest() != CPU_MODEL_SHA256:
+        raise ValueError('CPU model preparation checksum mismatch')
+    MODEL_PATH.write_bytes(prepared)
+    print('[s10 model] checked CPU model prepared at 320x192', flush=True)
+
+
 class MonocularDepth:
     def __init__(self, path=None):
         path = Path(path or MODEL_PATH)
         if not path.is_file():
             raise ValueError('monocular depth model is missing from the driver image')
-        if path.stat().st_size > 64 * 1024 * 1024 or hashlib.sha256(path.read_bytes()).hexdigest() != MODEL_SHA256:
+        if path.stat().st_size > 64 * 1024 * 1024 or hashlib.sha256(path.read_bytes()).hexdigest() != CPU_MODEL_SHA256:
             raise ValueError('monocular depth model checksum mismatch')
         import onnxruntime as ort
 
         options = ort.SessionOptions()
         options.intra_op_num_threads = 2
         options.inter_op_num_threads = 1
+        options.add_session_config_entry('session.intra_op.allow_spinning', '0')
+        options.add_session_config_entry('session.inter_op.allow_spinning', '0')
         self._session = ort.InferenceSession(str(path), sess_options=options,
                                             providers=['CPUExecutionProvider'])
         descriptor = self._session.get_inputs()[0]
@@ -115,3 +151,4 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--model-url', default=MODEL_URL)
     download_model(parser.parse_args().model_url)
+    prepare_cpu_model()

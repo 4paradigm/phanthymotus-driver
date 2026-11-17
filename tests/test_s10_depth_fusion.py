@@ -44,6 +44,16 @@ def test_interpolated_values_cannot_change_the_calibration_fit():
     assert first['calibration_median_relative_error'] == second['calibration_median_relative_error']
 
 
+@pytest.mark.parametrize('exponent,offset', [(1.25, -.3), (2., .1)])
+def test_robust_log_fit_recovers_nonunit_scale(exponent, offset):
+    raw, mono = scene()
+    measured = np.rint(np.exp(exponent * np.log(mono.astype(float) / 1000) + offset) * 1000)
+    raw[raw != 0] = measured[raw != 0].astype(np.uint16)
+    _, stats = fuse_depth(packet(raw), packet(raw), packet(mono))
+    assert stats['calibration_a'] == pytest.approx(exponent, abs=.002)
+    assert stats['calibration_b'] == pytest.approx(offset, abs=.002)
+
+
 def test_missing_lidar_references_cannot_be_replaced_by_a_guessed_scale():
     raw, mono = scene()
     with pytest.raises(ValueError, match='reference'):
