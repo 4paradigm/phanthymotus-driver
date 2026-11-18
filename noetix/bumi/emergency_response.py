@@ -127,7 +127,8 @@ class EmergencyResponsePlugin:
                 "type": "object", "required": ["action"],
                 "properties": {
                     "action": {"type": "string", "enum": [
-                        "engage", "snapshot", "release", "info", "history"]},
+                        "start", "stop", "engage", "snapshot", "release",
+                        "info", "history"]},
                     "reason": {"type": "string", "description": "交接原因；由上游保留原始来源"},
                     "source": {"type": "string", "enum": [
                         "manual", "vision", "audio", "system", "skill"]},
@@ -137,6 +138,7 @@ class EmergencyResponsePlugin:
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}},
                 "additionalProperties": False,
                 "x-action-params": {
+                    "start": {"params": []}, "stop": {"params": []},
                     "engage": {"params": ["reason", "source", "location"],
                                "required": ["reason", "source"]},
                     "snapshot": {"params": ["handoff_id"], "required": ["handoff_id"]},
@@ -184,6 +186,10 @@ class EmergencyResponsePlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         try:
+            if action == "start":
+                return {"state": "ready"}
+            if action == "stop":
+                return {"state": "idle"}
             if action == "engage":
                 reason = _text(args.get("reason"), "reason", 500)
                 source = args.get("source")
@@ -194,8 +200,11 @@ class EmergencyResponsePlugin:
                     if self._active is not None:
                         return {"state": "error", "error": "handoff_already_active",
                                 "active": deepcopy(self._active)}
-                    motion = (self._loco.dispatch("stop_move", {}) if self._loco is not None
+                    motion = (self._loco.dispatch(
+                        "stop_move", {"_tool_name": "loco"}) if self._loco is not None
                               else {"state": "unavailable"})
+                    if not isinstance(motion, dict):
+                        motion = {"state": "error", "error": "loco_stop_not_dispatched"}
                     photo = self._photo()
                     active = {"handoff_id": (
                                   f"handoff-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"),

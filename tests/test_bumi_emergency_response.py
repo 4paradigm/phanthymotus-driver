@@ -37,7 +37,10 @@ class FakeString:
 class FakeLoco:
     def __init__(self): self.calls = []
     def dispatch(self, action, args):
-        self.calls.append((action, args)); return {"state": "stopped"}
+        self.calls.append((action, args))
+        if action == "stop_move" and args.pop("_tool_name", "") == "loco":
+            return {"state": "stopped"}
+        return None
 
 
 class FakeCapture:
@@ -84,7 +87,7 @@ def test_tool_is_bumi_primitive_not_incident_workflow(module, tmp_path):
     tool = make_plugin(module, tmp_path).get_tool()
     actions = set(tool["inputSchema"]["properties"]["action"]["enum"])
     assert tool["name"] == "emergency_response" and tool["type"] == "actuator"
-    assert actions == {"engage", "snapshot", "release", "info", "history"}
+    assert actions == {"start", "stop", "engage", "snapshot", "release", "info", "history"}
     assert "呼叫安保" in tool["description"]
     assert tool["topic_out"][0]["format"] == "data/json"
 
@@ -98,6 +101,29 @@ def test_engage_stops_motion_captures_and_publishes(module, tmp_path):
     assert result["handoff"]["latest_photo"] == "/data/photo.jpg"
     assert result["record"]["schema"] == "motus.bumi-emergency-handoff/1"
     assert plugin._node.publisher.messages == [result["record"]]
+
+
+def test_canvas_dispatch_lifecycle(module, tmp_path):
+    plugin = make_plugin(module, tmp_path)
+    assert plugin.dispatch("start", {}) == {"state": "ready"}
+    assert plugin.dispatch("stop", {}) == {"state": "idle"}
+
+
+def test_engage_uses_real_loco_dispatch_route(module, tmp_path, monkeypatch):
+    from noetix.bumi.tests.test_loco_destination import _load_device
+
+    device, _ = _load_device(monkeypatch)
+    loco = object.__new__(device.LocoPlugin)
+    calls = []
+    loco._stop_move = lambda: calls.append("stop") or {"state": "stopped"}
+    loco._preempt_servo = lambda _reason: False
+    loco._body_action = None
+    plugin = make_plugin(module, tmp_path, loco=loco)
+
+    result = engage(plugin)
+
+    assert result["motion_stop"] == {"state": "stopped"}
+    assert calls == ["stop"]
 
 
 def test_one_active_handoff_snapshot_and_release(module, tmp_path):
