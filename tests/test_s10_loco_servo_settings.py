@@ -103,6 +103,49 @@ def test_servo_reports_static_standing_footprint_as_an_estimate(servo):
     assert descriptor['footprint'] == {'half_width': 0.23, 'source': 'estimate'}
 
 
+def test_servo_watchdog_holds_at_600_ms_without_admitting_stale_commands(servo, monkeypatch):
+    p = servo.plugin
+    monkeypatch.setattr(p, '_read_loop', lambda: None)
+    started = p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})
+    assert started['state'] == 'ready'
+    stamp = p._barrier_ms + 1
+    elapsed_ms = [0]
+    monkeypatch.setattr(p._sink, '_clock', lambda: 1000 + elapsed_ms[0])
+    monkeypatch.setattr(p._sink, '_wall_clock', lambda: stamp + elapsed_ms[0])
+
+    values = [.2, 0, 0, 0, 0, 0]
+    submit(p, {**command(p, values, stamp=stamp), 'obs_stamp_ms': stamp})
+    assert servo.native.calls[-1][2]['X'] == pytest.approx(.03)
+    commands_sent = len(servo.native.calls)
+
+    elapsed_ms[0] = 301
+    submit(p, {**command(p, values, seq=2, stamp=stamp), 'obs_stamp_ms': stamp})
+    assert p.dispatch('info', {})['last_command']['reason'] == 'expired: 301 ms old, ttl 300 ms'
+
+    elapsed_ms[0] = 500
+    p._tick()
+    assert len(servo.native.calls) == commands_sent
+
+    elapsed_ms[0] = 501
+    submit(p, {**command(p, values, seq=3, stamp=stamp + 501), 'obs_stamp_ms': stamp})
+    assert p.dispatch('info', {})['last_command']['reason'] == 'observation 501 ms old, limit 500 ms'
+
+    elapsed_ms[0] = 599
+    p._tick()
+    assert len(servo.native.calls) == commands_sent
+
+    elapsed_ms[0] = 600
+    p._tick()
+    assert len(servo.native.calls) == commands_sent + 1
+    assert servo.native.calls[-1] == (0x00100001, 0x00110002, dict.fromkeys(
+        ('X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw'), 0.0))
+    rate = started['control_interface']['rate']
+    assert rate['watchdog_ms'] == 600
+    assert rate['max_command_ttl_ms'] == 300
+    assert rate['max_obs_age_ms'] == 500
+    assert p.dispatch('info', {})['control_interface']['rate'] == rate
+
+
 @pytest.mark.parametrize('settings', [
     {'speed_preset': 'turbo'}, {'linear_acceleration': 0},
     {'linear_acceleration': float('nan')}, {'angular_acceleration': True},

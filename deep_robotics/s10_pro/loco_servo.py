@@ -66,7 +66,8 @@ def build_descriptor(expected_hz=10.0, settings=None):
         "frame": "base_link",
         # Approximate 0.40 m standing width plus 0.03 m per side for model uncertainty.
         "footprint": {"half_width": 0.23, "source": "estimate"},
-        "rate": {"max_hz": 20.0, "expected_hz": float(expected_hz), "watchdog_ms": 300, "max_obs_age_ms": 500},
+        "rate": {"max_hz": 20.0, "expected_hz": float(expected_hz), "watchdog_ms": 600,
+                 "max_command_ttl_ms": 300, "max_obs_age_ms": 500},
         "force_torque": None,
     }
 
@@ -74,8 +75,8 @@ def build_descriptor(expected_hz=10.0, settings=None):
 class _VelocitySink(ControlSink):
     """S10-only velocity stops and confirmed-output slew baseline.
 
-    Leave the shared sink and all other robots unchanged. Only the velocity
-    baseline is rebased; sequence, arbitration and watchdog state survive.
+    Rebasing updates the velocity baseline and preserves sequence, arbitration
+    and watchdog state.
     """
     def rebase(self, actual_values):
         self._last_values = tuple(float(value) for value in actual_values)

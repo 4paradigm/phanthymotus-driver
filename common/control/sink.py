@@ -481,6 +481,8 @@ class ControlSink:
             return Outcome(Verdict.REJECTED,
                            "ttl_ms is required, finite, and must be positive")
 
+        if self.descriptor.max_command_ttl_ms is not None:
+            ttl = min(ttl, self.descriptor.max_command_ttl_ms)
         age = now - stamp
         if age > ttl:
             return Outcome(Verdict.DROPPED, f"expired: {age} ms old, ttl {int(ttl)} ms")

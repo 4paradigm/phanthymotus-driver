@@ -130,9 +130,11 @@ confirmed output baseline to zero and require newly stamped commands. Pause and
 resume also reject pre-transition commands. Acceleration is a nominal per-frame
 slew limit, not a verified physical acceleration controller; an explicit zero
 axis stops immediately, including stopping forward travel while still turning.
-The implementation of these semantics is local to S10; Tianyi and shared
-ControlSink code are unchanged. Existing 300ms receive watchdog, 500ms observation
-freshness gate, sequence/priority arbitration and base ownership checks remain.
+The S10 receive watchdog sends zero when a reader tick sees 600 ms or more
+without an applied command. The reader polls every 50 ms. The descriptor caps
+command TTL at 300 ms during negotiation and admission. Incoming commands
+also have to pass the 500 ms observation freshness gate and sequence/priority
+arbitration. Base ownership checks still apply.
 Runtime permission revocation disarms the stream and sends zero.
 
 A rejected/failed native zero remains `stop_pending`, even after disarming.
