@@ -68,6 +68,24 @@ class BootstrapTests(unittest.TestCase):
                                                       {'host': {'password': 'test-secret'}})
         self.assertEqual(run.call_args.kwargs['env']['SSHPASS'], 'test-secret')
 
+    def test_commissioned_defaults_work_without_operator_secret_file(self):
+        result = types.SimpleNamespace(returncode=0, stdout=b'{"ok":true}')
+        for role in bootstrap.DEFAULTS:
+            with patch.object(bootstrap.subprocess, 'run', return_value=result) as run:
+                bootstrap.SshTransport(self.directory).run(role, bootstrap.DEFAULTS[role], {}, '', {})
+            self.assertEqual(run.call_args.kwargs['env']['SSHPASS'], bootstrap.DEFAULT_PASSWORDS[role])
+            self.assertEqual(json.loads(run.call_args.kwargs['input'])['_sudo_password'],
+                             bootstrap.DEFAULT_PASSWORDS[role])
+
+    def test_explicit_key_or_disabled_default_uses_batch_public_key_authentication(self):
+        result = types.SimpleNamespace(returncode=0, stdout=b'{"ok":true}')
+        for target, secrets in [(bootstrap.DEFAULTS['host'], {'host': {'key_file': '/config/id_test'}}),
+                                ({**bootstrap.DEFAULTS['host'], 'use_default_credentials': False}, {})]:
+            with patch.object(bootstrap.subprocess, 'run', return_value=result) as run:
+                bootstrap.SshTransport(self.directory).run('host', target, {}, '', secrets)
+            self.assertEqual(run.call_args.args[0][0], 'ssh')
+            self.assertIn('BatchMode=yes', run.call_args.args[0])
+
     def test_ssh_failure_never_echoes_peer_output_or_password(self):
         with patch.object(bootstrap.subprocess, 'run', return_value=types.SimpleNamespace(
                 returncode=255, stdout=b'', stderr=b'private-password\nremote log injection')):

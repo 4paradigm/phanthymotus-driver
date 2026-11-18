@@ -17,8 +17,10 @@ provisioning:
   install_missing_packages: true
   auto_initialize_and_pause: true
   # Override addresses/users/workspaces for a different factory installation.
-  # Passwords/keys belong in environment or /config/ssh-secrets.json (0600),
-  # never in this public file. Upper host is local to the host-network container.
+  # Default passwords are centralized in connection_defaults.py as requested.
+  # Private overrides: loco shared config, environment or ssh-secrets.json (0600).
+  # Set use_default_credentials: false per role to require explicit keys/secrets.
+  # Upper host is local to the host-network container.
   host: {address: 127.0.0.1, user: leju_kuavo, ros_ip: 192.168.26.12}
   controller: {address: 192.168.26.1, user: lab, ros_ip: 192.168.26.1}
   chassis: {address: 192.168.26.22, user: jt, ros_ip: 192.168.26.22, volume: 30}
@@ -32,8 +34,8 @@ sensors:
   # SDK permits N*m or current. Set N*m only after verifying robot hardware output.
   # Until then normalized tau is null; vendor.joint_torque preserves the raw values.
   joint_torque_unit: null
-  # No hardware-verified limits have been supplied. Only arm/leg move_joints
-  # are unavailable until a matching commissioning record is configured.
+  # No hardware-verified limits have been supplied. Arm/leg move_joints and
+  # named arm/leg/waist joint actions require a matching commissioning record.
   # Never copy the display URDF limits as verified control limits. See README.
   joint_limits: null
 plugins:

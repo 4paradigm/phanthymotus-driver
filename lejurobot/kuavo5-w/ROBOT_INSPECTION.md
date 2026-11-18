@@ -558,3 +558,36 @@ host helper 的首次安装仍需现场管理员执行一次，详见 README。
 - 283项离线测试、Python编译、service checker与diff检查通过。未拿第二台机器人复验，未完整断电冷启动；
   本轮不能替代这两项验收。arm/leg.move_joints仍缺现场核验限位，mic仍无确认的真实采集通路，
   controlled_spatial建图/打点/导航尚未实现；不会以安装器ready宣称上述功能已可用。
+
+### 共享连接默认值及执行卡接口调整（2026-11-18）
+
+本节取代前文“镜像未内置默认密码”、speaker独立interrupt及head速度/时长接口的旧说明。
+
+- 按操作人员明确要求，将现场确认的三机地址、账号、默认密码集中于connection_defaults.py并复制入镜像。
+  非默认机器仍在loco唯一的共享configSchema覆盖，整机所有卡共用；用户私有覆盖另存0600文件，
+  不在状态/schema/日志中回显。显式密钥不会被内置默认密码抢占，可按角色禁用默认凭据。
+  不声称当前现场默认值是所有厂家批次的通用公开凭据。容器以空私有凭据字典分别登录三台主机成功。
+- SSH用于统一分发/修复、监管初始化及导出实际控制器消息，日常执行动作经ROS/rosbridge；
+  不是每张执行卡各自登录。当前自动准备方案仍需控制下位机的SSH管理通路。
+- speaker新增get_volume/set_volume（整数0–100），只修改本PCM流增益，保留PulseAudio立方曲线；
+  request_id确认后成功，不刷新音频租约、不重建播放会话或修改厂商提示音音量。
+  音量使用独立短连接，不占用PCM生命周期锁；新增阻塞音量连接时PCM仍传输的离线回归。
+  按要求移除独立interrupt和interrupt hook，EOF忽略、后续PCM可继续，stop和断流租约保护保持。
+- head参照天工改为move_pos(yaw,pitch)绝对度、zero及stop_move，不再输入速度/时长。
+  固定官方源码及WebSocket SDK均实现/robot_head_motion_data绝对接口；真机只读确认订阅者/nodelet_manager。
+  ACP要求命令后不同sensor_time真实测量误差≤1°、跨0.2秒；反馈失效或20秒未收敛报错并尝试暂停。
+  本轮只测试越界yaw=100拒绝，没有发送有效头部目标，不能据此声称物理角度已验收。
+- arm参照Q5增加left/right_joint_1..7命名rad动作、set及zero；leg增加四个命名度字段的set/zero；
+  waist增加pitch/yaw单轴rad及仅腰部zero。省略关节在实际发令前重新取测量，waist/leg共享下肢通道。
+  兼容旧move_joints度数组、末端/躯干set_pose；新增关节角动作不绕过现场限位与模型绑定。
+  当前仍无核验限位记录，真机arm命名角动作被拒绝；未用显示骨架限位代替硬件核验。
+- 最新候选静音链路验收：37音量设/读、播放中静音0、EOF后继续PCM、边播放边设音量均通过，
+  同一会话累计写入51200字节，与发送量一致，无音频积压错误；最终恢复30、speaker.stop确认idle。
+  前一次固定等待0.7秒读取status缓存的字节断言未通过，改用最多3秒轮询状态，并加入退出清理；
+  最终候选复验及并发调音量均通过。本轮使用静音PCM，不把写入字节数当作新增声学验收。
+- 仓库Dockerfile构建候选local-bootstrap-261118，镜像dda57873df76，743113123字节；
+  对release.261117.2e96669的736907954字节增量6205169字节。
+  本轮没有新增运行依赖，仅新增默认连接模块及接口源码；该增量含此前自动准备依赖，非生产ros-base全量基线差。
+- 301项离线测试通过。容器重建前后控制器MainPID仍361395，boot complete、BaseArm3、
+  control_enabled=false保持。未重启控制器、未发送有效运动目标；第二台同款、完整冷启动、
+  真实头部/手臂/腰腿目标与物理停止仍待现场验收，mic和controlled_spatial没有新增可用能力。

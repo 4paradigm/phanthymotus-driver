@@ -5,11 +5,13 @@ Each start allocates a new lease. Old sessions/sequence numbers never replay.
 Only this service's paplay child is stopped; other robot prompts are untouched.
 """
 import argparse
+from array import array
 import base64
 import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -32,6 +34,7 @@ class PcmSink:
         self.last_seen = 0.
         self.error = None
         self.bytes_written = 0
+        self.volume_request_id = None
 
     def _stop(self):
         self.session = None
@@ -76,7 +79,37 @@ class PcmSink:
             return {'session': self.session, 'state': 'error' if self.error else
                     ('ready' if self.session else 'idle'), 'error': self.error,
                     'buffer_bytes': self.queued_bytes, 'bytes_written': self.bytes_written,
-                    'volume_percent': self.volume, 'sink': SINK}
+                    'volume_percent': self.volume, 'volume_request_id': self.volume_request_id,
+                    'volume_scope': 'this_pcm_stream', 'sink': SINK}
+
+    def receive_volume(self, raw):
+        if not isinstance(raw, str) or len(raw) > 200:
+            return
+        try:
+            request = json.loads(raw)
+            value, request_id = request['volume'], request['request_id']
+            if (type(value) is not int or not 0 <= value <= 100 or not isinstance(request_id, str)
+                    or len(request_id) != 32 or any(c not in '0123456789abcdef' for c in request_id)):
+                return
+            with self.lock:
+                self.volume, self.volume_request_id = value, request_id
+        except (ValueError, TypeError, KeyError):
+            return
+
+    def _gain(self, pcm):
+        # Apply only this PCM stream's gain; never alter the system sink or
+        # another vendor prompt. Works before and during an active session.
+        samples = array('h')
+        samples.frombytes(pcm)
+        if sys.byteorder != 'little':
+            samples.byteswap()
+        # Keep the former PulseAudio volume taper: 30% must not suddenly
+        # become a much louder 0.30 linear amplitude after this upgrade.
+        gain = (self.volume / 100) ** 3
+        scaled = array('h', (round(value * gain) for value in samples))
+        if sys.byteorder != 'little':
+            scaled.byteswap()
+        return scaled.tobytes()
 
     def receive(self, raw):
         # Callback only validates/enqueues; subprocess writes run in tick().
@@ -123,12 +156,12 @@ class PcmSink:
                         self.process = subprocess.Popen([
                             'paplay', '--raw', '--format=s16le', '--rate=16000',
                             '--channels=1', '--latency-msec=60', '--device=' + SINK,
-                            '--volume=' + str(round(65536 * self.volume / 100))],
+                            '--volume=65536'],
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, bufsize=0)
                         os.set_blocking(self.process.stdin.fileno(), False)
                     if not self.pending:
-                        self.pending = self.queue.popleft()
+                        self.pending = self._gain(self.queue.popleft())
                     try:
                         count = os.write(self.process.stdin.fileno(), self.pending)
                     except BlockingIOError:
@@ -163,6 +196,7 @@ def main():
                 lambda request, fn=operation: call(fn)) for name, operation in
                 (('start', sink.start), ('stop', sink.stop), ('status', sink.status))]
     sub = rospy.Subscriber(ROOT + '/pcm', String, lambda msg: sink.receive(msg.data), queue_size=10)
+    volume_sub = rospy.Subscriber(ROOT + '/volume', String, lambda msg: sink.receive_volume(msg.data), queue_size=1)
     rospy.on_shutdown(sink.stop)
     # Wall time watchdog remains live when ROS simulated time stops.
     while not rospy.is_shutdown():

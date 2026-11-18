@@ -1,6 +1,6 @@
-"""Image-owned, idempotent remote provisioning. No factory credentials in image.
+"""Image-owned provisioning with replaceable commissioned connection defaults.
 
-Passwords come from environment or a mode-0600 operator secret file, never argv.
+Private overrides come from environment or a mode-0600 file, never argv.
 OpenSSH pins first-use host keys in the driver's persistent configuration directory.
 """
 import base64
@@ -14,28 +14,28 @@ import threading
 import tempfile
 import time
 import yaml
+from connection_defaults import DEFAULTS, DEFAULT_PASSWORDS
 
 ROOT = Path(__file__).resolve().parent
 FILES = ('config.yaml', 'host/install.py', 'host/install_controller.py',
          'host/controller_boot.py', 'host/install_speaker.py', 'host/speaker_relay.py',
          'host/rosbridge_loopback.py', 'host/rosbridge.launch', 'host/runtime_manager.py',
          'host/battery_relay.py', 'host/head_camera.launch', 'host/head_jpeg.py', 'host/head_depth.py')
-DEFAULTS = {
-    'host': {'address': '127.0.0.1', 'user': 'leju_kuavo', 'ros_ip': '192.168.26.12'},
-    'controller': {'address': '192.168.26.1', 'user': 'lab', 'ros_ip': '192.168.26.1'},
-    'chassis': {'address': '192.168.26.22', 'user': 'jt', 'ros_ip': '192.168.26.22'},
-}
 
 
 def config_schema():
     properties = {}
+    labels = {'host': '上位机', 'controller': '控制下位机', 'chassis': '独立底盘'}
+    fields = {'address': 'SSH地址', 'user': 'SSH账号', 'password': 'SSH密码', 'sudo_password': 'sudo密码（与SSH不同才填）'}
     for role, defaults in DEFAULTS.items():
         for field in ('address', 'user', 'password', 'sudo_password'):
             key = 'provision_' + role + '_' + field
-            properties[key] = {'type': 'string', 'description': role + ' SSH ' + field,
+            properties[key] = {'type': 'string', 'description': '整机共用 · ' + labels[role] + fields[field],
                                'scope': 'shared'}
             if field in ('password', 'sudo_password'):
                 properties[key].update(format='password', **{'x-sensitive': True})
+                if field == 'password':
+                    properties[key]['description'] += '（留空使用内置默认值）'
             else:
                 properties[key]['default'] = defaults[field]
     return {'type': 'object', 'properties': properties}
@@ -76,9 +76,11 @@ class SshTransport:
         if not isinstance(role_secret, dict):
             raise ProvisionError('invalid_role_secret')
         prefix = 'KUAVO_' + role.upper()
-        password = os.environ.get(prefix + '_SSH_PASSWORD') or role_secret.get('password')
-        sudo_password = os.environ.get(prefix + '_SUDO_PASSWORD') or role_secret.get('sudo_password', password)
         key = os.environ.get(prefix + '_SSH_KEY') or role_secret.get('key_file')
+        password = os.environ.get(prefix + '_SSH_PASSWORD') or role_secret.get('password')
+        if password is None and not key and target.get('use_default_credentials', True):
+            password = DEFAULT_PASSWORDS[role]
+        sudo_password = os.environ.get(prefix + '_SUDO_PASSWORD') or role_secret.get('sudo_password', password)
         if any(value is not None and (not isinstance(value, str) or '\x00' in value or '\n' in value)
                for value in (password, sudo_password, key)):
             raise ProvisionError('invalid_ssh_secret')

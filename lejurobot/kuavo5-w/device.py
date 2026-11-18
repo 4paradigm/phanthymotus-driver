@@ -504,10 +504,27 @@ class _KuavoPlugin:
             print(f"[{self.PREFIX}] {_safe_log(action)}: {type(exc).__name__}: {_safe_log(str(exc))}", flush=True)
             return {"state": "error", "error": _safe_log(str(exc))}
 
-    def _async_reach(self, key, publish, allowed_modes=None, joint_target=None):
+    def _joint_set(self, updates, card=None):
+        """Named absolute angles; preserve unspecified joints at send time."""
+        card = card or self.PREFIX
+        offset, size, topic = (4, 14, '/kuavo_arm_traj') if card == 'arm' else (0, 4, '/lb_leg_traj')
+        target = [0.] * size
+        def validate():
+            candidate, measured = self.bundle.sensors.resolve_joint_target(card, updates)
+            target[:] = candidate
+            return measured
+        return self._async_reach('arm_reach_time' if card == 'arm' else 'leg_reach_time',
+            lambda: self.ros1.publish(topic, 'sensor_msgs/JointState', {
+                'header': {'seq': 0, 'stamp': {'secs': 0, 'nsecs': 0}, 'frame_id': ''},
+                'name': [f'joint{i}' for i in range(1, size + 1)],
+                'position': [math.degrees(v) for v in target], 'velocity': [], 'effort': []}),
+            joint_target=(offset, target), joint_card=card, preflight=validate)
+
+    def _async_reach(self, key, publish, allowed_modes=None, joint_target=None, joint_card=None, preflight=None):
         modes = allowed_modes or self.ALLOWED_MODES
-        validate = (None if joint_target is None else
-            lambda: self.bundle.sensors.validate_joint_target(self.PREFIX, joint_target[1]))
+        joint_card = joint_card or self.PREFIX
+        validate = preflight or (None if joint_target is None else
+            lambda: self.bundle.sensors.validate_joint_target(joint_card, joint_target[1]))
         aid, cancelled, generation, issued, preparation = self.bundle.start_motion(
             self.CHANNEL, self.PREFIX, modes, publish, validate,
             request_epoch=self._request_context.stop_epoch)
@@ -524,7 +541,7 @@ class _KuavoPlugin:
                         self.state.require_motion(modes)
                         if self.ros1.connection[1] != generation:
                             raise ConnectionError("connection changed during motion")
-                        measured = (self.bundle.sensors.validate_joint_target(self.PREFIX, joint_target[1])
+                        measured = (self.bundle.sensors.validate_joint_target(joint_card, joint_target[1])
                                     if joint_target is not None else None)
                         if duration is None:
                             value, seen = self.state.read(key)
@@ -650,21 +667,39 @@ class LocoPlugin(_KuavoPlugin):
 
 class ArmPlugin(_KuavoPlugin):
     PREFIX, CHANNEL, ALLOWED_MODES = "arm", "arms", (1, 3)
+    JOINTS = {f'{side}_joint_{i}': (offset + i - 1, f'{side}_joint_{i}_rad',
+              f'{label}臂关节{i}（zarm_{letter}{i}_joint）')
+              for side, offset, label, letter in [('left', 0, '左', 'l'), ('right', 7, '右', 'r')]
+              for i in range(1, 8)}
 
     def tool(self):
-        return self.schema("Kuavo 5-W 双臂关节/末端目标；关节单位度，位置米、四元数 xyzw。不自动开启 quick mode。", {
+        fields = {field: {'type': 'number', 'description': label + '绝对角度 rad；set省略时保持实测角度'}
+                  for _, field, label in self.JOINTS.values()}
+        named = {name: ([field], label + '绝对角度 rad') for name, (_, field, label) in self.JOINTS.items()}
+        return self.schema("Kuavo 5-W 双臂绝对关节控制：按关节名输入rad或set同时设置多关节；未指定关节保持实测位置。需现场核验限位。", {
+            **fields,
             "positions": _array_schema(14, "左臂7 + 右臂7关节，度"),
             "frame": {"type": "string", "enum": ["world", "local"], "description": "末端命令坐标系，必填"},
             "left_position": _array_schema(3, "左手 xyz 米"),
             "right_position": _array_schema(3, "右手 xyz 米"),
             "left_quaternion": _array_schema(4, "左手单位四元数 xyzw"),
             "right_quaternion": _array_schema(4, "右手单位四元数 xyzw"),
-        }, {"move_joints": (["positions"], "设置双臂14关节角度，需配置现场核验的关节限位"),
+        }, {**named, 'set': (list(fields), '按名称同时设置部分/全部关节，rad；至少填写一个'),
+            'zero': ([], '双臂14关节绝对角度归零，需核验限位'),
+            "move_joints": (["positions"], "兼容整组14关节角度，度；需现场核验限位"),
             "set_pose": (["frame", "left_position", "left_quaternion", "right_position", "right_quaternion"], "同时设置双手完整末端位姿"),
-            "stop_move": ([], "请求全身软件暂停")}, ["arm_l", "arm_r"], ("move_joints", "set_pose"),
-            required={"move_joints": ["positions"], "set_pose": ["frame", "left_position", "left_quaternion", "right_position", "right_quaternion"]})
+            "stop_move": ([], "请求全身软件暂停")}, ["arm_l", "arm_r"], (*named, 'set', 'zero', "move_joints", "set_pose"),
+            required={**{name: [field] for name, (_, field, _) in self.JOINTS.items()},
+                      "move_joints": ["positions"], "set_pose": ["frame", "left_position", "left_quaternion", "right_position", "right_quaternion"]})
 
     def _dispatch(self, action, args):
+        if action in self.JOINTS or action in ('set', 'zero'):
+            selected = self.JOINTS if action in ('set', 'zero') else {action: self.JOINTS[action]}
+            updates = {i: 0. if action == 'zero' else _number(args[field], field)
+                       for i, field, _ in selected.values() if action == 'zero' or field in args}
+            if not updates:
+                raise ValueError('at least one named absolute joint angle is required')
+            return self._joint_set(updates)
         if action == "move_joints":
             positions = _vector(args.get("positions"), 14, "positions")
             return self._async_reach("arm_reach_time", lambda: self.ros1.publish(
@@ -696,6 +731,8 @@ class ArmPlugin(_KuavoPlugin):
 
 class LowerBodyPlugin(_KuavoPlugin):
     CHANNEL = "lower_body"
+    FIELDS = {'knee_deg': (0, '膝关节knee_joint'), 'leg_deg': (1, '腿关节leg_joint'),
+              'waist_pitch_deg': (2, '腰俯仰waist_pitch_joint'), 'waist_yaw_deg': (3, '腰偏航waist_yaw_joint')}
 
     def __init__(self, bundle, card="leg"):
         super().__init__(bundle)
@@ -704,20 +741,43 @@ class LowerBodyPlugin(_KuavoPlugin):
     def tool(self):
         if self.PREFIX == "leg":
             return self.schema("Kuavo 5-W 下肢4关节目标，度；与 waist 共享控制通道。", {
+                **{field: {'type': 'number', 'description': label + '绝对角度，度；set省略时保持实测值'}
+                   for field, (_, label) in self.FIELDS.items()},
                 "positions": _array_schema(4, "四个下肢关节目标角度，度")}, {
+                'set': (list(self.FIELDS), '按名称设置部分/全部下肢关节绝对角度，度；至少填写一个'),
+                'zero': ([], '四个下肢关节归零，包含腰部；需现场核验限位'),
                 "move_joints": (["positions"], "设置四个下肢关节角度，需配置现场核验的关节限位"),
-                "stop_move": ([], "请求全身软件暂停")}, "lower_body", ("move_joints",),
+                "stop_move": ([], "请求全身软件暂停")}, "lower_body", ('set', 'zero', "move_joints"),
                 required={"move_joints": ["positions"]})
-        return self.schema("Kuavo 5-W 躯干相对底盘位姿；仅支持 x/z/pitch/yaw，四个值均必填。", {
+        return self.schema("Kuavo 5-W 腰部绝对关节角度rad，与leg共享通道；另保留躯干相对底盘位姿接口。", {
+            'waist_pitch_rad': {'type': 'number', 'description': '腰俯仰关节绝对角度rad'},
+            'waist_yaw_rad': {'type': 'number', 'description': '腰偏航关节绝对角度rad'},
             "x": {"type": "number", "description": "相对底盘 X 米"},
             "z": {"type": "number", "description": "相对底盘 Z 米"},
             "pitch": {"type": "number", "description": "俯仰弧度"},
             "yaw": {"type": "number", "description": "偏航弧度"}}, {
+            'waist_pitch': (['waist_pitch_rad'], '设置腰俯仰绝对关节角度rad，需下肢核验限位'),
+            'waist_yaw': (['waist_yaw_rad'], '设置腰偏航绝对关节角度rad，需下肢核验限位'),
+            'zero': ([], '仅腰俯仰/偏航归零，保留腿部当前角度'),
             "set_pose": (["x", "z", "pitch", "yaw"], "设置躯干完整有效位姿"),
-            "stop_move": ([], "请求全身软件暂停")}, "lower_body", ("set_pose",),
-            required={"set_pose": ["x", "z", "pitch", "yaw"]})
+            "stop_move": ([], "请求全身软件暂停")}, "lower_body", ('waist_pitch', 'waist_yaw', 'zero', "set_pose"),
+            required={'waist_pitch': ['waist_pitch_rad'], 'waist_yaw': ['waist_yaw_rad'],
+                      "set_pose": ["x", "z", "pitch", "yaw"]})
 
     def _dispatch(self, action, args):
+        if self.PREFIX == 'leg' and action in ('set', 'zero'):
+            updates = {i: 0. if action == 'zero' else math.radians(_number(args[field], field))
+                       for field, (i, _) in self.FIELDS.items() if action == 'zero' or field in args}
+            if not updates:
+                raise ValueError('set requires at least one named joint angle')
+            return self._joint_set(updates, 'leg')
+        if self.PREFIX == 'waist' and action in ('waist_pitch', 'waist_yaw', 'zero'):
+            if action == 'zero':
+                updates = {2: 0., 3: 0.}
+            else:
+                field = action + '_rad'
+                updates = {2 if action == 'waist_pitch' else 3: _number(args.get(field), field)}
+            return self._joint_set(updates, 'leg')
         if self.PREFIX == "leg" and action == "move_joints":
             positions = _vector(args.get("positions"), 4, "positions")
             return self._async_reach("leg_reach_time", lambda: self.ros1.publish(
@@ -737,22 +797,64 @@ class HeadPlugin(_KuavoPlugin):
     PREFIX, CHANNEL = "head", "head"
 
     def tool(self):
-        return self.schema("Kuavo 5-W 头部有界速度运动；yaw/pitch 使用度/秒，到时归零。不提供缺乏完成反馈的一次性角度目标。", {
-            "yaw": {"type": "number", "minimum": -30, "maximum": 30, "description": "yaw 度/秒，驱动保守上限"},
-            "pitch": {"type": "number", "minimum": -20, "maximum": 20, "description": "pitch 度/秒，驱动保守上限"},
-            "duration": {"type": "number", "minimum": 0.1, "maximum": 10}}, {
-            "move": (["yaw", "pitch", "duration"], "有界头部角速度控制，到时归零并等待 0.3s 超时窗口"),
-            "stop_move": ([], "请求全身软件暂停")}, "head", ("move",), required={"move": ["duration"]})
+        return self.schema("Kuavo 5-W 头部绝对角度，单位度；yaw/pitch两自由度，使用实测到位确认ACP。", {
+            'yaw': {'type': 'number', 'minimum': -80, 'maximum': 80, 'description': '偏航绝对角度，度'},
+            'pitch': {'type': 'number', 'minimum': -25, 'maximum': 25, 'description': '俯仰绝对角度，度'},
+        }, {'move_pos': (['yaw', 'pitch'], '设置头部两个绝对角度，单位度'),
+            'zero': ([], '头部yaw/pitch绝对角度归零'),
+            'stop_move': ([], '请求全身软件暂停')}, 'head', ('move_pos', 'zero'),
+            required={'move_pos': ['yaw', 'pitch']})
 
     def _dispatch(self, action, args):
-        if action != "move":
-            raise ValueError(f"unknown action: {action}")
-        yaw = _number(args.get("yaw", 0), "yaw", -30, 30)
-        pitch = _number(args.get("pitch", 0), "pitch", -20, 20)
-        duration = _number(args.get("duration"), "duration", 0.1, 10)
-        return self._timed_velocity(duration,
-            lambda: self.ros1.publish("/cmd_head_vel", "kuavo_msgs/robotHeadMotionData", {"joint_data": [yaw, pitch]}),
-            self.bundle.zero_head, 0.3)
+        if action not in ('move_pos', 'zero'):
+            raise ValueError(f'unknown action: {action}; use move_pos with absolute yaw/pitch in degrees')
+        target_deg = [0., 0.] if action == 'zero' else [
+            _number(args.get('yaw'), 'yaw', -80, 80), _number(args.get('pitch'), 'pitch', -25, 25)]
+        target = [math.radians(v) for v in target_deg]
+        def publish():
+            # Cancel residual velocity integration before the SDK's absolute
+            # head command. Both topics are implemented by ControlDataManager.
+            self.bundle.zero_head()
+            self.ros1.publish('/robot_head_motion_data', 'kuavo_msgs/robotHeadMotionData',
+                              {'joint_data': target_deg})
+        aid, cancelled, generation, issued, preparation = self.bundle.start_motion(
+            self.CHANNEL, self.PREFIX, self.ALLOWED_MODES, publish,
+            self.bundle.sensors.joint_positions, request_epoch=self._request_context.stop_epoch)
+
+        def worker():
+            converged_since_ns = last_capture_ns = None
+            deadline = issued + 20.
+            while not cancelled.wait(.02):
+                try:
+                    with self.tracker.lock:
+                        if not self.tracker.current(self.CHANNEL, aid):
+                            return
+                        self.state.require_motion(self.ALLOWED_MODES)
+                        if self.ros1.connection[1] != generation:
+                            raise ConnectionError('connection changed during head motion')
+                        q, measured_at, capture_ns = self.bundle.sensors.joint_positions()
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError('head absolute target did not converge within 20s')
+                        if measured_at < issued or (last_capture_ns is not None and capture_ns <= last_capture_ns):
+                            continue
+                        last_capture_ns = capture_ns
+                        close = all(abs(a - b) <= math.radians(1.) for a, b in zip(q[18:20], target))
+                        if not close:
+                            converged_since_ns = None
+                        elif converged_since_ns is None:
+                            converged_since_ns = capture_ns
+                        elif capture_ns - converged_since_ns >= 200_000_000:
+                            self.tracker.finish(self.CHANNEL, aid, self.PREFIX, 'completed', {
+                                'completion_basis': 'measured_head_convergence', 'measured_convergence': True,
+                                'yaw': target_deg[0], 'pitch': target_deg[1], 'units': 'deg'})
+                            return
+                except Exception as exc:
+                    self.bundle.pause(_safe_log(str(exc)), status='error', expected=(self.CHANNEL, aid))
+                    return
+        threading.Thread(target=worker, daemon=True, name='acp-head-position').start()
+        return {'state': 'executing', 'action_id': aid, 'control_preparation': preparation,
+                'completion_basis': 'measured_head_convergence', 'yaw': target_deg[0],
+                'pitch': target_deg[1], 'units': 'deg'}
 
 
 class KuavoBundle:
@@ -769,6 +871,7 @@ class KuavoBundle:
             ("/kuavo_arm_traj", "sensor_msgs/JointState"),
             ("/lb_leg_traj", "sensor_msgs/JointState"),
             ("/cmd_head_vel", "kuavo_msgs/robotHeadMotionData"),
+            ("/robot_head_motion_data", "kuavo_msgs/robotHeadMotionData"),
             ("/mm/two_arm_hand_pose_cmd", "kuavo_msgs/twoArmHandPoseCmd"),
         ):
             ros1.advertise(topic, message_type)

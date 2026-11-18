@@ -63,7 +63,7 @@ driver 薄适配层 + ROS2 Humble
 | 观测 | 轮臂是 `/mobile_manipulator_mpc_observation`，不是双足的 `/humanoid_mpc_observation`；本驱动直接使用 raw 实测，避免默认零状态 |
 | 末端指令 | 轮臂使用 `/mm/two_arm_hand_pose_cmd`，不使用双足路径 |
 | 下肢单位 | `/lb_leg_traj` topic 使用度；SDK `/lb_leg_control_srv` 服务使用弧度；不可混用 |
-| 头部 | 通用 SDK 有位置接口；本驱动继续使用 5-W 手册明确规定的 `/cmd_head_vel`，单位度/秒 |
+| 头部 | 通用 SDK 有位置接口；本驱动move_pos改用SDK `/robot_head_motion_data`绝对角度接口（度），并以真实反馈确认ACP；`/cmd_head_vel`仅用于清除残余速度 |
 | quick mode | 手册部分版本为 SetBool；固定源码示例已为 `changeLbQuickModeSrv` + `quickMode` 枚举；本驱动不调用，不猜测类型 |
 | 新增服务 | 源码还含定时轨迹、末端误差查询等新接口；未确认真机版本前不替换手册中的稳定控制接口 |
 
@@ -195,3 +195,12 @@ DDS42/loopback 的跨容器接收，以及软件暂停和断网时控制器行�
 - 头部RGB/深度卡start缺帧时通过固定loopback路径请求对应systemd服务；仅启用中的卡缺帧会重试。
   全局检查只确保桥接和电池服务，stop只停止卡输出，避免关闭共用RGBD源进程。
 - 当前laser_scan是二维测距的z=0投影。MID360配置与SDK不能证明硬件在线；专用网口carrier=0、无Livox发布者，不能提供真实三维雷达流。
+
+### 2026-11-18 绝对头部接口补查
+
+同一固定提交的 `humanoid_controllers/src/ControlDataManager.cpp` 保留 `/robot_head_motion_data` 的
+`headExternalControlCallback`，读取yaw/pitch度值、按HEAD_JOINT_LIMITS限制并转换为rad写入目标状态；
+`headVelCallback/headDeltaCallback`是额外的速度/增量入口，不是唯一可用接口。WebSocket SDK的
+`ControlRobotHeadWebsocket.pub_control_robot_head`同样使用该绝对话题。驱动现在直接发送绝对度值，
+不把实测位置差当成sticky目标增量，也不以估计转动时间冒充到位。本轮只读确认真机该话题有
+`/nodelet_manager`订阅者，越界参数在发令前拒绝；尚未发送有效绝对角度目标做物理运动验收。

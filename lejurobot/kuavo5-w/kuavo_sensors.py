@@ -302,6 +302,16 @@ class KuavoSensors:
             raise ValueError('joint limits require finite lower_deg < upper_deg')
         return [(math.radians(a), math.radians(b)) for a, b in zip(low, high)]
 
+    def resolve_joint_target(self, card, updates):
+        with self._lock:
+            offset, size = (4, 14) if card == 'arm' else (0, 4)
+            q, _, _ = self.joint_positions()
+            target = q[offset:offset + size]
+            for index, value in updates.items():
+                target[index] = value
+            measured = self.validate_joint_target(card, target)
+            return target, measured
+
     def validate_joint_target(self, card, target):
         with self._lock:
             # Read measurement and model/limit binding under one coherent lock.

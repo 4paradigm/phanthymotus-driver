@@ -41,8 +41,14 @@ Dashboard/PR镜像部署片段把宿主机 `/opt/phanthy-motus/drivers/lejurobot
 已有操作配置、关节限位、禁用设置和凭据不被镜像默认值覆盖；不再要求部署前手工创建配置文件。
 `CONFIG_PATH` 显式指向其他路径但文件缺失，或已有YAML损坏时仍报错，不悄悄回退。
 
-同款机器人首次部署仅需具备可达的SSH管理权限。可在 `loco` 卡的共享配置中填写三台主机的地址、账号、
-SSH密码及不同的sudo密码；Core发送系统 `config` 动作后自动保存并开始准备。所有密码字段均声明
+整机连接配置入口：驱动卡片列表中 `loco` 的全局变量/共享配置（侧栏配置齿轮），与天工ext_mic的共享配置形式相同。
+这是整个KuavoBundle共用的一份连接配置，不是每张执行卡各配一次；speaker/head/arm/leg/waist等不自行SSH登录。
+日常动作仍走ROS1/rosbridge，SSH仅供统一后台准备/修复三台主机。也不需要先往画布放一张loco卡才能使用默认配置。
+
+按操作人员要求，`connection_defaults.py` 已内置当前5-W/Jaten三机拓扑的地址、账号和默认密码；
+保持这些默认配置的同款机器无需首次手工填密码。它们是当前现场确认的连接默认值，不作为所有批次、所有官方文档版本的通用凭据声明。
+非默认安装、改过密码或网络的机器，只在上述一处填写覆盖值；环境变量优先于0600私有文件，再回退内置值。
+Core发送系统 `config` 动作后自动保存并开始准备。所有用户密码字段均声明
 `format: password` / `x-sensitive: true`，不会随Solution公开打包；驱动不在响应、日志或schema中回显密码。
 也可通过 `KUAVO_HOST/CONTROLLER/CHASSIS_SSH_PASSWORD`、相应 `SUDO_PASSWORD` 环境变量，
 或宿主机配置目录内0600权限的 `ssh-secrets.json` 提供连接信息：
@@ -56,7 +62,8 @@ SSH密码及不同的sudo密码；Core发送系统 `config` 动作后自动保�
 ```
 
 支持在各角色私有配置中设置 `key_file`（容器内私钥路径），或使用相应 `KUAVO_<ROLE>_SSH_KEY`。
-未提供密码时采用非交互公钥认证；不猜测/提交出厂密码，不把这台机器的账号凭据烧进镜像。
+显式配置私钥时优先使用非交互公钥认证，不因内置密码阻止私钥使用。
+每台主机可设 `use_default_credentials: false` 禁用其内置密码回退，改用公钥/显式凭据；只尝试选定的一套凭据，不轮询猜密码。
 空环境默认值不遮蔽私有文件，空格密码不被trim。OpenSSH使用accept-new首次信任并持久化known_hosts；
 主机密钥变化报错，不用StrictHostKeyChecking=no绕过。无法登录时MCP仍可提供配置及分主机错误，
 不会因此伪造传感数据或放开运动。
@@ -221,11 +228,11 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 | 卡片 | 动作 | 官方 ROS1 接口 |
 | --- | --- | --- |
 | `loco` | `move`、`move_relative`、`move_to`、`stop_move` | `/cmd_vel`、`/cmd_pose`、`/cmd_pose_world` |
-| `arm` | `move_joints`、`set_pose`、`stop_move` | `/kuavo_arm_traj`、`/mm/two_arm_hand_pose_cmd` |
-| `leg` | `move_joints`、`stop_move` | `/lb_leg_traj` |
-| `waist` | `set_pose`、`stop_move` | `/cmd_lb_torso_pose` |
-| `head` | `move`、`stop_move` | `/cmd_head_vel` |
-| `speaker` | 系统 `start`、`stop`、`info`；`interrupt` | ROS2 `AudioChunk` → 独立rosbridge → 自有底盘PCM播放服务 |
+| `arm` | 命名单关节、`set`、`zero`、`move_joints`、`set_pose`、`stop_move` | `/kuavo_arm_traj`、`/mm/two_arm_hand_pose_cmd` |
+| `leg` | `set`、`zero`、`move_joints`、`stop_move` | `/lb_leg_traj` |
+| `waist` | `waist_pitch`、`waist_yaw`、`zero`、`set_pose`、`stop_move` | `/lb_leg_traj`、`/cmd_lb_torso_pose` |
+| `head` | `move_pos`、`zero`、`stop_move` | `/robot_head_motion_data`；停止残余速度用`/cmd_head_vel` |
+| `speaker` | `start`、`stop`、`info`、`set_volume`、`get_volume` | ROS2 `AudioChunk` → 独立rosbridge → 自有底盘PCM播放服务 |
 | `joints` | 系统 `start`、`stop`、`info` | 两路：`sensor/skeleton` 骨架姿态 + `data/json` 原始 joint_state |
 | `imu` | 系统 `start`、`stop`、`info` | 同一原始消息的 IMU；`data/json` |
 | `loco_state` | 系统 `start`、`stop`、`info` | 两路：map/odom 位置、角度、速度 JSON + 独立 `state/odom` / `motus.odom/1` |
@@ -255,7 +262,7 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 sudo python3 host/install_speaker.py --user jt --master http://192.168.26.1:11311 --ros-ip 192.168.26.22 --volume 30
 ```
 
-仅使用该机已有ROS Noetic、`paplay/pactl`和PulseAudio；不安装SDK、声卡库或TTS引擎，不在播放器中保存SSH凭据；自动部署凭据仅保存在上文私有配置中。
+仅使用该机已有ROS Noetic、`paplay/pactl`和PulseAudio；不安装SDK、声卡库或TTS引擎，不在播放器中保存SSH凭据；默认连接值集中于驱动，用户覆盖密码另存私有配置。
 安装 `kuavo5w-speaker.service` 并启用音频用户linger，允许用户音频服务开机运行；
 自动启用该用户的 `pulseaudio.socket`，无需先登录桌面。轻量ROS服务随系统启动，但无音频数据时不启动播放器。
 服务只访问音频，无控制器/电机操作；`speaker` 不依赖 `motion_enabled` 或恢复电机。
@@ -270,37 +277,44 @@ sudo python3 host/install_speaker.py --user jt --master http://192.168.26.1:1131
 按实时速率转发，底盘队列上限1秒、非阻塞写入播放器。过载/进程异常停止，不无限堆积。
 会话token和递增序号拒绝旧会话/重复包；独立1.5秒墙钟租约在输入链路丢失后停止本服务的播放器，
 重连不会重放旧流。`stop` 销毁订阅、清空缓存并确认底盘停止；无法确认则明确报错。
-`interrupt` 立即清空并终止当前播放，重新分配会话，丢弃旧句后续数据直到EOF；新 `start` 也可重新建立流。
-同时声明 `on_interrupt_speak/on_interrupt_all` hook及 `mouth` 资源。
+不提供独立interrupt动作或interrupt hook；打断由前方TTS/PCM生成器处理，speaker只消费上游送达的流。
+EOF只作结束标记跳过，后续PCM继续播放；如需清空已排队PCM，显式stop后重新start。保留mouth资源。
 与其他驱动的流式speaker一致，这张卡以start/stop维持数据平面，不给每个PCM块伪造ACP动作；
 运动卡原有ACP不变。本卡不提供逐句声学播放完成ACP。
 
-音量为安装参数 `--volume`（默认30%，仅本播放流），`info.output_status.volume_percent`显示底盘实际配置；
+`set_volume(volume=0..100)` 设置本PCM播放流的数字增益；0静音、100原始幅度。
+百分比使用原PulseAudio的立方增益曲线，避免同为30%时升级后突然变响。
+底盘确认request_id后才返回成功，`get_volume`实时读取底盘值，可在未start时使用，也可播放中更改。
+音量变化不重启播放进程/会话；`--volume`只设服务启动默认值30%。`info.output_status.volume_percent`显示底盘值；
 不修改系统主音量、不停止厂商导航提示音。`output_status.bytes_written`是写入播放器的字节数，
 不是麦克风回录证明。2026-11-18现场已通过完整ROS2→rosbridge→底盘链路播放三遍“待命中”，
 124416字节全部写入，操作人员确认听到，stop确认idle；完整断电后音频自启动仍待复验。
-最终静音测试确认interrupt后旧句不再写入、EOF后新流恢复、stop约245ms确认，断连后租约失效。
+此前静音测试的interrupt属于旧接口历史结果；当前版本已移除该动作，stop和断连租约保护保持。
 接口快照、可行性及导航取消/ACP 适配前提见 `ROBOT_INSPECTION.md` 的能力核查记录。
 
 参数单位与约束：
 
 - 底盘速度：本体系 `vx/vy` 为 m/s，`vyaw` 为 rad/s。驱动限制分别为 ±0.3、±0.3、±0.5，`duration` 必填，范围 0.1–10s。
 - 底盘位姿：`x/y` 为米，`yaw` 为弧度，三个值均必填。`move_relative` 相对当前位置，`move_to` 使用机器人启动世界系。
-- 双臂关节：`positions` 必须是左臂7 + 右臂7共14个角度，单位**度**。
+- 双臂参照Q5的命名关节绝对控制：动作`left_joint_1`…`left_joint_7`、`right_joint_1`…`right_joint_7`，参数如`left_joint_1_rad`，单位**rad**。明确对应zarm_l1…l7/r1…r7，不借用另一机型的肩/肘标签猜关节轴。
+  `set`可同时指定任意几个同名`*_rad`字段；`zero`归零双臂。未指定关节在自动恢复后、实际发送前重新取实测角度。
+  兼容`move_joints(positions)`，仍为左7+右7共14个**度**值，避免悄悄改变旧接口单位。
 - 双手末端：`frame` 必填 `world` 或 `local`，分别对应官方 frame=1/2；左右手均需完整 xyz（米）和单位四元数 xyzw。
   不启用文档标为暂不支持的自定义 IK 参数或肘部约束。
-- 下肢：`positions` 必须为4个角度，单位**度**。
+- 下肢参照Q5的`set/zero`：`set`接受`knee_deg`、`leg_deg`、`waist_pitch_deg`、`waist_yaw_deg`中的一个或多个绝对**度**值，省略的保持实测值；`zero`归零全部4关节（含腰部）。兼容`move_joints(positions)`四个度值。
+- 腰部参照Q5的单轴形式：`waist_pitch(waist_pitch_rad)`、`waist_yaw(waist_yaw_rad)`使用绝对**rad**，保留其余下肢实测角度；`zero`仅归零这两个腰关节，与leg共用执行通道和同一份下肢核验限位。
 - 躯干：`x/z` 米、`pitch/yaw` 弧度，四个值均必填。文档不支持的 y/roll 不暴露。
-- 头部：`yaw/pitch` 为**度/秒**，驱动保守限制 ±30/±20，`duration` 必填，0.1–10s。
-  机器人角度限位由官方控制器执行。暂未暴露缺乏到达反馈的头部一次性增量指令。
+- 头部：`move_pos(yaw,pitch)`为绝对**度**，yaw范围[-80,80]、pitch[-25,25]；不要求速度或时长，无roll自由度。`zero`等同两个目标角度0。
+  使用SDK绝对话题，先清零残余速度；需新鲜且模型有效的真实关节反馈。命令后不同sensor_time的实测误差≤1°且跨越0.2s才报告ACP完成，20s未收敛或反馈中断会报错并尝试暂停。
+  旧`head.move`速度/时长动作已删除，避免把旧画布速度值误当绝对角度，旧卡需重新选择move_pos。
 
 上述速度和时长上限属于**驱动策略**，不代表厂家最大能力或完整的工作空间、关节限位及碰撞保护。
 末端和躯干目标仍需由调用方根据机器人实际安全工作空间设置；关节限位检查不等同于碰撞保护。
 
 ### 关节限位配置
 
-随包的 `sensors.joint_limits: null` 表示尚未提供硬件核验记录，因此 `arm.move_joints` 和
-`leg.move_joints` 会在发布前拒绝，其他动作仍遵循各自的运行时检查。不会从显示用参考 URDF 推断可信控制限位，
+随包的 `sensors.joint_limits: null` 表示尚未提供硬件核验记录，因此arm/leg的命名关节动作、`set/zero`、
+`move_joints`及waist的单轴角度/`zero`动作会在发布前拒绝，其他动作仍遵循各自的运行时检查。不会从显示用参考 URDF 推断可信控制限位，
 也不会把越界目标截断后发送。必须由现场负责人核验实际硬件、标定和控制器配置，再填写以下记录：
 
 | `sensors.joint_limits` 字段 | 要求 |
@@ -368,7 +382,7 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 模式写入同样保留最多一个未决响应，`remote_mode_unresolved` 为true时不允许新动作恢复并覆盖旧写入。
 现场版本63的模式服务在修改模式后返回终态result；保留到该结果可避免旧写入在新准备之后才生效。
 模式服务终态并不代替运动前的新鲜模式话题确认。
-所有执行卡声明 `on_interrupt_motion` hook。
+所有运动执行卡声明 `on_interrupt_motion` hook；speaker不声明打断hook。
 
 位姿/关节运动订阅相应的 `/lb_*_reach_time`（`std_msgs/Float32`），只使用指令发送后收到的反馈。
 反馈须在3s内到达，估计值接受0–110s；ACP fallback timeout 为125s。

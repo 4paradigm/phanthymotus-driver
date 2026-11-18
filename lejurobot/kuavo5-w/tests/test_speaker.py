@@ -1,6 +1,7 @@
 import base64
 import importlib.util
 import json
+import struct
 from pathlib import Path
 import sys
 import threading
@@ -28,13 +29,31 @@ def until(predicate):
 
 
 class Bridge:
-    def __init__(self):
+    def __init__(self, backend=None):
+        self.backend = backend or types.SimpleNamespace(volume=30, request_id=None)
         self.connection = (True, 1)
+        self.motion_ready = True
         self.published = []
         self.calls = []
         self.session = None
         self.closed = False
         self.fail_stop = False
+
+    @property
+    def volume(self):
+        return self.backend.volume
+
+    @volume.setter
+    def volume(self, value):
+        self.backend.volume = value
+
+    @property
+    def volume_request_id(self):
+        return self.backend.request_id
+
+    @volume_request_id.setter
+    def volume_request_id(self, value):
+        self.backend.request_id = value
 
     def start(self):
         pass
@@ -46,7 +65,12 @@ class Bridge:
         pass
 
     def publish(self, topic, kind, message):
-        self.published.append(json.loads(message['data']))
+        packet = json.loads(message['data'])
+        if topic.endswith('/volume'):
+            self.volume = packet['volume']
+            self.volume_request_id = packet['request_id']
+        else:
+            self.published.append(packet)
 
     def call_service(self, path, kind, args, timeout):
         action = path.rsplit('/', 1)[1]
@@ -57,7 +81,7 @@ class Bridge:
             if self.fail_stop:
                 raise ConnectionError('test stop failure')
             self.session = None
-        return {'success': True, 'message': json.dumps({'session': self.session})}
+        return {'success': True, 'message': json.dumps({'session': self.session, 'volume_percent': self.volume, 'volume_request_id': self.volume_request_id})}
 
 
 class SpeakerTests(unittest.TestCase):
@@ -71,8 +95,9 @@ class SpeakerTests(unittest.TestCase):
         self.modules.start()
         self.node = Mock()
         self.bridges = []
+        self.backend = types.SimpleNamespace(volume=30, request_id=None)
         def factory():
-            bridge = Bridge()
+            bridge = Bridge(self.backend)
             self.bridges.append(bridge)
             return bridge
         self.player = speaker.Speaker(self.node, factory)
@@ -89,10 +114,11 @@ class SpeakerTests(unittest.TestCase):
     def chunk(self, pcm=b'\0\0' * 160, fmt='audio/pcm-16k', session=None):
         self.player._chunk(types.SimpleNamespace(data=pcm, format=fmt), session or self.player.session)
 
-    def test_schema_matches_stream_contract_and_interrupt_hook(self):
+    def test_schema_matches_stream_contract_without_interrupt(self):
         tool = self.player.tool()
         self.assertEqual(tool['topic_in'], [{'format': 'audio/pcm-16k'}])
-        self.assertEqual(tool['inputSchema']['x-hooks']['on_interrupt_all'], {'action': 'interrupt'})
+        self.assertNotIn('x-hooks', tool['inputSchema'])
+        self.assertNotIn('interrupt', tool['inputSchema']['properties']['action']['enum'])
         self.assertNotIn('x-completion', tool['inputSchema'])
 
     def test_stream_start_stop_and_idempotent_start(self):
@@ -112,27 +138,91 @@ class SpeakerTests(unittest.TestCase):
             self.assertEqual(self.player.dispatch('start', {'input_topic': topic})['state'], 'error')
         self.assertFalse(self.bridges)
 
-    def test_idle_interrupt_is_noop(self):
-        self.assertEqual(self.player.dispatch('interrupt', {}), {'state': 'idle'})
+    def test_interrupt_is_not_supported_or_hooked(self):
+        self.assertEqual(self.player.dispatch('interrupt', {})['state'], 'error')
         self.assertFalse(self.bridges)
 
-    def test_interrupt_discards_old_utterance_until_eof(self):
+    def test_eof_is_ignored_and_restarted_sessions_reject_old_callbacks(self):
         bridge = self.start()
         old_callback = self.node.create_subscription.call_args.args[2]
-        result = self.player.dispatch('interrupt', {})
-        self.assertTrue(result['muted_until_eof'])
-        self.assertTrue(bridge.closed)
-        old_callback(types.SimpleNamespace(data=b'\0\0', format='audio/pcm-16k'))
-        self.chunk()
-        self.assertTrue(self.player.buffer.empty())
+        self.player.dispatch('stop', {})
+        new = self.start()
+        old_callback(types.SimpleNamespace(data=b'00', format='audio/pcm-16k'))
         self.chunk(speaker.EOF)
-        self.assertFalse(self.player.muted)
-        old_callback(types.SimpleNamespace(data=b'\0\0', format='audio/pcm-16k'))
         self.assertTrue(self.player.buffer.empty())
         self.chunk()
-        new = self.bridges[-1]
         self.assertTrue(until(lambda: any(p['pcm'] for p in new.published)))
+        self.assertTrue(bridge.closed)
         self.assertFalse(any(base64.b64decode(p['pcm']) == speaker.EOF for p in new.published))
+
+    def test_volume_get_set_without_starting_playback(self):
+        self.assertEqual(self.player.dispatch('get_volume', {})['volume'], 30)
+        result = self.player.dispatch('set_volume', {'volume': 63})
+        self.assertEqual(result, {'state': 'idle', 'volume': 63, 'volume_scope': 'this_pcm_stream'})
+        self.assertTrue(self.bridges[-1].closed)
+        self.assertIsNone(self.bridges[-1].session)
+
+    def test_active_volume_change_and_invalid_values_preserve_session(self):
+        bridge = self.start()
+        session = bridge.session
+        self.assertEqual(self.player.dispatch('set_volume', {'volume': 0})['volume'], 0)
+        for value in (True, -1, 101, 1.5, '30'):
+            self.assertEqual(self.player.dispatch('set_volume', {'volume': value})['state'], 'error')
+        self.assertEqual(bridge.session, session)
+        self.assertFalse(bridge.closed)
+        self.assertEqual(self.player.dispatch('get_volume', {})['volume'], 0)
+
+    def test_volume_connection_does_not_block_live_pcm(self):
+        bridge = self.start()
+        entered, release = threading.Event(), threading.Event()
+        original = self.player._connect
+        results = []
+        def connect():
+            entered.set()
+            if not release.wait(2.):
+                raise TimeoutError('test volume connection blocked')
+            return original()
+        with patch.object(self.player, '_connect', side_effect=connect):
+            thread = threading.Thread(target=lambda: results.append(
+                self.player.dispatch('set_volume', {'volume': 37})))
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(1.))
+                self.chunk()
+                self.assertTrue(until(lambda: any(p['pcm'] for p in bridge.published)))
+                self.assertFalse(bridge.closed)
+            finally:
+                release.set()
+                thread.join(2.)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results[0]['volume'], 37)
+        self.assertIs(self.player.client, bridge)
+
+    def test_volume_requires_matching_remote_acknowledgement(self):
+        clock = [0.]
+        def now():
+            clock[0] += .5
+            return clock[0]
+        with patch.object(speaker, 'time', types.SimpleNamespace(monotonic=now, sleep=lambda _: None)), \
+             patch.object(self.player, '_call', return_value={'volume_percent': 90, 'volume_request_id': 'wrong'}):
+            result = self.player.dispatch('set_volume', {'volume': 30})
+        self.assertEqual(result['state'], 'error')
+        self.assertIn('acknowledgement', result['error'])
+        self.assertTrue(self.bridges[-1].closed)
+
+    def test_volume_does_not_publish_before_ros_publisher_connections_are_ready(self):
+        bridge = Bridge()
+        bridge.motion_ready = False
+        self.player.factory = lambda: bridge
+        clock = [0.]
+        def now():
+            clock[0] += .5
+            return clock[0]
+        with patch.object(speaker, 'time', types.SimpleNamespace(monotonic=now, sleep=lambda _: None)), \
+             patch.object(bridge, 'publish') as publish:
+            result = self.player.dispatch('set_volume', {'volume': 30})
+        self.assertEqual(result['state'], 'error')
+        publish.assert_not_called()
 
     def test_bad_format_or_length_stops_audio(self):
         for data, fmt in ((b'0', 'audio/pcm-16k'), (b'00', 'mp3'), (b'00' * 16001, 'audio/pcm-16k')):
@@ -234,6 +324,22 @@ class SinkTests(unittest.TestCase):
 
     def packet(self, pcm=b'\0\0', seq=0, session='test'):
         return json.dumps({'session': session, 'seq': seq, 'pcm': base64.b64encode(pcm).decode()})
+
+    def test_volume_control_changes_only_pcm_gain_and_acknowledges_request(self):
+        for volume, expected in ((0, (0, 0)), (50, (250, -250)), (100, (2000, -2000))):
+            request_id = uuid4().hex
+            self.sink.receive_volume(json.dumps({'volume': volume, 'request_id': request_id}))
+            self.assertEqual(self.sink.status()['volume_request_id'], request_id)
+            self.assertEqual(self.sink.status()['volume_percent'], volume)
+            self.assertEqual(struct.unpack('<hh', self.sink._gain(struct.pack('<hh', 2000, -2000))), expected)
+
+    def test_invalid_volume_messages_cannot_mutate_gain(self):
+        for volume in (True, '50', -1, 101, .5, None):
+            self.sink.receive_volume(json.dumps({'volume': volume, 'request_id': uuid4().hex}))
+        for raw in ('[]', '{}', 'invalid', 'x' * 201):
+            self.sink.receive_volume(raw)
+        self.assertEqual(self.sink.volume, 30)
+        self.assertIsNone(self.sink.volume_request_id)
 
     def test_old_session_and_duplicate_packets_do_not_extend_lease(self):
         self.sink.receive(self.packet())
