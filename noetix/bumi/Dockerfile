@@ -50,9 +50,9 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
 #
 # The base image carries /opt/ros/humble but no ROS 2 apt source (only the Ubuntu
 # archive is configured), so `ros-humble-*` is invisible to apt until the ROS
-# repository and its signing key are added. Only rtabmap-odom is installed
-# explicitly: it declares tf2_ros and the message packages itself, so repeating
-# them here would not change the installed set. Measured ARM64 image size: the
+# repository and its signing key are added. The TF tree card also uses the standard
+# robot_state_publisher binary. Both use the distro's tf2 and message packages.
+# Measured ARM64 image size for the original odometry addition: the
 # Bumi image grows from ~2.1 GB (before RTAB-Map) to ~4.8 GB uncompressed
 # (~+2.7 GB), almost all of it the PCL/Qt/VTK transitive dependencies of the
 # official rtabmap-odom package. There is no smaller official package for the
@@ -83,7 +83,7 @@ RUN set -eu; \
       echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] $src $UBUNTU_CODENAME main" \
         > /etc/apt/sources.list.d/ros2.list; \
       if apt-get update && apt-get install -y --no-install-recommends \
-           ros-humble-rtabmap-odom; then \
+           ros-humble-rtabmap-odom ros-humble-robot-state-publisher; then \
         installed=1; break; \
       fi; \
       rm -rf /var/lib/apt/lists/*; \
@@ -148,6 +148,7 @@ COPY imu_distance_control.py /work/imu_distance_control.py
 COPY leg_odometry.py /work/leg_odometry.py
 COPY camera_specs.py /work/camera_specs.py
 COPY visual_inputs.py /work/visual_inputs.py
+COPY vision_tf.py tf_cards.py calibrate_camera_mount.py /work/
 COPY visual_odometry.py /work/visual_odometry.py
 COPY visual_odometry_contract.py /work/visual_odometry_contract.py
 COPY visual_odometry_probe.py /work/visual_odometry_probe.py

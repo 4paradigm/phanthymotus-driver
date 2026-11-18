@@ -13,6 +13,8 @@ build_context_extras:
 # Available cards; config.yaml controls which are enabled by default. Keep this
 # in sync with `plugins.*.enabled`, including the navigation `loco_servo` path.
 cards:
+  - { name: vision_tf,         type: processor }
+  - { name: tf_tree,           type: processor }
   - { name: imu,               type: sensor }
   - { name: battery,           type: sensor }
   - { name: joints,            type: sensor }
