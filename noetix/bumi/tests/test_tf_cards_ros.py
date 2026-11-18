@@ -22,7 +22,7 @@ from rclpy.qos import qos_profile_sensor_data
 
 DRIVER = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(DRIVER))
-from tf_cards import TransformCard
+from tf_cards import TfTreePlugin, VisionTfPlugin
 from vision_tf import CAMERA_ID, OPTICAL
 
 
@@ -54,9 +54,11 @@ def test_real_tf2_hand_to_marker(monkeypatch):
     listener = TransformListener(buffer, node)
     cfg = {"camera_mount":{"parent":"waist_yaw_link","xyz_m":[.04,.02,.20],"rpy_rad":[0,0,0]},
            "hand_frames":[{"parent":"l_elbow_pitch_link","name":"l_hand","xyz_m":[0,0,-.10],"rpy_rad":[0,0,0]}]}
-    cv = TransformCard("vision_tf", {}, ns, executor)
-    tree = TransformCard("tf_tree", cfg, ns, executor)
-    bare = TransformCard("tf_tree", {}, ns, executor)
+    cv = VisionTfPlugin({}, ns, executor)
+    tree = TfTreePlugin(cfg, ns, executor)
+    bare = TfTreePlugin({}, ns, executor)
+    assert cv.get_tool()["name"] == VisionTfPlugin.PREFIX == "vision_tf"
+    assert tree.get_tool()["name"] == TfTreePlugin.PREFIX == "tf_tree"
     wire = {"instance_id":"left","input_topic":"/weekly/aruco"}
     camera_pub = node.create_publisher(String,wire["input_topic"],qos_profile_sensor_data)
     joints_pub = node.create_publisher(String,"/"+ns+"/state/joints",qos_profile_sensor_data)

@@ -50,9 +50,9 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
 #
 # The base image carries /opt/ros/humble but no ROS 2 apt source (only the Ubuntu
 # archive is configured), so `ros-humble-*` is invisible to apt until the ROS
-# repository and its signing key are added. The TF tree card also uses the standard
-# robot_state_publisher binary. Both use the distro's tf2 and message packages.
-# Measured ARM64 image size for the original odometry addition: the
+# repository and its signing key are added. Only rtabmap-odom is installed
+# explicitly: it declares tf2_ros and the message packages itself, so repeating
+# them here would not change the installed set. Measured ARM64 image size: the
 # Bumi image grows from ~2.1 GB (before RTAB-Map) to ~4.8 GB uncompressed
 # (~+2.7 GB), almost all of it the PCL/Qt/VTK transitive dependencies of the
 # official rtabmap-odom package. There is no smaller official package for the
@@ -83,7 +83,7 @@ RUN set -eu; \
       echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] $src $UBUNTU_CODENAME main" \
         > /etc/apt/sources.list.d/ros2.list; \
       if apt-get update && apt-get install -y --no-install-recommends \
-           ros-humble-rtabmap-odom ros-humble-robot-state-publisher; then \
+           ros-humble-rtabmap-odom; then \
         installed=1; break; \
       fi; \
       rm -rf /var/lib/apt/lists/*; \
@@ -157,6 +157,10 @@ COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
+
+# The pinned ARM64 ros-base already ships this executable (layer 049dff30aaed).
+# Reusing it adds 0 compressed or uncompressed package bytes to the TF cards.
+RUN test -x /opt/ros/humble/lib/robot_state_publisher/robot_state_publisher
 
 # Add SDK DDS libs + pybind modules to paths
 ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH}

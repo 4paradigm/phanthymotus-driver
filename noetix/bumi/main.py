@@ -123,14 +123,16 @@ class BumiDeviceBundle:
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
         loco_plugin = None
+        if plugins_cfg.get("vision_tf", {}).get("enabled", False):
+            from tf_cards import VisionTfPlugin
+            self._plugins.append(VisionTfPlugin(plugins_cfg[VisionTfPlugin.PREFIX], namespace, executor))
+        if plugins_cfg.get("tf_tree", {}).get("enabled", False):
+            from tf_cards import TfTreePlugin
+            self._plugins.append(TfTreePlugin(plugins_cfg[TfTreePlugin.PREFIX], namespace, executor))
+
         # The camera subprocess reads this env var; set it before any plugin can
         # start that subprocess, so the raw RGB-D branch is published only when
         # the visual odometry card is enabled.
-        for name in ("vision_tf", "tf_tree"):
-            if plugins_cfg.get(name, {}).get("enabled", False):
-                from tf_cards import TransformCard
-                self._plugins.append(TransformCard(name, plugins_cfg[name], namespace, executor))
-
         if plugins_cfg.get("visual_odometry", {}).get("enabled", False):
             os.environ["BUMI_VISUAL_ODOMETRY"] = "1"
             os.environ["BUMI_VISUAL_ODOMETRY_MAX_FPS"] = str(

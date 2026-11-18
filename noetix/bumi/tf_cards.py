@@ -178,10 +178,9 @@ class TreeNode(_CardNode):
             super().destroy_node()
 
 
-class TransformCard:
-    def __init__(self, name, config, namespace, executor):
-        self.name = name
-        self.tree = name == "tf_tree"
+class _TransformCard:
+    def __init__(self, config, namespace, executor):
+        self.tree = self.PREFIX == "tf_tree"
         self.config = config
         self.ns = component(namespace)
         self.executor = executor
@@ -191,7 +190,7 @@ class TransformCard:
     def get_tool(self):
         desc = ("将 Bumi URDF、实时关节及左侧可选视觉 TF 合成 /tf 和 /tf_static。用 tf2 查询手与目标。"
                 if self.tree else "把相机光学坐标系中的米制定位结果转换为 TFMessage JSON，保留图像时间及每个目标身份。")
-        return {"name": self.name, "type": "processor", "multiInstance": not self.tree, "description": desc,
+        return {"name": self.PREFIX, "type": "processor", "multiInstance": not self.tree, "description": desc,
                 "inputSchema": {"type": "object", "required": ["action"], "properties": {
                     "action": {"type": "string", "enum": ["info", "start", "stop"]},
                     "input_topic": {"type": "string"}, "input_topics": {"type": "array", "items": {"type": "string"}},
@@ -261,3 +260,11 @@ class TransformCard:
                 if entry[1].process.poll() is not None:
                     result.update(state="error", message="robot_state_publisher exited; restart the card")
             return result
+
+
+class VisionTfPlugin(_TransformCard):
+    PREFIX = "vision_tf"
+
+
+class TfTreePlugin(_TransformCard):
+    PREFIX = "tf_tree"
