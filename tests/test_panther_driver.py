@@ -36,6 +36,32 @@ core_bridge = _load("core_bridge")
 plugins = _load("plugins")
 camera = _load("camera")
 device_module = _load("device")
+audio = _load("audio")
+
+
+class PantherAudioContractTest(unittest.TestCase):
+    def test_canvas_audio_ports_and_pulse_commands(self):
+        config = {"server": "unix:/run/user/1001/pulse/native",
+                  "source": "alsa_input.platform-sound.analog-stereo",
+                  "sink": "alsa_output.platform-sound.analog-stereo"}
+        mic = audio.AudioPlugin("mic", "unixai_panther", config).get_tool()
+        speaker = audio.AudioPlugin("speaker", "unixai_panther", config).get_tool()
+        self.assertEqual(mic["topic_out"], [{"topic": "/unixai_panther/panther/mic/audio",
+                                             "format": "audio/pcm-16k"}])
+        self.assertEqual(speaker["topic_in"], [{"format": "audio/pcm-16k"}])
+        self.assertEqual(speaker["inputSchema"]["x-action-params"]["start"]["params"],
+                         ["input_topic"])
+        self.assertIn("--device=alsa_input.platform-sound.analog-stereo",
+                      audio._pulse_command("mic", config["source"]))
+        self.assertIn("--device=alsa_output.platform-sound.analog-stereo",
+                      audio._pulse_command("speaker", config["sink"]))
+
+    def test_partial_pulse_reads_are_reassembled_before_publish(self):
+        pending = bytearray()
+        self.assertEqual(list(audio._complete_chunks(pending, b"a" * 300)), [])
+        self.assertEqual(list(audio._complete_chunks(pending, b"b" * 1748)),
+                         [b"a" * 300 + b"b" * 1748])
+        self.assertEqual(pending, b"")
 
 
 class PantherDriverTest(unittest.TestCase):

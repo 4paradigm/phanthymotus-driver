@@ -17,6 +17,21 @@ required for discovery.
 - Sensors: `joints`/`model`, compact `robot_state`, `battery`, `imu`, `odom`,
   merged `laser_scan`, lazy `camera_color`, and lazy `camera_depth`.
 - Actuators: `base_drive`, `arm_control`, `gripper`, `lifting`, and `head`.
+- Audio: `mic` publishes `audio/pcm-16k` from the host PulseAudio source;
+  `speaker` plays a canvas-connected `audio/pcm-16k` stream through its sink.
+
+The audio cards run in separate domain-42 processes and use the host PulseAudio
+server at `/run/user/1001/pulse/native`; they never open ALSA devices directly.
+The Compose fragment mounts the Pulse socket directory and the authentication
+cookie. Set `PANTHER_PULSE_COOKIE_PATH` to the host cookie path if it differs
+from `/home/unix_ai/.config/pulse/cookie`. Set `PANTHER_PULSE_SOURCE` and
+`PANTHER_PULSE_SINK` to override the configured Pulse device names after
+checking `pactl list sources` and `pactl list sinks` on the robot. The reported
+`platform-sound` names have not yet been verified against the physical M8 mic
+and speaker. Before enabling a project, verify container-side `pactl info`,
+then test `mic -> ASR` and `TTS -> speaker` on Panther. For simultaneous
+listening and speaking, insert the perception echo-cancellation card before
+ASR and check interaction with the robot's native AIUI conversation service.
 
 `model` falls back to the bundled, verbatim vendor `pmm_urdf` model before the robot
 publishes anything. Once a live `/robot_description` is available, reading the

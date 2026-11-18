@@ -10,7 +10,8 @@ RUN . /etc/os-release && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /panther_ws
 COPY vendor/unix_msgs/ /panther_ws/src/unix_msgs/
-RUN . /opt/ros/humble/setup.sh && colcon build --packages-select unix_msgs --merge-install
+COPY vendor/audio_msgs/ /panther_ws/src/audio_msgs/
+RUN . /opt/ros/humble/setup.sh && colcon build --packages-select unix_msgs audio_msgs --merge-install
 
 FROM ${ROS_BASE_IMAGE}
 ARG ROS_APT_MIRROR
@@ -22,6 +23,7 @@ RUN . /etc/os-release && \
       python3-opencv \
       systemd \
       util-linux \
+      pulseaudio-utils \
       ros-humble-rmw-cyclonedds-cpp \
       ros-humble-rmw-fastrtps-cpp \
       ros-humble-control-msgs \
@@ -44,7 +46,7 @@ RUN . /etc/os-release && \
 COPY --from=interface-builder /panther_ws/install /panther_ws/install
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py plugins.py contracts.py core_bridge.py camera.py config.yaml driver.yaml /work/
+COPY main.py device.py plugins.py contracts.py core_bridge.py camera.py audio.py config.yaml driver.yaml /work/
 COPY resource/panther.urdf /work/resource/panther.urdf
 COPY resource/cyclonedds-muzzle.xml /work/resource/cyclonedds-muzzle.xml
 COPY entrypoint.sh /work/entrypoint.sh

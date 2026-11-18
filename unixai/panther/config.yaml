@@ -29,6 +29,14 @@ plugins:
   camera_color: {enabled: true}
   camera_depth: {enabled: true}
 
+  audio:
+    server: "unix:/run/user/1001/pulse/native"
+    # Confirm physical routing on Panther before changing these names.
+    source: "alsa_input.platform-sound.analog-stereo"
+    sink: "alsa_output.platform-sound.analog-stereo"
+  mic: {enabled: true}
+  speaker: {enabled: true}
+
   base_drive:
     enabled: true
     # Operator-approved working caps; ROS receives angular velocity in radians/s.

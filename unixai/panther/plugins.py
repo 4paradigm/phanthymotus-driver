@@ -181,7 +181,6 @@ def _action_schema(actions, properties, required_by_action=None, resource=None,
 
 
 def build_plugins(config, namespace, device):
-    del namespace
     enabled = config.get("plugins", {})
     plugins = []
 
@@ -211,6 +210,11 @@ def build_plugins(config, namespace, device):
         plugins.append(CameraPlugin(
             device, "camera_depth", "depth", "Panther Gemini 2 depth stream (zlib 16UC1)"
         ))
+    if on("mic") or on("speaker"):
+        from audio import AudioPlugin
+        for name in ("mic", "speaker"):
+            if on(name):
+                plugins.append(AudioPlugin(name, namespace, enabled["audio"]))
 
     if on("base_drive"):
         cfg = enabled["base_drive"]
