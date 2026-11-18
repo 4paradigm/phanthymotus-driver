@@ -124,7 +124,10 @@ class Bundle:
         from slam_mapping import SlamMappingPlugin
         p = cfg.get("plugins", {})
         self.plugins = []
-        if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
+        state = None
+        if dds_ready and p.get("state", {}).get("enabled", True):
+            state = StatePlugin(p.get("state", {}), namespace, executor)
+            self.plugins.append(state)
         loco = None
         loco_servo = None
         special_motion = None
@@ -170,6 +173,14 @@ class Bundle:
                 controlled_spatial.attach_servo(loco_servo)
                 loco_servo.attach_controlled_spatial(controlled_spatial)
         if dds_ready and p.get("slam_mapping", {}).get("enabled", True): self.plugins.append(SlamMappingPlugin(p.get("slam_mapping", {}), namespace, executor))
+        if dds_ready and p.get("accompany", {}).get("enabled", False):
+            from accompany import AccompanyPlugin
+            # Reuses the state card's LowState subscription for the remote frame
+            # and the shared sport RPC proxy for GetState. Read-only by design:
+            # the vendor exposes no accompany enter/exit call.
+            self.plugins.append(AccompanyPlugin(
+                p.get("accompany", {}), namespace, executor,
+                proxy=proxy, state_plugin=state))
     def start_all(self):
         for plugin in self.plugins: plugin.start()
     def stop_all(self):

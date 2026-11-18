@@ -554,6 +554,15 @@ class StatePlugin:
         self._namespace = namespace
         self._executor = executor
         self._state = _StateNode(namespace, executor)
+    def remote_snapshot(self):
+        """Cached wireless-remote frame for sibling cards such as accompany.
+
+        The LowState subscriber is shared on purpose: a second subscription would
+        double the DDS callback load for one 24-byte payload per LowState message.
+        """
+        if self._state is None:
+            return _unavailable_remote()
+        return self._state.remote_snapshot()
     def get_tools(self):
         specs = (("imu", "state/imu", "data/json", "As2W IMU state"),
                  ("joints", "state/joints", "sensor/skeleton", "As2W 12-joint leg skeleton for model animation"),

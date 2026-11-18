@@ -63,6 +63,20 @@ plugins:
     # Override only after checking the driver's 15-second lidar diagnostics.
     # source_topics: ["rt/utlidar/cloud_deskewed"]
   controlled_spatial: {enabled: true}
+  accompany:
+    enabled: true
+    publish_hz: 5
+    # Read-only supervisor for the firmware-owned ISS 3.0 accompany mode. The
+    # vendor exposes no enter/exit call, so the card cannot switch the mode; it
+    # checks preconditions and reports exit evidence.
+    joystick_deadzone: 0.1
+    poll_state: true
+    state_poll_period_s: 3
+    # Populate after one on-robot run: enter accompany mode (head LED solid
+    # purple), call the loco card's get_state, and copy the returned fsm_name
+    # here. Empty means "no confirmed state name", so status reports
+    # confidence=none and relies on the operator watching the indicator lamp.
+    fsm_names: []
   slam_mapping:
     enabled: true
     voxel_size: 0.06
