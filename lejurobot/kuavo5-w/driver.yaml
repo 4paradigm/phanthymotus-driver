@@ -15,6 +15,7 @@ cards:
   - { name: leg,         type: actuator }
   - { name: waist,       type: actuator }
   - { name: head,        type: actuator }
+  - { name: speaker,     type: actuator }
   - { name: joints, type: sensor }
   - { name: imu, type: sensor }
   - { name: loco_state, type: sensor }

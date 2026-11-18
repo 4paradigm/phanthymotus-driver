@@ -23,11 +23,30 @@ CONTROLLER_NODES = {'/nodelet_manager', '/nodelet_controller',
 
 
 def check_no_controller(system_state):
-    """Fail closed on stale registrations as well as live competing owners."""
-    for entries in system_state:
-        for name, nodes in entries:
-            if CONTROLLER_NODES.intersection(nodes) or (name == '/sensors_data_raw' and nodes):
+    """Detect controller publishers/services without mistaking our own subscribers for ownership."""
+    if not isinstance(system_state, (list, tuple)) or len(system_state) != 3:
+        raise RuntimeError('invalid_ros_master_system_state')
+    publishers, subscribers, services = system_state
+    for entries in (publishers, subscribers, services):
+        for _, nodes in entries:
+            if CONTROLLER_NODES.intersection(nodes):
                 raise RuntimeError('existing_controller_owner')
+    # A raw sensor subscriber is not evidence that the controller is running;
+    # this boot monitor itself subscribes here while waiting for hardware.
+    if any(name == '/sensors_data_raw' and nodes for name, nodes in publishers):
+        raise RuntimeError('existing_controller_owner')
+
+
+def controller_environment(environment):
+    """Noninteractive systemd does not source the vendor's ~/.bashrc."""
+    library = Path('/opt/drake/lib/libdrake.so')
+    if not library.is_file():
+        raise RuntimeError('missing_controller_runtime: /opt/drake/lib/libdrake.so')
+    result = dict(environment)
+    paths = [part for part in result.get('LD_LIBRARY_PATH', '').split(':') if part]
+    result['LD_LIBRARY_PATH'] = ':'.join(['/opt/drake/lib', *(
+        part for part in paths if part.rstrip('/') != '/opt/drake/lib')])
+    return result
 
 
 class BootSequence:
@@ -135,8 +154,8 @@ def wait_for_master(stop, timeout=180, adopt_existing=False):
             if code == 1:
                 try:
                     check_no_controller(state)
-                except RuntimeError:
-                    if adopt_existing:
+                except RuntimeError as exc:
+                    if adopt_existing and str(exc) == 'existing_controller_owner':
                         return True
                     raise
                 return False
@@ -187,7 +206,7 @@ def run(version, adopt_existing=False):
     pub.publish(String(data=json.dumps(sequence.status())))
     child = None if existing else subprocess.Popen(['roslaunch', '--wait', 'humanoid_controllers',
         'load_kuavo_real_wheel.launch', 'joystick_type:=h12', 'start_way:=auto'],
-        stdin=subprocess.DEVNULL, start_new_session=True)
+        stdin=subprocess.DEVNULL, start_new_session=True, env=controller_environment(os.environ))
     failure_pause = None
     try:
         while not stop.is_set() and not rospy.is_shutdown():

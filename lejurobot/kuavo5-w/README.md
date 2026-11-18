@@ -117,6 +117,9 @@ sudo python3 host/install_controller.py \
 
 正常下次开机，服务等待厂商H12服务建立ROS master，确认没有已有控制器后启动
 `ROBOT_VERSION=63 roslaunch humanoid_controllers load_kuavo_real_wheel.launch joystick_type:=h12 start_way:=auto`。
+所有权检测只把控制节点或原始关节发布者视为已有控制器，忽略joy、bridge及监管自身的传感器订阅。
+启动环境显式加入现场已安装的 `/opt/drake/lib`，保留工作区/ROS库路径；systemd不依赖交互式.bashrc。
+缺少libdrake时在启动硬件前报错，不自动安装依赖或进入不完整初始化。
 核实机型、关节、服务来源后仅调用一次 `/humanoid_controller/real_initial_start`；
 等待请求终态及之后的新鲜BaseArm反馈（mode=3），再请求 `/enable_control(false)`，确认新收到的false后才报告complete。
 初始化超时保留请求，不重发；失败不假报就绪。控制进程故障不自动重启，也不调用enable=true。
@@ -167,7 +170,7 @@ WebSocket 使用 CPython 严格 UTF-8 解码和 JSON 校验，避免纯 Python �
 底盘源时间戳为0，无法据此测得端到端延迟；卡片 info 中 publish_delay_ms 仅是驱动接收至 DDS 发布耗时。
 传感卡 stop 停止该卡输出，相机 stop 不关闭其他卡或进程共享的物理图像流。
 现场 USB 音频说明要求 EB03_LJ 声卡，上位机未枚举到该卡；Pulse source 仅为播放 monitor，不是麦克风。
-ALSA PCM 可写不证明真实扬声器出声，因此不注册虚假可用的 `mic/speaker`。接线/供电尚未确认。
+因此暂不注册 `mic`。扬声器已在独立底盘电脑的ALC897模拟输出完成现场听音确认，见下文 `speaker`。
 已发现 Livox MID360 配置和 SDK，但专用网口无物理 carrier，未见第二雷达有效发布者；当前点云只来自底盘二维雷达。
 
 `KUA5W0710701302138` 是操作人员提供的机身标识，可在现场配置 `robot_serial` 中记录；
@@ -239,6 +242,7 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 | `leg` | `move_joints`、`stop_move` | `/lb_leg_traj` |
 | `waist` | `set_pose`、`stop_move` | `/cmd_lb_torso_pose` |
 | `head` | `move`、`stop_move` | `/cmd_head_vel` |
+| `speaker` | 系统 `start`、`stop`、`info`；`interrupt` | ROS2 `AudioChunk` → 独立rosbridge → 自有底盘PCM播放服务 |
 | `joints` | 系统 `start`、`stop`、`info` | 两路：`sensor/skeleton` 骨架姿态 + `data/json` 原始 joint_state |
 | `imu` | 系统 `start`、`stop`、`info` | 同一原始消息的 IMU；`data/json` |
 | `loco_state` | 系统 `start`、`stop`、`info` | 两路：map/odom 位置、角度、速度 JSON + 独立 `state/odom` / `motus.odom/1` |
@@ -255,11 +259,44 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 `stop_move` 不依赖机型探测，仍会尝试零速、取消在途动作及请求暂停；若控制服务/反馈缺失，
 返回 `physical_stop_confirmed: false`，不能假报暂停成功。查询返回的 `state: ready` 仅表示查询成功。
 
-左右/头部 RGB、头部深度、电池、二维雷达点云已适配；尚未提供 `mic`、`speaker`、`controlled_spatial` 卡片。
+左右/头部 RGB、头部深度、电池、二维雷达点云、扬声器已适配；尚未提供 `mic`、`controlled_spatial` 卡片。
 真机底盘另有导航主机 `192.168.26.22`，其 HTTP API 已验证可读当前地图和地图列表；
 任务下发、取消确认、建图保存/服务重启的完整协议仍待核实，上位机 rosbridge 也缺少对应自定义服务类型。
-用户已确认开机音效，底盘状态包含音乐编号和音量控制，但尚未找到任意 PCM/TTS 的实际播放入口；
-不能由上下位机 USB 声卡未枚举推断整机没有扬声器。
+厂商编号音效不是任意PCM接口；本驱动使用已实际听到声音的底盘标准音频输出。
+
+### 扬声器安装与使用
+
+在**独立底盘电脑**（现场 `192.168.26.22`，不是Jetson或全身控制下位机）一次性执行：
+
+```sh
+sudo python3 host/install_speaker.py --user jt --master http://192.168.26.1:11311 --ros-ip 192.168.26.22 --volume 30
+```
+
+仅使用该机已有ROS Noetic、`paplay/pactl`和PulseAudio；不安装SDK、声卡库或TTS引擎，不保存SSH凭据。
+安装 `kuavo5w-speaker.service` 并启用音频用户linger，允许用户音频服务开机运行；
+该机已有启用的 `pulseaudio.socket`，部署前应确认它正常。轻量ROS服务随系统启动，但无音频数据时不启动播放器。
+服务只访问音频，无控制器/电机操作；`speaker` 不依赖 `motion_enabled` 或恢复电机。
+
+画布将TTS/音频节点的 `audio/pcm-16k` 输出连接到 `speaker`，Core在 `start` 传入 `input_topic`。
+输入为标准 `audio_msgs/msg/AudioChunk`，16kHz、单声道、小端signed int16；接受Core的
+`pcm_16k_16bit_mono`格式标识和TTS的 `audio/pcm-16k`，EOF魔数只用于结束标识，不会当声音播放。
+复用基础镜像 `/ros_ws/install` 已有消息定义，Docker启动时加载并在构建时检查导入，不增加消息构建依赖。
+`start` 检查服务及已核实的模拟sink，分配新会话；服务缺失或声卡不可用时返回错误，不退回假输出。
+
+每张扬声器卡有独立WebSocket和播放线程，ROS2回调只校验/入队；最多100个100ms块，
+按实时速率转发，底盘队列上限1秒、非阻塞写入播放器。过载/进程异常停止，不无限堆积。
+会话token和递增序号拒绝旧会话/重复包；独立1.5秒墙钟租约在输入链路丢失后停止本服务的播放器，
+重连不会重放旧流。`stop` 销毁订阅、清空缓存并确认底盘停止；无法确认则明确报错。
+`interrupt` 立即清空并终止当前播放，重新分配会话，丢弃旧句后续数据直到EOF；新 `start` 也可重新建立流。
+同时声明 `on_interrupt_speak/on_interrupt_all` hook及 `mouth` 资源。
+与其他驱动的流式speaker一致，这张卡以start/stop维持数据平面，不给每个PCM块伪造ACP动作；
+运动卡原有ACP不变。本卡不提供逐句声学播放完成ACP。
+
+音量为安装参数 `--volume`（默认30%，仅本播放流），`info.output_status.volume_percent`显示底盘实际配置；
+不修改系统主音量、不停止厂商导航提示音。`output_status.bytes_written`是写入播放器的字节数，
+不是麦克风回录证明。2026-11-18现场已通过完整ROS2→rosbridge→底盘链路播放三遍“待命中”，
+124416字节全部写入，操作人员确认听到，stop确认idle；完整断电后音频自启动仍待复验。
+最终静音测试确认interrupt后旧句不再写入、EOF后新流恢复、stop约245ms确认，断连后租约失效。
 接口快照、可行性及导航取消/ACP 适配前提见 `ROBOT_INSPECTION.md` 的能力核查记录。
 
 参数单位与约束：

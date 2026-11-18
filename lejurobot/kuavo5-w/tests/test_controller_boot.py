@@ -3,6 +3,7 @@ from pathlib import Path
 import threading
 import types
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 def module(name):
@@ -116,10 +117,43 @@ class ControllerBootTests(unittest.TestCase):
 
     def test_existing_or_stale_controller_registration_refuses_duplicate_launch(self):
         boot.check_no_controller([[['/unrelated', ['/camera']]], [], []])
-        for state in (([['/sensors_data_raw', ['/unknown']]], [], []),
+        # The boot monitor and rosbridge subscribe before the controller exists.
+        boot.check_no_controller([[], [['/sensors_data_raw', ['/kuavo5w_controller_boot', '/rosbridge']]], []])
+        for state in (([('/sensors_data_raw', ['/unknown'])], [], []),
+                      ([], [['/state', ['/mobile_manipulator_sqp_mpc_node']]], []),
                       ([], [], [['/enable_control', ['/nodelet_manager']]])):
             with self.assertRaisesRegex(RuntimeError, 'existing_controller_owner'):
                 boot.check_no_controller(state)
+
+    def test_invalid_master_system_state_fails_closed(self):
+        for value in (None, [], [[], []], 'invalid'):
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, 'invalid_ros_master_system_state'):
+                boot.check_no_controller(value)
+
+    def test_normal_master_preflight_ignores_sensor_subscribers_but_not_real_owners(self):
+        cases = (([[], [['/sensors_data_raw', ['/joy_node', '/kuavo5w_controller_boot']]], []], False),
+                 ([[['/sensors_data_raw', ['/nodelet_manager']]], [], []], True))
+        with patch.object(boot.xmlrpc.client, 'ServerProxy') as proxy, patch.dict(
+                boot.os.environ, {'ROS_MASTER_URI': 'http://localhost:11311'}):
+            master = proxy.return_value.__enter__.return_value
+            for state, expected in cases:
+                master.getSystemState.return_value = (1, '', state)
+                self.assertIs(boot.wait_for_master(threading.Event(), adopt_existing=True), expected)
+            master.getSystemState.return_value = (1, '', [])
+            with self.assertRaisesRegex(RuntimeError, 'invalid_ros_master_system_state'):
+                boot.wait_for_master(threading.Event(), adopt_existing=True)
+
+    def test_systemd_controller_environment_supplies_drake_without_discarding_workspace(self):
+        original = {'LD_LIBRARY_PATH': '/ws/lib:/opt/drake/lib/:/opt/ros/noetic/lib', 'ROBOT_VERSION': '63'}
+        with patch.object(boot.Path, 'is_file', return_value=True):
+            result = boot.controller_environment(original)
+            self.assertEqual(result['LD_LIBRARY_PATH'], '/opt/drake/lib:/ws/lib:/opt/ros/noetic/lib')
+            self.assertEqual(result['ROBOT_VERSION'], '63')
+            self.assertEqual(boot.controller_environment({})['LD_LIBRARY_PATH'], '/opt/drake/lib')
+        self.assertEqual(original['LD_LIBRARY_PATH'], '/ws/lib:/opt/drake/lib/:/opt/ros/noetic/lib')
+        with patch.object(boot.Path, 'is_file', return_value=False):
+            with self.assertRaisesRegex(RuntimeError, 'missing_controller_runtime'):
+                boot.controller_environment(original)
 
     def test_existing_paused_controller_can_be_adopted_without_any_service_call(self):
         sequence = boot.BootSequence(63, lambda action: self.fail(action), existing=True)

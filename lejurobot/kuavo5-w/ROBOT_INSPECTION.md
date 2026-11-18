@@ -469,3 +469,63 @@ host helper 的首次安装仍需现场管理员执行一次，详见 README。
 - 228项离线测试及部署checker通过；移除旧UI模式参数测试，保留内部控制抢占、迟到响应、
   停止保护测试，并新增BaseArm开机确认及旧配置不能恢复已删除卡片的回归检查。
   本轮未做冷启动、位移或关节运动验收，硬件核验关节限位仍待配置。
+
+## 追加：本次开机初始化故障恢复（2026-11-18）
+
+- 上位机实际运行release.261117.2e96669，head报开机门控未确认；下位机监管服务虽enabled/active，
+  却从本次开机一直waiting_hardware、launch_ownership=external。实际没有控制器进程、机型参数、
+  原始关节发布者或enable_control服务；只有joy、bridge和监管节点订阅原始关节话题。
+- 根因为所有权检测将getSystemState的发布/订阅/服务三表不加区分地扫描，
+  任意/sensors_data_raw订阅者被当作控制器所有者。修复为已知控制节点仍在三表检测，
+  未知原始关节来源仅检查发布表；保留死亡控制器注册的故障关闭，不自动清理或重复启动。
+  正常XMLRPC预检路径新增回归覆盖，畸形master结果不能走已有控制器接管分支。
+- 操作人员明确确认本次旁站后启动，进一步发现systemd不继承.bashrc中的Drake库路径，
+  MPC/手柄进程报libdrake.so缺失。库实际位于/opt/drake/lib/libdrake.so，无需安装软件。
+  启动子进程显式补齐该路径并保留工作区/ROS路径，库缺失时在启动硬件前拒绝。
+- 对未完成的首轮进程树有序停机，确认仅nodelet_manager有已死亡注册后定点清理；
+  没有修改后台自动清理策略。ldd预检无未解析库，再启动完整受监管进程树。
+  最终监管complete、initialization_requested/accepted=true、initial_control_mode=3、
+  boot_pause_confirmed=true、launch_ownership=service；没有绕过开机门控。
+- 当前线上容器无需替换：真实调用head.move(duration=0.1，默认零速度)返回executing、
+  automatic/resumed=true、mode=3，随后head.stop_move确认control_enabled=false。
+  最终motion_blocked=true，无未决resume/mode或发送不确定，joints为20关节valid。
+  该结果验证本次开机后启动/初始化/暂停链路和零速度执行通路，不代表实际头部位移或机械急停验收。
+- 231项离线测试、部署checker与diff检查通过；未新增依赖、未改容器基础设施。
+  下位机固定安装路径已更新。仍需后续断电开机复验无人工干预的完整时序，arm/leg限位仍待核验。
+
+### 扬声器复查
+
+- 上位机厂商start_h12pro_play_node.service等待humanoid_plan_arm_trajectory_node后启动音频程序。
+  控制栈恢复后播放器进程存在，但ROS音频节点/服务仍未注册，PulseAudio仅auto_null；
+  厂商播放器在真实输出设备检查处等待，不能把“进程存在”当作可用speaker。
+- 独立底盘192.168.26.22的jaten_manager_node以jaten_behavior_manager运行，配置有
+  use_dongma_speaker=true、ttyS5/9600；存在Sound/SoundExternal编号消息定义，
+  但实际节点无这两类订阅或任意PCM/TTS服务。SetChassisState只提供音量控制，
+  当前8888 Swagger也无audio/sound/music/voice/tts/speak路径；不据静态消息包注册假入口。
+- 该底盘同时有真实ALC897模拟PulseAudio输出及/home/jt/jmap_config/music/7_standby.mp3。
+  使用底盘现有ffplay、30%播放器音量在其本地时间14:26:27–14:26:35播放三遍，进程正常退出。
+  操作人员确认听到，证明这条底盘标准音频通路可用；上位机/控制器下位机此前无声测试不代表整机没有扬声器。
+
+### speaker完整链路（2026-11-18）
+
+- 新增speaker卡，接标准ROS2 AudioChunk/audio/pcm-16k输入，使用独立WebSocket、墙钟心跳和有界队列，
+  转发到独立底盘的自有std_msgs/String PCM服务；控制服务仅使用std_srvs/Trigger。
+  paplay使用已核实analog-stereo sink、16k/mono/s16le、30%流音量，不修改系统音量或中断厂商提示音。
+- 一次性安装底盘kuavo5w-speaker.service并启用该用户linger；已有pulseaudio.socket enabled/active。
+  播放器在首块音频时才创建；start检查sink、stop/interrupt终止本子进程；1.5秒租约断流停止，
+  重连/旧session/重复sequence不重放。mic仍无真实采集通路，不新增假mic卡。
+- 实际发现ros-base已有/ros_ws/install/audio_msgs，只是原启动命令未加载；修正加载和构建预检，
+  没有新增pip/apt包。线上候选基于release.261117.2e96669覆盖代码，
+  最终候选local-speaker-final-261118为736907954→737019249字节（+111295字节）；
+  此为在已有release上覆盖代码的增量，不是生产Dockerfile相对ros-base的体积差。
+- 北京时间约14:46:30，从容器通过标准DDS domain42发布厂商提示音转出的PCM三遍，
+  DDS订阅者1，底盘bytes_written=124416、buffer=0、error=null，操作人员确认听到。
+  speaker.stop返回idle。前后enable=false、boot complete，未恢复或重启电机程序。
+  记录保存在上位机kuavo5w-motus-candidate/speaker-e2e-261118.jsonl。
+- 最终代码再用静音PCM检查：写入16000字节后interrupt，新session在旧句数据到来时保持bytes_written=0；
+  EOF后新3200字节正常写入。stop约245ms确认session=null、idle、buffer=0。
+  独立客户端启动后断开，1.8秒检查得到session=null、lease expired；恢复新会话后正常stop。
+  记录在speaker-smoke-261118.log。安装重启瞬间ROS服务尚未注册时start明确报错，注册完成后新请求成功。
+- 252项离线测试、Python编译、部署checker和diff检查通过。包括播放输入校验、有界队列、
+  生命周期锁不阻塞DDS回调、旧会话/重复包拒绝、EOF/中断、断线不重放及停止未确认报错。
+- 本轮未验证mic、物理关节运动或整机断电后的音频自启动。连续speaker流不提供逐句声学完成ACP。

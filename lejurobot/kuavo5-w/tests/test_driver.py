@@ -209,7 +209,8 @@ class DriverContractTests(unittest.TestCase):
             self.assertEqual(set(schema["properties"]["action"]["enum"]), set(schema["x-action-params"]))
             self.assertTrue(all(set(a["params"]) <= set(schema["properties"])
                                 for a in schema["x-action-params"].values()))
-            self.assertIn("x-completion", schema)
+            if not tool.get('topic_in'):  # continuous audio is tracked by upstream TTS ACP
+                self.assertIn("x-completion", schema)
             self.assertIn("x-resource", schema)
         self.assertEqual(tools["leg"]["inputSchema"]["x-resource"], tools["waist"]["inputSchema"]["x-resource"])
 

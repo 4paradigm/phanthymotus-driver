@@ -27,13 +27,15 @@ RUN set -eu; \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/kuavo-requirements.txt; \
     rm /tmp/kuavo-requirements.txt; \
     python3 -c 'import yaml, websocket'
+# The existing ros-base audio_msgs overlay is shared with Agent Core; reuse it.
+RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk"'
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py rosbridge_client.py kuavo_sensors.py peripherals.py startup.py config.yaml driver.yaml /work/
+COPY main.py device.py rosbridge_client.py kuavo_sensors.py peripherals.py speaker.py startup.py config.yaml driver.yaml /work/
 COPY host/ /work/host/
 COPY resource/ /work/resource/
 COPY deploy/ /deploy/
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_DOMAIN_ID=42
 EXPOSE 15747
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && exec python3 /work/main.py"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && exec python3 /work/main.py"]

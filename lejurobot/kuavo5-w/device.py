@@ -18,6 +18,7 @@ from uuid import uuid4
 from std_msgs.msg import String
 from kuavo_sensors import KuavoSensors, SENSOR_CARDS
 from peripherals import Peripherals, CARDS as PERIPHERAL_CARDS
+from speaker import Speaker
 from startup import StartupChecks
 
 
@@ -775,6 +776,7 @@ class KuavoBundle:
         self.startup_checks = StartupChecks(config.get('host_runtime', {}).get('enabled', True))
         self.peripherals = Peripherals(ros1, ros2_node, namespace, media_factory=media_factory,
             camera_ensure=self.startup_checks.ensure_camera if self.startup_checks.enabled else None)
+        self.speaker = Speaker(ros2_node, media_factory)
         self._auto_start = config.get('sensors', {}).get('auto_start',
             ['joints', 'imu', 'loco_state', *PERIPHERAL_CARDS])
         boot_required = config.get('host_runtime', {}).get('controller_boot_required', False)
@@ -791,7 +793,7 @@ class KuavoBundle:
                         LowerBodyPlugin(self, "waist"), HeadPlugin(self)]
         self._enabled = {name for name, cfg in config.get("plugins", {}).items()
                          if cfg.get("enabled", True)} if "plugins" in config else {
-                             "loco", "arm", "leg", "waist", "head", *SENSOR_CARDS, *PERIPHERAL_CARDS}
+                             "loco", "arm", "leg", "waist", "head", "speaker", *SENSOR_CARDS, *PERIPHERAL_CARDS}
         aliases = {'camera_rgb': 'camera_left', 'camera_rgb_right': 'camera_right'}
         self._enabled = {aliases.get(name, name) for name in self._enabled if name not in ('state', 'switch_mode')}
         self._auto_start = [aliases.get(name, name) for name in self._auto_start if name not in ('state', 'switch_mode')]
@@ -1136,7 +1138,8 @@ class KuavoBundle:
     def get_all_tools(self):
         tools = [p.get_tool() for p in self.plugins if p.PREFIX in self._enabled]
         return (tools + [t for t in self.sensors.tools() if t['name'] in self._enabled]
-                + [t for t in self.peripherals.tools() if t['name'] in self._enabled])
+                + [t for t in self.peripherals.tools() if t['name'] in self._enabled]
+                + ([self.speaker.tool()] if 'speaker' in self._enabled else []))
 
     def start_background(self):
         self.startup_checks.start()
@@ -1153,6 +1156,8 @@ class KuavoBundle:
             return None
         if self._closing:
             return {"state": "error", "error": "driver is shutting down"}
+        if name == 'speaker':
+            return self.speaker.dispatch(action, args)
         if name in PERIPHERAL_CARDS:
             return self.peripherals.dispatch(name, action)
         if name in SENSOR_CARDS:
@@ -1177,6 +1182,9 @@ class KuavoBundle:
         self.state.close()
         self.startup_checks.close()
         self.peripherals.close()
+        audio_stop = self.speaker.close()
+        if audio_stop.get('error'):
+            print(f"[speaker] shutdown {_safe_log(audio_stop['error'])}", flush=True)
         with self.tracker.lock:
             self.state._running = False
             self.sensors.close()
