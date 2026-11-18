@@ -66,6 +66,64 @@ _AUDIO_AGENT_POLL_INTERVAL_S = 0.1
 # Only ERROR_SLEEPED means the audio agent itself is down.
 _AUDIO_RESET_RECOVERED_STATUSES = frozenset(("READY", "SLEEPED"))
 
+
+class MediaControllerWriteGate:
+    """The one 500 ms spacing gate for every write to a ``MediaController``.
+
+    The vendor's limit is a minimum interval between configuration writes to
+    the *controller*, not between writes issued by one card.  ``speaker`` and
+    ``media_config`` drive the same voice unit, so giving each its own timer
+    let two cards each see a free slot and call the SDK back to back — the
+    case the vendor says can crash the voice system and needs a factory
+    return.  Both cards therefore take this object instead of keeping private
+    ``_config_lock`` / ``_last_config_change`` state, and by default they get
+    the single process-wide instance below.
+
+    ``clock`` and ``sleep`` are injectable so a test can drive the interval
+    without spending real seconds in ``time.sleep``.
+    """
+
+    def __init__(self, interval_s: float = _AUDIO_CONFIG_INTERVAL_S,
+                 clock=time.monotonic, sleep=time.sleep):
+        self._interval_s = interval_s
+        self._clock = clock
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._last_change = None
+
+    def write(self, setter, skip_if=None) -> bool:
+        """Run one SDK setter under the gate; report whether it ran.
+
+        ``skip_if`` is evaluated inside the lock and before any waiting, so a
+        caller whose write is already unnecessary (``speaker``'s read-back
+        check on the start path) costs neither a 500 ms delay nor a slot.
+        """
+        with self._lock:
+            if skip_if is not None and skip_if():
+                return False
+            if self._last_change is not None:
+                remaining = self._interval_s - (self._clock() - self._last_change)
+                if remaining > 0:
+                    self._sleep(remaining)
+            try:
+                setter()
+            finally:
+                # A setter that raised may still have reached the controller;
+                # count the attempt so the next write keeps its distance.
+                self._last_change = self._clock()
+            return True
+
+
+# One MediaController per process, so one gate per process.  Plugins accept a
+# ``write_gate`` argument for tests; production wiring relies on this default.
+_MEDIA_WRITE_GATE = MediaControllerWriteGate()
+
+
+def media_write_gate() -> MediaControllerWriteGate:
+    """Return the process-wide gate serializing MediaController writes."""
+    return _MEDIA_WRITE_GATE
+
+
 # ── Joint Mapping ─────────────────────────────────────────────────────────────
 # SDK motor_id order → URDF joint names (must match URDF exactly for skeleton renderer)
 
@@ -1857,7 +1915,8 @@ class MicPlugin:
 class SpeakerPlugin:
     PREFIX = "speaker"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
+    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl,
+                 write_gate: "MediaControllerWriteGate | None" = None):
         self._media_ctrl = media_ctrl
         self._namespace = namespace
         self._node = Node("bumi_speaker")
@@ -1869,8 +1928,7 @@ class SpeakerPlugin:
         self._frames_submitted = 0
         self._last_audio_time = 0.0
         self._last_error = None
-        self._last_config_change = 0.0
-        self._config_lock = threading.Lock()
+        self._config_gate = write_gate or _MEDIA_WRITE_GATE
         # HTTP MCP requests are handled concurrently.  Serialize operations
         # which change the shared MediaController audio state so a
         # start/stop sequence cannot interleave.
@@ -1930,14 +1988,6 @@ class SpeakerPlugin:
         finally:
             self._sub = None
 
-    def _wait_for_config_slot(self) -> None:
-        """Honor the SDK's 500 ms minimum interval between set calls."""
-        remaining = _AUDIO_CONFIG_INTERVAL_S - (
-            time.monotonic() - self._last_config_change
-        )
-        if remaining > 0:
-            time.sleep(remaining)
-
     def _set_config(
         self, getter_name: str, setter_name: str, enabled: bool, force: bool = False
     ) -> bool:
@@ -1948,17 +1998,20 @@ class SpeakerPlugin:
         value it can still return the stale one — believing it there would
         silently skip the write and leave the route closed.  The start path
         must therefore always write.
+
+        The interval lives on the controller-wide gate shared with
+        ``media_config``, not on this card: both write the same voice unit, and
+        per-card timers let them issue back-to-back writes.
         """
-        with self._config_lock:
-            setter = getattr(self._media_ctrl, setter_name)
-            if not force:
-                getter = getattr(self._media_ctrl, getter_name)
-                if bool(getter()) == enabled:
-                    return False
-            self._wait_for_config_slot()
-            setter(enabled)
-            self._last_config_change = time.monotonic()
-            return True
+        setter = getattr(self._media_ctrl, setter_name)
+        skip_if = None
+        if not force:
+            getter = getattr(self._media_ctrl, getter_name)
+
+            def skip_if() -> bool:
+                return bool(getter()) == enabled
+
+        return self._config_gate.write(lambda: setter(enabled), skip_if=skip_if)
 
     def _disable_config(self, getter_name: str, setter_name: str) -> bool:
         """Disable one MediaController route, only writing when necessary."""
@@ -2217,10 +2270,9 @@ class SpeakerPlugin:
         if action == "set_volume":
             vol = int(args.get("volume", 100))
             try:
-                with self._config_lock:
-                    self._wait_for_config_slot()
-                    self._media_ctrl.set_volume(vol)
-                    self._last_config_change = time.monotonic()
+                # Same controller-wide gate as every other set_*: a volume
+                # write and a media_config write hit one voice unit.
+                self._config_gate.write(lambda: self._media_ctrl.set_volume(vol))
                 return {"volume": vol, "state": "set"}
             except Exception as exc:
                 return {"state": "error", "error": str(exc)}
@@ -3684,28 +3736,22 @@ class MediaConfigPlugin:
     rejects any attempt to write it.
 
     The SDK requires at least 500 ms between ``set_*`` calls (shortening it can
-    crash the voice system and needs a factory return), so writes share the same
-    ``_config_lock`` / ``_wait_for_config_slot`` gate ``speaker`` already uses.
+    crash the voice system and needs a factory return). That limit is per
+    *controller*, so writes go through the ``MediaControllerWriteGate`` that
+    ``speaker`` also holds — a per-card lock here would let
+    ``speaker.set_volume`` and ``media_config.set_timeout`` fire back to back.
     This is an on-demand get/set card, not a poller: nothing is published, so
     there is no ROS node and no ``topic_out``.
     """
     PREFIX = "media_config"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
+    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl,
+                 write_gate: "MediaControllerWriteGate | None" = None):
         self._media_ctrl = media_ctrl
-        self._config_lock = threading.Lock()
-        self._last_config_change = 0.0
+        self._config_gate = write_gate or _MEDIA_WRITE_GATE
 
     def _controller_present(self) -> bool:
         return self._media_ctrl is not None
-
-    def _wait_for_config_slot(self) -> None:
-        """Honor the SDK's 500 ms minimum interval between set calls."""
-        remaining = _AUDIO_CONFIG_INTERVAL_S - (
-            time.monotonic() - self._last_config_change
-        )
-        if remaining > 0:
-            time.sleep(remaining)
 
     def _read_setting(self, key: str):
         import media_config_spec
@@ -3722,11 +3768,8 @@ class MediaConfigPlugin:
         import media_config_spec
 
         normalised = media_config_spec.validate(key, value)
-        with self._config_lock:
-            self._wait_for_config_slot()
-            setter = getattr(self._media_ctrl, media_config_spec.setter_name(key))
-            setter(normalised)
-            self._last_config_change = time.monotonic()
+        setter = getattr(self._media_ctrl, media_config_spec.setter_name(key))
+        self._config_gate.write(lambda: setter(normalised))
         return normalised
 
     def get_tool(self) -> dict:

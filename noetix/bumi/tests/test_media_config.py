@@ -168,11 +168,16 @@ class _Media:
         return self.wakeup_words
 
 
-def _plugin(monkeypatch, media):
+def _plugin(monkeypatch, media, gate=None):
     module, _ = _load_device(monkeypatch)
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    # A zero interval keeps these tests about behaviour, not about waiting.
+    # The 500 ms spacing itself is pinned by the cross-card tests below.
+    if gate is None:
+        gate = module.MediaControllerWriteGate(interval_s=0.0)
     plugin = module.MediaConfigPlugin(
-        {}, "robot", types.SimpleNamespace(add_node=lambda _: None), media)
+        {}, "robot", types.SimpleNamespace(add_node=lambda _: None), media,
+        write_gate=gate)
     return module, plugin
 
 
@@ -204,7 +209,6 @@ def test_get_reads_every_setting_including_the_read_only_wake_word(monkeypatch):
 
 def test_set_writes_and_reads_back_the_new_value(monkeypatch):
     _, plugin = _plugin(monkeypatch, _Media())
-    monkeypatch.setattr(plugin, "_wait_for_config_slot", lambda: None)
 
     result = plugin.dispatch("set_timeout", {"timeout": 60000})
 
@@ -214,7 +218,6 @@ def test_set_writes_and_reads_back_the_new_value(monkeypatch):
 
 def test_a_set_of_an_out_of_range_timeout_is_rejected_before_writing(monkeypatch):
     _, plugin = _plugin(monkeypatch, _Media())
-    monkeypatch.setattr(plugin, "_wait_for_config_slot", lambda: None)
 
     result = plugin.dispatch("set_timeout", {"timeout": 0})
 
@@ -224,7 +227,6 @@ def test_a_set_of_an_out_of_range_timeout_is_rejected_before_writing(monkeypatch
 
 def test_a_set_of_a_boolean_cue_accepts_only_real_booleans(monkeypatch):
     _, plugin = _plugin(monkeypatch, _Media())
-    monkeypatch.setattr(plugin, "_wait_for_config_slot", lambda: None)
 
     ok = plugin.dispatch("set_audio_cue", {"audio_cue": False})
     bad = plugin.dispatch("set_audio_cue", {"audio_cue": "false"})
@@ -293,3 +295,103 @@ def test_the_spec_module_reaches_the_image():
         encoding="utf-8")
 
     assert "COPY media_config_spec.py /work/media_config_spec.py" in dockerfile
+
+
+# ── the 500 ms gate belongs to the controller, not to one card ──────────────
+#
+# The vendor's limit is a minimum interval between writes to the voice unit that
+# both `speaker` (volume, route) and this card drive. Two per-card timers each
+# look free, so a volume write followed by a timeout write issue back to back —
+# the case the SDK says can crash the voice system. These tests fail if the
+# spacing state ever moves back onto a single card.
+
+class _FakeClock:
+    """A clock that only advances when something sleeps."""
+
+    def __init__(self):
+        self.now = 1_000.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class _SharedMedia(_Media):
+    """The single MediaController both cards would be handed on the robot."""
+
+    def __init__(self):
+        super().__init__()
+        self.volume = 100
+
+    def get_volume(self):
+        return self.volume
+
+    def set_volume(self, value):
+        self.set_calls.append(("volume", value))
+        self.volume = value
+
+
+def _shared_pair(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    clock = _FakeClock()
+    gate = module.MediaControllerWriteGate(clock=clock, sleep=clock.sleep)
+    media = _SharedMedia()
+    executor = types.SimpleNamespace(add_node=lambda _: None)
+    speaker = module.SpeakerPlugin({}, "robot", executor, media, write_gate=gate)
+    config = module.MediaConfigPlugin({}, "robot", executor, media, write_gate=gate)
+    return module, clock, media, speaker, config
+
+
+def test_both_cards_default_to_the_same_process_wide_gate(monkeypatch):
+    # Without this the two cards keep private timers and the next test cannot
+    # pass, so this pins the wiring rather than the mechanism.
+    module, _ = _load_device(monkeypatch)
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    executor = types.SimpleNamespace(add_node=lambda _: None)
+    media = _SharedMedia()
+
+    speaker = module.SpeakerPlugin({}, "robot", executor, media)
+    config = module.MediaConfigPlugin({}, "robot", executor, media)
+
+    assert speaker._config_gate is config._config_gate
+    assert speaker._config_gate is module.media_write_gate()
+
+
+def test_a_volume_write_then_a_config_write_keeps_the_500ms_distance(monkeypatch):
+    module, clock, media, speaker, config = _shared_pair(monkeypatch)
+
+    speaker.dispatch("set_volume", {"volume": 50})
+    wrote_at = clock.now
+    config.dispatch("set_timeout", {"timeout": 60000})
+
+    assert ("volume", 50) in media.set_calls
+    assert ("timeout", 60000) in media.set_calls
+    assert clock.now - wrote_at >= module._AUDIO_CONFIG_INTERVAL_S - 1e-9
+
+
+def test_the_shared_gate_delays_a_second_card_not_just_a_second_call(monkeypatch):
+    module, clock, media, speaker, config = _shared_pair(monkeypatch)
+    interval = module._AUDIO_CONFIG_INTERVAL_S
+
+    config.dispatch("set_timeout", {"timeout": 60000})
+    wrote_at = clock.now
+    speaker.dispatch("set_volume", {"volume": 70})
+
+    assert clock.now - wrote_at >= interval - 1e-9
+
+
+def test_a_skipped_write_costs_neither_a_delay_nor_a_slot(monkeypatch):
+    # `speaker`'s start path read-backs the route and skips the write when it is
+    # already open; that must not push the next real write 500 ms out.
+    module, clock, media, speaker, config = _shared_pair(monkeypatch)
+
+    media.audio_cue = True
+    assert speaker._set_config("get_audio_cue_enable",
+                              "set_audio_cue_enable", True) is False
+
+    wrote_at = clock.now
+    config.dispatch("set_timeout", {"timeout": 60000})
+    assert clock.now - wrote_at < module._AUDIO_CONFIG_INTERVAL_S
