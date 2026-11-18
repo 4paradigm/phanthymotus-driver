@@ -164,6 +164,47 @@ def test_interval_rejects_bad_values(value):
         timer_card.parse_interval(value)
 
 
+def test_config_is_accepted_and_sets_default_interval(monkeypatch):
+    # Agent Core sends `config` on save, before start and on reconnect; an
+    # unhandled action surfaced as `Unknown tool: timer`.
+    plugin, node = _plugin(monkeypatch)
+    result = plugin.dispatch("config", {"interval_s": 0.05, "input_topic": "ignored"})
+    assert result["state"] == "configured"
+    assert result["default_interval_s"] == 0.05
+    assert plugin.dispatch("config", {})["state"] == "configured"
+    assert plugin.get_tool()["inputSchema"]["properties"]["interval_s"]["default"] == 0.05
+    assert plugin.dispatch("info", {})["ticking"] is False
+    assert node.payloads == []
+    begun = plugin.dispatch("begin", {"label": "cfg"})
+    assert begun["interval_s"] == 0.05
+    plugin.dispatch("stop", {})
+
+
+def test_config_rejects_bad_interval():
+    node = FakeNode("/robot/timer/events")
+    plugin = timer_card.TimerPlugin({}, "robot", FakeExecutor(),
+                                    node_factory=lambda topic: node)
+    result = plugin.dispatch("config", {"interval_s": True})
+    assert result["state"] == "error"
+    assert plugin.dispatch("config", {"interval_s": 60})["state"] == "configured"
+
+
+def test_bundle_answers_config_for_timer(monkeypatch):
+    from test_mic_card import _load_device
+    import importlib
+    _load_device(monkeypatch)
+    reloaded = importlib.reload(timer_card)
+    monkeypatch.setitem(sys.modules, "timer_card", reloaded)
+    monkeypatch.setitem(sys.modules, "rclpy.executors", types.ModuleType("rclpy.executors"))
+    spec = importlib.util.spec_from_file_location("bumi_timer_cfg_test", BUNDLE / "main.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    bundle = module.BumiDeviceBundle({"plugins": {"timer": {"enabled": True}}}, "robot",
+                                     FakeExecutor(), None, object())
+    # main.py turns a None dispatch result into JSON-RPC -32601 "Unknown tool".
+    assert bundle.dispatch("timer", {"action": "config", "interval_s": 30}) is not None
+
+
 def test_tool_schema_and_topic():
     node = FakeNode("/robot/timer/events")
     plugin = timer_card.TimerPlugin({}, "robot", FakeExecutor(),

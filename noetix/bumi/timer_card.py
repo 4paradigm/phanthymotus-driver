@@ -383,6 +383,18 @@ class TimerPlugin:
             self._core.stop()
             self._armed = False
             return self._lifecycle()
+        if action == "config":
+            # Agent Core sends this when the panel saves the card's config, and
+            # again before every project start and on reconnect. Returning None
+            # here made the bundle answer `Unknown tool: timer`, which blocked
+            # both saving and starting. Other keys (start-path extras) are ignored.
+            if "interval_s" in args:
+                try:
+                    self._default_interval = parse_interval(args["interval_s"])
+                except ValueError as exc:
+                    return {"state": "error", "error": str(exc)}
+            return self._lifecycle({"state": "configured",
+                                    "default_interval_s": self._default_interval})
         if action == "info":
             return self._lifecycle()
         return None

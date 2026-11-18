@@ -470,6 +470,7 @@ Actions:
 | `begin` | start ticking; params `interval_s` (1–3600), `label`, `max_ticks` (0 = unlimited) |
 | `halt` | stop ticking, stay armed (`running`, `ticking: false`) |
 | `stop` | stop ticking and disarm (`idle`) |
+| `config` | sent by Agent Core when the panel saves the card, before every project start and on reconnect; sets the default `interval_s` and answers `configured` |
 | `info` | lifecycle `running`/`idle`, plus `ticking`, `timer_state` (running/idle/finished), timer_id, tick, elapsed and next tick |
 
 `start` deliberately does not begin ticking. The canvas sends `start` when a
