@@ -15,6 +15,7 @@ build_context_extras:
 # tool of its own, and ext_devices.py's ExtCameraPlugin is dead code (never
 # registered in main.py, no `ext_camera` key in config.yaml) so it is excluded.
 cards:
+  - { name: fanshi_group_send,  type: actuator }
   - { name: joints,             type: sensor }
   - { name: battery,            type: sensor }
   - { name: estop,              type: sensor }

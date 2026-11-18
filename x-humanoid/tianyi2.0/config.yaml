@@ -25,6 +25,8 @@ slamtec:
   base_url: "http://192.168.11.1:1448"
 
 plugins:
+  fanshi_group_send:
+    enabled: true
   state:
     enabled: true
   camera:
