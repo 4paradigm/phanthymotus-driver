@@ -88,6 +88,26 @@ plugins:
     max_rotation_residual: 0.05     # rad
   state:
     enabled: true
+  telemetry_recorder:
+    # Experimental: enable only after site topic/storage verification.
+    enabled: false
+    output_dir: /opt/phanthy-motus/data/telemetry_recorder
+    buffer_s: 30
+    pre_s: 10
+    post_s: 5
+    max_buffer_bytes: 4000000
+    max_clip_bytes: 4000000
+    max_message_bytes: 65536
+    max_samples: 10000
+    max_pending: 2
+    max_disk_bytes: 64000000
+    max_clips: 100
+    # Empty by default. Opt-in candidates from existing SmartMotion events:
+    # [safety_stop, safety_stop_failed, motion_stop_failed, joint_overheat]
+    auto_events: []
+    cooldown_s: 10
+    # Topic defaults use /<resolved ros_namespace>/state/{imu,joints,battery}
+    # and /<resolved ros_namespace>/safety/motion_events; override if verified.
   camera:
     enabled: true
   vision_capture:
