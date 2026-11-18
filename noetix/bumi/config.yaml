@@ -93,3 +93,9 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+  emergency_response:
+    enabled: true
+    # Robot-local append-only journal. Authentication and external notification
+    # remain Agent Core / dispatch-system responsibilities.
+    output_dir: /opt/phanthy-motus/data/emergency_response
+    max_records: 200

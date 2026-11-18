@@ -123,6 +123,7 @@ class BumiDeviceBundle:
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
         loco_plugin = None
+        vision_capture_plugin = None
         # The camera subprocess reads this env var; set it before any plugin can
         # start that subprocess, so the raw RGB-D branch is published only when
         # the visual odometry card is enabled.
@@ -200,9 +201,18 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("vision_capture", {}).get("enabled", False):
             from device import VisionCapturePlugin
-            self._plugins.append(VisionCapturePlugin(
-                plugins_cfg["vision_capture"], camera_plugin))
+            vision_capture_plugin = VisionCapturePlugin(
+                plugins_cfg["vision_capture"], camera_plugin)
+            self._plugins.append(vision_capture_plugin)
             print("[bundle] VisionCapturePlugin loaded")
+
+        if plugins_cfg.get("emergency_response", {}).get("enabled", False):
+            from emergency_response import EmergencyResponsePlugin
+            self._plugins.append(EmergencyResponsePlugin(
+                plugins_cfg["emergency_response"], namespace, executor,
+                loco_plugin=loco_plugin,
+                vision_capture_plugin=vision_capture_plugin))
+            print("[bundle] EmergencyResponsePlugin loaded")
 
     def start_all(self) -> None:
         failed = 0
