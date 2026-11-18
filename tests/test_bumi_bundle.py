@@ -25,6 +25,7 @@ class FakeLocoPlugin:
         self.executor = executor
         self.high_ctrl = high_ctrl
         self.servo = None
+        self._enable_unconfirmed = False
         self.started = False
         self.stopped = False
 
@@ -130,7 +131,7 @@ def test_loco_servo_enablement_is_not_coupled_to_loco_card(bundle_module):
         _config(loco=False), "bumi_test", object(), FakeHighCtrl(), None)
 
     assert [tool["name"] for tool in bundle.get_all_tools()] == ["loco_servo"]
-    assert bundle._plugins[0]._loco is None
+    assert isinstance(bundle._plugins[0]._loco, FakeLocoPlugin)
 
 
 @pytest.mark.parametrize(

@@ -18,27 +18,17 @@ def _get_default_cmd():
 
 
 class MotorEnablePlugin:
-    def __init__(self, plugin_config: dict, namespace: str, executor, high_ctrl):
+    def __init__(self, plugin_config: dict, namespace: str, executor, high_ctrl, *, chassis_owner):
         self._high_ctrl = high_ctrl
+        self._owner = chassis_owner
         self._action_lock = threading.Lock()
-        self._lock = threading.Lock()
-        self._last_cmd_time = 0.0
         self._enable_cancel = threading.Event()
-        self._enable_unconfirmed = False
 
     def start(self) -> None:
         pass
 
     def stop(self) -> None:
         self._enable_cancel.set()
-
-    def _publish_cmd(self, x, y, z, action, index):
-        with self._lock:
-            delay = 0.002 - (time.monotonic() - self._last_cmd_time)
-            if delay > 0:
-                time.sleep(delay)
-            self._high_ctrl.publish_cmd(x, y, z, action, index)
-            self._last_cmd_time = time.monotonic()
 
     def get_tool(self) -> dict:
         return {
@@ -79,7 +69,7 @@ class MotorEnablePlugin:
                 return {"state": "error", "command_sent": False, "error": str(exc)}
             return {"state": "completed", "command_sent": False,
                     "workmode": mode, "workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
-                    "enable_unconfirmed": self._enable_unconfirmed}
+                    "enable_unconfirmed": self._owner._enable_unconfirmed}
         if args.get("confirm") is not True:
             return {"state": "error", "command_sent": False, "code": "CONFIRM_REQUIRED",
                     "error": "Confirm safe face-up placement and a clear joint movement area before enabling."}
@@ -88,7 +78,17 @@ class MotorEnablePlugin:
                     "error": "An enable request is already active."}
         try:
             self._enable_cancel.clear()
-            return self._enable_motors()
+            if not self._owner.reserve_motor_enable():
+                return {"state": "error", "command_sent": False, "code": "CHASSIS_BUSY",
+                        "error": "Another chassis action is active."}
+            try:
+                self._owner.pause_servo_for_motor_enable()
+                return self._enable_motors()
+            finally:
+                try:
+                    self._owner._set_servo_velocity_owner(False)
+                finally:
+                    self._owner.release_motor_enable()
         finally:
             self._action_lock.release()
 
@@ -98,37 +98,31 @@ class MotorEnablePlugin:
         try:
             mode = int(self._high_ctrl.get_mode())
             if mode == 0:
-                self._enable_unconfirmed = False
+                self._owner._enable_unconfirmed = False
                 return {"state": "completed", "command_sent": False, "confirmed": True,
                         "workmode": 0, "workmode_name": "enabled", "message": "Already enabled."}
             if mode != 30:
                 return self._enable_mode_error(mode)
-            if self._enable_unconfirmed:
+            if self._owner._enable_unconfirmed:
                 return {"state": "error", "command_sent": False, "code": "ENABLE_UNCONFIRMED",
                         "error": "Previous START delivery is uncertain. Inspect the robot and motion_state; START will not be resent."}
-            with self._lock:
-                delay = 0.002 - (time.monotonic() - self._last_cmd_time)
-                if delay > 0:
-                    time.sleep(delay)
-                if self._enable_cancel.is_set():
-                    return {"state": "cancelled", "command_sent": False}
-                mode = int(self._high_ctrl.get_mode())
-                if mode != 30:
-                    return self._enable_mode_error(mode)
-                command = _get_control_cmd("START")
-                self._enable_unconfirmed = True
-                attempted = True
-                self._high_ctrl.publish_cmd(0, 0, 0, command, 0)
-                self._last_cmd_time = time.monotonic()
+            try:
+                mode = self._owner.publish_enable_if_disabled(self._enable_cancel)
+            finally:
+                attempted = self._owner._enable_unconfirmed
+            if mode is None:
+                return {"state": "cancelled", "command_sent": False}
+            if mode != 30:
+                return self._enable_mode_error(mode)
             # Release the event even if stop arrives after START. Never toggle
             # START again to cancel or compensate for missing feedback.
             time.sleep(0.01)
-            self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
+            self._owner._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
             deadline = time.monotonic() + 3.0
             while True:
                 mode = int(self._high_ctrl.get_mode())
                 if mode == 0:
-                    self._enable_unconfirmed = False
+                    self._owner._enable_unconfirmed = False
                     return {"state": "completed", "command_sent": True, "confirmed": True,
                             "workmode": 0, "workmode_name": "enabled",
                             "message": "Enabled mode observed. This does not confirm joint settling or standing."}

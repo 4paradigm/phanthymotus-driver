@@ -8,6 +8,8 @@ import yaml
 
 import importlib.util
 
+from test_loco_destination import _load_device
+
 
 class Controller:
     def __init__(self, mode=30, next_mode=0):
@@ -33,7 +35,11 @@ def card(monkeypatch):
     monkeypatch.setattr(module, "_get_control_cmd", lambda name: name)
     monkeypatch.setattr(module, "_get_default_cmd", lambda: "DEFAULT")
     ctrl = Controller()
-    plugin = module.MotorEnablePlugin({}, "test", None, ctrl)
+    device, _ = _load_device(monkeypatch)
+    monkeypatch.setattr(device, "_get_control_cmd", lambda name: name)
+    monkeypatch.setattr(device, "_get_default_cmd", lambda: "DEFAULT")
+    owner = device.LocoPlugin({}, "test", None, ctrl)
+    plugin = module.MotorEnablePlugin({}, "test", None, ctrl, chassis_owner=owner)
     return module, plugin, ctrl
 
 
@@ -118,10 +124,11 @@ def test_timeout_blocks_blind_retry(card, monkeypatch):
     monkeypatch.setattr(plugin._enable_cancel, "wait", lambda _: clock.__setitem__(0, clock[0] + 1))
     assert call(plugin, confirm=True)["code"] == "ENABLE_TIMEOUT"
     assert call(plugin, confirm=True)["code"] == "ENABLE_UNCONFIRMED"
+    assert plugin._owner._prepare_workmode(1, "stand_up")["state"] == "error"
     assert [c[3] for c in ctrl.commands] == ["START", "DEFAULT"]
     ctrl.mode = 0  # Delayed acknowledgement: no second START is necessary.
     assert call(plugin, confirm=True)["confirmed"] is True
-    assert plugin._enable_unconfirmed is False
+    assert plugin._owner._enable_unconfirmed is False
     assert len(ctrl.commands) == 2
 
 
@@ -164,6 +171,42 @@ def test_concurrent_enable_calls_are_serialized(card, monkeypatch):
         worker.join(2)
     assert not worker.is_alive()
     assert results[0]["state"] == "completed"
+    assert [c[3] for c in ctrl.commands] == ["START", "DEFAULT"]
+
+
+def test_enable_reserves_chassis_and_pauses_stream(card, monkeypatch):
+    _, plugin, ctrl = card
+    entered, release = threading.Event(), threading.Event()
+    class Servo:
+        paused = False
+        owned = False
+        def pause_for_explicit_command(self, reason):
+            self.paused = True
+            return True
+        def set_explicit_velocity_owner(self, value):
+            self.owned = value
+    servo = Servo()
+    plugin._owner.attach_servo(servo)
+    publish = ctrl.publish_cmd
+    def wait_before_publish(*args):
+        if args[3] == "START":
+            assert servo.paused and servo.owned
+            entered.set()
+            assert release.wait(2)
+        publish(*args)
+    monkeypatch.setattr(ctrl, "publish_cmd", wait_before_publish)
+    worker = threading.Thread(target=lambda: call(plugin, confirm=True))
+    worker.start()
+    try:
+        assert entered.wait(2)
+        result = plugin._owner.dispatch("stand_up", {"_tool_name": "stand_up_lie_prone"})
+        assert result["state"] == "error"
+        assert result["command_sent"] is False
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert not servo.owned
     assert [c[3] for c in ctrl.commands] == ["START", "DEFAULT"]
 
 
