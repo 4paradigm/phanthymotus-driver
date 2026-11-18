@@ -160,6 +160,8 @@ def validate_joint_target(
     limits: dict[str, tuple[float, float]],
     current: dict[str, float],
     max_delta_rad: Optional[float],
+    commanded_joint_names=None,
+    hold_limit_tolerance_rad: float = 0.0,
 ) -> list[float]:
     target = finite_vector(positions, "positions", len(joint_names))
     missing_limits = [name for name in joint_names if name not in limits]
@@ -175,8 +177,32 @@ def validate_joint_target(
         max_delta = finite_number(max_delta_rad, "max_delta_rad")
         if max_delta <= 0:
             raise ValueError("max_delta_rad must be positive")
-    for name, value in zip(joint_names, target):
+    commanded = (set(joint_names) if commanded_joint_names is None
+                 else set(commanded_joint_names))
+    unknown_commanded = commanded.difference(joint_names)
+    if unknown_commanded:
+        raise ValueError("unknown commanded joints: " + ", ".join(sorted(unknown_commanded)))
+    hold_tolerance = finite_number(hold_limit_tolerance_rad, "hold_limit_tolerance_rad")
+    if hold_tolerance < 0:
+        raise ValueError("hold_limit_tolerance_rad must not be negative")
+    for index, (name, value) in enumerate(zip(joint_names, target)):
         lower, upper = limits[name]
+        if name not in commanded and not lower <= value <= upper:
+            distance = lower - value if value < lower else value - upper
+            if distance <= hold_tolerance:
+                # A partial command must still send a complete trajectory. A
+                # held joint can sit just beyond its nominal URDF boundary due
+                # to encoder/zero-point noise; bring only that implicit hold
+                # target back to the nearest hard limit. Explicit user targets
+                # never receive this tolerance.
+                value = min(max(value, lower), upper)
+                target[index] = value
+            else:
+                raise ValueError(
+                    f"{name} current position {math.degrees(value):.2f} deg is outside URDF limit "
+                    f"[{math.degrees(lower):.2f}, {math.degrees(upper):.2f}] deg; "
+                    "calibration or recovery is required"
+                )
         if not lower <= value <= upper:
             raise ValueError(
                 f"{name} target {math.degrees(value):.2f} deg is outside URDF limit "

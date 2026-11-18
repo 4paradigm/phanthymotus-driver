@@ -288,7 +288,13 @@ def build_plugins(config, namespace, device):
             ["start", "info", "move", "move_separate", "home", "stop"],
             {
                 "side": {"type": "string", "enum": ["left", "right", "both"], "default": "left",
-                         "description": "left, right, or mirrored both arms"},
+                         "title": "Arm selection",
+                         "oneOf": [
+                             {"const": "left", "title": "Left arm"},
+                             {"const": "right", "title": "Right arm"},
+                             {"const": "both", "title": "Both arms (mirrored)"},
+                         ],
+                         "description": "Choose one arm, or mirror the same pose to both arms"},
                 **shared_joint_fields,
                 **separate_joint_fields,
                 "positions_deg": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8,
@@ -297,7 +303,8 @@ def build_plugins(config, namespace, device):
                                        "description": "8 left-arm targets in deg; live URDF limits"},
                 "right_positions_deg": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8,
                                         "description": "8 right-arm targets in deg; live URDF limits"},
-                "duration_s": {"type": "number", "minimum": 1.0, "maximum": enabled["arm_control"]["max_duration_s"],
+                "duration_s": {"type": "number", "title": "Duration (s)",
+                               "minimum": 1.0, "maximum": enabled["arm_control"]["max_duration_s"],
                                "description": f"[1, {enabled['arm_control']['max_duration_s']:g}] s"},
             },
             {"move": {"params": ["side", *shared_joint_fields, "duration_s"],
@@ -312,7 +319,26 @@ def build_plugins(config, namespace, device):
             {"actions": ["move", "move_separate", "home"], "timeout": enabled["arm_control"]["max_duration_s"] + 15},
             True,
         )
-        plugins.append(ActuatorPlugin(device, "arm_control", "Safe P2P arm control with verified controller switching", schema, device.arm))
+        schema["properties"]["action"].update(
+            title="Action",
+            default="move",
+            oneOf=[
+                {"const": "move", "title": "Move selected arm(s)"},
+                {"const": "move_separate", "title": "Move both arms independently"},
+                {"const": "home", "title": "Return to home pose"},
+                {"const": "stop", "title": "Stop arm motion"},
+                {"const": "start", "title": "Check readiness"},
+                {"const": "info", "title": "View status"},
+            ],
+        )
+        plugins.append(ActuatorPlugin(
+            device,
+            "arm_control",
+            "Move either arm, mirror one 8-joint pose to both arms, or control both arms independently. "
+            "Angles are in degrees and enforced against vendor URDF limits.",
+            schema,
+            device.arm,
+        ))
     if on("gripper"):
         schema = _action_schema(
             ["start", "info", "set", "open", "close", "stop"],

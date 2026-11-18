@@ -140,6 +140,14 @@ class PantherDriverTest(unittest.TestCase):
                          "Left Shoulder Rotation (deg)")
         self.assertEqual(arm["properties"]["ra7_deg"]["title"],
                          "Right Wrist 3 (deg)")
+        self.assertEqual(arm["properties"]["action"]["title"], "Action")
+        self.assertEqual(arm["properties"]["side"]["title"], "Arm selection")
+        self.assertEqual(arm["properties"]["duration_s"]["title"], "Duration (s)")
+        self.assertEqual(
+            arm["properties"]["action"]["oneOf"][0],
+            {"const": "move", "title": "Move selected arm(s)"},
+        )
+        self.assertIn("vendor URDF limits", tools["arm_control"]["description"])
         gripper = tools["gripper"]["inputSchema"]
         self.assertEqual(gripper["properties"]["side"]["enum"], ["left", "right", "both"])
         self.assertTrue({"set", "open", "close", "stop"} <= set(gripper["properties"]["action"]["enum"]))
@@ -250,7 +258,7 @@ class PantherDriverTest(unittest.TestCase):
         )
 
     def test_arm_runtime_builds_mirrored_and_independent_targets(self):
-        def run(arguments):
+        def run(arguments, positions=None, model_limits=None):
             device = object.__new__(device_module.PantherDevice)
             device._cfg = {"plugins": {"arm_control": {
                 "max_duration_s": 20.0, "min_duration_s": 1.0,
@@ -260,9 +268,13 @@ class PantherDriverTest(unittest.TestCase):
             device._arm_lock = threading.RLock()
             device._arm_active = None
             names = [*contracts.LEFT_ARM_JOINTS, *contracts.RIGHT_ARM_JOINTS]
-            device._model_joint_limits = dict.fromkeys(names, (-math.pi, math.pi))
+            device._model_joint_limits = (model_limits or
+                                          dict.fromkeys(names, (-math.pi, math.pi)))
             device._joint_limits = dict.fromkeys(names, (-math.pi, math.pi))
-            joint_msg = SimpleNamespace(name=names, position=[0.0] * len(names))
+            initial = [0.0] * len(names)
+            for name, value in (positions or {}).items():
+                initial[names.index(name)] = value
+            joint_msg = SimpleNamespace(name=names, position=initial)
             device._cache = {"joints": (joint_msg, time.monotonic())}
             device._ensure_motion_ready = lambda: None
             captured = {}
@@ -292,6 +304,17 @@ class PantherDriverTest(unittest.TestCase):
         separate = run({"action": "move_separate", "la0_deg": 6.0, "ra0_deg": 8.0})
         self.assertAlmostEqual(math.degrees(separate["left"][0]), 6.0)
         self.assertAlmostEqual(math.degrees(separate["right"][0]), 8.0)
+
+        vendor_limits = contracts.parse_joint_limits(
+            (DRIVER / "resource" / "panther.urdf").read_text()
+        )
+        partial = run(
+            {"action": "move", "side": "left", "j0_deg": 3.0},
+            positions={"joint_la2": math.radians(-0.08)},
+            model_limits=vendor_limits,
+        )
+        self.assertAlmostEqual(math.degrees(partial["left"][0]), 3.0)
+        self.assertEqual(partial["left"][2], 0.0)
 
     def test_imu_keeps_finite_vectors_when_zero_covariance_has_no_truth_value(self):
         class Covariance:
@@ -453,6 +476,39 @@ class PantherDriverTest(unittest.TestCase):
                 ("joint_la0",), [0.8], {"joint_la0": (-1.0, 1.0)}, {"joint_la0": 0.0}, 0.35
             )
 
+    def test_partial_arm_target_clamps_small_implicit_hold_limit_error(self):
+        names = ("joint_la0", "joint_la2")
+        limits = {"joint_la0": (-1.0, 1.0), "joint_la2": (0.0, 1.0)}
+        current = {"joint_la0": 0.0, "joint_la2": math.radians(-0.08)}
+        target = contracts.validate_joint_target(
+            names,
+            [math.radians(3.0), current["joint_la2"]],
+            limits,
+            current,
+            math.radians(20.0),
+            commanded_joint_names={"joint_la0"},
+            hold_limit_tolerance_rad=math.radians(0.5),
+        )
+        self.assertAlmostEqual(math.degrees(target[0]), 3.0)
+        self.assertEqual(target[1], 0.0)
+
+    def test_partial_arm_target_keeps_explicit_and_large_limit_errors_strict(self):
+        limits = {"joint_la2": (0.0, 1.0)}
+        current = {"joint_la2": math.radians(-0.08)}
+        with self.assertRaisesRegex(ValueError, "target -0.08 deg"):
+            contracts.validate_joint_target(
+                ("joint_la2",), [current["joint_la2"]], limits, current,
+                math.radians(20.0), commanded_joint_names={"joint_la2"},
+                hold_limit_tolerance_rad=math.radians(0.5),
+            )
+        far_current = {"joint_la2": math.radians(-2.0)}
+        with self.assertRaisesRegex(ValueError, "calibration or recovery"):
+            contracts.validate_joint_target(
+                ("joint_la2",), [far_current["joint_la2"]], limits, far_current,
+                math.radians(20.0), commanded_joint_names=set(),
+                hold_limit_tolerance_rad=math.radians(0.5),
+            )
+
     def test_drive_caps_and_finite_duration(self):
         config = {"max_linear_mps": 0.5, "max_angular_deg_s": 45.0, "max_duration_s": 10.0}
         command = contracts.validate_drive(
@@ -521,7 +577,7 @@ class PantherDriverTest(unittest.TestCase):
             "    def _run_arm", 1
         )[0]
         self.assertNotIn('step_limit = None if action == "home"', arm)
-        self.assertIn("current, max_delta)", arm)
+        self.assertIn("current, max_delta,", arm)
 
     def test_manifest_lists_expected_cards(self):
         driver_text = (DRIVER / "driver.yaml").read_text()

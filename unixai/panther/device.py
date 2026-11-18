@@ -1166,6 +1166,7 @@ class PantherDevice:
             raise RuntimeError("fresh /joint_states is required")
         current = {name: value for name, value in zip(joint_msg.name, joint_msg.position)}
         max_delta = math.radians(float(cfg["max_target_delta_deg"]))
+        hold_limit_tolerance = math.radians(float(cfg.get("hold_limit_tolerance_deg", 0.5)))
         targets: dict[str, list[float]] = {}
 
         shared_updates = {
@@ -1179,6 +1180,7 @@ class PantherDevice:
             legacy = args.get(legacy_field)
             if legacy is not None:
                 values = degrees_vector_to_radians(legacy, legacy_field, len(names))
+                commanded_names = set(names)
             elif action == "home":
                 home = cfg.get("home_pose_deg")
                 if not isinstance(home, dict) or not home:
@@ -1186,6 +1188,7 @@ class PantherDevice:
                 values = [current.get(name) if home.get(name) is None
                           else math.radians(finite_number(home[name], f"home_pose_deg.{name}"))
                           for name in names]
+                commanded_names = {name for name in names if home.get(name) is not None}
             elif action == "move" and shared_updates:
                 updates = {
                     name: math.radians(
@@ -1197,6 +1200,7 @@ class PantherDevice:
                     if index in shared_updates
                 }
                 values = [updates.get(name, current.get(name)) for name in names]
+                commanded_names = set(updates)
             else:
                 prefix = "la" if arm_side == "left" else "ra"
                 updates = {
@@ -1210,13 +1214,18 @@ class PantherDevice:
                         raise ValueError("at least one j0_deg..j7_deg target is required")
                     raise ValueError(f"at least one {prefix}0_deg..{prefix}7_deg target is required")
                 values = [updates.get(name, current.get(name)) for name in names]
+                commanded_names = set(updates)
             # Home is subject to the same per-command delta gate as every
             # other arm target until the candidate pose is independently
             # commissioned on hardware.
             effective_limits = intersect_joint_limits(
                 names, self._model_joint_limits, self._joint_limits
             )
-            return validate_joint_target(names, values, effective_limits, current, max_delta)
+            return validate_joint_target(
+                names, values, effective_limits, current, max_delta,
+                commanded_joint_names=commanded_names,
+                hold_limit_tolerance_rad=hold_limit_tolerance,
+            )
 
         if side in ("left", "both"):
             targets["left"] = target_for("left", LEFT_ARM_JOINTS)
