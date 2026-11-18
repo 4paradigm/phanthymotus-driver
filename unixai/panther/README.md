@@ -128,10 +128,11 @@ the runtime but are not shown in the ordinary canvas form. Each form field
 states the corresponding vendor-URDF range; shared fields show separate
 left/`both` and right ranges where they differ. Every completed target is
 checked against the vendor/live limit intersection before an action is queued.
-The canvas uses English semantic titles (`Shoulder Rotation`, `Shoulder
-Abduction`, `Shoulder Raise`, `Elbow Rotation`, `Elbow Flexion/Extension`, and
-`Wrist 1` through `Wrist 3`) while retaining the existing parameter keys for
-API compatibility.
+The canvas uses short English semantic fields (`shoulder_rot`, `shoulder_abd`,
+`shoulder_raise`, `elbow_rot`, `elbow_flex`, and `wrist_1` through `wrist_3`).
+Independent-arm fields add an `l_` or `r_` prefix. Their compact descriptions
+put the degree range first so narrow cards show the safety limit. The old
+`j0_deg`/`la0_deg`/`ra0_deg`-style keys remain accepted as hidden API aliases.
 
 ## Deliberately deferred
 

@@ -10,6 +10,18 @@ from typing import Optional
 
 LEFT_ARM_JOINTS = tuple(f"joint_la{i}" for i in range(8))
 RIGHT_ARM_JOINTS = tuple(f"joint_ra{i}" for i in range(8))
+# Short canvas/API field names. Values remain degrees; the range description
+# carries the unit so the narrow card does not waste label width on ``_deg``.
+ARM_JOINT_FIELDS = (
+    "shoulder_rot",
+    "shoulder_abd",
+    "shoulder_raise",
+    "elbow_rot",
+    "elbow_flex",
+    "wrist_1",
+    "wrist_2",
+    "wrist_3",
+)
 # Mirror across Panther's sagittal (XZ) plane.  Rotations around the vendor
 # URDF's X/Z axes reverse sign; rotations around Y retain their sign.
 ARM_MIRROR_SIGNS = (-1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0)

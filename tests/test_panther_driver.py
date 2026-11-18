@@ -141,39 +141,33 @@ class PantherDriverTest(unittest.TestCase):
         self.assertIn("+left", base["properties"]["linear_y"]["description"])
         arm = tools["arm_control"]["inputSchema"]
         self.assertTrue({"move", "move_separate", "home", "stop"} <= set(arm["properties"]["action"]["enum"]))
-        self.assertTrue({"j0_deg", "j7_deg", "la0_deg", "la7_deg", "ra0_deg", "ra7_deg"} <= set(arm["properties"]))
+        self.assertTrue({"shoulder_rot", "wrist_3", "l_shoulder_rot", "l_wrist_3",
+                         "r_shoulder_rot", "r_wrist_3"} <= set(arm["properties"]))
         self.assertEqual(
             arm["x-action-params"]["move"]["params"],
-            ["side", *[f"j{i}_deg" for i in range(8)], "duration_s"],
+            ["side", *contracts.ARM_JOINT_FIELDS, "duration_s"],
         )
         self.assertEqual(
             arm["x-action-params"]["move_separate"]["params"],
-            [*[f"la{i}_deg" for i in range(8)], *[f"ra{i}_deg" for i in range(8)],
+            [*[f"l_{field}" for field in contracts.ARM_JOINT_FIELDS],
+             *[f"r_{field}" for field in contracts.ARM_JOINT_FIELDS],
              "duration_s"],
         )
+        self.assertTrue(arm["properties"]["j0_deg"]["x-ui-hidden"])
         self.assertNotIn("confirm_motion", arm["properties"])
-        self.assertIn(
-            "left/both [0.0, 90.0] deg, right [-90.0, 0.0] deg",
-            arm["properties"]["j2_deg"]["description"],
-        )
-        self.assertIn(
-            "vendor URDF limit [-127.8, 0.0] deg",
-            arm["properties"]["la4_deg"]["description"],
-        )
-        self.assertEqual(arm["properties"]["j4_deg"]["title"],
+        self.assertTrue(arm["properties"]["shoulder_raise"]["description"].startswith(
+            "L/B [0.0, 90.0] deg; R [-90.0, 0.0] deg;"
+        ))
+        self.assertTrue(arm["properties"]["l_elbow_flex"]["description"].startswith(
+            "Range [-127.8, 0.0] deg;"
+        ))
+        self.assertEqual(arm["properties"]["elbow_flex"]["title"],
                          "Elbow Flexion/Extension (deg)")
-        self.assertEqual(arm["properties"]["la0_deg"]["title"],
+        self.assertEqual(arm["properties"]["l_shoulder_rot"]["title"],
                          "Left Shoulder Rotation (deg)")
-        self.assertEqual(arm["properties"]["ra7_deg"]["title"],
+        self.assertEqual(arm["properties"]["r_wrist_3"]["title"],
                          "Right Wrist 3 (deg)")
-        self.assertEqual(arm["properties"]["action"]["title"], "Action")
-        self.assertEqual(arm["properties"]["side"]["title"], "Arm selection")
-        self.assertEqual(arm["properties"]["duration_s"]["title"], "Duration (s)")
-        self.assertEqual(
-            arm["properties"]["action"]["oneOf"][0],
-            {"const": "move", "title": "Move selected arm(s)"},
-        )
-        self.assertIn("vendor URDF limits", tools["arm_control"]["description"])
+        self.assertNotIn("oneOf", arm["properties"]["action"])
         gripper = tools["gripper"]["inputSchema"]
         self.assertEqual(gripper["properties"]["side"]["enum"], ["left", "right", "both"])
         self.assertTrue({"set", "open", "close", "stop"} <= set(gripper["properties"]["action"]["enum"]))
@@ -318,8 +312,8 @@ class PantherDriverTest(unittest.TestCase):
             self.assertTrue(completed.wait(1.0))
             return captured
 
-        mirrored = run({"action": "move", "side": "both", "j0_deg": 10.0,
-                        "j1_deg": 5.0, "j4_deg": -10.0})
+        mirrored = run({"action": "move", "side": "both", "shoulder_rot": 10.0,
+                        "shoulder_abd": 5.0, "elbow_flex": -10.0})
         self.assertAlmostEqual(math.degrees(mirrored["left"][0]), 10.0)
         self.assertAlmostEqual(math.degrees(mirrored["right"][0]), -10.0)
         self.assertAlmostEqual(math.degrees(mirrored["left"][1]), 5.0)
@@ -327,7 +321,8 @@ class PantherDriverTest(unittest.TestCase):
         self.assertAlmostEqual(math.degrees(mirrored["left"][4]), -10.0)
         self.assertAlmostEqual(math.degrees(mirrored["right"][4]), -10.0)
 
-        separate = run({"action": "move_separate", "la0_deg": 6.0, "ra0_deg": 8.0})
+        separate = run({"action": "move_separate", "l_shoulder_rot": 6.0,
+                        "r_shoulder_rot": 8.0})
         self.assertAlmostEqual(math.degrees(separate["left"][0]), 6.0)
         self.assertAlmostEqual(math.degrees(separate["right"][0]), 8.0)
 
@@ -335,7 +330,7 @@ class PantherDriverTest(unittest.TestCase):
             (DRIVER / "resource" / "panther.urdf").read_text()
         )
         partial = run(
-            {"action": "move", "side": "left", "j0_deg": 3.0},
+            {"action": "move", "side": "left", "shoulder_rot": 3.0},
             positions={"joint_la2": math.radians(-0.08)},
             model_limits=vendor_limits,
         )

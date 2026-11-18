@@ -19,6 +19,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from contracts import (
+    ARM_JOINT_FIELDS,
     ARM_MIRROR_SIGNS,
     HEAD_JOINTS,
     LEFT_ARM_JOINTS,
@@ -1169,11 +1170,22 @@ class PantherDevice:
         hold_limit_tolerance = math.radians(float(cfg.get("hold_limit_tolerance_deg", 0.5)))
         targets: dict[str, list[float]] = {}
 
-        shared_updates = {
-            index: finite_number(args[f"j{index}_deg"], f"j{index}_deg")
-            for index in range(8)
-            if args.get(f"j{index}_deg") is not None
-        }
+        def read_joint_value(primary: str, legacy: str):
+            primary_value = args.get(primary)
+            legacy_value = args.get(legacy)
+            if primary_value is not None and legacy_value is not None:
+                raise ValueError(f"use {primary} or legacy {legacy}, not both")
+            if primary_value is not None:
+                return finite_number(primary_value, primary)
+            if legacy_value is not None:
+                return finite_number(legacy_value, legacy)
+            return None
+
+        shared_updates = {}
+        for index, field in enumerate(ARM_JOINT_FIELDS):
+            value = read_joint_value(field, f"j{index}_deg")
+            if value is not None:
+                shared_updates[index] = value
 
         def target_for(arm_side: str, names: tuple[str, ...]) -> list[float]:
             legacy_field = "positions_deg" if side == arm_side else f"{arm_side}_positions_deg"
@@ -1203,16 +1215,16 @@ class PantherDevice:
                 commanded_names = set(updates)
             else:
                 prefix = "la" if arm_side == "left" else "ra"
-                updates = {
-                    name: math.radians(finite_number(args[f"{prefix}{index}_deg"],
-                                                     f"{prefix}{index}_deg"))
-                    for index, name in enumerate(names)
-                    if args.get(f"{prefix}{index}_deg") is not None
-                }
+                side_prefix = "l" if arm_side == "left" else "r"
+                updates = {}
+                for index, (name, field) in enumerate(zip(names, ARM_JOINT_FIELDS)):
+                    value = read_joint_value(f"{side_prefix}_{field}", f"{prefix}{index}_deg")
+                    if value is not None:
+                        updates[name] = math.radians(value)
                 if not updates:
                     if action == "move":
-                        raise ValueError("at least one j0_deg..j7_deg target is required")
-                    raise ValueError(f"at least one {prefix}0_deg..{prefix}7_deg target is required")
+                        raise ValueError("at least one arm joint target is required")
+                    raise ValueError(f"at least one {arm_side} arm joint target is required")
                 values = [updates.get(name, current.get(name)) for name in names]
                 commanded_names = set(updates)
             # Home is subject to the same per-command delta gate as every
