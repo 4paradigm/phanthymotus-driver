@@ -31,10 +31,6 @@ URDF_PATH = BUNDLE / "resource" / "bumi_model.urdf"
 CONFIG_PATH = BUNDLE / "config.yaml"
 DEVICE_PATH = BUNDLE / "device.py"
 
-# The optical→body rotation, as declared in config.yaml (xyzw).
-_CALIBRATION_QUATERNION = (-0.5, 0.5, -0.5, 0.5)
-
-
 def _parse_urdf() -> ET.Element:
     return ET.parse(URDF_PATH).getroot()
 
@@ -128,11 +124,24 @@ def test_the_optical_frame_rotation_matches_the_calibration_quaternion():
     rpy = tuple(float(v) for v in origin.get("rpy").split())
 
     got = _rpy_to_quaternion(rpy)
-    # Quaternions are equal up to an overall sign.
-    for a, b in zip(got, _CALIBRATION_QUATERNION):
-        assert abs(a - b) < 1e-9 or abs(a + b) < 1e-9, (
-            f"rpy {rpy} → quaternion {got} does not match {_CALIBRATION_QUATERNION}"
-        )
+
+    config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    want = tuple(
+        config["plugins"]["visual_odometry"]["calibration"]["camera_to_body"][
+            "quaternion"]
+    )
+
+    # Quaternions are equal up to one *global* sign flip. Compare the whole
+    # tuple at once — a per-component sign tolerance would also admit mixed
+    # signs such as (0.5, 0.5, 0.5, 0.5), which is a different orientation.
+    got_neg = tuple(-v for v in got)
+    assert _close_quat(got, want) or _close_quat(got_neg, want), (
+        f"rpy {rpy} → quaternion {got} does not match {want}"
+    )
+
+
+def _close_quat(a: tuple, b: tuple, tol: float = 1e-9) -> bool:
+    return all(abs(x - y) < tol for x, y in zip(a, b))
 
 
 # ── 4. the mount translation matches the calibration translation ─────────────
