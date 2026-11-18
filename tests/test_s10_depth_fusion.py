@@ -96,10 +96,48 @@ def test_fusion_does_not_generate_depth_below_the_configured_minimum():
     assert np.frombuffer(zlib.decompress(output), dtype='<u2')[0] == 0
 
 
+def test_near_completion_requires_metric_support_from_original_points():
+    raw = np.zeros((480, 640), dtype=np.uint16)
+    raw[::16, ::16] = 2000
+    mono = np.full_like(raw, 2000)
+    mono[220:229, [100, 200, 300, 410]] = 200
+    # Keep these independent local measurements out of the global fit.
+    raw[224, [198, 199, 201]] = 420
+    raw[224, [298, 299, 301]] = 200
+    raw[224, [408, 409, 411, 412]] = [150, 150, 250, 250]
+    mono[(raw > 0) & (raw < 500)] = 0
+    local = raw.copy()
+    local[225, 300] = 203
+
+    output, _ = fuse_depth(packet(raw), packet(local), packet(mono))
+    result = np.frombuffer(zlib.decompress(output), dtype='<u2').reshape(raw.shape)
+    assert result[224, 100] == 0
+    assert result[224, 200] == 0
+    assert result[224, 300] == 200
+    assert result[225, 300] == 203
+    assert result[224, 410] == 0
+    assert np.array_equal(result[raw != 0], raw[raw != 0])
+    assert result[225, 310] == 2000
+
+
+def test_near_completion_cutoff_applies_to_published_millimetres():
+    raw = np.zeros((480, 640), dtype=np.uint16)
+    raw[::16, ::16] = 2000
+    mono = np.full_like(raw, 1999)
+    mono[224, 100:102] = [500, 501]
+
+    output, _ = fuse_depth(packet(raw), packet(raw), packet(mono))
+    result = np.frombuffer(zlib.decompress(output), dtype='<u2').reshape(raw.shape)
+    assert result[224, 100:102].tolist() == [0, 501]
+
+
 def test_near_original_measurements_remain_usable_calibration_references():
     raw, mono = scene()
     mono[:] = 150
     raw[raw != 0] = 300
     output, stats = fuse_depth(packet(raw), packet(raw), packet(mono))
-    assert np.all(np.frombuffer(zlib.decompress(output), dtype='<u2') == 300)
+    result = np.frombuffer(zlib.decompress(output), dtype='<u2').reshape(raw.shape)
+    assert np.array_equal(result[raw != 0], raw[raw != 0])
+    assert result[200, 201] == 300
+    assert result[0, 0] == 0
     assert stats['calibration_reference_pixels'] == int(np.count_nonzero(raw))

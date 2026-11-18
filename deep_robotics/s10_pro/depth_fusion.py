@@ -7,6 +7,10 @@ import numpy as np
 from deep_robotics.s10_pro import cpu_kernels
 
 
+_NEAR_COMPLETION_MM = 500
+_NEAR_RELATIVE_ERROR = .10
+
+
 def _decode(packet):
     raw = zlib.decompress(packet)
     if len(raw) != 640 * 480 * 2:
@@ -90,6 +94,20 @@ def fuse_depth(raw_packet, local_packet, mono_packet, *, min_depth_m=.1, max_dep
     valid = ((mono_mm != 0) & np.isfinite(depth)
              & (depth >= max(.001, min_depth_m)) & (depth <= max_depth_m))
     output = np.rint(np.where(valid, depth * 1000, 0)).astype('<u2')
+    near_fill = (local == 0) & (output > 0) & (output <= _NEAR_COMPLETION_MM)
+    if near_fill.any():
+        # Frame-wide holdout scores cannot validate a close extrapolation.
+        # Require nearby original returns of compatible depth. The RMS error
+        # keeps a mix of closer and farther surfaces from supporting their midpoint.
+        support = observed & (raw <= _NEAR_COMPLETION_MM * (1 + _NEAR_RELATIVE_ERROR))
+        close = np.where(support, measured, 0)
+        samples = _window_sum(support.astype(np.float64))[near_fill]
+        total = _window_sum(close)[near_fill]
+        squares = _window_sum(close**2)[near_fill]
+        candidate = depth[near_fill]
+        mean_error_sq = candidate**2 + (squares - 2 * candidate * total) / np.maximum(1, samples)
+        supported = (samples >= 3) & (mean_error_sq <= (_NEAR_RELATIVE_ERROR * candidate)**2)
+        output[near_fill] = np.where(supported, output[near_fill], 0)
     added = (local == 0) & (output != 0)
     output[local != 0] = local[local != 0]
     return zlib.compress(output.tobytes(), level=1), {
