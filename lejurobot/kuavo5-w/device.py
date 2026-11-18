@@ -35,6 +35,10 @@ DISPATCH_LOCK_TIMEOUT_S = 0.25
 ENABLE_LEASE_S = 3.0
 ENABLE_PROBE_INTERVAL_S = 1.0
 ENABLE_TOPIC = '/enable_control_state'
+HEAD_TIMEOUT_S = 20.
+# Kuavo v63 kuavo.json has narrower yaw limits than the generic SDK (80 deg).
+# Keep the 5-W card inside this conservative envelope, including held axes.
+HEAD_LIMITS_DEG = (('yaw', -30, 30), ('pitch', -25, 25))
 
 
 def _safe_log(value, limit=200):
@@ -792,7 +796,7 @@ class HeadPlugin(_KuavoPlugin):
 
     def tool(self):
         return self.schema("Kuavo 5-W 头部绝对角度，单位度；yaw/pitch两自由度，使用实测到位确认ACP。", {
-            'yaw': {'type': 'number', 'minimum': -80, 'maximum': 80, 'description': '偏航绝对角度，度；不填保持当前实测角度'},
+            'yaw': {'type': 'number', 'minimum': -30, 'maximum': 30, 'description': '偏航绝对角度，度；不填保持当前实测角度'},
             'pitch': {'type': 'number', 'minimum': -25, 'maximum': 25, 'description': '俯仰绝对角度，度；不填保持当前实测角度'},
         }, {'move_pos': (['yaw', 'pitch'], '设置头部绝对角度，度；至少填一个，未填保持当前角度'),
             'zero': ([], '头部yaw/pitch绝对角度归零'),
@@ -802,7 +806,7 @@ class HeadPlugin(_KuavoPlugin):
         if action not in ('move_pos', 'zero'):
             raise ValueError(f'unknown action: {action}; use move_pos with absolute yaw/pitch in degrees')
         updates = {i: 0. if action == 'zero' else _number(args[field], field, low, high)
-                   for i, (field, low, high) in enumerate((('yaw', -80, 80), ('pitch', -25, 25)))
+                   for i, (field, low, high) in enumerate(HEAD_LIMITS_DEG)
                    if action == 'zero' or _angle_supplied(args, field)}
         if not updates:
             raise ValueError('move_pos requires yaw or pitch; omitted axes keep their measured angles')
@@ -813,7 +817,7 @@ class HeadPlugin(_KuavoPlugin):
             for i, value in updates.items():
                 current[i] = value
             target_deg[:] = [_number(value, field, low, high)
-                             for value, (field, low, high) in zip(current, (('yaw', -80, 80), ('pitch', -25, 25)))]
+                             for value, (field, low, high) in zip(current, HEAD_LIMITS_DEG)]
             target[:] = [math.radians(value) for value in target_deg]
             return measured
         def publish():
@@ -828,7 +832,7 @@ class HeadPlugin(_KuavoPlugin):
 
         def worker():
             converged_since_ns = converged_since_at = last_capture_ns = None
-            deadline = issued + 20.
+            deadline = issued + HEAD_TIMEOUT_S
             while not cancelled.wait(.02):
                 try:
                     with self.tracker.lock:
@@ -839,7 +843,12 @@ class HeadPlugin(_KuavoPlugin):
                             raise ConnectionError('connection changed during head motion')
                         q, measured_at, capture_ns = self.bundle.sensors.joint_positions()
                         if time.monotonic() >= deadline:
-                            raise TimeoutError('head absolute target did not converge within 20s')
+                            measured_deg = [round(math.degrees(v), 3) for v in q[18:20]]
+                            error_deg = [round(a - b, 3) for a, b in zip(target_deg, measured_deg)]
+                            raise TimeoutError(
+                                f'head absolute target did not converge within {HEAD_TIMEOUT_S:g}s; '
+                                f'target_deg={[round(v, 3) for v in target_deg]}; '
+                                f'measured_deg={measured_deg}; error_deg={error_deg}')
                         if measured_at < issued or (last_capture_ns is not None and capture_ns <= last_capture_ns):
                             continue
                         last_capture_ns = capture_ns

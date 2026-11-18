@@ -1630,6 +1630,30 @@ class DriverContractTests(unittest.TestCase):
         self.assertFalse(self.callbacks)
         self.assertTrue(self.bundle.tracker.current('head', result['action_id']))
 
+    def test_head_uses_5w_limits_instead_of_generic_sdk_limits(self):
+        tool = next(p.tool() for p in self.bundle.plugins if p.PREFIX == 'head')
+        yaw = tool['inputSchema']['properties']['yaw']
+        self.assertEqual((yaw['minimum'], yaw['maximum']), (-30, 30))
+        for value in (-30.01, 30.01, 80.):
+            self.assertEqual(self.call('head', 'move_pos', yaw=value)['state'], 'error')
+        self.ros.raw(q=[0.] * 18 + [math.radians(31), 0.])
+        self.assertEqual(self.call('head', 'move_pos', pitch=1.)['state'], 'error')
+        self.assertFalse(self.ros.published)
+
+    def test_head_timeout_reports_actual_tracking_error_and_pauses(self):
+        self.ros.raw(q=[0.] * 18 + [math.radians(6.63), 0.])
+        with patch.object(driver, 'HEAD_TIMEOUT_S', .08):
+            result = self.call('head', 'move_pos', yaw=5., pitch=0.)
+            self.assertEqual(result['state'], 'executing')
+            self.assertTrue(wait_until(lambda: self.callbacks))
+        self.assertEqual(self.callbacks[0][:3], (result['action_id'], 'head', 'error'))
+        reason = self.callbacks[0][3]['reason']
+        for detail in ('target_deg=[5.0, 0.0]', 'measured_deg=[6.63, 0.0]',
+                       'error_deg=[-1.63, 0.0]'):
+            self.assertIn(detail, reason)
+        self.assertTrue(self.bundle.state.motion_blocked)
+        self.assertFalse(self.bundle.state.confirmed_enable())
+
     def test_head_yaw_only_holds_measured_pitch(self):
         self.ros.raw(q=[0.] * 18 + [math.radians(3), math.radians(7)])
         result = self.call('head', 'move_pos', yaw=10.)

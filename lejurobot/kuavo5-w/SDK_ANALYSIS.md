@@ -223,3 +223,36 @@ DDS42/loopback 的跨容器接收，以及软件暂停和断网时控制器行�
 使用原始header.stamp做0.5秒新鲜度检查，并继续要求sensor_time与header双递增、增量一致，
 重复/倒序帧不续租，不以接收时间或header.seq替代。ACP要求命令后有效时间和周期跨度均至少0.2秒。
 其他版本仍使用严格sensor_time墙钟策略；硬件库若升级并改变语义，应重新核对，不能据此推断所有版本相同。
+
+
+### 2026-11-18 头部未到位：官方配置与实际适配器核查
+
+本节更新此前“尚未发送有效头部目标”的记录；不将命令被接收视为物理运动验收。
+
+- 官方源码入口仍为Gitee的`leju-robot/kuavo-ros-opensource`，也提供LejuRobotics GitHub镜像。
+  固定提交`d9c036e19fce5689fcfa8c596ee89b2045bebb32`的
+  [v63配置](https://github.com/LejuRobotics/kuavo-ros-opensource/blob/d9c036e19fce5689fcfa8c596ee89b2045bebb32/src/kuavo_assets/config/kuavo_v63/kuavo.json)
+  与真机运行参数均为头部kp=[10,10]、kd=[4,3]，位置范围yaw±30°、pitch±25°。
+  通用SDK的yaw±80°比此范围宽，因此驱动卡片、请求校验及省略轴保持均收紧至±30°。
+- 真机`src/kuavo_humanoid_sdk`的robot_head→core→ROS control链路：公共接口rad转度，
+  `/robot_head_motion_data`发送一次`joint_data=[yaw,pitch]`；驱动的绝对度接口与之相符。
+  ControlDataManager接收度并转rad，wheel控制器直接将目标写入`/joint_cmd`尾部两关节。
+- 当前进程361577的初始化日志确认DUAL_BUS实际创建`motorevo::MotorevoActuator`，
+  不能因为进程同时加载`libruiwo_actuatorCXXLib.so`就把旧RuiWoActuator当作实际发送路径。
+  现场工作树HEAD为`69274e610eca8640abfa42821ecbac0721d16602`，不等于上述公开参考提交；
+  `installed/lib/libmotorevo_controller.so` SHA-256为
+  `9d4f97b963f3bf94d85553332723670e62ad7f5a151ccabd9ac17d740a5b1ea7`。
+- 固定公开提交中的`motorevo_actuator.cpp::set_positions`将硬件层度值转rad，优先采用每轮传入的kp/kd，
+  缺省时才回退到缓存；`motor_ctrl.cpp`将位置/增益编码进PTM帧。当前日志明确将头部默认35/2覆盖为
+  10/4、10/3，实际`/joint_cmd`也为后者。CAN YAML的35/2不是已验证的修复建议，
+  `/hardware/get_motor_param`仅前四个关节有效，其余0不能解释为头部实时kp=0。
+- 现场CAN配置Head_yaw/Head_pitch设备ID为15/16、ratio均36、ignore均false；方向分别false/true。
+  公开v62 CAN示例方向相反，不能将示例方向/零点覆盖到这台机器。
+- 已有旁站验证：yaw=10°时`/joint_cmd`为0.174532925rad，实测约6.673°；之后授权的yaw=5°测试中，
+  绝对话题只观察到一次5°目标，`/joint_cmd`保持5°，6秒内实测约6.63°，用户观察几乎没动、无异常声音。
+  这不能证明固定2/3缩放；亦未确认摩擦、增益、标定或CAN输出哪项是根因。
+- 测试后请求全身软件暂停。厂商控制器仍保留绝对头部目标，软件暂停不等于清除该目标或硬件失能。
+  本轮后续检查全部只读，没有改增益、减速比、方向、零点，未重新初始化或重复发送头部目标。
+  仍需针对实际批次的厂家参数/电机反馈与CAN发送端联合验证，不能以增大指令或放宽ACP误差代替修复。
+- 驱动保持实测±1°、不同采集周期跨0.2秒的ACP到位标准；超时现在带目标、实测及误差，
+  继续报错并请求软件暂停。323项离线测试通过；本轮限位/诊断代码尚未部署到真机运行容器。
