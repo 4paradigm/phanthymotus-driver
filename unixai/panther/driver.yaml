@@ -1,0 +1,25 @@
+id: unixai-panther-driver
+name: UniX AI Panther Driver
+category: driver
+hardware_provider: unixai
+hardware_model: panther
+image_name: unixai-panther
+port: 15747
+mcp_url: http://localhost:15747/mcp
+description: UniX AI Panther dual-arm wheeled robot - joint skeleton, IMU, odometry, robot state (battery, diagnostics, emergency stop, grippers, lift, controllers), merged front and rear lidar, RGB-D camera, and gated motion control (base, dual arm, grippers, lift, head)
+build_context_extras:
+  - ../../common
+cards:
+  - { name: model,        type: resource }
+  - { name: joints,       type: sensor }
+  - { name: imu,          type: sensor }
+  - { name: odom,         type: sensor }
+  - { name: robot_state,  type: sensor }
+  - { name: laser_scan,   type: sensor }
+  - { name: camera_color, type: sensor }
+  - { name: camera_depth, type: sensor }
+  - { name: base_drive,   type: actuator }
+  - { name: arm_control,  type: actuator }
+  - { name: gripper,      type: actuator }
+  - { name: lifting,      type: actuator }
+  - { name: head,         type: actuator }
