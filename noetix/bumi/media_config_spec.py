@@ -104,8 +104,16 @@ def setter_name(key: str) -> str | None:
 def validate_timeout_ms(value) -> int:
     """Validate and normalise the auto-sleep timeout, in milliseconds.
 
-    Rejects booleans (``True`` is not a duration) and non-finite numbers, then
-    enforces the range. Returns an ``int``; the SDK takes milliseconds.
+    Rejects booleans (``True`` is not a duration), non-finite numbers, and
+    fractional values, then enforces the range. Returns an ``int``; the SDK's
+    signature is ``set_timeout(int timeout_ms)`` and it takes milliseconds.
+
+    Fractions are **rejected, not truncated**: ``int(1.9)`` is ``1``, so a
+    caller who mistypes ``120001.9`` would silently get 120001, and a caller who
+    sends ``1.9`` would get the minimum timeout — a value that reads like a
+    plausible duration while meaning "sleep immediately". An integral float
+    (``60000.0``) and a numeric string (``"60000"``) still name a whole
+    millisecond, so they are accepted and converted.
     """
     if isinstance(value, bool):
         raise ValueError("timeout_ms 必须是数字，单位毫秒")
@@ -115,6 +123,9 @@ def validate_timeout_ms(value) -> int:
         raise ValueError("timeout_ms 必须是数字，单位毫秒") from exc
     if number != number or number in (float("inf"), float("-inf")):
         raise ValueError("timeout_ms 必须是有限数字")
+    if number != int(number):
+        raise ValueError(
+            f"timeout_ms 必须是整数毫秒（收到 {value!r}）；小数不会被截断")
     result = int(number)
     if not TIMEOUT_MIN_MS <= result <= TIMEOUT_MAX_MS:
         raise ValueError(

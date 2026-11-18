@@ -68,6 +68,26 @@ def test_a_non_finite_timeout_is_rejected():
         spec.validate_timeout_ms(float("inf"))
 
 
+def test_a_fractional_timeout_is_rejected_not_truncated():
+    # `int(1.9)` is 1, so truncating would turn a mistyped duration into the
+    # minimum timeout while looking like a successful write.
+    with pytest.raises(ValueError):
+        spec.validate_timeout_ms(1.9)
+    with pytest.raises(ValueError):
+        spec.validate_timeout_ms(120001.5)
+    with pytest.raises(ValueError):
+        spec.validate_timeout_ms("1.9")
+
+
+def test_an_integral_timeout_in_another_numeric_form_is_still_accepted():
+    # 60000.0 and "60000" name the same whole millisecond; only fractions are
+    # ambiguous, so these stay accepted and normalised to int.
+    assert spec.validate_timeout_ms(60000.0) == 60000
+    assert spec.validate_timeout_ms("60000") == 60000
+    assert spec.validate_timeout_ms(" 90000 ") == 90000
+    assert isinstance(spec.validate_timeout_ms("60000"), int)
+
+
 def test_response_words_must_be_a_non_empty_string():
     assert spec.validate_response_words(" 你好 ") == "你好"
     with pytest.raises(ValueError):
@@ -194,6 +214,57 @@ def test_the_card_is_an_actuator_with_no_topic_out(monkeypatch):
     assert "set_timeout" in enum
     assert "set_wakeup_words" not in enum
     assert "set_audio_cue" in enum
+
+
+def test_every_advertised_action_declares_its_parameters(monkeypatch):
+    # Agent Core splits the tool into per-action functions from this map, so an
+    # action present only in the enum loses its function without any error —
+    # that is exactly how `start`, `stop` and `info` went missing.
+    _, plugin = _plugin(monkeypatch, _Media())
+    schema = plugin.get_tool()["inputSchema"]
+    enum = schema["properties"]["action"]["enum"]
+    declared = schema["x-action-params"]
+
+    assert set(declared) == set(enum)
+    for action in enum:
+        expected = ([] if not action.startswith("set_")
+                    else [action[len("set_"):]])
+        assert declared[action]["params"] == expected, action
+        assert declared[action]["description"], action
+
+
+def test_lifecycle_actions_are_declared_with_no_parameters(monkeypatch):
+    _, plugin = _plugin(monkeypatch, _Media())
+    declared = plugin.get_tool()["inputSchema"]["x-action-params"]
+
+    for action in ("start", "stop", "info", "get"):
+        assert declared[action]["params"] == []
+
+
+def test_the_advertised_actions_are_exactly_the_documented_set(monkeypatch):
+    # The consistent-map test above cannot catch an action dropped from both
+    # maps at once, so pin the set itself: a card whose `start`/`stop`/`info`
+    # vanished still answers "get", which looks healthy from the outside.
+    _, plugin = _plugin(monkeypatch, _Media())
+    enum = plugin.get_tool()["inputSchema"]["properties"]["action"]["enum"]
+
+    assert set(enum) == {
+        "start", "stop", "info", "get",
+        "set_timeout", "set_audio_cue",
+        "set_wakeup_response", "set_sleep_response",
+    }
+    assert len(enum) == len(set(enum))
+
+
+def test_a_fractional_timeout_never_reaches_the_sdk(monkeypatch):
+    media = _Media()
+    _, plugin = _plugin(monkeypatch, media)
+
+    result = plugin.dispatch("set_timeout", {"timeout": 1.9})
+
+    assert result["state"] == "error"
+    assert media.set_calls == []
+    assert media.timeout_ms == 120000
 
 
 def test_get_reads_every_setting_including_the_read_only_wake_word(monkeypatch):

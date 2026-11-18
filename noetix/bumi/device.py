@@ -3775,23 +3775,38 @@ class MediaConfigPlugin:
     def get_tool(self) -> dict:
         import media_config_spec
 
+        # One source of truth for the actions: the enum and `x-action-params`
+        # are both built from these two maps.  Agent Core reads the map to split
+        # the tool into per-action functions, so an action advertised only in
+        # the enum is a function a caller never gets — and an action in the map
+        # but not the enum is one the schema says cannot be called.  Declaring
+        # them separately let `start`, `stop` and `info` fall through both ways.
+        action_params = {"start": [], "stop": [], "info": [], "get": []}
+        action_descriptions = {
+            "start": "卡片启动；媒体单元未连接时返回 error。",
+            "stop": "卡片停止，返回 idle。",
+            "info": "读取全部配置项当前值与接口声明（有哪些项、哪些可写、取值范围）。",
+            "get": "读取全部配置项当前值。",
+        }
         writable_descriptions = {
-            "timeout": "设置自动休眠超时（毫秒）。取值必须落在接口声明的区间内；单位是毫秒不是秒。",
+            "timeout": "设置自动休眠超时（整数毫秒）。取值必须落在接口声明的区间内；单位是毫秒不是秒，小数会被拒绝而不是截断。",
             "audio_cue": "开关提示音（true/false）。",
             "wakeup_response": "设置被唤醒时说的应答词（非空字符串）。",
             "sleep_response": "设置被催眠时说的应答词（非空字符串）。",
         }
-        x_action_params = {"get": {"params": [], "description": "读取全部配置项当前值。"}}
         for key in media_config_spec.WRITABLE_KEYS:
-            x_action_params[f"set_{key}"] = {
-                "params": [key],
-                "description": writable_descriptions[key],
-            }
+            action_params[f"set_{key}"] = [key]
+            action_descriptions[f"set_{key}"] = writable_descriptions[key]
+        actions = tuple(action_descriptions)
+        x_action_params = {
+            action: {"params": action_params[action],
+                     "description": action_descriptions[action]}
+            for action in actions
+        }
         properties = {
             "action": {
                 "type": "string",
-                "enum": ["start", "stop", "info", "get",
-                         *[f"set_{k}" for k in media_config_spec.WRITABLE_KEYS]],
+                "enum": list(actions),
                 "description": "卡片生命周期、读取或写入媒体配置项",
             },
         }

@@ -350,6 +350,11 @@ in `device.py`; no extra runtime Python file is required.
 `set_wakeup_words`（`.pyi` 里也搜不到）。把"设置唤醒词"做成一个动作，验收时会发现它根本
 调不通 —— 所以卡片照实把它标成只读，`set_wakeup_words` 这个动作不存在。
 
+**`timeout` 只收整数毫秒，小数报错而不是截断。** SDK 的签名是
+`set_timeout(int timeout_ms)`；`int(1.9)` 会等于 `1`，一个手误就会被当成"立刻休眠"，
+而且写入还显示成功。所以 `1.9` / `"120001.5"` 直接返回 `state: error`，而 `60000.0`、
+`"60000"` 这种整数值照常接受。
+
 **写操作之间必须隔 ≥500 ms。** 厂商的约束是**同一个 `MediaController` 上两次配置写**的
 最小间隔，间隔过短可能让语音系统崩掉（需要返厂）。所以这个间隔门不是每张卡一把锁，而是
 `device.py` 里的一个 `MediaControllerWriteGate`，由 `speaker` 和 `media_config` **共用同一
@@ -365,7 +370,8 @@ in `device.py`; no extra runtime Python file is required.
 - **写失败不编值。** 控制器没连上时任何 `set_*` 都被拒绝（`state: error`），`get` 返回
   `values: null` + `controller_present: false`，而不是给一份看着正常的默认值。
 
-校验规则（毫秒不是秒、布尔不是真值字符串、应答词非空）都在 `media_config_spec.py`，
+校验规则（整数毫秒不是秒也不是小数、布尔不是真值字符串、应答词非空）都在
+`media_config_spec.py`，
 不导入 rclpy，笔记本上就能测。该模块同样必须在镜像里单独 `COPY`
 （`COPY media_config_spec.py /work/media_config_spec.py`），否则容器内 import 失败、
 卡片静默消失。配置在 `plugins.media_config`：`enabled: true`，没有轮询参数。
