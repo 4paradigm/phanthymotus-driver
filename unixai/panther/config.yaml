@@ -31,6 +31,8 @@ plugins:
 
   audio:
     server: "unix:/run/user/1001/pulse/native"
+    uid: 1001
+    gid: 1002
     # Confirm physical routing on Panther before changing these names.
     source: "alsa_input.platform-sound.analog-stereo"
     sink: "alsa_output.platform-sound.analog-stereo"

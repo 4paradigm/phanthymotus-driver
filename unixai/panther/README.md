@@ -26,8 +26,11 @@ The Compose fragment mounts the Pulse socket directory and the authentication
 cookie. Set `PANTHER_PULSE_COOKIE_PATH` to the host cookie path if it differs
 from `/home/unix_ai/.config/pulse/cookie`. Set `PANTHER_PULSE_SOURCE` and
 `PANTHER_PULSE_SINK` to override the configured Pulse device names after
-checking `pactl list sources` and `pactl list sinks` on the robot. The reported
-`platform-sound` names have not yet been verified against the physical M8 mic
+checking `pactl list sources` and `pactl list sinks` on the robot.
+Pulse clients run as host UID 1001/GID 1002 because the host server rejected
+container root; override `PANTHER_PULSE_UID` and `PANTHER_PULSE_GID` if the host
+audio user differs. The driver and ROS bridge retain their existing identities.
+The reported `platform-sound` names have not yet been verified against the physical M8 mic
 and speaker. Before enabling a project, verify container-side `pactl info`,
 then test `mic -> ASR` and `TTS -> speaker` on Panther. For simultaneous
 listening and speaking, insert the perception echo-cancellation card before

@@ -29,6 +29,10 @@ def _pulse_command(mode: str, device: str) -> list[str]:
             f"--device={device}"]
 
 
+def _pulse_identity(config: dict) -> dict[str, int]:
+    return {"user": int(config["uid"]), "group": int(config["gid"])}
+
+
 def _worker(mode, topic, config, commands, replies):
     os.environ["ROS_DOMAIN_ID"] = os.environ.get("AGENT_CORE_ROS_DOMAIN_ID", "42")
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
@@ -171,13 +175,18 @@ def _worker(mode, topic, config, commands, replies):
                 state.update(error="", frames=0, dropped=0, last_frame=0.0, input_topic=input_topic)
                 stop_event.clear()
                 try:
-                    subprocess.run(["pactl", "info"], check=True, timeout=3,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    probe = subprocess.run(
+                        ["pactl", "info"], timeout=3, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE, text=True, **_pulse_identity(config))
+                    if probe.returncode != 0:
+                        raise RuntimeError(
+                            f"PulseAudio connection failed: {probe.stderr.strip()[-200:]}")
                     process = subprocess.Popen(
                         _pulse_command(mode, config["device"]),
                         stdin=subprocess.PIPE if mode == "speaker" else subprocess.DEVNULL,
                         stdout=subprocess.PIPE if mode == "mic" else subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL, bufsize=0)
+                        stderr=subprocess.DEVNULL, bufsize=0,
+                        **_pulse_identity(config))
                     time.sleep(0.1)
                     if process.poll() is not None:
                         raise RuntimeError(f"PulseAudio process exited ({process.returncode})")
@@ -212,7 +221,9 @@ class AudioPlugin:
         self.config = {"server": os.environ.get("PULSE_SERVER") or config["server"],
                        "device": os.environ.get("PANTHER_PULSE_SOURCE" if name == "mic"
                                                 else "PANTHER_PULSE_SINK")
-                       or config["source" if name == "mic" else "sink"]}
+                       or config["source" if name == "mic" else "sink"],
+                       "uid": os.environ.get("PANTHER_PULSE_UID", config.get("uid", 1001)),
+                       "gid": os.environ.get("PANTHER_PULSE_GID", config.get("gid", 1002))}
         self._ctx = mp.get_context("spawn")
         self._commands = None
         self._replies = None

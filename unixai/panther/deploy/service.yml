@@ -23,6 +23,8 @@ unixai-panther:
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PULSE_SERVER=unix:/run/user/1001/pulse/native
     - PULSE_COOKIE=/run/panther-pulse-cookie
+    - PANTHER_PULSE_UID=${PANTHER_PULSE_UID:-1001}
+    - PANTHER_PULSE_GID=${PANTHER_PULSE_GID:-1002}
     - PANTHER_PULSE_SOURCE=${PANTHER_PULSE_SOURCE:-alsa_input.platform-sound.analog-stereo}
     - PANTHER_PULSE_SINK=${PANTHER_PULSE_SINK:-alsa_output.platform-sound.analog-stereo}
     - PYTHONUNBUFFERED=1

@@ -55,6 +55,8 @@ class PantherAudioContractTest(unittest.TestCase):
                       audio._pulse_command("mic", config["source"]))
         self.assertIn("--device=alsa_output.platform-sound.analog-stereo",
                       audio._pulse_command("speaker", config["sink"]))
+        self.assertEqual(audio._pulse_identity({"uid": "1001", "gid": "1002"}),
+                         {"user": 1001, "group": 1002})
 
     def test_partial_pulse_reads_are_reassembled_before_publish(self):
         pending = bytearray()
