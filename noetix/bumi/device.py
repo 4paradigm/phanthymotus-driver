@@ -3162,6 +3162,14 @@ class _MediaStatusNode(Node):
                 payload = self._read_once()
             except Exception as exc:                          # noqa: BLE001
                 payload = self._failed_sample(exc)
+            # Checked here as well as in the loop condition, because a read can
+            # block across a whole stop-and-start: `stop` sets the event and
+            # `start` clears it again, so the thread would wake up with its own
+            # generation already superseded and publish the old cycle's sample
+            # on top of the new poller's. The condition is cheap and the check
+            # is the only thing standing between that race and the topic.
+            if generation != self._generation or not self._running:
+                break
             message = String()
             message.data = json.dumps(payload, ensure_ascii=False)
             self._pub.publish(message)

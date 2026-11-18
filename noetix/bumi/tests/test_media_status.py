@@ -7,6 +7,8 @@ fault, an unreadable status is not a healthy one, and nothing is nested (the
 dashboard renders a nested object as raw JSON text).
 """
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -314,6 +316,72 @@ def test_a_superseded_polling_thread_publishes_nothing(monkeypatch):
     node._loop(6)                     # the thread an earlier start handed out
 
     assert node.published == []
+
+
+def test_a_read_that_blocks_across_stop_and_start_publishes_nothing(monkeypatch):
+    """The case the loop condition cannot see. `stop` joins for one second and
+    `start` clears the very event `stop` set, so a thread blocked inside the
+    SDK call survives both transitions and wakes up still holding its old
+    generation. Checking only at the top of the loop lets that read return and
+    publish into a topic the new poller already owns; the sample is valid on
+    its face, and nothing in it says which cycle produced it."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _Blocking(_Media):
+        def get_system_status(self):
+            entered.set()
+            release.wait(5.0)
+            return super().get_system_status()
+
+    _, node, _, _ = _node(monkeypatch, _Blocking(), interval=0.01)
+    node._stopped.clear()
+    node._running = True
+    node._generation = 1
+    thread = threading.Thread(target=node._loop, args=(1,), daemon=True)
+    thread.start()
+    assert entered.wait(5.0), "the blocked read never started"
+
+    # The canvas toggles the card off and on while that read is still blocked.
+    node._running = False
+    node._stopped.set()
+    node._stopped.clear()
+    node._running = True
+    node._generation = 2
+
+    release.set()
+    thread.join(5.0)
+
+    assert not thread.is_alive()
+    assert node.published == []
+
+
+def test_an_unsuperseded_read_still_reaches_the_topic(monkeypatch):
+    """The guard above must not be so eager that it swallows a normal sample."""
+    entered = threading.Event()
+
+    class _Slow(_Media):
+        def get_system_status(self):
+            entered.set()
+            return super().get_system_status()
+
+    _, node, _, _ = _node(monkeypatch, _Slow(), interval=0.01)
+    node._stopped.clear()
+    node._running = True
+    node._generation = 1
+    thread = threading.Thread(target=node._loop, args=(1,), daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(5.0), "the read never started"
+        deadline = time.monotonic() + 5.0
+        while not node.published and time.monotonic() < deadline:
+            time.sleep(0.005)
+    finally:
+        node._running = False
+        node._stopped.set()
+        thread.join(5.0)
+
+    assert node.published, "a sample that was not superseded must still publish"
 
 
 def test_a_stopped_card_leaves_no_thread_behind(monkeypatch):
