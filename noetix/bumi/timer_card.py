@@ -228,10 +228,10 @@ class TimerPlugin:
         interval = self._default_interval
         return {
             "name": "timer",
-            "type": "processor",
+            "type": "sensor",
             "multiInstance": False,
             "description": (
-                "通用重复定时器：start/stop 只让卡片待命，begin 后按 interval_s 周期发布 "
+                "通用重复定时事件源：start 让卡片进入 running（待命，不发 tick），begin 后按 interval_s 周期发布 "
                 f"timer_tick 事件到 {self._topic}（data/json，priority=1），halt 停止 tick，"
                 "stop 停止并退出。事件可直接连到 decision core。"
             ),
@@ -299,11 +299,30 @@ class TimerPlugin:
         self._armed = False
         self._core.stop()
 
+    def _lifecycle(self, extra: dict | None = None) -> dict:
+        """Sensor lifecycle reply: `running` while armed, `idle` otherwise.
+
+        `ticking` and `timer_state` carry the schedule itself, so "armed but no
+        ticks until begin" stays visible without bending the sensor contract.
+        """
+        timer = self._core.snapshot()
+        reply = {k: v for k, v in timer.items() if k != "state"}
+        reply.update({
+            "state": "running" if self._armed else "idle",
+            "armed": self._armed,
+            "ticking": timer.get("state") == "running",
+            "timer_state": timer.get("state", "idle"),
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        })
+        if extra:
+            reply.update(extra)
+        return reply
+
     def dispatch(self, action: str, args: dict) -> dict | None:
         args.pop("_tool_name", None)
         if action == "start":
             self._armed = True
-            return {"state": "ready", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+            return self._lifecycle()
         if action == "begin":
             self._armed = True
             interval = args.get("interval_s", self._default_interval)
@@ -323,24 +342,20 @@ class TimerPlugin:
                     and current.get("interval_s") == requested_interval
                     and current.get("label") == requested_label
                     and current.get("max_ticks") == requested_max):
-                return {**current, "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+                return self._lifecycle()
             try:
-                state = self._core.start(interval, label, max_ticks)
+                self._core.start(interval, label, max_ticks)
             except ValueError as exc:
                 return {"state": "error", "error": str(exc)}
-            return {**state, "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+            return self._lifecycle()
         if action == "halt":
             self._core.stop()
             self._armed = True
-            return {"state": "ready", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+            return self._lifecycle()
         if action == "stop":
             self._core.stop()
             self._armed = False
-            return {"state": "idle", "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+            return self._lifecycle()
         if action == "info":
-            state = self._core.snapshot()
-            if state.get("state") == "idle" and self._armed:
-                state["state"] = "ready"
-            state["armed"] = self._armed
-            return {**state, "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+            return self._lifecycle()
         return None

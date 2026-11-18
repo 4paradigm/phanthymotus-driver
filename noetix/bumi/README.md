@@ -450,7 +450,7 @@ docker logs -f embodied-noetix-bumi
 
 ## `timer` card
 
-A hardware-free repeating timer. It exists because the agent cannot create a
+A hardware-free repeating timer, declared as a `sensor`: it has no `topic_in` and originates a `data/json` stream. It exists because the agent cannot create a
 timer by itself: `task_create` only tracks a task, `scheduler` is operator
 configuration, and a skill that promises "remind me in 10 minutes" without a
 clock is not executable.
@@ -466,11 +466,11 @@ Actions:
 
 | action | behavior |
 |---|---|
-| `start` | arm only, publish nothing |
+| `start` | arm only: lifecycle `running`, `ticking: false`, publish nothing |
 | `begin` | start ticking; params `interval_s` (1–3600), `label`, `max_ticks` (0 = unlimited) |
-| `halt` | stop ticking, stay armed |
-| `stop` | stop ticking and disarm |
-| `info` | running/idle/finished, timer_id, tick, elapsed and next tick |
+| `halt` | stop ticking, stay armed (`running`, `ticking: false`) |
+| `stop` | stop ticking and disarm (`idle`) |
+| `info` | lifecycle `running`/`idle`, plus `ticking`, `timer_state` (running/idle/finished), timer_id, tick, elapsed and next tick |
 
 `start` deliberately does not begin ticking. The canvas sends `start` when a
 project boots; an always-ticking timer would wake the model once a minute for

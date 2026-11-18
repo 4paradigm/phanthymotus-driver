@@ -15,7 +15,7 @@ build_context_extras:
 cards:
   - { name: imu,               type: sensor }
   - { name: battery,           type: sensor }
-  - { name: timer,             type: processor }
+  - { name: timer,             type: sensor }
   - { name: joints,            type: sensor }
   - { name: model,             type: resource }
   - { name: loco,              type: actuator }

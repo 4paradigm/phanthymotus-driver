@@ -78,11 +78,15 @@ def test_core_max_ticks_finishes(monkeypatch):
 
 def test_start_arms_but_does_not_tick(monkeypatch):
     plugin, node = _plugin(monkeypatch)
-    assert plugin.dispatch("start", {})["state"] == "ready"
+    started = plugin.dispatch("start", {})
+    assert started["state"] == "running"
+    assert started["ticking"] is False
     time.sleep(0.12)
     assert node.payloads == []
 
-    assert plugin.dispatch("begin", {"interval_s": 0.05, "label": "sedentary"})["state"] == "running"
+    begun = plugin.dispatch("begin", {"interval_s": 0.05, "label": "sedentary"})
+    assert begun["state"] == "running"
+    assert begun["ticking"] is True
     time.sleep(0.12)
     assert len(node.payloads) >= 2
     assert node.payloads[0]["priority"] == 1
@@ -98,6 +102,7 @@ def test_begin_is_idempotent_for_same_parameters(monkeypatch):
     plugin, node = _plugin(monkeypatch)
     first = plugin.dispatch("begin", {"interval_s": 0.05, "label": "sedentary"})
     timer_id = first["timer_id"]
+    assert first["ticking"] is True
     second = plugin.dispatch("begin", {"interval_s": 0.05, "label": "sedentary"})
     assert second["timer_id"] == timer_id
     plugin.dispatch("stop", {})
@@ -105,14 +110,19 @@ def test_begin_is_idempotent_for_same_parameters(monkeypatch):
 
 def test_armed_lifecycle(monkeypatch):
     plugin, _ = _plugin(monkeypatch)
-    assert plugin.dispatch("start", {})["state"] == "ready"
-    assert plugin.dispatch("info", {})["state"] == "ready"
-    assert plugin.dispatch("info", {})["armed"] is True
-    assert plugin.dispatch("halt", {})["state"] == "ready"
-    assert plugin.dispatch("info", {})["state"] == "ready"
-    assert plugin.dispatch("stop", {})["state"] == "idle"
     assert plugin.dispatch("info", {})["state"] == "idle"
-    assert plugin.dispatch("info", {})["armed"] is False
+    assert plugin.dispatch("start", {})["state"] == "running"
+    info = plugin.dispatch("info", {})
+    assert info["state"] == "running"
+    assert info["armed"] is True
+    assert info["ticking"] is False
+    halted = plugin.dispatch("halt", {})
+    assert halted["state"] == "running"
+    assert halted["ticking"] is False
+    assert plugin.dispatch("stop", {})["state"] == "idle"
+    info = plugin.dispatch("info", {})
+    assert info["state"] == "idle"
+    assert info["armed"] is False
 
 
 def test_invalid_interval_is_rejected(monkeypatch):
@@ -128,7 +138,7 @@ def test_tool_schema_and_topic():
                                     node_factory=lambda topic: node)
     tool = plugin.get_tool()
     assert tool["name"] == "timer"
-    assert tool["type"] == "processor"
+    assert tool["type"] == "sensor"
     assert set(tool["inputSchema"]["properties"]["action"]["enum"]) == {
         "start", "begin", "halt", "stop", "info"}
     assert tool["topic_out"] == [{"topic": "/robot/timer/events", "format": "data/json"}]
@@ -154,12 +164,13 @@ def test_bundle_registers_timer(monkeypatch):
         {"plugins": {"timer": {"enabled": True}}}, "robot",
         FakeExecutor(), None, object())
     assert [tool["name"] for tool in bundle.get_all_tools()] == ["timer"]
-    assert bundle.dispatch("timer", {"action": "start"})["state"] == "ready"
+    assert bundle.dispatch("timer", {"action": "start"})["state"] == "running"
     assert bundle.dispatch("timer", {"action": "stop"})["state"] == "idle"
 
 
 def test_manifest_and_config_agree():
     manifest = yaml.safe_load((BUNDLE / "driver.yaml").read_text())
-    assert "timer" in {card["name"] for card in manifest["cards"]}
+    cards = {card["name"]: card["type"] for card in manifest["cards"]}
+    assert cards["timer"] == "sensor"
     config = yaml.safe_load((BUNDLE / "config.yaml").read_text())
     assert config["plugins"]["timer"]["enabled"] is True
