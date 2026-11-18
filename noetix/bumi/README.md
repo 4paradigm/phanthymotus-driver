@@ -546,14 +546,25 @@ the same rotation as `calibration.camera_to_body.quaternion` `[-0.5, 0.5, -0.5,
 0.5]` (xyzw) in `config.yaml`. Changing one side without the other fails
 `tests/test_bumi_camera_mount_urdf.py`.
 
-### Not the visual-odometry frames
+### One camera, several names (same physical frame)
 
-`visual_odometry.py` also publishes `{segment}_base → rgb_optical`. Those are
-estimator-internal frames serving RTAB-Map's odom segment only, **not** body
-coordinates. The two pairs must not be looked up against each other; the
-conversion and tf-tree cards use only the `camera_*` frames.
+There is **one** physical camera, but it has more than one name in the running
+system. `camera_link` and `camera_optical_frame` are the *canonical*, repo-wide
+names declared in the URDF; the other names are produced at runtime and carry
+machine-specific or per-start prefixes, so they can never be hard-coded:
 
-| Frame set | Owner | Meaning |
-| --- | --- | --- |
-| `camera_link` / `camera_optical_frame` | the robot body | the physical camera, part of the whole-body tf tree, unique repo-wide |
-| `{segment}_base` / `rgb_optical` | the estimator | internal frames for the RTAB-Map odom segment, not body coordinates |
+| Physical frame | Canonical name (URDF, this task) | Runtime name | Where the runtime name comes from |
+| --- | --- | --- | --- |
+| body axes, origin at the optical centre | `camera_link` | `bumi_visual_<uuid>_base` | `visual_odometry.py` — `self.segment = 'bumi_visual_' + uuid.uuid4().hex` (regenerated on every start) |
+| optical axes (x right / y down / z deep) | `camera_optical_frame` | `<hostname>_rgb_optical` | `visual_inputs.py` — `f'{self.namespace}_rgb_optical'` (hostname from `main.py`) |
+
+These two pairs are the **same physical frames under different names**, not two
+separate cameras. Today the URDF tree (`base_link → camera_link →
+camera_optical_frame`) and the odometry tree (`bumi_visual_<uuid>_base →
+<hostname>_rgb_optical`) are **two disconnected trees** — a
+`lookup(base_link → <hostname>_rgb_optical)` reports `not connected`. They must
+be joined explicitly by the tf-tree card (T3) through its `frame_links` config
+(a `camera_link → bumi_visual_*_base` identity link), not assumed; the
+conversion card (T2) does not hard-code a parent frame and prefers the
+`frame_id` carried in the input JSON. See `02_命名与撞车筛查.md` §3.1 for the
+full collision analysis.
