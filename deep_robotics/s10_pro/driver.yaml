@@ -6,7 +6,7 @@ hardware_model: s10-pro
 image_name: deep-robotics-s10-pro
 port: 15745
 mcp_url: http://localhost:15745/mcp
-description: S10 Pro TCP locomotion, continuous velocity servo, controlled spatial mapping/localization/navigation, measured odometry, microphone PCM-16k capture, TTS PCM-16k playback, lighting, charging, IMU, battery, joints, cameras and LiDAR streams
+description: S10 Pro TCP locomotion, continuous velocity servo, controlled spatial mapping/localization/navigation, measured odometry, microphone PCM-16k capture, TTS PCM-16k playback, lighting, charging, IMU, battery, joints, cameras, LiDAR streams and LiDAR-assisted front depth
 build_context_extras:
   - ../../common
 cards:

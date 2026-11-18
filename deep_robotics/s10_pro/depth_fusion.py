@@ -94,9 +94,11 @@ def fuse_depth(raw_packet, local_packet, mono_packet, *, min_depth_m=.1, max_dep
     valid = ((mono_mm != 0) & np.isfinite(depth)
              & (depth >= max(.001, min_depth_m)) & (depth <= max_depth_m))
     output = np.rint(np.where(valid, depth * 1000, 0)).astype('<u2')
-    near_fill = (local == 0) & (output > 0) & (output <= _NEAR_COMPLETION_MM)
+    from_local = local != 0
+    output[from_local] = local[from_local]
+    near_fill = ~observed & (output > 0) & (output <= _NEAR_COMPLETION_MM)
     if near_fill.any():
-        # Frame-wide holdout scores cannot validate a close extrapolation.
+        # Even a bounded interpolation can turn two stray returns into a near patch.
         # Require nearby original returns of compatible depth. The RMS error
         # keeps a mix of closer and farther surfaces from supporting their midpoint.
         support = observed & (raw <= _NEAR_COMPLETION_MM * (1 + _NEAR_RELATIVE_ERROR))
@@ -104,18 +106,18 @@ def fuse_depth(raw_packet, local_packet, mono_packet, *, min_depth_m=.1, max_dep
         samples = _window_sum(support.astype(np.float64))[near_fill]
         total = _window_sum(close)[near_fill]
         squares = _window_sum(close**2)[near_fill]
-        candidate = depth[near_fill]
+        candidate = np.where(from_local[near_fill], output[near_fill] / 1000, depth[near_fill])
         mean_error_sq = candidate**2 + (squares - 2 * candidate * total) / np.maximum(1, samples)
         supported = (samples >= 3) & (mean_error_sq <= (_NEAR_RELATIVE_ERROR * candidate)**2)
         output[near_fill] = np.where(supported, output[near_fill], 0)
-    added = (local == 0) & (output != 0)
-    output[local != 0] = local[local != 0]
+    published = output != 0
     return zlib.compress(output.tobytes(), level=1), {
         'calibration_a': float(a), 'calibration_b': float(b),
         'calibration_reference_pixels': int(reference.sum()),
         'calibration_holdout_pixels': int(holdout.sum()),
         'calibration_median_relative_error': float(median),
         'calibration_p90_relative_error': float(p90),
-        'monocular_pixels': int(added.sum()),
-        'output_coverage': round(float(np.count_nonzero(output) / output.size), 4),
+        'filled_pixels': int(np.count_nonzero(from_local & ~observed & published)),
+        'monocular_pixels': int(np.count_nonzero(~from_local & published)),
+        'output_coverage': round(float(np.count_nonzero(published) / output.size), 4),
     }

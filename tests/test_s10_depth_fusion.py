@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from deep_robotics.s10_pro.depth_fusion import fuse_depth
+from deep_robotics.s10_pro.depth_projection import fill_depth_holes
 
 
 def packet(values):
@@ -129,6 +130,28 @@ def test_near_completion_cutoff_applies_to_published_millimetres():
     output, _ = fuse_depth(packet(raw), packet(raw), packet(mono))
     result = np.frombuffer(zlib.decompress(output), dtype='<u2').reshape(raw.shape)
     assert result[224, 100:102].tolist() == [0, 501]
+
+
+def test_sparse_close_returns_cannot_expand_through_local_hole_fill():
+    raw = np.zeros((480, 640), dtype=np.uint16)
+    raw[::16, ::16] = 2000
+    raw[208:256, 80:130] = 0
+    raw[208:256, 280:330] = 0
+    raw[230, [98, 104]] = 200
+    raw[230, [294, 298, 304]] = 300
+    local_packet, _ = fill_depth_holes(packet(raw))
+    local = np.frombuffer(zlib.decompress(local_packet), dtype='<u2').reshape(raw.shape)
+    assert local[230, 100] == 200
+    assert local[230, 300] == 300
+    mono = np.full_like(raw, 2000)
+    mono[(raw > 0) & (raw < 500)] = 0
+
+    output, stats = fuse_depth(packet(raw), local_packet, packet(mono))
+    result = np.frombuffer(zlib.decompress(output), dtype='<u2').reshape(raw.shape)
+    assert result[230, 100] == 0
+    assert result[230, 300] == 300
+    assert np.array_equal(result[raw != 0], raw[raw != 0])
+    assert stats['filled_pixels'] == np.count_nonzero((raw == 0) & (local != 0) & (result != 0))
 
 
 def test_near_original_measurements_remain_usable_calibration_references():

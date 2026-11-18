@@ -354,7 +354,11 @@ reference pixels is held out of both stages: the frame is rejected if median
 relative error exceeds 25% or its 90th percentile exceeds 50%. At least 64
 training points, 16 held-out points and six occupied 80x80 spatial cells are
 required. Near returns are not classified or removed by distance alone.
-Measured and locally filled pixels take priority over model completion.
+Measured pixels take priority, followed by local filling and model completion.
+Within 500 mm, both forms of completion require at least three original LiDAR
+pixels at or below 550 mm in a 17x17 neighborhood and an RMS depth difference
+of at most 10%.
+Local or monocular estimates with too little support are published as unknown.
 Invalid model values and generated values outside the configured depth range
 remain zero. There is no temporal accumulation or motion compensation.
 
