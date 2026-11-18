@@ -124,6 +124,16 @@ class SensorTests(unittest.TestCase):
                     self.hub.joint_positions()
                 self.assertTrue(self.hub.snapshot('imu')['valid'])
 
+    def test_capture_clock_offset_is_reported_without_accepting_fresh_header(self):
+        with patch.object(sensors_module.time, 'time', return_value=1000.8):
+            self.ros.raw(sensor_time={'secs': 1000, 'nsecs': 0},
+                         header={'stamp': {'secs': 1000, 'nsecs': 800_000_000}, 'seq': 123})
+        sample = self.hub.snapshot('joints')
+        self.assertFalse(sample['valid'])
+        self.assertIn('capture_age_s=0.800', sample['reason'])
+        with self.assertRaises(RuntimeError):
+            self.hub.joint_positions()
+
     def test_reordered_capture_does_not_replace_newer_joint_sample(self):
         ns = time.time_ns()
         captured = lambda value: {'secs': value // 1_000_000_000, 'nsecs': value % 1_000_000_000}

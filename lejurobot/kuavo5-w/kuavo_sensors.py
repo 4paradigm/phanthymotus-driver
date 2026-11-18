@@ -339,7 +339,9 @@ class KuavoSensors:
         now, wall = time.monotonic(), time.time()
         age = wall - capture_ns / 1e9
         if not -JOINT_FUTURE_TOLERANCE_S <= age <= JOINT_MAX_AGE_S:
-            raise ValueError('joint capture is stale or clocks are not synchronized')
+            raise ValueError('joint capture is stale or clocks are not synchronized: '
+                             f'capture_age_s={age:.3f}, allowed_s='
+                             f'[-{JOINT_FUTURE_TOLERANCE_S}, {JOINT_MAX_AGE_S}]')
         if self._joint_capture_ns is not None and capture_ns <= self._joint_capture_ns:
             return  # No data/freshness update for repeated or reordered captures.
         raw = message['joint_data']

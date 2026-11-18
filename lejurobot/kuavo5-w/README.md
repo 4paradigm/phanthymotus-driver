@@ -273,7 +273,7 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 | 卡片 | 动作 | 官方 ROS1 接口 |
 | --- | --- | --- |
 | `loco` | `move`、`move_relative`、`move_to`、`stop_move` | `/cmd_vel`、`/cmd_pose`、`/cmd_pose_world` |
-| `arm` | 命名单关节、`set`、`zero`、`move_joints`、`set_pose`、`stop_move` | `/kuavo_arm_traj`、`/mm/two_arm_hand_pose_cmd` |
+| `arm` | `set`、`stop_move` | `/kuavo_arm_traj` |
 | `leg` | `set`、`zero`、`move_joints`、`stop_move` | `/lb_leg_traj` |
 | `waist` | `waist_pitch`、`waist_yaw`、`zero`、`set_pose`、`stop_move` | `/lb_leg_traj`、`/cmd_lb_torso_pose` |
 | `head` | `move_pos`、`zero`、`stop_move` | `/robot_head_motion_data`；停止残余速度用`/cmd_head_vel` |
@@ -343,15 +343,14 @@ EOF只作结束标记跳过，后续PCM继续播放；如需清空已排队PCM�
 
 - 底盘速度：本体系 `vx/vy` 为 m/s，`vyaw` 为 rad/s。驱动限制分别为 ±0.3、±0.3、±0.5，`duration` 必填，范围 0.1–10s。
 - 底盘位姿：`x/y` 为米，`yaw` 为弧度，三个值均必填。`move_relative` 相对当前位置，`move_to` 使用机器人启动世界系。
-- 双臂参照Q5的命名关节绝对控制：动作`left_joint_1`…`left_joint_7`、`right_joint_1`…`right_joint_7`，参数如`left_joint_1_rad`，单位**rad**。明确对应zarm_l1…l7/r1…r7，不借用另一机型的肩/肘标签猜关节轴。
-  `set`可同时指定任意几个同名`*_rad`字段；`zero`归零双臂。未指定关节在自动恢复后、实际发送前重新取实测角度。
-  兼容`move_joints(positions)`，仍为左7+右7共14个**度**值，避免悄悄改变旧接口单位。
-- 双手末端：`frame` 必填 `world` 或 `local`，分别对应官方 frame=1/2；左右手均需完整 xyz（米）和单位四元数 xyzw。
-  不启用文档标为暂不支持的自定义 IK 参数或肘部约束。
+- 双臂卡片只提供`set`和必要的`stop_move`：`set`可填写`left_joint_1_rad`…`left_joint_7_rad`、`right_joint_1_rad`…`right_joint_7_rad`中的任意一个或多个绝对角度，单位**rad**。明确对应zarm_l1…l7/r1…r7。
+  省略、null或空白字段表示保持当前实测位置，0是有效目标；全部为空会拒绝。未指定关节在自动恢复后、实际发送前重新取实测角度，仍需模型、反馈和硬件核验限位有效。
+  移除卡片中的单关节动作和zero；旧客户端完整`move_joints(positions)`度数组及`set_pose`调用保留兼容分发，但不在卡片界面展示。
 - 下肢参照Q5的`set/zero`：`set`接受`knee_deg`、`leg_deg`、`waist_pitch_deg`、`waist_yaw_deg`中的一个或多个绝对**度**值，省略的保持实测值；`zero`归零全部4关节（含腰部）。兼容`move_joints(positions)`四个度值。
 - 腰部参照Q5的单轴形式：`waist_pitch(waist_pitch_rad)`、`waist_yaw(waist_yaw_rad)`使用绝对**rad**，保留其余下肢实测角度；`zero`仅归零这两个腰关节，与leg共用执行通道和同一份下肢核验限位。
 - 躯干：`x/z` 米、`pitch/yaw` 弧度，四个值均必填。文档不支持的 y/roll 不暴露。
 - 头部：`move_pos(yaw,pitch)`为绝对**度**，yaw范围[-80,80]、pitch[-25,25]；不要求速度或时长，无roll自由度。`zero`等同两个目标角度0。
+  yaw/pitch至少填写一个；省略、null或空白轴在实际发令前取当前实测角度，0是有效目标，不会把未填写的轴归零。
   使用SDK绝对话题，先清零残余速度；需新鲜且模型有效的真实关节反馈。命令后不同sensor_time的实测误差≤1°且跨越0.2s才报告ACP完成，20s未收敛或反馈中断会报错并尝试暂停。
   旧`head.move`速度/时长动作已删除，避免把旧画布速度值误当绝对角度，旧卡需重新选择move_pos。
 

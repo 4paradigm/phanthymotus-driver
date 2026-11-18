@@ -423,6 +423,11 @@ def _number(value, name, low=None, high=None):
     return value
 
 
+def _angle_supplied(arguments, field):
+    value = arguments.get(field)
+    return value is not None and not (isinstance(value, str) and not value.strip())
+
+
 def _vector(value, size, name):
     if not isinstance(value, list) or len(value) != size:
         raise ValueError(f"{name} must contain exactly {size} numbers")
@@ -672,33 +677,21 @@ class ArmPlugin(_KuavoPlugin):
               for i in range(1, 8)}
 
     def tool(self):
-        fields = {field: {'type': 'number', 'description': label + '绝对角度 rad；set省略时保持实测角度'}
+        fields = {field: {'type': 'number', 'description': label + '绝对角度 rad；不填时保持实测角度'}
                   for _, field, label in self.JOINTS.values()}
-        named = {name: ([field], label + '绝对角度 rad') for name, (_, field, label) in self.JOINTS.items()}
-        return self.schema("Kuavo 5-W 双臂绝对关节控制：按关节名输入rad或set同时设置多关节；未指定关节保持实测位置。需现场核验限位。", {
-            **fields,
-            "positions": _array_schema(14, "左臂7 + 右臂7关节，度"),
-            "frame": {"type": "string", "enum": ["world", "local"], "description": "末端命令坐标系，必填"},
-            "left_position": _array_schema(3, "左手 xyz 米"),
-            "right_position": _array_schema(3, "右手 xyz 米"),
-            "left_quaternion": _array_schema(4, "左手单位四元数 xyzw"),
-            "right_quaternion": _array_schema(4, "右手单位四元数 xyzw"),
-        }, {**named, 'set': (list(fields), '按名称同时设置部分/全部关节，rad；至少填写一个'),
-            'zero': ([], '双臂14关节绝对角度归零，需核验限位'),
-            "move_joints": (["positions"], "兼容整组14关节角度，度；需现场核验限位"),
-            "set_pose": (["frame", "left_position", "left_quaternion", "right_position", "right_quaternion"], "同时设置双手完整末端位姿"),
-            "stop_move": ([], "请求全身软件暂停")}, ["arm_l", "arm_r"], (*named, 'set', 'zero', "move_joints", "set_pose"),
-            required={**{name: [field] for name, (_, field, _) in self.JOINTS.items()},
-                      "move_joints": ["positions"], "set_pose": ["frame", "left_position", "left_quaternion", "right_position", "right_quaternion"]})
+        return self.schema('Kuavo 5-W 双臂set：同时设置部分或全部14关节绝对角度rad；未填写关节保持实测位置。需现场核验限位。',
+            fields, {'set': (list(fields), '同时设置双臂关节，rad；至少填写一个，未填保持当前实测角度'),
+                     'stop_move': ([], '请求全身软件暂停')}, ['arm_l', 'arm_r'], ('set',))
 
     def _dispatch(self, action, args):
-        if action in self.JOINTS or action in ('set', 'zero'):
-            selected = self.JOINTS if action in ('set', 'zero') else {action: self.JOINTS[action]}
-            updates = {i: 0. if action == 'zero' else _number(args[field], field)
-                       for i, field, _ in selected.values() if action == 'zero' or field in args}
+        if action == 'set':
+            updates = {i: _number(args[field], field) for i, field, _ in self.JOINTS.values()
+                       if _angle_supplied(args, field)}
             if not updates:
-                raise ValueError('at least one named absolute joint angle is required')
+                raise ValueError('set requires at least one absolute joint angle; omitted joints keep their measured positions')
             return self._joint_set(updates)
+        # Preserve the old full-array/Cartesian wire calls for existing clients;
+        # the card advertises only set and its software stop.
         if action == "move_joints":
             positions = _vector(args.get("positions"), 14, "positions")
             return self._async_reach("arm_reach_time", lambda: self.ros1.publish(
@@ -797,19 +790,30 @@ class HeadPlugin(_KuavoPlugin):
 
     def tool(self):
         return self.schema("Kuavo 5-W 头部绝对角度，单位度；yaw/pitch两自由度，使用实测到位确认ACP。", {
-            'yaw': {'type': 'number', 'minimum': -80, 'maximum': 80, 'description': '偏航绝对角度，度'},
-            'pitch': {'type': 'number', 'minimum': -25, 'maximum': 25, 'description': '俯仰绝对角度，度'},
-        }, {'move_pos': (['yaw', 'pitch'], '设置头部两个绝对角度，单位度'),
+            'yaw': {'type': 'number', 'minimum': -80, 'maximum': 80, 'description': '偏航绝对角度，度；不填保持当前实测角度'},
+            'pitch': {'type': 'number', 'minimum': -25, 'maximum': 25, 'description': '俯仰绝对角度，度；不填保持当前实测角度'},
+        }, {'move_pos': (['yaw', 'pitch'], '设置头部绝对角度，度；至少填一个，未填保持当前角度'),
             'zero': ([], '头部yaw/pitch绝对角度归零'),
-            'stop_move': ([], '请求全身软件暂停')}, 'head', ('move_pos', 'zero'),
-            required={'move_pos': ['yaw', 'pitch']})
+            'stop_move': ([], '请求全身软件暂停')}, 'head', ('move_pos', 'zero'))
 
     def _dispatch(self, action, args):
         if action not in ('move_pos', 'zero'):
             raise ValueError(f'unknown action: {action}; use move_pos with absolute yaw/pitch in degrees')
-        target_deg = [0., 0.] if action == 'zero' else [
-            _number(args.get('yaw'), 'yaw', -80, 80), _number(args.get('pitch'), 'pitch', -25, 25)]
-        target = [math.radians(v) for v in target_deg]
+        updates = {i: 0. if action == 'zero' else _number(args[field], field, low, high)
+                   for i, (field, low, high) in enumerate((('yaw', -80, 80), ('pitch', -25, 25)))
+                   if action == 'zero' or _angle_supplied(args, field)}
+        if not updates:
+            raise ValueError('move_pos requires yaw or pitch; omitted axes keep their measured angles')
+        target_deg, target = [0., 0.], [0., 0.]
+        def validate():
+            measured = self.bundle.sensors.joint_positions()
+            current = [math.degrees(v) for v in measured[0][18:20]]
+            for i, value in updates.items():
+                current[i] = value
+            target_deg[:] = [_number(value, field, low, high)
+                             for value, (field, low, high) in zip(current, (('yaw', -80, 80), ('pitch', -25, 25)))]
+            target[:] = [math.radians(value) for value in target_deg]
+            return measured
         def publish():
             # Cancel residual velocity integration before the SDK's absolute
             # head command. Both topics are implemented by ControlDataManager.
@@ -818,7 +822,7 @@ class HeadPlugin(_KuavoPlugin):
                               {'joint_data': target_deg})
         aid, cancelled, generation, issued, preparation = self.bundle.start_motion(
             self.CHANNEL, self.PREFIX, self.ALLOWED_MODES, publish,
-            self.bundle.sensors.joint_positions, request_epoch=self._request_context.stop_epoch)
+            validate, request_epoch=self._request_context.stop_epoch)
 
         def worker():
             converged_since_ns = last_capture_ns = None

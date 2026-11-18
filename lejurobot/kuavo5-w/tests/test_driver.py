@@ -1015,7 +1015,7 @@ class DriverContractTests(unittest.TestCase):
     def test_split_action_schemas_are_action_specific(self):
         tools = {t['name']: t for t in self.bundle.get_all_tools()}
         self.assertEqual(tools['loco']['inputSchema']['x-action-params']['move']['required'], ['duration'])
-        self.assertEqual(tools['arm']['inputSchema']['x-action-params']['move_joints']['required'], ['positions'])
+        self.assertEqual(set(tools['arm']['inputSchema']['properties']['action']['enum']), {'set', 'stop_move'})
 
     def test_joint_command_rejected_without_fresh_measurement(self):
         self.bundle.sensors._seen['joints'] = time.monotonic() - 1
@@ -1496,7 +1496,7 @@ class DriverContractTests(unittest.TestCase):
     def test_named_arm_angle_preserves_other_joints_and_converts_radians(self):
         q = [v / 100 for v in range(20)]
         self.ros.raw(q=q)
-        result = self.call('arm', 'left_joint_3', left_joint_3_rad=.25)
+        result = self.call('arm', 'set', left_joint_3_rad=.25)
         self.assertEqual(result['state'], 'executing')
         command = self.ros.published[-1][2]['position']
         expected = q[4:18]
@@ -1518,6 +1518,24 @@ class DriverContractTests(unittest.TestCase):
         positions = self.ros.published[-1][2]['position']
         self.assertAlmostEqual(positions[0], math.degrees(.1))
         self.assertAlmostEqual(positions[-1], math.degrees(.2))
+
+    def test_arm_set_blank_fields_hold_and_zero_is_a_target(self):
+        self.ros.raw(q=[.1] * 20)
+        result = self.call('arm', 'set', left_joint_1_rad=0., left_joint_2_rad=None,
+                           left_joint_3_rad='', right_joint_7_rad='   ')
+        self.assertEqual(result['state'], 'executing')
+        positions = self.ros.published[-1][2]['position']
+        self.assertEqual(positions[0], 0.)
+        for value in positions[1:]:
+            self.assertAlmostEqual(value, math.degrees(.1))
+
+    def test_arm_set_rejects_all_blank_or_invalid_fields_without_publishing(self):
+        for args in ({'left_joint_1_rad': None, 'right_joint_7_rad': ' '},
+                     {'left_joint_1_rad': 'ten'}, {'left_joint_1_rad': True}):
+            self.assertEqual(self.call('arm', 'set', **args)['state'], 'error')
+        for action in ('left_joint_1', 'right_joint_7', 'zero'):
+            self.assertEqual(self.call('arm', action)['state'], 'error')
+        self.assertFalse(self.ros.published)
 
     def test_named_leg_and_waist_targets_use_correct_lower_body_indices(self):
         self.ros.raw(q=[.1] * 20)
@@ -1551,7 +1569,7 @@ class DriverContractTests(unittest.TestCase):
     def test_new_joint_fields_reject_missing_or_out_of_range_angles(self):
         for card, action, args in [('arm', 'set', {}), ('leg', 'set', {}),
                                    ('arm', 'left_joint_1', {}),
-                                   ('arm', 'left_joint_1', {'left_joint_1_rad': 100.}),
+                                   ('arm', 'set', {'left_joint_1_rad': 100.}),
                                    ('waist', 'waist_pitch', {'waist_pitch_rad': float('nan')})]:
             self.assertEqual(self.call(card, action, **args)['state'], 'error')
         self.assertFalse(self.ros.published)
@@ -1560,7 +1578,7 @@ class DriverContractTests(unittest.TestCase):
         for action, args in [('move', {'yaw': 1., 'duration': 1.}),
                              ('move_pos', {'yaw': 81., 'pitch': 0.}),
                              ('move_pos', {'yaw': 0., 'pitch': -26.}),
-                             ('move_pos', {'yaw': 0.}),
+                             ('move_pos', {}),
                              ('move_pos', {'yaw': True, 'pitch': 0.})]:
             self.assertEqual(self.call('head', action, **args)['state'], 'error')
         self.bundle.sensors._seen['joints'] = time.monotonic() - 1.
@@ -1574,6 +1592,40 @@ class DriverContractTests(unittest.TestCase):
         time.sleep(.25)
         self.assertFalse(self.callbacks)
         self.assertTrue(self.bundle.tracker.current('head', result['action_id']))
+
+    def test_head_yaw_only_holds_measured_pitch(self):
+        self.ros.raw(q=[0.] * 18 + [math.radians(3), math.radians(7)])
+        result = self.call('head', 'move_pos', yaw=10.)
+        self.assertEqual(result['state'], 'executing')
+        self.assertAlmostEqual(result['pitch'], 7.)
+        self.assertEqual(self.ros.published[-1][0], '/robot_head_motion_data')
+        self.assertAlmostEqual(self.ros.published[-1][2]['joint_data'][1], 7.)
+
+    def test_head_pitch_only_holds_measured_yaw_and_blank_is_omitted(self):
+        self.ros.raw(q=[0.] * 18 + [math.radians(9), math.radians(7)])
+        result = self.call('head', 'move_pos', yaw=' ', pitch=0.)
+        self.assertEqual(result['state'], 'executing')
+        self.assertAlmostEqual(result['yaw'], 9.)
+        self.assertEqual(result['pitch'], 0.)
+
+    def test_head_all_blank_rejected_and_axes_not_required_in_schema(self):
+        self.assertEqual(self.call('head', 'move_pos', yaw=None, pitch='')['state'], 'error')
+        tool = next(p.tool() for p in self.bundle.plugins if p.PREFIX == 'head')
+        self.assertEqual(tool['inputSchema']['x-action-params']['move_pos']['required'], [])
+        self.assertFalse(self.ros.published)
+
+    def test_head_refreshes_omitted_axis_after_resume(self):
+        self.call('loco', 'stop_move')
+        original = self.bundle.confirm_control
+        def confirm(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if args[1] == '/enable_control' and args[3].get('data'):
+                self.ros.raw(q=[0.] * 18 + [0., math.radians(5)])
+            return result
+        with patch.object(self.bundle, 'confirm_control', side_effect=confirm):
+            result = self.call('head', 'move_pos', yaw=10., pitch=None)
+        self.assertEqual(result['state'], 'executing')
+        self.assertAlmostEqual(result['pitch'], 5.)
 
     def test_head_feedback_loss_aborts_instead_of_time_based_success(self):
         result = self.call('head', 'move_pos', yaw=10., pitch=0.)

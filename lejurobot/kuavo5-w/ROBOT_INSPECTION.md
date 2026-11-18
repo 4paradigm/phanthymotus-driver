@@ -605,3 +605,11 @@ host helper 的首次安装仍需现场管理员执行一次，详见 README。
   tools/list确认所有卡片无configSchema。三主机ready且changed=false，控制器PID仍361395，
   boot complete、initial_control_mode=3、control_enabled=false；speaker idle、音量30。
   本轮未发运动或音频目标。候选743108354字节，相对既有release增加6200400字节，未新增依赖。
+
+### 说话链路与关节反馈排查（2026-11-18）
+
+- 用户再次触发TTS后确认听到语音。同一speaker会话由0字节增加到36864字节，对应两次各18432字节的语音；`/perception/tts`发布者与订阅者QoS均为BEST_EFFORT，speaker无错误。此次恢复前仅做只读检查，没有重启服务、调整音量或修改播放链路，因此不能将恢复归功于代码修复，也尚未确认此前不出声的完整原因。
+- 容器当前为release.261118.d868826。`/sensors_data_raw`由`/nodelet_manager`持续发布，4秒观察到1682帧且有20个关节值；并非没有全身反馈发布者。样本sensor_time为1794992375.614862646、header.stamp为1794992376.438559897，接收时刻为1794992376.4435966。采集时间比header慢约0.824秒，因此被0.5秒采集新鲜度限制拒绝。
+- 厂商硬件节点以installed/lib/libnodelet_hardware_cxx.so提供；已查到的控制源码只消费sensor_time，未找到其生成源码，尚不能区分内部时基偏差与实际采集积压。保留原采集时间新鲜度和防重放检查，错误新增实际capture_age_s，不能用新header或接收时间将旧采集洗白。现场仍无arm/leg硬件核验限位记录，这是关节控制的另一道独立限制。
+- head参数允许单轴绝对角度；另一轴从实测值补齐，并在自动恢复后重新读取。arm卡片只展示set/stop_move，14个rad字段任意填写，null/空白保持实测值，0作为有效目标；移除单关节动作与zero，旧完整数组/末端客户端分发保留兼容。
+- 本轮没有发送有效运动目标、重启电机控制器或修改真机播放服务。参数修复不等于真机head/arm运动已验收；时间戳来源和硬件限位仍需确认。
