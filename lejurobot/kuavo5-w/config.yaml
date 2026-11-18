@@ -16,14 +16,12 @@ provisioning:
   # Fixed allowlist only, when existing vendor ROS/PulseAudio lacks a dependency.
   install_missing_packages: true
   auto_initialize_and_pause: true
-  # Override addresses/users/workspaces for a different factory installation.
-  # Default passwords are centralized in connection_defaults.py as requested.
-  # Private overrides: loco shared config, environment or ssh-secrets.json (0600).
+  # Addresses/users/ROS IPs/passwords default to connection_defaults.py.
+  # No card-level connection configuration; edit that module and rebuild.
+  # Advanced private overrides: environment or ssh-secrets.json (0600).
   # Set use_default_credentials: false per role to require explicit keys/secrets.
   # Upper host is local to the host-network container.
-  host: {address: 127.0.0.1, user: leju_kuavo, ros_ip: 192.168.26.12}
-  controller: {address: 192.168.26.1, user: lab, ros_ip: 192.168.26.1}
-  chassis: {address: 192.168.26.22, user: jt, ros_ip: 192.168.26.22, volume: 30}
+  chassis: {volume: 30}
 # Start rosbridge_server on the ROS Noetic host and point this URL at it.
 rosbridge_url: "ws://127.0.0.1:9090"
 sensors:

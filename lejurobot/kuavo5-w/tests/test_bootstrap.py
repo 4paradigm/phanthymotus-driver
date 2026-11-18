@@ -107,29 +107,6 @@ class BootstrapTests(unittest.TestCase):
                     bootstrap.SshTransport(self.directory).run('host', target, {}, '', {})
                 run.assert_not_called()
 
-    def test_dashboard_config_persists_secrets_separately_and_does_not_echo(self):
-        manager = bootstrap.AutoProvisioner()
-        result = manager.configure({'provision_controller_password': '   ',
-                                    'provision_chassis_password': 'private-value',
-                                    'provision_host_address': '192.0.2.1'})
-        self.assertNotIn('private-value', json.dumps(result) + json.dumps(manager.snapshot()))
-        config = (self.directory / 'config.yaml').read_text()
-        self.assertNotIn('private-value', config)
-        self.assertIn('192.0.2.1', config)
-        secrets = self.directory / 'ssh-secrets.json'
-        self.assertEqual(secrets.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(json.loads(secrets.read_text())['controller']['password'], '   ')
-        manager.configure({'provision_chassis_password': ''})
-        self.assertEqual(json.loads(secrets.read_text())['chassis']['password'], 'private-value')
-
-    def test_schema_marks_every_password_sensitive(self):
-        schema = bootstrap.config_schema()['properties']
-        for name, field in schema.items():
-            if 'password' in name:
-                self.assertEqual(field['format'], 'password')
-                self.assertTrue(field['x-sensitive'])
-                self.assertNotIn('default', field)
-
     def test_auto_provision_delivers_controller_overlay_to_upper_host(self):
         transport = Mock()
         messages = {'kuavo_msgs/msg/__init__.py': encoded('actual controller fixture')}
@@ -203,23 +180,22 @@ class BootstrapTests(unittest.TestCase):
         manager.request('chassis')
         manager.once()
         self.assertEqual(transport.run.call_count, 3)
-        manager.configure({'provision_host_password': 'updated-private-value'})
-        manager.once()
+        with patch.object(bootstrap.time, 'monotonic', return_value=bootstrap.time.monotonic() + 31):
+            manager.once()
         self.assertEqual(transport.run.call_count, 6)
 
-    def test_reapplied_core_config_does_not_reset_failed_connection_backoff(self):
-        transport = Mock()
-        transport.run.side_effect = bootstrap.ProvisionError('ssh_auth_host_key_or_remote_access_failed')
-        manager = bootstrap.AutoProvisioner(transport=transport)
-        manager.configure({'provision_host_password': 'test-private-value'})
-        path = self.directory / 'config.yaml'
-        modified = path.stat().st_mtime_ns
-        manager.once()
-        manager.configure({'provision_host_password': 'test-private-value'})
-        manager.configure({})
-        manager.once()
-        self.assertEqual(transport.run.call_count, 3)
-        self.assertEqual(path.stat().st_mtime_ns, modified)
+    def test_packaged_connection_defaults_are_not_shadowed_by_yaml(self):
+        import yaml
+        settings = yaml.safe_load((ROOT / 'config.yaml').read_text())['provisioning']
+        manager = bootstrap.AutoProvisioner(settings)
+        for role in bootstrap.DEFAULTS:
+            self.assertNotIn('address', settings.get(role, {}))
+            self.assertNotIn('user', settings.get(role, {}))
+            self.assertNotIn('ros_ip', settings.get(role, {}))
+            updated = {**bootstrap.DEFAULTS[role], 'address': '192.0.2.10', 'user': 'operator'}
+            with patch.dict(bootstrap.DEFAULTS, {role: updated}):
+                self.assertEqual(manager._target(role)['address'], '192.0.2.10')
+                self.assertEqual(manager._target(role)['user'], 'operator')
 
 
 class RemoteTests(unittest.TestCase):

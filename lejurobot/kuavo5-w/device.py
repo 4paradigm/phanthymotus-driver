@@ -19,7 +19,6 @@ from std_msgs.msg import String
 from kuavo_sensors import KuavoSensors, SENSOR_CARDS
 from peripherals import Peripherals, CARDS as PERIPHERAL_CARDS
 from speaker import Speaker
-from bootstrap import config_schema as provisioning_schema
 from startup import StartupChecks
 
 
@@ -1243,9 +1242,6 @@ class KuavoBundle:
 
     def get_all_tools(self):
         tools = [p.get_tool() for p in self.plugins if p.PREFIX in self._enabled]
-        for tool in tools:
-            if tool['name'] == 'loco':
-                tool['configSchema'] = provisioning_schema()
         return (tools + [t for t in self.sensors.tools() if t['name'] in self._enabled]
                 + [t for t in self.peripherals.tools() if t['name'] in self._enabled]
                 + ([self.speaker.tool()] if 'speaker' in self._enabled else []))
@@ -1265,8 +1261,6 @@ class KuavoBundle:
             return None
         if self._closing:
             return {"state": "error", "error": "driver is shutting down"}
-        if name == 'loco' and action == 'config':
-            return self.startup_checks.provisioner.configure(args)
         if name == 'speaker':
             return self.speaker.dispatch(action, args)
         if name in PERIPHERAL_CARDS:

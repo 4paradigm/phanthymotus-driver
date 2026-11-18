@@ -41,15 +41,17 @@ Dashboard/PR镜像部署片段把宿主机 `/opt/phanthy-motus/drivers/lejurobot
 已有操作配置、关节限位、禁用设置和凭据不被镜像默认值覆盖；不再要求部署前手工创建配置文件。
 `CONFIG_PATH` 显式指向其他路径但文件缺失，或已有YAML损坏时仍报错，不悄悄回退。
 
-整机连接配置入口：驱动卡片列表中 `loco` 的全局变量/共享配置（侧栏配置齿轮），与天工ext_mic的共享配置形式相同。
-这是整个KuavoBundle共用的一份连接配置，不是每张执行卡各配一次；speaker/head/arm/leg/waist等不自行SSH登录。
-日常动作仍走ROS1/rosbridge，SSH仅供统一后台准备/修复三台主机。也不需要先往画布放一张loco卡才能使用默认配置。
+整机连接默认值统一位于 `connection_defaults.py`：`DEFAULTS` 保存三台主机的地址、账号、ROS IP，
+`DEFAULT_PASSWORDS` 保存对应默认SSH密码。`loco`及其他卡片不再提供连接参数configSchema或config动作；
+不需要往画布放置额外配置卡。日常动作走ROS1/rosbridge，SSH仅供统一后台准备/修复三台主机。
 
-按操作人员要求，`connection_defaults.py` 已内置当前5-W/Jaten三机拓扑的地址、账号和默认密码；
-保持这些默认配置的同款机器无需首次手工填密码。它们是当前现场确认的连接默认值，不作为所有批次、所有官方文档版本的通用凭据声明。
-非默认安装、改过密码或网络的机器，只在上述一处填写覆盖值；环境变量优先于0600私有文件，再回退内置值。
-Core发送系统 `config` 动作后自动保存并开始准备。所有用户密码字段均声明
-`format: password` / `x-sensitive: true`，不会随Solution公开打包；驱动不在响应、日志或schema中回显密码。
+按操作人员要求，镜像内置当前5-W/Jaten现场确认的默认值。正常部署无需填写账号密码；
+默认值变化时修改上述模块，重新构建镜像并重建容器生效，重启旧镜像不会获得源码修改。
+包内YAML不再重复地址/账号/ROS IP，避免遮蔽模块默认值。
+这些值不作为所有批次、所有官方文档版本的通用凭据声明。
+
+兼容已有部署的显式覆盖仍保留：环境变量、操作配置中的角色字段及0600私有凭据文件优先于模块默认值。
+因此修改模块后，若旧部署曾配置相同字段，需同时移除或更新对应覆盖；驱动不会擅自覆盖已有操作配置。
 也可通过 `KUAVO_HOST/CONTROLLER/CHASSIS_SSH_PASSWORD`、相应 `SUDO_PASSWORD` 环境变量，
 或宿主机配置目录内0600权限的 `ssh-secrets.json` 提供连接信息：
 
@@ -65,7 +67,7 @@ Core发送系统 `config` 动作后自动保存并开始准备。所有用户密
 显式配置私钥时优先使用非交互公钥认证，不因内置密码阻止私钥使用。
 每台主机可设 `use_default_credentials: false` 禁用其内置密码回退，改用公钥/显式凭据；只尝试选定的一套凭据，不轮询猜密码。
 空环境默认值不遮蔽私有文件，空格密码不被trim。OpenSSH使用accept-new首次信任并持久化known_hosts；
-主机密钥变化报错，不用StrictHostKeyChecking=no绕过。无法登录时MCP仍可提供配置及分主机错误，
+主机密钥变化报错，不用StrictHostKeyChecking=no绕过。无法登录时MCP仍可提供分主机诊断错误，
 不会因此伪造传感数据或放开运动。
 
 默认ROS网络：上位机容器通过127.0.0.1登录本机，ROS_IP=192.168.26.12；

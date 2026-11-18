@@ -11,9 +11,7 @@ import re
 import shlex
 import subprocess
 import threading
-import tempfile
 import time
-import yaml
 from connection_defaults import DEFAULTS, DEFAULT_PASSWORDS
 
 ROOT = Path(__file__).resolve().parent
@@ -22,23 +20,6 @@ FILES = ('config.yaml', 'host/install.py', 'host/install_controller.py',
          'host/rosbridge_loopback.py', 'host/rosbridge.launch', 'host/runtime_manager.py',
          'host/battery_relay.py', 'host/head_camera.launch', 'host/head_jpeg.py', 'host/head_depth.py')
 
-
-def config_schema():
-    properties = {}
-    labels = {'host': '上位机', 'controller': '控制下位机', 'chassis': '独立底盘'}
-    fields = {'address': 'SSH地址', 'user': 'SSH账号', 'password': 'SSH密码', 'sudo_password': 'sudo密码（与SSH不同才填）'}
-    for role, defaults in DEFAULTS.items():
-        for field in ('address', 'user', 'password', 'sudo_password'):
-            key = 'provision_' + role + '_' + field
-            properties[key] = {'type': 'string', 'description': '整机共用 · ' + labels[role] + fields[field],
-                               'scope': 'shared'}
-            if field in ('password', 'sudo_password'):
-                properties[key].update(format='password', **{'x-sensitive': True})
-                if field == 'password':
-                    properties[key]['description'] += '（留空使用内置默认值）'
-            else:
-                properties[key]['default'] = defaults[field]
-    return {'type': 'object', 'properties': properties}
 
 
 class ProvisionError(RuntimeError):
@@ -152,56 +133,6 @@ class AutoProvisioner:
     def snapshot(self):
         with self._lock:
             return json.loads(json.dumps(self.status))
-
-    def configure(self, arguments):
-        """Core config action: persist only supplied fields; never echo secrets."""
-        secret_path = Path(os.environ.get('KUAVO_SSH_SECRETS', str(self.state_dir / 'ssh-secrets.json')))
-        with self._lock:
-            secrets = load_secrets(secret_path)
-            previous_secrets = json.dumps(secrets, sort_keys=True)
-            settings = json.loads(json.dumps(self.settings))
-            for role in DEFAULTS:
-                for field in ('address', 'user', 'password', 'sudo_password'):
-                    key = 'provision_' + role + '_' + field
-                    value = arguments.get(key)
-                    if value is None or value == '':
-                        continue  # redacted/unset config must not erase a working credential
-                    if not isinstance(value, str) or len(value) > 1024 or '\n' in value or '\x00' in value:
-                        raise ProvisionError('invalid_connection_configuration')
-                    if field in ('password', 'sudo_password'):
-                        secrets.setdefault(role, {})[field] = value
-                    else:
-                        pattern = r'[A-Za-z0-9_.:-]+' if field == 'address' else r'[A-Za-z_][A-Za-z0-9_-]*'
-                        if not re.fullmatch(pattern, value) or value.startswith('-'):
-                            raise ProvisionError('invalid_connection_configuration')
-                        settings.setdefault(role, {})[field] = value
-            # Core reapplies config before ordinary actions. An unchanged
-            # reapplication must not rewrite files or bypass SSH backoff.
-            if settings == self.settings and json.dumps(secrets, sort_keys=True) == previous_secrets:
-                return {'state': 'configured', 'message': 'Connection settings unchanged'}
-            self.state_dir.mkdir(parents=True, exist_ok=True)
-            # Config and secrets have separate lifetimes and permissions. No
-            # secret goes into public defaults, logs, tool schema, or status.
-            secret_path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(mode='w', dir=secret_path.parent, delete=False) as stream:
-                json.dump(secrets, stream)
-                temporary = Path(stream.name)
-            temporary.chmod(0o600)
-            temporary.replace(secret_path)
-            path = Path(os.environ.get('CONFIG_PATH', str(self.state_dir / 'config.yaml')))
-            existing = yaml.safe_load(path.read_text()) if path.exists() else {}
-            if not isinstance(existing, dict):
-                raise ProvisionError('invalid_operator_config')
-            existing['provisioning'] = settings
-            with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as stream:
-                yaml.safe_dump(existing, stream, sort_keys=False)
-                temporary = Path(stream.name)
-            temporary.chmod(0o600)
-            temporary.replace(path)
-            self.settings = settings
-            self._retry_at.clear()
-        self.request()
-        return {'state': 'configured', 'message': 'Connection settings saved; automatic provisioning requested'}
 
     def _target(self, role):
         config = {**DEFAULTS[role], **self.settings.get(role, {})}

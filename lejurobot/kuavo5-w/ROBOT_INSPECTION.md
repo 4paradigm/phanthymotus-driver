@@ -591,3 +591,17 @@ host helper 的首次安装仍需现场管理员执行一次，详见 README。
 - 301项离线测试通过。容器重建前后控制器MainPID仍361395，boot complete、BaseArm3、
   control_enabled=false保持。未重启控制器、未发送有效运动目标；第二台同款、完整冷启动、
   真实头部/手臂/腰腿目标与物理停止仍待现场验收，mic和controlled_spatial没有新增可用能力。
+
+### 移除卡片连接配置入口（2026-11-18）
+
+本节取代前文loco共享配置入口的说明。
+
+- 按操作人员要求移除loco的configSchema及config动作分发，删除后台对应的运行时配置写入函数。
+  全部卡片不再暴露SSH地址/账号/密码输入；旧config请求明确拒绝，不修改连接信息或发送运动命令。
+- 连接默认值保留在connection_defaults.py，删除包内YAML重复的地址/账号/ROS IP，
+  使新部署修改该模块并重建镜像后能使用新默认值。现有显式部署覆盖继续保留，需自行更新/移除才会回退默认值。
+- 自动准备、只读诊断和执行接口保持，未改变控制器开机/恢复或运动门控。
+- 301项离线测试、编译、service checker和diff检查通过；真机候选32fa1b962708构建并部署后，
+  tools/list确认所有卡片无configSchema。三主机ready且changed=false，控制器PID仍361395，
+  boot complete、initial_control_mode=3、control_enabled=false；speaker idle、音量30。
+  本轮未发运动或音频目标。候选743108354字节，相对既有release增加6200400字节，未新增依赖。

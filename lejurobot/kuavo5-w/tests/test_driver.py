@@ -222,6 +222,23 @@ class DriverContractTests(unittest.TestCase):
         self.assertTrue({'state', 'switch_mode'}.isdisjoint(
             {tool['name'] for tool in self.bundle.get_all_tools()}))
 
+    def test_connection_settings_are_not_exposed_on_cards(self):
+        for tool in self.bundle.get_all_tools():
+            self.assertNotIn('configSchema', tool)
+            self.assertNotIn('config', tool['inputSchema'].get('properties', {}).get('action', {}).get('enum', []))
+
+    def test_removed_loco_config_cannot_change_connections_or_send_commands(self):
+        manager = self.bundle.startup_checks.provisioner
+        before = {role: manager._target(role) for role in ('host', 'controller', 'chassis')}
+        with patch.object(manager.transport, 'run') as run:
+            result = self.call('loco', 'config', provision_host_address='192.0.2.1',
+                               provision_controller_password='unused')
+        self.assertEqual(result['state'], 'error')
+        self.assertEqual(before, {role: manager._target(role) for role in before})
+        run.assert_not_called()
+        self.assertFalse(self.ros.published)
+        self.assertFalse(self.ros.sent_services)
+
     def test_removed_control_card_cannot_be_reenabled_by_legacy_configuration(self):
         legacy = driver.KuavoBundle({'plugins': {'switch_mode': {'enabled': True},
                                                 'loco': {'enabled': True}}},
