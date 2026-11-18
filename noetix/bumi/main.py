@@ -148,6 +148,12 @@ class BumiDeviceBundle:
             self._plugins.append(loco_plugin)
             print("[bundle] LocoPlugin loaded")
 
+        if plugins_cfg.get("motor_enable", {}).get("enabled", False) and high_ctrl is not None:
+            from motor_enable import MotorEnablePlugin
+            self._plugins.append(MotorEnablePlugin(
+                plugins_cfg["motor_enable"], namespace, executor, high_ctrl))
+            print("[bundle] MotorEnablePlugin loaded")
+
         if (plugins_cfg.get("loco_servo", {}).get("enabled", False)
                 and high_ctrl is not None):
             from loco_servo import LocoServoPlugin

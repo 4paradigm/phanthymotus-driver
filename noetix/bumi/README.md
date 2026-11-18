@@ -370,9 +370,42 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 
 ## Direct action cards
 
-The former `switch_mode` tool is split into three user-facing cards. Internal
-`enable`, `ready` and `walk` transitions are completed automatically and are no
-longer exposed as user choices:
+### Exit disabled mode: `motor_enable`
+
+`motor_enable` is a standalone actuator plugin, controlled by
+`plugins.motor_enable.enabled`. It does not depend on `loco` or any other card.
+It uses the existing HighController connection and has no additional worker.
+
+- `start` / `stop` are lifecycle actions and never toggle motor power. `stop`
+  cancels pending observation; it cannot undo a START already delivered.
+- `info` reads workmode and whether an earlier enable attempt remains uncertain.
+- `enable(confirm=true)` requires safe face-up placement on a flat, non-slip
+  surface, free joints and a clear movement area. Enabling can move joints to
+  zero; it does not stand the robot up or start walking.
+- From disabled (30), send START once, release it with DEFAULT, and wait up to
+  3 seconds for enabled (0). Already enabled is a no-op. Protection (26), ready,
+  walking, action and unknown modes are refused. Concurrent calls to this card
+  are refused while an enable is in progress.
+- Missing/failed feedback is not success. An uncertain START attempt blocks
+  another START through this card during
+  this driver process. Observing 0 on a subsequent `enable` clears that guard
+  without publishing. Restarting the driver clears the in-memory guard; it is
+  not a recovery action and must not be used to blindly retry.
+
+The vendor [Bumi documentation](https://web.noetixrobotics.com/docs/) defines
+START as a toggle: outside mode 30 it **disables** the robot. The driver checks
+mode again immediately before sending, but the SDK exposes cached mode without
+a source timestamp or an atomic compare-and-enable API. This standalone card
+does not coordinate or pause other cards: stop all other motion commands and do
+not operate the App or another SDK controller concurrently. Other cards can
+still issue their own START, including after an unconfirmed attempt; inspect the
+robot and state before using them. `completed` means enabled mode was
+observed, not that physical joint motion has finished. Firmware protection is
+not bypassed. Hardware validation is still required for the installed firmware.
+
+The former `switch_mode` tool is split into direct action cards. The following
+three cards complete their required `enable`, `ready` and `walk` transitions
+automatically:
 
 - `stand_up_lie_prone`: `stand_up` from a face-up lying pose, or `lie_prone`
   from a stable standing pose into the prone storage posture;

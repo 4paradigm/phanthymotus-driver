@@ -21,6 +21,7 @@ cards:
   - { name: loco_relative_move,       type: actuator }
   - { name: loco_servo,        type: actuator }
   - { name: stand_up_lie_prone, type: actuator }
+  - { name: motor_enable,      type: actuator }
   - { name: semantic_action,   type: actuator }
   - { name: action_recording,  type: actuator }
   - { name: mic,               type: sensor }

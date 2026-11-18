@@ -170,3 +170,15 @@ def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
     assert [tool["name"] for tool in bundle.get_all_tools()] == [
         "loco", "loco_servo", "speaker"]
 
+
+def test_motor_enable_registers_without_locomotion_cards(bundle_module):
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["motor_enable"] = {"enabled": True}
+    ctrl = FakeHighCtrl()
+    ctrl.get_mode = lambda: 30
+    bundle = bundle_module.BumiDeviceBundle(config, "bumi_test", object(), ctrl, None)
+
+    assert [tool["name"] for tool in bundle.get_all_tools()] == ["motor_enable"]
+    assert bundle.dispatch("motor_enable", {"action": "start"})["state"] == "ready"
+    assert bundle.dispatch("motor_enable", {"action": "info"})["workmode"] == 30
+
