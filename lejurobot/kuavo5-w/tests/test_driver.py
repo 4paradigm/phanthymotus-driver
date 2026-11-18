@@ -227,6 +227,17 @@ class DriverContractTests(unittest.TestCase):
             self.assertNotIn('configSchema', tool)
             self.assertNotIn('config', tool['inputSchema'].get('properties', {}).get('action', {}).get('enum', []))
 
+    def test_model_without_action_remains_a_resource_fetch_across_lifecycle(self):
+        model = {'urdf': self.bundle.sensors._model_path.read_text()}
+        self.assertEqual(self.bundle.dispatch('model', {}), model)
+        self.assertEqual(self.call('model', 'start'), {'state': 'running'})
+        self.assertEqual(self.call('model', 'info'), {'state': 'running'})
+        self.assertEqual(self.bundle.dispatch('model', {}), model)
+        self.assertEqual(self.call('model', 'stop'), {'state': 'idle'})
+        self.assertEqual(self.bundle.dispatch('model', {}), model)
+        self.assertFalse(self.ros.published)
+        self.assertFalse(self.ros.sent_services)
+
     def test_removed_loco_config_cannot_change_connections_or_send_commands(self):
         manager = self.bundle.startup_checks.provisioner
         before = {role: manager._target(role) for role in ('host', 'controller', 'chassis')}

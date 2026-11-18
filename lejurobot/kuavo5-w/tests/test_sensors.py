@@ -277,6 +277,30 @@ class SensorTests(unittest.TestCase):
             with patch.object(type(self.hub._model_path), 'read_text', return_value=xml):
                 self.assertIn('error', self.hub.dispatch('model', 'read'))
 
+    def test_model_lifecycle_markers_are_idempotent_and_preserve_resource_reads(self):
+        model = self.hub.dispatch('model', 'read')
+        self.assertEqual(self.hub.dispatch('model', 'info'), {'state': 'idle'})
+        for _ in range(2):
+            self.assertEqual(self.hub.dispatch('model', 'start'), {'state': 'running'})
+        self.assertEqual(self.hub.dispatch('model', 'info'), {'state': 'running'})
+        self.assertEqual(self.hub.dispatch('model', 'read'), model)
+        self.assertNotIn('model', self.hub._running)
+        self.hub.tick()  # A resource must never enter the sensor publication loop.
+        self.assertTrue(all(not pub.messages for pub in self.hub._pubs.values()))
+        for _ in range(2):
+            self.assertEqual(self.hub.dispatch('model', 'stop'), {'state': 'idle'})
+        self.assertEqual(self.hub.dispatch('model', 'info'), {'state': 'idle'})
+        self.assertEqual(self.hub.dispatch('model', 'read'), model)
+        self.assertFalse(self.ros.published)
+
+    def test_model_lifecycle_is_offline_and_does_not_read_urdf(self):
+        self.ros.connection = (False, 2)
+        with patch.object(type(self.hub._model_path), 'read_text', side_effect=FileNotFoundError('missing')):
+            self.assertEqual(self.hub.dispatch('model', 'start'), {'state': 'running'})
+            self.assertEqual(self.hub.dispatch('model', 'stop'), {'state': 'idle'})
+            self.assertIn('error', self.hub.dispatch('model', 'read'))
+        self.assertFalse(self.ros.published)
+
     def test_runtime_joint_names_must_match_displayed_model(self):
         self.ros.raw()
         self.ros.params['humanoid_description'] = self.ros.params['humanoid_description'].replace(

@@ -76,6 +76,49 @@ Dashboard/PR镜像部署片段把宿主机 `/opt/phanthy-motus/drivers/lejurobot
 地址/账号也可用 `KUAVO_<ROLE>_ADDRESS/USER/ROS_IP/WORKSPACE` 环境变量覆盖。
 自动发现对应用户及/home下的厂商应用/控制工作区，匹配不唯一就报错，不猜测另一份工作区。
 
+### 部署时提供凭据（无需卡片配置）
+
+以下是现有的部署级覆盖方式，整机只配置一次。它们不会自动删除镜像内的默认密码；
+若要完全采纳凭据审查建议，还需另行去掉内置密码回退并更换已公开的真实密码。
+
+**方式一：宿主机私有文件（现有部署可直接使用）。** 部署片段已将
+`/opt/phanthy-motus/drivers/lejurobot-kuavo5-w/` 映射到容器 `/config`，无需新增挂载。
+在机器人上位机执行下列命令；touch不覆盖已有文件，编辑时保留其他角色的已有内容：
+
+```sh
+sudo install -d -m 0700 /opt/phanthy-motus/drivers/lejurobot-kuavo5-w
+sudo touch /opt/phanthy-motus/drivers/lejurobot-kuavo5-w/ssh-secrets.json
+sudo chmod 0600 /opt/phanthy-motus/drivers/lejurobot-kuavo5-w/ssh-secrets.json
+sudoedit /opt/phanthy-motus/drivers/lejurobot-kuavo5-w/ssh-secrets.json
+```
+
+填写上文host/controller/chassis的JSON，将占位内容替换为真实SSH密码；sudo密码相同时不用另填。
+文件不提交Git、不复制入镜像。后台每轮准备时重新读取，通常下一轮约30秒内使用，无需重建镜像。
+只要显式覆盖了所有需要密码认证的角色，就不会为这些角色使用内置密码。
+
+**方式二：环境变量。** 现有Compose片段已转发三台主机的SSH及sudo密码变量。
+例如用交互输入给出上位机密码，避免在命令字面量中写密码；其他两角色同理：
+
+```sh
+read -rs KUAVO_HOST_SSH_PASSWORD; echo
+export KUAVO_HOST_SSH_PASSWORD
+# 使用实际部署的Compose文件和project参数：
+docker compose -p your-project -f /path/to/docker-compose.yml up -d --force-recreate
+unset KUAVO_HOST_SSH_PASSWORD
+```
+
+另两角色为`KUAVO_CONTROLLER_SSH_PASSWORD`和`KUAVO_CHASSIS_SSH_PASSWORD`；
+sudo密码不同时分别设置相应`KUAVO_<ROLE>_SUDO_PASSWORD`。
+必须在运行Compose的同一环境设置，宿主机export不会改变已运行容器，单纯docker restart也不注入新值。
+非空环境密码优先于秘密文件；环境变量可被有容器管理权限的人查看，因此优先考虑私有文件或密钥。
+
+**方式三：SSH密钥。** 为部署生成密钥，将公钥分别加入三台主机对应账号的authorized_keys；
+私钥留在上位机专用目录（例如宿主机配置目录的ssh/id_ed25519，权限0600），不要提交或复制进镜像。
+现有目录挂载后，秘密文件中的三个角色可分别写`{"key_file":"/config/ssh/id_ed25519"}`，
+也可以使用各自独立密钥。注意这里填写的是容器内路径，并移除同角色旧password字段及非空SSH密码环境变量，
+避免显式密码继续选择密码认证。密钥存在时不会回退内置密码；sudo需配置目标机非交互权限，
+否则在该角色的秘密文件记录中单独提供sudo_password。
+
 | 目标 | 容器自动完成 |
 | --- | --- |
 | 控制下位机 | 查找版本63轮臂工作区和Drake，取得该控制器生成的kuavo_msgs；分发开机监管、安装systemd单元，首次本次开机未尝试过时启动，完成初始化→BaseArm确认→软件暂停 |
@@ -241,6 +284,8 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 | `model` | resource 读取 | 本地 `resource/kuavo5w_model.urdf` 参考骨架；离线可读 |
 
 sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 resource。
+`model.start/stop/info`仅返回独立生命周期状态，不加入传感器发布循环；
+显式`read`或不带action的模型请求返回普通`{"urdf": "..."}`字典，保持前端骨架读取兼容。
 业务参数通过 `x-action-params` 分组并声明动作各自的 required；`dispatch()` 返回普通 dict，HTTP 层只包装一次 MCP content。
 `config.yaml` 的 `plugins.<card>.enabled` 决定卡片是否暴露。
 

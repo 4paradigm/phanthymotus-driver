@@ -113,6 +113,7 @@ class KuavoSensors:
         self._display_pose = {}
         self._pose_seen = None
         self._running = set()
+        self._model_running = False  # Resource lifecycle, never a telemetry stream.
         self._body_frames = set(config.get('odom_body_frames', ['base_link', 'base_footprint']))
         self._torque_unit = config.get('joint_torque_unit')
         self._imu_topic = config.get('imu_topic', '/imu')
@@ -634,6 +635,10 @@ class KuavoSensors:
         self._session()
         with self._lock:
             if card == 'model':
+                if action in ('start', 'stop', 'info'):
+                    if action != 'info':
+                        self._model_running = action == 'start'
+                    return {'state': 'running' if self._model_running else 'idle'}
                 try:
                     urdf = self._model_path.read_text(encoding='utf-8')
                     model_names(urdf)
@@ -660,3 +665,4 @@ class KuavoSensors:
         self._closed.set()
         with self._lock:
             self._running.clear()
+            self._model_running = False

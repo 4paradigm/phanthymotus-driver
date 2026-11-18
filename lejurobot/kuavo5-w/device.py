@@ -1256,7 +1256,8 @@ class KuavoBundle:
 
     def dispatch(self, name, args):
         args = dict(args)
-        action = args.pop("action", "start")
+        # The skeleton renderer fetches the resource with arguments={}.
+        action = args.pop("action", "read" if name == "model" else "start")
         if name not in self._enabled:
             return None
         if self._closing:
