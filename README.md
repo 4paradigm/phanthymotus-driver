@@ -14,6 +14,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | [`dobot/cra`](dobot/cra/README.md) | Dobot CRA V4 | 15746 | Official SDK; 30 Hz joint skeleton/angles and absolute joint motion |
 | `pico/4ultra` | PICO 4 Ultra | 15742 | Independent teleop_device; signed App, pairing, DDS controller input |
 | `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
+| [`generic/teleopit`](generic/teleopit/README.md) | Teleopit G1 29DoF simulation | 15719 | BVH/PICO whole-body input, MuJoCo preview and joint diagnostics; no hardware output |
 | `unitree/go1` | Unitree Go1 (EDU) Quadruped | 15715 | State, locomotion, camera (RGB/depth/pointcloud), ext peripherals, URDF |
 | `unitree/go2` | Unitree Go2 Quadruped | 15703 | Locomotion, obstacle avoidance, voice, video, navigation |
 | `unitree/r1` | Unitree R1 (EDU) Humanoid | 15702 | Mic, TTS, LED, locomotion, stereo camera, state monitoring |
