@@ -71,16 +71,12 @@ for these concrete runtime paths:
 For a base-image update, measure package-layer changes with `docker history`
 instead of recording a size that becomes stale with the moving base image.
 
-Physical motion is disabled by default. Standard deployment enables it only
-when the mounted host file
-`/opt/phanthy-motus/data/panther-motion.authorization` contains exactly
-`ENABLE_PANTHER_MOTION`. Removing that file and restarting disables motion.
-This explicit host action cannot be inherited accidentally from the Compose
-environment and is not exposed as an MCP argument. Clicking Execute is the
-per-command user confirmation, so `confirm_motion` is not displayed on the
-cards; the plugin injects it only at the low-level device boundary. Commands
-are still rejected unless the deployment gate and live
-robot/controller state and configured limits pass their card-specific checks.
+Physical capabilities are registered only when their plugin has
+`enabled: true`. Motion cards are declared as `type: actuator`, so Agent Core
+applies its platform-level execution confirmation; Panther does not expose or
+inject a second `confirm_motion` parameter. After confirmation, commands are
+still rejected unless live robot/controller state and configured limits pass
+their card-specific checks.
 Arm and head commands
 also require a live `/robot_description`; missing limits cause a hard rejection
 rather than a guessed fallback. Base and arm movements are

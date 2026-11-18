@@ -5,13 +5,11 @@ from __future__ import annotations
 import math
 import time
 import xml.etree.ElementTree as ET
-from pathlib import Path
 from typing import Optional
 
 
 LEFT_ARM_JOINTS = tuple(f"joint_la{i}" for i in range(8))
 RIGHT_ARM_JOINTS = tuple(f"joint_ra{i}" for i in range(8))
-COMMISSIONING_AUTH_TOKEN = "ENABLE_PANTHER_MOTION"
 # Mirror across Panther's sagittal (XZ) plane.  Rotations around the vendor
 # URDF's X/Z axes reverse sign; rotations around Y retain their sign.
 ARM_MIRROR_SIGNS = (-1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0)
@@ -30,37 +28,6 @@ def finite_number(value, field: str) -> float:
     if not math.isfinite(value):
         raise ValueError(f"{field} must be finite")
     return value
-
-
-def strict_boolean(value, field: str) -> bool:
-    """Parse a trusted configuration boolean without truthy-string surprises."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in ("true", "1", "yes", "on"):
-            return True
-        if normalized in ("false", "0", "no", "off"):
-            return False
-    raise ValueError(f"{field} must be an explicit boolean")
-
-
-def resolve_commissioning_motion(configured, authorization_file: Optional[str]) -> bool:
-    """Resolve motion authorization from config or an explicit host file."""
-    enabled = strict_boolean(configured, "safety.commissioning_motion_enabled")
-    if not authorization_file:
-        return enabled
-    try:
-        token = Path(authorization_file).read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return enabled
-    except OSError as exc:
-        raise RuntimeError(
-            f"cannot read commissioning authorization file: {type(exc).__name__}"
-        ) from exc
-    if token != COMMISSIONING_AUTH_TOKEN:
-        raise RuntimeError("commissioning authorization file has invalid content")
-    return True
 
 
 def finite_vector(value, field: str, length: int) -> list[float]:
@@ -114,11 +81,6 @@ def head_target_from_degrees(args: dict, current: dict[str, float]) -> list[floa
         current.get(HEAD_YAW_JOINT) if yaw is None else degrees_to_radians(yaw, "yaw_deg"),
         current.get(HEAD_PITCH_JOINT) if pitch is None else degrees_to_radians(pitch, "pitch_deg"),
     ]
-
-
-def require_confirmation(args: dict) -> None:
-    if args.get("confirm_motion") is not True:
-        raise ValueError("confirm_motion=true is required before sending a physical-motion command")
 
 
 def parse_joint_limits(urdf: str) -> dict[str, tuple[float, float]]:
@@ -223,14 +185,13 @@ def validate_joint_target(
         delta = abs(value - float(current[name]))
         if max_delta is not None and delta > max_delta:
             raise ValueError(
-                f"{name} target delta {math.degrees(delta):.2f} deg exceeds commissioning gate "
+                f"{name} target delta {math.degrees(delta):.2f} deg exceeds per-command limit "
                 f"{math.degrees(max_delta):.2f} deg"
             )
     return target
 
 
 def validate_drive(args: dict, config: dict) -> tuple[float, float, float, float]:
-    require_confirmation(args)
     vx = finite_number(args.get("linear_x", 0.0), "linear_x")
     vy = finite_number(args.get("linear_y", 0.0), "linear_y")
     wz_deg_s = finite_number(args.get("angular_z_deg_s", 0.0), "angular_z_deg_s")
@@ -239,10 +200,10 @@ def validate_drive(args: dict, config: dict) -> tuple[float, float, float, float
     max_angular_deg_s = finite_number(config["max_angular_deg_s"], "max_angular_deg_s")
     max_duration = finite_number(config["max_duration_s"], "max_duration_s")
     if abs(vx) > max_linear or abs(vy) > max_linear:
-        raise ValueError(f"linear velocity exceeds configured commissioning cap {max_linear} m/s")
+        raise ValueError(f"linear velocity exceeds configured cap {max_linear} m/s")
     if abs(wz_deg_s) > max_angular_deg_s:
         raise ValueError(
-            f"angular velocity exceeds configured commissioning cap {max_angular_deg_s} deg/s"
+            f"angular velocity exceeds configured cap {max_angular_deg_s} deg/s"
         )
     if not 0.1 <= duration <= max_duration:
         raise ValueError(f"duration_s must be in [0.1, {max_duration}]")

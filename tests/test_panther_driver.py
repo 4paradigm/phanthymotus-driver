@@ -9,7 +9,6 @@ import math
 import os
 import re
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -180,18 +179,19 @@ class PantherDriverTest(unittest.TestCase):
             2,
         )
 
-    def test_execute_click_injects_low_level_motion_confirmation(self):
+    def test_actuator_dispatch_does_not_inject_driver_confirmation(self):
         captured = []
         plugin = plugins.ActuatorPlugin(
             None, "arm_control", "test", {}, lambda payload: captured.append(payload) or payload
         )
         result = plugin.dispatch("move", {"side": "left", "j0_deg": 1.0})
-        self.assertIs(result["confirm_motion"], True)
+        self.assertNotIn("confirm_motion", result)
         plugin.dispatch("info", {})
         self.assertNotIn("confirm_motion", captured[-1])
 
-    def test_runtime_rejects_unconfirmed_motion_before_ros_or_state_access(self):
+    def test_runtime_motion_enters_readiness_checks_without_driver_confirmation(self):
         device = object.__new__(device_module.PantherDevice)
+        device.robot_state = lambda: {"ready_for_motion": False}
         calls = (
             (device.drive, {"action": "move"}),
             (device.arm, {"action": "home"}),
@@ -200,33 +200,10 @@ class PantherDriverTest(unittest.TestCase):
             (device.head, {"action": "home"}),
         )
         for method, payload in calls:
-            for confirmation in (None, False):
-                args = dict(payload)
-                if confirmation is not None:
-                    args["confirm_motion"] = confirmation
-                with self.subTest(method=method.__name__, confirmation=confirmation):
-                    with self.assertRaisesRegex(ValueError, "confirm_motion=true"):
-                        method(args)
-
-    def test_default_false_commissioning_gate_rejects_confirmed_physical_motion(self):
-        device = object.__new__(device_module.PantherDevice)
-        device._commissioning_motion_enabled = False
-        calls = (
-            (device.drive, {"action": "move", "confirm_motion": True}),
-            (device.arm, {"action": "home", "confirm_motion": True}),
-            (device.gripper, {"action": "open", "confirm_motion": True}),
-            (device.lifting, {"action": "home", "confirm_motion": True}),
-            (device.head, {"action": "home", "confirm_motion": True}),
-        )
-        for method, payload in calls:
             with self.subTest(method=method.__name__), self.assertRaisesRegex(
-                RuntimeError, "commissioning_motion_enabled is false"
+                RuntimeError, "fresh joint and hardware state"
             ):
                 method(payload)
-        device._commissioning_motion_enabled = True
-        device.robot_state = lambda: {"ready_for_motion": False}
-        with self.assertRaisesRegex(RuntimeError, "fresh joint and hardware state"):
-            device._ensure_motion_ready()
 
     def test_state_and_battery_are_separate_streams(self):
         device = (DRIVER / "device.py").read_text()
@@ -298,7 +275,7 @@ class PantherDriverTest(unittest.TestCase):
                 completed.set()
 
             device._run_arm = capture
-            result = device.arm({**arguments, "confirm_motion": True, "duration_s": 1.0})
+            result = device.arm({**arguments, "duration_s": 1.0})
             self.assertEqual(result["state"], "queued")
             self.assertTrue(completed.wait(1.0))
             return captured
@@ -353,23 +330,6 @@ class PantherDriverTest(unittest.TestCase):
         self.assertEqual(contracts.byte_value(1, "level"), 1)
         with self.assertRaisesRegex(ValueError, "exactly one byte"):
             contracts.byte_value(b"12", "level")
-
-    def test_commissioning_boolean_is_parsed_strictly(self):
-        self.assertTrue(contracts.strict_boolean("true", "gate"))
-        self.assertFalse(contracts.strict_boolean("false", "gate"))
-        self.assertFalse(contracts.strict_boolean(False, "gate"))
-        with self.assertRaisesRegex(ValueError, "explicit boolean"):
-            contracts.strict_boolean("enabled", "gate")
-
-    def test_commissioning_requires_explicit_authorization_file_content(self):
-        with tempfile.TemporaryDirectory() as directory:
-            authorization = Path(directory) / "panther-motion.authorization"
-            self.assertFalse(contracts.resolve_commissioning_motion(False, str(authorization)))
-            authorization.write_text("wrong")
-            with self.assertRaisesRegex(RuntimeError, "invalid content"):
-                contracts.resolve_commissioning_motion(False, str(authorization))
-            authorization.write_text(contracts.COMMISSIONING_AUTH_TOKEN)
-            self.assertTrue(contracts.resolve_commissioning_motion(False, str(authorization)))
 
     def test_sensor_start_arms_while_waiting_for_first_sample(self):
         class FakeDevice:
@@ -459,7 +419,7 @@ class PantherDriverTest(unittest.TestCase):
             ):
                 device.arm({
                     "action": "move", "side": "left", **target,
-                    "duration_s": 1.0, "confirm_motion": True,
+                    "duration_s": 1.0,
                 })
 
     def test_render_model_and_joint_indices_share_one_snapshot(self):
@@ -487,8 +447,8 @@ class PantherDriverTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no limits"):
             contracts.validate_joint_target(("joint_la0",), [0.0], {}, {"joint_la0": 0.0}, 0.5)
 
-    def test_joint_target_rejects_large_commissioning_step(self):
-        with self.assertRaisesRegex(ValueError, "commissioning gate"):
+    def test_joint_target_rejects_large_per_command_step(self):
+        with self.assertRaisesRegex(ValueError, "per-command limit"):
             contracts.validate_joint_target(
                 ("joint_la0",), [0.8], {"joint_la0": (-1.0, 1.0)}, {"joint_la0": 0.0}, 0.35
             )
@@ -497,24 +457,15 @@ class PantherDriverTest(unittest.TestCase):
         config = {"max_linear_mps": 0.5, "max_angular_deg_s": 45.0, "max_duration_s": 10.0}
         command = contracts.validate_drive(
             {"linear_x": 0.5, "linear_y": -0.5, "angular_z_deg_s": 45.0,
-             "duration_s": 10.0, "confirm_motion": True}, config
+             "duration_s": 10.0}, config
         )
         self.assertEqual(command[:2], (0.5, -0.5))
         self.assertAlmostEqual(command[2], math.radians(45.0))
         self.assertEqual(command[3], 10.0)
         with self.assertRaisesRegex(ValueError, "duration_s"):
             contracts.validate_drive(
-                {"linear_x": 0.0, "duration_s": -1, "confirm_motion": True}, config
+                {"linear_x": 0.0, "duration_s": -1}, config
             )
-
-    def test_drive_validation_rejects_missing_or_false_confirmation(self):
-        config = {"max_linear_mps": 0.5, "max_angular_deg_s": 45.0,
-                  "max_duration_s": 10.0}
-        for args in ({"linear_x": 0.1},
-                     {"linear_x": 0.1, "confirm_motion": False}):
-            with self.subTest(args=args):
-                with self.assertRaisesRegex(ValueError, "confirm_motion=true"):
-                    contracts.validate_drive(args, config)
 
     def test_drive_stop_waits_for_match_then_republishes_zero(self):
         class FakePublisher:
@@ -898,7 +849,7 @@ class PantherDriverTest(unittest.TestCase):
         manifest = (DRIVER / "driver.yaml").read_text()
         service = (DRIVER / "deploy" / "service.yml").read_text()
         dockerfile = (DRIVER / "Dockerfile").read_text()
-        self.assertIn("commissioning_motion_enabled: false", config)
+        self.assertNotIn("commissioning_motion_enabled", config)
         for text in (config, manifest, dockerfile):
             self.assertIn("15792", text)
         self.assertIn("AGENT_CORE_ROS_DOMAIN_ID=42", service)
@@ -907,10 +858,7 @@ class PantherDriverTest(unittest.TestCase):
             service,
         )
         self.assertNotIn("PANTHER_COMMISSIONING_MOTION_ENABLED", service)
-        self.assertIn(
-            "PANTHER_COMMISSIONING_MOTION_AUTH_FILE=/opt/phanthy-motus/data/panther-motion.authorization",
-            service,
-        )
+        self.assertNotIn("PANTHER_COMMISSIONING_MOTION_AUTH_FILE", service)
         self.assertIn("PANTHER_ROS_DOMAIN_ID=0", service)
         self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
         self.assertIn(

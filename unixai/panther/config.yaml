@@ -7,11 +7,6 @@ ros:
   core_domain_id: 42
   robot_rmw: "rmw_cyclonedds_cpp"
 
-safety:
-  # Deployment-level authorization. Standard deployment enables this only
-  # through the explicit host authorization file, never inherited env state.
-  commissioning_motion_enabled: false
-
 plugins:
   joints: {enabled: true}
   robot_state: {enabled: true}

@@ -81,14 +81,6 @@ class JointsPlugin(SensorPlugin):
 
 
 class ActuatorPlugin:
-    _MOTION_ACTIONS = {
-        "base_drive": {"move"},
-        "arm_control": {"move", "move_separate", "home"},
-        "gripper": {"set", "open", "close"},
-        "lifting": {"set_position", "home"},
-        "head": {"look", "home"},
-    }
-
     def __init__(self, device, name, description, schema, method):
         self.device = device
         self.name = name
@@ -113,11 +105,6 @@ class ActuatorPlugin:
 
     def dispatch(self, action, args):
         payload = dict(args); payload["action"] = action
-        # Clicking Execute on a physical-motion action is the user-facing
-        # confirmation. Keep the low-level device guard for direct callers,
-        # but do not expose a repetitive boolean field on every card.
-        if action in self._MOTION_ACTIONS.get(self.name, set()):
-            payload["confirm_motion"] = True
         return self.method(payload)
 
 
