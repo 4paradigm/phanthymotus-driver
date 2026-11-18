@@ -25,6 +25,10 @@ provisioning:
 # Start rosbridge_server on the ROS Noetic host and point this URL at it.
 rosbridge_url: "ws://127.0.0.1:9090"
 sensors:
+  # v63 sensor_time is a fixed-step cycle clock, not wall-clock capture time.
+  # Auto uses fresh post-read header.stamp + distinct cycle IDs for v63 only.
+  # Other versions retain strict sensor_time wall-clock validation.
+  joint_timebase: auto
   imu_topic: /imu
   auto_start: [joints, imu, loco_state, battery, laser_scan, camera_left, camera_right, camera_head, camera_depth]
   # Only admit body-frame odometry; extend after verifying the robot's TF tree.

@@ -134,6 +134,82 @@ class SensorTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.hub.joint_positions()
 
+    def cycle_frame(self, capture_ns, header_ns, q=None):
+        stamp = lambda ns: {'secs': ns // 1_000_000_000, 'nsecs': ns % 1_000_000_000}
+        self.ros.raw(q, sensor_time=stamp(capture_ns), header={'stamp': stamp(header_ns)})
+
+    def enable_cycle_profile(self):
+        self.ros.params['robot_version'] = 63
+        self.hub.discover()
+
+    def test_v63_cycle_offset_does_not_make_fresh_post_read_header_stale(self):
+        self.enable_cycle_profile()
+        now = time.time_ns()
+        self.cycle_frame(now - 824_000_000, now - 5_000_000, [0.1] * 20)
+        q, captured_at, cycle = self.hub.joint_positions()
+        self.assertEqual(q, [0.1] * 20)
+        self.assertLess(time.monotonic() - captured_at, .1)
+        self.assertEqual(cycle, now - 824_000_000)
+        sample = self.hub.snapshot('joints')
+        self.assertEqual(sample['vendor']['joint_timebase'], 'kuavo_v63_cycle')
+        self.assertAlmostEqual(sample['stamp_ms'], (now - 5_000_000) / 1e6, delta=1)
+        self.assertEqual(self.hub.health()['joint_timing']['source'], 'kuavo_v63_cycle')
+
+    def test_v63_replayed_cycle_with_new_header_does_not_refresh_measurement(self):
+        self.enable_cycle_profile()
+        now = time.time_ns()
+        self.cycle_frame(now - 824_000_000, now - 10_000_000, [0.1] * 20)
+        original = self.hub.joint_positions()
+        seen = self.hub._seen['joints']
+        self.cycle_frame(now - 824_000_000, now, [0.9] * 20)
+        self.assertEqual(self.hub.joint_positions(), original)
+        self.assertEqual(self.hub._seen['joints'], seen)
+        with patch.object(sensors_module.time, 'monotonic', return_value=seen + .6):
+            with self.assertRaisesRegex(RuntimeError, 'stale'):
+                self.hub.joint_positions()
+
+    def test_v63_stale_future_missing_and_invalid_headers_are_rejected(self):
+        self.enable_cycle_profile()
+        now = time.time_ns()
+        for stamp in (None, {}, {'secs': True, 'nsecs': 0},
+                      {'secs': (now // 1_000_000_000) - 2, 'nsecs': 0},
+                      {'secs': (now // 1_000_000_000) + 2, 'nsecs': 0}):
+            with self.subTest(stamp=stamp):
+                self.ros.raw(header={'stamp': stamp})
+                self.assertFalse(self.hub.snapshot('joints')['valid'])
+
+    def test_v63_cycle_or_header_reordering_cannot_replace_newer_q(self):
+        self.enable_cycle_profile()
+        now = time.time_ns()
+        self.cycle_frame(now - 824_000_000, now - 10_000_000, [0.1] * 20)
+        original = self.hub.joint_positions()
+        self.cycle_frame(now - 826_000_000, now, [0.9] * 20)
+        self.assertEqual(self.hub.joint_positions(), original)
+        self.cycle_frame(now - 822_000_000, now - 12_000_000, [0.9] * 20)
+        self.assertEqual(self.hub.joint_positions(), original)
+
+    def test_v63_cycle_jump_with_nearby_header_is_not_convergence_evidence(self):
+        self.enable_cycle_profile()
+        now = time.time_ns()
+        self.cycle_frame(now - 824_000_000, now - 10_000_000)
+        self.cycle_frame(now - 424_000_000, now)
+        self.assertIn('progression is inconsistent', self.hub.snapshot('joints')['reason'])
+        with self.assertRaises(RuntimeError):
+            self.hub.joint_positions()
+
+    def test_explicit_wall_mode_retains_capture_age_check_on_v63(self):
+        self.enable_cycle_profile()
+        self.hub._joint_timebase = 'wall'
+        now = time.time_ns()
+        self.cycle_frame(now - 824_000_000, now)
+        self.assertFalse(self.hub.snapshot('joints')['valid'])
+
+    def test_cycle_timebase_cannot_be_forced_for_unverified_version(self):
+        self.hub._joint_timebase = 'kuavo_v63_cycle'
+        now = time.time_ns()
+        self.cycle_frame(now - 824_000_000, now)
+        self.assertIn('requires runtime robot_version 63', self.hub.snapshot('joints')['reason'])
+
     def test_reordered_capture_does_not_replace_newer_joint_sample(self):
         ns = time.time_ns()
         captured = lambda value: {'secs': value // 1_000_000_000, 'nsecs': value % 1_000_000_000}

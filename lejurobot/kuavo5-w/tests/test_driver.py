@@ -1289,12 +1289,26 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(self.callbacks[0][:3], (result['action_id'], 'leg', 'completed'))
         self.assertTrue(self.callbacks[0][3]['measured_convergence'])
 
-    def _run_stamped_joint_trace(self, samples):
+    def _run_stamped_joint_trace(self, samples, cycle_profile=False):
         """Exercise actual ROS callbacks + motion worker, with separate clocks.
 
         Samples are (receipt elapsed, sensor capture elapsed, leg degrees).
         Header seq changes even when the sensor capture itself is replayed.
         """
+        if cycle_profile:
+            self.bundle.close()
+            self.ros = FakeRos1()
+            self.ros.params['robot_version'] = 63
+            self.bundle = driver.KuavoBundle({'sensors': {'joint_limits': fixture_joint_limits(self.ros)}},
+                                             'test_robot', self.ros, self.node)
+            self.bundle.sensors.discover()
+            ns = time.time_ns()
+            self.ros.raw(sensor_time={'secs': (ns - 824_000_000) // 1_000_000_000,
+                                     'nsecs': (ns - 824_000_000) % 1_000_000_000},
+                         header={'stamp': {'secs': ns // 1_000_000_000, 'nsecs': ns % 1_000_000_000}})
+            self.ros.emit('/enable_control_state', True)
+            self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 3)
+            self.bundle.state.verify_enable()
         started, wall = time.monotonic(), time.time() + .001
         clock = [started]
         fake_time = types.SimpleNamespace(monotonic=lambda: clock[0],
@@ -1312,17 +1326,40 @@ class DriverContractTests(unittest.TestCase):
                 entry = next(entries, None)
                 if entry is None:
                     return True
-                seq, (received, captured, degrees) = entry
+                seq, sample = entry
+                received, captured, degrees = sample[:3]
                 clock[0] = started + received
-                ns = int((wall + captured) * 1e9)
+                ns = int((wall + captured - (.824 if cycle_profile else 0)) * 1e9)
+                header = {'seq': seq}
+                if cycle_profile:
+                    header_ns = int((wall + (sample[3] if len(sample) > 3 else received)) * 1e9)
+                    header['stamp'] = {'secs': header_ns // 1_000_000_000,
+                                       'nsecs': header_ns % 1_000_000_000}
                 self.ros.raw([math.radians(degrees)] * 4 + [0.] * 16,
                              sensor_time={'secs': ns // 1_000_000_000, 'nsecs': ns % 1_000_000_000},
-                             header={'seq': seq})
+                             header=header)
                 return False
             with patch.object(cancelled, 'wait', side_effect=poll):
                 worker()
         self.bundle.tracker._callbacks.join()
         return result
+
+    def test_v63_cycle_clock_and_fresh_headers_complete_measured_joint_action(self):
+        result = self._run_stamped_joint_trace([
+            (.02, .02, 10.), (.12, .12, 10.), (.24, .24, 10.)], cycle_profile=True)
+        self.assertEqual([c[:3] for c in self.callbacks], [(result['action_id'], 'leg', 'completed')])
+
+    def test_v63_repeated_cycle_with_new_headers_expires_instead_of_completing(self):
+        result = self._run_stamped_joint_trace([
+            (.02, .02, 10.), (.12, .02, 10.), (.24, .02, 10.), (.6, .02, 10.)], cycle_profile=True)
+        self.assertEqual([c[:3] for c in self.callbacks], [(result['action_id'], 'leg', 'error')])
+        self.assertTrue(self.bundle.state.motion_blocked)
+
+    def test_v63_precommand_header_cannot_start_convergence(self):
+        result = self._run_stamped_joint_trace([
+            (.02, .02, 10., -.01), (.12, .12, 10., .09), (.24, .24, 10., .21)], cycle_profile=True)
+        self.assertFalse(self.callbacks)
+        self.assertTrue(self.bundle.tracker.current('lower_body', result['action_id']))
 
     def test_replayed_stamped_sensor_frame_cannot_complete_joints(self):
         result = self._run_stamped_joint_trace([

@@ -613,3 +613,16 @@ host helper 的首次安装仍需现场管理员执行一次，详见 README。
 - 厂商硬件节点以installed/lib/libnodelet_hardware_cxx.so提供；已查到的控制源码只消费sensor_time，未找到其生成源码，尚不能区分内部时基偏差与实际采集积压。保留原采集时间新鲜度和防重放检查，错误新增实际capture_age_s，不能用新header或接收时间将旧采集洗白。现场仍无arm/leg硬件核验限位记录，这是关节控制的另一道独立限制。
 - head参数允许单轴绝对角度；另一轴从实测值补齐，并在自动恢复后重新读取。arm卡片只展示set/stop_move，14个rad字段任意填写，null/空白保持实测值，0作为有效目标；移除单关节动作与zero，旧完整数组/末端客户端分发保留兼容。
 - 本轮没有发送有效运动目标、重启电机控制器或修改真机播放服务。参数修复不等于真机head/arm运动已验收；时间戳来源和硬件限位仍需确认。
+
+### 版本63周期时间适配与现场部署（2026-11-18）
+
+本节更新上一节“时间戳来源未确认”的结论，硬件限位缺失与物理运动未验收的限制仍保留。
+
+- 只读核对实际硬件库sensorThreadFunc，确认sensor_time为固定dt累加的循环时间，而header.stamp是在该轮readSensor成功后调用ros::Time::now生成。库指纹、函数和指令位置见SDK_ANALYSIS.md；下位机chrony报告已同步，约4微秒偏差，不能把累计周期漂移当网络反馈积压。
+- sensors.joint_timebase默认auto：仅版本63改用header做0.5秒新鲜度检查；其他版本保持sensor_time墙钟检查，可显式wall回退。两种策略均要求合法非零sensor_time并拒绝重复/倒序；版本63还验证header递增及周期/header增量一致。ACP在周期和实际测量时间上都必须跨0.2秒，命令前header不参与收敛。没有扩大0.5秒超时、学习任意偏移或改用回调接收时间。
+- 先在运行容器临时目录中加载候选模块，只读订阅3秒：59次有效读取、周期跨度2.896秒，最后反馈约20毫秒新鲜，未发送任何运动目标。
+- 仓库Dockerfile基于现场release.261118.56bb266构建本地候选local-joint-clock-261118，镜像209b2a3e607b，742330670字节；当前release为741863513字节，增量467157字节。无新增依赖或基础设施变更；这是基于既有组件镜像的候选增量，不是相对ros-base的完整成本。
+- 已替换真机驱动容器。正式MCP joints.info.feedback连续5次valid=true，20关节完整，消息年龄约12–17毫秒；DDS domain42只读观察4秒，骨架41帧、原始关节流40帧，两者均valid=true。
+- 初始部署验证脚本误读joints.info的顶层valid，超时后先读回确认实际反馈有效；修正为feedback.valid后验证通过，没有重复部署。已恢复之前speaker的/perception/tts订阅和50%本流音量，无报错，本轮未发送音频。
+- 控制监管MainPID仍361395、active，boot complete、初始BaseArm3、control_enabled=false。没有重启控制器、重复初始化或发送运动目标。因此已确认反馈门槛修复，未声称实际头部角度与物理停止完成验收；arm/leg的硬件核验限位仍缺失。
+- 321项离线测试、Python编译、service checker和diff检查通过；新测试覆盖版本63周期漂移、新header重放同周期、旧/未来/缺失header、双时钟乱序/跳变、wall回退、实际worker收敛与重复过期、命令前header隔离。

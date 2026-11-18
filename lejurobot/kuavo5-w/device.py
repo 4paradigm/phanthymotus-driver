@@ -535,7 +535,7 @@ class _KuavoPlugin:
 
         def worker():
             deadline, duration, seen_at = time.monotonic() + 3, None, 0
-            converged_since_ns = None
+            converged_since_ns = converged_since_at = None
             last_capture_ns = None
             while not cancelled.wait(0.02):
                 try:
@@ -572,9 +572,11 @@ class _KuavoPlugin:
                                 if close:
                                     if converged_since_ns is None:
                                         converged_since_ns = capture_ns
+                                        converged_since_at = measured_at
                                 else:
-                                    converged_since_ns = None
-                                if converged_since_ns is None or capture_ns - converged_since_ns < 200_000_000:
+                                    converged_since_ns = converged_since_at = None
+                                if (converged_since_ns is None or capture_ns - converged_since_ns < 200_000_000
+                                        or measured_at - converged_since_at < .2):
                                     continue
                             self.tracker.finish(self.CHANNEL, aid, self.PREFIX, "completed", {
                                 "completion_basis": "measured_joint_convergence" if joint_target is not None else "vendor_reach_time_estimate",
@@ -825,7 +827,7 @@ class HeadPlugin(_KuavoPlugin):
             validate, request_epoch=self._request_context.stop_epoch)
 
         def worker():
-            converged_since_ns = last_capture_ns = None
+            converged_since_ns = converged_since_at = last_capture_ns = None
             deadline = issued + 20.
             while not cancelled.wait(.02):
                 try:
@@ -843,10 +845,12 @@ class HeadPlugin(_KuavoPlugin):
                         last_capture_ns = capture_ns
                         close = all(abs(a - b) <= math.radians(1.) for a, b in zip(q[18:20], target))
                         if not close:
-                            converged_since_ns = None
+                            converged_since_ns = converged_since_at = None
                         elif converged_since_ns is None:
                             converged_since_ns = capture_ns
-                        elif capture_ns - converged_since_ns >= 200_000_000:
+                            converged_since_at = measured_at
+                        elif (capture_ns - converged_since_ns >= 200_000_000
+                              and measured_at - converged_since_at >= .2):
                             self.tracker.finish(self.CHANNEL, aid, self.PREFIX, 'completed', {
                                 'completion_basis': 'measured_head_convergence', 'measured_convergence': True,
                                 'yaw': target_deg[0], 'pitch': target_deg[1], 'units': 'deg'})

@@ -34,6 +34,16 @@ def finite(value):
             and math.isfinite(value))
 
 
+def ros_time_ns(value, name):
+    if not isinstance(value, dict):
+        raise ValueError(f'{name} is missing')
+    secs, nsecs = value.get('secs'), value.get('nsecs')
+    if (type(secs) is not int or type(nsecs) is not int or secs < 0
+            or not 0 <= nsecs < 1_000_000_000 or secs + nsecs == 0):
+        raise ValueError(f'{name} is invalid')
+    return secs * 1_000_000_000 + nsecs
+
+
 def vector(value, size):
     if not isinstance(value, list) or len(value) != size or not all(map(finite, value)):
         raise ValueError(f'expected {size} finite sensor values')
@@ -97,6 +107,10 @@ class KuavoSensors:
         self._identity_checked_at = None
         self._joint_capture_ns = None
         self._joint_captured_at = None
+        self._joint_header_ns = None
+        self._joint_timebase = config.get('joint_timebase', 'auto')
+        if self._joint_timebase not in ('auto', 'wall', 'kuavo_v63_cycle'):
+            raise ValueError('joint_timebase must be auto, wall or kuavo_v63_cycle')
         self._joint_limit_config = copy.deepcopy(config.get('joint_limits'))
         self._model_error = 'waiting_for_discovery'
         self._model_path = Path(__file__).resolve().parent / 'resource' / 'kuavo5w_model.urdf'
@@ -151,6 +165,7 @@ class KuavoSensors:
                 self._identity_checked_at = None
                 self._standard_imu_at = None
                 self._joint_capture_ns = self._joint_captured_at = None
+                self._joint_header_ns = None
                 self._data.clear()
                 self._seen.clear()
                 self._errors.clear()
@@ -265,6 +280,9 @@ class KuavoSensors:
                         'age_s': None if self._identity_checked_at is None else
                                  max(0, time.monotonic() - self._identity_checked_at)},
                     'joint_limits': limits,
+                    'joint_timing': {'configured': self._joint_timebase,
+                                     'source': self._joint_timing_mode(),
+                                     'max_age_s': JOINT_MAX_AGE_S},
                     'discovery_error': self._discovery_error, 'model_error': self._model_error,
                     'skeleton_model': {'source': 'resource/kuavo5w_model.urdf',
                                        'reference_version': '63',
@@ -325,25 +343,41 @@ class KuavoSensors:
                     raise ValueError(f'{card} joint target {i} is outside hardware-verified limits')
             return measured
 
+    def _joint_timing_mode(self):
+        version = self._profile.get('robot_version') if self._profile else None
+        if self._joint_timebase == 'auto':
+            return 'kuavo_v63_cycle' if version == 63 else 'wall'
+        return self._joint_timebase
+
     def _store_joints(self, message, meta):
-        # sensor_time is the vendor capture time. Receipt time/header sequence
-        # cannot turn a retransmitted capture into independent evidence.
+        # v63 HardwareNode::sensorThreadFunc reads sensors, stamps the header
+        # with ros::Time::now(), and advances sensor_time by a fixed dt. That
+        # cycle clock drifts against wall time; it is a sample identity, not a
+        # UTC capture clock. Other profiles keep the strict wall-clock policy.
         capture = message.get('sensor_time')
-        if not isinstance(capture, dict):
-            raise ValueError('joint sensor_time is missing')
-        secs, nsecs = capture.get('secs'), capture.get('nsecs')
-        if (type(secs) is not int or type(nsecs) is not int or secs < 0
-                or not 0 <= nsecs < 1_000_000_000 or secs + nsecs == 0):
-            raise ValueError('joint sensor_time is invalid')
-        capture_ns = secs * 1_000_000_000 + nsecs
+        capture_ns = ros_time_ns(capture, 'joint sensor_time')
+        mode = self._joint_timing_mode()
+        header_ns = None
+        if mode == 'kuavo_v63_cycle':
+            if self._profile.get('robot_version') != 63:
+                raise ValueError('kuavo_v63_cycle requires runtime robot_version 63')
+            header_ns = ros_time_ns(message.get('header', {}).get('stamp'), 'joint header.stamp')
         now, wall = time.monotonic(), time.time()
-        age = wall - capture_ns / 1e9
+        age = wall - (header_ns if header_ns is not None else capture_ns) / 1e9
         if not -JOINT_FUTURE_TOLERANCE_S <= age <= JOINT_MAX_AGE_S:
             raise ValueError('joint capture is stale or clocks are not synchronized: '
                              f'capture_age_s={age:.3f}, allowed_s='
                              f'[-{JOINT_FUTURE_TOLERANCE_S}, {JOINT_MAX_AGE_S}]')
         if self._joint_capture_ns is not None and capture_ns <= self._joint_capture_ns:
             return  # No data/freshness update for repeated or reordered captures.
+        if header_ns is not None and self._joint_header_ns is not None:
+            if header_ns <= self._joint_header_ns:
+                return
+            # A cycle jump is not evidence of a sustained real-time interval.
+            # Do not learn an arbitrary offset from a delayed/replayed frame.
+            if abs((capture_ns - self._joint_capture_ns) -
+                   (header_ns - self._joint_header_ns)) > 50_000_000:
+                raise ValueError('joint cycle/header progression is inconsistent')
         raw = message['joint_data']
         q = vector(raw.get('joint_q'), 20)
         arrays = {}
@@ -358,11 +392,17 @@ class KuavoSensors:
             arrays['tau'] = [None] * 20
         joints = [{'idx': i, 'name': self._names[i] if self._names else None, 'q': v,
                    **{key: values[i] for key, values in arrays.items()}} for i, v in enumerate(q)]
+        if header_ns is not None:
+            stamp_ms, provenance = resolve_stamp_ms(vendor_ms=header_ns / 1e6,
+                                                    received_ms=int(wall * 1000))
+            meta = {'stamp_ms': stamp_ms, 'vendor': {**meta['vendor'], **provenance}}
         self._data['joints'] = {**meta, 'joints': joints,
             'vendor': {**meta['vendor'], 'sensor_time': dict(capture), 'joint_torque': raw_effort,
+                       'joint_timebase': mode, 'header': copy.deepcopy(message.get('header')),
                        'joint_torque_unit': self._torque_unit},
             'units': {'q': 'rad', 'dq': 'rad/s', 'ddq': 'rad/s^2', 'tau': self._torque_unit}}
         self._joint_capture_ns = capture_ns
+        self._joint_header_ns = header_ns
         # Map capture into the monotonic clock used by command issue/deadlines.
         # Never put a slightly future-dated capture after its own receipt.
         self._joint_captured_at = now - max(0, age)
@@ -558,7 +598,9 @@ class KuavoSensors:
             if (time.monotonic() - seen > JOINT_MAX_AGE_S or 'joints' not in self._data
                     or self._joint_captured_at is None
                     or time.monotonic() - self._joint_captured_at > JOINT_MAX_AGE_S):
-                raise RuntimeError('measured joint feedback is missing or stale')
+                reason = self._errors.get('joints')
+                raise RuntimeError('measured joint feedback is missing or stale' +
+                                   (f': {reason}' if reason else ''))
             return ([j['q'] for j in self._data['joints']['joints']],
                     self._joint_captured_at, self._joint_capture_ns)
 

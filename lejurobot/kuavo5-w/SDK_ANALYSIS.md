@@ -204,3 +204,22 @@ DDS42/loopback 的跨容器接收，以及软件暂停和断网时控制器行�
 `ControlRobotHeadWebsocket.pub_control_robot_head`同样使用该绝对话题。驱动现在直接发送绝对度值，
 不把实测位置差当成sticky目标增量，也不以估计转动时间冒充到位。本轮只读确认真机该话题有
 `/nodelet_manager`订阅者，越界参数在发令前拒绝；尚未发送有效绝对角度目标做物理运动验收。
+
+### 2026-11-18 版本63关节时间基准核对
+
+此前将sensor_time当作墙钟采集时间的假设不适用于现场版本63硬件库。下位机NTP正常，
+但sensor_time相对header落后约0.8秒；厂商installed/tests/motor_test.cpp也显示sensor_time使用start_time。
+进一步只读检查实际installed/lib/libros_hardware_plant_cxx.so的
+`HighlyDynamic::HardwareNode::sensorThreadFunc(ros::Publisher&)`确认：
+
+核对库SHA-256：`16d3c27fa9704b8c5e5c012c7f6adced792f2843531661f7c52f810b1c14269f`。
+
+- 0x288dc2调用ros::Time::now，保存循环初始时间。
+- 0x288ea1调用HardwarePlant::readSensor，失败分支sleep后回循环，不发布该轮数据。
+- 0x289f83重新调用ros::Time::now并写header.stamp；0x289f96–0x289f9d将循环累计时间写sensor_time。
+- 发布和Rate::sleep后，0x28a4a9–0x28a4b8将配置的周期dt转Duration并累加到该循环时间。
+
+因此该字段可用于区分成功采样循环和顺序，不能用于UTC数据年龄。驱动auto策略仅对运行时整数版本63
+使用原始header.stamp做0.5秒新鲜度检查，并继续要求sensor_time与header双递增、增量一致，
+重复/倒序帧不续租，不以接收时间或header.seq替代。ACP要求命令后有效时间和周期跨度均至少0.2秒。
+其他版本仍使用严格sensor_time墙钟策略；硬件库若升级并改变语义，应重新核对，不能据此推断所有版本相同。
