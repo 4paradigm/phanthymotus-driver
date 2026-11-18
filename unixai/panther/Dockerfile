@@ -19,8 +19,6 @@ RUN . /etc/os-release && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros2-archive-keyring.gpg] ${ROS_APT_MIRROR} ${UBUNTU_CODENAME} main" > /etc/apt/sources.list.d/ros2.list && \
     apt-get update && apt-get install -y --no-install-recommends \
       python3-yaml \
-      python3-numpy \
-      python3-opencv \
       systemd \
       util-linux \
       pulseaudio-utils \
@@ -34,6 +32,13 @@ RUN . /etc/os-release && \
       ros-humble-sensor-msgs \
       ros-humble-std-msgs \
       ros-humble-trajectory-msgs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Keep OpenCV's large multimedia dependency graph in its own apt transaction.
+# On x86_64 -> arm64 QEMU builds, libc-bin's post-install trigger has crashed
+# after the combined install; do not mask apt/dpkg failures.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3-numpy python3-opencv && \
     rm -rf /var/lib/apt/lists/*
 
 # Runtime dependencies deliberately come from Ubuntu/ROS apt packages. This
