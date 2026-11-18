@@ -22,8 +22,8 @@ Agent Core（同一主机，https://localhost:15678）
 
 ROS1 没有 DDS domain。本驱动负责 ROS1 → ROS2 消息转换，Agent Core 侧固定为 domain **42**。
 `deploy/service.yml` 使用 host 网络，并挂载、选择 `/opt/phanthy-motus/dds-local.xml`，与本机 Agent Core 的隔离传输保持一致。
-本驱动只通过 WebSocket/DDS 接口访问机器人，不直接访问设备，不申请 `privileged`，
-也不挂载可写 data 目录；仅挂载只读 DDS profile 与操作人员配置文件。
+驱动数据面通过 WebSocket/DDS 访问机器人；安装面通过SSH分发镜像自带程序。容器不申请 `privileged`，
+不挂载Docker socket或宿主机根目录；仅挂只读DDS profile和独立可写配置目录，用于配置、SSH信任及私有凭据。
 启动前检查该 profile 是文件；缺失、误挂成目录或 RMW 配置冲突时拒绝创建 ROS2 participant。
 
 ROS2 / Agent Core 与驱动容器需要在同一 Linux 主机；机器人 ROS1 可以在本机或另一台可达主机。
@@ -33,118 +33,101 @@ MCP 仅监听 `127.0.0.1:15747`，只接受本机无 `Origin` 的服务端请求
 `localhost`/`127.0.0.1`；浏览器预检、任意浏览器来源及外部客户端均被拒绝，不返回通配 CORS。
 页面通过 Agent Core 调用驱动，不直接访问运动端口。这是同机进程信任边界，不是本机进程之间的身份鉴权。
 
-### 容器部署配置
+### 首次部署与自动准备
 
-Dashboard 将镜像内的 `deploy/service.yml` 合并到宿主机 Compose，保留其中的配置挂载和环境变量。
-部署片段把宿主机 `/opt/phanthy-motus/drivers/lejurobot-kuavo5-w/config.yaml` **只读**挂到
-`/config/kuavo5-w.yaml`，并设置 `CONFIG_PATH` 指向它。操作人员在首次 Dashboard 部署前准备该文件：
+镜像包含全部自有配套程序和安装器（`bootstrap.py`、`host/bootstrap_remote.py`、`host/`）。
+Dashboard/PR镜像部署片段把宿主机 `/opt/phanthy-motus/drivers/lejurobot-kuavo5-w/` 挂到 `/config`；
+首次允许Docker创建目录，驱动仅在指定路径缺失时独占创建 `/config/config.yaml`（0600）。
+已有操作配置、关节限位、禁用设置和凭据不被镜像默认值覆盖；不再要求部署前手工创建配置文件。
+`CONFIG_PATH` 显式指向其他路径但文件缺失，或已有YAML损坏时仍报错，不悄悄回退。
 
-```sh
-# 在驱动仓库根目录执行，目标是运行 Agent Core / 驱动容器的 Linux 主机。
-# 首次初始化使用；已有现场配置时不要覆盖。
-sudo install -d -m 0755 /opt/phanthy-motus/drivers/lejurobot-kuavo5-w
-sudo test ! -e /opt/phanthy-motus/drivers/lejurobot-kuavo5-w/config.yaml && \
-  sudo install -m 0644 lejurobot/kuavo5-w/config.yaml /opt/phanthy-motus/drivers/lejurobot-kuavo5-w/config.yaml
+同款机器人首次部署仅需具备可达的SSH管理权限。可在 `loco` 卡的共享配置中填写三台主机的地址、账号、
+SSH密码及不同的sudo密码；Core发送系统 `config` 动作后自动保存并开始准备。所有密码字段均声明
+`format: password` / `x-sensitive: true`，不会随Solution公开打包；驱动不在响应、日志或schema中回显密码。
+也可通过 `KUAVO_HOST/CONTROLLER/CHASSIS_SSH_PASSWORD`、相应 `SUDO_PASSWORD` 环境变量，
+或宿主机配置目录内0600权限的 `ssh-secrets.json` 提供连接信息：
+
+```json
+{
+  "host": {"password": "<上位机SSH密码>"},
+  "controller": {"password": "<控制下位机SSH密码>"},
+  "chassis": {"password": "<独立底盘SSH密码>", "sudo_password": "<若与SSH不同>"}
+}
 ```
 
-没有源码的部署主机也可先从所选驱动镜像的停止容器中用 `docker cp` 提取 `/work/config.yaml`，
-再安装到同一宿主机路径；不需要启动控制程序或重建镜像。挂载要求 Docker Compose 支持
-`bind.create_host_path: false`；文件缺失时部署失败，不自动创建同名目录。
-文件应是完整配置，保留默认的 `sensors.joint_limits: null`，现场核验后再填写下节记录。
-修改宿主机文件后需重新创建驱动容器以重新加载并更新文件挂载，例如在宿主机 Compose 目录执行
-`docker compose up -d --force-recreate lejurobot-kuavo5-w`；重新创建会中断当前驱动，应在机器人受控停止后进行。
-Dashboard 重部署也复用此路径，不会用镜像默认文件覆盖现场配置。该路径不提供 Dashboard 在线编辑功能。
+支持在各角色私有配置中设置 `key_file`（容器内私钥路径），或使用相应 `KUAVO_<ROLE>_SSH_KEY`。
+未提供密码时采用非交互公钥认证；不猜测/提交出厂密码，不把这台机器的账号凭据烧进镜像。
+空环境默认值不遮蔽私有文件，空格密码不被trim。OpenSSH使用accept-new首次信任并持久化known_hosts；
+主机密钥变化报错，不用StrictHostKeyChecking=no绕过。无法登录时MCP仍可提供配置及分主机错误，
+不会因此伪造传感数据或放开运动。
 
-直接运行源码时，未设置 `CONFIG_PATH` 仍读取同目录的 `config.yaml`；显式设置的路径打不开或 YAML 无法解析时
-启动失败，不回退到包内默认配置。配置和硬件核验记录由操作人员管理，不应提交到仓库。
+默认ROS网络：上位机容器通过127.0.0.1登录本机，ROS_IP=192.168.26.12；
+控制下位机192.168.26.1/lab；独立底盘192.168.26.22/jt；ROS master为192.168.26.1:11311。
+`provisioning` 可覆盖master、每台机器的address/user/ros_ip/workspace及上位机head_workspace；
+地址/账号也可用 `KUAVO_<ROLE>_ADDRESS/USER/ROS_IP/WORKSPACE` 环境变量覆盖。
+自动发现对应用户及/home下的厂商应用/控制工作区，匹配不唯一就报错，不猜测另一份工作区。
 
-镜像依赖会有体积成本：FastDDS RMW / std_msgs / sensor_msgs 仅在基础镜像未提供时安装；`requirements.txt`
-声明 PyYAML（配置解析）及 websocket-client（rosbridge）。构建时先实际尝试 `import yaml`，已可用就不再
-通过 pip 安装 PyYAML，否则按 requirements 补齐；websocket-client 仍由 requirements 管理，最后检查两者均可导入。
-平台 `deploy/ros-base/Dockerfile` 未直接声明 PyYAML，其上游 ROS 镜像是否提供不能仅凭该文件确定。
-尚未对生产 Dockerfile 与 ros-base 完成全量构建体积对比，不能承诺零增长。
-现场增量候选镜像基于已有 release 构建，只验证当前依赖可复用，不代表生产基础镜像无需安装缺失包。
+| 目标 | 容器自动完成 |
+| --- | --- |
+| 控制下位机 | 查找版本63轮臂工作区和Drake，取得该控制器生成的kuavo_msgs；分发开机监管、安装systemd单元，首次本次开机未尝试过时启动，完成初始化→BaseArm确认→软件暂停 |
+| 上位机 | 分发并安装loopback rosbridge、rosapi消息覆盖层、电池转发、固定操作管理器、头部RGB/深度launch及转发器；确保基础服务启动，头部卡缺帧时按需启动相机服务 |
+| 独立底盘 | 分发PCM播放服务、准备用户PulseAudio；确保厂商jaten.service运行，以提供左右相机、二维雷达、IMU、里程计等；扬声器首块PCM才创建播放器 |
 
-## 机器人侧准备
+所有自有源码随镜像构建复制，不依赖助手留在/tmp下的文件。分发使用固定文件白名单和固定安装目的地，
+不接受画布传入shell命令；以文件/配置哈希、systemd单元及消息覆盖层检查进行幂等校验。
+普通进程探测或端口存在不能替代部署校验。每轮约30秒检查，缺少/损坏的自有文件或单元会修复，
+停止的非电机服务会启动，健康服务不反复restart。运行状态见 `loco.info.feedback.host_runtime.provisioning.targets`；
+controller/host/chassis分别报告checking/ready/blocked及错误，不传输私有凭据到状态中。
 
-### 一次安装，后续驱动启动自动检查
+容器默认不需要源码仓库、额外pip脚本或手工SSH安装。必要前提仍是机器人已有**厂商ROS Noetic、控制程序、
+匹配的硬件/标定、Orbbec驱动工作区及底盘jaten程序**，并允许SSH/sudo管理。
+缺少通用rosbridge、Python图像依赖或PulseAudio运行包时，自动从目标机配置的软件源安装固定白名单包；
+需要可用软件源，也可设 `provisioning.install_missing_packages: false` 只报告缺失。
+不会从网络下载并猜测安装专有控制固件、Drake、标定或整套厂商SDK；不支持的控制版本明确阻止运动。
+缺少真实麦克风、未核验的关节限位或尚未实现的导航协议，也不会靠自动部署变成“全部可用”。
 
-在 ROS1 上位机安装 `ros-noetic-rosbridge-server` 后，从本目录执行一次（参数使用现场 ROS 网络）：
+### 控制器自动启动的边界
 
-```sh
-sudo python3 host/install.py --user leju_kuavo \
-  --workspace /home/leju_kuavo/kuavo_ros_application \
-  --master http://192.168.26.1:11311 --ros-ip 192.168.26.12
-```
+随包默认 `host_runtime.controller_boot_required: true`、`provisioning.auto_initialize_and_pause: true`。
+首次自动部署在确认本次开机未启动过监管服务后请求一次启动；容器重启只观察已运行程序，
+**不重启电机、不重复初始化**。自有控制进程故障/退出、被人工停止，或记录表明本次开机已尝试过时，
+不自动再次拉起；需要现场排障。源码升级可安装到磁盘供下次开机使用，不重启当前控制器。
+关闭auto_initialize_and_pause会禁用该服务未来自动开机启动，保留当前运行进程；不把配置切换当成急停。
 
-安装器准备现场配置（保留已有值，仅补充缺失的外设插件），安装固定用途 systemd 服务。
-驱动启动后每5秒通过 `127.0.0.1:15748/ensure` 请求确保 rosbridge、只读电池转发器运行；
-它们异常退出由 systemd 重启。`loco.info` 的 `feedback.host_runtime` 报告检查状态。
-容器不需要宿主机 sudo、SSH 密码、Docker socket 或特权权限。
-头部 RGB/深度卡在 `start` 缺帧时分别请求 `/ensure/head`、`/ensure/depth`，确保固定相机和相应 relay 服务运行。
-助手仅能启动 rosbridge、电池 relay 及已安装的固定头部 RGB/深度服务，不接受命令或 unit 参数；仅监听 loopback，拒绝浏览器 Origin 和非本机 Host。
-ROS消息解码以普通用户运行，固定启动助手独立运行。旧版 rosbridge 忽略 address 参数时，通过进程内 wrapper
-明确指定 loopback 绑定，并在进程内为 ROS1 订阅启用 TCP_NODELAY、2MB 接收缓冲；不修改系统 ROS 包。
-保留全部 odom 接收样本，不通过 queue_size=1 在输入端丢弃测量。
+监管服务等待厂商H12服务/ROS master，检查真实控制节点和原始关节发布者，忽略joy、bridge及自身订阅者。
+启动前检查 `/opt/drake/lib/libdrake.so`，显式传入库路径。固定版本63/20关节及厂商服务来源通过后，
+只请求一次初始化，等待其后新鲜BaseArm(mode=3)反馈，再请求enable=false并确认新false。
+超时不重发、不假报complete。若已有外部控制器，仅在其已初始化且已暂停、型号/测量匹配时观察接管，
+不抢占另一控制者。`boot_pause_confirmed`是开机历史结果，当前使能仍以独立新鲜反馈为准。
+开机状态超过3秒未更新会阻止运动。新运动动作在参数/限位通过后自动恢复，不恢复旧目标；
+相机、音频或基础遥测的start/info不会触发enable=true。
 
-若上下位机 `kuavo_msgs/sensorsData` 的 MD5 不同，即使存在500Hz发布者，TCPROS也会拒绝订阅。
-从实际控制器工作区复制其生成的 `kuavo_msgs` Python包（包含msg和srv）到上位机独立目录，
-安装时添加 `--message-overlay /path/to/controller-python-packages`。该目录直接包含 `kuavo_msgs/`，
-不是源码msg目录；应与当前控制器版本同步，不能用另一版本猜测字段。安装器复制到自身 `ros1_messages/`，
-仅bridge和rosapi进程优先加载，不覆盖厂商工作区或系统ROS包。未传该参数时保留已有覆盖层。
-现场版本63的sensorsData含FTsensor_data，已验证用该方法恢复真实20关节数据。
+### 数据桥接、相机和人工排障
 
-### 下位机开机自动初始化并暂停
+上下位机kuavo_msgs可能同名但MD5不同；自动部署会从实际控制器导出生成的Python msg/srv，
+仅供bridge/rosapi进程优先加载，不覆盖厂商工作区。消息映射变化时重载bridge，不重启控制器。
+本地固定助手每5秒检查基础bridge/电池服务；头部RGB/深度卡缺帧时分别请求固定的head/depth操作，
+不接受任意unit或命令。wrapper将旧版rosbridge绑定到loopback，设置TCP_NODELAY/2MB缓冲；不改系统ROS包。
 
-全身控制栈属于下位机硬件进程，不由上位机驱动容器反复创建。现场版本63已获操作人员明确授权：
-每次下位机开机自动启动并初始化，完成后进入软件暂停。初始化会使能电机并可能调整姿态；
-版本、标定、遥控器与开机活动范围必须先核实，不能照搬到其他硬件。
+默认自动输出joints/imu/loco_state/battery/laser_scan及四路图像；运行中的相机卡缺帧约每5秒重试，
+未运行的头部卡不启动相机。speaker.start同时唤醒底盘服务检查。首次安装尚未完成时卡可能返回starting/error，
+通过分主机状态排除凭据/厂商运行时问题后可重新start；安装不是运动动作，不伪造ACP完成。
+如显式禁用host_runtime或provisioning，就由外部自行管理，不再承诺自动准备。
 
-将 `host/controller_boot.py`、`host/install_controller.py` 放到下位机同一目录，显式安装一次：
+`host/install.py`、`host/install_controller.py`、`host/install_speaker.py` 仍是容器实际调用的安装器，
+可在排障时手工执行，但不再是正常部署前置步骤。升级会保留现场配置及禁用开关。
+完整断电后的时序仍需在另一台同款出厂机器复验；单台既有环境的成功不能代替该验收。
 
-```sh
-sudo python3 host/install_controller.py \
-  --workspace /home/lab/kuavo-ros-opensource \
-  --master http://192.168.26.1:11311 --ros-ip 192.168.26.1 \
-  --confirm-auto-initialize-and-pause
-```
+### 构建依赖
 
-安装器只enable `kuavo5w-controller.service`，不停止或替换当前控制器。
-如需在本次开机启用监管，可显式 `sudo systemctl start kuavo5w-controller.service`：
-发现已有控制栈时只观察，不重复启动、初始化或发暂停；仅当其版本、20关节实测、初始化标志及
-新收到的暂停反馈均符合要求才接管状态，报告 `launch_ownership: external`。
-已有控制器未就绪或未暂停时保持等待，不能抢占另一个控制者。
-
-正常下次开机，服务等待厂商H12服务建立ROS master，确认没有已有控制器后启动
-`ROBOT_VERSION=63 roslaunch humanoid_controllers load_kuavo_real_wheel.launch joystick_type:=h12 start_way:=auto`。
-所有权检测只把控制节点或原始关节发布者视为已有控制器，忽略joy、bridge及监管自身的传感器订阅。
-启动环境显式加入现场已安装的 `/opt/drake/lib`，保留工作区/ROS库路径；systemd不依赖交互式.bashrc。
-缺少libdrake时在启动硬件前报错，不自动安装依赖或进入不完整初始化。
-核实机型、关节、服务来源后仅调用一次 `/humanoid_controller/real_initial_start`；
-等待请求终态及之后的新鲜BaseArm反馈（mode=3），再请求 `/enable_control(false)`，确认新收到的false后才报告complete。
-初始化超时保留请求，不重发；失败不假报就绪。控制进程故障不自动重启，也不调用enable=true。
-服务自有进程退出后需要现场检查再手动处理，不能用自动重启掩盖急停或硬件故障。
-
-确认下位机服务正常后，在上位机现场配置设 `host_runtime.controller_boot_required: true`，
-驱动的运动、resume和模式切换会等待开机流程确认；pause始终允许尝试。
-`loco.info.feedback.controller_boot` 展示结果；
-`boot_pause_confirmed` 仅代表开机流程曾确认暂停，当前使能仍以独立 `control_enabled` 反馈为准。
-新启动初始化路径记录 `initial_control_mode: 3`；只读接管已暂停的外部程序时未观察到该历史帧则为null，
-不伪造初始化模式，运动前仍等待实时模式反馈。
-开机状态超过3秒未更新会阻止运动；一旦发现开机服务，本次驱动会话即使重连也保留该要求。
-兼容旧手动部署，随包配置默认false；不应在已使用开机服务的现场关闭检查绕过故障。
-
-容器重启只重连这些服务，不重新初始化或自动恢复运动。下位机开机服务和上位机安装器均须部署，
-仅有容器的restart策略不能恢复另一台机器上的电机进程。
-本次已验证真实20关节反馈、MPC模式、软件暂停/恢复及当前已暂停程序的只读接管；
-尚未进行实际关机重启，也未验证位移或关节目标运动。arm/leg仍需要下文的硬件核验限位配置。
-
-默认自动启动 `joints/imu/loco_state/battery/laser_scan/camera_left/camera_right/camera_head/camera_depth` 的输出。
-卡片 `start` 先检查是否有新鲜图像；缺帧时异步请求启动，左右相机调用对应 `set_camera_enabled(true)`，头部卡请求上述宿主机服务。
-运行期间缺帧每5秒重试，已有新鲜帧不重复开启；未运行的头部卡不由全局检查器启动。不会启动 WBC、MPC 或使能机器人运动。
-`sensors.auto_start` 可缩小列表，`plugins.<name>.enabled: false` 可禁用卡片。
-远程 rosbridge 部署可设置 `host_runtime.enabled: false`，由远端自行管理其 ROS1 服务。
-首次缺少宿主机配置导致 bind 挂载失败时，容器代码尚未运行，仍需一次安装/初始化；无法靠容器内自检绕过。
+FastDDS/std_msgs/sensor_msgs以及新增openssh-client/sshpass仅在基础镜像缺失时安装；后两者用于自动跨机部署，
+无需SSH服务端或容器特权。密码通过环境/标准输入传递，不放进SSH argv。PyYAML/websocket-client保持requirements声明，
+复用已有PyYAML及 `/ros_ws/install/audio_msgs`；没有消息生成工具链或新增厂商SDK。
+新增SSH客户端和源码有镜像体积成本，不能称零增长。基础镜像若使用只能内网解析的腾讯apt源，
+构建可显式传 `--build-arg UBUNTU_APT_MIRROR=https://ports.ubuntu.com/ubuntu-ports`；默认不改已有软件源。
+2026-11-18已在真机用本Dockerfile构建候选，基于既有release由736907954增至743100785字节
+（+6192831字节，约6.19MB，含新增SSH客户端和源码）。此为相对既有驱动release的增量，
+不是生产ros-base全新构建的总增量；完整基线对比仍需发布构建核实。
 
 ### 外设卡与现场型号
 
@@ -266,15 +249,15 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 
 ### 扬声器安装与使用
 
-在**独立底盘电脑**（现场 `192.168.26.22`，不是Jetson或全身控制下位机）一次性执行：
+正常部署由容器自动安装到底盘。以下仅为人工排障时的等价命令，在**独立底盘电脑**执行：
 
 ```sh
 sudo python3 host/install_speaker.py --user jt --master http://192.168.26.1:11311 --ros-ip 192.168.26.22 --volume 30
 ```
 
-仅使用该机已有ROS Noetic、`paplay/pactl`和PulseAudio；不安装SDK、声卡库或TTS引擎，不保存SSH凭据。
+仅使用该机已有ROS Noetic、`paplay/pactl`和PulseAudio；不安装SDK、声卡库或TTS引擎，不在播放器中保存SSH凭据；自动部署凭据仅保存在上文私有配置中。
 安装 `kuavo5w-speaker.service` 并启用音频用户linger，允许用户音频服务开机运行；
-该机已有启用的 `pulseaudio.socket`，部署前应确认它正常。轻量ROS服务随系统启动，但无音频数据时不启动播放器。
+自动启用该用户的 `pulseaudio.socket`，无需先登录桌面。轻量ROS服务随系统启动，但无音频数据时不启动播放器。
 服务只访问音频，无控制器/电机操作；`speaker` 不依赖 `motion_enabled` 或恢复电机。
 
 画布将TTS/音频节点的 `audio/pcm-16k` 输出连接到 `speaker`，Core在 `start` 传入 `input_topic`。
@@ -499,7 +482,7 @@ SDK 对 effort 单位同时允许 N·m 或 A，因此默认 tau=null、单位未
 仓库 `build.sh` 会将驱动目录内容作为构建上下文，并将 `driver.yaml` 的 `../../common` 复制为 `common/`。
 Dockerfile 已按此布局配置，并将部署片段放入镜像 `/deploy/service.yml`。
 基础镜像已提供 `python3-pip`；Dockerfile 仅在缺失时安装 ROS2 FastDDS RMW、`std_msgs` 和 `sensor_msgs`，
-用于选定的 DDS participant、`String` 状态和原生压缩图像发布。不安装本地 ROS2 `geometry_msgs`：
+并条件补充openssh-client/sshpass，分别用于DDS participant、遥测/图像及跨机自动部署。不安装本地 ROS2 `geometry_msgs`：
 厂商 ROS1 `Twist` 是 rosbridge JSON 消息，由机器人侧解析。
 Python 依赖仅为配置解析用 PyYAML 和连接 rosbridge 用 websocket-client，不安装完整厂商 SDK。
 这些是运行所需的依赖；实际基础镜像是否已提供及最终镜像增量仍需容器构建核实，不能用离线测试替代。

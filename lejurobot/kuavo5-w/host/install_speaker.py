@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-time provisioning on the independent chassis computer, not the Jetson.
+"""Image-owned provisioning on the independent chassis computer, not the Jetson.
 
 sudo python3 install_speaker.py --user jt --master http://192.168.26.1:11311
 Uses existing ROS Noetic and PulseAudio packages. Never installs an SDK.
@@ -11,6 +11,17 @@ import pwd
 import re
 import shutil
 import subprocess
+
+
+def ensure_user_audio(user_name, uid):
+    subprocess.run(['loginctl', 'enable-linger', user_name], check=True)
+    subprocess.run(['systemctl', 'start', f'user@{uid}.service'], check=True)
+    # A fresh robot may never have opened a desktop session. Enable socket
+    # activation explicitly rather than relying on this machine's prior login.
+    subprocess.run(['runuser', '-u', user_name, '--', 'env',
+                    f'XDG_RUNTIME_DIR=/run/user/{uid}',
+                    f'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus',
+                    'systemctl', '--user', 'enable', '--now', 'pulseaudio.socket'], check=True)
 
 
 def main():
@@ -51,7 +62,7 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 '''
     Path('/etc/systemd/system/kuavo5w-speaker.service').write_text(unit)
-    subprocess.run(['loginctl', 'enable-linger', args.user], check=True)
+    ensure_user_audio(args.user, user.pw_uid)
     subprocess.run(['systemctl', 'daemon-reload'], check=True)
     subprocess.run(['systemctl', 'enable', '--now', 'kuavo5w-speaker.service'], check=True)
     subprocess.run(['systemctl', 'restart', 'kuavo5w-speaker.service'], check=True)

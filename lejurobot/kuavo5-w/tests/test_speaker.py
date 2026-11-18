@@ -185,6 +185,40 @@ class SpeakerTests(unittest.TestCase):
         self.assertIsNone(self.bridges[-1].session)
         self.assertTrue(self.bridges[-1].closed)
 
+    def test_service_registration_race_retries_only_definite_absence(self):
+        original = Bridge.call_service
+        attempts = []
+        def call(bridge, path, *args, **kwargs):
+            if path.endswith('/start'):
+                attempts.append(path)
+                if len(attempts) == 1:
+                    raise RuntimeError('Service /motus/kuavo5w/speaker/start does not exist')
+            return original(bridge, path, *args, **kwargs)
+        with patch.object(Bridge, 'call_service', call):
+            self.start()
+        self.assertEqual(len(attempts), 2)
+
+    def test_uncertain_start_timeout_is_never_replayed(self):
+        with patch.object(Bridge, 'call_service', side_effect=TimeoutError('service timed out')) as call:
+            result = self.player.dispatch('start', {'input_topic': '/test/audio'})
+        self.assertEqual(result['state'], 'error')
+        self.assertEqual(call.call_count, 1)
+
+    def test_missing_helper_repair_can_register_after_old_short_deadline(self):
+        original = Bridge.call_service
+        clock = [0.]
+        def call(bridge, path, *args, **kwargs):
+            if path.endswith('/start') and clock[0] < 3.5:
+                raise RuntimeError('Service /motus/kuavo5w/speaker/start does not exist')
+            return original(bridge, path, *args, **kwargs)
+        def sleep(seconds):
+            clock[0] += seconds
+        with patch.object(speaker, 'time', types.SimpleNamespace(
+                monotonic=lambda: clock[0], sleep=sleep)), \
+             patch.object(Bridge, 'call_service', call):
+            self.start()
+        self.assertGreaterEqual(clock[0], 3.5)
+
     def test_chassis_watchdog_failure_does_not_report_ready(self):
         bridge = self.start()
         bridge.session = None

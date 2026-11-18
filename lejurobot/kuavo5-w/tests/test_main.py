@@ -250,10 +250,11 @@ class DeploymentTests(unittest.TestCase):
         self.assertFalse(compose.get('privileged', False))
         self.assertEqual(compose['volumes'], [
             '/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro',
-            {'type': 'bind', 'source': '/opt/phanthy-motus/drivers/lejurobot-kuavo5-w/config.yaml',
-             'target': '/config/kuavo5-w.yaml', 'read_only': True,
-             'bind': {'create_host_path': False}}])
-        self.assertIn('CONFIG_PATH=/config/kuavo5-w.yaml', compose['environment'])
+            {'type': 'bind', 'source': '/opt/phanthy-motus/drivers/lejurobot-kuavo5-w',
+             'target': '/config', 'bind': {'create_host_path': True}}])
+        self.assertIn('CONFIG_PATH=/config/config.yaml', compose['environment'])
+        self.assertIn('KUAVO_CONFIG_SEED=1', compose['environment'])
+        self.assertTrue(config['host_runtime']['controller_boot_required'])
         self.assertIn("ROS_DOMAIN_ID=42", compose["environment"])
         # build.sh flattens driver contents and copies extras under basename.
         for line in (ROOT / "Dockerfile").read_text().splitlines():
@@ -285,6 +286,21 @@ class DeploymentTests(unittest.TestCase):
                     main._load_config()
                 path.write_text('sensors: [')
                 with self.assertRaises(yaml.YAMLError):
+                    main._load_config()
+
+    def test_fresh_deployment_seeds_only_designated_config_and_preserves_existing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'new/config.yaml'
+            with patch.dict(os.environ, {'CONFIG_PATH': str(path), 'KUAVO_STATE_DIR': str(path.parent),
+                                         'KUAVO_CONFIG_SEED': '1'}):
+                config = main._load_config()
+                self.assertTrue(config['provisioning']['enabled'])
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                path.write_text('motion_enabled: false\n')
+                self.assertEqual(main._load_config(), {'motion_enabled': False})
+            with patch.dict(os.environ, {'CONFIG_PATH': str(path.parent / 'missing.yaml'),
+                                         'KUAVO_STATE_DIR': str(path.parent), 'KUAVO_CONFIG_SEED': '1'}):
+                with self.assertRaises(FileNotFoundError):
                     main._load_config()
 
     def test_deployment_without_url_override_uses_operator_config(self):

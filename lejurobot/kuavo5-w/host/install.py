@@ -36,10 +36,14 @@ def main():
         parser.error('Missing workspace devel/setup.bash')
     root = Path('/opt/phanthy-motus/kuavo5w-host')
     root.mkdir(parents=True, exist_ok=True)
+    overlay_changed = False
     if args.message_overlay:
         package = Path(args.message_overlay).resolve() / 'kuavo_msgs'
         if not (package / 'msg/__init__.py').is_file() or not (package / 'srv/__init__.py').is_file():
             parser.error('Message overlay must contain generated kuavo_msgs/msg and kuavo_msgs/srv packages')
+        overlay_changed = any(not (root / 'ros1_messages/kuavo_msgs' / path.relative_to(package)).is_file()
+            or (root / 'ros1_messages/kuavo_msgs' / path.relative_to(package)).read_bytes() != path.read_bytes()
+            for path in package.rglob('*.py'))
         shutil.copytree(package, root / 'ros1_messages/kuavo_msgs', dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
     launch = root / 'head_camera.launch'
@@ -132,6 +136,10 @@ WantedBy=multi-user.target
     subprocess.run(['systemctl', 'enable', '--now', 'kuavo5w-runtime-manager.service'], check=True)
     # enable --now leaves an existing helper process running with old routes.
     subprocess.run(['systemctl', 'restart', 'kuavo5w-runtime-manager.service'], check=True)
+    if overlay_changed:
+        # Already-running bridge imports are cached; changing files alone would
+        # leave a wrong sensorsData MD5 until the next reboot.
+        subprocess.run(['systemctl', 'try-restart', 'kuavo5w-rosbridge.service'], check=True)
     if head is not None and head_launch_changed:
         # Reload a running RGB-only pipeline on upgrade; inactive cameras remain
         # inactive until a card requests them. Never touch robot controllers.

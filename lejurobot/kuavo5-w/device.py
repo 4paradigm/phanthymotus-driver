@@ -19,6 +19,7 @@ from std_msgs.msg import String
 from kuavo_sensors import KuavoSensors, SENSOR_CARDS
 from peripherals import Peripherals, CARDS as PERIPHERAL_CARDS
 from speaker import Speaker
+from bootstrap import config_schema as provisioning_schema
 from startup import StartupChecks
 
 
@@ -773,10 +774,12 @@ class KuavoBundle:
             ros1.advertise(topic, message_type)
         self.sensors = KuavoSensors(config.get('sensors', {}), namespace, ros1, ros2_node)
         self.sensors.robot_serial = config.get('robot_serial')
-        self.startup_checks = StartupChecks(config.get('host_runtime', {}).get('enabled', True))
+        self.startup_checks = StartupChecks(config.get('host_runtime', {}).get('enabled', True),
+                                           config.get('provisioning', {}))
         self.peripherals = Peripherals(ros1, ros2_node, namespace, media_factory=media_factory,
             camera_ensure=self.startup_checks.ensure_camera if self.startup_checks.enabled else None)
-        self.speaker = Speaker(ros2_node, media_factory)
+        self.speaker = Speaker(ros2_node, media_factory,
+            ensure=self.startup_checks.ensure_speaker if self.startup_checks.enabled else None)
         self._auto_start = config.get('sensors', {}).get('auto_start',
             ['joints', 'imu', 'loco_state', *PERIPHERAL_CARDS])
         boot_required = config.get('host_runtime', {}).get('controller_boot_required', False)
@@ -1137,6 +1140,9 @@ class KuavoBundle:
 
     def get_all_tools(self):
         tools = [p.get_tool() for p in self.plugins if p.PREFIX in self._enabled]
+        for tool in tools:
+            if tool['name'] == 'loco':
+                tool['configSchema'] = provisioning_schema()
         return (tools + [t for t in self.sensors.tools() if t['name'] in self._enabled]
                 + [t for t in self.peripherals.tools() if t['name'] in self._enabled]
                 + ([self.speaker.tool()] if 'speaker' in self._enabled else []))
@@ -1156,6 +1162,8 @@ class KuavoBundle:
             return None
         if self._closing:
             return {"state": "error", "error": "driver is shutting down"}
+        if name == 'loco' and action == 'config':
+            return self.startup_checks.provisioner.configure(args)
         if name == 'speaker':
             return self.speaker.dispatch(action, args)
         if name in PERIPHERAL_CARDS:

@@ -6,20 +6,27 @@ lejurobot-kuavo5-w:
   pid: host
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
-    # Seed this complete config from the packaged default before dashboard deploy.
-    # Fail if missing; never create a directory or fall back to another config.
+    # Docker may create this directory on a fresh robot. The driver exclusively
+    # seeds config.yaml, and persists SSH trust/optional mode-0600 operator secrets.
     - type: bind
-      source: /opt/phanthy-motus/drivers/lejurobot-kuavo5-w/config.yaml
-      target: /config/kuavo5-w.yaml
-      read_only: true
+      source: /opt/phanthy-motus/drivers/lejurobot-kuavo5-w
+      target: /config
       bind:
-        create_host_path: false
+        create_host_path: true
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONUNBUFFERED=1
-    - CONFIG_PATH=/config/kuavo5-w.yaml
+    - CONFIG_PATH=/config/config.yaml
+    - KUAVO_STATE_DIR=/config
+    - KUAVO_CONFIG_SEED=1
+    - KUAVO_HOST_SSH_PASSWORD=${KUAVO_HOST_SSH_PASSWORD:-}
+    - KUAVO_CONTROLLER_SSH_PASSWORD=${KUAVO_CONTROLLER_SSH_PASSWORD:-}
+    - KUAVO_CHASSIS_SSH_PASSWORD=${KUAVO_CHASSIS_SSH_PASSWORD:-}
+    - KUAVO_HOST_SUDO_PASSWORD=${KUAVO_HOST_SUDO_PASSWORD:-}
+    - KUAVO_CONTROLLER_SUDO_PASSWORD=${KUAVO_CONTROLLER_SUDO_PASSWORD:-}
+    - KUAVO_CHASSIS_SUDO_PASSWORD=${KUAVO_CHASSIS_SUDO_PASSWORD:-}
     - ROSBRIDGE_URL=${KUAVO_ROSBRIDGE_URL:-}
     - AGENT_CORE_URL=https://localhost:15678
   logging:

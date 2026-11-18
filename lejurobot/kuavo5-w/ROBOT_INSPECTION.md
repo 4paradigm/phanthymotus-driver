@@ -529,3 +529,32 @@ host helper 的首次安装仍需现场管理员执行一次，详见 README。
 - 252项离线测试、Python编译、部署checker和diff检查通过。包括播放输入校验、有界队列、
   生命周期锁不阻塞DDS回调、旧会话/重复包拒绝、EOF/中断、断线不重放及停止未确认报错。
 - 本轮未验证mic、物理关节运动或整机断电后的音频自启动。连续speaker流不提供逐句声学完成ACP。
+
+### 镜像自带的跨机自动准备（2026-11-18）
+
+- 将上位机bridge/电池/相机管理、下位机控制监管、独立底盘PCM播放的源码和安装器全部放入镜像。
+  后台通过SSH检测三台主机，缺少/损坏的自有程序或systemd单元从镜像恢复；正常检查不重复安装。
+  控制器生成的kuavo_msgs导出给上位机bridge，兼容catkin_tools在同一工作区内的符号链接，
+  不复制架构相关二进制，也不覆盖厂商工作区。
+- 配置改为独立/config目录，首次自动创建默认配置；loco共享配置可填写三台主机的地址/账号及SSH、sudo密码。
+  密码单独存于0600文件，不进入仓库/镜像/状态/SSH argv；固定默认地址及账号可覆盖，未内置这台机器的密码。
+  自动准备以匹配的厂商ROS Noetic、版本63工作区、Drake、Orbbec和jaten服务为前提，通用运行包缺失可按白名单补装。
+- 控制监管仅本次开机从未尝试过时允许首次启动；已运行、曾失败或人工停机后不自动重启电机。
+  本轮容器多次重建及三主机安装/修复前后，控制监管MainPID始终361395；boot complete、BaseArm3、
+  control_enabled=false保持，20关节型号继续有效。未执行位移或关节目标。
+- 真实测试停止非电机speaker服务并移走speaker_relay.py，保留备份；只调用一次speaker.start，
+  最终候选在约6.86秒内自动重新分发、启动并返回ready，文件恢复且服务active；speaker.stop返回idle。
+  原先2.5秒注册等待不足，改为仅明确服务不存在时最多等待10秒，超时/不确定送达仍不重放start。
+  底盘独立修复线程不排队等上位机部署；每角色锁防止同机并发安装。
+- 自动启用底盘音频用户linger、用户管理器和pulseaudio.socket，无需先登录桌面。
+  后续静音DDS链路检查：写入16000字节、interrupt后旧句0字节、EOF后新3200字节，stop约246ms确认idle；
+  独立客户端断开后1.8秒为session=null/lease expired，speaker_smoke_passed。该轮静音测试不声称新增声学验收。
+- 最终只读检查三台主机state=ready、changed=false，所需基础服务active；头部RGB/深度现有服务也active。
+  单独无网络新容器验证未预置config.yaml时能创建配置，provisioning及controller_boot_required均开启。
+- 使用仓库Dockerfile实际构建local-bootstrap-261118，最终镜像sha256前缀162a8ac3763b，
+  相对release.261117.2e96669为736907954→743100785字节（+6192831字节）。
+  新增openssh-client/sshpass及源码有成本；此为既有release基线，不代表生产ros-base完整增长。
+  现场腾讯apt源解析失败，使用显式UBUNTU_APT_MIRROR官方ports源后构建成功，默认构建源不变。
+- 283项离线测试、Python编译、service checker与diff检查通过。未拿第二台机器人复验，未完整断电冷启动；
+  本轮不能替代这两项验收。arm/leg.move_joints仍缺现场核验限位，mic仍无确认的真实采集通路，
+  controlled_spatial建图/打点/导航尚未实现；不会以安装器ready宣称上述功能已可用。

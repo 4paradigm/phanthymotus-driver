@@ -11,7 +11,7 @@ EOF = b'\x01\x00\xff\xff\x01\x00\xff\xff'
 
 
 class Speaker:
-    def __init__(self, node, media_factory):
+    def __init__(self, node, media_factory, ensure=None):
         self.node, self.factory = node, media_factory
         self.lock = threading.RLock()
         self.client = self.sub = self.session = self.worker = None
@@ -22,6 +22,7 @@ class Speaker:
         self.error = None
         self.stop_confirmed = True
         self.remote_status = {}
+        self.ensure = ensure
 
     def tool(self):
         return {'name': 'speaker', 'type': 'actuator', 'multiInstance': False,
@@ -166,6 +167,8 @@ class Speaker:
                 if action == 'start' and self.topic == topic and self.session and not self.stop_event.is_set():
                     return {'state': 'ready', 'topic': topic}
                 self._stop()
+                if self.ensure:
+                    self.ensure()
                 if self.factory is None:
                     raise RuntimeError('speaker requires an isolated media bridge')
                 from audio_msgs.msg import AudioChunk
@@ -176,7 +179,18 @@ class Speaker:
                 while not self.client.connection[0] and time.monotonic() < deadline:
                     time.sleep(.02)
                 self.client.advertise(ROOT + '/pcm', 'std_msgs/String')
-                status = self._call('start')
+                # Non-motor bootstrap can need a moment to register the ROS
+                # service after systemctl start. Retry ONLY definite absence;
+                # never replay a timed-out/possibly-delivered start request.
+                service_deadline = time.monotonic() + 10.
+                while True:
+                    try:
+                        status = self._call('start')
+                        break
+                    except RuntimeError as exc:
+                        if 'does not exist' not in str(exc) or time.monotonic() >= service_deadline:
+                            raise
+                        time.sleep(.1)
                 session = status.get('session')
                 if not isinstance(session, str) or not re.fullmatch('[a-f0-9]{32}', session):
                     raise RuntimeError('chassis playback session unavailable')

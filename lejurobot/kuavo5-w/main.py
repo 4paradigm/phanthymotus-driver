@@ -58,7 +58,20 @@ _request_log = _McpRequestLog()
 
 
 def _load_config():
-    with Path(os.environ.get("CONFIG_PATH", ROOT / "config.yaml")).open(encoding="utf-8") as stream:
+    path = Path(os.environ.get('CONFIG_PATH', ROOT / 'config.yaml'))
+    state = Path(os.environ.get('KUAVO_STATE_DIR', '/config'))
+    if os.environ.get('KUAVO_CONFIG_SEED') == '1' and path == state / 'config.yaml' and not path.exists():
+        state.mkdir(parents=True, exist_ok=True)
+        # Only the designated first-deploy path is seeded. Never replace an
+        # operator config, and never fall back for arbitrary missing paths.
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(descriptor, 'wb') as stream:
+                stream.write((ROOT / 'config.yaml').read_bytes())
+    with path.open(encoding="utf-8") as stream:
         return yaml.safe_load(stream) or {}
 
 
