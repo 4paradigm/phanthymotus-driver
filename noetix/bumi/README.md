@@ -500,3 +500,60 @@ media cards and motion cards keep running.
 
 The output contract, quality states, assumed body-axis calibration, validation
 status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
+
+## Camera mount & frame convention
+
+`resource/bumi_model.urdf` declares two extra frames so that vision results can
+hang off the body tf tree instead of floating: `camera_link` (body axes, origin
+at the camera optical centre) and `camera_optical_frame` (optical axes), joined
+by two `fixed` joints off `base_link`. They carry no `<inertial>` — empty links
+are valid URDF and this bundle does not run dynamics.
+
+### Where the camera is, and which parent link
+
+The camera sits above the waist. Its parent link is `base_link`.
+
+> **ASSUMED — not yet verified on the robot.** The deciding test (task T1 §5.3)
+> is: stand the robot, yaw `waist_yaw` 30°, and watch whether the camera image
+> follows. If it follows, the parent must be `waist_yaw_link` (the whole tree is
+> wrong on a turn otherwise); if it does not, `base_link` is correct. This has not
+> been run, so `base_link` is recorded as an assumption, not a measurement.
+
+### Mount translation
+
+`camera_mount_joint`'s `xyz` is the camera optical centre in parent-link
+coordinates (metres), **not** the centroid or the housing face — depth back-
+projection originates at the optical centre, so a wrong value offsets every
+visual target by a constant. The current value is `0 0 0`.
+
+> **ASSUMED — not yet measured.** Measurement needs the robot standing on flat
+> ground; record `measured_on: "<date> / <who> / <site>"` in the URDF comment and
+> here when it is done. Until then it stays nominal and must not be presented as
+> measured.
+
+### Two frames, two input conventions
+
+Vision inputs arrive in more than one convention, so there are two frames and the
+converting card only has to pick the right parent — no extra rotation:
+
+| Input convention | Parent frame |
+| --- | --- |
+| optical axes (x right / y down / z forward) — YOLO, AR tag, external recognition | `camera_optical_frame` |
+| body axes with origin at the camera (x forward / y left / z up) — `upper_body_track_spec.camera_to_body()` | `camera_link` |
+
+The `camera_link → camera_optical_frame` rotation is `rpy = (-π/2, 0, -π/2)`,
+the same rotation as `calibration.camera_to_body.quaternion` `[-0.5, 0.5, -0.5,
+0.5]` (xyzw) in `config.yaml`. Changing one side without the other fails
+`tests/test_bumi_camera_mount_urdf.py`.
+
+### Not the visual-odometry frames
+
+`visual_odometry.py` also publishes `{segment}_base → rgb_optical`. Those are
+estimator-internal frames serving RTAB-Map's odom segment only, **not** body
+coordinates. The two pairs must not be looked up against each other; the
+conversion and tf-tree cards use only the `camera_*` frames.
+
+| Frame set | Owner | Meaning |
+| --- | --- | --- |
+| `camera_link` / `camera_optical_frame` | the robot body | the physical camera, part of the whole-body tf tree, unique repo-wide |
+| `{segment}_base` / `rgb_optical` | the estimator | internal frames for the RTAB-Map odom segment, not body coordinates |
