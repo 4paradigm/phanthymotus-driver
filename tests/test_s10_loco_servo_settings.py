@@ -124,6 +124,25 @@ def test_config_schema_exposes_controls_without_start_defaults(servo):
         assert 'default' not in tool['inputSchema']['properties'][key]
 
 
+def test_resume_has_no_canvas_parameters(servo):
+    actions = servo.plugin.get_tool()['inputSchema']['x-action-params']
+    assert actions['resume']['params'] == []
+
+
+def test_canvas_resume_reuses_paused_stream_and_saved_settings(servo):
+    p = servo.plugin
+    assert p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False,
+                                'speed_preset': 'slow'})['state'] == 'ready'
+    assert p.dispatch('pause', {})['state'] == 'paused'
+    result = p.dispatch('resume', {'input_topic': '/policy/cmd',
+                                   'speed_preset': 'fast', 'dry_run': True})
+    assert result['state'] == 'running'
+    info = p.dispatch('info', {})
+    assert info['input'] == '/policy/cmd'
+    assert info['speed_preset'] == 'slow'
+    assert info['dry_run'] is False
+
+
 def test_dry_run_counts_valid_commands_without_any_native_setup_or_velocity(servo):
     p = servo.plugin
     p.dispatch('start', {'input_topic': '/policy/cmd'})

@@ -139,10 +139,10 @@ class S10LocoServoPlugin:
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": ["start", "stop", "pause", "resume", "info", "config"]},
                     "input_topic": {"type": "string"}, "confirm": {"type": "boolean",
-                        "description": "可显式确认实机控制；卡片选择空跑 No 后启动/恢复也可确认。显式 false 会拒绝实机请求。"},
+                        "description": "启动或配置时可显式确认实机控制。空跑选 No 后，恢复使用已选模式。显式 false 会拒绝实机请求。"},
                     **copy.deepcopy(properties)}, "required": ["action"], "x-is-dangerous": True,
                     "x-action-params": {"start": {"params": ["input_topic", *properties, "confirm"]}, "stop": {"params": []},
-                        "pause": {"params": []}, "resume": {"params": ["confirm"]}, "info": {"params": []},
+                        "pause": {"params": []}, "resume": {"params": [], "description": "继续执行"}, "info": {"params": []},
                         "config": {"params": [*properties, "confirm"]}}, "x-resource": "base",
                     "x-hooks": {"on_interrupt_motion": {"action": "pause"},
                                 "on_interrupt_all": {"action": "pause"}}},
@@ -304,7 +304,10 @@ class S10LocoServoPlugin:
         with self._lock:
             if not self._running: return {"state": "idle"}
             if not paused and not self._dry_run:
-                config = self._configure(args or {})
+                # Canvas can attach the input topic and hidden fields to resume.
+                # Revalidate the selected mode, honoring a legacy explicit confirmation.
+                confirmation = {"confirm": args["confirm"]} if args and "confirm" in args else {}
+                config = self._configure(confirmation)
                 if not config.get("ok"):
                     self._paused = True
                     self._hold()

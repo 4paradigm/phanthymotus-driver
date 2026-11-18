@@ -104,7 +104,7 @@ The card gear and `config`/`start` actions expose:
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `dry_run` | true | Check, shape and count commands without native output |
-| `speed_preset` | normal | Forward/backward cap: slow0.15, normal0.30, fast0.50 m/s |
+| `speed_preset` | normal | Forward/backward caps of 0.30 (slow), 0.60 (normal), and 1.00 (fast) m/s |
 | `rotate_only` | false | Clear vx/vy at execution; preserve yaw |
 | `linear_acceleration` | 0.3 | Nominal m/s² at expected10Hz for vx/vy |
 | `angular_acceleration` | 2.0 | Nominal rad/s² at expected10Hz |
@@ -185,11 +185,12 @@ published and its geometry is declared `unknown`: no pinhole angle fits it (the
 calibrated K's is about 10 degrees short at the edges). Changing the switch reconnects only that lane;
 restart downstream vision cards so they re-read the declaration, and do not
 chain a separate undistortion card behind a rectified camera.
-The per-camera K/D are the chessboard calibrations in `undistortion.py`
-(`CALIBRATIONS`, measured 2026-11-07/08, RMS 0.21-0.22 px). They are per model,
-not per unit, and are not editable from the card; re-measure with
-`tools/calibrate_chessboard.py` (a workstation tool needing numpy and OpenCV; it
-is not shipped in the image) and replace the row. These replace the earlier rough front-camera wall estimate of
+The per-camera K/D are the chessboard calibrations in
+`resource/calibration/s10_pro_camera_intrinsics.json` (measured 2026-11-07/08,
+RMS 0.21-0.22 px). They are per model, not per unit, and are not editable from
+the card. Re-measure with `tools/calibrate_chessboard.py` (a workstation tool
+needing NumPy and OpenCV that ships separately from the image) and replace the
+matching camera entry. These replace the earlier rough front-camera wall estimate of
 `0.423 rad`.
 A one-frame low-latency pipeline reconnects after stream interruption. The
 previous ROS image-topic receive path has been removed because the vendor camera service
