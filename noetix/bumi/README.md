@@ -317,6 +317,59 @@ in `device.py`; no extra runtime Python file is required.
 `poll_interval_s` 默认 `1.0`，允许 `[0.2, 5.0]`。该模块必须在镜像里单独 `COPY`
 （见 `Dockerfile` 末尾的模块清单），否则容器内 import 失败，卡片不会有任何输出。
 
+### `media_config` — 板载媒体单元的可配置项
+
+`media_status` 只回答"它现在是什么状态"，不能改任何东西；`speaker` 只管音量和播放路由。
+厂商 `MediaController` 里还有一组**能写**的设置项，此前没有任何卡片碰过它们 —— 这张卡就是
+它们的读写入口。
+
+**不发布话题、不轮询**：这是一张按需的 get/set 卡（`actuator`），没有 ROS 节点，也
+`topic_out: []`。与 `media_status` 的差别是本质的：那张卡被动持续采样，这张卡只在你调用
+时才碰 SDK。
+
+动作：
+
+| 动作 | 作用 |
+| --- | --- |
+| `get` | 一次读回全部配置项当前值 |
+| `set_timeout` / `set_audio_cue` / `set_wakeup_response` / `set_sleep_response` | 写单个配置项，**写完自动读回**放在 `readback` 里 |
+| `info` | 当前值 + 接口声明（有哪些项、哪些可写、取值范围） |
+| `start` / `stop` | 卡片生命周期，返回 `ready` / `idle` |
+
+配置项：
+
+| 参数名 | 含义 | 可写 | SDK 方法 | 取值 |
+| --- | --- | --- | --- | --- |
+| `timeout` | 自动休眠超时 | 是 | `get/set_timeout` | **整数毫秒**，`[1, 3600000]` |
+| `audio_cue` | 应答提示音开关 | 是 | `get/set_audio_cue_enable` | 真正的 `true` / `false`（字符串不行） |
+| `wakeup_response` | 被唤醒时说的应答词 | 是 | `get/set_wakeup_response_words` | 非空字符串，≤256 字符 |
+| `sleep_response` | 进入休眠时说的应答词 | 是 | `get/set_sleep_response_words` | 非空字符串，≤256 字符 |
+| `wakeup_words` | 唤醒词 | **否** | 只有 `get_wakeup_words` | 只读，见下 |
+
+**唤醒词是只读的，这是刻意的。** pybind 层只有 `get_wakeup_words`，厂商没有提供
+`set_wakeup_words`（`.pyi` 里也搜不到）。把"设置唤醒词"做成一个动作，验收时会发现它根本
+调不通 —— 所以卡片照实把它标成只读，`set_wakeup_words` 这个动作不存在。
+
+**写操作之间必须隔 ≥500 ms。** 厂商的约束是**同一个 `MediaController` 上两次配置写**的
+最小间隔，间隔过短可能让语音系统崩掉（需要返厂）。所以这个间隔门不是每张卡一把锁，而是
+`device.py` 里的一个 `MediaControllerWriteGate`，由 `speaker` 和 `media_config` **共用同一
+个实例**：否则 `speaker.set_volume` 紧跟 `media_config.set_timeout` 时，两张卡各自看自己的
+计时器都觉得"可以写"，实际却连着打了两下。跨卡串行化由
+`tests/test_media_config.py` 里基于假时钟的测试盯着。
+
+两条与 `media_status` 相反的注册规则：
+
+- **媒体控制器不在就不注册。** 这张卡是**写**卡，`media_ctrl is None` 时它无事可做，
+  `main.py` 直接跳过并打印 `MediaConfigPlugin skipped: media unit unavailable`
+  （`media_status` 相反：它要报的正是这个病，所以照样注册）。
+- **写失败不编值。** 控制器没连上时任何 `set_*` 都被拒绝（`state: error`），`get` 返回
+  `values: null` + `controller_present: false`，而不是给一份看着正常的默认值。
+
+校验规则（毫秒不是秒、布尔不是真值字符串、应答词非空）都在 `media_config_spec.py`，
+不导入 rclpy，笔记本上就能测。该模块同样必须在镜像里单独 `COPY`
+（`COPY media_config_spec.py /work/media_config_spec.py`），否则容器内 import 失败、
+卡片静默消失。配置在 `plugins.media_config`：`enabled: true`，没有轮询参数。
+
 ### `motion_state`
 
 Passive, read-only whole-body motion telemetry from `HighController`. The card has no action parameters or execute button. Its single JSON output combines the former summary and joint views:
