@@ -5,11 +5,13 @@ from __future__ import annotations
 import math
 import time
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import Optional
 
 
 LEFT_ARM_JOINTS = tuple(f"joint_la{i}" for i in range(8))
 RIGHT_ARM_JOINTS = tuple(f"joint_ra{i}" for i in range(8))
+COMMISSIONING_AUTH_TOKEN = "ENABLE_PANTHER_MOTION"
 # Mirror across Panther's sagittal (XZ) plane.  Rotations around the vendor
 # URDF's X/Z axes reverse sign; rotations around Y retain their sign.
 ARM_MIRROR_SIGNS = (-1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0)
@@ -41,6 +43,24 @@ def strict_boolean(value, field: str) -> bool:
         if normalized in ("false", "0", "no", "off"):
             return False
     raise ValueError(f"{field} must be an explicit boolean")
+
+
+def resolve_commissioning_motion(configured, authorization_file: Optional[str]) -> bool:
+    """Resolve motion authorization from config or an explicit host file."""
+    enabled = strict_boolean(configured, "safety.commissioning_motion_enabled")
+    if not authorization_file:
+        return enabled
+    try:
+        token = Path(authorization_file).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return enabled
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot read commissioning authorization file: {type(exc).__name__}"
+        ) from exc
+    if token != COMMISSIONING_AUTH_TOKEN:
+        raise RuntimeError("commissioning authorization file has invalid content")
+    return True
 
 
 def finite_vector(value, field: str, length: int) -> list[float]:

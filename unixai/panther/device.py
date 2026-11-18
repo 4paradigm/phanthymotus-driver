@@ -35,7 +35,7 @@ from contracts import (
     parse_joint_limits,
     populate_switch_request,
     require_confirmation,
-    strict_boolean,
+    resolve_commissioning_motion,
     validate_drive,
     validate_joint_target,
 )
@@ -123,11 +123,9 @@ class PantherDevice:
         configured_motion = config.get("safety", {}).get(
             "commissioning_motion_enabled", False
         )
-        self._commissioning_motion_enabled = strict_boolean(
-            os.environ.get(
-                "PANTHER_COMMISSIONING_MOTION_ENABLED", configured_motion
-            ),
-            "PANTHER_COMMISSIONING_MOTION_ENABLED",
+        self._commissioning_motion_enabled = resolve_commissioning_motion(
+            configured_motion,
+            os.environ.get("PANTHER_COMMISSIONING_MOTION_AUTH_FILE"),
         )
         self._lock = threading.RLock()
         self._cache: dict[str, tuple[object, float]] = {}
@@ -302,6 +300,19 @@ class PantherDevice:
         self._stop_head("driver_shutdown", wait_s=5.0)
         self._camera.close()
         self._bridge.stop()
+        pending_stop = self._wait_for_pending_drive_stop(0.0)
+        if pending_stop is not None and not pending_stop.get("stop_confirmed"):
+            with self._drive_lock:
+                request = self._drive_stop_request
+                self._drive_stop_request = None
+                if request is not None:
+                    request["event"].set()
+            if request is not None:
+                print(
+                    "[base_drive] shutdown stop is unconfirmed; no matched "
+                    "subscriber received the zero-velocity sequence",
+                    flush=True,
+                )
         try:
             self._executor.remove_node(self._node)
         except Exception:
@@ -942,13 +953,22 @@ class PantherDevice:
         repetitions = max(1, int(cfg.get("stop_repetitions", 5)))
         period = 1.0 / rate
         sent = 0
-        while not self._closed:
+        # Shutdown marks the device closed while other actuator workers are
+        # still winding down. Keep the zero-velocity path alive until it is
+        # confirmed or close() explicitly surfaces and retires it.
+        while True:
             with self._drive_lock:
                 if self._drive_stop_request is not request:
                     return
                 publisher = self._drive_pub
                 topic = self._drive_topic
             if not self._drive_publisher_matched(publisher):
+                if request.get("publish_while_unmatched") and publisher is not None:
+                    try:
+                        publisher.publish(Twist())
+                        request["unmatched_zero_attempts"] += 1
+                    except Exception as exc:
+                        request["last_error"] = f"{type(exc).__name__}: {exc}"
                 time.sleep(0.05)
                 continue
             deadline = time.monotonic() + duration
@@ -1097,6 +1117,8 @@ class PantherDevice:
                 "event": threading.Event(),
                 "result": None,
                 "last_error": None,
+                "publish_while_unmatched": reason == "driver_shutdown",
+                "unmatched_zero_attempts": 0,
             }
             self._drive_stop_request = request
             thread = threading.Thread(

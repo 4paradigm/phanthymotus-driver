@@ -6,8 +6,10 @@ import importlib.util
 import io
 import json
 import math
+import os
 import re
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -106,8 +108,7 @@ class PantherDriverTest(unittest.TestCase):
         tools = {plugin.name: plugin.get_tool()
                  for plugin in plugins.build_plugins(config, "test", FakeDevice())}
         base = tools["base_drive"]["inputSchema"]
-        self.assertIs(base["properties"]["confirm_motion"]["const"], True)
-        self.assertIn("confirm_motion", base["x-action-params"]["move"]["params"])
+        self.assertNotIn("confirm_motion", base["properties"])
         self.assertEqual(base["x-completion"]["actions"], ["move"])
         self.assertEqual(base["properties"]["angular_z_deg_s"]["maximum"], 45.0)
         self.assertEqual(base["properties"]["duration_s"]["maximum"], 10.0)
@@ -118,14 +119,14 @@ class PantherDriverTest(unittest.TestCase):
         self.assertTrue({"j0_deg", "j7_deg", "la0_deg", "la7_deg", "ra0_deg", "ra7_deg"} <= set(arm["properties"]))
         self.assertEqual(
             arm["x-action-params"]["move"]["params"],
-            ["side", *[f"j{i}_deg" for i in range(8)], "duration_s", "confirm_motion"],
+            ["side", *[f"j{i}_deg" for i in range(8)], "duration_s"],
         )
         self.assertEqual(
             arm["x-action-params"]["move_separate"]["params"],
             [*[f"la{i}_deg" for i in range(8)], *[f"ra{i}_deg" for i in range(8)],
-             "duration_s", "confirm_motion"],
+             "duration_s"],
         )
-        self.assertIs(arm["properties"]["confirm_motion"]["const"], True)
+        self.assertNotIn("confirm_motion", arm["properties"])
         self.assertIn(
             "left/both [0.0, 90.0] deg, right [-90.0, 0.0] deg",
             arm["properties"]["j2_deg"]["description"],
@@ -154,7 +155,7 @@ class PantherDriverTest(unittest.TestCase):
         self.assertTrue({"yaw_deg", "pitch_deg"} <= set(head["properties"]))
         self.assertEqual(head["properties"]["speed"]["enum"], ["low", "high"])
         self.assertEqual(head["properties"]["speed"]["default"], "high")
-        self.assertEqual(head["x-action-params"]["home"]["params"], ["confirm_motion"])
+        self.assertEqual(head["x-action-params"]["home"]["params"], [])
         self.assertEqual(set(head["x-completion"]["actions"]), {"look", "home"})
         expected_hooks = {
             "on_interrupt_motion": {"action": "stop"},
@@ -164,25 +165,10 @@ class PantherDriverTest(unittest.TestCase):
             self.assertEqual(tools[tool_name]["inputSchema"]["x-hooks"], expected_hooks)
         self.assertNotIn("x-hooks", tools["gripper"]["inputSchema"])
         self.assertNotIn("x-hooks", tools["lifting"]["inputSchema"])
-        confirmed = {
-            "base_drive": {"move"},
-            "arm_control": {"move", "move_separate", "home"},
-            "gripper": {"set", "open", "close"},
-            "lifting": {"set_position", "home"},
-            "head": {"look", "home"},
-        }
-        for tool_name, actions in confirmed.items():
+        for tool_name in ("base_drive", "arm_control", "gripper", "lifting", "head"):
             schema = tools[tool_name]["inputSchema"]
-            self.assertIs(schema["properties"]["confirm_motion"]["const"], True)
-            self.assertEqual(
-                set(schema["allOf"][0]["if"]["properties"]["action"]["enum"]),
-                actions,
-            )
-            self.assertEqual(schema["allOf"][0]["then"]["required"], ["confirm_motion"])
-            for action in actions:
-                self.assertIn("confirm_motion", schema["x-action-params"][action]["params"])
-            for action in set(schema["properties"]["action"]["enum"]) - actions:
-                self.assertNotIn("confirm_motion", schema["x-action-params"][action]["params"])
+            self.assertNotIn("confirm_motion", schema["properties"])
+            self.assertNotIn("confirm_motion", json.dumps(schema))
         exposed = json.dumps(tools, ensure_ascii=False)
         self.assertIsNone(re.search(r"[一-鿿]", exposed))
         self.assertNotRegex(exposed, r'"(?:head[01]|la[0-7]|ra[0-7])_rad"')
@@ -193,6 +179,16 @@ class PantherDriverTest(unittest.TestCase):
             device.count("single position command: nothing is in flight in this driver"),
             2,
         )
+
+    def test_execute_click_injects_low_level_motion_confirmation(self):
+        captured = []
+        plugin = plugins.ActuatorPlugin(
+            None, "arm_control", "test", {}, lambda payload: captured.append(payload) or payload
+        )
+        result = plugin.dispatch("move", {"side": "left", "j0_deg": 1.0})
+        self.assertIs(result["confirm_motion"], True)
+        plugin.dispatch("info", {})
+        self.assertNotIn("confirm_motion", captured[-1])
 
     def test_runtime_rejects_unconfirmed_motion_before_ros_or_state_access(self):
         device = object.__new__(device_module.PantherDevice)
@@ -365,7 +361,17 @@ class PantherDriverTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "explicit boolean"):
             contracts.strict_boolean("enabled", "gate")
 
-    def test_sensor_start_rejects_missing_or_stale_device_data(self):
+    def test_commissioning_requires_explicit_authorization_file_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authorization = Path(directory) / "panther-motion.authorization"
+            self.assertFalse(contracts.resolve_commissioning_motion(False, str(authorization)))
+            authorization.write_text("wrong")
+            with self.assertRaisesRegex(RuntimeError, "invalid content"):
+                contracts.resolve_commissioning_motion(False, str(authorization))
+            authorization.write_text(contracts.COMMISSIONING_AUTH_TOKEN)
+            self.assertTrue(contracts.resolve_commissioning_motion(False, str(authorization)))
+
+    def test_sensor_start_arms_while_waiting_for_first_sample(self):
         class FakeDevice:
             topics = {"imu": {"topic": "/test/imu", "format": "data/json"}}
 
@@ -374,8 +380,9 @@ class PantherDriverTest(unittest.TestCase):
                 return {"available": False, "fresh": False, "source_topic": "/imu"}
 
         plugin = plugins.SensorPlugin(FakeDevice(), "imu", "test", ["imu"])
-        with self.assertRaisesRegex(RuntimeError, "no fresh data received from /imu"):
-            plugin.dispatch("start", {})
+        started = plugin.dispatch("start", {})
+        self.assertEqual(started["state"], "waiting_for_data")
+        self.assertTrue(started["armed"])
         self.assertEqual(plugin.dispatch("info", {})["state"], "unavailable")
 
     def test_bundled_model_and_standardized_streams_are_packaged(self):
@@ -545,13 +552,15 @@ class PantherDriverTest(unittest.TestCase):
             "geometry_msgs": geometry,
             "geometry_msgs.msg": geometry_msg,
         }), patch.object(device_module, "_notify_completion"):
-            result = device.cancel_drive(wait_s=0.02)
+            result = device.cancel_drive("driver_shutdown", wait_s=0.08)
             self.assertEqual(result["state"], "stop_unconfirmed")
             self.assertFalse(result["stop_confirmed"])
-            self.assertEqual(publisher.messages, [])
+            self.assertGreater(len(publisher.messages), 0)
+            # close() marks the device closed before other actuator workers
+            # finish. The pending zero command must survive that transition.
+            device._closed = True
             publisher.matched = True
             confirmed = device._wait_for_pending_drive_stop(1.0)
-        device._closed = True
         self.assertTrue(confirmed["stop_confirmed"])
         self.assertGreaterEqual(len(publisher.messages), 2)
 
@@ -582,6 +591,77 @@ class PantherDriverTest(unittest.TestCase):
         self.assertEqual(topics["camera_color"]["format"], "image/jpeg")
         self.assertEqual(topics["camera_depth"]["format"], "image/depth-zlib")
         self.assertFalse({"laser_front", "laser_rear", "laser_fused"} & set(topics))
+
+    def test_agent_core_lane_creates_only_an_output_publisher(self):
+        created = {"publishers": [], "subscriptions": [], "messages": []}
+
+        class Messages:
+            def __init__(self):
+                self.items = [{"source_topic": "/scan", "ranges": [1.0]}, None]
+
+            def get(self):
+                return self.items.pop(0)
+
+        class Publisher:
+            def publish(self, message):
+                created["messages"].append(message)
+
+        class Node:
+            def __init__(self, _name, **kwargs):
+                self.kwargs = kwargs
+                self.assert_output_only_options()
+
+            def assert_output_only_options(self):
+                self_test.assertFalse(self.kwargs["enable_rosout"])
+                self_test.assertFalse(self.kwargs["start_parameter_services"])
+
+            def create_publisher(self, message_type, topic, _qos):
+                created["publishers"].append((message_type, topic))
+                return Publisher()
+
+            def create_subscription(self, *_args, **_kwargs):
+                created["subscriptions"].append(True)
+                raise AssertionError("Agent Core bridge must not create a DataReader")
+
+            def destroy_node(self):
+                pass
+
+        class String:
+            def __init__(self):
+                self.data = ""
+
+        class CompressedImage:
+            pass
+
+        self_test = self
+        rclpy = ModuleType("rclpy")
+        rclpy.init = lambda **_kwargs: None
+        rclpy.ok = lambda: True
+        rclpy.shutdown = lambda: None
+        rclpy_node = ModuleType("rclpy.node"); rclpy_node.Node = Node
+        rclpy_qos = ModuleType("rclpy.qos")
+        rclpy_qos.HistoryPolicy = SimpleNamespace(KEEP_LAST=1)
+        rclpy_qos.ReliabilityPolicy = SimpleNamespace(BEST_EFFORT=1)
+        rclpy_qos.QoSProfile = lambda **kwargs: kwargs
+        sensor_msgs = ModuleType("sensor_msgs")
+        sensor_msgs_msg = ModuleType("sensor_msgs.msg")
+        sensor_msgs_msg.CompressedImage = CompressedImage
+        sensor_msgs.msg = sensor_msgs_msg
+        std_msgs = ModuleType("std_msgs")
+        std_msgs_msg = ModuleType("std_msgs.msg")
+        std_msgs_msg.String = String
+        std_msgs.msg = std_msgs_msg
+        modules = {
+            "rclpy": rclpy, "rclpy.node": rclpy_node, "rclpy.qos": rclpy_qos,
+            "sensor_msgs": sensor_msgs, "sensor_msgs.msg": sensor_msgs_msg,
+            "std_msgs": std_msgs, "std_msgs.msg": std_msgs_msg,
+        }
+        with patch.dict(sys.modules, modules), patch.dict(os.environ, {}, clear=False):
+            core_bridge._run_lane(Messages(), "/profile.xml", 42, "test", "laser_scan")
+        self.assertEqual(len(created["publishers"]), 1)
+        self.assertEqual(created["publishers"][0][1], "/test/panther/laser_scan")
+        self.assertEqual(created["subscriptions"], [])
+        self.assertEqual(json.loads(created["messages"][0].data)["source_topic"], "/scan")
 
     def test_lidar_callback_matches_bridge_json_and_jpeg_contracts(self):
         class FakeImage:
@@ -801,6 +881,9 @@ class PantherDriverTest(unittest.TestCase):
         runtime = (ROOT / "common" / "vendor_runtime.py").read_text()
         self.assertIn('advertise_host: str = "localhost"', runtime)
         self.assertNotIn('os.environ.get("MCP_ADVERTISE_HOST"', runtime)
+        self.assertIn("failures % 12", runtime)
+        self.assertIn("type(exc).__name__[:80]", runtime)
+        self.assertNotIn('f"[register] failed: {exc}', runtime)
 
     def test_action_resources_follow_agent_core_conventions(self):
         plugins = (DRIVER / "plugins.py").read_text()
@@ -823,8 +906,9 @@ class PantherDriverTest(unittest.TestCase):
             "PANTHER_MCP_ADVERTISE_HOST=${PANTHER_MCP_ADVERTISE_HOST:-localhost}",
             service,
         )
+        self.assertNotIn("PANTHER_COMMISSIONING_MOTION_ENABLED", service)
         self.assertIn(
-            "PANTHER_COMMISSIONING_MOTION_ENABLED=${PANTHER_COMMISSIONING_MOTION_ENABLED:-false}",
+            "PANTHER_COMMISSIONING_MOTION_AUTH_FILE=/opt/phanthy-motus/data/panther-motion.authorization",
             service,
         )
         self.assertIn("PANTHER_ROS_DOMAIN_ID=0", service)
@@ -833,7 +917,14 @@ class PantherDriverTest(unittest.TestCase):
             "/home/unix_ai/config/cyclonedds.xml:/etc/cyclonedds/panther.xml:ro",
             service,
         )
-        self.assertIn("CYCLONEDDS_URI=file:///etc/cyclonedds/panther.xml", service)
+        self.assertIn(
+            "CYCLONEDDS_URI=file:///etc/cyclonedds/panther.xml,file:///work/resource/cyclonedds-muzzle.xml",
+            service,
+        )
+        muzzle = (DRIVER / "resource" / "cyclonedds-muzzle.xml").read_text()
+        self.assertIn("<Verbosity>none</Verbosity>", muzzle)
+        self.assertIn("<OutputFile>/dev/null</OutputFile>", muzzle)
+        self.assertIn("COPY resource/cyclonedds-muzzle.xml", dockerfile)
         self.assertIn("network_mode: host", service)
         self.assertIn("stop_grace_period: 30s", service)
 

@@ -28,6 +28,14 @@ limits. Arm execution uses the intersection of both limit sets. `joints`,
 `imu`, `odom`, `robot_state`, `battery`, and `laser_scan` are rate limited before crossing
 the per-card domain-42 bridge.
 
+Each Agent Core bridge lane creates one ROS publisher for an allowlisted
+`topic_out` and no subscription, parameter service, or rosout endpoint. A DDS
+participant does not receive application samples without a DataReader, so
+robot command topics have no ingress path in these bridge processes. The
+FastDDS profile additionally confines the domain-42 traffic to loopback.
+Ordinary sensor `start` returns `waiting_for_data` until the first fresh sample
+instead of failing the card lifecycle.
+
 `robot_state` contains compact readiness, controller, diagnostic, and hardware
 summaries. Battery measurements use the separate `battery` card; gripper and
 lifting feedback are available from their actuator cards. `laser_scan`
@@ -63,16 +71,15 @@ for these concrete runtime paths:
 For a base-image update, measure package-layer changes with `docker history`
 instead of recording a size that becomes stale with the moving base image.
 
-Physical motion is disabled by default. A trusted deployment must set
-`PANTHER_COMMISSIONING_MOTION_ENABLED=true` before any command can move the
-robot. This deployment-level gate is not an MCP argument and cannot be enabled
-by an action caller. After the gate is enabled, every physical-motion action
-still requires `confirm_motion: true`: base `move`, arm
-`move`/`move_separate`/`home`, gripper `set`/`open`/`close`, lifting `set_position`/`home`, and
-head `look`/`home`. The requirement is declared in each MCP schema and enforced
-again at the first runtime boundary, before any controller query, ROS publisher,
-or robot-state access. Lifecycle-only actions (`start`, `info`, `stop`, and
-`cancel`) do not require confirmation. Commands are also rejected unless live
+Physical motion is disabled by default. Standard deployment enables it only
+when the mounted host file
+`/opt/phanthy-motus/data/panther-motion.authorization` contains exactly
+`ENABLE_PANTHER_MOTION`. Removing that file and restarting disables motion.
+This explicit host action cannot be inherited accidentally from the Compose
+environment and is not exposed as an MCP argument. Clicking Execute is the
+per-command user confirmation, so `confirm_motion` is not displayed on the
+cards; the plugin injects it only at the low-level device boundary. Commands
+are still rejected unless the deployment gate and live
 robot/controller state and configured limits pass their card-specific checks.
 Arm and head commands
 also require a live `/robot_description`; missing limits cause a hard rejection
@@ -85,6 +92,10 @@ subscriber loss is never reported as a confirmed stop. Arm `home` retains the
 same per-command delta limit as ordinary moves because its all-zero candidate
 pose has not been independently commissioned. Head `home` uses its configured
 low-speed profile.
+
+The mounted robot-side CycloneDDS profile is followed by a bundled override
+that sets tracing verbosity to `none` and its output to `/dev/null`, preventing
+a host profile from enabling high-volume per-message container logs.
 
 Panther explicitly advertises `localhost` by default through
 `PANTHER_MCP_ADVERTISE_HOST`, matching its host-network Agent Core deployment.

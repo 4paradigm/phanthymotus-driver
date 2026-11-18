@@ -317,6 +317,7 @@ def start_registration(
 
     def loop():
         announced = False
+        failures = 0
         while True:
             try:
                 request = urllib.request.Request(f"{url}/api/mcp", data=payload, headers={"Content-Type": "application/json"}, method="POST")
@@ -329,9 +330,20 @@ def start_registration(
                         flush=True,
                     )
                     announced = True
+                failures = 0
                 time.sleep(30)
             except Exception as exc:
-                print(f"[register] failed: {exc}; retrying in 5s", flush=True)
+                failures += 1
+                if failures == 1 or failures % 12 == 0:
+                    # Exception strings may contain an attacker-controlled URL
+                    # or response text. Log only the bounded type and sample
+                    # persistent failures instead of emitting every retry.
+                    kind = type(exc).__name__[:80]
+                    print(
+                        f"[register] attempt {failures} failed ({kind}); "
+                        "retrying in 5s",
+                        flush=True,
+                    )
                 time.sleep(5)
 
     threading.Thread(target=loop, daemon=True, name="register").start()

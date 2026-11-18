@@ -46,6 +46,7 @@ WORKDIR /work
 COPY common/ /work/common/
 COPY main.py device.py plugins.py contracts.py core_bridge.py camera.py config.yaml driver.yaml /work/
 COPY resource/panther.urdf /work/resource/panther.urdf
+COPY resource/cyclonedds-muzzle.xml /work/resource/cyclonedds-muzzle.xml
 COPY entrypoint.sh /work/entrypoint.sh
 COPY deploy/ /deploy/
 RUN chmod 0755 /work/entrypoint.sh

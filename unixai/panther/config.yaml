@@ -8,8 +8,8 @@ ros:
   robot_rmw: "rmw_cyclonedds_cpp"
 
 safety:
-  # Deployment-level authorization. Per-command confirm_motion is still
-  # required after this gate is explicitly enabled.
+  # Deployment-level authorization. Standard deployment enables this only
+  # through the explicit host authorization file, never inherited env state.
   commissioning_motion_enabled: false
 
 plugins:

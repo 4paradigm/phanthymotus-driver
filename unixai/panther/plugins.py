@@ -58,12 +58,11 @@ class SensorPlugin:
             # completed its first cycle yet.
             self.device.controller_states()
         data = self.device.sensor_info(self.name)
-        if action == "start" and (not data.get("available") or not data.get("fresh")):
-            source = data.get("source_topic") or data.get("source") or self.name
-            detail = data.get("last_callback_error")
-            suffix = f"; last callback error: {detail}" if detail else ""
-            raise RuntimeError(f"no fresh data received from {source}{suffix}")
-        return {"state": "running" if data.get("fresh") else "unavailable", "data": data,
+        if action == "start":
+            state = "running" if data.get("available") and data.get("fresh") else "waiting_for_data"
+        else:
+            state = "running" if data.get("fresh") else "unavailable"
+        return {"state": state, "armed": action == "start", "data": data,
                 "topic_out": [self.device.topics[card] for card in self.topic_cards]}
 
 
@@ -82,6 +81,14 @@ class JointsPlugin(SensorPlugin):
 
 
 class ActuatorPlugin:
+    _MOTION_ACTIONS = {
+        "base_drive": {"move"},
+        "arm_control": {"move", "move_separate", "home"},
+        "gripper": {"set", "open", "close"},
+        "lifting": {"set_position", "home"},
+        "head": {"look", "home"},
+    }
+
     def __init__(self, device, name, description, schema, method):
         self.device = device
         self.name = name
@@ -106,6 +113,11 @@ class ActuatorPlugin:
 
     def dispatch(self, action, args):
         payload = dict(args); payload["action"] = action
+        # Clicking Execute on a physical-motion action is the user-facing
+        # confirmation. Keep the low-level device guard for direct callers,
+        # but do not expose a repetitive boolean field on every card.
+        if action in self._MOTION_ACTIONS.get(self.name, set()):
+            payload["confirm_motion"] = True
         return self.method(payload)
 
 
@@ -157,7 +169,7 @@ class CameraPlugin:
 
 
 def _action_schema(actions, properties, required_by_action=None, resource=None,
-                   completion=None, interruptible=False, confirmed_actions=None):
+                   completion=None, interruptible=False):
     schema = {
         "type": "object",
         "properties": {
@@ -178,11 +190,6 @@ def _action_schema(actions, properties, required_by_action=None, resource=None,
             "on_interrupt_motion": {"action": "stop"},
             "on_interrupt_all": {"action": "stop"},
         }
-    if confirmed_actions:
-        schema["allOf"] = [{
-            "if": {"properties": {"action": {"enum": list(confirmed_actions)}}},
-            "then": {"required": ["confirm_motion"]},
-        }]
     return schema
 
 
@@ -218,8 +225,6 @@ def build_plugins(config, namespace, device):
             device, "camera_depth", "depth", "Panther Gemini 2 depth stream (zlib 16UC1)"
         ))
 
-    confirm = {"type": "boolean", "const": True,
-               "description": "Required: explicitly confirm physical motion"}
     if on("base_drive"):
         cfg = enabled["base_drive"]
         schema = _action_schema(
@@ -233,9 +238,8 @@ def build_plugins(config, namespace, device):
                                     "description": f"[-{cfg['max_angular_deg_s']:g}, {cfg['max_angular_deg_s']:g}] deg/s; +turn left, -turn right"},
                 "duration_s": {"type": "number", "minimum": 0.1, "maximum": cfg["max_duration_s"],
                                "description": f"[0.1, {cfg['max_duration_s']:g}] s; auto-stops when elapsed"},
-                "confirm_motion": confirm,
             },
-            {"move": {"params": ["linear_x", "linear_y", "angular_z_deg_s", "duration_s", "confirm_motion"],
+            {"move": {"params": ["linear_x", "linear_y", "angular_z_deg_s", "duration_s"],
                       "description": "Move with bounded velocity for a finite duration"},
              "stop": {"params": [], "description": "Stop immediately"},
              "cancel": {"params": [], "description": "Cancel the active move and stop"},
@@ -244,7 +248,6 @@ def build_plugins(config, namespace, device):
             "base",
             {"actions": ["move"], "timeout": cfg["max_duration_s"] + 10},
             True,
-            confirmed_actions=["move"],
         )
         plugins.append(ActuatorPlugin(device, "base_drive", "Finite-duration omnidirectional Panther base drive", schema, device.drive))
     if on("arm_control"):
@@ -309,20 +312,18 @@ def build_plugins(config, namespace, device):
                                         "description": "8 right-arm targets in deg; live URDF limits"},
                 "duration_s": {"type": "number", "minimum": 1.0, "maximum": enabled["arm_control"]["max_duration_s"],
                                "description": f"[1, {enabled['arm_control']['max_duration_s']:g}] s"},
-                "confirm_motion": confirm,
             },
-            {"move": {"params": ["side", *shared_joint_fields, "duration_s", "confirm_motion"],
+            {"move": {"params": ["side", *shared_joint_fields, "duration_s"],
                       "description": "Move one arm, or both arms as a mirrored 8-axis pose"},
-             "move_separate": {"params": [*separate_joint_fields, "duration_s", "confirm_motion"],
+             "move_separate": {"params": [*separate_joint_fields, "duration_s"],
                                "description": "Move both arms with 16 independent joint targets"},
-             "home": {"params": ["side", "confirm_motion"], "description": "Move selected arms to the candidate home pose"},
+             "home": {"params": ["side"], "description": "Move selected arms to the candidate home pose"},
              "stop": {"params": [], "description": "Cancel the active arm motion"},
              "start": {"params": [], "description": "Check controller and feedback readiness"},
              "info": {"params": [], "description": "Read controller and feedback readiness"}},
             ["arm_l", "arm_r"],
             {"actions": ["move", "move_separate", "home"], "timeout": enabled["arm_control"]["max_duration_s"] + 15},
             True,
-            confirmed_actions=["move", "move_separate", "home"],
         )
         plugins.append(ActuatorPlugin(device, "arm_control", "Safe P2P arm control with verified controller switching", schema, device.arm))
     if on("gripper"):
@@ -331,28 +332,24 @@ def build_plugins(config, namespace, device):
             {"side": {"type": "string", "enum": ["left", "right", "both"], "default": "both",
                       "description": "left, right, or both grippers"},
              "position": {"type": "number", "minimum": 0.0, "maximum": 1.0,
-                          "description": "[0, 1]; 0=open, 1=closed"},
-             "confirm_motion": confirm},
-            {"set": {"params": ["side", "position", "confirm_motion"], "description": "Set normalized gripper position"},
-             "open": {"params": ["side", "confirm_motion"], "description": "Open selected grippers"},
-             "close": {"params": ["side", "confirm_motion"], "description": "Close selected grippers"},
+                          "description": "[0, 1]; 0=open, 1=closed"}},
+            {"set": {"params": ["side", "position"], "description": "Set normalized gripper position"},
+             "open": {"params": ["side"], "description": "Open selected grippers"},
+             "close": {"params": ["side"], "description": "Close selected grippers"},
              "stop": {"params": [], "description": "End the card lifecycle"},
              "start": {"params": [], "description": "Check controller and feedback readiness"},
-             "info": {"params": [], "description": "Read controller and feedback readiness"}}, ["hand_l", "hand_r"],
-            confirmed_actions=["set", "open", "close"])
+             "info": {"params": [], "description": "Read controller and feedback readiness"}}, ["hand_l", "hand_r"])
         plugins.append(ActuatorPlugin(device, "gripper", "Left/right Panther gripper position control", schema, device.gripper))
     if on("lifting"):
         schema = _action_schema(
             ["start", "info", "set_position", "home", "stop"],
             {"position_m": {"type": "number", "minimum": enabled["lifting"].get("min_position_m", 0.0), "maximum": enabled["lifting"]["max_position_m"],
-                            "description": f"[{enabled['lifting'].get('min_position_m', 0.0):g}, {enabled['lifting']['max_position_m']:g}] m"},
-             "confirm_motion": confirm},
-            {"set_position": {"params": ["position_m", "confirm_motion"], "description": "Set lifting height"},
-             "home": {"params": ["confirm_motion"], "description": f"Move to {enabled['lifting'].get('home_position_m', 0.6):g} m home height"},
+                            "description": f"[{enabled['lifting'].get('min_position_m', 0.0):g}, {enabled['lifting']['max_position_m']:g}] m"}},
+            {"set_position": {"params": ["position_m"], "description": "Set lifting height"},
+             "home": {"params": [], "description": f"Move to {enabled['lifting'].get('home_position_m', 0.6):g} m home height"},
              "stop": {"params": [], "description": "End the card lifecycle"},
              "start": {"params": [], "description": "Check controller and feedback readiness"},
-             "info": {"params": [], "description": "Read controller and feedback readiness"}}, "waist",
-            confirmed_actions=["set_position", "home"])
+             "info": {"params": [], "description": "Read controller and feedback readiness"}}, "waist")
         plugins.append(ActuatorPlugin(device, "lifting", "Panther lifting position control", schema, device.lifting))
     if on("head"):
         schema = _action_schema(
@@ -364,15 +361,14 @@ def build_plugins(config, namespace, device):
                            "maximum": enabled["head"].get("pitch_max_deg", 20.0),
                            "description": f"[{enabled['head'].get('pitch_min_deg', -86.0):g}, {enabled['head'].get('pitch_max_deg', 20.0):g}] deg; +down, -up"},
              "speed": {"type": "string", "enum": ["low", "high"], "default": "high",
-                       "description": f"low={enabled['head'].get('low_speed_deg_s', 10.0):g} deg/s; high={enabled['head'].get('high_speed_deg_s', 20.0):g} deg/s"},
-             "confirm_motion": confirm},
-            {"look": {"params": ["yaw_deg", "pitch_deg", "speed", "confirm_motion"], "description": "Move smoothly to a pan/tilt target"},
-             "home": {"params": ["confirm_motion"], "description": "Return home at low speed"},
+                       "description": f"low={enabled['head'].get('low_speed_deg_s', 10.0):g} deg/s; high={enabled['head'].get('high_speed_deg_s', 20.0):g} deg/s"}},
+            {"look": {"params": ["yaw_deg", "pitch_deg", "speed"], "description": "Move smoothly to a pan/tilt target"},
+             "home": {"params": [], "description": "Return home at low speed"},
              "stop": {"params": [], "description": "Cancel the active head motion"},
              "start": {"params": [], "description": "Check controller and feedback readiness"},
              "info": {"params": [], "description": "Read controller and feedback readiness"}}, "head",
             {"actions": ["look", "home"], "timeout": 30}, True,
-            confirmed_actions=["look", "home"])
+        )
         plugins.append(ActuatorPlugin(device, "head", "Panther head pan/tilt control using live URDF limits", schema, device.head))
     return plugins
 
