@@ -95,6 +95,8 @@ def test_real_tf2_hand_to_marker(monkeypatch):
                 obs = {"camera_id":CAMERA_ID,"frame_id":"","dictionary":"DICT_4X4_50","stamp":when,
                        "markers":[{"id":7,"translation_m":[.1,.03,.45],"rotation_rvec_rad":[0,0,0]},
                                   {"id":23,"translation_m":[0,0,.6],"rotation_rvec_rad":[0,0,.2]}]}
+                if angle:
+                    obs.update(camera_id="third_party_rgb", frame_id=OPTICAL)
                 camera_pub.publish(String(data=json.dumps(obs)))
                 for _ in range(12):
                     executor.spin_once(timeout_sec=.015)

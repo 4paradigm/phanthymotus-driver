@@ -113,15 +113,21 @@ def vision_transforms(payload, namespace, source="vision", bumi_optical=OPTICAL)
     return {"transforms": transforms}
 
 
-def validate_edges(batch, optical_parents, robot_frames):
+def validate_edges(batch, optical_parents, robot_frames, namespace=""):
     if not isinstance(batch, dict) or not isinstance(batch.get("transforms"), list) or len(batch["transforms"]) > 512:
         raise ValueError("Expected TFMessage JSON with at most 512 transforms")
+    prefix = namespace + "/" if namespace else ""
     result, seen = [], set()
     for edge in batch["transforms"]:
         if not isinstance(edge, dict) or not isinstance(edge.get("header"), dict) or not isinstance(edge.get("transform"), dict):
             raise ValueError("Invalid TransformStamped")
         parent = frame_name(edge["header"].get("frame_id"))
         child = frame_name(edge.get("child_frame_id"))
+        if prefix:
+            if parent not in optical_parents and prefix + parent in optical_parents:
+                parent = frame_name(prefix + parent)
+            if not child.startswith(prefix):
+                child = frame_name(prefix + child)
         if parent not in optical_parents or child in robot_frames or child in seen or child == parent:
             raise ValueError("Unknown camera parent, duplicate child, or collision with the robot tree")
         seen.add(child)

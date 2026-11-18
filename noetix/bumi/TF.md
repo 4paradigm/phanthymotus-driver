@@ -20,7 +20,7 @@ Here 5 mm is an example of a chosen residual limit. Copy the returned `camera_mo
 
 ## Vision inputs and boundaries
 
-`vision_tf` accepts the following stamped, metric observations. A named parent is a camera **optical** frame. The Bumi camera declaration `noetix/bumi/camera_color` also identifies its RGB frame when a legacy image header is empty. For an external camera, supply its real optical frame ID with a calibrated attachment to the robot.
+`vision_tf` accepts the following stamped, metric observations. A named parent is a camera **optical** frame. The Bumi camera declaration `noetix/bumi/camera_color` also identifies its RGB frame when a legacy image header is empty. An external camera can stamp the local name of its calibrated URDF optical link (for example, `front_color_optical`) or the published frame (`my_bumi/front_color_optical`). List the local link under `optical_frames`. The tree resolves both names to the published frame and scopes object frames to the same robot.
 
 | Input | Object identity | Pose |
 | --- | --- | --- |

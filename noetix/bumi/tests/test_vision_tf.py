@@ -64,6 +64,23 @@ def test_alien_camera_and_protected_robot_frames():
             validate_edges({"transforms": [dict(edge, child_frame_id=child)]}, {CAM}, {CAM, "lab/base_link"})
 
 
+def test_tree_matches_camera_headers_to_surveyed_urdf_links():
+    # ROS camera drivers commonly stamp the local optical link name, while
+    # robot_state_publisher adds its frame_prefix to every URDF link.
+    external = dict(aruco(), camera_id="vendor_rgb", frame_id=OPTICAL)
+    raw = vision_transforms(external, "lab")
+    own_links = {CAM, "lab/base_link"}
+    edges = validate_edges(raw, {CAM}, own_links, "lab")
+    assert [e["child_frame_id"] for e in edges] == [CAM + "/objects/aruco_DICT_4X4_50_" + str(i) for i in (7, 23)]
+    assert all(e["header"] == {"frame_id": CAM, "stamp": STAMP} for e in edges)
+    assert validate_edges({"transforms": edges}, {CAM}, own_links, "lab") == edges
+    edge = raw["transforms"][0]
+    for invalid in (dict(edge, child_frame_id="base_link"),
+                    dict(edge, header={"frame_id": "other/optical", "stamp": STAMP})):
+        with pytest.raises(ValueError):
+            validate_edges({"transforms": [invalid]}, {CAM}, own_links, "lab")
+
+
 def test_urdf_and_all_named_joints():
     root = ET.parse(DRIVER / "resource/bumi_model.urdf").getroot()
     before = ET.tostring(root)

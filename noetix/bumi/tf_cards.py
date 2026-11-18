@@ -85,6 +85,7 @@ class TreeNode(_CardNode):
         from tf2_ros import TransformBroadcaster
         root = ET.parse(config.get("urdf_path") or Path(__file__).with_name("resource") / "bumi_model.urdf").getroot()
         xml, links, self.joints = robot_description(root, config.get("camera_mount"), config.get("hand_frames", []))
+        self.frame_namespace = ns
         prefix = ns + "/"
         self.parents = {prefix + link for link in config.get("optical_frames", [OPTICAL]) if link in links}
         if topics and not self.parents:
@@ -152,7 +153,7 @@ class TreeNode(_CardNode):
         self.joint_pub.publish(msg)
 
     def _vision(self, data, source):
-        edges = validate_edges(data, self.parents, self.robot_frames)
+        edges = validate_edges(data, self.parents, self.robot_frames, self.frame_namespace)
         pending = {e["child_frame_id"]: (source, e["header"]["frame_id"]) for e in edges}
         if any(self.owners.get(child, owner) != owner for child, owner in pending.items()):
             raise ValueError("Two sources or cameras claim the same TF child")
