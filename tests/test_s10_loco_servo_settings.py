@@ -97,6 +97,12 @@ def test_speed_presets_change_forward_limit_without_scaling_yaw_or_raising_floor
         assert info['min_vx'] == 0
 
 
+def test_servo_reports_static_standing_footprint_as_an_estimate(servo):
+    descriptor = servo.plugin.dispatch('info', {})['control_interface']
+    assert descriptor['frame'] == 'base_link'
+    assert descriptor['footprint'] == {'half_width': 0.23, 'source': 'estimate'}
+
+
 @pytest.mark.parametrize('settings', [
     {'speed_preset': 'turbo'}, {'linear_acceleration': 0},
     {'linear_acceleration': float('nan')}, {'angular_acceleration': True},
