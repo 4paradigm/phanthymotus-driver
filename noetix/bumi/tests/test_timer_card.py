@@ -132,6 +132,38 @@ def test_invalid_interval_is_rejected(monkeypatch):
     assert "interval_s" in result["error"]
 
 
+@pytest.mark.parametrize("value", [1.9, 0.5, True, False, "2", [1], float("nan"), -1, timer_card.MAX_TICKS + 1])
+def test_max_ticks_rejects_non_integers_without_starting(value):
+    # No sleep: rejection must happen before any thread exists.
+    node = FakeNode("/robot/timer/events")
+    plugin = timer_card.TimerPlugin({}, "robot", FakeExecutor(),
+                                    node_factory=lambda topic: node)
+    result = plugin.dispatch("begin", {"interval_s": 60, "max_ticks": value})
+    assert result["state"] == "error"
+    assert "max_ticks" in result["error"]
+    assert plugin.dispatch("info", {})["ticking"] is False
+    assert node.payloads == []
+
+
+def test_max_ticks_rejection_beats_idempotence(monkeypatch):
+    plugin, node = _plugin(monkeypatch)
+    plugin.dispatch("begin", {"interval_s": 60, "label": "x", "max_ticks": 1})
+    result = plugin.dispatch("begin", {"interval_s": 60, "label": "x", "max_ticks": 1.9})
+    assert result["state"] == "error"
+    plugin.dispatch("stop", {})
+
+
+@pytest.mark.parametrize("value", [2, 2.0, 0, None])
+def test_max_ticks_accepts_integers(value):
+    assert timer_card.parse_max_ticks(value) == (int(value) if value is not None else 0)
+
+
+@pytest.mark.parametrize("value", [True, "abc", float("inf"), 0, 3601])
+def test_interval_rejects_bad_values(value):
+    with pytest.raises(ValueError):
+        timer_card.parse_interval(value)
+
+
 def test_tool_schema_and_topic():
     node = FakeNode("/robot/timer/events")
     plugin = timer_card.TimerPlugin({}, "robot", FakeExecutor(),

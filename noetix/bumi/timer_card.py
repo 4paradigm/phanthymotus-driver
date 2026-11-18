@@ -42,6 +42,41 @@ MAX_INTERVAL_S = 3600.0
 MAX_TICKS = 1_000_000
 
 
+def parse_interval(value) -> float:
+    """`interval_s` as a finite number in range; booleans are not numbers here."""
+    if isinstance(value, bool):
+        raise ValueError("interval_s must be a number")
+    try:
+        interval = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("interval_s must be a number") from None
+    if not math.isfinite(interval) or not MIN_INTERVAL_S <= interval <= MAX_INTERVAL_S:
+        raise ValueError(f"interval_s must be between {MIN_INTERVAL_S:g} and {MAX_INTERVAL_S:g}")
+    return interval
+
+
+def parse_max_ticks(value) -> int:
+    """`max_ticks` as an exact integer in range.
+
+    The MCP handler does not validate against the schema, so `int()` alone
+    would turn 1.9 into one tick and `true` into one tick. Accept int (or an
+    integral float such as 2.0 from a JSON client), reject everything else.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        raise ValueError("max_ticks must be an integer")
+    if isinstance(value, int):
+        ticks = value
+    elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        ticks = int(value)
+    else:
+        raise ValueError("max_ticks must be an integer")
+    if not 0 <= ticks <= MAX_TICKS:
+        raise ValueError(f"max_ticks must be between 0 and {MAX_TICKS}")
+    return ticks
+
+
 class TimerCore:
     """A single repeating timer with no ROS dependency.
 
@@ -60,18 +95,11 @@ class TimerCore:
         self._state: dict = {"state": "idle"}
 
     def start(self, interval_s: float, label: str = "", max_ticks: int = 0) -> dict:
-        interval = float(interval_s)
-        if not math.isfinite(interval) or not MIN_INTERVAL_S <= interval <= MAX_INTERVAL_S:
-            raise ValueError(f"interval_s must be between {MIN_INTERVAL_S:g} and {MAX_INTERVAL_S:g}")
+        interval = parse_interval(interval_s)
         label = str(label or "").strip()
         if len(label) > 64:
             raise ValueError("label must be at most 64 characters")
-        try:
-            max_ticks = int(max_ticks or 0)
-        except (TypeError, ValueError):
-            raise ValueError("max_ticks must be an integer") from None
-        if not 0 <= max_ticks <= MAX_TICKS:
-            raise ValueError(f"max_ticks must be between 0 and {MAX_TICKS}")
+        max_ticks = parse_max_ticks(max_ticks)
 
         self.stop()
         stop_event = threading.Event()
@@ -328,17 +356,16 @@ class TimerPlugin:
             interval = args.get("interval_s", self._default_interval)
             label = args.get("label", "")
             max_ticks = args.get("max_ticks", 0)
+            # Validate before the idempotence check: otherwise 1.9 would match a
+            # running timer with max_ticks=1 and be accepted without an error.
             try:
-                requested_interval = float(interval)
-                requested_label = str(label or "").strip()
-                requested_max = int(max_ticks or 0)
-            except (TypeError, ValueError):
-                requested_interval = None
-                requested_label = ""
-                requested_max = -1
+                requested_interval = parse_interval(interval)
+                requested_max = parse_max_ticks(max_ticks)
+            except ValueError as exc:
+                return {"state": "error", "error": str(exc)}
+            requested_label = str(label or "").strip()
             current = self._core.snapshot()
-            if (requested_interval is not None
-                    and current.get("state") == "running"
+            if (current.get("state") == "running"
                     and current.get("interval_s") == requested_interval
                     and current.get("label") == requested_label
                     and current.get("max_ticks") == requested_max):
