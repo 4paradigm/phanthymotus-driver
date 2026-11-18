@@ -349,7 +349,7 @@ class StatePlugin:
                 "name": "model",
                 "type": "resource",
                 "multiInstance": False,
-                "description": "Bumi URDF model for 3D skeleton visualization — 21-DOF kinematic chain",
+                "description": "Bumi URDF model for 3D skeleton visualization — 21-DOF kinematic chain plus the camera mount (camera_link) and optical frame (camera_optical_frame) that vision results attach to",
                 "inputSchema": {"type": "object", "properties": {}},
             },
         ]
