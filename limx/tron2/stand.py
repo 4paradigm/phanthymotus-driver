@@ -131,11 +131,11 @@ class Stand:
         if not sample.get('available') or not r.connected or r.ws is None or r.ws.closed:
             raise MoveError('机器人连接或新鲜状态不可用，未继续发送动作',False)
         if data.get('working_mode') != 'developer_mode' or data.get('working_mode_valid') is not True:
-            raise MoveError('需要有效上层developer_mode，未继续发送动作',False)
+            raise MoveError('A valid upper-level developer_mode is required. No further motion commands were sent.',False)
         if data.get('imu') != 'OK' or data.get('motor') != 'OK':
             raise MoveError('IMU或电机未报告OK，未继续发送动作',False)
         if data.get('collision_enable') is not True or data.get('collision_enable_valid') is not True or data.get('compliant_enable') is not False or data.get('compliant_enable_valid') is not True:
-            raise MoveError('碰撞保护或拖动状态不满足起立条件',False)
+            raise MoveError('Collision protection or compliance status does not meet the standing requirements.',False)
         return sample
 
     def dispatch(self):

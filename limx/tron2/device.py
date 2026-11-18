@@ -30,13 +30,13 @@ TOPICS = {name: '/limx_tron2/' + name for name in
 # Existing skeleton topics remain public; all JSON sensors use this map.
 SENSOR_TOPICS = {'joints':'/limx_tron2/state/joints','battery':'/limx_tron2/state/battery',**TOPICS}
 DESCRIPTIONS = {
-    'battery':'TRON2电池状态（只读，1Hz）：soc为剩余电量0～100%（首项）；current为有符号电流mA；cycle为非负整数充电循环数。bms_voltage为厂家原始电压读数；bms_current_valid为电流有效标志；bms_current_updated_at为厂家电流更新时间原值；bms_temp1～bms_temp5为5路温度采样原值（未确认倍率，不换算为摄氏度）。其他bms_字段按固件原名输出；不推测未公开字段语义。null表示暂无有效数据。',
-    'joints':'TRON2当前构型骨架：按厂家ACCID自动识别上肢DACH（16关节）或下肢WF/SF（10关节），发布官方关节名及q/dq/tau；使用平台原生sensor/skeleton与独立model模型资源；下肢接入厂家真实IMU四元数imu_quat（w,x,y,z），无有效姿态时省略。',
-    'camera': 'TRON2 头部RGB实时画面；start连接厂家MJPEG并发布JPEG图像，stop释放连接；限10fps，不录像、不控制头部，接收时间不是测量时间（只读）',
-    'camera_left': 'TRON2 左腕RGB实时画面；厂家left校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',
-    'camera_right': 'TRON2 右腕RGB实时画面；厂家right校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',
-    'joint_state': '旧版骨架话题兼容入口；使用当前构型关节与官方URDF模型，推荐joints卡片。',
-    'arm_control': 'TRON2 双臂控制：move自定义14项rad目标，reset自然垂下；响应含action_id，连续实时反馈确认到位后通知Core完成；reset自动验证自然垂下复位，两个动作均通过ACP报告完成',
+    'battery':'TRON2 battery telemetry (read-only, 1 Hz). soc is remaining charge (0–100%), current is signed current in mA, and cycle is the nonnegative charge-cycle count. BMS voltage, current validity and update time, temperatures, and any additional bms_ fields retain their vendor representation. Null means no valid reading.',
+    'joints':'TRON2 skeleton selected by vendor ACCID. DACH reports 16 joints, WF/SF report 10. Publishes vendor joint names, q/dq/tau, and a separate model resource. Lower-body imu_quat is reported in w,x,y,z order when available.',
+    'camera': 'Read-only TRON2 head RGB stream. Start connects to vendor MJPEG and publishes JPEG at up to 10 fps. Stop releases the connection. Reception time is not measurement time.',
+    'camera_left': 'Read-only corrected TRON2 left wrist RGB stream, up to 10 fps, with independent start, stop and info. Reception time is not measurement time.',
+    'camera_right': 'Read-only corrected TRON2 right wrist RGB stream, up to 10 fps, with independent start, stop and info. Reception time is not measurement time.',
+    'joint_state': 'Legacy skeleton stream using the current configuration and vendor URDF. Prefer the joints card.',
+    'arm_control': 'TRON2 dual-arm control. Move accepts 14 joint targets in radians. Reset returns the arms to their neutral hanging pose. Both actions return an action ID and report completion through ACP after feedback confirms the target.',
 }
 
 
@@ -46,8 +46,8 @@ def metadata_properties():
                   'pattern': r'^[^\x00-\x1f\x7f]*$',
                   'description': description}
             for key, description in (
-                ('instance_id', '画布调用层传入的卡片标识；可省略'),
-                ('_trace_id', 'Agent Core 自动注入的追踪标识；无需用户填写'))}
+                ('instance_id', 'Optional card instance identifier supplied by the canvas.'),
+                ('_trace_id', 'Trace identifier injected by Agent Core.'))}
 
 
 class Adapter:
@@ -164,26 +164,26 @@ class Adapter:
                 'x-completion': {'actions': ['move', 'reset'], 'timeout': ACP_TIMEOUT},
                 'x-resource': ['arm_l', 'arm_r'],
                 'x-action-params': {
-                    'move': {'params': ['joint', 'time'], 'description': '自定义双臂14项绝对关节目标'},
-                    'reset': {'params': [], 'description': '回到自然垂下目标；连续新反馈自动确认复位后，通过ACP通知完成'},
+                    'move': {'params': ['joint', 'time'], 'description': 'Set 14 absolute joint targets for both arms.'},
+                    'reset': {'params': [], 'description': 'Return to the neutral hanging pose and report completion through ACP after fresh feedback confirms it.'},
                 },
             },
         }
 
     def _loco_tool(self):
         return {'name':'loco_leg','type':'actuator','multiInstance':False,
-            'description':'TRON2下肢运动：stand_up完整起立，sit_down停止并坐下，move定时移动，stop_move停止移动并保持站立。仅支持下肢构型；轮足无横移。vx范围-3～3 m/s（正前负后），vyaw约±90 deg/s（正左负右），默认均为0；duration为-1持续移动、0停止，或0.1～60秒，默认2秒。计时结束另发约1秒零速度，vyaw×duration不是目标转角，不保证精确距离或实际转角。',
+            'description':'TRON2 lower-body locomotion. stand_up stands, sit_down folds, move sends timed velocity, and stop_move stops locomotion while standing. Wheel-foot mode has no lateral movement. vx is ±3 m/s, vyaw is ±90 deg/s, and duration accepts -1 for continuous movement, 0 to stop, or 0.1–60 seconds. Timed movement ends with about one second of zero-velocity commands. Actual distance and angle depend on the robot response.',
             'inputSchema':{'type':'object','additionalProperties':False,
-                'properties':{'action':{'type':'string','enum':['stand_up','sit_down','move','stop_move','start','stop','info'],'description':'选择要执行的动作'},
-                    'vx':{'type':'number','minimum':-3,'maximum':3,'default':0,'title':'vx','description':'前后速度，单位m/s，范围-3～3，默认0；正值前进、负值后退、0不前后移动。'},
-                    'vyaw':{'type':'number','minimum':-90,'maximum':90,'default':0,'title':'vyaw','description':'转向角速度，单位deg/s，范围约-90～90，默认0；正值左转、负值右转、0不转向。按现场标定z=vyaw/60换算，90deg/s对应厂家z=1.5；不是目标转角。'},
-                    'duration':{'type':'number','minimum':-1,'maximum':60,'anyOf':[{'const':-1},{'const':0},{'minimum':.1,'maximum':60}],'default':2,'title':'duration','description':'运动时间，单位秒；-1持续移动直到stop_move或生命周期stop；0停止，0.1～60定时，默认2。停止后另发约1秒零速度。'},
+                'properties':{'action':{'type':'string','enum':['stand_up','sit_down','move','stop_move','start','stop','info'],'description':'Select the action to execute.'},
+                    'vx':{'type':'number','minimum':-3,'maximum':3,'default':0,'title':'vx','description':'Forward velocity in m/s, from -3 to 3. Positive moves forward, negative moves backward, and zero stops longitudinal motion.'},
+                    'vyaw':{'type':'number','minimum':-90,'maximum':90,'default':0,'title':'vyaw','description':'Yaw rate in deg/s, from -90 to 90. Positive turns left, negative turns right, and zero requests no turn. The calibrated vendor command is z=vyaw/60.'},
+                    'duration':{'type':'number','minimum':-1,'maximum':60,'anyOf':[{'const':-1},{'const':0},{'minimum':.1,'maximum':60}],'default':2,'title':'duration','description':'Duration in seconds. Use -1 to continue until stop_move or lifecycle stop, 0 to stop, or 0.1–60 for timed motion. Defaults to 2 seconds. Stop sends zero velocity for about one second.'},
                     **metadata_properties()},'required':['action'],
                 'x-resource':['lower_body'],'x-completion':{'actions':['stand_up','sit_down','move'],'timeout':150},
-                'x-action-params':{'stand_up':{'params':[],'description':'从启动/准备姿态完整起立并保持站立，厂家状态WALK表示完成；无速度和时间参数，不命令前进或转向。'},
-                    'sit_down':{'params':[],'description':'停止移动并折叠坐回启动姿态；厂家状态SIT或DAMPING表示完成，无速度和时间参数。'},
-                    'move':{'params':['vx','vyaw','duration'],'description':'轮足定时移动：vx为-3～3 m/s（正前负后），vyaw约±90 deg/s（正左负右），默认0；duration为-1持续移动、0停止或0.1～60秒，默认2秒。需要先起立进入WALK，结束后发送零速度，无横移。'},
-                    'stop_move':{'params':[],'description':'请求零速度停止移动，保持站立，不执行坐下。'}}}}
+                'x-action-params':{'stand_up':{'params':[],'description':'Stand from the startup pose and maintain balance. Vendor WALK status indicates completion. This action takes no velocity or timing parameters.'},
+                    'sit_down':{'params':[],'description':'Stop and fold into the startup pose. Vendor SIT or DAMPING indicates completion. This action takes no velocity or timing parameters.'},
+                    'move':{'params':['vx','vyaw','duration'],'description':'Send wheel-foot velocity commands in WALK mode. vx is ±3 m/s and vyaw is ±90 deg/s. Duration is -1 for continuous motion, 0 to stop, or 0.1–60 seconds. The driver sends zero velocity at the end.'},
+                    'stop_move':{'params':[],'description':'Send zero velocity and remain standing.'}}}}
 
 
     def tools(self):

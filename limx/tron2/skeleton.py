@@ -10,8 +10,8 @@ from state import configuration as reported_configuration
 
 JOINT_NAMES = ARM_NAMES + ['head_pitch_Joint', 'head_yaw_Joint']
 MODEL_PATH = Path(__file__).with_name('resource') / 'tron2_dach.urdf'
-ARM_LABELS = ['肩俯仰', '肩侧摆', '肩旋转', '肘', '腕偏航', '腕俯仰', '腕旋转']
-JOINT_LABELS = ARM_LABELS + ARM_LABELS + ['头部俯仰', '头部偏航']
+ARM_LABELS = ['Shoulder pitch', 'Shoulder roll', 'Shoulder yaw', 'Elbow', 'Wrist yaw', 'Wrist pitch', 'Wrist roll']
+JOINT_LABELS = ARM_LABELS + ARM_LABELS + ['Head pitch', 'Head yaw']
 
 
 LEG_PREFIXES = ['proximal_pitch', 'proximal_roll', 'proximal_yaw', 'knee']
@@ -22,9 +22,9 @@ SF_JOINT_NAMES = [prefix + '_' + side + '_Joint'
 MODELS = {
     'upper_limb': ('DACH_TRON2A', MODEL_PATH, JOINT_NAMES, JOINT_LABELS),
     'wheel_foot': ('WF_TRON2A', MODEL_PATH.with_name('tron2_wf.urdf'), WF_JOINT_NAMES,
-                   ['髋俯仰', '髋侧摆', '髋旋转', '膝', '轮'] * 2),
+                   ['Hip pitch', 'Hip roll', 'Hip yaw', 'Knee', 'Wheel'] * 2),
     'sole_foot': ('SF_TRON2A', MODEL_PATH.with_name('tron2_sf.urdf'), SF_JOINT_NAMES,
-                  ['髋俯仰', '髋侧摆', '髋旋转', '膝', '踝俯仰'] * 2),
+                  ['Hip pitch', 'Hip roll', 'Hip yaw', 'Knee', 'Ankle pitch'] * 2),
 }
 
 
@@ -142,8 +142,8 @@ def skeleton_stream(sample, profile=None):
         motor_index = joint_names.index(name)
         joint = {'idx': motor_index, 'name': name, 'q': data['q'][index],
                  'q_deg': math.degrees(data['q'][index]),
-                 'group': ('左臂' if motor_index < 7 else '右臂' if motor_index < 14 else '头部')
-                          if mode == 'upper_limb' else ('左腿' if motor_index < 5 else '右腿'),
+                 'group': ('Left arm' if motor_index < 7 else 'Right arm' if motor_index < 14 else 'Head')
+                          if mode == 'upper_limb' else ('Left leg' if motor_index < 5 else 'Right leg'),
                  'label': labels[motor_index]}
         for field in ('dq', 'tau'):
             if data[field]:

@@ -119,21 +119,21 @@ class ArmServoPlugin:
 
     def get_tool(self):
         return {'name': self.PREFIX, 'type': 'actuator', 'multiInstance': False,
-            'description': 'TRON2上肢双臂连续伺服：接收一路motus.control/1关节目标流，官方18维顺序：左臂7维、左夹爪1维、右臂7维、右夹爪1维、头部俯仰/偏航2维；关节单位rad，夹爪0～1（0闭合、1全开）；建议30Hz、最多50Hz。Driver限速插值并以目标300Hz发送ServoJ；头部使用厂家原始方向；夹爪独立发送SDK开合协议，默认速度100、力50，0～1线性转为0～100开口度。普通动作使用arm_control/pose；本卡片供遥操作或执行模型接线使用。断流200ms或指令过期停止后续目标输出，不自动回零；不是硬件急停。',
+            'description': 'Stream motus.control/1 targets in official 18-value order: left arm (7), left gripper (1), right arm (7), right gripper (1), head pitch and yaw (2). Joint angles are in radians and gripper opening is 0–1. Recommended input rate is 30 Hz, maximum 50 Hz. The driver interpolates with speed limits and targets 300 Hz ServoJ. Gripper opening maps to 0–100 with default speed 100 and force 50. Stale targets or 200 ms without input halt new output without homing. Use arm_control or pose for discrete motion.',
             'inputSchema': {'type': 'object', 'properties': {
                 'action': {'type': 'string', 'enum': ['start', 'stop', 'pause', 'resume', 'info', 'config']},
-                'input_topic': {'type': 'string', 'description': 'control/joint指令流话题'},
-                'dry_run': {'type': 'boolean', 'description': 'config操作必填：true仅校验不发送，false允许输出；切换后暂停，需resume继续'}},
+                'input_topic': {'type': 'string', 'description': 'Topic carrying the control/joint command stream.'},
+                'dry_run': {'type': 'boolean', 'description': 'Required for config. True validates only, false enables output. Resume after changing this option.'}},
                 'required': ['action'],
                 'x-action-params': {
-                    'config': {'params': ['dry_run'], 'description': '设置空跑模式；dry_run须为布尔值，切换后暂停'},
-                    'pause': {'params': [], 'description': '暂停关节和夹爪输出并清空旧目标，保留订阅'},
-                    'resume': {'params': [], 'description': '恢复接收新目标，从实测关节角平滑接管'}},
+                    'config': {'params': ['dry_run'], 'description': 'Configure dry run using a boolean. Changing the option pauses output.'},
+                    'pause': {'params': [], 'description': 'Pause joint and gripper output and clear old targets while keeping the subscription.'},
+                    'resume': {'params': [], 'description': 'Resume with fresh targets and interpolate from measured joint angles.'}},
                 'x-hooks': {'on_interrupt_motion': {'action': 'pause'}, 'on_interrupt_all': {'action': 'pause'}},
                 'x-is-dangerous': True, 'x-resource': ['arm_l', 'arm_r', 'head', 'gripper_l', 'gripper_r']},
-            'topic_in': [{'format': 'control/joint', 'desc': 'motus.control/1 joint_position，18维：左臂7(rad)、左夹爪1(0～1)、右臂7(rad)、右夹爪1(0～1)、头部pitch/yaw(rad)'}],
+            'topic_in': [{'format': 'control/joint', 'desc': 'motus.control/1 joint_position: left arm (7 rad values), left gripper (1 normalized value), right arm (7 rad values), right gripper (1 normalized value), and head pitch/yaw (2 rad values).'}],
             'configSchema': {'type': 'object', 'properties': {
-                'dry_run': {'type': 'boolean', 'default': False, 'description': '空跑：接收并检查目标，不发送电机指令；切换后暂停，需resume继续'}}}}
+                'dry_run': {'type': 'boolean', 'default': False, 'description': 'Validate targets without sending motor commands. Resume after changing this option.'}}}}
 
     def info(self):
         return {'state': 'ready' if self.running else 'idle',
