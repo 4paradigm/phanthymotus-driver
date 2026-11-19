@@ -13,7 +13,7 @@ motor state, faults, capabilities and actual task outcomes.
 | Move to pose | Calibrated-only `pose_mm_deg=[x,y,z,roll,pitch,yaw]`, absolute base-frame tip target |
 | Set joints | Six `joints_deg`, with absolute or relative degree mode |
 | Reset | Configured `intent_control.reset_joints_deg`; otherwise the official six-zero target; joint trajectory, gripper unchanged |
-| Set gripper | `set_gripper_opening`, `width_mm`, effective SDK/deployment bounds, normally 0–70 mm, default 20 mm adjusted to bounds |
+| Set gripper | `set_gripper_opening`, `width_mm` (effective bounds, normally 0–70 mm, default 20 mm), `torque_nm` (0.001–1 N m, defaults to configured torque) |
 | Stop | Cancel current preparation/movement and attempt a measured hold; retain motor torque |
 | Get status | Passive actual feedback and per-action task/completion-delivery records |
 
@@ -24,6 +24,18 @@ Default speed is 1%, permitted range 1–10%; relative Move is limited to a tota
 10 mm translation. Inputs may be native JSON arrays or JSON-array text.
 Set position, Open gripper and Close gripper are removed; old requests return an
 interface-refresh error. Preserved legacy saved poses are not used for Reset.
+
+Set gripper accepts a motor torque command for each request. Omitting
+`torque_nm`, or passing an empty form field, uses
+`intent_control.gripper_torque_nm` (default 0.5 N m). Explicit values must be
+finite numbers in 0.001–1 N m. SDK commands round to 0.001 N m; the result includes
+`commanded_torque_nm`, separate from measured gripper feedback. The selected
+torque also applies when enabling at the measured opening, during movement, and
+to the measured-opening hold on cancellation or failure. It does not change the
+deployment default, enable movement permission, or affect named-waypoint moves.
+This is not calibrated fingertip force, contact detection, or grasp confirmation;
+an object that prevents reaching the requested width can still cause the existing
+five-second arrival timeout. No grasp policy or automatic object transport is added.
 
 Move remains linear. Absolute tip Pose/rotation stay hidden and rejected until
 the installed TCP is physically calibrated and verified. Candidate point-to-point
@@ -142,3 +154,12 @@ behavior, firmware limits and hardware acceptance remain documented in
 Earlier ten-card menus, Set position and Parameters instructions are preserved
 in [LEGACY_OPERATIONS.md](LEGACY_OPERATIONS.md). They are not the current public
 interface. Existing legacy code and its regression coverage are retained.
+
+### Named waypoints
+
+The independent **Waypoints** (`waypoints`) card saves named six-joint postures.
+Use `capture` at a stationary posture, `list` / `read` to inspect it, `move_to` to
+return to it, and `delete` to remove it. See [WAYPOINTS.md](WAYPOINTS.md) for the
+API, storage format, connection binding and validation limits. Gripper feedback
+is recorded for inspection; moving to a waypoint leaves the gripper unchanged.
+Reset continues to use its existing configured return position or official zero.

@@ -110,7 +110,7 @@ class UnifiedControlPlugin(IntentControlPlugin):
                       'Return to ' + ('recorded joint position ' if self.return_preset()['source'] == 'operator_recorded' else 'official zero position ')
                       + str(self.return_preset()['joints_deg']) + ' deg. This does not clear controller faults. Verify the return path on site. Gripper unchanged.'),
             'stop_motion': ([], 'Cancel preparation or motion; keep motor torque.'),
-            'set_gripper_opening': (['width_mm'], 'Set gripper opening in millimetres.'),
+            'set_gripper_opening': (['width_mm', 'torque_nm'], 'Set gripper opening and motor torque for this action. Opening arrival does not confirm a successful grasp.'),
             'get_status': ([], 'Read actual pose, joints, limits, mode, faults and the task result; no control commands.'),
             'start': ([], 'Connect and read; no mode, enable or motion commands.'),
             'stop': ([], 'Stop the card and cancel its current task.'),
@@ -127,6 +127,9 @@ class UnifiedControlPlugin(IntentControlPlugin):
                               'title': 'Speed (%)', 'description': '1–10%; SDK speed percentage, not a fixed mm/s.'},
             'width_mm': {'type': 'number', 'minimum': low, 'maximum': high, 'default': min(high, max(low, 20)),
                          'title': 'Gripper opening (mm)', 'description': f'{low:g}–{high:g} mm; effective limits.'},
+            'torque_nm': {'type': 'number', 'minimum': .001, 'maximum': 1, 'default': self.gripper_torque,
+                          'title': 'Gripper torque (N m)',
+                          'description': '0.001–1 N m motor torque command, rounded to 0.001 N m. Not calibrated fingertip force or grasp detection. Omitted/empty uses the configured default.'},
         }
         if not calibrated:
             actions.pop('pose')
@@ -160,7 +163,7 @@ class UnifiedControlPlugin(IntentControlPlugin):
                               + ('Calibrated tip-relative rotation and absolute base-frame Move to pose are available. '
                                  if calibrated else 'Uncalibrated Move translates along SDK end axes with unchanged orientation. ')
                               + 'Reset returns to the joint position reported in Get status and its action description, with the gripper unchanged. '
-                              + 'Set gripper uses the opening width in millimetres. '
+                              + 'Set gripper uses opening width in millimetres and a per-action motor torque in N m; arrival is not grasp confirmation. '
                               + 'Keep the workspace clear; a numeric target may still be unreachable.')
         return tools
 
@@ -345,10 +348,12 @@ class UnifiedControlPlugin(IntentControlPlugin):
                                                  'absolute gripper-tip position remains uncalibrated.')
                     else:
                         grip = driver.get_gripper()
+                        torque = args['torque_nm']
                         if not grip.enabled:
-                            driver.move_gripper(grip.width_mm, self.gripper_torque)
+                            driver.move_gripper(grip.width_mm, torque)
                         driver._check_cancelled()
-                        result = {'executed': True, 'gripper': asdict(driver.move_gripper(width, self.gripper_torque))}
+                        result = {'executed': True, 'gripper': asdict(driver.move_gripper(width, torque)),
+                                  'commanded_torque_nm': round(torque * 1000) / 1000}
                     with self.lifecycle:
                         driver._check_cancelled()
                         self._phase('completed', result=result)
@@ -413,7 +418,7 @@ class UnifiedControlPlugin(IntentControlPlugin):
         snapshot['capabilities'] = self.capabilities()
         snapshot['return_preset_configured'] = snapshot['capabilities']['return_preset']['available']
         snapshot['tcp_verified'] = snapshot['capabilities']['pose']['available']
-        status = snapshot.get('faults', {}).get('arm_status', '')
+        status = (snapshot.get('faults') or {}).get('arm_status', '')
         snapshot['controller_recovery'] = {
             'required': status.startswith(('NO_SOLUTION', 'SINGULARITY_POINT', 'TARGET_POS_EXCEEDS_LIMIT')),
             'controller_status': status, 'automatic': False,
