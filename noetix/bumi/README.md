@@ -1,5 +1,28 @@
 # Noetix Bumi driver
 
+## `image_quality_guard`
+
+This passive processor consumes the existing Camera Card's RGB JPEG stream:
+`/{namespace}/camera/color` (`sensor_msgs/msg/CompressedImage`, `format="jpeg"`).
+It does not open a camera or start RealSense. Its latest-frame slot and steady
+timer analyze at 2 Hz by default, using the existing shared ROS2 executor.
+Results are strict JSON in `std_msgs/msg/String` on
+`{input_topic}/image_quality_guard`; Dashboard uses the existing `data/json`
+renderer. Results include `run_id`, analysis-time `timestamp_ms`, metrics and
+confirmed/candidate reasons. No image pixels are stored in result messages.
+
+The production bundle keeps this Card disabled and out of discovery while the
+matching Core release is pending. The isolated test entry points enable it
+explicitly. In those tests, bundle boot registers the Card with no subscription.
+Core binds an admission epoch, issues a ticket for each run, and uses that same
+ticket to stop it. Local exit uses the separate `shutdown()` method.
+
+Synthetic JPEG tests verify transport and analysis contracts. Bumi camera
+behavior and threshold calibration require hardware acceptance. See the
+[ImageQualityGuard guide](IMAGE_QUALITY_GUARD_README.md),
+[deployment guide](IMAGE_QUALITY_GUARD_DEPLOYMENT_GUIDE.md), and
+[test report](IMAGE_QUALITY_GUARD_TEST_REPORT.md).
+
 The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
 
 ## `mic` and `sound_direction`
