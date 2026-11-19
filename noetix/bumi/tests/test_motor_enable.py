@@ -135,6 +135,7 @@ def test_timeout_blocks_confirmed_retry_and_automatic_preparation(card, monkeypa
     monkeypatch.setattr(plugin._enable_cancel, "wait", lambda _: clock.__setitem__(0, clock[0] + 1))
     timeout = call(plugin)
     assert timeout["code"] == "ENABLE_TIMEOUT" and timeout["retry_available"] is False
+    assert clock[0] == 104.0
     assert plugin._owner._prepare_workmode(1, "stand_up")["state"] == "error"
     commands = [c[3] for c in ctrl.commands]
     assert commands == ["START", "DEFAULT"]
@@ -289,7 +290,7 @@ def test_card_is_discoverable_in_enabled_bundle_and_manifest(card):
     bumi = Path(__file__).resolve().parents[1]
     manifest = yaml.safe_load((bumi / "driver.yaml").read_text(encoding="utf-8"))
     assert {"name": "motor_enable", "type": "actuator"} in manifest["cards"]
-    assert yaml.safe_load((bumi / "config.yaml").read_text(encoding="utf-8"))["plugins"]["motor_enable"]["enabled"] is False
+    assert yaml.safe_load((bumi / "config.yaml").read_text(encoding="utf-8"))["plugins"]["motor_enable"]["enabled"] is True
 
 
 

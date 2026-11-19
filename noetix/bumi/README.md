@@ -373,12 +373,11 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 ### Exit disabled mode: `motor_enable`
 
 `motor_enable` is a standalone actuator plugin, controlled by
-`plugins.motor_enable.enabled`. It is disabled by default pending hardware
-validation. To opt in, set this option to `true` in the driver's loaded config
-and restart the bundle with that config; the manifest lists available cards but
-does not register a disabled plugin. It does not require `loco` or any other
-card to be enabled. Internally the bundle supplies a shared chassis owner to
-coordinate the existing HighController connection and has no additional worker.
+`plugins.motor_enable.enabled`, which is enabled by default. The manifest lists
+available cards but a disabled plugin is not registered. It does not require
+`loco` or any other card to be enabled. Internally the bundle supplies a shared
+chassis owner to coordinate the existing HighController connection and has no
+additional worker. This card has not been validated on hardware.
 
 - `start` / `stop` are lifecycle actions and never toggle motor power. `stop`
   cancels pending observation; it cannot undo a START already delivered.
@@ -389,7 +388,7 @@ coordinate the existing HighController connection and has no additional worker.
   surface, free joints and a clear movement area. Enabling can move joints to
   zero; it does not stand the robot up or start walking.
 - From disabled (30), `enable` sends START once, releases it with DEFAULT, and
-  waits up to 3 seconds for enabled (0), cancellation, or another mode. This
+  waits up to 4 seconds for enabled (0), cancellation, or another mode. This
   cadence has not been validated on hardware. If already enabled, it sends nothing.
   Protection (26) and other modes are refused. Active chassis actions are
   refused; the streaming servo is paused and shared publishing is serialized.

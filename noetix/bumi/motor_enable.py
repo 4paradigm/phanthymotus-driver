@@ -143,7 +143,7 @@ class MotorEnablePlugin:
             # START again to cancel or compensate for missing feedback.
             time.sleep(0.01)
             self._owner._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
-            deadline = time.monotonic() + 3.0
+            deadline = time.monotonic() + 4.0
             while True:
                 mode = int(self._high_ctrl.get_mode())
                 if mode == target_mode:
@@ -160,7 +160,7 @@ class MotorEnablePlugin:
                     return {"state": "error", "command_sent": True, "confirmed": False,
                             "code": "ENABLE_TIMEOUT", "workmode": mode,
                             "retry_available": False,
-                            "error": "等待使能反馈超时（3 秒），未自动重发 START。",
+                            "error": "等待使能反馈超时（4 秒），未自动重发 START。",
                             "message": "机器人实际状态尚未确认。请检查机器人及控制链路，并遵循厂商确认的恢复流程。"}
                 self._enable_cancel.wait(0.05)
         except Exception as exc:
