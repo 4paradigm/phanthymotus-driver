@@ -373,30 +373,35 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 ### Exit disabled mode: `motor_enable`
 
 `motor_enable` is a standalone actuator plugin, controlled by
-`plugins.motor_enable.enabled`. It does not require `loco` or any other card to
-be enabled. Internally the bundle supplies a shared chassis owner to coordinate
-the existing HighController connection and has no additional worker.
+`plugins.motor_enable.enabled`. It is disabled by default pending hardware
+validation. To opt in, set this option to `true` in the driver's loaded config
+and restart the bundle with that config; the manifest lists available cards but
+does not register a disabled plugin. It does not require `loco` or any other
+card to be enabled. Internally the bundle supplies a shared chassis owner to
+coordinate the existing HighController connection and has no additional worker.
 
 - `start` / `stop` are lifecycle actions and never toggle motor power. `stop`
   cancels pending observation; it cannot undo a START already delivered.
-- `info` reads workmode and whether an earlier enable attempt remains uncertain.
+- `status` is visible in the action selector and reads workmode and whether an
+  earlier enable attempt remains uncertain; `info` provides the same result for
+  the platform. The mode comes from SDK cache and its freshness is unknown.
 - `enable(confirm=true)` requires safe face-up placement on a flat, non-slip
   surface, free joints and a clear movement area. Enabling can move joints to
   zero; it does not stand the robot up or start walking.
 - From disabled (30), `enable` sends START once, releases it with DEFAULT, and
-  refreshes zero DEFAULT commands at roughly 10 ms intervals while waiting up to
-  3 seconds for enabled (0), cancellation, or another mode. This follows the
-  vendor example's cadence; it has not been validated on hardware. If already
-  enabled, it sends nothing.
+  waits up to 3 seconds for enabled (0), cancellation, or another mode. This
+  cadence has not been validated on hardware. If already enabled, it sends nothing.
   Protection (26) and other modes are refused. Active chassis actions are
   refused; the streaming servo is paused and shared publishing is serialized.
-- A timeout reports `ENABLE_TIMEOUT` and permits a new, explicitly confirmed
-  `enable` request if the reported mode is still 30. Automatic action preparation
-  remains blocked while the earlier START is unconfirmed. Cancellation and SDK
-  errors keep the guard and do not permit this timeout retry. Observing the
-  target mode clears the guard without publishing; `info` leaves it set while
-  a body action is in flight. Restarting the driver clears the in-memory guard;
-  it is not a recovery action and must not be used to blindly retry.
+- A timeout reports `ENABLE_TIMEOUT` and leaves the START outcome unconfirmed.
+  Further START attempts through this card and automatic action preparation are
+  blocked; persistent mode 30 and `confirm=true` do not authorize a retry.
+  Cancellation and SDK errors also retain the guard. Observing the target mode
+  clears it without publishing; `status` and `info` leave it set while a body
+  action is in flight. This observation does not establish feedback freshness or
+  physical settling. Inspect the robot and control link and follow a recovery
+  procedure confirmed by the vendor. Restarting the driver clears the in-memory
+  guard; it is not a recovery action and must not be used to blindly retry.
 
 The vendor [Bumi documentation](https://web.noetixrobotics.com/docs/) defines
 START as a toggle: outside mode 30 it **disables** the robot. The driver checks

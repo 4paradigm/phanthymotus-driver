@@ -7,7 +7,8 @@ plugins:
   loco:
     enabled: true
   motor_enable:
-    enabled: true
+    # Opt in only after validating on the installed robot and firmware.
+    enabled: false
   # 底盘的流式控制卡片（motus.control/1 的 twist）。和上面的 loco 是同一个身体的
   # 两条路径：loco 是调用形态，一次 tools/call 一个动作；这张是数据面，订阅一路
   # control/velocity 指令流，给 actucore 的 navi 这类策略用。两者显式仲裁 ——

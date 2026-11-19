@@ -44,12 +44,13 @@ class MotorEnablePlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["enable", "info", "start", "stop"]},
+                    "action": {"type": "string", "enum": ["enable", "status", "info", "start", "stop"]},
                     "confirm": {"type": "boolean", "description": "确认机器人仰面平躺，关节活动范围安全且其他运动命令已停止。"},
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "enable": {"params": ["confirm"], "required": ["confirm"], "description": "确认安全放置后退出失能；使能前将机器人仰面平躺并确保关节活动范围安全。"},
+                    "status": {"params": [], "description": "查询报告的工作模式和未确认状态；反馈新鲜度未知。"},
                     "info": {"params": [], "description": "只读查询当前模式及上次使能是否仍未确认。"},
                     "start": {"params": [], "description": "将卡片置为就绪，不发送使能指令。"},
                     "stop": {"params": [], "description": "取消等待使能反馈，不发送失能指令，也不会撤回已发送的使能指令。"},
@@ -67,11 +68,11 @@ class MotorEnablePlugin:
             self._enable_cancel.set()
             return {"state": "idle", "command_sent": False,
                     "message": "Observation cancelled; an already sent enable command cannot be undone."}
-        if action not in {"info", "enable"}:
+        if action not in {"status", "info", "enable"}:
             return None
         if self._high_ctrl is None:
             return {"state": "error", "command_sent": False, "error": "Robot controller unavailable"}
-        if action == "info":
+        if action in {"status", "info"}:
             try:
                 # Do not reconcile against a potentially stale pre-command
                 # reading while any explicit body action is in flight.
@@ -80,13 +81,14 @@ class MotorEnablePlugin:
                     if (not self._owner._body_action and self._owner._enable_unconfirmed
                             and mode == self._owner._mode_toggle_target):
                         self._owner._enable_unconfirmed = False
-                        self._owner._enable_timeout_retry = False
                     unconfirmed = self._owner._enable_unconfirmed
             except Exception as exc:
                 return {"state": "error", "command_sent": False, "error": str(exc)}
             return {"state": "completed", "command_sent": False,
                     "workmode": mode, "workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
-                    "enable_unconfirmed": unconfirmed}
+                    "enable_unconfirmed": unconfirmed,
+                    "feedback_freshness": "unknown",
+                    "message": "模式为 SDK 缓存值，无法确认反馈新鲜度或关节是否已停止运动。"}
         if args.get("confirm") is not True:
             return {"state": "error", "command_sent": False, "code": "CONFIRM_REQUIRED",
                     "error": "Confirm safe face-up placement and a clear joint movement area before enabling."}
@@ -118,10 +120,10 @@ class MotorEnablePlugin:
             if self._owner._enable_unconfirmed:
                 if mode == self._owner._mode_toggle_target:
                     self._owner._enable_unconfirmed = False
-                    self._owner._enable_timeout_retry = False
-                elif not (mode == 30 and self._owner._enable_timeout_retry):
+                else:
                     return {"state": "error", "command_sent": False, "code": "ENABLE_UNCONFIRMED",
-                            "error": "Previous START delivery is uncertain. Inspect the robot and motion_state; START will not be resent."}
+                            "retry_available": False,
+                            "error": "上次 START 的结果尚未确认，不会再次发送。请检查机器人及控制链路，并遵循厂商确认的恢复流程。"}
             if mode == target_mode:
                 return {"state": "completed", "command_sent": False, "confirmed": True,
                         "workmode": mode, "workmode_name": _WORKMODE_NAMES[mode],
@@ -142,12 +144,10 @@ class MotorEnablePlugin:
             time.sleep(0.01)
             self._owner._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
             deadline = time.monotonic() + 3.0
-            refresh_due = False
             while True:
                 mode = int(self._high_ctrl.get_mode())
                 if mode == target_mode:
                     self._owner._enable_unconfirmed = False
-                    self._owner._enable_timeout_retry = False
                     return {"state": "completed", "command_sent": True, "confirmed": True,
                             "workmode": mode, "workmode_name": _WORKMODE_NAMES[mode],
                             "message": "Requested mode observed; physical motion or settling is not confirmed."}
@@ -157,21 +157,12 @@ class MotorEnablePlugin:
                     return {"state": "cancelled", "command_sent": True, "confirmed": False,
                             "message": "Stopped waiting; enable may still take effect. Inspect motion_state."}
                 if time.monotonic() >= deadline:
-                    self._owner._enable_timeout_retry = True
                     return {"state": "error", "command_sent": True, "confirmed": False,
                             "code": "ENABLE_TIMEOUT", "workmode": mode,
-                            "retry_available": True,
+                            "retry_available": False,
                             "error": "等待使能反馈超时（3 秒），未自动重发 START。",
-                            "message": "检查机器人和状态后，可以再次确认并执行 enable。状态反馈可能滞后，上次指令也可能延迟生效；重试可能使已使能的机器人失能。"}
-                # Match the vendor demo's idle command cadence while waiting,
-                # without repeating START. Stop refreshing on cancellation or
-                # timeout, and keep every publish under the chassis owner lock.
-                if refresh_due:
-                    self._owner._publish_cmd(0, 0, 0, _get_default_cmd(), 0,
-                                             cancel_event=self._enable_cancel)
-                remaining = deadline - time.monotonic()
-                self._enable_cancel.wait(min(0.01, max(0.0, remaining)))
-                refresh_due = True
+                            "message": "机器人实际状态尚未确认。请检查机器人及控制链路，并遵循厂商确认的恢复流程。"}
+                self._enable_cancel.wait(0.05)
         except Exception as exc:
             return {"state": "error", "command_sent": None if attempted else False,
                     "command_attempted": attempted, "confirmed": False,

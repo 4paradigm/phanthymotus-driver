@@ -186,4 +186,13 @@ def test_motor_enable_registers_without_locomotion_cards(bundle_module):
     assert [tool["name"] for tool in bundle.get_all_tools()] == ["motor_enable"]
     assert bundle.dispatch("motor_enable", {"action": "start"})["state"] == "ready"
     assert bundle.dispatch("motor_enable", {"action": "info"})["workmode"] == 30
+    status = bundle.dispatch("motor_enable", {"action": "status"})
+    assert status["workmode"] == 30 and status["feedback_freshness"] == "unknown"
+
+
+def test_disabled_motor_enable_is_not_registered(bundle_module):
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["motor_enable"] = {"enabled": False}
+    bundle = bundle_module.BumiDeviceBundle(config, "bumi_test", object(), FakeHighCtrl(), None)
+    assert "motor_enable" not in [tool["name"] for tool in bundle.get_all_tools()]
 
