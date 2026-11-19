@@ -145,12 +145,16 @@ class AdamGrpcClient:
 
     def get_robot_state(self) -> dict:
         response = self._call("GetRobotState", pb2.GetRobotStateRequest())
-        return self._response(response, (
+        state = self._response(response, (
             "fsm_state", "vx", "vy", "vyaw", "height",
             "current_motion_file", "motion_playing",
             "current_tracking_motion", "tracking_playing",
             "switchable_states", "available_actions",
         ))
+        for field in ("switchable_states", "available_actions"):
+            if field in state:
+                state[field] = list(state[field])
+        return state
 
     def get_stand_list(self) -> dict:
         state = self.get_robot_state()
