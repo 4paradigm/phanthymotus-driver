@@ -236,6 +236,41 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
                  in ArmGesturePlugin._GESTURES.items()}
         self.assertEqual(len(set(poses.values())), len(poses), poses)
 
+    def test_high_five_is_an_raised_bent_arm_with_open_palm(self):
+        gestures = self._gesture()
+        control = gestures._control
+        result = gestures.dispatch("high_five", {"side": "right"})
+        self.assertTrue(result["success"], result)
+        expected = {
+            "shoulderPitch_Right": -100.0,
+            "shoulderRoll_Right": -24.0,
+            "shoulderYaw_Right": -18.0,
+            "elbow_Right": -58.0,
+            "wristPitch_Right": 0.0,
+            "wristRoll_Right": 0.0,
+        }
+        for joint, degrees in expected.items():
+            index = ADAM_PRO_JOINTS.index(joint)
+            self.assertAlmostEqual(control._target_q[index], math.radians(degrees))
+        self.assertNotIn(ADAM_PRO_JOINTS.index("elbow_Left"), control._target_q)
+        gestures._cancel_sequence()
+
+    def test_high_five_mirrors_roll_and_yaw_for_left_arm(self):
+        gestures = self._gesture()
+        control = gestures._control
+        result = gestures.dispatch("high_five", {"side": "left"})
+        self.assertTrue(result["success"], result)
+        for joint, degrees in {
+            "shoulderPitch_Left": -100.0,
+            "shoulderRoll_Left": 24.0,
+            "shoulderYaw_Left": 18.0,
+            "elbow_Left": -58.0,
+        }.items():
+            index = ADAM_PRO_JOINTS.index(joint)
+            self.assertAlmostEqual(control._target_q[index], math.radians(degrees))
+        self.assertNotIn(ADAM_PRO_JOINTS.index("elbow_Right"), control._target_q)
+        gestures._cancel_sequence()
+
     def test_semantic_gestures_play_at_a_slower_velocity_ceiling(self):
         """Semantic gestures budget against 0.3 rad/s, not the raw card's 0.5.
 
@@ -279,13 +314,13 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
                     / ArmGesturePlugin._GESTURE_VELOCITY_RAD_S)
         self.assertAlmostEqual(span, expected, places=6)
 
-    def test_reset_returns_the_selected_arm_to_its_zero_target(self):
+    def test_reset_returns_the_selected_arm_to_its_startup_target(self):
         gestures = self._gesture()
         control = gestures._control
         result = gestures.dispatch("reset", {"side": "left"})
         self.assertTrue(result["success"], result)
-        self.assertEqual(control._target_q[ADAM_PRO_JOINTS.index("elbow_Left")],
-                         0.0)
+        elbow = ADAM_PRO_JOINTS.index("elbow_Left")
+        self.assertEqual(control._target_q[elbow], control._hold_q[elbow])
         self.assertNotIn(ADAM_PRO_JOINTS.index("elbow_Right"), control._target_q)
 
     def test_no_gesture_ever_selects_an_empty_joint_set(self):
@@ -621,8 +656,9 @@ class ArmWaveTests(RunningArmMixin, unittest.TestCase):
         self.assertEqual("completed", status)
         self.assertEqual("arm_gesture", tool)
         self.assertEqual("wave", payload["gesture"])
-        # The arm is lowered again, so the final target is the neutral one.
-        self.assertEqual(0.0, control._target_q[ADAM_PRO_JOINTS.index("elbow_Right")])
+        # The arm is lowered back to the startup pose captured from lowstate.
+        elbow = ADAM_PRO_JOINTS.index("elbow_Right")
+        self.assertEqual(control._hold_q[elbow], control._target_q[elbow])
 
     def test_stop_cancels_a_running_wave(self):
         control = self.arm_plugin()
@@ -707,6 +743,22 @@ class ArmWaveTests(RunningArmMixin, unittest.TestCase):
         self.assertAlmostEqual(
             math.radians(ARM_POSES["salute"][1]["right_elbow"]),
             control._target_q[elbow])
+
+    def test_direct_arm_command_supersedes_a_running_wave(self):
+        control = self.arm_plugin()
+        control._active_segment_span = lambda: 0.05
+        gestures = ArmGesturePlugin(control)
+        gestures._WAVE_SEQUENCE = (("wave_out", 0.05), ("wave_in", 0.05))
+        wave = gestures.dispatch("wave", {})
+        time.sleep(0.02)
+        direct = control.dispatch("set_elbow", {
+            "side": "right", "bend_deg": -35, "duration_s": 0.1,
+        })
+        self.assertTrue(direct["success"], direct)
+        self._wait()
+        self.assertEqual("cancelled", self.calls[0][1])
+        elbow = ADAM_PRO_JOINTS.index("elbow_Right")
+        self.assertAlmostEqual(math.radians(-35), control._target_q[elbow])
 
     def test_a_pose_cancels_a_running_wave_before_setting_its_target(self):
         control = self.arm_plugin()
@@ -900,38 +952,71 @@ class WaistHeadControlTests(RunningArmMixin, unittest.TestCase):
         self.assertIn("state", waist.dispatch("info", {}))
 
 
-class RemovedGestureTests(unittest.TestCase):
-    def test_config_and_marketplace_no_longer_list_removed_gesture_cards(self):
-        base = __file__.rsplit("/", 1)[0]
-        for filename in ("config.yaml", "driver.yaml"):
-            with open(f"{base}/{filename}", encoding="utf-8") as stream:
-                content = stream.read()
-            self.assertNotIn("arm_gesture", content, filename)
-            self.assertNotIn("waist_gesture", content, filename)
-            self.assertNotIn("head_gesture", content, filename)
-
-    def test_bundle_does_not_register_removed_gesture_cards(self):
+class ArmGestureRegistrationTests(unittest.TestCase):
+    def _bundle(self, overrides=None):
         disabled = {name: {"enabled": False} for name in (
             "state", "estop", "loco", "motion", "tracking_motion",
             "camera", "vision_capture", "hand", "hand_gesture",
             "hand_state", "model",
         )}
-        config = {
-            "variant": "pro",
-            "plugins": {
-                **disabled,
-                "arm": {"enabled": True},
-                "arm_gesture": {"enabled": True},
-                "waist": {"enabled": True},
-                "head": {"enabled": True},
-            },
+        plugins = {
+            **disabled,
+            "arm": {"enabled": True},
+            "arm_gesture": {"enabled": True},
+            "waist": {"enabled": True},
+            "head": {"enabled": True},
         }
-        bundle = AdamDeviceBundle(
-            config, "", None, None, dds_lowcmd_pub=_FakePublisher(),
-            ros2_enabled=False)
-        self.assertIn("arm_control", bundle._tool_map)
-        self.assertNotIn("arm_gesture", bundle._tool_map)
-        self.assertIn("waist_control", bundle._tool_map)
+        plugins.update(overrides or {})
+        return AdamDeviceBundle(
+            {"variant": "pro", "plugins": plugins}, "", None, None,
+            dds_lowcmd_pub=_FakePublisher(), ros2_enabled=False)
+
+    def test_config_and_marketplace_list_arm_gesture_only(self):
+        base = __file__.rsplit("/", 1)[0]
+        for filename in ("config.yaml", "driver.yaml"):
+            with open(f"{base}/{filename}", encoding="utf-8") as stream:
+                content = stream.read()
+            self.assertIn("arm_gesture", content, filename)
+            self.assertNotIn("waist_gesture", content, filename)
+            self.assertNotIn("head_gesture", content, filename)
+
+    def test_config_uses_adam_pro_dds_domain(self):
+        base = __file__.rsplit("/", 1)[0]
+        with open(f"{base}/config.yaml", encoding="utf-8") as stream:
+            lines = stream.readlines()
+        domain_lines = [
+            line for line in lines
+            if line.startswith("dds_domain_id:")
+        ]
+        self.assertEqual(["dds_domain_id: 0\n"], domain_lines)
+
+    def test_bundle_registers_gesture_with_the_shared_arm_controller(self):
+        bundle = self._bundle()
+        arm = bundle._tool_map["arm_control"]
+        gesture = bundle._tool_map["arm_gesture"]
+        self.assertIsInstance(gesture, ArmGesturePlugin)
+        self.assertIs(gesture._control, arm)
+        self.assertIsNone(gesture._hand)
+        self.assertIs(bundle._tool_map["waist_control"]._control, arm)
+        self.assertIs(bundle._tool_map["head_control"]._control, arm)
+
+    def test_bundle_reuses_the_registered_hand_gesture(self):
+        bundle = self._bundle({
+            "hand": {"enabled": True},
+            "hand_gesture": {"enabled": True},
+        })
+        self.assertIs(bundle._tool_map["arm_gesture"]._hand,
+                      bundle._tool_map["hand_gesture"])
+
+    def test_arm_or_gesture_disable_removes_arm_gesture(self):
+        self.assertNotIn(
+            "arm_gesture",
+            self._bundle({"arm_gesture": {"enabled": False}})._tool_map,
+        )
+        self.assertNotIn(
+            "arm_gesture",
+            self._bundle({"arm": {"enabled": False}})._tool_map,
+        )
 
 
 if __name__ == "__main__":
