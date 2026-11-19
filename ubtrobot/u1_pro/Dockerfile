@@ -27,7 +27,7 @@ RUN test -s /usr/share/keyrings/ros2-archive-keyring.gpg || \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros2-archive-keyring.gpg] ${ROS_APT_MIRROR} ${UBUNTU_CODENAME} main" \
         > /etc/apt/sources.list.d/ros2.list && \
     apt-get update && apt-get install -y --no-install-recommends \
-    python3-pip python3-pil pulseaudio-utils ros-humble-rmw-cyclonedds-cpp && rm -rf /var/lib/apt/lists/*
+    openssh-client python3-pip python3-pil pulseaudio-utils ros-humble-rmw-cyclonedds-cpp && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt /tmp/u1-requirements.txt
 RUN pip3 install --no-cache-dir -i "${PYPI_MIRROR}" -r /tmp/u1-requirements.txt && rm /tmp/u1-requirements.txt
 
@@ -35,6 +35,13 @@ WORKDIR /work
 COPY --from=interface-builder /u1_ws/install /u1_ws/install
 COPY common/ /work/common/
 COPY main.py device.py config.yaml driver.yaml /work/
+COPY visitor_badge.py /work/visitor_badge.py
+# Fail the image build instead of publishing a stale/cached U1 Pro bundle that
+# advertises QL_printer in driver.yaml but does not contain its runtime plugin.
+RUN test -s /work/visitor_badge.py && \
+    grep -q "QLPrinterPlugin" /work/device.py && \
+    grep -q "QL_printer" /work/config.yaml && \
+    grep -q "QL_printer" /work/driver.yaml
 COPY deploy/ /deploy/
 
 ENV ROS_DOMAIN_ID=42
