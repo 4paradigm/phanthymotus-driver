@@ -272,7 +272,8 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 
 | 卡片 | 动作 | 官方 ROS1 接口 |
 | --- | --- | --- |
-| `base_drive` | `move`、`move_relative`、`move_to`、`stop_move` | `/cmd_vel`；位姿动作使用新鲜 `/odom` 闭环 |
+| `base_drive` | `move`、`move_relative`、`stop_move` | `/cmd_vel`；相对位姿动作使用新鲜 `/odom` 闭环 |
+| `base_servo` | `pause`、`resume`；生命周期 `start/stop/info` | ActuCore navi 的 `control/velocity` → `/cmd_vel` |
 | `arm` | `set`、`zero`、`stop_move` | `/kuavo_arm_traj` |
 | `leg` | `set`、`zero`、`move_joints`、`stop_move` | `/lb_leg_traj` |
 | `head` | `move_pos`、`zero`、`stop_move` | `/robot_head_motion_data`；停止残余速度用`/cmd_head_vel` |
@@ -282,6 +283,16 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 | `imu` | 系统 `start`、`stop`、`info` | 同一原始消息的 IMU；`data/json` |
 | `loco_state` | 系统 `start`、`stop`、`info` | 两路：map/odom 位置、角度、速度 JSON + 独立 `state/odom` / `motus.odom/1` |
 | `model` | resource 读取 | 本地 `resource/kuavo5w_model.urdf` 参考骨架；离线可读 |
+
+`base_servo` 是轮式底盘连续伺服卡。在画布将 ActuCore navi 的 `control/velocity` 输出连接到它；Agent Core 在 start 传入 `input_topic`，并从返回值读取 `control_interface` 描述符。相机/深度连接对应传感器，里程计连接 `loco_state` 的 odom 流。
+
+速度协议与 R1 一致：ROS2 `std_msgs/String` JSON，`motus.control/1`、`mode=twist`、`dof=6`，机身系 `[vx,vy,vz,wx,wy,wz]`，单位 m/s、rad/s，vz/wx/wy 必须为零。复用主节点 domain 42 的隔离 DDS，工作线程经 rosbridge 转发 ROS1 `/cmd_vel`。期望10Hz、最大20Hz；校验序号、TTL和观测时间，300ms断流发零速、拒绝500ms以上旧观测；慢速使能完成后再次检查首帧是否过期，不执行积压旧目标。ROS2回调仅保留最新消息，不等待SSH或控制服务。
+
+`pause`及全局中断锁存暂停，需`resume`才接收后续帧；普通`base_drive.move/move_relative`优先暂停伺服。与厂商导航/建图共用内部base通道互斥。速度流不创建ACP pending，视觉导航到达由ActuCore navi负责ACP。容器启动不会自动订阅速度流。`info`返回输入话题、描述符、底盘准备状态、最近校验结果和执行次数。厂商控制器的速度超时机制保留。
+
+速度依据为2026-11-19真机只读核对：正在使用的 `humanoid_wheel_interface/config/kuavo_s63/task.info` 中 `wheel_move.max_vel=[0.8,0.8,1.6]`；底盘 `leju_node.launch` 及运行时 `/leju_node/max_linear_vel`、`max_angular_vel` 均为1.0。驱动取交集：平移合速度0.8m/s、旋转1rad/s。这是厂商软件命令包络，不宣称硬件极限；其他固件仍可能进一步限幅。官方《轮臂控制API》给出了单位和停止语义，没有统一的硬件最高速度数字。`controlled_spatial`仍遵守厂商路径规划器自己的速度限制。
+
+新增模块复用既有 `common/control`、std_msgs及rclpy，无新增pip/apt依赖。旧的持久化配置需加入`plugins.base_servo: {enabled: true}`，显式禁用配置仍受尊重。404项离线测试覆盖速度流、断流、旧帧、全局暂停、动作抢占、重连及使能期间暂停的晚响应竞态。新镜像已验证domain 42下的真实DDS收发和断流零速，ROS1端使用内存替身，不连接电机；尚未以新档位执行真机运动或验证整条视觉导航到达。
 
 sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 resource。
 `model.start/stop/info`仅返回独立生命周期状态，不加入传感器发布循环；
@@ -398,9 +409,9 @@ EOF只作结束标记跳过，后续PCM继续播放；如需清空已排队PCM�
 
 参数单位与约束：
 
-- 底盘速度：本体系 `vx/vy` 单位m/s，范围±0.3；`vyaw` 单位**度/秒**，范围±28.6478897565。`duration` 必填，0.1–10s，或 `-1` 持续运动至 `stop_move`。连续动作返回running/continuous，不注册永远无法完成的ACP pending；保留本地通道占用、心跳与安全检查，停止/断连/反馈失效时终止。有限时长与位姿动作仍保持正常ACP等待及资源屏障。
-- 底盘位姿：`x/y` 为米，`yaw` 为**度**，三个值均必填。`move_relative` 的x/y是动作实际发送时机身系相对位移，yaw是相对转角；`move_to` 是odom系绝对位置和朝向，不是地图导航坐标。故两动作参数名称相同。位置反馈来自新鲜带时间戳的原始`/odom`，按20Hz发送有界`/cmd_vel`；缺少反馈、坐标系改变或110s超时会暂停，不继续盲走。
-  `speed` 可选 `low`（默认：0.1m/s、10°/s）、`medium`（0.2m/s、20°/s）、`high`（0.3m/s、28.6479°/s），均为指令上限，接近目标时减速。位移上限5m；实测位置误差≤2cm、角度误差≤1°且不同样本持续0.3s才完成ACP。没有避障规划，避障导航使用`controlled_spatial`。
+- 底盘速度：本体系 `vx/vy` 单位m/s，平移合速度≤0.8；`vyaw` 单位**度/秒**，范围±57.2957795131。`duration` 必填，0.1–10s，或 `-1` 持续运动至 `stop_move`。连续动作返回running/continuous，不注册永远无法完成的ACP pending；保留本地通道占用、心跳与安全检查，停止/断连/反馈失效时终止。有限时长与位姿动作仍保持正常ACP等待及资源屏障。
+- 底盘位姿：`x/y` 为米，`yaw` 为**度**，三个值均必填。`move_relative` 的x/y是动作实际发送时机身系相对位移，yaw是相对转角。已移除`move_to`：odom原点由厂商里程计初始化/重置决定，本驱动没有可复现的绝对零点管理；地图绝对位置使用`controlled_spatial.navigate_to_pose`。位置反馈来自新鲜带时间戳的原始`/odom`，按20Hz发送有界`/cmd_vel`；缺少反馈、坐标系改变或110s超时会暂停。
+  `speed` 可选 `low`（默认：0.24m/s、17.1887°/s）、`medium`（0.48m/s、34.3775°/s）、`high`（0.8m/s、57.2958°/s），按厂商控制链命令上限的30%/60%/100%设置，接近目标时减速。位移上限5m；实测位置误差≤2cm、角度误差≤1°且不同样本持续0.3s才完成ACP。没有避障规划，避障导航使用`controlled_spatial`。
 - 双臂 `set` 可填写`left_joint_1_rad`…`left_joint_7_rad`、`right_joint_1_rad`…`right_joint_7_rad`中的任意关节，单位**rad**。左右臂1、4、7号关节相对于厂商原始数据反向；其余保持厂商方向。只转换明确填写的目标，未填关节保留实际位置，原始joint_state及URDF不反向。
   省略、null或空白表示保持当前实测位置；0是有效目标；全部为空拒绝。实际发送前重新取未指定关节的实测值。`zero`同时归零全部14个手臂关节。字段description包含实时限位（rad/度），方向反转后的上下界也同步转换；未发现限位时不声明虚构范围且拒绝执行。旧完整`move_joints`度数组保持原始厂商方向，未在UI展示。
 - 下肢 `leg` 包含膝、腿、腰俯仰与偏航，删除重复的`waist`卡。`set`接受`knee_deg`、`leg_deg`、`waist_pitch_deg`、`waist_yaw_deg`的一个或多个绝对**度**值；省略时保持实测值。`zero`归零全部4关节。兼容`move_joints(positions)`四个度值。

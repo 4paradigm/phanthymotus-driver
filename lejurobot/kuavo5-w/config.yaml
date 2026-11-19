@@ -48,6 +48,7 @@ controlled_spatial:
   # Only the factory ID-1 movement song; TTS and warning tracks are preserved.
   motion_music_enabled: false
 plugins:
+  base_servo: {enabled: true}
   base_drive: {enabled: true}
   controlled_spatial: {enabled: true}
   arm: {enabled: true}

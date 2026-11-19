@@ -21,6 +21,8 @@ from peripherals import Peripherals, CARDS as PERIPHERAL_CARDS
 from speaker import Speaker
 from startup import StartupChecks
 from controlled_spatial import ControlledSpatialPlugin
+from base_servo import BaseServo
+from base_limits import LINEAR_LIMIT, ANGULAR_LIMIT, SPEED_FRACTIONS
 
 
 REACH = {
@@ -666,53 +668,53 @@ class BaseDrivePlugin(_KuavoPlugin):
         return self.bundle.spatial.start_chassis()
 
     def tool(self):
-        tool = self.schema("Kuavo 5-W 轮式底盘；vx/vy ±0.3 m/s，旋转 ±28.6479 deg/s；位姿动作不含避障，避障请用controlled_spatial。", {
-            "vx": {"type": "number", "minimum": -0.3, "maximum": 0.3, "description": "本体前向速度 m/s，驱动保守上限"},
-            "vy": {"type": "number", "minimum": -0.3, "maximum": 0.3, "description": "本体左向速度 m/s，驱动保守上限"},
-            "vyaw": {"type": "number", "minimum": -math.degrees(.5), "maximum": math.degrees(.5), "description": "逆时针角速度 deg/s；范围 ±28.6478897565 deg/s"},
+        tool = self.schema(f"Kuavo 5-W 轮式底盘；平移≤{LINEAR_LIMIT} m/s，旋转≤{math.degrees(ANGULAR_LIMIT):.4f} deg/s；无避障，避障请用controlled_spatial。", {
+            "vx": {"type": "number", "minimum": -LINEAR_LIMIT, "maximum": LINEAR_LIMIT, "description": "本体前向速度 m/s；平移合速度≤0.8"},
+            "vy": {"type": "number", "minimum": -LINEAR_LIMIT, "maximum": LINEAR_LIMIT, "description": "本体左向速度 m/s；平移合速度≤0.8"},
+            "vyaw": {"type": "number", "minimum": -math.degrees(ANGULAR_LIMIT), "maximum": math.degrees(ANGULAR_LIMIT), "description": "逆时针角速度 deg/s；范围 ±57.2957795131 deg/s"},
             "duration": {"type": "number", "description": "持续秒数0.1–10；-1持续至stop_move", "minimum": -1, "maximum": 10},
-            "speed": {"type": "string", "enum": ["low", "medium", "high"], "default": "low", "description": "位姿速度上限：low=0.1m/s及10deg/s，medium=0.2及20，high=0.3及28.6479"},
-            "x": {"type": "number", "description": "相对机身X位移/odom绝对X，米"},
-            "y": {"type": "number", "description": "相对位移/世界 Y 米"},
-            "yaw": {"type": "number", "description": "相对/odom绝对 yaw，度"},
+            "speed": {"type": "string", "enum": ["low", "medium", "high"], "default": "low", "description": "厂商控制链命令上限30%/60%/100%：low=0.24m/s及17.1887deg/s，medium=0.48及34.3775，high=0.8及57.2958"},
+            "x": {"type": "number", "description": "相对机身X位移，米"},
+            "y": {"type": "number", "description": "相对机身Y位移，米"},
+            "yaw": {"type": "number", "description": "相对偏航转角，度"},
         }, {"move": (["vx", "vy", "vyaw", "duration"], "本体速度运动；duration=-1持续至stop_move，否则到时发零速度并等待1s停止窗口"),
             "move_relative": (["x", "y", "yaw", "speed"], "相对执行开始时机身的位移及转角；米/度，里程计闭环，无避障"),
-            "move_to": (["x", "y", "yaw", "speed"], "odom系绝对位置及朝向；米/度，里程计闭环，无避障"),
             "stop_move": ([], "发零速并请求全身软件暂停；下一次新动作自动准备控制")},
-            "base", ("move", "move_relative", "move_to"),
-            required={"move": ["duration"], "move_relative": ["x", "y", "yaw"], "move_to": ["x", "y", "yaw"]})
+            "base", ("move", "move_relative"),
+            required={"move": ["duration"], "move_relative": ["x", "y", "yaw"]})
         return tool
 
     def _dispatch(self, action, args):
         if action == "move":
-            vx = _number(args.get("vx", 0), "vx", -0.3, 0.3)
-            vy = _number(args.get("vy", 0), "vy", -0.3, 0.3)
-            vyaw = math.radians(_number(args.get("vyaw", 0), "vyaw", -math.degrees(.5), math.degrees(.5)))
+            vx = _number(args.get("vx", 0), "vx", -LINEAR_LIMIT, LINEAR_LIMIT)
+            vy = _number(args.get("vy", 0), "vy", -LINEAR_LIMIT, LINEAR_LIMIT)
+            vyaw = math.radians(_number(args.get("vyaw", 0), "vyaw", -math.degrees(ANGULAR_LIMIT), math.degrees(ANGULAR_LIMIT)))
+            if math.hypot(vx, vy) > LINEAR_LIMIT + 1e-9:
+                raise ValueError("planar velocity magnitude exceeds 0.8 m/s")
             duration = _number(args.get("duration"), "duration")
             if duration != -1 and not .1 <= duration <= 10:
                 raise ValueError("duration must be -1 or between 0.1 and 10 seconds")
             return self._timed_velocity(duration,
                 lambda: self.bundle.twist("/cmd_vel", x=vx, y=vy, yaw=vyaw),
                 lambda: self.bundle.twist("/cmd_vel"), 1.0)
-        if action in ("move_relative", "move_to"):
+        if action == "move_relative":
             x, y, yaw = [_number(args.get(k), k) for k in ("x", "y", "yaw")]
             yaw = math.radians(yaw)
             speed = args.get('speed', 'low')
             if speed not in ('low', 'medium', 'high'):
                 raise ValueError('speed must be low, medium or high')
-            return self._pose_move(action, x, y, yaw, speed)
+            return self._pose_move(x, y, yaw, speed)
         raise ValueError(f"unknown action: {action}")
 
-    def _pose_move(self, action, x, y, yaw, speed):
-        linear, angular = {'low': (.1, math.radians(10)), 'medium': (.2, math.radians(20)),
-                           'high': (.3, .5)}[speed]
+    def _pose_move(self, x, y, yaw, speed):
+        fraction = SPEED_FRACTIONS[speed]
+        linear, angular = LINEAR_LIMIT*fraction, ANGULAR_LIMIT*fraction
         target, frame = [], []
         def validate():
             pose, _, source = self.bundle.sensors.odom_pose()
             px, py, pa = pose
-            target[:] = ([px+math.cos(pa)*x-math.sin(pa)*y,
-                          py+math.sin(pa)*x+math.cos(pa)*y, pa+yaw]
-                         if action == 'move_relative' else [x, y, yaw])
+            target[:] = [px+math.cos(pa)*x-math.sin(pa)*y,
+                         py+math.sin(pa)*x+math.cos(pa)*y, pa+yaw]
             frame[:] = [source]
             if math.hypot(target[0]-px, target[1]-py) > 5:
                 raise ValueError('pose displacement exceeds 5m; use controlled_spatial navigation')
@@ -977,6 +979,7 @@ class KuavoBundle:
         self.plugins = [BaseDrivePlugin(self), ArmPlugin(self), LowerBodyPlugin(self),
                         HeadPlugin(self)]
         self.spatial = ControlledSpatialPlugin(self, config.get('controlled_spatial', {}))
+        self.base_servo = BaseServo(self, ros2_node)
         if "plugins" in config:
             plugin_config = dict(config['plugins'])
             # Preserve old deployments, but an explicit new setting wins.
@@ -985,7 +988,7 @@ class KuavoBundle:
             plugin_config.pop('loco', None)
             self._enabled = {name for name, cfg in plugin_config.items() if cfg.get('enabled', True)}
         else:
-            self._enabled = {"base_drive", "controlled_spatial", "arm", "leg", "head", "speaker",
+            self._enabled = {"base_drive", "base_servo", "controlled_spatial", "arm", "leg", "head", "speaker",
                              *SENSOR_CARDS, *PERIPHERAL_CARDS}
         aliases = {'loco': 'base_drive', 'camera_rgb': 'camera_left', 'camera_rgb_right': 'camera_right'}
         self._enabled = {aliases.get(name, name) for name in self._enabled if name not in ('state', 'switch_mode', 'waist')}
@@ -1112,6 +1115,7 @@ class KuavoBundle:
                 raise RuntimeError('control preparation needs an idle robot; another action is still running')
             target_mode = mode if compatible else 3
             token = self._new_transition('prepare_motion')
+            token['tool'] = tool
             self.state.motion_blocked = True
         finally:
             self.tracker.lock.release()
@@ -1255,6 +1259,7 @@ class KuavoBundle:
                 return {'state': 'idle'}  # An old preparation cannot pause a newer action.
             if expected is not None and not self.tracker.current(*expected):
                 return {'state': 'idle'}  # An old worker cannot cancel a newer action.
+            self.base_servo.mark_paused()
             self._stop_epoch += 1
             interrupted = self._transition is not None
             unresolved = self._resume_unresolved()
@@ -1346,7 +1351,8 @@ class KuavoBundle:
         return (tools + [t for t in self.sensors.tools() if t['name'] in self._enabled]
                 + [t for t in self.peripherals.tools() if t['name'] in self._enabled]
                 + ([self.spatial.get_tool()] if 'controlled_spatial' in self._enabled else [])
-                + ([self.speaker.tool()] if 'speaker' in self._enabled else []))
+                + ([self.speaker.tool()] if 'speaker' in self._enabled else [])
+                + ([self.base_servo.tool()] if 'base_servo' in self._enabled else []))
 
     def start_background(self):
         self.startup_checks.start()
@@ -1365,6 +1371,13 @@ class KuavoBundle:
             return None
         if self._closing:
             return {"state": "error", "error": "driver is shutting down"}
+        if name == 'base_drive' and action in ('move', 'move_relative'):
+            try:
+                self.base_servo.preempt()
+            except Exception as exc:
+                return {'state': 'error', 'error': _safe_log(str(exc))}
+        if name == 'base_servo':
+            return self.base_servo.dispatch(action, args)
         if name == 'speaker':
             return self.speaker.dispatch(action, args)
         if name == 'controlled_spatial':
@@ -1390,6 +1403,7 @@ class KuavoBundle:
             result = self.pause("driver_shutdown")
             if result.get("error"):
                 print(f"[shutdown] {_safe_log(result.get('error'))}", flush=True)
+        self.base_servo.close()
         self.state.close()
         self.spatial.close()
         self.startup_checks.close()

@@ -206,7 +206,8 @@ class DriverContractTests(unittest.TestCase):
             if tool['type'] != 'actuator':
                 continue
             schema = tool["inputSchema"]
-            self.assertEqual(set(schema["properties"]["action"]["enum"]), set(schema["x-action-params"]))
+            self.assertEqual(set(schema["properties"]["action"]["enum"]) - ({"start", "stop", "info"} if name == "base_servo" else set()),
+                             set(schema["x-action-params"]))
             self.assertTrue(all(set(a["params"]) <= set(schema["properties"])
                                 for a in schema["x-action-params"].values()))
             if not tool.get('topic_in') and name != 'head':  # synchronous head acceptance has no pending ACP
@@ -1896,7 +1897,7 @@ class CardRevisionTests(unittest.TestCase):
         self.assertFalse(self.callbacks)
 
     def test_position_profiles_limit_actual_velocity_and_relative_frame(self):
-        for speed, vmax, wmax in [('low', .1, 10),('medium', .2, 20),('high', .3, math.degrees(.5))]:
+        for speed, vmax, wmax in [(s, driver.LINEAR_LIMIT*f, math.degrees(driver.ANGULAR_LIMIT*f)) for s,f in driver.SPEED_FRACTIONS.items()]:
             with self.subTest(speed=speed):
                 self.bundle.sensors.odom_pose = lambda: ((2.,3.,math.pi/2), time.time(), 'odom')
                 result = self.call('base_drive','move_relative',x=1.,y=0.,yaw=90.,speed=speed)
@@ -1909,9 +1910,9 @@ class CardRevisionTests(unittest.TestCase):
                 self.assertLessEqual(abs(command['angular']['z']),math.radians(wmax)+1e-9)
                 self.call('base_drive','stop_move');self.ros.raw();self.ros.published.clear()
 
-    def test_absolute_target_uses_odom_frame_and_feedback_loss_stops(self):
+    def test_relative_target_uses_body_frame_and_feedback_loss_stops(self):
         self.bundle.sensors.odom_pose = lambda: ((2.,3.,math.pi/2), time.time(), 'odom')
-        result = self.call('base_drive','move_to',x=3.,y=3.,yaw=90.)
+        result = self.call('base_drive','move_relative',x=0.,y=-1.,yaw=0.)
         self.assertEqual(result['state'],'executing')
         self.assertTrue(wait_until(lambda: len(self.ros.published)>1))
         self.assertLess(self.ros.published[-1][2]['linear']['y'],0.)
@@ -1923,7 +1924,7 @@ class CardRevisionTests(unittest.TestCase):
     def test_pose_repeated_capture_cannot_complete_but_distinct_samples_can(self):
         capture = time.time()
         self.bundle.sensors.odom_pose = lambda: ((0.,0.,0.), capture, 'odom')
-        result = self.call('base_drive','move_to',x=0.,y=0.,yaw=0.)
+        result = self.call('base_drive','move_relative',x=0.,y=0.,yaw=0.)
         self.assertEqual(result['state'],'executing')
         time.sleep(.36)
         self.assertFalse(self.callbacks)
@@ -1934,7 +1935,7 @@ class CardRevisionTests(unittest.TestCase):
         self.assertTrue(self.callbacks[0][3]['measured_convergence'])
 
     def test_pose_requires_fresh_stamped_odom_before_resume(self):
-        self.assertIn('odometry',self.call('base_drive','move_to',x=0.,y=0.,yaw=0.)['error'])
+        self.assertIn('odometry',self.call('base_drive','move_relative',x=0.,y=0.,yaw=0.)['error'])
         self.assertFalse(self.ros.sent_services)
         self.assertFalse(self.ros.published)
 
@@ -1952,7 +1953,7 @@ class MotionConfigurationTests(unittest.TestCase):
             cases = [
                 ('base_drive', dict(action='move', duration=.1)),
                 ('base_drive', dict(action='move_relative', x=0, y=0, yaw=0)),
-                ('base_drive', dict(action='move_to', x=0, y=0, yaw=0)),
+                ('base_drive', dict(action='move_relative', x=0, y=0, yaw=0)),
                 ('arm', dict(action='move_joints', positions=[0.] * 14)),
                 ('arm', dict(action='set_pose', frame='world', left_position=[0, .4, 0],
                              right_position=[0, -.4, 0], left_quaternion=[0, 0, 0, 1],
