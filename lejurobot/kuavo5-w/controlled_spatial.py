@@ -104,12 +104,19 @@ class ControlledSpatialPlugin:
     def __init__(self, bundle, config=None, client=None):
         self.bundle = bundle
         config = config or {}
+        self._motion_music_enabled = config.get('motion_music_enabled', False)
+        if type(self._motion_music_enabled) is not bool:
+            raise ValueError('motion_music_enabled must be a boolean')
         self.client = client or JatenClient(bundle.startup_checks.provisioner)
         self.store = SpatialStore(config.get('db_path', str(Path(os.environ.get('KUAVO_STATE_DIR', '/config'))
                                                            / 'controlled_spatial.db')))
         self._operations = threading.Lock()
         self._native_lock = threading.RLock()
         self._start_lock = threading.Lock()
+        self._startup_guard = threading.Lock()
+        self._startup = None
+        self._startup_key = None
+        self._startup_thread = None
         self._preparation = None
         self._task = None
         self._uncertain = False
@@ -160,13 +167,52 @@ class ControlledSpatialPlugin:
         if any(agv.get(k) is not False for k in ('estopButtonEvent', 'bumperEvent', 'driverError')):
             raise RuntimeError('chassis_hardware_stop_or_fault_is_active')
 
-    def prepare_chassis(self):
+    def start_chassis(self):
+        """Share one background preflight across both base cards and a stop epoch."""
+        if not self.bundle.ros1.connection[0]:
+            return {'state': 'error', 'error': 'control_connection_is_disconnected'}
+        key = (self.bundle._stop_epoch, self.bundle.ros1.connection)
+        with self._startup_guard:
+            if self._startup_thread and self._startup_thread.is_alive():
+                return dict(self._startup)
+            if self._startup_key == key and self._startup and self._startup['state'] == 'running':
+                return dict(self._startup)
+            self._startup_key = key
+            self._startup = {'state': 'loading', 'message':
+                'Checking chassis status in background, please wait. Control will be ready automatically.'}
+            def worker():
+                try:
+                    # Audio configuration is independent of motor state.
+                    try:
+                        music = self.client.native('motion_music', enabled=self._motion_music_enabled)
+                    except Exception:
+                        music = {'state': 'unavailable'}
+                    result = self.prepare_chassis(request_epoch=key[0])
+                    if key != (self.bundle._stop_epoch, self.bundle.ros1.connection):
+                        raise RuntimeError('chassis_start_superseded_by_stop_or_reconnect')
+                    status = {'state': 'running', 'chassis_preparation': result, 'motion_music': music}
+                except Exception as exc:
+                    status = {'state': 'error', 'error': str(exc).encode('unicode_escape').decode('ascii')[:400]}
+                with self._startup_guard:
+                    self._startup = status
+            self._startup_thread = threading.Thread(target=worker, daemon=True, name='chassis-start')
+            self._workers.add(self._startup_thread)
+            self._startup_thread.start()
+            return dict(self._startup)
+
+    def startup_status(self):
+        with self._startup_guard:
+            if self._startup_key != (self.bundle._stop_epoch, self.bundle.ros1.connection):
+                return {'state': 'idle'}
+            return dict(self._startup or {'state': 'idle'})
+
+    def prepare_chassis(self, request_epoch=None):
         """Explicit card start: cancel old tasks, release soft stop, confirm rest.
 
         One shared preparation for both cards. Stops supersede its transition;
         the native lock orders a later soft stop after any resolved release.
         """
-        epoch = self.bundle._stop_epoch
+        epoch = self.bundle._stop_epoch if request_epoch is None else request_epoch
         if not self._start_lock.acquire(timeout=15):
             raise RuntimeError('chassis_preparation_busy')
         token = None
@@ -205,8 +251,9 @@ class ControlledSpatialPlugin:
             if observation['agvState'].get('softwareEstop') is not False:
                 raise RuntimeError('chassis_software_stop_release_unconfirmed')
             state = observation['state']
-            if state.get('driving') is not False or any(
-                    abs(number(state.get('velocity', {}).get(k), k)) > .01 for k in ('vx', 'vy', 'omega')):
+            # Native prepare already checked distinct, fresh raw /odom samples.
+            # The web velocity cache can remain nonzero after driving=false.
+            if state.get('driving') is not False:
                 raise RuntimeError('chassis_not_stationary_after_start')
             with self.bundle.tracker.lock:
                 self.bundle._check_transition(token)
@@ -254,12 +301,14 @@ class ControlledSpatialPlugin:
         try:
             self._restore()
             if action == 'start':
-                return {'state': 'running', 'chassis_preparation': self.prepare_chassis()}
+                return self.start_chassis()
             if action == 'info':
                 mapping = self.store.state('mapping')
-                return {'state': 'mapping' if mapping else 'ready', 'mapping': mapping,
+                startup = self.startup_status()
+                return {'state': startup['state'] if startup['state'] in ('loading', 'error') else 'mapping' if mapping else 'ready', 'mapping': mapping,
                         'remote_task': self._task, 'command_delivery_uncertain': self._uncertain,
                         'map_transition': self._map_pending, 'chassis_preparation': self._preparation,
+                        'startup': self.startup_status(),
                         'map': self.client.current_map(), 'feedback': self.client.observe()}
             if action in ('stop_nav', 'stop'):
                 result = self.bundle.pause('navigation_stopped')

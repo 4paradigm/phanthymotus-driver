@@ -40,15 +40,18 @@ sensors:
   # with live kuavo_configuration limits. No local-model/default fallback.
   # Set commissioned to require an operator record for arms as well as legs.
   arm_limit_source: vendor_runtime
+  leg_limit_source: vendor_runtime
   # An explicit record takes precedence; invalid records never fall back.
-  # Legs/waist still require commissioning. Vendor limits are not certification.
+  # Vendor runtime limits are not hardware certification.
   joint_limits: null
+controlled_spatial:
+  # Only the factory ID-1 movement song; TTS and warning tracks are preserved.
+  motion_music_enabled: false
 plugins:
   base_drive: {enabled: true}
   controlled_spatial: {enabled: true}
   arm: {enabled: true}
   leg: {enabled: true}
-  waist: {enabled: true}
   head: {enabled: true}
   speaker: {enabled: true}
   joints: {enabled: true}

@@ -272,10 +272,9 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 
 | 卡片 | 动作 | 官方 ROS1 接口 |
 | --- | --- | --- |
-| `base_drive` | `move`、`move_relative`、`move_to`、`stop_move` | `/cmd_vel`、`/cmd_pose`、`/cmd_pose_world` |
-| `arm` | `set`、`stop_move` | `/kuavo_arm_traj` |
+| `base_drive` | `move`、`move_relative`、`move_to`、`stop_move` | `/cmd_vel`；位姿动作使用新鲜 `/odom` 闭环 |
+| `arm` | `set`、`zero`、`stop_move` | `/kuavo_arm_traj` |
 | `leg` | `set`、`zero`、`move_joints`、`stop_move` | `/lb_leg_traj` |
-| `waist` | `waist_pitch`、`waist_yaw`、`zero`、`set_pose`、`stop_move` | `/lb_leg_traj`、`/cmd_lb_torso_pose` |
 | `head` | `move_pos`、`zero`、`stop_move` | `/robot_head_motion_data`；停止残余速度用`/cmd_head_vel` |
 | `controlled_spatial` | 建图、保存、打点、载图、按坐标/语义点导航、`stop_nav` | 原生 Leju 导航服务 + JaTen 地图 API |
 | `speaker` | `start`、`stop`、`info`、`set_volume`、`get_volume` | ROS2 `AudioChunk` → 独立rosbridge → 自有底盘PCM播放服务 |
@@ -320,7 +319,7 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 
 `base_drive.start` 与 `controlled_spatial.start` 共用底盘启动准备：检查硬件急停/碰撞/故障，
 调用厂商 CANCEL_CURRENT_TASK(2) 取消旧任务，确认新鲜里程计连续停稳，再在软急停有效时
-调用 CANCEL_SOFT_STOP(1)，最后核实原始反馈、界面状态与停稳；成功分别返回 ready/running。
+调用 CANCEL_SOFT_STOP(1)，最后核实原始反馈、界面状态与停稳；首次立即返回 `state: loading` 和英文消息 `Checking chassis status in background, please wait. Control will be ready automatically.`；`info` 可查询 loading/running/error。两张卡共享同一后台检查，同一次连接且未停止时不重复取消任务。停止或重连后重新检查。
 这一步不发送移动目标，不恢复旧任务，不使能全身控制；后续显式运动仍按既有流程恢复控制。
 两张卡的 `info` 只读，显示地图、定位、急停、在途任务和建图阶段。
 `motion_enabled: false`、硬件故障或已存在的在途/未确认动作会阻止准备，不会强行清除。
@@ -399,34 +398,32 @@ EOF只作结束标记跳过，后续PCM继续播放；如需清空已排队PCM�
 
 参数单位与约束：
 
-- 底盘速度：本体系 `vx/vy` 为 m/s，`vyaw` 为 rad/s。驱动限制分别为 ±0.3、±0.3、±0.5，`duration` 必填，范围 0.1–10s。
-- 底盘位姿：`x/y` 为米，`yaw` 为弧度，三个值均必填。`move_relative` 相对当前位置，`move_to` 使用机器人启动世界系。
-- 双臂卡片只提供`set`和必要的`stop_move`：`set`可填写`left_joint_1_rad`…`left_joint_7_rad`、`right_joint_1_rad`…`right_joint_7_rad`中的任意一个或多个绝对角度，单位**rad**。明确对应zarm_l1…l7/r1…r7。
-  省略、null或空白字段表示保持当前实测位置，0是有效目标；全部为空会拒绝。未指定关节在自动恢复后、实际发送前重新取实测角度，仍需模型、反馈和硬件核验限位有效。
-  移除卡片中的单关节动作和zero；旧客户端完整`move_joints(positions)`度数组及`set_pose`调用保留兼容分发，但不在卡片界面展示。
-- 下肢参照Q5的`set/zero`：`set`接受`knee_deg`、`leg_deg`、`waist_pitch_deg`、`waist_yaw_deg`中的一个或多个绝对**度**值，省略的保持实测值；`zero`归零全部4关节（含腰部）。兼容`move_joints(positions)`四个度值。
-- 腰部参照Q5的单轴形式：`waist_pitch(waist_pitch_rad)`、`waist_yaw(waist_yaw_rad)`使用绝对**rad**，保留其余下肢实测角度；`zero`仅归零这两个腰关节，与leg共用执行通道和同一份下肢核验限位。
-- 躯干：`x/z` 米、`pitch/yaw` 弧度，四个值均必填。文档不支持的 y/roll 不暴露。
-- 头部：`move_pos(yaw,pitch)`为绝对**度**，yaw范围[-30,30]、pitch[-25,25]（采用v63机器配置中更窄的范围，非通用SDK的±80°）；不要求速度或时长，无roll自由度。`zero`等同两个目标角度0。
-  yaw/pitch至少填写一个；省略、null或空白轴在实际发令前取当前实测角度，0是有效目标，不会把未填写的轴归零。
-  使用SDK绝对话题，先清零残余速度；需新鲜且模型有效的真实关节反馈。命令后不同sensor_time的实测误差≤1°且跨越0.2s才报告ACP完成，20s未收敛或反馈中断会报错并尝试暂停；到位超时包含目标、实测与误差（顺序yaw/pitch，度）。
-  2026-11-19旁站复验仍未通过物理到位验收：正程目标8.417°、实测4.881°，返程目标3.417°、实测4.793°；当前不能承诺头部精确定位正常。参数核查见SDK_ANALYSIS.md末节。
-  旧`head.move`速度/时长动作已删除，避免把旧画布速度值误当绝对角度，旧卡需重新选择move_pos。
+- 底盘速度：本体系 `vx/vy` 单位m/s，范围±0.3；`vyaw` 单位**度/秒**，范围±28.6478897565。`duration` 必填，0.1–10s，或 `-1` 持续运动至 `stop_move`。连续动作返回running/continuous，不注册永远无法完成的ACP pending；保留本地通道占用、心跳与安全检查，停止/断连/反馈失效时终止。有限时长与位姿动作仍保持正常ACP等待及资源屏障。
+- 底盘位姿：`x/y` 为米，`yaw` 为**度**，三个值均必填。`move_relative` 的x/y是动作实际发送时机身系相对位移，yaw是相对转角；`move_to` 是odom系绝对位置和朝向，不是地图导航坐标。故两动作参数名称相同。位置反馈来自新鲜带时间戳的原始`/odom`，按20Hz发送有界`/cmd_vel`；缺少反馈、坐标系改变或110s超时会暂停，不继续盲走。
+  `speed` 可选 `low`（默认：0.1m/s、10°/s）、`medium`（0.2m/s、20°/s）、`high`（0.3m/s、28.6479°/s），均为指令上限，接近目标时减速。位移上限5m；实测位置误差≤2cm、角度误差≤1°且不同样本持续0.3s才完成ACP。没有避障规划，避障导航使用`controlled_spatial`。
+- 双臂 `set` 可填写`left_joint_1_rad`…`left_joint_7_rad`、`right_joint_1_rad`…`right_joint_7_rad`中的任意关节，单位**rad**。左右臂1、4、7号关节相对于厂商原始数据反向；其余保持厂商方向。只转换明确填写的目标，未填关节保留实际位置，原始joint_state及URDF不反向。
+  省略、null或空白表示保持当前实测位置；0是有效目标；全部为空拒绝。实际发送前重新取未指定关节的实测值。`zero`同时归零全部14个手臂关节。字段description包含实时限位（rad/度），方向反转后的上下界也同步转换；未发现限位时不声明虚构范围且拒绝执行。旧完整`move_joints`度数组保持原始厂商方向，未在UI展示。
+- 下肢 `leg` 包含膝、腿、腰俯仰与偏航，删除重复的`waist`卡。`set`接受`knee_deg`、`leg_deg`、`waist_pitch_deg`、`waist_yaw_deg`的一个或多个绝对**度**值；省略时保持实测值。`zero`归零全部4关节。兼容`move_joints(positions)`四个度值。
+  `set_height(height)`接受`waist_yaw_link`相对`base_link`的绝对高度m，保守范围0.74–1.06。根据实时URDF和实测位置求逆解，保持躯干x/俯仰及腰偏航，通过厂商`/cmd_lb_torso_pose`联动膝、腿、腰；ACP仍用真实关节收敛确认。不支持的轴/固定变换、不可达高度和越界逆解在恢复控制前拒绝，不能把该范围内任意高度理解为任何姿态都可达。
+- 头部 `move_pos(yaw,pitch)` 为绝对**度**，yaw范围[-30,30]、pitch[-25,25]；**Pitch正值向上、负值向下**，只转换卡片输入，原始反馈不改。至少填一轴；省略轴在实际发令前取实测角度。`zero`两个轴归零。
+  实机厂商位置环存在数度偏差，目前没有经过验证的反馈补偿参数。按操作要求改为**同步返回发送成功**：`state: completed`、`completion_basis: absolute_command_sent`、`measured_convergence: false`；不等待20s，不声明物理到位，也不注册一个已同步结束的ACP pending。仍要求新鲜、模型有效的关节反馈以保持未填轴，发送异常仍按不确定运动指令暂停处理。没有修改增益、零点或伪造joint_state。
+
+`controlled_spatial.motion_music_enabled: false`（默认）在底盘卡后台启动时，仅把已核实的厂商ID-1运动曲目`1_flower.mp3`替换为有效静音MP3；原件与SHA256记录保存在同目录`.motus-motion-music/`，设为true可恢复。保留ID-2告警、待命、充电、障碍提示和TTS，不改变系统音量、不重启底盘管理节点。使用底盘已有ffmpeg，不自动安装新包；未知文件布局、缺少ffmpeg或操作员已改动曲目时返回unsupported/blocked，显示在`info.startup.motion_music`。已经开始的播放可能到本次结束后才静音。
 
 上述速度和时长上限属于**驱动策略**，不代表厂家最大能力或完整的工作空间、关节限位及碰撞保护。
 末端和躯干目标仍需由调用方根据机器人实际安全工作空间设置；关节限位检查不等同于碰撞保护。
 
 ### 关节限位配置
 
-默认 `sensors.arm_limit_source: vendor_runtime` 与厂商 SDK 的运行时模型取限位方式一致：
-读取实际 `/humanoid_description` 中14个手臂关节的有限上下界，再与 `/kuavo_configuration`
+默认 arm/leg 的 `*_limit_source: vendor_runtime` 与厂商SDK的运行时模型取限位方式一致：
+读取实际 `/humanoid_description` 中14个手臂及4个下肢关节的有限上下界，再与 `/kuavo_configuration`
 的20关节度制上下界取交集。要求关节类型、名称、数量、顺序及版本身份校验通过；
 按1s周期刷新，身份租约失效或参数缺失时拒绝新动作并终止在途关节动作。
 不使用随包显示模型、通用±π或其他型号的限位兜底，也不截断越界目标。
 这是厂商运行时配置校验，**不等同于独立硬件认证**；健康状态明确标记 `hardware_verified: false`。
 
 需要现场核验记录的部署可改为 `arm_limit_source: commissioned`；省略该键的旧配置仍使用此严格策略。
-下肢/腰部始终要求现场核验记录。显式填写 `sensors.joint_limits` 时优先使用该记录，
+下肢也可设置 `leg_limit_source: commissioned` 要求现场核验记录。显式填写 `sensors.joint_limits` 时优先使用该记录，
 记录错误或缺少arm字段不会退回厂商配置。记录格式如下：
 
 | `sensors.joint_limits` 字段 | 要求 |
@@ -466,9 +463,9 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 
 ## ACP、并发和停止语义
 
-底盘、双臂、下肢、躯干和头部的运动动作均声明 `x-completion`，返回唯一 `action_id`，
-结束后 POST `${AGENT_CORE_URL}/api/acp/complete`。资源分别为 `base`、`arm_l/arm_r`、`lower_body`、`head`；
-`leg` 与 `waist` 共享资源和驱动内部通道。同通道在途动作收到新命令会返回 busy，调用方应等待完成或显式停止。
+底盘、双臂和下肢的持续/轨迹动作声明 `x-completion`，返回唯一 `action_id`，
+结束后 POST `${AGENT_CORE_URL}/api/acp/complete`。资源分别为 `base`、`arm_l/arm_r`、`lower_body`；头部仅同步确认发令，保留 `head` 资源与停止hook，不声明异步物理到位。
+`leg` 独占下肢通道，包含腰部关节。同通道在途动作收到新命令会返回 busy，调用方应等待完成或显式停止。
 底盘速度/位姿也共享 busy 通道，避免位置指令被尚未过期的速度指令覆盖，或无效新参数误取消旧 ACP。
 全局恢复/模式准备由驱动内部仲裁，不另行暴露执行卡；其短状态转换同步等待反馈。
 同为BaseArm时不同资源可并发；若改变全局模式需要影响其他在途动作，则返回busy，不能静默重置它们。
@@ -669,3 +666,9 @@ IMU301帧、位置展示和标准odom各300帧且全部有效，电池/雷达点
 停止深度卡与relay后，基础检查不会启动闲置深度；重新start卡能自动恢复服务与有效数据。
 全身joints/joint_state仍因无真实发布者明确invalid。199项离线测试、Python编译和部署片段检查通过。
 详细检查记录见 ROBOT_INSPECTION.md 文末。
+
+### 2026-11-19 卡片调整验证边界
+
+新增方向、限位转换、同步头部回执、下肢实时限位/升降逆解、底盘三档闭环速度/持续运动和共享后台启动的离线回归测试。读取了三个板子的厂商源码与配置；新增的升降及底盘位姿反馈控制尚未做旁站运动验收。指令限速不等于实测速度保证，关节限位也不等于碰撞保护。
+
+本轮388项离线测试、Python编译和service.yml检查通过。上位机候选镜像基于当前release构建；只读验证确认arm/leg实时限位有效、重复waist已移除、头部同步发送语义生效。单独关闭ID-1运动音乐的操作返回disabled，其他曲目未改。未向电机发送测试目标；升降、连续运动和三档位姿闭环仍待旁站验收。

@@ -209,10 +209,10 @@ class DriverContractTests(unittest.TestCase):
             self.assertEqual(set(schema["properties"]["action"]["enum"]), set(schema["x-action-params"]))
             self.assertTrue(all(set(a["params"]) <= set(schema["properties"])
                                 for a in schema["x-action-params"].values()))
-            if not tool.get('topic_in'):  # continuous audio is tracked by upstream TTS ACP
+            if not tool.get('topic_in') and name != 'head':  # synchronous head acceptance has no pending ACP
                 self.assertIn("x-completion", schema)
             self.assertIn("x-resource", schema)
-        self.assertEqual(tools["leg"]["inputSchema"]["x-resource"], tools["waist"]["inputSchema"]["x-resource"])
+        self.assertNotIn("waist", tools)
 
     def test_actuator_info_preserves_diagnostics_without_public_control_cards(self):
         self.bundle.startup_checks.status = {'state': 'ready'}
@@ -748,7 +748,7 @@ class DriverContractTests(unittest.TestCase):
                      {"vx": float("nan"), "duration": 1}, {"duration": 0}, {"duration": "1"}):
             self.assertEqual(self.call("base_drive", "move", **args)["state"], "error")
         self.assertEqual(self.call("arm", "move_joints", positions=[0] * 13)["state"], "error")
-        self.assertEqual(self.call("waist", "set_pose", x=0)["state"], "error")
+        self.assertIsNone(self.call("waist", "set_pose", x=0))
         self.assertEqual(self.ros.published, [])
         self.assertEqual(self.ros.services, [])
 
@@ -790,7 +790,6 @@ class DriverContractTests(unittest.TestCase):
         for card, action, args in (
             ('arm', 'move_joints', {'positions': [0.] * 14}),
             ('leg', 'move_joints', {'positions': [0.] * 4}),
-            ('waist', 'set_pose', {'x': 0., 'z': .8, 'pitch': 0., 'yaw': 0.}),
             ('head', 'move_pos', {'yaw': 0., 'pitch': 0.}),
             ('arm', 'set_pose', {'frame': 'local', 'left_position': [0., .4, 0.],
                 'right_position': [0., -.4, 0.], 'left_quaternion': [0., 0., 0., 1.],
@@ -799,7 +798,7 @@ class DriverContractTests(unittest.TestCase):
                 self.call('base_drive', 'stop_move')
                 self.ros.raw()
                 result = self.call(card, action, **args)
-                self.assertEqual(result['state'], 'executing')
+                self.assertEqual(result['state'], 'completed' if card == 'head' else 'executing')
                 self.assertTrue(result['control_preparation']['resumed'])
                 self.call(card, 'stop_move')
         self.ros.sent_services.clear()
@@ -990,7 +989,7 @@ class DriverContractTests(unittest.TestCase):
     def test_leg_and_waist_share_busy_channel(self):
         first = self.call("leg", "move_joints", positions=[1, 2, 3, 4])
         self.assertIn("action_id", first)
-        second = self.call("waist", "set_pose", x=0, z=0.8, pitch=0, yaw=0)
+        second = self.call("leg", "set", knee_deg=10.)
         self.assertIn("busy", second["error"])
         self.assertEqual(len(self.ros.published), 1)
 
@@ -1034,7 +1033,7 @@ class DriverContractTests(unittest.TestCase):
     def test_split_action_schemas_are_action_specific(self):
         tools = {t['name']: t for t in self.bundle.get_all_tools()}
         self.assertEqual(tools['base_drive']['inputSchema']['x-action-params']['move']['required'], ['duration'])
-        self.assertEqual(set(tools['arm']['inputSchema']['properties']['action']['enum']), {'set', 'stop_move'})
+        self.assertEqual(set(tools['arm']['inputSchema']['properties']['action']['enum']), {'set', 'zero', 'stop_move'})
 
     def test_joint_command_rejected_without_fresh_measurement(self):
         self.bundle.sensors._seen['joints'] = time.monotonic() - 1
@@ -1067,7 +1066,7 @@ class DriverContractTests(unittest.TestCase):
         result = self.call('arm', 'set', left_joint_1_rad=.1)
         self.assertEqual(result['state'], 'executing')
         self.assertEqual(self.ros.published[-1][0], '/kuavo_arm_traj')
-        self.assertAlmostEqual(self.ros.published[-1][2]['position'][0], math.degrees(.1))
+        self.assertAlmostEqual(self.ros.published[-1][2]['position'][0], -math.degrees(.1))
         self.ros.params['kuavo_configuration'] = None
         self.bundle.sensors._retry_at = 0
         self.bundle.sensors.tick()
@@ -1485,7 +1484,8 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(len(self.callbacks), 1)
 
     def test_partial_initial_position_send_fails_closed_and_shutdown_retries_stop(self):
-        self._partial_initial_send('base_drive', 'move_relative', '/cmd_pose', x=.01, y=0., yaw=0.)
+        self.bundle.sensors.odom_pose = lambda: ((0., 0., 0.), time.time(), 'odom')
+        self._partial_initial_send('base_drive', 'move_relative', '/cmd_vel', x=.01, y=0., yaw=0.)
 
     def test_partial_initial_velocity_send_fails_closed(self):
         self._partial_initial_send('base_drive', 'move', '/cmd_vel', vx=.01, duration=.2)
@@ -1544,7 +1544,7 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(len(self.callbacks), 1)
 
     def test_input_validation_failure_does_not_mark_delivery_uncertain(self):
-        self.assertEqual(self.call('base_drive', 'move', duration=-1)['state'], 'error')
+        self.assertEqual(self.call('base_drive', 'move', duration=-2)['state'], 'error')
         self.assertFalse(self.bundle.state.motion_send_uncertain)
         self.assertFalse(self.bundle.state.motion_blocked)
         self.assertEqual(self.ros.sent_services, [])
@@ -1603,7 +1603,7 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(result['state'], 'executing')
         positions = self.ros.published[-1][2]['position']
         self.assertAlmostEqual(positions[0], math.degrees(.1))
-        self.assertAlmostEqual(positions[-1], math.degrees(.2))
+        self.assertAlmostEqual(positions[-1], -math.degrees(.2))
 
     def test_arm_set_blank_fields_hold_and_zero_is_a_target(self):
         self.ros.raw(q=[.1] * 20)
@@ -1619,13 +1619,13 @@ class DriverContractTests(unittest.TestCase):
         for args in ({'left_joint_1_rad': None, 'right_joint_7_rad': ' '},
                      {'left_joint_1_rad': 'ten'}, {'left_joint_1_rad': True}):
             self.assertEqual(self.call('arm', 'set', **args)['state'], 'error')
-        for action in ('left_joint_1', 'right_joint_7', 'zero'):
+        for action in ('left_joint_1', 'right_joint_7'):
             self.assertEqual(self.call('arm', action)['state'], 'error')
         self.assertFalse(self.ros.published)
 
     def test_named_leg_and_waist_targets_use_correct_lower_body_indices(self):
         self.ros.raw(q=[.1] * 20)
-        result = self.call('waist', 'waist_yaw', waist_yaw_rad=.2)
+        result = self.call('leg', 'set', waist_yaw_deg=math.degrees(.2))
         self.assertEqual(result['state'], 'executing')
         topic, _, message = self.ros.published[-1]
         self.assertEqual(topic, '/lb_leg_traj')
@@ -1647,7 +1647,7 @@ class DriverContractTests(unittest.TestCase):
         self.bundle.sensors._joint_limit_config = None
         for card, action, args in [('arm', 'set', {'left_joint_1_rad': .1}),
                                    ('leg', 'set', {'knee_deg': 1.}),
-                                   ('waist', 'zero', {})]:
+                                   ('leg', 'zero', {})]:
             result = self.call(card, action, **args)
             self.assertIn('not configured', result['error'])
         self.assertFalse(self.ros.published)
@@ -1656,7 +1656,7 @@ class DriverContractTests(unittest.TestCase):
         for card, action, args in [('arm', 'set', {}), ('leg', 'set', {}),
                                    ('arm', 'left_joint_1', {}),
                                    ('arm', 'set', {'left_joint_1_rad': 100.}),
-                                   ('waist', 'waist_pitch', {'waist_pitch_rad': float('nan')})]:
+                                   ('leg', 'set', {'waist_pitch_deg': float('nan')})]:
             self.assertEqual(self.call(card, action, **args)['state'], 'error')
         self.assertFalse(self.ros.published)
 
@@ -1671,13 +1671,14 @@ class DriverContractTests(unittest.TestCase):
         self.assertIn('stale', self.call('head', 'zero')['error'])
         self.assertFalse(self.ros.published)
 
-    def test_head_one_stamped_sample_cannot_satisfy_convergence(self):
+    def test_head_send_completes_without_claiming_measured_arrival(self):
         result = self.call('head', 'zero')
-        self.assertEqual(result['state'], 'executing')
-        self.ros.raw()
-        time.sleep(.25)
+        self.assertEqual(result['state'], 'completed')
+        self.assertFalse(result['measured_convergence'])
+        self.assertEqual(result['completion_basis'], 'absolute_command_sent')
+        self.assertFalse(self.bundle.tracker._active)
+        self.assertNotIn('action_id', result)
         self.assertFalse(self.callbacks)
-        self.assertTrue(self.bundle.tracker.current('head', result['action_id']))
 
     def test_head_uses_5w_limits_instead_of_generic_sdk_limits(self):
         tool = next(p.tool() for p in self.bundle.plugins if p.PREFIX == 'head')
@@ -1689,32 +1690,27 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(self.call('head', 'move_pos', pitch=1.)['state'], 'error')
         self.assertFalse(self.ros.published)
 
-    def test_head_timeout_reports_actual_tracking_error_and_pauses(self):
+    def test_head_tracking_offset_does_not_wait_or_claim_convergence(self):
         self.ros.raw(q=[0.] * 18 + [math.radians(6.63), 0.])
-        with patch.object(driver, 'HEAD_TIMEOUT_S', .08):
-            result = self.call('head', 'move_pos', yaw=5., pitch=0.)
-            self.assertEqual(result['state'], 'executing')
-            self.assertTrue(wait_until(lambda: self.callbacks))
-        self.assertEqual(self.callbacks[0][:3], (result['action_id'], 'head', 'error'))
-        reason = self.callbacks[0][3]['reason']
-        for detail in ('target_deg=[5.0, 0.0]', 'measured_deg=[6.63, 0.0]',
-                       'error_deg=[-1.63, 0.0]'):
-            self.assertIn(detail, reason)
-        self.assertTrue(self.bundle.state.motion_blocked)
-        self.assertFalse(self.bundle.state.confirmed_enable())
+        before = time.monotonic()
+        result = self.call('head', 'move_pos', yaw=5.)
+        self.assertLess(time.monotonic()-before, .5)
+        self.assertEqual(result['state'], 'completed')
+        self.assertFalse(result['measured_convergence'])
+        self.assertFalse(self.bundle.state.motion_blocked)
 
     def test_head_yaw_only_holds_measured_pitch(self):
         self.ros.raw(q=[0.] * 18 + [math.radians(3), math.radians(7)])
         result = self.call('head', 'move_pos', yaw=10.)
-        self.assertEqual(result['state'], 'executing')
-        self.assertAlmostEqual(result['pitch'], 7.)
+        self.assertEqual(result['state'], 'completed')
+        self.assertAlmostEqual(result['pitch'], -7.)
         self.assertEqual(self.ros.published[-1][0], '/robot_head_motion_data')
         self.assertAlmostEqual(self.ros.published[-1][2]['joint_data'][1], 7.)
 
     def test_head_pitch_only_holds_measured_yaw_and_blank_is_omitted(self):
         self.ros.raw(q=[0.] * 18 + [math.radians(9), math.radians(7)])
         result = self.call('head', 'move_pos', yaw=' ', pitch=0.)
-        self.assertEqual(result['state'], 'executing')
+        self.assertEqual(result['state'], 'completed')
         self.assertAlmostEqual(result['yaw'], 9.)
         self.assertEqual(result['pitch'], 0.)
 
@@ -1734,29 +1730,19 @@ class DriverContractTests(unittest.TestCase):
             return result
         with patch.object(self.bundle, 'confirm_control', side_effect=confirm):
             result = self.call('head', 'move_pos', yaw=10., pitch=None)
-        self.assertEqual(result['state'], 'executing')
-        self.assertAlmostEqual(result['pitch'], 5.)
+        self.assertEqual(result['state'], 'completed')
+        self.assertAlmostEqual(result['pitch'], -5.)
 
-    def test_head_feedback_loss_aborts_instead_of_time_based_success(self):
-        result = self.call('head', 'move_pos', yaw=10., pitch=0.)
-        self.bundle.sensors._seen['joints'] = time.monotonic() - 1.
-        self.assertTrue(wait_until(lambda: self.callbacks))
-        self.assertEqual(self.callbacks[0][:3], (result['action_id'], 'head', 'error'))
-        self.assertTrue(self.bundle.state.motion_blocked)
-
-    def test_head_uses_absolute_degrees_and_measured_acp(self):
+    def test_head_pitch_direction_and_immediate_acp(self):
         result = self.call('head', 'move_pos', yaw=12, pitch=4)
-        self.assertIn('action_id', result)
+        self.assertEqual(result['state'], 'completed')
         self.assertEqual(self.ros.published[1], ('/robot_head_motion_data', 'kuavo_msgs/robotHeadMotionData',
-                                                {'joint_data': [12, 4]}))
-        q = [0.] * 18 + [math.radians(12), math.radians(4)]
-        for _ in range(7):
-            self.ros.raw(q=q)
-            time.sleep(.05)
-        self.assertTrue(wait_until(lambda: self.callbacks))
-        self.assertEqual(self.callbacks[0][2], 'completed')
-        self.assertEqual(self.callbacks[0][3]['completion_basis'], 'measured_head_convergence')
-
+                                                {'joint_data': [12, -4]}))
+        self.assertEqual(result['pitch'], 4)
+        self.assertNotIn('action_id', result)
+        self.assertFalse(self.callbacks)
+        tool = next(t for t in self.bundle.get_all_tools() if t['name'] == 'head')
+        self.assertNotIn('x-completion', tool['inputSchema'])
 
     def test_slow_acp_delivery_does_not_block_stop(self):
         entered, release = threading.Event(), threading.Event()
@@ -1809,6 +1795,150 @@ class DriverContractTests(unittest.TestCase):
         self.assertTrue(self.bundle._closing)
 
 
+class CardRevisionTests(unittest.TestCase):
+    setUp = DriverContractTests.setUp
+    tearDown = DriverContractTests.tearDown
+    call = DriverContractTests.call
+
+    def vendor_model(self):
+        sensors = self.bundle.sensors
+        sensors._joint_limit_config = None
+        sensors._arm_limit_source = sensors._leg_limit_source = 'vendor_runtime'
+        self.ros.params['humanoid_description'] = (ROOT / 'resource/kuavo5w_model.urdf').read_text()
+        self.ros.params['kuavo_configuration'] = {
+            'NUM_JOINT': 20, 'NUM_ARM_JOINT': 14, 'NUM_HEAD_JOINT': 2,
+            'min_joint_position_limits': [-5.5, -161, -25, -190]+[-180.]*16,
+            'max_joint_position_limits': [83, 5.5, 181, 190]+[180.]*16}
+        sensors.discover()
+        self.ros.raw()
+
+    def test_arm_six_directions_change_only_supplied_card_commands(self):
+        values = {field: .1 for _, field, _ in driver.ArmPlugin.JOINTS.values()}
+        result = self.call('arm', 'set', **values)
+        self.assertEqual(result['state'], 'executing')
+        actual = self.ros.published[-1][2]['position']
+        for i, value in enumerate(actual):
+            self.assertAlmostEqual(value, math.degrees(-.1 if i in (0,3,6,7,10,13) else .1))
+        self.assertEqual(self.bundle.sensors.joint_positions()[0], [0.]*20)
+
+    def test_arm_zero_and_schema_transformed_asymmetric_limits(self):
+        policy = self.bundle.sensors._joint_limit_config['arm']
+        policy['lower_deg'][0], policy['upper_deg'][0] = -20., 10.
+        tool = next(t for t in self.bundle.get_all_tools() if t['name'] == 'arm')
+        field = tool['inputSchema']['properties']['left_joint_1_rad']
+        self.assertAlmostEqual(field['minimum'], math.radians(-10))
+        self.assertAlmostEqual(field['maximum'], math.radians(20))
+        self.assertIn('范围', field['description'])
+        result = self.call('arm', 'zero')
+        self.assertEqual(result['state'], 'executing')
+        self.assertEqual(self.ros.published[-1][2]['position'], [0.]*14)
+
+    def test_leg_uses_live_intersection_and_invalid_refresh_revokes_it(self):
+        self.vendor_model()
+        bounds = self.bundle.sensors.joint_bounds('leg')
+        for actual, expected in zip(bounds, [(0,83),(-161,0),(-9,171),(-180,180)]):
+            for a,b in zip(actual,expected): self.assertAlmostEqual(math.degrees(a), b, places=5)
+        self.assertEqual(self.call('leg', 'set', knee_deg=1.)['state'], 'executing')
+        self.ros.params['kuavo_configuration'] = None
+        self.bundle.sensors._retry_at = 0
+        self.bundle.sensors.tick()
+        self.bundle.sensors._thread.join(1)
+        self.assertTrue(wait_until(lambda: self.callbacks))
+        self.assertEqual(self.callbacks[0][2], 'error')
+
+    def test_height_ik_preserves_x_pitch_yaw_including_fixed_base_transform(self):
+        self.vendor_model()
+        q = [math.radians(1), math.radians(-2), math.radians(1), .2]
+        self.ros.raw(q=q+[0.]*16)
+        target, pose = self.bundle.sensors.height_target(1.02, with_pose=True)
+        def fk(q):
+            a,b,c = q[:3]
+            return (.093-.46521*math.cos(a)+.18325*math.sin(a)
+                    +.48296*math.cos(a+b)+.12941*math.sin(a+b)+.25*math.sin(a+b+c),
+                    .40635+.46521*math.sin(a)+.18325*math.cos(a)
+                    -.48296*math.sin(a+b)+.12941*math.cos(a+b)+.25*math.cos(a+b+c))
+        self.assertAlmostEqual(fk(q)[0], fk(target)[0])
+        self.assertAlmostEqual(fk(target)[1], 1.02)
+        self.assertAlmostEqual(sum(q[:3]),sum(target[:3]))
+        self.assertAlmostEqual(target[3], q[3])
+        result = self.call('leg', 'set_height', height=1.02)
+        self.assertEqual(result['state'], 'executing')
+        self.assertEqual(self.ros.published[-1][0], '/cmd_lb_torso_pose')
+        self.assertAlmostEqual(self.ros.published[-1][2]['linear']['z'], 1.02)
+        self.assertAlmostEqual(self.ros.published[-1][2]['linear']['x'], fk(q)[0])
+
+    def test_height_rejects_unreachable_or_unknown_geometry_without_enabling(self):
+        self.vendor_model()
+        self.assertEqual(self.call('leg', 'set_height', height=.74)['state'], 'error')
+        self.assertFalse(self.ros.published)
+        self.assertFalse(self.ros.sent_services)
+        self.ros.params['humanoid_description'] = self.ros.params['humanoid_description'].replace(
+            'xyz="-0.46521 0 0.18325"', 'xyz="-0.46521 0.01 0.18325"')
+        self.bundle.sensors.discover();self.ros.raw()
+        self.assertIn('unsupported', self.call('leg', 'set_height', height=1.)['error'])
+
+    def test_continuous_move_keeps_heartbeat_until_stop_and_angles_are_degrees(self):
+        result = self.call('base_drive', 'move', vx=.1, vyaw=10., duration=-1)
+        self.assertEqual(result['state'], 'running')
+        self.assertNotIn('expected_duration_s', result)
+        self.assertNotIn('action_id', result)
+        self.assertTrue(result['continuous'])
+        time.sleep(.15)
+        self.assertGreaterEqual(len(self.ros.published), 2)
+        self.assertAlmostEqual(self.ros.published[-1][2]['angular']['z'], math.radians(10.))
+        self.assertFalse(self.callbacks)
+        self.assertEqual(self.call('base_drive', 'stop_move')['state'], 'paused')
+        boundary = len(self.ros.published);time.sleep(.1)
+        self.assertEqual(len(self.ros.published), boundary)
+        schema = next(t for t in self.bundle.get_all_tools() if t['name']=='base_drive')['inputSchema']
+        self.assertEqual(schema['x-completion']['timeout'], 125)
+        self.assertNotIn('background', schema['x-completion'])
+        self.assertFalse(self.callbacks)
+
+    def test_position_profiles_limit_actual_velocity_and_relative_frame(self):
+        for speed, vmax, wmax in [('low', .1, 10),('medium', .2, 20),('high', .3, math.degrees(.5))]:
+            with self.subTest(speed=speed):
+                self.bundle.sensors.odom_pose = lambda: ((2.,3.,math.pi/2), time.time(), 'odom')
+                result = self.call('base_drive','move_relative',x=1.,y=0.,yaw=90.,speed=speed)
+                self.assertEqual(result['state'], 'executing')
+                self.assertTrue(wait_until(lambda: any(abs(p[2]['linear']['x'])>.001 for p in self.ros.published if p[0]=='/cmd_vel')))
+                command = self.ros.published[-1][2]
+                self.assertGreater(command['linear']['x'], 0)
+                self.assertAlmostEqual(command['linear']['y'],0.,places=6)
+                self.assertLessEqual(math.hypot(command['linear']['x'],command['linear']['y']),vmax+1e-9)
+                self.assertLessEqual(abs(command['angular']['z']),math.radians(wmax)+1e-9)
+                self.call('base_drive','stop_move');self.ros.raw();self.ros.published.clear()
+
+    def test_absolute_target_uses_odom_frame_and_feedback_loss_stops(self):
+        self.bundle.sensors.odom_pose = lambda: ((2.,3.,math.pi/2), time.time(), 'odom')
+        result = self.call('base_drive','move_to',x=3.,y=3.,yaw=90.)
+        self.assertEqual(result['state'],'executing')
+        self.assertTrue(wait_until(lambda: len(self.ros.published)>1))
+        self.assertLess(self.ros.published[-1][2]['linear']['y'],0.)
+        self.bundle.sensors.odom_pose = lambda: (_ for _ in ()).throw(RuntimeError('stale odometry'))
+        self.assertTrue(wait_until(lambda:self.callbacks))
+        self.assertEqual(self.callbacks[0][2],'error')
+        self.assertTrue(self.bundle.state.motion_blocked)
+
+    def test_pose_repeated_capture_cannot_complete_but_distinct_samples_can(self):
+        capture = time.time()
+        self.bundle.sensors.odom_pose = lambda: ((0.,0.,0.), capture, 'odom')
+        result = self.call('base_drive','move_to',x=0.,y=0.,yaw=0.)
+        self.assertEqual(result['state'],'executing')
+        time.sleep(.36)
+        self.assertFalse(self.callbacks)
+        self.assertTrue(self.bundle.tracker.current('base',result['action_id']))
+        self.bundle.sensors.odom_pose = lambda: ((0.,0.,0.), time.time(), 'odom')
+        self.assertTrue(wait_until(lambda:self.callbacks))
+        self.assertEqual(self.callbacks[0][2],'completed')
+        self.assertTrue(self.callbacks[0][3]['measured_convergence'])
+
+    def test_pose_requires_fresh_stamped_odom_before_resume(self):
+        self.assertIn('odometry',self.call('base_drive','move_to',x=0.,y=0.,yaw=0.)['error'])
+        self.assertFalse(self.ros.sent_services)
+        self.assertFalse(self.ros.published)
+
+
 class MotionConfigurationTests(unittest.TestCase):
     def test_explicit_disable_blocks_motion_and_enable_but_preserves_reads_and_pause(self):
         ros = FakeRos1()
@@ -1828,7 +1958,6 @@ class MotionConfigurationTests(unittest.TestCase):
                              right_position=[0, -.4, 0], left_quaternion=[0, 0, 0, 1],
                              right_quaternion=[0, 0, 0, 1])),
                 ('leg', dict(action='move_joints', positions=[0.] * 4)),
-                ('waist', dict(action='set_pose', x=0, z=.8, pitch=0, yaw=0)),
                 ('head', dict(action='move_pos', yaw=0., pitch=0.)),
             ]
             for name, args in cases:

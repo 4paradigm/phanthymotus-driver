@@ -41,7 +41,71 @@ def dispatch_service_class(service_class, server_md5):
                 '_md5sum': expected, '_request_class': request_class, '_response_class': response_class})
 
 
+def configure_motion_music(enabled, directory=Path.home() / 'jmap_config/music'):
+    """Replace only the verified ID-1 movement track with valid silent MP3.
+
+    Preserve the original and its digest; never mute a sink, stop the factory
+    manager, or alter ID-2 alarm / standby / TTS files. An unknown or externally
+    edited layout is reported, not overwritten.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    if type(enabled) is not bool:
+        raise ValueError('motion_music_enabled_must_be_boolean')
+    track = directory / '1_flower.mp3'
+    backup = directory / '.motus-motion-music'
+    original, silent, record = [backup / n for n in ('original.mp3', 'silent.mp3', 'identity.json')]
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    if track.is_symlink() or not track.is_file() or not 0 < track.stat().st_size < 4_000_000:
+        return {'state': 'unsupported', 'reason': 'factory_id1_movement_track_not_found'}
+    if record.is_file():
+        identity = json.loads(record.read_text())
+        if (not original.is_file() or not silent.is_file() or
+                digest(original) != identity['original'] or digest(silent) != identity['silent'] or
+                digest(track) not in (identity['original'], identity['silent'])):
+            return {'state': 'blocked', 'reason': 'movement_track_changed_by_operator'}
+    elif enabled:
+        return {'state': 'enabled', 'changed': False}
+    else:
+        ffmpeg = shutil.which('ffmpeg')
+        if not ffmpeg:
+            return {'state': 'unsupported', 'reason': 'existing_ffmpeg_required_no_package_installed'}
+        backup.mkdir(mode=0o700, exist_ok=True)
+        if original.exists() or silent.exists():
+            return {'state': 'blocked', 'reason': 'incomplete_movement_music_backup'}
+        shutil.copyfile(track, original)
+        try:
+            subprocess.run([ffmpeg, '-nostdin', '-v', 'error', '-f', 'lavfi', '-i',
+                            'anullsrc=r=44100:cl=stereo', '-t', '1', '-codec:a', 'libmp3lame',
+                            '-q:a', '9', str(silent)], check=True, timeout=8,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except (OSError, subprocess.SubprocessError):
+            original.unlink(missing_ok=True)
+            silent.unlink(missing_ok=True)
+            return {'state': 'unsupported', 'reason': 'existing_ffmpeg_cannot_encode_silent_mp3'}
+        identity = {'original': digest(original), 'silent': digest(silent)}
+        record.write_text(json.dumps(identity))
+    chosen = original if enabled else silent
+    changed = digest(track) != digest(chosen)
+    if changed:
+        mode = track.stat().st_mode & 0o777
+        with tempfile.NamedTemporaryFile(dir=directory, prefix='.motus-music-', delete=False) as temporary:
+            temporary.write(chosen.read_bytes())
+            temporary_path = Path(temporary.name)
+        try:
+            temporary_path.chmod(mode)
+            os.replace(temporary_path, track)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+    return {'state': 'enabled' if enabled else 'disabled', 'changed': changed,
+            'scope': 'factory_id1_movement_track_only', 'other_audio_unchanged': True,
+            'active_playback_may_finish': True}
+
+
 def main(request):
+    if request['operation'] == 'motion_music':
+        return configure_motion_music(request.get('args', {}).get('enabled', False))
     if request['operation'] == 'map_identity':
         name = request.get('args', {}).get('map_name')
         if (not isinstance(name, str) or not name or len(name) > 80

@@ -36,7 +36,6 @@ DISPATCH_LOCK_TIMEOUT_S = 0.25
 ENABLE_LEASE_S = 3.0
 ENABLE_PROBE_INTERVAL_S = 1.0
 ENABLE_TOPIC = '/enable_control_state'
-HEAD_TIMEOUT_S = 20.
 # Kuavo v63 kuavo.json has narrower yaw limits than the generic SDK (80 deg).
 # Keep the 5-W card inside this conservative envelope, including held axes.
 HEAD_LIMITS_DEG = (('yaw', -30, 30), ('pitch', -25, 25))
@@ -356,6 +355,7 @@ class ActionTracker:
     def __init__(self):
         self.lock = threading.RLock()
         self._active = {}
+        self._no_completion = set()
         self._closed = False
         self._callbacks = queue.Queue()
         self._worker = threading.Thread(target=self._deliver, daemon=True, name="acp-callbacks")
@@ -373,12 +373,14 @@ class ActionTracker:
             finally:
                 self._callbacks.task_done()
 
-    def begin(self, channel: str, tool: str):
+    def begin(self, channel: str, tool: str, notify=True):
         with self.lock:
             if channel in self._active:
                 raise RuntimeError(f"{channel} is busy; wait for ACP or stop it first")
             action_id, cancelled = f"kuavo_{tool}_{uuid4().hex}", threading.Event()
             self._active[channel] = (action_id, tool, cancelled)
+            if not notify:
+                self._no_completion.add(action_id)
             return action_id, cancelled
 
     def current(self, channel, action_id):
@@ -390,7 +392,10 @@ class ActionTracker:
             if self.current(channel, action_id):
                 active = self._active.pop(channel)
                 active[2].set()
-                self._callbacks.put((action_id, tool, status, result))
+                if action_id in self._no_completion:
+                    self._no_completion.discard(action_id)
+                else:
+                    self._callbacks.put((action_id, tool, status, result))
 
     def cancel(self, channel, reason, status="cancelled"):
         with self.lock:
@@ -398,13 +403,19 @@ class ActionTracker:
             if active:
                 aid, tool, event = active
                 event.set()
-                self._callbacks.put((aid, tool, status, {"reason": reason, "channel": channel}))
+                if aid in self._no_completion:
+                    self._no_completion.discard(aid)
+                else:
+                    self._callbacks.put((aid, tool, status, {"reason": reason, "channel": channel}))
 
     def cancel_all(self, reason, status="cancelled"):
         with self.lock:
             for channel, (aid, tool, event) in list(self._active.items()):
                 event.set()
-                self._callbacks.put((aid, tool, status, {"reason": reason, "channel": channel}))
+                if aid in self._no_completion:
+                    self._no_completion.discard(aid)
+                else:
+                    self._callbacks.put((aid, tool, status, {"reason": reason, "channel": channel}))
             self._active.clear()
 
     def close(self):
@@ -491,8 +502,10 @@ class _KuavoPlugin:
                 self.stop()
                 return {"state": "idle"}
             if action == "info":
-                return {"state": "ready" if self.ros1.connection[0] else "disconnected",
+                startup = self.bundle.spatial.startup_status() if self.PREFIX == "base_drive" else {}
+                return {"state": startup.get("state") if startup.get("state") in ("loading", "error") else "ready" if self.ros1.connection[0] else "disconnected",
                         "motion_enabled": self.state.motion_enabled,
+                        "startup": self.bundle.spatial.startup_status() if self.PREFIX == "base_drive" else None,
                         "feedback": {**self.state.snapshot(),
                                      "host_runtime": dict(self.bundle.startup_checks.status)}}
             # Control services wait outside the motion lock. Stops never take
@@ -604,8 +617,8 @@ class _KuavoPlugin:
     def _timed_velocity(self, duration, send, zero, stop_delay):
         aid, cancelled, generation, _, preparation = self.bundle.start_motion(
             self.CHANNEL, self.PREFIX, self.ALLOWED_MODES, send,
-            request_epoch=self._request_context.stop_epoch)
-        deadline = time.monotonic() + duration
+            request_epoch=self._request_context.stop_epoch, notify=duration != -1)
+        deadline = float('inf') if duration == -1 else time.monotonic() + duration
 
         def worker():
             try:
@@ -639,48 +652,115 @@ class _KuavoPlugin:
             except Exception as exc:
                 self.bundle.pause(_safe_log(str(exc)), status="error", expected=(self.CHANNEL, aid))
         threading.Thread(target=worker, daemon=True, name=f"velocity-{self.PREFIX}").start()
-        return {"state": "executing", "action_id": aid, "duration_s": duration,
+        return {"state": "running" if duration == -1 else "executing",
+                **({"continuous": True} if duration == -1 else {"action_id": aid}), "duration_s": duration,
+                **({"expected_duration_s": duration + stop_delay} if duration != -1 else {}),
                 'control_preparation': preparation,
-                "completion_basis": "command_duration_and_vendor_watchdog"}
+                "completion_basis": "continuous_until_stop" if duration == -1 else "command_duration_and_vendor_watchdog"}
 
 
 class BaseDrivePlugin(_KuavoPlugin):
     PREFIX, CHANNEL, ALLOWED_MODES = "base_drive", "base", (2, 3)
 
     def start(self):
-        return {"state": "ready", "chassis_preparation": self.bundle.spatial.prepare_chassis()}
+        return self.bundle.spatial.start_chassis()
 
     def tool(self):
-        return self.schema("Kuavo 5-W 轮式底盘：有界速度、相对/世界位姿。stop_move 使用全身软件暂停防止位置目标续行。", {
+        tool = self.schema("Kuavo 5-W 轮式底盘；vx/vy ±0.3 m/s，旋转 ±28.6479 deg/s；位姿动作不含避障，避障请用controlled_spatial。", {
             "vx": {"type": "number", "minimum": -0.3, "maximum": 0.3, "description": "本体前向速度 m/s，驱动保守上限"},
             "vy": {"type": "number", "minimum": -0.3, "maximum": 0.3, "description": "本体左向速度 m/s，驱动保守上限"},
-            "vyaw": {"type": "number", "minimum": -0.5, "maximum": 0.5, "description": "逆时针角速度 rad/s，驱动保守上限"},
-            "duration": {"type": "number", "minimum": 0.1, "maximum": 10},
-            "x": {"type": "number", "description": "相对位移/世界 X 米"},
+            "vyaw": {"type": "number", "minimum": -math.degrees(.5), "maximum": math.degrees(.5), "description": "逆时针角速度 deg/s；范围 ±28.6478897565 deg/s"},
+            "duration": {"type": "number", "description": "持续秒数0.1–10；-1持续至stop_move", "minimum": -1, "maximum": 10},
+            "speed": {"type": "string", "enum": ["low", "medium", "high"], "default": "low", "description": "位姿速度上限：low=0.1m/s及10deg/s，medium=0.2及20，high=0.3及28.6479"},
+            "x": {"type": "number", "description": "相对机身X位移/odom绝对X，米"},
             "y": {"type": "number", "description": "相对位移/世界 Y 米"},
-            "yaw": {"type": "number", "description": "相对/世界 yaw 弧度"},
-        }, {"move": (["vx", "vy", "vyaw", "duration"], "本体速度运动，到时发零速度并等待文档的 1s 停止窗口"),
-            "move_relative": (["x", "y", "yaw"], "相对当前位置的位姿目标"),
-            "move_to": (["x", "y", "yaw"], "启动世界系的绝对位姿目标"),
+            "yaw": {"type": "number", "description": "相对/odom绝对 yaw，度"},
+        }, {"move": (["vx", "vy", "vyaw", "duration"], "本体速度运动；duration=-1持续至stop_move，否则到时发零速度并等待1s停止窗口"),
+            "move_relative": (["x", "y", "yaw", "speed"], "相对执行开始时机身的位移及转角；米/度，里程计闭环，无避障"),
+            "move_to": (["x", "y", "yaw", "speed"], "odom系绝对位置及朝向；米/度，里程计闭环，无避障"),
             "stop_move": ([], "发零速并请求全身软件暂停；下一次新动作自动准备控制")},
             "base", ("move", "move_relative", "move_to"),
             required={"move": ["duration"], "move_relative": ["x", "y", "yaw"], "move_to": ["x", "y", "yaw"]})
+        return tool
 
     def _dispatch(self, action, args):
         if action == "move":
             vx = _number(args.get("vx", 0), "vx", -0.3, 0.3)
             vy = _number(args.get("vy", 0), "vy", -0.3, 0.3)
-            vyaw = _number(args.get("vyaw", 0), "vyaw", -0.5, 0.5)
-            duration = _number(args.get("duration"), "duration", 0.1, 10)
+            vyaw = math.radians(_number(args.get("vyaw", 0), "vyaw", -math.degrees(.5), math.degrees(.5)))
+            duration = _number(args.get("duration"), "duration")
+            if duration != -1 and not .1 <= duration <= 10:
+                raise ValueError("duration must be -1 or between 0.1 and 10 seconds")
             return self._timed_velocity(duration,
                 lambda: self.bundle.twist("/cmd_vel", x=vx, y=vy, yaw=vyaw),
                 lambda: self.bundle.twist("/cmd_vel"), 1.0)
         if action in ("move_relative", "move_to"):
             x, y, yaw = [_number(args.get(k), k) for k in ("x", "y", "yaw")]
-            topic = "/cmd_pose" if action == "move_relative" else "/cmd_pose_world"
-            return self._async_reach("base_reach_time",
-                lambda: self.bundle.twist(topic, x=x, y=y, yaw=yaw))
+            yaw = math.radians(yaw)
+            speed = args.get('speed', 'low')
+            if speed not in ('low', 'medium', 'high'):
+                raise ValueError('speed must be low, medium or high')
+            return self._pose_move(action, x, y, yaw, speed)
         raise ValueError(f"unknown action: {action}")
+
+    def _pose_move(self, action, x, y, yaw, speed):
+        linear, angular = {'low': (.1, math.radians(10)), 'medium': (.2, math.radians(20)),
+                           'high': (.3, .5)}[speed]
+        target, frame = [], []
+        def validate():
+            pose, _, source = self.bundle.sensors.odom_pose()
+            px, py, pa = pose
+            target[:] = ([px+math.cos(pa)*x-math.sin(pa)*y,
+                          py+math.sin(pa)*x+math.cos(pa)*y, pa+yaw]
+                         if action == 'move_relative' else [x, y, yaw])
+            frame[:] = [source]
+            if math.hypot(target[0]-px, target[1]-py) > 5:
+                raise ValueError('pose displacement exceeds 5m; use controlled_spatial navigation')
+        aid, cancelled, generation, issued, preparation = self.bundle.start_motion(
+            self.CHANNEL, self.PREFIX, self.ALLOWED_MODES,
+            lambda: self.bundle.twist('/cmd_vel'), validate,
+            request_epoch=self._request_context.stop_epoch)
+        def worker():
+            settled = last_capture = None
+            try:
+                while not cancelled.wait(.05):
+                    with self.tracker.lock:
+                        if not self.tracker.current(self.CHANNEL, aid):
+                            return
+                        self.state.require_motion(self.ALLOWED_MODES)
+                        if self.ros1.connection != (True, generation):
+                            raise ConnectionError('connection changed during pose motion')
+                        if time.monotonic()-issued > 110:
+                            raise TimeoutError('pose motion exceeded 110s')
+                        pose, captured, source = self.bundle.sensors.odom_pose()
+                        if source != frame[0]:
+                            raise RuntimeError('odometry frame changed during pose motion')
+                        dx, dy = target[0]-pose[0], target[1]-pose[1]
+                        da = math.atan2(math.sin(target[2]-pose[2]), math.cos(target[2]-pose[2]))
+                        distance = math.hypot(dx, dy)
+                        close = distance <= .02 and abs(da) <= math.radians(1)
+                        if close:
+                            self.bundle.twist('/cmd_vel')
+                            if last_capture is None or captured > last_capture:
+                                if settled is None:
+                                    settled = (captured, time.monotonic())
+                                elif captured-settled[0] >= .3 and time.monotonic()-settled[1] >= .3:
+                                    self.tracker.finish(self.CHANNEL, aid, self.PREFIX, 'completed', {
+                                        'completion_basis': 'measured_odometry_convergence', 'measured_convergence': True})
+                                    return
+                        else:
+                            settled = None
+                            scale = min(.8, linear/distance) if distance else 0.
+                            vx = scale*(math.cos(pose[2])*dx+math.sin(pose[2])*dy)
+                            vy = scale*(-math.sin(pose[2])*dx+math.cos(pose[2])*dy)
+                            self.bundle.twist('/cmd_vel', x=vx, y=vy, yaw=max(-angular,min(angular,.8*da)))
+                        last_capture = captured
+            except Exception as exc:
+                self.bundle.pause(_safe_log(str(exc)), status='error', expected=(self.CHANNEL, aid))
+        threading.Thread(target=worker, daemon=True, name='base-pose-feedback').start()
+        return {'state': 'executing', 'action_id': aid, 'control_preparation': preparation,
+                'speed': speed, 'linear_limit_m_s': linear, 'angular_limit_deg_s': math.degrees(angular),
+                'completion_basis': 'measured_odometry_convergence', 'expected_duration_s': 115}
 
 
 class ArmPlugin(_KuavoPlugin):
@@ -690,17 +770,37 @@ class ArmPlugin(_KuavoPlugin):
               for side, offset, label, letter in [('left', 0, '左', 'l'), ('right', 7, '右', 'r')]
               for i in range(1, 8)}
 
+    REVERSED = frozenset((0, 3, 6, 7, 10, 13))
+
     def tool(self):
-        fields = {field: {'type': 'number', 'description': label + '绝对角度 rad；不填时保持实测角度'}
-                  for _, field, label in self.JOINTS.values()}
-        return self.schema('Kuavo 5-W 双臂set：同时设置部分或全部14关节绝对角度rad；未填写关节保持实测位置。需现场核验限位。',
-            fields, {'set': (list(fields), '同时设置双臂关节，rad；至少填写一个，未填保持当前实测角度'),
-                     'stop_move': ([], '请求全身软件暂停')}, ['arm_l', 'arm_r'], ('set',))
+        fields = {}
+        try:
+            bounds = self.bundle.sensors.joint_bounds('arm')
+        except (RuntimeError, ValueError):
+            bounds = None
+        for i, field, label in self.JOINTS.values():
+            description = label + '绝对角度 rad；不填保持实测位置'
+            entry = {'type': 'number'}
+            if bounds:
+                low, high = bounds[i]
+                if i in self.REVERSED:
+                    low, high = -high, -low
+                entry.update(minimum=low, maximum=high)
+                description += f'；范围[{low:.6g}, {high:.6g}] rad（[{math.degrees(low):.3f}, {math.degrees(high):.3f}]度）'
+            else:
+                description += '；范围等待实时模型/控制器限位核验，未核验时拒绝执行'
+            fields[field] = {**entry, 'description': description}
+        return self.schema('Kuavo 5-W 双臂绝对角度rad；关节1/4/7使用卡片方向，原始joint_state不变。',
+            fields, {'set': (list(fields), '同时设置双臂关节；未填保持当前实测角度'),
+                     'zero': ([], '全部14个手臂关节归零'),
+                     'stop_move': ([], '请求全身软件暂停')}, ['arm_l', 'arm_r'], ('set', 'zero'))
 
     def _dispatch(self, action, args):
-        if action == 'set':
-            updates = {i: _number(args[field], field) for i, field, _ in self.JOINTS.values()
-                       if _angle_supplied(args, field)}
+        if action in ('set', 'zero'):
+            updates = {i: (0. if action == 'zero' else
+                           (-1 if i in self.REVERSED else 1) * _number(args[field], field))
+                       for i, field, _ in self.JOINTS.values()
+                       if action == 'zero' or _angle_supplied(args, field)}
             if not updates:
                 raise ValueError('set requires at least one absolute joint angle; omitted joints keep their measured positions')
             return self._joint_set(updates)
@@ -736,7 +836,7 @@ class ArmPlugin(_KuavoPlugin):
 
 
 class LowerBodyPlugin(_KuavoPlugin):
-    CHANNEL = "lower_body"
+    CHANNEL, ALLOWED_MODES = "lower_body", (3,)
     FIELDS = {'knee_deg': (0, '膝关节knee_joint'), 'leg_deg': (1, '腿关节leg_joint'),
               'waist_pitch_deg': (2, '腰俯仰waist_pitch_joint'), 'waist_yaw_deg': (3, '腰偏航waist_yaw_joint')}
 
@@ -746,43 +846,34 @@ class LowerBodyPlugin(_KuavoPlugin):
 
     def tool(self):
         if self.PREFIX == "leg":
-            return self.schema("Kuavo 5-W 下肢4关节目标，度；与 waist 共享控制通道。", {
+            return self.schema("Kuavo 5-W 下肢含膝、腿、腰俯仰/偏航；set_height保持躯干前后位置和俯仰，协调前三关节升降。", {
                 **{field: {'type': 'number', 'description': label + '绝对角度，度；set省略时保持实测值'}
                    for field, (_, label) in self.FIELDS.items()},
+                "height": {"type": "number", "minimum": .74, "maximum": 1.06, "description": "waist_yaw_link相对底盘的绝对高度m，0.74–1.06；不可达时拒绝"},
                 "positions": _array_schema(4, "四个下肢关节目标角度，度")}, {
+                'set_height': (['height'], '协调膝、腿、腰俯仰垂直升降，保持当前躯干x/俯仰和腰偏航'),
                 'set': (list(self.FIELDS), '按名称设置部分/全部下肢关节绝对角度，度；至少填写一个'),
                 'zero': ([], '四个下肢关节归零，包含腰部；需现场核验限位'),
                 "move_joints": (["positions"], "设置四个下肢关节角度，需配置现场核验的关节限位"),
-                "stop_move": ([], "请求全身软件暂停")}, "lower_body", ('set', 'zero', "move_joints"),
-                required={"move_joints": ["positions"]})
-        return self.schema("Kuavo 5-W 腰部绝对关节角度rad，与leg共享通道；另保留躯干相对底盘位姿接口。", {
-            'waist_pitch_rad': {'type': 'number', 'description': '腰俯仰关节绝对角度rad'},
-            'waist_yaw_rad': {'type': 'number', 'description': '腰偏航关节绝对角度rad'},
-            "x": {"type": "number", "description": "相对底盘 X 米"},
-            "z": {"type": "number", "description": "相对底盘 Z 米"},
-            "pitch": {"type": "number", "description": "俯仰弧度"},
-            "yaw": {"type": "number", "description": "偏航弧度"}}, {
-            'waist_pitch': (['waist_pitch_rad'], '设置腰俯仰绝对关节角度rad，需下肢核验限位'),
-            'waist_yaw': (['waist_yaw_rad'], '设置腰偏航绝对关节角度rad，需下肢核验限位'),
-            'zero': ([], '仅腰俯仰/偏航归零，保留腿部当前角度'),
-            "set_pose": (["x", "z", "pitch", "yaw"], "设置躯干完整有效位姿"),
-            "stop_move": ([], "请求全身软件暂停")}, "lower_body", ('waist_pitch', 'waist_yaw', 'zero', "set_pose"),
-            required={'waist_pitch': ['waist_pitch_rad'], 'waist_yaw': ['waist_yaw_rad'],
-                      "set_pose": ["x", "z", "pitch", "yaw"]})
-
+                "stop_move": ([], "请求全身软件暂停")}, "lower_body", ('set', 'zero', 'set_height', "move_joints"),
+                required={"move_joints": ["positions"], "set_height": ["height"]})
     def _dispatch(self, action, args):
+        if self.PREFIX == 'leg' and action == 'set_height':
+            height = _number(args.get('height'), 'height', .74, 1.06)
+            target, torso = [0.] * 4, {}
+            def validate():
+                candidate, pose = self.bundle.sensors.height_target(height, with_pose=True)
+                target[:] = candidate
+                torso.update(pose)
+                return self.bundle.sensors.validate_joint_target('leg', target)
+            return self._async_reach('torso_reach_time',
+                lambda: self.bundle.twist('/cmd_lb_torso_pose', **torso),
+                joint_target=(0, target), joint_card='leg', preflight=validate)
         if self.PREFIX == 'leg' and action in ('set', 'zero'):
             updates = {i: 0. if action == 'zero' else math.radians(_number(args[field], field))
                        for field, (i, _) in self.FIELDS.items() if action == 'zero' or field in args}
             if not updates:
                 raise ValueError('set requires at least one named joint angle')
-            return self._joint_set(updates, 'leg')
-        if self.PREFIX == 'waist' and action in ('waist_pitch', 'waist_yaw', 'zero'):
-            if action == 'zero':
-                updates = {2: 0., 3: 0.}
-            else:
-                field = action + '_rad'
-                updates = {2 if action == 'waist_pitch' else 3: _number(args.get(field), field)}
             return self._joint_set(updates, 'leg')
         if self.PREFIX == "leg" and action == "move_joints":
             positions = _vector(args.get("positions"), 4, "positions")
@@ -792,10 +883,6 @@ class LowerBodyPlugin(_KuavoPlugin):
                     "name": [f"joint{i}" for i in range(1, 5)],
                     "position": positions, "velocity": [], "effort": []}),
                 joint_target=(0, [math.radians(v) for v in positions]))
-        if self.PREFIX == "waist" and action == "set_pose":
-            values = {k: _number(args.get(k), k) for k in ("x", "z", "pitch", "yaw")}
-            return self._async_reach("torso_reach_time", lambda: self.bundle.twist(
-                "/cmd_lb_torso_pose", **values))
         raise ValueError(f"unknown action: {action}")
 
 
@@ -803,17 +890,17 @@ class HeadPlugin(_KuavoPlugin):
     PREFIX, CHANNEL = "head", "head"
 
     def tool(self):
-        return self.schema("Kuavo 5-W 头部绝对角度，单位度；yaw/pitch两自由度，使用实测到位确认ACP。", {
+        return self.schema("Kuavo 5-W 头部绝对角度，单位度；yaw/pitch两自由度，同步返回命令已发送，不表示实测到位。", {
             'yaw': {'type': 'number', 'minimum': -30, 'maximum': 30, 'description': '偏航绝对角度，度；不填保持当前实测角度'},
-            'pitch': {'type': 'number', 'minimum': -25, 'maximum': 25, 'description': '俯仰绝对角度，度；不填保持当前实测角度'},
+            'pitch': {'type': 'number', 'minimum': -25, 'maximum': 25, 'description': '俯仰绝对角度，度；正值向上，范围[-25,25]；不填保持当前实测角度'},
         }, {'move_pos': (['yaw', 'pitch'], '设置头部绝对角度，度；至少填一个，未填保持当前角度'),
             'zero': ([], '头部yaw/pitch绝对角度归零'),
-            'stop_move': ([], '请求全身软件暂停')}, 'head', ('move_pos', 'zero'))
+            'stop_move': ([], '请求全身软件暂停')}, 'head')
 
     def _dispatch(self, action, args):
         if action not in ('move_pos', 'zero'):
             raise ValueError(f'unknown action: {action}; use move_pos with absolute yaw/pitch in degrees')
-        updates = {i: 0. if action == 'zero' else _number(args[field], field, low, high)
+        updates = {i: 0. if action == 'zero' else (-1 if i == 1 else 1) * _number(args[field], field, low, high)
                    for i, (field, low, high) in enumerate(HEAD_LIMITS_DEG)
                    if action == 'zero' or _angle_supplied(args, field)}
         if not updates:
@@ -838,47 +925,15 @@ class HeadPlugin(_KuavoPlugin):
             self.CHANNEL, self.PREFIX, self.ALLOWED_MODES, publish,
             validate, request_epoch=self._request_context.stop_epoch)
 
-        def worker():
-            converged_since_ns = converged_since_at = last_capture_ns = None
-            deadline = issued + HEAD_TIMEOUT_S
-            while not cancelled.wait(.02):
-                try:
-                    with self.tracker.lock:
-                        if not self.tracker.current(self.CHANNEL, aid):
-                            return
-                        self.state.require_motion(self.ALLOWED_MODES)
-                        if self.ros1.connection[1] != generation:
-                            raise ConnectionError('connection changed during head motion')
-                        q, measured_at, capture_ns = self.bundle.sensors.joint_positions()
-                        if time.monotonic() >= deadline:
-                            measured_deg = [round(math.degrees(v), 3) for v in q[18:20]]
-                            error_deg = [round(a - b, 3) for a, b in zip(target_deg, measured_deg)]
-                            raise TimeoutError(
-                                f'head absolute target did not converge within {HEAD_TIMEOUT_S:g}s; '
-                                f'target_deg={[round(v, 3) for v in target_deg]}; '
-                                f'measured_deg={measured_deg}; error_deg={error_deg}')
-                        if measured_at < issued or (last_capture_ns is not None and capture_ns <= last_capture_ns):
-                            continue
-                        last_capture_ns = capture_ns
-                        close = all(abs(a - b) <= math.radians(1.) for a, b in zip(q[18:20], target))
-                        if not close:
-                            converged_since_ns = converged_since_at = None
-                        elif converged_since_ns is None:
-                            converged_since_ns = capture_ns
-                            converged_since_at = measured_at
-                        elif (capture_ns - converged_since_ns >= 200_000_000
-                              and measured_at - converged_since_at >= .2):
-                            self.tracker.finish(self.CHANNEL, aid, self.PREFIX, 'completed', {
-                                'completion_basis': 'measured_head_convergence', 'measured_convergence': True,
-                                'yaw': target_deg[0], 'pitch': target_deg[1], 'units': 'deg'})
-                            return
-                except Exception as exc:
-                    self.bundle.pause(_safe_log(str(exc)), status='error', expected=(self.CHANNEL, aid))
-                    return
-        threading.Thread(target=worker, daemon=True, name='acp-head-position').start()
-        return {'state': 'executing', 'action_id': aid, 'control_preparation': preparation,
-                'completion_basis': 'measured_head_convergence', 'yaw': target_deg[0],
-                'pitch': target_deg[1], 'units': 'deg'}
+        result = {'completion_basis': 'absolute_command_sent', 'measured_convergence': False,
+                  'yaw': target_deg[0], 'pitch': -target_deg[1], 'units': 'deg'}
+        with self.tracker.lock:
+            if self.tracker.current(self.CHANNEL, aid):
+                # Synchronous command acceptance has no pending ACP. Sending
+                # a callback here could race Agent Core's pending registration.
+                active = self.tracker._active.pop(self.CHANNEL)
+                active[2].set()
+        return {'state': 'completed', 'control_preparation': preparation, **result}
 
 
 class KuavoBundle:
@@ -920,7 +975,7 @@ class KuavoBundle:
         self._remote_mode = None
         self._stop_epoch = 0
         self.plugins = [BaseDrivePlugin(self), ArmPlugin(self), LowerBodyPlugin(self),
-                        LowerBodyPlugin(self, "waist"), HeadPlugin(self)]
+                        HeadPlugin(self)]
         self.spatial = ControlledSpatialPlugin(self, config.get('controlled_spatial', {}))
         if "plugins" in config:
             plugin_config = dict(config['plugins'])
@@ -930,11 +985,11 @@ class KuavoBundle:
             plugin_config.pop('loco', None)
             self._enabled = {name for name, cfg in plugin_config.items() if cfg.get('enabled', True)}
         else:
-            self._enabled = {"base_drive", "controlled_spatial", "arm", "leg", "waist", "head", "speaker",
+            self._enabled = {"base_drive", "controlled_spatial", "arm", "leg", "head", "speaker",
                              *SENSOR_CARDS, *PERIPHERAL_CARDS}
         aliases = {'loco': 'base_drive', 'camera_rgb': 'camera_left', 'camera_rgb_right': 'camera_right'}
-        self._enabled = {aliases.get(name, name) for name in self._enabled if name not in ('state', 'switch_mode')}
-        self._auto_start = [aliases.get(name, name) for name in self._auto_start if name not in ('state', 'switch_mode')]
+        self._enabled = {aliases.get(name, name) for name in self._enabled if name not in ('state', 'switch_mode', 'waist')}
+        self._auto_start = [aliases.get(name, name) for name in self._auto_start if name not in ('state', 'switch_mode', 'waist')]
 
     def twist(self, topic, x=0.0, y=0.0, z=0.0, pitch=0.0, yaw=0.0):
         self.ros1.publish(topic, "geometry_msgs/Twist", {
@@ -1004,11 +1059,11 @@ class KuavoBundle:
             return False
         return True
 
-    def _publish_motion_locked(self, channel, tool, modes, publish, validate, preparation):
+    def _publish_motion_locked(self, channel, tool, modes, publish, validate, preparation, notify=True):
         self.state.require_motion(modes)
         if validate is not None:
             validate()
-        aid, cancelled = self.tracker.begin(channel, tool)
+        aid, cancelled = self.tracker.begin(channel, tool, notify=notify)
         issued, generation = time.monotonic(), self.ros1.connection[1]
         try:
             publish()
@@ -1018,7 +1073,7 @@ class KuavoBundle:
             raise _UncertainMotionSend(channel, aid, str(exc)) from exc
         return aid, cancelled, generation, issued, preparation
 
-    def start_motion(self, channel, tool, modes, publish, validate=None, request_epoch=None):
+    def start_motion(self, channel, tool, modes, publish, validate=None, request_epoch=None, notify=True):
         """One user action owns resume -> mode -> target, interruptible at each step."""
         if not self.tracker.lock.acquire(timeout=DISPATCH_LOCK_TIMEOUT_S):
             raise RuntimeError('control transition is busy; query state before retrying')
@@ -1031,6 +1086,8 @@ class KuavoBundle:
                 raise RuntimeError('motion/control is busy; wait for preparation or stop it first')
             if self.state.motion_send_uncertain:
                 raise RuntimeError('motion command delivery is uncertain; controller reconciliation is required')
+            if channel == 'base' and self.spatial.startup_status().get('state') == 'loading':
+                raise RuntimeError('Checking chassis status in background, please wait.')
             if self.spatial.unresolved():
                 raise RuntimeError('native navigation is active or unresolved; stop_nav must be confirmed first')
             if self._resume_unresolved():
@@ -1050,7 +1107,7 @@ class KuavoBundle:
             fresh = time.monotonic() - seen <= 2
             preparation = {'automatic': True, 'resumed': False, 'mode_changed': False, 'mode': mode}
             if enabled is True and not self.state.motion_blocked and compatible and fresh:
-                return self._publish_motion_locked(channel, tool, modes, publish, validate, preparation)
+                return self._publish_motion_locked(channel, tool, modes, publish, validate, preparation, notify=notify)
             if self.tracker._active:
                 raise RuntimeError('control preparation needs an idle robot; another action is still running')
             target_mode = mode if compatible else 3
@@ -1083,7 +1140,7 @@ class KuavoBundle:
                 self.state.confirmed_enable()
                 self.state.motion_blocked = False
                 preparation['mode'] = target_mode
-                result = self._publish_motion_locked(channel, tool, modes, publish, validate, preparation)
+                result = self._publish_motion_locked(channel, tool, modes, publish, validate, preparation, notify=notify)
                 self._transition = None
                 return result
         except _UncertainMotionSend:

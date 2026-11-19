@@ -127,6 +127,9 @@ class Client:
             'localizationStatus': {'cartoStatusId': 1}}
 
     def native(self, operation, **args):
+        if operation == 'motion_music':
+            self.music_requests = getattr(self, 'music_requests', []) + [args]
+            return {'state': 'disabled'}
         self.calls.append((operation, args))
         if operation == 'navigate':
             return self.navigate
@@ -185,7 +188,11 @@ class SpatialTests(unittest.TestCase):
         self.temp.cleanup()
 
     def call(self, action, **args):
-        return self.plugin.dispatch(action, args)
+        result = self.plugin.dispatch(action, args)
+        if action == 'start' and result['state'] == 'loading':
+            self.plugin._startup_thread.join(4)
+            return dict(self.plugin._startup)
+        return result
 
     def navigate(self, **args):
         return self.call('navigate_to_pose', x=1., y=2., yaw=.3, **args)
@@ -213,6 +220,28 @@ class SpatialTests(unittest.TestCase):
         self.assertFalse(self.client.feedback['agvState']['softwareEstop'])
         self.assertFalse(self.plugin.unresolved())
         self.assertEqual([c[0] for c in self.client.calls], ['prepare'])
+
+    def test_background_start_deduplicates_and_ignores_only_web_velocity_cache(self):
+        entered, release = threading.Event(), threading.Event()
+        original = self.client.native
+        def blocked(operation, **args):
+            if operation == 'prepare':
+                entered.set();release.wait(2)
+            return original(operation, **args)
+        self.client.native = blocked
+        self.client.feedback['state']['velocity'] = {'vx': -.051, 'vy': -.051, 'omega': 0.}
+        try:
+            first = self.plugin.dispatch('start', {})
+            self.assertEqual(first['state'], 'loading')
+            self.assertIn('Checking chassis',first['message'])
+            self.assertTrue(entered.wait(1))
+            second = self.plugin.dispatch('start', {})
+            self.assertEqual(second['state'], 'loading')
+            release.set();self.plugin._startup_thread.join(2)
+            self.assertEqual(self.plugin.startup_status()['state'],'running')
+            self.assertEqual([c[0] for c in self.client.calls],['prepare'])
+        finally:
+            release.set()
 
     def test_start_fault_or_readonly_does_not_release(self):
         for field in ('estopButtonEvent', 'bumperEvent', 'driverError'):
@@ -542,11 +571,13 @@ class BundleIntegrationTests(unittest.TestCase):
             client.feedback['agvState']['softwareEstop'] = True
             bundle.spatial = ControlledSpatialPlugin(bundle, {'db_path': folder + '/db'}, client)
             try:
-                for card, state in [('base_drive', 'ready'), ('controlled_spatial', 'running')]:
+                for card in ('base_drive', 'controlled_spatial'):
                     result = bundle.dispatch(card, {'action': 'start'})
-                    self.assertEqual(result['state'], state)
-                    self.assertTrue(result['chassis_preparation']['old_task_cancelled'])
-                self.assertEqual([c[0] for c in client.calls], ['prepare', 'prepare'])
+                    self.assertIn(result['state'], ('loading', 'running'))
+                    bundle.spatial._startup_thread.join(2)
+                    self.assertTrue(bundle.spatial.startup_status()['chassis_preparation']['old_task_cancelled'])
+                self.assertEqual([c[0] for c in client.calls], ['prepare'])
+                self.assertEqual(client.music_requests, [{'enabled': False}])
                 self.assertFalse(ros.services)
                 self.assertFalse(ros.published)
             finally:

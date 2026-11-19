@@ -115,6 +115,11 @@ class KuavoSensors:
         self._arm_limit_source = config.get('arm_limit_source', 'commissioned')
         if self._arm_limit_source not in ('commissioned', 'vendor_runtime'):
             raise ValueError('arm_limit_source must be commissioned or vendor_runtime')
+        self._leg_limit_source = config.get('leg_limit_source', 'commissioned')
+        if self._leg_limit_source not in ('commissioned', 'vendor_runtime'):
+            raise ValueError('leg_limit_source must be commissioned or vendor_runtime')
+        self._vendor_leg_bounds = None
+        self._vendor_leg_error = 'waiting_for_discovery'
         self._vendor_arm_bounds = None
         self._vendor_arm_error = 'waiting_for_discovery'
         self._model_error = 'waiting_for_discovery'
@@ -214,46 +219,50 @@ class KuavoSensors:
                 model_error = None
             except Exception as exc:
                 urdf, names, model_error = None, None, str(exc)
-            vendor_bounds, vendor_error = None, None
-            if self._arm_limit_source == 'vendor_runtime':
-                try:
-                    if model_error:
-                        raise ValueError(model_error)
-                    # Match the vendor SDK's live-model source, never the local
-                    # display resource. Require the controller's bounds too.
-                    settings = self.ros1.get_param('/kuavo_configuration')
-                    if isinstance(settings, str):
-                        settings = json.loads(settings)
-                    if not isinstance(settings, dict):
-                        raise ValueError('missing runtime kuavo_configuration')
-                    if any(type(settings.get(key)) is not int or settings[key] != count
-                           for key, count in (('NUM_JOINT', 20), ('NUM_ARM_JOINT', 14),
-                                              ('NUM_HEAD_JOINT', 2))):
-                        raise ValueError('runtime limit configuration has incompatible joint counts')
-                    lower = vector(settings.get('min_joint_position_limits'), 20)
-                    upper = vector(settings.get('max_joint_position_limits'), 20)
-                    if any(a >= b for a, b in zip(lower, upper)):
-                        raise ValueError('invalid controller position limits')
-                    elements = ET.fromstring(urdf).findall('joint')
-                    joints = {j.get('name'): j for j in elements}
-                    if len(joints) != len(elements):
-                        raise ValueError('duplicate runtime joint names')
-                    vendor_bounds = []
-                    for i, name in enumerate(names[4:18], 4):
-                        joint = joints[name]
-                        if joint.get('type') != 'revolute':
-                            raise ValueError('arm joint must have finite revolute limits')
-                        limit = joint.find('limit')
-                        lo, hi = float(limit.attrib['lower']), float(limit.attrib['upper'])
-                        if not finite(lo) or not finite(hi) or lo >= hi:
-                            raise ValueError('invalid runtime URDF arm limits')
-                        low = max(lo, math.radians(lower[i]))
-                        high = min(hi, math.radians(upper[i]))
-                        if low >= high:
-                            raise ValueError('invalid or empty runtime arm limit intersection')
-                        vendor_bounds.append((low, high))
-                except Exception as exc:
-                    vendor_bounds, vendor_error = None, str(exc)
+            runtime_bounds, runtime_errors = {}, {}
+            for card, offset, size, source in (('arm', 4, 14, self._arm_limit_source),
+                                                ('leg', 0, 4, self._leg_limit_source)):
+                vendor_bounds, vendor_error = None, None
+                if source == 'vendor_runtime':
+                    try:
+                        if model_error:
+                            raise ValueError(model_error)
+                        # Match the vendor SDK's live-model source, never the local
+                        # display resource. Require the controller's bounds too.
+                        settings = self.ros1.get_param('/kuavo_configuration')
+                        if isinstance(settings, str):
+                            settings = json.loads(settings)
+                        if not isinstance(settings, dict):
+                            raise ValueError('missing runtime kuavo_configuration')
+                        if any(type(settings.get(key)) is not int or settings[key] != count
+                               for key, count in (('NUM_JOINT', 20), ('NUM_ARM_JOINT', 14),
+                                                  ('NUM_HEAD_JOINT', 2))):
+                            raise ValueError('runtime limit configuration has incompatible joint counts')
+                        lower = vector(settings.get('min_joint_position_limits'), 20)
+                        upper = vector(settings.get('max_joint_position_limits'), 20)
+                        if any(a >= b for a, b in zip(lower, upper)):
+                            raise ValueError('invalid controller position limits')
+                        elements = ET.fromstring(urdf).findall('joint')
+                        joints = {j.get('name'): j for j in elements}
+                        if len(joints) != len(elements):
+                            raise ValueError('duplicate runtime joint names')
+                        vendor_bounds = []
+                        for i, name in enumerate(names[offset:offset + size], offset):
+                            joint = joints[name]
+                            if joint.get('type') != 'revolute':
+                                raise ValueError('arm joint must have finite revolute limits')
+                            limit = joint.find('limit')
+                            lo, hi = float(limit.attrib['lower']), float(limit.attrib['upper'])
+                            if not finite(lo) or not finite(hi) or lo >= hi:
+                                raise ValueError('invalid runtime URDF arm limits')
+                            low = max(lo, math.radians(lower[i]))
+                            high = min(hi, math.radians(upper[i]))
+                            if low >= high:
+                                raise ValueError('invalid or empty runtime arm limit intersection')
+                            vendor_bounds.append((low, high))
+                    except Exception as exc:
+                        vendor_bounds, vendor_error = None, str(exc)
+                runtime_bounds[card], runtime_errors[card] = vendor_bounds, vendor_error
             with self._lock:
                 if self._closed.is_set() or self.ros1.connection != (True, generation):
                     return
@@ -277,7 +286,8 @@ class KuavoSensors:
                 self._profile = params
                 self._urdf, self._names, self._model_error = urdf, names, model_error
                 self._model_sha256 = model_sha256
-                self._vendor_arm_bounds, self._vendor_arm_error = vendor_bounds, vendor_error
+                self._vendor_arm_bounds, self._vendor_arm_error = runtime_bounds['arm'], runtime_errors['arm']
+                self._vendor_leg_bounds, self._vendor_leg_error = runtime_bounds['leg'], runtime_errors['leg']
                 # Lease starts before parameter reads, not when slow reads finish.
                 self._identity_checked_at = checked_at
                 self._discovery_error = None
@@ -320,7 +330,7 @@ class KuavoSensors:
             for card in ('arm', 'leg'):
                 try:
                     self._joint_bounds(card)
-                    vendor = (card == 'arm' and self._arm_limit_source == 'vendor_runtime'
+                    vendor = (getattr(self, '_' + card + '_limit_source') == 'vendor_runtime'
                               and self._joint_limit_config is None)
                     limits[card] = ({'available': True, 'source': 'vendor_runtime',
                                      'hardware_verified': False,
@@ -352,13 +362,14 @@ class KuavoSensors:
         selected vendor live-model/controller intersection, never display limits.
         """
         policy = self._joint_limit_config
-        if card == 'arm' and policy is None and self._arm_limit_source == 'vendor_runtime':
+        if policy is None and getattr(self, '_' + card + '_limit_source') == 'vendor_runtime':
             if (self._profile is None or not self._names or self._model_error is not None
                     or not self._identity_fresh()):
                 raise RuntimeError('runtime arm model/limit identity is missing or stale')
-            if self._vendor_arm_bounds is None:
-                raise RuntimeError(f'vendor runtime arm limits unavailable: {self._vendor_arm_error}')
-            return list(self._vendor_arm_bounds)
+            bounds = getattr(self, '_vendor_' + card + '_bounds')
+            if bounds is None:
+                raise RuntimeError(f'vendor runtime {card} limits unavailable: ' + str(getattr(self, '_vendor_' + card + '_error')))
+            return list(bounds)
         if not isinstance(policy, dict) or not isinstance(policy.get(card), dict):
             raise RuntimeError(f'hardware-verified joint limits are not configured for {card}')
         if self._profile is None or not self._names or self._model_error is not None:
@@ -383,6 +394,88 @@ class KuavoSensors:
         if any(a >= b for a, b in zip(low, high)):
             raise ValueError('joint limits require finite lower_deg < upper_deg')
         return [(math.radians(a), math.radians(b)) for a, b in zip(low, high)]
+
+    def joint_bounds(self, card):
+        with self._lock:
+            return self._joint_bounds(card)
+
+    def height_target(self, height, with_pose=False):
+        """Planar 3-joint IK from the validated live wheel-arm chain.
+
+        Preserve torso x, pitch and waist yaw; reject unknown geometry or
+        unreachable targets instead of applying a guessed joint ratio.
+        """
+        with self._lock:
+            bounds = self._joint_bounds('leg')
+            q = self.joint_positions()[0][:4]
+            joints = {j.get('name'): j for j in ET.fromstring(self._urdf).findall('joint')}
+            origins = []
+            for i, name in enumerate(self._names[:4]):
+                joint = joints[name]
+                origin = joint.find('origin')
+                xyz = vector([float(v) for v in origin.get('xyz', '0 0 0').split()], 3)
+                rpy = vector([float(v) for v in origin.get('rpy', '0 0 0').split()], 3)
+                axis = [float(v) for v in joint.find('axis').get('xyz').split()]
+                if any(abs(v) > 1e-8 for v in rpy) or abs(xyz[1]) > 1e-8 or axis != ([0., 1., 0.] if i < 3 else [0., 0., 1.]):
+                    raise RuntimeError('unsupported_live_leg_geometry_for_height')
+                if i and joint.find('parent').get('link') != joints[self._names[i-1]].find('child').get('link'):
+                    raise RuntimeError('unsupported_live_leg_chain_for_height')
+                origins.append((xyz[0], xyz[2]))
+            parent = joints[self._names[0]].find('parent').get('link')
+            visited = set()
+            while parent != 'base_link':
+                if parent in visited:
+                    raise RuntimeError('invalid_live_leg_fixed_chain')
+                visited.add(parent)
+                parents = [j for j in joints.values() if j.find('child').get('link') == parent]
+                if len(parents) != 1 or parents[0].get('type') != 'fixed':
+                    raise RuntimeError('unsupported_live_leg_root_for_height')
+                fixed = parents[0]
+                origin = fixed.find('origin')
+                xyz = vector([float(v) for v in origin.get('xyz', '0 0 0').split()], 3)
+                rpy = vector([float(v) for v in origin.get('rpy', '0 0 0').split()], 3)
+                if abs(xyz[1]) > 1e-8 or any(abs(v) > 1e-8 for v in rpy):
+                    raise RuntimeError('unsupported_live_leg_fixed_transform')
+                origins[0] = (origins[0][0]+xyz[0], origins[0][1]+xyz[2])
+                parent = fixed.find('parent').get('link')
+            def rotate(v, a):
+                return (math.cos(a)*v[0]+math.sin(a)*v[1], -math.sin(a)*v[0]+math.cos(a)*v[1])
+            pitch = sum(q[:3])
+            parts = [origins[0], rotate(origins[1], q[0]), rotate(origins[2], q[0]+q[1]), rotate(origins[3], pitch)]
+            x = sum(v[0] for v in parts)
+            end = rotate(origins[3], pitch)
+            dx, dz = x-origins[0][0]-end[0], height-origins[0][1]-end[1]
+            l1, l2 = [math.hypot(*v) for v in origins[1:3]]
+            if min(l1, l2) <= 1e-6:
+                raise RuntimeError('invalid_live_leg_link_lengths')
+            cosine = (dx*dx+dz*dz-l1*l1-l2*l2)/(2*l1*l2)
+            if not -1 <= cosine <= 1:
+                raise ValueError('height_is_unreachable_at_current_torso_x_and_pitch')
+            a1, a2 = [math.atan2(v[1], v[0]) for v in origins[1:3]]
+            candidates = []
+            for delta in (math.acos(cosine), -math.acos(cosine)):
+                knee = a1-math.atan2(dz, dx)+math.atan2(l2*math.sin(delta), l1+l2*math.cos(delta))
+                leg = a2-a1-delta
+                for turn in (-2*math.pi, 0., 2*math.pi):
+                    k = knee+turn
+                    target = [k, leg, pitch-k-leg, q[3]]
+                    if all(lo <= v <= hi for v, (lo, hi) in zip(target, bounds)):
+                        candidates.append(target)
+            if not candidates:
+                raise ValueError('height_would_exceed_live_joint_limits')
+            target = min(candidates, key=lambda t: sum((a-b)**2 for a,b in zip(t,q)))
+            return (target, {'x': x, 'z': height, 'pitch': pitch, 'yaw': q[3]}) if with_pose else target
+
+    def odom_pose(self):
+        with self._lock:
+            raw = self._data.get('loco_state', {}).get('vendor', {})
+            seen = self._seen.get('loco_state', -1e9)
+            stamp_data = raw.get('header', {}).get('stamp', {})
+            captured = stamp_data.get('secs', 0) + stamp_data.get('nsecs', 0)*1e-9
+            if time.monotonic()-seen > .5 or not -.1 <= time.time()-captured <= .5:
+                raise RuntimeError('fresh_stamped_odometry_required_for_pose_motion')
+            fields = self._pose_fields(raw['pose']['pose'], raw['header']['frame_id'], '/odom')
+            return (fields['x_m'], fields['y_m'], fields['yaw_rad']), captured, fields['frame_id']
 
     def resolve_joint_target(self, card, updates):
         with self._lock:
