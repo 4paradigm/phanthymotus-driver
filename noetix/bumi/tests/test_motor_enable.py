@@ -225,7 +225,7 @@ def test_card_is_discoverable_in_enabled_bundle_and_manifest(card):
     assert tool["type"] == "actuator"
     assert tool["inputSchema"]["x-is-dangerous"] is True
     assert tool["inputSchema"]["x-action-params"]["enable"]["params"] == []
-    assert tool["inputSchema"]["x-action-params"]["disable"]["params"] == []
+    assert "disable" not in tool["inputSchema"]["properties"]["action"]["enum"]
     assert "confirm" not in tool["inputSchema"]["properties"]
     bumi = Path(__file__).resolve().parents[1]
     manifest = yaml.safe_load((bumi / "driver.yaml").read_text(encoding="utf-8"))
@@ -233,23 +233,11 @@ def test_card_is_discoverable_in_enabled_bundle_and_manifest(card):
     assert yaml.safe_load((bumi / "config.yaml").read_text(encoding="utf-8"))["plugins"]["motor_enable"]["enabled"] is True
 
 
-def test_disable_from_enabled_sends_once_and_is_idempotent(card):
+
+def test_disable_is_rejected_without_sending_command(card):
     _, plugin, ctrl = card
-    ctrl.mode, ctrl.next_mode = 0, 30
+    ctrl.mode = 0
     result = call(plugin, "disable")
-    assert result["state"] == "completed"
-    assert result["workmode"] == 30
-    assert [c[3] for c in ctrl.commands] == ["START", "DEFAULT"]
-    assert call(plugin, "disable")["command_sent"] is False
-    assert len(ctrl.commands) == 2
-
-
-def test_timeout_cannot_be_cleared_by_requesting_source_mode(card, monkeypatch):
-    module, plugin, ctrl = card
-    ctrl.next_mode = 30
-    clock = [100.0]
-    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(plugin._enable_cancel, "wait", lambda _: clock.__setitem__(0, clock[0] + 1))
-    assert call(plugin, "enable")["code"] == "ENABLE_TIMEOUT"
-    assert call(plugin, "disable")["code"] == "ENABLE_UNCONFIRMED"
-    assert [c[3] for c in ctrl.commands] == ["START", "DEFAULT"]
+    assert result["state"] == "error"
+    assert result["command_sent"] is False
+    assert ctrl.commands == []

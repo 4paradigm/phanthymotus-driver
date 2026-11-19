@@ -370,7 +370,7 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 
 ## Direct action cards
 
-### Motor mode: `motor_enable`
+### Exit disabled mode: `motor_enable`
 
 `motor_enable` is a standalone actuator plugin, controlled by
 `plugins.motor_enable.enabled`. It does not require `loco` or any other card to
@@ -383,12 +383,10 @@ the existing HighController connection and has no additional worker.
 - `enable` requires safe face-up placement on a flat, non-slip
   surface, free joints and a clear movement area. Enabling can move joints to
   zero; it does not stand the robot up or start walking.
-- `disable` requests disabled mode (30). Motors stop active output and the robot
-  can fall; place or support it safely before using this action.
-- Both actions send START once only when a transition is needed, release it with
-  DEFAULT, and wait up to 3 seconds for the requested mode. Protection (26) and
-  unknown modes are refused. Active chassis actions are refused; the streaming
-  servo is paused and shared publishing is serialized.
+- From disabled (30), `enable` sends START once, releases it with DEFAULT, and
+  waits up to 3 seconds for enabled (0). If already enabled, it sends nothing.
+  Protection (26) and other modes are refused. Active chassis actions are
+  refused; the streaming servo is paused and shared publishing is serialized.
 - Missing/failed feedback is not success. An uncertain START attempt blocks
   another START through this card or automatic action preparation during
   this driver process. Observing the requested target mode on a subsequent call clears that guard
