@@ -93,3 +93,27 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+  # 视觉跌倒检测（YOLOv11-pose 官方权重 + 姿态几何判定，无需训练）。
+  # 它消费 camera 卡片的 RGB 流，真机跑 YOLO（CPU 较慢，先核对帧率并确认权重已
+  # 预下载）；检测到跌倒后经 fall_alarm/alarm 发布提醒语音（画布连到 speaker）并在
+  # fall_alarm/event 发布事件（画布连到监控/Agent）。
+  fall_alarm:
+    enabled: true
+    # YOLOv11-pose 权重。n=nano 最快；首次运行自动从 ultralytics 下载，离线机器人
+    # 请预先下载后填绝对路径。
+    model_path: yolo11n-pose.pt
+    device: cpu              # cpu | cuda | 0
+    conf: 0.5                # 人体检测置信度
+    imgsz: 640
+    rate_hz: 10              # 检测帧率上限（相机 30fps，只取最新帧）
+    # 报警语音 WAV（16k 单声道 S16LE）。缺省时回退到提示音并打日志；生成方法见
+    # fall_alarm/README.md 的 scripts/generate_alarm_wav.py。
+    alarm_wav_path: /work/fall_alarm/resource/fall_alarm.wav
+    alarm_text: 检测到有人摔倒，请注意安全
+    # 跌倒几何阈值（见 fall_alarm/fall_detector.py 文档）。
+    min_keypoint_conf: 0.5
+    aspect_ratio_max: 1.15
+    torso_angle_min_deg: 45.0
+    hip_elevation_max: 0.25
+    confirm_frames: 3
+    cooldown_s: 8.0

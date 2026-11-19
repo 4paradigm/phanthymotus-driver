@@ -18,7 +18,8 @@ RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && \
 FROM ${ROS_BASE_IMAGE}
 WORKDIR /work
 ARG PYPI_MIRROR
-RUN apt-get update && apt-get install -y --no-install-recommends python3-pip cmake build-essential curl && \
+RUN apt-get update && apt-get install -y --no-install-recommends python3-pip cmake build-essential curl \
+        libgl1 libglib2.0-0 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 # FFmpeg is a runtime dependency of record_video, not a test-only tool. Measure
@@ -49,6 +50,14 @@ COPY requirements.txt /work/requirements.txt
 # packages also purges ros-humble-rclpy under this image's APT dependency graph.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r requirements.txt && \
     pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5
+
+# Traffic-light-recognition card: YOLOv8n for traffic-light detection. ultralytics
+# pulls torch/torchvision (CPU-only on ARM64 via PyPI) plus opencv-python and
+# numpy; libgl1/libglib2.0-0 above satisfy opencv's GUI libraries. The weight
+# itself is fetched on first run, or point config `model_path` at a pre-downloaded
+# copy for offline robots. Fail the build here rather than on a robot.
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} ultralytics && \
+    python3 -c 'import ultralytics; from ultralytics import YOLO'
 COPY --from=audio-interface-builder /audio_ws/install/ /as2w_ws/install/
 # Validate the component-owned overlay before copying the application.  This
 # catches an interface build or runtime-link mismatch during image creation.
@@ -61,6 +70,7 @@ COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY main.py device.py loco_servo.py multimedia.py camera_specs.py vision_capture.py lidar.py lidar_backend.py sensor_worker.py controlled_spatial.py slam_mapping.py rpc_proxy.py config.yaml /work/
 COPY resource/ /work/resource/
 COPY common/ /work/common/
+COPY Traffic_Light_Recognition/ /work/Traffic_Light_Recognition/
 COPY deploy/ /deploy/
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 \
     ROS_DOMAIN_ID=42 \

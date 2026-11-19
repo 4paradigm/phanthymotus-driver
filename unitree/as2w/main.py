@@ -170,6 +170,9 @@ class Bundle:
                 controlled_spatial.attach_servo(loco_servo)
                 loco_servo.attach_controlled_spatial(controlled_spatial)
         if dds_ready and p.get("slam_mapping", {}).get("enabled", True): self.plugins.append(SlamMappingPlugin(p.get("slam_mapping", {}), namespace, executor))
+        if p.get("traffic_light", {}).get("enabled", False):
+            from Traffic_Light_Recognition.plugin import TrafficLightPlugin
+            self.plugins.append(TrafficLightPlugin(p.get("traffic_light", {}), namespace, executor))
     def start_all(self):
         for plugin in self.plugins: plugin.start()
     def stop_all(self):
