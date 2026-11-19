@@ -5,6 +5,30 @@ import xml.etree.ElementTree as ET
 from contracts import json_float
 
 
+def _fixed_segment(root, parent, child, xyz):
+    ET.SubElement(root, "link", name=child)
+    joint = ET.SubElement(root, "joint", name=f"{child}_joint", type="fixed")
+    ET.SubElement(joint, "parent", link=parent)
+    ET.SubElement(joint, "child", link=child)
+    ET.SubElement(joint, "origin", xyz=xyz)
+    return child
+
+
+def _add_base_outline(root):
+    """Canvas draws fixed-joint offsets as line segments but ignores URDF meshes."""
+    # SDK footprint: 650 × 510 mm. Approximate the bumper/body height in the preview.
+    lower = _fixed_segment(root, "base_link", "display_base_lower_0", "-0.325 -0.255 0")
+    edges = ("0.65 0 0", "0 0.51 0", "-0.65 0 0", "0 -0.51 0")
+    upper = None
+    for i, edge in enumerate(edges):
+        corner = _fixed_segment(root, lower, f"display_base_upper_{i}", "0 0 0.2")
+        if upper is None:
+            upper = corner
+        lower = _fixed_segment(root, lower, f"display_base_lower_{i + 1}", edge)
+    for i, edge in enumerate(edges):
+        upper = _fixed_segment(root, upper, f"display_base_top_edge_{i}", edge)
+
+
 def _add_fixed_column(root, joints):
     """Align the fixed rail with the head in the neutral Canvas pose."""
     lift = joints["body_joint"]
@@ -16,12 +40,7 @@ def _add_fixed_column(root, joints):
     parent = lift.find("parent").get("link")
     for child, xyz in (("display_column_base", f"{x} {y} 0"),
                        ("display_column_top", f"0 0 {top:g}")):
-        ET.SubElement(root, "link", name=child)
-        joint = ET.SubElement(root, "joint", name=f"{child}_joint", type="fixed")
-        ET.SubElement(joint, "parent", link=parent)
-        ET.SubElement(joint, "child", link=child)
-        ET.SubElement(joint, "origin", xyz=xyz)
-        parent = child
+        parent = _fixed_segment(root, parent, child, xyz)
 
 
 def render_model(urdf):
@@ -32,12 +51,8 @@ def render_model(urdf):
     for name, axis in (("joint_head0", "0 0 1"), ("joint_head1", "0 1 0")):
         joint = joints[name]
         joint.find("axis").set("xyz", axis)
-    # Reverse elbow rotation in the preview; elbow flex uses the bundled axes.
-    for name in ("joint_la3", "joint_ra3"):
-        axis = joints[name].find("axis")
-        axis.set("xyz", " ".join(f"{-value:g}" if value else "0"
-                                for value in map(float, axis.get("xyz").split())))
     _add_fixed_column(root, joints)
+    _add_base_outline(root)
     mimics = {}
     for name, joint in joints.items():
         mimic = joint.find("mimic")

@@ -7,7 +7,6 @@ is forwarded into Agent Core's DDS domain.
 
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import json
 import math
@@ -43,6 +42,7 @@ from common.odom import build_interface, build_sample, mean_twist, resolve_stamp
 from core_bridge import BridgeWorker, output_topics
 from joint_display import dedicated_row, display_gripper_row, joint_row, render_model
 from laser_cloud import current_points, point_packet
+from panther_media import VisionCapture
 
 
 MODEL_PATH = Path(__file__).with_name("resource") / "panther.urdf"
@@ -277,6 +277,8 @@ class PantherDevice:
         self._camera = PantherCameraRuntime(
             self._node, self._bridge, config.get("plugins", {}).get("camera", {}), sensor_qos
         )
+        self._vision = VisionCapture(self._camera, config.get("plugins", {}).get("vision_capture", {}),
+                                     _notify_completion)
 
     @property
     def topics(self):
@@ -302,6 +304,7 @@ class PantherDevice:
         self._closed = True
         self._stop_arm("driver_shutdown", wait_s=20.0)
         self._stop_head("driver_shutdown", wait_s=5.0)
+        self._vision.close()
         self._camera.close()
         self._bridge.stop()
         pending_stop = self._wait_for_pending_drive_stop(0.0)
@@ -1590,35 +1593,5 @@ class PantherDevice:
         raise ValueError(f"unsupported camera action: {action}")
 
     def vision_capture(self, args: dict) -> dict:
-        action = args.get("action", "info")
-        config = self._cfg.get("plugins", {}).get("vision_capture", {})
-        directory = Path(config.get("output_dir", "/opt/phanthy-motus/data/vision_capture/panther")) / "photos"
-        if action in ("start", "info"):
-            ready = self._node.count_publishers(self._camera.COLOR_TOPIC) > 0
-            return {"state": "ready" if ready else "waiting_for_camera",
-                    "source_topic": self._camera.COLOR_TOPIC, "photos_dir": str(directory)}
-        if action == "stop":
-            return {"state": "idle"}
-        if action != "capture_photo":
-            raise ValueError(f"unsupported vision_capture action: {action}")
-
-        try:
-            payload = self._camera.capture_jpeg(timeout_s=3.0)
-            captured_at = datetime.now().astimezone()
-            directory.mkdir(parents=True, exist_ok=True)
-            path = directory / f"IMG_{captured_at:%Y%m%d_%H%M%S}_{uuid4().hex}.jpg"
-            partial = path.with_suffix(".part")
-            output = partial.open("xb")
-            try:
-                with output:
-                    output.write(payload["data"])
-                partial.replace(path)
-            finally:
-                partial.unlink(missing_ok=True)
-        except Exception as exc:
-            return {"ok": False, "state": "error", "code": "CAPTURE_FAILED",
-                    "message": self._camera._bounded_error(exc)}
-        return {"ok": True, "state": "completed", "media_type": "photo",
-                "file_path": str(path), "captured_at": captured_at.isoformat(timespec="seconds"),
-                "frame_id": payload["frame_id"], "stamp": payload["stamp"]}
+        return self._vision.dispatch(args)
 

@@ -247,6 +247,9 @@ class PantherCameraRuntime:
                 self._photo_frame = msg
                 self._photo_ready.notify()
 
+    def rgb_available(self) -> bool:
+        return self._node.count_publishers(self.COLOR_TOPIC) > 0
+
     def capture_jpeg(self, timeout_s: float) -> dict:
         """Use the next RGB frame from a running source, independently of preview."""
         with self._photo_ready:
@@ -254,7 +257,7 @@ class PantherCameraRuntime:
                 raise RuntimeError("camera runtime is shutting down")
             if self._photo_waiting:
                 raise RuntimeError("another capture is already waiting for an RGB frame")
-            if not self._node.count_publishers(self.COLOR_TOPIC):
+            if not self.rgb_available():
                 raise RuntimeError("no RGB camera publisher; start camera_color first")
             self._photo_waiting = True
             try:

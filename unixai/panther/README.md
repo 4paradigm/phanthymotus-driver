@@ -19,7 +19,7 @@ required for discovery.
 - Actuators: `base_drive`, `arm_control`, `gripper`, `lifting`, and `head`.
 - Audio: `mic` publishes `audio/pcm-16k` from the host PulseAudio source;
   `speaker` plays a canvas-connected `audio/pcm-16k` stream through its sink.
-- Photos: `vision_capture` saves a fresh RGB frame as a JPEG.
+- Media: `vision_capture` takes JPEG photos, records silent MP4 clips, and lists or deletes saved files.
 
 The audio cards run in separate domain-42 processes and use the host PulseAudio
 server at `/run/user/1001/pulse/native`; they never open ALSA devices directly.
@@ -40,13 +40,13 @@ ASR and check interaction with the robot's native AIUI conversation service.
 `model` and `joints` use the same bundled articulated display model throughout
 the session. The live `/robot_description` can encode the lift and fingers as
 fixed joints, so it is kept separate from Canvas rendering. The display model
-uses the measured yaw/pitch order, reverses the two elbow-rotation axes, and maps
-gripper feedback as `1 - position` before expanding the finger linkage.
+uses the measured yaw/pitch order, the bundled elbow axes, and maps gripper
+feedback as `1 - position` before expanding the finger linkage.
 These are display-only corrections. `joints` combines `/joint_states` with fresh
 lift and gripper feedback, and `joints info` reports `body_joint` in metres.
-The display model includes a fixed guide column attached to `base_link` and
-ending at the neutral pose's head level, with
-the torso, head and arms on the separate `body_joint` prismatic branch. A
+The display model has a cuboid base outline (650 × 510 mm in plan, with an
+approximate 200 mm height) and a fixed guide column ending at the neutral
+pose's head level. The torso, head and arms are on the separate `body_joint` prismatic branch. A
 renderer with prismatic support moves that branch along the column; the current
 rotation-only Canvas shows the column and reports lift height without animating it.
 The response includes the display model's SHA-256 digest. Live
@@ -88,9 +88,12 @@ To take a photo, start `camera_color` (or use an already-running RGB publisher),
 then execute `vision_capture → capture_photo`. The card waits up to 3 seconds
 for a new frame and returns `file_path` and the ROS frame timestamp. The JPEG is
 saved under `/opt/phanthy-motus/data/vision_capture/panther/photos/` on the robot's
-existing persistent data mount. Photos use the same width and JPEG quality as
-`camera_color` and do not consume its preview frames. Files remain on the robot
-until removed by the operator.
+existing persistent data mount. `record_video` takes `duration_s` (1–30 s,
+default 5 s) and reports a silent H.264 MP4 in the sibling `videos/` directory
+on completion. `stop` cancels an in-flight recording and discards its temporary
+files. Both capture actions share the RGB source and leave its preview running.
+`list` returns up to 100 of the newest saved media files. Pass an exact
+`filename` from that result as `name` to `delete` to remove just that file.
 
 ## Container dependencies
 
@@ -105,6 +108,7 @@ for these concrete runtime paths:
 | `ros-humble-rmw-cyclonedds-cpp` | Robot-facing domain 0 process | Required |
 | `ros-humble-rmw-fastrtps-cpp` | Agent Core domain 42 bridge process | Required |
 | `python3-numpy`, `python3-opencv` | RGB/depth conversion | Apt-only; no duplicate pip wheels |
+| `ffmpeg` | H.264 MP4 encoding for `vision_capture` | Runtime only |
 | `util-linux` | `nsenter` into the host namespaces for the lazy camera source | Required |
 | `systemd` | `systemctl`/`systemd-run` clients for the owned host transient unit | Required; the driver does not run systemd in the container |
 

@@ -38,7 +38,7 @@ RUN . /etc/os-release && \
 # On x86_64 -> arm64 QEMU builds, libc-bin's post-install trigger has crashed
 # after the combined install; do not mask apt/dpkg failures.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3-numpy python3-opencv && \
+      python3-numpy python3-opencv ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 # Runtime dependencies deliberately come from Ubuntu/ROS apt packages. This
@@ -51,7 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=interface-builder /panther_ws/install /panther_ws/install
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py plugins.py contracts.py core_bridge.py camera.py audio.py laser_cloud.py joint_display.py config.yaml driver.yaml /work/
+COPY main.py device.py plugins.py contracts.py core_bridge.py camera.py audio.py laser_cloud.py joint_display.py panther_media.py config.yaml driver.yaml /work/
 COPY resource/panther.urdf /work/resource/panther.urdf
 COPY resource/cyclonedds-muzzle.xml /work/resource/cyclonedds-muzzle.xml
 COPY entrypoint.sh /work/entrypoint.sh
