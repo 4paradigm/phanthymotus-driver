@@ -42,7 +42,7 @@ class SshTransport:
     def __init__(self, state_dir):
         self.state_dir = Path(state_dir)
 
-    def run(self, role, target, request, source, secrets):
+    def run(self, role, target, request, source, secrets, timeout=240):
         address, user = target['address'], target['user']
         if not re.fullmatch(r'[A-Za-z0-9_.:-]+', address) or address.startswith('-'):
             raise ProvisionError('invalid_ssh_address')
@@ -86,7 +86,7 @@ class SshTransport:
         payload = dict(request, _sudo_password=sudo_password)
         try:
             result = subprocess.run(command, input=json.dumps(payload).encode(), capture_output=True,
-                                    timeout=240, env=env)
+                                    timeout=timeout, env=env)
         except subprocess.TimeoutExpired:
             raise ProvisionError('ssh_operation_timeout') from None
         except FileNotFoundError:

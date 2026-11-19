@@ -20,6 +20,7 @@ from kuavo_sensors import KuavoSensors, SENSOR_CARDS
 from peripherals import Peripherals, CARDS as PERIPHERAL_CARDS
 from speaker import Speaker
 from startup import StartupChecks
+from controlled_spatial import ControlledSpatialPlugin
 
 
 REACH = {
@@ -917,6 +918,7 @@ class KuavoBundle:
         self._stop_epoch = 0
         self.plugins = [BaseDrivePlugin(self), ArmPlugin(self), LowerBodyPlugin(self),
                         LowerBodyPlugin(self, "waist"), HeadPlugin(self)]
+        self.spatial = ControlledSpatialPlugin(self, config.get('controlled_spatial', {}))
         if "plugins" in config:
             plugin_config = dict(config['plugins'])
             # Preserve old deployments, but an explicit new setting wins.
@@ -925,7 +927,7 @@ class KuavoBundle:
             plugin_config.pop('loco', None)
             self._enabled = {name for name, cfg in plugin_config.items() if cfg.get('enabled', True)}
         else:
-            self._enabled = {"base_drive", "arm", "leg", "waist", "head", "speaker",
+            self._enabled = {"base_drive", "controlled_spatial", "arm", "leg", "waist", "head", "speaker",
                              *SENSOR_CARDS, *PERIPHERAL_CARDS}
         aliases = {'loco': 'base_drive', 'camera_rgb': 'camera_left', 'camera_rgb_right': 'camera_right'}
         self._enabled = {aliases.get(name, name) for name in self._enabled if name not in ('state', 'switch_mode')}
@@ -1025,6 +1027,8 @@ class KuavoBundle:
                 raise RuntimeError('motion/control is busy; wait for preparation or stop it first')
             if self.state.motion_send_uncertain:
                 raise RuntimeError('motion command delivery is uncertain; controller reconciliation is required')
+            if self.spatial.unresolved():
+                raise RuntimeError('native navigation is active or unresolved; stop_nav must be confirmed first')
             if self._resume_unresolved():
                 raise RuntimeError('remote resume is unresolved; motion remains blocked')
             if self._mode_unresolved():
@@ -1208,14 +1212,20 @@ class KuavoBundle:
                 enabled = self.state.confirmed_enable()
             except RuntimeError:
                 enabled = None
+            # Whole-body disable must not wait for a blocked chassis submit.
             # Even a fresh pre-resume False cannot bypass a superseding pause.
-            if enabled is False and not interrupted and not unresolved and not uncertain_motion:
-                with self.tracker.lock:
-                    self._check_transition(token)
-                    return {"state": "paused", "control_enabled": False,
-                            "completion_basis": "enable_control_state", "scope": "whole_body"}
-            self.confirm_control(token, "/enable_control", "std_srvs/SetBool", {"data": False},
-                                 "success", "control_enabled", False)
+            if not (enabled is False and not interrupted and not unresolved and not uncertain_motion and not errors):
+                try:
+                    self.confirm_control(token, "/enable_control", "std_srvs/SetBool", {"data": False},
+                                         "success", "control_enabled", False)
+                except Exception as exc:
+                    errors.append(_safe_log(str(exc)))
+            # Native navigation is independent of /enable_control. Always try
+            # cancellation even when the whole-body disable was unconfirmed.
+            try:
+                self.spatial.cancel_remote()
+            except Exception:
+                errors.append('native navigation cancellation/stop is unconfirmed')
             with self.tracker.lock:
                 self._check_transition(token)
                 # If an old resume was outstanding when disable was sent,
@@ -1225,6 +1235,8 @@ class KuavoBundle:
                     raise RuntimeError('remote resume is unresolved; pause cannot be confirmed')
                 if uncertain_motion:
                     raise RuntimeError('motion command delivery is uncertain; controller reconciliation is required')
+                if errors or self.spatial.unresolved():
+                    raise RuntimeError('native navigation stop is unresolved')
                 return {"state": "paused", "control_enabled": False,
                         "completion_basis": "enable_control_state", "scope": "whole_body"}
         except Exception as exc:
@@ -1272,6 +1284,7 @@ class KuavoBundle:
         tools = [p.get_tool() for p in self.plugins if p.PREFIX in self._enabled]
         return (tools + [t for t in self.sensors.tools() if t['name'] in self._enabled]
                 + [t for t in self.peripherals.tools() if t['name'] in self._enabled]
+                + ([self.spatial.get_tool()] if 'controlled_spatial' in self._enabled else [])
                 + ([self.speaker.tool()] if 'speaker' in self._enabled else []))
 
     def start_background(self):
@@ -1292,6 +1305,8 @@ class KuavoBundle:
             return {"state": "error", "error": "driver is shutting down"}
         if name == 'speaker':
             return self.speaker.dispatch(action, args)
+        if name == 'controlled_spatial':
+            return self.spatial.dispatch(action, args)
         if name in PERIPHERAL_CARDS:
             return self.peripherals.dispatch(name, action)
         if name in SENSOR_CARDS:
@@ -1308,12 +1323,13 @@ class KuavoBundle:
             self._closing = True
             needs_pause = (bool(self.tracker._active) or self._transition is not None
                            or self._remote_resume is not None or self._remote_mode is not None
-                           or self.state.motion_send_uncertain)
+                           or self.state.motion_send_uncertain or self.spatial.unresolved())
         if needs_pause:
             result = self.pause("driver_shutdown")
             if result.get("error"):
                 print(f"[shutdown] {_safe_log(result.get('error'))}", flush=True)
         self.state.close()
+        self.spatial.close()
         self.startup_checks.close()
         self.peripherals.close()
         audio_stop = self.speaker.close()

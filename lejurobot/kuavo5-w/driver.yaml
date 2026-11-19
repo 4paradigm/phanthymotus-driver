@@ -11,6 +11,7 @@ build_context_extras:
   - ../../common
 cards:
   - { name: base_drive,        type: actuator }
+  - { name: controlled_spatial, type: actuator }
   - { name: arm,         type: actuator }
   - { name: leg,         type: actuator }
   - { name: waist,       type: actuator }

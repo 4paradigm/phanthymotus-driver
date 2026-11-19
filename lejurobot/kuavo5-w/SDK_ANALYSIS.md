@@ -291,3 +291,29 @@ DDS42/loopback 的跨容器接收，以及软件暂停和断网时控制器行�
 - 没有运行会独占CAN的诊断/磨线/方向辨识程序，没有写电机参数或重启控制器。
   头部需进一步由厂商核对本机电机固件、PTM输出及机械/参数；当前证据不足以给出可验证的自动调参修复。
   模型仍与运行时biped_s63的全部35个joint定义一致，头部q[18]/q[19]按原始rad输出；不更换显示URDF掩盖物理偏差。
+
+## 2026-11-19：controlled_spatial 的原生协议适配
+
+进一步在独立底盘核对已安装生成类、厂商地图前端和后端命令实现后，找到与导航同源的取消接口：
+
+- `/move_base/set_dispatch_mode`，`leju_mobile_base_msgs/SetDispatchMode`，
+  control_mode=2 是 CANCEL_CURRENT_TASK，0/1是软件急停设置/解除，驱动不调用0/1。
+  与 MoveToTarget / CheckArrived 一样由 `/leju_node` 提供；每次 RPC 都核对三者类型和唯一同源提供者。
+- MoveToTarget 返回 task_id；CheckArrived 用同一个ID、blocking=false、timeout=0查询。
+  底盘附带测试把状态0/1/2/3解释为PENDING/ACTIVE/ARRIVED/FAILED；未知状态不当成功。
+  取消确认还需 cancel 返回成功及新采样 /odom 停稳，不使用杀节点的 `/cancel_task`。
+- 地图后端是底盘 `:8888`，新鲜状态来自 `/ws/home` 的 pose2d、state、agvState、localizationStatus。
+  `POST /map/list?type=pgm`（空body）读取栅格列表；默认列表是path路网，不能冒充栅格地图。
+  `GET /map/current?returnMapData=false` 的 mapMd5 是路网标识，不能单独标识栅格坐标系。
+  固定只读 SSH 操作对当前地图的PGM+YAML计算SHA256，再组合路网MD5绑定语义点。
+- 厂商前端采用 ChangeMode(MANUAL)、StartCartoMapping({})、
+  SaveCartoMap(mapName,savePath)、AgvSystemRestart({})、ChangeCartoMap/ChangeRoadMap(mapName)。
+  WebSocket命令使用 method/id/params，匹配taskResult中method和id，错误或丢失确认不重发。
+  保存必须等待PGM列表出现，再等服务恢复并核对加载后的文件身份；不能只凭success完成ACP。
+  ChangeMode(AUTO)恢复模式不表示已定位，也不意味着解除底盘软件急停。
+
+`host/navigation_rpc.py` 随镜像构建，用既有SSH通路在底盘运行固定操作、导入当地ROS消息类。
+无需新守护服务、rosbridge重启或安装额外SDK。容器只增加Python源文件，不增加运行依赖。
+本轮实际只读探针确认了服务同源、地图文件指纹和状态格式，并发现现场websocket-client对象
+不支持context manager；已使用contextlib.closing兼容，回归也使用不实现__enter__的socket。
+源码实现与现场运动验收区分：建图/保存/载图、MoveToTarget以及中途取消未在本轮实际调用。

@@ -45,6 +45,7 @@ sensors:
   joint_limits: null
 plugins:
   base_drive: {enabled: true}
+  controlled_spatial: {enabled: true}
   arm: {enabled: true}
   leg: {enabled: true}
   waist: {enabled: true}

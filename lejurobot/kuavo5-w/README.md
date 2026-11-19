@@ -136,7 +136,7 @@ controller/host/chassis分别报告checking/ready/blocked及错误，不传输�
 缺少通用rosbridge、Python图像依赖或PulseAudio运行包时，自动从目标机配置的软件源安装固定白名单包；
 需要可用软件源，也可设 `provisioning.install_missing_packages: false` 只报告缺失。
 不会从网络下载并猜测安装专有控制固件、Drake、标定或整套厂商SDK；不支持的控制版本明确阻止运动。
-缺少真实麦克风、未核验的关节限位或尚未实现的导航协议，也不会靠自动部署变成“全部可用”。
+缺少真实麦克风、未核验的关节限位或不兼容的导航协议，也不会靠自动部署变成“全部可用”。
 
 ### 控制器自动启动的边界
 
@@ -277,6 +277,7 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 | `leg` | `set`、`zero`、`move_joints`、`stop_move` | `/lb_leg_traj` |
 | `waist` | `waist_pitch`、`waist_yaw`、`zero`、`set_pose`、`stop_move` | `/lb_leg_traj`、`/cmd_lb_torso_pose` |
 | `head` | `move_pos`、`zero`、`stop_move` | `/robot_head_motion_data`；停止残余速度用`/cmd_head_vel` |
+| `controlled_spatial` | 建图、保存、打点、载图、按坐标/语义点导航、`stop_nav` | 原生 Leju 导航服务 + JaTen 地图 API |
 | `speaker` | `start`、`stop`、`info`、`set_volume`、`get_volume` | ROS2 `AudioChunk` → 独立rosbridge → 自有底盘PCM播放服务 |
 | `joints` | 系统 `start`、`stop`、`info` | 两路：`sensor/skeleton` 骨架姿态 + `data/json` 原始 joint_state |
 | `imu` | 系统 `start`、`stop`、`info` | 同一原始消息的 IMU；`data/json` |
@@ -300,13 +301,54 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 `stop_move` 不依赖机型探测，仍会尝试零速、取消在途动作及请求暂停；若控制服务/反馈缺失，
 返回 `physical_stop_confirmed: false`，不能假报暂停成功。查询返回的 `state: ready` 仅表示查询成功。
 
-左右/头部 RGB、头部深度、电池、二维雷达点云、扬声器已适配；尚未提供 `mic`、`controlled_spatial` 卡片。
-真机底盘另有导航主机 `192.168.26.22`，其 HTTP API 已验证可读当前地图和地图列表；
-已查到`/leju_node`提供的MoveToTarget/CheckArrived，以及独立Java节点提供的cancel_dispatch_task。
-两者任务ID归属与取消后停止确认尚未打通；`/cancel_task`会杀节点，不能用作普通stop_nav。
-厂商Cartographer建图保存还涉及服务重启和地图就绪确认；不能照搬天轶的Slamtec协议。
-打点可按地图ID/指纹保存真实map系位姿，但完整controlled_spatial仍需上述闭环适配和验证。
-本轮补查已取得底盘自定义服务定义，详细证据见ROBOT_INSPECTION.md末节。
+左右/头部 RGB、头部深度、电池、二维雷达点云、扬声器已适配；未发现可用麦克风，暂不提供 `mic`。
+
+### controlled_spatial：建图、打点和导航
+
+动作名称与天轶2.0保持一致，后端使用本机实际安装的 Leju/JaTen 协议，不能调用 Slamtec 接口：
+
+| 动作 | 参数 | 行为 |
+| --- | --- | --- |
+| `start_mapping` | `map_name` | 切手动并开始 Cartographer 建图；不覆盖已有同名地图 |
+| `stop_mapping` | 无 | 保存地图/路网、重启厂商地图服务，载入并确认地图文件身份 |
+| `tag_place` | `name`，可选 `description` | 保存当前 map 系 x/y/yaw；建图期间先绑定当前建图会话 |
+| `untag_place` / `list_tags` | `name` / 无 | 删除/列出当前地图语义点，列表含相对距离和方向 |
+| `list_maps` / `load_map` | 无 / `map_name` | 列出真实 PGM 地图 / 载入并切回自动模式 |
+| `navigate_to_pose` | `x`、`y`（米）、`yaw`（弧度），可选 `speed` | 按 map 系目标导航 |
+| `navigate_to_tag` | `tag_name`，可选 `speed` | 只精确匹配当前地图中的语义点 |
+| `stop_nav` | 无 | 全身暂停，同时取消原生导航并核实新鲜里程计停稳 |
+
+`start` 只检查原生服务，返回 running；`info` 显示地图、定位、急停、在途任务和建图阶段。
+把新卡片加入画布后使用。已有 `/config/config.yaml` 不会被镜像覆盖，旧部署需在
+`plugins` 下增加 `controlled_spatial: {enabled: true}`；新部署的镜像默认已开启。
+连接参数共用 `provisioning.chassis`，不需要每张卡重复填写 SSH 信息。
+SSH RPC 辅助源码随镜像构建，每次在底盘执行固定操作，使用当地已安装的 ROS 消息类；
+不需要手工安装新服务，不额外开端口或复制一个可能不兼容的消息工作区。
+
+导航的提交、查询和取消均核验为同一服务提供者。ACP 使用厂商返回的 task_id 跟踪，
+到达还需核对地图、位姿和零速反馈；不是“服务返回 success 就完成”。
+速度默认0.15m/s、范围0.05–0.3m/s；启用避障，避障距离0.5m，不暴露禁用避障开关。
+`base_drive` 和新卡共用内部 base 动作锁及 Agent Core 的 base 资源声明，中断走 `stop_nav`。
+停止会先请求全身禁用，不因旧导航提交阻塞这一步，再按顺序原生取消并核实停稳。
+
+**载图不等于定位成功**。载图/保存不会伪造 positionInitialized、解除底盘软件急停、硬件急停、
+碰撞或故障。定位未就绪或软件急停仍有效时，导航明确拒绝，需按厂商操作恢复。
+人工建图时使用现场认可的遥控方式采集，不发送自动探索目标。
+建图、保存、载图和导航都返回 action_id 并通过 ACP 报终态，地图操作最多150秒，
+导航最多150秒，避免 HTTP 请求被厂商保存/重启过程长时间挂住。
+
+语义点和未确认操作保存在已有持久卷 `/config/controlled_spatial.db`，
+绑定地图名、**PGM+YAML 的 SHA256**和路网 MD5；同名地图内容/坐标配置变动后，旧点不会继续导航。
+保存建图成功后才把会话内的点绑定到最终地图身份。
+丢失提交/地图操作确认时不自动重试，也不因容器重启忘掉在途状态；`info` 可查看 pending。
+已知任务可再次 `stop_nav` 请求取消；提交去向或地图变更仍不明时保持阻断，
+需要现场核对厂商状态后人工维护恢复记录，不提供“忽略错误继续运动”的复位入口。
+运行期间不要用另一客户端切换地图/改变坐标原点：周期核对不是原子的跨系统锁。
+
+离线测试覆盖任务ID、取消顺序、重启保留、地图指纹、语义点、地图转换和两卡互斥。
+已在真机只读确认服务同源、地图列表/PGM/YAML指纹及新鲜状态；
+**实际建图保存、载图、导航与途中取消尚未现场运动验收**，不能以单元测试替代。
+
 厂商编号音效不是任意PCM接口；本驱动使用已实际听到声音的底盘标准音频输出。
 
 ### 扬声器安装与使用

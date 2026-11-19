@@ -725,3 +725,26 @@ pitch+10°有一次实测到位完成。支持方向相关的稳态跟踪误差�
   base_drive.info=ready；旧现场配置无需改写即可迁移。joints valid、boot complete、control_enabled=false。
   原speaker /perception/tts与50%音量恢复。330项离线测试、编译、service checker和diff检查通过。
   本轮没有新增依赖、修改部署基础设施或验证实际底盘运动。
+
+## 2026-11-19：新增 controlled_spatial，原生导航与地图只读探针
+
+- 补查发现 `/move_base/set_dispatch_mode` 与提交/到达查询同属 `/leju_node`；
+  CANCEL_CURRENT_TASK=2，区别于另一Java节点的SetDispatchTask=1。已用镜像内固定RPC核对实际ROS图和类型。
+- 当前PGM地图为“斗索”，1239484字节；路网MD5 f36b710ec42aa48f41ac60dba69c0f96；
+  PGM+YAML SHA256 43614b66d7202ef949dd33821e3045fe99f56213be07becb8cf4ec2de00f0c09。
+  `/map/getMapConfig` 使用无扩展名时返回500，不作为导航授权依据；以真实文件指纹核对。
+- 被动WebSocket观测位姿约(4.05,-3.70,-1.54)，positionInitialized=true、Cartographer状态1、
+  runningMode=AUTO，但softwareEstop=true。新导航卡不自动解除该状态，会明确拒绝导航。
+- 新卡复用天轶2.0动作命名，实现建图/保存/载图/语义点/按点或位姿导航；
+  共享base动作锁，已知任务按ID完成ACP；停止先全身禁用、再按序取消原生导航并核实新鲜里程计停稳。
+  不确定提交/地图命令持久化到已有/config卷，重启后不会默认为无在途动作。
+- 本轮没有清除软件急停、发送导航目标、调用建图/保存/载图或重启底盘地图服务。
+  实际地图转换、运动及中途取消均待有人旁站的现场验收，不能据此宣称已通过运动验证。
+- 最终本地候选`local-spatial-261119`（9928796e2fa7）已部署，MCP实际注册controlled_spatial；
+  start=running、list_maps返回实际PGM、list_tags为空、info报告softwareEstop=true且无在途任务。
+  joints valid、boot complete、全身control_enabled=false；控制服务kuavo5w-controller.service的MainPID仍1963，未重启初始化。
+  speaker原输入/perception/tts和50%音量已恢复到ready；未生成测试音频。
+  原镜像/Compose的0600快照及持久卷内config.before-spatial-261119.yaml备份保留，可回退。
+- 358项离线测试、Python编译、service checker及diff检查通过。新增源码复用已有依赖和/config卷，
+  不增加运行包或挂载；Dockerfile仅补COPY。候选742328986字节，比local-base-drive-261119的
+  742189487字节增加139499字节，属于本地叠层增量，不替代正式CI或相对ros-base的完整大小评估。
