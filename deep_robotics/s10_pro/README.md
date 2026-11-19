@@ -132,9 +132,11 @@ slew limit, not a verified physical acceleration controller; an explicit zero
 axis stops immediately, including stopping forward travel while still turning.
 The S10 receive watchdog sends zero when a reader tick sees 600 ms or more
 without an applied command. The reader polls every 50 ms. The descriptor caps
-command TTL at 600 ms during negotiation and admission. Incoming commands
-also have to pass the 500 ms observation freshness gate and sequence/priority
-arbitration. Base ownership checks still apply.
+command TTL at 600 ms. The reader sends zero at the first poll after an applied
+command reaches its effective TTL or its observation reaches 500 ms, whichever
+comes first. Time already elapsed before receipt counts against both limits.
+This early hold leaves the 600 ms command-loss escalation in place. Incoming
+commands also have to pass sequence/priority arbitration and base ownership checks.
 Runtime permission revocation disarms the stream and sends zero.
 
 A rejected/failed native zero remains `stop_pending`, even after disarming.

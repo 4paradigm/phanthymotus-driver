@@ -114,7 +114,7 @@ def test_servo_watchdog_holds_at_600_ms_without_admitting_stale_commands(servo, 
     monkeypatch.setattr(p._sink, '_wall_clock', lambda: stamp + elapsed_ms[0])
 
     values = [.2, 0, 0, 0, 0, 0]
-    submit(p, {**command(p, values, stamp=stamp), 'obs_stamp_ms': stamp})
+    submit(p, {**command(p, values, stamp=stamp), 'ttl_ms': 600})
     assert servo.native.calls[-1][2]['X'] == pytest.approx(.03)
     commands_sent = len(servo.native.calls)
 
@@ -146,7 +146,7 @@ def test_servo_watchdog_holds_at_600_ms_without_admitting_stale_commands(servo, 
     assert p.dispatch('info', {})['control_interface']['rate'] == rate
 
 
-@pytest.mark.parametrize(('age_ms', 'verdict'), [(600, 'APPLIED'), (601, 'DROPPED')])
+@pytest.mark.parametrize(('age_ms', 'verdict'), [(599, 'APPLIED'), (600, 'DROPPED'), (601, 'DROPPED')])
 def test_servo_caps_command_ttl_at_600_ms(servo, monkeypatch, age_ms, verdict):
     p = servo.plugin
     monkeypatch.setattr(p, '_read_loop', lambda: None)
@@ -159,7 +159,41 @@ def test_servo_caps_command_ttl_at_600_ms(servo, monkeypatch, age_ms, verdict):
     last = p.dispatch('info', {})['last_command']
     assert last['verdict'] == verdict
     if verdict == 'DROPPED':
-        assert last['reason'] == 'expired: 601 ms old, ttl 600 ms'
+        assert 'expired' in last['reason']
+
+
+@pytest.mark.parametrize(('ttl_ms', 'obs_age_ms', 'remaining_ms'), [
+    (250, None, 180),  # 70 ms already elapsed in transit
+    (1000, None, 530),  # descriptor caps TTL before subtracting transit
+    (1000, 300, 200),  # observation expires before the command
+])
+def test_s10_sends_zero_at_active_command_expiry_before_watchdog(
+        servo, monkeypatch, ttl_ms, obs_age_ms, remaining_ms):
+    p = servo.plugin
+    monkeypatch.setattr(p, '_read_loop', lambda: None)
+    assert p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})['state'] == 'ready'
+    stamp = p._barrier_ms + 1
+    elapsed = [0]
+    monkeypatch.setattr(p._sink, '_clock', lambda: 1000 + elapsed[0])
+    monkeypatch.setattr(p._sink, '_wall_clock', lambda: stamp + 70)
+    payload = {**command(p, [.2, 0, 0, 0, 0, 0], stamp=stamp), 'ttl_ms': ttl_ms}
+    if obs_age_ms is not None:
+        payload['obs_stamp_ms'] = stamp + 70 - obs_age_ms
+
+    submit(p, payload)
+    assert servo.native.calls[-1][2]['X'] > 0.
+    sent = len(servo.native.calls)
+    elapsed[0] = remaining_ms - 1
+    p._tick()
+    assert len(servo.native.calls) == sent
+
+    elapsed[0] += 1
+    p._tick()
+    assert len(servo.native.calls) == sent + 1
+    assert servo.native.calls[-1][2] == dict.fromkeys(('X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw'), 0.)
+    assert p._sink.stats()['watchdog_strikes'] == 0
+    p._tick()
+    assert len(servo.native.calls) == sent + 1
 
 
 @pytest.mark.parametrize('settings', [

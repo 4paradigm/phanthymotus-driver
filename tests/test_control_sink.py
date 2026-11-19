@@ -149,6 +149,22 @@ def test_descriptor_round_trips():
     assert d.has_force_torque is False
 
 
+@pytest.mark.parametrize("cap", [None, 600])
+def test_descriptor_accepts_an_optional_command_ttl_cap(cap):
+    raw = descriptor_dict()
+    if cap is not None:
+        raw["rate"]["max_command_ttl_ms"] = cap
+    assert parse_descriptor(raw).max_command_ttl_ms == cap
+
+
+@pytest.mark.parametrize("cap", [0, -1, True, "600", math.nan, math.inf, -math.inf])
+def test_descriptor_rejects_invalid_command_ttl_caps(cap):
+    raw = descriptor_dict()
+    raw["rate"]["max_command_ttl_ms"] = cap
+    with pytest.raises(DescriptorError, match="rate.max_command_ttl_ms"):
+        parse_descriptor(raw)
+
+
 @pytest.mark.parametrize("mutate, fragment", [
     (lambda d: d.pop("mode"), "mode"),
     (lambda d: d.update(mode="waltz"), "waltz"),
@@ -238,6 +254,25 @@ def test_command_inside_ttl_is_applied():
     clock.advance(99)
     assert sink.submit(msg).verdict is Verdict.APPLIED
     assert apply.last == (0.1, 0.1)
+
+
+@pytest.mark.parametrize(("cap", "ttl", "age", "verdict"), [
+    (600, 1000, 600, Verdict.APPLIED),
+    (600, 1000, 601, Verdict.DROPPED),
+    (600, 200, 201, Verdict.DROPPED),
+    (None, 1000, 601, Verdict.APPLIED),
+])
+def test_command_ttl_uses_the_lower_of_producer_ttl_and_optional_cap(cap, ttl, age, verdict):
+    clock, apply = FakeClock(), Recorder()
+    raw = descriptor_dict()
+    if cap is not None:
+        raw["rate"]["max_command_ttl_ms"] = cap
+    sink = make_sink(clock, apply, raw)
+    cmd = message(clock, [0.1, 0.1], ttl_ms=ttl)
+    clock.advance(age)
+
+    assert sink.submit(cmd).verdict is verdict
+    assert bool(apply.calls) == (verdict is Verdict.APPLIED)
 
 
 def test_stale_observation_is_dropped_even_when_the_command_is_fresh():

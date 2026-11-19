@@ -245,7 +245,8 @@ class S10LocoServoPlugin:
                 raise RuntimeError(f"native command rejected: {result['ErrorCode']}")
 
     def _new_sink(self):
-        self._sink = _VelocitySink(self._descriptor, self._apply, on_watchdog=self._hold, on_abort=self._hold)
+        self._sink = _VelocitySink(self._descriptor, self._apply, on_watchdog=self._hold,
+                                   on_abort=self._hold, hold_on_command_expiry=True)
         self._last_output = [0.] * 6
         self._sink.rebase(self._last_output)
 
