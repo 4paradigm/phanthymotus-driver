@@ -310,10 +310,22 @@ class RobotSession:
             if self._connection_broken or self._process is None or self._process.stdin is None:
                 raise ConnectionError("Native command channel is unavailable")
             encoded = (command + "\n").encode("ascii")
-            # Commands are shorter than POSIX PIPE_BUF. A nonblocking atomic
-            # write cannot hold a card callback behind a wedged SDK process.
-            if os.write(self._process.stdin.fileno(), encoded) != len(encoded):
-                raise ConnectionError("Native command channel accepted a partial command")
+            fd = self._process.stdin.fileno()
+            remaining = memoryview(encoded)
+            deadline = time.monotonic() + 1.0
+            with selectors.DefaultSelector() as selector:
+                selector.register(fd, selectors.EVENT_WRITE)
+                while remaining:
+                    timeout = deadline - time.monotonic()
+                    if timeout <= 0 or not selector.select(timeout):
+                        raise TimeoutError("Timed out writing native command")
+                    try:
+                        written = os.write(fd, remaining)
+                    except BlockingIOError:
+                        continue
+                    if written == 0:
+                        raise ConnectionError("Native command channel stopped accepting data")
+                    remaining = remaining[written:]
         except (OSError, ValueError) as exc:
             self._break_locked(f"Native command channel failed: {exc}")
             raise RuntimeError(self._error) from exc

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import math
+import os
 from pathlib import Path
 import sys
 import threading
@@ -93,6 +94,26 @@ class FakePublisher:
 
     def close(self):
         self.closed += 1
+
+
+class NativeCommandTests(unittest.TestCase):
+    def test_long_command_survives_nonblocking_pipe_short_writes(self):
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb") as reader, os.fdopen(write_fd, "wb") as writer:
+            os.set_blocking(write_fd, False)
+            command = "TIMED motion " + "0 " * 100_000
+            session = object.__new__(hardware.RobotSession)
+            session._connection_broken = False
+            session._process = types.SimpleNamespace(stdin=writer)
+            received = []
+            thread = threading.Thread(target=lambda: received.append(reader.readline()))
+            thread.start()
+            try:
+                session._send_locked(command)
+            finally:
+                writer.close()
+                thread.join()
+            self.assertEqual(received, [(command + "\n").encode("ascii")])
 
 
 class FrankaCardTests(unittest.TestCase):
