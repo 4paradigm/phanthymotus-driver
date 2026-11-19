@@ -355,8 +355,39 @@ def test_clock_reference_only_declared_after_global_source_confirmation(source, 
     assert 'clock_reference' not in source._declarations()[0]['vendor']
 
 
+def test_missing_tf_does_not_delay_first_or_age_out_next_pair(source, monkeypatch):
+    now = [STAMP + 451_000_000]
+    monkeypatch.setattr(m.time, 'time_ns', lambda: now[0])
+    monkeypatch.setitem(sys.modules, 'rclpy.duration', NS(Duration=lambda **kw: NS(**kw)))
+    source.body_mount.buffer.fail = True
+    waits = []
+    def no_transform(*args, timeout):
+        waits.append(timeout.seconds)
+        now[0] += round(timeout.seconds * 1e9)
+        return False
+    monkeypatch.setattr(source.body_mount.buffer, 'can_transform', no_transform, raising=False)
+    original_get = source.pending.get
+    def get_once(*args, **kwargs):
+        if source.pending.empty():
+            source.stop_event.set()
+            raise queue.Empty
+        return original_get(*args, **kwargs)
+    monkeypatch.setattr(source.pending, 'get', get_once)
+
+    emit(source)
+    assert source.count == 1 and now[0] == STAMP + 451_000_000
+    next_stamp = STAMP + source.frame_interval_ns
+    now[0] = next_stamp + 451_000_000
+    emit(source, stamp=next_stamp)
+    assert source.count == 2 and not waits
+    mounts = [json.loads(msg.data) for topic, msg in source.events if topic.endswith('/body_mount')]
+    assert [packet['stamp_ns'] for packet in mounts] == [STAMP, next_stamp]
+    assert all(packet['status'] == 'unavailable' and 'matrix' not in packet for packet in mounts)
+
+
 def test_wait_for_capture_tf_does_not_block_camera_executor(source, monkeypatch):
     import threading
+    source.count = 1
     monkeypatch.setitem(sys.modules, 'rclpy.duration', NS(Duration=lambda **kw: NS(**kw)))
     source.body_mount.buffer.fail = True
     waits = []
@@ -380,6 +411,7 @@ def test_wait_for_capture_tf_does_not_block_camera_executor(source, monkeypatch)
 
 
 def test_stop_during_tf_wait_does_not_publish_images(source, monkeypatch):
+    source.count = 1
     monkeypatch.setitem(sys.modules, 'rclpy.duration', NS(Duration=lambda **kw: NS(**kw)))
     def stop(*args, **kwargs):
         source.stop_event.set()
@@ -390,6 +422,7 @@ def test_stop_during_tf_wait_does_not_publish_images(source, monkeypatch):
 
 
 def test_tf_wait_timeout_keeps_images_but_never_reuses_transform(source, monkeypatch):
+    source.count = 1
     monkeypatch.setitem(sys.modules, 'rclpy.duration', NS(Duration=lambda **kw: NS(**kw)))
     source.body_mount.buffer.can_transform = lambda *args, **kwargs: False
     source.body_mount.buffer.fail = True
@@ -401,6 +434,7 @@ def test_tf_wait_timeout_keeps_images_but_never_reuses_transform(source, monkeyp
 
 
 def test_tf_arriving_after_50ms_retains_exact_capture_stamp(source, monkeypatch):
+    source.count = 1
     monkeypatch.setitem(sys.modules, 'rclpy.duration', NS(Duration=lambda **kw: NS(**kw)))
     source.body_mount.buffer.fail = True
     def delayed(target, child, stamp, timeout):
@@ -416,6 +450,7 @@ def test_tf_arriving_after_50ms_retains_exact_capture_stamp(source, monkeypatch)
 
 @pytest.mark.parametrize('age', [500_000_001, -50_000_001])
 def test_worker_discards_capture_that_expires_during_tf_wait(source, monkeypatch, age):
+    source.count = 1
     # Finish one queue item, then stop the worker without publishing an image.
     original_get = source.pending.get
     def get(*args, **kwargs):

@@ -116,9 +116,9 @@ class _MountNode:
         return self.output.destroy_publisher(publisher)
 
 
-def _fresh_images(*images):
+def _fresh_images(*images, reserve_ns=0):
     now = time.time_ns()
-    return all(0 < _stamp(image) and -50_000_000 <= now - _stamp(image) <= 500_000_000
+    return all(0 < _stamp(image) and -50_000_000 <= now - _stamp(image) <= 500_000_000 - reserve_ns
                for image in images)
 
 
@@ -404,7 +404,7 @@ class RgbdCameraPlugin:
                         self.sub_node.create_subscription(Image, '/ob_camera_head/' + kind + '/image_raw',
                             lambda m, k=kind: self._image(k, m), qos_profile_sensor_data)
                     self.client = self.sub_node.create_client(GetParameters, '/ob_camera_head/ob_camera_head/get_parameters')
-                    self.sub_node.create_timer(.5, self._parameters)
+                    self.sub_node.create_timer(.05, self._parameters)
                     self.attached = True
                 self.running = True
                 self.registered = False
@@ -437,6 +437,7 @@ class RgbdCameraPlugin:
                 self.stop_event.clear()
                 self.worker = threading.Thread(target=self._work, name='tianyi_rgbd_source', daemon=True)
                 self.worker.start()
+                self._parameters()
 
     def _attach_imu(self):
         if not self.imu_enabled or self.imu_attached:
@@ -586,34 +587,39 @@ class RgbdCameraPlugin:
     def _parameters(self):
         from rcl_interfaces.srv import GetParameters
         with self.lock:
-            if not self.running or self.registered:
+            if not self.running or self.registered or self.future is not None:
                 return
-            if self.future is None:
-                if self.client.service_is_ready():
-                    self.parameter_stage = 'request'
-                    request = GetParameters.Request()
-                    request.names = ['depth_registration', 'time_domain', 'enable_sync_host_time']
-                    try:
-                        self.future = self.client.call_async(request)
-                        self.parameter_stage = 'response'
-                        self.error = None
-                    except Exception as error:
-                        self.error = ('source parameter request failed: ' + str(error))[:256]
-                else:
-                    self.parameter_stage = 'service'
-                    self.error = None
-            elif self.future.done():
-                try:
-                    values = self.future.result().values
-                    self.parameter_values = dict(depth_registration=values[0].bool_value,
-                        time_domain=values[1].string_value[:64], enable_sync_host_time=values[2].bool_value)
-                    self.parameter_stage = 'validation'
-                    self.registered = (values[0].bool_value and values[1].string_value == 'global' and values[2].bool_value)
-                    self.error = (None if self.registered else
-                                  'Orbbec requires registered depth and source global capture time')
-                except Exception as error:
-                    self.error = ('source parameter response failed: ' + str(error))[:256]
-                self.future = None
+            if not self.client.service_is_ready():
+                self.parameter_stage = 'service'
+                self.error = None
+                return
+            self.parameter_stage = 'request'
+            request = GetParameters.Request()
+            request.names = ['depth_registration', 'time_domain', 'enable_sync_host_time']
+            try:
+                self.future = self.client.call_async(request)
+            except Exception as error:
+                self.error = ('source parameter request failed: ' + str(error))[:256]
+                return
+            self.parameter_stage = 'response'
+            self.error = None
+            self.future.add_done_callback(self._parameter_response)
+
+    def _parameter_response(self, future):
+        with self.lock:
+            if not self.running or future is not self.future:
+                return
+            self.future = None
+            try:
+                values = future.result().values
+                self.parameter_values = dict(depth_registration=values[0].bool_value,
+                    time_domain=values[1].string_value[:64], enable_sync_host_time=values[2].bool_value)
+                self.parameter_stage = 'validation'
+                self.registered = (values[0].bool_value and values[1].string_value == 'global' and values[2].bool_value)
+                self.error = (None if self.registered else
+                              'Orbbec requires registered depth and source global capture time')
+            except Exception as error:
+                self.error = ('source parameter response failed: ' + str(error))[:256]
 
     def _info(self, kind, msg):
         with self.lock:
@@ -696,8 +702,10 @@ class RgbdCameraPlugin:
                 out_color.format, out_color.data = 'jpeg', array('B', jpg.tobytes())
                 out_depth.format = '16UC1; compressedDepth zlib'
                 out_depth.data = array('B', zlib.compress(metric.astype('<u2', copy=False).tobytes(), 1))
-                # Do not hold the image lock while its executor delivers TF.
-                self.body_mount.wait_for_capture(max(_stamp(color), _stamp(depth)))
+                # Publish the first pair immediately. Later pairs may wait for
+                # TF outside the lock if the 150 ms wait plus scheduling margin fits.
+                if self.count and _fresh_images(color, depth, reserve_ns=170_000_000):
+                    self.body_mount.wait_for_capture(max(_stamp(color), _stamp(depth)))
                 with self.lock:
                     if not self.running or self.stop_event.is_set():
                         continue
@@ -731,6 +739,9 @@ class RgbdCameraPlugin:
             with self.lock, self.imu_lock:
                 self.running = False
                 self.stop_event.set()
+                if self.future is not None:
+                    future, self.future = self.future, None
+                    future.cancel()
             if self.worker is not None:
                 self.worker.join(timeout=5)
                 if self.worker.is_alive():

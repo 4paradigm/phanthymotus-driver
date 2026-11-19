@@ -1,4 +1,5 @@
 """Offline startup diagnostics must explain missing real source evidence."""
+from concurrent.futures import Future
 import json
 import sys
 from types import SimpleNamespace as NS
@@ -15,6 +16,56 @@ def waiting(source):
     source.count = 0
     source.infos.clear()
     return source
+
+
+def test_start_requests_ready_service_and_validates_response_without_timer(source, monkeypatch):
+    source.stop()
+    source._work = lambda: None
+    monkeypatch.setitem(sys.modules, 'rcl_interfaces.srv', NS(GetParameters=NS(Request=lambda: NS())))
+    response = Future()
+    requests = []
+    def request(message):
+        requests.append(message.names)
+        return response
+    source.client = NS(service_is_ready=lambda: True, call_async=request)
+
+    source.start()
+    assert requests == [['depth_registration', 'time_domain', 'enable_sync_host_time']]
+    assert not source.registered
+    response.set_result(NS(values=[
+        NS(bool_value=True), NS(string_value='global'), NS(bool_value=True)]))
+    assert source.registered and source.error is None
+
+
+def test_discovery_sends_one_request_and_stop_discards_a_late_response(source, monkeypatch):
+    source.stop()
+    source._work = lambda: None
+    monkeypatch.setitem(sys.modules, 'rcl_interfaces.srv', NS(GetParameters=NS(Request=lambda: NS())))
+    ready = False
+    old_response, new_response = Future(), Future()
+    assert old_response.set_running_or_notify_cancel()
+    responses = iter((old_response, new_response))
+    requests = []
+    def request(message):
+        requests.append(message)
+        return next(responses)
+    source.client = NS(service_is_ready=lambda: ready, call_async=request)
+
+    source.start()
+    assert not requests
+    ready = True
+    source._parameters()
+    source._parameters()
+    assert len(requests) == 1
+
+    source.stop()
+    source.start()
+    assert len(requests) == 2
+    values = NS(values=[NS(bool_value=True), NS(string_value='global'), NS(bool_value=True)])
+    old_response.set_result(values)
+    assert not source.registered and source.future is new_response
+    new_response.set_result(values)
+    assert source.registered and source.future is None
 
 
 def test_source_and_cards_explain_parameter_discovery_without_claiming_running(source):
@@ -34,8 +85,7 @@ def test_source_and_cards_explain_parameter_discovery_without_claiming_running(s
 def test_pending_parameter_response_is_distinct_from_service_discovery(source, monkeypatch):
     waiting(source)
     monkeypatch.setitem(sys.modules, 'rcl_interfaces.srv', NS(GetParameters=NS(Request=lambda: NS())))
-    source.client = NS(service_is_ready=lambda: True,
-                       call_async=lambda request: NS(done=lambda: False))
+    source.client = NS(service_is_ready=lambda: True, call_async=lambda request: Future())
     source._parameters()
     status = source.dispatch('info', {})['source_status']
     assert status['stage'] == 'parameter_response'
@@ -59,9 +109,9 @@ def test_parameter_request_failure_is_bounded_diagnostic_and_can_retry(source, m
 
 def test_rejected_parameter_values_identify_registration_and_global_clock_gates(source):
     waiting(source)
-    source.future = NS(done=lambda: True, result=lambda: NS(values=[
+    source.future = NS(result=lambda: NS(values=[
         NS(bool_value=False), NS(string_value='device'), NS(bool_value=False)]))
-    source._parameters()
+    source._parameter_response(source.future)
     status = source.dispatch('info', {})['source_status']
     assert status['stage'] == 'parameter_validation'
     assert status['parameters'] == dict(stage='validation', depth_registration=False,
@@ -71,9 +121,9 @@ def test_rejected_parameter_values_identify_registration_and_global_clock_gates(
 
 def test_parameter_service_rediscovery_does_not_repeat_old_validation_error(source):
     waiting(source)
-    source.future = NS(done=lambda: True, result=lambda: NS(values=[
+    source.future = NS(result=lambda: NS(values=[
         NS(bool_value=False), NS(string_value='device'), NS(bool_value=False)]))
-    source._parameters()
+    source._parameter_response(source.future)
     assert source.error
     source._parameters()  # The fixture service is unavailable on the next query.
     status = source.dispatch('info', {})['source_status']

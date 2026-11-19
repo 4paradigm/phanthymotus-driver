@@ -92,13 +92,12 @@ def test_first_source_start_waits_for_calibration_before_core_snapshots_info():
     finally:thread.join()
 
 
-def test_recovered_vendor_parameters_clear_obsolete_error(monkeypatch):
-    import sys,threading
-    monkeypatch.setitem(sys.modules,'rcl_interfaces.srv',NS(GetParameters=object))
+def test_recovered_vendor_parameters_clear_obsolete_error():
+    import threading
     source=object.__new__(m.RgbdCameraPlugin)
     source.lock=threading.RLock();source.running=True;source.registered=False;source.error='old parameter failure'
-    source.future=NS(done=lambda:True,result=lambda:NS(values=[NS(bool_value=True),NS(string_value='global'),NS(bool_value=True)]))
-    source._parameters()
+    source.future=NS(result=lambda:NS(values=[NS(bool_value=True),NS(string_value='global'),NS(bool_value=True)]))
+    source._parameter_response(source.future)
     assert source.registered and source.error is None
 
 
