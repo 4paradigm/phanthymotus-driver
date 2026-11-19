@@ -6,6 +6,28 @@ ros_namespace: ""
 joint_state_position_unit: "radians"
 
 plugins:
+  wooden_man:
+    enabled: true
+    sensitivity: standard
+    detect_fingers: false  # Also enable hands on the upstream Pose card to use this.
+    host_interaction: true
+    cue_seconds: 3.0
+    settle_seconds: 0.5
+    watch_seconds: 3.0
+    motion_threshold: 0.07
+    moving_frames: 3
+    pose_timeout: 1.5
+    confidence: 0.5
+    finger_threshold: 0.15
+    finger_frames: 2
+    preparation_timeout: 20.0
+    dialogue_timeout: 20.0       # Starts after the estimated speech budget.
+    registration_timeout: 30.0
+    registration_seconds: 1.0
+    registration_confidence: 0.3 # Registration only; motion confidence stays 0.5.
+    registration_grace: 0.35    # Tolerate brief wrist/leg visibility flicker.
+    recovery_timeout: 20.0
+    max_players: 5              # Also set Pose max_persons >= players + bystanders.
   base_drive:
     enabled: true
     # Match the vendor SDK's direct base-drive contract, not the remote-control stream.

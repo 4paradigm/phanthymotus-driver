@@ -90,6 +90,8 @@ COPY q5_camera_worker.py /work/q5_camera_worker.py
 COPY odom.py /work/odom.py
 COPY teleop_state.py /work/teleop_state.py
 COPY robot_status.py /work/robot_status.py
+COPY wooden_man.py /work/wooden_man.py
+COPY games/ /work/games/
 COPY config.yaml /work/config.yaml
 COPY resource/q5_model.urdf /work/resource/q5_model.urdf
 COPY resource/fastdds_udp_only.xml /work/resource/fastdds_udp_only.xml
