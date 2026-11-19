@@ -9,6 +9,38 @@
         </inertial>
     </link>
 
+    <!-- Camera mount. The Bumi camera sits above the waist; the parent link is
+         base_link (ASSUMED — not yet verified on the robot whether the camera
+         yaws with the waist). The mount translation is also a nominal zero
+         (ASSUMED — not yet measured: it is the camera optical centre in parent
+         coordinates, not the centroid or housing face). Both must be re-measured
+         on the robot; see README "Camera mount & frame convention".
+         The rpy below is the same rotation as config.yaml's
+         calibration.camera_to_body.quaternion [-0.5, 0.5, -0.5, 0.5] (xyzw):
+         changing one side without the other will fail
+         tests/test_bumi_camera_mount_urdf.py.
+         camera_link is the SAME physical frame as the runtime
+         bumi_visual_<uuid>_base (body axes, origin at the optical centre), and
+         camera_optical_frame is the SAME physical frame as the image frame_id
+         <hostname>_rgb_optical (optical axes). These two name pairs must be
+         connected explicitly by the tf-tree card (T3) via its frame_links
+         config, never assumed. -->
+    <!-- 相机安装点：姿态与 base_link 同向（x 前 / y 左 / z 上），原点在相机光心 -->
+    <link name="camera_link"/>
+    <joint name="camera_mount_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="camera_link"/>
+        <origin xyz="0.0 0.0 0.0" rpy="0 0 0"/>
+    </joint>
+
+    <!-- 光学系：视觉算法实际使用的坐标系（x 右 / y 下 / z 深） -->
+    <link name="camera_optical_frame"/>
+    <joint name="camera_optical_joint" type="fixed">
+        <parent link="camera_link"/>
+        <child link="camera_optical_frame"/>
+        <origin xyz="0 0 0" rpy="-1.5707963267948966 0 -1.5707963267948966"/>
+    </joint>
+
     <!-- Waist -->
     <link name="waist_yaw_link">
         <inertial>
