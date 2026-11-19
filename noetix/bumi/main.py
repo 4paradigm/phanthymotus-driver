@@ -204,6 +204,13 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        if plugins_cfg.get("object_locator", {}).get("enabled", False):
+            # 查询：读取 object_memory 的记忆，回答并生成目标截图。
+            from object_locator_card import ObjectLocatorPlugin
+            self._plugins.append(ObjectLocatorPlugin(
+                plugins_cfg["object_locator"], namespace, executor))
+            print("[bundle] ObjectLocatorPlugin loaded")
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):
