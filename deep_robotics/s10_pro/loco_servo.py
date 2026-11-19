@@ -67,7 +67,7 @@ def build_descriptor(expected_hz=10.0, settings=None):
         # Approximate 0.40 m standing width plus 0.03 m per side for model uncertainty.
         "footprint": {"half_width": 0.23, "source": "estimate"},
         "rate": {"max_hz": 20.0, "expected_hz": float(expected_hz), "watchdog_ms": 600,
-                 "max_command_ttl_ms": 600, "max_obs_age_ms": 500},
+                 "max_command_ttl_ms": 600, "max_obs_age_ms": 800},
         "force_torque": None,
     }
 

@@ -127,8 +127,8 @@ def test_servo_watchdog_holds_at_600_ms_without_admitting_stale_commands(servo, 
     assert len(servo.native.calls) == commands_sent
 
     elapsed_ms[0] = 501
-    submit(p, {**command(p, values, seq=3, stamp=stamp + 501), 'obs_stamp_ms': stamp})
-    assert p.dispatch('info', {})['last_command']['reason'] == 'observation 501 ms old, limit 500 ms'
+    submit(p, {**command(p, values, seq=3, stamp=stamp + 501), 'obs_stamp_ms': stamp - 300})
+    assert p.dispatch('info', {})['last_command']['reason'] == 'observation 801 ms old, limit 800 ms'
 
     elapsed_ms[0] = 599
     p._tick()
@@ -142,8 +142,26 @@ def test_servo_watchdog_holds_at_600_ms_without_admitting_stale_commands(servo, 
     rate = started['control_interface']['rate']
     assert rate['watchdog_ms'] == 600
     assert rate['max_command_ttl_ms'] == 600
-    assert rate['max_obs_age_ms'] == 500
+    assert rate['max_obs_age_ms'] == 800
     assert p.dispatch('info', {})['control_interface']['rate'] == rate
+
+
+@pytest.mark.parametrize(('obs_age_ms', 'verdict'), [
+    (501, 'APPLIED'), (799, 'APPLIED'), (800, 'DROPPED'), (801, 'DROPPED'),
+])
+def test_s10_admits_delayed_observations_only_with_time_left(servo, monkeypatch, obs_age_ms, verdict):
+    p = servo.plugin
+    monkeypatch.setattr(p, '_read_loop', lambda: None)
+    assert p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})['state'] == 'ready'
+    stamp = p._barrier_ms + 1
+    monkeypatch.setattr(p._sink, '_wall_clock', lambda: stamp)
+    sent = len(servo.native.calls)
+
+    submit(p, {**command(p, [.02, 0, 0, 0, 0, 0], stamp=stamp),
+               'obs_stamp_ms': stamp - obs_age_ms})
+
+    assert p.dispatch('info', {})['last_command']['verdict'] == verdict
+    assert len(servo.native.calls) == sent + (verdict == 'APPLIED')
 
 
 @pytest.mark.parametrize(('age_ms', 'verdict'), [(599, 'APPLIED'), (600, 'DROPPED'), (601, 'DROPPED')])
@@ -165,7 +183,7 @@ def test_servo_caps_command_ttl_at_600_ms(servo, monkeypatch, age_ms, verdict):
 @pytest.mark.parametrize(('ttl_ms', 'obs_age_ms', 'remaining_ms'), [
     (250, None, 180),  # 70 ms already elapsed in transit
     (1000, None, 530),  # descriptor caps TTL before subtracting transit
-    (1000, 300, 200),  # observation expires before the command
+    (1000, 600, 200),  # observation expires before the command
 ])
 def test_s10_sends_zero_at_active_command_expiry_before_watchdog(
         servo, monkeypatch, ttl_ms, obs_age_ms, remaining_ms):
