@@ -293,7 +293,7 @@ def make_handler(bundle_getter: Callable[[], DriverBundle], server_name: str, dr
     return Handler
 
 
-def start_registration(port: int, config: dict, driver_id: str) -> None:
+def start_registration(port: int, config: dict, driver_id: str, refresh=None) -> None:
     import ssl
     import time
     import urllib.request
@@ -316,7 +316,11 @@ def start_registration(port: int, config: dict, driver_id: str) -> None:
                 request = urllib.request.Request(f"{url}/api/mcp", data=payload, headers={"Content-Type": "application/json"}, method="POST")
                 with urllib.request.urlopen(request, timeout=3, context=context):
                     pass
-                time.sleep(30)
+                if refresh is None:
+                    time.sleep(30)
+                else:
+                    refresh.wait(30)
+                    refresh.clear()
             except Exception as exc:
                 print(f"[register] failed: {exc}; retrying in 5s", flush=True)
                 time.sleep(5)
@@ -350,9 +354,12 @@ def run_driver(
 
     ros2 = DualDomainROS2(robot_domain, core_domain)
     ros2.start_spin()
-    bundle = DriverBundle(build_plugins(config, namespace, ros2))
+    plugins = list(build_plugins(config, namespace, ros2))
+    refresh = next((plugin.schema_refresh for plugin in plugins
+                    if hasattr(plugin, "schema_refresh")), None)
+    bundle = DriverBundle(plugins)
     bundle.start_all()
-    start_registration(port, config, driver_id)
+    start_registration(port, config, driver_id, refresh)
     server = ThreadingHTTPServer(("", port), make_handler(lambda: bundle, server_name, driver_id))
     stopping = threading.Event()
 

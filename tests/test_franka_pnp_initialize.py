@@ -121,15 +121,16 @@ class AlignmentCompletionTests(TestCase):
         plugin = PnpRemoteTeleopPlugin()
         definition = plugin.get_tools()[0]
         self.assertEqual(definition["inputSchema"]["properties"]["action"]["enum"],
-                         ["Align", "Follow", "Stop", "Status"])
+                         ["start_trajectory", "stop_trajectory", "stop_motion", "list_trajectories", "delete_trajectory", "status"])
         self.assertNotIn("auto_initialize", definition["configSchema"]["properties"])
-        self.assertEqual(definition["inputSchema"]["x-completion"]["actions"], ["Align"])
+        self.assertEqual(definition["inputSchema"]["x-completion"]["actions"],
+                         ["start_trajectory", "stop_trajectory", "stop_motion", "delete_trajectory"])
 
     def test_visible_stop_preserves_pause_behavior(self):
         plugin = PnpRemoteTeleopPlugin()
         plugin._loaded = True
         schema = plugin.get_tools()[0]["inputSchema"]
-        self.assertTrue(all(hook["action"] == "Stop" for hook in schema["x-hooks"].values()))
+        self.assertTrue(all(hook["action"] == "stop_motion" for hook in schema["x-hooks"].values()))
         with patch.object(plugin, "_stop_host") as stop_host:
             self.assertEqual(plugin.dispatch("Stop", {}), {"state": "stop"})
             with patch.object(plugin, "_ssh", return_value="LoadState=loaded\nActiveState=inactive\n"):

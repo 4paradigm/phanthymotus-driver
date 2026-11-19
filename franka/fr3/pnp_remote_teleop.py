@@ -6,6 +6,8 @@ import re
 import os
 from pathlib import Path
 import subprocess
+import socket
+from datetime import datetime, timezone
 import threading
 import time
 import uuid
@@ -15,9 +17,13 @@ from common.vendor_runtime import action_schema, tool
 
 class PnpRemoteTeleopPlugin:
     PREFIX = "teleop"
+    COMPLETION_ACTIONS = ("stop_trajectory", "stop_motion", "delete_trajectory")
 
     def __init__(self, acp_callback=None):
         self._lock = threading.RLock()
+        self._recording = None
+        self.schema_refresh = threading.Event()
+        self._trajectory_dir = Path(os.environ.get("FRANKA_TEACH_DIR", "/var/lib/fr3-pnp/trajectories"))
         self._loaded = False
         self._stopped = False
         self._init = {"state": "not_initialized"}
@@ -39,35 +45,29 @@ class PnpRemoteTeleopPlugin:
 
     def get_tools(self):
         schema = action_schema({
-            "Align": ([], "Run vendor startup, align slave arms, and complete ACP while holding the aligned pose."),
-            "Follow": ([], "Enable continuous vendor following after alignment has completed."),
-            "Stop": ([], "Stop PNP teleoperation in reverse vendor startup order and verify shutdown."),
-            "Status": ([], "Read PNP service states and vendor execution stages."),
-        }, {})
+            "start_trajectory": ([], "Align the arms and automatically start PNP following."),
+            "stop_trajectory": ([], "End the PNP teleoperation session and verify shutdown."),
+            "stop_motion": ([], "Interrupt PNP teleoperation and verify shutdown."),
+            "list_trajectories": ([], "List saved teaching recordings."),
+            "delete_trajectory": (["trajectory"], "Delete a saved teaching recording."),
+            "status": ([], "Read PNP service states and vendor execution stages."),
+        }, {"trajectory": {"type": "string",
+                           "description": "Paste the filename from list_trajectories."}})
         schema.update({
-            "x-completion": {"actions": ["Align"], "timeout": 150},
+            "x-completion": {"actions": ["start_trajectory", *self.COMPLETION_ACTIONS], "timeout": 150},
             "x-resource": "arm",
             "x-is-dangerous": True,
             "x-hooks": {
-                "on_interrupt_motion": {"action": "Stop"},
-                "on_interrupt_all": {"action": "Stop"},
+                "on_interrupt_motion": {"action": "stop_motion"},
+                "on_interrupt_all": {"action": "stop_motion"},
             },
         })
         definition = tool("teleop", "actuator", "PNP master teleoperation", schema)
         definition["configSchema"] = {
             "type": "object",
             "properties": {
-                "pnp_host": {"type": "string", "title": "PNP host IP (optional)", "default": "",
-                             "description": "Leave empty to discover a wired PNP host with both master USB devices."},
-                "right_slave_ip": {"type": "string", "title": "Right FR3 slave IP", "default": self._settings["right_slave_ip"],
-                                   "description": "Current right slave IP. Disable reading vendor IPs to use this value as a manual override."},
-                "left_slave_ip": {"type": "string", "title": "Left FR3 slave IP", "default": self._settings["left_slave_ip"],
-                                  "description": "Current left slave IP. Disable reading vendor IPs to use this value as a manual override."},
-                "read_vendor_slave_ips": {"type": "boolean", "title": "Read slave IPs from PNP",
-                                          "default": True,
-                                          "description": "Read vendor left/right assignments during initialization. Keep current values if unavailable."},
-                "ssh_user": {"type": "string", "title": "SSH username", "default": "pnp"},
-                "ssh_password": {"type": "string", "title": "SSH initialization password",
+                "ssh_user": {"type": "string", "title": "PNP Host Username", "default": "pnp"},
+                "ssh_password": {"type": "string", "title": "PNP Host Password",
                                  "format": "password", "x-sensitive": True, "writeOnly": True,
                                  "description": "Used for installation or updates; removed from driver memory after initialization."},
 
@@ -237,7 +237,11 @@ class PnpRemoteTeleopPlugin:
                     state = candidate
                     break
         right = hosts.get("right", {})
-        return {"state": state, "acp": self._acp, "initialization": dict(self._init),
+        recording = self._recording
+        return {"state": state, "acp": self._acp,
+                "recording": ({"trajectory": recording[0].name, **recording[3]}
+                              if recording else None),
+                "initialization": dict(self._init),
                 "slave_ips": {side: self._settings[f"{side}_slave_ip"] for side in ("right", "left")},
                 "hosts": hosts,
                 "masters": {arm: data for entry in hosts.values()
@@ -256,10 +260,67 @@ class PnpRemoteTeleopPlugin:
         from franka.fr3.device import JointControlPlugin
         return JointControlPlugin._post_completion(self, action_id, status, result)
 
-    def _watch_alignment(self, action_id, cancelled):
+    def _start_recording(self):
+        self._trajectory_dir.mkdir(parents=True, exist_ok=True)
+        name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        path = self._trajectory_dir / (name + ".partial")
+        receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            receiver.bind(("", 18642))
+            receiver.settimeout(.2)
+            output = path.open("x")
+        except Exception:
+            receiver.close()
+            raise
+        cancelled = threading.Event()
+        summary = {"samples": 0, "error": None}
+        host = self._hosts["right"].rsplit("@", 1)[-1]
+
+        def record():
+            try:
+                with receiver, output:
+                    while not cancelled.is_set():
+                        try:
+                            packet, address = receiver.recvfrom(4096)
+                        except socket.timeout:
+                            continue
+                        if address[0] != host:
+                            continue
+                        try:
+                            sample = json.loads(packet)
+                            if not isinstance(sample.get("stamp_ns"), int) or len(sample["submitted_action"]) != 8:
+                                continue
+                            line = json.dumps(sample, allow_nan=False)
+                        except (ValueError, TypeError, KeyError, AttributeError):
+                            continue
+                        output.write(line + "\n")
+                        summary["samples"] += 1
+            except OSError as exc:
+                summary["error"] = str(exc)
+
+        worker = threading.Thread(target=record, daemon=True)
+        self._recording = (path, cancelled, worker, summary)
+        worker.start()
+
+    def _finish_recording(self, complete=False):
+        if self._recording is None:
+            return {}
+        path, cancelled, worker, summary = self._recording
+        cancelled.set()
+        worker.join()
+        self._recording = None
+        if complete and summary["samples"] and not summary["error"]:
+            destination = path.with_suffix(".jsonl")
+            path.rename(destination)
+            path = destination
+        self.schema_refresh.set()
+        return {"trajectory": path.name, **summary, "complete": path.suffix == ".jsonl"}
+
+    def _watch_alignment(self, action_id, cancelled, teach=False):
         terminal = "error"
         result = {"error": "Alignment timed out"}
         deadline = time.monotonic() + 140
+        released = False
         while time.monotonic() < deadline:
             if cancelled.is_set():
                 terminal, result = "cancelled", {"state": "stop"}
@@ -269,7 +330,27 @@ class PnpRemoteTeleopPlugin:
             except Exception as exc:
                 result = {"error": str(exc)}
                 break
-            if status["state"] == "aligned":
+            if teach and status["state"] == "aligned" and not released:
+                with self._lock:
+                    if cancelled.is_set():
+                        continue
+                    self._acp["message"] = "Alignment complete. Starting Follow."
+                    try:
+                        self._start_recording()
+                    except OSError as exc:
+                        result = {"error": str(exc)}
+                        break
+                    _, errors = self._batch(
+                        (side for side, host in status["hosts"].items() if host["state"] == "aligned"),
+                        lambda side: self._ssh(side, "pnp-enable-follow"),
+                    )
+                if errors:
+                    result = {"error": "Unable to start Follow", "details": errors}
+                    break
+                released = True
+            if (teach and status["state"] == "following") or (not teach and status["state"] == "aligned"):
+                if teach:
+                    status["message"] = "Alignment complete. Follow is active."
                 terminal, result = "completed", status
                 break
             if status["state"] in ("fault", "unreachable", "follow_interrupted"):
@@ -278,7 +359,9 @@ class PnpRemoteTeleopPlugin:
             cancelled.wait(.4)
         if terminal != "completed":
             _, stop_errors = self._batch(self._hosts, self._stop_host)
-            result = {**result, "stop_errors": stop_errors}
+            with self._lock:
+                recording = self._finish_recording()
+            result = {**result, "stop_errors": stop_errors, **recording}
             if stop_errors:
                 terminal = "error"
         with self._lock:
@@ -287,7 +370,10 @@ class PnpRemoteTeleopPlugin:
         error = None
         for attempt in range(3):
             try:
-                self._acp_callback(action_id, terminal, result)
+                self._acp_callback(action_id, terminal, {
+                    key: result[key] for key in ("state", "message", "error", "details", "stop_errors")
+                    if key in result
+                } if teach and terminal == "completed" else result)
                 error = None
                 break
             except Exception as exc:
@@ -296,14 +382,59 @@ class PnpRemoteTeleopPlugin:
         with self._lock:
             if self._acp and self._acp["action_id"] == action_id:
                 self._acp = {"action_id": action_id, "state": "failed" if error else "accepted",
-                             "status": terminal, "error": error}
+                             "status": terminal, "error": error,
+                             **({"message": result["message"]} if "message" in result else {})}
+
+    def _saved_trajectories(self):
+        recording = self._recording
+        return sorted((path.name for path in self._trajectory_dir.iterdir()
+                       if path.is_file() and not path.is_symlink()
+                       and path.suffix in (".jsonl", ".partial")
+                       and (recording is None or path != recording[0])), reverse=True
+                      ) if self._trajectory_dir.is_dir() else []
 
     def dispatch(self, action, args):
+        result = self._dispatch_action(action, args)
+        if action not in self.COMPLETION_ACTIONS or result is None:
+            return result
+        action_id = "fr3_" + action + "_" + uuid.uuid4().hex
+        terminal = "error" if result.get("state") in ("error", "initializing") else "completed"
+
+        def notify():
+            for attempt in range(3):
+                try:
+                    self._acp_callback(action_id, terminal, result)
+                    return
+                except Exception as exc:
+                    if attempt == 2:
+                        print(f"[teleop] ACP {action_id} failed: {exc}", flush=True)
+                    else:
+                        time.sleep(.25 * (attempt + 1))
+
+        threading.Thread(target=notify, name="fr3-teleop-acp", daemon=True).start()
+        return {**result, "action_id": action_id}
+
+    def _dispatch_action(self, action, args):
+        normal_end = action == "stop_trajectory"
         # Core reserves lowercase stop for the card lifecycle.
-        action = {"Align": "align", "Follow": "follow", "Stop": "pause",
+        action = {"start_trajectory": "teach", "stop_trajectory": "pause",
+                  "stop_motion": "pause", "Teach": "teach", "Align": "align", "Follow": "follow", "Stop": "pause",
                   "Status": "status"}.get(action, action)
         with self._lock:
             try:
+                if action == "list_trajectories":
+                    self.schema_refresh.set()
+                    return {"trajectories": self._saved_trajectories()}
+                if action == "delete_trajectory":
+                    name = args.get("trajectory", "")
+                    if not isinstance(name, str) or not re.fullmatch(r"\d{8}T\d{6}\.\d{6}Z\.(?:jsonl|partial)", name):
+                        raise ValueError("Choose a timestamped recording from list_trajectories")
+                    path = self._trajectory_dir / name
+                    if self._recording and path == self._recording[0]:
+                        raise RuntimeError("Stop the active recording before deleting it")
+                    path.unlink()
+                    self.schema_refresh.set()
+                    return {"deleted": name}
                 if action == "config":
                     self._configure(args)
                     return {"state": "configured", "initialization": dict(self._init)}
@@ -328,7 +459,7 @@ class PnpRemoteTeleopPlugin:
                     if errors:
                         return {"state": "error", "errors": errors}
                     return self._status()
-                if action == "align":
+                if action in ("align", "teach"):
                     if self._align_thread and self._align_thread.is_alive():
                         return {"state": "aligning", "action_id": self._acp["action_id"]}
                     if not self._loaded:
@@ -364,9 +495,9 @@ class PnpRemoteTeleopPlugin:
                     self._align_cancel = threading.Event()
                     self._acp = {"action_id": action_id, "state": "waiting_for_motion"}
                     self._align_thread = threading.Thread(target=self._watch_alignment,
-                                                          args=(action_id, self._align_cancel), daemon=True)
+                                                          args=(action_id, self._align_cancel, action == "teach"), daemon=True)
                     self._align_thread.start()
-                    return {"state": "aligning", "action_id": action_id}
+                    return {"state": "aligning", "action_id": action_id, "message": "Aligning. Please wait."}
                 if action in ("pause", "stop"):
                     self._align_cancel.set()
                     if self._init.get("state") == "initializing":
@@ -377,10 +508,11 @@ class PnpRemoteTeleopPlugin:
                     if errors:
                         return {"state": "error", "message": "部分 PNP 遥操服务停止未确认",
                                 "errors": errors}
+                    recording = self._finish_recording(normal_end)
                     if action == "stop":
                         self._loaded = False
                     self._stopped = action == "pause"
-                    return {"state": "stop" if self._stopped else "idle"}
+                    return {"state": "stop" if self._stopped else "idle", **recording}
             except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
                 return {"state": "error", "message": str(exc)}
         return None

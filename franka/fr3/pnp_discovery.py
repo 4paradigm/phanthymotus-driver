@@ -11,7 +11,7 @@ import time
 
 
 
-def wired_interfaces():
+def wired_interfaces(networks=None):
     records = json.loads(subprocess.check_output(["ip", "-j", "-4", "addr", "show"], text=True))
     result = []
     for record in records:
@@ -19,11 +19,18 @@ def wired_interfaces():
         sys = Path("/sys/class/net") / name
         if (sys / "wireless").exists() or not (sys / "device").exists():
             continue
-        if "UP" not in record.get("flags", []):
+        if not {"UP", "LOWER_UP"}.issubset(record.get("flags", [])):
             continue
+        mac = (sys / "address").read_text().strip()
+        addresses = []
         for address in record.get("addr_info", []):
-            if address.get("scope") == "global":
-                result.append((name, address["local"], (sys / "address").read_text().strip()))
+            if address.get("scope") == "global" and (
+                    networks is None or any(ipaddress.ip_address(address["local"]) in network
+                                            for network in networks)):
+                addresses.append(address["local"])
+        if not addresses and networks:
+            result.append((name, None, mac))
+        result.extend((name, address, mac) for address in addresses)
     if not result:
         raise RuntimeError("No active wired IPv4 interface found on Orin")
     return result
@@ -37,6 +44,8 @@ def arp_hosts(interface, local, mac, networks):
         link.bind((interface, 0))
         link.setblocking(False)
         targets = {str(ip) for network in networks for ip in network.hosts() if str(ip) != local}
+        if not targets and all(network.prefixlen == 32 for network in networks):
+            targets = {str(network.network_address) for network in networks}
         for target in targets:
             request = struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, 1, hardware,
                                   socket.inet_aton(local), bytes(6), socket.inet_aton(target))
@@ -57,14 +66,36 @@ def arp_hosts(interface, local, mac, networks):
 def discover(slave_ips, user, password, progress):
     from franka.fr3.pnp_initialize import authenticated_command, paths
     networks = {ipaddress.ip_network(ip + "/24", strict=False) for ip in slave_ips.values()}
-    links = wired_interfaces()
+    links = wired_interfaces(networks)
+    configured = [link for link in links if link[1] is not None]
+    if not configured:
+        progress("configuring_wired_ipv4")
+        if len(links) != 1 or len(networks) != 1:
+            raise RuntimeError("Automatic IPv4 setup needs one active wired interface and one robot subnet")
+        interface, _, mac = links[0]
+        network = next(iter(networks))
+        for suffix in range(185, 200):
+            address = str(network.network_address + suffix)
+            if address in slave_ips.values():
+                continue
+            if arp_hosts(interface, "0.0.0.0", mac, [ipaddress.ip_network(address + "/32")]):
+                continue
+            subprocess.run(["ip", "address", "add", address + "/24", "dev", interface],
+                           check=True, capture_output=True)
+            configured = [(interface, address, mac)]
+            break
+        if not configured:
+            raise RuntimeError("No free IPv4 address found in the robot subnet")
+    links = configured
     excluded = set(slave_ips.values()) | {local for _, local, _ in links}
     candidates = {}
     progress("discovering_wired_hosts")
-    for interface, local, mac in links:
-        for peer in arp_hosts(interface, local, mac, networks):
-            if peer not in excluded:
-                candidates[peer] = (interface, local)
+    with ThreadPoolExecutor(max_workers=min(8, len(links))) as pool:
+        scans = [pool.submit(arp_hosts, interface, local, mac, networks)
+                 for interface, local, mac in links]
+        for (interface, local, _), scan in zip(links, scans):
+            for peer in scan.result() - excluded:
+                candidates.setdefault(peer, (interface, local))
     if len(candidates) > 16:
         raise RuntimeError("Too many wired candidates; specify the PNP IP manually")
     def ssh_open(item):

@@ -1,8 +1,8 @@
 # PNP FR3 teleoperation
 
-The Orin card offers `Align`, `Follow`, `Stop`, and `Status`. The PNP service starts
+The Orin card offers `start_trajectory`, `stop_trajectory`, `stop_motion`, and `status`. The PNP service starts
 the four installed vendor launchers for each selected side in order. The vendor initializer
-moves the arm to its configured pose and initializes the Hand during `Align`.
+moves the arm to its configured pose and initializes the Hand during alignment.
 
 On the PNP workstation, keep the vendor tree at `~/frankateleop` and its
 `polymetis` Conda environment. Run `sh install-pnp.sh` from this directory as
@@ -28,7 +28,7 @@ Run the PNP installer and install the restricted Orin key on each host. Leave
 the left variable empty when both USB devices are attached to one workstation.
 In that mode the card starts the sides that are ready on that workstation.
 The card keeps per-host and per-arm status, and stops all configured services
-when you execute `Stop`. If an SSH start request fails, it attempts to
+when you execute `stop_trajectory` or `stop_motion`. If an SSH start request fails, it attempts to
 stop each selected service and reports any stop that could not be confirmed.
 
 Right and left master identities come from the installed vendor side launchers.
@@ -70,12 +70,12 @@ the destination. FCI runs locally between PNP and the Franka controllers.
 ## Initialize from the canvas
 
 Fill in the workstation IP, SSH username, initial SSH password. The installer discovers the vendor tree
-and Polymetis Conda base on the remote host. Loading the card always starts an asynchronous install. `Status` returns `initialization.state`
+and Polymetis Conda base on the remote host. Loading the card always starts an asynchronous install. `status` returns `initialization.state`
 and the current stage. It checks the package version, installs the image's
 support sources, configures the service and limited sudo rule, authorizes a
 restricted service key, and verifies key login. Installation never starts the
-robot service. Execute `Align` after initialization reports `ready`, then wait for `aligned`
-and its ACP completion before executing `Follow`.
+robot service. Execute `start_trajectory` after initialization reports `ready`. The card
+waits for alignment, requests Follow, and completes ACP after Follow is confirmed.
 
 The driver keeps the private service key and known host keys in the writable
 `/var/lib/fr3-pnp` volume. Keep this volume across image replacements.
@@ -106,7 +106,7 @@ vendor launchers. Original vendor configuration files are retained.
 
 During initialization, vendor right/left IP assignments are read from each
 robot_client configuration and cross-checked against its gripper configuration.
-Resolved IPs and their sources are returned by `Status`; refreshed schemas show
+Resolved IPs and their sources are returned by `status`; refreshed schemas show
 these as editable defaults. Missing or ambiguous assignments retain the current
 values and produce a warning. Disable "Read slave IPs from PNP" to apply manual
 IP edits. Updating schema defaults does not force an open canvas form to discard
@@ -124,20 +124,19 @@ a consistent launcher and calibration entry for each master. Unmapped USB
 devices are reported without assigning a left/right role by enumeration order.
 
 
-## Alignment and explicit follow
+## Teach session
 
-The vendor startup scripts run on `Align`. The prepared run_env copy pauses before
-the continuous follow loop. It uses the same vendor env.step and impedance
-backend to converge to a frozen master target and confirm <=0.05 rad joint
-error with <=0.02 rad/s measured velocity over ten samples. The impedance
-target is held after alignment while the service stays running. The driver
-posts ACP completed for the `Align` action only after all selected arms report
-fresh aligned status. The ACP result and any delivery failure appear in `Status`.
+`start_trajectory` runs the vendor alignment sequence and releases Follow after
+fresh alignment feedback. `stop_trajectory` ends the session. The canvas
+interrupt hooks use `stop_motion`, which requests the same verified PNP
+shutdown. `status` reports the service and execution stage.
 
-Follow releases that waiting session without restarting the vendor scripts.
-The current master/follower difference must remain within 0.05 rad at release.
-Moving a master before executing `Follow` can require stopping and aligning again.
-Stop shuts down the complete service using the configured shutdown order.
+During Follow, the card records PNP telemetry received on UDP port 18642.
+The installed vendor runtime must provide this telemetry. Recordings default
+to `/var/lib/fr3-pnp/trajectories` and use UTC timestamp filenames.
+Confirmed stops with valid samples produce JSONL files. Interrupted or empty
+captures remain partial files.
 
-Service logs on the PNP workstation follow the host journald settings. Review
-the site retention policy when provisioning a workstation.
+Use `list_trajectories` to find a filename and pass it to
+`delete_trajectory`. The driver sends ACP results for start, stop, interrupt,
+and delete operations. Playback remains unimplemented.
