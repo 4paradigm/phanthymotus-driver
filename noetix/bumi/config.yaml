@@ -81,6 +81,12 @@ plugins:
       camera_to_body:
         translation: [0.0, 0.0, 0.0]
         quaternion: [-0.5, 0.5, -0.5, 0.5]
+  media_status:
+    enabled: true
+    # 只读：读工作状态、变化原因、错误码和自动休眠阈值，不下发任何命令。
+    # 1 Hz 足够 —— 状态变化本身很慢，休眠/唤醒的跳变 1 秒内必被看到，
+    # 再快只是把同一个值重复发一遍。取值必须落在 [0.2, 5.0]。
+    poll_interval_s: 1.0
   motion_state:
     enabled: true
     # 2 Hz: sufficient for Agent-facing motion telemetry without excessive DDS reads.
