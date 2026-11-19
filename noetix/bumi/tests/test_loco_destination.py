@@ -1345,6 +1345,49 @@ def test_servo_sees_reserved_rotation_as_busy(monkeypatch):
     assert plugin.is_moving() is True
 
 
+@pytest.mark.parametrize(("field", "value"), [
+    ("vx", 2), ("vx", -2), ("vy", 2), ("vy", -2), ("vyaw", 2), ("vyaw", -2),
+    ("vx", math.nan), ("vy", math.inf), ("vyaw", True), ("vx", "invalid"),
+    ("duration", -1), ("duration", math.inf),
+])
+def test_loco_move_rejects_bad_input_before_motion_arbitration(monkeypatch, field, value):
+    module, _ = _load_device(monkeypatch)
+    controller = FakeHighCtrl()
+    plugin = module.LocoPlugin({}, "robot", None, controller)
+    pause_calls = []
+    plugin.attach_servo(types.SimpleNamespace(pause_for_explicit_command=pause_calls.append))
+
+    result = plugin.dispatch("move", {"_tool_name": "loco", field: value})
+
+    assert result["state"] == "error"
+    assert result["command_sent"] is False
+    assert field in result["error"]
+    assert pause_calls == []
+    assert controller.cmds == []
+    assert plugin._move_thread is None
+
+
+def test_loco_move_sends_normalized_boundaries_and_brakes(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    controller = FakeHighCtrl()
+    plugin = _rotate_plugin(module, monkeypatch, controller)
+    clock = [0.0]
+    monkeypatch.setattr(module, "time", types.SimpleNamespace(
+        monotonic=lambda: clock[0],
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    ))
+
+    result = plugin.dispatch("move", {
+        "_tool_name": "loco", "vx": -1, "vy": 1, "duration": 0.03,
+    })
+    plugin._move_thread.join(timeout=1)
+
+    assert result["state"] == "moving"
+    assert not plugin._move_thread.is_alive()
+    assert controller.cmds[0] == (-1.0, 1.0, 0.0)
+    assert controller.cmds[-1] == (0.0, 0.0, 0.0)
+
+
 def test_rotate_waits_for_previous_move_handoff_and_releases_on_error(monkeypatch):
     module, _ = _load_device(monkeypatch)
     monkeypatch.setattr(module, '_get_default_cmd', lambda: 'walk')
