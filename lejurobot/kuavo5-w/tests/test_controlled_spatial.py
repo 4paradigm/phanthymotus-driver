@@ -528,6 +528,10 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(self.call('start_mapping', map_name='new')['state'], 'executing')
         self.assertEqual(self.completed()[0], 'completed')
         self.assertEqual(self.plugin.store.state('mapping')['phase'], 'mapping')
+        self.assertEqual(self.client.commands, [
+            ('ChangeMode', {'mode': 'MANUAL'}), ('StartCartoMapping', {}),
+            ('ChangeMode', {'mode': 'AUTO'})])
+        self.assertEqual(self.client.feedback['agvState']['runningMode'], 'AUTO')
         self.assertEqual(self.navigate()['state'], 'error')
         self.call('tag_place', name='entry')
         self.bundle.tracker.events.clear()
@@ -537,6 +541,34 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(self.call('list_tags')['tags'][0]['name'], 'entry')
         self.assertEqual(self.client.commands[-1], ('ChangeMode', {'mode': 'AUTO'}))
         self.assertFalse(self.plugin.unresolved())
+
+    def test_mapping_requires_both_active_slam_and_upper_remote_route(self):
+        original = self.client.command
+        def command(method, params, timeout):
+            original(method, params, timeout)
+            if method == 'ChangeMode' and params['mode'] == 'AUTO':
+                self.client.feedback['agvState']['isMapping'] = False
+        self.client.command = command
+        def confirm(predicate, *args, **kwargs):
+            if not predicate():
+                raise RuntimeError('map_transition_not_confirmed_inspect_info')
+        with patch.object(self.plugin, '_wait', side_effect=confirm):
+            self.call('start_mapping', map_name='new')
+            self.assertEqual(self.completed()[0], 'error')
+        self.assertEqual(self.plugin.store.state('mapping')['phase'], 'starting')
+        self.assertTrue(self.plugin.unresolved())
+
+    def test_lost_mapping_remote_route_ack_is_not_reported_ready(self):
+        original = self.client.command
+        def command(method, params, timeout):
+            original(method, params, timeout)
+            if method == 'ChangeMode' and params['mode'] == 'AUTO':
+                raise TimeoutError('lost_auto_ack')
+        self.client.command = command
+        self.call('start_mapping', map_name='new')
+        self.assertEqual(self.completed()[0], 'error')
+        self.assertEqual(self.plugin.store.state('mapping')['phase'], 'starting')
+        self.assertTrue(self.plugin.unresolved())
 
     def test_loading_does_not_clear_stop_or_forge_localization(self):
         self.client.feedback['agvState']['softwareEstop'] = True

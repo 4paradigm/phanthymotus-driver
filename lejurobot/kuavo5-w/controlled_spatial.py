@@ -643,9 +643,19 @@ class ControlledSpatialPlugin:
             self._command('ChangeMode', {'mode': 'MANUAL'}, cancelled)
             self._command('StartCartoMapping', {}, cancelled)
             self._wait(lambda: self.client.observe()['agvState'].get('isMapping') is True, cancelled)
+            # The upper-board G12 remote reaches JaTen through MPC's automatic
+            # velocity source, not the chassis-local MANUAL joystick source.
+            # Restore that route after the factory mapping transition; require
+            # mapping to remain active before advertising a usable session.
+            self._command('ChangeMode', {'mode': 'AUTO'}, cancelled)
+            def mapping_remote_ready():
+                state = self.client.observe()['agvState']
+                return state.get('isMapping') is True and state.get('runningMode') == 'AUTO'
+            self._wait(mapping_remote_ready, cancelled)
             mapping['phase'] = 'mapping'
             self.store.state('mapping', mapping)
-            return {'state': 'mapping', 'map_name': name}
+            return {'state': 'mapping', 'map_name': name,
+                    'remote_control_route': 'upper_board_mpc', 'chassis_mode': 'AUTO'}
         if action == 'stop_mapping':
             if not mapping or mapping['phase'] != 'mapping':
                 raise RuntimeError('no_confirmed_mapping_session_inspect_info')
