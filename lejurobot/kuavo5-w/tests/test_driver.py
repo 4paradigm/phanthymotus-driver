@@ -210,7 +210,7 @@ class DriverContractTests(unittest.TestCase):
                              set(schema["x-action-params"]))
             self.assertTrue(all(set(a["params"]) <= set(schema["properties"])
                                 for a in schema["x-action-params"].values()))
-            if not tool.get('topic_in') and name != 'head':  # synchronous head acceptance has no pending ACP
+            if not tool.get('topic_in'):
                 self.assertIn("x-completion", schema)
             self.assertIn("x-resource", schema)
         self.assertNotIn("waist", tools)
@@ -799,7 +799,7 @@ class DriverContractTests(unittest.TestCase):
                 self.call('base_drive', 'stop_move')
                 self.ros.raw()
                 result = self.call(card, action, **args)
-                self.assertEqual(result['state'], 'completed' if card == 'head' else 'executing')
+                self.assertEqual(result['state'], 'executing')
                 self.assertTrue(result['control_preparation']['resumed'])
                 self.call(card, 'stop_move')
         self.ros.sent_services.clear()
@@ -1672,14 +1672,26 @@ class DriverContractTests(unittest.TestCase):
         self.assertIn('stale', self.call('head', 'zero')['error'])
         self.assertFalse(self.ros.published)
 
-    def test_head_send_completes_without_claiming_measured_arrival(self):
+    def test_head_send_completes_through_acp_without_claiming_measured_arrival(self):
         result = self.call('head', 'zero')
-        self.assertEqual(result['state'], 'completed')
+        self.assertEqual(result['state'], 'executing')
         self.assertFalse(result['measured_convergence'])
         self.assertEqual(result['completion_basis'], 'absolute_command_sent')
+        self.assertTrue(self.bundle.tracker.current('head', result['action_id']))
+        self.assertTrue(wait_until(lambda: self.callbacks))
+        self.assertEqual(self.callbacks[0][:3], (result['action_id'], 'head', 'completed'))
+        self.assertFalse(self.callbacks[0][3]['measured_convergence'])
         self.assertFalse(self.bundle.tracker._active)
-        self.assertNotIn('action_id', result)
-        self.assertFalse(self.callbacks)
+
+    def test_head_stop_during_acp_handoff_cancels_exactly_once(self):
+        result = self.call('head', 'move_pos', yaw=5.)
+        self.assertEqual(result['state'], 'executing')
+        self.call('head', 'stop_move')
+        self.assertTrue(wait_until(lambda: self.callbacks))
+        time.sleep(.25)
+        callbacks = [c for c in self.callbacks if c[0] == result['action_id']]
+        self.assertEqual(len(callbacks), 1)
+        self.assertEqual(callbacks[0][2], 'cancelled')
 
     def test_head_uses_5w_limits_instead_of_generic_sdk_limits(self):
         tool = next(p.tool() for p in self.bundle.plugins if p.PREFIX == 'head')
@@ -1696,14 +1708,14 @@ class DriverContractTests(unittest.TestCase):
         before = time.monotonic()
         result = self.call('head', 'move_pos', yaw=5.)
         self.assertLess(time.monotonic()-before, .5)
-        self.assertEqual(result['state'], 'completed')
+        self.assertEqual(result['state'], 'executing')
         self.assertFalse(result['measured_convergence'])
         self.assertFalse(self.bundle.state.motion_blocked)
 
     def test_head_yaw_only_holds_measured_pitch(self):
         self.ros.raw(q=[0.] * 18 + [math.radians(3), math.radians(7)])
         result = self.call('head', 'move_pos', yaw=10.)
-        self.assertEqual(result['state'], 'completed')
+        self.assertEqual(result['state'], 'executing')
         self.assertAlmostEqual(result['pitch'], -7.)
         self.assertEqual(self.ros.published[-1][0], '/robot_head_motion_data')
         self.assertAlmostEqual(self.ros.published[-1][2]['joint_data'][1], 7.)
@@ -1711,7 +1723,7 @@ class DriverContractTests(unittest.TestCase):
     def test_head_pitch_only_holds_measured_yaw_and_blank_is_omitted(self):
         self.ros.raw(q=[0.] * 18 + [math.radians(9), math.radians(7)])
         result = self.call('head', 'move_pos', yaw=' ', pitch=0.)
-        self.assertEqual(result['state'], 'completed')
+        self.assertEqual(result['state'], 'executing')
         self.assertAlmostEqual(result['yaw'], 9.)
         self.assertEqual(result['pitch'], 0.)
 
@@ -1731,19 +1743,19 @@ class DriverContractTests(unittest.TestCase):
             return result
         with patch.object(self.bundle, 'confirm_control', side_effect=confirm):
             result = self.call('head', 'move_pos', yaw=10., pitch=None)
-        self.assertEqual(result['state'], 'completed')
+        self.assertEqual(result['state'], 'executing')
         self.assertAlmostEqual(result['pitch'], -5.)
 
     def test_head_pitch_direction_and_immediate_acp(self):
         result = self.call('head', 'move_pos', yaw=12, pitch=4)
-        self.assertEqual(result['state'], 'completed')
+        self.assertEqual(result['state'], 'executing')
         self.assertEqual(self.ros.published[1], ('/robot_head_motion_data', 'kuavo_msgs/robotHeadMotionData',
                                                 {'joint_data': [12, -4]}))
         self.assertEqual(result['pitch'], 4)
-        self.assertNotIn('action_id', result)
+        self.assertIn('action_id', result)
         self.assertFalse(self.callbacks)
         tool = next(t for t in self.bundle.get_all_tools() if t['name'] == 'head')
-        self.assertNotIn('x-completion', tool['inputSchema'])
+        self.assertEqual(tool['inputSchema']['x-completion']['actions'], ['move_pos', 'zero'])
 
     def test_slow_acp_delivery_does_not_block_stop(self):
         entered, release = threading.Event(), threading.Event()

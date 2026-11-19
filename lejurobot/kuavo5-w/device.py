@@ -892,12 +892,12 @@ class HeadPlugin(_KuavoPlugin):
     PREFIX, CHANNEL = "head", "head"
 
     def tool(self):
-        return self.schema("Kuavo 5-W 头部绝对角度，单位度；yaw/pitch两自由度，同步返回命令已发送，不表示实测到位。", {
+        return self.schema("Kuavo 5-W 头部绝对角度，单位度；yaw/pitch两自由度。ACP按指令发送完成回执，不表示实测到位。", {
             'yaw': {'type': 'number', 'minimum': -30, 'maximum': 30, 'description': '偏航绝对角度，度；不填保持当前实测角度'},
             'pitch': {'type': 'number', 'minimum': -25, 'maximum': 25, 'description': '俯仰绝对角度，度；正值向上，范围[-25,25]；不填保持当前实测角度'},
         }, {'move_pos': (['yaw', 'pitch'], '设置头部绝对角度，度；至少填一个，未填保持当前角度'),
             'zero': ([], '头部yaw/pitch绝对角度归零'),
-            'stop_move': ([], '请求全身软件暂停')}, 'head')
+            'stop_move': ([], '请求全身软件暂停')}, 'head', ('move_pos', 'zero'))
 
     def _dispatch(self, action, args):
         if action not in ('move_pos', 'zero'):
@@ -929,13 +929,15 @@ class HeadPlugin(_KuavoPlugin):
 
         result = {'completion_basis': 'absolute_command_sent', 'measured_convergence': False,
                   'yaw': target_deg[0], 'pitch': -target_deg[1], 'units': 'deg'}
-        with self.tracker.lock:
-            if self.tracker.current(self.CHANNEL, aid):
-                # Synchronous command acceptance has no pending ACP. Sending
-                # a callback here could race Agent Core's pending registration.
-                active = self.tracker._active.pop(self.CHANNEL)
-                active[2].set()
-        return {'state': 'completed', 'control_preparation': preparation, **result}
+        def complete():
+            # Let the MCP executing response establish Agent Core's pending
+            # record before delivering the ordinary ACP terminal event.
+            if cancelled.wait(.2):
+                return
+            self.tracker.finish(self.CHANNEL, aid, self.PREFIX, 'completed', result)
+        threading.Thread(target=complete, daemon=True, name='acp-head-command').start()
+        return {'state': 'executing', 'action_id': aid,
+                'expected_duration_s': .2, 'control_preparation': preparation, **result}
 
 
 class KuavoBundle:
