@@ -100,7 +100,7 @@ def test_speed_presets_change_forward_limit_without_scaling_yaw_or_raising_floor
 def test_servo_reports_static_standing_footprint_as_an_estimate(servo):
     descriptor = servo.plugin.dispatch('info', {})['control_interface']
     assert descriptor['frame'] == 'base_link'
-    assert descriptor['footprint'] == {'half_width': 0.23, 'source': 'estimate'}
+    assert descriptor['footprint'] == {'half_width': 0.20, 'half_length': 0.23, 'source': 'estimate'}
 
 
 def test_servo_watchdog_holds_at_600_ms_without_admitting_stale_commands(servo, monkeypatch):
