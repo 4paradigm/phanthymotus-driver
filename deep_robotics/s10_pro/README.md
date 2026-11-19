@@ -310,7 +310,7 @@ The existing maintenance `config` API and saved settings remain compatible:
 | `cloud_topic` | One raw `sensor_msgs/PointCloud2` topic whose XYZ values are in metres | `/LIDAR/POINTS` |
 | `cloud_frame_id` | The exact calibrated `header.frame_id` of that source | Obtained from deployment calibration |
 | `camera_optical_from_cloud` | Measured rigid 4x4 transform | Obtained from deployment calibration; no guessed default |
-| `min_depth_m` / `max_depth_m` | Accepted positive optical-Z range, in metres | `0.1` / `50.0` |
+| `min_depth_m` / `max_depth_m` | Accepted positive optical-Z range, in metres | `0.301` / `50.0` |
 | `rate_hz` | Maximum number of clouds submitted per second | `5.0`, configurable up to `15.0` |
 
 The transform uses column vectors:
