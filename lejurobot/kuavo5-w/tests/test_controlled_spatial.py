@@ -618,6 +618,22 @@ class SpatialTests(unittest.TestCase):
         self.assertFalse(self.plugin.unresolved())
         self.assertEqual(self.client.identity[0], 'factory')
 
+    def test_worker_preflight_failure_does_not_latch_map_busy(self):
+        original = self.plugin._require_stationary
+        calls = []
+        def stationary():
+            calls.append(True)
+            if len(calls) == 2:
+                raise RuntimeError('temporary_feedback_loss')
+            return original()
+        self.plugin._require_stationary = stationary
+        self.call('load_map', map_name='other')
+        status, result = self.completed()
+        self.assertEqual(status, 'error')
+        self.assertEqual(result['reason'], 'map_preflight_failed_no_command_sent')
+        self.assertFalse(self.plugin.unresolved())
+        self.assertFalse(self.client.commands)
+
     def test_save_waits_for_factory_optimization_without_short_rpc_timeout(self):
         self.call('start_mapping', map_name='new')
         self.completed()

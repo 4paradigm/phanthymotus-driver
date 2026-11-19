@@ -640,12 +640,14 @@ class ControlledSpatialPlugin:
                 failed_stage = (self._map_pending or {}).get('stage')
                 # 8211 is the verified native precondition rejection, before
                 # ChangeCartoMap touches the map. No mutation is still running.
-                if (action == 'load_map' and isinstance(exc, MapCommandRejected)
-                        and exc.method == 'ChangeCartoMap' and exc.code == 8211):
+                if (failed_stage is None or
+                        (action == 'load_map' and isinstance(exc, MapCommandRejected)
+                         and exc.method == 'ChangeCartoMap' and exc.code == 8211)):
                     self._map_pending = None
                     self._persist()
                 self.bundle.tracker.finish('base', aid, self.PREFIX, 'error',
-                    {'reason': 'factory_map_command_rejected' if isinstance(exc, MapCommandRejected)
+                    {'reason': 'map_preflight_failed_no_command_sent' if failed_stage is None
+                               else 'factory_map_command_rejected' if isinstance(exc, MapCommandRejected)
                                else 'map_transition_unconfirmed_inspect_info',
                      'failed_stage': failed_stage,
                      'error_type': type(exc).__name__, 'map_state': self.store.state('mapping')})
