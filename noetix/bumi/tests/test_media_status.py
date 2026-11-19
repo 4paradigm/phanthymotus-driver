@@ -2,9 +2,9 @@
 
 `media_status_spec` imports no `rclpy` precisely so that these can run on a
 laptop. What is worth pinning down here is not that the dictionary has the right
-keys but the three decisions that would be silent if they broke: sleep is not a
-fault, an unreadable status is not a healthy one, and nothing is nested (the
-dashboard renders a nested object as raw JSON text).
+keys but the decisions that would be silent if they broke: sleep is not a
+fault, neither an unreadable nor an unrecognised status is a healthy one, and
+nothing is nested (the dashboard renders a nested object as raw JSON text).
 """
 import sys
 import threading
@@ -91,13 +91,36 @@ def test_an_unseen_wakeup_is_null_rather_than_a_guess():
     assert payload["last_wakeup_age_s"] is None
 
 
-def test_a_state_added_by_a_firmware_update_stays_readable():
+def test_a_state_added_by_a_firmware_update_stays_readable_but_unclassified():
     payload = _sample(work_status="HIBERNATING", reason="SOMETHING_NEW")
 
+    # The raw names survive so an operator can see what the firmware added ...
     assert payload["work_status"] == "HIBERNATING"
     assert payload["work_status_text"] == "HIBERNATING"
+    assert payload["reason"] == "SOMETHING_NEW"
+    assert payload["reason_text"] == "SOMETHING_NEW"
     assert payload["awake"] is False
-    assert payload["healthy"] is True
+    # ... but this driver has no basis to call a state it has never seen healthy.
+    assert payload["healthy"] is None
+
+
+def test_one_unrecognised_half_is_enough_to_withhold_a_health_claim():
+    # Guards against an `or` in the check, and against checking only the status.
+    assert _sample(work_status="HIBERNATING",
+                   reason="CMD_SLEEPED")["healthy"] is None
+    assert _sample(work_status="SLEEPED",
+                   reason="SOMETHING_NEW")["healthy"] is None
+
+
+def test_every_known_pair_still_receives_a_health_verdict():
+    # The fix must not withhold a verdict from the vocabulary we do understand:
+    # all 32 pairs are classified, including the one hard fault.
+    for status in spec.WORK_STATUS_TEXT:
+        for reason in spec.REASON_TEXT:
+            payload = _sample(work_status=status, reason=reason)
+            assert payload["healthy"] is not None, (status, reason)
+    assert _sample(work_status="SLEEPED", reason="ERROR_SLEEPED")["healthy"] is False
+    assert _sample(work_status="SLEEPED", reason="CMD_SLEEPED")["healthy"] is True
 
 
 def test_a_pybind_enum_value_is_normalized_and_labelled():

@@ -3296,7 +3296,7 @@ class MediaStatusPlugin:
                 "出错休眠、复位）、最近一次错误码与说明、自动休眠阈值，"
                 "以及本驱动观察到该状态持续的时长。"
                 "休眠是正常状态，不是故障 —— 只有出错休眠（ERROR_SLEEPED）才算坏；"
-                "读不到状态时 healthy 为 null 而不是 true，"
+                "读不到状态、或固件新增了未识别的状态/原因时 healthy 为 null 而不是 true，"
                 "媒体单元始终没连上时 controller_present 为 false（重试不会自行恢复）。"
                 f"不控制机器人，也不会把它唤醒。发布到 {self._node.topic}。"
             ),
