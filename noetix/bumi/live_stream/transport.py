@@ -132,6 +132,9 @@ class RTMPPublisher:
 
 def _isolated_publish_loop(conn) -> None:
     """Keep blocking native librtmp calls in a killable child process."""
+    # Spawn starts a fresh interpreter, so protect stdout/stderr before any I/O.
+    from common import logsafe
+    logsafe.install(check_fd=False)
     publisher = None
     try:
         operation, value = conn.recv()

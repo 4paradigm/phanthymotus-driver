@@ -47,6 +47,32 @@ class FakeLibrtmp:
         pass
 
 
+def test_rtmp_child_installs_atomic_logging_before_receiving(monkeypatch):
+    """Spawned publishers must protect container log framing on entry."""
+    import types
+    import live_stream.transport as transport
+
+    calls = []
+
+    def install(*, check_fd):
+        calls.append(("logsafe", check_fd))
+
+    # Windows unit tests may not have the deployment's /work/common on PYTHONPATH.
+    monkeypatch.setitem(sys.modules, "common",
+                        types.SimpleNamespace(logsafe=types.SimpleNamespace(install=install)))
+
+    class FakeConn:
+        def recv(self):
+            assert calls == [("logsafe", False)]
+            raise EOFError
+
+        def close(self):
+            calls.append(("close",))
+
+    transport._isolated_publish_loop(FakeConn())
+    assert calls == [("logsafe", False), ("close",)]
+
+
 def test_flv_chunks_reassembled_into_complete_tags():
     data = b"FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00" + flv_tag(18) + flv_tag(9)
     f = FLVFramer()
