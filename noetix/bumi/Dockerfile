@@ -142,6 +142,8 @@ COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+# Runtime sources for the walking-mode backend imported by main.py.
+COPY walking_mode.py walking_mode_client.py /work/
 # Navi support modules are independent from device.py for ROS-free tests.
 COPY loco_servo.py /work/loco_servo.py
 COPY imu_distance_control.py /work/imu_distance_control.py

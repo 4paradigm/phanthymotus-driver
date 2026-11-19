@@ -26,6 +26,7 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from datetime import datetime
 from typing import Any
@@ -129,7 +130,9 @@ def _get_default_cmd():
     return _get_control_cmd("DEFAULT")
 
 _WORKMODE_NAMES = {
-    0: "enabled", 1: "ready", 2: "walking", 5: "dance",
+    # App status definitions and the 2026-11-11 hardware log agree on 2/3.
+    # These are feedback codes, not ControlCmd values (RUN is command 4).
+    0: "enabled", 1: "ready", 2: "walking", 3: "whole_body_walking", 5: "dance",
     8: "greet", 9: "shake", 10: "cheer", 11: "start_teach",
     12: "end_teach", 14: "save_teach_1", 23: "play_teach",
     26: "protection", 27: "fall_to_stand", 28: "stand_to_fall",
@@ -413,10 +416,15 @@ class LocoPlugin:
         # Set by LocoServoPlugin at construction. `loco` is built first, so the
         # link cannot be a constructor argument in this direction.
         self._servo = None
+        self._walking_mode = None
 
     def attach_servo(self, servo) -> None:
         """Let the streaming chassis card be paused before we drive it ourselves."""
         self._servo = servo
+
+    def attach_walking_mode(self, walking_mode) -> None:
+        """Share one mode-switch backend between both locomotion tools."""
+        self._walking_mode = walking_mode
 
     def _distance_full_scale(self):
         """Measured normalised-command-to-m/s calibration from the servo card.
@@ -438,6 +446,19 @@ class LocoPlugin:
         thread = self._move_thread
         return bool((thread is not None and thread.is_alive())
                     or self._rotate_state["state"] == "running" or self._body_action)
+
+    @contextmanager
+    def reserve_walking_mode(self):
+        """Exclude moves, rotations, body actions and servo resume atomically."""
+        with self._rotate_lock:
+            if self.is_moving():
+                raise RuntimeError("底盘已有动作，请停止移动或等待动作结束后再切换模式。")
+            self._body_action = "walking_mode"
+        try:
+            yield
+        finally:
+            with self._rotate_lock:
+                self._body_action = None
 
     def publish_velocity(self, x: float, y: float, z: float) -> None:
         """One normalised velocity command, through this plugin's rate limiter.
@@ -473,13 +494,17 @@ class LocoPlugin:
             self._servo.set_explicit_velocity_owner(owned)
 
     def get_tools(self) -> list:
-        return [
+        tools = [
             self._loco_tool(),
             self._loco_relative_move_tool(),
             self._stand_up_lie_prone_tool(),
             self._semantic_action_tool(),
             self._action_recording_tool(),
         ]
+        if self._walking_mode is not None:
+            for tool in tools[:2]:
+                self._walking_mode.add_to_tool(tool)
+        return tools
 
     def _loco_tool(self) -> dict:
         return {
@@ -519,7 +544,7 @@ class LocoPlugin:
                 "x-action-params": {
                     "move": {
                         "params": ["vx", "vy", "vyaw", "duration"],
-                        "description": "Move with specified velocities. Requires walking mode.",
+                        "description": "Move with specified velocities in lower-body or whole-body walking mode.",
                     },
                     "stop_move": {
                         "params": [],
@@ -533,7 +558,7 @@ class LocoPlugin:
     def _loco_relative_move_tool(self) -> dict:
         return {
             "name": "loco_relative_move", "type": "actuator", "multiInstance": False,
-            "description": "Bumi 目标运动：按 x/y 目标点前进+转弯走过去，或按 IMU 航向原地旋转指定角度。目标移动前须保持机器人静止以标定；位置估计存在打滑与漂移，实际精度未经验证。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
+            "description": "Bumi 目标运动：按 x/y 目标点前进+转弯走过去，或按 IMU 航向原地旋转指定角度。目标移动前须保持机器人静止以标定；位置估计存在打滑与漂移，实际精度未经验证。旋转容差 ±2°。须已处于仅腿部或全身行走模式，地面平坦防滑，运动区域无人无障碍。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -656,7 +681,8 @@ class LocoPlugin:
         }
 
     def start(self) -> None:
-        pass  # The standalone distance worker reads the SDK IMU and joint states directly.
+        if self._walking_mode is not None:
+            self._walking_mode.start()
 
     def stop(self) -> None:
         # BumiDeviceBundle.stop_all calls this during SIGTERM/redeploy. The
@@ -665,6 +691,8 @@ class LocoPlugin:
         # completes the ACP action before Agent Core is left holding a
         # pending action (mirrors VisionCapturePlugin.stop).
         self._stop_move()
+        if self._walking_mode is not None:
+            self._walking_mode.stop()
         self._wait_for_rotate_idle()
 
     def _wait_for_rotate_idle(self, timeout_s: float = 6.0) -> bool:
@@ -691,6 +719,7 @@ class LocoPlugin:
         if action == "config" and args.get('_tool_name') == 'loco_relative_move':
             return self._apply_distance_config(args)
         if action == "start":
+            self.start()
             return {"state": "ready"}
         if action == "stop":
             # The streaming card goes first. Stopping the chassis and leaving a
@@ -702,6 +731,16 @@ class LocoPlugin:
             return {"state": "idle"}
 
         tool_name = args.pop('_tool_name', '')
+
+        if action == "walking_mode" and tool_name in ("loco", "loco_relative_move"):
+            if self._walking_mode is None:
+                return {"state": "error", "code": "walking_mode_disabled",
+                        "command_sent": False, "error": "行走模式切换未启用。"}
+            # Return the final mode result to this call. An ACP callback from a
+            # manual canvas call also wakes the decision core on deployed cores.
+            result = self._walking_mode.dispatch(
+                action, {"walking_model": args.get("walking_model")})
+            return {"action": action, **result}
 
         handler = None
         if tool_name == "loco" and action == "move":
@@ -783,19 +822,9 @@ class LocoPlugin:
             return self._do_move_impl(args)
 
     def _do_move_impl(self, args: dict) -> dict:
-        # Check if in walking mode
-        mode = int(self._high_ctrl.get_mode())
-        if mode == 26:
-            return {"state": "error", "error": "Robot in protection mode, cannot move"}
-        if mode != 2:
-            return {
-                "state": "error",
-                "error": (
-                    f"movement requires workmode=2 (walking); current mode is "
-                    f"{mode} ({_WORKMODE_NAMES.get(mode, 'unknown')}). "
-                    "Use switch_mode switch=walk first."
-                ),
-            }
+        mode_error = self._rotate_mode_error()
+        if mode_error is not None:
+            return mode_error
 
         vx = float(args.get("vx", 0))
         vy = float(args.get("vy", 0))
@@ -851,13 +880,16 @@ class LocoPlugin:
             return {"state": "moving", "vx": vx, "vy": vy, "vyaw": vyaw, "duration": "continuous (5s watchdog)"}
 
     def _stop_move(self) -> dict:
-        self._rotate_stop_event.set()
-        self._move_stop_event.set()
-        if self._move_thread and self._move_thread.is_alive():
-            self._move_thread.join(timeout=1)
-        if self._high_ctrl is not None:
-            self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
-        self._set_servo_velocity_owner(False)
+        walking_mode = getattr(self, "_walking_mode", None)
+        guard = walking_mode.cancel_and_brake() if walking_mode is not None else nullcontext()
+        with guard:
+            self._rotate_stop_event.set()
+            self._move_stop_event.set()
+            if self._move_thread and self._move_thread.is_alive():
+                self._move_thread.join(timeout=1)
+            if self._high_ctrl is not None:
+                self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
+            self._set_servo_velocity_owner(False)
         return {"state": "stopped"}
 
     def _do_rotate(self, args: dict) -> dict:
@@ -987,16 +1019,18 @@ class LocoPlugin:
         return angle_deg, self._rotate_mode_error()
 
     def _rotate_mode_error(self) -> dict | None:
+        """Shared mode check for velocity moves, target moves and rotations."""
         mode = int(self._high_ctrl.get_mode())
         if mode == 26:
             return {"state": "error", "error": "Robot in protection mode, cannot move"}
-        if mode != 2:
+        if mode not in (2, 3):
             return {
                 "state": "error",
                 "error": (
-                    f"movement requires workmode=2 (walking); current mode is "
+                    "movement requires workmode=2 (walking) or 3 (whole_body_walking). "
+                    "Current mode is "
                     f"{mode} ({_WORKMODE_NAMES.get(mode, 'unknown')}). "
-                    "Use switch_mode switch=walk first."
+                    "Select lower_body or whole_body using action=walking_mode."
                 ),
             }
         return None
@@ -2702,15 +2736,6 @@ class CameraPlugin:
 # These cards intentionally live in device.py with the base device plugins so
 # the Bumi bundle has a single implementation module.
 
-
-_WORKMODE_NAMES = {
-    0: "enabled", 1: "ready", 2: "walking", 5: "dance",
-    8: "greet", 9: "shake", 10: "cheer", 11: "start_teach",
-    12: "end_teach", 14: "save_teach_1", 23: "play_teach",
-    26: "protection", 27: "fall_to_stand", 28: "stand_to_fall",
-    29: "save_teach_2", 30: "disabled", 31: "dance1", 32: "dance2",
-    33: "tear",
-}
 
 _MOTOR_ERROR_NAMES = {
     0x02: "overcurrent",

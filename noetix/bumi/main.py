@@ -120,6 +120,7 @@ def _disable_vendor_video_capture_service(cfg: dict) -> None:
 class BumiDeviceBundle:
     def __init__(self, cfg: dict, namespace: str, executor, high_ctrl, media_ctrl):
         self._plugins: list = []
+        self._walking_mode = None
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
         loco_plugin = None
@@ -147,6 +148,15 @@ class BumiDeviceBundle:
                 plugins_cfg["loco"], namespace, executor, high_ctrl)
             self._plugins.append(loco_plugin)
             print("[bundle] LocoPlugin loaded")
+
+        if (plugins_cfg.get("walking_mode", {}).get("enabled", False)
+                and high_ctrl is not None and loco_plugin is not None):
+            from walking_mode import WalkingModePlugin
+            self._walking_mode = WalkingModePlugin(
+                plugins_cfg["walking_mode"], namespace, executor, high_ctrl,
+                loco_plugin=loco_plugin)
+            loco_plugin.attach_walking_mode(self._walking_mode)
+            print("[bundle] Walking mode loaded into loco and loco_relative_move (App TCP)")
 
         if (plugins_cfg.get("loco_servo", {}).get("enabled", False)
                 and high_ctrl is not None):
@@ -237,6 +247,10 @@ class BumiDeviceBundle:
         return tools
 
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
+        # Saved skills can still call the former standalone tool. New tool
+        # discovery exposes mode selection through the two locomotion cards.
+        if tool_name == "walking_mode" and self._walking_mode is not None:
+            return self._walking_mode.dispatch(args.pop("action", tool_name), args)
         for p in self._plugins:
             plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
             for tool_def in plugin_tools:
