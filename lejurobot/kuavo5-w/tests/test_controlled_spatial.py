@@ -561,6 +561,49 @@ class ClientTests(unittest.TestCase):
 
 
 class BundleIntegrationTests(unittest.TestCase):
+    def test_container_start_configures_music_without_starting_control_cards(self):
+        from test_driver import driver, FakeRos1, FakeNode
+        for enabled, automation in ((False, True), (True, True), (False, False)):
+            with self.subTest(enabled=enabled, automation=automation), tempfile.TemporaryDirectory() as folder:
+                ros = FakeRos1()
+                bundle = driver.KuavoBundle({}, 'test', ros, FakeNode())
+                bundle.spatial.close()
+                client = Client()
+                bundle.spatial = ControlledSpatialPlugin(bundle, {
+                    'db_path': folder + '/db', 'motion_music_enabled': enabled}, client)
+                bundle.startup_checks.provisioner.enabled = automation
+                bundle._auto_start = []
+                try:
+                    with patch.object(bundle.startup_checks, 'start'), patch.object(bundle.peripherals, 'start'):
+                        bundle.start_background()
+                        bundle.start_background()
+                    if automation:
+                        bundle.spatial._music_thread.join(2)
+                        self.assertEqual(client.music_requests, [{'enabled': enabled}])
+                        self.assertEqual(bundle.spatial.startup_status()['motion_music']['state'], 'disabled')
+                    else:
+                        self.assertFalse(getattr(client, 'music_requests', []))
+                        self.assertEqual(bundle.spatial.startup_status()['motion_music']['state'], 'skipped')
+                    self.assertEqual(bundle.spatial.startup_status()['state'], 'idle')
+                    self.assertFalse(client.calls)
+                    self.assertFalse(ros.services)
+                    self.assertFalse(ros.published)
+                finally:
+                    bundle.close()
+
+    def test_music_failure_is_visible_and_retry_wait_is_cancellable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            bundle = Bundle()
+            bundle.startup_checks = types.SimpleNamespace(provisioner=types.SimpleNamespace(
+                enabled=True, _target=lambda role: {}))
+            client = Client()
+            client.native = lambda *a, **k: (_ for _ in ()).throw(ConnectionError('offline'))
+            plugin = ControlledSpatialPlugin(bundle, {'db_path': folder + '/db'}, client)
+            plugin.start_background()
+            wait(lambda: plugin.startup_status()['motion_music']['state'] == 'unavailable')
+            plugin.close()
+            self.assertFalse(plugin._music_thread.is_alive())
+
     def test_both_card_starts_share_preparation_without_enabling_whole_body(self):
         from test_driver import driver, FakeRos1, FakeNode
         with tempfile.TemporaryDirectory() as folder, patch.object(driver, '_acp_complete'):
@@ -577,7 +620,7 @@ class BundleIntegrationTests(unittest.TestCase):
                     bundle.spatial._startup_thread.join(2)
                     self.assertTrue(bundle.spatial.startup_status()['chassis_preparation']['old_task_cancelled'])
                 self.assertEqual([c[0] for c in client.calls], ['prepare'])
-                self.assertEqual(client.music_requests, [{'enabled': False}])
+                self.assertFalse(getattr(client, 'music_requests', []))
                 self.assertFalse(ros.services)
                 self.assertFalse(ros.published)
             finally:

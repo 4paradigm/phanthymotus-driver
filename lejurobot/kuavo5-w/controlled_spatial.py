@@ -117,6 +117,9 @@ class ControlledSpatialPlugin:
         self._startup = None
         self._startup_key = None
         self._startup_thread = None
+        self._music_status = {'state': 'idle'}
+        self._music_thread = None
+        self._closed = threading.Event()
         self._preparation = None
         self._task = None
         self._uncertain = False
@@ -182,15 +185,10 @@ class ControlledSpatialPlugin:
                 'Checking chassis status in background, please wait. Control will be ready automatically.'}
             def worker():
                 try:
-                    # Audio configuration is independent of motor state.
-                    try:
-                        music = self.client.native('motion_music', enabled=self._motion_music_enabled)
-                    except Exception:
-                        music = {'state': 'unavailable'}
                     result = self.prepare_chassis(request_epoch=key[0])
                     if key != (self.bundle._stop_epoch, self.bundle.ros1.connection):
                         raise RuntimeError('chassis_start_superseded_by_stop_or_reconnect')
-                    status = {'state': 'running', 'chassis_preparation': result, 'motion_music': music}
+                    status = {'state': 'running', 'chassis_preparation': result}
                 except Exception as exc:
                     status = {'state': 'error', 'error': str(exc).encode('unicode_escape').decode('ascii')[:400]}
                 with self._startup_guard:
@@ -200,11 +198,39 @@ class ControlledSpatialPlugin:
             self._startup_thread.start()
             return dict(self._startup)
 
+    def start_background(self):
+        """Configure the movement track without starting any chassis control."""
+        with self._startup_guard:
+            if self._music_thread is not None or self._closed.is_set():
+                return
+            provisioner = self.bundle.startup_checks.provisioner
+            if not provisioner.enabled or provisioner._target('chassis').get('enabled', True) is False:
+                self._music_status = {'state': 'skipped', 'reason': 'automatic_chassis_access_disabled'}
+                return
+            self._music_status = {'state': 'loading'}
+            def worker():
+                while not self._closed.is_set():
+                    try:
+                        status = self.client.native('motion_music', enabled=self._motion_music_enabled)
+                    except Exception:
+                        status = {'state': 'unavailable', 'retry_in_s': 30}
+                    with self._startup_guard:
+                        self._music_status = status
+                    if status.get('state') in ('enabled', 'disabled', 'unsupported', 'blocked'):
+                        return
+                    if self._closed.wait(30):
+                        return
+            self._music_thread = threading.Thread(target=worker, daemon=True, name='motion-music-start')
+            self._workers.add(self._music_thread)
+            self._music_thread.start()
+
     def startup_status(self):
         with self._startup_guard:
-            if self._startup_key != (self.bundle._stop_epoch, self.bundle.ros1.connection):
-                return {'state': 'idle'}
-            return dict(self._startup or {'state': 'idle'})
+            status = (dict(self._startup or {'state': 'idle'})
+                      if self._startup_key == (self.bundle._stop_epoch, self.bundle.ros1.connection)
+                      else {'state': 'idle'})
+            status['motion_music'] = dict(self._music_status)
+            return status
 
     def prepare_chassis(self, request_epoch=None):
         """Explicit card start: cancel old tasks, release soft stop, confirm rest.
@@ -626,6 +652,7 @@ class ControlledSpatialPlugin:
         raise RuntimeError('map_transition_not_confirmed_inspect_info')
 
     def close(self):
+        self._closed.set()
         for worker in list(self._workers):
             worker.join(timeout=1)
         if not any(worker.is_alive() for worker in self._workers):

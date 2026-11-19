@@ -1350,6 +1350,7 @@ class KuavoBundle:
 
     def start_background(self):
         self.startup_checks.start()
+        self.spatial.start_background()
         self.peripherals.start()
         allowed = {'joints', 'imu', 'loco_state', *PERIPHERAL_CARDS}
         for name in self._auto_start:

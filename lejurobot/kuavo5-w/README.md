@@ -408,7 +408,7 @@ EOF只作结束标记跳过，后续PCM继续播放；如需清空已排队PCM�
 - 头部 `move_pos(yaw,pitch)` 为绝对**度**，yaw范围[-30,30]、pitch[-25,25]；**Pitch正值向上、负值向下**，只转换卡片输入，原始反馈不改。至少填一轴；省略轴在实际发令前取实测角度。`zero`两个轴归零。
   实机厂商位置环存在数度偏差，目前没有经过验证的反馈补偿参数。按操作要求改为**同步返回发送成功**：`state: completed`、`completion_basis: absolute_command_sent`、`measured_convergence: false`；不等待20s，不声明物理到位，也不注册一个已同步结束的ACP pending。仍要求新鲜、模型有效的关节反馈以保持未填轴，发送异常仍按不确定运动指令暂停处理。没有修改增益、零点或伪造joint_state。
 
-`controlled_spatial.motion_music_enabled: false`（默认）在底盘卡后台启动时，仅把已核实的厂商ID-1运动曲目`1_flower.mp3`替换为有效静音MP3；原件与SHA256记录保存在同目录`.motus-motion-music/`，设为true可恢复。保留ID-2告警、待命、充电、障碍提示和TTS，不改变系统音量、不重启底盘管理节点。使用底盘已有ffmpeg，不自动安装新包；未知文件布局、缺少ffmpeg或操作员已改动曲目时返回unsupported/blocked，显示在`info.startup.motion_music`。已经开始的播放可能到本次结束后才静音。
+`controlled_spatial.motion_music_enabled: false`（默认）在容器启动后独立后台执行，无需启动底盘卡；连接暂不可用时每30秒重试，不触发取消任务、解除急停或电机使能。仅把已核实的厂商ID-1运动曲目`1_flower.mp3`替换为有效静音MP3；原件与SHA256记录保存在同目录`.motus-motion-music/`，设为true可恢复。保留ID-2告警、待命、充电、障碍提示和TTS，不改变系统音量、不重启底盘管理节点。使用底盘已有ffmpeg，不自动安装新包；未知文件布局、缺少ffmpeg或操作员已改动曲目时返回unsupported/blocked，显示在`info.startup.motion_music`。已经开始的播放可能到本次结束后才静音。
 
 上述速度和时长上限属于**驱动策略**，不代表厂家最大能力或完整的工作空间、关节限位及碰撞保护。
 末端和躯干目标仍需由调用方根据机器人实际安全工作空间设置；关节限位检查不等同于碰撞保护。
