@@ -355,6 +355,12 @@ in `device.py`; no extra runtime Python file is required.
 而且写入还显示成功。所以 `1.9` / `"120001.5"` 直接返回 `state: error`，而 `60000.0`、
 `"60000"` 这种整数值照常接受。
 
+**写完的读回和写是同一次原子操作。** MCP 请求是并发处理的：如果 `set_*` 先释放门禁锁、
+再去读值，另一个 `set_*` 就可能插在中间 —— A 写 60000、B 写 90000，A 却把 B 的 90000
+当成自己写入的结果报回来。所以 setter 与 getter 都在 `MediaControllerWriteGate` 的**同一
+个临界区**内完成，`readback` 一定是这次调用自己写下的值；500 ms 间隔仍然照常生效。
+并发交错的回归用例在 `tests/test_media_config.py`。
+
 **写操作之间必须隔 ≥500 ms。** 厂商的约束是**同一个 `MediaController` 上两次配置写**的
 最小间隔，间隔过短可能让语音系统崩掉（需要返厂）。所以这个间隔门不是每张卡一把锁，而是
 `device.py` 里的一个 `MediaControllerWriteGate`，由 `speaker` 和 `media_config` **共用同一

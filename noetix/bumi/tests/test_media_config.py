@@ -6,6 +6,7 @@ the wake word is read-only (the SDK has no setter), a timeout is in milliseconds
 not seconds, and a boolean flag is a real boolean rather than a truthy string.
 """
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -287,6 +288,43 @@ def test_set_writes_and_reads_back_the_new_value(monkeypatch):
     assert result["readback"] == 60000
 
 
+def test_a_failing_readback_does_not_turn_an_applied_write_into_an_error(monkeypatch):
+    # Moving the getter into the gate must not change the response contract:
+    # the SDK write already landed, so a getter that throws means
+    # `readback: null`, not `state: error`.
+    class _BadGetter(_Media):
+        def get_timeout(self):
+            raise RuntimeError("SDK read failed")
+
+    _, plugin = _plugin(monkeypatch, _BadGetter())
+
+    assert plugin.dispatch("set_timeout", {"timeout": 60000}) == {
+        "state": "set", "key": "timeout", "value": 60000, "readback": None,
+    }
+
+
+def test_a_setter_that_raises_still_consumes_a_gate_slot(monkeypatch):
+    # An SDK setter that throws may still have reached the controller.
+    class _ThrowingSetter(_Media):
+        def set_timeout(self, value):
+            raise RuntimeError("SDK write failed")
+
+    module, _ = _load_device(monkeypatch)
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    clock = _FakeClock()
+    gate = module.MediaControllerWriteGate(clock=clock, sleep=clock.sleep)
+    plugin = module.MediaConfigPlugin(
+        {}, "robot", types.SimpleNamespace(add_node=lambda _: None),
+        _ThrowingSetter(), write_gate=gate)
+
+    assert plugin.dispatch("set_timeout", {"timeout": 60000})["state"] == "error"
+    # The failed attempt is still a write; the next one must keep its distance.
+    first_change = gate._last_change
+    assert first_change == 1000.0
+    gate.write(lambda: None)
+    assert clock.now - first_change >= module._AUDIO_CONFIG_INTERVAL_S - 1e-9
+
+
 def test_a_set_of_an_out_of_range_timeout_is_rejected_before_writing(monkeypatch):
     _, plugin = _plugin(monkeypatch, _Media())
 
@@ -466,3 +504,90 @@ def test_a_skipped_write_costs_neither_a_delay_nor_a_slot(monkeypatch):
     wrote_at = clock.now
     config.dispatch("set_timeout", {"timeout": 60000})
     assert clock.now - wrote_at < module._AUDIO_CONFIG_INTERVAL_S
+
+
+# ── a set and its readback are one atomic operation ─────────────────────────
+#
+# MCP serves requests concurrently.  If the gate released its lock after the
+# setter but before the getter, a second `set_*` could land in between and the
+# first caller would report the other caller's value as its own `readback`.
+
+
+def test_the_gate_holds_its_lock_through_the_readback(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    gate = module.MediaControllerWriteGate(interval_s=0.0)
+    seen = {}
+
+    def setter():
+        seen["setter_locked"] = gate._lock.locked()
+
+    def readback():
+        seen["readback_locked"] = gate._lock.locked()
+        return 60000
+
+    performed, value = gate.write_with_readback(setter, readback)
+
+    assert performed is True
+    assert value == 60000
+    assert seen == {"setter_locked": True, "readback_locked": True}
+    assert gate._lock.locked() is False
+    # `speaker` still uses the plain write path and still gets a bool back.
+    assert gate.write(lambda: None) is True
+
+
+def test_a_concurrent_write_cannot_be_reported_as_this_calls_readback(monkeypatch):
+    """A sets 60000, B sets 90000; A must report 60000, not B's 90000."""
+    module, _ = _load_device(monkeypatch)
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    gate = module.MediaControllerWriteGate(interval_s=0.0)
+    marker = threading.local()
+
+    class _InterleavingMedia(_Media):
+        def __init__(self):
+            super().__init__()
+            self.a_wrote = threading.Event()
+            self.b_wrote = threading.Event()
+
+        def set_timeout(self, value):
+            super().set_timeout(value)
+            if value == 60000:
+                self.a_wrote.set()
+            elif value == 90000:
+                self.b_wrote.set()
+
+        def get_timeout(self):
+            # Hold A's readback open so a competing write has a chance to land.
+            # With the setter and getter in one critical section B cannot get
+            # in at all; with the old loose readback it can.
+            if getattr(marker, "is_a", False):
+                self.b_wrote.wait(timeout=0.2)
+            return self.timeout_ms
+
+    media = _InterleavingMedia()
+    plugin = module.MediaConfigPlugin(
+        {}, "robot", types.SimpleNamespace(add_node=lambda _: None), media,
+        write_gate=gate)
+    results = {}
+
+    def run_a():
+        marker.is_a = True
+        results["a"] = plugin.dispatch("set_timeout", {"timeout": 60000})
+
+    def run_b():
+        assert media.a_wrote.wait(timeout=1.0)
+        results["b"] = plugin.dispatch("set_timeout", {"timeout": 90000})
+
+    thread_a = threading.Thread(target=run_a)
+    thread_b = threading.Thread(target=run_b)
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=3.0)
+    thread_b.join(timeout=3.0)
+
+    assert not thread_a.is_alive() and not thread_b.is_alive()
+    assert ("timeout", 60000) in media.set_calls
+    assert ("timeout", 90000) in media.set_calls
+    assert results["a"]["state"] == "set"
+    assert results["a"]["readback"] == 60000
+    assert results["b"]["state"] == "set"
+    assert results["b"]["readback"] == 90000

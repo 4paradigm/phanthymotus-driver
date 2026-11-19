@@ -81,6 +81,11 @@ class MediaControllerWriteGate:
 
     ``clock`` and ``sleep`` are injectable so a test can drive the interval
     without spending real seconds in ``time.sleep``.
+
+    ``write_with_readback`` is for cards that report the applied value back to
+    the caller: the getter must run before this object releases its lock, or a
+    concurrent request can change the setting in between and be reported as
+    the first caller's own result.
     """
 
     def __init__(self, interval_s: float = _AUDIO_CONFIG_INTERVAL_S,
@@ -98,9 +103,25 @@ class MediaControllerWriteGate:
         caller whose write is already unnecessary (``speaker``'s read-back
         check on the start path) costs neither a 500 ms delay nor a slot.
         """
+        performed, _ = self._critical(setter, skip_if=skip_if, readback=None)
+        return performed
+
+    def write_with_readback(self, setter, readback, skip_if=None):
+        """Run a setter and its getter in ONE controller-wide critical section.
+
+        MCP requests are served concurrently.  Releasing the lock between the
+        setter and the getter lets a second ``set_*`` land in between, so the
+        first caller would report the *other* caller's value as its own
+        ``readback``.  Keeping both calls under the same lock makes the value a
+        call reports the one that call actually wrote; the 500 ms spacing still
+        applies to the setter.  Returns ``(performed, value)``.
+        """
+        return self._critical(setter, skip_if=skip_if, readback=readback)
+
+    def _critical(self, setter, skip_if, readback):
         with self._lock:
             if skip_if is not None and skip_if():
-                return False
+                return False, None
             if self._last_change is not None:
                 remaining = self._interval_s - (self._clock() - self._last_change)
                 if remaining > 0:
@@ -111,7 +132,8 @@ class MediaControllerWriteGate:
                 # A setter that raised may still have reached the controller;
                 # count the attempt so the next write keeps its distance.
                 self._last_change = self._clock()
-            return True
+            value = readback() if readback is not None else None
+            return True, value
 
 
 # One MediaController per process, so one gate per process.  Plugins accept a
@@ -3769,8 +3791,22 @@ class MediaConfigPlugin:
 
         normalised = media_config_spec.validate(key, value)
         setter = getattr(self._media_ctrl, media_config_spec.setter_name(key))
-        self._config_gate.write(lambda: setter(normalised))
-        return normalised
+
+        def readback():
+            # A getter that fails must not turn an applied write into an error;
+            # `readback: null` keeps the same contract as the old loose read.
+            try:
+                return self._read_setting(key)
+            except Exception:
+                return None
+
+        # The setter AND the getter run inside the controller-wide gate.  MCP
+        # serves requests concurrently: releasing the lock after the setter
+        # lets a second `set_*` land in between, and the first caller would
+        # report that other caller's value as its own readback.
+        _, observed = self._config_gate.write_with_readback(
+            lambda: setter(normalised), readback)
+        return normalised, observed
 
     def get_tool(self) -> dict:
         import media_config_spec
@@ -3906,17 +3942,13 @@ class MediaConfigPlugin:
             if key not in args:
                 return {"state": "error", "error": f"缺少参数 {key}"}
             try:
-                value = self._write_setting(key, args[key])
+                value, readback = self._write_setting(key, args[key])
             except ValueError as exc:
                 return {"state": "error", "error": str(exc)}
             except Exception as exc:
                 return {"state": "error", "error": str(exc)}
-            # Read back the value so a caller can confirm the write landed,
-            # rather than trusting a fire-and-forget setter.
-            try:
-                readback = self._read_setting(key)
-            except Exception as exc:
-                readback = None
+            # `readback` was captured inside the same gate-protected section as
+            # the setter, so it is this call's value, not a concurrent one's.
             return {"state": "set", "key": key, "value": value,
                     "readback": readback}
         return None
