@@ -45,9 +45,11 @@ class PickExecution:
         self.check()
         value = session.snapshot()
         age = value.get('data_age_ms')
-        if (not value.get('connected') or type(age) not in (int, float) or not 0 <= age <= 200
+        is_gripper = session is self.hand
+        max_age_ms = 200 if is_gripper else 300
+        if (not value.get('connected') or type(age) not in (int, float) or not 0 <= age <= max_age_ms
                 or not value.get('control_ready')):
-            device = 'Gripper' if session is self.hand else 'Arm'
+            device = 'Gripper' if is_gripper else 'Arm'
             detail = value.get('control_error') or value.get('error') or 'fresh control feedback required'
             if device == 'Gripper':
                 sdk_ns = value.get('sdk_received_ns')
