@@ -253,6 +253,12 @@ def test_card_is_discoverable_in_enabled_bundle_and_manifest(card):
     assert plugin.PREFIX == "motor_enable"
     tool = plugin.get_tool()
     assert tool["type"] == "actuator"
+    schema = tool["inputSchema"]
+    action_params = schema["x-action-params"]
+    assert set(action_params) == set(schema["properties"]["action"]["enum"])
+    for action in ("info", "start", "stop"):
+        assert action_params[action]["params"] == []
+        assert action_params[action].get("required", []) == []
     assert tool["inputSchema"]["x-is-dangerous"] is True
     assert tool["inputSchema"]["x-action-params"]["enable"]["params"] == ["confirm"]
     assert tool["inputSchema"]["x-action-params"]["enable"]["required"] == ["confirm"]

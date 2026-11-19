@@ -51,6 +51,8 @@ class MotorEnablePlugin:
                 "x-action-params": {
                     "enable": {"params": ["confirm"], "required": ["confirm"], "description": "确认安全放置后退出失能；使能前将机器人仰面平躺并确保关节活动范围安全。"},
                     "info": {"params": [], "description": "只读查询当前模式及上次使能是否仍未确认。"},
+                    "start": {"params": [], "description": "将卡片置为就绪，不发送使能指令。"},
+                    "stop": {"params": [], "description": "取消等待使能反馈，不发送失能指令，也不会撤回已发送的使能指令。"},
                 },
                 "x-is-dangerous": True,
                 "x-resource": ["base"],
