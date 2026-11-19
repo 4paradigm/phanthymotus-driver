@@ -5,42 +5,38 @@ import xml.etree.ElementTree as ET
 from contracts import json_float
 
 
-def _fixed_segment(root, parent, child, xyz):
-    ET.SubElement(root, "link", name=child)
-    joint = ET.SubElement(root, "joint", name=f"{child}_joint", type="fixed")
-    ET.SubElement(joint, "parent", link=parent)
-    ET.SubElement(joint, "child", link=child)
-    ET.SubElement(joint, "origin", xyz=xyz)
-    return child
+def _add_base_visuals(root, lift, joints):
+    """Replace the wheel and lidar skeleton branches with a simple chassis."""
+    base_name = lift.find("parent").get("link")
+    base = root.find(f"link[@name='{base_name}']")
+    # The bundled model's only other branches from the base are wheels and lidars.
+    def prune_children(parent):
+        for joint in root.findall("joint"):
+            if joint is lift or joint.find("parent").get("link") != parent:
+                continue
+            child = joint.find("child").get("link")
+            prune_children(child)
+            root.remove(joint)
+            root.remove(root.find(f"link[@name='{child}']"))
 
+    prune_children(base_name)
 
-def _add_base_outline(root):
-    """Canvas draws fixed-joint offsets as line segments but ignores URDF meshes."""
-    # SDK footprint: 650 × 510 mm. Approximate the bumper/body height in the preview.
-    lower = _fixed_segment(root, "base_link", "display_base_lower_0", "-0.325 -0.255 0")
-    edges = ("0.65 0 0", "0 0.51 0", "-0.65 0 0", "0 -0.51 0")
-    upper = None
-    for i, edge in enumerate(edges):
-        corner = _fixed_segment(root, lower, f"display_base_upper_{i}", "0 0 0.2")
-        if upper is None:
-            upper = corner
-        lower = _fixed_segment(root, lower, f"display_base_lower_{i + 1}", edge)
-    for i, edge in enumerate(edges):
-        upper = _fixed_segment(root, upper, f"display_base_top_edge_{i}", edge)
+    for visual in base.findall("visual"):
+        base.remove(visual)
+    # SDK footprint with an approximate bumper height.
+    height = 0.2
+    box = ET.SubElement(base, "visual", name="display_base")
+    ET.SubElement(box, "origin", xyz=f"0 0 {height / 2:g}")
+    ET.SubElement(ET.SubElement(box, "geometry"), "box", size="0.65 0.51 0.2")
 
-
-def _add_fixed_column(root, joints):
-    """Align the fixed rail with the head in the neutral Canvas pose."""
-    lift = joints["body_joint"]
+    # Match the head top at the observed upper position (0.62 m). The rail
+    # belongs to the base, while the torso moves on body_joint independently.
     x, y, _ = lift.find("origin").get("xyz").split()
-    # Canvas does not apply the lift's prismatic feedback to the drawing.
-    # Use the displayed head top (RGB-D mount), not the lift travel limit.
-    top = sum(float(joints[name].find("origin").get("xyz").split()[2])
-              for name in ("body_joint", "joint_head0", "joint_head1", "joint_rgbd"))
-    parent = lift.find("parent").get("link")
-    for child, xyz in (("display_column_base", f"{x} {y} 0"),
-                       ("display_column_top", f"0 0 {top:g}")):
-        parent = _fixed_segment(root, parent, child, xyz)
+    top = 0.62 + sum(float(joints[name].find("origin").get("xyz").split()[2])
+                     for name in ("body_joint", "joint_head0", "joint_head1", "joint_rgbd"))
+    rail = ET.SubElement(base, "visual", name="display_column")
+    ET.SubElement(rail, "origin", xyz=f"{x} {y} {(height + top) / 2:.9g}")
+    ET.SubElement(ET.SubElement(rail, "geometry"), "cylinder", radius="0.008", length=f"{top - height:.9g}")
 
 
 def render_model(urdf):
@@ -51,8 +47,7 @@ def render_model(urdf):
     for name, axis in (("joint_head0", "0 0 1"), ("joint_head1", "0 1 0")):
         joint = joints[name]
         joint.find("axis").set("xyz", axis)
-    _add_fixed_column(root, joints)
-    _add_base_outline(root)
+    _add_base_visuals(root, joints["body_joint"], joints)
     mimics = {}
     for name, joint in joints.items():
         mimic = joint.find("mimic")

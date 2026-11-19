@@ -44,11 +44,13 @@ uses the measured yaw/pitch order, the bundled elbow axes, and maps gripper
 feedback as `1 - position` before expanding the finger linkage.
 These are display-only corrections. `joints` combines `/joint_states` with fresh
 lift and gripper feedback, and `joints info` reports `body_joint` in metres.
-The display model has a cuboid base outline (650 × 510 mm in plan, with an
-approximate 200 mm height) and a fixed guide column ending at the neutral
-pose's head level. The torso, head and arms are on the separate `body_joint` prismatic branch. A
-renderer with prismatic support moves that branch along the column; the current
-rotation-only Canvas shows the column and reports lift height without animating it.
+The display model replaces the wheel and lidar branches with a cuboid base
+outline (650 × 510 mm in plan, approximately 200 mm high) and a fixed guide
+column aligned with the head at the observed 0.62 m raised position. The
+`body_joint` prismatic branch carries the torso, head and arms. Use the Canvas
+renderer from [phanthymotus#413](https://github.com/4paradigm/phanthymotus/pull/413)
+to draw the base primitives and move the upper body along the column from
+live feedback. Older renderers still report lift height but do not animate it.
 The response includes the display model's SHA-256 digest. Live
 `/robot_description` may narrow, but never widen, the bundled vendor motion
 limits. Arm execution uses the intersection of both limit sets. `joints`,

@@ -684,6 +684,7 @@ class PantherDevice:
                 if self._model_joint_limits.get(name) != live_limits.get(name)
             ) if live_limits else []
             return {"model": "UniX AI Panther", "urdf": render_urdf,
+                    "skeleton_visual_links": ["base_link"],
                     "available": True, "source": render_source,
                     "model_sha256": render_sha256,
                     "render_joint_count": render_joint_count,

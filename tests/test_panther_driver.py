@@ -516,18 +516,21 @@ class PantherDriverTest(unittest.TestCase):
         for arm in ("la", "ra"):
             self.assertEqual(joints[f"joint_{arm}3"].find("axis").get("xyz"), "0 0 1")
             self.assertEqual(joints[f"joint_{arm}4"].find("axis").get("xyz"), "0 1 0")
-        base, top = (joints[f"display_column_{segment}_joint"] for segment in ("base", "top"))
-        self.assertEqual(base.find("parent").get("link"), "base_link")
-        self.assertEqual(top.find("parent").get("link"), base.find("child").get("link"))
-        self.assertEqual([base.get("type"), top.get("type")], ["fixed", "fixed"])
-        self.assertAlmostEqual(float(top.find("origin").get("xyz").split()[2]), 0.785998)
         self.assertEqual(joints["body_joint"].get("type"), "prismatic")
         self.assertEqual(joints["body_joint"].find("parent").get("link"), "base_link")
         self.assertEqual(joints["body_joint"].find("child").get("link"), "body_link")
-        outline = [joint for name, joint in joints.items() if name.startswith("display_base_")]
-        self.assertEqual(len(outline), 13)
-        self.assertTrue(all(joint.get("type") == "fixed" for joint in outline))
-        self.assertEqual(joints["display_base_lower_0_joint"].find("parent").get("link"), "base_link")
+        self.assertEqual([name for name, j in joints.items() if j.find("parent").get("link") == "base_link"],
+                         ["body_joint"])
+        self.assertFalse({"joint_fl_rev", "joint_fl_con", "joint_front_lidar", "joint_behind_lidar"} & joints.keys())
+        self.assertEqual(model["skeleton_visual_links"], ["base_link"])
+        base = ET.fromstring(model["urdf"]).find("link[@name='base_link']")
+        self.assertEqual(len(base.findall("visual")), 2)
+        self.assertEqual(base.find("visual[@name='display_base']/geometry/box").get("size"), "0.65 0.51 0.2")
+        rail = base.find("visual[@name='display_column']")
+        center = float(rail.find("origin").get("xyz").split()[2])
+        half_length = float(rail.find("geometry/cylinder").get("length")) / 2
+        self.assertAlmostEqual(center - half_length, 0.2)
+        self.assertAlmostEqual(center + half_length, 0.62 + 0.785998)
 
     def test_skeleton_indices_follow_kinematic_urdf_order(self):
         urdf = """<robot name='p'>
