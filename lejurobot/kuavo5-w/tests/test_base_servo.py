@@ -101,10 +101,42 @@ class BaseServoTests(unittest.TestCase):
         self.send();time.sleep(.06)
         self.assertNotEqual(self.bundle.tracker._active['base'][1],'base_servo')
 
-    def test_refuses_conflicting_native_task(self):
+    def test_explicit_native_navigation_preempts_stream_and_keeps_it_paused(self):
+        import tempfile
+        from controlled_spatial import SpatialStore
+        from test_controlled_spatial import Client
+        with tempfile.TemporaryDirectory() as folder:
+            self.bundle.spatial.client = client = Client()
+            self.bundle.spatial.store = SpatialStore(folder+'/db')
+            client.check = {'success': True, 'status': 1, 'arrived': False}
+            self.start(); self.send()
+            self.assertTrue(wait_until(lambda: self.nonzero()))
+            result = self.call('controlled_spatial', 'navigate_to_pose', x=1, y=2, yaw=.3)
+            self.assertEqual(result['state'], 'executing')
+            self.assertTrue(wait_until(lambda: (self.bundle.spatial._task or {}).get('task_id')))
+            self.assertEqual(self.servo.info()['state'], 'paused')
+            before = self.servo._applied
+            self.send(); time.sleep(.06)
+            self.assertEqual(self.servo._applied, before)
+            self.assertEqual(self.bundle.tracker._active['base'][1], 'controlled_spatial')
+            self.assertIs(self.bundle.state.read('upper_velocity_enabled')[0], False)
+            self.assertEqual(self.call('controlled_spatial', 'stop_nav')['state'], 'paused')
+
+    def test_starting_servo_during_base_drive_only_connects_a_paused_input(self):
+        result = self.call('base_drive', 'move', vx=.1, duration=1)
+        self.assertEqual(self.start()['state'], 'paused')
+        self.send(); time.sleep(.06)
+        self.assertTrue(self.bundle.tracker.current('base', result['action_id']))
+        self.assertEqual(self.servo._applied, 0)
+
+    def test_start_connects_paused_without_overriding_an_unresolved_native_task(self):
         with patch.object(self.bundle.spatial,'unresolved',return_value=True):
-            self.assertEqual(self.start()['state'],'error')
+            self.assertEqual(self.start()['state'],'paused')
+            self.send()
+            time.sleep(.06)
+            self.assertEqual(self.call('base_servo', 'resume')['state'], 'error')
         self.assertFalse(self.ros.published)
+        self.assertFalse(self.ros.sent_services)
 
     def test_slow_preparation_never_executes_expired_target(self):
         original=self.bundle.start_motion

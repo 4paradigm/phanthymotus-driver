@@ -796,7 +796,7 @@ class DriverContractTests(unittest.TestCase):
             self.assertLess(len(line), 500)
             self.assertFalse(any(c in line for c in ('\n', '\x00', '\x1b')))
 
-    def test_cartesian_arm_mode_four_completes_without_joint_measurements(self):
+    def test_cartesian_arm_normalizes_mode_four_and_keeps_reach_time_completion(self):
         self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 4)
         self.bundle.sensors._data.pop('joints', None)
         result = self.call('arm', 'set_pose', frame='local', left_position=[0, .4, 0],
@@ -808,7 +808,7 @@ class DriverContractTests(unittest.TestCase):
         self.assertTrue(wait_until(lambda: self.callbacks))
         self.assertEqual(self.callbacks[0][:3], (result['action_id'], 'arm', 'completed'))
         self.assertFalse(self.callbacks[0][3]['measured_convergence'])
-        self.assertEqual(self.ros.services, [])
+        self.assertEqual(self.ros.sent_services[0][2], {'control_mode': 3})
 
     def test_motion_prepares_enable_stale_or_incompatible_mode_but_still_requires_warmup(self):
         for setup in (
@@ -864,12 +864,13 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(self.ros.sent_services[0][2], {'control_mode': 3})
         self.assertEqual(self.ros.published[0][0], '/kuavo_arm_traj')
 
-    def test_compatible_arm_only_mode_needs_no_redundant_service(self):
+    def test_arm_only_is_normalized_to_shared_base_arm_before_motion(self):
         self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 1)
         result = self.call('arm', 'move_joints', positions=[0.] * 14)
         self.assertEqual(result['state'], 'executing')
-        self.assertEqual(result['control_preparation']['mode'], 1)
-        self.assertEqual(self.ros.sent_services, [])
+        self.assertEqual(result['control_preparation']['mode'], 3)
+        self.assertEqual(self.ros.sent_services, [('/mobile_manipulator_mpc_control',
+                                                'kuavo_msgs/changeTorsoCtrlMode', {'control_mode': 3})])
 
     def test_all_motion_cards_prepare_after_pause_and_invalid_joint_target_never_resumes(self):
         for card, action, args in (
@@ -942,11 +943,12 @@ class DriverContractTests(unittest.TestCase):
         self.assertIn('boot initialization/pause is not confirmed', self.call('base_drive', 'move', duration=.1)['error'])
         self.assertEqual(self.ros.sent_services, [])
 
-    def test_incompatible_preparation_does_not_reconfigure_an_inflight_action(self):
-        self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 1)
+    def test_global_reconfiguration_does_not_change_an_inflight_action(self):
         arm = self.call('arm', 'move_joints', positions=[0.] * 14)
+        self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 1)
+        before = list(self.ros.sent_services)
         self.assertIn('another action', self.call('base_drive', 'move', duration=.1)['error'])
-        self.assertEqual(self.ros.sent_services, [])
+        self.assertEqual(self.ros.sent_services, before)
         self.assertTrue(self.bundle.tracker.current('arms', arm['action_id']))
 
     def test_base_arm_mode_allows_independent_channels_without_reconfiguration(self):

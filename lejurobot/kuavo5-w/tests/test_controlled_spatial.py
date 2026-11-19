@@ -33,7 +33,7 @@ class Tracker:
     def begin(self, channel, tool):
         self.counter += 1
         aid, event = str(self.counter), threading.Event()
-        self._active[channel] = aid, event
+        self._active[channel] = aid, tool, event
         return aid, event
 
     def current(self, channel, aid):
@@ -47,12 +47,15 @@ class Tracker:
 
     def cancel_all(self, reason, status='cancelled'):
         with self.lock:
-            for channel, (aid, event) in list(self._active.items()):
+            for channel, (aid, tool, event) in list(self._active.items()):
                 event.set()
                 self.finish(channel, aid, 'controlled_spatial', status, {'reason': reason})
 
 
 class Bundle:
+    def control_ownership(self):
+        return {'mode_policy': 'BaseArm'}
+
     def prepare_mapping_velocity(self, request_epoch):
         if request_epoch != self._stop_epoch:
             raise RuntimeError('superseded')
@@ -65,6 +68,7 @@ class Bundle:
                                            read=lambda key: (False if key == 'upper_velocity_enabled'
                                                              else 'nav_mpc_path_track', time.monotonic()))
         self.ros1 = types.SimpleNamespace(connection=(True, 1))
+        self.base_servo = types.SimpleNamespace(preempt=lambda: None)
         self.pauses = []
 
     def _begin_control(self, action):
@@ -321,7 +325,9 @@ class SpatialTests(unittest.TestCase):
 
     def test_start_does_not_cancel_an_active_local_action(self):
         self.bundle.tracker.begin('base', 'base_drive')
-        self.assertEqual(self.call('start')['state'], 'error')
+        result = self.call('start')
+        self.assertEqual(result['state'], 'running')
+        self.assertEqual(result['active_base_controller'], 'base_drive')
         self.assertFalse(self.client.calls)
 
     def test_known_rejection_is_stopped_and_can_be_retried(self):

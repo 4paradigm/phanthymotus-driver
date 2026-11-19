@@ -35,6 +35,7 @@ REACH = {
     "arm_ee_reach_time": "/lb_arm_ee_reach_time",
 }
 MODES = {0: "NoControl", 1: "ArmOnly", 2: "BaseOnly", 3: "BaseArm", 4: "ArmEeOnly"}
+CARD_CONTROL_MODE = 3  # All cards share BaseArm; only base velocity ownership changes.
 CONTROL_TIMEOUT_S = 2.0  # One total budget for service acceptance AND state confirmation.
 DISPATCH_LOCK_TIMEOUT_S = 0.25
 ENABLE_LEASE_S = 3.0
@@ -473,7 +474,7 @@ class _UncertainMotionSend(RuntimeError):
 
 
 class _KuavoPlugin:
-    ALLOWED_MODES = None
+    ALLOWED_MODES = (CARD_CONTROL_MODE,)
 
     def __init__(self, bundle):
         self.bundle = bundle
@@ -518,6 +519,7 @@ class _KuavoPlugin:
                         "motion_enabled": self.state.motion_enabled,
                         **({"motion": self._pose_progress} if self.PREFIX == "base_drive" else {}),
                         "startup": self.bundle.spatial.startup_status() if self.PREFIX == "base_drive" else None,
+                        "control_ownership": self.bundle.control_ownership(),
                         "feedback": {**self.state.snapshot(),
                                      "host_runtime": dict(self.bundle.startup_checks.status)}}
             # Control services wait outside the motion lock. Stops never take
@@ -638,7 +640,7 @@ class _KuavoPlugin:
                     with self.tracker.lock:
                         if not self.tracker.current(self.CHANNEL, aid):
                             return
-                        self.state.require_motion(self.ALLOWED_MODES)
+                        self.bundle.require_base_control(self.PREFIX)
                         if self.ros1.connection[1] != generation:
                             raise ConnectionError("connection changed during motion")
                         if time.monotonic() >= deadline:
@@ -653,7 +655,7 @@ class _KuavoPlugin:
                     with self.tracker.lock:
                         if not self.tracker.current(self.CHANNEL, aid):
                             return
-                        self.state.require_motion(self.ALLOWED_MODES)
+                        self.bundle.require_base_control(self.PREFIX)
                         if self.ros1.connection[1] != generation:
                             raise ConnectionError("connection changed during stopping")
                         if time.monotonic() >= until:
@@ -756,7 +758,7 @@ class _PoseServo:
 
 
 class BaseDrivePlugin(_KuavoPlugin):
-    PREFIX, CHANNEL, ALLOWED_MODES = "base_drive", "base", (2, 3)
+    PREFIX, CHANNEL, ALLOWED_MODES = "base_drive", "base", (CARD_CONTROL_MODE,)
 
     def __init__(self, bundle):
         super().__init__(bundle)
@@ -844,7 +846,7 @@ class BaseDrivePlugin(_KuavoPlugin):
                     with self.tracker.lock:
                         if not self.tracker.current(self.CHANNEL, aid):
                             return
-                        self.state.require_motion(self.ALLOWED_MODES)
+                        self.bundle.require_base_control(self.PREFIX)
                         if self.ros1.connection != (True, generation):
                             raise ConnectionError('connection changed during pose motion')
                         if time.monotonic()-issued > 110:
@@ -923,7 +925,7 @@ class BaseDrivePlugin(_KuavoPlugin):
 
 
 class ArmPlugin(_KuavoPlugin):
-    PREFIX, CHANNEL, ALLOWED_MODES = "arm", "arms", (1, 3)
+    PREFIX, CHANNEL, ALLOWED_MODES = "arm", "arms", (CARD_CONTROL_MODE,)
     JOINTS = {f'{side}_joint_{i}': (offset + i - 1, f'{side}_joint_{i}_rad',
               f'{label}臂关节{i}（zarm_{letter}{i}_joint）')
               for side, offset, label, letter in [('left', 0, '左', 'l'), ('right', 7, '右', 'r')]
@@ -990,7 +992,7 @@ class ArmPlugin(_KuavoPlugin):
                     "hand_poses": {"header": {"seq": 0, "stamp": {"secs": 0, "nsecs": 0}, "frame_id": ""}, **poses},
                     "frame": 1 if args["frame"] == "world" else 2,
                     "use_custom_ik_param": False, "joint_angles_as_q0": False,
-                    "ik_param": {}}), allowed_modes=(1, 3, 4))
+                    "ik_param": {}}), allowed_modes=(CARD_CONTROL_MODE,))
         raise ValueError(f"unknown action: {action}")
 
 
@@ -1244,13 +1246,18 @@ class KuavoBundle:
                 raise RuntimeError('remote resume is unresolved; motion remains blocked; request pause after resolution')
             if self._mode_unresolved():
                 raise RuntimeError('remote mode change is unresolved; motion remains blocked')
-            if self._closing or self._transition is not None or self.tracker._active:
+            base_only = action in ('prepare_chassis', 'mapping_velocity')
+            if base_only and self.spatial.unresolved():
+                raise RuntimeError(self.spatial.motion_block_reason())
+            occupied = 'base' in self.tracker._active if base_only else bool(self.tracker._active)
+            if self._closing or self._transition is not None or occupied:
                 raise RuntimeError('motion/control is busy; stop and await confirmation before retrying')
             enabled = self.state.confirmed_enable() if action != 'prepare_chassis' else None
             if action == 'set_mode' and enabled is not True:
                 raise RuntimeError('connect and resume control before changing mode')
             was_blocked = self.state.motion_blocked
-            self.state.motion_blocked = True
+            if not base_only:
+                self.state.motion_blocked = True
             return self._new_transition(action), enabled, was_blocked
         finally:
             self.tracker.lock.release()
@@ -1278,6 +1285,8 @@ class KuavoBundle:
 
     def _publish_motion_locked(self, channel, tool, modes, publish, validate, preparation, notify=True):
         self.state.require_motion(modes)
+        if channel == 'base':
+            self.require_base_control(tool)
         if validate is not None:
             validate()
         aid, cancelled = self.tracker.begin(channel, tool, notify=notify)
@@ -1305,7 +1314,7 @@ class KuavoBundle:
                 raise RuntimeError('motion command delivery is uncertain; controller reconciliation is required')
             if channel == 'base' and self.spatial.startup_status().get('state') == 'loading':
                 raise RuntimeError('Checking chassis status in background, please wait.')
-            if self.spatial.unresolved():
+            if self.spatial.unresolved() and not self.spatial.allows_independent_motion(channel):
                 raise RuntimeError(self.spatial.motion_block_reason())
             if self._resume_unresolved():
                 raise RuntimeError('remote resume is unresolved; motion remains blocked')
@@ -1320,20 +1329,25 @@ class KuavoBundle:
                 validate()
             enabled = self.state.confirmed_enable()
             mode, seen = self.state.read('mpc_mode')
-            compatible = mode in MODES and mode != 0 and (not modes or mode in modes)
+            compatible = mode == CARD_CONTROL_MODE and (not modes or mode in modes)
             fresh = time.monotonic() - seen <= 2
             preparation = {'automatic': True, 'resumed': False, 'mode_changed': False, 'mode': mode}
             upper_velocity = tool != 'controlled_spatial'
-            velocity, velocity_seen = self.state.read('upper_velocity_enabled')
-            velocity_ready = channel != 'base' or (velocity is upper_velocity and time.monotonic()-velocity_seen <= 2)
+            # This vendor Bool is latched and published on changes, not a
+            # heartbeat. read() invalidates it on a connection-generation change.
+            velocity, _ = self.state.read('upper_velocity_enabled')
+            velocity_ready = channel != 'base' or velocity is upper_velocity
             if enabled is True and not self.state.motion_blocked and compatible and fresh and velocity_ready:
                 return self._publish_motion_locked(channel, tool, modes, publish, validate, preparation, notify=notify)
-            if self.tracker._active:
+            base_handoff_only = (channel == 'base' and enabled is True and not self.state.motion_blocked
+                                 and compatible and fresh and not velocity_ready)
+            if self.tracker._active and not base_handoff_only:
                 raise RuntimeError('control preparation needs an idle robot; another action is still running')
-            target_mode = mode if compatible else 3
+            target_mode = CARD_CONTROL_MODE
             token = self._new_transition('prepare_motion')
             token['tool'] = tool
-            self.state.motion_blocked = True
+            if not base_handoff_only:
+                self.state.motion_blocked = True
         finally:
             self.tracker.lock.release()
         try:
@@ -1346,8 +1360,7 @@ class KuavoBundle:
                 # receives enable asynchronously and rejects mode writes while
                 # disabled. Wait for its resumed stream before a mode write.
                 mode = self.wait_mode_feedback(token, resume_issued)
-                compatible = mode != 0 and (not modes or mode in modes)
-                target_mode = mode if compatible else 3
+                compatible = mode == CARD_CONTROL_MODE and (not modes or mode in modes)
                 fresh = True
             if not compatible or not fresh:
                 self.confirm_control(token, '/mobile_manipulator_mpc_control',
@@ -1393,6 +1406,37 @@ class KuavoBundle:
             raise
         finally:
             self._end_control(token)
+
+    def require_base_control(self, tool):
+        self.state.require_motion((CARD_CONTROL_MODE,))
+        velocity, _ = self.state.read('upper_velocity_enabled')
+        if velocity is not (tool != 'controlled_spatial'):
+            raise RuntimeError('base velocity ownership changed; stop and prepare the requested base controller')
+
+    def control_ownership(self):
+        """Read-only policy/feedback view; never prepare or switch a controller."""
+        with self.tracker.lock:
+            enabled = None
+            try:
+                enabled = self.state.confirmed_enable()
+            except RuntimeError:
+                pass
+            mode, _ = self.state.read('mpc_mode')
+            velocity, _ = self.state.read('upper_velocity_enabled')
+            source, source_at = self.state.read('base_velocity_source')
+            owners = {channel: active[1] for channel, active in self.tracker._active.items()}
+            transition = self._transition
+            return {'mode_policy': 'BaseArm', 'required_mode': CARD_CONTROL_MODE,
+                    'measured_mode': mode, 'control_enabled': enabled,
+                    'motion_blocked': self.state.motion_blocked,
+                    'base_velocity_route': ('upper_mpc' if velocity is True else
+                                            'native_navigation' if velocity is False else 'unknown'),
+                    'observed_chassis_velocity_source': source,
+                    'observed_source_age_s': time.monotonic()-source_at if source is not None else None,
+                    'active_resources': owners,
+                    'base_exclusive': ['base_drive', 'base_servo', 'controlled_spatial', 'remote_control'],
+                    'transition': transition['action'] if transition is not None else None,
+                    'stop_move_scope': 'whole_body', 'servo_pause_scope': 'base_servo_only'}
 
     def wait_mode_feedback(self, token, after):
         deadline = time.monotonic() + CONTROL_TIMEOUT_S

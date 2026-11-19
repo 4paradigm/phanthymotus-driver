@@ -142,7 +142,7 @@ class ControlledSpatialPlugin:
                     'load_map': ['map_name'], 'navigate_to_pose': ['x', 'y', 'yaw'],
                     'navigate_to_tag': ['tag_name']}
         return {'name': self.PREFIX, 'type': 'actuator', 'multiInstance': False,
-                'description': 'Kuavo 5-W人工建图、地图绑定打点与避障导航；使用厂商原生接口。',
+                'description': '0.05–0.3 m/s；Kuavo 5-W人工建图、打点与厂商底盘原生导航；导航独占底盘速度，保持全身BaseArm，可并行控制手臂/头部/下肢。',
                 'inputSchema': {'type': 'object', 'properties': props, 'required': ['action'],
                     'x-resource': 'base', 'x-hooks': {'on_interrupt_motion': {'action': 'stop_nav'}},
                     'x-completion': {'actions': ['navigate_to_pose', 'navigate_to_tag', 'start_mapping', 'stop_mapping', 'load_map'], 'timeout': 1830},
@@ -175,6 +175,18 @@ class ControlledSpatialPlugin:
             return 'map transition is active or unconfirmed; inspect controlled_spatial.info; stop_nav does not finish map saving'
         return 'native navigation is active or unresolved; stop_nav must be confirmed first'
 
+    def allows_independent_motion(self, channel):
+        """A confirmed, tracked base task does not own arms/head/lower body.
+
+        Persisted orphan tasks, uncertain submissions and map/control transitions
+        remain blocked. Never reinterpret those as a healthy parallel action.
+        Caller holds tracker.lock, so a stop cannot invalidate this check midway.
+        """
+        task = self._task
+        return (channel != 'base' and task is not None and bool(task.get('task_id'))
+                and not self._uncertain and self._map_pending is None and self._preparation is None
+                and self.bundle.tracker.current('base', task['action_id']))
+
     @staticmethod
     def _check_chassis_faults(observation):
         agv = observation['agvState']
@@ -185,6 +197,11 @@ class ControlledSpatialPlugin:
         """Share one background preflight across both base cards and a stop epoch."""
         if not self.bundle.ros1.connection[0]:
             return {'state': 'error', 'error': 'control_connection_is_disconnected'}
+        with self.bundle.tracker.lock:
+            active = self.bundle.tracker._active.get('base')
+            if active is not None:
+                return {'state': 'running', 'active_base_controller': active[1],
+                        'message': 'Base control is already reserved; keeping its current controller.'}
         key = (self.bundle._stop_epoch, self.bundle.ros1.connection)
         with self._startup_guard:
             if self._startup_thread and self._startup_thread.is_alive():
@@ -376,6 +393,7 @@ class ControlledSpatialPlugin:
                           'remote_task': self._task, 'command_delivery_uncertain': self._uncertain,
                           'map_transition': self._map_pending, 'chassis_preparation': self._preparation,
                           'startup': startup}
+                result['control_ownership'] = self.bundle.control_ownership()
                 if mapping and mapping.get('phase') == 'saving':
                     result['state'] = 'saving'
                     result['message'] = 'Optimizing and saving the map in background. Please wait; do not restart mapping.'
@@ -436,8 +454,11 @@ class ControlledSpatialPlugin:
         self._observation(navigable=True)
         if self._identity() != identity:
             raise RuntimeError('map_changed_during_navigation_preflight')
+        # Explicit discrete commands have priority over the continuous stream.
+        # Latch the stream paused so subsequent packets cannot retake the base.
+        self.bundle.base_servo.preempt()
         aid, cancelled, generation, issued, preparation = self.bundle.start_motion(
-            'base', self.PREFIX, (2, 3), lambda: None, validate, request_epoch=epoch)
+            'base', self.PREFIX, (3,), lambda: None, validate, request_epoch=epoch)
         # The worker owns the external service, including any late response.
         record = {'action_id': aid, 'task_id': None, 'identity': identity, 'target': target}
         with self.bundle.tracker.lock:
@@ -472,7 +493,7 @@ class ControlledSpatialPlugin:
                     with self.bundle.tracker.lock:
                         if not self.bundle.tracker.current('base', aid):
                             return
-                        self.bundle.state.require_motion((2, 3))
+                        self.bundle.state.require_motion((3,))
                         if self.bundle.ros1.connection != (True, generation):
                             raise RuntimeError('navigation_control_connection_changed')
                         upper_velocity, _ = self.bundle.state.read('upper_velocity_enabled')

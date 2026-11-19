@@ -462,9 +462,9 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 `base_drive.info.feedback.robot_discovery.joint_limits` 查看。运行时模型指纹或配置身份不匹配时不允许关节动作。
 
 模式：0=NoControl（被动）、1=ArmOnly、2=BaseOnly、3=BaseArm、4=ArmEeOnly。
-底盘要求模式2/3；双臂关节要求1/3；末端允许1/3/4。下肢、躯干和头部要求非0模式。
+所有执行卡统一要求3=BaseArm，包括兼容保留的双臂末端接口；不再因单独使用手臂或底盘保留ArmOnly/BaseOnly。
 动作参数及关节目标/限位先校验，再按需恢复并等待恢复后的新鲜MPC反馈，最后准备模式及发布目标。
-当前模式兼容且反馈新鲜时不重复切换；不兼容或NoControl时选择3=BaseArm，兼顾底盘和双臂。
+当前模式为BaseArm且反馈新鲜时不重复切换；其余模式在没有在途动作时统一切回BaseArm，等待实际反馈后发令。
 现场版本63的厂商实现实际固定执行并发布BaseArm：模式服务虽会接受其他编号，
 但不会改变实际运行模式。该机器正常动作直接沿用反馈中的BaseArm，不依赖切换到ArmOnly/BaseOnly；
 驱动不暴露这些无效的手动模式操作，也不把服务受理冒充生效。
@@ -474,10 +474,43 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 驱动不会调用 `/enable_lb_arm_quick_mode`，该服务会绕过MPC。
 部署时应确认其他客户端没有开启 quick mode；本驱动没有该模式的官方反馈来源，不能自动判断外部设置。
 
+## 卡片控制权与组合使用
+
+**BaseArm是全身控制模式，AUTO/MANUAL是厂商底盘模式，速度通路是第三项独立状态。**
+驱动不再在卡片之间切换ArmOnly/BaseOnly；原生导航只交接底盘速度输出，不停用手臂、头部或下肢。
+
+| 卡片/操作 | 实际执行者与通路 | 控制模式 | 组合规则 |
+| --- | --- | --- | --- |
+| `base_drive.move/move_relative` | 驱动定时/里程计闭环 → `/cmd_vel` → 上位机MPC → 底盘 | BaseArm；上位机速度输出开启 | 独占base；可并行arm/head/leg；显式命令会暂停base_servo |
+| `base_servo` | ActuCore navi速度流 → ControlSink → `/cmd_vel` → 上位机MPC → 底盘 | BaseArm；上位机速度输出开启 | 独占base；可并行arm/head/leg；显式底盘/导航命令优先，之后须resume并发送新帧 |
+| `controlled_spatial.navigate_*` | 厂商MoveToTarget → 原生路径规划/跟踪 → `nav_mpc_path_track` | BaseArm、底盘AUTO；上位机速度输出关闭 | 独占base；目标已确认且任务正常时可并行arm/head/leg；不与遥控器/其它底盘动作同时控制 |
+| `controlled_spatial.start_mapping` | 厂商Cartographer；遥控采图走G12 → 上位机MPC | 全身保持BaseArm；建图切换后确认底盘AUTO及上位机速度输出开启 | 建图转换期间占用base；采图时只选一个底盘输入，遥控器与自动速度流不要同时发令 |
+| `controlled_spatial.stop_mapping/load_map` | 厂商地图服务 | 只在底盘停稳后切换底盘MANUAL，结束恢复AUTO；不改全身BaseArm | 地图转换独占base；未确认的转换不能被新底盘运动覆盖 |
+| `arm` | `/kuavo_arm_traj` → 厂商全身控制器 | BaseArm；不修改底盘速度开关 | 独占arms，与base/head/leg独立 |
+| `head` | `/robot_head_motion_data` → 厂商头部控制 | BaseArm；不修改底盘速度开关 | 独占head，与base/arms/leg独立 |
+| `leg` | 下肢关节轨迹/躯干位姿 → 厂商MPC/WBC | BaseArm；不修改底盘速度开关 | 独占lower_body，包含腰；与base/arms/head独立 |
+| `speaker` | PCM流 → 底盘播放服务 → 扬声器 | 不参与运动模式 | 可与执行/传感器卡并行 |
+| `joints/model/imu/loco_state/battery/laser_scan/camera_*` | ROS反馈、模型及独立图像/点云转发 | 不参与运动模式 | 不占运动通道，不改变控制权 |
+
+卡片处于启动状态不等于占有底盘：启动另一张底盘卡不会取消正在执行的底盘任务。
+`base_servo`在底盘已被占用/未确认时允许连接输入，但保持paused，必须等当前操作结束后resume。
+底盘动作之间仍互斥，`base_drive`和原生导航之间须等完成或stop后再发令；伺服流不能反抢离散动作。
+正常切换底盘速度通路以及底盘预检不会暂停正在运行的独立关节动作。
+没有在途动作时才允许全身恢复/全局模式准备；外部模式改变、反馈过期或真正的未确认写入仍安全拒绝/暂停，不能以“兼容”为由忽略。
+
+`base_drive/arm/head/leg/base_servo/controlled_spatial.info.control_ownership`只读显示：
+BaseArm策略、实测模式、确认的使能状态、底盘速度通路、厂商实际速度源及其回执年龄、在途资源拥有者、当前控制转换。
+`active_resources`表示驱动持有的动作通道；遥控器不在驱动内仲裁，不能由空通道推断摇杆中位。
+自动底盘运动时不要同时操作遥控摇杆；硬件急停始终保留。
+
+停止范围必须区分：`stop_move`、`controlled_spatial.stop_nav/stop`和运动异常走**全身软件暂停**，取消所有在途动作；
+`base_servo.pause/stop`只暂停该伺服流并向其拥有的底盘通道发零速，不停止其它独立通道。
+正常ACP完成不会软件暂停全身，也不会取消其它卡片。
+
 ## ACP、并发和停止语义
 
 底盘、双臂和下肢的持续/轨迹动作声明 `x-completion`，返回唯一 `action_id`，
-结束后 POST `${AGENT_CORE_URL}/api/acp/complete`。资源分别为 `base`、`arm_l/arm_r`、`lower_body`；头部仅同步确认发令，保留 `head` 资源与停止hook，不声明异步物理到位。
+结束后 POST `${AGENT_CORE_URL}/api/acp/complete`。驱动内部通道为 `base`、`arms`、`lower_body`、`head`；头部同样使用ACP，按实测到位或稳定后的有限残差结束，并报告误差。
 `leg` 独占下肢通道，包含腰部关节。同通道在途动作收到新命令会返回 busy，调用方应等待完成或显式停止。
 底盘速度/位姿也共享 busy 通道，避免位置指令被尚未过期的速度指令覆盖，或无效新参数误取消旧 ACP。
 全局恢复/模式准备由驱动内部仲裁，不另行暴露执行卡；其短状态转换同步等待反馈。
@@ -696,7 +729,9 @@ IMU301帧、位置展示和标准odom各300帧且全部有效，电池/雷达点
 
 Native navigation uses the chassis path tracker. Before submitting its goal,
 `controlled_spatial` disables the upper controller's `/enable_vel_control` and
-requires fresh `/enable_vel_control_state` feedback. Otherwise upper MPC output
+requires fresh `/enable_vel_control_state` feedback after changing it. This
+state is latched, not a periodic heartbeat: a confirmed value is retained within
+the same bridge connection and invalidated on reconnect. Otherwise upper MPC output
 can select `nav_mpc_move_base` and override the native navigation velocity.
 `base_drive` and `base_servo` restore this switch before publishing; starting
 mapping restores the upper MPC remote-control route without resuming motors.

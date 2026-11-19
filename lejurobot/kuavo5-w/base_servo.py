@@ -48,7 +48,7 @@ class BaseServo:
 
     def tool(self):
         return {'name': self.PREFIX, 'type': 'actuator', 'multiInstance': False,
-                'description': '≤0.8 m/s、1 rad/s；断流300ms发零速。轮式底盘连续伺服，接收ActuCore navi的motus.control/1 twist。',
+                'description': '≤0.8 m/s、1 rad/s；断流300ms发零速。ActuCore navi速度流经上位机MPC执行，保持BaseArm；与其他底盘动作互斥，显式底盘/导航命令会暂停本流。',
                 'topic_in': [{'format': 'control/velocity', 'desc': '6维机身速度[vx,vy,vz,wx,wy,wz]；m/s、rad/s'}],
                 'inputSchema': {'type': 'object', 'required': ['action'],
                     'properties': {'action': {'type': 'string', 'enum': ['start', 'stop', 'pause', 'resume', 'info']},
@@ -70,7 +70,7 @@ class BaseServo:
             return {'state': state,
                     'input': self._topic, 'control_interface': build_descriptor(),
                     'applied': self._applied, 'last': self._last, 'error': self._error,
-                    'startup': startup}
+                    'startup': startup, 'control_ownership': self.bundle.control_ownership()}
 
     def dispatch(self, action, args):
         try:
@@ -87,9 +87,9 @@ class BaseServo:
                         if topic != self._topic:
                             raise RuntimeError('stop before changing input_topic')
                         return self.info()
-                    if (self.bundle._transition is not None or 'base' in self.bundle.tracker._active
-                            or self.bundle.spatial.unresolved()):
+                    if self.bundle._transition is not None:
                         raise RuntimeError('base is busy; stop the current action first')
+                    defer_control = 'base' in self.bundle.tracker._active or self.bundle.spatial.unresolved()
                     self.bundle.state.require_motion_enabled()
                     self._sink = self._new_sink()
                     from std_msgs.msg import String
@@ -97,11 +97,13 @@ class BaseServo:
                     generation = self._subscription_generation
                     self._subscription = self.node.create_subscription(
                         String, topic, lambda msg: self._receive(msg, generation), 1)
-                    self._topic, self._paused = topic, False
+                    self._topic, self._paused = topic, defer_control
                     self._epoch = self.bundle._stop_epoch
                     if self._thread is None:
                         self._thread = threading.Thread(target=self._run, daemon=True, name='base-servo')
                         self._thread.start()
+                if defer_control:
+                    return {**self.info(), 'message': 'Input connected and paused; resume after the current base operation finishes.'}
                 preparation = self.bundle.spatial.start_chassis()
                 if preparation.get('state') == 'error':
                     with self._lock:
@@ -185,7 +187,7 @@ class BaseServo:
                     if self._sink is sink and not self._paused:
                         sink.tick()
                         if self._lease is not None:
-                            self.bundle.state.require_motion((2, 3))
+                            self.bundle.require_base_control(self.PREFIX)
                             if self.bundle.ros1.connection != (True, self._lease[2]):
                                 raise ConnectionError('connection changed during base servo')
             except Exception as exc:
@@ -218,7 +220,7 @@ class BaseServo:
     def _apply(self, values, _gripper=None):
         # Zero/lease acquisition uses the same guarded path as base_drive.
         if self._lease is None:
-            lease = self.bundle.start_motion('base', self.PREFIX, (2, 3),
+            lease = self.bundle.start_motion('base', self.PREFIX, (3,),
                 lambda: self.bundle.twist('/cmd_vel'), self._current,
                 request_epoch=self._epoch, notify=False)
             with self._lock:
@@ -230,7 +232,7 @@ class BaseServo:
             aid, _, generation, *_ = self._lease
             if not self.bundle.tracker.current('base', aid):
                 raise InterruptedError('base servo ownership was cancelled')
-            self.bundle.state.require_motion((2, 3))
+            self.bundle.require_base_control(self.PREFIX)
             if self.bundle.ros1.connection != (True, generation):
                 raise ConnectionError('connection changed during base servo')
             scale = min(1., LINEAR_LIMIT / max(math.hypot(values[0], values[1]), 1e-12))
