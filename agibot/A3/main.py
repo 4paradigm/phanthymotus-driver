@@ -21,6 +21,7 @@ import socket
 # and BOTH domains fell back to every interface — silently defeating the
 # declared DDS isolation.
 PROFILE_PATH = "/work/agibot/A3/dds-profile.xml"
+DISCOVERY_SERVERS = "10.42.10.10:11811;10.42.10.12:11811"
 
 
 def _robot_subnet_ip() -> str:
@@ -115,9 +116,13 @@ def _select_profile() -> None:
     except OSError as exc:
         raise RuntimeError(f"cannot write constrained DDS profile {profile}: {exc}") from exc
     os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile
+    # Discovery Server is only for the robot-domain participants in this
+    # process. CoreBridge workers remove it before creating domain-42 nodes.
+    os.environ["ROS_DISCOVERY_SERVER"] = DISCOVERY_SERVERS
     print(f"[ros2] robot DDS profile: {profile} "
-          f"(robot-domain-232 whitelist {robot_ip}; domain-42 publishing is "
-          "handled by the isolated bridge process)")
+          f"(robot-domain-232 whitelist {robot_ip}; discovery servers "
+          f"{DISCOVERY_SERVERS}; domain-42 publishing is handled by the "
+          "isolated bridge process)")
 
 
 def main() -> None:
