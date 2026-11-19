@@ -448,6 +448,48 @@ ros2 topic hz /<robot_namespace>/motion/state
 docker logs -f embodied-noetix-bumi
 ```
 
+## `timer` card
+
+A hardware-free repeating timer, declared as a `sensor`: it has no `topic_in` and originates a `data/json` stream. It exists because the agent cannot create a
+timer by itself: `task_create` only tracks a task, `scheduler` is operator
+configuration, and a skill that promises "remind me in 10 minutes" without a
+clock is not executable.
+
+The card publishes `data/json` on `/<namespace>/timer/events`, and the payload
+carries `"priority": 1`. That field is load-bearing: agent-core's collector
+scores a plain DDS event as P=0 and files it as background; `priority` makes the
+tick steer the main agent, the same way the pose card's gesture transitions do.
+Wire the topic into `decision_core` on the canvas — that data connection is what
+delivers the event.
+
+Actions:
+
+| action | behavior |
+|---|---|
+| `start` | arm only: lifecycle `running`, `ticking: false`, publish nothing |
+| `begin` | start ticking; params `interval_s` (1–3600), `label`, `max_ticks` (0 = unlimited) |
+| `halt` | stop ticking, stay armed (`running`, `ticking: false`) |
+| `stop` | stop ticking and disarm (`idle`) |
+| `config` | sent by Agent Core when the panel saves the card, before every project start and on reconnect; sets the default `interval_s` and answers `configured` |
+| `info` | lifecycle `running`/`idle`, plus `ticking`, `timer_state` (running/idle/finished), timer_id, tick, elapsed and next tick |
+
+`start` deliberately does not begin ticking. The canvas sends `start` when a
+project boots; an always-ticking timer would wake the model once a minute for
+every deployment, whether or not any skill is using it. A skill calls `begin`
+when the user asks for the reminder and `stop` when they end it.
+
+Payload:
+
+```json
+{"priority": 1, "event": "timer_tick", "timer": "bumi-timer",
+ "timer_id": "3f2a9c1d", "label": "sedentary", "tick": 3,
+ "interval_s": 60.0, "elapsed_s": 180.1, "ts": 1760000000.1}
+```
+
+The interval is fixed-delay: a late tick does not trigger a burst of catch-up
+ticks. `max_ticks` makes one-shot or bounded schedules possible without a second
+card. Config: `plugins.timer.interval_s` (default 60) and optional `topic`.
+
 ## Read-only RGB-D visual odometry card (`rgbd_visual_odometry`)
 
 Single container: the estimator runs inside this bundle, not in a sidecar.

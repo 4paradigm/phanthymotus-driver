@@ -4,6 +4,13 @@ ros_namespace: ""   # 留空则自动使用 hostname
 plugins:
   state:
     enabled: true
+  # 通用重复定时器卡片。start 只待命，begin 才开始按 interval_s 发 timer_tick；
+  # 事件走 data/json，带 priority=1，可直接连到 decision core。久坐提醒等技能用它
+  # 取代“模型自己不能创建定时器”的缺口。没有硬件依赖。
+  timer:
+    enabled: true
+    interval_s: 60
+    # topic: ""   # 留空用 /<namespace>/timer/events
   loco:
     enabled: true
   # 底盘的流式控制卡片（motus.control/1 的 twist）。和上面的 loco 是同一个身体的

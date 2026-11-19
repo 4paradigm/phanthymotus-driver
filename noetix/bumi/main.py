@@ -141,6 +141,11 @@ class BumiDeviceBundle:
             self._plugins.append(state_plugin)
             print("[bundle] StatePlugin loaded")
 
+        if plugins_cfg.get("timer", {}).get("enabled", False):
+            from timer_card import TimerPlugin
+            self._plugins.append(TimerPlugin(plugins_cfg["timer"], namespace, executor))
+            print("[bundle] TimerPlugin loaded")
+
         if plugins_cfg.get("loco", {}).get("enabled", False) and high_ctrl is not None:
             from device import LocoPlugin
             loco_plugin = LocoPlugin(
