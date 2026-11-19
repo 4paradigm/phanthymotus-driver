@@ -384,55 +384,59 @@ class RgbdCameraPlugin:
         from sensor_msgs.msg import Image, CameraInfo, CompressedImage
         from rclpy.qos import qos_profile_sensor_data
         from rcl_interfaces.srv import GetParameters
-        with self.lock, self.imu_lock:
-            if self._source_shutdown.is_set():
-                raise RuntimeError(self.error or 'camera source callback executor stopped; restart the driver')
-            if self._camera_executor is not None and self._camera_shutdown.is_set():
-                raise RuntimeError(self.error or 'camera callback executor stopped; restart the driver')
-            if self.running:
-                return
-            if not self.attached:
-                self.color_pub = self.pub_node.create_publisher(CompressedImage, self.color_topic, qos_profile_sensor_data)
-                self.depth_pub = self.pub_node.create_publisher(CompressedImage, self.depth_topic, qos_profile_sensor_data)
-                for kind in ('color', 'depth'):
-                    self.sub_node.create_subscription(CameraInfo, '/ob_camera_head/' + kind + '/camera_info',
-                        lambda m, k=kind: self._info(k, m), qos_profile_sensor_data)
-                    self.sub_node.create_subscription(Image, '/ob_camera_head/' + kind + '/image_raw',
-                        lambda m, k=kind: self._image(k, m), qos_profile_sensor_data)
-                self.client = self.sub_node.create_client(GetParameters, '/ob_camera_head/ob_camera_head/get_parameters')
-                self.sub_node.create_timer(.5, self._parameters)
-                self.attached = True
-            self.running = True
-            self.registered = False
-            self.geometry = None
-            self.signature = None
-            self.infos.clear()
-            self.last_emit = 0
-            self.count = 0
-            self.image_streams = {kind: dict(received=0, last_capture_ns=None, last_arrival_ns=None)
-                                  for kind in ('color', 'depth')}
-            self.last_publish_ns = None
-            self.future = None
-            self.parameter_stage = 'service'
-            self.parameter_values = {}
-            self.error = None
-            self.imu_epoch = uuid.uuid4().hex
-            self.imu_last_stamp = 0
-            self.imu_publication_attempts = self.imu_max_capture_gap_ns = 0
-            self.imu_translation_reason = 'waiting for camera motion TF translation'
-            for samples in self.imu_samples.values():
-                samples.clear()
-            self.imu_reason = 'waiting for camera motion samples and TF'
-            self._attach_imu()
-            if self.body_mount is not None:
-                self.body_mount.close()
-            self.body_mount = BodyMountSource(_MountNode(self.sub_node, self.pub_node), self.root,
-                body_frame=os.environ.get('CAMERA_BODY_FRAME', 'base_link'),
-                camera_frame=lambda: self.geometry['frame_id'] if self.geometry is not None else None,
-                clock_id=lambda: self.clock, capture_evidence=self.estimate_evidence)
-            self.stop_event.clear()
-            self.worker = threading.Thread(target=self._work, name='tianyi_rgbd_source', daemon=True)
-            self.worker.start()
+        with self.lifecycle_lock:
+            with self.lock, self.imu_lock:
+                if self._source_shutdown.is_set():
+                    raise RuntimeError(self.error or 'camera source callback executor stopped; restart the driver')
+                if self._camera_executor is not None and self._camera_shutdown.is_set():
+                    raise RuntimeError(self.error or 'camera callback executor stopped; restart the driver')
+                if self.running:
+                    return
+            if self.worker is not None:
+                self.stop()
+            with self.lock, self.imu_lock:
+                if not self.attached:
+                    self.color_pub = self.pub_node.create_publisher(CompressedImage, self.color_topic, qos_profile_sensor_data)
+                    self.depth_pub = self.pub_node.create_publisher(CompressedImage, self.depth_topic, qos_profile_sensor_data)
+                    for kind in ('color', 'depth'):
+                        self.sub_node.create_subscription(CameraInfo, '/ob_camera_head/' + kind + '/camera_info',
+                            lambda m, k=kind: self._info(k, m), qos_profile_sensor_data)
+                        self.sub_node.create_subscription(Image, '/ob_camera_head/' + kind + '/image_raw',
+                            lambda m, k=kind: self._image(k, m), qos_profile_sensor_data)
+                    self.client = self.sub_node.create_client(GetParameters, '/ob_camera_head/ob_camera_head/get_parameters')
+                    self.sub_node.create_timer(.5, self._parameters)
+                    self.attached = True
+                self.running = True
+                self.registered = False
+                self.geometry = None
+                self.signature = None
+                self.infos.clear()
+                self.last_emit = 0
+                self.count = 0
+                self.image_streams = {kind: dict(received=0, last_capture_ns=None, last_arrival_ns=None)
+                                      for kind in ('color', 'depth')}
+                self.last_publish_ns = None
+                self.future = None
+                self.parameter_stage = 'service'
+                self.parameter_values = {}
+                self.error = None
+                self.imu_epoch = uuid.uuid4().hex
+                self.imu_last_stamp = 0
+                self.imu_publication_attempts = self.imu_max_capture_gap_ns = 0
+                self.imu_translation_reason = 'waiting for camera motion TF translation'
+                for samples in self.imu_samples.values():
+                    samples.clear()
+                self.imu_reason = 'waiting for camera motion samples and TF'
+                self._attach_imu()
+                if self.body_mount is not None:
+                    self.body_mount.close()
+                self.body_mount = BodyMountSource(_MountNode(self.sub_node, self.pub_node), self.root,
+                    body_frame=os.environ.get('CAMERA_BODY_FRAME', 'base_link'),
+                    camera_frame=lambda: self.geometry['frame_id'] if self.geometry is not None else None,
+                    clock_id=lambda: self.clock, capture_evidence=self.estimate_evidence)
+                self.stop_event.clear()
+                self.worker = threading.Thread(target=self._work, name='tianyi_rgbd_source', daemon=True)
+                self.worker.start()
 
     def _attach_imu(self):
         if not self.imu_enabled or self.imu_attached:
@@ -646,8 +650,10 @@ class RgbdCameraPlugin:
                     if abs(delta) <= 20_000_000:
                         pair = color.popleft(), depth.popleft()
                         if _stamp(pair[1]) - self.last_emit >= self.frame_interval_ns:
-                            if self.pending.full():
+                            try:
                                 self.pending.get_nowait()
+                            except queue.Empty:
+                                pass
                             self.pending.put_nowait(pair + (dict(self.client_epochs),) if self.managed else pair)
                             self.last_emit = _stamp(pair[1])
                         break
@@ -671,8 +677,10 @@ class RgbdCameraPlugin:
             try:
                 if not _fresh_images(color, depth):
                     continue
-                if color.encoding not in ('rgb8', 'bgr8') or depth.encoding != '16UC1' or depth.is_bigendian:
-                    raise ValueError('unsupported source RGB-D encoding')
+                if (color.encoding not in ('rgb8', 'bgr8') or depth.encoding != '16UC1' or depth.is_bigendian or
+                        any(img.width <= 0 or img.height <= 0 or img.step < img.width * bpp or
+                            len(img.data) != img.height * img.step for img, bpp in ((color, 3), (depth, 2)))):
+                    continue
                 rgb = np.frombuffer(color.data, np.uint8).reshape(color.height, color.step)[:, :color.width*3].reshape(color.height, color.width, 3)
                 if color.encoding == 'rgb8':
                     rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -719,22 +727,27 @@ class RgbdCameraPlugin:
                     self.stop_event.set()
 
     def stop(self):
-        with self.lock, self.imu_lock:
-            self.running = False
-            self.stop_event.set()
-        if self.worker is not None:
-            self.worker.join(timeout=5)
-            if self.worker.is_alive():
-                raise RuntimeError('RGB-D source worker did not stop')
-        with self.lock, self.imu_lock:
-            if self.body_mount is not None:
-                self.body_mount.close()
-            for samples in self.imu_samples.values():
-                samples.clear()
-            for frames in self.frames.values():
-                frames.clear()
-            while not self.pending.empty():
-                self.pending.get_nowait()
+        with self.lifecycle_lock:
+            with self.lock, self.imu_lock:
+                self.running = False
+                self.stop_event.set()
+            if self.worker is not None:
+                self.worker.join(timeout=5)
+                if self.worker.is_alive():
+                    raise RuntimeError('RGB-D source worker did not stop')
+                self.worker = None
+            with self.lock, self.imu_lock:
+                if self.body_mount is not None:
+                    self.body_mount.close()
+                for samples in self.imu_samples.values():
+                    samples.clear()
+                for frames in self.frames.values():
+                    frames.clear()
+                while True:
+                    try:
+                        self.pending.get_nowait()
+                    except queue.Empty:
+                        break
 
     def dispatch(self, action, args):
         if action == 'start':

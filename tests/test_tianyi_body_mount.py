@@ -97,6 +97,102 @@ def emit(source, stamp=STAMP, color_stamp=None):
     source._work()
 
 
+@pytest.mark.parametrize('kind, defect', [('color', 'stride'), ('color', 'size'),
+                                        ('depth', 'stride'), ('depth', 'size'),
+                                        ('depth', 'encoding')])
+def test_malformed_frame_does_not_stop_shared_rgbd(source, kind, defect):
+    def pair(stamp):
+        header = NS(frame_id='head_optical', stamp=NS(sec=stamp//10**9, nanosec=stamp%10**9))
+        return dict(color=NS(header=header, encoding='bgr8', width=640, height=480, step=1924,
+                             data=bytes(1924*480)),
+                    depth=NS(header=header, encoding='16UC1', is_bigendian=False,
+                             width=640, height=480, step=1284, data=bytes(1284*480)))
+
+    bad = pair(STAMP)
+    image = bad[kind]
+    if defect == 'stride':
+        image.step = image.width * (3 if kind == 'color' else 2) - 1
+        image.data = bytes(image.step * image.height)
+    elif defect == 'size':
+        image.data = image.data[:-1]
+    else:
+        image.is_bigendian = True
+
+    good = pair(STAMP+1)
+    source.pending = queue.Queue()
+    source.pending.put_nowait(tuple(bad.values()))
+    source.pending.put_nowait(tuple(good.values()))
+    worker = threading.Thread(target=source._work, daemon=True)
+    worker.start()
+    try:
+        assert source.stop_event.wait(2)
+    finally:
+        source.stop_event.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert source.running and source.error is None
+    assert [(t, m._stamp(img)) for t, img in source.events if t in (source.color_topic, source.depth_topic)] == [
+        (source.color_topic, STAMP+1), (source.depth_topic, STAMP+1)]
+
+
+def test_restart_waits_for_stopped_worker_and_discards_pending_capture(source, monkeypatch):
+    old_worker_waiting, release_old_worker, restarted = (threading.Event() for _ in range(3))
+    pending_at_restart = []
+
+    def old_work():
+        old_worker_waiting.set()
+        release_old_worker.wait(3)
+
+    source.stop()
+    monkeypatch.setattr(source, '_work', old_work)
+    source.start()
+    assert old_worker_waiting.wait(1)
+    old_worker = source.worker
+    source.pending.put_nowait(('queued color from old run', 'queued depth from old run'))
+    monkeypatch.setattr(source, '_work', lambda: pending_at_restart.append(source.pending.qsize()))
+    stopper = threading.Thread(target=source.stop)
+
+    def restart():
+        source.start()
+        restarted.set()
+
+    starter = threading.Thread(target=restart)
+    stopper.start()
+    try:
+        assert source.stop_event.wait(1)
+        starter.start()
+        assert not restarted.wait(.25)
+    finally:
+        release_old_worker.set()
+        stopper.join(2)
+        if starter.ident is not None:
+            starter.join(2)
+        old_worker.join(2)
+    assert restarted.is_set() and not stopper.is_alive()
+    source.worker.join(2)
+    assert source.running and pending_at_restart == [0]
+
+
+def test_ready_pair_survives_worker_draining_the_previous_slot(source):
+    from test_tianyi_rgbd_camera import info
+
+    class WorkerDrainsSlot(queue.Queue):
+        def full(self):
+            full = super().full()
+            if full:
+                self.get_nowait()  # Interleave a worker dequeue after the producer checks capacity.
+            return full
+
+    source.pending = WorkerDrainsSlot(maxsize=1)
+    source.pending.put_nowait(('old color', 'old depth'))
+    source.infos = {kind: info(frame='head_optical') for kind in ('color', 'depth')}
+    msg = NS(width=640, height=480, header=NS(frame_id='head_optical',
+             stamp=NS(sec=STAMP//10**9, nanosec=STAMP%10**9)))
+    source._image('color', msg)
+    source._image('depth', msg)
+    assert source.pending.get_nowait() == (msg, msg)
+
+
 def test_fourth_port_declarations_actual_capture_tf_and_cross_domain_output(source):
     ports = source.get_tool()['topic_out']
     assert [port['format'] for port in ports] == ['image/jpeg', 'image/depth-zlib', 'sensor/imu', 'state/extrinsic']

@@ -7,7 +7,10 @@ import ast
 import json
 from pathlib import Path
 import struct
+import sys
+import threading
 from types import SimpleNamespace as NS
+from uuid import uuid4
 
 import pytest
 
@@ -37,10 +40,32 @@ def plugin_class(monkeypatch):
     assert len(classes) == 1
     extracted = ast.Module(body=classes, type_ignores=[])
     ast.fix_missing_locations(extracted)
-    namespace = {'json': json, 'String': FakeString,
-                 'time': NS(monotonic=lambda: 100.)}
+    class Node:
+        def __init__(self, *args, **kwargs):
+            self.subscriptions = []
+
+        def create_subscription(self, *args):
+            self.subscriptions.append(args)
+
+        def create_publisher(self, *args):
+            return Publisher()
+
+    monkeypatch.setitem(sys.modules, 'sensor_msgs.msg',
+                        NS(PointCloud2=object, Image=object, CameraInfo=object, Imu=object))
+    monkeypatch.setitem(sys.modules, 'std_msgs.msg', NS(UInt8MultiArray=object))
+    namespace = dict(json=json, String=FakeString, time=NS(monotonic=lambda: 100.), Node=Node,
+                     uuid4=uuid4, threading=threading, QoSProfile=lambda **kwargs: NS(**kwargs),
+                     ReliabilityPolicy=NS(BEST_EFFORT=1), HistoryPolicy=NS(KEEP_LAST=1),
+                     DurabilityPolicy=NS(VOLATILE=1), _LOW_LAT_QOS=object(), _RELIABLE_QOS=object())
     exec(compile(extracted, str(source), 'exec'), namespace)
     return namespace['PointCloudPlugin']
+
+
+@pytest.fixture
+def plugin(plugin_class):
+    executor = NS(add_node=lambda node: None)
+    ros = NS(ctx_tianyi=None, ctx_core=None, executor_tianyi=executor, executor_core=executor)
+    return plugin_class({}, 'robot', ros)
 
 
 def native_cloud():
@@ -52,21 +77,8 @@ def native_cloud():
               is_bigendian=False, data=struct.pack('<fff', 1., 2., 3.))
 
 
-def test_native_output_and_digest_are_not_affected_by_display_transform(plugin_class):
-    plugin = object.__new__(plugin_class)
-    plugin._native_topic = '/robot/camera/head/points_native'
-    plugin._topic = '/robot/camera/head/points'
-    plugin._format = 'sensor/pointcloud'
-    plugin._native_metadata_topic = plugin._native_topic + '/metadata'
-    plugin._native_generation = 'epoch-one'
-    plugin._native_last = 0.
-    plugin._native_hz = 2.
-    plugin._native_max_bytes = 1_000_000
-    plugin._native_forwarded = 0
-    plugin._native_evidence = None
-    plugin._native_error = None
-    plugin._native_pub = Publisher()
-    plugin._native_metadata_pub = Publisher()
+def test_native_output_and_digest_are_not_affected_by_display_transform(plugin):
+    plugin.start()
 
     msg = native_cloud()
     plugin._forward_native(msg)
@@ -76,7 +88,7 @@ def test_native_output_and_digest_are_not_affected_by_display_transform(plugin_c
     packet = json.loads(plugin._native_metadata_pub.samples[0].data)
     assert packet['frame_id'] == msg.header.frame_id
     assert packet['stamp_ns'] == 8_000_000_023
-    assert packet['source_generation'] == 'epoch-one'
+    assert packet['source_generation'] == plugin._native_generation
     assert packet['data_sha256'] == plugin._native_evidence['data_sha256']
     assert packet['mapping']['verified'] is False
 
@@ -87,16 +99,8 @@ def test_native_output_and_digest_are_not_affected_by_display_transform(plugin_c
     assert declaration['stamp_source'] == 'unknown'
 
 
-def test_invalid_native_frame_is_not_republished(plugin_class):
-    plugin = object.__new__(plugin_class)
-    plugin._native_last = 0.
-    plugin._native_hz = 2.
-    plugin._native_max_bytes = 1_000_000
-    plugin._native_generation = 'a'
-    plugin._native_pub = Publisher()
-    plugin._native_metadata_pub = Publisher()
-    plugin._native_forwarded = 0
-    plugin._native_error = None
+def test_invalid_native_frame_is_not_republished(plugin):
+    plugin.start()
     bad = native_cloud()
     bad.header.stamp.sec = 0
     bad.header.stamp.nanosec = 0
@@ -107,28 +111,43 @@ def test_invalid_native_frame_is_not_republished(plugin_class):
     assert 'zero ROS header' in plugin._native_error
 
 
-def test_pointcloud_card_rearms_after_stop_without_remaking_subscriptions(plugin_class):
-    plugin = object.__new__(plugin_class)
-    plugin._running = False
-    plugin._topic = '/display'
-    plugin._native_topic = '/native'
-    plugin._native_metadata_topic = '/native/metadata'
-    plugin._native_error = None
-    plugin._native_forwarded = 0
-    plugin._native_evidence = None
-    calls = []
-    plugin.start = lambda: (calls.append('start'), setattr(plugin, '_running', True))
-    plugin.stop = lambda: (calls.append('stop'), setattr(plugin, '_running', False))
+def test_native_cloud_restart_clears_cadence_evidence_and_generation(plugin):
+    plugin.start()
+    original_publisher = plugin._native_pub
+    plugin._forward_native(native_cloud())
+    prior = json.loads(plugin._native_metadata_pub.samples[-1].data)
+    assert plugin.dispatch('info', {})['native_status']['frames_forwarded'] == 1
+    plugin.start()  # Repeated start while running must keep the same run.
+    assert plugin.dispatch('info', {})['native_status']['frames_forwarded'] == 1
+    plugin.stop()
+    plugin.start()
+    status = plugin.dispatch('info', {})['native_status']
+    assert status['source_header'] is None and status['frames_forwarded'] == 0
+    assert len(plugin._sub_node.subscriptions) == 4
+    assert plugin._native_pub is original_publisher
+
+    fresh = native_cloud()
+    fresh.header.stamp.sec -= 1  # Source clock can restart behind its prior header.
+    plugin._forward_native(fresh)  # Same monotonic time as last run, no rate delay.
+    assert plugin._native_pub.samples[-1] is fresh
+    packet = json.loads(plugin._native_metadata_pub.samples[-1].data)
+    assert packet['source_generation'] != prior['source_generation']
+    assert packet['stamp_ns'] == 7_000_000_023
+    plugin._forward_native(native_cloud())
+    assert len(plugin._native_pub.samples) == 2  # Cadence still applies within a run.
+
+
+def test_pointcloud_card_rearms_after_stop_without_remaking_subscriptions(plugin):
     assert plugin.dispatch('start', {})['state'] == 'running'
     assert plugin.dispatch('stop', {})['state'] == 'idle'
     assert plugin.dispatch('start', {})['state'] == 'running'
-    assert calls == ['start', 'stop', 'start']
+    assert len(plugin._sub_node.subscriptions) == 4
     assert plugin.dispatch('info', {})['topic_out'][0]['format'] == 'sensor/pointcloud'
 
 
 @pytest.mark.parametrize('sidecar_order', ['before', 'after', 'absent'])
 def test_native_output_routes_through_core_and_maps_without_sidecar_dependency(
-        plugin_class, monkeypatch, sidecar_order):
+        plugin, monkeypatch, sidecar_order):
     import importlib.util
     companion = BASE.parents[2] / 'pr371-current-review'
     if not (companion / 'agent-core/src/api/slam_metadata.py').exists():
@@ -144,7 +163,7 @@ def test_native_output_routes_through_core_and_maps_without_sidecar_dependency(
     routing = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(routing)
     msg = native_cloud()
-    source = object.__new__(plugin_class)
+    source = plugin
     source._topic, source._format = '/display', 'sensor/pointcloud'
     source._native_topic, source._native_metadata_topic = '/native', '/metadata'
     source._native_evidence = native_cloud_evidence(msg)

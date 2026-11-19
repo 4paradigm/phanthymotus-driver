@@ -2340,7 +2340,8 @@ class PointCloudPlugin:
         # The display output continues to use gravity leveling and floor shift.
         self._native_topic = f"/{namespace}/camera/head/points_native"
         self._native_metadata_topic = self._native_topic + "/metadata"
-        self._native_last = 0.0
+        self._native_lock = threading.Lock()
+        self._native_last = None
         self._native_hz = max(0.2, min(float(plugin_config.get("native_hz", 2.0)), 5.0))
         self._native_max_bytes = max(1024, min(int(plugin_config.get("native_max_bytes", 12_000_000)), 20_000_000))
         self._native_generation = uuid4().hex
@@ -2359,19 +2360,20 @@ class PointCloudPlugin:
 
     def _native_info(self):
         from slam_pointcloud import input_declaration
-        return {
-            "topic_out": self._outputs(),
-            "input_metadata": [input_declaration(
-                self._native_topic, self._native_metadata_topic, self._native_evidence)],
-            "native_status": {
-                "frames_forwarded": self._native_forwarded,
-                "source_header": self._native_evidence,
-                "error": self._native_error,
-                "clock_verified": False,
-                "extrinsic_verified": False,
-                "note": "Orbbec header clock semantics and dynamic head mount are unverified",
-            },
-        }
+        with self._native_lock:
+            return {
+                "topic_out": self._outputs(),
+                "input_metadata": [input_declaration(
+                    self._native_topic, self._native_metadata_topic, self._native_evidence)],
+                "native_status": {
+                    "frames_forwarded": self._native_forwarded,
+                    "source_header": self._native_evidence,
+                    "error": self._native_error,
+                    "clock_verified": False,
+                    "extrinsic_verified": False,
+                    "note": "Orbbec header clock semantics and dynamic head mount are unverified",
+                },
+            }
 
     def get_tool(self):
         return {"name": "camera_pointcloud", "type": "sensor",
@@ -2379,28 +2381,35 @@ class PointCloudPlugin:
                 "inputSchema": {"type": "object", "properties": {}}, **self._native_info()}
 
     def start(self):
-        from sensor_msgs.msg import PointCloud2, Image, CameraInfo, Imu
-        from std_msgs.msg import UInt8MultiArray
-        self._running = True
-        if self._subscriptions_registered:
-            return
-        latest = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
-                            history=HistoryPolicy.KEEP_LAST, depth=1,
-                            durability=DurabilityPolicy.VOLATILE)
-        self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
-        self._native_pub = self._pub_node.create_publisher(PointCloud2, self._native_topic, latest)
-        self._native_metadata_pub = self._pub_node.create_publisher(String, self._native_metadata_topic, latest)
-        self._sub_node.create_subscription(PointCloud2, "/ob_camera_head/depth/points", self._on_cloud, _LOW_LAT_QOS)
-        # Gemini 336 currently has its depth image enabled even when the vendor
-        # point-cloud stream is disabled. The display fallback remains unchanged;
-        # it is NOT silently promoted to the native PointCloud2 output.
-        self._sub_node.create_subscription(CameraInfo, "/ob_camera_head/depth/camera_info", self._on_info, _RELIABLE_QOS)
-        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_depth, _LOW_LAT_QOS)
-        self._sub_node.create_subscription(Imu, "/ob_camera_head/accel/sample", self._on_accel, _LOW_LAT_QOS)
-        self._subscriptions_registered = True
+        with self._native_lock:
+            if self._running:
+                return
+            if not self._subscriptions_registered:
+                from sensor_msgs.msg import PointCloud2, Image, CameraInfo, Imu
+                from std_msgs.msg import UInt8MultiArray
+                latest = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                                    history=HistoryPolicy.KEEP_LAST, depth=1,
+                                    durability=DurabilityPolicy.VOLATILE)
+                self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
+                self._native_pub = self._pub_node.create_publisher(PointCloud2, self._native_topic, latest)
+                self._native_metadata_pub = self._pub_node.create_publisher(String, self._native_metadata_topic, latest)
+                self._sub_node.create_subscription(PointCloud2, "/ob_camera_head/depth/points", self._on_cloud, _LOW_LAT_QOS)
+                # Gemini 336 currently has its depth image enabled even when the vendor
+                # point-cloud stream is disabled. The display fallback remains unchanged;
+                # it is NOT silently promoted to the native PointCloud2 output.
+                self._sub_node.create_subscription(CameraInfo, "/ob_camera_head/depth/camera_info", self._on_info, _RELIABLE_QOS)
+                self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_depth, _LOW_LAT_QOS)
+                self._sub_node.create_subscription(Imu, "/ob_camera_head/accel/sample", self._on_accel, _LOW_LAT_QOS)
+                self._subscriptions_registered = True
+            self._native_last = None
+            self._native_generation = uuid4().hex
+            self._native_evidence = self._native_error = None
+            self._native_forwarded = 0
+            self._running = True
 
     def stop(self):
-        self._running = False
+        with self._native_lock:
+            self._running = False
     def _on_accel(self, msg):
         """Estimate display-frame up from the camera's stationary IMU vector."""
         # Optical raw coordinates are (right, down, forward); the renderer's
@@ -2455,25 +2464,27 @@ class PointCloudPlugin:
         guarantee. PR371 consumes the numeric cloud independently; this sidecar
         supplies optional diagnostics, not an admission prerequisite.
         """
-        if time.monotonic() - self._native_last < 1.0 / self._native_hz:
-            return
-        from slam_pointcloud import native_cloud_evidence, frame_declaration
-        try:
-            evidence = native_cloud_evidence(msg, max_bytes=self._native_max_bytes)
-            # The original msg carries the vendor's frame/fields/stamp/data.
-            # Neither display transform nor receive-time restamp is applied.
-            self._native_pub.publish(msg)
-            sidecar = String(data=json.dumps(
-                frame_declaration(evidence, self._native_generation),
-                allow_nan=False))
-            self._native_metadata_pub.publish(sidecar)
-        except (ValueError, TypeError, AttributeError, OverflowError, RuntimeError) as error:
-            self._native_error = str(error)
-            return
-        self._native_last = time.monotonic()
-        self._native_forwarded += 1
-        self._native_evidence = evidence
-        self._native_error = None
+        with self._native_lock:
+            if not self._running or (self._native_last is not None and
+                    time.monotonic() - self._native_last < 1.0 / self._native_hz):
+                return
+            from slam_pointcloud import native_cloud_evidence, frame_declaration
+            try:
+                evidence = native_cloud_evidence(msg, max_bytes=self._native_max_bytes)
+                # The original msg carries the vendor's frame/fields/stamp/data.
+                # Neither display transform nor receive-time restamp is applied.
+                self._native_pub.publish(msg)
+                sidecar = String(data=json.dumps(
+                    frame_declaration(evidence, self._native_generation),
+                    allow_nan=False))
+                self._native_metadata_pub.publish(sidecar)
+            except (ValueError, TypeError, AttributeError, OverflowError, RuntimeError) as error:
+                self._native_error = str(error)
+                return
+            self._native_last = time.monotonic()
+            self._native_forwarded += 1
+            self._native_evidence = evidence
+            self._native_error = None
 
     def _on_cloud(self, msg):
         if not self._running: return
