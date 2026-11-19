@@ -413,7 +413,7 @@ class UnifiedControlPlugin(IntentControlPlugin):
         snapshot['capabilities'] = self.capabilities()
         snapshot['return_preset_configured'] = snapshot['capabilities']['return_preset']['available']
         snapshot['tcp_verified'] = snapshot['capabilities']['pose']['available']
-        status = snapshot.get('faults', {}).get('arm_status', '')
+        status = (snapshot.get('faults') or {}).get('arm_status', '')
         snapshot['controller_recovery'] = {
             'required': status.startswith(('NO_SOLUTION', 'SINGULARITY_POINT', 'TARGET_POS_EXCEEDS_LIMIT')),
             'controller_status': status, 'automatic': False,
