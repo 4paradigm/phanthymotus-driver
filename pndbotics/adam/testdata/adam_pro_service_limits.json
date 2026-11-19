@@ -1,0 +1,25 @@
+{
+  "source": "Read-only installed pnd_service_dds configs/device/joints_info.json, adam_pro, 2026-10-22",
+  "note": "Sanitized upper-body slice; no addresses, serials or calibration offsets. Slots refer to the installed service, not the older SDK example.",
+  "joints": [
+    [12, "waistRoll", -0.279, 0.279],
+    [13, "waistPitch", -0.663, 1.361],
+    [14, "waistYaw", -0.829, 0.829],
+    [15, "neckYaw", -1.571, 1.571],
+    [16, "neckPitch", -0.873, 0.873],
+    [17, "shoulderPitch_Left", -1.047, 2.042],
+    [18, "shoulderRoll_Left", -0.628, 2.793],
+    [19, "shoulderYaw_Left", -2.583, 2.583],
+    [20, "elbow_Left", -2.496, 0.209],
+    [21, "wristYaw_Left", -2.670, 2.670],
+    [22, "wristPitch_Left", -0.960, 0.960],
+    [23, "wristRoll_Left", -0.960, 0.960],
+    [24, "shoulderPitch_Right", -1.047, 2.042],
+    [25, "shoulderRoll_Right", -2.793, 0.628],
+    [26, "shoulderYaw_Right", -2.583, 2.583],
+    [27, "elbow_Right", -2.496, 0.209],
+    [28, "wristYaw_Right", -2.670, 2.670],
+    [29, "wristPitch_Right", -0.960, 0.960],
+    [30, "wristRoll_Right", -0.960, 0.960]
+  ]
+}
