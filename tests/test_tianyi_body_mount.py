@@ -58,7 +58,7 @@ def source(monkeypatch):
         ShutdownException=type('ShutdownException', (Exception,), {})))
     monkeypatch.setitem(sys.modules, 'rclpy.time', NS(Time=lambda **kw: NS(**kw)))
     monkeypatch.setitem(sys.modules, 'rclpy.clock', NS(ClockType=NS(ROS_TIME='ros')))
-    monkeypatch.setitem(sys.modules, 'rclpy.qos', NS(qos_profile_sensor_data=object()))
+    monkeypatch.setitem(sys.modules, 'rclpy.qos', NS(qos_profile_sensor_data=NS(depth=5)))
     monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(Image=Image, CameraInfo=object, CompressedImage=Image))
     monkeypatch.setitem(sys.modules, 'std_msgs.msg', NS(String=lambda **kw: NS(**kw)))
     monkeypatch.setitem(sys.modules, 'rcl_interfaces.srv', NS(GetParameters=object))

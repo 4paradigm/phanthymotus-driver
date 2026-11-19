@@ -250,6 +250,13 @@ def test_reuses_vendor_streams_on_dedicated_imu_node_without_new_camera_owner(so
     assert source.imu_listener.node is source.imu_node
 
 
+def test_raw_image_subscriptions_keep_two_frames_without_shrinking_camera_info(source):
+    qos = source.sub_node.subscription_qos
+    for kind in ('color', 'depth'):
+        assert qos[f'/ob_camera_head/{kind}/image_raw'].depth == 2
+        assert qos[f'/ob_camera_head/{kind}/camera_info'].depth == 5
+
+
 def test_motion_capture_intervals_survive_a_200ms_callback_backlog(source):
     # DDS keeps only the newest `depth` samples while the shared source executor
     # is occupied. Exercise the real pairing/publisher after that ingress boundary.

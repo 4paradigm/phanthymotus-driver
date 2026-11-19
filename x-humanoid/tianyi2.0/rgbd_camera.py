@@ -6,7 +6,7 @@ rays also removes its distortion. The resulting two 640x480 images share K.
 """
 from collections import deque
 from array import array
-from copy import deepcopy
+from copy import copy, deepcopy
 import json
 import os
 import queue
@@ -398,11 +398,14 @@ class RgbdCameraPlugin:
                 if not self.attached:
                     self.color_pub = self.pub_node.create_publisher(CompressedImage, self.color_topic, qos_profile_sensor_data)
                     self.depth_pub = self.pub_node.create_publisher(CompressedImage, self.depth_topic, qos_profile_sensor_data)
+                    # Keep one adjacent frame for pairing without draining five old images after a callback stall.
+                    image_qos = copy(qos_profile_sensor_data)
+                    image_qos.depth = 2
                     for kind in ('color', 'depth'):
                         self.sub_node.create_subscription(CameraInfo, '/ob_camera_head/' + kind + '/camera_info',
                             lambda m, k=kind: self._info(k, m), qos_profile_sensor_data)
                         self.sub_node.create_subscription(Image, '/ob_camera_head/' + kind + '/image_raw',
-                            lambda m, k=kind: self._image(k, m), qos_profile_sensor_data)
+                            lambda m, k=kind: self._image(k, m), image_qos)
                     self.client = self.sub_node.create_client(GetParameters, '/ob_camera_head/ob_camera_head/get_parameters')
                     self.sub_node.create_timer(.05, self._parameters)
                     self.attached = True
