@@ -41,6 +41,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3-numpy python3-opencv && \
     rm -rf /var/lib/apt/lists/*
 
+# Keep the known-good OpenCV transaction unchanged: adding FFmpeg to it
+# crashed the libc-bin trigger under ARM64 emulation. Check the encoder in
+# the final runtime environment so a build without H.264 support fails here.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && \
+    ffmpeg -nostdin -v error -f lavfi -i color=size=16x16 -frames:v 1 \
+      -an -c:v libx264 -threads 1 -f mp4 -y /tmp/panther-encoder.mp4 && \
+    test -s /tmp/panther-encoder.mp4 && rm /tmp/panther-encoder.mp4 && \
+    rm -rf /var/lib/apt/lists/*
+
 # Runtime dependencies deliberately come from Ubuntu/ROS apt packages. This
 # avoids duplicate pip NumPy/OpenCV wheels and keeps their ABI aligned with ROS.
 # nav-msgs is required for the /odom Odometry subscription; removing the
@@ -51,7 +60,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=interface-builder /panther_ws/install /panther_ws/install
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py plugins.py contracts.py core_bridge.py camera.py audio.py config.yaml driver.yaml /work/
+COPY main.py device.py plugins.py contracts.py core_bridge.py camera.py audio.py laser_cloud.py joint_display.py panther_media.py config.yaml driver.yaml /work/
 COPY resource/panther.urdf /work/resource/panther.urdf
 COPY resource/cyclonedds-muzzle.xml /work/resource/cyclonedds-muzzle.xml
 COPY entrypoint.sh /work/entrypoint.sh

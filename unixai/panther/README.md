@@ -15,10 +15,11 @@ required for discovery.
 ## Implemented cards
 
 - Sensors: `joints`/`model`, compact `robot_state`, `battery`, `imu`, `odom`,
-  merged `laser_scan`, lazy `camera_color`, and lazy `camera_depth`.
+  `laser_scan` point cloud, lazy `camera_color`, and lazy `camera_depth`.
 - Actuators: `base_drive`, `arm_control`, `gripper`, `lifting`, and `head`.
 - Audio: `mic` publishes `audio/pcm-16k` from the host PulseAudio source;
   `speaker` plays a canvas-connected `audio/pcm-16k` stream through its sink.
+- Media: `vision_capture` takes JPEG photos, records silent MP4 clips, and lists or deletes saved files.
 
 The audio cards run in separate domain-42 processes and use the host PulseAudio
 server at `/run/user/1001/pulse/native`; they never open ALSA devices directly.
@@ -36,11 +37,21 @@ then test `mic -> ASR` and `TTS -> speaker` on Panther. For simultaneous
 listening and speaking, insert the perception echo-cancellation card before
 ASR and check interaction with the robot's native AIUI conversation service.
 
-`model` falls back to the bundled, verbatim vendor `pmm_urdf` model before the robot
-publishes anything. Once a live `/robot_description` is available, reading the
-model resource atomically switches both the returned URDF and the `joints`
-rendering indices to that same live snapshot. The response includes its source
-and SHA-256 digest so a renderer can identify the active morphology. Live
+`model` and `joints` use the same bundled articulated display model throughout
+the session. The live `/robot_description` can encode the lift and fingers as
+fixed joints, so it is kept separate from Canvas rendering. The display model
+uses the measured yaw/pitch order, the bundled elbow axes, and maps gripper
+feedback as `1 - position` before expanding the finger linkage.
+These are display-only corrections. `joints` combines `/joint_states` with fresh
+lift and gripper feedback, and `joints info` reports `body_joint` in metres.
+The display model replaces the wheel and lidar branches with a cuboid base
+outline (650 × 510 mm in plan, approximately 200 mm high) and a fixed guide
+column aligned with the head at the observed 0.62 m raised position. The
+`body_joint` prismatic branch carries the torso, head and arms. Use the Canvas
+renderer from [phanthymotus#413](https://github.com/4paradigm/phanthymotus/pull/413)
+to draw the base primitives and move the upper body along the column from
+live feedback. Older renderers still report lift height but do not animate it.
+The response includes the display model's SHA-256 digest. Live
 `/robot_description` may narrow, but never widen, the bundled vendor motion
 limits. Arm execution uses the intersection of both limit sets. `joints`,
 `imu`, `odom`, `robot_state`, `battery`, and `laser_scan` are rate limited before crossing
@@ -56,10 +67,15 @@ instead of failing the card lifecycle.
 
 `robot_state` contains compact readiness, controller, diagnostic, and hardware
 summaries. Battery measurements use the separate `battery` card; gripper and
-lifting feedback are available from their actuator cards. `laser_scan`
-consumes only `/scan`, whose publisher on Panther is the existing
-`dual_lidar_merger`; this driver performs no second lidar fusion, but pools each
-angular bin to its nearest valid return and reports scan quality.
+lifting feedback are available from their actuator cards. `laser_scan` prefers
+fresh `/scan` from the vendor merger and falls back to `/lidar_front/scan`; it
+does not fuse the feeds a second time. The first Canvas output is the native
+`sensor/pointcloud` stream; the second keeps the scan JSON with nearest-return
+pooling and quality metrics. Each point-cloud packet contains only the current
+scan projected in its own XY plane (`z=0`), capped at 20,000 points and a 12 m
+range by default. `info` reports the source, scan frame and point count. The
+current Canvas renderer replaces its last displayed frame when a new non-empty
+cloud arrives.
 
 The first camera card started on the canvas reuses an already-active host
 `panther_orbbec.service` without taking ownership. Otherwise it creates a
@@ -69,6 +85,17 @@ unit may be stopped or watchdog-restarted by this driver; a loaded but inactive
 host unit is left untouched. RGB and depth share the source process. Malformed
 frame diagnostics are bounded and sampled at the first failure and every 100th
 failure rather than logged once per frame.
+
+To take a photo, start `camera_color` (or use an already-running RGB publisher),
+then execute `vision_capture → capture_photo`. The card waits up to 3 seconds
+for a new frame and returns `file_path` and the ROS frame timestamp. The JPEG is
+saved under `/opt/phanthy-motus/data/vision_capture/panther/photos/` on the robot's
+existing persistent data mount. `record_video` takes `duration_s` (1–30 s,
+default 5 s) and reports a silent H.264 MP4 in the sibling `videos/` directory
+on completion. `stop` cancels an in-flight recording and discards its temporary
+files. Both capture actions share the RGB source and leave its preview running.
+`list` returns up to 100 of the newest saved media files. Pass an exact
+`filename` from that result as `name` to `delete` to remove just that file.
 
 ## Container dependencies
 
@@ -82,7 +109,8 @@ for these concrete runtime paths:
 | `ros-humble-nav-msgs` | `nav_msgs/msg/Odometry` on `/odom` | Required even though the navigation card was removed |
 | `ros-humble-rmw-cyclonedds-cpp` | Robot-facing domain 0 process | Required |
 | `ros-humble-rmw-fastrtps-cpp` | Agent Core domain 42 bridge process | Required |
-| `python3-numpy`, `python3-opencv` | RGB/depth conversion and laser rendering | Apt-only; no duplicate pip wheels |
+| `python3-numpy`, `python3-opencv` | RGB/depth conversion | Apt-only; no duplicate pip wheels |
+| `ffmpeg` | H.264 MP4 encoding for `vision_capture` | Runtime only |
 | `util-linux` | `nsenter` into the host namespaces for the lazy camera source | Required |
 | `systemd` | `systemctl`/`systemd-run` clients for the owned host transient unit | Required; the driver does not run systemd in the container |
 
@@ -148,6 +176,7 @@ put the degree range first so narrow cards show the safety limit. The old
 ```bash
 python3 scripts/check_service_yml.py unixai/panther
 python3 tests/test_panther_driver.py -v
+python3 -m pytest unixai/panther/test_panther_vision_capture.py
 ```
 
 Deployment uses the image's `/deploy/service.yml` fragment. The repository

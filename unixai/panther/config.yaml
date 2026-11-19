@@ -13,7 +13,12 @@ plugins:
   battery: {enabled: true}
   imu: {enabled: true}
   odom: {enabled: true}
-  laser_scan: {enabled: true}
+  laser_scan:
+    enabled: true
+    # Prefer the robot's fused scan; also support units with only a front scanner.
+    topics: ["/scan", "/lidar_front/scan"]
+    max_points: 20000
+    max_range_m: 12.0
 
   camera:
     workspace: "/home/unix_ai/orbbec_ws"
@@ -28,6 +33,9 @@ plugins:
     max_width: 640
   camera_color: {enabled: true}
   camera_depth: {enabled: true}
+  vision_capture:
+    enabled: true
+    output_dir: /opt/phanthy-motus/data/vision_capture/panther
 
   audio:
     server: "unix:/run/user/1001/pulse/native"

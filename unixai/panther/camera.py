@@ -28,6 +28,9 @@ class PantherCameraRuntime:
         self._config = config
         self._active: set[str] = set()
         self._lock = threading.RLock()
+        self._photo_ready = threading.Condition(self._lock)
+        self._photo_waiting = False
+        self._photo_frame = None
         self._source_lock = threading.Lock()
         self._frames = {"rgb": None, "depth": None}
         self._last_frame_at = {"rgb": 0.0, "depth": 0.0}
@@ -132,6 +135,7 @@ class PantherCameraRuntime:
     def close(self) -> None:
         with self._lock:
             self._closed = True
+            self._photo_ready.notify_all()
             self._active.clear()
             self._frames = {"rgb": None, "depth": None}
             managed_unit = self._managed_unit
@@ -236,10 +240,37 @@ class PantherCameraRuntime:
 
     def _on_rgb(self, msg) -> None:
         with self._lock:
-            if "rgb" not in self._active:
-                return
-            self._frames["rgb"] = msg
-            self._last_frame_at["rgb"] = time.monotonic()
+            if "rgb" in self._active:
+                self._frames["rgb"] = msg
+                self._last_frame_at["rgb"] = time.monotonic()
+            if self._photo_waiting and self._photo_frame is None:
+                self._photo_frame = msg
+                self._photo_ready.notify()
+
+    def rgb_available(self) -> bool:
+        return self._node.count_publishers(self.COLOR_TOPIC) > 0
+
+    def capture_jpeg(self, timeout_s: float) -> dict:
+        """Use the next RGB frame from a running source, independently of preview."""
+        with self._photo_ready:
+            if self._closed:
+                raise RuntimeError("camera runtime is shutting down")
+            if self._photo_waiting:
+                raise RuntimeError("another capture is already waiting for an RGB frame")
+            if not self.rgb_available():
+                raise RuntimeError("no RGB camera publisher; start camera_color first")
+            self._photo_waiting = True
+            try:
+                self._photo_ready.wait_for(lambda: self._photo_frame is not None or self._closed, timeout_s)
+                if self._closed:
+                    raise RuntimeError("camera runtime is shutting down")
+                message = self._photo_frame
+                if message is None:
+                    raise TimeoutError("no new RGB frame arrived before the capture timeout")
+            finally:
+                self._photo_waiting = False
+                self._photo_frame = None
+        return self._encode_rgb(message)
 
     def _on_depth(self, msg) -> None:
         with self._lock:
@@ -271,45 +302,46 @@ class PantherCameraRuntime:
             },
         }
 
-    def _rgb_loop(self) -> None:
+    def _encode_rgb(self, message) -> dict:
         import cv2
         import numpy as np
 
-        hz = max(1.0, min(float(self._config.get("rgb_hz", 10.0)), 20.0))
         quality = max(20, min(int(self._config.get("jpeg_quality", 70)), 95))
         max_width = max(160, int(self._config.get("max_width", 640)))
         channels = {"rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4, "mono8": 1}
+        encoding = str(message.encoding).lower()
+        count = channels.get(encoding)
+        width, height, step = int(message.width), int(message.height), int(message.step)
+        if count is None or width <= 0 or height <= 0 or step < width * count:
+            raise ValueError(f"unsupported RGB image layout: {message.encoding}")
+        raw = np.frombuffer(message.data, dtype=np.uint8)
+        if raw.size < height * step:
+            raise ValueError("truncated RGB image")
+        image = raw[: height * step].reshape(height, step)[:, : width * count]
+        image = image.reshape(height, width) if count == 1 else image.reshape(height, width, count)
+        if encoding == "rgb8":
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        elif encoding == "rgba8":
+            image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
+        elif encoding == "bgra8":
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        if width > max_width:
+            output_height = max(1, round(height * max_width / width))
+            image = cv2.resize(image, (max_width, output_height), interpolation=cv2.INTER_AREA)
+        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            raise ValueError("JPEG encoder rejected frame")
+        return {**self._header_payload(message), "message_format": "jpeg", "data": encoded.tobytes()}
+
+    def _rgb_loop(self) -> None:
+        hz = max(1.0, min(float(self._config.get("rgb_hz", 10.0)), 20.0))
         while not self._closed:
             message = self._take_latest("rgb", hz)
             if message is None:
                 time.sleep(0.01)
                 continue
             try:
-                encoding = str(message.encoding).lower()
-                count = channels.get(encoding)
-                width, height, step = int(message.width), int(message.height), int(message.step)
-                if count is None or width <= 0 or height <= 0 or step < width * count:
-                    raise ValueError(f"unsupported RGB image layout: {message.encoding}")
-                raw = np.frombuffer(message.data, dtype=np.uint8)
-                if raw.size < height * step:
-                    raise ValueError("truncated RGB image")
-                image = raw[: height * step].reshape(height, step)[:, : width * count]
-                image = image.reshape(height, width) if count == 1 else image.reshape(height, width, count)
-                if encoding == "rgb8":
-                    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-                elif encoding == "rgba8":
-                    image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
-                elif encoding == "bgra8":
-                    image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-                if width > max_width:
-                    output_height = max(1, round(height * max_width / width))
-                    image = cv2.resize(image, (max_width, output_height), interpolation=cv2.INTER_AREA)
-                ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
-                if not ok:
-                    raise ValueError("JPEG encoder rejected frame")
-                payload = self._header_payload(message)
-                payload.update({"message_format": "jpeg", "data": encoded.tobytes()})
-                self._bridge.publish("camera_color", payload)
+                self._bridge.publish("camera_color", self._encode_rgb(message))
             except Exception as exc:
                 self._log_frame_failure("rgb", "camera_color", exc)
 
