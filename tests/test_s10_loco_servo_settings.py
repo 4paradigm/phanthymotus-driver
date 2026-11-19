@@ -119,7 +119,7 @@ def test_servo_watchdog_holds_at_600_ms_without_admitting_stale_commands(servo, 
     commands_sent = len(servo.native.calls)
 
     elapsed_ms[0] = 301
-    submit(p, {**command(p, values, seq=2, stamp=stamp), 'obs_stamp_ms': stamp})
+    submit(p, {**command(p, values, seq=2, stamp=stamp), 'ttl_ms': 300, 'obs_stamp_ms': stamp})
     assert p.dispatch('info', {})['last_command']['reason'] == 'expired: 301 ms old, ttl 300 ms'
 
     elapsed_ms[0] = 500
@@ -141,9 +141,25 @@ def test_servo_watchdog_holds_at_600_ms_without_admitting_stale_commands(servo, 
         ('X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw'), 0.0))
     rate = started['control_interface']['rate']
     assert rate['watchdog_ms'] == 600
-    assert rate['max_command_ttl_ms'] == 300
+    assert rate['max_command_ttl_ms'] == 600
     assert rate['max_obs_age_ms'] == 500
     assert p.dispatch('info', {})['control_interface']['rate'] == rate
+
+
+@pytest.mark.parametrize(('age_ms', 'verdict'), [(600, 'APPLIED'), (601, 'DROPPED')])
+def test_servo_caps_command_ttl_at_600_ms(servo, monkeypatch, age_ms, verdict):
+    p = servo.plugin
+    monkeypatch.setattr(p, '_read_loop', lambda: None)
+    assert p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})['state'] == 'ready'
+    stamp = p._barrier_ms + 1
+    monkeypatch.setattr(p._sink, '_wall_clock', lambda: stamp + age_ms)
+
+    submit(p, {**command(p, [.02, 0, 0, 0, 0, 0], stamp=stamp), 'ttl_ms': 1000})
+
+    last = p.dispatch('info', {})['last_command']
+    assert last['verdict'] == verdict
+    if verdict == 'DROPPED':
+        assert last['reason'] == 'expired: 601 ms old, ttl 600 ms'
 
 
 @pytest.mark.parametrize('settings', [
