@@ -748,3 +748,26 @@ pitch+10°有一次实测到位完成。支持方向相关的稳态跟踪误差�
 - 358项离线测试、Python编译、service checker及diff检查通过。新增源码复用已有依赖和/config卷，
   不增加运行包或挂载；Dockerfile仅补COPY。候选742328986字节，比local-base-drive-261119的
   742189487字节增加139499字节，属于本地叠层增量，不替代正式CI或相对ros-base的完整大小评估。
+
+## 2026-11-19：启动卡片时取消旧任务并解除底盘软件急停
+
+- 本次开机14:33:12启动jaten服务，14:33:23起速度仲裁器即记录is_software_estop_，
+  早于导航卡部署；原始robot_state.soft_estop=true，硬件estop/bumper/driver_error=false。
+  未找到设置者审计，不能断言具体是谁触发或将启动时出现等同于厂商默认配置。
+- 按用户授权，将取消旧任务→新鲜里程计停稳→必要时解除软急停→双路反馈/停稳确认放在
+  base_drive和controlled_spatial的共用start中；不发送运动目标，不使能全身控制。
+- 首次实调发现厂商Python绑定与运行服务MD5不一致；握手直接拒绝，不能凭类型名判定兼容。
+  实际C++头匹配运行端，固定字段重算MD5并生成内存绑定后序列化往返通过，详见SDK_ANALYSIS。
+  本次已证实为握手拒绝、请求未投递的持久化准备记录经审计单次恢复；未添加通用清除不确定状态入口。
+- 现场ROS初始化/服务/里程计核验及进程退出耗时可超过原15秒，prepare/soft_stop外层时限改45秒，
+  普通cancel为25秒。超时仍锁存不确定状态，不能当作停止成功；操作无自动重试。
+- 最终候选local-chassis-start-261119（c57d10ea572b）部署成功：
+  base_drive.start返回ready、old_task_cancelled=true、released=true、stationary=true、software_estop=false；
+  controlled_spatial.start返回running、old_task_cancelled=true、released=false、stationary=true。
+  随后info确认softwareEstop=false、driving=false，无原生导航任务、无未决准备记录。
+  joints valid、boot complete、control_enabled=false；speaker恢复/perception/tts、音量50%。
+- 本轮未发送移动目标、导航目标、建图或载图命令；解除软件急停和取消旧任务通过现场调用验证，
+  不代表导航路径执行、到达与中途取消已验收。376项离线测试、编译、service checker及diff检查通过。
+  没有增加依赖、服务、挂载或修改厂家文件，源码包含于既有镜像构建COPY。
+- 最终只读复核控制进程PID仍1963、底盘静止、softEstop=false、全身暂停，speaker ready。
+  候选742449992字节，较local-spatial-261119增加121006字节，为本地源码叠层增量，非完整基础镜像成本。

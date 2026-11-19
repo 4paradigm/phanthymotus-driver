@@ -109,6 +109,8 @@ class ControlledSpatialPlugin:
                                                            / 'controlled_spatial.db')))
         self._operations = threading.Lock()
         self._native_lock = threading.RLock()
+        self._start_lock = threading.Lock()
+        self._preparation = None
         self._task = None
         self._uncertain = False
         self._restored = False
@@ -140,15 +142,86 @@ class ControlledSpatialPlugin:
                 self._task = pending.get('navigation')
                 self._uncertain = bool(pending.get('uncertain'))
                 self._map_pending = pending.get('map_transition')
+                self._preparation = pending.get('chassis_preparation')
             self._restored = True
 
     def _persist(self):
         self.store.state('pending', {'navigation': self._task, 'uncertain': self._uncertain,
-                                    'map_transition': self._map_pending})
+                                    'map_transition': self._map_pending, 'chassis_preparation': self._preparation})
 
     def unresolved(self):
         self._restore()
-        return self._uncertain or self._task is not None or self._map_pending is not None
+        return (self._uncertain or self._task is not None or self._map_pending is not None
+                or self._preparation is not None)
+
+    @staticmethod
+    def _check_chassis_faults(observation):
+        agv = observation['agvState']
+        if any(agv.get(k) is not False for k in ('estopButtonEvent', 'bumperEvent', 'driverError')):
+            raise RuntimeError('chassis_hardware_stop_or_fault_is_active')
+
+    def prepare_chassis(self):
+        """Explicit card start: cancel old tasks, release soft stop, confirm rest.
+
+        One shared preparation for both cards. Stops supersede its transition;
+        the native lock orders a later soft stop after any resolved release.
+        """
+        epoch = self.bundle._stop_epoch
+        if not self._start_lock.acquire(timeout=15):
+            raise RuntimeError('chassis_preparation_busy')
+        token = None
+        try:
+            self._restore()
+            if self.unresolved():
+                raise RuntimeError('previous_chassis_operation_unresolved_stop_first')
+            if not self.bundle.ros1.connection[0]:
+                raise RuntimeError('control_connection_is_disconnected')
+            self._check_chassis_faults(self.client.observe())
+            with self.bundle.tracker.lock:
+                if epoch != self.bundle._stop_epoch:
+                    raise RuntimeError('chassis_start_superseded_by_stop')
+                token, _, was_blocked = self.bundle._begin_control('prepare_chassis')
+            with self._native_lock:
+                with self.bundle.tracker.lock:
+                    self.bundle._check_transition(token)
+                    self._preparation = {'delivery_uncertain': True}
+                    self._persist()
+                result = self.client.native('prepare')
+                if result.get('success') is False and result.get('delivery_uncertain') is False:
+                    self._preparation = {'delivery_uncertain': False}
+                    self._persist()
+                if (result.get('success') is not True or result.get('stationary') is not True
+                        or result.get('software_estop') is not False or result.get('old_task_cancelled') is not True):
+                    stage = result.get('stage')
+                    known = {'read_fault_state', 'cancel_old_task', 'confirm_cancel_stationary',
+                             'release_software_stop', 'confirm_release_state', 'confirm_release_stationary',
+                             'validate_runtime'}
+                    raise RuntimeError('chassis_preparation_failed_at_' + stage if stage in known
+                                       else 'chassis_preparation_not_confirmed')
+                self._preparation = {'delivery_uncertain': False}
+                self._persist()
+            observation = self.client.observe()
+            self._check_chassis_faults(observation)
+            if observation['agvState'].get('softwareEstop') is not False:
+                raise RuntimeError('chassis_software_stop_release_unconfirmed')
+            state = observation['state']
+            if state.get('driving') is not False or any(
+                    abs(number(state.get('velocity', {}).get(k), k)) > .01 for k in ('vx', 'vy', 'omega')):
+                raise RuntimeError('chassis_not_stationary_after_start')
+            with self.bundle.tracker.lock:
+                self.bundle._check_transition(token)
+                self._preparation = None
+                self._persist()
+                self.bundle.state.motion_blocked = was_blocked
+            return {**result, 'completion_basis': 'old_task_cancelled_and_fresh_stationary_release_feedback'}
+        except Exception:
+            if token is not None:
+                self.bundle.pause('chassis_start_failed_or_interrupted', expected_transition=token)
+            raise
+        finally:
+            if token is not None:
+                self.bundle._end_control(token)
+            self._start_lock.release()
 
     def _identity(self):
         name, fingerprint = self.client.map_identity()
@@ -181,12 +254,12 @@ class ControlledSpatialPlugin:
         try:
             self._restore()
             if action == 'start':
-                return {'state': 'running', 'native_navigation': self.client.native('probe')}
+                return {'state': 'running', 'chassis_preparation': self.prepare_chassis()}
             if action == 'info':
                 mapping = self.store.state('mapping')
                 return {'state': 'mapping' if mapping else 'ready', 'mapping': mapping,
                         'remote_task': self._task, 'command_delivery_uncertain': self._uncertain,
-                        'map_transition': self._map_pending,
+                        'map_transition': self._map_pending, 'chassis_preparation': self._preparation,
                         'map': self.client.current_map(), 'feedback': self.client.observe()}
             if action in ('stop_nav', 'stop'):
                 result = self.bundle.pause('navigation_stopped')
@@ -324,6 +397,16 @@ class ControlledSpatialPlugin:
         if self._map_pending is not None:
             raise RuntimeError('map_transition_unconfirmed_inspect_info')
         with self._native_lock:
+            if self._preparation is not None:
+                uncertain = self._preparation['delivery_uncertain']
+                response = self.client.native('soft_stop')
+                if (response.get('success') is not True or response.get('stationary') is not True
+                        or response.get('software_estop') is not True):
+                    raise RuntimeError('chassis_soft_stop_unconfirmed')
+                if uncertain:
+                    raise RuntimeError('older_chassis_release_unresolved')
+                self._preparation = None
+                self._persist()
             if self._task is None and not self._uncertain:
                 return
             uncertain = self._uncertain

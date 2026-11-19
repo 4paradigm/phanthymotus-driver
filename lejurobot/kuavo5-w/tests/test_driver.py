@@ -297,10 +297,10 @@ class DriverContractTests(unittest.TestCase):
         self.bundle.state._publish()
         self.assertFalse(json.loads(self.node.publisher.messages[-1].data)['connected'])
         self.assertFalse(self.call("state", "info")["feedback"]["connected"])
-        self.assertEqual(self.call("base_drive", "start")["state"], "ready")  # Lifecycle only.
+        self.assertEqual(self.call("base_drive", "start")["state"], "error")  # Chassis preparation needs a live connection.
         self.assertEqual(self.call("base_drive", "info")["state"], "disconnected")
 
-    def test_actuator_lifecycle_never_waits_for_control_lock_or_calls_hardware(self):
+    def test_non_chassis_lifecycle_never_waits_for_control_lock_or_calls_hardware(self):
         entered, release = threading.Event(), threading.Event()
         def hold_lock():
             with self.bundle.tracker.lock:
@@ -312,6 +312,8 @@ class DriverContractTests(unittest.TestCase):
         try:
             with patch.object(self.bundle, 'pause', side_effect=AssertionError('lifecycle must not pause')):
                 for plugin in self.bundle.plugins:
+                    if plugin.PREFIX == 'base_drive':
+                        continue  # Explicit start now prepares the chassis.
                     self.assertEqual(self.call(plugin.PREFIX, 'start'), {'state': 'ready'})
                     self.assertEqual(self.call(plugin.PREFIX, 'stop'), {'state': 'idle'})
             self.assertTrue(thread.is_alive())

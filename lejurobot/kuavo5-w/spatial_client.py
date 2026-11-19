@@ -35,7 +35,7 @@ class JatenClient:
         secrets = load_secrets(os.environ.get('KUAVO_SSH_SECRETS', str(manager.state_dir / 'ssh-secrets.json')))
         request = {'operation': operation, 'args': args, 'ros_ip': target['ros_ip'],
                    'master': manager.settings.get('master', 'http://192.168.26.1:11311')}
-        response = manager.transport.run('chassis', target, request, self._source, secrets, timeout=15)
+        response = manager.transport.run('chassis', target, request, self._source, secrets, timeout=45 if operation in ('prepare', 'soft_stop') else 25 if operation == 'cancel' else 15)
         result = response.get('result')
         if not isinstance(result, dict):
             raise RuntimeError('invalid_native_navigation_response')

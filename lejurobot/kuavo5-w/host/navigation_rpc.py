@@ -7,9 +7,38 @@ import json
 import hashlib
 from pathlib import Path
 import math
+import re
 import os
 import sys
 import time
+
+
+def dispatch_service_class(service_class, server_md5):
+    if service_class._md5sum == server_md5:
+        return service_class
+    # Some factory images ship stale Python bindings but current C++ headers.
+    # Reconstruct ONLY the fixed, verified layout; never patch an MD5 blindly.
+    expected = hashlib.md5(b'uint8 control_modebool success\nstring message').hexdigest()
+    root = Path('/opt/jaten/include/leju_mobile_base_msgs')
+    header = (root / 'SetDispatchMode.h').read_text()
+    if server_md5 != expected or ('return "' + expected + '";') not in header:
+        raise RuntimeError('dispatch_service_abi_mismatch')
+    layouts = {'Request': ['uint8 control_mode'], 'Response': ['bool success', 'string message']}
+    for suffix, layout in layouts.items():
+        data = (root / ('SetDispatchMode' + suffix + '.h')).read_text()
+        definition = data.split('struct Definition<', 1)[1].split(';', 1)[0]
+        pieces = re.findall(r'"(?:[^"\\]|\\.)*"', definition)
+        content = ''.join(json.loads(piece) for piece in pieces)
+        fields = [line.split('#', 1)[0].strip() for line in content.splitlines()]
+        if [line for line in fields if line] != layout:
+            raise RuntimeError('dispatch_header_layout_mismatch')
+    from genpy.dynamic import generate_dynamic
+    request_type = 'leju_mobile_base_msgs/SetDispatchModeRequest'
+    response_type = 'leju_mobile_base_msgs/SetDispatchModeResponse'
+    request_class = generate_dynamic(request_type, 'uint8 control_mode\n')[request_type]
+    response_class = generate_dynamic(response_type, 'bool success\nstring message\n')[response_type]
+    return type('SetDispatchMode', (), {'_type': 'leju_mobile_base_msgs/SetDispatchMode',
+                '_md5sum': expected, '_request_class': request_class, '_response_class': response_class})
 
 
 def main(request):
@@ -56,10 +85,70 @@ def main(request):
     if any(len(owner) != 1 for owner in owners) or len({owner[0] for owner in owners}) != 1:
         raise RuntimeError('native_navigation_services_need_one_common_owner')
     for action, name in names.items():
-        if rosservice.get_service_type(name) != types[action]._type:
+        headers = rosservice.get_service_headers(name, rosgraph.Master('/motus_navigation_rpc').lookupService(name))
+        if headers.get('type') != types[action]._type:
             raise RuntimeError('native_navigation_service_type_mismatch')
+        if action == 'cancel':
+            types[action] = dispatch_service_class(types[action], headers.get('md5sum'))
+        elif headers.get('md5sum') != types[action]._md5sum:
+            raise RuntimeError('native_navigation_service_abi_mismatch')
     if operation == 'probe':
         return {'owner': owners[0][0], 'services': names}
+    if operation in ('prepare', 'soft_stop'):
+        from jaten_msgs.msg import RobotChassisState
+        proxy = rospy.ServiceProxy(names['cancel'], types['cancel'])
+        def state():
+            return rospy.wait_for_message('/jaten_behavior_manager/robot_state', RobotChassisState, timeout=2.)
+        def command(mode):
+            request['_command_unresolved'] = True
+            try:
+                response = proxy(control_mode=mode)
+            except Exception:
+                request['_older_command_unresolved'] = True
+                raise
+            request['_command_unresolved'] = False
+            if not response.success:
+                raise RuntimeError('chassis_preparation_command_rejected')
+        def healthy(value):
+            if value.estop or value.bumper or value.driver_error:
+                raise RuntimeError('chassis_hardware_stop_or_fault_active')
+        if operation == 'soft_stop':
+            command(0)
+            command(2)
+            confirm_stationary(rospy, Odometry)
+            if not state().soft_estop:
+                raise RuntimeError('chassis_soft_stop_unconfirmed')
+            return {'success': True, 'stationary': True, 'software_estop': True}
+        request['_preparation_stage'] = 'read_fault_state'
+        healthy(state())
+        request['_preparation_stage'] = 'cancel_old_task'
+        command(2)  # Cancel old tasks BEFORE releasing a software stop.
+        request['_preparation_stage'] = 'confirm_cancel_stationary'
+        confirm_stationary(rospy, Odometry)
+        current = state()
+        healthy(current)
+        released = bool(current.soft_estop)
+        try:
+            if released:
+                request['_preparation_stage'] = 'release_software_stop'
+                command(1)
+            request['_preparation_stage'] = 'confirm_release_state'
+            end = time.monotonic() + 3.
+            while time.monotonic() < end:
+                current = state()
+                healthy(current)
+                if not current.soft_estop:
+                    request['_preparation_stage'] = 'confirm_release_stationary'
+                    confirm_stationary(rospy, Odometry)
+                    return {'success': True, 'stationary': True, 'software_estop': False,
+                            'old_task_cancelled': True, 'released': released}
+            raise RuntimeError('chassis_release_feedback_unconfirmed')
+        except Exception:
+            try:
+                command(0)
+            except Exception:
+                pass
+            raise
     if operation not in names:
         raise ValueError('unsupported_navigation_operation')
     proxy = rospy.ServiceProxy(names[operation], types[operation])
@@ -79,31 +168,45 @@ def main(request):
         response = proxy(control_mode=2)  # SetDispatchMode.CANCEL_CURRENT_TASK
         if not response.success:
             raise RuntimeError('native_navigation_cancel_rejected')
-        # A successful cancel response alone is not evidence of stopping.
-        # Require new, distinctly stamped, stationary odometry spanning .3s.
-        issued = time.time()
-        end, since, previous = time.monotonic() + 5., None, None
-        while time.monotonic() < end:
-            msg = rospy.wait_for_message('/odom', Odometry, timeout=1.)
-            stamp = msg.header.stamp.to_sec()
-            if stamp <= issued or not 0 <= time.time() - stamp <= .5 or (previous is not None and stamp <= previous):
-                continue
-            previous = stamp
-            twist = msg.twist.twist
-            values = (twist.linear.x, twist.linear.y, twist.linear.z,
-                      twist.angular.x, twist.angular.y, twist.angular.z)
-            stationary = all(math.isfinite(v) and abs(v) <= .01 for v in values)
-            since = stamp if stationary and since is None else since if stationary else None
-            if since is not None and stamp - since >= .3:
-                return {'success': True, 'stationary': True,
-                        'completion_basis': 'native_cancel_and_fresh_stationary_odometry'}
-        raise RuntimeError('native_navigation_stop_not_confirmed')
+        confirm_stationary(rospy, Odometry)
+        return {'success': True, 'stationary': True,
+                'completion_basis': 'native_cancel_and_fresh_stationary_odometry'}
     return {name: getattr(response, name) for name in response.__slots__}
 
 
+def confirm_stationary(rospy, Odometry):
+    # A successful cancel response alone is not evidence of stopping.
+    # Require new, distinctly stamped, stationary odometry spanning .3s.
+    issued = time.time()
+    end, since, previous = time.monotonic() + 5., None, None
+    while time.monotonic() < end:
+        msg = rospy.wait_for_message('/odom', Odometry, timeout=1.)
+        stamp = msg.header.stamp.to_sec()
+        if stamp <= issued or not 0 <= time.time() - stamp <= .5 or (previous is not None and stamp <= previous):
+            continue
+        previous = stamp
+        twist = msg.twist.twist
+        values = (twist.linear.x, twist.linear.y, twist.linear.z,
+                  twist.angular.x, twist.angular.y, twist.angular.z)
+        stationary = all(math.isfinite(v) and abs(v) <= .01 for v in values)
+        since = stamp if stationary and since is None else since if stationary else None
+        if since is not None and stamp - since >= .3:
+            return
+    raise RuntimeError('native_navigation_stop_not_confirmed')
+
+
 if __name__ == '__main__':
+    request = None
     try:
-        print(json.dumps({'ok': True, 'result': main(json.load(sys.stdin))}), flush=True)
+        request = json.load(sys.stdin)
+        print(json.dumps({'ok': True, 'result': main(request)}), flush=True)
     except Exception:
-        # No ROS peer messages, credentials or arbitrary paths in SSH errors.
-        print(json.dumps({'ok': False, 'error': 'native_navigation_rpc_failed'}), flush=True)
+        # A completed rejection/feedback failure can be stopped and retried.
+        # A ROS transport failure may leave the controller service executing.
+        if isinstance(request, dict) and request.get('operation') == 'prepare':
+            result = {'success': False, 'stage': request.get('_preparation_stage', 'validate_runtime'),
+                      'delivery_uncertain': bool(
+                request.get('_command_unresolved') or request.get('_older_command_unresolved'))}
+            print(json.dumps({'ok': True, 'result': result}), flush=True)
+        else:
+            print(json.dumps({'ok': False, 'error': 'native_navigation_rpc_failed'}), flush=True)

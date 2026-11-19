@@ -485,8 +485,8 @@ class _KuavoPlugin:
         self._request_context.stop_epoch = self.bundle._stop_epoch
         try:
             if action == "start":
-                self.start()
-                return {"state": "ready"}
+                result = self.start()
+                return result if isinstance(result, dict) else {"state": "ready"}
             if action == "stop":
                 self.stop()
                 return {"state": "idle"}
@@ -646,6 +646,9 @@ class _KuavoPlugin:
 
 class BaseDrivePlugin(_KuavoPlugin):
     PREFIX, CHANNEL, ALLOWED_MODES = "base_drive", "base", (2, 3)
+
+    def start(self):
+        return {"state": "ready", "chassis_preparation": self.bundle.spatial.prepare_chassis()}
 
     def tool(self):
         return self.schema("Kuavo 5-W 轮式底盘：有界速度、相对/世界位姿。stop_move 使用全身软件暂停防止位置目标续行。", {
@@ -961,7 +964,8 @@ class KuavoBundle:
             raise RuntimeError('control transition is busy; query state before retrying')
         try:
             self.state.require_motion_enabled()
-            self.sensors.require_profile()
+            if action != 'prepare_chassis':
+                self.sensors.require_profile()
             if self.state.motion_send_uncertain:
                 raise RuntimeError('motion command delivery is uncertain; verify controller recovery before further control')
             if self._resume_unresolved():
@@ -970,7 +974,7 @@ class KuavoBundle:
                 raise RuntimeError('remote mode change is unresolved; motion remains blocked')
             if self._closing or self._transition is not None or self.tracker._active:
                 raise RuntimeError('motion/control is busy; stop and await confirmation before retrying')
-            enabled = self.state.confirmed_enable()
+            enabled = self.state.confirmed_enable() if action != 'prepare_chassis' else None
             if action == 'set_mode' and enabled is not True:
                 raise RuntimeError('connect and resume control before changing mode')
             was_blocked = self.state.motion_blocked

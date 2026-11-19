@@ -56,10 +56,30 @@ class Bundle:
     def __init__(self):
         self.tracker = Tracker()
         self._stop_epoch, self._transition = 0, None
-        self.state = types.SimpleNamespace(require_motion=lambda modes: None,
+        self.state = types.SimpleNamespace(motion_blocked=False, require_motion=lambda modes: None,
                                            require_motion_enabled=lambda: None)
         self.ros1 = types.SimpleNamespace(connection=(True, 1))
         self.pauses = []
+
+    def _begin_control(self, action):
+        with self.tracker.lock:
+            self.state.require_motion_enabled()
+            if self._transition or self.tracker._active:
+                raise RuntimeError('busy')
+            token = {'cancelled': threading.Event()}
+            self._transition = token
+            previous = self.state.motion_blocked
+            self.state.motion_blocked = True
+            return token, None, previous
+
+    def _check_transition(self, token):
+        if self._transition is not token or token['cancelled'].is_set():
+            raise RuntimeError('superseded')
+
+    def _end_control(self, token):
+        with self.tracker.lock:
+            if self._transition is token:
+                self._transition = None
 
     def start_motion(self, channel, tool, modes, publish, validate, request_epoch):
         with self.tracker.lock:
@@ -72,8 +92,13 @@ class Bundle:
             publish()
             return aid, cancelled, 1, time.monotonic(), {}
 
-    def pause(self, reason, status='cancelled', expected=None):
+    def pause(self, reason, status='cancelled', expected=None, expected_transition=None):
         with self.tracker.lock:
+            if expected_transition is not None and self._transition is not expected_transition:
+                return {'state': 'idle'}
+            if self._transition is not None:
+                self._transition['cancelled'].set()
+                self._transition = None
             if expected and not self.tracker.current(*expected):
                 return {'state': 'idle'}
             self._stop_epoch += 1
@@ -107,6 +132,14 @@ class Client:
             return self.navigate
         if operation == 'check':
             return self.check
+        if operation == 'prepare':
+            released = self.feedback['agvState']['softwareEstop']
+            self.feedback['agvState']['softwareEstop'] = False
+            return {'success': True, 'stationary': True, 'software_estop': False,
+                    'old_task_cancelled': True, 'released': released}
+        if operation == 'soft_stop':
+            self.feedback['agvState']['softwareEstop'] = True
+            return {'success': True, 'stationary': True, 'software_estop': True}
         if operation == 'cancel':
             return {'success': True, 'stationary': True}
         return {'owner': '/leju_node'}
@@ -170,6 +203,90 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(self.call('start')['state'], 'running')
         self.assertEqual(self.call('stop')['state'], 'idle')
         self.assertFalse(any(c[0] == 'navigate' for c in self.client.calls))
+
+    def test_start_cancels_then_releases_chassis_without_navigation(self):
+        self.client.feedback['agvState']['softwareEstop'] = True
+        result = self.call('start')
+        self.assertEqual(result['state'], 'running')
+        self.assertTrue(result['chassis_preparation']['old_task_cancelled'])
+        self.assertTrue(result['chassis_preparation']['released'])
+        self.assertFalse(self.client.feedback['agvState']['softwareEstop'])
+        self.assertFalse(self.plugin.unresolved())
+        self.assertEqual([c[0] for c in self.client.calls], ['prepare'])
+
+    def test_start_fault_or_readonly_does_not_release(self):
+        for field in ('estopButtonEvent', 'bumperEvent', 'driverError'):
+            self.client.feedback['agvState'][field] = True
+            self.assertEqual(self.call('start')['state'], 'error')
+            self.client.feedback['agvState'][field] = False
+        self.bundle.state.require_motion_enabled = lambda: (_ for _ in ()).throw(RuntimeError('disabled'))
+        self.assertEqual(self.call('start')['state'], 'error')
+        self.assertFalse(self.client.calls)
+
+    def test_start_does_not_cancel_an_active_local_action(self):
+        self.bundle.tracker.begin('base', 'base_drive')
+        self.assertEqual(self.call('start')['state'], 'error')
+        self.assertFalse(self.client.calls)
+
+    def test_known_rejection_is_stopped_and_can_be_retried(self):
+        original = self.client.native
+        def rejected(operation, **args):
+            if operation == 'prepare':
+                return {'success': False, 'delivery_uncertain': False}
+            return original(operation, **args)
+        self.client.native = rejected
+        self.assertEqual(self.call('start')['state'], 'error')
+        self.assertTrue(self.client.feedback['agvState']['softwareEstop'])
+        self.assertFalse(self.plugin.unresolved())
+        self.client.native = original
+        self.assertEqual(self.call('start')['state'], 'running')
+
+    def test_info_never_releases_software_stop(self):
+        self.client.feedback['agvState']['softwareEstop'] = True
+        self.assertEqual(self.call('info')['state'], 'ready')
+        self.assertTrue(self.client.feedback['agvState']['softwareEstop'])
+        self.assertFalse(self.client.calls)
+
+    def test_uncertain_release_survives_restart_and_blocks_motion(self):
+        original = self.client.native
+        def lost(operation, **args):
+            if operation == 'prepare':
+                raise TimeoutError('possibly delivered')
+            return original(operation, **args)
+        self.client.native = lost
+        self.assertEqual(self.call('start')['state'], 'error')
+        self.assertTrue(self.plugin.unresolved())
+        self.assertIn(('soft_stop', {}), self.client.calls)
+        restored = ControlledSpatialPlugin(self.bundle, {'db_path': self.path}, self.client)
+        self.assertTrue(restored.unresolved())
+        self.assertTrue(restored._preparation['delivery_uncertain'])
+        restored.close()
+        self.assertEqual(self.call('start')['state'], 'error')
+
+    def test_stop_orders_after_blocked_release_and_wins(self):
+        entered, release = threading.Event(), threading.Event()
+        original = self.client.native
+        def blocked(operation, **args):
+            if operation == 'prepare':
+                entered.set()
+                release.wait(3)
+            return original(operation, **args)
+        self.client.native = blocked
+        starts, stops = [], []
+        start = threading.Thread(target=lambda: starts.append(self.call('start')))
+        start.start()
+        self.assertTrue(entered.wait(1))
+        stop = threading.Thread(target=lambda: stops.append(self.call('stop_nav')))
+        stop.start()
+        wait(lambda: self.bundle._stop_epoch > 0)
+        self.assertFalse(stops)
+        release.set()
+        start.join(2); stop.join(2)
+        self.assertEqual(starts[0]['state'], 'error')
+        self.assertEqual(stops[0]['state'], 'paused')
+        self.assertTrue(self.client.feedback['agvState']['softwareEstop'])
+        self.assertFalse(self.plugin.unresolved())
+        self.assertEqual([c[0] for c in self.client.calls], ['prepare', 'soft_stop'])
 
     def test_arrival_uses_exact_native_task_id(self):
         result = self.navigate()
@@ -415,6 +532,26 @@ class ClientTests(unittest.TestCase):
 
 
 class BundleIntegrationTests(unittest.TestCase):
+    def test_both_card_starts_share_preparation_without_enabling_whole_body(self):
+        from test_driver import driver, FakeRos1, FakeNode
+        with tempfile.TemporaryDirectory() as folder, patch.object(driver, '_acp_complete'):
+            ros = FakeRos1()
+            bundle = driver.KuavoBundle({}, 'test', ros, FakeNode())
+            bundle.spatial.close()
+            client = Client()
+            client.feedback['agvState']['softwareEstop'] = True
+            bundle.spatial = ControlledSpatialPlugin(bundle, {'db_path': folder + '/db'}, client)
+            try:
+                for card, state in [('base_drive', 'ready'), ('controlled_spatial', 'running')]:
+                    result = bundle.dispatch(card, {'action': 'start'})
+                    self.assertEqual(result['state'], state)
+                    self.assertTrue(result['chassis_preparation']['old_task_cancelled'])
+                self.assertEqual([c[0] for c in client.calls], ['prepare', 'prepare'])
+                self.assertFalse(ros.services)
+                self.assertFalse(ros.published)
+            finally:
+                bundle.close()
+
     def test_base_drive_cannot_overlap_native_navigation_and_stop_disables_body_first(self):
         from test_driver import driver, FakeRos1, FakeNode, fixture_joint_limits
         with tempfile.TemporaryDirectory() as folder, patch.object(driver, '_acp_complete'):
@@ -458,6 +595,151 @@ class BundleIntegrationTests(unittest.TestCase):
                 bundle.close()
 
 
+class NativePreparationTests(unittest.TestCase):
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('native_prepare_test',
+                      Path(__file__).resolve().parents[1] / 'host/navigation_rpc.py')
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        self.state = types.SimpleNamespace(estop=False, bumper=False, driver_error=False, soft_estop=True)
+        self.events, self.reject, self.fail_after_release = [], None, False
+        classes = {name: type(name, (), {'_type': 'leju_mobile_base_msgs/' + name, '_md5sum': name})
+                   for name in ('MoveToTarget', 'CheckArrived', 'SetDispatchMode')}
+        names = {'/move_base/move_to_target': classes['MoveToTarget']._type,
+                 '/move_base/check_arrived': classes['CheckArrived']._type,
+                 '/move_base/set_dispatch_mode': classes['SetDispatchMode']._type}
+        def command(control_mode):
+            self.events.append(control_mode)
+            if self.reject == 'transport': raise ConnectionError('remote service reply lost')
+            if control_mode == 1: self.state.soft_estop = False
+            if control_mode == 0: self.state.soft_estop = True
+            return types.SimpleNamespace(success=control_mode != self.reject)
+        def sample(*a, **k):
+            if self.fail_after_release and 1 in self.events:
+                raise TimeoutError('feedback lost')
+            return copy.copy(self.state)
+        ros = types.SimpleNamespace(ERROR=1, init_node=lambda *a, **k: None,
+                                   ServiceProxy=lambda *a: command, wait_for_message=sample)
+        modules = {'rospy': ros,
+            'rosgraph': types.SimpleNamespace(Master=lambda *a: types.SimpleNamespace(
+                getSystemState=lambda: [[], [], [(n, ['/leju_node']) for n in names]], lookupService=lambda n: n)),
+            'rosservice': types.SimpleNamespace(get_service_type=lambda n: names[n],
+                get_service_headers=lambda n, uri: {'type': names[n], 'md5sum': names[n].split('/')[-1]}),
+            'leju_mobile_base_msgs': types.ModuleType('leju_mobile_base_msgs'),
+            'leju_mobile_base_msgs.srv': types.SimpleNamespace(**classes),
+            'leju_mobile_base_msgs.msg': types.SimpleNamespace(MoveToTargetOptions=object),
+            'nav_msgs': types.ModuleType('nav_msgs'), 'nav_msgs.msg': types.SimpleNamespace(Odometry=object),
+            'jaten_msgs': types.ModuleType('jaten_msgs'),
+            'jaten_msgs.msg': types.SimpleNamespace(RobotChassisState=object)}
+        self.module_patch = patch.dict(sys.modules, modules)
+        self.module_patch.start(); self.addCleanup(self.module_patch.stop)
+        self.env_patch = patch.dict(self.module.os.environ)
+        self.env_patch.start(); self.addCleanup(self.env_patch.stop)
+        self.stationary_patch = patch.object(self.module, 'confirm_stationary',
+                                              side_effect=lambda *a: self.events.append('stationary'))
+        self.stationary_patch.start(); self.addCleanup(self.stationary_patch.stop)
+
+    def call(self, operation='prepare'):
+        return self.module.main({'master': 'http://test:11311', 'ros_ip': '127.0.0.1', 'operation': operation})
+
+    def test_rpc_distinguishes_completed_rejection_from_uncertain_transport(self):
+        import io
+        import runpy
+        for rejection, uncertain in ((2, False), ('transport', True)):
+            self.reject = rejection
+            output = io.StringIO()
+            request = {'master': 'http://test:11311', 'ros_ip': '127.0.0.1', 'operation': 'prepare'}
+            with patch.object(sys, 'stdin', io.StringIO(json.dumps(request))), patch.object(sys, 'stdout', output):
+                runpy.run_path(str(Path(__file__).resolve().parents[1] / 'host/navigation_rpc.py'), run_name='__main__')
+            response = json.loads(output.getvalue())
+            self.assertTrue(response['ok'])
+            self.assertFalse(response['result']['success'])
+            self.assertIs(response['result']['delivery_uncertain'], uncertain)
+
+    def test_cancel_and_stationary_before_release_then_stationary_again(self):
+        result = self.call()
+        self.assertEqual(self.events, [2, 'stationary', 1, 'stationary'])
+        self.assertTrue(result['old_task_cancelled'])
+        self.assertFalse(result['software_estop'])
+
+    def test_clear_state_never_sends_redundant_release(self):
+        self.state.soft_estop = False
+        self.assertFalse(self.call()['released'])
+        self.assertEqual(self.events, [2, 'stationary', 'stationary'])
+
+    def test_hardware_fault_is_not_bypassed(self):
+        for flag in ('estop', 'bumper', 'driver_error'):
+            setattr(self.state, flag, True)
+            with self.assertRaises(RuntimeError): self.call()
+            setattr(self.state, flag, False)
+        self.assertFalse(self.events)
+
+    def test_rejected_cancel_never_releases(self):
+        self.reject = 2
+        with self.assertRaises(RuntimeError): self.call()
+        self.assertEqual(self.events, [2])
+
+    def test_missing_stationary_samples_never_releases(self):
+        with patch.object(self.module, 'confirm_stationary', side_effect=TimeoutError()):
+            with self.assertRaises(TimeoutError): self.call()
+        self.assertEqual(self.events, [2])
+
+    def test_feedback_loss_after_release_reasserts_stop(self):
+        self.fail_after_release = True
+        with self.assertRaises(TimeoutError): self.call()
+        self.assertEqual(self.events, [2, 'stationary', 1, 0])
+        self.assertTrue(self.state.soft_estop)
+
+    def test_interrupt_stop_asserts_stop_and_cancels_before_confirmation(self):
+        self.state.soft_estop = False
+        result = self.call('soft_stop')
+        self.assertEqual(self.events, [0, 2, 'stationary'])
+        self.assertTrue(result['software_estop'])
+
+
+class DispatchAbiTests(unittest.TestCase):
+    def test_factory_header_fallback_requires_matching_hash_and_exact_fields(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('dispatch_abi_test',
+                      Path(__file__).resolve().parents[1] / 'host/navigation_rpc.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        expected = '09d13be4b7fff0abe4e61d99b81ca03b'
+        installed = types.SimpleNamespace(_md5sum='stale')
+        generated = []
+        def generate(name, definition):
+            generated.append((name, definition))
+            return {name: type(name.split('/')[-1], (), {})}
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'SetDispatchMode.h').write_text('return "' + expected + '";')
+            def header(name, definition):
+                (root / name).write_text('struct Definition< T > { return ' + json.dumps(definition) + '; }')
+            header('SetDispatchModeRequest.h', '# command\nuint8 control_mode\n')
+            header('SetDispatchModeResponse.h', 'bool success\nstring message\n')
+            modules = {'genpy': types.ModuleType('genpy'), 'genpy.dynamic': types.SimpleNamespace(generate_dynamic=generate)}
+            with patch.object(module, 'Path', return_value=root), patch.dict(sys.modules, modules):
+                service = module.dispatch_service_class(installed, expected)
+                self.assertEqual(service._md5sum, expected)
+                self.assertEqual(service._type, 'leju_mobile_base_msgs/SetDispatchMode')
+                self.assertEqual(generated[0][1], 'uint8 control_mode\n')
+                with self.assertRaises(RuntimeError):
+                    module.dispatch_service_class(installed, 'unrecognized')
+                header('SetDispatchModeRequest.h', 'string control_mode\n')
+                with self.assertRaises(RuntimeError):
+                    module.dispatch_service_class(installed, expected)
+
+    def test_matching_installed_class_is_used_without_reading_headers(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('dispatch_abi_match',
+                      Path(__file__).resolve().parents[1] / 'host/navigation_rpc.py')
+        module = importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        service = types.SimpleNamespace(_md5sum='matching')
+        with patch.object(module, 'Path', side_effect=AssertionError('no fallback needed')):
+            self.assertIs(module.dispatch_service_class(service, 'matching'), service)
+
+
 class NativeIdentityTests(unittest.TestCase):
     def test_native_cancel_requires_distinct_post_cancel_stationary_samples(self):
         import importlib.util
@@ -465,7 +747,7 @@ class NativeIdentityTests(unittest.TestCase):
                       Path(__file__).resolve().parents[1] / 'host/navigation_rpc.py')
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        classes = {name: type(name, (), {'_type': 'leju_mobile_base_msgs/' + name})
+        classes = {name: type(name, (), {'_type': 'leju_mobile_base_msgs/' + name, '_md5sum': name})
                    for name in ('MoveToTarget', 'CheckArrived', 'SetDispatchMode')}
         names = {'/move_base/move_to_target': classes['MoveToTarget']._type,
                  '/move_base/check_arrived': classes['CheckArrived']._type,
@@ -479,8 +761,9 @@ class NativeIdentityTests(unittest.TestCase):
             ServiceProxy=lambda *a: lambda **k: types.SimpleNamespace(success=True))
         modules = {'rospy': ros,
             'rosgraph': types.SimpleNamespace(Master=lambda *a: types.SimpleNamespace(
-                getSystemState=lambda: [[], [], [(n, ['/leju_node']) for n in names]])),
-            'rosservice': types.SimpleNamespace(get_service_type=lambda n: names[n]),
+                getSystemState=lambda: [[], [], [(n, ['/leju_node']) for n in names]], lookupService=lambda n: n)),
+            'rosservice': types.SimpleNamespace(get_service_type=lambda n: names[n],
+                get_service_headers=lambda n, uri: {'type': names[n], 'md5sum': names[n].split('/')[-1]}),
             'leju_mobile_base_msgs': types.ModuleType('leju_mobile_base_msgs'),
             'leju_mobile_base_msgs.srv': types.SimpleNamespace(**classes),
             'leju_mobile_base_msgs.msg': types.SimpleNamespace(MoveToTargetOptions=object),

@@ -317,3 +317,21 @@ DDS42/loopback 的跨容器接收，以及软件暂停和断网时控制器行�
 本轮实际只读探针确认了服务同源、地图文件指纹和状态格式，并发现现场websocket-client对象
 不支持context manager；已使用contextlib.closing兼容，回归也使用不实现__enter__的socket。
 源码实现与现场运动验收区分：建图/保存/载图、MoveToTarget以及中途取消未在本轮实际调用。
+
+## 2026-11-19：卡片 start 准备底盘及厂商绑定兼容
+
+按操作者要求，base_drive.start与controlled_spatial.start共用准备流程：硬件故障检查、
+CANCEL_CURRENT_TASK(2)、不同新鲜里程计采样停稳、必要时CANCEL_SOFT_STOP(1)、
+原始RobotChassisState及WebSocket反馈核对。info不改变状态，start不发送位姿/速度目标，
+不使能全身控制。准备与执行共享控制转换锁，停止使旧准备失效；较早解除返回后再设置软件急停、取消并确认停稳。
+未确定投递的解除持久化保留，不能靠重启抹掉；确定拒绝/反馈失败经确认停止后允许重试。
+
+现场进一步发现同名服务类型并不保证兼容：/move_base/set_dispatch_mode运行服务MD5为
+09d13be4b7fff0abe4e61d99b81ca03b，但底盘Python绑定为f126da6618daf59c6668404bf03dea2d，
+因此旧绑定调用在TCPROS握手阶段被拒绝，未执行请求。MoveToTarget/CheckArrived的Python绑定则与服务一致。
+同机/opt/jaten/include/leju_mobile_base_msgs/SetDispatchMode{,Request,Response}.h与运行服务匹配，
+其请求为uint8 control_mode，响应为bool success/string message；按字段计算服务MD5亦为09d13...。
+适配先检查所有服务的实际类型/MD5；已安装Python绑定匹配时直接使用，否则只接受上述固定字段布局、
+C++服务头MD5与服务器三者一致的版本，利用现有genpy生成内存消息类，不改厂家文件、不绕过校验、不安装包。
+现场已完成请求字节[2]及响应的序列化往返检查，原生soft_stop操作也已返回成功、停稳且software_estop=true。
+其他未知ABI保持拒绝，而非把名字相同当作可控。
