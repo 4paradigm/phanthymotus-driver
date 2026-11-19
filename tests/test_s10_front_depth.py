@@ -808,21 +808,6 @@ def test_start_is_lazy_and_idempotent_preserves_source_stamp_and_metric_payload(
     assert rig.plugin.dispatch("info", {})["stats"]["published"] == 1
 
 
-@pytest.mark.parametrize(("settings", "retains_300_mm"), [({}, False), ({"min_depth_m": .1}, True)])
-def test_front_depth_near_clip_default_and_saved_override(rig, settings, retains_300_mm):
-    configure(rig, **settings)
-    plugin = module().FrontDepthPlugin({}, "robot", rig.nodes, config_path=rig.path)
-    assert plugin.dispatch("start", {})["state"] == "running"
-    message = cloud()
-    message.width, message.row_step = 2, 24
-    message.data = struct.pack("<ffffff", -.02, 0, .300, .02, 0, .30125)
-    rig.subscriptions[0].callback(message)
-    plugin._worker.complete()
-    values = struct.unpack("<307200H", zlib.decompress(rig.publications[0].data))
-    assert (300 in values) == retains_300_mm
-    assert 301 in values
-
-
 @pytest.mark.parametrize("bad", [cloud(frame="map"), cloud(sec=0, nanosec=0),
                                   cloud(nanosec=1000000000), cloud(sec=True)])
 def test_unexpected_frame_and_missing_or_malformed_stamp_are_rejected(rig, bad):

@@ -45,7 +45,7 @@ INPUT_ERROR_CODES = (None, "CLOUD_PUBLISHER_UNAVAILABLE", "CLOUD_DATA_TIMEOUT",
 DEFAULTS = {
     "cloud_topic": "/LIDAR/POINTS", "cloud_frame_id": "",
     "camera_optical_from_cloud": None,
-    "min_depth_m": 0.301, "max_depth_m": 50.0, "rate_hz": 5.0,
+    "min_depth_m": 0.1, "max_depth_m": 50.0, "rate_hz": 5.0,
 }
 
 
