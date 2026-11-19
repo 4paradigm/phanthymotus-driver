@@ -133,15 +133,17 @@ class AudioTimeline:
         self.trimmed += overlap
         self.position = end
 
-    def finish(self):
+    def finish(self, duration_s=None):
+        if duration_s is not None:
+            self.limit = round(duration_s * RATE)
         if not self.received:
             raise RecordingError("AUDIO_UNAVAILABLE", "No microphone PCM covered the recording")
-        self._pad(self.limit - self.position)
+        self._pad(max(0, self.limit - self.position))
         if self.padded > self.limit * 0.10:
             raise RecordingError("AUDIO_INTERRUPTED", "More than 10% of audio samples were missing")
         if not self.has_signal:
             raise RecordingError("AUDIO_NO_SIGNAL", "Only zero PCM received; check microphone mute/capture")
-        return {"audio_samples": self.position, "audio_gap_s": self.padded / RATE,
+        return {"audio_samples": self.limit, "audio_gap_s": self.padded / RATE,
                 "audio_overlap_trim_s": self.trimmed / RATE}
 
 
@@ -207,9 +209,11 @@ class AudioBurstAssembler:
         t.add(stamp, bytes(self.pending))
         self.pending.clear()
 
-    def finish(self):
+    def finish(self, duration_s=None):
+        if duration_s is not None:
+            self.timeline.limit = round(duration_s * RATE)
         self.flush()
-        return {**self.timeline.finish(),
+        return {**self.timeline.finish(duration_s),
                 "audio_timestamp_mode": "burst_end_and_pcm_sample_clock",
                 "audio_adjusted_bursts": self.adjusted_bursts,
                 "audio_max_clock_adjust_s": self.max_adjust_s}
@@ -240,19 +244,21 @@ def prepare_frames(directory, frames, duration_s):
 
 
 def encoder_command(images, audio, output, duration_s):
+    inputs = ["-i", str(audio), "-map", "0:v:0", "-map", "1:a:0"] if audio else ["-map", "0:v:0", "-an"]
+    sound = ["-c:a", "aac", "-b:a", "64k"] if audio else []
     return ["ffmpeg", "-nostdin", "-y", "-loglevel", "error",
             "-f", "image2", "-ts_from_file", "2", "-start_number", "0", "-i", str(images),
-            "-i", str(audio), "-map", "0:v:0", "-map", "1:a:0",
+            *inputs,
             "-vsync", "vfr", "-enc_time_base:v", "1:1000",
             "-c:v", "libx264", "-preset", "ultrafast", "-threads", "2",
             # Set nominal codec metadata without imposing output frame cadence.
             "-x264-params", "fps=30/1:force-cfr=0",
             "-pix_fmt", "yuv420p", "-video_track_timescale", "1000000",
-            "-c:a", "aac", "-b:a", "64k", "-t", str(duration_s),
+            *sound, "-t", str(duration_s),
             "-movflags", "+faststart", str(output)]
 
 
-def make_input_node(video_topic, audio_topic, buffer):
+def make_input_node(video_topic, audio_topic, buffer, include_audio=True):
     # Lazy imports keep timeline/encoding tests ROS- and hardware-free.
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -274,6 +280,8 @@ def make_input_node(video_topic, audio_topic, buffer):
         for kind, msg_type, topic, depth in [
                 ("video", CompressedImage, video_topic, 4),
                 ("audio", AudioChunk, audio_topic, 64)]:
+            if kind == "audio" and not include_audio:
+                continue
             qos = QoSProfile(depth=depth, reliability=ReliabilityPolicy.BEST_EFFORT,
                              history=HistoryPolicy.KEEP_LAST)
             node.create_subscription(msg_type, topic,
@@ -284,7 +292,8 @@ def make_input_node(video_topic, audio_topic, buffer):
     return node
 
 
-def collect(buffer, directory, duration_s, cancel):
+def collect(buffer, directory, duration_s, cancel, stop_event=None,
+            stop_state=None, include_audio=True):
     """Spool JPEGs/PCM on a worker; all memory/disk use is bounded."""
     frames = []
     pre_audio = deque(maxlen=64)
@@ -293,6 +302,8 @@ def collect(buffer, directory, duration_s, cancel):
     last_video_mono = time.monotonic()
     deadline = last_video_mono + 5.0
     total_bytes = 0
+    actual_duration = duration_s
+    stop_applied = False
     with wave.open(str(directory / "audio.wav"), "wb") as wav:
         # A failure before the first video frame must still close a valid WAV.
         wav.setparams((1, 2, RATE, 0, "NONE", "not compressed"))
@@ -300,9 +311,24 @@ def collect(buffer, directory, duration_s, cancel):
             if cancel.is_set():
                 raise RecordingError("RECORD_CANCELLED", "Video recording was cancelled")
             now = time.monotonic()
+            if stop_event is not None and stop_event.is_set() and not stop_applied:
+                if origin is None:
+                    raise RecordingError("RECORD_TOO_SHORT", "Stopped before the first camera frame")
+                stopped_at = (stop_state or {}).get("stop_at_monotonic", now)
+                actual_duration = min(duration_s, max(0, stopped_at - origin_mono))
+                if actual_duration < .1:
+                    raise RecordingError("RECORD_TOO_SHORT", "Record at least 100 ms before saving")
+                deadline = origin_mono + actual_duration
+                if timeline is not None:
+                    timeline.timeline.limit = round(actual_duration * RATE)
+                stop_applied = True
             if now >= deadline:
-                break
-            if timeline is not None:
+                # A normal stop may fall inside an unpublished PCM burst.
+                # Wait at most 500 ms for that burst; never collect later video.
+                if (stop_event is None or not include_audio
+                        or now >= deadline + .5 or origin is None):
+                    break
+            if timeline is not None and include_audio:
                 # A buffered burst has arrived even though it has not yet been
                 # committed to the WAV. Measuring freshness from WAV position
                 # incorrectly adds a full burst of latency (or two for batched
@@ -317,10 +343,20 @@ def collect(buffer, directory, duration_s, cancel):
                                          (idle_s, budget_s, timeline.pending_duration_s))
             if frames and now - last_video_mono > 3.0:
                 raise RecordingError("VIDEO_INTERRUPTED", "No camera frame received for 3 seconds")
-            item = buffer.get(min(0.05, deadline - now))
+            item = buffer.get(min(0.05, max(.02, deadline - now)))
             if item is None:
+                # A burst's first chunk carries roughly its *end* stamp too.
+                # Drain the entire queue and wait for a quiet split-loop gap,
+                # rather than stopping on that first chunk and losing its tail.
+                if (origin is not None and now >= deadline and timeline is not None
+                        and timeline.last_stamp is not None
+                        and timeline.last_stamp >= origin + round(actual_duration * 1e9)
+                        and time.monotonic() - last_audio_received >= .02):
+                    break
                 continue
             kind, stamp_ns, data, received, age = item
+            if kind == "audio" and not include_audio:
+                continue
             if kind == "audio":
                 last_audio_received = received
             if origin is None:
@@ -330,9 +366,10 @@ def collect(buffer, directory, duration_s, cancel):
                 origin = stamp_ns
                 origin_mono = received - age
                 deadline = origin_mono + duration_s
-                timeline = AudioBurstAssembler(AudioTimeline(wav, origin, duration_s))
-                for stamp, pcm in pre_audio:
-                    timeline.add(stamp, pcm)
+                if include_audio:
+                    timeline = AudioBurstAssembler(AudioTimeline(wav, origin, duration_s))
+                    for stamp, pcm in pre_audio:
+                        timeline.add(stamp, pcm)
                 pre_audio.clear()
             relative = (stamp_ns - origin) / 1e9
             if abs(relative - (received - origin_mono)) > 0.5:
@@ -340,7 +377,7 @@ def collect(buffer, directory, duration_s, cancel):
             if kind == "audio":
                 timeline.add(stamp_ns, data)
                 continue
-            if relative < 0 or relative >= duration_s - 0.001:
+            if relative < 0 or relative >= actual_duration - 0.001:
                 continue
             if frames and relative <= frames[-1][0]:
                 raise RecordingError("INVALID_MEDIA_TIMESTAMP", "Video timestamps moved backwards or repeated")
@@ -355,7 +392,14 @@ def collect(buffer, directory, duration_s, cancel):
             raise RecordingError("VIDEO_UNAVAILABLE", "No timestamped RGB frame arrived within 5 seconds")
         if time.monotonic() - last_video_mono > 3.0:
             raise RecordingError("VIDEO_INTERRUPTED", "Camera stopped before recording ended")
-        audio_info = timeline.finish()
+        end_tick = round(actual_duration * 1000) - 1
+        frames = [(t, name) for t, name in frames if round(t * 1000) < end_tick]
+        if not frames:
+            raise RecordingError("RECORD_TOO_SHORT", "No video frame precedes the stop time")
+        audio_info = timeline.finish(actual_duration) if include_audio else {}
+        audio_info["recorded_duration_s"] = actual_duration
+        if stop_event is not None:
+            audio_info["ended_by"] = "stop_recording" if stop_applied else "duration_limit"
     return frames, audio_info
 
 
@@ -364,15 +408,26 @@ def record_av(plugin, active):
     buffer = InputBuffer()
     node = process = path = None
     complete = False
+    owns_path = False
+    include_audio = active.get("include_audio", True)
     try:
         directory = plugin._output_dir / "videos"
         directory.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".av-", dir=str(directory)) as tmp:
             tmp = Path(tmp)
             try:
-                node = make_input_node(plugin._camera._color_topic, plugin._audio_topic, buffer)
+                if include_audio:
+                    node = make_input_node(plugin._camera._color_topic, plugin._audio_topic, buffer)
+                else:
+                    node = make_input_node(plugin._camera._color_topic, plugin._audio_topic, buffer, include_audio=False)
                 plugin._executor.add_node(node)
-                frames, audio_info = collect(buffer, tmp, active["duration_s"], active["cancel_event"])
+                if active.get("save_event") is not None or not include_audio:
+                    frames, audio_info = collect(
+                        buffer, tmp, active["duration_s"], active["cancel_event"],
+                        stop_event=active.get("save_event"), stop_state=active,
+                        include_audio=include_audio)
+                else:
+                    frames, audio_info = collect(buffer, tmp, active["duration_s"], active["cancel_event"])
             finally:
                 buffer.close()
                 if node is not None:
@@ -384,18 +439,23 @@ def record_av(plugin, active):
                 if active["cancel_event"].is_set():
                     raise RecordingError("RECORD_CANCELLED", "Video recording was cancelled")
                 active["state"] = "encoding"
-            images = prepare_frames(tmp, frames, active["duration_s"])
+            duration = audio_info.pop("recorded_duration_s", active["duration_s"])
+            images = prepare_frames(tmp, frames, duration)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            path = directory / ("video_%s.mp4" % stamp)
-            with path.open("xb"):
-                pass
+            if active.get("reserved_path"):
+                path = Path(active["reserved_path"])
+                owns_path = True
+            else:
+                path = directory / ("video_%s.mp4" % stamp)
+                with path.open("xb"):
+                    owns_path = True
             with tempfile.TemporaryFile() as errors:
                 with plugin._recording_lock:
                     active["path"] = str(path)
                     if active["cancel_event"].is_set():
                         raise RecordingError("RECORD_CANCELLED", "Video recording was cancelled")
                     process = subprocess.Popen(
-                        encoder_command(images, tmp / "audio.wav", path, active["duration_s"]),
+                        encoder_command(images, tmp / "audio.wav" if include_audio else None, path, duration),
                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errors)
                     active["process"] = process
                 encode_deadline = time.monotonic() + ENCODE_TIMEOUT_S
@@ -411,9 +471,10 @@ def record_av(plugin, active):
                         break
         complete = True
         return {"ok": True, "media_type": "video", "file_path": str(path),
-                "include_audio": True, "video_timing": "vfr", "audio_codec": "aac",
-                "timestamp_source": "ros_publish_header_pcm_burst_end",
-                "recorded_duration_s": active["duration_s"], "frames": len(frames),
+                "include_audio": include_audio, "video_timing": "vfr",
+                "audio_codec": "aac" if include_audio else None,
+                "timestamp_source": "ros_publish_header_pcm_burst_end" if include_audio else "ros_publish_header",
+                "recorded_duration_s": duration, "frames": len(frames),
                 "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 **audio_info}
     except Exception as exc:
@@ -422,5 +483,7 @@ def record_av(plugin, active):
         plugin._terminate_encoder(process)
         with plugin._recording_lock:
             active["process"] = None
-        if not complete and path is not None:
+        if not complete and owns_path and path is not None:
             plugin._remove_partial(path)
+        if not complete and active.get("reserved_path"):
+            plugin._remove_partial(Path(active["reserved_path"]))
