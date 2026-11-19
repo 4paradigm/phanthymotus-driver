@@ -1,0 +1,15 @@
+float32 degree
+bool with_waist
+MotionSetup revolute_setup
+MotionSetup prismatic_setup
+---
+int32 NO_ERROR=0
+int32 SHUTDOWN=1
+int32 JOINT_ERROR=2
+int32 MOTION_ERROR=3
+int32 TRJ_ERROR=4
+int32 STATE_ERROR=5
+int32 POSTURE_ERROR=6
+bool success
+int32 status
+string message

@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from common.vendor_runtime import action_schema, jsonable, tool
+from direction import HeadOrientationPlugin, SoundDirectionPlugin
 
 
 SERVICE_TIMEOUT = 10.0
@@ -979,6 +980,15 @@ class U1Nodes:
             return {"state": "closed", "users": 0, "vendor": result}
 
     def set_system_enabled(self, name: str, enabled: bool) -> dict:
+        audio = vars(self).get("_actuator_audio")
+        if audio is not None:
+            with audio._lock:
+                if enabled and audio._orientation_owner:
+                    raise RuntimeError("head orientation is active or unresolved")
+                return U1Nodes._set_system_enabled(self, name, enabled)
+        return U1Nodes._set_system_enabled(self, name, enabled)
+
+    def _set_system_enabled(self, name: str, enabled: bool) -> dict:
         requested = bool(enabled)
         response = self.string_call(name, {"enabled": requested})
         if _vendor_request_failed(response):
@@ -1245,6 +1255,8 @@ class U1Nodes:
             self.set_mic_enabled(False)
         except Exception:
             self.stop_mic_reader()
+        if hasattr(self, "_head_orientation"):
+            self._head_orientation.close()
         self._event_forwarding.clear()
         self.close_speaker_subscription()
         if self._mic_subscription is not None:
@@ -1409,7 +1421,8 @@ class AudioPlugin:
     def __init__(self, nodes: U1Nodes):
         self.nodes = nodes
         self.running = False
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._orientation_owner = None
         self._active: dict | None = None
         self.nodes.add_playback_listener(self._on_playback_state)
 
@@ -1436,21 +1449,36 @@ class AudioPlugin:
 
     def stop(self):
         with self._lock:
+            self.running = False
             active = self._active
-            self._active = None
-        result = {"state": "idle"}
-        if active:
-            try:
-                result["interrupt"] = self.nodes.trigger_call("interrupt")
-            except Exception as exc:
-                result["interrupt_error"] = str(exc)
-            finally:
-                _acp_notify(active["action_id"], "cancelled", {"state": "cancelled", "action_id": active["action_id"]}, active["tool_name"])
-        self.running = False
+            if not active:
+                return {"state": "idle"}
+            if active.get("stopping"):
+                return {"state": "interrupt_unconfirmed", "active": dict(active)}
+            # Keep ownership while the interrupt is pending or failed. Otherwise
+            # head_orientation could start while a preset is still moving.
+            active["stopping"] = True
+        result = {"state": "interrupt_unconfirmed"}
+        try:
+            response = self.nodes.trigger_call("interrupt")
+            result["interrupt"] = response
+            if _vendor_request_failed(response):
+                result["interrupt_error"] = "vendor rejected interrupt"
+        except Exception as exc:
+            result["interrupt_error"] = str(exc)[:256]
+        with self._lock:
+            if self._active is active:
+                if result.get("interrupt_error"):
+                    active["stop_error"] = result["interrupt_error"]
+                result["active"] = dict(active)
+            else:
+                result["state"] = "vendor_reported_terminal"
         return result
 
     def _queue(self, kind: str, payload: dict, action_id: str, tool_name: str = "audio") -> dict:
         with self._lock:
+            if self._orientation_owner:
+                return {"state": "error", "message": "head orientation is active or unresolved"}
             if self._active:
                 return {"state": "error", "message": "another U1 Pro audio action is active", "action_id": self._active["action_id"]}
             vendor_uuid = str(uuid.uuid4())
@@ -2110,6 +2138,9 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     # Keep cleanup first so DriverBundle.stop_all() runs it last, after every
     # card has disabled its vendor resources and stopped publishing.
     audio = AudioPlugin(nodes)
+    nodes._actuator_audio = audio
+    orientation = HeadOrientationPlugin(nodes, audio)
+    nodes._head_orientation = orientation
     # The firmware catalog is authoritative.  If it is unavailable, the
     # motion cards remain present but expose no actions instead of advertising
     # firmware-dependent static aliases. Song motions (A1xx) are intentionally
@@ -2121,6 +2152,6 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
                ExpressionPlugin(audio, motion_catalog, catalog_available),
                HeadPlugin(audio, motion_catalog, catalog_available),
-               SystemControlsPlugin(nodes),
+               SystemControlsPlugin(nodes), orientation, SoundDirectionPlugin(nodes),
                camera_left, camera_right]
     return plugins
