@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace as NS
 
+import yaml
+
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('bumi_imu_capture_fixture',ROOT/'tests/bumi_visual_odometry/test_bundle_hook.py')
 fixture=importlib.util.module_from_spec(spec)
@@ -14,12 +16,14 @@ capture=fixture.capture
 
 
 def test_capture_uses_body_imu_without_discovering_or_enabling_camera_motion(capture, monkeypatch):
-    from test_bumi_body_imu import MOUNT, reading
+    from test_bumi_body_imu import reading
+    config=yaml.safe_load((ROOT/'noetix/bumi/config.yaml').read_text())
+    mount=config['plugins']['visual_odometry']['calibration']
     device,state=capture
     sdk=sys.modules['pyrealsense2']
     probes=[]
     sdk.pipeline_wrapper=lambda pipeline:probes.append(pipeline)
-    monkeypatch.setenv('BUMI_BODY_IMU_MOUNT',json.dumps(MOUNT))
+    monkeypatch.setenv('BUMI_BODY_IMU_MOUNT',json.dumps(mount))
     state.frame_limit=2
     def spin(node):
         if state.iterations==1:
@@ -32,6 +36,9 @@ def test_capture_uses_body_imu_without_discovering_or_enabling_camera_motion(cap
     assert packet['camera_frame_id']=='robot_rgb_optical'
     assert packet['clock_id'].endswith('/hardware_clock')
     assert packet['angular_velocity']==[1.,2.,3.]
+    assert packet['camera_from_gyro_translation']==[0.,0.,0.]
+    assert packet['camera_from_accel_translation']==[0.,0.,0.]
+    assert packet['translation_source']=='configured_fixed_mount'
     assert probes==[]
     assert {args[0] for args in state.streams}=={'color','depth'}
     assert '/robot/camera/rgbd/imu' not in state.publisher_topics

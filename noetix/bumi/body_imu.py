@@ -20,6 +20,13 @@ class BodyImuSource:
             self.rotation = [list(row) for row in zip(*body_from_camera)]
         except (ValueError, TypeError, KeyError) as error:
             self.setup_reason = 'body IMU mount unavailable: ' + str(error)
+        self.translations = None
+        if not self.setup_reason:
+            offsets = calibration.data.get('body_imu_translation', {})
+            try:
+                self.translations = (finite(offsets['gyro'], 3), finite(offsets['accel'], 3))
+            except (ValueError, TypeError, KeyError):
+                pass  # Rotation assistance also works with older or incomplete mounts.
         self.signature = None
         self.reset()
 
@@ -61,8 +68,11 @@ class BodyImuSource:
                 units=dict(angular_velocity='rad/s', linear_acceleration='m/s^2'),
                 clock_mapping=dict(method='host_wall_read_completion', source_clock='ros_wall',
                                    offset_ns=0, verified=False))
-            # The existing mount sets the body reference at the camera origin;
-            # it does not measure the accelerometer lever arm. Publish no translation.
+            if self.translations is not None:
+                gyro_offset, accel_offset = self.translations
+                packet.update(camera_from_gyro_translation=gyro_offset,
+                              camera_from_accel_translation=accel_offset,
+                              translation_source='configured_fixed_mount')
             self.signature, self.last_capture_ns, self.reason = signature, stamp, None
             return packet
         except (ValueError, TypeError, KeyError) as error:
@@ -71,7 +81,10 @@ class BodyImuSource:
 
     def status(self, now_ns):
         live = self.reason is None and -50_000_000 <= now_ns-self.last_capture_ns <= 500_000_000
+        reason = self.reason or (None if live else 'body IMU reading stale')
+        fusion_reason = ('full IMU translation vectors are not supplied or invalid'
+                         if self.translations is None else reason)
         return dict(state='ready' if live else 'unavailable', source='body_imu',
-                    reason=self.reason if self.reason else (None if live else 'body IMU reading stale'),
+                    reason=reason,
                     last_capture_ns=self.last_capture_ns, stamp_source='read_completion',
-                    fusion=dict(state='unavailable', reason='full IMU translation vectors are not supplied'))
+                    fusion=dict(state='unavailable' if fusion_reason else 'ready', reason=fusion_reason))

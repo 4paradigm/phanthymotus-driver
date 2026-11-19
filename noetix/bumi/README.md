@@ -570,8 +570,9 @@ The configured fixed camera-to-body rotation in
 in the RGB optical frame. Raw angular velocity and acceleration remain in body
 axes and the generic consumer applies the declared rotation once. A usable
 numeric fixed rotation is required; an `assumed` label does not block it.
-The preset's camera-origin zero translation is not an accelerometer lever-arm measurement, so no IMU
-translation is declared.
+The `body_imu_translation` preset records the operator-confirmed zero offset
+for the gyro and accelerometer in RGB optical coordinates. The two configured
+vectors are published in metres.
 
 Packets use `motus.imu/1` over `std_msgs/String`, with a body source identity,
 activation epoch and explicit `stamp_source: read_completion`. The SDK does not
@@ -581,11 +582,9 @@ unchanged on the RGB-D mapped wall timeline, with an unverified
 hardware capture. Repeated identical SDK values do not refresh freshness.
 `imu_status` reports body input freshness separately from card activation.
 Perception accepts the numeric `motus.imu/1` format for any timestamp-source
-label, including full fusion. This adapter currently omits both numeric IMU
-translation vectors, so use its attitude path with `short_term_compensation`,
-`depth_geometry`, and `inertial_association` disabled until those fields are
-supplied. The limitation is the incomplete full-fusion format, not read time. Static hardware and moving accuracy acceptance
-of this adapter remain pending.
+label, including full fusion. Custom mounts without both finite IMU translation
+vectors can still provide attitude assistance. Static hardware and moving
+accuracy acceptance of this adapter remain pending.
 
 ### Capture-time body-camera TF
 

@@ -77,6 +77,16 @@ def test_assumed_mount_keeps_numeric_body_rotation_without_measured_translation(
     assert imu.status(1_010_000_000)['state'] == 'ready'
 
 
+def test_incomplete_body_imu_translation_preserves_rotation_assistance():
+    imu = source(dict(MOUNT, body_imu_translation={'gyro': [0., 0., 0.]}))
+    packet = imu.accept(reading(), 1_010_000_000)
+    assert 'camera_from_gyro_translation' not in packet
+    assert 'camera_from_accel_translation' not in packet
+    status = imu.status(1_010_000_000)
+    assert status['state'] == 'ready'
+    assert status['fusion']['state'] == 'unavailable'
+
+
 def test_cached_sdk_values_do_not_refresh_freshness_and_restart_has_new_epoch():
     imu = source()
     first = imu.accept(reading(), 1_010_000_000)
@@ -98,7 +108,12 @@ def test_real_generic_consumer_uses_body_axes_once_and_discloses_time_basis():
     spec = importlib.util.spec_from_file_location('generic_body_imu_consumer', path)
     consumer = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(consumer)
-    packet = json.loads(json.dumps(source().accept(reading(), 1_010_000_000)))
+    mount = dict(MOUNT, body_imu_translation={'gyro': [0., 0., 0.], 'accel': [0., 0., 0.]})
+    imu = source(mount)
+    packet = json.loads(json.dumps(imu.accept(reading(), 1_010_000_000)))
+    np.testing.assert_array_equal(consumer.translation_extrinsics(packet), np.zeros(6))
+    assert imu.status(1_010_000_000)['fusion']['state'] == 'ready'
+    assert imu.status(1_500_000_001)['fusion']['state'] == 'unavailable'
     attitude = consumer.ImuAttitude('robot_rgb_optical', 'capture/global_time')
     sample = attitude.observe(packet, 1_010_000_000)
     np.testing.assert_allclose(sample['angular_velocity'], [-2., -3., 1.])

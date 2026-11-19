@@ -78,6 +78,10 @@ plugins:
       camera_to_body:
         translation: [0.0, 0.0, 0.0]
         quaternion: [-0.5, 0.5, -0.5, 0.5]
+      # Operator-confirmed zero offset for this fixed installation, in RGB optical metres.
+      body_imu_translation:
+        gyro: [0.0, 0.0, 0.0]
+        accel: [0.0, 0.0, 0.0]
   # Experimental planar EKF: 40 Hz leg/IMU prediction and timestamped VO
   # correction. Opt in only after on-robot latency and accuracy validation.
   # Does not replace rgbd_visual_odometry or send movement commands.

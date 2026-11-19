@@ -41,8 +41,10 @@ second SDK owner or RealSense motion profile is used.
 configured fixed camera-to-body rotation, and declares
 `rotation_source=configured_fixed_mount`. The preset is an axis convention,
 not a measured body/IMU origin. Its `assumed` label does not block the numeric
-rotation. Both sensor translations are omitted because their lever arms have
-not been supplied; `imu_status.fusion` reports that missing numeric capability.
+rotation. The separate `body_imu_translation` preset uses operator-confirmed
+zero vectors for the fixed installation. Both vectors are published as
+`translation_source=configured_fixed_mount`. `imu_status.fusion` reports
+whether the input is fresh and includes both vectors.
 
 The SDK supplies no acquisition timestamp. Packets carry the host reading time
 unchanged with `stamp_source=read_completion` and an unverified
