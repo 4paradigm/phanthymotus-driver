@@ -397,6 +397,12 @@ class LocoPlugin:
         self._rotate_worker: threading.Thread | None = None
         self._active_action_id: str | None = None
         self._destination_action = "rotate"
+        # Internal capability, never accepted from MCP arguments. Retained for
+        # the whole sound-facing session, including observation and settling.
+        self._relative_owner = None
+        self._relative_authorization = None
+        self._relative_interrupted = False
+        self._owned_result = None
         # Card configuration, like the other cards: the slip factors are
         # operator-settable through the config action (configSchema below) and
         # apply to every following move until changed again.
@@ -437,7 +443,8 @@ class LocoPlugin:
         """
         thread = self._move_thread
         return bool((thread is not None and thread.is_alive())
-                    or self._rotate_state["state"] == "running" or self._body_action)
+                    or self._rotate_state["state"] == "running" or self._body_action
+                    or self._relative_owner is not None)
 
     def publish_velocity(self, x: float, y: float, z: float) -> None:
         """One normalised velocity command, through this plugin's rate limiter.
@@ -447,7 +454,114 @@ class LocoPlugin:
         with separate limiters can interleave inside a single publish, and the
         SDK has no way to tell us that happened.
         """
-        self._publish_cmd(x, y, z, _get_default_cmd(), 0)
+        self._publish_cmd(x, y, z, _get_default_cmd(), 0, from_servo=True)
+
+    def reserve_relative_motion(self, owner, *, authorization=None) -> dict:
+        """Reserve the existing executor without stopping another controller.
+
+        Lock order: action -> publisher. No servo call under either lock.
+        The publisher barrier drains an in-flight servo write before ownership
+        changes. Later servo writes are suppressed inside the same barrier.
+        """
+        if owner is None:
+            return {"state": "error", "error": "missing_owner"}
+        if self._servo is not None and self._servo._info()["state"] != "idle":
+            return {"state": "error", "error": "servo_not_idle"}
+        with self._rotate_lock:
+            if self._relative_owner is owner:
+                return {"state": "reserved"}
+            if self.is_moving():
+                return {"state": "error", "error": "chassis_busy"}
+            with self._lock:
+                self._relative_owner = owner
+                self._relative_authorization = authorization
+                self._relative_interrupted = False
+                self._owned_result = None
+        # A servo start that passed its preflight before reservation can still
+        # finish afterwards; it cannot publish across the ownership barrier.
+        try:
+            if self._servo is not None and self._servo._info()["state"] != "idle":
+                self.release_relative_motion(owner)
+                return {"state": "error", "error": "servo_not_idle"}
+        except Exception:
+            self.release_relative_motion(owner)
+            raise
+        return {"state": "reserved"}
+
+    def relative_motion_health(self, owner) -> dict:
+        with self._rotate_lock:
+            if self._relative_owner is not owner:
+                return {"state": "error", "error": "ownership_lost"}
+            if self._relative_interrupted:
+                return {"state": "error", "error": "operator_interrupted"}
+            if self._relative_authorization is not None and not self._relative_authorization():
+                return {"state": "error", "error": "owned_authorization_invalid"}
+        if self._servo is not None and self._servo._info()["state"] != "idle":
+            return {"state": "error", "error": "servo_not_idle"}
+        problem = self._rotate_mode_error()
+        if problem:
+            return problem
+        return self.owned_motion_stability(owner)
+
+    def owned_motion_stability(self, owner) -> dict:
+        """Read IMU quietness during scoped cancellation, even after mode loss."""
+        with self._rotate_lock:
+            if self._relative_owner is not owner:
+                return {"state": "error", "error": "ownership_lost"}
+        yaw, wz = self._read_rotate_imu()
+        return {"state": "ready", "yaw_deg": yaw, "wz_rad_s": wz,
+                "stationary": abs(wz) <= _ROTATE_WZ_STILL_RAD_S}
+
+    def rotate_owned(self, owner, angle_deg) -> dict:
+        return self._do_destination({"angle_deg": angle_deg}, "rotate", owner=owner)
+
+    def cancel_owned_rotation(self, owner, action_id) -> dict:
+        # Only signal the exact worker. Its existing finally block brakes; a
+        # delayed cancel must never publish zero into somebody else's action.
+        with self._rotate_lock:
+            if self._relative_owner is not owner:
+                return {"state": "error", "error": "ownership_lost"}
+            if self._active_action_id != action_id or action_id is None:
+                return {"state": "unchanged"}
+            self._rotate_stop_event.set()
+            return {"state": "cancelling", "action_id": action_id}
+
+    def interrupt_owned_session(self, owner) -> dict:
+        """Cancel this owner's session even before a turn ID is published.
+
+        Only local state and the existing cancellation Event are touched. A
+        sticky interruption prevents delayed preflight from clearing the stop.
+        Never sends zero into another owner's command stream.
+        """
+        with self._rotate_lock:
+            if self._relative_owner is not owner:
+                return {"state": "unchanged"}
+            self._relative_interrupted = True
+            self._rotate_stop_event.set()
+            return {"state": "cancelling", "action_id": self._active_action_id}
+
+    def owned_rotation_status(self, owner, action_id) -> dict:
+        with self._rotate_lock:
+            if self._relative_owner is not owner:
+                return {"state": "error", "error": "ownership_lost"}
+            if self._owned_result and self._owned_result["action_id"] == action_id:
+                return {**self._owned_result, "result": dict(self._owned_result["result"])}
+            if self._active_action_id == action_id and action_id is not None:
+                return {"state": "running", "action_id": action_id}
+            return {"state": "error", "error": "unknown_action"}
+
+    def release_relative_motion(self, owner) -> dict:
+        with self._rotate_lock:
+            if self._relative_owner is not owner:
+                return {"state": "error", "error": "ownership_lost"}
+            if self._rotate_state["state"] == "running":
+                return {"state": "error", "error": "rotation_not_terminal"}
+            if self._owned_result and not self._owned_result["result"].get("stop_command_sent"):
+                return {"state": "error", "error": "owned_stop_unconfirmed"}
+            with self._lock:
+                self._relative_owner = None
+                self._relative_authorization = None
+            return {"state": "released"}
 
     def _preempt_servo(self, reason: str) -> bool:
         """An explicit action outranks a streaming policy.
@@ -732,6 +846,9 @@ class LocoPlugin:
         body_action = tool_name in ("stand_up_lie_prone", "semantic_action", "action_recording")
         if body_action:
             with self._rotate_lock:
+                if self._relative_owner is not None:
+                    return {"state": "error", "command_sent": False,
+                            "error": "chassis reserved by an owned relative-motion session"}
                 if self._body_action:
                     return {"state": "error", "command_sent": False,
                             "error": f"chassis reserved by {self._body_action}"}
@@ -752,9 +869,11 @@ class LocoPlugin:
                     self._body_action = None
 
     def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0,
-                     *, cancel_event: threading.Event | None = None):
+                     *, cancel_event: threading.Event | None = None, from_servo=False):
         """Send command with rate limiting (≥2ms between calls). action_cmd is ControlCmd enum."""
         with self._lock:
+            if from_servo and self._relative_owner is not None:
+                return
             now = time.monotonic()
             elapsed = now - self._last_cmd_time
             if elapsed < 0.002:
@@ -763,6 +882,10 @@ class LocoPlugin:
             # rate-limit wait: a cancelled rotation must not restart motion.
             if cancel_event is not None and cancel_event.is_set():
                 return
+            if ((x or y or z) and self._relative_owner is not None
+                    and self._relative_authorization is not None
+                    and not self._relative_authorization()):
+                raise RuntimeError("owned_authorization_invalid")
             self._high_ctrl.publish_cmd(x, y, z, action_cmd, index)
             self._last_cmd_time = time.monotonic()
 
@@ -770,6 +893,8 @@ class LocoPlugin:
         # Reserve move startup until its worker exists, so rotate cannot
         # enter between the busy check and launching the move thread.
         with self._rotate_lock:
+            if self._relative_owner is not None:
+                return {"state": "error", "error": "chassis reserved by an owned relative-motion session"}
             if self._body_action:
                 return {"state": "error", "error": f"chassis reserved by {self._body_action}"}
             if self._rotate_state["state"] == "running":
@@ -851,6 +976,9 @@ class LocoPlugin:
             return {"state": "moving", "vx": vx, "vy": vy, "vyaw": vyaw, "duration": "continuous (5s watchdog)"}
 
     def _stop_move(self) -> dict:
+        with self._rotate_lock:
+            if self._relative_owner is not None:
+                self._relative_interrupted = True
         self._rotate_stop_event.set()
         self._move_stop_event.set()
         if self._move_thread and self._move_thread.is_alive():
@@ -863,7 +991,7 @@ class LocoPlugin:
     def _do_rotate(self, args: dict) -> dict:
         return self._do_destination(args, "rotate")
 
-    def _do_destination(self, args: dict, action: str) -> dict:
+    def _do_destination(self, args: dict, action: str, *, owner=None) -> dict:
         # Sync entry: reserve one rotation atomically (busy-guard + clear
         # cancellation) before exposing running status, then run the
         # pre-flight checks. Validation/mode refusals complete here, before
@@ -872,6 +1000,14 @@ class LocoPlugin:
         # to the bumi_rotate daemon thread, which records idle + the full
         # result and fires the ACP terminal exactly once.
         with self._rotate_lock:
+            if ((owner is not None and self._relative_owner is not owner)
+                    or (self._relative_owner is not None and self._relative_owner is not owner)):
+                return {"state": "error", "error": "relative_motion_ownership_conflict"}
+            if owner is not None and self._relative_interrupted:
+                return {"state": "error", "error": "owned_session_interrupted"}
+            if (owner is not None and self._relative_authorization is not None
+                    and not self._relative_authorization()):
+                return {"state": "error", "error": "owned_authorization_invalid"}
             if self._body_action:
                 return {"state": "error", "error": f"chassis reserved by {self._body_action}"}
             if self._rotate_state["state"] == "running":
@@ -895,9 +1031,17 @@ class LocoPlugin:
                     expected_duration_s = min(60.0, 12.0+20.0*value)
                 action_id = f"bumi_loco_relative_move_{uuid.uuid4().hex}"
                 worker = threading.Thread(target=self._do_rotate_worker,
-                                          args=(args, action_id, action),
+                                          args=(args, action_id, action, owner),
                                           daemon=True, name=f"bumi_{action}")
                 with self._rotate_lock:
+                    if owner is not None and (self._relative_interrupted
+                            or self._rotate_stop_event.is_set()
+                            or (self._relative_authorization is not None
+                                and not self._relative_authorization())):
+                        terminal = {"state": "stopped", "error": "owned_session_interrupted"}
+                        self._rotate_state["state"] = "idle"
+                        self._rotate_state["last_result"] = terminal
+                        return terminal
                     self._active_action_id = action_id
                     self._rotate_worker = worker
                 worker.start()
@@ -923,7 +1067,7 @@ class LocoPlugin:
             self._rotate_state["last_result"] = terminal
         return terminal
 
-    def _do_rotate_worker(self, args: dict, action_id: str, action: str = "rotate") -> dict | None:
+    def _do_rotate_worker(self, args: dict, action_id: str, action: str = "rotate", owner=None) -> dict | None:
         # bumi_rotate thread body: run the impl, then publish exactly one
         # ACP terminal. The active action is claimed (cleared) under the
         # lock BEFORE notifying — a duplicate completion is structurally
@@ -932,10 +1076,16 @@ class LocoPlugin:
         result = None
         owns_velocity = False
         try:
+            if owner is not None:
+                problem = self.relative_motion_health(owner)
+                if problem.get("state") != "ready":
+                    result = problem
+                    return result
             if action == "move" or abs(float(args["angle_deg"])) >= 0.05:
                 # Rotation is already reserved, so servo start/resume sees
                 # a busy chassis before this publisher takes ownership.
-                self._preempt_servo(f"loco_relative_move.{action}")
+                if owner is None:
+                    self._preempt_servo(f"loco_relative_move.{action}")
                 owns_velocity = True
             result = self._do_rotate_impl(args) if action == "rotate" else self._do_target_impl(args)
             result["action"] = action
@@ -949,22 +1099,48 @@ class LocoPlugin:
                       "error": f"{type(exc).__name__}: {exc}"}
             return result
         finally:
+            if owner is not None:
+                # Covers preflight/IMU exceptions before the existing loop's
+                # try/finally, too. Ownership remains held through this write.
+                # A successful SDK call is not physical stop confirmation.
+                if result is None:
+                    result = {"state": "error", "error": "missing_rotation_result"}
+                try:
+                    self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
+                    result["stop_command_sent"] = True
+                except Exception as exc:
+                    result.update(state="error", stop_command_sent=False,
+                                  error=f"owned brake failed: {type(exc).__name__}: {exc}")
+                result["physical_stop_confirmed"] = False
             if owns_velocity:
                 self._set_servo_velocity_owner(False)
             with self._rotate_lock:
                 claimed = self._active_action_id == action_id
                 if claimed:
                     self._active_action_id = None
+                    if owner is not None:
+                        # Publish the local receipt and idle atomically with
+                        # retiring the ID. Pollers must never see a gap where
+                        # the worker is neither active nor terminal.
+                        self._rotate_state["state"] = "idle"
+                        self._rotate_state["last_result"] = result
+                        self._owned_result = {"state": "terminal", "action_id": action_id,
+                                              "result": dict(result or {"state": "error"})}
             if claimed:
                 status = {"done": "completed", "stopped": "cancelled",
                           "timeout": "error"}.get(
                               result.get("state") if result else None,
                               "error")
-                _acp_notify(action_id, status, result, "loco_relative_move")
+                # An internal turn has no Core ACP pending action. Its local,
+                # correlated receipt is authoritative for the supervisor; do
+                # not send an orphan ACP callback or wait for network delivery.
+                if owner is None:
+                    _acp_notify(action_id, status, result, "loco_relative_move")
             with self._rotate_lock:
-                self._rotate_state["state"] = "idle"
-                if result is not None:
-                    self._rotate_state["last_result"] = result
+                if owner is None:
+                    self._rotate_state["state"] = "idle"
+                    if result is not None:
+                        self._rotate_state["last_result"] = result
 
     def _rotate_preflight(self, args: dict) -> tuple[float | None, dict | None]:
         # Synchronous pre-motion checks (Task 2 impl steps 1–2), shared by

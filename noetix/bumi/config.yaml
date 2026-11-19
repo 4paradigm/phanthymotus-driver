@@ -40,6 +40,24 @@ plugins:
     enabled: true
   sound_direction:
     enabled: true
+  bumi_sound_facing:
+    # Opt in to registration only. Explicit enable_follow is still required.
+    # Agent/Canvas require a separate operator signature. No public key means
+    # fail-closed; renew_follow never extends the operator's grant deadline.
+    enabled: false
+    deadzone_deg: 12.0
+    release_deg: 6.0
+    spread_deg: 12.0
+    stable_windows: 3
+    stable_span_s: 0.6
+    max_age_s: 1.0
+    max_window_s: 1.0
+    max_gap_s: 0.8
+    stream_timeout_s: 1.5
+    settle_s: 0.8
+    reversal_hold_s: 2.0
+    turn_timeout_s: 80.0
+    session_timeout_s: 30.0
   speaker:
     enabled: true
   camera:

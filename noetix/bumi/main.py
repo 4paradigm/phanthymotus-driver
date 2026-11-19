@@ -123,6 +123,7 @@ class BumiDeviceBundle:
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
         loco_plugin = None
+        sound_direction_plugin = None
         # The camera subprocess reads this env var; set it before any plugin can
         # start that subprocess, so the raw RGB-D branch is published only when
         # the visual odometry card is enabled.
@@ -166,9 +167,17 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("sound_direction", {}).get("enabled", False) and media_ctrl is not None:
             from direction_card import SoundDirectionPlugin
-            self._plugins.append(SoundDirectionPlugin(
-                plugins_cfg["sound_direction"], namespace, executor, media_ctrl))
+            sound_direction_plugin = SoundDirectionPlugin(
+                plugins_cfg["sound_direction"], namespace, executor, media_ctrl)
+            self._plugins.append(sound_direction_plugin)
             print("[bundle] SoundDirectionPlugin loaded")
+
+        if plugins_cfg.get("bumi_sound_facing", {}).get("enabled", False):
+            from sound_facing_card import SoundFacingPlugin
+            self._plugins.append(SoundFacingPlugin(
+                plugins_cfg["bumi_sound_facing"], namespace, executor, loco_plugin,
+                source_plugin=sound_direction_plugin))
+            print("[bundle] SoundFacingPlugin loaded (tracking disabled)")
 
         if plugins_cfg.get("speaker", {}).get("enabled", False) and media_ctrl is not None:
             from device import SpeakerPlugin
