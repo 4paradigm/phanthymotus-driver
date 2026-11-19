@@ -2,6 +2,10 @@
 
 The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
 
+The `detaforce_rps` actuator Card provides six DetaForce game gestures. Hardware
+playback is disabled until verified vendor teaching recordings are bound; the
+new arm trajectories are previewed only in Gazebo. See [DetaForce actions](DETAFORCE_RPS.md).
+
 ## `mic` and `sound_direction`
 
 `mic` publishes mono PCM `AudioChunk` messages on `/<namespace>/mic/audio`.
