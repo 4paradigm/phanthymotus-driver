@@ -13,6 +13,8 @@ from .model import fetch_model
 
 
 class HeliosJoints:
+    PREFIX = "joints"
+
     def __init__(self, config, namespace="rokae_helios", ros2=None, client=None, scope_client=None):
         self._config = config
         self._ros2 = ros2

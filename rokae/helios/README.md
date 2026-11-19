@@ -74,7 +74,7 @@ python scripts/check_service_yml.py rokae/helios
 
 ## 构建与部署
 
-使用仓库标准构建入口 `./build.sh rokae/helios`。Dockerfile 复用固定 Core 基础镜像中的 ROS Humble / Python 环境，容器只运行 Driver。构建环境需要具有读取该基础镜像的权限。
+使用仓库标准构建入口 `./build.sh rokae/helios`。Dockerfile 使用仓库通用的 `ros-base` 驱动基础镜像，使用系统 Python3 安装 aiohttp、PyYAML 和 Protobuf；不再携带 Core 应用及其虚拟环境。依赖安装使用 `--no-cache-dir`，源文件放在依赖层之后以便复用缓存。镜像只运行 Driver。
 
 `deploy/service.yml` 为 bot 提取的标准 host 网络服务片段。Core 和 Driver 必须共享 loopback，并使用 domain 42 及同一 DDS loopback 配置；只改变 HTTP 地址不能解决 DDS 隔离。
 

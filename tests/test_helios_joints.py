@@ -201,6 +201,7 @@ def _check_model_and_mcp_resource(source):
             with urlopen(req, timeout=2) as response:
                 return json.load(response)["result"]
         tools = rpc("tools/list", {})["tools"]
+        assert plugin.PREFIX == tools[0]['name']
         assert {t["name"]: t["type"] for t in tools} == {"joints": "sensor", "model": "resource"}
         assert tools[0]["configSchema"]["properties"]["state_url"]["x-sensitive"] is True
         resource = rpc("tools/call", {"name": "model", "arguments": {}})

@@ -96,6 +96,8 @@ class BatteryFeedbackClient(StreamFeedbackClient):
 
 
 class HeliosBattery:
+    PREFIX = "battery"
+
     def __init__(self, config, namespace="rokae_helios", ros2=None, client=None):
         self._config = config
         self._ros2 = ros2

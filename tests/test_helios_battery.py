@@ -197,6 +197,7 @@ def test_bundle_independent_lifecycle_partial_and_validation():
     config = {"state_url": "ws://127.0.0.1/joints", "battery_state_url": "ws://127.0.0.1/battery"}
     with chassis_server() as server:
         battery = HeliosBattery(config, client=BatteryFeedbackClient(server["url"]))
+        assert battery.PREFIX == 'battery'
         joints = HeliosJoints(config)
         bundle = DriverBundle([joints, battery])
         assert {t["name"]: t["type"] for t in bundle.get_all_tools()} == {
