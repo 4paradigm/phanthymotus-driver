@@ -2,7 +2,8 @@
 
 > 本文档记录「能不能用软件启停伴随模式」这一问题的全部证据。
 > 当前状态：**未找到控制路径，但已排除大半搜索空间，并把剩余三条假设做成了可在机器人上执行的实验**。
-> 配套工具：`unitree/as2w/accompany_probe.py`（默认只读）。
+> 配套工具：`unitree/as2w/accompany_probe.py`（机器人上取证，默认只读）、
+> `unitree/as2w/accompany_verdict.py`（笔记本上离线判读取证 JSON，纯标准库）。
 
 ---
 
@@ -116,6 +117,12 @@ docker exec -it <container> python3 /work/accompany_probe.py --watch 60 --json /
 # 3. 仅在 1、2 均无线索时才做，且必须架起机器人
 docker exec -it <container> python3 /work/accompany_probe.py \
     --probe-ids 1022,1023,1024 --armed --robot-on-stand --remote-in-hand --json /tmp/step3.json
+```
+
+判读不必人工比对：把 JSON 拷回笔记本（或仍在容器里）后运行判读脚本，它按下面的判读表自动输出每条现象的结论与下一步（纯标准库，无 DDS 依赖）：
+
+```bash
+python3 /work/accompany_verdict.py /tmp/step1.json /tmp/step2.json [/tmp/step3.json] --json /tmp/verdict.json
 ```
 
 判读表：
