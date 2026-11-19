@@ -174,6 +174,31 @@ class PcmSink:
                 self._stop()
 
 
+class RegistrationWatch:
+    """Restart a still-running rospy process after ROS Master loses its entries."""
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.next_check = clock()+10.
+        self.failures = 0
+
+    def check(self, master, node_name):
+        now = self.clock()
+        if now < self.next_check:
+            return
+        self.next_check = now+2.
+        try:
+            owners = dict(master.getSystemState()[2])
+            registered = all(node_name in owners.get(ROOT+'/'+name, [])
+                             for name in ('start', 'stop', 'status'))
+        except Exception:
+            registered = False
+        self.failures = 0 if registered else self.failures+1
+        if self.failures >= 3:
+            # systemd Restart=on-failure starts a new process, which re-registers
+            # every service/subscriber. Never repeatedly replay a playback call.
+            raise RuntimeError('speaker ROS registration lost; restarting relay')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--volume', type=int, default=30)
@@ -198,10 +223,17 @@ def main():
     sub = rospy.Subscriber(ROOT + '/pcm', String, lambda msg: sink.receive(msg.data), queue_size=10)
     volume_sub = rospy.Subscriber(ROOT + '/volume', String, lambda msg: sink.receive_volume(msg.data), queue_size=1)
     rospy.on_shutdown(sink.stop)
-    # Wall time watchdog remains live when ROS simulated time stops.
-    while not rospy.is_shutdown():
-        sink.tick()
-        time.sleep(.01)
+    import rosgraph
+    registration = RegistrationWatch()
+    master = rosgraph.Master(rospy.get_name())
+    # Wall time watchdog and registration checks survive a Master restart.
+    try:
+        while not rospy.is_shutdown():
+            sink.tick()
+            registration.check(master, rospy.get_name())
+            time.sleep(.01)
+    finally:
+        sink.stop()
 
 
 if __name__ == '__main__':

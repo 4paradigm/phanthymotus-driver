@@ -690,3 +690,5 @@ IMU301帧、位置展示和标准odom各300帧且全部有效，电池/雷达点
 2026-11-19 有人旁站验证：低速 `move_relative(x=0.2,y=0.2,yaw=90)`；原比例控制停在约0.072m/2.35°残差，末段积分修正后约13.1s完成ACP，完成时原始里程计残差约0.0182m/0.987°，测试后软件暂停。仅覆盖本次姿态/地面/速度；建图修复已在真机以只读原始里程计停稳探针验证，未创建或切换地图。
 
 近似完成是驱动的任务结束策略，不代表厂商精度保证；仅应用于`base_drive.move_relative`与`head.move_pos/zero`，不改变`controlled_spatial`的原生任务/地图到达确认，也不改变arm/leg的测量收敛要求。
+
+重启恢复：`controlled_spatial.info`在四类导航反馈尚未齐备时返回`loading`及`feedback_status.missing`，保留后台启动结果，不将一次状态读取超时当作启动失败；实际导航仍严格要求新鲜完整反馈。底盘speaker进程每2s核对自身start/stop/status的ROS注册，启动宽限10s、连续三次缺失/无法验证即退出，由systemd自动重启并重新注册；处理控制板ROS Master重启而底盘进程仍存活的情况，不重放音频start或PCM。

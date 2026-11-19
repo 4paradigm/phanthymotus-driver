@@ -219,6 +219,19 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual([c[0] for c in self.client.calls], ['prepare'])
         self.assertEqual(calls, [('agvState', 'state')] * 4)
 
+    def test_info_missing_feedback_is_loading_and_does_not_hide_background_start(self):
+        self.plugin._startup_key=(self.bundle._stop_epoch,self.bundle.ros1.connection)
+        self.plugin._startup={'state':'running'}
+        self.client.observe=lambda **kw: (_ for _ in ()).throw(NavigationStateUnavailable(['agvState','pose2d','state','localizationStatus']))
+        result=self.call('info')
+        self.assertEqual(result['state'],'loading')
+        self.assertEqual(result['startup']['state'],'running')
+        self.assertIsNone(result['feedback'])
+        self.assertEqual(result['feedback_status']['state'],'loading')
+        self.assertFalse(self.client.calls)
+        self.client.observe=lambda **kw: copy.deepcopy(Client().feedback)
+        self.assertEqual(self.call('info')['state'],'ready')
+
     def test_persistent_missing_state_has_diagnostic_without_control_mutation(self):
         self.client.observe = lambda **kw: (_ for _ in ()).throw(NavigationStateUnavailable(['agvState']))
         result = self.call('start')

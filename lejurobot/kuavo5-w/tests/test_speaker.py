@@ -423,3 +423,34 @@ class SinkTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RegistrationWatchTests(unittest.TestCase):
+    def test_master_restart_missing_entries_restarts_process_even_when_service_is_active(self):
+        now=[0.]
+        watch=relay.RegistrationWatch(lambda:now[0])
+        master=Mock()
+        master.getSystemState.return_value=[[],[],[]]
+        watch.check(master,'/speaker')
+        master.getSystemState.assert_not_called()
+        for t in (10.,12.):
+            now[0]=t;watch.check(master,'/speaker')
+        now[0]=14.
+        with self.assertRaisesRegex(RuntimeError,'registration lost'):
+            watch.check(master,'/speaker')
+
+    def test_recovery_resets_failures_and_other_owner_does_not_count(self):
+        now=[10.]
+        watch=relay.RegistrationWatch(lambda:0.)
+        master=Mock()
+        master.getSystemState.side_effect=ConnectionError('master unavailable')
+        watch.clock=lambda:now[0]
+        watch.check(master,'/speaker')
+        master.getSystemState.side_effect=None
+        master.getSystemState.return_value=[[],[],[(relay.ROOT+'/'+n,['/speaker']) for n in ('start','stop','status')]]
+        now[0]=12.;watch.clock=lambda:now[0];watch.check(master,'/speaker')
+        self.assertEqual(watch.failures,0)
+        master.getSystemState.return_value=[[],[],[(relay.ROOT+'/'+n,['/other'])for n in ('start','stop','status')]]
+        for t in (14.,16.):now[0]=t;watch.check(master,'/speaker')
+        now[0]=18.
+        with self.assertRaises(RuntimeError):watch.check(master,'/speaker')

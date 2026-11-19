@@ -363,11 +363,25 @@ class ControlledSpatialPlugin:
             if action == 'info':
                 mapping = self.store.state('mapping')
                 startup = self.startup_status()
-                return {'state': startup['state'] if startup['state'] in ('loading', 'error') else 'mapping' if mapping else 'ready', 'mapping': mapping,
-                        'remote_task': self._task, 'command_delivery_uncertain': self._uncertain,
-                        'map_transition': self._map_pending, 'chassis_preparation': self._preparation,
-                        'startup': self.startup_status(),
-                        'map': self.client.current_map(), 'feedback': self.client.observe()}
+                result = {'state': startup['state'] if startup['state'] in ('loading', 'error') else 'mapping' if mapping else 'ready', 'mapping': mapping,
+                          'remote_task': self._task, 'command_delivery_uncertain': self._uncertain,
+                          'map_transition': self._map_pending, 'chassis_preparation': self._preparation,
+                          'startup': startup}
+                try:
+                    result['map'] = self.client.current_map()
+                except Exception:
+                    result['map'] = None
+                    result['map_status'] = {'state': 'unavailable'}
+                try:
+                    result['feedback'] = self.client.observe()
+                    result['feedback_status'] = {'state': 'ready'}
+                except NavigationStateUnavailable as exc:
+                    result['feedback'] = None
+                    result['feedback_status'] = {'state': 'loading', 'missing': list(exc.missing), 'reason': exc.reason}
+                    if result['state'] != 'error':
+                        result['state'] = 'loading'
+                    result['message'] = 'Waiting for fresh chassis navigation feedback; checking in background, please wait.'
+                return result
             if action in ('stop_nav', 'stop'):
                 result = self.bundle.pause('navigation_stopped')
                 return result if action == 'stop_nav' or result.get('error') else {'state': 'idle'}
