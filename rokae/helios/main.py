@@ -1,5 +1,9 @@
 """Single-domain ROS publisher + loopback MCP server; no vendor DDS participant."""
 
+from common import logsafe
+
+logsafe.install()
+
 import os
 import signal
 import threading

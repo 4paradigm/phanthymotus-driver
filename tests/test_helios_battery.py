@@ -43,8 +43,9 @@ def test_units_order_zero_soc_and_unknown_fields():
     assert "charging" not in result[0] and "left" not in result[0]
 
 
-def test_real_installed_chassis_frame():
-    raw = Path(__file__).with_name("fixtures").joinpath("helios/robot_base_battery.bin").read_bytes()
+def test_installed_battery_records_in_synthetic_wire_envelope():
+    records = json.loads(Path(__file__).with_name("fixtures").joinpath("helios/battery_records.json").read_text())
+    raw = frame(records) + b"\x78\x01"  # Unknown field compatibility, no committed binary capture.
     rows = parse_battery_frame(raw)
     assert [(p["id"], p["soc_pct"], p["voltage_v"], p["current_ma"],
              p["temperature_max_c"], p["cycle_count"]) for p in rows] == [

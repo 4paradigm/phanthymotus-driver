@@ -40,6 +40,6 @@
 
 ## 验证
 
-`tests/fixtures/helios/robot_base_battery.bin` 保留实际报文的电池字段，移除了无关底盘状态及其他 Protobuf 字段，并添加无敏感数据的未知字段作为兼容性回归。模拟 WebSocket 测试另核对只读行为、停流、断线重连及独立生命周期。
+`tests/fixtures/helios/battery_records.json` 保留实际报文的电池字段，移除了无关底盘状态。测试运行时生成 Protobuf 信封并添加合成未知字段作为兼容性回归，不提交二进制采集文件。模拟 WebSocket 测试另核对只读行为、停流、断线重连及独立生命周期。
 
 已有本机调试验证不代表 bot 镜像验收。正式提交、部署与验收要求见 README 和 VALIDATION.md。

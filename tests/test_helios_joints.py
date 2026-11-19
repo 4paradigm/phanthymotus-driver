@@ -16,6 +16,7 @@ from aiohttp import web
 from common.vendor_runtime import DriverBundle, make_handler
 from rokae.helios.device import HeliosJoints
 from rokae.helios.feedback import FeedbackClient, GROUPS, JOINT_NAMES, parse_state
+from test_helios_model import model_server
 
 
 def frame():
@@ -182,7 +183,12 @@ def test_stop_during_handshake_is_cancellable():
 
 
 def test_model_and_mcp_resource_not_double_wrapped():
-    plugin = HeliosJoints({"state_url": "ws://127.0.0.1:8888/ws"})
+    with model_server() as source:
+        _check_model_and_mcp_resource(source)
+
+
+def _check_model_and_mcp_resource(source):
+    plugin = HeliosJoints({"state_url": source['state_url']})
     bundle = DriverBundle([plugin])
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(lambda: bundle, "helios", "helios"))
     worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -201,11 +207,13 @@ def test_model_and_mcp_resource_not_double_wrapped():
         model = json.loads(resource["content"][0]["text"])
         assert "visual_packages" not in model  # Standard URDF skeleton, no STL downloads.
         root = ET.fromstring(model["urdf"])
-        assert len(root.findall("link")) == 34
+        assert len(root.findall("link")) == 21  # Synthetic fixture, not manufacturer geometry.
         assert {j.get("name") for j in root.findall("joint") if j.get("type") != "fixed"} == set(JOINT_NAMES)
         skeleton, status = plugin.payloads()
         assert skeleton["joints"] == [] and not skeleton["available"]
         assert status["state"] == "idle" and status["angles_rad"] == {}
+        rpc("tools/call", {"name": "model", "arguments": {}})
+        assert source['requests'] == ['/api/robot_3d_model', '/model.urdf']  # Cached per source.
     finally:
         server.shutdown()
         server.server_close()

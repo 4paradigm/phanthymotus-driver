@@ -1,7 +1,7 @@
-# Helios protocol fixtures
+# Helios protocol test data
 
-`robot_base_battery.bin` contains battery records captured from the installed chassis UI on 2026-11-18. All unrelated data_pool entries and unknown original Protobuf fields have been removed; robot_id is the generic value `1`. A synthetic unknown field 15 (value 1) is appended to check wire-compatible decoding. This file is a sanitized protocol fixture, not an untouched complete robot capture.
-
-SHA-256: `6fcbf94ac564968300b0cbafd045ae4650510f7618eadd3ef99e34eeafa0ff44` (569 bytes).
+`battery_records.json` contains only the two battery records from the installed chassis UI (2026-11-18), with all unrelated chassis state removed. Tests generate the minimal Protobuf envelope and an unknown field in memory. No binary capture is committed.
 
 `joint_scope.json` retains the joint/scope feedback shape for the installed runtime. Fixed fixtures are for tests only; production never reads them or falls back to them as live telemetry.
+
+Model tests construct original abstract geometry in Python; no manufacturer model or manufacturer-derived transform fixture is included.

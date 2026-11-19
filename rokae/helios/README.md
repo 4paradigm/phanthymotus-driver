@@ -6,7 +6,7 @@
 |---|---|---|
 | `joints` | sensor | 关节骨架和逐轴状态，默认 10 Hz |
 | `battery` | sensor | 两块电池状态，默认 1 Hz |
-| `model` | resource | 匹配关节名称的 URDF，骨架渲染器自动调用 |
+| `model` | resource | 运行时读取本机 iNex 的 URDF，骨架渲染器自动调用 |
 
 ## 数据与单位
 
@@ -44,7 +44,7 @@
 
 ## 画布与 Core 前端
 
-在卡片共享配置中保存状态地址，再将 `joints` 和 `battery` 加入画布并启动。`model` 无需单独运行。监控页从 `joints` 自动生成骨架及 `joint_status` 模块。
+在卡片共享配置中保存状态地址，再将 `joints` 和 `battery` 加入画布并启动。`model` 无需单独运行；首次请求时读取同一 iNex 地址的 `/api/robot_3d_model` 及其同源 `urdf_url`，核对 20 轴名称后在进程内缓存。没有把厂家模型打入镜像。模型服务暂不可用时明确返回错误，不影响关节和电池订阅启动。监控页从 `joints` 自动生成骨架及 `joint_status` 模块。
 
 配套 Core 功能分支包含真实 MCP ID 传递、URDF RPY 修复、首帧回放和自动取景，以及 Helios 的显示适配：
 
@@ -66,7 +66,7 @@ Core 变更需要在 `4paradigm/phanthymotus` 单独提交评审；仅更新 Dri
 仓库根目录安装本 Driver 的 requirements 及 pytest 后执行：
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_joints.py tests/test_helios_battery.py tests/test_helios_torque.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_joints.py tests/test_helios_battery.py tests/test_helios_torque.py tests/test_helios_model.py
 python scripts/check_service_yml.py rokae/helios
 ```
 

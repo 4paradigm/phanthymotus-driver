@@ -6,11 +6,10 @@ import json
 import os
 import threading
 import time
-import xml.etree.ElementTree as ET
-from pathlib import Path
 
 from common.vendor_runtime import tool
-from .feedback import FeedbackClient, ScopeFeedbackClient, JOINT_NAMES, positive_number, validate_url
+from .feedback import FeedbackClient, ScopeFeedbackClient, positive_number, validate_url
+from .model import fetch_model
 
 
 class HeliosJoints:
@@ -29,11 +28,9 @@ class HeliosJoints:
             {"topic": f"/{namespace}/state/joints", "format": "sensor/skeleton"},
             {"topic": f"/{namespace}/state/joint_status", "format": "data/json"},
         ]
-        self._urdf = Path(__file__).with_name("resource").joinpath("helios.urdf").read_text()
-        root = ET.fromstring(self._urdf)
-        actual = {j.get("name") for j in root.findall("joint") if j.get("type") != "fixed"}
-        if actual != set(JOINT_NAMES):
-            raise ValueError("URDF movable joints do not match the iNex state mapping")
+        self._model_lock = threading.Lock()
+        self._model_url = None
+        self._urdf = None
 
     def _new_client(self, url, *, scope=False):
         cls = ScopeFeedbackClient if scope else FeedbackClient
@@ -119,7 +116,16 @@ class HeliosJoints:
     def dispatch(self, action, args):
         name = args.get("_tool_name", action)
         if name == "model":
-            return {"urdf": self._urdf, "display_name": "珞石 Helios-2.1"}
+            # A missing model must not prevent battery/joint subscriptions from starting.
+            # Separate lock keeps network reads out of the sensor lifecycle lock.
+            with self._model_lock:
+                url = self.client.url
+                if self._model_url != url:
+                    model = fetch_model(url, self._config.get("connect_timeout_s", 3))
+                    if self.client.url != url:
+                        raise RuntimeError("state endpoint changed while reading model; retry")
+                    self._urdf, self._model_url = model, url
+                return {"urdf": self._urdf, "display_name": "珞石 Helios-2.1"}
         if name != "joints":
             return None
         with self._lock:
