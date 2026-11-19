@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from controlled_spatial import ControlledSpatialPlugin, SpatialStore
-from spatial_client import JatenClient, NavigationStateUnavailable
+from spatial_client import JatenClient, MapCommandRejected, NavigationStateUnavailable
 
 
 def wait(predicate, timeout=2):
@@ -580,6 +580,43 @@ class SpatialTests(unittest.TestCase):
         self.assertTrue(self.client.feedback['agvState']['softwareEstop'])
         self.assertFalse(self.client.feedback['state']['agvPosition']['positionInitialized'])
         self.assertEqual(self.navigate()['state'], 'error')
+
+    def test_loading_waits_for_mode_feedback_after_command_ack(self):
+        original_command, original_observe = self.client.command, self.client.observe
+        pending, observed = [], []
+        def command(method, params, timeout):
+            if method == 'ChangeMode':
+                self.client.commands.append((method, params))
+                pending[:] = [params['mode']]
+            else:
+                if method == 'ChangeCartoMap':
+                    self.assertEqual(self.client.feedback['agvState']['runningMode'], 'MANUAL')
+                    self.assertIn('MANUAL', observed)
+                original_command(method, params, timeout)
+        def observe(required=None):
+            if pending and required == ('agvState',):
+                self.client.feedback['agvState']['runningMode'] = pending.pop()
+                observed.append(self.client.feedback['agvState']['runningMode'])
+            return original_observe(required)
+        self.client.command, self.client.observe = command, observe
+        self.call('load_map', map_name='other')
+        self.assertEqual(self.completed()[0], 'completed')
+        self.assertEqual(observed, ['MANUAL', 'AUTO'])
+
+    def test_explicit_mode_precondition_rejection_does_not_latch_map_busy(self):
+        original = self.client.command
+        def command(method, params, timeout):
+            if method == 'ChangeCartoMap':
+                raise MapCommandRejected(method, 8211)
+            original(method, params, timeout)
+        self.client.command = command
+        self.call('load_map', map_name='other')
+        status, result = self.completed()
+        self.assertEqual(status, 'error')
+        self.assertEqual(result['reason'], 'factory_map_command_rejected')
+        self.assertEqual(result['failed_stage'], 'ChangeCartoMap')
+        self.assertFalse(self.plugin.unresolved())
+        self.assertEqual(self.client.identity[0], 'factory')
 
     def test_save_waits_for_factory_optimization_without_short_rpc_timeout(self):
         self.call('start_mapping', map_name='new')

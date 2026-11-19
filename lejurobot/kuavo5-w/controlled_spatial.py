@@ -8,7 +8,7 @@ import threading
 import time
 from uuid import uuid4
 
-from spatial_client import JatenClient, NavigationStateUnavailable
+from spatial_client import JatenClient, MapCommandRejected, NavigationStateUnavailable
 
 
 def text(value, field):
@@ -370,7 +370,7 @@ class ControlledSpatialPlugin:
             if action == 'info':
                 mapping = self.store.state('mapping')
                 startup = self.startup_status()
-                result = {'state': startup['state'] if startup['state'] in ('loading', 'error') else 'mapping' if mapping else 'ready', 'mapping': mapping,
+                result = {'state': startup['state'] if startup['state'] in ('loading', 'error') else 'transition' if self._map_pending else 'mapping' if mapping else 'ready', 'mapping': mapping,
                           'remote_task': self._task, 'command_delivery_uncertain': self._uncertain,
                           'map_transition': self._map_pending, 'chassis_preparation': self._preparation,
                           'startup': startup}
@@ -637,9 +637,17 @@ class ControlledSpatialPlugin:
                 self._persist()
                 self.bundle.tracker.finish('base', aid, self.PREFIX, 'completed', result)
             except Exception as exc:
+                failed_stage = (self._map_pending or {}).get('stage')
+                # 8211 is the verified native precondition rejection, before
+                # ChangeCartoMap touches the map. No mutation is still running.
+                if (action == 'load_map' and isinstance(exc, MapCommandRejected)
+                        and exc.method == 'ChangeCartoMap' and exc.code == 8211):
+                    self._map_pending = None
+                    self._persist()
                 self.bundle.tracker.finish('base', aid, self.PREFIX, 'error',
-                    {'reason': 'map_transition_unconfirmed_inspect_info',
-                     'failed_stage': (self._map_pending or {}).get('stage'),
+                    {'reason': 'factory_map_command_rejected' if isinstance(exc, MapCommandRejected)
+                               else 'map_transition_unconfirmed_inspect_info',
+                     'failed_stage': failed_stage,
                      'error_type': type(exc).__name__, 'map_state': self.store.state('mapping')})
             finally:
                 self._workers.discard(threading.current_thread())
@@ -740,6 +748,9 @@ class ControlledSpatialPlugin:
         self.client.command(method, params, timeout=min(1500 if method == 'SaveCartoMap' else 25, remaining))
         if cancelled.is_set():
             raise RuntimeError('map_operation_interrupted_inspect_map_state')
+        if method == 'ChangeMode':
+            self._wait(lambda: self.client.observe(required=('agvState',))['agvState'].get('runningMode')
+                       == params['mode'], cancelled)
 
     def _load(self, name, cancelled):
         self._command('ChangeMode', {'mode': 'MANUAL'}, cancelled)

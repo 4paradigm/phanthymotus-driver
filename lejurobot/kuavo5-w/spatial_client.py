@@ -17,6 +17,13 @@ import urllib.request
 from bootstrap import load_secrets
 
 
+class MapCommandRejected(RuntimeError):
+    def __init__(self, method, code=None):
+        self.method = method
+        self.code = code if type(code) is int else None
+        super().__init__('factory_map_command_rejected')
+
+
 class NavigationStateUnavailable(RuntimeError):
     """Bounded diagnostics for a read-only, retryable state acquisition."""
     def __init__(self, missing, reason='timeout'):
@@ -149,7 +156,8 @@ class JatenClient:
                 if (frame.get('type') == 'taskResult' and isinstance(data, dict)
                         and data.get('id') == request_id and data.get('method') == method):
                     if data.get('error'):
-                        raise RuntimeError('factory_map_command_rejected')
+                        error = data['error']
+                        raise MapCommandRejected(method, error.get('code') if isinstance(error, dict) else None)
                     return data
         # Never retry a mutation: a lost acknowledgement is uncertain delivery.
         raise TimeoutError('factory_map_command_result_unconfirmed')
