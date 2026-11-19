@@ -700,6 +700,6 @@ requires fresh `/enable_vel_control_state` feedback. Otherwise upper MPC output
 can select `nav_mpc_move_base` and override the native navigation velocity.
 `base_drive` and `base_servo` restore this switch before publishing; starting
 mapping restores the upper MPC remote-control route without resuming motors.
-Stops retain the software stop. A known native task is not forgotten if the
-factory status still reports it running after cancellation, even when odometry
-is stationary. Inspect/reconcile that factory task before releasing the stop.
+Stops retain the software stop and require native cancellation plus fresh
+stationary odometry. Factory historical task queries can retain status 1 after
+a goal has been replaced; that history alone does not prove it is still active.

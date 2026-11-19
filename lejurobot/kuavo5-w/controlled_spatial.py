@@ -557,8 +557,7 @@ class ControlledSpatialPlugin:
             if self._task is None and not self._uncertain:
                 return
             uncertain = self._uncertain
-            task_id = (self._task or {}).get('task_id')
-            response = self.client.native('cancel', **({'task_id': task_id} if task_id else {}))
+            response = self.client.native('cancel')
             if response.get('success') is not True or response.get('stationary') is not True:
                 raise RuntimeError('native_navigation_stop_unconfirmed')
             if uncertain:

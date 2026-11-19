@@ -282,13 +282,6 @@ def main(request):
         if not response.success:
             raise RuntimeError('native_navigation_cancel_rejected')
         confirm_stationary(rospy, Odometry)
-        task_id = args.get('task_id')
-        if task_id:
-            status = rospy.ServiceProxy(names['check'], types['check'])(
-                task_id=task_id, blocking=False, timeout=0.)
-            if (status.success is not True or type(status.status) is not int
-                    or status.status not in (0, 2, 3)):
-                raise RuntimeError('native_cancel_task_still_running_or_unconfirmed')
         return {'success': True, 'stationary': True,
                 'completion_basis': 'native_cancel_and_fresh_stationary_odometry'}
     return {name: getattr(response, name) for name in response.__slots__}
