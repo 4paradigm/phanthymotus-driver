@@ -513,11 +513,11 @@ are valid URDF and this bundle does not run dynamics.
 
 The camera sits above the waist. Its parent link is `base_link`.
 
-> **ASSUMED — not yet verified on the robot.** The deciding test (task T1 §5.3)
-> is: stand the robot, yaw `waist_yaw` 30°, and watch whether the camera image
-> follows. If it follows, the parent must be `waist_yaw_link` (the whole tree is
-> wrong on a turn otherwise); if it does not, `base_link` is correct. This has not
-> been run, so `base_link` is recorded as an assumption, not a measurement.
+> **ASSUMED — not yet verified on the robot.** The deciding test is: stand the
+> robot, yaw `waist_yaw` 30°, and watch whether the camera image follows. If it
+> follows, the parent must be `waist_yaw_link` (the whole tree is wrong on a turn
+> otherwise); if it does not, `base_link` is correct. This has not been run, so
+> `base_link` is recorded as an assumption, not a measurement.
 
 ### Mount translation
 
@@ -533,13 +533,13 @@ visual target by a constant. The current value is `0 0 0`.
 
 ### Two frames, two input conventions
 
-Vision inputs arrive in more than one convention, so there are two frames and the
-converting card only has to pick the right parent — no extra rotation:
+Vision inputs arrive in more than one convention, so there are two frames and a
+consumer only has to pick the right parent — no extra rotation:
 
 | Input convention | Parent frame |
 | --- | --- |
 | optical axes (x right / y down / z forward) — YOLO, AR tag, external recognition | `camera_optical_frame` |
-| body axes with origin at the camera (x forward / y left / z up) — `upper_body_track_spec.camera_to_body()` | `camera_link` |
+| body axes with origin at the camera (x forward / y left / z up) — e.g. a pose whose translation is ignored and whose axes are already body-aligned | `camera_link` |
 
 The `camera_link → camera_optical_frame` rotation is `rpy = (-π/2, 0, -π/2)`,
 the same rotation as `calibration.camera_to_body.quaternion` `[-0.5, 0.5, -0.5,
@@ -562,9 +562,17 @@ These two pairs are the **same physical frames under different names**, not two
 separate cameras. Today the URDF tree (`base_link → camera_link →
 camera_optical_frame`) and the odometry tree (`bumi_visual_<uuid>_base →
 <hostname>_rgb_optical`) are **two disconnected trees** — a
-`lookup(base_link → <hostname>_rgb_optical)` reports `not connected`. They must
-be joined explicitly by the tf-tree card (T3) through its `frame_links` config
-(a `camera_link → bumi_visual_*_base` identity link), not assumed; the
-conversion card (T2) does not hard-code a parent frame and prefers the
-`frame_id` carried in the input JSON. See `02_命名与撞车筛查.md` §3.1 for the
-full collision analysis.
+`lookup(base_link → <hostname>_rgb_optical)` reports `not connected`.
+
+Connecting them is **not part of this change**: this change only declares the
+frames in the URDF asset. The only broadcaster in this bundle today is
+`visual_odometry.py`, which publishes the estimator-private
+`bumi_visual_<uuid>_base → <hostname>_rgb_optical` pair; nothing yet publishes
+the `base_link → camera_link → camera_optical_frame` static chain onto
+`/tf_static`. Until that broadcaster exists, `lookup(base_link →
+camera_optical_frame)` reports `not connected` by design, not by accident. A
+future consumer that publishes that chain (or runs a correctly configured
+`robot_state_publisher`) must link the two trees explicitly — e.g. a
+`camera_link → bumi_visual_*_base` identity link — rather than assume they
+coincide, and must not hard-code a parent frame in place of the `frame_id`
+already carried by the input image header.
