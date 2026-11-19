@@ -395,6 +395,7 @@ class LocoPlugin:
         # START is a toggle. An unconfirmed request must block all local paths
         # from issuing it again until enabled mode is observed.
         self._enable_unconfirmed = False
+        self._mode_toggle_target = None
         # ACP async completion for rotate: worker thread + the single active
         # action whose terminal callback fires exactly once.
         self._rotate_worker: threading.Thread | None = None
@@ -438,8 +439,8 @@ class LocoPlugin:
         # operation sole velocity ownership until its mode edge is released.
         self._set_servo_velocity_owner(True)
 
-    def publish_enable_if_disabled(self, cancel_event) -> int | None:
-        """Recheck the mode and issue START under the shared publisher lock."""
+    def publish_mode_toggle(self, cancel_event, expected_mode: int, target_mode: int) -> int | None:
+        """Issue START only if the mode remains the observed source mode."""
         with self._lock:
             delay = 0.002 - (time.monotonic() - self._last_cmd_time)
             if delay > 0:
@@ -447,9 +448,10 @@ class LocoPlugin:
             if cancel_event.is_set():
                 return None
             mode = int(self._high_ctrl.get_mode())
-            if mode != 30:
+            if mode != expected_mode:
                 return mode
             command = _get_control_cmd("START")
+            self._mode_toggle_target = target_mode
             self._enable_unconfirmed = True
             self._high_ctrl.publish_cmd(0, 0, 0, command, 0)
             self._last_cmd_time = time.monotonic()
@@ -1580,7 +1582,7 @@ class LocoPlugin:
 
         steps = []
         mode = int(self._high_ctrl.get_mode())
-        if mode == 0:
+        if self._enable_unconfirmed and mode == self._mode_toggle_target:
             self._enable_unconfirmed = False
         if mode == 26:
             return self._protection_error(requested_action, steps, mode)
@@ -1634,6 +1636,7 @@ class LocoPlugin:
     def _run_preparation_step(self, step: str, command_name: str,
                               expected_modes: set[int], steps: list[dict]) -> int:
         if command_name == "START":
+            self._mode_toggle_target = 0
             self._enable_unconfirmed = True
         observed = self._send_edge_and_wait(
             _get_control_cmd(command_name), expected_modes | {26}, timeout_s=3.0)

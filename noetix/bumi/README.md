@@ -370,7 +370,7 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 
 ## Direct action cards
 
-### Exit disabled mode: `motor_enable`
+### Motor mode: `motor_enable`
 
 `motor_enable` is a standalone actuator plugin, controlled by
 `plugins.motor_enable.enabled`. It does not require `loco` or any other card to
@@ -380,16 +380,18 @@ the existing HighController connection and has no additional worker.
 - `start` / `stop` are lifecycle actions and never toggle motor power. `stop`
   cancels pending observation; it cannot undo a START already delivered.
 - `info` reads workmode and whether an earlier enable attempt remains uncertain.
-- `enable(confirm=true)` requires safe face-up placement on a flat, non-slip
+- `enable` requires safe face-up placement on a flat, non-slip
   surface, free joints and a clear movement area. Enabling can move joints to
   zero; it does not stand the robot up or start walking.
-- From disabled (30), send START once, release it with DEFAULT, and wait up to
-  3 seconds for enabled (0). Already enabled is a no-op. Protection (26), ready,
-  walking, action and unknown modes are refused. Active chassis actions are
-  refused; the streaming servo is paused and shared publishing is serialized.
+- `disable` requests disabled mode (30). Motors stop active output and the robot
+  can fall; place or support it safely before using this action.
+- Both actions send START once only when a transition is needed, release it with
+  DEFAULT, and wait up to 3 seconds for the requested mode. Protection (26) and
+  unknown modes are refused. Active chassis actions are refused; the streaming
+  servo is paused and shared publishing is serialized.
 - Missing/failed feedback is not success. An uncertain START attempt blocks
   another START through this card or automatic action preparation during
-  this driver process. Observing 0 on a subsequent `enable` clears that guard
+  this driver process. Observing the requested target mode on a subsequent call clears that guard
   without publishing. Restarting the driver clears the in-memory guard; it is
   not a recovery action and must not be used to blindly retry.
 
