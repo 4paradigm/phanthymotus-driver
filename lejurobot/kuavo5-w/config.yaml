@@ -47,6 +47,8 @@ sensors:
 controlled_spatial:
   # Only the factory ID-1 movement song; TTS and warning tracks are preserved.
   motion_music_enabled: false
+  # Silence only factory ID-7 standby prompt; preserve alarms and speaker/TTS.
+  standby_voice_enabled: false
 plugins:
   base_servo: {enabled: true}
   base_drive: {enabled: true}

@@ -127,6 +127,9 @@ class Client:
             'localizationStatus': {'cartoStatusId': 1}}
 
     def native(self, operation, **args):
+        if operation == 'standby_voice':
+            self.standby_requests = getattr(self, 'standby_requests', []) + [args]
+            return {'state': 'disabled'}
         if operation == 'motion_music':
             self.music_requests = getattr(self, 'music_requests', []) + [args]
             return {'state': 'disabled'}
@@ -659,6 +662,8 @@ class BundleIntegrationTests(unittest.TestCase):
                     if automation:
                         bundle.spatial._music_thread.join(2)
                         self.assertEqual(client.music_requests, [{'enabled': enabled}])
+                        self.assertEqual(client.standby_requests, [{'enabled': False}])
+                        self.assertEqual(bundle.spatial.startup_status()['standby_voice']['state'], 'disabled')
                         self.assertEqual(bundle.spatial.startup_status()['motion_music']['state'], 'disabled')
                     else:
                         self.assertFalse(getattr(client, 'music_requests', []))
@@ -669,6 +674,26 @@ class BundleIntegrationTests(unittest.TestCase):
                     self.assertFalse(ros.published)
                 finally:
                     bundle.close()
+
+    def test_standby_is_configured_even_if_movement_track_fails(self):
+        with tempfile.TemporaryDirectory() as folder:
+            bundle = Bundle()
+            bundle.startup_checks = types.SimpleNamespace(provisioner=types.SimpleNamespace(
+                enabled=True, _target=lambda role: {}))
+            client = Client()
+            def native(operation, **args):
+                if operation == 'motion_music':
+                    raise ConnectionError('offline')
+                self.assertEqual((operation, args), ('standby_voice', {'enabled': False}))
+                return {'state': 'disabled'}
+            client.native = native
+            plugin = ControlledSpatialPlugin(bundle, {'db_path': folder + '/db'}, client)
+            try:
+                plugin.start_background()
+                wait(lambda: plugin.startup_status()['standby_voice']['state'] == 'disabled')
+                self.assertEqual(plugin.startup_status()['motion_music']['state'], 'unavailable')
+            finally:
+                plugin.close()
 
     def test_music_failure_is_visible_and_retry_wait_is_cancellable(self):
         with tempfile.TemporaryDirectory() as folder:

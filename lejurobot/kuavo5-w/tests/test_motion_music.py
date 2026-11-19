@@ -41,3 +41,27 @@ class MotionMusicTests(unittest.TestCase):
                 self.assertEqual(rpc.configure_motion_music(False, directory)['state'], 'unsupported')
             self.assertEqual(track.read_bytes(), b'original')
             self.assertFalse((directory / '.motus-motion-music').exists())
+
+
+class StandbyVoiceTests(unittest.TestCase):
+    def test_independent_backup_restore_preserves_movement_alarm_and_tts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            names = ('1_flower.mp3', '2_alarm.mp3', '7_standby.mp3', 'tts.wav')
+            for name in names:
+                (directory / name).write_bytes(name.encode())
+            def encode(command, **kwargs):
+                Path(command[-1]).write_bytes(b'silent fixture')
+            with patch('shutil.which', return_value='/usr/bin/ffmpeg'), patch('subprocess.run', side_effect=encode):
+                self.assertEqual(rpc.configure_motion_music(False, directory)['state'], 'disabled')
+                result = rpc.configure_standby_voice(False, directory)
+                self.assertEqual(result['scope'], 'factory_id7_standby_track_only')
+                self.assertFalse(rpc.configure_standby_voice(False, directory)['changed'])
+                self.assertEqual((directory / '2_alarm.mp3').read_bytes(), b'2_alarm.mp3')
+                self.assertEqual((directory / 'tts.wav').read_bytes(), b'tts.wav')
+                rpc.configure_standby_voice(True, directory)
+                self.assertEqual((directory / '7_standby.mp3').read_bytes(), b'7_standby.mp3')
+                self.assertEqual((directory / '1_flower.mp3').read_bytes(), b'silent fixture')
+                (directory / '7_standby.mp3').write_bytes(b'operator edit')
+                self.assertEqual(rpc.configure_standby_voice(False, directory)['state'], 'blocked')
+                self.assertEqual((directory / '7_standby.mp3').read_bytes(), b'operator edit')

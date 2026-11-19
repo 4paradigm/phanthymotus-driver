@@ -416,11 +416,13 @@ EOF只作结束标记跳过，后续PCM继续播放；如需清空已排队PCM�
 - 双臂 `set` 可填写`left_joint_1_rad`…`left_joint_7_rad`、`right_joint_1_rad`…`right_joint_7_rad`中的任意关节，单位**rad**。左右臂1、4、7号关节相对于厂商原始数据反向；其余保持厂商方向。只转换明确填写的目标，未填关节保留实际位置，原始joint_state及URDF不反向。
   省略、null或空白表示保持当前实测位置；0是有效目标；全部为空拒绝。实际发送前重新取未指定关节的实测值。`zero`同时归零全部14个手臂关节。字段description包含实时限位（rad/度），方向反转后的上下界也同步转换；未发现限位时不声明虚构范围且拒绝执行。旧完整`move_joints`度数组保持原始厂商方向，未在UI展示。
 - 下肢 `leg` 包含膝、腿、腰俯仰与偏航，删除重复的`waist`卡。`set`接受`knee_deg`、`leg_deg`、`waist_pitch_deg`、`waist_yaw_deg`的一个或多个绝对**度**值；省略时保持实测值。`zero`归零全部4关节。兼容`move_joints(positions)`四个度值。
-  `set_height(height)`接受`waist_yaw_link`相对`base_link`的绝对高度m，保守范围0.74–1.06。根据实时URDF和实测位置求逆解，保持躯干x/俯仰及腰偏航，通过厂商`/cmd_lb_torso_pose`联动膝、腿、腰；ACP仍用真实关节收敛确认。不支持的轴/固定变换、不可达高度和越界逆解在恢复控制前拒绝，不能把该范围内任意高度理解为任何姿态都可达。
+  `set_height(height)`接受`waist_yaw_link`原点在`base_link`坐标系中的绝对Z坐标（m），不是头顶离地高度。厂商轮臂API的`/cmd_lb_torso_pose.linear.z`及控制器`task.info`中的`baseFrame/torsoFrame`定义了这一参考系。此前0.74–1.06只是驱动固定筛选值，没有足够依据作为该机器人的实际工作范围，现已移除。先调用`get_height`获取实测`height_m`与当前姿态下的`reachable_height_intervals_m`：由实时URDF和关节限位求解析边界，保持躯干x/俯仰及腰偏航；这些是运动学可达区间，并非碰撞/负载安全认证。不可达请求返回当前值和区间，不静默夹紧。通过厂商`/cmd_lb_torso_pose`联动膝、腿、腰，ACP仍用真实关节收敛确认；不支持的几何或缺失反馈在恢复控制前拒绝。
 - 头部 `move_pos(yaw,pitch)` 为绝对**度**，yaw范围[-30,30]、pitch[-25,25]；**Pitch正值向上、负值向下**，只转换卡片输入，原始反馈不改。至少填一轴；省略轴在实际发令前取实测角度。`zero`两个轴归零。
   实机厂商位置环存在数度偏差，目前没有经过验证的反馈补偿参数。`move_pos/zero`保留ACP：发送成功返回`state: executing`和`action_id`，随后发送`completed`回调；`completion_basis: absolute_command_sent`、`measured_convergence: false`明确表示命令发送完成。仅预留0.2s异步回执交接窗口，不等待20s，也不声明实测到位。窗口内中断会发送一次cancelled，不再补发completed。仍要求新鲜、模型有效的关节反馈以保持未填轴，发送异常仍按不确定运动指令暂停处理。没有修改增益、零点或伪造joint_state。
 
-`controlled_spatial.motion_music_enabled: false`（默认）在容器启动后独立后台执行，无需启动底盘卡；连接暂不可用时每30秒重试，不触发取消任务、解除急停或电机使能。仅把已核实的厂商ID-1运动曲目`1_flower.mp3`替换为有效静音MP3；原件与SHA256记录保存在同目录`.motus-motion-music/`，设为true可恢复。保留ID-2告警、待命、充电、障碍提示和TTS，不改变系统音量、不重启底盘管理节点。使用底盘已有ffmpeg，不自动安装新包；未知文件布局、缺少ffmpeg或操作员已改动曲目时返回unsupported/blocked，显示在`info.startup.motion_music`。已经开始的播放可能到本次结束后才静音。
+`controlled_spatial.motion_music_enabled: false`（默认）在容器启动后独立后台执行，无需启动底盘卡；连接暂不可用时每30秒重试，不触发取消任务、解除急停或电机使能。仅把已核实的厂商ID-1运动曲目`1_flower.mp3`替换为有效静音MP3；原件与SHA256记录保存在同目录`.motus-motion-music/`，设为true可恢复。保留ID-2告警、充电、障碍提示和TTS，不改变系统音量、不重启底盘管理节点。使用底盘已有ffmpeg，不自动安装新包；未知文件布局、缺少ffmpeg或操作员已改动曲目时返回unsupported/blocked，显示在`info.startup.motion_music`。已经开始的播放可能到本次结束后才静音。
+
+`controlled_spatial.standby_voice_enabled: false`（默认）同样在容器启动时关闭厂商ID-7“待命中”曲目`7_standby.mp3`，独立备份至`.motus-standby-voice/`；设为true恢复。状态显示在`info.startup.standby_voice`。两项音频设置独立处理，任一失败不会阻止另一项；不关闭speaker/TTS或报警音。
 
 上述速度和时长上限属于**驱动策略**，不代表厂家最大能力或完整的工作空间、关节限位及碰撞保护。
 末端和躯干目标仍需由调用方根据机器人实际安全工作空间设置；关节限位检查不等同于碰撞保护。

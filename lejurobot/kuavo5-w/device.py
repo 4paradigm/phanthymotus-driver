@@ -851,17 +851,20 @@ class LowerBodyPlugin(_KuavoPlugin):
             return self.schema("Kuavo 5-W 下肢含膝、腿、腰俯仰/偏航；set_height保持躯干前后位置和俯仰，协调前三关节升降。", {
                 **{field: {'type': 'number', 'description': label + '绝对角度，度；set省略时保持实测值'}
                    for field, (_, label) in self.FIELDS.items()},
-                "height": {"type": "number", "minimum": .74, "maximum": 1.06, "description": "0.74–1.06 m；waist_yaw_link相对底盘的绝对高度，不可达时拒绝"},
+                "height": {"type": "number", "description": "动态可达范围见get_height，单位m；waist_yaw_link原点相对base_link的Z坐标，非头顶离地高度"},
                 "positions": _array_schema(4, "四个下肢关节目标角度，度")}, {
-                'set_height': (['height'], '0.74–1.06 m；协调膝、腿、腰俯仰垂直升降，保持当前躯干x/俯仰和腰偏航'),
+                'get_height': ([], '动态可达范围与当前高度，单位m；保持当前躯干x/俯仰和腰偏航，基于实时URDF和关节限位'),
+                'set_height': (['height'], '动态可达范围见get_height，单位m；协调膝、腿、腰垂直升降，保持当前躯干x/俯仰和腰偏航'),
                 'set': (list(self.FIELDS), '按名称设置部分/全部下肢关节绝对角度，度；至少填写一个'),
                 'zero': ([], '四个下肢关节归零，包含腰部；需现场核验限位'),
                 "move_joints": (["positions"], "设置四个下肢关节角度，需配置现场核验的关节限位"),
                 "stop_move": ([], "请求全身软件暂停")}, "lower_body", ('set', 'zero', 'set_height', "move_joints"),
                 required={"move_joints": ["positions"], "set_height": ["height"]})
     def _dispatch(self, action, args):
+        if self.PREFIX == 'leg' and action == 'get_height':
+            return {'state': 'ready', **self.bundle.sensors.height_state()}
         if self.PREFIX == 'leg' and action == 'set_height':
-            height = _number(args.get('height'), 'height', .74, 1.06)
+            height = _number(args.get('height'), 'height')
             target, torso = [0.] * 4, {}
             def validate():
                 candidate, pose = self.bundle.sensors.height_target(height, with_pose=True)

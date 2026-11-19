@@ -1880,6 +1880,44 @@ class CardRevisionTests(unittest.TestCase):
         self.assertAlmostEqual(self.ros.published[-1][2]['linear']['z'], 1.02)
         self.assertAlmostEqual(self.ros.published[-1][2]['linear']['x'], fk(q)[0])
 
+    def test_height_query_reports_actual_origin_and_pose_dependent_range_without_motion(self):
+        self.vendor_model()
+        status = self.call('leg', 'get_height')
+        self.assertEqual(status['state'], 'ready')
+        self.assertEqual(status['frame_id'], 'base_link')
+        self.assertEqual(status['target_frame'], 'waist_yaw_link')
+        self.assertAlmostEqual(status['height_m'], .96901)
+        intervals = status['reachable_height_intervals_m']
+        self.assertGreater(intervals[-1][1], 1.06)
+        self.assertGreater(intervals[0][0], .74)
+        error = self.call('leg', 'set_height', height=.8)
+        self.assertEqual(error['state'], 'error')
+        self.assertIn('current=', error['error'])
+        self.assertIn('reachable_intervals_m=', error['error'])
+        self.assertFalse(self.ros.published)
+        self.assertFalse(self.ros.sent_services)
+        self.ros.raw(q=[.2,-.4,.2,0.]+[0.]*16)
+        self.assertNotEqual(self.call('leg', 'get_height')['reachable_height_intervals_m'], intervals)
+
+    def test_height_interval_endpoints_and_interior_match_fk_and_joint_limits(self):
+        self.vendor_model()
+        for q in ([0.,0.,0.,0.], [.2,-.4,.2,.1], [.7,-1.2,.5,0.]):
+            self.ros.raw(q=q+[0.]*16)
+            status = self.bundle.sensors.height_state()
+            bounds = self.bundle.sensors.joint_bounds('leg')
+            for lo, hi in status['reachable_height_intervals_m']:
+                for z in (lo, (lo+hi)/2, hi):
+                    target = self.bundle.sensors.height_target(z)
+                    a,b,c = target[:3]
+                    actual_z = (.40635+.46521*math.sin(a)+.18325*math.cos(a)
+                                -.48296*math.sin(a+b)+.12941*math.cos(a+b)+.25*math.cos(a+b+c))
+                    actual_x = (.093-.46521*math.cos(a)+.18325*math.sin(a)
+                                +.48296*math.cos(a+b)+.12941*math.sin(a+b)+.25*math.sin(a+b+c))
+                    self.assertAlmostEqual(actual_z, z, places=7)
+                    self.assertAlmostEqual(actual_x, status['x_m'], places=7)
+                    self.assertAlmostEqual(sum(target[:3]), sum(q[:3]), places=7)
+                    self.assertTrue(all(low <= v <= high for v,(low,high) in zip(target,bounds)))
+
     def test_height_rejects_unreachable_or_unknown_geometry_without_enabling(self):
         self.vendor_model()
         self.assertEqual(self.call('leg', 'set_height', height=.74)['state'], 'error')

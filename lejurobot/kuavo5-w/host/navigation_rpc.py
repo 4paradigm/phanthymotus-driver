@@ -42,29 +42,38 @@ def dispatch_service_class(service_class, server_md5):
 
 
 def configure_motion_music(enabled, directory=Path.home() / 'jmap_config/music'):
-    """Replace only the verified ID-1 movement track with valid silent MP3.
+    """Configure only the verified ID-1 movement track, reversibly."""
+    return _configure_factory_track(enabled, directory, 'movement')
 
-    Preserve the original and its digest; never mute a sink, stop the factory
-    manager, or alter ID-2 alarm / standby / TTS files. An unknown or externally
-    edited layout is reported, not overwritten.
-    """
+
+def configure_standby_voice(enabled, directory=Path.home() / 'jmap_config/music'):
+    """Configure only the verified ID-7 standby voice, not TTS or alarms."""
+    return _configure_factory_track(enabled, directory, 'standby')
+
+
+def _configure_factory_track(enabled, directory, kind):
+    # Fixed whitelist: remote requests cannot select arbitrary audio files.
+    filename, backup_name, scope = {
+        'movement': ('1_flower.mp3', '.motus-motion-music', 'factory_id1_movement_track_only'),
+        'standby': ('7_standby.mp3', '.motus-standby-voice', 'factory_id7_standby_track_only'),
+    }[kind]
     import shutil
     import subprocess
     import tempfile
     if type(enabled) is not bool:
-        raise ValueError('motion_music_enabled_must_be_boolean')
-    track = directory / '1_flower.mp3'
-    backup = directory / '.motus-motion-music'
+        raise ValueError('factory_audio_enabled_must_be_boolean')
+    track = directory / filename
+    backup = directory / backup_name
     original, silent, record = [backup / n for n in ('original.mp3', 'silent.mp3', 'identity.json')]
     digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
     if track.is_symlink() or not track.is_file() or not 0 < track.stat().st_size < 4_000_000:
-        return {'state': 'unsupported', 'reason': 'factory_id1_movement_track_not_found'}
+        return {'state': 'unsupported', 'reason': kind + '_track_not_found'}
     if record.is_file():
         identity = json.loads(record.read_text())
         if (not original.is_file() or not silent.is_file() or
                 digest(original) != identity['original'] or digest(silent) != identity['silent'] or
                 digest(track) not in (identity['original'], identity['silent'])):
-            return {'state': 'blocked', 'reason': 'movement_track_changed_by_operator'}
+            return {'state': 'blocked', 'reason': kind + '_track_changed_by_operator'}
     elif enabled:
         return {'state': 'enabled', 'changed': False}
     else:
@@ -73,7 +82,7 @@ def configure_motion_music(enabled, directory=Path.home() / 'jmap_config/music')
             return {'state': 'unsupported', 'reason': 'existing_ffmpeg_required_no_package_installed'}
         backup.mkdir(mode=0o700, exist_ok=True)
         if original.exists() or silent.exists():
-            return {'state': 'blocked', 'reason': 'incomplete_movement_music_backup'}
+            return {'state': 'blocked', 'reason': 'incomplete_' + kind + '_backup'}
         shutil.copyfile(track, original)
         try:
             subprocess.run([ffmpeg, '-nostdin', '-v', 'error', '-f', 'lavfi', '-i',
@@ -99,11 +108,13 @@ def configure_motion_music(enabled, directory=Path.home() / 'jmap_config/music')
         finally:
             temporary_path.unlink(missing_ok=True)
     return {'state': 'enabled' if enabled else 'disabled', 'changed': changed,
-            'scope': 'factory_id1_movement_track_only', 'other_audio_unchanged': True,
+            'scope': scope, 'other_audio_unchanged': True,
             'active_playback_may_finish': True}
 
 
 def main(request):
+    if request['operation'] == 'standby_voice':
+        return configure_standby_voice(request.get('args', {}).get('enabled', False))
     if request['operation'] == 'motion_music':
         return configure_motion_music(request.get('args', {}).get('enabled', False))
     if request['operation'] == 'map_identity':

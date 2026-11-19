@@ -400,6 +400,13 @@ class KuavoSensors:
             return self._joint_bounds(card)
 
     def height_target(self, height, with_pose=False):
+        target, pose, _ = self._height_plan(height)
+        return (target, pose) if with_pose else target
+
+    def height_state(self):
+        return self._height_plan(None)[2]
+
+    def _height_plan(self, height):
         """Planar 3-joint IK from the validated live wheel-arm chain.
 
         Preserve torso x, pitch and waist yaw; reject unknown geometry or
@@ -444,27 +451,80 @@ class KuavoSensors:
             parts = [origins[0], rotate(origins[1], q[0]), rotate(origins[2], q[0]+q[1]), rotate(origins[3], pitch)]
             x = sum(v[0] for v in parts)
             end = rotate(origins[3], pitch)
-            dx, dz = x-origins[0][0]-end[0], height-origins[0][1]-end[1]
+            dx = x-origins[0][0]-end[0]
+            z0 = origins[0][1]+end[1]
             l1, l2 = [math.hypot(*v) for v in origins[1:3]]
             if min(l1, l2) <= 1e-6:
                 raise RuntimeError('invalid_live_leg_link_lengths')
-            cosine = (dx*dx+dz*dz-l1*l1-l2*l2)/(2*l1*l2)
-            if not -1 <= cosine <= 1:
-                raise ValueError('height_is_unreachable_at_current_torso_x_and_pitch')
             a1, a2 = [math.atan2(v[1], v[0]) for v in origins[1:3]]
-            candidates = []
-            for delta in (math.acos(cosine), -math.acos(cosine)):
-                knee = a1-math.atan2(dz, dx)+math.atan2(l2*math.sin(delta), l1+l2*math.cos(delta))
-                leg = a2-a1-delta
-                for turn in (-2*math.pi, 0., 2*math.pi):
-                    k = knee+turn
-                    target = [k, leg, pitch-k-leg, q[3]]
-                    if all(lo <= v <= hi for v, (lo, hi) in zip(target, bounds)):
-                        candidates.append(target)
+
+            def solutions(z):
+                dz = z-z0
+                cosine = (dx*dx+dz*dz-l1*l1-l2*l2)/(2*l1*l2)
+                if not -1-1e-10 <= cosine <= 1+1e-10:
+                    return []
+                candidates = []
+                for delta in (math.acos(max(-1., min(1., cosine))), -math.acos(max(-1., min(1., cosine)))):
+                    knee = a1-math.atan2(dz, dx)+math.atan2(l2*math.sin(delta), l1+l2*math.cos(delta))
+                    leg = a2-a1-delta
+                    # Both revolute angles have equivalent branches. Wrapping
+                    # only the first joint can incorrectly reject a valid IK.
+                    for kt in (-2*math.pi, 0., 2*math.pi):
+                        for lt in (-2*math.pi, 0., 2*math.pi):
+                            k, l = knee+kt, leg+lt
+                            target = [k, l, pitch-k-l, q[3]]
+                            if all(lo-1e-9 <= v <= hi+1e-9 for v, (lo, hi) in zip(target, bounds)):
+                                candidates.append([min(hi, max(lo, v)) for v, (lo, hi) in zip(target, bounds)])
+                return candidates
+
+            # Feasibility changes only at a joint bound or a two-link tangent.
+            # Intersect each boundary circle with the fixed-x vertical line;
+            # test the resulting intervals with the same exact IK as commands.
+            boundaries = []
+            def circle(cx, cz, radius):
+                remaining = radius*radius-(dx-cx)**2
+                if remaining >= -1e-10:
+                    dz = math.sqrt(max(0., remaining))
+                    boundaries.extend((z0+cz-dz, z0+cz+dz))
+            circle(0., 0., l1+l2)
+            circle(0., 0., abs(l1-l2))
+            for k in bounds[0]:
+                v = rotate(origins[1], k)
+                circle(*v, l2)
+            for l in bounds[1]:
+                v = rotate(origins[2], l)
+                circle(0., 0., math.hypot(origins[1][0]+v[0], origins[1][1]+v[1]))
+            for c in bounds[2]:
+                v = rotate(origins[2], pitch-c)
+                circle(*v, l1)
+            boundaries = sorted(set(boundaries))
+            intervals = []
+            for low, high in zip(boundaries, boundaries[1:]):
+                if high-low > 1e-9 and solutions((low+high)/2):
+                    if intervals and abs(intervals[-1][1]-low) < 1e-8:
+                        intervals[-1][1] = high
+                    else:
+                        intervals.append([low, high])
+            for z in boundaries:
+                if solutions(z) and not any(lo-1e-8 <= z <= hi+1e-8 for lo, hi in intervals):
+                    intervals.append([z, z])
+            intervals.sort()
+            current = sum(v[1] for v in parts)
+            status = {'height_m': current, 'frame_id': 'base_link', 'target_frame': 'waist_yaw_link',
+                      'x_m': x, 'pitch_rad': pitch, 'yaw_rad': q[3],
+                      'reachable_height_intervals_m': intervals,
+                      'basis': 'live_urdf_and_joint_limits_at_current_x_pitch_yaw',
+                      'meaning': 'torso_frame_origin_z_relative_to_base_link_not_total_robot_height'}
+            if height is None:
+                return None, None, status
+            candidates = solutions(height)
             if not candidates:
-                raise ValueError('height_would_exceed_live_joint_limits')
+                ranges = ','.join(f'[{lo:.6f},{hi:.6f}]' for lo,hi in intervals) or 'none'
+                raise ValueError(f'height_unreachable_at_current_pose: requested={height:.6f}m; '
+                                 f'current={current:.6f}m; reachable_intervals_m={ranges}; '
+                                 'preserving_torso_x_pitch_yaw_and_live_joint_limits')
             target = min(candidates, key=lambda t: sum((a-b)**2 for a,b in zip(t,q)))
-            return (target, {'x': x, 'z': height, 'pitch': pitch, 'yaw': q[3]}) if with_pose else target
+            return target, {'x': x, 'z': height, 'pitch': pitch, 'yaw': q[3]}, status
 
     def odom_pose(self):
         with self._lock:

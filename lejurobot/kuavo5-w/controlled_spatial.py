@@ -107,6 +107,9 @@ class ControlledSpatialPlugin:
         self._motion_music_enabled = config.get('motion_music_enabled', False)
         if type(self._motion_music_enabled) is not bool:
             raise ValueError('motion_music_enabled must be a boolean')
+        self._standby_voice_enabled = config.get('standby_voice_enabled', False)
+        if type(self._standby_voice_enabled) is not bool:
+            raise ValueError('standby_voice_enabled must be a boolean')
         self.client = client or JatenClient(bundle.startup_checks.provisioner)
         self.store = SpatialStore(config.get('db_path', str(Path(os.environ.get('KUAVO_STATE_DIR', '/config'))
                                                            / 'controlled_spatial.db')))
@@ -118,6 +121,7 @@ class ControlledSpatialPlugin:
         self._startup_key = None
         self._startup_thread = None
         self._music_status = {'state': 'idle'}
+        self._standby_status = {'state': 'idle'}
         self._music_thread = None
         self._closed = threading.Event()
         self._preparation = None
@@ -199,26 +203,33 @@ class ControlledSpatialPlugin:
             return dict(self._startup)
 
     def start_background(self):
-        """Configure the movement track without starting any chassis control."""
+        """Configure factory movement/standby tracks without starting chassis control."""
         with self._startup_guard:
             if self._music_thread is not None or self._closed.is_set():
                 return
             provisioner = self.bundle.startup_checks.provisioner
             if not provisioner.enabled or provisioner._target('chassis').get('enabled', True) is False:
                 self._music_status = {'state': 'skipped', 'reason': 'automatic_chassis_access_disabled'}
+                self._standby_status = dict(self._music_status)
                 return
             self._music_status = {'state': 'loading'}
+            self._standby_status = {'state': 'loading'}
             def worker():
-                while not self._closed.is_set():
-                    try:
-                        status = self.client.native('motion_music', enabled=self._motion_music_enabled)
-                    except Exception:
-                        status = {'state': 'unavailable', 'retry_in_s': 30}
-                    with self._startup_guard:
-                        self._music_status = status
-                    if status.get('state') in ('enabled', 'disabled', 'unsupported', 'blocked'):
-                        return
-                    if self._closed.wait(30):
+                pending = {'motion_music': (self._motion_music_enabled, '_music_status'),
+                           'standby_voice': (self._standby_voice_enabled, '_standby_status')}
+                while pending and not self._closed.is_set():
+                    for operation, (enabled, attribute) in list(pending.items()):
+                        if self._closed.is_set():
+                            return
+                        try:
+                            status = self.client.native(operation, enabled=enabled)
+                        except Exception:
+                            status = {'state': 'unavailable', 'retry_in_s': 30}
+                        with self._startup_guard:
+                            setattr(self, attribute, status)
+                        if status.get('state') in ('enabled', 'disabled', 'unsupported', 'blocked'):
+                            pending.pop(operation)
+                    if pending and self._closed.wait(30):
                         return
             self._music_thread = threading.Thread(target=worker, daemon=True, name='motion-music-start')
             self._workers.add(self._music_thread)
@@ -230,6 +241,7 @@ class ControlledSpatialPlugin:
                       if self._startup_key == (self.bundle._stop_epoch, self.bundle.ros1.connection)
                       else {'state': 'idle'})
             status['motion_music'] = dict(self._music_status)
+            status['standby_voice'] = dict(self._standby_status)
             return status
 
     def _startup_observation(self, epoch):
