@@ -1,7 +1,8 @@
 """Kuavo 5-W cards: documented ROS 1 interfaces -> Agent Core domain 42.
 
-Joint convergence uses real sensorsData positions; base/Cartesian reach-time
-completion remains explicitly an estimate. Never use MPC targets as sensors.
+Joint/head/base completion uses real feedback; approximate completion reports
+its measured residual. Cartesian reach-time remains an explicit estimate.
+Never use MPC targets as sensors.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import ssl
 import threading
 import time
 import urllib.request
+from collections import deque
 from uuid import uuid4
 
 from std_msgs.msg import String
@@ -662,6 +664,43 @@ class _KuavoPlugin:
                 "completion_basis": "continuous_until_stop" if duration == -1 else "command_duration_and_vendor_watchdog"}
 
 
+class _StableFeedback:
+    """A bounded window of distinct measurements, never repeated cache reads."""
+    def __init__(self, duration, linear_count=0, linear_epsilon=.002,
+                 angular_epsilon=.2, angular_period=None):
+        self.duration = duration
+        self.linear_count, self.linear_epsilon = linear_count, linear_epsilon
+        self.angular_epsilon, self.angular_period = angular_epsilon, angular_period
+        self.samples = deque(maxlen=256)
+        self.last_capture = self.last_received = None
+
+    def reset(self):
+        self.samples.clear()
+
+    def update(self, values, captured, received):
+        if self.last_capture is not None and captured <= self.last_capture:
+            return False
+        if self.last_received is not None and received-self.last_received > .35:
+            self.reset()
+        self.last_capture, self.last_received = captured, received
+        self.samples.append((captured, received, tuple(values)))
+        while (len(self.samples) > 2 and captured-self.samples[1][0] >= self.duration
+               and received-self.samples[1][1] >= self.duration):
+            self.samples.popleft()
+        if (len(self.samples) < 3 or captured-self.samples[0][0] < self.duration
+                or received-self.samples[0][1] < self.duration):
+            return False
+        spans = []
+        for i, anchor in enumerate(self.samples[0][2]):
+            values = [sample[2][i]-anchor for sample in self.samples]
+            if i >= self.linear_count and self.angular_period is not None:
+                period = self.angular_period
+                values = [(v+period/2) % period-period/2 for v in values]
+            spans.append(max(values)-min(values))
+        return (math.hypot(*spans[:self.linear_count]) <= self.linear_epsilon
+                and all(v <= self.angular_epsilon for v in spans[self.linear_count:]))
+
+
 class _PoseServo:
     """Bounded integral correction for small-command steady-state error.
 
@@ -730,7 +769,7 @@ class BaseDrivePlugin(_KuavoPlugin):
             "y": {"type": "number", "description": "合位移≤5 m；相对机身Y位移，米"},
             "yaw": {"type": "number", "description": "相对偏航转角，度"},
         }, {"move": (["vx", "vy", "vyaw", "duration"], "0.1–10 s或-1持续至stop_move；本体速度运动，到时发零速度并等待1s停止窗口"),
-            "move_relative": (["x", "y", "yaw", "speed"], "≤5 m；相对执行开始时机身的位移及转角，米/度，里程计闭环，无避障"),
+            "move_relative": (["x", "y", "yaw", "speed"], "≤5 m；到位2cm/1°；稳定残差≤10cm/5°可近似完成并报告误差；相对机身位移/转角，米/度，无避障"),
             "stop_move": ([], "发零速并请求全身软件暂停；下一次新动作自动准备控制")},
             "base", ("move", "move_relative"),
             required={"move": ["duration"], "move_relative": ["x", "y", "yaw"]})
@@ -774,12 +813,25 @@ class BaseDrivePlugin(_KuavoPlugin):
             self.CHANNEL, self.PREFIX, self.ALLOWED_MODES,
             lambda: self.bundle.twist('/cmd_vel'), validate,
             request_epoch=self._request_context.stop_epoch)
+        command_wall = time.time()
         self._pose_progress = {'state': 'executing', 'action_id': aid, 'frame_id': frame[0],
                                'target': {'x_m': target[0], 'y_m': target[1], 'yaw_deg': math.degrees(target[2])}}
         def worker():
             settled = last_capture = None
             servo = _PoseServo(linear, angular)
             best_score, last_progress = float('inf'), issued
+            plateau = _StableFeedback(1., 2, angular_epsilon=math.radians(.2), angular_period=2*math.pi)
+            stopped = _StableFeedback(1.1, 2, angular_epsilon=math.radians(.2), angular_period=2*math.pi)
+            approximate_stop = None
+            def complete(approximate):
+                progress = self._pose_progress
+                error = progress['error']
+                result = {'completion_basis': 'measured_odometry_stable_residual' if approximate else 'measured_odometry_convergence',
+                          'measured_convergence': not approximate, 'approximate': approximate,
+                          'frame_id': progress['frame_id'], 'target': progress['target'], 'measured': progress['measured'], 'error': error,
+                          'message': f"Completed{' approximately' if approximate else ''}; remaining distance {error['position_m']:.4f} m, yaw error {error['yaw_deg']:+.3f} deg."}
+                self._pose_progress = {**progress, 'state': 'completed', 'completion': result}
+                self.tracker.finish(self.CHANNEL, aid, self.PREFIX, 'completed', result)
             try:
                 while not cancelled.wait(.05):
                     with self.tracker.lock:
@@ -799,9 +851,33 @@ class BaseDrivePlugin(_KuavoPlugin):
                         distance = math.hypot(dx, dy)
                         self._pose_progress = {**self._pose_progress,
                             'measured': {'x_m': pose[0], 'y_m': pose[1], 'yaw_deg': math.degrees(pose[2])},
-                            'error': {'position_m': round(distance, 6), 'yaw_deg': round(math.degrees(da), 6)},
+                            'error': {'position_m': round(distance, 6), 'x_m': round(dx, 6), 'y_m': round(dy, 6), 'yaw_deg': round(math.degrees(da), 6)},
                             'elapsed_s': round(time.monotonic()-issued, 3), 'capture_time_s': captured}
                         close = distance <= servo.POSITION_TOLERANCE and abs(da) <= servo.YAW_TOLERANCE
+                        near = distance <= .10 and abs(da) <= math.radians(5.)
+                        now = time.monotonic()
+                        if approximate_stop is not None:
+                            self.bundle.twist('/cmd_vel')
+                            self._pose_progress = {**self._pose_progress, 'command': {'vx_m_s': 0., 'vy_m_s': 0., 'yaw_rad_s': 0.}}
+                            if not near:
+                                raise RuntimeError('base moved outside approximate arrival bounds while stopping')
+                            if stopped.update(pose, captured, now):
+                                complete(True)
+                                return
+                            if now-approximate_stop > 4.:
+                                raise TimeoutError('approximate arrival stop not confirmed')
+                            continue
+                        if near and captured >= command_wall:
+                            stable = plateau.update(pose, captured, now)
+                        else:
+                            plateau.reset()
+                            stable = False
+                        if stable and not close:
+                            approximate_stop = now
+                            self._pose_progress = {**self._pose_progress, 'state': 'stopping', 'approximate': True,
+                                                   'command': {'vx_m_s': 0., 'vy_m_s': 0., 'yaw_rad_s': 0.}}
+                            self.bundle.twist('/cmd_vel')
+                            continue
                         score = max(distance/servo.POSITION_TOLERANCE, abs(da)/servo.YAW_TOLERANCE)
                         if score < best_score-.1:
                             best_score, last_progress = score, time.monotonic()
@@ -815,10 +891,7 @@ class BaseDrivePlugin(_KuavoPlugin):
                                 if settled is None:
                                     settled = (captured, time.monotonic())
                                 elif captured-settled[0] >= .3 and time.monotonic()-settled[1] >= .3:
-                                    self._pose_progress = {**self._pose_progress, 'state': 'completed'}
-                                    self.tracker.finish(self.CHANNEL, aid, self.PREFIX, 'completed', {
-                                        'completion_basis': 'measured_odometry_convergence', 'measured_convergence': True,
-                                        'error': self._pose_progress['error']})
+                                    complete(False)
                                     return
                         else:
                             settled = None
@@ -831,12 +904,13 @@ class BaseDrivePlugin(_KuavoPlugin):
                 self.bundle.pause(_safe_log(str(exc)), status='error', expected=(self.CHANNEL, aid))
             finally:
                 if (cancelled.is_set() and self._pose_progress.get('action_id') == aid
-                        and self._pose_progress.get('state') == 'executing'):
+                        and self._pose_progress.get('state') in ('executing', 'stopping')):
                     self._pose_progress = {**self._pose_progress, 'state': 'cancelled'}
         threading.Thread(target=worker, daemon=True, name='base-pose-feedback').start()
         return {'state': 'executing', 'action_id': aid, 'control_preparation': preparation,
                 'speed': speed, 'linear_limit_m_s': linear, 'angular_limit_deg_s': math.degrees(angular),
-                'completion_basis': 'measured_odometry_convergence',
+                'completion_basis': 'measured_odometry_or_stable_residual',
+                'approximate_limits': {'position_m': .10, 'yaw_deg': 5., 'stable_s': 1.},
                 'expected_duration_s': round(math.hypot(x,y)/linear+abs(yaw)/angular+2., 1),
                 'timeout_s': 110, 'stall_timeout_s': 8}
 
@@ -987,7 +1061,7 @@ class HeadPlugin(_KuavoPlugin):
     PREFIX, CHANNEL = "head", "head"
 
     def tool(self):
-        return self.schema("yaw[-30,30]°、pitch[-25,25]°；Kuavo 5-W头部绝对角度。ACP按指令发送完成回执，不表示实测到位。", {
+        return self.schema("yaw[-30,30]°、pitch[-25,25]°；Kuavo 5-W头部绝对角度。到位≤1°；残差≤5°且稳定1s可近似完成，ACP报告实测误差。", {
             'yaw': {'type': 'number', 'minimum': -30, 'maximum': 30, 'description': '[-30,30]°；偏航绝对角度，不填保持当前实测角度'},
             'pitch': {'type': 'number', 'minimum': -25, 'maximum': 25, 'description': '[-25,25]°；俯仰绝对角度，正值向上，不填保持当前实测角度'},
         }, {'move_pos': (['yaw', 'pitch'], 'yaw[-30,30]°、pitch[-25,25]°；设置绝对角度，至少填一个，未填保持当前角度'),
@@ -1002,7 +1076,7 @@ class HeadPlugin(_KuavoPlugin):
                    if action == 'zero' or _angle_supplied(args, field)}
         if not updates:
             raise ValueError('move_pos requires yaw or pitch; omitted axes keep their measured angles')
-        target_deg, target = [0., 0.], [0., 0.]
+        target_deg = [0., 0.]
         def validate():
             measured = self.bundle.sensors.joint_positions()
             current = [math.degrees(v) for v in measured[0][18:20]]
@@ -1010,7 +1084,6 @@ class HeadPlugin(_KuavoPlugin):
                 current[i] = value
             target_deg[:] = [_number(value, field, low, high)
                              for value, (field, low, high) in zip(current, HEAD_LIMITS_DEG)]
-            target[:] = [math.radians(value) for value in target_deg]
             return measured
         def publish():
             # Cancel residual velocity integration before the SDK's absolute
@@ -1022,17 +1095,54 @@ class HeadPlugin(_KuavoPlugin):
             self.CHANNEL, self.PREFIX, self.ALLOWED_MODES, publish,
             validate, request_epoch=self._request_context.stop_epoch)
 
-        result = {'completion_basis': 'absolute_command_sent', 'measured_convergence': False,
-                  'yaw': target_deg[0], 'pitch': -target_deg[1], 'units': 'deg'}
+        result = {'completion_basis': 'measured_head_or_stable_residual', 'measured_convergence': False,
+                  'yaw': target_deg[0], 'pitch': -target_deg[1], 'units': 'deg',
+                  'approximate_limits': {'max_error_deg': 5., 'stable_s': 1.}}
         def complete():
-            # Let the MCP executing response establish Agent Core's pending
-            # record before delivering the ordinary ACP terminal event.
-            if cancelled.wait(.2):
-                return
-            self.tracker.finish(self.CHANNEL, aid, self.PREFIX, 'completed', result)
-        threading.Thread(target=complete, daemon=True, name='acp-head-command').start()
+            exact = _StableFeedback(.3, angular_epsilon=.2)
+            plateau = _StableFeedback(1., angular_epsilon=.2)
+            error = None
+            try:
+                while not cancelled.wait(.02):
+                    with self.tracker.lock:
+                        if not self.tracker.current(self.CHANNEL, aid):
+                            return
+                        self.state.require_motion(self.ALLOWED_MODES)
+                        if self.ros1.connection != (True, generation):
+                            raise ConnectionError('connection changed during head motion')
+                        q, measured_at, capture_ns = self.bundle.sensors.joint_positions()
+                        now = time.monotonic()
+                        if now-issued > 8.:
+                            raise TimeoutError(f'head feedback did not settle within 8s; error_deg={error}')
+                        if measured_at < issued:
+                            continue
+                        measured = [math.degrees(v) for v in q[18:20]]
+                        error = [a-b for a,b in zip(target_deg, measured)]
+                        close = max(map(abs, error)) <= 1.
+                        near = max(map(abs, error)) <= 5.
+                        if not close:
+                            exact.reset()
+                        if not near:
+                            plateau.reset()
+                        captured = capture_ns/1e9
+                        arrived = close and exact.update(measured, captured, now)
+                        approximate = near and plateau.update(measured, captured, now)
+                        if not arrived and not approximate:
+                            continue
+                        approximate = not arrived
+                        residual = {'yaw_deg': round(error[0], 6), 'pitch_deg': round(-error[1], 6)}
+                        self.tracker.finish(self.CHANNEL, aid, self.PREFIX, 'completed', {
+                            'completion_basis': 'measured_head_stable_residual' if approximate else 'measured_head_convergence',
+                            'measured_convergence': not approximate, 'approximate': approximate,
+                            'target': {'yaw_deg': target_deg[0], 'pitch_deg': -target_deg[1]},
+                            'measured': {'yaw_deg': measured[0], 'pitch_deg': -measured[1]}, 'error': residual,
+                            'message': f"Completed{' approximately' if approximate else ''}; remaining yaw error {residual['yaw_deg']:+.3f} deg, pitch error {residual['pitch_deg']:+.3f} deg."})
+                        return
+            except Exception as exc:
+                self.bundle.pause(_safe_log(str(exc)), status='error', expected=(self.CHANNEL, aid))
+        threading.Thread(target=complete, daemon=True, name='acp-head-feedback').start()
         return {'state': 'executing', 'action_id': aid,
-                'expected_duration_s': .2, 'control_preparation': preparation, **result}
+                'expected_duration_s': 2., 'timeout_s': 8., 'control_preparation': preparation, **result}
 
 
 class KuavoBundle:

@@ -1672,16 +1672,51 @@ class DriverContractTests(unittest.TestCase):
         self.assertIn('stale', self.call('head', 'zero')['error'])
         self.assertFalse(self.ros.published)
 
-    def test_head_send_completes_through_acp_without_claiming_measured_arrival(self):
+    def test_head_exact_completion_requires_new_measurements_and_reports_error(self):
         result = self.call('head', 'zero')
         self.assertEqual(result['state'], 'executing')
-        self.assertFalse(result['measured_convergence'])
-        self.assertEqual(result['completion_basis'], 'absolute_command_sent')
+        self.assertEqual(result['completion_basis'], 'measured_head_or_stable_residual')
         self.assertTrue(self.bundle.tracker.current('head', result['action_id']))
+        end = time.monotonic()+1.
+        while not self.callbacks and time.monotonic()<end:
+            self.ros.raw()
+            time.sleep(.05)
         self.assertTrue(wait_until(lambda: self.callbacks))
         self.assertEqual(self.callbacks[0][:3], (result['action_id'], 'head', 'completed'))
-        self.assertFalse(self.callbacks[0][3]['measured_convergence'])
+        self.assertTrue(self.callbacks[0][3]['measured_convergence'])
+        self.assertFalse(self.callbacks[0][3]['approximate'])
+        self.assertEqual(self.callbacks[0][3]['error'], {'yaw_deg': 0., 'pitch_deg': 0.})
         self.assertFalse(self.bundle.tracker._active)
+
+    def test_head_stable_offset_completes_approximately_with_card_pitch_direction(self):
+        result = self.call('head', 'move_pos', yaw=10., pitch=4.)
+        end = time.monotonic()+1.6
+        while not self.callbacks and time.monotonic()<end:
+            self.ros.raw(q=[0.]*18+[math.radians(7), math.radians(-1)])
+            time.sleep(.05)
+        self.assertTrue(wait_until(lambda: self.callbacks))
+        event = self.callbacks[0]
+        self.assertEqual(event[:3], (result['action_id'], 'head', 'completed'))
+        self.assertTrue(event[3]['approximate'])
+        self.assertFalse(event[3]['measured_convergence'])
+        self.assertEqual(event[3]['error'], {'yaw_deg': 3., 'pitch_deg': 3.})
+        self.assertAlmostEqual(event[3]['measured']['pitch_deg'], 1.)
+        self.assertIn('approximately',event[3]['message'])
+
+    def test_head_large_stable_error_does_not_claim_success(self):
+        result = self.call('head', 'move_pos', yaw=20.)
+        end = time.monotonic()+1.25
+        while time.monotonic()<end:
+            self.ros.raw()
+            time.sleep(.05)
+        self.assertFalse(self.callbacks)
+        self.assertTrue(self.bundle.tracker.current('head',result['action_id']))
+
+    def test_head_missing_post_command_feedback_errors_instead_of_success(self):
+        result = self.call('head', 'move_pos', yaw=4.)
+        self.assertTrue(wait_until(lambda:self.callbacks,1.))
+        self.assertEqual(self.callbacks[0][:3], (result['action_id'], 'head', 'error'))
+        self.assertIn('stale',self.callbacks[0][3]['reason'])
 
     def test_head_stop_during_acp_handoff_cancels_exactly_once(self):
         result = self.call('head', 'move_pos', yaw=5.)
@@ -1703,7 +1738,7 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(self.call('head', 'move_pos', pitch=1.)['state'], 'error')
         self.assertFalse(self.ros.published)
 
-    def test_head_tracking_offset_does_not_wait_or_claim_convergence(self):
+    def test_head_dispatch_returns_without_waiting_for_stable_feedback(self):
         self.ros.raw(q=[0.] * 18 + [math.radians(6.63), 0.])
         before = time.monotonic()
         result = self.call('head', 'move_pos', yaw=5.)
@@ -1746,7 +1781,7 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(result['state'], 'executing')
         self.assertAlmostEqual(result['pitch'], -5.)
 
-    def test_head_pitch_direction_and_immediate_acp(self):
+    def test_head_pitch_direction_and_acp_schema(self):
         result = self.call('head', 'move_pos', yaw=12, pitch=4)
         self.assertEqual(result['state'], 'executing')
         self.assertEqual(self.ros.published[1], ('/robot_head_motion_data', 'kuavo_msgs/robotHeadMotionData',
@@ -2042,6 +2077,66 @@ class CardRevisionTests(unittest.TestCase):
         self.assertEqual(progress['error']['yaw_deg'], 90.)
         self.assertLessEqual(abs(progress['command']['yaw_rad_s']), .3)
 
+    def test_base_stable_small_residual_stops_before_approximate_acp(self):
+        self.bundle.sensors.odom_pose = lambda: ((0.,0.,0.),time.time(),'odom')
+        result = self.call('base_drive','move_relative',x=.2,y=0.,yaw=0.)
+        self.bundle.sensors.odom_pose = lambda: ((.13,0.,math.radians(2.)),time.time(),'odom')
+        end = time.monotonic()+2.8
+        zero_started = None
+        while not self.callbacks and time.monotonic()<end:
+            self.ros.emit('/mobile_manipulator/lb_mpc_control_mode',3)
+            progress = self.call('base_drive','info')['motion']
+            if progress['state']=='stopping' and zero_started is None:
+                zero_started=time.monotonic()
+            time.sleep(.05)
+        self.assertTrue(wait_until(lambda:self.callbacks))
+        event=self.callbacks[0]
+        self.assertEqual(event[:3],(result['action_id'],'base_drive','completed'))
+        self.assertTrue(event[3]['approximate'])
+        self.assertFalse(event[3]['measured_convergence'])
+        self.assertAlmostEqual(event[3]['error']['position_m'],.07)
+        self.assertAlmostEqual(event[3]['error']['yaw_deg'],-2.)
+        self.assertIsNotNone(zero_started)
+        self.assertGreaterEqual(time.monotonic()-zero_started,1.)
+        self.assertEqual(self.ros.published[-1][2]['linear']['x'],0.)
+        self.assertIn('0.0700 m',event[3]['message'])
+
+    def test_base_large_residual_does_not_approximate(self):
+        self.bundle.sensors.odom_pose = lambda: ((0.,0.,0.),time.time(),'odom')
+        result = self.call('base_drive','move_relative',x=.3,y=0.,yaw=0.)
+        self.bundle.sensors.odom_pose = lambda: ((.1,0.,0.),time.time(),'odom')
+        time.sleep(1.2)
+        self.assertFalse(self.callbacks)
+        self.assertTrue(self.bundle.tracker.current('base',result['action_id']))
+        self.call('base_drive','stop_move')
+
+    def test_base_near_residual_with_replayed_capture_does_not_approximate(self):
+        self.bundle.sensors.odom_pose = lambda: ((0.,0.,0.),time.time(),'odom')
+        result = self.call('base_drive','move_relative',x=.2,y=0.,yaw=0.)
+        captured=time.time()
+        self.bundle.sensors.odom_pose = lambda: ((.13,0.,0.),captured,'odom')
+        time.sleep(1.25)
+        self.assertFalse(self.callbacks)
+        self.assertTrue(self.bundle.tracker.current('base',result['action_id']))
+
+    def test_base_approximate_completion_requires_stopping_after_zero(self):
+        self.bundle.sensors.odom_pose = lambda: ((0.,0.,0.),time.time(),'odom')
+        result = self.call('base_drive','move_relative',x=.2,y=0.,yaw=0.)
+        self.bundle.sensors.odom_pose = lambda: ((.13,0.,0.),time.time(),'odom')
+        self.assertTrue(wait_until(lambda:self.call('base_drive','info')['motion']['state']=='stopping',1.7))
+        start=time.monotonic()
+        self.bundle.sensors.odom_pose = lambda: ((.13+.02*(time.monotonic()-start),0.,0.),time.time(),'odom')
+        end=start+1.25
+        while time.monotonic()<end:
+            self.ros.emit('/mobile_manipulator/lb_mpc_control_mode',3)
+            time.sleep(.05)
+        self.assertFalse(self.callbacks)
+        self.assertTrue(self.bundle.tracker.current('base',result['action_id']))
+        self.assertEqual(self.ros.published[-1][2]['linear']['x'],0.)
+        self.call('base_drive','stop_move')
+        self.assertTrue(wait_until(lambda:self.callbacks))
+        self.assertEqual(self.callbacks[0][2],'cancelled')
+
     def test_pose_requires_fresh_stamped_odom_before_resume(self):
         self.assertIn('odometry',self.call('base_drive','move_relative',x=0.,y=0.,yaw=0.)['error'])
         self.assertFalse(self.ros.sent_services)
@@ -2093,3 +2188,32 @@ class MotionConfigurationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StableFeedbackTests(unittest.TestCase):
+    def test_distinct_capture_and_receipt_time_are_both_required(self):
+        window=driver._StableFeedback(1.,angular_epsilon=.2)
+        for i in range(20):
+            self.assertFalse(window.update([0.,0.],10.,20.+i*.1))
+        for i in range(1,11):
+            self.assertFalse(window.update([0.,0.],10.+i*.1,22.+i*.1))
+        self.assertTrue(window.update([0.,0.],11.1,23.1))
+        burst=driver._StableFeedback(1.,angular_epsilon=.2)
+        for i in range(20):
+            self.assertFalse(burst.update([0.,0.],10.+i*.1,20.+i*.001))
+
+    def test_motion_and_large_sampling_gaps_cannot_look_like_plateau(self):
+        window=driver._StableFeedback(1.,angular_epsilon=.2)
+        for i in range(20):
+            self.assertFalse(window.update([i*.1,0.],10.+i*.1,20.+i*.1))
+        self.assertFalse(window.update([2.,0.],15.,25.))
+        for i in range(1,10):
+            self.assertFalse(window.update([2.,0.],15.+i*.1,25.+i*.1))
+        self.assertTrue(window.update([2.,0.],16.,26.))
+
+    def test_base_yaw_wrap_is_stable_but_linear_drift_is_not(self):
+        window=driver._StableFeedback(1.,2,angular_epsilon=math.radians(.2),angular_period=2*math.pi)
+        for i in range(12):
+            ready=window.update([1.,2.,math.radians(179.99 if i%2 else -179.99)],10.+i*.1,20.+i*.1)
+        self.assertTrue(ready)
+        self.assertFalse(window.update([1.01,2.,math.pi],11.2,21.2))

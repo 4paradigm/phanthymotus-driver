@@ -411,14 +411,14 @@ EOF只作结束标记跳过，后续PCM继续播放；如需清空已排队PCM�
 参数单位与约束：
 
 - 底盘速度：本体系 `vx/vy` 单位m/s，平移合速度≤0.8；`vyaw` 单位**度/秒**，范围±57.2957795131。`duration` 必填，0.1–10s，或 `-1` 持续运动至 `stop_move`。连续动作返回running/continuous，不注册永远无法完成的ACP pending；保留本地通道占用、心跳与安全检查，停止/断连/反馈失效时终止。有限时长与位姿动作仍保持正常ACP等待及资源屏障。
-- 底盘位姿：`x/y` 为米，`yaw` 为**度**，三个值均必填。`move_relative` 的x/y是动作实际发送时机身系相对位移，yaw是相对转角。已移除`move_to`：odom原点由厂商里程计初始化/重置决定，本驱动没有可复现的绝对零点管理；地图绝对位置使用`controlled_spatial.navigate_to_pose`。位置反馈来自新鲜带时间戳的原始`/odom`，按20Hz发送有界`/cmd_vel`。末段使用有限幅、抗饱和积分补偿，只有新测量才累积；仍需2cm/1°内连续0.3s新测量才完成ACP，不按发送成功或宽松到位判断。各轴组在进入容差后发零速并清除积分，不提高所选速度档位。`info.motion`显示目标、实测、误差及速度；8s无实质进展、缺少反馈、坐标系改变或110s总超时会暂停并报告误差。`expected_duration_s`是按距离/转角与速度档估计的时间，`timeout_s`才是总超时。
-  `speed` 可选 `low`（默认：0.24m/s、17.1887°/s）、`medium`（0.48m/s、34.3775°/s）、`high`（0.8m/s、57.2958°/s），按厂商控制链命令上限的30%/60%/100%设置，接近目标时减速。位移上限5m；实测位置误差≤2cm、角度误差≤1°且不同样本持续0.3s才完成ACP。没有避障规划，避障导航使用`controlled_spatial`。
+- 底盘位姿：`x/y` 为米，`yaw` 为**度**，三个值均必填。`move_relative` 的x/y是动作实际发送时机身系相对位移，yaw是相对转角。已移除`move_to`：odom原点由厂商里程计初始化/重置决定，本驱动没有可复现的绝对零点管理；地图绝对位置使用`controlled_spatial.navigate_to_pose`。位置反馈来自新鲜带时间戳的原始`/odom`，按20Hz发送有界`/cmd_vel`。末段使用有限幅、抗饱和积分补偿，只有新测量才累积；2cm/1°内连续0.3s新测量属于精确完成。另允许近似完成：残差≤10cm/5°且连续1s新测量漂移≤2mm/0.2°时，先发零速，再用至少1.1s新测量确认稳定（最多等4s），才发送成功ACP。近似完成明确返回`approximate: true`、`measured_convergence: false`以及目标、实测、剩余距离/各轴误差和英文说明；精确完成返回`approximate: false`。不以缓存的重复帧、旧反馈、明显未停稳或范围外误差宣称成功。各轴组在进入容差后发零速并清除积分，不提高所选速度档位。`info.motion`显示目标、实测、误差及速度；8s无实质进展、缺少反馈、坐标系改变或110s总超时会暂停并报告误差。`expected_duration_s`是按距离/转角与速度档估计的时间，`timeout_s`才是总超时。
+  `speed` 可选 `low`（默认：0.24m/s、17.1887°/s）、`medium`（0.48m/s、34.3775°/s）、`high`（0.8m/s、57.2958°/s），按厂商控制链命令上限的30%/60%/100%设置，接近目标时减速。位移上限5m；实测位置误差≤2cm、角度误差≤1°且不同样本持续0.3s为精确完成；上述稳定小残差分支为近似完成，附实测误差。没有避障规划，避障导航使用`controlled_spatial`。
 - 双臂 `set` 可填写`left_joint_1_rad`…`left_joint_7_rad`、`right_joint_1_rad`…`right_joint_7_rad`中的任意关节，单位**rad**。左右臂1、4、7号关节相对于厂商原始数据反向；其余保持厂商方向。只转换明确填写的目标，未填关节保留实际位置，原始joint_state及URDF不反向。
   省略、null或空白表示保持当前实测位置；0是有效目标；全部为空拒绝。实际发送前重新取未指定关节的实测值。`zero`同时归零全部14个手臂关节。字段description包含实时限位（rad/度），方向反转后的上下界也同步转换；未发现限位时不声明虚构范围且拒绝执行。旧完整`move_joints`度数组保持原始厂商方向，未在UI展示。
 - 下肢 `leg` 包含膝、腿、腰俯仰与偏航，删除重复的`waist`卡。`set`接受`knee_deg`、`leg_deg`、`waist_pitch_deg`、`waist_yaw_deg`的一个或多个绝对**度**值；省略时保持实测值。`zero`归零全部4关节。兼容`move_joints(positions)`四个度值。
   `set_height(height)`接受`waist_yaw_link`原点在`base_link`坐标系中的绝对Z坐标（m），不是头顶离地高度。厂商轮臂API的`/cmd_lb_torso_pose.linear.z`及控制器`task.info`中的`baseFrame/torsoFrame`定义了这一参考系。此前0.74–1.06只是驱动固定筛选值，没有足够依据作为该机器人的实际工作范围，现已移除。先调用`get_height`获取实测`height_m`与当前姿态下的`reachable_height_intervals_m`：由实时URDF和关节限位求解析边界，保持躯干x/俯仰及腰偏航；这些是运动学可达区间，并非碰撞/负载安全认证。不可达请求返回当前值和区间，不静默夹紧。通过厂商`/cmd_lb_torso_pose`联动膝、腿、腰，ACP仍用真实关节收敛确认；不支持的几何或缺失反馈在恢复控制前拒绝。
 - 头部 `move_pos(yaw,pitch)` 为绝对**度**，yaw范围[-30,30]、pitch[-25,25]；**Pitch正值向上、负值向下**，只转换卡片输入，原始反馈不改。至少填一轴；省略轴在实际发令前取实测角度。`zero`两个轴归零。
-  实机厂商位置环存在数度偏差，目前没有经过验证的反馈补偿参数。`move_pos/zero`保留ACP：发送成功返回`state: executing`和`action_id`，随后发送`completed`回调；`completion_basis: absolute_command_sent`、`measured_convergence: false`明确表示命令发送完成。仅预留0.2s异步回执交接窗口，不等待20s，也不声明实测到位。窗口内中断会发送一次cancelled，不再补发completed。仍要求新鲜、模型有效的关节反馈以保持未填轴，发送异常仍按不确定运动指令暂停处理。没有修改增益、零点或伪造joint_state。
+  实机厂商位置环存在数度偏差，目前没有经过验证的反馈补偿参数。`move_pos/zero`返回`executing/action_id`，通过真实`joint_state`对应的关节反馈判断完成：各轴≤1°并连续稳定0.3s为精确完成；各轴残差≤5°且连续1s漂移≤0.2°可近似完成。ACP返回`approximate`、`target`、`measured`、`error`（yaw/pitch，度，均使用卡片方向）和说明，不再仅以指令发送成功回执。必须使用新鲜、不同且指令后采集的帧；旧帧、断流、失去控制或8s内无法稳定会报错并暂停。中断只发一次cancelled；没有修改增益、零点或伪造joint_state。
 
 `controlled_spatial.motion_music_enabled: false`（默认）在容器启动后独立后台执行，无需启动底盘卡；连接暂不可用时每30秒重试，不触发取消任务、解除急停或电机使能。仅把已核实的厂商ID-1运动曲目`1_flower.mp3`替换为有效静音MP3；原件与SHA256记录保存在同目录`.motus-motion-music/`，设为true可恢复。保留ID-2告警、充电、障碍提示和TTS，不改变系统音量、不重启底盘管理节点。使用底盘已有ffmpeg，不自动安装新包；未知文件布局、缺少ffmpeg或操作员已改动曲目时返回unsupported/blocked，显示在`info.startup.motion_music`。已经开始的播放可能到本次结束后才静音。
 
@@ -688,3 +688,5 @@ IMU301帧、位置展示和标准odom各300帧且全部有效，电池/雷达点
 本轮388项离线测试、Python编译和service.yml检查通过。上位机候选镜像基于当前release构建；只读验证确认arm/leg实时限位有效、重复waist已移除、头部同步发送语义生效。单独关闭ID-1运动音乐的操作返回disabled，其他曲目未改。未向电机发送测试目标；升降、连续运动和三档位姿闭环仍待旁站验收。
 
 2026-11-19 有人旁站验证：低速 `move_relative(x=0.2,y=0.2,yaw=90)`；原比例控制停在约0.072m/2.35°残差，末段积分修正后约13.1s完成ACP，完成时原始里程计残差约0.0182m/0.987°，测试后软件暂停。仅覆盖本次姿态/地面/速度；建图修复已在真机以只读原始里程计停稳探针验证，未创建或切换地图。
+
+近似完成是驱动的任务结束策略，不代表厂商精度保证；仅应用于`base_drive.move_relative`与`head.move_pos/zero`，不改变`controlled_spatial`的原生任务/地图到达确认，也不改变arm/leg的测量收敛要求。
