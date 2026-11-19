@@ -148,16 +148,35 @@ class BumiDeviceBundle:
             self._plugins.append(loco_plugin)
             print("[bundle] LocoPlugin loaded")
 
+        loco_servo_plugin = None
         if (plugins_cfg.get("loco_servo", {}).get("enabled", False)
                 and high_ctrl is not None):
             from loco_servo import LocoServoPlugin
-            self._plugins.append(LocoServoPlugin(
+            loco_servo_plugin = LocoServoPlugin(
                 plugins_cfg["loco_servo"], namespace, executor, high_ctrl,
                 # When the call-shaped card is enabled, both paths share its
                 # lock/rate limiter and explicit actions preempt the stream.
                 loco_plugin=loco_plugin,
-            ))
+            )
+            self._plugins.append(loco_servo_plugin)
             print("[bundle] LocoServoPlugin loaded")
+
+        if plugins_cfg.get("waist_sway", {}).get("enabled", False) and high_ctrl is not None:
+            from waist_sway import WaistSwayPlugin
+            waist_sway_plugin = WaistSwayPlugin(
+                plugins_cfg["waist_sway"], namespace, executor, high_ctrl,
+                # Needs the loco card's workmode machinery to hand the robot
+                # back to the high-level controller after the stream stops.
+                loco_plugin=loco_plugin,
+            )
+            # The two chassis paths tell the sway when they drive the robot;
+            # appended after them so stop_all() releases the waist first.
+            if loco_plugin is not None:
+                loco_plugin.attach_sway(waist_sway_plugin)
+            if loco_servo_plugin is not None:
+                loco_servo_plugin.attach_sway(waist_sway_plugin)
+            self._plugins.append(waist_sway_plugin)
+            print("[bundle] WaistSwayPlugin loaded")
 
         if plugins_cfg.get("mic", {}).get("enabled", False) and media_ctrl is not None:
             from device import MicPlugin

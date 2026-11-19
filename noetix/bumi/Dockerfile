@@ -121,18 +121,21 @@ RUN cd /work/noetix_sdk_bumi && \
     sed -i '/target_include_directories(example/,/^)/s/^/#/' CMakeLists.txt && \
     sed -i '/target_link_libraries(example/,/^)/s/^/#/' CMakeLists.txt
 
-# Build the pybind modules used by the current cards
+# Build the pybind modules used by the current cards. lowcontrol_py is the
+# LowController wrapper the waist_sway card streams joint commands through;
+# it links only libdriver.a + the DDS libs (no onnxruntime).
 RUN cd /work/noetix_sdk_bumi && \
     mkdir -p build && cd build && \
     cmake .. \
         -DCMAKE_CXX_STANDARD=17 \
         -Dpybind11_DIR=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())") && \
-    make -j$(nproc) highcontrol_py mediacontrol_py && \
+    make -j$(nproc) highcontrol_py mediacontrol_py lowcontrol_py && \
     echo "[build] pybind modules built successfully"
 
 # Verify .so files exist
 RUN ls /work/noetix_sdk_bumi/build/highcontrol_py*.so && \
-    ls /work/noetix_sdk_bumi/build/mediacontrol_py*.so
+    ls /work/noetix_sdk_bumi/build/mediacontrol_py*.so && \
+    ls /work/noetix_sdk_bumi/build/lowcontrol_py*.so
 
 # ROS2 domain isolation
 ENV ROS_DOMAIN_ID=42
@@ -144,6 +147,7 @@ COPY main.py   /work/main.py
 COPY device.py /work/device.py
 # Navi support modules are independent from device.py for ROS-free tests.
 COPY loco_servo.py /work/loco_servo.py
+COPY waist_sway.py /work/waist_sway.py
 COPY imu_distance_control.py /work/imu_distance_control.py
 COPY leg_odometry.py /work/leg_odometry.py
 COPY camera_specs.py /work/camera_specs.py
