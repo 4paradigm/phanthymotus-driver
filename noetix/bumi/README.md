@@ -282,7 +282,7 @@ in `device.py`; no extra runtime Python file is required.
 | `work_status` / `work_status_text` | `READY` 就绪 / `SLEEPED` 已休眠 / `WAKEUPED` 已唤醒 / `EXIT` 已退出（复位中） |
 | `reason` / `reason_text` | 为什么会变成现在这样：超时自动休眠、被语音或命令唤醒/休眠、出错休眠、复位、开机 |
 | `awake` | 是否处于可听可说的状态；读不到时为 `null` |
-| `healthy` | 只有 `ERROR_SLEEPED` 为 `false`；读不到时为 `null` |
+| `healthy` | 只有 `ERROR_SLEEPED` 为 `false`；读不到、或固件状态/原因不在已知词表中时为 `null` |
 | `transitioning` | 正在 `EXIT` / `CMD_RESET` 复位途中 |
 | `sleep_after_s` | 自动休眠阈值（`get_timeout()` 的毫秒折算成秒） |
 | `error_code` / `error_message` | 最近一次错误；`0` / `""` 表示没有记录 |
@@ -299,6 +299,9 @@ in `device.py`; no extra runtime Python file is required.
   itself is down"）。
 - **读不到不等于正常。** 状态读失败时 `healthy` 是 `null` 而不是 `true` —— SDK 不回答
   不是"机器人没事"的证据。
+- **没见过的状态也不等于正常。** 固件新增的工作状态或原因会原样保留在
+  `work_status` / `reason` 及其文本里（便于发现变化），但只要有一个不在已知词表中，
+  `healthy` 就是 `null` —— 驱动没有依据替一个自己没学会分类的状态背书。
 - **时间戳是本驱动的观测，不是机器人的。** 这个 SDK 不提供任何时间戳（`odom_spec.py`
   对 IMU 记过同一件事），所以 `observed_for_s` 从本驱动第一次看到该状态起算；一次读
   失败会打断观测，恢复后重新计时，而不是跨过那段不知道发生了什么的时间。

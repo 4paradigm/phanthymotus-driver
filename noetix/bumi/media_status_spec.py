@@ -25,8 +25,10 @@ most common benign state on this robot into an alarm, and an alarm that fires
 during normal use is an alarm that gets ignored.
 
 `healthy` is therefore deliberately narrow, and `None` when the status could not
-be read at all. "I do not know" and "it is fine" are different answers, and a
-failing SDK call is not evidence that the robot is well.
+be read at all — or when the firmware reports a work status or a reason this
+driver has never been taught to classify. "I do not know" and "it is fine" are
+different answers: a failing SDK call is not evidence that the robot is well,
+and neither is a state added by a firmware update that nobody has reviewed.
 """
 from __future__ import annotations
 
@@ -122,7 +124,10 @@ def sample(*, work_status=None, reason=None, error_code: int = 0,
     payload.
 
     `work_status=None` means the read failed, not that the unit is idle: the
-    state fields then report `unknown` and `healthy` is `None`.
+    state fields then report `unknown` and `healthy` is `None`. An unrecognised
+    work status or reason is kept verbatim in the text fields but also yields
+    `healthy: None` — a new firmware state is a reason to say "unknown", not to
+    reassure the operator.
 
     `controller_present=False` says the SDK object was never created, so no
     number of retries will change the answer. Both cases report
@@ -132,6 +137,14 @@ def sample(*, work_status=None, reason=None, error_code: int = 0,
     bare_status = status_name(work_status)
     bare_reason = status_name(reason)
     known = bool(bare_status)
+    # A firmware update can add a work status or a reason this driver has never
+    # seen. Keep both verbatim in the text fields so the change leaves a readable
+    # trace, but make no health claim: "unknown" is not "healthy". Both halves
+    # of the pair must be in the vocabularies above before this card vouches for
+    # the unit — a reassuring `true` is the worst possible answer to a state
+    # nobody has reviewed yet.
+    classified = (bare_status in WORK_STATUS_TEXT
+                  and bare_reason in REASON_TEXT)
     work_text, reason_text = labels(bare_status, bare_reason)
     name = bare_status or "unknown"
     why = bare_reason or "unknown"
@@ -151,7 +164,7 @@ def sample(*, work_status=None, reason=None, error_code: int = 0,
         "reason": why,
         "reason_text": reason_text,
         "awake": (name in AWAKE_STATUSES) if known else None,
-        "healthy": (why not in HARD_FAULT_REASONS) if known else None,
+        "healthy": (why not in HARD_FAULT_REASONS) if classified else None,
         "transitioning": bool(
             known and (name in TRANSITION_STATUSES or why in TRANSITION_REASONS)
         ),
