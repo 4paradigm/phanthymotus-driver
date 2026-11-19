@@ -75,10 +75,14 @@ class LiveStreamPlugin:
                         ),
                         "format": "password",
                         "x-sensitive": True,
+                        # Keep the instance gear visible in stock Canvas.
+                        # The Driver validates missing URLs and persists them.
                         "scope": "instance",
                     },
                 },
-                "required": ["rtmp_url"],
+                # Core cannot resolve an instance-scoped setting when a
+                # Canvas action omits instance_id. Let Driver preflight it.
+                "required": [],
             },
             "inputSchema": {
                 "type": "object",
@@ -147,7 +151,13 @@ class LiveStreamPlugin:
                 return {"ok": False, "error_code": "INVALID_STREAM_URL",
                         "message": "仅支持已验证的虎牙或小红书官方 RTMP 地址"}
             with self._lock:
-                if self._worker.info()["state"] in ("starting", "streaming", "stopping"):
+                state = self._worker.info()["state"]
+                if state in ("starting", "streaming", "stopping"):
+                    if url == self._url:
+                        # Core replays config before end_live; an identical
+                        # replay is a no-op, never a new approval or write.
+                        return {"ok": True, "state": state, "configured": True,
+                                "ready_to_go_live": False}
                     return {"ok": False, "error_code": "STREAM_ACTIVE",
                             "message": "请先结束直播再更新推流地址"}
                 try:

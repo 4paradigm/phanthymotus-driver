@@ -137,16 +137,24 @@ def test_canvas_save_to_mock_bumi_and_real_local_rtmp(monkeypatch):
 
     try:
         time.sleep(0.5)
-        saved = asyncio.run(canvas.save_instance_config(
-            mcp_id, "live_stream", card_id, {"rtmp_url": demo_url}))
-        assert saved["code"] == 200 and saved["applied"] is True
-        assert saved["ready_to_go_live"] is True
+        # Stock Core applies gear settings asynchronously, so keep one event
+        # loop alive until the real Driver confirms that it was configured.
+        async def save_and_wait():
+            result = await canvas.save_instance_config(
+                mcp_id, "live_stream", card_id, {"rtmp_url": demo_url})
+            for _ in range(40):
+                if plugin.dispatch("info", {})["configured"]:
+                    return result
+                await asyncio.sleep(0.05)
+            pytest.fail("Original Core gear did not reach Driver")
+        saved = asyncio.run(save_and_wait())
+        assert saved["code"] == 200
         assert cfg[f"tool_config:{mcp_id}:live_stream:{card_id}"]["rtmp_url"] == demo_url
 
-        # Actual Core HTTP MCP dispatch, including instance-config replay.
+        # Stock Core Canvas execute omits instance_id: Driver still allows go_live.
         result = asyncio.run(mcp_manage.mcp_call_tool(
             mcp_id, MCPCallRequest(tool="live_stream",
-                arguments={"action": "go_live", "instance_id": card_id}), timeout_s=10))
+                arguments={"action": "go_live"}), timeout_s=10))
         assert result["code"] == 200, result
         assert json.loads(result["data"][0]["text"])["state"] == "starting"
 
@@ -166,19 +174,16 @@ def test_canvas_save_to_mock_bumi_and_real_local_rtmp(monkeypatch):
                 arguments={"action": "end_live", "instance_id": card_id}), timeout_s=10))
         assert stopped["code"] == 200, stopped
 
-        # Same URL cannot silently rearm; rejection must be surfaced as failure.
-        same = asyncio.run(canvas.save_instance_config(
-            mcp_id, "live_stream", card_id, {"rtmp_url": demo_url}))
-        assert same["code"] == 200 and same["ready_to_go_live"] is False
+        # The unchanged Core wraps business failures in code 200; Driver
+        # must still reject a second broadcast without fresh approval.
         denied = asyncio.run(mcp_manage.mcp_call_tool(
             mcp_id, MCPCallRequest(tool="live_stream",
-                arguments={"action": "go_live", "instance_id": card_id}), timeout_s=10))
-        assert denied["code"] == 400
-        assert "APPROVAL_REQUIRED" in denied["message"]
-
-        invalid = asyncio.run(canvas.save_instance_config(
-            mcp_id, "live_stream", card_id, {"rtmp_url": "not-rtmp"}))
-        assert invalid.status_code == 422
+                arguments={"action": "go_live"}), timeout_s=10))
+        assert denied["code"] == 200
+        assert json.loads(denied["data"][0]["text"])["error_code"] == "APPROVAL_REQUIRED"
+        assert plugin.dispatch("info", {})["state"] == "idle"
+        invalid = plugin.dispatch("config", {"rtmp_url": "not-rtmp"})
+        assert invalid["error_code"] == "INVALID_STREAM_URL"
         assert cfg[f"tool_config:{mcp_id}:live_stream:{card_id}"]["rtmp_url"] == demo_url
     finally:
         audio_stop.set()

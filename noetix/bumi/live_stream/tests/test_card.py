@@ -89,13 +89,13 @@ def test_canvas_gear_config_reaches_driver_but_never_becomes_llm_tool():
     assert set(params) == {"start", "stop", "info", "go_live", "end_live"}
 
     gear = config_schema["properties"]["rtmp_url"]
-    assert config_schema["required"] == ["rtmp_url"]
+    assert config_schema["required"] == []
     assert gear["scope"] == "instance"
     assert gear["x-sensitive"] and gear["format"] == "password"
 
     # Canvas stores the instance-scoped value, and Agent Core replays the
     # saved config directly to the MCP action before the card is started.
-    saved_config = {key: URL for key in config_schema["required"]}
+    saved_config = {"rtmp_url": URL}
     args = {"instance_id": "card-1", **saved_config}
     configured = subject.dispatch("config", args)
     assert configured["ok"] is True
@@ -194,7 +194,10 @@ def test_config_and_explicit_broadcast_do_not_leak_url():
     assert store.saves == 1
     assert subject.dispatch("go_live", {})["state"] == "starting"
     assert worker.received_url == URL
-    assert subject.dispatch("config", {"rtmp_url": URL})["error_code"] == "STREAM_ACTIVE"
+    same = subject.dispatch("config", {"rtmp_url": URL})
+    assert same["ok"] is True and same["state"] == "streaming"
+    assert store.saves == 1
+    assert subject.dispatch("config", {"rtmp_url": URL.replace("seq=123", "seq=456")})["error_code"] == "STREAM_ACTIVE"
     assert subject.dispatch("end_live", {})["state"] == "idle"
     assert subject.dispatch("info", {})["configured"] is True
     assert URL not in str(result)
