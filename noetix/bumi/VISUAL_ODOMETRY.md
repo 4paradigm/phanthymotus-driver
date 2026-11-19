@@ -159,3 +159,78 @@ plugin lifecycle/actions, static TF/mount and the gated camera raw branch.
 On-robot verification: the body-IMU path reaches `tracking`; controller-source
 direct polling and stop/start behavior still need hardware stress validation.
 The camera-IMU RSUSB build path and its modules have been removed.
+
+## 真机首轮坐标验证：采集与 WSL 回放
+
+用一块有纹理的哑光板做参照，在板面画一个清晰十字，测量或标记它的固定位置。
+同一轮里标注的每张图都点同一个十字中心。把停留位置标为 A、B、A-return，记录顺序和大致时间。
+先在 A 等视觉里程计达到 `tracking`。操作员按现场流程移动 Bumi，在 A、B 用不同位置和朝向
+观察，在 A-return 回到起点和原朝向。每站停稳后等几秒采样。参照物全程保持不动。
+首轮尽量保留同一个 tracking segment。若采集中跟踪丢失，可以保留文件，按 segment 分开分析。
+
+### 在 Bumi 上采集
+
+在工作电脑的 `phanthymotus-driver` 根目录，把脚本复制到实验室 Bumi。将示例中的 SSH 地址
+换成实验室提供的账号和设备地址。
+
+```bash
+ROBOT='账号@Bumi的地址'
+scp noetix/bumi/tools/capture_coordinates.py "$ROBOT:/tmp/bumi_capture_coordinates.py"
+ssh "$ROBOT"
+```
+
+以下命令在 **Bumi 的 SSH 终端**执行。使用运行中的驱动容器，以沿用 ROS domain 和 DDS 配置。
+先确认 Dashboard 上 `rgbd_visual_odometry` 已启动。相机的普通 JPEG 和压缩深度话题使用发布时刻，
+采集脚本使用原始 RGB-D 支路的设备时间戳。
+
+```bash
+CTR=embodied-noetix-bumi
+docker cp /tmp/bumi_capture_coordinates.py "$CTR:/tmp/bumi_capture_coordinates.py"
+docker exec "$CTR" bash -lc 'source /opt/ros/humble/setup.bash && ros2 topic list --no-daemon' \
+  | grep -E 'odometry_input/(rgb|depth|info|camera_meta)$|bumi_visual_odometry/state/odom$|^/tf_static$'
+```
+
+把 `NS` 改为实际话题的首段，例如看到 `/ubuntu/odometry_input/rgb` 时填 `ubuntu`。
+脚本订阅 RGB (`bgr8`)、已对齐深度 (`32FC1` 米)、`CameraInfo`、
+`camera_meta`、`motus.odom/1` 和 `/tf_static` 上对应相机的安装变换。
+`--duration` 到时或 Ctrl+C 后，脚本关闭文件并打印各数据流计数。60 秒的数据通常约 1 GiB，
+默认载荷预算为 2 GiB。
+
+```bash
+NS=ubuntu
+RECORD="/opt/phanthy-motus/data/bumi-coordinates-$(date +%Y%m%d-%H%M%S).sqlite3"
+docker exec -it "$CTR" bash -lc 'source /opt/ros/humble/setup.bash && exec python3 "$@"' _ \
+  /tmp/bumi_capture_coordinates.py --namespace "$NS" --output "$RECORD" --duration 60
+printf '%s\n' "$RECORD"
+```
+
+成功的采集应有六类数据且 `tracking_odom_samples` 大于零。若无图像，检查命名空间和
+`rgbd_visual_odometry` 是否运行。若只有图像而没有 tracking，先解决里程计状态再录。
+驱动按默认部署将数据目录挂到 Bumi 主机。等脚本结束后，在 WSL 用
+`scp "$ROBOT:/opt/phanthy-motus/data/实际录制文件.sqlite3" ./` 取回文件。
+
+### 在 WSL 中离线回放
+
+在仓库根目录，使用装有 NumPy 和 OpenCV 的 Python 环境。若缺依赖，可在 WSL 的 Python 虚拟环境安装
+`python -m pip install numpy opencv-python-headless`。
+
+```bash
+RECORD=./实际录制文件.sqlite3
+python3 noetix/bumi/tools/replay_coordinates.py prepare "$RECORD" ./coordinate-preview --every 5
+```
+
+查看 `coordinate-preview/capture_summary.json` 中的配对数量、丢弃原因和 segment。
+打开导出的原始尺寸 PNG，在 `observations.csv` 对应行填 `station,u,v`，像素原点在左上角，
+`u` 向右、`v` 向下。每站任选 3–5 帧停稳且十字清晰的图片，其余行留空。
+若停留阶段导出的帧太少，用 `--every 1` 导出到一个新目录。
+
+```bash
+python3 noetix/bumi/tools/replay_coordinates.py analyze "$RECORD" \
+  ./coordinate-preview/observations.csv --output ./coordinate-report.json
+```
+
+回放以原始 RGB 帧时间匹配内参和 tracking 位姿，用相机元数据找实际深度帧，再通过录下的
+`base -> optical` 静态变换投影到该 segment 的 `odom` 坐标系。
+报告包含每次投影的三维坐标、各站中位坐标、最大点间距及两站间的中位坐标差。
+可以用 `--tolerance-m` 按场地误差预算对最大点间距设门槛。
+该实验测的是同一物理点投影结果的一致性。若需要绝对误差，还需要在相同坐标系里测量独立真值。
