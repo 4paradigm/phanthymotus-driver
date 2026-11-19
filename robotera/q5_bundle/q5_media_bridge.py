@@ -24,6 +24,7 @@ q5_bridge_worker.py — 独立子进程 DDS bridge，将 Q5 sensor snapshot 发�
 """
 
 import multiprocessing as mp
+from collections import deque
 import os
 import queue
 import sys
@@ -31,6 +32,143 @@ import threading
 import time
 
 from fastdds_transport import configure_bundled_fastdds_transport
+from playback_telemetry import parse_audio_format
+
+
+_SUPPORTED_SPEAKER_FORMATS = {"audio/pcm-16k", "pcm_16k_16bit_mono"}
+_SPEAKER_FAILURE_DEDUPE_LIMIT = 256
+_SPEAKER_FAILURE_MERGE_LIMIT = 64
+_POSE_QUEUE_SIZE = 256
+_MAX_POSE_JSON_BYTES = 8_192
+
+
+def pose_message_item(msg, clock_ns=time.monotonic_ns,
+                      max_raw_bytes: int = _MAX_POSE_JSON_BYTES) -> dict:
+    """Convert one ROS String message without interpreting its source clock."""
+    raw_json = str(msg.data)
+    byte_limit = max(1, int(max_raw_bytes))
+    if (len(raw_json) > byte_limit
+            or len(raw_json.encode("utf-8")) > byte_limit):
+        raise ValueError("Pose JSON exceeds maximum byte size")
+    return {
+        "kind": "pose",
+        "raw_json": raw_json,
+        "bridge_received_monotonic_ns": int(clock_ns()),
+    }
+
+
+def pose_barrier_item(token: str, clock_ns=time.monotonic_ns,
+                      bridge_transport_drops: int = 0) -> dict:
+    """Create an in-band marker ordered after earlier Pose callbacks."""
+    return {
+        "kind": "barrier",
+        "token": str(token),
+        "bridge_received_monotonic_ns": int(clock_ns()),
+        "bridge_transport_drops": max(0, int(bridge_transport_drops)),
+    }
+
+
+def _increment_shared_counter(counter, amount: int = 1):
+    with counter.get_lock():
+        counter.value += int(amount)
+
+
+def _shared_counter_value(counter) -> int:
+    with counter.get_lock():
+        return int(counter.value)
+
+
+def _offer_pose(pose_q, item: dict, transport_drops) -> bool:
+    """Offer without blocking, replacing the oldest item under overload."""
+    try:
+        pose_q.put_nowait(dict(item))
+        return True
+    except queue.Full:
+        pass
+    try:
+        pose_q.get_nowait()
+    except queue.Empty:
+        _increment_shared_counter(transport_drops)
+        return False
+    _increment_shared_counter(transport_drops)
+    try:
+        pose_q.put_nowait(dict(item))
+        return True
+    except queue.Full:
+        _increment_shared_counter(transport_drops)
+        return False
+
+
+def _offer_pose_barrier(pose_q, item: dict, transport_drops=None,
+                        timeout_seconds: float = 0.25) -> bool:
+    """Boundedly wait for a barrier slot without evicting a Pose frame."""
+    del transport_drops
+    try:
+        pose_q.put(dict(item), timeout=max(0.0, float(timeout_seconds)))
+        return True
+    except queue.Full:
+        return False
+
+
+def _queue_speaker_failure(failure_q, failure: dict, seen_ids: dict,
+                           overflow_epoch=None) -> bool:
+    """Offer one failure without blocking; coalesce overload conservatively."""
+    speech_id = str(failure.get("speech_id") or "")
+    if not speech_id or speech_id in seen_ids:
+        return False
+
+    item = dict(failure)
+    try:
+        failure_q.put_nowait(item)
+    except queue.Full:
+        failed_epoch = int(item.get("speaker_epoch", -1))
+        if overflow_epoch is not None:
+            lock = overflow_epoch.get_lock()
+            with lock:
+                overflow_epoch.value = max(
+                    int(overflow_epoch.value), failed_epoch)
+        evicted = None
+        try:
+            evicted = failure_q.get_nowait()
+        except queue.Empty:
+            pass
+        speech_ids = []
+        for candidate in (evicted or {}).get("speech_ids", []):
+            if str(candidate) not in speech_ids:
+                speech_ids.append(str(candidate))
+        for candidate in ((evicted or {}).get("speech_id"), speech_id):
+            if candidate and str(candidate) not in speech_ids:
+                speech_ids.append(str(candidate))
+        item = {
+            "fail_all": True,
+            "speech_id": speech_id,
+            "speech_ids": speech_ids[-_SPEAKER_FAILURE_MERGE_LIMIT:],
+            "through_epoch": failed_epoch,
+            "code": "SPEAKER_FAILURE_QUEUE_OVERFLOW",
+            "message": "speaker failure notification queue overloaded",
+        }
+        seen_ids[speech_id] = None
+        while len(seen_ids) > _SPEAKER_FAILURE_DEDUPE_LIMIT:
+            del seen_ids[next(iter(seen_ids))]
+        try:
+            failure_q.put_nowait(item)
+        except queue.Full:
+            return False
+    else:
+        seen_ids[speech_id] = None
+        while len(seen_ids) > _SPEAKER_FAILURE_DEDUPE_LIMIT:
+            del seen_ids[next(iter(seen_ids))]
+    return True
+
+
+def speaker_chunk_from_message(msg) -> dict:
+    """Validate an AudioChunk and retain optional utterance metadata."""
+    metadata = parse_audio_format(str(msg.format))
+    if metadata.base_format not in _SUPPORTED_SPEAKER_FORMATS:
+        raise ValueError(f"unsupported audio format: {metadata.base_format!r}")
+    if not metadata.valid:
+        raise ValueError(metadata.error or "invalid playback metadata")
+    return {"pcm": bytes(msg.data), "metadata": metadata}
 
 
 class BridgeWorker:
@@ -51,6 +189,11 @@ class BridgeWorker:
         self._media_lock = threading.Lock()
         self._audio_q = self._ctx.Queue(maxsize=100)
         self._speaker_q = self._ctx.Queue(maxsize=64)
+        self._speaker_fail_q = self._ctx.Queue(maxsize=64)
+        self._speaker_fail_epoch = self._ctx.Value("q", -1)
+        self._speaker_seen_fail_epoch = -1
+        self._pose_q = self._ctx.Queue(maxsize=_POSE_QUEUE_SIZE)
+        self._pose_transport_drops = self._ctx.Value("q", 0)
         self._proc = None
         self._debug = debug
         self._namespace = namespace
@@ -60,6 +203,8 @@ class BridgeWorker:
         self._proc = self._ctx.Process(
             target=_run_bridge_subprocess,
             args=(self._cmd_q, self._sensor_q, self._media_qs, self._audio_q, self._speaker_q,
+                  self._speaker_fail_q, self._speaker_fail_epoch,
+                  self._pose_q, self._pose_transport_drops,
                   self._debug, self._namespace),
             name="q5_bridge_worker", daemon=True,
         )
@@ -110,11 +255,56 @@ class BridgeWorker:
         except Exception:
             pass
 
+    def publish_speaker_event(self, event: dict):
+        try:
+            self._cmd_q.put_nowait({"kind": "speaker_event", "event": dict(event)})
+        except Exception:
+            pass
+
+    def pop_speaker_failure(self):
+        with self._speaker_fail_epoch.get_lock():
+            failed_epoch = int(self._speaker_fail_epoch.value)
+        if failed_epoch > self._speaker_seen_fail_epoch:
+            self._speaker_seen_fail_epoch = failed_epoch
+            return {
+                "fail_all": True,
+                "through_epoch": failed_epoch,
+                "code": "SPEAKER_FAILURE_QUEUE_OVERFLOW",
+                "message": "speaker failure notification queue overloaded",
+            }
+        try:
+            return self._speaker_fail_q.get_nowait()
+        except queue.Empty:
+            return None
+
     def pop_speaker_chunk(self):
         try:
             return self._speaker_q.get_nowait()
         except Exception:
             return None
+
+    def configure_pose(self, topic: str):
+        try:
+            self._cmd_q.put_nowait({"kind": "pose_config", "topic": str(topic)})
+        except Exception:
+            pass
+
+    def request_pose_barrier(self, token: str):
+        try:
+            self._cmd_q.put_nowait({"kind": "pose_barrier", "token": str(token)})
+        except Exception:
+            pass
+
+    def pop_pose(self):
+        try:
+            return self._pose_q.get_nowait()
+        except queue.Empty:
+            return None
+
+    def pose_stats(self) -> dict:
+        with self._pose_transport_drops.get_lock():
+            drops = int(self._pose_transport_drops.value)
+        return {"bridge_transport_drops": drops}
 
     def shutdown(self):
         """Gracefully stop the bridge subprocess."""
@@ -130,7 +320,10 @@ class BridgeWorker:
 
 
 def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[str, mp.Queue],
-                           audio_q: mp.Queue, speaker_q: mp.Queue, debug: bool, namespace: str):
+                           audio_q: mp.Queue, speaker_q: mp.Queue,
+                          speaker_fail_q: mp.Queue, speaker_fail_epoch,
+                          pose_q: mp.Queue, pose_transport_drops,
+                          debug: bool, namespace: str):
     """Subprocess entry point — runs in separate process with own DDS domain."""
     try:
         from common import logsafe
@@ -205,51 +398,91 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
     pub_depth = node.create_publisher(Image, f"{prefix}/camera/depth", QOS_MEDIA)
     pub_depth_preview = node.create_publisher(CompressedImage, f"{prefix}/camera/depth_preview", QOS_MEDIA)
     pub_pointcloud = node.create_publisher(UInt8MultiArray, f"{prefix}/camera/pointcloud", QOS_MEDIA)
+    pub_speaker_events = node.create_publisher(
+        String, f"{prefix}/speaker/playback_events", QOS_MEDIA)
     # Audio is a live lossy stream. Match the audio cards used by the other
     # drivers so Agent Core/FastDDS subscribers can request BEST_EFFORT without
     # a reliability negotiation mismatch or unnecessary retransmission delay.
     pub_mic = node.create_publisher(AudioChunk, f"{prefix}/mic/audio", QOS_AUDIO)
     speaker_sub = None
+    pose_sub = None
     mic_frames_published = 0
     speaker_frames_received = 0
     speaker_duplicate_frames_dropped = 0
     last_speaker_digest = b""
     last_speaker_frame_at = 0.0
+    invalid_format_count = 0
+    last_invalid_format_warning_at = None
+    speaker_failed_ids = {}
+    speaker_epoch = int(speaker_fail_epoch.value) + 1
+    pending_pose_barriers = deque(maxlen=64)
 
-    supported_audio_formats = {"audio/pcm-16k", "pcm_16k_16bit_mono"}
+    def _on_pose(msg):
+        try:
+            item = pose_message_item(msg)
+        except ValueError:
+            _increment_shared_counter(pose_transport_drops)
+            return
+        _offer_pose(pose_q, item, pose_transport_drops)
 
     def _on_speaker(msg):
         nonlocal speaker_frames_received, speaker_duplicate_frames_dropped
         nonlocal last_speaker_digest, last_speaker_frame_at
+        nonlocal invalid_format_count, last_invalid_format_warning_at
+        nonlocal speaker_epoch
         # Agent Core's remote microphone uses pcm_16k_16bit_mono while
         # perception TTS uses audio/pcm-16k. Both carry S16_LE, 16 kHz mono.
-        if msg.format not in supported_audio_formats:
-            node.get_logger().warning(
-                f"speaker ignored unsupported audio format: {msg.format!r}")
-            return
         try:
-            pcm = bytes(msg.data)
+            item = speaker_chunk_from_message(msg)
+            if (item["metadata"].tracked
+                    and item["metadata"].speech_id in speaker_failed_ids):
+                return
+            item["speaker_epoch"] = speaker_epoch
+            pcm = item["pcm"]
             # Two phanthy_bus_bridge publishers were observed on connected
             # browser-mic topics.  They can relay the exact same packet within
             # milliseconds; submitting both makes live speech garbled.  Do not
             # collapse regular repeated samples (such as silence), only an
             # identical packet that arrives in this short duplicate window.
-            now = time.monotonic()
-            digest = hashlib.blake2s(pcm, digest_size=8).digest()
-            browser_frame = msg.header.stamp.sec == 0 and msg.header.stamp.nanosec == 0
-            if (browser_frame and digest == last_speaker_digest
-                    and now - last_speaker_frame_at < 0.02):
-                speaker_duplicate_frames_dropped += 1
+            if not item["metadata"].tracked:
+                now = time.monotonic()
+                digest = hashlib.blake2s(pcm, digest_size=8).digest()
+                browser_frame = msg.header.stamp.sec == 0 and msg.header.stamp.nanosec == 0
+                if (browser_frame and digest == last_speaker_digest
+                        and now - last_speaker_frame_at < 0.02):
+                    speaker_duplicate_frames_dropped += 1
+                    return
+                last_speaker_digest = digest
+                last_speaker_frame_at = now
+            try:
+                speaker_q.put_nowait(item)
+            except queue.Full:
+                # Do not lose tracked EOF or other tracked chunks silently.
+                if item["metadata"].tracked:
+                    _queue_speaker_failure(speaker_fail_q, {
+                        "speech_id": item["metadata"].speech_id,
+                        "speaker_epoch": speaker_epoch,
+                        "code": "SPEAKER_QUEUE_OVERFLOW",
+                        "message": "tracked speaker chunk dropped because the queue is full",
+                    }, speaker_failed_ids, speaker_fail_epoch)
+                    speaker_epoch += 1
                 return
-            last_speaker_digest = digest
-            last_speaker_frame_at = now
-            speaker_q.put_nowait(pcm)
             speaker_frames_received += 1
             if speaker_frames_received == 1:
                 node.get_logger().info("speaker received first PCM frame")
             elif speaker_duplicate_frames_dropped and speaker_frames_received % 100 == 0:
                 node.get_logger().info(
                     f"speaker dropped {speaker_duplicate_frames_dropped} duplicate PCM frames")
+        except ValueError:
+            invalid_format_count += 1
+            now = time.monotonic()
+            if (last_invalid_format_warning_at is None
+                    or now - last_invalid_format_warning_at >= 5.0):
+                node.get_logger().warning(
+                    f"speaker rejected {invalid_format_count} chunks with "
+                    "unsupported audio format or invalid metadata")
+                invalid_format_count = 0
+                last_invalid_format_warning_at = now
         except Exception:
             pass
 
@@ -392,6 +625,20 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
                     AudioChunk, str(cmd["topic"]), _on_speaker, QOS_AUDIO)
                 node.get_logger().info(
                     f"speaker subscribed to {cmd['topic']} (BEST_EFFORT)")
+            elif isinstance(cmd, dict) and cmd.get("kind") == "speaker_event":
+                _publish_json(pub_speaker_events, cmd.get("event") or {})
+            elif isinstance(cmd, dict) and cmd.get("kind") == "pose_config":
+                if pose_sub is not None:
+                    node.destroy_subscription(pose_sub)
+                    pose_sub = None
+                topic = str(cmd.get("topic") or "")
+                if topic:
+                    pose_sub = node.create_subscription(
+                        String, topic, _on_pose, QOS_SENSOR)
+                    node.get_logger().info(f"pose subscribed to {topic} (BEST_EFFORT)")
+            elif isinstance(cmd, dict) and cmd.get("kind") == "pose_barrier":
+                if len(pending_pose_barriers) < pending_pose_barriers.maxlen:
+                    pending_pose_barriers.append(str(cmd.get("token") or ""))
             elif debug:
                 node.get_logger().debug(f"bridge cmd: {cmd}")
         except Exception:
@@ -443,6 +690,19 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
         # A short DDS wait avoids a busy loop while draining bursty live PCM
         # fast enough to preserve every 1 KiB browser-microphone frame.
         executor.spin_once(timeout_sec=0.005)
+
+        # Defer the marker until after this executor turn. The guaranteed cut
+        # is the ordered Pose IPC queue: callbacks already offered to pose_q
+        # precede the marker; later callbacks receive a later Bridge clock.
+        while pending_pose_barriers:
+            token = pending_pose_barriers.popleft()
+            _offer_pose_barrier(
+                pose_q,
+                pose_barrier_item(
+                    token,
+                    bridge_transport_drops=_shared_counter_value(
+                        pose_transport_drops)),
+                pose_transport_drops)
 
     # Cleanup
     node.destroy_node()
