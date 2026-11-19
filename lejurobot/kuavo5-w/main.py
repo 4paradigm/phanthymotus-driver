@@ -25,7 +25,7 @@ _bundle = None
 
 class _McpRequestLog:
     """One bounded sampler shared by all HTTP connections/worker threads."""
-    TOOLS = frozenset(('loco', 'arm', 'leg', 'waist', 'head', 'speaker',
+    TOOLS = frozenset(('base_drive', 'arm', 'leg', 'waist', 'head', 'speaker',
                        'joints', 'imu', 'loco_state', 'model',
                        'battery', 'laser_scan', 'camera_left', 'camera_right', 'camera_head', 'camera_depth'))
     STATES = frozenset(('ready', 'idle', 'running', 'executing', 'paused',

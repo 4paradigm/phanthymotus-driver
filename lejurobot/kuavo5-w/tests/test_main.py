@@ -74,7 +74,7 @@ class McpTests(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertNotIn(b'Access-Control-Allow-Origin', head)
                 self.assertFalse(response['result'].get('isError', False))
-        self.assertEqual(calls, [('loco', {}), ('loco', {})])
+        self.assertEqual(calls, [('base_drive', {}), ('base_drive', {})])
 
     def test_successful_poll_logs_are_sampled_across_http_connections(self):
         rpc = self.rpc('state', {'action': 'info'})
@@ -108,7 +108,7 @@ class McpTests(unittest.TestCase):
                 self.http_request([('Host', 'localhost:15747')])
         self.assertEqual(log.call_count, 3)
         for call, state in zip(log.call_args_list, ('ready', 'executing', 'paused')):
-            self.assertIn(f'tool=loco state={state}', call[0][0])
+            self.assertIn(f'tool=base_drive state={state}', call[0][0])
 
     def test_request_log_sampler_is_shared_and_bounded_under_concurrency(self):
         logger = main._McpRequestLog()
@@ -151,7 +151,7 @@ class McpTests(unittest.TestCase):
         handler.do_POST()
         return replies[0]
 
-    def rpc(self, name="loco", arguments=None):
+    def rpc(self, name="base_drive", arguments=None):
         return {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
                 "params": {"name": name, "arguments": arguments or {}}}
 

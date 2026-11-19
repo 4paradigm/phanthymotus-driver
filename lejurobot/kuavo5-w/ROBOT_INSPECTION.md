@@ -696,3 +696,32 @@ pitch+10°有一次实测到位完成。支持方向相关的稳态跟踪误差�
   这是本地候选叠层增量，不是正式CI镜像或相对ros-base成本。无新增依赖/基础设施。
 - 原镜像、Compose文件及speaker状态保存在上位机0600回退快照；配置备份保留。
   328项离线测试通过；仅验证小角度单关节动作，不代表双臂全工作空间或碰撞安全验收。
+
+
+## 2026-11-19：base_drive改名与导航协议复查
+
+- 轮式底盘执行卡由loco更名base_drive；旧plugins.loco自动迁移，显式plugins.base_drive优先。
+  动作、单位、base资源及ACP保持原语义。遥测loco_state及两个现有主题保持兼容，旧画布执行卡需重新添加。
+- 只读登录底盘重查已安装源码、服务定义及实际ROS图，没有发送移动目标、取消、建图、地图修改或重启命令。
+  目前地图/路网、Cartographer、导航服务存在，不属于硬件缺少导航能力。
+- 实际`/move_base/move_to_target`、`/move_base/check_arrived`提供者为`/leju_node`，
+  类型分别leju_mobile_base_msgs/MoveToTarget（x/y/theta/options→success/message/task_id）
+  和CheckArrived（task_id/blocking/timeout→arrived/success/message/status）。
+- 实际`/leju/cancel_dispatch_task`提供者为另一节点`/navigation_api_node_java`，
+  jaten_msgs/SetDispatchTask只有task_id/control_mode→success/message，CANCEL_CURRENT_TASK=1。
+  服务存在不能证明其task_id与leju_node分配的ID同源或能停止该路径；仍需厂家协议或有旁站的实际取消验证。
+- `/cancel_task`的已安装源码明确调用rosnode kill，终止demo_client/path_sequence_executor/lqr_path_track等节点；
+  禁止将这个破坏性重启路径包装成普通stop_nav。当前未观察到标准/move_base/cancel接入证据。
+- `/get_jmap_lists`、`/jmap_operate`的自定义定义已取得。已安装jmap_server源码的
+  ADD_GRIDMAP_ALL/ADD_GRIDMAP_ONLY分支打开文件后注释了实际write/close，不能把success当地图落盘证明；
+  它导入jmap_msgs，现场另有jaten_msgs同名定义；尚未确认此Python文件就是当前服务实现，
+  不能把该代码片段断言为运行时故障，适配须以当前服务类型和实际保存结果为准。
+  厂商地图界面的StartCartoMapping/SaveCartoMap后续AgvSystemRestart是另一条路径，
+  需保存后核验地图身份和重新定位，不能直接复制Slamtec的start/stop_mapping流程。
+- 打点存储可以按地图ID/指纹绑定map系位姿实现；但要组成与天轶一致的完整controlled_spatial，
+  尚需接通可靠取消/终态ACP、base_drive互斥及地图保存/重载确认。本轮没有注册仅能受理的占位导航卡。
+
+- 真机部署候选local-base-drive-261119（edcc2b405e88），实际tools/list仅含base_drive、不含loco，
+  base_drive.info=ready；旧现场配置无需改写即可迁移。joints valid、boot complete、control_enabled=false。
+  原speaker /perception/tts与50%音量恢复。330项离线测试、编译、service checker和diff检查通过。
+  本轮没有新增依赖、修改部署基础设施或验证实际底盘运动。

@@ -42,7 +42,7 @@ Dashboard/PR镜像部署片段把宿主机 `/opt/phanthy-motus/drivers/lejurobot
 `CONFIG_PATH` 显式指向其他路径但文件缺失，或已有YAML损坏时仍报错，不悄悄回退。
 
 整机连接默认值统一位于 `connection_defaults.py`：`DEFAULTS` 保存三台主机的地址、账号、ROS IP，
-`DEFAULT_PASSWORDS` 保存对应默认SSH密码。`loco`及其他卡片不再提供连接参数configSchema或config动作；
+`DEFAULT_PASSWORDS` 保存对应默认SSH密码。`base_drive`及其他卡片不再提供连接参数configSchema或config动作；
 不需要往画布放置额外配置卡。日常动作走ROS1/rosbridge，SSH仅供统一后台准备/修复三台主机。
 
 按操作人员要求，镜像内置当前5-W/Jaten现场确认的默认值。正常部署无需填写账号密码；
@@ -128,7 +128,7 @@ sudo密码不同时分别设置相应`KUAVO_<ROLE>_SUDO_PASSWORD`。
 所有自有源码随镜像构建复制，不依赖助手留在/tmp下的文件。分发使用固定文件白名单和固定安装目的地，
 不接受画布传入shell命令；以文件/配置哈希、systemd单元及消息覆盖层检查进行幂等校验。
 普通进程探测或端口存在不能替代部署校验。每轮约30秒检查，缺少/损坏的自有文件或单元会修复，
-停止的非电机服务会启动，健康服务不反复restart。运行状态见 `loco.info.feedback.host_runtime.provisioning.targets`；
+停止的非电机服务会启动，健康服务不反复restart。运行状态见 `base_drive.info.feedback.host_runtime.provisioning.targets`；
 controller/host/chassis分别报告checking/ready/blocked及错误，不传输私有凭据到状态中。
 
 容器默认不需要源码仓库、额外pip脚本或手工SSH安装。必要前提仍是机器人已有**厂商ROS Noetic、控制程序、
@@ -257,10 +257,10 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 该开关仅允许处理运动请求，后台检查、读取传感器、卡片start/info不会触发恢复或发运动目标；原有运行时检查仍生效。
 如需只读运行，可在实际加载的配置文件中设置 `motion_enabled: false` 并重启驱动；此时拒绝运动、
 恢复控制及模式切换，仍允许状态/传感器/模型读取、软件暂停和 `stop_move`。该字段必须是 YAML 布尔值。
-`loco.info.feedback.motion_enabled` 与执行卡 `info.motion_enabled` 可确认当前配置。
+`base_drive.info.feedback.motion_enabled` 与执行卡 `info.motion_enabled` 可确认当前配置。
 机器人必须处于允许运动的状态，且收到本次 WebSocket 连接内的控制状态和新鲜模式反馈后才接受运动指令。
 启动和重连后，独立线程经 rosapi 探测机型、robot_version、自由度、SHM 参数及 `/humanoid_description`。
-必须确认 wheel-arm=1、下肢4、双臂14、头2后才能运动；探测失败时可通过 `loco.info.feedback.robot_discovery` 查原因。
+必须确认 wheel-arm=1、下肢4、双臂14、头2后才能运动；探测失败时可通过 `base_drive.info.feedback.robot_discovery` 查原因。
 参数缺失不回退到 SDK 的双足默认配置。后台探测在每轮结束约1s后重新读取完整身份参数和 URDF；
 成功读取的身份有效期为3s，从该轮读取开始计时，慢查询不会在完成时伪造新租约。
 查询失败、身份过期或模型/限位绑定变化会拒绝/终止相关动作，不依赖 WebSocket 重连；
@@ -272,7 +272,7 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 
 | 卡片 | 动作 | 官方 ROS1 接口 |
 | --- | --- | --- |
-| `loco` | `move`、`move_relative`、`move_to`、`stop_move` | `/cmd_vel`、`/cmd_pose`、`/cmd_pose_world` |
+| `base_drive` | `move`、`move_relative`、`move_to`、`stop_move` | `/cmd_vel`、`/cmd_pose`、`/cmd_pose_world` |
 | `arm` | `set`、`stop_move` | `/kuavo_arm_traj` |
 | `leg` | `set`、`zero`、`move_joints`、`stop_move` | `/lb_leg_traj` |
 | `waist` | `waist_pitch`、`waist_yaw`、`zero`、`set_pose`、`stop_move` | `/lb_leg_traj`、`/cmd_lb_torso_pose` |
@@ -291,14 +291,22 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 
 初始化流程等待实际BaseArm反馈（mode=3），再进入软件暂停；新的运动动作自动恢复控制。
 不提供单独的模式切换/恢复卡，底盘、手臂等执行卡的 `stop_move` 和中断 hook 仍会全身软件暂停。
-诊断通过任一执行卡的系统 `info.feedback` 读取，例如 `loco.info`；旧画布中的switch_mode卡应删除。
+底盘执行卡已从 `loco` 更名为 `base_drive`，动作、单位、ACP及`base`资源锁保持一致。
+旧部署配置的`plugins.loco`自动迁移为新名称；若同时指定`plugins.base_drive`，以新键为准。
+旧画布上的loco卡需替换为base_drive。遥测卡`loco_state`及其已有双流主题不随执行卡改名。
+
+诊断通过任一执行卡的系统 `info.feedback` 读取，例如 `base_drive.info`；旧画布中的switch_mode卡应删除。
 `controller_not_ready` 表示控制器前提缺失，不能通过填入默认参数绕过。
 `stop_move` 不依赖机型探测，仍会尝试零速、取消在途动作及请求暂停；若控制服务/反馈缺失，
 返回 `physical_stop_confirmed: false`，不能假报暂停成功。查询返回的 `state: ready` 仅表示查询成功。
 
 左右/头部 RGB、头部深度、电池、二维雷达点云、扬声器已适配；尚未提供 `mic`、`controlled_spatial` 卡片。
 真机底盘另有导航主机 `192.168.26.22`，其 HTTP API 已验证可读当前地图和地图列表；
-任务下发、取消确认、建图保存/服务重启的完整协议仍待核实，上位机 rosbridge 也缺少对应自定义服务类型。
+已查到`/leju_node`提供的MoveToTarget/CheckArrived，以及独立Java节点提供的cancel_dispatch_task。
+两者任务ID归属与取消后停止确认尚未打通；`/cancel_task`会杀节点，不能用作普通stop_nav。
+厂商Cartographer建图保存还涉及服务重启和地图就绪确认；不能照搬天轶的Slamtec协议。
+打点可按地图ID/指纹保存真实map系位姿，但完整controlled_spatial仍需上述闭环适配和验证。
+本轮补查已取得底盘自定义服务定义，详细证据见ROBOT_INSPECTION.md末节。
 厂商编号音效不是任意PCM接口；本驱动使用已实际听到声音的底盘标准音频输出。
 
 ### 扬声器安装与使用
@@ -391,7 +399,7 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 ```
 
 不要对 `rosparam get` 的 YAML 输出计算指纹。配置需重启加载；可用性及核验记录引用在
-`loco.info.feedback.robot_discovery.joint_limits` 查看。运行时模型指纹或配置身份不匹配时不允许关节动作。
+`base_drive.info.feedback.robot_discovery.joint_limits` 查看。运行时模型指纹或配置身份不匹配时不允许关节动作。
 
 模式：0=NoControl（被动）、1=ArmOnly、2=BaseOnly、3=BaseArm、4=ArmEeOnly。
 底盘要求模式2/3；双臂关节要求1/3；末端允许1/3/4。下肢、躯干和头部要求非0模式。
@@ -429,7 +437,7 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 即使旧恢复在该次 disable 等待期间才结清，该次停止仍不确认；调用方须在结清后显式再次暂停，
 使最终 disable 发送在旧恢复终态之后。不会自动重试控制服务或自动重新启用。
 
-`loco.info.feedback.remote_resume_unresolved` 暴露该状态；未结清时拒绝新恢复/模式切换。
+`base_drive.info.feedback.remote_resume_unresolved` 暴露该状态；未结清时拒绝新恢复/模式切换。
 只保留至多一个未决恢复的响应句柄，超时/本地取消后仍能收到迟到响应；传输断开不是控制器拒绝，
 重连和新会话 False 不会消除旧请求的不确定性。无法取得旧请求终态或发生部分发送/断线时，
 需现场核实并处置控制器状态；重启驱动本身不证明远端请求已取消。
@@ -502,14 +510,14 @@ MCP 请求日志在所有 HTTP 连接间共享采样器，重复成功/失败请
 
 运动及恢复/模式切换要求有效租约和租约期内接收的使能状态；过期的 True 不能作为已启用依据，
 过期的 False 不能跳过暂停请求。恢复时验证未知则拒绝请求，等待只读检查，不擅自调用启用服务。
-`loco.info.feedback.enable_verification` 提供有效性、年龄、来源及错误。
+`base_drive.info.feedback.enable_verification` 提供有效性、年龄、来源及错误。
 ROS 图查询和 latch 重新投递是状态通路检查，不是带生产者时间戳的硬件心跳，也不证明物理静止；
 ROS master 缓存、具体 rosbridge 版本和真机控制器行为仍需现场核实。
 
 ## 传感输出与能力边界
 
 已移除公开 `state` 卡；控制安全检查的内部反馈订阅仍保留。
-诊断通过 `loco.info.feedback` 获取，包括连接、控制反馈、robot_discovery 和 host_runtime，
+诊断通过 `base_drive.info.feedback` 获取，包括连接、控制反馈、robot_discovery 和 host_runtime，
 不再发布原来无助于传感展示的 control 流。
 
 `joints/imu/loco_state` 按10Hz输出，battery/laser_scan按5Hz输出：
@@ -534,7 +542,7 @@ ROS master 缓存、具体 rosbridge 版本和真机控制器行为仍需现场�
 不依赖机器人在线或控制器启动。模型来源、固定版本和许可证见 [resource/README.md](resource/README.md)。
 该文件与现场版本63控制器使用的biped_s63一致，尚未独立核实实物尺寸及标定，不能用作控制模型。
 实时更新仍要求实测 q；真机 `/humanoid_description` 缺失，或其20个受测关节名称与本地模型不一致时，
-`joints` 输出 invalid、空关节数组和原因，静态 `model` 仍可读取。`loco.info.feedback` 中的
+`joints` 输出 invalid、空关节数组和原因，静态 `model` 仍可读取。`base_drive.info.feedback` 中的
 `robot_discovery.model_error` 表示运行时模型校验错误，`skeleton_model` 记录本地来源与名称校验状态。
 参考姿态不代表测得的 q=0。原始20关节不含底盘轮角/手指；这些不属于本卡的实测能力。
 
@@ -591,7 +599,7 @@ MCP 探测示例（只查询状态）：
 curl -s http://localhost:15747/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 curl -s http://localhost:15747/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"loco","arguments":{"action":"info"}}}'
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"base_drive","arguments":{"action":"info"}}}'
 ```
 
 真机仍需验证：

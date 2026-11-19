@@ -643,8 +643,8 @@ class _KuavoPlugin:
                 "completion_basis": "command_duration_and_vendor_watchdog"}
 
 
-class LocoPlugin(_KuavoPlugin):
-    PREFIX, CHANNEL, ALLOWED_MODES = "loco", "base", (2, 3)
+class BaseDrivePlugin(_KuavoPlugin):
+    PREFIX, CHANNEL, ALLOWED_MODES = "base_drive", "base", (2, 3)
 
     def tool(self):
         return self.schema("Kuavo 5-W 轮式底盘：有界速度、相对/世界位姿。stop_move 使用全身软件暂停防止位置目标续行。", {
@@ -915,12 +915,19 @@ class KuavoBundle:
         self._remote_resume = None
         self._remote_mode = None
         self._stop_epoch = 0
-        self.plugins = [LocoPlugin(self), ArmPlugin(self), LowerBodyPlugin(self),
+        self.plugins = [BaseDrivePlugin(self), ArmPlugin(self), LowerBodyPlugin(self),
                         LowerBodyPlugin(self, "waist"), HeadPlugin(self)]
-        self._enabled = {name for name, cfg in config.get("plugins", {}).items()
-                         if cfg.get("enabled", True)} if "plugins" in config else {
-                             "loco", "arm", "leg", "waist", "head", "speaker", *SENSOR_CARDS, *PERIPHERAL_CARDS}
-        aliases = {'camera_rgb': 'camera_left', 'camera_rgb_right': 'camera_right'}
+        if "plugins" in config:
+            plugin_config = dict(config['plugins'])
+            # Preserve old deployments, but an explicit new setting wins.
+            if 'base_drive' not in plugin_config and 'loco' in plugin_config:
+                plugin_config['base_drive'] = plugin_config['loco']
+            plugin_config.pop('loco', None)
+            self._enabled = {name for name, cfg in plugin_config.items() if cfg.get('enabled', True)}
+        else:
+            self._enabled = {"base_drive", "arm", "leg", "waist", "head", "speaker",
+                             *SENSOR_CARDS, *PERIPHERAL_CARDS}
+        aliases = {'loco': 'base_drive', 'camera_rgb': 'camera_left', 'camera_rgb_right': 'camera_right'}
         self._enabled = {aliases.get(name, name) for name in self._enabled if name not in ('state', 'switch_mode')}
         self._auto_start = [aliases.get(name, name) for name in self._auto_start if name not in ('state', 'switch_mode')]
 

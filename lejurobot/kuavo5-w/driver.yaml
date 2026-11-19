@@ -10,7 +10,7 @@ description: "乐聚 Kuavo 5-W — 轮式底盘、双臂、下肢/躯干、头�
 build_context_extras:
   - ../../common
 cards:
-  - { name: loco,        type: actuator }
+  - { name: base_drive,        type: actuator }
   - { name: arm,         type: actuator }
   - { name: leg,         type: actuator }
   - { name: waist,       type: actuator }

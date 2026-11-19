@@ -216,7 +216,7 @@ class DriverContractTests(unittest.TestCase):
 
     def test_actuator_info_preserves_diagnostics_without_public_control_cards(self):
         self.bundle.startup_checks.status = {'state': 'ready'}
-        result = self.call('loco', 'info')
+        result = self.call('base_drive', 'info')
         self.assertEqual(result['feedback']['host_runtime'], {'state': 'ready'})
         self.assertIn('robot_discovery', result['feedback'])
         self.assertTrue({'state', 'switch_mode'}.isdisjoint(
@@ -242,7 +242,7 @@ class DriverContractTests(unittest.TestCase):
         manager = self.bundle.startup_checks.provisioner
         before = {role: manager._target(role) for role in ('host', 'controller', 'chassis')}
         with patch.object(manager.transport, 'run') as run:
-            result = self.call('loco', 'config', provision_host_address='192.0.2.1',
+            result = self.call('base_drive', 'config', provision_host_address='192.0.2.1',
                                provision_controller_password='unused')
         self.assertEqual(result['state'], 'error')
         self.assertEqual(before, {role: manager._target(role) for role in before})
@@ -252,11 +252,11 @@ class DriverContractTests(unittest.TestCase):
 
     def test_removed_control_card_cannot_be_reenabled_by_legacy_configuration(self):
         legacy = driver.KuavoBundle({'plugins': {'switch_mode': {'enabled': True},
-                                                'loco': {'enabled': True}}},
+                                                'base_drive': {'enabled': True}}},
                                     'legacy', FakeRos1(), FakeNode())
         try:
             self.assertNotIn('switch_mode', legacy._enabled)
-            self.assertEqual([tool['name'] for tool in legacy.get_all_tools()], ['loco'])
+            self.assertEqual([tool['name'] for tool in legacy.get_all_tools()], ['base_drive'])
         finally:
             legacy.close()
         for configure in (False, True):
@@ -297,8 +297,8 @@ class DriverContractTests(unittest.TestCase):
         self.bundle.state._publish()
         self.assertFalse(json.loads(self.node.publisher.messages[-1].data)['connected'])
         self.assertFalse(self.call("state", "info")["feedback"]["connected"])
-        self.assertEqual(self.call("loco", "start")["state"], "ready")  # Lifecycle only.
-        self.assertEqual(self.call("loco", "info")["state"], "disconnected")
+        self.assertEqual(self.call("base_drive", "start")["state"], "ready")  # Lifecycle only.
+        self.assertEqual(self.call("base_drive", "info")["state"], "disconnected")
 
     def test_actuator_lifecycle_never_waits_for_control_lock_or_calls_hardware(self):
         entered, release = threading.Event(), threading.Event()
@@ -424,7 +424,7 @@ class DriverContractTests(unittest.TestCase):
         self.assertIn('connection changed', result['error'])
 
     def test_stops_preempt_blocked_resume_and_mode_service_without_waiting(self):
-        for transition, card, stop_action in [('resume', 'loco', 'stop_move'),
+        for transition, card, stop_action in [('resume', 'base_drive', 'stop_move'),
                                                ('set_mode', '_control', 'pause')]:
             with self.subTest(transition=transition):
                 self.ros.emit('/enable_control_state', transition != 'resume')
@@ -464,7 +464,7 @@ class DriverContractTests(unittest.TestCase):
                 self.assertFalse(worker.is_alive())
                 self.assertIn('superseded', results[0]['error'])
                 self.assertTrue(self.bundle.state.motion_blocked)
-                self.assertEqual(self.call('loco', 'move', duration=.1)['state'], 'error')
+                self.assertEqual(self.call('base_drive', 'move', duration=.1)['state'], 'error')
                 if transition == 'resume':
                     pending = self.bundle._remote_resume['pending']
                     self.ros.service_results[id(pending)] = {'success': False}
@@ -585,7 +585,7 @@ class DriverContractTests(unittest.TestCase):
 
     def test_stop_preempts_service_wait_and_cancels_other_actions_exactly_once(self):
         # A pause service can itself be waiting while ACP actions are cancelled.
-        action = self.call('loco', 'move', duration=1)
+        action = self.call('base_drive', 'move', duration=1)
         entered, release = threading.Event(), threading.Event()
         results = []
         original = self.ros.wait_service
@@ -601,10 +601,10 @@ class DriverContractTests(unittest.TestCase):
             worker.start()
             try:
                 self.assertTrue(entered.wait(1))
-                self.assertEqual(self.call('loco', 'stop_move')['state'], 'paused')
+                self.assertEqual(self.call('base_drive', 'stop_move')['state'], 'paused')
                 self.assertTrue(worker.is_alive())
                 self.assertTrue(wait_until(lambda: bool(self.callbacks)))
-                self.assertEqual([c[:3] for c in self.callbacks], [(action['action_id'], 'loco', 'cancelled')])
+                self.assertEqual([c[:3] for c in self.callbacks], [(action['action_id'], 'base_drive', 'cancelled')])
             finally:
                 release.set()
                 worker.join(1)
@@ -613,7 +613,7 @@ class DriverContractTests(unittest.TestCase):
     def test_stale_enable_never_allows_motion_resume_or_mode_shortcuts(self):
         self.bundle.state._enable_verified_at = time.monotonic() - 3600
         self.bundle.state._seen['control_enabled'] = time.monotonic() - 3600
-        for card, args in [('loco', dict(action='move', duration=.1)),
+        for card, args in [('base_drive', dict(action='move', duration=.1)),
                            ('_control', dict(action='resume')),
                            ('_control', dict(action='set_mode', mode=3))]:
             self.assertIn('verification is missing or stale', self.call(card, **args)['error'])
@@ -677,15 +677,15 @@ class DriverContractTests(unittest.TestCase):
         self.bundle.state._enable_verified_at = time.monotonic() - driver.ENABLE_LEASE_S - 1
         self.ros.emit('/enable_control_state', True)
         self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 3)
-        self.assertIn('verification is missing or stale', self.call('loco', 'move', duration=.1)['error'])
+        self.assertIn('verification is missing or stale', self.call('base_drive', 'move', duration=.1)['error'])
         self.assertEqual(self.ros.published, [])
 
     def test_enable_verification_loss_aborts_inflight_action(self):
-        action = self.call('loco', 'move', duration=1)
+        action = self.call('base_drive', 'move', duration=1)
         self.ros.enable_publishers = []
         self.bundle.state.verify_enable()
         self.assertTrue(wait_until(lambda: bool(self.callbacks)))
-        self.assertEqual(self.callbacks[0][:3], (action['action_id'], 'loco', 'error'))
+        self.assertEqual(self.callbacks[0][:3], (action['action_id'], 'base_drive', 'error'))
         self.assertIn('control-enable', self.callbacks[0][3]['reason'])
         self.assertTrue(self.bundle.state.motion_blocked)
 
@@ -732,19 +732,19 @@ class DriverContractTests(unittest.TestCase):
             self.ros.emit("/enable_control_state", True)
             self.ros.emit("/mobile_manipulator/lb_mpc_control_mode", 3)
             setup()
-            result = self.call('loco', 'move', duration=.1)
+            result = self.call('base_drive', 'move', duration=.1)
             self.assertEqual(result['state'], 'executing')
             self.assertEqual(result['control_preparation']['mode'], 3)
-            self.call('loco', 'stop_move')
+            self.call('base_drive', 'stop_move')
         self.ros.motion_ready = False
         boundary, calls = len(self.ros.published), len(self.ros.sent_services)
-        self.assertIn('warming up', self.call('loco', 'move', duration=.1)['error'])
+        self.assertIn('warming up', self.call('base_drive', 'move', duration=.1)['error'])
         self.assertEqual((len(self.ros.published), len(self.ros.sent_services)), (boundary, calls))
 
     def test_rejects_invalid_values_before_hardware_calls(self):
         for args in ({"vx": 1, "duration": 1}, {"vx": True, "duration": 1},
                      {"vx": float("nan"), "duration": 1}, {"duration": 0}, {"duration": "1"}):
-            self.assertEqual(self.call("loco", "move", **args)["state"], "error")
+            self.assertEqual(self.call("base_drive", "move", **args)["state"], "error")
         self.assertEqual(self.call("arm", "move_joints", positions=[0] * 13)["state"], "error")
         self.assertEqual(self.call("waist", "set_pose", x=0)["state"], "error")
         self.assertEqual(self.ros.published, [])
@@ -761,7 +761,7 @@ class DriverContractTests(unittest.TestCase):
             order.append((args[0], args[2]))
             return publish(*args)
         with patch.object(self.ros, 'start_service', side_effect=service), patch.object(self.ros, 'publish', side_effect=target):
-            result = self.call('loco', 'move', vx=.05, duration=.1)
+            result = self.call('base_drive', 'move', vx=.05, duration=.1)
         self.assertEqual(result['state'], 'executing')
         self.assertEqual(order[:2], [('/enable_control', {'data': True}),
                                     ('/mobile_manipulator_mpc_control', {'control_mode': 3})])
@@ -794,7 +794,7 @@ class DriverContractTests(unittest.TestCase):
                 'right_position': [0., -.4, 0.], 'left_quaternion': [0., 0., 0., 1.],
                 'right_quaternion': [0., 0., 0., 1.]})):
             with self.subTest(card=card, action=action):
-                self.call('loco', 'stop_move')
+                self.call('base_drive', 'stop_move')
                 self.ros.raw()
                 result = self.call(card, action, **args)
                 self.assertEqual(result['state'], 'executing')
@@ -815,7 +815,7 @@ class DriverContractTests(unittest.TestCase):
                 return {'result': False, 'message': 'mode rejected'}
             return original(service, *args)
         with patch.object(self.ros, 'call_service', side_effect=reject_mode):
-            result = self.call('loco', 'move', vx=.2, duration=.1)
+            result = self.call('base_drive', 'move', vx=.2, duration=.1)
         self.assertEqual(result['state'], 'error')
         self.assertFalse(self.bundle.state.confirmed_enable())
         self.assertFalse(self.bundle.tracker._active)
@@ -827,7 +827,7 @@ class DriverContractTests(unittest.TestCase):
         self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 1)
         self.ros.confirm = False
         with patch.object(driver, 'CONTROL_TIMEOUT_S', .04):
-            result = self.call('loco', 'move', vx=.2, duration=.1)
+            result = self.call('base_drive', 'move', vx=.2, duration=.1)
         self.assertEqual(result['state'], 'error')
         self.assertIn('not confirmed', result['error'])
         self.assertFalse(self.bundle.tracker._active)
@@ -845,7 +845,7 @@ class DriverContractTests(unittest.TestCase):
                     self.ros.subscriptions['/mobile_manipulator/lb_mpc_control_mode'] = callback
             return original(service, *args)
         with patch.object(self.ros, 'call_service', side_effect=enable_without_mpc), patch.object(driver, 'CONTROL_TIMEOUT_S', .04):
-            result = self.call('loco', 'move', vx=.2, duration=.1)
+            result = self.call('base_drive', 'move', vx=.2, duration=.1)
         self.assertIn('resumed MPC mode feedback not confirmed', result['error'])
         self.assertEqual([s[2] for s in self.ros.sent_services], [{'data': True}, {'data': False}])
         self.assertFalse(any(p[0] == '/cmd_vel' and p[2]['linear']['x'] for p in self.ros.published))
@@ -853,19 +853,19 @@ class DriverContractTests(unittest.TestCase):
     def test_action_never_auto_resumes_before_boot_confirmation(self):
         self.bundle.state._boot_update({'data': json.dumps({'state': 'initializing', 'boot_pause_confirmed': False})})
         self.ros.emit('/enable_control_state', False)
-        self.assertIn('boot initialization/pause is not confirmed', self.call('loco', 'move', duration=.1)['error'])
+        self.assertIn('boot initialization/pause is not confirmed', self.call('base_drive', 'move', duration=.1)['error'])
         self.assertEqual(self.ros.sent_services, [])
 
     def test_incompatible_preparation_does_not_reconfigure_an_inflight_action(self):
         self.ros.emit('/mobile_manipulator/lb_mpc_control_mode', 1)
         arm = self.call('arm', 'move_joints', positions=[0.] * 14)
-        self.assertIn('another action', self.call('loco', 'move', duration=.1)['error'])
+        self.assertIn('another action', self.call('base_drive', 'move', duration=.1)['error'])
         self.assertEqual(self.ros.sent_services, [])
         self.assertTrue(self.bundle.tracker.current('arms', arm['action_id']))
 
     def test_base_arm_mode_allows_independent_channels_without_reconfiguration(self):
         self.assertEqual(self.call('arm', 'move_joints', positions=[0.] * 14)['state'], 'executing')
-        self.assertEqual(self.call('loco', 'move', duration=.1)['state'], 'executing')
+        self.assertEqual(self.call('base_drive', 'move', duration=.1)['state'], 'executing')
         self.assertEqual(self.ros.sent_services, [])
 
     def test_stop_between_auto_resume_and_mode_cannot_recover_or_cancel_a_new_action(self):
@@ -881,12 +881,12 @@ class DriverContractTests(unittest.TestCase):
                 release.wait(2)
             return result
         with patch.object(self.bundle, 'confirm_control', side_effect=confirm):
-            thread = threading.Thread(target=lambda: results.append(self.call('loco', 'move', vx=.2, duration=1)))
+            thread = threading.Thread(target=lambda: results.append(self.call('base_drive', 'move', vx=.2, duration=1)))
             thread.start()
             try:
                 self.assertTrue(entered.wait(1))
-                self.assertEqual(self.call('loco', 'stop_move')['state'], 'paused')
-                fresh = self.call('loco', 'move', duration=1)
+                self.assertEqual(self.call('base_drive', 'stop_move')['state'], 'paused')
+                fresh = self.call('base_drive', 'move', duration=1)
                 self.assertEqual(fresh['state'], 'executing')
                 boundary = len(self.ros.sent_services)
             finally:
@@ -912,19 +912,19 @@ class DriverContractTests(unittest.TestCase):
                 self.ros.service_results[id(pending)] = {'result': True, 'mode': 3}
             return original(pending, timeout, cancelled)
         with patch.object(self.ros, 'wait_service', side_effect=wait):
-            thread = threading.Thread(target=lambda: results.append(self.call('loco', 'move', vx=.2, duration=1)))
+            thread = threading.Thread(target=lambda: results.append(self.call('base_drive', 'move', vx=.2, duration=1)))
             thread.start()
             try:
                 self.assertTrue(entered.wait(1))
-                self.assertEqual(self.call('loco', 'stop_move')['state'], 'paused')
+                self.assertEqual(self.call('base_drive', 'stop_move')['state'], 'paused')
                 before = len(self.ros.sent_services)
-                self.assertIn('mode change is unresolved', self.call('loco', 'move', duration=1)['error'])
+                self.assertIn('mode change is unresolved', self.call('base_drive', 'move', duration=1)['error'])
                 self.assertEqual(len(self.ros.sent_services), before)
             finally:
                 release.set()
                 thread.join(1)
         self.assertIn('superseded', results[0]['error'])
-        self.assertEqual(self.call('loco', 'move', duration=.1)['state'], 'executing')
+        self.assertEqual(self.call('base_drive', 'move', duration=.1)['state'], 'executing')
 
     def test_stop_during_argument_validation_cannot_be_undone_by_the_old_action(self):
         entered, release, result = threading.Event(), threading.Event(), []
@@ -935,11 +935,11 @@ class DriverContractTests(unittest.TestCase):
                 release.wait(2)
             return original(value, name, *args)
         with patch.object(driver, '_number', side_effect=number):
-            thread = threading.Thread(target=lambda: result.append(self.call('loco', 'move', vx=.2, duration=1)))
+            thread = threading.Thread(target=lambda: result.append(self.call('base_drive', 'move', vx=.2, duration=1)))
             thread.start()
             try:
                 self.assertTrue(entered.wait(1))
-                self.assertEqual(self.call('loco', 'stop_move')['state'], 'paused')
+                self.assertEqual(self.call('base_drive', 'stop_move')['state'], 'paused')
                 boundary = len(self.ros.sent_services)
             finally:
                 release.set()
@@ -947,6 +947,25 @@ class DriverContractTests(unittest.TestCase):
         self.assertIn('superseded by stop', result[0]['error'])
         self.assertEqual(len(self.ros.sent_services), boundary)
         self.assertFalse(any(p[0] == '/cmd_vel' and p[2]['linear']['x'] for p in self.ros.published))
+
+    def test_legacy_loco_config_enables_only_renamed_base_drive(self):
+        bundle = driver.KuavoBundle({'plugins': {'loco': {'enabled': True}}},
+                                   'renamed_robot', self.ros, self.node)
+        try:
+            tools = bundle.get_all_tools()
+            self.assertEqual([t['name'] for t in tools], ['base_drive'])
+            self.assertEqual(bundle.dispatch('base_drive', {'action': 'info'})['state'], 'ready')
+        finally:
+            bundle.close()
+
+    def test_explicit_base_drive_disable_overrides_legacy_loco_enable(self):
+        bundle = driver.KuavoBundle({'plugins': {'loco': {'enabled': True},
+                                               'base_drive': {'enabled': False}}},
+                                   'renamed_robot', self.ros, self.node)
+        try:
+            self.assertEqual(bundle.get_all_tools(), [])
+        finally:
+            bundle.close()
 
     def test_arm_measured_completion_needs_no_vendor_reach_time(self):
         result = self.call("arm", "move_joints", positions=list(range(14)))
@@ -991,7 +1010,7 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(self.ros.services, [])
 
     def test_loco_velocity_acp_waits_for_vendor_stop_window(self):
-        result = self.call("loco", "move", vx=0.1, duration=0.1)
+        result = self.call("base_drive", "move", vx=0.1, duration=0.1)
         self.assertIn("action_id", result)
         self.assertGreater(self.ros.published[0][2]["linear"]["x"], 0)
         self.assertTrue(wait_until(lambda: self.ros.published[-1][2]["linear"]["x"] == 0))
@@ -1001,10 +1020,10 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(self.callbacks[0][3]["stop_delay_s"], 1.0)
 
     def test_base_busy_or_invalid_command_preserves_active_motion(self):
-        velocity = self.call("loco", "move", vx=0.1, duration=1)
-        bad = self.call("loco", "move_relative", x=0.2)
+        velocity = self.call("base_drive", "move", vx=0.1, duration=1)
+        bad = self.call("base_drive", "move_relative", x=0.2)
         self.assertEqual(bad['state'], 'error')
-        pose = self.call("loco", "move_relative", x=0.2, y=0, yaw=0)
+        pose = self.call("base_drive", "move_relative", x=0.2, y=0, yaw=0)
         self.assertIn('busy', pose['error'])
         self.assertTrue(self.bundle.tracker.current('base', velocity['action_id']))
         self.assertFalse(any(p[0] == '/cmd_pose' for p in self.ros.published))
@@ -1012,7 +1031,7 @@ class DriverContractTests(unittest.TestCase):
 
     def test_split_action_schemas_are_action_specific(self):
         tools = {t['name']: t for t in self.bundle.get_all_tools()}
-        self.assertEqual(tools['loco']['inputSchema']['x-action-params']['move']['required'], ['duration'])
+        self.assertEqual(tools['base_drive']['inputSchema']['x-action-params']['move']['required'], ['duration'])
         self.assertEqual(set(tools['arm']['inputSchema']['properties']['action']['enum']), {'set', 'stop_move'})
 
     def test_joint_command_rejected_without_fresh_measurement(self):
@@ -1031,7 +1050,7 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(self.bundle.sensors.health()['joint_limits'],
                          {'arm': {'available': False}, 'leg': {'available': False}})
         self.assertTrue(self.bundle.state.motion_enabled)
-        self.assertEqual(self.call('loco', 'move', duration=.1)['state'], 'executing')
+        self.assertEqual(self.call('base_drive', 'move', duration=.1)['state'], 'executing')
 
     def test_vendor_runtime_arm_can_publish_and_missing_limits_abort_in_flight(self):
         self.bundle.sensors._joint_limit_config = None
@@ -1421,15 +1440,15 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(self.callbacks, [])
 
     def test_stop_blocks_old_velocity_thread_and_cancels_acp_once(self):
-        result = self.call("loco", "move", vx=0.1, duration=1)
-        stopped = self.call("loco", "stop_move")
+        result = self.call("base_drive", "move", vx=0.1, duration=1)
+        stopped = self.call("base_drive", "stop_move")
         self.assertEqual(stopped["state"], "paused")
         boundary = len(self.ros.published)
         time.sleep(0.1)
         self.assertEqual(len(self.ros.published), boundary)
         self.assertTrue(wait_until(lambda: self.callbacks))
-        self.assertEqual([c[:3] for c in self.callbacks], [(result["action_id"], "loco", "cancelled")])
-        fresh = self.call('loco', 'move', duration=.1)
+        self.assertEqual([c[:3] for c in self.callbacks], [(result["action_id"], "base_drive", "cancelled")])
+        fresh = self.call('base_drive', 'move', duration=.1)
         self.assertEqual(fresh['state'], 'executing')
         self.assertNotEqual(fresh['action_id'], result['action_id'])
         self.assertTrue(fresh['control_preparation']['resumed'])
@@ -1456,7 +1475,7 @@ class DriverContractTests(unittest.TestCase):
         # A False feedback/accepted pause is not proof the old target was cancelled.
         self.assertFalse(self.bundle.state.confirmed_enable())
         self.assertIn('delivery is uncertain', self.call('_control', 'resume')['error'])
-        self.assertEqual(self.call('loco', 'move', duration=.1)['state'], 'error')
+        self.assertEqual(self.call('base_drive', 'move', duration=.1)['state'], 'error')
         count = len(self.ros.sent_services)
         self.bundle.close()
         self.assertEqual(len(self.ros.sent_services), count + 1)
@@ -1464,10 +1483,10 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(len(self.callbacks), 1)
 
     def test_partial_initial_position_send_fails_closed_and_shutdown_retries_stop(self):
-        self._partial_initial_send('loco', 'move_relative', '/cmd_pose', x=.01, y=0., yaw=0.)
+        self._partial_initial_send('base_drive', 'move_relative', '/cmd_pose', x=.01, y=0., yaw=0.)
 
     def test_partial_initial_velocity_send_fails_closed(self):
-        self._partial_initial_send('loco', 'move', '/cmd_vel', vx=.01, duration=.2)
+        self._partial_initial_send('base_drive', 'move', '/cmd_vel', vx=.01, duration=.2)
 
     def test_partial_initial_joint_send_fails_closed(self):
         self._partial_initial_send('arm', 'move_joints', '/kuavo_arm_traj', positions=[0.] * 14)
@@ -1477,7 +1496,7 @@ class DriverContractTests(unittest.TestCase):
             self.ros.connection = (False, 1)
             raise ConnectionError('delivery unknown')
         with patch.object(self.ros, 'publish', side_effect=disconnect):
-            result = self.call('loco', 'move', duration=.2)
+            result = self.call('base_drive', 'move', duration=.2)
         self.assertEqual(result['command_delivery'], 'uncertain')
         self.assertFalse(result['physical_stop_confirmed'])
         self.ros.connection = (True, 2)
@@ -1505,7 +1524,7 @@ class DriverContractTests(unittest.TestCase):
                 release.wait(2)
             return original_wait(pending, timeout, cancelled)
         with patch.object(self.ros, 'publish', side_effect=publish), patch.object(self.ros, 'wait_service', side_effect=wait):
-            worker = threading.Thread(target=lambda: result.append(self.call('loco', 'move', duration=.2)))
+            worker = threading.Thread(target=lambda: result.append(self.call('base_drive', 'move', duration=.2)))
             worker.start()
             try:
                 self.assertTrue(entered.wait(1))
@@ -1523,7 +1542,7 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(len(self.callbacks), 1)
 
     def test_input_validation_failure_does_not_mark_delivery_uncertain(self):
-        self.assertEqual(self.call('loco', 'move', duration=-1)['state'], 'error')
+        self.assertEqual(self.call('base_drive', 'move', duration=-1)['state'], 'error')
         self.assertFalse(self.bundle.state.motion_send_uncertain)
         self.assertFalse(self.bundle.state.motion_blocked)
         self.assertEqual(self.ros.sent_services, [])
@@ -1570,7 +1589,7 @@ class DriverContractTests(unittest.TestCase):
             self.assertAlmostEqual(value, math.degrees(target))
 
     def test_named_joint_targets_refresh_unset_joints_after_resume(self):
-        self.call('loco', 'stop_move')
+        self.call('base_drive', 'stop_move')
         original = self.bundle.confirm_control
         def confirm(*args, **kwargs):
             result = original(*args, **kwargs)
@@ -1704,7 +1723,7 @@ class DriverContractTests(unittest.TestCase):
         self.assertFalse(self.ros.published)
 
     def test_head_refreshes_omitted_axis_after_resume(self):
-        self.call('loco', 'stop_move')
+        self.call('base_drive', 'stop_move')
         original = self.bundle.confirm_control
         def confirm(*args, **kwargs):
             result = original(*args, **kwargs)
@@ -1751,7 +1770,7 @@ class DriverContractTests(unittest.TestCase):
             self.ros.raw()
             self.assertTrue(entered.wait(1))
             try:
-                result = self.call("loco", "stop_move")
+                result = self.call("base_drive", "stop_move")
                 self.assertEqual(result["state"], "paused")
                 self.assertFalse(release.is_set())
             finally:
@@ -1780,10 +1799,10 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(args, {"action": "info"})
 
     def test_shutdown_pauses_and_rejects_new_motion(self):
-        self.call("loco", "move", duration=1)
+        self.call("base_drive", "move", duration=1)
         self.bundle.close()
         self.assertEqual(self.ros.services[-1][0], "/enable_control")
-        self.assertEqual(self.call("loco", "move", duration=1)["state"], "error")
+        self.assertEqual(self.call("base_drive", "move", duration=1)["state"], "error")
         # close is idempotent, including the callback worker.
         self.assertTrue(self.bundle._closing)
 
@@ -1799,9 +1818,9 @@ class MotionConfigurationTests(unittest.TestCase):
             ros.emit('/mobile_manipulator/lb_mpc_control_mode', 3)
             bundle.state.verify_enable()
             cases = [
-                ('loco', dict(action='move', duration=.1)),
-                ('loco', dict(action='move_relative', x=0, y=0, yaw=0)),
-                ('loco', dict(action='move_to', x=0, y=0, yaw=0)),
+                ('base_drive', dict(action='move', duration=.1)),
+                ('base_drive', dict(action='move_relative', x=0, y=0, yaw=0)),
+                ('base_drive', dict(action='move_to', x=0, y=0, yaw=0)),
                 ('arm', dict(action='move_joints', positions=[0.] * 14)),
                 ('arm', dict(action='set_pose', frame='world', left_position=[0, .4, 0],
                              right_position=[0, -.4, 0], left_quaternion=[0, 0, 0, 1],
@@ -1822,7 +1841,7 @@ class MotionConfigurationTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'motion is disabled'):
                     request()
             self.assertIsNone(bundle.dispatch('switch_mode', {'action': 'resume'}))
-            self.assertEqual(bundle.dispatch('loco', {'action': 'stop_move'})['state'], 'paused')
+            self.assertEqual(bundle.dispatch('base_drive', {'action': 'stop_move'})['state'], 'paused')
             self.assertFalse(ros.services[-1][2]['data'])
         finally:
             bundle.close()

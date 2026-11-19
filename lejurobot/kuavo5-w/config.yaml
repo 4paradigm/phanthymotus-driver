@@ -44,7 +44,7 @@ sensors:
   # Legs/waist still require commissioning. Vendor limits are not certification.
   joint_limits: null
 plugins:
-  loco: {enabled: true}
+  base_drive: {enabled: true}
   arm: {enabled: true}
   leg: {enabled: true}
   waist: {enabled: true}

@@ -142,7 +142,7 @@ class PeripheryTests(unittest.TestCase):
         self.assertFalse(self.periphery.snapshot('camera_left')['valid'])
 
     def test_background_start_cannot_start_actuator_cards(self):
-        bundle = driver.KuavoBundle({'sensors': {'auto_start': ['arm', 'loco', 'switch_mode', 'battery', 'imu']}},
+        bundle = driver.KuavoBundle({'sensors': {'auto_start': ['arm', 'base_drive', 'switch_mode', 'battery', 'imu']}},
                                    'test', self.ros, FakeNode())
         try:
             with patch.object(bundle.startup_checks, 'start'), patch.object(bundle, 'dispatch') as dispatch:
