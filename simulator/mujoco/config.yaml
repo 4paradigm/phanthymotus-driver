@@ -1,0 +1,12 @@
+mcp_port: 15712
+name: 仿真环境 (MuJoCo)
+ros_namespace: mujoco
+ros:
+  robot_domain_id: 42
+  core_domain_id: 42
+  robot_interface: lo
+plugins:
+  simulation:
+    enabled: true
+    endpoint: ""
+    api_key: ""
