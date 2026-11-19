@@ -38,7 +38,16 @@ RUN . /etc/os-release && \
 # On x86_64 -> arm64 QEMU builds, libc-bin's post-install trigger has crashed
 # after the combined install; do not mask apt/dpkg failures.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3-numpy python3-opencv ffmpeg && \
+      python3-numpy python3-opencv && \
+    rm -rf /var/lib/apt/lists/*
+
+# Keep the known-good OpenCV transaction unchanged: adding FFmpeg to it
+# crashed the libc-bin trigger under ARM64 emulation. Check the encoder in
+# the final runtime environment so a build without H.264 support fails here.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && \
+    ffmpeg -nostdin -v error -f lavfi -i color=size=16x16 -frames:v 1 \
+      -an -c:v libx264 -threads 1 -f mp4 -y /tmp/panther-encoder.mp4 && \
+    test -s /tmp/panther-encoder.mp4 && rm /tmp/panther-encoder.mp4 && \
     rm -rf /var/lib/apt/lists/*
 
 # Runtime dependencies deliberately come from Ubuntu/ROS apt packages. This
