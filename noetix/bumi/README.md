@@ -500,3 +500,7 @@ media cards and motion cards keep running.
 
 The output contract, quality states, assumed body-axis calibration, validation
 status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
+
+## 区域目标在场卡
+
+[区域在场、停留与取景引导使用说明](REGION_PRESENCE.md)
