@@ -448,6 +448,39 @@ ros2 topic hz /<robot_namespace>/motion/state
 docker logs -f embodied-noetix-bumi
 ```
 
+## `spin`
+
+原地缓慢转圈：输入圈数（1–5）、选择顺时针/逆时针，并可调整旋转速度。
+卡片用 IMU 闭环控制，起步平滑、接近目标自动减速，最后用短脉冲修正，避免急转急停。
+
+- `spin`：按 `turns`、`direction` 和 `speed` 转圈。`clockwise`=顺时针（右转），
+  `counterclockwise`=逆时针（左转）；最大 5 圈；`speed` 范围 0.55–0.80，
+  默认 0.55（与旧版本相同）。
+- `stop`：立即停止并发送零速度。
+- `info`：当前状态、workmode、最近一次结果、可用速度范围和上限。
+- `start`：检查 HighController 是否就绪，不移动。
+
+安全要求：机器人必须已稳定站立并处于行走模式（workmode=2），地面平坦防滑，
+周围至少 3m×3m 无人无障碍物；旋转过程中不要靠近或推拉机器人。其他移动动作
+（`loco`、`loco_relative_move`、`loco_servo`）正在执行时卡片会拒绝启动；
+本卡片启动时也会先暂停 `loco_servo` 的流式速度，并占用底盘互斥标记，
+显式动作优先。
+
+转圈是异步动作：返回 `action_id`，完成/取消/失败通过
+`AGENT_CORE_URL/api/acp/complete` 上报（`x-completion`）。`stop` 会打断当前转圈。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `speed`（卡片输入） | `0.55` | 归一化角速度，0.55 是旧版本速度（最慢），0.80 是上限；越大越快 |
+| `max_vyaw`（config） | `0.80` | 卡片允许的最高速度上限，范围 0.55–0.80 |
+
+> 0.40 左右是 Bumi 的偏航死区，低于该值腿式底盘可能只抖不转，所以最低速度固定为
+> 0.55。最高上限取 0.80：满速 1.0 对应实测约 0.83 rad/s，0.80 约 0.66 rad/s
+>（约 38°/s），低于满速，也仍属于温和范围。`speed` 只是巡航上限，实际速度还会
+> 按剩余角度减速，最后用 0.45 的短脉冲修正。
+
+测试：`python -m pytest noetix/bumi/tests/test_spin_card.py -q`
+
 ## Read-only RGB-D visual odometry card (`rgbd_visual_odometry`)
 
 Single container: the estimator runs inside this bundle, not in a sidecar.
