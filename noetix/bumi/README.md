@@ -1,5 +1,7 @@
 # Noetix Bumi driver
 
+The `vision_tf` and `tf_tree` processors connect metric camera observations to Bumi's live robot frames. See [camera mount calibration, wiring and hand-to-target verification](TF.md).
+
 The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
 
 ## `mic` and `sound_direction`
