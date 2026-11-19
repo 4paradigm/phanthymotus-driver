@@ -264,6 +264,132 @@ in `device.py`; no extra runtime Python file is required.
 
 ## New cards
 
+### `media_status` — 板载媒体单元的运行状态
+
+只读。Bumi 身上有两套计算单元：管腿和行走的 `HighController`，以及管听、说、看的那台
+板载媒体单元（`MediaController`）。现有卡片只用到后者的**输出**（相机画面、麦克风音频），
+没有一张说明它自己现在是什么状态 —— 于是"机器人不说话了"这件事，在仪表盘上和
+"机器人坏了"长得一模一样。
+
+命名上刻意与 `system_health` 区分：那张卡看的是算力板的操作系统指标（温度、CPU、
+内存、文件系统），这张看的是厂商媒体栈自己的状态机与错误码，两者没有重叠字段。
+
+输出 `/<namespace>/media/status`（`data/json`，默认 1 Hz），字段全是顶层标量，好让
+仪表盘的 KV 面板直接渲染：
+
+| 字段 | 含义 |
+| --- | --- |
+| `work_status` / `work_status_text` | `READY` 就绪 / `SLEEPED` 已休眠 / `WAKEUPED` 已唤醒 / `EXIT` 已退出（复位中） |
+| `reason` / `reason_text` | 为什么会变成现在这样：超时自动休眠、被语音或命令唤醒/休眠、出错休眠、复位、开机 |
+| `awake` | 是否处于可听可说的状态；读不到时为 `null` |
+| `healthy` | 只有 `ERROR_SLEEPED` 为 `false`；读不到、或固件状态/原因不在已知词表中时为 `null` |
+| `transitioning` | 正在 `EXIT` / `CMD_RESET` 复位途中 |
+| `sleep_after_s` | 自动休眠阈值（`get_timeout()` 的毫秒折算成秒） |
+| `error_code` / `error_message` | 最近一次错误；`0` / `""` 表示没有记录 |
+| `observed_for_s` | 本驱动观察到当前状态持续的时长 |
+| `last_wakeup_age_s` | 距最近一次**被观察到**的唤醒多久；没观察到就是 `null` |
+| `read_errors` | 连续读取失败次数，成功后归零 |
+| `controller_present` | 媒体控制器是否真的创建成功；`false` 时重试不会自行恢复 |
+
+四条规则：
+
+- **休眠不是故障。** 超时休眠是这台机器人最常见的正常状态，把它报成 `healthy: false`
+  会让告警在正常使用时一直响，然后被忽略。`device.py` 对播放早已采用同一条规则
+  （`_AUDIO_RESET_RECOVERED_STATUSES`："Only ERROR_SLEEPED means the audio agent
+  itself is down"）。
+- **读不到不等于正常。** 状态读失败时 `healthy` 是 `null` 而不是 `true` —— SDK 不回答
+  不是"机器人没事"的证据。
+- **没见过的状态也不等于正常。** 固件新增的工作状态或原因会原样保留在
+  `work_status` / `reason` 及其文本里（便于发现变化），但只要有一个不在已知词表中，
+  `healthy` 就是 `null` —— 驱动没有依据替一个自己没学会分类的状态背书。
+- **时间戳是本驱动的观测，不是机器人的。** 这个 SDK 不提供任何时间戳（`odom_spec.py`
+  对 IMU 记过同一件事），所以 `observed_for_s` 从本驱动第一次看到该状态起算；一次读
+  失败会打断观测，恢复后重新计时，而不是跨过那段不知道发生了什么的时间。
+  `last_wakeup_age_s` 只有在驱动运行期间真的看到一次切到 `WAKEUPED` 时才有值。
+- **控制器没起来也要注册。** 与 `mic` / `speaker` 那些消费媒体单元的卡片不同，这张卡
+  不因 `media_ctrl is None` 被跳过（`main.py`）：媒体单元初始化失败恰好是它要报的病，
+  按控制器是否可用决定注册与否，等于把卡片从唯一需要的场景里删掉。此时它照常发布
+  `healthy: null`、`controller_present: false`，`read_errors` 持续增长。
+
+不带任何写操作：只调用 `get_system_status` / `get_system_error` / `get_timeout`，不调用
+`wakeup` / `sleep` / `restart`，也不改音量或超时。一张能顺手把被观测对象改掉的健康卡，
+需要别人先相信它不会。
+
+载荷的构造在 `media_status_spec.py`，不导入 rclpy，所以"哪些状态算故障"这条规则在
+笔记本上就能测（`tests/test_media_status.py`）。配置在 `plugins.media_status`：
+`poll_interval_s` 默认 `1.0`，允许 `[0.2, 5.0]`。该模块必须在镜像里单独 `COPY`
+（见 `Dockerfile` 末尾的模块清单），否则容器内 import 失败，卡片不会有任何输出。
+
+### `media_config` — 板载媒体单元的可配置项
+
+`media_status` 只回答"它现在是什么状态"，不能改任何东西；`speaker` 只管音量和播放路由。
+厂商 `MediaController` 里还有一组**能写**的设置项，此前没有任何卡片碰过它们 —— 这张卡就是
+它们的读写入口。
+
+**不发布话题、不轮询**：这是一张按需的 get/set 卡（`actuator`），没有 ROS 节点，也
+`topic_out: []`。与 `media_status` 的差别是本质的：那张卡被动持续采样，这张卡只在你调用
+时才碰 SDK。
+
+动作：
+
+| 动作 | 作用 |
+| --- | --- |
+| `get` | 一次读回全部配置项当前值 |
+| `set_timeout` / `set_audio_cue` / `set_wakeup_response` / `set_sleep_response` | 写单个配置项，**写完自动读回**放在 `readback` 里 |
+| `info` | 当前值 + 接口声明（有哪些项、哪些可写、取值范围） |
+| `start` / `stop` | 卡片生命周期，返回 `ready` / `idle` |
+
+配置项：
+
+| 参数名 | 含义 | 可写 | SDK 方法 | 取值 |
+| --- | --- | --- | --- | --- |
+| `timeout` | 自动休眠超时 | 是 | `get/set_timeout` | **整数毫秒**，`[1000, 3600000]` |
+| `audio_cue` | 应答提示音开关 | 是 | `get/set_audio_cue_enable` | 真正的 `true` / `false`（字符串不行） |
+| `wakeup_response` | 被唤醒时说的应答词 | 是 | `get/set_wakeup_response_words` | 非空字符串，≤256 字符 |
+| `sleep_response` | 进入休眠时说的应答词 | 是 | `get/set_sleep_response_words` | 非空字符串，≤256 字符 |
+| `wakeup_words` | 唤醒词 | **否** | 只有 `get_wakeup_words` | 只读，见下 |
+
+**唤醒词是只读的，这是刻意的。** pybind 层只有 `get_wakeup_words`，厂商没有提供
+`set_wakeup_words`（`.pyi` 里也搜不到）。把"设置唤醒词"做成一个动作，验收时会发现它根本
+调不通 —— 所以卡片照实把它标成只读，`set_wakeup_words` 这个动作不存在。
+
+**`timeout` 只收整数毫秒，小数报错而不是截断。** SDK 的签名是
+`set_timeout(int timeout_ms)`；`int(1.9)` 会等于 `1`，一个手误就会被当成"立刻休眠"，
+而且写入还显示成功。所以 `1.9` / `"120001.5"` 直接返回 `state: error`，而 `60000.0`、
+`"60000"` 这种整数值照常接受。
+
+**亚秒值会被拒绝，避免把"5 秒"写成 5 毫秒。** `timeout` 的下限是 1000 毫秒（1 秒）：
+`5` / `500` 这类值直接返回 `state: error`，错误信息会提醒单位是毫秒、想表达秒请乘以
+1000。合法用法是写 `5000` 表达 5 秒；`1000` 本身是合法的 1 秒。自动休眠阈值低于 1 秒
+没有实际意义，而且配置写之间有 500 ms 间隔，亚秒值根本来不及起作用。
+
+**写完的读回和写是同一次原子操作。** MCP 请求是并发处理的：如果 `set_*` 先释放门禁锁、
+再去读值，另一个 `set_*` 就可能插在中间 —— A 写 60000、B 写 90000，A 却把 B 的 90000
+当成自己写入的结果报回来。所以 setter 与 getter 都在 `MediaControllerWriteGate` 的**同一
+个临界区**内完成，`readback` 一定是这次调用自己写下的值；500 ms 间隔仍然照常生效。
+并发交错的回归用例在 `tests/test_media_config.py`。
+
+**写操作之间必须隔 ≥500 ms。** 厂商的约束是**同一个 `MediaController` 上两次配置写**的
+最小间隔，间隔过短可能让语音系统崩掉（需要返厂）。所以这个间隔门不是每张卡一把锁，而是
+`device.py` 里的一个 `MediaControllerWriteGate`，由 `speaker` 和 `media_config` **共用同一
+个实例**：否则 `speaker.set_volume` 紧跟 `media_config.set_timeout` 时，两张卡各自看自己的
+计时器都觉得"可以写"，实际却连着打了两下。跨卡串行化由
+`tests/test_media_config.py` 里基于假时钟的测试盯着。
+
+两条与 `media_status` 相反的注册规则：
+
+- **媒体控制器不在就不注册。** 这张卡是**写**卡，`media_ctrl is None` 时它无事可做，
+  `main.py` 直接跳过并打印 `MediaConfigPlugin skipped: media unit unavailable`
+  （`media_status` 相反：它要报的正是这个病，所以照样注册）。
+- **写失败不编值。** 控制器没连上时任何 `set_*` 都被拒绝（`state: error`），`get` 返回
+  `values: null` + `controller_present: false`，而不是给一份看着正常的默认值。
+
+校验规则（整数毫秒不是秒也不是小数、布尔不是真值字符串、应答词非空）都在
+`media_config_spec.py`，
+不导入 rclpy，笔记本上就能测。该模块同样必须在镜像里单独 `COPY`
+（`COPY media_config_spec.py /work/media_config_spec.py`），否则容器内 import 失败、
+卡片静默消失。配置在 `plugins.media_config`：`enabled: true`，没有轮询参数。
+
 ### `motion_state`
 
 Passive, read-only whole-body motion telemetry from `HighController`. The card has no action parameters or execute button. Its single JSON output combines the former summary and joint views:

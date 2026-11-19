@@ -8,6 +8,7 @@ drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
   - LocoPlugin: locomotion, stand-up/prone storage, semantic actions and action recording
   - MicPlugin: 8ch mic capture → mono PCM 16kHz
   - SpeakerPlugin: audio playback via MediaController
+  - MediaStatusPlugin: on-board media unit state (read-only)
   - CameraPlugin: Realsense D435i color + depth
   - MotionStatePlugin: combined whole-body motion state
 """
@@ -64,6 +65,86 @@ _AUDIO_AGENT_POLL_INTERVAL_S = 0.1
 # utterance played while the vendor voice agent sat at SLEEPED/CMD_SLEEPED.
 # Only ERROR_SLEEPED means the audio agent itself is down.
 _AUDIO_RESET_RECOVERED_STATUSES = frozenset(("READY", "SLEEPED"))
+
+
+class MediaControllerWriteGate:
+    """The one 500 ms spacing gate for every write to a ``MediaController``.
+
+    The vendor's limit is a minimum interval between configuration writes to
+    the *controller*, not between writes issued by one card.  ``speaker`` and
+    ``media_config`` drive the same voice unit, so giving each its own timer
+    let two cards each see a free slot and call the SDK back to back — the
+    case the vendor says can crash the voice system and needs a factory
+    return.  Both cards therefore take this object instead of keeping private
+    ``_config_lock`` / ``_last_config_change`` state, and by default they get
+    the single process-wide instance below.
+
+    ``clock`` and ``sleep`` are injectable so a test can drive the interval
+    without spending real seconds in ``time.sleep``.
+
+    ``write_with_readback`` is for cards that report the applied value back to
+    the caller: the getter must run before this object releases its lock, or a
+    concurrent request can change the setting in between and be reported as
+    the first caller's own result.
+    """
+
+    def __init__(self, interval_s: float = _AUDIO_CONFIG_INTERVAL_S,
+                 clock=time.monotonic, sleep=time.sleep):
+        self._interval_s = interval_s
+        self._clock = clock
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._last_change = None
+
+    def write(self, setter, skip_if=None) -> bool:
+        """Run one SDK setter under the gate; report whether it ran.
+
+        ``skip_if`` is evaluated inside the lock and before any waiting, so a
+        caller whose write is already unnecessary (``speaker``'s read-back
+        check on the start path) costs neither a 500 ms delay nor a slot.
+        """
+        performed, _ = self._critical(setter, skip_if=skip_if, readback=None)
+        return performed
+
+    def write_with_readback(self, setter, readback, skip_if=None):
+        """Run a setter and its getter in ONE controller-wide critical section.
+
+        MCP requests are served concurrently.  Releasing the lock between the
+        setter and the getter lets a second ``set_*`` land in between, so the
+        first caller would report the *other* caller's value as its own
+        ``readback``.  Keeping both calls under the same lock makes the value a
+        call reports the one that call actually wrote; the 500 ms spacing still
+        applies to the setter.  Returns ``(performed, value)``.
+        """
+        return self._critical(setter, skip_if=skip_if, readback=readback)
+
+    def _critical(self, setter, skip_if, readback):
+        with self._lock:
+            if skip_if is not None and skip_if():
+                return False, None
+            if self._last_change is not None:
+                remaining = self._interval_s - (self._clock() - self._last_change)
+                if remaining > 0:
+                    self._sleep(remaining)
+            try:
+                setter()
+            finally:
+                # A setter that raised may still have reached the controller;
+                # count the attempt so the next write keeps its distance.
+                self._last_change = self._clock()
+            value = readback() if readback is not None else None
+            return True, value
+
+
+# One MediaController per process, so one gate per process.  Plugins accept a
+# ``write_gate`` argument for tests; production wiring relies on this default.
+_MEDIA_WRITE_GATE = MediaControllerWriteGate()
+
+
+def media_write_gate() -> MediaControllerWriteGate:
+    """Return the process-wide gate serializing MediaController writes."""
+    return _MEDIA_WRITE_GATE
+
 
 # ── Joint Mapping ─────────────────────────────────────────────────────────────
 # SDK motor_id order → URDF joint names (must match URDF exactly for skeleton renderer)
@@ -1856,7 +1937,8 @@ class MicPlugin:
 class SpeakerPlugin:
     PREFIX = "speaker"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
+    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl,
+                 write_gate: "MediaControllerWriteGate | None" = None):
         self._media_ctrl = media_ctrl
         self._namespace = namespace
         self._node = Node("bumi_speaker")
@@ -1868,8 +1950,7 @@ class SpeakerPlugin:
         self._frames_submitted = 0
         self._last_audio_time = 0.0
         self._last_error = None
-        self._last_config_change = 0.0
-        self._config_lock = threading.Lock()
+        self._config_gate = write_gate or _MEDIA_WRITE_GATE
         # HTTP MCP requests are handled concurrently.  Serialize operations
         # which change the shared MediaController audio state so a
         # start/stop sequence cannot interleave.
@@ -1929,14 +2010,6 @@ class SpeakerPlugin:
         finally:
             self._sub = None
 
-    def _wait_for_config_slot(self) -> None:
-        """Honor the SDK's 500 ms minimum interval between set calls."""
-        remaining = _AUDIO_CONFIG_INTERVAL_S - (
-            time.monotonic() - self._last_config_change
-        )
-        if remaining > 0:
-            time.sleep(remaining)
-
     def _set_config(
         self, getter_name: str, setter_name: str, enabled: bool, force: bool = False
     ) -> bool:
@@ -1947,17 +2020,20 @@ class SpeakerPlugin:
         value it can still return the stale one — believing it there would
         silently skip the write and leave the route closed.  The start path
         must therefore always write.
+
+        The interval lives on the controller-wide gate shared with
+        ``media_config``, not on this card: both write the same voice unit, and
+        per-card timers let them issue back-to-back writes.
         """
-        with self._config_lock:
-            setter = getattr(self._media_ctrl, setter_name)
-            if not force:
-                getter = getattr(self._media_ctrl, getter_name)
-                if bool(getter()) == enabled:
-                    return False
-            self._wait_for_config_slot()
-            setter(enabled)
-            self._last_config_change = time.monotonic()
-            return True
+        setter = getattr(self._media_ctrl, setter_name)
+        skip_if = None
+        if not force:
+            getter = getattr(self._media_ctrl, getter_name)
+
+            def skip_if() -> bool:
+                return bool(getter()) == enabled
+
+        return self._config_gate.write(lambda: setter(enabled), skip_if=skip_if)
 
     def _disable_config(self, getter_name: str, setter_name: str) -> bool:
         """Disable one MediaController route, only writing when necessary."""
@@ -2216,10 +2292,9 @@ class SpeakerPlugin:
         if action == "set_volume":
             vol = int(args.get("volume", 100))
             try:
-                with self._config_lock:
-                    self._wait_for_config_slot()
-                    self._media_ctrl.set_volume(vol)
-                    self._last_config_change = time.monotonic()
+                # Same controller-wide gate as every other set_*: a volume
+                # write and a media_config write hit one voice unit.
+                self._config_gate.write(lambda: self._media_ctrl.set_volume(vol))
                 return {"volume": vol, "state": "set"}
             except Exception as exc:
                 return {"state": "error", "error": str(exc)}
@@ -3059,6 +3134,284 @@ class MotionStatePlugin:
         return None
 
 
+# ── MediaStatusPlugin (read-only view of the media unit's own state) ───────
+
+# Refresh period for the auto-sleep threshold. `get_timeout()` is a separate
+# DDS query and the value only changes when somebody sets it, so it is cached
+# rather than asked for once per sample.
+_SLEEP_THRESHOLD_REFRESH_S = 60.0
+
+
+class _MediaUnitUnavailable(RuntimeError):
+    """The media controller was never created, so there is nothing to poll.
+
+    Distinct from a failed read: a failed read may well succeed on the next
+    sample, while this one cannot clear without restarting the container. The
+    payload says which of the two it is (`controller_present`), because an
+    operator waiting for `healthy` to come back needs to know whether waiting
+    can help.
+    """
+
+
+class _MediaStatusNode(Node):
+    """Polls the media unit's own status and publishes it as one JSON sample.
+
+    Read-only by construction: this node calls `get_system_status`,
+    `get_system_error` and `get_timeout`, and never `wakeup`, `sleep` or any
+    setter. A health card that could also change the thing it reports would have
+    to be trusted not to, and this one is meant to be safe to leave on screen.
+
+    The payload itself is built in `media_status_spec`, which imports no
+    rclpy, so the part where a mistake would be silent — which states count as
+    a fault — is testable on a laptop.
+    """
+
+    def __init__(self, namespace: str, media_ctrl, interval_s: float):
+        super().__init__("bumi_media_status")
+        self._media_ctrl = media_ctrl
+        self._topic = f"/{namespace}/media/status"
+        self._pub = self.create_publisher(String, self._topic, 10)
+        self._interval_s = interval_s
+        self._running = False
+        self._thread = None
+        # The (work_status, reason) pair last actually observed, and since when.
+        # Cleared on a failed read: after an outage the state was not observed
+        # continuously, so the duration must restart rather than span a gap it
+        # knows nothing about.
+        self._pair = None
+        self._pair_since = None
+        self._last_wakeup_at = None
+        self._read_errors = 0
+        self._sleep_after_ms = None
+        self._sleep_after_read_at = 0.0
+        # Bumped on every start. `stop` joins for one second, which is shorter
+        # than the longest allowed interval, so a thread from an earlier start
+        # can still be sleeping when the next one begins. Each thread therefore
+        # carries the generation it was started for and exits once superseded;
+        # otherwise stop-then-start leaves two threads publishing the same
+        # topic and nothing in the payload would reveal the doubled rate.
+        self._generation = 0
+        # Set by `stop` so a stop does not have to wait out `interval_s`.
+        self._stopped = threading.Event()
+
+    @property
+    def topic(self) -> str:
+        return self._topic
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def start_polling(self):
+        if self._running:
+            return
+        # Clear before the thread exists, so a stop from a previous cycle
+        # cannot be mistaken for this one's.
+        self._stopped.clear()
+        self._running = True
+        self._generation += 1
+        self._thread = threading.Thread(target=self._loop, args=(self._generation,),
+                                        daemon=True,
+                                        name="bumi_media_status")
+        self._thread.start()
+
+    def stop_polling(self):
+        self._running = False
+        self._stopped.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def read_now(self) -> dict:
+        """One sample on demand, for `info` — so a canvas that only asks does
+        not have to wait a poll interval for the topic to arrive."""
+        try:
+            return self._read_once(refresh_timeout=True)
+        except Exception as exc:                              # noqa: BLE001
+            return self._failed_sample(exc)
+
+    def _loop(self, generation: int):
+        while self._running and generation == self._generation:
+            try:
+                payload = self._read_once()
+            except Exception as exc:                          # noqa: BLE001
+                payload = self._failed_sample(exc)
+            message = String()
+            message.data = json.dumps(payload, ensure_ascii=False)
+            self._pub.publish(message)
+            # Interruptible on purpose: a plain sleep would make `stop` take up
+            # to `interval_s` to be believed, and the canvas toggles a card off
+            # by asking for `idle`.
+            if self._stopped.wait(self._interval_s):
+                break
+
+    def _failed_sample(self, exc) -> dict:
+        import media_status_spec
+
+        self._read_errors += 1
+        self._pair = None
+        self._pair_since = None
+        # One outage is not fifty warnings a second: keep the first failure and
+        # every hundredth visible, and let the sample's `read_errors` carry the
+        # rest. A recovered read resets the count silently.
+        if self._read_errors == 1 or self._read_errors % 100 == 0:
+            self.get_logger().warn(
+                f"media status read failed ({self._read_errors}): {exc}")
+        return media_status_spec.sample(
+            received_ms=int(time.time() * 1000), read_errors=self._read_errors,
+            controller_present=self._media_ctrl is not None)
+
+    def _read_once(self, *, refresh_timeout: bool = False) -> dict:
+        import media_status_spec
+
+        if self._media_ctrl is None:
+            # The bundle registers this card without a controller on purpose
+            # (see `main.py`), so reaching here means the media unit never
+            # initialised — the failure this card exists to make visible.
+            # Raising keeps that a diagnosis in the log and a `healthy: null`
+            # sample on the topic, rather than an AttributeError on None.
+            raise _MediaUnitUnavailable(
+                "media unit unavailable: MediaController did not initialise at startup")
+
+        now = time.monotonic()
+        status = self._media_ctrl.get_system_status()
+        work_status = media_status_spec.status_name(getattr(status, "value", None))
+        reason = media_status_spec.status_name(getattr(status, "reason", None))
+
+        if (work_status, reason) != self._pair:
+            # A wakeup nobody watched happen has no age, so only a transition
+            # observed while this card was running is recorded. The first
+            # sample is not a transition: it says what the unit is now, not
+            # when it got there.
+            if (self._pair is not None and work_status == "WAKEUPED"
+                    and self._pair[0] != "WAKEUPED"):
+                self._last_wakeup_at = now
+            self._pair = (work_status, reason)
+            self._pair_since = now
+
+        error_code, error_message = self._read_error()
+        self._read_errors = 0
+        return media_status_spec.sample(
+            work_status=work_status,
+            reason=reason,
+            error_code=error_code,
+            error_message=error_message,
+            sleep_after_ms=self._read_sleep_after_ms(refresh=refresh_timeout, now=now),
+            received_ms=int(time.time() * 1000),
+            observed_for_s=now - self._pair_since,
+            last_wakeup_age_s=(None if self._last_wakeup_at is None
+                               else now - self._last_wakeup_at),
+            read_errors=self._read_errors,
+        )
+
+    def _read_error(self) -> tuple:
+        """The last error the unit recorded, as `(code, message)`.
+
+        A failure to read the error record is reported as "none recorded"
+        rather than as a failed sample. The state is what this card exists to
+        show, and blanking it because the error-log query failed would hide the
+        very field an operator came for; `read_errors` counts failed *status*
+        reads, which is the read that actually blanks the card.
+        """
+        try:
+            error = self._media_ctrl.get_system_error()
+            return (int(getattr(error, "code", 0) or 0),
+                    str(getattr(error, "message", "") or ""))
+        except Exception:                                     # noqa: BLE001
+            return 0, ""
+
+    def _read_sleep_after_ms(self, *, refresh: bool, now: float):
+        """Cached auto-sleep threshold in milliseconds, or the last known one.
+
+        A threshold that cannot be read is not a threshold of zero, so the
+        previous value is kept and `None` is reported until one is read.
+        """
+        if not refresh and now - self._sleep_after_read_at < _SLEEP_THRESHOLD_REFRESH_S:
+            return self._sleep_after_ms
+        try:
+            self._sleep_after_ms = int(self._media_ctrl.get_timeout())
+        except Exception:                                     # noqa: BLE001
+            pass
+        # Stamped even on failure, so an unavailable query is retried on the
+        # refresh period rather than on every sample.
+        self._sleep_after_read_at = now
+        return self._sleep_after_ms
+
+
+class MediaStatusPlugin:
+    PREFIX = "media_status"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
+        interval = _finite_number(plugin_config.get("poll_interval_s", 1.0),
+                                  "poll_interval_s")
+        if not 0.2 <= interval <= 5.0:
+            raise ValueError("poll_interval_s must be in [0.2, 5.0]")
+        self._node = _MediaStatusNode(namespace, media_ctrl, interval)
+        executor.add_node(self._node)
+
+    def _topic_out(self) -> list:
+        return [{"topic": self._node.topic, "format": "data/json"}]
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "media_status", "type": "sensor", "multiInstance": False,
+            "description": (
+                "Bumi 板载媒体单元（负责语音与相机的那套小系统）的运行健康，只读。"
+                "持续输出当前工作状态（就绪 / 已休眠 / 已唤醒 / 退出）、"
+                "**为什么会变成这个状态**（超时自动休眠、被语音或命令唤醒/休眠、"
+                "出错休眠、复位）、最近一次错误码与说明、自动休眠阈值，"
+                "以及本驱动观察到该状态持续的时长。"
+                "休眠是正常状态，不是故障 —— 只有出错休眠（ERROR_SLEEPED）才算坏；"
+                "读不到状态时 healthy 为 null 而不是 true，"
+                "媒体单元始终没连上时 controller_present 为 false（重试不会自行恢复）。"
+                f"不控制机器人，也不会把它唤醒。发布到 {self._node.topic}。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "stop", "info"],
+                        "description": "卡片生命周期或实时状态查询",
+                    },
+                },
+            },
+            "topic_out": self._topic_out(),
+        }
+
+    def start(self):
+        self._node.start_polling()
+
+    def stop(self):
+        self._node.stop_polling()
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            self._node.start_polling()
+            # The documented sensor lifecycle answer, matching `motion_state`:
+            # one `state` and no topic description, which belongs to `info` and
+            # to the tool declaration. Reporting the state that is rather than
+            # the one requested — a card that answers `running` without polling
+            # is the "silence that looks like success" this bundle avoids.
+            return {"state": "running" if self._node.running else "unavailable"}
+        if action == "stop":
+            self._node.stop_polling()
+            return {"state": "idle"}
+        if action == "info":
+            import media_status_spec
+
+            return {
+                **self._node.read_now(),
+                "state": "running" if self._node.running else "idle",
+                "topic_out": self._topic_out(),
+                # Read once by anything that needs to know which states mean
+                # "awake" and which reason means a real fault, instead of
+                # hard-coding the vocabulary somewhere else.
+                "interface": media_status_spec.interface(),
+            }
+        return None
+
+
 # ── VisionCapturePlugin (persistent RGB photos and videos) ──────────────────
 
 CARD = "vision_capture"
@@ -3389,4 +3742,213 @@ class VisionCapturePlugin:
             return self._start_video_recording(args)
         if action == "stop":
             return self._stop_recording()
+        return None
+
+
+# ── MediaConfigPlugin (get/set the media unit's configurable settings) ──────
+
+class MediaConfigPlugin:
+    """Read and write Bumi media-unit settings that no other card exposes.
+
+    Covers the auto-sleep timeout, the audio-cue flag, and the wake/sleep
+    response words — all reachable through ``MediaController`` getters/setters
+    that ``speaker`` (volume only) and ``media_status`` (read-only health) leave
+    untouched. The wake word itself is read-only on this vendor: the SDK ships
+    ``get_wakeup_words`` and no ``set_wakeup_words``, so this card reports it but
+    rejects any attempt to write it.
+
+    The SDK requires at least 500 ms between ``set_*`` calls (shortening it can
+    crash the voice system and needs a factory return). That limit is per
+    *controller*, so writes go through the ``MediaControllerWriteGate`` that
+    ``speaker`` also holds — a per-card lock here would let
+    ``speaker.set_volume`` and ``media_config.set_timeout`` fire back to back.
+    This is an on-demand get/set card, not a poller: nothing is published, so
+    there is no ROS node and no ``topic_out``.
+    """
+    PREFIX = "media_config"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl,
+                 write_gate: "MediaControllerWriteGate | None" = None):
+        self._media_ctrl = media_ctrl
+        self._config_gate = write_gate or _MEDIA_WRITE_GATE
+
+    def _controller_present(self) -> bool:
+        return self._media_ctrl is not None
+
+    def _read_setting(self, key: str):
+        import media_config_spec
+
+        getter = getattr(self._media_ctrl, media_config_spec.getter_name(key))
+        value = getter()
+        # Normalise pybind enum/object values to a JSON-safe scalar.
+        name = getattr(value, "name", None)
+        if name is not None:
+            return str(name)
+        return value
+
+    def _write_setting(self, key: str, value):
+        import media_config_spec
+
+        normalised = media_config_spec.validate(key, value)
+        setter = getattr(self._media_ctrl, media_config_spec.setter_name(key))
+
+        def readback():
+            # A getter that fails must not turn an applied write into an error;
+            # `readback: null` keeps the same contract as the old loose read.
+            try:
+                return self._read_setting(key)
+            except Exception:
+                return None
+
+        # The setter AND the getter run inside the controller-wide gate.  MCP
+        # serves requests concurrently: releasing the lock after the setter
+        # lets a second `set_*` land in between, and the first caller would
+        # report that other caller's value as its own readback.
+        _, observed = self._config_gate.write_with_readback(
+            lambda: setter(normalised), readback)
+        return normalised, observed
+
+    def get_tool(self) -> dict:
+        import media_config_spec
+
+        # One source of truth for the actions: the enum and `x-action-params`
+        # are both built from these two maps.  Agent Core reads the map to split
+        # the tool into per-action functions, so an action advertised only in
+        # the enum is a function a caller never gets — and an action in the map
+        # but not the enum is one the schema says cannot be called.  Declaring
+        # them separately let `start`, `stop` and `info` fall through both ways.
+        action_params = {"start": [], "stop": [], "info": [], "get": []}
+        action_descriptions = {
+            "start": "卡片启动；媒体单元未连接时返回 error。",
+            "stop": "卡片停止，返回 idle。",
+            "info": "读取全部配置项当前值与接口声明（有哪些项、哪些可写、取值范围）。",
+            "get": "读取全部配置项当前值。",
+        }
+        writable_descriptions = {
+            "timeout": "设置自动休眠超时（整数毫秒）。取值必须落在接口声明的区间内；单位是毫秒不是秒，小数会被拒绝而不是截断。",
+            "audio_cue": "开关提示音（true/false）。",
+            "wakeup_response": "设置被唤醒时说的应答词（非空字符串）。",
+            "sleep_response": "设置被催眠时说的应答词（非空字符串）。",
+        }
+        for key in media_config_spec.WRITABLE_KEYS:
+            action_params[f"set_{key}"] = [key]
+            action_descriptions[f"set_{key}"] = writable_descriptions[key]
+        actions = tuple(action_descriptions)
+        x_action_params = {
+            action: {"params": action_params[action],
+                     "description": action_descriptions[action]}
+            for action in actions
+        }
+        properties = {
+            "action": {
+                "type": "string",
+                "enum": list(actions),
+                "description": "卡片生命周期、读取或写入媒体配置项",
+            },
+        }
+        for key in media_config_spec.WRITABLE_KEYS:
+            if key == "timeout":
+                properties["timeout"] = {
+                    "type": "integer",
+                    "minimum": media_config_spec.TIMEOUT_MIN_MS,
+                    "maximum": media_config_spec.TIMEOUT_MAX_MS,
+                    "description": "自动休眠超时，单位毫秒",
+                }
+            elif key == "audio_cue":
+                properties["audio_cue"] = {
+                    "type": "boolean",
+                    "description": "提示音开关",
+                }
+            else:
+                properties[key] = {
+                    "type": "string",
+                    "maxLength": media_config_spec.RESPONSE_WORDS_MAX_CHARS,
+                    "description": media_config_spec.label(key),
+                }
+        return {
+            "name": "media_config", "type": "actuator", "multiInstance": False,
+            "description": (
+                "Bumi 媒体单元（负责语音与相机的小系统）的可配置项，读写。"
+                "覆盖自动休眠超时（毫秒）、提示音开关、唤醒应答词、休眠应答词；"
+                "唤醒词本身只读（厂商锁定，SDK 无 set 接口）。"
+                "写操作遵守厂商 ≥500ms 间隔约束。"
+                "读不到时返回 null 而不是编一个值；媒体单元没连上时 "
+                "controller_present 为 false，任何 set 都会被拒绝。"
+                "不发布话题、不控制机器人动作。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": properties,
+                "required": ["action"],
+                "x-action-params": x_action_params,
+            },
+            "topic_out": [],
+        }
+
+    def start(self):
+        return {"state": "ready" if self._controller_present() else "error"}
+
+    def stop(self):
+        return {"state": "idle"}
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        import media_config_spec
+
+        args.pop('_tool_name', None)
+        if action == "start":
+            return {"state": "ready" if self._controller_present() else "error"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            if not self._controller_present():
+                return {
+                    "state": "idle",
+                    "controller_present": False,
+                    "interface": media_config_spec.interface(),
+                    "values": None,
+                }
+            try:
+                values = {key: self._read_setting(key)
+                          for key in media_config_spec.SETTING_KEYS}
+            except Exception as exc:
+                return {
+                    "state": "error",
+                    "controller_present": True,
+                    "interface": media_config_spec.interface(),
+                    "values": None,
+                    "error": str(exc),
+                }
+            return {
+                "state": "idle",
+                "controller_present": True,
+                "interface": media_config_spec.interface(),
+                "values": values,
+            }
+        if action == "get":
+            if not self._controller_present():
+                return {"controller_present": False, "values": None}
+            try:
+                return {"controller_present": True,
+                        "values": {key: self._read_setting(key)
+                                   for key in media_config_spec.SETTING_KEYS}}
+            except Exception as exc:
+                return {"controller_present": True, "values": None, "error": str(exc)}
+        if action.startswith("set_"):
+            key = action[len("set_"):]
+            if key not in media_config_spec.WRITABLE_KEYS:
+                return {"state": "error", "error": f"未知或只读配置项: {key}"}
+            if not self._controller_present():
+                return {"state": "error", "error": "媒体单元未连接，无法写入"}
+            if key not in args:
+                return {"state": "error", "error": f"缺少参数 {key}"}
+            try:
+                value, readback = self._write_setting(key, args[key])
+            except ValueError as exc:
+                return {"state": "error", "error": str(exc)}
+            except Exception as exc:
+                return {"state": "error", "error": str(exc)}
+            # `readback` was captured inside the same gate-protected section as
+            # the setter, so it is this call's value, not a concurrent one's.
+            return {"state": "set", "key": key, "value": value,
+                    "readback": readback}
         return None
