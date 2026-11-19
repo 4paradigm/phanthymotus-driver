@@ -37,6 +37,68 @@ class SensorTests(unittest.TestCase):
         self.assertEqual(self.ros.services, [])
         self.assertEqual(self.ros.published, [])
 
+    def vendor_arm_fixture(self):
+        self.hub.close()
+        self.ros.params['humanoid_description'] = (ROOT / 'resource' / 'kuavo5w_model.urdf').read_text()
+        self.ros.params['kuavo_configuration'] = {
+            'NUM_JOINT': 20, 'NUM_ARM_JOINT': 14, 'NUM_HEAD_JOINT': 2,
+            'min_joint_position_limits': [-180.] * 20,
+            'max_joint_position_limits': [180.] * 20}
+        self.hub = driver.KuavoSensors({'arm_limit_source': 'vendor_runtime'}, 'test', self.ros, self.node)
+        self.hub.discover()
+        self.ros.raw()
+
+    def test_vendor_arm_limits_use_live_urdf_and_stricter_controller_bounds(self):
+        self.vendor_arm_fixture()
+        self.ros.params['kuavo_configuration']['max_joint_position_limits'][4] = 45.
+        self.hub.discover()
+        self.ros.raw()
+        self.assertAlmostEqual(self.hub._joint_bounds('arm')[0][1], math.radians(45.))
+        self.assertAlmostEqual(self.hub._joint_bounds('arm')[1][0], -.349065850398866)
+        health = self.hub.health()['joint_limits']
+        self.assertEqual(health['arm']['source'], 'vendor_runtime')
+        self.assertFalse(health['arm']['hardware_verified'])
+        self.assertFalse(health['leg']['available'])
+        with self.assertRaises(ValueError):
+            self.hub.validate_joint_target('arm', [10000.] * 14)
+        self.assertFalse(self.ros.published)
+
+    def test_vendor_arm_missing_invalid_or_nonfinite_data_never_falls_back(self):
+        self.vendor_arm_fixture()
+        valid = json.loads(json.dumps(self.ros.params['kuavo_configuration']))
+        for bad in (None, {}, {**valid, 'NUM_JOINT': 19},
+                    {**valid, 'min_joint_position_limits': [True] * 20},
+                    {**valid, 'min_joint_position_limits': [math.nan] * 20},
+                    {**valid, 'min_joint_position_limits': [181.] * 20}):
+            self.ros.params['kuavo_configuration'] = bad
+            self.hub.discover()
+            with self.assertRaisesRegex(RuntimeError, 'limits unavailable'):
+                self.hub._joint_bounds('arm')
+        self.ros.params['kuavo_configuration'] = valid
+        xml = self.ros.params['humanoid_description']
+        for bad in ('nan', 'inf'):
+            self.ros.params['humanoid_description'] = xml.replace('lower="-3.14159265358979"',
+                                                               'lower="' + bad + '"')
+            self.hub.discover()
+            self.assertFalse(self.hub.health()['joint_limits']['arm']['available'])
+
+    def test_vendor_arm_timer_refresh_revokes_limits_and_invalid_record_has_priority(self):
+        self.vendor_arm_fixture()
+        self.assertTrue(self.hub.health()['joint_limits']['arm']['available'])
+        self.ros.params['kuavo_configuration'] = None
+        self.hub._retry_at = 0
+        self.hub.tick()
+        self.hub._thread.join(1)
+        self.assertFalse(self.hub.health()['joint_limits']['arm']['available'])
+        self.hub._vendor_arm_bounds = [(-1., 1.)] * 14
+        self.hub._joint_limit_config = {}
+        with self.assertRaisesRegex(RuntimeError, 'not configured'):
+            self.hub._joint_bounds('arm')
+        self.hub._joint_limit_config = None
+        self.hub._identity_checked_at = time.monotonic() - 4
+        with self.assertRaisesRegex(RuntimeError, 'stale'):
+            self.hub._joint_bounds('arm')
+
     def test_raw_field_mapping_units_and_urdf_joint_names(self):
         self.ros.raw(list(range(20)))
         data = self.hub.snapshot('joints')

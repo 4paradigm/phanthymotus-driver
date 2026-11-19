@@ -112,6 +112,11 @@ class KuavoSensors:
         if self._joint_timebase not in ('auto', 'wall', 'kuavo_v63_cycle'):
             raise ValueError('joint_timebase must be auto, wall or kuavo_v63_cycle')
         self._joint_limit_config = copy.deepcopy(config.get('joint_limits'))
+        self._arm_limit_source = config.get('arm_limit_source', 'commissioned')
+        if self._arm_limit_source not in ('commissioned', 'vendor_runtime'):
+            raise ValueError('arm_limit_source must be commissioned or vendor_runtime')
+        self._vendor_arm_bounds = None
+        self._vendor_arm_error = 'waiting_for_discovery'
         self._model_error = 'waiting_for_discovery'
         self._model_path = Path(__file__).resolve().parent / 'resource' / 'kuavo5w_model.urdf'
         self._discovery_error = 'waiting_for_discovery'
@@ -162,6 +167,7 @@ class KuavoSensors:
             if not connected or generation != self._generation:
                 self._profile = self._urdf = self._names = None
                 self._model_sha256 = None
+                self._vendor_arm_bounds = None
                 self._identity_checked_at = None
                 self._standard_imu_at = None
                 self._joint_capture_ns = self._joint_captured_at = None
@@ -208,6 +214,46 @@ class KuavoSensors:
                 model_error = None
             except Exception as exc:
                 urdf, names, model_error = None, None, str(exc)
+            vendor_bounds, vendor_error = None, None
+            if self._arm_limit_source == 'vendor_runtime':
+                try:
+                    if model_error:
+                        raise ValueError(model_error)
+                    # Match the vendor SDK's live-model source, never the local
+                    # display resource. Require the controller's bounds too.
+                    settings = self.ros1.get_param('/kuavo_configuration')
+                    if isinstance(settings, str):
+                        settings = json.loads(settings)
+                    if not isinstance(settings, dict):
+                        raise ValueError('missing runtime kuavo_configuration')
+                    if any(type(settings.get(key)) is not int or settings[key] != count
+                           for key, count in (('NUM_JOINT', 20), ('NUM_ARM_JOINT', 14),
+                                              ('NUM_HEAD_JOINT', 2))):
+                        raise ValueError('runtime limit configuration has incompatible joint counts')
+                    lower = vector(settings.get('min_joint_position_limits'), 20)
+                    upper = vector(settings.get('max_joint_position_limits'), 20)
+                    if any(a >= b for a, b in zip(lower, upper)):
+                        raise ValueError('invalid controller position limits')
+                    elements = ET.fromstring(urdf).findall('joint')
+                    joints = {j.get('name'): j for j in elements}
+                    if len(joints) != len(elements):
+                        raise ValueError('duplicate runtime joint names')
+                    vendor_bounds = []
+                    for i, name in enumerate(names[4:18], 4):
+                        joint = joints[name]
+                        if joint.get('type') != 'revolute':
+                            raise ValueError('arm joint must have finite revolute limits')
+                        limit = joint.find('limit')
+                        lo, hi = float(limit.attrib['lower']), float(limit.attrib['upper'])
+                        if not finite(lo) or not finite(hi) or lo >= hi:
+                            raise ValueError('invalid runtime URDF arm limits')
+                        low = max(lo, math.radians(lower[i]))
+                        high = min(hi, math.radians(upper[i]))
+                        if low >= high:
+                            raise ValueError('invalid or empty runtime arm limit intersection')
+                        vendor_bounds.append((low, high))
+                except Exception as exc:
+                    vendor_bounds, vendor_error = None, str(exc)
             with self._lock:
                 if self._closed.is_set() or self.ros1.connection != (True, generation):
                     return
@@ -231,6 +277,7 @@ class KuavoSensors:
                 self._profile = params
                 self._urdf, self._names, self._model_error = urdf, names, model_error
                 self._model_sha256 = model_sha256
+                self._vendor_arm_bounds, self._vendor_arm_error = vendor_bounds, vendor_error
                 # Lease starts before parameter reads, not when slow reads finish.
                 self._identity_checked_at = checked_at
                 self._discovery_error = None
@@ -239,6 +286,7 @@ class KuavoSensors:
                 if self.ros1.connection == (True, generation):
                     self._profile = self._urdf = self._names = None
                     self._model_sha256 = None
+                    self._vendor_arm_bounds = None
                     self._identity_checked_at = None
                     for card in ('joints', 'imu'):
                         if card == 'imu' and self._standard_imu_at is not None:
@@ -272,7 +320,13 @@ class KuavoSensors:
             for card in ('arm', 'leg'):
                 try:
                     self._joint_bounds(card)
-                    limits[card] = {'available': True, 'verification': self._joint_limit_config['verification']}
+                    vendor = (card == 'arm' and self._arm_limit_source == 'vendor_runtime'
+                              and self._joint_limit_config is None)
+                    limits[card] = ({'available': True, 'source': 'vendor_runtime',
+                                     'hardware_verified': False,
+                                     'runtime_urdf_sha256': self._model_sha256}
+                                    if vendor else {'available': True,
+                                        'verification': self._joint_limit_config['verification']})
                 except (RuntimeError, ValueError, TypeError):
                     limits[card] = {'available': False}
             return {'profile': copy.deepcopy(self._profile), 'sensor_topic': self._raw_topic,
@@ -280,6 +334,8 @@ class KuavoSensors:
                         'age_s': None if self._identity_checked_at is None else
                                  max(0, time.monotonic() - self._identity_checked_at)},
                     'joint_limits': limits,
+                    'arm_limit_source': self._arm_limit_source,
+                    'vendor_arm_limit_error': self._vendor_arm_error,
                     'joint_timing': {'configured': self._joint_timebase,
                                      'source': self._joint_timing_mode(),
                                      'max_age_s': JOINT_MAX_AGE_S},
@@ -292,10 +348,17 @@ class KuavoSensors:
                                        'runtime_joint_names_verified': self._names is not None}}
 
     def _joint_bounds(self, card):
-        """Caller holds _lock. Configuration is an operator commissioning record,
-        never inferred from the display URDF or from joint-name agreement alone.
+        """Caller holds _lock. Use an explicit commissioning record or the
+        selected vendor live-model/controller intersection, never display limits.
         """
         policy = self._joint_limit_config
+        if card == 'arm' and policy is None and self._arm_limit_source == 'vendor_runtime':
+            if (self._profile is None or not self._names or self._model_error is not None
+                    or not self._identity_fresh()):
+                raise RuntimeError('runtime arm model/limit identity is missing or stale')
+            if self._vendor_arm_bounds is None:
+                raise RuntimeError(f'vendor runtime arm limits unavailable: {self._vendor_arm_error}')
+            return list(self._vendor_arm_bounds)
         if not isinstance(policy, dict) or not isinstance(policy.get(card), dict):
             raise RuntimeError(f'hardware-verified joint limits are not configured for {card}')
         if self._profile is None or not self._names or self._model_error is not None:

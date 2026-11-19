@@ -948,8 +948,7 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(len(self.ros.sent_services), boundary)
         self.assertFalse(any(p[0] == '/cmd_vel' and p[2]['linear']['x'] for p in self.ros.published))
 
-    def test_arm_does_not_enable_quick_mode_and_requires_fresh_estimate(self):
-        self.ros.emit("/lb_arm_joint_reach_time", 0)
+    def test_arm_measured_completion_needs_no_vendor_reach_time(self):
         result = self.call("arm", "move_joints", positions=list(range(14)))
         self.assertIn("action_id", result)
         self.assertEqual(self.ros.services, [])
@@ -957,8 +956,7 @@ class DriverContractTests(unittest.TestCase):
             "header": {"seq": 0, "stamp": {"secs": 0, "nsecs": 0}, "frame_id": ""},
             "name": [f"joint{i}" for i in range(1, 15)], "position": list(range(14)), "velocity": [], "effort": []}))
         time.sleep(0.06)
-        self.assertEqual(self.callbacks, [])  # Cached estimate cannot complete new motion.
-        self.ros.emit("/lb_arm_joint_reach_time", 0)
+        self.assertEqual(self.callbacks, [])  # No measured convergence yet.
         self.ros.raw([0] * 4 + [math.radians(v) for v in range(14)] + [0] * 2)
         time.sleep(0.06)
         self.assertEqual(self.callbacks, [])  # A single in-tolerance sample is insufficient.
@@ -1034,6 +1032,29 @@ class DriverContractTests(unittest.TestCase):
                          {'arm': {'available': False}, 'leg': {'available': False}})
         self.assertTrue(self.bundle.state.motion_enabled)
         self.assertEqual(self.call('loco', 'move', duration=.1)['state'], 'executing')
+
+    def test_vendor_runtime_arm_can_publish_and_missing_limits_abort_in_flight(self):
+        self.bundle.sensors._joint_limit_config = None
+        self.bundle.sensors._arm_limit_source = 'vendor_runtime'
+        self.ros.params['humanoid_description'] = (ROOT / 'resource' / 'kuavo5w_model.urdf').read_text()
+        self.ros.params['kuavo_configuration'] = {
+            'NUM_JOINT': 20, 'NUM_ARM_JOINT': 14, 'NUM_HEAD_JOINT': 2,
+            'min_joint_position_limits': [-180.] * 20,
+            'max_joint_position_limits': [180.] * 20}
+        self.bundle.sensors.discover()
+        self.ros.raw()
+        result = self.call('arm', 'set', left_joint_1_rad=.1)
+        self.assertEqual(result['state'], 'executing')
+        self.assertEqual(self.ros.published[-1][0], '/kuavo_arm_traj')
+        self.assertAlmostEqual(self.ros.published[-1][2]['position'][0], math.degrees(.1))
+        self.ros.params['kuavo_configuration'] = None
+        self.bundle.sensors._retry_at = 0
+        self.bundle.sensors.tick()
+        self.bundle.sensors._thread.join(1)
+        self.assertTrue(wait_until(lambda: self.callbacks))
+        self.assertEqual(self.callbacks[0][:3], (result['action_id'], 'arm', 'error'))
+        self.assertIn('limits unavailable', self.callbacks[0][3]['reason'])
+        self.assertTrue(self.bundle.state.motion_blocked)
 
     def test_extreme_arm_and_leg_targets_are_rejected_before_publication(self):
         for card, size in (('arm', 14), ('leg', 4)):
@@ -1259,6 +1280,13 @@ class DriverContractTests(unittest.TestCase):
             self.assertEqual(positions.call_count, len(samples))
         self.bundle.tracker._callbacks.join()
         return result
+
+    def test_unconverged_joint_target_times_out_without_vendor_estimate(self):
+        with patch.object(self.bundle.state, 'require_motion'):
+            result = self._run_joint_measurement_trace([(0.02, 0.02, 0.), (115.01, 115.01, 0.)])
+        self.assertEqual(self.callbacks[0][:3], (result['action_id'], 'leg', 'error'))
+        self.assertIn('115s', self.callbacks[0][3]['reason'])
+        self.assertTrue(self.bundle.state.motion_blocked)
 
     def test_cached_joint_sample_does_not_accumulate_convergence(self):
         result = self._run_joint_measurement_trace([
@@ -1730,9 +1758,11 @@ class DriverContractTests(unittest.TestCase):
                 release.set()
                 self.bundle.tracker._callbacks.join()
 
-    def test_excessive_reach_time_aborts_and_pauses(self):
-        result = self.call("arm", "move_joints", positions=[0] * 14)
-        self.ros.emit("/lb_arm_joint_reach_time", 111)
+    def test_excessive_cartesian_reach_time_aborts_and_pauses(self):
+        result = self.call("arm", "set_pose", frame="world", left_position=[0, .4, 0],
+                           right_position=[0, -.4, 0], left_quaternion=[0, 0, 0, 1],
+                           right_quaternion=[0, 0, 0, 1])
+        self.ros.emit("/lb_arm_ee_reach_time", 111)
         self.assertTrue(wait_until(lambda: self.callbacks))
         self.assertEqual(self.callbacks[0][:3], (result["action_id"], "arm", "error"))
         self.assertIn("110s", self.callbacks[0][3]["reason"])

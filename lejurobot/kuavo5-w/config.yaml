@@ -36,9 +36,12 @@ sensors:
   # SDK permits N*m or current. Set N*m only after verifying robot hardware output.
   # Until then normalized tau is null; vendor.joint_torque preserves the raw values.
   joint_torque_unit: null
-  # No hardware-verified limits have been supplied. Arm/leg move_joints and
-  # named arm/leg/waist joint actions require a matching commissioning record.
-  # Never copy the display URDF limits as verified control limits. See README.
+  # Vendor SDK uses the LIVE controller URDF for arm limits; intersect these
+  # with live kuavo_configuration limits. No local-model/default fallback.
+  # Set commissioned to require an operator record for arms as well as legs.
+  arm_limit_source: vendor_runtime
+  # An explicit record takes precedence; invalid records never fall back.
+  # Legs/waist still require commissioning. Vendor limits are not certification.
   joint_limits: null
 plugins:
   loco: {enabled: true}

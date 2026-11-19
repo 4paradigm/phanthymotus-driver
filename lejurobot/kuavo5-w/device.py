@@ -538,7 +538,11 @@ class _KuavoPlugin:
             request_epoch=self._request_context.stop_epoch)
 
         def worker():
-            deadline, duration, seen_at = time.monotonic() + 3, None, 0
+            # Joint trajectories do not consistently publish reach-time on
+            # vendor versions (notably /kuavo_arm_traj on v63). Their
+            # completion evidence is measured convergence, not an estimate.
+            deadline = issued + (115 if joint_target is not None else 3)
+            duration, seen_at = None, 0
             converged_since_ns = converged_since_at = None
             last_capture_ns = None
             while not cancelled.wait(0.02):
@@ -551,7 +555,9 @@ class _KuavoPlugin:
                             raise ConnectionError("connection changed during motion")
                         measured = (self.bundle.sensors.validate_joint_target(joint_card, joint_target[1])
                                     if joint_target is not None else None)
-                        if duration is None:
+                        if joint_target is not None and time.monotonic() >= deadline:
+                            raise TimeoutError('measured joint target did not converge within 115s')
+                        if joint_target is None and duration is None:
                             value, seen = self.state.read(key)
                             if seen >= issued and value is not None:
                                 if not 0 <= value <= 110:
@@ -559,12 +565,10 @@ class _KuavoPlugin:
                                 duration, seen_at = float(value), seen
                             elif time.monotonic() >= deadline:
                                 raise TimeoutError(f"no fresh {key} feedback within 3s")
-                        if duration is not None and time.monotonic() >= seen_at + duration:
+                        if joint_target is not None or (duration is not None and time.monotonic() >= seen_at + duration):
                             if joint_target is not None:
                                 offset, target = joint_target
                                 q, measured_at, capture_ns = measured
-                                if time.monotonic() >= seen_at + duration + 5:
-                                    raise TimeoutError('measured joint target did not converge within 5s of reach-time estimate')
                                 # Polling a cached sample is not a new observation.
                                 # Keep freshness/deadline checks active while waiting.
                                 if measured_at < issued or (last_capture_ns is not None
