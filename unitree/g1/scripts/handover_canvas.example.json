@@ -1,0 +1,107 @@
+{
+  "cards": [
+    {
+      "id": "card-muaysl8u8486",
+      "mcpId": "agentcore",
+      "toolName": "remote_message",
+      "driverName": "AgentCore",
+      "x": 80,
+      "y": 220,
+      "topicIn": [],
+      "topicOut": [
+        {
+          "topic": "/remote_control/message",
+          "format": "data/json"
+        }
+      ]
+    },
+    {
+      "id": "card-mu5aq9qm9659",
+      "mcpId": "agentcore",
+      "toolName": "decision_core",
+      "driverName": "AgentCore",
+      "x": 450,
+      "y": 220,
+      "topicIn": [
+        {
+          "format": "data/json"
+        }
+      ],
+      "topicOut": [
+        {
+          "topic": "/decision_core",
+          "format": "data/json"
+        }
+      ]
+    },
+    {
+      "id": "handover-posture",
+      "mcpId": "driver-unitree-g1",
+      "toolName": "posture",
+      "driverName": "g1-device-bundle",
+      "x": 850,
+      "y": 100,
+      "topicIn": [],
+      "topicOut": []
+    },
+    {
+      "id": "handover-switch_mode",
+      "mcpId": "driver-unitree-g1",
+      "toolName": "switch_mode",
+      "driverName": "g1-device-bundle",
+      "x": 850,
+      "y": 340,
+      "topicIn": [],
+      "topicOut": []
+    },
+    {
+      "id": "handover-tts",
+      "mcpId": "driver-unitree-g1",
+      "toolName": "tts",
+      "driverName": "g1-device-bundle",
+      "x": 850,
+      "y": 560,
+      "topicIn": [],
+      "topicOut": []
+    }
+  ],
+  "connections": [
+    {
+      "id": "handover-text",
+      "fromCardId": "card-muaysl8u8486",
+      "fromPortIdx": "0",
+      "toCardId": "card-mu5aq9qm9659",
+      "toPortIdx": "0",
+      "format": "data/json",
+      "fromTopic": "/remote_control/message"
+    }
+  ],
+  "execConnections": [
+    {
+      "id": "handover-exec-posture",
+      "fromCardId": "card-mu5aq9qm9659",
+      "toCardId": "handover-posture",
+      "toToolName": "posture",
+      "toMcpId": "driver-unitree-g1"
+    },
+    {
+      "id": "handover-exec-switch_mode",
+      "fromCardId": "card-mu5aq9qm9659",
+      "toCardId": "handover-switch_mode",
+      "toToolName": "switch_mode__get_current_mode",
+      "toMcpId": "driver-unitree-g1"
+    },
+    {
+      "id": "handover-exec-tts",
+      "fromCardId": "card-mu5aq9qm9659",
+      "toCardId": "handover-tts",
+      "toToolName": "tts",
+      "toMcpId": "driver-unitree-g1"
+    }
+  ],
+  "transform": {
+    "zoom": 0.85,
+    "tx": 20,
+    "ty": 30
+  }
+}
