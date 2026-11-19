@@ -40,11 +40,14 @@ ASR and check interaction with the robot's native AIUI conversation service.
 `model` and `joints` use the same bundled articulated display model throughout
 the session. The live `/robot_description` can encode the lift and fingers as
 fixed joints, so it is kept separate from Canvas rendering. The display model
-uses the measured yaw/pitch channel order. `joints` combines `/joint_states`
-with fresh lift and gripper feedback and expands the display model's gripper
-mimic joints. `joints info` reports the measured `body_joint` in metres, also
-available in `lifting info`. Canvas versions that only render rotational joints
-show head and gripper feedback but keep the lift geometry static.
+uses the measured yaw/pitch order, reverses the two elbow-flex axes, and maps
+gripper feedback as `1 - position` before expanding the finger linkage.
+These are display-only corrections. `joints` combines `/joint_states` with fresh
+lift and gripper feedback, and `joints info` reports `body_joint` in metres.
+The display model includes a fixed guide column attached to `base_link`, with
+the torso, head and arms on the separate `body_joint` prismatic branch. A
+renderer with prismatic support moves that branch along the column; the current
+rotation-only Canvas shows the column and reports lift height without animating it.
 The response includes the display model's SHA-256 digest. Live
 `/robot_description` may narrow, but never widen, the bundled vendor motion
 limits. Arm execution uses the intersection of both limit sets. `joints`,
@@ -65,14 +68,11 @@ lifting feedback are available from their actuator cards. `laser_scan` prefers
 fresh `/scan` from the vendor merger and falls back to `/lidar_front/scan`; it
 does not fuse the feeds a second time. The first Canvas output is the native
 `sensor/pointcloud` stream; the second keeps the scan JSON with nearest-return
-pooling and quality metrics. Scans are projected in their own plane, then
-transformed to `odom` at the scan timestamp for accumulation. The default
-history is 20 s with 5 cm voxels, capped at 20,000 points and a 12 m scan range.
-Without scan-time TF, an individual scan is shown in its own frame and is never
-added to the odom cloud. `info` reports the selected scan and cloud frames,
-`accumulating`, and point count. `clear` resets the accumulated history and the
-next non-empty cloud replaces the previous displayed frame. Until a new scan
-arrives, the existing Canvas renderer keeps the last frame on screen.
+pooling and quality metrics. Each point-cloud packet contains only the current
+scan projected in its own XY plane (`z=0`), capped at 20,000 points and a 12 m
+range by default. `info` reports the source, scan frame and point count. The
+current Canvas renderer replaces its last displayed frame when a new non-empty
+cloud arrives.
 
 The first camera card started on the canvas reuses an already-active host
 `panther_orbbec.service` without taking ownership. Otherwise it creates a
@@ -103,7 +103,6 @@ for these concrete runtime paths:
 | `ros-humble-nav-msgs` | `nav_msgs/msg/Odometry` on `/odom` | Required even though the navigation card was removed |
 | `ros-humble-rmw-cyclonedds-cpp` | Robot-facing domain 0 process | Required |
 | `ros-humble-rmw-fastrtps-cpp` | Agent Core domain 42 bridge process | Required |
-| `ros-humble-tf2-ros-py` | Robot-side timestamped transforms for lidar accumulation | Required |
 | `python3-numpy`, `python3-opencv` | RGB/depth conversion | Apt-only; no duplicate pip wheels |
 | `util-linux` | `nsenter` into the host namespaces for the lazy camera source | Required |
 | `systemd` | `systemctl`/`systemd-run` clients for the owned host transient unit | Required; the driver does not run systemd in the container |

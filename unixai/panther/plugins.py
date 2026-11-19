@@ -81,19 +81,6 @@ class JointsPlugin(SensorPlugin):
         return super().dispatch(action, args)
 
 
-class LaserScanPlugin(SensorPlugin):
-    def get_tool(self):
-        tool = super().get_tool()
-        tool["inputSchema"]["properties"]["action"]["enum"].append("clear")
-        return tool
-
-    def dispatch(self, action, args):
-        if action == "clear":
-            self.device.clear_laser_cloud()
-            action = "info"
-        return super().dispatch(action, args)
-
-
 class ActuatorPlugin:
     def __init__(self, device, name, description, schema, method):
         self.device = device
@@ -212,8 +199,8 @@ def build_plugins(config, namespace, device):
         if on(name):
             plugins.append(SensorPlugin(device, name, description, [name]))
     if on("laser_scan"):
-        plugins.append(LaserScanPlugin(
-            device, "laser_scan", "Panther planar lidar point cloud with odometry-aligned history",
+        plugins.append(SensorPlugin(
+            device, "laser_scan", "Panther live planar lidar point cloud",
             ["laser_cloud", "laser_scan"],
         ))
     if on("camera_color"):

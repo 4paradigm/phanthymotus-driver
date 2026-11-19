@@ -5,6 +5,21 @@ import xml.etree.ElementTree as ET
 from contracts import json_float
 
 
+def _add_fixed_column(root, lift):
+    """Draw the guide rail as fixed bones on the base, beside the lift joint."""
+    x, y, z = lift.find("origin").get("xyz").split()
+    top = float(z) + float(lift.find("limit").get("upper"))
+    parent = lift.find("parent").get("link")
+    for child, xyz in (("display_column_base", f"{x} {y} 0"),
+                       ("display_column_top", f"0 0 {top:g}")):
+        ET.SubElement(root, "link", name=child)
+        joint = ET.SubElement(root, "joint", name=f"{child}_joint", type="fixed")
+        ET.SubElement(joint, "parent", link=parent)
+        ET.SubElement(joint, "child", link=child)
+        ET.SubElement(joint, "origin", xyz=xyz)
+        parent = child
+
+
 def render_model(urdf):
     root = ET.fromstring(urdf)
     joints = {joint.get("name"): joint for joint in root.findall("joint")}
@@ -13,6 +28,12 @@ def render_model(urdf):
     for name, axis in (("joint_head0", "0 0 1"), ("joint_head1", "0 1 0")):
         joint = joints[name]
         joint.find("axis").set("xyz", axis)
+    # Both elbow encoders flex in the opposite direction to the model axes.
+    for name in ("joint_la4", "joint_ra4"):
+        axis = joints[name].find("axis")
+        axis.set("xyz", " ".join(f"{-float(value):g}" if float(value) else "0"
+                                for value in axis.get("xyz").split()))
+    _add_fixed_column(root, joints["body_joint"])
     mimics = {}
     for name, joint in joints.items():
         mimic = joint.find("mimic")
@@ -44,3 +65,11 @@ def dedicated_row(msg, model_name, *, gripper=False):
     if gripper and row is not None and not 0.0 <= row["q"] <= 1.0:
         return None
     return row
+
+
+def display_gripper_row(row):
+    """The display linkage is open at q=1; the hardware reports open at 0."""
+    display = {**row, "q": 1.0 - row["q"]}
+    if row.get("dq") is not None:
+        display["dq"] = -row["dq"]
+    return display

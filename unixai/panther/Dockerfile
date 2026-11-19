@@ -31,7 +31,6 @@ RUN . /etc/os-release && \
       ros-humble-nav-msgs \
       ros-humble-sensor-msgs \
       ros-humble-std-msgs \
-      ros-humble-tf2-ros-py \
       ros-humble-trajectory-msgs && \
     rm -rf /var/lib/apt/lists/*
 

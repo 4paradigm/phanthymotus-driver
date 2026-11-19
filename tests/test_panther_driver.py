@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-from collections import deque
 import hashlib
 import importlib.util
 import io
@@ -14,6 +13,7 @@ import sys
 import threading
 import time
 import unittest
+import xml.etree.ElementTree as ET
 from unittest.mock import patch
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -492,7 +492,7 @@ class PantherDriverTest(unittest.TestCase):
             return SimpleNamespace(name=names, position=positions, velocity=[], effort=[])
 
         device._put("lifting", feedback(["height"], [0.6]))
-        device._put("gripper_left", feedback(["joint_lf"], [0.5]))
+        device._put("gripper_left", feedback(["joint_lf"], [0.0]))
         device._cache["gripper_right"] = (feedback(["joint_rf"], [0.8]), time.monotonic() - 10)
         payload = device._joints_payload(feedback(["joint_head0", "joint_la0"], [0.2, 0.1]), time.monotonic())
         self.assertEqual(model["model_sha256"], payload["model_sha256"])
@@ -500,9 +500,28 @@ class PantherDriverTest(unittest.TestCase):
         self.assertEqual(rows["body_joint"]["q"], 0.6)
         self.assertEqual(rows["joint_head0"]["q"], 0.2)
         self.assertEqual(rows["joint_la0"]["q"], 0.1)
-        self.assertEqual(rows["joint_lf02"]["q"], 0.5)
+        self.assertEqual(rows["joint_lf"]["q"], 1.0)
+        self.assertEqual(rows["joint_lf02"]["q"], 1.0)
         self.assertNotIn("joint_rf", rows)
         self.assertEqual(rows["joint_lf"]["idx"], contracts.parse_joint_indices(model["urdf"])["joint_lf"])
+
+        device._put("gripper_left", feedback(["joint_lf"], [1.0]))
+        device._put("gripper_right", feedback(["joint_rf"], [0.2]))
+        payload = device._joints_payload(feedback([], []), time.monotonic())
+        rows = {joint["name"]: joint["q"] for joint in payload["joints"]}
+        self.assertEqual(rows["joint_lf02"], 0.0)
+        self.assertAlmostEqual(rows["joint_rf02"], -0.8)
+
+        joints = {j.get("name"): j for j in ET.fromstring(model["urdf"]).findall("joint")}
+        for name in ("joint_la4", "joint_ra4"):
+            self.assertEqual(joints[name].find("axis").get("xyz"), "0 -1 0")
+        base, top = (joints[f"display_column_{segment}_joint"] for segment in ("base", "top"))
+        self.assertEqual(base.find("parent").get("link"), "base_link")
+        self.assertEqual(top.find("parent").get("link"), base.find("child").get("link"))
+        self.assertEqual([base.get("type"), top.get("type")], ["fixed", "fixed"])
+        self.assertEqual(joints["body_joint"].get("type"), "prismatic")
+        self.assertEqual(joints["body_joint"].find("parent").get("link"), "base_link")
+        self.assertEqual(joints["body_joint"].find("child").get("link"), "body_link")
 
     def test_skeleton_indices_follow_kinematic_urdf_order(self):
         urdf = """<robot name='p'>
@@ -726,7 +745,7 @@ class PantherDriverTest(unittest.TestCase):
         self.assertEqual(created["publishers"][1], (std_msgs_msg.UInt8MultiArray, "/test/panther/laser_scan/points"))
         self.assertEqual(bytes(created["messages"][1].data), packet)
 
-    def test_lidar_waits_for_scan_time_tf_and_falls_back_to_front(self):
+    def test_lidar_publishes_only_current_scan_and_falls_back_to_front(self):
         device = object.__new__(device_module.PantherDevice)
         device._lock = threading.RLock()
         device._laser_lock = threading.Lock()
@@ -736,10 +755,8 @@ class PantherDriverTest(unittest.TestCase):
         device._laser_topics = ("/scan", "/lidar_front/scan")
         device._laser_source = None
         device._laser_seen = {}
-        device._laser_pending = deque(maxlen=24)
-        device._laser_cloud = laser_cloud.ScanCloud()
-        device._laser_fixed_frame = "odom"
-        device._scan_transform = lambda _scan: None
+        device._laser_max_points = 20_000
+        device._laser_max_range_m = 12.0
         captured = {}
         device._bridge = SimpleNamespace(publish=lambda card, payload: captured.update({card: payload}))
         scan = SimpleNamespace(
@@ -748,30 +765,26 @@ class PantherDriverTest(unittest.TestCase):
             angle_min=-1.0, angle_max=1.0, angle_increment=1.0,
             range_min=0.1, range_max=10.0,
         )
+        front = "/lidar_front/scan"
+        only_center = SimpleNamespace(**{**vars(scan), "ranges": [float("inf"), 3.0, float("nan")]})
         with patch.object(device_module.time, "monotonic", return_value=10.0) as clock:
-            device._on_laser(scan, "/lidar_front/scan")
-            device._publish_laser_cloud()
-            self.assertNotIn("laser_cloud", captured)
-            clock.return_value = 10.4
-            device._publish_laser_cloud()
+            device._on_laser(scan, front)
             cloud_wire = core_bridge.encode_bridge_payload("laser_cloud", captured["laser_cloud"])
             self.assertEqual(struct.unpack_from("<II", cloud_wire["data"]), (16, 2))
             self.assertEqual(device.sensor_info("laser_scan")["cloud_frame"], "laser")
             scan_wire = core_bridge.encode_bridge_payload("laser_scan", captured["laser_scan"])
-            clock.return_value = 11.0
+            clock.return_value = 10.1
+            device._on_laser(only_center, front)
+            self.assertEqual(struct.unpack("<IIffff", captured["laser_cloud"]), (16, 1, 3.0, 0.0, 0.0, 0.0))
+            clock.return_value = 10.2
             device._on_laser(scan, "/scan")
-            device._on_laser(scan, "/lidar_front/scan")
+            device._on_laser(only_center, front)
             self.assertEqual(device.sensor_info("laser_scan")["source_topic"], "/scan")
-            device.clear_laser_cloud()
-            self.assertEqual(device.sensor_info("laser_scan")["cloud_points"], 0)
-            device._publish_laser_cloud()
             self.assertEqual(captured["laser_cloud"], cloud_wire["data"])
-            clock.return_value = 11.1
-            next_scan = SimpleNamespace(**{**vars(scan), "ranges": [3.0]})
-            device._on_laser(next_scan, "/scan")
-            clock.return_value = 11.5
-            device._publish_laser_cloud()
-            self.assertEqual(struct.unpack_from("<II", captured["laser_cloud"]), (16, 1))
+            clock.return_value = 11.3
+            device._on_laser(only_center, front)
+            self.assertEqual(device.sensor_info("laser_scan")["source_topic"], front)
+            self.assertEqual(device.sensor_info("laser_scan")["cloud_points"], 1)
 
         scan_json = json.loads(scan_wire["data"])
         self.assertEqual(scan_wire["kind"], "string")
@@ -900,27 +913,14 @@ class PantherDriverTest(unittest.TestCase):
         self.assertIn("#200:", lines[2])
         self.assertTrue(all(len(line) < 300 for line in lines))
 
-    def test_laser_accumulation_aligns_scans_expires_and_rejects_mixed_frames(self):
-        history = laser_cloud.ScanCloud(voxel_m=0.05, history_s=2.0, max_points=2)
-
-        def scan(*distances):
-            return SimpleNamespace(angle_min=0.0, angle_increment=math.pi / 2,
-                                   range_min=0.1, range_max=10.0, ranges=distances)
-
-        def pose(x=0.0, yaw=0.0):
-            return SimpleNamespace(translation=SimpleNamespace(x=x, y=0.0, z=0.2),
-                                   rotation=SimpleNamespace(x=0.0, y=0.0, z=math.sin(yaw / 2), w=math.cos(yaw / 2)))
-
-        self.assertEqual(history.update(scan(1.0), 10.0, 10, pose()), [(1.0, 0.0, 0.2)])
-        self.assertEqual(history.update(scan(0.75), 10.1, 11, pose(0.25)), [(1.0, 0.0, 0.2)])
-        rotated = history.update(scan(1.0), 10.2, 12, pose(0.25, math.pi / 2))
-        self.assertEqual(len(rotated), 2)
-        self.assertAlmostEqual(rotated[-1][0], 0.25)
-        self.assertAlmostEqual(rotated[-1][1], 1.0)
-        self.assertEqual(history.update(scan(9.0), 10.3, 13, None), [(9.0, 0.0, 0.0)])
-        self.assertEqual(len(history.update(scan(2.0), 10.4, 14, pose())), 2)
-        self.assertEqual(history.update(scan(1.0), 13.0, 15, pose()), [(1.0, 0.0, 0.2)])
-        self.assertEqual(history.update(scan(1.0), 13.1, 16, pose(4.0)), [(5.0, 0.0, 0.2)])
+    def test_laser_range_and_points_are_bounded_and_keep_original_beam_angles(self):
+        scan = SimpleNamespace(angle_min=0.0, angle_increment=math.pi / 2,
+                               range_min=0.1, range_max=20.0,
+                               ranges=[0.05, 2.0, 13.0, 3.0])
+        points = laser_cloud.current_points(scan, max_range_m=12.0, max_points=1)
+        self.assertEqual(len(points), 1)
+        self.assertAlmostEqual(points[0][0], 0.0)
+        self.assertEqual(points[0][1:], (2.0, 0.0))
 
     def test_container_dependency_contract_is_apt_only_and_explained(self):
         dockerfile = (DRIVER / "Dockerfile").read_text()

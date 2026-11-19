@@ -17,9 +17,6 @@ plugins:
     enabled: true
     # Prefer the robot's fused scan; also support units with only a front scanner.
     topics: ["/scan", "/lidar_front/scan"]
-    fixed_frame: odom
-    history_s: 20.0
-    voxel_m: 0.05
     max_points: 20000
     max_range_m: 12.0
 

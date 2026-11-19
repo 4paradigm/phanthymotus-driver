@@ -7,7 +7,6 @@ is forwarded into Agent Core's DDS domain.
 
 from __future__ import annotations
 
-from collections import deque
 from datetime import datetime
 import hashlib
 import json
@@ -42,8 +41,8 @@ from contracts import (
 )
 from common.odom import build_interface, build_sample, mean_twist, resolve_stamp_ms
 from core_bridge import BridgeWorker, output_topics
-from joint_display import dedicated_row, joint_row, render_model
-from laser_cloud import ScanCloud, point_packet
+from joint_display import dedicated_row, display_gripper_row, joint_row, render_model
+from laser_cloud import current_points, point_packet
 
 
 MODEL_PATH = Path(__file__).with_name("resource") / "panther.urdf"
@@ -130,14 +129,13 @@ class PantherDevice:
         self._laser_lock = threading.Lock()
         laser = config.get("plugins", {}).get("laser_scan", {})
         self._laser_topics = tuple(laser.get("topics", ("/scan", "/lidar_front/scan")))
-        self._laser_fixed_frame = laser.get("fixed_frame", "odom")
-        self._laser_cloud = ScanCloud(**{k: laser[k] for k in (
-            "voxel_m", "history_s", "max_points", "max_range_m",
-        ) if k in laser})
+        self._laser_max_points = int(laser.get("max_points", 20000))
+        self._laser_max_range_m = float(laser.get("max_range_m", 12.0))
+        if not (1 <= self._laser_max_points <= 40000 and 0 < self._laser_max_range_m <= 100):
+            raise ValueError("invalid laser_scan cloud limits")
         self._laser_source = None
         self._laser_seen = {}
         self._laser_cloud_info = {}
-        self._laser_pending = deque(maxlen=24)
         self._model_urdf = MODEL_PATH.read_text(encoding="utf-8")
         self._model_joint_limits = parse_joint_limits(self._model_urdf)
         self._urdf = ""
@@ -234,17 +232,12 @@ class PantherDevice:
             String, "/robot_description", guarded("model", self._on_robot_description), latched_qos
         )
         if laser.get("enabled", False):
-            from tf2_ros import Buffer, TransformListener
-
-            self._laser_tf = Buffer()
-            self._laser_tf_listener = TransformListener(self._laser_tf, self._node, spin_thread=False)
             for topic in self._laser_topics:
                 self._node.create_subscription(
                     LaserScan, topic,
                     guarded("laser_scan", lambda msg, topic=topic: self._on_laser(msg, topic)),
                     sensor_qos,
                 )
-            self._node.create_timer(0.05, guarded("laser_scan", self._publish_laser_cloud))
 
         self._twist_type = Twist
         self._drive_qos = reliable_qos
@@ -460,28 +453,6 @@ class PantherDevice:
                 "child_frame_id": msg.child_frame_id,
             }
 
-    def _scan_transform(self, msg):
-        from rclpy.time import Time
-        from tf2_ros import TransformException
-
-        stamp = Time.from_msg(msg.header.stamp)
-        if not stamp.nanoseconds or not msg.header.frame_id:
-            return None
-        try:
-            return self._laser_tf.lookup_transform(
-                self._laser_fixed_frame, msg.header.frame_id, stamp
-            ).transform
-        except TransformException:
-            return None
-
-    def clear_laser_cloud(self):
-        with self._laser_lock:
-            self._laser_cloud.clear()
-            self._laser_pending.clear()
-            self._laser_cloud_info = {"accumulating": False, "cloud_points": 0}
-            # Canvas replaces each frame, but ignores a zero-point packet. Rebuild
-            # from the next scan instead of relying on Canvas to clear itself.
-
     def _on_laser(self, msg, topic) -> None:
         with self._laser_lock:
             now = time.monotonic()
@@ -489,45 +460,18 @@ class PantherDevice:
             preferred = next(t for t in self._laser_topics if now - self._laser_seen.get(t, -math.inf) < 1.0)
             if topic != preferred:
                 return
-            if topic != self._laser_source:
-                self._laser_cloud.clear()
-                self._laser_pending.clear()
-                self._laser_source = topic
-                self._laser_cloud_info = {"accumulating": False, "cloud_points": 0}
+            changed_source = topic != self._laser_source
+            self._laser_source = topic
             received = self._put("laser_scan", msg)
-            self._laser_pending.append((msg, received))
-            self._publish_limited("laser_scan", self._laser_payload(msg, received, topic), 5.0)
-
-    def _publish_laser_cloud(self):
-        with self._laser_lock:
-            now = time.monotonic()
-            if now - self._last_card_publish.get("laser_cloud", -math.inf) < 0.2:
+            self._publish_limited("laser_scan", self._laser_payload(msg, received, topic), 5.0,
+                                  force=changed_source)
+            if not changed_source and now - self._last_card_publish.get("laser_cloud", -math.inf) < 1 / 15:
                 return
-            last = aligned = None
-            while self._laser_pending:
-                msg, received = self._laser_pending[0]
-                transform = self._scan_transform(msg)
-                # TF and scan are separate DDS streams. Wait briefly for the
-                # transform without blocking the executor that receives it.
-                if transform is None and now - received < 0.35:
-                    break
-                self._laser_pending.popleft()
-                stamp = msg.header.stamp
-                points = self._laser_cloud.update(
-                    msg, received, stamp.sec * 1_000_000_000 + stamp.nanosec, transform
-                )
-                last = msg, transform, points
-                if transform is not None:
-                    aligned = last
-            if last is None:
-                return
-            msg, transform, points = aligned or last
+            points = current_points(msg, self._laser_max_range_m, self._laser_max_points)
             self._laser_cloud_info = {
-                "cloud_frame": self._laser_fixed_frame if transform else msg.header.frame_id,
-                "accumulating": transform is not None, "cloud_points": len(points),
+                "cloud_frame": msg.header.frame_id, "cloud_points": len(points),
             }
-            if points:
-                self._publish_limited("laser_cloud", point_packet(points), 5.0, force=True)
+            self._publish_limited("laser_cloud", point_packet(points), 15.0, force=True)
 
     def _publish_odom_window(self) -> None:
         with self._lock:
@@ -579,8 +523,11 @@ class PantherDevice:
                     sources[name] = key
         # Canvas consumes one value per animated joint; resolve the bundled
         # gripper linkage even when only its master channel is published.
+        for name in ("joint_lf", "joint_rf"):
+            if name in rows:
+                rows[name] = display_gripper_row(rows[name])
         for name, (master, multiplier, offset) in self._render_mimics.items():
-            if master in rows and (name not in rows or master in sources):
+            if master in rows:
                 rows[name] = {"q": rows[master]["q"] * multiplier + offset}
         joints = [{"idx": joint_indices[name], "name": name, **row}
                   for name, row in rows.items() if name in joint_indices]

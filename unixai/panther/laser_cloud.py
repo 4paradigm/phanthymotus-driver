@@ -1,6 +1,5 @@
-"""Planar scan projection and bounded, odom-aligned accumulation for Canvas."""
+"""Project one planar scan into the Canvas point-cloud wire format."""
 
-from collections import OrderedDict
 import math
 import struct
 
@@ -26,49 +25,6 @@ def point_packet(points):
     )
 
 
-class ScanCloud:
-    def __init__(self, *, voxel_m=0.05, history_s=20.0, max_points=20000, max_range_m=12.0):
-        if not (0 < voxel_m <= 1 and 0 < history_s <= 120 and 1 <= max_points <= 40000
-                and 0 < max_range_m <= 100):
-            raise ValueError("invalid laser_scan cloud limits")
-        self.voxel_m = voxel_m
-        self.history_s = history_s
-        self.max_points = max_points
-        self.max_range_m = max_range_m
-        self.clear()
-
-    def clear(self):
-        self._cells = OrderedDict()
-        self._last_pose = None
-        self._last_stamp = None
-
-    def update(self, scan, received, stamp_ns, transform):
-        points = list(scan_points(scan, self.max_range_m))
-        if transform is None:
-            # Scans without a transform are shown alone, never inserted into the odom cloud.
-            stride = max(1, math.ceil(len(points) / self.max_points))
-            return points[::stride]
-        t, q = transform.translation, transform.rotation
-        length = math.hypot(q.x, q.y, q.z, q.w)
-        if not length or not all(math.isfinite(v) for v in (length, t.x, t.y, t.z)):
-            raise ValueError("invalid laser transform")
-        x, y, z, w = (v / length for v in (q.x, q.y, q.z, q.w))
-        # First two columns of the full 3D rotation: input points lie in the scan's XY plane.
-        xx, xy, xz = 1 - 2 * (y*y + z*z), 2 * (x*y + w*z), 2 * (x*z - w*y)
-        yx, yy, yz = 2 * (x*y - w*z), 1 - 2 * (x*x + z*z), 2 * (y*z + w*x)
-        pose = (t.x, t.y, t.z)
-        if self._last_stamp is not None and (
-            stamp_ns < self._last_stamp or math.dist(self._last_pose, pose) > 1.0
-        ):
-            self.clear()
-        self._last_stamp, self._last_pose = stamp_ns, pose
-        while self._cells and next(iter(self._cells.values()))[0] < received - self.history_s:
-            self._cells.popitem(last=False)
-        for px, py, _ in points:
-            point = (xx*px + yx*py + t.x, xy*px + yy*py + t.y, xz*px + yz*py + t.z)
-            key = tuple(math.floor(value / self.voxel_m) for value in point)
-            self._cells[key] = (received, point)
-            self._cells.move_to_end(key)
-            if len(self._cells) > self.max_points:
-                self._cells.popitem(last=False)
-        return [point for _, point in self._cells.values()]
+def current_points(scan, max_range_m, max_points):
+    points = list(scan_points(scan, max_range_m))
+    return points[::max(1, math.ceil(len(points) / max_points))]
