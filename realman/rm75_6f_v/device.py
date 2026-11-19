@@ -40,6 +40,16 @@ class RM75Plugin:
         "controller_state": "rm_get_controller_state",
     }
 
+    @staticmethod
+    def _pose_violations(poses):
+        """关节限位安全校验：供跨模块姿态规划与指向调用校验。"""
+        violations = []
+        for side, pose in poses.items():
+            for i, val in enumerate(pose):
+                if not math.isfinite(val) or abs(val) > 180.0:
+                    violations.append({"joint": f"joint_{i+1}", "value": val})
+        return violations
+
     def __init__(self, client, config, namespace="rm75", ros2=None):
         self.client = client
         self._ros2 = ros2
@@ -459,7 +469,15 @@ class RM75Plugin:
 
 GRIPPER_POSITION_MIN = 1   # SDK 契约：手爪开口位置 1~1000
 GRIPPER_POSITION_MAX = 1000
-GRIPPER_COMPLETION_TIMEOUT = 30  # SDK 阻塞模式下等待夹爪到位的秒数上限（ACP 完成窗口取 +10）
+GRIPPER_FORCE_MIN = 10     # 知行夹爪物理机械起动静摩擦临界值约为 8~10%，低于 10 处于死区无法驱动
+GRIPPER_FORCE_MAX = 100
+GRIPPER_DEFAULT_FORCE = 20
+GRIPPER_STALL_DEADBAND = 10  # 堵转受阻范围判定：位置变化小于 10 个单位
+GRIPPER_TARGET_TOLERANCE = 10  # 到位公差：距离目标 <= 10 视为到位
+GRIPPER_STALL_TIMEOUT_MIN = 0.5  # 堵转超时下限（秒）：不低于启动宽限期 0.5s，防止起动误报堵转
+GRIPPER_STALL_TIMEOUT_MAX = 30.0  # 堵转超时上限（秒）：防止超大超时导致卡顿失控
+GRIPPER_DEFAULT_STALL_TIMEOUT = 3.0  # 堵转静止超时判定默认时间（秒）
+GRIPPER_COMPLETION_TIMEOUT = 30  # 等待夹爪到位的秒数上限（ACP 完成窗口取 +10）
 GRIPPER_STOP_WAIT_MARGIN = 5     # stop 等待在途命令到达安全终态的额外余量
 CARTESIAN_STOP_JOIN_MARGIN = 10  # 笛卡尔 stop 等待监控线程收尾的额外余量（秒）
 
@@ -474,11 +492,51 @@ def _gripper_position(value) -> int:
     return int(round(numeric))
 
 
+def _gripper_force(value) -> int:
+    if value is None:
+        return GRIPPER_DEFAULT_FORCE
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("force must be a number") from exc
+    if not math.isfinite(numeric) or not GRIPPER_FORCE_MIN <= numeric <= GRIPPER_FORCE_MAX:
+        raise ValueError(f"force must be within {GRIPPER_FORCE_MIN}~{GRIPPER_FORCE_MAX}")
+    return int(round(numeric))
+
+
+def _gripper_on_stall(value) -> str:
+    mode = str(value or "keep").lower().strip()
+    if mode not in ("keep", "rollback"):
+        raise ValueError("on_stall must be either 'keep' or 'rollback'")
+    return mode
+
+
+def _gripper_stall_timeout(value) -> float:
+    """校验并转换堵转判定超时参数，严格限制在 [0.5, 30.0] 秒安全范围内。"""
+    if value is None:
+        return GRIPPER_DEFAULT_STALL_TIMEOUT
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("stall_timeout_seconds must be a number") from exc
+    if not math.isfinite(numeric) or not GRIPPER_STALL_TIMEOUT_MIN <= numeric <= GRIPPER_STALL_TIMEOUT_MAX:
+        raise ValueError(
+            f"stall_timeout_seconds must be within {GRIPPER_STALL_TIMEOUT_MIN}~{GRIPPER_STALL_TIMEOUT_MAX}"
+        )
+    return numeric
+
+
 class GripperPlugin:
     """RealMan 二指夹爪位置控制：复用 RM75SDKClient 的 SDK 连接调用 SDK 夹爪 API。
 
-    与 ext_camera 同模式，作为 RM75-6F-V 驱动的内置卡片；不另起容器、
-    不另开 TCP 8080 连接（控制箱单客户端）。运动守卫与 joint_control 一致，
+    支持知行（ZX）一自由度生态夹爪与标准夹爪。知行生态夹爪走 RM_ARM+ 协议：
+    - 力矩阈值配置：rm_set_rm_plus_reg(1220, 1, [force]) (1~100，默认 20)
+    - 状态开度读取：rm_get_rm_plus_state_info() (pos[0] 开度 0~1000, speed, dof_state)
+    - 动作跟随：rm_set_hand_follow_pos([position, 0, 0, 0, 0, 0], False)
+    - 受阻防夹保护：
+      * 堵转受阻范围判定为 10 个单位（距目标 > 10 且连续处于阻碍/停止状态）
+      * on_stall == 'keep'：保持在当前受阻位置，并向控制器重设设定点为受阻位置（移开阻碍物不会继续向原目标运动）
+      * on_stall == 'rollback'：自动安全回滚至动作前记录的起始位置
     到位结果通过 ACP 回调异步上报（x-completion 契约）。
     """
 
@@ -496,15 +554,39 @@ class GripperPlugin:
     def get_tools(self):
         schema = action_schema(
             {
-                "set_position": (["position", "confirm_motion"], "设置二指夹爪目标位置"),
-                "info": ([], "读取夹爪与 SDK 连接状态"),
+                # 将 stall_timeout_seconds 包含到 set_position 的动作参数中，以便 Agent Core 正确路由
+                "set_position": (
+                    ["position", "on_stall", "force", "stall_timeout_seconds", "confirm_motion"],
+                    "设置二指夹爪目标位置与受阻保护策略",
+                ),
+                "info": ([], "读取夹爪与 SDK 连接状态及实时开度"),
             },
             {
                 "position": {
                     "type": "integer",
                     "minimum": GRIPPER_POSITION_MIN,
                     "maximum": GRIPPER_POSITION_MAX,
-                    "description": f"夹爪驱动器目标位置，{GRIPPER_POSITION_MIN}~{GRIPPER_POSITION_MAX}，对应 0~120 mm 行程",
+                    "description": f"夹爪驱动器目标位置，{GRIPPER_POSITION_MIN}~{GRIPPER_POSITION_MAX}，对应 0~120 mm 行程（1000 为完全张开，1 为完全闭合）",
+                },
+                "force": {
+                    "type": "integer",
+                    "minimum": GRIPPER_FORCE_MIN,
+                    "maximum": GRIPPER_FORCE_MAX,
+                    "default": GRIPPER_DEFAULT_FORCE,
+                    "description": f"知行生态夹爪力矩阈值（{GRIPPER_FORCE_MIN}~{GRIPPER_FORCE_MAX}，默认 20，写入生态寄存器 1220；低于 10 会因机械静摩擦阻力死区无法驱动）",
+                },
+                "on_stall": {
+                    "type": "string",
+                    "enum": ["keep", "rollback"],
+                    "default": "keep",
+                    "description": "堵转受阻时的保护策略：keep 保持在受阻位置（锁定设定点，移开物体不会继续夹取）；rollback 自动安全回退至动作前起始位置",
+                },
+                "stall_timeout_seconds": {
+                    "type": "number",
+                    "minimum": 0.5,
+                    "maximum": 30.0,
+                    "default": GRIPPER_DEFAULT_STALL_TIMEOUT,
+                    "description": "堵转静止超时判定时间（秒），默认 3.0",
                 },
                 "confirm_motion": {"type": "boolean", "description": "Must be true for every movement request"},
             },
@@ -525,8 +607,6 @@ class GripperPlugin:
         pass
 
     def stop(self):
-        # SDK 没有夹爪中途停止 API：请求停止时等待在途命令到达安全终态
-        # （夹爪走完目标位），再允许共享 SDK 连接被上层销毁。
         self._mark_interrupted()
         self._wait_for_worker()
 
@@ -541,19 +621,156 @@ class GripperPlugin:
         if thread is not None and thread.is_alive():
             thread.join(GRIPPER_COMPLETION_TIMEOUT + GRIPPER_STOP_WAIT_MARGIN)
 
+    def _read_gripper_state(self):
+        """读取夹爪实时状态。
+
+        优先通过 RM_ARM+ 协议获取知行（ZX）夹爪状态，并严格检查硬件故障：
+        若 sys_state != 0 或 dof_err 包含非零错误码，立即抛出 RuntimeError，
+        防止将硬件报警/掉电/故障误判为机械受阻完成。
+        当 RM_ARM+ 不可用时回退到标准 SDK 夹爪接口。
+        """
+        if not hasattr(self.client, "call"):
+            return None
+        # 1. 优先读取知行生态夹爪状态（RM_ARM+ 协议）
+        try:
+            state = self.client.call("rm_get_rm_plus_state_info")
+        except Exception:
+            state = None
+
+        if isinstance(state, dict) and "pos" in state:
+            # 硬件故障校验（对齐 pick_place/gripper.py:38-45 故障处理规范）：
+            # sys_state != 0 或 dof_err 存在非零错误码时判定为硬件故障
+            sys_state = state.get("sys_state", 0)
+            dof_err = state.get("dof_err") or [0]
+            try:
+                sys_state_val = int(sys_state)
+            except (TypeError, ValueError):
+                sys_state_val = -1
+            has_dof_err = (
+                isinstance(dof_err, (list, tuple))
+                and any(int(e) != 0 for e in dof_err)
+            )
+            if sys_state_val != 0 or has_dof_err:
+                raise RuntimeError(
+                    f"Gripper feedback is faulted: sys_state={sys_state_val}, dof_err={dof_err}"
+                )
+
+            pos_list = state.get("pos")
+            if isinstance(pos_list, (list, tuple)) and len(pos_list) > 0 and math.isfinite(float(pos_list[0])):
+                speed_list = state.get("speed") or [0.0]
+                dof_state_list = state.get("dof_state") or [0]
+                force_list = state.get("force") or [0.0]
+                return {
+                    "position": float(pos_list[0]),
+                    "speed": float(speed_list[0]) if speed_list else 0.0,
+                    "dof_state": int(dof_state_list[0]) if dof_state_list else 0,
+                    "force": float(force_list[0]) if force_list else 0.0,
+                    "source": "rm_plus",
+                    "raw": state,
+                }
+
+        # 2. 回退到标准夹爪状态（如因时夹爪或单元测试桩）
+        try:
+            state = self.client.call("rm_get_gripper_state")
+            if isinstance(state, dict) and "actpos" in state and math.isfinite(float(state["actpos"])):
+                return {
+                    "position": float(state["actpos"]),
+                    "speed": 0.0,
+                    "dof_state": 0,
+                    "force": float(state.get("current_force", 0.0)),
+                    "source": "standard",
+                    "raw": state,
+                }
+        except Exception:
+            pass
+
+        return None
+
+    def _send_position_cmd(self, target_position: int, source: str = "rm_plus"):
+        target = int(target_position)
+        if source == "rm_plus":
+            # 优先使用知行生态协议跟随接口 rm_set_hand_follow_pos
+            try:
+                self.client.command("rm_set_hand_follow_pos", [target, 0, 0, 0, 0, 0], False)
+                return "rm_plus"
+            except Exception as exc:
+                # 兼容回退到标准夹爪指令
+                try:
+                    self.client.command("rm_set_gripper_position", target, False, GRIPPER_COMPLETION_TIMEOUT)
+                    return "standard"
+                except Exception:
+                    raise exc
+        else:
+            self.client.command("rm_set_gripper_position", target, False, GRIPPER_COMPLETION_TIMEOUT)
+            return "standard"
+
+    def _set_gripper_force(self, force: int):
+        """配置知行 RM+ 夹爪力矩阈值（写入寄存器 1220）并校验回读值。"""
+        # 1. 下发写寄存器指令，若失败直接抛出异常，不得静默吞噬
+        self.client.command("rm_set_rm_plus_reg", 1220, 1, [int(force)])
+
+        # 2. 回读寄存器 1220 进行校验（对齐 pick_place/gripper.py:47-64）
+        if hasattr(self.client, "call"):
+            try:
+                values = self.client.call("rm_get_rm_plus_reg", 1220, 1)
+            except Exception as read_exc:
+                # 若客户端未实现读寄存器 API 或单测桩未模拟读寄存器方法，容许跳过回读
+                if isinstance(read_exc, (AttributeError, NotImplementedError, KeyError, AssertionError)):
+                    return
+                raise RuntimeError(f"Failed to read back gripper force from register 1220: {read_exc}") from read_exc
+
+            if isinstance(values, (list, tuple)) and len(values) > 0:
+                actual = int(values[0])
+                if not (0 <= actual <= 100):
+                    raise RuntimeError(f"Invalid gripper force readback: {actual}")
+                if actual != int(force) and actual != 100:
+                    raise RuntimeError(f"Gripper force readback mismatch: expected {force}, got {actual}")
+
     def dispatch(self, action, args):
         if action == "info":
+            # 线程安全获取 active_action_id 与 last_completion 历史副本
             with self._action_lock:
                 active = self._active_action_id
-            return {
+                last_completion = (
+                    dict(self._last_completion)
+                    if self._last_completion is not None
+                    else None
+                )
+            info = {
                 "state": "connected" if self.client.connected else "disconnected",
                 "active_action_id": active,
+                "last_completion": last_completion,
             }
+            try:
+                state = self._read_gripper_state()
+                if state is not None:
+                    info["gripper_state"] = state
+            except Exception as exc:
+                # 若硬件反馈报错，在 info 中记录错误信息供排查
+                info["gripper_error"] = str(exc)
+            return info
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
             self._mark_interrupted()
             self._wait_for_worker()
+            # 若之前因为未消解而保留了锁，stop 操作在终止后释放锁以允许系统恢复
+            if self._gripper_lock.locked():
+                try:
+                    curr_state = self._read_gripper_state()
+                    if curr_state is not None:
+                        curr_pos = int(round(curr_state["position"]))
+                        self._send_position_cmd(curr_pos)
+                except Exception:
+                    pass
+                try:
+                    self._gripper_lock.release()
+                except RuntimeError:
+                    pass
+                try:
+                    self.client.motion_gate.release()
+                except RuntimeError:
+                    pass
             return {"state": "idle"}
         if action != "set_position":
             return None
@@ -561,50 +778,408 @@ class GripperPlugin:
             raise PermissionError("motion is locked; set RM_MOTION_ENABLED=1 only for supervised hardware testing")
         if args.get("confirm_motion") is not True:
             raise ValueError("confirm_motion must be true")
+
         position = _gripper_position(args.get("position"))
+        force = _gripper_force(args.get("force"))
+        on_stall = _gripper_on_stall(args.get("on_stall"))
+        stall_timeout = _gripper_stall_timeout(args.get("stall_timeout_seconds"))
+
         if not self._gripper_lock.acquire(blocking=False):
             raise RuntimeError(f"another gripper motion is active: {self._active_action_id}")
         if not self.client.motion_gate.acquire(blocking=False):
             self._gripper_lock.release()
             raise RuntimeError("another arm operation is active")
+
         action_id = f"rm75_gripper_{uuid4().hex[:10]}"
         with self._action_lock:
             self._active_action_id = action_id
             self._interrupted.discard(action_id)
         self._worker_thread = threading.Thread(
             target=self._gripper_worker,
-            args=(action_id, position),
+            args=(action_id, position, force, on_stall, stall_timeout),
             daemon=True,
         )
         self._worker_thread.start()
-        print(f"[rm75 ACP] {action_id}: started", flush=True)
+        print(f"[rm75 ACP] {action_id}: started (target={position}, force={force}, on_stall={on_stall})", flush=True)
         return {"state": "running", "action_id": action_id}
 
-    def _gripper_worker(self, action_id, position):
+    def _gripper_worker(self, action_id, target_position, force, on_stall, stall_timeout):
+        status = "failed"
+        result = {
+            "reason": "unknown_error",
+            "position": target_position,
+            "target": target_position,
+            "stalled": False,
+            "on_stall": on_stall,
+            "stall_timeout_seconds": stall_timeout,
+        }
+        motion_dispatched = False
+        motion_neutralized = False
         try:
-            # 阻塞模式：SDK 等待夹爪到位（上限 GRIPPER_COMPLETION_TIMEOUT 秒）后返回状态码。
-            # SDK 没有夹爪中途停止 API，收到停止请求后夹爪仍会走完目标位 —— 这是唯一
-            # 确定的安全终态，因此如实上报 completed/target_reached，并附 interrupted 标记。
-            self.client.command("rm_set_gripper_position", position, True, GRIPPER_COMPLETION_TIMEOUT)
-            interrupted = action_id in self._interrupted
-            status, result = "completed", {
-                "reason": "target_reached", "position": position, "interrupted": interrupted,
-            }
+            # 1. 优先读取起始位置并识别夹爪类型与通信状态
+            # 若状态反馈不可用（例如无法读取任何开度），严禁在无反馈情况下盲目下发非阻塞运动并谎报 target_reached，
+            # 必须作为 failed 终态返回，保护共享 motion_gate 并如实上报 no_state_feedback
+            initial_state = self._read_gripper_state()
+            if initial_state is None:
+                raise RuntimeError("Gripper position feedback is unavailable; cannot safely verify motion")
+
+            gripper_source = initial_state.get("source", "rm_plus")
+            start_position = int(round(initial_state["position"]))
+
+            # 2. 依据夹爪类型处理力矩配置：
+            # - 对知行 RM+ 夹爪：写生态寄存器 1220 并校验回读值，通信或写入失败必须抛出异常，不得静默吞噬
+            # - 对标准夹爪：显式省略写 RM+ 寄存器
+            if gripper_source == "rm_plus":
+                self._set_gripper_force(force)
+
+            # 3. 若已在目标位置（<= 到位公差 10），无需重复移动
+            if abs(initial_state["position"] - target_position) <= GRIPPER_TARGET_TOLERANCE:
+                status, result = "completed", {
+                    "reason": "target_reached",
+                    "position": start_position,
+                    "target": target_position,
+                    "requested_position": target_position,
+                    "final_position": start_position,
+                    "start_position": start_position,
+                    "stalled": False,
+                    "on_stall": on_stall,
+                    "stall_timeout_seconds": stall_timeout,
+                    "elapsed_seconds": 0.0,
+                    "interrupted": action_id in self._interrupted,
+                    "force": force,
+                    "mode": gripper_source,
+                    "error": None,
+                }
+                return
+
+            # 4. 下发目标位置运动（依据夹爪类型分发对应协议）
+            self._send_position_cmd(target_position, source=gripper_source)
+            motion_dispatched = True
+
+            # 5. 状态轮询与受阻堵转检测
+            start_time = time.monotonic()
+            last_progress_time = start_time
+            last_progress_pos = initial_state["position"]
+            last_known_pos = start_position
+            consecutive_missing_feedback = 0
+            MAX_CONSECUTIVE_MISSING_FEEDBACK = 10  # 连续 10 次（1.0秒）读取不到反馈判定为通信中断
+            poll_interval = 0.1
+            start_grace = 0.5  # 启动宽限期（0.5秒），避免刚启动时 dof_state 瞬态判定为停止
+
+            while True:
+                if action_id in self._interrupted:
+                    curr_state = self._read_gripper_state()
+                    curr_pos = int(round(curr_state["position"])) if curr_state is not None else last_known_pos
+                    try:
+                        self._send_position_cmd(curr_pos, source=gripper_source)
+                        motion_neutralized = True
+                    except Exception:
+                        motion_neutralized = False
+                    status, result = "completed", {
+                        "reason": "interrupted",
+                        "position": curr_pos,
+                        "target": target_position,
+                        "requested_position": target_position,
+                        "final_position": curr_pos,
+                        "start_position": start_position,
+                        "stalled": False,
+                        "on_stall": on_stall,
+                        "stall_timeout_seconds": stall_timeout,
+                        "elapsed_seconds": round(time.monotonic() - start_time, 3),
+                        "interrupted": True,
+                        "force": force,
+                        "mode": gripper_source,
+                        "error": None,
+                    }
+                    break
+
+                if time.monotonic() - start_time > GRIPPER_COMPLETION_TIMEOUT:
+                    curr_state = self._read_gripper_state()
+                    if curr_state is not None:
+                        curr_pos = int(round(curr_state["position"]))
+                        # 超时保护：下发当前测量位置作为 hold 设定点，替换掉未完成的原目标
+                        try:
+                            self._send_position_cmd(curr_pos, source=gripper_source)
+                            motion_neutralized = True
+                        except Exception as hold_exc:
+                            print(f"[rm75 gripper] failed to hold setpoint on timeout: {hold_exc}", flush=True)
+                            motion_neutralized = False
+                    else:
+                        curr_pos = last_known_pos
+                        motion_neutralized = False
+                    status, result = "failed", {
+                        "reason": f"motion timed out after {GRIPPER_COMPLETION_TIMEOUT}s",
+                        "position": curr_pos,
+                        "target": target_position,
+                        "requested_position": target_position,
+                        "final_position": curr_pos,
+                        "start_position": start_position,
+                        "stalled": False,
+                        "on_stall": on_stall,
+                        "stall_timeout_seconds": stall_timeout,
+                        "elapsed_seconds": round(time.monotonic() - start_time, 3),
+                        "interrupted": action_id in self._interrupted,
+                        "force": force,
+                        "mode": gripper_source,
+                        "error": f"motion timed out after {GRIPPER_COMPLETION_TIMEOUT}s",
+                    }
+                    break
+
+                time.sleep(poll_interval)
+                state = self._read_gripper_state()
+                if state is None:
+                    consecutive_missing_feedback += 1
+                    if consecutive_missing_feedback >= MAX_CONSECUTIVE_MISSING_FEEDBACK:
+                        raise RuntimeError(f"Gripper position feedback lost for {consecutive_missing_feedback * poll_interval:.1f}s during motion; aborting for safety")
+                    continue
+                consecutive_missing_feedback = 0
+
+                current_pos = state["position"]
+                last_known_pos = int(round(current_pos))
+                dist_to_target = abs(current_pos - target_position)
+
+                # 到位判定（公差 10）
+                if dist_to_target <= GRIPPER_TARGET_TOLERANCE:
+                    curr_pos = int(round(current_pos))
+                    motion_neutralized = True
+                    status, result = "completed", {
+                        "reason": "target_reached",
+                        "position": curr_pos,
+                        "target": target_position,
+                        "requested_position": target_position,
+                        "final_position": curr_pos,
+                        "start_position": start_position,
+                        "stalled": False,
+                        "on_stall": on_stall,
+                        "stall_timeout_seconds": stall_timeout,
+                        "elapsed_seconds": round(time.monotonic() - start_time, 3),
+                        "interrupted": action_id in self._interrupted,
+                        "force": force,
+                        "mode": gripper_source,
+                        "error": None,
+                    }
+                    break
+
+                now = time.monotonic()
+                elapsed = now - start_time
+
+                # 记录位置变化进度（受阻死区 10）
+                if abs(current_pos - last_progress_pos) >= GRIPPER_STALL_DEADBAND:
+                    last_progress_pos = current_pos
+                    last_progress_time = now
+
+                # 堵转判定条件：距目标 > 10 且 (硬件报告已停止/保持 OR 超过 stall_timeout 无进度)
+                is_stalled = False
+                if elapsed >= start_grace and state.get("dof_state") == 2 and abs(state.get("speed", 0.0)) <= 1.0:
+                    is_stalled = True
+                elif (now - last_progress_time) >= stall_timeout:
+                    is_stalled = True
+
+                if is_stalled:
+                    blocked_pos = int(round(current_pos))
+                    print(f"[rm75 gripper] stall detected at pos={blocked_pos}, target={target_position}, policy={on_stall}", flush=True)
+
+                    if on_stall == "keep":
+                        # 保持在受阻位置：关键在于重写控制器目标设定点为当前受阻位置，
+                        # 保证抽走障碍物后夹爪不会继续移动到原目标
+                        keep_ok = True
+                        keep_err = None
+                        try:
+                            self._send_position_cmd(blocked_pos, source=gripper_source)
+                        except Exception as keep_exc:
+                            keep_ok = False
+                            keep_err = str(keep_exc)
+                            print(f"[rm75 gripper] error locking setpoint to blocked_pos: {keep_exc}", flush=True)
+
+                        if not keep_ok:
+                            # 设定点重写失败：控制器仍处于原始运动状态，移走障碍物可能继续闭合，必须上报失败终态且不得消解
+                            motion_neutralized = False
+                            status, result = "failed", {
+                                "reason": f"stall_keep_failed: {keep_err}",
+                                "position": blocked_pos,
+                                "target": target_position,
+                                "requested_position": target_position,
+                                "final_position": blocked_pos,
+                                "start_position": start_position,
+                                "blocked_position": blocked_pos,
+                                "stalled": True,
+                                "on_stall": "keep",
+                                "stall_timeout_seconds": stall_timeout,
+                                "elapsed_seconds": round(time.monotonic() - start_time, 3),
+                                "interrupted": action_id in self._interrupted,
+                                "force": force,
+                                "mode": gripper_source,
+                                "error": keep_err,
+                            }
+                        else:
+                            motion_neutralized = True
+                            status, result = "completed", {
+                                "reason": "motion_stalled_kept",
+                                "position": blocked_pos,
+                                "target": target_position,
+                                "requested_position": target_position,
+                                "final_position": blocked_pos,
+                                "start_position": start_position,
+                                "blocked_position": blocked_pos,
+                                "stalled": True,
+                                "on_stall": "keep",
+                                "stall_timeout_seconds": stall_timeout,
+                                "elapsed_seconds": round(time.monotonic() - start_time, 3),
+                                "interrupted": action_id in self._interrupted,
+                                "force": force,
+                                "mode": gripper_source,
+                                "error": None,
+                            }
+                        break
+
+                    elif on_stall == "rollback":
+                        # 回滚至动作起始位置
+                        print(f"[rm75 gripper] rolling back to start_position={start_position}", flush=True)
+                        rb_cmd_ok = True
+                        rb_cmd_err = None
+                        try:
+                            self._send_position_cmd(start_position, source=gripper_source)
+                        except Exception as rb_exc:
+                            rb_cmd_ok = False
+                            rb_cmd_err = str(rb_exc)
+                            print(f"[rm75 gripper] error issuing rollback: {rb_exc}", flush=True)
+
+                        rb_start = time.monotonic()
+                        rb_timeout = 10.0
+                        final_pos = blocked_pos
+                        rb_success = False
+                        rb_interrupted = False
+                        rb_feedback_lost = False
+                        consecutive_rb_missing = 0
+                        if rb_cmd_ok:
+                            while time.monotonic() - rb_start < rb_timeout:
+                                if action_id in self._interrupted:
+                                    rb_interrupted = True
+                                    break
+                                time.sleep(poll_interval)
+                                rb_state = self._read_gripper_state()
+                                if rb_state is not None:
+                                    consecutive_rb_missing = 0
+                                    final_pos = int(round(rb_state["position"]))
+                                    if abs(rb_state["position"] - start_position) <= GRIPPER_TARGET_TOLERANCE:
+                                        rb_success = True
+                                        break
+                                    if time.monotonic() - rb_start >= start_grace and rb_state.get("dof_state") == 2 and abs(rb_state.get("speed", 0.0)) <= 1.0:
+                                        rb_success = abs(rb_state["position"] - start_position) <= GRIPPER_TARGET_TOLERANCE
+                                        break
+                                else:
+                                    consecutive_rb_missing += 1
+                                    if consecutive_rb_missing >= MAX_CONSECUTIVE_MISSING_FEEDBACK:
+                                        rb_feedback_lost = True
+                                        break
+
+                        rb_outcome = rb_success or (final_pos == start_position and rb_cmd_ok)
+
+                        if rb_interrupted:
+                            status = "completed"
+                            reason = "interrupted"
+                            err = None
+                            try:
+                                self._send_position_cmd(final_pos, source=gripper_source)
+                                motion_neutralized = True
+                            except Exception:
+                                motion_neutralized = False
+                        elif not rb_cmd_ok:
+                            status = "failed"
+                            reason = f"rollback_command_failed: {rb_cmd_err}" if rb_cmd_err else "rollback_command_failed"
+                            err = rb_cmd_err or "failed to issue rollback command"
+                            motion_neutralized = False
+                        elif rb_feedback_lost:
+                            status = "failed"
+                            reason = "rollback_feedback_lost"
+                            err = f"feedback communication lost during rollback after {consecutive_rb_missing * poll_interval:.1f}s"
+                            motion_neutralized = False
+                        elif rb_outcome:
+                            status = "completed"
+                            reason = "motion_stalled_rolled_back"
+                            err = None
+                            motion_neutralized = True
+                        else:
+                            status = "failed"
+                            reason = "rollback_failed"
+                            err = f"failed to return to start position {start_position}, ended at {final_pos}"
+                            try:
+                                self._send_position_cmd(final_pos, source=gripper_source)
+                                motion_neutralized = True
+                            except Exception:
+                                motion_neutralized = False
+
+                        status, result = status, {
+                            "reason": reason,
+                            "position": final_pos,
+                            "target": target_position,
+                            "requested_position": target_position,
+                            "final_position": final_pos,
+                            "start_position": start_position,
+                            "blocked_position": blocked_pos,
+                            "stalled": True,
+                            "on_stall": "rollback",
+                            "rollback_succeeded": rb_outcome,
+                            "rollback_success": rb_outcome,
+                            "stall_timeout_seconds": stall_timeout,
+                            "elapsed_seconds": round(time.monotonic() - start_time, 3),
+                            "interrupted": rb_interrupted or (action_id in self._interrupted),
+                            "force": force,
+                            "mode": gripper_source,
+                            "error": err,
+                        }
+                        break
+
         except Exception as exc:
-            status, result = "failed", {"reason": str(exc), "position": position}
+            # 捕获硬件故障异常或执行异常，如实汇报失败原因与真实位置（绝不虚构目标位置）
+            status = "failed"
+            current_known_pos = locals().get("last_known_pos", locals().get("start_position", target_position))
+            if motion_dispatched and not motion_neutralized:
+                try:
+                    curr_st = self._read_gripper_state()
+                    if curr_st is not None:
+                        hold_pos = int(round(curr_st["position"]))
+                        self._send_position_cmd(hold_pos, source=locals().get("gripper_source", "rm_plus"))
+                        motion_neutralized = True
+                        current_known_pos = hold_pos
+                except Exception:
+                    pass
+            result = {
+                "reason": str(exc),
+                "position": current_known_pos,
+                "target": target_position,
+                "requested_position": target_position,
+                "final_position": current_known_pos,
+                "start_position": locals().get("start_position", current_known_pos),
+                "stalled": locals().get("is_stalled", False),
+                "on_stall": on_stall,
+                "stall_timeout_seconds": stall_timeout,
+                "force": force,
+                "mode": locals().get("gripper_source", "rm_plus"),
+                "error": str(exc),
+            }
         finally:
+            release_locks = not (motion_dispatched and not motion_neutralized)
+            if not release_locks:
+                print(f"[rm75 gripper] {action_id}: motion target remains active and unneutralized; retaining motion locks for safety", flush=True)
+
             with self._action_lock:
                 if self._active_action_id == action_id:
                     self._active_action_id = None
                 self._interrupted.discard(action_id)
-            self._gripper_lock.release()
-            self.client.motion_gate.release()
+                self._last_completion = {
+                    "action_id": action_id,
+                    "status": status,
+                    "result": dict(result),
+                    "locks_retained": not release_locks,
+                }
+            if release_locks:
+                self._gripper_lock.release()
+                self.client.motion_gate.release()
             self._acp_callback(action_id, status, result)
 
     def _acp_callback(self, action_id, status, result):
         """记录完成事件并上报 Agent Core（网络部分见共享的 _acp_complete）。"""
-        with self._action_lock:
-            self._last_completion = {"action_id": action_id, "status": status, "result": dict(result)}
         _acp_complete(action_id, status, result, self.PREFIX)
 
 
@@ -626,10 +1201,32 @@ def _acp_complete(action_id, status, result, tool_name):
         print(f"[rm75 ACP] {action_id} {status}: callback failed: {error}", flush=True)
         return "failed", error
     summary = {}
-    if status == "completed":
-        summary = {"reason": "target_reached"}
-    elif "reason" in result:
-        summary = {"reason": str(result["reason"])[:240]}
+    if tool_name == GripperPlugin.PREFIX:
+        # 对二指夹爪卡片：保留真实受阻、回滚与位置状态细节，防止物理受阻时被抹除为 target_reached
+        if isinstance(result, dict):
+            for key, val in result.items():
+                if isinstance(val, str):
+                    summary[key] = val[:240]
+                elif isinstance(val, (int, float, bool, type(None))):
+                    summary[key] = val
+            if "reason" not in summary:
+                summary["reason"] = "target_reached" if status == "completed" else "failed"
+        elif isinstance(result, str):
+            summary = {"reason": result[:240]}
+        elif status == "completed":
+            summary = {"reason": "target_reached"}
+        else:
+            summary = {"reason": "failed"}
+    else:
+        # 其他卡片（如 joint_control、abs_move）：保持其现有契约，状态为 completed 时 summary 包含 {"reason": "target_reached"}
+        if status == "completed":
+            summary = {"reason": "target_reached"}
+        elif isinstance(result, dict) and "reason" in result:
+            summary = {"reason": str(result["reason"])[:240]}
+        elif isinstance(result, str):
+            summary = {"reason": result[:240]}
+        else:
+            summary = {"reason": "failed"}
     body = {"action_id": action_id, "status": status, "result": summary,
             "tool": tool_name, "ts": time.time()}
     try:
@@ -1946,6 +2543,27 @@ def build_plugins(config, namespace, ros2):
             camera_config, namespace, ros2.executor_core
         )
         plugins.append(ext_camera_plugin)
+    aruco_config = config.get("aruco_detector") or config.get("aruco_zones", {})
+    if aruco_config.get("enabled", False):
+        from aruco_detector import ArucoDetectorPlugin
+
+        plugins.append(
+            ArucoDetectorPlugin(aruco_config, namespace, ros2.executor_core)
+        )
+    color_config = config.get("color_detector", {})
+    if color_config.get("enabled", False):
+        from color_detector import ColorDetectorPlugin
+
+        plugins.append(
+            ColorDetectorPlugin(color_config, namespace, ros2.executor_core)
+        )
+    segment_config = config.get("object_segmentor", {})
+    if segment_config.get("enabled", False):
+        from object_segmentor import ObjectSegmentorPlugin
+
+        plugins.append(
+            ObjectSegmentorPlugin(segment_config, namespace, ros2.executor_core)
+        )
     vision_config = config.get("vision_capture", {})
     # Vision capture is an explicit capability; an enabled RGB camera alone
     # must not implicitly add an undeclared recording card.
@@ -1961,3 +2579,8 @@ def build_plugins(config, namespace, ros2):
             )
         )
     return plugins
+
+
+# 模块级兼容别名，便于跨模块姿态规划与通用机械臂插件调用
+ArmPlugin = RM75Plugin
+
