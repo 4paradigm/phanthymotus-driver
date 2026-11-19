@@ -226,3 +226,29 @@ RealSense enumeration and capture, as described above.
 Skeleton publication skips disconnected/busy SDK clients, retries failed samples
 at most every two seconds, and logs once per outage until a successful sample.
 An already-running SDK TCP query still holds the SDK lock until it returns.
+
+## 点位管理（waypoint）
+
+添加「点位管理」卡片后，选择动作并填写参数：
+
+- `save`：填写 `name`，只读采集当前实测七轴关节角、TCP 位姿（米/弧度）、型号/自由度/末端类型、工具和工作坐标系完整定义及 UTC 时间。运动中或状态读取失败时拒绝保存。同名默认拒绝，只有 `overwrite=true` 才覆盖。
+- `list`：列出已保存点位及关节角、坐标配置和时间；启动、查询、刷新页面均不移动机械臂。
+- `delete`：按 `name` 删除点位，不移动机械臂。
+- `move`：填写 `name`，**显式设置 `confirm_motion=true`**，可选 `speed_percent`（默认 5，最高为驱动配置上限且不超过 10）。通过关节空间 `movej` 返回单点，返回 `action_id`，ACP 报告完成、失败或取消。
+- `info`：查看本卡片当前动作、最近 ACP 结果和存储目录。
+- `cancel`：受控减速中止本卡片运动；框架的运动/全部中断钩子也调用该动作。没有本卡片运动时不会向控制器发送停止命令。
+
+执行前会读取当前配置，与保存时的型号、七轴自由度、末端类型以及工具/工作坐标系名称和完整定义逐项比较；读取失败或任一项变化都会拒绝移动，不自动切换坐标系。关节目标同时服从官方限位、控制器限位、现有预检及运动看门狗。与关节、笛卡尔、servo、抓放卡片共用 SDK 连接和机械臂运动锁，不可并行占用机械臂。
+
+返回点位的路径**不提供自动避障**。操作员须确认路径和工作空间，保留物理急停；本卡片不提供轨迹串联、拖动示教或夹爪联动。
+
+持久化固定使用 `/opt/phanthy-motus/data/waypoints/realman/waypoints.json`，不接受用户文件路径。部署清单将同名宿主机专用目录挂载为可写，容器重建后仍保留；其他数据目录的只读挂载保持不变。镜像只创建该专用目录（0700），部署方须保证宿主目录可由容器运行用户写入。存储使用进程/线程锁、临时文件、fsync 和原子替换；磁盘/权限错误明确返回，损坏文件拒绝读取、删除和覆盖，请由部署方恢复备份，不会静默清空。删除容器时请保留宿主目录。
+
+离线验证（模拟 SDK，无需机械臂、ROS 或厂商动态库）：
+
+```sh
+python3 -m unittest discover -s tests -p test_realman_waypoint.py -v
+python3 -m unittest discover -s tests -p test_realman_rm75_driver.py -v
+```
+
+网页验收：添加卡片 → `save` 保存点位 → `list` 确认摘要并刷新页面 → 再次同名保存确认拒绝 → 按需显式覆盖 → 在现场确认运动条件后由操作员使用 `move` 并确认运动 → 查看 `action_id`/ACP 和 `info` → 运动期间测试 `cancel`/框架中断 → `delete` 删除测试点位。镜像部署、网页验收及真机运动验证由部署方执行。
