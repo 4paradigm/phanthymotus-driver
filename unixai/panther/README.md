@@ -41,8 +41,9 @@ the session. The live `/robot_description` can encode the lift and fingers as
 fixed joints, so it is kept separate from Canvas rendering. The display model
 uses the measured yaw/pitch channel order. `joints` combines `/joint_states`
 with fresh lift and gripper feedback and expands the display model's gripper
-mimic joints. `body_joint` is reported in metres and rotates no links; the
-Canvas skeleton renderer must support URDF prismatic joints to show it moving.
+mimic joints. `joints info` reports the measured `body_joint` in metres, also
+available in `lifting info`. Canvas versions that only render rotational joints
+show head and gripper feedback but keep the lift geometry static.
 The response includes the display model's SHA-256 digest. Live
 `/robot_description` may narrow, but never widen, the bundled vendor motion
 limits. Arm execution uses the intersection of both limit sets. `joints`,
@@ -68,7 +69,9 @@ transformed to `odom` at the scan timestamp for accumulation. The default
 history is 20 s with 5 cm voxels, capped at 20,000 points and a 12 m scan range.
 Without scan-time TF, an individual scan is shown in its own frame and is never
 added to the odom cloud. `info` reports the selected scan and cloud frames,
-`accumulating`, and point count. `clear` resets the accumulated history.
+`accumulating`, and point count. `clear` resets the accumulated history and the
+next non-empty cloud replaces the previous displayed frame. Until a new scan
+arrives, the existing Canvas renderer keeps the last frame on screen.
 
 The first camera card started on the canvas reuses an already-active host
 `panther_orbbec.service` without taking ownership. Otherwise it creates a

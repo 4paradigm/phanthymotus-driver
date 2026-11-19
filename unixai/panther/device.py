@@ -478,7 +478,8 @@ class PantherDevice:
             self._laser_cloud.clear()
             self._laser_pending.clear()
             self._laser_cloud_info = {"accumulating": False, "cloud_points": 0}
-            self._bridge.publish("laser_cloud", point_packet([]))
+            # Canvas replaces each frame, but ignores a zero-point packet. Rebuild
+            # from the next scan instead of relying on Canvas to clear itself.
 
     def _on_laser(self, msg, topic) -> None:
         with self._laser_lock:
@@ -524,7 +525,8 @@ class PantherDevice:
                 "cloud_frame": self._laser_fixed_frame if transform else msg.header.frame_id,
                 "accumulating": transform is not None, "cloud_points": len(points),
             }
-            self._publish_limited("laser_cloud", point_packet(points), 5.0, force=True)
+            if points:
+                self._publish_limited("laser_cloud", point_packet(points), 5.0, force=True)
 
     def _publish_odom_window(self) -> None:
         with self._lock:

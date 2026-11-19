@@ -763,7 +763,15 @@ class PantherDriverTest(unittest.TestCase):
             device._on_laser(scan, "/lidar_front/scan")
             self.assertEqual(device.sensor_info("laser_scan")["source_topic"], "/scan")
             device.clear_laser_cloud()
-            self.assertEqual(captured["laser_cloud"], struct.pack("<II", 16, 0))
+            self.assertEqual(device.sensor_info("laser_scan")["cloud_points"], 0)
+            device._publish_laser_cloud()
+            self.assertEqual(captured["laser_cloud"], cloud_wire["data"])
+            clock.return_value = 11.1
+            next_scan = SimpleNamespace(**{**vars(scan), "ranges": [3.0]})
+            device._on_laser(next_scan, "/scan")
+            clock.return_value = 11.5
+            device._publish_laser_cloud()
+            self.assertEqual(struct.unpack_from("<II", captured["laser_cloud"]), (16, 1))
 
         scan_json = json.loads(scan_wire["data"])
         self.assertEqual(scan_wire["kind"], "string")
