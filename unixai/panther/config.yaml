@@ -36,6 +36,9 @@ plugins:
     max_width: 640
   camera_color: {enabled: true}
   camera_depth: {enabled: true}
+  vision_capture:
+    enabled: true
+    output_dir: /opt/phanthy-motus/data/vision_capture/panther
 
   audio:
     server: "unix:/run/user/1001/pulse/native"

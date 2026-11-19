@@ -19,6 +19,7 @@ required for discovery.
 - Actuators: `base_drive`, `arm_control`, `gripper`, `lifting`, and `head`.
 - Audio: `mic` publishes `audio/pcm-16k` from the host PulseAudio source;
   `speaker` plays a canvas-connected `audio/pcm-16k` stream through its sink.
+- Photos: `vision_capture` saves a fresh RGB frame as a JPEG.
 
 The audio cards run in separate domain-42 processes and use the host PulseAudio
 server at `/run/user/1001/pulse/native`; they never open ALSA devices directly.
@@ -81,6 +82,14 @@ unit may be stopped or watchdog-restarted by this driver; a loaded but inactive
 host unit is left untouched. RGB and depth share the source process. Malformed
 frame diagnostics are bounded and sampled at the first failure and every 100th
 failure rather than logged once per frame.
+
+To take a photo, start `camera_color` (or use an already-running RGB publisher),
+then execute `vision_capture → capture_photo`. The card waits up to 3 seconds
+for a new frame and returns `file_path` and the ROS frame timestamp. The JPEG is
+saved under `/opt/phanthy-motus/data/vision_capture/panther/photos/` on the robot's
+existing persistent data mount. Photos use the same width and JPEG quality as
+`camera_color` and do not consume its preview frames. Files remain on the robot
+until removed by the operator.
 
 ## Container dependencies
 
@@ -161,6 +170,7 @@ put the degree range first so narrow cards show the safety limit. The old
 ```bash
 python3 scripts/check_service_yml.py unixai/panther
 python3 tests/test_panther_driver.py -v
+python3 -m pytest unixai/panther/test_panther_vision_capture.py
 ```
 
 Deployment uses the image's `/deploy/service.yml` fragment. The repository
