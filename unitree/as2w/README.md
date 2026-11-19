@@ -249,6 +249,47 @@ shared IMU, joint, or battery subscription. `active` is an observation for
 future operator-takeover logic; this driver does not turn it into a motion
 command.
 
+`obstacle_monitor` is a read-only sensor card that subscribes to the existing
+`/<namespace>/lidar/cloud` ROS stream; it does not create another Unitree DDS
+subscriber. It publishes `data/json` to `/<namespace>/obstacle/monitor` and
+supports `start`, `stop`, `info`, and `read`. Stopping it does not stop the
+shared `lidar_cloud` card.
+
+The input is the dashboard's sampled point cloud, including its display-axis
+ordering. The monitor reverses that axis mapping and applies the configured
+JT128 URDF translation. `distance_m` is the horizontal distance from the
+assumed `base_link` origin, **not** clearance from the robot's outer edge.
+The output marks `geometry_status` as `unverified`.
+Directions are +X forward and +Y left: front is -30 to +30 degrees,
+front-left/right extend to +/-60 degrees, left/right to +/-120 degrees, and
+rear covers the remaining angles. Confirm the active lidar source, mounting,
+orientation, and footprint on the actual robot before interpreting results.
+
+Each region reports its nearest retained point, point count, and `critical`,
+`warning`, `clear`, or `unknown` status. A status must repeat for
+`confirm_frames` frames before it is reported; an unconfirmed transition is
+`unknown`. A region with no points is `unknown`; a `clear` result requires at
+least `min_clear_points` and means only that no retained point was inside the
+warning threshold. Sparse sampling, blind spots and occlusion mean this does
+not prove that a region is free of obstacles. The height window is only an
+approximate ground filter and changes meaning as the robot pitches or changes
+height. Reflections from the robot itself are not removed. Thresholds and
+offsets in `config.yaml` are illustrative, not measured
+stopping or collision limits.
+
+`overall_status` gives precedence to `critical`, then `warning`, `unknown`,
+and `clear`. Check individual regions as well: a warning in one region can
+coexist with unknown coverage in another.
+
+`sensor_status` is `no_data`, `healthy`, `invalid`, `stale`, or `not_running`.
+`healthy` means a valid cloud packet arrived recently; it does not certify the
+sensor or coverage. Invalid or timed-out input makes all regions `unknown`.
+`receive_age_ms` is time since the ROS packet arrived. The cloud packet does
+not include the acquisition timestamp, so `source_timestamp` is null and
+upstream latency is unknown. CPU fallback in `lidar_cloud` limits the sample to
+2,000 points, which can miss small obstacles. This monitor neither identifies
+people nor controls motion and is not a collision-prevention system.
+
 For a no-hardware check, run `python3 test_driver.py` in `as2w`. In a built
 container, verify the media tools with `ffmpeg -version` and
 `ffprobe -version`. On an AS2W host, inspect the shared inputs and outputs with
@@ -256,6 +297,9 @@ container, verify the media tools with `ffmpeg -version` and
 `ros2 topic echo /<namespace>/state/remote_controller --once`, and the MCP
 `info`/`capture_photo`/`record_video` actions. These checks do not replace
 opening the JPG and MP4 or exercising every physical remote control on robot.
+
+For the obstacle monitor and driver tests together, run from the repository
+root: `python3 -B -m unittest unitree.as2w.test_driver unitree.as2w.test_obstacle_monitor`.
 
 FFmpeg is not installed only for validation: `record_video` pipes the live JPEG
 frames into the `ffmpeg` executable to produce H.264 MP4, and rejects the action
