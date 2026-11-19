@@ -4,12 +4,31 @@ from pathlib import Path
 import sys
 import unittest
 import numpy as np
+from scipy.interpolate import BPoly
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT),str(ROOT/'franka/fr3')]
-from franka.fr3.pick_place.hand_collision import frame, vertices, check_table
+from franka.fr3.pick_place.hand_collision import frame, vertices, check_table, check_descent_curve
 from franka.fr3.pick_place.planning import rigid, rotation
 
 class HandCollisionTests(unittest.TestCase):
+    def test_descent_validates_between_waypoints_and_both_planes(self):
+        class Model:
+            def pose(self, q):
+                return rigid(rotation((1, 0, 0), math.pi + q[1]), [0, 0, q[0]])
+
+        def verify(controls, planes):
+            curve = BPoly(np.asarray(controls)[:, None, :], [0., 1.])
+            check_descent_curve(Model(), curve, np.zeros((1, 3)), planes, lambda: None)
+
+        plane = (np.zeros(3), np.array([0., 0., 1.]))
+        verify([[.05, 0.], [.03, 0.], [.015, 0.]], [plane])
+        with self.assertRaisesRegex(ValueError, 'below 5 mm'):
+            verify([[.02, 0.], [-.02, 0.], [.02, 0.]], [plane])
+        with self.assertRaisesRegex(ValueError, 'tilt'):
+            verify([[.05, 0.], [.05, .2], [.05, 0.]], [plane])
+        with self.assertRaisesRegex(ValueError, 'below 5 mm'):
+            verify([[.015, 0.], [.015, 0.]], [plane, (np.array([0., 0., .012]), plane[1])])
+
     def test_sdk_frame_and_compensation_are_independent(self):
         measured=rigid(rotation((0,0,1),-math.pi/4),[0,0,.1034])
         profile={'tool_frame':{'F_T_EE':measured.tolist()},'depth_compensation_mm':25}

@@ -332,11 +332,11 @@ class Session {
             pending.append(buffer, static_cast<std::size_t>(count));
             std::size_t end;
             while ((end = pending.find('\n')) != std::string::npos) {
-              if (end > 4096) throw std::runtime_error("Command exceeds 4096 bytes");
+              if (end > 524288) throw std::runtime_error("Command exceeds 524288 bytes");
               accept(pending.substr(0, end));
               pending.erase(0, end + 1);
             }
-            if (pending.size() > 4096) throw std::runtime_error("Command exceeds 4096 bytes");
+            if (pending.size() > 524288) throw std::runtime_error("Command exceeds 524288 bytes");
           }
         }
         if (eof) std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -371,8 +371,15 @@ class Session {
         if (!stationary(initial)) throw std::runtime_error("Robot must be idle and stationary before motion");
         // A start based on desired positions avoids the discontinuity caused by
         // commanding a measured position that differs from the SDK's q_d.
-        fr3::PathTrajectory trajectory(initial.q_d, command,
-            franka::computeUpperLimitsJointVelocity, franka::computeLowerLimitsJointVelocity);
+        std::optional<fr3::PathTrajectory> path;
+        std::optional<fr3::TimedTrajectory> timed;
+        if (command.timed.empty()) {
+          path.emplace(initial.q_d, command, franka::computeUpperLimitsJointVelocity,
+                       franka::computeLowerLimitsJointVelocity);
+        } else {
+          timed.emplace(initial.q_d, command);
+        }
+        const double duration = timed ? timed->duration() : path->duration();
         double elapsed = 0.0;
         bool first = true;
         event("motion", command.id, "running", "", &command.target);
@@ -393,10 +400,10 @@ class Session {
           in_control_ = true;
           elapsed += period.toSec();
           if (elapsed > command.timeout) throw std::runtime_error("Motion execution timed out");
-          franka::JointPositions positions(trajectory.at(elapsed));
+          franka::JointPositions positions(timed ? timed->at(elapsed) : path->at(elapsed));
           // Continue the smooth trajectory while the non-RT StopMove request
           // performs the manufacturer's controlled stop. Do not jump to q_d.
-          if (elapsed >= trajectory.duration() + 0.25)
+          if (elapsed >= duration + 0.25)
             return franka::MotionFinished(positions);
           return positions;
         }, franka::ControllerMode::kJointImpedance, true);

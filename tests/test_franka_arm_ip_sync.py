@@ -45,7 +45,7 @@ class ArmIPSyncTests(unittest.TestCase):
             self.plugin.dispatch('start', {})
         factory.assert_called_once()
         self.plugin.publish()
-        publisher.publish.assert_called_once_with({'left': '172.16.0.3', 'right': '172.16.0.2'})
+        publisher.publish.assert_called_once_with({'left': '172.16.0.3', 'right': '172.16.0.2', 'controller_ip': ''})
         info = self.plugin.dispatch('info', {})
         self.assertTrue(info['fresh'])
         self.assertEqual(info['frames_published'], 1)

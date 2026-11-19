@@ -20,6 +20,11 @@ constexpr double kLimitMargin = 0.01;
 constexpr double kMinSpeed = 0.0017453292519943296;  // 0.1 degree/s
 constexpr double kMaxSpeed = 0.17453292519943295;    // 10 degrees/s
 
+struct TimedSegment {
+  double end{};
+  std::array<Joints, 6> controls{};
+};
+
 struct Command {
   std::string action;
   std::string id;
@@ -28,6 +33,7 @@ struct Command {
   double timeout = 0.0;
   Joints target{};
   std::vector<Joints> path;
+  std::vector<TimedSegment> timed;
 };
 
 inline bool valid_id(const std::string& id) {
@@ -58,7 +64,7 @@ inline Command parse_command(const std::string& line) {
       throw std::invalid_argument("Invalid command ID");
     }
   }
-  if (command.action == "MOVE" || command.action == "PATH") {
+  if (command.action == "MOVE" || command.action == "PATH" || command.action == "TIMED") {
     if (!(input >> command.speed >> command.tolerance >> command.timeout)) {
       throw std::invalid_argument("MOVE requires speed, tolerance and timeout");
     }
@@ -73,10 +79,27 @@ inline Command parse_command(const std::string& line) {
         validate_joints(point);
       }
       command.target = command.path.back();
+    } else if (command.action == "TIMED") {
+      int count = 0;
+      if (!(input >> count) || count < 1 || count > 512)
+        throw std::invalid_argument("TIMED requires 1 to 512 segments");
+      double previous = 0.0;
+      command.timed.resize(count);
+      for (auto& segment : command.timed) {
+        if (!(input >> segment.end) || !std::isfinite(segment.end) || segment.end - previous < 0.001)
+          throw std::invalid_argument("Invalid TIMED segment time");
+        previous = segment.end;
+        for (auto& point : segment.controls) {
+          for (auto& q : point)
+            if (!(input >> q)) throw std::invalid_argument("Incomplete TIMED control point");
+          validate_joints(point);
+        }
+      }
+      command.target = command.timed.back().controls.back();
     } else for (auto& q : command.target) {
       if (!(input >> q)) throw std::invalid_argument("MOVE requires seven joint angles in radians");
     }
-    if (!std::isfinite(command.speed) || command.speed < kMinSpeed || (command.path.empty() && command.speed > kMaxSpeed))
+    if (!std::isfinite(command.speed) || command.speed < kMinSpeed || (command.action == "MOVE" && command.speed > kMaxSpeed))
       throw std::invalid_argument("Invalid joint speed (MOVE: 0.1–10 deg/s; PATH: at least 0.1 deg/s)");
     if (!std::isfinite(command.tolerance) || command.tolerance <= 0 ||
         command.tolerance > 0.017453292519943295)
@@ -121,6 +144,77 @@ class Trajectory {
  private:
   Joints start_, goal_;
   double duration_;
+};
+
+// Execute the same quintic Bernstein polynomials checked by the planner.
+class TimedTrajectory {
+ public:
+  TimedTrajectory(const Joints& start, const Command& command)
+      : segments_(command.timed), lead_(start, lead_command(command)) {
+    const auto& first = segments_.front().controls.front();
+    const auto& last = segments_.back().controls.back();
+    double previous = 0.0;
+    Joints p = first, v{}, a{};
+    for (const auto& segment : segments_) {
+      const auto& c = segment.controls;
+      const double dt = segment.end - previous;
+      for (size_t j = 0; j < 7; ++j) {
+        if (std::abs(start[j] - first[j]) > .001 ||
+            std::abs(c[0][j] - p[j]) > 1e-8 ||
+            std::abs(5 * (c[1][j] - c[0][j]) / dt - v[j]) > 1e-6 ||
+            std::abs(20 * (c[2][j] - 2*c[1][j] + c[0][j]) / (dt*dt) - a[j]) > 1e-4)
+          throw std::invalid_argument("TIMED start or segment derivatives are discontinuous");
+        for (size_t k = 0; k < 5; ++k)
+          if (std::abs(5 * (c[k+1][j] - c[k][j]) / dt) > command.speed * 1.001)
+            throw std::invalid_argument("TIMED joint velocity exceeds requested speed");
+        for (size_t k = 0; k < 4; ++k)
+          if (std::abs(20 * (c[k+2][j] - 2*c[k+1][j] + c[k][j]) / (dt*dt)) > 1.501)
+            throw std::invalid_argument("TIMED joint acceleration exceeds limit");
+        for (size_t k = 0; k < 3; ++k)
+          if (std::abs(60 * (c[k+3][j] - 3*c[k+2][j] + 3*c[k+1][j] - c[k][j]) / (dt*dt*dt)) > 15.01)
+            throw std::invalid_argument("TIMED joint jerk exceeds limit");
+        p[j] = c[5][j];
+        v[j] = 5 * (c[5][j] - c[4][j]) / dt;
+        a[j] = 20 * (c[5][j] - 2*c[4][j] + c[3][j]) / (dt*dt);
+      }
+      previous = segment.end;
+    }
+    for (size_t j = 0; j < last.size(); ++j)
+      if (std::abs(v[j]) > 1e-6 || std::abs(a[j]) > 1e-4)
+        throw std::invalid_argument("TIMED endpoint must be stationary");
+    if (duration() + 2.0 > command.timeout)
+      throw std::invalid_argument("TIMED trajectory exceeds timeout");
+  }
+
+  Joints at(double elapsed) const noexcept {
+    if (elapsed < lead_.duration()) return lead_.at(elapsed);
+    elapsed -= lead_.duration();
+    const auto it = std::upper_bound(segments_.begin(), segments_.end(), elapsed,
+        [](double time, const TimedSegment& segment) { return time < segment.end; });
+    if (it == segments_.end()) return segments_.back().controls.back();
+    const double start = it == segments_.begin() ? 0.0 : (it-1)->end;
+    const double t = (elapsed - start) / (it->end - start);
+    auto c = it->controls;
+    for (size_t n = c.size()-1; n > 0; --n)
+      for (size_t k = 0; k < n; ++k)
+        for (size_t j = 0; j < c[k].size(); ++j)
+          c[k][j] += t * (c[k+1][j] - c[k][j]);
+    return c.front();
+  }
+
+  double duration() const noexcept { return lead_.duration() + segments_.back().end; }
+
+ private:
+  static Command lead_command(const Command& original) {
+    Command lead;
+    lead.target = original.timed.front().controls.front();
+    lead.speed = original.speed;
+    lead.timeout = original.timeout;
+    return lead;
+  }
+
+  const std::vector<TimedSegment>& segments_;
+  Trajectory lead_;
 };
 
 // Uniform cubic B-spline. Repeated end points give zero start/end velocity

@@ -7,6 +7,8 @@ import numpy as np
 from hardware import JOINT_LOWER, JOINT_UPPER
 
 
+OBSERVATION_TOLERANCE_DEG = 1.0
+
 SPEED_CONFIG = {
     'speed_deg_s': (.1, math.inf, 5, 'Arm joint speed limit (deg/s)'),
     'speed_mm_s': (.1, 100, 20, 'Gripper opening and closing speed (mm/s)'),
@@ -45,7 +47,17 @@ class PickExecution:
         age = value.get('data_age_ms')
         if (not value.get('connected') or type(age) not in (int, float) or not 0 <= age <= 200
                 or not value.get('control_ready')):
-            raise RuntimeError(value.get('control_error') or 'Fresh control-ready state is required')
+            device = 'Gripper' if session is self.hand else 'Arm'
+            detail = value.get('control_error') or value.get('error') or 'fresh control feedback required'
+            if device == 'Gripper':
+                sdk_ns = value.get('sdk_received_ns')
+                sdk_age = None if sdk_ns is None else round((time.monotonic_ns() - sdk_ns) / 1e6, 1)
+                print(f"[fr3 feedback] action={self.active.get('action_id')} "
+                      f"stage={self.active.get('stage')} driver_age_ms={age} sdk_age_ms={sdk_age} "
+                      f"sdk_read_ms={value.get('sdk_read_ms')} "
+                      f"sdk_to_driver_ms={value.get('sdk_to_driver_ms')}", flush=True)
+            raise RuntimeError(f"{device}: {detail} (connected={value.get('connected')}, "
+                               f"ready={value.get('control_ready')}, age_ms={age})")
         return value
 
     def wait(self, session, command, timeout, key):
@@ -53,6 +65,13 @@ class PickExecution:
         deadline = time.monotonic()+timeout
         while True:
             self.check()
+            result = session.motion(command)
+            if result['status'] in ('succeeded', 'failed', 'cancelled', 'rejected'):
+                if key == 'hand_command_id' or result['status'] in ('succeeded', 'rejected'):
+                    self.active[key] = None
+                if result['status'] != 'succeeded':
+                    raise RuntimeError(result.get('error') or result['status'])
+                return result
             if key == 'command_id' and self.active.get('stage') in ('lift', 'move_to_place') and not self.fresh(self.hand)['is_grasped']:
                 raise RuntimeError('Grasp feedback lost during lift')
             if key == 'command_id' and self.active.get('stage') in ('approach', 'descend'):
@@ -62,13 +81,6 @@ class PickExecution:
             if key == 'command_id':
                 state = self.fresh(self.arm)
                 self.peak_speed = max(self.peak_speed, max(map(abs, state['dq'])))
-            result = session.motion(command)
-            if result['status'] in ('succeeded', 'failed', 'cancelled'):
-                if key == 'hand_command_id' or result['status'] == 'succeeded':
-                    self.active[key] = None
-                if result['status'] != 'succeeded':
-                    raise RuntimeError(result.get('error') or result['status'])
-                return result
             if time.monotonic() >= deadline:
                 raise TimeoutError('Command completion timed out')
             self.active['cancel'].wait(.02)

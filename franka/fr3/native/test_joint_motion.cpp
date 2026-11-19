@@ -116,6 +116,27 @@ int main() {
   auto wrong_start=start;
   wrong_start[0]+=.01;
   rejects([&] { fr3::PathTrajectory bad(wrong_start, continuous); });
+  {
+    const fr3::Joints start{0, 0, 0, -1, 0, 1, 0};
+    auto goal = start;
+    goal[6] += .02;
+    std::ostringstream wire;
+    wire << "TIMED t .1 .001 10 1 4";
+    for (const auto& point : {start, start, start, goal, goal, goal})
+      for (double q : point) wire << ' ' << q;
+    const auto command = fr3::parse_command(wire.str());
+    const fr3::TimedTrajectory timed(start, command);
+    require(fr3::max_error(timed.at(0), start) < 1e-12, "TIMED start jumped");
+    require(fr3::max_error(timed.at(timed.duration()), goal) < 1e-12, "TIMED end missed");
+    require(std::abs(timed.at(3.)[6] - .01) < 1e-12, "TIMED midpoint incorrect");
+    auto discontinuous = command;
+    discontinuous.timed.front().controls[1][6] += .01;
+    rejects([&] { fr3::TimedTrajectory invalid(start, discontinuous); });
+    auto short_segment = command;
+    short_segment.timed.front().end = .01;
+    rejects([&] { fr3::TimedTrajectory invalid(start, short_segment); });
+  }
+
   require(fr3::parse_command("PATH p .02 .001 600 2 0 0 0 -1 0 1 0 .1 0 0 -1 0 1 0").path.size()==2,
           "PATH wire format failed");
   rejects([&] { fr3::parse_command("PATH p .02 .001 600 22"); });

@@ -201,6 +201,15 @@ class RobotSession:
                   *(v for point in points for v in point))
         return self._submit_motion(owner, points[-1], "PATH", fields, timeout_s)
 
+    def move_timed(self, owner, segments, speed_rad_s, tolerance_rad, timeout_s):
+        """Submit the bounded interpolation of a MoveIt joint trajectory."""
+        if not 1 <= len(segments) <= 512:
+            raise ValueError("Timed motion requires 1 to 512 segments")
+        fields = (speed_rad_s, tolerance_rad, timeout_s, len(segments),
+                  *(value for end, controls in segments for value in
+                    (end, *(q for point in controls for q in point))))
+        return self._submit_motion(owner, segments[-1][1][-1], "TIMED", fields, timeout_s)
+
     def _submit_motion(self, owner, target, verb, fields, timeout_s, *, validate=None, stop=False):
         """Atomically validate ownership/state and submit one non-replayed command."""
         with self._changed:
@@ -537,15 +546,19 @@ class SessionManager:
         self._close_lock = threading.Lock()
         self._sessions = {}
         self._retiring = {}
+        self._exclusive = {}
         self._closed = False
 
-    def acquire(self, address, owner):
+    def acquire(self, address, owner, *, exclusive=False):
         address = canonical_ip(address)
         hash(owner)
         while True:
             with self._lock:
                 if self._closed:
                     raise RuntimeError("Franka session manager is closed")
+                reserved = self._exclusive.get(address)
+                if reserved is not None and reserved != owner:
+                    raise RuntimeError(f"Franka connection {address} is reserved for visual motion")
                 retired = self._retiring.get(address)
                 if retired is None:
                     existing = self._sessions.get(address)
@@ -553,12 +566,16 @@ class SessionManager:
                         if not existing[0].stopped:
                             raise RuntimeError(f"Previous reader for {address} is still stopping; retry shortly")
                         del self._sessions[address]
+                    if exclusive and address in self._sessions and self._sessions[address][1] - {owner}:
+                        raise RuntimeError(f"Franka connection {address} is already in use")
                     if address not in self._sessions:
                         factory = self._session_factory or RobotSession
                         self._sessions[address] = (factory(address, **self._options), set())
                     session, owners = self._sessions[address]
                     session.register_owner(owner)
                     owners.add(owner)
+                    if exclusive:
+                        self._exclusive[address] = owner
                     return session
             # Wait only for this address; stopping another robot cannot block us.
             if not retired[1].wait(timeout=retired[0].close_deadline):
@@ -572,6 +589,8 @@ class SessionManager:
                 return
             session, owners = entry
             owners.discard(owner)
+            if self._exclusive.get(address) == owner:
+                self._exclusive.pop(address, None)
             last_owner = not owners
             if last_owner:
                 del self._sessions[address]

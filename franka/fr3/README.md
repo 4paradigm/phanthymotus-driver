@@ -190,7 +190,7 @@ Speeds are joint degrees/s and total finger-spacing mm/s, not percentages.
 Legacy saved IP-bearing arm labels migrate by physical side. Dual-arm execution requires the IP input; configured YAML defaults alone do not
 authorize motion.
 
-`observe` uses a fixed 2 deg/s observation speed and returns object names,
+`observe` uses the configured joint speed limit and returns object names,
 normalized positions and confidence. Position is image-centered XY in [-1,1],
 with positive X right and positive Y down; it is not a robot-base coordinate.
 The driver retains aligned RGB-D, camera calibration and the captured SDK EE
@@ -205,8 +205,8 @@ Both transfer actions automatically observe when no saved photograph is availabl
 - Both require `confirm_motion=true`; optional `rotation_deg` is [-180,180],
   clockwise viewed from above, applied after lifting.
 
-The driver plans approach, descent, lift, transfer, placement and return before
-commanding motion. It checks joint limits, sampled paths, modeled arm clearance
+The driver requests plans from MoveIt on the PNP host over SSH and executes
+the validated trajectories on Orin with libfranka. It checks joint limits, sampled paths, modeled arm clearance
 and Hand/table clearance. Environment geometry beyond those models is not
 certified. Unaccepted calibration, insufficient depth or infeasible paths reject
 transfer. The original calibration matrices are retained when an IP changes.
@@ -223,7 +223,7 @@ post-transfer capture does not erase an already completed placement.
 ## Arm IP sensor
 
 `arm_ip_sync` is a single-instance configuration sensor. `start` publishes
-`{"left":"172.16.0.3","right":"172.16.0.2"}` as `std_msgs/String` JSON at
+`{"left":"172.16.0.3","right":"172.16.0.2","controller_ip":""}` as `std_msgs/String` JSON at
 1 Hz on `/{namespace}/arm_ip_sync` (`data/json`); `stop` releases the publisher.
 The payload is an endpoint mapping, not a measurement of robot connectivity.
 `info` returns its authoritative topic, configuration and publication freshness.

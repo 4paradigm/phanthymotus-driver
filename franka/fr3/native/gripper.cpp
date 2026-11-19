@@ -234,6 +234,10 @@ class Session {
         << ",\"max_width\":" << value.state.max_width
         << ",\"is_grasped\":" << (value.state.is_grasped ? "true" : "false")
         << ",\"temperature\":" << value.state.temperature
+        << ",\"sdk_received_ns\":" << std::chrono::duration_cast<std::chrono::nanoseconds>(
+               value.received.time_since_epoch()).count()
+        << ",\"sdk_read_ms\":" << std::chrono::duration<double, std::milli>(
+               value.received - value.started).count()
         << ",\"control_ready\":" << (fatal_.empty() && !closing_ ? "true" : "false")
         << ",\"control_error\":" << (fatal_.empty() ? "null" : json_quoted(fatal_)) << '}';
     queue(out.str());

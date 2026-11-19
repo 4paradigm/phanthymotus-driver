@@ -68,6 +68,7 @@ class ArmIPSyncPlugin:
         self.username = "pnp"
         self.password = "ros"
         self.controller_ip = saved.get("fallback_controller_ip", "")
+        self.detected_controller_ip = saved.get("controller_ip", "")
         self.last_result = None
         self.cancel = threading.Event()
         self.deadline = float("inf")
@@ -108,7 +109,7 @@ class ArmIPSyncPlugin:
 
     def publish(self):
         if self.publisher:
-            self.publisher.publish(dict(self.arm_ips))
+            self.publisher.publish(dict(self.arm_ips, controller_ip=self.detected_controller_ip))
             self.frames_published += 1
             self.last_published_at = time.monotonic()
 
@@ -205,6 +206,7 @@ class ArmIPSyncPlugin:
         binding = {**binding, "motion_arm_ips": arms}
         self._persist(binding)
         self.arm_ips = arms
+        self.detected_controller_ip = binding.get("controller_ip", "")
         self.publish()
         return dict(state="completed", restart_required=False,
                     config=self.configuration(), **binding)
@@ -226,6 +228,7 @@ class ArmIPSyncPlugin:
                         fresh=self.publisher is not None and age is not None and age < 3,
                         topic_out=self.get_tools()[0]["topic_out"],
                         controller_ip=self.controller_ip, config=self.configuration(),
+                        detected_controller_ip=self.detected_controller_ip,
                         restart_required=False, last_result=self.last_result,
                         motion_arm_ips=dict(self.arm_ips))
         if action not in ("sync", "config"):
@@ -253,7 +256,10 @@ class ArmIPSyncPlugin:
                 password = password or "ros"
                 arms = mapping({side: args.get(side + "_ip", self.arm_ips[side])
                                 for side in ("left", "right")})
-                result = self.save(dict(fallback_controller_ip=controller, motion_arm_ips=arms))
+                binding = dict(fallback_controller_ip=controller, motion_arm_ips=arms)
+                if self.detected_controller_ip and arms == self.arm_ips:
+                    binding["controller_ip"] = self.detected_controller_ip
+                result = self.save(binding)
                 self.controller_ip, self.username, self.password = controller, username, password
                 return dict(result, ok=True, config=self.configuration())
         except (OSError, subprocess.SubprocessError, ValueError, RuntimeError, KeyError, IndexError) as exc:

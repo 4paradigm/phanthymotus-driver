@@ -78,7 +78,7 @@ FROM ros-base
 # iproute2 and aiohttp support bounded, read-only Desk device discovery.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates python3-yaml python3-aiohttp iproute2 openssh-client sshpass ros-humble-rmw-fastrtps-cpp \
+        ca-certificates python3-yaml python3-aiohttp python3-scipy iproute2 openssh-client sshpass ros-humble-rmw-fastrtps-cpp \
         libpocofoundation80 libpoconet80 libfmt8 libtinyxml2-9 libconsole-bridge1.0 \
         libboost-filesystem1.74.0 libboost-serialization1.74.0 \
         libassimp5 liboctomap1.9 libtinyxml2.6.2v5 libusb-1.0-0 python3-pip \

@@ -78,6 +78,31 @@ def check_path_table(model, q, points, table, normal, stage, profile):
         if model.table_clearance(q, point, axis) < .005:
             raise ValueError(f'Arm/table clearance below 5 mm during {stage}')
 
+def check_descent_curve(model, curve, points, planes, check):
+    """Bound hand clearance and tilt between samples of the executed spline."""
+    start, stop = curve.x
+    velocity_bound = np.max(np.abs(curve.derivative().c[:, 0]), axis=0).sum()
+    tilt_limit = math.radians(3)
+    intervals = [(start, stop, 0)]
+    while intervals:
+        check()
+        left, right, depth = intervals.pop()
+        middle = (left + right) / 2
+        ee = model.pose(curve(middle))
+        gaps = [check_table(ee, points, table, normal, 'descend') for table, normal in planes]
+        tilt = max(math.acos(np.clip(ee[:3, 2] @ -normal, -1., 1.)) for _, normal in planes)
+        if tilt > tilt_limit:
+            raise ValueError(f'Hand tilt {math.degrees(tilt):.2f} deg exceeds 3 deg during descend')
+        joint_travel = velocity_bound * (right - left) / 2
+        # Two metres bounds the distance from every FR3 joint axis to any
+        # vertex in the Hand V2 model. Sum joint motion to bound tip travel.
+        if min(gaps) - 2 * joint_travel >= .005 and tilt + joint_travel <= tilt_limit:
+            continue
+        if depth >= 12:
+            raise ValueError('Cannot verify 5 mm hand clearance and 3 deg tilt throughout descent')
+        intervals.extend(((middle, right, depth+1), (left, middle, depth+1)))
+
+
 def observation_path(state, target_degrees, profile, lifts=(.10, .15, .20)):
     """Check opening at the current pose and the joint return before motion."""
     plane = profile.get('table_plane')

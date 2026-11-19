@@ -4,7 +4,7 @@ import numpy as np
 
 from .geometry import locate, transform
 from .kinematics import Kinematics
-from .planning import rotation
+from .planning import rigid, rotation
 from .trajectory import samples
 
 
@@ -55,6 +55,25 @@ def destination(observation, scene, handeye, options):
         target = camera[:3,3]+ray*((table-camera[:3,3])@normal/denominator)
         delta = target-(source-normal*((source-table)@normal))
     return delta
+
+
+def moveit_targets(observation, pick, scene, handeye, options):
+    """Build SDK-frame targets for remote planning without solving local IK."""
+    approach, grasp, lift = np.asarray(pick['poses'], dtype=float)
+    normal = np.asarray(scene['table_normal_base'], dtype=float)
+    delta = destination(observation, scene, handeye, options)
+    initial = grasp[:3, :3]
+    final = rotation(-normal, math.radians(options['rotation_deg'])) @ initial
+    pad = pick['sdk_to_pad_offset_mm'] / 1000
+    grasp_centre = grasp[:3, 3] + pad * initial[:, 2]
+    raised = lift[:3, 3] + pad * initial[:, 2] + .05 * normal
+    land = grasp_centre + delta - pad * final[:, 2]
+    carry = [rigid(initial, raised - pad * initial[:, 2])]
+    if options['rotation_deg']:
+        carry.append(rigid(final, raised - pad * final[:, 2]))
+    carry.extend((rigid(final, raised + delta - pad * final[:, 2]), rigid(final, land)))
+    return dict(approach=approach, descent=grasp, lift=lift, carry=carry,
+                place_lift=rigid(final, land + .15 * normal))
 
 
 def plan_transfer(observation, pick, handeye, options, check=None, profile=None):

@@ -35,7 +35,7 @@ def segment_distance(a, b, c, d):
     return min(distances)
 
 
-def preview(observation, position, diameter_mm, profile, scene=None):
+def preview(observation, position, diameter_mm, profile, scene=None, *, target_only=False):
     if type(diameter_mm) not in (int, float) or not 0 < diameter_mm < 79.4:
         raise ValueError('Object diameter must be between 0 and 79.4 mm')
     surface = locate(observation, position, profile['handeye'])
@@ -64,9 +64,10 @@ def preview(observation, position, diameter_mm, profile, scene=None):
     low, high = np.asarray(JOINT_LOWER)+.05, np.asarray(JOINT_UPPER)-.05
     if q0.shape != (7,) or not np.isfinite(q0).all() or not np.all((low <= q0)&(q0 <= high)):
         raise ValueError('Observation joints lack required limit margin')
-    model = Kinematics(q0, actual)
-    frames, offset = model.frames, model.offset
-    vector, clearance = model.vector, model.clearance
+    if not target_only:
+        model = Kinematics(q0, actual)
+        frames, offset = model.frames, model.offset
+        vector, clearance = model.vector, model.clearance
 
     initial_r = actual[:3,:3]
     down = -normal
@@ -100,7 +101,7 @@ def preview(observation, position, diameter_mm, profile, scene=None):
             short = axes[best] if widths[best] <= lengths[best] else perpendicular[best]
             yaw = math.degrees(math.atan2(down @ np.cross(closing,short), closing @ short))
             yaw_candidates = (yaw, yaw+180, yaw+90, yaw-90)
-    failures = []
+    failures, candidates = [], []
     for yaw in yaw_candidates:
         goal_r = rotation(down, math.radians(yaw)) @ np.column_stack((np.cross(closing, down), closing, down))
         retreat = profile.get('shallow_retreat_mm', 0)
@@ -143,6 +144,14 @@ def preview(observation, position, diameter_mm, profile, scene=None):
             continue
         sdk_grasp = grasp + shift - pad_offset*goal_r[:,2]
         ends = [sdk_grasp-.15*goal_r[:,2], sdk_grasp, sdk_grasp+.01*normal]
+        if target_only:
+            candidates.append(dict(
+                yaw_deg=yaw, observation_id=metadata['observation_id'],
+                poses=[rigid(goal_r, point).tolist() for point in ends],
+                grasp_width_mm=grasp_width,
+                sdk_to_pad_offset_mm=pad_offset*1000,
+            ))
+            continue
         delta = goal_r @ initial_r.T
         turn = math.acos(np.clip((np.trace(delta)-1)/2,-1,1))
         def solve(q, point, iterations=120):
@@ -238,4 +247,6 @@ def preview(observation, position, diameter_mm, profile, scene=None):
                                              else 'sampled_arm_self_collision_and_fingers_table'),
                             trajectory_timed=False,
                             phase_end_indices=[100,200,300], motion_sent=False)
+    if target_only and candidates:
+        return candidates
     raise ValueError('No complete vertical grasp trajectory: ' + ('; '.join(failures) or 'path checks failed'))

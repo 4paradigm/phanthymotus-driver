@@ -1,6 +1,7 @@
 """FR3 wrist observation and RealMan-compatible pick-and-place actions."""
 import copy
 import logging
+from contextlib import contextmanager
 import math
 import threading
 import time
@@ -9,7 +10,7 @@ from uuid import uuid4
 import numpy as np
 from common.vendor_runtime import action_schema, tool
 from hardware import JOINT_LOWER, JOINT_UPPER, JOINT_MARGIN
-from .execution import SPEED_CONFIG
+from .execution import OBSERVATION_TOLERANCE_DEG, SPEED_CONFIG
 from .inputs import ObservationInputs, resolve_topics
 from franka.fr3.arm_ips import ArmIPInput, split_topics, mapping
 
@@ -71,6 +72,8 @@ class PickPlacePlugin:
         self.lock = threading.RLock()
         self.active = self.last_result = self.observation = None
         self.enabled = False
+        self.ssh_username = 'pnp'
+        self.ssh_password = 'ros'
         self.arm_ip_input = ArmIPInput(ros2, self.apply_arm_ip_input)
 
     def apply_arm_ip_input(self, addresses):
@@ -111,9 +114,9 @@ class PickPlacePlugin:
 
     def get_tools(self):
         schema = action_schema({
-            'observe': (['confirm_motion'], 'Move to the configured observation pose, settle and retain one synchronized RGB-D/VOP photograph. Uses a fixed 2 deg/s observation speed. Opens the unloaded hand to its maximum permitted width. Wait for ACP completion.'),
-            'grab_to': (['start_point_x','start_point_y','target_point_x','target_point_y','rotation_deg','confirm_motion'], 'Pick and place at normalized coordinates in the same observation photo, release and return to observation.'),
-            'grab_by': (['start_point_x','start_point_y','delta_x','delta_y','rotation_deg','confirm_motion'], 'Pick and translate along the observation image right/down directions in actual table millimetres, release and return to observation.'),
+            'observe': (['confirm_motion'], 'Move to the configured observation pose, settle and synchronously return one RGB-D/VOP observation. Uses the configured arm speed and opens the unloaded hand.'),
+            'grab_to': (['start_point_x','start_point_y','target_point_x','target_point_y','rotation_deg','confirm_motion'], 'Pick and place using coordinates from the same image (X right, Y down). Observes automatically if needed, returns an action ID, then releases and returns to the observation pose.'),
+            'grab_by': (['start_point_x','start_point_y','delta_x','delta_y','rotation_deg','confirm_motion'], 'Pick and translate in table millimetres along the image axes (X right, Y down). Observes automatically if needed, returns an action ID, then releases and returns to the observation pose.'),
             'cancel': ([], 'Cancel observation and stop only this card\'s active motion. Never opens the gripper.'),
         }, {'confirm_motion': {'type': 'boolean', 'const': True},
             'start_point_x': {'type': 'number', 'minimum': -1, 'maximum': 1},
@@ -132,31 +135,29 @@ class PickPlacePlugin:
                        'x-hooks': {'on_interrupt_motion': {'action': 'cancel'},
                                    'on_interrupt_all': {'action': 'cancel'}}})
         definition = tool(self.PREFIX, 'actuator',
-            'FR3 wrist pick and place. Run observe, then select objects[].position in [-1,1]: X right, Y down. '
-            'grab_to uses a placement point in the same photograph; grab_by uses actual table millimetres aligned with that photograph. '
-            'An optional arm_ip_sync JSON input supplies both controller IPs without restarting; wait for the first valid mapping before motion. '
-            'Observe returns detections synchronously as JSON. Transfers auto-observe when needed and return an action_id for ACP. Successful transfers release and return to observation. '
-            'observe_after_transfer optionally captures a new observation after returning. Check transfer_completed, return_completed, '
-            'recovery_required and observation_required before starting another task. '
-            'Rotation defaults to zero; only request extra rotation when needed. Force is read from configuration; observe uses 2 deg/s; transfer speeds are read from configuration. FR3 force is in newtons, not a RealMan raw register value.',
+            'Pick and place with the FR3 wrist camera. Connect RGB, depth, object detections, and arm_ip_sync.',
             schema, topic_in=[dict(format=fmt, desc=desc, **({'topic': self.inputs.topics[i]} if self.inputs.topics else {}))
                               for i, fmt, desc in ((1, 'image/depth-zlib', 'Depth image'),
                                   (0, 'image/jpeg', 'RGB image'), (2, 'data/json', 'VOP objects'))]
                              + [dict(format='data/json', desc='Left/right arm controller IPs from arm_ip_sync',
                                      **({'topic': self.arm_ip_input.topic} if self.arm_ip_input.topic else {}))])
         definition['configSchema'] = {'type': 'object', 'additionalProperties': False, 'required': ['force_n'], 'properties': {
+            'username': {'type': 'string', 'title': 'SSH username', 'default': 'pnp', 'scope': 'instance'},
+            'password': {'type': 'string', 'title': 'SSH password', 'default': 'ros',
+                         'format': 'password', 'x-sensitive': True, 'scope': 'instance',
+                         'description': 'Leave blank to use the default SSH password.'},
             'arm': {'type': 'string', 'title': 'Arm', 'enum': list(self.arm_labels.values()),
                 'enumNames': ['Left hand' if side == 'left' else 'Right hand' for side in self.arm_labels],
                 'default': self.config['arm'],
-                'description': 'Select the physical left or right arm. The connected arm_ip_sync stream supplies its controller IP; changing endpoints requires a new observation.'},
+                'description': 'Select the left or right arm. A new observation is required after the IP mapping changes.'},
             **{name: {'type': 'number', 'minimum': low,
                       **({'maximum': high} if math.isfinite(high) else {}),
                       'default': default, 'title': title}
                for name, (low, high, default, title) in SPEED_CONFIG.items()},
             'force_n': {'type': 'number', 'minimum': 30, 'maximum': 70,
-                'description': 'Required Franka Hand grasp force in newtons; configure explicitly before transferring.'},
+                'description': 'Set the grasp force in newtons before running a transfer.'},
             'observe_after_transfer': {'type': 'boolean', 'default': False,
-                'description': 'Capture a new RGB-D/VOP observation after returning; otherwise observe again before the next transfer.'}}}
+                'description': 'Capture a fresh observation after returning to the observation pose.'}}}
         return [definition]
 
     def start(self):
@@ -164,10 +165,11 @@ class PickPlacePlugin:
 
     def info(self):
         with self.lock:
+            arm_input = self.arm_ip_input.info()
             return dict(state='running' if self.active else 'ready' if self.enabled or self.arm_ip_input.topic else 'idle',
                         arm=self.arm, robot_ip=self.address, camera_serial=self.serial,
-                        config=dict(self.config), motion_arm_ips=dict(self.addresses),
-                        arm_ip_input=self.arm_ip_input.info(),
+                        config=dict(self.config, username=self.ssh_username), motion_arm_ips=dict(self.addresses),
+                        arm_ip_input=arm_input, controller_ip=arm_input['controller_ip'] if arm_input['ready'] else '',
                         topic_in=self.get_tools()[0]['topic_in'],
                         stage=self.active.get('stage') if self.active else None,
                         action_id=self.active.get('action_id') if self.active else None,
@@ -199,7 +201,16 @@ class PickPlacePlugin:
         with self.lock:
             if self.active: return dict(state='error', code='ACTION_IN_PROGRESS', message='Wait for the current action')
             if action == 'config':
+                import re
                 updates = {k: v for k, v in args.items() if k not in ('_tool_name', 'instance_id')}
+                username = updates.pop('username', self.ssh_username)
+                password = updates.pop('password', self.ssh_password)
+                username = 'pnp' if username == '' else username
+                password = 'ros' if password == '' else password
+                if not isinstance(username, str) or not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_.-]{0,63}', username):
+                    return dict(ok=False, code='INVALID_CONFIG', message='Invalid SSH username')
+                if not isinstance(password, str) or any(ch in password for ch in ('\r', '\n', '\x00')):
+                    return dict(ok=False, code='INVALID_CONFIG', message='Invalid SSH password')
                 # Ignore the removed persistent hand-speed field from older saved canvases.
                 updates.pop('speed_percent', None)
                 for key in ('depth_compensation_mm', 'observation_joints_deg',
@@ -250,7 +261,8 @@ class PickPlacePlugin:
                     self.config = cfg
                     self.arm_configs[arm] = dict(cfg)
                     self.observation = None
-                return dict(ok=True, **cfg)
+                self.ssh_username, self.ssh_password = username, password
+                return dict(ok=True, username=username, **cfg)
             if action == 'start':
                 previous_topics=tuple(self.inputs.topics)
                 was_enabled=self.enabled
@@ -306,7 +318,7 @@ class PickPlacePlugin:
                     action=action,transfer=transfer,config=dict(self.config),
                     owner='vision_pick_and_drop_'+uuid4().hex, cancel=threading.Event(),
                     stage='planning', target=joint_target(self.config['observation_joints_deg']),
-                    speed_deg_s=2., session=None, command_id=None, hand_command_id=None,
+                    session=None, command_id=None, hand_command_id=None,
                     observation=self.observation, position=[args.get('start_point_x'),args.get('start_point_y')],
                     profile={**copy.deepcopy(self.planning_profile),
                              **{f'{axis}_compensation_mm': self.config[f'{axis}_compensation_mm'] for axis in 'xyz'}}, options=options)
@@ -326,7 +338,7 @@ class PickPlacePlugin:
             except (RuntimeError, ValueError) as exc:
                 return dict(state='error', code='CAMERA_NOT_READY', message=str(exc))
             active = dict(action_id='vision_pick_and_drop_observe_'+uuid4().hex, cancel=threading.Event(),
-                          owner='vision_pick_and_drop_'+uuid4().hex, target=target, speed_deg_s=2., config=dict(self.config),
+                          owner='vision_pick_and_drop_'+uuid4().hex, target=target, config=dict(self.config),
                           stage='checking', session=None, command_id=None)
             self.observation = None; self.active = active
         status, result = self.run_observation(active)
@@ -343,14 +355,14 @@ class PickPlacePlugin:
             self.active = None
         return terminal
 
-    def state(self, active, *, settling=False):
+    def state(self, active, *, settling=False, sample=None):
         if active['cancel'].is_set(): raise RuntimeError('Observation cancelled')
-        s = active['session'].snapshot()
+        s = active['session'].snapshot() if sample is None else sample
         if (not s.get('connected') or (s.get('data_age_ms') or 0) > 200 or
-                s.get('robot_mode') != 1 or not s.get('O_T_EE')):
+                s.get('robot_mode') not in (1, 2) or not s.get('control_ready') or not s.get('O_T_EE')):
             if settling and not s.get('error') and s.get('robot_mode') in (1, 2):
                 return None
-            raise RuntimeError(s.get('error') or 'Fresh stationary Idle robot state is required')
+            raise RuntimeError(s.get('error') or f"Fresh control-ready robot state required (mode={s.get('robot_mode')}, age_ms={s.get('data_age_ms')})")
         if max(map(abs, s['dq'])) > .01:
             if settling:
                 return None
@@ -360,104 +372,102 @@ class PickPlacePlugin:
         frame(self.planning_profile or {}, s.get('F_T_EE'))
         return s
 
+    @contextmanager
+    def controller(self, active):
+        from .controller_session import ControllerSession
+        arm_input = self.arm_ip_input.info()
+        endpoint = arm_input['controller_ip'] if arm_input['ready'] else ''
+        if not endpoint:
+            raise RuntimeError('Run arm_ip_sync sync before visual motion')
+        owner = active['owner']
+        local = self.manager.acquire(self.address, owner, exclusive=True)
+        try:
+            deadline = time.monotonic() + 8
+            while not local.snapshot().get('control_ready'):
+                if active['cancel'].wait(.025):
+                    raise RuntimeError('Pick cancelled')
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('Orin native Franka control connection is not ready')
+            with ControllerSession(endpoint, self.ssh_username, self.ssh_password, active['cancel'],
+                                   local=local).start(self.address) as controller:
+                yield controller
+        finally:
+            self.manager.release(self.address, owner)
+
+    def observe_on_controller(self, active, arm, hand):
+        from .remote_execution import RemoteExecution
+        active['session'] = arm
+        before = self.state(active)
+        target = [math.radians(v) for v in active['target']]
+        if max(abs(a-b) for a,b in zip(before['q'], target)) > math.radians(OBSERVATION_TOLERANCE_DEG):
+            options = dict(active['config'])
+            executor = RemoteExecution(active, arm, hand, options, before, self.planning_profile or {})
+            if executor.fresh(hand)['is_grasped']:
+                raise RuntimeError('Hand reports a held object; release it before moving to the observation pose')
+            step = executor.prepare('move_to_observation', target, joint=True)
+            try:
+                executor.open_hand('observe_open')
+                executor.move_remote(step)
+            except Exception:
+                executor.stop_pending()
+                raise
+        return self.capture(active)
+
+    def acquire_hand(self, active):
+        if self.gripper_manager is None:
+            raise RuntimeError('Driver gripper manager is missing')
+        hand = self.gripper_manager.acquire(self.address, active['owner'], exclusive=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not hand.snapshot().get('connected'):
+                if active['cancel'].wait(.025):
+                    raise RuntimeError('Visual action cancelled')
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('Hand connection timed out')
+            return hand
+        except Exception:
+            self.gripper_manager.release(self.address, active['owner'])
+            raise
+
     def run_observation(self, active):
-        status, result = 'error', {}
         hand = None
         try:
-            session = self.manager.acquire(self.address, active['owner']); active['session'] = session
-            deadline = time.monotonic()+5
-            while not session.snapshot().get('connected'):
-                if active['cancel'].wait(.02): raise RuntimeError('Observation cancelled')
-                if time.monotonic() >= deadline: raise RuntimeError('Robot state connection timed out')
-            before = self.state(active)
-            target = [math.radians(v) for v in active['target']]
-            needs_motion = max(abs(a-b) for a,b in zip(before['q'], target)) > math.radians(.2)
-            if needs_motion:
-                from .hand_collision import check_observation_path
-                return_path = check_observation_path(before, active['target'], self.planning_profile or {})
-            if needs_motion and self.gripper_manager is not None:
-                hand = self.gripper_manager.acquire(self.address, active['owner'])
-                deadline = time.monotonic() + 5
-                while not hand.snapshot().get('connected'):
-                    if active['cancel'].wait(.02):
-                        raise RuntimeError('Observation cancelled')
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError('Hand connection timed out')
-                from .execution import PickExecution
-                executor = PickExecution(active, session, hand, {'speed_mm_s': active['config']['speed_mm_s']})
-                state = executor.fresh(hand)
-                if state['is_grasped']:
-                    raise RuntimeError('Hand reports a held object; release it before moving to the observation pose')
-                opening = min(state['max_width'], .08)
-                if opening <= 0:
-                    raise RuntimeError('Invalid calibrated hand opening')
-                if abs(state['width'] - opening) > .001:
-                    active['stage'] = 'observe_open'
-                    command = hand.command(active['owner'], 'set_position',
-                                           width_m=opening, speed_m_s=active['config']['speed_mm_s']/1000, timeout_s=15)
-                    try:
-                        executor.wait(hand, command, 17, 'hand_command_id')
-                        if abs(executor.fresh(hand)['width'] - opening) > .001:
-                            raise RuntimeError('Hand did not reach its maximum opening')
-                    except Exception:
-                        executor.stop_pending()
-                        raise
-            if needs_motion:
-                active['stage'] = 'move_to_observation'
-                if not before.get('control_ready'): raise RuntimeError(before.get('control_error') or 'Robot control is not ready')
-                motion_args = dict(speed_rad_s=math.radians(active['speed_deg_s']),
-                                   tolerance_rad=math.radians(.2), timeout_s=360)
-                if return_path is None:
-                    active['command_id'] = session.move(active['owner'], target, **motion_args)
-                else:
-                    active['command_id'] = session.move_path(active['owner'], return_path.tolist(), **motion_args)
-                while not active['cancel'].wait(.05):
-                    motion = session.motion(active['command_id'])
-                    if motion['status'] in ('succeeded', 'failed', 'cancelled'):
-                        if motion['status'] != 'succeeded': raise RuntimeError(motion.get('error') or motion['status'])
-                        break
-                if active['cancel'].is_set(): raise RuntimeError('Observation cancelled')
-            result = self.capture(active)
-            status = 'completed'
+            hand = self.acquire_hand(active)
+            with self.controller(active) as arm:
+                return 'completed', self.observe_on_controller(active, arm, hand)
         except Exception as exc:
-            if active['session'] and active['command_id']:
-                try: active['session'].stop_motion(owner=active['owner'], command_id=active['command_id'])
-                except Exception as stop_exc: log.warning('Observation stop failed: %s', stop_exc)
-            status = 'cancelled' if active['cancel'].is_set() else 'error'
-            result = dict(ok=False, message=str(exc), stage=active['stage'])
+            return ('cancelled' if active['cancel'].is_set() else 'error',
+                    dict(ok=False, message=str(exc), stage=active['stage']))
         finally:
+            active.update(session=None, command_id=None)
             if hand is not None:
-                try:
-                    self.gripper_manager.release(self.address, active['owner'])
-                except Exception as exc:
-                    status = 'error'
-                    result.update(ok=False, stop_error=str(exc))
-                    with self.lock:
-                        self.observation = None
-            if active['session']:
-                try: self.manager.release(self.address, active['owner'])
-                except Exception as exc:
-                    status = 'error'; result.update(ok=False, stop_error=str(exc))
-                    with self.lock: self.observation = None
-        active.update(session=None, command_id=None)
-        return status, result
+                self.gripper_manager.release(self.address, active['owner'])
 
     def capture(self, active):
         target = [math.radians(v) for v in active['target']]
         active['stage'] = 'settling'
         deadline = time.monotonic() + 5
         while True:
-            anchor = self.state(active, settling=True)
-            if anchor is not None and max(abs(a-b) for a,b in zip(anchor['q'], target)) <= math.radians(.2):
+            sample = active['session'].snapshot()
+            anchor = self.state(active, settling=True, sample=sample)
+            errors = [abs(math.degrees(a - b)) for a, b in zip(sample['q'], target)]
+            worst = max(range(len(errors)), key=errors.__getitem__)
+            if anchor is not None and errors[worst] <= OBSERVATION_TOLERANCE_DEG:
                 break
             if time.monotonic() >= deadline:
-                raise RuntimeError('Observation pose did not settle within 5 seconds after arrival')
+                velocity = math.degrees(max(map(abs, sample['dq'])))
+                raise RuntimeError(
+                    f'Observation did not settle: joint {worst + 1} error={errors[worst]:.3f} deg '
+                    f'(target={math.degrees(target[worst]):.3f}, actual={math.degrees(sample["q"][worst]):.3f}, '
+                    f'limit={OBSERVATION_TOLERANCE_DEG:.3f}); max speed={velocity:.3f} deg/s (limit=0.573); '
+                    f'mode={sample.get("robot_mode")}, age_ms={sample.get("data_age_ms")}'
+                )
             if active['cancel'].wait(.025):
                 raise RuntimeError('Observation cancelled')
         after = time.time()
         def check():
             current = self.state(active)
-            if max(abs(a-b) for a,b in zip(current['q'], target)) > math.radians(.2):
+            if max(abs(a-b) for a,b in zip(current['q'], target)) > math.radians(OBSERVATION_TOLERANCE_DEG):
                 raise RuntimeError('Arm left the observation joint target')
             if max(abs(a-b) for a,b in zip(current['q'], anchor['q'])) > math.radians(.05):
                 raise RuntimeError('Arm moved during observation')
@@ -500,59 +510,89 @@ class PickPlacePlugin:
             self.active = None
 
     def run_transfer(self, active):
-        from .execution import PickExecution
+        from .remote_execution import RemoteExecution
         from .planning import preview
         from .scene import estimate
+        from .transfer import moveit_targets
         status, result, executor, hand = 'error', {}, None, None
         try:
-            if not active['observation']:
-                active['stage'] = 'auto_observe'
-                self.inputs.prepare()
-                self.inputs.binding()
-                observation_status, observed = self.run_observation(active)
-                if observation_status != 'completed':
-                    raise RuntimeError(observed.get('message') or observed.get('stop_error') or 'Automatic observation failed')
-                with self.lock:
-                    active['observation'], self.observation = self.observation, None
+            hand = self.acquire_hand(active)
+            with self.controller(active) as arm:
+                active['session'] = arm
+                if not active['observation']:
+                    active['stage'] = 'auto_observe'
+                    self.inputs.prepare()
+                    self.inputs.binding()
+                    self.observe_on_controller(active, arm, hand)
+                    with self.lock:
+                        active['observation'], self.observation = self.observation, None
                 active['stage'] = 'planning'
-                if active['cancel'].is_set():
-                    raise RuntimeError('Pick cancelled')
-            scene = estimate(active['observation'], active['position'], active['profile']['handeye'])
-            plan = preview(active['observation'], active['position'], scene['diameter_mm'],
-                           {**active['profile'], **scene}, scene)
-            plan['scene'] = scene
-            def check():
-                if active['cancel'].is_set():
-                    raise RuntimeError('Pick cancelled')
-            check()
-            from .transfer import plan_transfer
-            transfer = plan_transfer(active['observation'],plan,active['profile']['handeye'],
-                                     active['transfer'],check, active['profile'])
-            check()
-            active['session'] = self.manager.acquire(self.address, active['owner'])
-            hand = self.gripper_manager.acquire(self.address, active['owner'])
-            deadline = time.monotonic()+5
-            while not (active['session'].snapshot().get('connected') and hand.snapshot().get('connected')):
-                if active['cancel'].wait(.02):
-                    raise RuntimeError('Pick cancelled')
-                if time.monotonic() > deadline:
-                    raise TimeoutError('Robot/hand connection timed out')
-            from .hand_collision import frame
-            frame(active['profile'], active['session'].snapshot().get('F_T_EE'))
-            live_pose = np.asarray(active['session'].snapshot()['O_T_EE']).reshape(4,4,order='F')
-            saved_pose = np.asarray(active['observation']['metadata']['O_T_EE']).reshape(4,4,order='F')
-            pose_vector(live_pose.flatten(order='F').tolist())
-            relative = live_pose[:3,:3].T @ saved_pose[:3,:3]
-            angle = math.acos(np.clip((np.trace(relative)-1)/2,-1,1))
-            if np.linalg.norm(live_pose[:3,3]-saved_pose[:3,3]) > .002 or angle > math.radians(1):
-                raise RuntimeError('End-effector pose or tool frame changed since observation')
-            executor = PickExecution(active, active['session'], hand, active['options'])
-            executor.run(plan)
-            result = dict(executor.transfer(transfer),observation_id=plan['observation_id'])
-            if active['config']['observe_after_transfer']:
-                active['target'] = joint_target(active['config']['observation_joints_deg'])
-                result['observation'] = self.capture(active)
-            status = 'completed'
+                photo, profile = active['observation'], active['profile']
+                scene = estimate(photo, active['position'], profile['handeye'])
+                candidates = preview(photo, active['position'], scene['diameter_mm'],
+                               {**profile, **scene}, scene, target_only=True)
+                live = self.state(active)
+                live_pose = np.asarray(live['O_T_EE']).reshape(4,4,order='F')
+                saved_pose = np.asarray(photo['metadata']['O_T_EE']).reshape(4,4,order='F')
+                relative = live_pose[:3,:3].T @ saved_pose[:3,:3]
+                angle = math.acos(np.clip((np.trace(relative)-1)/2,-1,1))
+                if np.linalg.norm(live_pose[:3,3]-saved_pose[:3,3]) > .002 or angle > math.radians(1):
+                    raise RuntimeError('End-effector pose changed since observation')
+                executor = RemoteExecution(active, arm, hand, active['options'], live, profile, scene)
+                if executor.fresh(hand)['is_grasped']:
+                    raise RuntimeError('Hand already reports a held object')
+                opening = min(executor.fresh(hand)['max_width'], .08)
+                errors = []
+                deadline = time.monotonic() + 120
+                for pick in candidates:
+                    executor.check()
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError('MoveIt candidate planning deadline: ' + '; '.join(errors))
+                    executor.q = list(live['q'])
+                    width = pick['grasp_width_mm'] / 1000
+                    try:
+                        if not 0 < width < opening:
+                            raise ValueError('Target does not fit the calibrated opening')
+                        targets = moveit_targets(photo, pick, scene, profile['handeye'], active['transfer'])
+                        approach = executor.prepare('approach', targets['approach'], use_ik=True)
+                        descent = executor.prepare('descend', [targets['descent']], cartesian=True)
+                        lift = executor.prepare('lift', [targets['lift']], cartesian=True)
+                        carry = executor.prepare('move_to_place', targets['carry'], cartesian=True)
+                        place_lift = executor.prepare('place_lift', [targets['place_lift']], cartesian=True)
+                        home = executor.prepare('return_to_observation', list(map(math.radians, active['target'])), joint=True)
+                    except (RuntimeError, ValueError, TimeoutError) as exc:
+                        errors.append(f'{pick["yaw_deg"]:.1f} deg: {exc}')
+                        continue
+                    break
+                else:
+                    raise RuntimeError('No complete MoveIt plan: ' + '; '.join(errors))
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('MoveIt candidate planning deadline: ' + '; '.join(errors))
+                executor.open_hand('pick_open')
+                executor.move_remote(approach)
+                executor.move_remote(descent)
+                executor.grasp(width)
+                executor.move_remote(lift)
+                if not executor.fresh(hand)['is_grasped']:
+                    raise RuntimeError('Grasp feedback lost during lift')
+                executor.move_remote(carry)
+                executor.open_hand('place_open')
+                active.update(holding_object_possible=False, release_completed=True, transfer_completed=True)
+                executor.move_remote(place_lift)
+                executor.move_remote(home)
+                active['return_completed'] = True
+                rotation = active['transfer']['rotation_deg']
+                result = dict(ok=True, stage='completed', transfer_completed=True, return_completed=True,
+                              release_completed=True, holding_object_possible=False, recovery_required=False,
+                              observation_id=pick['observation_id'], rotation_deg=rotation,
+                              rotation_completed=bool(rotation), grasp_checked=True,
+                              last_completed_stage='return_to_observation', arm_path_commands=executor.arm_commands,
+                              observe_after_transfer=active['config']['observe_after_transfer'],
+                              observation=dict(skipped=True, reason='disabled'),
+                              final_pose=pose_vector(self.state(active)['O_T_EE']))
+                if active['config']['observe_after_transfer']:
+                    result['observation'] = self.capture(active)
+                status = 'completed'
         except Exception as exc:
             status = 'cancelled' if active['cancel'].is_set() else 'error'
             # A rejected target before session acquisition has not changed the scene.
@@ -580,12 +620,12 @@ class PickPlacePlugin:
                     status = 'error'
                     result.update(stop_error=str(stop_exc), recovery_required=True)
         finally:
-            for manager, session in ((self.manager, active['session']), (self.gripper_manager, hand)):
-                if session is not None:
-                    try:
-                        manager.release(self.address, active['owner'])
-                    except Exception as exc:
-                        status = 'error'
-                        result.update(ok=False, release_error=str(exc), recovery_required=True)
-                        with self.lock: self.observation = None
+            if hand is not None:
+                try:
+                    self.gripper_manager.release(self.address, active['owner'])
+                except Exception as exc:
+                    status = 'error'
+                    result.update(ok=False, release_error=str(exc), recovery_required=True)
+                    with self.lock:
+                        self.observation = None
         self.complete(active, status, result)

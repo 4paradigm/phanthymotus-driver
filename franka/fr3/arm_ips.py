@@ -1,4 +1,5 @@
 """Optional arm endpoint input, independent of RGB-D acquisition."""
+import ipaddress
 import json
 import threading
 import time
@@ -35,17 +36,24 @@ class ArmIPInput:
         self.quit = threading.Event()
         self.received_at = None
         self.addresses = None
+        self.controller_ip = ""
         self.error = None
 
     def receive(self, raw):
         try:
             if not isinstance(raw, str) or len(raw.encode()) > 4096:
                 raise ValueError('Arm IP message is invalid or exceeds 4096 bytes')
-            addresses = mapping(json.loads(raw))
+            payload = json.loads(raw)
+            controller = payload.pop("controller_ip", "") if isinstance(payload, dict) else ""
+            if not isinstance(controller, str):
+                raise ValueError("Controller IP must be a string")
+            controller = str(ipaddress.IPv4Address(controller)) if controller else ""
+            addresses = mapping(payload)
             # Never hold the input lock while acquiring the card's lock.
             self.apply(addresses)
             with self.lock:
                 self.addresses = addresses
+                self.controller_ip = controller
                 self.received_at = time.monotonic()
                 self.error = None
         except Exception as exc:
@@ -58,6 +66,7 @@ class ArmIPInput:
             return dict(topic=self.topic, connected=self.topic is not None,
                         fresh=self.topic is not None and age is not None and age < 3 and not self.error,
                         ready=self.topic is not None and self.addresses is not None and not self.error,
+                        controller_ip=self.controller_ip,
                         motion_arm_ips=dict(self.addresses) if self.addresses else None, error=self.error)
 
     def start(self, topic):
@@ -104,3 +113,4 @@ class ArmIPInput:
         self.thread = None
         with self.lock:
             self.topic = self.received_at = self.addresses = self.error = None
+            self.controller_ip = ""
