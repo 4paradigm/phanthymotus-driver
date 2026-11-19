@@ -6,7 +6,7 @@ hardware_model: "adam"
 image_name: pndbotics-adam
 port: 15722
 mcp_url: "http://localhost:15722/mcp"
-description: "PNDbotics Adam — RL gRPC运动控制 + FSM/动作/安全执行 + 状态感知 + 实体急停 + ZED拍照 + 手臂/手部/腰部/头部控制 + 3D模型"
+description: "PNDbotics Adam — RL gRPC运动控制 + FSM/动作/安全执行 + 状态感知 + 实体急停 + ZED视觉 + MID-360雷达 + 手臂/手部/腰部/头部控制 + 3D模型"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
@@ -15,7 +15,8 @@ build_context_extras:
 # model plugins are enabled, so every tool
 # they expose is listed. camera_pointcloud is included even though its nested
 # `camera.pointcloud.enabled` defaults to false — that only gates whether the
-# point-cloud stream auto-starts, not whether the card is discoverable.
+# point-cloud stream auto-starts, not whether the card is discoverable. The
+# independently attached MID-360 is exposed as lidar_cloud.
 cards:
   - { name: joints,             type: sensor }
   - { name: motor_state,        type: sensor }
@@ -34,5 +35,6 @@ cards:
   - { name: camera_head,         type: sensor }
   - { name: camera_depth,        type: sensor }
   - { name: camera_pointcloud,   type: sensor }
+  - { name: lidar_cloud,         type: sensor }
   - { name: vision_capture,      type: actuator }
   - { name: model,               type: resource }

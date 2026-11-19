@@ -3,6 +3,9 @@ pndbotics-adam:
   container_name: embodied-pndbotics-adam
   runtime: nvidia
   network_mode: host
+  # Required by the in-container Livox SDK2 runtime: MID-360 sends its raw UDP
+  # point-cloud/IMU packets directly to eno1 ports 56301/56401. Host networking
+  # is intentional; Docker port mappings cannot express this device topology.
   ipc: host
   pid: host
   privileged: true
