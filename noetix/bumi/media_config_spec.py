@@ -69,10 +69,12 @@ SETTING_KEYS = tuple(SETTINGS)
 # The settings a caller may write. ``wakeup_words`` is deliberately absent.
 WRITABLE_KEYS = tuple(k for k in SETTING_KEYS if SETTINGS[k]["writable"])
 
-# The vendor's auto-sleep timeout unit is milliseconds. A value is only ever a
-# number, but the range is what keeps a typo like ``set_timeout(5)`` — meaning
-# "sleep after 5 ms" — from being accepted as a plausible "5 s".
-TIMEOUT_MIN_MS = 1
+# The vendor's auto-sleep timeout unit is milliseconds. The lower bound is one
+# full second: ``set_timeout(5)`` almost certainly means five *seconds*, and
+# accepting it as 5 ms would silently put the robot to sleep immediately.
+# Sub-second values are refused with the unit in the message instead of being
+# forwarded to the SDK.
+TIMEOUT_MIN_MS = 1_000
 TIMEOUT_MAX_MS = 3_600_000  # one hour, an upper bound far beyond any real use
 
 # Response words are short text; the SDK stores them as a single string. No
@@ -110,8 +112,9 @@ def validate_timeout_ms(value) -> int:
 
     Fractions are **rejected, not truncated**: ``int(1.9)`` is ``1``, so a
     caller who mistypes ``120001.9`` would silently get 120001, and a caller who
-    sends ``1.9`` would get the minimum timeout — a value that reads like a
-    plausible duration while meaning "sleep immediately". An integral float
+    sends ``1.9`` would be truncated into the sub-second band, which this card
+    refuses outright — both look like plausible durations while meaning "sleep
+    immediately". An integral float
     (``60000.0``) and a numeric string (``"60000"``) still name a whole
     millisecond, so they are accepted and converted.
     """
@@ -127,7 +130,11 @@ def validate_timeout_ms(value) -> int:
         raise ValueError(
             f"timeout_ms 必须是整数毫秒（收到 {value!r}）；小数不会被截断")
     result = int(number)
-    if not TIMEOUT_MIN_MS <= result <= TIMEOUT_MAX_MS:
+    if result < TIMEOUT_MIN_MS:
+        raise ValueError(
+            f"timeout_ms 必须在 [{TIMEOUT_MIN_MS}, {TIMEOUT_MAX_MS}] 毫秒之间；"
+            f"单位是毫秒，{result} 接近立即休眠（想表达秒请乘以 1000）")
+    if result > TIMEOUT_MAX_MS:
         raise ValueError(
             f"timeout_ms 必须在 [{TIMEOUT_MIN_MS}, {TIMEOUT_MAX_MS}] 毫秒之间")
     return result

@@ -343,7 +343,7 @@ in `device.py`; no extra runtime Python file is required.
 
 | 参数名 | 含义 | 可写 | SDK 方法 | 取值 |
 | --- | --- | --- | --- | --- |
-| `timeout` | 自动休眠超时 | 是 | `get/set_timeout` | **整数毫秒**，`[1, 3600000]` |
+| `timeout` | 自动休眠超时 | 是 | `get/set_timeout` | **整数毫秒**，`[1000, 3600000]` |
 | `audio_cue` | 应答提示音开关 | 是 | `get/set_audio_cue_enable` | 真正的 `true` / `false`（字符串不行） |
 | `wakeup_response` | 被唤醒时说的应答词 | 是 | `get/set_wakeup_response_words` | 非空字符串，≤256 字符 |
 | `sleep_response` | 进入休眠时说的应答词 | 是 | `get/set_sleep_response_words` | 非空字符串，≤256 字符 |
@@ -357,6 +357,11 @@ in `device.py`; no extra runtime Python file is required.
 `set_timeout(int timeout_ms)`；`int(1.9)` 会等于 `1`，一个手误就会被当成"立刻休眠"，
 而且写入还显示成功。所以 `1.9` / `"120001.5"` 直接返回 `state: error`，而 `60000.0`、
 `"60000"` 这种整数值照常接受。
+
+**亚秒值会被拒绝，避免把"5 秒"写成 5 毫秒。** `timeout` 的下限是 1000 毫秒（1 秒）：
+`5` / `500` 这类值直接返回 `state: error`，错误信息会提醒单位是毫秒、想表达秒请乘以
+1000。合法用法是写 `5000` 表达 5 秒；`1000` 本身是合法的 1 秒。自动休眠阈值低于 1 秒
+没有实际意义，而且配置写之间有 500 ms 间隔，亚秒值根本来不及起作用。
 
 **写完的读回和写是同一次原子操作。** MCP 请求是并发处理的：如果 `set_*` 先释放门禁锁、
 再去读值，另一个 `set_*` 就可能插在中间 —— A 写 60000、B 写 90000，A 却把 B 的 90000

@@ -44,17 +44,28 @@ def test_writable_settings_cover_timeout_cue_and_response_words():
 # ── validation: the part where a wrong unit or type fails silently ──────────
 
 def test_a_timeout_is_validated_in_milliseconds_not_seconds():
-    # A caller that sends `5` meaning "5 s" would otherwise be accepted and the
-    # robot would sleep after 5 ms. The guard returns the int the SDK wants.
+    # The guard returns the int the SDK wants; the sub-second values a caller
+    # might mistake for seconds are rejected in the test just below.
     assert spec.validate_timeout_ms(120000) == 120000
     assert spec.validate_timeout_ms("90000") == 90000
 
 
 def test_a_timeout_outside_the_range_is_rejected():
     with pytest.raises(ValueError):
-        spec.validate_timeout_ms(0)
-    with pytest.raises(ValueError):
         spec.validate_timeout_ms(3_600_001)
+
+
+def test_a_sub_second_timeout_is_refused_instead_of_sleeping_immediately():
+    # `5` is the classic mistake: five seconds intended, five milliseconds
+    # configured. The whole sub-second band fails, not just literal 5.
+    for value in (0, 1, 5, 999, "5", 999.0):
+        with pytest.raises(ValueError, match="毫秒"):
+            spec.validate_timeout_ms(value)
+    with pytest.raises(ValueError, match="乘以 1000"):
+        spec.validate_timeout_ms(5)
+    # The boundary itself is a legitimate one-second timeout.
+    assert spec.validate_timeout_ms(1000) == 1000
+    assert spec.validate_timeout_ms(1001) == 1001
 
 
 def test_a_boolean_timeout_is_not_a_duration():
@@ -128,7 +139,7 @@ def test_the_interface_names_the_timeout_unit_and_range():
 
     assert interface["card"] == "media_config"
     assert interface["timeout_unit"] == "milliseconds"
-    assert interface["timeout_range_ms"] == [1, 3_600_000]
+    assert interface["timeout_range_ms"] == [1_000, 3_600_000]
     keys = {setting["key"] for setting in interface["settings"]}
     assert "wakeup_words" in keys
     by_key = {setting["key"]: setting["writable"]
@@ -365,7 +376,7 @@ def test_a_missing_argument_is_a_clear_error_not_a_key_error(monkeypatch):
 def test_without_a_controller_sets_are_refused_and_info_stays_honest(monkeypatch):
     _, plugin = _plugin(monkeypatch, None)
 
-    assert plugin.dispatch("set_timeout", {"timeout": 5})["state"] == "error"
+    assert plugin.dispatch("set_timeout", {"timeout": 60000})["state"] == "error"
     info = plugin.dispatch("info", {})
     assert info["controller_present"] is False
     assert info["values"] is None
