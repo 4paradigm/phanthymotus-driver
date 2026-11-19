@@ -93,3 +93,8 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+  # Optional operator baseline and report drafts. No motion or notification I/O.
+  # The bundled profile is a rehearsal template, not a verified site baseline.
+  patrol_baseline:
+    enabled: false
+    baseline_path: examples/patrol-baseline-bumi-fixed.json

@@ -1,0 +1,57 @@
+{
+  "schema": "motus.patrol-baseline/1",
+  "site_id": "demo-office",
+  "revision": "normal-v1",
+  "mode": "rehearsal",
+  "max_age_seconds": 30,
+  "review_route": "duty-review",
+  "routes": {
+    "duty-review": "值班复核记录",
+    "facilities": "物业设施工单",
+    "it-operations": "IT 运维工单"
+  },
+  "points": [
+    {
+      "point_id": "east-exit",
+      "label": "东侧疏散口",
+      "waypoint_id": "demo-east-exit",
+      "view_id": "exit-front",
+      "checks": [
+        {
+          "check_id": "clear-walkway",
+          "normal": "从固定视角可看到疏散门前和通道的有效通行区域连续可见，通行区域内没有占用物。",
+          "evidence_kind": "visual",
+          "route_id": "facilities"
+        }
+      ]
+    },
+    {
+      "point_id": "pantry",
+      "label": "茶水间",
+      "waypoint_id": "demo-pantry",
+      "view_id": "sink-and-floor",
+      "checks": [
+        {
+          "check_id": "dry-floor",
+          "normal": "茶水间水槽外的指定地面可见且干燥。无法从画面确认反光的原因时标记待复核。",
+          "evidence_kind": "visual",
+          "route_id": "facilities"
+        }
+      ]
+    },
+    {
+      "point_id": "server-room",
+      "label": "机房门外",
+      "waypoint_id": "demo-server-room",
+      "view_id": "status-panel",
+      "checks": [
+        {
+          "check_id": "panel-state",
+          "normal": "指定状态面板显示绿色运行指示，告警区没有显示告警文字。面板不清晰时标记待复核。",
+          "evidence_kind": "visual",
+          "route_id": "it-operations"
+        }
+      ]
+    }
+  ]
+}
