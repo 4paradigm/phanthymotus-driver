@@ -23,6 +23,32 @@ import math
 UNIT_TOLERANCE = 1e-3
 
 
+def rpy_to_quat(rx: float, ry: float, rz: float):
+    """欧拉角（弧度）→ 单位四元数 xyzw。**约定是 ZYX，R = Rz·Ry·Rx。**
+
+    存在的理由是厂商 SDK 报的位姿是欧拉角，而 `eef_pose` 的标准布局是四元数
+    （四元数自带单位范数校验，这是选它的全部理由 —— 见模块 docstring）。
+
+    **欧拉角的合成顺序必须写明，而且必须和同一台机器人上的其它换算一致。**
+    三种顺序都给出一串看着合理的浮点数，接错了不报错：末端姿态偏掉一个固定的
+    旋转，而残差、限位、单位范数全部正常。这里选 ZYX 是因为它是
+    `realman/rm75_6f_v/device.py:_euler_to_matrix` 已经在用的那一个（那个函数
+    参与笛卡尔运动的工作空间校验），`tests/test_control_rotation.py` 有一条测试
+    把两者钉在一起，所以它们不会各自漂走。
+    """
+    half_x, half_y, half_z = float(rx) / 2.0, float(ry) / 2.0, float(rz) / 2.0
+    cx, sx = math.cos(half_x), math.sin(half_x)
+    cy, sy = math.cos(half_y), math.sin(half_y)
+    cz, sz = math.cos(half_z), math.sin(half_z)
+    # qz * qy * qx，和 R = Rz·Ry·Rx 同序。
+    return (
+        sx * cy * cz - cx * sy * sz,      # qx
+        cx * sy * cz + sx * cy * sz,      # qy
+        cx * cy * sz - sx * sy * cz,      # qz
+        cx * cy * cz + sx * sy * sz,      # qw
+    )
+
+
 def norm(quaternion) -> float:
     return math.sqrt(sum(float(v) * float(v) for v in quaternion))
 
