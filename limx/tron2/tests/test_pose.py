@@ -29,7 +29,7 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
         self.file=Path(self.tmp.name)/'home.json'
         self.file.write_text(json.dumps({'schema':'tron2-arms-reset-pose-v1','scope':'arms_only','unit':'rad',
             'joint_names':ARM_NAMES,'target_q':HOME,'head_policy':'unchanged','gripper_policy':'unchanged',
-            'accid':'TEST_TRON2A','firmware':'test-fw'}))
+            'accid':'DACH_TRON2A_TEST','firmware':'test-fw'}))
         self.reader=RobotReader(settings());packet=info();packet['data']['sw_version']='test-fw'
         self.reader.accept_info(packet);self.reader.ws=types.SimpleNamespace(closed=False)
         self.stamp=100;self.position=HOME+[0,0];self.accept_feedback()
@@ -498,7 +498,7 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
     def test_readiness_sensor_sampling_has_no_undefined_discovery_dependency(self):
         import check
         with patch.object(check,'rpc',return_value={'content':[{'text':json.dumps({'sample':{'available':True}})}]}) as rpc:
-            self.assertEqual(check.read_samples(),{'joint_state':{'available':True}})
+            self.assertEqual(check.read_samples(),{'joints':{'available':True}})
         self.assertEqual(rpc.call_args.args[1]['arguments']['action'],'info')
 
     async def test_frozen_vendor_timestamp_cannot_complete_sequence(self):
