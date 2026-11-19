@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """UBTECH U1 Pro MCP driver entry point."""
 
+from common import logsafe
+
+logsafe.install()
+
 import os
 
 from common.vendor_runtime import load_config, run_driver
