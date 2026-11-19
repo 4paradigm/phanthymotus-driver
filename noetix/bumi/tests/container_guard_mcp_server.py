@@ -40,7 +40,8 @@ def run(args):
     ros_thread = http_thread = None
     try:
         bundle = bumi_main.BumiDeviceBundle({"plugins": {
-            "image_quality_guard": {"enabled": True}}}, args.namespace, executor, None, None)
+            "image_quality_guard": {"enabled": True}}}, args.namespace, executor, None, None,
+            allow_image_quality_guard_for_test=True)
         bumi_main._bundle = bundle
         bundle.start_all()
         tools = bundle.get_all_tools()

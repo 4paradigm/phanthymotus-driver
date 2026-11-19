@@ -158,7 +158,7 @@ COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
 COPY config.yaml /work/config.yaml
-COPY tools/ /work/tools/
+COPY tools/image_quality_observe.py /work/tools/image_quality_observe.py
 COPY deploy/     /deploy/
 
 # Add SDK DDS libs + pybind modules to paths

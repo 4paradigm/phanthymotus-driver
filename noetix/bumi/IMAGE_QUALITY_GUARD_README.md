@@ -4,6 +4,8 @@ ImageQualityGuard 是 Bumi 的被动 processor Card。它订阅已有 Camera Car
 
 ## 实现与使用
 
+生产 Bundle 暂不注册此 Card。配套 Core 发布并通过验收前，可使用[部署指南中的隔离入口](IMAGE_QUALITY_GUARD_DEPLOYMENT_GUIDE.md#隔离联调入口)联调。
+
 主框架与 Driver 必须使用本次配套修改。Canvas 将 Camera 的 `image/jpeg` 输出连到 `image_quality_guard`。Core 签发运行票据后才会启动处理；Bundle 的无参 `start()` 仅为启动钩子，不订阅图像。未绑定 Core 准入会话或缺少票据的外部 start/stop 会失败。
 
 输入由画布提供，通常是 `/{namespace}/camera/color`，消息为 `sensor_msgs/msg/CompressedImage`，Camera 的 format 为 `jpeg`。namespace 来源为 `config.yaml.ros_namespace`，空值使用清理后的 hostname；不能写死为 robot。输出为 `{input_topic}/image_quality_guard`，消息为 `std_msgs/msg/String`。

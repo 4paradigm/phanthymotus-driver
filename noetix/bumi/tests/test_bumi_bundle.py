@@ -14,8 +14,11 @@ import sys
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 from urllib.request import Request, urlopen
 from uuid import uuid4
+
+import yaml
 
 
 BUMI = Path(__file__).resolve().parents[1]
@@ -89,15 +92,67 @@ class BundleTests(unittest.TestCase):
         return self.bundle.dispatch(self.guard.PREFIX, {"action": "start",
             "input_topic": "/robot/camera/color", "run_id": self.run_id})
 
-    def test_configured_bundle_registers_guard_without_boot_subscription(self):
+    def test_production_config_keeps_guard_out_of_marketplace_and_mcp_discovery(self):
+        manifest = yaml.safe_load((BUMI / "driver.yaml").read_text(encoding="utf-8"))
+        self.assertNotIn(self.guard.PREFIX, {card["name"] for card in manifest["cards"]})
+        config = yaml.safe_load((BUMI / "config.yaml").read_text(encoding="utf-8"))
+        guard_cfg = config["plugins"][self.guard.PREFIX]
+        self.assertIs(guard_cfg["enabled"], False)
+
+        # Exercise the production constructor with the default Guard config
+        # and with a persisted config from a build that enabled it.
+        for settings in (guard_cfg, {**guard_cfg, "enabled": True}):
+            with self.subTest(enabled=settings["enabled"]):
+                bundle = self.ns["BumiDeviceBundle"]({"plugins": {
+                    self.guard.PREFIX: settings}}, "robot", object(), None, None)
+                bundle._plugins.append(self.legacy)
+                url = self.server(bundle)
+                self.rpc(url, "initialize")
+                listed = self.rpc(url, "tools/list")["result"]["tools"]
+                self.assertEqual([tool["name"] for tool in listed], ["legacy_card"])
+                call = self.rpc(url, "tools/call", {"name": self.guard.PREFIX,
+                    "arguments": {"action": "start", "input_topic": "/robot/camera/color"}})
+                self.assertEqual(call["error"]["code"], -32601)
+                status = self.rpc(url, "motus.lifecycle.status", {"tool": self.guard.PREFIX})
+                self.assertEqual(status["result"]["code"], "UNKNOWN_LIFECYCLE_TOOL")
+
+    def test_test_entry_point_respects_disabled_guard_config(self):
         bundle = self.ns["BumiDeviceBundle"]({"plugins": {
-            "image_quality_guard": {"enabled": True}}}, "robot", object(), None, None)
+            self.guard.PREFIX: {"enabled": False}}}, "robot", object(), None, None,
+            allow_image_quality_guard_for_test=True)
+        self.assertEqual(bundle.get_all_tools(), [])
+
+    def test_compatible_core_can_discover_bind_start_and_stop_in_test_bundle(self):
+        tool = self.guard.PREFIX
+        with patch("image_quality_guard._runtime_factory", return_value=self.runtime) as factory:
+            bundle = self.ns["BumiDeviceBundle"]({"plugins": {
+                tool: {"enabled": True}}}, "robot", object(), None, None,
+                allow_image_quality_guard_for_test=True)
         self.addCleanup(bundle.stop_all)
-        tools = bundle.get_all_tools()
-        self.assertEqual([tool["name"] for tool in tools], ["image_quality_guard"])
-        self.assertEqual(tools[0]["x-lifecycle"]["schema"], "motus.lifecycle/1")
         bundle.start_all()
-        self.assertFalse(bundle._plugins[0].info()["resources_pending"])
+        factory.assert_not_called()
+        url = self.server(bundle)
+        tools = self.rpc(url, "tools/list")["result"]["tools"]
+        self.assertEqual([definition["name"] for definition in tools], [tool])
+        self.assertEqual(tools[0]["x-lifecycle"]["schema"], "motus.lifecycle/1")
+
+        actual = self.rpc(url, "motus.lifecycle.status", {"tool": tool})["result"]
+        self.assertFalse(actual["resources_pending"])
+        epoch = str(uuid4())
+        bound = self.rpc(url, "motus.lifecycle.bind", {"tool": tool,
+            "driver_boot_id": actual["driver_boot_id"], "expected_epoch": actual["admission_epoch"],
+            "proposed_epoch": epoch})["result"]
+        self.assertEqual(bound["admission_epoch"], epoch)
+        run_id = epoch + "." + str(uuid4())
+        started = self.rpc(url, "tools/call", {"name": tool, "arguments": {
+            "action": "start", "run_id": run_id, "input_topic": "/robot/camera/color"}})["result"]
+        self.assertEqual(json.loads(started["content"][0]["text"])["active_run_id"], run_id)
+        self.assertTrue(self.runtime.started)
+        stopped = self.rpc(url, "tools/call", {"name": tool, "arguments": {
+            "action": "stop", "run_id": run_id}})["result"]
+        self.assertEqual(json.loads(stopped["content"][0]["text"])["state"], "idle")
+        self.assertFalse(self.runtime.started)
+        self.assertEqual(self.runtime.closes, 1)
 
     def test_legacy_card_arguments_and_local_stop_stay_compatible(self):
         args = {"action": "start", "run_id": "legacy-business-value", "value": 4}
@@ -154,8 +209,8 @@ class BundleTests(unittest.TestCase):
         self.bundle.stop_all()
         self.assertEqual(self.runtime.closes, 1)
 
-    def server(self):
-        self.ns["_bundle"] = self.bundle
+    def server(self, bundle=None):
+        self.ns["_bundle"] = self.bundle if bundle is None else bundle
         server = ThreadingHTTPServer(("127.0.0.1", 0), self.ns["make_handler"]())
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
         thread.start()
@@ -204,6 +259,26 @@ class BundleTests(unittest.TestCase):
         denied = self.rpc(url, "tools/call", {"name": self.guard.PREFIX,
             "arguments": {"action": "shutdown"}})
         self.assertEqual(denied["error"]["code"], -32601)
+
+    def test_real_http_failed_stop_keeps_owner_until_same_ticket_retry(self):
+        self.assertEqual(self.start_guard()["state"], "running")
+        url = self.server()
+        target = {"tool": self.guard.PREFIX}
+        stop = {"name": self.guard.PREFIX, "arguments": {"action": "stop", "run_id": self.run_id}}
+
+        with patch.object(self.runtime, "close", side_effect=RuntimeError("temporary close failure")):
+            failed = self.rpc(url, "tools/call", stop)["result"]
+        self.assertEqual(json.loads(failed["content"][0]["text"])["code"], "CLEANUP_FAILED")
+        pending = self.rpc(url, "motus.lifecycle.status", target)["result"]
+        self.assertTrue(pending["resources_pending"])
+        self.assertEqual(pending["active_run_id"], self.run_id)
+
+        retried = self.rpc(url, "tools/call", stop)["result"]
+        self.assertEqual(json.loads(retried["content"][0]["text"])["state"], "idle")
+        status = self.rpc(url, "motus.lifecycle.status", target)["result"]
+        self.assertFalse(status["resources_pending"])
+        self.assertIsNone(status["active_run_id"])
+        self.assertEqual(self.runtime.closes, 1)
 
 
 if __name__ == "__main__":

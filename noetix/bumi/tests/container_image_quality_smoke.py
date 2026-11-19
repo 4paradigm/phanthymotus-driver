@@ -34,7 +34,8 @@ from main import BumiDeviceBundle
 def configured_bundle(executor):
     # No other plugin is enabled; no camera, SDK initialization or controller.
     return BumiDeviceBundle({"plugins": {"image_quality_guard": {"enabled": True}}},
-                            "iqg_container", executor, None, None)
+                            "iqg_container", executor, None, None,
+                            allow_image_quality_guard_for_test=True)
 
 
 def start_guard(bundle):

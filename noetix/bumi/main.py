@@ -119,7 +119,8 @@ def _disable_vendor_video_capture_service(cfg: dict) -> None:
     )
 
 class BumiDeviceBundle:
-    def __init__(self, cfg: dict, namespace: str, executor, high_ctrl, media_ctrl):
+    def __init__(self, cfg: dict, namespace: str, executor, high_ctrl, media_ctrl, *,
+                 allow_image_quality_guard_for_test: bool = False):
         self._plugins: list = []
         self._driver_boot_id = str(uuid4())
         plugins_cfg = cfg.get("plugins", {})
@@ -206,10 +207,13 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
-        if plugins_cfg.get("image_quality_guard", {}).get("enabled", False):
+        # Only isolated test entry points opt in until the matching Core ships.
+        # A config carried over from an earlier image must not advertise the Card.
+        guard_cfg = plugins_cfg.get("image_quality_guard", {})
+        if allow_image_quality_guard_for_test and guard_cfg.get("enabled") is True:
             from image_quality_guard import ImageQualityGuardPlugin
             self._plugins.append(ImageQualityGuardPlugin(
-                plugins_cfg["image_quality_guard"], namespace, executor,
+                guard_cfg, namespace, executor,
                 driver_boot_id=self._driver_boot_id))
             print("[bundle] ImageQualityGuardPlugin loaded")
 

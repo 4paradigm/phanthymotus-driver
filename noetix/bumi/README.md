@@ -11,16 +11,17 @@ Results are strict JSON in `std_msgs/msg/String` on
 renderer. Results include `run_id`, analysis-time `timestamp_ms`, metrics and
 confirmed/candidate reasons. No image pixels are stored in result messages.
 
-Bundle boot only registers the Card. Core must bind an admission epoch and
-issue the original run ticket for each start/stop. Old or missing tickets
-cannot stop the active run. Local exit uses the separate `shutdown()` method.
-The plugin config defaults to enabled, but no subscription is created until a
-valid explicit start with a connected input Topic.
+The production bundle keeps this Card disabled and out of discovery while the
+matching Core release is pending. The isolated test entry points enable it
+explicitly. In those tests, bundle boot registers the Card with no subscription.
+Core binds an admission epoch, issues a ticket for each run, and uses that same
+ticket to stop it. Local exit uses the separate `shutdown()` method.
 
-See [ImageQualityGuard guide](IMAGE_QUALITY_GUARD_README.md) and
-[test report](IMAGE_QUALITY_GUARD_TEST_REPORT.md) for configuration, validation
-boundaries and hardware acceptance. Synthetic JPEG tests verify transport and
-analysis contracts; they do not replace Bumi camera and threshold calibration.
+Synthetic JPEG tests verify transport and analysis contracts. Bumi camera
+behavior and threshold calibration require hardware acceptance. See the
+[ImageQualityGuard guide](IMAGE_QUALITY_GUARD_README.md),
+[deployment guide](IMAGE_QUALITY_GUARD_DEPLOYMENT_GUIDE.md), and
+[test report](IMAGE_QUALITY_GUARD_TEST_REPORT.md).
 
 The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
 
