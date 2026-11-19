@@ -10,6 +10,6 @@ COPY common/__init__.py common/vendor_runtime.py common/logsafe.py /driver/commo
 COPY __init__.py main.py device.py model.py feedback.py battery.py chassis_battery_pb2.py config.yaml driver.yaml /driver/rokae/helios/
 COPY resource/ /driver/rokae/helios/resource/
 COPY deploy/ /deploy/
-ENV PYTHONPATH=/driver PYTHONUNBUFFERED=1 ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENV PYTHONPATH=/driver PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0 ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && python3 -c "import rclpy; from rokae.helios.battery import HeliosBattery; from rokae.helios.device import HeliosJoints"'
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && exec python3 -m rokae.helios.main"]
