@@ -1,6 +1,7 @@
 """
 sensors.py — Go1 状态/资源卡聚合（battery, imu, feet, fall_alarm, obstacle_range,
-             remote_controller, udp_diagnostics, loco_state, odometry, joints, model）。
+             remote_controller, udp_diagnostics, loco_state, odometry, joints,
+             motor_health, model）。
 
 自包含：一张合并文件 = 多张卡片。main.py 按 config.yaml 里的卡名手动 import 并 make_plugin()。
 每张卡保持独立的 CARD / Plugin / make_plugin，只是合并在同一文件。
@@ -770,6 +771,193 @@ class JointsPlugin:
 
 def make_joints(plugin_config, namespace, executor, client):
     return JointsPlugin(plugin_config, namespace, executor, client)
+
+
+# ============================================================================
+# motor_health.py — Go1 电机温度健康卡（可连接 Agent Core 的 data/json）
+# ============================================================================
+
+_CARD_MOTOR_HEALTH = "motor_health"
+_TOPIC_MOTOR_HEALTH = "/{ns}/state/motor_health"
+_NODE_MOTOR_HEALTH = "go1_motor_health"
+_DESC_MOTOR_HEALTH = (
+    "Go1 12 leg-motor thermal health — machine-readable temperatures, "
+    "hottest joint and configurable warning/critical classification"
+)
+_DEFAULT_MOTOR_HEALTH_HZ = 1.0
+_DEFAULT_WARNING_TEMPERATURE_C = 60.0
+_DEFAULT_CRITICAL_TEMPERATURE_C = 70.0
+
+
+def _motor_health_config(plugin_config: dict) -> tuple[float, float, float]:
+    """Validate the local operational thresholds used by the card.
+
+    These are project-configured guardrails, not manufacturer hardware limits.
+    Failing fast is preferable to silently running with an inverted threshold.
+    """
+    publish_hz = float(plugin_config.get("publish_hz", _DEFAULT_MOTOR_HEALTH_HZ))
+    warning_c = float(plugin_config.get(
+        "warning_temperature_c", _DEFAULT_WARNING_TEMPERATURE_C))
+    critical_c = float(plugin_config.get(
+        "critical_temperature_c", _DEFAULT_CRITICAL_TEMPERATURE_C))
+    values = (publish_hz, warning_c, critical_c)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("motor_health configuration values must be finite")
+    if not 0.1 <= publish_hz <= 20.0:
+        raise ValueError("motor_health publish_hz must be within [0.1, 20]")
+    if warning_c <= 0.0 or critical_c <= warning_c:
+        raise ValueError(
+            "motor_health temperatures require 0 < warning_temperature_c "
+            "< critical_temperature_c")
+    return publish_hz, warning_c, critical_c
+
+
+def _build_motor_health(snap: dict, warning_c: float, critical_c: float) -> dict:
+    fresh = bool(snap.get("fresh", False))
+    data = {
+        "timestamp_ms": int(time.time() * 1000),
+        "control_level": snap.get("control_level", "HIGHLEVEL"),
+        "fresh": fresh,
+        "available": False,
+        "telemetry_valid": False,
+        "status": "unavailable",
+        "thresholds_c": {"warning": warning_c, "critical": critical_c},
+    }
+    raw_joints = snap.get("joints")
+    if not isinstance(raw_joints, (list, tuple)) or not raw_joints:
+        data["reason"] = "joint_data_missing"
+        return data
+
+    readings = []
+    invalid_joints = []
+    for position, joint in enumerate(list(raw_joints)[:12]):
+        index = int(joint.get("i", position))
+        name = JOINT_NAMES[index] if 0 <= index < len(JOINT_NAMES) else f"joint_{index}"
+        try:
+            temperature_c = float(joint.get("temp", 0))
+        except (TypeError, ValueError):
+            temperature_c = 0.0
+        valid = math.isfinite(temperature_c) and temperature_c > 0.0
+        if not valid:
+            invalid_joints.append(name)
+            level = "unavailable"
+        elif temperature_c >= critical_c:
+            level = "critical"
+        elif temperature_c >= warning_c:
+            level = "warning"
+        else:
+            level = "ok"
+        readings.append({
+            "index": index,
+            "name": name,
+            "temperature_c": round(temperature_c, 1),
+            "status": level,
+        })
+
+    valid_readings = [item for item in readings if item["status"] != "unavailable"]
+    data.update({
+        "available": True,
+        "joint_count": len(readings),
+        "invalid_joints": invalid_joints,
+        "joints": readings,
+    })
+    if not fresh:
+        data["reason"] = "stale_snapshot"
+        return data
+    if not valid_readings:
+        data["reason"] = "zero_filled_joint_temperatures"
+        return data
+
+    hottest = max(valid_readings, key=lambda item: item["temperature_c"])
+    valid_temperatures = [item["temperature_c"] for item in valid_readings]
+    warning_joints = [item for item in valid_readings if item["status"] == "warning"]
+    critical_joints = [item for item in valid_readings if item["status"] == "critical"]
+    complete = len(readings) == 12 and not invalid_joints
+    if critical_joints:
+        status = "critical"
+        recommendation = "stop_and_cool_down"
+    elif warning_joints or not complete:
+        status = "warning"
+        recommendation = "cool_down_and_recheck" if warning_joints else "check_missing_telemetry"
+    else:
+        status = "ok"
+        recommendation = "continue_monitoring"
+
+    data.update({
+        "telemetry_valid": complete,
+        "status": status,
+        "max_temperature_c": hottest["temperature_c"],
+        "min_temperature_c": min(valid_temperatures),
+        "mean_temperature_c": round(sum(valid_temperatures) / len(valid_temperatures), 1),
+        "hottest_joint": hottest["name"],
+        "warning_joints": warning_joints,
+        "critical_joints": critical_joints,
+        "recommendation": recommendation,
+    })
+    return data
+
+
+class MotorHealthPlugin:
+    def __init__(self, plugin_config, namespace, executor, client):
+        self._client = client
+        self._topic = _TOPIC_MOTOR_HEALTH.format(ns=namespace)
+        self._publish_hz, self._warning_c, self._critical_c = _motor_health_config(plugin_config)
+        self._node = None
+        if _HAS_ROS2 and executor is not None:
+            try:
+                self._node = Node(_NODE_MOTOR_HEALTH)
+                self._pub = self._node.create_publisher(String, self._topic, _QOS)
+                self._node.create_timer(1.0 / self._publish_hz, self._tick)
+                executor.add_node(self._node)
+                self._node.get_logger().info(
+                    f"go1 motor health → {self._topic} @ {self._publish_hz}Hz")
+            except Exception as e:  # noqa: BLE001
+                print(f"[{_CARD_MOTOR_HEALTH}] ROS2 发布不可用，退回 MCP 轮询: {e}", flush=True)
+                self._node = None
+
+    def _payload(self):
+        return _build_motor_health(
+            self._client.snapshot(), self._warning_c, self._critical_c)
+
+    def _tick(self):
+        try:
+            message = String()
+            message.data = json.dumps(self._payload())
+            self._pub.publish(message)
+        except Exception as e:  # noqa: BLE001
+            self._node.get_logger().error(f"publish {self._topic} error: {e}")
+
+    def get_tool(self):
+        desc = _DESC_MOTOR_HEALTH + (
+            f" — → {self._topic}" if self._node else " — poll via MCP action=info")
+        return {
+            "name": _CARD_MOTOR_HEALTH,
+            "type": "sensor",
+            "multiInstance": False,
+            "description": desc,
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": ([{"topic": self._topic, "format": "data/json"}]
+                          if self._node else []),
+        }
+
+    def start(self): pass
+    def stop(self): pass
+
+    def dispatch(self, action, args):
+        if action == "start": return {"state": "running"}
+        if action == "stop": return {"state": "idle"}
+        if action in ("info", "read", "get", _CARD_MOTOR_HEALTH):
+            return {
+                "state": "running",
+                "data": self._payload(),
+                "topic_out": ([{"topic": self._topic, "format": "data/json"}]
+                              if self._node else []),
+            }
+        return None
+
+
+def make_motor_health(plugin_config, namespace, executor, client):
+    return MotorHealthPlugin(plugin_config, namespace, executor, client)
 
 
 # ============================================================================

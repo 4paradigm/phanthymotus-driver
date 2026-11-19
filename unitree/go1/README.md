@@ -2,8 +2,8 @@
 
 > 一张"卡片" = Driver 暴露的一个 MCP 工具 = 平台画布上一个可拖拽、可被大模型单独调用的能力。
 >
-> 本 bundle 当前发布 **24 张卡**：11 张传感卡（sensor）+ 9 张控制卡（actuator）+ 1 张资源卡（resource）+ 3 张独立视觉卡。
-> **4 个聚合文件**：`sensors.py`（11 张）/ `controllers.py`（5 张）/ `ext_devices.py`（4 张）/ `camera.py`（RGB/depth/pointcloud 三张卡），每张卡仍然是自包含的类 + 工厂函数，方便按组评审、多人并行不撞车。
+> 本 bundle 当前实现 **25 张卡**。
+> **4 个聚合文件**：`sensors.py`（13 张状态/资源卡）/ `controllers.py`（5 张控制卡）/ `ext_devices.py`（4 张外部设备卡）/ `camera.py`（RGB/depth/pointcloud 三张卡），每张卡仍然是自包含的类 + 工厂函数，方便按组评审、多人并行不撞车。
 > 目的有二：① 把这些卡干净地上架；② 作为后来者新增其它卡片的开发起点 —— 怎么加卡见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 实现基座
@@ -28,6 +28,7 @@
 | `obstacle_range` | 超声波避障 | `/{ns}/state/obstacle_range`：range_raw[4]（仅 HIGHLEVEL；方向/单位官方未定义，原样输出） |
 | `udp_diagnostics` | UDP 通信健康 | `/{ns}/state/udp_diagnostics`：收发计数 + CRC/丢包/标志错误计数 |
 | `joints` | 12 腿关节 | `/{ns}/state/joints`：q/dq/tau/temp（骨架渲染，需 `model` 卡提供 URDF） |
+| `motor_health` | 电机温度健康 | `/{ns}/state/motor_health`：12 关节温度、最热关节及可配置 warning/critical 状态（`data/json`，可连接 Agent Core） |
 | `remote_controller` | 无线遥控器 | `/{ns}/state/remote_controller`：16 按键 + 5 摇杆轴（`HighState.wirelessRemote[40]`） |
 | `activity_monitor` | 活动度统计 | `/{ns}/state/activity`：后台采样速度/模式，action=report 返回 last_30s + since_start（距离/运动占比/平均速度/峰值/当前模式） |
 | `camera_rgb` | RGB 去畸变图像（5 机位·multiInstance） | `start` 才连对应 Nano → CompressedImage；`stop` 断开释放相机 |
@@ -80,7 +81,7 @@ Nano 板 (.13/.14/.15)              Pi 驱动容器 (.161)
 
 > **新增一张卡**：若属于传感类，在 `sensors.py` 末尾追加 `Plugin` + `make_<卡名>`；
 > 控制类加到 `controllers.py`；外部设备加到 `ext_devices.py`。
-> 然后在 `config.yaml` 打开它。不用改 `main.py`。
+> 然后在 `config.yaml` 打开它，并在 `main.py` 的 `Go1Bundle.__init__` 中装配工厂函数。
 
 ## 接口约定（与平台其它驱动一致）
 
@@ -97,10 +98,10 @@ go1_bundle/
 ├── main.py                 # MCP server 入口 + 按 config 卡名自动装配（HIGHLEVEL）
 ├── go1_sdk_client.py       # 共享 raw SDK client（已由 sdk_proxy.py 子进程承接）
 ├── sdk_proxy.py            # SDK 子进程代理：隔离 robot_interface 避免 GIL 冲突
-│   ── 聚合卡文件（sensors.py = 12 张）──
+│   ── 聚合卡文件（sensors.py = 13 张）──
 ├── sensors.py              # 状态卡合集：battery/imu/feet/fall_alarm/obstacle_range/
 │                           #   remote_controller/udp_diagnostics/loco_state/odometry/joints/
-│                           #   activity_monitor/model
+│                           #   motor_health/activity_monitor/model
 │   ── 聚合卡文件（controllers.py = 5 张）──
 ├── controllers.py          # 运动控制合集：loco/body_pose/switch_gait/gesture/special_motion
 │   ── 聚合卡文件（ext_devices.py = 4 张）──
