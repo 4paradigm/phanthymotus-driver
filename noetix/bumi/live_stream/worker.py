@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 
-from .transport import FLVFramer, RTMPPublisher, RTMPTransportError
+from .transport import FLVFramer, IsolatedRTMPPublisher, RTMPTransportError
 
 
 class AudioBuffer:
@@ -56,7 +56,10 @@ ERROR_MESSAGES = {
     "LIBRTMP_UNAVAILABLE": "机器人缺少 librtmp1 运行库",
     "RTMP_CONNECT_FAILED": "虎牙服务器连接失败，请检查网络和推流地址",
     "RTMP_PUBLISH_REJECTED": "虎牙拒绝推流，请更新推流地址",
-    "RTMP_WRITE_FAILED": "向虎牙上传直播数据失败",
+    "RTMP_WRITE_FAILED": "上传直播数据失败",
+    "RTMP_CONNECT_TIMEOUT": "直播服务器连接超时",
+    "RTMP_WRITE_TIMEOUT": "推流发送超时",
+    "RTMP_CANCELLED": "推流已取消",
 }
 
 
@@ -65,7 +68,7 @@ class LiveStreamWorker:
 
     def __init__(self, camera, audio: AudioBuffer, fps: int = 15,
                  bitrate_kbps: int = 1200, popen=subprocess.Popen,
-                 publisher_factory=RTMPPublisher):
+                 publisher_factory=IsolatedRTMPPublisher):
         self.camera = camera
         self.audio = audio
         self.fps = max(1, min(15, int(fps)))
@@ -76,6 +79,7 @@ class LiveStreamWorker:
         self._cancel = threading.Event()
         self._thread = None
         self._process = None
+        self._publisher = None
         self._status = "idle"
         self._error = ""
         self._start_time = 0.0
@@ -123,7 +127,9 @@ class LiveStreamWorker:
     def stop(self) -> dict:
         with self._lock:
             self._cancel.set()
-            proc, thread = self._process, self._thread
+            proc, thread, publisher = self._process, self._thread, self._publisher
+        if publisher is not None and hasattr(publisher, "abort"):
+            publisher.abort()
         if proc is not None and proc.poll() is None:
             proc.terminate()
         if thread is not None and thread is not threading.current_thread():
@@ -164,7 +170,15 @@ class LiveStreamWorker:
         try:
             # RTMP credentials are only passed to the in-process library.
             publisher = self._publisher_factory(url)
+            with self._lock:
+                self._publisher = publisher
+            if cancel.is_set():
+                return
             publisher.connect()
+            if cancel.is_set():
+                return
+            # Discard microphone samples captured during the RTMP handshake.
+            self.audio.clear()
             audio_r, audio_fd = os.pipe()
             cmd = [
                 "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
@@ -193,18 +207,31 @@ class LiveStreamWorker:
 
             def video() -> None:
                 sequence = None
+                last_jpeg = None
+                last_fresh = time.monotonic()
                 next_tick = time.monotonic()
                 try:
                     while not cancel.is_set():
                         if cancel.wait(max(0, next_tick - time.monotonic())):
                             return
-                        frame, sequence = self.camera.wait_for_color_frame(
-                            after_sequence=sequence, timeout_s=1.5)
-                        if not frame or not frame.get("data"):
+                        # Input frames are irregular; FFmpeg assumes fixed FPS.
+                        # Duplicate the latest frame on a missed capture tick so
+                        # its timestamp tracks wall time and audio sample time.
+                        try:
+                            frame, new_sequence = self.camera.wait_for_color_frame(
+                                after_sequence=sequence, timeout_s=0.03)
+                            if frame and frame.get("data"):
+                                sequence = new_sequence
+                                last_jpeg = frame["data"]
+                                last_fresh = time.monotonic()
+                        except TimeoutError:
+                            pass
+                        if time.monotonic() - last_fresh > 2.0:
                             raise TimeoutError
-                        self._write(proc.stdin.fileno(), frame["data"], cancel)
-                        with self._lock:
-                            self._frames += 1
+                        if last_jpeg is not None:
+                            self._write(proc.stdin.fileno(), last_jpeg, cancel)
+                            with self._lock:
+                                self._frames += 1
                         next_tick = max(next_tick + 1 / self.fps, time.monotonic())
                 except (OSError, TimeoutError, RuntimeError, ValueError):
                     failure.put("VIDEO_PIPE_FAILED")
@@ -284,6 +311,7 @@ class LiveStreamWorker:
                     pass
             with self._lock:
                 self._process = None
+                self._publisher = None
                 if self._status != "idle":
                     self._status = "error" if error_code else "idle"
                     self._error = error_code

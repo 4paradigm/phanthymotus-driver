@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from live_stream.config import HuyaCredentialStore, validate_huya_url
+from live_stream.config import HuyaCredentialStore, validate_huya_url, validate_stream_url
 
 URL = ("rtmp://tx.direct.huya.com/huyalive/111-222-A-333"
        "?seq=12345&type=simple")
@@ -27,6 +27,36 @@ URL = ("rtmp://tx.direct.huya.com/huyalive/111-222-A-333"
 def test_rejects_non_huya_and_bad_urls(url):
     with pytest.raises(ValueError):
         validate_huya_url(url)
+
+
+XHS_URL = "rtmp://live-push.xhscdn.com/live/123456789?txSecret=example&txTime=ffffffff"
+
+
+def test_xiaohongshu_server_and_stream_key_form_full_url():
+    server = "rtmp://live-push.xhscdn.com/live"
+    stream_key = "123456789?txSecret=example&txTime=ffffffff"
+    platform, url = validate_stream_url(server + "/" + stream_key)
+    assert platform == "xiaohongshu"
+    assert url == XHS_URL
+
+
+@pytest.mark.parametrize("url", [
+    "rtmp://fake-live-push.xhscdn.com/live/id?txSecret=x&txTime=y",
+    "rtmp://live-push.xhscdn.com.evil.com/live/id?txSecret=x&txTime=y",
+    "rtmp://live-push.xhscdn.com/live/id?txSecret=x",
+    "rtmp://live-push.xhscdn.com/live/id?txSecret=&txTime=y",
+    "rtmp://live-push.xhscdn.com:5555/live/id?txSecret=x&txTime=y",
+    "file:///live/id?txSecret=x&txTime=y",
+])
+def test_rejects_invalid_or_impostor_xiaohongshu_urls(url):
+    with pytest.raises(ValueError):
+        validate_stream_url(url)
+
+
+def test_xiaohongshu_store_is_private_and_restored(tmp_path):
+    store = HuyaCredentialStore(tmp_path / "private" / "rtmp")
+    store.save(XHS_URL)
+    assert store.read() == XHS_URL
 
 
 def test_accepts_valid_huya_url():

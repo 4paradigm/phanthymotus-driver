@@ -50,6 +50,34 @@ def test_worker_preflight_and_idempotent_stop():
     assert worker.stop()["state"] == "idle"
 
 
+def test_stop_interrupts_publisher_stuck_in_connect():
+    audio = AudioBuffer()
+    audio.push(b"\x00\x00", "audio/pcm-16k")
+    entered, released = threading.Event(), threading.Event()
+
+    class BlockingPublisher:
+        def __init__(self, url):
+            pass
+
+        def connect(self):
+            entered.set()
+            released.wait(timeout=15)
+
+        def abort(self):
+            released.set()
+
+        def close(self):
+            pass
+
+    worker = LiveStreamWorker(Camera(), audio, publisher_factory=BlockingPublisher)
+    assert worker.start("rtmp://example.com/test")["state"] == "starting"
+    assert entered.wait(timeout=2)
+    started = time.monotonic()
+    assert worker.stop()["state"] == "idle"
+    assert time.monotonic() - started < 2.5
+    assert released.is_set()
+
+
 def test_encoder_command_uses_one_mjpeg_and_one_pcm_input():
     audio = AudioBuffer()
     audio.push(b"\x00\x00", "audio/pcm-16k")
@@ -144,6 +172,41 @@ def test_video_writer_failure_is_error_not_normal_idle(monkeypatch):
     assert publishers[0].closed
     assert spawned[0].poll() is not None
     assert worker.stop()["state"] == "idle"
+
+def test_irregular_camera_frames_are_duplicated_to_keep_wall_clock(monkeypatch):
+    import live_stream.worker as module
+    monkeypatch.setattr(module.select, "select",
+                        lambda readable, writable, errors, timeout: ([], writable, []))
+
+    class SparseCamera(Camera):
+        def __init__(self):
+            super().__init__()
+            self.samples = 0
+
+        def wait_for_color_frame(self, **kwargs):
+            self.samples += 1
+            if self.samples == 1:
+                return {"data": b"\xff\xd8\xff\xd9"}, 1
+            raise TimeoutError
+
+    def spawn(cmd, **options):
+        return subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    audio = AudioBuffer()
+    audio.push(b"\x00\x00", "pcm_16k_16bit_mono")
+    camera = SparseCamera()
+    worker = LiveStreamWorker(camera, audio, popen=spawn,
+                              publisher_factory=FakePublisher)
+    assert worker.start("rtmp://example.com/test")["state"] == "starting"
+    time.sleep(0.6)
+    status = worker.info()
+    assert status["video_frames"] >= 4
+    assert camera.samples >= 4
+    assert status["error_code"] is None
+    assert worker.stop()["state"] == "idle"
+
 
 def test_audio_writer_failure_is_error_not_idle(monkeypatch):
     import queue

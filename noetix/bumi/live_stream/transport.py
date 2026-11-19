@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import multiprocessing
+import threading
+import time
 
 
 class RTMPTransportError(RuntimeError):
@@ -125,3 +128,122 @@ class RTMPPublisher:
                 self._lib.RTMP_Close(handle)
             finally:
                 self._lib.RTMP_Free(handle)
+
+
+def _isolated_publish_loop(conn) -> None:
+    """Keep blocking native librtmp calls in a killable child process."""
+    publisher = None
+    try:
+        operation, value = conn.recv()
+        if operation != "connect":
+            return
+        publisher = RTMPPublisher(value)
+        publisher.connect()
+        conn.send(("ready", None))
+        while True:
+            operation, value = conn.recv()
+            if operation == "close":
+                break
+            if operation != "send":
+                raise RTMPTransportError("RTMP_PROTOCOL_ERROR")
+            publisher.send(value)
+            conn.send(("sent", None))
+    except EOFError:
+        pass
+    except RTMPTransportError as error:
+        try:
+            conn.send(("error", str(error)))
+        except (OSError, EOFError, BrokenPipeError):
+            pass
+    except (OSError, RuntimeError, ValueError):
+        try:
+            conn.send(("error", "RTMP_WRITE_FAILED"))
+        except (OSError, EOFError, BrokenPipeError):
+            pass
+    finally:
+        if publisher is not None:
+            try:
+                publisher.close()
+            except OSError:
+                pass
+        conn.close()
+
+
+class IsolatedRTMPPublisher:
+    """Bound native connect/write in a subprocess without putting URLs in argv."""
+
+    CONNECT_TIMEOUT = 12.0
+    SEND_TIMEOUT = 4.0
+
+    def __init__(self, url: str):
+        self._url = url
+        self._ctx = multiprocessing.get_context("spawn")
+        self._conn = None
+        self._process = None
+        self._aborted = threading.Event()
+
+    def _exchange(self, operation: str, value: object, timeout: float) -> None:
+        if self._conn is None or self._aborted.is_set():
+            raise RTMPTransportError("RTMP_CANCELLED")
+        try:
+            self._conn.send((operation, value))
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if self._aborted.is_set():
+                    raise RTMPTransportError("RTMP_CANCELLED")
+                if self._conn.poll(0.1):
+                    status, detail = self._conn.recv()
+                    if status == "error":
+                        raise RTMPTransportError(str(detail))
+                    if status not in ("ready", "sent"):
+                        raise RTMPTransportError("RTMP_PROTOCOL_ERROR")
+                    return
+                if self._process is None or not self._process.is_alive():
+                    raise RTMPTransportError("RTMP_PROCESS_EXITED")
+        except (OSError, EOFError, BrokenPipeError, ValueError):
+            raise RTMPTransportError("RTMP_PROCESS_EXITED") from None
+        self.abort()
+        raise RTMPTransportError(
+            "RTMP_CONNECT_TIMEOUT" if operation == "connect" else "RTMP_WRITE_TIMEOUT"
+        )
+
+    def connect(self) -> None:
+        parent, child = self._ctx.Pipe(duplex=True)
+        self._conn = parent
+        self._process = self._ctx.Process(
+            target=_isolated_publish_loop, args=(child,), daemon=True
+        )
+        try:
+            self._process.start()
+        finally:
+            child.close()
+        url, self._url = self._url, None
+        self._exchange("connect", url, self.CONNECT_TIMEOUT)
+
+    def send(self, record: bytes) -> None:
+        self._exchange("send", record, self.SEND_TIMEOUT)
+
+    def abort(self) -> None:
+        """Interrupt an in-flight native call without waiting for its return."""
+        self._aborted.set()
+        proc = self._process
+        if proc is not None:
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=0.8)
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join(timeout=0.5)
+            except (OSError, ValueError, AssertionError):
+                pass
+
+    def close(self) -> None:
+        self.abort()
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        self._url = None

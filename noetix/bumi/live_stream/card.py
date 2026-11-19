@@ -1,9 +1,10 @@
-"""Huya-only actuator Card: explicit go_live/end_live, no automatic streaming."""
+"""Supervised Bumi live-stream Card for approved RTMP destinations."""
 from __future__ import annotations
 
 import threading
+import time
 
-from .config import HuyaCredentialStore, validate_huya_url
+from .config import HuyaCredentialStore, validate_stream_url
 from .worker import AudioBuffer, LiveStreamWorker
 
 
@@ -12,7 +13,7 @@ def attach_audio_subscription(executor, namespace: str, audio: AudioBuffer):
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
-    node = Node("bumi_huya_live_audio")
+    node = Node("bumi_live_stream_audio")
     qos = QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
         history=HistoryPolicy.KEEP_LAST,
@@ -32,11 +33,16 @@ class LiveStreamPlugin:
     PREFIX = "live_stream"
 
     def __init__(self, cfg: dict, namespace: str, executor, camera,
-                 *, store=None, audio=None, worker=None):
+                 *, store=None, audio=None, worker=None, clock=None):
         self._lock = threading.RLock()
         self._store = store if store is not None else HuyaCredentialStore(
             cfg.get("credential_path", "/opt/phanthy-motus/data/live_stream/huya-rtmp-url"))
         self._url = self._store.read()
+        self._platform = validate_stream_url(self._url)[0] if self._url else None
+        self._clock = clock if clock is not None else time.monotonic
+        # Save from the Canvas gear authorizes one start for five minutes.
+        # Merely restoring a persisted URL on startup never arms a broadcast.
+        self._armed_until = 0.0
         self._audio = audio if audio is not None else AudioBuffer()
         self._worker = worker if worker is not None else LiveStreamWorker(
             camera, self._audio, fps=cfg.get("fps", 15),
@@ -51,21 +57,21 @@ class LiveStreamPlugin:
             "type": "actuator",
             "multiInstance": False,
             "description": (
-                "虎牙直播：将 Bumi 的摄像头画面及麦克风声音直播到虎牙。"
-                "首次使用：虎牙主播中心→普通/VR远程推流→复制完整地址；"
-                "点击本卡片配置齿轮填写保存；执行 go_live 开播、end_live 停播。"
-                "启动智能控制不会自动公开直播。仅支持虎牙。"
+                "Bumi 直播：支持虎牙和小红书授权 RTMP 地址。"
+                "小红书三方推流页面复制服务器及推流码，本地拼接为完整 URL；"
+                "在齿轮中填写新推流地址并保存，即授权本场 go_live。"
+                "start 不会公开直播，end_live 结束推流。"
             ),
             "configSchema": {
                 "type": "object",
                 "properties": {
                     "rtmp_url": {
                         "type": "string",
-                        "title": "虎牙 RTMP 完整推流地址",
+                        "title": "RTMP 完整推流地址（含推流码）",
                         "description": (
-                            "在虎牙主播中心→普通/VR远程推流→普通直播，"
-                            "点击复制完整推流地址后粘贴。"
-                            "地址包含密钥，勿发送给他人。刷新地址后需重新保存。"
+                            "小红书：将服务器地址末尾加 / 再拼接推流码；"
+                            "虎牙：直接复制完整 RTMP 地址。"
+                            "含敏感密钥，仅在本机齿轮填写，勿发送到聊天。"
                         ),
                         "format": "password",
                         "x-sensitive": True,
@@ -80,7 +86,7 @@ class LiveStreamPlugin:
                     "action": {
                         "type": "string",
                         "enum": ["start", "stop", "info", "go_live", "end_live", "config"],
-                        "description": "虎牙直播控制操作",
+                        "description": "受控直播操作",
                     },
                 },
                 "required": ["action"],
@@ -93,8 +99,8 @@ class LiveStreamPlugin:
                     "start": {"params": [], "description": "初始化 Card，不开播"},
                     "stop": {"params": [], "description": "画布停止时关闭直播"},
                     "info": {"params": [], "description": "查询直播连接状态"},
-                    "go_live": {"params": [], "description": "公开开播：推送 Bumi 摄像头和麦克风"},
-                    "end_live": {"params": [], "description": "结束虎牙直播"},
+                    "go_live": {"params": [], "description": "本场新地址保存后五分钟内允许一次开播"},
+                    "end_live": {"params": [], "description": "结束直播"},
                 },
             },
         }
@@ -126,18 +132,18 @@ class LiveStreamPlugin:
         if action == "end_live":
             return self._worker.stop()
         if action == "info":
-            return {"platform": "huya", "configured": bool(self._url),
+            return {"platform": self._platform or "none", "configured": bool(self._url),
                     **self._worker.info()}
         if action == "config":
             value = args.get("rtmp_url")
             if not isinstance(value, str) or not value.strip():
                 return {"ok": False, "error_code": "MISSING_URL",
-                        "message": "请点击卡片齿轮填写虎牙完整 RTMP 推流地址"}
+                        "message": "请在卡片齿轮填写完整 RTMP 地址"}
             try:
-                url = validate_huya_url(value)
+                platform, url = validate_stream_url(value)
             except ValueError:
-                return {"ok": False, "error_code": "INVALID_HUYA_URL",
-                        "message": "仅支持虎牙远程推流地址，请重新复制"}
+                return {"ok": False, "error_code": "INVALID_STREAM_URL",
+                        "message": "仅支持已验证的虎牙或小红书官方 RTMP 地址"}
             with self._lock:
                 if self._worker.info()["state"] in ("starting", "streaming", "stopping"):
                     return {"ok": False, "error_code": "STREAM_ACTIVE",
@@ -147,13 +153,24 @@ class LiveStreamPlugin:
                 except OSError:
                     return {"ok": False, "error_code": "CONFIG_SAVE_FAILED",
                             "message": "无法安全保存推流地址，请检查机器人数据目录权限"}
+                # Replaying the same saved configuration on reconnect does not
+                # grant fresh authority to capture and publish camera/microphone.
+                if url != self._url:
+                    self._armed_until = self._clock() + 300.0
                 self._url = url
+                self._platform = platform
             return {"ok": True, "state": "ready", "configured": True,
-                    "message": "推流地址已保存，使用 go_live 开始虎牙直播"}
+                    "message": "推流地址已保存；新地址五分钟内可直接执行 go_live"}
         if action == "go_live":
             with self._lock:
                 if not self._url:
                     return {"ok": False, "error_code": "MISSING_URL",
-                            "message": "请先在卡片齿轮填写并保存虎牙 RTMP 推流地址"}
-                return self._worker.start(self._url)
+                            "message": "请先在卡片齿轮填写并保存完整 RTMP 地址"}
+                if self._clock() >= self._armed_until:
+                    return {"ok": False, "error_code": "APPROVAL_REQUIRED",
+                            "message": "请在卡片齿轮重新填写本场新推流地址并保存"}
+                result = self._worker.start(self._url)
+                if result.get("state") in ("starting", "streaming"):
+                    self._armed_until = 0.0  # Consume only after successful preflight.
+                return result
         return {"ok": False, "error_code": "UNKNOWN_ACTION"}

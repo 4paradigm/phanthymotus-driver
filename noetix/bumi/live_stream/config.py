@@ -1,4 +1,4 @@
-"""Huya-only URL validation and protected, atomic local credential storage."""
+"""Allowlisted streaming URLs and protected, atomic credential storage."""
 from __future__ import annotations
 
 import os
@@ -6,9 +6,10 @@ import secrets
 import stat
 import tempfile
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 MAX_URL = 4096
+XIAOHONGSHU_PUSH_HOST = "live-push.xhscdn.com"
 
 
 def validate_huya_url(value: object) -> str:
@@ -31,6 +32,36 @@ def validate_huya_url(value: object) -> str:
     except ValueError:
         raise ValueError("仅支持虎牙官方远程推流完整地址") from None
     return value
+
+
+def validate_stream_url(value: object) -> tuple[str, str]:
+    """Identify supported RTMP destinations without allowing arbitrary hosts."""
+    if not isinstance(value, str):
+        raise ValueError("需要完整 RTMP 推流地址")
+    url = value.strip()
+    if not url or len(url) > MAX_URL or any(ord(c) < 32 for c in url):
+        raise ValueError("无效的 RTMP 地址")
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        if (parts.scheme not in ("rtmp", "rtmps")
+                or parts.port not in (None, 1935, 443)
+                or parts.username or parts.password or parts.fragment):
+            raise ValueError
+        if host == XIAOHONGSHU_PUSH_HOST:
+            segments = parts.path.split("/")
+            params = parse_qs(parts.query, keep_blank_values=True, strict_parsing=True)
+            if (len(segments) != 3 or segments[:2] != ["", "live"]
+                    or not segments[2] or "/" in segments[2]
+                    or not params.get("txSecret", [""])[0]
+                    or not params.get("txTime", [""])[0]):
+                raise ValueError
+            return "xiaohongshu", url
+        if host == "tx.direct.huya.com" or host.endswith(".direct.huya.com"):
+            return "huya", validate_huya_url(url)
+    except ValueError:
+        pass
+    raise ValueError("只允许已验证的小红书或虎牙官方推流地址") from None
 
 
 class HuyaCredentialStore:
@@ -63,7 +94,7 @@ class HuyaCredentialStore:
             try:
                 if self.path.is_symlink():
                     return None
-                return validate_huya_url(self.path.read_text(encoding="utf-8"))
+                return validate_stream_url(self.path.read_text(encoding="utf-8"))[1]
             except (OSError, ValueError, UnicodeError):
                 return None
         try:
@@ -76,7 +107,7 @@ class HuyaCredentialStore:
                 meta = os.fstat(fd)
                 if not stat.S_ISREG(meta.st_mode) or meta.st_size > MAX_URL + 16 or meta.st_mode & 0o077:
                     return None
-                return validate_huya_url(os.read(fd, MAX_URL + 16).decode("utf-8"))
+                return validate_stream_url(os.read(fd, MAX_URL + 16).decode("utf-8"))[1]
             finally:
                 os.close(fd)
         except (OSError, UnicodeError, ValueError):
@@ -85,7 +116,7 @@ class HuyaCredentialStore:
             os.close(directory)
 
     def save(self, raw: object) -> None:
-        url = validate_huya_url(raw)
+        url = validate_stream_url(raw)[1]
         if os.name == "nt":
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if self.path.is_symlink():
