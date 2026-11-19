@@ -69,7 +69,9 @@ the destination. FCI runs locally between PNP and the Franka controllers.
 
 ## Initialize from the canvas
 
-Fill in the workstation IP, SSH username, initial SSH password. The installer discovers the vendor tree
+Fill in **PNP Host Username** and **PNP Host Password**. When the card loads,
+the driver checks the wired IPv4 configuration, discovers the PNP workstation,
+and starts initialization automatically. The installer discovers the vendor tree
 and Polymetis Conda base on the remote host. Loading the card always starts an asynchronous install. `status` returns `initialization.state`
 and the current stage. It checks the package version, installs the image's
 support sources, configures the service and limited sudo rule, authorizes a
@@ -90,27 +92,25 @@ same password. Initialization requires the PNP vendor runtime already installed.
 
 ## Wired discovery and slave IP configuration
 
-Leave PNP host IP empty for automatic discovery. Orin sends ARP requests on
+PNP host discovery is automatic. Orin sends ARP requests on
 active wired interfaces within the /24 networks derived from the slave IPs.
 It excludes its own addresses and both slave controllers, checks SSH, and
 verifies both known USB masters after login. A unique matching host is selected.
 Credentials are required for a new host. Discovery identifies USB connectivity;
 the masters do not stream joint telemetry over Ethernet before teleoperation.
-Multiple matches stop initialization and require an explicit PNP address.
+Multiple matches stop initialization. Connect only the intended PNP workstation
+to the robot network before retrying.
 
 Host networking, NET_RAW and NET_ADMIN are required for ARP discovery and
-per-candidate wired host routes. Configure distinct right and left slave IPs.
-The installer stores them in the PNP runtime and passes IP overrides to the
-vendor launchers. Original vendor configuration files are retained.
+per-candidate wired host routes. The installer stores distinct right and left
+slave IPs in the PNP runtime and passes them to the vendor launchers.
 
 
 During initialization, vendor right/left IP assignments are read from each
 robot_client configuration and cross-checked against its gripper configuration.
-Resolved IPs and their sources are returned by `status`; refreshed schemas show
-these as editable defaults. Missing or ambiguous assignments retain the current
-values and produce a warning. Disable "Read slave IPs from PNP" to apply manual
-IP edits. Updating schema defaults does not force an open canvas form to discard
-its saved values; consult the resolved slave_ips in the initialization result.
+Use `status` to see the resolved IPs and their sources. Missing or ambiguous
+assignments retain the current values and produce a warning. Configure the
+controller addresses on the PNP workstation.
 
 
 ## Master USB identities

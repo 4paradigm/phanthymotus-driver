@@ -14,7 +14,9 @@ external RealSense cameras over USB. It registers with Agent Core as
 
 ## PNP teleoperation
 
-The FR3 driver exposes `teleop` with `Align`, `Follow`, `Stop`, and `Status`.
+The FR3 driver exposes `teleop` with `start_trajectory`, `stop_trajectory`,
+`stop_motion`, `list_trajectories`, `delete_trajectory`, and `status`.
+`start_trajectory` aligns the arms and automatically starts Follow.
 It starts the installed vendor scripts on the PNP workstation, including
 their startup movements. Both known USB masters may share one workstation.
 See [PNP deployment](deploy/pnp-remote/README.md).
