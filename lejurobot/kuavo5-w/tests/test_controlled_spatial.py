@@ -148,6 +148,8 @@ class Client:
             return {'success': True, 'stationary': True, 'software_estop': True}
         if operation == 'stationary':
             return {'success': True, 'stationary': getattr(self, 'stationary', True)}
+        if operation == 'map_save_status':
+            return {'complete': True, 'files': {'final': [2, 1]}}
         if operation == 'cancel':
             return {'success': True, 'stationary': True}
         return {'owner': '/leju_node'}
@@ -578,6 +580,79 @@ class SpatialTests(unittest.TestCase):
         self.assertTrue(self.client.feedback['agvState']['softwareEstop'])
         self.assertFalse(self.client.feedback['state']['agvPosition']['positionInitialized'])
         self.assertEqual(self.navigate()['state'], 'error')
+
+    def test_save_waits_for_factory_optimization_without_short_rpc_timeout(self):
+        self.call('start_mapping', map_name='new')
+        self.completed()
+        self.bundle.tracker.events.clear()
+        original = self.client.command
+        timeouts = []
+        def command(method, params, timeout):
+            if method == 'SaveCartoMap':
+                timeouts.append(timeout)
+            original(method, params, timeout)
+        self.client.command = command
+        self.call('stop_mapping')
+        self.assertEqual(self.completed()[0], 'completed')
+        self.assertGreaterEqual(timeouts[0], 1490)
+
+    def test_resume_save_waits_for_files_without_replaying_save_and_preserves_tags(self):
+        self.call('start_mapping', map_name='new')
+        self.completed()
+        self.call('tag_place', name='P1')
+        wait(lambda: not self.plugin._workers)
+        self.bundle.tracker.events.clear()
+        original = self.client.command
+        def lost_save(method, params, timeout):
+            original(method, params, timeout)
+            if method == 'SaveCartoMap':
+                raise TimeoutError('old_save_still_executing')
+        self.client.command = lost_save
+        self.call('stop_mapping')
+        self.assertEqual(self.completed()[0], 'error')
+        wait(lambda: not self.plugin._workers)
+        self.bundle.tracker.events.clear()
+        self.client.commands.clear()
+        self.client.command = original
+        # Production retains completed startup/music thread objects. These
+        # background workers must not prevent resuming an unrelated save.
+        background = threading.Thread(target=lambda: None, name='motion-music-start')
+        background.start()
+        background.join()
+        self.plugin._workers.add(background)
+        self.call('stop_mapping')
+        wait(lambda: bool(self.bundle.tracker.events), timeout=5)
+        self.assertEqual(self.completed()[0], 'completed')
+        self.assertFalse(any(m == 'SaveCartoMap' for m, _ in self.client.commands))
+        self.assertEqual(self.call('list_tags')['tags'][0]['name'], 'P1')
+        self.assertFalse(self.plugin.unresolved())
+
+    def test_save_recovery_does_not_restart_on_partial_grid_files(self):
+        self.plugin.store.state('mapping', {'name': 'new', 'token': 'x', 'phase': 'saving'})
+        self.plugin._map_pending = {'operation': 'stop_mapping', 'stage': 'SaveCartoMap'}
+        self.plugin._persist()
+        self.client.grid_maps.append({'fileName': 'new.pgm'})
+        original = self.client.native
+        reached = threading.Event()
+        def native(operation, **args):
+            if operation == 'map_save_status':
+                reached.set()
+                return {'complete': False}
+            return original(operation, **args)
+        self.client.native = native
+        self.assertEqual(self.call('stop_mapping')['state'], 'executing')
+        self.assertTrue(reached.wait(1))
+        self.assertFalse(self.client.commands)
+        self.bundle.tracker.cancel_all('test_end')
+        wait(lambda: not self.plugin._workers)
+
+    def test_saving_info_explains_missing_tf_and_blocks_load(self):
+        self.plugin.store.state('mapping', {'name': 'new', 'token': 'x', 'phase': 'saving'})
+        self.client.observe = lambda **kwargs: (_ for _ in ()).throw(NavigationStateUnavailable(['pose2d']))
+        info = self.call('info')
+        self.assertEqual(info['state'], 'saving')
+        self.assertIn('Optimizing', info['message'])
+        self.assertIn('finish_or_reconcile', self.call('load_map', map_name='other')['error'])
 
     def test_invalid_maps_are_rejected_without_latching_busy(self):
         for action, args in (('load_map', {'map_name': 'missing'}),
@@ -1071,6 +1146,28 @@ class NativeIdentityTests(unittest.TestCase):
                 self.assertNotEqual(first, module.main(request)['sha256'])
                 with self.assertRaises(ValueError):
                     module.main({'operation': 'map_identity', 'args': {'map_name': '../escape'}})
+
+    def test_save_completion_requires_final_valid_path_after_all_outputs(self):
+        import importlib.util
+        import os
+        spec = importlib.util.spec_from_file_location('navigation_save_test',
+                      Path(__file__).resolve().parents[1] / 'host/navigation_rpc.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for suffix in ('.pgm', '.yaml', '.pbstream'):
+                (root / ('map' + suffix)).write_bytes(b'output')
+            self.assertFalse(module.map_save_status('map', root)['complete'])
+            path = root / 'map.path'
+            path.write_text('{')
+            self.assertFalse(module.map_save_status('map', root)['complete'])
+            path.write_text('{}')
+            self.assertTrue(module.map_save_status('map', root)['complete'])
+            os.utime(path, ns=(1, 1))
+            self.assertFalse(module.map_save_status('map', root)['complete'])
+            with self.assertRaises(ValueError):
+                module.map_save_status('../map', root)
 
 
 if __name__ == '__main__':

@@ -196,6 +196,19 @@ class DriverContractTests(unittest.TestCase):
             return self.bundle.state.dispatch(action, args)
         return self.bundle.dispatch(card, {"action": action, **args})
 
+    def test_pending_map_rejects_leg_without_pause_or_target(self):
+        self.bundle.spatial._restored = True
+        self.bundle.spatial._map_pending = {'operation': 'stop_mapping', 'stage': 'SaveCartoMap'}
+        with patch.object(self.bundle, 'pause') as pause:
+            result = self.call('leg', 'set_height', height=.9)
+            self.assertEqual(result['state'], 'error')
+            self.assertIn('map transition', result['error'])
+            self.assertIn('stop_nav does not finish', result['error'])
+            pause.assert_not_called()
+            self.assertFalse(self.ros.sent_services)
+            self.assertFalse(self.ros.published)
+        self.bundle.spatial._map_pending = None
+
     def test_metadata_and_schema_actions_agree(self):
         import yaml
         self.assertTrue(self.bundle.state.snapshot()['motion_enabled'])

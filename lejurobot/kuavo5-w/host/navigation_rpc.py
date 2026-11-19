@@ -112,7 +112,42 @@ def _configure_factory_track(enabled, directory, kind):
             'active_playback_may_finish': True}
 
 
+def map_save_status(name, root=Path('/home/jt/jmap_config/jmaps')):
+    """Read-only completion fence for the factory SaveCartoMap implementation.
+
+    The installed MapManager writes the JSON .path AFTER its synchronous
+    Cartographer SaveMap returns. A PGM alone can appear before saving ends.
+    Require that final file to be valid and newer than every map output.
+    Callers additionally compare two snapshots before restarting the map stack.
+    """
+    if (not isinstance(name, str) or not name or len(name) > 80
+            or any(c in name for c in '/\\') or any(ord(c) < 32 for c in name)):
+        raise ValueError('invalid_map_name')
+    root = root.resolve()
+    stats = {}
+    try:
+        for suffix in ('.pgm', '.yaml', '.pbstream', '.path'):
+            path = root / (name + suffix)
+            if path.is_symlink() or not path.is_file():
+                return {'complete': False}
+            stat = path.stat()
+            if stat.st_size <= 0:
+                return {'complete': False}
+            stats[suffix] = [stat.st_size, stat.st_mtime_ns]
+        path = root / (name + '.path')
+        if stats['.path'][0] > 32_000_000:
+            return {'complete': False}
+        if not isinstance(json.loads(path.read_text()), dict):
+            return {'complete': False}
+        complete = all(stats['.path'][1] >= stat[1] for stat in stats.values())
+        return {'complete': complete, 'files': stats}
+    except (OSError, ValueError):
+        return {'complete': False}
+
+
 def main(request):
+    if request['operation'] == 'map_save_status':
+        return map_save_status(request.get('args', {}).get('map_name'))
     if request['operation'] == 'standby_voice':
         return configure_standby_voice(request.get('args', {}).get('enabled', False))
     if request['operation'] == 'motion_music':

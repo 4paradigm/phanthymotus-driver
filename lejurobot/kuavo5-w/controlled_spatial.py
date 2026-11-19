@@ -145,7 +145,7 @@ class ControlledSpatialPlugin:
                 'description': 'Kuavo 5-W人工建图、地图绑定打点与避障导航；使用厂商原生接口。',
                 'inputSchema': {'type': 'object', 'properties': props, 'required': ['action'],
                     'x-resource': 'base', 'x-hooks': {'on_interrupt_motion': {'action': 'stop_nav'}},
-                    'x-completion': {'actions': ['navigate_to_pose', 'navigate_to_tag', 'start_mapping', 'stop_mapping', 'load_map'], 'timeout': 180},
+                    'x-completion': {'actions': ['navigate_to_pose', 'navigate_to_tag', 'start_mapping', 'stop_mapping', 'load_map'], 'timeout': 1830},
                     'x-action-params': {k: {'params': p, 'description': d, 'required': required.get(k, [])}
                                         for k, (p, d) in self.ACTIONS.items()}}}
 
@@ -167,6 +167,13 @@ class ControlledSpatialPlugin:
         self._restore()
         return (self._uncertain or self._task is not None or self._map_pending is not None
                 or self._preparation is not None)
+
+    def motion_block_reason(self):
+        if not self.unresolved():
+            return None
+        if self._map_pending is not None:
+            return 'map transition is active or unconfirmed; inspect controlled_spatial.info; stop_nav does not finish map saving'
+        return 'native navigation is active or unresolved; stop_nav must be confirmed first'
 
     @staticmethod
     def _check_chassis_faults(observation):
@@ -367,6 +374,9 @@ class ControlledSpatialPlugin:
                           'remote_task': self._task, 'command_delivery_uncertain': self._uncertain,
                           'map_transition': self._map_pending, 'chassis_preparation': self._preparation,
                           'startup': startup}
+                if mapping and mapping.get('phase') == 'saving':
+                    result['state'] = 'saving'
+                    result['message'] = 'Optimizing and saving the map in background. Please wait; do not restart mapping.'
                 try:
                     result['map'] = self.client.current_map()
                 except Exception:
@@ -378,9 +388,10 @@ class ControlledSpatialPlugin:
                 except NavigationStateUnavailable as exc:
                     result['feedback'] = None
                     result['feedback_status'] = {'state': 'loading', 'missing': list(exc.missing), 'reason': exc.reason}
-                    if result['state'] != 'error':
+                    if result['state'] not in ('error', 'saving'):
                         result['state'] = 'loading'
-                    result['message'] = 'Waiting for fresh chassis navigation feedback; checking in background, please wait.'
+                    if result['state'] != 'saving':
+                        result['message'] = 'Waiting for fresh chassis navigation feedback; checking in background, please wait.'
                 return result
             if action in ('stop_nav', 'stop'):
                 result = self.bundle.pause('navigation_stopped')
@@ -546,6 +557,12 @@ class ControlledSpatialPlugin:
         if action == 'list_maps':
             return {'state': 'ready', 'maps': self.client.maps(), 'current_map': self.client.current_map()}
         mapping = self.store.state('mapping')
+        recovering_save = (action == 'stop_mapping' and mapping and mapping.get('phase') == 'saving'
+            and self._map_pending is not None
+            and self._map_pending.get('operation') == 'stop_mapping'
+            and self._map_pending.get('stage') == 'SaveCartoMap'
+            and not any(w.is_alive() and w.name == 'kuavo-map-operation' for w in self._workers)
+            and not self._task and not self._uncertain and self._preparation is None)
         if action in ('list_tags', 'tag_place', 'untag_place'):
             identity = (mapping['name'], mapping['token']) if mapping else self._identity()
             if action == 'tag_place':
@@ -575,7 +592,7 @@ class ControlledSpatialPlugin:
             if mapping:
                 raise RuntimeError('mapping_session_already_exists')
         elif action == 'stop_mapping':
-            if not mapping or mapping['phase'] != 'mapping':
+            if not mapping or (mapping['phase'] != 'mapping' and not recovering_save):
                 raise RuntimeError('no_confirmed_mapping_session_inspect_info')
         elif action == 'load_map':
             text(args.get('map_name'), 'map_name')
@@ -588,7 +605,14 @@ class ControlledSpatialPlugin:
             if exists == (action == 'start_mapping'):
                 raise ValueError('map_name_already_exists' if exists else 'grid_map_not_found')
 
-        self._require_stationary()
+        if recovering_save:
+            # The old SaveCartoMap may still be optimizing with map TF paused.
+            # Never send it twice. Only wait for its files, then finalize.
+            stopped = self.client.native('stationary')
+            if stopped.get('success') is not True or stopped.get('stationary') is not True:
+                raise RuntimeError('fresh_stationary_odometry_required_before_changing_map')
+        else:
+            self._require_stationary()
 
         # Map mutations cannot overlap chassis driving or another preparation.
         with self.bundle.tracker.lock:
@@ -596,12 +620,14 @@ class ControlledSpatialPlugin:
                 raise RuntimeError('map_request_superseded_by_stop')
             self.bundle.state.require_motion_enabled()
             if (self.bundle._transition is not None or 'base' in self.bundle.tracker._active
-                    or self.unresolved()):
+                    or (self.unresolved() and not recovering_save)):
                 raise RuntimeError('base_busy_or_navigation_unresolved')
             aid, cancelled = self.bundle.tracker.begin('base', self.PREFIX)
             self._map_pending = {'operation': action, 'action_id': aid}
+            if recovering_save:
+                self._map_pending['stage'] = 'SaveCartoMap'
             self._persist()
-        self._map_deadline = time.monotonic() + 150
+        self._map_deadline = time.monotonic() + (1800 if action == 'stop_mapping' else 150)
         def worker():
             try:
                 result = self._mutate_map(action, args, mapping, cancelled)
@@ -633,7 +659,9 @@ class ControlledSpatialPlugin:
             raise RuntimeError('fresh_stationary_odometry_required_before_changing_map')
 
     def _mutate_map(self, action, args, mapping, cancelled):
-        self._require_stationary()
+        recovering_save = action == 'stop_mapping' and mapping and mapping['phase'] == 'saving'
+        if not recovering_save:
+            self._require_stationary()
         if action == 'start_mapping':
             if mapping:
                 raise RuntimeError('mapping_session_already_exists')
@@ -659,14 +687,29 @@ class ControlledSpatialPlugin:
             return {'state': 'mapping', 'map_name': name,
                     'remote_control_route': 'upper_board_mpc', 'chassis_mode': 'AUTO'}
         if action == 'stop_mapping':
-            if not mapping or mapping['phase'] != 'mapping':
+            if not mapping or mapping['phase'] not in ('mapping', 'saving'):
                 raise RuntimeError('no_confirmed_mapping_session_inspect_info')
             mapping['phase'] = 'saving'
             self.store.state('mapping', mapping)
-            self._command('ChangeMode', {'mode': 'MANUAL'}, cancelled)
-            self._command('SaveCartoMap', {'mapName': mapping['name'], 'savePath': True}, cancelled)
+            if not recovering_save:
+                self._command('ChangeMode', {'mode': 'MANUAL'}, cancelled)
+                self._command('SaveCartoMap', {'mapName': mapping['name'], 'savePath': True}, cancelled)
+            else:
+                # A timed-out socket does not cancel the factory's save. The
+                # final .path write fences the synchronous Cartographer call;
+                # require stable output snapshots before any restart/load.
+                previous = [None, None]
+                def saved():
+                    status = self.client.native('map_save_status', map_name=mapping['name'])
+                    signature = status.get('files') if status.get('complete') is True else None
+                    now = time.monotonic()
+                    if signature is not None and signature == previous[0]:
+                        return now - previous[1] >= 2.
+                    previous[:] = [signature, now]
+                    return False
+                self._wait(saved, cancelled, 1500)
             self._wait(lambda: mapping['name'] in [Path(m.get('fileName', '')).stem
-                                                   for m in self.client.maps()], cancelled)
+                                                   for m in self.client.maps()], cancelled, 1500)
             self._command('AgvSystemRestart', {}, cancelled)
             self._wait(lambda: self.client.observe()['agvState'].get('isMapping') is False, cancelled, 60)
             self._load(mapping['name'], cancelled)
@@ -694,7 +737,7 @@ class ControlledSpatialPlugin:
         if self._map_pending is not None:
             self._map_pending['stage'] = method
             self._persist()
-        self.client.command(method, params, timeout=min(25, remaining))
+        self.client.command(method, params, timeout=min(1500 if method == 'SaveCartoMap' else 25, remaining))
         if cancelled.is_set():
             raise RuntimeError('map_operation_interrupted_inspect_map_state')
 

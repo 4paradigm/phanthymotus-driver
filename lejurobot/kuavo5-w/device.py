@@ -1299,7 +1299,7 @@ class KuavoBundle:
             if channel == 'base' and self.spatial.startup_status().get('state') == 'loading':
                 raise RuntimeError('Checking chassis status in background, please wait.')
             if self.spatial.unresolved():
-                raise RuntimeError('native navigation is active or unresolved; stop_nav must be confirmed first')
+                raise RuntimeError(self.spatial.motion_block_reason())
             if self._resume_unresolved():
                 raise RuntimeError('remote resume is unresolved; motion remains blocked')
             if self._mode_unresolved():
