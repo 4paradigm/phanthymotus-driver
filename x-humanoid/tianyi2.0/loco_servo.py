@@ -22,7 +22,7 @@ MAX_OBS_AGE_MS = 600
 CANCEL_AFTER_MS = 1000
 FOLLOW_KEYS = ("wz_limit",)
 SPEED_PRESETS = {"slow": 0.15, "normal": 0.30, "fast": 0.50}
-FOOTPRINT_HALF_WIDTH_M = 0.39  # Conservative envelope; measured width is 0.55 m.
+FOOTPRINT_HALF_WIDTH_M = 0.35  # Conservative envelope; measured width is 0.55 m.
 TOGGLES = {"dry_run": True, "rotate_only": False, "require_standing": False}
 CONFIG_KEYS = (*TOGGLES, "speed_preset", "min_vx",
                "linear_acceleration", "angular_acceleration", *FOLLOW_KEYS)
