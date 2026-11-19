@@ -71,13 +71,26 @@ class JointsPlugin(SensorPlugin):
     def get_tools(self):
         return [super().get_tool(), {
             "name": "model", "type": "resource", "multiInstance": False,
-            "description": "Panther live URDF from /robot_description, with bundled fallback",
+            "description": "Panther articulated display URDF with matching joint stream",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         }]
 
     def dispatch(self, action, args):
         if action == "model" or args.get("_tool_name") == "model":
             return self.device.sensor_info("model")
+        return super().dispatch(action, args)
+
+
+class LaserScanPlugin(SensorPlugin):
+    def get_tool(self):
+        tool = super().get_tool()
+        tool["inputSchema"]["properties"]["action"]["enum"].append("clear")
+        return tool
+
+    def dispatch(self, action, args):
+        if action == "clear":
+            self.device.clear_laser_cloud()
+            action = "info"
         return super().dispatch(action, args)
 
 
@@ -189,7 +202,7 @@ def build_plugins(config, namespace, device):
         return bool(enabled.get(name, {}).get("enabled", False))
 
     if on("joints"):
-        plugins.append(JointsPlugin(device, "joints", "Panther live URDF skeleton and joint state", ["joints"]))
+        plugins.append(JointsPlugin(device, "joints", "Panther skeleton with live joint feedback", ["joints"]))
     for name, description in (
         ("robot_state", "Panther motion readiness, controller, diagnostic and hardware summary"),
         ("battery", "Panther battery percentage, voltage, current, temperature and power status"),
@@ -199,9 +212,9 @@ def build_plugins(config, namespace, device):
         if on(name):
             plugins.append(SensorPlugin(device, name, description, [name]))
     if on("laser_scan"):
-        plugins.append(SensorPlugin(
-            device, "laser_scan", "Panther merged dual-lidar scan from /scan",
-            ["laser_scan", "laser_view"],
+        plugins.append(LaserScanPlugin(
+            device, "laser_scan", "Panther planar lidar point cloud with odometry-aligned history",
+            ["laser_cloud", "laser_scan"],
         ))
     if on("camera_color"):
         plugins.append(CameraPlugin(

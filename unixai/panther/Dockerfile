@@ -31,6 +31,7 @@ RUN . /etc/os-release && \
       ros-humble-nav-msgs \
       ros-humble-sensor-msgs \
       ros-humble-std-msgs \
+      ros-humble-tf2-ros-py \
       ros-humble-trajectory-msgs && \
     rm -rf /var/lib/apt/lists/*
 
@@ -51,7 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=interface-builder /panther_ws/install /panther_ws/install
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py plugins.py contracts.py core_bridge.py camera.py audio.py config.yaml driver.yaml /work/
+COPY main.py device.py plugins.py contracts.py core_bridge.py camera.py audio.py laser_cloud.py joint_display.py config.yaml driver.yaml /work/
 COPY resource/panther.urdf /work/resource/panther.urdf
 COPY resource/cyclonedds-muzzle.xml /work/resource/cyclonedds-muzzle.xml
 COPY entrypoint.sh /work/entrypoint.sh

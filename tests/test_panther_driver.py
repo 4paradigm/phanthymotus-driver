@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from collections import deque
 import hashlib
 import importlib.util
 import io
@@ -8,6 +9,7 @@ import json
 import math
 import os
 import re
+import struct
 import sys
 import threading
 import time
@@ -37,6 +39,7 @@ plugins = _load("plugins")
 camera = _load("camera")
 device_module = _load("device")
 audio = _load("audio")
+laser_cloud = _load("laser_cloud")
 
 
 class PantherAudioContractTest(unittest.TestCase):
@@ -77,7 +80,7 @@ class PantherDriverTest(unittest.TestCase):
                        "format": "image/jpeg" if name == "camera_color" else
                                  "image/depth-zlib" if name == "camera_depth" else
                                  "data/json"}
-                for name in (*card_names, "laser_view")
+                for name in (*card_names, "laser_cloud")
             }
 
             def __getattr__(self, _name):
@@ -394,12 +397,12 @@ class PantherDriverTest(unittest.TestCase):
     def test_bundled_model_and_standardized_streams_are_packaged(self):
         model = DRIVER / "resource" / "panther.urdf"
         self.assertTrue(model.exists())
-        model_text = model.read_text()
+        model_text = model.read_text(encoding="utf-8")
         self.assertIn('<robot\n  name="pmm_urdf">', model_text)
         self.assertIn("joint_la0", model_text)
         self.assertIn("package://pmm_urdf/meshes/", model_text)
         self.assertEqual(
-            hashlib.sha256(model.read_bytes()).hexdigest(),
+            hashlib.sha256(model_text.encode("utf-8")).hexdigest(),
             "abcd54d188f93c62247816b93c9998e112b1be36cd2bae582910d393c4f4902d",
         )
         dockerfile = (DRIVER / "Dockerfile").read_text()
@@ -469,12 +472,37 @@ class PantherDriverTest(unittest.TestCase):
                 })
 
     def test_render_model_and_joint_indices_share_one_snapshot(self):
-        device = (DRIVER / "device.py").read_text()
-        self.assertIn("self._render_urdf = self._urdf", device)
-        self.assertIn("self._render_joint_indices = dict(self._joint_indices)", device)
-        self.assertIn("joint_indices = dict(self._render_joint_indices)", device)
-        self.assertIn('"model_sha256": model_sha256', device)
-        self.assertIn('"source": render_source', device)
+        device = object.__new__(device_module.PantherDevice)
+        device._lock = threading.RLock()
+        device._cache = {}
+        device._callback_errors = {}
+        device._model_urdf = (DRIVER / "resource" / "panther.urdf").read_text(encoding="utf-8")
+        device._model_joint_limits = contracts.parse_joint_limits(device._model_urdf)
+        device._render_urdf, device._render_mimics = device_module.render_model(device._model_urdf)
+        device._render_joint_indices = contracts.parse_joint_indices(device._render_urdf)
+        device._render_model_sha256 = hashlib.sha256(device._render_urdf.encode()).hexdigest()
+        device._render_source = "bundled articulated display model"
+        live = '<robot><joint name="body_joint" type="fixed"><parent link="a"/><child link="b"/></joint></robot>'
+        device._on_robot_description(SimpleNamespace(data=live))
+        model = device.sensor_info("model")
+        self.assertNotEqual(model["urdf"], live)
+        self.assertEqual(device._urdf, live)
+
+        def feedback(names, positions):
+            return SimpleNamespace(name=names, position=positions, velocity=[], effort=[])
+
+        device._put("lifting", feedback(["height"], [0.6]))
+        device._put("gripper_left", feedback(["joint_lf"], [0.5]))
+        device._cache["gripper_right"] = (feedback(["joint_rf"], [0.8]), time.monotonic() - 10)
+        payload = device._joints_payload(feedback(["joint_head0", "joint_la0"], [0.2, 0.1]), time.monotonic())
+        self.assertEqual(model["model_sha256"], payload["model_sha256"])
+        rows = {joint["name"]: joint for joint in payload["joints"]}
+        self.assertEqual(rows["body_joint"]["q"], 0.6)
+        self.assertEqual(rows["joint_head0"]["q"], 0.2)
+        self.assertEqual(rows["joint_la0"]["q"], 0.1)
+        self.assertEqual(rows["joint_lf02"]["q"], 0.5)
+        self.assertNotIn("joint_rf", rows)
+        self.assertEqual(rows["joint_lf"]["idx"], contracts.parse_joint_indices(model["urdf"])["joint_lf"])
 
     def test_skeleton_indices_follow_kinematic_urdf_order(self):
         urdf = """<robot name='p'>
@@ -617,7 +645,7 @@ class PantherDriverTest(unittest.TestCase):
         self.assertEqual(topics["robot_state"]["format"], "data/json")
         self.assertEqual(topics["battery"]["topic"], "/test/panther/battery")
         self.assertEqual(topics["laser_scan"]["topic"], "/test/panther/laser_scan")
-        self.assertEqual(topics["laser_view"]["format"], "image/jpeg")
+        self.assertEqual(topics["laser_cloud"]["format"], "sensor/pointcloud")
         self.assertEqual(topics["camera_color"]["format"], "image/jpeg")
         self.assertEqual(topics["camera_depth"]["format"], "image/depth-zlib")
         self.assertFalse({"laser_front", "laser_rear", "laser_fused"} & set(topics))
@@ -626,8 +654,8 @@ class PantherDriverTest(unittest.TestCase):
         created = {"publishers": [], "subscriptions": [], "messages": []}
 
         class Messages:
-            def __init__(self):
-                self.items = [{"source_topic": "/scan", "ranges": [1.0]}, None]
+            def __init__(self, payload):
+                self.items = [payload, None]
 
             def get(self):
                 return self.items.pop(0)
@@ -680,6 +708,7 @@ class PantherDriverTest(unittest.TestCase):
         std_msgs = ModuleType("std_msgs")
         std_msgs_msg = ModuleType("std_msgs.msg")
         std_msgs_msg.String = String
+        std_msgs_msg.UInt8MultiArray = type("UInt8MultiArray", (), {})
         std_msgs.msg = std_msgs_msg
         modules = {
             "rclpy": rclpy, "rclpy.node": rclpy_node, "rclpy.qos": rclpy_qos,
@@ -687,65 +716,62 @@ class PantherDriverTest(unittest.TestCase):
             "std_msgs": std_msgs, "std_msgs.msg": std_msgs_msg,
         }
         with patch.dict(sys.modules, modules), patch.dict(os.environ, {}, clear=False):
-            core_bridge._run_lane(Messages(), "/profile.xml", 42, "test", "laser_scan")
-        self.assertEqual(len(created["publishers"]), 1)
+            core_bridge._run_lane(Messages({"source_topic": "/scan", "ranges": [1.0]}), "/profile.xml", 42, "test", "laser_scan")
+            packet = laser_cloud.point_packet([(1, 2, 0)])
+            core_bridge._run_lane(Messages(packet), "/profile.xml", 42, "test", "laser_cloud")
+        self.assertEqual(len(created["publishers"]), 2)
         self.assertEqual(created["publishers"][0][1], "/test/panther/laser_scan")
         self.assertEqual(created["subscriptions"], [])
         self.assertEqual(json.loads(created["messages"][0].data)["source_topic"], "/scan")
+        self.assertEqual(created["publishers"][1], (std_msgs_msg.UInt8MultiArray, "/test/panther/laser_scan/points"))
+        self.assertEqual(bytes(created["messages"][1].data), packet)
 
-    def test_lidar_callback_matches_bridge_json_and_jpeg_contracts(self):
-        class FakeImage:
-            def __setitem__(self, _key, _value):
-                pass
-
-        class FakeEncoded:
-            @staticmethod
-            def tobytes():
-                return b"\xff\xd8test-jpeg\xff\xd9"
-
-        numpy = ModuleType("numpy")
-        numpy.uint8 = object()
-        numpy.zeros = lambda *_args, **_kwargs: FakeImage()
-        cv2 = ModuleType("cv2")
-        cv2.IMWRITE_JPEG_QUALITY = 1
-        cv2.circle = lambda *_args, **_kwargs: None
-        cv2.imencode = lambda *_args, **_kwargs: (True, FakeEncoded())
-
+    def test_lidar_waits_for_scan_time_tf_and_falls_back_to_front(self):
         device = object.__new__(device_module.PantherDevice)
         device._lock = threading.RLock()
+        device._laser_lock = threading.Lock()
         device._cache = {}
+        device._callback_errors = {}
         device._last_card_publish = {}
-        device._laser_render_failures = 0
-        device._log_laser_render_failure = (
-            lambda exc: (_ for _ in ()).throw(exc)
-        )
+        device._laser_topics = ("/scan", "/lidar_front/scan")
+        device._laser_source = None
+        device._laser_seen = {}
+        device._laser_pending = deque(maxlen=24)
+        device._laser_cloud = laser_cloud.ScanCloud()
+        device._laser_fixed_frame = "odom"
+        device._scan_transform = lambda _scan: None
         captured = {}
-        device._publish_limited = (
-            lambda card, payload, _rate, force=False: captured.setdefault(card, payload)
-        )
+        device._bridge = SimpleNamespace(publish=lambda card, payload: captured.update({card: payload}))
         scan = SimpleNamespace(
-            header=SimpleNamespace(frame_id="laser"),
+            header=SimpleNamespace(frame_id="laser", stamp=SimpleNamespace(sec=10, nanosec=0)),
             ranges=[1.0, float("inf"), 2.0],
             angle_min=-1.0, angle_max=1.0, angle_increment=1.0,
             range_min=0.1, range_max=10.0,
         )
-        with patch.dict(sys.modules, {"cv2": cv2, "numpy": numpy}), patch.object(
-            device_module.time, "monotonic", return_value=10.0
-        ):
-            device._on_laser(scan)
+        with patch.object(device_module.time, "monotonic", return_value=10.0) as clock:
+            device._on_laser(scan, "/lidar_front/scan")
+            device._publish_laser_cloud()
+            self.assertNotIn("laser_cloud", captured)
+            clock.return_value = 10.4
+            device._publish_laser_cloud()
+            cloud_wire = core_bridge.encode_bridge_payload("laser_cloud", captured["laser_cloud"])
+            self.assertEqual(struct.unpack_from("<II", cloud_wire["data"]), (16, 2))
+            self.assertEqual(device.sensor_info("laser_scan")["cloud_frame"], "laser")
+            scan_wire = core_bridge.encode_bridge_payload("laser_scan", captured["laser_scan"])
+            clock.return_value = 11.0
+            device._on_laser(scan, "/scan")
+            device._on_laser(scan, "/lidar_front/scan")
+            self.assertEqual(device.sensor_info("laser_scan")["source_topic"], "/scan")
+            device.clear_laser_cloud()
+            self.assertEqual(captured["laser_cloud"], struct.pack("<II", 16, 0))
 
-        scan_wire = core_bridge.encode_bridge_payload("laser_scan", captured["laser_scan"])
         scan_json = json.loads(scan_wire["data"])
         self.assertEqual(scan_wire["kind"], "string")
-        self.assertEqual(scan_json["source_topic"], "/scan")
+        self.assertEqual(scan_json["source_topic"], "/lidar_front/scan")
         self.assertEqual(scan_json["ranges"], [1.0, None, 2.0])
-        view_wire = core_bridge.encode_bridge_payload("laser_view", captured["laser_view"])
-        self.assertEqual(view_wire["kind"], "compressed_image")
-        self.assertEqual(view_wire["message_format"], "jpeg")
-        self.assertTrue(view_wire["data"].startswith(b"\xff\xd8"))
         with self.assertRaisesRegex(ValueError, "not JPEG"):
             core_bridge.encode_bridge_payload(
-                "laser_view", {"message_format": "jpeg", "data": b"not-jpeg"}
+                "camera_color", {"message_format": "jpeg", "data": b"not-jpeg"}
             )
 
     def test_removed_nav_and_ultrasonic_have_no_runtime_code(self):
@@ -866,22 +892,27 @@ class PantherDriverTest(unittest.TestCase):
         self.assertIn("#200:", lines[2])
         self.assertTrue(all(len(line) < 300 for line in lines))
 
-    def test_laser_render_failures_are_bounded_and_sampled(self):
-        device = object.__new__(device_module.PantherDevice)
-        device._lock = threading.RLock()
-        device._laser_render_failures = 0
-        output = io.StringIO()
-        noisy = ValueError("bad\nlayout " + "x" * 400)
-        with contextlib.redirect_stdout(output):
-            for _ in range(200):
-                device._log_laser_render_failure(noisy)
-        lines = output.getvalue().splitlines()
-        self.assertEqual(len(lines), 3)
-        self.assertIn("#1:", lines[0])
-        self.assertIn("#100:", lines[1])
-        self.assertIn("#200:", lines[2])
-        self.assertTrue(all(len(line) < 320 for line in lines))
-        self.assertIn("laser_view_attempt", (DRIVER / "device.py").read_text())
+    def test_laser_accumulation_aligns_scans_expires_and_rejects_mixed_frames(self):
+        history = laser_cloud.ScanCloud(voxel_m=0.05, history_s=2.0, max_points=2)
+
+        def scan(*distances):
+            return SimpleNamespace(angle_min=0.0, angle_increment=math.pi / 2,
+                                   range_min=0.1, range_max=10.0, ranges=distances)
+
+        def pose(x=0.0, yaw=0.0):
+            return SimpleNamespace(translation=SimpleNamespace(x=x, y=0.0, z=0.2),
+                                   rotation=SimpleNamespace(x=0.0, y=0.0, z=math.sin(yaw / 2), w=math.cos(yaw / 2)))
+
+        self.assertEqual(history.update(scan(1.0), 10.0, 10, pose()), [(1.0, 0.0, 0.2)])
+        self.assertEqual(history.update(scan(0.75), 10.1, 11, pose(0.25)), [(1.0, 0.0, 0.2)])
+        rotated = history.update(scan(1.0), 10.2, 12, pose(0.25, math.pi / 2))
+        self.assertEqual(len(rotated), 2)
+        self.assertAlmostEqual(rotated[-1][0], 0.25)
+        self.assertAlmostEqual(rotated[-1][1], 1.0)
+        self.assertEqual(history.update(scan(9.0), 10.3, 13, None), [(9.0, 0.0, 0.0)])
+        self.assertEqual(len(history.update(scan(2.0), 10.4, 14, pose())), 2)
+        self.assertEqual(history.update(scan(1.0), 13.0, 15, pose()), [(1.0, 0.0, 0.2)])
+        self.assertEqual(history.update(scan(1.0), 13.1, 16, pose(4.0)), [(5.0, 0.0, 0.2)])
 
     def test_container_dependency_contract_is_apt_only_and_explained(self):
         dockerfile = (DRIVER / "Dockerfile").read_text()

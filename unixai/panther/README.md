@@ -15,7 +15,7 @@ required for discovery.
 ## Implemented cards
 
 - Sensors: `joints`/`model`, compact `robot_state`, `battery`, `imu`, `odom`,
-  merged `laser_scan`, lazy `camera_color`, and lazy `camera_depth`.
+  `laser_scan` point cloud, lazy `camera_color`, and lazy `camera_depth`.
 - Actuators: `base_drive`, `arm_control`, `gripper`, `lifting`, and `head`.
 - Audio: `mic` publishes `audio/pcm-16k` from the host PulseAudio source;
   `speaker` plays a canvas-connected `audio/pcm-16k` stream through its sink.
@@ -36,11 +36,14 @@ then test `mic -> ASR` and `TTS -> speaker` on Panther. For simultaneous
 listening and speaking, insert the perception echo-cancellation card before
 ASR and check interaction with the robot's native AIUI conversation service.
 
-`model` falls back to the bundled, verbatim vendor `pmm_urdf` model before the robot
-publishes anything. Once a live `/robot_description` is available, reading the
-model resource atomically switches both the returned URDF and the `joints`
-rendering indices to that same live snapshot. The response includes its source
-and SHA-256 digest so a renderer can identify the active morphology. Live
+`model` and `joints` use the same bundled articulated display model throughout
+the session. The live `/robot_description` can encode the lift and fingers as
+fixed joints, so it is kept separate from Canvas rendering. The display model
+uses the measured yaw/pitch channel order. `joints` combines `/joint_states`
+with fresh lift and gripper feedback and expands the display model's gripper
+mimic joints. `body_joint` is reported in metres and rotates no links; the
+Canvas skeleton renderer must support URDF prismatic joints to show it moving.
+The response includes the display model's SHA-256 digest. Live
 `/robot_description` may narrow, but never widen, the bundled vendor motion
 limits. Arm execution uses the intersection of both limit sets. `joints`,
 `imu`, `odom`, `robot_state`, `battery`, and `laser_scan` are rate limited before crossing
@@ -56,10 +59,16 @@ instead of failing the card lifecycle.
 
 `robot_state` contains compact readiness, controller, diagnostic, and hardware
 summaries. Battery measurements use the separate `battery` card; gripper and
-lifting feedback are available from their actuator cards. `laser_scan`
-consumes only `/scan`, whose publisher on Panther is the existing
-`dual_lidar_merger`; this driver performs no second lidar fusion, but pools each
-angular bin to its nearest valid return and reports scan quality.
+lifting feedback are available from their actuator cards. `laser_scan` prefers
+fresh `/scan` from the vendor merger and falls back to `/lidar_front/scan`; it
+does not fuse the feeds a second time. The first Canvas output is the native
+`sensor/pointcloud` stream; the second keeps the scan JSON with nearest-return
+pooling and quality metrics. Scans are projected in their own plane, then
+transformed to `odom` at the scan timestamp for accumulation. The default
+history is 20 s with 5 cm voxels, capped at 20,000 points and a 12 m scan range.
+Without scan-time TF, an individual scan is shown in its own frame and is never
+added to the odom cloud. `info` reports the selected scan and cloud frames,
+`accumulating`, and point count. `clear` resets the accumulated history.
 
 The first camera card started on the canvas reuses an already-active host
 `panther_orbbec.service` without taking ownership. Otherwise it creates a
@@ -82,7 +91,8 @@ for these concrete runtime paths:
 | `ros-humble-nav-msgs` | `nav_msgs/msg/Odometry` on `/odom` | Required even though the navigation card was removed |
 | `ros-humble-rmw-cyclonedds-cpp` | Robot-facing domain 0 process | Required |
 | `ros-humble-rmw-fastrtps-cpp` | Agent Core domain 42 bridge process | Required |
-| `python3-numpy`, `python3-opencv` | RGB/depth conversion and laser rendering | Apt-only; no duplicate pip wheels |
+| `ros-humble-tf2-ros-py` | Robot-side timestamped transforms for lidar accumulation | Required |
+| `python3-numpy`, `python3-opencv` | RGB/depth conversion | Apt-only; no duplicate pip wheels |
 | `util-linux` | `nsenter` into the host namespaces for the lazy camera source | Required |
 | `systemd` | `systemctl`/`systemd-run` clients for the owned host transient unit | Required; the driver does not run systemd in the container |
 

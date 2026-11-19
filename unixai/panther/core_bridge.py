@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from array import array
 import json
 import multiprocessing as mp
 import os
@@ -17,7 +18,7 @@ TOPIC_SUFFIXES = {
     "imu": ("imu", "data/json"),
     "odom": ("odom", "state/odom"),
     "laser_scan": ("laser_scan", "data/json"),
-    "laser_view": ("laser_scan/view", "image/jpeg"),
+    "laser_cloud": ("laser_scan/points", "sensor/pointcloud"),
     "camera_color": ("camera/rgb", "image/jpeg"),
     "camera_depth": ("camera/depth", "image/depth-zlib"),
 }
@@ -36,6 +37,10 @@ def encode_bridge_payload(card: str, payload) -> dict:
     if card not in TOPIC_SUFFIXES:
         raise ValueError(f"unknown bridge card: {card}")
     data_format = TOPIC_SUFFIXES[card][1]
+    if data_format == "sensor/pointcloud":
+        if not isinstance(payload, bytes):
+            raise ValueError(f"{card} point cloud must be bytes")
+        return {"kind": "uint8_array", "data": payload}
     if data_format.startswith("image/"):
         if not isinstance(payload, dict):
             raise ValueError(f"{card} image payload must be an object")
@@ -181,14 +186,19 @@ def _run_lane(messages, profile: str, domain: int, namespace: str, card: str) ->
     from rclpy.node import Node
     from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
     from sensor_msgs.msg import CompressedImage
-    from std_msgs.msg import String
+    from std_msgs.msg import String, UInt8MultiArray
 
     rclpy.init(domain_id=domain)
     node = Node(f"panther_core_{card}", enable_rosout=False, start_parameter_services=False)
     qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                      history=HistoryPolicy.KEEP_LAST, depth=1)
     spec = output_topics(namespace)[card]
-    message_type = CompressedImage if spec["format"].startswith("image/") else String
+    if spec["format"].startswith("image/"):
+        message_type = CompressedImage
+    elif spec["format"] == "sensor/pointcloud":
+        message_type = UInt8MultiArray
+    else:
+        message_type = String
     publisher = node.create_publisher(message_type, spec["topic"], qos)
     print(f"[bridge] ready lane={card} domain={domain} topic={spec['topic']}", flush=True)
     try:
@@ -205,8 +215,11 @@ def _run_lane(messages, profile: str, domain: int, namespace: str, card: str) ->
                 stamp = wire["stamp"]
                 message.header.stamp.sec = int(stamp.get("sec", 0))
                 message.header.stamp.nanosec = int(stamp.get("nanosec", 0))
+            elif message_type is UInt8MultiArray:
+                message = UInt8MultiArray()
+                message.data = array("B", wire["data"])
             else:
-                message = String()
+                message = message_type()
                 message.data = wire["data"]
             publisher.publish(message)
     finally:
