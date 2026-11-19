@@ -133,7 +133,7 @@ class ControlledSpatialPlugin:
                  **{k: {'type': 'string'} for k in ('map_name', 'name', 'description', 'tag_name')},
                  **{k: {'type': 'number', 'description': 'map坐标系位置，米'} for k in ('x', 'y')},
                  'yaw': {'type': 'number', 'description': 'map坐标系绝对朝向，弧度'},
-                 'speed': {'type': 'number', 'description': '导航线速度，米/秒', 'minimum': .05, 'maximum': .3, 'default': .15}}
+                 'speed': {'type': 'number', 'description': '0.05–0.3 m/s；导航线速度，默认0.15 m/s', 'minimum': .05, 'maximum': .3, 'default': .15}}
         required = {'start_mapping': ['map_name'], 'tag_place': ['name'], 'untag_place': ['name'],
                     'load_map': ['map_name'], 'navigate_to_pose': ['x', 'y', 'yaw'],
                     'navigate_to_tag': ['tag_name']}

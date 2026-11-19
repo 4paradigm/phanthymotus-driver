@@ -48,7 +48,7 @@ class BaseServo:
 
     def tool(self):
         return {'name': self.PREFIX, 'type': 'actuator', 'multiInstance': False,
-                'description': '轮式底盘连续伺服；接收ActuCore navi的motus.control/1 twist，断流自动发零速。',
+                'description': '≤0.8 m/s、1 rad/s；断流300ms发零速。轮式底盘连续伺服，接收ActuCore navi的motus.control/1 twist。',
                 'topic_in': [{'format': 'control/velocity', 'desc': '6维机身速度[vx,vy,vz,wx,wy,wz]；m/s、rad/s'}],
                 'inputSchema': {'type': 'object', 'required': ['action'],
                     'properties': {'action': {'type': 'string', 'enum': ['start', 'stop', 'pause', 'resume', 'info']},

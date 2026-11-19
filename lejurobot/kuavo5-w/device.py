@@ -668,17 +668,17 @@ class BaseDrivePlugin(_KuavoPlugin):
         return self.bundle.spatial.start_chassis()
 
     def tool(self):
-        tool = self.schema(f"Kuavo 5-W 轮式底盘；平移≤{LINEAR_LIMIT} m/s，旋转≤{math.degrees(ANGULAR_LIMIT):.4f} deg/s；无避障，避障请用controlled_spatial。", {
-            "vx": {"type": "number", "minimum": -LINEAR_LIMIT, "maximum": LINEAR_LIMIT, "description": "本体前向速度 m/s；平移合速度≤0.8"},
-            "vy": {"type": "number", "minimum": -LINEAR_LIMIT, "maximum": LINEAR_LIMIT, "description": "本体左向速度 m/s；平移合速度≤0.8"},
-            "vyaw": {"type": "number", "minimum": -math.degrees(ANGULAR_LIMIT), "maximum": math.degrees(ANGULAR_LIMIT), "description": "逆时针角速度 deg/s；范围 ±57.2957795131 deg/s"},
-            "duration": {"type": "number", "description": "持续秒数0.1–10；-1持续至stop_move", "minimum": -1, "maximum": 10},
-            "speed": {"type": "string", "enum": ["low", "medium", "high"], "default": "low", "description": "厂商控制链命令上限30%/60%/100%：low=0.24m/s及17.1887deg/s，medium=0.48及34.3775，high=0.8及57.2958"},
-            "x": {"type": "number", "description": "相对机身X位移，米"},
-            "y": {"type": "number", "description": "相对机身Y位移，米"},
+        tool = self.schema(f"平移≤{LINEAR_LIMIT} m/s，旋转≤{math.degrees(ANGULAR_LIMIT):.4f} deg/s；Kuavo 5-W轮式底盘，无避障，避障请用controlled_spatial。", {
+            "vx": {"type": "number", "minimum": -LINEAR_LIMIT, "maximum": LINEAR_LIMIT, "description": "≤0.8 m/s（平移合速度）；本体前向速度"},
+            "vy": {"type": "number", "minimum": -LINEAR_LIMIT, "maximum": LINEAR_LIMIT, "description": "≤0.8 m/s（平移合速度）；本体左向速度"},
+            "vyaw": {"type": "number", "minimum": -math.degrees(ANGULAR_LIMIT), "maximum": math.degrees(ANGULAR_LIMIT), "description": "±57.2958 deg/s；逆时针角速度"},
+            "duration": {"type": "number", "description": "0.1–10 s；-1持续至stop_move；运动时长", "minimum": -1, "maximum": 10},
+            "speed": {"type": "string", "enum": ["low", "medium", "high"], "default": "low", "description": "low=0.24 m/s、17.19°/s；medium=0.48、34.38；high=0.8、57.30；厂商命令上限30%/60%/100%"},
+            "x": {"type": "number", "description": "合位移≤5 m；相对机身X位移，米"},
+            "y": {"type": "number", "description": "合位移≤5 m；相对机身Y位移，米"},
             "yaw": {"type": "number", "description": "相对偏航转角，度"},
-        }, {"move": (["vx", "vy", "vyaw", "duration"], "本体速度运动；duration=-1持续至stop_move，否则到时发零速度并等待1s停止窗口"),
-            "move_relative": (["x", "y", "yaw", "speed"], "相对执行开始时机身的位移及转角；米/度，里程计闭环，无避障"),
+        }, {"move": (["vx", "vy", "vyaw", "duration"], "0.1–10 s或-1持续至stop_move；本体速度运动，到时发零速度并等待1s停止窗口"),
+            "move_relative": (["x", "y", "yaw", "speed"], "≤5 m；相对执行开始时机身的位移及转角，米/度，里程计闭环，无避障"),
             "stop_move": ([], "发零速并请求全身软件暂停；下一次新动作自动准备控制")},
             "base", ("move", "move_relative"),
             required={"move": ["duration"], "move_relative": ["x", "y", "yaw"]})
@@ -788,9 +788,9 @@ class ArmPlugin(_KuavoPlugin):
                 if i in self.REVERSED:
                     low, high = -high, -low
                 entry.update(minimum=low, maximum=high)
-                description += f'；范围[{low:.6g}, {high:.6g}] rad（[{math.degrees(low):.3f}, {math.degrees(high):.3f}]度）'
+                description = f'范围[{low:.6g}, {high:.6g}] rad（[{math.degrees(low):.3f}, {math.degrees(high):.3f}]度）；' + description
             else:
-                description += '；范围等待实时模型/控制器限位核验，未核验时拒绝执行'
+                description = '范围待实时模型/控制器限位核验；未核验时拒绝执行；' + description
             fields[field] = {**entry, 'description': description}
         return self.schema('Kuavo 5-W 双臂绝对角度rad；关节1/4/7使用卡片方向，原始joint_state不变。',
             fields, {'set': (list(fields), '同时设置双臂关节；未填保持当前实测角度'),
@@ -851,9 +851,9 @@ class LowerBodyPlugin(_KuavoPlugin):
             return self.schema("Kuavo 5-W 下肢含膝、腿、腰俯仰/偏航；set_height保持躯干前后位置和俯仰，协调前三关节升降。", {
                 **{field: {'type': 'number', 'description': label + '绝对角度，度；set省略时保持实测值'}
                    for field, (_, label) in self.FIELDS.items()},
-                "height": {"type": "number", "minimum": .74, "maximum": 1.06, "description": "waist_yaw_link相对底盘的绝对高度m，0.74–1.06；不可达时拒绝"},
+                "height": {"type": "number", "minimum": .74, "maximum": 1.06, "description": "0.74–1.06 m；waist_yaw_link相对底盘的绝对高度，不可达时拒绝"},
                 "positions": _array_schema(4, "四个下肢关节目标角度，度")}, {
-                'set_height': (['height'], '协调膝、腿、腰俯仰垂直升降，保持当前躯干x/俯仰和腰偏航'),
+                'set_height': (['height'], '0.74–1.06 m；协调膝、腿、腰俯仰垂直升降，保持当前躯干x/俯仰和腰偏航'),
                 'set': (list(self.FIELDS), '按名称设置部分/全部下肢关节绝对角度，度；至少填写一个'),
                 'zero': ([], '四个下肢关节归零，包含腰部；需现场核验限位'),
                 "move_joints": (["positions"], "设置四个下肢关节角度，需配置现场核验的关节限位"),
@@ -892,10 +892,10 @@ class HeadPlugin(_KuavoPlugin):
     PREFIX, CHANNEL = "head", "head"
 
     def tool(self):
-        return self.schema("Kuavo 5-W 头部绝对角度，单位度；yaw/pitch两自由度。ACP按指令发送完成回执，不表示实测到位。", {
-            'yaw': {'type': 'number', 'minimum': -30, 'maximum': 30, 'description': '偏航绝对角度，度；不填保持当前实测角度'},
-            'pitch': {'type': 'number', 'minimum': -25, 'maximum': 25, 'description': '俯仰绝对角度，度；正值向上，范围[-25,25]；不填保持当前实测角度'},
-        }, {'move_pos': (['yaw', 'pitch'], '设置头部绝对角度，度；至少填一个，未填保持当前角度'),
+        return self.schema("yaw[-30,30]°、pitch[-25,25]°；Kuavo 5-W头部绝对角度。ACP按指令发送完成回执，不表示实测到位。", {
+            'yaw': {'type': 'number', 'minimum': -30, 'maximum': 30, 'description': '[-30,30]°；偏航绝对角度，不填保持当前实测角度'},
+            'pitch': {'type': 'number', 'minimum': -25, 'maximum': 25, 'description': '[-25,25]°；俯仰绝对角度，正值向上，不填保持当前实测角度'},
+        }, {'move_pos': (['yaw', 'pitch'], 'yaw[-30,30]°、pitch[-25,25]°；设置绝对角度，至少填一个，未填保持当前角度'),
             'zero': ([], '头部yaw/pitch绝对角度归零'),
             'stop_move': ([], '请求全身软件暂停')}, 'head', ('move_pos', 'zero'))
 

@@ -31,7 +31,7 @@ class Speaker:
                 'inputSchema': {'type': 'object', 'properties': {
                     'action': {'type': 'string', 'enum': ['start', 'stop', 'info', 'set_volume', 'get_volume']},
                     'volume': {'type': 'integer', 'minimum': 0, 'maximum': 100,
-                               'description': '本PCM播放流音量0–100，不修改系统或厂商提示音音量'},
+                               'description': '0–100；本PCM播放流音量，不修改系统或厂商提示音音量'},
                     'input_topic': {'type': 'string', 'description': 'AudioChunk input topic provided by canvas'}},
                     'required': ['action'], 'x-resource': 'mouth',
                     'x-action-params': {name: {'params': ['input_topic'] if name == 'start' else
