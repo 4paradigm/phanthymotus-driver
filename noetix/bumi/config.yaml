@@ -93,3 +93,17 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+
+  # Read-only host observations, independent of the SDK and robot controls.
+  system_health:
+    enabled: true
+    sample_interval_s: 2.0
+    # Local observation policies, not vendor safety limits.
+    cpu_load_per_core_warn: 1.0
+    memory_used_percent_warn: 90.0
+    disk_used_percent_warn: 90.0
+    # The vision_capture bind mount; container "/" is the image overlay.
+    disk_paths:
+      - /opt/phanthy-motus/data
+    # Report temperatures without judging an unverified Bumi thermal limit.
+    temperature_warn_celsius: null

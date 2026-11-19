@@ -170,3 +170,29 @@ def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
     assert [tool["name"] for tool in bundle.get_all_tools()] == [
         "loco", "loco_servo", "speaker"]
 
+
+def test_system_health_registers_without_sdk_controllers(bundle_module):
+    bundle = bundle_module.BumiDeviceBundle(
+        {"plugins": {"system_health": {"enabled": True}}},
+        "bumi_test", object(), high_ctrl=None, media_ctrl=None)
+
+    tools = bundle.get_all_tools()
+    assert [(tool["name"], tool["type"]) for tool in tools] == [
+        ("system_health", "sensor")]
+    assert tools[0]["topic_out"] == [
+        {"topic": "/bumi_test/state/system_health", "format": "data/json"}]
+    assert bundle.dispatch("system_health", {"action": "info"})["state"] == "idle"
+    assert bundle.dispatch("system_health", {"action": "start"}) == {
+        "state": "idle", "topic_out": tools[0]["topic_out"]}
+    assert bundle._plugins[0]._worker is None
+
+
+def test_invalid_system_health_policy_skips_only_this_card(bundle_module, capsys):
+    cfg = _config(loco_servo=False)
+    cfg["plugins"]["system_health"] = {"enabled": True, "disk_paths": ["relative"]}
+    bundle = bundle_module.BumiDeviceBundle(
+        cfg, "bumi_test", object(), FakeHighCtrl(), None)
+
+    assert [tool["name"] for tool in bundle.get_all_tools()] == ["loco"]
+    assert "system_health skipped, invalid config" in capsys.readouterr().out
+
