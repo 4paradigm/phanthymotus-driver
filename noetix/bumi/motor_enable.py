@@ -43,10 +43,11 @@ class MotorEnablePlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["enable", "info", "start", "stop"]},
+                    "confirm": {"type": "boolean", "description": "确认机器人仰面平躺，关节活动范围安全且其他运动命令已停止。"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "enable": {"params": [], "description": "退出失能；使能前将机器人仰面平躺并确保关节活动范围安全。"},
+                    "enable": {"params": ["confirm"], "required": ["confirm"], "description": "确认安全放置后退出失能；使能前将机器人仰面平躺并确保关节活动范围安全。"},
                     "info": {"params": [], "description": "只读查询当前模式及上次使能是否仍未确认。"},
                 },
                 "x-is-dangerous": True,
@@ -74,6 +75,9 @@ class MotorEnablePlugin:
             return {"state": "completed", "command_sent": False,
                     "workmode": mode, "workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
                     "enable_unconfirmed": self._owner._enable_unconfirmed}
+        if args.get("confirm") is not True:
+            return {"state": "error", "command_sent": False, "code": "CONFIRM_REQUIRED",
+                    "error": "Confirm safe face-up placement and a clear joint movement area before enabling."}
         if not self._action_lock.acquire(blocking=False):
             return {"state": "error", "command_sent": False, "code": "ENABLE_BUSY",
                     "error": "A motor mode request is already active."}

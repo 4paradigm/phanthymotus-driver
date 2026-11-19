@@ -380,7 +380,7 @@ the existing HighController connection and has no additional worker.
 - `start` / `stop` are lifecycle actions and never toggle motor power. `stop`
   cancels pending observation; it cannot undo a START already delivered.
 - `info` reads workmode and whether an earlier enable attempt remains uncertain.
-- `enable` requires safe face-up placement on a flat, non-slip
+- `enable(confirm=true)` requires safe face-up placement on a flat, non-slip
   surface, free joints and a clear movement area. Enabling can move joints to
   zero; it does not stand the robot up or start walking.
 - From disabled (30), `enable` sends START once, releases it with DEFAULT, and

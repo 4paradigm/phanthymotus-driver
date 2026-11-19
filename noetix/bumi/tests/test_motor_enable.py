@@ -44,7 +44,21 @@ def card(monkeypatch):
 
 
 def call(plugin, action="enable", **args):
+    if action == "enable" and "confirm" not in args:
+        args["confirm"] = True
     return plugin.dispatch(action, {"_tool_name": "motor_enable", **args})
+
+
+@pytest.mark.parametrize("args", [{}, {"confirm": False}, {"confirm": "true"}, {"confirm": 1}])
+def test_enable_requires_explicit_boolean_confirmation(card, monkeypatch, args):
+    _, plugin, ctrl = card
+    def unexpected_reservation():
+        raise AssertionError("unconfirmed request reserved chassis")
+    monkeypatch.setattr(plugin._owner, "reserve_motor_enable", unexpected_reservation)
+    result = plugin.dispatch("enable", args)
+    assert result["code"] == "CONFIRM_REQUIRED"
+    assert result["command_sent"] is False
+    assert ctrl.commands == []
 
 
 def test_enable_once_and_repeat_does_not_disable(card):
@@ -224,9 +238,10 @@ def test_card_is_discoverable_in_enabled_bundle_and_manifest(card):
     tool = plugin.get_tool()
     assert tool["type"] == "actuator"
     assert tool["inputSchema"]["x-is-dangerous"] is True
-    assert tool["inputSchema"]["x-action-params"]["enable"]["params"] == []
+    assert tool["inputSchema"]["x-action-params"]["enable"]["params"] == ["confirm"]
+    assert tool["inputSchema"]["x-action-params"]["enable"]["required"] == ["confirm"]
     assert "disable" not in tool["inputSchema"]["properties"]["action"]["enum"]
-    assert "confirm" not in tool["inputSchema"]["properties"]
+    assert tool["inputSchema"]["properties"]["confirm"]["type"] == "boolean"
     bumi = Path(__file__).resolve().parents[1]
     manifest = yaml.safe_load((bumi / "driver.yaml").read_text(encoding="utf-8"))
     assert {"name": "motor_enable", "type": "actuator"} in manifest["cards"]
