@@ -149,6 +149,9 @@ def main(request):
     from nav_msgs.msg import Odometry
     rospy.init_node('motus_navigation_rpc', anonymous=True, disable_signals=True,
                     disable_rosout=True, log_level=rospy.ERROR)
+    if request['operation'] == 'stationary':
+        confirm_stationary(rospy, Odometry)
+        return {'success': True, 'stationary': True, 'completion_basis': 'fresh_distinct_odometry'}
     names = {'navigate': '/move_base/move_to_target', 'check': '/move_base/check_arrived',
              'cancel': '/move_base/set_dispatch_mode'}
     types = {'navigate': MoveToTarget, 'check': CheckArrived, 'cancel': SetDispatchMode}

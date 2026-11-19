@@ -507,6 +507,7 @@ class _KuavoPlugin:
                 startup = self.bundle.spatial.startup_status() if self.PREFIX == "base_drive" else {}
                 return {"state": startup.get("state") if startup.get("state") in ("loading", "error") else "ready" if self.ros1.connection[0] else "disconnected",
                         "motion_enabled": self.state.motion_enabled,
+                        **({"motion": self._pose_progress} if self.PREFIX == "base_drive" else {}),
                         "startup": self.bundle.spatial.startup_status() if self.PREFIX == "base_drive" else None,
                         "feedback": {**self.state.snapshot(),
                                      "host_runtime": dict(self.bundle.startup_checks.status)}}
@@ -661,8 +662,59 @@ class _KuavoPlugin:
                 "completion_basis": "continuous_until_stop" if duration == -1 else "command_duration_and_vendor_watchdog"}
 
 
+class _PoseServo:
+    """Bounded integral correction for small-command steady-state error.
+
+    Integrate only distinct observations near the target. Clear bias inside
+    each axis group's tolerance; never raise the selected speed envelope.
+    """
+    POSITION_TOLERANCE = .02
+    YAW_TOLERANCE = math.radians(1.)
+
+    def __init__(self, linear, angular):
+        self.linear, self.angular = linear, angular
+        self.bias = [0., 0., 0.]
+        self.capture = None
+
+    def command(self, dx, dy, da, yaw, captured):
+        dt = max(0., min(.1, captured-self.capture)) if self.capture is not None else 0.
+        if self.capture is None or captured > self.capture:
+            self.capture = captured
+        distance = math.hypot(dx, dy)
+        if distance <= self.POSITION_TOLERANCE or distance > .15:
+            self.bias[:2] = [0., 0.]
+        elif dt:
+            if dx*self.bias[0]+dy*self.bias[1] < 0:
+                self.bias[:2] = [0., 0.]
+            candidate = [self.bias[0]+.3*dx*dt, self.bias[1]+.3*dy*dt]
+            magnitude = math.hypot(*candidate)
+            scale = min(1., min(.08, self.linear*.5)/magnitude) if magnitude else 1.
+            candidate = [v*scale for v in candidate]
+            if math.hypot(.8*dx+candidate[0], .8*dy+candidate[1]) <= self.linear:
+                self.bias[:2] = candidate
+        if abs(da) <= self.YAW_TOLERANCE or abs(da) > .35:
+            self.bias[2] = 0.
+        elif dt:
+            if da*self.bias[2] < 0:
+                self.bias[2] = 0.
+            cap = min(.12, self.angular*.5)
+            candidate = max(-cap, min(cap, self.bias[2]+.3*da*dt))
+            if abs(.8*da+candidate) <= self.angular:
+                self.bias[2] = candidate
+        wx, wy = (.8*dx+self.bias[0], .8*dy+self.bias[1]) if distance > self.POSITION_TOLERANCE else (0., 0.)
+        magnitude = math.hypot(wx, wy)
+        scale = min(1., self.linear/magnitude) if magnitude else 1.
+        wx, wy = wx*scale, wy*scale
+        wz = max(-self.angular, min(self.angular, .8*da+self.bias[2])) if abs(da) > self.YAW_TOLERANCE else 0.
+        return math.cos(yaw)*wx+math.sin(yaw)*wy, -math.sin(yaw)*wx+math.cos(yaw)*wy, wz
+
+
 class BaseDrivePlugin(_KuavoPlugin):
     PREFIX, CHANNEL, ALLOWED_MODES = "base_drive", "base", (2, 3)
+
+    def __init__(self, bundle):
+        super().__init__(bundle)
+        self._pose_progress = None
 
     def start(self):
         return self.bundle.spatial.start_chassis()
@@ -722,8 +774,12 @@ class BaseDrivePlugin(_KuavoPlugin):
             self.CHANNEL, self.PREFIX, self.ALLOWED_MODES,
             lambda: self.bundle.twist('/cmd_vel'), validate,
             request_epoch=self._request_context.stop_epoch)
+        self._pose_progress = {'state': 'executing', 'action_id': aid, 'frame_id': frame[0],
+                               'target': {'x_m': target[0], 'y_m': target[1], 'yaw_deg': math.degrees(target[2])}}
         def worker():
             settled = last_capture = None
+            servo = _PoseServo(linear, angular)
+            best_score, last_progress = float('inf'), issued
             try:
                 while not cancelled.wait(.05):
                     with self.tracker.lock:
@@ -733,36 +789,56 @@ class BaseDrivePlugin(_KuavoPlugin):
                         if self.ros1.connection != (True, generation):
                             raise ConnectionError('connection changed during pose motion')
                         if time.monotonic()-issued > 110:
-                            raise TimeoutError('pose motion exceeded 110s')
+                            error = self._pose_progress.get('error', {})
+                            raise TimeoutError(f"pose motion exceeded 110s; position_error_m={error.get('position_m')}; yaw_error_deg={error.get('yaw_deg')}")
                         pose, captured, source = self.bundle.sensors.odom_pose()
                         if source != frame[0]:
                             raise RuntimeError('odometry frame changed during pose motion')
                         dx, dy = target[0]-pose[0], target[1]-pose[1]
                         da = math.atan2(math.sin(target[2]-pose[2]), math.cos(target[2]-pose[2]))
                         distance = math.hypot(dx, dy)
-                        close = distance <= .02 and abs(da) <= math.radians(1)
+                        self._pose_progress = {**self._pose_progress,
+                            'measured': {'x_m': pose[0], 'y_m': pose[1], 'yaw_deg': math.degrees(pose[2])},
+                            'error': {'position_m': round(distance, 6), 'yaw_deg': round(math.degrees(da), 6)},
+                            'elapsed_s': round(time.monotonic()-issued, 3), 'capture_time_s': captured}
+                        close = distance <= servo.POSITION_TOLERANCE and abs(da) <= servo.YAW_TOLERANCE
+                        score = max(distance/servo.POSITION_TOLERANCE, abs(da)/servo.YAW_TOLERANCE)
+                        if score < best_score-.1:
+                            best_score, last_progress = score, time.monotonic()
+                        elif not close and time.monotonic()-last_progress > 8:
+                            raise TimeoutError(f'pose motion stalled for 8s; position_error_m={distance:.4f}; yaw_error_deg={math.degrees(da):.3f}')
                         if close:
+                            servo.command(dx, dy, da, pose[2], captured)
+                            self._pose_progress = {**self._pose_progress, 'command': {'vx_m_s': 0., 'vy_m_s': 0., 'yaw_rad_s': 0.}}
                             self.bundle.twist('/cmd_vel')
                             if last_capture is None or captured > last_capture:
                                 if settled is None:
                                     settled = (captured, time.monotonic())
                                 elif captured-settled[0] >= .3 and time.monotonic()-settled[1] >= .3:
+                                    self._pose_progress = {**self._pose_progress, 'state': 'completed'}
                                     self.tracker.finish(self.CHANNEL, aid, self.PREFIX, 'completed', {
-                                        'completion_basis': 'measured_odometry_convergence', 'measured_convergence': True})
+                                        'completion_basis': 'measured_odometry_convergence', 'measured_convergence': True,
+                                        'error': self._pose_progress['error']})
                                     return
                         else:
                             settled = None
-                            scale = min(.8, linear/distance) if distance else 0.
-                            vx = scale*(math.cos(pose[2])*dx+math.sin(pose[2])*dy)
-                            vy = scale*(-math.sin(pose[2])*dx+math.cos(pose[2])*dy)
-                            self.bundle.twist('/cmd_vel', x=vx, y=vy, yaw=max(-angular,min(angular,.8*da)))
+                            vx, vy, wz = servo.command(dx, dy, da, pose[2], captured)
+                            self._pose_progress = {**self._pose_progress, 'command': {'vx_m_s': vx, 'vy_m_s': vy, 'yaw_rad_s': wz}}
+                            self.bundle.twist('/cmd_vel', x=vx, y=vy, yaw=wz)
                         last_capture = captured
             except Exception as exc:
+                self._pose_progress = {**self._pose_progress, 'state': 'error', 'reason': _safe_log(str(exc))}
                 self.bundle.pause(_safe_log(str(exc)), status='error', expected=(self.CHANNEL, aid))
+            finally:
+                if (cancelled.is_set() and self._pose_progress.get('action_id') == aid
+                        and self._pose_progress.get('state') == 'executing'):
+                    self._pose_progress = {**self._pose_progress, 'state': 'cancelled'}
         threading.Thread(target=worker, daemon=True, name='base-pose-feedback').start()
         return {'state': 'executing', 'action_id': aid, 'control_preparation': preparation,
                 'speed': speed, 'linear_limit_m_s': linear, 'angular_limit_deg_s': math.degrees(angular),
-                'completion_basis': 'measured_odometry_convergence', 'expected_duration_s': 115}
+                'completion_basis': 'measured_odometry_convergence',
+                'expected_duration_s': round(math.hypot(x,y)/linear+abs(yaw)/angular+2., 1),
+                'timeout_s': 110, 'stall_timeout_s': 8}
 
 
 class ArmPlugin(_KuavoPlugin):
@@ -848,9 +924,25 @@ class LowerBodyPlugin(_KuavoPlugin):
 
     def tool(self):
         if self.PREFIX == "leg":
-            return self.schema("Kuavo 5-W 下肢含膝、腿、腰俯仰/偏航；set_height保持躯干前后位置和俯仰，协调前三关节升降。", {
-                **{field: {'type': 'number', 'description': label + '绝对角度，度；set省略时保持实测值'}
-                   for field, (_, label) in self.FIELDS.items()},
+            fields = {}
+            try:
+                bounds = self.bundle.sensors.joint_bounds('leg')
+            except (RuntimeError, ValueError):
+                bounds = None
+            for field, (index, label) in self.FIELDS.items():
+                entry = {'type': 'number'}
+                if bounds:
+                    low, high = [math.degrees(v) for v in bounds[index]]
+                    entry.update(minimum=low, maximum=high)
+                    prefix = f'[{low:.3f}, {high:.3f}]°；'
+                else:
+                    prefix = '范围待实时关节限位核验；未核验时拒绝执行；'
+                fields[field] = {**entry, 'description': prefix+label+'绝对角度；set省略时保持实测值'}
+            range_summary = ('、'.join(f'{field.removesuffix("_deg")}[{math.degrees(bounds[i][0]):.3f},{math.degrees(bounds[i][1]):.3f}]°'
+                                      for field,(i,_) in self.FIELDS.items())
+                             if bounds else '角度范围待实时关节限位核验')
+            return self.schema(range_summary+"；动态高度范围见get_height；Kuavo 5-W 下肢含膝、腿、腰俯仰/偏航；set_height保持躯干前后位置和俯仰，协调前三关节升降。", {
+                **fields,
                 "height": {"type": "number", "description": "动态可达范围见get_height，单位m；waist_yaw_link原点相对base_link的Z坐标，非头顶离地高度"},
                 "positions": _array_schema(4, "四个下肢关节目标角度，度")}, {
                 'get_height': ([], '动态可达范围与当前高度，单位m；保持当前躯干x/俯仰和腰偏航，基于实时URDF和关节限位'),

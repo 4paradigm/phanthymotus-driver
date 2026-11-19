@@ -467,21 +467,23 @@ class ControlledSpatialPlugin:
                         raise RuntimeError('native_navigation_failed')
                     if code == 2 and status.get('arrived') is True:
                         pose, observation = self._observation(navigable=True)
-                        velocity = observation['state'].get('velocity', {})
-                        if any(abs(number(velocity.get(k), k)) > .01 for k in ('vx', 'vy', 'omega')):
+                        if observation['state'].get('driving') is not False:
                             continue
                         error = math.hypot(pose['x'] - target['x'], pose['y'] - target['y'])
                         yaw_error = abs(math.atan2(math.sin(pose['yaw'] - target['yaw']),
                                                    math.cos(pose['yaw'] - target['yaw'])))
                         if error > .15 or yaw_error > .15:
                             raise RuntimeError('native_arrival_pose_mismatch')
+                        stationary = self.client.native('stationary')
+                        if stationary.get('success') is not True or stationary.get('stationary') is not True:
+                            continue
                         with self.bundle.tracker.lock:
                             if not cancelled.is_set() and self.bundle.tracker.current('base', aid):
                                 self._task = None
                                 self._persist()
                                 self.bundle.tracker.finish('base', aid, self.PREFIX, 'completed',
                                     {'task_id': task_id, 'map': identity[0], 'position_error_m': error,
-                                     'completion_basis': 'native_task_id_arrival_and_map_pose'})
+                                     'completion_basis': 'native_task_id_arrival_map_pose_and_fresh_stationary_odometry'})
                         return
             except Exception:
                 self.bundle.pause('native_navigation_failed_or_unconfirmed', status='error', expected=('base', aid))
@@ -605,11 +607,14 @@ class ControlledSpatialPlugin:
         return {'state': 'executing', 'action_id': aid, 'operation': action}
 
     def _require_stationary(self):
-        state = self.client.observe()['state']
-        if state.get('driving') is not False or any(
-                abs(number(state.get('velocity', {}).get(k), k)) > .01
-                for k in ('vx', 'vy', 'omega')):
+        state = self.client.observe(required=('agvState', 'state'))['state']
+        # The factory web bridge can retain the final nonzero command velocity
+        # while driving=False. Use fresh raw odometry to establish a stop.
+        if state.get('driving') is not False:
             raise RuntimeError('stop_chassis_before_changing_map')
+        result = self.client.native('stationary')
+        if result.get('success') is not True or result.get('stationary') is not True:
+            raise RuntimeError('fresh_stationary_odometry_required_before_changing_map')
 
     def _mutate_map(self, action, args, mapping, cancelled):
         self._require_stationary()

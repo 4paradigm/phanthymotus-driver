@@ -1859,6 +1859,16 @@ class CardRevisionTests(unittest.TestCase):
         self.assertTrue(wait_until(lambda: self.callbacks))
         self.assertEqual(self.callbacks[0][2], 'error')
 
+    def test_leg_field_limits_are_live_and_front_loaded(self):
+        self.vendor_model()
+        schema = next(t for t in self.bundle.get_all_tools() if t['name']=='leg')
+        bounds = self.bundle.sensors.joint_bounds('leg')
+        for field,(index,_) in driver.LowerBodyPlugin.FIELDS.items():
+            entry = schema['inputSchema']['properties'][field]
+            self.assertTrue(entry['description'].startswith('['))
+            self.assertAlmostEqual(entry['minimum'], math.degrees(bounds[index][0]))
+            self.assertAlmostEqual(entry['maximum'], math.degrees(bounds[index][1]))
+
     def test_height_ik_preserves_x_pitch_yaw_including_fixed_base_transform(self):
         self.vendor_model()
         q = [math.radians(1), math.radians(-2), math.radians(1), .2]
@@ -1983,6 +1993,54 @@ class CardRevisionTests(unittest.TestCase):
         self.assertTrue(wait_until(lambda:self.callbacks))
         self.assertEqual(self.callbacks[0][2],'completed')
         self.assertTrue(self.callbacks[0][3]['measured_convergence'])
+
+    def test_pose_servo_overcomes_small_command_deadband_without_relaxing_tolerance(self):
+        # A plant that ignores small per-axis speeds reproduces the observed
+        # P-only stall. Integral correction must finish within the same 2cm/1deg.
+        pose = [0.,0.,0.]
+        servo = driver._PoseServo(.24,.3)
+        settled = 0
+        for step in range(600):
+            dx,dy = .2-pose[0], .2-pose[1]
+            da = math.atan2(math.sin(math.pi/2-pose[2]), math.cos(math.pi/2-pose[2]))
+            vx,vy,w = servo.command(dx,dy,da,pose[2],10.+step*.05)
+            self.assertLessEqual(math.hypot(vx,vy), .24+1e-9)
+            self.assertLessEqual(abs(w), .3+1e-9)
+            vx,vy,w = [v if abs(v)>=.05 else 0. for v in (vx,vy,w)]
+            pose[0] += (math.cos(pose[2])*vx-math.sin(pose[2])*vy)*.05
+            pose[1] += (math.sin(pose[2])*vx+math.cos(pose[2])*vy)*.05
+            pose[2] += w*.05
+            close = math.hypot(.2-pose[0],.2-pose[1])<=.02 and abs(math.pi/2-pose[2])<=math.radians(1.)
+            settled = settled+1 if close else 0
+            if settled >= 8:
+                break
+        self.assertGreaterEqual(settled, 8)
+
+    def test_pose_servo_replayed_samples_do_not_accumulate_and_bias_is_cleared_at_target(self):
+        servo = driver._PoseServo(.24,.3)
+        first = servo.command(.05,.05,.04,0.,10.)
+        for _ in range(100):
+            self.assertEqual(servo.command(.05,.05,.04,0.,10.),first)
+        servo.command(.05,.05,.04,0.,10.1)
+        self.assertTrue(any(servo.bias))
+        self.assertEqual(servo.command(.001,.001,.001,0.,10.2),(0.,0.,0.))
+        self.assertEqual(servo.bias,[0.,0.,0.])
+        for step in range(100):
+            vx,vy,w = servo.command(5.,5.,3.,0.,20.+step*.05)
+            self.assertLessEqual(math.hypot(vx,vy),.24+1e-9)
+            self.assertLessEqual(abs(w),.3+1e-9)
+        self.assertEqual(servo.bias,[0.,0.,0.])
+
+    def test_pose_info_reports_target_measured_residual_and_command(self):
+        self.bundle.sensors.odom_pose = lambda: ((2.,3.,0.), time.time(), 'odom')
+        result = self.call('base_drive', 'move_relative', x=.2, y=.2, yaw=90.)
+        self.assertTrue(wait_until(lambda: self.call('base_drive', 'info')['motion'].get('command')))
+        progress = self.call('base_drive', 'info')['motion']
+        self.assertEqual(progress['action_id'], result['action_id'])
+        self.assertEqual(progress['target'], {'x_m': 2.2, 'y_m': 3.2, 'yaw_deg': 90.})
+        self.assertAlmostEqual(progress['error']['position_m'], math.sqrt(.08), places=5)
+        self.assertEqual(progress['error']['yaw_deg'], 90.)
+        self.assertLessEqual(abs(progress['command']['yaw_rad_s']), .3)
 
     def test_pose_requires_fresh_stamped_odom_before_resume(self):
         self.assertIn('odometry',self.call('base_drive','move_relative',x=0.,y=0.,yaw=0.)['error'])

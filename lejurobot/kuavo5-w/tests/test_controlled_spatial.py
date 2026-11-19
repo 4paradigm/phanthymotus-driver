@@ -146,6 +146,8 @@ class Client:
         if operation == 'soft_stop':
             self.feedback['agvState']['softwareEstop'] = True
             return {'success': True, 'stationary': True, 'software_estop': True}
+        if operation == 'stationary':
+            return {'success': True, 'stationary': getattr(self, 'stationary', True)}
         if operation == 'cancel':
             return {'success': True, 'stationary': True}
         return {'owner': '/leju_node'}
@@ -396,10 +398,13 @@ class SpatialTests(unittest.TestCase):
         self.bundle.tracker.events.clear()
         self.client.feedback['pose2d']['x'] = 1
         self.client.feedback['state']['velocity']['vx'] = .2
+        self.client.stationary = False
         self.navigate()
         wait(lambda: any(c[0] == 'check' for c in self.client.calls))
         time.sleep(.3)
         self.assertFalse(self.bundle.tracker.events)
+        self.client.stationary = True
+        self.assertEqual(self.completed()[0], 'completed')
 
     def test_safety_faults_prevent_submit(self):
         for field in ('softwareEstop', 'estopButtonEvent', 'bumperEvent', 'driverError'):
@@ -536,6 +541,20 @@ class SpatialTests(unittest.TestCase):
             self.assertEqual(self.call(action, **args)['state'], 'error')
         self.assertFalse(self.plugin.unresolved())
         self.assertFalse(self.client.commands)
+
+    def test_map_stationary_uses_native_odom_despite_stale_web_velocity(self):
+        self.client.feedback['state']['velocity'] = {'vx': .1, 'vy': -.1, 'omega': -.05}
+        self.plugin._require_stationary()
+        self.assertEqual(self.client.calls, [('stationary', {})])
+        self.assertFalse(self.client.commands)
+
+    def test_missing_or_moving_native_odom_rejects_map_mutations(self):
+        for response in ({'success': True, 'stationary': False}, {'success': False}):
+            self.client.native = lambda *a, **k: response
+            result = self.call('start_mapping', map_name='new')
+            self.assertEqual(result['state'], 'error')
+            self.assertFalse(self.client.commands)
+            self.assertFalse(self.plugin.unresolved())
 
     def test_external_chassis_motion_prevents_map_change(self):
         self.client.feedback['state']['driving'] = True
@@ -834,6 +853,11 @@ class NativePreparationTests(unittest.TestCase):
             self.assertTrue(response['ok'])
             self.assertFalse(response['result']['success'])
             self.assertIs(response['result']['delivery_uncertain'], uncertain)
+
+    def test_stationary_probe_reads_odom_without_cancel_or_release(self):
+        result = self.call('stationary')
+        self.assertTrue(result['stationary'])
+        self.assertEqual(self.events, ['stationary'])
 
     def test_cancel_and_stationary_before_release_then_stationary_again(self):
         result = self.call()
