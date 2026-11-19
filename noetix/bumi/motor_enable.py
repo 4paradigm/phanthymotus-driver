@@ -80,6 +80,7 @@ class MotorEnablePlugin:
                     if (not self._owner._body_action and self._owner._enable_unconfirmed
                             and mode == self._owner._mode_toggle_target):
                         self._owner._enable_unconfirmed = False
+                        self._owner._enable_timeout_retry = False
                     unconfirmed = self._owner._enable_unconfirmed
             except Exception as exc:
                 return {"state": "error", "command_sent": False, "error": str(exc)}
@@ -117,7 +118,8 @@ class MotorEnablePlugin:
             if self._owner._enable_unconfirmed:
                 if mode == self._owner._mode_toggle_target:
                     self._owner._enable_unconfirmed = False
-                else:
+                    self._owner._enable_timeout_retry = False
+                elif not (mode == 30 and self._owner._enable_timeout_retry):
                     return {"state": "error", "command_sent": False, "code": "ENABLE_UNCONFIRMED",
                             "error": "Previous START delivery is uncertain. Inspect the robot and motion_state; START will not be resent."}
             if mode == target_mode:
@@ -140,10 +142,12 @@ class MotorEnablePlugin:
             time.sleep(0.01)
             self._owner._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
             deadline = time.monotonic() + 3.0
+            refresh_due = False
             while True:
                 mode = int(self._high_ctrl.get_mode())
                 if mode == target_mode:
                     self._owner._enable_unconfirmed = False
+                    self._owner._enable_timeout_retry = False
                     return {"state": "completed", "command_sent": True, "confirmed": True,
                             "workmode": mode, "workmode_name": _WORKMODE_NAMES[mode],
                             "message": "Requested mode observed; physical motion or settling is not confirmed."}
@@ -153,10 +157,21 @@ class MotorEnablePlugin:
                     return {"state": "cancelled", "command_sent": True, "confirmed": False,
                             "message": "Stopped waiting; enable may still take effect. Inspect motion_state."}
                 if time.monotonic() >= deadline:
+                    self._owner._enable_timeout_retry = True
                     return {"state": "error", "command_sent": True, "confirmed": False,
                             "code": "ENABLE_TIMEOUT", "workmode": mode,
-                            "error": "Requested mode was not observed within 3 seconds. START was not retried."}
-                self._enable_cancel.wait(0.05)
+                            "retry_available": True,
+                            "error": "等待使能反馈超时（3 秒），未自动重发 START。",
+                            "message": "检查机器人和状态后，可以再次确认并执行 enable。状态反馈可能滞后，上次指令也可能延迟生效；重试可能使已使能的机器人失能。"}
+                # Match the vendor demo's idle command cadence while waiting,
+                # without repeating START. Stop refreshing on cancellation or
+                # timeout, and keep every publish under the chassis owner lock.
+                if refresh_due:
+                    self._owner._publish_cmd(0, 0, 0, _get_default_cmd(), 0,
+                                             cancel_event=self._enable_cancel)
+                remaining = deadline - time.monotonic()
+                self._enable_cancel.wait(min(0.01, max(0.0, remaining)))
+                refresh_due = True
         except Exception as exc:
             return {"state": "error", "command_sent": None if attempted else False,
                     "command_attempted": attempted, "confirmed": False,

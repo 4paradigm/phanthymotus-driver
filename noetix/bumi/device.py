@@ -392,10 +392,12 @@ class LocoPlugin:
         self._rotate_stop_event = threading.Event()
         self._rotate_state: dict = {"state": "idle", "last_result": None}
         self._body_action: str | None = None
-        # START is a toggle. An unconfirmed request must block all local paths
-        # from issuing it again until enabled mode is observed.
+        # START is a toggle. An unconfirmed request blocks automatic paths;
+        # only a confirmed motor_enable retry after timeout may bypass it.
         self._enable_unconfirmed = False
         self._mode_toggle_target = None
+        # Only a completed motor_enable timeout permits an explicit retry.
+        self._enable_timeout_retry = False
         # ACP async completion for rotate: worker thread + the single active
         # action whose terminal callback fires exactly once.
         self._rotate_worker: threading.Thread | None = None
@@ -453,6 +455,7 @@ class LocoPlugin:
             command = _get_control_cmd("START")
             self._mode_toggle_target = target_mode
             self._enable_unconfirmed = True
+            self._enable_timeout_retry = False
             self._high_ctrl.publish_cmd(0, 0, 0, command, 0)
             self._last_cmd_time = time.monotonic()
             return 30
@@ -1584,6 +1587,7 @@ class LocoPlugin:
         mode = int(self._high_ctrl.get_mode())
         if self._enable_unconfirmed and mode == self._mode_toggle_target:
             self._enable_unconfirmed = False
+            self._enable_timeout_retry = False
         if mode == 26:
             return self._protection_error(requested_action, steps, mode)
 
@@ -1638,6 +1642,7 @@ class LocoPlugin:
         if command_name == "START":
             self._mode_toggle_target = 0
             self._enable_unconfirmed = True
+            self._enable_timeout_retry = False
         observed = self._send_edge_and_wait(
             _get_control_cmd(command_name), expected_modes | {26}, timeout_s=3.0)
         if command_name == "START" and observed == 0:

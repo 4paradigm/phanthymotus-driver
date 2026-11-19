@@ -384,20 +384,26 @@ the existing HighController connection and has no additional worker.
   surface, free joints and a clear movement area. Enabling can move joints to
   zero; it does not stand the robot up or start walking.
 - From disabled (30), `enable` sends START once, releases it with DEFAULT, and
-  waits up to 3 seconds for enabled (0). If already enabled, it sends nothing.
+  refreshes zero DEFAULT commands at roughly 10 ms intervals while waiting up to
+  3 seconds for enabled (0), cancellation, or another mode. This follows the
+  vendor example's cadence; it has not been validated on hardware. If already
+  enabled, it sends nothing.
   Protection (26) and other modes are refused. Active chassis actions are
   refused; the streaming servo is paused and shared publishing is serialized.
-- Missing/failed feedback is not success. An uncertain START attempt blocks
-  another START through this card or automatic action preparation during
-  this driver process. A subsequent `info` or `enable` call that observes the
+- A timeout reports `ENABLE_TIMEOUT` and permits a new, explicitly confirmed
+  `enable` request if the reported mode is still 30. Automatic action preparation
+  remains blocked while the earlier START is unconfirmed. Cancellation and SDK
+  errors keep the guard and do not permit this timeout retry. Observing the
   target mode clears the guard without publishing; `info` leaves it set while
-  a body action is in flight. Restarting the driver clears the in-memory guard; it is
-  not a recovery action and must not be used to blindly retry.
+  a body action is in flight. Restarting the driver clears the in-memory guard;
+  it is not a recovery action and must not be used to blindly retry.
 
 The vendor [Bumi documentation](https://web.noetixrobotics.com/docs/) defines
 START as a toggle: outside mode 30 it **disables** the robot. The driver checks
 mode again immediately before sending, but the SDK exposes cached mode without
-a source timestamp or an atomic compare-and-enable API. Do not operate the App
+a source timestamp or an atomic compare-and-enable API. A timed-out START may
+take effect later: retrying against stale mode 30 can disable an enabled robot.
+Inspect the robot and its state before deciding to retry. Do not operate the App
 or another SDK controller concurrently: the shared owner coordinates only this
 bundle. Inspect the robot and state after an unconfirmed attempt. `completed` means enabled mode was
 observed, not that physical joint motion has finished. Firmware protection is

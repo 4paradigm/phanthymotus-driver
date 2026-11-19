@@ -123,22 +123,85 @@ def test_protection_during_enable_is_not_success(card):
     assert [c[3] for c in ctrl.commands] == ["START", "DEFAULT"]
 
 
-def test_timeout_blocks_blind_retry(card, monkeypatch):
+def test_timeout_allows_confirmed_retry_but_blocks_automatic_preparation(card, monkeypatch):
+    module, plugin, ctrl = card
+    ctrl.next_mode = 30
+    clock = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(plugin._enable_cancel, "wait", lambda _: clock.__setitem__(0, clock[0] + 1))
+    timeout = call(plugin)
+    assert timeout["code"] == "ENABLE_TIMEOUT" and timeout["retry_available"] is True
+    assert plugin._owner._prepare_workmode(1, "stand_up")["state"] == "error"
+    commands = [c[3] for c in ctrl.commands]
+    assert commands[0] == "START" and commands.count("START") == 1
+    assert len(commands) > 2 and set(commands[1:]) == {"DEFAULT"}
+    assert plugin.dispatch("enable", {})["code"] == "CONFIRM_REQUIRED"
+    ctrl.next_mode = 0
+    retry = call(plugin)
+    assert retry["state"] == "completed" and retry["confirmed"] is True
+    assert [c[3] for c in ctrl.commands].count("START") == 2
+    assert plugin._owner._enable_timeout_retry is False
+
+
+def test_info_reconciles_delayed_ack_after_timeout(card, monkeypatch):
     module, plugin, ctrl = card
     ctrl.next_mode = 30
     clock = [100.0]
     monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(plugin._enable_cancel, "wait", lambda _: clock.__setitem__(0, clock[0] + 1))
     assert call(plugin)["code"] == "ENABLE_TIMEOUT"
-    assert call(plugin)["code"] == "ENABLE_UNCONFIRMED"
-    assert plugin._owner._prepare_workmode(1, "stand_up")["state"] == "error"
-    assert [c[3] for c in ctrl.commands] == ["START", "DEFAULT"]
+    commands = [c[3] for c in ctrl.commands]
     ctrl.mode = 0  # Delayed acknowledgement: no second START is necessary.
     info = call(plugin, "info")
     assert info["workmode"] == 0
     assert info["enable_unconfirmed"] is False
     assert plugin._owner._enable_unconfirmed is False
-    assert len(ctrl.commands) == 2
+    assert plugin._owner._enable_timeout_retry is False
+    assert [c[3] for c in ctrl.commands] == commands
+
+
+def test_timeout_retry_rechecks_mode_before_sending(card, monkeypatch):
+    _, plugin, ctrl = card
+    plugin._owner._enable_unconfirmed = True
+    plugin._owner._mode_toggle_target = 0
+    plugin._owner._enable_timeout_retry = True
+    modes = iter([30, 0])
+    monkeypatch.setattr(ctrl, "get_mode", lambda: next(modes))
+    result = call(plugin)
+    assert result["command_sent"] is False
+    assert ctrl.commands == []
+
+
+def test_delayed_mode_feedback_stops_default_refresh(card, monkeypatch):
+    module, plugin, ctrl = card
+    ctrl.next_mode = 30
+    clock = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(plugin._enable_cancel, "wait", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    publish = ctrl.publish_cmd
+    def acknowledge_after_refresh(*args):
+        publish(*args)
+        if [c[3] for c in ctrl.commands].count("DEFAULT") == 3:
+            ctrl.mode = 0
+    monkeypatch.setattr(ctrl, "publish_cmd", acknowledge_after_refresh)
+    result = call(plugin)
+    assert result["state"] == "completed" and result["confirmed"] is True
+    assert [c[3] for c in ctrl.commands] == ["START", "DEFAULT", "DEFAULT", "DEFAULT"]
+
+
+def test_stop_during_default_refresh_retains_guard(card, monkeypatch):
+    _, plugin, ctrl = card
+    ctrl.next_mode = 30
+    publish = ctrl.publish_cmd
+    def cancel_after_refresh(*args):
+        publish(*args)
+        if [c[3] for c in ctrl.commands].count("DEFAULT") == 2:
+            call(plugin, "stop")
+    monkeypatch.setattr(ctrl, "publish_cmd", cancel_after_refresh)
+    result = call(plugin)
+    assert result["state"] == "cancelled" and result["command_sent"] is True
+    assert [c[3] for c in ctrl.commands] == ["START", "DEFAULT", "DEFAULT"]
+    assert call(plugin)["code"] == "ENABLE_UNCONFIRMED"
 
 
 def test_info_does_not_clear_uncertainty_during_body_action(card):
