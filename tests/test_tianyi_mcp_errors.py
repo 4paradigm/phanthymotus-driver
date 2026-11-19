@@ -24,17 +24,17 @@ def call_tool():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    def call(reply):
+    def call(reply, *, name="wrist_camera", action="start"):
         bundle.reply = reply
         conn = http.client.HTTPConnection(*server.server_address, timeout=5)
         try:
             conn.request("POST", "/mcp", json.dumps({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": {"name": "wrist_camera", "arguments": {"action": "start"}},
+                "params": {"name": name, "arguments": {"action": action}},
             }), {"Content-Type": "application/json"})
             response = conn.getresponse()
             assert response.status == 200
-            return json.loads(response.read())["result"]
+            return json.loads(response.read())
         finally:
             conn.close()
 
@@ -55,6 +55,22 @@ def call_tool():
     ({"state": "running", "error": "Capture failed"}, True),
 ])
 def test_mcp_error_flag_requires_an_actual_error(call_tool, reply, is_error):
-    result = call_tool(reply)
+    result = call_tool(reply)["result"]
     assert bool(result.get("isError")) is is_error
     assert json.loads(result["content"][0]["text"]) == reply
+
+
+def test_loco_servo_config_rejection_reaches_the_startup_gate(call_tool):
+    reason = "loco_servo.min_vx must be finite and between 0 and max_vx (0.3)"
+    reply = call_tool({"state": "error", "error": reason}, name="loco_servo", action="config")
+
+    assert reply["error"]["message"] == reason
+    assert "result" not in reply
+
+
+def test_loco_servo_config_accepts_false_as_a_normal_result(call_tool):
+    config = {"state": "idle", "ok": True, "dry_run": False}
+    reply = call_tool(config, name="loco_servo", action="config")
+
+    assert "error" not in reply
+    assert json.loads(reply["result"]["content"][0]["text"]) == config

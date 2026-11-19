@@ -824,9 +824,15 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
+                    servo_config = name == "loco_servo" and args.get("action") == "config"
                     result = _bundle.dispatch(name, args)
+                    failed = isinstance(result, dict) and (result.get("state") == "error"
+                                                          or result.get("error"))
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
+                    elif servo_config and failed:
+                        # Canvas startup checks the JSON-RPC error before sending start.
+                        err(-32000, result.get("error") or "loco_servo configuration failed")
                     else:
                         tool_result = {
                             "content": [{
@@ -834,9 +840,7 @@ def make_handler():
                                 "text": json.dumps(result, ensure_ascii=False),
                             }],
                         }
-                        if (isinstance(result, dict)
-                                and (result.get("state") == "error"
-                                     or result.get("error"))):
+                        if failed:
                             tool_result["isError"] = True
                         ok(tool_result)
                 else:
