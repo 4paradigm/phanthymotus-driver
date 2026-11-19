@@ -332,6 +332,7 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 调用厂商 CANCEL_CURRENT_TASK(2) 取消旧任务，确认新鲜里程计连续停稳，再在软急停有效时
 调用 CANCEL_SOFT_STOP(1)，最后核实原始反馈、界面状态与停稳；首次立即返回 `state: loading` 和英文消息 `Checking chassis status in background, please wait. Control will be ready automatically.`；`info` 可查询 loading/running/error。两张卡共享同一后台检查，同一次连接且未停止时不重复取消任务。停止或重连后重新检查。
 这一步不发送移动目标，不恢复旧任务，不使能全身控制；后续显式运动仍按既有流程恢复控制。
+启动只要求新鲜的`agvState/state`故障与行驶状态，不依赖地图定位帧；实际导航仍必须收齐`pose2d/agvState/state/localizationStatus`并通过定位校验。每次快照使用新连接，所需帧的接收年龄须≤2s。启动快照超时或断连时最多读取3次，期间保持loading并显示缺失字段；仅重试读取，不重复取消任务或解除请求。持续失败返回`fresh_navigation_state_unavailable: missing=...; reason=...`，方便区分缺帧与连接故障。中断或关闭会阻止后续准备。
 两张卡的 `info` 只读，显示地图、定位、急停、在途任务和建图阶段。
 `motion_enabled: false`、硬件故障或已存在的在途/未确认动作会阻止准备，不会强行清除。
 停止可抢占准备：较早解除请求返回后，再设置软急停(0)、取消任务并核实反馈；

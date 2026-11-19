@@ -8,7 +8,7 @@ import threading
 import time
 from uuid import uuid4
 
-from spatial_client import JatenClient
+from spatial_client import JatenClient, NavigationStateUnavailable
 
 
 def text(value, field):
@@ -232,6 +232,26 @@ class ControlledSpatialPlugin:
             status['motion_music'] = dict(self._music_status)
             return status
 
+    def _startup_observation(self, epoch):
+        """Retry reads only; never resubmit prepare/release on a missing frame."""
+        for attempt in range(3):
+            if self._closed.is_set() or epoch != self.bundle._stop_epoch:
+                raise RuntimeError('chassis_start_superseded_by_stop')
+            try:
+                result = self.client.observe(required=('agvState', 'state'))
+                if self._closed.is_set() or epoch != self.bundle._stop_epoch:
+                    raise RuntimeError('chassis_start_superseded_by_stop')
+                return result
+            except NavigationStateUnavailable as exc:
+                if attempt == 2:
+                    raise
+                with self._startup_guard:
+                    self._startup = {'state': 'loading',
+                        'message': 'Waiting for fresh chassis status, retrying in background. Please wait.',
+                        'state_read_attempt': attempt + 1, 'missing_state': list(exc.missing)}
+                if self._closed.wait(.5):
+                    raise RuntimeError('driver_is_shutting_down')
+
     def prepare_chassis(self, request_epoch=None):
         """Explicit card start: cancel old tasks, release soft stop, confirm rest.
 
@@ -248,7 +268,7 @@ class ControlledSpatialPlugin:
                 raise RuntimeError('previous_chassis_operation_unresolved_stop_first')
             if not self.bundle.ros1.connection[0]:
                 raise RuntimeError('control_connection_is_disconnected')
-            self._check_chassis_faults(self.client.observe())
+            self._check_chassis_faults(self._startup_observation(epoch))
             with self.bundle.tracker.lock:
                 if epoch != self.bundle._stop_epoch:
                     raise RuntimeError('chassis_start_superseded_by_stop')
@@ -272,7 +292,7 @@ class ControlledSpatialPlugin:
                                        else 'chassis_preparation_not_confirmed')
                 self._preparation = {'delivery_uncertain': False}
                 self._persist()
-            observation = self.client.observe()
+            observation = self._startup_observation(epoch)
             self._check_chassis_faults(observation)
             if observation['agvState'].get('softwareEstop') is not False:
                 raise RuntimeError('chassis_software_stop_release_unconfirmed')

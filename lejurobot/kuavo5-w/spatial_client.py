@@ -7,6 +7,7 @@ No motion, map changes or service restarts occur during construction/probing.
 import json
 from contextlib import closing
 import os
+import socket
 from pathlib import Path
 import time
 import urllib.request
@@ -14,6 +15,15 @@ from uuid import uuid4
 
 
 from bootstrap import load_secrets
+
+
+class NavigationStateUnavailable(RuntimeError):
+    """Bounded diagnostics for a read-only, retryable state acquisition."""
+    def __init__(self, missing, reason='timeout'):
+        self.missing = tuple(sorted(missing))
+        self.reason = reason
+        super().__init__('fresh_navigation_state_unavailable: missing=' + ','.join(self.missing)
+                         + '; reason=' + reason)
 
 
 class JatenClient:
@@ -84,25 +94,39 @@ class JatenClient:
             raise RuntimeError('invalid_navigation_websocket_frame')
         return value
 
-    def observe(self):
-        # A new socket ensures no old cached observations can pass freshness.
+    def observe(self, required=None):
+        # Base readiness needs fresh faults/driving, not map localization. A
+        # navigation request still uses all four fields by default.
         import websocket
-        seen, end = {}, time.monotonic() + 5
-        with closing(websocket.create_connection(self.ws_url, timeout=2, http_proxy_host=None)) as ws:
-            while time.monotonic() < end:
-                try:
-                    frame = self._frame(ws.recv())
-                except websocket.WebSocketTimeoutException:
-                    continue
-                key, data = frame.get('type'), frame.get('data')
-                if key == 'state' and isinstance(data, dict):
-                    seen[key] = data
-                elif key in ('pose2d', 'agvState', 'localizationStatus') and isinstance(data, dict):
-                    if isinstance(data.get('data'), dict):
-                        seen[key] = data['data']
-                if all(key in seen for key in ('pose2d', 'agvState', 'state', 'localizationStatus')):
-                    return seen
-        raise RuntimeError('fresh_navigation_state_unavailable')
+        required = frozenset(required or ('pose2d', 'agvState', 'state', 'localizationStatus'))
+        supported = {'pose2d', 'agvState', 'state', 'localizationStatus'}
+        if not required <= supported:
+            raise ValueError('unsupported_navigation_state_field')
+        seen, received, end = {}, {}, time.monotonic() + 5
+        def missing():
+            now = time.monotonic()
+            return required - {key for key, at in received.items() if now-at <= 2.}
+        try:
+            # Fresh socket per snapshot; never accept a prior connection cache.
+            with closing(websocket.create_connection(self.ws_url, timeout=2, http_proxy_host=None)) as ws:
+                while time.monotonic() < end:
+                    try:
+                        frame = self._frame(ws.recv())
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    key, data = frame.get('type'), frame.get('data')
+                    if key == 'state' and isinstance(data, dict):
+                        seen[key] = data
+                        received[key] = time.monotonic()
+                    elif key in ('pose2d', 'agvState', 'localizationStatus') and isinstance(data, dict):
+                        if isinstance(data.get('data'), dict):
+                            seen[key] = data['data']
+                            received[key] = time.monotonic()
+                    if not missing():
+                        return seen
+        except (OSError, socket.timeout, websocket.WebSocketException):
+            raise NavigationStateUnavailable(missing(), 'connection') from None
+        raise NavigationStateUnavailable(missing())
 
     def command(self, method, params, timeout=25):
         import websocket

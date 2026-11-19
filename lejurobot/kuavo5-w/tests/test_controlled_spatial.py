@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from controlled_spatial import ControlledSpatialPlugin, SpatialStore
-from spatial_client import JatenClient
+from spatial_client import JatenClient, NavigationStateUnavailable
 
 
 def wait(predicate, timeout=2):
@@ -156,7 +156,7 @@ class Client:
     def maps(self):
         return self.grid_maps
 
-    def observe(self):
+    def observe(self, required=None):
         return copy.deepcopy(self.feedback)
 
     def command(self, method, params, timeout):
@@ -200,6 +200,47 @@ class SpatialTests(unittest.TestCase):
     def completed(self):
         wait(lambda: bool(self.bundle.tracker.events))
         return self.bundle.tracker.events[-1]
+
+    def test_start_retries_read_only_state_before_preparing_exactly_once(self):
+        original = self.client.observe
+        calls = []
+        def delayed(required=None):
+            calls.append(required)
+            if len(calls) <= 2:
+                raise NavigationStateUnavailable(['state'])
+            return original(required)
+        self.client.observe = delayed
+        self.assertEqual(self.call('start')['state'], 'running')
+        self.assertEqual([c[0] for c in self.client.calls], ['prepare'])
+        self.assertEqual(calls, [('agvState', 'state')] * 4)
+
+    def test_persistent_missing_state_has_diagnostic_without_control_mutation(self):
+        self.client.observe = lambda **kw: (_ for _ in ()).throw(NavigationStateUnavailable(['agvState']))
+        result = self.call('start')
+        self.assertEqual(result['state'], 'error')
+        self.assertIn('missing=agvState', result['error'])
+        self.assertFalse(self.client.calls)
+        self.assertFalse(self.plugin.unresolved())
+
+    def test_stop_during_missing_state_retry_cannot_later_prepare(self):
+        self.client.observe = lambda **kw: (_ for _ in ()).throw(NavigationStateUnavailable(['state']))
+        self.plugin.start_chassis()
+        wait(lambda: self.plugin.startup_status().get('missing_state') == ['state'])
+        self.bundle._stop_epoch += 1
+        self.plugin._startup_thread.join(2)
+        self.assertFalse(self.client.calls)
+
+    def test_post_prepare_state_retry_does_not_repeat_remote_commands(self):
+        original = self.client.observe
+        reads = []
+        def observe(required=None):
+            reads.append(required)
+            if len(reads) == 2:
+                raise NavigationStateUnavailable(['state'])
+            return original(required)
+        self.client.observe = observe
+        self.assertEqual(self.call('start')['state'], 'running')
+        self.assertEqual([c[0] for c in self.client.calls], ['prepare'])
 
     def test_contract_lifecycle_resource_and_acp(self):
         schema = self.plugin.get_tool()['inputSchema']
@@ -518,6 +559,44 @@ class SpatialTests(unittest.TestCase):
 
 
 class ClientTests(unittest.TestCase):
+    def test_base_observation_does_not_require_map_frames_but_navigation_does(self):
+        frames = [json.dumps({'type': 'state', 'data': {'driving': False}}),
+                  json.dumps({'type': 'agvState', 'data': {'data': {'softwareEstop': True}}})]
+        class Socket:
+            def __init__(self): self.frames = iter(frames)
+            def close(self): pass
+            def recv(self):
+                try: return next(self.frames)
+                except StopIteration: raise ConnectionError('closed')
+        ws = types.SimpleNamespace(create_connection=lambda *a, **k: Socket(),
+            WebSocketTimeoutException=TimeoutError, WebSocketException=ConnectionError)
+        client = object.__new__(JatenClient);client.ws_url='ws://test'
+        with patch.dict(sys.modules, {'websocket': ws}):
+            result=client.observe(required=('agvState','state'))
+            self.assertIs(result['state']['driving'],False)
+            with self.assertRaises(NavigationStateUnavailable) as caught:
+                client.observe()
+            self.assertEqual(caught.exception.missing, ('localizationStatus','pose2d'))
+
+    def test_old_received_frame_does_not_satisfy_snapshot_freshness(self):
+        clock = [0.]
+        frames = iter([(0., {'type':'state','data':{'driving':False}}),
+                       (3., {'type':'agvState','data':{'data':{'softwareEstop':False}}})])
+        class Socket:
+            def close(self): pass
+            def recv(self):
+                try:
+                    clock[0], frame = next(frames)
+                    return json.dumps(frame)
+                except StopIteration: raise ConnectionError('closed')
+        ws=types.SimpleNamespace(create_connection=lambda *a, **kw:Socket(),
+            WebSocketTimeoutException=TimeoutError,WebSocketException=ConnectionError)
+        client=object.__new__(JatenClient);client.ws_url='ws://test'
+        with patch.dict(sys.modules,{'websocket':ws}), patch('spatial_client.time.monotonic',side_effect=lambda:clock[0]):
+            with self.assertRaises(NavigationStateUnavailable) as caught:
+                client.observe(required=('agvState','state'))
+            self.assertEqual(caught.exception.missing,('state',))
+
     def test_grid_content_identity_not_road_md5_alone(self):
         client = object.__new__(JatenClient)
         client.current_map = lambda: {'mapId': 'factory', 'mapMd5': 'unchanged-road'}
