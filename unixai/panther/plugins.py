@@ -211,6 +211,18 @@ def build_plugins(config, namespace, device):
         plugins.append(CameraPlugin(
             device, "camera_depth", "depth", "Panther Gemini 2 depth stream (zlib 16UC1)"
         ))
+    if on("vision_capture"):
+        schema = _action_schema(
+            ["capture_photo", "start", "info", "stop"], {},
+            {"capture_photo": {"params": [], "description": "Save the next RGB frame as a JPEG"},
+             "start": {"params": [], "description": "Check for a running RGB source"},
+             "info": {"params": [], "description": "Read the camera status and photo directory"},
+             "stop": {"params": [], "description": "End the card lifecycle"}},
+        )
+        plugins.append(ActuatorPlugin(
+            device, "vision_capture", "Save a new photo from the running Panther RGB camera",
+            schema, device.vision_capture,
+        ))
     if on("mic") or on("speaker"):
         from audio import AudioPlugin
         for name in ("mic", "speaker"):
