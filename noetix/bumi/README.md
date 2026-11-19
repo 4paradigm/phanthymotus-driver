@@ -1,6 +1,6 @@
 # Noetix Bumi driver
 
-The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
+The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the object-memory card lives in `object_memory_card.py` (shared logic in `object_memory_core.py`); the other cards remain in `device.py`.
 
 ## `mic` and `sound_direction`
 
@@ -367,6 +367,106 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 
 `footprint` 的出错方向是单边的（以为自己更宽只是多减速，以为更窄就是把肩膀送进
 门框），所以默认值刻意偏宽；死区不是，所以它宁可声明成估计值也不写零。
+
+## `object_memory` 卡片：订阅场景图并记住物品位置
+
+这个拷贝只保留位置记忆流水线的第二张卡：订阅 `scene_graph` 产出的场景图和标注
+截图，把它们写成一份本地记忆。
+
+两种用法：
+
+- **单独使用**：接上一路 `scene_graph/state` + `scene_graph/evidence`，就可以
+  `remember`、`list`、`get`、`forget`、`info`，不依赖相机或检测器。
+- **与完整流水线组合**：写出的 `memory.json` 就是第三张 `object_locator` 读取的
+  同一份记忆；同时把完整 memory 发布到 `object_memory/state` 供监控。
+
+本卡不读相机、不跑检测、不做自然语言问答。
+
+### 动作
+
+| action | 说明 |
+|---|---|
+| `remember` | 把最近一次 `scene_graph` 场景写入记忆；可选 `note` |
+| `list` | 列出已记住的物品（标签、时间、距离、证据路径） |
+| `get` | 按标签直接取回一条记忆（位置、关系、证据路径、次数） |
+| `forget` | 按标签删除一条；不填 `label` 清空全部记忆 |
+| `info` | 输入新鲜度、记忆数量、存储路径、更新时间 |
+| `start` | 检查 ROS 输入和存储目录 |
+
+示例：
+
+```json
+{"tool": "object_memory", "action": "remember"}
+{"tool": "object_memory", "action": "list"}
+{"tool": "object_memory", "action": "get", "label": "钥匙"}
+```
+
+`remember` 返回（节选）：
+
+```json
+{
+  "state": "remembered",
+  "scene_id": "3f2a...",
+  "count": 2,
+  "labels": ["keys", "cup"],
+  "objects": [{"label": "keys", "distance_m": 0.82, "pixel": [301, 244]}],
+  "edges": [{"source": "obj1", "relation": "left_of", "target": "obj2"}],
+  "evidence_path": "/opt/phanthy-motus/data/memory_palace/evidence/scene_....jpg",
+  "memory_path": "/opt/phanthy-motus/data/memory_palace/memory.json"
+}
+```
+
+### 接线
+
+```text
+scene_graph/state  ──► object_memory ──► memory.json
+scene_graph/evidence ──►             └──► object_memory/state（完整 memory）
+```
+
+与完整流水线组合时，`scene_graph` 负责采集，`object_memory` 负责持久化，
+`object_locator` 读取同一份 `memory.json` 回答问题；三张卡的字段/路径保持一致。
+
+### 记忆格式
+
+`memory.json`：
+
+- `objects`：按归一化标签索引，保存 `label`、`position`、`pixel`、`scene_width`、
+  `distance_m`、`confidence`、`scene_id`、`evidence`、`first_seen`、`last_seen`、
+  `sightings`、`relations`；
+- `scenes`：最近 40 个场景的完整场景图（供查询卡重放/标注）；
+- `updated_at`：最近一次写入时间。
+
+证据 JPEG 写到 `<storage_dir>/evidence/`，最多保留 200 张；记忆文件原子写入，
+损坏时回退为空记忆。
+
+### 与基本卡片的关系
+
+| 基本卡片 | 本卡片怎么用 |
+|---|---|
+| `camera` / `depth` / `vision_capture` | 完全不直接使用；只消费 `scene_graph` 的话题 |
+| `visual_odometry` | 不使用；记忆是场景图给出的相对位置，不是世界地图 |
+| `scene_graph`（第一张卡） | 唯一输入源；话题和字段契约与它一致 |
+
+### 配置
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `storage_dir` | `/opt/phanthy-motus/data/memory_palace` | 记忆与证据目录（与第三张卡共用） |
+| `scene_topic` | `/<namespace>/scene_graph/state` | 场景图输入 |
+| `evidence_topic` | `/<namespace>/scene_graph/evidence` | 标注截图输入 |
+
+### 限制
+
+- 没有新鲜的场景图时 `remember` 返回 `scene_unavailable`，不会伪造位置；
+- 记忆是“上次看到时”的相对位置，不是全局地图；
+- 只保留最近 40 个场景、200 张证据图；
+- 本卡不做自然语言问答；问答由第三张 `object_locator` 读取 `memory.json` 完成。
+
+测试：
+
+```bash
+python -m pytest noetix/bumi/tests/test_object_memory.py noetix/bumi/tests/test_object_memory_card.py -q
+```
 
 ## Direct action cards
 
