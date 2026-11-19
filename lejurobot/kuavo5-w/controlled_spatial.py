@@ -352,10 +352,12 @@ class ControlledSpatialPlugin:
         if navigable:
             agv = observation['agvState']
             if agv.get('isMapping') is not False or agv.get('runningMode') != 'AUTO':
-                raise RuntimeError('navigation_requires_localized_auto_mode')
+                raise RuntimeError('navigation_requires_localized_auto_mode: isMapping='
+                                   + str(agv.get('isMapping')) + ', runningMode=' + str(agv.get('runningMode')))
             if (agv.get('softwareEstop') is not False or agv.get('estopButtonEvent') is not False
                     or agv.get('bumperEvent') is not False or agv.get('driverError') is not False):
-                raise RuntimeError('chassis_stop_or_fault_is_active')
+                flags = ('softwareEstop', 'estopButtonEvent', 'bumperEvent', 'driverError')
+                raise RuntimeError('chassis_stop_or_fault_is_active: ' + ','.join(k for k in flags if agv.get(k) is not False))
             if observation['localizationStatus'].get('cartoStatusId') != 1:
                 raise RuntimeError('cartographer_localization_not_ready')
         if navigable and state['agvPosition'].get('mapId') != self._identity()[0]:
@@ -473,6 +475,13 @@ class ControlledSpatialPlugin:
                         self.bundle.state.require_motion((2, 3))
                         if self.bundle.ros1.connection != (True, generation):
                             raise RuntimeError('navigation_control_connection_changed')
+                        upper_velocity, _ = self.bundle.state.read('upper_velocity_enabled')
+                        if upper_velocity is not False:
+                            raise RuntimeError('upper_mpc_velocity_handoff_lost')
+                        source, source_at = self.bundle.state.read('base_velocity_source')
+                        if (time.monotonic()-issued > 5 and time.monotonic()-source_at < 2
+                                and source == 'nav_mpc_move_base'):
+                            raise RuntimeError('native_navigation_velocity_source_overridden_by_upper_mpc')
                     if time.monotonic() - issued >= self.NAV_TIMEOUT:
                         raise TimeoutError('navigation_timeout')
                     if self._identity() != identity:
@@ -486,6 +495,8 @@ class ControlledSpatialPlugin:
                     if status.get('success') is not True:
                         raise RuntimeError('task_status_query_failed')
                     code = status.get('status')
+                    record['native_status'] = code
+                    record['native_arrived'] = status.get('arrived')
                     if type(code) is not int or code not in (0, 1, 2, 3):
                         raise RuntimeError('unknown_native_navigation_status')
                     if code == 3:
@@ -510,8 +521,10 @@ class ControlledSpatialPlugin:
                                     {'task_id': task_id, 'map': identity[0], 'position_error_m': error,
                                      'completion_basis': 'native_task_id_arrival_map_pose_and_fresh_stationary_odometry'})
                         return
-            except Exception:
-                self.bundle.pause('native_navigation_failed_or_unconfirmed', status='error', expected=('base', aid))
+            except Exception as exc:
+                detail = str(exc)[:160].encode('unicode_escape').decode('ascii')[:200]
+                self.bundle.pause('native_navigation_failed_or_unconfirmed: ' + detail,
+                                  status='error', expected=('base', aid))
             finally:
                 self._workers.discard(threading.current_thread())
 
@@ -544,7 +557,8 @@ class ControlledSpatialPlugin:
             if self._task is None and not self._uncertain:
                 return
             uncertain = self._uncertain
-            response = self.client.native('cancel')
+            task_id = (self._task or {}).get('task_id')
+            response = self.client.native('cancel', **({'task_id': task_id} if task_id else {}))
             if response.get('success') is not True or response.get('stationary') is not True:
                 raise RuntimeError('native_navigation_stop_unconfirmed')
             if uncertain:
@@ -613,6 +627,9 @@ class ControlledSpatialPlugin:
                 raise RuntimeError('fresh_stationary_odometry_required_before_changing_map')
         else:
             self._require_stationary()
+
+        if action == 'start_mapping':
+            self.bundle.prepare_mapping_velocity(epoch)
 
         # Map mutations cannot overlap chassis driving or another preparation.
         with self.bundle.tracker.lock:

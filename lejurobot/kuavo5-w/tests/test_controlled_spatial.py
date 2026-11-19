@@ -53,11 +53,17 @@ class Tracker:
 
 
 class Bundle:
+    def prepare_mapping_velocity(self, request_epoch):
+        if request_epoch != self._stop_epoch:
+            raise RuntimeError('superseded')
+
     def __init__(self):
         self.tracker = Tracker()
         self._stop_epoch, self._transition = 0, None
         self.state = types.SimpleNamespace(motion_blocked=False, require_motion=lambda modes: None,
-                                           require_motion_enabled=lambda: None)
+                                           require_motion_enabled=lambda: None,
+                                           read=lambda key: (False if key == 'upper_velocity_enabled'
+                                                             else 'nav_mpc_path_track', time.monotonic()))
         self.ros1 = types.SimpleNamespace(connection=(True, 1))
         self.pauses = []
 
@@ -393,7 +399,7 @@ class SpatialTests(unittest.TestCase):
         wait(lambda: any(c[0] == 'check' for c in self.client.calls))
         self.assertFalse(self.bundle.tracker.events)
         self.assertEqual(self.call('stop_nav')['state'], 'paused')
-        self.assertIn(('cancel', {}), self.client.calls)
+        self.assertIn(('cancel', {'task_id': 'native-task-1'}), self.client.calls)
         self.assertEqual(self.completed()[0], 'cancelled')
 
     def test_unknown_or_failed_status_causes_pause(self):
@@ -1037,6 +1043,20 @@ class NativePreparationTests(unittest.TestCase):
 
     def call(self, operation='prepare'):
         return self.module.main({'master': 'http://test:11311', 'ros_ip': '127.0.0.1', 'operation': operation})
+
+    def test_cancel_does_not_clear_a_task_still_reported_running(self):
+        import sys
+        ros = sys.modules['rospy']
+        original = ros.ServiceProxy
+        def service(name, kind):
+            if name == '/move_base/check_arrived':
+                return lambda **kw: types.SimpleNamespace(success=True, status=1)
+            return original(name, kind)
+        with patch.object(ros, 'ServiceProxy', side_effect=service):
+            with self.assertRaisesRegex(RuntimeError, 'still_running_or_unconfirmed'):
+                self.module.main({'master': 'http://test:11311', 'ros_ip': '127.0.0.1',
+                                  'operation': 'cancel', 'args': {'task_id': 'old-task'}})
+        self.assertEqual(self.events, [2, 'stationary'])
 
     def test_rpc_distinguishes_completed_rejection_from_uncertain_transport(self):
         import io

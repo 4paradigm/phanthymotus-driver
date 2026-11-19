@@ -83,6 +83,8 @@ class FakeRos1:
                               self.latched.get('/mobile_manipulator/lb_mpc_control_mode', 3))
             elif service == "/mobile_manipulator_mpc_control":
                 self.emit("/mobile_manipulator/lb_mpc_control_mode", args["control_mode"])
+            elif service == '/enable_vel_control':
+                self.emit('/enable_vel_control_state', args['data'])
         return {"success": self.service_accepts, "result": self.service_accepts, "message": "test service"}
 
     def start_service(self, service, service_type, args):
@@ -175,6 +177,7 @@ class DriverContractTests(unittest.TestCase):
         self.ros.emit("/enable_control_state", True)
         self.ros.emit("/mobile_manipulator/lb_mpc_control_mode", 3)
         self.bundle.state.verify_enable()
+        self.ros.emit('/enable_vel_control_state', True)
 
     def tearDown(self):
         self.bundle.close()
@@ -208,6 +211,74 @@ class DriverContractTests(unittest.TestCase):
             self.assertFalse(self.ros.sent_services)
             self.assertFalse(self.ros.published)
         self.bundle.spatial._map_pending = None
+
+    def test_native_navigation_disables_upper_velocity_and_base_drive_restores_it(self):
+        observed = []
+        def publish():
+            observed.append(self.bundle.state.read('upper_velocity_enabled')[0])
+        first = self.bundle.start_motion('base', 'controlled_spatial', (2, 3), publish)
+        self.assertEqual(observed, [False])
+        self.assertEqual(first[-1]['velocity_owner'], 'native_navigation')
+        self.assertIn(('/enable_vel_control', 'std_srvs/SetBool', {'data': False}), self.ros.sent_services)
+        self.bundle.tracker.cancel_all('test_done')
+        second = self.bundle.start_motion('base', 'base_drive', (2, 3), publish)
+        self.assertEqual(observed, [False, True])
+        self.assertEqual(second[-1]['velocity_owner'], 'upper_mpc')
+        self.assertEqual(self.ros.sent_services[-1],
+                         ('/enable_vel_control', 'std_srvs/SetBool', {'data': True}))
+
+    def test_velocity_handoff_requires_feedback_before_any_navigation_target(self):
+        original = self.ros.call_service
+        def missing_feedback(service, service_type, args, timeout):
+            if service == '/enable_vel_control':
+                return {'success': True}
+            return original(service, service_type, args, timeout)
+        self.ros.call_service = missing_feedback
+        published = []
+        with patch.object(driver, 'CONTROL_TIMEOUT_S', .03):
+            with self.assertRaisesRegex(TimeoutError, 'upper_velocity_enabled'):
+                self.bundle.start_motion('base', 'controlled_spatial', (2, 3),
+                                         lambda: published.append(True))
+        self.assertFalse(published)
+        self.assertTrue(self.bundle.state.motion_blocked)
+
+    def test_stop_during_velocity_handoff_retains_the_older_remote_request(self):
+        entered, release, errors = threading.Event(), threading.Event(), []
+        original = self.ros.wait_service
+        def wait_service(pending, timeout, cancelled=None):
+            if pending[0] == '/enable_vel_control':
+                entered.set()
+                release.wait(2)
+                self.ros.emit('/enable_vel_control_state', pending[2]['data'])
+                self.ros.service_results[id(pending)] = {'success': True}
+            return original(pending, timeout, cancelled)
+        def start():
+            try:
+                self.bundle.start_motion('base', 'controlled_spatial', (2, 3), lambda: None)
+            except Exception as exc:
+                errors.append(exc)
+        with patch.object(self.ros, 'wait_service', side_effect=wait_service):
+            thread = threading.Thread(target=start)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(self.call('base_drive', 'stop_move')['state'], 'paused')
+                self.assertTrue(self.bundle._mode_unresolved())
+            finally:
+                release.set()
+                thread.join(2)
+        self.assertTrue(errors)
+        self.assertFalse(self.bundle._mode_unresolved())
+        self.assertIs(self.bundle.state.read('control_enabled')[0], False)
+
+    def test_mapping_restores_remote_velocity_without_resuming_motors(self):
+        self.ros.emit('/enable_vel_control_state', False)
+        self.ros.emit('/enable_control_state', False)
+        self.bundle.prepare_mapping_velocity(self.bundle._stop_epoch)
+        self.assertIs(self.bundle.state.read('upper_velocity_enabled')[0], True)
+        self.assertIs(self.bundle.state.read('control_enabled')[0], False)
+        self.assertEqual(self.ros.sent_services,
+                         [('/enable_vel_control', 'std_srvs/SetBool', {'data': True})])
 
     def test_metadata_and_schema_actions_agree(self):
         import yaml

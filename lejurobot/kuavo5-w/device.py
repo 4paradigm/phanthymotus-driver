@@ -104,6 +104,10 @@ class RobotState:
                        lambda msg: self._update("mpc_mode", msg.get("data")))
         ros1.subscribe("/enable_control_state", "std_msgs/Bool",
                        lambda msg: self._update("control_enabled", msg.get("data")))
+        ros1.subscribe('/enable_vel_control_state', 'std_msgs/Bool',
+                       lambda msg: self._update('upper_velocity_enabled', msg.get('data')))
+        ros1.subscribe('/twist_mux_new/out/nav_source_used', 'std_msgs/String',
+                       lambda msg: self._update('base_velocity_source', msg.get('data')))
         for key, topic in REACH.items():
             ros1.subscribe(topic, "std_msgs/Float32",
                            lambda msg, k=key: self._update(k, msg.get("data")))
@@ -169,8 +173,11 @@ class RobotState:
         connected, _ = self._sync_session()
         if not connected:
             return
-        if key == "control_enabled":
+        if key in ('control_enabled', 'upper_velocity_enabled'):
             if not isinstance(value, bool):
+                return
+        elif key == 'base_velocity_source':
+            if not isinstance(value, str) or len(value) > 80 or not value.isascii() or any(ord(c) < 32 for c in value):
                 return
         elif key == "mpc_mode":
             if isinstance(value, bool) or not isinstance(value, int) or value not in MODES:
@@ -1263,7 +1270,7 @@ class KuavoBundle:
         if self.ros1.connection != (True, request['generation']) or request['pending'] is None:
             return True
         response = self.ros1.service_result(request['pending'])
-        if response is not None and type(response.get('result')) is bool:
+        if response is not None and type(response.get(request.get('accepted_key', 'result'))) is bool:
             self._remote_mode = None
             self.state.remote_mode_unresolved = False
             return False
@@ -1316,7 +1323,10 @@ class KuavoBundle:
             compatible = mode in MODES and mode != 0 and (not modes or mode in modes)
             fresh = time.monotonic() - seen <= 2
             preparation = {'automatic': True, 'resumed': False, 'mode_changed': False, 'mode': mode}
-            if enabled is True and not self.state.motion_blocked and compatible and fresh:
+            upper_velocity = tool != 'controlled_spatial'
+            velocity, velocity_seen = self.state.read('upper_velocity_enabled')
+            velocity_ready = channel != 'base' or (velocity is upper_velocity and time.monotonic()-velocity_seen <= 2)
+            if enabled is True and not self.state.motion_blocked and compatible and fresh and velocity_ready:
                 return self._publish_motion_locked(channel, tool, modes, publish, validate, preparation, notify=notify)
             if self.tracker._active:
                 raise RuntimeError('control preparation needs an idle robot; another action is still running')
@@ -1344,6 +1354,10 @@ class KuavoBundle:
                     'kuavo_msgs/changeTorsoCtrlMode', {'control_mode': target_mode},
                     'result', 'mpc_mode', target_mode)
                 preparation['mode_changed'] = mode != target_mode
+            if channel == 'base' and not velocity_ready:
+                self.confirm_control(token, '/enable_vel_control', 'std_srvs/SetBool',
+                    {'data': upper_velocity}, 'success', 'upper_velocity_enabled', upper_velocity)
+                preparation['velocity_owner'] = 'upper_mpc' if upper_velocity else 'native_navigation'
             with self.tracker.lock:
                 self._check_transition(token)
                 if self._resume_unresolved() or self._mode_unresolved():
@@ -1358,6 +1372,24 @@ class KuavoBundle:
             raise  # The caller owns cancellation of this already-tracked action.
         except Exception:
             self.pause('automatic_control_preparation_failed', status='error', expected_transition=token)
+            raise
+        finally:
+            self._end_control(token)
+
+    def prepare_mapping_velocity(self, request_epoch):
+        """Restore the factory remote's MPC route without enabling motors."""
+        with self.tracker.lock:
+            if request_epoch != self._stop_epoch:
+                raise InterruptedError('mapping preparation superseded by stop')
+            token, _, was_blocked = self._begin_control('mapping_velocity')
+        try:
+            self.confirm_control(token, '/enable_vel_control', 'std_srvs/SetBool',
+                {'data': True}, 'success', 'upper_velocity_enabled', True)
+            with self.tracker.lock:
+                self._check_transition(token)
+                self.state.motion_blocked = was_blocked
+        except Exception:
+            self.pause('mapping_velocity_preparation_failed', expected_transition=token)
             raise
         finally:
             self._end_control(token)
@@ -1411,14 +1443,14 @@ class KuavoBundle:
             self._check_transition(token)
             issued = time.monotonic()
             enabling = service == '/enable_control' and args.get('data') is True
-            changing_mode = service == '/mobile_manipulator_mpc_control'
+            changing_mode = service in ('/mobile_manipulator_mpc_control', '/enable_vel_control')
             if enabling:
                 # Mark before SEND: even a send exception can mean partial delivery.
                 self._remote_resume = {'pending': None, 'issued': issued,
                                        'generation': token['generation']}
                 self.state.remote_resume_unresolved = True
             if changing_mode:
-                self._remote_mode = {'pending': None, 'generation': token['generation']}
+                self._remote_mode = {'pending': None, 'generation': token['generation'], 'accepted_key': accepted_key}
                 self.state.remote_mode_unresolved = True
             pending = self.ros1.start_service(service, service_type, args)
             if enabling:

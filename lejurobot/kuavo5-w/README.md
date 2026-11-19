@@ -691,3 +691,15 @@ IMU301帧、位置展示和标准odom各300帧且全部有效，电池/雷达点
 近似完成是驱动的任务结束策略，不代表厂商精度保证；仅应用于`base_drive.move_relative`与`head.move_pos/zero`，不改变`controlled_spatial`的原生任务/地图到达确认，也不改变arm/leg的测量收敛要求。
 
 重启恢复：`controlled_spatial.info`在四类导航反馈尚未齐备时返回`loading`及`feedback_status.missing`，保留后台启动结果，不将一次状态读取超时当作启动失败；实际导航仍严格要求新鲜完整反馈。底盘speaker进程每2s核对自身start/stop/status的ROS注册，启动宽限10s、连续三次缺失/无法验证即退出，由systemd自动重启并重新注册；处理控制板ROS Master重启而底盘进程仍存活的情况，不重放音频start或PCM。
+
+### Native navigation velocity ownership
+
+Native navigation uses the chassis path tracker. Before submitting its goal,
+`controlled_spatial` disables the upper controller's `/enable_vel_control` and
+requires fresh `/enable_vel_control_state` feedback. Otherwise upper MPC output
+can select `nav_mpc_move_base` and override the native navigation velocity.
+`base_drive` and `base_servo` restore this switch before publishing; starting
+mapping restores the upper MPC remote-control route without resuming motors.
+Stops retain the software stop. A known native task is not forgotten if the
+factory status still reports it running after cancellation, even when odometry
+is stationary. Inspect/reconcile that factory task before releasing the stop.
