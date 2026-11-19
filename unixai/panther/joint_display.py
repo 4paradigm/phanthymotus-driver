@@ -5,10 +5,14 @@ import xml.etree.ElementTree as ET
 from contracts import json_float
 
 
-def _add_fixed_column(root, lift):
-    """Draw the guide rail as fixed bones on the base, beside the lift joint."""
-    x, y, z = lift.find("origin").get("xyz").split()
-    top = float(z) + float(lift.find("limit").get("upper"))
+def _add_fixed_column(root, joints):
+    """Align the fixed rail with the head in the neutral Canvas pose."""
+    lift = joints["body_joint"]
+    x, y, _ = lift.find("origin").get("xyz").split()
+    # Canvas does not apply the lift's prismatic feedback to the drawing.
+    # Use the displayed head top (RGB-D mount), not the lift travel limit.
+    top = sum(float(joints[name].find("origin").get("xyz").split()[2])
+              for name in ("body_joint", "joint_head0", "joint_head1", "joint_rgbd"))
     parent = lift.find("parent").get("link")
     for child, xyz in (("display_column_base", f"{x} {y} 0"),
                        ("display_column_top", f"0 0 {top:g}")):
@@ -28,12 +32,12 @@ def render_model(urdf):
     for name, axis in (("joint_head0", "0 0 1"), ("joint_head1", "0 1 0")):
         joint = joints[name]
         joint.find("axis").set("xyz", axis)
-    # Both elbow encoders flex in the opposite direction to the model axes.
-    for name in ("joint_la4", "joint_ra4"):
+    # Reverse elbow rotation in the preview; elbow flex uses the bundled axes.
+    for name in ("joint_la3", "joint_ra3"):
         axis = joints[name].find("axis")
-        axis.set("xyz", " ".join(f"{-float(value):g}" if float(value) else "0"
-                                for value in axis.get("xyz").split()))
-    _add_fixed_column(root, joints["body_joint"])
+        axis.set("xyz", " ".join(f"{-value:g}" if value else "0"
+                                for value in map(float, axis.get("xyz").split())))
+    _add_fixed_column(root, joints)
     mimics = {}
     for name, joint in joints.items():
         mimic = joint.find("mimic")

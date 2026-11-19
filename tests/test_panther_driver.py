@@ -513,12 +513,14 @@ class PantherDriverTest(unittest.TestCase):
         self.assertAlmostEqual(rows["joint_rf02"], -0.8)
 
         joints = {j.get("name"): j for j in ET.fromstring(model["urdf"]).findall("joint")}
-        for name in ("joint_la4", "joint_ra4"):
-            self.assertEqual(joints[name].find("axis").get("xyz"), "0 -1 0")
+        for arm in ("la", "ra"):
+            self.assertEqual(joints[f"joint_{arm}3"].find("axis").get("xyz"), "0 0 -1")
+            self.assertEqual(joints[f"joint_{arm}4"].find("axis").get("xyz"), "0 1 0")
         base, top = (joints[f"display_column_{segment}_joint"] for segment in ("base", "top"))
         self.assertEqual(base.find("parent").get("link"), "base_link")
         self.assertEqual(top.find("parent").get("link"), base.find("child").get("link"))
         self.assertEqual([base.get("type"), top.get("type")], ["fixed", "fixed"])
+        self.assertAlmostEqual(float(top.find("origin").get("xyz").split()[2]), 0.785998)
         self.assertEqual(joints["body_joint"].get("type"), "prismatic")
         self.assertEqual(joints["body_joint"].find("parent").get("link"), "base_link")
         self.assertEqual(joints["body_joint"].find("child").get("link"), "body_link")

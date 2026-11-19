@@ -40,11 +40,12 @@ ASR and check interaction with the robot's native AIUI conversation service.
 `model` and `joints` use the same bundled articulated display model throughout
 the session. The live `/robot_description` can encode the lift and fingers as
 fixed joints, so it is kept separate from Canvas rendering. The display model
-uses the measured yaw/pitch order, reverses the two elbow-flex axes, and maps
+uses the measured yaw/pitch order, reverses the two elbow-rotation axes, and maps
 gripper feedback as `1 - position` before expanding the finger linkage.
 These are display-only corrections. `joints` combines `/joint_states` with fresh
 lift and gripper feedback, and `joints info` reports `body_joint` in metres.
-The display model includes a fixed guide column attached to `base_link`, with
+The display model includes a fixed guide column attached to `base_link` and
+ending at the neutral pose's head level, with
 the torso, head and arms on the separate `body_joint` prismatic branch. A
 renderer with prismatic support moves that branch along the column; the current
 rotation-only Canvas shows the column and reports lift height without animating it.
