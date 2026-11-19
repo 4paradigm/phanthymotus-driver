@@ -703,3 +703,11 @@ mapping restores the upper MPC remote-control route without resuming motors.
 Stops retain the software stop and require native cancellation plus fresh
 stationary odometry. Factory historical task queries can retain status 1 after
 a goal has been replaced; that history alone does not prove it is still active.
+
+On the commissioned robot, a supervised `navigate_to_pose` test with a 0.2 m
+forward target and 0.1 m/s requested speed kept `nav_mpc_path_track` selected.
+Map feedback recorded approximately 0.150 m displacement and 0.050 m remaining
+error; native status changed from 1 to 2 and the driver completed after its
+stationary check. The factory request uses a 0.1 m position threshold. The test
+ended with confirmed whole-body disable and chassis software stop. This checks
+the short navigation/control-ownership path, not long-route or obstacle trials.
