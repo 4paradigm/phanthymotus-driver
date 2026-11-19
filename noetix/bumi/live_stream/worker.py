@@ -50,12 +50,12 @@ class AudioBuffer:
 
 ERROR_MESSAGES = {
     "ENCODER_START_FAILED": "直播编码器启动失败，请检查机器人 FFmpeg 环境",
-    "RTMP_PROCESS_EXITED": "推流异常结束，请刷新虎牙地址并检查机器人网络",
+    "RTMP_PROCESS_EXITED": "推流异常结束，请刷新平台推流地址并检查机器人网络",
     "VIDEO_PIPE_FAILED": "实时画面中断，请检查 Bumi 摄像头",
     "AUDIO_PIPE_FAILED": "实时声音中断，请检查 Bumi 麦克风",
     "LIBRTMP_UNAVAILABLE": "机器人缺少 librtmp1 运行库",
-    "RTMP_CONNECT_FAILED": "虎牙服务器连接失败，请检查网络和推流地址",
-    "RTMP_PUBLISH_REJECTED": "虎牙拒绝推流，请更新推流地址",
+    "RTMP_CONNECT_FAILED": "直播服务器连接失败，请检查网络和推流地址",
+    "RTMP_PUBLISH_REJECTED": "直播平台拒绝推流，请更新推流地址",
     "RTMP_WRITE_FAILED": "上传直播数据失败",
     "RTMP_CONNECT_TIMEOUT": "直播服务器连接超时",
     "RTMP_WRITE_TIMEOUT": "推流发送超时",
@@ -122,7 +122,7 @@ class LiveStreamWorker:
                 target=self._run, args=(url, self._cancel),
                 name="bumi-huya-live", daemon=True)
             self._thread.start()
-            return {"state": "starting", "message": "正在建立虎牙推流连接"}
+            return {"state": "starting", "message": "正在建立直播推流连接"}
 
     def stop(self) -> dict:
         with self._lock:

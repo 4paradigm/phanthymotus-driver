@@ -133,6 +133,8 @@ class LiveStreamPlugin:
             return self._worker.stop()
         if action == "info":
             return {"platform": self._platform or "none", "configured": bool(self._url),
+                    "ready_to_go_live": bool(self._url) and self._clock() < self._armed_until,
+                    "authorization_expires_in_s": max(0, round(self._armed_until - self._clock(), 1)),
                     **self._worker.info()}
         if action == "config":
             value = args.get("rtmp_url")
@@ -159,8 +161,11 @@ class LiveStreamPlugin:
                     self._armed_until = self._clock() + 300.0
                 self._url = url
                 self._platform = platform
+            armed = self._clock() < self._armed_until
             return {"ok": True, "state": "ready", "configured": True,
-                    "message": "推流地址已保存；新地址五分钟内可直接执行 go_live"}
+                    "ready_to_go_live": armed,
+                    "message": ("已授权本场直播，请在五分钟内执行 go_live" if armed
+                                else "地址已保存，但重复保存旧地址不会重新授权；请获取新推流码")}
         if action == "go_live":
             with self._lock:
                 if not self._url:
@@ -169,6 +174,12 @@ class LiveStreamPlugin:
                 if self._clock() >= self._armed_until:
                     return {"ok": False, "error_code": "APPROVAL_REQUIRED",
                             "message": "请在卡片齿轮重新填写本场新推流地址并保存"}
+                # A direct go_live call must not require a separate Canvas start.
+                if self._node is None and self._executor is not None:
+                    self.start()
+                    deadline = time.monotonic() + 2.0
+                    while not self._audio.fresh() and time.monotonic() < deadline:
+                        time.sleep(0.05)
                 result = self._worker.start(self._url)
                 if result.get("state") in ("starting", "streaming"):
                     self._armed_until = 0.0  # Consume only after successful preflight.

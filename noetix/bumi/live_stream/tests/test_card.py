@@ -254,3 +254,37 @@ def test_canvas_stop_start_recreates_audio_subscription(monkeypatch):
     assert not nodes[1].destroyed
     subject.stop()
     assert nodes[1].destroyed
+
+def test_auth_status_exposes_expiry_without_url():
+    store, worker = Store(), Worker()
+    now = [100.0]
+    subject = LiveStreamPlugin({}, "bumi", None, None, store=store,
+                               worker=worker, clock=lambda: now[0])
+    assert subject.dispatch("info", {})["ready_to_go_live"] is False
+    result = subject.dispatch("config", {"rtmp_url": URL})
+    assert result["ready_to_go_live"] is True
+    assert subject.dispatch("info", {})["authorization_expires_in_s"] == 300.0
+    now[0] += 301
+    assert subject.dispatch("info", {})["ready_to_go_live"] is False
+    repeated = subject.dispatch("config", {"rtmp_url": URL})
+    assert repeated["ok"] is True
+    assert repeated["ready_to_go_live"] is False
+    assert "重新授权" in repeated["message"]
+    assert URL not in str(repeated)
+
+
+def test_go_live_initializes_audio_subscription_when_canvas_start_was_skipped(monkeypatch):
+    import live_stream.card as module
+    audio = module.AudioBuffer()
+    calls = []
+    def attach(executor, namespace, buffer):
+        calls.append((executor, namespace))
+        buffer.push(b"\\x00\\x00" * 640, "audio/pcm-16k")
+        return object()
+    monkeypatch.setattr(module, "attach_audio_subscription", attach)
+    executor = object()
+    subject = LiveStreamPlugin({}, "bumi", executor, None, store=Store(),
+                               audio=audio, worker=Worker(), clock=lambda: 100.0)
+    assert subject.dispatch("config", {"rtmp_url": URL})["ready_to_go_live"]
+    assert subject.dispatch("go_live", {})["state"] == "starting"
+    assert calls == [(executor, "bumi")]
