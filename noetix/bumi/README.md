@@ -500,3 +500,17 @@ media cards and motion cards keep running.
 
 The output contract, quality states, assumed body-axis calibration, validation
 status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
+
+## Foot-pose prototype and scene Skills
+
+`foot_pose` reads leg-joint snapshots, estimates body-frame foot positions and
+separation, compares saved pose signatures, and reloads individual assets.
+The geometry calculator also runs offline without ROS or the SDK. Motion requests
+default to preview-only: no verified leg-motion assets or source-reception
+freshness adapter are shipped.
+See [FOOT_POSE.md](FOOT_POSE.md) for its execution boundary and checks.
+
+The [scene Skill sources](skills/README.md) include doorway greeting with wave
+and welcome speech, station photo records, and an offline foot-RPS rules draft.
+Skills are installed separately into Agent Core; building this driver does not
+install or start them. [PORTING.md](PORTING.md) records the migration scope.
