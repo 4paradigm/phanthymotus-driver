@@ -610,9 +610,11 @@ class ControlledSpatialPlugin:
                 self._map_pending = None
                 self._persist()
                 self.bundle.tracker.finish('base', aid, self.PREFIX, 'completed', result)
-            except Exception:
+            except Exception as exc:
                 self.bundle.tracker.finish('base', aid, self.PREFIX, 'error',
-                    {'reason': 'map_transition_unconfirmed_inspect_info', 'map_state': self.store.state('mapping')})
+                    {'reason': 'map_transition_unconfirmed_inspect_info',
+                     'failed_stage': (self._map_pending or {}).get('stage'),
+                     'error_type': type(exc).__name__, 'map_state': self.store.state('mapping')})
             finally:
                 self._workers.discard(threading.current_thread())
         thread = threading.Thread(target=worker, daemon=True, name='kuavo-map-operation')
@@ -689,6 +691,9 @@ class ControlledSpatialPlugin:
         remaining = self._map_deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError('map_operation_timeout')
+        if self._map_pending is not None:
+            self._map_pending['stage'] = method
+            self._persist()
         self.client.command(method, params, timeout=min(25, remaining))
         if cancelled.is_set():
             raise RuntimeError('map_operation_interrupted_inspect_map_state')

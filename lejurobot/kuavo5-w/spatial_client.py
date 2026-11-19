@@ -8,10 +8,10 @@ import json
 from contextlib import closing
 import os
 import socket
+import secrets
 from pathlib import Path
 import time
 import urllib.request
-from uuid import uuid4
 
 
 from bootstrap import load_secrets
@@ -132,7 +132,11 @@ class JatenClient:
         import websocket
         if method not in self.COMMANDS:
             raise ValueError('unsupported_map_command')
-        request_id = uuid4().hex
+        # The installed native handle<...>() applies std::stoi(request.id)
+        # before dispatch (including StartCartoMapping). Hex UUIDs can abort
+        # the entire Java/JNA API process; decimal IDs must also fit int32.
+        # Each command owns a fresh socket and still matches ID AND method.
+        request_id = str(secrets.randbelow(2_147_483_647) + 1)
         end = time.monotonic() + timeout
         with closing(websocket.create_connection(self.ws_url, timeout=2, http_proxy_host=None)) as ws:
             ws.send(json.dumps({'method': method, 'id': request_id, 'params': params}))

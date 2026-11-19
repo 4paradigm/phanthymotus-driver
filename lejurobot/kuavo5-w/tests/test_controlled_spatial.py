@@ -705,6 +705,31 @@ class ClientTests(unittest.TestCase):
             self.assertNotEqual(result['id'], 'other')
             with self.assertRaises(ValueError): client.command('ClearEstop', {})
 
+    def test_all_native_command_ids_fit_decimal_stoi_contract(self):
+        requests = []
+        class Socket:
+            def close(self): pass
+            def send(self, raw):
+                self.request = json.loads(raw)
+                requests.append(self.request)
+                value = self.request['id']
+                # Model the strict range expected by the native C++ wrapper.
+                if not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= 2_147_483_647:
+                    raise AssertionError('native API would abort on request ID')
+            def recv(self):
+                return json.dumps({'type': 'taskResult', 'data': {
+                    'id': self.request['id'], 'method': self.request['method']}})
+        ws = types.SimpleNamespace(create_connection=lambda *a, **k: Socket(),
+                                   WebSocketTimeoutException=TimeoutError)
+        client = object.__new__(JatenClient)
+        client.ws_url = 'ws://test'
+        with patch.dict(sys.modules, {'websocket': ws}):
+            for edge in (0, 2_147_483_646):
+                with patch('spatial_client.secrets.randbelow', return_value=edge):
+                    for method in sorted(JatenClient.COMMANDS):
+                        client.command(method, {})
+        self.assertEqual({r['id'] for r in requests}, {'1', '2147483647'})
+
 
 class BundleIntegrationTests(unittest.TestCase):
     def test_container_start_configures_music_without_starting_control_cards(self):
