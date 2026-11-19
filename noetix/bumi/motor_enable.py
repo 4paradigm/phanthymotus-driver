@@ -23,6 +23,8 @@ def _get_default_cmd():
 
 
 class MotorEnablePlugin:
+    PREFIX = "motor_enable"
+
     def __init__(self, plugin_config: dict, namespace: str, executor, high_ctrl, *, chassis_owner):
         self._high_ctrl = high_ctrl
         self._owner = chassis_owner
@@ -56,7 +58,7 @@ class MotorEnablePlugin:
             "topic_out": [],
         }
 
-    def dispatch(self, action: str, args: dict) -> dict:
+    def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
             return {"state": "ready", "command_sent": False}
         if action == "stop":
@@ -64,17 +66,24 @@ class MotorEnablePlugin:
             return {"state": "idle", "command_sent": False,
                     "message": "Observation cancelled; an already sent enable command cannot be undone."}
         if action not in {"info", "enable"}:
-            return {"state": "error", "command_sent": False, "error": "Unknown motor_enable action"}
+            return None
         if self._high_ctrl is None:
             return {"state": "error", "command_sent": False, "error": "Robot controller unavailable"}
         if action == "info":
             try:
-                mode = int(self._high_ctrl.get_mode())
+                # Do not reconcile against a potentially stale pre-command
+                # reading while any explicit body action is in flight.
+                with self._owner._rotate_lock:
+                    mode = int(self._high_ctrl.get_mode())
+                    if (not self._owner._body_action and self._owner._enable_unconfirmed
+                            and mode == self._owner._mode_toggle_target):
+                        self._owner._enable_unconfirmed = False
+                    unconfirmed = self._owner._enable_unconfirmed
             except Exception as exc:
                 return {"state": "error", "command_sent": False, "error": str(exc)}
             return {"state": "completed", "command_sent": False,
                     "workmode": mode, "workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
-                    "enable_unconfirmed": self._owner._enable_unconfirmed}
+                    "enable_unconfirmed": unconfirmed}
         if args.get("confirm") is not True:
             return {"state": "error", "command_sent": False, "code": "CONFIRM_REQUIRED",
                     "error": "Confirm safe face-up placement and a clear joint movement area before enabling."}

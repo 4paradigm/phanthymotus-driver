@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -26,6 +27,9 @@ class FakeLocoPlugin:
         self.high_ctrl = high_ctrl
         self.servo = None
         self._enable_unconfirmed = False
+        self._mode_toggle_target = None
+        self._body_action = None
+        self._rotate_lock = threading.Lock()
         self.started = False
         self.stopped = False
 

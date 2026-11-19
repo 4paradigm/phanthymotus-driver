@@ -88,7 +88,7 @@ def test_lifecycle_and_info_are_read_only(card):
     assert call(plugin, "start")["state"] == "ready"
     assert call(plugin, "info")["workmode"] == 30
     assert call(plugin, "stop")["state"] == "idle"
-    assert call(plugin, "unsupported")["state"] == "error"
+    assert call(plugin, "unsupported") is None
     assert ctrl.commands == []
 
 
@@ -134,9 +134,24 @@ def test_timeout_blocks_blind_retry(card, monkeypatch):
     assert plugin._owner._prepare_workmode(1, "stand_up")["state"] == "error"
     assert [c[3] for c in ctrl.commands] == ["START", "DEFAULT"]
     ctrl.mode = 0  # Delayed acknowledgement: no second START is necessary.
-    assert call(plugin)["confirmed"] is True
+    info = call(plugin, "info")
+    assert info["workmode"] == 0
+    assert info["enable_unconfirmed"] is False
     assert plugin._owner._enable_unconfirmed is False
     assert len(ctrl.commands) == 2
+
+
+def test_info_does_not_clear_uncertainty_during_body_action(card):
+    _, plugin, ctrl = card
+    ctrl.mode = 0
+    plugin._owner._enable_unconfirmed = True
+    plugin._owner._mode_toggle_target = 0
+    plugin._owner._body_action = "another_action"
+    assert call(plugin, "info")["enable_unconfirmed"] is True
+    assert ctrl.commands == []
+    plugin._owner._body_action = None
+    assert call(plugin, "info")["enable_unconfirmed"] is False
+    assert ctrl.commands == []
 
 
 @pytest.mark.parametrize("failed_command", ["START", "DEFAULT"])
@@ -235,6 +250,7 @@ def test_stop_after_start_releases_event_without_second_toggle(card, monkeypatch
 
 def test_card_is_discoverable_in_enabled_bundle_and_manifest(card):
     _, plugin, _ = card
+    assert plugin.PREFIX == "motor_enable"
     tool = plugin.get_tool()
     assert tool["type"] == "actuator"
     assert tool["inputSchema"]["x-is-dangerous"] is True
@@ -253,6 +269,5 @@ def test_disable_is_rejected_without_sending_command(card):
     _, plugin, ctrl = card
     ctrl.mode = 0
     result = call(plugin, "disable")
-    assert result["state"] == "error"
-    assert result["command_sent"] is False
+    assert result is None
     assert ctrl.commands == []

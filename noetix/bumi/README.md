@@ -389,8 +389,9 @@ the existing HighController connection and has no additional worker.
   refused; the streaming servo is paused and shared publishing is serialized.
 - Missing/failed feedback is not success. An uncertain START attempt blocks
   another START through this card or automatic action preparation during
-  this driver process. Observing the requested target mode on a subsequent call clears that guard
-  without publishing. Restarting the driver clears the in-memory guard; it is
+  this driver process. A subsequent `info` or `enable` call that observes the
+  target mode clears the guard without publishing; `info` leaves it set while
+  a body action is in flight. Restarting the driver clears the in-memory guard; it is
   not a recovery action and must not be used to blindly retry.
 
 The vendor [Bumi documentation](https://web.noetixrobotics.com/docs/) defines
