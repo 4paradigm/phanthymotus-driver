@@ -1,0 +1,15 @@
+<root main_tree_to_execute="PrivateAudioInput" BTCPP_format="4">
+  <BehaviorTree ID="PrivateAudioInput">
+    <Sequence>
+    <AudioSubscriptionNode name="raw_input"
+      audio_topic_in="/phanthy/u1_doa/raw"
+      timeout_ms_in="3000" start_channel_in="0" num_channels_in="8"
+      internal_mic_config_in="/opt/walker/config_csh2/share/config_csh2/config/audio_sense_controller/config/internal_mics.yml"
+      external_mic_config_in="/opt/walker/config_csh2/share/config_csh2/config/audio_sense_controller/config/external_mics.yml"
+      audio_out="{audio_raw}" device_profile_out="{device_profile}"/>
+    <AecNode name="native_aec" audio_in="{audio_raw}" device_profile_in="{device_profile}"
+      audio_out="{audio_after_aec}"
+      plugin_config_in="/opt/walker/config_csh2/share/config_csh2/config/audio_sense_controller/config/algo_plugins/aec_plugin.json"/>
+    </Sequence>
+  </BehaviorTree>
+</root>
