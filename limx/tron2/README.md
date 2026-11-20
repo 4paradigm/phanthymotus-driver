@@ -1,11 +1,13 @@
 # LimX TRON2 传感器、双臂、头部与夹爪控制驱动
 
-为 Phanthy Motus 提供构型识别、电池状态、原生关节骨架、下肢运动及双臂/头部流式伺服，保留原有RGB相机、双臂动作、夹爪和VOP人物跟随。运行于通过以太网连接TRON2的Jetson / ARM64主机。驱动版本：`0.25.0`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供构型识别、电池状态、原生关节骨架、下肢运动及双臂/头部流式伺服，保留原有RGB相机、双臂动作、夹爪和VOP人物跟随。运行于通过以太网连接TRON2的Jetson / ARM64主机。驱动版本为 `0.25.13`，MCP 仅监听 `127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
 | `joints` | sensor | 按ACCID选择DACH上肢16轴、WF轮足或SF足式10轴；独立model提供URDF | `/limx_tron2/state/joints`（sensor/skeleton） |
 | `battery` | sensor | 1Hz发布soc、current、cycle；无效值为null | `/limx_tron2/state/battery`（data/json） |
+| `eef_state` | sensor | 双侧 TCP 实测位姿和夹爪名义开口，单位 m | 输出 `/limx_tron2/state/eef`（state/eef） |
+| `servo_eef` | actuator | 接收双手 TCP 和双夹爪的完整绝对目标 | 默认输入 `/limx_tron2/control/eef`（control/eef） |
 | `loco_leg` | actuator | stand_up、sit_down、move、stop_move；轮足速度与时间控制 | 无 |
 | `loco_servo_arm` | actuator | 双臂14轴、双夹爪2维与头部2轴；关节rad、夹爪0～1 | 输入control/joint |
 | `pose` | actuator | salute/wave/welcome预设轨迹；挥手含右夹爪一次开合；整套ACP完成 | 无；详情显示共享双臂任务 |
@@ -17,6 +19,38 @@
 | `move_head` | actuator | 俯仰-60～45°（上正）、偏航-88～88°（自身左正）绝对目标；ACP确认到位 | 无 |
 | `head_visual_follow` | actuator | 平滑人物跟随；不跟随模式含暂停与头部复位；ACP会话跟踪 | 左侧输入 `/limx_tron2/camera/objects`（data/json） |
 | `model` | resource | 随DACH/WF/SF构型选择官方URDF，供平台自动加载 | 无 |
+
+### 桌面操作的末端反馈和命令
+
+`eef_state` 与 `servo_eef` 均使用 ROS 2 `std_msgs/String` 和同一 JSON 布局。把前者的 `state/eef` 连给任务卡，把任务卡的 `control/eef` 连给后者。每帧包含 `schema`（`tron2.eef/1`）、`frame`（`base_Link`）、`stamp_ms`（Unix 毫秒整数）和 `eef`（16 个有限数值）。控制帧可附带生成目标时实测帧的 `obs_stamp_ms`。这让驱动能精确辨认沿用该次观测的分量，避免为反馈漂移触发额外 IK。订阅使用 BEST_EFFORT QoS。
+
+传感卡初始为 `idle`。画布启动卡片时会发送 `start`。直接订阅 ROS 话题时，须先启动卡片。运行期间，双臂和双夹爪反馈均新鲜时按约 10 Hz 发布，反馈不完整时暂停发布，`info` 返回 `available: false`。收到 `stop` 后立即停发，重复停止也返回 `idle`。再次 `start` 可恢复发布。启用了 `servo_eef` 的驱动会继续为执行卡采集所需的内部反馈。反馈年龄包括厂商查询往返时间。整帧的 `stamp_ms` 取两类样本首次查询起点的较早值，重复的厂商样本保留原时间戳。
+
+| `eef` 下标（从 0 起） | 内容 |
+|---|---|
+| 0–6 | 左手 TCP 的 x、y、z（m）和单位四元数 qx、qy、qz、qw |
+| 7 | 左夹爪名义开口（m） |
+| 8–14 | 右手 TCP 的 x、y、z（m）和单位四元数 qx、qy、qz、qw |
+| 15 | 右夹爪名义开口（m） |
+
+TCP 使用厂商操作模型的 `L_ee_link`、`R_ee_link`。两侧从旧版任务卡使用的 URDF grasper 原点到 TCP，旋转相同，在 grasper 局部坐标系的平移为 `[-0.0021, 0, -0.1313]` m。状态由实测关节角正解，控制端用同一 TCP 解逆运动学。夹爪的 0～0.085 m 按驱动既有名义映射对应原始值 0～94。零是有效的闭合读数。[厂商 TCP 模型](https://github.com/limxdynamics/tron2_manipulation_controller/blob/10af63c20e0dd2149168c6693453cc28f2c2dcbf/Tron2_controller/install/etc/tron2_manipulation_config/robot.urdf)
+
+每条指令都指定双臂和双夹爪的绝对目标。以下示例从静止、空爪状态开始，沿基座 Z 轴抬高左手 3 mm。如果夹爪正在夹持物体，抬臂时要保留上一次要求的闭合开口。物体可能使实际开口大于这个目标。若非选侧仍有在途目标，也应将原目标带入新帧。
+
+```python
+import time
+
+target = state["eef"].copy()
+target[2] += 0.003
+command = {"schema": state["schema"], "frame": state["frame"],
+           "stamp_ms": time.time_ns() // 1_000_000, "eef": target}
+```
+
+控制卡通过 `start` 订阅，每个绝对目标发一次。不同目标会替换对应组的在途指令。回传当前实测帧会用生成该帧 TCP 的实测关节角和该帧夹爪开口覆盖先前下达的目标，后续空闲回显不会反复驱动电机。指令使用递增的 Unix 毫秒时间戳，超过 1 s 的旧指令会被拒绝。执行卡验证整帧，在双臂 IK 解可用后按关节速度、加速度和硬限位插补，向厂商提交最终关节指令后结束该臂的输出。16 轴 ServoJ 同时包含另一臂和头部的保持指令。夹爪开口按 0～0.085 m 限幅。
+
+IK 优先求请求的完整位姿。如果目标超出工作空间或关节限位使完整目标无法求解，会在同一平移方向和旋转轴上按相同比例缩短请求，选取找到的可行终点。10 cm、30° 以内的局部解每个关节相对起始角最多变化 35°。同一连接上重复发送相同绝对目标会沿用已下发的指令。求解期间收到同一目标的新帧会更新该目标的有效时间，收到不同目标则丢弃旧解，按最新帧求解。关节插值期间 TCP 路径可能弯曲。如果某只手臂沿请求方向找不到可行步，该臂保持，`info.last.held_at_boundary` 标出这一侧，另一臂和夹爪仍处理各自的有效目标。输入无效、反馈异常或目标过期仍会拒收新帧。已受理目标的 `info.last.planned_tcp` 记录本帧新求解的各臂名义终点。
+
+任务卡从 `state/eef` 读取发令后时间戳推进的实测帧，使用自己的位置、姿态、开口公差和稳定时间判断到位。`accepted` 表示指令受理，`active_arms` 表示驱动正在生成关节指令的手臂。夹爪的名义开口分辨率约 0.9 mm。驱动在 ServoJ 发送期间检查关节反馈新鲜度、机器人状态和实测关节相对指令的异常偏差。运行故障会暂停发送，`info.last` 提供原因。`stop` 或 `pause` 时若夹爪写入仍在等待厂商答复，驱动取消本地等待，记录 `outcome_unknown` 和对应指令时间戳。已经交给厂商的动作可能继续，应根据新反馈判断现场状态。
 
 夹爪卡片说明见 [夹爪卡片使用说明](GRIPPER.md)。只填写side（left/right）、opening_mm（0至85mm）、speed、force；没有action/close/recover选项。驱动按底层值=毫米数×94/85名义换算，0mm闭合。非法输入在占用任务和发送前拒绝，两侧独立管理；合法指令仍保留未到位或断连保护。
 
@@ -94,7 +128,7 @@ VOP发布时间、可选处理耗时、本地接收时间只用于新鲜度/重�
 
 ## 读取边界与字段说明
 
-传感器后台仅发送request_get_joint_state。arm_control仅在显式move/reset调用时发送一次request_movej；move_head在显式move时发送一次request_moveh；显式启用人物跟随后，跟随模块占用同一头部通道发送带ACK关联的两轴MoveH最新目标流；夹爪卡片仅在显式读取状态或跟踪开合动作时查询夹爪，显式开合只发送一次所选侧的指令。pose仅在显式选择英文动作后自检、必要时先回原home并确认，再回正头部，以ServoJ执行预设轨迹；挥手在右肩旋转三轮后保持手臂、右夹爪开合一次，再回原home。没有模式切换、拖动示教或自动演示循环。
+骨架传感器通过 `request_get_joint_state` 读取关节。`eef_state` 运行期间，或驱动配置启用了 `servo_eef` 时，驱动还会定期读取左右夹爪开口。arm_control仅在显式move/reset调用时发送一次request_movej；move_head在显式move时发送一次request_moveh；显式启用人物跟随后，跟随模块占用同一头部通道发送带ACK关联的两轴MoveH最新目标流；夹爪卡片仅在显式读取状态或跟踪开合动作时查询夹爪，显式开合只发送一次所选侧的指令。pose仅在显式选择英文动作后自检、必要时先回原home并确认，再回正头部，以ServoJ执行预设轨迹；挥手在右肩旋转三轮后保持手臂、右夹爪开合一次，再回原home。没有模式切换、拖动示教或自动演示循环。
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。
@@ -209,7 +243,7 @@ reset自动复位检查与动作完成跟踪为同一个过程，无需另调ver
 - 只有验证成功且回调送达才释放本地所有权。反馈验证失败或回调无法送达会保留blocked_requires_operator_check，阻止新的运动。失败通知和Core超时不会物理停止机械臂；现场确认停止、处理原因后再重启驱动。内部start/stop不会清除该状态，stop仍不是急停。
 - 进程正常关闭时终止验证任务并报告error，说明运动可能继续；不发送停机、复位或第二条运动命令。进程强制退出无法保证回调，Core保留120秒超时兜底。
 
-Dockerfile按dpkg实际安装状态检查python3-pip和ca-certificates，仅缺少时执行apt更新/安装；基础镜像已提供的包不重复安装。aiohttp/PyYAML仍由requirements.txt管理，是既有HTTP/WebSocket和配置解析依赖；完成机制只增加Python标准库源码，没有新增pip包、设备权限或资源资产。
+Dockerfile 通过 dpkg 检查 `python3-pip`、`ca-certificates` 和 `python3-numpy`，按需通过 apt 安装。`servo_eef` 的 TRON2 运动学使用系统 NumPy。`requirements.txt` 管理 HTTP/WebSocket 和配置解析使用的 aiohttp 和 PyYAML。
 
 ## 头部与左右腕RGB摄像头
 

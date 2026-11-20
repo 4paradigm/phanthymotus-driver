@@ -10,6 +10,8 @@ description: "TRON2 configuration detection, battery telemetry, skeleton, wheel-
 build_context_extras:
   - ../../common
 cards:
+  - {name: eef_state, type: sensor}
+  - {name: servo_eef, type: actuator}
   - {name: loco_servo_arm, type: actuator}
   - {name: loco_leg, type: actuator}
   - {name: battery, type: sensor}
