@@ -24,7 +24,6 @@ class PnpRemoteTeleopPlugin:
         self._lock = threading.RLock()
         self._recording = None
         self._playback = None
-        self.schema_refresh = threading.Event()
         self._loaded = False
         self._stopped = False
         self._init = {"state": "not_initialized"}
@@ -279,7 +278,6 @@ class PnpRemoteTeleopPlugin:
         if self._recording is None:
             return {}
         previous, self._recording = self._recording, None
-        self.schema_refresh.set()
         try:
             trajectories = [name for name in self._saved_trajectories() if name not in previous]
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
@@ -489,7 +487,6 @@ class PnpRemoteTeleopPlugin:
                     self._ssh(side, "pnp-pause-playback" if action == "pause" else "pnp-resume-playback")
                     return {"state": "pausing" if action == "pause" else "resuming"}
                 if action == "list_trajectories":
-                    self.schema_refresh.set()
                     names = self._saved_trajectories()
                     return {"trajectories": names, "trajectories_by_arm": {
                         arm: [name for name in names if name.startswith((f"franka-{arm}-", f"fr3-{arm}-"))]
@@ -503,7 +500,6 @@ class PnpRemoteTeleopPlugin:
                     if side is None:
                         raise ValueError("PNP recording does not exist")
                     self._ssh(side, "pnp-delete-recording", name)
-                    self.schema_refresh.set()
                     return {"deleted": name}
                 if action == "config":
                     self._configure(args)

@@ -293,7 +293,12 @@ def make_handler(bundle_getter: Callable[[], DriverBundle], server_name: str, dr
     return Handler
 
 
-def start_registration(port: int, config: dict, driver_id: str, refresh=None) -> None:
+def start_registration(
+    port: int,
+    config: dict,
+    driver_id: str,
+    advertise_host: str = "localhost",
+) -> None:
     import ssl
     import time
     import urllib.request
@@ -302,7 +307,7 @@ def start_registration(port: int, config: dict, driver_id: str, refresh=None) ->
     payload = json.dumps({
         "id": driver_id,
         "name": config.get("name", driver_id),
-        "url": f"http://localhost:{port}/mcp",
+        "url": f"http://{advertise_host}:{port}/mcp",
         "transport": "http",
         "category": "driver",
     }).encode()
@@ -311,18 +316,34 @@ def start_registration(port: int, config: dict, driver_id: str, refresh=None) ->
     context.verify_mode = ssl.CERT_NONE
 
     def loop():
+        announced = False
+        failures = 0
         while True:
             try:
                 request = urllib.request.Request(f"{url}/api/mcp", data=payload, headers={"Content-Type": "application/json"}, method="POST")
                 with urllib.request.urlopen(request, timeout=3, context=context):
                     pass
-                if refresh is None:
-                    time.sleep(30)
-                else:
-                    refresh.wait(30)
-                    refresh.clear()
+                if not announced:
+                    print(
+                        f"[register] registered {config.get('name', driver_id)} "
+                        f"at http://{advertise_host}:{port}/mcp",
+                        flush=True,
+                    )
+                    announced = True
+                failures = 0
+                time.sleep(30)
             except Exception as exc:
-                print(f"[register] failed: {exc}; retrying in 5s", flush=True)
+                failures += 1
+                if failures == 1 or failures % 12 == 0:
+                    # Exception strings may contain an attacker-controlled URL
+                    # or response text. Log only the bounded type and sample
+                    # persistent failures instead of emitting every retry.
+                    kind = type(exc).__name__[:80]
+                    print(
+                        f"[register] attempt {failures} failed ({kind}); "
+                        "retrying in 5s",
+                        flush=True,
+                    )
                 time.sleep(5)
 
     threading.Thread(target=loop, daemon=True, name="register").start()
@@ -354,12 +375,9 @@ def run_driver(
 
     ros2 = DualDomainROS2(robot_domain, core_domain)
     ros2.start_spin()
-    plugins = list(build_plugins(config, namespace, ros2))
-    refresh = next((plugin.schema_refresh for plugin in plugins
-                    if hasattr(plugin, "schema_refresh")), None)
-    bundle = DriverBundle(plugins)
+    bundle = DriverBundle(build_plugins(config, namespace, ros2))
     bundle.start_all()
-    start_registration(port, config, driver_id, refresh)
+    start_registration(port, config, driver_id)
     server = ThreadingHTTPServer(("", port), make_handler(lambda: bundle, server_name, driver_id))
     stopping = threading.Event()
 
