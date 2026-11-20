@@ -1207,11 +1207,11 @@ class KuavoBundle:
             plugin_config.pop('loco', None)
             self._enabled = {name for name, cfg in plugin_config.items() if cfg.get('enabled', True)}
         else:
-            self._enabled = {"base_drive", "base_servo", "controlled_spatial", "arm", "leg", "head", "speaker", "mic", "ext_mic",
+            self._enabled = {"base_drive", "base_servo", "controlled_spatial", "arm", "leg", "head", "speaker", "ext_mic",
                              *SENSOR_CARDS, *PERIPHERAL_CARDS}
         aliases = {'loco': 'base_drive', 'camera_rgb': 'camera_left', 'camera_rgb_right': 'camera_right'}
-        self._enabled = {aliases.get(name, name) for name in self._enabled if name not in ('state', 'switch_mode', 'waist')}
-        self._auto_start = [aliases.get(name, name) for name in self._auto_start if name not in ('state', 'switch_mode', 'waist')]
+        self._enabled = {aliases.get(name, name) for name in self._enabled if name not in ('state', 'switch_mode', 'waist', 'mic')}
+        self._auto_start = [aliases.get(name, name) for name in self._auto_start if name not in ('state', 'switch_mode', 'waist', 'mic')]
 
     def twist(self, topic, x=0.0, y=0.0, z=0.0, pitch=0.0, yaw=0.0):
         self.ros1.publish(topic, "geometry_msgs/Twist", {

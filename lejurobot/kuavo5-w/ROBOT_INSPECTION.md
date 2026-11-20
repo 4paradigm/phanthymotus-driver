@@ -791,3 +791,14 @@ pitch+10°有一次实测到位完成。支持方向相关的稳态跟踪误差�
   唯一USB选择、多实例隔离及共享凭据不入SSH命令参数。
 - 操作人员明确要求恢复默认密码回退，已恢复 connection_defaults.py 默认值，保留私有覆盖和逐角色禁用；
   不把密码写进卡片状态/schema/日志，不要求默认部署提供额外凭据文件。
+
+### 外置麦克风卡片整理（2026-11-20）
+
+- 隐藏未确认的内置mic卡，旧配置也不再暴露。仅保留multiInstance ext_mic。
+- ext_mic的公开inputSchema为空，设备选择只在configSchema；start/stop/config/info仍供生命周期使用，
+  不再将刷新/配置等动作暴露为业务执行表单。后台每15秒只读探测设备。
+- 选择列表只列USB ALSA采集端点；板载模拟接口及PulseAudio重复别名不显示，旧模拟设备选择也拒绝启动。
+- 486项离线测试与服务部署检查通过。已部署local-ext-mic-ui-261120，源码hash、卡片声明、test地图与P0/P1/P2均核对保留。
+- 本轮上位机新枚举到host/alsa/plughw:CARD=Rx,DEV=0（USB Audio），通过真实ext_mic卡采集，
+  domain42端收到94个PCM16k块，stop后无录音实例，电机仍禁用。
+  观察到的末帧RMS/peak均为0；仅证明USB采集与DDS通路，尚不能声称已验证人声，需现场说话/ASR验收。

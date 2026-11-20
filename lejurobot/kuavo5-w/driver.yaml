@@ -17,7 +17,6 @@ cards:
   - { name: leg,         type: actuator }
   - { name: head,        type: actuator }
   - { name: speaker,     type: actuator }
-  - { name: mic,         type: sensor }
   - { name: ext_mic,     type: sensor }
   - { name: joints, type: sensor }
   - { name: imu, type: sensor }

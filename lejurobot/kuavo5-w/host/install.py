@@ -71,7 +71,8 @@ def main():
             if old in plugins:
                 plugins.setdefault(new, plugins.pop(old))
         plugins.pop('state', None)
-        for name in ('battery', 'laser_scan', 'camera_left', 'camera_right', 'camera_head', 'camera_depth', 'speaker', 'mic', 'ext_mic'):
+        plugins.pop('mic', None)
+        for name in ('battery', 'laser_scan', 'camera_left', 'camera_right', 'camera_head', 'camera_depth', 'speaker', 'ext_mic'):
             plugins.setdefault(name, defaults['plugins'][name])
         sensors = operator.setdefault('sensors', {})
         if 'auto_start' in sensors:

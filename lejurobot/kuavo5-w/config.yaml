@@ -51,10 +51,6 @@ controlled_spatial:
   motion_music_enabled: false
   # Silence only factory ID-7 standby prompt; preserve alarms and speaker/TTS.
   standby_voice_enabled: false
-microphones:
-  # Empty means auto-select only a unique USB capture device.
-  # Analog inputs require explicit selection after acoustic verification.
-  source: ""
 plugins:
   base_servo: {enabled: true}
   base_drive: {enabled: true}
@@ -63,7 +59,6 @@ plugins:
   leg: {enabled: true}
   head: {enabled: true}
   speaker: {enabled: true}
-  mic: {enabled: true}
   ext_mic: {enabled: true}
   joints: {enabled: true}
   imu: {enabled: true}

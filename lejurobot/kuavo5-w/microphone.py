@@ -169,28 +169,32 @@ class Microphones:
             return {'state': 'ready', 'available_devices': devices, 'probe_errors': errors}
 
     def start_background(self):
+        def discover():
+            while not self.closed.is_set():
+                self.refresh()
+                self.closed.wait(15.)
         with self.lock:
             if self.worker is None and not self.closed.is_set():
-                self.worker = threading.Thread(target=self.refresh, daemon=True, name='microphone-discovery')
+                self.worker = threading.Thread(target=discover, daemon=True, name='microphone-discovery')
                 self.worker.start()
+
+    def _external_devices(self):
+        # One ALSA endpoint per USB capture device; PulseAudio aliases and
+        # unverified motherboard jacks must not appear as physical microphones.
+        return [d for d in self.devices if d.get('usb') and '/alsa/' in d['id']]
 
     def tools(self):
         with self.lock:
-            choices = [{'const': d['id'], 'title': d['role']+': '+d['name']} for d in self.devices]
-        tools = []
-        for name in ('mic', 'ext_mic'):
-            selector = {'type': 'string', 'scope': 'instance',
-                        'description': 'Capture input on a robot board; SSH uses shared deployment credentials.'}
-            if choices:
-                selector['oneOf'] = choices
-            tools.append({'name': name, 'type': 'sensor', 'multiInstance': name == 'ext_mic',
-                'description': '16 kHz mono PCM16 microphone input; start probes and opens capture. No playback monitor or synthetic silence. Plug a USB microphone into a robot board, then refresh_devices.',
-                'topic_in': [], 'topic_out': [{'format': 'audio/pcm-16k'}],
-                'inputSchema': {'type': 'object', 'required': ['action'], 'properties': {
-                    'action': {'type': 'string', 'enum': ['start', 'stop', 'info', 'config', 'refresh_devices']},
-                    'instance_id': {'type': 'string'}, 'device_index': {'type': 'string'}}},
-                'configSchema': {'type': 'object', 'properties': {'device_index': selector}}})
-        return tools
+            choices = [{'const': d['id'], 'title': d['role']+': '+d['name']}
+                       for d in self._external_devices()]
+        selector = {'type': 'string', 'scope': 'instance',
+                    'description': 'USB microphone connected to a robot board. Shared SSH settings are used.',
+                    'oneOf': choices or [{'const': '', 'title': 'No USB microphone detected — connect one and refresh the driver cards'}]}
+        return [{'name': 'ext_mic', 'type': 'sensor', 'multiInstance': True,
+            'description': '16 kHz mono PCM16 USB microphone. Select an input in card settings; enabling/disabling the sensor starts/stops capture.',
+            'topic_in': [], 'topic_out': [{'format': 'audio/pcm-16k'}],
+            'inputSchema': {'type': 'object', 'properties': {}},
+            'configSchema': {'type': 'object', 'properties': {'device_index': selector}}}]
 
     def _key(self, card, args):
         instance = args.get('instance_id', '') if card == 'ext_mic' else 'default'
@@ -201,11 +205,13 @@ class Microphones:
     def dispatch(self, card, action, args):
         key, token = None, None
         try:
+            if card != 'ext_mic':
+                raise ValueError('unverified_builtin_microphone_not_available_use_ext_mic')
             if action == 'refresh_devices':
                 return self.refresh()
             if action == 'info' and card == 'ext_mic' and not args.get('instance_id'):
                 with self.lock:
-                    return {'state': 'idle', 'available_devices': list(self.devices),
+                    return {'state': 'idle', 'available_devices': list(self._external_devices()),
                             'probe_errors': dict(self.errors), 'active_instances': [k[1] for k in self.sessions if k[0] == card]}
             key = self._key(card, args)
             with self.lock:
@@ -214,7 +220,7 @@ class Microphones:
                 session = self.sessions.get(key)
                 if action == 'info':
                     return session.snapshot() if session else {'state': 'idle',
-                        'available_devices': list(self.devices), 'probe_errors': dict(self.errors)}
+                        'available_devices': list(self._external_devices()), 'probe_errors': dict(self.errors)}
                 if action == 'config':
                     if session or key in self.starting:
                         raise RuntimeError('stop_before_changing_microphone')
@@ -255,8 +261,8 @@ class Microphones:
                     usb = [d['id'] for d in self.devices if d.get('usb') and '/alsa/' in d['id']]
                     if len(usb) == 1:
                         selection = usb[0]
-                if selection not in {d['id'] for d in self.devices}:
-                    raise RuntimeError('microphone_unavailable_select_device_or_connect_USB_and_refresh')
+                if selection not in {d['id'] for d in self._external_devices()}:
+                    raise RuntimeError('USB_microphone_unavailable_connect_device_and_refresh_driver_cards')
                 if any(value == selection and k in self.sessions for k, value in self.configs.items() if k != key):
                     raise RuntimeError('microphone_device_in_use')
                 role, device = selection.split('/', 1)

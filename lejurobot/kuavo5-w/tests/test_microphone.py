@@ -105,6 +105,20 @@ class MicrophoneTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     remote.capture_command(bad)
 
+    def test_only_usb_capture_inputs_are_visible_and_analog_cannot_start(self):
+        self.mics.devices = [
+            {'id':'chassis/alsa/plughw:CARD=PCH,DEV=0','role':'chassis','name':'Analog','usb':False},
+            {'id':'host/pulse/alsa_input.usb-mic','role':'host','name':'USB alias','usb':True},
+            {'id':'host/alsa/plughw:CARD=USB,DEV=0','role':'host','name':'USB mic','usb':True}]
+        choices = self.mics.tools()[0]['configSchema']['properties']['device_index']['oneOf']
+        self.assertEqual([c['const'] for c in choices], ['host/alsa/plughw:CARD=USB,DEV=0'])
+        self.assertEqual(self.mics.dispatch('mic','start',{})['state'],'error')
+        self.mics.refresh = lambda:None
+        result=self.mics.dispatch('ext_mic','start',{'instance_id':'one',
+            'device_index':'chassis/alsa/plughw:CARD=PCH,DEV=0'})
+        self.assertEqual(result['state'],'error')
+        self.manager.transport.open_stream.assert_not_called()
+
     def test_fragmented_real_pipe_publishes_correct_audio_and_stop_reaps_recorder(self):
         process=process_fixture()
         capture=microphone.Capture(self.node,process,'/robot/mic/default/audio')
@@ -133,6 +147,8 @@ class MicrophoneTests(unittest.TestCase):
         self.mics.refresh()
         tool=next(t for t in self.mics.tools() if t['name']=='ext_mic')
         self.assertTrue(tool['multiInstance'])
+        self.assertEqual(tool['inputSchema'], {'type':'object','properties':{}})
+        self.assertEqual([t['name'] for t in self.mics.tools()], ['ext_mic'])
         self.assertEqual(set(tool['configSchema']['properties']),{'device_index'})
         self.assertEqual(self.mics.dispatch('ext_mic','start',{})['state'],'error')
         device='host/alsa/plughw:CARD=USB,DEV=0'
@@ -141,17 +157,17 @@ class MicrophoneTests(unittest.TestCase):
         result=self.mics.dispatch('ext_mic','start',{'instance_id':'one'})
         self.assertEqual(result['state'],'running')
         self.assertEqual(result['topic_out'][0]['topic'],'/robot/ext_mic/i_6f6e65/audio')
-        self.assertEqual(self.mics.dispatch('mic','start',{'device_index':device})['state'],'error')
+        self.assertEqual(self.mics.dispatch('ext_mic','start',{'instance_id':'two','device_index':device})['state'],'error')
         self.assertEqual(self.mics.dispatch('ext_mic','stop',{'instance_id':'one'})['state'],'idle')
         self.assertFalse(self.mics.sessions)
 
     def test_missing_or_ambiguous_mic_is_not_replaced_with_a_simulated_source(self):
-        result=self.mics.dispatch('mic','start',{})
+        result=self.mics.dispatch('ext_mic','start',{'instance_id':'one'})
         self.assertEqual(result['state'],'error')  # Three boards, no arbitrary auto-pick.
         self.assertFalse(self.node.messages)
         self.manager.transport.open_stream.assert_not_called()
         self.manager.transport.run.return_value={'ok':True,'result':{'devices':[]}}
-        self.assertEqual(self.mics.dispatch('mic','start',{})['state'],'error')
+        self.assertEqual(self.mics.dispatch('ext_mic','start',{'instance_id':'one'})['state'],'error')
 
     def test_stop_during_discovery_prevents_late_capture_start(self):
         entered,release=threading.Event(),threading.Event()
@@ -160,11 +176,11 @@ class MicrophoneTests(unittest.TestCase):
             self.mics.devices=[{'id':'host/alsa/test','usb':True}]
         self.mics.refresh=refresh
         results=[]
-        worker=threading.Thread(target=lambda:results.append(self.mics.dispatch('mic','start',{'device_index':'host/alsa/test'})))
+        worker=threading.Thread(target=lambda:results.append(self.mics.dispatch('ext_mic','start',{'instance_id':'one','device_index':'host/alsa/test'})))
         worker.start()
         try:
             self.assertTrue(entered.wait(2))
-            self.assertEqual(self.mics.dispatch('mic','stop',{})['state'],'idle')
+            self.assertEqual(self.mics.dispatch('ext_mic','stop',{'instance_id':'one'})['state'],'idle')
             release.set();worker.join(3)
             self.assertEqual(results[0]['state'],'idle')
             self.manager.transport.open_stream.assert_not_called()
@@ -177,10 +193,10 @@ class MicrophoneTests(unittest.TestCase):
             return {'ok':True,'result':{'devices':devices}}
         self.manager.transport.run.side_effect=probe
         self.manager.transport.open_stream.side_effect=lambda *a:process_fixture()
-        result=self.mics.dispatch('mic','start',{})
+        result=self.mics.dispatch('ext_mic','start',{'instance_id':'one'})
         self.assertEqual(result['state'],'running')
         self.assertEqual(result['device_index'],'host/alsa/plughw:CARD=USB,DEV=0')
-        self.assertEqual(self.mics.dispatch('mic','stop',{})['state'],'idle')
+        self.assertEqual(self.mics.dispatch('ext_mic','stop',{'instance_id':'one'})['state'],'idle')
 
     def test_remote_recorder_is_reaped_after_stdin_closes_or_heartbeat_expires(self):
         for close_input in (True,False):
