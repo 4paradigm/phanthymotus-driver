@@ -57,6 +57,9 @@ class FakeRos1:
     def get_param(self, name, default=None):
         return self.params.get(name.lstrip('/'), default)
 
+    def get_params(self, defaults, timeout=2.):
+        return {name: self.get_param(name, default) for name, default in defaults.items()}
+
     def unsubscribe(self, topic):
         self.subscriptions.pop(topic, None)
 

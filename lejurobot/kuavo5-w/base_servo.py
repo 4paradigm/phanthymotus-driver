@@ -121,9 +121,11 @@ class BaseServo:
                         if topic != self._topic:
                             raise RuntimeError('stop before changing input_topic')
                         return self._start_reply()
-                    if self.bundle._transition is not None:
+                    joining_start = self.bundle.spatial.chassis_start_in_progress()
+                    if self.bundle._transition is not None and not joining_start:
                         raise RuntimeError('base is busy; stop the current action first')
-                    defer_control = 'base' in self.bundle.tracker._active or self.bundle.spatial.unresolved()
+                    defer_control = ('base' in self.bundle.tracker._active
+                                     or (self.bundle.spatial.unresolved() and not joining_start))
                     self.bundle.state.require_motion_enabled()
                     self._sink = self._new_sink()
                     from std_msgs.msg import String
@@ -158,8 +160,10 @@ class BaseServo:
                 with self._lock:
                     if self._subscription is None:
                         raise RuntimeError('start with input_topic first')
-                    if (self.bundle._transition is not None or 'base' in self.bundle.tracker._active
-                            or self.bundle.spatial.unresolved()):
+                    joining_start = self.bundle.spatial.chassis_start_in_progress()
+                    if ((self.bundle._transition is not None and not joining_start)
+                            or 'base' in self.bundle.tracker._active
+                            or (self.bundle.spatial.unresolved() and not joining_start)):
                         raise RuntimeError('base is busy; stop the current action first')
                     self._sink = self._new_sink()
                     self._lease = None

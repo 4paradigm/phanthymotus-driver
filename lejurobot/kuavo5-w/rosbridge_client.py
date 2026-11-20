@@ -107,6 +107,33 @@ class RosbridgeClient:
             raise ValueError(f'invalid ROS parameter response: {name}')
         return json.loads(raw)
 
+    def get_params(self, defaults: dict, timeout=2.0):
+        """Read a bounded parameter set concurrently within one shared deadline.
+
+        Only read-only rosapi calls are pipelined; motion services are unchanged.
+        No partial result is returned if any value fails or misses the deadline.
+        """
+        if not 1 <= len(defaults) <= 16:
+            raise ValueError('expected 1 to 16 ROS parameters')
+        pending, values = {}, {}
+        deadline = time.monotonic() + timeout
+        try:
+            for name, default in defaults.items():
+                pending[name] = self.start_service('/rosapi/get_param', 'rosapi/GetParam',
+                    {'name': name, 'default': json.dumps(default)})
+            for name, request in pending.items():
+                response = self.wait_service(request, max(0., deadline - time.monotonic()))
+                raw = response.get('value')
+                if not isinstance(raw, str):
+                    raise ValueError(f'invalid ROS parameter response: {name}')
+                values[name] = json.loads(raw)
+            return values
+        finally:
+            # A failed early response must not leak the other pending reads.
+            with self._lock:
+                for request in pending.values():
+                    self._services.pop(request[0], None)
+
     def publish(self, topic: str, message_type: str, message: dict) -> None:
         with self._lock:
             if not self._connected.is_set():

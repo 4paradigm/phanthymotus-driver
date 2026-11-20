@@ -309,6 +309,26 @@ class SensorTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'identity verification is stale'):
                 self.hub.require_profile()
 
+    def test_identity_refresh_batches_one_configuration_read_and_keeps_start_cadence(self):
+        self.hub._arm_limit_source = self.hub._leg_limit_source = 'vendor_runtime'
+        clock = [time.monotonic()]
+        started = clock[0]
+        original = self.ros.get_params
+        def delayed(defaults):
+            result = original(defaults)
+            clock[0] += 1.4  # A slow round must not add another 1 s idle gap.
+            return result
+        with patch.object(sensors_module, 'time', types.SimpleNamespace(monotonic=lambda: clock[0])), \
+                patch.object(self.ros, 'get_params', side_effect=delayed) as batch, \
+                patch.object(self.ros, 'get_param', wraps=self.ros.get_param) as single:
+            self.hub.discover()
+            self.assertEqual(batch.call_count, 1)
+            self.assertEqual([c.args[0] for c in single.call_args_list].count('/kuavo_configuration'), 1)
+            self.assertEqual(len(batch.call_args.args[0]), 9)
+            self.assertAlmostEqual(self.hub._identity_checked_at, started)
+            self.assertAlmostEqual(self.hub._retry_at, started + sensors_module.IDENTITY_REFRESH_S)
+            self.assertLess(self.hub._retry_at, clock[0])
+
     def test_stale_or_reconnected_measurements_are_not_zeros(self):
         self.ros.raw()
         self.hub._seen['joints'] = time.monotonic() - 1

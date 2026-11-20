@@ -206,11 +206,18 @@ class KuavoSensors:
         if not connected:
             return
         checked_at = time.monotonic()
+        refresh_ok = False
         try:
-            params = {name: self.ros1.get_param('/' + name) for name in (
+            defaults = {'/' + name: None for name in (
                 'robot_type', 'robot_version', 'armRealDof', 'headRealDof',
                 'legRealDof', 'waistRealDof')}
-            params['use_shm_communication'] = self.ros1.get_param('/use_shm_communication', False)
+            defaults.update({'/use_shm_communication': False, '/humanoid_description': None})
+            if 'vendor_runtime' in (self._arm_limit_source, self._leg_limit_source):
+                defaults['/kuavo_configuration'] = None
+            values = self.ros1.get_params(defaults)
+            params = {name: values['/' + name] for name in (
+                'robot_type', 'robot_version', 'armRealDof', 'headRealDof',
+                'legRealDof', 'waistRealDof', 'use_shm_communication')}
             missing = [key for key, value in params.items() if value is None]
             if missing:
                 raise ValueError('controller_not_ready: missing ROS parameters ' + ', '.join(missing))
@@ -223,7 +230,7 @@ class KuavoSensors:
                 raise ValueError('use_shm_communication must be a ROS boolean')
             topic = '/sensors_data_raw_shm' if params['use_shm_communication'] else '/sensors_data_raw'
             try:
-                urdf = self.ros1.get_param('/humanoid_description')
+                urdf = values['/humanoid_description']
                 names = model_names(urdf)
                 if names != model_names(self._model_path.read_text(encoding='utf-8')):
                     raise ValueError('runtime joint names differ from resource/kuavo5w_model.urdf; update the reference model')
@@ -240,7 +247,7 @@ class KuavoSensors:
                             raise ValueError(model_error)
                         # Match the vendor SDK's live-model source, never the local
                         # display resource. Require the controller's bounds too.
-                        settings = self.ros1.get_param('/kuavo_configuration')
+                        settings = values['/kuavo_configuration']
                         if isinstance(settings, str):
                             settings = json.loads(settings)
                         if not isinstance(settings, dict):
@@ -302,6 +309,7 @@ class KuavoSensors:
                 # Lease starts before parameter reads, not when slow reads finish.
                 self._identity_checked_at = checked_at
                 self._discovery_error = None
+                refresh_ok = True
         except Exception as exc:
             with self._lock:
                 if self.ros1.connection == (True, generation):
@@ -320,7 +328,9 @@ class KuavoSensors:
         finally:
             with self._lock:
                 self._discovering = False
-                self._retry_at = time.monotonic() + IDENTITY_REFRESH_S
+                # Keep a start-to-start cadence. Waiting another full interval
+                # after a slow read needlessly consumes the previous lease.
+                self._retry_at = (checked_at if refresh_ok else time.monotonic()) + IDENTITY_REFRESH_S
 
     def _identity_fresh(self):
         return (self._identity_checked_at is not None

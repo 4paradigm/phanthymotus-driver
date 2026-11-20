@@ -178,6 +178,22 @@ class ControlledSpatialPlugin:
         return (self._uncertain or self._task is not None or self._map_pending is not None
                 or self._preparation is not None)
 
+    def chassis_start_in_progress(self):
+        """Caller holds tracker.lock: a live shared start can be joined, not owned.
+
+        Persisted/orphan preparations and uncertain navigation/map writes still
+        block control. A stopped or reconnected startup cannot be joined.
+        """
+        self._restore()
+        token = self.bundle._transition
+        with self._startup_guard:
+            return bool(self._startup_thread and self._startup_thread.is_alive()
+                and self._startup_key == (self.bundle._stop_epoch, self.bundle.ros1.connection)
+                and self._startup and self._startup['state'] == 'loading'
+                and (token is None or (token['action'] == 'prepare_chassis'
+                                      and not token['cancelled'].is_set()))
+                and not self._uncertain and self._task is None and self._map_pending is None)
+
     def motion_block_reason(self):
         if not self.unresolved():
             return None

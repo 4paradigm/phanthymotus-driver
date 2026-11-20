@@ -4,6 +4,7 @@ import sys
 import math
 import time
 import threading
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
@@ -141,6 +142,68 @@ class BaseServoTests(unittest.TestCase):
             self.send()
             time.sleep(.06)
             self.assertEqual(self.call('base_servo', 'resume')['state'], 'error')
+        self.assertFalse(self.ros.published)
+        self.assertFalse(self.ros.sent_services)
+
+    def test_start_and_resume_join_live_shared_chassis_preparation(self):
+        from controlled_spatial import ControlledSpatialPlugin, SpatialStore
+        from test_controlled_spatial import Client
+        spatial = self.bundle.spatial
+        with tempfile.TemporaryDirectory() as folder:
+            spatial.store = SpatialStore(folder + '/db')
+            spatial.client = client = Client()
+            original = client.native
+            for resume in (False, True):
+                with self.subTest(resume=resume):
+                    if resume:
+                        self.call('base_servo', 'pause')
+                    entered, release = threading.Event(), threading.Event()
+                    def prepare(operation, **args):
+                        if operation == 'prepare':
+                            entered.set()
+                            release.wait(2)
+                        return original(operation, **args)
+                    spatial._startup_key = None
+                    with patch.object(client, 'native', side_effect=prepare), \
+                            patch.object(spatial, 'start_chassis', side_effect=lambda: ControlledSpatialPlugin.start_chassis(spatial)), \
+                            patch.object(spatial, 'startup_status', side_effect=lambda: ControlledSpatialPlugin.startup_status(spatial)):
+                        spatial.start_chassis()
+                        try:
+                            self.assertTrue(entered.wait(1))
+                            self.assertEqual(self.bundle._transition['action'], 'prepare_chassis')
+                            self.assertTrue(spatial.unresolved())
+                            result = self.call('base_servo', 'resume') if resume else self.start()
+                            self.assertEqual(result['state'], 'loading' if resume else 'ready')
+                            self.assertEqual(self.servo.info()['state'], 'loading')
+                            self.assertFalse(self.servo._paused)
+                            self.assertIsNone(self.servo._lease)
+                            self.assertFalse(self.ros.published)
+                            self.assertFalse(self.ros.sent_services)
+                        finally:
+                            release.set()
+                            spatial._startup_thread.join(1)
+                        self.assertFalse(spatial._startup_thread.is_alive())
+                        self.assertEqual(self.servo.info()['state'], 'running')
+            self.assertEqual([op for op, _ in client.calls].count('prepare'), 2)
+            spatial.store.close()
+
+    def test_start_cannot_join_orphan_preparation_or_other_control_transition(self):
+        spatial = self.bundle.spatial
+        spatial._restored = True
+        spatial._preparation = {'delivery_uncertain': True}
+        started = self.start()
+        self.assertEqual(started['state'], 'ready')
+        self.assertEqual(started['stream_state'], 'paused')
+        self.assertEqual(self.call('base_servo', 'resume')['state'], 'error')
+        spatial._preparation = None
+        self.call('base_servo', 'stop')
+        with self.bundle.tracker.lock:
+            token = self.bundle._new_transition('resume')
+        try:
+            self.assertEqual(self.start()['state'], 'error')
+            self.assertIsNone(self.servo._subscription)
+        finally:
+            self.bundle._end_control(token)
         self.assertFalse(self.ros.published)
         self.assertFalse(self.ros.sent_services)
 

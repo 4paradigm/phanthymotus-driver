@@ -68,6 +68,58 @@ class RosbridgeClientTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.client.get_param('/robot_type')
 
+    def test_parameter_batch_sends_all_reads_before_waiting_and_matches_response_ids(self):
+        original = self.sock.send
+        def send(raw):
+            original(raw)
+            if len(self.sock.sent) == 3:
+                for request in reversed(self.sock.sent):
+                    self.packet({'op': 'service_response', 'id': request['id'], 'result': True,
+                        'values': {'value': request['args']['default']}})
+        with patch.object(self.sock, 'send', side_effect=send):
+            result = self.client.get_params({'/version': None, '/shm': False, '/count': 14})
+        self.assertEqual(result, {'/version': None, '/shm': False, '/count': 14})
+        self.assertEqual({p['service'] for p in self.sock.sent}, {'/rosapi/get_param'})
+        self.assertFalse(self.client._services)
+
+    def test_parameter_batch_timeout_and_invalid_response_clean_all_pending_reads(self):
+        for malformed in (False, True):
+            with self.subTest(malformed=malformed):
+                self.sock.sent.clear()
+                original = self.sock.send
+                def send(raw):
+                    original(raw)
+                    request = self.sock.sent[-1]
+                    if malformed and len(self.sock.sent) == 1:
+                        self.packet({'op': 'service_response', 'id': request['id'],
+                                     'result': True, 'values': {'value': False}})
+                with patch.object(self.sock, 'send', side_effect=send):
+                    with self.assertRaises(ValueError if malformed else TimeoutError):
+                        self.client.get_params({'/a': None, '/b': None}, timeout=.01)
+                self.assertEqual(len(self.sock.sent), 2)
+                self.assertFalse(self.client._services)
+
+    def test_parameter_batch_uses_one_deadline_and_cleans_up_partial_send(self):
+        clock = [10.]
+        def wait(request, timeout):
+            self.assertAlmostEqual(timeout, 2. if request[3] == '/first' else 1.25)
+            clock[0] += .75
+            return {'value': '1'}
+        # Real handles have a shared service name; distinguish them for this test.
+        with patch.object(module.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(self.client, 'start_service', side_effect=[('1', None, {}, '/first'), ('2', None, {}, '/second')]), \
+                patch.object(self.client, 'wait_service', side_effect=wait):
+            self.assertEqual(self.client.get_params({'/a': None, '/b': None}), {'/a': 1, '/b': 1})
+        original = self.sock.send
+        def fail_second(raw):
+            if self.sock.sent:
+                raise ConnectionError('partial send')
+            original(raw)
+        with patch.object(self.sock, 'send', side_effect=fail_second):
+            with self.assertRaises(ConnectionError):
+                self.client.get_params({'/a': None, '/b': None})
+        self.assertFalse(self.client._services)
+
     def test_unsubscribe_is_not_restored_on_reconnect(self):
         self.client.subscribe('/old', 'std_msgs/String', lambda msg: None)
         self.client.unsubscribe('/old')
