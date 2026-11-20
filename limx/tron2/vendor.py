@@ -26,6 +26,11 @@ ARM_UPPER = (2.6005, 3.1940, 1.4835, .2618, 1.3963, .7854, 1.5708,
              2.6005, .2618, 3.6652, .2618, 1.7453, .7854, 1.5708)
 
 
+# LimX SDK guide §3.6.3, native dual-arm MoveP XYZ command bounds (metres).
+MOVE_P_BOUNDS = {'left': ((.250, .732), (-.213, .900), (-.673, .500)),
+                 'right': ((.250, .732), (-.900, .213), (-.673, .500))}
+
+
 # Operator requests the DACH manual/URDF limits for both axes. Pitch motion
 # was reported working on 0.7.3; yaw endpoints are not yet field-verified.
 # Preserve native vendor signs and exact degree-to-radian conversion.
@@ -131,6 +136,7 @@ class RobotReader:
         self.move_pending = None
         self.head_pending = None
         self.gripper_pending = {}
+        self.eef_pending = {}
         self._pose_servo = None
         self._pose_feedback_leases = set()
         self._joint_poll_wake = None  # Create on the reader's running loop.
@@ -183,6 +189,10 @@ class RobotReader:
         for _, future in self.gripper_pending.values():
             if not future.done():
                 future.set_exception(MoveError('夹爪连接中断，结果未确认；不会自动重发', None))
+        for expected, future in self.eef_pending.values():
+            if not future.done():
+                future.set_exception(MoveError('EEF connection lost; request outcome unknown',
+                                               False if expected == 'response_get_move_pose' else None))
         if self.move_pending:
             future = self.move_pending[1]
             if not future.done():
@@ -267,12 +277,14 @@ class RobotReader:
         body = json.loads(msg.data, parse_constant=reject_constant)
         if not isinstance(body, dict):
             raise ValueError('Expected robot JSON object')
-        if self._pose_servo is not None and body.get('accid') == self.serial and body.get('title') in (
-                'notify_servoJ','notify_servoj','notify_invalid_request'):
+        guid = body.get('guid')
+        if (self._pose_servo is not None and self._pose_servo['job'].get('motion_tool') != 'servo_eef'
+                and guid not in self.eef_pending and body.get('accid') == self.serial and body.get('title') in (
+                'notify_servoJ','notify_servoj','notify_invalid_request')):
             # ServoJ has no success response. Treat any vendor failure during
             # this owned output session as a fault, never silently ignore it.
             self._pose_servo['error'] = 'Vendor ServoJ failure notification'
-        pending = self.gripper_pending.get(body.get('guid'))
+        pending = self.gripper_pending.get(guid) or self.eef_pending.get(guid)
         if pending and body.get('accid') == self.serial:
             expected, future = pending
             if not future.done() and body.get('title') == expected:
@@ -472,6 +484,72 @@ class RobotReader:
                 'data':{'q':q,'filter_ratio':1.0}}),.02)
         except (OSError,aiohttp.ClientError,asyncio.TimeoutError) as exc:
             raise MoveError('ServoJ socket submission uncertain; no retry',None,'trajectory_send_unknown') from exc
+
+    async def read_move_pose(self):
+        """Query both native end poses on the existing WebSocket receive pump."""
+        return await self._move_pose_request()
+
+    async def send_move_p(self, left, right, duration, token):
+        """Submit one paired MoveP. The public pose order is xyz + xyzw."""
+        if token is None or token is not self._pose_servo or token.get('error') or (
+                token['ws'] is not self.ws or token['serial'] != self.serial):
+            raise MoveError('MoveP owner or connection changed', False)
+        if any(expected == 'response_movep' for expected, _ in self.eef_pending.values()):
+            raise MoveError('A MoveP acknowledgement is pending', False)
+        status = self.sample('robot_status')
+        if (self.configuration.get('mode') != 'upper_limb' or not status['available']
+                or status['data'].get('motor') != 'OK' or not motion_readiness(status['data'])['ready']):
+            raise MoveError('MoveP requires ready DACH upper-limb developer mode', False)
+        if type(duration) not in (int, float) or not .1 <= duration <= 60:
+            raise MoveError('MoveP time must be between 0.1 and 60 seconds', False)
+        pos = []
+        for side, pose in (('left', left), ('right', right)):
+            if (not isinstance(pose, (list, tuple)) or len(pose) != 7
+                    or any(type(v) not in (int, float) or not -1. <= v <= 1. for v in pose[3:])
+                    or abs(math.hypot(*pose[3:]) - 1.) > .001
+                    or any(type(v) not in (int, float) or not low <= v <= high
+                           for v, (low, high) in zip(pose[:3], MOVE_P_BOUNDS[side]))):
+                raise MoveError(f'Invalid {side} MoveP pose or position outside vendor limits', False)
+            pos.extend([*pose[:3], pose[6], *pose[3:6]])
+        await self._move_pose_request({'time': duration, 'pos': pos})
+        if token is not self._pose_servo or token.get('error'):
+            raise MoveError('MoveP acknowledged after ownership changed', True, 'outcome_unknown')
+        return {'status': 'accepted', 'motion_sent': True, 'arrival_verified': False}
+
+    async def _move_pose_request(self, move=None):
+        if not self.connected or self.ws is None or self.ws.closed or not self.serial:
+            raise MoveError('EEF WebSocket unavailable', False)
+        ws, serial = self.ws, self.serial
+        title = 'request_get_move_pose' if move is None else 'request_movep'
+        guid = str(uuid.uuid4())
+        future = asyncio.get_running_loop().create_future()
+        self.eef_pending[guid] = (title.replace('request_', 'response_', 1), future)
+        sent = False
+        try:
+            await asyncio.wait_for(ws.send_json({'title': title, 'accid': serial, 'guid': guid,
+                'timestamp': int(time.time()*1000), 'data': {} if move is None else move}), 5)
+            sent = True
+            reply = await asyncio.wait_for(future, self.settings['response_timeout_seconds'])
+            if ws is not self.ws or serial != self.serial:
+                raise MoveError('EEF connection changed before confirmation', None if move else False, 'outcome_unknown')
+            if not isinstance(reply, dict) or not isinstance(reply.get('result'), str):
+                raise MoveError('Malformed EEF acknowledgement; outcome unknown', None if move else False, 'outcome_unknown')
+            if reply['result'] != 'success':
+                if not reply['result'].startswith('fail'):
+                    raise MoveError('Unknown EEF response result', None if move else False, 'outcome_unknown')
+                code = 'movep_remote_rejected' if move is not None and reply['result'] == 'fail_remote' else 'vendor_rejected'
+                raise MoveError('Vendor rejected EEF request: ' + reply['result'][:90],
+                                bool(move), code)
+            return reply
+        except (OSError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise MoveError('EEF request outcome unconfirmed; no automatic retry',
+                            (True if sent else None) if move else False, 'outcome_unknown') from exc
+        finally:
+            self.eef_pending.pop(guid, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
 
     async def send_arm_servoj(self, q, token):
         """General 16-axis stream writer; pose retains its separate zero-head rule."""

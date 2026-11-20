@@ -7,6 +7,8 @@ robot:
   response_timeout_seconds: 5
   stale_after_seconds: 5
 plugins:
+  eef_state: {enabled: true}
+  servo_eef: {enabled: true}
   loco_servo_arm: {enabled: true, expected_hz: 30, dry_run: false}
   loco_leg: {enabled: true}
   battery: {enabled: true}

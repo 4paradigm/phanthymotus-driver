@@ -853,12 +853,12 @@ class PackagingTests(unittest.TestCase):
         from device import VERSION
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for name in ('main.py','device.py','vendor.py','arm_servo.py','stand.py','sit_down.py','walk.py','state.py','reset.py','skeleton.py','completion.py','trajectory.py','pose.py','head.py','gripper.py','camera.py','ros2.py','config.yaml'):
+            for name in ('main.py','device.py','vendor.py','arm_servo.py','eef_state.py','servo_eef.py','stand.py','sit_down.py','walk.py','state.py','reset.py','skeleton.py','completion.py','trajectory.py','pose.py','head.py','gripper.py','camera.py','ros2.py','config.yaml'):
                 shutil.copyfile(DRIVER/name, root/name)
             shutil.copytree(DRIVER/'resource', root/'resource')
             shutil.copytree(DRIVER/'head_follow', root/'head_follow')
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
-            script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
+            script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton, eef_state, servo_eef; '
                 'assert "<robot" in skeleton.model()["urdf"]; '
                 'assert device.VERSION == '+repr(VERSION)+'; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
@@ -866,14 +866,19 @@ class PackagingTests(unittest.TestCase):
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_wire_commands_are_limited_to_joint_head_and_gripper_protocols(self):
+    def test_wire_commands_are_limited_to_driver_protocols(self):
         source = ast.parse((DRIVER/'vendor.py').read_text())
         calls = [n for n in ast.walk(source) if isinstance(n,ast.Call)
                  and isinstance(n.func,ast.Attribute) and n.func.attr == 'send_json']
-        self.assertEqual(len(calls),6)
+        self.assertEqual(len(calls),8)
         payloads = [{k.value:v for k,v in zip(c.args[0].keys,c.args[0].values)} for c in calls]
         literal = [p for p in payloads if isinstance(p['title'], ast.Constant)]
-        self.assertEqual({p['title'].value for p in literal}, {'request_get_joint_state', 'request_movej', 'request_moveh', 'request_servoj'})
+        self.assertEqual({p['title'].value for p in literal},
+                         {'request_enable_imu', 'request_get_joint_state', 'request_movej', 'request_moveh', 'request_servoj'})
+        eef = next(fn for fn in ast.walk(source) if isinstance(fn, ast.AsyncFunctionDef) and fn.name == '_move_pose_request')
+        titles = {n.value for n in ast.walk(eef) if isinstance(n, ast.Constant)
+                  and isinstance(n.value, str) and n.value.startswith('request_') and n.value != 'request_'}
+        self.assertEqual(titles, {'request_get_move_pose', 'request_movep'})
         query = next(p for p in literal if p['title'].value == 'request_get_joint_state')
         self.assertEqual(query['data'].keys, [])
         for filename in ('motion.py','control.py','record.py','teach.py'):
@@ -900,7 +905,7 @@ class PackagingTests(unittest.TestCase):
                 with patch.dict(os.environ,CONFIG_PATH=str(path)), self.assertRaisesRegex(ValueError, 'read-only sensor'): load()
                 path.write_text(yaml.safe_dump(config))
                 with patch.dict(os.environ,CONFIG_PATH=str(path)):
-                    self.assertEqual(set(load()['enabled_cards']),{'battery', 'joints', 'loco_leg', 'loco_servo_arm', 'arm_control', 'move_head', 'pose', 'gripper', 'camera', 'camera_left', 'camera_right', 'head_visual_follow'})
+                    self.assertEqual(set(load()['enabled_cards']),{'battery', 'joints', 'loco_leg', 'loco_servo_arm', 'eef_state', 'servo_eef', 'arm_control', 'move_head', 'pose', 'gripper', 'camera', 'camera_left', 'camera_right', 'head_visual_follow'})
 
     def test_camera_only_and_fixed_source_configuration(self):
         load = self.function('load_settings')
