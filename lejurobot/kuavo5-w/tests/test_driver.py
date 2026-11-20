@@ -8,6 +8,8 @@ import threading
 import time
 import types
 import unittest
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -201,6 +203,127 @@ class DriverContractTests(unittest.TestCase):
         if card == 'state':  # Internal safety state remains tested, no public card.
             return self.bundle.state.dispatch(action, args)
         return self.bundle.dispatch(card, {"action": action, **args})
+
+    @contextmanager
+    def held_chassis_start(self):
+        from controlled_spatial import SpatialStore
+        from test_controlled_spatial import Client
+        spatial = self.bundle.spatial
+        previous_store, previous_client = spatial.store, spatial.client
+        entered, release = threading.Event(), threading.Event()
+        with tempfile.TemporaryDirectory() as folder:
+            spatial.store, spatial.client = SpatialStore(folder + '/db'), Client()
+            original = spatial.client.native
+            def native(operation, **args):
+                if operation == 'prepare':
+                    entered.set()
+                    release.wait(2)
+                return original(operation, **args)
+            with patch.object(spatial.client, 'native', side_effect=native):
+                spatial.start_chassis()
+                try:
+                    self.assertTrue(entered.wait(1))
+                    yield release
+                finally:
+                    release.set()
+                    spatial._startup_thread.join(2)
+                    spatial.store.close()
+                    spatial.store, spatial.client = previous_store, previous_client
+
+    def test_leg_motion_waits_for_shared_chassis_start_then_revalidates_target(self):
+        targets, validated, results = [], [], []
+        def motion():
+            results.append(self.bundle.start_motion('lower_body', 'leg', (3,),
+                lambda: targets.append('target'), lambda: validated.append('live'),
+                request_epoch=self.bundle._stop_epoch, notify=False))
+        with self.held_chassis_start() as release:
+            thread = threading.Thread(target=motion)
+            thread.start()
+            time.sleep(.06)
+            self.assertTrue(thread.is_alive())
+            self.assertFalse(targets)
+            self.assertFalse(validated)
+            release.set()
+            thread.join(1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(targets, ['target'])
+            self.assertGreaterEqual(len(validated), 1)
+            self.assertGreater(results[0][-1]['waited_for_chassis_start_s'], 0)
+            self.bundle.tracker.cancel_all('test_done')
+
+    def test_stop_while_waiting_for_chassis_start_never_replays_the_joint_request(self):
+        targets, errors = [], []
+        def motion():
+            try:
+                self.bundle.start_motion('lower_body', 'leg', (3,), lambda: targets.append(True),
+                                         request_epoch=self.bundle._stop_epoch)
+            except Exception as exc:
+                errors.append(exc)
+        with self.held_chassis_start() as release:
+            thread = threading.Thread(target=motion)
+            thread.start()
+            time.sleep(.05)
+            stop = threading.Thread(target=lambda: self.bundle.pause('test_stop'))
+            stop.start()
+            thread.join(1)
+            self.assertFalse(thread.is_alive())
+            self.assertIsInstance(errors[0], InterruptedError)
+            release.set()
+            stop.join(1)
+        self.assertFalse(targets)
+
+    def test_reconnect_and_timeout_while_waiting_never_send_a_joint_target(self):
+        targets, errors = [], []
+        def motion():
+            try:
+                self.bundle.start_motion('lower_body', 'leg', (3,), lambda: targets.append(True))
+            except Exception as exc:
+                errors.append(exc)
+        with self.held_chassis_start():
+            with patch.object(driver, 'CHASSIS_PREPARATION_WAIT_S', .04):
+                motion()
+            self.assertIsInstance(errors[-1], TimeoutError)
+            self.assertIn('No motion target was sent', str(errors[-1]))
+            thread = threading.Thread(target=motion)
+            thread.start()
+            time.sleep(.04)
+            self.ros.connection = (True, 2)
+            thread.join(1)
+            self.assertIsInstance(errors[-1], ConnectionError)
+            self.assertFalse(thread.is_alive())
+        self.assertFalse(targets)
+
+    def test_other_motion_preparation_still_rejects_with_its_owner(self):
+        with self.bundle.tracker.lock:
+            token = self.bundle._new_transition('prepare_motion')
+            token['tool'] = 'head'
+        try:
+            result = self.call('leg', 'move_joints', positions=[0.] * 4)
+            self.assertIn('preparing=prepare_motion; owner=head', result['error'])
+            ownership = self.bundle.control_ownership()
+            self.assertEqual(ownership['transition_owner'], 'head')
+            self.assertGreaterEqual(ownership['transition_age_s'], 0.)
+            self.assertFalse(self.ros.published)
+        finally:
+            self.bundle._end_control(token)
+
+    def test_joint_limits_are_revalidated_after_waiting_before_any_enable_or_target(self):
+        results = []
+        with self.held_chassis_start() as release:
+            thread = threading.Thread(target=lambda: results.append(
+                self.call('leg', 'move_joints', positions=[0.] * 4)))
+            thread.start()
+            time.sleep(.05)
+            self.ros.params['robot_version'] += 1
+            self.bundle.sensors.discover()
+            self.ros.raw()
+            release.set()
+            thread.join(1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(results[0]['state'], 'error')
+            self.assertIn('robot_version', results[0]['error'])
+            self.assertFalse(self.ros.sent_services)
+            self.assertFalse(self.ros.published)
 
     def test_pending_map_rejects_leg_without_pause_or_target(self):
         self.bundle.spatial._restored = True

@@ -39,6 +39,7 @@ MODES = {0: "NoControl", 1: "ArmOnly", 2: "BaseOnly", 3: "BaseArm", 4: "ArmEeOnl
 CARD_CONTROL_MODE = 3  # All cards share BaseArm; only base velocity ownership changes.
 CONTROL_TIMEOUT_S = 2.0  # One total budget for service acceptance AND state confirmation.
 DISPATCH_LOCK_TIMEOUT_S = 0.25
+CHASSIS_PREPARATION_WAIT_S = 15.0  # Bounded wait, below the MCP request timeout.
 ENABLE_LEASE_S = 3.0
 ENABLE_PROBE_INTERVAL_S = 1.0
 ENABLE_TOPIC = '/enable_control_state'
@@ -1226,7 +1227,7 @@ class KuavoBundle:
         if self._transition is not None:
             self._transition['cancelled'].set()
         token = {'action': action, 'cancelled': threading.Event(),
-                 'generation': self.ros1.connection[1]}
+                 'generation': self.ros1.connection[1], 'started_at': time.monotonic()}
         self._transition = token
         return token
 
@@ -1302,17 +1303,58 @@ class KuavoBundle:
             raise _UncertainMotionSend(channel, aid, str(exc)) from exc
         return aid, cancelled, generation, issued, preparation
 
+    def _wait_for_chassis_start(self, request_epoch):
+        """Join only a live shared preflight, outside the control lock.
+
+        Never queue behind a motion, stop, orphan task or a different transition.
+        The caller revalidates the target and this stop/session fence before use.
+        """
+        started, waiting = time.monotonic(), False
+        epoch, connection = request_epoch, None
+        while True:
+            if not self.tracker.lock.acquire(timeout=DISPATCH_LOCK_TIMEOUT_S):
+                raise RuntimeError('control transition is busy; query state before retrying')
+            try:
+                if epoch is None:
+                    epoch = self._stop_epoch
+                if self._closing or epoch != self._stop_epoch:
+                    raise InterruptedError('motion request superseded by stop')
+                if waiting and self.ros1.connection != connection:
+                    raise ConnectionError('connection changed while waiting for chassis preparation')
+                if not self.spatial.chassis_start_in_progress():
+                    if not waiting:
+                        return None
+                    status = self.spatial.startup_status()
+                    if status['state'] != 'running':
+                        raise RuntimeError('chassis preparation did not complete; no motion target sent: '
+                                           + str(status.get('error', status['state'])))
+                    return epoch, connection, time.monotonic() - started
+                if not waiting:
+                    waiting, connection = True, self.ros1.connection
+                if time.monotonic() - started >= CHASSIS_PREPARATION_WAIT_S:
+                    raise TimeoutError('Checking chassis status in background, please wait. '
+                                       'No motion target was sent; retry after preparation finishes.')
+            finally:
+                self.tracker.lock.release()
+            time.sleep(.02)
+
     def start_motion(self, channel, tool, modes, publish, validate=None, request_epoch=None, notify=True):
         """One user action owns resume -> mode -> target, interruptible at each step."""
+        joined = self._wait_for_chassis_start(request_epoch) if channel != 'base' else None
         if not self.tracker.lock.acquire(timeout=DISPATCH_LOCK_TIMEOUT_S):
             raise RuntimeError('control transition is busy; query state before retrying')
         try:
             if request_epoch is not None and request_epoch != self._stop_epoch:
                 raise InterruptedError('motion request superseded by stop')
+            if joined and (joined[0] != self._stop_epoch or joined[1] != self.ros1.connection):
+                raise InterruptedError('motion request superseded by stop or reconnect')
             self.state.require_motion_enabled()
             self.sensors.require_profile()
             if self._closing or self._transition is not None:
-                raise RuntimeError('motion/control is busy; wait for preparation or stop it first')
+                transition = self._transition or {}
+                raise RuntimeError('motion/control is busy; preparing=' + transition.get('action', 'shutdown')
+                                   + '; owner=' + transition.get('tool', 'shared_control')
+                                   + '; wait for preparation or stop it first')
             if self.state.motion_send_uncertain:
                 raise RuntimeError('motion command delivery is uncertain; controller reconciliation is required')
             if channel == 'base' and self.spatial.startup_status().get('state') == 'loading':
@@ -1335,6 +1377,8 @@ class KuavoBundle:
             compatible = mode == CARD_CONTROL_MODE and (not modes or mode in modes)
             fresh = time.monotonic() - seen <= 2
             preparation = {'automatic': True, 'resumed': False, 'mode_changed': False, 'mode': mode}
+            if joined:
+                preparation['waited_for_chassis_start_s'] = round(joined[2], 3)
             upper_velocity = tool != 'controlled_spatial'
             # This vendor Bool is latched and published on changes, not a
             # heartbeat. read() invalidates it on a connection-generation change.
@@ -1439,6 +1483,9 @@ class KuavoBundle:
                     'active_resources': owners,
                     'base_exclusive': ['base_drive', 'base_servo', 'controlled_spatial', 'remote_control'],
                     'transition': transition['action'] if transition is not None else None,
+                    'transition_owner': transition.get('tool', 'shared_control') if transition else None,
+                    'transition_age_s': max(0., time.monotonic() - transition['started_at'])
+                                        if transition and 'started_at' in transition else None,
                     'stop_move_scope': 'whole_body', 'servo_pause_scope': 'base_servo_only'}
 
     def wait_mode_feedback(self, token, after):
