@@ -70,6 +70,14 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
     async def feed(self, values, **fields):
         await self.send(message(values, **fields))
 
+    def segment_clock(self):
+        """Advance the native segment clock independently of the async worker."""
+        patcher = patch('servo_eef.time', wraps=time)
+        clock = patcher.start().monotonic
+        self.addCleanup(patcher.stop)
+        clock.return_value = time.monotonic()
+        return clock
+
     async def send(self, raw):
         before = self.servo.accepted + self.servo.rejected
         self.servo.publisher.callback(raw)
@@ -140,20 +148,31 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.reader.send_gripper.assert_not_awaited()
 
     async def test_changed_target_replaces_active_movep_and_measurement_can_hold_it(self):
+        clock = self.segment_clock()
         target = self.measured.copy()
         target[0] += .004
         await self.feed(target)
         self.assert_pose_call(target[:7], RIGHT)
-        # The native call has acknowledged, but the robot is still in transit.
+        window = self.reader.send_move_p.await_args.args[2]
         self.measured[0] += .001
         target = self.measured.copy()
         target[2] += .003
+        clock.return_value += window / 2
         await self.feed(target)
+        self.reader.send_move_p.assert_awaited_once()
+        clock.return_value += window / 2 + .001
+        await self.feed(target)
+        self.assertEqual(self.reader.send_move_p.await_count, 2)
         self.assert_pose_call(target[:7], RIGHT)
         self.measured[2] += .001
         hold = self.measured.copy()
+        clock.return_value += window / 2
+        await self.feed(hold)
+        self.assertEqual(self.reader.send_move_p.await_count, 2)
+        clock.return_value += window / 2 + .001
         await self.feed(hold)
         self.assert_pose_call(hold[:7], RIGHT)
+        clock.return_value += window + .001
         await self.feed(hold)
         self.assertEqual(self.reader.send_move_p.await_count, 3)
         self.reader.send_gripper.assert_not_awaited()
@@ -355,19 +374,84 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
                 await self.feed(self.measured)
                 self.assertEqual(transitions(), before + ['stream_interrupted'])
 
-    async def test_native_rejection_does_not_resubmit_the_same_pose(self):
-        self.reader.send_move_p.side_effect = MoveError('vendor refused', True, 'vendor_rejected')
+    async def test_rejected_first_segment_does_not_retry_on_peer_feedback_noise(self):
+        clock = self.segment_clock()
+        for code in ('vendor_rejected', 'movep_remote_rejected'):
+            with self.subTest(code=code):
+                self.reader.send_move_p.reset_mock()
+                self.reader.send_gripper.reset_mock()
+                self.reader.send_move_p.side_effect = MoveError('vendor refused', True, code)
+                self.measured[:] = MEASURED
+                target = self.measured.copy()
+                target[2] += .040
+                target[15] = .06
+                for tick in range(8):
+                    target[8:15] = self.measured[8:15]
+                    noise = .0001 if tick % 2 else -.0001
+                    self.measured[8] = RIGHT[0] + noise
+                    peer_angle = math.atan2(RIGHT[4], RIGHT[6]) + noise
+                    self.measured[12], self.measured[14] = math.sin(peer_angle), math.cos(peer_angle)
+                    clock.return_value += .125
+                    await self.feed(target)
+                    if tick == 0:
+                        self.assertEqual(self.servo.last['status'], 'partial')
+                self.assertFalse(self.servo.paused)
+                self.reader.send_move_p.assert_awaited_once()
+                self.reader.send_gripper.assert_awaited_once()
+                await self.servo.call({'action': 'pause'})
+                await self.servo.call({'action': 'resume'})
+
+    async def test_continuation_remote_rejection_retries_once_despite_peer_noise(self):
+        clock = self.segment_clock()
+        remote = MoveError('Vendor rejected EEF request: fail_remote', True, 'movep_remote_rejected')
+        self.reader.send_move_p.side_effect = [None, remote, remote, None]
         target = self.measured.copy()
-        target[2] += .004
-        target[15] = .06
+        target[0] += .07
         await self.feed(target)
-        self.assertFalse(self.servo.paused)
-        self.assertEqual(self.servo.last['status'], 'partial')
-        self.reader.send_gripper.assert_awaited_once()
-        for _ in range(3):
+        first, _, window, _ = self.reader.send_move_p.await_args.args
+        self.measured[:7] = first
+
+        async def send_fresh(delta):
+            clock.return_value += delta
+            target[8] = self.measured[8]
+            self.measured[8] = RIGHT[0] + (.0001 if self.measured[8] <= RIGHT[0] else -.0001)
             await self.feed(target)
-        self.reader.send_move_p.assert_awaited_once()
-        self.reader.send_gripper.assert_awaited_once()
+
+        await send_fresh(window + .001)
+        self.assertEqual(self.reader.send_move_p.await_count, 2)
+        self.assertEqual(self.servo.last['status'], 'rejected')
+        await send_fresh(window / 2)
+        self.assertEqual(self.reader.send_move_p.await_count, 2)
+        await send_fresh(window / 2 + .001)
+        self.assertEqual(self.reader.send_move_p.await_count, 3)
+        for _ in range(8):
+            await send_fresh(window / 2)
+        self.assertEqual(self.reader.send_move_p.await_count, 3)
+        self.assertFalse(self.servo.paused)
+        target[0] = self.measured[0] - .008
+        await send_fresh(window / 2)
+        self.assertEqual(self.reader.send_move_p.await_count, 4)
+        self.assertAlmostEqual(self.reader.send_move_p.await_args.args[0][0], target[0])
+        self.assertEqual(self.servo.last['status'], 'accepted')
+
+    async def test_stream_interruption_discards_refused_continuation_retry(self):
+        remote = MoveError('Vendor rejected EEF request: fail_remote', True, 'movep_remote_rejected')
+        self.reader.send_move_p.side_effect = [None, remote]
+        target = self.measured.copy()
+        target[0] += .07
+        await self.feed(target)
+        first, _, window, _ = self.reader.send_move_p.await_args.args
+        self.measured[:7] = first
+        await asyncio.sleep(window / 2)
+        await self.feed(target)
+        await asyncio.sleep(window / 2 + .02)
+        await self.feed(target)
+        self.assertEqual(self.reader.send_move_p.await_count, 2)
+        self.assertEqual(self.servo.last['status'], 'rejected')
+        await wait_until(lambda: self.servo.info()['sink']['holding'])
+        self.assertEqual(self.reader.send_move_p.await_count, 2)
+        await self.feed(target)
+        self.assertEqual(self.reader.send_move_p.await_count, 2)
 
     async def test_rejected_gripper_pauses_without_retransmitting_motor_fault(self):
         self.reader.send_gripper.side_effect = MoveError('fail_motor', True, 'vendor_rejected')
@@ -428,6 +512,43 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(second[0], first[0])
         self.assertLessEqual(second[0], target[0])
 
+    async def test_sustained_targets_reach_distinct_distances_with_delayed_peer_feedback(self):
+        clock = self.segment_clock()
+        for distance in (.040, .070):
+            with self.subTest(distance=distance):
+                self.measured[:] = MEASURED
+                writes = []
+
+                async def move(left, right, duration, token):
+                    writes.append((clock.return_value, self.measured[0], left[0], duration))
+                    return {'result': 'success'}  # Motion continues after the acknowledgement.
+
+                self.reader.send_move_p.side_effect = move
+                goal = LEFT[0] + distance
+                for tick in range(12):
+                    clock.return_value += .125  # One new control frame at 8 Hz.
+                    if writes:
+                        start_time, origin, target, duration = writes[-1]
+                        progress = min(1., (clock.return_value - start_time) / duration)
+                        self.measured[0] = origin + progress * (target - origin)
+                    # The upstream echoes the previous right TCP measurement.
+                    # The driver has already received a newer, slightly different one.
+                    frame = self.measured.copy()
+                    self.measured[8] = RIGHT[0] + (-1 if tick % 2 else 1) * .0001
+                    frame[0] = goal
+                    await self.feed(frame)
+
+                self.assertGreaterEqual(len(writes), math.ceil(distance / .020 - 1e-9))
+                for previous, following in zip(writes, writes[1:]):
+                    self.assertGreaterEqual(following[0] - previous[0] + 1e-9, previous[3])
+                for _, origin, target, duration in writes:
+                    self.assertLessEqual(abs(target - origin), .10 * duration + 1e-9)
+                self.assertAlmostEqual(self.measured[0] - LEFT[0], distance)
+                self.assertEqual(self.servo.rejected, 0)
+                clock.return_value += 1.
+                await self.servo.call({'action': 'pause'})
+                await self.servo.call({'action': 'resume'})
+
     async def test_first_diagonal_and_rotation_reach_vendor_as_one_sink_approved_point(self):
         self.measured[3:7] = [0., 0., 0., 1.]
         target = self.measured.copy()
@@ -472,6 +593,7 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(right), RIGHT)
 
     async def test_burst_during_pending_ack_cannot_accumulate_unsent_arm_steps(self):
+        clock = self.segment_clock()
         release = asyncio.Event()
 
         async def move(*_):
@@ -493,12 +615,11 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
             self.measured[0] += .015
         finally:
             release.set()
-        # A host may discard the pending point if feedback changed during the ACK.
-        # Only a new, legitimately sequenced input may then drive the next point.
         await asyncio.sleep(.03)
-        if self.reader.send_move_p.await_count == 1:
-            self.servo.publisher.callback(message(target))
-        await wait_until(lambda: self.reader.send_move_p.await_count >= 2)
+        self.reader.send_move_p.assert_awaited_once()
+        clock.return_value += self.reader.send_move_p.await_args.args[2] + .001
+        await self.feed(target)
+        self.assertEqual(self.reader.send_move_p.await_count, 2)
         left, right, duration, _ = self.reader.send_move_p.await_args.args
         self.assertLess(left[0], self.measured[0])
         self.assertAlmostEqual(left[1], self.measured[1])
@@ -508,6 +629,7 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.reader.send_move_p.await_count, 2)
 
     async def test_only_latest_target_dispatches_after_pending_native_ack(self):
+        clock = self.segment_clock()
         started, release = asyncio.Event(), asyncio.Event()
         async def move(*args):
             started.set()
@@ -523,9 +645,17 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
                 target[0] = LEFT[0] + dx
                 await asyncio.sleep(.005)
                 self.servo.publisher.callback(message(target))
+            window = self.reader.send_move_p.await_args.args[2]
+            clock.return_value += window + .01
         finally:
             release.set()
-        await wait_until(lambda: self.reader.send_move_p.await_count >= 2)
+        await asyncio.sleep(.02)
+        self.reader.send_move_p.assert_awaited_once()
+        clock.return_value += window / 2
+        await self.feed(target)
+        self.reader.send_move_p.assert_awaited_once()
+        clock.return_value += window / 2 + .001
+        await self.feed(target)
         self.assert_pose_call(target[:7], RIGHT)
         self.assertEqual(self.reader.send_move_p.await_count, 2)
 
@@ -588,18 +718,19 @@ class MovePWireTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_vendor_rejection_and_lost_ack_do_not_retry(self):
         with self.reader.pose_servo({'motion_tool': 'servo_eef'}) as token:
-            future = asyncio.create_task(self.reader.send_move_p(LEFT, RIGHT, 1., token))
-            sent = await asyncio.wait_for(self.writes.get(), 1.)
-            await self.receive(sent, {'result':'fail_invalid_cmd'})
-            with self.assertRaises(MoveError) as refused:
-                await future
-            self.assertEqual(refused.exception.code, 'vendor_rejected')
+            for result, code in [('fail_invalid_cmd', 'vendor_rejected'), ('fail_remote', 'movep_remote_rejected')]:
+                future = asyncio.create_task(self.reader.send_move_p(LEFT, RIGHT, 1., token))
+                sent = await asyncio.wait_for(self.writes.get(), 1.)
+                await self.receive(sent, {'result': result})
+                with self.assertRaises(MoveError) as refused:
+                    await future
+                self.assertEqual(refused.exception.code, code)
             with self.assertRaises(MoveError) as timeout:
                 await self.reader.send_move_p(LEFT, RIGHT, 1., token)
             self.assertTrue(timeout.exception.motion_sent)
             self.assertNotEqual(timeout.exception.code, 'vendor_rejected')
         self.assertEqual(self.writes.qsize(), 1)
-        self.assertEqual(self.socket.send_json.await_count, 2)
+        self.assertEqual(self.socket.send_json.await_count, 3)
 
     async def test_outside_peer_and_lost_owner_cannot_reach_wire(self):
         with self.reader.pose_servo({'motion_tool': 'servo_eef'}) as token:

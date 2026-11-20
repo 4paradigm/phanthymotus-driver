@@ -537,8 +537,9 @@ class RobotReader:
             if reply['result'] != 'success':
                 if not reply['result'].startswith('fail'):
                     raise MoveError('Unknown EEF response result', None if move else False, 'outcome_unknown')
+                code = 'movep_remote_rejected' if move is not None and reply['result'] == 'fail_remote' else 'vendor_rejected'
                 raise MoveError('Vendor rejected EEF request: ' + reply['result'][:90],
-                                bool(move), 'vendor_rejected')
+                                bool(move), code)
             return reply
         except (OSError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise MoveError('EEF request outcome unconfirmed; no automatic retry',

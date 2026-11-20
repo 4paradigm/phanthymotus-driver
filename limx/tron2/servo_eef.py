@@ -110,6 +110,7 @@ class EefServo:
         self.arm_intent = (None, None)
         self.commanded = (None, None)
         self.arm_error = None
+        self.retry_stream = None
         self.activity = None
         self.next_segment = 0.
         self.jaw_targets = {}
@@ -179,8 +180,11 @@ class EefServo:
             remaining_ms = min(WATCHDOG_MS, stamp + message["ttl_ms"] - now_ms)
             if message.get("obs_stamp_ms") is not None:
                 remaining_ms = min(remaining_ms, message["obs_stamp_ms"] + layout.max_obs_age_ms - now_ms)
+            previous = self.latest
+            stream = (previous.stream if previous and previous.source == message["source"]
+                      and previous.session is self.reader.ws else object())
             self.latest = _Frame(target, values, message["source"], stamp, time.monotonic() + remaining_ms/1000,
-                                 self.reader.ws, self.latest.stream if self.latest else object())
+                                 self.reader.ws, stream)
             self.overruns += int(wake.is_set())
             wake.set()
 
@@ -235,27 +239,49 @@ class EefServo:
                 and frame.session is self.reader.ws and frame.source == latest.source
                 and frame.target == latest.target and time.monotonic() < min(frame.deadline, latest.deadline))
 
-    async def _arms(self, goals, pair, starts):
+    async def _arms(self, goals, pair, starts, stream):
         intent = tuple(None if goal == start else goal for goal, start in zip(goals, starts))
-        now = time.monotonic()
         repeated = intent == self.arm_intent
-        if repeated and (self.arm_error or now < self.next_segment):
+        # Compare only refused goals with a noise allowance (0.5 mm / 2 mrad).
+        # Normal targets and the native endpoints retain their full precision.
+        same_refusal = self.arm_error and (repeated or (any(self.arm_intent) and all(
+            prior is None or (math.dist(prior[:3], goal[:3]) <= .0005 and
+                              rotation.angle_between(prior[3:], goal[3:]) <= .002)
+            for prior, goal in zip(self.arm_intent, goals))))
+        # A fresh frame can change the held arm by a few encoder counts. All
+        # targets share the same paired MoveP transport and execution window.
+        if time.monotonic() < self.next_segment or (same_refusal and self.retry_stream is not stream):
             return
         if intent == (None, None) and all(last is None or goal == last for goal, last in zip(goals, self.commanded)):
             self.arm_intent, self.commanded, self.arm_error = intent, (None, None), None
             return
         commanded = tuple(point if wanted is not None else None for point, wanted in zip(pair, intent))
-        if repeated and commanded == self.commanded:
+        if repeated and commanded == self.commanded and not self.arm_error:
             return
+        prior_path = self.arm_intent
+        prior_accepted = not self.arm_error
+        continuing = tuple(goal if goal == prior and point is not None and point != goal else None
+                           for goal, prior, point in zip(intent, prior_path, self.commanded))
         self.arm_intent, self.arm_error = intent, None
+        self.retry_stream = None
         self.inflight = "MoveP"
         self.active_arms = [side for side, old, target in zip(SIDES, self.commanded, intent)
                             if old is not None or target is not None]
         try:
             with self.reader.pose_servo({"motion_tool": "servo_eef"}) as token:
-                self.next_segment = now + MOVE_TIME_S
                 await self.reader.send_move_p(*pair, MOVE_TIME_S, token)
+        except MoveError as error:
+            # Only a definitively refused continuation of an accepted path gets
+            # one more opportunity, from a fresh upstream frame after cooldown.
+            if same_refusal:
+                self.arm_intent = prior_path
+            elif prior_accepted and any(continuing):
+                self.arm_intent = continuing
+                if error.code == "movep_remote_rejected":
+                    self.retry_stream = stream
+            raise
         finally:
+            self.next_segment = time.monotonic() + MOVE_TIME_S
             self.active_arms = []
             self.inflight = None
         self.commanded = commanded
@@ -284,7 +310,7 @@ class EefServo:
                     or rotation.angle_between(point[3:], goal[3:]) > rotation.angle_between(start[3:], goal[3:]) + 1e-7):
                 raise ValueError("Measured TCP advanced beyond this segment; waiting for a fresh command")
         try:
-            await self._arms(goals, pair, starts)
+            await self._arms(goals, pair, starts, frame.stream)
         except ValueError as error:
             if isinstance(error, MoveError) and (error.motion_sent is None or error.code == "outcome_unknown"):
                 raise
