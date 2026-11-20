@@ -11,6 +11,7 @@ external RealSense cameras over USB. It registers with Agent Core as
 | `joint_control` | Actuator | Absolute joint targets, single-axis jog, and controlled stop |
 | `gripper` | Actuator | Franka Hand opening, grasp, calibration, and stop |
 | `ext_camera` | Sensor | RGB, depth, or left near-infrared from a selected RealSense |
+| `controller_configuration` | Configuration | SSH credentials for automatic PNP controller discovery |
 
 ## Requirements
 
@@ -75,7 +76,11 @@ limits do not model obstacles in the workcell.
 
 `joint_control` and `gripper` are single-instance cards with no configuration panel.
 Select `arm` and enter speed, force and other parameters directly in each action.
-Without a workstation arm mapping, enter `robot_ip` in the action instead.
+Both cards use the Driver's verified Controller Configuration to resolve the selected
+side. No canvas connection is required. Without a verified mapping, new motion is
+rejected and stop remains available. Address changes apply while idle and release
+the card's previous sessions. Active motion or a known held object blocks a change.
+
 The first execution connects and waits up to five seconds for fresh, control-ready
 feedback before submitting motion. Offline or unsafe states still reject motion.
 
@@ -134,10 +139,10 @@ Confirm fresh joint state, the three camera channels and USB reconnect,
 then verify arm and gripper motion, stop behavior, and ACP acknowledgement
 with the operator monitoring the workcell.
 
-With `motion_arm_ips` configured, each action selects the left or right arm.
-Each arm accepts one in-flight action per control type. The workstation mapping
-is stored under `motion_arm_ips.left` and `motion_arm_ips.right` in the driver
-configuration; it is not a canvas card configuration.
+With `motion_arm_ips` configured, actions select the physical left or right arm.
+The Driver resolves the selected side using the mapping verified at startup.
+Use each controller's C2 (Shop Floor network) IP, match the physical mounting
+side, and give the arms distinct addresses.
 
 ## Grasp limits
 
@@ -147,3 +152,75 @@ in the error before connecting to hardware. Optional `min_width_mm` and
 22 mm is converted to SDK inner/outer tolerances of 2 mm each (total span 4 mm).
 An omitted lower/upper bound uses target minus/plus 5 mm, bounded to 0–80 mm.
 The limits describe acceptable grasp width, not extra move commands.
+
+## Visual pick and place
+
+`vision_pick_and_drop` provides `observe`, `grab_to`, `grab_by`, and `cancel`.
+Select only `left` or `right`; camera assignments, observation joints, tool
+geometry and accepted hand-eye calibration are stored per physical side in
+`config.yaml`. The deployed .3/262922070633 pair is left and the
+.2/263022071451 pair is right. Endpoint changes do not recalibrate a robot.
+
+Connect these inputs, in any order:
+
+| Input | Format | Contract |
+| --- | --- | --- |
+| RGB | `image/jpeg` | Selected wrist camera's `/rgb` topic |
+| Depth | `image/depth-zlib` | Same camera's `/depth` topic |
+| Objects | `data/json` | VOP must consume that RGB; output is `/rgb/objects` |
+
+Configure `force_n` (30–70 N), `speed_deg_s` and `speed_mm_s` before transfer.
+Speeds are joint degrees/s and total finger-spacing mm/s, not percentages.
+`observe_after_transfer` optionally captures another observation after returning.
+Legacy saved IP-bearing arm labels migrate by physical side. Dual-arm execution requires the IP input; configured YAML defaults alone do not
+authorize motion.
+
+`observe` uses the configured joint speed limit and returns object names,
+normalized positions and confidence. Position is image-centered XY in [-1,1],
+with positive X right and positive Y down; it is not a robot-base coordinate.
+The driver retains aligned RGB-D, camera calibration and the captured SDK EE
+pose privately. Publication timestamps are bounded to 200 ms skew; they are not
+hardware exposure synchronization. Objects must remain stationary after capture.
+
+Both transfer actions automatically observe when no saved photograph is available:
+
+- `grab_to`: `start_point_x/y` and `target_point_x/y`, all from the same image.
+- `grab_by`: `start_point_x/y` plus `delta_x/y` in physical table millimetres,
+  aligned with image right/down. A displacement or rotation must be nonzero.
+- Both require `confirm_motion=true`; optional `rotation_deg` is [-180,180],
+  clockwise viewed from above, applied after lifting.
+
+The driver requests plans from MoveIt on the PNP host over SSH and executes
+the validated trajectories on Orin with libfranka. It checks joint limits, sampled paths, modeled arm clearance
+and Hand/table clearance. Environment geometry beyond those models is not
+certified. Unaccepted calibration, insufficient depth or infeasible paths reject
+transfer. The original calibration matrices are retained when an IP changes.
+The Hand's `is_grasped` feedback is checked before and during transport; it does
+not measure contact force or prove placement.
+
+Transfers return `running` with an `action_id`; one ACP callback reports completion,
+error or cancellation. `info` retains the result, stage, mapping and input readiness.
+Check `transfer_completed`, `release_completed`, `return_completed`,
+`last_completed_stage`, `observation_required` and `recovery_required` before retrying.
+Cancellation never automatically opens a possibly held object. A failed return or
+post-transfer capture does not erase an already completed placement.
+
+## Controller Configuration
+
+The Driver starts discovery before initializing the camera and motion cards.
+No canvas instance is required. The configuration panel contains only the SSH
+username and password, which default to `pnp` and `ros`. Saving changed
+credentials triggers discovery again. The panel has no input or output ports
+and does not expose the discovered addresses.
+
+Discovery probes the robot Ethernet network and then tries the last verified
+host if necessary. Set `FRANKA_ROBOT_INTERFACE` to select the interface. The
+Driver verifies the host key under `/opt/phanthy-motus/franka-controller-access`
+with alias `franka-pnp-controller` and reads the existing Desk and hardware
+configuration. Both sides must be present and agree where the files overlap.
+
+The Driver stores verified addresses and credentials separately under
+`/opt/phanthy-motus/franka-ip-sync`. Credentials are private to the Driver and
+never included in action results. Each Driver boot verifies the mapping
+before accepting new motion. Joint control, gripper and visual pick use the
+same mapping, and visual pick also uses the shared SSH credentials.

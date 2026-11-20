@@ -71,5 +71,88 @@ int main() {
   invalid.target[0] = fr3::kUpper[0];
   rejects([&] { fr3::validate_joints(invalid.target); });
   require(fr3::max_error(start, command.target) == 0.5, "Measured completion error is wrong");
+  auto continuous = command;
+  continuous.path = {start, start, command.target, command.target};
+  continuous.timeout = 600;
+  const fr3::PathTrajectory smooth(start, continuous);
+  require(fr3::max_error(smooth.at(0), start) < 1e-12, "PATH start jumped");
+  require(fr3::max_error(smooth.at(smooth.duration()), command.target) < 1e-12, "PATH end missed");
+  const double dt = smooth.duration()/50000;
+  previous = smooth.at(0);
+  previous_velocity = {};
+  previous_acceleration = {};
+  for (int n=1; n<=50000; ++n) {
+    const auto q = smooth.at(n*dt);
+    fr3::validate_joints(q);
+    for (std::size_t j=0;j<7;++j) {
+      const double v = (q[j]-previous[j])/dt;
+      const double a = (v-previous_velocity[j])/dt;
+      const double jerk = (a-previous_acceleration[j])/dt;
+      require(std::abs(v) <= continuous.speed+1e-6, "PATH velocity exceeded");
+      require(std::abs(a) <= .15001, "PATH acceleration exceeded");
+      require(std::abs(jerk) <= .501, "PATH jerk exceeded");
+      previous_velocity[j]=v;
+      previous_acceleration[j]=a;
+    }
+    previous=q;
+  }
+  auto faster = continuous;
+  faster.speed = .4;
+  const auto positive = [](const fr3::Joints&) {
+    fr3::Joints limits;
+    limits.fill(.01);
+    return limits;
+  };
+  const auto negative = [](const fr3::Joints&) {
+    fr3::Joints limits;
+    limits.fill(-.01);
+    return limits;
+  };
+  const fr3::PathTrajectory unrestricted(start, faster);
+  const fr3::PathTrajectory limited(start, faster, positive, negative);
+  require(limited.duration() > unrestricted.duration(), "Directional limits must slow PATH");
+  faster.timeout = unrestricted.duration()+2.1;
+  rejects([&] { fr3::PathTrajectory bad(start, faster, positive, negative); });
+  auto wrong_start=start;
+  wrong_start[0]+=.01;
+  rejects([&] { fr3::PathTrajectory bad(wrong_start, continuous); });
+  {
+    const fr3::Joints start{0, 0, 0, -1, 0, 1, 0};
+    auto goal = start;
+    goal[6] += .02;
+    std::ostringstream wire;
+    wire << "TIMED t .1 .001 10 1 4";
+    for (const auto& point : {start, start, start, goal, goal, goal})
+      for (double q : point) wire << ' ' << q;
+    const auto command = fr3::parse_command(wire.str());
+    const fr3::TimedTrajectory timed(start, command);
+    require(fr3::max_error(timed.at(0), start) < 1e-12, "TIMED start jumped");
+    require(fr3::max_error(timed.at(timed.duration()), goal) < 1e-12, "TIMED end missed");
+    require(std::abs(timed.at(3.)[6] - .01) < 1e-12, "TIMED midpoint incorrect");
+    auto faster_timed = command;
+    faster_timed.speed = .5;
+    faster_timed.timed.front().end = .25;
+    const fr3::TimedTrajectory faster_motion(start, faster_timed);
+    require(faster_motion.duration() < timed.duration(), "FR3 limits should allow a faster TIMED path");
+    auto high_acceleration = faster_timed;
+    high_acceleration.speed = 1.;
+    high_acceleration.timed.front().end = .15;
+    rejects([&] { fr3::TimedTrajectory invalid(start, high_acceleration); });
+    auto high_jerk = command;
+    high_jerk.timed.front().end = .002;
+    for (size_t i = 3; i < 6; ++i) high_jerk.timed.front().controls[i][6] = .0000005;
+    rejects([&] { fr3::TimedTrajectory invalid(start, high_jerk); });
+    auto discontinuous = command;
+    discontinuous.timed.front().controls[1][6] += .01;
+    rejects([&] { fr3::TimedTrajectory invalid(start, discontinuous); });
+    auto short_segment = command;
+    short_segment.timed.front().end = .01;
+    rejects([&] { fr3::TimedTrajectory invalid(start, short_segment); });
+  }
+
+  require(fr3::parse_command("PATH p .02 .001 600 2 0 0 0 -1 0 1 0 .1 0 0 -1 0 1 0").path.size()==2,
+          "PATH wire format failed");
+  rejects([&] { fr3::parse_command("PATH p .02 .001 600 22"); });
+  rejects([&] { fr3::parse_command("PATH p .02 .001 600 2 0"); });
   std::cout << "FR3 command validation and trajectory bounds passed\n";
 }

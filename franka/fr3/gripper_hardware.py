@@ -185,6 +185,11 @@ class GripperSession(RobotSession):
             raise ValueError("Reader control_error must be text or null")
         sample.update(temperature=temperature, control_error=error,
                       timestamp_ms=int(time.time() * 1000))
+        received_ns = time.monotonic_ns()
+        sdk_ns = record.get("sdk_received_ns")
+        if type(sdk_ns) is int and 0 < sdk_ns <= received_ns:
+            sample.update(sdk_received_ns=sdk_ns, sdk_read_ms=record.get("sdk_read_ms"),
+                          sdk_to_driver_ms=round((received_ns - sdk_ns) / 1e6, 1))
         with self._lock:
             if self._stop.is_set() or self._connection_broken:
                 return False

@@ -84,7 +84,7 @@ class GripperCardTests(unittest.TestCase):
         self.assertIn("feedback", completion[2])
         self.publishers.assert_not_called()
 
-    def test_arm_selection_routes_without_a_topic_or_card_id(self):
+    def test_arm_selection_routes_from_controller_configuration_without_a_card_id(self):
         self.plugin._arm_ips = {"left": "172.16.0.3", "right": "172.16.0.2"}
         spec, = self.bundle.get_all_tools()
         self.assertNotIn("configSchema", spec)
@@ -93,6 +93,9 @@ class GripperCardTests(unittest.TestCase):
         self.assertEqual("ready", self.call("start", speed_mm_s=15)["state"])
         self.call("start", "hand-b", speed_mm_s=15)
         self.assertEqual([], self.sessions)
+        self.plugin._controller_configuration = mock.Mock()
+        self.plugin._controller_configuration.snapshot.return_value = (
+            "172.16.0.200", self.plugin._arm_ips, "pnp", "ros")
         left = self.call("set_position", instance_id="", arm="left", width_mm=20)
         right = self.call("set_position", instance_id="", arm="right", width_mm=20)
         self.assertEqual(["172.16.0.3", "172.16.0.2"], [session.address for session in self.sessions])
@@ -171,6 +174,34 @@ class GripperCardTests(unittest.TestCase):
         self.assertEqual("homing", session.commands[0]["action"])
         self.assertNotIn("width_m", session.commands[0])
         self.complete(session, result)
+
+    def test_idle_unloaded_gripper_hands_off_and_can_reconnect(self):
+        session = self.start()
+        other = self.start("hand-b", "172.16.0.3")
+        result = self.call("set_position", width_mm=40)
+        self.complete(session, result)
+        visual = self.plugin.acquire_for_vision(session.address, "vision")
+        self.assertIsNot(visual, session)
+        self.assertTrue(session.stopped)
+        self.assertFalse(other.stopped)
+        with self.assertRaisesRegex(RuntimeError, "reserved for visual motion"):
+            self.call("set_position", width_mm=35)
+        self.manager.release(visual.address, "vision")
+        result = self.call("set_position", width_mm=30)
+        self.complete(self.sessions[-1], result)
+
+    def test_vision_cannot_take_a_moving_held_or_stale_hand(self):
+        session = self.start()
+        result = self.call("grasp", width_mm=20)
+        with self.assertRaisesRegex(RuntimeError, "still moving"):
+            self.plugin.acquire_for_vision(session.address, "vision")
+        self.complete(session, result)
+        for feedback in ({"is_grasped": True}, {"is_grasped": False, "data_age_ms": 221}):
+            with self.subTest(feedback=feedback):
+                session.value.update(feedback)
+                with self.assertRaisesRegex(RuntimeError, "fresh, unloaded"):
+                    self.plugin.acquire_for_vision(session.address, "vision")
+        self.assertFalse(session.stopped)
 
     def test_stopmotion_releases_hold_without_stopping_other_ip_or_card(self):
         first = self.start()

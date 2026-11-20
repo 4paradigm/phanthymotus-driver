@@ -175,13 +175,40 @@ class RobotSession:
         for name, value, low, high in (
                 ("speed_rad_s", speed_rad_s, math.radians(0.1), math.radians(10)),
                 ("tolerance_rad", tolerance_rad, 0.0, math.radians(1)),
-                ("timeout_s", timeout_s, 1.0, 120.0)):
+                ("timeout_s", timeout_s, 1.0, 600.0)):
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value < low or value > high
                     or (name == "tolerance_rad" and value == 0)):
                 raise ValueError(f"{name} is outside its permitted range")
         fields = (speed_rad_s, tolerance_rad, timeout_s, *target)
         return self._submit_motion(owner, target, "MOVE", fields, timeout_s)
+
+    def move_path(self, owner, points, speed_rad_s=math.radians(2),
+                  tolerance_rad=math.radians(.1), timeout_s=600):
+        """Submit one continuous, bounded cubic spline; never queue or replay it."""
+        points = [_joints(point, "path point") for point in points]
+        if not 2 <= len(points) <= 21:
+            raise ValueError("Path requires 2 to 21 control points")
+        for point in points:
+            if any(not low+JOINT_MARGIN <= q <= high-JOINT_MARGIN
+                   for q,low,high in zip(point,JOINT_LOWER,JOINT_UPPER)):
+                raise ValueError("Path point is outside FR3 joint limits")
+        if (not math.isfinite(speed_rad_s) or not speed_rad_s >= math.radians(.1)
+                or not math.isfinite(tolerance_rad) or not 0 < tolerance_rad <= math.radians(1)
+                or not math.isfinite(timeout_s) or not 1 <= timeout_s <= 600):
+            raise ValueError("Invalid continuous path speed, tolerance or timeout")
+        fields = (speed_rad_s,tolerance_rad,timeout_s,len(points),
+                  *(v for point in points for v in point))
+        return self._submit_motion(owner, points[-1], "PATH", fields, timeout_s)
+
+    def move_timed(self, owner, segments, speed_rad_s, tolerance_rad, timeout_s):
+        """Submit the bounded interpolation of a MoveIt joint trajectory."""
+        if not 1 <= len(segments) <= 512:
+            raise ValueError("Timed motion requires 1 to 512 segments")
+        fields = (speed_rad_s, tolerance_rad, timeout_s, len(segments),
+                  *(value for end, controls in segments for value in
+                    (end, *(q for point in controls for q in point))))
+        return self._submit_motion(owner, segments[-1][1][-1], "TIMED", fields, timeout_s)
 
     def _submit_motion(self, owner, target, verb, fields, timeout_s, *, validate=None, stop=False):
         """Atomically validate ownership/state and submit one non-replayed command."""
@@ -283,10 +310,22 @@ class RobotSession:
             if self._connection_broken or self._process is None or self._process.stdin is None:
                 raise ConnectionError("Native command channel is unavailable")
             encoded = (command + "\n").encode("ascii")
-            # Commands are shorter than POSIX PIPE_BUF. A nonblocking atomic
-            # write cannot hold a card callback behind a wedged SDK process.
-            if os.write(self._process.stdin.fileno(), encoded) != len(encoded):
-                raise ConnectionError("Native command channel accepted a partial command")
+            fd = self._process.stdin.fileno()
+            remaining = memoryview(encoded)
+            deadline = time.monotonic() + 1.0
+            with selectors.DefaultSelector() as selector:
+                selector.register(fd, selectors.EVENT_WRITE)
+                while remaining:
+                    timeout = deadline - time.monotonic()
+                    if timeout <= 0 or not selector.select(timeout):
+                        raise TimeoutError("Timed out writing native command")
+                    try:
+                        written = os.write(fd, remaining)
+                    except BlockingIOError:
+                        continue
+                    if written == 0:
+                        raise ConnectionError("Native command channel stopped accepting data")
+                    remaining = remaining[written:]
         except (OSError, ValueError) as exc:
             self._break_locked(f"Native command channel failed: {exc}")
             raise RuntimeError(self._error) from exc
@@ -350,6 +389,13 @@ class RobotSession:
         if isinstance(mode, bool) or not isinstance(mode, int) or not 0 <= mode <= 6:
             raise ValueError("Reader robot_mode must be a libfranka RobotMode value")
         sample.update(robot_mode=mode, timestamp_ms=int(time.time() * 1000))
+        for name in ("O_T_EE", "F_T_EE"):
+            if name in record:
+                pose = record[name]
+                if (not isinstance(pose, list) or len(pose) != 16 or
+                        any(type(v) not in (int, float) or not math.isfinite(v) for v in pose)):
+                    raise ValueError(f"Reader {name} must contain sixteen finite numbers")
+                sample[name] = list(pose)
         with self._lock:
             if self._stop.is_set() or self._connection_broken:
                 return False
@@ -512,15 +558,19 @@ class SessionManager:
         self._close_lock = threading.Lock()
         self._sessions = {}
         self._retiring = {}
+        self._exclusive = {}
         self._closed = False
 
-    def acquire(self, address, owner):
+    def acquire(self, address, owner, *, exclusive=False):
         address = canonical_ip(address)
         hash(owner)
         while True:
             with self._lock:
                 if self._closed:
                     raise RuntimeError("Franka session manager is closed")
+                reserved = self._exclusive.get(address)
+                if reserved is not None and reserved != owner:
+                    raise RuntimeError(f"Franka connection {address} is reserved for visual motion")
                 retired = self._retiring.get(address)
                 if retired is None:
                     existing = self._sessions.get(address)
@@ -528,12 +578,16 @@ class SessionManager:
                         if not existing[0].stopped:
                             raise RuntimeError(f"Previous reader for {address} is still stopping; retry shortly")
                         del self._sessions[address]
+                    if exclusive and address in self._sessions and self._sessions[address][1] - {owner}:
+                        raise RuntimeError(f"Franka connection {address} is already in use")
                     if address not in self._sessions:
                         factory = self._session_factory or RobotSession
                         self._sessions[address] = (factory(address, **self._options), set())
                     session, owners = self._sessions[address]
                     session.register_owner(owner)
                     owners.add(owner)
+                    if exclusive:
+                        self._exclusive[address] = owner
                     return session
             # Wait only for this address; stopping another robot cannot block us.
             if not retired[1].wait(timeout=retired[0].close_deadline):
@@ -547,6 +601,8 @@ class SessionManager:
                 return
             session, owners = entry
             owners.discard(owner)
+            if self._exclusive.get(address) == owner:
+                self._exclusive.pop(address, None)
             last_owner = not owners
             if last_owner:
                 del self._sessions[address]
