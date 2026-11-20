@@ -531,6 +531,11 @@ def build_plugins(config: dict, _namespace: str, _ros2) -> list:
     if follow_config.get("enabled", False):
         from visual_follow import VisualFollowPlugin
         plugins.append(VisualFollowPlugin(hand, follow_config, _ros2))
+    tactile_config = config.get("plugins", {}).get("hand_tactile", {})
+    if tactile_config.get("enabled", False):
+        from lite_tactile import LiteTactilePlugin
+        plugins.append(LiteTactilePlugin(hand, tactile_config, global_config=config,
+                                         ros2=_ros2, namespace=_namespace))
     return plugins
 
 

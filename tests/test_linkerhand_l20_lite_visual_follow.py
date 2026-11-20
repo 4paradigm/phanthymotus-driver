@@ -164,7 +164,12 @@ def test_start_disarms_and_resume_is_the_confirmation_gate():
     assert plugin._streams["card1"]["paused"] is True
     assert plugin.accept(sample()) is False            # data ignored while armed
 
+    # resume without confirmation must be rejected (safety gate)
     result = plugin.dispatch("resume", {"instance_id": "card1"})
+    assert result["state"] == "error", result
+    assert "confirm" in result["error"]
+    assert plugin._streams["card1"]["paused"] is True
+    result = plugin.dispatch("resume", {"instance_id": "card1", "confirm_motion": True})
     assert result["state"] == "running", result
     assert plugin._streams["card1"]["paused"] is False
 
@@ -187,10 +192,10 @@ def test_accept_writes_a_clamped_command_and_rejects_wrong_data():
     assert len(client.writes) == before
 
 
-def test_watchdog_releases_torque_but_stream_survives_and_recovers():
+def test_watchdog_releases_torque_and_requires_confirmed_resume():
     plugin = make_plugin()
     client = start_with_fake_client(plugin)
-    plugin.dispatch("resume", {"instance_id": "card1"})
+    plugin.dispatch("resume", {"instance_id": "card1", "confirm_motion": True})
     assert plugin.accept(sample()) is True
     stream = plugin._streams["card1"]
     stream["last_data_monotonic"] = time.monotonic() - 2.0
@@ -198,12 +203,17 @@ def test_watchdog_releases_torque_but_stream_survives_and_recovers():
     assert "card1" in plugin._streams          # subscription kept alive
     assert stream["starved"] is True
     assert client.torques[-1] == [0] * 10      # torque released while silent
-    # Fresh data re-energizes automatically, no re-start / no confirmation.
+    # Fresh data must NOT auto re-energize: stays starved, no commands.
     stream["last_command_monotonic"] = 0.0
     curl = dict(sample()["flexions"]); curl["index"] = 1.0
-    assert plugin.accept(sample(flexions=curl)) is True
+    assert plugin.accept(sample(flexions=curl)) is False   # rejected while starved
+    assert stream["starved"] is True
+    assert client.torques[-1] == [0] * 10                   # still released
+    # Only an explicit confirmed resume restores motion.
+    r = plugin.dispatch("resume", {"instance_id": "card1", "confirm_motion": True})
+    assert r["state"] == "running", r
     assert stream["starved"] is False
-    assert plugin.dispatch("info", {"instance_id": "card1"})["state"] == "running"
+    assert plugin.accept(sample(flexions=curl)) is True
 
 
 def test_pause_releases_torque_and_resume_needs_confirmation():
@@ -214,7 +224,9 @@ def test_pause_releases_torque_and_resume_needs_confirmation():
     assert plugin.dispatch("pause", {"instance_id": "card1"})["state"] == "paused"
     assert client.torques[-1] == [0] * 10
     assert plugin.accept(sample()) is False
-    assert plugin.dispatch("resume", {"instance_id": "card1"})["state"] == "running"
+    assert plugin.dispatch("resume", {"instance_id": "card1"})["state"] == "error"
+    assert plugin.dispatch("resume", {"instance_id": "card1",
+                                      "confirm_motion": True})["state"] == "running"
 
 
 def test_confirmation_accepts_canvas_string_but_nothing_else():
@@ -414,7 +426,7 @@ def test_per_finger_deadband_keeps_jittering_finger_frozen():
     p._connection = connection
     p._subscribe = lambda t: None
     p.dispatch('start', {'instance_id': 'card1', 'input_topic': '/x'})
-    p.dispatch('resume', {'instance_id': 'card1'})
+    p.dispatch('resume', {'instance_id': 'card1', 'confirm_motion': True})
 
     base = sample()
     assert p.accept(base) is True
@@ -435,14 +447,29 @@ def test_per_finger_deadband_keeps_jittering_finger_frozen():
 
 def test_thumb_palm_plane_mapping_is_graded_and_monotonic():
     """Thumb bend must be graded across the whole range, not just 0/1."""
-    import sys
-    sys.path.insert(0, '/Users/4paradigm/Desktop/version-gestrue-hand/phanthymotus-main/actucore')
     import numpy as np
-    from plugins.handdrive.vision import _OPEN, _FIST
     import visual_follow as vf
+    # Self-contained fixtures: 21-point open/fist poses. Kept here so the
+    # test runs in any checkout/CI without an author-specific local path.
+    OPEN = np.array([
+        [0.50, 0.90, 0.0],
+        [0.42, 0.78, 0.0], [0.35, 0.68, 0.0], [0.28, 0.60, 0.0], [0.22, 0.52, 0.0],
+        [0.45, 0.72, 0.0], [0.44, 0.58, 0.0], [0.43, 0.47, 0.0], [0.42, 0.36, 0.0],
+        [0.51, 0.71, 0.0], [0.51, 0.55, 0.0], [0.51, 0.44, 0.0], [0.51, 0.31, 0.0],
+        [0.57, 0.72, 0.0], [0.58, 0.57, 0.0], [0.59, 0.46, 0.0], [0.59, 0.34, 0.0],
+        [0.62, 0.75, 0.0], [0.64, 0.62, 0.0], [0.65, 0.53, 0.0], [0.66, 0.44, 0.0],
+    ], dtype=np.float32)
+    FIST = np.array([
+        [0.50, 0.90, 0.0],
+        [0.42, 0.78, 0.0], [0.37, 0.70, 0.0], [0.39, 0.66, 0.0], [0.44, 0.70, 0.0],
+        [0.45, 0.72, 0.0], [0.46, 0.66, 0.0], [0.47, 0.69, 0.0], [0.46, 0.71, 0.0],
+        [0.51, 0.71, 0.0], [0.52, 0.65, 0.0], [0.53, 0.68, 0.0], [0.52, 0.70, 0.0],
+        [0.57, 0.72, 0.0], [0.58, 0.66, 0.0], [0.59, 0.69, 0.0], [0.58, 0.71, 0.0],
+        [0.62, 0.75, 0.0], [0.64, 0.69, 0.0], [0.65, 0.72, 0.0], [0.64, 0.74, 0.0],
+    ], dtype=np.float32)
     weights = []
     for k in (0.0, 0.25, 0.5, 0.75, 1.0):
-        lm = (_OPEN * (1 - k) + _FIST * k).tolist()
+        lm = (OPEN * (1 - k) + FIST * k).tolist()
         weights.append(vf.thumb_opposition_from_landmarks(lm))
     assert weights[0] < 0.05, f"open must not oppose: {weights}"
     assert weights[-1] > 0.95, f"fist must fully oppose: {weights}"

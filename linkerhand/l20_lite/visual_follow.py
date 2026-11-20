@@ -588,11 +588,18 @@ class VisualFollowPlugin:
             return {"state": "paused", "torque_released": True}
 
         if action == "resume":
+            # Energizing a dexterous hand is dangerous: require the SAME
+            # explicit confirmation the tool schema advertises as mandatory.
+            # Never energize on a bare resume (e.g. watchdog auto-recovery).
+            if not confirm_motion_ok(args):
+                return {"state": "error",
+                        "error": "resume requires confirm_motion: true"}
             with self._lock:
                 stream = self._streams.get(instance_id)
                 if stream is None:
                     return {"state": "idle", "message": "card is not running"}
                 stream["paused"] = False
+                stream["starved"] = False
                 stream["last_data_monotonic"] = time.monotonic()
             self._energize(instance_id)
             return {"state": "running", "side": stream["side"]}
@@ -719,12 +726,15 @@ class VisualFollowPlugin:
                 # releasing torque after ~10 s of otherwise healthy tracking.
                 stream["last_data_monotonic"] = now
                 if stream.get("starved"):
-                    # Fresh data returned after a watchdog release: re-energize
-                    # and carry on. No re-start, no extra confirmation.
-                    self._energize(instance_id)
-                    stream["starved"] = False
+                    # Data returned after a watchdog release. Safety requires
+                    # a human to re-confirm the workspace is still safe: do NOT
+                    # re-energize automatically. Keep the stream starved and
+                    # skip commanding until an explicit confirmed resume.
                     with self._lock:
-                        self._last_error = ""
+                        self._last_error = (
+                            "手部数据已恢复，但力矩保持释放；请人工确认安全后重新 resume")
+                    self._reject("awaiting_confirmed_resume")
+                    continue
                 if now - stream["last_command_monotonic"] < 1.0 / self.max_hz:
                     self._reject("throttled")
                     continue
@@ -833,11 +843,10 @@ class VisualFollowPlugin:
     def _on_watchdog(self):
         """Silence releases torque but keeps the subscription alive.
 
-        The operator asked for a stream that does not silently die after a
-        brief vision dropout. We still must not keep a hand energized with no
-        fresh data, so on timeout we release torque and mark the stream
-        starved; the next fresh sample re-energizes automatically. `stop`
-        remains the explicit way to end the stream.
+        We must not keep a hand energized with no fresh data, so on timeout we
+        release torque and mark the stream starved. When data returns we do
+        NOT re-energize on our own: a person must re-confirm the workspace is
+        safe with an explicit confirmed `resume`. `stop` ends the stream.
         """
         now = time.monotonic()
         with self._lock:
@@ -853,7 +862,7 @@ class VisualFollowPlugin:
                     stream["starved"] = True
                     self._last_error = (
                         f"手部视觉数据超过 {self.watchdog_ms} ms 未更新，"
-                        "已临时释放力矩；数据恢复后自动继续")
+                        "已释放力矩；数据恢复后需人工确认安全再 resume")
                 self._reject("watchdog")
         # Never close the node here: the subscription must survive a dropout
         # so recovery can happen without a fresh start.
