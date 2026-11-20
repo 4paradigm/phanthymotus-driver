@@ -71,8 +71,13 @@ def run(path: Path, seconds: int):
     source = threading.Thread(target=feed_audio, args=(audio, stopped), daemon=True)
     source.start()
     worker = LiveStreamWorker(SyntheticCamera(), audio, fps=15, bitrate_kbps=350)
+    # This standalone, explicitly opt-in MANUAL probe runs only synthetic
+    # media in this process. Inject a test-only verifier because it does not
+    # contact the authenticated Agent Core. Production Driver uses its normal
+    # signed-approval verifier and remains fail-closed.
     card = LiveStreamPlugin({}, "sim", None, None,
-                            store=MemoryStore(), audio=audio, worker=worker)
+                            store=MemoryStore(), audio=audio, worker=worker,
+                            approval_verifier=lambda *_: True)
     streamed = False
     state = "not_started"
     error = None
