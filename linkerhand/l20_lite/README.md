@@ -234,3 +234,26 @@ Tactile data is published as `sensor/tactile` (JSON in `std_msgs/String`,
 BEST_EFFORT, KEEP_LAST, depth 1, VOLATILE). The topic is
 `/l20_lite/hand/<side>/tactile` under the configured ROS namespace, so it
 stays separate from an L20 driver on the same robot.
+
+## Gesture mimic card
+
+Connect the Pose card's `gesture` output to **L20 Lite 手势模仿**.
+Enable hand recognition and gesture events on Pose and allow
+`open_palm, fist, pointing, victory, ok, thumbs_up`. The mimic card
+subscribes to the sibling `poses` stream for tracking and stream health.
+Select the physical hand. Either camera-side hand can acquire control.
+The optional instance speed multiplier defaults to `2.0x` and uses the
+same calibrated speed settings as the manual cards.
+Once the canvas is running, choose `enable` with `confirm_motion=true` after
+checking the bench. Starting the canvas subscribes to data without arming motion.
+
+The card locks one tracked person and one hand. When eligible events arrive in
+the same Pose frame, a person closer to the center takes priority. Pose start
+events select calibrated driver poses. Repeated poses hold their position and new
+poses cancel the current move before the next command. A visible locked hand keeps control even while no gesture label is available.
+After three seconds without seeing it, the closest-to-center active candidate
+may take over. A candidate requires a start event from this session and the
+same label in the latest two Pose frames. With no candidate, the last target
+is preserved. Operator stop or a dead Pose stream
+cancels motion and releases torque. Check the card's status stream or `info`
+before re-enabling after a fault.

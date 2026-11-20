@@ -13,6 +13,8 @@ baudrate: 115200
 response_timeout_s: 0.5
 
 plugins:
+  gesture_mimic:
+    enabled: true
   hand_tactile:
     enabled: true
     poll_hz: 10.0
