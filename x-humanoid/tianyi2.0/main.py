@@ -317,6 +317,11 @@ class TianyiDeviceBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
+        if plugins_cfg.get("fanshi_group_send", {}).get("enabled", False):
+            from fanshi_group_send import FanshiGroupSendPlugin
+            self._plugins.append(FanshiGroupSendPlugin(plugins_cfg["fanshi_group_send"], namespace))
+            print("[bundle] FanshiGroupSendPlugin loaded")
+
         if plugins_cfg.get("state", {}).get("enabled", False):
             from device import StatePlugin
             state_cfg = dict(plugins_cfg["state"])
