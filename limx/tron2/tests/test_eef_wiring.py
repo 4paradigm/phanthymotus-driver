@@ -49,20 +49,25 @@ class EefWiringTests(unittest.IsolatedAsyncioTestCase):
         a = self.adapter('servo_eef', 'loco_servo_arm', 'arm_control')
         a.servo_eef.publisher = a.arm_servo.publisher = Mock()
         try:
-            await a.execute_tool('servo_eef', {'action': 'start'})
+            started = await a.execute_tool('servo_eef', {'action': 'start'})
+            self.assertEqual(started['state'], 'ready')
             joint_start = {'action': 'start', 'input_topic': '/test/joint'}
             with self.assertRaisesRegex(ValueError, 'other arm servo'):
                 await a.execute_tool('loco_servo_arm', joint_start)
-            await a.execute_tool('servo_eef', {'action': 'pause'})
+            paused = await a.execute_tool('servo_eef', {'action': 'pause'})
+            self.assertEqual(paused['state'], 'paused')
             await a.execute_tool('loco_servo_arm', joint_start)
             with self.assertRaisesRegex(ValueError, 'other arm servo'):
                 await a.execute_tool('servo_eef', {'action': 'resume'})
             await a.execute_tool('loco_servo_arm', {'action': 'stop'})
-            await a.execute_tool('servo_eef', {'action': 'resume'})
+            resumed = await a.execute_tool('servo_eef', {'action': 'resume'})
+            self.assertEqual(resumed['state'], 'ready')
             a.motion.dispatch = AsyncMock(return_value={'action_id': 'test'})
             await a.execute_tool('arm_control', {'action': 'move', 'joint': [0.] * 14, 'time': 6})
             self.assertTrue(a.servo_eef.paused)
             a.motion.dispatch.assert_awaited_once()
+            stopped = await a.execute_tool('servo_eef', {'action': 'stop'})
+            self.assertEqual(stopped['state'], 'idle')
         finally:
             await a.servo_eef.close()
             await a.arm_servo.close()

@@ -6,7 +6,7 @@ hardware_model: tron2
 image_name: limx-tron2
 port: 15791
 mcp_url: "http://localhost:15791/mcp"
-description: "TRON2 configuration detection, battery telemetry, skeleton, wheel-foot locomotion, arm and head servo, cameras, presets, grippers, and person following."
+description: "TRON2 configuration detection, battery telemetry, skeleton, wheel-foot locomotion, arm and head servo, end-effector feedback (eef_state), absolute MoveP end-effector control (servo_eef), cameras, presets, grippers, and person following."
 build_context_extras:
   - ../../common
 cards:

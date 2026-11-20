@@ -124,7 +124,7 @@ class EefServo:
                 "topic_in": [{"format": "control/eef", "topic": CONTROL_TOPIC}]}
 
     def info(self):
-        return {"state": "idle" if not self.running else "paused" if self.paused else "running",
+        return {"state": "idle" if not self.running else "paused" if self.paused else "ready",
                 "paused": self.paused, "topic_in": [{"format": "control/eef", "topic": self.topic}],
                 "control_interface": self.descriptor, "sink": self.sink.stats() if self.sink else {},
                 "accepted": self.accepted, "rejected": self.rejected, "queue_full": self.overruns,
