@@ -17,8 +17,8 @@ class PickExecutionTests(unittest.TestCase):
         self.card.enabled = True
         self.card.config['force_n'] = 30
         self.card.planning_profile['handeye']['accepted'] = True
-        self.card.arm_ip_input.topic = '/franka/arm_ip_sync'
-        self.card.arm_ip_input.addresses = self.card.addresses
+        self.card.controller_configuration = Mock()
+        self.card.controller_configuration.snapshot.return_value = ('172.16.0.200', self.card.addresses, 'pnp', 'ros')
         self.card.manager = Mock()
         self.card.manager.acquire.side_effect = AssertionError('Unexpected direct arm connection')
         self.card.gripper_manager = Mock()
@@ -89,6 +89,8 @@ class PickExecutionTests(unittest.TestCase):
         self.card.manager.acquire.assert_not_called()
 
     def test_two_transfer_actions_plan_and_execute_with_auto_observe(self):
+        from franka.fr3.pick_place.hand_collision import TableClearanceError
+
         for action, extra in (
             ('grab_to', dict(target_point_x=.3, target_point_y=.4)),
             ('grab_by', dict(delta_x=20, delta_y=0)),
@@ -101,18 +103,45 @@ class PickExecutionTests(unittest.TestCase):
                 executor = Mock(goals={})
                 executor.fresh.return_value = dict(is_grasped=False, max_width=.08)
                 executor.grasp.side_effect = lambda width: executor.fresh.return_value.update(is_grasped=True)
-                approaches = []
+                approaches, descent_starts, retreat_starts, planned_stages = [], [], [], []
                 def prepare(stage, *args, **kwargs):
+                    planned_stages.append(stage)
                     if stage == 'approach':
                         approaches.append(kwargs)
                         if len(approaches) == 1:
                             raise RuntimeError('MoveIt approach IK failed')
+                        executor.q = [.25] * 7
+                    if stage == 'descend':
+                        descent_starts.append((list(executor.q), args[0], kwargs))
+                        executor.q = [.5] * 7
+                        if action == 'grab_to':
+                            raise TableClearanceError('Insufficient table clearance')
+                        return stage, {'descent_gap_bound_mm': 1.2}
                     return stage, None
+
+                def shorten(target):
+                    retreat_starts.append((list(executor.q), target))
+                    executor.q = [.5] * 7
+                    if action == 'grab_to' and len(retreat_starts) == 1:
+                        raise TableClearanceError('Insufficient table clearance')
+                    return 'descend', {'descent_gap_bound_mm': 1.2}
+
+                executor.shorten_descent.side_effect = shorten
                 executor.prepare.side_effect = prepare
                 targets = dict(approach=1, descent=2, lift=3, carry=[4], place_lift=5)
+                candidates = [{'observation_id': 'test', 'grasp_width_mm': 25, 'yaw_deg': yaw}
+                              for yaw in (0, 30)]
+
+                def grasp_targets(*_, extra_retreat_mm=0, only_yaw=None):
+                    if only_yaw is None:
+                        return candidates
+                    return [dict(candidates[1], retreat=extra_retreat_mm)]
+
+                def moveit_targets(_, pick, *args):
+                    return dict(targets, descent=targets['descent'] + pick.get('retreat', 0))
                 with patch('franka.fr3.pick_place.scene.estimate', return_value={'diameter_mm': 25}), \
-                     patch('franka.fr3.pick_place.planning.grasp_targets', return_value=[{'observation_id': 'test', 'grasp_width_mm': 25, 'yaw_deg': yaw} for yaw in (0, 30)]) as geometry, \
-                     patch('franka.fr3.pick_place.transfer.moveit_targets', return_value=targets), \
+                     patch('franka.fr3.pick_place.planning.grasp_targets', side_effect=grasp_targets) as geometry, \
+                     patch('franka.fr3.pick_place.transfer.moveit_targets', side_effect=moveit_targets), \
                      patch('franka.fr3.pick_place.remote_execution.RemoteExecution', return_value=executor):
                     reply = self.card.dispatch(action, dict(confirm_motion=True, start_point_x=.1, start_point_y=.2, **extra))
                     self.assertEqual(reply['state'], 'running')
@@ -120,6 +149,13 @@ class PickExecutionTests(unittest.TestCase):
                 self.assertEqual(self.card.last_result['state'], 'completed', self.card.last_result)
                 self.assertEqual(geometry.call_args.args[1], {'diameter_mm': 25})
                 self.assertEqual(approaches, [{'use_ik': True}, {'use_ik': True}])
+                self.assertEqual(descent_starts, [([.25] * 7, [2], {'cartesian': True})])
+                expected_retreats = [3, 4] if action == 'grab_to' else []
+                self.assertEqual(retreat_starts, [([.25] * 7, goal) for goal in expected_retreats])
+                self.assertEqual(self.card.last_result['result']['grasp_retreat_mm'],
+                                 2 if action == 'grab_to' else 0)
+                self.assertEqual(planned_stages, ['approach', 'approach', 'descend',
+                                                 'lift', 'move_to_place', 'place_lift', 'return_to_observation'])
                 self.assertEqual([c.args[0][0] for c in executor.move_remote.call_args_list],
                                  ['approach', 'descend', 'lift', 'move_to_place', 'place_lift', 'return_to_observation'])
                 self.card.manager.acquire.assert_not_called()
@@ -142,7 +178,7 @@ class PickExecutionTests(unittest.TestCase):
         self.assertEqual(self.card.last_result['state'], 'error')
         executor.grasp.assert_not_called()
 
-    def test_confirmed_miss_opens_and_returns_without_transfer(self):
+    def test_confirmed_miss_opens_returns_and_captures_without_retry(self):
         from franka.fr3.pick_place.remote_execution import GraspMiss
 
         done = Event()
@@ -169,6 +205,14 @@ class PickExecutionTests(unittest.TestCase):
         self.assertTrue(result['return_completed'])
         self.assertFalse(result['transfer_completed'])
         self.assertFalse(result['recovery_required'])
+
+        self.assertFalse(result['observe_after_transfer'])
+        executor.grasp.assert_called_once()
+        self.assertTrue(result['observation']['ok'])
+        observation_id = result['observation']['observation_id']
+        self.assertNotEqual(result['observation_id'], observation_id)
+        self.assertEqual(self.card.observation['result']['observation_id'], observation_id)
+        self.assertFalse(self.card.last_result['observation_required'])
 
     def test_unaccepted_calibration_never_acquires_hardware(self):
         self.card.planning_profile['handeye']['accepted'] = False

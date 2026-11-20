@@ -20,6 +20,28 @@ class GripperPlugin(JointControlPlugin):
         super().__init__(*args, manager=manager if manager is not None else
                          SessionManager(session_factory=GripperSession), **kwargs)
 
+    def acquire_for_vision(self, address, owner):
+        """Transfer an idle, unloaded Hand connection to the visual action."""
+        key = "robot_" + address.encode("ascii").hex()
+        with self._endpoint_lock:
+            with self._lock:
+                instance = self._instances.get(key)
+            if instance is not None:
+                with instance.lock:
+                    session = instance.session
+                    if session is not None:
+                        motion = session.motion()
+                        if motion["status"] not in ("idle", "succeeded", "cancelled", "failed", "rejected"):
+                            raise RuntimeError("Gripper card is still moving; wait for it to finish")
+                        feedback = session.snapshot()
+                        age = feedback.get("data_age_ms")
+                        if (not feedback.get("connected") or not feedback.get("control_ready")
+                                or age is None or not 0 <= age <= 220
+                                or feedback.get("is_grasped") is not False):
+                            raise RuntimeError("Gripper card must confirm a fresh, unloaded Hand before visual motion")
+                        self._stop_instance(key, instance)
+            return self._manager.acquire(address, owner, exclusive=True)
+
     @staticmethod
     def _validate(cfg):
         cfg = FrankaPlugin._validate(cfg)
@@ -70,8 +92,7 @@ class GripperPlugin(JointControlPlugin):
         schema["x-is-dangerous"] = True
         schema["x-hooks"] = {key: {"action": "stopmotion"}
                              for key in ("on_interrupt_motion", "on_interrupt_all")}
-        return [{**tool(self.PREFIX, "actuator", "Franka gripper: opening, grasp, homing calibration and confirmed stop. Connect arm_ip_sync to supply left/right controller IPs.", schema,
-                        topic_in=self._arm_ip_ports()),
+        return [{**tool(self.PREFIX, "actuator", "Franka gripper: opening, grasp, homing calibration and confirmed stop.", schema),
                  "multiInstance": False}]
 
     def _info(self, instance_id, instance):

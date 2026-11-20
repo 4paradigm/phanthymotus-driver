@@ -1,149 +1,103 @@
-"""Arm mapping configuration and synchronization without network access."""
-import importlib.util
+"""Controller configuration startup, persistence and trusted discovery."""
+import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / 'franka/fr3'))
-spec = importlib.util.spec_from_file_location('fr3_arm_ip_sync_test', ROOT / 'franka/fr3/arm_ip_sync.py')
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
+sys.path[:0] = [str(ROOT), str(ROOT / 'franka/fr3')]
+
+from common.vendor_runtime import DriverBundle
+from franka.fr3 import arm_ip_sync as controller
+
+ARMS = {'left': '172.16.0.3', 'right': '172.16.0.2'}
+HOST = '172.16.0.200'
 
 
-class ArmIPSyncTests(unittest.TestCase):
+class ControllerConfigurationTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.state = Path(self.tmp.name)
-        self.patch = patch.object(m, 'STATE', self.state)
-        self.patch.start()
-        self.addCleanup(self.patch.stop)
-        with patch.object(m, 'load_binding', return_value={}):
-            self.plugin = m.ArmIPSyncPlugin({'left': '172.16.0.3', 'right': '172.16.0.2'}, 'franka', None, callback=lambda *args: None)
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.state = Path(temp.name)
+        self.enterContext(patch.object(controller, 'STATE', self.state))
+        self.plugin = controller.ControllerConfiguration(ARMS)
+        self.addCleanup(self.stop)
 
-    def test_sensor_lifecycle_publication_and_english_metadata(self):
-        import re
-        from types import SimpleNamespace
-        from unittest.mock import Mock
-        publisher = Mock()
-        factory = Mock(return_value=publisher)
-        self.plugin.ros2 = object()
-        tool = self.plugin.get_tools()[0]
-        self.assertEqual(tool['type'], 'sensor')
-        self.assertFalse(tool['multiInstance'])
-        self.assertEqual(tool['topic_out'][0]['format'], 'data/json')
-        for prop in tool['configSchema']['properties'].values():
-            self.assertIsNone(re.search(r'[\u4e00-\u9fff]', prop.get('title', '') + prop.get('description', '')))
-        self.assertEqual(self.plugin.dispatch('info', {})['state'], 'idle')
-        with patch.dict(sys.modules, {'device': SimpleNamespace(RosPublisher=factory)}):
-            self.assertEqual(self.plugin.dispatch('start', {})['state'], 'running')
-            self.plugin.dispatch('start', {})
-        factory.assert_called_once()
-        self.plugin.publish()
-        publisher.publish.assert_called_once_with({'left': '172.16.0.3', 'right': '172.16.0.2', 'controller_ip': ''})
-        info = self.plugin.dispatch('info', {})
-        self.assertTrue(info['fresh'])
-        self.assertEqual(info['frames_published'], 1)
-        self.assertEqual(info['topic_out'], tool['topic_out'])
-        self.assertEqual(self.plugin.dispatch('stop', {})['state'], 'idle')
-        self.assertFalse(self.plugin.dispatch('info', {})['fresh'])
-        publisher.close.assert_called_once()
+    def stop(self):
+        self.plugin.stop()
+        if self.plugin.thread:
+            self.plugin.thread.join(2)
 
-    def test_password_default_and_user_override(self):
-        self.assertEqual(self.plugin.password, 'ros')
-        schema = self.plugin.get_tools()[0]['configSchema']['properties']['password']
-        self.assertEqual(schema['default'], 'ros')
-        self.assertTrue(schema['x-sensitive'])
-        result = self.plugin.dispatch('config', {'password': 'test-custom-password'})
-        self.assertTrue(result['ok'])
-        self.assertEqual(self.plugin.password, 'test-custom-password')
-        self.assertNotIn('password', result['config'])
-        self.plugin.dispatch('config', {'password': ''})
-        self.assertEqual(self.plugin.password, 'ros')
-
-    def test_defaults_and_controller_only_in_configuration(self):
-        tool = self.plugin.get_tools()[0]
-        self.assertNotIn('controller_ip', tool['inputSchema']['properties'])
-        self.assertEqual(tool['configSchema']['properties']['left_ip']['default'], '172.16.0.3')
-        self.assertEqual(tool['configSchema']['properties']['controller_ip']['default'], '')
-        self.assertEqual(self.plugin.dispatch('info', {})['motion_arm_ips'], self.plugin.arm_ips)
-
-    def test_manual_configuration_persists_and_rejects_duplicates_atomically(self):
-        result = self.plugin.dispatch('config', {'left_ip': '172.16.0.4', 'controller_ip': '172.16.0.200'})
-        self.assertFalse(result['restart_required'])
-        before = (self.state / 'binding.json').read_text()
-        self.assertEqual(self.plugin.dispatch('config', {'right_ip': '172.16.0.4'})['state'], 'error')
-        self.assertEqual((self.state / 'binding.json').read_text(), before)
-        self.assertEqual(self.plugin.arm_ips['left'], '172.16.0.4')
-
-    def sync_result(self):
-        accepted = self.plugin.dispatch('sync', {})
-        self.assertEqual(accepted['state'], 'running')
+    def ready(self):
         deadline = time.monotonic() + 2
-        while self.plugin.lock.locked() and time.monotonic() < deadline:
-            time.sleep(.01)
-        self.assertFalse(self.plugin.lock.locked())
-        self.assertEqual(self.plugin.last_result['action_id'], accepted['action_id'])
-        return self.plugin.last_result
+        while True:
+            try:
+                return self.plugin.snapshot()
+            except RuntimeError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(.01)
 
-    def test_sync_updates_config_output_and_preserves_on_failure(self):
-        arms = {'left': '172.16.0.5', 'right': '172.16.0.6'}
-        with patch.object(self.plugin, 'candidates', return_value=['172.16.0.200']), patch.object(self.plugin, 'read_controller', return_value=arms):
-            terminal = self.sync_result()
-        self.assertEqual(terminal['state'], 'completed')
-        self.assertEqual(terminal['result']['config']['left_ip'], arms['left'])
-        self.assertEqual(self.plugin.dispatch('info', {})['motion_arm_ips'], arms)
-        before = (self.state / 'binding.json').read_text()
-        with patch.object(self.plugin, 'candidates', return_value=[]):
-            self.assertEqual(self.sync_result()['state'], 'error')
-        self.assertEqual((self.state / 'binding.json').read_text(), before)
-        with patch.object(m, 'load_binding', return_value=m.load_binding(self.state)):
-            restarted = m.ArmIPSyncPlugin(arms, 'franka', None, callback=lambda *args: None)
-        self.assertEqual(restarted.arm_ips, arms)
+    def test_configuration_only_and_boot_discovery_without_canvas_call(self):
+        card, = self.plugin.get_tools()
+        self.assertEqual(card['title'], 'Controller Configuration')
+        self.assertEqual(set(card['configSchema']['properties']), {'username', 'password'})
+        password = card['configSchema']['properties']['password']
+        self.assertEqual(password['default'], 'ros')
+        self.assertTrue(password['x-sensitive'])
+        self.assertEqual((card['topic_in'], card['topic_out']), ([], []))
+        self.assertIsNone(self.plugin.dispatch('info', {}))
+        with self.assertRaises(RuntimeError):
+            self.plugin.snapshot()
+        with patch.object(self.plugin, 'candidates', return_value=[HOST]), \
+             patch.object(self.plugin, 'read_controller', return_value=ARMS) as read:
+            DriverBundle([self.plugin]).start_all()
+            self.assertEqual(self.ready(), (HOST, ARMS, 'pnp', 'ros'))
+        read.assert_called_once_with(HOST, ('pnp', 'ros'))
+        self.assertEqual(json.loads((self.state / 'binding.json').read_text()),
+                         {'controller_ip': HOST, 'motion_arm_ips': ARMS})
 
-    def test_discovery_precedes_optional_fallback(self):
-        from unittest.mock import Mock
-        arms = {'left': '172.16.0.5', 'right': '172.16.0.6'}
-        self.plugin.dispatch('config', {'controller_ip': '172.16.0.201'})
-        reader = Mock(side_effect=[ValueError('Not a PNP controller'), arms])
-        with patch.object(self.plugin, 'candidates', return_value=['172.16.0.184']), patch.object(self.plugin, 'read_controller', reader):
-            self.assertEqual(self.sync_result()['state'], 'completed')
-        self.assertEqual([c.args[0] for c in reader.call_args_list], ['172.16.0.184', '172.16.0.201'])
-        with patch.object(self.plugin, 'candidates', return_value=['172.16.0.200']), patch.object(self.plugin, 'read_controller', return_value=arms) as reader:
-            self.assertEqual(self.sync_result()['result']['controller_ip'], '172.16.0.200')
-        reader.assert_called_once_with('172.16.0.200')
-        self.assertEqual(self.plugin.configuration()['controller_ip'], '172.16.0.201')
+    def test_credential_change_discards_unfinished_discovery_and_persists_privately(self):
+        entered = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
 
-    def test_discovery_failure_still_tries_fallback_and_retains_mapping_on_failure(self):
-        self.plugin.dispatch('config', {'controller_ip': '172.16.0.201'})
-        before = (self.state / 'binding.json').read_text()
-        with patch.object(self.plugin, 'candidates', side_effect=OSError('No interface')), patch.object(self.plugin, 'read_controller', side_effect=ValueError('Unavailable')) as reader:
-            self.assertEqual(self.sync_result()['state'], 'error')
-        reader.assert_called_once_with('172.16.0.201')
-        self.assertEqual((self.state / 'binding.json').read_text(), before)
-        self.assertEqual(self.plugin.arm_ips, {'left': '172.16.0.3', 'right': '172.16.0.2'})
+        def find(previous, credentials):
+            if credentials == ('pnp', 'ros'):
+                entered.set()
+                release.wait(2)
+            return HOST, ARMS
 
-    def test_network_discovery_probes_ethernet_ssh_without_arm_or_local_addresses(self):
-        devices = [{'ifname': 'eno1', 'flags': ['UP'], 'addr_info': [
-            {'local': '172.16.0.1', 'prefixlen': 29, 'scope': 'global'}]},
-            {'ifname': 'wlan0', 'flags': ['UP'], 'addr_info': [
-                {'local': '10.0.0.1', 'prefixlen': 24, 'scope': 'global'}]}]
-        with patch.dict(m.os.environ, {'FRANKA_ROBOT_INTERFACE': ''}), patch.object(m, 'network_json', return_value=devices), patch.object(m.socket, 'create_connection') as connect:
-            self.assertEqual(self.plugin.candidates(), ['172.16.0.4', '172.16.0.5', '172.16.0.6'])
-        self.assertEqual({c.args[0] for c in connect.call_args_list}, {('172.16.0.4', 22), ('172.16.0.5', 22), ('172.16.0.6', 22)})
+        with patch.object(self.plugin, 'find_binding', side_effect=find) as search:
+            self.plugin.start()
+            self.assertTrue(entered.wait(1))
+            result = self.plugin.dispatch('config', {'username': 'operator', 'password': 'test-password'})
+            self.assertEqual(result, {'ok': True, 'username': 'operator'})
+            release.set()
+            self.assertEqual(self.ready(), (HOST, ARMS, 'operator', 'test-password'))
+        self.assertEqual(search.call_count, 2)
+        self.assertEqual((self.state / 'credentials.json').stat().st_mode & 0o777, 0o600)
+        restarted = controller.ControllerConfiguration(ARMS)
+        self.assertEqual((restarted.username, restarted.password), ('operator', 'test-password'))
+        with self.assertRaises(RuntimeError):
+            restarted.snapshot()
 
-    def test_controller_configuration_disagreement_is_rejected(self):
-        def read(address, path):
-            if path == m.ROBOT_CONFIG:
-                return {'robots': {'left_fci': {'host': '172.16.0.3'}, 'right_fci': {'host': '172.16.0.2'}}}
-            if path.endswith('left_franka_hardware.yaml'):
-                return {'robot_ip': '172.16.0.8'}
-            return {'robot_ip': '172.16.0.2'}
-        with patch.object(self.plugin, 'read_file', side_effect=read):
+    def test_discovery_precedes_saved_host_fallback(self):
+        with patch.object(self.plugin, 'candidates', return_value=['172.16.0.10']), \
+             patch.object(self.plugin, 'read_controller', side_effect=[ValueError('Invalid mapping'), ARMS]) as read:
+            self.assertEqual(self.plugin.find_binding(HOST, ('pnp', 'ros')), (HOST, ARMS))
+        self.assertEqual([c.args[0] for c in read.call_args_list], ['172.16.0.10', HOST])
+
+    def test_disagreeing_desk_and_hardware_are_rejected(self):
+        def configuration(_, path, credentials):
+            if path == controller.ROBOT_CONFIG:
+                return {'robots': {'left_fci': {'host': ARMS['left']}, 'right_fci': {'host': ARMS['right']}}}
+            return {'robot_ip': '172.16.0.99'}
+
+        with patch.object(self.plugin, 'read_file', side_effect=configuration):
             with self.assertRaisesRegex(ValueError, 'disagree'):
-                self.plugin.read_controller('172.16.0.200')
+                self.plugin.read_controller(HOST, ('pnp', 'ros'))

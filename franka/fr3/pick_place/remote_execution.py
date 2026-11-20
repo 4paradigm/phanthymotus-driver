@@ -1,14 +1,20 @@
 """Use MoveIt for arm motion and retain the local Franka Hand commands."""
-from copy import deepcopy
 import math
 import time
 
 import numpy as np
+from scipy.interpolate import BPoly
+from scipy.optimize import brentq
 from scipy.spatial.transform import Rotation
 
 from .execution import OBSERVATION_TOLERANCE_DEG, PickExecution
 from .hand_collision import check_descent_curve, check_path_table, frame, table_clearance, vertices
 from .kinematics import Kinematics
+
+
+# FR3 FCI joint limits, with a 1% margin for strict native comparisons.
+JOINT_ACCELERATION_LIMIT = 10.0 * .99  # rad/s²
+JOINT_JERK_LIMIT = 5000.0 * .99  # rad/s³
 
 
 class GraspMiss(RuntimeError):
@@ -24,6 +30,7 @@ class RemoteExecution(PickExecution):
         self.hand_points = vertices(frame(profile, state['F_T_EE']))
         self.q = list(state['q'])
         self.goals = {}
+        self.descent = None
         self.visible_surface = (np.asarray(scene['visible_surface_base_mm']) / 1000
                                 if scene and scene.get('visible_surface_base_mm') else None)
         actual = np.asarray(state['O_T_EE']).reshape(4, 4, order='F')
@@ -48,10 +55,12 @@ class RemoteExecution(PickExecution):
         target = np.asarray(ee) @ np.linalg.inv(self.flange_to_ee)
         return [*target[:3, 3], *Rotation.from_matrix(target[:3, :3]).as_quat()]
 
-    def prepare(self, stage, target, *, cartesian=False, joint=False, use_ik=False, descent_plan=None):
+    def prepare(self, stage, target, *, cartesian=False, joint=False, use_ik=False):
         self.check()
         started = time.monotonic()
-        self.goals[stage] = (target, dict(cartesian=cartesian, joint=joint, use_ik=use_ik, descent_plan=descent_plan))
+        self.goals[stage] = (target, dict(cartesian=cartesian, joint=joint, use_ik=use_ik))
+        if stage == 'descend':
+            self.descent = None
         if use_ik:
             target_joints = self.arm.solve_ik(self.flange_pose(target), self.q)
         elif joint:
@@ -83,53 +92,13 @@ class RemoteExecution(PickExecution):
                     failure = error
             raise failure
 
-        if descent_plan is not None:
-            plan = self.trim_descent(descent_plan, target[0])
-        elif target_joints is not None:
+        if target_joints is not None:
             plan = self.arm.plan_joint(target_joints, self.q)
         elif cartesian:
             plan = self.arm.plan_cartesian([self.flange_pose(p) for p in target], .1, self.q)
         else:
             plan = self.arm.plan_pose(self.flange_pose(target), self.q)
-        if stage == 'descend' and descent_plan is None:
-            self.raw_descent = deepcopy(plan)
         return self.prepare_trajectory(stage, target, plan, cartesian, joint, started)
-
-    def trim_descent(self, plan, target):
-        from scipy.interpolate import BPoly
-        from scipy.optimize import brentq
-
-        plan = deepcopy(plan)
-        names = plan['joint_names']
-        order = [names.index(f'fr3_joint{i}') for i in range(1, 8)]
-        samples = plan['points']
-        direction = target[:3, 2]
-        position = target[:3, 3]
-
-        def distance(q):
-            return (self.model.pose(np.asarray(q)[order])[:3, 3] - position) @ direction
-
-        def node(sample, endpoint):
-            return [sample['positions'], *[
-                [0.] * 7 if endpoint else sample[key] or [0.] * 7
-                for key in ('velocities', 'accelerations')]]
-
-        for i, (a, b) in enumerate(zip(samples, samples[1:])):
-            self.check()
-            if not distance(a['positions']) < 0 <= distance(b['positions']):
-                continue
-            start, end = a['time_ns'] / 1e9, b['time_ns'] / 1e9
-            curve = BPoly.from_derivatives([start, end],
-                                           [node(a, i == 0), node(b, i + 2 == len(samples))])
-            stop = brentq(lambda t: distance(curve(t)), start, end)
-            q = curve(stop)
-            if np.linalg.norm(self.model.pose(q[order])[:3, 3] - position) > .0005:
-                raise ValueError('Original descent does not pass near the shallower target')
-            plan['points'] = samples[:i + 1] + [
-                dict(time_ns=round(stop * 1e9), positions=q.tolist(),
-                     velocities=[0.] * 7, accelerations=[0.] * 7)]
-            return plan
-        raise ValueError('Shallower target was not reached along the original descent')
 
     def prepare_trajectory(self, stage, target, plan, cartesian, joint, started):
         if (plan.get('code') != 1 or not plan.get('points')
@@ -168,7 +137,6 @@ class RemoteExecution(PickExecution):
                 raise ValueError('Invalid descent clearance allowance')
             # Apply the measured allowance to collision checking only.
             descent_planes = [(table + normal * (allowance / 1000), normal)]
-            descent_minimum = math.inf
             clearance_mm = self.profile.get('descent_min_clearance_mm', 5)
             if type(clearance_mm) not in (int, float) or not math.isfinite(clearance_mm) or clearance_mm < 1:
                 raise ValueError('Invalid descent minimum clearance')
@@ -195,53 +163,23 @@ class RemoteExecution(PickExecution):
             sample['accelerations'] = [0.] * 7
         derivative_bounds = [0., 0., 0.]
         segments = []
-        from scipy.interpolate import BPoly
         for idx, (start, stop) in enumerate(zip(times, times[1:])):
             self.check()
-            values = []
-            for j in (idx, idx+1):
-                node = [positions[j]]
-                for key in ('velocities', 'accelerations'):
-                    if not samples[j][key]:
-                        break
-                    node.append(np.asarray(samples[j][key])[order])
-                values.append(node)
-            if len(values[0]) != len(values[1]):
-                raise ValueError('Inconsistent MoveIt interpolation data')
+            values = [[positions[j], np.asarray(samples[j]['velocities'])[order],
+                       np.asarray(samples[j]['accelerations'])[order]] for j in (idx, idx + 1)]
             curve = BPoly.from_derivatives([start, stop], values)
-            if stage in ('descend', 'miss_retreat'):
-                descent_minimum = min(descent_minimum, check_descent_curve(
-                    self.model, curve, self.hand_points, descent_planes, self.check, minimum_gap=minimum_gap))
             segments.append((stop, curve.c[:, 0].tolist()))
-            interval = np.linspace(start, stop, max(8, int(np.ceil((stop-start)/.01))+1))
             # Bernstein coefficients bound each derivative over the interval.
             for derivative in (1, 2, 3):
                 bound = float(np.max(np.abs(curve.derivative(derivative).c)))
                 derivative_bounds[derivative-1] = max(derivative_bounds[derivative-1], bound)
-            for q in curve(interval):
-                if np.any(q < self.model.low) or np.any(q > self.model.high):
-                    j = np.flatnonzero((q < self.model.low) | (q > self.model.high))[0]
-                    lo, hi, actual = map(math.degrees, (self.model.low[j], self.model.high[j], q[j]))
-                    raise ValueError(f'Joint {j+1} at {actual:.3f} deg outside [{lo:.3f}, {hi:.3f}] during {stage}')
-                if self.model.clearance(q) <= .02:
-                    raise ValueError(f'Arm self-collision clearance violated during {stage}')
-                if plane:
-                    check_path_table(self.model, q, self.hand_points, table, normal, stage, self.profile)
-                if self.visible_surface is not None and stage in ('approach', 'descend'):
-                    ee = self.model.pose(q)
-                    local = (self.visible_surface - ee[:3, 3]) @ ee[:3, :3]
-                    if np.any(np.all((local >= [-.03164, -.10399, -.12944])
-                                     & (local <= [.03164, .10043, -.03744]), axis=1)):
-                        raise ValueError(f'Hand housing intersects the target during {stage}')
         velocity, acceleration, jerk = derivative_bounds
-        limits = {'original': 1., 'speed': velocity / speed * 1.01,
-                  'acceleration': math.sqrt(acceleration / .3), 'jerk': jerk ** (1./3.)}
+        limits = {'sample_period': .001001 / float(np.min(np.diff(times))),
+                  'speed': velocity / speed * 1.01,
+                  'acceleration': math.sqrt(acceleration / JOINT_ACCELERATION_LIMIT),
+                  'jerk': (jerk / JOINT_JERK_LIMIT) ** (1./3.)}
         limiting = max(limits, key=limits.get)
         factor = limits[limiting]
-        print(f"[fr3 timing] action={self.active.get('action_id')} stage={stage} "
-              f"rpc_s={planned-started:.3f} checks_s={time.monotonic()-planned:.3f} "
-              f"speed_deg_s={math.degrees(speed):.2f} nominal_s={times[-1]:.3f} "
-              f"retimed_s={times[-1]*factor:.3f} limiting={limiting} factor={factor:.2f}", flush=True)
         if times[-1] * factor > 359.:
             raise ValueError(f'Continuous position trajectory for {stage} exceeds execution time limit')
         for sample in samples:
@@ -251,10 +189,121 @@ class RemoteExecution(PickExecution):
         if stage in ('descend', 'miss_retreat'):
             plan['descent_planes'] = descent_planes
             plan['descent_min_gap_m'] = minimum_gap
-            plan['descent_gap_bound_mm'] = descent_minimum * 1000
-        plan["segments"] = [(end * factor, controls) for end, controls in segments]
+        plan['segments'] = [(end * factor, controls) for end, controls in segments]
+        if stage == 'descend':
+            self.descent = plan
+        self.validate_path(stage, plan, sample_scale=factor)
+        print(f"[fr3 timing] action={self.active.get('action_id')} stage={stage} "
+              f"rpc_s={planned-started:.3f} checks_s={time.monotonic()-planned:.3f} "
+              f"speed_deg_s={math.degrees(speed):.2f} nominal_s={times[-1]:.3f} "
+              f"retimed_s={times[-1]*factor:.3f} limiting={limiting} factor={factor:.2f}", flush=True)
         self.q = positions[-1].tolist()
         return stage, plan
+
+    def validate_path(self, stage, plan, *, sample_scale=1., descent_target=None):
+        plane = self.scene or self.profile.get('table_plane')
+        if plane:
+            table = np.asarray(plane.get('table_point_base_mm', plane.get('point_base_mm'))) / 1000
+            normal = np.asarray(plane.get('table_normal_base', plane.get('normal_base')))
+        minimum = math.inf
+        start = 0.
+        for stop, controls in plan['segments']:
+            self.check()
+            curve = BPoly(np.asarray(controls)[:, None, :], [start, stop])
+            if 'descent_planes' in plan:
+                minimum = min(minimum, check_descent_curve(
+                    self.model, curve, self.hand_points, plan['descent_planes'], self.check,
+                    minimum_gap=plan['descent_min_gap_m']))
+            interval = np.linspace(start, stop, max(8, int(np.ceil((stop - start) / (.01 * sample_scale))) + 1))
+            for q in curve(interval):
+                if np.any(q < self.model.low) or np.any(q > self.model.high):
+                    j = np.flatnonzero((q < self.model.low) | (q > self.model.high))[0]
+                    lo, hi, actual = map(math.degrees, (self.model.low[j], self.model.high[j], q[j]))
+                    raise ValueError(f'Joint {j+1} at {actual:.3f} deg outside [{lo:.3f}, {hi:.3f}] during {stage}')
+                if self.model.clearance(q) <= .02:
+                    raise ValueError(f'Arm self-collision clearance violated during {stage}')
+                if plane:
+                    check_path_table(self.model, q, self.hand_points, table, normal, stage, self.profile)
+                if descent_target is not None:
+                    offset = self.model.pose(q)[:3, 3] - descent_target[:3, 3]
+                    axis = descent_target[:3, 2]
+                    down = offset @ axis
+                    if down > .0001 or np.linalg.norm(offset - down * axis) > .001:
+                        raise ValueError('Shortened descent deviates from the vertical path to its stop')
+                if self.visible_surface is not None and stage in ('approach', 'descend'):
+                    ee = self.model.pose(q)
+                    local = (self.visible_surface - ee[:3, 3]) @ ee[:3, :3]
+                    if np.any(np.all((local >= [-.03164, -.10399, -.12944])
+                                     & (local <= [.03164, .10043, -.03744]), axis=1)):
+                        raise ValueError('Hand housing intersects the target during {stage}')
+            start = stop
+        if 'descent_planes' in plan:
+            plan['descent_gap_bound_mm'] = minimum * 1000
+
+    def shorten_descent(self, target):
+        # Preserve the timed prefix and replace only the end with a continuous stop.
+        self.check()
+        original = self.descent
+        if original is None:
+            raise ValueError('No original descent to shorten')
+        segments = original['segments']
+        axis, position = target[:3, 2], target[:3, 3]
+
+        def depth(q):
+            return (self.model.pose(q)[:3, 3] - position) @ axis
+
+        curves = []
+        start = 0.
+        for stop, controls in segments:
+            self.check()
+            curve = BPoly(np.asarray(controls)[:, None, :], [start, stop])
+            curves.append(curve)
+            # Find the first crossing, including one inside a spline segment.
+            times = np.linspace(start, stop, 9)
+            for left, right in zip(times, times[1:]):
+                if depth(curve(left)) < 0 <= depth(curve(right)):
+                    cut = brentq(lambda t: depth(curve(t)), left, right)
+                    break
+            else:
+                start = stop
+                continue
+            break
+        else:
+            raise ValueError('Original descent does not reach the shallower target')
+
+        q = curve(cut)
+        if np.linalg.norm(self.model.pose(q)[:3, 3] - position) > .0005:
+            raise ValueError('Original descent does not pass near the shallower target')
+
+        speed = math.radians(self.options['speed_deg_s'])
+        names = original['joint_names']
+        order = [names.index(f'fr3_joint{i}') for i in range(1, 8)]
+        goal = q[np.argsort(order)].tolist()
+        failure = ValueError('Cannot stop at the shallower target within motion limits')
+        for i in range(len(curves)-1, max(-1, len(curves)-7), -1):
+            self.check()
+            prefix = curves[i]
+            begin = prefix.x[0]
+            initial = [prefix(begin), prefix.derivative()(begin), prefix.derivative(2)(begin)]
+            for scale in (1., .75, 1.25, 1.5, 2.):
+                end = begin + (cut - begin) * scale
+                if not begin + .001 <= end <= 359.:
+                    continue
+                tail = BPoly.from_derivatives([begin, end], [initial, [q, np.zeros(7), np.zeros(7)]])
+                if any(np.max(np.abs(tail.derivative(n).c)) > limit
+                       for n, limit in enumerate((speed, JOINT_ACCELERATION_LIMIT, JOINT_JERK_LIMIT), 1)):
+                    continue
+                points = original['points'][:i + 1] + [
+                    dict(time_ns=round(end * 1e9), positions=goal, velocities=[0.] * 7, accelerations=[0.] * 7)]
+                plan = dict(original, points=points, segments=segments[:i] + [(end, tail.c[:, 0].tolist())])
+                try:
+                    self.validate_path('descend', plan, descent_target=target)
+                except ValueError as exc:
+                    failure = exc
+                    continue
+                self.q = q.tolist()
+                return 'descend', plan
+        raise failure
 
     def move_remote(self, step):
         self.check()
@@ -271,7 +320,7 @@ class RemoteExecution(PickExecution):
                 raise RuntimeError(f'Arm moved more than 1 degree before {stage}; trajectory withheld')
             if deviation > .0005:
                 if self.active.get('grasp_retreat_mm') and stage in ('approach', 'descend'):
-                    raise RuntimeError(f'Arm moved from the verified start of {stage}; trimmed pick withheld')
+                    raise RuntimeError(f'Arm moved from the verified start of {stage}; shallower pick withheld')
                 goal, options = self.goals[stage]
                 self.q = measured.tolist()
                 _, trajectory = self.prepare(stage, goal, **options)

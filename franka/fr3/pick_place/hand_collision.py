@@ -66,7 +66,7 @@ class TableClearanceError(ValueError):
 def check_table(ee, points, table, normal, stage, *, minimum_gap=.005):
     gap = table_clearance(ee, points, table, normal)
     if gap < minimum_gap:
-        raise TableClearanceError(f'Hand/finger table clearance {gap*1000:.2f} mm below {minimum_gap*1000:g} mm during {stage}; grasp target unchanged')
+        raise TableClearanceError(f'Hand/finger table clearance {gap*1000:.4f} mm below {minimum_gap*1000:g} mm during {stage}')
     return gap
 
 
@@ -107,6 +107,8 @@ def check_descent_curve(model, curve, points, planes, check, *, minimum_gap=.005
             minimum = min(minimum, lower_bound)
             continue
         if depth >= 12:
-            raise ValueError(f'Cannot verify {minimum_gap*1000:g} mm hand clearance and 3 deg tilt throughout descent')
+            if tilt + joint_travel > tilt_limit:
+                raise ValueError('Cannot verify 3 deg hand tilt throughout descent')
+            raise TableClearanceError(f'Cannot verify {minimum_gap*1000:g} mm hand clearance throughout descent')
         intervals.extend(((middle, right, depth+1), (left, middle, depth+1)))
     return minimum

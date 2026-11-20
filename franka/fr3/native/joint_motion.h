@@ -148,6 +148,9 @@ class Trajectory {
 
 // Execute the same quintic Bernstein polynomials checked by the planner.
 class TimedTrajectory {
+  static constexpr double kAccelerationLimit = 10.0;  // FR3 FCI, rad/s²
+  static constexpr double kJerkLimit = 5000.0;  // FR3 FCI, rad/s³
+
  public:
   TimedTrajectory(const Joints& start, const Command& command)
       : segments_(command.timed), lead_(start, lead_command(command)) {
@@ -168,10 +171,10 @@ class TimedTrajectory {
           if (std::abs(5 * (c[k+1][j] - c[k][j]) / dt) > command.speed * 1.001)
             throw std::invalid_argument("TIMED joint velocity exceeds requested speed");
         for (size_t k = 0; k < 4; ++k)
-          if (std::abs(20 * (c[k+2][j] - 2*c[k+1][j] + c[k][j]) / (dt*dt)) > 1.501)
+          if (std::abs(20 * (c[k+2][j] - 2*c[k+1][j] + c[k][j]) / (dt*dt)) >= kAccelerationLimit)
             throw std::invalid_argument("TIMED joint acceleration exceeds limit");
         for (size_t k = 0; k < 3; ++k)
-          if (std::abs(60 * (c[k+3][j] - 3*c[k+2][j] + 3*c[k+1][j] - c[k][j]) / (dt*dt*dt)) > 15.01)
+          if (std::abs(60 * (c[k+3][j] - 3*c[k+2][j] + 3*c[k+1][j] - c[k][j]) / (dt*dt*dt)) >= kJerkLimit)
             throw std::invalid_argument("TIMED joint jerk exceeds limit");
         p[j] = c[5][j];
         v[j] = 5 * (c[5][j] - c[4][j]) / dt;

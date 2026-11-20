@@ -19,6 +19,8 @@ vision_pick_and_drop:
   camera_serial: "262922070633"
   planning:
     grasp_depth_offset_mm: -5
+    # Pick correction in observation-aligned table X/Y and upward table normal.
+    grasp_offset_mm: [0, -2, 3]
     # Provisional left-arm allowance based on measured clearance at the pick workspace.
     descent_clearance_allowance_mm: 43
     descent_min_clearance_mm: 1

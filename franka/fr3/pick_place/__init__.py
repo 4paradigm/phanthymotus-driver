@@ -12,7 +12,7 @@ from common.vendor_runtime import action_schema, tool
 from hardware import JOINT_LOWER, JOINT_UPPER, JOINT_MARGIN
 from .execution import OBSERVATION_TOLERANCE_DEG, SPEED_CONFIG, PickExecution
 from .inputs import ObservationInputs, resolve_topics
-from franka.fr3.arm_ips import ArmIPInput, split_topics, mapping
+from franka.fr3.arm_ips import mapping
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +44,8 @@ def pose_vector(matrix):
 class PickPlacePlugin:
     PREFIX = 'vision_pick_and_drop'
 
-    def __init__(self, config, manager, camera, ros2, callback=None, inputs=None, gripper_manager=None):
+    def __init__(self, config, manager, camera, ros2, callback=None, inputs=None, gripper_manager=None,
+                 controller_configuration=None, acquire_gripper=None):
         profile = config.get('vision_pick_and_drop', {})
         self.addresses = dict(config.get('motion_arm_ips', {}))
         self.arm = profile.get('default_arm', 'right')
@@ -55,6 +56,7 @@ class PickPlacePlugin:
         self.address = self.addresses.get(self.arm)
         self.serial = profile.get('camera_serial', '')
         self.gripper_manager = gripper_manager
+        self.acquire_gripper = acquire_gripper
         self.manager = manager
         self.planning_profile = profile.get('planning')
         self.inputs = inputs or ObservationInputs(ros2, camera, self.serial)
@@ -73,11 +75,9 @@ class PickPlacePlugin:
         self.active = self.last_result = self.observation = None
         self.enabled = False
         self.hand_initialized = False
-        self.ssh_username = 'pnp'
-        self.ssh_password = 'ros'
-        self.arm_ip_input = ArmIPInput(ros2, self.apply_arm_ip_input)
+        self.controller_configuration = controller_configuration
 
-    def apply_arm_ip_input(self, addresses):
+    def apply_arm_mapping(self, addresses):
         addresses = mapping(addresses)
         if addresses == self.addresses:
             return
@@ -137,29 +137,23 @@ class PickPlacePlugin:
                        'x-hooks': {'on_interrupt_motion': {'action': 'cancel'},
                                    'on_interrupt_all': {'action': 'cancel'}}})
         definition = tool(self.PREFIX, 'actuator',
-            'Pick and place with the FR3 wrist camera. Connect RGB, depth, object detections, and arm_ip_sync. '
+            'Pick and place with the FR3 wrist camera. Connect RGB, depth and object detections. '
             'The first confirmed motion may home the hand. Remove any held object before starting.',
             schema, topic_in=[dict(format=fmt, desc=desc, **({'topic': self.inputs.topics[i]} if self.inputs.topics else {}))
                               for i, fmt, desc in ((1, 'image/depth-zlib', 'Depth image'),
-                                  (0, 'image/jpeg', 'RGB image'), (2, 'data/json', 'VOP objects'))]
-                             + [dict(format='data/json', desc='Left/right arm controller IPs from arm_ip_sync',
-                                     **({'topic': self.arm_ip_input.topic} if self.arm_ip_input.topic else {}))])
+                                  (0, 'image/jpeg', 'RGB image'), (2, 'data/json', 'VOP objects'))])
         definition['configSchema'] = {'type': 'object', 'additionalProperties': False, 'required': ['force_n'], 'properties': {
-            'username': {'type': 'string', 'title': 'SSH username', 'default': 'pnp', 'scope': 'instance'},
-            'password': {'type': 'string', 'title': 'SSH password', 'default': 'ros',
-                         'format': 'password', 'x-sensitive': True, 'scope': 'instance',
-                         'description': 'Leave blank to use the default SSH password.'},
-            'arm': {'type': 'string', 'title': 'Arm', 'enum': list(self.arm_labels.values()),
+            'arm': {'type': 'string', 'title': 'Arm', 'scope': 'instance', 'enum': list(self.arm_labels.values()),
                 'enumNames': ['Left hand' if side == 'left' else 'Right hand' for side in self.arm_labels],
                 'default': self.config['arm'],
-                'description': 'Select the left or right arm. A new observation is required after the IP mapping changes.'},
+                'description': 'Select the left or right arm.'},
             **{name: {'type': 'number', 'minimum': low,
                       **({'maximum': high} if math.isfinite(high) else {}),
-                      'default': default, 'title': title}
+                      'default': default, 'title': title, 'scope': 'instance'}
                for name, (low, high, default, title) in SPEED_CONFIG.items()},
-            'force_n': {'type': 'number', 'minimum': 30, 'maximum': 70,
+            'force_n': {'type': 'number', 'minimum': 30, 'maximum': 70, 'scope': 'instance',
                 'description': 'Set the grasp force in newtons before running a transfer.'},
-            'observe_after_transfer': {'type': 'boolean', 'default': False,
+            'observe_after_transfer': {'type': 'boolean', 'default': False, 'scope': 'instance',
                 'description': 'Capture a fresh observation after returning to the observation pose.'}}}
         return [definition]
 
@@ -168,11 +162,8 @@ class PickPlacePlugin:
 
     def info(self):
         with self.lock:
-            arm_input = self.arm_ip_input.info()
-            return dict(state='running' if self.active else 'ready' if self.enabled or self.arm_ip_input.topic else 'idle',
-                        arm=self.arm, robot_ip=self.address, camera_serial=self.serial,
-                        config=dict(self.config, username=self.ssh_username), motion_arm_ips=dict(self.addresses),
-                        arm_ip_input=arm_input, controller_ip=arm_input['controller_ip'] if arm_input['ready'] else '',
+            return dict(state='running' if self.active else 'ready' if self.enabled else 'idle',
+                        arm=self.arm, camera_serial=self.serial, config=dict(self.config),
                         topic_in=self.get_tools()[0]['topic_in'],
                         stage=self.active.get('stage') if self.active else None,
                         action_id=self.active.get('action_id') if self.active else None,
@@ -189,7 +180,6 @@ class PickPlacePlugin:
             self.observation = None
             self.hand_initialized = False
         self.inputs.stop()
-        self.arm_ip_input.stop()
 
     def cancel(self):
         with self.lock:
@@ -207,16 +197,8 @@ class PickPlacePlugin:
         with self.lock:
             if self.active: return dict(state='error', code='ACTION_IN_PROGRESS', message='Wait for the current action')
             if action == 'config':
-                import re
-                updates = {k: v for k, v in args.items() if k not in ('_tool_name', 'instance_id')}
-                username = updates.pop('username', self.ssh_username)
-                password = updates.pop('password', self.ssh_password)
-                username = 'pnp' if username == '' else username
-                password = 'ros' if password == '' else password
-                if not isinstance(username, str) or not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_.-]{0,63}', username):
-                    return dict(ok=False, code='INVALID_CONFIG', message='Invalid SSH username')
-                if not isinstance(password, str) or any(ch in password for ch in ('\r', '\n', '\x00')):
-                    return dict(ok=False, code='INVALID_CONFIG', message='Invalid SSH password')
+                updates = {k: v for k, v in args.items()
+                           if k not in ('_tool_name', 'instance_id', 'username', 'password')}
                 # Ignore the removed persistent hand-speed field from older saved canvases.
                 updates.pop('speed_percent', None)
                 for key in ('depth_compensation_mm', 'observation_joints_deg',
@@ -268,25 +250,26 @@ class PickPlacePlugin:
                     self.config = cfg
                     self.arm_configs[arm] = dict(cfg)
                     self.observation = None
-                self.ssh_username, self.ssh_password = username, password
-                return dict(ok=True, username=username, **cfg)
+                return dict(ok=True, **cfg)
             if action == 'start':
                 previous_topics=tuple(self.inputs.topics)
                 was_enabled=self.enabled
-                ip_topic, camera_topics = split_topics(args)
-                if camera_topics:
-                    resolve_topics({'input_topics': camera_topics})
-                elif ip_topic is None:
-                    raise ValueError('Connect RGB-D/VOP inputs or an arm_ip_sync input')
-                self.arm_ip_input.start(ip_topic)
+                # Old canvases may still send the retired IP topic with camera inputs.
+                topics = args.get('input_topics') or []
+                if isinstance(topics, list):
+                    topics = [topic for topic in topics if not (
+                        isinstance(topic, str) and topic.endswith('/arm_ip_sync'))]
+                camera_topics = resolve_topics(dict(input_topics=topics))
+                config_fields = ('arm', *SPEED_CONFIG, 'force_n', 'observe_after_transfer')
+                updates = {key: args[key] for key in config_fields if key in args}
+                if updates:
+                    configured = self.dispatch('config', updates)
+                    if not configured['ok']:
+                        return dict(configured, state='error')
                 try:
-                    if camera_topics:
-                        self.inputs.start(dict(args, input_topics=camera_topics))
-                    else:
-                        self.inputs.stop()
+                    self.inputs.start(dict(args, input_topics=camera_topics))
                 except Exception:
                     self.enabled = False
-                    self.arm_ip_input.stop()
                     self.observation = None
                     raise
                 if not was_enabled or previous_topics != tuple(self.inputs.topics):
@@ -300,12 +283,18 @@ class PickPlacePlugin:
                     if not same_source:self.observation=None
                 self.enabled = bool(camera_topics)
                 return self.info()
-            if action in ('observe', 'grab_to', 'grab_by') and self.addresses and not self.arm_ip_input.info()['ready']:
-                return dict(state='error', code='ARM_IP_INPUT_NOT_READY',
-                            message=self.arm_ip_input.info()['error'] or 'No valid arm IP mapping has been received. Start and connect arm_ip_sync before motion')
-            if action in ('grab_to','grab_by'):
+            if action in ('observe', 'grab_to', 'grab_by'):
                 if args.get('confirm_motion') is not True:
-                    return dict(state='error',code='CONFIRMATION_REQUIRED',message='confirm_motion=true is required')
+                    return dict(state='error', code='CONFIRMATION_REQUIRED', message='confirm_motion=true is required')
+                connection = None
+                if self.controller_configuration is not None:
+                    try:
+                        host, addresses, username, password = self.controller_configuration.snapshot()
+                        self.apply_arm_mapping(addresses)
+                        connection = host, username, password
+                    except RuntimeError as error:
+                        return dict(state='error', code='CONTROLLER_CONFIGURATION_NOT_READY', message=str(error))
+            if action in ('grab_to','grab_by'):
                 from .execution import parameters
                 from .transfer import parameters as transfer_parameters
                 try:
@@ -323,7 +312,7 @@ class PickPlacePlugin:
                 if self.gripper_manager is None:
                     return dict(state='error',code='GRIPPER_NOT_CONFIGURED',message='Driver gripper manager is missing')
                 active = dict(action_id='vision_pick_and_drop_'+action+'_'+uuid4().hex,
-                    action=action,transfer=transfer,config=dict(self.config),
+                    action=action,transfer=transfer,config=dict(self.config), controller_connection=connection,
                     owner='vision_pick_and_drop_'+uuid4().hex, cancel=threading.Event(),
                     stage='planning', target=joint_target(self.config['observation_joints_deg']),
                     session=None, command_id=None, hand_command_id=None,
@@ -335,8 +324,6 @@ class PickPlacePlugin:
                 threading.Thread(target=self.run_transfer, args=(active,), daemon=True, name='fr3-transfer').start()
                 return dict(state='running', action_id=active['action_id'])
             if action != 'observe': return None
-            if args.get('confirm_motion') is not True:
-                return dict(state='error', code='CONFIRMATION_REQUIRED', message='confirm_motion=true is required')
             if not self.enabled: return dict(state='error', message='Start the three observation inputs first')
             if not self.address or not self.serial: raise ValueError('Configure the selected arm and wrist camera before observation')
             target = joint_target(self.config['observation_joints_deg'])
@@ -347,7 +334,7 @@ class PickPlacePlugin:
                 return dict(state='error', code='CAMERA_NOT_READY', message=str(exc))
             active = dict(action_id='vision_pick_and_drop_observe_'+uuid4().hex, cancel=threading.Event(),
                           owner='vision_pick_and_drop_'+uuid4().hex, target=target, config=dict(self.config),
-                          stage='checking', session=None, command_id=None)
+                          stage='checking', session=None, command_id=None, controller_connection=connection)
             self.observation = None; self.active = active
         status, result = self.run_observation(active)
         if status == 'completed':
@@ -383,10 +370,9 @@ class PickPlacePlugin:
     @contextmanager
     def controller(self, active):
         from .controller_session import ControllerSession
-        arm_input = self.arm_ip_input.info()
-        endpoint = arm_input['controller_ip'] if arm_input['ready'] else ''
-        if not endpoint:
-            raise RuntimeError('Run arm_ip_sync sync before visual motion')
+        if active.get('controller_connection') is None:
+            raise RuntimeError('PNP controller configuration is not ready')
+        endpoint, username, password = active['controller_connection']
         owner = active['owner']
         local = self.manager.acquire(self.address, owner, exclusive=True)
         try:
@@ -396,7 +382,7 @@ class PickPlacePlugin:
                     raise RuntimeError('Pick cancelled')
                 if time.monotonic() >= deadline:
                     raise RuntimeError('Orin native Franka control connection is not ready')
-            with ControllerSession(endpoint, self.ssh_username, self.ssh_password, active['cancel'],
+            with ControllerSession(endpoint, username, password, active['cancel'],
                                    local=local).start(self.address) as controller:
                 yield controller
         finally:
@@ -424,7 +410,9 @@ class PickPlacePlugin:
     def acquire_hand(self, active):
         if self.gripper_manager is None:
             raise RuntimeError('Driver gripper manager is missing')
-        hand = self.gripper_manager.acquire(self.address, active['owner'], exclusive=True)
+        owner = active['owner']
+        hand = (self.acquire_gripper(self.address, owner) if self.acquire_gripper is not None
+                else self.gripper_manager.acquire(self.address, owner, exclusive=True))
         try:
             deadline = time.monotonic() + 5
             while not hand.snapshot().get('connected'):
@@ -617,9 +605,10 @@ class PickPlacePlugin:
                     except (RuntimeError, ValueError, TimeoutError) as exc:
                         errors.append(f'{pick["yaw_deg"]:.1f} deg approach: {exc}')
 
-                selected = None
                 for _, pick, targets, approach, approach_end in sorted(ranked, key=lambda item: item[0]):
-                    raw_descent = None
+                    if time.monotonic() >= deadline:
+                        break
+                    descent = None
                     for retreat_mm in range(6):
                         executor.check()
                         if time.monotonic() >= deadline:
@@ -634,32 +623,36 @@ class PickPlacePlugin:
                             width = candidate['grasp_width_mm'] / 1000
                             if not 0 < width < opening:
                                 raise ValueError('Target does not fit the calibrated opening')
-                            options = {'descent_plan': raw_descent} if retreat_mm else {}
-                            descent = executor.prepare('descend', [goals['descent']], cartesian=True, **options)
-                            lift = executor.prepare('lift', [goals['lift']], cartesian=True)
-                            carry = executor.prepare('move_to_place', goals['carry'], cartesian=True)
-                            place_lift = executor.prepare('place_lift', [goals['place_lift']], cartesian=True)
-                            home = executor.prepare('return_to_observation',
-                                                    list(map(math.radians, active['target'])), joint=True)
-                        except (RuntimeError, ValueError, TimeoutError) as exc:
+                            if retreat_mm:
+                                descent = executor.shorten_descent(goals['descent'])
+                            else:
+                                descent = executor.prepare('descend', [goals['descent']], cartesian=True)
+                        except (RuntimeError, ValueError) as exc:
                             errors.append(f'{pick["yaw_deg"]:.1f} deg (+{retreat_mm} mm): {exc}')
-                            if not retreat_mm:
-                                if not isinstance(exc, TableClearanceError):
-                                    break
-                                raw_descent = executor.raw_descent
-                            continue
-                        selected = candidate, goals
-                        break
-                    if selected is not None:
-                        pick, targets = selected
-                        executor.goals['approach'] = (targets['approach'], {'use_ik': True})
-                        break
+                            if not retreat_mm and not isinstance(exc, TableClearanceError):
+                                break
+                        else:
+                            break
+                    if descent is None:
+                        continue
+                    try:
+                        lift = executor.prepare('lift', [goals['lift']], cartesian=True)
+                        carry = executor.prepare('move_to_place', goals['carry'], cartesian=True)
+                        place_lift = executor.prepare('place_lift', [goals['place_lift']], cartesian=True)
+                        home = executor.prepare('return_to_observation',
+                                                list(map(math.radians, active['target'])), joint=True)
+                    except (RuntimeError, ValueError) as exc:
+                        errors.append(f'{pick["yaw_deg"]:.1f} deg after descend: {exc}')
+                        continue
+                    executor.goals['approach'] = (targets['approach'], {'use_ik': True})
+                    pick, targets = candidate, goals
+                    break
                 else:
                     raise RuntimeError('No complete MoveIt plan: ' + '; '.join(errors))
                 if time.monotonic() >= deadline:
                     raise RuntimeError('MoveIt candidate planning deadline: ' + '; '.join(errors))
                 if retreat_mm:
-                    print(f"[fr3 descent trim] action={active['action_id']} retreat_mm={retreat_mm} "
+                    print(f"[fr3 descent retreat] action={active['action_id']} retreat_mm={retreat_mm} "
                           f"minimum_clearance_bound_mm={descent[1]['descent_gap_bound_mm']:.3f}", flush=True)
                 active['grasp_retreat_mm'] = retreat_mm
                 executor.open_hand('pick_open')
@@ -681,8 +674,13 @@ class PickPlacePlugin:
                     executor.move_remote(retreat)
                     executor.move_remote(home)
                     active.update(return_completed=True, recovery_required=False)
+                    try:
+                        result['observation'] = self.capture(active)
+                    except Exception as exc:
+                        result['observation'] = dict(ok=False, message=str(exc))
+                        raise
                     active['stage'] = 'pick_close'
-                    raise RuntimeError('Grasp missed; hand opened and arm returned to observation') from miss
+                    raise RuntimeError('Grasp missed; hand opened and a new observation is available') from miss
                 executor.move_remote(lift)
                 if not executor.fresh(hand)['is_grasped']:
                     raise RuntimeError('Grasp feedback lost during lift')
@@ -716,8 +714,6 @@ class PickPlacePlugin:
                           transfer_completed=active.get('transfer_completed',False),
                           return_completed=active.get('return_completed',False),
                           observe_after_transfer=active['config']['observe_after_transfer'],
-                          observation=(dict(ok=False,message=str(exc)) if active.get('transfer_completed') and active['config']['observe_after_transfer']
-                              else dict(skipped=True,reason='transfer_incomplete' if active['config']['observe_after_transfer'] else 'disabled')),
                           observation_id=(active['observation'] or {}).get('result',{}).get('observation_id'),
                           last_completed_stage=active.get('last_completed_stage'),
                           feedback_recoveries=active.get('feedback_recoveries', 0),
@@ -727,6 +723,11 @@ class PickPlacePlugin:
                           release_completed=active.get('release_completed',False),
                           rotation_deg=(active.get('transfer') or {}).get('rotation_deg',0),
                           rotation_completed=active.get('rotation_completed',False))
+            if active.get('transfer_completed') and active['config']['observe_after_transfer']:
+                result['observation'] = dict(ok=False, message=str(exc))
+            else:
+                result.setdefault('observation', dict(skipped=True,
+                    reason='transfer_incomplete' if active['config']['observe_after_transfer'] else 'disabled'))
             result.pop('final_pose', None)
             if executor:
                 try:

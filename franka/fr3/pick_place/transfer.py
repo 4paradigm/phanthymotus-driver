@@ -63,7 +63,7 @@ def moveit_targets(observation, pick, scene, handeye, options):
     initial = grasp[:3, :3]
     final = rotation(-normal, math.radians(options['rotation_deg'])) @ initial
     pad = pick['sdk_to_pad_offset_mm'] / 1000
-    grasp_centre = grasp[:3, 3] + pad * initial[:, 2]
+    grasp_centre = np.asarray(pick.get('placement_reference', grasp[:3, 3])) + pad * initial[:, 2]
     raised = lift[:3, 3] + pad * initial[:, 2] + .05 * normal
     land = grasp_centre + delta - pad * final[:, 2]
     carry = [rigid(initial, raised - pad * initial[:, 2])]

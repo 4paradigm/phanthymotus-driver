@@ -57,18 +57,70 @@ class GraspTargetTests(unittest.TestCase):
                           extra_retreat_mm=12, only_yaw=initial['yaw_deg'])
 
 
-    def test_trim_descent_keeps_prefix_and_stops_short(self):
+    def test_shorten_descent_keeps_timed_prefix_and_stops_with_clearance(self):
+        import time
         from types import SimpleNamespace
-        from franka.fr3.pick_place.planning import rigid
+        from unittest.mock import Mock
+
+        from scipy.interpolate import BPoly
+        from franka.fr3.pick_place.hand_collision import TableClearanceError
         from franka.fr3.pick_place.remote_execution import RemoteExecution
 
-        executor = SimpleNamespace(check=lambda: None,
-                                   model=SimpleNamespace(pose=lambda q: rigid(np.eye(3), [0, 0, q[0]])))
-        points = [dict(time_ns=t, positions=[z] + [0.] * 6, velocities=[0.] * 7,
-                       accelerations=[0.] * 7) for t, z in [(0, 0.), (10**9, .01), (2*10**9, .02)]]
-        plan = dict(joint_names=[f'fr3_joint{i}' for i in range(1, 8)], points=points)
-        trimmed = RemoteExecution.trim_descent(executor, plan, rigid(np.eye(3), [0, 0, .019]))
-        self.assertEqual(trimmed['points'][:-1], points[:-1])
-        self.assertAlmostEqual(trimmed['points'][-1]['positions'][0], .019)
-        self.assertEqual(trimmed['points'][-1]['velocities'], [0.] * 7)
-        self.assertEqual(plan['points'][-1]['positions'][0], .02)
+        executor = RemoteExecution.__new__(RemoteExecution)
+        executor.check = Mock()
+        executor.active = {}
+        executor.options = dict(speed_deg_s=5)
+        executor.profile = dict(descent_min_clearance_mm=1, descent_clearance_allowance_mm=5)
+        executor.scene = dict(table_point_base_mm=[0, 0, 0], table_normal_base=[0, 0, 1])
+        executor.visible_surface = None
+        executor.hand_points = np.zeros((1, 3))
+        orientation = np.diag([1., -1., -1.])
+
+        def pose(q):
+            result = np.eye(4)
+            result[:3, :3] = orientation
+            result[2, 3] = q[0]
+            return result
+
+        executor.model = SimpleNamespace(pose=pose, low=np.full(7, -1.), high=np.full(7, 1.),
+                                         clearance=lambda q: 1., table_clearance=lambda *args: 1.)
+        executor.q = [.023] + [0.] * 6
+        plan = dict(code=1, fraction=1., joint_names=[f'fr3_joint{i}' for i in range(1, 8)],
+                    points=[dict(time_ns=t*10**9, positions=[z] + [0.] * 6,
+                                 velocities=[v] + [0.] * 6, accelerations=[0.] * 7)
+                            for t, z, v in [(0, .023, 0.), (1, .015, -.01), (2, .0055, 0.)]])
+        original_target = pose(plan['points'][-1]['positions'])
+        with self.assertRaises(TableClearanceError):
+            executor.prepare_trajectory('descend', [original_target], plan, True, False, time.monotonic())
+        self.assertLess(executor.descent['segments'][-1][0], 2.)
+        segment = executor.descent['segments'][0]
+        target = original_target.copy()
+        target[2, 3] += .002
+        _, shorter = executor.shorten_descent(target)
+        self.assertEqual(shorter['segments'][0], segment)
+        self.assertAlmostEqual(shorter['points'][-1]['positions'][0], .0075)
+        self.assertGreaterEqual(shorter['descent_gap_bound_mm'], 1.)
+        first = BPoly(np.asarray(segment[1])[:, None, :], [0., segment[0]])
+        end, controls = shorter['segments'][-1]
+        tail = BPoly(np.asarray(controls)[:, None, :], [segment[0], end])
+        for degree in (0, 1, 2):
+            np.testing.assert_allclose(first.derivative(degree)(segment[0]),
+                                       tail.derivative(degree)(segment[0]), atol=1e-9)
+        for degree in (1, 2):
+            np.testing.assert_allclose(tail.derivative(degree)(end), 0., atol=1e-9)
+
+
+    def test_pick_offset_preserves_hover_height_and_placement_reference(self):
+        from franka.fr3.pick_place.geometry import transform
+        from franka.fr3.pick_place.transfer import image_table_axes
+
+        original = grasp_targets(self.observation, self.scene, self.profile)[0]
+        corrected = grasp_targets(self.observation, self.scene, {**self.profile, 'grasp_offset_mm': [0, -2, 3]})[0]
+        ee = np.asarray(self.observation['metadata']['O_T_EE']).reshape(4, 4, order='F')
+        camera = ee @ transform(self.profile['handeye']['EE_T_camera'], 'EE_T_camera')
+        normal = np.asarray(self.scene['table_normal_base'])
+        horizontal = image_table_axes(camera, normal)[:, 1] * -.002
+        delta = np.asarray(corrected['poses'])[:, :3, 3] - np.asarray(original['poses'])[:, :3, 3]
+        np.testing.assert_allclose(delta[0], horizontal)
+        np.testing.assert_allclose(delta[1], horizontal + normal * .003)
+        np.testing.assert_allclose(corrected['placement_reference'], np.asarray(original['poses'][1])[:3, 3])

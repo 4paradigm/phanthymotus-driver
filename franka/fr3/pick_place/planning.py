@@ -60,6 +60,11 @@ def grasp_targets(observation, scene, profile, *, extra_retreat_mm=0, only_yaw=N
     from .transfer import image_table_axes
     xy = np.array([profile.get(f'{axis}_compensation_mm', 0) for axis in 'xy'])
     shift = image_table_axes(camera, normal) @ xy / 1000 if np.any(xy) else np.zeros(3)
+    offset = np.asarray(profile.get('grasp_offset_mm', [0, 0, 0]), dtype=float)
+    if offset.shape != (3,) or not np.isfinite(offset).all() or np.any(np.abs(offset) > 50):
+        raise ValueError('grasp_offset_mm must contain three finite values in [-50, 50]')
+    horizontal = image_table_axes(camera, normal) @ offset[:2] / 1000 if np.any(offset[:2]) else np.zeros(3)
+    vertical = normal * offset[2] / 1000
     closing = initial_r[:,1] - (initial_r[:,1] @ down)*down
     if np.linalg.norm(closing) < 1e-6:
         closing = np.cross(down, initial_r[:,0])
@@ -132,11 +137,14 @@ def grasp_targets(observation, scene, profile, *, extra_retreat_mm=0, only_yaw=N
         if not 0 < grasp_width <= 79:
             continue
         sdk_grasp = grasp + shift - pad_offset*goal_r[:,2]
-        ends = [sdk_grasp-(.15-extra_retreat_mm/1000)*goal_r[:,2], sdk_grasp, sdk_grasp+.01*normal]
+        hover = sdk_grasp - (.15 - extra_retreat_mm/1000) * goal_r[:, 2]
+        corrected_grasp = sdk_grasp + horizontal + vertical
+        ends = [hover + horizontal, corrected_grasp, corrected_grasp + .01 * normal]
         candidates.append(dict(
             yaw_deg=yaw, observation_id=metadata['observation_id'],
             poses=[rigid(goal_r, point).tolist() for point in ends],
             grasp_width_mm=grasp_width,
+            placement_reference=sdk_grasp.tolist(),
             sdk_to_pad_offset_mm=pad_offset*1000,
         ))
     if not candidates:

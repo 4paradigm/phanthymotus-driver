@@ -11,7 +11,7 @@ external RealSense cameras over USB. It registers with Agent Core as
 | `joint_control` | Actuator | Absolute joint targets, single-axis jog, and controlled stop |
 | `gripper` | Actuator | Franka Hand opening, grasp, calibration, and stop |
 | `ext_camera` | Sensor | RGB, depth, or left near-infrared from a selected RealSense |
-| `arm_ip_sync` | Sensor | Configured left/right controller IP stream and manual PNP refresh |
+| `controller_configuration` | Configuration | SSH credentials for automatic PNP controller discovery |
 
 ## Requirements
 
@@ -76,23 +76,10 @@ limits do not model obstacles in the workcell.
 
 `joint_control` and `gripper` are single-instance cards with no configuration panel.
 Select `arm` and enter speed, force and other parameters directly in each action.
-Without a workstation arm mapping, enter `robot_ip` in the action instead.
-Connect the `arm_ip_sync` sensor output (`data/json`) to each of these cards.
-Their `left`/`right` action choices and other action parameters remain unchanged.
-In dual-arm workstation mode, commands require a successfully received mapping;
-there is no silent fallback to YAML addresses when the stream has not supplied
-one. Each card subscribes independently and reports `motion_arm_ips` and
-`arm_ip_input` through `info`. A valid cached mapping does not expire when
-heartbeats pause. Manual `sync` is not required after intelligent-control restart;
-starting the connected sensor publishes its current configuration again.
-
-Changed endpoints apply immediately while idle, releasing that card's old
-connections. Updates are rejected during arm/Hand motion or while a known Hand
-session is holding an object. Repeated unchanged messages are allowed during
-motion. Invalid input blocks new motion without changing the last applied
-mapping; stop and stopmotion remain available. Card stop releases its IP
-subscriber. The legacy standalone single-controller `robot_ip` mode remains
-available when no dual-arm mapping is configured.
+Both cards use the Driver's verified Controller Configuration to resolve the selected
+side. No canvas connection is required. Without a verified mapping, new motion is
+rejected and stop remains available. Address changes apply while idle and release
+the card's previous sessions. Active motion or a known held object blocks a change.
 
 The first execution connects and waits up to five seconds for fresh, control-ready
 feedback before submitting motion. Offline or unsafe states still reject motion.
@@ -153,8 +140,7 @@ then verify arm and gripper motion, stop behavior, and ACP acknowledgement
 with the operator monitoring the workcell.
 
 With `motion_arm_ips` configured, actions select the physical left or right arm.
-The YAML values initialize the sensor defaults; connected cards use the mapping
-received from `arm_ip_sync`. Configure that sensor for another installation.
+The Driver resolves the selected side using the mapping verified at startup.
 Use each controller's C2 (Shop Floor network) IP, match the physical mounting
 side, and give the arms distinct addresses.
 
@@ -182,7 +168,6 @@ Connect these inputs, in any order:
 | RGB | `image/jpeg` | Selected wrist camera's `/rgb` topic |
 | Depth | `image/depth-zlib` | Same camera's `/depth` topic |
 | Objects | `data/json` | VOP must consume that RGB; output is `/rgb/objects` |
-| Arm IPs | `data/json` | `arm_ip_sync` output, ending in `/arm_ip_sync` |
 
 Configure `force_n` (30–70 N), `speed_deg_s` and `speed_mm_s` before transfer.
 Speeds are joint degrees/s and total finger-spacing mm/s, not percentages.
@@ -220,44 +205,22 @@ Check `transfer_completed`, `release_completed`, `return_completed`,
 Cancellation never automatically opens a possibly held object. A failed return or
 post-transfer capture does not erase an already completed placement.
 
-## Arm IP sensor
+## Controller Configuration
 
-`arm_ip_sync` is a single-instance configuration sensor. `start` publishes
-`{"left":"172.16.0.3","right":"172.16.0.2","controller_ip":""}` as `std_msgs/String` JSON at
-1 Hz on `/{namespace}/arm_ip_sync` (`data/json`); `stop` releases the publisher.
-The payload is an endpoint mapping, not a measurement of robot connectivity.
-`info` returns its authoritative topic, configuration and publication freshness.
+The Driver starts discovery before initializing the camera and motion cards.
+No canvas instance is required. The configuration panel contains only the SSH
+username and password, which default to `pnp` and `ros`. Saving changed
+credentials triggers discovery again. The panel has no input or output ports
+and does not expose the discovered addresses.
 
-Configure both arm IPs and, optionally, the PNP host address. SSH defaults are
-username `pnp` and password `ros`; the password is editable, masked and sensitive,
-and never included in stream payloads or results. Provision a verified PNP host
-key in `/opt/phanthy-motus/franka-controller-access/known_hosts`, with alias
-`franka-pnp-controller`. Unknown/changed keys are rejected. The optional PNP
-address defaults to blank and is a fallback, never the first choice. `sync`
-first probes SSH on active Ethernet IPv4 subnets (up to 1024 addresses per
-subnet), then verifies the trusted host and reads its configuration. Set
-`FRANKA_ROBOT_INTERFACE` to select a specific interface. Only if discovery
-fails does it try the optional configured address. A detected address is
-reported separately from the configured fallback.
+Discovery probes the robot Ethernet network and then tries the last verified
+host if necessary. Set `FRANKA_ROBOT_INTERFACE` to select the interface. The
+Driver verifies the host key under `/opt/phanthy-motus/franka-controller-access`
+with alias `franka-pnp-controller` and reads the existing Desk and hardware
+configuration. Both sides must be present and agree where the files overlap.
 
-`sync` is an optional manual acquisition refresh: it reads the trusted PNP host's
-existing Desk/hardware configuration in a bounded background job. It returns an
-`action_id`; ACP and `info.last_result` report its outcome. It neither commands
-motion nor directly edits another card. Successful config/sync saves the mapping
-atomically under `/opt/phanthy-motus/franka-ip-sync/binding.json`; errors retain
-the previous values, which continue to be published. Before a successful sync,
-the configured/default arm IPs are published; after success the detected arm IPs
-replace them. The deployment template mounts this directory and SSH trust
-data on the host so they survive container replacement.
-
-Connect this output separately to `joint_control`, `gripper` and the visual card.
-Consumers apply endpoint updates while idle and reject changes during active
-motion or a known held object. They retain a valid received mapping when
-heartbeats pause: `arm_ip_input.ready` controls availability, while `fresh` is
-only a heartbeat diagnostic. New subscriptions must first receive a valid mapping.
-No manual sync is needed after intelligent-control restart; the source republishes
-its current configuration. Reobserve after changing a visual-card endpoint.
-
-Runtime schema defaults and `info.config` reflect sensor updates. Core owns its
-saved form; this driver does not rewrite that database. Reapplying an older form
-is an explicit configuration change and can restore older values.
+The Driver stores verified addresses and credentials separately under
+`/opt/phanthy-motus/franka-ip-sync`. Credentials are private to the Driver and
+never included in action results. Each Driver boot verifies the mapping
+before accepting new motion. Joint control, gripper and visual pick use the
+same mapping, and visual pick also uses the shared SSH credentials.
