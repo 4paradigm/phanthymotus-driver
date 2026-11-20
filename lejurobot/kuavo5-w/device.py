@@ -1676,6 +1676,9 @@ class KuavoBundle:
         if name in PERIPHERAL_CARDS:
             return self.peripherals.dispatch(name, action)
         if name in SENSOR_CARDS:
+            if name == 'imu' and action == 'start' and self.startup_checks.enabled:
+                # Reuse the fixed camera service path; no motor/controller start.
+                self.peripherals.dispatch('camera_depth', 'start')
             return self.sensors.dispatch(name, action)
         for plugin in self.plugins:
             if plugin.PREFIX == name:

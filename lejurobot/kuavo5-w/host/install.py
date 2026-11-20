@@ -46,10 +46,8 @@ def main():
             for path in package.rglob('*.py'))
         shutil.copytree(package, root / 'ros1_messages/kuavo_msgs', dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
-    launch = root / 'head_camera.launch'
-    head_launch_changed = launch.is_file() and launch.read_bytes() != (Path(__file__).parent / launch.name).read_bytes()
     for name in ('rosbridge_loopback.py', 'rosbridge.launch', 'battery_relay.py', 'runtime_manager.py',
-                 'head_camera.launch', 'head_jpeg.py', 'head_depth.py'):
+                 'head_camera.launch', 'head_jpeg.py', 'head_depth.py', 'rgbd_geometry.py', 'head_imu.py', 'head_rgbd.py'):
         shutil.copyfile(Path(__file__).parent / name, root / name)
         (root / name).chmod(0o644)
     config = Path('/opt/phanthy-motus/drivers/lejurobot-kuavo5-w/config.yaml')
@@ -96,8 +94,8 @@ def main():
                 and (candidate / 'src/OrbbecSDK_ROS1/launch/gemini_330_series.launch').is_file()):
             head = candidate / 'devel/setup.bash'
             commands['kuavo5w-head-camera'] = f'roslaunch --wait {root}/head_camera.launch'
-            commands['kuavo5w-head-jpeg-relay'] = f'python3 {root}/head_jpeg.py'
-            commands['kuavo5w-head-depth-relay'] = f'python3 {root}/head_depth.py'
+            commands['kuavo5w-head-jpeg-relay'] = f'python3 {root}/head_rgbd.py'
+            commands['kuavo5w-head-imu-relay'] = f'python3 {root}/head_imu.py'
             break
     if args.head_workspace and head is None:
         parser.error('Head workspace must contain built OrbbecSDK_ROS1 gemini_330_series.launch')
@@ -141,10 +139,17 @@ WantedBy=multi-user.target
         # Already-running bridge imports are cached; changing files alone would
         # leave a wrong sensorsData MD5 until the next reboot.
         subprocess.run(['systemctl', 'try-restart', 'kuavo5w-rosbridge.service'], check=True)
-    if head is not None and head_launch_changed:
-        # Reload a running RGB-only pipeline on upgrade; inactive cameras remain
-        # inactive until a card requests them. Never touch robot controllers.
+    if head is not None:
+        # Install only runs for a changed helper bundle. Reload a running camera
+        # even after a previously interrupted install copied its launch file.
+        # Inactive cameras stay inactive; robot controllers are never touched.
         subprocess.run(['systemctl', 'try-restart', 'kuavo5w-head-camera.service'], check=True)
+    if head is not None:
+        obsolete = Path('/etc/systemd/system/kuavo5w-head-depth-relay.service')
+        if obsolete.exists():
+            subprocess.run(['systemctl', 'disable', '--now', obsolete.name], check=True)
+        subprocess.run(['systemctl', 'try-restart', 'kuavo5w-head-jpeg-relay.service',
+                        'kuavo5w-head-imu-relay.service'], check=True)
     print('Host helper installed. Driver startup ensures rosbridge/battery; camera card start ensures installed RGB/depth services.')
 
 

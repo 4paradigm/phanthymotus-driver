@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent
 FILES = ('config.yaml', 'host/install.py', 'host/install_controller.py',
          'host/controller_boot.py', 'host/install_speaker.py', 'host/speaker_relay.py',
          'host/rosbridge_loopback.py', 'host/rosbridge.launch', 'host/runtime_manager.py',
-         'host/battery_relay.py', 'host/head_camera.launch', 'host/head_jpeg.py', 'host/head_depth.py')
+         'host/battery_relay.py', 'host/head_camera.launch', 'host/head_jpeg.py', 'host/head_depth.py', 'host/rgbd_geometry.py', 'host/head_imu.py', 'host/head_rgbd.py')
 
 
 

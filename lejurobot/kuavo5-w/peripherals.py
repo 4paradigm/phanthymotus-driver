@@ -12,12 +12,14 @@ import zlib
 from std_msgs.msg import String, UInt8MultiArray
 from sensor_msgs.msg import CompressedImage
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from camera_specs import INFO_TOPICS, calibration, declare, jpeg_dimensions, registered_pair
+from base_servo import footprint_from_polygon
 
 CARDS = ('battery', 'laser_scan', 'camera_left', 'camera_right', 'camera_head', 'camera_depth')
 CAMERAS = {'camera_left': ('/camera_1/color/image_raw/compressed', '/camera_left/set_camera_enabled'),
            'camera_right': ('/camera_2/color/image_raw/compressed', '/camera_right/set_camera_enabled'),
-           'camera_head': ('/camera_head/color/image_raw/compressed', None),
-           'camera_depth': ('/camera_head/depth/image_raw/compressed_zlib', None)}
+           'camera_head': ('/camera_head/color/image_rect/compressed', None),
+           'camera_depth': ('/camera_head/depth/image_rect/compressed_zlib', None)}
 DEPTH_FORMAT = 'image/depth-zlib'
 DEPTH_BYTES = 640 * 480 * 2
 
@@ -95,6 +97,8 @@ class Peripherals:
         self._generation = None
         self._running, self._data, self._seen = set(), {}, {}
         self._images, self._last_image_publish = {}, {}
+        self._calibrations, self._dimensions = {}, {}
+        self._depth_registration, self._footprint = None, None
         self._enabling, self._retry_at, self._camera_error = set(), {}, {}
         # Each camera owns a WebSocket receiver and a latest-frame publisher.
         # Image JSON/base64 and DDS work cannot block control/odom replies.
@@ -113,6 +117,9 @@ class Peripherals:
         self._image_pubs = {card: node.create_publisher(CompressedImage, self.topics[card], latest_qos()) for card in CAMERAS}
         ros1.subscribe('/motus/kuavo5w/battery', 'std_msgs/String', self._on_battery)
         ros1.subscribe('/scan', 'sensor_msgs/LaserScan', self._on_scan, throttle_ms=200)
+        for card, topic in INFO_TOPICS.items():
+            ros1.subscribe(topic, 'sensor_msgs/CameraInfo',
+                           lambda msg, c=card: self._on_camera_info(c, msg), throttle_ms=1000)
         self._timer = node.create_timer(.2, self.tick)
 
     def start(self):
@@ -125,6 +132,54 @@ class Peripherals:
             worker = threading.Thread(target=self._image_loop, args=(card,), daemon=True, name=f'{card}-publish')
             self._workers.append(worker)
             worker.start()
+        worker = threading.Thread(target=self._metadata_loop, daemon=True, name='camera-geometry')
+        self._workers.append(worker)
+        worker.start()
+
+    def _on_camera_info(self, card, message):
+        with self._lock:
+            if self._closed or not self._session():
+                return
+            try:
+                self._calibrations[card] = calibration(message)
+            except (ValueError, TypeError, AttributeError):
+                self._calibrations.pop(card, None)
+
+    def _metadata_loop(self):
+        # Parameter services may be slow. Never perform them in an image,
+        # control callback, or under either the motion or peripheral lock.
+        while not self._stop.is_set():
+            generation = self.ros1.connection
+            if not generation[0]:
+                self._stop.wait(.2)
+                continue
+            try:
+                registration = self.ros1.get_param('/camera_head/camera/depth_registration')
+            except Exception:
+                registration = None
+            try:
+                polygon = self.ros1.get_param('/lqr_path_track/local_costmap/footprint')
+                padding = self.ros1.get_param('/lqr_path_track/local_costmap/footprint_padding', 0.)
+                footprint = footprint_from_polygon(polygon, padding)
+            except Exception:
+                footprint = None
+            with self._lock:
+                if generation == self.ros1.connection and not self._closed:
+                    self._depth_registration, self._footprint = registration, footprint
+            self._stop.wait(5.)
+
+    def footprint(self):
+        with self._lock:
+            self._session()
+            return copy.deepcopy(self._footprint)
+
+    def _depth_aligned(self):
+        return registered_pair(self._calibrations.get('camera_head'),
+                               self._calibrations.get('camera_depth'), self._depth_registration)
+
+    def _camera_declaration(self, card):
+        return declare(card, self.topics[card], DEPTH_FORMAT if card == 'camera_depth' else 'image/jpeg',
+                       self._calibrations.get(card), self._dimensions.get(card), self._depth_aligned())
 
     def _image_loop(self, card):
         while not self._stop.is_set():
@@ -143,6 +198,9 @@ class Peripherals:
             self._seen.clear()
             self._images.clear()
             self._last_image_publish.clear()
+            self._calibrations.clear()
+            self._dimensions.clear()
+            self._depth_registration, self._footprint = None, None
             self._retry_at.clear()
             self._generation = generation
         return connected
@@ -200,14 +258,20 @@ class Peripherals:
                     if message.get('format') != DEPTH_FORMAT:
                         raise ValueError('unexpected depth format')
                     validate_depth(payload)
+                    if (not self._depth_aligned() or image_header(message)['frame_id']
+                            != 'camera_head_color_optical_frame'):
+                        raise ValueError('depth is not verified RGB-registered')
                 elif not payload.startswith(b'\xff\xd8') or not payload.endswith(b'\xff\xd9'):
                     raise ValueError('not a complete JPEG')
                 self._images[card] = (payload, image_header(message))
+                dimensions = (640, 480) if card == 'camera_depth' else jpeg_dimensions(payload)
+                if dimensions:
+                    self._dimensions[card] = dimensions
                 self._data[card] = {'valid': True, 'bytes': len(payload),
                                     'encoding': '16UC1-zlib' if card == 'camera_depth' else 'jpeg',
                                     'source_topic': CAMERAS[card][0]}
                 if card == 'camera_depth':
-                    self._data[card].update(width=640, height=480, unit='mm', invalid_value=0, aligned_to_rgb=False)
+                    self._data[card].update(width=640, height=480, unit='mm', invalid_value=0, aligned_to_rgb=True)
                 self._seen[card] = time.monotonic()
                 self._image_stats[card]['received'] += 1
                 self._wake[card].set()
@@ -260,8 +324,8 @@ class Peripherals:
             'laser_scan': '二维雷达点云图 + 原始测距（laser 坐标系，z=0；不是额外3D雷达）',
             'camera_left': '底盘左路 RGB JPEG，独立接收/发布线程，自动开启',
             'camera_right': '底盘右路 RGB JPEG，独立接收/发布线程，自动开启',
-            'camera_head': 'Orbbec Gemini 335L 头部 RGB JPEG，独立接收/发布线程',
-            'camera_depth': 'Orbbec 头部原生深度图，640×480 uint16 毫米，zlib无损压缩；0无效，未对齐RGB'}
+            'camera_head': '640×480 RGB；Orbbec Gemini 335L头部相机，运行时CameraInfo内参。接VOP后可配camera_depth用于navi；导航前头部须朝正前，导航时不要转头。',
+            'camera_depth': '640×480 uint16 毫米，0无效；Orbbec头部深度经厂商SDK对齐camera_head RGB，zlib无损压缩。用于navi时，VOP也必须来自camera_head，头部保持朝正前；不可与底盘左右相机混用。'}
         tools = []
         for card in CARDS:
             outputs = [{'topic': self.topics[card], 'format': DEPTH_FORMAT if card == 'camera_depth'
@@ -292,8 +356,16 @@ class Peripherals:
             elif action != 'info':
                 return {'state': 'error', 'error': 'unsupported sensor lifecycle action'}
             result = {'state': 'running' if card in self._running else 'idle', 'feedback': self.snapshot(card)}
-            if card in self._running:
+            if card in self._running or card in CAMERAS:
                 result['topic_out'] = next(t['topic_out'] for t in self.tools() if t['name'] == card)
+            if card in CAMERAS:
+                result['camera_info'] = self._camera_declaration(card)
+            if card in self._running and card in ('camera_head', 'camera_depth'):
+                ready = bool(self._calibrations.get(card)) and result['feedback']['valid']
+                if card == 'camera_depth':
+                    ready = ready and self._depth_aligned()
+                if not ready:
+                    result.update(state='loading', message='Waiting for camera calibration and verified RGB-aligned frames.')
             return result
 
     def tick(self):
@@ -371,6 +443,8 @@ class Peripherals:
             for card in CAMERAS:
                 self._media[card].unsubscribe(CAMERAS[card][0])
                 self._wake[card].set()
+            for topic in INFO_TOPICS.values():
+                self.ros1.unsubscribe(topic)
             self._running.clear()
         if self._owns_media:
             for client in self._media.values():

@@ -7,7 +7,7 @@ ROS1 environment lacks compressed_image_transport; no ROS package is patched.
 import threading
 
 
-def encode(message, cv2, np):
+def encode(message, cv2, np, geometry=None):
     channels = {'rgb8': 3, 'bgr8': 3, 'mono8': 1}.get(message.encoding)
     if (channels is None or not 1 <= message.width <= 4096 or not 1 <= message.height <= 2160
             or not message.width * channels <= message.step <= message.width * channels + 4096
@@ -17,6 +17,8 @@ def encode(message, cv2, np):
     image = image[:, :message.width * channels].reshape(message.height, message.width, channels)
     if message.encoding == 'rgb8':
         image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    if geometry is not None:
+        image = cv2.remap(image, geometry['color_x'], geometry['color_y'], cv2.INTER_LINEAR)
     ok, jpeg = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 75])
     if not ok:
         raise ValueError('JPEG encode failed')
@@ -27,10 +29,15 @@ def main():
     import cv2
     import numpy as np
     import rospy
-    from sensor_msgs.msg import Image, CompressedImage
+    from sensor_msgs.msg import Image, CompressedImage, CameraInfo
+    from rgbd_geometry import Geometry, camera_info
     rospy.init_node('motus_head_jpeg')
     lock, latest = threading.Lock(), []
-    publisher = rospy.Publisher('/camera_head/color/image_raw/compressed', CompressedImage, queue_size=1)
+    publisher = rospy.Publisher('/camera_head/color/image_rect/compressed', CompressedImage, queue_size=1)
+    info_pub = rospy.Publisher('/camera_head/color/image_rect/camera_info', CameraInfo, queue_size=1)
+    geometry = Geometry()
+    infos = [rospy.Subscriber('/camera_head/'+kind+'/camera_info', CameraInfo,
+             lambda msg, k=kind: geometry.receive(k, msg), queue_size=1) for kind in ('color', 'depth')]
 
     def receive(message):
         with lock:
@@ -45,7 +52,9 @@ def main():
             try:
                 message = CompressedImage()
                 message.header, message.format = source.header, 'jpeg'
-                message.data = encode(source, cv2, np)
+                g = geometry.get(cv2, np)
+                message.data = encode(source, cv2, np, g)
+                info_pub.publish(camera_info(g, source.header))
                 publisher.publish(message)
             except Exception as exc:
                 rospy.logwarn_throttle(10, 'head JPEG frame rejected: %s', type(exc).__name__)

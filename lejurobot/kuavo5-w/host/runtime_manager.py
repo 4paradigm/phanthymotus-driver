@@ -13,8 +13,8 @@ _lock = threading.Lock()
 
 
 CAMERA_SERVICES = {
-    'head': ('kuavo5w-head-camera.service', 'kuavo5w-head-jpeg-relay.service'),
-    'depth': ('kuavo5w-head-camera.service', 'kuavo5w-head-depth-relay.service'),
+    'head': ('kuavo5w-head-camera.service', 'kuavo5w-head-jpeg-relay.service', 'kuavo5w-head-imu-relay.service'),
+    'depth': ('kuavo5w-head-camera.service', 'kuavo5w-head-jpeg-relay.service', 'kuavo5w-head-imu-relay.service'),
 }
 
 

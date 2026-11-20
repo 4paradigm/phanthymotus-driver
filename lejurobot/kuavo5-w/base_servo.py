@@ -12,8 +12,32 @@ from common.control import ControlSink
 from base_limits import LINEAR_LIMIT, ANGULAR_LIMIT
 
 
-def build_descriptor():
-    return {'control_interface': 'motus.control/1', 'mode': 'twist', 'dof': 6,
+def footprint_from_polygon(points, padding=0.):
+    """Bound the live factory costmap polygon, explicitly as an estimate."""
+    if isinstance(points, str):
+        if len(points) > 8192:
+            raise ValueError('oversized footprint')
+        points = json.loads(points)
+    if (not isinstance(points, list) or not 3 <= len(points) <= 64
+            or isinstance(padding, bool) or not isinstance(padding, (int, float))
+            or not math.isfinite(padding) or not 0 <= padding <= .5):
+        raise ValueError('invalid footprint')
+    if any(not isinstance(p, (list, tuple)) or len(p) != 2
+           or any(isinstance(x, bool) or not isinstance(x, (int, float))
+                  or not math.isfinite(x) or abs(x) > 3 for x in p) for p in points):
+        raise ValueError('invalid footprint vertices')
+    xs, ys = zip(*points)
+    if not min(xs) < 0 < max(xs) or not min(ys) < 0 < max(ys):
+        raise ValueError('footprint must contain the base origin')
+    return {'shape': 'box', 'half_width': max(abs(min(ys)), abs(max(ys))) + padding,
+            'front': max(xs) + padding, 'rear': -min(xs) + padding, 'height': None,
+            'source': 'estimate', 'arms': 'at-rest',
+            'provenance': '/lqr_path_track/local_costmap/footprint + footprint_padding; '
+                          'factory planner envelope, not measured full-body clearance'}
+
+
+def build_descriptor(footprint=None):
+    descriptor = {'control_interface': 'motus.control/1', 'mode': 'twist', 'dof': 6,
             'joint_names': ['vx', 'vy', 'vz', 'wx', 'wy', 'wz'],
             'units': {'linear': 'm/s', 'angular': 'rad/s', 'time': 's'},
             'frame': 'base_link',
@@ -23,6 +47,9 @@ def build_descriptor():
             'groups': [{'name': 'base', 'offset': 0, 'count': 6, 'unit': 'm/s', 'resource': 'base'}],
             'rate': {'expected_hz': 10., 'max_hz': 20., 'watchdog_ms': 300, 'max_obs_age_ms': 500},
             'force_torque': None}
+    if footprint:
+        descriptor['footprint'] = footprint
+    return descriptor
 
 
 class BaseServo:
@@ -60,7 +87,10 @@ class BaseServo:
                                 'on_interrupt_all': {'action': 'pause'}}}}
 
     def _new_sink(self):
-        return ControlSink(build_descriptor(), self._apply, on_watchdog=self._hold, on_abort=self._hold)
+        return ControlSink(self._descriptor(), self._apply, on_watchdog=self._hold, on_abort=self._hold)
+
+    def _descriptor(self):
+        return build_descriptor(self.bundle.peripherals.footprint())
 
     def info(self):
         with self._lock:
@@ -68,7 +98,7 @@ class BaseServo:
             state = ('idle' if self._subscription is None else 'paused' if self._paused
                      else 'loading' if startup['state'] == 'loading' else 'running')
             return {'state': state,
-                    'input': self._topic, 'control_interface': build_descriptor(),
+                    'input': self._topic, 'control_interface': self._descriptor(),
                     'applied': self._applied, 'last': self._last, 'error': self._error,
                     'startup': startup, 'control_ownership': self.bundle.control_ownership()}
 

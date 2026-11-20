@@ -12,7 +12,7 @@ WIDTH, HEIGHT = 640, 480
 FORMAT = 'image/depth-zlib'
 
 
-def encode(message):
+def encode(message, geometry=None, cv2=None, np=None):
     if (message.encoding != '16UC1' or message.width != WIDTH or message.height != HEIGHT
             or not WIDTH * 2 <= message.step <= WIDTH * 2 + 4096
             or len(message.data) != message.step * HEIGHT
@@ -25,15 +25,25 @@ def encode(message):
         swapped = bytearray(len(raw))
         swapped[0::2], swapped[1::2] = raw[1::2], raw[0::2]
         raw = bytes(swapped)
+    if geometry is not None:
+        image = np.frombuffer(raw, dtype='<u2').reshape(HEIGHT, WIDTH)
+        raw = cv2.remap(image, geometry['depth_x'], geometry['depth_y'], cv2.INTER_NEAREST).astype('<u2').tobytes()
     return zlib.compress(raw, 1)
 
 
 def main():
     import rospy
-    from sensor_msgs.msg import Image, CompressedImage
+    import cv2
+    import numpy as np
+    from rgbd_geometry import Geometry, camera_info
+    from sensor_msgs.msg import Image, CompressedImage, CameraInfo
     rospy.init_node('motus_head_depth')
     lock, latest = threading.Lock(), []
-    publisher = rospy.Publisher('/camera_head/depth/image_raw/compressed_zlib', CompressedImage, queue_size=1)
+    publisher = rospy.Publisher('/camera_head/depth/image_rect/compressed_zlib', CompressedImage, queue_size=1)
+    info_pub = rospy.Publisher('/camera_head/depth/image_rect/camera_info', CameraInfo, queue_size=1)
+    geometry = Geometry()
+    infos = [rospy.Subscriber('/camera_head/'+kind+'/camera_info', CameraInfo,
+             lambda msg, k=kind: geometry.receive(k, msg), queue_size=1) for kind in ('color', 'depth')]
 
     def receive(message):
         with lock:
@@ -49,7 +59,9 @@ def main():
             try:
                 message = CompressedImage()
                 message.header, message.format = source.header, FORMAT
-                message.data = encode(source)
+                g = geometry.get(cv2, np)
+                message.data = encode(source, g, cv2, np)
+                info_pub.publish(camera_info(g, source.header))
                 publisher.publish(message)
             except Exception as exc:
                 rospy.logwarn_throttle(10, 'head depth frame rejected: %s', type(exc).__name__)

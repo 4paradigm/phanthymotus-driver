@@ -156,36 +156,84 @@ class PeripheryTests(unittest.TestCase):
     def test_head_camera_reads_jpeg_without_chassis_enable_service(self):
         self.periphery.dispatch('camera_head', 'start')
         self.periphery.tick()
-        self.assertIn('/camera_head/color/image_raw/compressed', self.ros.subscriptions)
+        self.assertIn('/camera_head/color/image_rect/compressed', self.ros.subscriptions)
         self.assertEqual(self.ros.services, [])
 
-    def test_depth_publishes_native_lossless_format_with_provenance(self):
+    def calibrate_head(self):
+        info = {'width': 640, 'height': 480, 'K': [370., 0., 320., 0., 370., 240., 0., 0., 1.],
+                'D': [0.] * 8, 'distortion_model': 'rational_polynomial',
+                'header': {'frame_id': 'camera_head_color_optical_frame'}}
+        for card in ('camera_head', 'camera_depth'):
+            self.periphery._on_camera_info(card, info)
+        self.periphery._depth_registration = True
+
+    def test_depth_publishes_rgb_registered_lossless_format_with_provenance(self):
         self.periphery.dispatch('camera_depth', 'start')
+        self.calibrate_head()
         raw = struct.pack('<HH', 0, 1500) * (640*480//2)
         compressed = zlib.compress(raw, 1)
         self.periphery._on_image('camera_depth', {'format': 'image/depth-zlib',
             'data': base64.b64encode(compressed).decode(),
-            'header': {'frame_id': 'camera_head_depth_optical_frame', 'stamp': {'secs': 12, 'nsecs': 34}}}, 1)
+            'header': {'frame_id': 'camera_head_color_optical_frame', 'stamp': {'secs': 12, 'nsecs': 34}}}, 1)
         self.periphery.tick()
         msg = self.periphery._image_pubs['camera_depth'].messages[-1]
         self.assertEqual(msg.format, 'image/depth-zlib')
         self.assertEqual(zlib.decompress(bytes(msg.data)), raw)
-        self.assertEqual(msg.header.frame_id, 'camera_head_depth_optical_frame')
+        self.assertEqual(msg.header.frame_id, 'camera_head_color_optical_frame')
         self.assertEqual(msg.header.stamp.sec, 12)
         self.assertEqual(next(t for t in self.periphery.tools() if t['name']=='camera_depth')['topic_out'][0]['format'], 'image/depth-zlib')
         self.assertEqual(self.periphery.snapshot('camera_depth')['unit'], 'mm')
+        self.assertTrue(self.periphery.snapshot('camera_depth')['aligned_to_rgb'])
+        rgb = self.periphery.dispatch('camera_head', 'info')['camera_info'][0]
+        depth = self.periphery.dispatch('camera_depth', 'info')['camera_info'][0]
+        self.assertEqual((depth['id'], depth['K']), (rgb['id'], rgb['K']))
+        self.assertEqual(self.periphery.dispatch('camera_depth', 'info')['state'], 'running')
 
     def test_start_with_fresh_depth_does_not_request_hardware_again(self):
         with patch.object(peripherals_module.threading, 'Thread'):
             self.periphery.dispatch('camera_depth', 'start')
+        self.calibrate_head()
         raw = b'\x00\x00' * (640 * 480)
         self.periphery._on_image('camera_depth', {'format': 'image/depth-zlib',
-            'data': base64.b64encode(zlib.compress(raw)).decode()}, 1)
+            'data': base64.b64encode(zlib.compress(raw)).decode(),
+            'header': {'frame_id': 'camera_head_color_optical_frame'}}, 1)
         self.periphery._enabling.clear()
         self.periphery._camera_ensure = lambda card: self.fail('fresh source was enabled again')
         with patch.object(peripherals_module.threading, 'Thread') as worker:
             self.periphery.dispatch('camera_depth', 'start')
             worker.assert_not_called()
+
+    def test_native_or_misregistered_depth_is_not_published_as_aligned(self):
+        self.periphery.dispatch('camera_depth', 'start')
+        self.calibrate_head()
+        payload = {'format': 'image/depth-zlib',
+                   'data': base64.b64encode(zlib.compress(bytes(640*480*2))).decode(),
+                   'header': {'frame_id': 'camera_head_depth_optical_frame'}}
+        self.periphery._on_image('camera_depth', payload, 1)
+        self.assertFalse(self.periphery.snapshot('camera_depth')['valid'])
+        self.assertEqual(self.periphery.dispatch('camera_depth', 'info')['state'], 'loading')
+        payload['header']['frame_id'] = 'camera_head_color_optical_frame'
+        self.periphery._depth_registration = False
+        self.periphery._on_image('camera_depth', payload, 1)
+        self.assertFalse(self.periphery.snapshot('camera_depth')['valid'])
+
+    def test_idle_camera_declares_unknown_optics_without_borrowing_head_calibration(self):
+        self.calibrate_head()
+        left = self.periphery.dispatch('camera_left', 'info')
+        self.assertEqual(left['state'], 'idle')
+        self.assertIsNone(left['camera_info'][0]['K'])
+        self.assertIsNone(left['camera_info'][0]['half_fov_rad'])
+        self.assertEqual(left['camera_info'][0]['source'], 'unknown')
+        self.assertNotEqual(left['camera_info'][0]['id'],
+                            self.periphery.dispatch('camera_head', 'info')['camera_info'][0]['id'])
+
+    def test_reconnect_invalidates_camera_geometry_and_footprint(self):
+        self.calibrate_head()
+        self.periphery._footprint = {'half_width': .35}
+        self.ros.connection = (True, self.ros.connection[1] + 1)
+        self.periphery.tick()
+        self.assertFalse(self.periphery._depth_aligned())
+        self.assertIsNone(self.periphery.footprint())
 
     def test_depth_decoder_rejects_bad_size_trailing_data_and_expansion_bombs(self):
         self.periphery.dispatch('camera_depth', 'start')
@@ -301,14 +349,14 @@ class HostManagerTests(unittest.TestCase):
         with patch.object(self.module.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
             with patch.object(self.module.socket, 'create_connection'), patch.object(self.module.Path, 'is_file', return_value=True):
                 self.module.ensure_services('head')
-        self.assertEqual(run.call_args_list[0].args[0][-2:], ['kuavo5w-head-camera.service', 'kuavo5w-head-jpeg-relay.service'])
+        self.assertEqual(run.call_args_list[0].args[0][-3:], ['kuavo5w-head-camera.service', 'kuavo5w-head-jpeg-relay.service', 'kuavo5w-head-imu-relay.service'])
 
     def test_depth_scope_uses_only_its_fixed_services_and_rejects_arbitrary_paths(self):
         with patch.object(self.module.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
             with patch.object(self.module.socket, 'create_connection'), patch.object(self.module.Path, 'is_file', return_value=True):
                 self.module.ensure_services('depth')
         self.assertEqual(run.call_args_list[0].args[0], ['systemctl', 'start', '--no-block',
-            'kuavo5w-rosbridge.service', 'kuavo5w-head-camera.service', 'kuavo5w-head-depth-relay.service'])
+            'kuavo5w-rosbridge.service', 'kuavo5w-head-camera.service', 'kuavo5w-head-jpeg-relay.service', 'kuavo5w-head-imu-relay.service'])
         with patch.object(self.module, 'ensure_services', return_value={'requested': True}) as ensure:
             self.assertEqual(self.request(path='/ensure/depth'), 200)
             ensure.assert_called_once_with('depth')

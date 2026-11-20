@@ -191,7 +191,7 @@ FastDDS/std_msgs/sensor_msgs以及新增openssh-client/sshpass仅在基础镜像
 | `camera_left` | 左路 `/camera_1/color/image_raw/compressed`，原生 ROS2 `CompressedImage` / `image/jpeg` |
 | `camera_right` | 右路 `/camera_2/color/image_raw/compressed`，同上；保留源时间戳，空 frame_id 保持为空 |
 | `camera_head` | 头部 Orbbec Gemini335L，640×480 RGB JPEG；宿主机已有 Orbbec ROS1 驱动和 OpenCV/numpy 时安装转发 |
-| `camera_depth` | 头部原生640×480 uint16毫米深度，`image/depth-zlib` 无损压缩；0为无效距离，未对齐RGB |
+| `camera_depth` | 头部640×480 uint16毫米深度，经Orbbec SDK软件D2C对齐头部RGB；`image/depth-zlib` 无损压缩，0无效；仅在运行时验证像素几何一致后发布 |
 | `imu` | 优先独立 `/imu`，全身 raw 为备用；不再要求全身控制器存在才能读取 IMU |
 
 电池转发器校验现场三种已核实 topic/type/MD5 组合，动态加载发布者提供的有界定义，输出标准 String。
@@ -286,6 +286,13 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 | `model` | resource 读取 | 本地 `resource/kuavo5w_model.urdf` 参考骨架；离线可读 |
 
 `base_servo` 是轮式底盘连续伺服卡。在画布将 ActuCore navi 的 `control/velocity` 输出连接到它；Agent Core 在 start 传入 `input_topic`，并从返回值读取 `control_interface` 描述符。相机/深度连接对应传感器，里程计连接 `loco_state` 的 odom 流。
+
+视觉导航接线：`camera_head → vop → navi`（检测结果）、`camera_depth → navi`（米制深度）、`loco_state` 的 `state/odom → navi`，最后 `navi → base_servo`。需要预览叠加时，也可将 `camera_head` 的图像直接连入 navi。**不要把底盘 camera_left/right 的检测框与头部 camera_depth 混用**；它们来自不同镜头，像素位置不对应。底盘RGB如需视觉深度，应从同一路RGB生成 visual_depth。头部相机可转动，当前 navi 不补偿头部姿态，因此导航前须让头部朝正前，导航期间保持不动。
+
+四路相机在 `info/start` 返回 `motus.camera/1` 声明；分辨率取实际JPEG或深度图，内参K/D来自各自ROS CameraInfo，不复制其他型号的FOV。缺少标定时保持 unknown。头部深度只有在 `depth_registration=true`、RGB/深度都使用color optical frame、分辨率和K一致时，才与RGB共享镜头ID并输出有效帧；等待校验时为 loading。VOP沿输入传递镜头ID和分辨率，navi按声明的 `image/depth-zlib` 绑定深度，而非依赖话题名后缀。更新后须重新启动上游和navi，以刷新启动时冻结的声明。
+
+`base_servo.info.control_interface.footprint` 来自真机厂商 `/lqr_path_track/local_costmap/footprint` 加 padding，并标注 `source: estimate`、`arms: at-rest`；这不是实测全身安全包络。当前现场配置为±0.34m方形加0.01m padding，即前/后/半宽0.35m；高度未知，保持 null。其他同款机以其运行时参数为准。navi仍可提示估计包络，不应把这一提示当作缺失元数据；伸臂、头部姿态和实际避障效果须另行验证。
+
 
 速度协议与 R1 一致：ROS2 `std_msgs/String` JSON，`motus.control/1`、`mode=twist`、`dof=6`，机身系 `[vx,vy,vz,wx,wy,wz]`，单位 m/s、rad/s，vz/wx/wy 必须为零。复用主节点 domain 42 的隔离 DDS，工作线程经 rosbridge 转发 ROS1 `/cmd_vel`。期望10Hz、最大20Hz；校验序号、TTL和观测时间，300ms断流发零速、拒绝500ms以上旧观测；慢速使能完成后再次检查首帧是否过期，不执行积压旧目标。ROS2回调仅保留最新消息，不等待SSH或控制服务。
 
@@ -673,7 +680,7 @@ ROS master 缓存、具体 rosbridge 版本和真机控制器行为仍需现场�
 | `battery` | `/<namespace>/state/battery` | 扁平 main_/chassis_/small_ 标量字段，单位写在键名中；保留不同状态码，不将0V或缺失数据当作有效测量 |
 | `laser_scan` | `/<namespace>/state/laser_scan/points` | 首路 `sensor/pointcloud`：UInt8MultiArray 中 `<u32 step=16><u32 N><float32 x,y,z,intensity × N>`；z/intensity=0 |
 | `laser_scan` | `/<namespace>/state/laser_scan` | 原始 angle/range 元数据及测距 JSON；无效测距 null |
-| `camera_depth` | `/<namespace>/state/camera_depth` | CompressedImage，format=`image/depth-zlib`；zlib解压后640×480小端uint16毫米深度，0无效，保留采集header |
+| `camera_depth` | `/<namespace>/state/camera_depth` | CompressedImage，format=`image/depth-zlib`；zlib解压后640×480小端uint16毫米深度，0无效，RGB对齐后使用color optical frame并保留采集时间 |
 
 前端默认使用 topic_out 首路，因此雷达首路改为可视化点云，loco_state 首路改为位置/姿态展示。
 旧画布保存的卡名/输出可能需刷新驱动或重新添加卡片，驱动兼容旧配置 camera_rgb/camera_rgb_right 的开启设置。
@@ -794,3 +801,116 @@ error; native status changed from 1 to 2 and the driver completed after its
 stationary check. The factory request uses a 0.1 m position threshold. The test
 ended with confirmed whole-body disable and chassis software stop. This checks
 the short navigation/control-ownership path, not long-route or obstacle trials.
+
+### 2026-11-20 camera/navi geometry verification
+
+Compared the shared camera/control contracts with Bumi, Tianyi 2.0, R1 and the
+ActuCore navi consumer. Added camera-owned declarations and live factory costmap
+footprint provenance; no new Python/APT dependencies. The head SDK launch now
+requests software depth registration and frame sync. The installed Orbbec SDK
+supports SW D2C on Gemini 335L; runtime verification confirmed both CameraInfo
+streams use 640×480, `camera_head_color_optical_frame`, and identical K
+(fx=367.468933, fy=367.310486, cx=320.404572, cy=245.939484). The depth stream uses
+the RGB lens identity only after these checks; native/mismatched frames are
+rejected. Depth is uint16 millimetres with 0 invalid, compressed losslessly.
+
+A no-motion live integration test used head RGB → VOP, RGB-aligned hardware
+depth, and body-frame odometry. ActuCore correctly bound
+`/ubuntu/state/camera_depth` by its explicit `image/depth-zlib` declaration;
+this also requires the companion ActuCore role-binding fix, not only a driver
+update. The site ran an older ActuCore image without the newer declaration
+reader, so its local validation image also backported that reader and start
+argument forwarding. A future normal release should build from the updated
+ActuCore source rather than depend on the local validation image.
+
+VOP forwarded 640×480, K and the head lens ID; navi reported
+`objects_frame=[640,480]` and normalised all eight boxes in one sampled frame.
+An independent eight-second DDS read received 80 depth, 81 odom and 33 detection
+messages; the latest depth had 83.9% valid pixels. Navi adopted horizontal
+half-FOV 0.716 rad from K and the factory ±0.35 m estimated envelope. Remaining
+notes concerned that estimate, negotiated speed caps and adoption of real
+camera geometry, rather than missing inputs. These observations establish data
+compatibility, not navigation clearance or physical arrival performance.
+
+The project was stopped before the update, whole-body control remained software
+paused, `base_servo` had no input subscription and applied zero commands. No
+navigation target was sent. Temporary navi/VOP instances were stopped after the
+test; the project remains stopped for the operator to reconnect and start.
+The head must face forward and stay stationary during this navigation mode;
+head-to-base motion compensation and a measured full-body envelope remain
+outside this verification.
+
+### PR #519 camera, depth, IMU and odometry compatibility
+
+The Kuavo producer follows the numeric layouts reviewed in driver PR #519
+(head `090231d1477af7a60a4398d58e21d99d867694b4`). These are additional
+computation interfaces; the body IMU display and navigation velocity window
+keep their existing semantics.
+
+| Output | Format and parameters |
+| --- | --- |
+| `camera_head` | `image/jpeg`, 640×480; camera-owned `motus.camera/1` containing effective K, zero D, optical frame, lens ID and source-clock provenance |
+| `camera_depth` | `image/depth-zlib`, lossless little-endian uint16 millimetres, 640×480, zero invalid; the same rectified optical rays, K and lens ID as head RGB |
+| `imu.camera_imu` | Named `sensor/imu` output on `/ubuntu/state/camera_imu`; `std_msgs/msg/String` JSON with `schema=motus.imu/1` |
+| `loco_state` odom output | `state/odom`, `motus.odom/1`; body-frame velocity plus source `/odom` pose, xyzw quaternion, frames and covariance |
+
+One shared host RGB-D relay owns both public head image streams. It applies
+the measured RGB distortion and registered depth calibration to common
+rectified rays, rather than merely changing the metadata. Images and their
+CameraInfo retain each original source header. Pairing permits at most 50 ms
+capture skew. Its bounded 16-frame source buffers tolerate software registration
+transport delay without widening that capture-time bound; only the latest
+completed pair waits for encoding. Independent transport/consumer drops can
+still remove one member of a published pair. Left/right chassis cameras retain
+their own calibration and lens IDs and are not paired with head depth.
+
+The camera IMU port preserves integer `stamp_ns` and `accel_stamp_ns`, raw
+`angular_velocity` xyz in rad/s and `linear_acceleration` xyz in m/s². It carries
+SDK-internal `camera_from_gyro`/`camera_from_accel` rotations and the actual
+sensor origins as `camera_from_gyro_translation`/`camera_from_accel_translation`
+in metres. Raw vectors are not pre-rotated. The helper associates gyro/accel
+within 20 ms, drains bounded batches, and never substitutes body IMU values or
+invented zero lever arms. The existing first `data/json` output remains the
+independent body IMU display. Connect the named `camera_imu` port when using
+RGB-D IMU assistance, not that display output.
+
+Odometry includes `pose.stamp_ms`, `frame_id`, `child_frame_id`, position,
+quaternion and covariance. `vendor.motus_slam.stamp_ns` preserves exact source
+nanoseconds independently of the averaged navigation twist and its receipt-time
+fallback. A missing/invalid source pose is reported unavailable; it is not
+replaced by map localization or a fabricated pose. Wheel odometry drift remains
+unbounded.
+
+The host helpers and launch configuration are shipped in the image/bootstrap
+bundle and installed through the existing managed provisioning path. No new
+Python/APT dependency is required; rectification uses host OpenCV/NumPy and
+camera-internal transforms use the installed ROS1 SDK TF. The obsolete separate
+depth relay is stopped during upgrade.
+
+These interfaces do **not** supply a calibrated body-to-head-optical mount or
+verified cross-board clock synchronization. The articulated head must remain
+forward and stationary for the current navi path. SDK camera-internal IMU
+geometry is distinct from a measured camera-to-robot mounting transform. The
+installed Perception version does not include the PR371 RGB-D fusion backend;
+numeric producer compatibility and navi input tests do not establish full
+fusion, SLAM accuracy or navigation performance.
+
+2026-11-20 follow-up verification: 504 driver tests passed (one local OpenCV
+test skipped); all four RGB-D geometry/pairing tests passed on the actual host
+with OpenCV. The companion ActuCore navi suite passed 290 tests with 21 skips.
+A final eight-second DDS observation with the sensor cards explicitly started
+received 70 RGB images, 70 depth images, 989 camera IMU packets and 71 odometry
+packets. The latest depth had 89.3% nonzero pixels; the observed IMU gyro/accel
+skew was at most 0.0771 ms with no duplicate IMU timestamps. These are observed
+sample counts, not guaranteed output rates or calibrated timing accuracy.
+Independent readers can lose image pairs: the 50 ms bound belongs to the
+source relay's pairing, not nearest timestamps after separate DDS losses.
+
+The installed SDK also exhibited native IMU silence after camera service
+restarts. Restarting only the relay did not recover it; invoking the factory
+camera-only `reboot_device` service restored the native streams. This remains
+a restart-reliability limitation; no automatic camera reboot policy was added
+and the short successful data check does not establish reboot endurance.
+The project remains stopped, whole-body control software paused and base_servo
+disconnected with zero applied commands. Temporary navi/VOP instances were
+stopped; the final image is a local validation build, not a published release.

@@ -13,10 +13,12 @@ import math
 from pathlib import Path
 import threading
 import time
+import uuid
 import xml.etree.ElementTree as ET
 
 from std_msgs.msg import String
 from common.odom import build_interface, build_sample, mean_twist, resolve_stamp_ms
+from spatial_telemetry import odometry_pose, imu_packet
 
 
 LINK_ORDER = (['knee_link', 'leg_link', 'waist_link', 'waist_yaw_link'] +
@@ -134,6 +136,9 @@ class KuavoSensors:
         self._seen = {}
         self._errors = {}
         self._odom_window = deque(maxlen=2048)
+        self._odom_epoch = uuid.uuid4().hex
+        self._camera_imu, self._camera_imu_at = None, None
+        self._camera_imu_status = {'state': 'unavailable', 'reason': 'waiting for native camera IMU relay'}
         self._display_pose = {}
         self._pose_seen = None
         self._running = set()
@@ -153,6 +158,8 @@ class KuavoSensors:
         self._joint_state_pub = node.create_publisher(String, self._joint_state_topic, 1)
         self._joint_raw = None
         self._joint_raw_seen = None
+        self._camera_imu_topic = f'/{namespace}/state/camera_imu'
+        self._camera_imu_pub = node.create_publisher(String, self._camera_imu_topic, 20)
         self._loco_topic = f'/{namespace}/state/loco_state'
         self._loco_pub = node.create_publisher(String, self._loco_topic, 1)
         # Average all received odometry within each 10 Hz output window. Do not
@@ -164,6 +171,8 @@ class KuavoSensors:
             ros1.subscribe(topic, 'kuavo_msgs/sensorsData',
                            lambda msg, source=topic: self._on_joint_raw(msg, source), throttle_ms=100)
         ros1.subscribe(self._imu_topic, 'sensor_msgs/Imu', self._on_standard_imu)
+        ros1.subscribe('/motus/kuavo5w/camera_imu', 'std_msgs/String', self._on_camera_imu)
+        ros1.subscribe('/motus/kuavo5w/camera_imu/status', 'std_msgs/String', self._on_camera_imu_status)
         self._timer = node.create_timer(0.1, self.tick)
 
     def _session(self):
@@ -181,6 +190,8 @@ class KuavoSensors:
                 self._seen.clear()
                 self._errors.clear()
                 self._odom_window.clear()
+                self._odom_epoch = uuid.uuid4().hex
+                self._camera_imu, self._camera_imu_at = None, None
                 self._display_pose.clear()
                 self._pose_seen = self._joint_raw_seen = None
                 self._joint_raw = None
@@ -778,6 +789,52 @@ class KuavoSensors:
                 self._seen.pop('imu', None)
                 self._errors['imu'] = str(exc)
 
+    def _on_camera_imu_status(self, message):
+        try:
+            if not self._session()[0] or len(message.get('data', '')) > 8192:
+                return
+            status = json.loads(message['data'])
+            if isinstance(status, dict):
+                with self._lock:
+                    self._camera_imu_status = status
+        except (KeyError, ValueError, TypeError):
+            pass
+
+    def _on_camera_imu(self, message):
+        if not self._session()[0]:
+            return
+        try:
+            if len(message.get('data', '')) > 65536:
+                raise ValueError('oversized IMU packet')
+            packet = imu_packet(json.loads(message['data']))
+            with self._lock:
+                # Repeated bridge deliveries are not new captures.
+                if (self._camera_imu and packet.get('epoch') == self._camera_imu.get('epoch')
+                        and packet['stamp_ns'] <= self._camera_imu['stamp_ns']):
+                    return
+                self._camera_imu, self._camera_imu_at = packet, time.monotonic()
+                if 'imu' in self._running:
+                    out = String()
+                    out.data = json.dumps(packet, allow_nan=False, separators=(',', ':'))
+                    self._camera_imu_pub.publish(out)
+        except (KeyError, ValueError, TypeError) as error:
+            with self._lock:
+                self._camera_imu, self._camera_imu_at = None, None
+                self._camera_imu_status = {'state': 'unavailable', 'reason': str(error)}
+
+    def camera_imu_status(self):
+        with self._lock:
+            fresh = self._camera_imu_at is not None and time.monotonic()-self._camera_imu_at <= .5
+            packet = self._camera_imu if fresh else None
+            fusion = packet is not None and all(k in packet for k in
+                ('camera_from_gyro_translation', 'camera_from_accel_translation'))
+            return {'state': 'available' if packet else 'unavailable',
+                    'source': 'orbbec_camera_imu', 'body_display_source': self._imu_topic,
+                    'reason': None if packet else self._camera_imu_status.get('reason') or 'missing_or_stale_camera_imu',
+                    'fusion': {'state': 'available' if fusion else 'unavailable',
+                               'reason': None if fusion else 'fresh raw vectors, rotations and sensor origins required'},
+                    'relay': copy.deepcopy(self._camera_imu_status)}
+
     def _on_odom(self, message):
         if not self._session()[0]:
             return
@@ -796,6 +853,13 @@ class KuavoSensors:
                     **provenance, 'topic': '/odom', 'header': copy.deepcopy(message.get('header', {})),
                     'child_frame_id': message['child_frame_id'],
                     'pose': json_safe(message.get('pose')), 'twist': json_safe(message['twist'])}}
+                try:
+                    pose, quality = odometry_pose(message, self._odom_epoch)
+                except (KeyError, TypeError, ValueError) as error:
+                    pose, quality = None, {'profile': 'motus_slam/1', 'status': 'unavailable',
+                                           'reason': str(error), 'pose_source': '/odom'}
+                self._data['loco_state']['pose'] = pose
+                self._data['loco_state']['vendor']['motus_slam'] = quality
                 self._seen['loco_state'] = time.monotonic()
                 self._errors.pop('loco_state', None)
                 self._odom_window.append((time.monotonic(), [values[0], values[1], None, None, None, values[2]]))
@@ -839,7 +903,8 @@ class KuavoSensors:
                 if valid and not window:
                     valid, reason = False, 'no_new_odometry_samples'
                 payload = build_sample(stamp_ms=payload.get('stamp_ms', int(time.time()*1000)),
-                    twist=mean_twist(window), vendor={**payload.get('vendor', {}), 'samples': len(window)})
+                    twist=mean_twist(window), pose=payload.get('pose'),
+                    vendor={**payload.get('vendor', {}), 'samples': len(window)})
             elif card == 'joints' and not valid:
                 payload['joints'] = []
             return {**payload, 'valid': bool(valid), 'reason': reason,
@@ -872,7 +937,7 @@ class KuavoSensors:
 
     def tools(self):
         descriptions = {'joints': '全身控制器实测20关节；控制器未启动时 invalid，参考骨架不冒充实际姿态',
-                        'imu': '独立 /imu 实测姿态/角速度/加速度，不依赖全身控制器；不将其套到骨架根节点',
+                        'imu': '首路独立 /imu 展示；camera_imu计算口输出相机原始gyro/accel、采集纳秒时间和SDK内部旋转/传感器原点，供RGB-D辅助。缺少真实数据时明确unavailable',
                         'loco_state': '位置/姿态/速度展示 + 独立 actucore navi motus.odom/1 里程计；区分 map 定位与 odom'}
         tools = [{'name': name, 'type': 'sensor', 'multiInstance': False,
                   'description': description, 'inputSchema': {'type': 'object', 'properties': {}},
@@ -883,6 +948,9 @@ class KuavoSensors:
             if tool['name'] == 'joints':
                 tool['topic_out'].append({'topic': self._joint_state_topic, 'format': 'data/json',
                                           'desc': 'joint_state 原始关节数组，不依赖显示模型校验'})
+            elif tool['name'] == 'imu':
+                tool['topic_out'].append({'name': 'camera_imu', 'topic': self._camera_imu_topic,
+                    'format': 'sensor/imu', 'desc': 'motus.imu/1 原始相机陀螺仪/加速度及SDK内部外参；用于RGB-D里程计，非首路底盘IMU展示'})
             elif tool['name'] == 'loco_state':
                 tool['topic_out'].insert(0, {'topic': self._loco_topic, 'format': 'data/json',
                                             'desc': '位置、角度和速度；frame与来源明确标注'})
@@ -915,10 +983,14 @@ class KuavoSensors:
                       'feedback': self.loco_display() if card == 'loco_state' else self.snapshot(card)}
             if card == 'joints':
                 result['skeleton_model'] = self.health()['skeleton_model']
-            if card in self._running:
+            if card == 'imu':
+                result['imu_status'] = self.camera_imu_status()
+            if card in self._running or card in ('imu', 'loco_state'):
                 result['topic_out'] = next(t['topic_out'] for t in self.tools() if t['name'] == card)
             if card == 'loco_state':
-                result['odom_interface'] = build_interface(provides=['vx', 'vy', 'wz'], rate_hz=10)
+                result['odom_interface'] = build_interface(provides=['vx', 'vy', 'wz'], rate_hz=10, pose_drift='unbounded')
+                result['odom_interface']['slam_pose'] = {'available': True, 'profile': 'motus_slam/1',
+                    'source': '/odom', 'clock_id': 'ros1_odom_header', 'synchronization': 'unverified'}
             return result
 
     def close(self):

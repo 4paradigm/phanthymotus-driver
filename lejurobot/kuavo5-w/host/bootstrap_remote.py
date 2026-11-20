@@ -18,12 +18,12 @@ import tempfile
 FILES = {'config.yaml', 'host/install.py', 'host/install_controller.py',
          'host/controller_boot.py', 'host/install_speaker.py', 'host/speaker_relay.py',
          'host/rosbridge_loopback.py', 'host/rosbridge.launch', 'host/runtime_manager.py',
-         'host/battery_relay.py', 'host/head_camera.launch', 'host/head_jpeg.py', 'host/head_depth.py'}
+         'host/battery_relay.py', 'host/head_camera.launch', 'host/head_jpeg.py', 'host/head_depth.py', 'host/rgbd_geometry.py', 'host/head_imu.py', 'host/head_rgbd.py'}
 ROOTS = {'host': Path('/opt/phanthy-motus/kuavo5w-host'),
          'controller': Path('/opt/phanthy-motus/kuavo5w-controller'),
          'chassis': Path('/opt/phanthy-motus/kuavo5w-speaker')}
 OWNED = {'host': ('rosbridge_loopback.py', 'rosbridge.launch', 'runtime_manager.py',
-                 'battery_relay.py', 'head_camera.launch', 'head_jpeg.py', 'head_depth.py'),
+                 'battery_relay.py', 'head_camera.launch', 'head_jpeg.py', 'head_depth.py', 'rgbd_geometry.py', 'head_imu.py', 'head_rgbd.py'),
          'controller': ('controller_boot.py',), 'chassis': ('speaker_relay.py',)}
 UNIT_DIR = Path('/etc/systemd/system')
 CONTROLLER_RUNTIME = Path('/run/kuavo5w-controller')
