@@ -12,6 +12,11 @@ from device import Adapter, VERSION
 from vendor import RobotReader
 
 
+READY_STATUS = {'working_mode': 'developer_mode', 'working_mode_valid': True, 'motor': 'OK',
+                'collision_enable_valid': True, 'collision_enable': True,
+                'compliant_enable_valid': True, 'compliant_enable': False}
+
+
 class EefWiringTests(unittest.IsolatedAsyncioTestCase):
     def adapter(self, *cards):
         settings = {'enabled_cards': list(cards), 'serial': '', 'stale_after_seconds': 5}
@@ -47,10 +52,18 @@ class EefWiringTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_streams_handover_by_pause_and_explicit_commands_preempt(self):
         a = self.adapter('servo_eef', 'loco_servo_arm', 'arm_control')
+        a.reader.connected = True
+        a.reader.configuration = {'mode': 'upper_limb', 'state': 'identified'}
+        a.reader.info, a.reader.info_at = READY_STATUS.copy(), time.monotonic()
         a.servo_eef.publisher = a.arm_servo.publisher = Mock()
         try:
             started = await a.execute_tool('servo_eef', {'action': 'start'})
             self.assertEqual(started['state'], 'ready')
+            with a.reader.pose_servo({'motion_tool': 'servo_eef'}):
+                for action in ('start', 'resume'):
+                    repeated = await a.execute_tool('servo_eef', {'action': action})
+                    self.assertEqual(repeated['state'], 'ready')
+            a.servo_eef.publisher.subscribe_json.assert_called_once()
             joint_start = {'action': 'start', 'input_topic': '/test/joint'}
             with self.assertRaisesRegex(ValueError, 'other arm servo'):
                 await a.execute_tool('loco_servo_arm', joint_start)
@@ -81,9 +94,7 @@ class EefWiringTests(unittest.IsolatedAsyncioTestCase):
         reader.read_move_pose = AsyncMock(side_effect=lambda: dict(poses, timestamp=time.time_ns() // 1_000_000))
         reader.read_gripper = AsyncMock(side_effect=lambda: {'result': 'success',
             'timestamp': time.time_ns() // 1_000_000, 'left_opening': 40, 'right_opening': 47})
-        reader.sample = Mock(return_value={'available': True, 'data': {'working_mode': 'developer_mode',
-            'working_mode_valid': True, 'motor': 'OK', 'collision_enable_valid': True, 'collision_enable': True,
-            'compliant_enable_valid': True, 'compliant_enable': False}})
+        reader.sample = Mock(return_value={'available': True, 'data': READY_STATUS})
         reader.send_move_p = AsyncMock(return_value={'status': 'accepted'})
         reader.send_gripper = AsyncMock()
         frames = asyncio.Queue()

@@ -130,8 +130,9 @@ class EefServo:
                 "accepted": self.accepted, "rejected": self.rejected, "queue_full": self.overruns,
                 "active_arms": list(self.active_arms), "last": self.last, "activity": self.activity}
 
-    def _ready(self):
-        self.adapter.arm_servo._conflict()
+    def _ready(self, *, check_owner=True):
+        if check_owner:
+            self.adapter.arm_servo._conflict()
         status = self.reader.sample("robot_status")
         data = status.get("data") or {}
         if (Path(os.environ.get("TRON2_MOTION_MAINTENANCE_FILE", "/config/tron2/motion-maintenance.json")).exists()
@@ -373,19 +374,21 @@ class EefServo:
         if action not in ("start", "resume"):
             raise ValueError("Unsupported servo_eef action")
         if action == "start" and self.running or action == "resume" and (not self.running or not self.paused):
+            if self.running and not self.paused:
+                # A repeated start/resume already owns its stream and may be sending MoveP.
+                self._ready(check_owner=False)
             return self.info()
         if self.running:
             await self.preempt()
-        else:
+        self._ready()
+        if not self.running:
             topics = args.get("input_topics") or [CONTROL_TOPIC]
             topic = args.get("input_topic") or topics[0]
             if not isinstance(topic, str) or not topic.startswith("/") or len(topic) > 256:
                 raise ValueError("Expected an absolute control/eef topic name")
             self.topic = topic
-        self.adapter.arm_servo._conflict()
-        self.paused = False
         self._subscribe()
-        self.running = True
+        self.running, self.paused = True, False
         return self.info()
 
     async def close(self):

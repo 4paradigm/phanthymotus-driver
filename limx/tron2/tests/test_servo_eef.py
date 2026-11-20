@@ -91,6 +91,35 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(math.isfinite(args[2]) and args[2] > 0)
         self.assertIsNotNone(args[3])
 
+    async def test_start_and_resume_require_ready_robot_before_subscribing(self):
+        for action, end, expected in (('start', 'stop', 'idle'), ('resume', 'pause', 'paused')):
+            with self.subTest(action=action):
+                await self.servo.call({'action': end})
+                self.reader.sample.return_value = {'available': False, 'data': None}
+                with self.assertRaisesRegex(ValueError, 'unavailable'):
+                    await self.servo.call({'action': action})
+                self.assertEqual(self.servo.info()['state'], expected)
+                self.assertIsNone(self.servo.publisher.callback)
+                self.reader.sample.return_value = {'available': True, 'data': READY}
+                result = await self.servo.call({'action': action})
+                self.assertEqual(result['state'], 'ready')
+                self.assertIsNotNone(self.servo.publisher.callback)
+        self.reader.send_move_p.assert_not_awaited()
+        self.reader.send_gripper.assert_not_awaited()
+
+    async def test_robot_losing_readiness_after_start_rejects_motion_frame(self):
+        self.reader.sample.return_value = {'available': True, 'data': dict(READY, collision_enable=False)}
+        for action in ('start', 'resume'):
+            with self.assertRaisesRegex(ValueError, 'unavailable'):
+                await self.servo.call({'action': action})
+        target = self.measured.copy()
+        target[0] += .003
+        target[7] += .005
+        await self.feed(target)
+        self.assertEqual(self.servo.last['status'], 'rejected')
+        self.reader.send_move_p.assert_not_awaited()
+        self.reader.send_gripper.assert_not_awaited()
+
     async def test_feedback_echo_and_gripper_only_do_not_write_movep(self):
         now = time.time_ns() // 1_000_000
         self.observed[now] = self.measured.copy()
