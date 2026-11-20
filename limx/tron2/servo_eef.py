@@ -96,6 +96,12 @@ class EefServo:
                 "inputSchema": {"type": "object", "required": ["action"], "properties": {
                     "action": {"type": "string", "enum": ["start", "stop", "pause", "resume", "info"]},
                     "input_topic": {"type": "string", "default": CONTROL_TOPIC}},
+                    "x-action-params": {
+                        "start": {"params": ["input_topic"], "description": "Subscribe to the EEF control topic."},
+                        "stop": {"params": [], "description": "Unsubscribe and stop accepting EEF targets."},
+                        "pause": {"params": [], "description": "Pause the stream and clear queued targets."},
+                        "resume": {"params": [], "description": "Resume on the same topic with fresh EEF targets."},
+                        "info": {"params": [], "description": "Read the stream status and control descriptor."}},
                     "x-hooks": {"on_interrupt_motion": {"action": "pause"}, "on_interrupt_all": {"action": "pause"}},
                     "x-is-dangerous": True, "x-resource": ["arm_l", "arm_r", "gripper_l", "gripper_r"]},
                 "topic_in": [{"format": "control/eef", "topic": CONTROL_TOPIC}]}

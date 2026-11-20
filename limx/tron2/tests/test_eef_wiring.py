@@ -36,7 +36,13 @@ class EefWiringTests(unittest.IsolatedAsyncioTestCase):
         a = self.adapter('servo_eef')
         self.assertEqual([t['name'] for t in a.tools()], ['servo_eef'])
         self.assertIs(a.servo_eef.state, a.eef_state)
-        port = a.tools()[0]['topic_in'][0]
+        tool = a.tools()[0]
+        schema = tool['inputSchema']
+        actions = schema['x-action-params']
+        self.assertEqual(set(actions), set(schema['properties']['action']['enum']))
+        for action, declaration in actions.items():
+            self.assertEqual(declaration['params'], ['input_topic'] if action == 'start' else [], action)
+        port = tool['topic_in'][0]
         self.assertEqual((port['topic'], port['format']), ('/limx_tron2/control/eef', 'control/eef'))
         info = await a.execute_tool('servo_eef', {'action': 'info'})
         interface = info['control_interface']
