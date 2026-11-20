@@ -29,7 +29,7 @@ def main():
     parser.add_argument('--user', required=True)
     parser.add_argument('--master', required=True)
     parser.add_argument('--ros-ip', default='192.168.26.22')
-    parser.add_argument('--volume', type=int, default=30)
+    parser.add_argument('--volume', type=int, default=50)
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('run on the chassis with sudo')

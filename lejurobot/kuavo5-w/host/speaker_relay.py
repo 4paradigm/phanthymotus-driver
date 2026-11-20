@@ -22,7 +22,7 @@ SINK = 'alsa_output.pci-0000_00_1f.3.analog-stereo'
 
 
 class PcmSink:
-    def __init__(self, volume=30):
+    def __init__(self, volume=50):
         self.volume = volume
         self.lock = threading.RLock()
         self.session = None
@@ -201,7 +201,7 @@ class RegistrationWatch:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--volume', type=int, default=30)
+    parser.add_argument('--volume', type=int, default=50)
     args = parser.parse_args()
     if not 0 <= args.volume <= 100:
         parser.error('volume must be from 0 to 100')

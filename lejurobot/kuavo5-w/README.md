@@ -429,7 +429,7 @@ SSH RPC 辅助源码随镜像构建，每次在底盘执行固定操作，使用
 正常部署由容器自动安装到底盘。以下仅为人工排障时的等价命令，在**独立底盘电脑**执行：
 
 ```sh
-sudo python3 host/install_speaker.py --user jt --master http://192.168.26.1:11311 --ros-ip 192.168.26.22 --volume 30
+sudo python3 host/install_speaker.py --user jt --master http://192.168.26.1:11311 --ros-ip 192.168.26.22 --volume 50
 ```
 
 仅使用该机已有ROS Noetic、`paplay/pactl`和PulseAudio；不安装SDK、声卡库或TTS引擎，不在播放器中保存SSH凭据；默认连接值集中于驱动，私有覆盖密码另存于部署配置。
@@ -455,7 +455,7 @@ EOF只作结束标记跳过，后续PCM继续播放；如需清空已排队PCM�
 `set_volume(volume=0..100)` 设置本PCM播放流的数字增益；0静音、100原始幅度。
 百分比使用原PulseAudio的立方增益曲线，避免同为30%时升级后突然变响。
 底盘确认request_id后才返回成功，`get_volume`实时读取底盘值，可在未start时使用，也可播放中更改。
-音量变化不重启播放进程/会话；`--volume`只设服务启动默认值30%。`info.output_status.volume_percent`显示底盘值；
+音量变化不重启播放进程/会话；`--volume`只设服务启动默认值50%。`info.output_status.volume_percent`显示底盘值；
 不修改系统主音量、不停止厂商导航提示音。`output_status.bytes_written`是写入播放器的字节数，
 不是麦克风回录证明。2026-11-18现场已通过完整ROS2→rosbridge→底盘链路播放三遍“待命中”，
 124416字节全部写入，操作人员确认听到，stop确认idle；完整断电后音频自启动仍待复验。

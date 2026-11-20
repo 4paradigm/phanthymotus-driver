@@ -197,6 +197,7 @@ class BootstrapTests(unittest.TestCase):
         import yaml
         settings = yaml.safe_load((ROOT / 'config.yaml').read_text())['provisioning']
         manager = bootstrap.AutoProvisioner(settings)
+        self.assertEqual(manager._target('chassis')['volume'], 50)
         for role in bootstrap.DEFAULTS:
             self.assertNotIn('address', settings.get(role, {}))
             self.assertNotIn('user', settings.get(role, {}))
@@ -357,6 +358,8 @@ class RemoteTests(unittest.TestCase):
                  patch.object(remote, 'dependencies'), patch.object(remote, 'run', side_effect=execute) as run:
                 first = remote.install(request)
                 second = remote.install(request)
+                installer = next(c.args[0] for c in run.call_args_list if c.args[0][0] == 'python3')
+                self.assertEqual(installer[installer.index('--volume') + 1], '50')
                 self.assertTrue(first['changed'])
                 self.assertFalse(second['changed'])
                 self.assertEqual(len([c for c in run.call_args_list if c.args[0][0] == 'python3']), 1)

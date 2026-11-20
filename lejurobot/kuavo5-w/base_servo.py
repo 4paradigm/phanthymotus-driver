@@ -138,8 +138,17 @@ class BaseServo:
                     'applied': self._applied, 'last': self._last, 'error': self._error,
                     'startup': startup, 'control_ownership': self.bundle.control_ownership()}
 
-    def _start_reply(self):
+    def _lifecycle_reply(self):
         status = self.info()
+        # A previous stream fault is diagnostic, not a failure of the current
+        # successful lifecycle action. info() retains the original error.
+        previous_error = status.pop('error', None)
+        if previous_error:
+            status['last_stream_error'] = previous_error
+        return status
+
+    def _start_reply(self):
+        status = self._lifecycle_reply()
         return {**status, 'state': 'ready', 'stream_state': status['state']}
 
     def dispatch(self, action, args):
@@ -195,7 +204,7 @@ class BaseServo:
                     # Returning info() here makes MCP mark this successful stop
                     # as isError; keep those diagnostics on the info action.
                     return {'state': 'idle'}
-                return self.info()
+                return self._lifecycle_reply()
             if action == 'resume':
                 with self._lock:
                     if self._subscription is None:

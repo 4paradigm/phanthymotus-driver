@@ -325,6 +325,11 @@ class SinkTests(unittest.TestCase):
     def packet(self, pcm=b'\0\0', seq=0, session='test'):
         return json.dumps({'session': session, 'seq': seq, 'pcm': base64.b64encode(pcm).decode()})
 
+    def test_default_volume_is_fifty_and_stop_preserves_an_explicit_volume(self):
+        self.assertEqual(relay.PcmSink().status()['volume_percent'], 50)
+        configured = relay.PcmSink(volume=17)
+        self.assertEqual(configured.stop()['volume_percent'], 17)
+
     def test_volume_control_changes_only_pcm_gain_and_acknowledges_request(self):
         for volume, expected in ((0, (0, 0)), (50, (250, -250)), (100, (2000, -2000))):
             request_id = uuid4().hex
@@ -338,7 +343,7 @@ class SinkTests(unittest.TestCase):
             self.sink.receive_volume(json.dumps({'volume': volume, 'request_id': uuid4().hex}))
         for raw in ('[]', '{}', 'invalid', 'x' * 201):
             self.sink.receive_volume(raw)
-        self.assertEqual(self.sink.volume, 30)
+        self.assertEqual(self.sink.volume, 50)
         self.assertIsNone(self.sink.volume_request_id)
 
     def test_old_session_and_duplicate_packets_do_not_extend_lease(self):

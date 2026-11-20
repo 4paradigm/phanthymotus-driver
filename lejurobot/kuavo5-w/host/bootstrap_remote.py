@@ -272,7 +272,7 @@ def install(request):
                     raise Blocked('automatic_initialization_not_authorized')
                 command += ['--confirm-auto-initialize-and-pause']
             elif role == 'chassis':
-                volume = target.get('volume', 30)
+                volume = target.get('volume', 50)
                 if type(volume) is not int or not 0 <= volume <= 100:
                     raise Blocked('invalid_speaker_volume')
                 command += ['--volume', str(volume)]

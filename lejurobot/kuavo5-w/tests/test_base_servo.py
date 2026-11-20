@@ -112,6 +112,27 @@ class BaseServoTests(unittest.TestCase):
         finally:
             self.call('base_servo', 'stop')
 
+    def test_start_and_pause_do_not_fail_mcp_because_of_a_previous_stream_error(self):
+        import test_main
+        http = test_main.McpTests()
+        self.start()
+        self.servo._error = 'previous stream verification failure'
+        with patch.dict(sys.modules, {'std_msgs.msg': fixtures.std}), \
+                patch.object(test_main.main, '_bundle', self.bundle):
+            for action in ('start', 'pause', 'stop', 'start', 'pause'):
+                _, response = http.request(http.rpc('base_servo', {
+                    'action': action, 'input_topic': '/actucore/navi/cmd'}))
+                result = json.loads(response['result']['content'][0]['text'])
+                self.assertFalse(response['result'].get('isError', False), (action, result))
+                self.assertEqual(result['state'], {'start': 'ready', 'pause': 'paused', 'stop': 'idle'}[action])
+                if action != 'stop':
+                    self.assertEqual(result['last_stream_error'], 'previous stream verification failure')
+                self.assertEqual(self.servo.info()['error'], 'previous stream verification failure')
+        self.assertFalse(self.ros.published)
+        self.assertFalse(self.ros.sent_services)
+        self.assertEqual(self.call('base_servo', 'resume')['state'], 'running')
+        self.assertIsNone(self.servo.info()['error'])
+
     def test_stop_does_not_confirm_idle_when_subscription_cleanup_raises(self):
         self.start()
         with patch.object(self.node, 'destroy_subscription', side_effect=RuntimeError('cleanup failed')):
