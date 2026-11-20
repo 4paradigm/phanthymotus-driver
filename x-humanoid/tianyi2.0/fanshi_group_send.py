@@ -62,10 +62,63 @@ def _interpret(status, raw):
             raise ValueError()
     except (ValueError, UnicodeError):
         return _reply("unknown", "平台响应格式异常，请先核对群内是否收到。")
-    if codes[0] != 0 or (detail or {}).get("fail"):
-        return _reply("failed", "平台拒绝请求或 data.fail 包含失败群，请检查群 ID 和权限。",
-                      platform_code=codes[0])
+    failures = (detail or {}).get("fail")
+    if codes[0] != 0 or failures:
+        # Keep numeric per-group diagnostics; never echo a request or Webhook.
+        failed_groups = {}
+        if isinstance(failures, dict):
+            for group, value in list(failures.items())[:32]:
+                if re.fullmatch(r"[0-9]{1,20}", str(group)):
+                    if type(value) is int:
+                        failed_groups[str(group)] = value
+                    elif isinstance(value, str) and re.fullmatch(r"-?[0-9]{1,12}", value):
+                        failed_groups[str(group)] = int(value)
+                    else:
+                        failed_groups[str(group)] = "detail_unavailable"
+        message = ("平台拒绝请求，请结合 platform_code 排查。"
+                   if codes[0] != 0 else
+                   "平台返回群投递失败，请查看 failed_groups 错误码；不能仅凭此认定为权限问题。")
+        return _reply("failed", message, platform_code=codes[0],
+                      has_group_failures=bool(failures), failed_groups=failed_groups)
     return _reply("accepted", "平台接受消息且无失败群；最终到达及图片展示以群内为准。")
+
+
+def _split_payload(payload):
+    """Plan requests before sending; no mixed request or fallback retry."""
+    body = payload["message"]["body"]
+    has_text = any(item["type"] == "TEXT" for item in body)
+    has_image = any(item["type"] == "IMAGE" for item in body)
+    if not (has_text and has_image):
+        return [("image" if has_image else "text", payload)]
+    requests = []
+    for kind, items in (
+        ("text", [item for item in body if item["type"] != "IMAGE"]),
+        ("image", [item for item in body if item["type"] == "IMAGE"]),
+    ):
+        request = copy.deepcopy(payload)
+        request["message"]["body"] = copy.deepcopy(items)
+        requests.append((kind, request))
+    return requests
+
+
+def _combine_results(parts):
+    accepted = sum(part["status"] == "accepted" for part in parts)
+    if len(parts) == 1:
+        result = {key: value for key, value in parts[0].items()
+                  if key not in ("part", "attempted")}
+    elif accepted == len(parts):
+        result = _reply("accepted", "文字和图片已分别被平台接受，群内将显示为两条消息。")
+    elif any(part["status"] == "unknown" for part in parts):
+        result = _reply("unknown", "部分结果未确认；查看 parts 和群聊，勿整组重发。")
+    elif accepted:
+        result = _reply("partial", "仅部分消息被平台接受；查看 parts，勿重复发送已成功部分。")
+    elif parts[0]["status"] == "cancelled":
+        result = _reply("cancelled", "发送前卡片停止或配置改变，本组消息未发送。")
+    else:
+        result = _reply("failed", "发送失败，后续部分未发送；请查看 parts 的具体错误。")
+    result.update(parts=parts, accepted_parts=accepted, total_parts=len(parts),
+                  request_count=sum(part["attempted"] for part in parts))
+    return result
 
 
 def _complete(action_id, result):
@@ -111,6 +164,8 @@ class FanshiGroupSendPlugin:
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
             "description": (
                 "向预先配置的范式+群发送文字和可选单张图片、@一个成员。"
+                "同时提供文字和图片时，依次发送两条消息，用同一 action_id 跟踪。"
+                "全部 accepted 才表示整组被接受；partial 表示部分成功，勿整组重发。"
                 "无需原消息 ID。send 返回 queued 只表示已排队；等待完成回执，"
                 "或用 result 查询 action_id；accepted 才表示平台接受。"
                 "unknown 时先核对群聊，不自动重发。图片使用拍照工具返回的真实 path。"
@@ -202,6 +257,33 @@ class FanshiGroupSendPlugin:
             body.append({"type": "AT", "atuserids": [userid.strip()], "atall": False})
         return {"message": {"header": {"toid": [group]}, "body": body}}
 
+    def _send_parts(self, action_id, settings, generation, payload):
+        planned = _split_payload(payload)
+        parts = []
+        for kind, request in planned:
+            with self._lock:
+                cancelled = not self._active or generation != self._generation
+            if cancelled:
+                outcome = _reply("cancelled", "该部分提交前卡片已停止或配置改变。")
+                attempted = False
+            else:
+                attempted = True
+                try:
+                    outcome = _interpret(*_post_json(settings[0], request))
+                except (OSError, URLError, ValueError):
+                    outcome = _reply("unknown", "网络错误或超时；未自动重试，请先核对群聊。")
+                except Exception:
+                    outcome = _reply("unknown", "发送结果未确认；未自动重试，请先核对群聊。")
+            parts.append({**outcome, "part": kind, "attempted": attempted})
+            with self._lock:
+                self._jobs[action_id]["parts"] = copy.deepcopy(parts)
+            if outcome["status"] != "accepted":
+                break
+        for kind, _ in planned[len(parts):]:
+            parts.append({**_reply("not_sent", "前一部分未确认成功，本部分未发送。"),
+                          "part": kind, "attempted": False})
+        return _combine_results(parts)
+
     def _worker(self, action_id, settings, generation, payload):
         with self._lock:
             cancelled = not self._active or generation != self._generation
@@ -211,7 +293,7 @@ class FanshiGroupSendPlugin:
             result = _reply("cancelled", "提交前卡片已停止或配置改变，没有发送本条消息。")
         else:
             try:
-                result = _interpret(*_post_json(settings[0], payload))
+                result = self._send_parts(action_id, settings, generation, payload)
             except (OSError, URLError, ValueError):
                 result = _reply("unknown", "网络错误或超时；未自动重试，请先核对群聊。")
             except Exception:
@@ -269,6 +351,7 @@ class FanshiGroupSendPlugin:
             return _reply("failed", str(exc))
         except OSError:
             return _reply("failed", "图片不存在或不可读，请使用驱动中的实际路径。")
+        request_cost = len(_split_payload(payload))
         with self._lock:
             if not self._active or generation != self._generation:
                 return _reply("failed", "准备发送期间卡片停止或配置变化，请核对后重新操作。")
@@ -277,9 +360,11 @@ class FanshiGroupSendPlugin:
             now = time.monotonic()
             while self._recent and now - self._recent[0] >= 60:
                 self._recent.popleft()
-            if len(self._recent) >= 30:
-                return _reply("failed", "达到本进程每分钟 30 次的发送限制。")
-            self._recent.append(now)
+            if len(self._recent) + request_cost > 30:
+                return _reply("failed", "达到本进程每分钟 30 次请求的限制；图文一组占两次。")
+            # Reserve the entire group so the second request cannot exceed the cap.
+            # Unused reservations expire normally; failures never trigger retries.
+            self._recent.extend([now] * request_cost)
             action_id = "fanshi_" + uuid4().hex
             queued = _reply("queued", "已排队，等待完成回执或使用 result 查询；尚未确认平台接受。",
                             state="running", action_id=action_id)

@@ -162,10 +162,10 @@ class FanshiTests(unittest.TestCase):
             photo.write_bytes(raw)
             self.assertEqual(self.finish(self.send(image_path=str(photo)))["status"], "accepted")
             payload = self.post.call_args.args[1]
-            self.assertEqual(base64.b64decode(payload["message"]["body"][1]["content"]), raw)
+            self.assertEqual(base64.b64decode(payload["message"]["body"][0]["content"]), raw)
             photo.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 750000)
             self.assertFalse(self.send(image_path=str(photo))["ok"])
-            self.assertEqual(self.post.call_count, 1)
+            self.assertEqual(self.post.call_count, 2)
 
     def test_image_path_and_symlink_escape_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
