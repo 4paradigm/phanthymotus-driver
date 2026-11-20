@@ -25,5 +25,5 @@
 - 新增只读独立 `joint/scope` 订阅，按现有20轴名称映射 `motor_torque_nm`；双臂及躯干18轴另有 `gravity_torque_nm`，头部没有该值时保留null。
 - 角度流和力矩流分别判断新鲜度，1秒力矩过期后清空；scope消息不能延长位置年龄。只有位置、力矩均有效才合入同一输出。分别记录接收时间，不宣称两路严格同步。
 - `torque_status.feedback_source=motor_torque`、`gravity_source=robot_model`、`unit=Nm`；`physical_validity_verified=false`。
-- 当前通过通用 `joint_status` 最新视图查看 `motor_torques_nm` 和 `gravity_torques_nm`，单位 Nm；缺失值不补零。
+- 力矩随骨架消息逐轴发布（`joints[].motor_torque_nm` / `gravity_torque_nm`，单位 Nm），不再另设状态 topic；缺失值不补零。
 - 静止样本电机反馈全为0，仅能证明上报内容如此；没有厂家逐轴有效标志，不代表真实受力为零或测量链正常。未进行运动、使能或加载校验。未额外启动或修改原厂诊断录波通道。

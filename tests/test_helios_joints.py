@@ -210,9 +210,11 @@ def _check_model_and_mcp_resource(source):
         root = ET.fromstring(model["urdf"])
         assert len(root.findall("link")) == 21  # Synthetic fixture, not manufacturer geometry.
         assert {j.get("name") for j in root.findall("joint") if j.get("type") != "fixed"} == set(JOINT_NAMES)
-        skeleton, status = plugin.payloads()
+        skeleton = plugin.payload()
         assert skeleton["joints"] == [] and not skeleton["available"]
-        assert status["state"] == "idle" and status["angles_rad"] == {}
+        assert skeleton["state"] == "idle" and skeleton["message"] == "状态订阅已停止"
+        assert plugin.get_tools()[0]["topic_out"] == [
+            {"topic": "/rokae_helios/state/joints", "format": "sensor/skeleton"}]
         rpc("tools/call", {"name": "model", "arguments": {}})
         assert source['requests'] == ['/api/robot_3d_model', '/model.urdf']  # Cached per source.
     finally:

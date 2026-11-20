@@ -89,3 +89,49 @@ def test_reject_redirect_and_mismatched_or_oversized_model():
         server['xml'] = 'x' * (1024 * 1024 + 1)
         with pytest.raises(ValueError, match='size limit'):
             fetch_model(server['state_url'])
+
+
+def _head_model(rpy="0 0 0", axis="0 1 0"):
+    # Original test geometry: a head frame offset sideways with mirrored child mounts.
+    return ('<robot name="head_test"><link name="head_link_1"/>'
+            '<link name="head_link_2"><visual><origin xyz="0 0 0" rpy="0 0 0"/></visual></link>'
+            '<link name="cam_l"/><link name="cam_r"/><link name="cam_front"/>'
+            '<joint name="head_joint_2" type="revolute"><parent link="head_link_1"/>'
+            f'<child link="head_link_2"/><origin xyz="0.02 0.04 0.2" rpy="{rpy}"/><axis xyz="{axis}"/></joint>'
+            '<joint name="cl" type="fixed"><parent link="head_link_2"/><child link="cam_l"/>'
+            '<origin xyz="-0.05 0.03 0.03" rpy="0 0 2.1"/></joint>'
+            '<joint name="cr" type="fixed"><parent link="head_link_2"/><child link="cam_r"/>'
+            '<origin xyz="-0.05 -0.11 0.03" rpy="0 0 -2.1"/></joint>'
+            '<joint name="cf" type="fixed"><parent link="head_link_2"/><child link="cam_front"/>'
+            '<origin xyz="0.1 -0.04 0.05" rpy="0 0.3 0"/></joint></robot>')
+
+
+def _positions(xml):
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml)
+    joints = {j.get("name"): [float(v) for v in j.find("origin").get("xyz").split()]
+              for j in root.findall("joint")}
+    head = joints["head_joint_2"]
+    return head, {n: [h + c for h, c in zip(head, joints[n])] for n in ("cl", "cr", "cf")}
+
+
+def test_head_frame_recentered_without_moving_children():
+    from rokae.helios.model import recenter_head
+    original = _head_model()
+    head_before, before = _positions(original)
+    recentred = recenter_head(original)
+    head_after, after = _positions(recentred)
+    assert head_after[1] == 0 and head_after[0] == head_before[0] and head_after[2] == head_before[2]
+    for name in before:  # Same position in the parent frame: kinematics unchanged.
+        assert after[name] == pytest.approx(before[name])
+    rel = {n: [a - h for a, h in zip(after[n], head_after)] for n in after}
+    assert rel["cl"][1] == pytest.approx(-rel["cr"][1])  # Mirrored mounts now look mirrored.
+    assert rel["cf"][1] == pytest.approx(0)
+    assert 'rpy="0 0 2.1"' in recentred  # Mount orientations are untouched.
+
+
+@pytest.mark.parametrize("rpy, axis", [("0 0.1 0", "0 1 0"), ("0 0 0", "0 0 1")])
+def test_head_frame_left_untouched_when_shift_would_change_kinematics(rpy, axis):
+    from rokae.helios.model import recenter_head
+    model = _head_model(rpy, axis)
+    assert recenter_head(model) == model

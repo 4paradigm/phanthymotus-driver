@@ -26,10 +26,9 @@ class HeliosJoints:
             raise ValueError("publish_hz must not exceed 30; iNex feedback is approximately 10 Hz")
         self.client = client or self._new_client(os.getenv("HELIOS_STATE_URL", config["state_url"]))
         self.scope_client = scope_client or self._new_client(self.client.url, scope=True)
-        self._topics = [
-            {"topic": f"/{namespace}/state/joints", "format": "sensor/skeleton"},
-            {"topic": f"/{namespace}/state/joint_status", "format": "data/json"},
-        ]
+        # One output only: the skeleton message already carries per-joint q, dq
+        # and torques, so a separate status topic would duplicate it.
+        self._topics = [{"topic": f"/{namespace}/state/joints", "format": "sensor/skeleton"}]
         self._model_lock = threading.Lock()
         self._model_url = None
         self._urdf = None
@@ -41,7 +40,7 @@ class HeliosJoints:
                               connect_timeout_s=self._config.get("connect_timeout_s", 3))
 
     def get_tools(self):
-        sensor = tool("joints", "sensor", "Helios-2.1 实时关节骨架：双臂、躯干、头部共 20 轴；电机反馈力矩与模型重力矩(Nm)；只读，约 10 Hz。状态输出显示断线、过期及接收时间。",
+        sensor = tool("joints", "sensor", "Helios-2.1 实时关节骨架：双臂、躯干、头部共 20 轴；每轴含角度(rad)、速度、电机反馈力矩与模型重力矩(Nm)；只读，约 10 Hz。",
                       topic_out=self._topics)
         sensor["configSchema"] = {"type": "object", "properties": {
             "state_url": {"type": "string", "scope": "shared", "x-sensitive": True,
@@ -83,7 +82,7 @@ class HeliosJoints:
                 self._node = None
             self._publishers = []
 
-    def payloads(self):
+    def payload(self):
         snap = self.client.snapshot()
         scope = self.scope_client.snapshot()
         torques = {j["name"]: j for j in scope["torques"]} if scope["available"] and snap["available"] else {}
@@ -93,26 +92,17 @@ class HeliosJoints:
         torque_status.update({"unit": "Nm", "source_topic": "joint/scope",
                               "feedback_source": "motor_torque", "gravity_source": "robot_model",
                               "physical_validity_verified": False})
-        skeleton = {**snap, "joints": joints, "torque_status": torque_status,
-                    "timestamp_ms": int(time.time() * 1000), "angle_unit": "rad"}
-        status = {k: v for k, v in skeleton.items() if k != "joints"}
-        status["joint_count"] = len(snap["joints"])
-        status["angles_rad"] = {j["name"]: j["q"] for j in snap["joints"]}
-        status["velocities_rad_s"] = {j["name"]: j.get("dq") for j in joints}
-        status["motor_torques_nm"] = {j["name"]: j.get("motor_torque_nm") for j in joints}
-        status["gravity_torques_nm"] = {j["name"]: j.get("gravity_torque_nm") for j in joints}
-        status["units"] = {"angles_rad": "rad", "velocities_rad_s": "rad/s",
-                           "motor_torques_nm": "Nm", "gravity_torques_nm": "Nm"}
-        status["message"] = {"online": "实时关节数据正常", "idle": "状态订阅已停止",
-                             "reconnecting": "连接中或已断线，正在重连", "waiting": "已连接，等待有效关节数据",
-                             "stale": "关节数据过期", "invalid": "收到无效关节数据"}[snap["state"]]
-        return skeleton, status
+        message = {"online": "实时关节数据正常", "idle": "状态订阅已停止",
+                   "reconnecting": "连接中或已断线，正在重连", "waiting": "已连接，等待有效关节数据",
+                   "stale": "关节数据过期", "invalid": "收到无效关节数据"}[snap["state"]]
+        return {**snap, "joints": joints, "torque_status": torque_status, "message": message,
+                "timestamp_ms": int(time.time() * 1000), "angle_unit": "rad"}
 
     def _publish(self):
         with self._lock:
-            for publisher, payload in zip(self._publishers, self.payloads()):
+            for publisher in self._publishers:
                 msg = self._message_type()
-                msg.data = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+                msg.data = json.dumps(self.payload(), ensure_ascii=False, allow_nan=False)
                 publisher.publish(msg)
 
     def dispatch(self, action, args):

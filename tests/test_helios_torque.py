@@ -65,35 +65,26 @@ def test_independent_freshness_and_lifecycle():
     positions = SnapshotClient('joints', parse_state(frame()))
     scope = SnapshotClient('torques', parse_scope(scope_frame()))
     plugin = HeliosJoints({'state_url': positions.url}, client=positions, scope_client=scope)
-    skeleton, status = plugin.payloads()
+    skeleton = plugin.payload()
     assert skeleton['joints'][0]['motor_torque_nm'] == 0
-    for joint in skeleton['joints']:
-        name = joint['name']
-        assert status['angles_rad'][name] == joint['q']
-        assert status['velocities_rad_s'][name] == joint.get('dq')
-        assert status['motor_torques_nm'][name] == joint.get('motor_torque_nm')
-        assert status['gravity_torques_nm'][name] == joint.get('gravity_torque_nm')
-    assert status['units']['velocities_rad_s'] == 'rad/s'
-    assert status['units']['motor_torques_nm'] == 'Nm'
+    # The single skeleton topic carries angle, velocity and both torques per joint.
+    assert all({'q', 'motor_torque_nm', 'gravity_torque_nm'} <= set(j) for j in skeleton['joints'])
+    assert skeleton['angle_unit'] == 'rad' and skeleton['torque_status']['unit'] == 'Nm'
+    assert skeleton['message'] == '实时关节数据正常'
     assert skeleton['torque_status']['feedback_source'] == 'motor_torque'
     assert not skeleton['torque_status']['physical_validity_verified']
     scope.online = False
-    skeleton, status = plugin.payloads()
+    skeleton = plugin.payload()
     assert skeleton['available'] and len(skeleton['joints']) == 20
     assert all('motor_torque_nm' not in j for j in skeleton['joints'])
-    assert len(status['motor_torques_nm']) == 20
-    assert all(value is None for value in status['motor_torques_nm'].values())
-    assert all(value is None for value in status['gravity_torques_nm'].values())
     scope.online = True
     positions.online = False
-    assert plugin.payloads()[0]['joints'] == []
-    status = plugin.payloads()[1]
-    assert all(status[field] == {} for field in ('angles_rad', 'velocities_rad_s', 'motor_torques_nm', 'gravity_torques_nm'))
+    assert plugin.payload()['joints'] == []
     plugin.dispatch('start', {'_tool_name':'joints'})
     assert positions.started == scope.started == 1
     plugin.dispatch('stop', {'_tool_name':'joints'})
     assert positions.stopped == scope.stopped == 1
-    assert plugin.payloads()[0]['joints'] == []
+    assert plugin.payload()['joints'] == []
 
 
 def test_scope_ignores_other_messages_and_only_subscribes_readonly():
