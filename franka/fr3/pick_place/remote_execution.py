@@ -285,13 +285,29 @@ class RemoteExecution(PickExecution):
         opening = self.opening = min(hand['max_width'], .08)
         if opening <= 0:
             raise RuntimeError('Invalid calibrated hand opening')
-        if abs(hand['width'] - opening) > .001 or hand['is_grasped']:
-            command = self.hand.command(self.active['owner'], 'set_position', width_m=opening,
-                                        speed_m_s=self.options['speed_mm_s']/1000, timeout_s=15)
-            self.wait(self.hand, command, 17, 'hand_command_id')
-        if abs(self.fresh(self.hand)['width'] - opening) > .001:
-            raise RuntimeError('Hand opening was not confirmed')
-        return opening
+        if abs(hand['width'] - opening) <= .001 and not hand['is_grasped']:
+            return opening
+
+        requested_at = time.monotonic_ns()
+        command = self.hand.command(self.active['owner'], 'set_position', width_m=opening,
+                                    speed_m_s=self.options['speed_mm_s']/1000, timeout_s=15)
+        self.wait(self.hand, command, 17, 'hand_command_id')
+        # The native success event can arrive before the matching width sample.
+        deadline = time.monotonic() + .5
+        while True:
+            self.check()
+            hand = self.hand.snapshot()
+            if (hand.get('sdk_received_ns', 0) > requested_at
+                    and hand.get('connected') and hand.get('control_ready')
+                    and 0 <= hand['data_age_ms'] <= 220
+                    and abs(hand['width'] - opening) <= .001 and not hand['is_grasped']):
+                return opening
+            if time.monotonic() >= deadline:
+                width = hand.get('width')
+                actual = f'{width*1000:.2f} mm' if width is not None else 'unavailable'
+                raise RuntimeError(f'Hand opening was not confirmed (target={opening*1000:.2f} mm, '
+                                   f'feedback={actual}, is_grasped={hand.get("is_grasped")})')
+            self.active['cancel'].wait(.02)
 
     def grasp(self, width):
         self.active.update(stage='pick_close', holding_object_possible=True)

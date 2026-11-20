@@ -118,3 +118,35 @@ class PickExecutionTests(unittest.TestCase):
             self.assertEqual(reply['code'], 'CALIBRATION_NOT_ACCEPTED')
         self.card.gripper_manager.acquire.assert_not_called()
         self.card.controller.assert_not_called()
+
+
+class HandOpeningTests(unittest.TestCase):
+    def test_waits_for_post_command_width_without_reissuing_command(self):
+        from franka.fr3.pick_place.remote_execution import RemoteExecution
+
+        executor = Mock()
+        executor.active = dict(owner='pick', cancel=Event())
+        executor.options = dict(speed_mm_s=20)
+        before = dict(width=.02, max_width=.08, is_grasped=True, connected=True,
+                      control_ready=True, data_age_ms=1, sdk_received_ns=99)
+        after = dict(before, width=.0795, is_grasped=False, sdk_received_ns=101)
+        executor.fresh.return_value = before
+        executor.hand.snapshot.side_effect = [before, after]
+        with patch('franka.fr3.pick_place.remote_execution.time.monotonic_ns', return_value=100):
+            self.assertEqual(RemoteExecution.open_hand(executor, 'place_open'), .08)
+        executor.hand.command.assert_called_once()
+        self.assertEqual(executor.hand.snapshot.call_count, 2)
+
+    def test_partial_opening_still_reports_target_and_feedback(self):
+        from franka.fr3.pick_place.remote_execution import RemoteExecution
+
+        executor = Mock()
+        executor.active = dict(owner='pick', cancel=Event())
+        executor.options = dict(speed_mm_s=20)
+        executor.fresh.return_value = dict(width=.02, max_width=.08, is_grasped=True)
+        executor.hand.snapshot.return_value = dict(width=.078, is_grasped=False, connected=True,
+                                                   control_ready=True, data_age_ms=1, sdk_received_ns=101)
+        with patch('franka.fr3.pick_place.remote_execution.time.monotonic_ns', return_value=100), \
+             patch('franka.fr3.pick_place.remote_execution.time.monotonic', side_effect=[1, 2]):
+            with self.assertRaisesRegex(RuntimeError, 'target=80.00 mm, feedback=78.00 mm'):
+                RemoteExecution.open_hand(executor, 'place_open')
