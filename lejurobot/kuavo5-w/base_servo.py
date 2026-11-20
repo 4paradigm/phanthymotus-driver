@@ -72,6 +72,10 @@ class BaseServo:
                     'applied': self._applied, 'last': self._last, 'error': self._error,
                     'startup': startup, 'control_ownership': self.bundle.control_ownership()}
 
+    def _start_reply(self):
+        status = self.info()
+        return {**status, 'state': 'ready', 'stream_state': status['state']}
+
     def dispatch(self, action, args):
         try:
             if action == 'info':
@@ -86,7 +90,7 @@ class BaseServo:
                     if self._subscription is not None:
                         if topic != self._topic:
                             raise RuntimeError('stop before changing input_topic')
-                        return self.info()
+                        return self._start_reply()
                     if self.bundle._transition is not None:
                         raise RuntimeError('base is busy; stop the current action first')
                     defer_control = 'base' in self.bundle.tracker._active or self.bundle.spatial.unresolved()
@@ -103,14 +107,14 @@ class BaseServo:
                         self._thread = threading.Thread(target=self._run, daemon=True, name='base-servo')
                         self._thread.start()
                 if defer_control:
-                    return {**self.info(), 'message': 'Input connected and paused; resume after the current base operation finishes.'}
+                    return {**self._start_reply(), 'message': 'Input connected and paused; resume after the current base operation finishes.'}
                 preparation = self.bundle.spatial.start_chassis()
                 if preparation.get('state') == 'error':
                     with self._lock:
                         self.mark_paused()
                         self._error = preparation.get('error')
                     return preparation
-                return self.info()
+                return self._start_reply()
             if action in ('pause', 'stop'):
                 self.preempt()
                 if action == 'stop':

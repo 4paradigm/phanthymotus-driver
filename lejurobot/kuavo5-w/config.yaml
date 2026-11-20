@@ -16,10 +16,9 @@ provisioning:
   # Fixed allowlist only, when existing vendor ROS/PulseAudio lacks a dependency.
   install_missing_packages: true
   auto_initialize_and_pause: true
-  # Addresses/users/ROS IPs/passwords default to connection_defaults.py.
-  # No card-level connection configuration; edit that module and rebuild.
-  # Advanced private overrides: environment or ssh-secrets.json (0600).
-  # Set use_default_credentials: false per role to require explicit keys/secrets.
+  # Non-secret addresses/users/ROS IPs default to connection_defaults.py.
+  # Configure authentication once per robot through environment variables,
+  # ssh-secrets.json (0600), or SSH keys. No passwords are bundled.
   # Upper host is local to the host-network container.
   chassis: {volume: 30}
 # Start rosbridge_server on the ROS Noetic host and point this URL at it.

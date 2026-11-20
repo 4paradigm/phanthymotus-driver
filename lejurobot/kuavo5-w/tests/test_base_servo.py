@@ -49,13 +49,15 @@ class BaseServoTests(unittest.TestCase):
         self.assertEqual(descriptor.mode, 'twist')
         self.assertEqual(self.call('base_servo', 'start')['state'], 'error')
         result = self.start()
-        self.assertEqual(result['state'], 'running')
+        self.assertEqual(result['state'], 'ready')
+        self.assertEqual(result['stream_state'], 'running')
+        self.assertEqual(self.start()['state'], 'ready')
         self.assertEqual(result['control_interface']['units']['angular'], 'rad/s')
         time.sleep(.08)
         self.assertFalse(self.ros.published)
         self.assertFalse(self.ros.sent_services)
         self.assertEqual(self.call('base_servo','stop')['state'], 'idle')
-        self.assertEqual(self.start()['state'], 'running')
+        self.assertEqual(self.start()['state'], 'ready')
 
     def test_stream_relay_watchdog_and_recovery(self):
         self.start();self.send()
@@ -124,14 +126,18 @@ class BaseServoTests(unittest.TestCase):
 
     def test_starting_servo_during_base_drive_only_connects_a_paused_input(self):
         result = self.call('base_drive', 'move', vx=.1, duration=1)
-        self.assertEqual(self.start()['state'], 'paused')
+        started = self.start()
+        self.assertEqual(started['state'], 'ready')
+        self.assertEqual(started['stream_state'], 'paused')
         self.send(); time.sleep(.06)
         self.assertTrue(self.bundle.tracker.current('base', result['action_id']))
         self.assertEqual(self.servo._applied, 0)
 
     def test_start_connects_paused_without_overriding_an_unresolved_native_task(self):
         with patch.object(self.bundle.spatial,'unresolved',return_value=True):
-            self.assertEqual(self.start()['state'],'paused')
+            result = self.start()
+            self.assertEqual(result['state'], 'ready')
+            self.assertEqual(result['stream_state'], 'paused')
             self.send()
             time.sleep(.06)
             self.assertEqual(self.call('base_servo', 'resume')['state'], 'error')
@@ -167,7 +173,10 @@ class BaseServoTests(unittest.TestCase):
 
     def test_pending_chassis_check_and_old_topic_callback_cannot_drive(self):
         with patch.object(self.bundle.spatial,'startup_status',return_value={'state':'loading'}):
-            self.assertEqual(self.start()['state'],'loading')
+            result = self.start()
+            self.assertEqual(result['state'], 'ready')
+            self.assertEqual(result['stream_state'], 'loading')
+            self.assertEqual(result['startup']['state'], 'loading')
             self.send();time.sleep(.1)
             self.assertFalse(self.nonzero())
         old = self.servo._subscription

@@ -41,19 +41,14 @@ Dashboard/PR镜像部署片段把宿主机 `/opt/phanthy-motus/drivers/lejurobot
 已有操作配置、关节限位、禁用设置和凭据不被镜像默认值覆盖；不再要求部署前手工创建配置文件。
 `CONFIG_PATH` 显式指向其他路径但文件缺失，或已有YAML损坏时仍报错，不悄悄回退。
 
-整机连接默认值统一位于 `connection_defaults.py`：`DEFAULTS` 保存三台主机的地址、账号、ROS IP，
-`DEFAULT_PASSWORDS` 保存对应默认SSH密码。`base_drive`及其他卡片不再提供连接参数configSchema或config动作；
-不需要往画布放置额外配置卡。日常动作走ROS1/rosbridge，SSH仅供统一后台准备/修复三台主机。
+整机的非秘密连接默认值统一位于 `connection_defaults.py`：`DEFAULTS` 保存地址、账号和 ROS IP，
+包内 YAML 不重复这些字段。账号或网络变化可通过私有操作配置或环境变量覆盖，无需逐卡配置。
+日常动作走 ROS1/rosbridge，SSH 用于统一后台准备和修复。
 
-按操作人员要求，镜像内置当前5-W/Jaten现场确认的默认值。正常部署无需填写账号密码；
-默认值变化时修改上述模块，重新构建镜像并重建容器生效，重启旧镜像不会获得源码修改。
-包内YAML不再重复地址/账号/ROS IP，避免遮蔽模块默认值。
-这些值不作为所有批次、所有官方文档版本的通用凭据声明。
-
-兼容已有部署的显式覆盖仍保留：环境变量、操作配置中的角色字段及0600私有凭据文件优先于模块默认值。
-因此修改模块后，若旧部署曾配置相同字段，需同时移除或更新对应覆盖；驱动不会擅自覆盖已有操作配置。
-也可通过 `KUAVO_HOST/CONTROLLER/CHASSIS_SSH_PASSWORD`、相应 `SUDO_PASSWORD` 环境变量，
-或宿主机配置目录内0600权限的 `ssh-secrets.json` 提供连接信息：
+**镜像和源码不包含 SSH 密码。升级前请为需要 SSH 的角色提供部署凭据**，否则自动安装/修复可能因认证失败而不可用；
+已安装服务仍按其自身状态工作，驱动不会绕过缺失反馈或控制检查。
+可以通过 `KUAVO_HOST/CONTROLLER/CHASSIS_SSH_PASSWORD`、相应 `SUDO_PASSWORD` 环境变量，
+或宿主机配置目录内权限 0600 的 `ssh-secrets.json` 提供：
 
 ```json
 {
@@ -64,8 +59,8 @@ Dashboard/PR镜像部署片段把宿主机 `/opt/phanthy-motus/drivers/lejurobot
 ```
 
 支持在各角色私有配置中设置 `key_file`（容器内私钥路径），或使用相应 `KUAVO_<ROLE>_SSH_KEY`。
-显式配置私钥时优先使用非交互公钥认证，不因内置密码阻止私钥使用。
-每台主机可设 `use_default_credentials: false` 禁用其内置密码回退，改用公钥/显式凭据；只尝试选定的一套凭据，不轮询猜密码。
+未提供密码时使用非交互公钥认证，可指定私钥或使用 OpenSSH 的默认身份。
+旧的 `use_default_credentials` 配置不再生效；不存在内置密码回退，只尝试部署提供的认证方式。
 空环境默认值不遮蔽私有文件，空格密码不被trim。OpenSSH使用accept-new首次信任并持久化known_hosts；
 主机密钥变化报错，不用StrictHostKeyChecking=no绕过。无法登录时MCP仍可提供分主机诊断错误，
 不会因此伪造传感数据或放开运动。
@@ -78,8 +73,8 @@ Dashboard/PR镜像部署片段把宿主机 `/opt/phanthy-motus/drivers/lejurobot
 
 ### 部署时提供凭据（无需卡片配置）
 
-以下是现有的部署级覆盖方式，整机只配置一次。它们不会自动删除镜像内的默认密码；
-若要完全采纳凭据审查建议，还需另行去掉内置密码回退并更换已公开的真实密码。
+以下是部署级认证方式，整机只配置一次。旧版本源码、Git 历史和已发布镜像可能仍含旧密码；
+操作员需要在设备上轮换已公开密码，并更新私有部署凭据。新版本不会修改设备密码或重写 Git 历史。
 
 **方式一：宿主机私有文件（现有部署可直接使用）。** 部署片段已将
 `/opt/phanthy-motus/drivers/lejurobot-kuavo5-w/` 映射到容器 `/config`，无需新增挂载。
@@ -94,7 +89,7 @@ sudoedit /opt/phanthy-motus/drivers/lejurobot-kuavo5-w/ssh-secrets.json
 
 填写上文host/controller/chassis的JSON，将占位内容替换为真实SSH密码；sudo密码相同时不用另填。
 文件不提交Git、不复制入镜像。后台每轮准备时重新读取，通常下一轮约30秒内使用，无需重建镜像。
-只要显式覆盖了所有需要密码认证的角色，就不会为这些角色使用内置密码。
+没有提供密码或可用密钥的角色将报告 SSH 认证失败，不使用默认密码。
 
 **方式二：环境变量。** 现有Compose片段已转发三台主机的SSH及sudo密码变量。
 例如用交互输入给出上位机密码，避免在命令字面量中写密码；其他两角色同理：
@@ -116,7 +111,7 @@ sudo密码不同时分别设置相应`KUAVO_<ROLE>_SUDO_PASSWORD`。
 私钥留在上位机专用目录（例如宿主机配置目录的ssh/id_ed25519，权限0600），不要提交或复制进镜像。
 现有目录挂载后，秘密文件中的三个角色可分别写`{"key_file":"/config/ssh/id_ed25519"}`，
 也可以使用各自独立密钥。注意这里填写的是容器内路径，并移除同角色旧password字段及非空SSH密码环境变量，
-避免显式密码继续选择密码认证。密钥存在时不会回退内置密码；sudo需配置目标机非交互权限，
+避免显式密码继续选择密码认证。sudo需配置目标机非交互权限，
 否则在该角色的秘密文件记录中单独提供sudo_password。
 
 | 目标 | 容器自动完成 |
@@ -290,6 +285,11 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 
 `pause`及全局中断锁存暂停，需`resume`才接收后续帧；普通`base_drive.move/move_relative`优先暂停伺服。与厂商导航/建图共用内部base通道互斥。速度流不创建ACP pending，视觉导航到达由ActuCore navi负责ACP。容器启动不会自动订阅速度流。`info`返回输入话题、描述符、底盘准备状态、最近校验结果和执行次数。厂商控制器的速度超时机制保留。
 
+`base_servo.start` 成功接受输入订阅统一返回执行器生命周期 `state: ready`；
+`stream_state` 与 `startup` 单独报告 paused/loading/running 和底盘准备结果。
+ready 仅表示卡片生命周期已接受，不表示底盘已完成准备或已使能；未完成准备时不执行速度输入。
+`info` 保留实际流状态，重复 start 同样返回 ready，且不重新接管其他底盘动作。
+
 速度依据为2026-11-19真机只读核对：正在使用的 `humanoid_wheel_interface/config/kuavo_s63/task.info` 中 `wheel_move.max_vel=[0.8,0.8,1.6]`；底盘 `leju_node.launch` 及运行时 `/leju_node/max_linear_vel`、`max_angular_vel` 均为1.0。驱动取交集：平移合速度0.8m/s、旋转1rad/s。这是厂商软件命令包络，不宣称硬件极限；其他固件仍可能进一步限幅。官方《轮臂控制API》给出了单位和停止语义，没有统一的硬件最高速度数字。`controlled_spatial`仍遵守厂商路径规划器自己的速度限制。
 
 新增模块复用既有 `common/control`、std_msgs及rclpy，无新增pip/apt依赖。旧的持久化配置需加入`plugins.base_servo: {enabled: true}`，显式禁用配置仍受尊重。404项离线测试覆盖速度流、断流、旧帧、全局暂停、动作抢占、重连及使能期间暂停的晚响应竞态。新镜像已验证domain 42下的真实DDS收发和断流零速，ROS1端使用内存替身，不连接电机；尚未以新档位执行真机运动或验证整条视觉导航到达。
@@ -392,7 +392,7 @@ SSH RPC 辅助源码随镜像构建，每次在底盘执行固定操作，使用
 sudo python3 host/install_speaker.py --user jt --master http://192.168.26.1:11311 --ros-ip 192.168.26.22 --volume 30
 ```
 
-仅使用该机已有ROS Noetic、`paplay/pactl`和PulseAudio；不安装SDK、声卡库或TTS引擎，不在播放器中保存SSH凭据；默认连接值集中于驱动，用户覆盖密码另存私有配置。
+仅使用该机已有ROS Noetic、`paplay/pactl`和PulseAudio；不安装SDK、声卡库或TTS引擎，不在播放器中保存SSH凭据；非秘密连接默认值集中于驱动，密码仅存于私有部署配置。
 安装 `kuavo5w-speaker.service` 并启用音频用户linger，允许用户音频服务开机运行；
 自动启用该用户的 `pulseaudio.socket`，无需先登录桌面。轻量ROS服务随系统启动，但无音频数据时不启动播放器。
 服务只访问音频，无控制器/电机操作；`speaker` 不依赖 `motion_enabled` 或恢复电机。

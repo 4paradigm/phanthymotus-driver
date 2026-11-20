@@ -12,7 +12,7 @@ import shlex
 import subprocess
 import threading
 import time
-from connection_defaults import DEFAULTS, DEFAULT_PASSWORDS
+from connection_defaults import DEFAULTS
 
 ROOT = Path(__file__).resolve().parent
 FILES = ('config.yaml', 'host/install.py', 'host/install_controller.py',
@@ -59,8 +59,6 @@ class SshTransport:
         prefix = 'KUAVO_' + role.upper()
         key = os.environ.get(prefix + '_SSH_KEY') or role_secret.get('key_file')
         password = os.environ.get(prefix + '_SSH_PASSWORD') or role_secret.get('password')
-        if password is None and not key and target.get('use_default_credentials', True):
-            password = DEFAULT_PASSWORDS[role]
         sudo_password = os.environ.get(prefix + '_SUDO_PASSWORD') or role_secret.get('sudo_password', password)
         if any(value is not None and (not isinstance(value, str) or '\x00' in value or '\n' in value)
                for value in (password, sudo_password, key)):
