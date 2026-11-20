@@ -511,7 +511,7 @@ class PickPlacePlugin:
 
     def run_transfer(self, active):
         from .remote_execution import RemoteExecution
-        from .planning import preview
+        from .planning import grasp_targets
         from .scene import estimate
         from .transfer import moveit_targets
         status, result, executor, hand = 'error', {}, None, None
@@ -529,8 +529,7 @@ class PickPlacePlugin:
                 active['stage'] = 'planning'
                 photo, profile = active['observation'], active['profile']
                 scene = estimate(photo, active['position'], profile['handeye'])
-                candidates = preview(photo, active['position'], scene['diameter_mm'],
-                               {**profile, **scene}, scene, target_only=True)
+                candidates = grasp_targets(photo, scene, profile)
                 live = self.state(active)
                 live_pose = np.asarray(live['O_T_EE']).reshape(4,4,order='F')
                 saved_pose = np.asarray(photo['metadata']['O_T_EE']).reshape(4,4,order='F')

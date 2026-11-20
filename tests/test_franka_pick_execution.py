@@ -79,14 +79,14 @@ class PickExecutionTests(unittest.TestCase):
                 executor.prepare.side_effect = prepare
                 targets = dict(approach=1, descent=2, lift=3, carry=[4], place_lift=5)
                 with patch('franka.fr3.pick_place.scene.estimate', return_value={'diameter_mm': 25}), \
-                     patch('franka.fr3.pick_place.planning.preview', return_value=[{'observation_id': 'test', 'grasp_width_mm': 25, 'yaw_deg': yaw} for yaw in (0, 30)]) as geometry, \
+                     patch('franka.fr3.pick_place.planning.grasp_targets', return_value=[{'observation_id': 'test', 'grasp_width_mm': 25, 'yaw_deg': yaw} for yaw in (0, 30)]) as geometry, \
                      patch('franka.fr3.pick_place.transfer.moveit_targets', return_value=targets), \
                      patch('franka.fr3.pick_place.remote_execution.RemoteExecution', return_value=executor):
                     reply = self.card.dispatch(action, dict(confirm_motion=True, start_point_x=.1, start_point_y=.2, **extra))
                     self.assertEqual(reply['state'], 'running')
                     self.assertTrue(done.wait(3))
                 self.assertEqual(self.card.last_result['state'], 'completed', self.card.last_result)
-                self.assertTrue(geometry.call_args.kwargs['target_only'])
+                self.assertEqual(geometry.call_args.args[1], {'diameter_mm': 25})
                 self.assertEqual(approaches, [{'use_ik': True}, {'use_ik': True}])
                 self.assertEqual([c.args[0][0] for c in executor.move_remote.call_args_list],
                                  ['approach', 'descend', 'lift', 'move_to_place', 'place_lift', 'return_to_observation'])
@@ -100,7 +100,7 @@ class PickExecutionTests(unittest.TestCase):
         executor.fresh.return_value = dict(is_grasped=False, max_width=.08)
         executor.move_remote.side_effect = RuntimeError('Remote execution failed')
         with patch('franka.fr3.pick_place.scene.estimate', return_value={'diameter_mm': 25}), \
-             patch('franka.fr3.pick_place.planning.preview', return_value=[{'grasp_width_mm': 25, 'yaw_deg': 0}]), \
+             patch('franka.fr3.pick_place.planning.grasp_targets', return_value=[{'grasp_width_mm': 25, 'yaw_deg': 0}]), \
              patch('franka.fr3.pick_place.transfer.moveit_targets',
                    return_value=dict(approach=1, descent=2, lift=3, carry=[4], place_lift=5)), \
              patch('franka.fr3.pick_place.remote_execution.RemoteExecution', return_value=executor):

@@ -14,8 +14,6 @@ class TransferTests(unittest.TestCase):
     def setUp(self):
         f=json.loads((ROOT/'tests/fixtures/franka/transfer.json').read_text())
         self.observation,self.handeye,self.pick=f['observation'],f['handeye'],f['pick']
-        q0,overhead,lift=f['joints']
-        self.pick['joint_path_rad']=np.vstack((np.linspace(q0,overhead,101),np.linspace(overhead,lift,200))).tolist()
         self.args=dict(start_point_x=0,start_point_y=0,delta_x=30,delta_y=0)
 
     def test_realman_fields_units_and_invalid_inputs(self):
@@ -41,26 +39,15 @@ class TransferTests(unittest.TestCase):
             delta=transfer.destination(self.observation,self.pick['scene'],self.handeye,options)
         self.assertAlmostEqual(delta@n,0,places=7)
 
-    def test_optional_rotation_preserves_vertical_placement(self):
-        options=transfer.parameters('grab_by',{**self.args,'rotation_deg':45})
-        result=transfer.plan_transfer(self.observation,self.pick,self.handeye,options)
-        qs=np.asarray(self.pick['joint_path_rad'])
-        model=transfer.Kinematics(qs[0],np.asarray(self.observation['metadata']['O_T_EE']).reshape(4,4,order='F'))
-        start=model.pose(qs[-1]);finish=model.pose(result['paths'][0][-1])
-        expected=transfer.rotation(-np.asarray(self.pick['scene']['table_normal_base']),np.pi/4)@start[:3,:3]
-        np.testing.assert_allclose(finish[:3,:3],expected,atol=.0002)
-        self.assertEqual(result['result']['rotation_deg'],45)
-
-    def test_complete_transfer_release_retreat_and_return_paths(self):
-        result=transfer.plan_transfer(self.observation,self.pick,self.handeye,transfer.parameters('grab_by',self.args))
-        self.assertEqual(result['stages'],['move_to_place','place_lift','return_to_observation'])
-        self.assertEqual(result['result']['delta_x'],30)
-        self.assertGreater(result['arm_capsule_clearance_mm'],20)
-        np.testing.assert_allclose(result['paths'][-1][-1],self.pick['joint_path_rad'][0])
-        for a,b in zip(result['paths'],result['paths'][1:]):np.testing.assert_allclose(a[-1],b[0])
-        self.assertTrue(all(len(p)<=21 for p in result['paths']))
-        with mock.patch.object(transfer.Kinematics,'clearance',return_value=0):
-            with self.assertRaisesRegex(ValueError,'self-collision'):
-                transfer.plan_transfer(self.observation,self.pick,self.handeye,transfer.parameters('grab_by',self.args))
-
-if __name__=='__main__':unittest.main()
+    def test_moveit_placement_keeps_vertical_axis_with_rotation(self):
+        normal = np.asarray(self.pick['scene']['table_normal_base'])
+        axis = np.cross([0., 0., 1.], normal)
+        axis /= np.linalg.norm(axis)
+        orientation = np.column_stack((axis, np.cross(-normal, axis), -normal))
+        grasp = transfer.rigid(orientation, np.asarray(self.pick['sdk_grasp_base_mm']) / 1000)
+        pick = dict(poses=[grasp, grasp, grasp], sdk_to_pad_offset_mm=self.pick['sdk_to_pad_offset_mm'])
+        options = transfer.parameters('grab_by', {**self.args, 'rotation_deg': 45})
+        targets = transfer.moveit_targets(self.observation, pick, self.pick['scene'], self.handeye, options)
+        place = targets['carry'][-1]
+        np.testing.assert_allclose(place[:3, :3], transfer.rotation(-normal, np.pi / 4) @ orientation)
+        np.testing.assert_allclose(targets['place_lift'][:3, 3] - place[:3, 3], .15 * normal)

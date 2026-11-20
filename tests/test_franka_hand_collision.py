@@ -80,20 +80,3 @@ class HandCollisionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'Arm/table clearance'):
             check_path_table(model,np.zeros(7),np.array([[0.,0.,.1]]),
                              np.zeros(3),np.array([0,0,1]),'return',{})
-
-    def test_recorded_left_return_lifts_before_shoulder_turn(self):
-        import json
-        from franka.fr3.pick_place.hand_collision import observation_path
-        from franka.fr3.pick_place.kinematics import Kinematics
-        f=json.loads((ROOT/'tests/fixtures/franka/left_return.json').read_text())
-        profile={'tool_frame':{'F_T_EE':np.array(f['F_T_EE']).reshape(4,4,order='F').tolist()},
-                 'table_plane':f['table_plane']}
-        path=observation_path(f,f['target'],profile)
-        self.assertEqual(path.shape,(21,7))
-        np.testing.assert_allclose(path[0],f['q'])
-        np.testing.assert_allclose(path[-1],np.radians(f['target']))
-        model=Kinematics(f['q'],np.array(f['O_T_EE']).reshape(4,4,order='F'))
-        normal=np.array(f['table_plane']['normal_base'])
-        lift=model.pose(path[10])[:3,3]-model.pose(path[0])[:3,3]
-        self.assertGreater(lift@normal,.099)
-        self.assertLess(np.linalg.norm(lift-normal*(lift@normal)),.001)

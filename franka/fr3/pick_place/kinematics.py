@@ -29,10 +29,6 @@ class Kinematics:
     def pose(self, q):
         return self.frames(q)[-1]@self.offset
 
-    def vector(self, q):
-        t = self.pose(q)
-        return np.r_[t[:3,3], .25*t[:3,:3].ravel()]
-
     def clearance(self, q):
         from .planning import segment_distance
         chain, caps = self.frames(q), []
@@ -48,15 +44,3 @@ class Kinematics:
         return min(min((chain[i][:3,:3] @ np.asarray(a)+chain[i][:3,3]-table) @ normal,
                        (chain[i][:3,:3] @ np.asarray(b)+chain[i][:3,3]-table) @ normal)-radius
                    for i, a, b, radius in CAPSULES)
-
-    def solve(self, q, goal):
-        q = np.array(q, dtype=float, copy=True)
-        target = np.r_[goal[:3,3], .25*goal[:3,:3].ravel()]
-        for _ in range(180):
-            f = self.vector(q); error = target-f
-            if np.linalg.norm(error) < .00003:
-                return q
-            jac = np.column_stack([(self.vector(q+d)-f)/1e-5 for d in np.eye(7)*1e-5])
-            step = np.linalg.solve(jac.T@jac+1e-5*np.eye(7),jac.T@error)
-            q = np.clip(q+np.clip(step,-.02,.02),self.low,self.high)
-        raise ValueError('No complete transfer trajectory within joint limits')
