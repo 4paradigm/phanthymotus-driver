@@ -29,13 +29,15 @@ class MotorEnablePlugin:
         self._high_ctrl = high_ctrl
         self._owner = chassis_owner
         self._action_lock = threading.Lock()
+        self._cancel_lock = threading.Lock()
         self._enable_cancel = threading.Event()
 
     def start(self) -> None:
         pass
 
     def stop(self) -> None:
-        self._enable_cancel.set()
+        with self._cancel_lock:
+            self._enable_cancel.set()
 
     def get_tool(self) -> dict:
         return {
@@ -65,7 +67,7 @@ class MotorEnablePlugin:
         if action == "start":
             return {"state": "ready", "command_sent": False}
         if action == "stop":
-            self._enable_cancel.set()
+            self.stop()
             return {"state": "idle", "command_sent": False,
                     "message": "Observation cancelled; an already sent enable command cannot be undone."}
         if action not in {"status", "info", "enable"}:
@@ -92,11 +94,15 @@ class MotorEnablePlugin:
         if args.get("confirm") is not True:
             return {"state": "error", "command_sent": False, "code": "CONFIRM_REQUIRED",
                     "error": "Confirm safe face-up placement and a clear joint movement area before enabling."}
-        if not self._action_lock.acquire(blocking=False):
-            return {"state": "error", "command_sent": False, "code": "ENABLE_BUSY",
-                    "error": "A motor mode request is already active."}
-        try:
+        # Admission and cancellation initialization are one operation with
+        # respect to stop(), including bundle shutdown. Do not hold this lock
+        # during chassis reservation, publishing or the feedback wait.
+        with self._cancel_lock:
+            if not self._action_lock.acquire(blocking=False):
+                return {"state": "error", "command_sent": False, "code": "ENABLE_BUSY",
+                        "error": "A motor mode request is already active."}
             self._enable_cancel.clear()
+        try:
             if not self._owner.reserve_motor_enable():
                 return {"state": "error", "command_sent": False, "code": "CHASSIS_BUSY",
                         "error": "Another chassis action is active."}

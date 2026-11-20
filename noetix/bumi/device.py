@@ -451,6 +451,8 @@ class LocoPlugin:
             if mode != expected_mode:
                 return mode
             command = _get_control_cmd("START")
+            if cancel_event.is_set():
+                return None
             self._mode_toggle_target = target_mode
             self._enable_unconfirmed = True
             self._high_ctrl.publish_cmd(0, 0, 0, command, 0)

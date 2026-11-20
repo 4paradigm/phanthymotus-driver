@@ -219,6 +219,106 @@ def test_concurrent_enable_calls_are_serialized(card, monkeypatch):
     assert [c[3] for c in ctrl.commands] == ["START", "DEFAULT"]
 
 
+@pytest.mark.parametrize("stop_via_dispatch", [True, False])
+def test_stop_during_enable_initialization_is_not_lost(card, monkeypatch, stop_via_dispatch):
+    _, plugin, ctrl = card
+    clear_entered, release_clear = threading.Event(), threading.Event()
+    stop_entered, stop_done = threading.Event(), threading.Event()
+    reserve_entered, release_reserve = threading.Event(), threading.Event()
+    results = []
+
+    # Signal either a direct event set (old implementation) or an attempt to
+    # take the new cancellation lock before allowing clear() to continue.
+    original_lock = getattr(plugin, "_cancel_lock", threading.Lock())
+    class ObservedLock:
+        def __enter__(self):
+            if threading.current_thread().name == "stop-request":
+                stop_entered.set()
+            original_lock.acquire()
+            return self
+        def __exit__(self, *_args):
+            original_lock.release()
+    monkeypatch.setattr(plugin, "_cancel_lock", ObservedLock(), raising=False)
+    original_clear = plugin._enable_cancel.clear
+    original_set = plugin._enable_cancel.set
+    def pause_clear():
+        clear_entered.set()
+        assert release_clear.wait(2)
+        original_clear()
+    def observe_set():
+        original_set()
+        stop_entered.set()
+    monkeypatch.setattr(plugin._enable_cancel, "clear", pause_clear)
+    monkeypatch.setattr(plugin._enable_cancel, "set", observe_set)
+    reserve = plugin._owner.reserve_motor_enable
+    def pause_reservation():
+        reserve_entered.set()
+        assert release_reserve.wait(2)
+        return reserve()
+    monkeypatch.setattr(plugin._owner, "reserve_motor_enable", pause_reservation)
+
+    def issue_stop():
+        if stop_via_dispatch:
+            call(plugin, "stop")
+        else:
+            plugin.stop()
+        stop_done.set()
+
+    worker = threading.Thread(target=lambda: results.append(call(plugin)))
+    stopper = threading.Thread(target=issue_stop, name="stop-request")
+    worker.start()
+    try:
+        assert clear_entered.wait(2)
+        stopper.start()
+        assert stop_entered.wait(2)
+        release_clear.set()
+        assert reserve_entered.wait(2)
+        assert stop_done.wait(2)
+    finally:
+        release_clear.set()
+        release_reserve.set()
+        worker.join(2)
+        if stopper.ident is not None:
+            stopper.join(2)
+    assert not worker.is_alive() and not stopper.is_alive()
+    assert results[0]["state"] == "cancelled"
+    assert results[0]["command_sent"] is False
+    assert ctrl.commands == []
+
+
+def test_stop_while_idle_does_not_cancel_next_enable(card):
+    _, plugin, ctrl = card
+    assert call(plugin, "stop")["state"] == "idle"
+    assert call(plugin)["state"] == "completed"
+    assert [c[3] for c in ctrl.commands] == ["START", "DEFAULT"]
+
+
+def test_stop_during_final_mode_check_prevents_start(card, monkeypatch):
+    _, plugin, ctrl = card
+    entered, release = threading.Event(), threading.Event()
+    results = []
+    reads = [0]
+    def get_mode():
+        reads[0] += 1
+        if reads[0] == 2:
+            entered.set()
+            assert release.wait(2)
+        return 30
+    monkeypatch.setattr(ctrl, "get_mode", get_mode)
+    worker = threading.Thread(target=lambda: results.append(call(plugin)))
+    worker.start()
+    try:
+        assert entered.wait(2)
+        assert call(plugin, "stop")["state"] == "idle"
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert results[0]["state"] == "cancelled"
+    assert results[0]["command_sent"] is False
+    assert ctrl.commands == []
+
+
 def test_enable_reserves_chassis_and_pauses_stream(card, monkeypatch):
     _, plugin, ctrl = card
     entered, release = threading.Event(), threading.Event()

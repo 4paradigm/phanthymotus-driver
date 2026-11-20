@@ -380,7 +380,10 @@ chassis owner to coordinate the existing HighController connection and has no
 additional worker. This card has not been validated on hardware.
 
 - `start` / `stop` are lifecycle actions and never toggle motor power. `stop`
-  cancels pending observation; it cannot undo a START already delivered.
+  cancels an accepted enable if observed by its final pre-publication check, or
+  cancels pending observation. A stop concurrent with or after publication may
+  arrive too late to prevent START and cannot retract a delivered command.
+  Cancellation does not prove the robot's physical state.
 - `status` is visible in the action selector and reads workmode and whether an
   earlier enable attempt remains uncertain; `info` provides the same result for
   the platform. The mode comes from SDK cache and its freshness is unknown.
