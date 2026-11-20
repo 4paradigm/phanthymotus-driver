@@ -1,12 +1,15 @@
 """Exercise EEF discovery and arbitration through the driver's public dispatcher."""
+import asyncio
 import io
 import json
+import time
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import check
 from common.control import parse_descriptor
 from device import Adapter, VERSION
+from vendor import RobotReader
 
 
 class EefWiringTests(unittest.IsolatedAsyncioTestCase):
@@ -63,6 +66,49 @@ class EefWiringTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await a.servo_eef.close()
             await a.arm_servo.close()
+
+    async def test_native_sample_anchors_single_move_and_other_side_holds(self):
+        reader = RobotReader({'serial': 'DACH_TRON2A_TEST'})
+        reader.connected, reader.ws = True, Mock(closed=False)
+        reader.configuration = {'mode': 'upper_limb', 'state': 'identified'}
+        poses = {'result': 'success', 'left_position': [.48, .2, -.38], 'left_quat': [1., 0., 0., 0.],
+                 'right_position': [.41, -.21, -.37], 'right_quat': [.8, 0., -.6, 0.]}
+        reader.read_move_pose = AsyncMock(side_effect=lambda: dict(poses, timestamp=time.time_ns() // 1_000_000))
+        reader.read_gripper = AsyncMock(side_effect=lambda: {'result': 'success',
+            'timestamp': time.time_ns() // 1_000_000, 'left_opening': 40, 'right_opening': 47})
+        reader.sample = Mock(return_value={'available': True, 'data': {'working_mode': 'developer_mode',
+            'working_mode_valid': True, 'motor': 'OK', 'collision_enable_valid': True, 'collision_enable': True,
+            'compliant_enable_valid': True, 'compliant_enable': False}})
+        reader.send_move_p = AsyncMock(return_value={'status': 'accepted'})
+        reader.send_gripper = AsyncMock()
+        frames = asyncio.Queue()
+        a = Adapter(lambda topic, packet: frames.put_nowait((topic, packet)),
+                    {'enabled_cards': ['eef_state', 'servo_eef']}, reader=reader)
+        bus = a.servo_eef.publisher = Mock()
+        sensor = asyncio.create_task(a.eef_state.run())
+        try:
+            await a.execute_tool('eef_state', {'action': 'start'})
+            await a.execute_tool('servo_eef', {'action': 'start', 'input_topic': '/test/control/eef'})
+            self.assertEqual(bus.subscribe_json.call_args.args[0], '/test/control/eef')
+            callback = bus.subscribe_json.call_args.args[1]
+            topic, state = await asyncio.wait_for(frames.get(), 1.)
+            self.assertEqual(topic, '/limx_tron2/state/eef')
+            target = state['eef'].copy()
+            target[0] -= .002
+            for seq in (1, 2):
+                callback(json.dumps({'schema': 'motus.control/1', 'source': 'native-eef-test',
+                    'seq': seq, 'ttl_ms': 200, 'stamp_ms': time.time_ns() // 1_000_000,
+                    'obs_stamp_ms': state['stamp_ms'], 'mode': 'eef_pose', 'dof': 16, 'values': target}))
+                await asyncio.sleep(.03)
+            reader.send_move_p.assert_awaited_once()
+            left, right = reader.send_move_p.await_args.args[:2]
+            self.assertEqual(list(left), target[:7])
+            self.assertEqual(list(right), state['eef'][8:15])
+            reader.send_gripper.assert_not_awaited()
+        finally:
+            await a.servo_eef.close()
+            sensor.cancel()
+            await asyncio.gather(sensor, return_exceptions=True)
 
     async def test_readonly_checker_for_standalone_cards(self):
         for name in ('eef_state', 'servo_eef'):

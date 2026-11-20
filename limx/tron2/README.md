@@ -38,7 +38,7 @@
 | 8–14 | 右手 TCP 的 x、y、z（m）和单位四元数 qx、qy、qz、qw |
 | 15 | 右夹爪名义开口（m） |
 
-TCP 使用厂商操作模型的 `L_ee_link`、`R_ee_link`。两侧从旧版任务卡使用的 URDF grasper 原点到 TCP，旋转相同，在 grasper 局部坐标系的平移为 `[-0.0021, 0, -0.1313]` m。状态由实测关节角正解，控制端用同一 TCP 解逆运动学。夹爪的 0～0.085 m 按驱动既有名义映射对应原始值 0～94。零是有效的闭合读数。[厂商 TCP 模型](https://github.com/limxdynamics/tron2_manipulation_controller/blob/10af63c20e0dd2149168c6693453cc28f2c2dcbf/Tron2_controller/install/etc/tron2_manipulation_config/robot.urdf)
+末端位姿采用厂商 MoveP 使用的参考点和基座坐标系。`eef_state` 直接读取 `request_get_move_pose` 返回的左右臂位姿，并将厂商四元数 `wxyz` 转成话题上的 `xyzw`。`request_get_limx_2fclaw_state` 提供夹爪反馈，原始值 0～94 对应名义开口 0～0.085 m，零表示闭合。[厂商 SDK 指南 §3.6.3、§3.6.6](https://www.limxdynamics.com/zh/documents/847884267345285120)
 
 每条指令都指定双臂和双夹爪的绝对目标。以下示例从静止、空爪状态开始，沿基座 Z 轴抬高左手 3 mm。如果夹爪正在夹持物体，抬臂时要保留上一次要求的闭合开口。物体可能使实际开口大于这个目标。若非选侧仍有在途目标，也应将原目标带入新帧。
 
@@ -56,15 +56,18 @@ def lift_command(state, seq):
     }
 ```
 
-控制卡通过 `start` 订阅。共享 `ControlSink` 按来源、优先级、序号和有效期接收命令。依据末端反馈或相机等外部观测计算的目标应附上真实的 `obs_stamp_ms`，每帧按 `info.control_interface.rate.max_obs_age_ms` 检查该观测的年龄。直接给定的绝对目标可省略该字段。若引用本驱动的实测帧并原样发回 TCP，驱动可使用该帧的关节角保持对应臂。
+控制卡通过 `start` 订阅。共享 `ControlSink` 按来源、优先级、序号和有效期接收命令。依据末端反馈或相机等观测计算的目标应附上真实的 `obs_stamp_ms`，每帧按 `info.control_interface.rate.max_obs_age_ms` 检查其年龄。直接给定的绝对目标可省略该字段。沿用本驱动某个实测帧的 TCP 时可引用其时间戳，使执行卡识别需要保持的臂。
 
-上游按描述符的 `expected_hz` 发送有效命令。超过 `watchdog_ms` 未收到有效帧时，驱动停止继续生成旧目标的运动指令。已交给夹爪的动作可能继续，实际开口以反馈为准。
+机械臂使用原厂 `request_movep`，每次发送左右臂两个目标位姿及本段运动时间。驱动从实测姿态沿请求方向生成有界的短段，并在持续收到有效目标时向终点推进。目标超过厂商位置范围时，沿该方向最多运动到边界。每个短段都必须满足以下厂商限制，单位为 m。
 
-有效的新目标替换对应组的在途指令。驱动按关节速度、加速度和硬限位插补，向厂商提交最终关节指令后结束该臂的输出。16 轴 ServoJ 同时包含另一臂和头部的保持指令。夹爪开口按 0～0.085 m 限幅，同帧中有效的手臂目标仍可执行。
+| 机械臂 | x | y | z |
+| --- | --- | --- | --- |
+| 左臂 | 0.250～0.732 | −0.213～0.900 | −0.673～0.500 |
+| 右臂 | 0.250～0.732 | −0.900～0.213 | −0.673～0.500 |
 
-描述符的 xyz 上下界表示可受理的目标数值范围。实际可达范围由机械臂模型、当前姿态和厂家关节限位决定。IK 优先求请求的完整位姿。如果目标超出工作空间或关节限位使完整目标无法求解，会在同一平移方向和旋转轴上按相同比例缩短请求，选取找到的可行终点。10 cm、30° 以内的局部解每个关节相对起始角最多变化 35°。同一连接上重复发送相同绝对目标会沿用已下发的指令。求解期间收到同一目标的新帧会更新该目标的有效时间，收到不同目标则丢弃旧解，按最新帧求解。关节插值期间 TCP 路径可能弯曲。如果某只手臂沿请求方向找不到可行步，该臂保持，`info.last.held_at_boundary` 标出这一侧，另一臂和夹爪仍处理各自的有效目标。输入无效、反馈异常或目标过期仍会拒收新帧。已受理目标的 `info.last.planned_tcp` 记录本帧新求解的各臂名义终点。
+只移动一只手臂时，另一只手臂也需要有合法的保持目标。如果应保持的手臂已经超出上表范围，驱动拒绝发送本次双臂 MoveP，并在 `info.last.arm_error` 说明原因。夹爪通过独立原厂命令下发，开口按 0～0.085 m 限幅；同帧夹爪执行成功、双臂目标被拒时，`info.last.status` 为 `partial`。
 
-任务卡从 `state/eef` 读取发令后时间戳推进的实测帧，使用自己的位置、姿态、开口公差和稳定时间判断到位。`accepted` 表示指令受理，`active_arms` 表示驱动正在生成关节指令的手臂。夹爪的名义开口分辨率约 0.9 mm。驱动在 ServoJ 发送期间检查关节反馈新鲜度、机器人状态和实测关节相对指令的异常偏差。运行故障会暂停发送，`info.last` 提供原因。`stop` 或 `pause` 时若夹爪写入仍在等待厂商答复，驱动取消本地等待，记录 `outcome_unknown` 和对应指令时间戳。已经交给厂商的动作可能继续，应根据新反馈判断现场状态。
+上游按 `info.control_interface.rate.expected_hz` 发送目标。断流超过 `watchdog_ms` 后停止发送后续运动段。厂商已受理的 MoveP 或夹爪动作可能继续；等待回复时停止卡片也可能得到 `outcome_unknown`。MoveP 成功回复表示厂商受理该段指令。任务卡使用后续 `state/eef` 实测帧及自身的位置、姿态和开口公差判断到位。
 
 夹爪卡片说明见 [夹爪卡片使用说明](GRIPPER.md)。只填写side（left/right）、opening_mm（0至85mm）、speed、force；没有action/close/recover选项。驱动按底层值=毫米数×94/85名义换算，0mm闭合。非法输入在占用任务和发送前拒绝，两侧独立管理；合法指令仍保留未到位或断连保护。
 
@@ -142,7 +145,7 @@ VOP发布时间、可选处理耗时、本地接收时间只用于新鲜度/重�
 
 ## 读取边界与字段说明
 
-骨架传感器通过 `request_get_joint_state` 读取关节。`eef_state` 运行期间，或驱动配置启用了 `servo_eef` 时，驱动还会定期读取左右夹爪开口。arm_control仅在显式move/reset调用时发送一次request_movej；move_head在显式move时发送一次request_moveh；显式启用人物跟随后，跟随模块占用同一头部通道发送带ACK关联的两轴MoveH最新目标流；夹爪卡片仅在显式读取状态或跟踪开合动作时查询夹爪，显式开合只发送一次所选侧的指令。pose仅在显式选择英文动作后自检、必要时先回原home并确认，再回正头部，以ServoJ执行预设轨迹；挥手在右肩旋转三轮后保持手臂、右夹爪开合一次，再回原home。没有模式切换、拖动示教或自动演示循环。
+骨架传感器通过 `request_get_joint_state` 读取关节。`eef_state` 运行期间，或驱动配置启用了 `servo_eef` 时，驱动还会定期读取原厂双臂末端位姿和左右夹爪开口。arm_control仅在显式move/reset调用时发送一次request_movej；move_head在显式move时发送一次request_moveh；显式启用人物跟随后，跟随模块占用同一头部通道发送带ACK关联的两轴MoveH最新目标流；夹爪卡片仅在显式读取状态或跟踪开合动作时查询夹爪，显式开合只发送一次所选侧的指令。pose仅在显式选择英文动作后自检、必要时先回原home并确认，再回正头部，以ServoJ执行预设轨迹；挥手在右肩旋转三轮后保持手臂、右夹爪开合一次，再回原home。没有模式切换、拖动示教或自动演示循环。
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。
@@ -257,7 +260,7 @@ reset自动复位检查与动作完成跟踪为同一个过程，无需另调ver
 - 只有验证成功且回调送达才释放本地所有权。反馈验证失败或回调无法送达会保留blocked_requires_operator_check，阻止新的运动。失败通知和Core超时不会物理停止机械臂；现场确认停止、处理原因后再重启驱动。内部start/stop不会清除该状态，stop仍不是急停。
 - 进程正常关闭时终止验证任务并报告error，说明运动可能继续；不发送停机、复位或第二条运动命令。进程强制退出无法保证回调，Core保留120秒超时兜底。
 
-Dockerfile 通过 dpkg 检查 `python3-pip`、`ca-certificates` 和 `python3-numpy`，按需通过 apt 安装。`servo_eef` 的 TRON2 运动学使用系统 NumPy。`requirements.txt` 管理 HTTP/WebSocket 和配置解析使用的 aiohttp 和 PyYAML。
+Dockerfile 通过 dpkg 检查 `python3-pip` 和 `ca-certificates`，按需通过 apt 安装。`requirements.txt` 管理 HTTP/WebSocket 和配置解析使用的 aiohttp 和 PyYAML。
 
 ## 头部与左右腕RGB摄像头
 

@@ -1,4 +1,4 @@
-"""Full absolute TCP and gripper targets for the TRON2 tabletop task executor."""
+"""Receive standard two-arm EEF targets and dispatch paired native TRON2 MoveP."""
 import asyncio
 import json
 import math
@@ -7,467 +7,334 @@ import time
 from pathlib import Path
 from sys import float_info
 
-from common.control import ControlSink, SCHEMA, parse_descriptor
-
-from arm_servo import Limiter, MAX_ACCELERATION, MAX_OUTPUT_GAP, MAX_VELOCITY, OUTPUT_HZ, TRACKING_LIMIT, MAX_HZ, WATCHDOG_MS
-from eef_kinematics import NoFeasibleStep
-from eef_state import CONTROL_TOPIC, FRAME
+from common.control import ControlSink, SCHEMA, parse_descriptor, rotation
+from arm_servo import MAX_HZ, WATCHDOG_MS
+from eef_state import CONTROL_TOPIC, FRAME, SIDES
 from gripper import MAX_OPENING_MM, command
-from vendor import ARM_LOWER, ARM_UPPER, MoveError, motion_readiness, reject_constant
+from vendor import MOVE_P_BOUNDS, MoveError, motion_readiness, reject_constant
 
-SIDES = ("left", "right")
 MAX_OBS_AGE_MS = 1000
 MAX_FUTURE_MS = 100
+# A submitted native point move can finish after the publisher goes silent.
+# Bound that commitment in both time and Cartesian distance.
+MOVE_TIME_S = WATCHDOG_MS / 1000
+LINEAR_M_S = .10
+ANGULAR_RAD_S = .50
+MAX_GAP_M = MAX_OPENING_MM / 1000
 
 
 def build_descriptor():
     names, groups = [], []
-    for offset, side in ((0, "l"), (8, "r")):
+    for i, side in enumerate(("l", "r")):
         names.extend(f"eef_{side}_{axis}" for axis in ("x", "y", "z", "qx", "qy", "qz", "qw"))
         names.append(f"gripper_{side}")
-        groups.extend([{"name": f"eef_{side}", "offset": offset, "count": 7, "unit": "m+quat",
+        groups.extend([{"name": f"eef_{side}", "offset": 8*i, "count": 7, "unit": "m+quat",
                         "mode": "eef_pose", "resource": f"arm_{side}"},
-                       {"name": f"gripper_{side}", "offset": offset + 7, "count": 1, "unit": "m",
+                       {"name": f"gripper_{side}", "offset": 8*i+7, "count": 1, "unit": "m",
                         "mode": "joint_position", "resource": f"gripper_{side}"}])
-    # XYZ bounds describe accepted requests; joint-limited IK finds the reachable endpoint.
-    lower = [-float_info.max] * 3 + [-1.] * 4 + [0.]
-    upper = [float_info.max] * 3 + [1.] * 4 + [MAX_OPENING_MM / 1000.]
+    # The request space includes out-of-box goals and observed stationary peers.
+    # The separate vendor box applies to both poses in every actual MoveP write.
+    lower = [-float_info.max]*3 + [-1.]*4 + [0.]
+    upper = [float_info.max]*3 + [1.]*4 + [MAX_GAP_M]
     return {"control_interface": SCHEMA, "mode": "eef_pose", "dof": 16, "frame": FRAME,
             "joint_names": names, "groups": groups, "units": {"length": "m", "rotation": "quat_xyzw", "time": "s"},
-            "limits": {"lower": lower * 2, "upper": upper * 2}, "force_torque": None, "urdf_ref": "model",
-            "end_effector": {"left": "L_ee_link", "right": "R_ee_link"},
+            "limits": {"lower": lower*2, "upper": upper*2}, "force_torque": None,
+            "end_effector": {"workspace_m": MOVE_P_BOUNDS, "pose_source": "request_get_move_pose"},
             "rate": {"expected_hz": 10, "max_hz": MAX_HZ, "watchdog_ms": WATCHDOG_MS,
                      "max_obs_age_ms": MAX_OBS_AGE_MS}}
 
 
 def canonical_pose(pose):
-    quaternion = pose[3:]
-    length = math.hypot(*quaternion)
-    if abs(length - 1.) > .001:
-        raise ValueError("Expected a unit quaternion (xyzw)")
-    # q and -q command exactly the same orientation, including at half turns.
-    sign = next(v for v in reversed(quaternion) if v != 0.)
-    return pose[:3] + [v / math.copysign(length, sign) for v in quaternion]
+    q = rotation.normalize(pose[3:])
+    sign = next(v for v in reversed(q) if v)
+    return (*pose[:3], *(v * math.copysign(1., sign) for v in q))
 
 
-def decode(raw):
-    if not isinstance(raw, str) or len(raw) > 8192:
-        raise ValueError("Expected a control JSON message of at most 8 KiB")
-    msg = json.loads(raw, parse_constant=reject_constant)
-    if not isinstance(msg, dict) or msg.get("frame", FRAME) != FRAME or msg.get("gripper") is not None:
-        raise ValueError(f"Expected both grippers in values, with TCPs in {FRAME}")
-    now = time.time_ns() // 1_000_000
-    for field in ("stamp_ms", "obs_stamp_ms"):
-        stamp = msg.get(field)
-        if stamp is not None and (type(stamp) is not int or not 0 < stamp <= now + MAX_FUTURE_MS):
-            raise ValueError(f"Expected a Unix millisecond {field} without future clock skew")
-    # Saturate the two physical openings before the shared whole-frame hard-limit check.
-    # Malformed fields are left for ControlSink's contract validation.
-    overflow = {}
-    values = msg.get("values")
-    if isinstance(values, list) and len(values) == 16:
-        for side, i in zip(SIDES, (7, 15)):
-            gap = values[i]
-            if type(gap) in (float, int) and math.isfinite(gap):
-                limit = min(MAX_OPENING_MM / 1000., max(0., gap))
-                if limit != gap:
-                    overflow[side] = gap
-                    values[i] = limit
-    return msg, overflow
-
-
-def _command_step(limiter, target, dt):
-    """End the slew on the exact IK setpoint when a final bounded step can hold it."""
-    previous, velocities = limiter.q.copy(), limiter.v.copy()
-    limiter.step(target, dt)
-    dv = MAX_ACCELERATION * dt
-    for i, goal in enumerate(target):
-        final_speed = (goal - previous[i]) / dt
-        if abs(final_speed) <= min(MAX_VELOCITY, dv) and abs(final_speed - velocities[i]) <= dv:
-            limiter.q[i], limiter.v[i] = goal, 0.
-    return limiter.q.copy()
+def waypoint(side, start, goal):
+    """Return a bounded point along the requested pose displacement and whether to continue."""
+    bounds = MOVE_P_BOUNDS[side]
+    delta = [end - begin for end, begin in zip(goal[:3], start[:3])]
+    fraction = 1.
+    for coord, step, end, (low, high) in zip(start, delta, goal, bounds):
+        if not low <= end <= high:
+            if not low <= coord <= high:
+                raise ValueError(f"{side} MoveP target is outside the vendor workspace")
+            edge = high if end > high else low
+            fraction = min(fraction, (edge - coord) / step)
+    # Scale first so even a finite request near the float limit keeps its direction.
+    scale = max(map(abs, delta))
+    step_fraction = 1.
+    if scale:
+        step_fraction = min(1., (LINEAR_M_S * MOVE_TIME_S / math.hypot(*(d/scale for d in delta))) / scale)
+    angle = rotation.angle_between(start[3:], goal[3:])
+    if angle:
+        step_fraction = min(step_fraction, ANGULAR_RAD_S * MOVE_TIME_S / angle)
+    portion = min(fraction, step_fraction)
+    if portion == 0.:
+        return start, False
+    if portion == 1.:
+        return goal, False
+    xyz = tuple(a + portion*d for a, d in zip(start, delta))
+    if any(not lo-1e-12 <= a <= hi+1e-12 for a, (lo, hi) in zip(xyz, bounds)):
+        raise ValueError(f"{side} MoveP cannot take a bounded step from the measured pose")
+    # Remove roundoff at a box face only after establishing the segment is inside.
+    xyz = tuple(min(hi, max(lo, a)) for a, (lo, hi) in zip(xyz, bounds))
+    q, _ = rotation.slerp_limit(start[3:], goal[3:], angle * portion)
+    return (*xyz, *q), step_fraction < fraction
 
 
 class EefServo:
     def __init__(self, adapter, state):
         self.adapter, self.reader, self.state = adapter, adapter.reader, state
-        self.publisher = self.subscription = self.worker = self.output = self.watchdog = None
+        self.publisher = self.subscription = self.sink = None
+        self.worker = self.watchdog = self.wake = self.latest = None
         self.running = self.paused = False
-        self.queue = self.token = None
-        self.latest = self.pending_ik = None
-        self.descriptor = build_descriptor()
-        self.sink = None
-        self.deadline = 0.
-        self.echo_arms, self.echo_jaws = {}, set()
-        self.gripper_send = None
-        self.last_stamp = -1
-        self.arms = {}
-        self.jaws = {}
-        self.poses = {}
-        self.held_at_boundary = set()
-        self.target_session = None
-        self.last = None
-        self.rejected = self.accepted = 0
-        self.overruns = 0
         self.topic = CONTROL_TOPIC
+        self.descriptor = build_descriptor()
+        self.arm_intent = (None, None)
+        self.commanded = (None, None)
+        self.more = False
+        self.arm_error = None
+        self.next_segment = 0.
+        self.jaw_targets = {}
+        self.active_arms = []
+        self.inflight = self.session = self.last = None
+        self.accepted = self.rejected = self.overruns = 0
 
     def tool(self):
         return {"name": "servo_eef", "type": "actuator", "multiInstance": False,
-                "description": "Absolute vendor TCP targets (L_ee_link / R_ee_link) in base_Link, metres and xyzw. "
-                               "Left pose (7), opening (1), right pose (7), opening (1). "
-                               "Send all 16 values in the motus.control/1 values array for each absolute target. The task evaluates arrival from state/eef.",
+                "description": "Standard absolute TCP and opening targets: left pose (7), opening (1), "
+                               "right pose (7), opening (1), metres and xyzw in base_Link. Uses paired native MoveP.",
                 "inputSchema": {"type": "object", "required": ["action"], "properties": {
                     "action": {"type": "string", "enum": ["start", "stop", "pause", "resume", "info"]},
                     "input_topic": {"type": "string", "default": CONTROL_TOPIC}},
-                    "x-hooks": {"on_interrupt_motion": {"action": "pause"},
-                                "on_interrupt_all": {"action": "pause"}},
-                    "x-is-dangerous": True,
-                    "x-resource": ["arm_l", "arm_r", "head", "gripper_l", "gripper_r"]},
-                "topic_in": [{"format": "control/eef", "topic": CONTROL_TOPIC,
-                              "desc": f"{SCHEMA}, both TCP poses and both gripper openings"}]}
+                    "x-hooks": {"on_interrupt_motion": {"action": "pause"}, "on_interrupt_all": {"action": "pause"}},
+                    "x-is-dangerous": True, "x-resource": ["arm_l", "arm_r", "gripper_l", "gripper_r"]},
+                "topic_in": [{"format": "control/eef", "topic": CONTROL_TOPIC}]}
 
     def info(self):
         return {"state": "idle" if not self.running else "paused" if self.paused else "running",
-                "paused": self.paused,
-                "topic_in": [{"format": "control/eef", "topic": self.topic}],
+                "paused": self.paused, "topic_in": [{"format": "control/eef", "topic": self.topic}],
                 "control_interface": self.descriptor, "sink": self.sink.stats() if self.sink else {},
                 "accepted": self.accepted, "rejected": self.rejected, "queue_full": self.overruns,
-                "active_arms": list(self.arms), "last": self.last}
+                "active_arms": list(self.active_arms), "last": self.last}
 
     def _ready(self):
-        self.adapter.arm_servo._conflict(self.token)
+        self.adapter.arm_servo._conflict()
         status = self.reader.sample("robot_status")
         data = status.get("data") or {}
-        if (Path(os.environ.get("TRON2_MOTION_MAINTENANCE_FILE",
-                                "/config/tron2/motion-maintenance.json")).exists()
-                or not status["available"] or data.get("motor") != "OK"
-                or not motion_readiness(data)["ready"]
-                or self.reader.configuration.get("mode") != "upper_limb"):
+        if (Path(os.environ.get("TRON2_MOTION_MAINTENANCE_FILE", "/config/tron2/motion-maintenance.json")).exists()
+                or self.reader.configuration.get("mode") != "upper_limb" or not status["available"]
+                or data.get("motor") != "OK" or not motion_readiness(data)["ready"]):
             raise ValueError("DACH upper-limb motion is unavailable")
-
-    def _solve_arms(self, targets, joints):
-        solutions, blocked = {}, set()
-        for side, pose in targets.items():
-            seed = joints[:7] if side == "left" else joints[7:14]
-            try:
-                solutions[side] = self.state.kinematics.solve(side, pose[:3], pose[3:], seed)
-            except NoFeasibleStep:
-                blocked.add(side)
-        return solutions, blocked
-
-    async def _apply(self, stamp, poses, requested_jaws, clamped, observed):
-        echo_arms, echo_jaws = self.echo_arms, self.echo_jaws
-
-        def current():
-            # New measurement/command stamps may renew the same target during IK or SDK I/O.
-            return (not self.paused and self.latest is not None and self.latest[1:3] == (poses, requested_jaws)
-                    and self.echo_arms.keys() == echo_arms.keys() and self.echo_jaws == echo_jaws
-                    and time.monotonic() < self.deadline)
-
-        if not current():
-            return
-        self._ready()
-        measured = self.state.values()
-        session = self.reader.ws
-        if self.target_session is not session:
-            self.jaws.clear()
-            self.poses.clear()
-            self.held_at_boundary.clear()
-            self.target_session = session
-        # Only a previously commanded arm needs one joint-space hold on transition.
-        to_hold = {side for side in echo_arms if side in self.poses
-                   and (side not in self.held_at_boundary or side in self.arms)}
-        to_solve = {}
-        for i, side in enumerate(SIDES):
-            pose = poses[side]
-            if side in echo_arms or pose == self.poses.get(side):
-                continue
-            if side in self.poses or side in self.arms or pose != canonical_pose(measured[8*i:8*i + 7]):
-                to_solve[side] = pose
-        held = {s for s in self.held_at_boundary.difference(echo_arms) if poses[s] == self.poses[s]}
-        solved = {}
-        if to_solve:
-            joints = self.state.joints()
-            # Cancelling the wait discards an obsolete result. The solver thread
-            # does only numerical work and has no access to motor output.
-            loop = asyncio.get_running_loop()
-            self.pending_ik = loop.run_in_executor(None, self._solve_arms, to_solve, joints)
-            try:
-                solved, blocked = await self.pending_ik
-            except asyncio.CancelledError:
-                if self.paused:
-                    raise
-                return
-            finally:
-                self.pending_ik = None
-            if not current():
-                return
-            stamp = self.latest[0]
-            if self.reader.ws is not session:
-                raise ValueError("Robot connection changed while solving IK")
-            self._ready()
-            measured = self.state.values()
-            held.update(blocked)
-            to_hold.update(blocked.intersection(self.arms))
-        if to_solve or to_hold:
-            _, measured_q, speeds = self.state.joint_snapshot()
-            if to_solve and max(abs(a - b) for a, b in zip(measured_q, joints)) > TRACKING_LIMIT:
-                raise ValueError("Robot configuration changed while solving IK")
-        if solved or to_hold:
-            if self.token is None and max(map(abs, speeds)) > .05:
-                raise ValueError("Cannot take over a moving arm or head")
-            Limiter(measured_q)
-            for side in to_hold:
-                start = 7 * SIDES.index(side)
-                # An echoed TCP refers to the encoders of that same observation.
-                # A blocked IK step holds the live configuration instead.
-                goal = self.echo_arms.get(side, measured_q[start:start + 7])
-                solved[side] = [min(ARM_UPPER[i], max(ARM_LOWER[i], q))
-                                for i, q in enumerate(goal, start)]
-        # A previous command can still be travelling even when the encoder
-        # currently reads the new goal. Replace that command if its goal changed.
-        cmds = {}
-        for i, side in enumerate(SIDES):
-            requested = requested_jaws[side]
-            gap = clamped.get(side, requested)
-            if side in echo_jaws and side not in self.jaws:
-                continue
-            previous = self.jaws.get(side, measured[8 * i + 7])
-            if gap != previous:
-                cmds[side] = command("open", {"opening_mm": gap * 1000., "speed": 15, "force": 30}, side)
-        planned_tcp = {side: self.state.kinematics.forward(side, joints) for side, joints in solved.items()}
-        if not current():
-            return
-        for side, joint_goal in solved.items():
-            self.arms[side] = (joint_goal, poses[side], stamp, self.deadline)
-        if solved and (self.output is None or self.output.done()):
-            self.output = asyncio.create_task(self._drive())
-        self.held_at_boundary = held
-        for side in echo_arms:
-            self.poses.pop(side, None)
-        self.poses.update(to_solve)
-        for side in echo_jaws - cmds.keys():
-            self.jaws.pop(side, None)
-        for index, (side, cmd) in enumerate(cmds.items()):
-            if index:
-                # The first gripper reply yielded control to the SDK and other jobs.
-                if self.paused or self.reader.ws is not session:
-                    raise MoveError("Interrupted EEF command or changed robot connection", None)
-                try:
-                    self._ready()
-                    self.state.values()
-                except ValueError as exc:
-                    raise MoveError(str(exc), None) from exc
-            if not current():
-                return
-            send = self.gripper_send = asyncio.create_task(self.reader.send_gripper(cmd))
-            try:
-                await asyncio.shield(send)
-            finally:
-                if send.done() and self.gripper_send is send:
-                    self.gripper_send = None
-            if side in echo_jaws:
-                self.jaws.pop(side, None)
-            else:
-                self.jaws[side] = clamped.get(side, requested_jaws[side])
-        if not current():
-            return
-        self.accepted += 1
-        self.last = {"status": "accepted", "stamp_ms": stamp, "planned_tcp": planned_tcp,
-                     "clamped_opening_m": clamped, "held_at_boundary": sorted(held)}
-
-    async def _drive(self):
-        try:
-            self._ready()
-            _, initial, speeds = self.state.joint_snapshot()
-            if max(map(abs, speeds)) > .05:
-                raise ValueError("Cannot take over a moving arm or head")
-            limiter = Limiter(initial)
-            target = list(initial)
-            with self.reader.pose_feedback(), self.reader.pose_servo({"motion_tool": "servo_eef"}) as token:
-                self.token = token
-                last = time.monotonic()
-                next_check = last
-                while self.arms and not self.paused:
-                    now = time.monotonic()
-                    for side, goal in self.arms.copy().items():
-                        if now >= goal[3]:
-                            del self.arms[side]
-                            self.poses[side] = None
-                            start = 7 * SIDES.index(side)
-                            target[start:start + 7] = limiter.q[start:start + 7]
-                            limiter.v[start:start + 7] = [0.] * 7
-                    if not self.arms:
-                        break
-                    if token.get("error"):
-                        raise ValueError(token["error"])
-                    if now >= next_check:
-                        self._ready()
-                        next_check = now + .05
-                    current = self.state.joints()
-                    if max(abs(a - b) for a, b in zip(current, limiter.q)) > TRACKING_LIMIT:
-                        raise ValueError("Tracking error exceeded the TRON2 servo limit")
-                    goals = self.arms.copy()
-                    for side, goal in goals.items():
-                        start = 7 * SIDES.index(side)
-                        target[start:start + 7] = goal[0]
-                    dt = now - last
-                    if dt > MAX_OUTPUT_GAP:
-                        raise ValueError("ServoJ output missed its deadline")
-                    command_q = _command_step(limiter, target, max(dt, .000001))
-                    await self.reader.send_arm_servoj(command_q, token)
-                    for side, goal in goals.items():
-                        start = 7 * SIDES.index(side)
-                        if (self.arms.get(side) is goal and command_q[start:start + 7] == goal[0]
-                                and not any(limiter.v[start:start + 7])):
-                            del self.arms[side]
-                    if not self.arms:
-                        break
-                    last = now
-                    await asyncio.sleep(max(0., 1 / OUTPUT_HZ - (time.monotonic() - now)))
-        except Exception as exc:
-            self._fault(exc)
-            self.last["arm_command_stamps"] = {side: goal[2] for side, goal in self.arms.items()}
-        finally:
-            self.token = None
-            self.arms.clear()
-
-    def _fault(self, exc, stamp=None):
-        self.paused = True
-        self.last = {"status": "fault", "reason": str(exc)[:300]}
-        if stamp is not None:
-            self.last["stamp_ms"] = stamp
-
-    async def _run(self, queue):
-        while True:
-            frame = await queue.get()
-            stamp = frame[0]
-            try:
-                if not self.paused:
-                    await self._apply(*frame)
-            except MoveError as exc:
-                self._fault(exc, stamp)
-            except (ValueError, TypeError, OverflowError, RecursionError) as exc:
-                self.rejected += 1
-                self.last = {"status": "rejected", "reason": str(exc)[:300], "stamp_ms": stamp}
-            except Exception as exc:
-                self._fault(exc, stamp)
-
-    def _echoed_groups(self, frame):
-        _, poses, jaws, _, observed = frame
-        arms, grippers = {}, set()
-        source = self.state.observation(observed) if observed is not None else None
-        if source is not None:
-            eef, joints = source
-            for i, side in enumerate(SIDES):
-                start = 8 * i
-                if poses[side] == canonical_pose(eef[start:start + 7]):
-                    arms[side] = joints[7*i:7*i + 7]
-                if jaws[side] == eef[start + 7]:
-                    grippers.add(side)
-        return arms, grippers
 
     def _clear_stream(self):
         self.latest = None
-        if self.pending_ik is not None:
-            self.pending_ik.cancel()
-        for side in self.arms:
-            # The last generated point may be in flight. A new frame may hold or retarget it.
-            self.poses[side] = None
-        self.arms.clear()
-        if self.queue is not None and not self.queue.empty():
-            self.queue.get_nowait()
+        if self.wake:
+            self.wake.clear()
 
     async def _watch(self):
         while True:
             outcome = self.sink.tick()
-            if outcome is not None and not self.paused:
+            if outcome and not self.paused:
                 self.last = {"status": outcome.verdict.value, "reason": outcome.reason}
             await asyncio.sleep(.02)
 
     def _subscribe(self):
         loop = asyncio.get_running_loop()
-        queue = asyncio.Queue(maxsize=1)
+        self.wake = wake = asyncio.Event()
+        message = original_gaps = None
 
-        # ControlSink calls apply synchronously within submit, on this event loop.
-        def apply(values, _gripper):
-            stamp, observed = message["stamp_ms"], message.get("obs_stamp_ms")
-            expires_ms = stamp + message["ttl_ms"]
+        def accept(values, _):
+            stamp = message["stamp_ms"]
+            observed = message.get("obs_stamp_ms")
+            expires = stamp + message["ttl_ms"]
             if observed is not None:
-                expires_ms = min(expires_ms, observed + MAX_OBS_AGE_MS)
-            # Only another frame for this arm target can extend its SDK output window.
-            remaining_ms = min(WATCHDOG_MS, expires_ms - time.time_ns() / 1_000_000)
-            self.deadline = time.monotonic() + remaining_ms / 1000
-            poses = {s: canonical_pose(list(values[i:i + 7])) for s, i in zip(SIDES, (0, 8))}
-            jaws = dict(zip(SIDES, (values[7], values[15])))
-            clamped = {side: jaws[side] for side in overflow}
-            jaws.update(overflow)  # An echoed measurement may itself exceed nominal stroke.
-            frame = (stamp, poses, jaws, clamped, observed)
-            self.last_stamp = stamp
-            if self.latest is None or self.latest[1:] != frame[1:] or self.target_session is not self.reader.ws:
-                self.echo_arms, self.echo_jaws = self._echoed_groups(frame)
-            self.latest = frame
-            for side, goal in self.arms.items():
-                if poses[side] == goal[1]:
-                    self.arms[side] = (*goal[:3], self.deadline)
-            if self.pending_ik is not None and len(self.echo_arms) == len(self.echo_jaws) == len(SIDES):
-                self.pending_ik.cancel()
-            if queue.full():
-                queue.get_nowait()
-                self.overruns += 1
-            queue.put_nowait(frame)
+                expires = min(expires, observed + MAX_OBS_AGE_MS)
+            remaining = min(WATCHDOG_MS, expires - time.time_ns()/1_000_000)
+            self.latest = (values, original_gaps, observed, stamp, time.monotonic() + remaining/1000)
+            self.overruns += int(wake.is_set())
+            wake.set()
 
-        message = overflow = None
+        self.sink = ControlSink(parse_descriptor(self.descriptor), accept, on_watchdog=self._clear_stream)
 
         def offer(raw):
-            nonlocal message, overflow
-            if self.queue is not queue or self.paused:
+            nonlocal message, original_gaps
+            if self.wake is not wake or self.paused:
                 return
             try:
-                message, overflow = decode(raw)
+                if not isinstance(raw, str) or len(raw) > 8192:
+                    raise ValueError("Expected a JSON control frame of at most 8 KiB")
+                message = json.loads(raw, parse_constant=reject_constant)
+                if not isinstance(message, dict) or message.get("frame", FRAME) != FRAME or message.get("gripper") is not None:
+                    raise ValueError("Expected both grippers in values and TCPs in base_Link")
+                now = time.time_ns() // 1_000_000
+                for name in ("stamp_ms", "obs_stamp_ms"):
+                    stamp = message.get(name)
+                    if stamp is not None and (type(stamp) is not int or not 0 < stamp <= now + MAX_FUTURE_MS):
+                        raise ValueError(f"Invalid {name}")
+                original_gaps = []
+                values = message.get("values")
+                if isinstance(values, list) and len(values) == 16:
+                    for i in (7, 15):
+                        gap = values[i]
+                        original_gaps.append(gap)
+                        if type(gap) in (int, float) and math.isfinite(gap):
+                            values[i] = min(MAX_GAP_M, max(0., gap))
                 outcome = self.sink.submit(message)
                 if not outcome.applied:
                     raise ValueError(outcome.reason)
-            except (ValueError, TypeError, OverflowError, RecursionError) as exc:
+            except (ValueError, TypeError, OverflowError, RecursionError) as error:
                 self.rejected += 1
-                self.last = {"status": "rejected", "reason": str(exc)[:300]}
+                self.last = {"status": "rejected", "reason": str(error)[:300]}
 
-        self.sink = ControlSink(parse_descriptor(self.descriptor), apply, on_watchdog=self._clear_stream)
-        self.queue = queue
         self.subscription = self.publisher.subscribe_json(self.topic, lambda raw: loop.call_soon_threadsafe(offer, raw))
-        self.worker = asyncio.create_task(self._run(queue))
+        self.worker = asyncio.create_task(self._run(wake))
         self.watchdog = asyncio.create_task(self._watch())
 
-    async def preempt(self, *, interrupt_gripper=False):
-        if not self.running:
+    def _valid(self, frame):
+        return (not self.paused and self.latest is not None and self.latest[:2] == frame[:2]
+                and self.reader.ws is self.session and time.monotonic() < self.latest[-1])
+
+    async def _arms(self, values, reference, measured):
+        poses = tuple(canonical_pose(values[i:i+7]) for i in (0, 8))
+        starts = tuple(canonical_pose(measured[i:i+7]) for i in (0, 8))
+        intent = tuple(None if p == canonical_pose(reference[i:i+7]) else p for p, i in zip(poses, (0, 8)))
+        now = time.monotonic()
+        repeated = intent == self.arm_intent
+        if repeated and (not self.more or now < self.next_segment):
             return
+        self.arm_intent, self.more, self.arm_error = intent, False, None
+        if intent == (None, None) and all(last is None or goal == last
+                                           for goal, last in zip(poses, self.commanded)):
+            self.commanded = (None, None)
+            return
+        pair, continuing = [], False
+        for side, goal, requested, start in zip(SIDES, poses, intent, starts):
+            if requested is None:
+                point = start
+                if any(not lo <= v <= hi for v, (lo, hi) in zip(point, MOVE_P_BOUNDS[side])):
+                    raise ValueError(f"Cannot send paired MoveP: held {side} arm is outside its vendor workspace")
+            else:
+                point, more = waypoint(side, start, goal)
+                continuing |= more
+            pair.append(point)
+        if tuple(pair) == starts and self.commanded == (None, None):
+            return
+        commanded = tuple(point if target is not None else None for point, target in zip(pair, intent))
+        if repeated and commanded == self.commanded:
+            self.more = continuing
+            return
+        self.inflight = "MoveP"
+        self.active_arms = [side for side, old, target in zip(SIDES, self.commanded, intent)
+                            if old is not None or target is not None]
+        try:
+            with self.reader.pose_servo({"motion_tool": "servo_eef"}) as token:
+                self.next_segment = now + MOVE_TIME_S
+                await self.reader.send_move_p(*pair, MOVE_TIME_S, token)
+        finally:
+            self.active_arms = []
+            self.inflight = None
+        self.more = continuing
+        self.commanded = commanded
+
+    async def _apply(self, frame):
+        values, raw_gaps, observed, stamp, _ = frame
+        self._ready()
+        if self.session is not self.reader.ws:
+            self.session = self.reader.ws
+            self.arm_intent = (None, None)
+            self.commanded = (None, None)
+            self.arm_error = None
+            self.more = False
+            self.jaw_targets.clear()
+        measured = self.state.values()
+        reference = (self.state.observation(observed) if observed is not None else None) or measured
+        if not self._valid(frame):
+            return
+        try:
+            await self._arms(values, reference, measured)
+        except ValueError as error:
+            if isinstance(error, MoveError) and (error.motion_sent is None or error.code == "outcome_unknown"):
+                raise
+            self.arm_error = str(error)
+        jaw_sent = []
+        for side, i, raw in zip(SIDES, (7, 15), raw_gaps):
+            if not self._valid(frame):
+                return
+            gap = values[i]
+            if raw == reference[i] and side not in self.jaw_targets:
+                continue
+            if gap == self.jaw_targets.get(side, measured[i]):
+                continue
+            self._ready()
+            self.state.values()
+            self.inflight = side + " gripper"
+            try:
+                await self.reader.send_gripper(command("open", {"opening_mm": gap*1000, "speed": 15, "force": 30}, side))
+            finally:
+                self.inflight = None
+            if raw == reference[i]:
+                self.jaw_targets.pop(side, None)
+            else:
+                self.jaw_targets[side] = gap
+            jaw_sent.append(side)
+        if not self._valid(frame):
+            return
+        status = "accepted"
+        if self.arm_error:
+            status = "partial" if jaw_sent else "rejected"
+        self.accepted += int(status != "rejected")
+        self.rejected += int(status != "accepted")
+        self.last = {"status": status, "stamp_ms": stamp, "grippers_sent": jaw_sent,
+                     "clamped_opening_m": {s: values[i] for s, i, g in zip(SIDES, (7, 15), raw_gaps) if values[i] != g}}
+        if self.arm_error:
+            self.last["arm_error"] = self.arm_error
+
+    async def _run(self, wake):
+        while True:
+            await wake.wait()
+            wake.clear()
+            frame = self.latest
+            if frame is None or self.paused:
+                continue
+            try:
+                await self._apply(frame)
+            except MoveError as error:
+                if error.motion_sent is not False:
+                    self.paused = True
+                self.rejected += 1
+                uncertain = self.paused and error.code != "vendor_rejected"
+                self.last = {"status": "outcome_unknown" if uncertain else "rejected", "reason": str(error)}
+            except (ValueError, TypeError, OverflowError) as error:
+                self.rejected += 1
+                self.last = {"status": "rejected", "reason": str(error)}
+            except Exception as error:
+                self.paused = True
+                self.last = {"status": "fault", "reason": str(error)}
+
+    async def preempt(self, *, interrupt_gripper=False):
         self.paused = True
-        self.queue = None
+        self.latest = self.wake = None
         if self.subscription is not None:
             self.publisher.unsubscribe(self.subscription)
             self.subscription = None
-        tasks = [task for task in (self.worker, self.output, self.watchdog) if task is not None]
-        pending = self.gripper_send
-        if interrupt_gripper and pending is not None:
-            # A single gripper ACK can race a stop of a multi-group command.
-            # It cannot confirm delivery of the complete frame.
-            if not pending.done():
-                pending.cancel()
-            self.last = {"status": "outcome_unknown", "stamp_ms": self.last_stamp,
-                         "reason": "Command output stopped during gripper dispatch"}
+        tasks = [t for t in (self.worker, self.watchdog) if t is not None]
+        if self.inflight:
+            self.last = {"status": "outcome_unknown", "reason": "Stopped while awaiting " + self.inflight}
+        if self.inflight == "MoveP":
+            self.next_segment = time.monotonic() + MOVE_TIME_S
         for task in tasks:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        if pending is not None:
-            await asyncio.gather(pending, return_exceptions=True)
-            self.gripper_send = None
-        self.worker = self.output = self.watchdog = None
-        self.arms.clear()
-        self.jaws.clear()
-        self.poses.clear()
-        self.held_at_boundary.clear()
-        self.latest = self.target_session = None
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if self.next_segment > time.monotonic():
+            await asyncio.sleep(self.next_segment - time.monotonic())
+        self.worker = self.watchdog = None
+        self.more = False
+        self.arm_error = None
+        self.arm_intent = (None, None)
+        self.commanded = (None, None)
+        self.jaw_targets.clear()
 
     async def call(self, args):
         action = args.get("action", "info")
@@ -480,16 +347,13 @@ class EefServo:
             return self.info()
         if action not in ("start", "resume"):
             raise ValueError("Unsupported servo_eef action")
-        if action == "start" and self.running or action == "resume" and not self.running:
+        if action == "start" and self.running or action == "resume" and (not self.running or not self.paused):
             return self.info()
-        if action == "resume" and not self.paused:
-            return self.info()
-        if self.publisher is None:
-            raise ValueError("EEF subscription has no ROS publisher")
         if self.running:
             await self.preempt()
         else:
-            topic = args.get("input_topic") or (args.get("input_topics") or [CONTROL_TOPIC])[0]
+            topics = args.get("input_topics") or [CONTROL_TOPIC]
+            topic = args.get("input_topic") or topics[0]
             if not isinstance(topic, str) or not topic.startswith("/") or len(topic) > 256:
                 raise ValueError("Expected an absolute control/eef topic name")
             self.topic = topic
