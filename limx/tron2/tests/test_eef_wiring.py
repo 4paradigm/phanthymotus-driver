@@ -54,9 +54,15 @@ class EefWiringTests(unittest.IsolatedAsyncioTestCase):
                          [(0, 7, 'eef_pose'), (7, 1, 'joint_position'),
                           (8, 7, 'eef_pose'), (15, 1, 'joint_position')])
         self.assertEqual(descriptor.eef_quat_offsets, (3, 11))
+        self.assertIsNotNone(descriptor.max_delta_per_step)
         for side, offset in (('left', 0), ('right', 8)):
             for i, bounds in enumerate(MOVE_P_BOUNDS[side], offset):
                 self.assertEqual((descriptor.lower[i], descriptor.upper[i]), bounds)
+                self.assertGreater(descriptor.max_delta_per_step[i], 0.)
+                self.assertLessEqual(descriptor.max_delta_per_step[i], .020 + 1e-9)
+            # The qx slot declares the limit on the whole rotation (radians).
+            self.assertGreater(descriptor.max_delta_per_step[offset + 3], 0.)
+            self.assertLessEqual(descriptor.max_delta_per_step[offset + 3], .100 + 1e-9)
             self.assertEqual((descriptor.lower[offset + 7], descriptor.upper[offset + 7]), (0., .085))
         self.assertGreater(descriptor.max_obs_age_ms, 0)
         self.assertEqual(descriptor.watchdog_ms, 200)

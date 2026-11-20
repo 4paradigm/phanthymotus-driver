@@ -5,10 +5,11 @@ import math
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
 
+from common.control import ControlSink
 from eef_state import CONTROL_TOPIC
 from servo_eef import EefServo, WATCHDOG_MS
 from vendor import MoveError, RobotReader
@@ -172,6 +173,9 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.reader.send_gripper.assert_awaited_once()
 
     async def test_raw_targets_outside_hard_limits_reject_every_write(self):
+        # Establish an in-range baseline: a step limiter alone could otherwise
+        # turn the illegal requests below into legal intermediate points.
+        await self.feed(self.measured)
         for index, raw in ((0, .733), (10, -.674), (7, .086), (15, -.001)):
             with self.subTest(index=index):
                 target = self.measured.copy()
@@ -273,14 +277,15 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         target[15] = .06
         self.servo.publisher.callback(message(target))
         await asyncio.wait_for(started.wait(), 1.)
-        interval = WATCHDOG_MS / 1000
         try:
-            await asyncio.sleep(interval + .10)
+            await wait_until(lambda: self.servo.info()['sink']['stood_down'])
+            self.assert_activity('stream_stood_down')
         finally:
             acknowledge.set()
         await asyncio.sleep(.05)
         self.reader.send_gripper.assert_not_awaited()
         self.reader.send_move_p.assert_awaited_once()
+        self.assert_activity('stream_stood_down')
 
     async def test_expired_observation_during_movep_ack_prevents_late_gripper(self):
         started, release = asyncio.Event(), asyncio.Event()
@@ -314,18 +319,21 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
 
         await self.feed(self.measured, stamp_ms=time.time_ns() // 1_000_000 - 500)
         await wait_until(lambda: self.servo.info()['sink']['stood_down'])
-        self.assertEqual(transitions(), [interrupted])
+        escalated = 'stream_stood_down'
+        self.assert_activity(escalated)
+        await asyncio.sleep(WATCHDOG_MS / 1000 + .03)
+        self.assertEqual(transitions(), [interrupted, escalated])
         with self.assertLogs('servo_eef', level='INFO') as resumed_log:
             await self.feed(self.measured)
             await self.feed(self.measured)
         self.assertEqual(len(resumed_log.records), 1)
-        self.assertEqual(transitions(), [interrupted, resumed])
+        self.assertEqual(transitions(), [interrupted, escalated, resumed])
         self.assert_activity(resumed)
         self.assertIn(self.servo.info()['activity']['text'], resumed_log.records[0].getMessage())
 
         await wait_until(lambda: transitions().count(interrupted) == 2)
         await self.feed(self.measured)
-        self.assertEqual(transitions(), [interrupted, resumed, interrupted, resumed])
+        self.assertEqual(transitions(), [interrupted, escalated, resumed, interrupted, resumed])
         self.reader.send_move_p.assert_not_awaited()
         self.reader.send_gripper.assert_not_awaited()
 
@@ -419,6 +427,85 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         second = self.reader.send_move_p.await_args.args[0]
         self.assertGreater(second[0], first[0])
         self.assertLessEqual(second[0], target[0])
+
+    async def test_first_diagonal_and_rotation_reach_vendor_as_one_sink_approved_point(self):
+        self.measured[3:7] = [0., 0., 0., 1.]
+        target = self.measured.copy()
+        target[:3] = [.64, .28, -.42]
+        target[3:7] = [0., 0., math.sin(.2), math.cos(.2)]
+        approved = []
+        submit = ControlSink.submit
+
+        def record_outcome(sink, frame):
+            outcome = submit(sink, frame)
+            if outcome.applied:
+                approved.append(outcome.values)
+            return outcome
+
+        with patch.object(ControlSink, 'submit', record_outcome):
+            await self.feed(target)
+        left, right, duration, _ = self.reader.send_move_p.await_args.args
+        self.assertIn((*left, target[7], *right, target[15]), approved)
+        self.assertEqual(list(right), RIGHT)
+        limits = self.servo.info()['control_interface']['end_effector']
+        self.assertAlmostEqual(duration, limits['move_time_s'])
+        dx, dy, dz = (end - start for end, start in zip(left[:3], self.measured))
+        self.assertGreater(dx, 0.)
+        self.assertAlmostEqual(dy, dx / 2)
+        self.assertAlmostEqual(dz, -dx / 4)
+        self.assertLessEqual(math.hypot(dx, dy, dz), limits['max_translation_per_step_m'] + 1e-9)
+        angle = 2 * math.atan2(left[5], left[6])
+        self.assertGreater(angle, 0.)
+        self.assertLessEqual(angle, limits['max_rotation_per_step_rad'] + 1e-9)
+
+    async def test_recovery_rebases_on_the_new_robot_measurement(self):
+        target = self.measured.copy()
+        target[0] += .14
+        await self.feed(target)
+        await wait_until(lambda: self.servo.info()['sink']['holding'])
+        self.measured[0] = .36
+        await self.feed(target)
+        point, right, duration, _ = self.reader.send_move_p.await_args.args
+        self.assertEqual(self.reader.send_move_p.await_count, 2)
+        self.assertGreater(point[0], self.measured[0])
+        self.assertLessEqual(point[0] - self.measured[0], .10 * duration + 1e-9)
+        self.assertEqual(list(right), RIGHT)
+
+    async def test_burst_during_pending_ack_cannot_accumulate_unsent_arm_steps(self):
+        release = asyncio.Event()
+
+        async def move(*_):
+            await release.wait()
+
+        self.reader.send_move_p.side_effect = move
+        target = self.measured.copy()
+        target[0] += .15
+        self.servo.publisher.callback(message(target))
+        try:
+            await wait_until(lambda: self.reader.send_move_p.await_count == 1)
+            for dx, dy in ((.15, 0.), (0., .06), (-.16, 0.)):
+                target[0], target[1] = LEFT[0] + dx, LEFT[1] + dy
+                for _ in range(10):
+                    self.servo.publisher.callback(message(target))
+            # Simulate movement of the first segment as its ACK is pending.
+            await asyncio.sleep(.04)
+            self.assertEqual(self.reader.send_move_p.await_count, 1)
+            self.measured[0] += .015
+        finally:
+            release.set()
+        # A host may discard the pending point if feedback changed during the ACK.
+        # Only a new, legitimately sequenced input may then drive the next point.
+        await asyncio.sleep(.03)
+        if self.reader.send_move_p.await_count == 1:
+            self.servo.publisher.callback(message(target))
+        await wait_until(lambda: self.reader.send_move_p.await_count >= 2)
+        left, right, duration, _ = self.reader.send_move_p.await_args.args
+        self.assertLess(left[0], self.measured[0])
+        self.assertAlmostEqual(left[1], self.measured[1])
+        self.assertLessEqual(math.dist(left[:3], self.measured[:3]), .10 * duration + 1e-9)
+        self.assertEqual(list(right), RIGHT)
+        await asyncio.sleep(.02)
+        self.assertEqual(self.reader.send_move_p.await_count, 2)
 
     async def test_only_latest_target_dispatches_after_pending_native_ack(self):
         started, release = asyncio.Event(), asyncio.Event()

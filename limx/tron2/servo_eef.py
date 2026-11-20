@@ -6,6 +6,7 @@ import math
 import os
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 from common.control import ControlSink, SCHEMA, parse_descriptor, rotation
 from arm_servo import MAX_HZ, WATCHDOG_MS
@@ -19,9 +20,12 @@ MAX_FUTURE_MS = 100
 MOVE_TIME_S = WATCHDOG_MS / 1000
 LINEAR_M_S = .10
 ANGULAR_RAD_S = .50
+LINEAR_STEP_M = LINEAR_M_S * MOVE_TIME_S
+ANGULAR_STEP_RAD = ANGULAR_RAD_S * MOVE_TIME_S
 MAX_GAP_M = MAX_OPENING_MM / 1000
 STREAM_MESSAGES = {
     "stream_interrupted": "servo_eef 控制流中断，已停止下发新的运动段",
+    "stream_stood_down": "servo_eef 控制流持续中断，已停止下发；厂商已受理的动作可能继续",
     "stream_resumed": "servo_eef 已收到新的有效目标，控制流恢复",
 }
 
@@ -41,10 +45,14 @@ def build_descriptor():
         upper.extend([*xyz_max, 1., 1., 1., 1., MAX_GAP_M])
     return {"control_interface": SCHEMA, "mode": "eef_pose", "dof": len(names), "frame": FRAME,
             "joint_names": names, "groups": groups, "units": {"length": "m", "rotation": "quat_xyzw", "time": "s"},
-            "limits": {"lower": lower, "upper": upper}, "force_torque": None,
+            "limits": {"lower": lower, "upper": upper,
+                       "max_delta_per_step": ([LINEAR_STEP_M]*3 + [ANGULAR_STEP_RAD]*4 + [MAX_GAP_M])*2},
+            "force_torque": None,
             "tip_frames": {side: f"MoveP_{side}_TCP" for side in SIDES}, "opening_m": [0., MAX_GAP_M],
             "state": {"schema": STATE_SCHEMA, "field": "eef"},
-            "end_effector": {"workspace_m": MOVE_P_BOUNDS, "pose_source": "request_get_move_pose"},
+            "end_effector": {"workspace_m": MOVE_P_BOUNDS, "pose_source": "request_get_move_pose",
+                             "max_translation_per_step_m": LINEAR_STEP_M, "max_rotation_per_step_rad": ANGULAR_STEP_RAD,
+                             "move_time_s": MOVE_TIME_S},
             "rate": {"expected_hz": 10, "max_hz": MAX_HZ, "watchdog_ms": WATCHDOG_MS,
                      "max_obs_age_ms": int(GRIPPER_MAX_AGE * 1000)}}
 
@@ -55,19 +63,40 @@ def canonical_pose(pose):
     return (*pose[:3], *(v * math.copysign(1., sign) for v in q))
 
 
-def waypoint(side, start, goal):
-    """Commit at most one watchdog period of Cartesian motion toward an admitted goal."""
-    distance = math.dist(start[:3], goal[:3])
-    angle = rotation.angle_between(start[3:], goal[3:])
-    portion = min(1., LINEAR_M_S * MOVE_TIME_S / distance if distance else 1.,
-                  ANGULAR_RAD_S * MOVE_TIME_S / angle if angle else 1.)
-    if portion == 1.:
-        return goal, False
-    xyz = tuple(a + portion * (b-a) for a, b in zip(start[:3], goal[:3]))
-    if any(not lo <= x <= hi for x, (lo, hi) in zip(xyz, MOVE_P_BOUNDS[side])):
-        raise ValueError(f"{side} MoveP cannot take a bounded step from the measured pose")
-    q, _ = rotation.slerp_limit(start[3:], goal[3:], angle * portion)
-    return (*xyz, *q), True
+def plan_step(values, measured, layout):
+    """Check the original target before reducing each TCP path to one native segment."""
+    if (not isinstance(values, list) or len(values) != layout.dof
+            or not all(type(v) in (int, float) and math.isfinite(v) for v in values)):
+        raise ValueError("Expected 16 finite EEF values")
+    target, step = list(values), list(values)
+    for i in (0, 8):
+        if any(not layout.lower[k] <= values[k] <= layout.upper[k] for k in (i, i+1, i+2, i+7)):
+            raise ValueError("EEF target is outside the declared hard limits")
+        if not rotation.is_unit(values[i+3:i+7]):
+            raise ValueError("Expected a unit xyzw quaternion")
+        start, goal = canonical_pose(measured[i:i+7]), canonical_pose(values[i:i+7])
+        target[i:i+7] = goal
+        distance = math.dist(start[:3], goal[:3])
+        angle = rotation.angle_between(start[3:], goal[3:])
+        portion = min(1., LINEAR_STEP_M / distance if distance else 1.,
+                      ANGULAR_STEP_RAD / angle if angle else 1.)
+        if portion == 1.:
+            step[i:i+7] = goal
+        else:
+            xyz = [a + portion*(b-a) for a, b in zip(start[:3], goal[:3])]
+            q, _ = rotation.slerp_limit(start[3:], goal[3:], angle * portion)
+            step[i:i+7] = [*xyz, *q]
+    return tuple(target), step
+
+
+class _Frame(NamedTuple):
+    target: tuple
+    step: tuple
+    source: str
+    stamp: int
+    deadline: float
+    session: object
+    stream: object
 
 
 class EefServo:
@@ -80,7 +109,6 @@ class EefServo:
         self.topic = CONTROL_TOPIC
         self.arm_intent = (None, None)
         self.commanded = (None, None)
-        self.more = False
         self.arm_error = None
         self.activity = None
         self.next_segment = 0.
@@ -131,13 +159,17 @@ class EefServo:
     def _subscribe(self):
         loop = asyncio.get_running_loop()
         self.wake = wake = asyncio.Event()
-        message = None
+        message = target = None
 
         def clear():
             if self.latest is not None:
                 self._announce("stream_interrupted")
             self.latest = None
             wake.clear()
+
+        def stand_down():
+            clear()
+            self._announce("stream_stood_down")
 
         def accept(values, _gripper):
             if sink.holding:
@@ -147,12 +179,13 @@ class EefServo:
             remaining_ms = min(WATCHDOG_MS, stamp + message["ttl_ms"] - now_ms)
             if message.get("obs_stamp_ms") is not None:
                 remaining_ms = min(remaining_ms, message["obs_stamp_ms"] + layout.max_obs_age_ms - now_ms)
-            self.latest = (values, stamp, time.monotonic() + remaining_ms/1000)
+            self.latest = _Frame(target, values, message["source"], stamp, time.monotonic() + remaining_ms/1000,
+                                 self.reader.ws, self.latest.stream if self.latest else object())
             self.overruns += int(wake.is_set())
             wake.set()
 
         layout = parse_descriptor(self.descriptor)
-        self.sink = sink = ControlSink(layout, accept, on_watchdog=clear, on_abort=clear)
+        self.sink = sink = ControlSink(layout, accept, on_watchdog=clear, on_abort=stand_down)
 
         async def watch():
             while True:
@@ -161,7 +194,7 @@ class EefServo:
                 await asyncio.sleep(.02)
 
         def offer(raw):
-            nonlocal message
+            nonlocal message, target
             if self.wake is not wake or self.paused:
                 return
             try:
@@ -176,7 +209,15 @@ class EefServo:
                     if stamp is not None and (type(stamp) is not int or not 0 < stamp <= now + MAX_FUTURE_MS):
                         raise ValueError(f"Invalid {key}")
                 sink.tick()
-                outcome = sink.submit(message)
+                measured = self.state.values()
+                target, step = plan_step(message.get("values"), measured, layout)
+                # Admission can run faster than native writes. Only physical feedback
+                # is a valid baseline, including the first frame after a reconnect.
+                baseline = list(measured)
+                for i in (0, 8):
+                    baseline[i:i+7] = canonical_pose(measured[i:i+7])
+                sink.rebase(baseline)
+                outcome = sink.submit({**message, "values": step})
                 if not outcome.applied:
                     self.rejected += 1
                     self.last = {"status": outcome.verdict.value, "reason": outcome.reason}
@@ -189,38 +230,24 @@ class EefServo:
         self.watchdog = asyncio.create_task(watch())
 
     def _valid(self, frame):
-        return (not self.paused and self.latest is not None and self.latest[0] == frame[0]
-                and self.reader.ws is self.session and time.monotonic() < self.latest[-1])
+        latest = self.latest
+        return (not self.paused and latest is not None and latest.stream is frame.stream
+                and frame.session is self.reader.ws and frame.source == latest.source
+                and frame.target == latest.target and time.monotonic() < min(frame.deadline, latest.deadline))
 
-    async def _arms(self, values, measured):
-        poses = tuple(canonical_pose(values[i:i+7]) for i in (0, 8))
-        starts = tuple(canonical_pose(measured[i:i+7]) for i in (0, 8))
-        intent = tuple(None if goal == start else goal for goal, start in zip(poses, starts))
+    async def _arms(self, goals, pair, starts):
+        intent = tuple(None if goal == start else goal for goal, start in zip(goals, starts))
         now = time.monotonic()
         repeated = intent == self.arm_intent
-        if repeated and (not self.more or now < self.next_segment):
+        if repeated and (self.arm_error or now < self.next_segment):
             return
-        self.arm_intent, self.more, self.arm_error = intent, False, None
-        if intent == (None, None) and all(last is None or goal == last
-                                           for goal, last in zip(poses, self.commanded)):
-            self.commanded = (None, None)
+        if intent == (None, None) and all(last is None or goal == last for goal, last in zip(goals, self.commanded)):
+            self.arm_intent, self.commanded, self.arm_error = intent, (None, None), None
             return
-        pair, continuing = [], False
-        for side, goal, requested, start in zip(SIDES, poses, intent, starts):
-            if requested is None:
-                point = start
-                if any(not lo <= v <= hi for v, (lo, hi) in zip(point, MOVE_P_BOUNDS[side])):
-                    raise ValueError(f"Cannot send paired MoveP: held {side} arm is outside its vendor workspace")
-            else:
-                point, more = waypoint(side, start, goal)
-                continuing |= more
-            pair.append(point)
-        if tuple(pair) == starts and self.commanded == (None, None):
-            return
-        commanded = tuple(point if target is not None else None for point, target in zip(pair, intent))
+        commanded = tuple(point if wanted is not None else None for point, wanted in zip(pair, intent))
         if repeated and commanded == self.commanded:
-            self.more = continuing
             return
+        self.arm_intent, self.arm_error = intent, None
         self.inflight = "MoveP"
         self.active_arms = [side for side, old, target in zip(SIDES, self.commanded, intent)
                             if old is not None or target is not None]
@@ -231,24 +258,33 @@ class EefServo:
         finally:
             self.active_arms = []
             self.inflight = None
-        self.more = continuing
         self.commanded = commanded
 
     async def _apply(self, frame):
-        values, stamp, _ = frame
+        values, stamp = frame.step, frame.stamp
         self._ready()
         if self.session is not self.reader.ws:
             self.session = self.reader.ws
             self.arm_intent = (None, None)
             self.commanded = (None, None)
             self.arm_error = None
-            self.more = False
             self.jaw_targets.clear()
         measured = self.state.values()
         if not self._valid(frame):
             return
+        goals = tuple(frame.target[i:i+7] for i in (0, 8))
+        pair = tuple(values[i:i+7] for i in (0, 8))
+        starts = tuple(canonical_pose(measured[i:i+7]) for i in (0, 8))
+        # Feedback may have advanced while a preceding SDK call was waiting for
+        # its reply. Drop a superseded segment; only a new source frame may replan it.
+        for start, point, goal in zip(starts, pair, goals):
+            if (math.dist(point[:3], start[:3]) > LINEAR_STEP_M + 1e-12
+                    or rotation.angle_between(start[3:], point[3:]) > ANGULAR_STEP_RAD + 1e-10
+                    or math.dist(point[:3], goal[:3]) > math.dist(start[:3], goal[:3]) + 1e-12
+                    or rotation.angle_between(point[3:], goal[3:]) > rotation.angle_between(start[3:], goal[3:]) + 1e-7):
+                raise ValueError("Measured TCP advanced beyond this segment; waiting for a fresh command")
         try:
-            await self._arms(values, measured)
+            await self._arms(goals, pair, starts)
         except ValueError as error:
             if isinstance(error, MoveError) and (error.motion_sent is None or error.code == "outcome_unknown"):
                 raise
@@ -324,7 +360,6 @@ class EefServo:
         if self.next_segment > time.monotonic():
             await asyncio.sleep(self.next_segment - time.monotonic())
         self.worker = self.watchdog = None
-        self.more = False
         self.arm_error = None
         self.arm_intent = (None, None)
         self.commanded = (None, None)
