@@ -5,16 +5,39 @@ import math
 import os
 import time
 from pathlib import Path
+from sys import float_info
 
-from arm_servo import Limiter, MAX_ACCELERATION, MAX_OUTPUT_GAP, MAX_VELOCITY, OUTPUT_HZ, TRACKING_LIMIT
+from common.control import ControlSink, SCHEMA, parse_descriptor
+
+from arm_servo import Limiter, MAX_ACCELERATION, MAX_OUTPUT_GAP, MAX_VELOCITY, OUTPUT_HZ, TRACKING_LIMIT, MAX_HZ, WATCHDOG_MS
 from eef_kinematics import NoFeasibleStep
-from eef_state import CONTROL_TOPIC, FRAME, SCHEMA
+from eef_state import CONTROL_TOPIC, FRAME
 from gripper import MAX_OPENING_MM, command
 from vendor import ARM_LOWER, ARM_UPPER, MoveError, motion_readiness, reject_constant
 
 SIDES = ("left", "right")
-MAX_AGE_MS = 1000
+MAX_OBS_AGE_MS = 1000
 MAX_FUTURE_MS = 100
+
+
+def build_descriptor():
+    names, groups = [], []
+    for offset, side in ((0, "l"), (8, "r")):
+        names.extend(f"eef_{side}_{axis}" for axis in ("x", "y", "z", "qx", "qy", "qz", "qw"))
+        names.append(f"gripper_{side}")
+        groups.extend([{"name": f"eef_{side}", "offset": offset, "count": 7, "unit": "m+quat",
+                        "mode": "eef_pose", "resource": f"arm_{side}"},
+                       {"name": f"gripper_{side}", "offset": offset + 7, "count": 1, "unit": "m",
+                        "mode": "joint_position", "resource": f"gripper_{side}"}])
+    # XYZ bounds describe accepted requests; joint-limited IK finds the reachable endpoint.
+    lower = [-float_info.max] * 3 + [-1.] * 4 + [0.]
+    upper = [float_info.max] * 3 + [1.] * 4 + [MAX_OPENING_MM / 1000.]
+    return {"control_interface": SCHEMA, "mode": "eef_pose", "dof": 16, "frame": FRAME,
+            "joint_names": names, "groups": groups, "units": {"length": "m", "rotation": "quat_xyzw", "time": "s"},
+            "limits": {"lower": lower * 2, "upper": upper * 2}, "force_torque": None, "urdf_ref": "model",
+            "end_effector": {"left": "L_ee_link", "right": "R_ee_link"},
+            "rate": {"expected_hz": 10, "max_hz": MAX_HZ, "watchdog_ms": WATCHDOG_MS,
+                     "max_obs_age_ms": MAX_OBS_AGE_MS}}
 
 
 def canonical_pose(pose):
@@ -27,42 +50,30 @@ def canonical_pose(pose):
     return pose[:3] + [v / math.copysign(length, sign) for v in quaternion]
 
 
-def decode(raw, *, include_observation=False):
+def decode(raw):
     if not isinstance(raw, str) or len(raw) > 8192:
-        raise ValueError("Expected an EEF JSON message of at most 8 KiB")
+        raise ValueError("Expected a control JSON message of at most 8 KiB")
     msg = json.loads(raw, parse_constant=reject_constant)
-    if not isinstance(msg, dict) or msg.get("schema") != SCHEMA or msg.get("frame") != FRAME:
-        raise ValueError(f"Expected {SCHEMA} absolute poses in {FRAME}")
-    stamp = msg.get("stamp_ms")
-    if type(stamp) is not int:
-        raise ValueError("stamp_ms must be Unix time in integer milliseconds")
-    check_age(stamp)
-    eef = msg.get("eef")
-    if (not isinstance(eef, list) or len(eef) != 16
-            or not all(type(v) in (int, float) and math.isfinite(v) for v in eef)):
-        raise ValueError("Expected 16 finite numbers in eef for both TCP poses and gripper openings")
-    poses, jaws, clamped = {}, {}, {}
-    for i, side in enumerate(SIDES):
-        offset = 8 * i
-        pose = eef[offset:offset + 7]
-        poses[side] = canonical_pose(pose)
-        gap = eef[offset + 7]
-        jaws[side] = min(MAX_OPENING_MM / 1000., max(0., gap))
-        if jaws[side] != gap:
-            clamped[side] = jaws[side]
-    observed = msg.get("obs_stamp_ms")
-    if observed is not None and (type(observed) is not int or observed <= 0):
-        raise ValueError("obs_stamp_ms must be an integer measurement timestamp")
-    frame = (stamp, poses, jaws, clamped)
-    if include_observation:
-        return stamp, poses, {side: eef[8*i + 7] for i, side in enumerate(SIDES)}, clamped, observed
-    return frame
-
-
-def check_age(stamp):
-    age = time.time_ns() // 1_000_000 - stamp
-    if not -MAX_FUTURE_MS <= age <= MAX_AGE_MS:
-        raise ValueError("EEF message expired or clock is ahead")
+    if not isinstance(msg, dict) or msg.get("frame", FRAME) != FRAME or msg.get("gripper") is not None:
+        raise ValueError(f"Expected both grippers in values, with TCPs in {FRAME}")
+    now = time.time_ns() // 1_000_000
+    for field in ("stamp_ms", "obs_stamp_ms"):
+        stamp = msg.get(field)
+        if stamp is not None and (type(stamp) is not int or not 0 < stamp <= now + MAX_FUTURE_MS):
+            raise ValueError(f"Expected a Unix millisecond {field} without future clock skew")
+    # Saturate the two physical openings before the shared whole-frame hard-limit check.
+    # Malformed fields are left for ControlSink's contract validation.
+    overflow = {}
+    values = msg.get("values")
+    if isinstance(values, list) and len(values) == 16:
+        for side, i in zip(SIDES, (7, 15)):
+            gap = values[i]
+            if type(gap) in (float, int) and math.isfinite(gap):
+                limit = min(MAX_OPENING_MM / 1000., max(0., gap))
+                if limit != gap:
+                    overflow[side] = gap
+                    values[i] = limit
+    return msg, overflow
 
 
 def _command_step(limiter, target, dt):
@@ -80,10 +91,13 @@ def _command_step(limiter, target, dt):
 class EefServo:
     def __init__(self, adapter, state):
         self.adapter, self.reader, self.state = adapter, adapter.reader, state
-        self.publisher = self.subscription = self.worker = self.output = None
+        self.publisher = self.subscription = self.worker = self.output = self.watchdog = None
         self.running = self.paused = False
         self.queue = self.token = None
         self.latest = self.pending_ik = None
+        self.descriptor = build_descriptor()
+        self.sink = None
+        self.deadline = 0.
         self.echo_arms, self.echo_jaws = {}, set()
         self.gripper_send = None
         self.last_stamp = -1
@@ -101,7 +115,7 @@ class EefServo:
         return {"name": "servo_eef", "type": "actuator", "multiInstance": False,
                 "description": "Absolute vendor TCP targets (L_ee_link / R_ee_link) in base_Link, metres and xyzw. "
                                "Left pose (7), opening (1), right pose (7), opening (1). "
-                               "Send all 16 values in the eef array for each absolute target. The task evaluates arrival from state/eef.",
+                               "Send all 16 values in the motus.control/1 values array for each absolute target. The task evaluates arrival from state/eef.",
                 "inputSchema": {"type": "object", "required": ["action"], "properties": {
                     "action": {"type": "string", "enum": ["start", "stop", "pause", "resume", "info"]},
                     "input_topic": {"type": "string", "default": CONTROL_TOPIC}},
@@ -116,13 +130,7 @@ class EefServo:
         return {"state": "idle" if not self.running else "paused" if self.paused else "running",
                 "paused": self.paused,
                 "topic_in": [{"format": "control/eef", "topic": self.topic}],
-                "control_interface": {"control_interface": SCHEMA, "frame": FRAME, "mode": "eef_pose",
-                    "dof": 16, "tip_frames": {"left": "L_ee_link", "right": "R_ee_link"},
-                    "opening_m": [0., MAX_OPENING_MM / 1000.], "groups": [
-                        {"name": label + "_" + side[0], "offset": i * 8 + offset, "count": count,
-                         "unit": unit}
-                        for i, side in enumerate(SIDES)
-                        for label, offset, count, unit in (("eef", 0, 7, "m+quat_xyzw"), ("gripper", 7, 1, "m"))]},
+                "control_interface": self.descriptor, "sink": self.sink.stats() if self.sink else {},
                 "accepted": self.accepted, "rejected": self.rejected, "queue_full": self.overruns,
                 "active_arms": list(self.arms), "last": self.last}
 
@@ -148,7 +156,16 @@ class EefServo:
         return solutions, blocked
 
     async def _apply(self, stamp, poses, requested_jaws, clamped, observed):
-        check_age(stamp)
+        echo_arms, echo_jaws = self.echo_arms, self.echo_jaws
+
+        def current():
+            # New measurement/command stamps may renew the same target during IK or SDK I/O.
+            return (not self.paused and self.latest is not None and self.latest[1:3] == (poses, requested_jaws)
+                    and self.echo_arms.keys() == echo_arms.keys() and self.echo_jaws == echo_jaws
+                    and time.monotonic() < self.deadline)
+
+        if not current():
+            return
         self._ready()
         measured = self.state.values()
         session = self.reader.ws
@@ -157,7 +174,6 @@ class EefServo:
             self.poses.clear()
             self.held_at_boundary.clear()
             self.target_session = session
-        echo_arms, echo_jaws = self.echo_arms, self.echo_jaws
         # Only a previously commanded arm needs one joint-space hold on transition.
         to_hold = {side for side in echo_arms if side in self.poses
                    and (side not in self.held_at_boundary or side in self.arms)}
@@ -184,10 +200,9 @@ class EefServo:
                 return
             finally:
                 self.pending_ik = None
-            if self.paused or self.latest[1:] != (poses, requested_jaws, clamped, observed):
+            if not current():
                 return
             stamp = self.latest[0]
-            check_age(stamp)
             if self.reader.ws is not session:
                 raise ValueError("Robot connection changed while solving IK")
             self._ready()
@@ -195,18 +210,18 @@ class EefServo:
             held.update(blocked)
             to_hold.update(blocked.intersection(self.arms))
         if to_solve or to_hold:
-            _, current, speeds = self.state.joint_snapshot()
-            if to_solve and max(abs(a - b) for a, b in zip(current, joints)) > TRACKING_LIMIT:
+            _, measured_q, speeds = self.state.joint_snapshot()
+            if to_solve and max(abs(a - b) for a, b in zip(measured_q, joints)) > TRACKING_LIMIT:
                 raise ValueError("Robot configuration changed while solving IK")
         if solved or to_hold:
             if self.token is None and max(map(abs, speeds)) > .05:
                 raise ValueError("Cannot take over a moving arm or head")
-            Limiter(current)
+            Limiter(measured_q)
             for side in to_hold:
                 start = 7 * SIDES.index(side)
                 # An echoed TCP refers to the encoders of that same observation.
                 # A blocked IK step holds the live configuration instead.
-                goal = echo_arms.get(side, current[start:start + 7])
+                goal = self.echo_arms.get(side, measured_q[start:start + 7])
                 solved[side] = [min(ARM_UPPER[i], max(ARM_LOWER[i], q))
                                 for i, q in enumerate(goal, start)]
         # A previous command can still be travelling even when the encoder
@@ -221,8 +236,10 @@ class EefServo:
             if gap != previous:
                 cmds[side] = command("open", {"opening_mm": gap * 1000., "speed": 15, "force": 30}, side)
         planned_tcp = {side: self.state.kinematics.forward(side, joints) for side, joints in solved.items()}
+        if not current():
+            return
         for side, joint_goal in solved.items():
-            self.arms[side] = (joint_goal, poses[side], stamp)
+            self.arms[side] = (joint_goal, poses[side], stamp, self.deadline)
         if solved and (self.output is None or self.output.done()):
             self.output = asyncio.create_task(self._drive())
         self.held_at_boundary = held
@@ -236,13 +253,13 @@ class EefServo:
                 # The first gripper reply yielded control to the SDK and other jobs.
                 if self.paused or self.reader.ws is not session:
                     raise MoveError("Interrupted EEF command or changed robot connection", None)
-                if self.latest[1:] != (poses, requested_jaws, clamped, observed):
-                    return
                 try:
                     self._ready()
                     self.state.values()
                 except ValueError as exc:
                     raise MoveError(str(exc), None) from exc
+            if not current():
+                return
             send = self.gripper_send = asyncio.create_task(self.reader.send_gripper(cmd))
             try:
                 await asyncio.shield(send)
@@ -253,7 +270,7 @@ class EefServo:
                 self.jaws.pop(side, None)
             else:
                 self.jaws[side] = clamped.get(side, requested_jaws[side])
-        if self.paused:
+        if not current():
             return
         self.accepted += 1
         self.last = {"status": "accepted", "stamp_ms": stamp, "planned_tcp": planned_tcp,
@@ -273,6 +290,15 @@ class EefServo:
                 next_check = last
                 while self.arms and not self.paused:
                     now = time.monotonic()
+                    for side, goal in self.arms.copy().items():
+                        if now >= goal[3]:
+                            del self.arms[side]
+                            self.poses[side] = None
+                            start = 7 * SIDES.index(side)
+                            target[start:start + 7] = limiter.q[start:start + 7]
+                            limiter.v[start:start + 7] = [0.] * 7
+                    if not self.arms:
+                        break
                     if token.get("error"):
                         raise ValueError(token["error"])
                     if now >= next_check:
@@ -341,25 +367,49 @@ class EefServo:
                     grippers.add(side)
         return arms, grippers
 
+    def _clear_stream(self):
+        self.latest = None
+        if self.pending_ik is not None:
+            self.pending_ik.cancel()
+        for side in self.arms:
+            # The last generated point may be in flight. A new frame may hold or retarget it.
+            self.poses[side] = None
+        self.arms.clear()
+        if self.queue is not None and not self.queue.empty():
+            self.queue.get_nowait()
+
+    async def _watch(self):
+        while True:
+            outcome = self.sink.tick()
+            if outcome is not None and not self.paused:
+                self.last = {"status": outcome.verdict.value, "reason": outcome.reason}
+            await asyncio.sleep(.02)
+
     def _subscribe(self):
         loop = asyncio.get_running_loop()
         queue = asyncio.Queue(maxsize=1)
 
-        def offer(raw):
-            if self.queue is not queue or self.paused:
-                return
-            try:
-                frame = decode(raw, include_observation=True)
-                if frame[0] <= self.last_stamp:
-                    raise ValueError("Duplicate or out-of-order EEF target")
-            except (ValueError, TypeError, OverflowError, RecursionError) as exc:
-                self.rejected += 1
-                self.last = {"status": "rejected", "reason": str(exc)[:300]}
-                return
-            self.last_stamp = frame[0]
+        # ControlSink calls apply synchronously within submit, on this event loop.
+        def apply(values, _gripper):
+            stamp, observed = message["stamp_ms"], message.get("obs_stamp_ms")
+            expires_ms = stamp + message["ttl_ms"]
+            if observed is not None:
+                expires_ms = min(expires_ms, observed + MAX_OBS_AGE_MS)
+            # Only another frame for this arm target can extend its SDK output window.
+            remaining_ms = min(WATCHDOG_MS, expires_ms - time.time_ns() / 1_000_000)
+            self.deadline = time.monotonic() + remaining_ms / 1000
+            poses = {s: canonical_pose(list(values[i:i + 7])) for s, i in zip(SIDES, (0, 8))}
+            jaws = dict(zip(SIDES, (values[7], values[15])))
+            clamped = {side: jaws[side] for side in overflow}
+            jaws.update(overflow)  # An echoed measurement may itself exceed nominal stroke.
+            frame = (stamp, poses, jaws, clamped, observed)
+            self.last_stamp = stamp
             if self.latest is None or self.latest[1:] != frame[1:] or self.target_session is not self.reader.ws:
                 self.echo_arms, self.echo_jaws = self._echoed_groups(frame)
             self.latest = frame
+            for side, goal in self.arms.items():
+                if poses[side] == goal[1]:
+                    self.arms[side] = (*goal[:3], self.deadline)
             if self.pending_ik is not None and len(self.echo_arms) == len(self.echo_jaws) == len(SIDES):
                 self.pending_ik.cancel()
             if queue.full():
@@ -367,9 +417,26 @@ class EefServo:
                 self.overruns += 1
             queue.put_nowait(frame)
 
+        message = overflow = None
+
+        def offer(raw):
+            nonlocal message, overflow
+            if self.queue is not queue or self.paused:
+                return
+            try:
+                message, overflow = decode(raw)
+                outcome = self.sink.submit(message)
+                if not outcome.applied:
+                    raise ValueError(outcome.reason)
+            except (ValueError, TypeError, OverflowError, RecursionError) as exc:
+                self.rejected += 1
+                self.last = {"status": "rejected", "reason": str(exc)[:300]}
+
+        self.sink = ControlSink(parse_descriptor(self.descriptor), apply, on_watchdog=self._clear_stream)
         self.queue = queue
         self.subscription = self.publisher.subscribe_json(self.topic, lambda raw: loop.call_soon_threadsafe(offer, raw))
         self.worker = asyncio.create_task(self._run(queue))
+        self.watchdog = asyncio.create_task(self._watch())
 
     async def preempt(self, *, interrupt_gripper=False):
         if not self.running:
@@ -379,7 +446,7 @@ class EefServo:
         if self.subscription is not None:
             self.publisher.unsubscribe(self.subscription)
             self.subscription = None
-        tasks = [task for task in (self.worker, self.output) if task is not None]
+        tasks = [task for task in (self.worker, self.output, self.watchdog) if task is not None]
         pending = self.gripper_send
         if interrupt_gripper and pending is not None:
             # A single gripper ACK can race a stop of a multi-group command.
@@ -395,7 +462,7 @@ class EefServo:
         if pending is not None:
             await asyncio.gather(pending, return_exceptions=True)
             self.gripper_send = None
-        self.worker = self.output = None
+        self.worker = self.output = self.watchdog = None
         self.arms.clear()
         self.jaws.clear()
         self.poses.clear()

@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import check
+from common.control import parse_descriptor
 from device import Adapter, VERSION
 
 
@@ -28,6 +29,15 @@ class EefWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(a.servo_eef.state, a.eef_state)
         port = a.tools()[0]['topic_in'][0]
         self.assertEqual((port['topic'], port['format']), ('/limx_tron2/control/eef', 'control/eef'))
+        interface = (await a.execute_tool('servo_eef', {'action': 'info'}))['control_interface']
+        self.assertEqual(interface['control_interface'], 'motus.control/1')
+        descriptor = parse_descriptor(interface)
+        self.assertEqual((descriptor.dof, descriptor.frame), (16, 'base_Link'))
+        self.assertEqual([(g.offset, g.count, g.mode) for g in descriptor.groups],
+                         [(0, 7, 'eef_pose'), (7, 1, 'joint_position'),
+                          (8, 7, 'eef_pose'), (15, 1, 'joint_position')])
+        self.assertGreater(descriptor.max_obs_age_ms, 0)
+        self.assertGreater(descriptor.watchdog_ms, 0)
         with self.assertRaises(ValueError):
             await a.execute_tool('servo_eef', {'action': 'start', 'dry_run': True})
         self.assertFalse(a.servo_eef.running)

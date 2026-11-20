@@ -12,14 +12,16 @@ from unittest.mock import AsyncMock, Mock
 from device import Adapter
 from eef_kinematics import Kinematics, NoFeasibleStep
 from eef_state import CONTROL_TOPIC, FRAME, SCHEMA, STATE_TOPIC
-from servo_eef import EefServo, decode
+from servo_eef import EefServo
 from vendor import MoveError
 
 
-def message(eef, *, stamp=None, obs_stamp=None):
-    payload = {"schema": SCHEMA, "frame": FRAME,
+def message(values, *, seq=None, source="test", priority=50, ttl=1000, stamp=None, obs_stamp=None):
+    payload = {"schema": "motus.control/1", "mode": "eef_pose", "dof": 16,
+               "source": source, "priority": priority, "ttl_ms": ttl,
+               "seq": time.monotonic_ns() if seq is None else seq,
                "stamp_ms": time.time_ns() // 1_000_000 if stamp is None else stamp,
-               "eef": eef}
+               "values": values}
     if obs_stamp is not None:
         payload["obs_stamp_ms"] = obs_stamp
     return json.dumps(payload)
@@ -148,7 +150,7 @@ class WiredRoundTripTests(unittest.IsolatedAsyncioTestCase):
                 start = motors.q[:7].copy()
                 nominal = adapter.eef_state.kinematics.solve('left', target[:3], target[3:], start)
                 count = adapter.servo_eef.accepted + 1
-                # The task card copies the latest state, then replaces the selected TCP.
+                # A producer may copy feedback, set a TCP, and stream the absolute target.
                 frame = await measure()
                 command = frame.copy()
                 command[:7] = target
@@ -156,16 +158,19 @@ class WiredRoundTripTests(unittest.IsolatedAsyncioTestCase):
                 bus.callback(message(command))
 
                 async def wait_for_dispatch():
+                    planned = {}
                     while True:
                         info = adapter.servo_eef.info()
                         self.assertEqual(info['state'], 'running', info['last'])
-                        if info['accepted'] == count and not info['active_arms']:
-                            return
+                        if info['accepted'] >= count:
+                            planned.update(info['last']['planned_tcp'])
+                            if not info['active_arms']:
+                                return planned
                         self.assertEqual((await measure())[7:], original[7:])
+                        bus.callback(message(command))
 
-                await asyncio.wait_for(wait_for_dispatch(), 4.)
+                planned = await asyncio.wait_for(wait_for_dispatch(), 4.)
                 self.assertEqual(motors.sent[-1][:7], nominal)
-                planned = adapter.servo_eef.info()['last']['planned_tcp']
                 self.assertEqual(planned, {'left': adapter.eef_state.kinematics.forward('left', nominal)})
                 sent = len(motors.sent)
                 # A repeated observation still describes its original sampling instant.
@@ -212,19 +217,43 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.servo.close()
 
-    async def feed(self, values, *, obs_stamp=None):
-        self.stamp += 1
+    async def send(self, raw):
         count = self.servo.accepted + self.servo.rejected
-        self.servo.publisher.callback(message(values, stamp=self.stamp, obs_stamp=obs_stamp))
+        self.servo.publisher.callback(raw)
         for _ in range(400):
             if self.servo.accepted + self.servo.rejected > count or self.servo.paused:
                 return
             await asyncio.sleep(.002)
         self.fail(self.servo.info())
 
-    async def wait_for_end_of_stream(self):
+    async def feed(self, values, **fields):
+        await self.send(message(values, **fields))
+
+    @contextmanager
+    def delayed_ik(self):
+        started, release = threading.Event(), threading.Event()
+        solve = self.state.kinematics.solve.side_effect
+
+        def wait_for_release(*args):
+            started.set()
+            if not release.wait(5.):
+                raise RuntimeError("test solver timeout")
+            return solve(*args)
+
+        self.state.kinematics.solve.side_effect = wait_for_release
+        try:
+            yield started
+        finally:
+            release.set()
+            self.state.kinematics.solve.side_effect = solve
+
+    async def wait_for_end_of_stream(self, target=None, **fields):
         async def wait():
+            refresh = time.monotonic() + .05
             while self.servo.info()['active_arms']:
+                if target is not None and time.monotonic() >= refresh:
+                    await self.feed(target, **fields)
+                    refresh = time.monotonic() + .05
                 await asyncio.sleep(.005)
         await asyncio.wait_for(wait(), 4.)
 
@@ -277,7 +306,7 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.measured[0], self.measured[8] = -.0002, .0001
         frame[0] += .00005
         await self.feed(frame, obs_stamp=baseline_stamp)
-        await self.wait_for_end_of_stream()
+        await self.wait_for_end_of_stream(frame, obs_stamp=baseline_stamp)
         self.state.kinematics.solve.assert_called_once()
         self.assertEqual(self.state.kinematics.solve.call_args.args[0], "left")
         self.assertEqual(self.reader.sent[-1], [.00005] * 7 + [0.] * 9)
@@ -288,7 +317,7 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         frame = self.measured.copy()
         frame[0] = .0005
         await self.feed(frame)
-        await self.wait_for_end_of_stream()
+        await self.wait_for_end_of_stream(frame)
         self.assertEqual(self.reader.sent[-1], [.0005] * 7 + [0.] * 9)
         self.assertFalse(self.servo.info()['paused'])
 
@@ -300,7 +329,7 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         second = self.measured.copy()
         second[8:15] = self.POSE
         await self.feed(second)
-        await self.wait_for_end_of_stream()
+        await self.wait_for_end_of_stream(second)
         self.assertEqual(self.reader.sent[-1], [0.] * 7 + [.02] * 7 + [0.] * 2)
         self.reader.send_gripper.assert_not_awaited()
 
@@ -351,7 +380,7 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         await self.feed(frame)
         await asyncio.wait_for(self.reader.first_write.wait(), 1.)
         if after_final_write:
-            await self.wait_for_end_of_stream()
+            await self.wait_for_end_of_stream(frame)
         else:
             self.assertEqual(self.servo.info()['active_arms'], ['left'])
 
@@ -359,7 +388,7 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         # an unnecessary IK solve even if it would yield the same TCP.
         measured_q = self.reader.q.copy()
         measured_q[0] -= .00004
-        measured_q[1] += .0002
+        measured_q[1] += .00005
         self.measured[0] = measured_q[0]
         held_frame = self.measured.copy()
         self.stamp = time.time_ns() // 1_000_000
@@ -367,15 +396,15 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.observed[observed] = (held_frame.copy(), measured_q[:14])
         # The SDK encoder has advanced by the time this observation is echoed.
         live = measured_q.copy()
-        live[0] += .001
+        live[0] += .00008
         self.state.joints = live.copy
         self.state.joint_snapshot = lambda: (time.monotonic(), live.copy(), self.speeds)
         self.measured[0] = live[0]
         await self.feed(held_frame, obs_stamp=observed)
         self.assertEqual(self.servo.last['status'], 'accepted', self.servo.last)
-        await self.wait_for_end_of_stream()
-        self.assertEqual(self.reader.sent[-1], measured_q)
         self.assertEqual(self.servo.last['planned_tcp'], {'left': held_frame[:7]})
+        await self.wait_for_end_of_stream(held_frame, obs_stamp=observed)
+        self.assertEqual(self.reader.sent[-1], measured_q)
         self.state.kinematics.solve.assert_called_once()
         writes = len(self.reader.sent)
         self.observed.clear()
@@ -421,7 +450,7 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         target[:7] = self.measured[:7]
         target[2] += .002
         await self.feed(target)
-        await self.wait_for_end_of_stream()
+        await self.wait_for_end_of_stream(target)
         self.assertEqual(self.servo.info()['last']['held_at_boundary'], [])
         self.assertEqual(self.state.kinematics.solve.call_count, 2)
         actual = kinematics.forward('left', self.reader.sent[-1][:7])
@@ -445,9 +474,9 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.state.kinematics.solve.side_effect = blocked_left
         target[0], target[8] = -.1, .015
         await self.feed(target)
-        await self.wait_for_end_of_stream()
         self.assertEqual(self.servo.info()['last']['held_at_boundary'], ['left'])
         self.assertEqual(self.servo.accepted, 2)
+        await self.wait_for_end_of_stream(target)
         self.assertLess(abs(self.reader.sent[-1][0]), .01)
         self.assertEqual(self.reader.sent[-1][7:14], [.015] * 7)
         self.reader.send_gripper.assert_not_awaited()
@@ -518,20 +547,12 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.servo.accepted, 2)
 
     async def test_long_ik_uses_new_stamp_for_same_goal_or_discards_superseded_goal(self):
-        original = self.state.kinematics.solve.side_effect
         for changed in (False, True):
-            started, release = threading.Event(), threading.Event()
-            def slow_solve(*args):
-                started.set()
-                if not release.wait(3):
-                    raise RuntimeError("test solver timeout")
-                return original(*args)
-            self.state.kinematics.solve.side_effect = slow_solve
             frame = self.measured.copy()
             frame[0] = .023 if changed else .012
             # The original frame has less time left than the test solve takes.
-            self.servo.publisher.callback(message(frame, stamp=time.time_ns() // 1_000_000 - 950))
-            try:
+            with self.delayed_ik() as started:
+                self.servo.publisher.callback(message(frame, stamp=time.time_ns() // 1_000_000 - 950))
                 self.assertTrue(await asyncio.to_thread(started.wait, 1))
                 await asyncio.sleep(.08)
                 final = frame.copy()
@@ -539,10 +560,8 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
                     final[0] = .01
                 self.servo.publisher.callback(message(final))
                 await asyncio.sleep(.005)
-            finally:
-                release.set()
             await asyncio.sleep(.05)
-            await self.wait_for_end_of_stream()
+            await self.wait_for_end_of_stream(final)
             self.assertEqual(self.servo.rejected, 0)
             self.assertAlmostEqual(self.reader.sent[-1][0], final[0])
             if changed:
@@ -550,28 +569,42 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
             # A new subscription is a new admission context for the next trial.
             await self.servo.call({"action": "pause"})
             await self.servo.call({"action": "resume"})
-            self.servo.last_stamp = -1
+
+    async def test_fresh_observations_keep_one_slow_ik_and_jaw_command(self):
+        target = self.measured.copy()
+        target[0], target[7] = .0005, .05
+
+        async def stream():
+            while True:
+                observed = time.time_ns() // 1_000_000
+                self.servo.publisher.callback(message(target, obs_stamp=observed))
+                await asyncio.sleep(.03)
+
+        publisher = asyncio.create_task(stream())
+        try:
+            with self.delayed_ik() as started:
+                self.assertTrue(await asyncio.to_thread(started.wait, 1.))
+                await asyncio.sleep(.25)
+            await asyncio.wait_for(self.reader.first_write.wait(), 1.)
+            await self.wait_for_end_of_stream()
+            self.assertEqual(self.reader.sent[-1], [.0005] * 7 + [0.] * 9)
+            self.reader.send_gripper.assert_awaited_once()
+            self.state.kinematics.solve.assert_called_once()
+            self.assertEqual(self.servo.rejected, 0)
+        finally:
+            publisher.cancel()
+            await asyncio.gather(publisher, return_exceptions=True)
 
     async def test_echo_supersedes_outstanding_ik_and_active_arm_before_solve_returns(self):
         left = self.measured.copy()
         left[0] = .035
         await self.feed(left)
         await asyncio.wait_for(self.reader.first_write.wait(), 1.)
-        started, release = threading.Event(), threading.Event()
-        original = self.state.kinematics.solve.side_effect
-
-        def slow_solve(*args):
-            started.set()
-            if not release.wait(8.):
-                raise RuntimeError("test solver timeout")
-            return original(*args)
-
-        self.state.kinematics.solve.side_effect = slow_solve
         both = left.copy()
         both[8] = .02
         self.stamp += 1
-        self.servo.publisher.callback(message(both, stamp=self.stamp))
-        try:
+        with self.delayed_ik() as started:
+            self.servo.publisher.callback(message(both, stamp=self.stamp))
             self.assertTrue(await asyncio.to_thread(started.wait, 1.))
             self.assertEqual(self.servo.info()['active_arms'], ['left'])
             self.measured[0] = self.reader.q[0]
@@ -579,13 +612,11 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
             self.observed[observed] = (self.measured.copy(), self.state.joints()[:14])
             self.stamp += 1
             self.servo.publisher.callback(message(self.measured, stamp=self.stamp, obs_stamp=observed))
-            await self.wait_for_end_of_stream()
+            await self.wait_for_end_of_stream(self.measured, obs_stamp=observed)
             self.assertLess(abs(self.reader.sent[-1][0] - self.measured[0]), .001)
             self.assertFalse(self.servo.paused)
-        finally:
-            release.set()
         await self.echo_measurement()
-        await self.wait_for_end_of_stream()
+        await self.wait_for_end_of_stream(self.measured, obs_stamp=self.stamp)
         self.assertEqual(self.state.kinematics.solve.call_count, 2)
         self.assertTrue(all(q[7:] == [0.] * 9 for q in self.reader.sent))
 
@@ -593,24 +624,114 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         frame = self.measured.copy()
         frame[:7] = self.POSE
         await self.feed(frame)
-        await self.wait_for_end_of_stream()
+        await self.wait_for_end_of_stream(frame)
         sent = len(self.reader.sent)
         await self.feed(frame)
         self.state.kinematics.solve.assert_called_once()
         self.assertEqual(len(self.reader.sent), sent)
 
-    async def test_duplicate_and_older_frames_do_not_reissue_commands(self):
+    async def test_duplicate_and_older_sequences_do_not_reissue_commands(self):
         frame = self.measured.copy()
         frame[7] += .01
-        await self.feed(frame)
-        accepted_stamp = self.servo.last["stamp_ms"]
+        await self.feed(frame, seq=10)
         frame[7] += .02
-        for stamp in (accepted_stamp, accepted_stamp - 1):
-            self.stamp = stamp - 1
-            await self.feed(frame)
+        for seq in (10, 9):
+            await self.feed(frame, seq=seq)
             self.assertEqual(self.servo.last["status"], "rejected")
         self.assertEqual(self.servo.accepted, 1)
         self.reader.send_gripper.assert_awaited_once()
+
+    async def test_arbitration_uses_sender_and_sequence_per_source(self):
+        target = self.measured.copy()
+        target[7] = .05
+        await self.feed(target, source="task", seq=90, priority=10)
+        target[7] = .02
+        await self.feed(target, source="operator", seq=1, priority=50)
+        target[7] = .06
+        await self.feed(target, source="task", seq=91, priority=10)
+        self.assertEqual((self.servo.accepted, self.servo.rejected), (2, 1))
+        self.assertEqual(self.reader.send_gripper.await_count, 2)
+        self.assertAlmostEqual(self.reader.send_gripper.await_args.args[0]['left_opening'],
+                               .02 / .085 * 94, places=5)
+
+    async def test_receive_checks_ttl_and_age_of_optional_external_observation(self):
+        target = self.measured.copy()
+        target[7] = .05
+        now = time.time_ns() // 1_000_000
+        max_age = self.servo.info()['control_interface']['rate']['max_obs_age_ms']
+        await self.feed(target, stamp=now - 100, ttl=10)
+        await self.feed(target, obs_stamp=now - max_age - 1)
+        self.reader.send_gripper.assert_not_awaited()
+        await self.feed(target, obs_stamp=now - 25)  # A fresh external camera frame.
+        target[7] = .02
+        await self.feed(target)  # An absolute setpoint independent of any observation.
+        self.assertFalse(self.observed)
+        self.assertEqual((self.servo.accepted, self.servo.rejected), (2, 2))
+        self.assertEqual(self.reader.send_gripper.await_count, 2)
+
+    async def test_expired_target_cannot_reach_sdk_after_slow_ik(self):
+        target = self.measured.copy()
+        target[0], target[7] = .001, .05
+        with self.delayed_ik() as started:
+            self.servo.publisher.callback(message(target, ttl=40))
+            self.assertTrue(await asyncio.to_thread(started.wait, 1.))
+            await asyncio.sleep(.06)
+        await asyncio.sleep(.03)
+        self.assertFalse(self.reader.sent)
+        self.reader.send_gripper.assert_not_awaited()
+
+    async def test_oversized_gripper_request_still_executes_reachable_arm_target(self):
+        target = self.measured.copy()
+        target[0], target[7] = .0005, .2
+        await self.feed(target)
+        self.assertEqual(self.servo.last['clamped_opening_m'], {'left': .085})
+        await self.wait_for_end_of_stream(target)
+        self.assertEqual(self.reader.sent[-1], [.0005] * 7 + [0.] * 9)
+        self.reader.send_gripper.assert_awaited_once()
+        self.assertEqual(self.reader.send_gripper.await_args.args[0]['left_opening'], 94.)
+
+    async def test_watchdog_interrupts_active_arm_and_discards_inflight_ik(self):
+        target = self.measured.copy()
+        target[0] = .2
+        await self.feed(target)
+        await asyncio.wait_for(self.reader.first_write.wait(), 1.)
+        target[8], target[15] = .05, .08
+        with self.delayed_ik() as started:
+            self.servo.publisher.callback(message(target))
+            self.assertTrue(await asyncio.to_thread(started.wait, 1.))
+            await asyncio.wait_for(self.wait_for_end_of_stream(), 1.)
+            sent = len(self.reader.sent)
+            self.assertLess(self.reader.sent[-1][0], .2)
+        await asyncio.sleep(.05)
+        self.assertEqual(len(self.reader.sent), sent)
+        self.assertTrue(all(q[7:] == [0.] * 9 for q in self.reader.sent))
+        self.reader.send_gripper.assert_not_awaited()
+        target = self.measured.copy()
+        target[7] = .05
+        await self.feed(target)
+        self.reader.send_gripper.assert_awaited_once()
+
+    async def test_slow_replacement_does_not_keep_old_arm_goal_alive(self):
+        old = self.measured.copy()
+        old[0] = .2
+        await self.feed(old, source="task", priority=10, ttl=5000)
+        await asyncio.wait_for(self.reader.first_write.wait(), 1.)
+        new = old.copy()
+        new[0] = -.001
+        with self.delayed_ik() as started:
+            self.servo.publisher.callback(message(new, source="operator"))
+            self.assertTrue(await asyncio.to_thread(started.wait, 1.))
+            # Refresh the replacement past the old goal's watchdog interval.
+            watchdog = self.servo.info()['control_interface']['rate']['watchdog_ms'] / 1000
+            end = time.monotonic() + watchdog + .10
+            while time.monotonic() < end:
+                self.servo.publisher.callback(message(new, source="operator"))
+                await asyncio.sleep(.025)
+            self.assertFalse(self.servo.info()['active_arms'])
+            self.assertLess(self.reader.sent[-1][0], .2)
+            writes = len(self.reader.sent)
+            await asyncio.sleep(.03)
+            self.assertEqual(len(self.reader.sent), writes)
 
     async def test_moving_head_blocks_arm_takeover_and_sibling_jaw(self):
         self.speeds[-1] = .2
@@ -651,7 +772,8 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_admitted_arm_finishes_sending_if_jaw_feedback_is_lost(self):
         target = self.measured.copy()
-        target[:7] = self.POSE
+        # A short, already-admitted move can finish inside its watchdog interval.
+        target[0] = .00003
         await self.feed(target)
         await asyncio.wait_for(self.reader.first_write.wait(), 1.)
         self.state.values = Mock(side_effect=ValueError('Fresh gripper openings are required'))
@@ -659,7 +781,7 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         info = self.servo.info()
         self.assertEqual(info['state'], 'running', info['last'])
         self.assertEqual(info['last']['status'], 'accepted')
-        self.assertEqual(self.reader.sent[-1], [.02] * 7 + [0.] * 9)
+        self.assertEqual(self.reader.sent[-1], [.00003] * 7 + [0.] * 9)
 
     async def test_encoder_divergence_aborts_stream(self):
         target = self.measured.copy()
@@ -710,14 +832,16 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.servo.last["status"], "fault")
         self.reader.send_gripper.assert_awaited_once()
 
-    def test_wire_validation(self):
+    async def test_wire_validation(self):
         valid = self.measured.copy()
         wrong_quat = valid.copy()
         wrong_quat[3:7] = [0.] * 4
-        old_frame = json.loads(message(valid))
-        old_frame["values"] = old_frame.pop("eef")
+        old_frame = {"schema": SCHEMA, "frame": FRAME, "stamp_ms": self.stamp, "eef": valid}
         for raw in (json.dumps(old_frame), message(wrong_quat), message(valid[:-1]), message(valid[:-1] + [True]),
                     message(valid[:-1] + [float("inf")]), message(valid, stamp=1),
                     message(valid, stamp=time.time_ns() // 1_000_000 + 500)):
-            with self.subTest(raw=raw), self.assertRaises(ValueError):
-                decode(raw)
+            with self.subTest(raw=raw):
+                await self.send(raw)
+                self.assertEqual(self.servo.last["status"], "rejected")
+        self.assertFalse(self.reader.sent)
+        self.reader.send_gripper.assert_not_awaited()
