@@ -1,6 +1,7 @@
 """Receive standard two-arm EEF targets and dispatch paired native TRON2 MoveP."""
 import asyncio
 import json
+import logging
 import math
 import os
 import time
@@ -21,6 +22,10 @@ MOVE_TIME_S = WATCHDOG_MS / 1000
 LINEAR_M_S = .10
 ANGULAR_RAD_S = .50
 MAX_GAP_M = MAX_OPENING_MM / 1000
+STREAM_MESSAGES = {
+    "stream_interrupted": "servo_eef 控制流中断，已停止下发新的运动段",
+    "stream_resumed": "servo_eef 已收到新的有效目标，控制流恢复",
+}
 
 
 def build_descriptor():
@@ -39,7 +44,8 @@ def build_descriptor():
     return {"control_interface": SCHEMA, "mode": "eef_pose", "dof": 16, "frame": FRAME,
             "joint_names": names, "groups": groups, "units": {"length": "m", "rotation": "quat_xyzw", "time": "s"},
             "limits": {"lower": lower*2, "upper": upper*2}, "force_torque": None,
-            "end_effector": {"workspace_m": MOVE_P_BOUNDS, "pose_source": "request_get_move_pose"},
+            "end_effector": {"workspace_m": MOVE_P_BOUNDS, "workspace_policy": "clip_along_request",
+                             "pose_source": "request_get_move_pose"},
             "rate": {"expected_hz": 10, "max_hz": MAX_HZ, "watchdog_ms": WATCHDOG_MS,
                      "max_obs_age_ms": MAX_OBS_AGE_MS}}
 
@@ -51,7 +57,7 @@ def canonical_pose(pose):
 
 
 def waypoint(side, start, goal):
-    """Return a bounded point along the requested pose displacement and whether to continue."""
+    """Return the next segment, whether to continue, and any workspace intersection."""
     bounds = MOVE_P_BOUNDS[side]
     delta = [end - begin for end, begin in zip(goal[:3], start[:3])]
     fraction = 1.
@@ -61,6 +67,9 @@ def waypoint(side, start, goal):
                 raise ValueError(f"{side} MoveP target is outside the vendor workspace")
             edge = high if end > high else low
             fraction = min(fraction, (edge - coord) / step)
+    boundary = None
+    if fraction < 1.:
+        boundary = [min(hi, max(lo, a + fraction*d)) for a, d, (lo, hi) in zip(start, delta, bounds)]
     # Scale first so even a finite request near the float limit keeps its direction.
     scale = max(map(abs, delta))
     step_fraction = 1.
@@ -71,16 +80,16 @@ def waypoint(side, start, goal):
         step_fraction = min(step_fraction, ANGULAR_RAD_S * MOVE_TIME_S / angle)
     portion = min(fraction, step_fraction)
     if portion == 0.:
-        return start, False
+        return start, False, boundary
     if portion == 1.:
-        return goal, False
+        return goal, False, boundary
     xyz = tuple(a + portion*d for a, d in zip(start, delta))
     if any(not lo-1e-12 <= a <= hi+1e-12 for a, (lo, hi) in zip(xyz, bounds)):
         raise ValueError(f"{side} MoveP cannot take a bounded step from the measured pose")
     # Remove roundoff at a box face only after establishing the segment is inside.
     xyz = tuple(min(hi, max(lo, a)) for a, (lo, hi) in zip(xyz, bounds))
     q, _ = rotation.slerp_limit(start[3:], goal[3:], angle * portion)
-    return (*xyz, *q), step_fraction < fraction
+    return (*xyz, *q), step_fraction < fraction, boundary
 
 
 class EefServo:
@@ -95,6 +104,8 @@ class EefServo:
         self.commanded = (None, None)
         self.more = False
         self.arm_error = None
+        self.boundaries = {}
+        self.activity = None
         self.next_segment = 0.
         self.jaw_targets = {}
         self.active_arms = []
@@ -117,7 +128,7 @@ class EefServo:
                 "paused": self.paused, "topic_in": [{"format": "control/eef", "topic": self.topic}],
                 "control_interface": self.descriptor, "sink": self.sink.stats() if self.sink else {},
                 "accepted": self.accepted, "rejected": self.rejected, "queue_full": self.overruns,
-                "active_arms": list(self.active_arms), "last": self.last}
+                "active_arms": list(self.active_arms), "last": self.last, "activity": self.activity}
 
     def _ready(self):
         self.adapter.arm_servo._conflict()
@@ -128,7 +139,13 @@ class EefServo:
                 or data.get("motor") != "OK" or not motion_readiness(data)["ready"]):
             raise ValueError("DACH upper-limb motion is unavailable")
 
+    def _announce(self, event):
+        self.activity = {"event": event, "text": STREAM_MESSAGES[event], "stamp_ms": time.time_ns() // 1_000_000}
+        logging.getLogger(__name__).info("%s %s", event, self.activity["text"])
+
     def _clear_stream(self):
+        if not self.paused and self.latest is not None:
+            self._announce("stream_interrupted")
         self.latest = None
         if self.wake:
             self.wake.clear()
@@ -146,6 +163,8 @@ class EefServo:
         message = original_gaps = None
 
         def accept(values, _):
+            if self.sink.holding:
+                self._announce("stream_resumed")
             stamp = message["stamp_ms"]
             observed = message.get("obs_stamp_ms")
             expires = stamp + message["ttl_ms"]
@@ -205,6 +224,7 @@ class EefServo:
         if repeated and (not self.more or now < self.next_segment):
             return
         self.arm_intent, self.more, self.arm_error = intent, False, None
+        self.boundaries = {}
         if intent == (None, None) and all(last is None or goal == last
                                            for goal, last in zip(poses, self.commanded)):
             self.commanded = (None, None)
@@ -216,7 +236,9 @@ class EefServo:
                 if any(not lo <= v <= hi for v, (lo, hi) in zip(point, MOVE_P_BOUNDS[side])):
                     raise ValueError(f"Cannot send paired MoveP: held {side} arm is outside its vendor workspace")
             else:
-                point, more = waypoint(side, start, goal)
+                point, more, boundary = waypoint(side, start, goal)
+                if boundary is not None:
+                    self.boundaries[side] = boundary
                 continuing |= more
             pair.append(point)
         if tuple(pair) == starts and self.commanded == (None, None):
@@ -246,6 +268,7 @@ class EefServo:
             self.arm_intent = (None, None)
             self.commanded = (None, None)
             self.arm_error = None
+            self.boundaries = {}
             self.more = False
             self.jaw_targets.clear()
         measured = self.state.values()
@@ -290,6 +313,8 @@ class EefServo:
                      "clamped_opening_m": {s: values[i] for s, i, g in zip(SIDES, (7, 15), raw_gaps) if values[i] != g}}
         if self.arm_error:
             self.last["arm_error"] = self.arm_error
+        if self.boundaries:
+            self.last["workspace_boundary_m"] = self.boundaries
 
     async def _run(self, wake):
         while True:

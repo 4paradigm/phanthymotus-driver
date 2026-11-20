@@ -74,6 +74,16 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.servo.publisher.callback(raw)
         await wait_until(lambda: self.servo.accepted + self.servo.rejected > before or self.servo.paused)
 
+    def capture_transitions(self):
+        announce = self.servo._announce = Mock(wraps=self.servo._announce)
+        return lambda: [call.args[0] for call in announce.call_args_list]
+
+    def assert_activity(self, event):
+        activity = self.servo.info()['activity']
+        self.assertEqual(activity['event'], event)
+        self.assertTrue(activity['text'])
+        self.assertGreater(activity['stamp_ms'], 0)
+
     def assert_pose_call(self, left, right, *, index=-1):
         args = self.reader.send_move_p.await_args_list[index].args
         self.assertEqual(list(args[0]), left)
@@ -151,6 +161,11 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         actual, other = self.reader.send_move_p.await_args.args[:2]
         for value, expected in zip(actual, left):
             self.assertAlmostEqual(value, expected)
+        boundary = self.servo.last['workspace_boundary_m']
+        self.assertEqual(set(boundary), {'left'})
+        self.assertEqual(len(boundary['left']), 3)
+        for value, expected in zip(boundary['left'], left[:3]):
+            self.assertAlmostEqual(value, expected)
         self.assertEqual(list(other), RIGHT)
         self.assertEqual(self.reader.send_gripper.await_args.args[0]['left_opening'], 94.)
         await self.feed(target)
@@ -174,6 +189,30 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.reader.send_move_p.assert_not_awaited()
         self.assertEqual(self.reader.send_gripper.await_count, 2)
         self.assertIn('left_opening', self.reader.send_gripper.await_args.args[0])
+
+    async def test_distant_workspace_boundary_is_distinct_from_next_short_segment(self):
+        target = self.measured.copy()
+        target[0], target[1] = .9, .41
+        await self.feed(target)
+        step = self.reader.send_move_p.await_args.args[0]
+        boundary = self.servo.last['workspace_boundary_m']['left']
+        self.assertGreater(step[0], LEFT[0])
+        self.assertLess(step[0], .732)
+        self.assertAlmostEqual(step[1] - LEFT[1], (step[0] - LEFT[0]) * .5)
+        for actual, expected in zip(boundary, [.732, .326, LEFT[2]]):
+            self.assertAlmostEqual(actual, expected)
+
+    async def test_peer_echo_from_earlier_sample_cannot_pull_it_inside_workspace(self):
+        self.measured[8] = .251
+        stamp = time.time_ns() // 1_000_000
+        self.observed[stamp] = self.measured.copy()
+        target = self.measured.copy()
+        target[0] -= .003
+        self.measured[8] = .249  # The held right side has since crossed the native X limit.
+        await self.feed(target, obs_stamp_ms=stamp)
+        self.assertEqual(self.servo.last['status'], 'rejected')
+        self.reader.send_move_p.assert_not_awaited()
+        self.reader.send_gripper.assert_not_awaited()
 
     async def test_upstream_priority_replay_ttl_and_optional_observation(self):
         frame = self.measured.copy()
@@ -241,6 +280,65 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(.05)
         self.reader.send_gripper.assert_not_awaited()
         self.reader.send_move_p.assert_awaited_once()
+
+    async def test_watchdog_notifies_once_per_gap_and_only_valid_input_resumes(self):
+        transitions = self.capture_transitions()
+        clock = self.servo.sink._clock = Mock(return_value=10000)
+        period = self.servo.sink.descriptor.watchdog_ms
+        await self.feed(self.measured, source='operator', priority=80, seq=1)
+        with self.assertLogs('servo_eef', level='INFO') as interrupted_log:
+            clock.return_value += period
+            await wait_until(lambda: self.servo.sink.stats()['holding'])
+        self.assert_activity('stream_interrupted')
+        self.assertIn(self.servo.info()['activity']['text'], interrupted_log.records[0].getMessage())
+
+        # At the exact watchdog boundary the owner still outranks this publisher.
+        await self.feed(self.measured, source='policy', priority=10, seq=1)
+        self.assertIn('outranked', self.servo.last['reason'])
+        await self.feed(self.measured, source='operator', priority=80, seq=2,
+                        ttl_ms=1, stamp_ms=time.time_ns() // 1_000_000 - 20)
+        self.assertTrue(self.servo.sink.stats()['holding'])
+
+        for strike in range(2, self.servo.sink._escalate_after + 1):
+            clock.return_value += period
+            await wait_until(lambda: self.servo.sink.stats()['watchdog_strikes'] == strike)
+        self.assertTrue(self.servo.sink.stats()['stood_down'])
+        interrupted, resumed = 'stream_interrupted', 'stream_resumed'
+        self.assertEqual(transitions(), [interrupted])
+        with self.assertLogs('servo_eef', level='INFO') as resumed_log:
+            await self.feed(self.measured, source='operator', priority=80, seq=3)
+            await self.feed(self.measured, source='operator', priority=80, seq=4)
+        self.assertEqual(len(resumed_log.records), 1)
+        self.assertEqual(transitions(), [interrupted, resumed])
+        self.assert_activity(resumed)
+        self.assertIn(self.servo.info()['activity']['text'], resumed_log.records[0].getMessage())
+
+        clock.return_value += period
+        await wait_until(lambda: self.servo.sink.stats()['holding'])
+        await self.feed(self.measured, source='operator', priority=80, seq=5)
+        self.assertEqual(transitions(), [interrupted, resumed, interrupted, resumed])
+        self.reader.send_move_p.assert_not_awaited()
+        self.reader.send_gripper.assert_not_awaited()
+
+    async def test_explicit_pause_and_stop_do_not_announce_watchdog_recovery(self):
+        transitions = self.capture_transitions()
+        for ending, restart in (('pause', 'resume'), ('stop', 'start')):
+            with self.subTest(ending=ending):
+                await self.feed(self.measured)
+                before = transitions()
+                await self.servo.call({'action': ending})
+                await self.servo.call({'action': restart})
+                clock = self.servo.sink._clock = Mock(return_value=10000)
+                await self.feed(self.measured)
+                self.assertEqual(transitions(), before)
+                clock.return_value += self.servo.sink.descriptor.watchdog_ms
+                await wait_until(lambda: self.servo.sink.stats()['holding'])
+                stale = self.servo.publisher.callback
+                await self.servo.call({'action': ending})
+                await self.servo.call({'action': restart})
+                stale(message(self.measured))
+                await self.feed(self.measured)
+                self.assertEqual(transitions(), before + ['stream_interrupted'])
 
     async def test_native_rejection_does_not_resubmit_the_same_pose(self):
         self.reader.send_move_p.side_effect = MoveError('vendor refused', True, 'vendor_rejected')
