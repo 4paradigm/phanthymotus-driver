@@ -1,18 +1,17 @@
 """LinkerHand L20 joint feedback card (joints).
 
 One card reads one hand. Every round is one fresh five-frame position query that
-feeds two outputs with the same sequence:
+feeds one output:
 
-  /{namespace}/hand/{side}/joints_{card}           data/json        (every round)
   /{namespace}/hand/{side}/joints_{card}_skeleton  sensor/skeleton  (valid rounds only)
 
 Each card has its own topic suffix (the card's instance id), so two cards on the
 same driver never share an output. The CAN interface is matched automatically:
 the card claims a free hand of its side among the hands that answer on the local
 socketcan interfaces. When no free hand exists the card keeps running in the
-`waiting` state: it publishes an invalid JSON frame once per second, publishes no
-skeleton frame, and re-probes every couple of seconds so a hand plugged in later
-is picked up.
+`waiting` state: it publishes no skeleton frame and re-probes every couple of
+seconds so a hand plugged in later is picked up. The JSON sample is kept for
+`info`/`get_state` diagnostics; it is not a public topic.
 
 The card only sends position-query frames: no motion, torque, calibration or
 fault clearing. The `model` tool serves a single-hand URDF to a panel that asks
@@ -45,8 +44,7 @@ logger = logging.getLogger("linkerhand.joints")
 
 # Fixed acquisition rate: the card exposes no rate setting.
 POLL_HZ = 30.0
-# A card without a free hand keeps its JSON output alive at this rate.
-WAITING_PUBLISH_INTERVAL_S = 1.0
+# A card without a free hand publishes no frames; it only re-probes.
 # How often a waiting card looks for a hand that appeared since the last look.
 MATCH_RETRY_INTERVAL_S = 2.0
 # One probe query waits this long for the hand's position replies.
@@ -109,12 +107,11 @@ class _JointsStream:
         self.instance_id = instance_id
         self.side = side
         self.channel = channel
-        self.json_topic, self.skeleton_topic = plugin.topics(side, instance_id)
+        self.skeleton_topic = plugin.skeleton_topic(side, instance_id)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._node = None
-        self._json_pub = None
         self._skeleton_pub = None
         self._qos = None
         self._last_publisher_attempt = 0.0
@@ -122,7 +119,6 @@ class _JointsStream:
         self.sequence = 0
         self.latest: dict[str, Any] = {}
         self.waiting_reason = ""
-        self.published_json = 0
         self.published_skeleton = 0
         self.last_publish_time = None
         self.publish_error = None
@@ -130,7 +126,7 @@ class _JointsStream:
     # ── sampling ──────────────────────────────────────────────────────
 
     def read(self) -> dict[str, Any]:
-        """One fresh position query, converted into the data/json payload."""
+        """One fresh position query, converted into the sample behind the skeleton."""
         assert self.channel is not None
         plugin = self.plugin
         started = time.monotonic()
@@ -210,7 +206,7 @@ class _JointsStream:
         if ros2 is None or not hasattr(ros2, "ctx_core"):
             self.publish_error = "没有可用的 ROS 2 Core 上下文，仅能本地读取"
             return False
-        if self._json_pub is not None:
+        if self._skeleton_pub is not None:
             return True
         node = None
         try:
@@ -226,12 +222,11 @@ class _JointsStream:
             )
             node = Node(f"hand_joints_{self.side}_{_slug(self.instance_id)}_{uuid.uuid4().hex[:8]}",
                         context=ros2.ctx_core)
-            json_pub = node.create_publisher(String, self.json_topic, qos)
             skeleton_pub = node.create_publisher(String, self.skeleton_topic, qos)
             ros2.executor_core.add_node(node)
-            self._node, self._json_pub, self._skeleton_pub, self._qos = node, json_pub, skeleton_pub, qos
+            self._node, self._skeleton_pub, self._qos = node, skeleton_pub, qos
             self.publish_error = None
-            print(f"[joints] ROS2 publishers ready: {self.json_topic}, {self.skeleton_topic}", flush=True)
+            print(f"[joints] ROS2 publisher ready: {self.skeleton_topic}", flush=True)
             return True
         except Exception as exc:
             if node is not None:
@@ -246,7 +241,7 @@ class _JointsStream:
 
     def _teardown_publishers(self) -> None:
         node, self._node = self._node, None
-        self._json_pub = self._skeleton_pub = None
+        self._skeleton_pub = None
         ros2 = self.plugin._ros2
         if node is None or ros2 is None:
             return
@@ -260,12 +255,11 @@ class _JointsStream:
             pass
 
     def publisher_ready(self) -> bool:
-        return self._json_pub is not None
+        return self._skeleton_pub is not None
 
     def subscriber_count(self) -> int:
         try:
-            return sum(pub.get_subscription_count()
-                       for pub in (self._json_pub, self._skeleton_pub) if pub is not None)
+            return self._skeleton_pub.get_subscription_count() if self._skeleton_pub is not None else 0
         except Exception:
             return 0
 
@@ -305,70 +299,28 @@ class _JointsStream:
             if thread.is_alive():
                 raise RuntimeError("关节采集尚未停止；保留线程及发布器，避免重复启动")
         self._thread = None
-        self._publish_stopped()
         self._teardown_publishers()
 
-    def stopped_sample(self) -> dict[str, Any]:
-        """Final frame for a stopped stream; carries no measured value.
-
-        Core keeps the last frame of a silent topic on screen and its renderer
-        has no invalid state, so without this frame the last `ok/valid=true`
-        sample would stay displayed as if it were live.
-        """
-        with self._lock:
-            self.sequence += 1
-            sequence = self.sequence
-        return _blank_sample(self.side, self.channel, sequence, "idle",
-                             "关节采集已停止；本帧不含实测值", self._can_id())
-
-    def waiting_sample(self) -> dict[str, Any]:
-        """Invalid frame for a running card that has not claimed a hand yet."""
-        with self._lock:
-            self.sequence += 1
-            sequence = self.sequence
-        reason = self.waiting_reason or self.plugin._match_reason(self.side)
-        return _blank_sample(self.side, self.channel, sequence, "waiting", reason, self._can_id())
-
-    def _can_id(self) -> str:
-        return hex(self.plugin.can_id(self.side))
-
-    def _publish_stopped(self) -> None:
-        # Invalid, so _publish sends no skeleton frame: the renderer would
-        # otherwise keep drawing an old pose as live.
-        if self._json_pub is None:
-            return
-        try:
-            self._publish(self.stopped_sample())
-            # Give the executor a moment to hand the frame over before the
-            # node is destroyed in _teardown_publishers().
-            time.sleep(0.05)
-        except Exception as exc:
-            self.publish_error = str(exc)
-
     def _publish(self, sample: dict[str, Any]) -> None:
-        from std_msgs.msg import String
-        msg = String()
-        msg.data = json.dumps(sample, ensure_ascii=False, allow_nan=False)
-        self._json_pub.publish(msg)
-        self.published_json += 1
-        if sample["valid"]:
+        if not sample["valid"]:
             # Invalid rounds publish no skeleton frame: the renderer has no
             # invalid state and would otherwise show an old pose as live.
-            msg = String()
-            msg.data = json.dumps(self.skeleton(sample), ensure_ascii=False, allow_nan=False)
-            self._skeleton_pub.publish(msg)
-            self.published_skeleton += 1
+            return
+        from std_msgs.msg import String
+        msg = String()
+        msg.data = json.dumps(self.skeleton(sample), ensure_ascii=False, allow_nan=False)
+        self._skeleton_pub.publish(msg)
+        self.published_skeleton += 1
         self.last_publish_time = time.time()
         self.publish_error = None
 
     def _loop(self) -> None:
         consecutive_errors = 0
-        next_wait_publish = 0.0
         next_match = 0.0
         while not self._stop_event.is_set():
             loop_start = time.monotonic()
             if self.channel is None:
-                # Waiting for a free hand: keep the JSON output alive and look
+                # Waiting for a free hand: publish nothing, just keep looking
                 # for a hand that appeared since the last look.
                 now = time.monotonic()
                 if now >= next_match:
@@ -378,16 +330,8 @@ class _JointsStream:
                         self.set_channel(target[1])
                         continue
                     self.waiting_reason = self.plugin._match_reason(self.side)
-                if self._json_pub is None and now - self._last_publisher_attempt >= 2.0:
+                if self._skeleton_pub is None and now - self._last_publisher_attempt >= 2.0:
                     self._setup_publishers()
-                if self._json_pub is not None and now >= next_wait_publish:
-                    next_wait_publish = now + WAITING_PUBLISH_INTERVAL_S
-                    try:
-                        self._publish(self.waiting_sample())
-                    except Exception as exc:
-                        self.publish_error = str(exc)
-                        logger.warning("Joints waiting frame failed: %s", exc)
-                        self._teardown_publishers()
                 self._stop_event.wait(0.05)
                 continue
             # Sequential rounds: the next query starts only after this one ends.
@@ -403,9 +347,9 @@ class _JointsStream:
                 if consecutive_errors == 1 or consecutive_errors % 100 == 0:
                     logger.warning("Joints %s/%s position query failed (%d in a row): %s",
                                    self.side, self.channel, consecutive_errors, sample["reason"])
-            if self._json_pub is None and time.monotonic() - self._last_publisher_attempt >= 2.0:
+            if self._skeleton_pub is None and time.monotonic() - self._last_publisher_attempt >= 2.0:
                 self._setup_publishers()
-            if self._json_pub is not None and not self._stop_event.is_set():
+            if self._skeleton_pub is not None and not self._stop_event.is_set():
                 try:
                     self._publish(sample)
                 except Exception as exc:
@@ -468,18 +412,14 @@ class JointsPlugin:
     def can_id(self, side: str) -> int:
         return self.right_can_id if side == "right" else self.left_can_id
 
-    def topics(self, side: str, instance_id: str) -> tuple[str, str]:
-        base = f"/{self.namespace}/hand/{side}/joints_{_slug(instance_id)}".replace("//", "/")
-        return base, base + "_skeleton"
+    def skeleton_topic(self, side: str, instance_id: str) -> str:
+        return f"/{self.namespace}/hand/{side}/joints_{_slug(instance_id)}_skeleton".replace("//", "/")
 
     def topic_out(self, instance_id: str, side: str | None = None) -> list[dict]:
         side = side or self._bindings.get(instance_id)
         if side not in ("left", "right"):
             return []
-        json_topic, skeleton_topic = self.topics(side, instance_id)
-        # data/json first: Core's detail view opens the first output.
-        return [{"topic": json_topic, "format": "data/json"},
-                {"topic": skeleton_topic, "format": "sensor/skeleton"}]
+        return [{"topic": self.skeleton_topic(side, instance_id), "format": "sensor/skeleton"}]
 
     def get_tools(self) -> list[dict]:
         # `action_schema` drives the card's action list. `get_state` is an
@@ -489,8 +429,8 @@ class JointsPlugin:
         schema = action_schema(
             {
                 "info": ([], "获取关节卡片信息、当前绑定的手、实测刷新率及 topic_out"),
-                "start": ([], "启动关节位置后台连续采集，同时输出 JSON 与骨架"),
-                "stop": ([], "停止本卡片的关节数据流"),
+                "start": ([], "启动关节位置后台连续采集，输出实时骨架"),
+                "stop": ([], "停止本卡片的关节骨架流"),
                 "config": ([], "按提供的字段更新实例选择的左右手"),
             },
             {},
@@ -498,13 +438,13 @@ class JointsPlugin:
         definition = tool(
             self.PREFIX,
             "sensor",
-            "LinkerHand L20 16 主动关节实测位置流：原始值、按厂家 L20-10 标定表换算的角度与实时骨架",
+            "LinkerHand L20 16 主动关节实时骨架（按厂家 L20-10 标定表换算；不输出 JSON 数据流）",
             schema,
             # Per-instance topics depend on the instance id, so the card asks
             # the driver (info) instead of using a static default.
             topic_out=[],
         )
-        definition["title"] = "L20 关节状态"
+        definition["title"] = "L20 关节骨架"
         definition["multiInstance"] = True
         definition["configSchema"] = {
             "type": "object",
@@ -833,7 +773,7 @@ class JointsPlugin:
                 "poll_hz": POLL_HZ, "query_timeout_s": self.query_timeout_s,
                 "angle_source": ANGLE_SOURCE,
                 "publisher_ready": False, "subscriber_count": 0,
-                "published_json_frames": 0, "published_skeleton_frames": 0,
+                "published_skeleton_frames": 0,
                 "last_publish_time": None, "publish_error": None,
                 "sample_state": "unset", "sample_valid": False, "sample_age_s": None,
                 "measured_hz": None, "reason": "请选择左手或右手",
@@ -855,7 +795,6 @@ class JointsPlugin:
             "angle_source": ANGLE_SOURCE,
             "publisher_ready": stream is not None and stream.publisher_ready(),
             "subscriber_count": stream.subscriber_count() if stream is not None else 0,
-            "published_json_frames": stream.published_json if stream is not None else 0,
             "published_skeleton_frames": stream.published_skeleton if stream is not None else 0,
             "last_publish_time": stream.last_publish_time if stream is not None else None,
             "publish_error": stream.publish_error if stream is not None else None,

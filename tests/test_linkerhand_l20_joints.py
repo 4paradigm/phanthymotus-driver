@@ -1,4 +1,4 @@
-"""Tests for the LinkerHand L20 joints card (data/json + sensor/skeleton) and its model."""
+"""Tests for the LinkerHand L20 skeleton-only joints card and its model."""
 
 import json
 import math
@@ -563,7 +563,6 @@ def test_topics_are_per_instance_and_keep_the_side():
     assert plugin.topic_out("a") == []
     plugin.dispatch("config", {"instance_id": "card-1", "bound_side": "left"})
     assert plugin.topic_out("card-1") == [
-        {"topic": "/hand/left/joints_card1", "format": "data/json"},
         {"topic": "/hand/left/joints_card1_skeleton", "format": "sensor/skeleton"},
     ]
     plugin.dispatch("config", {"instance_id": "card-2", "bound_side": "left"})
@@ -571,7 +570,7 @@ def test_topics_are_per_instance_and_keep_the_side():
     # A different namespace is honoured.
     ns = JointsPlugin(None, {}, global_config=GLOBAL_CONFIG, namespace="robot1")
     ns.dispatch("config", {"instance_id": "x", "bound_side": "right"})
-    assert ns.topic_out("x")[0]["topic"] == "/robot1/hand/right/joints_x"
+    assert ns.topic_out("x")[0]["topic"] == "/robot1/hand/right/joints_x_skeleton"
 
 
 def test_no_side_selected_reports_unset_without_topic_or_can():
@@ -591,21 +590,20 @@ def test_start_claims_a_free_hand():
     wait_for(lambda: clients[("left", "can1")].calls > 0)
 
 
-def test_waiting_card_publishes_invalid_json_and_no_skeleton(ros_runtime, monkeypatch):
+def test_waiting_card_publishes_nothing_and_reports_waiting(ros_runtime):
     ros2, published, _ = ros_runtime
-    monkeypatch.setattr(joints_device, "WAITING_PUBLISH_INTERVAL_S", 0.02)
     plugin, _, _ = make_plugin(ros2=ros2, hands=set())
     try:
         plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
-        wait_for(lambda: any(t == "/hand/left/joints_a" and p["state"] == "waiting" for t, p in published))
+        wait_for(lambda: plugin.dispatch("info", {"instance_id": "a"})["state"] == "waiting")
+        time.sleep(0.1)
         info = plugin.dispatch("info", {"instance_id": "a"})
     finally:
         plugin.stop()
     assert info["state"] == "waiting" and info["can_channel"] is None
-    assert info["measured_hz"] is None
-    frame = next(p for t, p in published if t == "/hand/left/joints_a")
-    assert frame["valid"] is False and frame["joints"][0]["raw"] is None and frame["timestamp"] is None
-    assert not any(t.endswith("_skeleton") for t, _ in published)
+    assert info["measured_hz"] is None and info["waiting_reason"]
+    assert published == []
+    assert info["published_skeleton_frames"] == 0
 
 
 def test_waiting_card_takes_a_hand_that_appears_later(ros_runtime, monkeypatch):
@@ -651,8 +649,8 @@ def test_left_and_right_cards_can_share_one_bus(ros_runtime):
         assert plugin.dispatch("info", {"instance_id": "L"})["state"] == "running"
         assert plugin.dispatch("info", {"instance_id": "R"})["state"] == "running"
         assert plugin._claims == {"L": ("left", "can1"), "R": ("right", "can1")}
-        assert plugin.topic_out("L")[0]["topic"] == "/hand/left/joints_l"
-        assert plugin.topic_out("R")[0]["topic"] == "/hand/right/joints_r"
+        assert plugin.topic_out("L")[0]["topic"] == "/hand/left/joints_l_skeleton"
+        assert plugin.topic_out("R")[0]["topic"] == "/hand/right/joints_r_skeleton"
         wait_for(lambda: clients[("left", "can1")].calls > 0 and clients[("right", "can1")].calls > 0)
     finally:
         plugin.stop()
@@ -720,7 +718,7 @@ def wait_for(predicate, timeout=3.0):
     assert predicate()
 
 
-def test_one_round_feeds_both_outputs_with_the_same_sequence(ros_runtime):
+def test_one_round_feeds_one_skeleton_frame(ros_runtime):
     ros2, published, _ = ros_runtime
     plugin, _, _ = make_plugin(ros2=ros2)
     try:
@@ -728,54 +726,49 @@ def test_one_round_feeds_both_outputs_with_the_same_sequence(ros_runtime):
         wait_for(lambda: sum(1 for t, _ in published if t.endswith("_skeleton")) >= 2)
     finally:
         plugin.stop()
-    json_frames = {p["sequence"]: p for t, p in published if t == "/hand/right/joints_a"}
     skeleton_frames = [p for t, p in published if t == "/hand/right/joints_a_skeleton"]
+    limits = {f"right_hand_{j['name']}": j for j in side_joints("right")}
+    sequences = [frame["status"]["sequence"] for frame in skeleton_frames]
+    assert sequences == sorted(sequences) and len(set(sequences)) == len(sequences)
     for frame in skeleton_frames:
-        sample = json_frames[frame["status"]["sequence"]]
-        assert frame["status"]["timestamp"] == sample["timestamp"] and frame["status"]["valid"] is True
-        by_name = {e["name"]: e for e in frame["joints"]}
-        for joint in sample["joints"]:
-            entry = by_name[joint["model_joint"]]
-            assert entry["source"] == "measured"
-            limits = next(j for j in side_joints("right") if f"right_hand_{j['name']}" == joint["model_joint"])
-            assert entry["q"] == pytest.approx(min(limits["upper"], max(limits["lower"], joint["angle_rad"])))
+        assert frame["status"]["valid"] is True
+        assert len(frame["joints"]) == 21
+        for entry in frame["joints"]:
+            assert entry["name"].startswith("right_hand_")
+            limit = limits[entry["name"]]
+            assert limit["lower"] - 1e-9 <= entry["q"] <= limit["upper"] + 1e-9
+            assert isinstance(entry["clamped_to_model"], bool)
+        assert sum(1 for entry in frame["joints"] if entry["source"] == "derived_calibration") == 5
 
 
-def test_invalid_rounds_publish_json_but_no_skeleton(ros_runtime):
+def test_invalid_rounds_publish_nothing_and_report_error(ros_runtime):
     ros2, published, _ = ros_runtime
     client = FakeClient()
     client.error = PositionQueryTimeout("位置回复超时", {})
     plugin, _, _ = make_plugin({("left", "can0"): client}, ros2=ros2)
     try:
         plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
-        wait_for(lambda: len(published) >= 3)
+        wait_for(lambda: plugin.dispatch("info", {"instance_id": "a"})["sample_state"] == "error")
+        time.sleep(0.1)
         info = plugin.dispatch("info", {"instance_id": "a"})
     finally:
         plugin.stop()
-    assert all(t == "/hand/left/joints_a" and p["valid"] is False for t, p in published)
+    assert published == []
     assert info["published_skeleton_frames"] == 0 and info["sample_state"] == "error"
 
 
-def test_stop_sends_one_final_invalid_frame_and_no_skeleton(ros_runtime):
+def test_stop_publishes_no_final_frame(ros_runtime):
     ros2, published, _ = ros_runtime
     plugin, _, _ = make_plugin(ros2=ros2)
     try:
         plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
-        wait_for(lambda: sum(1 for t, _ in published if t == "/hand/left/joints_a") >= 2)
+        wait_for(lambda: sum(1 for t, _ in published if t.endswith("_skeleton")) >= 2)
         published.clear()
-        plugin.dispatch("stop", {"instance_id": "a"})
+        result = plugin.dispatch("stop", {"instance_id": "a"})
     finally:
         plugin.stop()
-    frames = [p for t, p in published if t == "/hand/left/joints_a"]
-    assert [f for f in frames if f["state"] == "idle"], published
-    final = frames[-1]
-    assert final["state"] == "idle" and final["valid"] is False and final["reason"]
-    assert sum(1 for f in frames if f["state"] == "idle") == 1
-    assert final["timestamp"] is None and final["measured_hz"] is None
-    assert final["query_elapsed_s"] is None and final["joint_count"] == 16
-    assert all(j["raw"] is None and j["angle_rad"] is None and j["angle_deg"] is None
-               for j in final["joints"])
-    assert not [p for t, p in published if t.endswith("_skeleton") and p["status"]["valid"] is False]
+    assert result["state"] == "idle"
+    assert published == []
 
 
 def test_fixed_rate_is_thirty_hz(ros_runtime):
@@ -785,9 +778,9 @@ def test_fixed_rate_is_thirty_hz(ros_runtime):
     try:
         plugin.dispatch("start", {"instance_id": "a", "bound_side": "left"})
         start = time.monotonic()
-        wait_for(lambda: sum(1 for t, _ in published if t == "/hand/left/joints_a") >= 6, timeout=2.0)
+        wait_for(lambda: sum(1 for t, _ in published if t.endswith("_skeleton")) >= 6, timeout=2.0)
         elapsed = time.monotonic() - start
-        count = sum(1 for t, _ in published if t == "/hand/left/joints_a")
+        count = sum(1 for t, _ in published if t.endswith("_skeleton"))
         assert count / elapsed >= 15, (count, elapsed)
         assert plugin.dispatch("info", {"instance_id": "a"})["poll_hz"] == 30.0
     finally:
