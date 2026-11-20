@@ -250,6 +250,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertFalse(compose.get('privileged', False))
         self.assertEqual(compose['volumes'], [
             '/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro',
+            '/opt/phanthy-motus/data:/opt/phanthy-motus/data',
             {'type': 'bind', 'source': '/opt/phanthy-motus/drivers/lejurobot-kuavo5-w',
              'target': '/config', 'bind': {'create_host_path': True}}])
         self.assertIn('CONFIG_PATH=/config/config.yaml', compose['environment'])

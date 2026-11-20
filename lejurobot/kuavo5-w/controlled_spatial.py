@@ -9,6 +9,7 @@ import time
 from uuid import uuid4
 
 from spatial_client import JatenClient, MapCommandRejected, NavigationStateUnavailable
+from map_storage import MapArchive, migrate_database
 
 
 def text(value, field):
@@ -111,8 +112,13 @@ class ControlledSpatialPlugin:
         if type(self._standby_voice_enabled) is not bool:
             raise ValueError('standby_voice_enabled must be a boolean')
         self.client = client or JatenClient(bundle.startup_checks.provisioner)
-        self.store = SpatialStore(config.get('db_path', str(Path(os.environ.get('KUAVO_STATE_DIR', '/config'))
-                                                           / 'controlled_spatial.db')))
+        legacy_db = Path(os.environ.get('KUAVO_STATE_DIR', '/config')) / 'controlled_spatial.db'
+        data_dir = os.environ.get('KUAVO_DATA_DIR')
+        default_db = Path(data_dir) / 'kuavo5w/controlled_spatial.db' if data_dir else legacy_db
+        db_path = Path(config.get('db_path', str(default_db)))
+        if data_dir and 'db_path' not in config:
+            migrate_database(legacy_db, db_path)
+        self.store = SpatialStore(db_path)
         self._operations = threading.Lock()
         self._native_lock = threading.RLock()
         self._start_lock = threading.Lock()
@@ -124,6 +130,10 @@ class ControlledSpatialPlugin:
         self._standby_status = {'state': 'idle'}
         self._music_thread = None
         self._closed = threading.Event()
+        self.archive = (MapArchive(self.client, config.get('map_archive_dir',
+                        str(Path(data_dir) / 'maps/kuavo5w')), self._closed,
+                        idle=lambda: not self._map_pending and not self.store.state('mapping'))
+                        if data_dir else None)
         self._preparation = None
         self._task = None
         self._uncertain = False
@@ -228,6 +238,8 @@ class ControlledSpatialPlugin:
 
     def start_background(self):
         """Configure factory movement/standby tracks without starting chassis control."""
+        if self.archive is not None:
+            self.archive.schedule()
         with self._startup_guard:
             if self._music_thread is not None or self._closed.is_set():
                 return
@@ -394,6 +406,12 @@ class ControlledSpatialPlugin:
                           'map_transition': self._map_pending, 'chassis_preparation': self._preparation,
                           'startup': startup}
                 result['control_ownership'] = self.bundle.control_ownership()
+                result['storage'] = {'database': str(self.store.path),
+                    'factory_maps': '/home/jt/jmap_config/jmaps',
+                    'archive': self.archive.snapshot() if self.archive else {'state': 'disabled'}}
+                result['last_map_operation'] = self.store.state('last_map_operation')
+                if self._map_pending and self._map_pending.get('stage_started_at'):
+                    result['map_stage_elapsed_s'] = max(0., time.time()-self._map_pending['stage_started_at'])
                 if mapping and mapping.get('phase') == 'saving':
                     result['state'] = 'saving'
                     result['message'] = 'Optimizing and saving the map in background. Please wait; do not restart mapping.'
@@ -665,15 +683,26 @@ class ControlledSpatialPlugin:
                 self._map_pending['stage'] = 'SaveCartoMap'
             self._persist()
         self._map_deadline = time.monotonic() + (1800 if action == 'stop_mapping' else 150)
+        started = time.monotonic()
+        timing = {'operation': action, 'started_at': time.time(), 'stages': []}
+        self._map_timing = timing
         def worker():
             try:
                 result = self._mutate_map(action, args, mapping, cancelled)
                 if cancelled.is_set():
                     raise RuntimeError('map_operation_interrupted')
+                timing.update(state='completed', elapsed_s=time.monotonic()-started)
+                self.store.state('last_map_operation', timing)
+                result['timing'] = dict(timing)
                 self._map_pending = None
                 self._persist()
+                if self.archive is not None:
+                    self.archive.schedule()
                 self.bundle.tracker.finish('base', aid, self.PREFIX, 'completed', result)
             except Exception as exc:
+                timing.update(state='error', elapsed_s=time.monotonic()-started,
+                              error_type=type(exc).__name__)
+                self.store.state('last_map_operation', timing)
                 failed_stage = (self._map_pending or {}).get('stage')
                 # 8211 is the verified native precondition rejection, before
                 # ChangeCartoMap touches the map. No mutation is still running.
@@ -781,23 +810,50 @@ class ControlledSpatialPlugin:
         remaining = self._map_deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError('map_operation_timeout')
+        if method == 'ChangeMode':
+            try:
+                if self.client.observe(required=('agvState',))['agvState'].get('runningMode') == params['mode']:
+                    return  # Fresh feedback already proves the requested mode.
+            except NavigationStateUnavailable:
+                pass
         if self._map_pending is not None:
             self._map_pending['stage'] = method
+            self._map_pending['stage_started_at'] = time.time()
             self._persist()
-        self.client.command(method, params, timeout=min(1500 if method == 'SaveCartoMap' else 25, remaining))
-        if cancelled.is_set():
-            raise RuntimeError('map_operation_interrupted_inspect_map_state')
-        if method == 'ChangeMode':
-            self._wait(lambda: self.client.observe(required=('agvState',))['agvState'].get('runningMode')
-                       == params['mode'], cancelled)
+        started = time.monotonic()
+        try:
+            self.client.command(method, params, timeout=min(1500 if method == 'SaveCartoMap' else 25, remaining))
+            if cancelled.is_set():
+                raise RuntimeError('map_operation_interrupted_inspect_map_state')
+            if method == 'ChangeMode':
+                self._wait(lambda: self.client.observe(required=('agvState',))['agvState'].get('runningMode')
+                           == params['mode'], cancelled)
+        finally:
+            if hasattr(self, '_map_timing'):
+                self._map_timing['stages'].append({'stage': method, 'elapsed_s': time.monotonic()-started})
 
     def _load(self, name, cancelled):
+        try:
+            identity = self._identity()
+        except Exception:
+            identity = None  # A missing old map must not prevent loading a valid replacement.
+        if identity and identity[0] == name and self.store.state('loaded_map_identity') == list(identity):
+            observation = self.client.observe()
+            if (observation['agvState'].get('isMapping') is False
+                    and observation['localizationStatus'].get('cartoStatusId') == 1
+                    and observation['state'].get('agvPosition', {}).get('mapId') == name
+                    and observation['state']['agvPosition'].get('positionInitialized') is True):
+                self._command('ChangeMode', {'mode': 'AUTO'}, cancelled)
+                return  # Same content AND confirmed active localization, not just a matching name.
         self._command('ChangeMode', {'mode': 'MANUAL'}, cancelled)
         self._command('ChangeCartoMap', {'mapName': name}, cancelled)
         self._command('ChangeRoadMap', {'mapName': name}, cancelled)
-        self._wait(lambda: self._identity()[0] == name, cancelled)
+        self._wait(lambda: self.client.current_map()['mapId'] == name, cancelled)
         self._command('ChangeMode', {'mode': 'AUTO'}, cancelled)
-        self._wait(lambda: self.client.observe()['agvState'].get('runningMode') == 'AUTO', cancelled)
+        identity = self._identity()
+        if identity[0] != name:
+            raise RuntimeError('map_changed_during_load_confirmation')
+        self.store.state('loaded_map_identity', list(identity))
 
     def _wait(self, predicate, cancelled, timeout=30):
         end = min(time.monotonic() + timeout, self._map_deadline)
@@ -812,6 +868,10 @@ class ControlledSpatialPlugin:
 
     def close(self):
         self._closed.set()
+        if self.archive is not None:
+            self.archive.wake.set()
+            if self.archive.thread is not None:
+                self._workers.add(self.archive.thread)
         for worker in list(self._workers):
             worker.join(timeout=1)
         if not any(worker.is_alive() for worker in self._workers):

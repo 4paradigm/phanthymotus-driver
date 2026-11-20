@@ -45,6 +45,9 @@ sensors:
   # Vendor runtime limits are not hardware certification.
   joint_limits: null
 controlled_spatial:
+  # Deployment sets KUAVO_DATA_DIR=/opt/phanthy-motus/data.
+  # DB: <data>/kuavo5w/controlled_spatial.db; map snapshots: <data>/maps/kuavo5w/.
+  # Existing /config DB is migrated once without deleting/overwriting it.
   # Only the factory ID-1 movement song; TTS and warning tracks are preserved.
   motion_music_enabled: false
   # Silence only factory ID-7 standby prompt; preserve alarms and speaker/TTS.

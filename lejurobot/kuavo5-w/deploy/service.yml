@@ -6,6 +6,7 @@ lejurobot-kuavo5-w:
   pid: host
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     # Docker may create this directory on a fresh robot. The driver exclusively
     # seeds config.yaml, and persists SSH trust/optional mode-0600 operator secrets.
     - type: bind
@@ -20,6 +21,7 @@ lejurobot-kuavo5-w:
     - PYTHONUNBUFFERED=1
     - CONFIG_PATH=/config/config.yaml
     - KUAVO_STATE_DIR=/config
+    - KUAVO_DATA_DIR=/opt/phanthy-motus/data
     - KUAVO_CONFIG_SEED=1
     - KUAVO_HOST_SSH_PASSWORD=${KUAVO_HOST_SSH_PASSWORD:-}
     - KUAVO_CONTROLLER_SSH_PASSWORD=${KUAVO_CONTROLLER_SSH_PASSWORD:-}

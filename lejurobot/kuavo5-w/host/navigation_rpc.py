@@ -11,6 +11,48 @@ import re
 import os
 import sys
 import time
+import base64
+
+
+def map_archive_read(operation, args, root=Path('/home/jt/jmap_config/jmaps')):
+    name = args.get('map_name')
+    if (not isinstance(name, str) or not name.strip() or len(name) > 80 or name in ('.', '..')
+            or any(c in name for c in '/\\') or any(ord(c) < 32 for c in name)):
+        raise ValueError('invalid_map_name')
+    if map_save_status(name, root).get('complete') is not True:
+        raise RuntimeError('map_save_not_complete_for_archive')
+    suffixes = ('.pgm', '.yaml', '.pbstream', '.path')
+    def path(suffix):
+        p = root / (name+suffix)
+        if p.is_symlink() or not p.is_file() or not 0 < p.stat().st_size <= 512*1024*1024:
+            raise RuntimeError('invalid_map_archive_source')
+        return p
+    if operation == 'map_archive_manifest':
+        files = {}
+        for suffix in suffixes:
+            p = path(suffix)
+            before = p.stat()
+            digest = hashlib.sha256()
+            with p.open('rb') as stream:
+                for chunk in iter(lambda: stream.read(1024*1024), b''):
+                    digest.update(chunk)
+            after = p.stat()
+            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                raise RuntimeError('map_changed_during_archive')
+            files[suffix] = {'size': after.st_size, 'mtime_ns': after.st_mtime_ns, 'sha256': digest.hexdigest()}
+        return {'map_name': name, 'files': files}
+    suffix, offset, expected = args.get('suffix'), args.get('offset'), args.get('expected', {})
+    if suffix not in suffixes or type(offset) is not int or offset < 0 or offset % (1024*1024):
+        raise ValueError('invalid_map_archive_chunk')
+    p = path(suffix)
+    stat = p.stat()
+    if (stat.st_size != expected.get('size') or stat.st_mtime_ns != expected.get('mtime_ns')
+            or offset >= stat.st_size):
+        raise RuntimeError('map_changed_during_archive')
+    with p.open('rb') as stream:
+        stream.seek(offset)
+        data = stream.read(min(1024*1024, stat.st_size-offset))
+    return {'data': base64.b64encode(data).decode('ascii')}
 
 
 def dispatch_service_class(service_class, server_md5):
@@ -146,6 +188,8 @@ def map_save_status(name, root=Path('/home/jt/jmap_config/jmaps')):
 
 
 def main(request):
+    if request['operation'] in ('map_archive_manifest', 'map_archive_chunk'):
+        return map_archive_read(request['operation'], request.get('args', {}))
     if request['operation'] == 'map_save_status':
         return map_save_status(request.get('args', {}).get('map_name'))
     if request['operation'] == 'standby_voice':
