@@ -6,7 +6,6 @@ import time
 import urllib.error
 import urllib.request
 
-from common.control import parse_descriptor
 
 BASE = 'http://127.0.0.1:15791'
 from device import VERSION
@@ -132,13 +131,13 @@ def run_check(timeout=20, camera=False):
                 if data['available']:
                     sample = data['sample']
                     eef = sample.get('eef')
-                    if (sample.get('schema') != 'tron2.eef/1' or not isinstance(eef, list)
+                    if (set(sample) != {'schema', 'frame', 'stamp_ms', 'eef'}
+                            or sample['schema'] != 'motus.eef/1' or sample['frame'] != 'base_Link'
+                            or type(sample['stamp_ms']) is not int or not isinstance(eef, list)
                             or len(eef) != 16 or not all(type(v) in (int, float) and math.isfinite(v) for v in eef)):
                         raise ValueError('Expected a complete numeric EEF state')
             else:
-                interface = parse_descriptor(data['control_interface'])
-                if (interface.mode != 'eef_pose' or interface.dof != 16
-                        or interface.frame != 'base_Link' or interface.eef_quat_offsets != (3, 11)):
+                if data.get('schema') != 'motus.eef/1' or data.get('frame') != 'base_Link':
                     raise ValueError('Expected the TRON2 dual TCP and gripper control layout')
     if eef_only:
         if camera:

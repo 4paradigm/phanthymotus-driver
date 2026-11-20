@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, Mock
 import aiohttp
 
 from eef_state import CONTROL_TOPIC
-from servo_eef import EefServo
+from servo_eef import EefServo, WATCHDOG_MS
 from vendor import MoveError, RobotReader
 
 
@@ -23,9 +23,8 @@ READY = {'working_mode': 'developer_mode', 'working_mode_valid': True, 'motor': 
 
 
 def message(values, **fields):
-    msg = {'schema': 'motus.control/1', 'mode': 'eef_pose', 'dof': 16, 'values': values,
-           'source': 'test', 'priority': 50, 'seq': time.monotonic_ns(),
-           'stamp_ms': time.time_ns() // 1_000_000, 'ttl_ms': 500}
+    msg = {'schema': 'motus.eef/1', 'frame': 'base_Link',
+           'stamp_ms': time.time_ns() // 1_000_000, 'eef': values}
     msg.update(fields)
     return json.dumps(msg)
 
@@ -49,7 +48,6 @@ class Bus:
 class ServoTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.measured = MEASURED.copy()
-        self.observed = {}
         self.reader = RobotReader({'serial': 'DACH_TRON2A_TEST', 'response_timeout_seconds': .2})
         self.reader.ws = Mock(closed=False)
         self.reader.connected = True
@@ -57,7 +55,7 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.reader.sample = Mock(return_value={'available': True, 'data': READY})
         self.reader.send_move_p = AsyncMock(return_value={'result': 'success', 'status': 'accepted'})
         self.reader.send_gripper = AsyncMock(return_value={'result': 'success'})
-        state = SimpleNamespace(values=lambda: self.measured.copy(), observation=self.observed.get)
+        state = SimpleNamespace(values=lambda: self.measured.copy())
         self.servo = EefServo(SimpleNamespace(reader=self.reader,
             arm_servo=SimpleNamespace(_conflict=lambda token=None: None)), state)
         self.servo.publisher = Bus()
@@ -121,26 +119,20 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.reader.send_gripper.assert_not_awaited()
 
     async def test_feedback_echo_and_gripper_only_do_not_write_movep(self):
-        now = time.time_ns() // 1_000_000
-        self.observed[now] = self.measured.copy()
         frame = self.measured.copy()
-        self.measured[0] += .001
-        await self.feed(frame, obs_stamp_ms=now)
+        await self.feed(frame)
         self.reader.send_move_p.assert_not_awaited()
         self.reader.send_gripper.assert_not_awaited()
         frame[7] += .01
-        await self.feed(frame, obs_stamp_ms=now)
+        await self.feed(frame)
         self.reader.send_move_p.assert_not_awaited()
         self.reader.send_gripper.assert_awaited_once()
 
     async def test_paired_movep_uses_current_peer_without_rewriting_echoed_opening(self):
         self.measured[15] = .085 * 100 / 94
-        stamp = time.time_ns() // 1_000_000
-        self.observed[stamp] = self.measured.copy()
         target = self.measured.copy()
         target[0] += .003
-        self.measured[8] -= .002
-        await self.feed(target, obs_stamp_ms=stamp)
+        await self.feed(target)
         self.assert_pose_call(target[:7], self.measured[8:15])
         self.reader.send_gripper.assert_not_awaited()
 
@@ -157,11 +149,9 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.assert_pose_call(target[:7], RIGHT)
         self.measured[2] += .001
         hold = self.measured.copy()
-        now = time.time_ns() // 1_000_000
-        self.observed[now] = hold.copy()
-        await self.feed(hold, obs_stamp_ms=now)
+        await self.feed(hold)
         self.assert_pose_call(hold[:7], RIGHT)
-        await self.feed(hold, obs_stamp_ms=now)
+        await self.feed(hold)
         self.assertEqual(self.reader.send_move_p.await_count, 3)
         self.reader.send_gripper.assert_not_awaited()
 
@@ -173,9 +163,9 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.assert_pose_call(LEFT, target[8:15])
         target[11:15] = [-v for v in target[11:15]]
         for _ in range(3):
-            await self.feed(target, obs_stamp_ms=time.time_ns() // 1_000_000)
+            await self.feed(target)
         self.measured[:] = target
-        await self.feed(target, obs_stamp_ms=time.time_ns() // 1_000_000)
+        await self.feed(target)
         self.reader.send_move_p.assert_awaited_once()
         self.reader.send_gripper.assert_awaited_once()
 
@@ -231,32 +221,19 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         for actual, expected in zip(boundary, [.732, .326, LEFT[2]]):
             self.assertAlmostEqual(actual, expected)
 
-    async def test_peer_echo_from_earlier_sample_cannot_pull_it_inside_workspace(self):
-        self.measured[8] = .251
-        stamp = time.time_ns() // 1_000_000
-        self.observed[stamp] = self.measured.copy()
-        target = self.measured.copy()
-        target[0] -= .003
-        self.measured[8] = .249  # The held right side has since crossed the native X limit.
-        await self.feed(target, obs_stamp_ms=stamp)
-        self.assertEqual(self.servo.last['status'], 'rejected')
-        self.reader.send_move_p.assert_not_awaited()
-        self.reader.send_gripper.assert_not_awaited()
-
-    async def test_upstream_priority_replay_ttl_and_optional_observation(self):
+    async def test_stale_and_reordered_frames_are_rejected_but_same_millisecond_can_replace(self):
         frame = self.measured.copy()
         frame[7] = .05
-        await self.feed(frame, source='policy', seq=11, priority=20)
-        frame[7] = .02
         now = time.time_ns() // 1_000_000
-        await self.feed(frame, source='operator', seq=1, priority=80, obs_stamp_ms=now - 10)
-        frame[7] = .06
-        limit = self.servo.info()['control_interface']['rate']['max_obs_age_ms']
-        for fields in ({'source':'policy', 'seq':12, 'priority':20}, {'source':'operator','seq':1},
-                       {'source':'operator','seq':2,'ttl_ms':1,'stamp_ms':now-10},
-                       {'source':'operator','seq':3,'obs_stamp_ms':now-limit-1}):
-            await self.feed(frame, **fields)
-        self.assertEqual((self.servo.accepted, self.servo.rejected), (2, 4))
+        await self.feed(frame, stamp_ms=now - 300)
+        self.reader.send_gripper.assert_not_awaited()
+        await self.feed(frame, stamp_ms=now - 20)
+        self.reader.send_gripper.assert_awaited_once()
+        frame[7] = .02
+        await self.feed(frame, stamp_ms=now - 21)
+        self.reader.send_gripper.assert_awaited_once()
+        await self.feed(frame, stamp_ms=now - 20)
+        self.assertEqual((self.servo.accepted, self.servo.rejected), (2, 2))
         self.assertEqual(self.reader.send_gripper.await_count, 2)
         self.reader.send_move_p.assert_not_awaited()
 
@@ -265,11 +242,15 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         target[7] = .06
         bad = target.copy()
         bad[3:7] = [0.] * 4
-        for raw in (message(bad), message(target[:-1]), message(target[:-1]+[True]),
-                    message(target, frame='other'), message(target, seq=False),
-                    message(target, stamp_ms=time.time_ns()//1_000_000+900),
-                    message(target, schema='tron2.eef/1')):
+        for raw in (message(bad), message(target[:-1]), message(target[:-1] + [True]),
+                    message(target[:-1] + [math.nan]), message(target, frame='other'),
+                    message(target, stamp_ms=True), message(target, stamp_ms=time.time_ns() // 1_000_000 + 900),
+                    message(target, schema='motus.control/1')):
             await self.send(raw)
+        for key in ('schema', 'frame', 'stamp_ms', 'eef'):
+            missing = json.loads(message(target))
+            del missing[key]
+            await self.send(json.dumps(missing))
         self.servo.state.values = Mock(side_effect=ValueError('Fresh native feedback required'))
         await self.feed(target)
         self.assertEqual(self.servo.accepted, 0)
@@ -301,7 +282,7 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         target[15] = .06
         self.servo.publisher.callback(message(target))
         await asyncio.wait_for(started.wait(), 1.)
-        interval = self.servo.info()['control_interface']['rate']['watchdog_ms'] / 1000
+        interval = WATCHDOG_MS / 1000
         try:
             await asyncio.sleep(interval + .10)
         finally:
@@ -312,39 +293,26 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watchdog_notifies_once_per_gap_and_only_valid_input_resumes(self):
         transitions = self.capture_transitions()
-        clock = self.servo.sink._clock = Mock(return_value=10000)
-        period = self.servo.sink.descriptor.watchdog_ms
-        await self.feed(self.measured, source='operator', priority=80, seq=1)
+        interrupted, resumed = 'stream_interrupted', 'stream_resumed'
+        await self.feed(self.measured)
         with self.assertLogs('servo_eef', level='INFO') as interrupted_log:
-            clock.return_value += period
-            await wait_until(lambda: self.servo.sink.stats()['holding'])
-        self.assert_activity('stream_interrupted')
+            await wait_until(lambda: interrupted in transitions())
+        self.assert_activity(interrupted)
         self.assertIn(self.servo.info()['activity']['text'], interrupted_log.records[0].getMessage())
 
-        # At the exact watchdog boundary the owner still outranks this publisher.
-        await self.feed(self.measured, source='policy', priority=10, seq=1)
-        self.assertIn('outranked', self.servo.last['reason'])
-        await self.feed(self.measured, source='operator', priority=80, seq=2,
-                        ttl_ms=1, stamp_ms=time.time_ns() // 1_000_000 - 20)
-        self.assertTrue(self.servo.sink.stats()['holding'])
-
-        for strike in range(2, self.servo.sink._escalate_after + 1):
-            clock.return_value += period
-            await wait_until(lambda: self.servo.sink.stats()['watchdog_strikes'] == strike)
-        self.assertTrue(self.servo.sink.stats()['stood_down'])
-        interrupted, resumed = 'stream_interrupted', 'stream_resumed'
+        await self.feed(self.measured, stamp_ms=time.time_ns() // 1_000_000 - 500)
+        await asyncio.sleep(WATCHDOG_MS / 1000 + .03)
         self.assertEqual(transitions(), [interrupted])
         with self.assertLogs('servo_eef', level='INFO') as resumed_log:
-            await self.feed(self.measured, source='operator', priority=80, seq=3)
-            await self.feed(self.measured, source='operator', priority=80, seq=4)
+            await self.feed(self.measured)
+            await self.feed(self.measured)
         self.assertEqual(len(resumed_log.records), 1)
         self.assertEqual(transitions(), [interrupted, resumed])
         self.assert_activity(resumed)
         self.assertIn(self.servo.info()['activity']['text'], resumed_log.records[0].getMessage())
 
-        clock.return_value += period
-        await wait_until(lambda: self.servo.sink.stats()['holding'])
-        await self.feed(self.measured, source='operator', priority=80, seq=5)
+        await wait_until(lambda: transitions().count(interrupted) == 2)
+        await self.feed(self.measured)
         self.assertEqual(transitions(), [interrupted, resumed, interrupted, resumed])
         self.reader.send_move_p.assert_not_awaited()
         self.reader.send_gripper.assert_not_awaited()
@@ -357,11 +325,9 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
                 before = transitions()
                 await self.servo.call({'action': ending})
                 await self.servo.call({'action': restart})
-                clock = self.servo.sink._clock = Mock(return_value=10000)
                 await self.feed(self.measured)
                 self.assertEqual(transitions(), before)
-                clock.return_value += self.servo.sink.descriptor.watchdog_ms
-                await wait_until(lambda: self.servo.sink.stats()['holding'])
+                await wait_until(lambda: transitions() == before + ['stream_interrupted'])
                 stale = self.servo.publisher.callback
                 await self.servo.call({'action': ending})
                 await self.servo.call({'action': restart})
@@ -426,7 +392,7 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         target[0], target[1] = .64, .28
         await self.feed(target)
         first, other, duration, _ = self.reader.send_move_p.await_args.args
-        watchdog = self.servo.info()['control_interface']['rate']['watchdog_ms'] / 1000
+        watchdog = WATCHDOG_MS / 1000
         self.assertGreater(duration, 0.)
         self.assertLessEqual(duration, watchdog)
         self.assertEqual(list(other), RIGHT)
@@ -456,8 +422,8 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         try:
             for dx in (-.002, .003):
                 target[0] = LEFT[0] + dx
-                self.servo.publisher.callback(message(target))
                 await asyncio.sleep(.005)
+                self.servo.publisher.callback(message(target))
         finally:
             release.set()
         await wait_until(lambda: self.reader.send_move_p.await_count >= 2)

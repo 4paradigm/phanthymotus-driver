@@ -1,5 +1,4 @@
 """DACH vendor TCP poses and measured gripper openings on the Motus ROS bus."""
-from collections import deque
 import asyncio
 import math
 import time
@@ -9,7 +8,7 @@ from vendor import POSE_JOINT_POLL_SECONDS
 
 STATE_TOPIC = '/limx_tron2/state/eef'
 CONTROL_TOPIC = '/limx_tron2/control/eef'
-SCHEMA = 'tron2.eef/1'
+SCHEMA = 'motus.eef/1'
 FRAME = 'base_Link'
 POSE_MAX_AGE = .35
 GRIPPER_MAX_AGE = .75
@@ -53,7 +52,6 @@ class EefState:
         self.reader = adapter.reader
         self._publishing = False
         self._connection = None
-        self._published = deque(maxlen=32)
         self._pose_time = _Freshness()
         self._gripper_time = _Freshness()
         self._poses = self._openings = ()
@@ -72,7 +70,6 @@ class EefState:
         socket = self.reader.ws
         if socket is not self._connection:
             self._connection = socket
-            self._published.clear()
             self._pose_time = _Freshness()
             self._gripper_time = _Freshness()
             self._poses = self._openings = ()
@@ -93,12 +90,6 @@ class EefState:
     def values(self):
         return self.packet()['eef']
 
-    def _observation_packet(self):
-        packet = self.packet()
-        if not self._published or self._published[-1]['stamp_ms'] != packet['stamp_ms']:
-            self._published.append(packet)
-        return self._published[-1]
-
     def call(self, action):
         if action == 'start':
             self._publishing = True
@@ -113,7 +104,7 @@ class EefState:
         if not self._publishing:
             return dict(info, state='idle', available=False)
         try:
-            return dict(info, state='running', available=True, sample=self._observation_packet())
+            return dict(info, state='running', available=True, sample=self.packet())
         except ValueError as exc:
             return dict(info, state='running', available=False, reason=str(exc))
 
@@ -140,15 +131,6 @@ class EefState:
         self._openings = tuple(percentage(data.get(side + '_opening'), side + '_opening')
                                * (MAX_OPENING_MM / 1000.) / MAX_OPENING for side in SIDES)
 
-    def observation(self, stamp):
-        """Return the EEF vector supplied to clients with this observation time."""
-        if self._connection is not self.reader.ws:
-            return None
-        for packet in reversed(self._published):
-            if packet['stamp_ms'] == stamp:
-                return packet['eef']
-        return None
-
     def _update_poses(self, data, round_trip):
         if (not isinstance(data, dict) or data.get('result') != 'success'
                 or not self._pose_time.observe(data.get('timestamp'), round_trip, POSE_MAX_AGE)):
@@ -167,7 +149,7 @@ class EefState:
         if not self._publishing:
             return
         try:
-            packet = self._observation_packet()
+            packet = self.packet()
         except ValueError:
             return
         self.adapter.publish(STATE_TOPIC, packet)

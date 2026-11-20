@@ -26,12 +26,12 @@
 
 | 话题 | 协议 | 数据 |
 |---|---|---|
-| `/limx_tron2/state/eef` | `tron2.eef/1` | `eef` 是实测值，`frame` 是 `base_Link`，`stamp_ms` 是采样时间（Unix 毫秒）。 |
-| `/limx_tron2/control/eef` | `motus.control/1` | `values` 是绝对目标。发送方填写自身的 `source`、严格递增的 `seq`、发送时间 `stamp_ms`、有效期 `ttl_ms`、`mode: eef_pose` 和 `dof: 16`，可用 `priority` 声明优先级。 |
+| `/limx_tron2/state/eef` | `motus.eef/1` | `eef` 是实测值，`frame` 是 `base_Link`，`stamp_ms` 是采样时间（Unix 毫秒）。 |
+| `/limx_tron2/control/eef` | `motus.eef/1` | `eef` 是绝对目标，`frame` 是 `base_Link`，`stamp_ms` 是本次发送时间（Unix 毫秒）。 |
 
 传感卡初始为 `idle`。画布启动卡片时会发送 `start`。直接订阅 ROS 话题时，须先启动卡片。运行期间，双臂和双夹爪反馈均新鲜时按约 10 Hz 发布，反馈不完整时暂停发布，`info` 返回 `available: false`。收到 `stop` 后立即停发，重复停止也返回 `idle`。再次 `start` 可恢复发布。启用了 `servo_eef` 的驱动会继续为执行卡采集所需的内部反馈。反馈年龄包括厂商查询往返时间。整帧的 `stamp_ms` 取两类样本首次查询起点的较早值，重复的厂商样本保留原时间戳。
 
-| `eef` 和 `values` 下标（从 0 起） | 内容 |
+| `eef` 下标（从 0 起） | 内容 |
 |---|---|
 | 0–6 | 左手 TCP 的 x、y、z（m）和单位四元数 qx、qy、qz、qw |
 | 7 | 左夹爪名义开口（m） |
@@ -45,18 +45,17 @@
 ```python
 import time
 
-def lift_command(state, seq):
-    target = state["eef"].copy()
-    target[2] += 0.003
-    return {
-        "schema": "motus.control/1", "mode": "eef_pose", "dof": 16,
-        "source": "left_arm_example", "seq": seq, "priority": 50,
-        "stamp_ms": time.time_ns() // 1_000_000, "ttl_ms": 200,
-        "obs_stamp_ms": state["stamp_ms"], "values": target,
-    }
+# 从一帧新鲜实测计算一次目标。
+target = state["eef"].copy()
+target[2] += 0.003
+
+# 持续发布同一目标时，每次更新发送时间。
+def control_frame():
+    return {"schema": "motus.eef/1", "frame": "base_Link",
+            "stamp_ms": time.time_ns() // 1_000_000, "eef": target}
 ```
 
-控制卡通过 `start` 订阅。共享 `ControlSink` 按来源、优先级、序号和有效期接收命令。依据末端反馈或相机等观测计算的目标应附上真实的 `obs_stamp_ms`，每帧按 `info.control_interface.rate.max_obs_age_ms` 检查其年龄。直接给定的绝对目标可省略该字段。沿用本驱动某个实测帧的 TCP 时可引用其时间戳，使执行卡识别需要保持的臂。
+两条话题的 JSON 都只含上述四个字段。每个控制话题使用一个发布者。控制卡通过 `start` 订阅，以最新收到的有效帧替换待处理目标。同一毫秒内按接收顺序处理。距发送已达 200 ms、时间戳比已接收帧更早、或时间戳超前本机超过 100 ms 的命令会被拒绝。上游以当前实测值覆盖在途目标即可请求保持。
 
 机械臂使用原厂 `request_movep`，每次发送左右臂两个目标位姿及本段运动时间。驱动从实测姿态沿请求方向生成有界的短段，并在持续收到有效目标时向终点推进。目标超过厂商位置范围时，沿该方向最多运动到边界。每个短段都必须满足以下厂商限制，单位为 m。
 
@@ -67,7 +66,7 @@ def lift_command(state, seq):
 
 只移动一只手臂时，另一只手臂也需要有合法的保持目标。如果应保持的手臂已经超出上表范围，驱动拒绝发送本次双臂 MoveP，并在 `info.last.arm_error` 说明原因。夹爪通过独立原厂命令下发，开口按 0～0.085 m 限幅；同帧夹爪执行成功、双臂目标被拒时，`info.last.status` 为 `partial`。
 
-上游按 `info.control_interface.rate.expected_hz` 发送目标。断流超过 `watchdog_ms` 后停止发送后续运动段。厂商已受理的 MoveP 或夹爪动作可能继续；等待回复时停止卡片也可能得到 `outcome_unknown`。MoveP 成功回复表示厂商受理该段指令。任务卡使用后续 `state/eef` 实测帧及自身的位置、姿态和开口公差判断到位。
+建议上游以 10 Hz 发送目标。有效帧到期后驱动停止下发后续运动段。断流和恢复可通过 `info.activity` 或容器日志查看，超时见 `info.watchdog_ms`。厂商已受理的 MoveP 或夹爪动作可能继续；等待回复时停止卡片也可能得到 `outcome_unknown`。MoveP 成功回复表示厂商受理该段指令。任务卡使用后续 `state/eef` 实测帧及自身的位置、姿态和开口公差判断到位。
 
 夹爪卡片说明见 [夹爪卡片使用说明](GRIPPER.md)。只填写side（left/right）、opening_mm（0至85mm）、speed、force；没有action/close/recover选项。驱动按底层值=毫米数×94/85名义换算，0mm闭合。非法输入在占用任务和发送前拒绝，两侧独立管理；合法指令仍保留未到位或断连保护。
 

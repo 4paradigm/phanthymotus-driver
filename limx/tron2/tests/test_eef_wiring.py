@@ -7,7 +7,6 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import check
-from common.control import parse_descriptor
 from device import Adapter, VERSION
 from vendor import RobotReader
 
@@ -37,15 +36,8 @@ class EefWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(a.servo_eef.state, a.eef_state)
         port = a.tools()[0]['topic_in'][0]
         self.assertEqual((port['topic'], port['format']), ('/limx_tron2/control/eef', 'control/eef'))
-        interface = (await a.execute_tool('servo_eef', {'action': 'info'}))['control_interface']
-        self.assertEqual(interface['control_interface'], 'motus.control/1')
-        descriptor = parse_descriptor(interface)
-        self.assertEqual((descriptor.dof, descriptor.frame), (16, 'base_Link'))
-        self.assertEqual([(g.offset, g.count, g.mode) for g in descriptor.groups],
-                         [(0, 7, 'eef_pose'), (7, 1, 'joint_position'),
-                          (8, 7, 'eef_pose'), (15, 1, 'joint_position')])
-        self.assertGreater(descriptor.max_obs_age_ms, 0)
-        self.assertGreater(descriptor.watchdog_ms, 0)
+        info = await a.execute_tool('servo_eef', {'action': 'info'})
+        self.assertEqual((info['schema'], info['frame']), ('motus.eef/1', 'base_Link'))
         with self.assertRaises(ValueError):
             await a.execute_tool('servo_eef', {'action': 'start', 'dry_run': True})
         self.assertFalse(a.servo_eef.running)
@@ -111,10 +103,10 @@ class EefWiringTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(topic, '/limx_tron2/state/eef')
             target = state['eef'].copy()
             target[0] -= .002
-            for seq in (1, 2):
-                callback(json.dumps({'schema': 'motus.control/1', 'source': 'native-eef-test',
-                    'seq': seq, 'ttl_ms': 200, 'stamp_ms': time.time_ns() // 1_000_000,
-                    'obs_stamp_ms': state['stamp_ms'], 'mode': 'eef_pose', 'dof': 16, 'values': target}))
+            self.assertEqual(set(state), {'schema', 'frame', 'stamp_ms', 'eef'})
+            self.assertEqual(state['schema'], 'motus.eef/1')
+            for _ in range(2):
+                callback(json.dumps(dict(state, stamp_ms=time.time_ns() // 1_000_000, eef=target)))
                 await asyncio.sleep(.03)
             reader.send_move_p.assert_awaited_once()
             left, right = reader.send_move_p.await_args.args[:2]

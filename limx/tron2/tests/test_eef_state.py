@@ -39,14 +39,22 @@ class EefStateTests(unittest.IsolatedAsyncioTestCase):
         self.state.call('start')
         frame = await self.next_frame()
         self.assertEqual(set(frame), {'schema', 'frame', 'stamp_ms', 'eef'})
-        self.assertEqual((frame['schema'], frame['frame']), ('tron2.eef/1', FRAME))
+        self.assertEqual((frame['schema'], frame['frame']), ('motus.eef/1', FRAME))
         self.assertEqual(frame['eef'][:7], [.48, .20, -.38, -.5, .5, -.5, .5])
         self.assertAlmostEqual(frame['eef'][7], .085 * 100 / 94)
         # An out-of-workspace measured TCP is valid sensor data.
         self.assertEqual(frame['eef'][8:], [.10, -.21, -.73, 0., -.6, 0., .8, 0.])
-        self.assertEqual(self.state.observation(frame['stamp_ms']), frame['eef'])
-        self.assertIsNone(self.state.observation(frame['stamp_ms'] - 1))
+        self.assertEqual(self.state.values(), frame['eef'])
         self.assertLessEqual(frame['stamp_ms'], time.time_ns() // 1_000_000)
+
+    async def test_new_tcp_is_published_between_gripper_samples(self):
+        self.reader.read_gripper.side_effect = lambda: dict(self.jaws, timestamp=1)
+        self.state.call('start')
+        first = await self.next_frame()
+        self.poses['left_position'][0] += .003
+        next_frame = await self.next_frame()
+        self.assertAlmostEqual(next_frame['eef'][0] - first['eef'][0], .003)
+        self.assertEqual(next_frame['eef'][7], first['eef'][7])
 
     async def test_standalone_sensor_only_polls_while_running(self):
         await asyncio.sleep(.12)
@@ -114,7 +122,7 @@ class EefStateTests(unittest.IsolatedAsyncioTestCase):
         self.reader.read_move_pose.side_effect = lambda: dict(self.poses, timestamp=time.time_ns() // 1_000_000)
         new = await self.next_frame()
         self.assertGreater(new['stamp_ms'], frame['stamp_ms'])
-        self.assertIsNone(self.state.observation(frame['stamp_ms']))
+        self.assertTrue(self.state.info()['available'])
 
     async def test_late_read_and_its_fast_duplicate_are_both_stale(self):
         self.state._connected()
