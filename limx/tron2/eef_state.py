@@ -82,10 +82,9 @@ class EefState:
             raise ValueError('Fresh DACH end poses are required')
         if not self._openings or not self._gripper_time.fresh(GRIPPER_MAX_AGE):
             raise ValueError('Fresh gripper openings are required')
-        left, right = self._poses
         return {'schema': SCHEMA, 'frame': FRAME,
                 'stamp_ms': min(self._pose_time.wall_ms, self._gripper_time.wall_ms),
-                'eef': [*left, self._openings[0], *right, self._openings[1]]}
+                'eef': [value for pose, opening in zip(self._poses, self._openings) for value in (*pose, opening)]}
 
     def values(self):
         return self.packet()['eef']
@@ -100,7 +99,7 @@ class EefState:
         return self.info()
 
     def info(self):
-        info = {'read_only': True, 'topic_out': self.tool()['topic_out']}
+        info = {'read_only': True, 'schema': SCHEMA, 'frame': FRAME, 'topic_out': self.tool()['topic_out']}
         if not self._publishing:
             return dict(info, state='idle', available=False)
         try:

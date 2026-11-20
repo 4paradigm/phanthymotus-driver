@@ -23,8 +23,10 @@ READY = {'working_mode': 'developer_mode', 'working_mode_valid': True, 'motor': 
 
 
 def message(values, **fields):
-    msg = {'schema': 'motus.eef/1', 'frame': 'base_Link',
-           'stamp_ms': time.time_ns() // 1_000_000, 'eef': values}
+    now = time.time_ns() // 1_000_000
+    msg = {'schema': 'motus.control/1', 'mode': 'eef_pose', 'dof': 16, 'values': values,
+           'source': 'test', 'seq': time.monotonic_ns(), 'stamp_ms': now, 'ttl_ms': 200,
+           'obs_stamp_ms': now}
     msg.update(fields)
     return json.dumps(msg)
 
@@ -129,7 +131,7 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.reader.send_gripper.assert_awaited_once()
 
     async def test_paired_movep_uses_current_peer_without_rewriting_echoed_opening(self):
-        self.measured[15] = .085 * 100 / 94
+        self.measured[15] = .085
         target = self.measured.copy()
         target[0] += .003
         await self.feed(target)
@@ -169,72 +171,59 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.reader.send_move_p.assert_awaited_once()
         self.reader.send_gripper.assert_awaited_once()
 
-    async def test_clamp_native_workspace_and_gripper_within_one_frame(self):
+    async def test_raw_targets_outside_hard_limits_reject_every_write(self):
+        for index, raw in ((0, .733), (10, -.674), (7, .086), (15, -.001)):
+            with self.subTest(index=index):
+                target = self.measured.copy()
+                target[0] += .003
+                target[7] += .02
+                target[index] = raw
+                await self.feed(target)
+                self.assertEqual(self.servo.last['status'], 'rejected')
+        self.reader.send_move_p.assert_not_awaited()
+        self.reader.send_gripper.assert_not_awaited()
+
+    async def test_target_on_vendor_boundary_is_legal(self):
         self.measured[0] = .730
         target = self.measured.copy()
-        target[0], target[1], target[7] = .8, .235, .105
+        target[0], target[1], target[7] = .732, .201, .085
         await self.feed(target)
-        left = self.measured[:7]
-        left[0] = .732
-        left[1] += .001
-        actual, other = self.reader.send_move_p.await_args.args[:2]
-        for value, expected in zip(actual, left):
-            self.assertAlmostEqual(value, expected)
-        boundary = self.servo.last['workspace_boundary_m']
-        self.assertEqual(set(boundary), {'left'})
-        self.assertEqual(len(boundary['left']), 3)
-        for value, expected in zip(boundary['left'], left[:3]):
-            self.assertAlmostEqual(value, expected)
-        self.assertEqual(list(other), RIGHT)
+        self.assert_pose_call(target[:7], RIGHT)
         self.assertEqual(self.reader.send_gripper.await_args.args[0]['left_opening'], 94.)
-        await self.feed(target)
-        self.reader.send_move_p.assert_awaited_once()
-        self.reader.send_gripper.assert_awaited_once()
 
-    async def test_outside_measured_peer_is_never_moved_to_admit_other_arm(self):
-        # The right arm reported X = .107 m in the real trace, outside MoveP's X box.
-        self.measured[8] = .107
-        frame = self.measured.copy()
-        frame[0] -= .003
-        frame[7] = .06
-        await self.feed(frame)
-        self.assertEqual(self.servo.last['status'], 'partial')
-        await self.feed(frame)
-        self.assertEqual(self.servo.last['status'], 'rejected')
-        frame = self.measured.copy()
-        frame[7] = .02
-        await self.feed(frame)
-        self.assertEqual(self.servo.last['status'], 'accepted')
-        self.reader.send_move_p.assert_not_awaited()
-        self.assertEqual(self.reader.send_gripper.await_count, 2)
-        self.assertIn('left_opening', self.reader.send_gripper.await_args.args[0])
-
-    async def test_distant_workspace_boundary_is_distinct_from_next_short_segment(self):
+    async def test_outside_echo_prevents_motion_and_independent_gripper_write(self):
+        self.measured[8] = .107  # Actual held right TCP below its native X minimum.
         target = self.measured.copy()
-        target[0], target[1] = .9, .41
+        target[7] = .06
         await self.feed(target)
-        step = self.reader.send_move_p.await_args.args[0]
-        boundary = self.servo.last['workspace_boundary_m']['left']
-        self.assertGreater(step[0], LEFT[0])
-        self.assertLess(step[0], .732)
-        self.assertAlmostEqual(step[1] - LEFT[1], (step[0] - LEFT[0]) * .5)
-        for actual, expected in zip(boundary, [.732, .326, LEFT[2]]):
-            self.assertAlmostEqual(actual, expected)
-
-    async def test_stale_and_reordered_frames_are_rejected_but_same_millisecond_can_replace(self):
-        frame = self.measured.copy()
-        frame[7] = .05
-        now = time.time_ns() // 1_000_000
-        await self.feed(frame, stamp_ms=now - 300)
+        self.assertEqual(self.servo.last['status'], 'rejected')
+        target[0] -= .003
+        await self.feed(target)
+        self.assertEqual(self.servo.last['status'], 'rejected')
+        self.reader.send_move_p.assert_not_awaited()
         self.reader.send_gripper.assert_not_awaited()
-        await self.feed(frame, stamp_ms=now - 20)
-        self.reader.send_gripper.assert_awaited_once()
-        frame[7] = .02
-        await self.feed(frame, stamp_ms=now - 21)
-        self.reader.send_gripper.assert_awaited_once()
-        await self.feed(frame, stamp_ms=now - 20)
-        self.assertEqual((self.servo.accepted, self.servo.rejected), (2, 2))
-        self.assertEqual(self.reader.send_gripper.await_count, 2)
+
+    async def test_priority_replay_expiry_and_observation_age_gate_native_writes(self):
+        target = self.measured.copy()
+        target[7] = .05
+        await self.feed(target, source='policy', seq=10, priority=20)
+        target[7] = .025
+        now = time.time_ns() // 1_000_000
+        await self.feed(target, source='operator', seq=1, priority=80, stamp_ms=now)
+        max_age = self.servo.info()['control_interface']['rate']['max_obs_age_ms']
+        target[7] = .02
+        for fields in ({'source': 'policy', 'seq': 11, 'priority': 20},
+                       {'source': 'operator', 'seq': 1, 'priority': 80},
+                       {'source': 'operator', 'seq': 2, 'priority': 80, 'stamp_ms': now - 500},
+                       {'source': 'operator', 'seq': 2, 'priority': 80, 'obs_stamp_ms': now - max_age - 1}):
+            with self.subTest(fields=fields):
+                await self.feed(target, **fields)
+                self.assertEqual(self.reader.send_gripper.await_count, 2)
+        # A later sequence sent in the same millisecond can replace the prior target.
+        await self.feed(target, source='operator', seq=2, priority=80, stamp_ms=now)
+        self.assertEqual(self.reader.send_gripper.await_count, 3)
+        self.assertEqual((self.servo.accepted, self.servo.rejected), (3, 4))
+        self.assertEqual(self.servo.info()['sink']['holder'], 'operator')
         self.reader.send_move_p.assert_not_awaited()
 
     async def test_malformed_frame_and_missing_feedback_never_write(self):
@@ -245,9 +234,11 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         for raw in (message(bad), message(target[:-1]), message(target[:-1] + [True]),
                     message(target[:-1] + [math.nan]), message(target, frame='other'),
                     message(target, stamp_ms=True), message(target, stamp_ms=time.time_ns() // 1_000_000 + 900),
-                    message(target, schema='motus.control/1')):
+                    message(target, schema='motus.eef/1'), message(target, mode='joint_position'),
+                    message(target, dof=15), message(target, seq=True), message(target, ttl_ms=0),
+                    message(target, source='')):
             await self.send(raw)
-        for key in ('schema', 'frame', 'stamp_ms', 'eef'):
+        for key in ('schema', 'mode', 'dof', 'source', 'seq', 'ttl_ms', 'stamp_ms', 'values'):
             missing = json.loads(message(target))
             del missing[key]
             await self.send(json.dumps(missing))
@@ -291,6 +282,27 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.reader.send_gripper.assert_not_awaited()
         self.reader.send_move_p.assert_awaited_once()
 
+    async def test_expired_observation_during_movep_ack_prevents_late_gripper(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        async def delayed(*args):
+            started.set()
+            await release.wait()
+        self.reader.send_move_p.side_effect = delayed
+        target = self.measured.copy()
+        target[0] -= .002
+        target[7] += .02
+        max_age = self.servo.info()['control_interface']['rate']['max_obs_age_ms']
+        now = time.time_ns() // 1_000_000
+        self.servo.publisher.callback(message(target, obs_stamp_ms=now - max_age + 80))
+        try:
+            await asyncio.wait_for(started.wait(), 1.)
+            await asyncio.sleep(.1)  # Observation expired, but the command TTL and watchdog are still live.
+        finally:
+            release.set()
+        await asyncio.sleep(.03)
+        self.reader.send_gripper.assert_not_awaited()
+        self.reader.send_move_p.assert_awaited_once()
+
     async def test_watchdog_notifies_once_per_gap_and_only_valid_input_resumes(self):
         transitions = self.capture_transitions()
         interrupted, resumed = 'stream_interrupted', 'stream_resumed'
@@ -301,7 +313,7 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(self.servo.info()['activity']['text'], interrupted_log.records[0].getMessage())
 
         await self.feed(self.measured, stamp_ms=time.time_ns() // 1_000_000 - 500)
-        await asyncio.sleep(WATCHDOG_MS / 1000 + .03)
+        await wait_until(lambda: self.servo.info()['sink']['stood_down'])
         self.assertEqual(transitions(), [interrupted])
         with self.assertLogs('servo_eef', level='INFO') as resumed_log:
             await self.feed(self.measured)

@@ -8,6 +8,7 @@ import urllib.request
 
 
 BASE = 'http://127.0.0.1:15791'
+from common.control import parse_descriptor
 from device import VERSION
 CARDS = {'joints'}
 from camera import CAMERA_SOURCES
@@ -137,7 +138,9 @@ def run_check(timeout=20, camera=False):
                             or len(eef) != 16 or not all(type(v) in (int, float) and math.isfinite(v) for v in eef)):
                         raise ValueError('Expected a complete numeric EEF state')
             else:
-                if data.get('schema') != 'motus.eef/1' or data.get('frame') != 'base_Link':
+                interface = parse_descriptor(data['control_interface'])
+                if (interface.mode != 'eef_pose' or interface.dof != 16 or interface.frame != 'base_Link'
+                        or interface.eef_quat_offsets != (3, 11)):
                     raise ValueError('Expected the TRON2 dual TCP and gripper control layout')
     if eef_only:
         if camera:

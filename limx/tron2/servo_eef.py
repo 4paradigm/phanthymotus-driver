@@ -1,4 +1,4 @@
-"""Receive motus.eef/1 targets and dispatch paired native TRON2 MoveP."""
+"""Receive motus.control/1 targets and dispatch paired native TRON2 MoveP."""
 import asyncio
 import json
 import logging
@@ -7,9 +7,9 @@ import os
 import time
 from pathlib import Path
 
-from common.control import rotation
-from arm_servo import WATCHDOG_MS
-from eef_state import CONTROL_TOPIC, FRAME, SCHEMA, SIDES
+from common.control import ControlSink, SCHEMA, parse_descriptor, rotation
+from arm_servo import MAX_HZ, WATCHDOG_MS
+from eef_state import CONTROL_TOPIC, FRAME, GRIPPER_MAX_AGE, SCHEMA as STATE_SCHEMA, SIDES
 from gripper import MAX_OPENING_MM, command
 from vendor import MOVE_P_BOUNDS, MoveError, motion_readiness, reject_constant
 
@@ -26,6 +26,29 @@ STREAM_MESSAGES = {
 }
 
 
+def build_descriptor():
+    names, groups, lower, upper = [], [], [], []
+    for i, side in enumerate(SIDES):
+        suffix = side[0]
+        names.extend(f"eef_{suffix}_{axis}" for axis in ("x", "y", "z", "qx", "qy", "qz", "qw"))
+        names.append(f"gripper_{suffix}")
+        groups.extend([{"name": f"eef_{suffix}", "offset": 8*i, "count": 7, "unit": "m+quat_xyzw",
+                        "mode": "eef_pose", "resource": f"arm_{suffix}"},
+                       {"name": f"gripper_{suffix}", "offset": 8*i+7, "count": 1, "unit": "m",
+                        "mode": "joint_position", "resource": f"gripper_{suffix}"}])
+        xyz_min, xyz_max = zip(*MOVE_P_BOUNDS[side])
+        lower.extend([*xyz_min, -1., -1., -1., -1., 0.])
+        upper.extend([*xyz_max, 1., 1., 1., 1., MAX_GAP_M])
+    return {"control_interface": SCHEMA, "mode": "eef_pose", "dof": len(names), "frame": FRAME,
+            "joint_names": names, "groups": groups, "units": {"length": "m", "rotation": "quat_xyzw", "time": "s"},
+            "limits": {"lower": lower, "upper": upper}, "force_torque": None,
+            "tip_frames": {side: f"MoveP_{side}_TCP" for side in SIDES}, "opening_m": [0., MAX_GAP_M],
+            "state": {"schema": STATE_SCHEMA, "field": "eef"},
+            "end_effector": {"workspace_m": MOVE_P_BOUNDS, "pose_source": "request_get_move_pose"},
+            "rate": {"expected_hz": 10, "max_hz": MAX_HZ, "watchdog_ms": WATCHDOG_MS,
+                     "max_obs_age_ms": int(GRIPPER_MAX_AGE * 1000)}}
+
+
 def canonical_pose(pose):
     q = rotation.normalize(pose[3:])
     sign = next(v for v in reversed(q) if v)
@@ -33,45 +56,25 @@ def canonical_pose(pose):
 
 
 def waypoint(side, start, goal):
-    """Return the next segment, whether to continue, and any workspace intersection."""
-    bounds = MOVE_P_BOUNDS[side]
-    delta = [end - begin for end, begin in zip(goal[:3], start[:3])]
-    fraction = 1.
-    for coord, step, end, (low, high) in zip(start, delta, goal, bounds):
-        if not low <= end <= high:
-            if not low <= coord <= high:
-                raise ValueError(f"{side} MoveP target is outside the vendor workspace")
-            edge = high if end > high else low
-            fraction = min(fraction, (edge - coord) / step)
-    boundary = None
-    if fraction < 1.:
-        boundary = [min(hi, max(lo, a + fraction*d)) for a, d, (lo, hi) in zip(start, delta, bounds)]
-    # Scale first so even a finite request near the float limit keeps its direction.
-    scale = max(map(abs, delta))
-    step_fraction = 1.
-    if scale:
-        step_fraction = min(1., (LINEAR_M_S * MOVE_TIME_S / math.hypot(*(d/scale for d in delta))) / scale)
+    """Commit at most one watchdog period of Cartesian motion toward an admitted goal."""
+    distance = math.dist(start[:3], goal[:3])
     angle = rotation.angle_between(start[3:], goal[3:])
-    if angle:
-        step_fraction = min(step_fraction, ANGULAR_RAD_S * MOVE_TIME_S / angle)
-    portion = min(fraction, step_fraction)
-    if portion == 0.:
-        return start, False, boundary
+    portion = min(1., LINEAR_M_S * MOVE_TIME_S / distance if distance else 1.,
+                  ANGULAR_RAD_S * MOVE_TIME_S / angle if angle else 1.)
     if portion == 1.:
-        return goal, False, boundary
-    xyz = tuple(a + portion*d for a, d in zip(start, delta))
-    if any(not lo-1e-12 <= a <= hi+1e-12 for a, (lo, hi) in zip(xyz, bounds)):
+        return goal, False
+    xyz = tuple(a + portion * (b-a) for a, b in zip(start[:3], goal[:3]))
+    if any(not lo <= x <= hi for x, (lo, hi) in zip(xyz, MOVE_P_BOUNDS[side])):
         raise ValueError(f"{side} MoveP cannot take a bounded step from the measured pose")
-    # Remove roundoff at a box face only after establishing the segment is inside.
-    xyz = tuple(min(hi, max(lo, a)) for a, (lo, hi) in zip(xyz, bounds))
     q, _ = rotation.slerp_limit(start[3:], goal[3:], angle * portion)
-    return (*xyz, *q), step_fraction < fraction, boundary
+    return (*xyz, *q), True
 
 
 class EefServo:
     def __init__(self, adapter, state):
         self.adapter, self.reader, self.state = adapter, adapter.reader, state
-        self.publisher = self.subscription = None
+        self.publisher = self.subscription = self.sink = None
+        self.descriptor = build_descriptor()
         self.worker = self.watchdog = self.wake = self.latest = None
         self.running = self.paused = False
         self.topic = CONTROL_TOPIC
@@ -79,7 +82,6 @@ class EefServo:
         self.commanded = (None, None)
         self.more = False
         self.arm_error = None
-        self.boundaries = {}
         self.activity = None
         self.next_segment = 0.
         self.jaw_targets = {}
@@ -89,7 +91,7 @@ class EefServo:
 
     def tool(self):
         return {"name": "servo_eef", "type": "actuator", "multiInstance": False,
-                "description": "motus.eef/1 absolute TCP and opening targets: left pose (7), opening (1), "
+                "description": "motus.control/1 absolute TCP and opening targets: left pose (7), opening (1), "
                                "right pose (7), opening (1), metres and xyzw in base_Link. Uses paired native MoveP.",
                 "inputSchema": {"type": "object", "required": ["action"], "properties": {
                     "action": {"type": "string", "enum": ["start", "stop", "pause", "resume", "info"]},
@@ -102,6 +104,7 @@ class EefServo:
         return {"state": "idle" if not self.running else "paused" if self.paused else "ready",
                 "paused": self.paused, "topic_in": [{"format": "control/eef", "topic": self.topic}],
                 "schema": SCHEMA, "frame": FRAME, "watchdog_ms": WATCHDOG_MS,
+                "control_interface": self.descriptor, "sink": self.sink.stats() if self.sink else {},
                 "accepted": self.accepted, "rejected": self.rejected, "queue_full": self.overruns,
                 "active_arms": list(self.active_arms), "last": self.last, "activity": self.activity}
 
@@ -122,55 +125,58 @@ class EefServo:
     def _subscribe(self):
         loop = asyncio.get_running_loop()
         self.wake = wake = asyncio.Event()
-        last_stamp = 0
-        interrupted = False
+        message = None
 
-        def expire():
-            nonlocal interrupted
-            if self.latest is not None and time.monotonic() >= self.latest[-1] and not self.paused:
-                self.latest = None
-                wake.clear()
-                interrupted = True
+        def clear():
+            if self.latest is not None:
                 self._announce("stream_interrupted")
+            self.latest = None
+            wake.clear()
+
+        def accept(values, _gripper):
+            if sink.holding:
+                self._announce("stream_resumed")
+            stamp = message["stamp_ms"]
+            now_ms = time.time_ns() // 1_000_000
+            remaining_ms = min(WATCHDOG_MS, stamp + message["ttl_ms"] - now_ms)
+            if message.get("obs_stamp_ms") is not None:
+                remaining_ms = min(remaining_ms, message["obs_stamp_ms"] + layout.max_obs_age_ms - now_ms)
+            self.latest = (values, stamp, time.monotonic() + remaining_ms/1000)
+            self.overruns += int(wake.is_set())
+            wake.set()
+
+        layout = parse_descriptor(self.descriptor)
+        self.sink = sink = ControlSink(layout, accept, on_watchdog=clear, on_abort=clear)
 
         async def watch():
             while True:
-                expire()
+                if not self.paused:
+                    sink.tick()
                 await asyncio.sleep(.02)
 
         def offer(raw):
-            nonlocal last_stamp, interrupted
+            nonlocal message
             if self.wake is not wake or self.paused:
                 return
-            expire()
             try:
                 if not isinstance(raw, str) or len(raw) > 8192:
-                    raise ValueError("Expected a JSON EEF frame of at most 8 KiB")
+                    raise ValueError("Expected a JSON control frame of at most 8 KiB")
                 message = json.loads(raw, parse_constant=reject_constant)
-                if (not isinstance(message, dict) or set(message) != {"schema", "frame", "stamp_ms", "eef"}
-                        or message["schema"] != SCHEMA or message["frame"] != FRAME):
-                    raise ValueError(f"Expected {SCHEMA} in {FRAME} with stamp_ms and eef")
-                stamp, values = message["stamp_ms"], message["eef"]
-                now_ms = time.time_ns() // 1_000_000
-                if (type(stamp) is not int or not now_ms - WATCHDOG_MS < stamp <= now_ms + MAX_FUTURE_MS
-                        or stamp < last_stamp):
-                    raise ValueError("Invalid, expired or out-of-order stamp_ms")
-                if (not isinstance(values, list) or len(values) != 16
-                        or not all(type(v) in (int, float) and math.isfinite(v) for v in values)
-                        or not all(rotation.is_unit(values[i:i+4]) for i in (3, 11))):
-                    raise ValueError("Expected 16 finite EEF values with two unit xyzw quaternions")
+                if not isinstance(message, dict) or message.get("frame", FRAME) != FRAME or message.get("gripper") is not None:
+                    raise ValueError("Expected both grippers in values and TCPs in base_Link")
+                now = time.time_ns() // 1_000_000
+                for key in ("stamp_ms", "obs_stamp_ms"):
+                    stamp = message.get(key)
+                    if stamp is not None and (type(stamp) is not int or not 0 < stamp <= now + MAX_FUTURE_MS):
+                        raise ValueError(f"Invalid {key}")
+                sink.tick()
+                outcome = sink.submit(message)
+                if not outcome.applied:
+                    self.rejected += 1
+                    self.last = {"status": outcome.verdict.value, "reason": outcome.reason}
             except (ValueError, TypeError, OverflowError, RecursionError) as error:
                 self.rejected += 1
                 self.last = {"status": "rejected", "reason": str(error)[:300]}
-                return
-            last_stamp = stamp
-            remaining_ms = min(WATCHDOG_MS, stamp + WATCHDOG_MS - now_ms)
-            self.latest = (values, stamp, time.monotonic() + remaining_ms/1000)
-            if interrupted:
-                self._announce("stream_resumed")
-                interrupted = False
-            self.overruns += int(wake.is_set())
-            wake.set()
 
         self.subscription = self.publisher.subscribe_json(self.topic, lambda raw: loop.call_soon_threadsafe(offer, raw))
         self.worker = asyncio.create_task(self._run(wake))
@@ -189,7 +195,6 @@ class EefServo:
         if repeated and (not self.more or now < self.next_segment):
             return
         self.arm_intent, self.more, self.arm_error = intent, False, None
-        self.boundaries = {}
         if intent == (None, None) and all(last is None or goal == last
                                            for goal, last in zip(poses, self.commanded)):
             self.commanded = (None, None)
@@ -201,9 +206,7 @@ class EefServo:
                 if any(not lo <= v <= hi for v, (lo, hi) in zip(point, MOVE_P_BOUNDS[side])):
                     raise ValueError(f"Cannot send paired MoveP: held {side} arm is outside its vendor workspace")
             else:
-                point, more, boundary = waypoint(side, start, goal)
-                if boundary is not None:
-                    self.boundaries[side] = boundary
+                point, more = waypoint(side, start, goal)
                 continuing |= more
             pair.append(point)
         if tuple(pair) == starts and self.commanded == (None, None):
@@ -233,7 +236,6 @@ class EefServo:
             self.arm_intent = (None, None)
             self.commanded = (None, None)
             self.arm_error = None
-            self.boundaries = {}
             self.more = False
             self.jaw_targets.clear()
         measured = self.state.values()
@@ -246,15 +248,11 @@ class EefServo:
                 raise
             self.arm_error = str(error)
         jaw_sent = []
-        clamped = {}
         for side, i in zip(SIDES, (7, 15)):
             if not self._valid(frame):
                 return
-            raw = values[i]
-            gap = min(MAX_GAP_M, max(0., raw))
-            if gap != raw:
-                clamped[side] = gap
-            if raw == measured[i] and side not in self.jaw_targets:
+            gap = values[i]
+            if gap == measured[i] and side not in self.jaw_targets:
                 continue
             if gap == self.jaw_targets.get(side, measured[i]):
                 continue
@@ -265,7 +263,7 @@ class EefServo:
                 await self.reader.send_gripper(command("open", {"opening_mm": gap*1000, "speed": 15, "force": 30}, side))
             finally:
                 self.inflight = None
-            if raw == measured[i]:
+            if gap == measured[i]:
                 self.jaw_targets.pop(side, None)
             else:
                 self.jaw_targets[side] = gap
@@ -277,12 +275,9 @@ class EefServo:
             status = "partial" if jaw_sent else "rejected"
         self.accepted += int(status != "rejected")
         self.rejected += int(status != "accepted")
-        self.last = {"status": status, "stamp_ms": stamp, "grippers_sent": jaw_sent,
-                     "clamped_opening_m": clamped}
+        self.last = {"status": status, "stamp_ms": stamp, "grippers_sent": jaw_sent}
         if self.arm_error:
             self.last["arm_error"] = self.arm_error
-        if self.boundaries:
-            self.last["workspace_boundary_m"] = self.boundaries
 
     async def _run(self, wake):
         while True:

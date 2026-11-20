@@ -7,8 +7,9 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import check
+from common.control import parse_descriptor
 from device import Adapter, VERSION
-from vendor import RobotReader
+from vendor import MOVE_P_BOUNDS, RobotReader
 
 
 READY_STATUS = {'working_mode': 'developer_mode', 'working_mode_valid': True, 'motor': 'OK',
@@ -26,6 +27,7 @@ class EefWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([t['name'] for t in a.tools()], ['eef_state'])
         info = await a.execute_tool('eef_state', {'action': 'info'})
         self.assertEqual(info['state'], 'idle')
+        self.assertEqual((info['schema'], info['frame']), ('motus.eef/1', 'base_Link'))
         self.assertEqual(info['topic_out'][0]['topic'], '/limx_tron2/state/eef')
         self.assertFalse(info['available'])
         self.assertIsNone(a.servo_eef)
@@ -37,7 +39,21 @@ class EefWiringTests(unittest.IsolatedAsyncioTestCase):
         port = a.tools()[0]['topic_in'][0]
         self.assertEqual((port['topic'], port['format']), ('/limx_tron2/control/eef', 'control/eef'))
         info = await a.execute_tool('servo_eef', {'action': 'info'})
-        self.assertEqual((info['schema'], info['frame']), ('motus.eef/1', 'base_Link'))
+        interface = info['control_interface']
+        self.assertEqual(interface['control_interface'], 'motus.control/1')
+        self.assertEqual(interface['state'], {'schema': 'motus.eef/1', 'field': 'eef'})
+        descriptor = parse_descriptor(interface)
+        self.assertEqual((descriptor.frame, descriptor.dof, descriptor.mode), ('base_Link', 16, 'eef_pose'))
+        self.assertEqual([(g.offset, g.count, g.mode) for g in descriptor.groups],
+                         [(0, 7, 'eef_pose'), (7, 1, 'joint_position'),
+                          (8, 7, 'eef_pose'), (15, 1, 'joint_position')])
+        self.assertEqual(descriptor.eef_quat_offsets, (3, 11))
+        for side, offset in (('left', 0), ('right', 8)):
+            for i, bounds in enumerate(MOVE_P_BOUNDS[side], offset):
+                self.assertEqual((descriptor.lower[i], descriptor.upper[i]), bounds)
+            self.assertEqual((descriptor.lower[offset + 7], descriptor.upper[offset + 7]), (0., .085))
+        self.assertGreater(descriptor.max_obs_age_ms, 0)
+        self.assertEqual(descriptor.watchdog_ms, 200)
         with self.assertRaises(ValueError):
             await a.execute_tool('servo_eef', {'action': 'start', 'dry_run': True})
         self.assertFalse(a.servo_eef.running)
@@ -105,8 +121,10 @@ class EefWiringTests(unittest.IsolatedAsyncioTestCase):
             target[0] -= .002
             self.assertEqual(set(state), {'schema', 'frame', 'stamp_ms', 'eef'})
             self.assertEqual(state['schema'], 'motus.eef/1')
-            for _ in range(2):
-                callback(json.dumps(dict(state, stamp_ms=time.time_ns() // 1_000_000, eef=target)))
+            for seq in (1, 2):
+                callback(json.dumps({'schema': 'motus.control/1', 'mode': 'eef_pose', 'dof': 16,
+                    'source': 'native-eef-test', 'seq': seq, 'ttl_ms': 200, 'values': target,
+                    'stamp_ms': time.time_ns() // 1_000_000, 'obs_stamp_ms': state['stamp_ms']}))
                 await asyncio.sleep(.03)
             reader.send_move_p.assert_awaited_once()
             left, right = reader.send_move_p.await_args.args[:2]
