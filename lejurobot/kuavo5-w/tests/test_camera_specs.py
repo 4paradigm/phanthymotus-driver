@@ -5,7 +5,7 @@ import unittest
 
 import test_driver  # installs ROS stubs and the driver/common import paths
 from camera_specs import calibration, declare, jpeg_dimensions, registered_pair
-from base_servo import footprint_from_polygon, build_descriptor
+from base_servo import footprint_from_polygon, footprint_from_model, build_descriptor
 
 
 class CameraSpecsTests(unittest.TestCase):
@@ -60,6 +60,27 @@ class CameraSpecsTests(unittest.TestCase):
         self.assertEqual(f['source'], 'estimate')
         self.assertIsNone(f['height'])
         self.assertEqual(build_descriptor(f)['footprint'], f)
+
+    def test_runtime_vendor_chassis_collision_is_nominal_geometry_without_padding(self):
+        xml = '<robot><link name="base_link"><collision><origin xyz="0 0 0.18"/>' \
+              '<geometry><cylinder radius="0.37" length="0.32"/></geometry></collision></link></robot>'
+        f = footprint_from_model(xml)
+        self.assertEqual([f[k] for k in ('half_width', 'front', 'rear')], [.37]*3)
+        self.assertEqual(f['source'], 'vendor-spec')
+        self.assertEqual(f['scope'], 'chassis')
+        self.assertIsNone(f['height'])  # Cylinder height is not the robot height.
+        self.assertEqual(len(f['runtime_urdf_sha256']), 64)
+        shifted = footprint_from_model(xml.replace('0 0 0.18', '0.02 -0.01 0.18'))
+        self.assertAlmostEqual(shifted['half_width'], .38)
+        self.assertAlmostEqual(shifted['front'], .39)
+        self.assertAlmostEqual(shifted['rear'], .35)
+        for invalid in (xml.replace('0.37', 'nan'), xml.replace('0.37', '-1'),
+                        xml.replace('xyz="0 0 0.18"', 'rpy="0.18 0 0"'), xml.replace('name="base_link"', 'name="other"'),
+                        '<robot><link name="base_link"/></robot>',
+                        '<!DOCTYPE robot [<!ENTITY x "bad">]>' + xml):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    footprint_from_model(invalid)
         for p in ([], [[1, 1]]*3, [[math.nan, 0]]*4):
             with self.assertRaises(ValueError):footprint_from_polygon(p)
 

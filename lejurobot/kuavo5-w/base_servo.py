@@ -4,12 +4,48 @@ The ROS2 callback only retains the latest frame. A dedicated worker owns all
 control transitions and rechecks freshness after potentially slow preparation.
 """
 import json
+import hashlib
 import math
 import threading
 import time
+import xml.etree.ElementTree as ET
 
 from common.control import ControlSink
 from base_limits import LINEAR_LIMIT, ANGULAR_LIMIT
+
+
+def footprint_from_model(urdf):
+    """Nominal chassis envelope from the live vendor model, never display URDF.
+
+    Support the commissioned model's upright cylinder only. Other geometry
+    needs explicit support; never guess mesh dimensions or use wheel centres.
+    """
+    if (not isinstance(urdf, str) or len(urdf) > 5_000_000
+            or '<!DOCTYPE' in urdf.upper() or '<!ENTITY' in urdf.upper()):
+        raise ValueError('missing or unsafe runtime chassis model')
+    roots = ET.fromstring(urdf).findall("link[@name='base_link']")
+    if len(roots) != 1 or len(roots[0].findall('collision')) != 1:
+        raise ValueError('one base_link collision required')
+    collision = roots[0].find('collision')
+    origin = collision.find('origin')
+    xyz = [float(x) for x in (origin.get('xyz', '0 0 0') if origin is not None else '0 0 0').split()]
+    rpy = [float(x) for x in (origin.get('rpy', '0 0 0') if origin is not None else '0 0 0').split()]
+    cylinder = collision.find('geometry/cylinder')
+    if (len(xyz) != 3 or len(rpy) != 3 or cylinder is None
+            or any(not math.isfinite(x) for x in xyz + rpy)
+            or abs(rpy[0]) > 1e-6 or abs(rpy[1]) > 1e-6):
+        raise ValueError('upright chassis collision cylinder required')
+    radius, length = float(cylinder.get('radius', 'nan')), float(cylinder.get('length', 'nan'))
+    if (not math.isfinite(radius) or not math.isfinite(length)
+            or not .1 <= radius <= 2 or not 0 < length <= 3
+            or abs(xyz[0]) >= radius or abs(xyz[1]) >= radius):
+        raise ValueError('invalid chassis collision dimensions')
+    return {'shape': 'box', 'half_width': radius + abs(xyz[1]),
+            'front': radius + xyz[0], 'rear': radius - xyz[0], 'height': None,
+            'source': 'vendor-spec', 'arms': 'at-rest', 'scope': 'chassis',
+            'runtime_urdf_sha256': hashlib.sha256(urdf.encode('utf-8')).hexdigest(),
+            'provenance': '/humanoid_description base_link collision cylinder; '
+                          'nominal chassis model, not measured full-body clearance; no planner padding'}
 
 
 def footprint_from_polygon(points, padding=0.):

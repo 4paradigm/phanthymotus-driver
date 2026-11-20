@@ -575,12 +575,23 @@ class SensorTests(unittest.TestCase):
         self.ros.subscriptions['/odom'][1]({})
         self.assertEqual(self.hub.snapshot('loco_state')['twist'], [None] * 6)
 
-    def test_synchronized_vendor_timestamp_preserved(self):
+    def test_odom_receipt_time_is_stable_and_capture_time_remains_separate(self):
         now = int(time.time())
         self.odom(secs=now)
         sample = self.hub.snapshot('loco_state')
-        self.assertEqual(sample['stamp_ms'], now * 1000)
-        self.assertEqual(sample['vendor']['stamp_source'], 'robot')
+        self.assertLess(abs(sample['stamp_ms'] - time.time()*1000), 100)
+        self.assertEqual(sample['vendor']['stamp_source'], 'received')
+        self.assertEqual(sample['vendor']['source_timing']['stamp_ms'], now * 1000)
+        self.assertEqual(sample['vendor']['source_timing']['stamp_source'], 'robot')
+        interface = self.hub.dispatch('loco_state', 'info')['odom_interface']
+        self.assertEqual(interface['topic'], self.hub._topics['loco_state'])
+        self.assertEqual(interface['timing']['stamp_source'], 'received')
+        self.assertNotIn('max_measurement_delay_ms', interface['timing'])
+        self.assertEqual(interface['timing']['measurement_delay_bound'], 'unverified')
+        self.odom(secs=1)  # Unsynchronized source never changes the public clock.
+        sample = self.hub.snapshot('loco_state')
+        self.assertEqual(sample['vendor']['stamp_source'], 'received')
+        self.assertLess(abs(sample['stamp_ms'] - time.time()*1000), 100)
 
     def test_discovery_runs_off_receiver_and_discards_old_session_result(self):
         entered, release = threading.Event(), threading.Event()

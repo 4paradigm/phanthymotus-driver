@@ -291,7 +291,7 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 
 四路相机在 `info/start` 返回 `motus.camera/1` 声明；分辨率取实际JPEG或深度图，内参K/D来自各自ROS CameraInfo，不复制其他型号的FOV。缺少标定时保持 unknown。头部深度只有在 `depth_registration=true`、RGB/深度都使用color optical frame、分辨率和K一致时，才与RGB共享镜头ID并输出有效帧；等待校验时为 loading。VOP沿输入传递镜头ID和分辨率，navi按声明的 `image/depth-zlib` 绑定深度，而非依赖话题名后缀。更新后须重新启动上游和navi，以刷新启动时冻结的声明。
 
-`base_servo.info.control_interface.footprint` 来自真机厂商 `/lqr_path_track/local_costmap/footprint` 加 padding，并标注 `source: estimate`、`arms: at-rest`；这不是实测全身安全包络。当前现场配置为±0.34m方形加0.01m padding，即前/后/半宽0.35m；高度未知，保持 null。其他同款机以其运行时参数为准。navi仍可提示估计包络，不应把这一提示当作缺失元数据；伸臂、头部姿态和实际避障效果须另行验证。
+`base_servo.info.control_interface.footprint` 优先读取真机 `/humanoid_description` 中 `base_link` 的直立圆柱碰撞体，标注 `source: vendor-spec`、`scope: chassis`，附运行时URDF哈希；当前v63模型半径0.37m，因此前/后/半宽均为0.37m，不另加规划器padding。此为厂家底盘模型，非全身实测包络，机器人高度仍为null。模型缺失/不支持时退回厂商costmap多边形加padding并标记estimate；若costmap包络更大则保留更大的估计值。当前现场costmap为±0.34m加0.01m padding。伸臂、头部姿态和实际避障效果须另行验证。
 
 
 速度协议与 R1 一致：ROS2 `std_msgs/String` JSON，`motus.control/1`、`mode=twist`、`dof=6`，机身系 `[vx,vy,vz,wx,wy,wz]`，单位 m/s、rad/s，vz/wx/wy 必须为零。复用主节点 domain 42 的隔离 DDS，工作线程经 rosbridge 转发 ROS1 `/cmd_vel`。期望10Hz、最大20Hz；校验序号、TTL和观测时间，300ms断流发零速、拒绝500ms以上旧观测；慢速使能完成后再次检查首帧是否过期，不执行积压旧目标。ROS2回调仅保留最新消息，不等待SSH或控制服务。
@@ -698,6 +698,8 @@ SDK 对 effort 单位同时允许 N·m 或 A，因此默认 tau=null、单位未
 只有在真机核实所有输出为关节端 N·m 后才配置 `sensors.joint_torque_unit: N*m`，届时才输出标准 tau。
 
 `loco_state.info` 返回 `odom_interface`；消息携带时间来源、原始 frame、窗口样本数，空窗口不重发旧速度。
+
+`odom_interface` 明确提供输出 `topic`、10Hz频率和 `timing.stamp_source: received`。速度摘要的顶层时间戳固定为驱动收到ROS消息的主机时间；厂商时间和选择原因保留于 `vendor.source_timing`，原始ROS header及 `pose` / `vendor.motus_slam` 的采集时间保持不变，避免把接收时间冒充测量时间。跨板时钟及测量到接收的延迟上限尚未验证，因此不虚报 `max_measurement_delay_ms`；navi仍可提示未声明测量延迟并保留通用有效期。当前Agent Core还必须将该声明按连线话题转发为navi的 `odom_interfaces`，仅在驱动info中存在声明不等于navi已经收到；此驱动不修改ActuCore或Agent Core。
 底盘里程计的只读输出独立于全身控制栈的启动/机型探测；探测失败会阻止运动，不会阻止读取已存在的有效 `/odom`。
 默认仅接受 child_frame_id 为 base_link/base_footprint 的 odom；真机名称不同时先核实 TF/发布器，再配置 `sensors.odom_body_frames`。
 不将未经定位和漂移核实的 pose 提升为标准导航位姿。

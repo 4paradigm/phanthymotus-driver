@@ -858,9 +858,11 @@ class KuavoSensors:
                 twist = message['twist']['twist']
                 values = [twist['linear']['x'], twist['linear']['y'], twist['angular']['z']]
                 vector(values, 3)
-                stamp_ms, provenance = stamp(message)
-                self._data['loco_state'] = {'stamp_ms': stamp_ms, 'vendor': {
-                    **provenance, 'topic': '/odom', 'header': copy.deepcopy(message.get('header', {})),
+                source_stamp_ms, provenance = stamp(message)
+                self._data['loco_state'] = {'stamp_ms': int(time.time()*1000), 'vendor': {
+                    'stamp_source': 'received',
+                    'source_timing': {'stamp_ms': source_stamp_ms, **provenance},
+                    'topic': '/odom', 'header': copy.deepcopy(message.get('header', {})),
                     'child_frame_id': message['child_frame_id'],
                     'pose': json_safe(message.get('pose')), 'twist': json_safe(message['twist'])}}
                 try:
@@ -999,6 +1001,11 @@ class KuavoSensors:
                 result['topic_out'] = next(t['topic_out'] for t in self.tools() if t['name'] == card)
             if card == 'loco_state':
                 result['odom_interface'] = build_interface(provides=['vx', 'vy', 'wz'], rate_hz=10, pose_drift='unbounded')
+                result['odom_interface']['topic'] = self._topics['loco_state']
+                result['odom_interface']['timing'] = {
+                    'stamp_source': 'received', 'clock_id': 'driver_host_wall',
+                    'timestamp_semantics': 'rosbridge_callback_receipt',
+                    'measurement_delay_bound': 'unverified'}
                 result['odom_interface']['slam_pose'] = {'available': True, 'profile': 'motus_slam/1',
                     'source': '/odom', 'clock_id': 'ros1_odom_header', 'synchronization': 'unverified'}
             return result

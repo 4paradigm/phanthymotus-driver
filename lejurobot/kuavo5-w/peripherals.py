@@ -13,7 +13,7 @@ from std_msgs.msg import String, UInt8MultiArray
 from sensor_msgs.msg import CompressedImage
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from camera_specs import INFO_TOPICS, calibration, declare, jpeg_dimensions, registered_pair
-from base_servo import footprint_from_polygon
+from base_servo import footprint_from_polygon, footprint_from_model
 
 CARDS = ('battery', 'laser_scan', 'camera_left', 'camera_right', 'camera_head', 'camera_depth')
 CAMERAS = {'camera_left': ('/camera_1/color/image_raw/compressed', '/camera_left/set_camera_enabled'),
@@ -169,6 +169,15 @@ class Peripherals:
                 footprint = footprint_from_polygon(polygon, padding)
             except Exception:
                 footprint = None
+            try:
+                model_footprint = footprint_from_model(self.ros1.get_param('/humanoid_description'))
+                # Never shrink an existing factory planner envelope merely
+                # because the chassis-only collision model is smaller.
+                if (footprint is None or all(model_footprint[k] >= footprint[k]
+                        for k in ('half_width', 'front', 'rear'))):
+                    footprint = model_footprint
+            except Exception:
+                pass  # Existing costmap estimate stays explicit as the fallback.
             with self._lock:
                 if generation == self.ros1.connection and not self._closed:
                     self._depth_registration, self._footprint = registration, footprint

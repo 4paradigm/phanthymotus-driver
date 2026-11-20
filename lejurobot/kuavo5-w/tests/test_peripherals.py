@@ -26,6 +26,25 @@ class PeripheryTests(unittest.TestCase):
     def tearDown(self):
         self.periphery.close()
 
+    def test_model_footprint_preferred_without_shrinking_a_larger_factory_envelope(self):
+        self.periphery._session()
+        self.ros.params.update({'humanoid_description': '<robot><link name="base_link"><collision>'
+            '<geometry><cylinder radius="0.37" length="0.32"/></geometry></collision></link></robot>',
+            'lqr_path_track/local_costmap/footprint': [[.34,.34],[.34,-.34],[-.34,-.34],[-.34,.34]],
+            'lqr_path_track/local_costmap/footprint_padding': .01})
+        for radius, polygon_half_width, expected, source in (('0.37', .34, .37, 'vendor-spec'),
+                ('nan', .34, .35, 'estimate'), ('0.37', .5, .51, 'estimate')):
+            with self.subTest(radius=radius, polygon=polygon_half_width):
+                self.ros.params['humanoid_description'] = '<robot><link name="base_link"><collision>' \
+                    '<geometry><cylinder radius="'+radius+'" length="0.32"/></geometry></collision></link></robot>'
+                r = polygon_half_width
+                self.ros.params['lqr_path_track/local_costmap/footprint'] = [[r,r],[r,-r],[-r,-r],[-r,r]]
+                with patch.object(self.periphery._stop, 'is_set', side_effect=[False, True]), \
+                        patch.object(self.periphery._stop, 'wait'):
+                    self.periphery._metadata_loop()
+                self.assertAlmostEqual(self.periphery.footprint()['half_width'], expected)
+                self.assertEqual(self.periphery.footprint()['source'], source)
+
     def test_battery_preserves_sources_and_does_not_claim_zero_voltage(self):
         now = int(time.time() * 1000)
         sources = {topic: {'received_ms': now, 'values': {'percentage': 96.5, 'voltage': 0.,
