@@ -19,6 +19,7 @@ from modbus_client import JOINT_COUNT, _bytes
 from modbus_device import L20LiteConnection, SPEED_RATIOS, _named
 
 
+CONFIRM_MOTION_DESCRIPTION = "确认手附近无人和障碍物后，本次请求显式传入布尔值 true"
 ACTIONS = ("ok_gesture", "thumb_up_gesture", "v_sign_gesture", "number", "grasp", "custom_grasp")
 NUMBER_POSES = {
     0: [93, 255, 0, 0, 0, 0, 128, 128, 128, 255],
@@ -109,7 +110,7 @@ class GesturePlugin:
             "torque": {"type": "integer", "minimum": 1, "maximum": 255,
                        "description": "设备原始扭矩上限，不是牛顿或防夹保证"},
             "confirm_motion": {"type": "boolean", "const": True,
-                               "description": "确认手附近无人和障碍物后，本次请求显式传入布尔值 true"},
+                               "description": CONFIRM_MOTION_DESCRIPTION},
         })
         schema["allOf"] = [
             {"if": {"properties": {"action": {"enum": list(ACTIONS)}}},
@@ -298,6 +299,8 @@ class GesturePlugin:
         try:
             with self.hand._bus_lock:
                 self._check_stop()
+                if getattr(self.hand, "_mimic_side", None) == side:
+                    raise RuntimeError("该灵巧手正在由手势模仿卡控制")
                 found = self.hand._discover()
                 if found.get(side) != port:
                     raise RuntimeError(f"{side} hand moved or disconnected before motion")
@@ -392,6 +395,8 @@ class GesturePlugin:
             with self.hand._bus_lock:
                 connection = self._connections.get(instance_id)
                 if connection is not None and connection._client is not None:
+                    if getattr(self.hand, "_mimic_side", None) == connection.side:
+                        return {"state": "idle", "torque_released": False}
                     connection._client.set_torques([0] * JOINT_COUNT)
             return {"state": "idle", "torque_released": True}
         if action == "info":
