@@ -280,6 +280,7 @@ class PnpRemoteTeleopPlugin:
         previous, self._recording = self._recording, None
         try:
             trajectories = [name for name in self._saved_trajectories() if name not in previous]
+            trajectories.sort(key=lambda name: TRAJECTORY_NAME.fullmatch(name)[1] != "left")
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
             return {"trajectory_error": str(exc)}
         return {"trajectories": trajectories, "complete": bool(trajectories) and complete}

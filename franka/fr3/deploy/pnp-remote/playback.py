@@ -15,7 +15,7 @@ PAUSE = ROOT / "playback.pause"
 START = ROOT / "playback.start"
 APPROACH = ROOT / "playback.approach"
 PERIOD = .02
-TRACKING_LIMIT_RAD = math.radians(10)
+TRACKING_LIMIT_RAD = math.radians(90)
 ENTRY_LIMIT_RAD = .2
 
 

@@ -38,7 +38,7 @@ driver is updated.
 The driver discovers wired addresses and reads the workstation's arm configuration
 during initialization. PNP credentials and the workstation service provide access
 to the vendor scripts. Each arm records its measured joint state and the vendor
-control target after each successful Follow step. New frames also carry a
+control target after each successful Follow step. Stop lists left-arm recordings before right-arm recordings. New frames also carry a
 monotonic observation timestamp.
 New recordings are stored on PNP under
 `~/bc_data/teleop/franka-<side>-<local-timestamp><UTC-offset>/`, for example
@@ -60,7 +60,7 @@ joint must be within 0.2 rad of that pose before alignment can start.
 The gripper target is held during approach. The arm uses the same joint
 impedance controller for approach and playback. That controller holds the
 start target until settling is confirmed. Tracking aborts if any joint differs from its target
-by more than 10 degrees.
+by more than 90 degrees.
 The card checks tighter position and velocity tolerances before reporting
 a confirmed pause or completion.
 Teach and playback use the same 80 mm fully open gripper target.
