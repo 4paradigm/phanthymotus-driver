@@ -14,6 +14,7 @@ COPY modbus_client.py /work/modbus_client.py
 COPY modbus_device.py /work/modbus_device.py
 COPY lite_tactile.py /work/lite_tactile.py
 COPY gesture_device.py /work/gesture_device.py
+COPY visual_follow.py /work/visual_follow.py
 COPY config.yaml   /work/config.yaml
 COPY deploy/       /deploy/
 
