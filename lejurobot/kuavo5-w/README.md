@@ -41,14 +41,19 @@ Dashboard/PR镜像部署片段把宿主机 `/opt/phanthy-motus/drivers/lejurobot
 已有操作配置、关节限位、禁用设置和凭据不被镜像默认值覆盖；不再要求部署前手工创建配置文件。
 `CONFIG_PATH` 显式指向其他路径但文件缺失，或已有YAML损坏时仍报错，不悄悄回退。
 
-整机的非秘密连接默认值统一位于 `connection_defaults.py`：`DEFAULTS` 保存地址、账号和 ROS IP，
-包内 YAML 不重复这些字段。账号或网络变化可通过私有操作配置或环境变量覆盖，无需逐卡配置。
-日常动作走 ROS1/rosbridge，SSH 用于统一后台准备和修复。
+整机连接默认值统一位于 `connection_defaults.py`：`DEFAULTS` 保存三台主机的地址、账号、ROS IP，
+`DEFAULT_PASSWORDS` 保存对应默认SSH密码。`base_drive`及其他执行卡不再提供连接参数configSchema或config动作；
+不需要往画布放置额外配置卡。日常动作走ROS1/rosbridge，SSH供统一后台准备/修复三台主机及麦克风音频采集。
 
-**镜像和源码不包含 SSH 密码。升级前请为需要 SSH 的角色提供部署凭据**，否则自动安装/修复可能因认证失败而不可用；
-已安装服务仍按其自身状态工作，驱动不会绕过缺失反馈或控制检查。
-可以通过 `KUAVO_HOST/CONTROLLER/CHASSIS_SSH_PASSWORD`、相应 `SUDO_PASSWORD` 环境变量，
-或宿主机配置目录内权限 0600 的 `ssh-secrets.json` 提供：
+按操作人员要求，镜像内置当前5-W/Jaten现场确认的默认值。正常部署无需填写账号密码；
+默认值变化时修改上述模块，重新构建镜像并重建容器生效，重启旧镜像不会获得源码修改。
+包内YAML不再重复地址/账号/ROS IP，避免遮蔽模块默认值。
+这些值不作为所有批次、所有官方文档版本的通用凭据声明。
+
+兼容已有部署的显式覆盖仍保留：环境变量、操作配置中的角色字段及0600私有凭据文件优先于模块默认值。
+因此修改模块后，若旧部署曾配置相同字段，需同时移除或更新对应覆盖；驱动不会擅自覆盖已有操作配置。
+也可通过 `KUAVO_HOST/CONTROLLER/CHASSIS_SSH_PASSWORD`、相应 `SUDO_PASSWORD` 环境变量，
+或宿主机配置目录内0600权限的 `ssh-secrets.json` 提供连接信息：
 
 ```json
 {
@@ -59,8 +64,8 @@ Dashboard/PR镜像部署片段把宿主机 `/opt/phanthy-motus/drivers/lejurobot
 ```
 
 支持在各角色私有配置中设置 `key_file`（容器内私钥路径），或使用相应 `KUAVO_<ROLE>_SSH_KEY`。
-未提供密码时使用非交互公钥认证，可指定私钥或使用 OpenSSH 的默认身份。
-旧的 `use_default_credentials` 配置不再生效；不存在内置密码回退，只尝试部署提供的认证方式。
+显式配置私钥时优先使用非交互公钥认证，不因内置密码阻止私钥使用。
+每台主机可设 `use_default_credentials: false` 禁用其内置密码回退，改用公钥/显式凭据；只尝试选定的一套凭据，不轮询猜密码。
 空环境默认值不遮蔽私有文件，空格密码不被trim。OpenSSH使用accept-new首次信任并持久化known_hosts；
 主机密钥变化报错，不用StrictHostKeyChecking=no绕过。无法登录时MCP仍可提供分主机诊断错误，
 不会因此伪造传感数据或放开运动。
@@ -73,8 +78,9 @@ Dashboard/PR镜像部署片段把宿主机 `/opt/phanthy-motus/drivers/lejurobot
 
 ### 部署时提供凭据（无需卡片配置）
 
-以下是部署级认证方式，整机只配置一次。旧版本源码、Git 历史和已发布镜像可能仍含旧密码；
-操作员需要在设备上轮换已公开密码，并更新私有部署凭据。新版本不会修改设备密码或重写 Git 历史。
+以下都是可选的部署级覆盖，整机只配置一次。按操作人员要求，本版本保留内置默认密码；
+默认账号密码未变时，不要求额外提供文件。镜像升级不会修改机器人账号密码。
+内置值会出现在源码和镜像中，不作为私密凭据；不希望使用时可按角色关闭回退并提供私有密码或密钥。
 
 **方式一：宿主机私有文件（现有部署可直接使用）。** 部署片段已将
 `/opt/phanthy-motus/drivers/lejurobot-kuavo5-w/` 映射到容器 `/config`，无需新增挂载。
@@ -89,7 +95,7 @@ sudoedit /opt/phanthy-motus/drivers/lejurobot-kuavo5-w/ssh-secrets.json
 
 填写上文host/controller/chassis的JSON，将占位内容替换为真实SSH密码；sudo密码相同时不用另填。
 文件不提交Git、不复制入镜像。后台每轮准备时重新读取，通常下一轮约30秒内使用，无需重建镜像。
-没有提供密码或可用密钥的角色将报告 SSH 认证失败，不使用默认密码。
+只要显式覆盖了所有需要密码认证的角色，就不会为这些角色使用内置密码。
 
 **方式二：环境变量。** 现有Compose片段已转发三台主机的SSH及sudo密码变量。
 例如用交互输入给出上位机密码，避免在命令字面量中写密码；其他两角色同理：
@@ -111,7 +117,7 @@ sudo密码不同时分别设置相应`KUAVO_<ROLE>_SUDO_PASSWORD`。
 私钥留在上位机专用目录（例如宿主机配置目录的ssh/id_ed25519，权限0600），不要提交或复制进镜像。
 现有目录挂载后，秘密文件中的三个角色可分别写`{"key_file":"/config/ssh/id_ed25519"}`，
 也可以使用各自独立密钥。注意这里填写的是容器内路径，并移除同角色旧password字段及非空SSH密码环境变量，
-避免显式密码继续选择密码认证。sudo需配置目标机非交互权限，
+避免显式密码继续选择密码认证。密钥存在时不会回退内置密码；sudo需配置目标机非交互权限，
 否则在该角色的秘密文件记录中单独提供sudo_password。
 
 | 目标 | 容器自动完成 |
@@ -384,6 +390,24 @@ SSH RPC 辅助源码随镜像构建，每次在底盘执行固定操作，使用
 
 厂商编号音效不是任意PCM接口；本驱动使用已实际听到声音的底盘标准音频输出。
 
+### 麦克风与外置采集
+
+新增 `mic`（单实例）和 `ext_mic`（多实例传感器），输出标准 `AudioChunk` / `audio/pcm-16k`：
+16 kHz、单声道、S16_LE，32 ms 一块。可直接连接 ASR/VAD 等音频输入。
+默认不自动录音，不写音频文件，不发送到第三方；仅 start 后采集和发布 DDS，stop/容器退出关闭录音进程。
+
+- USB 麦克风接在上位机、控制下位机或独立底盘均可；后台只读枚举三台机器，插拔后调用 `refresh_devices`，刷新卡片设备列表。
+- 在全局变量控制中选择 `device_index`（例如 `host/alsa/plughw:CARD=USB,DEV=0`，以实际列表为准）；`ext_mic` 配置按 `instance_id` 隔离，可分别启动和停止。选择值可由 config 或 start 提供。
+- 未选择输入时，只自动选择唯一的 USB ALSA 采集端点；无设备、多设备或模拟接口均要求明确选择，不猜测哪个是内置麦克风。单实例 mic 的整机默认值可设在 `microphones.source`。
+- 复用三台机器现有共享 SSH 地址/凭据，不在每张卡重复配置；私有覆盖优先于内置默认值。采集 helper 随镜像打包，start 时经加密 SSH 执行，无需手工安装常驻录音服务或开放 TCP 端口。
+- 远端需有 `arecord`（ALSA）或 `parecord/pactl`（PulseAudio）；当前三板已有这些工具。缺少时明确报错，不自动修改声卡配置/音量、不切换厂商服务。USB 推荐使用系统直接识别的 USB Audio Class 麦克风；不保证任意专用声卡兼容。
+- 排除 PulseAudio 的 playback monitor 和 Jetson APE 虚拟路由端点，防止把扬声器回放冒充麦克风。采集开头丢弃一秒，避免模拟输入开启时的冲击声。
+- `info` 显示真实采集字节数、RMS、peak、最近帧时间和错误；这些只能证明数据通路，不是“已听到人声”。设备移除、断连或积压会终止采集并报告错误，不发布合成静音、不自动恢复录音；重新 start 需重新探测。
+- 原始远端帧时间用于顺序与延迟检查，DDS header 使用驱动接收时间，不宣称声卡硬件时间戳同步。每路独立工作线程，小队列 BEST_EFFORT 发布。
+- 断开 SSH stdin 或心跳中断10秒会使远端 helper 关闭 arecord/parecord，不把断线后的后台录音留在机器人上。上位机容器不挂载 /dev/snd，不增加音频 pip/apt 包。
+
+2026-11-20 三板检查：没有 USB 音频设备；下位机 ALC897 的一路全零，另一路只有很低噪声；上位机 APE 的 PulseAudio 输入短时未返回数据。底盘模拟输入确实有 PCM，但延长采样后，最初强信号在约一秒内衰减为低噪声，不能据此确认机器人装有可用内置麦克风。模拟输入仍可显式选择作现场验证；需要接入可用麦克风并通过说话/ASR确认声学通路，不能以“capture 1”推断硬件存在。
+
 ### 扬声器安装与使用
 
 正常部署由容器自动安装到底盘。以下仅为人工排障时的等价命令，在**独立底盘电脑**执行：
@@ -392,7 +416,7 @@ SSH RPC 辅助源码随镜像构建，每次在底盘执行固定操作，使用
 sudo python3 host/install_speaker.py --user jt --master http://192.168.26.1:11311 --ros-ip 192.168.26.22 --volume 30
 ```
 
-仅使用该机已有ROS Noetic、`paplay/pactl`和PulseAudio；不安装SDK、声卡库或TTS引擎，不在播放器中保存SSH凭据；非秘密连接默认值集中于驱动，密码仅存于私有部署配置。
+仅使用该机已有ROS Noetic、`paplay/pactl`和PulseAudio；不安装SDK、声卡库或TTS引擎，不在播放器中保存SSH凭据；默认连接值集中于驱动，私有覆盖密码另存于部署配置。
 安装 `kuavo5w-speaker.service` 并启用音频用户linger，允许用户音频服务开机运行；
 自动启用该用户的 `pulseaudio.socket`，无需先登录桌面。轻量ROS服务随系统启动，但无音频数据时不启动播放器。
 服务只访问音频，无控制器/电机操作；`speaker` 不依赖 `motion_enabled` 或恢复电机。

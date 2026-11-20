@@ -309,8 +309,11 @@ class DriverContractTests(unittest.TestCase):
 
     def test_connection_settings_are_not_exposed_on_cards(self):
         for tool in self.bundle.get_all_tools():
-            self.assertNotIn('configSchema', tool)
-            self.assertNotIn('config', tool['inputSchema'].get('properties', {}).get('action', {}).get('enum', []))
+            if tool['name'] in ('mic', 'ext_mic'):
+                self.assertEqual(set(tool['configSchema']['properties']), {'device_index'})
+            else:
+                self.assertNotIn('configSchema', tool)
+                self.assertNotIn('config', tool['inputSchema'].get('properties', {}).get('action', {}).get('enum', []))
 
     def test_model_without_action_remains_a_resource_fetch_across_lifecycle(self):
         model = {'urdf': self.bundle.sensors._model_path.read_text()}

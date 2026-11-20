@@ -68,19 +68,23 @@ class BootstrapTests(unittest.TestCase):
                                                       {'host': {'password': 'test-secret'}})
         self.assertEqual(run.call_args.kwargs['env']['SSHPASS'], 'test-secret')
 
-    def test_no_secrets_uses_batch_public_key_authentication_without_password_fallback(self):
+    def test_operator_requested_defaults_and_explicit_opt_out(self):
         result = types.SimpleNamespace(returncode=0, stdout=b'{"ok":true}')
         for role in bootstrap.DEFAULTS:
-            # Legacy configuration must not re-enable a removed password.
-            target = {**bootstrap.DEFAULTS[role], 'use_default_credentials': True}
-            with patch.dict(os.environ, {f'KUAVO_{role.upper()}_SSH_PASSWORD': '',
-                                         f'KUAVO_{role.upper()}_SUDO_PASSWORD': '',
-                                         f'KUAVO_{role.upper()}_SSH_KEY': ''}), \
-                 patch.object(bootstrap.subprocess, 'run', return_value=result) as run:
-                bootstrap.SshTransport(self.directory).run(role, target, {}, '', {})
-            self.assertEqual(run.call_args.args[0][0], 'ssh')
-            self.assertIn('BatchMode=yes', run.call_args.args[0])
-            self.assertIsNone(json.loads(run.call_args.kwargs['input'])['_sudo_password'])
+            for enabled in (True, False):
+                target = {**bootstrap.DEFAULTS[role], 'use_default_credentials': enabled}
+                with patch.dict(os.environ, {f'KUAVO_{role.upper()}_SSH_PASSWORD': '',
+                                             f'KUAVO_{role.upper()}_SUDO_PASSWORD': '',
+                                             f'KUAVO_{role.upper()}_SSH_KEY': ''}), \
+                     patch.object(bootstrap.subprocess, 'run', return_value=result) as run:
+                    bootstrap.SshTransport(self.directory).run(role, target, {}, '', {})
+                if enabled:
+                    self.assertEqual(run.call_args.args[0][:3], ['sshpass','-e','ssh'])
+                    self.assertEqual(run.call_args.kwargs['env']['SSHPASS'], bootstrap.DEFAULT_PASSWORDS[role])
+                else:
+                    self.assertEqual(run.call_args.args[0][0], 'ssh')
+                    self.assertIn('BatchMode=yes', run.call_args.args[0])
+                    self.assertIsNone(json.loads(run.call_args.kwargs['input'])['_sudo_password'])
 
     def test_explicit_key_uses_batch_public_key_authentication(self):
         result = types.SimpleNamespace(returncode=0, stdout=b'{"ok":true}')

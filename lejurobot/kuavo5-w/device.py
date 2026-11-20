@@ -21,6 +21,7 @@ from std_msgs.msg import String
 from kuavo_sensors import KuavoSensors, SENSOR_CARDS
 from peripherals import Peripherals, CARDS as PERIPHERAL_CARDS
 from speaker import Speaker
+from microphone import Microphones
 from startup import StartupChecks
 from controlled_spatial import ControlledSpatialPlugin
 from base_servo import BaseServo
@@ -1180,6 +1181,8 @@ class KuavoBundle:
             camera_ensure=self.startup_checks.ensure_camera if self.startup_checks.enabled else None)
         self.speaker = Speaker(ros2_node, media_factory,
             ensure=self.startup_checks.ensure_speaker if self.startup_checks.enabled else None)
+        self.microphones = Microphones(ros2_node, namespace, self.startup_checks.provisioner,
+                                       config.get('microphones', {}))
         self._auto_start = config.get('sensors', {}).get('auto_start',
             ['joints', 'imu', 'loco_state', *PERIPHERAL_CARDS])
         boot_required = config.get('host_runtime', {}).get('controller_boot_required', False)
@@ -1204,7 +1207,7 @@ class KuavoBundle:
             plugin_config.pop('loco', None)
             self._enabled = {name for name, cfg in plugin_config.items() if cfg.get('enabled', True)}
         else:
-            self._enabled = {"base_drive", "base_servo", "controlled_spatial", "arm", "leg", "head", "speaker",
+            self._enabled = {"base_drive", "base_servo", "controlled_spatial", "arm", "leg", "head", "speaker", "mic", "ext_mic",
                              *SENSOR_CARDS, *PERIPHERAL_CARDS}
         aliases = {'loco': 'base_drive', 'camera_rgb': 'camera_left', 'camera_rgb_right': 'camera_right'}
         self._enabled = {aliases.get(name, name) for name in self._enabled if name not in ('state', 'switch_mode', 'waist')}
@@ -1635,12 +1638,15 @@ class KuavoBundle:
                 + [t for t in self.peripherals.tools() if t['name'] in self._enabled]
                 + ([self.spatial.get_tool()] if 'controlled_spatial' in self._enabled else [])
                 + ([self.speaker.tool()] if 'speaker' in self._enabled else [])
+                + [t for t in self.microphones.tools() if t['name'] in self._enabled]
                 + ([self.base_servo.tool()] if 'base_servo' in self._enabled else []))
 
     def start_background(self):
         self.startup_checks.start()
         self.spatial.start_background()
         self.peripherals.start()
+        if self._enabled.intersection({'mic', 'ext_mic'}):
+            self.microphones.start_background()
         allowed = {'joints', 'imu', 'loco_state', *PERIPHERAL_CARDS}
         for name in self._auto_start:
             if name in allowed and name in self._enabled:
@@ -1661,6 +1667,8 @@ class KuavoBundle:
                 return {'state': 'error', 'error': _safe_log(str(exc))}
         if name == 'base_servo':
             return self.base_servo.dispatch(action, args)
+        if name in ('mic', 'ext_mic'):
+            return self.microphones.dispatch(name, action, args)
         if name == 'speaker':
             return self.speaker.dispatch(action, args)
         if name == 'controlled_spatial':
@@ -1691,6 +1699,7 @@ class KuavoBundle:
         self.spatial.close()
         self.startup_checks.close()
         self.peripherals.close()
+        self.microphones.close()
         audio_stop = self.speaker.close()
         if audio_stop.get('error'):
             print(f"[speaker] shutdown {_safe_log(audio_stop['error'])}", flush=True)

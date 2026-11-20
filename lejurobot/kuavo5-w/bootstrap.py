@@ -12,7 +12,7 @@ import shlex
 import subprocess
 import threading
 import time
-from connection_defaults import DEFAULTS
+from connection_defaults import DEFAULTS, DEFAULT_PASSWORDS
 
 ROOT = Path(__file__).resolve().parent
 FILES = ('config.yaml', 'host/install.py', 'host/install_controller.py',
@@ -42,7 +42,7 @@ class SshTransport:
     def __init__(self, state_dir):
         self.state_dir = Path(state_dir)
 
-    def run(self, role, target, request, source, secrets, timeout=240):
+    def _prepare(self, role, target, request, source, secrets):
         address, user = target['address'], target['user']
         if not re.fullmatch(r'[A-Za-z0-9_.:-]+', address) or address.startswith('-'):
             raise ProvisionError('invalid_ssh_address')
@@ -59,6 +59,8 @@ class SshTransport:
         prefix = 'KUAVO_' + role.upper()
         key = os.environ.get(prefix + '_SSH_KEY') or role_secret.get('key_file')
         password = os.environ.get(prefix + '_SSH_PASSWORD') or role_secret.get('password')
+        if password is None and not key and target.get('use_default_credentials', True):
+            password = DEFAULT_PASSWORDS[role]
         sudo_password = os.environ.get(prefix + '_SUDO_PASSWORD') or role_secret.get('sudo_password', password)
         if any(value is not None and (not isinstance(value, str) or '\x00' in value or '\n' in value)
                for value in (password, sudo_password, key)):
@@ -82,6 +84,30 @@ class SshTransport:
         launcher = "import base64; BOOTSTRAP_SOURCE=base64.b64decode(%r).decode(); exec(compile(BOOTSTRAP_SOURCE,'bootstrap_remote.py','exec'))" % encoded
         command += [f'{user}@{address}', 'python3 -c ' + shlex.quote(launcher)]
         payload = dict(request, _sudo_password=sudo_password)
+        return command, env, payload
+
+    def open_stream(self, role, target, request, source, secrets):
+        """Fixed image-owned helper over authenticated SSH; caller owns shutdown."""
+        command, env, payload = self._prepare(role, target, request, source, secrets)
+        payload.pop('_sudo_password', None)  # Capture is unprivileged.
+        try:
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, env=env, bufsize=0)
+        except FileNotFoundError:
+            raise ProvisionError('image_missing_openssh_or_sshpass') from None
+        try:
+            process.stdin.write((json.dumps(payload)+'\n').encode())
+            process.stdin.flush()
+        except Exception:
+            process.kill()
+            process.wait()
+            for stream in (process.stdin, process.stdout):
+                stream.close()
+            raise ProvisionError('ssh_stream_start_failed') from None
+        return process
+
+    def run(self, role, target, request, source, secrets, timeout=240):
+        command, env, payload = self._prepare(role, target, request, source, secrets)
         try:
             result = subprocess.run(command, input=json.dumps(payload).encode(), capture_output=True,
                                     timeout=timeout, env=env)

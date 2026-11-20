@@ -16,9 +16,9 @@ provisioning:
   # Fixed allowlist only, when existing vendor ROS/PulseAudio lacks a dependency.
   install_missing_packages: true
   auto_initialize_and_pause: true
-  # Non-secret addresses/users/ROS IPs default to connection_defaults.py.
-  # Configure authentication once per robot through environment variables,
-  # ssh-secrets.json (0600), or SSH keys. No passwords are bundled.
+  # Shared addresses/users/ROS IPs and operator-requested default passwords
+  # are in connection_defaults.py. Private environment/0600 secret overrides win.
+  # Set use_default_credentials: false per role to require explicit keys/secrets.
   # Upper host is local to the host-network container.
   chassis: {volume: 30}
 # Start rosbridge_server on the ROS Noetic host and point this URL at it.
@@ -51,6 +51,10 @@ controlled_spatial:
   motion_music_enabled: false
   # Silence only factory ID-7 standby prompt; preserve alarms and speaker/TTS.
   standby_voice_enabled: false
+microphones:
+  # Empty means auto-select only a unique USB capture device.
+  # Analog inputs require explicit selection after acoustic verification.
+  source: ""
 plugins:
   base_servo: {enabled: true}
   base_drive: {enabled: true}
@@ -59,6 +63,8 @@ plugins:
   leg: {enabled: true}
   head: {enabled: true}
   speaker: {enabled: true}
+  mic: {enabled: true}
+  ext_mic: {enabled: true}
   joints: {enabled: true}
   imu: {enabled: true}
   loco_state: {enabled: true}
