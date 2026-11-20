@@ -177,7 +177,8 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.reader.send_move_p.await_count, 3)
         self.reader.send_gripper.assert_not_awaited()
 
-    async def test_repeated_target_and_equivalent_quaternion_are_sent_once(self):
+    async def test_equivalent_quaternion_does_not_restart_window_or_move_reached_pose(self):
+        clock = self.segment_clock()
         target = self.measured.copy()
         target[8] -= .004
         target[7] = .05
@@ -187,9 +188,35 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(3):
             await self.feed(target)
         self.measured[:] = target
+        clock.return_value += self.reader.send_move_p.await_args.args[2] + .001
         await self.feed(target)
         self.reader.send_move_p.assert_awaited_once()
         self.reader.send_gripper.assert_awaited_once()
+
+    async def test_accepted_final_point_is_resent_until_measured_target_matches(self):
+        clock = self.segment_clock()
+        target = self.measured.copy()
+        target[0] += .003
+        await self.feed(target)
+        self.assert_pose_call(target[:7], RIGHT)
+        window = self.reader.send_move_p.await_args.args[2]
+        self.measured[0] += .002019
+        clock.return_value += window / 2
+        await self.feed(target)
+        self.reader.send_move_p.assert_awaited_once()
+        clock.return_value += window / 2 + .001
+        await asyncio.sleep(.025)
+        self.reader.send_move_p.assert_awaited_once()
+        await self.feed(target)
+        self.assertEqual(self.reader.send_move_p.await_count, 2)
+        self.assert_pose_call(target[:7], RIGHT)
+        clock.return_value += window + .001
+        await self.feed(target)
+        self.assertEqual(self.reader.send_move_p.await_count, 3)
+        self.measured[:] = target
+        clock.return_value += window + .001
+        await self.feed(target)
+        self.assertEqual(self.reader.send_move_p.await_count, 3)
 
     async def test_raw_targets_outside_hard_limits_reject_every_write(self):
         # Establish an in-range baseline: a step limiter alone could otherwise
@@ -492,6 +519,7 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(math.hypot(*left[3:]), 1.)
 
     async def test_long_target_advances_in_bounded_segments_only_with_fresh_input(self):
+        clock = self.segment_clock()
         target = self.measured.copy()
         target[0], target[1] = .64, .28
         await self.feed(target)
@@ -503,11 +531,19 @@ class ServoTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(first[0], LEFT[0])
         self.assertLess(first[0], target[0])
         self.assertAlmostEqual(first[1] - LEFT[1], (first[0] - LEFT[0]) / 2)
+        clock.return_value += duration / 2
+        await self.feed(target)
+        self.reader.send_move_p.assert_awaited_once()
+        clock.return_value += duration / 2 + .001
         await asyncio.sleep(watchdog + .08)
         self.reader.send_move_p.assert_awaited_once()
-        self.measured[:7] = first
         await self.feed(target)
         self.assertEqual(self.reader.send_move_p.await_count, 2)
+        self.assert_pose_call(list(first), RIGHT)
+        self.measured[:7] = first
+        clock.return_value += duration + .001
+        await self.feed(target)
+        self.assertEqual(self.reader.send_move_p.await_count, 3)
         second = self.reader.send_move_p.await_args.args[0]
         self.assertGreater(second[0], first[0])
         self.assertLessEqual(second[0], target[0])

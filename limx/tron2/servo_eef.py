@@ -256,8 +256,8 @@ class EefServo:
             self.arm_intent, self.commanded, self.arm_error = intent, (None, None), None
             return
         commanded = tuple(point if wanted is not None else None for point, wanted in zip(pair, intent))
-        if repeated and commanded == self.commanded and not self.arm_error:
-            return
+        # An ACK confirms receipt, even when the TCP stopped short of this
+        # waypoint. A fresh command may request it again in the next window.
         prior_path = self.arm_intent
         prior_accepted = not self.arm_error
         continuing = tuple(goal if goal == prior and point is not None and point != goal else None
