@@ -189,6 +189,40 @@ class PeripheryTests(unittest.TestCase):
         self.assertEqual((depth['id'], depth['K']), (rgb['id'], rgb['K']))
         self.assertEqual(self.periphery.dispatch('camera_depth', 'info')['state'], 'running')
 
+    def test_depth_declares_legacy_navi_suffix_even_before_any_source_is_ready(self):
+        tool = next(t for t in self.periphery.tools() if t['name']=='camera_depth')
+        self.assertEqual(tool['topic_out'], [{'topic':'/test/state/camera_head/visual_depth',
+                                             'format':'image/depth-zlib'}])
+        info = self.periphery.dispatch('camera_depth', 'info')
+        self.assertEqual(info['state'], 'idle')
+        self.assertEqual(info['topic_out'], tool['topic_out'])
+        self.assertEqual([d['topic'] for d in info['camera_info']],
+                         ['/test/state/camera_head/visual_depth','/test/state/camera_depth'])
+
+    def test_depth_alias_preserves_bytes_capture_header_and_lifecycle(self):
+        self.periphery.dispatch('camera_depth', 'start')
+        self.calibrate_head()
+        data = zlib.compress(struct.pack('<H',1500)*(640*480))
+        frame = {'format':'image/depth-zlib','data':base64.b64encode(data).decode(),
+                 'header':{'frame_id':'camera_head_color_optical_frame',
+                           'stamp':{'secs':123,'nsecs':456}}}
+        self.periphery._on_image('camera_depth',frame,1)
+        self.periphery.tick()
+        primary = self.periphery._image_pubs['camera_depth'].messages
+        legacy = self.periphery._legacy_depth_pub.messages
+        self.assertEqual(len(primary),1)
+        self.assertEqual(len(legacy),1)
+        self.assertIs(primary[0],legacy[0])
+        self.assertEqual(bytes(legacy[0].data),data)
+        self.assertEqual((legacy[0].header.stamp.sec,legacy[0].header.stamp.nanosec),(123,456))
+        declarations = self.periphery.dispatch('camera_depth','info')['camera_info']
+        self.assertEqual(declarations[0]['K'],declarations[1]['K'])
+        self.assertEqual(declarations[0]['id'],declarations[1]['id'])
+        self.periphery.dispatch('camera_depth','stop')
+        self.periphery._on_image('camera_depth',frame,1)
+        self.periphery.tick()
+        self.assertEqual(len(legacy),1)
+
     def test_start_with_fresh_depth_does_not_request_hardware_again(self):
         with patch.object(peripherals_module.threading, 'Thread'):
             self.periphery.dispatch('camera_depth', 'start')

@@ -823,6 +823,34 @@ reader, so its local validation image also backported that reader and start
 argument forwarding. A future normal release should build from the updated
 ActuCore source rather than depend on the local validation image.
 
+That initial integration used a patched ActuCore validation image. For the
+older unmodified release, the driver now declares the hardware depth card's
+primary output as `/ubuntu/state/camera_head/visual_depth` (namespace-dependent),
+which its existing suffix-based binder recognises even before DDS discovery.
+The card remains named `camera_depth`; the wire format stays `image/depth-zlib`
+and the source remains measured head-camera depth, not a visual-depth model.
+`/ubuntu/state/camera_depth` remains a backwards-compatible alias publishing
+the identical bytes and source header while the card is running. CameraInfo
+describes both endpoints with the same calibrated lens identity. Existing
+canvas links should resolve the current port-0 topic from `info()` on the next
+project start; a stale direct topic override must be refreshed. This producer
+compatibility path does not require changing ActuCore or adding a visual_depth
+inference card. Older navi can still omit its optional RGB overlay if its
+separate graph lookup runs before discovery; depth role binding is independent
+of that graph lookup.
+
+This compatibility path was verified against the unmodified site ActuCore
+`release.261113.a332240-jetson-jp5.11`: navi started with the new depth endpoint,
+the objects endpoint and `/ubuntu/state/odom`, and decoded measured depths for
+visible detections. An eight-second independent DDS observation received 78
+depth images, 80 odometry messages and 64 detection messages; the latest depth
+had 94.2% valid pixels. Its optional RGB preview was not bound because that
+version still relies on an immediate graph lookup for RGB. This does not block
+the objects/depth navigation inputs, but the preview limitation remains.
+No hardware control sink or navigation target was enabled during validation;
+temporary navi/VOP instances were stopped afterwards. The change is in the
+driver only; the ActuCore image and source were not altered for this test.
+
 VOP forwarded 640×480, K and the head lens ID; navi reported
 `objects_frame=[640,480]` and normalised all eight boxes in one sampled frame.
 An independent eight-second DDS read received 80 depth, 81 odom and 33 detection

@@ -110,11 +110,17 @@ class Peripherals:
         self._stop = threading.Event()
         self._image_stats = {card: {'received': 0, 'published': 0, 'publish_delay_ms': None} for card in CAMERAS}
         self.topics = {card: f'/{namespace}/state/{card}' for card in CARDS}
+        # Released navi versions identify depth by this suffix before DDS
+        # discovery completes; they do not read explicit format declarations.
+        # Keep the old wire endpoint as an alias for existing direct readers.
+        self._legacy_depth_topic = self.topics['camera_depth']
+        self.topics['camera_depth'] = f'/{namespace}/state/camera_head/visual_depth'
         self._pubs = {card: node.create_publisher(String, self.topics[card], 10) for card in ('battery', 'laser_scan')}
         self._points_topic = f'/{namespace}/state/laser_scan/points'
         self._points_pub = node.create_publisher(UInt8MultiArray, self._points_topic, latest_qos())
         self._image_type = CompressedImage
         self._image_pubs = {card: node.create_publisher(CompressedImage, self.topics[card], latest_qos()) for card in CAMERAS}
+        self._legacy_depth_pub = node.create_publisher(CompressedImage, self._legacy_depth_topic, latest_qos())
         ros1.subscribe('/motus/kuavo5w/battery', 'std_msgs/String', self._on_battery)
         ros1.subscribe('/scan', 'sensor_msgs/LaserScan', self._on_scan, throttle_ms=200)
         for card, topic in INFO_TOPICS.items():
@@ -178,8 +184,12 @@ class Peripherals:
                                self._calibrations.get('camera_depth'), self._depth_registration)
 
     def _camera_declaration(self, card):
-        return declare(card, self.topics[card], DEPTH_FORMAT if card == 'camera_depth' else 'image/jpeg',
+        entries = declare(card, self.topics[card], DEPTH_FORMAT if card == 'camera_depth' else 'image/jpeg',
                        self._calibrations.get(card), self._dimensions.get(card), self._depth_aligned())
+        if card == 'camera_depth':
+            entries.extend(declare(card, self._legacy_depth_topic, DEPTH_FORMAT,
+                           self._calibrations.get(card), self._dimensions.get(card), self._depth_aligned()))
+        return entries
 
     def _image_loop(self, card):
         while not self._stop.is_set():
@@ -432,6 +442,8 @@ class Peripherals:
         msg.header.frame_id = header['frame_id']
         msg.header.stamp.sec, msg.header.stamp.nanosec = header['sec'], header['nanosec']
         self._image_pubs[card].publish(msg)  # No shared lock held during DDS serialization.
+        if card == 'camera_depth':
+            self._legacy_depth_pub.publish(msg)
         with self._lock:
             self._image_stats[card]['published'] += 1
             self._image_stats[card]['publish_delay_ms'] = round((time.monotonic() - seen) * 1000, 2)
