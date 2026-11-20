@@ -118,8 +118,9 @@ class HeliosBattery:
 
     def get_tools(self):
         sensor = tool("battery", "sensor",
-                      "Helios-2.1 双电池状态：电量(%)、总/单体范围电压(V)、电流(mA)、温度(℃)、容量(mAh)、循环次数和BMS版本。"
-                      "只读；左右安装位置待核对；不推断充电状态，断线/过期清空数据。",
+                      "Helios-2.1 双电池状态（battery_1 / battery_2）：soc(%)、voltage(V)、current(mA，原始符号)、"
+                      "cell_vol_min/max(V)、temperature_min/max(℃)、cycle(次)、remaining/full_charge_capacity(mAh)。"
+                      "只读；1/2 为厂家编号，左右安装位置待核对；不推断充电状态，断线/过期数值为空。",
                       topic_out=self._topics)
         sensor["configSchema"] = {"type": "object", "properties": {
             "battery_state_url": {"type": "string", "scope": "shared", "x-sensitive": True,
@@ -157,26 +158,35 @@ class HeliosBattery:
                 self._node = None
             self._publisher = None
 
+    # Flat, G1-style fields per pack. Core's generic "latest" view expands one
+    # object level, so each value gets its own cell (battery_1.soc, ...).
+    # Units are fixed and documented in the tool description and README.
+    _PACK_FIELDS = (("soc", "soc_pct"), ("voltage", "voltage_v"), ("current", "current_ma"),
+                    ("cell_vol_min", "cell_voltage_min_v"), ("cell_vol_max", "cell_voltage_max_v"),
+                    ("temperature_min", "temperature_min_c"), ("temperature_max", "temperature_max_c"),
+                    ("cycle", "cycle_count"), ("remaining_capacity", "remaining_capacity_mah"),
+                    ("full_charge_capacity", "full_charge_capacity_mah"))
+
     def payload(self):
         snap = self.client.snapshot()
-        packs = snap["batteries"]
-        reported = sum(p["available"] for p in packs)
+        by_id = {p["id"]: p for p in snap["batteries"]}
+        reported = sum(p["available"] for p in snap["batteries"])
         state = snap["state"]
         if snap["available"]:
             state = "online" if reported == 2 else "partial" if reported else "unavailable"
-        return {**snap, "timestamp_ms": int(time.time() * 1000), "state": state,
-                "available": bool(snap["available"] and reported),
-                "complete": bool(snap["available"] and reported == 2),
-                "battery_count": reported, "expected_battery_count": 2,
-                "position_mapping_confirmed": False,
-                "units": {"soc_pct": "%", "voltage_v": "V", "current_ma": "mA",
-                          "temperature_min_c": "℃", "temperature_max_c": "℃",
-                          "cycle_count": "次", "cell_voltage_min_v": "V", "cell_voltage_max_v": "V",
-                          "full_charge_capacity_mah": "mAh", "remaining_capacity_mah": "mAh"},
+        result = {}
+        for pack_id in ("1", "2"):
+            pack = by_id.get(pack_id)
+            # Missing or invalid values stay null; never fill with zero.
+            fields = {name: (pack[source] if pack else None) for name, source in self._PACK_FIELDS}
+            fields["state"] = pack["state"] if pack else state
+            result[f"battery_{pack_id}"] = fields
+        return {**result, "state": state,
                 "message": {"online": "两块电池状态正常", "partial": "部分电池电量未报告或无效",
                             "unavailable": "未收到有效电池电量", "idle": "电池订阅已停止",
                             "reconnecting": "底盘未连接，正在重连", "waiting": "等待底盘电池数据",
-                            "stale": "电池数据过期", "invalid": "电池数据格式无效"}[state]}
+                            "stale": "电池数据过期", "invalid": "电池数据格式无效"}[state],
+                "age_ms": snap["age_ms"], "timestamp_ms": int(time.time() * 1000)}
 
     def _publish(self):
         with self._lock:

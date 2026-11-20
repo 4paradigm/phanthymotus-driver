@@ -24,36 +24,44 @@
 
 位置保持厂家原始弧度值，不改零位、符号或限位。独立 `joint/scope` 流提供电机反馈力矩和模型重力矩，单位 Nm；头部未报告重力矩时为 null。两路流分别判断过期，不宣称同步采样。电机反馈不是关节力矩传感器读数，尚未通过实际加载校验，详见 [TORQUE_INTERFACE.md](TORQUE_INTERFACE.md)。
 
-`battery` 发布 `/rokae_helios/state/battery`（`data/json`），从底盘 `UiDatagram.robot_base.data_pool.multi_battery_info` 解码：
+`battery` 发布 `/rokae_helios/state/battery`（`data/json`），从底盘 `UiDatagram.robot_base.data_pool.multi_battery_info` 解码。输出采用与 G1 电池卡相同的扁平写法，官方 Core 监控页"最新"模式会把每个字段显示为独立一格（如 `battery_1.soc`）。示例（数值仅作格式说明）：
+
+```json
+{"battery_1": {"soc": 98, "voltage": 53.26, "current": 0, "cell_vol_min": 3.515, "cell_vol_max": 3.58,
+               "temperature_min": 25, "temperature_max": 25, "cycle": 10,
+               "remaining_capacity": 29400, "full_charge_capacity": 30000, "state": "online"},
+ "battery_2": {"...": "同上"},
+ "state": "online", "message": "两块电池状态正常", "age_ms": 71, "timestamp_ms": 1795164659231}
+```
 
 | 字段 | 单位 / 含义 |
 |---|---|
-| `id` | 厂家编号 1 / 2，尚未核对物理左右位置 |
-| `soc_pct` | %；0 是有效数值 |
-| `voltage_v` | V，由原始 mV 换算 |
-| `current_ma` | 原始电流 mA，保留符号；当前展示不显示此字段 |
-| `temperature_min_c` / `temperature_max_c` | 当前帧 BMS 最低 / 最高温度，°C |
-| `cell_voltage_min_v` / `cell_voltage_max_v` | 单体电压范围，V |
-| `remaining_capacity_mah` / `full_charge_capacity_mah` | 剩余 / 满充容量，mAh，不是设计容量 |
-| `cycle_count` | 循环次数 |
-| `bms_hardware_version` / `bms_software_version` | 原始 BMS 版本字符串 |
+| `battery_1` / `battery_2` | 厂家编号 1 / 2，尚未核对物理左右位置 |
+| `soc` | %；0 是有效数值 |
+| `voltage` | 总电压 V，由原始 mV 换算 |
+| `current` | 原始电流 mA，保留符号；不据此推断充放电 |
+| `cell_vol_min` / `cell_vol_max` | 单体电压范围，V |
+| `temperature_min` / `temperature_max` | 当前帧 BMS 最低 / 最高传感器温度，°C |
+| `cycle` | 循环次数 |
+| `remaining_capacity` / `full_charge_capacity` | 剩余 / 当前满充容量，mAh，不是设计容量 |
+| `battery_N.state` | `online`、`not_reported`、`invalid_soc`，或整体停止/过期状态 |
+| `state` / `message` | 整体状态：`online`（两块有效）、`partial`（仅一块）、`idle`、`stale`、`reconnecting` 等 |
+| `age_ms` | 距离最近一次有效电池报文的毫秒数 |
 
-两块 SOC 均有效时 `complete=true`；仅一块有效为 `partial`。缺失值保留 null，不补零。不推断 SOH、设计容量或充电状态。单体电压尺度依据实机原始值和总压一致性，仍需厂家明确单位确认。协议、来源及限制见 [BATTERY_INTERFACE.md](BATTERY_INTERFACE.md)。
+缺失值保留 null，不补零。不推断 SOH、设计容量或充电状态。单体电压尺度依据实机原始值和总压一致性，仍需厂家明确单位确认。BMS 版本字符串仍会解析校验，但不再发布。协议、来源及限制见 [BATTERY_INTERFACE.md](BATTERY_INTERFACE.md)。
 
-关节默认 1 秒、电池默认 3 秒无有效报文即过期。断线、无效、过期或停止时清空相应数据；无关报文不刷新有效期。`received_at_ms` 是 Driver 接收时间，`timestamp_ms` 是发布时刻，`source_timestamp=null`。没有厂家采样时间，无法仅凭接收计数排除控制器内部数据冻结。
+关节默认 1 秒、电池默认 3 秒无有效报文即过期。断线、无效、过期或停止时清空相应数据；无关报文不刷新有效期。关节流的 `received_at_ms` 是 Driver 接收时间；`timestamp_ms` 是发布时刻。没有厂家采样时间，无法仅凭接收计数排除控制器内部数据冻结。
 
 ## 画布与 Core 前端
 
 在卡片共享配置中保存状态地址，再将 `joints` 和 `battery` 加入画布并启动。`model` 无需单独运行；首次请求时读取同一 iNex 地址的 `/api/robot_3d_model` 及其同源 `urdf_url`，核对 20 轴名称后在进程内缓存。没有把厂家模型打入镜像。模型服务暂不可用时明确返回错误，不影响关节和电池订阅启动。监控页从 `joints` 自动生成骨架及 `joint_status` 模块。
 
-配套 Core 功能分支包含真实 MCP ID 传递、URDF RPY 修复、首帧回放和自动取景，以及 Helios 的显示适配：
+官方 Core 无需修改即可使用：监控页按真实 Driver ID 读取 URDF 显示骨架，电池用通用"最新"模式逐字段显示。已知差异：
 
-- 上半身采用类似 G1 的肩线、短颈和圆点头部，保留全部原始运动学坐标。示意外观不能用于量取头肩位置，不加载 STL。
-- 双电池沿用原生英文日志及字体，同帧共用一个接收时间；展示 SOC、电压、单体电压范围、当前最高传感器温度及循环次数。
-- 容量、BMS 版本和诊断放入 Details。展开历史详情时保留记录及阅读位置，收起后恢复跟随。
-- 当前界面隐藏 current、无来源的 SOH 和未知充电状态。原始 Driver 数据合约保留电流。
+- 官方骨架把 URDF 中全部连杆画成线段，包括头部 4 个相机、胸部深度相机和 4 个轮子的固定安装坐标，因此头部呈若干短线、胸前有一段前伸线段；关节姿态本身取自实时数据。
+- 配置页"查看数据流"面板在官方 Core 中不读取 Driver 模型，显示的是通用默认人形，应以监控页为准。
 
-Core 变更需要在 `4paradigm/phanthymotus` 单独提交评审；仅更新 Driver 镜像不会安装这些前端变更。通用骨架可能保留失联前姿态，应结合 `available` / `state` 判断在线状态。
+`4paradigm/phanthymotus` 中另有可选的 Helios 显示适配分支（MCP ID 传递、URDF RPY 顺序修复、取景和人形外观），需单独评审，不是本 Driver 运行的前提。通用骨架可能保留失联前姿态，应结合 `joint_status` 的 `available` / `state` 判断在线状态。
 
 ## 配置
 
