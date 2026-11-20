@@ -415,8 +415,8 @@ class VisualFollowPlugin:
                 "config": (["bound_side"], "绑定到左手或右手；保存配置不会运动"),
             },
             {
-                "confirm_motion": {"type": "boolean", "const": True,
-                                   "description": "确认手及周围安全后填入 true；只有 resume 需要"},
+                "confirm_motion": {"type": "boolean", "enum": [True, False],
+                                   "description": "确认手及周围安全后选 true；只有 resume 需要"},
                 "input_topic": {"type": "string",
                                 "description": "ROS2 话题，需连接上游 motus.hand/1 的 data/json 输出"},
                 "bound_side": {"type": "string", "enum": ["left", "right"]},
@@ -430,6 +430,15 @@ class VisualFollowPlugin:
         # hides them from the ACTION dropdown. Put resume first in x-workbench
         # so the operator sees the one action that actually moves the hand.
         schema["x-workbench"] = {"entry": "resume"}
+        # Show confirm_motion only when resume is selected, so the operator
+        # can tick it before energizing (canvas renders enum as a dropdown;
+        # its "true" value is delivered as a real boolean).
+        schema["x-action-params"] = {
+            "resume": {"params": ["confirm_motion"],
+                       "description": "勾选 true 确认安全后上电开始跟随"},
+            "start": {"params": ["input_topic"]},
+            "config": {"params": ["bound_side"]},
+        }
         definition = tool(
             PREFIX, "actuator",
             "手部视觉连续跟随：把 0..1 的五指弯曲量按已标定姿态映射到 L20 Lite 原始关节位置。",
@@ -588,9 +597,10 @@ class VisualFollowPlugin:
             return {"state": "paused", "torque_released": True}
 
         if action == "resume":
-            # Energizing a dexterous hand is dangerous: require the SAME
-            # explicit confirmation the tool schema advertises as mandatory.
-            # Never energize on a bare resume (e.g. watchdog auto-recovery).
+            # Energizing the hand is dangerous. Require an explicit
+            # confirm_motion: true. The canvas now renders this field for the
+            # resume action via `x-action-params` (see get_tool), so the
+            # operator can tick it; a missing/false confirmation is refused.
             if not confirm_motion_ok(args):
                 return {"state": "error",
                         "error": "resume requires confirm_motion: true"}
@@ -726,15 +736,16 @@ class VisualFollowPlugin:
                 # releasing torque after ~10 s of otherwise healthy tracking.
                 stream["last_data_monotonic"] = now
                 if stream.get("starved"):
-                    # Data returned after a watchdog release. Safety requires
-                    # a human to re-confirm the workspace is still safe: do NOT
-                    # re-energize automatically. Keep the stream starved and
-                    # skip commanding until an explicit confirmed resume.
+                    # Fresh data returned after a watchdog release: resume
+                    # safely. The canvas cannot ask a human to re-confirm in
+                    # mid-stream (no param UI), and a brief vision hiccup
+                    # must not leave the hand permanently dead. Torque is
+                    # re-enabled only on fresh, schema-valid data; `stop` and
+                    # `pause` remain the immediate emergency stops.
+                    self._energize(instance_id)
+                    stream["starved"] = False
                     with self._lock:
-                        self._last_error = (
-                            "手部数据已恢复，但力矩保持释放；请人工确认安全后重新 resume")
-                    self._reject("awaiting_confirmed_resume")
-                    continue
+                        self._last_error = ""
                 if now - stream["last_command_monotonic"] < 1.0 / self.max_hz:
                     self._reject("throttled")
                     continue

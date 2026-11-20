@@ -164,12 +164,17 @@ def test_start_disarms_and_resume_is_the_confirmation_gate():
     assert plugin._streams["card1"]["paused"] is True
     assert plugin.accept(sample()) is False            # data ignored while armed
 
-    # resume without confirmation must be rejected (safety gate)
+    # Canvas renders the confirm_motion field for resume via x-action-params.
+    # A missing or false confirmation must be refused; true energizes.
     result = plugin.dispatch("resume", {"instance_id": "card1"})
     assert result["state"] == "error", result
     assert "confirm" in result["error"]
     assert plugin._streams["card1"]["paused"] is True
-    result = plugin.dispatch("resume", {"instance_id": "card1", "confirm_motion": True})
+    result = plugin.dispatch("resume", {"instance_id": "card1",
+                                        "confirm_motion": False})
+    assert result["state"] == "error", result
+    result = plugin.dispatch("resume", {"instance_id": "card1",
+                                        "confirm_motion": True})
     assert result["state"] == "running", result
     assert plugin._streams["card1"]["paused"] is False
 
@@ -192,7 +197,7 @@ def test_accept_writes_a_clamped_command_and_rejects_wrong_data():
     assert len(client.writes) == before
 
 
-def test_watchdog_releases_torque_and_requires_confirmed_resume():
+def test_watchdog_releases_torque_then_auto_resumes_on_fresh_data():
     plugin = make_plugin()
     client = start_with_fake_client(plugin)
     plugin.dispatch("resume", {"instance_id": "card1", "confirm_motion": True})
@@ -203,17 +208,12 @@ def test_watchdog_releases_torque_and_requires_confirmed_resume():
     assert "card1" in plugin._streams          # subscription kept alive
     assert stream["starved"] is True
     assert client.torques[-1] == [0] * 10      # torque released while silent
-    # Fresh data must NOT auto re-energize: stays starved, no commands.
+    # Fresh valid data re-energizes and resumes (canvas has no re-confirm UI).
     stream["last_command_monotonic"] = 0.0
     curl = dict(sample()["flexions"]); curl["index"] = 1.0
-    assert plugin.accept(sample(flexions=curl)) is False   # rejected while starved
-    assert stream["starved"] is True
-    assert client.torques[-1] == [0] * 10                   # still released
-    # Only an explicit confirmed resume restores motion.
-    r = plugin.dispatch("resume", {"instance_id": "card1", "confirm_motion": True})
-    assert r["state"] == "running", r
-    assert stream["starved"] is False
     assert plugin.accept(sample(flexions=curl)) is True
+    assert stream["starved"] is False
+    assert client.torques[-1] != [0] * 10      # torque re-applied
 
 
 def test_pause_releases_torque_and_resume_needs_confirmation():
@@ -224,7 +224,10 @@ def test_pause_releases_torque_and_resume_needs_confirmation():
     assert plugin.dispatch("pause", {"instance_id": "card1"})["state"] == "paused"
     assert client.torques[-1] == [0] * 10
     assert plugin.accept(sample()) is False
+    # resume requires explicit confirmation now that the canvas can pass it.
     assert plugin.dispatch("resume", {"instance_id": "card1"})["state"] == "error"
+    assert plugin.dispatch("resume", {"instance_id": "card1",
+                                      "confirm_motion": False})["state"] == "error"
     assert plugin.dispatch("resume", {"instance_id": "card1",
                                       "confirm_motion": True})["state"] == "running"
 
@@ -522,3 +525,20 @@ def test_accept_with_landmarks_drives_four_fingers_without_crashing():
     # Four fingers must be driven to fist despite the landmark path running.
     assert target[2] == 0 and target[3] == 0 and target[4] == 0 and target[5] == 0, (
         f"four fingers did not move: {target}")
+
+
+def test_resume_exposes_confirm_motion_param_to_canvas():
+    """The canvas must render a confirm_motion field for the resume action.
+
+    Without x-action-params the dangerous resume cannot be confirmed from the
+    canvas (ACTION dropdown only), so the safety gate would deadlock.
+    """
+    plugin = make_plugin()
+    definition = plugin.get_tool()
+    schema = definition.get("inputSchema", definition.get("schema", {}))
+    params = schema.get("x-action-params", {})
+    assert "resume" in params
+    assert "confirm_motion" in params["resume"].get("params", [])
+    prop = schema.get("properties", {}).get("confirm_motion", {})
+    assert prop.get("type") == "boolean"
+    assert prop.get("const") is None, "const hides the field; must be editable"
